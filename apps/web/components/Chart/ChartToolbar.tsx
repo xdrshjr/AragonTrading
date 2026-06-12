@@ -1,0 +1,123 @@
+"use client";
+
+import { useQuery } from "@tanstack/react-query";
+import { api } from "@/lib/api";
+import { useAppStore } from "@/lib/store";
+import type { Bar, Instrument } from "@/lib/types";
+import { Badge, Select } from "@/components/ui";
+
+const BARS: Bar[] = ["1m", "5m", "15m", "30m", "1H", "4H", "1D"];
+const FALLBACK_INSTRUMENTS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"];
+
+export default function ChartToolbar({
+  okxUp,
+  onJumpDate,
+}: {
+  okxUp: boolean | null;
+  onJumpDate: (tsSeconds: number) => void;
+}) {
+  const { instId, bar, mode, setInst, setBar, setMode } = useAppStore();
+
+  const { data: instruments } = useQuery({
+    queryKey: ["instruments"],
+    queryFn: () => api.instruments("SWAP"),
+    staleTime: 5 * 60_000,
+  });
+
+  // 仅展示 USDT 永续，避免下拉过长；保证默认三标的可选
+  const instOptions = buildInstOptions(instruments);
+
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      <Select value={instId} onChange={(e) => setInst(e.target.value)} aria-label="标的">
+        {instOptions.map((id) => (
+          <option key={id} value={id}>
+            {id}
+          </option>
+        ))}
+      </Select>
+
+      <div className="flex gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-0.5">
+        {BARS.map((b) => (
+          <button
+            key={b}
+            onClick={() => setBar(b)}
+            className={
+              "rounded-[7px] px-2 py-1 text-xs font-medium transition-all " +
+              (bar === b
+                ? "bg-[var(--surface)] text-[var(--text)] shadow-soft"
+                : "text-[var(--muted)] hover:text-[var(--text)]")
+            }
+          >
+            {b}
+          </button>
+        ))}
+      </div>
+
+      <input
+        type="date"
+        onChange={(e) => {
+          if (!e.target.value) return;
+          const ts = Math.floor(new Date(`${e.target.value}T00:00:00Z`).getTime() / 1000);
+          onJumpDate(ts);
+        }}
+        className="rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)] hover:border-[var(--accent)]"
+        aria-label="跳转日期"
+      />
+
+      <div className="ml-auto flex items-center gap-2">
+        <div className="flex gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-0.5">
+          <button
+            onClick={() => setMode("backtest")}
+            className={
+              "rounded-[7px] px-2.5 py-1 text-xs font-medium transition-all " +
+              (mode === "backtest"
+                ? "bg-[var(--surface)] text-[var(--text)] shadow-soft"
+                : "text-[var(--muted)] hover:text-[var(--text)]")
+            }
+          >
+            回测
+          </button>
+          <button
+            onClick={() => setMode("paper")}
+            className={
+              "rounded-[7px] px-2.5 py-1 text-xs font-medium transition-all " +
+              (mode === "paper"
+                ? "bg-[var(--surface)] text-[var(--text)] shadow-soft"
+                : "text-[var(--muted)] hover:text-[var(--text)]")
+            }
+          >
+            实时模拟
+          </button>
+        </div>
+
+        <ConnDot okxUp={okxUp} />
+      </div>
+    </div>
+  );
+}
+
+function ConnDot({ okxUp }: { okxUp: boolean | null }) {
+  const tone = okxUp === null ? "neutral" : okxUp ? "long" : "short";
+  const label = okxUp === null ? "探测中" : okxUp ? "OKX 已连接" : "OKX 不可达";
+  return (
+    <Badge tone={tone}>
+      <span
+        className="mr-1 inline-block h-1.5 w-1.5 rounded-full"
+        style={{ background: "currentColor" }}
+      />
+      {label}
+    </Badge>
+  );
+}
+
+function buildInstOptions(instruments: Instrument[] | undefined): string[] {
+  const set = new Set<string>(FALLBACK_INSTRUMENTS);
+  if (instruments) {
+    instruments
+      .filter((i) => i.quote === "USDT")
+      .slice(0, 40)
+      .forEach((i) => set.add(i.instId));
+  }
+  return Array.from(set);
+}

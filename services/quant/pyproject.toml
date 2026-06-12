@@ -1,0 +1,9 @@
+# pytest / 工具配置（依赖见 requirements.txt，spec §8.3 "pyproject.toml 或 requirements.txt"）
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"

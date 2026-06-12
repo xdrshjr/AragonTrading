@@ -1,0 +1,19 @@
+# Aragon Trading — Python 量化后端依赖 (spec §3 / §8.3)
+# Web 框架
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+# 异步网络（OKX REST / WS）
+httpx==0.28.1
+websockets==14.1
+# 计算
+pandas==2.2.3
+numpy==2.2.1
+# 校验 / 配置
+pydantic==2.10.4
+pydantic-settings==2.7.1
+# 持久化（async SQLite）
+SQLAlchemy==2.0.36
+aiosqlite==0.20.0
+# 测试
+pytest==8.3.4
+pytest-asyncio==0.25.2

@@ -1,0 +1,115 @@
+"use client";
+
+import clsx from "clsx";
+import React from "react";
+
+/** 复用基础组件 (spec §8.2)：Button / Select / Card / Tabs / Skeleton / Badge。 */
+
+export function Button({
+  variant = "default",
+  size = "md",
+  className,
+  ...props
+}: React.ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: "default" | "primary" | "ghost" | "danger";
+  size?: "sm" | "md";
+}) {
+  return (
+    <button
+      className={clsx(
+        "inline-flex items-center justify-center gap-1.5 rounded-[10px] font-medium transition-all duration-150 ease-smooth disabled:opacity-40 disabled:cursor-not-allowed",
+        size === "sm" ? "px-2.5 py-1 text-xs" : "px-3.5 py-2 text-sm",
+        variant === "primary" &&
+          "bg-[var(--accent)] text-white hover:brightness-105 active:brightness-95 shadow-soft",
+        variant === "default" &&
+          "bg-[var(--surface-2)] text-[var(--text)] hover:bg-[var(--border)]",
+        variant === "ghost" && "bg-transparent text-[var(--muted)] hover:text-[var(--text)] hover:bg-[var(--surface-2)]",
+        variant === "danger" && "bg-transparent text-[var(--short)] hover:bg-[var(--accent-soft)]",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+export function Select({
+  className,
+  ...props
+}: React.SelectHTMLAttributes<HTMLSelectElement>) {
+  return (
+    <select
+      className={clsx(
+        "rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-sm text-[var(--text)]",
+        "hover:border-[var(--accent)] focus:border-[var(--accent)] transition-colors cursor-pointer",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+export function Card({ className, children, ...props }: React.HTMLAttributes<HTMLDivElement>) {
+  return (
+    <div className={clsx("card", className)} {...props}>
+      {children}
+    </div>
+  );
+}
+
+export function Badge({
+  tone = "neutral",
+  className,
+  children,
+}: {
+  tone?: "neutral" | "long" | "short" | "accent";
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <span
+      className={clsx(
+        "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium tabular",
+        tone === "neutral" && "bg-[var(--surface-2)] text-[var(--muted)]",
+        tone === "long" && "bg-[color-mix(in_srgb,var(--long)_16%,transparent)] text-[var(--long)]",
+        tone === "short" && "bg-[color-mix(in_srgb,var(--short)_16%,transparent)] text-[var(--short)]",
+        tone === "accent" && "bg-[var(--accent-soft)] text-[var(--accent)]",
+        className,
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
+export function Skeleton({ className }: { className?: string }) {
+  return <div className={clsx("skeleton", className)} />;
+}
+
+export function Tabs({
+  tabs,
+  active,
+  onChange,
+}: {
+  tabs: { key: string; label: string }[];
+  active: string;
+  onChange: (key: string) => void;
+}) {
+  return (
+    <div className="flex gap-1 rounded-[10px] bg-[var(--surface-2)] p-1">
+      {tabs.map((t) => (
+        <button
+          key={t.key}
+          onClick={() => onChange(t.key)}
+          className={clsx(
+            "flex-1 rounded-[7px] px-3 py-1.5 text-xs font-medium transition-all duration-150",
+            active === t.key
+              ? "bg-[var(--surface)] text-[var(--text)] shadow-soft"
+              : "text-[var(--muted)] hover:text-[var(--text)]",
+          )}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
