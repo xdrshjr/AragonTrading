@@ -10,7 +10,7 @@ import { api } from "@/lib/api";
 import { colorForIndex } from "@/lib/compare";
 import { useAppStore } from "@/lib/store";
 import type { Candle, CompareResult, EquityPoint, Trade } from "@/lib/types";
-import { paperWS, type WsEvent } from "@/lib/ws";
+import { marketWS, paperWS, type WsEvent } from "@/lib/ws";
 
 // lightweight-charts 仅客户端渲染（R6）
 const CandleChart = dynamic(() => import("@/components/Chart/CandleChart"), { ssr: false });
@@ -20,6 +20,9 @@ export default function Page() {
 
   const [older, setOlder] = useState<Candle[]>([]);
   const [live, setLive] = useState<Candle[]>([]);
+  const [forming, setForming] = useState<Candle | null>(null); // F1：成形中（未确认）最右一根
+  const [lastPrice, setLastPrice] = useState<number | null>(null); // F1：实时最新价
+  const [liveWsOpen, setLiveWsOpen] = useState(false); // F1：市场实时流连接态
   const [liveEquity, setLiveEquity] = useState<EquityPoint[]>([]);
   const [liveTrades, setLiveTrades] = useState<Trade[]>([]);
   const [jumpToTs, setJumpToTs] = useState<number | null>(null);
@@ -48,22 +51,27 @@ export default function Page() {
         }))
       : undefined;
 
-  // 真实历史 K 线
+  // 真实历史 K 线（带数据来源 meta，F2）：读 X-Aragon-Data-Source 头判断 live / cache
   const candlesQ = useQuery({
     queryKey: ["candles", instId, bar],
-    queryFn: () => api.candles(instId, bar, 300),
+    queryFn: () => api.candlesWithMeta(instId, bar, 300),
     retry: 0,
   });
+  const baseCandles = candlesQ.data?.candles;
+  // 主视图新鲜度：以一次性历史拉取的来源为准（query 重取时回落 live，天然覆盖切标的/周期重置，C5/C9）
+  const dataSource = candlesQ.data?.source ?? "live";
 
-  // 切换标的/周期 → 清空增量与实时缓冲
+  // 切换标的/周期 → 清空增量与实时缓冲（F1：连带重置成形根 / 实时价，避免显示上一标的旧值，C5）
   useEffect(() => {
     setOlder([]);
     setLive([]);
+    setForming(null);
+    setLastPrice(null);
   }, [instId, bar]);
 
   const candles = useMemo(
-    () => mergeCandles(older, candlesQ.data ?? [], live),
-    [older, candlesQ.data, live],
+    () => mergeCandles(older, baseCandles ?? [], live, forming),
+    [older, baseCandles, live, forming],
   );
 
   const loadMore = async (beforeTs: number) => {
@@ -110,11 +118,44 @@ export default function Page() {
     return () => ws.close();
   }, [mode, paperSessionId]);
 
+  // F1：默认（回测 / 对比）视图接通真实 OKX 实时行情——让最右一根 K 线随真实成交跳动。
+  // 仅非 paper 模式生效（paper 自己走 paperWS，避免双订阅，R3）；OKX 已判不可达则不连（省无意义重连）。
+  useEffect(() => {
+    if (mode === "paper" || okxUp === false) return;
+    const ws = marketWS(
+      instId,
+      bar,
+      (e: WsEvent) => {
+        if (e.type !== "candle") return;
+        const c = e.data as Candle;
+        setLastPrice(c.c); // 实时最新价（供工具栏显示）
+        if (c.confirm === true) {
+          // 已收口的新历史根：并入 live（与 paper 同语义，mergeUnique 去重升序），清空成形根
+          setLive((prev) => mergeUnique(prev, [c]));
+          setForming(null);
+        } else {
+          setForming(c); // 成形中（未确认）的最右一根
+        }
+      },
+      (open) => setLiveWsOpen(open),
+    );
+    ws.connect();
+    return () => {
+      ws.close();
+      setLiveWsOpen(false);
+    };
+  }, [mode, instId, bar, okxUp]);
+
   // compare 模式不画单策略净值 / markers（改用多条归一化 overlays，C1）
   const overlayEquity =
     mode === "paper" ? liveEquity : mode === "backtest" ? equityQ.data : undefined;
   const overlayTrades =
     mode === "paper" ? liveTrades : mode === "backtest" ? tradesQ.data : undefined;
+
+  // F3：挂载后从 localStorage 补水持久化选择态/主题（skipHydration 配合，避免 SSR 水合告警，C2）
+  useEffect(() => {
+    useAppStore.persist.rehydrate();
+  }, []);
 
   // 初始化主题
   useEffect(() => {
@@ -150,9 +191,17 @@ export default function Page() {
               okxUp={okxUp}
               latencyMs={latencyMs}
               lastOkTs={lastOkTs}
+              liveWsOpen={mode !== "paper" ? liveWsOpen : undefined}
+              lastPrice={mode !== "paper" ? lastPrice : undefined}
               onJumpDate={setJumpToTs}
             />
           </div>
+          {/* F2：缓存回退诚实标注——仅当后端返回缓存样例（X-Aragon-Data-Source: cache）时显示 */}
+          {dataSource === "cache" && (
+            <div className="shrink-0 border-b border-[var(--accent)] bg-[var(--accent-soft)] px-4 py-1.5 text-[11px] font-medium text-[var(--accent)]">
+              ⚠️ 缓存样例 · 非实时——OKX 暂不可达，当前显示本地缓存的真实历史（非最新行情）
+            </div>
+          )}
           <div className="relative flex-1">
             <CandleChart
               candles={candles}
@@ -176,8 +225,15 @@ export default function Page() {
   );
 }
 
-function mergeCandles(older: Candle[], base: Candle[], live: Candle[]): Candle[] {
-  return mergeUnique(mergeUnique(older, base), live);
+function mergeCandles(
+  older: Candle[],
+  base: Candle[],
+  live: Candle[],
+  forming?: Candle | null,
+): Candle[] {
+  const merged = mergeUnique(mergeUnique(older, base), live);
+  // F1：成形根并入最右端——同 ts 覆盖历史/确认根，得到"最后一根实时跳动"，全程 ts 严格升序（R2）
+  return forming ? mergeUnique(merged, [forming]) : merged;
 }
 
 function mergeUnique(a: Candle[], b: Candle[]): Candle[] {

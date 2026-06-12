@@ -65,6 +65,25 @@ cd services/quant && .venv\Scripts\python -m pytest -m network
 - **运行历史（F4）**：右侧底部「历史」Tab 列出近期 run（可按 全部 / 回测 / 模拟 过滤），点击任意行复现其净值与成交。
 - **历史回放加速模拟（F5）**：模式段切到「实时」→ 数据来源选「历史回放」+ 倍速（1× / 4× / 16×），按真实近端 OKX K 线加速驱动模拟撮合，数秒内即见 markers / 净值推进，结束自动停止。**回放数据全部为真实 OKX 历史（非合成），仅加速演示。**
 
+### 迭代 3 收尾增强
+
+- **默认视图实时行情（F1）**：回测 / 对比模式下左图最右一根 K 线随真实 OKX 行情**实时跳动**，工具栏显示实时最新价与「实时流」状态脉冲点（接通既有 `/api/ws/market`，纯展示，不改撮合）。OKX 不可达时不连、不刷屏。
+- **缓存回退诚实标注（F2）**：`/api/candles` 经响应头 `X-Aragon-Data-Source: live|cache`（+ `X-Aragon-Stale`）标注数据来源。**默认配置**下 OKX 不可达即显式 502、绝不假数据；仅当运维显式开启 `ALLOW_CACHED_FALLBACK=true` 且命中缓存时返回**真实但过期**的历史，前端醒目横幅「缓存样例 · 非实时」，杜绝静默冒充实时。`/api/health` 增 `cachedFallbackEnabled` 供前端预知。
+- **选择态与主题持久化（F3）**：标的 / 周期 / 策略 / 模式 / 主题落 `localStorage`（key `aragon-ui`），刷新后恢复上次工作上下文；恢复到已删除策略时安全回落第一个。**不持久化**运行期句柄（`runId` / `paperSessionId`）。
+- **成交 / 净值导出 CSV（F4）**：右侧「绩效指标」/「成交明细」Tab 一键导出当前 run 的净值曲线 / 成交明细为 CSV（UTF-8 + BOM，字段 RFC4180 转义，可被 Excel / Pandas 正确解析）。
+
+### 容器化一键运行（F5）
+
+```bash
+docker compose up --build      # 拉起 web:3000 + quant:8000
+docker compose down            # 停止并清理
+# 浏览器打开 http://localhost:3000 ；后端健康检查 http://localhost:8000/api/health
+```
+
+> **真实数据硬约束**：容器内**仍需能连通 OKX**（compose 透传 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`），否则按硬约束**显式报错、绝不以假数据兜底**。`NEXT_PUBLIC_PY_WS_URL` 默认 `ws://localhost:8000`（**仅同机浏览器**有效；远程部署须改为宿主可达地址并作为 build-arg 传入）。SQLite 数据持久化在命名卷 `aragon-db`。
+>
+> CI（`.github/workflows/ci.yml`）在 push / PR 上跑**后端 pytest（不含 network）+ 前端 tsc / vitest / build**；CI 只跑离线用例，真实数据校验仍以 `scripts/smoke_e2e.py` / `pytest -m network` 为准。
+
 ### 0) 连通性预检（必须先通过 — 真实数据硬约束）
 
 ```bash
@@ -120,9 +139,9 @@ cd apps/web && pnpm test
 
 | Method | Path | 说明 |
 |---|---|---|
-| GET | `/api/health` | 健康检查（含 `okx:up\|down`）|
+| GET | `/api/health` | 健康检查（含 `okx:up\|down`、`cachedFallbackEnabled`）|
 | GET | `/api/instruments` | 可选标的 |
-| GET | `/api/candles` | 历史 K 线（真实 OKX，秒级 ts）|
+| GET | `/api/candles` | 历史 K 线（真实 OKX，秒级 ts；响应头 `X-Aragon-Data-Source: live\|cache`）|
 | GET/POST/PUT/DELETE | `/api/strategies[/{id}]` | 策略 CRUD（内置不可删，可"另存为"）|
 | POST | `/api/strategies/{id}/backtest` | 触发回测，返回 `{runId, metrics}` |
 | GET | `/api/runs/{id}/trades` · `/equity` | 成交明细 / 净值曲线 |

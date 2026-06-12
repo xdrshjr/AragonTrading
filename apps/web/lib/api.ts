@@ -2,6 +2,7 @@
 import type {
   Candle,
   CompareResult,
+  DataSource,
   EquityPoint,
   Health,
   Instrument,
@@ -23,7 +24,11 @@ export class ApiRequestError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+// 内部变体：同 request 的错误处理，但同时回传原始 Response 以便读取响应头（F2）。
+async function rawRequest<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<{ data: T; res: Response }> {
   const res = await fetch(`${BASE}${path}`, {
     ...init,
     headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
@@ -43,8 +48,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new ApiRequestError(code, message, res.status);
   }
-  if (res.status === 204) return undefined as T;
-  return (await res.json()) as T;
+  const data = res.status === 204 ? (undefined as T) : ((await res.json()) as T);
+  return { data, res };
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  return (await rawRequest<T>(path, init)).data;
 }
 
 export const api = {
@@ -57,6 +66,21 @@ export const api = {
     const params = new URLSearchParams({ instId, bar, limit: String(limit) });
     if (before) params.set("before", String(before));
     return request<Candle[]>(`/candles?${params.toString()}`);
+  },
+
+  // 主历史拉取：同 candles，但读响应头 X-Aragon-Data-Source 暴露数据来源（F2）。
+  // 经 /api/py/* 同源代理（Next rewrite 透传上游头），故无需 CORS expose 即可读到。
+  candlesWithMeta: async (
+    instId: string,
+    bar: string,
+    limit = 300,
+    before?: number,
+  ): Promise<{ candles: Candle[]; source: DataSource }> => {
+    const params = new URLSearchParams({ instId, bar, limit: String(limit) });
+    if (before) params.set("before", String(before));
+    const { data, res } = await rawRequest<Candle[]>(`/candles?${params.toString()}`);
+    const source: DataSource = res.headers.get("X-Aragon-Data-Source") === "cache" ? "cache" : "live";
+    return { candles: data, source };
   },
 
   strategies: () => request<Strategy[]>("/strategies"),

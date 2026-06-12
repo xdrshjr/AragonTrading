@@ -6,6 +6,12 @@ const PY_BACKEND_URL = process.env.PY_BACKEND_URL || "http://localhost:8000";
 
 const nextConfig = {
   reactStrictMode: true,
+  // F5：standalone 产物用于容器瘦镜像（只影响 next build，不影响 next dev / rewrite）。
+  // 仅在容器 / CI（Linux）构建时经 NEXT_OUTPUT_STANDALONE=1 开启——Windows 本机 pnpm 的
+  // node_modules 符号链接结构会令 standalone 的 copyTracedFiles 在无 Developer Mode 时报
+  // EPERM symlink，故本机 `pnpm build` 默认走普通产物保持绿；Linux 容器 / CI 无此限制
+  // （实施发现，见 spec §11 D2）。
+  output: process.env.NEXT_OUTPUT_STANDALONE === "1" ? "standalone" : undefined,
   async rewrites() {
     return [
       {

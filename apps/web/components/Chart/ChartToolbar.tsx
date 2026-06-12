@@ -2,7 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import { fmtTime } from "@/lib/format";
+import { fmtPrice, fmtTime } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 import type { Bar, Instrument, Mode } from "@/lib/types";
 import { Badge, Select } from "@/components/ui";
@@ -19,11 +19,15 @@ export default function ChartToolbar({
   okxUp,
   latencyMs,
   lastOkTs,
+  liveWsOpen,
+  lastPrice,
   onJumpDate,
 }: {
   okxUp: boolean | null;
   latencyMs?: number | null;
   lastOkTs?: number | null;
+  liveWsOpen?: boolean; // F1：市场实时流连接态（仅非 paper 模式传入）
+  lastPrice?: number | null; // F1：实时最新价
   onJumpDate: (tsSeconds: number) => void;
 }) {
   const { instId, bar, mode, setInst, setBar, setMode } = useAppStore();
@@ -93,9 +97,37 @@ export default function ChartToolbar({
           ))}
         </div>
 
+        <LivePrice liveWsOpen={liveWsOpen} lastPrice={lastPrice} />
         <ConnDot okxUp={okxUp} latencyMs={latencyMs} lastOkTs={lastOkTs} />
       </div>
     </div>
+  );
+}
+
+// F1：实时价 chip + 实时流状态脉冲点（仅在传入 lastPrice / liveWsOpen 时渲染）
+function LivePrice({
+  liveWsOpen,
+  lastPrice,
+}: {
+  liveWsOpen?: boolean;
+  lastPrice?: number | null;
+}) {
+  if (lastPrice == null && liveWsOpen === undefined) return null;
+  const open = !!liveWsOpen;
+  return (
+    <span
+      className="flex items-center gap-1.5 rounded-[10px] bg-[var(--surface-2)] px-2 py-1 text-xs"
+      title={open ? "实时行情流已连接（最右一根随真实成交跳动）" : "实时行情流连接中…"}
+    >
+      <span
+        className="inline-block h-1.5 w-1.5 rounded-full"
+        style={{
+          background: open ? "var(--long)" : "var(--muted)",
+          animation: open ? "shimmer 1.4s ease-in-out infinite" : undefined,
+        }}
+      />
+      <span className="tabular font-medium text-[var(--text)]">{fmtPrice(lastPrice)}</span>
+    </span>
   );
 }
 

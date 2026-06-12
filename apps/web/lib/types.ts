@@ -4,6 +4,9 @@
 export type Bar = "1m" | "5m" | "15m" | "30m" | "1H" | "4H" | "1D";
 export type Mode = "backtest" | "compare" | "paper";
 
+// /candles 响应头 X-Aragon-Data-Source 的取值（F2）：live=真实实时，cache=缓存样例·非实时。
+export type DataSource = "live" | "cache";
+
 export type Candle = { ts: number; o: number; h: number; l: number; c: number; vol: number; confirm?: boolean };
 
 export type Instrument = { instId: string; instType: "SWAP" | "SPOT"; base: string; quote: string };
@@ -96,6 +99,7 @@ export type Health = {
   okxLatencyMs: number | null;
   lastOkTs: number | null;
   wsConfigured: boolean;
+  cachedFallbackEnabled?: boolean; // F2 新增（可选，向后兼容）
 };
 
 export type ApiError = { error: { code: string; message: string } };

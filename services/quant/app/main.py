@@ -40,6 +40,9 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    # F2：仅"跨源直连"FastAPI（绕过 Next 同源代理，如本地调试 :8000）时才靠它放行自定义头；
+    # 经 /api/py/* 同源代理的默认路径不依赖它（Next rewrite 默认透传上游响应头）。无害零成本，保留。
+    expose_headers=["X-Aragon-Data-Source", "X-Aragon-Stale"],
 )
 
 

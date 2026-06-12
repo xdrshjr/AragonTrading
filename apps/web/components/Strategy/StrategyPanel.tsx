@@ -3,9 +3,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import { equityToCsv, downloadCsv, tradesToCsv } from "@/lib/export";
 import { useAppStore } from "@/lib/store";
 import type { Metrics, Strategy } from "@/lib/types";
-import { Skeleton, Tabs } from "@/components/ui";
+import { Button, Skeleton, Tabs } from "@/components/ui";
 import StrategyList from "./StrategyList";
 import StrategyDetail from "./StrategyDetail";
 import MetricsCards from "./MetricsCards";
@@ -31,9 +32,12 @@ export default function StrategyPanel() {
     queryFn: api.strategies,
   });
 
-  // 默认选中第一个
+  // 默认选中第一个；F3：持久化恢复的 strategyId 若已不在列表中（被删的自定义策略）也回落第一个，
+  // 避免空详情 / 自动回测打到不存在的 id。
   useEffect(() => {
-    if (strategies && strategies.length > 0 && strategyId === null) {
+    if (!strategies || strategies.length === 0) return;
+    const exists = strategyId !== null && strategies.some((s) => s.id === strategyId);
+    if (!exists) {
       setStrategyId(strategies[0].id);
     }
   }, [strategies, strategyId, setStrategyId]);
@@ -66,6 +70,13 @@ export default function StrategyPanel() {
     queryFn: () => api.trades(runId as number),
     enabled: !!runId,
     refetchInterval: mode === "paper" && paperSessionId ? 3000 : false,
+  });
+
+  // 净值（F4 导出用）：与 page 同键查询共享 RQ 缓存，不重复请求
+  const equityQ = useQuery({
+    queryKey: ["equity", runId],
+    queryFn: () => api.equity(runId as number),
+    enabled: !!runId,
   });
 
   const paperStart = useMutation({
@@ -164,9 +175,41 @@ export default function StrategyPanel() {
               />
             </div>
             {tab === "metrics" ? (
-              <MetricsCards metrics={metrics} loading={backtest.isPending} />
+              <>
+                <div className="mb-2 flex justify-end">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={!equityQ.data?.length}
+                    onClick={() =>
+                      runId &&
+                      equityQ.data &&
+                      downloadCsv(`aragon-equity-run${runId}.csv`, equityToCsv(equityQ.data))
+                    }
+                  >
+                    ⬇ 导出净值 CSV
+                  </Button>
+                </div>
+                <MetricsCards metrics={metrics} loading={backtest.isPending} />
+              </>
             ) : tab === "trades" ? (
-              <TradesTable trades={trades} />
+              <>
+                <div className="mb-2 flex justify-end">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={!trades?.length}
+                    onClick={() =>
+                      runId &&
+                      trades &&
+                      downloadCsv(`aragon-trades-run${runId}.csv`, tradesToCsv(trades))
+                    }
+                  >
+                    ⬇ 导出 CSV
+                  </Button>
+                </div>
+                <TradesTable trades={trades} />
+              </>
             ) : (
               <RunHistory />
             )}

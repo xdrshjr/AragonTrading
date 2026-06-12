@@ -1,0 +1,51 @@
+name: CI
+
+# 守护回归：后端 pytest（不含 network）+ 前端 tsc / vitest / build（spec §4.5 / F5）。
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  backend:
+    name: Backend (pytest, no network)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/quant
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      # pyproject 的 addopts="-m 'not network'" 默认排除真实网络用例，离线可绿（C4）
+      - name: Run pytest
+        run: python -m pytest -q
+
+  frontend:
+    name: Frontend (tsc / vitest / build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+      # 构建上下文锁定 apps/web，锁文件 apps/web/pnpm-lock.yaml（C3）
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Typecheck
+        run: pnpm exec tsc --noEmit
+      - name: Unit tests
+        run: pnpm test
+      - name: Build (standalone)
+        run: pnpm build
