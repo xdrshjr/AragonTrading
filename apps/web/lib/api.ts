@@ -1,6 +1,7 @@
 // REST 客户端：封装 /api/py/*（经 Next rewrite 代理到 Python 后端）(spec §8.2 / §9.1)。
 import type {
   Candle,
+  CompareResult,
   EquityPoint,
   Health,
   Instrument,
@@ -84,11 +85,53 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  // 多策略对比（F3）：一次回测多个策略，返回含归一化前净值的榜单
+  compare: (body: {
+    strategyIds: number[];
+    instId: string;
+    bar: string;
+    limit?: number;
+    initialCapital?: number;
+    fees?: number;
+    slippage?: number;
+    leverage?: number;
+  }) =>
+    request<CompareResult>("/strategies/compare", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
   run: (runId: number) => request<Run>(`/runs/${runId}`),
   trades: (runId: number, limit = 500) => request<Trade[]>(`/runs/${runId}/trades?limit=${limit}`),
   equity: (runId: number) => request<EquityPoint[]>(`/runs/${runId}/equity`),
 
-  paperStart: (body: { strategyId: number; instId: string; bar: string; initialCapital?: number }) =>
+  // 运行历史列表（F4）
+  runsList: (filter?: {
+    strategyId?: number;
+    instId?: string;
+    mode?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const params = new URLSearchParams();
+    if (filter?.strategyId != null) params.set("strategyId", String(filter.strategyId));
+    if (filter?.instId) params.set("instId", filter.instId);
+    if (filter?.mode) params.set("mode", filter.mode);
+    if (filter?.limit != null) params.set("limit", String(filter.limit));
+    if (filter?.offset != null) params.set("offset", String(filter.offset));
+    const qs = params.toString();
+    return request<Run[]>(`/runs${qs ? `?${qs}` : ""}`);
+  },
+
+  paperStart: (body: {
+    strategyId: number;
+    instId: string;
+    bar: string;
+    initialCapital?: number;
+    source?: "live" | "replay";
+    speed?: number;
+    replayBars?: number;
+  }) =>
     request<{ sessionId: string; runId: number }>("/paper/start", {
       method: "POST",
       body: JSON.stringify(body),

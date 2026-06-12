@@ -2,7 +2,7 @@
 // 约定：本文件所有 ts 字段均为「秒级 UTC 时间戳」(C2，见 spec §4.4)。
 
 export type Bar = "1m" | "5m" | "15m" | "30m" | "1H" | "4H" | "1D";
-export type Mode = "backtest" | "paper";
+export type Mode = "backtest" | "compare" | "paper";
 
 export type Candle = { ts: number; o: number; h: number; l: number; c: number; vol: number; confirm?: boolean };
 
@@ -80,6 +80,22 @@ export type PaperSessionInfo = {
   positionSide: "long" | "short" | "flat";
 };
 
-export type Health = { status: string; okx: "up" | "down" };
+// 多策略对比结果（F3）。equity 为归一化前的真实净值，前端按 equity/initial-1 归一化叠加。
+export type CompareItem = {
+  strategyId: number;
+  name: string;
+  runId: number;
+  metrics: Metrics;
+  equity: EquityPoint[];
+};
+export type CompareResult = { instId: string; bar: string; items: CompareItem[] };
+
+export type Health = {
+  status: string;
+  okx: "up" | "down";
+  okxLatencyMs: number | null;
+  lastOkTs: number | null;
+  wsConfigured: boolean;
+};
 
 export type ApiError = { error: { code: string; message: string } };

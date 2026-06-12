@@ -19,19 +19,29 @@ from ..okx.ws_client import OKXWSClient
 from ..strategies.base import BaseStrategy
 
 _WINDOW_MAX = 600
+_REPLAY_BASE_INTERVAL = 0.2   # 回放每根基准间隔（秒）；实际间隔 = BASE / speed (F5)
 
 
 class PaperSession:
-    """一个 (strategy, inst, bar) 的实时模拟会话。"""
+    """一个 (strategy, inst, bar) 的实时模拟会话。
+
+    source="live"：订阅真实 OKX WS，仅在已确认 K 线上驱动撮合。
+    source="replay"：拉取真实 OKX 历史 K 线，用可调倍速顺序驱动同一撮合管线，
+    立即演示"模拟快速交易"（数据仍为真实历史，非合成，F5）。
+    """
 
     def __init__(self, session_id: str, run_id: int, strategy: BaseStrategy,
-                 inst_id: str, bar: str, initial_capital: float):
+                 inst_id: str, bar: str, initial_capital: float,
+                 source: str = "live", speed: float = 1.0, replay_bars: int = 300):
         self.session_id = session_id
         self.run_id = run_id
         self.strategy = strategy
         self.inst_id = inst_id
         self.bar = bar
         self.state = "running"
+        self.source = source
+        self.speed = speed
+        self.replay_bars = replay_bars
 
         settings = get_settings()
         self.broker = SimBroker(
@@ -46,6 +56,7 @@ class PaperSession:
         self._trade_cursor = 0
         self._subscribers: set[asyncio.Queue] = set()
         self._ws: OKXWSClient | None = None
+        self._replay_task: asyncio.Task | None = None
         self._lock = asyncio.Lock()
 
     # ---------- fan-out ----------
@@ -66,7 +77,12 @@ class PaperSession:
 
     # ---------- lifecycle ----------
     async def start(self) -> None:
-        """预热历史窗口后订阅实时 WS。"""
+        """live：预热历史窗口后订阅实时 WS；replay：后台任务加速回放真实历史。"""
+        if self.source == "replay":
+            await self._push({"type": "status", "data": {"state": "running"}})
+            self._replay_task = asyncio.create_task(self._run_replay())
+            return
+
         warmup = max(self.strategy.warmup() + 5, 60)
         try:
             history = await get_rest_client().get_candles(self.inst_id, self.bar, limit=warmup)
@@ -80,8 +96,39 @@ class PaperSession:
         self._ws.start()
         await self._push({"type": "status", "data": {"state": "running"}})
 
+    async def _run_replay(self) -> None:
+        """拉真实历史 K 线，按可调倍速顺序经 feed_candle 驱动撮合，跑完自动结算 (F5/C3)。"""
+        interval = max(0.0, _REPLAY_BASE_INTERVAL / self.speed)
+        try:
+            history = await get_rest_client().get_candles(
+                self.inst_id, self.bar, limit=self.replay_bars)
+            for c in history:
+                if self.state != "running":
+                    break
+                # 强制 confirm=True：每根历史 K 线都驱动撮合（演示"快速交易"）
+                await self.feed_candle(Candle(ts=c.ts, o=c.o, h=c.h, l=c.l, c=c.c,
+                                              vol=c.vol, confirm=True))
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise   # 被 stop() 取消：交由 finally 结算
+        except Exception:  # noqa: BLE001 —— 取数失败等，仍进入 finally 结算
+            pass
+        finally:
+            await self.stop()   # 正常跑完或被取消都自动结算（stop 幂等，不会重复结算）
+
     async def stop(self) -> None:
+        # 幂等：非 running 直接返回，避免回放自动 stop 与手动 /stop、shutdown 重复结算 (C3)
+        if self.state != "running":
+            return
         self.state = "stopped"
+        # 取消回放任务并等待（除非由回放任务自身触发 stop，避免自我 await 死锁，C3）
+        task = self._replay_task
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         if self._ws is not None:
             await self._ws.stop()
         # 结算：仍持仓按最新收盘平

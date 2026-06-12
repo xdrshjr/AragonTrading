@@ -12,7 +12,7 @@ from ..db import repositories as repo
 from ..db.session import get_session
 from ..engine.backtester import run_backtest
 from ..okx.rest_client import get_rest_client
-from ..schemas import BacktestReq, CreateStrategyReq, UpdateStrategyReq
+from ..schemas import BacktestReq, CompareReq, CreateStrategyReq, UpdateStrategyReq, equity_out
 from ..strategies.base import get_strategy_class
 
 router = APIRouter(tags=["strategies"])
@@ -104,3 +104,64 @@ async def backtest(strategy_id: int, body: BacktestReq,
         metrics=result.metrics, start_ts=result.start_ts, end_ts=result.end_ts,
     )
     return {"runId": run.id, "metrics": result.metrics}
+
+
+@router.post("/strategies/compare")
+async def compare_strategies(body: CompareReq,
+                             session: AsyncSession = Depends(get_session)) -> dict:
+    """多策略横向对比（F3）：候选 candles 只取一次复用于全部策略，逐一回测并各自落库。"""
+    # strategyIds 去重（保序），重复 id 不重复落库
+    seen: set[int] = set()
+    ordered_ids: list[int] = []
+    for sid in body.strategyIds:
+        if sid not in seen:
+            seen.add(sid)
+            ordered_ids.append(sid)
+
+    settings = get_settings()
+    initial_capital = body.initialCapital or settings.initial_capital
+    fees = body.fees if body.fees is not None else settings.default_taker_fee_bps
+    slippage = body.slippage if body.slippage is not None else settings.default_slippage_bps
+    leverage = body.leverage if body.leverage is not None else settings.default_leverage
+
+    # 候选 candles 只取一次（复用于全部策略，避免 N× OKX 调用触发限频，R1）
+    candles = await get_rest_client().get_candles(body.instId, body.bar, body.limit)
+    await repo.upsert_candles(session, body.instId, body.bar, candles)
+
+    items: list[dict] = []
+    for sid in ordered_ids:
+        row = await repo.get_strategy_row(session, sid)
+        if row is None:
+            continue   # 跳过不存在的策略，不整体失败
+        cls = get_strategy_class(row.template_key)
+        if cls is None:
+            continue   # 模板失效则跳过
+        try:
+            params = {**cls.meta.default_params, **json.loads(row.params_json or "{}")}
+        except json.JSONDecodeError:
+            params = dict(cls.meta.default_params)
+        strategy = cls(params)
+
+        run = await repo.create_run(
+            session, strategy_id=sid, inst_id=body.instId, bar=body.bar, mode="backtest",
+            config={"initialCapital": initial_capital, "fees": fees, "slippage": slippage,
+                    "leverage": leverage, "limit": body.limit},
+        )
+        result = await run_in_threadpool(
+            run_backtest, strategy, candles, body.bar,
+            initial_capital=initial_capital, taker_fee_bps=fees, slippage_bps=slippage,
+            leverage=leverage,
+        )
+        await repo.persist_backtest_result(
+            session, run, trades=result.trades, equity=result.equity_points,
+            metrics=result.metrics, start_ts=result.start_ts, end_ts=result.end_ts,
+        )
+        items.append({
+            "strategyId": sid,
+            "name": row.name or cls.meta.name,
+            "runId": run.id,
+            "metrics": result.metrics,
+            "equity": [equity_out(e) for e in result.equity_points],
+        })
+
+    return {"instId": body.instId, "bar": body.bar, "items": items}

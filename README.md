@@ -34,6 +34,37 @@ services/quant  Python 3.11 + FastAPI：OKX 适配 / 策略引擎 / SimBroker �
 
 ## 快速开始
 
+### 一键启动（推荐）
+
+仓库根目录下，一条命令完成预检 + 依赖就绪 + 同时拉起前后端（跨平台纯 Python 编排，F1）：
+
+```bash
+pnpm setup     # 建 venv + 装 Python 依赖 + pnpm install（首次）
+pnpm preflight # OKX 连通性预检（真实数据硬约束）
+pnpm dev       # 预检 → 并发起后端(:8000) + 前端(:3000)，聚合日志，Ctrl-C 双进程优雅退出
+pnpm test      # 后端 pytest（不含 network）+ 前端 vitest
+```
+
+> 等价底层命令：`python scripts/dev.py {setup|preflight|up|test}`（`up` 支持 `--skip-preflight`）。
+> Ctrl-C 时编排器会向前后端各发 terminate 并等待退出，避免端口残留。
+
+### 真实数据端到端校验（F2）
+
+```bash
+# 经代理直连真实 OKX，串起 candles → 回测 全链路并断言（退出码 0=PASS）
+services/quant/.venv/Scripts/python scripts/smoke_e2e.py     # Windows
+# 或后端可选网络测试（默认排除，opt-in）：
+cd services/quant && .venv\Scripts\python -m pytest -m network
+```
+
+`GET /api/health` 现额外返回 `okxLatencyMs`（往返时延）、`lastOkTs`（最近成功取数秒级 UTC）、`wsConfigured`（WS 端点是否配置）；前端 Header 连接点 tooltip 会展示时延与最近取数时间。
+
+### 新增功能用法
+
+- **多策略对比（F3）**：顶部模式段切到「对比」→ 右侧勾选 2–12 个策略 → 「运行对比」，左图叠加多条**归一化净值曲线**（`净值/初始-1`），右侧榜单可按收益 / 夏普 / 胜率 / 回撤 / 交易数排序，点「打开」下钻单策略详情。
+- **运行历史（F4）**：右侧底部「历史」Tab 列出近期 run（可按 全部 / 回测 / 模拟 过滤），点击任意行复现其净值与成交。
+- **历史回放加速模拟（F5）**：模式段切到「实时」→ 数据来源选「历史回放」+ 倍速（1× / 4× / 16×），按真实近端 OKX K 线加速驱动模拟撮合，数秒内即见 markers / 净值推进，结束自动停止。**回放数据全部为真实 OKX 历史（非合成），仅加速演示。**
+
 ### 0) 连通性预检（必须先通过 — 真实数据硬约束）
 
 ```bash

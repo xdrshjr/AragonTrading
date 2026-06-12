@@ -2,6 +2,9 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# 裸跑 pytest 默认排除真实网络用例（不污染离线 CI）；opt-in 用 `pytest -m network` (C4)
+addopts = "-m 'not network'"
+markers = ["network: 需真实 OKX 连通的端到端用例（默认排除，opt-in: pytest -m network）"]
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.ruff]

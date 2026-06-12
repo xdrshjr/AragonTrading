@@ -47,6 +47,16 @@ class OKXRestClient:
         self._settings = settings or get_settings()
         self._limiter = _RateLimiter()
         self._client: httpx.AsyncClient | None = None
+        self._last_ok_ts: int | None = None       # 最近一次成功取数的秒级 UTC (F2)
+        self._last_latency_ms: int | None = None   # 最近一次 health 探活往返毫秒 (F2)
+
+    @property
+    def last_ok_ts(self) -> int | None:
+        return self._last_ok_ts
+
+    @property
+    def last_latency_ms(self) -> int | None:
+        return self._last_latency_ms
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -78,6 +88,7 @@ class OKXRestClient:
                 body = resp.json()
                 if str(body.get("code")) != "0":
                     raise OKXError(str(body.get("code")), str(body.get("msg") or "OKX error"))
+                self._last_ok_ts = int(time.time())   # 秒级 UTC，最近成功取数 (F2)
                 return body.get("data", [])
             except (httpx.TransportError, httpx.HTTPStatusError) as exc:
                 last_exc = exc
@@ -85,15 +96,21 @@ class OKXRestClient:
         raise OKXError("OKX_UNREACHABLE", f"无法连接 OKX ({path}): {last_exc}")
 
     async def health(self) -> bool:
-        """轻量探活：能取到一根 K 线即视为 up。"""
+        """轻量探活：能取到一根 K 线即视为 up，并记录一次往返时延 (F2)。"""
+        start = time.monotonic()
         try:
             data = await self._request(
                 "/api/v5/market/candles",
                 {"instId": self._settings.default_inst, "bar": "1H", "limit": 1},
                 retries=1,
             )
-            return len(data) > 0
+            if data:
+                self._last_latency_ms = int((time.monotonic() - start) * 1000)
+                return True
+            self._last_latency_ms = None
+            return False
         except OKXError:
+            self._last_latency_ms = None
             return False
 
     async def get_candles(

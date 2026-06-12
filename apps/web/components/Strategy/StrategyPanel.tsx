@@ -10,8 +10,11 @@ import StrategyList from "./StrategyList";
 import StrategyDetail from "./StrategyDetail";
 import MetricsCards from "./MetricsCards";
 import TradesTable from "./TradesTable";
+import CompareView from "./CompareView";
+import RunHistory from "./RunHistory";
 
 type Params = Record<string, unknown>;
+type PaperOpts = { source?: "live" | "replay"; speed?: number; replayBars?: number };
 
 export default function StrategyPanel() {
   const qc = useQueryClient();
@@ -66,8 +69,8 @@ export default function StrategyPanel() {
   });
 
   const paperStart = useMutation({
-    mutationFn: (params: Params) =>
-      applyThenStartPaper(strategyId as number, params, instId, bar),
+    mutationFn: (vars: { params: Params; opts?: PaperOpts }) =>
+      applyThenStartPaper(strategyId as number, vars.params, instId, bar, vars.opts),
     onSuccess: (data) => {
       setPaperSessionId(data.sessionId);
       setRunId(data.runId);
@@ -114,39 +117,47 @@ export default function StrategyPanel() {
       </div>
 
       <div className="flex-1 overflow-auto px-4 py-3">
-        <StrategyList
-          strategies={strategies}
-          activeId={strategyId}
-          returnsById={returnsById}
-          onSelect={(id) => setStrategyId(id)}
-        />
-
-        {selected && (
+        {mode === "compare" ? (
+          <CompareView />
+        ) : (
           <>
-            <div className="my-3 border-t border-[var(--border)]" />
-            <StrategyDetail
-              strategy={selected}
-              mode={mode}
-              busy={busy}
-              paperActive={!!paperSessionId}
-              onApplyAndBacktest={(params) => backtest.mutate({ id: selected.id, params })}
-              onStartPaper={(params) => paperStart.mutate(params)}
-              onStopPaper={() => paperStop.mutate()}
-              onSaveAs={(name, params) => saveAs.mutate({ name, params })}
+            <StrategyList
+              strategies={strategies}
+              activeId={strategyId}
+              returnsById={returnsById}
+              onSelect={(id) => setStrategyId(id)}
             />
 
-            {(backtest.isError || paperStart.isError) && (
-              <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
-                操作失败：{(backtest.error as Error)?.message || (paperStart.error as Error)?.message}
-              </div>
+            {selected && (
+              <>
+                <div className="my-3 border-t border-[var(--border)]" />
+                <StrategyDetail
+                  strategy={selected}
+                  mode={mode === "paper" ? "paper" : "backtest"}
+                  busy={busy}
+                  paperActive={!!paperSessionId}
+                  onApplyAndBacktest={(params) => backtest.mutate({ id: selected.id, params })}
+                  onStartPaper={(params, opts) => paperStart.mutate({ params, opts })}
+                  onStopPaper={() => paperStop.mutate()}
+                  onSaveAs={(name, params) => saveAs.mutate({ name, params })}
+                />
+
+                {(backtest.isError || paperStart.isError) && (
+                  <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+                    操作失败：{(backtest.error as Error)?.message || (paperStart.error as Error)?.message}
+                  </div>
+                )}
+              </>
             )}
 
+            {/* 历史 Tab 挂在 selected 外层：运行历史是全局的，不因未选中策略而隐藏（C8）*/}
             <div className="my-3 border-t border-[var(--border)]" />
             <div className="mb-2">
               <Tabs
                 tabs={[
                   { key: "metrics", label: "绩效指标" },
                   { key: "trades", label: "成交明细" },
+                  { key: "history", label: "历史" },
                 ]}
                 active={tab}
                 onChange={setTab}
@@ -154,8 +165,10 @@ export default function StrategyPanel() {
             </div>
             {tab === "metrics" ? (
               <MetricsCards metrics={metrics} loading={backtest.isPending} />
-            ) : (
+            ) : tab === "trades" ? (
               <TradesTable trades={trades} />
+            ) : (
+              <RunHistory />
             )}
           </>
         )}
@@ -171,7 +184,13 @@ async function runBacktest(id: number, params: Params | undefined, instId: strin
   return api.backtest(id, { instId, bar, limit: 500 });
 }
 
-async function applyThenStartPaper(id: number, params: Params, instId: string, bar: string) {
+async function applyThenStartPaper(
+  id: number,
+  params: Params,
+  instId: string,
+  bar: string,
+  opts?: PaperOpts,
+) {
   await api.updateStrategy(id, { params });
-  return api.paperStart({ strategyId: id, instId, bar });
+  return api.paperStart({ strategyId: id, instId, bar, ...opts });
 }

@@ -145,6 +145,21 @@ async def get_run(session: AsyncSession, run_id: int) -> StrategyRun | None:
     return await session.get(StrategyRun, run_id)
 
 
+async def list_runs(session: AsyncSession, *, strategy_id: int | None = None,
+                    inst_id: str | None = None, mode: str | None = None,
+                    limit: int = 50, offset: int = 0) -> list[StrategyRun]:
+    """运行历史列表：按 id 降序（最新在前），支持 strategy/inst/mode 过滤 + 分页（F4）。"""
+    stmt = select(StrategyRun)
+    if strategy_id is not None:
+        stmt = stmt.where(StrategyRun.strategy_id == strategy_id)
+    if inst_id is not None:
+        stmt = stmt.where(StrategyRun.inst_id == inst_id)
+    if mode is not None:
+        stmt = stmt.where(StrategyRun.mode == mode)
+    stmt = stmt.order_by(StrategyRun.id.desc()).limit(limit).offset(offset)
+    return list((await session.execute(stmt)).scalars().all())
+
+
 async def list_trades(session: AsyncSession, run_id: int, limit: int = 200,
                       offset: int = 0) -> list[Trade]:
     stmt = (select(Trade).where(Trade.run_id == run_id)

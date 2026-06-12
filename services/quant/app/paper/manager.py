@@ -21,7 +21,8 @@ class PaperManager:
         self._sessions: dict[str, PaperSession] = {}
 
     async def start(self, strategy: BaseStrategy, strategy_id: int, inst_id: str,
-                    bar: str, initial_capital: float) -> PaperSession:
+                    bar: str, initial_capital: float, *, source: str = "live",
+                    speed: float = 1.0, replay_bars: int = 300) -> PaperSession:
         settings = get_settings()
         active = [s for s in self._sessions.values() if s.state == "running"]
         if len(active) >= settings.max_paper_sessions:
@@ -32,12 +33,14 @@ class PaperManager:
         async with sm() as s:
             run = await repo.create_run(
                 s, strategy_id=strategy_id, inst_id=inst_id, bar=bar, mode="paper",
-                config={"initialCapital": initial_capital}, status="running",
+                config={"initialCapital": initial_capital, "source": source,
+                        "speed": speed, "replayBars": replay_bars}, status="running",
             )
             run_id = run.id
 
         session_id = uuid.uuid4().hex
-        session = PaperSession(session_id, run_id, strategy, inst_id, bar, initial_capital)
+        session = PaperSession(session_id, run_id, strategy, inst_id, bar, initial_capital,
+                               source=source, speed=speed, replay_bars=replay_bars)
         self._sessions[session_id] = session
         await session.start()
         return session

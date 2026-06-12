@@ -11,6 +11,21 @@ from ..schemas import equity_out, run_out, trade_out
 router = APIRouter(tags=["runs"])
 
 
+@router.get("/runs")
+async def list_runs(
+    strategyId: int | None = Query(None),
+    instId: str | None = Query(None),
+    mode: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    session: AsyncSession = Depends(get_session),
+) -> list[dict]:
+    """运行历史列表（F4）：按 id 降序，支持 strategy/inst/mode 过滤 + 分页。"""
+    runs = await repo.list_runs(session, strategy_id=strategyId, inst_id=instId,
+                                mode=mode, limit=limit, offset=offset)
+    return [run_out(r) for r in runs]
+
+
 @router.get("/runs/{run_id}")
 async def get_run(run_id: int, session: AsyncSession = Depends(get_session)) -> dict:
     run = await repo.get_run(session, run_id)

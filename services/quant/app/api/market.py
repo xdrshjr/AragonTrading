@@ -18,8 +18,19 @@ router = APIRouter(tags=["market"])
 
 @router.get("/health")
 async def health() -> dict:
-    okx_up = await get_rest_client().health()
-    return {"status": "ok", "okx": "up" if okx_up else "down"}
+    """健康检查：OKX 可达性 + 时延 + 最近成功取数时间 + WS 端点是否配置 (F2)。"""
+    rest = get_rest_client()
+    okx_up = await rest.health()
+    # getattr 兜底：使旧/测试用假客户端无需实现这些属性也不致 500
+    latency = getattr(rest, "last_latency_ms", None) if okx_up else None
+    last_ok_ts = getattr(rest, "last_ok_ts", None)
+    return {
+        "status": "ok",
+        "okx": "up" if okx_up else "down",
+        "okxLatencyMs": latency,
+        "lastOkTs": last_ok_ts,
+        "wsConfigured": bool(get_settings().okx_ws_public),
+    }
 
 
 @router.get("/instruments")

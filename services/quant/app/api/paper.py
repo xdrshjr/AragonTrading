@@ -36,7 +36,8 @@ async def paper_start(body: PaperStartReq,
     initial_capital = body.initialCapital or settings.initial_capital
     try:
         sess = await get_paper_manager().start(
-            strategy, body.strategyId, body.instId, body.bar, initial_capital)
+            strategy, body.strategyId, body.instId, body.bar, initial_capital,
+            source=body.source, speed=body.speed, replay_bars=body.replayBars)
     except PaperSessionLimitError as exc:
         raise HTTPException(429, detail={"code": "SESSION_LIMIT", "message": str(exc)})
     return {"sessionId": sess.session_id, "runId": sess.run_id}

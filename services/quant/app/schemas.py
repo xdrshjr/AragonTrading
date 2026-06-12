@@ -32,11 +32,27 @@ class BacktestReq(BaseModel):
     leverage: float | None = None
 
 
+class CompareReq(BaseModel):
+    # 2..12 个策略横向对比（去重后逐一回测，复用同一批 candles，R1）
+    strategyIds: list[int] = Field(min_length=2, max_length=12)
+    instId: str
+    bar: str = "1H"
+    limit: int = Field(default=500, ge=10, le=1000)   # 对齐 BacktestReq (C9)
+    initialCapital: float | None = None
+    fees: float | None = None        # taker_fee_bps
+    slippage: float | None = None    # slippage_bps
+    leverage: float | None = None
+
+
 class PaperStartReq(BaseModel):
     strategyId: int
     instId: str
     bar: str = "1H"
     initialCapital: float | None = None
+    # 数据来源：live=实时 WS；replay=真实历史加速回放（C2，"模拟快速交易"可演示）
+    source: Literal["live", "replay"] = "live"
+    speed: float = Field(default=1.0, gt=0, le=64)        # 回放倍速；gt=0 杜绝除零
+    replayBars: int = Field(default=300, ge=10, le=600)   # 回放根数；≤_WINDOW_MAX=600
 
 
 # ---------------- Response serializers ----------------

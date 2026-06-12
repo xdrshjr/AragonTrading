@@ -11,12 +11,17 @@ import {
   createChart,
 } from "lightweight-charts";
 import { useEffect, useRef } from "react";
+import { normalizeEquity } from "@/lib/compare";
 import type { Candle, EquityPoint, Trade } from "@/lib/types";
+
+// 一条对比净值叠加曲线（compare 模式，F3）
+export type Overlay = { id: number; name: string; color: string; equity: EquityPoint[] };
 
 type Props = {
   candles: Candle[];
   equity?: EquityPoint[];
   trades?: Trade[];
+  overlays?: Overlay[];
   theme: "light" | "dark";
   loading?: boolean;
   error?: string | null;
@@ -33,6 +38,7 @@ export default function CandleChart({
   candles,
   equity,
   trades,
+  overlays,
   theme,
   loading,
   error,
@@ -43,6 +49,7 @@ export default function CandleChart({
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const equitySeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const overlaySeriesRef = useRef<Map<number, ISeriesApi<"Line">>>(new Map());
   const loadMoreRef = useRef(onLoadMore);
   const loadingMoreRef = useRef(false);
   const earliestRef = useRef<number | null>(null);
@@ -108,6 +115,7 @@ export default function CandleChart({
       chartRef.current = null;
       candleSeriesRef.current = null;
       equitySeriesRef.current = null;
+      overlaySeriesRef.current.clear();
     };
   }, []);
 
@@ -164,6 +172,49 @@ export default function CandleChart({
     data.sort((a, b) => (a.time as number) - (b.time as number));
     series.setData(data);
   }, [equity]);
+
+  // 多策略对比净值叠加（compare 模式，F3）：归一化为百分比，挂在与 K 线右价轴
+  // 隔离的独立 "overlay" 价轴上（否则会被 6 万量级价格刻度压成贴底直线，C1）。
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const map = overlaySeriesRef.current;
+    const next = overlays ?? [];
+    const nextIds = new Set(next.map((o) => o.id));
+
+    // 移除不再需要的曲线，释放 series（R6）
+    for (const [id, series] of map) {
+      if (!nextIds.has(id)) {
+        chart.removeSeries(series);
+        map.delete(id);
+      }
+    }
+
+    // 新增 / 更新曲线
+    for (const ov of next) {
+      let series = map.get(ov.id);
+      if (!series) {
+        series = chart.addLineSeries({
+          priceScaleId: "overlay",
+          color: ov.color,
+          lineWidth: 2,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          title: ov.name,
+        });
+        map.set(ov.id, series);
+      } else {
+        series.applyOptions({ color: ov.color, title: ov.name });
+      }
+      const norm = normalizeEquity(ov.equity);
+      series.setData(norm.map((p) => ({ time: p.ts as UTCTimestamp, value: p.value })));
+    }
+
+    if (next.length > 0) {
+      // 自适应百分比区间，留出上下边距
+      chart.priceScale("overlay").applyOptions({ scaleMargins: { top: 0.1, bottom: 0.2 } });
+    }
+  }, [overlays]);
 
   // 日期跳转：滚动到指定时间附近；若早于已加载范围则触发增量加载
   useEffect(() => {

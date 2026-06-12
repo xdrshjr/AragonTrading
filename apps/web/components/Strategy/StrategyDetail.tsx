@@ -5,6 +5,9 @@ import type { Strategy } from "@/lib/types";
 import { Button } from "@/components/ui";
 
 type Params = Record<string, unknown>;
+type PaperOpts = { source?: "live" | "replay"; speed?: number; replayBars?: number };
+
+const SPEEDS = [1, 4, 16];
 
 export default function StrategyDetail({
   strategy,
@@ -21,11 +24,13 @@ export default function StrategyDetail({
   busy: boolean;
   paperActive: boolean;
   onApplyAndBacktest: (params: Params) => void;
-  onStartPaper: (params: Params) => void;
+  onStartPaper: (params: Params, opts?: PaperOpts) => void;
   onStopPaper: () => void;
   onSaveAs: (name: string, params: Params) => void;
 }) {
   const [params, setParams] = useState<Params>(strategy.params);
+  const [source, setSource] = useState<"live" | "replay">("live");
+  const [speed, setSpeed] = useState(16);
 
   useEffect(() => {
     setParams(strategy.params);
@@ -33,6 +38,9 @@ export default function StrategyDetail({
 
   const schema = strategy.paramsSchema || {};
   const setVal = (k: string, v: unknown) => setParams((p) => ({ ...p, [k]: v }));
+
+  const startPaper = () =>
+    onStartPaper(params, { source, speed, replayBars: 300 });
 
   return (
     <div className="flex flex-col gap-3">
@@ -81,6 +89,56 @@ export default function StrategyDetail({
         })}
       </div>
 
+      {mode === "paper" && !paperActive && (
+        <div className="flex flex-col gap-2 rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[11px] text-[var(--muted)]">数据来源</span>
+            <div className="flex gap-0.5 rounded-[8px] bg-[var(--surface)] p-0.5">
+              {(["live", "replay"] as const).map((s) => (
+                <button
+                  key={s}
+                  onClick={() => setSource(s)}
+                  className={
+                    "rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-all " +
+                    (source === s
+                      ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                      : "text-[var(--muted)] hover:text-[var(--text)]")
+                  }
+                >
+                  {s === "live" ? "实时" : "历史回放"}
+                </button>
+              ))}
+            </div>
+          </div>
+          {source === "replay" && (
+            <>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] text-[var(--muted)]">倍速</span>
+                <div className="flex gap-0.5 rounded-[8px] bg-[var(--surface)] p-0.5">
+                  {SPEEDS.map((sp) => (
+                    <button
+                      key={sp}
+                      onClick={() => setSpeed(sp)}
+                      className={
+                        "rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-all " +
+                        (speed === sp
+                          ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                          : "text-[var(--muted)] hover:text-[var(--text)]")
+                      }
+                    >
+                      {sp}×
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <p className="text-[10px] leading-snug text-[var(--muted)]">
+                历史回放（真实数据，加速）：按真实近端 OKX K 线加速驱动模拟撮合，立即可见"快速交易"。
+              </p>
+            </>
+          )}
+        </div>
+      )}
+
       <div className="flex flex-wrap gap-2">
         {mode === "backtest" ? (
           <Button variant="primary" disabled={busy} onClick={() => onApplyAndBacktest(params)}>
@@ -91,8 +149,8 @@ export default function StrategyDetail({
             停止模拟
           </Button>
         ) : (
-          <Button variant="primary" disabled={busy} onClick={() => onStartPaper(params)}>
-            {busy ? "启动中…" : "启动实时模拟"}
+          <Button variant="primary" disabled={busy} onClick={startPaper}>
+            {busy ? "启动中…" : source === "replay" ? "启动历史回放" : "启动实时模拟"}
           </Button>
         )}
 

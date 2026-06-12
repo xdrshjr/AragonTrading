@@ -7,8 +7,9 @@ import ChartToolbar from "@/components/Chart/ChartToolbar";
 import StrategyPanel from "@/components/Strategy/StrategyPanel";
 import { Button } from "@/components/ui";
 import { api } from "@/lib/api";
+import { colorForIndex } from "@/lib/compare";
 import { useAppStore } from "@/lib/store";
-import type { Candle, EquityPoint, Trade } from "@/lib/types";
+import type { Candle, CompareResult, EquityPoint, Trade } from "@/lib/types";
 import { paperWS, type WsEvent } from "@/lib/ws";
 
 // lightweight-charts 仅客户端渲染（R6）
@@ -24,9 +25,28 @@ export default function Page() {
   const [jumpToTs, setJumpToTs] = useState<number | null>(null);
   const loadingMore = useRef(false);
 
-  // 健康检查（连接状态点反映真实 OKX 可达性，C1）
+  // 健康检查（连接状态点反映真实 OKX 可达性，C1；含时延 / 最近取数时间，F2）
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
   const okxUp = health.data ? health.data.okx === "up" : null;
+  const latencyMs = health.data?.okxLatencyMs ?? null;
+  const lastOkTs = health.data?.lastOkTs ?? null;
+
+  // 对比结果（由右侧 CompareView 写入共享缓存，F3）→ 映射为左图归一化净值叠加
+  const compareQ = useQuery<CompareResult | null>({
+    queryKey: ["compare", instId, bar],
+    queryFn: () => null, // 占位：实际数据由 CompareView 通过 setQueryData 写入，本查询不主动请求
+    enabled: false,
+    initialData: null,
+  });
+  const overlays =
+    mode === "compare" && compareQ.data
+      ? compareQ.data.items.map((it, i) => ({
+          id: it.strategyId,
+          name: it.name,
+          color: colorForIndex(i),
+          equity: it.equity,
+        }))
+      : undefined;
 
   // 真实历史 K 线
   const candlesQ = useQuery({
@@ -90,8 +110,11 @@ export default function Page() {
     return () => ws.close();
   }, [mode, paperSessionId]);
 
-  const overlayEquity = mode === "paper" ? liveEquity : equityQ.data;
-  const overlayTrades = mode === "paper" ? liveTrades : tradesQ.data;
+  // compare 模式不画单策略净值 / markers（改用多条归一化 overlays，C1）
+  const overlayEquity =
+    mode === "paper" ? liveEquity : mode === "backtest" ? equityQ.data : undefined;
+  const overlayTrades =
+    mode === "paper" ? liveTrades : mode === "backtest" ? tradesQ.data : undefined;
 
   // 初始化主题
   useEffect(() => {
@@ -123,13 +146,19 @@ export default function Page() {
       <main className="grid flex-1 grid-cols-1 overflow-hidden lg:grid-cols-[1fr_380px]">
         <section className="flex min-h-[360px] flex-col border-b border-[var(--border)] lg:border-b-0 lg:border-r">
           <div className="shrink-0 border-b border-[var(--border)] px-4 py-2.5">
-            <ChartToolbar okxUp={okxUp} onJumpDate={setJumpToTs} />
+            <ChartToolbar
+              okxUp={okxUp}
+              latencyMs={latencyMs}
+              lastOkTs={lastOkTs}
+              onJumpDate={setJumpToTs}
+            />
           </div>
           <div className="relative flex-1">
             <CandleChart
               candles={candles}
               equity={overlayEquity}
               trades={overlayTrades}
+              overlays={overlays}
               theme={theme}
               loading={candlesQ.isFetching && candles.length === 0}
               error={chartError}

@@ -1,0 +1,12 @@
+{
+  "name": "aragon-trading",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Aragon Trading — 多策略量化模拟交易平台（Next.js + FastAPI，真实 OKX 数据）一键开发编排",
+  "scripts": {
+    "setup": "python scripts/dev.py setup",
+    "preflight": "python scripts/dev.py preflight",
+    "dev": "python scripts/dev.py up",
+    "test": "python scripts/dev.py test"
+  }
+}

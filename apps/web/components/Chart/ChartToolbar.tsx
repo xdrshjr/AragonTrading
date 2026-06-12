@@ -2,18 +2,28 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
+import { fmtTime } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
-import type { Bar, Instrument } from "@/lib/types";
+import type { Bar, Instrument, Mode } from "@/lib/types";
 import { Badge, Select } from "@/components/ui";
 
 const BARS: Bar[] = ["1m", "5m", "15m", "30m", "1H", "4H", "1D"];
 const FALLBACK_INSTRUMENTS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"];
+const MODES: { key: Mode; label: string }[] = [
+  { key: "backtest", label: "回测" },
+  { key: "compare", label: "对比" },
+  { key: "paper", label: "实时" },
+];
 
 export default function ChartToolbar({
   okxUp,
+  latencyMs,
+  lastOkTs,
   onJumpDate,
 }: {
   okxUp: boolean | null;
+  latencyMs?: number | null;
+  lastOkTs?: number | null;
   onJumpDate: (tsSeconds: number) => void;
 }) {
   const { instId, bar, mode, setInst, setBar, setMode } = useAppStore();
@@ -67,47 +77,56 @@ export default function ChartToolbar({
 
       <div className="ml-auto flex items-center gap-2">
         <div className="flex gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-0.5">
-          <button
-            onClick={() => setMode("backtest")}
-            className={
-              "rounded-[7px] px-2.5 py-1 text-xs font-medium transition-all " +
-              (mode === "backtest"
-                ? "bg-[var(--surface)] text-[var(--text)] shadow-soft"
-                : "text-[var(--muted)] hover:text-[var(--text)]")
-            }
-          >
-            回测
-          </button>
-          <button
-            onClick={() => setMode("paper")}
-            className={
-              "rounded-[7px] px-2.5 py-1 text-xs font-medium transition-all " +
-              (mode === "paper"
-                ? "bg-[var(--surface)] text-[var(--text)] shadow-soft"
-                : "text-[var(--muted)] hover:text-[var(--text)]")
-            }
-          >
-            实时模拟
-          </button>
+          {MODES.map((m) => (
+            <button
+              key={m.key}
+              onClick={() => setMode(m.key)}
+              className={
+                "rounded-[7px] px-2.5 py-1 text-xs font-medium transition-all " +
+                (mode === m.key
+                  ? "bg-[var(--surface)] text-[var(--text)] shadow-soft"
+                  : "text-[var(--muted)] hover:text-[var(--text)]")
+              }
+            >
+              {m.label}
+            </button>
+          ))}
         </div>
 
-        <ConnDot okxUp={okxUp} />
+        <ConnDot okxUp={okxUp} latencyMs={latencyMs} lastOkTs={lastOkTs} />
       </div>
     </div>
   );
 }
 
-function ConnDot({ okxUp }: { okxUp: boolean | null }) {
+function ConnDot({
+  okxUp,
+  latencyMs,
+  lastOkTs,
+}: {
+  okxUp: boolean | null;
+  latencyMs?: number | null;
+  lastOkTs?: number | null;
+}) {
   const tone = okxUp === null ? "neutral" : okxUp ? "long" : "short";
   const label = okxUp === null ? "探测中" : okxUp ? "OKX 已连接" : "OKX 不可达";
+  const title = okxUp
+    ? `OKX 已连接${latencyMs != null ? ` · 时延 ${latencyMs}ms` : ""}${
+        lastOkTs ? ` · 最近取数 ${fmtTime(lastOkTs)}` : ""
+      }`
+    : okxUp === null
+      ? "正在探测 OKX 可达性…"
+      : "OKX 不可达：请检查代理 / 网络（不会以假数据冒充真实行情）";
   return (
-    <Badge tone={tone}>
-      <span
-        className="mr-1 inline-block h-1.5 w-1.5 rounded-full"
-        style={{ background: "currentColor" }}
-      />
-      {label}
-    </Badge>
+    <span title={title}>
+      <Badge tone={tone}>
+        <span
+          className="mr-1 inline-block h-1.5 w-1.5 rounded-full"
+          style={{ background: "currentColor" }}
+        />
+        {label}
+      </Badge>
+    </span>
   );
 }
 
