@@ -10,9 +10,18 @@ import {
   type UTCTimestamp,
   createChart,
 } from "lightweight-charts";
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
+import {
+  PRICE_SCALE_MIN_WIDTH,
+  alignPriceScaleWidths,
+  createSyncGroup,
+  type SyncGroup,
+} from "@/lib/chartSync";
 import { normalizeEquity } from "@/lib/compare";
+import { INDICATORS, type IndicatorKey, type Plot, type ThemeColors } from "@/lib/indicators";
 import type { Candle, EquityPoint, Trade } from "@/lib/types";
+import IndicatorPane from "./IndicatorPane";
+import { reconcilePlots, type PlotSeries } from "./plots";
 
 // 一条对比净值叠加曲线（compare 模式，F3）
 export type Overlay = { id: number; name: string; color: string; equity: EquityPoint[] };
@@ -22,6 +31,7 @@ type Props = {
   equity?: EquityPoint[];
   trades?: Trade[];
   overlays?: Overlay[];
+  indicators: Record<IndicatorKey, boolean>;
   theme: "light" | "dark";
   loading?: boolean;
   error?: string | null;
@@ -34,11 +44,22 @@ function cssVar(name: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
+function themeColors(): ThemeColors {
+  return {
+    long: cssVar("--long"),
+    short: cssVar("--short"),
+    muted: cssVar("--muted"),
+    accent: cssVar("--accent"),
+    text: cssVar("--text"),
+  };
+}
+
 export default function CandleChart({
   candles,
   equity,
   trades,
   overlays,
+  indicators,
   theme,
   loading,
   error,
@@ -50,11 +71,28 @@ export default function CandleChart({
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const equitySeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const overlaySeriesRef = useRef<Map<number, ISeriesApi<"Line">>>(new Map());
+  // 主图叠加技术指标（MA/EMA/BOLL）的系列 map：key 为命名空间化 id ${def.key}:${plot.id}（RV-3）。
+  const overlayIndSeriesRef = useRef<Map<string, PlotSeries>>(new Map());
   const loadMoreRef = useRef(onLoadMore);
   const loadingMoreRef = useRef(false);
   const earliestRef = useRef<number | null>(null);
 
+  // 主图 + 各副图的时间轴 / 十字光标同步组（挂载期内稳定，懒创建一次）。
+  const syncRef = useRef<SyncGroup | null>(null);
+  if (syncRef.current === null) syncRef.current = createSyncGroup();
+
   loadMoreRef.current = onLoadMore;
+
+  // 启用的叠加 / 副图指标（注册表顺序即渲染顺序）。
+  const enabledPaneDefs = INDICATORS.filter((d) => d.category === "pane" && indicators[d.key]);
+  const hasPane = enabledPaneDefs.length > 0;
+  const paneSig = enabledPaneDefs.map((d) => d.key).join(",");
+  const hasEquity = !!equity && equity.length > 0;
+  // 价格量级（默认 BTC≈6 万 vs SOL≈百），仅量级变化才触发价轴等宽重对齐，避免实时每 tick 抖动（RV-1）。
+  const priceMagnitude = useMemo(() => {
+    const c = candles[candles.length - 1]?.c ?? candles[0]?.c;
+    return c ? Math.round(Math.log10(Math.abs(c) + 1) * 2) : 0;
+  }, [candles]);
 
   // 创建图表（仅客户端，挂载一次；卸载时 remove，避免内存泄漏 R6）
   useEffect(() => {
@@ -72,9 +110,19 @@ export default function CandleChart({
         horzLines: { color: cssVar("--border"), style: 1 },
       },
       crosshair: { mode: CrosshairMode.Normal },
-      rightPriceScale: { borderColor: cssVar("--border") },
-      leftPriceScale: { visible: true, borderColor: cssVar("--border") },
-      timeScale: { borderColor: cssVar("--border"), timeVisible: true, secondsVisible: false },
+      rightPriceScale: { borderColor: cssVar("--border"), minimumWidth: PRICE_SCALE_MIN_WIDTH },
+      leftPriceScale: {
+        visible: true,
+        borderColor: cssVar("--border"),
+        minimumWidth: PRICE_SCALE_MIN_WIDTH,
+      },
+      // 有副图 pane 时主图隐藏自身日期轴，由最底部 pane 独占，全栈只一行日期轴（RV-2）。
+      timeScale: {
+        visible: !hasPane,
+        borderColor: cssVar("--border"),
+        timeVisible: true,
+        secondsVisible: false,
+      },
       autoSize: true,
     });
     chartRef.current = chart;
@@ -110,12 +158,28 @@ export default function CandleChart({
     };
     chart.timeScale().subscribeVisibleLogicalRangeChange(onRange as never);
 
+    // 注册进同步组（主图为锚，getSeries 供跨图十字光标贯穿）。
+    const sync = syncRef.current;
+    const unregister = sync ? sync.register(chart, () => candleSeriesRef.current) : undefined;
+
+    // 容器尺寸变化后重对齐主副价格轴等宽（autoSize 负责重排，本处仅重测回写宽度，RV-1）。
+    let ro: ResizeObserver | undefined;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(() => {
+        if (syncRef.current) alignPriceScaleWidths(syncRef.current.getCharts());
+      });
+      ro.observe(el);
+    }
+
     return () => {
+      ro?.disconnect();
+      unregister?.();
       chart.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
       equitySeriesRef.current = null;
       overlaySeriesRef.current.clear();
+      overlayIndSeriesRef.current.clear();
     };
   }, []);
 
@@ -279,9 +343,51 @@ export default function CandleChart({
     series.setMarkers(markers);
   }, [trades, theme]);
 
+  // 主图叠加技术指标（MA/EMA/BOLL）：compute → 把每个 plot.id 命名空间化为 ${def.key}:${plot.id}
+  // 再交给 reconcilePlots（RV-3：建键 / 删除 / 建系列三处同一 id），挂在与 K 线同一右价轴上天然共轴。
+  // 依赖 candles（实时重算最右值）/ theme（重着色）/ indicators（开关增删系列）。
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const tc = themeColors();
+    const overlayPlots: Plot[] = [];
+    for (const def of INDICATORS) {
+      if (def.category !== "overlay" || !indicators[def.key]) continue;
+      for (const plot of def.compute(candles, tc)) {
+        const id = `${def.key}:${plot.id}`;
+        overlayPlots.push(plot.kind === "line" ? { ...plot, id } : { ...plot, id });
+      }
+    }
+    reconcilePlots(chart, overlayIndSeriesRef.current, overlayPlots, { priceScaleId: "right" });
+  }, [candles, theme, indicators]);
+
+  // 主图时间轴可见性（RV-2）：开关副图导致 hasPane 变化时即时更新，任一时刻全栈只渲染一行日期轴。
+  useEffect(() => {
+    chartRef.current?.applyOptions({ timeScale: { visible: !hasPane } });
+  }, [hasPane]);
+
+  // 价格轴动态等宽对齐（RV-1）：仅价格量级 / 副图数量 / 主题 / 净值轴存废变化时重对齐，
+  // 避免实时每 tick 抖动。新 pane 的子 chart 已在其挂载 effect（先于父 effect 执行）内注册进 sync 组，
+  // 故此处 getCharts() 已含全部图。
+  useEffect(() => {
+    if (syncRef.current) alignPriceScaleWidths(syncRef.current.getCharts());
+  }, [priceMagnitude, paneSig, theme, hasEquity]);
+
   return (
-    <div className="relative h-full w-full">
-      <div ref={containerRef} className="h-full w-full" />
+    <div className="relative flex h-full w-full flex-col">
+      <div ref={containerRef} className="min-h-0 w-full flex-1" />
+
+      {/* 副图指标窗格：每个启用的 pane 指标一个，稳定 key={def.key}（RV-6），最底部独占日期轴（RV-2）。 */}
+      {enabledPaneDefs.map((def, i) => (
+        <IndicatorPane
+          key={def.key}
+          candles={candles}
+          def={def}
+          theme={theme}
+          sync={syncRef.current as SyncGroup}
+          showTimeAxis={i === enabledPaneDefs.length - 1}
+        />
+      ))}
 
       {loading && !error && (
         <div className="absolute left-1/2 top-3 -translate-x-1/2 rounded-full bg-[var(--surface)] px-3 py-1 text-xs text-[var(--muted)] shadow-soft">

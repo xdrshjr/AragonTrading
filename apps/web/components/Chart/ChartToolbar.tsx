@@ -6,6 +6,7 @@ import { fmtPrice, fmtTime } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 import type { Bar, Instrument, Mode } from "@/lib/types";
 import { Badge, Select } from "@/components/ui";
+import IndicatorMenu from "./IndicatorMenu";
 
 const BARS: Bar[] = ["1m", "5m", "15m", "30m", "1H", "4H", "1D"];
 const FALLBACK_INSTRUMENTS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"];
@@ -77,6 +78,8 @@ export default function ChartToolbar({
           </button>
         ))}
       </div>
+
+      <IndicatorMenu />
 
       <input
         type="date"

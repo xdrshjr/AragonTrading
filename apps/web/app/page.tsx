@@ -25,6 +25,7 @@ export default function Page() {
     theme,
     backtestStartTs,
     backtestEndTs,
+    indicators,
     toggleTheme,
   } = useAppStore();
 
@@ -249,6 +250,7 @@ export default function Page() {
               equity={overlayEquity}
               trades={overlayTrades}
               overlays={overlays}
+              indicators={indicators}
               theme={theme}
               loading={(runQ.isFetching || candlesQ.isFetching) && candles.length === 0}
               error={chartError}

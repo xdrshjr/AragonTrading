@@ -85,6 +85,47 @@ export function Skeleton({ className }: { className?: string }) {
   return <div className={clsx("skeleton", className)} />;
 }
 
+/** 开关原子组件（技术指标弹窗用）：role="switch" + aria-checked，复用设计 token，键盘 Space/Enter 切换。 */
+export function Switch({
+  checked,
+  onChange,
+  label,
+  id,
+  className,
+  tabIndex,
+}: {
+  checked: boolean;
+  onChange: (next: boolean) => void;
+  label?: string;
+  id?: string;
+  className?: string;
+  tabIndex?: number;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      id={id}
+      tabIndex={tabIndex}
+      onClick={() => onChange(!checked)}
+      className={clsx(
+        "relative inline-flex h-5 w-9 shrink-0 cursor-pointer items-center rounded-full transition-colors duration-150 ease-smooth",
+        checked ? "bg-[var(--accent)]" : "bg-[var(--surface-2)] border border-[var(--border)]",
+        className,
+      )}
+    >
+      <span
+        className={clsx(
+          "inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow-sm transition-transform duration-150 ease-smooth",
+          checked ? "translate-x-[18px]" : "translate-x-[3px]",
+        )}
+      />
+    </button>
+  );
+}
+
 export function Tabs({
   tabs,
   active,
