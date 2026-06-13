@@ -65,6 +65,49 @@ npm run smoke       # = build:backend → build:web → electron-builder --dir
 打包后的应用：DB 落 `%APPDATA%/Aragon Trading/aragon.db`，日志落 `%APPDATA%/Aragon Trading/logs/`。
 目标机无需预装 Python / Node / pnpm。
 
+## 发布验收清单（`npm run verify:dist` —— 让「确保可用 / 数据真实可用」可机器复验）
+
+「打包成功」≠「打包出来的东西真的能用、且用的是真实数据」。`verify:dist` 驱动**已构建的 `dist/win-unpacked/`
+真实产物**（后端 exe + Next standalone server.js），用 HTTP 断言把全局目标的每条子句映射到一条可执行校验
+（设计见 `docs/plans/desktop-release-acceptance/spec.md`）：
+
+| 全局目标子句 | 验收手段 | 通过判据 |
+|---|---|---|
+| 能成功**打包** | `npm run smoke`（或 `npm run dist`） | 出 `win-unpacked/`（与/或安装包），无 EPERM、无报错退出 |
+| **可用**（起得来） | `npm run verify:dist` 后端/前端就绪步 | 后端 60s 内 `/api/health` 200；前端 90s 内 `/` 200 `text/html` |
+| **数据真实可用** | `npm run verify:dist` candles 步 | `/api/candles` 头 `X-Aragon-Data-Source: live` + 形状（≥50 根、ts 升序秒级、c>0）；且 `/api/health.cachedFallbackEnabled===false` |
+| **功能正常**（端到端集成） | `npm run verify:dist` BFF 步 | 前端 `/api/py/health` 200（standalone rewrites 代理真打到后端） |
+| 退出**干净**（无孤儿占端口） | `npm run verify:dist` 拆解步 | 拆解后 18760/18761 轮询 ≤5s 内重新可绑 |
+
+**命令速查（Windows / PowerShell）：**
+
+```powershell
+cd desktop
+npm run check            # 静态语法校验（含 verify-dist.mjs）
+npm run release:check    # 一条龙：构建免安装产物（smoke）→ 立刻端到端验收（联网，要求 live 真实数据）
+# 仅对已构建产物再验收（不重新构建）：
+npm run verify:dist
+# 离线 / 受限网络（仍禁假数据，只接受诚实 5xx）：
+npm run verify:dist -- --allow-okx-down
+# 排障：保留子进程不拆解（自行 taskkill 释放 18760/18761）：
+npm run verify:dist -- --keep-running
+# 重生成品牌图标（改图标时）：
+npm run icons
+```
+
+> **数据真实是硬门**：默认必须实拿 `X-Aragon-Data-Source: live` + 形状校验 + `cachedFallbackEnabled===false`
+> 三者同时满足才 PASS；缓存 / 假数据冒充 live 一律 FAIL。须先**导出**代理环境变量
+> （`HTTP_PROXY/HTTPS_PROXY=http://127.0.0.1:7897`，非仅开系统代理开关）OKX 方可达；本机 shell 启动已自动导出。
+>
+> **退出码**（便于脚本定位）：`0`=PASS/WARN-PASS；`10`=产物缺失（先 `smoke`/`dist`）；`11`=端口被占；
+> `20`=后端未就绪；`21`=health 非 ok；`22`=candles 非 live（且未 `--allow-okx-down`）；`23`=K 线形状不合理；
+> `24`=`cachedFallbackEnabled!==false`；`30`=前端未就绪；`31`=前端首页异常；`32`=BFF 代理异常；
+> `40`=拆解后轮询 5s 仍端口未释放。
+>
+> ⚠️ `verify:dist` **不进托管 CI**（需 Windows + 真实网络 + 分钟级构建 + 120 MB Electron 下载）；它是**本地/发布前**
+> 手动验收门。CI 只新增 `desktop` 静态校验 job（`npm run check`）。窗口 / 菜单「关于」/ 退出等 GUI 交互由
+> `npm run dev` 人工核对（弹原生窗口、5 策略可切、K 线真实；菜单「帮助 → 关于 Aragon Trading」显示版本与数据来源声明）。
+
 ## 三、跨平台
 
 - **Windows 为一等公民**（本轮验收平台）。

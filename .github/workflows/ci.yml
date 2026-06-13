@@ -49,3 +49,24 @@ jobs:
         run: pnpm test
       - name: Build (standalone)
         run: pnpm build
+
+  desktop:
+    name: Desktop (static check, no Electron download)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # desktop/ 无 lockfile（故不用 npm ci）；--ignore-scripts 跳过 electron postinstall 的 ≈111 MB
+      # 二进制下载（与 spec D6/R9「CI 只做静态校验、绝不下载 120 MB Electron」一致，job 秒级且不抖）。
+      # npm-run-all 等纯 JS 包仍正常装，node --check 不需 electron 二进制。
+      - name: Install (no scripts, no Electron binary)
+        run: npm install --ignore-scripts --no-audit --no-fund
+      # check:* 含 verify-dist.mjs（check:verifydist，P1-4），覆盖本轮核心新文件的语法。
+      # make-icons.py 为 Python，node --check 不覆盖，靠运行时 `npm run icons` 保障（如实声明）。
+      - name: Static syntax check
+        run: npm run check

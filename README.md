@@ -160,10 +160,12 @@ cd desktop ; npm install
 npm run dev                # 拉起 Electron 桌面调试窗口（自动起后端+前端+DevTools），而非浏览器
 npm run smoke              # 快速打包冒烟（免安装目录，先 build 再 --dir）
 npm run dist               # 全量打包 → desktop/dist/（Windows NSIS 安装包 + portable）
+npm run release:check      # 打包 → 端到端发布验收（verify:dist：断言真实 OKX 数据 + 前端代理 + 无残端口）
 ```
 
 > 详见 `desktop/README.md`；设计文档 `docs/plans/desktop-electron-packaging/spec.md`（v2）。
 > Windows 为一等公民；PyInstaller 不能交叉编译，mac/linux 需各自平台构建。真实数据硬约束不变。
+> 发布前用 `npm run verify:dist` 机器复验「确保可用 / 数据真实可用」（验收方案见 `docs/plans/desktop-release-acceptance/spec.md`）。
 
 ## 免责声明
 

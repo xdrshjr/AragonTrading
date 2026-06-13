@@ -87,7 +87,7 @@ function webSpec() {
 
 // ----------------------------- 窗口 -----------------------------
 function createWindow() {
-  win = new BrowserWindow({
+  const opts = {
     width: 1440,
     height: 900,
     minWidth: 1024,
@@ -101,12 +101,51 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true,
     },
-  });
+  };
+  // 窗口图标（G3，防御性）：dev 期 desktop/build/icon.png 可达即设；
+  // 打包后窗口图标由 exe 图标承载（build/ 不入 asar），故 exists 才设、不存在则不设，零回归。
+  const iconPng = path.join(__dirname, '..', 'build', 'icon.png');
+  if (fs.existsSync(iconPng)) opts.icon = iconPng;
+
+  win = new BrowserWindow(opts);
   // 就绪前先显示内置过渡页，避免白屏 / ERR_CONNECTION_REFUSED 闪现（spec §4.2 step8）。
   win.loadFile(path.join(__dirname, 'loading.html'));
   win.on('closed', () => {
     win = null;
   });
+}
+
+// 「关于 Aragon Trading」对话框（G3，§4.3 / §6.3）：版本 / 运行期版本 / appId / 端口 /
+// 数据来源诚实声明 / 一键打开日志目录。放在桌面外壳（不碰渲染层），维持 apps/web 零源码改动（D4）。
+function showAbout() {
+  const v = process.versions;
+  const lines = [
+    `Aragon Trading  v${app.getVersion()}`,
+    '多策略量化模拟交易平台（桌面端）',
+    '',
+    `Electron ${v.electron}  ·  Node ${v.node}  ·  Chromium ${v.chrome}`,
+    'appId: com.aragon.trading',
+    `端口：后端 ${cfg.BACKEND_HOST}:${cfg.BACKEND_PORT} / 前端 ${cfg.WEB_HOST}:${cfg.WEB_PORT}`,
+    '',
+    '数据来源：仅采用 OKX 真实行情；OKX 不可达时显式报错，绝不使用假数据兜底。',
+    `日志目录：${paths.logsDir()}`,
+  ];
+  // 构建 commit 可选——构建期注入了 ARAGON_COMMIT 才附上，否则省略（不强依赖）。
+  if (process.env.ARAGON_COMMIT) lines.push(`构建：${process.env.ARAGON_COMMIT}`);
+
+  dialog
+    .showMessageBox(win, {
+      type: 'info',
+      title: '关于 Aragon Trading',
+      message: 'Aragon Trading',
+      detail: lines.join('\n'),
+      buttons: ['打开日志目录', '确定'],
+      defaultId: 1,
+      cancelId: 1,
+    })
+    .then(({ response }) => {
+      if (response === 0) shell.openPath(paths.ensureLogsDir());
+    });
 }
 
 function buildMenu() {
@@ -132,6 +171,10 @@ function buildMenu() {
     {
       label: '帮助',
       submenu: [
+        {
+          label: '关于 Aragon Trading',
+          click: showAbout,
+        },
         {
           label: '打开日志目录',
           click: () => shell.openPath(paths.ensureLogsDir()),

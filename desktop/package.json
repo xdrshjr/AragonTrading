@@ -15,6 +15,9 @@
     "dist": "run-s build:backend build:web dist:only",
     "pack": "electron-builder --dir",
     "smoke": "run-s build:backend build:web pack",
+    "verify:dist": "node scripts/verify-dist.mjs",
+    "release:check": "run-s smoke verify:dist",
+    "icons": "python scripts/make-icons.py",
     "check": "run-s check:*",
     "check:main": "node --check src/main.js",
     "check:devlaunch": "node --check scripts/dev-launch.js",
@@ -22,7 +25,8 @@
     "check:config": "node --check src/lib/config.js",
     "check:paths": "node --check src/lib/paths.js",
     "check:pm": "node --check src/lib/process-manager.js",
-    "check:buildweb": "node --check scripts/build-web.mjs"
+    "check:buildweb": "node --check scripts/build-web.mjs",
+    "check:verifydist": "node --check scripts/verify-dist.mjs"
   },
   "dependencies": {},
   "devDependencies": {
