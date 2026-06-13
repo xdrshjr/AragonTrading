@@ -2,6 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import dynamic from "next/dynamic";
+import Image from "next/image";
 import { useEffect, useMemo, useRef, useState } from "react";
 import ChartToolbar from "@/components/Chart/ChartToolbar";
 import StrategyPanel from "@/components/Strategy/StrategyPanel";
@@ -213,9 +214,14 @@ export default function Page() {
     <div className="flex h-screen flex-col bg-[var(--bg)]">
       <header className="flex h-12 shrink-0 items-center justify-between border-b border-[var(--border)] px-4">
         <div className="flex items-center gap-2">
-          <div className="flex h-6 w-6 items-center justify-center rounded-[7px] bg-[var(--accent)] text-xs font-bold text-white">
-            A
-          </div>
+          <Image
+            src="/brand/logo.png"
+            alt="Aragon Trading"
+            width={24}
+            height={24}
+            priority
+            className="h-6 w-6 shrink-0"
+          />
           <span className="text-sm font-semibold tracking-tight">Aragon Trading</span>
           <span className="hidden text-[11px] text-[var(--muted)] sm:inline">
             多策略量化模拟交易 · 欧易(OKX)真实行情

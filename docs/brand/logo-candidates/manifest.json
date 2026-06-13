@@ -1,0 +1,205 @@
+{
+  "version": 1,
+  "selectedId": "logo-07-signal-gate",
+  "selectionCriteria": [
+    "small-size legibility",
+    "originality",
+    "fit with Aragon Trading",
+    "fit with dark UI",
+    "packaging suitability",
+    "low-color discipline"
+  ],
+  "selectionRationale": "logo-07-signal-gate has the strongest desktop-icon silhouette, stays readable at 16px and 32px, fits the existing dark trading workbench, and avoids the closer resemblance risks of the symmetric knot and monoline A candidates.",
+  "candidates": [
+    {
+      "id": "logo-01-orbital-a",
+      "displayName": "Orbital A",
+      "sourcePng": "logo-01-orbital-a.png",
+      "prompt": "Abstract orbital A monogram for a premium quantitative trading platform; flat geometric mark on chroma-key background, low-color graphite, silver, muted teal palette, no text.",
+      "palette": ["#0B0D12", "#E7ECEF", "#5FA8A3"],
+      "styleNotes": "Angular A with orbital accent and strong AI-company signal.",
+      "strengths": ["clear brand initial", "good dark UI contrast", "distinct trading orbit motif"],
+      "weaknesses": ["more literal than the selected mark", "less compact at favicon size"],
+      "score": {
+        "smallSizeLegibility": 7,
+        "originality": 7,
+        "aragonFit": 8,
+        "darkUiFit": 8,
+        "packagingSuitability": 7,
+        "lowColorDiscipline": 8
+      },
+      "selected": false
+    },
+    {
+      "id": "logo-02-market-aperture",
+      "displayName": "Market Aperture",
+      "sourcePng": "logo-02-market-aperture.png",
+      "prompt": "Compact aperture or ring mark with implied signal axis; premium geometric logo on chroma-key background, no text, no chart cliches.",
+      "palette": ["#0B0D12", "#E7ECEF"],
+      "styleNotes": "Segmented ring with diagonal signal line.",
+      "strengths": ["premium geometry", "good conceptual fit for signal capture"],
+      "weaknesses": ["small segments soften at 16px", "less distinctive than the selected gate"],
+      "score": {
+        "smallSizeLegibility": 6,
+        "originality": 7,
+        "aragonFit": 7,
+        "darkUiFit": 8,
+        "packagingSuitability": 6,
+        "lowColorDiscipline": 9
+      },
+      "selected": false
+    },
+    {
+      "id": "logo-03-strategy-node",
+      "displayName": "Strategy Node",
+      "sourcePng": "logo-03-strategy-node.png",
+      "prompt": "Three-node strategy graph inside a compact emblem; flat low-color quant systems mark on chroma-key background.",
+      "palette": ["#0B0D12", "#E7ECEF", "#5FA8A3"],
+      "styleNotes": "Minimal connected node system in a dark geometric container.",
+      "strengths": ["clear quant strategy metaphor", "restrained palette"],
+      "weaknesses": ["node details become tiny in favicon contexts", "risks generic network-logo feel"],
+      "score": {
+        "smallSizeLegibility": 5,
+        "originality": 6,
+        "aragonFit": 7,
+        "darkUiFit": 8,
+        "packagingSuitability": 5,
+        "lowColorDiscipline": 8
+      },
+      "selected": false
+    },
+    {
+      "id": "logo-04-folded-alpha",
+      "displayName": "Folded Alpha",
+      "sourcePng": "logo-04-folded-alpha.png",
+      "prompt": "Folded alpha or triangular form; high-contrast premium geometric mark on chroma-key background, one or two colors, no text.",
+      "palette": ["#0B0D12", "#E7ECEF"],
+      "styleNotes": "Sharp folded triangular alpha-like form.",
+      "strengths": ["very strong silhouette", "excellent small-size clarity"],
+      "weaknesses": ["less unique", "can read as a generic navigation or paper-plane mark"],
+      "score": {
+        "smallSizeLegibility": 9,
+        "originality": 5,
+        "aragonFit": 7,
+        "darkUiFit": 8,
+        "packagingSuitability": 8,
+        "lowColorDiscipline": 9
+      },
+      "selected": false
+    },
+    {
+      "id": "logo-05-calm-wave",
+      "displayName": "Calm Wave",
+      "sourcePng": "logo-05-calm-wave.png",
+      "prompt": "Single calm wave or curve suggesting an equity curve without literal chart bars; flat premium logo on chroma-key background.",
+      "palette": ["#0B0D12", "#5FA8A3"],
+      "styleNotes": "Smooth teal curve in a dark compact field.",
+      "strengths": ["calm trading metaphor", "simple and modern"],
+      "weaknesses": ["least distinctive as an app icon", "small-size version reads as a generic wave"],
+      "score": {
+        "smallSizeLegibility": 6,
+        "originality": 5,
+        "aragonFit": 6,
+        "darkUiFit": 8,
+        "packagingSuitability": 5,
+        "lowColorDiscipline": 9
+      },
+      "selected": false
+    },
+    {
+      "id": "logo-06-symmetric-knot",
+      "displayName": "Symmetric Knot",
+      "sourcePng": "logo-06-symmetric-knot.png",
+      "prompt": "One-color symmetric interlocking knot with AI systems restraint; flat logo on chroma-key background, no text, avoid copying existing AI marks.",
+      "palette": ["#E7ECEF"],
+      "styleNotes": "Single-color interlocking loop mark.",
+      "strengths": ["very clean", "excellent low-color discipline", "strong favicon readability"],
+      "weaknesses": ["too close in spirit to existing AI-company knot marks", "less specific to Aragon Trading"],
+      "score": {
+        "smallSizeLegibility": 9,
+        "originality": 5,
+        "aragonFit": 6,
+        "darkUiFit": 8,
+        "packagingSuitability": 8,
+        "lowColorDiscipline": 10
+      },
+      "selected": false
+    },
+    {
+      "id": "logo-07-signal-gate",
+      "displayName": "Signal Gate",
+      "sourcePng": "logo-07-signal-gate.png",
+      "prompt": "Gateway or portal mark with negative-space signal axis; bold premium desktop icon candidate on chroma-key background, low-color graphite, silver, muted teal palette, no text.",
+      "palette": ["#0B0D12", "#E7ECEF", "#5FA8A3"],
+      "styleNotes": "Geometric gate with central negative-space signal path.",
+      "strengths": ["clearest desktop icon candidate", "readable at 16px and 32px", "strong dark UI fit", "distinct without looking like a stock chart"],
+      "weaknesses": ["slightly more architectural than financial"],
+      "score": {
+        "smallSizeLegibility": 9,
+        "originality": 8,
+        "aragonFit": 9,
+        "darkUiFit": 9,
+        "packagingSuitability": 9,
+        "lowColorDiscipline": 8
+      },
+      "selected": true
+    },
+    {
+      "id": "logo-08-precision-compass",
+      "displayName": "Precision Compass",
+      "sourcePng": "logo-08-precision-compass.png",
+      "prompt": "Restrained compass or crosshair abstraction for trading precision; flat low-color logo on chroma-key background, not military.",
+      "palette": ["#0B0D12", "#E7ECEF", "#5FA8A3"],
+      "styleNotes": "Balanced four-point compass with muted center accent.",
+      "strengths": ["precise and compact", "good dark UI fit"],
+      "weaknesses": ["can read as a generic compass", "small center detail disappears at favicon size"],
+      "score": {
+        "smallSizeLegibility": 7,
+        "originality": 6,
+        "aragonFit": 7,
+        "darkUiFit": 8,
+        "packagingSuitability": 7,
+        "lowColorDiscipline": 8
+      },
+      "selected": false
+    },
+    {
+      "id": "logo-09-liquid-grid",
+      "displayName": "Liquid Grid",
+      "sourcePng": "logo-09-liquid-grid.png",
+      "prompt": "Soft grid folded into an emblem for systematic trading infrastructure; flat modern SaaS logo on chroma-key background, no text.",
+      "palette": ["#0B0D12", "#E7ECEF", "#5FA8A3"],
+      "styleNotes": "Folded grid tiles with subtle teal plane.",
+      "strengths": ["modern systems feel", "distinct from chart cliches"],
+      "weaknesses": ["asymmetric details blur at 16px", "less premium than simpler marks"],
+      "score": {
+        "smallSizeLegibility": 6,
+        "originality": 7,
+        "aragonFit": 7,
+        "darkUiFit": 8,
+        "packagingSuitability": 6,
+        "lowColorDiscipline": 7
+      },
+      "selected": false
+    },
+    {
+      "id": "logo-10-monoline-a",
+      "displayName": "Monoline A",
+      "sourcePng": "logo-10-monoline-a.png",
+      "prompt": "One-color monoline A with hidden tick or signal; restrained premium mark on chroma-key background, no text wordmark.",
+      "palette": ["#E7ECEF"],
+      "styleNotes": "Simple single-stroke A form with hidden crossbar signal.",
+      "strengths": ["very restrained", "excellent low-color discipline", "clear brand initial"],
+      "weaknesses": ["too plain for a desktop app icon", "less ownable than the selected gate"],
+      "score": {
+        "smallSizeLegibility": 8,
+        "originality": 5,
+        "aragonFit": 8,
+        "darkUiFit": 8,
+        "packagingSuitability": 7,
+        "lowColorDiscipline": 10
+      },
+      "selected": false
+    }
+  ]
+}

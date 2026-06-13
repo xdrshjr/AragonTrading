@@ -91,9 +91,17 @@ npm run verify:dist
 npm run verify:dist -- --allow-okx-down
 # 排障：保留子进程不拆解（自行 taskkill 释放 18760/18761）：
 npm run verify:dist -- --keep-running
-# 重生成品牌图标（改图标时）：
+# 从 docs/brand/logo-candidates/manifest.json 的 selected 候选重生成品牌图标：
 npm run icons
+# 切换候选并同步 web/desktop 运行时资产：
+npm run icons -- --candidate logo-07-signal-gate
 ```
+
+`npm run icons` 读取 `docs/brand/logo-candidates/manifest.json` 中唯一的
+`selected: true` 候选，并从该 AI 生成 PNG 派生 `apps/web/public/brand/*`、
+`apps/web/public/favicon.ico`、`desktop/build/icon.png`、`desktop/build/icon.ico`
+和可写平台上的 `desktop/build/icon.icns`。Windows 发布验收以 `icon.png` 和
+`icon.ico` 为必需；macOS 发布前需要在 macOS 上确认 `icon.icns` 已重新生成。
 
 > **数据真实是硬门**：默认必须实拿 `X-Aragon-Data-Source: live` + 形状校验 + `cachedFallbackEnabled===false`
 > 三者同时满足才 PASS；缓存 / 假数据冒充 live 一律 FAIL。须先**导出**代理环境变量

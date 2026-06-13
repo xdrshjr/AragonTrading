@@ -1,99 +1,163 @@
-"""make-icons —— 确定性生成 Aragon Trading 品牌图标集（spec: desktop-release-acceptance v2, §4.4 / G5）。
+"""Sync Aragon Trading logo assets from the selected AI-generated candidate.
 
-替换前两轮遗留的 ≈1.2 KB 占位 build/icon.{ico,png,icns}。设计决策 D5：用 Pillow 在品牌深色底
-（#0b0d12，与窗口 backgroundColor 一致）上画圆角块 + 单字母「A」标——**纯几何绘制、不依赖任何字体文件**，
-故任何纯编码 agent 都可复现、可重跑（被否方案：手绘 PNG 二进制 blob 不可复现、不可审计）。
-
-用法：python scripts/make-icons.py   （改图标时手动跑，或 `npm run icons`）
-
-产物（写入 desktop/build/）：
-  · icon.png   256×256 品牌 PNG（linux icon、窗口 dev 期 icon、文档预览）
-  · icon.ico   多分辨率 [16,24,32,48,64,128,256]（electron-builder win.icon，配置零改动）
-  · icon.icns  尽力导出（mac；Pillow 写出受限，失败则保留占位并提示在 mac 上重生成，R6/R-icns）
-
-注：build-time 工具，不写入 requirements.txt（同 pyinstaller 的处理）；Pillow 缺失则尝试 pip 安装。
+The source-of-truth logo library lives in docs/brand/logo-candidates. This
+script reads manifest.json, validates that exactly one candidate is selected,
+and derives all runtime web and desktop icon assets from that generated PNG.
 """
 from __future__ import annotations
 
+import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
 
-# ---- Pillow 依赖（构建期工具，按需安装，不入 requirements.txt）----
 try:
-    from PIL import Image, ImageDraw
-except ImportError:  # pragma: no cover - 仅首次缺失时触发
-    print("[make-icons] 未检测到 Pillow，尝试 pip 安装 …")
+    from PIL import Image
+except ImportError:  # pragma: no cover - first-run convenience for local tooling
+    print("[make-icons] Pillow not found; installing build-time dependency...")
     subprocess.run([sys.executable, "-m", "pip", "install", "pillow"], check=True)
-    from PIL import Image, ImageDraw
-
-# ---- 品牌参数 ----
-BG = (11, 13, 18, 255)        # #0b0d12 —— 与 BrowserWindow.backgroundColor 一致
-CLAY = (217, 119, 87, 255)    # #D97757 —— Anthropic 暖陶土色，作圆角块底
-MASTER = 1024                 # 主画布尺寸；各目标尺寸由此 LANCZOS 下采样，保证小尺寸仍锐利
-SIZES = [16, 24, 32, 48, 64, 128, 256]
-
-BUILD_DIR = Path(__file__).resolve().parent.parent / "build"
+    from PIL import Image
 
 
-def render_master() -> "Image.Image":
-    """在 MASTER×MASTER 画布上绘制：深色底 + 圆角陶土块 + 负空间「A」字标。"""
-    img = Image.new("RGBA", (MASTER, MASTER), BG)
-    d = ImageDraw.Draw(img)
+ROOT = Path(__file__).resolve().parents[2]
+MANIFEST_PATH = ROOT / "docs" / "brand" / "logo-candidates" / "manifest.json"
+CANDIDATE_DIR = MANIFEST_PATH.parent
+WEB_BRAND_DIR = ROOT / "apps" / "web" / "public" / "brand"
+WEB_FAVICON = ROOT / "apps" / "web" / "public" / "favicon.ico"
+DESKTOP_BUILD_DIR = ROOT / "desktop" / "build"
+ICO_SIZES = [16, 24, 32, 48, 64, 128, 256]
 
-    # 圆角块（陶土底）
-    pad = 96
-    x0, y0, x1, y1 = pad, pad, MASTER - pad, MASTER - pad
-    d.rounded_rectangle([x0, y0, x1, y1], radius=180, fill=CLAY)
 
-    # 「A」字标：以底色画三笔（左腿 / 右腿 / 横梁）——两腿间三角空间自然留陶土色，读作 A。
-    stroke = 90
-    apex = (512, 266)
-    bl = (306, 758)
-    br = (722, 758)
-    # 横梁落在两腿约 70% 高度处（视觉平衡）
-    t = 0.701
-    cross_l = (apex[0] + (bl[0] - apex[0]) * t, apex[1] + (bl[1] - apex[1]) * t)
-    cross_r = (apex[0] + (br[0] - apex[0]) * t, apex[1] + (br[1] - apex[1]) * t)
+def load_manifest() -> dict:
+    if not MANIFEST_PATH.exists():
+        raise FileNotFoundError(f"Missing logo manifest: {MANIFEST_PATH}")
+    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
 
-    d.line([apex, bl], fill=BG, width=stroke)
-    d.line([apex, br], fill=BG, width=stroke)
-    d.line([cross_l, cross_r], fill=BG, width=stroke)
-    # 圆化笔触端点（apex / 两脚），避免下采样后出现生硬方头
-    r = stroke // 2
-    for cx, cy in (apex, bl, br):
-        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=BG)
 
-    return img
+def save_manifest(manifest: dict) -> None:
+    MANIFEST_PATH.write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def select_candidate(manifest: dict, candidate_id: str | None) -> dict:
+    candidates = manifest.get("candidates", [])
+    if not candidates:
+        raise ValueError("Logo manifest has no candidates.")
+
+    if candidate_id:
+        matches = [item for item in candidates if item.get("id") == candidate_id]
+        if len(matches) != 1:
+            raise ValueError(f"Unknown logo candidate: {candidate_id}")
+        manifest["selectedId"] = candidate_id
+        for item in candidates:
+            item["selected"] = item.get("id") == candidate_id
+        save_manifest(manifest)
+
+    selected_id = manifest.get("selectedId")
+    selected = [item for item in candidates if item.get("selected") is True]
+    if len(selected) != 1:
+        raise ValueError("Logo manifest must contain exactly one selected candidate.")
+    if selected[0].get("id") != selected_id:
+        raise ValueError("Logo manifest selectedId does not match selected candidate.")
+    return selected[0]
+
+
+def load_source(candidate: dict) -> Image.Image:
+    source = CANDIDATE_DIR / str(candidate.get("sourcePng", ""))
+    if not source.exists():
+        raise FileNotFoundError(f"Selected logo source is missing: {source}")
+
+    image = Image.open(source).convert("RGBA")
+    width, height = image.size
+    if width < 1024 or height < 1024:
+        raise ValueError(f"Selected logo source must be at least 1024x1024: {source}")
+
+    alpha = image.getchannel("A")
+    bbox = alpha.getbbox()
+    if bbox is None:
+        raise ValueError(f"Selected logo source appears blank: {source}")
+    opaque_pixels = sum(1 for value in alpha.getdata() if value > 32)
+    if opaque_pixels < int(width * height * 0.01):
+        raise ValueError(f"Selected logo source has too little visible artwork: {source}")
+
+    return image
+
+
+def fit_square(image: Image.Image, size: int, padding_ratio: float = 0.12) -> Image.Image:
+    alpha = image.getchannel("A")
+    bbox = alpha.getbbox()
+    if bbox is None:
+        raise ValueError("Cannot resize a blank image.")
+
+    cropped = image.crop(bbox)
+    max_art = int(size * (1 - padding_ratio * 2))
+    cropped.thumbnail((max_art, max_art), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    canvas.alpha_composite(cropped, ((size - cropped.width) // 2, (size - cropped.height) // 2))
+    return canvas
+
+
+def save_pngs(source: Image.Image) -> None:
+    WEB_BRAND_DIR.mkdir(parents=True, exist_ok=True)
+    DESKTOP_BUILD_DIR.mkdir(parents=True, exist_ok=True)
+
+    fit_square(source, 512).save(WEB_BRAND_DIR / "logo.png", format="PNG")
+    fit_square(source, 192).save(WEB_BRAND_DIR / "logo-192.png", format="PNG")
+    fit_square(source, 512).save(WEB_BRAND_DIR / "logo-512.png", format="PNG")
+    fit_square(source, 256).save(DESKTOP_BUILD_DIR / "icon.png", format="PNG")
+
+
+def save_ico(source: Image.Image) -> None:
+    icon = fit_square(source, 256)
+    icon.save(
+        WEB_FAVICON,
+        format="ICO",
+        sizes=[(size, size) for size in ICO_SIZES],
+    )
+    icon.save(
+        DESKTOP_BUILD_DIR / "icon.ico",
+        format="ICO",
+        sizes=[(size, size) for size in ICO_SIZES],
+    )
+
+
+def save_icns(source: Image.Image) -> None:
+    icns_path = DESKTOP_BUILD_DIR / "icon.icns"
+    try:
+        fit_square(source, 1024).save(icns_path, format="ICNS")
+        print(f"[make-icons] Wrote {icns_path.as_posix()}")
+    except Exception as exc:  # noqa: BLE001 - Pillow ICNS writing is platform-sensitive.
+        print(
+            "[make-icons] WARNING: Could not write icon.icns on this platform "
+            f"({exc}). Regenerate on macOS before a macOS release.",
+            file=sys.stderr,
+        )
 
 
 def main() -> int:
-    BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    master = render_master()
+    parser = argparse.ArgumentParser(description="Sync runtime logo assets.")
+    parser.add_argument(
+        "--candidate",
+        help="Optional logo candidate id to select before regenerating assets.",
+    )
+    args = parser.parse_args()
 
-    # icon.png —— 256
-    png_path = BUILD_DIR / "icon.png"
-    master.resize((256, 256), Image.LANCZOS).save(png_path, format="PNG")
-    print(f"[make-icons] ✓ 写 {png_path.name}（256×256）")
+    manifest = load_manifest()
+    candidate = select_candidate(manifest, args.candidate)
+    source = load_source(candidate)
 
-    # icon.ico —— 多分辨率（Pillow 由 256 源自动下采样各尺寸）
-    ico_path = BUILD_DIR / "icon.ico"
-    src256 = master.resize((256, 256), Image.LANCZOS)
-    src256.save(ico_path, format="ICO", sizes=[(s, s) for s in SIZES])
-    print(f"[make-icons] ✓ 写 {ico_path.name}（多分辨率 {SIZES}）")
+    save_pngs(source)
+    save_ico(source)
+    save_icns(source)
 
-    # icon.icns —— 尽力（R6/R-icns）；失败保留占位并提示 mac 重生成
-    icns_path = BUILD_DIR / "icon.icns"
-    try:
-        master.resize((512, 512), Image.LANCZOS).save(icns_path, format="ICNS")
-        print(f"[make-icons] ✓ 写 {icns_path.name}（512×512，尽力）")
-    except Exception as exc:  # noqa: BLE001 - icns 写出受限属预期，不阻断 Windows 验收
-        print(
-            f"[make-icons] ⚠ 生成 {icns_path.name} 失败（{exc}）。"
-            " 保留既有占位；mac 正式产物须在 mac 上重生成（R-icns）。"
-        )
-
-    print("[make-icons] 完成。Windows 验收用 icon.ico（win.icon 路径不变，仅换内容）。")
+    print(f"[make-icons] Selected {candidate['id']}")
+    print(f"[make-icons] Wrote {(WEB_BRAND_DIR / 'logo.png').as_posix()}")
+    print(f"[make-icons] Wrote {WEB_FAVICON.as_posix()}")
+    print(f"[make-icons] Wrote {(DESKTOP_BUILD_DIR / 'icon.png').as_posix()}")
+    print(f"[make-icons] Wrote {(DESKTOP_BUILD_DIR / 'icon.ico').as_posix()}")
     return 0
 
 
