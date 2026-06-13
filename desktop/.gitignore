@@ -4,6 +4,9 @@ dist/
 resources/web/
 resources/backend/
 
+# build:web 隔离构建副本（apps/web 源码副本 + 扁平 node_modules + .next，临时、可随时删除）
+.web-build/
+
 # PyInstaller 中间产物
 build/pyi-work/
 build/pyi-dist/

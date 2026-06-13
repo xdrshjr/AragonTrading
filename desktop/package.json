@@ -10,6 +10,7 @@
     "dev": "node scripts/dev-launch.js",
     "build:backend": "python scripts/build-backend.py",
     "build:web": "node scripts/build-web.mjs",
+    "build:web:clean": "node scripts/build-web.mjs --clean",
     "dist:only": "electron-builder",
     "dist": "run-s build:backend build:web dist:only",
     "pack": "electron-builder --dir",

@@ -36,13 +36,22 @@ cd desktop
 npm run dist        # = build:backend → build:web → electron-builder（run-s 串接）
 ```
 
+> ✅ **无需开发者模式 / 管理员特权**。`build:web` 不再原地用 pnpm 符号链接的 `node_modules` 跑 standalone，
+> 而是先在隔离副本 `.web-build/` 里做一次**扁平安装**（无符号链接的真实 `node_modules`），再 `next build`——
+> 这样 Next 的 `copyTracedFiles` 全程只复制真实文件、从不 `fs.symlink`，Windows 的符号链接特权约束（EPERM）
+> 从根上消失（方案见 `docs/plans/desktop-packaging-build-hardening/spec.md`）。
+
 三步：
 
 | 步骤 | 命令 | 产物 |
 |---|---|---|
 | `build:backend` | `python scripts/build-backend.py` | PyInstaller onedir 后端 exe → `resources/backend/`（含自检冒烟 `/api/health`） |
-| `build:web` | `node scripts/build-web.mjs` | Next standalone（构建期 `PY_BACKEND_URL=http://127.0.0.1:18760`）→ `resources/web/` + `web-server.json` |
+| `build:web` | `node scripts/build-web.mjs` | 隔离副本 `.web-build/` 扁平安装 + Next standalone（构建期 `PY_BACKEND_URL=http://127.0.0.1:18760`）→ `resources/web/` + `web-server.json` |
 | `electron-builder` | `dist:only` | `dist/` 下 Windows NSIS 安装包 + portable |
+
+> ⏱ **首次 `build:web` 较慢**：会在 `.web-build/` 做一次扁平依赖安装（探测到 pnpm 时复用本地 store、走硬链接免下载，
+> 否则 `npm install` 全量下载），并占用约数百 MB 磁盘。`.web-build/` 已 git 忽略、可随时删除（下次自重建）；
+> 二次构建复用其 `node_modules` 显著更快。需从零重装可跑 `npm run build:web:clean`。
 
 **快速冒烟**（不出安装包，只出免安装目录；**务必用 `smoke` 而非裸 `pack`**）：
 
@@ -68,7 +77,9 @@ npm run smoke       # = build:backend → build:web → electron-builder --dir
 |---|---|
 | `dev` 报「缺少 Python 虚拟环境」 | 先在仓库根 `pnpm setup` |
 | 端口被占（启动弹对话框） | `Get-NetTCPConnection -LocalPort 18760,18761 \| Select OwningProcess` 后 `Stop-Process -Id <PID> -Force` |
-| `build:web` 失败、EPERM symlink | 启用 Windows「开发人员模式」（设置 → 隐私和安全性 → 开发者选项），或以管理员运行 |
+| `build:web` 失败、EPERM symlink | 新流程已用隔离扁平构建根除此问题，正常不应再现。若仍遇到，先 `npm run build:web:clean` 强制重装隔离副本；**兜底**：启用 Windows「开发人员模式」（设置 → 隐私和安全性 → 开发者选项）或以管理员运行 |
+| `build:web` 依赖安装失败（网络/镜像） | 隔离副本 `.web-build/` 装依赖失败：检查网络/镜像；本机有 pnpm 时优先复用其 store（免下载）；可手动 `cd .web-build ; npm install --include=dev` 排查 |
+| `electron-builder` 卡在下载 `electron-v<ver>-win32-x64.zip`（EOF / 超时） | 受限网络下 GitHub / 镜像的大文件（约 111 MB）易断流。优先复用 `npm install` 已落地的本地 Electron，跳过下载：`npm run dist:only -- --config.electronDist=node_modules/electron/dist`；或设镜像后重试：`$env:ELECTRON_MIRROR='https://registry.npmmirror.com/-/binary/electron/' ; npm run dist`。此步与 EPERM 无关，纯属二进制下载网络问题 |
 | 取不到 OKX 真实数据 | 设置系统代理（README：本机 Clash `127.0.0.1:7897`），桌面会透传 `HTTP(S)_PROXY` |
 | 后端 exe 启动即崩 | 多为 PyInstaller 漏 `hiddenimports`；见 `aragon-quant.spec`，`build:backend` 末尾已自检 `/api/health` |
 
