@@ -41,12 +41,13 @@ services/quant  Python 3.11 + FastAPI：OKX 适配 / 策略引擎 / SimBroker �
 ```bash
 pnpm setup     # 建 venv + 装 Python 依赖 + pnpm install（首次）
 pnpm preflight # OKX 连通性预检（真实数据硬约束）
-pnpm dev       # 预检 → 并发起后端(:8000) + 前端(:3000)，聚合日志，Ctrl-C 双进程优雅退出
+pnpm dev       # 预检 → 端口检查 → 并发起后端(:18760) + 前端(:18761)，聚合日志，Ctrl-C 双进程优雅退出
 pnpm test      # 后端 pytest（不含 network）+ 前端 vitest
 ```
 
 > 等价底层命令：`python scripts/dev.py {setup|preflight|up|test}`（`up` 支持 `--skip-preflight`）。
-> Ctrl-C 时编排器会向前后端各发 terminate 并等待退出，避免端口残留。
+> 端口刻意选用不常用值（后端 18760 / 前端 18761），规避与常见开发端口冲突；启动前会先做端口占用预检，被占用即给出定位/释放命令而非崩在半路。
+> Ctrl-C 时编排器会向前后端各发 CTRL_BREAK（Win）/SIGTERM（POSIX）整组优雅停止，超时再强杀整棵进程树，杜绝 `uvicorn --reload` 子进程残留占端口。
 
 ### 真实数据端到端校验（F2）
 
@@ -75,12 +76,12 @@ cd services/quant && .venv\Scripts\python -m pytest -m network
 ### 容器化一键运行（F5）
 
 ```bash
-docker compose up --build      # 拉起 web:3000 + quant:8000
+docker compose up --build      # 拉起 web:18761 + quant:18760
 docker compose down            # 停止并清理
-# 浏览器打开 http://localhost:3000 ；后端健康检查 http://localhost:8000/api/health
+# 浏览器打开 http://localhost:18761 ；后端健康检查 http://localhost:18760/api/health
 ```
 
-> **真实数据硬约束**：容器内**仍需能连通 OKX**（compose 透传 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`），否则按硬约束**显式报错、绝不以假数据兜底**。`NEXT_PUBLIC_PY_WS_URL` 默认 `ws://localhost:8000`（**仅同机浏览器**有效；远程部署须改为宿主可达地址并作为 build-arg 传入）。SQLite 数据持久化在命名卷 `aragon-db`。
+> **真实数据硬约束**：容器内**仍需能连通 OKX**（compose 透传 `HTTP_PROXY/HTTPS_PROXY/ALL_PROXY`），否则按硬约束**显式报错、绝不以假数据兜底**。`NEXT_PUBLIC_PY_WS_URL` 默认 `ws://localhost:18760`（**仅同机浏览器**有效；远程部署须改为宿主可达地址并作为 build-arg 传入）。SQLite 数据持久化在命名卷 `aragon-db`。
 >
 > CI（`.github/workflows/ci.yml`）在 push / PR 上跑**后端 pytest（不含 network）+ 前端 tsc / vitest / build**；CI 只跑离线用例，真实数据校验仍以 `scripts/smoke_e2e.py` / `pytest -m network` 为准。
 
@@ -96,31 +97,31 @@ python -m venv .venv
 
 > 预检失败请先解决网络/代理，再继续。系统**严禁**在 OKX 不可达时以随机/mock 数据冒充真实行情——届时前端会显示明确的「无法连接 OKX」错误态。
 
-### 1) 启动 Python 后端（端口 8000）
+### 1) 启动 Python 后端（端口 18760）
 
 ```bash
 cd services/quant
 # Windows（中文日志需 UTF-8）
 set PYTHONUTF8=1
-.venv\Scripts\uvicorn app.main:app --port 8000 --reload
-# 健康检查： http://localhost:8000/api/health  -> {"status":"ok","okx":"up"}
-# OpenAPI 文档： http://localhost:8000/docs
+.venv\Scripts\uvicorn app.main:app --port 18760 --reload
+# 健康检查： http://localhost:18760/api/health  -> {"status":"ok","okx":"up"}
+# OpenAPI 文档： http://localhost:18760/docs
 ```
 
-### 2) 启动前端（端口 3000）
+### 2) 启动前端（端口 18761）
 
 ```bash
 cd apps/web
 pnpm install
 pnpm dev
-# 打开 http://localhost:3000
+# 打开 http://localhost:18761
 ```
 
 ## 环境变量
 
 复制根目录 `.env.example` 后按需填写：
 
-- 前端 `apps/web/.env.local`：`PY_BACKEND_URL`（默认 `http://localhost:8000`）、`NEXT_PUBLIC_PY_WS_URL`（默认 `ws://localhost:8000`）。
+- 前端 `apps/web/.env.local`：`PY_BACKEND_URL`（默认 `http://localhost:18760`）、`NEXT_PUBLIC_PY_WS_URL`（默认 `ws://localhost:18760`）。
 - 后端 `services/quant/.env`：`HTTP_PROXY/HTTPS_PROXY`、`DB_PATH`、`DEFAULT_INST/BAR`、`INITIAL_CAPITAL`、`MAX_PAPER_SESSIONS`、`ALLOW_CACHED_FALLBACK` 等。
 
 > **安全**：本期仅用 OKX 公共行情，**不需要** API 密钥。切勿把任何真实密钥写入仓库；若密钥曾明文出现，请视为已泄露并轮换。`.env` 已被 `.gitignore` 排除。
@@ -147,6 +148,22 @@ cd apps/web && pnpm test
 | GET | `/api/runs/{id}/trades` · `/equity` | 成交明细 / 净值曲线 |
 | POST | `/api/paper/start` · `/api/paper/{sid}/stop` | 实时模拟会话 |
 | WS | `/api/ws/market` · `/api/ws/paper/{sid}` | 实时 K 线 / 模拟事件流 |
+
+## 桌面端（Electron）
+
+可把整套 Web 应用封装成**双击即用**的桌面应用（自带 Python 后端可执行体 + Next 服务，目标机无需预装
+Node / Python / pnpm）。全部产物集中在 `desktop/`，对 `apps/web` / `services/quant` **零源码改动**。
+
+```powershell
+pnpm setup                 # 前置：建 venv + 装依赖（仓库根，一次性）
+cd desktop ; npm install
+npm run dev                # 拉起 Electron 桌面调试窗口（自动起后端+前端+DevTools），而非浏览器
+npm run smoke              # 快速打包冒烟（免安装目录，先 build 再 --dir）
+npm run dist               # 全量打包 → desktop/dist/（Windows NSIS 安装包 + portable）
+```
+
+> 详见 `desktop/README.md`；设计文档 `docs/plans/desktop-electron-packaging/spec.md`（v2）。
+> Windows 为一等公民；PyInstaller 不能交叉编译，mac/linux 需各自平台构建。真实数据硬约束不变。
 
 ## 免责声明
 

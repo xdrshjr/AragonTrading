@@ -34,3 +34,10 @@ Thumbs.db
 # --- Editor ---
 .vscode/
 .idea/
+
+# --- Desktop (Electron) build artifacts ---
+desktop/dist/
+desktop/resources/web/
+desktop/resources/backend/
+desktop/build/pyi-work/
+desktop/build/pyi-dist/

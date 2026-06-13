@@ -1,0 +1,55 @@
+# electron-builder 打包配置 (spec §4.6 ③ / §5)。
+# 把 desktop/src/** 装进 asar，把 desktop/resources/{backend,web}（构建产物）作为 extraResources
+# 落到 resourcesPath 下。Windows 一等公民（nsis + portable）；mac/linux 配置位齐备但需各自平台构建（R12）。
+appId: com.aragon.trading
+productName: Aragon Trading
+copyright: Copyright © 2026 Aragon Trading
+
+directories:
+  output: dist
+  buildResources: build
+
+# 进 asar 的应用代码（主进程 + preload + loading.html）。资源密集型产物走 extraResources。
+files:
+  - "src/**/*"
+  - "package.json"
+
+asar: true
+
+# 构建产物（PyInstaller 后端 onedir + Next standalone）→ resourcesPath/{backend,web}
+# 注意：必须先 build:backend + build:web 生成它们；裸 pack 缺这俩会报缺 from（P1-6，故冒烟走 npm run smoke）。
+extraResources:
+  - from: "resources/backend"
+    to: "backend"
+  - from: "resources/web"
+    to: "web"
+
+win:
+  target:
+    - nsis
+    - portable
+  icon: build/icon.ico
+  artifactName: "${productName}-${version}-${arch}.${ext}"
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  allowElevation: true
+  deleteAppDataOnUninstall: false
+
+# ↓ 占位：本轮不出 mac/linux 正式产物（PyInstaller 不能交叉编译，需对应平台构建，Non-Goal / R12）。
+mac:
+  target:
+    - dmg
+  icon: build/icon.icns
+  category: public.app-category.finance
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+
+linux:
+  target:
+    - AppImage
+  icon: build/icon.png
+  category: Office

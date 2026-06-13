@@ -14,7 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-EXPOSE 8000
+EXPOSE 18760
 
 # 容器内仍需能连通 OKX（透传代理），否则按硬约束显式报错、绝不假数据（R5）。
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "18760"]

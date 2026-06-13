@@ -1,7 +1,7 @@
 // WebSocket 客户端（market + paper），自动重连 (spec §8.2 / §9.2)。
 // 浏览器直连 Python WS：NEXT_PUBLIC_PY_WS_URL + /api/ws/*。
 
-const WS_BASE = process.env.NEXT_PUBLIC_PY_WS_URL || "ws://localhost:8000";
+const WS_BASE = process.env.NEXT_PUBLIC_PY_WS_URL || "ws://localhost:18760";
 
 export type WsEvent = { type: string; data: any };
 

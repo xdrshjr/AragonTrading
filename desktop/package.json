@@ -1,0 +1,34 @@
+{
+  "name": "aragon-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Aragon Trading — Electron 桌面外壳与打包流水线（dev 调试窗口 + 生产安装包）",
+  "main": "src/main.js",
+  "author": "Aragon Trading",
+  "license": "UNLICENSED",
+  "scripts": {
+    "dev": "node scripts/dev-launch.js",
+    "build:backend": "python scripts/build-backend.py",
+    "build:web": "node scripts/build-web.mjs",
+    "dist:only": "electron-builder",
+    "dist": "run-s build:backend build:web dist:only",
+    "pack": "electron-builder --dir",
+    "smoke": "run-s build:backend build:web pack",
+    "check": "run-s check:*",
+    "check:main": "node --check src/main.js",
+    "check:devlaunch": "node --check scripts/dev-launch.js",
+    "check:preload": "node --check src/preload.js",
+    "check:config": "node --check src/lib/config.js",
+    "check:paths": "node --check src/lib/paths.js",
+    "check:pm": "node --check src/lib/process-manager.js",
+    "check:buildweb": "node --check scripts/build-web.mjs"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "electron": "^31.0.0",
+    "electron-builder": "^25.0.0",
+    "fs-extra": "^11.2.0",
+    "npm-run-all": "^4.1.5"
+  }
+}

@@ -7,6 +7,8 @@
     "setup": "python scripts/dev.py setup",
     "preflight": "python scripts/dev.py preflight",
     "dev": "python scripts/dev.py up",
-    "test": "python scripts/dev.py test"
+    "test": "python scripts/dev.py test",
+    "desktop:dev": "npm --prefix desktop run dev",
+    "desktop:dist": "npm --prefix desktop run dist"
   }
 }

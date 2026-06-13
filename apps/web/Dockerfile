@@ -10,7 +10,7 @@ WORKDIR /app
 RUN npm install -g pnpm@9
 
 # NEXT_PUBLIC_* 在 build 期 baked 进前端 bundle；用"浏览器可达"地址（compose 注入，R5）
-ARG NEXT_PUBLIC_PY_WS_URL=ws://localhost:8000
+ARG NEXT_PUBLIC_PY_WS_URL=ws://localhost:18760
 ENV NEXT_PUBLIC_PY_WS_URL=$NEXT_PUBLIC_PY_WS_URL
 # Linux 容器内符号链接可用，开启 standalone 产物（Windows 本机经 env 关闭以避 EPERM，spec §11 D2）
 ENV NEXT_OUTPUT_STANDALONE=1
@@ -26,12 +26,12 @@ RUN pnpm build
 FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
-ENV PORT=3000
+ENV PORT=18761
 # PY_BACKEND_URL 由 compose 注入（Next 服务端 rewrite 代理目标，默认见 next.config.mjs）
 
 # standalone 自带最小化 node_modules 与扁平 server.js；再补 .next/static（无 public 目录）
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 
-EXPOSE 3000
+EXPOSE 18761
 CMD ["node", "server.js"]

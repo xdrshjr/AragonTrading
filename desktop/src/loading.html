@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'" />
+    <title>Aragon Trading</title>
+    <style>
+      :root {
+        --bg: #0b0d12;
+        --panel: #12151c;
+        --ink: #e8e6e1;
+        --muted: #8b8a86;
+        --accent: #cc785c; /* Anthropic clay */
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+        -webkit-user-select: none;
+        user-select: none;
+        overflow: hidden;
+      }
+      .wrap {
+        height: 100%;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 22px;
+      }
+      .mark {
+        width: 56px;
+        height: 56px;
+        border-radius: 14px;
+        background: linear-gradient(135deg, var(--accent), #a85c45);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 30px;
+        font-weight: 700;
+        color: #1a120e;
+        box-shadow: 0 10px 30px rgba(204, 120, 92, 0.25);
+      }
+      .title { font-size: 18px; font-weight: 600; letter-spacing: 0.3px; }
+      .sub { font-size: 13px; color: var(--muted); }
+      .spinner {
+        width: 26px;
+        height: 26px;
+        border: 3px solid rgba(232, 230, 225, 0.15);
+        border-top-color: var(--accent);
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="mark">A</div>
+      <div class="title">Aragon Trading</div>
+      <div class="spinner"></div>
+      <div class="sub">正在启动 Aragon 引擎…（首次启动需编译/解压，请稍候）</div>
+    </div>
+  </body>
+</html>

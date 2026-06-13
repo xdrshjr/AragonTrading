@@ -1,0 +1,13 @@
+# Electron 桌面端构建产物（不入库）
+node_modules/
+dist/
+resources/web/
+resources/backend/
+
+# PyInstaller 中间产物
+build/pyi-work/
+build/pyi-dist/
+*.spec.bak
+
+# 日志
+*.log
