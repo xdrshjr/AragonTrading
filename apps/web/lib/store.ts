@@ -5,6 +5,9 @@ import { createJSONStorage, persist } from "zustand/middleware";
 import type { Bar, Mode } from "./types";
 
 type Theme = "light" | "dark";
+const DEFAULT_RANGE_DAYS = 30;
+const defaultEndTs = Math.floor(Date.now() / 1000);
+const defaultStartTs = defaultEndTs - DEFAULT_RANGE_DAYS * 24 * 60 * 60;
 
 interface AppState {
   instId: string;
@@ -14,6 +17,8 @@ interface AppState {
   mode: Mode;
   paperSessionId: string | null;
   theme: Theme;
+  backtestStartTs: number;
+  backtestEndTs: number;
 
   setInst: (instId: string) => void;
   setBar: (bar: Bar) => void;
@@ -21,6 +26,7 @@ interface AppState {
   setRunId: (id: number | null) => void;
   setMode: (mode: Mode) => void;
   setPaperSessionId: (id: string | null) => void;
+  setBacktestRange: (startTs: number, endTs: number) => void;
   toggleTheme: () => void;
   setTheme: (t: Theme) => void;
 }
@@ -35,6 +41,8 @@ export const useAppStore = create<AppState>()(
       mode: "backtest",
       paperSessionId: null,
       theme: "light",
+      backtestStartTs: defaultStartTs,
+      backtestEndTs: defaultEndTs,
 
       setInst: (instId) => set({ instId, runId: null }),
       setBar: (bar) => set({ bar, runId: null }),
@@ -42,6 +50,8 @@ export const useAppStore = create<AppState>()(
       setRunId: (runId) => set({ runId }),
       setMode: (mode) => set({ mode }),
       setPaperSessionId: (paperSessionId) => set({ paperSessionId }),
+      setBacktestRange: (backtestStartTs, backtestEndTs) =>
+        set({ backtestStartTs, backtestEndTs, runId: null }),
       toggleTheme: () =>
         set((s) => {
           const theme = s.theme === "light" ? "dark" : "light";
@@ -68,6 +78,8 @@ export const useAppStore = create<AppState>()(
         strategyId: s.strategyId,
         mode: s.mode,
         theme: s.theme,
+        backtestStartTs: s.backtestStartTs,
+        backtestEndTs: s.backtestEndTs,
       }),
       // SSR / 水合安全（C2）：先以默认 state 渲染（与服务端 HTML 一致 → 无 hydration 告警），
       // 由根客户端组件挂载后显式 useAppStore.persist.rehydrate() 补水（接受"默认→恢复"一帧闪烁）。

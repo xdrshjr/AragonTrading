@@ -19,7 +19,8 @@ const COLUMNS: { key: SortKey; label: string }[] = [
 
 export default function CompareView() {
   const qc = useQueryClient();
-  const { instId, bar, setRunId, setMode, setStrategyId } = useAppStore();
+  const { instId, bar, backtestStartTs, backtestEndTs, setRunId, setMode, setStrategyId } =
+    useAppStore();
   const { data: strategies } = useQuery({ queryKey: ["strategies"], queryFn: api.strategies });
 
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -34,11 +35,19 @@ export default function CompareView() {
   }, [strategies]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // 对比结果写入共享缓存（page.tsx 据此叠加 overlays），与本组件配色一致
-  const result = qc.getQueryData<CompareResult>(["compare", instId, bar]);
+  const compareKey = ["compare", instId, bar, backtestStartTs, backtestEndTs];
+  const result = qc.getQueryData<CompareResult>(compareKey);
   const compare = useMutation({
     mutationFn: () =>
-      api.compare({ strategyIds: Array.from(selected), instId, bar, limit: 500 }),
-    onSuccess: (data) => qc.setQueryData(["compare", instId, bar], data),
+      api.compare({
+        strategyIds: Array.from(selected),
+        instId,
+        bar,
+        limit: 1000,
+        startTs: backtestStartTs,
+        endTs: backtestEndTs,
+      }),
+    onSuccess: (data) => qc.setQueryData(compareKey, data),
   });
 
   const toggle = (id: number) =>

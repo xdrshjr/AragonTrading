@@ -16,7 +16,17 @@ import { marketWS, paperWS, type WsEvent } from "@/lib/ws";
 const CandleChart = dynamic(() => import("@/components/Chart/CandleChart"), { ssr: false });
 
 export default function Page() {
-  const { instId, bar, mode, runId, paperSessionId, theme, toggleTheme } = useAppStore();
+  const {
+    instId,
+    bar,
+    mode,
+    runId,
+    paperSessionId,
+    theme,
+    backtestStartTs,
+    backtestEndTs,
+    toggleTheme,
+  } = useAppStore();
 
   const [older, setOlder] = useState<Candle[]>([]);
   const [live, setLive] = useState<Candle[]>([]);
@@ -34,9 +44,25 @@ export default function Page() {
   const latencyMs = health.data?.okxLatencyMs ?? null;
   const lastOkTs = health.data?.lastOkTs ?? null;
 
+  const runQ = useQuery({
+    queryKey: ["run", runId],
+    queryFn: () => api.run(runId as number),
+    enabled: !!runId && mode === "backtest",
+  });
+  const runRange = useMemo(() => {
+    const run = runQ.data;
+    if (mode !== "backtest" || !run || run.endTs == null) return null;
+    return { instId: run.instId, bar: run.bar, startTs: run.startTs, endTs: run.endTs };
+  }, [mode, runQ.data]);
+  const chartRange = useMemo(() => {
+    if (runRange) return runRange;
+    if (mode !== "compare") return null;
+    return { instId, bar, startTs: backtestStartTs, endTs: backtestEndTs };
+  }, [runRange, mode, instId, bar, backtestStartTs, backtestEndTs]);
+
   // 对比结果（由右侧 CompareView 写入共享缓存，F3）→ 映射为左图归一化净值叠加
   const compareQ = useQuery<CompareResult | null>({
-    queryKey: ["compare", instId, bar],
+    queryKey: ["compare", instId, bar, backtestStartTs, backtestEndTs],
     queryFn: () => null, // 占位：实际数据由 CompareView 通过 setQueryData 写入，本查询不主动请求
     enabled: false,
     initialData: null,
@@ -53,11 +79,25 @@ export default function Page() {
 
   // 真实历史 K 线（带数据来源 meta，F2）：读 X-Aragon-Data-Source 头判断 live / cache
   const candlesQ = useQuery({
-    queryKey: ["candles", instId, bar],
-    queryFn: () => api.candlesWithMeta(instId, bar, 300),
+    queryKey: [
+      "candles",
+      chartRange?.instId ?? instId,
+      chartRange?.bar ?? bar,
+      chartRange?.startTs,
+      chartRange?.endTs,
+    ],
+    queryFn: () =>
+      chartRange
+        ? api.candlesWithMeta(chartRange.instId, chartRange.bar, 1000, chartRange.endTs, chartRange.startTs)
+        : api.candlesWithMeta(instId, bar, 300),
+    enabled: mode !== "backtest" || !runId || !!chartRange,
     retry: 0,
   });
-  const baseCandles = candlesQ.data?.candles;
+  const baseCandles = useMemo(() => {
+    const rows = candlesQ.data?.candles;
+    if (!rows || !chartRange) return rows;
+    return rows.filter((c) => chartRange.startTs <= c.ts && c.ts <= chartRange.endTs);
+  }, [candlesQ.data?.candles, chartRange]);
   // 主视图新鲜度：以一次性历史拉取的来源为准（query 重取时回落 live，天然覆盖切标的/周期重置，C5/C9）
   const dataSource = candlesQ.data?.source ?? "live";
 
@@ -67,15 +107,16 @@ export default function Page() {
     setLive([]);
     setForming(null);
     setLastPrice(null);
-  }, [instId, bar]);
+  }, [instId, bar, chartRange?.startTs, chartRange?.endTs]);
 
   const candles = useMemo(
-    () => mergeCandles(older, baseCandles ?? [], live, forming),
-    [older, baseCandles, live, forming],
+    () => (chartRange ? baseCandles ?? [] : mergeCandles(older, baseCandles ?? [], live, forming)),
+    [older, baseCandles, live, forming, chartRange],
   );
 
   const loadMore = async (beforeTs: number) => {
     if (loadingMore.current) return;
+    if (chartRange) return;
     loadingMore.current = true;
     try {
       const more = await api.candles(instId, bar, 300, beforeTs);
@@ -121,7 +162,7 @@ export default function Page() {
   // F1：默认（回测 / 对比）视图接通真实 OKX 实时行情——让最右一根 K 线随真实成交跳动。
   // 仅非 paper 模式生效（paper 自己走 paperWS，避免双订阅，R3）；OKX 已判不可达则不连（省无意义重连）。
   useEffect(() => {
-    if (mode === "paper" || okxUp === false) return;
+    if (mode === "paper" || okxUp === false || chartRange) return;
     const ws = marketWS(
       instId,
       bar,
@@ -144,7 +185,7 @@ export default function Page() {
       ws.close();
       setLiveWsOpen(false);
     };
-  }, [mode, instId, bar, okxUp]);
+  }, [mode, instId, bar, okxUp, chartRange]);
 
   // compare 模式不画单策略净值 / markers（改用多条归一化 overlays，C1）
   const overlayEquity =
@@ -191,8 +232,8 @@ export default function Page() {
               okxUp={okxUp}
               latencyMs={latencyMs}
               lastOkTs={lastOkTs}
-              liveWsOpen={mode !== "paper" ? liveWsOpen : undefined}
-              lastPrice={mode !== "paper" ? lastPrice : undefined}
+              liveWsOpen={mode !== "paper" && !chartRange ? liveWsOpen : undefined}
+              lastPrice={mode !== "paper" && !chartRange ? lastPrice : undefined}
               onJumpDate={setJumpToTs}
             />
           </div>
@@ -209,7 +250,7 @@ export default function Page() {
               trades={overlayTrades}
               overlays={overlays}
               theme={theme}
-              loading={candlesQ.isFetching && candles.length === 0}
+              loading={(runQ.isFetching || candlesQ.isFetching) && candles.length === 0}
               error={chartError}
               onLoadMore={loadMore}
               jumpToTs={jumpToTs}

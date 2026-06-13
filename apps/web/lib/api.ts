@@ -62,9 +62,10 @@ export const api = {
   instruments: (instType = "SWAP") =>
     request<Instrument[]>(`/instruments?instType=${encodeURIComponent(instType)}`),
 
-  candles: (instId: string, bar: string, limit = 300, before?: number) => {
+  candles: (instId: string, bar: string, limit = 300, before?: number, after?: number) => {
     const params = new URLSearchParams({ instId, bar, limit: String(limit) });
     if (before) params.set("before", String(before));
+    if (after) params.set("after", String(after));
     return request<Candle[]>(`/candles?${params.toString()}`);
   },
 
@@ -75,9 +76,11 @@ export const api = {
     bar: string,
     limit = 300,
     before?: number,
+    after?: number,
   ): Promise<{ candles: Candle[]; source: DataSource }> => {
     const params = new URLSearchParams({ instId, bar, limit: String(limit) });
     if (before) params.set("before", String(before));
+    if (after) params.set("after", String(after));
     const { data, res } = await rawRequest<Candle[]>(`/candles?${params.toString()}`);
     const source: DataSource = res.headers.get("X-Aragon-Data-Source") === "cache" ? "cache" : "live";
     return { candles: data, source };
@@ -99,9 +102,12 @@ export const api = {
       instId: string;
       bar: string;
       limit?: number;
+      startTs: number;
+      endTs: number;
       initialCapital?: number;
       fees?: number;
       slippage?: number;
+      leverage?: number;
     },
   ) =>
     request<{ runId: number; metrics: Metrics }>(`/strategies/${id}/backtest`, {
@@ -115,6 +121,8 @@ export const api = {
     instId: string;
     bar: string;
     limit?: number;
+    startTs: number;
+    endTs: number;
     initialCapital?: number;
     fees?: number;
     slippage?: number;

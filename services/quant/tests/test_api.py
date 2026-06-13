@@ -9,12 +9,21 @@ from tests.conftest import make_synthetic_candles
 
 
 class _FakeRest:
+    def __init__(self):
+        self.calls = []
+
     async def health(self) -> bool:
         return True
 
     async def get_candles(self, inst_id, bar, limit=300, before=None, after=None):
-        rows = make_synthetic_candles(min(limit, 300))
-        return [Candle(ts=r["ts"], o=r["o"], h=r["h"], l=r["l"], c=r["c"], vol=r["vol"]) for r in rows]
+        self.calls.append({"inst_id": inst_id, "bar": bar, "limit": limit,
+                           "before": before, "after": after})
+        rows = make_synthetic_candles(min(limit, 300), start_ts=1_700_000_000, step=3600)
+        candles = [
+            Candle(ts=r["ts"], o=r["o"], h=r["h"], l=r["l"], c=r["c"], vol=r["vol"])
+            for r in rows
+        ]
+        return candles
 
     async def get_instruments(self, inst_type="SWAP"):
         return [Instrument(instId="BTC-USDT-SWAP", instType="SWAP", base="BTC", quote="USDT")]
@@ -52,7 +61,9 @@ async def test_full_api_flow(patch_okx):
 
             # 触发回测
             r = await client.post(f"/api/strategies/{sid}/backtest",
-                                  json={"instId": "BTC-USDT-SWAP", "bar": "1H", "limit": 200})
+                                  json={"instId": "BTC-USDT-SWAP", "bar": "1H", "limit": 200,
+                                        "startTs": 1_700_000_000,
+                                        "endTs": 1_700_000_000 + 100 * 3600})
             assert r.status_code == 200, r.text
             body = r.json()
             run_id = body["runId"]
@@ -75,6 +86,60 @@ async def test_full_api_flow(patch_okx):
             new_id = r.json()["id"]
             r = await client.delete(f"/api/strategies/{new_id}")
             assert r.status_code == 204
+    finally:
+        await dispose_engine()
+
+
+async def test_backtest_uses_requested_time_range(patch_okx):
+    from app.db.session import dispose_engine, init_db
+    await init_db()
+    transport = ASGITransport(app=_load_app())
+    start_ts = 1_700_000_000 + 20 * 3600
+    end_ts = 1_700_000_000 + 80 * 3600
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            sid = [s for s in (await client.get("/api/strategies")).json() if s["builtin"]][0]["id"]
+            r = await client.post(f"/api/strategies/{sid}/backtest", json={
+                "instId": "BTC-USDT-SWAP",
+                "bar": "1H",
+                "limit": 200,
+                "startTs": start_ts,
+                "endTs": end_ts,
+            })
+            assert r.status_code == 200, r.text
+            assert patch_okx.calls[-1] == {
+                "inst_id": "BTC-USDT-SWAP",
+                "bar": "1H",
+                "limit": 200,
+                "before": end_ts,
+                "after": start_ts,
+            }
+            run = (await client.get(f"/api/runs/{r.json()['runId']}")).json()
+            equity = (await client.get(f"/api/runs/{r.json()['runId']}/equity")).json()
+            assert run["startTs"] == start_ts
+            assert run["endTs"] == end_ts
+            assert equity[0]["ts"] == start_ts
+            assert equity[-1]["ts"] == end_ts
+            assert all(start_ts <= point["ts"] <= end_ts for point in equity)
+    finally:
+        await dispose_engine()
+
+
+async def test_backtest_rejects_empty_requested_range(patch_okx):
+    from app.db.session import dispose_engine, init_db
+    await init_db()
+    transport = ASGITransport(app=_load_app())
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            sid = [s for s in (await client.get("/api/strategies")).json() if s["builtin"]][0]["id"]
+            r = await client.post(f"/api/strategies/{sid}/backtest", json={
+                "instId": "BTC-USDT-SWAP",
+                "bar": "1H",
+                "limit": 200,
+                "startTs": 1_800_000_000,
+                "endTs": 1_800_003_600,
+            })
+            assert r.status_code == 400
     finally:
         await dispose_engine()
 

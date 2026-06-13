@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .db.models import EquityPoint, StrategyRun, Trade
 from .engine.metrics import _empty_metrics
@@ -26,10 +26,18 @@ class BacktestReq(BaseModel):
     instId: str
     bar: str = "1H"
     limit: int = Field(default=500, ge=10, le=1000)   # 同步回测上限 (C12)
+    startTs: int = Field(ge=0)
+    endTs: int = Field(ge=0)
     initialCapital: float | None = None
     fees: float | None = None        # taker_fee_bps
     slippage: float | None = None    # slippage_bps
     leverage: float | None = None
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "BacktestReq":
+        if self.startTs >= self.endTs:
+            raise ValueError("startTs must be less than endTs")
+        return self
 
 
 class CompareReq(BaseModel):
@@ -38,10 +46,18 @@ class CompareReq(BaseModel):
     instId: str
     bar: str = "1H"
     limit: int = Field(default=500, ge=10, le=1000)   # 对齐 BacktestReq (C9)
+    startTs: int = Field(ge=0)
+    endTs: int = Field(ge=0)
     initialCapital: float | None = None
     fees: float | None = None        # taker_fee_bps
     slippage: float | None = None    # slippage_bps
     leverage: float | None = None
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "CompareReq":
+        if self.startTs >= self.endTs:
+            raise ValueError("startTs must be less than endTs")
+        return self
 
 
 class PaperStartReq(BaseModel):

@@ -5,7 +5,7 @@ import { useState } from "react";
 import { api } from "@/lib/api";
 import { fmtPct, fmtTime } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
-import type { Run } from "@/lib/types";
+import type { Bar, Run } from "@/lib/types";
 import { Badge } from "@/components/ui";
 
 // mode 过滤：对比会一次落多行 backtest run，按来源过滤避免淹没历史（C8）
@@ -18,7 +18,7 @@ const MODE_FILTERS: { key: string; label: string }[] = [
 const MODE_LABEL: Record<string, string> = { backtest: "回测", paper: "模拟" };
 
 export default function RunHistory() {
-  const { setRunId, setMode, setStrategyId } = useAppStore();
+  const { setInst, setBar, setRunId, setMode, setStrategyId } = useAppStore();
   const [modeFilter, setModeFilter] = useState("");
 
   const { data: runs, isLoading } = useQuery({
@@ -28,6 +28,8 @@ export default function RunHistory() {
   });
 
   const open = (r: Run) => {
+    setInst(r.instId);
+    setBar(r.bar as Bar);
     setStrategyId(r.strategyId);
     setRunId(r.id);
     setMode("backtest");

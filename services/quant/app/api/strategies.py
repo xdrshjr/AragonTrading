@@ -11,11 +11,29 @@ from ..config import get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
 from ..engine.backtester import run_backtest
+from ..okx.types import Candle
 from ..okx.rest_client import get_rest_client
 from ..schemas import BacktestReq, CompareReq, CreateStrategyReq, UpdateStrategyReq, equity_out
 from ..strategies.base import get_strategy_class
 
 router = APIRouter(tags=["strategies"])
+
+
+def _filter_backtest_candles(candles: list[Candle], start_ts: int, end_ts: int) -> list[Candle]:
+    return [
+        c for c in candles
+        if start_ts <= c.ts <= end_ts and getattr(c, "confirm", True)
+    ]
+
+
+async def _load_backtest_candles(body: BacktestReq | CompareReq) -> list[Candle]:
+    candles = await get_rest_client().get_candles(
+        body.instId, body.bar, body.limit, before=body.endTs, after=body.startTs,
+    )
+    filtered = _filter_backtest_candles(candles, body.startTs, body.endTs)
+    if not filtered:
+        raise HTTPException(400, detail={"code": "EMPTY_RANGE", "message": "No confirmed candles in requested range"})
+    return filtered
 
 
 @router.get("/strategies")
@@ -84,13 +102,14 @@ async def backtest(strategy_id: int, body: BacktestReq,
     leverage = body.leverage if body.leverage is not None else settings.default_leverage
 
     # 取真实 K 线（OKX 不可达直接抛 OKXError -> 5xx 显式错误，C1）
-    candles = await get_rest_client().get_candles(body.instId, body.bar, body.limit)
+    candles = await _load_backtest_candles(body)
     await repo.upsert_candles(session, body.instId, body.bar, candles)
 
     run = await repo.create_run(
         session, strategy_id=strategy_id, inst_id=body.instId, bar=body.bar, mode="backtest",
         config={"initialCapital": initial_capital, "fees": fees, "slippage": slippage,
-                "leverage": leverage, "limit": body.limit},
+                "leverage": leverage, "limit": body.limit, "startTs": body.startTs,
+                "endTs": body.endTs, "effectiveCandleCount": len(candles)},
     )
 
     # 回测纯计算放线程池，避免阻塞事件循环 (R9 / C12)
@@ -125,7 +144,7 @@ async def compare_strategies(body: CompareReq,
     leverage = body.leverage if body.leverage is not None else settings.default_leverage
 
     # 候选 candles 只取一次（复用于全部策略，避免 N× OKX 调用触发限频，R1）
-    candles = await get_rest_client().get_candles(body.instId, body.bar, body.limit)
+    candles = await _load_backtest_candles(body)
     await repo.upsert_candles(session, body.instId, body.bar, candles)
 
     items: list[dict] = []
@@ -145,7 +164,8 @@ async def compare_strategies(body: CompareReq,
         run = await repo.create_run(
             session, strategy_id=sid, inst_id=body.instId, bar=body.bar, mode="backtest",
             config={"initialCapital": initial_capital, "fees": fees, "slippage": slippage,
-                    "leverage": leverage, "limit": body.limit},
+                    "leverage": leverage, "limit": body.limit, "startTs": body.startTs,
+                    "endTs": body.endTs, "effectiveCandleCount": len(candles)},
         )
         result = await run_in_threadpool(
             run_backtest, strategy, candles, body.bar,

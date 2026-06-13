@@ -19,8 +19,19 @@ type PaperOpts = { source?: "live" | "replay"; speed?: number; replayBars?: numb
 
 export default function StrategyPanel() {
   const qc = useQueryClient();
-  const { instId, bar, mode, strategyId, runId, paperSessionId, setStrategyId, setRunId, setPaperSessionId } =
-    useAppStore();
+  const {
+    instId,
+    bar,
+    mode,
+    strategyId,
+    runId,
+    paperSessionId,
+    backtestStartTs,
+    backtestEndTs,
+    setStrategyId,
+    setRunId,
+    setPaperSessionId,
+  } = useAppStore();
 
   const [metrics, setMetrics] = useState<Metrics | undefined>();
   const [returnsById, setReturnsById] = useState<Record<number, number | undefined>>({});
@@ -46,7 +57,7 @@ export default function StrategyPanel() {
 
   const backtest = useMutation({
     mutationFn: (vars: { id: number; params?: Params }) =>
-      runBacktest(vars.id, vars.params, instId, bar),
+      runBacktest(vars.id, vars.params, instId, bar, backtestStartTs, backtestEndTs),
     onSuccess: (data, vars) => {
       setRunId(data.runId);
       setMetrics(data.metrics);
@@ -57,12 +68,12 @@ export default function StrategyPanel() {
   // 选择策略 / 切换标的周期 → 自动回测（acceptance #3）
   useEffect(() => {
     if (mode !== "backtest" || !strategyId || !strategies) return;
-    const key = `${strategyId}|${instId}|${bar}`;
+    const key = `${strategyId}|${instId}|${bar}|${backtestStartTs}|${backtestEndTs}`;
     if (lastAutoKey.current === key) return;
     lastAutoKey.current = key;
     backtest.mutate({ id: strategyId });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [strategyId, instId, bar, mode, strategies]);
+  }, [strategyId, instId, bar, mode, strategies, backtestStartTs, backtestEndTs]);
 
   // 成交明细（回测拉一次；实时模拟轮询）
   const { data: trades } = useQuery({
@@ -220,11 +231,18 @@ export default function StrategyPanel() {
   );
 }
 
-async function runBacktest(id: number, params: Params | undefined, instId: string, bar: string) {
+async function runBacktest(
+  id: number,
+  params: Params | undefined,
+  instId: string,
+  bar: string,
+  startTs: number,
+  endTs: number,
+) {
   if (params) {
     await api.updateStrategy(id, { params });
   }
-  return api.backtest(id, { instId, bar, limit: 500 });
+  return api.backtest(id, { instId, bar, limit: 1000, startTs, endTs });
 }
 
 async function applyThenStartPaper(

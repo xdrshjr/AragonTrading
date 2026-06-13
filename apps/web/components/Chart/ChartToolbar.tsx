@@ -30,7 +30,17 @@ export default function ChartToolbar({
   lastPrice?: number | null; // F1：实时最新价
   onJumpDate: (tsSeconds: number) => void;
 }) {
-  const { instId, bar, mode, setInst, setBar, setMode } = useAppStore();
+  const {
+    instId,
+    bar,
+    mode,
+    backtestStartTs,
+    backtestEndTs,
+    setInst,
+    setBar,
+    setMode,
+    setBacktestRange,
+  } = useAppStore();
 
   const { data: instruments } = useQuery({
     queryKey: ["instruments"],
@@ -77,6 +87,28 @@ export default function ChartToolbar({
         }}
         className="rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)] hover:border-[var(--accent)]"
         aria-label="跳转日期"
+      />
+
+      <input
+        type="date"
+        value={dateInputValue(backtestStartTs)}
+        onChange={(e) => {
+          if (!e.target.value) return;
+          setBacktestRange(dateStartTs(e.target.value), backtestEndTs);
+        }}
+        className="rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)] hover:border-[var(--accent)]"
+        aria-label="Backtest start date"
+      />
+
+      <input
+        type="date"
+        value={dateInputValue(backtestEndTs)}
+        onChange={(e) => {
+          if (!e.target.value) return;
+          setBacktestRange(backtestStartTs, dateEndTs(e.target.value));
+        }}
+        className="rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)] hover:border-[var(--accent)]"
+        aria-label="Backtest end date"
       />
 
       <div className="ml-auto flex items-center gap-2">
@@ -171,4 +203,16 @@ function buildInstOptions(instruments: Instrument[] | undefined): string[] {
       .forEach((i) => set.add(i.instId));
   }
   return Array.from(set);
+}
+
+function dateInputValue(ts: number): string {
+  return new Date(ts * 1000).toISOString().slice(0, 10);
+}
+
+function dateStartTs(value: string): number {
+  return Math.floor(new Date(`${value}T00:00:00Z`).getTime() / 1000);
+}
+
+function dateEndTs(value: string): number {
+  return Math.floor(new Date(`${value}T23:59:59Z`).getTime() / 1000);
 }
