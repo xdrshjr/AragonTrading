@@ -1,10 +1,9 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import dynamic from "next/dynamic";
 import Image from "next/image";
 import { useEffect, useMemo, useRef, useState } from "react";
-import ChartToolbar from "@/components/Chart/ChartToolbar";
+import ChartWorkspace from "@/components/Chart/ChartWorkspace";
 import StrategyPanel from "@/components/Strategy/StrategyPanel";
 import { Button } from "@/components/ui";
 import { api } from "@/lib/api";
@@ -18,9 +17,6 @@ import { colorForIndex } from "@/lib/compare";
 import { useAppStore } from "@/lib/store";
 import type { Candle, CompareResult, EquityPoint, Trade } from "@/lib/types";
 import { marketWS, paperWS, type WsEvent } from "@/lib/ws";
-
-// lightweight-charts 仅客户端渲染（R6）
-const CandleChart = dynamic(() => import("@/components/Chart/CandleChart"), { ssr: false });
 
 export default function Page() {
   const {
@@ -275,41 +271,31 @@ export default function Page() {
       </header>
 
       <main className="grid flex-1 grid-cols-1 overflow-hidden lg:grid-cols-[1fr_380px]">
-        <section className="flex min-h-[360px] flex-col border-b border-[var(--border)] lg:border-b-0 lg:border-r">
-          <div className="shrink-0 border-b border-[var(--border)] px-4 py-2.5">
-            <ChartToolbar
-              okxUp={okxUp}
-              latencyMs={latencyMs}
-              lastOkTs={lastOkTs}
-              liveWsOpen={followLive ? liveWsOpen : undefined}
-              lastPrice={followLive ? lastPrice : undefined}
-              chartView={chartView}
-              rangeAvailable={rangeAvailable}
-              onChartViewChange={(view) => setChartView(view)}
-              onJumpDate={setJumpToTs}
-            />
-          </div>
-          {/* F2：缓存回退诚实标注——仅当后端返回缓存样例（X-Aragon-Data-Source: cache）时显示 */}
-          {dataSource === "cache" && (
-            <div className="shrink-0 border-b border-[var(--accent)] bg-[var(--accent-soft)] px-4 py-1.5 text-[11px] font-medium text-[var(--accent)]">
-              ⚠️ 缓存样例 · 非实时——OKX 暂不可达，当前显示本地缓存的真实历史（非最新行情）
-            </div>
-          )}
-          <div className="relative flex-1">
-            <CandleChart
-              candles={candles}
-              equity={overlayEquity}
-              trades={overlayTrades}
-              overlays={overlays}
-              indicators={indicators}
-              theme={theme}
-              loading={(runQ.isFetching || candlesQ.isFetching) && candles.length === 0}
-              error={chartError}
-              onLoadMore={loadMore}
-              jumpToTs={jumpToTs}
-            />
-          </div>
-        </section>
+        <ChartWorkspace
+          candles={candles}
+          overlayEquity={overlayEquity}
+          overlays={overlays}
+          overlayTrades={overlayTrades}
+          indicators={indicators}
+          theme={theme}
+          lastPrice={followLive ? lastPrice : null}
+          dataSource={dataSource}
+          chartLoading={(runQ.isFetching || candlesQ.isFetching) && candles.length === 0}
+          chartError={chartError}
+          onLoadMore={loadMore}
+          jumpToTs={jumpToTs}
+          toolbar={{
+            okxUp,
+            latencyMs,
+            lastOkTs,
+            liveWsOpen: followLive ? liveWsOpen : undefined,
+            lastPrice: followLive ? lastPrice : undefined,
+            chartView,
+            rangeAvailable,
+            onChartViewChange: setChartView,
+            onJumpDate: setJumpToTs,
+          }}
+        />
 
         <aside className="min-h-[300px] overflow-hidden bg-[var(--surface)]/40">
           <StrategyPanel />

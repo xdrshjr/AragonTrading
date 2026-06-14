@@ -1,20 +1,30 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
-import { api } from "@/lib/api";
 import { fmtPrice, fmtTime } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
-import type { Bar, ChartView, Instrument, Mode } from "@/lib/types";
-import { Badge, Select } from "@/components/ui";
+import type { Bar, ChartView, Mode } from "@/lib/types";
+import { Badge } from "@/components/ui";
 import IndicatorMenu from "./IndicatorMenu";
 
 const BARS: Bar[] = ["1m", "5m", "15m", "30m", "1H", "4H", "1D"];
-const FALLBACK_INSTRUMENTS = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"];
 const MODES: { key: Mode; label: string }[] = [
   { key: "backtest", label: "回测" },
   { key: "compare", label: "对比" },
   { key: "paper", label: "实时" },
 ];
+
+// 标的选择已迁至 InstrumentList（chart-workspace-layout #10）；工具栏专注周期 / 指标 / 日期 / 区间 / 模式 / 状态。
+export interface ChartToolbarProps {
+  okxUp: boolean | null;
+  latencyMs?: number | null;
+  lastOkTs?: number | null;
+  liveWsOpen?: boolean; // F1：市场实时流连接态（仅非 paper 模式传入）
+  lastPrice?: number | null;
+  chartView: ChartView;
+  rangeAvailable: boolean;
+  onChartViewChange: (view: ChartView) => void;
+  onJumpDate: (tsSeconds: number) => void;
+}
 
 export default function ChartToolbar({
   okxUp,
@@ -26,48 +36,12 @@ export default function ChartToolbar({
   rangeAvailable,
   onChartViewChange,
   onJumpDate,
-}: {
-  okxUp: boolean | null;
-  latencyMs?: number | null;
-  lastOkTs?: number | null;
-  liveWsOpen?: boolean; // F1：市场实时流连接态（仅非 paper 模式传入）
-  lastPrice?: number | null;
-  chartView: ChartView;
-  rangeAvailable: boolean;
-  onChartViewChange: (view: ChartView) => void;
-  onJumpDate: (tsSeconds: number) => void;
-}) {
-  const {
-    instId,
-    bar,
-    mode,
-    backtestStartTs,
-    backtestEndTs,
-    setInst,
-    setBar,
-    setMode,
-    setBacktestRange,
-  } = useAppStore();
-
-  const { data: instruments } = useQuery({
-    queryKey: ["instruments"],
-    queryFn: () => api.instruments("SWAP"),
-    staleTime: 5 * 60_000,
-  });
-
-  // 仅展示 USDT 永续，避免下拉过长；保证默认三标的可选
-  const instOptions = buildInstOptions(instruments);
+}: ChartToolbarProps) {
+  const { bar, mode, backtestStartTs, backtestEndTs, setBar, setMode, setBacktestRange } =
+    useAppStore();
 
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <Select value={instId} onChange={(e) => setInst(e.target.value)} aria-label="标的">
-        {instOptions.map((id) => (
-          <option key={id} value={id}>
-            {id}
-          </option>
-        ))}
-      </Select>
-
       <div className="flex gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-0.5">
         {BARS.map((b) => (
           <button
@@ -229,17 +203,6 @@ function ConnDot({
       </Badge>
     </span>
   );
-}
-
-function buildInstOptions(instruments: Instrument[] | undefined): string[] {
-  const set = new Set<string>(FALLBACK_INSTRUMENTS);
-  if (instruments) {
-    instruments
-      .filter((i) => i.quote === "USDT")
-      .slice(0, 40)
-      .forEach((i) => set.add(i.instId));
-  }
-  return Array.from(set);
 }
 
 function dateInputValue(ts: number): string {

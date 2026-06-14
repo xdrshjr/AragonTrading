@@ -5,6 +5,7 @@ import {
   CrosshairMode,
   type IChartApi,
   type ISeriesApi,
+  type MouseEventParams,
   type SeriesMarker,
   type Time,
   type UTCTimestamp,
@@ -19,12 +20,9 @@ import {
 } from "@/lib/chartSync";
 import { normalizeEquity } from "@/lib/compare";
 import { INDICATORS, type IndicatorKey, type Plot, type ThemeColors } from "@/lib/indicators";
-import type { Candle, EquityPoint, Trade } from "@/lib/types";
+import type { Candle, EquityPoint, Overlay, Trade } from "@/lib/types";
 import IndicatorPane from "./IndicatorPane";
 import { reconcilePlots, type PlotSeries } from "./plots";
-
-// 一条对比净值叠加曲线（compare 模式，F3）
-export type Overlay = { id: number; name: string; color: string; equity: EquityPoint[] };
 
 type Props = {
   candles: Candle[];
@@ -37,6 +35,8 @@ type Props = {
   error?: string | null;
   onLoadMore?: (beforeTs: number) => void;
   jumpToTs?: number | null;
+  // 十字光标悬停主图回吐被选中 K 线秒级 ts；移出为 null（chart-workspace-layout 需求 2）。
+  onCrosshairChange?: (ts: number | null) => void;
 };
 
 function cssVar(name: string): string {
@@ -65,6 +65,7 @@ export default function CandleChart({
   error,
   onLoadMore,
   jumpToTs,
+  onCrosshairChange,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -76,6 +77,9 @@ export default function CandleChart({
   const loadMoreRef = useRef(onLoadMore);
   const loadingMoreRef = useRef(false);
   const earliestRef = useRef<number | null>(null);
+  // 用 ref 持有最新十字光标回调，避免重订阅（创建 effect 仅挂载一次执行，R9/§9.1）。
+  const onCrosshairRef = useRef(onCrosshairChange);
+  onCrosshairRef.current = onCrosshairChange;
 
   // 主图 + 各副图的时间轴 / 十字光标同步组（挂载期内稳定，懒创建一次）。
   const syncRef = useRef<SyncGroup | null>(null);
@@ -111,8 +115,9 @@ export default function CandleChart({
       },
       crosshair: { mode: CrosshairMode.Normal },
       rightPriceScale: { borderColor: cssVar("--border"), minimumWidth: PRICE_SCALE_MIN_WIDTH },
+      // 净值剥离后（price 视图无 equity）隐藏左价轴，避免残留空轴（§3.2(B)）。
       leftPriceScale: {
-        visible: true,
+        visible: hasEquity,
         borderColor: cssVar("--border"),
         minimumWidth: PRICE_SCALE_MIN_WIDTH,
       },
@@ -158,6 +163,13 @@ export default function CandleChart({
     };
     chart.timeScale().subscribeVisibleLogicalRangeChange(onRange as never);
 
+    // 十字光标回吐：仅直接悬停主图时 param.time 有值（秒级 ts）；移出或悬停副图为 null（R9）。
+    const onCross = (param: MouseEventParams) => {
+      const t = param.time;
+      onCrosshairRef.current?.(typeof t === "number" ? t : null);
+    };
+    chart.subscribeCrosshairMove(onCross);
+
     // 注册进同步组（主图为锚，getSeries 供跨图十字光标贯穿）。
     const sync = syncRef.current;
     const unregister = sync ? sync.register(chart, () => candleSeriesRef.current) : undefined;
@@ -174,6 +186,7 @@ export default function CandleChart({
     return () => {
       ro?.disconnect();
       unregister?.();
+      chart.unsubscribeCrosshairMove(onCross);
       chart.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
@@ -365,6 +378,11 @@ export default function CandleChart({
   useEffect(() => {
     chartRef.current?.applyOptions({ timeScale: { visible: !hasPane } });
   }, [hasPane]);
+
+  // 左价轴随净值存废（§3.2(B)）：price 视图无 equity 时隐藏，避免残留空轴。
+  useEffect(() => {
+    chartRef.current?.applyOptions({ leftPriceScale: { visible: hasEquity } });
+  }, [hasEquity]);
 
   // 价格轴动态等宽对齐（RV-1）：仅价格量级 / 副图数量 / 主题 / 净值轴存废变化时重对齐，
   // 避免实时每 tick 抖动。新 pane 的子 chart 已在其挂载 effect（先于父 effect 执行）内注册进 sync 组，

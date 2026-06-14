@@ -2,8 +2,14 @@
 // 约定：本文件所有 ts 字段均为「秒级 UTC 时间戳」(C2，见 spec §4.4)。
 
 export type Bar = "1m" | "5m" | "15m" | "30m" | "1H" | "4H" | "1D";
-export type ChartView = "run-range" | "compare-range" | "live-follow";
 export type Mode = "backtest" | "compare" | "paper";
+export type ChartView = "run-range" | "compare-range" | "live-follow";
+
+// 左侧图表区上方「K线价格走势 / 净值」视图页签（chart-workspace-layout 需求 1）。
+// 注意：与既有 ChartView（历史区间选择器）正交，故另起字段名 chartPane（见 spec §实施过程发现的方案缺陷）。
+export type ChartPane = "price" | "equity";
+// 左侧下区「成交记录 / 当前持仓」数据页签（需求 3）。
+export type BottomTab = "trades" | "positions";
 
 // /candles 响应头 X-Aragon-Data-Source 的取值（F2）：live=真实实时，cache=缓存样例·非实时。
 export type DataSource = "live" | "cache";
@@ -51,6 +57,12 @@ export type Trade = {
 };
 
 export type EquityPoint = { ts: number; equity: number; drawdown: number };
+
+// 一条对比净值叠加曲线（compare 模式，F3）。由 CandleChart 上移至此，供 EquityChart / ChartWorkspace 共享。
+export type Overlay = { id: number; name: string; color: string; equity: EquityPoint[] };
+
+// 合约行情快照（chart-workspace-layout P2，/tickers）。缺省时 InstrumentList 仅当前标的有价。
+export type Ticker = { instId: string; last: number; open24h: number; changePct: number };
 
 export type Metrics = {
   totalReturn: number;

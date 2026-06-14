@@ -3,7 +3,7 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { DEFAULT_INDICATORS, type IndicatorKey } from "./indicators";
-import type { Bar, ChartView, Mode } from "./types";
+import type { Bar, BottomTab, ChartPane, ChartView, Mode } from "./types";
 
 type Theme = "light" | "dark";
 const DEFAULT_RANGE_DAYS = 30;
@@ -14,8 +14,10 @@ interface AppState {
   instId: string;
   bar: Bar;
   strategyId: number | null;
-  chartView: ChartView;
   runId: number | null;
+  chartView: ChartView;
+  chartPane: ChartPane;
+  bottomTab: BottomTab;
   mode: Mode;
   paperSessionId: string | null;
   theme: Theme;
@@ -26,8 +28,10 @@ interface AppState {
   setInst: (instId: string) => void;
   setBar: (bar: Bar) => void;
   setStrategyId: (id: number | null) => void;
-  setChartView: (view: ChartView) => void;
   setRunId: (id: number | null) => void;
+  setChartView: (view: ChartView) => void;
+  setChartPane: (pane: ChartPane) => void;
+  setBottomTab: (tab: BottomTab) => void;
   setMode: (mode: Mode) => void;
   setPaperSessionId: (id: string | null) => void;
   setBacktestRange: (startTs: number, endTs: number) => void;
@@ -46,6 +50,8 @@ export const useAppStore = create<AppState>()(
       strategyId: null,
       runId: null,
       chartView: "live-follow",
+      chartPane: "price",
+      bottomTab: "trades",
       mode: "backtest",
       paperSessionId: null,
       theme: "light",
@@ -59,6 +65,8 @@ export const useAppStore = create<AppState>()(
       setRunId: (runId) => set({ runId }),
       setChartView: (chartView) =>
         set(chartView === "live-follow" ? { chartView, runId: null } : { chartView }),
+      setChartPane: (chartPane) => set({ chartPane }),
+      setBottomTab: (bottomTab) => set({ bottomTab }),
       setMode: (mode) =>
         set({
           mode,
@@ -89,7 +97,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 2,
+      version: 3,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -101,13 +109,19 @@ export const useAppStore = create<AppState>()(
         backtestStartTs: s.backtestStartTs,
         backtestEndTs: s.backtestEndTs,
         indicators: s.indicators,
+        chartPane: s.chartPane,
+        bottomTab: s.bottomTab,
       }),
-      // v1→v2：补 indicators 默认态（即便缺省 zustand 浅合并也回落初值，migrate 仅为显式稳妥，R7）。
+      // 逐版补默认态（即便缺省 zustand 浅合并也回落初值，migrate 仅为显式稳妥，R7/R11）。
       migrate: (persisted, version) => {
+        let next = persisted as Record<string, unknown>;
         if (version < 2) {
-          return { ...(persisted as object), indicators: { ...DEFAULT_INDICATORS } } as never;
+          next = { ...next, indicators: { ...DEFAULT_INDICATORS } };
         }
-        return persisted as never;
+        if (version < 3) {
+          next = { ...next, chartPane: "price", bottomTab: "trades" };
+        }
+        return next as never;
       },
       // SSR / 水合安全（C2）：先以默认 state 渲染（与服务端 HTML 一致 → 无 hydration 告警），
       // 由根客户端组件挂载后显式 useAppStore.persist.rehydrate() 补水（接受"默认→恢复"一帧闪烁）。
