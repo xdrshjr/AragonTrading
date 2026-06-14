@@ -53,12 +53,11 @@ async def ws_market(websocket: WebSocket) -> None:
         await _send_if_open(closed, websocket, "book", book.model_dump(by_alias=True))
 
     async def on_error(code: str, message: str) -> None:
+        # A per-channel OKX error (e.g. 60018 "channel doesn't exist") is advisory:
+        # forward it so the UI can flag that channel as unavailable, but never tear
+        # down the shared candle stream. Transport-level failures are handled by the
+        # client's own reconnect loop, not here.
         await _send_if_open(closed, websocket, "error", {"code": code, "message": message})
-        closed.set()
-        try:
-            await websocket.close()
-        except Exception:  # noqa: BLE001
-            pass
 
     client = OKXMarketWSClient(
         inst_id,
@@ -70,6 +69,10 @@ async def ws_market(websocket: WebSocket) -> None:
             on_book=on_book,
             on_error=on_error,
         ),
+        # Candle channels are served by OKX's business endpoint; trades/tickers/
+        # books5 exist only on the public endpoint and would 60018 here. Subscribe
+        # candle-only so the live chart feed cannot be broken by those errors.
+        market_channels=False,
     )
     client.start()
     try:
