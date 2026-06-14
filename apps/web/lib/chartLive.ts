@@ -42,6 +42,18 @@ export function shouldFollowLive(
   return chartView === "live-follow" && mode !== "paper" && okxUp !== false;
 }
 
+export function shouldStreamMarket(mode: Mode, okxUp: boolean | null): boolean {
+  return okxUp !== false && (mode === "backtest" || mode === "compare" || mode === "paper");
+}
+
+export function shouldApplyPublicCandle(
+  chartView: ChartView,
+  mode: Mode,
+  paperSessionId: string | null,
+): boolean {
+  return chartView === "live-follow" && !(mode === "paper" && paperSessionId);
+}
+
 export function liveCandleRefreshIntervalMs(bar: Bar | string): number {
   if (bar === "1m") return 15_000;
   if (bar === "5m" || bar === "15m" || bar === "30m") return 30_000;

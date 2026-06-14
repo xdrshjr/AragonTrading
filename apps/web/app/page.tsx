@@ -10,12 +10,25 @@ import {
   LATEST_CANDLE_LIMIT,
   liveCandleRefreshIntervalMs,
   resolveChartRange,
-  shouldFollowLive,
+  shouldApplyPublicCandle,
+  shouldStreamMarket,
 } from "@/lib/chartLive";
 import { colorForIndex } from "@/lib/compare";
+import { mergeTradeTape } from "@/lib/marketDepth";
 import { useAppStore } from "@/lib/store";
-import type { Candle, CompareResult, EquityPoint, Trade } from "@/lib/types";
+import type {
+  Candle,
+  CompareResult,
+  EquityPoint,
+  LiveMarketState,
+  MarketTicker,
+  MarketTrade,
+  OrderBookSnapshot,
+  Trade,
+} from "@/lib/types";
 import { marketWS, paperWS, type WsEvent } from "@/lib/ws";
+
+const BACKTEST_TRADE_LIMIT = 5000;
 
 export default function Page() {
   const {
@@ -38,10 +51,16 @@ export default function Page() {
   const [forming, setForming] = useState<Candle | null>(null); // F1：成形中（未确认）最右一根
   const [lastPrice, setLastPrice] = useState<number | null>(null); // F1：实时最新价
   const [liveWsOpen, setLiveWsOpen] = useState(false); // F1：市场实时流连接态
+  const [marketTicker, setMarketTicker] = useState<MarketTicker | null>(null);
+  const [orderBook, setOrderBook] = useState<OrderBookSnapshot | null>(null);
+  const [tradeTape, setTradeTape] = useState<MarketTrade[]>([]);
+  const [lastMarketTs, setLastMarketTs] = useState<number | null>(null);
+  const [marketError, setMarketError] = useState<string | null>(null);
   const [liveEquity, setLiveEquity] = useState<EquityPoint[]>([]);
   const [liveTrades, setLiveTrades] = useState<Trade[]>([]);
   const [jumpToTs, setJumpToTs] = useState<number | null>(null);
   const loadingMore = useRef(false);
+  const lastMarketTsRef = useRef<number | null>(null);
 
   // 健康检查（连接状态点反映真实 OKX 可达性，C1；含时延 / 最近取数时间，F2）
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
@@ -72,7 +91,9 @@ export default function Page() {
       }),
     [chartView, mode, runRange, instId, bar, backtestStartTs, backtestEndTs],
   );
-  const followLive = shouldFollowLive(chartView, mode, okxUp);
+  const streamMarket = shouldStreamMarket(mode, okxUp);
+  const applyPublicCandle = shouldApplyPublicCandle(chartView, mode, paperSessionId);
+  const latestFallback = applyPublicCandle && !liveWsOpen;
   const rangeAvailable = mode === "compare" || !!runRange;
 
   // 对比结果（由右侧 CompareView 写入共享缓存，F3）→ 映射为左图归一化净值叠加
@@ -111,7 +132,7 @@ export default function Page() {
   const latestCandlesQ = useQuery({
     queryKey: ["candles-latest", instId, bar],
     queryFn: () => api.candlesWithMeta(instId, bar, LATEST_CANDLE_LIMIT),
-    enabled: followLive,
+    enabled: latestFallback,
     retry: 0,
     refetchInterval: liveCandleRefreshIntervalMs(bar),
   });
@@ -129,16 +150,22 @@ export default function Page() {
     setLive([]);
     setForming(null);
     setLastPrice(null);
+    setMarketTicker(null);
+    setOrderBook(null);
+    setTradeTape([]);
+    setLastMarketTs(null);
+    setMarketError(null);
+    lastMarketTsRef.current = null;
   }, [instId, bar, chartRange?.startTs, chartRange?.endTs]);
 
   useEffect(() => {
-    if (!followLive) return;
+    if (!latestFallback) return;
     const latest = latestCandlesQ.data?.candles;
     if (!latest?.length) return;
     setLive((prev) => mergeUnique(prev, latest));
     setLastPrice(latest[latest.length - 1].c);
     setForming((prev) => (prev && latest.some((c) => c.ts === prev.ts) ? null : prev));
-  }, [followLive, latestCandlesQ.data?.candles]);
+  }, [latestFallback, latestCandlesQ.data?.candles]);
 
   const candles = useMemo(
     () => (chartRange ? baseCandles ?? [] : mergeCandles(older, baseCandles ?? [], live, forming)),
@@ -166,9 +193,9 @@ export default function Page() {
     enabled: !!runId && mode === "backtest",
   });
   const tradesQ = useQuery({
-    queryKey: ["trades", runId],
-    queryFn: () => api.trades(runId as number),
-    enabled: !!runId && mode === "backtest",
+    queryKey: ["trades", runId, BACKTEST_TRADE_LIMIT],
+    queryFn: () => api.trades(runId as number, BACKTEST_TRADE_LIMIT),
+    enabled: !!runId && mode === "backtest" && chartView === "run-range",
   });
 
   // 实时模拟 WS：累积净值 / 成交 / 实时蜡烛
@@ -190,33 +217,60 @@ export default function Page() {
     return () => ws.close();
   }, [mode, paperSessionId]);
 
-  // F1：默认（回测 / 对比）视图接通真实 OKX 实时行情——让最右一根 K 线随真实成交跳动。
-  // 仅非 paper 模式生效（paper 自己走 paperWS，避免双订阅，R3）；OKX 已判不可达则不连（省无意义重连）。
+  const recordMarketTs = (ts: number) => {
+    lastMarketTsRef.current = Math.max(lastMarketTsRef.current ?? 0, ts);
+    setLastMarketTs((prev) => Math.max(prev ?? 0, ts));
+  };
+
   useEffect(() => {
-    if (!followLive) return;
+    if (!streamMarket) return;
     const ws = marketWS(
       instId,
       bar,
-      (e: WsEvent) => {
-        if (e.type !== "candle") return;
-        const c = e.data as Candle;
-        setLastPrice(c.c); // 实时最新价（供工具栏显示）
+      (e) => {
+        if (e.type === "error") {
+          setMarketError(e.data.message);
+          return;
+        }
+        setMarketError(null);
+        if (e.type === "trade") {
+          setTradeTape((prev) => mergeTradeTape(prev, e.data));
+          setLastPrice(e.data.price);
+          recordMarketTs(e.data.ts);
+          return;
+        }
+        if (e.type === "ticker") {
+          setMarketTicker(e.data);
+          setLastPrice(e.data.last);
+          recordMarketTs(e.data.ts);
+          return;
+        }
+        if (e.type === "book") {
+          setOrderBook(e.data);
+          recordMarketTs(e.data.ts);
+          return;
+        }
+        const c = e.data;
+        if ((lastMarketTsRef.current ?? 0) <= c.ts) setLastPrice(c.c);
+        if (!applyPublicCandle) return;
         if (c.confirm === true) {
-          // 已收口的新历史根：并入 live（与 paper 同语义，mergeUnique 去重升序），清空成形根
           setLive((prev) => mergeUnique(prev, [c]));
           setForming(null);
         } else {
-          setForming(c); // 成形中（未确认）的最右一根
+          setForming(c);
         }
       },
-      (open) => setLiveWsOpen(open),
+      (open) => {
+        setLiveWsOpen(open);
+        if (open) setMarketError(null);
+      },
     );
     ws.connect();
     return () => {
       ws.close();
       setLiveWsOpen(false);
     };
-  }, [followLive, instId, bar]);
+  }, [streamMarket, applyPublicCandle, instId, bar]);
 
   // compare 模式不画单策略净值 / markers（改用多条归一化 overlays，C1）
   const overlayEquity =
@@ -231,6 +285,10 @@ export default function Page() {
       : chartView === "run-range" && mode === "backtest"
         ? tradesQ.data
         : undefined;
+  const tradeCapReached =
+    chartView === "run-range" &&
+    mode === "backtest" &&
+    (tradesQ.data?.length ?? 0) >= BACKTEST_TRADE_LIMIT;
 
   // F3：挂载后从 localStorage 补水持久化选择态/主题（skipHydration 配合，避免 SSR 水合告警，C2）
   useEffect(() => {
@@ -246,6 +304,16 @@ export default function Page() {
     candlesQ.isError && candles.length === 0
       ? (candlesQ.error as Error)?.message || "请求失败"
       : null;
+  const market: LiveMarketState = {
+    instId,
+    lastPrice,
+    ticker: marketTicker,
+    book: orderBook,
+    trades: tradeTape,
+    connected: liveWsOpen,
+    error: marketError,
+    updatedTs: lastMarketTs,
+  };
 
   return (
     <div className="flex h-screen flex-col bg-[var(--bg)]">
@@ -274,9 +342,11 @@ export default function Page() {
           overlayEquity={overlayEquity}
           overlays={overlays}
           overlayTrades={overlayTrades}
+          tradeCapReached={tradeCapReached}
           indicators={indicators}
           theme={theme}
-          lastPrice={followLive ? lastPrice : null}
+          lastPrice={streamMarket ? lastPrice : null}
+          market={market}
           dataSource={dataSource}
           chartLoading={(runQ.isFetching || candlesQ.isFetching) && candles.length === 0}
           chartError={chartError}
@@ -286,8 +356,8 @@ export default function Page() {
             okxUp,
             latencyMs,
             lastOkTs,
-            liveWsOpen: followLive ? liveWsOpen : undefined,
-            lastPrice: followLive ? lastPrice : undefined,
+            liveWsOpen: streamMarket ? liveWsOpen : undefined,
+            lastPrice: streamMarket ? lastPrice : undefined,
             chartView,
             rangeAvailable,
             onChartViewChange: setChartView,

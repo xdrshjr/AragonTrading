@@ -7,10 +7,19 @@ import TradesTable from "@/components/Strategy/TradesTable";
 import { Tabs } from "@/components/ui";
 import type { IndicatorKey } from "@/lib/indicators";
 import { useAppStore } from "@/lib/store";
-import type { BottomTab, Candle, DataSource, EquityPoint, Overlay, Trade } from "@/lib/types";
+import type {
+  BottomTab,
+  Candle,
+  DataSource,
+  EquityPoint,
+  LiveMarketState,
+  Overlay,
+  Trade,
+} from "@/lib/types";
 import ChartHeaderBar from "./ChartHeaderBar";
 import ChartToolbar, { type ChartToolbarProps } from "./ChartToolbar";
 import InstrumentList from "./InstrumentList";
+import MarketDepthPanel from "./MarketDepthPanel";
 
 // lightweight-charts 仅客户端渲染（R6）。
 const CandleChart = dynamic(() => import("./CandleChart"), { ssr: false });
@@ -29,9 +38,11 @@ interface ChartWorkspaceProps {
   overlayEquity?: EquityPoint[];
   overlays?: Overlay[];
   overlayTrades?: Trade[];
+  tradeCapReached?: boolean;
   indicators: Record<IndicatorKey, boolean>;
   theme: "light" | "dark";
   lastPrice: number | null; // 跟随实时时的最新价；否则 null（OHLC / markPrice 回落最新收盘）
+  market: LiveMarketState;
   dataSource: DataSource;
   chartLoading: boolean;
   chartError: string | null;
@@ -46,9 +57,11 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     overlayEquity,
     overlays,
     overlayTrades,
+    tradeCapReached,
     indicators,
     theme,
     lastPrice,
+    market,
     dataSource,
     chartLoading,
     chartError,
@@ -107,11 +120,12 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     <section className="flex h-full min-h-0 flex-col border-b border-[var(--border)] lg:border-b-0 lg:border-r">
       {/* 上区 ≈80%（lg 桌面优先；窄屏纵向堆叠，R5） */}
       <div className="flex min-h-0 flex-[8] flex-col lg:flex-row">
-        <div className="shrink-0 overflow-auto border-b border-[var(--border)] lg:w-1/5 lg:min-w-[140px] lg:max-w-[240px] lg:border-b-0 lg:border-r">
+        <div className="shrink-0 overflow-auto border-b border-[var(--border)] lg:basis-[10%] lg:min-w-[128px] lg:max-w-[180px] lg:border-b-0 lg:border-r">
+          <MarketDepthPanel market={market} activeCandle={displayCandle} />
           <InstrumentList
             active={instId}
             onSelect={setInst}
-            lastPrice={lastPrice}
+            lastPrice={market.lastPrice}
             changePct={sessionChangePct}
           />
         </div>
@@ -123,6 +137,11 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
           {dataSource === "cache" && (
             <div className="shrink-0 border-b border-[var(--accent)] bg-[var(--accent-soft)] px-4 py-1.5 text-[11px] font-medium text-[var(--accent)]">
               ⚠️ 缓存样例 · 非实时——OKX 暂不可达，当前显示本地缓存的真实历史（非最新行情）
+            </div>
+          )}
+          {tradeCapReached && (
+            <div className="shrink-0 border-b border-[var(--border)] bg-[var(--surface-2)] px-4 py-1.5 text-[11px] font-medium text-[var(--muted)]">
+              Backtest trade cap reached: showing the latest 5000 returned trades.
             </div>
           )}
           <ChartHeaderBar
@@ -146,6 +165,7 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
                 onCrosshairChange={setHoverTs}
                 paneTab={paneTab}
                 onPaneTabChange={setPaneTab}
+                livePrice={market.lastPrice}
               />
             ) : (
               <EquityChart

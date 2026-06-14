@@ -1,7 +1,7 @@
 "use client";
 
 import type { Trade } from "@/lib/types";
-import { fmtPrice, fmtTime, signed } from "@/lib/format";
+import { fmtPrice, fmtQty, fmtTime, signed } from "@/lib/format";
 import { Badge } from "@/components/ui";
 
 const SIDE_LABEL: Record<Trade["side"], string> = { long: "开多", short: "开空", close: "平仓" };
@@ -45,7 +45,7 @@ export default function TradesTable({ trades, loading }: { trades?: Trade[]; loa
                 <Badge tone={SIDE_TONE[t.side]}>{SIDE_LABEL[t.side]}</Badge>
               </td>
               <td className="py-1.5 pr-2 text-right tabular">{fmtPrice(t.price)}</td>
-              <td className="py-1.5 pr-2 text-right tabular">{t.qty.toFixed(4)}</td>
+              <td className="py-1.5 pr-2 text-right tabular">{fmtQty(t.qty)}</td>
               <td
                 className="py-1.5 text-right tabular font-medium"
                 style={{ color: t.pnl > 0 ? "var(--long)" : t.pnl < 0 ? "var(--short)" : "var(--muted)" }}

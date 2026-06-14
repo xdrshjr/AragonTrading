@@ -16,6 +16,47 @@ export type DataSource = "live" | "cache";
 
 export type Candle = { ts: number; o: number; h: number; l: number; c: number; vol: number; confirm?: boolean };
 
+export type MarketTrade = {
+  ts: number;
+  price: number;
+  qty: number;
+  side: "buy" | "sell";
+  tradeId?: string | null;
+};
+
+export type OrderBookLevel = { price: number; qty: number; orders?: number | null };
+export type OrderBookSnapshot = {
+  ts: number;
+  bids: OrderBookLevel[];
+  asks: OrderBookLevel[];
+};
+
+export type MarketTicker = {
+  ts: number;
+  last: number;
+  open24h: number | null;
+  vol24h: number | null;
+  volCcy24h: number | null;
+};
+
+export type MarketWsEvent =
+  | { type: "candle"; data: Candle }
+  | { type: "trade"; data: MarketTrade }
+  | { type: "ticker"; data: MarketTicker }
+  | { type: "book"; data: OrderBookSnapshot }
+  | { type: "error"; data: { code: string; message: string } };
+
+export interface LiveMarketState {
+  instId: string;
+  lastPrice: number | null;
+  ticker: MarketTicker | null;
+  book: OrderBookSnapshot | null;
+  trades: MarketTrade[];
+  connected: boolean;
+  error: string | null;
+  updatedTs: number | null;
+}
+
 export type Instrument = { instId: string; instType: "SWAP" | "SPOT"; base: string; quote: string };
 
 export type ParamSchema = Record<
@@ -55,6 +96,28 @@ export type Trade = {
   positionAfter: number;
   reason: string;
 };
+
+export type TradeDirection = "long" | "short";
+
+export interface TradeTrailSegment {
+  id: string;
+  direction: TradeDirection;
+  entry: Trade;
+  exit: Trade;
+  pnl: number;
+  isWin: boolean;
+  canRenderLine: boolean;
+  lineColor: string;
+  lineStyle?: number;
+}
+
+export interface TradeMarkerEvent {
+  id: string;
+  trade: Trade;
+  kind: "entry-long" | "entry-short" | "close" | "orphan-close";
+  direction?: TradeDirection;
+  pairedSegmentId?: string;
+}
 
 export type EquityPoint = { ts: number; equity: number; drawdown: number };
 

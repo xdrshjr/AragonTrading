@@ -4,7 +4,12 @@
 """
 from __future__ import annotations
 
-from pydantic import BaseModel
+import logging
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+logger = logging.getLogger("aragon.okx.types")
 
 
 class Candle(BaseModel):
@@ -26,6 +31,38 @@ class Instrument(BaseModel):
     instType: str  # "SWAP" | "SPOT"
     base: str
     quote: str
+
+
+class MarketTrade(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    ts: int
+    price: float
+    qty: float
+    side: Literal["buy", "sell"]
+    trade_id: str | None = Field(default=None, alias="tradeId")
+
+
+class OrderBookLevel(BaseModel):
+    price: float
+    qty: float
+    orders: int | None = None
+
+
+class OrderBookSnapshot(BaseModel):
+    ts: int
+    bids: list[OrderBookLevel]
+    asks: list[OrderBookLevel]
+
+
+class MarketTicker(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    ts: int
+    last: float
+    open24h: float | None = None
+    vol24h: float | None = None
+    vol_ccy24h: float | None = Field(default=None, alias="volCcy24h")
 
 
 # OKX candles 行的列顺序 (spec §7.2):
@@ -73,3 +110,65 @@ def parse_okx_candle(row: list[str]) -> Candle:
         vol=float(row[5]),
         confirm=(str(row[8]) == "1") if len(row) > 8 else True,
     )
+
+
+def parse_okx_trade(row: dict) -> MarketTrade | None:
+    try:
+        side = row["side"]
+        if side not in {"buy", "sell"}:
+            return None
+        return MarketTrade(
+            ts=int(row["ts"]) // 1000,
+            price=float(row["px"]),
+            qty=float(row["sz"]),
+            side=side,
+            trade_id=row.get("tradeId"),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.debug("drop malformed OKX trade row: %s (%s)", row, exc)
+        return None
+
+
+def parse_okx_ticker(row: dict) -> MarketTicker | None:
+    try:
+        return MarketTicker(
+            ts=int(row["ts"]) // 1000,
+            last=float(row["last"]),
+            open24h=_optional_float(row.get("open24h")),
+            vol24h=_optional_float(row.get("vol24h")),
+            vol_ccy24h=_optional_float(row.get("volCcy24h")),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.debug("drop malformed OKX ticker row: %s (%s)", row, exc)
+        return None
+
+
+def parse_okx_books5(row: dict) -> OrderBookSnapshot | None:
+    try:
+        asks = [_parse_book_level(level) for level in row.get("asks", [])]
+        bids = [_parse_book_level(level) for level in row.get("bids", [])]
+        if any(level is None for level in asks + bids):
+            return None
+        return OrderBookSnapshot(
+            ts=int(row["ts"]) // 1000,
+            asks=[level for level in asks if level is not None],
+            bids=[level for level in bids if level is not None],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.debug("drop malformed OKX books5 row: %s (%s)", row, exc)
+        return None
+
+
+def _optional_float(value: object) -> float | None:
+    if value in (None, ""):
+        return None
+    return float(value)
+
+
+def _parse_book_level(level: list[str]) -> OrderBookLevel | None:
+    try:
+        orders = int(level[3]) if len(level) > 3 and level[3] != "" else None
+        return OrderBookLevel(price=float(level[0]), qty=float(level[1]), orders=orders)
+    except (IndexError, TypeError, ValueError) as exc:
+        logger.debug("drop malformed OKX book level: %s (%s)", level, exc)
+        return None

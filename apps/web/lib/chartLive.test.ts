@@ -3,7 +3,8 @@ import {
   LATEST_CANDLE_LIMIT,
   liveCandleRefreshIntervalMs,
   resolveChartRange,
-  shouldFollowLive,
+  shouldApplyPublicCandle,
+  shouldStreamMarket,
 } from "./chartLive";
 
 const runRange = {
@@ -26,7 +27,8 @@ describe("chart live-follow policy", () => {
         backtestEndTs: 2,
       }),
     ).toEqual(runRange);
-    expect(shouldFollowLive("run-range", "backtest", true)).toBe(false);
+    expect(shouldStreamMarket("backtest", true)).toBe(true);
+    expect(shouldApplyPublicCandle("run-range", "backtest", null)).toBe(false);
 
     expect(
       resolveChartRange({
@@ -39,10 +41,10 @@ describe("chart live-follow policy", () => {
         backtestEndTs: 2,
       }),
     ).toBeNull();
-    expect(shouldFollowLive("live-follow", "backtest", true)).toBe(true);
+    expect(shouldApplyPublicCandle("live-follow", "backtest", null)).toBe(true);
   });
 
-  it("keeps compare range historical and never opens a live feed for it", () => {
+  it("keeps compare range historical while market stream stays available", () => {
     expect(
       resolveChartRange({
         chartView: "compare-range",
@@ -59,7 +61,14 @@ describe("chart live-follow policy", () => {
       startTs: 1_700_000_000,
       endTs: 1_700_360_000,
     });
-    expect(shouldFollowLive("compare-range", "compare", true)).toBe(false);
+    expect(shouldStreamMarket("compare", true)).toBe(true);
+    expect(shouldApplyPublicCandle("compare-range", "compare", null)).toBe(false);
+  });
+
+  it("streams market data in paper mode without applying public candles", () => {
+    expect(shouldStreamMarket("paper", true)).toBe(true);
+    expect(shouldApplyPublicCandle("live-follow", "paper", "sid-1")).toBe(false);
+    expect(shouldStreamMarket("paper", false)).toBe(false);
   });
 
   it("uses a tiny latest-candle poll window with bar-aware intervals", () => {

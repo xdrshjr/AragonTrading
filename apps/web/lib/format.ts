@@ -38,3 +38,11 @@ export function colorForReturn(v: number): string {
   if (v < 0) return "var(--short)";
   return "var(--muted)";
 }
+
+export function fmtQty(v: number | null | undefined): string {
+  if (v === null || v === undefined || Number.isNaN(v)) return "-";
+  return v.toLocaleString("en-US", {
+    minimumFractionDigits: 4,
+    maximumFractionDigits: 4,
+  });
+}

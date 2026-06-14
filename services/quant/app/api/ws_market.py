@@ -1,15 +1,24 @@
-"""路由：ws /ws/market —— 转发 OKX 实时 K 线给浏览器 (spec §9.2)。"""
+"""Browser websocket route for live OKX market data."""
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from ..okx.types import Candle
-from ..okx.ws_client import OKXWSClient
+from ..okx.types import (
+    BAR_TO_WS_CHANNEL,
+    Candle,
+    MarketTicker,
+    MarketTrade,
+    OrderBookSnapshot,
+)
+from ..okx.ws_client import MarketWSHandlers, OKXMarketWSClient
 
 router = APIRouter(tags=["ws"])
+
+INST_ID_RE = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+(?:-[A-Z0-9]+)?$")
 
 
 @router.websocket("/ws/market")
@@ -17,24 +26,53 @@ async def ws_market(websocket: WebSocket) -> None:
     await websocket.accept()
     inst_id = websocket.query_params.get("instId", "BTC-USDT-SWAP")
     bar = websocket.query_params.get("bar", "1H")
+    if bar not in BAR_TO_WS_CHANNEL or not INST_ID_RE.match(inst_id):
+        await _send_event(
+            websocket,
+            "error",
+            {
+                "code": "INVALID_MARKET_SUBSCRIPTION",
+                "message": "Unsupported OKX instrument or bar.",
+            },
+        )
+        await websocket.close()
+        return
 
-    loop = asyncio.get_event_loop()
     closed = asyncio.Event()
 
     async def on_candle(candle: Candle) -> None:
-        if closed.is_set():
-            return
-        try:
-            await websocket.send_text(json.dumps({"type": "candle", "data": {
-                "ts": candle.ts, "o": candle.o, "h": candle.h, "l": candle.l,
-                "c": candle.c, "vol": candle.vol, "confirm": candle.confirm}}))
-        except Exception:  # noqa: BLE001
-            closed.set()
+        await _send_if_open(closed, websocket, "candle", candle.model_dump())
 
-    client = OKXWSClient(inst_id, bar, on_candle)
+    async def on_trade(trade: MarketTrade) -> None:
+        await _send_if_open(closed, websocket, "trade", trade.model_dump(by_alias=True))
+
+    async def on_ticker(ticker: MarketTicker) -> None:
+        await _send_if_open(closed, websocket, "ticker", ticker.model_dump(by_alias=True))
+
+    async def on_book(book: OrderBookSnapshot) -> None:
+        await _send_if_open(closed, websocket, "book", book.model_dump(by_alias=True))
+
+    async def on_error(code: str, message: str) -> None:
+        await _send_if_open(closed, websocket, "error", {"code": code, "message": message})
+        closed.set()
+        try:
+            await websocket.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    client = OKXMarketWSClient(
+        inst_id,
+        bar,
+        MarketWSHandlers(
+            on_candle=on_candle,
+            on_trade=on_trade,
+            on_ticker=on_ticker,
+            on_book=on_book,
+            on_error=on_error,
+        ),
+    )
     client.start()
     try:
-        # 维持连接：等待客户端关闭（或读取心跳）
         while not closed.is_set():
             try:
                 await asyncio.wait_for(websocket.receive_text(), timeout=30)
@@ -45,3 +83,21 @@ async def ws_market(websocket: WebSocket) -> None:
     finally:
         closed.set()
         await client.stop()
+
+
+async def _send_if_open(
+    closed: asyncio.Event,
+    websocket: WebSocket,
+    event_type: str,
+    data,
+) -> None:
+    if closed.is_set():
+        return
+    try:
+        await _send_event(websocket, event_type, data)
+    except Exception:  # noqa: BLE001
+        closed.set()
+
+
+async def _send_event(websocket: WebSocket, event_type: str, data) -> None:
+    await websocket.send_text(json.dumps({"type": event_type, "data": data}))

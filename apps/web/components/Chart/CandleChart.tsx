@@ -4,14 +4,16 @@ import {
   ColorType,
   CrosshairMode,
   type IChartApi,
+  type IPriceLine,
   type ISeriesApi,
+  type LineStyle,
   type MouseEventParams,
   type SeriesMarker,
   type Time,
   type UTCTimestamp,
   createChart,
 } from "lightweight-charts";
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   PRICE_SCALE_MIN_WIDTH,
   alignPriceScaleWidths,
@@ -21,10 +23,23 @@ import {
 import { normalizeEquity } from "@/lib/compare";
 import { INDICATORS, type IndicatorKey, type Plot, type ThemeColors } from "@/lib/indicators";
 import { selectActivePane } from "@/lib/paneTabs";
-import type { Candle, EquityPoint, Overlay, Trade } from "@/lib/types";
+import {
+  buildTradeMarkerEvents,
+  buildTradeTrailSegments,
+  tradeToneForEvent,
+} from "@/lib/tradeTrails";
+import type {
+  Candle,
+  EquityPoint,
+  Overlay,
+  Trade,
+  TradeMarkerEvent,
+  TradeTrailSegment,
+} from "@/lib/types";
 import { Tabs } from "@/components/ui";
 import IndicatorPane from "./IndicatorPane";
 import { reconcilePlots, type PlotSeries } from "./plots";
+import TradeTooltip from "./TradeTooltip";
 
 type Props = {
   candles: Candle[];
@@ -42,6 +57,7 @@ type Props = {
   // 副图页签当前选中态（来自 store，可空）+ 点击回调（= store.setPaneTab，仅传启用项）。
   paneTab?: IndicatorKey | null;
   onPaneTabChange?: (key: IndicatorKey) => void;
+  livePrice?: number | null;
 };
 
 function cssVar(name: string): string {
@@ -73,12 +89,15 @@ export default function CandleChart({
   onCrosshairChange,
   paneTab,
   onPaneTabChange,
+  livePrice,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const priceLineRef = useRef<IPriceLine | null>(null);
   const equitySeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const overlaySeriesRef = useRef<Map<number, ISeriesApi<"Line">>>(new Map());
+  const trailSeriesRef = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
   // 主图叠加技术指标（MA/EMA/BOLL）的系列 map：key 为命名空间化 id ${def.key}:${plot.id}（RV-3）。
   const overlayIndSeriesRef = useRef<Map<string, PlotSeries>>(new Map());
   const loadMoreRef = useRef(onLoadMore);
@@ -86,13 +105,32 @@ export default function CandleChart({
   const earliestRef = useRef<number | null>(null);
   // 用 ref 持有最新十字光标回调，避免重订阅（创建 effect 仅挂载一次执行，R9/§9.1）。
   const onCrosshairRef = useRef(onCrosshairChange);
+  const tradeEventsByTsRef = useRef<Map<number, TradeMarkerEvent[]>>(new Map());
   onCrosshairRef.current = onCrosshairChange;
+  const [tradeTooltip, setTradeTooltip] = useState<{
+    events: TradeMarkerEvent[];
+    x: number;
+    y: number;
+  } | null>(null);
 
   // 主图 + 各副图的时间轴 / 十字光标同步组（挂载期内稳定，懒创建一次）。
   const syncRef = useRef<SyncGroup | null>(null);
   if (syncRef.current === null) syncRef.current = createSyncGroup();
 
   loadMoreRef.current = onLoadMore;
+
+  const tradeSegments = useMemo(() => buildTradeTrailSegments(trades ?? []), [trades]);
+  const tradeEvents = useMemo(() => buildTradeMarkerEvents(trades ?? []), [trades]);
+  const tradeEventsByTs = useMemo(() => {
+    const map = new Map<number, TradeMarkerEvent[]>();
+    for (const event of tradeEvents) {
+      const existing = map.get(event.trade.ts);
+      if (existing) existing.push(event);
+      else map.set(event.trade.ts, [event]);
+    }
+    return map;
+  }, [tradeEvents]);
+  tradeEventsByTsRef.current = tradeEventsByTs;
 
   // 启用的副图指标（注册表顺序即页签顺序）；单显切换：任一时刻只渲染当前选中的一个窗格。
   const enabledPaneDefs = INDICATORS.filter((d) => d.category === "pane" && indicators[d.key]);
@@ -177,7 +215,15 @@ export default function CandleChart({
     // 十字光标回吐：仅直接悬停主图时 param.time 有值（秒级 ts）；移出或悬停副图为 null（R9）。
     const onCross = (param: MouseEventParams) => {
       const t = param.time;
-      onCrosshairRef.current?.(typeof t === "number" ? t : null);
+      const ts = typeof t === "number" ? t : null;
+      onCrosshairRef.current?.(ts);
+      const point = param.point;
+      const events = ts == null ? undefined : tradeEventsByTsRef.current.get(ts);
+      if (!point || !events?.length) {
+        setTradeTooltip(null);
+        return;
+      }
+      setTradeTooltip({ events, x: point.x, y: point.y });
     };
     chart.subscribeCrosshairMove(onCross);
 
@@ -201,8 +247,10 @@ export default function CandleChart({
       chart.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
+      priceLineRef.current = null;
       equitySeriesRef.current = null;
       overlaySeriesRef.current.clear();
+      trailSeriesRef.current.clear();
       overlayIndSeriesRef.current.clear();
     };
   }, []);
@@ -228,6 +276,24 @@ export default function CandleChart({
     });
     equitySeriesRef.current?.applyOptions({ color: cssVar("--accent") });
   }, [theme]);
+
+  useEffect(() => {
+    const series = candleSeriesRef.current;
+    if (!series) return;
+    if (priceLineRef.current) {
+      series.removePriceLine(priceLineRef.current);
+      priceLineRef.current = null;
+    }
+    if (livePrice == null) return;
+    priceLineRef.current = series.createPriceLine({
+      price: livePrice,
+      color: cssVar("--accent"),
+      lineWidth: 1,
+      lineStyle: 2,
+      axisLabelVisible: true,
+      title: "LIVE",
+    });
+  }, [livePrice, theme]);
 
   // 更新 K 线
   useEffect(() => {
@@ -304,6 +370,46 @@ export default function CandleChart({
     }
   }, [overlays]);
 
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const map = trailSeriesRef.current;
+    const drawable = tradeSegments.filter((segment) => segment.canRenderLine);
+    const nextIds = new Set(drawable.map((segment) => segment.id));
+
+    for (const [id, series] of map) {
+      if (!nextIds.has(id)) {
+        chart.removeSeries(series);
+        map.delete(id);
+      }
+    }
+
+    for (const segment of drawable) {
+      let series = map.get(segment.id);
+      const color = trailColor(segment);
+      if (!series) {
+        series = chart.addLineSeries({
+          priceScaleId: "right",
+          color,
+          lineWidth: 2,
+          lineStyle: segment.lineStyle as LineStyle | undefined,
+          priceLineVisible: false,
+          lastValueVisible: false,
+        });
+        map.set(segment.id, series);
+      } else {
+        series.applyOptions({
+          color,
+          lineStyle: segment.lineStyle as LineStyle | undefined,
+        });
+      }
+      series.setData([
+        { time: segment.entry.ts as UTCTimestamp, value: segment.entry.price },
+        { time: segment.exit.ts as UTCTimestamp, value: segment.exit.price },
+      ]);
+    }
+  }, [tradeSegments, theme]);
+
   // 日期跳转：滚动到指定时间附近；若早于已加载范围则触发增量加载
   useEffect(() => {
     const chart = chartRef.current;
@@ -326,46 +432,17 @@ export default function CandleChart({
     }
   }, [jumpToTs, candles]);
 
-  // 更新买卖 markers
+  // 更新买卖/平仓 markers
   useEffect(() => {
     const series = candleSeriesRef.current;
     if (!series) return;
-    if (!trades || trades.length === 0) {
+    if (tradeEvents.length === 0) {
       series.setMarkers([]);
+      setTradeTooltip(null);
       return;
     }
-    const markers: SeriesMarker<Time>[] = trades
-      .slice()
-      .sort((a, b) => a.ts - b.ts)
-      .map((t) => {
-        if (t.side === "long") {
-          return {
-            time: t.ts as UTCTimestamp,
-            position: "belowBar" as const,
-            color: cssVar("--long"),
-            shape: "arrowUp" as const,
-            text: `多 ${t.reason || ""}`.trim(),
-          };
-        }
-        if (t.side === "short") {
-          return {
-            time: t.ts as UTCTimestamp,
-            position: "aboveBar" as const,
-            color: cssVar("--short"),
-            shape: "arrowDown" as const,
-            text: `空 ${t.reason || ""}`.trim(),
-          };
-        }
-        return {
-          time: t.ts as UTCTimestamp,
-          position: "aboveBar" as const,
-          color: cssVar("--muted"),
-          shape: "circle" as const,
-          text: `平 ${t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(1)}`,
-        };
-      });
-    series.setMarkers(markers);
-  }, [trades, theme]);
+    series.setMarkers(tradeEvents.map((event) => markerForEvent(event)));
+  }, [tradeEvents, theme]);
 
   // 主图叠加技术指标（MA/EMA/BOLL）：compute → 把每个 plot.id 命名空间化为 ${def.key}:${plot.id}
   // 再交给 reconcilePlots（RV-3：建键 / 删除 / 建系列三处同一 id），挂在与 K 线同一右价轴上天然共轴。
@@ -406,6 +483,9 @@ export default function CandleChart({
   return (
     <div className="relative flex h-full w-full flex-col">
       <div ref={containerRef} className="min-h-0 w-full flex-[4]" />
+      {tradeTooltip && (
+        <TradeTooltip events={tradeTooltip.events} x={tradeTooltip.x} y={tradeTooltip.y} />
+      )}
 
       {/* 副图指标容器（≈20% 高）：顶部靠左短标签页签 + 下方仅渲染当前选中的单个窗格（单显切换）。 */}
       {hasPane && activePaneDef && (
@@ -450,4 +530,46 @@ export default function CandleChart({
       )}
     </div>
   );
+}
+
+function markerForEvent(event: TradeMarkerEvent): SeriesMarker<Time> {
+  const trade = event.trade;
+  if (event.kind === "entry-long") {
+    return {
+      time: trade.ts as UTCTimestamp,
+      position: "belowBar",
+      color: cssVar("--long"),
+      shape: "arrowUp",
+      text: "BUY",
+    };
+  }
+  if (event.kind === "entry-short") {
+    return {
+      time: trade.ts as UTCTimestamp,
+      position: "aboveBar",
+      color: cssVar("--short"),
+      shape: "arrowDown",
+      text: "SELL",
+    };
+  }
+
+  const tone = tradeToneForEvent(event);
+  const color =
+    tone === "long"
+      ? cssVar("--long")
+      : tone === "short"
+        ? cssVar("--short")
+        : cssVar("--muted");
+
+  return {
+    time: trade.ts as UTCTimestamp,
+    position: "aboveBar",
+    color,
+    shape: "circle",
+    text: `CLOSE ${trade.pnl >= 0 ? "+" : ""}${trade.pnl.toFixed(1)}`,
+  };
+}
+
+function trailColor(segment: TradeTrailSegment): string {
+  return segment.direction === "long" ? cssVar("--long") : cssVar("--short");
 }

@@ -1,33 +1,65 @@
-"""OKX 公共 WebSocket 订阅 (spec §7.2 / §9.2)。
-
-订阅 candle{bar} 频道，心跳保活 + 指数退避重连，把每根 K 线归一化为秒级 ts 后回调。
-"""
+"""OKX public WebSocket clients."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 import websockets
 
 from ..config import Settings, get_settings
-from .types import BAR_TO_WS_CHANNEL, Candle
+from .types import (
+    BAR_TO_WS_CHANNEL,
+    Candle,
+    MarketTicker,
+    MarketTrade,
+    OrderBookSnapshot,
+    parse_okx_books5,
+    parse_okx_candle,
+    parse_okx_ticker,
+    parse_okx_trade,
+)
 
 logger = logging.getLogger("aragon.okx.ws")
 
 CandleHandler = Callable[[Candle], Awaitable[None]]
+TradeHandler = Callable[[MarketTrade], Awaitable[None]]
+TickerHandler = Callable[[MarketTicker], Awaitable[None]]
+BookHandler = Callable[[OrderBookSnapshot], Awaitable[None]]
+ErrorHandler = Callable[[str, str], Awaitable[None]]
 
 
-class OKXWSClient:
-    """单个 (instId, bar) 订阅的 OKX 公共 WS 客户端。"""
+async def _noop_error(_code: str, _message: str) -> None:
+    return None
 
-    def __init__(self, inst_id: str, bar: str, on_candle: CandleHandler,
-                 settings: Settings | None = None):
+
+@dataclass
+class MarketWSHandlers:
+    on_candle: CandleHandler
+    on_trade: TradeHandler
+    on_ticker: TickerHandler
+    on_book: BookHandler
+    on_error: ErrorHandler = _noop_error
+
+
+class OKXMarketWSClient:
+    """One OKX public WS connection for the selected instrument and bar."""
+
+    def __init__(
+        self,
+        inst_id: str,
+        bar: str,
+        handlers: MarketWSHandlers,
+        settings: Settings | None = None,
+        market_channels: bool = True,
+    ):
         self._settings = settings or get_settings()
         self.inst_id = inst_id
         self.bar = bar
-        self._on_candle = on_candle
+        self._handlers = handlers
+        self._market_channels = market_channels
         self._channel = BAR_TO_WS_CHANNEL.get(bar, "candle1H")
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
@@ -48,16 +80,16 @@ class OKXWSClient:
 
     async def _run(self) -> None:
         backoff = 1.0
-        # 心跳由本类 _heartbeat 主动发 "ping" 文本帧维持，故关闭库内置 ping。
-        # 注：websockets 14.x 的 connect() 无 proxy 形参（原生代理直到 15.0 才支持），
-        # 因此 WS 依赖系统/TUN 代理（本机 Clash）连通 OKX；REST 侧已在 httpx 显式透传 proxy。
         connect_kwargs: dict = {"ping_interval": None, "open_timeout": 15}
         while not self._stop.is_set():
             try:
-                async with websockets.connect(self._settings.okx_ws_public, **connect_kwargs) as ws:
+                async with websockets.connect(
+                    self._settings.okx_ws_public,
+                    **connect_kwargs,
+                ) as ws:
                     await ws.send(json.dumps({
                         "op": "subscribe",
-                        "args": [{"channel": self._channel, "instId": self.inst_id}],
+                        "args": self._subscription_args(),
                     }))
                     backoff = 1.0
                     heartbeat = asyncio.create_task(self._heartbeat(ws))
@@ -71,12 +103,21 @@ class OKXWSClient:
             except Exception as exc:  # noqa: BLE001
                 if self._stop.is_set():
                     break
-                logger.warning("OKX WS 断线，%.1fs 后重连: %s", backoff, exc)
+                logger.warning("OKX WS disconnected; reconnecting in %.1fs: %s", backoff, exc)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
+    def _subscription_args(self) -> list[dict[str, str]]:
+        args = [{"channel": self._channel, "instId": self.inst_id}]
+        if self._market_channels:
+            args.extend([
+                {"channel": "trades", "instId": self.inst_id},
+                {"channel": "tickers", "instId": self.inst_id},
+                {"channel": "books5", "instId": self.inst_id},
+            ])
+        return args
+
     async def _heartbeat(self, ws) -> None:
-        """OKX 要求 ~25s 内有数据往返，否则断开；主动发 'ping' 文本帧。"""
         try:
             while True:
                 await asyncio.sleep(20)
@@ -91,22 +132,82 @@ class OKXWSClient:
             msg = json.loads(raw)
         except json.JSONDecodeError:
             return
-        if "event" in msg:  # subscribe ack / error
+        if "event" in msg:
             if msg.get("event") == "error":
-                logger.warning("OKX WS 订阅错误: %s", msg)
+                logger.warning("OKX WS subscription error: %s", msg)
+                await self._handlers.on_error(
+                    str(msg.get("code") or "OKX_WS_ERROR"),
+                    str(msg.get("msg") or "OKX websocket error"),
+                )
             return
         data = msg.get("data")
         if not data:
             return
+        channel = (msg.get("arg") or {}).get("channel")
         for row in data:
-            # candle 行同 REST：[ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
+            await self._dispatch_row(channel, row)
+
+    async def _dispatch_row(self, channel: str | None, row) -> None:
+        if channel == self._channel:
             try:
-                candle = Candle(
-                    ts=int(row[0]) // 1000,
-                    o=float(row[1]), h=float(row[2]), l=float(row[3]),
-                    c=float(row[4]), vol=float(row[5]),
-                    confirm=(str(row[8]) == "1") if len(row) > 8 else False,
-                )
+                candle = parse_okx_candle(row)
             except (ValueError, IndexError):
-                continue
-            await self._on_candle(candle)
+                return
+            await self._handlers.on_candle(candle)
+            return
+        if channel == "trades":
+            trade = parse_okx_trade(row)
+            if trade is not None:
+                await self._handlers.on_trade(trade)
+            return
+        if channel == "tickers":
+            ticker = parse_okx_ticker(row)
+            if ticker is not None:
+                await self._handlers.on_ticker(ticker)
+            return
+        if channel == "books5":
+            book = parse_okx_books5(row)
+            if book is not None:
+                await self._handlers.on_book(book)
+
+
+class OKXWSClient:
+    """Candle-only compatibility wrapper used by paper trading."""
+
+    def __init__(
+        self,
+        inst_id: str,
+        bar: str,
+        on_candle: CandleHandler,
+        settings: Settings | None = None,
+    ):
+        self._client = OKXMarketWSClient(
+            inst_id,
+            bar,
+            MarketWSHandlers(
+                on_candle=on_candle,
+                on_trade=_ignore_trade,
+                on_ticker=_ignore_ticker,
+                on_book=_ignore_book,
+            ),
+            settings=settings,
+            market_channels=False,
+        )
+
+    def start(self) -> None:
+        self._client.start()
+
+    async def stop(self) -> None:
+        await self._client.stop()
+
+
+async def _ignore_trade(_trade: MarketTrade) -> None:
+    return None
+
+
+async def _ignore_ticker(_ticker: MarketTicker) -> None:
+    return None
+
+
+async def _ignore_book(_book: OrderBookSnapshot) -> None:
+    return None
