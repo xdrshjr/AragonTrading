@@ -3,7 +3,7 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { DEFAULT_INDICATORS, type IndicatorKey } from "./indicators";
-import type { Bar, Mode } from "./types";
+import type { Bar, ChartView, Mode } from "./types";
 
 type Theme = "light" | "dark";
 const DEFAULT_RANGE_DAYS = 30;
@@ -14,6 +14,7 @@ interface AppState {
   instId: string;
   bar: Bar;
   strategyId: number | null;
+  chartView: ChartView;
   runId: number | null;
   mode: Mode;
   paperSessionId: string | null;
@@ -25,6 +26,7 @@ interface AppState {
   setInst: (instId: string) => void;
   setBar: (bar: Bar) => void;
   setStrategyId: (id: number | null) => void;
+  setChartView: (view: ChartView) => void;
   setRunId: (id: number | null) => void;
   setMode: (mode: Mode) => void;
   setPaperSessionId: (id: string | null) => void;
@@ -43,6 +45,7 @@ export const useAppStore = create<AppState>()(
       bar: "1H",
       strategyId: null,
       runId: null,
+      chartView: "live-follow",
       mode: "backtest",
       paperSessionId: null,
       theme: "light",
@@ -50,11 +53,17 @@ export const useAppStore = create<AppState>()(
       backtestEndTs: defaultEndTs,
       indicators: { ...DEFAULT_INDICATORS },
 
-      setInst: (instId) => set({ instId, runId: null }),
-      setBar: (bar) => set({ bar, runId: null }),
+      setInst: (instId) => set({ instId, runId: null, chartView: "live-follow" }),
+      setBar: (bar) => set({ bar, runId: null, chartView: "live-follow" }),
       setStrategyId: (strategyId) => set({ strategyId }),
       setRunId: (runId) => set({ runId }),
-      setMode: (mode) => set({ mode }),
+      setChartView: (chartView) =>
+        set(chartView === "live-follow" ? { chartView, runId: null } : { chartView }),
+      setMode: (mode) =>
+        set({
+          mode,
+          chartView: mode === "compare" ? "compare-range" : "live-follow",
+        }),
       setPaperSessionId: (paperSessionId) => set({ paperSessionId }),
       setBacktestRange: (backtestStartTs, backtestEndTs) =>
         set({ backtestStartTs, backtestEndTs, runId: null }),

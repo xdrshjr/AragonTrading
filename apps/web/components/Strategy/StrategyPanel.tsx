@@ -30,6 +30,7 @@ export default function StrategyPanel() {
     backtestEndTs,
     setStrategyId,
     setRunId,
+    setChartView,
     setPaperSessionId,
   } = useAppStore();
 
@@ -56,10 +57,11 @@ export default function StrategyPanel() {
   const selected: Strategy | undefined = strategies?.find((s) => s.id === strategyId);
 
   const backtest = useMutation({
-    mutationFn: (vars: { id: number; params?: Params }) =>
+    mutationFn: (vars: { id: number; params?: Params; showRunRange?: boolean }) =>
       runBacktest(vars.id, vars.params, instId, bar, backtestStartTs, backtestEndTs),
     onSuccess: (data, vars) => {
       setRunId(data.runId);
+      if (vars.showRunRange) setChartView("run-range");
       setMetrics(data.metrics);
       setReturnsById((prev) => ({ ...prev, [vars.id]: data.metrics.totalReturn }));
     },
@@ -158,7 +160,9 @@ export default function StrategyPanel() {
                   mode={mode === "paper" ? "paper" : "backtest"}
                   busy={busy}
                   paperActive={!!paperSessionId}
-                  onApplyAndBacktest={(params) => backtest.mutate({ id: selected.id, params })}
+                  onApplyAndBacktest={(params) =>
+                    backtest.mutate({ id: selected.id, params, showRunRange: true })
+                  }
                   onStartPaper={(params, opts) => paperStart.mutate({ params, opts })}
                   onStopPaper={() => paperStop.mutate()}
                   onSaveAs={(name, params) => saveAs.mutate({ name, params })}

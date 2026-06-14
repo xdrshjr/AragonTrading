@@ -19,7 +19,7 @@ const COLUMNS: { key: SortKey; label: string }[] = [
 
 export default function CompareView() {
   const qc = useQueryClient();
-  const { instId, bar, backtestStartTs, backtestEndTs, setRunId, setMode, setStrategyId } =
+  const { instId, bar, backtestStartTs, backtestEndTs, setRunId, setMode, setStrategyId, setChartView } =
     useAppStore();
   const { data: strategies } = useQuery({ queryKey: ["strategies"], queryFn: api.strategies });
 
@@ -75,6 +75,7 @@ export default function CompareView() {
     setStrategyId(strategyId);
     setRunId(runId);
     setMode("backtest");
+    setChartView("run-range");
   };
 
   if (!strategies) {

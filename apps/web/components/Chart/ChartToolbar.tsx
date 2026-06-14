@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
 import { fmtPrice, fmtTime } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
-import type { Bar, Instrument, Mode } from "@/lib/types";
+import type { Bar, ChartView, Instrument, Mode } from "@/lib/types";
 import { Badge, Select } from "@/components/ui";
 import IndicatorMenu from "./IndicatorMenu";
 
@@ -22,13 +22,19 @@ export default function ChartToolbar({
   lastOkTs,
   liveWsOpen,
   lastPrice,
+  chartView,
+  rangeAvailable,
+  onChartViewChange,
   onJumpDate,
 }: {
   okxUp: boolean | null;
   latencyMs?: number | null;
   lastOkTs?: number | null;
   liveWsOpen?: boolean; // F1：市场实时流连接态（仅非 paper 模式传入）
-  lastPrice?: number | null; // F1：实时最新价
+  lastPrice?: number | null;
+  chartView: ChartView;
+  rangeAvailable: boolean;
+  onChartViewChange: (view: ChartView) => void;
   onJumpDate: (tsSeconds: number) => void;
 }) {
   const {
@@ -81,6 +87,34 @@ export default function ChartToolbar({
 
       <IndicatorMenu />
 
+      <div className="flex gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-0.5">
+        <button
+          onClick={() => onChartViewChange("live-follow")}
+          className={
+            "rounded-[7px] px-2.5 py-1 text-xs font-medium transition-all " +
+            (chartView === "live-follow"
+              ? "bg-[var(--surface)] text-[var(--text)] shadow-soft"
+              : "text-[var(--muted)] hover:text-[var(--text)]")
+          }
+          title="跟随当前标的实时 K 线"
+        >
+          实时
+        </button>
+        <button
+          onClick={() => onChartViewChange(mode === "compare" ? "compare-range" : "run-range")}
+          disabled={!rangeAvailable}
+          className={
+            "rounded-[7px] px-2.5 py-1 text-xs font-medium transition-all disabled:cursor-not-allowed disabled:opacity-45 " +
+            (chartView !== "live-follow"
+              ? "bg-[var(--surface)] text-[var(--text)] shadow-soft"
+              : "text-[var(--muted)] hover:text-[var(--text)]")
+          }
+          title="查看回测或对比使用的历史区间"
+        >
+          区间
+        </button>
+      </div>
+
       <input
         type="date"
         onChange={(e) => {
@@ -100,7 +134,7 @@ export default function ChartToolbar({
           setBacktestRange(dateStartTs(e.target.value), backtestEndTs);
         }}
         className="rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)] hover:border-[var(--accent)]"
-        aria-label="Backtest start date"
+        aria-label="回测开始日期"
       />
 
       <input
@@ -111,7 +145,7 @@ export default function ChartToolbar({
           setBacktestRange(backtestStartTs, dateEndTs(e.target.value));
         }}
         className="rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)] hover:border-[var(--accent)]"
-        aria-label="Backtest end date"
+        aria-label="回测结束日期"
       />
 
       <div className="ml-auto flex items-center gap-2">

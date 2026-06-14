@@ -18,7 +18,7 @@ const MODE_FILTERS: { key: string; label: string }[] = [
 const MODE_LABEL: Record<string, string> = { backtest: "回测", paper: "模拟" };
 
 export default function RunHistory() {
-  const { setInst, setBar, setRunId, setMode, setStrategyId } = useAppStore();
+  const { setInst, setBar, setRunId, setMode, setStrategyId, setChartView } = useAppStore();
   const [modeFilter, setModeFilter] = useState("");
 
   const { data: runs, isLoading } = useQuery({
@@ -33,6 +33,7 @@ export default function RunHistory() {
     setStrategyId(r.strategyId);
     setRunId(r.id);
     setMode("backtest");
+    setChartView("run-range");
   };
 
   return (

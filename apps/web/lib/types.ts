@@ -2,6 +2,7 @@
 // 约定：本文件所有 ts 字段均为「秒级 UTC 时间戳」(C2，见 spec §4.4)。
 
 export type Bar = "1m" | "5m" | "15m" | "30m" | "1H" | "4H" | "1D";
+export type ChartView = "run-range" | "compare-range" | "live-follow";
 export type Mode = "backtest" | "compare" | "paper";
 
 // /candles 响应头 X-Aragon-Data-Source 的取值（F2）：live=真实实时，cache=缓存样例·非实时。

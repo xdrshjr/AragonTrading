@@ -8,6 +8,12 @@ import ChartToolbar from "@/components/Chart/ChartToolbar";
 import StrategyPanel from "@/components/Strategy/StrategyPanel";
 import { Button } from "@/components/ui";
 import { api } from "@/lib/api";
+import {
+  LATEST_CANDLE_LIMIT,
+  liveCandleRefreshIntervalMs,
+  resolveChartRange,
+  shouldFollowLive,
+} from "@/lib/chartLive";
 import { colorForIndex } from "@/lib/compare";
 import { useAppStore } from "@/lib/store";
 import type { Candle, CompareResult, EquityPoint, Trade } from "@/lib/types";
@@ -22,11 +28,13 @@ export default function Page() {
     bar,
     mode,
     runId,
+    chartView,
     paperSessionId,
     theme,
     backtestStartTs,
     backtestEndTs,
     indicators,
+    setChartView,
     toggleTheme,
   } = useAppStore();
 
@@ -56,11 +64,21 @@ export default function Page() {
     if (mode !== "backtest" || !run || run.endTs == null) return null;
     return { instId: run.instId, bar: run.bar, startTs: run.startTs, endTs: run.endTs };
   }, [mode, runQ.data]);
-  const chartRange = useMemo(() => {
-    if (runRange) return runRange;
-    if (mode !== "compare") return null;
-    return { instId, bar, startTs: backtestStartTs, endTs: backtestEndTs };
-  }, [runRange, mode, instId, bar, backtestStartTs, backtestEndTs]);
+  const chartRange = useMemo(
+    () =>
+      resolveChartRange({
+        chartView,
+        mode,
+        runRange,
+        instId,
+        bar,
+        backtestStartTs,
+        backtestEndTs,
+      }),
+    [chartView, mode, runRange, instId, bar, backtestStartTs, backtestEndTs],
+  );
+  const followLive = shouldFollowLive(chartView, mode, okxUp);
+  const rangeAvailable = mode === "compare" || !!runRange;
 
   // 对比结果（由右侧 CompareView 写入共享缓存，F3）→ 映射为左图归一化净值叠加
   const compareQ = useQuery<CompareResult | null>({
@@ -70,7 +88,7 @@ export default function Page() {
     initialData: null,
   });
   const overlays =
-    mode === "compare" && compareQ.data
+    chartView === "compare-range" && mode === "compare" && compareQ.data
       ? compareQ.data.items.map((it, i) => ({
           id: it.strategyId,
           name: it.name,
@@ -92,8 +110,15 @@ export default function Page() {
       chartRange
         ? api.candlesWithMeta(chartRange.instId, chartRange.bar, 1000, chartRange.endTs, chartRange.startTs)
         : api.candlesWithMeta(instId, bar, 300),
-    enabled: mode !== "backtest" || !runId || !!chartRange,
+    enabled: chartView === "live-follow" || mode !== "backtest" || !runId || !!chartRange,
     retry: 0,
+  });
+  const latestCandlesQ = useQuery({
+    queryKey: ["candles-latest", instId, bar],
+    queryFn: () => api.candlesWithMeta(instId, bar, LATEST_CANDLE_LIMIT),
+    enabled: followLive,
+    retry: 0,
+    refetchInterval: liveCandleRefreshIntervalMs(bar),
   });
   const baseCandles = useMemo(() => {
     const rows = candlesQ.data?.candles;
@@ -111,14 +136,23 @@ export default function Page() {
     setLastPrice(null);
   }, [instId, bar, chartRange?.startTs, chartRange?.endTs]);
 
+  useEffect(() => {
+    if (!followLive) return;
+    const latest = latestCandlesQ.data?.candles;
+    if (!latest?.length) return;
+    setLive((prev) => mergeUnique(prev, latest));
+    setLastPrice(latest[latest.length - 1].c);
+    setForming((prev) => (prev && latest.some((c) => c.ts === prev.ts) ? null : prev));
+  }, [followLive, latestCandlesQ.data?.candles]);
+
   const candles = useMemo(
     () => (chartRange ? baseCandles ?? [] : mergeCandles(older, baseCandles ?? [], live, forming)),
     [older, baseCandles, live, forming, chartRange],
   );
 
   const loadMore = async (beforeTs: number) => {
-    if (loadingMore.current) return;
     if (chartRange) return;
+    if (loadingMore.current) return;
     loadingMore.current = true;
     try {
       const more = await api.candles(instId, bar, 300, beforeTs);
@@ -164,7 +198,7 @@ export default function Page() {
   // F1：默认（回测 / 对比）视图接通真实 OKX 实时行情——让最右一根 K 线随真实成交跳动。
   // 仅非 paper 模式生效（paper 自己走 paperWS，避免双订阅，R3）；OKX 已判不可达则不连（省无意义重连）。
   useEffect(() => {
-    if (mode === "paper" || okxUp === false || chartRange) return;
+    if (!followLive) return;
     const ws = marketWS(
       instId,
       bar,
@@ -187,13 +221,21 @@ export default function Page() {
       ws.close();
       setLiveWsOpen(false);
     };
-  }, [mode, instId, bar, okxUp, chartRange]);
+  }, [followLive, instId, bar]);
 
   // compare 模式不画单策略净值 / markers（改用多条归一化 overlays，C1）
   const overlayEquity =
-    mode === "paper" ? liveEquity : mode === "backtest" ? equityQ.data : undefined;
+    mode === "paper"
+      ? liveEquity
+      : chartView === "run-range" && mode === "backtest"
+        ? equityQ.data
+        : undefined;
   const overlayTrades =
-    mode === "paper" ? liveTrades : mode === "backtest" ? tradesQ.data : undefined;
+    mode === "paper"
+      ? liveTrades
+      : chartView === "run-range" && mode === "backtest"
+        ? tradesQ.data
+        : undefined;
 
   // F3：挂载后从 localStorage 补水持久化选择态/主题（skipHydration 配合，避免 SSR 水合告警，C2）
   useEffect(() => {
@@ -239,8 +281,11 @@ export default function Page() {
               okxUp={okxUp}
               latencyMs={latencyMs}
               lastOkTs={lastOkTs}
-              liveWsOpen={mode !== "paper" && !chartRange ? liveWsOpen : undefined}
-              lastPrice={mode !== "paper" && !chartRange ? lastPrice : undefined}
+              liveWsOpen={followLive ? liveWsOpen : undefined}
+              lastPrice={followLive ? lastPrice : undefined}
+              chartView={chartView}
+              rangeAvailable={rangeAvailable}
+              onChartViewChange={(view) => setChartView(view)}
               onJumpDate={setJumpToTs}
             />
           </div>
