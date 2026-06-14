@@ -107,6 +107,41 @@ function httpGetFull(url, timeoutMs = 12_000) {
   });
 }
 
+function extractNextStaticAssets(html, ext) {
+  const pattern = new RegExp(`\\/_next\\/static\\/[^"'<>\\s)]+\\.${ext}(?:\\?[^"'<>\\s)]*)?`, 'g');
+  return [...new Set([...html.matchAll(pattern)].map((m) => m[0].replace(/&amp;/g, '&')))];
+}
+
+function contentTypeMatches(kind, contentType) {
+  const value = String(contentType || '').toLowerCase();
+  return kind === 'css' ? value.includes('text/css') : value.includes('javascript');
+}
+
+async function verifyStaticAssets(html) {
+  const cssAssets = extractNextStaticAssets(html, 'css');
+  const jsAssets = extractNextStaticAssets(html, 'js');
+  if (cssAssets.length === 0) fail(31, 'web-static-css', '首页引用 CSS 静态资源', '未找到 /_next/static/*.css');
+  if (jsAssets.length === 0) fail(31, 'web-static-js', '首页引用 JS 静态资源', '未找到 /_next/static/*.js');
+
+  for (const asset of cssAssets) {
+    const res = await httpGetFull(new URL(asset, cfg.WEB_URL).toString());
+    if (res.status !== 200) fail(31, 'web-static-css', `CSS ${asset} 200`, `状态码 ${res.status}`);
+    if (!contentTypeMatches('css', res.headers['content-type'])) {
+      fail(31, 'web-static-css', `CSS ${asset} text/css`, `content-type=${res.headers['content-type'] || '(无)'}`);
+    }
+  }
+  recordPass('web-static-css', '前端 CSS 静态资源可用', `${cssAssets.length} 个 /_next/static CSS`);
+
+  for (const asset of jsAssets) {
+    const res = await httpGetFull(new URL(asset, cfg.WEB_URL).toString());
+    if (res.status !== 200) fail(31, 'web-static-js', `JS ${asset} 200`, `状态码 ${res.status}`);
+    if (!contentTypeMatches('js', res.headers['content-type'])) {
+      fail(31, 'web-static-js', `JS ${asset} JavaScript`, `content-type=${res.headers['content-type'] || '(无)'}`);
+    }
+  }
+  recordPass('web-static-js', '前端 JS 静态资源可用', `${jsAssets.length} 个 /_next/static JS`);
+}
+
 /** 轮询直到所有端口可绑（释放）或超时。Windows taskkill /T 异步、子进程树 socket 释放有数百 ms~秒级延迟（P1-2）。 */
 async function waitPortsFree(ports, timeoutMs = 5_000, intervalMs = 250) {
   const deadline = Date.now() + timeoutMs;
@@ -291,6 +326,7 @@ async function main() {
       fail(31, 'web-home', '前端首页含应用标识', '未见 <title 或 Aragon');
     }
     recordPass('web-home', '前端首页可用', `200 ${ctype}`);
+    await verifyStaticAssets(home.body);
 
     // --- 步骤 6b：前端 BFF 代理 → 后端（端到端集成，证明「功能正常」）---
     const bff = await httpGetFull(`${cfg.WEB_URL}/api/py/health`);

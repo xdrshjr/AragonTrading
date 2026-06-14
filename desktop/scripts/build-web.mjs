@@ -25,6 +25,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -61,6 +62,36 @@ function log(msg) {
 function fail(msg) {
   console.error(`[build-web] ✗ ${msg}`);
   process.exit(1);
+}
+
+function directoryHasEntries(dir) {
+  try {
+    return readdirSync(dir).length > 0;
+  } catch {
+    return false;
+  }
+}
+
+function replaceDirectory(stageDir, targetDir) {
+  const backupDir = `${targetDir}.previous-${process.pid}`;
+  if (existsSync(backupDir)) rmSync(backupDir, { recursive: true, force: true });
+
+  let backedUp = false;
+  if (existsSync(targetDir)) {
+    renameSync(targetDir, backupDir);
+    backedUp = true;
+  }
+
+  try {
+    renameSync(stageDir, targetDir);
+  } catch (e) {
+    if (backedUp && !existsSync(targetDir) && existsSync(backupDir)) {
+      renameSync(backupDir, targetDir);
+    }
+    throw e;
+  }
+
+  if (backedUp) rmSync(backupDir, { recursive: true, force: true });
 }
 
 /** 递归查找名为 server.js 的文件；跳过 node_modules 以免误命中第三方包的 server.js。 */
@@ -243,24 +274,41 @@ function assemble() {
   const relServer = relative(STANDALONE, serverJsAbs); // tracing root 钉准时 "server.js"；嵌套时为相对子路径
   log(`standalone server.js：${relServer}`);
 
-  // 清并整棵拷贝 standalone → resources/web
-  if (existsSync(RES_WEB)) rmSync(RES_WEB, { recursive: true, force: true });
-  mkdirSync(RES_WEB, { recursive: true });
-  cpSync(STANDALONE, RES_WEB, { recursive: true });
+  const stage = `${RES_WEB}.staging-${process.pid}`;
+  if (existsSync(stage)) rmSync(stage, { recursive: true, force: true });
+  mkdirSync(stage, { recursive: true });
+  cpSync(STANDALONE, stage, { recursive: true });
 
   // server.js 在 resources/web 中的同级目录（standalone 不含 .next/static 与 public，须手动补，Next 文档）
-  const serverDirInRes = join(RES_WEB, dirname(relServer));
+  const serverDirInStage = join(stage, dirname(relServer));
   const staticSrc = join(BUILD_NEXT, 'static');
-  if (existsSync(staticSrc)) {
-    cpSync(staticSrc, join(serverDirInRes, '.next', 'static'), { recursive: true });
-    log('已拷 .next/static');
-  } else {
-    log('（警告）未找到 .next/static');
+  if (!directoryHasEntries(staticSrc)) {
+    rmSync(stage, { recursive: true, force: true });
+    fail(`未找到可打包的 .next/static：${staticSrc}`);
   }
+  const staticDst = join(serverDirInStage, '.next', 'static');
+  mkdirSync(join(serverDirInStage, '.next'), { recursive: true });
+  cpSync(staticSrc, staticDst, { recursive: true });
+  if (!directoryHasEntries(staticDst)) {
+    rmSync(stage, { recursive: true, force: true });
+    fail(`装配后的 .next/static 为空：${staticDst}`);
+  }
+  log('已拷 .next/static');
+
   const publicSrc = join(BUILD, 'public');
   if (existsSync(publicSrc)) {
-    cpSync(publicSrc, join(serverDirInRes, 'public'), { recursive: true });
+    cpSync(publicSrc, join(serverDirInStage, 'public'), { recursive: true });
     log('已拷 public');
+  }
+
+  const serverJsInStage = join(stage, relServer);
+  if (!existsSync(serverJsInStage)) {
+    rmSync(stage, { recursive: true, force: true });
+    fail(`装配后的 server.js 不存在：${serverJsInStage}`);
+  }
+  if (!directoryHasEntries(join(dirname(serverJsInStage), '.next', 'static'))) {
+    rmSync(stage, { recursive: true, force: true });
+    fail('manifest 指向的 server.js 旁缺少 .next/static');
   }
 
   const manifest = {
@@ -269,7 +317,8 @@ function assemble() {
     nextVersion: '14.2.15',
     buildMode: 'hoisted-isolated', // 标注隔离扁平构建方式；主进程忽略未知字段，向后兼容
   };
-  writeFileSync(join(RES_WEB, 'web-server.json'), JSON.stringify(manifest, null, 2), 'utf-8');
+  writeFileSync(join(stage, 'web-server.json'), JSON.stringify(manifest, null, 2), 'utf-8');
+  replaceDirectory(stage, RES_WEB);
   log(`✓ 写 web-server.json：${JSON.stringify(manifest)}`);
 }
 

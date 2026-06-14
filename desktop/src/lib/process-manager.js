@@ -16,12 +16,13 @@ function delay(ms) {
 }
 
 /** 无害的 bind 探测：端口能否绑定（即未被占用），探测后立即释放（同 dev.py）。 */
-function portFree(port, host = '127.0.0.1') {
+function portFree(port, host = null) {
   return new Promise((resolve) => {
     const srv = net.createServer();
     srv.once('error', () => resolve(false));
     srv.once('listening', () => srv.close(() => resolve(true)));
-    srv.listen(port, host);
+    if (host) srv.listen(port, host);
+    else srv.listen(port);
   });
 }
 

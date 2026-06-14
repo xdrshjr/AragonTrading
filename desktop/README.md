@@ -31,6 +31,21 @@ npm run dev         # 拉起 Electron 桌面调试窗口（自动起后端 + 前
 
 ## 二、生产打包模式（`npm run dist` 出安装包）
 
+**一键脚本（推荐，Windows）**：`desktop/pack.ps1` 封装了下方全流程并自带前置自检
+（node/npm/python 校验、缺 venv 自动 `pnpm setup`、缺 `node_modules` 自动 `npm install`、
+复用本地 electron 二进制规避 111MB 重复下载）：
+
+```powershell
+cd desktop
+./pack.ps1                       # 出 NSIS 安装包 + portable -> dist/
+./pack.ps1 -Target smoke         # 只出免安装目录 win-unpacked/（快速冒烟）
+./pack.ps1 -Target release-check # 打包后立即端到端验收（verify:dist）
+./pack.ps1 -Clean                # 全量干净打包
+# 若 PowerShell 阻止脚本执行：powershell -ExecutionPolicy Bypass -File .\pack.ps1
+```
+
+**或直接走 npm 脚本**：
+
 ```powershell
 cd desktop
 npm run dist        # = build:backend → build:web → electron-builder（run-s 串接）
