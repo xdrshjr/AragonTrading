@@ -56,8 +56,18 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     jumpToTs,
     toolbar,
   } = props;
-  const { instId, bar, mode, chartPane, bottomTab, setInst, setChartPane, setBottomTab } =
-    useAppStore();
+  const {
+    instId,
+    bar,
+    mode,
+    chartPane,
+    bottomTab,
+    paneTab,
+    setInst,
+    setChartPane,
+    setBottomTab,
+    setPaneTab,
+  } = useAppStore();
 
   const [hoverTs, setHoverTs] = useState<number | null>(null);
   // 切标的 / 周期 → 清空 hover，避免残留 ts 让有数据却显示空（R3）。
@@ -134,6 +144,8 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
                 onLoadMore={onLoadMore}
                 jumpToTs={jumpToTs}
                 onCrosshairChange={setHoverTs}
+                paneTab={paneTab}
+                onPaneTabChange={setPaneTab}
               />
             ) : (
               <EquityChart
@@ -149,8 +161,10 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
 
       {/* 下区 ≈20%，min-h 下限防塌陷（R5） */}
       <div className="flex min-h-[140px] flex-[2] flex-col border-t border-[var(--border)]">
-        <div className="shrink-0 border-b border-[var(--border)] px-3 py-2">
+        {/* 需求 2：下区页签靠左、内容宽度（underline 变体自带底边线，故 wrapper 不再叠加 border-b）。 */}
+        <div className="shrink-0 px-3 pt-2">
           <Tabs
+            variant="underline"
             tabs={BOTTOM_TABS}
             active={bottomTab}
             onChange={(k) => setBottomTab(k as BottomTab)}

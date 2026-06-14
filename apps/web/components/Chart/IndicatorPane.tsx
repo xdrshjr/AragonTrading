@@ -152,7 +152,7 @@ export default function IndicatorPane({ candles, def, theme, sync, showTimeAxis 
   }, [candles, theme, def]);
 
   return (
-    <div className="relative w-full" style={{ height: 140 }}>
+    <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
       <span className="pointer-events-none absolute left-2 top-1 z-10 select-none text-[11px] font-medium text-[var(--muted)]">
         {def.label}

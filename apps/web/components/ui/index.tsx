@@ -130,11 +130,37 @@ export function Tabs({
   tabs,
   active,
   onChange,
+  variant = "segmented",
 }: {
   tabs: { key: string; label: string }[];
   active: string;
   onChange: (key: string) => void;
+  variant?: "segmented" | "underline";
 }) {
+  // underline 变体：靠左、内容宽度、下划线高亮（副图页签 + 下区数据页签共用）。
+  // 评审 R-2：不加 overflow-x-auto（会令 overflow-y 计算为 auto 而裁掉 -mb-px 下划线）；
+  // 两处调用方页签数少，单行不溢出。如未来需横向滚动，把溢出下沉到不承载底边线的内层 wrapper。
+  if (variant === "underline") {
+    return (
+      <div className="flex items-center gap-1 border-b border-[var(--border)]">
+        {tabs.map((t) => (
+          <button
+            key={t.key}
+            onClick={() => onChange(t.key)}
+            className={clsx(
+              "-mb-px shrink-0 border-b-2 px-3 py-1.5 text-xs font-medium transition-colors duration-150",
+              active === t.key
+                ? "border-[var(--accent)] text-[var(--text)]"
+                : "border-transparent text-[var(--muted)] hover:text-[var(--text)]",
+            )}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+    );
+  }
+  // —— 既有 segmented 实现，原样保留（默认变体，不传 variant 的调用方零变化）——
   return (
     <div className="flex gap-1 rounded-[10px] bg-[var(--surface-2)] p-1">
       {tabs.map((t) => (

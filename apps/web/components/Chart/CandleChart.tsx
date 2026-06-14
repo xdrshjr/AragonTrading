@@ -20,7 +20,9 @@ import {
 } from "@/lib/chartSync";
 import { normalizeEquity } from "@/lib/compare";
 import { INDICATORS, type IndicatorKey, type Plot, type ThemeColors } from "@/lib/indicators";
+import { selectActivePane } from "@/lib/paneTabs";
 import type { Candle, EquityPoint, Overlay, Trade } from "@/lib/types";
+import { Tabs } from "@/components/ui";
 import IndicatorPane from "./IndicatorPane";
 import { reconcilePlots, type PlotSeries } from "./plots";
 
@@ -37,6 +39,9 @@ type Props = {
   jumpToTs?: number | null;
   // 十字光标悬停主图回吐被选中 K 线秒级 ts；移出为 null（chart-workspace-layout 需求 2）。
   onCrosshairChange?: (ts: number | null) => void;
+  // 副图页签当前选中态（来自 store，可空）+ 点击回调（= store.setPaneTab，仅传启用项）。
+  paneTab?: IndicatorKey | null;
+  onPaneTabChange?: (key: IndicatorKey) => void;
 };
 
 function cssVar(name: string): string {
@@ -66,6 +71,8 @@ export default function CandleChart({
   onLoadMore,
   jumpToTs,
   onCrosshairChange,
+  paneTab,
+  onPaneTabChange,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -87,10 +94,14 @@ export default function CandleChart({
 
   loadMoreRef.current = onLoadMore;
 
-  // 启用的叠加 / 副图指标（注册表顺序即渲染顺序）。
+  // 启用的副图指标（注册表顺序即页签顺序）；单显切换：任一时刻只渲染当前选中的一个窗格。
   const enabledPaneDefs = INDICATORS.filter((d) => d.category === "pane" && indicators[d.key]);
   const hasPane = enabledPaneDefs.length > 0;
-  const paneSig = enabledPaneDefs.map((d) => d.key).join(",");
+  const activeKey = selectActivePane(
+    enabledPaneDefs.map((d) => d.key),
+    paneTab ?? null,
+  );
+  const activePaneDef = enabledPaneDefs.find((d) => d.key === activeKey) ?? null;
   const hasEquity = !!equity && equity.length > 0;
   // 价格量级（默认 BTC≈6 万 vs SOL≈百），仅量级变化才触发价轴等宽重对齐，避免实时每 tick 抖动（RV-1）。
   const priceMagnitude = useMemo(() => {
@@ -384,28 +395,43 @@ export default function CandleChart({
     chartRef.current?.applyOptions({ leftPriceScale: { visible: hasEquity } });
   }, [hasEquity]);
 
-  // 价格轴动态等宽对齐（RV-1）：仅价格量级 / 副图数量 / 主题 / 净值轴存废变化时重对齐，
-  // 避免实时每 tick 抖动。新 pane 的子 chart 已在其挂载 effect（先于父 effect 执行）内注册进 sync 组，
-  // 故此处 getCharts() 已含全部图。
+  // 价格轴动态等宽对齐（RV-1）：仅价格量级 / 当前副图 / 副图存废 / 主题 / 净值轴存废变化时重对齐，
+  // 避免实时每 tick 抖动。切页签时不同副图值域不同（RSI 0~100 / MACD 小数 / VOL 大数），须以
+  // activeKey 为依赖重测重写同侧价轴宽度（§3.2(B)/(E)）；新 pane 子 chart 已在其挂载 effect
+  //（先于父 effect 执行）内注册进 sync 组，故此处 getCharts() 已含当前图。
   useEffect(() => {
     if (syncRef.current) alignPriceScaleWidths(syncRef.current.getCharts());
-  }, [priceMagnitude, paneSig, theme, hasEquity]);
+  }, [priceMagnitude, activeKey, hasPane, theme, hasEquity]);
 
   return (
     <div className="relative flex h-full w-full flex-col">
-      <div ref={containerRef} className="min-h-0 w-full flex-1" />
+      <div ref={containerRef} className="min-h-0 w-full flex-[4]" />
 
-      {/* 副图指标窗格：每个启用的 pane 指标一个，稳定 key={def.key}（RV-6），最底部独占日期轴（RV-2）。 */}
-      {enabledPaneDefs.map((def, i) => (
-        <IndicatorPane
-          key={def.key}
-          candles={candles}
-          def={def}
-          theme={theme}
-          sync={syncRef.current as SyncGroup}
-          showTimeAxis={i === enabledPaneDefs.length - 1}
-        />
-      ))}
+      {/* 副图指标容器（≈20% 高）：顶部靠左短标签页签 + 下方仅渲染当前选中的单个窗格（单显切换）。 */}
+      {hasPane && activePaneDef && (
+        <div className="flex min-h-[120px] flex-1 flex-col border-t border-[var(--border)]">
+          <div className="shrink-0 px-2">
+            {/* 评审 R-1：页签用短标签（指标键大写：MACD/RSI/KDJ/VOL），与 §2 示意图一致；
+                注册表 d.label 为长名（如「RSI 相对强弱」）会撑宽容器顶部，违背「靠左紧凑」。 */}
+            <Tabs
+              variant="underline"
+              tabs={enabledPaneDefs.map((d) => ({ key: d.key, label: d.key.toUpperCase() }))}
+              active={activePaneDef.key}
+              onChange={(k) => onPaneTabChange?.(k as IndicatorKey)}
+            />
+          </div>
+          <div className="relative min-h-0 flex-1">
+            <IndicatorPane
+              key={activePaneDef.key}
+              candles={candles}
+              def={activePaneDef}
+              theme={theme}
+              sync={syncRef.current as SyncGroup}
+              showTimeAxis
+            />
+          </div>
+        </div>
+      )}
 
       {loading && !error && (
         <div className="absolute left-1/2 top-3 -translate-x-1/2 rounded-full bg-[var(--surface)] px-3 py-1 text-xs text-[var(--muted)] shadow-soft">

@@ -18,6 +18,7 @@ interface AppState {
   chartView: ChartView;
   chartPane: ChartPane;
   bottomTab: BottomTab;
+  paneTab: IndicatorKey | null;
   mode: Mode;
   paperSessionId: string | null;
   theme: Theme;
@@ -32,6 +33,7 @@ interface AppState {
   setChartView: (view: ChartView) => void;
   setChartPane: (pane: ChartPane) => void;
   setBottomTab: (tab: BottomTab) => void;
+  setPaneTab: (key: IndicatorKey | null) => void;
   setMode: (mode: Mode) => void;
   setPaperSessionId: (id: string | null) => void;
   setBacktestRange: (startTs: number, endTs: number) => void;
@@ -52,6 +54,7 @@ export const useAppStore = create<AppState>()(
       chartView: "live-follow",
       chartPane: "price",
       bottomTab: "trades",
+      paneTab: null,
       mode: "backtest",
       paperSessionId: null,
       theme: "light",
@@ -67,6 +70,7 @@ export const useAppStore = create<AppState>()(
         set(chartView === "live-follow" ? { chartView, runId: null } : { chartView }),
       setChartPane: (chartPane) => set({ chartPane }),
       setBottomTab: (bottomTab) => set({ bottomTab }),
+      setPaneTab: (paneTab) => set({ paneTab }),
       setMode: (mode) =>
         set({
           mode,
@@ -97,7 +101,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 3,
+      version: 4,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -111,6 +115,7 @@ export const useAppStore = create<AppState>()(
         indicators: s.indicators,
         chartPane: s.chartPane,
         bottomTab: s.bottomTab,
+        paneTab: s.paneTab,
       }),
       // 逐版补默认态（即便缺省 zustand 浅合并也回落初值，migrate 仅为显式稳妥，R7/R11）。
       migrate: (persisted, version) => {
@@ -120,6 +125,9 @@ export const useAppStore = create<AppState>()(
         }
         if (version < 3) {
           next = { ...next, chartPane: "price", bottomTab: "trades" };
+        }
+        if (version < 4) {
+          next = { ...next, paneTab: null };
         }
         return next as never;
       },
