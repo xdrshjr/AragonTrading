@@ -1,7 +1,6 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import Image from "next/image";
 import { useEffect, useMemo, useRef, useState } from "react";
 import ChartWorkspace from "@/components/Chart/ChartWorkspace";
 import StrategyPanel from "@/components/Strategy/StrategyPanel";
@@ -252,12 +251,11 @@ export default function Page() {
     <div className="flex h-screen flex-col bg-[var(--bg)]">
       <header className="flex h-12 shrink-0 items-center justify-between border-b border-[var(--border)] px-4">
         <div className="flex items-center gap-2">
-          <Image
+          <img
             src="/brand/logo.png"
             alt="Aragon Trading"
-            width={24}
-            height={24}
-            priority
+            width="24"
+            height="24"
             className="h-6 w-6 shrink-0"
           />
           <span className="text-sm font-semibold tracking-tight">Aragon Trading</span>
