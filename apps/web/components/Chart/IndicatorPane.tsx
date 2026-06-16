@@ -154,10 +154,6 @@ export default function IndicatorPane({ candles, def, theme, sync, showTimeAxis 
   return (
     <div className="relative h-full w-full">
       <div ref={containerRef} className="h-full w-full" />
-      <span className="pointer-events-none absolute left-2 top-1 z-10 select-none text-[11px] font-medium text-[var(--muted)]">
-        {def.label}
-        {def.paramsHint ? <span className="ml-1 opacity-70">{def.paramsHint}</span> : null}
-      </span>
     </div>
   );
 }

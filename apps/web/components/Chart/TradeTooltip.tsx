@@ -22,7 +22,7 @@ export default function TradeTooltip({ events, x, y }: TradeTooltipProps) {
 
   return (
     <div
-      className="pointer-events-none absolute z-20 w-[280px] rounded-[8px] border border-[var(--border)] bg-[var(--surface)] p-2 text-[11px] text-[var(--text)] shadow-soft"
+      className="pointer-events-none absolute z-30 w-[280px] rounded-[8px] border border-[var(--border)] bg-[var(--surface)] p-2 text-[11px] text-[var(--text)] shadow-soft"
       style={{
         left: `min(max(${x + 12}px, 8px), calc(100% - 288px))`,
         top: `min(max(${y + 12}px, 8px), calc(100% - 190px))`,

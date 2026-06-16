@@ -21,6 +21,7 @@ import {
   type SyncGroup,
 } from "@/lib/chartSync";
 import { normalizeEquity } from "@/lib/compare";
+import { buildIndicatorLegendItems } from "@/lib/indicatorLegend";
 import { INDICATORS, type IndicatorKey, type Plot, type ThemeColors } from "@/lib/indicators";
 import { selectActivePane } from "@/lib/paneTabs";
 import {
@@ -37,6 +38,7 @@ import type {
   TradeTrailSegment,
 } from "@/lib/types";
 import { Tabs } from "@/components/ui";
+import IndicatorLegendOverlay from "./IndicatorLegendOverlay";
 import IndicatorPane from "./IndicatorPane";
 import { reconcilePlots, type PlotSeries } from "./plots";
 import TradeTooltip from "./TradeTooltip";
@@ -140,6 +142,10 @@ export default function CandleChart({
     paneTab ?? null,
   );
   const activePaneDef = enabledPaneDefs.find((d) => d.key === activeKey) ?? null;
+  const legendItems = useMemo(
+    () => buildIndicatorLegendItems({ indicators, activePaneKey: activeKey }),
+    [indicators, activeKey],
+  );
   const hasEquity = !!equity && equity.length > 0;
   // 价格量级（默认 BTC≈6 万 vs SOL≈百），仅量级变化才触发价轴等宽重对齐，避免实时每 tick 抖动（RV-1）。
   const priceMagnitude = useMemo(() => {
@@ -482,7 +488,10 @@ export default function CandleChart({
 
   return (
     <div className="relative flex h-full w-full flex-col">
-      <div ref={containerRef} className="min-h-0 w-full flex-[4]" />
+      <div className="relative min-h-0 w-full flex-[4]">
+        <div ref={containerRef} className="h-full w-full" />
+        <IndicatorLegendOverlay items={legendItems} />
+      </div>
       {tradeTooltip && (
         <TradeTooltip events={tradeTooltip.events} x={tradeTooltip.x} y={tradeTooltip.y} />
       )}
@@ -514,13 +523,13 @@ export default function CandleChart({
       )}
 
       {loading && !error && (
-        <div className="absolute left-1/2 top-3 -translate-x-1/2 rounded-full bg-[var(--surface)] px-3 py-1 text-xs text-[var(--muted)] shadow-soft">
+        <div className="absolute left-1/2 top-3 z-30 -translate-x-1/2 rounded-full bg-[var(--surface)] px-3 py-1 text-xs text-[var(--muted)] shadow-soft">
           正在加载真实行情…
         </div>
       )}
 
       {error && (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-[var(--bg)]/80 backdrop-blur-sm">
+        <div className="absolute inset-0 z-40 flex flex-col items-center justify-center gap-2 bg-[var(--bg)]/80 backdrop-blur-sm">
           <div className="rounded-[12px] border border-[var(--short)] bg-[var(--surface)] px-5 py-4 text-center shadow-soft">
             <div className="text-sm font-semibold text-[var(--short)]">无法连接 OKX</div>
             <div className="mt-1 max-w-xs text-xs text-[var(--muted)]">{error}</div>

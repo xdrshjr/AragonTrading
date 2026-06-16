@@ -14,6 +14,7 @@ export interface ReconcileOpts {
   priceScaleId?: string;
   // 副图固定值域时给定（如 RSI 0~100）；须挂到该 pane 全部系列（RV-4），故由调用方统一传入。
   autoscaleInfoProvider?: AutoscaleInfoProvider;
+  showSeriesTitle?: boolean;
 }
 
 export function reconcilePlots(
@@ -37,6 +38,7 @@ export function reconcilePlots(
 
   for (const plot of plots) {
     let series = map.get(plot.id);
+    const title = opts.showSeriesTitle ? plot.title : "";
     if (!series) {
       if (plot.kind === "line") {
         series = chart.addLineSeries({
@@ -44,7 +46,7 @@ export function reconcilePlots(
           color: plot.color,
           lineWidth: plot.lineWidth ?? 1,
           lineStyle: plot.lineStyle as LineStyle | undefined,
-          title: plot.title,
+          title,
           lastValueVisible: false,
           priceLineVisible: false,
           autoscaleInfoProvider: opts.autoscaleInfoProvider,
@@ -52,7 +54,7 @@ export function reconcilePlots(
       } else {
         series = chart.addHistogramSeries({
           priceScaleId: opts.priceScaleId,
-          title: plot.title,
+          title,
           base: plot.base ?? 0,
           lastValueVisible: false,
           priceLineVisible: false,
@@ -64,11 +66,11 @@ export function reconcilePlots(
       // 更新颜色 / 标题 / 线型，应对主题切换（spec §4.8）
       series.applyOptions({
         color: plot.color,
-        title: plot.title,
+        title,
         lineStyle: plot.lineStyle as LineStyle | undefined,
       });
     } else {
-      series.applyOptions({ title: plot.title });
+      series.applyOptions({ title });
     }
 
     // 全量 setData（~300–600 根规模成本可忽略，R3）。line 用 {time,value}，histogram 用 {time,value,color}。
