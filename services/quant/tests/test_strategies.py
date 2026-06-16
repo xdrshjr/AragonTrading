@@ -11,11 +11,13 @@ from app.strategies.ema_cross_scalper import EmaCrossScalper
 from tests.conftest import make_synthetic_candles
 
 
-def test_registry_has_five_builtins():
+def test_registry_has_builtins():
+    # 注：原 `>= 5` 在新增后仍为真，此处为覆盖增强 + 命名纠正(R7)，纳入 2 个新 key。
     for key in ("long_shadow_reversal", "momentum_breakout", "ema_cross_scalper",
-                "bollinger_reversion", "vwap_rsi_momentum"):
+                "bollinger_reversion", "vwap_rsi_momentum",
+                "trend_pullback_long", "trend_pullback_short"):
         assert key in STRATEGY_REGISTRY
-    assert len(STRATEGY_REGISTRY) >= 5
+    assert len(STRATEGY_REGISTRY) >= 7
 
 
 def test_long_shadow_emits_long_on_hammer():

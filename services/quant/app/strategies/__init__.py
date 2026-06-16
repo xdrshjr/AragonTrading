@@ -17,6 +17,8 @@ from . import momentum_breakout     # noqa: F401,E402
 from . import ema_cross_scalper     # noqa: F401,E402
 from . import bollinger_reversion   # noqa: F401,E402
 from . import vwap_rsi_momentum     # noqa: F401,E402
+from . import trend_pullback_long   # noqa: F401,E402
+from . import trend_pullback_short  # noqa: F401,E402
 
 # 内置策略的稳定展示顺序（key 列表）
 BUILTIN_ORDER = [
@@ -25,4 +27,6 @@ BUILTIN_ORDER = [
     "ema_cross_scalper",
     "bollinger_reversion",
     "vwap_rsi_momentum",
+    "trend_pullback_long",
+    "trend_pullback_short",
 ]
