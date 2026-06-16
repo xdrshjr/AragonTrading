@@ -204,9 +204,12 @@ async function startEngines() {
 
   // 后端
   logMain('启动后端 …');
-  pm.startChild(backendSpec());
+  // 捕获受管子进程：就绪轮询期间一旦后端早退（如绑定端口失败 Errno 10048），立刻中止轮询并判失败，
+  // 避免占住同端口的孤儿进程用其 health 200 冒充「就绪」（见 desktop-backend-port-bind-conflict；
+  // 与 verify-dist.mjs 的 earlyExit 守卫一致）。
+  const backend = pm.startChild(backendSpec());
   const backendOk = await waitForHttp(cfg.BACKEND_HEALTH_URL, cfg.BACKEND_READY_TIMEOUT_MS, {
-    isAborted: () => quitting,
+    isAborted: () => quitting || backend.exited,
   });
   if (!backendOk) {
     if (quitting) return false;
@@ -223,9 +226,10 @@ async function startEngines() {
 
   // 前端
   logMain('启动前端 …');
-  pm.startChild(webSpec());
+  // 同后端：受管前端早退即中止就绪轮询，杜绝被 `::`/双栈孤儿监听者冒充就绪。
+  const web = pm.startChild(webSpec());
   const webOk = await waitForHttp(cfg.WEB_URL, cfg.WEB_READY_TIMEOUT_MS, {
-    isAborted: () => quitting,
+    isAborted: () => quitting || web.exited,
   });
   if (!webOk) {
     if (quitting) return false;

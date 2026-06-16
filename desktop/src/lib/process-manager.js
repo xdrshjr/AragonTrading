@@ -15,8 +15,8 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** 无害的 bind 探测：端口能否绑定（即未被占用），探测后立即释放（同 dev.py）。 */
-function portFree(port, host = null) {
+/** 单地址 bind 探测：能 listen 即空闲，探测后立即释放（同 dev.py）。host=null 走 net 默认（通配 :: / 0.0.0.0）。 */
+function tryBind(port, host) {
   return new Promise((resolve) => {
     const srv = net.createServer();
     srv.once('error', () => resolve(false));
@@ -24,6 +24,24 @@ function portFree(port, host = null) {
     if (host) srv.listen(port, host);
     else srv.listen(port);
   });
+}
+
+/**
+ * 无害的端口占用预检：未被占用（可绑）才返回 true。
+ *
+ * 显式传 host 时只探该地址；缺省（host=null）依次探两类地址，两者都可绑才算空闲：
+ *   1) 127.0.0.1：后端/前端实际绑定的 IPv4 回环地址。Windows 上通配 bind 不会与已被独占的
+ *      127.0.0.1:port 冲突，故必须按真实 host 探测才能发现回环独占的占用者，否则预检漏检导致
+ *      启动时 Errno 10048（见 docs/diagnoses/desktop-backend-port-bind-conflict）。
+ *   2) 通配（:: / 0.0.0.0）：捕获 IPv6 `::` / 双栈上的残留监听者（见
+ *      docs/diagnoses/desktop-packaged-static-assets：stale next start 监听 `::` 被回环探测漏掉）。
+ * 两次探测**串行**执行，避免双栈系统上 `::`(dual-stack) 与 127.0.0.1 互相占用导致的误报。
+ */
+function portFree(port, host = null) {
+  if (host) return tryBind(port, host);
+  return tryBind(port, '127.0.0.1').then(
+    (ok) => (ok ? tryBind(port, null) : false),
+  );
 }
 
 /** 单次 HTTP 探测：拿到任意响应即视为「在听」（含 4xx/5xx）。自带短超时，避免被慢响应拖死。 */
