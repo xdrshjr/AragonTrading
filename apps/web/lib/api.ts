@@ -163,6 +163,8 @@ export const api = {
     source?: "live" | "replay";
     speed?: number;
     replayBars?: number;
+    priming?: boolean; // live 启动时预热回放建仓（warm-start，默认后端为 true）
+    primingBars?: number; // 预热回看根数（默认后端 300）
   }) =>
     request<{ sessionId: string; runId: number }>("/paper/start", {
       method: "POST",

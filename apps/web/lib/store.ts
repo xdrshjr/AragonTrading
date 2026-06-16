@@ -3,12 +3,17 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { DEFAULT_INDICATORS, type IndicatorKey } from "./indicators";
-import type { Bar, BottomTab, ChartPane, ChartView, Mode } from "./types";
+import type { AccountMode, Bar, BottomTab, ChartPane, ChartView, Mode } from "./types";
 
 type Theme = "light" | "dark";
 const DEFAULT_RANGE_DAYS = 30;
 const defaultEndTs = Math.floor(Date.now() / 1000);
 const defaultStartTs = defaultEndTs - DEFAULT_RANGE_DAYS * 24 * 60 * 60;
+
+// 模拟资金（支柱 A）：默认与后端 settings.initial_capital=10000 对齐；夹取区间防误输入。
+export const DEFAULT_SIM_BALANCE = 10000;
+const MIN_SIM_BALANCE = 100;
+const MAX_SIM_BALANCE = 1e8;
 
 interface AppState {
   instId: string;
@@ -20,6 +25,8 @@ interface AppState {
   bottomTab: BottomTab;
   paneTab: IndicatorKey | null;
   mode: Mode;
+  accountMode: AccountMode;
+  simBalance: number;
   paperSessionId: string | null;
   theme: Theme;
   backtestStartTs: number;
@@ -35,6 +42,8 @@ interface AppState {
   setBottomTab: (tab: BottomTab) => void;
   setPaneTab: (key: IndicatorKey | null) => void;
   setMode: (mode: Mode) => void;
+  setAccountMode: (m: AccountMode) => void;
+  setSimBalance: (n: number) => void;
   setPaperSessionId: (id: string | null) => void;
   setBacktestRange: (startTs: number, endTs: number) => void;
   toggleTheme: () => void;
@@ -56,6 +65,8 @@ export const useAppStore = create<AppState>()(
       bottomTab: "trades",
       paneTab: null,
       mode: "backtest",
+      accountMode: "sim",
+      simBalance: DEFAULT_SIM_BALANCE,
       paperSessionId: null,
       theme: "light",
       backtestStartTs: defaultStartTs,
@@ -76,6 +87,15 @@ export const useAppStore = create<AppState>()(
           mode,
           chartView: mode === "compare" ? "compare-range" : "live-follow",
         }),
+      // 账户模式单字段原子写（模式联动由组件编排：选「模拟盘」时另调 setMode("paper")）。
+      setAccountMode: (accountMode) => set({ accountMode }),
+      // 模拟资金：夹取到 [MIN, MAX]；非有限数忽略（守住边界，R8）。
+      setSimBalance: (n) =>
+        set((s) =>
+          Number.isFinite(n)
+            ? { simBalance: Math.min(Math.max(n, MIN_SIM_BALANCE), MAX_SIM_BALANCE) }
+            : { simBalance: s.simBalance },
+        ),
       setPaperSessionId: (paperSessionId) => set({ paperSessionId }),
       setBacktestRange: (backtestStartTs, backtestEndTs) =>
         set({ backtestStartTs, backtestEndTs, runId: null }),
@@ -101,14 +121,16 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 4,
+      version: 5,
       storage: createJSONStorage(() => localStorage),
-      // 只持久化选择态 / 主题；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
+      // 只持久化选择态 / 主题 / 账户态；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
         instId: s.instId,
         bar: s.bar,
         strategyId: s.strategyId,
         mode: s.mode,
+        accountMode: s.accountMode,
+        simBalance: s.simBalance,
         theme: s.theme,
         backtestStartTs: s.backtestStartTs,
         backtestEndTs: s.backtestEndTs,
@@ -128,6 +150,9 @@ export const useAppStore = create<AppState>()(
         }
         if (version < 4) {
           next = { ...next, paneTab: null };
+        }
+        if (version < 5) {
+          next = { ...next, accountMode: "sim", simBalance: DEFAULT_SIM_BALANCE };
         }
         return next as never;
       },

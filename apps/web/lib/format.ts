@@ -46,3 +46,17 @@ export function fmtQty(v: number | null | undefined): string {
     maximumFractionDigits: 4,
   });
 }
+
+// 模拟资金显示：¥ + 千分位（整数不带小数，否则至多两位）。非有限回落 ¥0。
+export function fmtMoney(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "¥0";
+  return `¥${v.toLocaleString("en-US", { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
+}
+
+// 解析用户输入的金额：剥离 ¥ / 逗号 / 空白；空串或非有限数返回 null（由调用方回退原值）。
+export function parseMoneyInput(raw: string): number | null {
+  const cleaned = raw.replace(/[¥,\s]/g, "");
+  if (cleaned === "") return null;
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}

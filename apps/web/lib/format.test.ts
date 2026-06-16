@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fmtPct, fmtPrice, fmtTime, signed } from "./format";
+import { fmtMoney, fmtPct, fmtPrice, fmtTime, parseMoneyInput, signed } from "./format";
 
 describe("format utils", () => {
   it("fmtPct formats fractions as percent", () => {
@@ -21,5 +21,19 @@ describe("format utils", () => {
     // 2021-01-01T00:00:00Z -> 包含日期
     const out = fmtTime(1609459200);
     expect(out).toMatch(/2020|2021/); // 本地时区可能跨日
+  });
+
+  it("fmtMoney prefixes ¥ with thousands separators", () => {
+    expect(fmtMoney(10000)).toBe("¥10,000");
+    expect(fmtMoney(1234567.5)).toBe("¥1,234,567.5");
+    expect(fmtMoney(null)).toBe("¥0");
+    expect(fmtMoney(Number.NaN)).toBe("¥0");
+  });
+
+  it("parseMoneyInput strips currency symbols and rejects non-numeric", () => {
+    expect(parseMoneyInput("¥1,234.5")).toBe(1234.5);
+    expect(parseMoneyInput("50000")).toBe(50000);
+    expect(parseMoneyInput("abc")).toBeNull();
+    expect(parseMoneyInput("")).toBeNull();
   });
 });

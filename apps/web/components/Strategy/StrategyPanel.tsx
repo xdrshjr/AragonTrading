@@ -25,6 +25,7 @@ export default function StrategyPanel() {
     mode,
     strategyId,
     runId,
+    simBalance,
     paperSessionId,
     backtestStartTs,
     backtestEndTs,
@@ -94,7 +95,7 @@ export default function StrategyPanel() {
 
   const paperStart = useMutation({
     mutationFn: (vars: { params: Params; opts?: PaperOpts }) =>
-      applyThenStartPaper(strategyId as number, vars.params, instId, bar, vars.opts),
+      applyThenStartPaper(strategyId as number, vars.params, instId, bar, simBalance, vars.opts),
     onSuccess: (data) => {
       setPaperSessionId(data.sessionId);
       setRunId(data.runId);
@@ -160,6 +161,7 @@ export default function StrategyPanel() {
                   mode={mode === "paper" ? "paper" : "backtest"}
                   busy={busy}
                   paperActive={!!paperSessionId}
+                  simBalance={simBalance}
                   onApplyAndBacktest={(params) =>
                     backtest.mutate({ id: selected.id, params, showRunRange: true })
                   }
@@ -254,8 +256,17 @@ async function applyThenStartPaper(
   params: Params,
   instId: string,
   bar: string,
+  simBalance: number,
   opts?: PaperOpts,
 ) {
   await api.updateStrategy(id, { params });
-  return api.paperStart({ strategyId: id, instId, bar, ...opts });
+  // 注入模拟资金为初始权益；live 启动默认预热回放建仓（warm-start，B1）。
+  return api.paperStart({
+    strategyId: id,
+    instId,
+    bar,
+    initialCapital: simBalance,
+    priming: true,
+    ...opts,
+  });
 }

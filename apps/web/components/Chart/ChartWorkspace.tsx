@@ -76,6 +76,7 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     chartPane,
     bottomTab,
     paneTab,
+    paperSessionId,
     setInst,
     setChartPane,
     setBottomTab,
@@ -181,6 +182,12 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
 
       {/* 下区 ≈20%，min-h 下限防塌陷（R5） */}
       <div className="flex min-h-[140px] flex-[2] flex-col border-t border-[var(--border)]">
+        {/* B4：实时模拟运行中的诚实非阻断提示——下方持仓/成交含基于近端真实历史的预热回填。 */}
+        {mode === "paper" && paperSessionId && (
+          <div className="shrink-0 border-b border-[var(--border)] bg-[var(--surface-2)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
+            ● 已启动实时模拟 · 正在等待新的交易信号；下方为基于近端真实历史的预热持仓 / 成交
+          </div>
+        )}
         {/* 需求 2：下区页签靠左、内容宽度（underline 变体自带底边线，故 wrapper 不再叠加 border-b）。 */}
         <div className="shrink-0 px-3 pt-2">
           <Tabs

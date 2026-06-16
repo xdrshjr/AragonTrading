@@ -69,6 +69,9 @@ class PaperStartReq(BaseModel):
     source: Literal["live", "replay"] = "live"
     speed: float = Field(default=1.0, gt=0, le=64)        # 回放倍速；gt=0 杜绝除零
     replayBars: int = Field(default=300, ge=10, le=600)   # 回放根数；≤_WINDOW_MAX=600
+    # 预热回放（warm-start priming，B1）：live 启动时是否对近端真实历史做因果微回测建仓。
+    priming: bool = True
+    primingBars: int = Field(default=300, ge=10, le=600)  # 预热回看根数；会话内再夹取 [warmup+5,600]
 
 
 # ---------------- Response serializers ----------------

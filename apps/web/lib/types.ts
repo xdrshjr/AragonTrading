@@ -3,6 +3,8 @@
 
 export type Bar = "1m" | "5m" | "15m" | "30m" | "1H" | "4H" | "1D";
 export type Mode = "backtest" | "compare" | "paper";
+// 顶部账户模式（live-paper-account-mode 支柱 A）：sim=模拟盘；live=实盘（Phase 2，本期禁用）。
+export type AccountMode = "sim" | "live";
 export type ChartView = "run-range" | "compare-range" | "live-follow";
 
 // 左侧图表区上方「K线价格走势 / 净值」视图页签（chart-workspace-layout 需求 1）。
@@ -95,6 +97,7 @@ export type Trade = {
   pnl: number;
   positionAfter: number;
   reason: string;
+  seeded?: boolean; // 预热回放（warm-start priming）回填的历史成交标记（live-paper-account-mode B1）
 };
 
 export type TradeDirection = "long" | "short";
@@ -119,7 +122,33 @@ export interface TradeMarkerEvent {
   pairedSegmentId?: string;
 }
 
-export type EquityPoint = { ts: number; equity: number; drawdown: number };
+// transient：逐笔瞬时盯市点（不入库/不计指标，前端按 ts upsert 仅用于绘动，B2）。
+export type EquityPoint = { ts: number; equity: number; drawdown: number; transient?: boolean };
+
+// 实时模拟当前持仓便捷读数（可选，B2/§7.1）；权威视图仍由 deriveOpenPosition 推导。
+export interface PaperPositionEvent {
+  side: "long" | "short" | "flat";
+  size: number;
+  avgEntry: number;
+  markPrice: number;
+  unrealizedPnl: number;
+}
+
+// 实时模拟会话状态（订阅即发，显式标注预热边界，B3/§7.1）。
+export interface PaperStatus {
+  state: string;
+  warmedBars: number;
+  seededTrades: number;
+  initialCapital: number;
+}
+
+// 订阅即重放快照（晚订阅 / 断线重连恢复，B3/§7.1）。
+export interface PaperSnapshot {
+  trades: Trade[];
+  equity: EquityPoint[];
+  position: PaperPositionEvent | null;
+  status?: PaperStatus;
+}
 
 // 一条对比净值叠加曲线（compare 模式，F3）。由 CandleChart 上移至此，供 EquityChart / ChartWorkspace 共享。
 export type Overlay = { id: number; name: string; color: string; equity: EquityPoint[] };

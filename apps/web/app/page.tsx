@@ -2,6 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
+import AccountModeSwitch from "@/components/Header/AccountModeSwitch";
 import ChartWorkspace from "@/components/Chart/ChartWorkspace";
 import StrategyPanel from "@/components/Strategy/StrategyPanel";
 import { Button } from "@/components/ui";
@@ -14,6 +15,7 @@ import {
   shouldStreamMarket,
 } from "@/lib/chartLive";
 import { colorForIndex } from "@/lib/compare";
+import { mergeEquityByTs } from "@/lib/liveSeries";
 import { mergeTradeTape } from "@/lib/marketDepth";
 import { useAppStore } from "@/lib/store";
 import type {
@@ -24,6 +26,7 @@ import type {
   MarketTicker,
   MarketTrade,
   OrderBookSnapshot,
+  PaperSnapshot,
   Trade,
 } from "@/lib/types";
 import { marketWS, paperWS, type WsEvent } from "@/lib/ws";
@@ -198,20 +201,35 @@ export default function Page() {
     enabled: !!runId && mode === "backtest" && chartView === "run-range",
   });
 
-  // 实时模拟 WS：累积净值 / 成交 / 实时蜡烛
+  // 实时模拟 WS：快照重放 + 增量（净值按 ts upsert、成形根跳动、seeded 成交）
   useEffect(() => {
     if (mode !== "paper" || !paperSessionId) return;
     setLiveEquity([]);
     setLiveTrades([]);
+    setForming(null);
     const ws = paperWS(paperSessionId, (e: WsEvent) => {
-      if (e.type === "equity") {
-        setLiveEquity((prev) => [...prev, e.data as EquityPoint]);
+      if (e.type === "snapshot") {
+        // 订阅即重放：整体替换（修复晚订阅 / 断线重连丢历史，B3）；其后增量再追加。
+        const snap = e.data as PaperSnapshot;
+        setLiveTrades(snap.trades ?? []);
+        setLiveEquity(snap.equity ?? []);
+      } else if (e.type === "equity") {
+        // transient 与同根确认 equity 共享成形根 ts → 按 ts upsert 收敛为单点（修复 P1-3）。
+        setLiveEquity((prev) => mergeEquityByTs(prev, e.data as EquityPoint));
       } else if (e.type === "trade") {
         setLiveTrades((prev) => [...prev, e.data as Trade]);
       } else if (e.type === "candle") {
+        // paper 模式下成形根来自 paper 流（公共行情成形根被 shouldApplyPublicCandle 抑制，B2）。
         const c = e.data as Candle;
-        if (c.confirm) setLive((prev) => mergeUnique(prev, [c]));
+        if (c.confirm) {
+          setLive((prev) => mergeUnique(prev, [c]));
+          setForming(null);
+        } else {
+          setForming(c);
+        }
       }
+      // position 事件为可选便捷读数（B2/P2-3）：当前持仓权威视图仍由 deriveOpenPosition
+      // 从 overlayTrades + markPrice 推导，故此处不消费，避免双数据源分叉。
     });
     ws.connect();
     return () => ws.close();
@@ -331,9 +349,12 @@ export default function Page() {
             多策略量化模拟交易 · 欧易(OKX)真实行情
           </span>
         </div>
-        <Button variant="ghost" size="sm" onClick={toggleTheme} aria-label="切换主题">
-          {theme === "light" ? "🌙 暗色" : "☀️ 亮色"}
-        </Button>
+        <div className="flex items-center gap-2">
+          <AccountModeSwitch />
+          <Button variant="ghost" size="sm" onClick={toggleTheme} aria-label="切换主题">
+            {theme === "light" ? "🌙 暗色" : "☀️ 亮色"}
+          </Button>
+        </div>
       </header>
 
       <main className="grid flex-1 grid-cols-1 overflow-hidden lg:grid-cols-[1fr_380px]">

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { fmtMoney } from "@/lib/format";
 import type { Strategy } from "@/lib/types";
 import { Button } from "@/components/ui";
 
@@ -14,6 +15,7 @@ export default function StrategyDetail({
   mode,
   busy,
   paperActive,
+  simBalance,
   onApplyAndBacktest,
   onStartPaper,
   onStopPaper,
@@ -23,6 +25,7 @@ export default function StrategyDetail({
   mode: "backtest" | "paper";
   busy: boolean;
   paperActive: boolean;
+  simBalance?: number;
   onApplyAndBacktest: (params: Params) => void;
   onStartPaper: (params: Params, opts?: PaperOpts) => void;
   onStopPaper: () => void;
@@ -91,6 +94,15 @@ export default function StrategyDetail({
 
       {mode === "paper" && !paperActive && (
         <div className="flex flex-col gap-2 rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2">
+          {simBalance != null && (
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] text-[var(--muted)]">本金</span>
+              <span className="text-[11px] text-[var(--muted)]">
+                <span className="tabular font-medium text-[var(--text)]">{fmtMoney(simBalance)}</span>
+                <span className="ml-1">（在右上角「模拟资金」处调整）</span>
+              </span>
+            </div>
+          )}
           <div className="flex items-center justify-between gap-2">
             <span className="text-[11px] text-[var(--muted)]">数据来源</span>
             <div className="flex gap-0.5 rounded-[8px] bg-[var(--surface)] p-0.5">

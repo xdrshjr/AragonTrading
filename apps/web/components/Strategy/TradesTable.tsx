@@ -39,10 +39,26 @@ export default function TradesTable({ trades, loading }: { trades?: Trade[]; loa
         </thead>
         <tbody>
           {ordered.map((t, i) => (
-            <tr key={t.id ?? `${t.ts}-${i}`} className="border-t border-[var(--border)]">
+            <tr
+              key={t.id ?? `${t.ts}-${i}`}
+              className={
+                "border-t border-[var(--border)]" + (t.seeded ? " bg-[var(--surface-2)]/40" : "")
+              }
+            >
               <td className="py-1.5 pr-2 tabular text-[var(--muted)]">{fmtTime(t.ts)}</td>
               <td className="py-1.5 pr-2">
-                <Badge tone={SIDE_TONE[t.side]}>{SIDE_LABEL[t.side]}</Badge>
+                <span className="inline-flex items-center gap-1">
+                  <Badge tone={SIDE_TONE[t.side]}>{SIDE_LABEL[t.side]}</Badge>
+                  {/* B4：预热回填成交以「历史预热」角标区分于实时新成交，避免误读为刚发生（R2）。 */}
+                  {t.seeded && (
+                    <span
+                      title="基于近端真实历史的预热回填，非刚发生的实时成交"
+                      className="rounded-full border border-[var(--border)] px-1.5 py-px text-[10px] text-[var(--muted)]"
+                    >
+                      历史预热
+                    </span>
+                  )}
+                </span>
               </td>
               <td className="py-1.5 pr-2 text-right tabular">{fmtPrice(t.price)}</td>
               <td className="py-1.5 pr-2 text-right tabular">{fmtQty(t.qty)}</td>

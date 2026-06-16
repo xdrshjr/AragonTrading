@@ -37,7 +37,8 @@ async def paper_start(body: PaperStartReq,
     try:
         sess = await get_paper_manager().start(
             strategy, body.strategyId, body.instId, body.bar, initial_capital,
-            source=body.source, speed=body.speed, replay_bars=body.replayBars)
+            source=body.source, speed=body.speed, replay_bars=body.replayBars,
+            priming=body.priming, priming_bars=body.primingBars)
     except PaperSessionLimitError as exc:
         raise HTTPException(429, detail={"code": "SESSION_LIMIT", "message": str(exc)})
     return {"sessionId": sess.session_id, "runId": sess.run_id}
@@ -68,10 +69,14 @@ async def ws_paper(websocket: WebSocket, session_id: str) -> None:
                                               "data": {"code": "NOT_FOUND", "message": "会话不存在"}}))
         await websocket.close()
         return
+    # subscribe() 与 snapshot() 间无 await：asyncio 协作式单线程下二者对事件循环原子，
+    # 故 snapshot 之后才可能有新事件入队，前端「整体替换 + 其后追加」不会重复（R7）。
     queue = session.subscribe()
+    snap = session.snapshot()
     try:
-        # 立即同步当前状态
-        await websocket.send_text(json.dumps({"type": "status", "data": {"state": session.state}}))
+        # 立即同步当前状态，紧随其后下发快照（订阅晚于预热 / 断线重连均可恢复，B3）
+        await websocket.send_text(json.dumps({"type": "status", "data": snap["status"]}))
+        await websocket.send_text(json.dumps({"type": "snapshot", "data": snap}))
         while True:
             event = await queue.get()
             await websocket.send_text(json.dumps(event))
