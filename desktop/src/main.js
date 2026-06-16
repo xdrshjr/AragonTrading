@@ -11,7 +11,16 @@ const { app, BrowserWindow, dialog, ipcMain, shell, Menu } = require('electron')
 
 const cfg = require('./lib/config');
 const paths = require('./lib/paths');
-const { ProcessManager, portFree, waitForHttp } = require('./lib/process-manager');
+const {
+  ProcessManager,
+  portFree,
+  waitForHttp,
+  reclaimPort,
+  reapRecordedPids,
+  writeRecordedPids,
+  removeRecordedPids,
+  httpGetText,
+} = require('./lib/process-manager');
 
 let win = null;
 let pm = null;
@@ -32,6 +41,95 @@ function logMain(msg) {
   const line = `${new Date().toISOString()} ${msg}\n`;
   if (logStreams.main) logStreams.main.write(line);
   else process.stdout.write(`[main] ${msg}\n`);
+}
+
+// ----------------------------- 端口自愈 / 子进程留痕 (round-3) -----------------------------
+function pidFilePath() {
+  return path.join(app.getPath('userData'), 'aragon-pids.json');
+}
+
+// 后端 /api/health 应答签名校验：以本应用特有的响应字段为权威判据（R1），
+// 避免仅凭通用镜像名 python.exe / node.exe 误杀无关进程。
+async function backendHealthMatches() {
+  const body = await httpGetText(cfg.BACKEND_HEALTH_URL, 4000);
+  if (!body) return false;
+  try {
+    const j = JSON.parse(body);
+    return !!j && typeof j === 'object' && 'okx' in j && 'cachedFallbackEnabled' in j;
+  } catch {
+    return false;
+  }
+}
+
+// 端口占用者身份护栏（C/R1）：仅当占用者确属本应用才放行强杀，杜绝「误杀陌生进程」。
+// 判据：非通用镜像名 aragon-quant.exe（后端可执行体）∥ 后端端口应答本应用 /api/health 签名。
+function makePortOwnerGuard(port) {
+  return async (pid, image) => {
+    if (image && image.toLowerCase() === 'aragon-quant.exe') return true;
+    if (port === cfg.BACKEND_PORT) return backendHealthMatches();
+    return false;
+  };
+}
+
+// 记录本次拉起的子进程 PID + 镜像名 + 端口到 userData/aragon-pids.json，
+// 供下次启动在「异常退出（force-kill / 崩溃）未触发 before-quit」时清扫残留（B）。
+function persistChildPids() {
+  if (!pm) return;
+  const children = pm.children
+    .filter((c) => c.pid != null)
+    .map((c) => ({
+      name: c.name,
+      pid: c.pid,
+      image: path.basename(c.command),
+      port: c.name === 'backend' ? cfg.BACKEND_PORT : cfg.WEB_PORT,
+    }));
+  writeRecordedPids(pidFilePath(), children);
+}
+
+// 启动端口就绪保障 (round-3)：先清扫上次异常退出残留子进程（B/R3），再预检 18760/18761；
+// 仍被占用者交身份护栏自动回收（A+C）并重检；最终仍被占用才退回提示对话框并请求退出。
+// 返回 true=端口已就绪可继续启动；false=已弹窗并 app.quit()，调用方应立即中止。
+async function ensurePortsAvailable() {
+  // 上次异常退出（force-kill / 崩溃，未触发 before-quit）遗留的本应用子进程：按记录的 PID + 镜像名
+  // 校验（R3 防 PID 复用）后清扫，满足「关闭后端口应被释放」（round-3 之一，覆盖异常退出场景）。
+  try {
+    const reaped = await reapRecordedPids(pidFilePath(), { selfPid: process.pid, log: logMain });
+    if (reaped.length) logMain(`已回收上次异常退出残留子进程：${reaped.join(', ')}`);
+  } catch (e) {
+    logMain(`清扫残留子进程出错（忽略，继续启动）：${e && e.message}`);
+  }
+
+  const probeBusyPorts = async () => {
+    const busy = [];
+    for (const p of [cfg.BACKEND_PORT, cfg.WEB_PORT]) {
+      if (!(await portFree(p))) busy.push(p);
+    }
+    return busy;
+  };
+
+  // 自动回收（A+C）：对被占端口定位 PID，身份护栏放行后强杀并轮询至释放——即自动化原弹窗里
+  // 要求用户手敲的 Get-NetTCPConnection | Stop-Process（round-3 之二），回收后再重检一次。
+  let busy = await probeBusyPorts();
+  if (busy.length) {
+    for (const p of busy) {
+      const res = await reclaimPort(p, { guard: makePortOwnerGuard(p), log: logMain });
+      if (res.reclaimed.length) {
+        logMain(`端口 ${p} 已自动回收占用进程 ${res.reclaimed.join(', ')} 并释放。`);
+      }
+    }
+    busy = await probeBusyPorts();
+  }
+  if (!busy.length) return true;
+
+  // 仍被占用（回收失败 / 占用者非本应用且拒绝越权强杀）→ 退回 round-2 的提示对话框，零行为回归。
+  dialog.showErrorBox(
+    '端口被占用',
+    `端口 ${busy.join(', ')} 已被占用，无法启动 Aragon。\n` +
+      `请释放后重试：\nPowerShell> Get-NetTCPConnection -LocalPort ${busy.join(',')} | ` +
+      `Select OwningProcess ; Stop-Process -Id <PID> -Force`,
+  );
+  app.quit();
+  return false;
 }
 
 // ----------------------------- 子进程启动规格 -----------------------------
@@ -208,6 +306,7 @@ async function startEngines() {
   // 避免占住同端口的孤儿进程用其 health 200 冒充「就绪」（见 desktop-backend-port-bind-conflict；
   // 与 verify-dist.mjs 的 earlyExit 守卫一致）。
   const backend = pm.startChild(backendSpec());
+  persistChildPids(); // 尽早留痕：若启动期被 force-kill，下次启动据此清扫后端孤儿
   const backendOk = await waitForHttp(cfg.BACKEND_HEALTH_URL, cfg.BACKEND_READY_TIMEOUT_MS, {
     isAborted: () => quitting || backend.exited,
   });
@@ -228,6 +327,7 @@ async function startEngines() {
   logMain('启动前端 …');
   // 同后端：受管前端早退即中止就绪轮询，杜绝被 `::`/双栈孤儿监听者冒充就绪。
   const web = pm.startChild(webSpec());
+  persistChildPids(); // 两个子进程齐备后再次留痕（含前端 PID）
   const webOk = await waitForHttp(cfg.WEB_URL, cfg.WEB_READY_TIMEOUT_MS, {
     isAborted: () => quitting || web.exited,
   });
@@ -260,21 +360,8 @@ async function bootstrap() {
     return;
   }
 
-  // 端口预检（18760 / 18761）
-  const busy = [];
-  for (const p of [cfg.BACKEND_PORT, cfg.WEB_PORT]) {
-    if (!(await portFree(p))) busy.push(p);
-  }
-  if (busy.length) {
-    dialog.showErrorBox(
-      '端口被占用',
-      `端口 ${busy.join(', ')} 已被占用，无法启动 Aragon。\n` +
-        `请释放后重试：\nPowerShell> Get-NetTCPConnection -LocalPort ${busy.join(',')} | ` +
-        `Select OwningProcess ; Stop-Process -Id <PID> -Force`,
-    );
-    app.quit();
-    return;
-  }
+  // 端口就绪保障：清扫上次异常退出残留 → 预检 → 自动回收占用 → 仍占用则弹窗退出（round-3）。
+  if (!(await ensurePortsAvailable())) return;
 
   buildMenu();
   createWindow();
@@ -302,8 +389,18 @@ async function gracefulQuit() {
   if (pm) {
     logMain('收到退出信号，正在停止前后端 …');
     await pm.stop();
+    // 兜底端口清扫（R4）：pm.stop() 仅按 PID 树杀受管子进程；若仍有端口被占（逃逸的孙子进程），
+    // 按身份护栏回收，确保「关闭后端口被释放」（round-3 之一，覆盖正常退出场景）。
+    for (const p of [cfg.BACKEND_PORT, cfg.WEB_PORT]) {
+      if (!(await portFree(p))) {
+        const res = await reclaimPort(p, { guard: makePortOwnerGuard(p), log: logMain });
+        if (res.reclaimed.length) logMain(`退出清扫：端口 ${p} 回收 ${res.reclaimed.join(', ')}。`);
+      }
+    }
     logMain('前后端已停止。');
   }
+  // 正常退出已回收自身子进程：清除留痕，避免下次启动误清已不存在 / 被复用的 PID。
+  removeRecordedPids(pidFilePath());
 }
 
 // ----------------------------- 生命周期接线 -----------------------------
