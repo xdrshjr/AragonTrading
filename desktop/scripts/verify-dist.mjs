@@ -107,6 +107,41 @@ function httpGetFull(url, timeoutMs = 12_000) {
   });
 }
 
+function httpPostJson(url, body, timeoutMs = 20_000) {
+  return new Promise((resolve, reject) => {
+    const payload = body == null ? '' : JSON.stringify(body);
+    const req = http.request(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () =>
+        resolve({
+          status: res.statusCode,
+          headers: res.headers,
+          body: Buffer.concat(chunks).toString('utf-8'),
+        }),
+      );
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`HTTP POST timeout ${timeoutMs}ms: ${url}`)));
+    req.on('error', reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+function parseJsonOrFail(res, code, id, label) {
+  try {
+    return JSON.parse(res.body);
+  } catch {
+    fail(code, id, label, `non-JSON: ${res.body.slice(0, 160)}`);
+  }
+}
+
 function extractNextStaticAssets(html, ext) {
   const pattern = new RegExp(`\\/_next\\/static\\/[^"'<>\\s)]+\\.${ext}(?:\\?[^"'<>\\s)]*)?`, 'g');
   return [...new Set([...html.matchAll(pattern)].map((m) => m[0].replace(/&amp;/g, '&')))];
@@ -142,6 +177,60 @@ async function verifyStaticAssets(html) {
   recordPass('web-static-js', '前端 JS 静态资源可用', `${jsAssets.length} 个 /_next/static JS`);
 }
 
+async function verifyPaperBatchSmoke() {
+  const strategiesRes = await httpGetFull(`${cfg.WEB_URL}/api/py/strategies?enabled=true`);
+  if (strategiesRes.status !== 200) {
+    fail(33, 'paper-batch-strategies', 'BFF /api/py/strategies?enabled=true 200', `status ${strategiesRes.status}`);
+  }
+  const strategies = parseJsonOrFail(strategiesRes, 33, 'paper-batch-strategies', 'strategies JSON');
+  const strategyIds = (Array.isArray(strategies) ? strategies : [])
+    .filter((item) => item && item.enabled !== false && !item.unavailable && Number.isInteger(item.id))
+    .map((item) => item.id)
+    .slice(0, 2);
+  if (strategyIds.length < 2) {
+    fail(33, 'paper-batch-strategies', 'at least two enabled strategies', `found ${strategyIds.length}`);
+  }
+
+  const startRes = await httpPostJson(`${cfg.WEB_URL}/api/py/paper/batch/start`, {
+    strategyIds,
+    instId: 'BTC-USDT-SWAP',
+    bar: '1H',
+    initialCapital: 10000,
+    source: 'live',
+    speed: 1,
+    replayBars: 10,
+    priming: false,
+    primingBars: 10,
+  });
+  if (startRes.status !== 200) {
+    fail(33, 'paper-batch-start', 'BFF /api/py/paper/batch/start 200', `status ${startRes.status}: ${startRes.body.slice(0, 240)}`);
+  }
+  const startBody = parseJsonOrFail(startRes, 33, 'paper-batch-start', 'batch start JSON');
+  if (!startBody.groupId || !Array.isArray(startBody.sessions)) {
+    fail(33, 'paper-batch-start', 'batch start shape', startRes.body.slice(0, 240));
+  }
+  const startedIds = startBody.sessions.map((item) => item.strategyId);
+  if (JSON.stringify(startedIds) !== JSON.stringify(strategyIds)) {
+    fail(33, 'paper-batch-start', 'batch strategy ids match selection', `expected ${strategyIds.join(',')}, got ${startedIds.join(',')}`);
+  }
+  smokeGroupId = startBody.groupId;
+
+  const sessionsRes = await httpGetFull(`${cfg.BACKEND_URL}/api/paper/sessions`);
+  if (sessionsRes.status !== 200) {
+    fail(33, 'paper-batch-sessions', 'backend /api/paper/sessions 200', `status ${sessionsRes.status}`);
+  }
+  const sessions = parseJsonOrFail(sessionsRes, 33, 'paper-batch-sessions', 'paper sessions JSON');
+  const runningForGroup = (Array.isArray(sessions) ? sessions : [])
+    .filter((item) => item && item.groupId === startBody.groupId)
+    .map((item) => item.strategyId)
+    .sort((a, b) => a - b);
+  const expectedIds = [...strategyIds].sort((a, b) => a - b);
+  if (JSON.stringify(runningForGroup) !== JSON.stringify(expectedIds)) {
+    fail(33, 'paper-batch-sessions', 'sessions include started batch group', `expected ${expectedIds.join(',')}, got ${runningForGroup.join(',')}`);
+  }
+  recordPass('paper-batch-start', '多策略 paper 批量启动可用', `group=${startBody.groupId}, strategies=${strategyIds.join(',')}`);
+}
+
 /** 轮询直到所有端口可绑（释放）或超时。Windows taskkill /T 异步、子进程树 socket 释放有数百 ms~秒级延迟（P1-2）。 */
 async function waitPortsFree(ports, timeoutMs = 5_000, intervalMs = 250) {
   const deadline = Date.now() + timeoutMs;
@@ -167,6 +256,7 @@ const pm = new ProcessManager({
 });
 
 const tmpDb = join(tmpdir(), `aragon-verify-${process.pid}.db`);
+let smokeGroupId = null;
 
 async function main() {
   log(`目标产物：${UNPACKED}`);
@@ -339,6 +429,9 @@ async function main() {
     }
     if (bffJson.status !== 'ok') fail(32, 'web-bff', 'BFF status==ok', `status=${bffJson.status}`);
     recordPass('web-bff', '前端 BFF 代理可用', '/api/py/health → 后端 200（standalone rewrites 生效）');
+
+    // --- 步骤 6c：多策略 paper 启动 smoke（复现桌面 packaged proxy 失败边界）---
+    await verifyPaperBatchSmoke();
   } catch (err) {
     if (err instanceof VerifyFail) {
       exitCode = err.code;
@@ -348,6 +441,19 @@ async function main() {
       log(`✗ 未预期错误：${err && err.stack ? err.stack : err}`);
     }
   } finally {
+    if (smokeGroupId) {
+      try {
+        const stopped = await httpPostJson(`${cfg.BACKEND_URL}/api/paper/batch/${encodeURIComponent(smokeGroupId)}/stop`, null, 12_000);
+        if (stopped.status === 200) {
+          recordPass('paper-batch-cleanup', '多策略 paper smoke 清理完成', smokeGroupId);
+        } else {
+          recordWarn('paper-batch-cleanup', '多策略 paper smoke 清理异常', `status ${stopped.status}: ${stopped.body.slice(0, 160)}`);
+        }
+      } catch (e) {
+        recordWarn('paper-batch-cleanup', '多策略 paper smoke 清理异常', e && e.message ? e.message : String(e));
+      }
+      smokeGroupId = null;
+    }
     if (KEEP_RUNNING) {
       // P2-3：保留子进程与临时 DB，跳过拆解与残端口断言，给手动释放指引。
       recordWarn('teardown', '保留子进程（--keep-running）', `临时 DB 保留于 ${tmpDb}`);
