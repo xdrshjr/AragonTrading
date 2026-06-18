@@ -9,11 +9,17 @@ export default function StrategyList({
   activeId,
   returnsById,
   onSelect,
+  multiSelectIds = [],
+  multiSelectDisabledIds = [],
+  onToggleMultiSelect,
 }: {
   strategies: Strategy[];
   activeId: number | null;
   returnsById: Record<number, number | undefined>;
   onSelect: (id: number) => void;
+  multiSelectIds?: number[];
+  multiSelectDisabledIds?: number[];
+  onToggleMultiSelect?: (id: number) => void;
 }) {
   return (
     <div className="flex flex-col gap-1.5">
@@ -34,7 +40,22 @@ export default function StrategyList({
             )}
           >
             <div className="flex items-center justify-between gap-2">
-              <span className="text-sm font-semibold text-[var(--text)]">{s.name}</span>
+              <span className="flex min-w-0 items-center gap-2">
+                {onToggleMultiSelect && (
+                  <input
+                    type="checkbox"
+                    checked={multiSelectIds.includes(s.id)}
+                    disabled={s.unavailable || multiSelectDisabledIds.includes(s.id)}
+                    onChange={() => onToggleMultiSelect(s.id)}
+                    onClick={(event) => event.stopPropagation()}
+                    className="h-4 w-4 shrink-0 accent-[var(--accent)]"
+                    aria-label={`选择 ${s.name}`}
+                  />
+                )}
+                <span className="truncate text-sm font-semibold text-[var(--text)]">
+                  {s.name}
+                </span>
+              </span>
               <div className="flex items-center gap-1">
                 {s.builtin && <Badge tone="accent">内置</Badge>}
                 {ret !== undefined && (

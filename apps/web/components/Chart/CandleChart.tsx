@@ -543,27 +543,32 @@ export default function CandleChart({
 
 function markerForEvent(event: TradeMarkerEvent): SeriesMarker<Time> {
   const trade = event.trade;
+  const strategyTrade = trade as Trade & { color?: string; strategyName?: string };
+  const color = strategyTrade.color;
+  const label = strategyTrade.strategyName ? shortStrategyLabel(strategyTrade.strategyName) : "";
+  const suffix = label ? ` ${label}` : "";
   if (event.kind === "entry-long") {
     return {
       time: trade.ts as UTCTimestamp,
       position: "belowBar",
-      color: cssVar("--long"),
+      color: color ?? cssVar("--long"),
       shape: "arrowUp",
-      text: "BUY",
+      text: `BUY${suffix}`,
     };
   }
   if (event.kind === "entry-short") {
     return {
       time: trade.ts as UTCTimestamp,
       position: "aboveBar",
-      color: cssVar("--short"),
+      color: color ?? cssVar("--short"),
       shape: "arrowDown",
-      text: "SELL",
+      text: `SELL${suffix}`,
     };
   }
 
   const tone = tradeToneForEvent(event);
-  const color =
+  const closeColor =
+    color ??
     tone === "long"
       ? cssVar("--long")
       : tone === "short"
@@ -573,12 +578,22 @@ function markerForEvent(event: TradeMarkerEvent): SeriesMarker<Time> {
   return {
     time: trade.ts as UTCTimestamp,
     position: "aboveBar",
-    color,
+    color: closeColor,
     shape: "circle",
-    text: `CLOSE ${trade.pnl >= 0 ? "+" : ""}${trade.pnl.toFixed(1)}`,
+    text: `CLOSE${suffix} ${trade.pnl >= 0 ? "+" : ""}${trade.pnl.toFixed(1)}`,
   };
 }
 
 function trailColor(segment: TradeTrailSegment): string {
-  return segment.direction === "long" ? cssVar("--long") : cssVar("--short");
+  const color = (segment.entry as Trade & { color?: string }).color;
+  return color ?? (segment.direction === "long" ? cssVar("--long") : cssVar("--short"));
+}
+
+function shortStrategyLabel(name: string): string {
+  return name
+    .split(/\s+/)
+    .map((part) => part[0])
+    .join("")
+    .slice(0, 4)
+    .toUpperCase();
 }

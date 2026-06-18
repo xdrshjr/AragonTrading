@@ -74,6 +74,44 @@ class PaperStartReq(BaseModel):
     primingBars: int = Field(default=300, ge=10, le=600)  # 预热回看根数；会话内再夹取 [warmup+5,600]
 
 
+class PaperBatchStartReq(BaseModel):
+    strategyIds: list[int] = Field(min_length=1, max_length=12)
+    instId: str
+    bar: str = "1H"
+    initialCapital: float | None = None
+    source: Literal["live", "replay"] = "live"
+    speed: float = Field(default=1.0, gt=0, le=64)
+    replayBars: int = Field(default=300, ge=10, le=600)
+    priming: bool = True
+    primingBars: int = Field(default=300, ge=10, le=600)
+
+
+class PaperBatchSessionOut(BaseModel):
+    strategyId: int
+    name: str
+    sessionId: str
+    runId: int
+    state: str
+
+
+class PaperBatchStartOut(BaseModel):
+    groupId: str
+    instId: str
+    bar: str
+    sessions: list[PaperBatchSessionOut]
+
+
+class PaperBatchStopRunOut(BaseModel):
+    strategyId: int
+    sessionId: str
+    run: dict[str, Any]
+
+
+class PaperBatchStopOut(BaseModel):
+    groupId: str
+    runs: list[PaperBatchStopRunOut]
+
+
 # ---------------- Response serializers ----------------
 def trade_out(t: Trade) -> dict:
     return {

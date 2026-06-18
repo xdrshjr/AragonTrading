@@ -3,7 +3,15 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { DEFAULT_INDICATORS, type IndicatorKey } from "./indicators";
-import type { AccountMode, Bar, BottomTab, ChartPane, ChartView, Mode } from "./types";
+import type {
+  AccountMode,
+  Bar,
+  BottomTab,
+  ChartPane,
+  ChartView,
+  Mode,
+  PaperStrategySession,
+} from "./types";
 
 type Theme = "light" | "dark";
 const DEFAULT_RANGE_DAYS = 30;
@@ -28,6 +36,12 @@ interface AppState {
   accountMode: AccountMode;
   simBalance: number;
   paperSessionId: string | null;
+  paperSelectionIds: number[];
+  paperVisibleStrategyIds: number[];
+  paperActiveStrategyId: number | null;
+  paperBatchGroupId: string | null;
+  paperSessionsByStrategyId: Record<number, PaperStrategySession>;
+  paperStreamsEnabled: boolean;
   theme: Theme;
   backtestStartTs: number;
   backtestEndTs: number;
@@ -45,6 +59,15 @@ interface AppState {
   setAccountMode: (m: AccountMode) => void;
   setSimBalance: (n: number) => void;
   setPaperSessionId: (id: string | null) => void;
+  setPaperSelectionIds: (ids: number[]) => void;
+  togglePaperSelectionId: (id: number) => void;
+  setPaperVisibleStrategyIds: (ids: number[]) => void;
+  togglePaperVisibleStrategyId: (id: number) => void;
+  setPaperActiveStrategyId: (id: number | null) => void;
+  setPaperBatchGroupId: (id: string | null) => void;
+  setPaperSessionsByStrategyId: (sessions: Record<number, PaperStrategySession>) => void;
+  setPaperStreamsEnabled: (enabled: boolean) => void;
+  clearPaperRuntime: () => void;
   setBacktestRange: (startTs: number, endTs: number) => void;
   toggleTheme: () => void;
   setTheme: (t: Theme) => void;
@@ -68,6 +91,12 @@ export const useAppStore = create<AppState>()(
       accountMode: "sim",
       simBalance: DEFAULT_SIM_BALANCE,
       paperSessionId: null,
+      paperSelectionIds: [],
+      paperVisibleStrategyIds: [],
+      paperActiveStrategyId: null,
+      paperBatchGroupId: null,
+      paperSessionsByStrategyId: {},
+      paperStreamsEnabled: false,
       theme: "light",
       backtestStartTs: defaultStartTs,
       backtestEndTs: defaultEndTs,
@@ -97,6 +126,34 @@ export const useAppStore = create<AppState>()(
             : { simBalance: s.simBalance },
         ),
       setPaperSessionId: (paperSessionId) => set({ paperSessionId }),
+      setPaperSelectionIds: (paperSelectionIds) => set({ paperSelectionIds }),
+      togglePaperSelectionId: (id) =>
+        set((s) => ({
+          paperSelectionIds: s.paperSelectionIds.includes(id)
+            ? s.paperSelectionIds.filter((item) => item !== id)
+            : [...s.paperSelectionIds, id],
+        })),
+      setPaperVisibleStrategyIds: (paperVisibleStrategyIds) => set({ paperVisibleStrategyIds }),
+      togglePaperVisibleStrategyId: (id) =>
+        set((s) => ({
+          paperVisibleStrategyIds: s.paperVisibleStrategyIds.includes(id)
+            ? s.paperVisibleStrategyIds.filter((item) => item !== id)
+            : [...s.paperVisibleStrategyIds, id],
+        })),
+      setPaperActiveStrategyId: (paperActiveStrategyId) => set({ paperActiveStrategyId }),
+      setPaperBatchGroupId: (paperBatchGroupId) => set({ paperBatchGroupId }),
+      setPaperSessionsByStrategyId: (paperSessionsByStrategyId) =>
+        set({ paperSessionsByStrategyId }),
+      setPaperStreamsEnabled: (paperStreamsEnabled) => set({ paperStreamsEnabled }),
+      clearPaperRuntime: () =>
+        set({
+          paperSessionId: null,
+          paperVisibleStrategyIds: [],
+          paperActiveStrategyId: null,
+          paperBatchGroupId: null,
+          paperSessionsByStrategyId: {},
+          paperStreamsEnabled: false,
+        }),
       setBacktestRange: (backtestStartTs, backtestEndTs) =>
         set({ backtestStartTs, backtestEndTs, runId: null }),
       toggleTheme: () =>

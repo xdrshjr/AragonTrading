@@ -7,6 +7,8 @@ import type {
   Health,
   Instrument,
   Metrics,
+  PaperBatchStartResult,
+  PaperBatchStopResult,
   Run,
   Strategy,
   Trade,
@@ -170,7 +172,24 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  paperBatchStart: (body: {
+    strategyIds: number[];
+    instId: string;
+    bar: string;
+    initialCapital?: number;
+    source?: "live" | "replay";
+    speed?: number;
+    replayBars?: number;
+    priming?: boolean;
+    primingBars?: number;
+  }) =>
+    request<PaperBatchStartResult>("/paper/batch/start", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   paperStop: (sessionId: string) =>
     request<Run>(`/paper/${sessionId}/stop`, { method: "POST" }),
+  paperBatchStop: (groupId: string) =>
+    request<PaperBatchStopResult>(`/paper/batch/${groupId}/stop`, { method: "POST" }),
   paperSessions: () => request<unknown[]>("/paper/sessions"),
 };

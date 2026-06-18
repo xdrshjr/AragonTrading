@@ -42,8 +42,10 @@ export default function TradeTooltip({ events, x, y }: TradeTooltipProps) {
 }
 
 function TooltipRow({ event }: { event: TradeMarkerEvent }) {
+  const strategy = event.trade as typeof event.trade & { strategyName?: string; color?: string };
   const tone = tradeToneForEvent(event);
   const color =
+    strategy.color ??
     tone === "long"
       ? "var(--long)"
       : tone === "short"
@@ -53,8 +55,13 @@ function TooltipRow({ event }: { event: TradeMarkerEvent }) {
   return (
     <div className="rounded-[6px] bg-[var(--surface-2)] px-2 py-1.5">
       <div className="flex items-center justify-between gap-2">
-        <span className="font-semibold" style={{ color }}>
-          {KIND_LABEL[event.kind]}
+        <span className="flex min-w-0 items-center gap-1.5 font-semibold" style={{ color }}>
+          <span>{KIND_LABEL[event.kind]}</span>
+          {strategy.strategyName && (
+            <span className="truncate text-[10px] text-[var(--muted)]">
+              {strategy.strategyName}
+            </span>
+          )}
         </span>
         <span className="tabular text-[var(--muted)]">
           px {fmtPrice(event.trade.price)} / qty {fmtQty(event.trade.qty)}

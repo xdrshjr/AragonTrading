@@ -3,16 +3,17 @@
 import { Tabs } from "@/components/ui";
 import { colorForReturn, fmtNum, fmtPct, fmtPrice, fmtTime, signed } from "@/lib/format";
 import { computeOhlcStats } from "@/lib/ohlc";
-import type { Candle, ChartPane } from "@/lib/types";
+import type { Candle, ChartPane, PaperStrategySession } from "@/lib/types";
 
-// 工具栏下方横栏（chart-workspace-layout 需求 1 视图页签 + 需求 2 OHLC 数值横栏）。
-// 空安全（R2）：candle / prevClose 可能为 null，统计经纯函数 computeOhlcStats，仅对非空数值着色 / 取符号，否则「—」。
 interface ChartHeaderBarProps {
   view: ChartPane;
   onView: (v: ChartPane) => void;
-  candle: Candle | null; // 被选中 / 最新一根（price 视图用）
-  prevClose: number | null; // 计算涨跌 / 振幅的昨收基准
-  equitySummary?: { last: number | null; ret: number | null }; // equity 视图右侧摘要
+  candle: Candle | null;
+  prevClose: number | null;
+  equitySummary?: { last: number | null; ret: number | null };
+  paperStrategies?: PaperStrategySession[];
+  visiblePaperStrategyIds?: number[];
+  onTogglePaperStrategy?: (id: number) => void;
 }
 
 const VIEW_TABS = [
@@ -26,9 +27,11 @@ export default function ChartHeaderBar({
   candle,
   prevClose,
   equitySummary,
+  paperStrategies = [],
+  visiblePaperStrategyIds = [],
+  onTogglePaperStrategy,
 }: ChartHeaderBarProps) {
   const { change, changePct, amplitude } = computeOhlcStats(candle, prevClose);
-  // R1：共享 Tabs.onChange 形参为宽类型 string，在组件内部收窄后再上抛窄类型 setter。
   const changeColor = change != null ? colorForReturn(change) : "var(--muted)";
 
   return (
@@ -39,7 +42,7 @@ export default function ChartHeaderBar({
 
       {view === "price" ? (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5 tabular">
-          <span className="text-[var(--muted)]">{candle ? fmtTime(candle.ts) : "—"}</span>
+          <span className="text-[var(--muted)]">{candle ? fmtTime(candle.ts) : "-"}</span>
           <Field label="开" value={fmtPrice(candle?.o)} />
           <Field label="高" value={fmtPrice(candle?.h)} />
           <Field label="低" value={fmtPrice(candle?.l)} />
@@ -47,14 +50,14 @@ export default function ChartHeaderBar({
           <span className="flex items-center gap-1">
             <span className="text-[var(--muted)]">涨跌</span>
             <span className="font-medium" style={{ color: changeColor }}>
-              {change != null ? signed(change) : "—"} / {fmtPct(changePct)}
+              {change != null ? signed(change) : "-"} / {fmtPct(changePct)}
             </span>
           </span>
           <Field label="振幅" value={fmtPct(amplitude)} />
         </div>
       ) : (
         <div className="flex items-center gap-x-3 tabular">
-          <Field label="净值" value={equitySummary ? fmtNum(equitySummary.last) : "—"} />
+          <Field label="净值" value={equitySummary ? fmtNum(equitySummary.last) : "-"} />
           <span className="flex items-center gap-1">
             <span className="text-[var(--muted)]">收益</span>
             <span
@@ -67,6 +70,30 @@ export default function ChartHeaderBar({
               {fmtPct(equitySummary?.ret)}
             </span>
           </span>
+        </div>
+      )}
+
+      {paperStrategies.length > 1 && (
+        <div className="ml-auto flex max-w-full flex-wrap items-center justify-end gap-1">
+          {paperStrategies.map((strategy) => {
+            const active = visiblePaperStrategyIds.includes(strategy.strategyId);
+            return (
+              <button
+                key={strategy.strategyId}
+                type="button"
+                onClick={() => onTogglePaperStrategy?.(strategy.strategyId)}
+                className="flex h-6 items-center gap-1 rounded border px-1.5 text-[10px] font-medium"
+                style={{
+                  borderColor: active ? strategy.color : "var(--border)",
+                  color: active ? "var(--text)" : "var(--muted)",
+                  background: active ? "var(--surface-2)" : "transparent",
+                }}
+              >
+                <span className="h-2 w-2 rounded-full" style={{ background: strategy.color }} />
+                <span className="max-w-[72px] truncate">{strategy.strategyName}</span>
+              </button>
+            );
+          })}
         </div>
       )}
     </div>

@@ -10,8 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
-from ..paper.manager import PaperSessionLimitError, get_paper_manager
-from ..schemas import PaperStartReq
+from ..paper.manager import (
+    PaperBatchStrategy,
+    PaperSessionLimitError,
+    get_paper_manager,
+)
+from ..schemas import PaperBatchStartReq, PaperStartReq
 from ..strategies.base import get_strategy_class
 
 router = APIRouter(tags=["paper"])
@@ -42,6 +46,81 @@ async def paper_start(body: PaperStartReq,
     except PaperSessionLimitError as exc:
         raise HTTPException(429, detail={"code": "SESSION_LIMIT", "message": str(exc)})
     return {"sessionId": sess.session_id, "runId": sess.run_id}
+
+
+@router.post("/paper/batch/start")
+async def paper_batch_start(body: PaperBatchStartReq,
+                            session: AsyncSession = Depends(get_session)) -> dict:
+    strategy_ids = dedupe_ids(body.strategyIds)
+    settings = get_settings()
+    if len(strategy_ids) > settings.max_paper_sessions:
+        raise HTTPException(429, detail={
+            "code": "SESSION_LIMIT",
+            "message": f"requested sessions exceed limit {settings.max_paper_sessions}",
+        })
+
+    batch_items: list[PaperBatchStrategy] = []
+    missing_ids: list[int] = []
+    for strategy_id in strategy_ids:
+        row = await repo.get_strategy_row(session, strategy_id)
+        if row is None:
+            missing_ids.append(strategy_id)
+            continue
+        cls = get_strategy_class(row.template_key)
+        if cls is None:
+            raise HTTPException(400, detail={
+                "code": "UNAVAILABLE",
+                "message": f"strategy template unavailable: {row.template_key}",
+            })
+        try:
+            params = {**cls.meta.default_params, **json.loads(row.params_json or "{}")}
+        except json.JSONDecodeError:
+            params = dict(cls.meta.default_params)
+        batch_items.append(PaperBatchStrategy(strategy_id, row.name or cls.meta.name, cls(params)))
+    if missing_ids:
+        raise HTTPException(404, detail={
+            "code": "NOT_FOUND",
+            "message": f"strategy ids not found: {missing_ids}",
+        })
+
+    initial_capital = body.initialCapital or settings.initial_capital
+    try:
+        group = await get_paper_manager().start_batch(
+            batch_items, body.instId, body.bar, initial_capital,
+            source=body.source, speed=body.speed, replay_bars=body.replayBars,
+            priming=body.priming, priming_bars=body.primingBars)
+    except PaperSessionLimitError as exc:
+        raise HTTPException(429, detail={"code": "SESSION_LIMIT", "message": str(exc)})
+    except Exception as exc:
+        raise HTTPException(500, detail={
+            "code": "PAPER_BATCH_START_FAILED",
+            "message": str(exc),
+        })
+    return {
+        "groupId": group.group_id,
+        "instId": group.inst_id,
+        "bar": group.bar,
+        "sessions": [group_session_out(item) for item in group.sessions],
+    }
+
+
+@router.post("/paper/batch/{group_id}/stop")
+async def paper_batch_stop(group_id: str,
+                           session: AsyncSession = Depends(get_session)) -> dict:
+    group = await get_paper_manager().stop_batch(group_id)
+    if group is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "group not found"})
+    runs = []
+    from ..schemas import run_out
+    for item in group.sessions:
+        run = await repo.get_run(session, item.run_id)
+        if run is not None:
+            runs.append({
+                "strategyId": item.strategy_id,
+                "sessionId": item.session_id,
+                "run": run_out(run),
+            })
+    return {"groupId": group.group_id, "runs": runs}
 
 
 @router.post("/paper/{session_id}/stop")
@@ -84,3 +163,24 @@ async def ws_paper(websocket: WebSocket, session_id: str) -> None:
         pass
     finally:
         session.unsubscribe(queue)
+
+
+def dedupe_ids(strategy_ids: list[int]) -> list[int]:
+    seen: set[int] = set()
+    unique: list[int] = []
+    for strategy_id in strategy_ids:
+        if strategy_id in seen:
+            continue
+        seen.add(strategy_id)
+        unique.append(strategy_id)
+    return unique
+
+
+def group_session_out(item) -> dict:
+    return {
+        "strategyId": item.strategy_id,
+        "name": item.strategy_name,
+        "sessionId": item.session_id,
+        "runId": item.run_id,
+        "state": item.state,
+    }

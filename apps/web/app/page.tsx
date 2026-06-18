@@ -1,9 +1,10 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
+import type { Dispatch, SetStateAction } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import AccountModeSwitch from "@/components/Header/AccountModeSwitch";
 import ChartWorkspace from "@/components/Chart/ChartWorkspace";
+import AccountModeSwitch from "@/components/Header/AccountModeSwitch";
 import StrategyPanel from "@/components/Strategy/StrategyPanel";
 import { Button } from "@/components/ui";
 import { api } from "@/lib/api";
@@ -15,8 +16,14 @@ import {
   shouldStreamMarket,
 } from "@/lib/chartLive";
 import { colorForIndex } from "@/lib/compare";
-import { mergeEquityByTs } from "@/lib/liveSeries";
 import { mergeTradeTape } from "@/lib/marketDepth";
+import {
+  mergePaperEquity,
+  mergePaperTrade,
+  paperSessionsToOverlays,
+  selectFirstAvailablePaperStrategy,
+  visiblePaperTrades,
+} from "@/lib/paperMulti";
 import { useAppStore } from "@/lib/store";
 import type {
   Candle,
@@ -26,7 +33,12 @@ import type {
   MarketTicker,
   MarketTrade,
   OrderBookSnapshot,
+  PaperPositionEvent,
   PaperSnapshot,
+  PaperStatus,
+  PaperStrategySession,
+  StrategyEquityPoint,
+  StrategyTrade,
   Trade,
 } from "@/lib/types";
 import { marketWS, paperWS, type WsEvent } from "@/lib/ws";
@@ -41,31 +53,47 @@ export default function Page() {
     runId,
     chartView,
     paperSessionId,
+    paperSessionsByStrategyId,
+    paperVisibleStrategyIds,
+    paperActiveStrategyId,
+    paperStreamsEnabled,
     theme,
     backtestStartTs,
     backtestEndTs,
     indicators,
     setChartView,
+    setPaperActiveStrategyId,
+    setPaperVisibleStrategyIds,
+    togglePaperVisibleStrategyId,
     toggleTheme,
   } = useAppStore();
 
   const [older, setOlder] = useState<Candle[]>([]);
   const [live, setLive] = useState<Candle[]>([]);
-  const [forming, setForming] = useState<Candle | null>(null); // F1：成形中（未确认）最右一根
-  const [lastPrice, setLastPrice] = useState<number | null>(null); // F1：实时最新价
-  const [liveWsOpen, setLiveWsOpen] = useState(false); // F1：市场实时流连接态
+  const [forming, setForming] = useState<Candle | null>(null);
+  const [lastPrice, setLastPrice] = useState<number | null>(null);
+  const [liveWsOpen, setLiveWsOpen] = useState(false);
   const [marketTicker, setMarketTicker] = useState<MarketTicker | null>(null);
   const [orderBook, setOrderBook] = useState<OrderBookSnapshot | null>(null);
   const [tradeTape, setTradeTape] = useState<MarketTrade[]>([]);
   const [lastMarketTs, setLastMarketTs] = useState<number | null>(null);
   const [marketError, setMarketError] = useState<string | null>(null);
-  const [liveEquity, setLiveEquity] = useState<EquityPoint[]>([]);
-  const [liveTrades, setLiveTrades] = useState<Trade[]>([]);
+  const [paperTradesByStrategyId, setPaperTradesByStrategyId] = useState<
+    Record<number, StrategyTrade[]>
+  >({});
+  const [paperEquityByStrategyId, setPaperEquityByStrategyId] = useState<
+    Record<number, StrategyEquityPoint[]>
+  >({});
+  const [paperStatusByStrategyId, setPaperStatusByStrategyId] = useState<
+    Record<number, PaperStatus>
+  >({});
+  const [paperPositionsByStrategyId, setPaperPositionsByStrategyId] = useState<
+    Record<number, PaperPositionEvent | null>
+  >({});
   const [jumpToTs, setJumpToTs] = useState<number | null>(null);
   const loadingMore = useRef(false);
   const lastMarketTsRef = useRef<number | null>(null);
 
-  // 健康检查（连接状态点反映真实 OKX 可达性，C1；含时延 / 最近取数时间，F2）
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
   const okxUp = health.data ? health.data.okx === "up" : null;
   const latencyMs = health.data?.okxLatencyMs ?? null;
@@ -94,29 +122,28 @@ export default function Page() {
       }),
     [chartView, mode, runRange, instId, bar, backtestStartTs, backtestEndTs],
   );
+
   const streamMarket = shouldStreamMarket(mode, okxUp);
   const applyPublicCandle = shouldApplyPublicCandle(chartView, mode, paperSessionId);
   const latestFallback = applyPublicCandle && !liveWsOpen;
   const rangeAvailable = mode === "compare" || !!runRange;
 
-  // 对比结果（由右侧 CompareView 写入共享缓存，F3）→ 映射为左图归一化净值叠加
   const compareQ = useQuery<CompareResult | null>({
     queryKey: ["compare", instId, bar, backtestStartTs, backtestEndTs],
-    queryFn: () => null, // 占位：实际数据由 CompareView 通过 setQueryData 写入，本查询不主动请求
+    queryFn: () => null,
     enabled: false,
     initialData: null,
   });
-  const overlays =
+  const compareOverlays =
     chartView === "compare-range" && mode === "compare" && compareQ.data
-      ? compareQ.data.items.map((it, i) => ({
-          id: it.strategyId,
-          name: it.name,
-          color: colorForIndex(i),
-          equity: it.equity,
+      ? compareQ.data.items.map((item, index) => ({
+          id: item.strategyId,
+          name: item.name,
+          color: colorForIndex(index),
+          equity: item.equity,
         }))
       : undefined;
 
-  // 真实历史 K 线（带数据来源 meta，F2）：读 X-Aragon-Data-Source 头判断 live / cache
   const candlesQ = useQuery({
     queryKey: [
       "candles",
@@ -144,10 +171,8 @@ export default function Page() {
     if (!rows || !chartRange) return rows;
     return rows.filter((c) => chartRange.startTs <= c.ts && c.ts <= chartRange.endTs);
   }, [candlesQ.data?.candles, chartRange]);
-  // 主视图新鲜度：以一次性历史拉取的来源为准（query 重取时回落 live，天然覆盖切标的/周期重置，C5/C9）
   const dataSource = candlesQ.data?.source ?? "live";
 
-  // 切换标的/周期 → 清空增量与实时缓冲（F1：连带重置成形根 / 实时价，避免显示上一标的旧值，C5）
   useEffect(() => {
     setOlder([]);
     setLive([]);
@@ -176,20 +201,16 @@ export default function Page() {
   );
 
   const loadMore = async (beforeTs: number) => {
-    if (chartRange) return;
-    if (loadingMore.current) return;
+    if (chartRange || loadingMore.current) return;
     loadingMore.current = true;
     try {
       const more = await api.candles(instId, bar, 300, beforeTs);
       if (more.length) setOlder((prev) => mergeUnique(more, prev));
-    } catch {
-      /* 忽略增量失败 */
     } finally {
       loadingMore.current = false;
     }
   };
 
-  // 回测叠加数据
   const equityQ = useQuery({
     queryKey: ["equity", runId],
     queryFn: () => api.equity(runId as number),
@@ -201,39 +222,62 @@ export default function Page() {
     enabled: !!runId && mode === "backtest" && chartView === "run-range",
   });
 
-  // 实时模拟 WS：快照重放 + 增量（净值按 ts upsert、成形根跳动、seeded 成交）
+  const paperStrategies = useMemo(
+    () => Object.values(paperSessionsByStrategyId),
+    [paperSessionsByStrategyId],
+  );
+  const effectiveVisibleIds =
+    paperVisibleStrategyIds.length > 0
+      ? paperVisibleStrategyIds
+      : paperStrategies.map((session) => session.strategyId);
+  const effectiveActivePaperStrategyId = selectFirstAvailablePaperStrategy(
+    paperActiveStrategyId,
+    paperSessionsByStrategyId,
+  );
+
   useEffect(() => {
-    if (mode !== "paper" || !paperSessionId) return;
-    setLiveEquity([]);
-    setLiveTrades([]);
+    if (paperStrategies.length === 0) return;
+    if (paperVisibleStrategyIds.length === 0) {
+      setPaperVisibleStrategyIds(paperStrategies.map((session) => session.strategyId));
+    }
+    const nextActive = selectFirstAvailablePaperStrategy(
+      paperActiveStrategyId,
+      paperSessionsByStrategyId,
+    );
+    if (nextActive !== paperActiveStrategyId) setPaperActiveStrategyId(nextActive);
+  }, [
+    paperStrategies,
+    paperVisibleStrategyIds.length,
+    paperActiveStrategyId,
+    paperSessionsByStrategyId,
+    setPaperActiveStrategyId,
+    setPaperVisibleStrategyIds,
+  ]);
+
+  useEffect(() => {
+    if (mode !== "paper" || !paperStreamsEnabled || paperStrategies.length === 0) return;
+    setPaperTradesByStrategyId({});
+    setPaperEquityByStrategyId({});
+    setPaperStatusByStrategyId({});
+    setPaperPositionsByStrategyId({});
     setForming(null);
-    const ws = paperWS(paperSessionId, (e: WsEvent) => {
-      if (e.type === "snapshot") {
-        // 订阅即重放：整体替换（修复晚订阅 / 断线重连丢历史，B3）；其后增量再追加。
-        const snap = e.data as PaperSnapshot;
-        setLiveTrades(snap.trades ?? []);
-        setLiveEquity(snap.equity ?? []);
-      } else if (e.type === "equity") {
-        // transient 与同根确认 equity 共享成形根 ts → 按 ts upsert 收敛为单点（修复 P1-3）。
-        setLiveEquity((prev) => mergeEquityByTs(prev, e.data as EquityPoint));
-      } else if (e.type === "trade") {
-        setLiveTrades((prev) => [...prev, e.data as Trade]);
-      } else if (e.type === "candle") {
-        // paper 模式下成形根来自 paper 流（公共行情成形根被 shouldApplyPublicCandle 抑制，B2）。
-        const c = e.data as Candle;
-        if (c.confirm) {
-          setLive((prev) => mergeUnique(prev, [c]));
-          setForming(null);
-        } else {
-          setForming(c);
-        }
-      }
-      // position 事件为可选便捷读数（B2/P2-3）：当前持仓权威视图仍由 deriveOpenPosition
-      // 从 overlayTrades + markPrice 推导，故此处不消费，避免双数据源分叉。
+
+    const clients = paperStrategies.map((session) => {
+      const ws = paperWS(session.sessionId, (event: WsEvent) => {
+        handlePaperEvent(event, session, {
+          setPaperTradesByStrategyId,
+          setPaperEquityByStrategyId,
+          setPaperStatusByStrategyId,
+          setPaperPositionsByStrategyId,
+          setLive,
+          setForming,
+        });
+      });
+      ws.connect();
+      return ws;
     });
-    ws.connect();
-    return () => ws.close();
-  }, [mode, paperSessionId]);
+    return () => clients.forEach((client) => client.close());
+  }, [mode, paperStreamsEnabled, paperStrategies]);
 
   const recordMarketTs = (ts: number) => {
     lastMarketTsRef.current = Math.max(lastMarketTsRef.current ?? 0, ts);
@@ -245,37 +289,37 @@ export default function Page() {
     const ws = marketWS(
       instId,
       bar,
-      (e) => {
-        if (e.type === "error") {
-          setMarketError(e.data.message);
+      (event) => {
+        if (event.type === "error") {
+          setMarketError(event.data.message);
           return;
         }
         setMarketError(null);
-        if (e.type === "trade") {
-          setTradeTape((prev) => mergeTradeTape(prev, e.data));
-          setLastPrice(e.data.price);
-          recordMarketTs(e.data.ts);
+        if (event.type === "trade") {
+          setTradeTape((prev) => mergeTradeTape(prev, event.data));
+          setLastPrice(event.data.price);
+          recordMarketTs(event.data.ts);
           return;
         }
-        if (e.type === "ticker") {
-          setMarketTicker(e.data);
-          setLastPrice(e.data.last);
-          recordMarketTs(e.data.ts);
+        if (event.type === "ticker") {
+          setMarketTicker(event.data);
+          setLastPrice(event.data.last);
+          recordMarketTs(event.data.ts);
           return;
         }
-        if (e.type === "book") {
-          setOrderBook(e.data);
-          recordMarketTs(e.data.ts);
+        if (event.type === "book") {
+          setOrderBook(event.data);
+          recordMarketTs(event.data.ts);
           return;
         }
-        const c = e.data;
-        if ((lastMarketTsRef.current ?? 0) <= c.ts) setLastPrice(c.c);
+        const candle = event.data;
+        if ((lastMarketTsRef.current ?? 0) <= candle.ts) setLastPrice(candle.c);
         if (!applyPublicCandle) return;
-        if (c.confirm === true) {
-          setLive((prev) => mergeUnique(prev, [c]));
+        if (candle.confirm === true) {
+          setLive((prev) => mergeUnique(prev, [candle]));
           setForming(null);
         } else {
-          setForming(c);
+          setForming(candle);
         }
       },
       (open) => {
@@ -290,30 +334,45 @@ export default function Page() {
     };
   }, [streamMarket, applyPublicCandle, instId, bar]);
 
-  // compare 模式不画单策略净值 / markers（改用多条归一化 overlays，C1）
+  const paperOverlayTrades = visiblePaperTrades(paperTradesByStrategyId, effectiveVisibleIds);
+  const activePaperTrades =
+    effectiveActivePaperStrategyId == null
+      ? paperOverlayTrades
+      : paperTradesByStrategyId[effectiveActivePaperStrategyId] ?? [];
+  const paperEquityOverlays = paperSessionsToOverlays(
+    paperSessionsByStrategyId,
+    paperEquityByStrategyId,
+    effectiveVisibleIds,
+  );
+  const paperActiveEquity =
+    effectiveActivePaperStrategyId == null
+      ? undefined
+      : paperEquityByStrategyId[effectiveActivePaperStrategyId];
+
   const overlayEquity =
     mode === "paper"
-      ? liveEquity
+      ? paperActiveEquity
       : chartView === "run-range" && mode === "backtest"
         ? equityQ.data
         : undefined;
+  const overlays =
+    mode === "paper" && paperEquityOverlays.length > 0 ? paperEquityOverlays : compareOverlays;
   const overlayTrades =
     mode === "paper"
-      ? liveTrades
+      ? paperOverlayTrades
       : chartView === "run-range" && mode === "backtest"
         ? tradesQ.data
         : undefined;
+  const bottomTrades = mode === "paper" ? activePaperTrades : overlayTrades;
   const tradeCapReached =
     chartView === "run-range" &&
     mode === "backtest" &&
     (tradesQ.data?.length ?? 0) >= BACKTEST_TRADE_LIMIT;
 
-  // F3：挂载后从 localStorage 补水持久化选择态/主题（skipHydration 配合，避免 SSR 水合告警，C2）
   useEffect(() => {
     useAppStore.persist.rehydrate();
   }, []);
 
-  // 初始化主题
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
   }, [theme]);
@@ -346,13 +405,13 @@ export default function Page() {
           />
           <span className="text-sm font-semibold tracking-tight">Aragon Trading</span>
           <span className="hidden text-[11px] text-[var(--muted)] sm:inline">
-            多策略量化模拟交易 · 欧易(OKX)真实行情
+            多策略量化模拟交易 · OKX 真实行情
           </span>
         </div>
         <div className="flex items-center gap-2">
           <AccountModeSwitch />
           <Button variant="ghost" size="sm" onClick={toggleTheme} aria-label="切换主题">
-            {theme === "light" ? "🌙 暗色" : "☀️ 亮色"}
+            {theme === "light" ? "暗色" : "亮色"}
           </Button>
         </div>
       </header>
@@ -363,6 +422,7 @@ export default function Page() {
           overlayEquity={overlayEquity}
           overlays={overlays}
           overlayTrades={overlayTrades}
+          bottomTrades={bottomTrades}
           tradeCapReached={tradeCapReached}
           indicators={indicators}
           theme={theme}
@@ -373,6 +433,11 @@ export default function Page() {
           chartError={chartError}
           onLoadMore={loadMore}
           jumpToTs={jumpToTs}
+          paperStrategies={paperStrategies}
+          activePaperStrategyId={effectiveActivePaperStrategyId}
+          visiblePaperStrategyIds={effectiveVisibleIds}
+          onActivePaperStrategyChange={setPaperActiveStrategyId}
+          onToggleVisiblePaperStrategy={togglePaperVisibleStrategyId}
           toolbar={{
             okxUp,
             latencyMs,
@@ -394,6 +459,97 @@ export default function Page() {
   );
 }
 
+interface PaperEventSetters {
+  setPaperTradesByStrategyId: Dispatch<SetStateAction<Record<number, StrategyTrade[]>>>;
+  setPaperEquityByStrategyId: Dispatch<SetStateAction<Record<number, StrategyEquityPoint[]>>>;
+  setPaperStatusByStrategyId: Dispatch<SetStateAction<Record<number, PaperStatus>>>;
+  setPaperPositionsByStrategyId: Dispatch<
+    SetStateAction<Record<number, PaperPositionEvent | null>>
+  >;
+  setLive: Dispatch<SetStateAction<Candle[]>>;
+  setForming: Dispatch<SetStateAction<Candle | null>>;
+}
+
+function handlePaperEvent(
+  event: WsEvent,
+  session: PaperStrategySession,
+  setters: PaperEventSetters,
+) {
+  if (event.type === "snapshot") {
+    const snap = event.data as PaperSnapshot;
+    setters.setPaperTradesByStrategyId((prev) => ({
+      ...prev,
+      [session.strategyId]: (snap.trades ?? []).map((trade) => enrichTrade(trade, session)),
+    }));
+    setters.setPaperEquityByStrategyId((prev) => ({
+      ...prev,
+      [session.strategyId]: (snap.equity ?? []).map((point) =>
+        enrichEquity(point, session.strategyId),
+      ),
+    }));
+    setters.setPaperPositionsByStrategyId((prev) => ({
+      ...prev,
+      [session.strategyId]: snap.position ?? null,
+    }));
+    if (snap.status) {
+      setters.setPaperStatusByStrategyId((prev) => ({
+        ...prev,
+        [session.strategyId]: snap.status as PaperStatus,
+      }));
+    }
+    return;
+  }
+  if (event.type === "equity") {
+    setters.setPaperEquityByStrategyId((prev) =>
+      mergePaperEquity(prev, enrichEquity(event.data as EquityPoint, session.strategyId)),
+    );
+    return;
+  }
+  if (event.type === "trade") {
+    setters.setPaperTradesByStrategyId((prev) =>
+      mergePaperTrade(prev, enrichTrade(event.data as Trade, session)),
+    );
+    return;
+  }
+  if (event.type === "status") {
+    setters.setPaperStatusByStrategyId((prev) => ({
+      ...prev,
+      [session.strategyId]: event.data as PaperStatus,
+    }));
+    return;
+  }
+  if (event.type === "position") {
+    setters.setPaperPositionsByStrategyId((prev) => ({
+      ...prev,
+      [session.strategyId]: event.data as PaperPositionEvent,
+    }));
+    return;
+  }
+  if (event.type === "candle") {
+    const candle = event.data as Candle;
+    if (candle.confirm) {
+      setters.setLive((prev) => mergeUnique(prev, [candle]));
+      setters.setForming(null);
+    } else {
+      setters.setForming(candle);
+    }
+  }
+}
+
+function enrichTrade(trade: Trade, session: PaperStrategySession): StrategyTrade {
+  return {
+    ...trade,
+    strategyId: session.strategyId,
+    strategyName: session.strategyName,
+    runId: trade.runId ?? session.runId,
+    color: session.color,
+  };
+}
+
+function enrichEquity(point: EquityPoint, strategyId: number): StrategyEquityPoint {
+  return { ...point, strategyId };
+}
+
 function mergeCandles(
   older: Candle[],
   base: Candle[],
@@ -401,13 +557,12 @@ function mergeCandles(
   forming?: Candle | null,
 ): Candle[] {
   const merged = mergeUnique(mergeUnique(older, base), live);
-  // F1：成形根并入最右端——同 ts 覆盖历史/确认根，得到"最后一根实时跳动"，全程 ts 严格升序（R2）
   return forming ? mergeUnique(merged, [forming]) : merged;
 }
 
 function mergeUnique(a: Candle[], b: Candle[]): Candle[] {
   const map = new Map<number, Candle>();
-  for (const c of a) map.set(c.ts, c);
-  for (const c of b) map.set(c.ts, c);
+  for (const candle of a) map.set(candle.ts, candle);
+  for (const candle of b) map.set(candle.ts, candle);
   return Array.from(map.values()).sort((x, y) => x.ts - y.ts);
 }

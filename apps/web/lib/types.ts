@@ -1,45 +1,48 @@
-// 与后端 Pydantic schema 对齐的共享类型 (spec §9.3)。
-// 约定：本文件所有 ts 字段均为「秒级 UTC 时间戳」(C2，见 spec §4.4)。
-
 export type Bar = "1m" | "5m" | "15m" | "30m" | "1H" | "4H" | "1D";
 export type Mode = "backtest" | "compare" | "paper";
-// 顶部账户模式（live-paper-account-mode 支柱 A）：sim=模拟盘；live=实盘（Phase 2，本期禁用）。
 export type AccountMode = "sim" | "live";
 export type ChartView = "run-range" | "compare-range" | "live-follow";
-
-// 左侧图表区上方「K线价格走势 / 净值」视图页签（chart-workspace-layout 需求 1）。
-// 注意：与既有 ChartView（历史区间选择器）正交，故另起字段名 chartPane（见 spec §实施过程发现的方案缺陷）。
 export type ChartPane = "price" | "equity";
-// 左侧下区「成交记录 / 当前持仓」数据页签（需求 3）。
 export type BottomTab = "trades" | "positions";
-
-// /candles 响应头 X-Aragon-Data-Source 的取值（F2）：live=真实实时，cache=缓存样例·非实时。
 export type DataSource = "live" | "cache";
 
-export type Candle = { ts: number; o: number; h: number; l: number; c: number; vol: number; confirm?: boolean };
+export interface Candle {
+  ts: number;
+  o: number;
+  h: number;
+  l: number;
+  c: number;
+  vol: number;
+  confirm?: boolean;
+}
 
-export type MarketTrade = {
+export interface MarketTrade {
   ts: number;
   price: number;
   qty: number;
   side: "buy" | "sell";
   tradeId?: string | null;
-};
+}
 
-export type OrderBookLevel = { price: number; qty: number; orders?: number | null };
-export type OrderBookSnapshot = {
+export interface OrderBookLevel {
+  price: number;
+  qty: number;
+  orders?: number | null;
+}
+
+export interface OrderBookSnapshot {
   ts: number;
   bids: OrderBookLevel[];
   asks: OrderBookLevel[];
-};
+}
 
-export type MarketTicker = {
+export interface MarketTicker {
   ts: number;
   last: number;
   open24h: number | null;
   vol24h: number | null;
   volCcy24h: number | null;
-};
+}
 
 export type MarketWsEvent =
   | { type: "candle"; data: Candle }
@@ -59,7 +62,12 @@ export interface LiveMarketState {
   updatedTs: number | null;
 }
 
-export type Instrument = { instId: string; instType: "SWAP" | "SPOT"; base: string; quote: string };
+export interface Instrument {
+  instId: string;
+  instType: "SWAP" | "SPOT";
+  base: string;
+  quote: string;
+}
 
 export type ParamSchema = Record<
   string,
@@ -74,7 +82,7 @@ export type ParamSchema = Record<
   }
 >;
 
-export type Strategy = {
+export interface Strategy {
   id: number;
   templateKey: string;
   name: string;
@@ -84,9 +92,9 @@ export type Strategy = {
   enabled: boolean;
   builtin: boolean;
   unavailable?: boolean;
-};
+}
 
-export type Trade = {
+export interface Trade {
   id?: number;
   runId?: number;
   ts: number;
@@ -97,8 +105,8 @@ export type Trade = {
   pnl: number;
   positionAfter: number;
   reason: string;
-  seeded?: boolean; // 预热回放（warm-start priming）回填的历史成交标记（live-paper-account-mode B1）
-};
+  seeded?: boolean;
+}
 
 export type TradeDirection = "long" | "short";
 
@@ -122,10 +130,13 @@ export interface TradeMarkerEvent {
   pairedSegmentId?: string;
 }
 
-// transient：逐笔瞬时盯市点（不入库/不计指标，前端按 ts upsert 仅用于绘动，B2）。
-export type EquityPoint = { ts: number; equity: number; drawdown: number; transient?: boolean };
+export interface EquityPoint {
+  ts: number;
+  equity: number;
+  drawdown: number;
+  transient?: boolean;
+}
 
-// 实时模拟当前持仓便捷读数（可选，B2/§7.1）；权威视图仍由 deriveOpenPosition 推导。
 export interface PaperPositionEvent {
   side: "long" | "short" | "flat";
   size: number;
@@ -134,7 +145,6 @@ export interface PaperPositionEvent {
   unrealizedPnl: number;
 }
 
-// 实时模拟会话状态（订阅即发，显式标注预热边界，B3/§7.1）。
 export interface PaperStatus {
   state: string;
   warmedBars: number;
@@ -142,7 +152,6 @@ export interface PaperStatus {
   initialCapital: number;
 }
 
-// 订阅即重放快照（晚订阅 / 断线重连恢复，B3/§7.1）。
 export interface PaperSnapshot {
   trades: Trade[];
   equity: EquityPoint[];
@@ -150,13 +159,64 @@ export interface PaperSnapshot {
   status?: PaperStatus;
 }
 
-// 一条对比净值叠加曲线（compare 模式，F3）。由 CandleChart 上移至此，供 EquityChart / ChartWorkspace 共享。
-export type Overlay = { id: number; name: string; color: string; equity: EquityPoint[] };
+export interface PaperStrategySession {
+  strategyId: number;
+  strategyName: string;
+  sessionId: string;
+  runId: number;
+  color: string;
+  state: "starting" | "running" | "stopped" | "error";
+}
 
-// 合约行情快照（chart-workspace-layout P2，/tickers）。缺省时 InstrumentList 仅当前标的有价。
-export type Ticker = { instId: string; last: number; open24h: number; changePct: number };
+export interface StrategyTrade extends Trade {
+  strategyId: number;
+  strategyName: string;
+  color: string;
+}
 
-export type Metrics = {
+export interface StrategyEquityPoint extends EquityPoint {
+  strategyId: number;
+}
+
+export interface PaperBatchSessionResult {
+  strategyId: number;
+  name: string;
+  sessionId: string;
+  runId: number;
+  state: PaperStrategySession["state"];
+}
+
+export interface PaperBatchStartResult {
+  groupId: string;
+  instId: string;
+  bar: string;
+  sessions: PaperBatchSessionResult[];
+}
+
+export interface PaperBatchStopResult {
+  groupId: string;
+  runs: { strategyId: number; sessionId: string; run: Run }[];
+}
+
+export interface PaperChartFilter {
+  strategyIds: number[];
+}
+
+export interface Overlay {
+  id: number;
+  name: string;
+  color: string;
+  equity: EquityPoint[];
+}
+
+export interface Ticker {
+  instId: string;
+  last: number;
+  open24h: number;
+  changePct: number;
+}
+
+export interface Metrics {
   totalReturn: number;
   winRate: number;
   profitFactor: number;
@@ -164,9 +224,9 @@ export type Metrics = {
   sharpe: number;
   tradeCount: number;
   avgPnl: number;
-};
+}
 
-export type Run = {
+export interface Run {
   id: number;
   strategyId: number;
   instId: string;
@@ -176,9 +236,9 @@ export type Run = {
   startTs: number;
   endTs?: number | null;
   metrics: Metrics;
-};
+}
 
-export type PaperSessionInfo = {
+export interface PaperSessionInfo {
   sessionId: string;
   runId: number;
   instId: string;
@@ -186,25 +246,32 @@ export type PaperSessionInfo = {
   state: string;
   equity: number;
   positionSide: "long" | "short" | "flat";
-};
+}
 
-// 多策略对比结果（F3）。equity 为归一化前的真实净值，前端按 equity/initial-1 归一化叠加。
-export type CompareItem = {
+export interface CompareItem {
   strategyId: number;
   name: string;
   runId: number;
   metrics: Metrics;
   equity: EquityPoint[];
-};
-export type CompareResult = { instId: string; bar: string; items: CompareItem[] };
+}
 
-export type Health = {
+export interface CompareResult {
+  instId: string;
+  bar: string;
+  items: CompareItem[];
+}
+
+export interface Health {
   status: string;
   okx: "up" | "down";
   okxLatencyMs: number | null;
   lastOkTs: number | null;
   wsConfigured: boolean;
-  cachedFallbackEnabled?: boolean; // F2 新增（可选，向后兼容）
-};
+  cachedFallbackEnabled?: boolean;
+  maxPaperSessions?: number;
+}
 
-export type ApiError = { error: { code: string; message: string } };
+export interface ApiError {
+  error: { code: string; message: string };
+}

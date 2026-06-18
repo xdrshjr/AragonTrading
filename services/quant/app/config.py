@@ -45,7 +45,7 @@ class Settings(BaseSettings):
 
     # ---- 行为开关 ----
     allow_cached_fallback: bool = False
-    max_paper_sessions: int = 3
+    max_paper_sessions: int = 12
 
     # ---- 撮合默认参数 (spec §6.1) ----
     default_taker_fee_bps: float = 5.0       # OKX 永续 taker ≈ 5 bps

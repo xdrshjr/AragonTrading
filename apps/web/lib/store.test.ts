@@ -46,4 +46,26 @@ describe("app store — account mode & sim balance", () => {
     expect(s.instId).toBe("ETH-USDT-SWAP");
     expect(s.bar).toBe("4H");
   });
+
+  it("does not persist runtime paper batch handles", async () => {
+    useAppStore.getState().setPaperBatchGroupId("group-1");
+    useAppStore.getState().setPaperStreamsEnabled(true);
+    useAppStore.getState().setPaperSessionsByStrategyId({
+      1: {
+        strategyId: 1,
+        strategyName: "Alpha",
+        sessionId: "session-1",
+        runId: 101,
+        color: "#111111",
+        state: "running",
+      },
+    });
+
+    const raw = localStorage.getItem("aragon-ui");
+    expect(raw).toBeTruthy();
+    expect(raw).not.toContain("paperBatchGroupId");
+    expect(raw).not.toContain("paperSessionsByStrategyId");
+    expect(raw).not.toContain("paperStreamsEnabled");
+    expect(raw).not.toContain("session-1");
+  });
 });

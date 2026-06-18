@@ -122,18 +122,28 @@ function tradeOrder(item: IndexedTrade): number {
 
 function segmentId(entry: IndexedTrade, exit: IndexedTrade): string {
   const runId = entry.trade.runId ?? exit.trade.runId;
+  const strategyId = strategyKey(entry.trade) ?? strategyKey(exit.trade);
   if (runId != null && entry.trade.id != null && exit.trade.id != null) {
-    return `${runId}-${entry.trade.id}-${exit.trade.id}`;
+    return [strategyId, runId, entry.trade.id, exit.trade.id].filter(Boolean).join("-");
   }
   return [
+    strategyId,
     entry.trade.ts,
     entry.index,
     exit.trade.ts,
     exit.index,
-  ].join("-");
+  ].filter(Boolean).join("-");
 }
 
 function markerId(trade: Trade, index: number): string {
-  if (trade.runId != null && trade.id != null) return `${trade.runId}-${trade.id}`;
-  return `${trade.ts}-${index}-${trade.side}`;
+  const strategyId = strategyKey(trade);
+  if (trade.runId != null && trade.id != null) {
+    return [strategyId, trade.runId, trade.id].filter(Boolean).join("-");
+  }
+  return [strategyId, trade.ts, index, trade.side].filter(Boolean).join("-");
+}
+
+function strategyKey(trade: Trade): string | undefined {
+  const strategyId = (trade as Trade & { strategyId?: number }).strategyId;
+  return strategyId == null ? undefined : `s${strategyId}`;
 }

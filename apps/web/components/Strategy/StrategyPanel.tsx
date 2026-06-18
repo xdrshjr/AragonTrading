@@ -2,17 +2,18 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
-import { api } from "@/lib/api";
-import { equityToCsv, downloadCsv, tradesToCsv } from "@/lib/export";
+import { ApiRequestError, api } from "@/lib/api";
+import { colorForPaperStrategy, resolveMaxPaperSessions, sessionsFromBatch } from "@/lib/paperMulti";
 import { useAppStore } from "@/lib/store";
-import type { Metrics, Strategy } from "@/lib/types";
+import { downloadCsv, equityToCsv, tradesToCsv } from "@/lib/export";
+import type { Metrics, PaperStrategySession, Strategy } from "@/lib/types";
 import { Button, Skeleton, Tabs } from "@/components/ui";
-import StrategyList from "./StrategyList";
-import StrategyDetail from "./StrategyDetail";
-import MetricsCards from "./MetricsCards";
-import TradesTable from "./TradesTable";
 import CompareView from "./CompareView";
+import MetricsCards from "./MetricsCards";
 import RunHistory from "./RunHistory";
+import StrategyDetail from "./StrategyDetail";
+import StrategyList from "./StrategyList";
+import TradesTable from "./TradesTable";
 
 type Params = Record<string, unknown>;
 type PaperOpts = { source?: "live" | "replay"; speed?: number; replayBars?: number };
@@ -27,35 +28,55 @@ export default function StrategyPanel() {
     runId,
     simBalance,
     paperSessionId,
+    paperSelectionIds,
+    paperBatchGroupId,
+    paperSessionsByStrategyId,
     backtestStartTs,
     backtestEndTs,
     setStrategyId,
     setRunId,
     setChartView,
     setPaperSessionId,
+    setPaperSelectionIds,
+    togglePaperSelectionId,
+    setPaperVisibleStrategyIds,
+    setPaperActiveStrategyId,
+    setPaperBatchGroupId,
+    setPaperSessionsByStrategyId,
+    setPaperStreamsEnabled,
+    clearPaperRuntime,
   } = useAppStore();
 
   const [metrics, setMetrics] = useState<Metrics | undefined>();
   const [returnsById, setReturnsById] = useState<Record<number, number | undefined>>({});
   const [tab, setTab] = useState("metrics");
-  const lastAutoKey = useRef<string>("");
+  const [stopError, setStopError] = useState<string | null>(null);
+  const lastAutoKey = useRef("");
 
   const { data: strategies, isLoading } = useQuery({
     queryKey: ["strategies"],
     queryFn: api.strategies,
   });
+  const health = useQuery({ queryKey: ["health"], queryFn: api.health });
+  const maxPaperSessions = resolveMaxPaperSessions(health.data?.maxPaperSessions);
 
-  // 默认选中第一个；F3：持久化恢复的 strategyId 若已不在列表中（被删的自定义策略）也回落第一个，
-  // 避免空详情 / 自动回测打到不存在的 id。
   useEffect(() => {
-    if (!strategies || strategies.length === 0) return;
+    if (!strategies?.length) return;
     const exists = strategyId !== null && strategies.some((s) => s.id === strategyId);
-    if (!exists) {
-      setStrategyId(strategies[0].id);
-    }
+    if (!exists) setStrategyId(strategies[0].id);
   }, [strategies, strategyId, setStrategyId]);
 
-  const selected: Strategy | undefined = strategies?.find((s) => s.id === strategyId);
+  useEffect(() => {
+    if (mode !== "paper" || !strategyId || paperSelectionIds.length > 0) return;
+    setPaperSelectionIds([strategyId]);
+  }, [mode, strategyId, paperSelectionIds.length, setPaperSelectionIds]);
+
+  const selected = strategies?.find((s) => s.id === strategyId);
+  const enabledStrategies = strategies?.filter((s) => !s.unavailable && s.enabled) ?? [];
+  const runningSessions = Object.values(paperSessionsByStrategyId);
+  const selectedCount = paperSelectionIds.length;
+  const capReached = selectedCount >= maxPaperSessions;
+  const busy = false;
 
   const backtest = useMutation({
     mutationFn: (vars: { id: number; params?: Params; showRunRange?: boolean }) =>
@@ -68,7 +89,6 @@ export default function StrategyPanel() {
     },
   });
 
-  // 选择策略 / 切换标的周期 → 自动回测（acceptance #3）
   useEffect(() => {
     if (mode !== "backtest" || !strategyId || !strategies) return;
     const key = `${strategyId}|${instId}|${bar}|${backtestStartTs}|${backtestEndTs}`;
@@ -78,7 +98,6 @@ export default function StrategyPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [strategyId, instId, bar, mode, strategies, backtestStartTs, backtestEndTs]);
 
-  // 成交明细（回测拉一次；实时模拟轮询）
   const { data: trades } = useQuery({
     queryKey: ["trades", runId],
     queryFn: () => api.trades(runId as number),
@@ -86,7 +105,6 @@ export default function StrategyPanel() {
     refetchInterval: mode === "paper" && paperSessionId ? 3000 : false,
   });
 
-  // 净值（F4 导出用）：与 page 同键查询共享 RQ 缓存，不重复请求
   const equityQ = useQuery({
     queryKey: ["equity", runId],
     queryFn: () => api.equity(runId as number),
@@ -95,20 +113,39 @@ export default function StrategyPanel() {
 
   const paperStart = useMutation({
     mutationFn: (vars: { params: Params; opts?: PaperOpts }) =>
-      applyThenStartPaper(strategyId as number, vars.params, instId, bar, simBalance, vars.opts),
-    onSuccess: (data) => {
-      setPaperSessionId(data.sessionId);
-      setRunId(data.runId);
+      startPaperSelection({
+        activeStrategyId: strategyId as number,
+        selectionIds: paperSelectionIds.length ? paperSelectionIds : [strategyId as number],
+        namesById: Object.fromEntries(strategies?.map((item) => [item.id, item.name]) ?? []),
+        params: vars.params,
+        instId,
+        bar,
+        simBalance,
+        opts: vars.opts,
+      }),
+    onSuccess: ({ sessions, groupId }) => {
+      const first = Object.values(sessions)[0];
+      setPaperSessionsByStrategyId(sessions);
+      setPaperBatchGroupId(groupId);
+      setPaperSessionId(first?.sessionId ?? null);
+      setRunId(first?.runId ?? null);
+      setPaperActiveStrategyId(first?.strategyId ?? null);
+      setPaperVisibleStrategyIds(Object.keys(sessions).map(Number));
+      setPaperStreamsEnabled(true);
       setMetrics(undefined);
+      setStopError(null);
     },
   });
 
   const paperStop = useMutation({
-    mutationFn: () => api.paperStop(paperSessionId as string),
-    onSuccess: (run) => {
-      setPaperSessionId(null);
-      setMetrics(run.metrics);
+    mutationFn: () => stopPaperSessions(paperBatchGroupId, runningSessions),
+    onSuccess: (runs) => {
+      clearPaperRuntime();
+      const lastRun = runs.at(-1)?.run;
+      if (lastRun) setMetrics(lastRun.metrics);
+      setStopError(null);
     },
+    onError: (error) => setStopError((error as Error).message),
   });
 
   const saveAs = useMutation({
@@ -130,7 +167,19 @@ export default function StrategyPanel() {
     );
   }
 
-  const busy = backtest.isPending || paperStart.isPending || paperStop.isPending;
+  const actionBusy = backtest.isPending || paperStart.isPending || paperStop.isPending || busy;
+  const startDisabledReason =
+    mode === "paper" && selectedCount === 0
+      ? "请选择至少一个策略"
+      : mode === "paper" && selectedCount > maxPaperSessions
+        ? `最多同时运行 ${maxPaperSessions} 个策略`
+        : null;
+  const disabledIds =
+    runningSessions.length > 0
+      ? enabledStrategies.map((s) => s.id)
+      : capReached
+        ? enabledStrategies.filter((s) => !paperSelectionIds.includes(s.id)).map((s) => s.id)
+        : [];
 
   return (
     <div className="flex h-full flex-col">
@@ -146,11 +195,27 @@ export default function StrategyPanel() {
           <CompareView />
         ) : (
           <>
+            {mode === "paper" && (
+              <PaperSelectionBar
+                selectedCount={selectedCount}
+                totalCount={enabledStrategies.length}
+                maxPaperSessions={maxPaperSessions}
+                disabled={runningSessions.length > 0}
+                onSelectAll={() =>
+                  setPaperSelectionIds(enabledStrategies.slice(0, maxPaperSessions).map((s) => s.id))
+                }
+                onClear={() => setPaperSelectionIds([])}
+              />
+            )}
+
             <StrategyList
               strategies={strategies}
               activeId={strategyId}
               returnsById={returnsById}
               onSelect={(id) => setStrategyId(id)}
+              multiSelectIds={mode === "paper" ? paperSelectionIds : undefined}
+              multiSelectDisabledIds={mode === "paper" ? disabledIds : undefined}
+              onToggleMultiSelect={mode === "paper" ? togglePaperSelectionId : undefined}
             />
 
             {selected && (
@@ -159,26 +224,36 @@ export default function StrategyPanel() {
                 <StrategyDetail
                   strategy={selected}
                   mode={mode === "paper" ? "paper" : "backtest"}
-                  busy={busy}
-                  paperActive={!!paperSessionId}
+                  busy={actionBusy}
+                  paperActive={runningSessions.length > 0 || !!paperSessionId}
                   simBalance={simBalance}
                   onApplyAndBacktest={(params) =>
                     backtest.mutate({ id: selected.id, params, showRunRange: true })
                   }
-                  onStartPaper={(params, opts) => paperStart.mutate({ params, opts })}
-                  onStopPaper={() => paperStop.mutate()}
+                  onStartPaper={(params, opts) => {
+                    if (!startDisabledReason) paperStart.mutate({ params, opts });
+                  }}
+                  onStopPaper={() => {
+                    setPaperStreamsEnabled(false);
+                    paperStop.mutate();
+                  }}
                   onSaveAs={(name, params) => saveAs.mutate({ name, params })}
                 />
-
-                {(backtest.isError || paperStart.isError) && (
+                {startDisabledReason && (
+                  <div className="mt-2 text-[11px] text-[var(--muted)]">{startDisabledReason}</div>
+                )}
+                {runningSessions.length > 0 && <PaperRunningList sessions={runningSessions} />}
+                {(backtest.isError || paperStart.isError || stopError) && (
                   <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
-                    操作失败：{(backtest.error as Error)?.message || (paperStart.error as Error)?.message}
+                    操作失败：
+                    {stopError ||
+                      (backtest.error as Error)?.message ||
+                      (paperStart.error as Error)?.message}
                   </div>
                 )}
               </>
             )}
 
-            {/* 历史 Tab 挂在 selected 外层：运行历史是全局的，不因未选中策略而隐藏（C8）*/}
             <div className="my-3 border-t border-[var(--border)]" />
             <div className="mb-2">
               <Tabs
@@ -204,7 +279,7 @@ export default function StrategyPanel() {
                       downloadCsv(`aragon-equity-run${runId}.csv`, equityToCsv(equityQ.data))
                     }
                   >
-                    ⬇ 导出净值 CSV
+                    导出净值 CSV
                   </Button>
                 </div>
                 <MetricsCards metrics={metrics} loading={backtest.isPending} />
@@ -217,12 +292,10 @@ export default function StrategyPanel() {
                     size="sm"
                     disabled={!trades?.length}
                     onClick={() =>
-                      runId &&
-                      trades &&
-                      downloadCsv(`aragon-trades-run${runId}.csv`, tradesToCsv(trades))
+                      runId && trades && downloadCsv(`aragon-trades-run${runId}.csv`, tradesToCsv(trades))
                     }
                   >
-                    ⬇ 导出 CSV
+                    导出 CSV
                   </Button>
                 </div>
                 <TradesTable trades={trades} />
@@ -237,6 +310,54 @@ export default function StrategyPanel() {
   );
 }
 
+function PaperSelectionBar({
+  selectedCount,
+  totalCount,
+  maxPaperSessions,
+  disabled,
+  onSelectAll,
+  onClear,
+}: {
+  selectedCount: number;
+  totalCount: number;
+  maxPaperSessions: number;
+  disabled: boolean;
+  onSelectAll: () => void;
+  onClear: () => void;
+}) {
+  return (
+    <div className="mb-2 flex items-center justify-between gap-2 rounded-[8px] border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1.5">
+      <span className="text-[11px] text-[var(--muted)]">
+        已选 {selectedCount}/{Math.min(totalCount, maxPaperSessions)}
+      </span>
+      <div className="flex gap-1">
+        <Button variant="ghost" size="sm" disabled={disabled} onClick={onSelectAll}>
+          全选
+        </Button>
+        <Button variant="ghost" size="sm" disabled={disabled} onClick={onClear}>
+          清空
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function PaperRunningList({ sessions }: { sessions: PaperStrategySession[] }) {
+  return (
+    <div className="mt-2 space-y-1 rounded-[8px] border border-[var(--border)] bg-[var(--surface-2)] p-2">
+      {sessions.map((session) => (
+        <div key={session.strategyId} className="flex items-center justify-between gap-2 text-[11px]">
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span className="h-2 w-2 rounded-full" style={{ background: session.color }} />
+            <span className="truncate">{session.strategyName}</span>
+          </span>
+          <span className="tabular text-[var(--muted)]">run #{session.runId}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 async function runBacktest(
   id: number,
   params: Params | undefined,
@@ -245,28 +366,81 @@ async function runBacktest(
   startTs: number,
   endTs: number,
 ) {
-  if (params) {
-    await api.updateStrategy(id, { params });
-  }
+  if (params) await api.updateStrategy(id, { params });
   return api.backtest(id, { instId, bar, limit: 1000, startTs, endTs });
 }
 
-async function applyThenStartPaper(
-  id: number,
-  params: Params,
-  instId: string,
-  bar: string,
-  simBalance: number,
-  opts?: PaperOpts,
-) {
-  await api.updateStrategy(id, { params });
-  // 注入模拟资金为初始权益；live 启动默认预热回放建仓（warm-start，B1）。
-  return api.paperStart({
-    strategyId: id,
+async function startPaperSelection({
+  activeStrategyId,
+  selectionIds,
+  namesById,
+  params,
+  instId,
+  bar,
+  simBalance,
+  opts,
+}: {
+  activeStrategyId: number;
+  selectionIds: number[];
+  namesById: Record<number, string>;
+  params: Params;
+  instId: string;
+  bar: string;
+  simBalance: number;
+  opts?: PaperOpts;
+}): Promise<{ sessions: Record<number, PaperStrategySession>; groupId: string | null }> {
+  await api.updateStrategy(activeStrategyId, { params });
+  const uniqueIds = Array.from(new Set(selectionIds));
+  if (uniqueIds.length <= 1) {
+    const id = uniqueIds[0] ?? activeStrategyId;
+    const result = await api.paperStart({
+      strategyId: id,
+      instId,
+      bar,
+      initialCapital: simBalance,
+      priming: true,
+      ...opts,
+    });
+    return {
+      groupId: null,
+      sessions: {
+        [id]: {
+          strategyId: id,
+          strategyName: namesById[id] ?? `Strategy ${id}`,
+          sessionId: result.sessionId,
+          runId: result.runId,
+          color: colorForPaperStrategy(0),
+          state: "running",
+        },
+      },
+    };
+  }
+  const result = await api.paperBatchStart({
+    strategyIds: uniqueIds,
     instId,
     bar,
     initialCapital: simBalance,
     priming: true,
     ...opts,
   });
+  return { groupId: result.groupId, sessions: sessionsFromBatch(result) };
+}
+
+async function stopPaperSessions(
+  groupId: string | null,
+  sessions: PaperStrategySession[],
+): Promise<{ strategyId: number; sessionId: string; run: { metrics: Metrics } }[]> {
+  if (groupId) {
+    try {
+      return (await api.paperBatchStop(groupId)).runs;
+    } catch (error) {
+      if (!(error instanceof ApiRequestError) || error.status !== 404) throw error;
+    }
+  }
+  const runs = [];
+  for (const session of sessions) {
+    const run = await api.paperStop(session.sessionId);
+    runs.push({ strategyId: session.strategyId, sessionId: session.sessionId, run });
+  }
+  return runs;
 }

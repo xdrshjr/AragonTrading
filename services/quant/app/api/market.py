@@ -24,14 +24,16 @@ async def health() -> dict:
     # getattr 兜底：使旧/测试用假客户端无需实现这些属性也不致 500
     latency = getattr(rest, "last_latency_ms", None) if okx_up else None
     last_ok_ts = getattr(rest, "last_ok_ts", None)
+    settings = get_settings()
     return {
         "status": "ok",
         "okx": "up" if okx_up else "down",
         "okxLatencyMs": latency,
         "lastOkTs": last_ok_ts,
-        "wsConfigured": bool(get_settings().okx_ws_public),
+        "wsConfigured": bool(settings.okx_ws_public),
         # F2：缓存回退开关是否启用——前端据此预知"回退可能发生"（仅信息性，不放宽硬约束）
-        "cachedFallbackEnabled": get_settings().allow_cached_fallback,
+        "cachedFallbackEnabled": settings.allow_cached_fallback,
+        "maxPaperSessions": settings.max_paper_sessions,
     }
 
 
