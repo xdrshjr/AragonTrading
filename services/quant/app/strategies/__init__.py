@@ -19,6 +19,7 @@ from . import bollinger_reversion   # noqa: F401,E402
 from . import vwap_rsi_momentum     # noqa: F401,E402
 from . import trend_pullback_long   # noqa: F401,E402
 from . import trend_pullback_short  # noqa: F401,E402
+from . import range_scalping_strategy  # noqa: F401,E402
 
 # 内置策略的稳定展示顺序（key 列表）
 BUILTIN_ORDER = [
@@ -29,4 +30,5 @@ BUILTIN_ORDER = [
     "vwap_rsi_momentum",
     "trend_pullback_long",
     "trend_pullback_short",
+    "range_scalping_strategy",
 ]

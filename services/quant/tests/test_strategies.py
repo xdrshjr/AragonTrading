@@ -15,9 +15,10 @@ def test_registry_has_builtins():
     # 注：原 `>= 5` 在新增后仍为真，此处为覆盖增强 + 命名纠正(R7)，纳入 2 个新 key。
     for key in ("long_shadow_reversal", "momentum_breakout", "ema_cross_scalper",
                 "bollinger_reversion", "vwap_rsi_momentum",
-                "trend_pullback_long", "trend_pullback_short"):
+                "trend_pullback_long", "trend_pullback_short",
+                "range_scalping_strategy"):
         assert key in STRATEGY_REGISTRY
-    assert len(STRATEGY_REGISTRY) >= 7
+    assert len(STRATEGY_REGISTRY) >= 8
 
 
 def test_long_shadow_emits_long_on_hammer():
