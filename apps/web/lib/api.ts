@@ -9,6 +9,7 @@ import type {
   Metrics,
   PaperBatchStartResult,
   PaperBatchStopResult,
+  PaperSessionRow,
   Run,
   Strategy,
   Trade,
@@ -191,5 +192,5 @@ export const api = {
     request<Run>(`/paper/${sessionId}/stop`, { method: "POST" }),
   paperBatchStop: (groupId: string) =>
     request<PaperBatchStopResult>(`/paper/batch/${groupId}/stop`, { method: "POST" }),
-  paperSessions: () => request<unknown[]>("/paper/sessions"),
+  paperSessions: () => request<PaperSessionRow[]>("/paper/sessions"),
 };

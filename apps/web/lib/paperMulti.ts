@@ -2,6 +2,7 @@ import { colorForIndex } from "./compare";
 import type {
   Overlay,
   PaperBatchStartResult,
+  PaperSessionRow,
   PaperStrategySession,
   StrategyEquityPoint,
   StrategyTrade,
@@ -32,6 +33,32 @@ export function sessionsFromBatch(
     },
   ]);
   return Object.fromEntries(entries);
+}
+
+// 挂载即对账：把后端 GET /api/paper/sessions 拉回的真实会话映射成前端运行期句柄。
+// 只保留 state == "running"（list_sessions 会带回已 stopped 的残留行，rehydrate 它们会复活死会话并误锁选择）；
+// 后端行无 strategyName(单条会话)/color，名称按 strategyId 从 namesById 解析、颜色按序号配色（与 sessionsFromBatch 同口径）。
+// groupId：所有 running 行同属一个非空 group 时回填以支持批量停止；否则置 null，走单条停止兜底。
+export function sessionsFromReconcile(
+  rows: PaperSessionRow[],
+  namesById: Record<number, string>,
+): { sessions: Record<number, PaperStrategySession>; groupId: string | null } {
+  const running = rows.filter((row) => row.state === "running");
+  const entries = running.map((row, index) => [
+    row.strategyId,
+    {
+      strategyId: row.strategyId,
+      strategyName: namesById[row.strategyId] ?? row.strategyName ?? `Strategy ${row.strategyId}`,
+      sessionId: row.sessionId,
+      runId: row.runId,
+      color: colorForPaperStrategy(index),
+      state: "running" as const,
+    },
+  ]);
+  const sessions = Object.fromEntries(entries) as Record<number, PaperStrategySession>;
+  const groupIds = new Set(running.map((row) => row.groupId));
+  const groupId = groupIds.size === 1 && !groupIds.has(null) ? running[0].groupId : null;
+  return { sessions, groupId };
 }
 
 export function mergePaperTrade(

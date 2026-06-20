@@ -1,12 +1,17 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiRequestError, api } from "@/lib/api";
-import { colorForPaperStrategy, resolveMaxPaperSessions, sessionsFromBatch } from "@/lib/paperMulti";
+import {
+  colorForPaperStrategy,
+  resolveMaxPaperSessions,
+  sessionsFromBatch,
+  sessionsFromReconcile,
+} from "@/lib/paperMulti";
 import { useAppStore } from "@/lib/store";
 import { downloadCsv, equityToCsv, tradesToCsv } from "@/lib/export";
-import type { Metrics, PaperStrategySession, Strategy } from "@/lib/types";
+import type { Metrics, PaperSessionRow, PaperStrategySession, Strategy } from "@/lib/types";
 import { Button, Skeleton, Tabs } from "@/components/ui";
 import CompareView from "./CompareView";
 import MetricsCards from "./MetricsCards";
@@ -52,6 +57,7 @@ export default function StrategyPanel() {
   const [tab, setTab] = useState("metrics");
   const [stopError, setStopError] = useState<string | null>(null);
   const lastAutoKey = useRef("");
+  const reconciledRef = useRef(false);
 
   const { data: strategies, isLoading } = useQuery({
     queryKey: ["strategies"],
@@ -59,6 +65,16 @@ export default function StrategyPanel() {
   });
   const health = useQuery({ queryKey: ["health"], queryFn: api.health });
   const maxPaperSessions = resolveMaxPaperSessions(health.data?.maxPaperSessions);
+
+  // 候选 A：挂载即对账。后端 PaperManager 是进程级单例，刷新/重开后会话变成孤儿仍占配额，
+  // 而 store 不持久化运行期句柄 → UI 误以为无会话运行，再次启动即被 429「active … exceed limit」。
+  // 拉取真实会话回填 store，让用户看得见、可停止、可在剩余配额内继续。
+  const paperSessionsQ = useQuery({
+    queryKey: ["paperSessions"],
+    queryFn: api.paperSessions,
+    enabled: mode === "paper",
+    refetchOnWindowFocus: false,
+  });
 
   useEffect(() => {
     if (!strategies?.length) return;
@@ -70,6 +86,44 @@ export default function StrategyPanel() {
     if (mode !== "paper" || !strategyId || paperSelectionIds.length > 0) return;
     setPaperSelectionIds([strategyId]);
   }, [mode, strategyId, paperSelectionIds.length, setPaperSelectionIds]);
+
+  // 把对账行回填为运行期句柄；与 paperStart.onSuccess 同口径（含开启 ws 流以重放快照恢复实时数据）。
+  const applyReconcile = useCallback(
+    (rows: PaperSessionRow[]): boolean => {
+      if (!strategies) return false;
+      const namesById = Object.fromEntries(strategies.map((s) => [s.id, s.name]));
+      const { sessions, groupId } = sessionsFromReconcile(rows, namesById);
+      if (Object.keys(sessions).length === 0) return false;
+      const first = Object.values(sessions)[0];
+      setPaperSessionsByStrategyId(sessions);
+      setPaperBatchGroupId(groupId);
+      setPaperSessionId(first?.sessionId ?? null);
+      setRunId(first?.runId ?? null);
+      setPaperActiveStrategyId(first?.strategyId ?? null);
+      setPaperVisibleStrategyIds(Object.keys(sessions).map(Number));
+      setPaperStreamsEnabled(true);
+      return true;
+    },
+    [
+      strategies,
+      setPaperSessionsByStrategyId,
+      setPaperBatchGroupId,
+      setPaperSessionId,
+      setRunId,
+      setPaperActiveStrategyId,
+      setPaperVisibleStrategyIds,
+      setPaperStreamsEnabled,
+    ],
+  );
+
+  // 仅在挂载后对账一次；store 已有句柄（同会话内刚启动）则视为权威，不覆盖。
+  useEffect(() => {
+    if (mode !== "paper" || reconciledRef.current) return;
+    if (!strategies || !paperSessionsQ.data) return;
+    reconciledRef.current = true;
+    if (Object.keys(paperSessionsByStrategyId).length > 0) return;
+    applyReconcile(paperSessionsQ.data);
+  }, [mode, strategies, paperSessionsQ.data, paperSessionsByStrategyId, applyReconcile]);
 
   const selected = strategies?.find((s) => s.id === strategyId);
   const enabledStrategies = strategies?.filter((s) => !s.unavailable && s.enabled) ?? [];
@@ -156,6 +210,35 @@ export default function StrategyPanel() {
       setStrategyId(created.id);
     },
   });
+
+  const isSessionLimitError =
+    paperStart.error instanceof ApiRequestError && paperStart.error.code === "SESSION_LIMIT";
+
+  // 候选 C（安全网）：启动撞上 SESSION_LIMIT（孤儿会话占满配额）时，把真实会话对账回 UI，
+  // 用户即可看到是什么占着配额，并一键「停止全部并重试」，而非停在死胡同错误上。
+  useEffect(() => {
+    if (!isSessionLimitError) return;
+    let cancelled = false;
+    api
+      .paperSessions()
+      .then((rows) => {
+        if (!cancelled) applyReconcile(rows);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isSessionLimitError, applyReconcile]);
+
+  const stopAllAndRetry = () => {
+    const retryVars = paperStart.variables;
+    setPaperStreamsEnabled(false);
+    paperStop.mutate(undefined, {
+      onSuccess: () => {
+        if (retryVars) paperStart.mutate(retryVars);
+      },
+    });
+  };
 
   if (isLoading || !strategies) {
     return (
@@ -245,10 +328,24 @@ export default function StrategyPanel() {
                 {runningSessions.length > 0 && <PaperRunningList sessions={runningSessions} />}
                 {(backtest.isError || paperStart.isError || stopError) && (
                   <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
-                    操作失败：
-                    {stopError ||
-                      (backtest.error as Error)?.message ||
-                      (paperStart.error as Error)?.message}
+                    <div>
+                      操作失败：
+                      {stopError ||
+                        (backtest.error as Error)?.message ||
+                        (paperStart.error as Error)?.message}
+                    </div>
+                    {isSessionLimitError && (
+                      <div className="mt-1.5">
+                        <Button
+                          variant="danger"
+                          size="sm"
+                          disabled={paperStop.isPending || paperStart.isPending}
+                          onClick={stopAllAndRetry}
+                        >
+                          停止全部并重试
+                        </Button>
+                      </div>
+                    )}
                   </div>
                 )}
               </>

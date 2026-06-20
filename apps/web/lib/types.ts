@@ -248,6 +248,14 @@ export interface PaperSessionInfo {
   positionSide: "long" | "short" | "flat";
 }
 
+// GET /api/paper/sessions 行：session.info() 合并 _session_meta 的形态。
+// strategyName 仅批量会话携带（单条 start 不写），groupId 为 null 时表示单条会话。
+export interface PaperSessionRow extends PaperSessionInfo {
+  strategyId: number;
+  strategyName?: string;
+  groupId: string | null;
+}
+
 export interface CompareItem {
   strategyId: number;
   name: string;
