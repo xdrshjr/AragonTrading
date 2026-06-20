@@ -1,7 +1,9 @@
 import { colorForIndex } from "./compare";
+import { deriveOpenPosition } from "./position";
 import type {
   Overlay,
   PaperBatchStartResult,
+  PaperPositionEvent,
   PaperSessionRow,
   PaperStrategySession,
   StrategyEquityPoint,
@@ -113,4 +115,88 @@ export function paperSessionsToOverlays(
     });
   }
   return overlays;
+}
+
+// 按策略「当前持仓 + 资金」一行的规范化形态（Fix B）。持仓字段统一来源：后端权威
+// PaperPositionEvent 或前端 deriveOpenPosition，二者归一到同一结构供列表渲染。
+export interface PaperRowPosition {
+  side: "long" | "short";
+  size: number;
+  avgEntry: number;
+  markPrice: number | null;
+  unrealizedPnl: number | null;
+  unrealizedPct: number | null;
+}
+
+export interface PaperPositionRow {
+  strategyId: number;
+  strategyName: string;
+  color: string;
+  position: PaperRowPosition | null; // null = 当前无持仓（真平仓 / 权威报平）
+  equity: number | null; // 该策略当前净值/资金（paperEquityByStrategyId 末点）
+}
+
+const POSITION_EPS = 1e-9;
+
+function positionFromEvent(event: PaperPositionEvent): PaperRowPosition | null {
+  if (event.side === "flat" || Math.abs(event.size) <= POSITION_EPS) return null;
+  const size = Math.abs(event.size);
+  const denom = event.avgEntry * size;
+  return {
+    side: event.side,
+    size,
+    avgEntry: event.avgEntry,
+    markPrice: event.markPrice,
+    unrealizedPnl: event.unrealizedPnl,
+    unrealizedPct: denom > 0 ? event.unrealizedPnl / denom : null,
+  };
+}
+
+// Fix A 的数据源规则：每行持仓优先取后端权威 paperPositionsByStrategyId[id]
+// （自带各策略自身 markPrice，跨合约天然正确，含权威报平 null）；仅当该策略尚无任何
+// position/snapshot 事件（值为 undefined，即首个事件前的窗口）才回退 deriveOpenPosition。
+function resolveRowPosition(
+  authoritative: PaperPositionEvent | null | undefined,
+  trades: StrategyTrade[],
+  markPrice: number | null,
+): PaperRowPosition | null {
+  if (authoritative !== undefined) {
+    return authoritative ? positionFromEvent(authoritative) : null;
+  }
+  const derived = deriveOpenPosition(trades, markPrice);
+  if (!derived) return null;
+  return {
+    side: derived.side,
+    size: derived.size,
+    avgEntry: derived.avgEntry,
+    markPrice: derived.markPrice,
+    unrealizedPnl: derived.unrealizedPnl,
+    unrealizedPct: derived.unrealizedPct,
+  };
+}
+
+// 把运行中各策略汇总成「按策略持仓 + 资金」行列表（Fix B 主入口）。
+// markPrice 仅用于首事件前回退路径（deriveOpenPosition）；权威路径自带各策略 markPrice。
+export function buildPaperPositionRows(
+  strategies: PaperStrategySession[],
+  positionsByStrategyId: Record<number, PaperPositionEvent | null>,
+  tradesByStrategyId: Record<number, StrategyTrade[]>,
+  equityByStrategyId: Record<number, StrategyEquityPoint[]>,
+  markPrice: number | null,
+): PaperPositionRow[] {
+  return strategies.map((session) => {
+    const id = session.strategyId;
+    const equity = equityByStrategyId[id];
+    return {
+      strategyId: id,
+      strategyName: session.strategyName,
+      color: session.color,
+      position: resolveRowPosition(
+        positionsByStrategyId[id],
+        tradesByStrategyId[id] ?? [],
+        markPrice,
+      ),
+      equity: equity?.length ? equity[equity.length - 1].equity : null,
+    };
+  });
 }

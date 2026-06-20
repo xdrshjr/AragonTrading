@@ -464,6 +464,9 @@ export default function Page() {
           visiblePaperStrategyIds={effectiveVisibleIds}
           onActivePaperStrategyChange={setPaperActiveStrategyId}
           onToggleVisiblePaperStrategy={togglePaperVisibleStrategyId}
+          paperPositionsByStrategyId={paperPositionsByStrategyId}
+          paperEquityByStrategyId={paperEquityByStrategyId}
+          paperTradesByStrategyId={paperTradesByStrategyId}
           toolbar={{
             okxUp,
             latencyMs,

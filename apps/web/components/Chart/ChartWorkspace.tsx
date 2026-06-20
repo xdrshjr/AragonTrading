@@ -2,10 +2,12 @@
 
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useState } from "react";
+import PaperPositionsTable from "@/components/Strategy/PaperPositionsTable";
 import PositionPanel from "@/components/Strategy/PositionPanel";
 import TradesTable from "@/components/Strategy/TradesTable";
 import { Tabs } from "@/components/ui";
 import type { IndicatorKey } from "@/lib/indicators";
+import { buildPaperPositionRows } from "@/lib/paperMulti";
 import { useAppStore } from "@/lib/store";
 import type {
   BottomTab,
@@ -14,7 +16,10 @@ import type {
   EquityPoint,
   LiveMarketState,
   Overlay,
+  PaperPositionEvent,
   PaperStrategySession,
+  StrategyEquityPoint,
+  StrategyTrade,
   Trade,
 } from "@/lib/types";
 import ChartHeaderBar from "./ChartHeaderBar";
@@ -52,6 +57,9 @@ interface ChartWorkspaceProps {
   visiblePaperStrategyIds?: number[];
   onActivePaperStrategyChange?: (id: number) => void;
   onToggleVisiblePaperStrategy?: (id: number) => void;
+  paperPositionsByStrategyId?: Record<number, PaperPositionEvent | null>;
+  paperEquityByStrategyId?: Record<number, StrategyEquityPoint[]>;
+  paperTradesByStrategyId?: Record<number, StrategyTrade[]>;
 }
 
 export default function ChartWorkspace(props: ChartWorkspaceProps) {
@@ -77,6 +85,9 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     visiblePaperStrategyIds = [],
     onActivePaperStrategyChange,
     onToggleVisiblePaperStrategy,
+    paperPositionsByStrategyId = {},
+    paperEquityByStrategyId = {},
+    paperTradesByStrategyId = {},
   } = props;
   const {
     instId,
@@ -101,6 +112,24 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
   const displayIndex = displayCandle ? (tsIndex.get(displayCandle.ts) ?? -1) : -1;
   const prevClose = displayIndex > 0 ? candles[displayIndex - 1].c : (displayCandle?.o ?? null);
   const markPrice = lastPrice ?? candles.at(-1)?.c ?? null;
+
+  const paperPositionRows = useMemo(
+    () =>
+      buildPaperPositionRows(
+        paperStrategies,
+        paperPositionsByStrategyId,
+        paperTradesByStrategyId,
+        paperEquityByStrategyId,
+        markPrice,
+      ),
+    [
+      paperStrategies,
+      paperPositionsByStrategyId,
+      paperTradesByStrategyId,
+      paperEquityByStrategyId,
+      markPrice,
+    ],
+  );
 
   const sessionChangePct = useMemo(() => {
     const first = candles[0]?.c;
@@ -232,6 +261,8 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
         <div className="min-h-0 flex-1 overflow-auto px-3 py-2">
           {bottomTab === "trades" ? (
             <TradesTable trades={bottomTrades ?? overlayTrades} />
+          ) : mode === "paper" ? (
+            <PaperPositionsTable rows={paperPositionRows} instId={instId} />
           ) : (
             <PositionPanel trades={bottomTrades ?? overlayTrades} markPrice={markPrice} instId={instId} />
           )}
