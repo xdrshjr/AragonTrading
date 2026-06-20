@@ -159,6 +159,24 @@ class PaperManager:
                 entry.state = session.state
         return group
 
+    async def stop_all(self) -> list[PaperSession]:
+        """Stop every running session and return those that were stopped.
+
+        Reclaims orphaned sessions that survived a renderer reload and still
+        consume the cap — they are never auto-reclaimed, since the WS endpoint
+        only unsubscribes on disconnect. Iterates `state == "running"` only, so
+        already-stopped rows are left intact (never revived) and a call made
+        while nothing is running is a safe no-op.
+        """
+        stopped: list[PaperSession] = []
+        for session_id, session in list(self._sessions.items()):
+            if session.state != "running":
+                continue
+            await session.stop()
+            self._sync_group_session(session_id)
+            stopped.append(session)
+        return stopped
+
     def list_sessions(self) -> list[dict]:
         rows = []
         for session_id, session in self._sessions.items():

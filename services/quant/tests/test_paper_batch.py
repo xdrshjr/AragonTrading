@@ -219,6 +219,67 @@ async def test_batch_stop_unknown_group_returns_404(patch_paper_session):
         await dispose_engine()
 
 
+async def test_stop_all_frees_capacity_for_subsequent_start(monkeypatch, patch_paper_session):
+    from app.config import get_settings
+    from app.db.session import dispose_engine, init_db
+    from app.paper.manager import get_paper_manager
+
+    get_settings.cache_clear()
+    monkeypatch.setenv("MAX_PAPER_SESSIONS", "2")
+    await init_db()
+    transport = ASGITransport(app=_load_app())
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            ids = [item["id"] for item in (await client.get("/api/strategies")).json()[:2]]
+            filled = await client.post("/api/paper/batch/start", json=_body(ids))
+            assert filled.status_code == 200, filled.text
+
+            blocked = await client.post(
+                "/api/paper/start", json={**_body([ids[0]]), "strategyId": ids[0]})
+            assert blocked.status_code == 429
+
+            stop_all = await client.post("/api/paper/stop-all")
+            assert stop_all.status_code == 200, stop_all.text
+            assert stop_all.json()["stopped"] == 2
+            running = [s for s in get_paper_manager().list_sessions() if s["state"] == "running"]
+            assert running == []
+
+            retry = await client.post("/api/paper/batch/start", json=_body(ids))
+            assert retry.status_code == 200, retry.text
+    finally:
+        get_settings.cache_clear()
+        await dispose_engine()
+
+
+async def test_stop_all_is_noop_safe_and_keeps_stopped_rows(patch_paper_session):
+    from app.db.session import dispose_engine, init_db
+    from app.paper.manager import get_paper_manager
+
+    await init_db()
+    transport = ASGITransport(app=_load_app())
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            empty = await client.post("/api/paper/stop-all")
+            assert empty.status_code == 200, empty.text
+            assert empty.json()["stopped"] == 0
+            assert empty.json()["runs"] == []
+
+            sid = (await client.get("/api/strategies")).json()[0]["id"]
+            started = await client.post(
+                "/api/paper/start", json={**_body([sid]), "strategyId": sid})
+            assert started.status_code == 200, started.text
+            session_id = started.json()["sessionId"]
+            await client.post(f"/api/paper/{session_id}/stop")
+
+            again = await client.post("/api/paper/stop-all")
+            assert again.json()["stopped"] == 0
+            rows = get_paper_manager().list_sessions()
+            assert len(rows) == 1
+            assert all(row["state"] == "stopped" for row in rows)
+    finally:
+        await dispose_engine()
+
+
 def _body(strategy_ids: list[int]) -> dict:
     return {
         "strategyIds": strategy_ids,

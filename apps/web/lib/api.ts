@@ -10,6 +10,7 @@ import type {
   PaperBatchStartResult,
   PaperBatchStopResult,
   PaperSessionRow,
+  PaperStopAllResult,
   Run,
   Strategy,
   Trade,
@@ -192,5 +193,7 @@ export const api = {
     request<Run>(`/paper/${sessionId}/stop`, { method: "POST" }),
   paperBatchStop: (groupId: string) =>
     request<PaperBatchStopResult>(`/paper/batch/${groupId}/stop`, { method: "POST" }),
+  // 停止后端注册表中全部 running 会话，回收被孤儿会话占满的配额（停止全部并重试）。
+  paperStopAll: () => request<PaperStopAllResult>("/paper/stop-all", { method: "POST" }),
   paperSessions: () => request<PaperSessionRow[]>("/paper/sessions"),
 };

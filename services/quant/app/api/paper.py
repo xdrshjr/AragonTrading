@@ -123,6 +123,29 @@ async def paper_batch_stop(group_id: str,
     return {"groupId": group.group_id, "runs": runs}
 
 
+@router.post("/paper/stop-all")
+async def paper_stop_all(session: AsyncSession = Depends(get_session)) -> dict:
+    """停止注册表中所有 running 会话，确定性地释放配额。
+
+    接到前端「停止全部并重试」：刷新/重开渲染进程会让会话变成孤儿仍占满配额
+    （进程级单例、WS 断开只取消订阅不停会话），用户据此一键回收。返回被停止的
+    run 列表；无会话运行时为安全 no-op，不触碰已 stopped 的残留行。
+    """
+    stopped = await get_paper_manager().stop_all()
+    from ..schemas import run_out
+    runs = []
+    for sess in stopped:
+        run = await repo.get_run(session, sess.run_id)
+        if run is not None:
+            out = run_out(run)
+            runs.append({
+                "strategyId": out["strategyId"],
+                "sessionId": sess.session_id,
+                "run": out,
+            })
+    return {"stopped": len(stopped), "runs": runs}
+
+
 @router.post("/paper/{session_id}/stop")
 async def paper_stop(session_id: str,
                      session: AsyncSession = Depends(get_session)) -> dict:

@@ -198,6 +198,12 @@ export interface PaperBatchStopResult {
   runs: { strategyId: number; sessionId: string; run: Run }[];
 }
 
+// POST /api/paper/stop-all：停止注册表中所有 running 会话，回收配额（停止全部并重试）。
+export interface PaperStopAllResult {
+  stopped: number;
+  runs: { strategyId: number; sessionId: string; run: Run }[];
+}
+
 export interface PaperChartFilter {
   strategyIds: number[];
 }

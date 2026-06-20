@@ -202,6 +202,19 @@ export default function StrategyPanel() {
     onError: (error) => setStopError((error as Error).message),
   });
 
+  // 「停止全部并重试」专用：调用后端 POST /api/paper/stop-all 停止注册表中**全部** running
+  // 会话（含 store 因 dedup-by-strategyId 看不见、停不掉的孤儿），确定性回收配额；
+  // 再拉回真实会话列表对齐 UI。这是 round-1 前端对账/停止之所以「没修改好」的根因修复。
+  const paperStopAll = useMutation({
+    mutationFn: () => api.paperStopAll(),
+    onSuccess: () => {
+      clearPaperRuntime();
+      qc.invalidateQueries({ queryKey: ["paperSessions"] });
+      setStopError(null);
+    },
+    onError: (error) => setStopError((error as Error).message),
+  });
+
   const saveAs = useMutation({
     mutationFn: (vars: { name: string; params: Params }) =>
       api.createStrategy({ templateKey: selected!.templateKey, name: vars.name, params: vars.params }),
@@ -233,7 +246,7 @@ export default function StrategyPanel() {
   const stopAllAndRetry = () => {
     const retryVars = paperStart.variables;
     setPaperStreamsEnabled(false);
-    paperStop.mutate(undefined, {
+    paperStopAll.mutate(undefined, {
       onSuccess: () => {
         if (retryVars) paperStart.mutate(retryVars);
       },
@@ -250,7 +263,8 @@ export default function StrategyPanel() {
     );
   }
 
-  const actionBusy = backtest.isPending || paperStart.isPending || paperStop.isPending || busy;
+  const actionBusy =
+    backtest.isPending || paperStart.isPending || paperStop.isPending || paperStopAll.isPending || busy;
   const startDisabledReason =
     mode === "paper" && selectedCount === 0
       ? "请选择至少一个策略"
@@ -339,7 +353,7 @@ export default function StrategyPanel() {
                         <Button
                           variant="danger"
                           size="sm"
-                          disabled={paperStop.isPending || paperStart.isPending}
+                          disabled={paperStopAll.isPending || paperStart.isPending}
                           onClick={stopAllAndRetry}
                         >
                           停止全部并重试
