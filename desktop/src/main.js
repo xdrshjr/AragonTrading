@@ -185,6 +185,9 @@ function webSpec() {
 
 // ----------------------------- 窗口 -----------------------------
 function createWindow() {
+  // 去系统框架（spec §4.1 / D1）：win/linux 完全无边框、右侧自绘控制键；
+  // mac 保留左侧红绿灯并整合进内容区（titleBarStyle:'hidden' + 红绿灯位移）。
+  const isMac = process.platform === 'darwin';
   const opts = {
     width: 1440,
     height: 900,
@@ -193,6 +196,14 @@ function createWindow() {
     backgroundColor: '#0b0d12',
     title: 'Aragon Trading',
     show: true,
+    frame: false,
+    ...(isMac
+      ? {
+          frame: true,
+          titleBarStyle: 'hidden',
+          trafficLightPosition: { x: 16, y: 16 },
+        }
+      : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -206,6 +217,15 @@ function createWindow() {
   if (fs.existsSync(iconPng)) opts.icon = iconPng;
 
   win = new BrowserWindow(opts);
+  // 最大化态变化回推渲染层，驱动「最大化↔还原」图标切换（spec §4.3）。
+  const pushMax = () =>
+    win && win.webContents.send('aragon:win:maximized-changed', win.isMaximized());
+  win.on('maximize', pushMax);
+  win.on('unmaximize', pushMax);
+  win.on('enter-full-screen', pushMax);
+  win.on('leave-full-screen', pushMax);
+  // 补偿被移除原生菜单的视图加速键（重载 / DevTools / 缩放 / 全屏，跨平台）。
+  wireWindowShortcuts(win);
   // 就绪前先显示内置过渡页，避免白屏 / ERR_CONNECTION_REFUSED 闪现（spec §4.2 step8）。
   win.loadFile(path.join(__dirname, 'loading.html'));
   win.on('closed', () => {
@@ -246,41 +266,47 @@ function showAbout() {
     });
 }
 
-function buildMenu() {
-  const isMac = process.platform === 'darwin';
-  const template = [
-    ...(isMac ? [{ role: 'appMenu' }] : []),
-    { role: 'fileMenu' },
-    { role: 'editMenu' },
-    {
-      label: '视图',
-      submenu: [
-        { role: 'reload' },
-        { role: 'forceReload' },
-        { role: 'toggleDevTools' },
-        { type: 'separator' },
-        { role: 'resetZoom' },
-        { role: 'zoomIn' },
-        { role: 'zoomOut' },
-        { type: 'separator' },
-        { role: 'togglefullscreen' },
-      ],
-    },
-    {
-      label: '帮助',
-      submenu: [
-        {
-          label: '关于 Aragon Trading',
-          click: showAbout,
-        },
-        {
-          label: '打开日志目录',
-          click: () => shell.openPath(paths.ensureLogsDir()),
-        },
-      ],
-    },
-  ];
-  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+// 安装应用菜单（spec §4.2 / D2，按平台分流）：
+// - win/linux：彻底移除窗口内菜单栏（用户诉求「不要菜单栏」）。
+// - mac：全局菜单不在窗口内，保留最小原生菜单（appMenu 含 Cmd+Q；editMenu 提供
+//   Cmd+C/V/X/A/Z；viewMenu 提供重载/缩放/全屏），否则文本框剪贴板与撤销快捷键失效。
+// 原菜单的「关于 / 打开日志」改由渲染层 AppMenu 经 IPC 触发；视图加速键由 wireWindowShortcuts 补偿。
+function installAppMenu() {
+  if (process.platform !== 'darwin') {
+    Menu.setApplicationMenu(null);
+    return;
+  }
+  Menu.setApplicationMenu(
+    Menu.buildFromTemplate([{ role: 'appMenu' }, { role: 'editMenu' }, { role: 'viewMenu' }]),
+  );
+}
+
+// 窗口级键盘加速键补偿（spec §4.2）：补回被移除视图菜单的重载 / 强制重载 / DevTools /
+// 缩放 / 全屏，跨平台经 before-input-event 接线（mac 即便有 viewMenu 亦保留，行为幂等）。
+function wireWindowShortcuts(targetWin) {
+  targetWin.webContents.on('before-input-event', (event, input) => {
+    if (input.type !== 'keyDown') return;
+    const ctrl = input.control || input.meta;
+    const key = (input.key || '').toLowerCase();
+    const match = () => {
+      if (ctrl && input.shift && key === 'r')
+        return targetWin.webContents.reloadIgnoringCache(), true;
+      if (ctrl && key === 'r') return targetWin.webContents.reload(), true;
+      if (key === 'f12' || (ctrl && input.shift && key === 'i'))
+        return targetWin.webContents.toggleDevTools(), true;
+      if (key === 'f11')
+        return targetWin.setFullScreen(!targetWin.isFullScreen()), true;
+      if (ctrl && (key === '=' || key === '+')) return bumpZoom(targetWin, +0.5), true;
+      if (ctrl && key === '-') return bumpZoom(targetWin, -0.5), true;
+      if (ctrl && key === '0') return targetWin.webContents.setZoomLevel(0), true;
+      return false;
+    };
+    if (match()) event.preventDefault();
+  });
+}
+
+function bumpZoom(w, d) {
+  w.webContents.setZoomLevel(w.webContents.getZoomLevel() + d);
 }
 
 // ----------------------------- 启动编排 -----------------------------
@@ -363,7 +389,7 @@ async function bootstrap() {
   // 端口就绪保障：清扫上次异常退出残留 → 预检 → 自动回收占用 → 仍占用则弹窗退出（round-3）。
   if (!(await ensurePortsAvailable())) return;
 
-  buildMenu();
+  installAppMenu();
   createWindow();
 
   const ok = await startEngines();
@@ -420,6 +446,17 @@ if (!gotLock) {
     e.returnValue = app.getVersion();
   });
   ipcMain.handle('aragon:open-logs', () => shell.openPath(paths.ensureLogsDir()));
+
+  // 窗口控制 IPC（spec §4.3 / §6）：自定义标题栏的最小化 / 最大化切换 / 关闭 /
+  // 查询最大化态 + 触发既有「关于」对话框。关闭仅 win.close()，落既有退出清理链（D3）。
+  ipcMain.on('aragon:win:minimize', () => win && win.minimize());
+  ipcMain.on('aragon:win:maximize-toggle', () => {
+    if (!win) return;
+    win.isMaximized() ? win.unmaximize() : win.maximize();
+  });
+  ipcMain.on('aragon:win:close', () => win && win.close());
+  ipcMain.handle('aragon:win:is-maximized', () => !!win && win.isMaximized());
+  ipcMain.on('aragon:show-about', () => showAbout());
 
   app.whenReady().then(bootstrap);
 

@@ -1,13 +1,17 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import type { Dispatch, SetStateAction } from "react";
+import clsx from "clsx";
+import type { Dispatch, MouseEventHandler, SetStateAction } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import ChartWorkspace from "@/components/Chart/ChartWorkspace";
+import AppMenu from "@/components/Desktop/AppMenu";
+import WindowControls from "@/components/Desktop/WindowControls";
 import AccountModeSwitch from "@/components/Header/AccountModeSwitch";
 import StrategyPanel from "@/components/Strategy/StrategyPanel";
 import { Button } from "@/components/ui";
 import { api } from "@/lib/api";
+import { getDesktopPlatform, getWindowControls } from "@/lib/desktop";
 import {
   LATEST_CANDLE_LIMIT,
   liveCandleRefreshIntervalMs,
@@ -377,6 +381,19 @@ export default function Page() {
     document.documentElement.classList.toggle("dark", theme === "dark");
   }, [theme]);
 
+  // 桌面端自定义标题栏（spec §4.9 / D4 / RV-3）：mac 红绿灯安全区 padding 必须由挂载后状态驱动，
+  // 不得在渲染期直接读 platform 决定 className，否则 mac 上 React 水合不一致。
+  const [macSafeArea, setMacSafeArea] = useState(false);
+  useEffect(() => {
+    setMacSafeArea(getDesktopPlatform() === "darwin");
+  }, []);
+
+  // 双击拖拽区切换最大化（spec §4.9 / D6）；落在 no-drag 控件上则不处理，避免误触。
+  const onTitleDoubleClick: MouseEventHandler<HTMLElement> = (e) => {
+    if ((e.target as HTMLElement).closest(".no-drag")) return;
+    getWindowControls()?.toggleMaximize();
+  };
+
   const chartError =
     candlesQ.isError && candles.length === 0
       ? (candlesQ.error as Error)?.message || "请求失败"
@@ -394,7 +411,14 @@ export default function Page() {
 
   return (
     <div className="flex h-screen flex-col bg-[var(--bg)]">
-      <header className="flex h-12 shrink-0 items-center justify-between border-b border-[var(--border)] px-4">
+      <header
+        className={clsx(
+          "drag-region flex h-12 shrink-0 items-center justify-between",
+          "border-b border-[var(--border)]",
+          macSafeArea ? "pl-[84px] pr-4" : "px-4",
+        )}
+        onDoubleClick={onTitleDoubleClick}
+      >
         <div className="flex items-center gap-2">
           <img
             src="/brand/logo.png"
@@ -407,12 +431,14 @@ export default function Page() {
           <span className="hidden text-[11px] text-[var(--muted)] sm:inline">
             多策略量化模拟交易 · OKX 真实行情
           </span>
+          <AppMenu />
         </div>
-        <div className="flex items-center gap-2">
+        <div className="no-drag flex items-center gap-2">
           <AccountModeSwitch />
           <Button variant="ghost" size="sm" onClick={toggleTheme} aria-label="切换主题">
             {theme === "light" ? "暗色" : "亮色"}
           </Button>
+          <WindowControls />
         </div>
       </header>
 

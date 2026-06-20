@@ -2,7 +2,7 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'unsafe-inline'; script-src 'self'" />
     <title>Aragon Trading</title>
     <style>
       :root {
@@ -23,6 +23,26 @@
         user-select: none;
         overflow: hidden;
       }
+      /* 无边框加载窗：整页可拖拽移动，避免后端慢启动时用户被「钉死」（spec §4.5 / D7 / R-4）。 */
+      body { -webkit-app-region: drag; }
+      .win-close {
+        position: fixed;
+        top: 0;
+        right: 0;
+        width: 46px;
+        height: 40px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border: 0;
+        background: transparent;
+        color: var(--muted);
+        cursor: pointer;
+        -webkit-app-region: no-drag;
+        transition: background 0.15s ease, color 0.15s ease;
+      }
+      .win-close:hover { background: #e81123; color: #fff; }
+      .win-close:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
       .wrap {
         height: 100%;
         display: flex;
@@ -58,11 +78,17 @@
     </style>
   </head>
   <body>
+    <button id="loading-close" class="win-close" type="button" aria-label="关闭" title="关闭">
+      <svg width="11" height="11" viewBox="0 0 11 11" aria-hidden="true">
+        <path d="M1 1l9 9M10 1l-9 9" stroke="currentColor" stroke-width="1.2" fill="none" />
+      </svg>
+    </button>
     <div class="wrap">
       <div class="mark">A</div>
       <div class="title">Aragon Trading</div>
       <div class="spinner"></div>
       <div class="sub">正在启动 Aragon 引擎…（首次启动需编译/解压，请稍候）</div>
     </div>
+    <script src="./loading.js"></script>
   </body>
 </html>
