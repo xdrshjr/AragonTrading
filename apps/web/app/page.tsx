@@ -442,7 +442,7 @@ export default function Page() {
         </div>
       </header>
 
-      <main className="grid flex-1 grid-cols-1 overflow-hidden lg:grid-cols-[1fr_380px]">
+      <main className="no-drag grid flex-1 grid-cols-1 overflow-hidden lg:grid-cols-[1fr_380px]">
         <ChartWorkspace
           candles={candles}
           overlayEquity={overlayEquity}

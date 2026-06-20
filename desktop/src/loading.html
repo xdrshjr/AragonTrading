@@ -23,8 +23,17 @@
         user-select: none;
         overflow: hidden;
       }
-      /* 无边框加载窗：整页可拖拽移动，避免后端慢启动时用户被「钉死」（spec §4.5 / D7 / R-4）。 */
-      body { -webkit-app-region: drag; }
+      /* 无边框加载窗：仅顶部一条拖拽带可移动窗口（仿应用 48px 顶栏）。
+         整页 drag 会在 loadFile→loadURL 跨文档导航后残留、吞掉应用内容区的点击，
+         故收敛为顶部拖拽带，既保留慢启动时可拖动加载窗，又不让整窗成为死区（spec §4.5 / D7 / R-4）。 */
+      .drag-bar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 48px;
+        -webkit-app-region: drag;
+      }
       .win-close {
         position: fixed;
         top: 0;
@@ -78,6 +87,7 @@
     </style>
   </head>
   <body>
+    <div class="drag-bar" aria-hidden="true"></div>
     <button id="loading-close" class="win-close" type="button" aria-label="关闭" title="关闭">
       <svg width="11" height="11" viewBox="0 0 11 11" aria-hidden="true">
         <path d="M1 1l9 9M10 1l-9 9" stroke="currentColor" stroke-width="1.2" fill="none" />
