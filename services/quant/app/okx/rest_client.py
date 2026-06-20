@@ -11,7 +11,7 @@ import time
 import httpx
 
 from ..config import Settings, get_settings
-from .types import Candle, Instrument, parse_okx_candle
+from .types import Candle, Instrument, _optional_float, parse_okx_candle
 
 
 class OKXError(Exception):
@@ -170,7 +170,12 @@ class OKXRestClient:
         return candles[-limit:] if len(candles) > limit else candles
 
     async def get_instruments(self, inst_type: str = "SWAP") -> list[Instrument]:
-        """从 tickers 拉取可选标的列表（USDT 计价优先）。"""
+        """从 tickers 拉取该类型**全量**标的并携带 24h 行情，按成交额降序。
+
+        OKX `tickers` 单次即返回该 instType 全量且自带行情（last/open24h/vol*），
+        无需逐标的取价；`changePct=(last-open24h)/open24h`（open24h 为 0/缺失则 None），
+        按 `volCcy24h` 降序（缺失视为 0）让主流币天然靠前，取代旧的「字母序+截断」。
+        """
         rows = await self._request("/api/v5/market/tickers", {"instType": inst_type})
         out: list[Instrument] = []
         for r in rows:
@@ -179,9 +184,22 @@ class OKXRestClient:
             if len(parts) < 2:
                 continue
             base, quote = parts[0], parts[1]
-            out.append(Instrument(instId=inst_id, instType=inst_type, base=base, quote=quote))
-        # 把常见 USDT 标的排前面，便于前端默认展示
-        out.sort(key=lambda i: (i.quote != "USDT", i.instId))
+            last = _optional_float(r.get("last"))
+            open24h = _optional_float(r.get("open24h"))
+            change_pct = (last - open24h) / open24h if last is not None and open24h else None
+            out.append(Instrument(
+                instId=inst_id,
+                instType=inst_type,
+                base=base,
+                quote=quote,
+                last=last,
+                open24h=open24h,
+                vol24h=_optional_float(r.get("vol24h")),
+                volCcy24h=_optional_float(r.get("volCcy24h")),
+                changePct=change_pct,
+            ))
+        # 按 24h 成交额降序（缺失视为 0）；同额时回落 instId 稳定排序
+        out.sort(key=lambda i: (-(i.volCcy24h or 0.0), i.instId))
         return out
 
     async def get_ticker(self, inst_id: str) -> float | None:

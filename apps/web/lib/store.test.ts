@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { FALLBACK_INSTRUMENTS } from "./instruments";
 import { DEFAULT_SIM_BALANCE, useAppStore } from "./store";
 
 describe("app store — account mode & sim balance", () => {
@@ -67,5 +68,58 @@ describe("app store — account mode & sim balance", () => {
     expect(raw).not.toContain("paperSessionsByStrategyId");
     expect(raw).not.toContain("paperStreamsEnabled");
     expect(raw).not.toContain("session-1");
+  });
+});
+
+describe("app store — watchlist & instrument sidebar tab", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({ watchlist: [...FALLBACK_INSTRUMENTS], instSidebarTab: "watch" });
+  });
+
+  it("toggleWatchlist adds (prepends) then removes, idempotently", () => {
+    useAppStore.setState({ watchlist: [] });
+    useAppStore.getState().toggleWatchlist("PEPE-USDT");
+    expect(useAppStore.getState().watchlist).toEqual(["PEPE-USDT"]);
+    useAppStore.getState().toggleWatchlist("DOGE-USDT");
+    expect(useAppStore.getState().watchlist).toEqual(["DOGE-USDT", "PEPE-USDT"]);
+    useAppStore.getState().toggleWatchlist("PEPE-USDT");
+    expect(useAppStore.getState().watchlist).toEqual(["DOGE-USDT"]);
+  });
+
+  it("addToWatchlist dedupes and removeFromWatchlist is a no-op when absent", () => {
+    useAppStore.setState({ watchlist: ["BTC-USDT-SWAP"] });
+    useAppStore.getState().addToWatchlist("BTC-USDT-SWAP");
+    expect(useAppStore.getState().watchlist).toEqual(["BTC-USDT-SWAP"]);
+    useAppStore.getState().removeFromWatchlist("NOPE-USDT");
+    expect(useAppStore.getState().watchlist).toEqual(["BTC-USDT-SWAP"]);
+    useAppStore.getState().removeFromWatchlist("BTC-USDT-SWAP");
+    expect(useAppStore.getState().watchlist).toEqual([]);
+  });
+
+  it("persists watchlist and instSidebarTab to localStorage", () => {
+    useAppStore.getState().setInstSidebarTab("swap");
+    useAppStore.getState().toggleWatchlist("OP-USDT");
+    const raw = localStorage.getItem("aragon-ui");
+    expect(raw).toBeTruthy();
+    const persisted = JSON.parse(raw as string);
+    expect(persisted.state.instSidebarTab).toBe("swap");
+    expect(persisted.state.watchlist).toContain("OP-USDT");
+  });
+
+  it("migrates v5 persisted state to v6 with default watchlist seed and tab", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({
+        state: { instId: "SOL-USDT-SWAP", bar: "1H", theme: "dark", accountMode: "sim" },
+        version: 5,
+      }),
+    );
+    await useAppStore.persist.rehydrate();
+    const s = useAppStore.getState();
+    expect(s.watchlist).toEqual([...FALLBACK_INSTRUMENTS]);
+    expect(s.instSidebarTab).toBe("watch");
+    // 既有持久化字段仍恢复
+    expect(s.instId).toBe("SOL-USDT-SWAP");
   });
 });

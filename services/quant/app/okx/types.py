@@ -25,12 +25,21 @@ class Candle(BaseModel):
 
 
 class Instrument(BaseModel):
-    """可交易标的。"""
+    """可交易标的（携带 24h 行情快照，供前端列表展示与成交额排序）。
+
+    行情字段均为 `Optional[float]`、默认 `None`，向后兼容旧调用方；
+    `volCcy24h` 仅作同一 `instType` 列表内的成交额排序启发式（跨类型口径不同，不可比）。
+    """
 
     instId: str
-    instType: str  # "SWAP" | "SPOT"
+    instType: str  # "SWAP" | "SPOT" | "FUTURES"
     base: str
     quote: str
+    last: float | None = None        # 最新成交价
+    open24h: float | None = None     # 24h 前价（算涨跌）
+    vol24h: float | None = None      # 24h 成交量（基础币）
+    volCcy24h: float | None = None   # 24h 成交额（计价币）→ 排序键
+    changePct: float | None = None   # (last-open24h)/open24h
 
 
 class MarketTrade(BaseModel):

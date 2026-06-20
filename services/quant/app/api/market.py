@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
@@ -14,6 +14,9 @@ from ..db.session import get_session
 from ..okx.rest_client import OKXError, get_rest_client
 
 router = APIRouter(tags=["market"])
+
+# 仅 OKX 公共行情支持的可枚举标的类型；非法值在边界处一次性拒绝（C1 显式错误）。
+_ALLOWED_INST_TYPES = {"SPOT", "SWAP", "FUTURES"}
 
 
 @router.get("/health")
@@ -39,6 +42,18 @@ async def health() -> dict:
 
 @router.get("/instruments")
 async def get_instruments(instType: str = Query("SWAP")) -> list[dict]:
+    """按类型返回该 instType 全量标的（带 24h 行情、按成交额降序）。
+
+    `instType` 仅接受 `SPOT|SWAP|FUTURES`，非法值→400（main 全局处理器包成 {error:{...}}）。
+    """
+    if instType not in _ALLOWED_INST_TYPES:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "BAD_INST_TYPE",
+                "message": f"instType 必须是 {sorted(_ALLOWED_INST_TYPES)} 之一，收到 {instType!r}",
+            },
+        )
     instruments = await get_rest_client().get_instruments(instType)
     return [i.model_dump() for i in instruments]
 

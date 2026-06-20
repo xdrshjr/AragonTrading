@@ -64,9 +64,14 @@ export interface LiveMarketState {
 
 export interface Instrument {
   instId: string;
-  instType: "SWAP" | "SPOT";
+  instType: "SPOT" | "SWAP" | "FUTURES";
   base: string;
   quote: string;
+  last?: number | null;
+  open24h?: number | null;
+  vol24h?: number | null;
+  volCcy24h?: number | null;
+  changePct?: number | null;
 }
 
 export type ParamSchema = Record<
@@ -213,13 +218,6 @@ export interface Overlay {
   name: string;
   color: string;
   equity: EquityPoint[];
-}
-
-export interface Ticker {
-  instId: string;
-  last: number;
-  open24h: number;
-  changePct: number;
 }
 
 export interface Metrics {

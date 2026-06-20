@@ -1,6 +1,10 @@
 """OKX 归一化单测 (spec R7 / C2)：毫秒->秒、升序、number 类型。"""
 from __future__ import annotations
 
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from app.okx.rest_client import OKXRestClient
 from app.okx.types import (
     parse_okx_books5,
     parse_okx_candle,
@@ -83,3 +87,62 @@ def test_market_parsers_drop_malformed_rows():
     assert parse_okx_trade({"px": "1", "sz": "1", "side": "hold", "ts": "1"}) is None
     assert parse_okx_ticker({"last": "", "ts": "1"}) is None
     assert parse_okx_books5({"asks": [["bad"]], "bids": [], "ts": "1"}) is None
+
+
+class _StubRest(OKXRestClient):
+    """覆盖 _request 喂入固定 tickers 行，验证 get_instruments 解析/排序（不联网）。"""
+
+    def __init__(self, rows: list[dict]) -> None:
+        super().__init__()
+        self._rows = rows
+
+    async def _request(self, path: str, params: dict, *, retries: int = 3) -> list:
+        assert path == "/api/v5/market/tickers"
+        return self._rows
+
+
+async def test_get_instruments_parses_quotes_and_sorts_by_turnover():
+    rows = [
+        {"instId": "AAVE-USDT-SWAP", "last": "100", "open24h": "80",
+         "vol24h": "10", "volCcy24h": "1000"},
+        {"instId": "BTC-USDT-SWAP", "last": "64000", "open24h": "0",
+         "vol24h": "5", "volCcy24h": "9000000"},
+        {"instId": "ETH-USDT-SWAP", "last": "3000", "open24h": "3300",
+         "vol24h": "20", "volCcy24h": "5000000"},
+        {"instId": "BADROW"},  # 无法切分 base/quote -> 跳过
+    ]
+    out = await _StubRest(rows).get_instruments("SWAP")
+    # 按 volCcy24h 降序：BTC(9e6) > ETH(5e6) > AAVE(1e3)，无法切分的行被丢弃
+    assert [i.instId for i in out] == ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "AAVE-USDT-SWAP"]
+    aave = out[-1]
+    assert aave.base == "AAVE" and aave.quote == "USDT"
+    assert aave.last == 100 and aave.open24h == 80
+    assert aave.vol24h == 10 and aave.volCcy24h == 1000
+    assert aave.changePct == pytest.approx((100 - 80) / 80)
+    # open24h=0 -> changePct None（不除零）
+    assert out[0].open24h == 0 and out[0].changePct is None
+    # 负向涨跌正确
+    assert out[1].changePct == pytest.approx((3000 - 3300) / 3300)
+
+
+async def test_get_instruments_tolerates_missing_quote_fields():
+    out = await _StubRest([{"instId": "OP-USDT", "last": "", "volCcy24h": ""}]).get_instruments("SPOT")
+    assert len(out) == 1
+    inst = out[0]
+    assert inst.base == "OP" and inst.quote == "USDT"
+    assert inst.last is None and inst.volCcy24h is None and inst.changePct is None
+
+
+async def test_instruments_endpoint_rejects_bad_inst_type():
+    from app.db.session import dispose_engine, init_db
+    from app.main import app
+
+    await init_db()
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.get("/api/instruments", params={"instType": "OPTION"})
+            assert r.status_code == 400
+            assert r.json()["error"]["code"] == "BAD_INST_TYPE"
+    finally:
+        await dispose_engine()

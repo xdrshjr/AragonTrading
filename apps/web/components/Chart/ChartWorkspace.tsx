@@ -19,7 +19,7 @@ import type {
 } from "@/lib/types";
 import ChartHeaderBar from "./ChartHeaderBar";
 import ChartToolbar, { type ChartToolbarProps } from "./ChartToolbar";
-import InstrumentList from "./InstrumentList";
+import InstrumentSidebar from "./InstrumentSidebar";
 import MarketDepthPanel from "./MarketDepthPanel";
 
 const CandleChart = dynamic(() => import("./CandleChart"), { ssr: false });
@@ -126,14 +126,18 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
   return (
     <section className="flex h-full min-h-0 flex-col border-b border-[var(--border)] lg:border-b-0 lg:border-r">
       <div className="flex min-h-0 flex-[8] flex-col lg:flex-row">
-        <div className="shrink-0 overflow-auto border-b border-[var(--border)] lg:basis-[10%] lg:min-w-[128px] lg:max-w-[180px] lg:border-b-0 lg:border-r">
-          <MarketDepthPanel market={market} activeCandle={displayCandle} />
-          <InstrumentList
-            active={instId}
-            onSelect={setInst}
-            lastPrice={market.lastPrice}
-            changePct={sessionChangePct}
-          />
+        <div className="flex max-h-[42vh] min-h-0 shrink-0 flex-col border-b border-[var(--border)] lg:max-h-none lg:basis-[16%] lg:min-w-[220px] lg:max-w-[300px] lg:border-b-0 lg:border-r">
+          <div className="shrink-0 border-b border-[var(--border)]">
+            <MarketDepthPanel market={market} activeCandle={displayCandle} />
+          </div>
+          <div className="min-h-0 flex-1">
+            <InstrumentSidebar
+              active={instId}
+              onSelect={setInst}
+              livePrice={market.lastPrice}
+              changePct={sessionChangePct}
+            />
+          </div>
         </div>
         <div className="flex min-h-[320px] min-w-0 flex-1 flex-col">
           <div className="shrink-0 border-b border-[var(--border)] px-4 py-2.5">

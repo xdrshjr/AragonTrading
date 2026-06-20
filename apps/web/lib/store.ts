@@ -3,6 +3,7 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { DEFAULT_INDICATORS, type IndicatorKey } from "./indicators";
+import { FALLBACK_INSTRUMENTS } from "./instruments";
 import type {
   AccountMode,
   Bar,
@@ -14,6 +15,8 @@ import type {
 } from "./types";
 
 type Theme = "light" | "dark";
+// 标的侧边栏页签：自选 / 现货 / 合约（"swap" 承载 SWAP+FUTURES 合约页签，RV-10）。
+export type InstSidebarTab = "watch" | "spot" | "swap";
 const DEFAULT_RANGE_DAYS = 30;
 const defaultEndTs = Math.floor(Date.now() / 1000);
 const defaultStartTs = defaultEndTs - DEFAULT_RANGE_DAYS * 24 * 60 * 60;
@@ -46,6 +49,8 @@ interface AppState {
   backtestStartTs: number;
   backtestEndTs: number;
   indicators: Record<IndicatorKey, boolean>;
+  watchlist: string[];
+  instSidebarTab: InstSidebarTab;
 
   setInst: (instId: string) => void;
   setBar: (bar: Bar) => void;
@@ -74,6 +79,10 @@ interface AppState {
   toggleIndicator: (key: IndicatorKey) => void;
   setIndicators: (rec: Record<IndicatorKey, boolean>) => void;
   resetIndicators: () => void;
+  addToWatchlist: (instId: string) => void;
+  removeFromWatchlist: (instId: string) => void;
+  toggleWatchlist: (instId: string) => void;
+  setInstSidebarTab: (tab: InstSidebarTab) => void;
 }
 
 export const useAppStore = create<AppState>()(
@@ -101,6 +110,9 @@ export const useAppStore = create<AppState>()(
       backtestStartTs: defaultStartTs,
       backtestEndTs: defaultEndTs,
       indicators: { ...DEFAULT_INDICATORS },
+      // 全新安装兜底（RV-1 / C-1）：只走初始化器、不触发 migrate，故默认值必须写在此处。
+      watchlist: [...FALLBACK_INSTRUMENTS],
+      instSidebarTab: "watch",
 
       setInst: (instId) => set({ instId, runId: null, chartView: "live-follow" }),
       setBar: (bar) => set({ bar, runId: null, chartView: "live-follow" }),
@@ -175,12 +187,28 @@ export const useAppStore = create<AppState>()(
         set((s) => ({ indicators: { ...s.indicators, [key]: !s.indicators[key] } })),
       setIndicators: (indicators) => set({ indicators }),
       resetIndicators: () => set({ indicators: { ...DEFAULT_INDICATORS } }),
+      // 自选（spec §6.4）：有序去重；新收藏置首便于即时可见（§7）。
+      addToWatchlist: (instId) =>
+        set((s) =>
+          s.watchlist.includes(instId)
+            ? s
+            : { watchlist: [instId, ...s.watchlist] },
+        ),
+      removeFromWatchlist: (instId) =>
+        set((s) => ({ watchlist: s.watchlist.filter((id) => id !== instId) })),
+      toggleWatchlist: (instId) =>
+        set((s) => ({
+          watchlist: s.watchlist.includes(instId)
+            ? s.watchlist.filter((id) => id !== instId)
+            : [instId, ...s.watchlist],
+        })),
+      setInstSidebarTab: (instSidebarTab) => set({ instSidebarTab }),
     }),
     {
       name: "aragon-ui",
-      version: 5,
+      version: 6,
       storage: createJSONStorage(() => localStorage),
-      // 只持久化选择态 / 主题 / 账户态；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
+      // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
         instId: s.instId,
         bar: s.bar,
@@ -195,6 +223,8 @@ export const useAppStore = create<AppState>()(
         chartPane: s.chartPane,
         bottomTab: s.bottomTab,
         paneTab: s.paneTab,
+        watchlist: s.watchlist,
+        instSidebarTab: s.instSidebarTab,
       }),
       // 逐版补默认态（即便缺省 zustand 浅合并也回落初值，migrate 仅为显式稳妥，R7/R11）。
       migrate: (persisted, version) => {
@@ -210,6 +240,9 @@ export const useAppStore = create<AppState>()(
         }
         if (version < 5) {
           next = { ...next, accountMode: "sim", simBalance: DEFAULT_SIM_BALANCE };
+        }
+        if (version < 6) {
+          next = { ...next, watchlist: [...FALLBACK_INSTRUMENTS], instSidebarTab: "watch" };
         }
         return next as never;
       },
