@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from ..config import get_settings
 from ..db import repositories as repo
 from ..db.session import get_sessionmaker
+from ..okx.types import BAR_SECONDS
 from ..strategies.base import BaseStrategy
 from .session import PaperSession
 
@@ -55,13 +56,17 @@ class PaperManager:
                     priming: bool = True, priming_bars: int = 300) -> PaperSession:
         self._ensure_capacity(1)
 
+        base_seconds = BAR_SECONDS.get(bar, 60)
+        htf_bars = [tf for tf in strategy.timeframes()
+                    if BAR_SECONDS.get(tf, 0) > base_seconds]   # §6.3/P2-2 透明追溯
         sm = get_sessionmaker()
         async with sm() as s:
             run = await repo.create_run(
                 s, strategy_id=strategy_id, inst_id=inst_id, bar=bar, mode="paper",
                 config={"initialCapital": initial_capital, "source": source,
                         "speed": speed, "replayBars": replay_bars,
-                        "priming": priming, "primingBars": priming_bars},
+                        "priming": priming, "primingBars": priming_bars,
+                        "htfBars": htf_bars},
                 status="running",
             )
             run_id = run.id

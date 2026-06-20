@@ -163,6 +163,48 @@ def _regime_resampled(
     return mapped
 
 
+def regime_from_htf_frame(
+    htf_df: pd.DataFrame,
+    *,
+    ema_fast: int,
+    ema_slow: int,
+    atr_period: int,
+    pivot_left: int,
+    pivot_right: int,
+) -> pd.DataFrame:
+    """在【真实高周期 OHLC】上直算趋势/波动率/摆动点的**数值列** (MTF §3.7)。
+
+    与 `attach_htf_regime` 的重采样路径不同：本函数直接把传入的 `htf_df` 当作高周期
+    序列（每行即一根真实高周期 K 线），省去「从基础重采样 + shift 桶」，因果性改由
+    `engine.mtf.causal_htf_merge` 的收盘时间对齐保证。
+
+    **【P1-1】只产出数值列、不产出布尔趋势列**：列名为「无 `htf_` 前缀」的特征名
+    （`ema_fast/ema_slow/slope/atr/high/low/swing_low/swing_high`），由 `causal_htf_merge`
+    统一加上 `htf_` 前缀后即与既有 `HTF_COLUMNS` 数值列同名；`htf_uptrend/htf_downtrend`
+    须在合并之后由 `_attach_trend_flags` 派生（未匹配行 `nan>nan→False`，绝不 `bool(nan)→True`）。
+
+    Args:
+        htf_df: 高周期真实 K 线（列 `ts,o,h,l,c,vol`，升序）。
+        ema_fast / ema_slow: 高周期快 / 慢 EMA 周期。
+        atr_period: 高周期 ATR 周期。
+        pivot_left / pivot_right: 高周期确认型摆动点左右窗口。
+
+    Returns:
+        与 `htf_df` 同索引、含上述 8 个无前缀数值列的 DataFrame；历史不足处为 NaN。
+    """
+    close = htf_df["c"]
+    out = pd.DataFrame(index=htf_df.index)
+    out["ema_fast"] = ema(close, int(ema_fast))
+    out["ema_slow"] = ema(close, int(ema_slow))
+    out["slope"] = out["ema_slow"].diff()
+    out["atr"] = atr(htf_df, int(atr_period))
+    out["high"] = htf_df["h"]
+    out["low"] = htf_df["l"]
+    out["swing_low"] = pivot_low_confirmed(htf_df["l"], pivot_left, pivot_right)
+    out["swing_high"] = pivot_high_confirmed(htf_df["h"], pivot_left, pivot_right)
+    return out
+
+
 def _attach_trend_flags(frame: pd.DataFrame) -> None:
     """就地派生 `htf_uptrend / htf_downtrend`（与 NaN 比较得 False，永不为 NaN）。"""
     frame["htf_uptrend"] = (

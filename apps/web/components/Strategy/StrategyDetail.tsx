@@ -43,9 +43,19 @@ export default function StrategyDetail({
   const setValue = (key: string, value: unknown) =>
     setParams((prev) => ({ ...prev, [key]: value }));
 
+  // 多周期：策略声明了高周期参考时展示信息性徽标（不改任何请求路径，仅帮助理解综合多周期）。
+  const htfFilterOn = params.htf_trend_filter !== false;
+  const htfBar = typeof params.htf_bar === "string" && htfFilterOn ? params.htf_bar : null;
+
   return (
     <div className="flex flex-col gap-3">
       <p className="text-xs leading-relaxed text-[var(--muted)]">{strategy.description}</p>
+
+      {htfBar && (
+        <span className="inline-flex w-fit items-center gap-1 rounded-[6px] bg-[var(--accent-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--accent)]">
+          参考周期：{htfBar}
+        </span>
+      )}
 
       <div className="grid grid-cols-2 gap-2">
         {Object.entries(schema).map(([key, def]) => {

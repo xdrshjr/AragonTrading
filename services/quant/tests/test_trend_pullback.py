@@ -225,3 +225,70 @@ def test_warmup_is_pure():
 def test_new_strategies_registered():
     for key in ("trend_pullback_long", "trend_pullback_short"):
         assert key in STRATEGY_REGISTRY
+
+
+# ---------------- 多周期迁移：真实高周期 vs 重采样兜底（MTF T6 / T6b / P1-4）----------------
+
+def _htf_1h(closes: list[float]) -> pd.DataFrame:
+    """构造真实 1H K 线帧（升序 ts），收盘价由入参驱动。"""
+    rows = []
+    for i, c in enumerate(closes):
+        o = closes[i - 1] if i > 0 else c
+        rows.append({"ts": 1_700_000_000 + i * 3600, "o": round(o, 2),
+                     "h": round(max(o, c) + 0.5, 2), "l": round(min(o, c) - 0.5, 2),
+                     "c": round(c, 2), "vol": 1000.0})
+    return pd.DataFrame(rows)
+
+
+def test_timeframes_derived_from_htf_seconds():
+    """timeframes() 单一真源于 htf_seconds（P1-4）：标准秒→bar；非标准→[]（回退重采样）。"""
+    assert TrendPullbackLong({**TEST_PARAMS, "htf_seconds": 3600}).timeframes() == ["1H"]
+    assert TrendPullbackLong({**TEST_PARAMS, "htf_seconds": 900}).timeframes() == ["15m"]
+    assert TrendPullbackLong({**TEST_PARAMS, "htf_seconds": 7200}).timeframes() == []
+    assert TrendPullbackShort({**TEST_PARAMS, "htf_seconds": 14400}).timeframes() == ["4H"]
+
+
+def test_resample_fallback_is_noop_without_frames():
+    """无真实帧（或非标准周期）：attach_timeframes 为 no-op，HTF 列仍由 prepare 重采样产出（T6b）。
+
+    prepare 未改动 → 兜底路径与 v1 逐字节一致；既有 prepare-only 用例即其回归基线。
+    """
+    strat = TrendPullbackLong(TEST_PARAMS)
+    rows = _uptrend_pullbacks()
+    df_prepare = strat.prepare(pd.DataFrame(rows), "5m")
+    df_attach = strat.attach_timeframes(df_prepare.copy(), "5m", {})        # 无帧
+    for col in ts.HTF_COLUMNS:
+        pd.testing.assert_series_equal(df_prepare[col], df_attach[col], check_names=False)
+    # 非标准 htf_seconds：即便给了帧，tf 为 None 也不并入（回退重采样）。
+    odd = TrendPullbackLong({**TEST_PARAMS, "htf_seconds": 7200})
+    df_odd = odd.prepare(pd.DataFrame(rows), "5m")
+    df_odd2 = odd.attach_timeframes(df_odd.copy(), "5m", {"1H": _htf_1h([100.0] * 60)})
+    for col in ts.HTF_COLUMNS:
+        pd.testing.assert_series_equal(df_odd[col], df_odd2[col], check_names=False)
+
+
+def test_real_htf_frame_drives_direction_causally():
+    """真实 1H 帧因果并入：趋势方向门控正确，早段无未来泄漏（T6 核心：多周期改变决策）。"""
+    rows = [
+        {"ts": 1_700_000_000 + i * 300, "o": 100.0, "h": 101.0, "l": 99.0,
+         "c": 100.0, "vol": 1000.0}
+        for i in range(120)                      # 120 根 5m = 10h
+    ]
+    base = pd.DataFrame(rows)
+    strat = TrendPullbackLong(TEST_PARAMS)
+    df_prepare = strat.prepare(base, "5m")
+
+    up_htf = _htf_1h([100.0 + i for i in range(12)])     # 明确上行
+    df_up = strat.attach_timeframes(df_prepare.copy(), "5m", {"1H": up_htf})
+    down_htf = _htf_1h([200.0 - i for i in range(12)])   # 明确下行
+    df_down = strat.attach_timeframes(df_prepare.copy(), "5m", {"1H": down_htf})
+
+    # 真实帧确实激活了 HTF 数值列（非全 NaN），证明并入生效。
+    assert df_up["htf_ema_slow"].notna().any()
+    # 方向门控：上行帧出现 htf_uptrend=True；下行帧同列恒 False（且出现 htf_downtrend=True）。
+    assert bool(df_up["htf_uptrend"].iloc[-1]) is True
+    assert bool(df_down["htf_uptrend"].iloc[-1]) is False
+    assert bool(df_down["htf_downtrend"].iloc[-1]) is True
+    # 因果：早段未匹配行（首个 1H 收盘前）布尔列为 False（非 NaN/True，P1-1）。
+    assert df_up["htf_uptrend"].iloc[0] == False    # noqa: E712
+    assert pd.isna(df_up["htf_ema_slow"].iloc[0])

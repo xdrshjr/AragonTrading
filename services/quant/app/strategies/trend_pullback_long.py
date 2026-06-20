@@ -13,6 +13,7 @@ from __future__ import annotations
 import pandas as pd
 
 from ..engine.indicators import atr
+from ..engine.mtf import bar_to_seconds, causal_htf_merge, seconds_to_bar
 from ..engine.simulator import BrokerContext
 from ..okx.types import BAR_SECONDS
 from . import _trend_structure as ts
@@ -27,8 +28,9 @@ class TrendPullbackLong(BaseStrategy):
         description=(
             "大周期(默认1h)EMA定多头方向，价格回踩到1h支撑区(摆动低点±HTF-ATR)且"
             "非放量、收阳止跌时顺势做多；小级别破位仅收紧跟踪止损不清仓，2m/5m结构破/"
-            "1h失效/跟踪止损才全平。建议基础周期5m/15m；细周期需足够历史"
-            "(如5m+1h约需600根才激活高周期EMA)，否则仅无信号而非报错。"
+            "1h失效/跟踪止损才全平。建议基础周期5m/15m。高周期优先用真实K线"
+            "(标准周期由htf_seconds派生，历史更长、HTF指标更早激活)；取不到时回退基础"
+            "周期重采样兜底，仅无信号而非报错。"
         ),
         default_params={
             "htf_seconds": 3600,
@@ -83,6 +85,48 @@ class TrendPullbackLong(BaseStrategy):
             int(p["slow_pivot_left"]) + int(p["slow_pivot_right"]) + 1,
             int(p["fast_pivot_left"]) + int(p["fast_pivot_right"]) + 1,
         ) + 2
+
+    def timeframes(self) -> list[str]:
+        """高周期由现有 `htf_seconds` 单一真源派生（P1-4，不新增枚举）。
+
+        标准秒数 → 对应 OKX bar 走真实高周期 K 线；非标准(如旧参 7200s)→ `None` →
+        `attach_timeframes` 取不到帧 → 回退 `prepare` 的重采样兜底（R-5，完全向后兼容）。
+        """
+        tf = seconds_to_bar(int(self.params.get("htf_seconds", 3600)))
+        return [tf] if tf else []
+
+    def htf_warmup_bars(self) -> int:
+        """真实高周期需暖机 HTF 慢 EMA + 慢摆动窗，方激活区域结构。"""
+        p = self.params
+        return (int(p["htf_ema_slow"]) + int(p["slow_pivot_left"])
+                + int(p["slow_pivot_right"]) + 5)
+
+    def attach_timeframes(self, df: pd.DataFrame, bar: str,
+                          frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """有真实高周期帧时，用真实 K 线因果覆盖 `prepare` 重采样得到的 HTF 列。
+
+        缺帧（非标准 `htf_seconds` / 离线 / 取数失败）则直接返回——`prepare` 的重采样
+        兜底 HTF 列已就位（T6b：兜底路径与 v1 逐字节一致）。
+        """
+        tf = seconds_to_bar(int(self.params["htf_seconds"]))
+        htf_df = frames.get(tf) if tf else None
+        if htf_df is None or htf_df.empty:
+            return df
+        p = self.params
+
+        def _compute(h: pd.DataFrame) -> pd.DataFrame:
+            return ts.regime_from_htf_frame(
+                h, ema_fast=int(p["htf_ema_fast"]), ema_slow=int(p["htf_ema_slow"]),
+                atr_period=int(p["atr_period"]),
+                pivot_left=int(p["slow_pivot_left"]), pivot_right=int(p["slow_pivot_right"]))
+
+        merged = causal_htf_merge(df, htf_df, bar_to_seconds(tf),
+                                  compute=_compute, prefix="htf_")
+        df = df.copy()
+        for col in merged.columns:
+            df[col] = merged[col]
+        ts._attach_trend_flags(df)   # 【P1-1】合并后由数值列派生布尔趋势列
+        return df
 
     def prepare(self, df: pd.DataFrame, bar: str) -> pd.DataFrame:
         df = df.copy()

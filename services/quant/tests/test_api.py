@@ -144,6 +144,63 @@ async def test_backtest_rejects_empty_requested_range(patch_okx):
         await dispose_engine()
 
 
+async def test_backtest_loads_and_caches_htf(patch_okx):
+    """多周期接入（T7）：声明高周期的策略回测后落 1H 缓存、run.config.htfBars 含 1H。"""
+    import json
+
+    from sqlalchemy import select
+
+    from app.db import repositories as repo
+    from app.db.models import CandleCache
+    from app.db.session import dispose_engine, get_sessionmaker, init_db
+    await init_db()
+    transport = ASGITransport(app=_load_app())
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            strategies = (await client.get("/api/strategies")).json()
+            sid = next(s["id"] for s in strategies if s["templateKey"] == "ema_cross_scalper")
+            r = await client.post(f"/api/strategies/{sid}/backtest", json={
+                "instId": "BTC-USDT-SWAP", "bar": "5m", "limit": 200,
+                "startTs": 1_700_000_000, "endTs": 1_700_000_000 + 100 * 3600})
+            assert r.status_code == 200, r.text
+            run_id = r.json()["runId"]
+
+            # REST 对 1H 高周期发起过取数
+            assert any(c["bar"] == "1H" for c in patch_okx.calls)
+            sm = get_sessionmaker()
+            async with sm() as s:
+                run = await repo.get_run(s, run_id)
+                cfg = json.loads(run.config_json or "{}")
+                htf_rows = (await s.execute(
+                    select(CandleCache).where(CandleCache.bar == "1H"))).scalars().all()
+            assert "1H" in cfg["htfBars"]          # run.config 透明追溯
+            assert len(htf_rows) > 0               # 高周期入缓存复用
+    finally:
+        await dispose_engine()
+
+
+async def test_compare_fetches_htf_union_once(patch_okx):
+    """对比并集取数（T8 / P1-2）：两个都声明 1H 的策略只触发 1 次 1H REST 取数。"""
+    from app.db.session import dispose_engine, init_db
+    await init_db()
+    transport = ASGITransport(app=_load_app())
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            strategies = (await client.get("/api/strategies")).json()
+            ema_id = next(s["id"] for s in strategies if s["templateKey"] == "ema_cross_scalper")
+            tpl_id = next(s["id"] for s in strategies if s["templateKey"] == "trend_pullback_long")
+            r = await client.post("/api/strategies/compare", json={
+                "strategyIds": [ema_id, tpl_id], "instId": "BTC-USDT-SWAP", "bar": "5m",
+                "limit": 200, "startTs": 1_700_000_000,
+                "endTs": 1_700_000_000 + 100 * 3600})
+            assert r.status_code == 200, r.text
+            assert len(r.json()["items"]) == 2
+            # 并集只取一次：1H 取数计数恰为 1（而非每策略各取一次）。
+            assert sum(1 for c in patch_okx.calls if c["bar"] == "1H") == 1
+    finally:
+        await dispose_engine()
+
+
 def _load_app():
     from app.main import app
     return app

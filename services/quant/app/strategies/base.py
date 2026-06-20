@@ -61,6 +61,28 @@ class BaseStrategy(ABC):
     def prepare(self, df: pd.DataFrame, bar: str) -> pd.DataFrame:
         return df
 
+    # ---- 多周期（MTF）声明式 hook（默认空实现 → 未声明高周期者零开销）----
+    def timeframes(self) -> list[str]:
+        """本策略需参考的【高于基础周期】的标准 OKX bar 列表（由 params 派生）。
+
+        默认 `[]` —— 不取额外周期，行为与现状完全一致。是否严格高于基础周期由
+        调用方（API 取数 / 回测 / 会话）按 `bar_to_seconds` 过滤，本方法不依赖运行态。
+        """
+        return []
+
+    def htf_warmup_bars(self) -> int:
+        """高周期指标暖机所需的最小【高周期】根数（用于 API 计算取数窗口）。"""
+        return 60
+
+    def attach_timeframes(self, df: pd.DataFrame, bar: str,
+                          frames: dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """把真实高周期 K 线因果并入基础 df。默认恒等（未声明周期者零开销）。
+
+        在 `prepare` 之后调用；子类内部用 `engine.mtf.causal_htf_merge` 生成带前缀列。
+        `frames`: `{htf_bar: 升序 OHLC df}`；缺某周期时由子类决定降级（重采样兜底）。
+        """
+        return df
+
     def warmup(self) -> int:
         """开始产生信号前需要的最小历史根数。"""
         return 20

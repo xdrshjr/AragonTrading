@@ -15,7 +15,7 @@ from ..db.session import get_sessionmaker
 from ..engine.backtester import candles_to_df
 from ..engine.simulator import SimBroker
 from ..okx.rest_client import get_rest_client
-from ..okx.types import Candle
+from ..okx.types import BAR_SECONDS, Candle
 from ..okx.ws_client import OKXWSClient
 from ..strategies.base import BaseStrategy
 
@@ -61,6 +61,14 @@ class PaperSession:
             leverage=settings.default_leverage,
         )
         self._candles: deque[dict] = deque(maxlen=_WINDOW_MAX)
+        # 多周期（MTF §3.6/§6.4）：仅当策略声明了【严格高于基础周期】的高周期时才有开销。
+        base_seconds = BAR_SECONDS.get(bar, 60)
+        self._htf_bars: list[str] = [tf for tf in strategy.timeframes()
+                                     if BAR_SECONDS.get(tf, 0) > base_seconds]
+        self._htf_windows: dict[str, deque] = {
+            b: deque(maxlen=_WINDOW_MAX) for b in self._htf_bars}
+        self._htf_last_bucket: dict[str, int] = {}   # 各高周期上次刷新所在桶（跨边界才刷新）
+        self._htf_warmup = strategy.htf_warmup_bars()
         self._last_confirmed_ts: int | None = None
         self._bar_index = -1
         self._trade_cursor = 0
@@ -99,6 +107,8 @@ class PaperSession:
             self._replay_task = asyncio.create_task(self._run_replay())
             return
 
+        # 高周期窗口须在预热回放前就位，使早段 seeded 基础根也能因果对齐（§6.4-1）。
+        await self._prefill_htf(self.priming_bars if self.priming else 60)
         if self.priming:
             await self._prime_history()
         else:
@@ -142,10 +152,64 @@ class PaperSession:
         except Exception:  # noqa: BLE001 —— 预热失败不阻塞，等实时 K 线
             pass
 
+    # ---------- 多周期（MTF）高周期窗口（§6.4）----------
+    async def _prefill_htf(self, base_span_bars: int) -> None:
+        """启动时一次性预填各高周期窗口，覆盖 base_span_bars 根基础区间 + 暖机（§6.4-1）。
+
+        取数失败不阻塞（降级为空窗 → 后续 `attach_timeframes` 走子类缺失回退）。
+        """
+        if not self._htf_bars:
+            return
+        base_seconds = BAR_SECONDS.get(self.bar, 60)
+        for b in self._htf_bars:
+            secs = BAR_SECONDS.get(b)
+            if not secs:
+                continue
+            span_htf = (int(base_span_bars) * base_seconds) // secs + 1
+            limit = min(_WINDOW_MAX, max(self._htf_warmup, span_htf) + 5)
+            try:
+                candles = await get_rest_client().get_candles(self.inst_id, b, limit=limit)
+            except Exception:  # noqa: BLE001 —— 取数失败：窗口留空，安全降级（绝不假数据）
+                continue
+            win = self._htf_windows[b]
+            for c in candles:
+                if getattr(c, "confirm", True):
+                    win.append({"ts": c.ts, "o": c.o, "h": c.h, "l": c.l,
+                                "c": c.c, "vol": c.vol})
+            if win:
+                self._htf_last_bucket[b] = int(win[-1]["ts"]) // secs
+
+    async def _maybe_refresh_htf(self, base_ts: int) -> None:
+        """实时段按高周期边界限频刷新窗口：仅当基础 ts 跨过高周期边界才取一次（§6.4-2）。
+
+        未跨边界复用窗口（避免每根都打 OKX，限频 R1/R3）；取数失败吞为窗口不更新。
+        """
+        for b in self._htf_bars:
+            secs = BAR_SECONDS.get(b)
+            if not secs:
+                continue
+            bucket = base_ts // secs
+            if self._htf_last_bucket.get(b) == bucket:
+                continue   # 未跨边界：复用窗口
+            try:
+                candles = await get_rest_client().get_candles(
+                    self.inst_id, b, limit=self._htf_warmup + 5)
+            except Exception:  # noqa: BLE001 —— 取数失败：窗口不更新（降级，不阻塞撮合）
+                continue
+            win = self._htf_windows[b]
+            existing = {row["ts"] for row in win}
+            for c in candles:
+                if getattr(c, "confirm", True) and c.ts not in existing:
+                    win.append({"ts": c.ts, "o": c.o, "h": c.h, "l": c.l,
+                                "c": c.c, "vol": c.vol})
+            self._htf_last_bucket[b] = bucket
+
     async def _run_replay(self) -> None:
         """拉真实历史 K 线，按可调倍速顺序经 feed_candle 驱动撮合，跑完自动结算 (F5/C3)。"""
         interval = max(0.0, _REPLAY_BASE_INTERVAL / self.speed)
         try:
+            # 回放是固定历史区间：高周期窗口一次性预填即可，逐根回放不再刷新（§6.4-1/4）。
+            await self._prefill_htf(self.replay_bars)
             history = await get_rest_client().get_candles(
                 self.inst_id, self.bar, limit=self.replay_bars)
             for c in history:
@@ -224,6 +288,15 @@ class PaperSession:
         i = len(self._candles) - 1
 
         df = self.strategy.prepare(candles_to_df(list(self._candles)), self.bar)
+        if self._htf_bars:
+            # 【P1-3】按需 REST 刷新仅限实时段(source=="live" 且非 seeded)；
+            # replay/priming 的历史区间已在启动时一次性预填，绝不逐根刷新（限频 R1/R3）。
+            if self.source == "live" and not seeded:
+                await self._maybe_refresh_htf(int(candle.ts))
+            frames = {b: candles_to_df(list(win))
+                      for b, win in self._htf_windows.items() if win}
+            if frames:
+                df = self.strategy.attach_timeframes(df, self.bar, frames)
         r = df.iloc[i]
         risk = self.strategy.risk_params()
 

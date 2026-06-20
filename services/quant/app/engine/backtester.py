@@ -45,14 +45,22 @@ def run_backtest(
     taker_fee_bps: float,
     slippage_bps: float,
     leverage: float = 1.0,
+    htf_frames: dict[str, list] | None = None,
 ) -> BacktestResult:
-    """在历史 K 线上跑完一个策略，返回成交 / 权益 / 指标。"""
+    """在历史 K 线上跑完一个策略，返回成交 / 权益 / 指标。
+
+    `htf_frames`（可选，多周期 §3.4）：`{htf_bar: 高周期 Candle 列表}`。仅当策略声明了
+    高周期且 API 取到真实数据时下发；为 None/空时与单周期既有行为逐字节等价（G3）。
+    """
     df = candles_to_df(candles)
     n = len(df)
     if n == 0:
         return BacktestResult([], [], compute_metrics([], [], bar, initial_capital), 0, 0)
 
     df = strategy.prepare(df, bar)
+    if htf_frames:   # 仅声明了高周期且取到真实数据才走 MTF 路径
+        frames = {b: candles_to_df(cs) for b, cs in htf_frames.items()}
+        df = strategy.attach_timeframes(df, bar, frames)
     risk = strategy.risk_params()
     broker = SimBroker(initial_capital, taker_fee_bps, slippage_bps, leverage)
     warmup = max(strategy.warmup(), 1)
