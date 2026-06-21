@@ -17,6 +17,16 @@ import type {
 type Theme = "light" | "dark";
 // 标的侧边栏页签：自选 / 现货 / 合约（"swap" 承载 SWAP+FUTURES 合约页签，RV-10）。
 export type InstSidebarTab = "watch" | "spot" | "swap";
+// 右侧面板页签：AI 助手 / 交易策略（Agent Trading Copilot §5.3，默认 "agent"）。
+export type RightTab = "agent" | "strategy";
+
+// 生成新会话 id（SSR 安全：crypto 不可用时回落空串，由组件挂载后补）。
+function makeConversationId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "";
+}
 const DEFAULT_RANGE_DAYS = 30;
 const defaultEndTs = Math.floor(Date.now() / 1000);
 const defaultStartTs = defaultEndTs - DEFAULT_RANGE_DAYS * 24 * 60 * 60;
@@ -58,6 +68,8 @@ interface AppState {
   watchlist: string[];
   instSidebarTab: InstSidebarTab;
   chartSplitRatio: number;
+  rightTab: RightTab;
+  agentConversationId: string;
 
   setInst: (instId: string) => void;
   setBar: (bar: Bar) => void;
@@ -91,6 +103,9 @@ interface AppState {
   toggleWatchlist: (instId: string) => void;
   setInstSidebarTab: (tab: InstSidebarTab) => void;
   setChartSplitRatio: (ratio: number) => void;
+  setRightTab: (tab: RightTab) => void;
+  setAgentConversationId: (id: string) => void;
+  newConversation: () => void;
 }
 
 export const useAppStore = create<AppState>()(
@@ -122,6 +137,9 @@ export const useAppStore = create<AppState>()(
       watchlist: [...FALLBACK_INSTRUMENTS],
       instSidebarTab: "watch",
       chartSplitRatio: DEFAULT_CHART_SPLIT_RATIO,
+      // 右侧默认激活「AI 助手」页签；会话 id 首次为空，挂载时生成并落盘以便重连恢复。
+      rightTab: "agent",
+      agentConversationId: "",
 
       setInst: (instId) => set({ instId, runId: null, chartView: "live-follow" }),
       setBar: (bar) => set({ bar, runId: null, chartView: "live-follow" }),
@@ -212,6 +230,11 @@ export const useAppStore = create<AppState>()(
             : [instId, ...s.watchlist],
         })),
       setInstSidebarTab: (instSidebarTab) => set({ instSidebarTab }),
+      // 右侧页签切换（AI 助手 / 交易策略）；两面板各自持续挂载，切换不破坏状态（§6.2#1）。
+      setRightTab: (rightTab) => set({ rightTab }),
+      setAgentConversationId: (agentConversationId) => set({ agentConversationId }),
+      // 新对话：生成新会话 uuid（旧消息流随 conversationId 变更而失效，DB 历史仍可经其原 id 查到）。
+      newConversation: () => set({ agentConversationId: makeConversationId() }),
       // 纵向分栏比例：夹取到 [MIN, MAX]；非有限数忽略（守住边界，与 simBalance 同模式）。
       setChartSplitRatio: (n) =>
         set((s) =>
@@ -227,7 +250,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 7,
+      version: 8,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -247,6 +270,8 @@ export const useAppStore = create<AppState>()(
         watchlist: s.watchlist,
         instSidebarTab: s.instSidebarTab,
         chartSplitRatio: s.chartSplitRatio,
+        rightTab: s.rightTab,
+        agentConversationId: s.agentConversationId,
       }),
       // 逐版补默认态（即便缺省 zustand 浅合并也回落初值，migrate 仅为显式稳妥，R7/R11）。
       migrate: (persisted, version) => {
@@ -268,6 +293,9 @@ export const useAppStore = create<AppState>()(
         }
         if (version < 7) {
           next = { ...next, chartSplitRatio: DEFAULT_CHART_SPLIT_RATIO };
+        }
+        if (version < 8) {
+          next = { ...next, rightTab: "agent", agentConversationId: "" };
         }
         return next as never;
       },

@@ -2,7 +2,7 @@
 # Web 框架
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-# 异步网络（OKX REST / WS）
+# 异步网络（OKX REST / WS；Agent LLM 双标准 anthropic/openai 亦复用 httpx 直连，零新增三方依赖）
 httpx==0.28.1
 websockets==14.1
 # 计算

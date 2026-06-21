@@ -140,6 +140,14 @@ def run_out(run: StrategyRun) -> dict:
     }
 
 
+class AgentConfigOut(BaseModel):
+    """GET /agent/config 响应：是否已配置密钥 + 当前 provider/model（绝不含 key，R3）。"""
+
+    configured: bool
+    provider: str
+    model: str
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

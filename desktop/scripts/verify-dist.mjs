@@ -53,6 +53,8 @@ const BACKEND_DIR = join(RES, 'backend');
 const BACKEND_EXE = join(BACKEND_DIR, IS_WIN ? 'aragon-quant.exe' : 'aragon-quant');
 const WEB_RES = join(RES, 'web');
 const WEB_MANIFEST = join(WEB_RES, 'web-server.json');
+// Agent 凭证文件（build:agent-env 产物 → extraResources）。缺失即"无密钥包"，硬约束断言其存在（P1-C）。
+const AGENT_ENV = join(RES, 'agent', 'agent.env');
 
 // ----------------------------- 报告记录（§7）-----------------------------
 const steps = [];
@@ -267,6 +269,7 @@ async function main() {
   if (!existsSync(UNPACKED)) missing.push(UNPACKED);
   if (!existsSync(BACKEND_EXE)) missing.push(BACKEND_EXE);
   if (!existsSync(WEB_MANIFEST)) missing.push(WEB_MANIFEST);
+  if (!existsSync(AGENT_ENV)) missing.push(AGENT_ENV); // P1-C：Agent 凭证文件必须打进包
   if (missing.length) {
     steps.push({ id: 'artifacts', label: '前置产物存在', ok: false, detail: `缺失：${missing.join(' ; ')}` });
     log(`✗ 前置产物缺失：\n    ${missing.join('\n    ')}`);
@@ -289,7 +292,7 @@ async function main() {
     finishAndExit(10);
     return;
   }
-  recordPass('artifacts', '前置产物存在', `backend exe + standalone(${serverJs.slice(WEB_RES.length + 1)})`);
+  recordPass('artifacts', '前置产物存在', `backend exe + standalone(${serverJs.slice(WEB_RES.length + 1)}) + agent.env`);
 
   // === 步骤 2：端口预检（18760 / 18761），失败直接 exit-11 ===
   const busy = [];

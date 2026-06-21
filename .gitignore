@@ -39,5 +39,6 @@ Thumbs.db
 desktop/dist/
 desktop/resources/web/
 desktop/resources/backend/
+desktop/resources/agent/
 desktop/build/pyi-work/
 desktop/build/pyi-dist/

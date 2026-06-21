@@ -11,6 +11,7 @@ const { app, BrowserWindow, dialog, ipcMain, shell, Menu } = require('electron')
 
 const cfg = require('./lib/config');
 const paths = require('./lib/paths');
+const agentEnvLib = require('./lib/agent-env');
 const {
   ProcessManager,
   portFree,
@@ -135,7 +136,21 @@ async function ensurePortsAvailable() {
 // ----------------------------- 子进程启动规格 -----------------------------
 function backendSpec() {
   const m = paths.mode();
-  const env = cfg.backendEnv({ mode: m, dbPath: m === 'prod' ? paths.userDataDbPath() : undefined });
+  // prod：首启播种 userData/agent.env，解析 AGENT_* 注入后端子进程（dev 经 services/quant/.env 读取）。
+  let agentEnv;
+  if (m === 'prod') {
+    try {
+      agentEnvLib.seedUserAgentEnv();
+      agentEnv = agentEnvLib.loadAgentEnv();
+    } catch (e) {
+      logMain(`加载 Agent 凭证出错（忽略，Agent 将提示未配置）：${e && e.message}`);
+    }
+  }
+  const env = cfg.backendEnv({
+    mode: m,
+    dbPath: m === 'prod' ? paths.userDataDbPath() : undefined,
+    agentEnv,
+  });
   if (m === 'prod') {
     return {
       name: 'backend',

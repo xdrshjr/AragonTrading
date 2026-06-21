@@ -23,6 +23,9 @@ extraResources:
     to: "backend"
   - from: "resources/web"
     to: "web"
+  # Agent 凭证（build:agent-env 产物；首启播种到 userData/agent.env，含密钥占位，gitignored）。
+  - from: "resources/agent"
+    to: "agent"
 
 win:
   target:

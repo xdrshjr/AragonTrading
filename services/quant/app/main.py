@@ -12,7 +12,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .api import market, paper, runs, strategies, ws_market
+from .agent.manager import get_agent_manager
+from .api import agent, market, paper, runs, strategies, ws_market
 from .db.session import dispose_engine, init_db
 from .okx.rest_client import OKXError, get_rest_client
 from .paper.manager import get_paper_manager
@@ -26,6 +27,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("DB initialized; builtin strategies seeded.")
     yield
+    await get_agent_manager().shutdown()
     await get_paper_manager().shutdown()
     await get_rest_client().aclose()
     await dispose_engine()
@@ -78,6 +80,7 @@ app.include_router(strategies.router, prefix="/api")
 app.include_router(runs.router, prefix="/api")
 app.include_router(paper.router, prefix="/api")
 app.include_router(ws_market.router, prefix="/api")
+app.include_router(agent.router, prefix="/api")
 
 
 @app.get("/")

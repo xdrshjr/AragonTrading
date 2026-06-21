@@ -92,6 +92,24 @@ class EquityPoint(Base):
     run: Mapped["StrategyRun"] = relationship(back_populates="equity_points")
 
 
+class AgentMessage(Base):
+    """对话式 AI 助手的持久化消息（可重开恢复会话）(Agent Trading Copilot §5.1)。
+
+    `content_json` 存该条消息的归一化 block 序列（text / tool_use / tool_result），
+    保留 `tool_use.id ↔ tool_result.toolUseId` 关联，使 resume / history 重放无损（P1-B）。
+    仅落对话可读历史，不落 API Key、不落原始大体量 payload。
+    """
+
+    __tablename__ = "agent_messages"
+    __table_args__ = (Index("ix_agent_conv", "conversation_id", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[str] = mapped_column(String(64), index=True)
+    role: Mapped[str] = mapped_column(String(16))           # user | assistant | tool
+    content_json: Mapped[str] = mapped_column(Text, default="[]")
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)  # 秒级 UTC（全系统统一，C2）
+
+
 class CandleCache(Base):
     """OKX K 线本地缓存（降低调用、加速回测）。"""
 

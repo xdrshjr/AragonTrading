@@ -11,10 +11,11 @@
     "build:backend": "python scripts/build-backend.py",
     "build:web": "node scripts/build-web.mjs",
     "build:web:clean": "node scripts/build-web.mjs --clean",
+    "build:agent-env": "node scripts/build-agent-env.mjs",
     "dist:only": "electron-builder",
-    "dist": "run-s build:backend build:web dist:only",
+    "dist": "run-s build:backend build:web build:agent-env dist:only",
     "pack:only": "electron-builder --dir",
-    "pack": "run-s build:web pack:only",
+    "pack": "run-s build:web build:agent-env pack:only",
     "smoke": "run-s build:backend pack",
     "verify:dist": "node scripts/verify-dist.mjs",
     "release:check": "run-s smoke verify:dist",
@@ -27,7 +28,9 @@
     "check:paths": "node --check src/lib/paths.js",
     "check:pm": "node --check src/lib/process-manager.js",
     "check:buildweb": "node --check scripts/build-web.mjs",
-    "check:verifydist": "node --check scripts/verify-dist.mjs"
+    "check:verifydist": "node --check scripts/verify-dist.mjs",
+    "check:agentenv": "node --check src/lib/agent-env.js",
+    "check:buildagentenv": "node --check scripts/build-agent-env.mjs"
   },
   "dependencies": {},
   "devDependencies": {

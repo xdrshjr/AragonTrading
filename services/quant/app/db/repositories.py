@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..engine.simulator import EquityRecord, TradeRecord
 from ..strategies import STRATEGY_REGISTRY
-from .models import CandleCache, EquityPoint, Strategy, StrategyRun, Trade
+from .models import AgentMessage, CandleCache, EquityPoint, Strategy, StrategyRun, Trade
 
 
 # ============================ Strategies ============================
@@ -209,3 +209,32 @@ async def upsert_candles(session: AsyncSession, inst_id: str, bar: str, candles:
         session.add(CandleCache(inst_id=inst_id, bar=bar, ts=c.ts,
                                 o=c.o, h=c.h, l=c.l, c=c.c, vol=c.vol))
     await session.commit()
+
+
+# ============================ Agent messages ============================
+async def append_agent_message(session: AsyncSession, conversation_id: str, role: str,
+                               content_json: str, created_ts: int) -> AgentMessage:
+    """追加一条对话消息（content_json 为归一化 block 序列，P1-B）。"""
+    row = AgentMessage(conversation_id=conversation_id, role=role,
+                       content_json=content_json, created_ts=created_ts)
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def list_agent_messages(session: AsyncSession, conversation_id: str,
+                              limit: int = 200) -> list[AgentMessage]:
+    """按时间升序返回某会话的消息（取最近 limit 条后再升序，便于重放）。"""
+    stmt = (select(AgentMessage).where(AgentMessage.conversation_id == conversation_id)
+            .order_by(AgentMessage.id.desc()).limit(limit))
+    rows = list((await session.execute(stmt)).scalars().all())
+    return list(reversed(rows))
+
+
+async def clear_agent_messages(session: AsyncSession, conversation_id: str) -> int:
+    """清空某会话（"新对话"），返回删除条数。"""
+    stmt = delete(AgentMessage).where(AgentMessage.conversation_id == conversation_id)
+    result = await session.execute(stmt)
+    await session.commit()
+    return result.rowcount or 0

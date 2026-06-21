@@ -52,10 +52,35 @@ class Settings(BaseSettings):
     default_slippage_bps: float = 2.0
     default_leverage: float = 1.0
 
+    # ---- Agent（对话式 AI 助手）LLM 接入 (Agent Trading Copilot spec §3.1) ----
+    # 字段名即环境变量名（AGENT_*，大小写不敏感）；密钥仅存后端，绝不下发前端 / 不入库 / 不进日志。
+    agent_provider: str = "anthropic"                       # anthropic | openai（双标准适配）
+    agent_base_url: str = "https://api.kimi.com/coding"     # KIMI Coding 端点
+    agent_api_key: str = ""                                 # 缺省为空 → 面板优雅引导而非崩溃
+    # 默认采用任务显式指定值 kimi-k2.6；kimi-k2.5 为 docs/examples 已实测可用的回退值（R1/P1-A）。
+    agent_model: str = "kimi-k2.6"
+    agent_anthropic_version: str = "2023-06-01"
+    agent_user_agent: str = "claude-code/1.0"               # KIMI 端点校验 UA（R2）
+    agent_max_tokens: int = 2048
+    agent_temperature: float = 1.0
+    agent_top_p: float = 0.95
+    agent_max_tool_rounds: int = 12                         # 失控护栏（spec §2.3）
+    agent_max_context_messages: int = 40                    # 回喂模型的近 N 条裁剪（P2-2）
+    agent_timeout_seconds: float = 120.0
+    # Agent LLM 独立代理：留空回落 settings.proxy_url；显式 "none" 强制直连（R5）。
+    agent_proxy: str = ""
+
     @property
     def proxy_url(self) -> str | None:
         """优先 HTTPS_PROXY，其次 HTTP_PROXY / ALL_PROXY；都没有则 None。"""
         return self.https_proxy or self.http_proxy or self.all_proxy or None
+
+    @property
+    def agent_proxy_url(self) -> str | None:
+        """Agent LLM 调用专用代理（R5）：'none' → None（强制直连）；空 → 回落 proxy_url。"""
+        if self.agent_proxy.strip().lower() == "none":
+            return None
+        return self.agent_proxy or self.proxy_url
 
 
 @lru_cache

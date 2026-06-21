@@ -8,7 +8,7 @@ import ChartWorkspace from "@/components/Chart/ChartWorkspace";
 import AppMenu from "@/components/Desktop/AppMenu";
 import WindowControls from "@/components/Desktop/WindowControls";
 import AccountModeSwitch from "@/components/Header/AccountModeSwitch";
-import StrategyPanel from "@/components/Strategy/StrategyPanel";
+import RightPanel from "@/components/RightPanel/RightPanel";
 import { Button } from "@/components/ui";
 import { api } from "@/lib/api";
 import { getDesktopPlatform, getWindowControls } from "@/lib/desktop";
@@ -481,7 +481,7 @@ export default function Page() {
         />
 
         <aside className="min-h-[300px] overflow-hidden bg-[var(--surface)]/40">
-          <StrategyPanel />
+          <RightPanel />
         </aside>
       </main>
     </div>
