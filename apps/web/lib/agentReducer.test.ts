@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   appendUserMessage,
   buildHistory,
+  dropStreaming,
   reconcileHistory,
   reduceAgentEvent,
   settleStreaming,
@@ -193,5 +194,52 @@ describe("reconcileHistory (RN-1)", () => {
     // 半轮只现一次（来自 DB 重建）；本地非 streaming 气泡不保留 → 无重复、无孤儿。
     expect(out).toHaveLength(2);
     expect(out.filter((m) => m.text === "刚开口便断")).toHaveLength(1);
+  });
+});
+
+describe("dropStreaming (RN-1)", () => {
+  it("removes in-flight streaming bubbles, keeps settled ones", () => {
+    const state: ChatMessage[] = [
+      { id: "u1", role: "user", text: "q", thinking: "", toolCalls: [], streaming: false },
+      { id: "done", role: "assistant", text: "完成", thinking: "", toolCalls: [], streaming: false },
+      { id: "stream", role: "assistant", text: "半截", thinking: "", toolCalls: [], streaming: true },
+    ];
+    expect(dropStreaming(state).map((m) => m.id)).toEqual(["u1", "done"]);
+  });
+
+  it("after resumed{ok:false}, dropStreaming + reconcileHistory yields no duplicate bubble", () => {
+    // 本地：用户气泡 + 在途 uuid 流式气泡（同一轮，与 DB-int 不同 id 空间）。
+    const local: ChatMessage[] = [
+      { id: "u1", role: "user", text: "回测一下", thinking: "", toolCalls: [], streaming: false },
+      { id: "uuid-stream", role: "assistant", text: "结果如下", thinking: "", toolCalls: [], streaming: true },
+    ];
+    // run 已在宽限内终结：先丢弃在途，再以 DB history 权威重建（替代旧的 settleStreaming 标中断）。
+    const dropped = dropStreaming(local);
+    const hist: AgentMessage[] = [
+      { id: 1, role: "user", ts: 1, blocks: [{ type: "text", text: "回测一下" }] },
+      { id: 2, role: "assistant", ts: 2, blocks: [{ type: "text", text: "结果如下" }] },
+    ];
+    const out = reconcileHistory(dropped, hist);
+    // 同一轮只出现一次（DB-int 重建），无 uuid 残留重复（RN-1 根治"宽限内完成→重复气泡"）。
+    expect(out).toHaveLength(2);
+    expect(out.map((m) => m.id)).toEqual(["1", "2"]);
+    expect(out.filter((m) => m.text === "结果如下")).toHaveLength(1);
+  });
+});
+
+describe("reduceAgentEvent resilient events (RS-7/RN-2)", () => {
+  it("heartbeat passes through default — message stream untouched, no lastSeq mutation", () => {
+    const start = run([{ type: "message_start", data: { id: "a1", role: "assistant" } }]);
+    const after = reduceAgentEvent(start, { type: "heartbeat", data: {} } as AgentServerEvent);
+    expect(after).toEqual(start);
+  });
+
+  it("resumed passes through default — no message mutation", () => {
+    const start = run([{ type: "message_start", data: { id: "a1", role: "assistant" } }]);
+    const after = reduceAgentEvent(start, {
+      type: "resumed",
+      data: { ok: true },
+    } as AgentServerEvent);
+    expect(after).toEqual(start);
   });
 });

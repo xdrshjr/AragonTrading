@@ -86,9 +86,14 @@ class GetRunTradesTool(Tool):
         limit = min(int(args.get("limit", _TRADES_LIMIT)), _TRADES_LIMIT)
         async with ctx.session_factory() as session:
             trades = await repo.list_trades(session, args["runId"], limit=limit)
-        lines = [f"{t.ts} {t.side} 价 {t.price} 量 {t.qty} 盈亏 {t.pnl}" for t in trades[:limit]]
-        summary = f"run {args['runId']} 成交 {len(trades)} 笔（已截断 {limit}）：\n" + "\n".join(lines)
-        payload = {"runId": args["runId"], "count": len(trades)}
+        lines = [f"{t.ts} {t.side} 价 {t.price} 量 {t.qty} 盈亏 {t.pnl}" for t in trades]
+        shown = len(trades)
+        # 截断透明化（RS-15）：返回满页即可能还有更多（repo 已按 limit 取数，真总数未知，故 totalCount 省略）。
+        truncated = shown >= limit
+        note = (f"（已截断，仅返回最近 {shown} 笔；如需更多请缩小范围或提高 limit）" if truncated
+                else f"（共 {shown} 笔）")
+        summary = f"run {args['runId']} 成交{note}：\n" + "\n".join(lines)
+        payload = {"runId": args["runId"], "count": shown, "truncated": truncated}
         return ToolResult(True, summary, payload=payload)
 
 
@@ -113,8 +118,13 @@ class GetRunEquityTool(Tool):
         sampled = points[::step]
         first, last = points[0], points[-1]
         max_dd = min((p.drawdown for p in points), default=0.0)
+        total = len(points)
+        # 截断透明化（RS-15）：下采样后明确告知原始点数与返回点数。
+        downsampled = len(sampled) < total
+        note = (f"（已下采样：共 {total} 点，返回 {len(sampled)} 点）" if downsampled
+                else f"（共 {total} 点）")
         summary = (f"run {args['runId']} 净值：起 {first.equity} → 末 {last.equity}，"
-                   f"最大回撤 {max_dd}（{len(points)} 点，下采样 {len(sampled)}）。")
+                   f"最大回撤 {max_dd}{note}。")
         payload = {"runId": args["runId"], "first": first.equity, "last": last.equity,
-                   "maxDrawdown": max_dd}
+                   "maxDrawdown": max_dd, "truncated": downsampled, "totalCount": total}
         return ToolResult(True, summary, payload=payload)

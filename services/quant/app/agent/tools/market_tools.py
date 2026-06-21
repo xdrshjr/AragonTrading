@@ -63,9 +63,14 @@ class ListInstrumentsTool(Tool):
             f"{idx + 1}. {i.instId} 价 {i.last} 24h {_fmt_pct(i.changePct)}"
             for idx, i in enumerate(top)
         ]
-        suffix = f"（按成交额降序，共 {len(instruments)} 个，已截断前 {len(top)}）"
+        total = len(instruments)
+        truncated = total > len(top)
+        # 截断透明化（RS-15）：summary 与 payload 一致告知是否裁剪及总数，避免模型据残缺数据下错结论。
+        suffix = (f"（按成交额降序，已截断：共 {total} 个，仅返回前 {len(top)}）" if truncated
+                  else f"（按成交额降序，共 {total} 个）")
         summary = f"{inst_type} 成交额最高标的{suffix}：\n" + "\n".join(lines)
-        return ToolResult(True, summary, payload={"instType": inst_type, "items": rows})
+        return ToolResult(True, summary, payload={"instType": inst_type, "items": rows,
+                                                  "truncated": truncated, "totalCount": total})
 
 
 class GetMarketSummaryTool(Tool):

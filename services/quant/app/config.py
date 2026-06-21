@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -64,17 +65,23 @@ class Settings(BaseSettings):
     agent_max_tokens: int = 2048
     agent_temperature: float = 1.0
     agent_top_p: float = 0.95
-    agent_max_tool_rounds: int = 12                         # 失控护栏（spec §2.3）
-    agent_max_context_messages: int = 40                    # 回喂模型的近 N 条裁剪（P2-2）
+    # 失控护栏 / 上下文裁剪（RS-13 边界校验：轮数 ≥1、回喂条数 ≥2，杜绝 .env 误填 0/负值）。
+    agent_max_tool_rounds: int = Field(default=12, ge=1)     # 失控护栏（spec §2.3）
+    agent_max_context_messages: int = Field(default=40, ge=2)  # 回喂模型的近 N 条裁剪（P2-2）
     agent_timeout_seconds: float = 120.0
     # Agent LLM 独立代理：留空回落 settings.proxy_url；显式 "none" 强制直连（R5）。
     agent_proxy: str = ""
     # ---- 加固增强（iteration 2）：LLM 传输层有界重试 + 断连 drain 超时 (hardening H1/H4) ----
     # 字段名即 AGENT_* 环境变量名（大小写不敏感），可经 .env 覆盖。
-    agent_max_retries: int = 2          # pre-stream 重试上限（最多 1+max 次尝试，0 即不重试）
-    agent_retry_base_ms: int = 500      # 指数退避基数（第 i 次退避 base*2**i，封顶 max）
-    agent_retry_max_ms: int = 8000      # 单次退避封顶（亦为 Retry-After 整数秒解析上限）
-    agent_drain_timeout_seconds: float = 8.0  # 断连后等待 in-flight run 收束的兜底超时
+    agent_max_retries: int = Field(default=2, ge=0)  # pre-stream 重试上限（最多 1+max 次，0 即不重试）
+    agent_retry_base_ms: int = 500      # 指数退避基数（第 i 次退避 base*2**i，封顶 max）；RN-6：不新增校验
+    agent_retry_max_ms: int = 8000      # 单次退避封顶（亦为 Retry-After 整数秒解析上限）；RN-6：不新增校验
+    agent_drain_timeout_seconds: float = Field(default=8.0, gt=0)  # 断连后兜底 drain 超时
+    # ---- 韧性流式（iteration 3）：run/socket 解耦续流 + 心跳保活（RS-1/RS-3/RS-7/RS-13）----
+    # 字段名即 AGENT_* 环境变量名；缺省回落以下默认值，桌面端经白名单按需覆盖。
+    agent_detach_grace_seconds: float = Field(default=30.0, ge=0)   # 断连存活宽限；0 即断连立即取消（回退迭代2）
+    agent_heartbeat_seconds: float = Field(default=20.0, gt=0)      # run 期心跳间隔（须 < 中间层 idle 超时）
+    agent_event_buffer_size: int = Field(default=512, ge=64)        # 会话事件缓冲上限（重放窗口）
 
     @property
     def proxy_url(self) -> str | None:

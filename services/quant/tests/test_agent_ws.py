@@ -1,4 +1,8 @@
-"""Agent WS 端点单测（假 LLM + 假 WebSocket，不依赖网络）。"""
+"""Agent WS 端点单测（假 LLM + 假 WebSocket，不依赖网络）。
+
+韧性流式（iteration 3）：断连即 detach（run 在宽限内存活）、重连 resume 重放续流、
+run 在宽限内自然完成则 resumed{ok:false,completed} 且不重放（RN-1 防回归）。
+"""
 from __future__ import annotations
 
 import asyncio
@@ -24,6 +28,22 @@ class _ScriptedLLM:
         self.calls += 1
         for ev in turn:
             yield ev
+
+
+class _PausingLLM:
+    """先吐两段文本即暂停（等待 resume_gate），收到放行后吐尾段并结束（驱动断连/续流时序）。"""
+
+    def __init__(self):
+        self.first_done = asyncio.Event()   # 已吐完前两段（A 可断连）
+        self.resume_gate = asyncio.Event()  # 测试放行尾段
+
+    async def stream(self, *, system, messages, tools):
+        yield StreamEvent(kind="text_delta", text="A")
+        yield StreamEvent(kind="text_delta", text="B")
+        self.first_done.set()
+        await self.resume_gate.wait()
+        yield StreamEvent(kind="text_delta", text="C")
+        yield StreamEvent(kind="message_done", stop_reason="end_turn")
 
 
 class _FakeWS:
@@ -56,8 +76,66 @@ class _FakeWS:
         raise WebSocketDisconnect()
 
 
-def _manager(api_key, llm):
-    settings = Settings(agent_api_key=api_key, agent_provider="anthropic")
+class _FakeWSDisconnectAfter:
+    """A 连接：发 user_message，待 run 吐完前两段（first_done）即断连（run 仍在跑）。"""
+
+    def __init__(self, gate: asyncio.Event):
+        self.gate = gate
+        self.sent = []
+        self._sent_user = False
+
+    async def accept(self):
+        pass
+
+    async def close(self):
+        pass
+
+    async def send_text(self, text):
+        self.sent.append(json.loads(text))
+
+    async def receive_text(self):
+        if not self._sent_user:
+            self._sent_user = True
+            return json.dumps({"type": "user_message", "data": {"text": "hi", "ui": None}})
+        await self.gate.wait()
+        raise WebSocketDisconnect()
+
+
+class _FakeWSResume:
+    """B 连接：重连后发 resume{lastSeq}，可选放行 gate，等待 resumed/done 再断连。"""
+
+    def __init__(self, last_seq: int, *, release: asyncio.Event | None = None,
+                 wait_for: str = "resumed"):
+        self.last_seq = last_seq
+        self._release = release
+        self._wait_for = wait_for
+        self.sent = []
+        self._sent_resume = False
+
+    async def accept(self):
+        pass
+
+    async def close(self):
+        pass
+
+    async def send_text(self, text):
+        self.sent.append(json.loads(text))
+
+    async def receive_text(self):
+        if not self._sent_resume:
+            self._sent_resume = True
+            return json.dumps({"type": "resume", "data": {"lastSeq": self.last_seq}})
+        if self._release is not None:
+            self._release.set()  # 放行尾段，使 run 续流至 done
+        for _ in range(20000):
+            if any(e.get("type") == self._wait_for for e in self.sent):
+                break
+            await asyncio.sleep(0)
+        raise WebSocketDisconnect()
+
+
+def _manager(api_key, llm, **settings_kw):
+    settings = Settings(agent_api_key=api_key, agent_provider="anthropic", **settings_kw)
     return AgentManager(settings, llm=llm, registry=ToolRegistry(),
                         session_factory=get_sessionmaker())
 
@@ -93,6 +171,9 @@ async def test_ws_emits_ready_history_and_full_run(monkeypatch):
         assert any(e["type"] == "tool_call" and e["data"]["name"] == "show_chart" for e in ws.sent)
         assert any(e["type"] == "ui_action" for e in ws.sent)
         assert any(e["type"] == "done" for e in ws.sent)
+        # run 事件均带 seq（连接级 ready/history 不带 seq，RS-1/RN-5）。
+        assert "seq" not in ws.sent[0] and "seq" not in ws.sent[1]
+        assert all("seq" in e for e in ws.sent if e["type"] in ("message_start", "done"))
     finally:
         await dispose_engine()
 
@@ -107,6 +188,57 @@ async def test_ws_unconfigured_reports_not_configured(monkeypatch):
         assert ws.sent[0]["type"] == "ready" and ws.sent[0]["data"]["configured"] is False
         errors = [e for e in ws.sent if e["type"] == "error"]
         assert errors and errors[0]["data"]["code"] == "AGENT_NOT_CONFIGURED"
+    finally:
+        await dispose_engine()
+
+
+async def test_ws_resume_replays_after_last_seq_and_continues_to_done(monkeypatch):
+    """断连→宽限内重连（run 仍在跑）→resume→重放 seq>lastSeq + 实时续流至 done，无重复（RS-5）。"""
+    await init_db()
+    llm = _PausingLLM()
+    manager = _manager("x", llm, agent_detach_grace_seconds=5.0)
+    monkeypatch.setattr("app.api.agent.get_agent_manager", lambda: manager)
+    try:
+        ws_a = _FakeWSDisconnectAfter(llm.first_done)
+        await ws_agent(ws_a, "conv-r1")  # A 吐完 A/B 即断连，run 暂停（仍在跑）
+        last_seq = max(e["seq"] for e in ws_a.sent if "seq" in e)
+        sess = manager._sessions["conv-r1"]
+        assert sess.running is True  # 断连即脱离、run 未取消
+
+        ws_b = _FakeWSResume(last_seq, release=llm.resume_gate, wait_for="done")
+        await ws_agent(ws_b, "conv-r1")
+        resumed = [e for e in ws_b.sent if e["type"] == "resumed"]
+        assert resumed and resumed[0]["data"]["ok"] is True
+        deltas = [e for e in ws_b.sent if e["type"] == "text_delta"]
+        assert all(e["seq"] > last_seq for e in deltas)  # 仅 seq>lastSeq，无 A/B 重复
+        assert any(e["data"]["text"] == "C" for e in deltas)  # 尾段续流到达
+        assert "done" in _types(ws_b)
+    finally:
+        await dispose_engine()
+
+
+async def test_ws_resume_after_grace_completion_acks_false_without_replay(monkeypatch):
+    """RN-1 防回归（端到端）：run 已完成 → 重连 resume 得 resumed{ok:false,completed}，绝不重放。"""
+    await init_db()
+    llm = _ScriptedLLM([[
+        StreamEvent(kind="text_delta", text="完整回答"),
+        StreamEvent(kind="message_done", stop_reason="end_turn"),
+    ]])
+    manager = _manager("x", llm, agent_detach_grace_seconds=5.0)
+    monkeypatch.setattr("app.api.agent.get_agent_manager", lambda: manager)
+    try:
+        ws_a = _FakeWS([{"type": "user_message", "data": {"text": "hi", "ui": None}}])
+        await ws_agent(ws_a, "conv-r2")  # 完整跑完一轮
+        assert any(e["type"] == "done" for e in ws_a.sent)
+        sess = manager._sessions["conv-r2"]
+        assert sess.running is False
+
+        ws_b = _FakeWSResume(0, wait_for="resumed")
+        await ws_agent(ws_b, "conv-r2")
+        resumed = [e for e in ws_b.sent if e["type"] == "resumed"]
+        assert resumed and resumed[0]["data"] == {"ok": False, "reason": "completed"}
+        # 绝不重放 run 事件（DB history 为权威，前端 dropStreaming 后与 history 重建无重复，RN-1）。
+        assert not any(e["type"] == "text_delta" for e in ws_b.sent)
     finally:
         await dispose_engine()
 

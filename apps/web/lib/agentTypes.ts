@@ -40,19 +40,34 @@ export interface ShowChartAction {
   runId?: number;
 }
 
+// 续流 resumed 控制事件的失败原因（RN-1）：run 已终结 / 缓冲空洞 / 会话不存在。
+export type ResumedReason = "completed" | "cancelled" | "gap" | "none";
+
 // Server → Client 事件（{type,data} 信封）。
+// 韧性流式（iteration 3, RS-1/RS-4/RS-7）：run 生命周期事件信封追加**可选** `seq`（连接级
+// ready/history 与纯活性 heartbeat 不带 seq）；新增 resumed/heartbeat 两个追加事件，老前端忽略。
 export type AgentServerEvent =
   | { type: "ready"; data: { conversationId: string; provider: string; model: string; configured: boolean } }
   | { type: "history"; data: { messages: AgentMessage[] } }
-  | { type: "message_start"; data: { id: string; role: "assistant" } }
-  | { type: "text_delta"; data: { id: string; text: string } }
-  | { type: "thinking_delta"; data: { id: string; text: string } }
-  | { type: "tool_call"; data: { id: string; name: string; input: Record<string, unknown> } }
-  | { type: "tool_result"; data: { id: string; name: string; ok: boolean; summary: string } }
-  | { type: "ui_action"; data: ShowChartAction }
-  | { type: "message_end"; data: { id: string; usage?: AgentUsage } }
-  | { type: "done"; data: { cancelled?: boolean } }
-  | { type: "error"; data: { code: string; message: string } };
+  | { type: "message_start"; seq?: number; data: { id: string; role: "assistant" } }
+  | { type: "text_delta"; seq?: number; data: { id: string; text: string } }
+  | { type: "thinking_delta"; seq?: number; data: { id: string; text: string } }
+  | { type: "tool_call"; seq?: number; data: { id: string; name: string; input: Record<string, unknown> } }
+  | { type: "tool_result"; seq?: number; data: { id: string; name: string; ok: boolean; summary: string } }
+  | { type: "ui_action"; seq?: number; data: ShowChartAction }
+  | { type: "message_end"; seq?: number; data: { id: string; usage?: AgentUsage } }
+  | { type: "done"; seq?: number; data: { cancelled?: boolean } }
+  | { type: "error"; seq?: number; data: { code: string; message: string } }
+  // 续流握手响应（RS-2/RN-1）：ok=true 已重放并转实时续流；ok=false 按 reason 丢弃在途气泡。
+  | { type: "resumed"; data: { ok: boolean; reason?: ResumedReason; fromSeq?: number } }
+  // 纯活性心跳（RS-7/RN-2）：不带 seq、不入缓冲、不入消息流；仅用于半开检测 / 活性指示。
+  | { type: "heartbeat"; data: Record<string, never> };
+
+// Client → Server 续流请求（RS-12）：仅当本地有在途 streaming 气泡时发送。
+export interface AgentResumeRequest {
+  type: "resume";
+  data: { lastSeq: number };
+}
 
 // UI 渲染模型：一条 user/assistant 气泡 + 其下工具卡片。
 export interface ToolCall {

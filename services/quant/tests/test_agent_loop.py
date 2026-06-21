@@ -1,6 +1,8 @@
 """AgentSession agentic loop 单测（假 LLMClient 驱动，真实 DB + 真实 registry）。"""
 from __future__ import annotations
 
+import asyncio
+
 from app.agent.llm.base import StreamEvent
 from app.agent.loop import AgentSession, _RunStats
 from app.agent.tools.registry import ToolRegistry
@@ -158,7 +160,7 @@ async def test_round_limit_triggers_toolless_summary_then_done():
 
 
 async def test_finalize_on_limit_skips_llm_when_cancelled():
-    """终轮总结前命中取消 → 不再发起 LLM，亦不 emit 事件（RN-7）。"""
+    """终轮总结前命中取消 → 不再发起 LLM，亦不 emit 事件（RN-7；emit→sink 适配）。"""
     await init_db()
     llm = _ScriptedLLM([[StreamEvent(kind="text_delta", text="不应运行"),
                          StreamEvent(kind="message_done", stop_reason="end_turn")]])
@@ -169,9 +171,54 @@ async def test_finalize_on_limit_skips_llm_when_cancelled():
     async def emit(ev):
         events.append(ev)
 
+    session.set_sink(emit)
     try:
-        await session._finalize_on_limit("sys", emit, _RunStats())
+        await session._finalize_on_limit("sys", _RunStats())
         assert llm.calls == 0  # 已取消：未发起 LLM 调用
         assert events == []    # 未 emit 任何事件
+    finally:
+        await dispose_engine()
+
+
+async def test_run_events_carry_monotonic_seq():
+    """run 生命周期事件经 _emit 注入单调递增 seq（重放对账锚点，RS-1）。"""
+    await init_db()
+    llm = _ScriptedLLM([[StreamEvent(kind="text_delta", text="hi"),
+                         StreamEvent(kind="message_done", stop_reason="end_turn")]])
+    try:
+        events = await _collect_run(_session(llm, _settings()), text="hi")
+        assert all("seq" in e for e in events)  # 所有 run 事件带 seq
+        seqs = [e["seq"] for e in events]
+        assert seqs == list(range(1, len(seqs) + 1))  # 单调 1..N，无缺号、无重复
+    finally:
+        await dispose_engine()
+
+
+class _SlowLLM:
+    """每个 text_delta 间 sleep，使 run 持续足够久供心跳 / 宽限测。"""
+
+    def __init__(self, n: int = 5, delay: float = 0.02):
+        self.n = n
+        self.delay = delay
+
+    async def stream(self, *, system, messages, tools):
+        for i in range(self.n):
+            await asyncio.sleep(self.delay)
+            yield StreamEvent(kind="text_delta", text=str(i))
+        yield StreamEvent(kind="message_done", stop_reason="end_turn")
+
+
+async def test_heartbeat_streams_during_run_and_is_reaped_after():
+    """run 期心跳周期下行（不带 seq、不入缓冲）；run 结束后心跳任务被回收（RN-2/RN-7）。"""
+    await init_db()
+    session = _session(_SlowLLM(), _settings(agent_heartbeat_seconds=0.01))
+    try:
+        events = await _collect_run(session, text="hi")
+        heartbeats = [e for e in events if e["type"] == "heartbeat"]
+        assert heartbeats                               # run 期至少一跳
+        assert all("seq" not in e for e in heartbeats)  # 心跳不带 seq（RN-2）
+        assert session._heartbeat_task is None          # run 结束已回收（RN-7）
+        # 心跳不入缓冲：缓冲里只有真实 run 事件，绝无 heartbeat。
+        assert all(ev["type"] != "heartbeat" for _, ev in session._buffer)
     finally:
         await dispose_engine()

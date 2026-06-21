@@ -153,3 +153,73 @@ async def test_invalid_args_blocked_before_execute(monkeypatch):
     assert res.ok is False and "参数无效" in res.summary
     assert called["n"] == 0  # execute 未被调用
 
+
+# ============================ 截断透明化（RS-15）：正反例 ============================
+async def test_list_instruments_truncation_transparency(monkeypatch):
+    big = _FakeRest(instruments=[_inst(f"C{i}-USDT", 100 + i, 1000 - i) for i in range(30)])
+    monkeypatch.setattr("app.agent.tools.market_tools.get_rest_client", lambda: big)
+    res = await ListInstrumentsTool().execute({"instType": "SPOT"}, _ctx())
+    assert res.payload["truncated"] is True and res.payload["totalCount"] == 30
+    assert "已截断" in res.summary
+
+    small = _FakeRest(instruments=[_inst(f"D{i}-USDT", 100 + i, 1.0) for i in range(5)])
+    monkeypatch.setattr("app.agent.tools.market_tools.get_rest_client", lambda: small)
+    res2 = await ListInstrumentsTool().execute({"instType": "SPOT"}, _ctx())
+    assert res2.payload["truncated"] is False and res2.payload["totalCount"] == 5
+    assert "已截断" not in res2.summary
+
+
+async def _seed_run(n_trades: int, n_equity: int) -> int:
+    from app.db import repositories as repo
+    from app.db.session import get_sessionmaker
+    from app.engine.simulator import EquityRecord, TradeRecord
+    sm = get_sessionmaker()
+    async with sm() as session:
+        run = await repo.create_run(session, strategy_id=1, inst_id="BTC-USDT-SWAP",
+                                     bar="1H", mode="backtest", config={})
+        rid = run.id
+        for i in range(n_trades):
+            await repo.append_trade(session, rid, TradeRecord(
+                ts=1_700_000_000 + i, side="long", price=100.0 + i, qty=1.0, fee=0.1,
+                pnl=0.0, position_after=1.0, reason="t"))
+        for i in range(n_equity):
+            await repo.append_equity(session, rid, EquityRecord(
+                ts=1_700_000_000 + i, equity=10000.0 + i, drawdown=0.0))
+        return rid
+
+
+async def test_get_run_trades_truncation_transparency():
+    from app.agent.tools.run_tools import GetRunTradesTool
+    from app.db.session import dispose_engine, init_db
+    await init_db()
+    try:
+        full = await _seed_run(60, 0)  # ≥ 截断上限 50 → truncated
+        res = await GetRunTradesTool().execute({"runId": full}, _ctx())
+        assert res.payload["truncated"] is True and res.payload["count"] == 50
+        assert "已截断" in res.summary
+
+        few = await _seed_run(3, 0)
+        res2 = await GetRunTradesTool().execute({"runId": few}, _ctx())
+        assert res2.payload["truncated"] is False and res2.payload["count"] == 3
+        assert "已截断" not in res2.summary
+    finally:
+        await dispose_engine()
+
+
+async def test_get_run_equity_downsample_transparency():
+    from app.agent.tools.run_tools import GetRunEquityTool
+    from app.db.session import dispose_engine, init_db
+    await init_db()
+    try:
+        big = await _seed_run(0, 200)  # > 下采样目标 60 → downsampled
+        res = await GetRunEquityTool().execute({"runId": big}, _ctx())
+        assert res.payload["truncated"] is True and res.payload["totalCount"] == 200
+        assert "已下采样" in res.summary
+
+        small = await _seed_run(0, 10)
+        res2 = await GetRunEquityTool().execute({"runId": small}, _ctx())
+        assert res2.payload["truncated"] is False and res2.payload["totalCount"] == 10
+        assert "已下采样" not in res2.summary
+    finally:
+        await dispose_engine()
+

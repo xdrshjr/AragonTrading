@@ -32,6 +32,10 @@ const AGENT_KEYS = [
   'AGENT_RETRY_BASE_MS',
   'AGENT_RETRY_MAX_MS',
   'AGENT_DRAIN_TIMEOUT_SECONDS',
+  // 韧性流式（iteration 3）：run/socket 解耦续流 + 心跳保活（缺省即不写、回落 config.py 默认值）。
+  'AGENT_DETACH_GRACE_SECONDS',
+  'AGENT_HEARTBEAT_SECONDS',
+  'AGENT_EVENT_BUFFER_SIZE',
 ];
 
 function parseEnv(text) {

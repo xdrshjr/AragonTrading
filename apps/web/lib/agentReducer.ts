@@ -98,7 +98,12 @@ function patchToolResult(
   });
 }
 
-/** 把单个 Server 事件折叠进 ChatMessage[]；非消息类事件（ready/ui_action/done/error）原样返回。 */
+/**
+ * 把单个 Server 事件折叠进 ChatMessage[]；非消息类事件原样返回。
+ *
+ * 非消息类（ready/ui_action/done/error）与韧性流式追加事件（resumed/heartbeat，RS-7/RN-2）
+ * 均走 `default` 原样返回——`heartbeat` 不入消息流、不推进 `lastSeq`，由 AgentPanel 单独刷活性。
+ */
 export function reduceAgentEvent(state: ChatMessage[], ev: AgentServerEvent): ChatMessage[] {
   switch (ev.type) {
     case "history":
@@ -137,6 +142,18 @@ export function appendUserMessage(state: ChatMessage[], id: string, text: string
  */
 export function settleStreaming(state: ChatMessage[]): ChatMessage[] {
   return state.map((m) => (m.streaming ? { ...m, streaming: false, interrupted: true } : m));
+}
+
+/**
+ * 丢弃在途 streaming 气泡（resumed{ok:false} 用，RN-1）。
+ *
+ * 区别于 `settleStreaming`（标"已中断"并保留）：当 run 已在宽限内终结（completed/cancelled）
+ * 或缓冲空洞（gap），DB `history`（本次重连已 `reconcileHistory` 重建）即权威且完整——此时
+ * 必须**整体移除**在途 uuid 气泡，否则会与 history 重建的同一轮 DB-int 气泡**重复**（RN-1 根因）。
+ * 取消时部分文本亦已落库，故丢弃无损。
+ */
+export function dropStreaming(state: ChatMessage[]): ChatMessage[] {
+  return state.filter((m) => !m.streaming);
 }
 
 /**

@@ -1,26 +1,24 @@
 """路由：Agent WS /ws/agent/{convId} + REST /agent/config、/agent/conversations/{id} (spec §4)。
 
-WS 事件沿用 {type,data} 信封（同 _send_event）。run 在后台任务跑，使接收循环仍能处理 cancel；
-断连即取消（P1-D）走与 cancel 同一中断路径，避免孤儿 run 继续烧配额。
+WS 事件沿用 {type,data} 信封（同 _send_event）。韧性流式（iteration 3, RS-4）：连接即 `attach`、
+断连即 `detach`（脱离而非取消）、收 `resume` 即重放续流；BUSY 改会话级 `sess.running`（跨重连可见）。
+run 归属会话、跨连接存活；宽限耗尽才由 manager 取消并 drain。
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import logging
 
 from fastapi import APIRouter, Depends, Query, Response, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agent.conversation import row_to_client_dict
-from ..agent.manager import get_agent_manager
-from ..config import get_settings
+from ..agent.manager import AgentManager, get_agent_manager
 from ..db import repositories as repo
 from ..db.session import get_session
 from ..schemas import AgentConfigOut
 
 router = APIRouter(tags=["agent"])
-logger = logging.getLogger("aragon.agent.api")
 
 
 @router.get("/agent/config", response_model=AgentConfigOut)
@@ -53,51 +51,54 @@ async def ws_agent(websocket: WebSocket, conversation_id: str) -> None:
     async def emit(event: dict) -> None:
         await _send_raw(websocket, event)
 
-    run_task: asyncio.Task | None = None
+    # 连接即 attach（注册 sink；run 归属会话，RS-4）：返回会话供 BUSY 快路与续流判定。
+    sess = await manager.attach(conversation_id, emit)
     try:
         while True:
             raw = await websocket.receive_text()
-            run_task = await _dispatch(raw, conversation_id, manager, emit, run_task, websocket)
+            await _dispatch(raw, conversation_id, manager, sess, emit, websocket)
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass
     finally:
-        # 断连即取消（P1-D）：停止 in-flight run（落盘已完成轮次），回收孤儿配额。
-        await manager.cancel(conversation_id)
-        await _drain(run_task, get_settings().agent_drain_timeout_seconds)
+        # 断连即脱离（非取消，RS-4）：run 进入宽限窗口，宽限耗尽才由 manager 取消并 drain。
+        await manager.detach(conversation_id, emit)
 
 
-async def _dispatch(raw: str, conversation_id: str, manager, emit, run_task, websocket):
-    """处理一条 client 消息，返回（可能新建的）run_task。"""
+async def _dispatch(raw: str, conversation_id: str, manager, sess, emit, websocket) -> None:
+    """处理一条 client 消息（user_message / cancel / resume）。"""
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
-        return run_task
+        return
     mtype = msg.get("type")
     if mtype == "cancel":
         await manager.cancel(conversation_id)
-        return run_task
-    if mtype == "user_message":
-        if run_task is not None and not run_task.done():
-            await _send(websocket, "error", {"code": "BUSY", "message": "上一条仍在处理，请稍候。"})
-            return run_task
+    elif mtype == "resume":
         data = msg.get("data") or {}
-        return asyncio.create_task(
-            manager.handle(conversation_id, data.get("text", ""), data.get("ui"), emit))
-    return run_task
+        await manager.resume(conversation_id, _as_int(data.get("lastSeq"), 0), emit)
+    elif mtype == "user_message":
+        await _handle_user_message(msg, conversation_id, manager, sess, websocket)
+
+
+async def _handle_user_message(msg, conversation_id: str, manager, sess, websocket) -> None:
+    """user_message：会话级 BUSY 快路（RN-4：权威是 run() 内层守卫，此处仅 best-effort）。"""
+    if sess.running:
+        await _send(websocket, "error", {"code": "BUSY", "message": "上一条仍在处理，请稍候。"})
+        return
+    data = msg.get("data") or {}
+    await manager.handle(conversation_id, data.get("text", ""), data.get("ui"))
+
+
+def _as_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 async def _drain(run_task: asyncio.Task | None, timeout: float) -> None:
-    """有界等待 in-flight run 收束（H4）：超时即 cancel 孤儿并 warning，清理路径永不挂死。"""
-    if run_task is None or run_task.done():
-        return
-    try:
-        await asyncio.wait_for(run_task, timeout=timeout)
-    except asyncio.TimeoutError:
-        run_task.cancel()
-        logger.warning("agent run task drained by timeout (%.1fs); possible orphan cancelled",
-                       timeout)
-    except Exception:  # noqa: BLE001 —— 取消路径的兜底，吞掉后台任务残余异常
-        logger.debug("agent run task ended with error during drain", exc_info=True)
+    """有界等待 in-flight run 收束（H4，宽限取消路径兜底）：委托 AgentManager.drain（单一实现）。"""
+    await AgentManager.drain(run_task, timeout)
 
 
 async def _send(websocket: WebSocket, event_type: str, data: dict) -> None:
