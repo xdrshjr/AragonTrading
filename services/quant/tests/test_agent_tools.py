@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import pytest
 
-from app.agent.tools.base import ToolContext, UiContext
+from app.agent.tools.base import ToolContext, ToolResult, UiContext
 from app.agent.tools.market_tools import GetCandlesTool, GetMarketSummaryTool, ListInstrumentsTool
 from app.agent.tools.registry import ToolRegistry
-from app.agent.tools.strategy_tools import ListStrategiesTool
+from app.agent.tools.run_tools import GetRunMetricsTool
+from app.agent.tools.strategy_tools import CompareStrategiesTool, ListStrategiesTool, RunBacktestTool
 from app.agent.tools.ui_tools import ShowChartTool
 from app.okx.rest_client import OKXError
 from app.okx.types import Candle, Instrument
@@ -97,3 +98,58 @@ async def test_registry_unknown_tool():
     registry = ToolRegistry()
     res = await registry.execute("does_not_exist", {}, _ctx())
     assert res.ok is False
+
+
+# ============================ 入参边界校验（H2）：正反例 ============================
+def test_validate_run_backtest_reject_and_accept():
+    tool = RunBacktestTool()
+    assert tool.validate({}) is not None                                       # 缺必填
+    assert tool.validate({"strategyId": 1, "instId": "BTC-USDT-SWAP", "bar": "2H",
+                          "startTs": 1, "endTs": 2}) is not None               # bar 越界
+    assert tool.validate({"strategyId": 1, "instId": "BTC-USDT-SWAP", "bar": "1H",
+                          "startTs": 5, "endTs": 5}) is not None               # ts 逆序/相等
+    assert tool.validate({"strategyId": 1, "instId": "BTC-USDT-SWAP", "bar": "1H",
+                          "startTs": 1, "endTs": 2, "limit": 99999}) is not None  # limit 越界
+    assert tool.validate({"strategyId": 1, "instId": "BTC-USDT-SWAP", "bar": "1H",
+                          "startTs": 1, "endTs": 2}) is None                   # 合法
+
+
+def test_validate_compare_strategy_ids():
+    base = {"instId": "ETH-USDT", "bar": "1H", "startTs": 1, "endTs": 2}
+    assert CompareStrategiesTool().validate({**base, "strategyIds": []}) is not None
+    assert CompareStrategiesTool().validate({**base, "strategyIds": [1, -2]}) is not None
+    assert CompareStrategiesTool().validate({**base, "strategyIds": [1, 2]}) is None
+
+
+def test_validate_get_run_metrics_runid():
+    assert GetRunMetricsTool().validate({"runId": 0}) is not None
+    assert GetRunMetricsTool().validate({"runId": -1}) is not None
+    assert GetRunMetricsTool().validate({"runId": 3}) is None
+
+
+def test_validate_list_instruments_enum():
+    assert ListInstrumentsTool().validate({"instType": "BOGUS"}) is not None
+    assert ListInstrumentsTool().validate({"instType": "SPOT"}) is None
+    assert ListInstrumentsTool().validate({}) is None  # 缺省由 execute 回退默认
+
+
+def test_validate_show_chart_all_optional():
+    assert ShowChartTool().validate({}) is None
+    assert ShowChartTool().validate({"bar": "9x"}) is not None
+    assert ShowChartTool().validate({"startTs": 9, "endTs": 1}) is not None
+    assert ShowChartTool().validate({"instId": "X-Y", "runId": 7}) is None
+
+
+async def test_invalid_args_blocked_before_execute(monkeypatch):
+    """非法入参经 validate 拦截，execute 不被调用（spy），summary 指明原因（H2 闭环）。"""
+    called = {"n": 0}
+
+    async def _spy_execute(self, args, ctx):
+        called["n"] += 1
+        return ToolResult(True, "should not run")
+
+    monkeypatch.setattr(RunBacktestTool, "execute", _spy_execute)
+    res = await ToolRegistry().execute("run_backtest", {"strategyId": -1}, _ctx())
+    assert res.ok is False and "参数无效" in res.summary
+    assert called["n"] == 0  # execute 未被调用
+

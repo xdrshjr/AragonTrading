@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 
 from ..config import Settings, get_settings
@@ -30,6 +31,8 @@ class AgentManager:
         self._llm = llm
         self._session_factory = session_factory
         self._sessions: dict[str, AgentSession] = {}
+        # 会话注册表并发锁（H3）：保证每 convId 唯一会话，杜绝多连接脑裂。
+        self._lock = asyncio.Lock()
 
     def _factory(self) -> Callable:
         return self._session_factory or get_sessionmaker()
@@ -46,13 +49,15 @@ class AgentManager:
         return {"provider": self._settings.agent_provider, "model": self._settings.agent_model,
                 "configured": self.configured()}
 
-    def get_or_create(self, conversation_id: str) -> AgentSession:
-        sess = self._sessions.get(conversation_id)
-        if sess is None:
-            sess = AgentSession(conversation_id, self._client(), self._registry,
-                                self._settings, self._factory())
-            self._sessions[conversation_id] = sess
-        return sess
+    async def get_or_create(self, conversation_id: str) -> AgentSession:
+        """取或建会话：临界区加锁，确保同 convId 跨连接复用同一 AgentSession（H3，无脑裂）。"""
+        async with self._lock:
+            sess = self._sessions.get(conversation_id)
+            if sess is None:
+                sess = AgentSession(conversation_id, self._client(), self._registry,
+                                    self._settings, self._factory())
+                self._sessions[conversation_id] = sess
+            return sess
 
     async def history(self, conversation_id: str) -> list[dict]:
         sm = self._factory()
@@ -67,12 +72,13 @@ class AgentManager:
                 "code": "AGENT_NOT_CONFIGURED",
                 "message": "未配置模型密钥（AGENT_API_KEY）。请在 .env / userData/agent.env 填写后重试。"}})
             return
-        sess = self.get_or_create(conversation_id)
+        sess = await self.get_or_create(conversation_id)
         if not sess.loaded:
             await sess.load_from_db()
         await sess.run(user_text, ui, emit)
 
     async def cancel(self, conversation_id: str) -> None:
+        # 仅 .get() 读取，读安全、无需加锁（R4）。
         sess = self._sessions.get(conversation_id)
         if sess is not None:
             sess.cancel()
@@ -81,7 +87,9 @@ class AgentManager:
         sm = self._factory()
         async with sm() as session:
             removed = await repo.clear_agent_messages(session, conversation_id)
-        self._sessions.pop(conversation_id, None)
+        # clear 实为字典写入（pop），随 H3 一并纳入同一锁（RN-4）。
+        async with self._lock:
+            self._sessions.pop(conversation_id, None)
         return removed
 
     async def shutdown(self) -> None:

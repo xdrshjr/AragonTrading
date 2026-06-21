@@ -6,7 +6,16 @@
 from __future__ import annotations
 
 from ...okx.rest_client import get_rest_client
-from .base import Tool, ToolContext, ToolResult
+from .base import (
+    Tool,
+    ToolContext,
+    ToolResult,
+    check_enum,
+    check_limit,
+    check_optional_range,
+    first_error,
+    require_str,
+)
 
 _INST_TYPE_ENUM = ["SPOT", "SWAP", "FUTURES"]
 _BAR_ENUM = ["1m", "5m", "15m", "30m", "1H", "4H", "1D"]
@@ -38,6 +47,10 @@ class ListInstrumentsTool(Tool):
         "required": ["instType"],
     }
 
+    def validate(self, args: dict) -> str | None:
+        # 缺省由 execute 回退默认；给值则须为合法类型。
+        return check_enum(args, "instType", _INST_TYPE_ENUM)
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         inst_type = args.get("instType", "SWAP")
         instruments = await get_rest_client().get_instruments(inst_type)
@@ -65,6 +78,9 @@ class GetMarketSummaryTool(Tool):
         },
         "required": ["instId"],
     }
+
+    def validate(self, args: dict) -> str | None:
+        return require_str(args, "instId")
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         inst_id = args["instId"]
@@ -94,6 +110,14 @@ class GetCandlesTool(Tool):
         },
         "required": ["instId", "bar"],
     }
+
+    def validate(self, args: dict) -> str | None:
+        return first_error(
+            require_str(args, "instId"),
+            check_enum(args, "bar", _BAR_ENUM, required=True),
+            check_optional_range(args),
+            check_limit(args, 1, 1000),
+        )
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         inst_id = args["instId"]

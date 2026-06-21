@@ -69,6 +69,12 @@ class Settings(BaseSettings):
     agent_timeout_seconds: float = 120.0
     # Agent LLM 独立代理：留空回落 settings.proxy_url；显式 "none" 强制直连（R5）。
     agent_proxy: str = ""
+    # ---- 加固增强（iteration 2）：LLM 传输层有界重试 + 断连 drain 超时 (hardening H1/H4) ----
+    # 字段名即 AGENT_* 环境变量名（大小写不敏感），可经 .env 覆盖。
+    agent_max_retries: int = 2          # pre-stream 重试上限（最多 1+max 次尝试，0 即不重试）
+    agent_retry_base_ms: int = 500      # 指数退避基数（第 i 次退避 base*2**i，封顶 max）
+    agent_retry_max_ms: int = 8000      # 单次退避封顶（亦为 Retry-After 整数秒解析上限）
+    agent_drain_timeout_seconds: float = 8.0  # 断连后等待 in-flight run 收束的兜底超时
 
     @property
     def proxy_url(self) -> str | None:

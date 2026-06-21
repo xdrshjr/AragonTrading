@@ -4,7 +4,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui";
 import { applyShowChart } from "@/lib/agentActions";
 import { agentWS } from "@/lib/agentWs";
-import { appendUserMessage, reduceAgentEvent } from "@/lib/agentReducer";
+import {
+  appendUserMessage,
+  reconcileHistory,
+  reduceAgentEvent,
+  settleStreaming,
+} from "@/lib/agentReducer";
 import type {
   AgentServerEvent,
   AgentUiContext,
@@ -52,6 +57,10 @@ export default function AgentPanel() {
   const [error, setError] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const wsRef = useRef<ReconnectingWS | null>(null);
+  // 连接态变迁探针（H8a）：检测 true→false 瞬断以复位 running / 收束在途气泡。
+  const connectedRef = useRef(false);
+  // 最近一条 user 文本（H12 失败重试用）。
+  const lastUserTextRef = useRef<string>("");
 
   // 首次挂载时若无会话 id，生成一个（SSR 安全：水合后于客户端执行）。
   useEffect(() => {
@@ -65,7 +74,8 @@ export default function AgentPanel() {
         setConfig({ configured: ev.data.configured, provider: ev.data.provider, model: ev.data.model });
         break;
       case "history":
-        setMessages(reduceAgentEvent([], ev));
+        // 重连以 DB 历史为权威重建：不闪烁 / 不重复 / 不孤儿（H8b / RN-1）。
+        setMessages((prev) => reconcileHistory(prev, ev.data.messages));
         break;
       case "message_start":
         setRunning(true);
@@ -92,26 +102,47 @@ export default function AgentPanel() {
     }
   }, []);
 
+  // 连接态变迁回调（H8a/RN-3）：瞬断（true→false）复位 running + 收束在途气泡；重连清提示。
+  const onConnState = useCallback((open: boolean) => {
+    const was = connectedRef.current;
+    connectedRef.current = open;
+    setConnected(open);
+    if (was && !open) {
+      setRunning(false);
+      setError("连接中断，正在重连…");
+      setMessages((prev) => settleStreaming(prev));
+    } else if (!was && open) {
+      setError(null);
+    }
+  }, []);
+
   // 连接（会话 id 变更即重连到新会话 → 收到空 history → 清空消息流）。
   useEffect(() => {
     if (!conversationId) return;
     setMessages([]);
     setRunning(false);
     setError(null);
-    const ws = agentWS(conversationId, handleEvent, setConnected);
+    connectedRef.current = false;
+    const ws = agentWS(conversationId, handleEvent, onConnState);
     wsRef.current = ws;
     ws.connect();
     return () => {
       ws.close();
       wsRef.current = null;
     };
-  }, [conversationId, handleEvent]);
+  }, [conversationId, handleEvent, onConnState]);
 
   const send = useCallback(
     (text: string) => {
       const trimmed = text.trim();
       const ws = wsRef.current;
       if (!ws || !trimmed || running) return;
+      // 发送前连接守卫（H8c）：未连接则提示并拦截，避免乐观追加"幽灵消息"。
+      if (!connected) {
+        setError("未连接，无法发送，请稍候重连。");
+        return;
+      }
+      lastUserTextRef.current = trimmed;
       setMessages((prev) => appendUserMessage(prev, newUserId(), trimmed));
       const s = useAppStore.getState();
       const ui: AgentUiContext = {
@@ -127,8 +158,13 @@ export default function AgentPanel() {
       setError(null);
       setInput("");
     },
-    [running],
+    [running, connected],
   );
+
+  // 失败重试（H12）：重发上一条 user 文本（受 send 内连接 / running 守卫保护）。
+  const retry = useCallback(() => {
+    if (lastUserTextRef.current) send(lastUserTextRef.current);
+  }, [send]);
 
   const stop = useCallback(() => {
     wsRef.current?.send({ type: "cancel" });
@@ -166,8 +202,17 @@ export default function AgentPanel() {
       </div>
 
       {error && (
-        <div className="border-t border-[var(--border)] bg-[color-mix(in_srgb,var(--short)_10%,transparent)] px-3 py-1.5 text-[11px] text-[var(--short)]">
-          {error}
+        <div className="flex items-center justify-between gap-2 border-t border-[var(--border)] bg-[color-mix(in_srgb,var(--short)_10%,transparent)] px-3 py-1.5 text-[11px] text-[var(--short)]">
+          <span className="min-w-0 flex-1 truncate">{error}</span>
+          {lastUserTextRef.current && !running && (
+            <button
+              type="button"
+              onClick={retry}
+              className="shrink-0 rounded-[6px] border border-[var(--border)] px-2 py-0.5 text-[var(--text)] transition-colors duration-150 ease-smooth hover:bg-[var(--surface-2)]"
+            >
+              重试
+            </button>
+          )}
         </div>
       )}
 

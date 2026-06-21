@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from .base import Tool, ToolContext, ToolResult
+from .base import Tool, ToolContext, ToolResult, check_enum, check_optional_range, first_error
 
 _BAR_ENUM = ["1m", "5m", "15m", "30m", "1H", "4H", "1D"]
 
@@ -25,6 +25,13 @@ class ShowChartTool(Tool):
             "runId": {"type": "integer", "description": "叠加该次 run 的买卖点（可选）"},
         },
     }
+
+    def validate(self, args: dict) -> str | None:
+        # 全字段可选：给则校验 bar 枚举与 ts 顺序，未指定沿用当前工作台上下文。
+        return first_error(
+            check_enum(args, "bar", _BAR_ENUM),
+            check_optional_range(args),
+        )
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         directive: dict = {"action": "show_chart"}

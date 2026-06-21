@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 
 from ...db import repositories as repo
-from .base import Tool, ToolContext, ToolResult
+from .base import Tool, ToolContext, ToolResult, require_pos_int
 
 _TRADES_LIMIT = 50
 _EQUITY_POINTS = 60
@@ -54,6 +54,9 @@ class GetRunMetricsTool(Tool):
         "required": ["runId"],
     }
 
+    def validate(self, args: dict) -> str | None:
+        return require_pos_int(args, "runId")
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         async with ctx.session_factory() as session:
             run = await repo.get_run(session, args["runId"])
@@ -76,6 +79,9 @@ class GetRunTradesTool(Tool):
         "required": ["runId"],
     }
 
+    def validate(self, args: dict) -> str | None:
+        return require_pos_int(args, "runId")
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         limit = min(int(args.get("limit", _TRADES_LIMIT)), _TRADES_LIMIT)
         async with ctx.session_factory() as session:
@@ -94,6 +100,9 @@ class GetRunEquityTool(Tool):
         "properties": {"runId": {"type": "integer"}},
         "required": ["runId"],
     }
+
+    def validate(self, args: dict) -> str | None:
+        return require_pos_int(args, "runId")
 
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         async with ctx.session_factory() as session:

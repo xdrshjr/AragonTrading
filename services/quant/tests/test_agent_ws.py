@@ -9,7 +9,7 @@ from starlette.websockets import WebSocketDisconnect
 from app.agent.llm.base import StreamEvent
 from app.agent.manager import AgentManager
 from app.agent.tools.registry import ToolRegistry
-from app.api.agent import ws_agent
+from app.api.agent import _drain, ws_agent
 from app.config import Settings
 from app.db.session import dispose_engine, get_sessionmaker, init_db
 
@@ -109,3 +109,25 @@ async def test_ws_unconfigured_reports_not_configured(monkeypatch):
         assert errors and errors[0]["data"]["code"] == "AGENT_NOT_CONFIGURED"
     finally:
         await dispose_engine()
+
+
+async def test_drain_cancels_orphan_run_on_timeout():
+    """run 在客户端断连后仍未收束时，_drain 在超时内返回并 cancel 孤儿，绝不挂死（H4）。"""
+
+    async def _hang():
+        await asyncio.sleep(30)
+
+    task = asyncio.create_task(_hang())
+    await asyncio.sleep(0)  # 让任务起跑
+    await _drain(task, timeout=0.05)
+    assert task.cancelled()  # 孤儿被显式 cancel
+
+
+async def test_drain_noop_when_task_already_done():
+    async def _quick():
+        return 1
+
+    task = asyncio.create_task(_quick())
+    await task
+    await _drain(task, timeout=1.0)  # 已完成：直接返回，不抛
+    assert task.done() and not task.cancelled()

@@ -27,6 +27,11 @@ const AGENT_KEYS = [
   'AGENT_TEMPERATURE',
   'AGENT_TOP_P',
   'AGENT_PROXY',
+  // 加固增强（iteration 2）：LLM 传输层重试 + 断连 drain 超时（缺省回落 config.py 默认值）。
+  'AGENT_MAX_RETRIES',
+  'AGENT_RETRY_BASE_MS',
+  'AGENT_RETRY_MAX_MS',
+  'AGENT_DRAIN_TIMEOUT_SECONDS',
 ];
 
 function parseEnv(text) {

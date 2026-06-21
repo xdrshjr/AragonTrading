@@ -114,7 +114,11 @@ export function reduceAgentEvent(state: ChatMessage[], ev: AgentServerEvent): Ch
     case "tool_result":
       return patchToolResult(state, ev.data);
     case "message_end":
-      return patchById(state, ev.data.id, (m) => ({ ...m, streaming: false }));
+      return patchById(state, ev.data.id, (m) => ({
+        ...m,
+        streaming: false,
+        usage: ev.data.usage ?? m.usage,
+      }));
     default:
       return state;
   }
@@ -123,4 +127,31 @@ export function reduceAgentEvent(state: ChatMessage[], ev: AgentServerEvent): Ch
 /** 追加一条用户气泡（发送时本地乐观更新；服务端不回显 user_message）。 */
 export function appendUserMessage(state: ChatMessage[], id: string, text: string): ChatMessage[] {
   return [...state, { id, role: "user", text, thinking: "", toolCalls: [], streaming: false }];
+}
+
+/**
+ * 断连即收束：把仍 `streaming` 的在途气泡置为已结束并标记中断（H8a / RN-3）。
+ *
+ * 任何断连都触发服务端 cancel（永不再有 done 到达原 msg_id），故必须就地收束，
+ * 否则气泡永远停在"流式中"，且会成为重连重复（reconcileHistory）的根源。
+ */
+export function settleStreaming(state: ChatMessage[]): ChatMessage[] {
+  return state.map((m) => (m.streaming ? { ...m, streaming: false, interrupted: true } : m));
+}
+
+/**
+ * 重连以 DB 历史为权威重建（替代 v1 的 merge-by-id，RN-1）。
+ *
+ * 1. 已完成轮以 `history`（DB-int id）整体重建——天然无重复、无 id 空间错配。
+ * 2. 仅当 `prev` 中存在恰一条仍 `streaming` 的在途气泡时追加保留它（history 罕见地在
+ *    流式中途到达的兜底）；否则不保留。
+ * 3. **绝不跨 `uuid`(客户端流式 id) / `DB-int`(history id) 边界按 id 去重**——v1 缺陷根因。
+ */
+export function reconcileHistory(prev: ChatMessage[], history: AgentMessage[]): ChatMessage[] {
+  const rebuilt = buildHistory(history);
+  const inFlight = prev.filter((m) => m.streaming);
+  if (inFlight.length === 1) {
+    return [...rebuilt, inFlight[0]];
+  }
+  return rebuilt;
 }

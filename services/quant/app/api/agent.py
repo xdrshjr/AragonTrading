@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..agent.conversation import row_to_client_dict
 from ..agent.manager import get_agent_manager
+from ..config import get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
 from ..schemas import AgentConfigOut
@@ -62,7 +63,7 @@ async def ws_agent(websocket: WebSocket, conversation_id: str) -> None:
     finally:
         # 断连即取消（P1-D）：停止 in-flight run（落盘已完成轮次），回收孤儿配额。
         await manager.cancel(conversation_id)
-        await _drain(run_task)
+        await _drain(run_task, get_settings().agent_drain_timeout_seconds)
 
 
 async def _dispatch(raw: str, conversation_id: str, manager, emit, run_task, websocket):
@@ -85,12 +86,18 @@ async def _dispatch(raw: str, conversation_id: str, manager, emit, run_task, web
     return run_task
 
 
-async def _drain(run_task: asyncio.Task | None) -> None:
-    if run_task is not None and not run_task.done():
-        try:
-            await run_task
-        except Exception:  # noqa: BLE001 —— 取消路径的兜底，吞掉后台任务残余异常
-            logger.debug("agent run task ended with error during drain", exc_info=True)
+async def _drain(run_task: asyncio.Task | None, timeout: float) -> None:
+    """有界等待 in-flight run 收束（H4）：超时即 cancel 孤儿并 warning，清理路径永不挂死。"""
+    if run_task is None or run_task.done():
+        return
+    try:
+        await asyncio.wait_for(run_task, timeout=timeout)
+    except asyncio.TimeoutError:
+        run_task.cancel()
+        logger.warning("agent run task drained by timeout (%.1fs); possible orphan cancelled",
+                       timeout)
+    except Exception:  # noqa: BLE001 —— 取消路径的兜底，吞掉后台任务残余异常
+        logger.debug("agent run task ended with error during drain", exc_info=True)
 
 
 async def _send(websocket: WebSocket, event_type: str, data: dict) -> None:

@@ -24,6 +24,12 @@ export interface AgentMessage {
   blocks: AgentBlock[];
 }
 
+// 归一化 token 用量（后端 normalize_usage 输出的 camelCase 形状，RN-2；字段可缺失）。
+export interface AgentUsage {
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+}
+
 // show_chart ui-action directive（后端 payload 原样下发）。
 export interface ShowChartAction {
   action: "show_chart";
@@ -44,7 +50,7 @@ export type AgentServerEvent =
   | { type: "tool_call"; data: { id: string; name: string; input: Record<string, unknown> } }
   | { type: "tool_result"; data: { id: string; name: string; ok: boolean; summary: string } }
   | { type: "ui_action"; data: ShowChartAction }
-  | { type: "message_end"; data: { id: string; usage?: Record<string, unknown> } }
+  | { type: "message_end"; data: { id: string; usage?: AgentUsage } }
   | { type: "done"; data: { cancelled?: boolean } }
   | { type: "error"; data: { code: string; message: string } };
 
@@ -65,6 +71,8 @@ export interface ChatMessage {
   thinking: string;
   toolCalls: ToolCall[];
   streaming: boolean;
+  usage?: AgentUsage; // 本轮 token 用量（H5/H12，可选展示）
+  interrupted?: boolean; // 断连收束的在途气泡（H8a/RN-3）
 }
 
 // store 中 ui-action 需要的 setter 子集（lib/agentActions 据此映射）。

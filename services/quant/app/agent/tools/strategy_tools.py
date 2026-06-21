@@ -7,7 +7,18 @@ from __future__ import annotations
 from ...db import repositories as repo
 from ...okx.rest_client import get_rest_client
 from .. import services
-from .base import Tool, ToolContext, ToolResult
+from .base import (
+    Tool,
+    ToolContext,
+    ToolResult,
+    check_enum,
+    check_limit,
+    check_pos_int_list,
+    check_required_range,
+    first_error,
+    require_pos_int,
+    require_str,
+)
 
 _BAR_ENUM = ["1m", "5m", "15m", "30m", "1H", "4H", "1D"]
 
@@ -53,6 +64,15 @@ class RunBacktestTool(Tool):
         "required": ["strategyId", "instId", "bar", "startTs", "endTs"],
     }
 
+    def validate(self, args: dict) -> str | None:
+        return first_error(
+            require_pos_int(args, "strategyId"),
+            require_str(args, "instId"),
+            check_enum(args, "bar", _BAR_ENUM, required=True),
+            check_required_range(args),
+            check_limit(args, 1, 1000),
+        )
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         limit = min(int(args.get("limit", 500)), 1000)
         async with ctx.session_factory() as session:
@@ -84,6 +104,15 @@ class CompareStrategiesTool(Tool):
         "required": ["strategyIds", "instId", "bar", "startTs", "endTs"],
     }
 
+    def validate(self, args: dict) -> str | None:
+        return first_error(
+            check_pos_int_list(args, "strategyIds"),
+            require_str(args, "instId"),
+            check_enum(args, "bar", _BAR_ENUM, required=True),
+            check_required_range(args),
+            check_limit(args, 1, 1000),
+        )
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         limit = min(int(args.get("limit", 500)), 1000)
         async with ctx.session_factory() as session:
@@ -91,6 +120,7 @@ class CompareStrategiesTool(Tool):
                 session, get_rest_client(),
                 strategy_ids=args["strategyIds"], inst_id=args["instId"], bar=args["bar"],
                 limit=limit, start_ts=args["startTs"], end_ts=args["endTs"],
+                cancel_check=ctx.cancel_check,
             )
         lines = [
             f"#{it['strategyId']} {it['name']} (run {it['runId']})：{_metrics_line(it['metrics'])}"

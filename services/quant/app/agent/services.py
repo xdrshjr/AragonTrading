@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -163,8 +164,14 @@ async def _prepare_compare(session: AsyncSession, ordered_ids: list[int]) -> lis
 async def run_compare(session: AsyncSession, rest, *, strategy_ids: list[int], inst_id: str,
                       bar: str, limit: int, start_ts: int, end_ts: int,
                       initial_capital: float | None = None, fees: float | None = None,
-                      slippage: float | None = None, leverage: float | None = None) -> dict:
-    """多策略横向对比：候选 candles 与 HTF 并集各取一次，逐策略回测并各自落库（F3 / P1-2）。"""
+                      slippage: float | None = None, leverage: float | None = None,
+                      cancel_check: Callable[[], bool] | None = None) -> dict:
+    """多策略横向对比：候选 candles 与 HTF 并集各取一次，逐策略回测并各自落库（F3 / P1-2）。
+
+    Args:
+        cancel_check: 可选协作式取消探针（H11）；逐策略前命中即提前返回已完成项，余者跳过。
+            UI router 不传（None → 不检查 → 行为与原路由逐字节一致，R8）。
+    """
     costs = _resolve_costs(get_settings(), initial_capital, fees, slippage, leverage)
     candles = await load_range_candles(rest, inst_id=inst_id, bar=bar, limit=limit,
                                        start_ts=start_ts, end_ts=end_ts)
@@ -185,6 +192,8 @@ async def run_compare(session: AsyncSession, rest, *, strategy_ids: list[int], i
 
     items: list[dict] = []
     for sid, row, strategy in prepared:
+        if cancel_check is not None and cancel_check():
+            break  # 协作式取消（H11）：返回已完成项，余下策略跳过。
         htf_frames = {tf: union_frames[tf] for tf in strategy.timeframes() if tf in union_frames}
         run, result = await _execute_and_persist(
             session, strategy_id=sid, strategy=strategy, inst_id=inst_id, bar=bar, limit=limit,

@@ -10,6 +10,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 
 from ..config import Settings
 from ..db import repositories as repo
@@ -22,6 +23,7 @@ from .llm.base import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from .llm.retry import normalize_usage
 from .prompts import build_system_prompt
 from .tools.base import ToolContext, UiContext
 from .tools.registry import ToolRegistry
@@ -53,6 +55,28 @@ class _ToolAcc:
         except json.JSONDecodeError:
             args = {}
         return ToolUseBlock(id=self.id, name=self.name, input=args)
+
+
+@dataclass
+class _StreamAcc:
+    """单轮流式累积：文本分片 + 工具累积器 + 末轮 usage / stop_reason。"""
+
+    text_parts: list[str] = field(default_factory=list)
+    accs: dict[str, _ToolAcc] = field(default_factory=dict)
+    order: list[str] = field(default_factory=list)
+    usage: dict | None = None
+    stop_reason: str | None = None
+
+
+@dataclass
+class _RunStats:
+    """单次 run 的可观测统计（结构化日志用，仅元数据，绝不含密钥 / 用户原文，C7）。"""
+
+    rounds: int = 0
+    tools: list[dict] = field(default_factory=list)
+    stop_reason: str | None = None
+    in_tokens: int | None = None
+    out_tokens: int | None = None
 
 
 class AgentSession:
@@ -94,7 +118,8 @@ class AgentSession:
             return
         self._running = True
         self._cancel = False
-        ctx = ToolContext(session_factory=self._session_factory, ui=UiContext.from_dict(ui))
+        ctx = ToolContext(session_factory=self._session_factory, ui=UiContext.from_dict(ui),
+                          cancel_check=lambda: self._cancel)
         try:
             await self._run_rounds(user_text, ui, ctx, emit)
         finally:
@@ -104,65 +129,103 @@ class AgentSession:
                           ctx: ToolContext, emit: Emit) -> None:
         await self._append_and_persist(LlmMessage("user", [TextBlock(user_text)]))
         system = build_system_prompt(ui)
+        stats = _RunStats()
+        outcome = await self._iterate_tool_rounds(system, ctx, emit, stats)
+        if outcome == "limit":
+            await self._finalize_on_limit(system, emit, stats)
+        self._log_run(stats)
+        await emit(_event("done", {"cancelled": self._cancel}))
+
+    async def _iterate_tool_rounds(self, system: str, ctx: ToolContext,
+                                   emit: Emit, stats: _RunStats) -> str:
+        """跑工具轮直到自然收尾 / 出错 / 取消（返回对应状态），或触顶返回 "limit"。"""
         for _ in range(self._settings.agent_max_tool_rounds):
             if self._cancel:
-                break
-            assistant_msg, errored = await self._stream_assistant_turn(system, emit)
+                return "cancelled"
+            assistant_msg, errored = await self._stream_assistant_turn(system, emit, stats)
+            stats.rounds += 1
             if assistant_msg.content:
                 await self._append_and_persist(assistant_msg)
             if errored:
-                await emit(_event("done", {"cancelled": False}))
-                return
+                return "error"
             tool_uses = [b for b in assistant_msg.content if isinstance(b, ToolUseBlock)]
             if not tool_uses:
-                await emit(_event("done", {"cancelled": False}))
-                return
+                return "ended"
             if self._cancel:
-                break
-            await self._execute_tool_calls(tool_uses, ctx, emit)
-        else:
+                return "cancelled"
+            await self._execute_tool_calls(tool_uses, ctx, emit, stats)
+        return "limit"
+
+    async def _finalize_on_limit(self, system: str, emit: Emit, stats: _RunStats) -> None:
+        """轮数耗尽：禁用工具再请求一次文字总结（H9）；已取消则不再调用 LLM（RN-7）。"""
+        if self._cancel:
+            return
+        assistant_msg, errored = await self._stream_assistant_turn(system, emit, stats, tools=[])
+        stats.rounds += 1
+        if assistant_msg.content:
+            await self._append_and_persist(assistant_msg)
+        summarized = any(isinstance(b, TextBlock) and b.text for b in assistant_msg.content)
+        if errored or not summarized:
             await emit(_event("error", {"code": "TOOL_LOOP_LIMIT",
                                         "message": "工具调用轮数已达上限。"}))
-        await emit(_event("done", {"cancelled": self._cancel}))
 
-    async def _stream_assistant_turn(self, system: str, emit: Emit) -> tuple[LlmMessage, bool]:
-        """单轮流式累积：emit 增量事件并返回（assistant 消息, 是否出错）。"""
+    def _log_run(self, stats: _RunStats) -> None:
+        """run 结束结构化日志（轮数 / 每工具耗时 / stop_reason / token，仅元数据，C7）。"""
+        logger.info("agent run complete: %s", {
+            "conv": self.conversation_id, "rounds": stats.rounds, "tools": stats.tools,
+            "stop_reason": stats.stop_reason, "in_tokens": stats.in_tokens,
+            "out_tokens": stats.out_tokens})
+
+    async def _stream_assistant_turn(self, system: str, emit: Emit, stats: _RunStats,
+                                     tools: list | None = None) -> tuple[LlmMessage, bool]:
+        """单轮流式累积：emit 增量事件并返回（assistant 消息, 是否出错）。`tools=[]` 即禁用工具。"""
         msg_id = uuid.uuid4().hex
         await emit(_event("message_start", {"id": msg_id, "role": "assistant"}))
-        text_parts: list[str] = []
-        accs: dict[str, _ToolAcc] = {}
-        order: list[str] = []
+        acc = _StreamAcc()
         errored = False
+        schemas = self._registry.schemas() if tools is None else tools
         async for ev in self._llm.stream(system=system, messages=self._trimmed_messages(),
-                                          tools=self._registry.schemas()):
+                                          tools=schemas):
             if self._cancel:
                 break
-            done = await self._on_stream_event(ev, msg_id, text_parts, accs, order, emit)
+            done = await self._on_stream_event(ev, msg_id, acc, emit)
             if done == "error":
                 errored = True
                 break
             if done == "stop":
                 break
-        await emit(_event("message_end", {"id": msg_id}))
-        blocks = self._build_assistant_blocks(text_parts, accs, order)
-        return LlmMessage("assistant", blocks), errored
+        await emit(_event("message_end", self._message_end_data(msg_id, acc, stats)))
+        return LlmMessage("assistant", self._build_assistant_blocks(acc)), errored
 
-    async def _on_stream_event(self, ev: StreamEvent, msg_id: str, text_parts: list[str],
-                               accs: dict[str, _ToolAcc], order: list[str],
+    def _message_end_data(self, msg_id: str, acc: _StreamAcc, stats: _RunStats) -> dict:
+        """构造 message_end 负载：归一化 usage（RN-2）并累计进运行统计（H5）。"""
+        usage = normalize_usage(getattr(self._llm, "provider", "anthropic"), acc.usage)
+        stats.stop_reason = acc.stop_reason or stats.stop_reason
+        if usage:
+            stats.in_tokens = (stats.in_tokens or 0) + (usage.get("inputTokens") or 0)
+            stats.out_tokens = (stats.out_tokens or 0) + (usage.get("outputTokens") or 0)
+        data: dict = {"id": msg_id}
+        if usage:
+            data["usage"] = usage
+        return data
+
+    async def _on_stream_event(self, ev: StreamEvent, msg_id: str, acc: _StreamAcc,
                                emit: Emit) -> str | None:
         """消费单个归一化流事件，返回 None|"stop"|"error"。"""
         if ev.kind == "text_delta":
-            text_parts.append(ev.text or "")
+            acc.text_parts.append(ev.text or "")
             await emit(_event("text_delta", {"id": msg_id, "text": ev.text or ""}))
         elif ev.kind == "thinking_delta":
             await emit(_event("thinking_delta", {"id": msg_id, "text": ev.text or ""}))
         elif ev.kind == "tool_use_start":
-            accs[ev.id] = _ToolAcc(ev.id, ev.name)
-            order.append(ev.id)
+            acc.accs[ev.id] = _ToolAcc(ev.id, ev.name)
+            acc.order.append(ev.id)
         elif ev.kind == "tool_use_args_delta":
-            if ev.id in accs:
-                accs[ev.id].add(ev.partial_json or "")
+            if ev.id in acc.accs:
+                acc.accs[ev.id].add(ev.partial_json or "")
         elif ev.kind == "message_done":
+            acc.usage = ev.usage
+            acc.stop_reason = ev.stop_reason
             return "stop"
         elif ev.kind == "error":
             await emit(_event("error", {"code": ev.code or "LLM_ERROR",
@@ -170,24 +233,27 @@ class AgentSession:
             return "error"
         return None
 
-    def _build_assistant_blocks(self, text_parts, accs, order) -> list:
+    def _build_assistant_blocks(self, acc: _StreamAcc) -> list:
         blocks: list = []
-        text = "".join(text_parts)
+        text = "".join(acc.text_parts)
         if text:
             blocks.append(TextBlock(text))
-        for tool_id in order:
-            blocks.append(accs[tool_id].to_block())
+        for tool_id in acc.order:
+            blocks.append(acc.accs[tool_id].to_block())
         return blocks
 
-    async def _execute_tool_calls(self, tool_uses: list[ToolUseBlock],
-                                  ctx: ToolContext, emit: Emit) -> None:
+    async def _execute_tool_calls(self, tool_uses: list[ToolUseBlock], ctx: ToolContext,
+                                  emit: Emit, stats: _RunStats) -> None:
         """顺序执行工具，emit 结果 / ui_action，回喂 tool_result（断连即取消亦保持配对）。"""
         result_blocks: list[ToolResultBlock] = []
         for tu in tool_uses:
             if self._cancel:
                 break
             await emit(_event("tool_call", {"id": tu.id, "name": tu.name, "input": tu.input}))
+            started = time.perf_counter()
             result = await self._registry.execute(tu.name, tu.input, ctx)
+            stats.tools.append({"name": tu.name, "ok": result.ok,
+                                "ms": round((time.perf_counter() - started) * 1000, 1)})
             await emit(_event("tool_result", {"id": tu.id, "name": tu.name,
                                               "ok": result.ok, "summary": result.summary}))
             if self._registry.is_ui_action(tu.name) and result.ok and result.payload:

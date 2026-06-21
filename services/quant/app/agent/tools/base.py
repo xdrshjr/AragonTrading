@@ -44,10 +44,11 @@ class UiContext:
 
 @dataclass
 class ToolContext:
-    """每次 run 注入：DB session 工厂 + 当前 UI 上下文。"""
+    """每次 run 注入：DB session 工厂 + 当前 UI 上下文 + 协作式取消探针（H11，可选）。"""
 
     session_factory: Callable[[], AsyncSession]
     ui: UiContext = field(default_factory=UiContext)
+    cancel_check: Callable[[], bool] | None = None
 
 
 @dataclass
@@ -67,5 +68,97 @@ class Tool:
     input_schema: dict = {}
     is_ui_action: bool = False
 
+    def validate(self, args: dict) -> str | None:
+        """校验模型产出的工具入参（外部输入，边界一次性校验，H2）。
+
+        Args:
+            args: 模型产出的入参 dict（malformed JSON 已在 loop 回退为 ``{}``）。
+
+        Returns:
+            ``None`` 表示放行；返回错误信息字符串即视为非法（registry 据此拒绝执行并回喂模型自纠）。
+        """
+        return None
+
     async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
         raise NotImplementedError
+
+
+# ============================ 入参校验原语（H2，各工具 validate 复用） ============================
+BAR_ENUM = ("1m", "5m", "15m", "30m", "1H", "4H", "1D")
+
+
+def first_error(*messages: str | None) -> str | None:
+    """返回首个非空错误信息（链式校验：全部通过则 ``None``）。"""
+    for message in messages:
+        if message:
+            return message
+    return None
+
+
+def _is_pos_int(value: object) -> bool:
+    """正整数判定（显式排除 bool，避免 ``True`` 被当作 1）。"""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def require_str(args: dict, key: str) -> str | None:
+    """必填非空字符串。"""
+    value = args.get(key)
+    if not isinstance(value, str) or not value.strip():
+        return f"缺少必填参数 {key}（应为非空字符串）"
+    return None
+
+
+def check_enum(args: dict, key: str, allowed: tuple, *, required: bool = False) -> str | None:
+    """枚举校验：缺省按 ``required`` 决定是否报错；给值则须在 ``allowed`` 内。"""
+    value = args.get(key)
+    if value is None:
+        return f"缺少必填参数 {key}" if required else None
+    if value not in allowed:
+        return f"{key} 必须为 {'/'.join(allowed)} 之一"
+    return None
+
+
+def require_pos_int(args: dict, key: str) -> str | None:
+    """必填正整数。"""
+    return None if _is_pos_int(args.get(key)) else f"{key} 必须为正整数"
+
+
+def check_pos_int_list(args: dict, key: str) -> str | None:
+    """必填非空数组，元素均为正整数。"""
+    value = args.get(key)
+    if not isinstance(value, list) or not value:
+        return f"{key} 必须为非空数组"
+    if not all(_is_pos_int(item) for item in value):
+        return f"{key} 的元素必须为正整数"
+    return None
+
+
+def check_limit(args: dict, low: int, high: int) -> str | None:
+    """可选 ``limit``：给值则须为 ``low..high`` 的整数。"""
+    value = args.get("limit")
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+        return f"limit 必须为 {low}..{high} 之间的整数"
+    return None
+
+
+def check_required_range(args: dict) -> str | None:
+    """``startTs``/``endTs`` 必填、正整数且 ``startTs < endTs``。"""
+    return first_error(
+        require_pos_int(args, "startTs"), require_pos_int(args, "endTs"),
+        None if not (_is_pos_int(args.get("startTs")) and _is_pos_int(args.get("endTs")))
+        else ("startTs 必须小于 endTs" if args["startTs"] >= args["endTs"] else None))
+
+
+def check_optional_range(args: dict) -> str | None:
+    """``startTs``/``endTs`` 可选：给则须为正整数且有序（任一缺失不报顺序错）。"""
+    start, end = args.get("startTs"), args.get("endTs")
+    if start is None and end is None:
+        return None
+    for key in ("startTs", "endTs"):
+        if args.get(key) is not None and not _is_pos_int(args.get(key)):
+            return f"{key} 必须为正整数"
+    if _is_pos_int(start) and _is_pos_int(end) and start >= end:
+        return "startTs 必须小于 endTs"
+    return None

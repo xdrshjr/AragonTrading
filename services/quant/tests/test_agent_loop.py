@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from app.agent.llm.base import StreamEvent
-from app.agent.loop import AgentSession
+from app.agent.loop import AgentSession, _RunStats
 from app.agent.tools.registry import ToolRegistry
 from app.config import Settings
 from app.db import repositories as repo
@@ -112,5 +112,66 @@ async def test_cancel_mid_stream_stops_before_executing_tools():
         assert events[-1]["type"] == "done" and events[-1]["data"]["cancelled"] is True
         # 取消后不应执行工具：无 ui_action / tool_result。
         assert not any(e["type"] in ("ui_action", "tool_result") for e in events)
+    finally:
+        await dispose_engine()
+
+
+async def test_message_end_carries_normalized_camelcase_usage():
+    """假 LLM 在 message_done 给原始 snake_case usage，断言外发为归一 camelCase（RN-2）。"""
+    await init_db()
+    llm = _ScriptedLLM([
+        [
+            StreamEvent(kind="text_delta", text="你好"),
+            StreamEvent(kind="message_done", stop_reason="end_turn",
+                        usage={"input_tokens": 11, "output_tokens": 22}),
+        ],
+    ])
+    try:
+        events = await _collect_run(_session(llm, _settings()), text="hi")
+        end = next(e for e in events if e["type"] == "message_end")
+        assert end["data"]["usage"] == {"inputTokens": 11, "outputTokens": 22}
+        assert "input_tokens" not in end["data"]["usage"]  # 不外泄原始 snake_case
+    finally:
+        await dispose_engine()
+
+
+async def test_round_limit_triggers_toolless_summary_then_done():
+    """命中轮上限后追加禁用工具的终轮总结（产文本即不报 TOOL_LOOP_LIMIT）(H9)。"""
+    await init_db()
+    tool_turn = [
+        StreamEvent(kind="tool_use_start", id="t1", name="list_strategies"),
+        StreamEvent(kind="message_done", stop_reason="tool_use"),
+    ]
+    llm = _ScriptedLLM([
+        tool_turn, tool_turn,
+        [StreamEvent(kind="text_delta", text="综上，已尽力总结。"),
+         StreamEvent(kind="message_done", stop_reason="end_turn")],
+    ])
+    try:
+        events = await _collect_run(_session(llm, _settings(agent_max_tool_rounds=2)))
+        assert not any(e["type"] == "error" and e["data"]["code"] == "TOOL_LOOP_LIMIT"
+                       for e in events)
+        assert any(e["type"] == "text_delta" and "总结" in e["data"]["text"] for e in events)
+        assert events[-1]["type"] == "done"
+    finally:
+        await dispose_engine()
+
+
+async def test_finalize_on_limit_skips_llm_when_cancelled():
+    """终轮总结前命中取消 → 不再发起 LLM，亦不 emit 事件（RN-7）。"""
+    await init_db()
+    llm = _ScriptedLLM([[StreamEvent(kind="text_delta", text="不应运行"),
+                         StreamEvent(kind="message_done", stop_reason="end_turn")]])
+    session = _session(llm, _settings())
+    session._cancel = True
+    events: list[dict] = []
+
+    async def emit(ev):
+        events.append(ev)
+
+    try:
+        await session._finalize_on_limit("sys", emit, _RunStats())
+        assert llm.calls == 0  # 已取消：未发起 LLM 调用
+        assert events == []    # 未 emit 任何事件
     finally:
         await dispose_engine()

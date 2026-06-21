@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import httpx
 
@@ -18,15 +19,18 @@ from .base import (
     ToolSchema,
     ToolUseBlock,
 )
+from .retry import RetryConfig, open_stream_with_retry
 
 
 class AnthropicClient:
     """Anthropic `/v1/messages` 流式客户端。"""
 
+    provider = "anthropic"
+
     def __init__(self, *, base_url: str, api_key: str, model: str,
                  anthropic_version: str, user_agent: str, max_tokens: int,
                  temperature: float, top_p: float, timeout: float,
-                 proxy: str | None):
+                 proxy: str | None, retry: RetryConfig | None = None):
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
@@ -37,6 +41,7 @@ class AnthropicClient:
         self._top_p = top_p
         self._timeout = timeout
         self._proxy = proxy
+        self._retry = retry or RetryConfig()
 
     def _headers(self) -> dict:
         return {
@@ -64,22 +69,25 @@ class AnthropicClient:
             ]
         return body
 
+    @asynccontextmanager
+    async def _request_cm(self, url: str, body: dict):
+        """单次流式请求上下文（每次尝试新建，供 pre-stream 重试编排复用，H1）。"""
+        async with httpx.AsyncClient(timeout=self._timeout, proxy=self._proxy) as client:
+            async with client.stream("POST", url, headers=self._headers(), json=body) as resp:
+                yield resp
+
     async def stream(self, *, system: str, messages: list[LlmMessage],
                      tools: list[ToolSchema]) -> AsyncIterator[StreamEvent]:
         url = f"{self._base_url}/v1/messages"
         body = self._body(system, messages, tools)
-        try:
-            async with httpx.AsyncClient(timeout=self._timeout, proxy=self._proxy) as client:
-                async with client.stream("POST", url, headers=self._headers(), json=body) as resp:
-                    if resp.status_code >= 400:
-                        text = (await resp.aread()).decode("utf-8", "replace")
-                        yield StreamEvent(kind="error", code="LLM_HTTP_ERROR",
-                                          message=f"HTTP {resp.status_code}: {text[:400]}")
-                        return
-                    async for event in parse_anthropic_sse(resp.aiter_lines()):
-                        yield event
-        except httpx.HTTPError as exc:
-            yield StreamEvent(kind="error", code="LLM_NETWORK_ERROR", message=str(exc))
+        # pre-stream 有界重试：429/5xx/网络瞬断退避重试；401/403→AGENT_AUTH_ERROR；
+        # 一旦开始产出 SSE 即不再重试（防重复输出，R1）。
+        async for event in open_stream_with_retry(
+            make_request_cm=lambda: self._request_cm(url, body),
+            parse_sse=parse_anthropic_sse,
+            config=self._retry,
+        ):
+            yield event
 
 
 def _to_anthropic_message(msg: LlmMessage) -> dict:

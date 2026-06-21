@@ -60,13 +60,19 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(False, f"未知工具：{name}")
+        args = args or {}
+        # 模型产出的入参即外部输入：边界处一次性校验，非法即拒并回喂模型自纠（H2，不执行）。
+        invalid = tool.validate(args)
+        if invalid is not None:
+            return ToolResult(False, f"参数无效：{invalid}")
         try:
-            return await tool.execute(args or {}, ctx)
+            return await tool.execute(args, ctx)
         except OKXError as exc:
             return ToolResult(False, f"OKX 暂不可达，无法取数（{exc.message}）。请稍后重试。")
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
             return ToolResult(False, f"操作失败：{detail.get('message', detail)}")
         except Exception as exc:  # noqa: BLE001 —— 工具边界统一兜底，避免单工具异常拖垮整轮 run
+            # 脱敏有界根因：仅类型名 + 截断消息，便于模型 / 用户纠正，杜绝栈与密钥（H7 / C7）。
             logger.exception("tool %s execute failed", name)
-            return ToolResult(False, f"工具 {name} 执行出错：{exc}")
+            return ToolResult(False, f"工具 {name} 执行出错：{type(exc).__name__}: {str(exc)[:200]}")
