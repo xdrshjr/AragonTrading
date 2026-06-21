@@ -118,6 +118,21 @@ function findServerJs(root) {
   return null;
 }
 
+// 删除 .web-build/ 下除 node_modules 外的全部条目——这些都是上一轮从 apps/web 复制来的源码/产物，
+// 会被本轮重新复制覆盖；唯独 node_modules 体积大、保留以复用（--clean 才整体重装）。
+function pruneCopiedSources() {
+  let entries;
+  try {
+    entries = readdirSync(BUILD, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const ent of entries) {
+    if (ent.name === 'node_modules') continue;
+    rmSync(join(BUILD, ent.name), { recursive: true, force: true });
+  }
+}
+
 // 步骤 1 + 2：重建隔离目录并复制源码（保留既有 node_modules 以复用，除非 --clean）。
 function prepareBuildDir() {
   if (CLEAN && existsSync(BUILD)) {
@@ -125,8 +140,11 @@ function prepareBuildDir() {
     rmSync(BUILD, { recursive: true, force: true });
   }
   mkdirSync(BUILD, { recursive: true });
-  // 清掉上次构建的 .next（保留 node_modules 以复用加速）；next build 会重建 .next/standalone。
-  if (existsSync(BUILD_NEXT)) rmSync(BUILD_NEXT, { recursive: true, force: true });
+  // 删除上一轮复制进来的源码与 .next（仅保留体积大的 node_modules 复用加速）。cpSync 是叠加复制，
+  // 不会清理 apps/web 已删除/改名的文件——若不先剪枝，旧源码会作为幽灵模块参与 next build 类型检查
+  // 而失败（如已移除的 InstrumentList.tsx 仍 import 已删除的 buildInstOptions）。node_modules 由
+  // installDeps 增量同步，--clean 才整体重装。
+  pruneCopiedSources();
 
   log('复制 apps/web 源码 → .web-build/（排除 node_modules/.next 与 pnpm/workspace 标记）…');
   cpSync(WEB, BUILD, {

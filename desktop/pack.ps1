@@ -35,11 +35,16 @@
 .PARAMETER DownloadElectron
     不复用本地 electron，强制让 electron-builder 自行下载对应版本二进制。
 
+.PARAMETER NoStopRunningDist
+    默认打包前会回收仍从 dist/win-unpacked 运行的旧产物，避免 Windows EBUSY 文件锁。
+    指定此开关后，若发现旧产物仍在运行则直接失败并打印 PID。
+
 .EXAMPLE
     ./pack.ps1                       # 出安装包
     ./pack.ps1 -Target smoke         # 快速冒烟（免安装目录）
     ./pack.ps1 -Target release-check # 打包并端到端验收
     ./pack.ps1 -Clean                # 全量干净打包
+    ./pack.ps1 -NoStopRunningDist    # 检测到旧 win-unpacked 正在运行时直接失败
     ./pack.ps1 -Target verify -- --allow-okx-down   # 离线只接受诚实 5xx 的验收
 #>
 #Requires -Version 5.1
@@ -52,6 +57,7 @@ param(
     [switch]$SkipInstall,
     [string]$ElectronMirror,
     [switch]$DownloadElectron,
+    [switch]$NoStopRunningDist,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$ExtraArgs
 )
@@ -86,6 +92,72 @@ function Invoke-Native {
 
 function Test-Tool([string]$Name) {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Get-RunningDistProcesses([string]$UnpackedDir) {
+    $root = [System.IO.Path]::GetFullPath($UnpackedDir).TrimEnd([char[]]"\/")
+    $rootBackslash = "$root\"
+    $rootForward = $root.Replace('\', '/')
+    $rootForwardSlash = "$rootForward/"
+    $comparison = [System.StringComparison]::OrdinalIgnoreCase
+
+    Get-CimInstance Win32_Process |
+        Where-Object {
+            $pidValue = [int]$_.ProcessId
+            if ($pidValue -eq $PID) { return $false }
+
+            $exe = [string]$_.ExecutablePath
+            $cmd = [string]$_.CommandLine
+            $exeInDist =
+                $exe -and $exe.StartsWith($rootBackslash, $comparison)
+            $cmdInDist =
+                $cmd -and (
+                    $cmd.IndexOf($rootBackslash, $comparison) -ge 0 -or
+                    $cmd.IndexOf($rootForwardSlash, $comparison) -ge 0
+                )
+
+            return $exeInDist -or $cmdInDist
+        } |
+        Sort-Object ProcessId
+}
+
+function Format-DistProcessList($Processes) {
+    return ($Processes |
+        ForEach-Object {
+            $path = if ($_.ExecutablePath) { $_.ExecutablePath } else { $_.CommandLine }
+            "PID $($_.ProcessId) $($_.Name) $path"
+        }) -join "`n    "
+}
+
+function Stop-RunningDistProcesses([string]$UnpackedDir, [bool]$StopProcesses) {
+    $running = @(Get-RunningDistProcesses $UnpackedDir)
+    if (-not $running) { return }
+
+    $summary = Format-DistProcessList $running
+    if (-not $StopProcesses) {
+        Fail "dist/win-unpacked 仍有旧产物进程在运行：`n    $summary`n请先关闭后重试，或去掉 -NoStopRunningDist 让脚本自动回收。" 6
+    }
+
+    Write-Section '3) 回收正在运行的旧 win-unpacked 产物'
+    Write-Host "    发现旧产物进程，将先停止以释放 Windows 文件锁：" -ForegroundColor DarkGray
+    Write-Host "    $summary" -ForegroundColor DarkGray
+
+    foreach ($proc in $running) {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    $deadline = (Get-Date).AddSeconds(12)
+    do {
+        Start-Sleep -Milliseconds 250
+        $remaining = @(Get-RunningDistProcesses $UnpackedDir)
+        if (-not $remaining) {
+            Write-Host '    旧产物进程已释放 ✓' -ForegroundColor DarkGray
+            return
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    $remainingSummary = Format-DistProcessList $remaining
+    Fail "旧 win-unpacked 进程未能退出：`n    $remainingSummary`n请手动关闭后重试。" 6
 }
 
 Write-Host '────────────────────────────────────────────' -ForegroundColor DarkGray
@@ -147,6 +219,10 @@ try {
         Write-Host '[pack.ps1] ✓ 验收完成。' -ForegroundColor Green
         exit 0
     }
+
+    Stop-RunningDistProcesses `
+        (Join-Path $DesktopDir 'dist/win-unpacked') `
+        (-not $NoStopRunningDist)
 
     # --- 3) 可选清理 ---
     if ($Clean) {
