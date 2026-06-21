@@ -26,6 +26,12 @@ export const DEFAULT_SIM_BALANCE = 10000;
 const MIN_SIM_BALANCE = 100;
 const MAX_SIM_BALANCE = 1e8;
 
+// 左侧纵向分栏比例：图表区(上)占左侧高度的比例，1-ratio 即「成交记录/当前持仓」(下)区。
+// 夹取上区于 [0.4, 0.85] ⇒ 下区于 [15%, 60%]，尊重图表 min-h-[320px] 与下区 min-h-[140px] 硬下限。
+export const DEFAULT_CHART_SPLIT_RATIO = 0.8;
+const MIN_CHART_SPLIT_RATIO = 0.4;
+const MAX_CHART_SPLIT_RATIO = 0.85;
+
 interface AppState {
   instId: string;
   bar: Bar;
@@ -51,6 +57,7 @@ interface AppState {
   indicators: Record<IndicatorKey, boolean>;
   watchlist: string[];
   instSidebarTab: InstSidebarTab;
+  chartSplitRatio: number;
 
   setInst: (instId: string) => void;
   setBar: (bar: Bar) => void;
@@ -83,6 +90,7 @@ interface AppState {
   removeFromWatchlist: (instId: string) => void;
   toggleWatchlist: (instId: string) => void;
   setInstSidebarTab: (tab: InstSidebarTab) => void;
+  setChartSplitRatio: (ratio: number) => void;
 }
 
 export const useAppStore = create<AppState>()(
@@ -113,6 +121,7 @@ export const useAppStore = create<AppState>()(
       // 全新安装兜底（RV-1 / C-1）：只走初始化器、不触发 migrate，故默认值必须写在此处。
       watchlist: [...FALLBACK_INSTRUMENTS],
       instSidebarTab: "watch",
+      chartSplitRatio: DEFAULT_CHART_SPLIT_RATIO,
 
       setInst: (instId) => set({ instId, runId: null, chartView: "live-follow" }),
       setBar: (bar) => set({ bar, runId: null, chartView: "live-follow" }),
@@ -203,10 +212,22 @@ export const useAppStore = create<AppState>()(
             : [instId, ...s.watchlist],
         })),
       setInstSidebarTab: (instSidebarTab) => set({ instSidebarTab }),
+      // 纵向分栏比例：夹取到 [MIN, MAX]；非有限数忽略（守住边界，与 simBalance 同模式）。
+      setChartSplitRatio: (n) =>
+        set((s) =>
+          Number.isFinite(n)
+            ? {
+                chartSplitRatio: Math.min(
+                  Math.max(n, MIN_CHART_SPLIT_RATIO),
+                  MAX_CHART_SPLIT_RATIO,
+                ),
+              }
+            : { chartSplitRatio: s.chartSplitRatio },
+        ),
     }),
     {
       name: "aragon-ui",
-      version: 6,
+      version: 7,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -225,6 +246,7 @@ export const useAppStore = create<AppState>()(
         paneTab: s.paneTab,
         watchlist: s.watchlist,
         instSidebarTab: s.instSidebarTab,
+        chartSplitRatio: s.chartSplitRatio,
       }),
       // 逐版补默认态（即便缺省 zustand 浅合并也回落初值，migrate 仅为显式稳妥，R7/R11）。
       migrate: (persisted, version) => {
@@ -243,6 +265,9 @@ export const useAppStore = create<AppState>()(
         }
         if (version < 6) {
           next = { ...next, watchlist: [...FALLBACK_INSTRUMENTS], instSidebarTab: "watch" };
+        }
+        if (version < 7) {
+          next = { ...next, chartSplitRatio: DEFAULT_CHART_SPLIT_RATIO };
         }
         return next as never;
       },

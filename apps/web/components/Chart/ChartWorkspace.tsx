@@ -1,14 +1,14 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import PaperPositionsTable from "@/components/Strategy/PaperPositionsTable";
 import PositionPanel from "@/components/Strategy/PositionPanel";
 import TradesTable from "@/components/Strategy/TradesTable";
 import { Tabs } from "@/components/ui";
 import type { IndicatorKey } from "@/lib/indicators";
 import { buildPaperPositionRows } from "@/lib/paperMulti";
-import { useAppStore } from "@/lib/store";
+import { DEFAULT_CHART_SPLIT_RATIO, useAppStore } from "@/lib/store";
 import type {
   BottomTab,
   Candle,
@@ -97,14 +97,39 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     bottomTab,
     paneTab,
     paperSessionId,
+    chartSplitRatio,
     setInst,
     setChartPane,
     setBottomTab,
     setPaneTab,
+    setChartSplitRatio,
   } = useAppStore();
 
   const [hoverTs, setHoverTs] = useState<number | null>(null);
   useEffect(() => setHoverTs(null), [instId, bar]);
+
+  // 纵向分栏拖拽：以 section 为测量容器，比例 = 指针 Y 相对 section 顶部的占比（store 负责夹取）。
+  // setPointerCapture 把拖拽期事件锁定到手柄，卸载即自动释放，无需手动清理 window 监听。
+  const splitContainerRef = useRef<HTMLElement>(null);
+  const splitDraggingRef = useRef(false);
+  const onSplitPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    splitDraggingRef.current = true;
+  };
+  const onSplitPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!splitDraggingRef.current) return;
+    const rect = splitContainerRef.current?.getBoundingClientRect();
+    if (!rect || rect.height <= 0) return;
+    setChartSplitRatio((e.clientY - rect.top) / rect.height);
+  };
+  const onSplitPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+    splitDraggingRef.current = false;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+  };
+  const onSplitReset = () => setChartSplitRatio(DEFAULT_CHART_SPLIT_RATIO);
 
   const byTs = useMemo(() => new Map(candles.map((c) => [c.ts, c])), [candles]);
   const tsIndex = useMemo(() => new Map(candles.map((c, i) => [c.ts, i])), [candles]);
@@ -153,9 +178,15 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
         : "运行回测后显示净值曲线";
 
   return (
-    <section className="flex h-full min-h-0 flex-col border-b border-[var(--border)] lg:border-b-0 lg:border-r">
-      <div className="flex min-h-0 flex-[8] flex-col lg:flex-row">
-        <div className="flex max-h-[42vh] min-h-0 shrink-0 flex-col border-b border-[var(--border)] lg:max-h-none lg:basis-[16%] lg:min-w-[220px] lg:max-w-[300px] lg:border-b-0 lg:border-r">
+    <section
+      ref={splitContainerRef}
+      className="flex h-full min-h-0 min-w-0 flex-col border-r border-[var(--border)]"
+    >
+      <div
+        className="flex min-h-0 min-w-0 flex-row"
+        style={{ flexGrow: chartSplitRatio, flexShrink: 1, flexBasis: 0 }}
+      >
+        <div className="flex min-h-0 shrink-0 basis-[16%] min-w-[220px] max-w-[300px] flex-col border-r border-[var(--border)]">
           <div className="shrink-0 border-b border-[var(--border)]">
             <MarketDepthPanel market={market} activeCandle={displayCandle} />
           </div>
@@ -220,7 +251,24 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
         </div>
       </div>
 
-      <div className="flex min-h-[140px] flex-[2] flex-col border-t border-[var(--border)]">
+      <div
+        role="separator"
+        aria-orientation="horizontal"
+        title="拖动调整图表与下方面板高度，双击复位"
+        onPointerDown={onSplitPointerDown}
+        onPointerMove={onSplitPointerMove}
+        onPointerUp={onSplitPointerUp}
+        onDoubleClick={onSplitReset}
+        style={{ touchAction: "none" }}
+        className="group flex h-1.5 shrink-0 cursor-row-resize items-center justify-center border-t border-[var(--border)] bg-[var(--surface-2)] hover:bg-[var(--accent-soft)]"
+      >
+        <div className="h-0.5 w-8 rounded-full bg-[var(--border)] group-hover:bg-[var(--accent)]" />
+      </div>
+
+      <div
+        className="flex min-h-[140px] flex-col"
+        style={{ flexGrow: 1 - chartSplitRatio, flexShrink: 1, flexBasis: 0 }}
+      >
         {mode === "paper" && paperSessionId && (
           <div className="shrink-0 border-b border-[var(--border)] bg-[var(--surface-2)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
             已启动实时模拟 · 下方成交和持仓按策略标签切换查看。

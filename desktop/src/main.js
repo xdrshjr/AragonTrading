@@ -191,7 +191,9 @@ function createWindow() {
   const opts = {
     width: 1440,
     height: 900,
-    minWidth: 1024,
+    // 两列地板 = 左栏 220 + 右策略 380 + 图表可用 ≈260 = 860；放开到 860 让窗口可收窄至
+    // 1366×768@150%(≈910 DIP) 等高 DPI/小屏内，避免右侧策略列被顶出屏幕（见 workstation-layout 诊断）。
+    minWidth: 860,
     minHeight: 680,
     backgroundColor: '#0b0d12',
     title: 'Aragon Trading',
