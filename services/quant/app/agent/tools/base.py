@@ -133,6 +133,22 @@ def check_pos_int_list(args: dict, key: str) -> str | None:
     return None
 
 
+def check_int_list(args: dict, key: str, *, max_len: int, max_val: int) -> str | None:
+    """可选有界正整数数组：缺省放行；给值则须为长度 ``1..max_len``、每元素 ``1..max_val`` 的整数。
+
+    与 ``check_pos_int_list`` 区分——后者必填非空、不限上界；本原语可选且对长度与元素同时设上界
+    （供 ``horizons`` 等「给则有界」的列表参数复用）。
+    """
+    value = args.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not 1 <= len(value) <= max_len:
+        return f"{key} 必须为长度 1..{max_len} 的数组"
+    if not all(_is_pos_int(item) and item <= max_val for item in value):
+        return f"{key} 的元素必须为 1..{max_val} 之间的整数"
+    return None
+
+
 def check_limit(args: dict, low: int, high: int) -> str | None:
     """可选 ``limit``：给值则须为 ``low..high`` 的整数。"""
     value = args.get("limit")

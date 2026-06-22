@@ -20,6 +20,7 @@ from .run_tools import (
     GetRunTradesTool,
     ListRunsTool,
 )
+from .signal_tools import TestSignalForwardReturnsTool
 from .strategy_tools import CompareStrategiesTool, ListStrategiesTool, RunBacktestTool
 from .ui_tools import ShowChartTool
 
@@ -34,6 +35,7 @@ _ALL_TOOLS: list[Tool] = [
     RunBacktestTool(),
     CompareStrategiesTool(),
     LabelMarketRegimeTool(),
+    TestSignalForwardReturnsTool(),
     ListRunsTool(),
     GetRunMetricsTool(),
     GetRunTradesTool(),

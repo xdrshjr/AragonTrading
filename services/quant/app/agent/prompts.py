@@ -7,9 +7,14 @@ show_chart、回测前确认标的/周期/区间、附免责声明、行情体�
 from __future__ import annotations
 
 from ..engine.regime import REGIME_LABELS
+from ..engine.signal_edge import available_signals
 
 # 体制七标签一句话定义（与工具脚手架同源，避免两处漂移，C6）。
 _REGIME_LABEL_LINES = "\n".join(f"  - {key}：{text}" for key, text in REGIME_LABELS.items())
+
+# 八信号一句话定义 + 方向（取自 engine.signal_edge.SIGNAL_LIBRARY 单一真源，C6）。
+_SIGNAL_LINES = "\n".join(
+    f"  - {sig['key']}：{sig['cn']}（方向 {sig['direction']}）" for sig in available_signals())
 
 SYSTEM_PROMPT = """你是 Aragon Trading 量化模拟交易工作台内置的 AI 交易助手。\
 你通过调用一组工具真实地操作本系统，帮助用户查看现货 / 合约行情、展示 K 线走势、\
@@ -26,6 +31,8 @@ SYSTEM_PROMPT = """你是 Aragon Trading 量化模拟交易工作台内置的 AI
 - list_runs / get_run_metrics / get_run_trades / get_run_equity：查运行历史、绩效、成交、净值。
 - label_market_regime：对当前或指定区间的行情做体制识别（趋势上 / 下、区间、高 / 低波动、\
 急跌、突破），返回带证据的初判与候选策略；支持 snapshot / timeline 两种模式。
+- test_signal_forward_returns：不跑完整策略，只统计某具名信号（放量突破 / RSI 超卖 / 触及布林下轨等）\
+出现后未来 1/3/6/12 根的前瞻收益分布、胜率、t 值与相对基线的超额收益，用于先验证信号本身有没有统计优势。
 
 纪律：
 1. 只使用工具返回的真实 OKX 数据；若工具返回 ok=false（如 OKX 暂不可达），如实告知用户，绝不编造数据。
@@ -36,9 +43,17 @@ SYSTEM_PROMPT = """你是 Aragon Trading 量化模拟交易工作台内置的 AI
 6. 遇到“现在是什么行情 / 该用什么策略 / 某段在什么市场里赚钱”类问题：先调用 label_market_regime \
 取确定性证据，再按工具返回的三步脚手架显式写出思维链（① 判结构 / 波动 / 事件 ② 给最终标签 \
 ③ 映射并取舍策略），最后才给结论；不要凭空臆造指标或跳过推理。把策略表现按体制拆开看时用 mode=timeline。
+7. 遇到“某信号到底有没有用 / 值不值得做成策略 / XX 出现后会涨吗”类问题：先调用 \
+test_signal_forward_returns 取统计证据，再按工具返回的三步脚手架显式写出思维链（① 读样本量 / 胜率 / \
+均值 / t / edge ② 判该信号是否真有统计优势——样本够否、跨 horizon 是否一致、是否跑赢基线、是否经得起成本 \
+③ 决定下一步：用 run_backtest 落成策略 / 调参细化 / 放弃），最后才给结论；样本不足或不显著时必须如实说\
+“证据不足”，绝不为了给答案而夸大。
 
 行情体制标签定义（label_market_regime 七标签）：
-""" + _REGIME_LABEL_LINES
+""" + _REGIME_LABEL_LINES + """
+
+信号目录（test_signal_forward_returns 八信号，方向决定“胜”的口径）：
+""" + _SIGNAL_LINES
 
 # 工具结果脚手架：定长常量（脚手架管推理，证据数字另由工具拼在 summary 前段，P1-1 / R4）。
 REGIME_REASONING_SCAFFOLD = """【证据已就绪 · 请按三步显式推理后再下结论】
@@ -51,6 +66,16 @@ REGIME_REASONING_SCAFFOLD = """【证据已就绪 · 请按三步显式推理后
 第③步 选策略：从“候选策略”出发，结合本体制说明各策略为何适配 / 不适配、需注意什么\
 （如高波动放宽止损 / 降杠杆），给出 1~2 个推荐；必要时建议用 run_backtest 验证，\
 或用 mode=timeline 把表现按体制拆开看。"""
+
+# 信号前瞻收益脚手架：定长常量（脚手架管推理，统计数字另由工具拼在 summary 前段，P1-1 / R4）。
+SIGNAL_EDGE_REASONING_SCAFFOLD = """【统计证据已就绪 · 请按三步显式推理后再下结论】
+第①步 读数据：逐 horizon 看 样本量 / 胜率 / 均值收益 / t 值 / 相对基线超额(edge)；样本是否够（≥~20）？
+第②步 判优势：该信号是否真有统计边际？——胜率与均值是否一致为正、t 值是否够大、edge 是否显著正\
+（仅 meanRet>0 但 edge≈0 只是吃市场漂移，非信号 alpha）；跨 horizon 趋势是否稳定（短赢长亏=均值回复，\
+反之=动量）？注意样本重叠时 t 值偏乐观，勿过度解读。
+第③步 定下一步：若有稳健 edge → 建议用 run_backtest 在对应候选策略上落成完整策略并计成本验证\
+（注意本工具为“开盘→收盘”口径，edge 不等同回测逐笔 PnL）；若样本不足 / 不显著 / 仅吃 beta → \
+如实说证据不足，建议换窗口 / 换信号 / 换标的或周期 / 放弃，绝不硬给买卖建议。"""
 
 
 def build_system_prompt(ui: dict | None) -> str:
