@@ -90,6 +90,63 @@ export interface ChatMessage {
   interrupted?: boolean; // 断连收束的在途气泡（H8a/RN-3）
 }
 
+// ---------------- AI 模型服务商（设置中心） ----------------
+export type ApiStandard = "anthropic" | "openai";
+export type ProviderKind = "official" | "custom";
+
+// 服务商（与后端 AgentProviderOut 对齐）：**绝不含 raw key**，仅 hasKey/keyPreview。
+export interface AgentProvider {
+  id: number;
+  slug: string;
+  kind: ProviderKind;
+  label: string;
+  apiStandard: ApiStandard;
+  baseUrl: string;
+  model: string;
+  userAgent: string;
+  hasKey: boolean;
+  keyPreview: string;
+  isDefault: boolean;
+  deletable: boolean;
+  createdTs: number;
+  updatedTs: number;
+}
+
+// 表单草稿（新增 / 编辑共用）：apiKey 留空表示保留原 key（编辑）或不填（新增）。
+export interface ProviderDraft {
+  label: string;
+  apiStandard: ApiStandard;
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  userAgent?: string;
+}
+
+// 连通性测试结果（与后端 ProviderTestResult 对齐）。
+export interface ProviderTestResult {
+  ok: boolean;
+  latencyMs?: number;
+  model?: string;
+  code?: string;
+  message?: string;
+}
+
+// 当前生效服务摘要（GET /agent/providers.active）。
+export interface ProviderActive {
+  configured: boolean;
+  providerId: number | null;
+  label: string;
+  provider: string;
+  model: string;
+}
+
+// GET /agent/providers 响应。
+export interface ProvidersListResponse {
+  providers: AgentProvider[];
+  defaultId: number | null;
+  active: ProviderActive;
+}
+
 // store 中 ui-action 需要的 setter 子集（lib/agentActions 据此映射）。
 export interface UiActionStore {
   setInst: (instId: string) => void;

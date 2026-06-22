@@ -228,13 +228,17 @@ class AgentSession:
         self.messages = [row_to_llm_message(r) for r in rows]
         self._loaded = True
 
-    async def run(self, user_text: str, ui: dict | None = None, sink: Emit | None = None) -> None:
+    async def run(self, user_text: str, ui: dict | None = None, sink: Emit | None = None,
+                  *, client: LLMClient | None = None) -> None:
         """跑一轮 agentic loop。事件经 ``self._emit`` 发出（run/socket 解耦，RS-1）。
 
         Args:
             user_text: 用户输入。
             ui: 当前工作台上下文（注入 system prompt / ui-action 默认值）。
             sink: 可选初始 sink（兼容既有单测 / 直驱）；生产路径由 ``manager.attach`` 预挂。
+            client: 本轮使用的 LLM 客户端（manager 解析的当前默认服务）。仅在**通过下方权威
+                BUSY 守卫之后**才绑定 ``self._llm``——擦过 WS best-effort 检查的并发轮在守卫处即被
+                拒、绑定永不发生，故进行中 run 的 client 绝不被中途替换（P1-Race）。
         """
         if sink is not None:
             self._sink = sink
@@ -244,6 +248,8 @@ class AgentSession:
                 _event("error", {"code": "BUSY", "message": "上一条仍在处理，请稍候。"}))
             return
         self._running = True
+        if client is not None:  # 过守卫后才绑定：赢得 run 槽的这一轮才换用最新默认服务（P1-Race）。
+            self._llm = client
         self._cancel = False
         self._buffer.clear()  # 新 run 起始清空事件窗口（缓冲只承载当前 run，R4）
         ctx = ToolContext(session_factory=self._session_factory, ui=UiContext.from_dict(ui),

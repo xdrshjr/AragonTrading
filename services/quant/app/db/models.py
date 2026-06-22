@@ -110,6 +110,31 @@ class AgentMessage(Base):
     created_ts: Mapped[int] = mapped_column(Integer, default=0)  # 秒级 UTC（全系统统一，C2）
 
 
+class AgentProvider(Base):
+    """AI 模型服务商配置（设置中心 · AI 模型服务）。
+
+    每行是一个可被 Agent 使用的 LLM 接入目标。官方项（openai/anthropic/gemini/kimi）
+    `kind="official"` 不可删但可编辑；自定义项 `kind="custom"` 可增删改。全表至多一行
+    `is_default=True`（`set_default` 事务保证）。`api_key` 仅后端存，绝不出接口 / 不进日志（C7）。
+    """
+
+    __tablename__ = "agent_providers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    slug: Mapped[str] = mapped_column(String(64), unique=True, index=True)  # 官方为定值，自定义为 uuid
+    kind: Mapped[str] = mapped_column(String(16))           # official | custom（deletable=custom）
+    label: Mapped[str] = mapped_column(String(128))
+    api_standard: Mapped[str] = mapped_column(String(16))   # anthropic | openai（决定走哪个 client）
+    base_url: Mapped[str] = mapped_column(String(256))
+    # APIKEY —— 仅后端存：列表 / 详情仅回 hasKey/keyPreview，绝不返回原文，绝不进日志（C7）。
+    api_key: Mapped[str] = mapped_column(Text, default="")
+    model: Mapped[str] = mapped_column(String(128))
+    user_agent: Mapped[str] = mapped_column(String(128), default="claude-code/1.0")
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
 class CandleCache(Base):
     """OKX K 线本地缓存（降低调用、加速回测）。"""
 

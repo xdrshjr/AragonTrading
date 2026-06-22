@@ -79,7 +79,10 @@ class OpenAIClient:
 
     async def stream(self, *, system: str, messages: list[LlmMessage],
                      tools: list[ToolSchema]) -> AsyncIterator[StreamEvent]:
-        url = f"{self._base_url}/v1/chat/completions"
+        # 整端点直通（P1-URL）：base_url 已以资源段结尾即原样 POST（如 Gemini OpenAI 兼容端点
+        # 与自建网关完整 URL）；否则按现行把根 URL 追加 /v1/chat/completions（根 URL 行为零变化）。
+        base = self._base_url
+        url = base if base.endswith("/chat/completions") else f"{base}/v1/chat/completions"
         body = self._body(system, messages, tools)
         # pre-stream 有界重试：429/5xx/网络瞬断退避重试；401/403→AGENT_AUTH_ERROR；
         # 一旦开始产出 SSE 即不再重试（防重复输出，R1）。

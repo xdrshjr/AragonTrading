@@ -70,6 +70,9 @@ interface AppState {
   chartSplitRatio: number;
   rightTab: RightTab;
   agentConversationId: string;
+  // 设置中心（spec §5.3）：showSettings 为瞬态（不持久化，刷新回工作台）；settingsSection 持久化。
+  showSettings: boolean;
+  settingsSection: string;
 
   setInst: (instId: string) => void;
   setBar: (bar: Bar) => void;
@@ -106,6 +109,8 @@ interface AppState {
   setRightTab: (tab: RightTab) => void;
   setAgentConversationId: (id: string) => void;
   newConversation: () => void;
+  setShowSettings: (show: boolean) => void;
+  setSettingsSection: (section: string) => void;
 }
 
 export const useAppStore = create<AppState>()(
@@ -140,6 +145,9 @@ export const useAppStore = create<AppState>()(
       // 右侧默认激活「AI 助手」页签；会话 id 首次为空，挂载时生成并落盘以便重连恢复。
       rightTab: "agent",
       agentConversationId: "",
+      // 设置中心：默认在工作台（showSettings=false）；默认设置项为「AI 模型服务」。
+      showSettings: false,
+      settingsSection: "ai-models",
 
       setInst: (instId) => set({ instId, runId: null, chartView: "live-follow" }),
       setBar: (bar) => set({ bar, runId: null, chartView: "live-follow" }),
@@ -235,6 +243,9 @@ export const useAppStore = create<AppState>()(
       setAgentConversationId: (agentConversationId) => set({ agentConversationId }),
       // 新对话：生成新会话 uuid（旧消息流随 conversationId 变更而失效，DB 历史仍可经其原 id 查到）。
       newConversation: () => set({ agentConversationId: makeConversationId() }),
+      // 设置中心：切换设置面板（瞬态）/ 切换当前设置项（持久化）。
+      setShowSettings: (showSettings) => set({ showSettings }),
+      setSettingsSection: (settingsSection) => set({ settingsSection }),
       // 纵向分栏比例：夹取到 [MIN, MAX]；非有限数忽略（守住边界，与 simBalance 同模式）。
       setChartSplitRatio: (n) =>
         set((s) =>
@@ -250,7 +261,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 8,
+      version: 9,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -272,6 +283,8 @@ export const useAppStore = create<AppState>()(
         chartSplitRatio: s.chartSplitRatio,
         rightTab: s.rightTab,
         agentConversationId: s.agentConversationId,
+        // 持久化当前设置项；showSettings 为瞬态故**不**入 partialize（刷新默认回工作台，R-Migrate）。
+        settingsSection: s.settingsSection,
       }),
       // 逐版补默认态（即便缺省 zustand 浅合并也回落初值，migrate 仅为显式稳妥，R7/R11）。
       migrate: (persisted, version) => {
@@ -296,6 +309,9 @@ export const useAppStore = create<AppState>()(
         }
         if (version < 8) {
           next = { ...next, rightTab: "agent", agentConversationId: "" };
+        }
+        if (version < 9) {
+          next = { ...next, settingsSection: "ai-models" };
         }
         return next as never;
       },

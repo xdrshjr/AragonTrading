@@ -56,6 +56,61 @@ export function Card({ className, children, ...props }: React.HTMLAttributes<HTM
   );
 }
 
+/** 文本 / 密码输入原子组件（设置中心表单用）：复用设计 token，自动适配明暗主题。 */
+export function Input({
+  className,
+  invalid,
+  ...props
+}: React.InputHTMLAttributes<HTMLInputElement> & { invalid?: boolean }) {
+  return (
+    <input
+      className={clsx(
+        "w-full rounded-[10px] border bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]",
+        "placeholder:text-[var(--muted)] outline-none transition-colors duration-150 ease-smooth",
+        "disabled:opacity-50 disabled:cursor-not-allowed",
+        invalid
+          ? "border-[var(--short)] focus:border-[var(--short)]"
+          : "border-[var(--border)] hover:border-[var(--accent)] focus:border-[var(--accent)]",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+/** 表单字段包裹：label + 控件（children）+ 错误 / 提示文案，统一垂直节奏。 */
+export function Field({
+  label,
+  htmlFor,
+  error,
+  hint,
+  className,
+  children,
+}: {
+  label?: string;
+  htmlFor?: string;
+  error?: string;
+  hint?: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className={clsx("flex flex-col gap-1.5", className)}>
+      {label && (
+        <label htmlFor={htmlFor} className="text-xs font-medium text-[var(--muted)]">
+          {label}
+        </label>
+      )}
+      {children}
+      {error ? (
+        <span className="text-[11px] text-[var(--short)]">{error}</span>
+      ) : hint ? (
+        <span className="text-[11px] leading-relaxed text-[var(--muted)]">{hint}</span>
+      ) : null}
+    </div>
+  );
+}
+
 export function Badge({
   tone = "neutral",
   className,

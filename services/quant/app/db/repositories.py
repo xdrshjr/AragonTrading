@@ -5,13 +5,23 @@
 from __future__ import annotations
 
 import json
+import uuid
+from dataclasses import dataclass
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..engine.simulator import EquityRecord, TradeRecord
 from ..strategies import STRATEGY_REGISTRY
-from .models import AgentMessage, CandleCache, EquityPoint, Strategy, StrategyRun, Trade
+from .models import (
+    AgentMessage,
+    AgentProvider,
+    CandleCache,
+    EquityPoint,
+    Strategy,
+    StrategyRun,
+    Trade,
+)
 
 
 # ============================ Strategies ============================
@@ -238,3 +248,140 @@ async def clear_agent_messages(session: AsyncSession, conversation_id: str) -> i
     result = await session.execute(stmt)
     await session.commit()
     return result.rowcount or 0
+
+
+# ============================ Agent providers（设置中心 · AI 模型服务） ============================
+@dataclass(frozen=True)
+class ProviderValues:
+    """新增服务商的可写字段集合（聚合传参，避免位置参数堆叠）。"""
+
+    label: str
+    api_standard: str
+    base_url: str
+    api_key: str
+    model: str
+    user_agent: str
+
+
+@dataclass(frozen=True)
+class ProviderPatch:
+    """编辑服务商的部分字段（None = 不改；`api_key` 空/None = 保留原 key，前端不持有明文）。"""
+
+    label: str | None = None
+    api_standard: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+    user_agent: str | None = None
+
+
+async def list_agent_providers(session: AsyncSession) -> list[AgentProvider]:
+    """全量服务商，官方在前、同类按 id 升序（展示顺序稳定）。"""
+    stmt = select(AgentProvider).order_by(
+        (AgentProvider.kind == "custom"), AgentProvider.id.asc())
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def get_agent_provider(session: AsyncSession, provider_id: int) -> AgentProvider | None:
+    return await session.get(AgentProvider, provider_id)
+
+
+async def get_agent_provider_by_slug(session: AsyncSession, slug: str) -> AgentProvider | None:
+    stmt = select(AgentProvider).where(AgentProvider.slug == slug)
+    return (await session.execute(stmt)).scalars().first()
+
+
+async def get_default_agent_provider(session: AsyncSession) -> AgentProvider | None:
+    stmt = select(AgentProvider).where(AgentProvider.is_default == True)  # noqa: E712
+    return (await session.execute(stmt)).scalars().first()
+
+
+async def create_agent_provider(session: AsyncSession, *, kind: str, values: ProviderValues,
+                                slug: str | None = None,
+                                is_default: bool = False) -> AgentProvider:
+    """新增服务商（自定义默认 `kind="custom"` + 随机 slug）。"""
+    row = AgentProvider(
+        slug=slug or uuid.uuid4().hex,
+        kind=kind,
+        label=values.label,
+        api_standard=values.api_standard,
+        base_url=values.base_url,
+        api_key=values.api_key or "",
+        model=values.model,
+        user_agent=values.user_agent or "claude-code/1.0",
+        is_default=is_default,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def update_agent_provider(session: AsyncSession, provider_id: int, *,
+                                patch: ProviderPatch) -> AgentProvider | None:
+    """编辑服务商；官方项锁定 `slug/kind/api_standard`，`api_key` 空则保留原值。"""
+    row = await session.get(AgentProvider, provider_id)
+    if row is None:
+        return None
+    if patch.label is not None:
+        row.label = patch.label
+    if patch.base_url is not None:
+        row.base_url = patch.base_url
+    if patch.model is not None:
+        row.model = patch.model
+    if patch.user_agent is not None:
+        row.user_agent = patch.user_agent
+    if patch.api_key:  # 非空才更新（空/None = 保留原 key，R-Sec）
+        row.api_key = patch.api_key
+    if patch.api_standard is not None and row.kind == "custom":  # 官方项标准锁定
+        row.api_standard = patch.api_standard
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def delete_agent_provider(session: AsyncSession, provider_id: int) -> str:
+    """返回 'ok' | 'not_found' | 'not_deletable'（官方项不可删）。删默认后自动回落（P2-Fallback）。"""
+    row = await session.get(AgentProvider, provider_id)
+    if row is None:
+        return "not_found"
+    if row.kind != "custom":
+        return "not_deletable"
+    was_default = bool(row.is_default)
+    await session.delete(row)
+    await session.commit()
+    if was_default:
+        await _reassign_default_after_delete(session)
+    return "ok"
+
+
+async def set_default_agent_provider(session: AsyncSession, provider_id: int) -> bool:
+    """事务内清其余 `is_default` 再置本行，杜绝多默认（R-Default）。不存在返回 False。
+
+    用 ORM 逐行置位（至多一行原默认）而非批量 UPDATE：批量 UPDATE + `expire_on_commit=False`
+    会令同 session 内已加载对象的 `is_default` 滞留旧值，导致 set 后立即重查仍读到脏值。
+    """
+    target = await session.get(AgentProvider, provider_id)
+    if target is None:
+        return False
+    stmt = select(AgentProvider).where(AgentProvider.is_default == True)  # noqa: E712
+    for row in (await session.execute(stmt)).scalars().all():
+        row.is_default = False
+    target.is_default = True
+    await session.commit()
+    return True
+
+
+async def _reassign_default_after_delete(session: AsyncSession) -> None:
+    """删默认后选「含 key 且 id 最小」的行为新默认（确定可复现）；无含 key 行则不设默认。"""
+    stmt = (select(AgentProvider)
+            .where(AgentProvider.api_key != "")  # noqa: E711
+            .order_by(AgentProvider.id.asc()).limit(1))
+    row = (await session.execute(stmt)).scalars().first()
+    if row is not None:
+        await set_default_agent_provider(session, row.id)
+
+
+async def count_agent_providers(session: AsyncSession) -> int:
+    rows = (await session.execute(select(AgentProvider.id))).all()
+    return len(rows)

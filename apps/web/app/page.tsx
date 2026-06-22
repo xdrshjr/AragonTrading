@@ -9,6 +9,8 @@ import AppMenu from "@/components/Desktop/AppMenu";
 import WindowControls from "@/components/Desktop/WindowControls";
 import AccountModeSwitch from "@/components/Header/AccountModeSwitch";
 import RightPanel from "@/components/RightPanel/RightPanel";
+import SettingsGearButton from "@/components/Settings/SettingsGearButton";
+import SettingsPanel from "@/components/Settings/SettingsPanel";
 import { Button } from "@/components/ui";
 import { api } from "@/lib/api";
 import { getDesktopPlatform, getWindowControls } from "@/lib/desktop";
@@ -65,6 +67,7 @@ export default function Page() {
     backtestStartTs,
     backtestEndTs,
     indicators,
+    showSettings,
     setChartView,
     setPaperActiveStrategyId,
     setPaperVisibleStrategyIds,
@@ -438,52 +441,59 @@ export default function Page() {
           <Button variant="ghost" size="sm" onClick={toggleTheme} aria-label="切换主题">
             {theme === "light" ? "暗色" : "亮色"}
           </Button>
+          <SettingsGearButton />
           <WindowControls />
         </div>
       </header>
 
-      <main className="no-drag grid flex-1 grid-cols-[minmax(0,1fr)_380px] overflow-hidden">
-        <ChartWorkspace
-          candles={candles}
-          overlayEquity={overlayEquity}
-          overlays={overlays}
-          overlayTrades={overlayTrades}
-          bottomTrades={bottomTrades}
-          tradeCapReached={tradeCapReached}
-          indicators={indicators}
-          theme={theme}
-          lastPrice={streamMarket ? lastPrice : null}
-          market={market}
-          dataSource={dataSource}
-          chartLoading={(runQ.isFetching || candlesQ.isFetching) && candles.length === 0}
-          chartError={chartError}
-          onLoadMore={loadMore}
-          jumpToTs={jumpToTs}
-          paperStrategies={paperStrategies}
-          activePaperStrategyId={effectiveActivePaperStrategyId}
-          visiblePaperStrategyIds={effectiveVisibleIds}
-          onActivePaperStrategyChange={setPaperActiveStrategyId}
-          onToggleVisiblePaperStrategy={togglePaperVisibleStrategyId}
-          paperPositionsByStrategyId={paperPositionsByStrategyId}
-          paperEquityByStrategyId={paperEquityByStrategyId}
-          paperTradesByStrategyId={paperTradesByStrategyId}
-          toolbar={{
-            okxUp,
-            latencyMs,
-            lastOkTs,
-            liveWsOpen: streamMarket ? liveWsOpen : undefined,
-            lastPrice: streamMarket ? lastPrice : undefined,
-            chartView,
-            rangeAvailable,
-            onChartViewChange: setChartView,
-            onJumpDate: setJumpToTs,
-          }}
-        />
+      {showSettings ? (
+        <main className="no-drag min-h-0 flex-1 overflow-hidden">
+          <SettingsPanel />
+        </main>
+      ) : (
+        <main className="no-drag grid flex-1 grid-cols-[minmax(0,1fr)_380px] overflow-hidden">
+          <ChartWorkspace
+            candles={candles}
+            overlayEquity={overlayEquity}
+            overlays={overlays}
+            overlayTrades={overlayTrades}
+            bottomTrades={bottomTrades}
+            tradeCapReached={tradeCapReached}
+            indicators={indicators}
+            theme={theme}
+            lastPrice={streamMarket ? lastPrice : null}
+            market={market}
+            dataSource={dataSource}
+            chartLoading={(runQ.isFetching || candlesQ.isFetching) && candles.length === 0}
+            chartError={chartError}
+            onLoadMore={loadMore}
+            jumpToTs={jumpToTs}
+            paperStrategies={paperStrategies}
+            activePaperStrategyId={effectiveActivePaperStrategyId}
+            visiblePaperStrategyIds={effectiveVisibleIds}
+            onActivePaperStrategyChange={setPaperActiveStrategyId}
+            onToggleVisiblePaperStrategy={togglePaperVisibleStrategyId}
+            paperPositionsByStrategyId={paperPositionsByStrategyId}
+            paperEquityByStrategyId={paperEquityByStrategyId}
+            paperTradesByStrategyId={paperTradesByStrategyId}
+            toolbar={{
+              okxUp,
+              latencyMs,
+              lastOkTs,
+              liveWsOpen: streamMarket ? liveWsOpen : undefined,
+              lastPrice: streamMarket ? lastPrice : undefined,
+              chartView,
+              rangeAvailable,
+              onChartViewChange: setChartView,
+              onJumpDate: setJumpToTs,
+            }}
+          />
 
-        <aside className="min-h-[300px] overflow-hidden bg-[var(--surface)]/40">
-          <RightPanel />
-        </aside>
-      </main>
+          <aside className="min-h-[300px] overflow-hidden bg-[var(--surface)]/40">
+            <RightPanel />
+          </aside>
+        </main>
+      )}
     </div>
   );
 }

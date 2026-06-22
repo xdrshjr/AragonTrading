@@ -1,6 +1,12 @@
 // Agent REST 客户端（经 /api/py/* 代理 → 后端 /api/agent/*）。绝不携带 / 返回密钥（R3）。
 import { ApiRequestError } from "./api";
-import type { AgentMessage } from "./agentTypes";
+import type {
+  AgentMessage,
+  AgentProvider,
+  ProviderDraft,
+  ProviderTestResult,
+  ProvidersListResponse,
+} from "./agentTypes";
 
 const BASE = "/api/py";
 
@@ -45,4 +51,32 @@ export const agentApi = {
     request<void>(`/agent/conversations/${encodeURIComponent(conversationId)}`, {
       method: "DELETE",
     }),
+
+  // AI 模型服务商管理（设置中心）。请求体仅 camelCase，apiKey 留空 = 保留原 key（R-Sec）。
+  providers: {
+    list: () => request<ProvidersListResponse>("/agent/providers"),
+    create: (draft: ProviderDraft) =>
+      request<AgentProvider>("/agent/providers", {
+        method: "POST",
+        body: JSON.stringify(draft),
+      }),
+    update: (id: number, draft: Partial<ProviderDraft>) =>
+      request<AgentProvider>(`/agent/providers/${id}`, {
+        method: "PUT",
+        body: JSON.stringify(draft),
+      }),
+    remove: (id: number) =>
+      request<void>(`/agent/providers/${id}`, { method: "DELETE" }),
+    setDefault: (id: number) =>
+      request<ProvidersListResponse>(`/agent/providers/${id}/default`, { method: "POST" }),
+    // 测存量服务连通性（用库内 key）。
+    test: (id: number) =>
+      request<ProviderTestResult>(`/agent/providers/${id}/test`, { method: "POST" }),
+    // 测草稿连通性（首存前；须带显式 apiKey）。
+    testDraft: (draft: ProviderDraft) =>
+      request<ProviderTestResult>("/agent/providers/test", {
+        method: "POST",
+        body: JSON.stringify(draft),
+      }),
+  },
 };

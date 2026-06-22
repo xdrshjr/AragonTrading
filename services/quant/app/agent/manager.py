@@ -17,8 +17,9 @@ from ..db import repositories as repo
 from ..db.session import get_sessionmaker
 from .conversation import row_to_client_dict
 from .llm.base import LLMClient
-from .llm.factory import make_llm_client
+from .llm.factory import make_llm_client, make_llm_client_from_config
 from .loop import AgentSession
+from .providers import resolve_active_provider
 from .tools.registry import ToolRegistry
 
 logger = logging.getLogger("aragon.agent.manager")
@@ -60,7 +61,8 @@ class AgentManager:
                  session_factory: Callable | None = None):
         self._settings = settings or get_settings()
         self._registry = registry or ToolRegistry()
-        self._llm = llm
+        self._llm = llm                       # 注入的测试桩（生产为 None，绝不自动赋值）
+        self._env_client: LLMClient | None = None   # 懒建 env 回落 client（与注入桩分离）
         self._session_factory = session_factory
         self._sessions: dict[str, AgentSession] = {}
         # 会话注册表并发锁（H3）：保证每 convId 唯一会话，杜绝多连接脑裂。
@@ -72,16 +74,39 @@ class AgentManager:
         return self._session_factory or get_sessionmaker()
 
     def _client(self) -> LLMClient:
-        if self._llm is None:
-            self._llm = make_llm_client(self._settings)
-        return self._llm
+        """会话构造期的初始 client（注入桩优先，否则懒建 env 回落 client）。
 
-    def configured(self) -> bool:
-        return bool(self._settings.agent_api_key)
+        生产路径每轮 `run()` 会以解析出的当前默认服务**重新绑定** `self._llm`，故初始 client 仅占位。
+        """
+        if self._llm is not None:
+            return self._llm
+        if self._env_client is None:
+            self._env_client = make_llm_client(self._settings)
+        return self._env_client
 
-    def config_info(self) -> dict:
-        return {"provider": self._settings.agent_provider, "model": self._settings.agent_model,
-                "configured": self.configured()}
+    async def _resolve_client(self) -> LLMClient | None:
+        """解析当前生效服务的 client；未配置返回 None（handle 据此回 AGENT_NOT_CONFIGURED）。
+
+        注入桩路径（测试）配置判定回落 `settings.agent_api_key`（保持既有 env-only 测试语义），
+        由桩控制 LLM 行为；生产路径走 DB 默认 → env → None 三级回落（每轮解析，毫秒级）。
+        """
+        if self._llm is not None:
+            return self._llm if bool(self._settings.agent_api_key) else None
+        cfg = await resolve_active_provider(self._factory(), self._settings)
+        return make_llm_client_from_config(cfg) if cfg is not None else None
+
+    async def active_config(self) -> dict:
+        """当前生效服务摘要（WS ready / REST /agent/config 共用）；绝不返回 key（R3）。"""
+        if self._llm is not None:
+            return {"configured": bool(self._settings.agent_api_key),
+                    "provider": self._settings.agent_provider, "model": self._settings.agent_model,
+                    "providerId": None, "label": ""}
+        cfg = await resolve_active_provider(self._factory(), self._settings)
+        if cfg is None:
+            return {"configured": False, "provider": self._settings.agent_provider,
+                    "model": self._settings.agent_model, "providerId": None, "label": ""}
+        return {"configured": True, "provider": cfg.api_standard, "model": cfg.model,
+                "providerId": cfg.provider_id, "label": cfg.label}
 
     async def get_or_create(self, conversation_id: str) -> AgentSession:
         """取或建会话：临界区加锁，确保同 convId 跨连接复用同一 AgentSession（H3，无脑裂）。"""
@@ -183,17 +208,18 @@ class AgentManager:
             logger.debug("agent run task ended with error during drain", exc_info=True)
 
     async def handle(self, conversation_id: str, user_text: str, ui: dict | None) -> None:
-        """启动一轮 run：在会话上起持有式后台 task（跨连接存活，RS-2）；未配置即经 sink 回报。"""
+        """启动一轮 run：解析当前默认服务、把 client 传入 run（过 BUSY 守卫后才绑定，P1-Race）。"""
         sess = await self.get_or_create(conversation_id)
-        if not self.configured():
+        client = await self._resolve_client()
+        if client is None:
             await sess.notify(_error(
                 "AGENT_NOT_CONFIGURED",
-                "未配置模型密钥（AGENT_API_KEY）。请在 .env / userData/agent.env 填写后重试。"))
+                "未配置模型密钥。请在设置中心填写并选择一个默认 AI 模型服务后重试。"))
             return
         if not sess.loaded:
             await sess.load_from_db()
         user_text = self._guard_user_text(user_text, conversation_id)
-        task = asyncio.create_task(sess.run(user_text, ui))
+        task = asyncio.create_task(sess.run(user_text, ui, client=client))
         sess.bind_run_task(task)
         task.add_done_callback(_retrieve_run_exception)
 

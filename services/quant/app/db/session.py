@@ -48,11 +48,12 @@ async def get_session() -> AsyncIterator[AsyncSession]:
 
 
 async def init_db() -> None:
-    """建表 + seed 内置策略（幂等）。"""
+    """建表 + seed 内置策略 + seed AI 模型服务商（均幂等）。"""
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await _seed_builtin_strategies()
+    await _seed_agent_providers()
 
 
 async def _seed_builtin_strategies() -> None:
@@ -74,6 +75,38 @@ async def _seed_builtin_strategies() -> None:
                 builtin=True,
             ))
         await session.commit()
+
+
+async def _seed_agent_providers() -> None:
+    """仅空表时种入官方预置（openai/anthropic/gemini，空 key）+ `.env` KIMI 默认服务（幂等）。
+
+    非空即跳过（保护用户在 UI 的增删改；桌面端每次启动注入 env 也不覆盖，R-Seed）。
+    """
+    # 延迟导入避免 db 模块层与 agent 层的循环依赖（db 不应在加载期依赖 agent）。
+    from ..agent.providers import OFFICIAL_PRESETS
+    from . import repositories as repo
+
+    settings = get_settings()
+    sm = get_sessionmaker()
+    async with sm() as session:
+        if await repo.count_agent_providers(session) > 0:
+            return
+        for preset in OFFICIAL_PRESETS:
+            await repo.create_agent_provider(
+                session, kind="official", slug=preset.slug,
+                values=repo.ProviderValues(
+                    label=preset.label, api_standard=preset.api_standard,
+                    base_url=preset.base_url, api_key="", model=preset.model,
+                    user_agent=preset.user_agent))
+        # KIMI：.env 默认服务，自动种入并设为默认服务（任务要求；缺 key 时仍为默认，UI 引导补 key）。
+        await repo.create_agent_provider(
+            session, kind="official", slug="kimi",
+            values=repo.ProviderValues(
+                label="Kimi（内置默认）",
+                api_standard=(settings.agent_provider or "anthropic").strip().lower(),
+                base_url=settings.agent_base_url, api_key=settings.agent_api_key,
+                model=settings.agent_model, user_agent=settings.agent_user_agent),
+            is_default=True)
 
 
 async def dispose_engine() -> None:

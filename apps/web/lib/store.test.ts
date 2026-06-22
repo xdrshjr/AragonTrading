@@ -123,3 +123,42 @@ describe("app store — watchlist & instrument sidebar tab", () => {
     expect(s.instId).toBe("SOL-USDT-SWAP");
   });
 });
+
+describe("app store — settings center (v9)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    // store 为模块单例：重置瞬态 showSettings，避免跨用例残留。
+    useAppStore.setState({ showSettings: false });
+  });
+
+  it("setShowSettings toggles transient flag without persisting it", () => {
+    useAppStore.getState().setShowSettings(true);
+    expect(useAppStore.getState().showSettings).toBe(true);
+    const raw = localStorage.getItem("aragon-ui");
+    expect(raw).toBeTruthy();
+    // showSettings 为瞬态：绝不写入 localStorage（刷新回工作台）。
+    expect(raw).not.toContain("showSettings");
+  });
+
+  it("persists settingsSection", () => {
+    useAppStore.getState().setSettingsSection("ai-models");
+    const persisted = JSON.parse(localStorage.getItem("aragon-ui") as string);
+    expect(persisted.state.settingsSection).toBe("ai-models");
+    expect(persisted.state.showSettings).toBeUndefined();
+  });
+
+  it("migrates v8 persisted state to v9 with default settingsSection", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({
+        state: { instId: "ETH-USDT-SWAP", rightTab: "agent" },
+        version: 8,
+      }),
+    );
+    await useAppStore.persist.rehydrate();
+    const s = useAppStore.getState();
+    expect(s.settingsSection).toBe("ai-models");
+    expect(s.showSettings).toBe(false); // 瞬态默认值，不来自持久化
+    expect(s.instId).toBe("ETH-USDT-SWAP");
+  });
+});

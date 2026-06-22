@@ -78,7 +78,10 @@ class AnthropicClient:
 
     async def stream(self, *, system: str, messages: list[LlmMessage],
                      tools: list[ToolSchema]) -> AsyncIterator[StreamEvent]:
-        url = f"{self._base_url}/v1/messages"
+        # 整端点直通（P1-URL，对称 openai）：base_url 以 /messages 结尾即原样 POST；
+        # 否则把根 URL（KIMI …/coding、anthropic 根）追加 /v1/messages（根 URL 行为零变化）。
+        base = self._base_url
+        url = base if base.endswith("/messages") else f"{base}/v1/messages"
         body = self._body(system, messages, tools)
         # pre-stream 有界重试：429/5xx/网络瞬断退避重试；401/403→AGENT_AUTH_ERROR；
         # 一旦开始产出 SSE 即不再重试（防重复输出，R1）。

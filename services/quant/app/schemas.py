@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from .db.models import EquityPoint, StrategyRun, Trade
+from .db.models import AgentProvider, EquityPoint, StrategyRun, Trade
 from .engine.metrics import _empty_metrics
 
 
@@ -141,11 +141,91 @@ def run_out(run: StrategyRun) -> dict:
 
 
 class AgentConfigOut(BaseModel):
-    """GET /agent/config 响应：是否已配置密钥 + 当前 provider/model（绝不含 key，R3）。"""
+    """GET /agent/config 响应：是否已配置密钥 + 当前生效服务（绝不含 key，R3）。"""
 
     configured: bool
     provider: str
     model: str
+    providerId: int | None = None      # 当前默认服务库内 id（env 回落 / 未配置为 None）
+    label: str = ""                    # 当前默认服务展示名（追加字段，向后兼容）
+
+
+# ---------------- AI 模型服务商（设置中心） ----------------
+def _key_preview(api_key: str) -> str:
+    """密钥脱敏预览：仅末 4 位，前缀点号；无 key 返回空串（绝不外泄明文，R-Sec）。"""
+    key = (api_key or "").strip()
+    return f"····{key[-4:]}" if key else ""
+
+
+def provider_out(row: AgentProvider) -> dict:
+    """AgentProvider 行 → 前端 dict（camelCase）。**绝不含 raw key**，仅 hasKey/keyPreview。"""
+    has_key = bool((row.api_key or "").strip())
+    return {
+        "id": row.id, "slug": row.slug, "kind": row.kind, "label": row.label,
+        "apiStandard": row.api_standard, "baseUrl": row.base_url, "model": row.model,
+        "userAgent": row.user_agent, "hasKey": has_key, "keyPreview": _key_preview(row.api_key),
+        "isDefault": bool(row.is_default), "deletable": row.kind == "custom",
+        "createdTs": int(row.created_at.timestamp()) if row.created_at else 0,
+        "updatedTs": int(row.updated_at.timestamp()) if row.updated_at else 0,
+    }
+
+
+class AgentProviderIn(BaseModel):
+    """POST /agent/providers：新增自定义服务（kind 固定 custom）。"""
+
+    label: str = Field(min_length=1)
+    apiStandard: Literal["anthropic", "openai"]
+    baseUrl: str = Field(min_length=1)
+    apiKey: str = ""
+    model: str = Field(min_length=1)
+    userAgent: str | None = None
+
+
+class AgentProviderUpdate(BaseModel):
+    """PUT /agent/providers/{id}：编辑（apiKey 缺/空 = 保留原 key；官方项锁 slug/kind/标准）。"""
+
+    label: str | None = None
+    apiStandard: Literal["anthropic", "openai"] | None = None
+    baseUrl: str | None = None
+    apiKey: str | None = None
+    model: str | None = None
+    userAgent: str | None = None
+
+
+class ProviderTestReq(BaseModel):
+    """POST /agent/providers/test：测草稿连通性（首存前，须带显式 apiKey）。"""
+
+    apiStandard: Literal["anthropic", "openai"]
+    baseUrl: str = Field(min_length=1)
+    apiKey: str = ""
+    model: str = Field(min_length=1)
+    userAgent: str | None = None
+
+
+class ProviderTestResult(BaseModel):
+    """连通性测试结果：ok + 时延 / 错误码（code: AGENT_AUTH_ERROR|CONNECTION_FAILED|…）。"""
+
+    ok: bool
+    latencyMs: float | None = None
+    model: str | None = None
+    code: str | None = None
+    message: str | None = None
+
+
+class ProviderActiveOut(BaseModel):
+    configured: bool
+    providerId: int | None = None
+    label: str = ""
+    provider: str
+    model: str
+
+
+class ProvidersListOut(BaseModel):
+    """GET /agent/providers：全量服务商（脱敏）+ 当前默认 id + 解析后的当前生效服务摘要。"""
+
+    providers: list[dict]
+    defaultId: int | None = None
+    active: ProviderActiveOut
 
 
 class ErrorBody(BaseModel):
