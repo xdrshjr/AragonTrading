@@ -56,7 +56,8 @@ export function Card({ className, children, ...props }: React.HTMLAttributes<HTM
   );
 }
 
-/** 文本 / 密码输入原子组件（设置中心表单用）：复用设计 token，自动适配明暗主题。 */
+/** 文本 / 密码输入原子组件（设置中心表单用）：复用设计 token，自动适配明暗主题。
+ * `invalid` 同步 `aria-invalid` 供读屏识别；`aria-describedby` 由调用方透传以串联错误说明（H6）。 */
 export function Input({
   className,
   invalid,
@@ -64,6 +65,7 @@ export function Input({
 }: React.InputHTMLAttributes<HTMLInputElement> & { invalid?: boolean }) {
   return (
     <input
+      aria-invalid={invalid || undefined}
       className={clsx(
         "w-full rounded-[10px] border bg-[var(--surface)] px-3 py-2 text-sm text-[var(--text)]",
         "placeholder:text-[var(--muted)] outline-none transition-colors duration-150 ease-smooth",
@@ -94,6 +96,8 @@ export function Field({
   className?: string;
   children: React.ReactNode;
 }) {
+  // 错误 span 生成稳定 id（`${htmlFor}-err`），供调用方串到对应 Input 的 aria-describedby（H6）。
+  const errorId = htmlFor ? `${htmlFor}-err` : undefined;
   return (
     <div className={clsx("flex flex-col gap-1.5", className)}>
       {label && (
@@ -103,7 +107,7 @@ export function Field({
       )}
       {children}
       {error ? (
-        <span className="text-[11px] text-[var(--short)]">{error}</span>
+        <span id={errorId} className="text-[11px] text-[var(--short)]">{error}</span>
       ) : hint ? (
         <span className="text-[11px] leading-relaxed text-[var(--muted)]">{hint}</span>
       ) : null}

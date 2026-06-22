@@ -12,7 +12,8 @@ const CODE_HINT: Record<string, string> = {
   LLM_NETWORK_ERROR: "网络错误",
 };
 
-/** 连通性结果行：loading（转圈）/ ✓ 连通+时延 / ✗ 错误码+消息（hover 看详情）。 */
+/** 连通性结果行：loading（转圈）/ ✓ 连通+时延 / ✗ 错误码+消息（hover 看详情）。
+ * 根容器 role="status" aria-live="polite"，使状态变化对读屏用户即时朗读（H6）。 */
 export default function ConnectivityResult({
   loading,
   result,
@@ -20,6 +21,14 @@ export default function ConnectivityResult({
   loading: boolean;
   result: ProviderTestResult | null;
 }) {
+  return (
+    <span role="status" aria-live="polite" className="inline-flex items-center">
+      {renderState(loading, result)}
+    </span>
+  );
+}
+
+function renderState(loading: boolean, result: ProviderTestResult | null) {
   if (loading) {
     return (
       <span className="inline-flex items-center gap-1.5 text-xs text-[var(--muted)]">

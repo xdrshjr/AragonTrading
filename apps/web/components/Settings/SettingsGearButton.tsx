@@ -14,6 +14,7 @@ export default function SettingsGearButton() {
   return (
     <button
       type="button"
+      id="settings-gear"
       onClick={() => setShowSettings(!showSettings)}
       aria-label="设置"
       aria-pressed={showSettings}

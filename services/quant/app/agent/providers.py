@@ -119,11 +119,14 @@ def config_from_row(row: AgentProvider, settings: Settings) -> LlmProviderConfig
 
 
 async def resolve_active_provider(session_factory, settings: Settings) -> LlmProviderConfig | None:
-    """三级回落解析当前生效服务：库内默认（含 key）→ env → None（未配置）。"""
+    """显式默认权威解析：含 key 即生效；缺 key 视为「未配置」(引导补 key)，不静默回退 env。
+    仅当「全无任何默认行」时才回落 env（纯 env 部署 / 删默认无含 key 行的兜底，H1）。"""
     async with session_factory() as session:
         row = await repo.get_default_agent_provider(session)
-    if row is not None and (row.api_key or "").strip():
-        return config_from_row(row, settings)
+    if row is not None:
+        if (row.api_key or "").strip():
+            return config_from_row(row, settings)
+        return None                      # 缺 key 的显式默认不再回退 env：交由 UI 引导补 key
     if (settings.agent_api_key or "").strip():
         return provider_config_from_settings(settings)
     return None
@@ -133,24 +136,45 @@ def _is_http_url(url: str) -> bool:
     return url.strip().lower().startswith(("http://", "https://"))
 
 
+def _redact(text: str, secret: str) -> str:
+    """把可能出现在错误文本中的密钥子串替换为脱敏占位（纵深防御，C7）。
+    仅当密钥长度 ≥6 才替换，避免短串误伤无关文本。"""
+    s = (secret or "").strip()
+    if s and len(s) >= 6:
+        text = text.replace(s, "····")
+    return text
+
+
+def _fail(code: str, message: str, api_key: str) -> dict:
+    """探测失败统一收口：错误文本一律先脱敏再截断（C7 单点 redaction，杜绝散落遗漏）。"""
+    return {"ok": False, "code": code, "message": _redact(message, api_key)[:200]}
+
+
 async def probe_provider(cfg: LlmProviderConfig) -> dict:
-    """连通性测试：先边界校验（空 key / 非法 url）避免无谓往返，再发一次极小请求（C5）。"""
+    """连通性测试：先边界校验（空 key / 非法 url）避免无谓往返，再发一次极小请求（C5）。
+
+    所有 ``ok is False`` 的对外 message 统一经 ``_redact`` 脱敏（H2）；密钥的真实对外
+    暴露面是本函数返回的 message（流向前端 API 响应），故在此单点收口。该路径当前不写
+    日志；若未来在此新增任何 logger 调用，须同样复用 ``_redact``。
+    """
     if not (cfg.api_key or "").strip():
         return {"ok": False, "code": "AGENT_NOT_CONFIGURED", "message": "未填写密钥"}
     if not _is_http_url(cfg.base_url):
         return {"ok": False, "code": "INVALID_BASE_URL",
                 "message": "APIURL 需以 http:// 或 https:// 开头"}
-    probe_cfg = replace(cfg, max_tokens=min(cfg.max_tokens, _PROBE_MAX_TOKENS))
-    client = make_llm_client_from_config(probe_cfg)
     timeout = min(cfg.timeout or _PROBE_TIMEOUT_CAP, _PROBE_TIMEOUT_CAP)
     started = time.perf_counter()
     try:
-        return await asyncio.wait_for(_consume_probe(client, cfg.model, started), timeout=timeout)
+        probe_cfg = replace(cfg, max_tokens=min(cfg.max_tokens, _PROBE_MAX_TOKENS))
+        client = make_llm_client_from_config(probe_cfg)   # H4：构造纳入兜底，异常不裸抛
+        result = await asyncio.wait_for(_consume_probe(client, cfg.model, started), timeout=timeout)
     except asyncio.TimeoutError:
-        return {"ok": False, "code": "CONNECTION_FAILED",
-                "message": f"连通性测试超时（>{int(timeout)}s）"}
+        return _fail("CONNECTION_FAILED", f"连通性测试超时（>{int(timeout)}s）", cfg.api_key)
     except Exception as exc:  # noqa: BLE001 —— 探测边界：任何异常归一为连接失败，绝不裸抛 / 不记 key
-        return {"ok": False, "code": "CONNECTION_FAILED", "message": str(exc)[:200]}
+        return _fail("CONNECTION_FAILED", str(exc), cfg.api_key)
+    if not result.get("ok"):              # _consume_probe 的 error 事件文本末次收口（②）
+        result["message"] = _redact(result.get("message", ""), cfg.api_key)[:200]
+    return result
 
 
 async def _consume_probe(client, model: str, started: float) -> dict:

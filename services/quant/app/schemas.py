@@ -171,35 +171,42 @@ def provider_out(row: AgentProvider) -> dict:
 
 
 class AgentProviderIn(BaseModel):
-    """POST /agent/providers：新增自定义服务（kind 固定 custom）。"""
+    """POST /agent/providers：新增自定义服务（kind 固定 custom）。
 
-    label: str = Field(min_length=1)
+    写入字段补 max_length（SQLite 不强制 VARCHAR 长度，须在边界一次性校验，C5/H3）。
+    """
+
+    label: str = Field(min_length=1, max_length=128)
     apiStandard: Literal["anthropic", "openai"]
-    baseUrl: str = Field(min_length=1)
-    apiKey: str = ""
-    model: str = Field(min_length=1)
-    userAgent: str | None = None
+    baseUrl: str = Field(min_length=1, max_length=512)
+    apiKey: str = Field(default="", max_length=512)
+    model: str = Field(min_length=1, max_length=128)
+    userAgent: str | None = Field(default=None, max_length=128)
 
 
 class AgentProviderUpdate(BaseModel):
-    """PUT /agent/providers/{id}：编辑（apiKey 缺/空 = 保留原 key；官方项锁 slug/kind/标准）。"""
+    """PUT /agent/providers/{id}：编辑（apiKey 缺/空 = 保留原 key；官方项锁 slug/kind/标准）。
 
-    label: str | None = None
+    可空字段「缺省=不改」语义不变（None 不触发 min_length）；但「显式给出」时校验非空 +
+    上限——堵住 PUT 把 label/model 置空串的隐患（H3）。
+    """
+
+    label: str | None = Field(default=None, min_length=1, max_length=128)
     apiStandard: Literal["anthropic", "openai"] | None = None
-    baseUrl: str | None = None
-    apiKey: str | None = None
-    model: str | None = None
-    userAgent: str | None = None
+    baseUrl: str | None = Field(default=None, min_length=1, max_length=512)
+    apiKey: str | None = Field(default=None, max_length=512)
+    model: str | None = Field(default=None, min_length=1, max_length=128)
+    userAgent: str | None = Field(default=None, max_length=128)
 
 
 class ProviderTestReq(BaseModel):
     """POST /agent/providers/test：测草稿连通性（首存前，须带显式 apiKey）。"""
 
     apiStandard: Literal["anthropic", "openai"]
-    baseUrl: str = Field(min_length=1)
-    apiKey: str = ""
-    model: str = Field(min_length=1)
-    userAgent: str | None = None
+    baseUrl: str = Field(min_length=1, max_length=512)
+    apiKey: str = Field(default="", max_length=512)
+    model: str = Field(min_length=1, max_length=128)
+    userAgent: str | None = Field(default=None, max_length=128)
 
 
 class ProviderTestResult(BaseModel):

@@ -1,7 +1,7 @@
 "use client";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Badge, Button, Skeleton } from "@/components/ui";
 import { agentApi } from "@/lib/agentApi";
 import type { ProviderActive, ProviderDraft, ProviderTestResult } from "@/lib/agentTypes";
@@ -15,13 +15,25 @@ const PROVIDERS_KEY = ["agent", "providers"];
 /** 右侧主面板：当前默认横幅 + 官方组 + 自定义组 + 「添加自定义模型」。 */
 export default function AiModelsSection() {
   const qc = useQueryClient();
-  const { data, isLoading, isError, error } = useQuery({
+  const { data, isLoading, isError, error, refetch } = useQuery({
     queryKey: PROVIDERS_KEY,
     queryFn: agentApi.providers.list,
   });
   const invalidate = () => {
     void qc.invalidateQueries({ queryKey: PROVIDERS_KEY });
   };
+
+  // 区级轻量内联反馈（H9）：新增成功后短暂提示；卸载清理计时器。
+  const [feedback, setFeedback] = useState<string | null>(null);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flash = (msg: string) => {
+    setFeedback(msg);
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setFeedback(null), 1500);
+  };
+  useEffect(() => () => {
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+  }, []);
 
   if (isLoading) {
     return (
@@ -34,8 +46,11 @@ export default function AiModelsSection() {
   }
   if (isError || !data) {
     return (
-      <div className="card p-4 text-sm text-[var(--short)]">
-        加载服务商失败：{(error as Error)?.message || "请稍后重试"}
+      <div className="card flex items-center justify-between gap-3 p-4 text-sm text-[var(--short)]">
+        <span>加载服务商失败：{(error as Error)?.message || "请稍后重试"}</span>
+        <Button variant="ghost" size="sm" onClick={() => void refetch()}>
+          重试
+        </Button>
       </div>
     );
   }
@@ -45,6 +60,11 @@ export default function AiModelsSection() {
   return (
     <div className="flex flex-col gap-5 pb-6">
       <ActiveBanner active={data.active} />
+      {feedback && (
+        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--long)]">
+          {feedback}
+        </p>
+      )}
 
       <Group title="官方模型" desc="OpenAI / Anthropic / Gemini / Kimi（不可删除，可编辑密钥与模型）">
         {official.map((p) => (
@@ -59,7 +79,12 @@ export default function AiModelsSection() {
         {custom.length === 0 && (
           <p className="text-xs text-[var(--muted)]">还没有自定义模型，点击下方按钮添加。</p>
         )}
-        <AddCustom onAdded={invalidate} />
+        <AddCustom
+          onAdded={() => {
+            invalidate();
+            flash("已添加 ✓");
+          }}
+        />
       </Group>
     </div>
   );
@@ -170,7 +195,13 @@ function AddCustom({ onAdded }: { onAdded: () => void }) {
       <div className="flex items-center justify-between gap-2">
         <ConnectivityResult loading={testing} result={testResult} />
         <div className="flex items-center gap-1.5">
-          <Button variant="ghost" size="sm" onClick={test} disabled={busy || testing}>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={test}
+            disabled={testing || busy || !draft.apiKey.trim() || !isDraftValid(draft)}
+            title={!draft.apiKey.trim() ? "请先填写 API Key" : "测试连通性"}
+          >
             测试
           </Button>
           <Button variant="ghost" size="sm" onClick={reset} disabled={busy}>

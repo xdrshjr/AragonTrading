@@ -56,6 +56,41 @@ async def test_probe_exception_maps_to_connection_failed(monkeypatch):
     assert result["ok"] is False and result["code"] == "CONNECTION_FAILED"
 
 
+async def test_probe_exception_message_redacts_key(monkeypatch):
+    """H2：异常文本含密钥时，对外 message 不得出现明文（脱敏单点收口）。"""
+    _patch_client(monkeypatch, _RaisingLLM())  # 抛 "boom k-secret-1234"
+    result = await probe_provider(_cfg(api_key="k-secret-1234"))
+    assert result["ok"] is False
+    assert "k-secret-1234" not in str(result)  # 含 message 在内整体不含明文
+    assert "····" in result["message"]          # 已被脱敏占位替换
+
+
+async def test_probe_error_event_message_redacts_key(monkeypatch):
+    """H2：error 事件 message 含密钥时同样脱敏（②路径经末次收口）。"""
+
+    class _ErrWithKeyLLM:
+        async def stream(self, *, system, messages, tools):
+            yield StreamEvent(kind="error", code="AGENT_AUTH_ERROR",
+                              message="rejected token k-secret-1234")
+
+    _patch_client(monkeypatch, _ErrWithKeyLLM())
+    result = await probe_provider(_cfg(api_key="k-secret-1234"))
+    assert result["ok"] is False and result["code"] == "AGENT_AUTH_ERROR"
+    assert "k-secret-1234" not in str(result)
+
+
+async def test_probe_factory_construction_error_no_500(monkeypatch):
+    """H4：client 构造（factory）抛错也归一 CONNECTION_FAILED，绝不裸抛为 500。"""
+
+    def _raise(cfg):
+        raise ValueError("bad proxy config k-secret-1234")
+
+    monkeypatch.setattr("app.agent.providers.make_llm_client_from_config", _raise)
+    result = await probe_provider(_cfg(api_key="k-secret-1234"))
+    assert result["ok"] is False and result["code"] == "CONNECTION_FAILED"
+    assert "k-secret-1234" not in str(result)  # 构造期异常文本同样脱敏
+
+
 async def test_probe_empty_key_short_circuits_without_network(monkeypatch):
     called = {"n": 0}
 

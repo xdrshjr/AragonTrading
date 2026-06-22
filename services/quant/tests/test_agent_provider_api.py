@@ -150,6 +150,79 @@ async def test_test_endpoint_uses_probe(monkeypatch):
         await dispose_engine()
 
 
+async def test_create_rejects_overlong_label():
+    """H3：超长 label（>128）→ 422（FastAPI 校验体）。"""
+    await _reseed()
+    try:
+        async with await _client() as client:
+            r = await client.post("/api/agent/providers", json={
+                "label": "x" * 200, "apiStandard": "openai",
+                "baseUrl": "https://ok.test", "apiKey": "k", "model": "m"})
+            assert r.status_code == 422, r.text
+    finally:
+        await dispose_engine()
+
+
+async def test_create_rejects_overlong_base_url():
+    """H3：超长 baseUrl（>512）→ 422。"""
+    await _reseed()
+    try:
+        async with await _client() as client:
+            r = await client.post("/api/agent/providers", json={
+                "label": "ok", "apiStandard": "openai",
+                "baseUrl": "https://x.test/" + "a" * 600, "apiKey": "k", "model": "m"})
+            assert r.status_code == 422, r.text
+    finally:
+        await dispose_engine()
+
+
+async def test_put_rejects_explicit_empty_label():
+    """H3：PUT 显式给空 label → 422（缺省=不改语义不变，仅拒显式空串）。"""
+    await _reseed()
+    try:
+        async with await _client() as client:
+            created = (await client.post("/api/agent/providers", json={
+                "label": "原名", "apiStandard": "openai", "baseUrl": "https://ok.test",
+                "apiKey": "sk-abcd1234", "model": "m"})).json()
+            r = await client.put(f"/api/agent/providers/{created['id']}", json={"label": ""})
+            assert r.status_code == 422, r.text
+    finally:
+        await dispose_engine()
+
+
+async def test_put_rejects_explicit_empty_model():
+    """H3：PUT 显式给空 model → 422。"""
+    await _reseed()
+    try:
+        async with await _client() as client:
+            created = (await client.post("/api/agent/providers", json={
+                "label": "原名", "apiStandard": "openai", "baseUrl": "https://ok.test",
+                "apiKey": "sk-abcd1234", "model": "m"})).json()
+            r = await client.put(f"/api/agent/providers/{created['id']}", json={"model": ""})
+            assert r.status_code == 422, r.text
+    finally:
+        await dispose_engine()
+
+
+async def test_set_default_to_keyless_marks_unconfigured():
+    """H1 闭环：把缺 key 服务设为默认 → active.configured=false、providerId=null（不静默用 env）。"""
+    await _reseed()
+    try:
+        async with await _client() as client:
+            created = (await client.post("/api/agent/providers", json={
+                "label": "无key目标", "apiStandard": "openai",
+                "baseUrl": "https://nokey.test", "apiKey": "", "model": "nm"})).json()
+            pid = created["id"]
+            r = await client.post(f"/api/agent/providers/{pid}/default")
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["defaultId"] == pid               # 默认指向该缺 key 行
+            assert body["active"]["configured"] is False  # 但解析为「未配置」
+            assert body["active"]["providerId"] is None
+    finally:
+        await dispose_engine()
+
+
 async def test_draft_test_empty_key_reports_not_configured():
     await _reseed()
     try:

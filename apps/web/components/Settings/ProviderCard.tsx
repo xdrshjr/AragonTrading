@@ -1,7 +1,7 @@
 "use client";
 
 import clsx from "clsx";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Badge, Button } from "@/components/ui";
 import { agentApi } from "@/lib/agentApi";
 import type { AgentProvider, ProviderDraft, ProviderTestResult } from "@/lib/agentTypes";
@@ -24,8 +24,20 @@ export default function ProviderCard({
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<string | null>(null);
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const errors = validateProviderDraft(draft);
+
+  // 轻量内联反馈（H9）：1.5s 后淡出；卸载清理计时器，避免对已卸载组件 setState。
+  const flash = (msg: string) => {
+    setFeedback(msg);
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setFeedback(null), 1500);
+  };
+  useEffect(() => () => {
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+  }, []);
 
   const beginEdit = () => {
     setDraft(draftFromProvider(provider));
@@ -66,11 +78,13 @@ export default function ProviderCard({
       if (!isDraftValid(draft)) return;
       await agentApi.providers.update(provider.id, draft);
       setEditing(false);
+      flash("已保存 ✓");
       onMutated();
     });
 
   const setDefault = () => guard(async () => {
     await agentApi.providers.setDefault(provider.id);
+    flash("已设为默认");
     onMutated();
   });
 
@@ -101,6 +115,12 @@ export default function ProviderCard({
           {provider.hasKey ? `密钥 ${provider.keyPreview}` : "未配置密钥"}
         </span>
       </div>
+
+      {provider.isDefault && !provider.hasKey && !editing && (
+        <p className="text-[11px] font-medium text-[var(--short)]">
+          该默认服务未填写密钥，填写后生效
+        </p>
+      )}
 
       {editing ? (
         <ProviderEditForm
@@ -171,6 +191,11 @@ export default function ProviderCard({
         </div>
       </div>
       {error && <p className="text-[11px] text-[var(--short)]">{error}</p>}
+      {feedback && (
+        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--long)]">
+          {feedback}
+        </p>
+      )}
     </div>
   );
 }
