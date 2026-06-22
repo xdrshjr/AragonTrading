@@ -36,6 +36,15 @@ class MomentumBreakout(BaseStrategy):
         },
     )
 
+    def __init__(self, params: dict | None = None):
+        super().__init__(params)
+        self._reset_state()
+
+    def _reset_state(self) -> None:
+        """按笔清零跟踪止损运行态（绝不在 `prepare()` 调用，对齐 trend_pullback_long）。"""
+        self._peak = 0.0            # 入场后运行最高价（多头跟踪止损基准）
+        self._trough = float("inf") # 入场后运行最低价（空头跟踪止损基准）
+
     def warmup(self) -> int:
         return int(self.params["breakout_window"]) + 2
 
@@ -45,10 +54,7 @@ class MomentumBreakout(BaseStrategy):
         df["prior_high"] = df["h"].shift(1).rolling(w, min_periods=w).max()
         df["prior_low"] = df["l"].shift(1).rolling(w, min_periods=w).min()
         df["vol_mean"] = df["vol"].shift(1).rolling(w, min_periods=w).mean()
-        # 跟踪止损的运行极值状态（每笔持仓独立，入场时设定、空仓时清零，见 §18 D5）
-        self._peak = 0.0
-        self._trough = float("inf")
-        return df
+        return df  # 不触碰 self._* 运行态（paper/live 逐根重调，写入会清空跟踪止损）
 
     def on_candle(self, df: pd.DataFrame, i: int, ctx: BrokerContext) -> list[Signal]:
         w = int(self.params["breakout_window"])
@@ -76,8 +82,7 @@ class MomentumBreakout(BaseStrategy):
             return []
 
         # 空仓：清空上一笔持仓残留的运行极值，再寻找突破入场（每笔独立，§18 D5）
-        self._peak = 0.0
-        self._trough = float("inf")
+        self._reset_state()
         surge_pct = float(self.params["surge_pct"])
         vol_mult = float(self.params["vol_mult"])
         strength = float(self.params["strength"])
