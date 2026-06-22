@@ -9,6 +9,7 @@ export default function AgentComposer({
   onChange,
   onSend,
   onStop,
+  onClear,
   running,
   disabled,
 }: {
@@ -16,6 +17,7 @@ export default function AgentComposer({
   onChange: (v: string) => void;
   onSend: () => void;
   onStop: () => void;
+  onClear: () => void;
   running: boolean;
   disabled?: boolean;
 }) {
@@ -48,6 +50,17 @@ export default function AgentComposer({
           placeholder={disabled ? "AI 助手暂不可用" : "问点什么…（Enter 发送，Shift+Enter 换行）"}
           className="max-h-[140px] flex-1 resize-none bg-transparent text-[13px] leading-relaxed text-[var(--text)] outline-none placeholder:text-[var(--muted)] disabled:cursor-not-allowed"
         />
+        {/* 清除在发送/停止左侧：清除为同步操作，仅 running 时禁用（与连接态 disabled 解耦）。 */}
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onClear}
+          disabled={running}
+          aria-label="清除上下文"
+          title="清除所有上下文"
+        >
+          清除
+        </Button>
         {running ? (
           <Button variant="danger" size="sm" onClick={onStop} aria-label="停止">
             停止

@@ -78,3 +78,53 @@ describe("parseBlocks structure", () => {
     expect(blocks.map((b) => b.kind)).toEqual(["heading", "p", "ul", "code"]);
   });
 });
+
+describe("markdown tables (GFM)", () => {
+  it("renders a GFM table with thead/tbody", () => {
+    const out = html("| A | B |\n| --- | --- |\n| a1 | b1 |");
+    expect(out).toContain("<table");
+    expect(out).toContain("<thead");
+    expect(out).toContain("<th");
+    expect(out).toContain("<td");
+    expect(out).toContain("A");
+    expect(out).toContain("b1");
+  });
+
+  it("applies column alignment classes", () => {
+    const out = html("| L | C | R |\n| :-- | :--: | --: |\n| 1 | 2 | 3 |");
+    expect(out).toContain("text-left");
+    expect(out).toContain("text-center");
+    expect(out).toContain("text-right");
+  });
+
+  it("renders inline formatting inside cells", () => {
+    const out = html("| H |\n| --- |\n| **粗** |");
+    expect(out).toContain("<strong>粗</strong>");
+  });
+
+  it("does not treat a pipe paragraph without a delimiter row as a table", () => {
+    const out = html("a | b\nc | d");
+    expect(out).not.toContain("<table");
+  });
+
+  it("unescapes escaped pipes in cells", () => {
+    const out = html("| a\\|b | c |\n| --- | --- |\n| 1 | 2 |");
+    expect(out).toContain("a|b");
+  });
+
+  it("escapes html inside table cells (R6)", () => {
+    const out = html("| H |\n| --- |\n| <script>alert(1)</script> |");
+    expect(out).not.toContain("<script>");
+    expect(out).toContain("&lt;script&gt;");
+  });
+
+  it("parseBlocks separates a table block", () => {
+    const blocks = parseBlocks("| A | B |\n| --- | --- |\n| a1 | b1 |");
+    expect(blocks.map((b) => b.kind)).toContain("table");
+  });
+
+  it("separates a table that immediately follows a paragraph", () => {
+    const blocks = parseBlocks("段落文字\n| A | B |\n| --- | --- |\n| a1 | b1 |");
+    expect(blocks.map((b) => b.kind)).toEqual(["p", "table"]);
+  });
+});

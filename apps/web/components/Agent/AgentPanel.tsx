@@ -255,6 +255,15 @@ export default function AgentPanel() {
     setRunning(false);
   }, []);
 
+  // 一键清除上下文：换新会话 id（既有 effect 重置消息流 + 重连空会话）并 best-effort 删旧会话行。
+  // 运行中禁用（按钮亦 disabled）：避免孤儿 run 把消息回写已删除会话、复活旧行（R2）。
+  const clearContext = useCallback(() => {
+    if (running) return;
+    const old = convIdRef.current;
+    newConversation();
+    if (old) void agentApi.clear(old).catch(() => {}); // best-effort purge：失败仅旧行残留（R3）
+  }, [running, newConversation]);
+
   const unconfigured = config !== null && !config.configured;
 
   return (
@@ -306,6 +315,7 @@ export default function AgentPanel() {
           onChange={setInput}
           onSend={() => send(input)}
           onStop={stop}
+          onClear={clearContext}
           running={running}
           disabled={!connected}
         />
