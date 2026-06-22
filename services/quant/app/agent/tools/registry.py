@@ -13,6 +13,7 @@ from ...okx.rest_client import OKXError
 from ..llm.base import ToolSchema
 from .base import Tool, ToolContext, ToolResult
 from .market_tools import GetCandlesTool, GetMarketSummaryTool, ListInstrumentsTool
+from .regime_tools import LabelMarketRegimeTool
 from .run_tools import (
     GetRunEquityTool,
     GetRunMetricsTool,
@@ -32,6 +33,7 @@ _ALL_TOOLS: list[Tool] = [
     ListStrategiesTool(),
     RunBacktestTool(),
     CompareStrategiesTool(),
+    LabelMarketRegimeTool(),
     ListRunsTool(),
     GetRunMetricsTool(),
     GetRunTradesTool(),

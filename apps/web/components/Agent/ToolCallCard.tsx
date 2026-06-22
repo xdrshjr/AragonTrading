@@ -13,6 +13,7 @@ const TOOL_LABELS: Record<string, { label: string; icon: string }> = {
   list_strategies: { label: "策略列表", icon: "🧩" },
   run_backtest: { label: "运行回测", icon: "⚙️" },
   compare_strategies: { label: "策略对比", icon: "⚖️" },
+  label_market_regime: { label: "市场体制分析", icon: "📍" },
   list_runs: { label: "运行历史", icon: "🗂️" },
   get_run_metrics: { label: "绩效指标", icon: "📊" },
   get_run_trades: { label: "成交明细", icon: "🧾" },
