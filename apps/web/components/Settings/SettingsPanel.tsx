@@ -5,6 +5,7 @@ import { Button } from "@/components/ui";
 import { useAppStore } from "@/lib/store";
 import AgentToolsSection from "./AgentToolsSection";
 import AiModelsSection from "./AiModelsSection";
+import OkxAccountsSection from "./OkxAccountsSection";
 import SettingsNav from "./SettingsNav";
 
 /**
@@ -53,7 +54,13 @@ export default function SettingsPanel() {
           <SettingsNav />
         </nav>
         <section className="w-[75%] min-w-0 grow-0 overflow-y-auto">
-          {section === "agent-tools" ? <AgentToolsSection /> : <AiModelsSection />}
+          {section === "okx-accounts" ? (
+            <OkxAccountsSection />
+          ) : section === "agent-tools" ? (
+            <AgentToolsSection />
+          ) : (
+            <AiModelsSection />
+          )}
         </section>
       </div>
     </div>

@@ -1,9 +1,10 @@
 "use client";
 
 import clsx from "clsx";
-import React from "react";
+import React, { useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 
-/** 复用基础组件 (spec §8.2)：Button / Select / Card / Tabs / Skeleton / Badge。 */
+/** 复用基础组件 (spec §8.2)：Button / Select / Card / Tabs / Skeleton / Badge / Modal。 */
 
 export function Button({
   variant = "default",
@@ -182,6 +183,111 @@ export function Switch({
         )}
       />
     </button>
+  );
+}
+
+// 可见且可聚焦的元素选择器（焦点陷阱用）。
+const FOCUSABLE =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * 可复用对话框原语（P1-Modal）：详情面板与未来任何浮层均复用，避免一次性孤岛。
+ *
+ * a11y / 行为契约（与 Modal.test.tsx 一致）：
+ * - `role="dialog"` + `aria-modal="true"` + `aria-labelledby`（指向调用方渲染的标题 id）。
+ * - React portal 到 `document.body`；半透明遮罩 + 居中卡片，配色用既有 CSS 变量、明/暗主题零适配。
+ * - `Esc` 与**点击遮罩**触发 `onClose`；挂载时初始焦点入对话框；`Tab`/`Shift+Tab` 焦点陷阱于框内；
+ *   卸载时焦点恢复到触发元素；打开期 `body` 滚动锁定。
+ */
+export function Modal({
+  open,
+  onClose,
+  labelledBy,
+  className,
+  children,
+}: {
+  open: boolean;
+  onClose: () => void;
+  labelledBy?: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+
+  // 挂载：记住触发元素 → 初始焦点入对话框 → body 滚动锁定；卸载：解锁并把焦点交还触发元素。
+  useEffect(() => {
+    if (!open) return;
+    restoreFocusRef.current = (document.activeElement as HTMLElement) ?? null;
+    const dialog = dialogRef.current;
+    const first = dialog?.querySelector<HTMLElement>(FOCUSABLE);
+    (first ?? dialog)?.focus();
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prevOverflow;
+      restoreFocusRef.current?.focus?.();
+    };
+  }, [open]);
+
+  // Esc 关闭 + Tab/Shift+Tab 焦点陷阱（捕获期绑定，优先于面板级 Esc 流，避免双重关闭）。
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      const dialog = dialogRef.current;
+      if (!dialog) return;
+      const items = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE));
+      if (items.length === 0) {
+        e.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey && (active === first || active === dialog)) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={labelledBy}
+        tabIndex={-1}
+        className={clsx(
+          "flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-[14px]",
+          "border border-[var(--border)] bg-[var(--bg)] shadow-soft outline-none",
+          className,
+        )}
+      >
+        {children}
+      </div>
+    </div>,
+    document.body,
   );
 }
 

@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     okx_secret_key: str = ""
     okx_passphrase: str = ""
 
+    # ---- 实盘账户（设置中心 · 实盘账户私有签名请求，spec §12）----
+    # 字段名即环境变量名（OKX_ACCOUNT_*，大小写不敏感）；凭证真源为库内多账户，env 不参与。
+    okx_account_demo: bool = False             # True 时私有请求附 x-simulated-trading:1（模拟盘）
+    okx_account_timeout_seconds: float = 15.0  # 私有请求超时上限
+
     # ---- 代理（透传给 httpx / websockets）----
     http_proxy: str = ""
     https_proxy: str = ""

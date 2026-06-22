@@ -19,6 +19,7 @@ from .models import (
     AgentToolState,
     CandleCache,
     EquityPoint,
+    OkxAccount,
     Strategy,
     StrategyRun,
     Trade,
@@ -420,3 +421,127 @@ async def set_all_tool_states(session: AsyncSession, names: list[str], enabled: 
         else:
             row.enabled = enabled
     await session.commit()
+
+
+# ============================ OKX 实盘账户（设置中心 · 实盘账户） ============================
+@dataclass(frozen=True)
+class OkxAccountValues:
+    """新增账户的可写字段集合（聚合传参，避免位置参数堆叠）。"""
+
+    label: str
+    api_key: str
+    secret_key: str
+    passphrase: str
+    ip_whitelist: str
+    permissions: str
+
+
+@dataclass(frozen=True)
+class OkxAccountPatch:
+    """编辑账户的部分字段（None = 不改；`secret_key`/`passphrase` 空/None = 保留原值）。"""
+
+    label: str | None = None
+    api_key: str | None = None
+    secret_key: str | None = None
+    passphrase: str | None = None
+    ip_whitelist: str | None = None
+    permissions: str | None = None
+
+
+async def list_okx_accounts(session: AsyncSession) -> list[OkxAccount]:
+    """全量账户，按 id 升序（展示顺序稳定）。"""
+    stmt = select(OkxAccount).order_by(OkxAccount.id.asc())
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def get_okx_account(session: AsyncSession, account_id: int) -> OkxAccount | None:
+    return await session.get(OkxAccount, account_id)
+
+
+async def get_default_okx_account(session: AsyncSession) -> OkxAccount | None:
+    stmt = select(OkxAccount).where(OkxAccount.is_default == True)  # noqa: E712
+    return (await session.execute(stmt)).scalars().first()
+
+
+async def create_okx_account(session: AsyncSession, *, values: OkxAccountValues,
+                             is_default: bool = False) -> OkxAccount:
+    """新增账户。secret_key/passphrase 原样列存（仅后端，绝不出接口 / 不进日志，C7）。"""
+    row = OkxAccount(
+        label=values.label,
+        api_key=values.api_key or "",
+        secret_key=values.secret_key or "",
+        passphrase=values.passphrase or "",
+        ip_whitelist=values.ip_whitelist or "",
+        permissions=values.permissions or "",
+        is_default=is_default,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def update_okx_account(session: AsyncSession, account_id: int, *,
+                             patch: OkxAccountPatch) -> OkxAccount | None:
+    """编辑账户；`secret_key`/`passphrase` 空则保留原值（前端不持有明文，R-Secret）。"""
+    row = await session.get(OkxAccount, account_id)
+    if row is None:
+        return None
+    if patch.label is not None:
+        row.label = patch.label
+    if patch.api_key is not None:
+        row.api_key = patch.api_key
+    if patch.secret_key:  # 非空才更新（空/None = 保留原值）
+        row.secret_key = patch.secret_key
+    if patch.passphrase:  # 非空才更新（空/None = 保留原值）
+        row.passphrase = patch.passphrase
+    if patch.ip_whitelist is not None:
+        row.ip_whitelist = patch.ip_whitelist
+    if patch.permissions is not None:
+        row.permissions = patch.permissions
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def delete_okx_account(session: AsyncSession, account_id: int) -> str:
+    """返回 'ok' | 'not_found'。删默认后自动回落（id 最小者，P2-Fallback）。"""
+    row = await session.get(OkxAccount, account_id)
+    if row is None:
+        return "not_found"
+    was_default = bool(row.is_default)
+    await session.delete(row)
+    await session.commit()
+    if was_default:
+        await _reassign_default_okx_after_delete(session)
+    return "ok"
+
+
+async def set_default_okx_account(session: AsyncSession, account_id: int) -> bool:
+    """事务内清其余 `is_default` 再置本行，杜绝多默认（R-Default）。不存在返回 False。
+
+    用 ORM 逐行置位（至多一行原默认）而非批量 UPDATE：批量 UPDATE + `expire_on_commit=False`
+    会令同 session 内已加载对象的 `is_default` 滞留旧值（延续 provider 经验）。
+    """
+    target = await session.get(OkxAccount, account_id)
+    if target is None:
+        return False
+    stmt = select(OkxAccount).where(OkxAccount.is_default == True)  # noqa: E712
+    for row in (await session.execute(stmt)).scalars().all():
+        row.is_default = False
+    target.is_default = True
+    await session.commit()
+    return True
+
+
+async def _reassign_default_okx_after_delete(session: AsyncSession) -> None:
+    """删默认后选 id 最小者为新默认（确定可复现）；空表则不设默认。"""
+    stmt = select(OkxAccount).order_by(OkxAccount.id.asc()).limit(1)
+    row = (await session.execute(stmt)).scalars().first()
+    if row is not None:
+        await set_default_okx_account(session, row.id)
+
+
+async def count_okx_accounts(session: AsyncSession) -> int:
+    rows = (await session.execute(select(OkxAccount.id))).all()
+    return len(rows)

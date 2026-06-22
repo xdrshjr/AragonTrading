@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from .db.models import AgentProvider, EquityPoint, StrategyRun, Trade
+from .db.models import AgentProvider, EquityPoint, OkxAccount, StrategyRun, Trade
 from .engine.metrics import _empty_metrics
 
 
@@ -272,6 +272,116 @@ def tool_out(meta: dict, enabled: bool) -> dict:
     return {"name": meta["name"], "description": meta["description"],
             "category": meta["category"], "isUiAction": meta["isUiAction"],
             "enabled": enabled, "paramsSchema": meta["paramsSchema"]}
+
+
+# ---------------- 实盘账户（设置中心 · 实盘 OKX 账户凭证） ----------------
+def account_out(row: OkxAccount) -> dict:
+    """OkxAccount 行 → 前端 dict（camelCase）。**绝不含 raw secret/passphrase / 完整 api_key**。
+
+    掩码复用 `_key_preview`（P2-Naming：字段名取 `apiKeyPreview` 而非 `keyPreview`，多密钥实体下更清晰）；
+    时间照 `provider_out` 输出秒级 UTC 整数（P2-Time，全系统时间口径一致）。
+    """
+    return {
+        "id": row.id, "label": row.label,
+        "apiKeyPreview": _key_preview(row.api_key),
+        "hasSecret": bool((row.secret_key or "").strip()),
+        "hasPassphrase": bool((row.passphrase or "").strip()),
+        "ipWhitelist": row.ip_whitelist, "permissions": row.permissions,
+        "isDefault": bool(row.is_default),
+        "createdTs": int(row.created_at.timestamp()) if row.created_at else 0,
+        "updatedTs": int(row.updated_at.timestamp()) if row.updated_at else 0,
+    }
+
+
+class OkxAccountIn(BaseModel):
+    """POST /accounts：新增账户。label/apiKey/secretKey/passphrase 必填。
+
+    写入字段补 max_length（SQLite 不强制 VARCHAR 长度，须在边界一次性校验，C5/H3）。
+    """
+
+    label: str = Field(min_length=1, max_length=128)
+    apiKey: str = Field(min_length=1, max_length=128)
+    secretKey: str = Field(min_length=1, max_length=128)
+    passphrase: str = Field(min_length=1, max_length=128)
+    ipWhitelist: str = Field(default="", max_length=512)
+    permissions: str = Field(default="", max_length=128)
+
+
+class OkxAccountUpdate(BaseModel):
+    """PUT /accounts/{id}：编辑（None/空=不改；secretKey/passphrase 空=保留原值）。"""
+
+    label: str | None = Field(default=None, min_length=1, max_length=128)
+    apiKey: str | None = Field(default=None, min_length=1, max_length=128)
+    secretKey: str | None = Field(default=None, max_length=128)
+    passphrase: str | None = Field(default=None, max_length=128)
+    ipWhitelist: str | None = Field(default=None, max_length=512)
+    permissions: str | None = Field(default=None, max_length=128)
+
+
+class OkxAccountTestReq(BaseModel):
+    """POST /accounts/test：测草稿连通性（首存前，须带显式 apiKey/secretKey/passphrase）。"""
+
+    apiKey: str = Field(min_length=1, max_length=128)
+    secretKey: str = Field(min_length=1, max_length=128)
+    passphrase: str = Field(min_length=1, max_length=128)
+    ipWhitelist: str = Field(default="", max_length=512)
+
+
+class OkxAccountTestResult(BaseModel):
+    """连通性测试结果：ok + 时延 / 语义错误码（OKX_AUTH_*/OKX_IP_DENIED/CONNECTION_FAILED/…）。"""
+
+    ok: bool
+    latencyMs: float | None = None
+    code: str | None = None
+    message: str | None = None
+
+
+class OkxAccountBalanceRow(BaseModel):
+    ccy: str
+    eq: float | None = None
+    availBal: float | None = None
+    frozenBal: float | None = None
+    eqUsd: float | None = None
+
+
+class OkxAccountPosition(BaseModel):
+    instId: str
+    instType: str
+    posSide: str
+    pos: float | None = None
+    avgPx: float | None = None
+    last: float | None = None
+    upl: float | None = None
+    uplRatio: float | None = None
+    lever: float | None = None
+    marginMode: str
+
+
+class OkxAccountInfo(BaseModel):
+    uid: str
+    acctLevel: str
+    acctLevelLabel: str
+    permissions: list[str]
+
+
+class OkxAccountBalance(BaseModel):
+    totalEqUsd: float | None = None
+    details: list[OkxAccountBalanceRow]
+
+
+class OkxAccountDetailOut(BaseModel):
+    """GET /accounts/{id}/detail：信息 + 资产 + 持仓（真实 OKX，鉴权失败→502，绝不假数据）。"""
+
+    info: OkxAccountInfo
+    balance: OkxAccountBalance
+    positions: list[OkxAccountPosition]
+
+
+class OkxAccountsListOut(BaseModel):
+    """GET /accounts：全量账户（脱敏）+ 当前默认 id。"""
+
+    accounts: list[dict]
+    defaultId: int | None = None
 
 
 class ErrorBody(BaseModel):

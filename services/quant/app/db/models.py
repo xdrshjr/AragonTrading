@@ -150,6 +150,27 @@ class AgentToolState(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
+class OkxAccount(Base):
+    """实盘 OKX 账户凭证（设置中心 · 实盘账户）。
+
+    每行一个真实 OKX API 凭证；全表至多一行 is_default=True（set_default 事务保证）。
+    secret_key / passphrase 仅后端存，绝不出接口 / 不进日志（C7）；api_key 列表态仅回末 4 位掩码。
+    """
+
+    __tablename__ = "okx_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    label: Mapped[str] = mapped_column(String(128))                 # 备注名，如 Dev-JR-US
+    api_key: Mapped[str] = mapped_column(Text, default="")          # 列表回掩码
+    secret_key: Mapped[str] = mapped_column(Text, default="")       # 绝不出接口
+    passphrase: Mapped[str] = mapped_column(Text, default="")       # 绝不出接口
+    ip_whitelist: Mapped[str] = mapped_column(String(512), default="")  # informational，逗号分隔
+    permissions: Mapped[str] = mapped_column(String(128), default="")   # informational，如 读取/交易
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
 class CandleCache(Base):
     """OKX K 线本地缓存（降低调用、加速回测）。"""
 
