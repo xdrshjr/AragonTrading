@@ -12,13 +12,17 @@ from app.db.session import dispose_engine, get_sessionmaker, init_db
 
 
 class _ScriptedLLM:
-    """按 turns 脚本化产出归一化流事件。"""
+    """按 turns 脚本化产出归一化流事件；记录最近一次收到的 system / tools 供启用门控断言。"""
 
     def __init__(self, turns):
         self._turns = turns
         self.calls = 0
+        self.last_system = None
+        self.last_tools = None
 
     async def stream(self, *, system, messages, tools):
+        self.last_system = system
+        self.last_tools = tools
         turn = self._turns[min(self.calls, len(self._turns) - 1)]
         self.calls += 1
         for ev in turn:
@@ -190,6 +194,44 @@ async def test_run_events_carry_monotonic_seq():
         assert all("seq" in e for e in events)  # 所有 run 事件带 seq
         seqs = [e["seq"] for e in events]
         assert seqs == list(range(1, len(seqs) + 1))  # 单调 1..N，无缺号、无重复
+    finally:
+        await dispose_engine()
+
+
+async def test_run_filters_schemas_by_enabled_tools():
+    """启用门控（P1-3）：enabled_tools 仅含 get_candles → 桩收到的 tools 仅该项，其余进禁用说明。"""
+    await init_db()
+    llm = _ScriptedLLM([[StreamEvent(kind="text_delta", text="ok"),
+                         StreamEvent(kind="message_done", stop_reason="end_turn")]])
+    session = _session(llm, _settings())
+
+    async def emit(_ev):
+        pass
+
+    try:
+        await session.run("hi", {"instId": "BTC-USDT-SWAP", "bar": "1D"}, emit,
+                          enabled_tools={"get_candles"})
+        names = {s.name for s in llm.last_tools}
+        assert names == {"get_candles"}  # schema 硬闸门：模型只见启用工具
+        marker = "以下工具当前已被用户禁用，本轮不可调用："
+        assert marker in llm.last_system
+        clause = llm.last_system.split(marker, 1)[1]
+        assert "run_backtest" in clause          # 禁用工具进系统提示说明
+        assert "get_candles" not in clause       # 启用工具不在禁用清单
+    finally:
+        await dispose_engine()
+
+
+async def test_run_enabled_tools_none_keeps_all():
+    """回归：enabled_tools=None（直驱 / 旧路径）→ 桩收到全部 13 工具，且不追加禁用说明。"""
+    await init_db()
+    llm = _ScriptedLLM([[StreamEvent(kind="text_delta", text="ok"),
+                         StreamEvent(kind="message_done", stop_reason="end_turn")]])
+    try:
+        await _collect_run(_session(llm, _settings()), text="hi")
+        names = {s.name for s in llm.last_tools}
+        assert names == ToolRegistry().all_names()         # 默认参数不过滤，全部可见
+        assert "以下工具当前已被用户禁用" not in llm.last_system  # 无禁用说明
     finally:
         await dispose_engine()
 

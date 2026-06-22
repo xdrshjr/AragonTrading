@@ -78,19 +78,30 @@ SIGNAL_EDGE_REASONING_SCAFFOLD = """【统计证据已就绪 · 请按三步显�
 如实说证据不足，建议换窗口 / 换信号 / 换标的或周期 / 放弃，绝不硬给买卖建议。"""
 
 
-def build_system_prompt(ui: dict | None) -> str:
-    """在系统提示后追加当前 UI 上下文，让助手默认理解“在看哪个标的 / 周期”。"""
-    if not ui:
-        return SYSTEM_PROMPT
-    lines = ["", "当前工作台上下文："]
-    if ui.get("instId"):
-        lines.append(f"- 标的：{ui['instId']}")
-    if ui.get("bar"):
-        lines.append(f"- 周期：{ui['bar']}")
-    if ui.get("mode"):
-        lines.append(f"- 模式：{ui['mode']}")
-    if ui.get("strategyId") is not None:
-        lines.append(f"- 选中策略 id：{ui['strategyId']}")
-    if ui.get("backtestStartTs") and ui.get("backtestEndTs"):
-        lines.append(f"- 回测区间（秒级 UTC）：{ui['backtestStartTs']} ~ {ui['backtestEndTs']}")
-    return SYSTEM_PROMPT + "\n" + "\n".join(lines)
+def build_system_prompt(ui: dict | None, disabled_tools: list[str] | None = None) -> str:
+    """在系统提示后追加当前 UI 上下文与已禁用工具说明，让助手默认理解“在看哪个标的 / 周期”。
+
+    Args:
+        ui: 当前工作台上下文（标的 / 周期 / 模式等），用于注入默认值。
+        disabled_tools: 本轮被用户禁用的工具名列表（设置中心 · Agent 工具管理）。非空时在末尾追加
+            一行说明，避免模型按散文枚举臆想调用已被 schema 硬闸门拦下的工具；``None`` / 空时不追加
+            （既有调用行为不变）。
+    """
+    prompt = SYSTEM_PROMPT
+    if ui:
+        lines = ["", "当前工作台上下文："]
+        if ui.get("instId"):
+            lines.append(f"- 标的：{ui['instId']}")
+        if ui.get("bar"):
+            lines.append(f"- 周期：{ui['bar']}")
+        if ui.get("mode"):
+            lines.append(f"- 模式：{ui['mode']}")
+        if ui.get("strategyId") is not None:
+            lines.append(f"- 选中策略 id：{ui['strategyId']}")
+        if ui.get("backtestStartTs") and ui.get("backtestEndTs"):
+            lines.append(f"- 回测区间（秒级 UTC）：{ui['backtestStartTs']} ~ {ui['backtestEndTs']}")
+        prompt = prompt + "\n" + "\n".join(lines)
+    if disabled_tools:
+        prompt += (f"\n\n（注意：以下工具当前已被用户禁用，本轮不可调用："
+                   f"{', '.join(disabled_tools)}。）")
+    return prompt

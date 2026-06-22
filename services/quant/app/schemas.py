@@ -235,6 +235,45 @@ class ProvidersListOut(BaseModel):
     active: ProviderActiveOut
 
 
+# ---------------- Agent 工具管理（设置中心 · Agent 工具管理） ----------------
+class AgentToolOut(BaseModel):
+    """单个工具的展示项（GET 列表 / PUT 回包）：元信息来自注册表 + 合并后的启用态。"""
+
+    name: str
+    description: str
+    category: str
+    isUiAction: bool
+    enabled: bool
+    paramsSchema: dict
+
+
+class AgentToolsListOut(BaseModel):
+    """GET /agent/tools、POST /agent/tools/bulk 响应：全量工具 + 启用计数概览。"""
+
+    tools: list[dict]
+    enabledCount: int
+    totalCount: int
+
+
+class AgentToolUpdate(BaseModel):
+    """PUT /agent/tools/{name}：设置单工具启用态。"""
+
+    enabled: bool
+
+
+class AgentToolBulkUpdate(BaseModel):
+    """POST /agent/tools/bulk：批量启用 / 禁用全部工具。"""
+
+    enabled: bool
+
+
+def tool_out(meta: dict, enabled: bool) -> dict:
+    """注册表元信息 + 启用态 → 前端 dict（camelCase；工具是否存在以注册表为准，C6）。"""
+    return {"name": meta["name"], "description": meta["description"],
+            "category": meta["category"], "isUiAction": meta["isUiAction"],
+            "enabled": enabled, "paramsSchema": meta["paramsSchema"]}
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

@@ -135,6 +135,21 @@ class AgentProvider(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
+class AgentToolState(Base):
+    """Agent 工具启用状态覆盖项（设置中心 · Agent 工具管理）。
+
+    稀疏存储：仅落用户显式改过的工具；表中无该 name 即视为「启用」（默认放行）。
+    name 与 ToolRegistry 工具名一一对应；非真源——工具是否存在以注册表为准（C6）。
+    """
+
+    __tablename__ = "agent_tool_states"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), unique=True, index=True)  # = Tool.name
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
 class CandleCache(Base):
     """OKX K 线本地缓存（降低调用、加速回测）。"""
 

@@ -31,10 +31,15 @@ from ..schemas import (
     AgentConfigOut,
     AgentProviderIn,
     AgentProviderUpdate,
+    AgentToolBulkUpdate,
+    AgentToolOut,
+    AgentToolsListOut,
+    AgentToolUpdate,
     ProviderTestReq,
     ProviderTestResult,
     ProvidersListOut,
     provider_out,
+    tool_out,
 )
 
 router = APIRouter(tags=["agent"])
@@ -151,6 +156,50 @@ async def test_provider_draft(body: ProviderTestReq) -> dict:
         base_url=body.baseUrl, api_key=body.apiKey, model=body.model,
         user_agent=body.userAgent or settings.agent_user_agent)
     return await probe_provider(config_from_row(draft, settings))
+
+
+# ============================ Agent 工具管理（设置中心 REST，spec §4） ============================
+def _tool_not_found() -> None:
+    raise HTTPException(status_code=404,
+                        detail={"code": "TOOL_NOT_FOUND", "message": "工具不存在"})
+
+
+def _tools_list_payload(metas: list[dict], states: dict[str, bool]) -> dict:
+    """合并注册表元信息与 DB 启用态覆盖项（无记录即启用，C6），并算启用计数概览。"""
+    tools = [tool_out(meta, states.get(meta["name"], True)) for meta in metas]
+    enabled_count = sum(1 for t in tools if t["enabled"])
+    return {"tools": tools, "enabledCount": enabled_count, "totalCount": len(tools)}
+
+
+@router.get("/agent/tools", response_model=AgentToolsListOut)
+async def list_tools(session: AsyncSession = Depends(get_session)) -> dict:
+    """列出全部工具（按注册表顺序）及合并后的启用态 + 启用计数概览。"""
+    manager = get_agent_manager()
+    states = await repo.get_tool_states(session)
+    return _tools_list_payload(manager.tool_metadata(), states)
+
+
+@router.put("/agent/tools/{name}", response_model=AgentToolOut)
+async def update_tool(name: str, body: AgentToolUpdate,
+                      session: AsyncSession = Depends(get_session)) -> dict:
+    """设置单工具启用态（落库）；未知工具 → 404 TOOL_NOT_FOUND。"""
+    manager = get_agent_manager()
+    if not manager.has_tool(name):
+        _tool_not_found()
+    await repo.set_tool_enabled(session, name, body.enabled)
+    meta = next(m for m in manager.tool_metadata() if m["name"] == name)
+    return tool_out(meta, body.enabled)
+
+
+@router.post("/agent/tools/bulk", response_model=AgentToolsListOut)
+async def bulk_tools(body: AgentToolBulkUpdate,
+                     session: AsyncSession = Depends(get_session)) -> dict:
+    """批量启用 / 禁用全部工具（落库）；返回最新整列，便于前端整列刷新。"""
+    manager = get_agent_manager()
+    metas = manager.tool_metadata()
+    await repo.set_all_tool_states(session, [m["name"] for m in metas], body.enabled)
+    states = await repo.get_tool_states(session)
+    return _tools_list_payload(metas, states)
 
 
 @router.websocket("/ws/agent/{conversation_id}")

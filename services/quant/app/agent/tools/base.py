@@ -67,6 +67,7 @@ class Tool:
     description: str = ""
     input_schema: dict = {}
     is_ui_action: bool = False
+    category: str = "general"  # 语义分组键（设置中心 · Agent 工具管理按此分组展示）
 
     def validate(self, args: dict) -> str | None:
         """校验模型产出的工具入参（外部输入，边界一次性校验，H2）。

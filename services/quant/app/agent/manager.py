@@ -108,6 +108,22 @@ class AgentManager:
         return {"configured": True, "provider": cfg.api_standard, "model": cfg.model,
                 "providerId": cfg.provider_id, "label": cfg.label}
 
+    # ============================ Agent 工具管理（设置中心 · Agent 工具管理） ============================
+    def tool_metadata(self) -> list[dict]:
+        """全部工具的展示元信息（委托运行时同一 registry 实例，保证「展示==实际可用」，C6）。"""
+        return self._registry.tool_meta()
+
+    def has_tool(self, name: str) -> bool:
+        """工具是否存在于注册表（PUT 未知工具 → 404 的判定真源）。"""
+        return self._registry.get(name) is not None
+
+    async def resolve_enabled_tools(self) -> set[str]:
+        """解析当前启用工具集：读 DB 覆盖项，按「无记录即启用」合并（每轮 run 解析，毫秒级）。"""
+        sm = self._factory()
+        async with sm() as session:
+            states = await repo.get_tool_states(session)
+        return {name for name in self._registry.all_names() if states.get(name, True)}
+
     async def get_or_create(self, conversation_id: str) -> AgentSession:
         """取或建会话：临界区加锁，确保同 convId 跨连接复用同一 AgentSession（H3，无脑裂）。"""
         async with self._lock:
@@ -219,7 +235,8 @@ class AgentManager:
         if not sess.loaded:
             await sess.load_from_db()
         user_text = self._guard_user_text(user_text, conversation_id)
-        task = asyncio.create_task(sess.run(user_text, ui, client=client))
+        enabled = await self.resolve_enabled_tools()
+        task = asyncio.create_task(sess.run(user_text, ui, client=client, enabled_tools=enabled))
         sess.bind_run_task(task)
         task.add_done_callback(_retrieve_run_exception)
 

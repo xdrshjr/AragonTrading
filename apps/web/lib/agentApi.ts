@@ -3,6 +3,8 @@ import { ApiRequestError } from "./api";
 import type {
   AgentMessage,
   AgentProvider,
+  AgentTool,
+  AgentToolsResponse,
   ProviderDraft,
   ProviderTestResult,
   ProvidersListResponse,
@@ -77,6 +79,21 @@ export const agentApi = {
       request<ProviderTestResult>("/agent/providers/test", {
         method: "POST",
         body: JSON.stringify(draft),
+      }),
+  },
+
+  // Agent 工具管理（设置中心）：查看 + 逐项 / 批量开关。工具清单只来自后端注册表（C6）。
+  tools: {
+    list: () => request<AgentToolsResponse>("/agent/tools"),
+    setEnabled: (name: string, enabled: boolean) =>
+      request<AgentTool>(`/agent/tools/${encodeURIComponent(name)}`, {
+        method: "PUT",
+        body: JSON.stringify({ enabled }),
+      }),
+    setAll: (enabled: boolean) =>
+      request<AgentToolsResponse>("/agent/tools/bulk", {
+        method: "POST",
+        body: JSON.stringify({ enabled }),
       }),
   },
 };

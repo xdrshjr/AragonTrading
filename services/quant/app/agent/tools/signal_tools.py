@@ -109,6 +109,7 @@ def _payload(args: dict, result: SignalEdgeResult) -> dict:
 
 class TestSignalForwardReturnsTool(Tool):
     name = "test_signal_forward_returns"
+    category = "analysis"
     description = (
         "不跑完整策略，只统计某具名信号（如放量突破 / RSI 超卖 / 触及布林下轨）出现后未来 N 根 "
         "K 线的前瞻收益：返回每个 horizon 的样本量、胜率、均值 / 中位收益、t 值与相对无条件基线的"

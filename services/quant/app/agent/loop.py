@@ -97,6 +97,8 @@ class AgentSession:
         self._loaded = False
         self._running = False
         self._cancel = False
+        # 本轮启用工具集（设置中心 · Agent 工具管理解析后注入）；None = 不过滤（兼容直驱 / 单测）。
+        self._enabled_tools: set[str] | None = None
         # 韧性流式运行态（RS-1）：会话级单调 seq + 当前 run 事件缓冲 + 可热切换 sink + 任务句柄。
         self._seq = 0                                       # 跨重连不重置（重放对账锚点）
         self._buffer: deque[tuple[int, dict]] = deque(
@@ -229,7 +231,8 @@ class AgentSession:
         self._loaded = True
 
     async def run(self, user_text: str, ui: dict | None = None, sink: Emit | None = None,
-                  *, client: LLMClient | None = None) -> None:
+                  *, client: LLMClient | None = None,
+                  enabled_tools: set[str] | None = None) -> None:
         """跑一轮 agentic loop。事件经 ``self._emit`` 发出（run/socket 解耦，RS-1）。
 
         Args:
@@ -239,6 +242,8 @@ class AgentSession:
             client: 本轮使用的 LLM 客户端（manager 解析的当前默认服务）。仅在**通过下方权威
                 BUSY 守卫之后**才绑定 ``self._llm``——擦过 WS best-effort 检查的并发轮在守卫处即被
                 拒、绑定永不发生，故进行中 run 的 client 绝不被中途替换（P1-Race）。
+            enabled_tools: 本轮启用工具集（manager 解析）；与 ``client`` 同点位绑定，使赢得 run
+                槽的这一轮才采用最新启用集，避免并发轮中途替换。``None`` = 不过滤（兼容直驱 / 单测）。
         """
         if sink is not None:
             self._sink = sink
@@ -250,6 +255,7 @@ class AgentSession:
         self._running = True
         if client is not None:  # 过守卫后才绑定：赢得 run 槽的这一轮才换用最新默认服务（P1-Race）。
             self._llm = client
+        self._enabled_tools = enabled_tools  # 与 client 同点位：本轮快照启用集，run 中途开关变更下一轮才生效。
         self._cancel = False
         self._buffer.clear()  # 新 run 起始清空事件窗口（缓冲只承载当前 run，R4）
         ctx = ToolContext(session_factory=self._session_factory, ui=UiContext.from_dict(ui),
@@ -263,7 +269,8 @@ class AgentSession:
 
     async def _run_rounds(self, user_text: str, ui: dict | None, ctx: ToolContext) -> None:
         await self._append_and_persist(LlmMessage("user", [TextBlock(user_text)]))
-        system = build_system_prompt(ui)
+        disabled = self._registry.disabled_names(self._enabled_tools)
+        system = build_system_prompt(ui, disabled)
         stats = _RunStats()
         outcome = await self._iterate_tool_rounds(system, ctx, stats)
         if outcome == "limit":
@@ -317,7 +324,7 @@ class AgentSession:
         await self._emit(_event("message_start", {"id": msg_id, "role": "assistant"}))
         acc = _StreamAcc()
         errored = False
-        schemas = self._registry.schemas() if tools is None else tools
+        schemas = self._registry.schemas(self._enabled_tools) if tools is None else tools
         async for ev in self._llm.stream(system=system, messages=self._trimmed_messages(),
                                           tools=schemas):
             if self._cancel:
@@ -384,7 +391,8 @@ class AgentSession:
                 break
             await self._emit(_event("tool_call", {"id": tu.id, "name": tu.name, "input": tu.input}))
             started = time.perf_counter()
-            result = await self._registry.execute(tu.name, tu.input, ctx)
+            result = await self._registry.execute(tu.name, tu.input, ctx,
+                                                  enabled=self._enabled_tools)
             stats.tools.append({"name": tu.name, "ok": result.ok,
                                 "ms": round((time.perf_counter() - started) * 1000, 1)})
             await self._emit(_event("tool_result", {"id": tu.id, "name": tu.name,

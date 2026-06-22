@@ -49,9 +49,11 @@ class ToolRegistry:
     def __init__(self, tools: list[Tool] | None = None):
         self._tools: dict[str, Tool] = {t.name: t for t in (tools or _ALL_TOOLS)}
 
-    def schemas(self) -> list[ToolSchema]:
+    def schemas(self, enabled: set[str] | None = None) -> list[ToolSchema]:
+        """工具声明列表：`enabled is None` 返回全部（向后兼容既有调用 / 单测）；否则只返回启用项。"""
         return [ToolSchema(name=t.name, description=t.description, input_schema=t.input_schema)
-                for t in self._tools.values()]
+                for t in self._tools.values()
+                if enabled is None or t.name in enabled]
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
@@ -60,10 +62,39 @@ class ToolRegistry:
         tool = self._tools.get(name)
         return bool(tool and tool.is_ui_action)
 
-    async def execute(self, name: str, args: dict, ctx: ToolContext) -> ToolResult:
+    def all_names(self) -> set[str]:
+        """注册表内全部工具名（启用集解析的全集，C6 唯一真源）。"""
+        return set(self._tools)
+
+    def tool_meta(self) -> list[dict]:
+        """按 `_ALL_TOOLS` 顺序返回展示元信息（设置中心 · Agent 工具管理用，不含启用态）。"""
+        return [self._meta_of(t) for t in self._tools.values()]
+
+    def meta_for(self, name: str) -> dict | None:
+        """单个工具的展示元信息（PUT 回包用）；未知名返回 None。"""
+        tool = self._tools.get(name)
+        return self._meta_of(tool) if tool is not None else None
+
+    @staticmethod
+    def _meta_of(tool: Tool) -> dict:
+        return {"name": tool.name, "description": tool.description, "category": tool.category,
+                "isUiAction": tool.is_ui_action, "paramsSchema": tool.input_schema}
+
+    def disabled_names(self, enabled: set[str] | None) -> list[str]:
+        """供系统提示用的已禁用工具名（升序）；`enabled is None` 不过滤即返回 `[]`。"""
+        if enabled is None:
+            return []
+        return sorted(self.all_names() - enabled)
+
+    async def execute(self, name: str, args: dict, ctx: ToolContext, *,
+                      enabled: set[str] | None = None) -> ToolResult:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(False, f"未知工具：{name}")
+        # 纵深防御（在「未知工具」判定之后、校验之前）：禁用工具二次兜底拒绝，schema 硬闸门外再加一道。
+        if enabled is not None and name not in enabled:
+            return ToolResult(
+                False, f"工具 {name} 已被禁用，请在设置中心 · Agent 工具管理中开启后再使用。")
         args = args or {}
         # 模型产出的入参即外部输入：边界处一次性校验，非法即拒并回喂模型自纠（H2，不执行）。
         invalid = tool.validate(args)

@@ -119,6 +119,7 @@ def _timeline_payload(args: dict, segments: list[RegimeSegment], merged: bool) -
 
 class LabelMarketRegimeTool(Tool):
     name = "label_market_regime"
+    category = "analysis"
     description = (
         "对某标的某周期的当前或指定区间行情做体制识别：返回趋势上 / 下、区间、高 / 低波动、"
         "急跌、突破等标签的打分与带证据初判，以及按体制推荐的候选策略；mode=timeline 时把"

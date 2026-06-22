@@ -12,6 +12,7 @@ _BAR_ENUM = ["1m", "5m", "15m", "30m", "1H", "4H", "1D"]
 
 class ShowChartTool(Tool):
     name = "show_chart"
+    category = "ui"
     description = ("把左侧主图切换到指定标的/周期/时间区间；带 runId 时叠加该次回测的买卖点与净值。"
                   "未指定的字段沿用当前工作台上下文。")
     is_ui_action = True

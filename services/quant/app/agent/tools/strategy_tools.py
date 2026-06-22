@@ -31,6 +31,7 @@ def _metrics_line(metrics: dict) -> str:
 
 class ListStrategiesTool(Tool):
     name = "list_strategies"
+    category = "strategy"
     description = "列出内置与自定义策略及其当前参数。"
     input_schema = {"type": "object", "properties": {}}
 
@@ -49,6 +50,7 @@ class ListStrategiesTool(Tool):
 
 class RunBacktestTool(Tool):
     name = "run_backtest"
+    category = "strategy"
     description = "对指定策略在某标的/周期/时间区间上运行回测，返回 runId 与绩效指标。"
     input_schema = {
         "type": "object",
@@ -89,6 +91,7 @@ class RunBacktestTool(Tool):
 
 class CompareStrategiesTool(Tool):
     name = "compare_strategies"
+    category = "strategy"
     description = "多个策略在同一标的/周期/时间区间上横向对比绩效。"
     input_schema = {
         "type": "object",

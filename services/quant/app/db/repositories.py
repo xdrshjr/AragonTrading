@@ -16,6 +16,7 @@ from ..strategies import STRATEGY_REGISTRY
 from .models import (
     AgentMessage,
     AgentProvider,
+    AgentToolState,
     CandleCache,
     EquityPoint,
     Strategy,
@@ -385,3 +386,37 @@ async def _reassign_default_after_delete(session: AsyncSession) -> None:
 async def count_agent_providers(session: AsyncSession) -> int:
     rows = (await session.execute(select(AgentProvider.id))).all()
     return len(rows)
+
+
+# ============================ Agent 工具启用态（设置中心 · Agent 工具管理） ============================
+async def get_tool_states(session: AsyncSession) -> dict[str, bool]:
+    """读全部启用态覆盖项为 `{name: enabled}`（只读，不提交）。
+
+    稀疏表：仅含用户显式改过的工具；调用方按「无记录即启用」合并（`states.get(name, True)`，C6）。
+    """
+    rows = (await session.execute(select(AgentToolState))).scalars().all()
+    return {row.name: bool(row.enabled) for row in rows}
+
+
+async def set_tool_enabled(session: AsyncSession, name: str, enabled: bool) -> None:
+    """按 name upsert 单个工具启用态（select-then-update / 否则 insert）后 `commit`，否则不落库。"""
+    stmt = select(AgentToolState).where(AgentToolState.name == name)
+    row = (await session.execute(stmt)).scalars().first()
+    if row is None:
+        session.add(AgentToolState(name=name, enabled=enabled))
+    else:
+        row.enabled = enabled
+    await session.commit()
+
+
+async def set_all_tool_states(session: AsyncSession, names: list[str], enabled: bool) -> None:
+    """对给定名集合批量 upsert 启用态后 `commit`（「全部启用 / 全部禁用」用）。"""
+    stmt = select(AgentToolState).where(AgentToolState.name.in_(names))
+    existing = {row.name: row for row in (await session.execute(stmt)).scalars().all()}
+    for name in names:
+        row = existing.get(name)
+        if row is None:
+            session.add(AgentToolState(name=name, enabled=enabled))
+        else:
+            row.enabled = enabled
+    await session.commit()

@@ -37,6 +37,7 @@ def _fmt_pct(value: float | None) -> str:
 
 class ListInstrumentsTool(Tool):
     name = "list_instruments"
+    category = "market"
     description = "列出某类型（SPOT/SWAP/FUTURES）成交额最高的若干标的及其 24h 行情快照。"
     input_schema = {
         "type": "object",
@@ -75,6 +76,7 @@ class ListInstrumentsTool(Tool):
 
 class GetMarketSummaryTool(Tool):
     name = "get_market_summary"
+    category = "market"
     description = "查某标的的最新价、24h 涨跌幅与成交额快照。"
     input_schema = {
         "type": "object",
@@ -103,6 +105,7 @@ class GetMarketSummaryTool(Tool):
 
 class GetCandlesTool(Tool):
     name = "get_candles"
+    category = "market"
     description = "拉取某标的某周期的 K 线并返回聚合摘要（首尾价、区间高低、均量）。"
     input_schema = {
         "type": "object",

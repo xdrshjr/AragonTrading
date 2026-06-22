@@ -21,6 +21,7 @@ def _parse_metrics(run) -> dict:
 
 class ListRunsTool(Tool):
     name = "list_runs"
+    category = "runs"
     description = "列出运行历史（回测 / 实时模拟），按最新在前，支持按策略/标的/模式过滤。"
     input_schema = {
         "type": "object",
@@ -47,6 +48,7 @@ class ListRunsTool(Tool):
 
 class GetRunMetricsTool(Tool):
     name = "get_run_metrics"
+    category = "runs"
     description = "查某次 run 的绩效指标（收益 / 胜率 / 夏普 / 回撤等）。"
     input_schema = {
         "type": "object",
@@ -69,6 +71,7 @@ class GetRunMetricsTool(Tool):
 
 class GetRunTradesTool(Tool):
     name = "get_run_trades"
+    category = "runs"
     description = "查某次 run 的成交明细（截断 Top N）。"
     input_schema = {
         "type": "object",
@@ -99,6 +102,7 @@ class GetRunTradesTool(Tool):
 
 class GetRunEquityTool(Tool):
     name = "get_run_equity"
+    category = "runs"
     description = "查某次 run 的净值 / 回撤序列（下采样）。"
     input_schema = {
         "type": "object",

@@ -147,6 +147,26 @@ export interface ProvidersListResponse {
   active: ProviderActive;
 }
 
+// ---------------- Agent 工具管理（设置中心 · Agent 工具管理） ----------------
+export type AgentToolCategory = "market" | "ui" | "strategy" | "analysis" | "runs" | "general";
+
+// 单个工具（与后端 AgentToolOut 对齐）：元信息来自注册表 + 合并后的启用态。
+export interface AgentTool {
+  name: string;
+  description: string;
+  category: AgentToolCategory;
+  isUiAction: boolean;
+  enabled: boolean;
+  paramsSchema: { type?: string; properties?: Record<string, any>; required?: string[] };
+}
+
+// GET /agent/tools、POST /agent/tools/bulk 响应。
+export interface AgentToolsResponse {
+  tools: AgentTool[];
+  enabledCount: number;
+  totalCount: number;
+}
+
 // store 中 ui-action 需要的 setter 子集（lib/agentActions 据此映射）。
 export interface UiActionStore {
   setInst: (instId: string) => void;
