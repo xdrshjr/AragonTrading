@@ -517,6 +517,7 @@ export default function CandleChart({
               theme={theme}
               sync={syncRef.current as SyncGroup}
               showTimeAxis
+              showLeftAxis={hasEquity}
             />
           </div>
         </div>
