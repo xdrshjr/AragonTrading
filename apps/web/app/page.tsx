@@ -391,9 +391,12 @@ export default function Page() {
     setMacSafeArea(getDesktopPlatform() === "darwin");
   }, []);
 
-  // 双击拖拽区切换最大化（spec §4.9 / D6）；落在 no-drag 控件上则不处理，避免误触。
+  // 双击拖拽面切换最大化（spec §4.9 / D6）。反转拖拽契约后（诊断
+  // desktop-titlebar-buttons-unclickable-when-restored），仅在显式 .drag-region 拖拽面上才触发，
+  // 使「可双击最大化」与「可拖动窗口」的区域一致；落在控件、菜单及顶栏空白(HTCLIENT)处一律忽略，
+  // 避免在不可拖动处误触最大化。
   const onTitleDoubleClick: MouseEventHandler<HTMLElement> = (e) => {
-    if ((e.target as HTMLElement).closest(".no-drag")) return;
+    if (!(e.target as HTMLElement).closest(".drag-region")) return;
     getWindowControls()?.toggleMaximize();
   };
 
@@ -416,26 +419,33 @@ export default function Page() {
     <div className="flex h-screen flex-col bg-[var(--bg)]">
       <header
         className={clsx(
-          "drag-region flex h-12 shrink-0 items-center justify-between",
+          "flex h-12 shrink-0 items-center",
           "border-b border-[var(--border)]",
           macSafeArea ? "pl-[84px] pr-4" : "px-4",
         )}
         onDoubleClick={onTitleDoubleClick}
       >
+        {/* 反转拖拽契约（spec §4.10 / 诊断 desktop-titlebar-buttons-unclickable-when-restored）：
+            顶栏整体不再 drag，仅「无交互控件」的品牌簇与中部空白标 drag 作为拖拽面，
+            交互控件留在默认/no-drag 区（HTCLIENT），规避无边框可缩放窗口还原态下
+            「drag 区内 no-drag 洞不被 OS 命中测试生效」的缺陷。 */}
         <div className="flex items-center gap-2">
-          <img
-            src="/brand/logo.png"
-            alt="Aragon Trading"
-            width="24"
-            height="24"
-            className="h-6 w-6 shrink-0"
-          />
-          <span className="text-sm font-semibold tracking-tight">Aragon Trading</span>
-          <span className="hidden text-[11px] text-[var(--muted)] sm:inline">
-            多策略量化模拟交易 · OKX 真实行情
-          </span>
+          <div className="drag-region flex items-center gap-2 self-stretch">
+            <img
+              src="/brand/logo.png"
+              alt="Aragon Trading"
+              width="24"
+              height="24"
+              className="h-6 w-6 shrink-0"
+            />
+            <span className="text-sm font-semibold tracking-tight">Aragon Trading</span>
+            <span className="hidden text-[11px] text-[var(--muted)] sm:inline">
+              多策略量化模拟交易 · OKX 真实行情
+            </span>
+          </div>
           <AppMenu />
         </div>
+        <div className="drag-region flex-1 self-stretch" />
         <div className="no-drag flex items-center gap-2">
           <AccountModeSwitch />
           <Button variant="ghost" size="sm" onClick={toggleTheme} aria-label="切换主题">

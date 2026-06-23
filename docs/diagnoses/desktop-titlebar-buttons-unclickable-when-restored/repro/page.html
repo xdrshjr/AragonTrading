@@ -1,0 +1,32 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body { height: 100%; margin: 0; }
+      /* 复刻生产顶栏：48px、紧贴窗口顶边(y=0)、drag-region */
+      header {
+        height: 48px;
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        border-bottom: 1px solid #ccc;
+        -webkit-app-region: drag;
+        padding: 0 16px;
+      }
+      /* 复刻 SettingsGearButton：h-8 (32px) 居中、no-drag */
+      #gear {
+        height: 32px;
+        width: 32px;
+        -webkit-app-region: no-drag;
+      }
+      main { height: calc(100% - 48px); }
+    </style>
+  </head>
+  <body>
+    <header>
+      <button id="gear" type="button">⚙</button>
+    </header>
+    <main></main>
+  </body>
+</html>

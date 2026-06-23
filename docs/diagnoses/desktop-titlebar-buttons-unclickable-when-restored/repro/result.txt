@@ -1,0 +1,19 @@
+=== RESTORED (非最大化) ===
+isMaximized: false
+getBounds       : x=377 y=174 w=1001 h=701
+getContentBounds: x=377 y=174 w=1001 h=701
+button/header   : {"btnRect":{"x":936.5714721679688,"y":8,"w":32,"h":32},"btnRegion":"no-drag","headerRegion":"drag"}
+=== MAXIMIZED (最大化) ===
+isMaximized: true
+getBounds       : x=-7 y=-7 w=1770 h=1063
+getContentBounds: x=0 y=0 w=1756 h=1050
+button/header   : {"btnRect":{"x":1691.4285888671875,"y":8,"w":32,"h":32},"btnRegion":"no-drag","headerRegion":"drag"}
+
+# 解读：
+# - RESTORED：getBounds == getContentBounds（差值=0）→ 还原态下 Web 内容紧贴窗口顶边(y=0)，
+#   窗口无任何客户区缩进；而 resizable:true 默认保留 WS_THICKFRAME，OS 仍在顶边保留 resize 非客户区。
+# - MAXIMIZED：getBounds=(-7,-7,1770,1063) vs getContentBounds=(0,0,1756,1050)
+#   → 最大化态下内容被向内缩进约 7px（Electron 补偿无边框最大化窗外溢工作区 7px）。
+# - 两态下按钮计算值恒为 no-drag、顶栏恒为 drag、按钮几何(y=8,h=32)一致
+#   → 排除 CSS / 布局因素；差异只剩「还原(缩进0) vs 最大化(缩进7px)」这一 OS 帧内缩进不对称，
+#   它正是 Chromium 无边框可缩放窗口在两态间拖拽/非拖拽命中区错位的根因输入。
