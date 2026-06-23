@@ -39,8 +39,10 @@ function proxyEnv() {
  * 后端子进程 env。
  * - PYTHONUTF8 / PYTHONIOENCODING：中文日志不崩（同 dev.py）。
  * - DB_PATH：仅 prod 注入到 userData（资源目录只读，D6）；dev 不设走仓库默认。
- * - AGENT_*：仅 prod 注入（由 main.js 经 agent-env 解析 userData/agent.env 传入 agentEnv）；
+ * - AGENT_* / LIVE_*：仅 prod 注入（由 main.js 经 agent-env 解析 userData/agent.env 传入 agentEnv）；
  *   pydantic Settings 从进程 env 读取，prod 无需 .env 文件（dev 经 services/quant/.env 读取）。
+ *   LIVE_*（LIVE_TRADING_ENABLED / LIVE_MAX_ORDER_NOTIONAL_USD / LIVE_DEFAULT_TD_MODE /
+ *   LIVE_DEFAULT_LEVERAGE）须同 AGENT_* 一并透传，否则打包桌面无法启用实盘下单（C1-6）。
  * - ALLOW_CACHED_FALLBACK：默认不设（=false），保持诚实默认——OKX 不可达即显式报错，不假数据。
  */
 function backendEnv({ mode, dbPath, agentEnv } = {}) {
@@ -53,10 +55,12 @@ function backendEnv({ mode, dbPath, agentEnv } = {}) {
   if (mode === 'prod' && dbPath) {
     env.DB_PATH = dbPath;
   }
-  // prod：把 AGENT_* 注入后端子进程 env（密钥仅在后端，绝不下发前端，R3/R4）。
+  // prod：把 AGENT_* / LIVE_* 注入后端子进程 env（密钥仅在后端，绝不下发前端，R3/R4；实盘开关 C1-6）。
   if (mode === 'prod' && agentEnv && typeof agentEnv === 'object') {
     for (const [key, value] of Object.entries(agentEnv)) {
-      if (key.startsWith('AGENT_') && value != null) env[key] = String(value);
+      if ((key.startsWith('AGENT_') || key.startsWith('LIVE_')) && value != null) {
+        env[key] = String(value);
+      }
     }
   }
   return env;

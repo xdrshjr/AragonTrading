@@ -384,6 +384,103 @@ class OkxAccountsListOut(BaseModel):
     defaultId: int | None = None
 
 
+# ---------------- 实盘交易（Phase 2 · /api/trading/*） ----------------
+class InstMetaOut(BaseModel):
+    """合约元数据（来源 GET /api/v5/public/instruments，C1-1）；下单数学全依赖之。"""
+
+    ctVal: float
+    ctValCcy: str
+    lotSz: float
+    minSz: float
+    tickSz: float
+    maxLever: float
+
+
+class TradingConfigOut(BaseModel):
+    """GET /trading/config：下单面板上下文（鉴权失败→502，绝不假数据，C1）。"""
+
+    accountId: int
+    instId: str
+    posMode: str                      # long_short_mode | net_mode
+    tdMode: str                       # cross | isolated
+    availUsdt: float
+    instMeta: InstMetaOut
+    lastPx: float | None = None
+    instrumentSupported: bool         # settleCcy=USDT 且 SWAP/FUTURES 才可下单（C1-4）
+    liveTradingEnabled: bool
+
+
+class PlaceOrderIn(BaseModel):
+    """POST /trading/order：px 仅 limit 必填；tp/sl 可选；lever 提供则先设杠杆。clOrdId 由后端生成。"""
+
+    accountId: int | None = None
+    instId: str = Field(min_length=1, max_length=32)
+    direction: Literal["long", "short"]
+    ordType: Literal["limit", "market"]
+    tdMode: Literal["cross", "isolated"] = "cross"
+    px: float | None = Field(default=None, gt=0)
+    sz: float = Field(gt=0)
+    lever: float | None = Field(default=None, gt=0, le=125)
+    tpTriggerPx: float | None = Field(default=None, gt=0)
+    slTriggerPx: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_limit_price(self) -> "PlaceOrderIn":
+        if self.ordType == "limit" and self.px is None:
+            raise ValueError("limit order requires px")
+        return self
+
+
+class PlaceOrderOut(BaseModel):
+    """POST /trading/order 响应（clOrdId 为后端生成的唯一值，C1-2）。"""
+
+    ok: bool
+    ordId: str | None = None
+    clOrdId: str | None = None
+    code: str | None = None
+    message: str | None = None
+
+
+class SetLeverageIn(BaseModel):
+    """POST /trading/leverage：posSide 仅 isolated + long_short_mode 时传，cross/net_mode 省略（C2-1）。"""
+
+    accountId: int | None = None
+    instId: str = Field(min_length=1, max_length=32)
+    lever: float = Field(gt=0, le=125)
+    mgnMode: Literal["cross", "isolated"] = "cross"
+    posSide: Literal["long", "short"] | None = None
+
+
+class SetLeverageOut(BaseModel):
+    ok: bool
+    instId: str
+    lever: float
+    mgnMode: str
+    posSide: str | None = None
+
+
+class LiveFill(BaseModel):
+    """实盘成交明细单行（GET /trading/fills）。"""
+
+    ts: int                # 秒级 UTC
+    instId: str
+    side: str              # buy | sell
+    fillPx: float
+    fillSz: float
+    fee: float
+    ordId: str
+
+
+class LiveFillsOut(BaseModel):
+    fills: list[LiveFill]
+
+
+class LivePositionsOut(BaseModel):
+    """GET /trading/positions：真实持仓（行复用 OkxAccountPosition）。"""
+
+    positions: list[OkxAccountPosition]
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

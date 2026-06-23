@@ -186,6 +186,52 @@ export function Switch({
   );
 }
 
+/** 可复用滑块原语（实盘下单仓位 / 杠杆用）：受控 range，键盘可达（原生 range 支持方向键 / Home / End），
+ * 显式 aria-valuemin/max/now 供读屏朗读，配色用设计 token（accent-color 着色拇指与轨道）。 */
+export function Slider({
+  value,
+  min = 0,
+  max = 100,
+  step = 1,
+  onChange,
+  ariaLabel,
+  id,
+  disabled,
+  className,
+}: {
+  value: number;
+  min?: number;
+  max?: number;
+  step?: number;
+  onChange: (next: number) => void;
+  ariaLabel?: string;
+  id?: string;
+  disabled?: boolean;
+  className?: string;
+}) {
+  return (
+    <input
+      type="range"
+      id={id}
+      value={value}
+      min={min}
+      max={max}
+      step={step}
+      disabled={disabled}
+      aria-label={ariaLabel}
+      aria-valuemin={min}
+      aria-valuemax={max}
+      aria-valuenow={value}
+      onChange={(e) => onChange(Number(e.target.value))}
+      className={clsx(
+        "h-1.5 w-full cursor-pointer appearance-none rounded-full bg-[var(--surface-2)]",
+        "accent-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-40",
+        className,
+      )}
+    />
+  );
+}
+
 // 可见且可聚焦的元素选择器（焦点陷阱用）。
 const FOCUSABLE =
   'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';

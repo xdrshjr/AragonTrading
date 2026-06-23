@@ -53,6 +53,8 @@ interface AppState {
   paneTab: IndicatorKey | null;
   mode: Mode;
   accountMode: AccountMode;
+  // 实盘「真实下单」风险勾选的会话记忆（瞬态，不持久化，刷新即复位 → 每会话首单仍需勾选，C1-3）。
+  liveAcknowledged: boolean;
   simBalance: number;
   paperSessionId: string | null;
   paperSelectionIds: number[];
@@ -84,6 +86,7 @@ interface AppState {
   setPaneTab: (key: IndicatorKey | null) => void;
   setMode: (mode: Mode) => void;
   setAccountMode: (m: AccountMode) => void;
+  setLiveAcknowledged: (v: boolean) => void;
   setSimBalance: (n: number) => void;
   setPaperSessionId: (id: string | null) => void;
   setPaperSelectionIds: (ids: number[]) => void;
@@ -126,6 +129,7 @@ export const useAppStore = create<AppState>()(
       paneTab: null,
       mode: "backtest",
       accountMode: "sim",
+      liveAcknowledged: false,
       simBalance: DEFAULT_SIM_BALANCE,
       paperSessionId: null,
       paperSelectionIds: [],
@@ -163,8 +167,12 @@ export const useAppStore = create<AppState>()(
           mode,
           chartView: mode === "compare" ? "compare-range" : "live-follow",
         }),
-      // 账户模式单字段原子写（模式联动由组件编排：选「模拟盘」时另调 setMode("paper")）。
-      setAccountMode: (accountMode) => set({ accountMode }),
+      // 账户模式写：选「实盘」时联动 chartView="live-follow"（§5.3）；「模拟盘」保持现状，
+      // setMode("paper") 由组件另行编排。实盘进入由组件做凭证 / 开关守门（C1-5），此处只落状态。
+      setAccountMode: (accountMode) =>
+        set(accountMode === "live" ? { accountMode, chartView: "live-follow" } : { accountMode }),
+      // 实盘风险勾选会话记忆（仅记忆勾选本身，不跳过逐单明细复核弹窗，C1-3）。
+      setLiveAcknowledged: (liveAcknowledged) => set({ liveAcknowledged }),
       // 模拟资金：夹取到 [MIN, MAX]；非有限数忽略（守住边界，R8）。
       setSimBalance: (n) =>
         set((s) =>
@@ -261,7 +269,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 9,
+      version: 10,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -312,6 +320,12 @@ export const useAppStore = create<AppState>()(
         }
         if (version < 9) {
           next = { ...next, settingsSection: "ai-models" };
+        }
+        if (version < 10) {
+          // 实盘交易模式：liveAcknowledged 为瞬态（不入 partialize），迁移仍显式补默认稳妥。
+          // accountMode="live" 的水合守门（缺默认账户 / 开关关闭即回落 sim，C1-5）须依赖后端异步数据，
+          // 故由 AccountModeSwitch 挂载时校验，迁移此处不动 accountMode。
+          next = { ...next, liveAcknowledged: false };
         }
         return next as never;
       },

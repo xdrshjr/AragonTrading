@@ -2,6 +2,7 @@
 
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
+import LiveBottomPanel from "@/components/Live/LiveBottomPanel";
 import PaperPositionsTable from "@/components/Strategy/PaperPositionsTable";
 import PositionPanel from "@/components/Strategy/PositionPanel";
 import TradesTable from "@/components/Strategy/TradesTable";
@@ -93,6 +94,7 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     instId,
     bar,
     mode,
+    accountMode,
     chartPane,
     bottomTab,
     paneTab,
@@ -269,6 +271,11 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
         className="flex min-h-[140px] flex-col"
         style={{ flexGrow: 1 - chartSplitRatio, flexShrink: 1, flexBasis: 0 }}
       >
+        {accountMode === "live" ? (
+          // 实盘模式：下方改为左右分栏（左下单面板 / 右成交记录 · 当前持仓，需求）。
+          <LiveBottomPanel instId={instId} markPrice={markPrice} />
+        ) : (
+          <>
         {mode === "paper" && paperSessionId && (
           <div className="shrink-0 border-b border-[var(--border)] bg-[var(--surface-2)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
             已启动实时模拟 · 下方成交和持仓按策略标签切换查看。
@@ -315,6 +322,8 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
             <PositionPanel trades={bottomTrades ?? overlayTrades} markPrice={markPrice} instId={instId} />
           )}
         </div>
+          </>
+        )}
       </div>
     </section>
   );

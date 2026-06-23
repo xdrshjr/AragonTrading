@@ -14,6 +14,10 @@ from ..config import Settings, get_settings
 from .types import Candle, Instrument, _optional_float, parse_okx_candle
 
 
+# 合约元数据缓存 TTL（秒）：ctVal/lotSz/tickSz 等极少变动，1 小时足够新鲜又免重复往返。
+_INST_META_TTL_SECONDS = 3600.0
+
+
 class OKXError(Exception):
     """OKX 取数失败（连通性 / 业务错误码）。上层据此返回显式错误态。"""
 
@@ -21,6 +25,14 @@ class OKXError(Exception):
         self.code = code
         self.message = message
         super().__init__(f"[{code}] {message}")
+
+
+def infer_inst_type(inst_id: str) -> str:
+    """由 instId 推断 OKX ``instType``（下单仅涉合约：``-SWAP`` 后缀=SWAP，否则按段数判 FUTURES/SPOT）。"""
+    if inst_id.endswith("-SWAP"):
+        return "SWAP"
+    parts = inst_id.split("-")
+    return "FUTURES" if len(parts) >= 3 else "SPOT"
 
 
 class _RateLimiter:
@@ -49,6 +61,8 @@ class OKXRestClient:
         self._client: httpx.AsyncClient | None = None
         self._last_ok_ts: int | None = None       # 最近一次成功取数的秒级 UTC (F2)
         self._last_latency_ms: int | None = None   # 最近一次 health 探活往返毫秒 (F2)
+        # 合约元数据进程内缓存（instId -> (到期 monotonic, meta)）；元数据低频变动，短 TTL (C1-1)。
+        self._inst_meta_cache: dict[str, tuple[float, dict]] = {}
 
     @property
     def last_ok_ts(self) -> int | None:
@@ -208,6 +222,33 @@ class OKXRestClient:
         if not rows:
             return None
         return float(rows[0]["last"])
+
+    async def get_instrument_meta(self, inst_type: str, inst_id: str) -> dict:
+        """合约元数据（``GET /api/v5/public/instruments``，公共无签名，C1-1）。
+
+        下单数学全依赖 ``ctVal/lotSz/minSz/tickSz/maxLever``；``ctType/settleCcy`` 供标的范围守门
+        （C1-4）。进程内按 instId 短 TTL 缓存（元数据低频变动）。未找到该标的抛 ``OKXError``。
+        """
+        cached = self._inst_meta_cache.get(inst_id)
+        if cached and cached[0] > time.monotonic():
+            return cached[1]
+        rows = await self._request(
+            "/api/v5/public/instruments", {"instType": inst_type, "instId": inst_id})
+        row = next((r for r in rows if r.get("instId") == inst_id), rows[0] if rows else None)
+        if row is None:
+            raise OKXError("INSTRUMENT_NOT_FOUND", f"未找到标的元数据：{inst_id}")
+        meta = {
+            "ctVal": _optional_float(row.get("ctVal")) or 0.0,
+            "ctValCcy": str(row.get("ctValCcy") or ""),
+            "lotSz": _optional_float(row.get("lotSz")) or 0.0,
+            "minSz": _optional_float(row.get("minSz")) or 0.0,
+            "tickSz": _optional_float(row.get("tickSz")) or 0.0,
+            "maxLever": _optional_float(row.get("lever")) or 0.0,
+            "ctType": str(row.get("ctType") or ""),
+            "settleCcy": str(row.get("settleCcy") or ""),
+        }
+        self._inst_meta_cache[inst_id] = (time.monotonic() + _INST_META_TTL_SECONDS, meta)
+        return meta
 
 
 # 进程级单例（FastAPI 启动时创建，关闭时 aclose）

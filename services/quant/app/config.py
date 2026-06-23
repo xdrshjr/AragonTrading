@@ -36,6 +36,16 @@ class Settings(BaseSettings):
     okx_account_demo: bool = False             # True 时私有请求附 x-simulated-trading:1（模拟盘）
     okx_account_timeout_seconds: float = 15.0  # 私有请求超时上限
 
+    # ---- 实盘交易（Phase 2「guarded order placement」，实盘交易模式 spec §3）----
+    # 字段名即环境变量名（LIVE_*，大小写不敏感）；首跨「real trading disabled」红线，故默认全关。
+    # 桌面端经 desktop/src/lib/config.js 白名单透传（C1-6），dev 经 services/quant/.env 读取。
+    live_trading_enabled: bool = False           # 总开关：False 时 /trading/order|leverage 一律 403
+    # 单笔下单名义价值本地上限（USDT），越界本地拦截。C1-7：默认收紧至 1000，避免高默认值架空
+    # §8 风险①护栏③；需放大须显式 env（LIVE_MAX_ORDER_NOTIONAL_USD）覆写。
+    live_max_order_notional_usd: float = 1000.0
+    live_default_td_mode: str = "cross"          # 合约默认保证金模式（cross | isolated）
+    live_default_leverage: float = 3.0           # 下单面板默认杠杆
+
     # ---- 代理（透传给 httpx / websockets）----
     http_proxy: str = ""
     https_proxy: str = ""

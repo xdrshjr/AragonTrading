@@ -19,6 +19,7 @@ from .models import (
     AgentToolState,
     CandleCache,
     EquityPoint,
+    LiveOrderAudit,
     OkxAccount,
     Strategy,
     StrategyRun,
@@ -545,3 +546,50 @@ async def _reassign_default_okx_after_delete(session: AsyncSession) -> None:
 async def count_okx_accounts(session: AsyncSession) -> int:
     rows = (await session.execute(select(OkxAccount.id))).all()
     return len(rows)
+
+
+# ============================ 实盘下单审计（实盘交易模式 §5.1） ============================
+@dataclass(frozen=True)
+class LiveOrderAuditValues:
+    """一条下单审计留痕的字段集合（聚合传参；绝不含任何密钥，C7）。"""
+
+    account_id: int
+    inst_id: str
+    direction: str
+    ord_type: str
+    td_mode: str
+    px: float | None
+    sz: float
+    lever: float | None
+    tp_trigger_px: float | None
+    sl_trigger_px: float | None
+    status: str
+    cl_ord_id: str
+    ord_id: str
+    error_code: str
+    created_ts: int
+
+
+async def create_live_order_audit(session: AsyncSession, *,
+                                  values: LiveOrderAuditValues) -> LiveOrderAudit:
+    """落一行下单审计（accepted/rejected/error 均留痕；订单真源仍在 OKX）。"""
+    row = LiveOrderAudit(
+        account_id=values.account_id, inst_id=values.inst_id, direction=values.direction,
+        ord_type=values.ord_type, td_mode=values.td_mode, px=values.px, sz=values.sz,
+        lever=values.lever, tp_trigger_px=values.tp_trigger_px, sl_trigger_px=values.sl_trigger_px,
+        status=values.status, cl_ord_id=values.cl_ord_id, ord_id=values.ord_id,
+        error_code=values.error_code, created_ts=values.created_ts)
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def list_live_order_audit(session: AsyncSession, *, account_id: int | None = None,
+                                limit: int = 100) -> list[LiveOrderAudit]:
+    """按 id 降序（最新在前）列审计行，可按账户过滤。"""
+    stmt = select(LiveOrderAudit)
+    if account_id is not None:
+        stmt = stmt.where(LiveOrderAudit.account_id == account_id)
+    stmt = stmt.order_by(LiveOrderAudit.id.desc()).limit(limit)
+    return list((await session.execute(stmt)).scalars().all())

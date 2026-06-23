@@ -171,6 +171,35 @@ class OkxAccount(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
+class LiveOrderAudit(Base):
+    """实盘下单审计留痕（实盘交易模式 §5.1）。
+
+    订单唯一真源在 OKX，本表仅记操作痕迹（对账 / 复盘 / 安全审计）。**绝不**存任何
+    secret/passphrase/api_key，message 字段不落原始凭证（沿用 ``_redact`` 单点收口，C7）。
+    所有时间秒级 UTC（C2）。``account_id`` 指向 ``okx_accounts.id`` 但不加外键——账户可删，留痕保留。
+    """
+
+    __tablename__ = "live_order_audit"
+    __table_args__ = (Index("ix_live_audit_account", "account_id", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(Integer, index=True)
+    inst_id: Mapped[str] = mapped_column(String(32))
+    direction: Mapped[str] = mapped_column(String(8))    # long | short
+    ord_type: Mapped[str] = mapped_column(String(8))     # limit | market
+    td_mode: Mapped[str] = mapped_column(String(8))      # cross | isolated
+    px: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sz: Mapped[float] = mapped_column(Float)
+    lever: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tp_trigger_px: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sl_trigger_px: Mapped[float | None] = mapped_column(Float, nullable=True)
+    status: Mapped[str] = mapped_column(String(16))      # accepted | rejected | error
+    cl_ord_id: Mapped[str] = mapped_column(String(32), default="")  # 本地生成唯一客户端单号（C1-2）
+    ord_id: Mapped[str] = mapped_column(String(64), default="")     # 成功填 OKX ordId，否则空
+    error_code: Mapped[str] = mapped_column(String(64), default="")  # 失败填归一码，否则空
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class CandleCache(Base):
     """OKX K 线本地缓存（降低调用、加速回测）。"""
 
