@@ -45,7 +45,15 @@ class MarketWSHandlers:
 
 
 class OKXMarketWSClient:
-    """One OKX public WS connection for the selected instrument and bar."""
+    """OKX market WS streams for the selected instrument and bar.
+
+    OKX V5 serves the candle channels only on the *business* endpoint and
+    trades/tickers/books5 only on the *public* endpoint, so a single socket
+    cannot carry both. This client runs one connection loop per endpoint that
+    needs to be live — always the business loop for the candle channel, and the
+    public loop for the market channels when ``market_channels`` is true — and
+    feeds both into the same handlers.
+    """
 
     def __init__(
         self,
@@ -62,35 +70,37 @@ class OKXMarketWSClient:
         self._market_channels = market_channels
         self._channel = BAR_TO_WS_CHANNEL.get(bar, "candle1H")
         self._stop = asyncio.Event()
-        self._task: asyncio.Task | None = None
+        self._tasks: list[asyncio.Task] = []
 
     def start(self) -> None:
-        if self._task is None:
-            self._task = asyncio.create_task(self._run())
+        if self._tasks:
+            return
+        self._tasks.append(asyncio.create_task(
+            self._run_endpoint(self._settings.okx_ws_business, self._candle_args())
+        ))
+        if self._market_channels:
+            self._tasks.append(asyncio.create_task(
+                self._run_endpoint(self._settings.okx_ws_public, self._market_args())
+            ))
 
     async def stop(self) -> None:
         self._stop.set()
-        if self._task is not None:
-            self._task.cancel()
+        for task in self._tasks:
+            task.cancel()
+        for task in self._tasks:
             try:
-                await self._task
+                await task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-            self._task = None
+        self._tasks = []
 
-    async def _run(self) -> None:
+    async def _run_endpoint(self, url: str, args: list[dict[str, str]]) -> None:
         backoff = 1.0
         connect_kwargs: dict = {"ping_interval": None, "open_timeout": 15}
         while not self._stop.is_set():
             try:
-                async with websockets.connect(
-                    self._settings.okx_ws_public,
-                    **connect_kwargs,
-                ) as ws:
-                    await ws.send(json.dumps({
-                        "op": "subscribe",
-                        "args": self._subscription_args(),
-                    }))
+                async with websockets.connect(url, **connect_kwargs) as ws:
+                    await ws.send(json.dumps({"op": "subscribe", "args": args}))
                     backoff = 1.0
                     heartbeat = asyncio.create_task(self._heartbeat(ws))
                     try:
@@ -107,15 +117,15 @@ class OKXMarketWSClient:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
 
-    def _subscription_args(self) -> list[dict[str, str]]:
-        args = [{"channel": self._channel, "instId": self.inst_id}]
-        if self._market_channels:
-            args.extend([
-                {"channel": "trades", "instId": self.inst_id},
-                {"channel": "tickers", "instId": self.inst_id},
-                {"channel": "books5", "instId": self.inst_id},
-            ])
-        return args
+    def _candle_args(self) -> list[dict[str, str]]:
+        return [{"channel": self._channel, "instId": self.inst_id}]
+
+    def _market_args(self) -> list[dict[str, str]]:
+        return [
+            {"channel": "trades", "instId": self.inst_id},
+            {"channel": "tickers", "instId": self.inst_id},
+            {"channel": "books5", "instId": self.inst_id},
+        ]
 
     async def _heartbeat(self, ws) -> None:
         try:

@@ -33,7 +33,7 @@ async def health() -> dict:
         "okx": "up" if okx_up else "down",
         "okxLatencyMs": latency,
         "lastOkTs": last_ok_ts,
-        "wsConfigured": bool(settings.okx_ws_public),
+        "wsConfigured": bool(settings.okx_ws_public and settings.okx_ws_business),
         # F2：缓存回退开关是否启用——前端据此预知"回退可能发生"（仅信息性，不放宽硬约束）
         "cachedFallbackEnabled": settings.allow_cached_fallback,
         "maxPaperSessions": settings.max_paper_sessions,

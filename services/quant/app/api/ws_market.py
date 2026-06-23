@@ -69,10 +69,9 @@ async def ws_market(websocket: WebSocket) -> None:
             on_book=on_book,
             on_error=on_error,
         ),
-        # Candle channels are served by OKX's business endpoint; trades/tickers/
-        # books5 exist only on the public endpoint and would 60018 here. Subscribe
-        # candle-only so the live chart feed cannot be broken by those errors.
-        market_channels=False,
+        # market_channels defaults to True: the candle channel streams from the
+        # business endpoint and trades/tickers/books5 from the public endpoint,
+        # so the depth panel (asks/bids/trade tape/24h vol/spread) gets data.
     )
     client.start()
     try:

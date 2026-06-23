@@ -171,27 +171,33 @@ async def test_market_client_subscription_scope():
     market = OKXMarketWSClient("BTC-USDT-SWAP", "1m", handlers)
     candle_only = OKXWSClient("BTC-USDT-SWAP", "1m", on_candle)
 
-    assert [arg["channel"] for arg in market._subscription_args()] == [
-        "candle1m",
+    # Candle rides the business endpoint; trades/tickers/books5 ride the public
+    # endpoint — each loop subscribes only the channels its endpoint serves.
+    assert market._candle_args() == [{"channel": "candle1m", "instId": "BTC-USDT-SWAP"}]
+    assert [arg["channel"] for arg in market._market_args()] == [
         "trades",
         "tickers",
         "books5",
     ]
-    assert candle_only._client._subscription_args() == [
+    # The paper-trading wrapper stays candle-only (no public market loop).
+    assert candle_only._client._market_channels is False
+    assert candle_only._client._candle_args() == [
         {"channel": "candle1m", "instId": "BTC-USDT-SWAP"}
     ]
 
 
 @pytest.mark.asyncio
-async def test_ws_market_subscribes_candle_only(monkeypatch):
+async def test_ws_market_subscribes_market_channels(monkeypatch):
     _FakeMarketClient.created = []
     monkeypatch.setattr("app.api.ws_market.OKXMarketWSClient", _FakeMarketClient)
     websocket = _FakeWebSocket({"instId": "BTC-USDT-SWAP", "bar": "1m"})
     await ws_market(websocket)
 
     fake = _FakeMarketClient.created[0]
-    # The chart route must not push public-only channels to the business endpoint.
-    assert fake.market_channels is False
+    # The chart route subscribes the public market channels (asks/bids/trades/
+    # ticker) so the depth panel gets data; they reach OKX via the public
+    # endpoint while candles ride the business endpoint.
+    assert fake.market_channels is True
 
 
 @pytest.mark.asyncio

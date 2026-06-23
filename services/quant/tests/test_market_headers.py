@@ -48,6 +48,7 @@ class _FakeSettings:
     def __init__(self, allow_cached_fallback: bool) -> None:
         self.allow_cached_fallback = allow_cached_fallback
         self.okx_ws_public = "wss://example.test/ws"
+        self.okx_ws_business = "wss://example.test/ws-business"
 
 
 def _load_app():

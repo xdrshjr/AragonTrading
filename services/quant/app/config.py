@@ -22,9 +22,12 @@ class Settings(BaseSettings):
 
     # ---- OKX 端点 ----
     okx_rest_base: str = "https://www.okx.com"
-    # ⚠️ candle{bar} 频道由 OKX 的 **business** WS 端点提供，public 端点会返回
-    # "channel ... doesn't exist"。实测确认：/ws/v5/business 才能订阅到 K 线。
-    okx_ws_public: str = "wss://ws.okx.com:8443/ws/v5/business"
+    # ⚠️ OKX V5 把公共行情拆到两个 WS 端点：trades/tickers/books5 仅在 **public**
+    # 端点；candle{bar} K 线仅在 **business** 端点（在 public 订阅 candle 会回 60018
+    # "channel doesn't exist"，反之亦然）。故两端点都要配：盘口/成交/ticker 走
+    # public，K 线走 business。
+    okx_ws_public: str = "wss://ws.okx.com:8443/ws/v5/public"
+    okx_ws_business: str = "wss://ws.okx.com:8443/ws/v5/business"
 
     # ---- OKX 凭据（本期仅占位，公共行情不需要）----
     okx_api_key: str = ""
