@@ -258,6 +258,8 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
                 paneTab={paneTab}
                 onPaneTabChange={setPaneTab}
                 livePrice={market.lastPrice}
+                instId={instId}
+                bar={bar}
               />
             ) : (
               <EquityChart

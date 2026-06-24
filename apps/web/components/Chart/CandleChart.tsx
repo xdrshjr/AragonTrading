@@ -60,6 +60,10 @@ type Props = {
   paneTab?: IndicatorKey | null;
   onPaneTabChange?: (key: IndicatorKey) => void;
   livePrice?: number | null;
+  // 切标的 / 切周期的离散复位键：用于在换标的时把主图价轴 autoScale 拨回 true
+  //（chart-candles-disappear-on-symbol-switch，见下方 reset effect）。
+  instId?: string;
+  bar?: string;
 };
 
 function cssVar(name: string): string {
@@ -92,6 +96,8 @@ export default function CandleChart({
   paneTab,
   onPaneTabChange,
   livePrice,
+  instId,
+  bar,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -300,6 +306,20 @@ export default function CandleChart({
       title: "LIVE",
     });
   }, [livePrice, theme]);
+
+  // 切标的 / 切周期时复位主图价轴自适应（chart-candles-disappear-on-symbol-switch）。
+  // 根因：用户拖动价轴缩放会把 autoScale 关掉（lwc scaleTo→setMode），此后切到价格量级相差很大的
+  // 标的，下方 [candles] 的 setData 因库内 !isAutoScale() 短路而不再重拟合价区间，新 K 线落在旧价窗
+  // 之外，中间面板看似「K 线消失」。此处仅在 instId/bar 这一离散事件上把 autoScale 拨回 true（等价库内
+  // 双击价轴的 resetPriceScale），令随后的 setData 自动把新标的 K 线拟合到合适价位。
+  // 关键约束：① 依赖仅 [instId, bar]，不绑定 candles —— 同一标的内实时每秒 setData 不触发复位，用户在
+  // 该标的内手动缩放的价轴得以保留（避免每 tick 抢回自适应的体验回归）；② 必须声明在下方 setData effect
+  // 之前，确保缓存命中（切回看过的标的、instId 与 candles 同帧变化）时「先复位 autoScale，再 setData」。
+  useEffect(() => {
+    candleSeriesRef.current?.priceScale().applyOptions({ autoScale: true });
+    // 净值视图存在时左价轴一并复位（成本极低的防御，非主诉所必需）。
+    equitySeriesRef.current?.priceScale().applyOptions({ autoScale: true });
+  }, [instId, bar]);
 
   // 更新 K 线
   useEffect(() => {
