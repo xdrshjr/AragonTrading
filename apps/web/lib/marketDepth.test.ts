@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { Candle, MarketTicker, MarketTrade, OrderBookSnapshot } from "./types";
-import { bookSideTotals, bookSpread, mergeTradeTape, resolveLivePrice } from "./marketDepth";
+import {
+  bookSideTotals,
+  bookSpread,
+  foldTradeTape,
+  mergeTradeTape,
+  resolveLivePrice,
+} from "./marketDepth";
 
 describe("market depth helpers", () => {
   it("dedupes trade ids, sorts newest first, and caps rows", () => {
@@ -10,6 +16,35 @@ describe("market depth helpers", () => {
 
     const rows = mergeTradeTape([older], newer, 2);
     expect(mergeTradeTape(rows, duplicate, 2)).toEqual([newer, older]);
+  });
+
+  it("folds a batch of trades at once: dedupes, keeps newest first, caps rows", () => {
+    const existing: MarketTrade = { ts: 10, price: 1, qty: 1, side: "buy", tradeId: "a" };
+    const batch: MarketTrade[] = [
+      { ts: 12, price: 2, qty: 1, side: "sell", tradeId: "b" },
+      { ts: 11, price: 3, qty: 1, side: "buy", tradeId: "a" }, // duplicate of existing → dropped
+      { ts: 13, price: 4, qty: 1, side: "buy", tradeId: "c" },
+    ];
+    expect(foldTradeTape([existing], batch, 2)).toEqual([batch[2], batch[0]]);
+  });
+
+  it("returns the previous tape unchanged when the incoming batch is empty", () => {
+    const prev: MarketTrade[] = [{ ts: 5, price: 1, qty: 1, side: "buy", tradeId: "x" }];
+    expect(foldTradeTape(prev, [])).toEqual(prev);
+  });
+
+  it("caps a large fold to the newest `limit` rows by timestamp", () => {
+    const batch: MarketTrade[] = Array.from({ length: 50 }, (_, i) => ({
+      ts: i,
+      price: i,
+      qty: 1,
+      side: "buy" as const,
+      tradeId: `t${i}`,
+    }));
+    const folded = foldTradeTape([], batch, 40);
+    expect(folded).toHaveLength(40);
+    expect(folded[0].ts).toBe(49);
+    expect(folded[39].ts).toBe(10);
   });
 
   it("returns spread and percentage from top book levels", () => {

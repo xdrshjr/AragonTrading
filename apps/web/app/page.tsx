@@ -22,7 +22,8 @@ import {
   shouldStreamMarket,
 } from "@/lib/chartLive";
 import { colorForIndex } from "@/lib/compare";
-import { mergeTradeTape } from "@/lib/marketDepth";
+import { foldTradeTape } from "@/lib/marketDepth";
+import { createMarketThrottle } from "@/lib/marketThrottle";
 import {
   mergePaperEquity,
   mergePaperTrade,
@@ -286,41 +287,55 @@ export default function Page() {
     return () => clients.forEach((client) => client.close());
   }, [mode, paperStreamsEnabled, paperStrategies]);
 
-  const recordMarketTs = (ts: number) => {
+  // 节流约束：ref 推进必须随入帧同步发生（ref 无渲染成本，candle 分支门控要读最新值），
+  // 只有 setLastMarketTs 这个 state 写入才纳入节流（由 throttle 的 flush 统一落库）。
+  const advanceMarketTs = (ts: number) => {
     lastMarketTsRef.current = Math.max(lastMarketTsRef.current ?? 0, ts);
-    setLastMarketTs((prev) => Math.max(prev ?? 0, ts));
   };
 
   useEffect(() => {
     if (!streamMarket) return;
+    // 自适应节流器：把高频 book/ticker/trade（含其 lastPrice）缓冲后按 1s/0.5s 节奏一次性刷入 state，
+    // 把面板重渲染从 20~40+Hz 降到 1~2Hz（诊断 market-depth-refresh-too-frequent，方案 A）。
+    const throttle = createMarketThrottle({
+      flush: (frame) => {
+        if (frame.book) setOrderBook(frame.book);
+        if (frame.ticker) setMarketTicker(frame.ticker);
+        // 增量折叠进既有成交带，禁止整段替换（否则成交带每周期被清空重建）。
+        if (frame.trades.length) setTradeTape((prev) => foldTradeTape(prev, frame.trades));
+        if (frame.lastPrice != null) setLastPrice(frame.lastPrice);
+        const marketTs = frame.marketTs;
+        if (marketTs != null) setLastMarketTs((prev) => Math.max(prev ?? 0, marketTs));
+      },
+    });
     const ws = marketWS(
       instId,
       bar,
       (event) => {
         if (event.type === "error") {
-          setMarketError(event.data.message);
+          setMarketError(event.data.message); // 故障提示保持即时，不进节流
           return;
         }
         setMarketError(null);
         if (event.type === "trade") {
-          setTradeTape((prev) => mergeTradeTape(prev, event.data));
-          setLastPrice(event.data.price);
-          recordMarketTs(event.data.ts);
+          advanceMarketTs(event.data.ts);
+          throttle.pushTrade(event.data);
           return;
         }
         if (event.type === "ticker") {
-          setMarketTicker(event.data);
-          setLastPrice(event.data.last);
-          recordMarketTs(event.data.ts);
+          advanceMarketTs(event.data.ts);
+          throttle.pushTicker(event.data);
           return;
         }
         if (event.type === "book") {
-          setOrderBook(event.data);
-          recordMarketTs(event.data.ts);
+          advanceMarketTs(event.data.ts);
+          throttle.pushBook(event.data);
           return;
         }
+        // candle：confirm/forming 维持即时（右侧 K 线需即时落定）；其价格经门控并入节流缓冲，
+        // 使 flush 成为 lastPrice 的唯一写入口，避免与节流流互相打架（面板顶部最新价同步降到 1~2Hz）。
         const candle = event.data;
-        if ((lastMarketTsRef.current ?? 0) <= candle.ts) setLastPrice(candle.c);
+        if ((lastMarketTsRef.current ?? 0) <= candle.ts) throttle.pushPrice(candle.c, candle.ts);
         if (!applyPublicCandle) return;
         if (candle.confirm === true) {
           setLive((prev) => mergeUnique(prev, [candle]));
@@ -336,6 +351,7 @@ export default function Page() {
     );
     ws.connect();
     return () => {
+      throttle.dispose(); // instId/bar 变化或卸载时清除定时器并丢弃挂起帧；effect 重建即重置全部节流基线
       ws.close();
       setLiveWsOpen(false);
     };

@@ -1,17 +1,29 @@
 import type { Candle, MarketTicker, MarketTrade, OrderBookLevel, OrderBookSnapshot } from "./types";
 
+// 把一批新成交一次性折叠进既有成交带：prev 在同 key 上胜出（不被新数据覆盖），整体按 ts 降序后截断。
+// 一次 Map 遍历完成，避免节流 flush 时对每条 pending 调用一次 mergeTradeTape 的 O(limit) 重复折叠。
+export function foldTradeTape(
+  prev: MarketTrade[],
+  incoming: MarketTrade[],
+  limit = 40,
+): MarketTrade[] {
+  const byKey = new Map<string, MarketTrade>();
+  for (const row of prev) byKey.set(tradeKey(row), row);
+  for (const trade of incoming) {
+    const key = tradeKey(trade);
+    if (!byKey.has(key)) byKey.set(key, trade);
+  }
+  return Array.from(byKey.values())
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, limit);
+}
+
 export function mergeTradeTape(
   prev: MarketTrade[],
   trade: MarketTrade,
   limit = 40,
 ): MarketTrade[] {
-  const byKey = new Map<string, MarketTrade>();
-  for (const row of prev) byKey.set(tradeKey(row), row);
-  const key = tradeKey(trade);
-  if (!byKey.has(key)) byKey.set(key, trade);
-  return Array.from(byKey.values())
-    .sort((a, b) => b.ts - a.ts)
-    .slice(0, limit);
+  return foldTradeTape(prev, [trade], limit);
 }
 
 export function resolveLivePrice(
