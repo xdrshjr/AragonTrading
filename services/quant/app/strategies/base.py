@@ -28,6 +28,8 @@ class StrategyMeta(BaseModel):
     key: str               # 唯一标识，如 "long_shadow_reversal"
     name: str
     description: str
+    # 区分原子策略与组合策略（轮动）；默认 "atomic" 使既有策略零改动向后兼容。
+    kind: str = "atomic"   # "atomic" | "combo"
     default_params: dict
     params_schema: dict     # 与前端 ParamSchema 对齐
 

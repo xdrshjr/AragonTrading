@@ -13,6 +13,7 @@ import { useAppStore } from "@/lib/store";
 import { downloadCsv, equityToCsv, tradesToCsv } from "@/lib/export";
 import type { Metrics, PaperSessionRow, PaperStrategySession, Strategy } from "@/lib/types";
 import { Button, Skeleton, Tabs } from "@/components/ui";
+import ComboView from "./ComboView";
 import CompareView from "./CompareView";
 import MetricsCards from "./MetricsCards";
 import RunHistory from "./RunHistory";
@@ -126,7 +127,10 @@ export default function StrategyPanel() {
   }, [mode, strategies, paperSessionsQ.data, paperSessionsByStrategyId, applyReconcile]);
 
   const selected = strategies?.find((s) => s.id === strategyId);
-  const enabledStrategies = strategies?.filter((s) => !s.unavailable && s.enabled) ?? [];
+  // 组合策略在「组合」页签构建/回测、在「对比」页签横向比较；回测/实时列表只列原子策略，
+  // 既避免在实时模拟误启动组合（组合不接 paper），也保持各模式职责清晰。
+  const atomicStrategies = strategies?.filter((s) => s.kind !== "combo") ?? [];
+  const enabledStrategies = atomicStrategies.filter((s) => !s.unavailable && s.enabled);
   const runningSessions = Object.values(paperSessionsByStrategyId);
   const selectedCount = paperSelectionIds.length;
   const capReached = selectedCount >= maxPaperSessions;
@@ -288,7 +292,9 @@ export default function StrategyPanel() {
       </div>
 
       <div className="flex-1 overflow-auto px-4 py-3">
-        {mode === "compare" ? (
+        {mode === "combo" ? (
+          <ComboView />
+        ) : mode === "compare" ? (
           <CompareView />
         ) : (
           <>
@@ -306,7 +312,7 @@ export default function StrategyPanel() {
             )}
 
             <StrategyList
-              strategies={strategies}
+              strategies={atomicStrategies}
               activeId={strategyId}
               returnsById={returnsById}
               onSelect={(id) => setStrategyId(id)}

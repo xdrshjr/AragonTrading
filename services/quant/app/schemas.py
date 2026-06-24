@@ -60,6 +60,48 @@ class CompareReq(BaseModel):
         return self
 
 
+class ComboMemberIn(BaseModel):
+    """组合成员入参：自包含快照 {templateKey, params}（不引用其它策略行主键）。"""
+
+    templateKey: str
+    params: dict[str, Any] = Field(default_factory=dict)
+    name: str | None = None
+
+
+class ComboPolicyIn(BaseModel):
+    """轮动策略入参（camelCase 与前端对齐；缺省即模板默认）。"""
+
+    rebalanceBars: int = Field(default=24, ge=4, le=240)
+    lookbackBars: int = Field(default=168, ge=24, le=1000)
+    selectionMetric: Literal["return", "sharpe", "calmar"] = "sharpe"
+    minDwellBars: int = Field(default=24, ge=1, le=240)
+    switchMarginPct: float = Field(default=0.10, ge=0.0, le=1.0)
+    regimeGating: bool = True
+    turnoverBps: float = Field(default=5.0, ge=0.0, le=50.0)
+
+
+class ComboPreviewReq(BaseModel):
+    """POST /strategies/combo/preview：即时回测一个（未保存）组合。"""
+
+    members: list[ComboMemberIn] = Field(min_length=2, max_length=8)  # 2..8 个成员
+    policy: ComboPolicyIn | None = None                               # 缺省用模板默认
+    instId: str
+    bar: str = "1H"
+    limit: int = Field(default=1000, ge=10, le=1000)   # 同 BacktestReq 上限
+    startTs: int = Field(ge=0)
+    endTs: int = Field(ge=0)
+    initialCapital: float | None = None
+    fees: float | None = None        # taker_fee_bps
+    slippage: float | None = None    # slippage_bps
+    leverage: float | None = None
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "ComboPreviewReq":
+        if self.startTs >= self.endTs:
+            raise ValueError("startTs must be less than endTs")
+        return self
+
+
 class PaperStartReq(BaseModel):
     strategyId: int
     instId: str
@@ -137,6 +179,25 @@ def run_out(run: StrategyRun) -> dict:
         "id": run.id, "strategyId": run.strategy_id, "instId": run.inst_id, "bar": run.bar,
         "mode": run.mode, "status": run.status, "startTs": run.start_ts, "endTs": run.end_ts,
         "metrics": metrics,
+    }
+
+
+def _combo_segment_out(seg) -> dict:
+    """ComboSegment → 前端 dict（camelCase）。"""
+    return {
+        "startTs": seg.start_ts, "endTs": seg.end_ts, "memberKey": seg.member_key,
+        "memberName": seg.member_name, "regime": seg.regime, "bars": seg.bars,
+        "contribution": round(seg.contribution, 6),
+    }
+
+
+def combo_out(result, notes: list[str] | None = None) -> dict:
+    """ComboBacktestResult 的 `combo` 子对象序列化（annualized + 时间线 + 分体制贡献 + notes）。"""
+    return {
+        "annualizedReturn": round(result.annualized_return, 6),
+        "timeline": [_combo_segment_out(s) for s in result.segments],
+        "breakdown": list(result.breakdown),
+        "notes": notes if notes is not None else list(result.notes),
     }
 
 

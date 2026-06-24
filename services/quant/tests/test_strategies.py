@@ -68,6 +68,10 @@ def test_ema_cross_emits_signal():
 def test_backtest_runs_for_all_strategies():
     candles = make_synthetic_candles(300)
     for key, cls in STRATEGY_REGISTRY.items():
+        # 组合策略（kind=="combo"）走 engine.combo.run_combo_backtest，不可直接进 run_backtest
+        # （其 on_candle 显式抛错）；其覆盖见 test_combo_engine.py。
+        if getattr(cls.meta, "kind", "atomic") == "combo":
+            continue
         strat = cls()
         result = run_backtest(strat, candles, "1H", initial_capital=10000,
                               taker_fee_bps=5, slippage_bps=2)

@@ -2,6 +2,7 @@
 // F3：用 persist 中间件把选择态/主题落 localStorage（key "aragon-ui"），刷新后恢复上次工作上下文。
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
+import { type ComboDraft, DEFAULT_COMBO_DRAFT } from "./combo";
 import { DEFAULT_INDICATORS, type IndicatorKey } from "./indicators";
 import { FALLBACK_INSTRUMENTS } from "./instruments";
 import type {
@@ -72,6 +73,8 @@ interface AppState {
   chartSplitRatio: number;
   rightTab: RightTab;
   agentConversationId: string;
+  // 策略组合草稿（成员 id + 轮动参数）：持久化，跨刷新恢复上次搭建的组合上下文。
+  comboDraft: ComboDraft;
   // 设置中心（spec §5.3）：showSettings 为瞬态（不持久化，刷新回工作台）；settingsSection 持久化。
   showSettings: boolean;
   settingsSection: string;
@@ -112,6 +115,7 @@ interface AppState {
   setRightTab: (tab: RightTab) => void;
   setAgentConversationId: (id: string) => void;
   newConversation: () => void;
+  setComboDraft: (draft: ComboDraft) => void;
   setShowSettings: (show: boolean) => void;
   setSettingsSection: (section: string) => void;
 }
@@ -149,6 +153,7 @@ export const useAppStore = create<AppState>()(
       // 右侧默认激活「AI 助手」页签；会话 id 首次为空，挂载时生成并落盘以便重连恢复。
       rightTab: "agent",
       agentConversationId: "",
+      comboDraft: { memberIds: [], policy: { ...DEFAULT_COMBO_DRAFT.policy } },
       // 设置中心：默认在工作台（showSettings=false）；默认设置项为「AI 模型服务」。
       showSettings: false,
       settingsSection: "ai-models",
@@ -165,7 +170,13 @@ export const useAppStore = create<AppState>()(
       setMode: (mode) =>
         set({
           mode,
-          chartView: mode === "compare" ? "compare-range" : "live-follow",
+          // 组合回测后用 runId 在左图画单条组合净值（复用 run-range）；对比走 compare-range；余者实时。
+          chartView:
+            mode === "compare"
+              ? "compare-range"
+              : mode === "combo"
+                ? "run-range"
+                : "live-follow",
         }),
       // 账户模式写：选「实盘」时联动 chartView="live-follow"（§5.3）；「模拟盘」保持现状，
       // setMode("paper") 由组件另行编排。实盘进入由组件做凭证 / 开关守门（C1-5），此处只落状态。
@@ -251,6 +262,8 @@ export const useAppStore = create<AppState>()(
       setAgentConversationId: (agentConversationId) => set({ agentConversationId }),
       // 新对话：生成新会话 uuid（旧消息流随 conversationId 变更而失效，DB 历史仍可经其原 id 查到）。
       newConversation: () => set({ agentConversationId: makeConversationId() }),
+      // 组合草稿：成员选择 / 轮动参数变更（持久化，跨刷新恢复）。
+      setComboDraft: (comboDraft) => set({ comboDraft }),
       // 设置中心：切换设置面板（瞬态）/ 切换当前设置项（持久化）。
       setShowSettings: (showSettings) => set({ showSettings }),
       setSettingsSection: (settingsSection) => set({ settingsSection }),
@@ -269,7 +282,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 10,
+      version: 11,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -291,6 +304,7 @@ export const useAppStore = create<AppState>()(
         chartSplitRatio: s.chartSplitRatio,
         rightTab: s.rightTab,
         agentConversationId: s.agentConversationId,
+        comboDraft: s.comboDraft,
         // 持久化当前设置项；showSettings 为瞬态故**不**入 partialize（刷新默认回工作台，R-Migrate）。
         settingsSection: s.settingsSection,
       }),
@@ -326,6 +340,10 @@ export const useAppStore = create<AppState>()(
           // accountMode="live" 的水合守门（缺默认账户 / 开关关闭即回落 sim，C1-5）须依赖后端异步数据，
           // 故由 AccountModeSwitch 挂载时校验，迁移此处不动 accountMode。
           next = { ...next, liveAcknowledged: false };
+        }
+        if (version < 11) {
+          // 策略组合：补默认组合草稿（成员空 + 轮动参数默认）。
+          next = { ...next, comboDraft: { ...DEFAULT_COMBO_DRAFT, policy: { ...DEFAULT_COMBO_DRAFT.policy } } };
         }
         return next as never;
       },

@@ -1,6 +1,9 @@
 // REST 客户端：封装 /api/py/*（经 Next rewrite 代理到 Python 后端）(spec §8.2 / §9.1)。
 import type {
   Candle,
+  ComboMemberSpec,
+  ComboPolicy,
+  ComboPreviewResult,
   CompareResult,
   DataSource,
   EquityPoint,
@@ -133,6 +136,25 @@ export const api = {
     leverage?: number;
   }) =>
     request<CompareResult>("/strategies/compare", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  // 策略组合即时回测（regime rotation）：落一条 backtest run 并回轮动时间线/分体制贡献。
+  comboPreview: (body: {
+    members: ComboMemberSpec[];
+    policy?: Partial<ComboPolicy>;
+    instId: string;
+    bar: string;
+    limit?: number;
+    startTs: number;
+    endTs: number;
+    initialCapital?: number;
+    fees?: number;
+    slippage?: number;
+    leverage?: number;
+  }) =>
+    request<ComboPreviewResult>("/strategies/combo/preview", {
       method: "POST",
       body: JSON.stringify(body),
     }),

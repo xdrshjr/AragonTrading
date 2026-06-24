@@ -13,7 +13,13 @@ from ..agent import services
 from ..db import repositories as repo
 from ..db.session import get_session
 from ..okx.rest_client import get_rest_client
-from ..schemas import BacktestReq, CompareReq, CreateStrategyReq, UpdateStrategyReq
+from ..schemas import (
+    BacktestReq,
+    ComboPreviewReq,
+    CompareReq,
+    CreateStrategyReq,
+    UpdateStrategyReq,
+)
 from ..strategies.base import get_strategy_class
 
 router = APIRouter(tags=["strategies"])
@@ -60,6 +66,20 @@ async def delete_strategy(strategy_id: int, session: AsyncSession = Depends(get_
         raise HTTPException(409, detail={"code": "BUILTIN_READONLY",
                                          "message": "内置模板不可删除，请改用'另存为'或禁用"})
     return Response(status_code=204)
+
+
+@router.post("/strategies/combo/preview")
+async def combo_preview(body: ComboPreviewReq,
+                        session: AsyncSession = Depends(get_session)) -> dict:
+    """即时回测一个（未保存）组合，落一条 backtest run 以便用 runId 拉净值/成交。"""
+    return await services.run_combo_preview(
+        session, get_rest_client(),
+        members_spec=[m.model_dump() for m in body.members],
+        policy_spec=body.policy.model_dump() if body.policy else None,
+        inst_id=body.instId, bar=body.bar, limit=body.limit,
+        start_ts=body.startTs, end_ts=body.endTs, initial_capital=body.initialCapital,
+        fees=body.fees, slippage=body.slippage, leverage=body.leverage,
+    )
 
 
 @router.post("/strategies/{strategy_id}/backtest")

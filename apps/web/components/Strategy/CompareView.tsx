@@ -7,7 +7,7 @@ import { colorForIndex, sortCompareItems, type SortDir, type SortKey } from "@/l
 import { fmtNum, fmtPct } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 import type { CompareResult } from "@/lib/types";
-import { Button } from "@/components/ui";
+import { Badge, Button } from "@/components/ui";
 
 const COLUMNS: { key: SortKey; label: string }[] = [
   { key: "totalReturn", label: "收益率" },
@@ -87,7 +87,7 @@ export default function CompareView() {
       <div>
         <h3 className="text-sm font-semibold text-[var(--text)]">多策略对比</h3>
         <p className="text-[11px] text-[var(--muted)]">
-          选择 2–12 个策略，对同一标的 / 周期一键回测并横向对比（真实 OKX 数据）。
+          选择 2–12 个策略（可混选「组合」），对同一标的 / 周期一键回测并横向对比期望收益（真实 OKX 数据）。
         </p>
       </div>
 
@@ -105,6 +105,7 @@ export default function CompareView() {
               className="h-3.5 w-3.5 accent-[var(--accent)]"
             />
             <span className="flex-1 truncate text-[var(--text)]">{s.name}</span>
+            {s.kind === "combo" && <Badge tone="accent">组合</Badge>}
             {s.builtin && <span className="text-[10px] text-[var(--muted)]">内置</span>}
           </label>
         ))}

@@ -345,6 +345,21 @@ def _per_bar_primaries(df: pd.DataFrame, params: RegimeParams) -> list[tuple[int
     return out
 
 
+def per_bar_primaries(df: pd.DataFrame, params: RegimeParams | None = None) -> list[tuple[int, str]]:
+    """逐根结构标签的公开稳定包装（组合层轮动复用，严格因果）。
+
+    Args:
+        df: ``candles_to_df`` 产物（升序）。
+        params: 可选体制参数覆盖，缺省即生产默认。
+
+    Returns:
+        ``list[(i, primary)]``（升序，仅含第 ``max(ema_slow_p, trend_win)`` 根起的条目；
+        起算根之前不产条目，由调用方按需补中性标签）。
+    """
+    params = params or RegimeParams()
+    return _per_bar_primaries(df.reset_index(drop=True), params)
+
+
 def _merge_runs(primaries: list[tuple[int, str]]) -> list[dict]:
     """相邻同结构标签合并为原始子段。"""
     runs: list[dict] = []

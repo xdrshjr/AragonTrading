@@ -76,6 +76,9 @@ export default function Page() {
     toggleTheme,
   } = useAppStore();
 
+  // 回测与组合同档：都用单条 run 净值 + 成交 markers 在左图渲染（复用 run-range 链路）。
+  const singleRunMode = mode === "backtest" || mode === "combo";
+
   const [older, setOlder] = useState<Candle[]>([]);
   const [live, setLive] = useState<Candle[]>([]);
   const [forming, setForming] = useState<Candle | null>(null);
@@ -110,13 +113,13 @@ export default function Page() {
   const runQ = useQuery({
     queryKey: ["run", runId],
     queryFn: () => api.run(runId as number),
-    enabled: !!runId && mode === "backtest",
+    enabled: !!runId && singleRunMode,
   });
   const runRange = useMemo(() => {
     const run = runQ.data;
-    if (mode !== "backtest" || !run || run.endTs == null) return null;
+    if (!singleRunMode || !run || run.endTs == null) return null;
     return { instId: run.instId, bar: run.bar, startTs: run.startTs, endTs: run.endTs };
-  }, [mode, runQ.data]);
+  }, [singleRunMode, runQ.data]);
   const chartRange = useMemo(
     () =>
       resolveChartRange({
@@ -222,12 +225,12 @@ export default function Page() {
   const equityQ = useQuery({
     queryKey: ["equity", runId],
     queryFn: () => api.equity(runId as number),
-    enabled: !!runId && mode === "backtest",
+    enabled: !!runId && singleRunMode,
   });
   const tradesQ = useQuery({
     queryKey: ["trades", runId, BACKTEST_TRADE_LIMIT],
     queryFn: () => api.trades(runId as number, BACKTEST_TRADE_LIMIT),
-    enabled: !!runId && mode === "backtest" && chartView === "run-range",
+    enabled: !!runId && singleRunMode && chartView === "run-range",
   });
 
   const paperStrategies = useMemo(
@@ -375,7 +378,7 @@ export default function Page() {
   const overlayEquity =
     mode === "paper"
       ? paperActiveEquity
-      : chartView === "run-range" && mode === "backtest"
+      : chartView === "run-range" && singleRunMode
         ? equityQ.data
         : undefined;
   const overlays =
@@ -383,13 +386,13 @@ export default function Page() {
   const overlayTrades =
     mode === "paper"
       ? paperOverlayTrades
-      : chartView === "run-range" && mode === "backtest"
+      : chartView === "run-range" && singleRunMode
         ? tradesQ.data
         : undefined;
   const bottomTrades = mode === "paper" ? activePaperTrades : overlayTrades;
   const tradeCapReached =
     chartView === "run-range" &&
-    mode === "backtest" &&
+    singleRunMode &&
     (tradesQ.data?.length ?? 0) >= BACKTEST_TRADE_LIMIT;
 
   useEffect(() => {

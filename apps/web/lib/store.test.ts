@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { DEFAULT_COMBO_POLICY } from "./combo";
 import { FALLBACK_INSTRUMENTS } from "./instruments";
 import { DEFAULT_SIM_BALANCE, useAppStore } from "./store";
 
@@ -159,6 +160,44 @@ describe("app store — settings center (v9)", () => {
     const s = useAppStore.getState();
     expect(s.settingsSection).toBe("ai-models");
     expect(s.showSettings).toBe(false); // 瞬态默认值，不来自持久化
+    expect(s.instId).toBe("ETH-USDT-SWAP");
+  });
+});
+
+describe("app store — strategy combination (v11)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({ comboDraft: { memberIds: [], policy: { ...DEFAULT_COMBO_POLICY } } });
+  });
+
+  it("setMode('combo') switches chartView to run-range", () => {
+    useAppStore.getState().setMode("combo");
+    expect(useAppStore.getState().mode).toBe("combo");
+    expect(useAppStore.getState().chartView).toBe("run-range");
+  });
+
+  it("persists comboDraft", () => {
+    useAppStore.getState().setComboDraft({
+      memberIds: [1, 2, 3],
+      policy: { ...DEFAULT_COMBO_POLICY, rebalanceBars: 48 },
+    });
+    const persisted = JSON.parse(localStorage.getItem("aragon-ui") as string);
+    expect(persisted.state.comboDraft.memberIds).toEqual([1, 2, 3]);
+    expect(persisted.state.comboDraft.policy.rebalanceBars).toBe(48);
+  });
+
+  it("migrates v10 persisted state to v11 with default comboDraft", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({
+        state: { instId: "ETH-USDT-SWAP", mode: "backtest" },
+        version: 10,
+      }),
+    );
+    await useAppStore.persist.rehydrate();
+    const s = useAppStore.getState();
+    expect(s.comboDraft.memberIds).toEqual([]);
+    expect(s.comboDraft.policy.selectionMetric).toBe("sharpe");
     expect(s.instId).toBe("ETH-USDT-SWAP");
   });
 });

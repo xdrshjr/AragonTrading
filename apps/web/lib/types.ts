@@ -1,5 +1,5 @@
 export type Bar = "1m" | "5m" | "15m" | "30m" | "1H" | "4H" | "1D";
-export type Mode = "backtest" | "compare" | "paper";
+export type Mode = "backtest" | "compare" | "combo" | "paper";
 export type AccountMode = "sim" | "live";
 export type ChartView = "run-range" | "compare-range" | "live-follow";
 export type ChartPane = "price" | "equity";
@@ -92,11 +92,59 @@ export interface Strategy {
   templateKey: string;
   name: string;
   description: string;
+  // 原子策略 "atomic" | 组合策略 "combo"（后端 merge_strategy 输出；旧前端忽略不影响）。
+  kind?: "atomic" | "combo";
   params: Record<string, unknown>;
   paramsSchema: ParamSchema;
   enabled: boolean;
   builtin: boolean;
   unavailable?: boolean;
+}
+
+// ---- 策略组合（regime rotation）----
+export interface ComboMemberSpec {
+  templateKey: string;
+  params: Record<string, unknown>;
+  name?: string;
+}
+
+export interface ComboPolicy {
+  rebalanceBars: number;
+  lookbackBars: number;
+  selectionMetric: "return" | "sharpe" | "calmar";
+  minDwellBars: number;
+  switchMarginPct: number;
+  regimeGating: boolean;
+  turnoverBps: number;
+}
+
+export interface ComboTimelineSeg {
+  startTs: number;
+  endTs: number;
+  memberKey: string;
+  memberName: string;
+  regime: string;
+  bars: number;
+  contribution: number;
+}
+
+export interface ComboBreakdownRow {
+  regime: string;
+  memberKey: string;
+  memberName: string;
+  bars: number;
+  contribution: number;
+}
+
+export interface ComboPreviewResult {
+  runId: number;
+  metrics: Metrics;
+  combo: {
+    annualizedReturn: number;
+    timeline: ComboTimelineSeg[];
+    breakdown: ComboBreakdownRow[];
+    notes?: string[];
+  };
 }
 
 export interface Trade {
