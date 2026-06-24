@@ -90,6 +90,9 @@ interface AppState {
   agentConversationId: string;
   // 策略组合草稿（成员 id + 轮动参数）：持久化，跨刷新恢复上次搭建的组合上下文。
   comboDraft: ComboDraft;
+  // 组合编辑指针：null=新建态，number=正在编辑该组合 id。瞬态（不入 partialize），
+  // 刷新即复位，避免指向已删行（无需 bump 持久化 version）。
+  comboEditingId: number | null;
   // 设置中心（spec §5.3）：showSettings 为瞬态（不持久化，刷新回工作台）；settingsSection 持久化。
   showSettings: boolean;
   settingsSection: string;
@@ -133,6 +136,7 @@ interface AppState {
   setAgentConversationId: (id: string) => void;
   newConversation: () => void;
   setComboDraft: (draft: ComboDraft) => void;
+  setComboEditingId: (id: number | null) => void;
   setShowSettings: (show: boolean) => void;
   setSettingsSection: (section: string) => void;
 }
@@ -174,6 +178,7 @@ export const useAppStore = create<AppState>()(
       rightTab: "agent",
       agentConversationId: "",
       comboDraft: { memberIds: [], policy: { ...DEFAULT_COMBO_DRAFT.policy } },
+      comboEditingId: null,
       // 设置中心：默认在工作台（showSettings=false）；默认设置项为「AI 模型服务」。
       showSettings: false,
       settingsSection: "ai-models",
@@ -284,6 +289,8 @@ export const useAppStore = create<AppState>()(
       newConversation: () => set({ agentConversationId: makeConversationId() }),
       // 组合草稿：成员选择 / 轮动参数变更（持久化，跨刷新恢复）。
       setComboDraft: (comboDraft) => set({ comboDraft }),
+      // 组合编辑指针：进入编辑置 id，保存 / 放弃置 null（瞬态，不持久化）。
+      setComboEditingId: (comboEditingId) => set({ comboEditingId }),
       // 设置中心：切换设置面板（瞬态）/ 切换当前设置项（持久化）。
       setShowSettings: (showSettings) => set({ showSettings }),
       setSettingsSection: (settingsSection) => set({ settingsSection }),

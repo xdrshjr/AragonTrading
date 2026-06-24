@@ -1,5 +1,6 @@
 // REST 客户端：封装 /api/py/*（经 Next rewrite 代理到 Python 后端）(spec §8.2 / §9.1)。
 import type {
+  BacktestResult,
   Candle,
   ComboMemberSpec,
   ComboPolicy,
@@ -9,7 +10,6 @@ import type {
   EquityPoint,
   Health,
   Instrument,
-  Metrics,
   PaperBatchStartResult,
   PaperBatchStopResult,
   PaperSessionRow,
@@ -117,7 +117,7 @@ export const api = {
       leverage?: number;
     },
   ) =>
-    request<{ runId: number; metrics: Metrics }>(`/strategies/${id}/backtest`, {
+    request<BacktestResult>(`/strategies/${id}/backtest`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

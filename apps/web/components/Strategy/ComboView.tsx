@@ -1,16 +1,23 @@
 "use client";
 
-import { useMutation, useQueryClient, useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { api } from "@/lib/api";
 import {
   clampComboPolicy,
+  DEFAULT_COMBO_POLICY,
+  extractComboPolicy,
   groupBreakdownByRegime,
+  importComboMembers,
+  isUserCombo,
   MAX_MEMBERS,
+  resolveMemberIds,
+  selectedMembers,
   validateMemberCount,
 } from "@/lib/combo";
+import { POLICY_HINTS } from "@/lib/comboPolicyHints";
 import { colorForReturn, fmtPct } from "@/lib/format";
-import { regimeAffinityLabels, regimeLabel } from "@/lib/regimeAffinity";
+import { regimeLabel } from "@/lib/regimeAffinity";
 import { useAppStore } from "@/lib/store";
 import type {
   ComboMemberSpec,
@@ -19,20 +26,13 @@ import type {
   ParamSchema,
   Strategy,
 } from "@/lib/types";
-import { Badge, Button } from "@/components/ui";
+import { Button } from "@/components/ui";
+import ComboDetailModal from "./ComboDetailModal";
 import ComboTimeline from "./ComboTimeline";
+import DeleteComboConfirm from "./DeleteComboConfirm";
+import MemberPicker from "./MemberPicker";
 import MetricsCards from "./MetricsCards";
-
-// 轮动参数 tooltip：解释每项的抗过拟合 / 抗未来函数含义（人机交互：让保守默认可被理解）。
-const POLICY_HINTS: Record<string, string> = {
-  rebalanceBars: "每隔多少根重新决策一次活跃成员。间隔越大切换越少、越稳健。",
-  lookbackBars: "评估成员近端表现的回看窗口。宜覆盖多个再平衡周期，过短易过拟合。",
-  selectionMetric: "在候选成员中选优的指标：收益率 / 夏普(风险调整) / 卡玛(收益/回撤)。",
-  minDwellBars: "选中成员的最短持有根数，抑制频繁来回切换(whipsaw)。",
-  switchMarginPct: "切换迟滞：挑战者须超出在任者该相对优势才替换，过滤噪声切换。",
-  regimeGating: "仅在与当前体制匹配的候选成员内选优(注入领域先验，抗过拟合)。",
-  turnoverBps: "每次切换扣的换手成本(基点)，近似建仓代价，避免高估收益。",
-};
+import SavedCombosList from "./SavedCombosList";
 
 export default function ComboView() {
   const qc = useQueryClient();
@@ -44,27 +44,34 @@ export default function ComboView() {
     backtestEndTs,
     comboDraft,
     setComboDraft,
+    comboEditingId,
+    setComboEditingId,
     setRunId,
     setMode,
   } = useAppStore();
-  const { data: strategies } = useQuery({ queryKey: ["strategies"], queryFn: api.strategies });
-  const [result, setResult] = useState<ComboPreviewResult | null>(null);
-  const [saveError, setSaveError] = useState<string | null>(null);
+  const { data: strategies, isLoading } = useQuery({
+    queryKey: ["strategies"],
+    queryFn: api.strategies,
+  });
 
-  const candidates = (strategies ?? []).filter(
-    (s) => s.kind !== "combo" && !s.unavailable && s.enabled,
-  );
-  const comboTemplate = (strategies ?? []).find((s) => s.templateKey === "regime_rotation");
+  const [result, setResult] = useState<ComboPreviewResult | null>(null);
+  const [name, setName] = useState("");
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [importNotice, setImportNotice] = useState<string | null>(null);
+  const [detailCombo, setDetailCombo] = useState<Strategy | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Strategy | null>(null);
+
+  const all = strategies ?? [];
+  const candidates = all.filter((s) => s.kind !== "combo" && !s.unavailable && s.enabled);
+  const userCombos = all.filter(isUserCombo);
+  const pickerCombos = userCombos.filter((s) => s.id !== comboEditingId);
+  const comboTemplate = all.find((s) => s.templateKey === "regime_rotation");
   const policySchema: ParamSchema = comboTemplate?.paramsSchema ?? {};
   const memberIds = comboDraft.memberIds.filter((id) => candidates.some((s) => s.id === id));
   const policy = comboDraft.policy;
   const memberError = validateMemberCount(memberIds.length);
-
-  const selectedMembers = (): ComboMemberSpec[] =>
-    memberIds
-      .map((id) => candidates.find((s) => s.id === id))
-      .filter((s): s is Strategy => Boolean(s))
-      .map((s) => ({ templateKey: s.templateKey, params: s.params, name: s.name }));
+  const nameError = name.trim().length === 0;
+  const isEditing = comboEditingId !== null;
 
   const toggleMember = (id: number) => {
     const next = memberIds.includes(id)
@@ -78,10 +85,47 @@ export default function ComboView() {
   const setPolicyValue = (key: string, value: unknown) =>
     setComboDraft({ ...comboDraft, policy: { ...policy, [key]: value } as ComboPolicy });
 
+  // 复位编辑器到「新建」空态（兼作「+ 新建组合」「放弃编辑」「保存成功后」三处复用）。
+  const resetEditor = () => {
+    setComboDraft({ memberIds: [], policy: { ...DEFAULT_COMBO_POLICY } });
+    setComboEditingId(null);
+    setName("");
+    setResult(null);
+    setSaveError(null);
+    setImportNotice(null);
+  };
+
+  // 进入编辑态：成员快照映射回草稿 id、取出轮动参数、回填名称（R4b），并置编辑指针。
+  const loadForEdit = (combo: Strategy) => {
+    const members = Array.isArray(combo.params?.members)
+      ? (combo.params.members as ComboMemberSpec[])
+      : [];
+    const { memberIds: ids } = resolveMemberIds(members, candidates);
+    setComboDraft({ memberIds: ids, policy: extractComboPolicy(combo.params ?? {}) });
+    setComboEditingId(combo.id);
+    setName(combo.name);
+    setResult(null);
+    setSaveError(null);
+    setImportNotice(null);
+    setDetailCombo(null);
+  };
+
+  const handleImport = (combo: Strategy) => {
+    const { memberIds: next, importedCount, dropped } = importComboMembers(
+      combo,
+      candidates,
+      memberIds,
+    );
+    setComboDraft({ ...comboDraft, memberIds: next });
+    const parts = [`已展开导入 ${importedCount} 个原子成员（组合不可嵌套）`];
+    if (dropped.length) parts.push(`${dropped.length} 个成员不可用已跳过`);
+    setImportNotice(parts.join(" · "));
+  };
+
   const preview = useMutation({
     mutationFn: () =>
       api.comboPreview({
-        members: selectedMembers(),
+        members: selectedMembers(memberIds, candidates),
         policy: clampComboPolicy(policy),
         instId,
         bar,
@@ -96,127 +140,196 @@ export default function ComboView() {
     },
   });
 
-  const saveAs = useMutation({
-    mutationFn: (name: string) =>
-      api.createStrategy({
-        templateKey: "regime_rotation",
-        name,
-        params: { members: selectedMembers(), ...clampComboPolicy(policy) },
-      }),
+  const buildParams = () => ({
+    members: selectedMembers(memberIds, candidates),
+    ...clampComboPolicy(policy),
+  });
+
+  const create = useMutation({
+    mutationFn: () =>
+      api.createStrategy({ templateKey: "regime_rotation", name: name.trim(), params: buildParams() }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["strategies"] });
-      setSaveError(null);
+      resetEditor();
     },
     onError: (e) => setSaveError((e as Error).message),
   });
 
+  const update = useMutation({
+    mutationFn: (id: number) => api.updateStrategy(id, { name: name.trim(), params: buildParams() }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["strategies"] });
+      resetEditor();
+    },
+    onError: (e) => setSaveError((e as Error).message),
+  });
+
+  const remove = useMutation({
+    mutationFn: (id: number) => api.deleteStrategy(id),
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: ["strategies"] });
+      if (comboEditingId === id) resetEditor();
+      if (detailCombo?.id === id) setDetailCombo(null);
+      setDeleteTarget(null);
+    },
+  });
+
+  const runBacktest = useMutation({
+    mutationFn: (id: number) =>
+      api.backtest(id, {
+        instId,
+        bar,
+        limit: 1000,
+        startTs: backtestStartTs,
+        endTs: backtestEndTs,
+        initialCapital: simBalance,
+      }),
+    onSuccess: (res) => {
+      setRunId(res.runId);
+      if (res.combo) setResult({ runId: res.runId, metrics: res.metrics, combo: res.combo });
+    },
+  });
+
+  const handleSave = () => {
+    if (memberError || nameError) return;
+    if (comboEditingId !== null) update.mutate(comboEditingId);
+    else create.mutate();
+  };
+
   // 加载守门置于全部 hooks 之后（杜绝条件式调用 hooks）。
-  if (!strategies) {
+  if (isLoading || !strategies) {
     return <div className="py-8 text-center text-xs text-[var(--muted)]">加载策略…</div>;
   }
 
-  return (
-    <div className="flex flex-col gap-3">
-      <div>
-        <h3 className="text-sm font-semibold text-[var(--text)]">策略组合 · 体制自适应轮动</h3>
-        <p className="text-[11px] leading-relaxed text-[var(--muted)]">
-          自动识别不同时段市场体制并切换到近端表现最优的成员策略；决策滞后 1 根、严格因果无未来函数。
-        </p>
-      </div>
+  const saving = create.isPending || update.isPending;
+  const backtestingId = runBacktest.isPending ? (runBacktest.variables ?? null) : null;
 
-      <MemberPicker
-        candidates={candidates}
-        memberIds={memberIds}
-        maxMembers={MAX_MEMBERS}
-        onToggle={toggleMember}
+  return (
+    <div className="flex flex-col gap-4">
+      <SavedCombosList
+        combos={userCombos}
+        isLoading={isLoading}
+        editingId={comboEditingId}
+        backtestingId={backtestingId}
+        onNew={resetEditor}
+        onView={setDetailCombo}
+        onEdit={loadForEdit}
+        onDelete={setDeleteTarget}
+        onBacktest={(combo) => runBacktest.mutate(combo.id)}
       />
 
-      <PolicyEditor schema={policySchema} policy={policy} onChange={setPolicyValue} />
+      <div className="flex flex-col gap-3 border-t border-[var(--border)] pt-3">
+        <div>
+          <h3 className="text-sm font-semibold text-[var(--text)]">
+            {isEditing ? `编辑组合 · ${name || "未命名"}` : "新建组合 · 体制自适应轮动"}
+          </h3>
+          <p className="text-[11px] leading-relaxed text-[var(--muted)]">
+            自动识别不同时段市场体制并切换到近端表现最优的成员策略；决策滞后 1 根、严格因果无未来函数。
+          </p>
+        </div>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <Button
-          variant="primary"
-          size="sm"
-          disabled={!!memberError || preview.isPending}
-          onClick={() => preview.mutate()}
-        >
-          {preview.isPending ? "回测中…" : "运行组合回测"}
-        </Button>
-        {memberError && <span className="text-[11px] text-[var(--muted)]">{memberError}</span>}
+        <NameField value={name} onChange={setName} invalid={nameError} />
+
+        <MemberPicker
+          candidates={candidates}
+          userCombos={pickerCombos}
+          memberIds={memberIds}
+          maxMembers={MAX_MEMBERS}
+          onToggle={toggleMember}
+          onImportCombo={handleImport}
+          onViewCombo={setDetailCombo}
+          importNotice={importNotice}
+        />
+
+        <PolicyEditor schema={policySchema} policy={policy} onChange={setPolicyValue} />
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={!!memberError || nameError || saving}
+            onClick={handleSave}
+          >
+            {saving ? "保存中…" : isEditing ? "保存修改" : "保存组合"}
+          </Button>
+          <Button
+            variant="default"
+            size="sm"
+            disabled={!!memberError || preview.isPending}
+            onClick={() => preview.mutate()}
+          >
+            {preview.isPending ? "回测中…" : "运行组合回测"}
+          </Button>
+          {isEditing && (
+            <Button variant="ghost" size="sm" onClick={resetEditor}>
+              放弃编辑
+            </Button>
+          )}
+          {memberError && <span className="text-[11px] text-[var(--muted)]">{memberError}</span>}
+          {!memberError && nameError && (
+            <span className="text-[11px] text-[var(--muted)]">请填写组合名称</span>
+          )}
+          {saveError && <span className="text-[11px] text-[var(--short)]">保存失败：{saveError}</span>}
+        </div>
+
+        {preview.isError && (
+          <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+            回测失败：{(preview.error as Error)?.message}
+          </div>
+        )}
       </div>
 
-      {preview.isError && (
-        <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
-          回测失败：{(preview.error as Error)?.message}
-        </div>
+      {result && <ComboResult result={result} onGoCompare={() => setMode("compare")} />}
+
+      {detailCombo && (
+        <ComboDetailModal
+          combo={detailCombo}
+          strategies={all}
+          editDisabled={comboEditingId !== null && comboEditingId !== detailCombo.id}
+          onClose={() => setDetailCombo(null)}
+          onEdit={loadForEdit}
+          onDelete={(c) => {
+            setDetailCombo(null);
+            setDeleteTarget(c);
+          }}
+        />
       )}
 
-      {result && (
-        <ComboResult
-          result={result}
-          disabled={!!memberError}
-          saveError={saveError}
-          onSaveAs={(name) => saveAs.mutate(name)}
-          onGoCompare={() => setMode("compare")}
+      {deleteTarget && (
+        <DeleteComboConfirm
+          combo={deleteTarget}
+          pending={remove.isPending}
+          error={remove.isError ? (remove.error as Error).message : null}
+          onCancel={() => setDeleteTarget(null)}
+          onConfirm={() => remove.mutate(deleteTarget.id)}
         />
       )}
     </div>
   );
 }
 
-function MemberPicker({
-  candidates,
-  memberIds,
-  maxMembers,
-  onToggle,
+function NameField({
+  value,
+  onChange,
+  invalid,
 }: {
-  candidates: Strategy[];
-  memberIds: number[];
-  maxMembers: number;
-  onToggle: (id: number) => void;
+  value: string;
+  onChange: (v: string) => void;
+  invalid: boolean;
 }) {
-  const capReached = memberIds.length >= maxMembers;
   return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex items-center justify-between">
-        <span className="text-[11px] font-medium text-[var(--text)]">选择成员策略</span>
-        <span className="text-[11px] text-[var(--muted)]">
-          已选 {memberIds.length}/{maxMembers}
-        </span>
-      </div>
-      <div className="flex flex-col gap-1">
-        {candidates.map((s) => {
-          const checked = memberIds.includes(s.id);
-          const affinity = regimeAffinityLabels(s.templateKey);
-          return (
-            <label
-              key={s.id}
-              className="flex items-center gap-2 rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs"
-            >
-              <input
-                type="checkbox"
-                checked={checked}
-                disabled={!checked && capReached}
-                onChange={() => onToggle(s.id)}
-                className="h-3.5 w-3.5 accent-[var(--accent)]"
-              />
-              <span className="min-w-0 flex-1 truncate text-[var(--text)]">{s.name}</span>
-              {affinity.length > 0 && (
-                <span className="flex shrink-0 flex-wrap justify-end gap-1">
-                  {affinity.map((label) => (
-                    <span
-                      key={label}
-                      className="rounded-[5px] bg-[var(--surface-2)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]"
-                    >
-                      {label}
-                    </span>
-                  ))}
-                </span>
-              )}
-            </label>
-          );
-        })}
-      </div>
+    <div className="flex flex-col gap-1">
+      <label htmlFor="combo-name" className="text-[11px] font-medium text-[var(--text)]">
+        组合名称
+      </label>
+      <input
+        id="combo-name"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="例如：趋势·震荡自适应组合"
+        aria-invalid={invalid || undefined}
+        className="rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs text-[var(--text)] placeholder:text-[var(--muted)] outline-none transition-colors duration-150 hover:border-[var(--accent)] focus:border-[var(--accent)]"
+      />
     </div>
   );
 }
@@ -292,15 +405,9 @@ function PolicyEditor({
 
 function ComboResult({
   result,
-  disabled,
-  saveError,
-  onSaveAs,
   onGoCompare,
 }: {
   result: ComboPreviewResult;
-  disabled: boolean;
-  saveError: string | null;
-  onSaveAs: (name: string) => void;
   onGoCompare: () => void;
 }) {
   const { metrics, combo } = result;
@@ -334,24 +441,12 @@ function ComboResult({
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        <Button
-          variant="default"
-          size="sm"
-          disabled={disabled}
-          onClick={() => {
-            const name = window.prompt("另存为组合名称", "我的策略组合");
-            if (name) onSaveAs(name);
-          }}
-        >
-          另存为组合
-        </Button>
         <button
           onClick={onGoCompare}
           className="rounded-[6px] px-2 py-0.5 text-[11px] text-[var(--accent)] hover:bg-[var(--accent-soft)]"
         >
           在对比中查看已保存组合 →
         </button>
-        {saveError && <span className="text-[11px] text-[var(--short)]">保存失败：{saveError}</span>}
       </div>
     </div>
   );

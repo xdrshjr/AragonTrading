@@ -44,12 +44,18 @@ async def create_strategy(body: CreateStrategyReq,
                           session: AsyncSession = Depends(get_session)) -> dict:
     if get_strategy_class(body.templateKey) is None:
         raise HTTPException(400, detail={"code": "BAD_TEMPLATE", "message": "模板不存在"})
+    services.validate_combo_params(body.templateKey, body.params)
     return await repo.create_strategy(session, body.templateKey, body.name, body.params)
 
 
 @router.put("/strategies/{strategy_id}")
 async def update_strategy(strategy_id: int, body: UpdateStrategyReq,
                           session: AsyncSession = Depends(get_session)) -> dict:
+    # 改成员时按该行模板做组合成员数边界校验（P2 纵深防御，防绕过 UI 存出非法组合）。
+    if body.params is not None:
+        existing = await repo.get_strategy(session, strategy_id)
+        if existing is not None:
+            services.validate_combo_params(existing["templateKey"], body.params)
     s = await repo.update_strategy(session, strategy_id, name=body.name,
                                    params=body.params, enabled=body.enabled)
     if s is None:

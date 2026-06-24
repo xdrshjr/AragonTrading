@@ -235,10 +235,30 @@ async def run_compare(session: AsyncSession, rest, *, strategy_ids: list[int], i
 
 
 # ============================ 组合编排（regime rotation） ============================
+MIN_COMBO_MEMBERS = 2
+MAX_COMBO_MEMBERS = 8
+
+
 def _is_combo(template_key: str) -> bool:
     """该模板是否为组合策略（kind=="combo"）；模板失效 → False。"""
     cls = get_strategy_class(template_key)
     return cls is not None and getattr(cls.meta, "kind", "atomic") == "combo"
+
+
+def validate_combo_params(template_key: str, params: dict | None) -> None:
+    """保存 / 更新组合时的成员数边界校验（2..8）；非组合模板直接放行。
+
+    纵深防御（R6）：防绕过 UI 直接 POST/PUT 存出非法组合，与运行期 `_build_members` 的
+    `< 2` 兜底互补。越界即 400 `COMBO_MEMBERS`（与运行期同错误码，前端可统一处理）。
+    """
+    if not _is_combo(template_key):
+        return
+    members = (params or {}).get("members", [])
+    count = len(members) if isinstance(members, list) else 0
+    if count < MIN_COMBO_MEMBERS or count > MAX_COMBO_MEMBERS:
+        raise HTTPException(400, detail={
+            "code": "COMBO_MEMBERS",
+            "message": f"组合成员数须在 {MIN_COMBO_MEMBERS}..{MAX_COMBO_MEMBERS} 之间"})
 
 
 async def _combo_template_strategy_id(session: AsyncSession) -> int:

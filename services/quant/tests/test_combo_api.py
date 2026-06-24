@@ -101,6 +101,70 @@ async def test_combo_preview_guards_unavailable_members(patch_okx):
         await dispose_engine()
 
 
+_M2 = [
+    {"templateKey": "trend_pullback_long", "params": {}},
+    {"templateKey": "range_scalping_strategy", "params": {}},
+]
+
+
+def _combo_body(members: list[dict], name: str = "我的组合") -> dict:
+    return {"templateKey": "regime_rotation", "name": name,
+            "params": {"members": members, "selectionMetric": "sharpe"}}
+
+
+async def test_save_update_delete_user_combo(patch_okx):
+    """保存用户组合 → 列表含其 kind==combo → 改成员回读一致 → 删用户组合 204 / 删内置 409。"""
+    from app.db.session import dispose_engine, init_db
+    await init_db()
+    transport = ASGITransport(app=_load_app())
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.post("/api/strategies", json=_combo_body(_M2))
+            assert r.status_code == 201, r.text
+            created = r.json()
+            assert created["kind"] == "combo"
+            cid = created["id"]
+
+            listed = (await client.get("/api/strategies")).json()
+            assert any(s["id"] == cid and s["kind"] == "combo" for s in listed)
+
+            m3 = _M2 + [{"templateKey": "trend_pullback_short", "params": {}}]
+            r = await client.put(f"/api/strategies/{cid}",
+                                 json={"params": {"members": m3, "selectionMetric": "calmar"}})
+            assert r.status_code == 200, r.text
+            reread = (await client.get(f"/api/strategies/{cid}")).json()
+            assert len(reread["params"]["members"]) == 3
+
+            assert (await client.delete(f"/api/strategies/{cid}")).status_code == 204
+
+            builtin_id = next(s["id"] for s in listed
+                              if s["templateKey"] == "regime_rotation" and s["builtin"])
+            r = await client.delete(f"/api/strategies/{builtin_id}")
+            assert r.status_code == 409
+            assert r.json()["error"]["code"] == "BUILTIN_READONLY"
+    finally:
+        await dispose_engine()
+
+
+async def test_save_combo_rejects_member_count_out_of_bounds(patch_okx):
+    """绕过 UI 直接保存 <2 或 >8 成员的组合 → 400 COMBO_MEMBERS（纵深防御）。"""
+    from app.db.session import dispose_engine, init_db
+    await init_db()
+    transport = ASGITransport(app=_load_app())
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            r1 = await client.post("/api/strategies", json=_combo_body([_M2[0]]))
+            assert r1.status_code == 400
+            assert r1.json()["error"]["code"] == "COMBO_MEMBERS"
+
+            too_many = [{"templateKey": "trend_pullback_long", "params": {}} for _ in range(9)]
+            r2 = await client.post("/api/strategies", json=_combo_body(too_many))
+            assert r2.status_code == 400
+            assert r2.json()["error"]["code"] == "COMBO_MEMBERS"
+    finally:
+        await dispose_engine()
+
+
 async def test_combo_in_compare(patch_okx):
     """compare 传 1 组合 id + 1 原子 id → items 含两项且结构同构（可混排对比）。"""
     from app.db.session import dispose_engine, init_db

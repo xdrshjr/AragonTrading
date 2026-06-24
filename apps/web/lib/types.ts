@@ -147,6 +147,14 @@ export interface ComboPreviewResult {
   };
 }
 
+// 单策略回测响应（POST /strategies/{id}/backtest）。组合行后端追加 `combo`（_run_saved_combo），
+// 原子行 `combo` 为 undefined。详情弹窗绩效区据此渲染年化 / 时间线（R1）。
+export interface BacktestResult {
+  runId: number;
+  metrics: Metrics;
+  combo?: ComboPreviewResult["combo"];
+}
+
 export interface Trade {
   id?: number;
   runId?: number;
