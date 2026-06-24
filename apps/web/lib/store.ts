@@ -43,6 +43,19 @@ export const DEFAULT_CHART_SPLIT_RATIO = 0.8;
 const MIN_CHART_SPLIT_RATIO = 0.4;
 const MAX_CHART_SPLIT_RATIO = 0.85;
 
+// 右侧「AI 助手 / 交易策略」面板像素宽：用户拖拽左边框调宽，夹取 [320, 640]，持久化刷新恢复。
+// MAX 640 为宽屏（默认窗口 1440）上限；近最小窗口（860）放大右栏会触发 overflow-hidden 优雅裁切，
+// 双击复位或拉宽窗口即恢复（不溢出硬保证包络为右栏 ≤ 默认 380，详见 spec §6.2）。
+export const DEFAULT_RIGHT_PANEL_WIDTH = 380;
+const MIN_RIGHT_PANEL_WIDTH = 320;
+const MAX_RIGHT_PANEL_WIDTH = 640;
+
+// 盘口列占上区宽度比例：盘口面板移到 K 线右侧后默认约 15%，夹取 [0.10, 0.30]；
+// 像素安全边界（min-w 160 / max-w 420）由组件兜底，与比例取较小 / 较大者，互不冲突。
+export const DEFAULT_DEPTH_PANEL_RATIO = 0.15;
+const MIN_DEPTH_PANEL_RATIO = 0.1;
+const MAX_DEPTH_PANEL_RATIO = 0.3;
+
 interface AppState {
   instId: string;
   bar: Bar;
@@ -71,6 +84,8 @@ interface AppState {
   watchlist: string[];
   instSidebarTab: InstSidebarTab;
   chartSplitRatio: number;
+  rightPanelWidth: number;
+  depthPanelRatio: number;
   rightTab: RightTab;
   agentConversationId: string;
   // 策略组合草稿（成员 id + 轮动参数）：持久化，跨刷新恢复上次搭建的组合上下文。
@@ -112,6 +127,8 @@ interface AppState {
   toggleWatchlist: (instId: string) => void;
   setInstSidebarTab: (tab: InstSidebarTab) => void;
   setChartSplitRatio: (ratio: number) => void;
+  setRightPanelWidth: (px: number) => void;
+  setDepthPanelRatio: (ratio: number) => void;
   setRightTab: (tab: RightTab) => void;
   setAgentConversationId: (id: string) => void;
   newConversation: () => void;
@@ -150,6 +167,9 @@ export const useAppStore = create<AppState>()(
       watchlist: [...FALLBACK_INSTRUMENTS],
       instSidebarTab: "watch",
       chartSplitRatio: DEFAULT_CHART_SPLIT_RATIO,
+      // 全新安装只走初始化器、不触发 migrate，故面板尺寸默认值必须写在此处（与 chartSplitRatio 并列）。
+      rightPanelWidth: DEFAULT_RIGHT_PANEL_WIDTH,
+      depthPanelRatio: DEFAULT_DEPTH_PANEL_RATIO,
       // 右侧默认激活「AI 助手」页签；会话 id 首次为空，挂载时生成并落盘以便重连恢复。
       rightTab: "agent",
       agentConversationId: "",
@@ -279,10 +299,34 @@ export const useAppStore = create<AppState>()(
               }
             : { chartSplitRatio: s.chartSplitRatio },
         ),
+      // 右侧面板宽：夹取到 [MIN, MAX] 像素；非有限数忽略（守住边界，与 chartSplitRatio 同模式）。
+      setRightPanelWidth: (n) =>
+        set((s) =>
+          Number.isFinite(n)
+            ? {
+                rightPanelWidth: Math.min(
+                  Math.max(n, MIN_RIGHT_PANEL_WIDTH),
+                  MAX_RIGHT_PANEL_WIDTH,
+                ),
+              }
+            : { rightPanelWidth: s.rightPanelWidth },
+        ),
+      // 盘口列比例：夹取到 [MIN, MAX]；非有限数忽略（像素安全边界由组件 min-w/max-w 兜底）。
+      setDepthPanelRatio: (n) =>
+        set((s) =>
+          Number.isFinite(n)
+            ? {
+                depthPanelRatio: Math.min(
+                  Math.max(n, MIN_DEPTH_PANEL_RATIO),
+                  MAX_DEPTH_PANEL_RATIO,
+                ),
+              }
+            : { depthPanelRatio: s.depthPanelRatio },
+        ),
     }),
     {
       name: "aragon-ui",
-      version: 11,
+      version: 12,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -302,6 +346,8 @@ export const useAppStore = create<AppState>()(
         watchlist: s.watchlist,
         instSidebarTab: s.instSidebarTab,
         chartSplitRatio: s.chartSplitRatio,
+        rightPanelWidth: s.rightPanelWidth,
+        depthPanelRatio: s.depthPanelRatio,
         rightTab: s.rightTab,
         agentConversationId: s.agentConversationId,
         comboDraft: s.comboDraft,
@@ -344,6 +390,14 @@ export const useAppStore = create<AppState>()(
         if (version < 11) {
           // 策略组合：补默认组合草稿（成员空 + 轮动参数默认）。
           next = { ...next, comboDraft: { ...DEFAULT_COMBO_DRAFT, policy: { ...DEFAULT_COMBO_DRAFT.policy } } };
+        }
+        if (version < 12) {
+          // 工作台面板尺寸：补右侧面板宽与盘口列比例默认（追加字段，浅合并本就回落初值，迁移显式稳妥）。
+          next = {
+            ...next,
+            rightPanelWidth: DEFAULT_RIGHT_PANEL_WIDTH,
+            depthPanelRatio: DEFAULT_DEPTH_PANEL_RATIO,
+          };
         }
         return next as never;
       },

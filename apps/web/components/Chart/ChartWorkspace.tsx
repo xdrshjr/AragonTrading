@@ -7,9 +7,15 @@ import PaperPositionsTable from "@/components/Strategy/PaperPositionsTable";
 import PositionPanel from "@/components/Strategy/PositionPanel";
 import TradesTable from "@/components/Strategy/TradesTable";
 import { Tabs } from "@/components/ui";
+import PanelResizeHandle from "@/components/ui/PanelResizeHandle";
 import type { IndicatorKey } from "@/lib/indicators";
+import { ratioFromRightEdge } from "@/lib/panelResize";
 import { buildPaperPositionRows } from "@/lib/paperMulti";
-import { DEFAULT_CHART_SPLIT_RATIO, useAppStore } from "@/lib/store";
+import {
+  DEFAULT_CHART_SPLIT_RATIO,
+  DEFAULT_DEPTH_PANEL_RATIO,
+  useAppStore,
+} from "@/lib/store";
 import type {
   BottomTab,
   Candle,
@@ -100,11 +106,13 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     paneTab,
     paperSessionId,
     chartSplitRatio,
+    depthPanelRatio,
     setInst,
     setChartPane,
     setBottomTab,
     setPaneTab,
     setChartSplitRatio,
+    setDepthPanelRatio,
   } = useAppStore();
 
   const [hoverTs, setHoverTs] = useState<number | null>(null);
@@ -132,6 +140,15 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     }
   };
   const onSplitReset = () => setChartSplitRatio(DEFAULT_CHART_SPLIT_RATIO);
+
+  // 盘口列调宽：以上区 flex-row 为测量容器，比例 = (右边缘 − 指针 X) / 容器宽（store 负责夹取）。
+  const topRef = useRef<HTMLDivElement>(null);
+  const onResizeDepth = (clientX: number) => {
+    const rect = topRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setDepthPanelRatio(ratioFromRightEdge(rect.right, rect.width, clientX));
+  };
+  const onDepthReset = () => setDepthPanelRatio(DEFAULT_DEPTH_PANEL_RATIO);
 
   const byTs = useMemo(() => new Map(candles.map((c) => [c.ts, c])), [candles]);
   const tsIndex = useMemo(() => new Map(candles.map((c, i) => [c.ts, i])), [candles]);
@@ -184,16 +201,15 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
   return (
     <section
       ref={splitContainerRef}
-      className="flex h-full min-h-0 min-w-0 flex-col border-r border-[var(--border)]"
+      className="flex h-full min-h-0 min-w-0 flex-col"
     >
       <div
+        ref={topRef}
         className="flex min-h-0 min-w-0 flex-row"
         style={{ flexGrow: chartSplitRatio, flexShrink: 1, flexBasis: 0 }}
       >
+        {/* 左栏：盘口面板已迁出到 K 线右侧（需求二），此处仅保留标的列表并占满整列高度。 */}
         <div className="flex min-h-0 shrink-0 basis-[16%] min-w-[220px] max-w-[300px] flex-col border-r border-[var(--border)]">
-          <div className="shrink-0 border-b border-[var(--border)]">
-            <MarketDepthPanel market={market} activeCandle={displayCandle} />
-          </div>
           <div className="min-h-0 flex-1">
             <InstrumentSidebar
               active={instId}
@@ -252,6 +268,19 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
               />
             )}
           </div>
+        </div>
+
+        {/* 需求二：盘口 / 成交量列移到 K 线右侧，默认约 15%，左边框可拖（夹取 [0.10,0.30] + 像素 [160,420]）。 */}
+        <PanelResizeHandle
+          onResize={onResizeDepth}
+          onReset={onDepthReset}
+          ariaLabel="拖动调整盘口面板宽度，双击复位"
+        />
+        <div
+          className="flex min-h-0 min-w-[160px] max-w-[420px] flex-col overflow-auto"
+          style={{ flexGrow: 0, flexShrink: 0, flexBasis: `${depthPanelRatio * 100}%` }}
+        >
+          <MarketDepthPanel market={market} activeCandle={displayCandle} />
         </div>
       </div>
 

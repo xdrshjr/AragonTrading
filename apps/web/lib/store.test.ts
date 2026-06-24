@@ -1,7 +1,12 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_COMBO_POLICY } from "./combo";
 import { FALLBACK_INSTRUMENTS } from "./instruments";
-import { DEFAULT_SIM_BALANCE, useAppStore } from "./store";
+import {
+  DEFAULT_DEPTH_PANEL_RATIO,
+  DEFAULT_RIGHT_PANEL_WIDTH,
+  DEFAULT_SIM_BALANCE,
+  useAppStore,
+} from "./store";
 
 describe("app store — account mode & sim balance", () => {
   beforeEach(() => {
@@ -199,5 +204,75 @@ describe("app store — strategy combination (v11)", () => {
     expect(s.comboDraft.memberIds).toEqual([]);
     expect(s.comboDraft.policy.selectionMetric).toBe("sharpe");
     expect(s.instId).toBe("ETH-USDT-SWAP");
+  });
+});
+
+describe("app store — workstation panel sizes (v12)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    // store 为模块单例：把两面板尺寸复位到默认，避免跨用例残留。
+    useAppStore.setState({
+      rightPanelWidth: DEFAULT_RIGHT_PANEL_WIDTH,
+      depthPanelRatio: DEFAULT_DEPTH_PANEL_RATIO,
+    });
+  });
+
+  it("setRightPanelWidth clamps to [320, 640]", () => {
+    useAppStore.getState().setRightPanelWidth(-5);
+    expect(useAppStore.getState().rightPanelWidth).toBe(320);
+    useAppStore.getState().setRightPanelWidth(9999);
+    expect(useAppStore.getState().rightPanelWidth).toBe(640);
+    useAppStore.getState().setRightPanelWidth(500);
+    expect(useAppStore.getState().rightPanelWidth).toBe(500);
+  });
+
+  it("setRightPanelWidth ignores non-finite input", () => {
+    useAppStore.getState().setRightPanelWidth(500);
+    useAppStore.getState().setRightPanelWidth(Number.NaN);
+    expect(useAppStore.getState().rightPanelWidth).toBe(500);
+    useAppStore.getState().setRightPanelWidth(Number.POSITIVE_INFINITY);
+    expect(useAppStore.getState().rightPanelWidth).toBe(500);
+  });
+
+  it("setDepthPanelRatio clamps to [0.10, 0.30]", () => {
+    useAppStore.getState().setDepthPanelRatio(0);
+    expect(useAppStore.getState().depthPanelRatio).toBeCloseTo(0.1, 10);
+    useAppStore.getState().setDepthPanelRatio(1);
+    expect(useAppStore.getState().depthPanelRatio).toBeCloseTo(0.3, 10);
+    useAppStore.getState().setDepthPanelRatio(0.2);
+    expect(useAppStore.getState().depthPanelRatio).toBeCloseTo(0.2, 10);
+  });
+
+  it("setDepthPanelRatio ignores non-finite input", () => {
+    useAppStore.getState().setDepthPanelRatio(0.2);
+    useAppStore.getState().setDepthPanelRatio(Number.NaN);
+    expect(useAppStore.getState().depthPanelRatio).toBeCloseTo(0.2, 10);
+    useAppStore.getState().setDepthPanelRatio(Number.POSITIVE_INFINITY);
+    expect(useAppStore.getState().depthPanelRatio).toBeCloseTo(0.2, 10);
+  });
+
+  it("persists rightPanelWidth and depthPanelRatio", () => {
+    useAppStore.getState().setRightPanelWidth(420);
+    useAppStore.getState().setDepthPanelRatio(0.22);
+    const persisted = JSON.parse(localStorage.getItem("aragon-ui") as string);
+    expect(persisted.state.rightPanelWidth).toBe(420);
+    expect(persisted.state.depthPanelRatio).toBeCloseTo(0.22, 10);
+  });
+
+  it("migrates v11 persisted state to v12 with default panel sizes", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({
+        state: { instId: "ETH-USDT-SWAP", chartSplitRatio: 0.7 },
+        version: 11,
+      }),
+    );
+    await useAppStore.persist.rehydrate();
+    const s = useAppStore.getState();
+    expect(s.rightPanelWidth).toBe(DEFAULT_RIGHT_PANEL_WIDTH);
+    expect(s.depthPanelRatio).toBe(DEFAULT_DEPTH_PANEL_RATIO);
+    // 既有持久化字段仍恢复
+    expect(s.instId).toBe("ETH-USDT-SWAP");
+    expect(s.chartSplitRatio).toBe(0.7);
   });
 });

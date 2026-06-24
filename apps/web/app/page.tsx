@@ -12,6 +12,7 @@ import RightPanel from "@/components/RightPanel/RightPanel";
 import SettingsGearButton from "@/components/Settings/SettingsGearButton";
 import SettingsPanel from "@/components/Settings/SettingsPanel";
 import { Button } from "@/components/ui";
+import PanelResizeHandle from "@/components/ui/PanelResizeHandle";
 import { api } from "@/lib/api";
 import { getDesktopPlatform, getWindowControls } from "@/lib/desktop";
 import {
@@ -24,6 +25,7 @@ import {
 import { colorForIndex } from "@/lib/compare";
 import { foldTradeTape } from "@/lib/marketDepth";
 import { createMarketThrottle } from "@/lib/marketThrottle";
+import { widthFromRightEdge } from "@/lib/panelResize";
 import {
   mergePaperEquity,
   mergePaperTrade,
@@ -31,7 +33,7 @@ import {
   selectFirstAvailablePaperStrategy,
   visiblePaperTrades,
 } from "@/lib/paperMulti";
-import { useAppStore } from "@/lib/store";
+import { DEFAULT_RIGHT_PANEL_WIDTH, useAppStore } from "@/lib/store";
 import type {
   Candle,
   CompareResult,
@@ -69,11 +71,13 @@ export default function Page() {
     backtestEndTs,
     indicators,
     showSettings,
+    rightPanelWidth,
     setChartView,
     setPaperActiveStrategyId,
     setPaperVisibleStrategyIds,
     togglePaperVisibleStrategyId,
     toggleTheme,
+    setRightPanelWidth,
   } = useAppStore();
 
   // 回测与组合同档：都用单条 run 净值 + 成交 markers 在左图渲染（复用 run-range 链路）。
@@ -104,6 +108,13 @@ export default function Page() {
   const [jumpToTs, setJumpToTs] = useState<number | null>(null);
   const loadingMore = useRef(false);
   const lastMarketTsRef = useRef<number | null>(null);
+  // 右侧面板调宽：以 <main> 右边缘为锚，宽度 = 右边缘 − 指针 X（store 负责夹取 [320,640]）。
+  const mainRef = useRef<HTMLElement>(null);
+  const onResizeRight = (clientX: number) => {
+    const rect = mainRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setRightPanelWidth(widthFromRightEdge(rect.right, clientX));
+  };
 
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
   const okxUp = health.data ? health.data.okx === "up" : null;
@@ -480,7 +491,11 @@ export default function Page() {
           <SettingsPanel />
         </main>
       ) : (
-        <main className="no-drag grid flex-1 grid-cols-[minmax(0,1fr)_380px] overflow-hidden">
+        <main
+          ref={mainRef}
+          className="no-drag grid flex-1 overflow-hidden"
+          style={{ gridTemplateColumns: `minmax(0,1fr) 6px ${rightPanelWidth}px` }}
+        >
           <ChartWorkspace
             candles={candles}
             overlayEquity={overlayEquity}
@@ -518,7 +533,13 @@ export default function Page() {
             }}
           />
 
-          <aside className="min-h-[300px] overflow-hidden bg-[var(--surface)]/40">
+          <PanelResizeHandle
+            onResize={onResizeRight}
+            onReset={() => setRightPanelWidth(DEFAULT_RIGHT_PANEL_WIDTH)}
+            ariaLabel="拖动调整右侧面板宽度，双击复位"
+          />
+
+          <aside className="min-h-[300px] min-w-0 overflow-hidden bg-[var(--surface)]/40">
             <RightPanel />
           </aside>
         </main>
