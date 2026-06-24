@@ -3,6 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiRequestError, api } from "@/lib/api";
+import { isCombo, isUserCombo } from "@/lib/combo";
 import {
   colorForPaperStrategy,
   resolveMaxPaperSessions,
@@ -12,6 +13,7 @@ import {
 import { useAppStore } from "@/lib/store";
 import { downloadCsv, equityToCsv, tradesToCsv } from "@/lib/export";
 import type {
+  ComboPreviewResult,
   Metrics,
   PaperSessionRow,
   PaperStrategySession,
@@ -20,13 +22,15 @@ import type {
 } from "@/lib/types";
 import { Button, Skeleton, Tabs } from "@/components/ui";
 import BacktestModeSwitch from "./BacktestModeSwitch";
-import ComboView from "./ComboView";
+import ComboResult from "./ComboResult";
+import ComboStrategyDetail from "./ComboStrategyDetail";
 import CompareView from "./CompareView";
 import MetricsCards from "./MetricsCards";
 import RunHistory from "./RunHistory";
 import StrategyDetail from "./StrategyDetail";
 import StrategyList from "./StrategyList";
 import TradesTable from "./TradesTable";
+import { useComboPanel } from "./useComboPanel";
 import WalkForwardResults from "./WalkForwardResults";
 
 type CoverageMeta = { effectiveCandleCount?: number; requestedBars?: number; truncated?: boolean };
@@ -52,6 +56,9 @@ export default function StrategyPanel() {
     paperSessionsByStrategyId,
     backtestStartTs,
     backtestEndTs,
+    comboEditingId,
+    setComboEditingId,
+    setMode,
     setStrategyId,
     setRunId,
     setChartView,
@@ -72,6 +79,8 @@ export default function StrategyPanel() {
   const [returnsById, setReturnsById] = useState<Record<number, number | undefined>>({});
   const [tab, setTab] = useState("metrics");
   const [stopError, setStopError] = useState<string | null>(null);
+  // 组合回测结果（年化 / 轮动时间线 / 分体制贡献）：选中组合回测后接入绩效页签；原子回测回填 null。
+  const [comboResult, setComboResult] = useState<ComboPreviewResult["combo"] | null>(null);
   const lastAutoKey = useRef("");
   const reconciledRef = useRef(false);
 
@@ -92,11 +101,16 @@ export default function StrategyPanel() {
     refetchOnWindowFocus: false,
   });
 
+  // 选中合法性守门按「当前模式的列表」校验：回测列表 = 原子 + 用户组合，实时/其余只列原子。
+  // 这同时解决「回测选中组合后切到实时，组合不在 paper 列表却仍 selected」的边界——切到 paper
+  // 自动把选择收敛到首个原子策略，避免对组合误启动 paper（组合不接 paper）。
   useEffect(() => {
     if (!strategies?.length) return;
-    const exists = strategyId !== null && strategies.some((s) => s.id === strategyId);
-    if (!exists) setStrategyId(strategies[0].id);
-  }, [strategies, strategyId, setStrategyId]);
+    const atoms = strategies.filter((s) => s.kind !== "combo");
+    const list = mode === "backtest" ? [...atoms, ...strategies.filter(isUserCombo)] : atoms;
+    const exists = strategyId !== null && list.some((s) => s.id === strategyId);
+    if (!exists) setStrategyId(list[0]?.id ?? null);
+  }, [strategies, mode, strategyId, setStrategyId]);
 
   useEffect(() => {
     if (mode !== "paper" || !strategyId || paperSelectionIds.length > 0) return;
@@ -142,10 +156,17 @@ export default function StrategyPanel() {
   }, [mode, strategies, paperSessionsQ.data, paperSessionsByStrategyId, applyReconcile]);
 
   const selected = strategies?.find((s) => s.id === strategyId);
-  // 组合策略在「组合」页签构建/回测、在「对比」页签横向比较；回测/实时列表只列原子策略，
-  // 既避免在实时模拟误启动组合（组合不接 paper），也保持各模式职责清晰。
+  // 组合并入回测列表后与原子策略平级：回测列表 = 原子 + 用户组合（组合靠「组合」徽标区分）；
+  // 实时（paper）列表仍只列原子（组合不接 paper）。对比模式由 CompareView 自己列全部策略。
   const atomicStrategies = strategies?.filter((s) => s.kind !== "combo") ?? [];
+  const userCombos = strategies?.filter(isUserCombo) ?? [];
+  const listStrategies = mode === "backtest" ? [...atomicStrategies, ...userCombos] : atomicStrategies;
   const enabledStrategies = atomicStrategies.filter((s) => !s.unavailable && s.enabled);
+  // 选中组合时分流到 ComboStrategyDetail，并强制普通回测（effectiveKind="simple"）：
+  // 后端对组合 walk-forward 显式抛 WF_COMBO_UNSUPPORTED，前端在「开关渲染 / 执行路径 /
+  // 结果区渲染分支 / 自动回测守卫」四处一致按 effectiveKind 收口，彻底绕开高级回测。
+  const selectedCombo = selected && isCombo(selected) ? selected : null;
+  const effectiveKind = selectedCombo ? "simple" : backtestKind;
   const runningSessions = Object.values(paperSessionsByStrategyId);
   const selectedCount = paperSelectionIds.length;
   const capReached = selectedCount >= maxPaperSessions;
@@ -158,6 +179,8 @@ export default function StrategyPanel() {
       setRunId(data.runId);
       if (vars.showRunRange) setChartView("run-range");
       setMetrics(data.metrics);
+      // 组合行后端追加 combo（年化 / 时间线 / 分体制）；原子行 combo 为 undefined → 回填 null 清陈旧。
+      setComboResult(data.combo ?? null);
       // 全区间覆盖透明度（v2·P1-1）：记录覆盖元信息，truncated 时在绩效区上方显示横幅。
       setCoverage({
         effectiveCandleCount: data.effectiveCandleCount,
@@ -179,14 +202,15 @@ export default function StrategyPanel() {
   });
 
   useEffect(() => {
-    // 普通回测随参自动跑；高级回测计算较重，仅手动触发（backtestKind==="simple" 守卫）。
-    if (mode !== "backtest" || backtestKind !== "simple" || !strategyId || !strategies) return;
+    // 普通回测随参自动跑；高级回测计算较重，仅手动触发（effectiveKind==="simple" 守卫）。
+    // 用 effectiveKind 而非 backtestKind：全局处于高级回测、但选中的是组合时仍走普通回测自动刷新。
+    if (mode !== "backtest" || effectiveKind !== "simple" || !strategyId || !strategies) return;
     const key = `${strategyId}|${instId}|${bar}|${backtestStartTs}|${backtestEndTs}`;
     if (lastAutoKey.current === key) return;
     lastAutoKey.current = key;
     backtest.mutate({ id: strategyId });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [strategyId, instId, bar, mode, backtestKind, strategies, backtestStartTs, backtestEndTs]);
+  }, [strategyId, instId, bar, mode, effectiveKind, strategies, backtestStartTs, backtestEndTs]);
 
   const { data: trades } = useQuery({
     queryKey: ["trades", runId],
@@ -260,6 +284,16 @@ export default function StrategyPanel() {
     },
   });
 
+  // 组合三弹窗（编辑器 / 详情 / 删除）开关态、删除 mutation 与渲染抽到 useComboPanel（守 ≤750 行）。
+  const { openNewCombo, openEditCombo, openComboDetail, openDeleteCombo, comboModals } =
+    useComboPanel({
+      strategies: strategies ?? [],
+      strategyId,
+      comboEditingId,
+      setComboEditingId,
+      setStrategyId,
+    });
+
   const isSessionLimitError =
     paperStart.error instanceof ApiRequestError && paperStart.error.code === "SESSION_LIMIT";
 
@@ -321,17 +355,22 @@ export default function StrategyPanel() {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="border-b border-[var(--border)] px-4 py-3">
-        <h2 className="text-sm font-semibold text-[var(--text)]">交易策略</h2>
-        <p className="text-[11px] text-[var(--muted)]">
-          {strategies.filter((s) => s.builtin).length} 个内置 · 共 {strategies.length} 个
-        </p>
+      <div className="flex items-start justify-between gap-2 border-b border-[var(--border)] px-4 py-3">
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold text-[var(--text)]">交易策略</h2>
+          <p className="text-[11px] text-[var(--muted)]">
+            {strategies.filter((s) => s.builtin).length} 个内置 · 共 {strategies.length} 个
+          </p>
+        </div>
+        {mode === "backtest" && (
+          <Button variant="default" size="sm" onClick={openNewCombo}>
+            + 新建组合
+          </Button>
+        )}
       </div>
 
       <div className="flex-1 overflow-auto px-4 py-3">
-        {mode === "combo" ? (
-          <ComboView />
-        ) : mode === "compare" ? (
+        {mode === "compare" ? (
           <CompareView />
         ) : (
           <>
@@ -349,7 +388,7 @@ export default function StrategyPanel() {
             )}
 
             <StrategyList
-              strategies={atomicStrategies}
+              strategies={listStrategies}
               activeId={strategyId}
               returnsById={returnsById}
               onSelect={(id) => setStrategyId(id)}
@@ -361,61 +400,81 @@ export default function StrategyPanel() {
             {selected && (
               <>
                 <div className="my-3 border-t border-[var(--border)]" />
-                {mode === "backtest" && (
-                  <div className="mb-3">
-                    <BacktestModeSwitch />
-                  </div>
-                )}
-                <StrategyDetail
-                  strategy={selected}
-                  mode={mode === "paper" ? "paper" : "backtest"}
-                  backtestKind={backtestKind}
-                  busy={actionBusy}
-                  paperActive={runningSessions.length > 0 || !!paperSessionId}
-                  simBalance={simBalance}
-                  onApplyAndBacktest={(params) =>
-                    backtest.mutate({ id: selected.id, params, showRunRange: true })
-                  }
-                  onRunWalkForward={(params) => walkForward.mutate({ id: selected.id, params })}
-                  onStartPaper={(params, opts) => {
-                    if (!startDisabledReason) paperStart.mutate({ params, opts });
-                  }}
-                  onStopPaper={() => {
-                    setPaperStreamsEnabled(false);
-                    paperStop.mutate();
-                  }}
-                  onSaveAs={(name, params) => saveAs.mutate({ name, params })}
-                />
-                {startDisabledReason && (
-                  <div className="mt-2 text-[11px] text-[var(--muted)]">{startDisabledReason}</div>
-                )}
-                {runningSessions.length > 0 && <PaperRunningList sessions={runningSessions} />}
-                {(backtest.isError || paperStart.isError || stopError) && (
-                  <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
-                    <div>
-                      操作失败：
-                      {stopError ||
-                        (backtest.error as Error)?.message ||
-                        (paperStart.error as Error)?.message}
-                    </div>
-                    {isSessionLimitError && (
-                      <div className="mt-1.5">
-                        <Button
-                          variant="danger"
-                          size="sm"
-                          disabled={paperStopAll.isPending || paperStart.isPending}
-                          onClick={stopAllAndRetry}
-                        >
-                          停止全部并重试
-                        </Button>
+                {selectedCombo ? (
+                  <>
+                    <ComboStrategyDetail
+                      combo={selectedCombo}
+                      busy={actionBusy}
+                      onRunBacktest={(c) => backtest.mutate({ id: c.id, showRunRange: true })}
+                      onView={openComboDetail}
+                      onEdit={openEditCombo}
+                      onDelete={openDeleteCombo}
+                    />
+                    {backtest.isError && (
+                      <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+                        回测失败：{(backtest.error as Error)?.message}
                       </div>
                     )}
-                  </div>
+                  </>
+                ) : (
+                  <>
+                    {mode === "backtest" && (
+                      <div className="mb-3">
+                        <BacktestModeSwitch />
+                      </div>
+                    )}
+                    <StrategyDetail
+                      strategy={selected}
+                      mode={mode === "paper" ? "paper" : "backtest"}
+                      backtestKind={backtestKind}
+                      busy={actionBusy}
+                      paperActive={runningSessions.length > 0 || !!paperSessionId}
+                      simBalance={simBalance}
+                      onApplyAndBacktest={(params) =>
+                        backtest.mutate({ id: selected.id, params, showRunRange: true })
+                      }
+                      onRunWalkForward={(params) => walkForward.mutate({ id: selected.id, params })}
+                      onStartPaper={(params, opts) => {
+                        if (!startDisabledReason) paperStart.mutate({ params, opts });
+                      }}
+                      onStopPaper={() => {
+                        setPaperStreamsEnabled(false);
+                        paperStop.mutate();
+                      }}
+                      onSaveAs={(name, params) => saveAs.mutate({ name, params })}
+                    />
+                    {startDisabledReason && (
+                      <div className="mt-2 text-[11px] text-[var(--muted)]">{startDisabledReason}</div>
+                    )}
+                    {runningSessions.length > 0 && <PaperRunningList sessions={runningSessions} />}
+                    {(backtest.isError || paperStart.isError || stopError) && (
+                      <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+                        <div>
+                          操作失败：
+                          {stopError ||
+                            (backtest.error as Error)?.message ||
+                            (paperStart.error as Error)?.message}
+                        </div>
+                        {isSessionLimitError && (
+                          <div className="mt-1.5">
+                            <Button
+                              variant="danger"
+                              size="sm"
+                              disabled={paperStopAll.isPending || paperStart.isPending}
+                              onClick={stopAllAndRetry}
+                            >
+                              停止全部并重试
+                            </Button>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </>
                 )}
               </>
             )}
 
-            {mode === "backtest" && backtestKind === "walkforward" ? (
+            {mode === "backtest" && effectiveKind === "walkforward" ? (
               <>
                 <div className="my-3 border-t border-[var(--border)]" />
                 <WalkForwardResults
@@ -460,7 +519,14 @@ export default function StrategyPanel() {
                         导出净值 CSV
                       </Button>
                     </div>
-                    <MetricsCards metrics={metrics} loading={backtest.isPending} />
+                    {selectedCombo && comboResult && metrics ? (
+                      <ComboResult
+                        result={{ metrics, combo: comboResult }}
+                        onGoCompare={() => setMode("compare")}
+                      />
+                    ) : (
+                      <MetricsCards metrics={metrics} loading={backtest.isPending} />
+                    )}
                   </>
                 ) : tab === "trades" ? (
                   <>
@@ -488,6 +554,10 @@ export default function StrategyPanel() {
           </>
         )}
       </div>
+
+      {/* 组合弹窗（Portal 居中，复用 Modal 原语）：新建 / 编辑 · 查看 · 删除二次确认。
+          开关态与渲染在 useComboPanel 内，由列表选中态 / 头部「+ 新建组合」入口驱动。 */}
+      {comboModals}
     </div>
   );
 }

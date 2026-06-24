@@ -80,8 +80,9 @@ export default function Page() {
     setRightPanelWidth,
   } = useAppStore();
 
-  // 回测与组合同档：都用单条 run 净值 + 成交 markers 在左图渲染（复用 run-range 链路）。
-  const singleRunMode = mode === "backtest" || mode === "combo";
+  // 回测（含并入回测列表的用户组合）：用单条 run 净值 + 成交 markers 在左图渲染（run-range 链路）。
+  // 组合回测产出真实 run（含 equity/trades/metrics），其 run.mode 落库即 "backtest"，故并入后绘制行为不变。
+  const singleRunMode = mode === "backtest";
 
   const [older, setOlder] = useState<Candle[]>([]);
   const [live, setLive] = useState<Candle[]>([]);

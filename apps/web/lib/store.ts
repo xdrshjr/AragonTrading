@@ -216,13 +216,9 @@ export const useAppStore = create<AppState>()(
       setMode: (mode) =>
         set({
           mode,
-          // 组合回测后用 runId 在左图画单条组合净值（复用 run-range）；对比走 compare-range；余者实时。
-          chartView:
-            mode === "compare"
-              ? "compare-range"
-              : mode === "combo"
-                ? "run-range"
-                : "live-follow",
+          // 对比走 compare-range（左图叠加多策略归一化净值）；回测 / 实时走 live-follow。
+          // 组合已并入回测列表：选中后由自动回测刷新绩效、由「运行回测」经 run-range 显式绘制单条净值。
+          chartView: mode === "compare" ? "compare-range" : "live-follow",
         }),
       // 回测子模式（普通 | 高级/滑动窗口）：切到 walkforward 时**不**联动 chartView（无单条净值，
       // 左图维持 K 线视图，结果只在右侧面板呈现，§7.4）。
@@ -360,7 +356,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 13,
+      version: 14,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -439,6 +435,11 @@ export const useAppStore = create<AppState>()(
         if (version < 13) {
           // 高级回测：补回测子模式与窗口参数默认（walkForwardResult 为瞬态，不入 partialize）。
           next = { ...next, backtestKind: "simple", wfParams: { ...DEFAULT_WF_PARAMS } };
+        }
+        if (version < 14) {
+          // 「组合」模式页签已删（组合并入回测列表）：把历史持久化的 mode:"combo" 安全收敛到
+          // "backtest"，避免水合到一个已不存在的视图（comboDraft/comboEditingId 形态不变，无需迁移）。
+          if ((next as { mode?: string }).mode === "combo") next.mode = "backtest";
         }
         return next as never;
       },

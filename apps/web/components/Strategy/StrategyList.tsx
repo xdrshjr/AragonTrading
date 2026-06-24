@@ -57,6 +57,7 @@ export default function StrategyList({
                 </span>
               </span>
               <div className="flex items-center gap-1">
+                {s.kind === "combo" && <Badge tone="accent">组合</Badge>}
                 {s.builtin && <Badge tone="accent">内置</Badge>}
                 {ret !== undefined && (
                   <Badge tone={ret > 0 ? "long" : ret < 0 ? "short" : "neutral"}>

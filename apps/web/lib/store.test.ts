@@ -176,12 +176,6 @@ describe("app store — strategy combination (v11)", () => {
     useAppStore.setState({ comboDraft: { memberIds: [], policy: { ...DEFAULT_COMBO_POLICY } } });
   });
 
-  it("setMode('combo') switches chartView to run-range", () => {
-    useAppStore.getState().setMode("combo");
-    expect(useAppStore.getState().mode).toBe("combo");
-    expect(useAppStore.getState().chartView).toBe("run-range");
-  });
-
   it("persists comboDraft", () => {
     useAppStore.getState().setComboDraft({
       memberIds: [1, 2, 3],
@@ -349,5 +343,38 @@ describe("app store — advanced backtest / walk-forward (v13)", () => {
     expect(s.wfParams).toEqual(DEFAULT_WF_PARAMS);
     // 既有持久化字段仍恢复
     expect(s.instId).toBe("ETH-USDT-SWAP");
+  });
+});
+
+describe("app store — combo merged into backtest list (v14)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("migrates v13 persisted mode:'combo' to backtest (combo tab removed)", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({
+        state: { instId: "ETH-USDT-SWAP", mode: "combo" },
+        version: 13,
+      }),
+    );
+    await useAppStore.persist.rehydrate();
+    const s = useAppStore.getState();
+    // 历史的「组合」模式已删，安全收敛到回测，避免水合到不存在的视图。
+    expect(s.mode).toBe("backtest");
+    expect(s.instId).toBe("ETH-USDT-SWAP");
+  });
+
+  it("leaves a non-combo persisted mode untouched across the v14 migration", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({
+        state: { instId: "SOL-USDT-SWAP", mode: "paper" },
+        version: 13,
+      }),
+    );
+    await useAppStore.persist.rehydrate();
+    expect(useAppStore.getState().mode).toBe("paper");
   });
 });

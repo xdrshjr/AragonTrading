@@ -7,10 +7,11 @@ import type { Strategy } from "@/lib/types";
 import { Badge, Button, Tabs } from "@/components/ui";
 
 /**
- * 多页签成员选择器：「普通策略」勾选原子成员；「组合策略」可查看 / 把已存组合的原子成员展开导入。
+ * 多页签成员选择器：「普通策略」勾选原子成员；「组合策略」把已存组合的原子成员展开导入。
  *
  * 组合不嵌套组合（轮动引擎成员只接原子 {templateKey, params}）：选「组合策略」落地为把其成员
- * 展开进当前草稿，由父组件经 importComboMembers 处理并回传 importNotice 文案。
+ * 展开进当前草稿，由父组件经 importComboMembers 处理并回传 importNotice 文案。在编辑器弹窗内
+ * 只保留「导入成员」，不在弹窗里再开详情弹窗（规避 Modal-on-Modal），查看入口在列表选中态提供。
  */
 export default function MemberPicker({
   candidates,
@@ -19,7 +20,6 @@ export default function MemberPicker({
   maxMembers,
   onToggle,
   onImportCombo,
-  onViewCombo,
   importNotice,
 }: {
   candidates: Strategy[];
@@ -28,7 +28,6 @@ export default function MemberPicker({
   maxMembers: number;
   onToggle: (id: number) => void;
   onImportCombo: (combo: Strategy) => void;
-  onViewCombo: (combo: Strategy) => void;
   importNotice?: string | null;
 }) {
   const [tab, setTab] = useState<"atomic" | "combo">("atomic");
@@ -61,7 +60,6 @@ export default function MemberPicker({
           userCombos={userCombos}
           notice={importNotice}
           onImport={onImportCombo}
-          onView={onViewCombo}
         />
       )}
     </div>
@@ -123,12 +121,10 @@ function ComboSourceList({
   userCombos,
   notice,
   onImport,
-  onView,
 }: {
   userCombos: Strategy[];
   notice?: string | null;
   onImport: (combo: Strategy) => void;
-  onView: (combo: Strategy) => void;
 }) {
   if (userCombos.length === 0) {
     return <EmptyHint text="还没有可复用的组合策略，先在下方保存一个组合" />;
@@ -155,9 +151,6 @@ function ComboSourceList({
             </span>
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            <Button variant="ghost" size="sm" onClick={() => onView(combo)}>
-              查看
-            </Button>
             <Button variant="default" size="sm" onClick={() => onImport(combo)}>
               导入成员
             </Button>

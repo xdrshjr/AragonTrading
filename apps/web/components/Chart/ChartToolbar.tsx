@@ -10,7 +10,6 @@ const BARS: Bar[] = ["1m", "5m", "15m", "30m", "1H", "4H", "1D"];
 const MODES: { key: Mode; label: string }[] = [
   { key: "backtest", label: "回测" },
   { key: "compare", label: "对比" },
-  { key: "combo", label: "组合" },
   { key: "paper", label: "实时" },
 ];
 

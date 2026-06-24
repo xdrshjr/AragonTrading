@@ -192,11 +192,9 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
   const emptyHint =
     mode === "compare"
       ? "运行多策略对比后显示归一化净值曲线"
-      : mode === "combo"
-        ? "运行组合回测后显示组合净值曲线"
-        : mode === "paper"
-          ? "启动实时模拟后显示净值曲线"
-          : "运行回测后显示净值曲线";
+      : mode === "paper"
+        ? "启动实时模拟后显示净值曲线"
+        : "运行回测后显示净值曲线";
 
   return (
     <section
