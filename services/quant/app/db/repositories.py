@@ -156,6 +156,38 @@ async def persist_backtest_result(session: AsyncSession, run: StrategyRun, *,
     await session.commit()
 
 
+async def persist_walk_forward_result(session: AsyncSession, run: StrategyRun, *,
+                                      summary: dict, windows: list[dict], start_ts: int,
+                                      end_ts: int, status: str = "done") -> None:
+    """合并写回高级回测结果（v2·P1-5 契约钉死，spec §4 / §6.1）。
+
+    读取 `run.config_json` 并**合并**（叠加 `summary`/`windows`，**不覆盖**既有窗口参数键）后写回；
+    构造 `metrics_json` 展示投影（Metrics 形状，仅供通用 run 列表卡片渲染，非真实单次回测指标）；
+    写 `start_ts/end_ts/status` 后 commit。**不**落 `Trade`/`EquityPoint`（窗口各自独立、无单条连续净值）。
+    """
+    try:
+        cfg = json.loads(run.config_json or "{}")
+    except json.JSONDecodeError:
+        cfg = {}
+    cfg["summary"] = summary
+    cfg["windows"] = windows
+    run.config_json = json.dumps(cfg, ensure_ascii=False)
+    total_trades = sum(int(w.get("tradeCount", 0)) for w in windows)
+    run.metrics_json = json.dumps({
+        "totalReturn": summary.get("avgReturn", 0.0),
+        "winRate": summary.get("profitableRate", 0.0),
+        "profitFactor": 0.0,
+        "maxDrawdown": summary.get("avgMaxDrawdown", 0.0),
+        "sharpe": summary.get("stabilityScore", 0.0),
+        "tradeCount": total_trades,
+        "avgPnl": summary.get("medianReturn", 0.0),
+    }, ensure_ascii=False)
+    run.status = status
+    run.start_ts = start_ts
+    run.end_ts = end_ts
+    await session.commit()
+
+
 async def get_run(session: AsyncSession, run_id: int) -> StrategyRun | None:
     return await session.get(StrategyRun, run_id)
 

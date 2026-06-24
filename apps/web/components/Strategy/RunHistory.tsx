@@ -8,14 +8,16 @@ import { useAppStore } from "@/lib/store";
 import type { Bar, Run } from "@/lib/types";
 import { Badge } from "@/components/ui";
 
-// mode 过滤：对比会一次落多行 backtest run，按来源过滤避免淹没历史（C8）
+// mode 过滤：对比会一次落多行 backtest run，按来源过滤避免淹没历史（C8）。
+// 高级回测落 mode="walkforward" run，追加「高级」筛选项便于单列查看（v2·P2-5）。
 const MODE_FILTERS: { key: string; label: string }[] = [
   { key: "", label: "全部" },
   { key: "backtest", label: "回测" },
+  { key: "walkforward", label: "高级" },
   { key: "paper", label: "模拟" },
 ];
 
-const MODE_LABEL: Record<string, string> = { backtest: "回测", paper: "模拟" };
+const MODE_LABEL: Record<string, string> = { backtest: "回测", walkforward: "高级", paper: "模拟" };
 
 export default function RunHistory() {
   const { setInst, setBar, setRunId, setMode, setStrategyId, setChartView } = useAppStore();

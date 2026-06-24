@@ -5,6 +5,7 @@ import {
   DEFAULT_DEPTH_PANEL_RATIO,
   DEFAULT_RIGHT_PANEL_WIDTH,
   DEFAULT_SIM_BALANCE,
+  DEFAULT_WF_PARAMS,
   useAppStore,
 } from "./store";
 
@@ -274,5 +275,79 @@ describe("app store — workstation panel sizes (v12)", () => {
     // 既有持久化字段仍恢复
     expect(s.instId).toBe("ETH-USDT-SWAP");
     expect(s.chartSplitRatio).toBe(0.7);
+  });
+});
+
+describe("app store — advanced backtest / walk-forward (v13)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({
+      backtestKind: "simple",
+      wfParams: { ...DEFAULT_WF_PARAMS },
+      walkForwardResult: null,
+    });
+  });
+
+  it("setBacktestKind switches kind without touching chartView", () => {
+    useAppStore.setState({ chartView: "live-follow" });
+    useAppStore.getState().setBacktestKind("walkforward");
+    expect(useAppStore.getState().backtestKind).toBe("walkforward");
+    // 切到 walkforward 不联动 chartView（无单条净值，左图维持 K 线视图）。
+    expect(useAppStore.getState().chartView).toBe("live-follow");
+  });
+
+  it("setWfParams merges partial updates", () => {
+    useAppStore.getState().setWfParams({ windowBars: 2000 });
+    expect(useAppStore.getState().wfParams).toEqual({
+      windowBars: 2000,
+      stepBars: 200,
+      resetCapital: true,
+    });
+    useAppStore.getState().setWfParams({ resetCapital: false });
+    expect(useAppStore.getState().wfParams.resetCapital).toBe(false);
+    expect(useAppStore.getState().wfParams.windowBars).toBe(2000);
+  });
+
+  it("persists backtestKind and wfParams but not walkForwardResult", () => {
+    useAppStore.getState().setBacktestKind("walkforward");
+    useAppStore.getState().setWfParams({ stepBars: 500 });
+    useAppStore.getState().setWalkForwardResult({
+      runId: 1,
+      summary: {
+        windowCount: 1,
+        profitableWindows: 1,
+        profitableRate: 1,
+        medianReturn: 0.1,
+        avgReturn: 0.1,
+        worstReturn: 0.1,
+        bestReturn: 0.1,
+        avgMaxDrawdown: -0.02,
+        stabilityScore: 0.8,
+        uncoveredBars: 0,
+        notes: [],
+      },
+      windows: [],
+    });
+    const persisted = JSON.parse(localStorage.getItem("aragon-ui") as string);
+    expect(persisted.state.backtestKind).toBe("walkforward");
+    expect(persisted.state.wfParams.stepBars).toBe(500);
+    // walkForwardResult 为运行期产物，绝不持久化（避免刷新后陈旧）。
+    expect(persisted.state.walkForwardResult).toBeUndefined();
+  });
+
+  it("migrates v12 persisted state to v13 with default advanced-backtest fields", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({
+        state: { instId: "ETH-USDT-SWAP", mode: "backtest" },
+        version: 12,
+      }),
+    );
+    await useAppStore.persist.rehydrate();
+    const s = useAppStore.getState();
+    expect(s.backtestKind).toBe("simple");
+    expect(s.wfParams).toEqual(DEFAULT_WF_PARAMS);
+    // 既有持久化字段仍恢复
+    expect(s.instId).toBe("ETH-USDT-SWAP");
   });
 });

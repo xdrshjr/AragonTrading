@@ -23,6 +23,33 @@ class BacktestResult:
     end_ts: int
 
 
+def plan_walk_forward_windows(n: int, window_bars: int, step_bars: int) -> list[tuple[int, int]]:
+    """按 (总根数, 窗口长度, 步长) 生成 [(i0, i1), ...] 半开区间索引（高级回测 §3.3）。
+
+    Args:
+        n: 区间内有效 K 线总根数。
+        window_bars: 每个窗口的长度（根数）。
+        step_bars: 相邻窗口起点的滑动步长（根数）。
+
+    Returns:
+        半开区间 `[i0, i1)` 列表（升序）：
+        - `n < window_bars`：退化为单窗口 `[(0, n)]`（前端标注「数据不足一个完整窗口」）。
+        - 否则：start = 0, step, 2*step, ...，只要 `start + window_bars <= n` 即纳入；
+          末尾不足一个完整窗口的尾段被丢弃（其根数由调用方记入 uncoveredBars）。
+        - 退化入参（n / window_bars / step_bars <= 0）返回空列表。
+    """
+    if n <= 0 or window_bars <= 0 or step_bars <= 0:
+        return []
+    if n < window_bars:
+        return [(0, n)]
+    out: list[tuple[int, int]] = []
+    start = 0
+    while start + window_bars <= n:
+        out.append((start, start + window_bars))
+        start += step_bars
+    return out
+
+
 def candles_to_df(candles: list) -> pd.DataFrame:
     """把归一化 Candle 列表（或 dict）转为回测用 DataFrame。"""
     rows = []

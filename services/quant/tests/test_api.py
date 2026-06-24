@@ -107,13 +107,10 @@ async def test_backtest_uses_requested_time_range(patch_okx):
                 "endTs": end_ts,
             })
             assert r.status_code == 200, r.text
-            assert patch_okx.calls[-1] == {
-                "inst_id": "BTC-USDT-SWAP",
-                "bar": "1H",
-                "limit": 200,
-                "before": end_ts,
-                "after": start_ts,
-            }
+            # 全区间分页（v2·P1-1）：以 end_ts 为锚向更早翻页（before=end_ts+bar_sec），不再用 after。
+            last = patch_okx.calls[-1]
+            assert last["inst_id"] == "BTC-USDT-SWAP" and last["bar"] == "1H"
+            assert last["before"] == end_ts + 3600 and last["after"] is None
             run = (await client.get(f"/api/runs/{r.json()['runId']}")).json()
             equity = (await client.get(f"/api/runs/{r.json()['runId']}/equity")).json()
             assert run["startTs"] == start_ts

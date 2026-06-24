@@ -70,6 +70,86 @@ def compute_metrics(
     }
 
 
+# ============================ 高级回测：跨窗口聚合（spec §3.3） ============================
+def compute_stability_score(returns: list[float], profitable_rate: float) -> float:
+    """稳定性评分 ∈ [0,1]，越高越稳健（高级回测 v1 启发式，纯函数可单测）。
+
+    consistency = 1/(1+cv)，cv = std/(|avg|+1e-9)（离散度惩罚，越分散越低）；
+    score = 0.6*profitable_rate + 0.4*consistency，夹取 [0,1] 后 round(6)。
+    全部窗口正收益且方差小 → 接近 1；盈亏参半且高离散 → 接近 0。
+
+    Args:
+        returns: 各窗口的 totalReturn 列表。
+        profitable_rate: 盈利窗口占比 ∈ [0,1]。
+
+    Returns:
+        稳定性评分 ∈ [0,1]，保留 6 位小数。
+    """
+    if not returns:
+        return 0.0
+    avg = sum(returns) / len(returns)
+    if len(returns) >= 2:
+        var = sum((r - avg) ** 2 for r in returns) / (len(returns) - 1)
+        std = math.sqrt(var)
+    else:
+        std = 0.0
+    cv = std / (abs(avg) + 1e-9)
+    consistency = 1.0 / (1.0 + cv)
+    score = 0.6 * profitable_rate + 0.4 * consistency
+    return round(min(max(score, 0.0), 1.0), 6)
+
+
+def _median(values: list[float]) -> float:
+    """有序中位数（偶数个取中间两者均值）；空列表返回 0.0。"""
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return ordered[mid] if n % 2 == 1 else (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def summarize_windows(windows: list[dict], *, uncovered_bars: int = 0,
+                      notes: list[str] | None = None) -> dict:
+    """跨窗口聚合，返回与 TS `WalkForwardSummary` 对齐的 dict（spec §3.3 / §6.2）。
+
+    returns 取各窗口 `metrics.totalReturn`；avgMaxDrawdown 取各窗口 `metrics.maxDrawdown` 均值（≤0）。
+
+    Args:
+        windows: `run_walk_forward` 产出的逐窗口结果（含 `metrics`）。
+        uncovered_bars: 末尾被丢弃的尾段根数（v2·P1-2，随 summary 回包供前端提示）。
+        notes: 用户可读提示（窗口偏短 / 数据不足一个窗口 / 截断 等，v2·P1-2）。
+
+    Returns:
+        含 windowCount / profitableWindows / profitableRate / medianReturn / avgReturn /
+        worstReturn / bestReturn / avgMaxDrawdown / stabilityScore / uncoveredBars / notes 的 dict。
+    """
+    notes = list(notes or [])
+    count = len(windows)
+    if count == 0:
+        return {"windowCount": 0, "profitableWindows": 0, "profitableRate": 0.0,
+                "medianReturn": 0.0, "avgReturn": 0.0, "worstReturn": 0.0, "bestReturn": 0.0,
+                "avgMaxDrawdown": 0.0, "stabilityScore": 0.0,
+                "uncoveredBars": int(uncovered_bars), "notes": notes}
+    returns = [float(w["metrics"]["totalReturn"]) for w in windows]
+    drawdowns = [float(w["metrics"]["maxDrawdown"]) for w in windows]
+    profitable = sum(1 for r in returns if r > 0)
+    profitable_rate = profitable / count
+    return {
+        "windowCount": count,
+        "profitableWindows": profitable,
+        "profitableRate": round(profitable_rate, 6),
+        "medianReturn": round(_median(returns), 6),
+        "avgReturn": round(sum(returns) / count, 6),
+        "worstReturn": round(min(returns), 6),
+        "bestReturn": round(max(returns), 6),
+        "avgMaxDrawdown": round(sum(drawdowns) / count, 6),
+        "stabilityScore": compute_stability_score(returns, profitable_rate),
+        "uncoveredBars": int(uncovered_bars),
+        "notes": notes,
+    }
+
+
 def _empty_metrics() -> dict:
     return {
         "totalReturn": 0.0,

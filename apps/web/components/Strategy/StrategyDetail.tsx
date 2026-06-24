@@ -3,7 +3,8 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui";
 import { fmtMoney } from "@/lib/format";
-import type { Strategy } from "@/lib/types";
+import type { BacktestKind, Strategy } from "@/lib/types";
+import WalkForwardForm from "./WalkForwardForm";
 
 type Params = Record<string, unknown>;
 type PaperOpts = { source?: "live" | "replay"; speed?: number; replayBars?: number };
@@ -13,20 +14,24 @@ const SPEEDS = [1, 4, 16];
 export default function StrategyDetail({
   strategy,
   mode,
+  backtestKind = "simple",
   busy,
   paperActive,
   simBalance,
   onApplyAndBacktest,
+  onRunWalkForward,
   onStartPaper,
   onStopPaper,
   onSaveAs,
 }: {
   strategy: Strategy;
   mode: "backtest" | "paper";
+  backtestKind?: BacktestKind;
   busy: boolean;
   paperActive: boolean;
   simBalance?: number;
   onApplyAndBacktest: (params: Params) => void;
+  onRunWalkForward?: (params: Params) => void;
   onStartPaper: (params: Params, opts?: PaperOpts) => void;
   onStopPaper: () => void;
   onSaveAs: (name: string, params: Params) => void;
@@ -162,11 +167,17 @@ export default function StrategyDetail({
         </div>
       )}
 
+      {mode === "backtest" && backtestKind === "walkforward" && onRunWalkForward && (
+        <WalkForwardForm busy={busy} onRun={() => onRunWalkForward(params)} />
+      )}
+
       <div className="flex flex-wrap gap-2">
         {mode === "backtest" ? (
-          <Button variant="primary" disabled={busy} onClick={() => onApplyAndBacktest(params)}>
-            {busy ? "运行中..." : "运行回测"}
-          </Button>
+          backtestKind === "walkforward" ? null : (
+            <Button variant="primary" disabled={busy} onClick={() => onApplyAndBacktest(params)}>
+              {busy ? "运行中..." : "运行回测"}
+            </Button>
+          )
         ) : paperActive ? (
           <Button variant="danger" disabled={busy} onClick={onStopPaper}>
             停止模拟

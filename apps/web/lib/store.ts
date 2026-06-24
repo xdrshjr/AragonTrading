@@ -7,12 +7,14 @@ import { DEFAULT_INDICATORS, type IndicatorKey } from "./indicators";
 import { FALLBACK_INSTRUMENTS } from "./instruments";
 import type {
   AccountMode,
+  BacktestKind,
   Bar,
   BottomTab,
   ChartPane,
   ChartView,
   Mode,
   PaperStrategySession,
+  WalkForwardResult,
 } from "./types";
 
 type Theme = "light" | "dark";
@@ -31,6 +33,14 @@ function makeConversationId(): string {
 const DEFAULT_RANGE_DAYS = 30;
 const defaultEndTs = Math.floor(Date.now() / 1000);
 const defaultStartTs = defaultEndTs - DEFAULT_RANGE_DAYS * 24 * 60 * 60;
+
+// 高级回测（滑动窗口 / Walk-forward）默认窗口参数：镜像后端建议预设，持久化跨刷新恢复。
+export interface WfParams {
+  windowBars: number;
+  stepBars: number;
+  resetCapital: boolean;
+}
+export const DEFAULT_WF_PARAMS: WfParams = { windowBars: 1000, stepBars: 200, resetCapital: true };
 
 // 模拟资金（支柱 A）：默认与后端 settings.initial_capital=10000 对齐；夹取区间防误输入。
 export const DEFAULT_SIM_BALANCE = 10000;
@@ -66,6 +76,11 @@ interface AppState {
   bottomTab: BottomTab;
   paneTab: IndicatorKey | null;
   mode: Mode;
+  // 回测子模式（普通回测 | 高级回测/滑动窗口）：持久化；高级回测下渲染窗口分布而非单条净值。
+  backtestKind: BacktestKind;
+  // 高级回测窗口参数（持久化）；运行结果 walkForwardResult 不持久化（避免刷新后陈旧）。
+  wfParams: WfParams;
+  walkForwardResult: WalkForwardResult | null;
   accountMode: AccountMode;
   // 实盘「真实下单」风险勾选的会话记忆（瞬态，不持久化，刷新即复位 → 每会话首单仍需勾选，C1-3）。
   liveAcknowledged: boolean;
@@ -106,6 +121,9 @@ interface AppState {
   setBottomTab: (tab: BottomTab) => void;
   setPaneTab: (key: IndicatorKey | null) => void;
   setMode: (mode: Mode) => void;
+  setBacktestKind: (kind: BacktestKind) => void;
+  setWfParams: (patch: Partial<WfParams>) => void;
+  setWalkForwardResult: (result: WalkForwardResult | null) => void;
   setAccountMode: (m: AccountMode) => void;
   setLiveAcknowledged: (v: boolean) => void;
   setSimBalance: (n: number) => void;
@@ -153,6 +171,9 @@ export const useAppStore = create<AppState>()(
       bottomTab: "trades",
       paneTab: null,
       mode: "backtest",
+      backtestKind: "simple",
+      wfParams: { ...DEFAULT_WF_PARAMS },
+      walkForwardResult: null,
       accountMode: "sim",
       liveAcknowledged: false,
       simBalance: DEFAULT_SIM_BALANCE,
@@ -203,6 +224,12 @@ export const useAppStore = create<AppState>()(
                 ? "run-range"
                 : "live-follow",
         }),
+      // 回测子模式（普通 | 高级/滑动窗口）：切到 walkforward 时**不**联动 chartView（无单条净值，
+      // 左图维持 K 线视图，结果只在右侧面板呈现，§7.4）。
+      setBacktestKind: (backtestKind) => set({ backtestKind }),
+      // 高级回测窗口参数局部更新（合并 patch）。
+      setWfParams: (patch) => set((s) => ({ wfParams: { ...s.wfParams, ...patch } })),
+      setWalkForwardResult: (walkForwardResult) => set({ walkForwardResult }),
       // 账户模式写：选「实盘」时联动 chartView="live-follow"（§5.3）；「模拟盘」保持现状，
       // setMode("paper") 由组件另行编排。实盘进入由组件做凭证 / 开关守门（C1-5），此处只落状态。
       setAccountMode: (accountMode) =>
@@ -333,7 +360,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 12,
+      version: 13,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -341,6 +368,9 @@ export const useAppStore = create<AppState>()(
         bar: s.bar,
         strategyId: s.strategyId,
         mode: s.mode,
+        // 高级回测子模式与窗口参数持久化；walkForwardResult 为运行期产物，**不**持久化（避免刷新后陈旧）。
+        backtestKind: s.backtestKind,
+        wfParams: s.wfParams,
         accountMode: s.accountMode,
         simBalance: s.simBalance,
         theme: s.theme,
@@ -405,6 +435,10 @@ export const useAppStore = create<AppState>()(
             rightPanelWidth: DEFAULT_RIGHT_PANEL_WIDTH,
             depthPanelRatio: DEFAULT_DEPTH_PANEL_RATIO,
           };
+        }
+        if (version < 13) {
+          // 高级回测：补回测子模式与窗口参数默认（walkForwardResult 为瞬态，不入 partialize）。
+          next = { ...next, backtestKind: "simple", wfParams: { ...DEFAULT_WF_PARAMS } };
         }
         return next as never;
       },

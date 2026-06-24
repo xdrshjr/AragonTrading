@@ -17,6 +17,7 @@ import type {
   Run,
   Strategy,
   Trade,
+  WalkForwardResult,
 } from "./types";
 
 const BASE = "/api/py";
@@ -121,6 +122,33 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+
+  // 高级回测：滑动窗口 / Walk-forward（不影响 backtest）。返回窗口分布 + 汇总（spec §5.3）。
+  walkForward: (
+    id: number,
+    body: {
+      instId: string;
+      bar: string;
+      startTs: number;
+      endTs: number;
+      windowBars: number;
+      stepBars: number;
+      resetCapital: boolean;
+      initialCapital?: number;
+      fees?: number;
+      slippage?: number;
+      leverage?: number;
+      maxBars?: number;
+    },
+  ) =>
+    request<WalkForwardResult>(`/strategies/${id}/walk-forward`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  // 历史复看：从 parent run 的 config_json 还原 {runId, summary, windows}（GET /runs/{id}/walk-forward）。
+  walkForwardResult: (runId: number) =>
+    request<WalkForwardResult>(`/runs/${runId}/walk-forward`),
 
   // 多策略对比（F3）：一次回测多个策略，返回含归一化前净值的榜单
   compare: (body: {

@@ -149,10 +149,44 @@ export interface ComboPreviewResult {
 
 // 单策略回测响应（POST /strategies/{id}/backtest）。组合行后端追加 `combo`（_run_saved_combo），
 // 原子行 `combo` 为 undefined。详情弹窗绩效区据此渲染年化 / 时间线（R1）。
+// （v2·P1-1）全区间覆盖透明度：旧字段不变，新增三项可选，原子回测路径回传（combo 路径为 undefined）。
 export interface BacktestResult {
   runId: number;
   metrics: Metrics;
+  effectiveCandleCount?: number; // 实际参与回测的已确认 K 线根数
+  requestedBars?: number; // (endTs-startTs)/barSec + 1，请求区间应有根数
+  truncated?: boolean; // 未覆盖到 startTs（撞 max_bars 上限或 OKX 历史不足）
   combo?: ComboPreviewResult["combo"];
+}
+
+// ---- 高级回测：滑动窗口 / Walk-forward（spec advanced-backtest-walk-forward §6.2）----
+export type BacktestKind = "simple" | "walkforward";
+
+export interface WalkForwardWindow {
+  startTs: number;
+  endTs: number;
+  metrics: Metrics; // 复用现有 Metrics（totalReturn/winRate/maxDrawdown/sharpe/...）
+  tradeCount: number; // == metrics.tradeCount，冗余便于表格直读
+}
+
+export interface WalkForwardSummary {
+  windowCount: number;
+  profitableWindows: number;
+  profitableRate: number;
+  medianReturn: number;
+  avgReturn: number;
+  worstReturn: number;
+  bestReturn: number;
+  avgMaxDrawdown: number; // ≤ 0
+  stabilityScore: number; // [0,1]
+  uncoveredBars: number; // 末尾被丢弃的尾段根数（v2·P1-2）
+  notes: string[]; // 用户可读提示（窗口偏短 / 数据不足一个窗口 / 截断 等，v2·P1-2）
+}
+
+export interface WalkForwardResult {
+  runId: number;
+  summary: WalkForwardSummary;
+  windows: WalkForwardWindow[];
 }
 
 export interface Trade {

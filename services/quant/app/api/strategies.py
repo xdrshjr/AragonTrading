@@ -19,6 +19,7 @@ from ..schemas import (
     CompareReq,
     CreateStrategyReq,
     UpdateStrategyReq,
+    WalkForwardReq,
 )
 from ..strategies.base import get_strategy_class
 
@@ -96,6 +97,20 @@ async def backtest(strategy_id: int, body: BacktestReq,
         strategy_id=strategy_id, inst_id=body.instId, bar=body.bar, limit=body.limit,
         start_ts=body.startTs, end_ts=body.endTs, initial_capital=body.initialCapital,
         fees=body.fees, slippage=body.slippage, leverage=body.leverage,
+    )
+
+
+@router.post("/strategies/{strategy_id}/walk-forward")
+async def walk_forward(strategy_id: int, body: WalkForwardReq,
+                       session: AsyncSession = Depends(get_session)) -> dict:
+    """高级回测：滑动窗口（Walk-forward）。不影响既有 /backtest（spec §5.1）。"""
+    return await services.run_walk_forward(
+        session, get_rest_client(),
+        strategy_id=strategy_id, inst_id=body.instId, bar=body.bar,
+        start_ts=body.startTs, end_ts=body.endTs, window_bars=body.windowBars,
+        step_bars=body.stepBars, reset_capital=body.resetCapital,
+        initial_capital=body.initialCapital, fees=body.fees, slippage=body.slippage,
+        leverage=body.leverage, max_bars=body.maxBars,
     )
 
 

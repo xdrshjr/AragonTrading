@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import repositories as repo
 from ..db.session import get_session
-from ..schemas import equity_out, run_out, trade_out
+from ..schemas import equity_out, run_out, trade_out, walk_forward_out
 
 router = APIRouter(tags=["runs"])
 
@@ -32,6 +32,18 @@ async def get_run(run_id: int, session: AsyncSession = Depends(get_session)) -> 
     if run is None:
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "运行不存在"})
     return run_out(run)
+
+
+@router.get("/runs/{run_id}/walk-forward")
+async def get_walk_forward_run(run_id: int,
+                               session: AsyncSession = Depends(get_session)) -> dict:
+    """历史复看高级回测：从 config_json 还原 {runId, summary, windows}；非 walkforward → 404（spec §5.2）。"""
+    run = await repo.get_run(session, run_id)
+    if run is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "运行不存在"})
+    if run.mode != "walkforward":
+        raise HTTPException(404, detail={"code": "NOT_WALK_FORWARD", "message": "该运行不是高级回测"})
+    return walk_forward_out(run)
 
 
 @router.get("/runs/{run_id}/trades")

@@ -25,7 +25,9 @@ class UpdateStrategyReq(BaseModel):
 class BacktestReq(BaseModel):
     instId: str
     bar: str = "1H"
-    limit: int = Field(default=500, ge=10, le=1000)   # 同步回测上限 (C12)
+    # （v2·P1-1）不再用作覆盖上限：全区间分页保证 [startTs,endTs] 全覆盖；若显式给出仅作
+    # max_bars 安全上限覆盖（仍被 settings.backtest_max_bars 二次夹取）。默认 None、解除 1000 上界。
+    limit: int | None = Field(default=None, ge=10, le=200000)
     startTs: int = Field(ge=0)
     endTs: int = Field(ge=0)
     initialCapital: float | None = None
@@ -45,7 +47,7 @@ class CompareReq(BaseModel):
     strategyIds: list[int] = Field(min_length=2, max_length=12)
     instId: str
     bar: str = "1H"
-    limit: int = Field(default=500, ge=10, le=1000)   # 对齐 BacktestReq (C9)
+    limit: int | None = Field(default=None, ge=10, le=200000)   # 对齐 BacktestReq（全区间覆盖，v2·P1-1）
     startTs: int = Field(ge=0)
     endTs: int = Field(ge=0)
     initialCapital: float | None = None
@@ -87,7 +89,7 @@ class ComboPreviewReq(BaseModel):
     policy: ComboPolicyIn | None = None                               # 缺省用模板默认
     instId: str
     bar: str = "1H"
-    limit: int = Field(default=1000, ge=10, le=1000)   # 同 BacktestReq 上限
+    limit: int | None = Field(default=None, ge=10, le=200000)   # 同 BacktestReq（全区间覆盖，v2·P1-1）
     startTs: int = Field(ge=0)
     endTs: int = Field(ge=0)
     initialCapital: float | None = None
@@ -99,6 +101,35 @@ class ComboPreviewReq(BaseModel):
     def validate_time_range(self) -> "ComboPreviewReq":
         if self.startTs >= self.endTs:
             raise ValueError("startTs must be less than endTs")
+        return self
+
+
+class WalkForwardReq(BaseModel):
+    """POST /strategies/{id}/walk-forward：滑动窗口（Walk-forward）高级回测入参（spec §5.1）。
+
+    继承基础回测字段并新增三项窗口参数。`windowBars` 下界 100（v2·P1-3：须显著大于策略 warmup，
+    防整窗口零成交）；`stepBars <= windowBars`（避免出现未覆盖空档）。
+    """
+
+    instId: str
+    bar: str = "1H"
+    startTs: int = Field(ge=0)
+    endTs: int = Field(ge=0)
+    windowBars: int = Field(ge=100, le=5000)   # 窗口长度（根数），下界 50→100（v2·P1-3）
+    stepBars: int = Field(ge=10, le=5000)      # 滑动步长（根数）
+    resetCapital: bool = True                  # 每个窗口是否重置本金，默认 true（鲁棒性测试语义）
+    initialCapital: float | None = None
+    fees: float | None = None        # taker_fee_bps
+    slippage: float | None = None    # slippage_bps
+    leverage: float | None = None
+    maxBars: int | None = Field(default=None, ge=100, le=200000)  # 覆盖 backtest_max_bars（仍被其二次夹取）
+
+    @model_validator(mode="after")
+    def validate_walk_forward(self) -> "WalkForwardReq":
+        if self.startTs >= self.endTs:
+            raise ValueError("startTs must be less than endTs")
+        if self.stepBars > self.windowBars:
+            raise ValueError("stepBars must be <= windowBars")
         return self
 
 
@@ -180,6 +211,19 @@ def run_out(run: StrategyRun) -> dict:
         "mode": run.mode, "status": run.status, "startTs": run.start_ts, "endTs": run.end_ts,
         "metrics": metrics,
     }
+
+
+def walk_forward_out(run: StrategyRun) -> dict:
+    """从 parent run 的 config_json 还原 {runId, summary, windows}（GET /runs/{id}/walk-forward）。
+
+    与 POST 响应同构；config 缺字段时回落空 summary / 空 windows（历史 run 损坏的稳妥兜底）。
+    """
+    import json
+    try:
+        cfg = json.loads(run.config_json or "{}")
+    except json.JSONDecodeError:
+        cfg = {}
+    return {"runId": run.id, "summary": cfg.get("summary", {}), "windows": cfg.get("windows", [])}
 
 
 def _combo_segment_out(seg) -> dict:

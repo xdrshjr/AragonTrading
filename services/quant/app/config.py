@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     default_slippage_bps: float = 2.0
     default_leverage: float = 1.0
 
+    # ---- 回测取数安全闸（高级回测：滑动窗口 / 全区间分页 spec §6.3）----
+    # 字段名即环境变量名（BACKTEST_MAX_BARS / WALK_FORWARD_MAX_WINDOWS，大小写不敏感）。
+    backtest_max_bars: int = Field(default=20000, ge=1000)   # 单次回测取数安全上限（防超长区间拖垮）
+    walk_forward_max_windows: int = Field(default=200, ge=1)  # 高级回测窗口数硬上限
+
     # ---- Agent（对话式 AI 助手）LLM 接入 (Agent Trading Copilot spec §3.1) ----
     # 字段名即环境变量名（AGENT_*，大小写不敏感）；密钥仅存后端，绝不下发前端 / 不入库 / 不进日志。
     agent_provider: str = "anthropic"                       # anthropic | openai（双标准适配）

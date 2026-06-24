@@ -11,8 +11,15 @@ import {
 } from "@/lib/paperMulti";
 import { useAppStore } from "@/lib/store";
 import { downloadCsv, equityToCsv, tradesToCsv } from "@/lib/export";
-import type { Metrics, PaperSessionRow, PaperStrategySession, Strategy } from "@/lib/types";
+import type {
+  Metrics,
+  PaperSessionRow,
+  PaperStrategySession,
+  Strategy,
+  WalkForwardResult,
+} from "@/lib/types";
 import { Button, Skeleton, Tabs } from "@/components/ui";
+import BacktestModeSwitch from "./BacktestModeSwitch";
 import ComboView from "./ComboView";
 import CompareView from "./CompareView";
 import MetricsCards from "./MetricsCards";
@@ -20,6 +27,9 @@ import RunHistory from "./RunHistory";
 import StrategyDetail from "./StrategyDetail";
 import StrategyList from "./StrategyList";
 import TradesTable from "./TradesTable";
+import WalkForwardResults from "./WalkForwardResults";
+
+type CoverageMeta = { effectiveCandleCount?: number; requestedBars?: number; truncated?: boolean };
 
 type Params = Record<string, unknown>;
 type PaperOpts = { source?: "live" | "replay"; speed?: number; replayBars?: number };
@@ -30,6 +40,9 @@ export default function StrategyPanel() {
     instId,
     bar,
     mode,
+    backtestKind,
+    wfParams,
+    walkForwardResult,
     strategyId,
     runId,
     simBalance,
@@ -42,6 +55,7 @@ export default function StrategyPanel() {
     setStrategyId,
     setRunId,
     setChartView,
+    setWalkForwardResult,
     setPaperSessionId,
     setPaperSelectionIds,
     togglePaperSelectionId,
@@ -54,6 +68,7 @@ export default function StrategyPanel() {
   } = useAppStore();
 
   const [metrics, setMetrics] = useState<Metrics | undefined>();
+  const [coverage, setCoverage] = useState<CoverageMeta | undefined>();
   const [returnsById, setReturnsById] = useState<Record<number, number | undefined>>({});
   const [tab, setTab] = useState("metrics");
   const [stopError, setStopError] = useState<string | null>(null);
@@ -143,18 +158,35 @@ export default function StrategyPanel() {
       setRunId(data.runId);
       if (vars.showRunRange) setChartView("run-range");
       setMetrics(data.metrics);
+      // 全区间覆盖透明度（v2·P1-1）：记录覆盖元信息，truncated 时在绩效区上方显示横幅。
+      setCoverage({
+        effectiveCandleCount: data.effectiveCandleCount,
+        requestedBars: data.requestedBars,
+        truncated: data.truncated,
+      });
       setReturnsById((prev) => ({ ...prev, [vars.id]: data.metrics.totalReturn }));
     },
   });
 
+  // 高级回测：显式触发（不随参自动跑），运行后把结果写入 store.walkForwardResult 供右侧渲染。
+  const walkForward = useMutation({
+    mutationFn: (vars: { id: number; params?: Params }) =>
+      runWalkForward(vars.id, vars.params, instId, bar, backtestStartTs, backtestEndTs, wfParams),
+    onSuccess: (data) => {
+      setRunId(data.runId);
+      setWalkForwardResult(data);
+    },
+  });
+
   useEffect(() => {
-    if (mode !== "backtest" || !strategyId || !strategies) return;
+    // 普通回测随参自动跑；高级回测计算较重，仅手动触发（backtestKind==="simple" 守卫）。
+    if (mode !== "backtest" || backtestKind !== "simple" || !strategyId || !strategies) return;
     const key = `${strategyId}|${instId}|${bar}|${backtestStartTs}|${backtestEndTs}`;
     if (lastAutoKey.current === key) return;
     lastAutoKey.current = key;
     backtest.mutate({ id: strategyId });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [strategyId, instId, bar, mode, strategies, backtestStartTs, backtestEndTs]);
+  }, [strategyId, instId, bar, mode, backtestKind, strategies, backtestStartTs, backtestEndTs]);
 
   const { data: trades } = useQuery({
     queryKey: ["trades", runId],
@@ -268,7 +300,12 @@ export default function StrategyPanel() {
   }
 
   const actionBusy =
-    backtest.isPending || paperStart.isPending || paperStop.isPending || paperStopAll.isPending || busy;
+    backtest.isPending ||
+    walkForward.isPending ||
+    paperStart.isPending ||
+    paperStop.isPending ||
+    paperStopAll.isPending ||
+    busy;
   const startDisabledReason =
     mode === "paper" && selectedCount === 0
       ? "请选择至少一个策略"
@@ -324,15 +361,22 @@ export default function StrategyPanel() {
             {selected && (
               <>
                 <div className="my-3 border-t border-[var(--border)]" />
+                {mode === "backtest" && (
+                  <div className="mb-3">
+                    <BacktestModeSwitch />
+                  </div>
+                )}
                 <StrategyDetail
                   strategy={selected}
                   mode={mode === "paper" ? "paper" : "backtest"}
+                  backtestKind={backtestKind}
                   busy={actionBusy}
                   paperActive={runningSessions.length > 0 || !!paperSessionId}
                   simBalance={simBalance}
                   onApplyAndBacktest={(params) =>
                     backtest.mutate({ id: selected.id, params, showRunRange: true })
                   }
+                  onRunWalkForward={(params) => walkForward.mutate({ id: selected.id, params })}
                   onStartPaper={(params, opts) => {
                     if (!startDisabledReason) paperStart.mutate({ params, opts });
                   }}
@@ -371,54 +415,75 @@ export default function StrategyPanel() {
               </>
             )}
 
-            <div className="my-3 border-t border-[var(--border)]" />
-            <div className="mb-2">
-              <Tabs
-                tabs={[
-                  { key: "metrics", label: "绩效指标" },
-                  { key: "trades", label: "成交明细" },
-                  { key: "history", label: "历史" },
-                ]}
-                active={tab}
-                onChange={setTab}
-              />
-            </div>
-            {tab === "metrics" ? (
+            {mode === "backtest" && backtestKind === "walkforward" ? (
               <>
-                <div className="mb-2 flex justify-end">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={!equityQ.data?.length}
-                    onClick={() =>
-                      runId &&
-                      equityQ.data &&
-                      downloadCsv(`aragon-equity-run${runId}.csv`, equityToCsv(equityQ.data))
-                    }
-                  >
-                    导出净值 CSV
-                  </Button>
-                </div>
-                <MetricsCards metrics={metrics} loading={backtest.isPending} />
-              </>
-            ) : tab === "trades" ? (
-              <>
-                <div className="mb-2 flex justify-end">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={!trades?.length}
-                    onClick={() =>
-                      runId && trades && downloadCsv(`aragon-trades-run${runId}.csv`, tradesToCsv(trades))
-                    }
-                  >
-                    导出 CSV
-                  </Button>
-                </div>
-                <TradesTable trades={trades} />
+                <div className="my-3 border-t border-[var(--border)]" />
+                <WalkForwardResults
+                  result={walkForwardResult}
+                  loading={walkForward.isPending}
+                  error={walkForward.isError ? (walkForward.error as Error)?.message : null}
+                />
               </>
             ) : (
-              <RunHistory />
+              <>
+                <div className="my-3 border-t border-[var(--border)]" />
+                <div className="mb-2">
+                  <Tabs
+                    tabs={[
+                      { key: "metrics", label: "绩效指标" },
+                      { key: "trades", label: "成交明细" },
+                      { key: "history", label: "历史" },
+                    ]}
+                    active={tab}
+                    onChange={setTab}
+                  />
+                </div>
+                {tab === "metrics" ? (
+                  <>
+                    {coverage?.truncated && (
+                      <div className="mb-2 rounded-[8px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-[11px] text-[var(--muted)]">
+                        ⚠ 区间过长 / 历史不足，仅覆盖最近 {coverage.effectiveCandleCount} /{" "}
+                        {coverage.requestedBars} 根，收益率为部分区间结果。
+                      </div>
+                    )}
+                    <div className="mb-2 flex justify-end">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={!equityQ.data?.length}
+                        onClick={() =>
+                          runId &&
+                          equityQ.data &&
+                          downloadCsv(`aragon-equity-run${runId}.csv`, equityToCsv(equityQ.data))
+                        }
+                      >
+                        导出净值 CSV
+                      </Button>
+                    </div>
+                    <MetricsCards metrics={metrics} loading={backtest.isPending} />
+                  </>
+                ) : tab === "trades" ? (
+                  <>
+                    <div className="mb-2 flex justify-end">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={!trades?.length}
+                        onClick={() =>
+                          runId &&
+                          trades &&
+                          downloadCsv(`aragon-trades-run${runId}.csv`, tradesToCsv(trades))
+                        }
+                      >
+                        导出 CSV
+                      </Button>
+                    </div>
+                    <TradesTable trades={trades} />
+                  </>
+                ) : (
+                  <RunHistory />
+                )}
+              </>
             )}
           </>
         )}
@@ -484,7 +549,29 @@ async function runBacktest(
   endTs: number,
 ) {
   if (params) await api.updateStrategy(id, { params });
-  return api.backtest(id, { instId, bar, limit: 1000, startTs, endTs });
+  // 去掉硬编码 limit（v2·P1-1）：后端全区间分页保证 [startTs,endTs] 全覆盖，不再截断到最近 1000 根。
+  return api.backtest(id, { instId, bar, startTs, endTs });
+}
+
+async function runWalkForward(
+  id: number,
+  params: Params | undefined,
+  instId: string,
+  bar: string,
+  startTs: number,
+  endTs: number,
+  wfParams: { windowBars: number; stepBars: number; resetCapital: boolean },
+): Promise<WalkForwardResult> {
+  if (params) await api.updateStrategy(id, { params });
+  return api.walkForward(id, {
+    instId,
+    bar,
+    startTs,
+    endTs,
+    windowBars: wfParams.windowBars,
+    stepBars: wfParams.stepBars,
+    resetCapital: wfParams.resetCapital,
+  });
 }
 
 async function startPaperSelection({

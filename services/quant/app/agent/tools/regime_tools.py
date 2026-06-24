@@ -187,6 +187,6 @@ class LabelMarketRegimeTool(Tool):
         if start_ts is not None and end_ts is not None:
             return await services.load_range_candles(
                 get_rest_client(), inst_id=args["instId"], bar=args["bar"],
-                limit=limit, start_ts=start_ts, end_ts=end_ts)
+                max_bars=limit, start_ts=start_ts, end_ts=end_ts)
         candles = await get_rest_client().get_candles(args["instId"], args["bar"], limit)
         return _drop_forming(candles)
