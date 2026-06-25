@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -521,22 +522,46 @@ async def _compare_combo_item(session: AsyncSession, rest, row: Strategy, candle
 
 
 # ============================ 高级回测：滑动窗口 / Walk-forward（spec §3.3） ============================
+@dataclass(frozen=True)
+class WalkForwardRunContext:
+    inst_id: str
+    bar: str
+    start_ts: int
+    end_ts: int
+    window_bars: int
+    step_bars: int
+    reset_capital: bool
+    initial_capital: float | None = None
+    fees: float | None = None
+    slippage: float | None = None
+    leverage: float | None = None
+    max_bars: int | None = None
+
+
+@dataclass(frozen=True)
+class ComboWalkForwardWindowContext:
+    members_spec: list[dict]
+    policy_spec: dict
+    candles: list[Candle]
+    plan: list[tuple[int, int]]
+    run_ctx: WalkForwardRunContext
+    costs: tuple[float, float, float, float]
+    htf_by_member: dict
+    warmup: int
+
+
 async def _resolve_strategy_spec(session: AsyncSession, strategy_id: int) -> tuple:
-    """取策略行 + 注册表类 + 合并后 params；组合策略 → 400 WF_COMBO_UNSUPPORTED（高级回测 v1 不支持）。
+    """取原子策略行 + 注册表类 + 合并后 params。
 
     Returns:
         (row, cls, params)：DB 行、策略类、叠加默认后的实例参数 dict。
 
     Raises:
-        HTTPException: 404 NOT_FOUND（策略不存在）/ 400 WF_COMBO_UNSUPPORTED（组合）/
-            400 UNAVAILABLE（模板已失效）。
+        HTTPException: 404 NOT_FOUND（策略不存在）/ 400 UNAVAILABLE（模板已失效）。
     """
     row = await repo.get_strategy_row(session, strategy_id)
     if row is None:
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "策略不存在"})
-    if _is_combo(row.template_key):
-        raise HTTPException(400, detail={"code": "WF_COMBO_UNSUPPORTED",
-                                         "message": "高级回测暂不支持组合策略"})
     cls = get_strategy_class(row.template_key)
     if cls is None:
         raise HTTPException(400, detail={"code": "UNAVAILABLE", "message": "策略模板已失效"})
@@ -576,33 +601,114 @@ async def _run_wf_windows(cls, params: dict, candles: list[Candle], bar: str,
     return windows, notes
 
 
-async def run_walk_forward(session: AsyncSession, rest, *, strategy_id: int, inst_id: str, bar: str,
-                           start_ts: int, end_ts: int, window_bars: int, step_bars: int,
-                           reset_capital: bool, initial_capital: float | None = None,
-                           fees: float | None = None, slippage: float | None = None,
-                           leverage: float | None = None, max_bars: int | None = None) -> dict:
-    """滑动窗口高级回测编排：全区间分页取数 → 规划窗口 → 逐窗口独立回测 → 跨窗口聚合（spec §3.3）。
+def _combo_warmup_estimate(members: list[ComboMember], policy: ComboPolicy) -> int:
+    from ..engine.regime import RegimeParams
+    regime_params = RegimeParams()
+    regime_start = max(regime_params.ema_slow_p, regime_params.trend_win)
+    member_warmup = max((member.strategy.warmup() for member in members), default=0)
+    return max(member_warmup, regime_start, policy.lookback_bars)
 
-    Returns:
-        {runId, summary, windows}（与 POST /strategies/{id}/walk-forward 响应同构）。
-    """
-    _row, cls, params = await _resolve_strategy_spec(session, strategy_id)
+
+def _slice_member_htf_for_window(htf_by_member: dict, start_ts: int, end_ts: int) -> dict:
+    """窗口 HTF 只截掉未来数据；保留 start_ts 前历史用于指标暖机。"""
+    _ = start_ts
+    return {
+        member_key: {
+            tf: [candle for candle in candles if int(candle.ts) <= end_ts]
+            for tf, candles in frames.items()
+        }
+        for member_key, frames in htf_by_member.items()
+    }
+
+
+async def _run_combo_wf_windows(
+    window_ctx: ComboWalkForwardWindowContext,
+) -> tuple[list[dict], list[str]]:
+    windows: list[dict] = []
+    notes: list[str] = []
+    icap, fee, slip, lev = window_ctx.costs
+    rolling = icap
+    short_flagged = False
+    for i0, i1 in window_ctx.plan:
+        sub = window_ctx.candles[i0:i1]
+        cap = icap if window_ctx.run_ctx.reset_capital else rolling
+        window_htf = _slice_member_htf_for_window(
+            window_ctx.htf_by_member,
+            int(sub[0].ts),
+            int(sub[-1].ts),
+        )
+        window_notes: list[str] = []
+        members = _build_members(window_ctx.members_spec, window_notes)
+        policy = _policy_from_spec(window_ctx.policy_spec)
+        result = await run_in_threadpool(
+            run_combo_backtest,
+            members,
+            sub,
+            window_ctx.run_ctx.bar,
+            initial_capital=cap,
+            taker_fee_bps=fee,
+            slippage_bps=slip,
+            leverage=lev,
+            htf_frames_by_member=window_htf,
+            policy=policy,
+        )
+        notes.extend(window_notes)
+        notes.extend(list(result.notes))
+        if not window_ctx.run_ctx.reset_capital and result.equity_points:
+            rolling = result.equity_points[-1].equity
+        if not short_flagged and len(sub) < window_ctx.warmup + 5:
+            notes.append("部分窗口长度接近组合暖机根数，指标可能偏弱，建议增大 windowBars")
+            short_flagged = True
+        windows.append({
+            "startTs": int(sub[0].ts),
+            "endTs": int(sub[-1].ts),
+            "metrics": result.metrics,
+            "tradeCount": result.metrics["tradeCount"],
+        })
+    return windows, notes
+
+
+async def _run_atomic_walk_forward(
+    session: AsyncSession,
+    rest,
+    row: Strategy,
+    ctx: WalkForwardRunContext,
+) -> dict:
+    _row, cls, params = await _resolve_strategy_spec(session, row.id)
     meta_strategy = cls(params)                                          # P2-6：元信息单实例复用
-    icap, fee, slip, lev = _resolve_costs(get_settings(), initial_capital, fees, slippage, leverage)
-    candles = await load_range_candles(rest, inst_id=inst_id, bar=bar, start_ts=start_ts,
-                                       end_ts=end_ts, max_bars=max_bars)
-    await repo.upsert_candles(session, inst_id, bar, candles)
+    icap, fee, slip, lev = _resolve_costs(
+        get_settings(),
+        ctx.initial_capital,
+        ctx.fees,
+        ctx.slippage,
+        ctx.leverage,
+    )
+    candles = await load_range_candles(
+        rest,
+        inst_id=ctx.inst_id,
+        bar=ctx.bar,
+        start_ts=ctx.start_ts,
+        end_ts=ctx.end_ts,
+        max_bars=ctx.max_bars,
+    )
+    await repo.upsert_candles(session, ctx.inst_id, ctx.bar, candles)
     warmup = max(meta_strategy.warmup(), 1)
     htf_frames: dict[str, list[Candle]] = {}
-    tfs = [tf for tf in meta_strategy.timeframes() if tf != bar]
-    if tfs:   # P1-4：load_htf_frames 保留 start_ts 之前 htf_warmup_bars 覆盖（暖机段不被饿死）
-        htf_frames = await load_htf_frames(rest, inst_id=inst_id, start_ts=start_ts, end_ts=end_ts,
-                                           base_seconds=bar_to_seconds(bar), timeframes=tfs,
-                                           htf_warmup_bars=meta_strategy.htf_warmup_bars())
+    tfs = [tf for tf in meta_strategy.timeframes() if tf != ctx.bar]
+    if tfs:   # P1-4：load_htf_frames 保留 start_ts 之前 htf_warmup_bars 覆盖
+        htf_frames = await load_htf_frames(
+            rest,
+            inst_id=ctx.inst_id,
+            start_ts=ctx.start_ts,
+            end_ts=ctx.end_ts,
+            base_seconds=bar_to_seconds(ctx.bar),
+            timeframes=tfs,
+            htf_warmup_bars=meta_strategy.htf_warmup_bars(),
+        )
         for tf, cs in htf_frames.items():
-            await repo.upsert_candles(session, inst_id, tf, cs)
+            await repo.upsert_candles(session, ctx.inst_id, tf, cs)
 
-    plan = plan_walk_forward_windows(len(candles), window_bars, step_bars)
+    plan = plan_walk_forward_windows(len(candles), ctx.window_bars, ctx.step_bars)
     if not plan:
         raise HTTPException(400, detail={"code": "WF_RANGE_TOO_SHORT",
                                          "message": "区间内无足够 K 线生成窗口"})
@@ -611,20 +717,154 @@ async def run_walk_forward(session: AsyncSession, rest, *, strategy_id: int, ins
                                          "message": "窗口数过多，请增大步长或缩短区间"})
 
     parent = await repo.create_run(
-        session, strategy_id=strategy_id, inst_id=inst_id, bar=bar, mode="walkforward",
-        config={"kind": "walkforward", "windowBars": window_bars, "stepBars": step_bars,
-                "resetCapital": reset_capital, "initialCapital": icap, "fees": fee,
-                "slippage": slip, "leverage": lev, "startTs": start_ts, "endTs": end_ts,
+        session, strategy_id=row.id, inst_id=ctx.inst_id, bar=ctx.bar, mode="walkforward",
+        config={"kind": "walkforward", "windowBars": ctx.window_bars,
+                "stepBars": ctx.step_bars, "resetCapital": ctx.reset_capital,
+                "initialCapital": icap, "fees": fee, "slippage": slip, "leverage": lev,
+                "startTs": ctx.start_ts, "endTs": ctx.end_ts,
                 "effectiveCandleCount": len(candles)})
     windows, notes = await _run_wf_windows(
-        cls, params, candles, bar, plan, reset_capital=reset_capital, icap=icap, fee=fee,
-        slip=slip, lev=lev, htf_frames=htf_frames, warmup=warmup)
-    # P1-2：末尾被丢弃的尾段根数 + 退化提示，随 summary 回包
+        cls, params, candles, ctx.bar, plan, reset_capital=ctx.reset_capital, icap=icap,
+        fee=fee, slip=slip, lev=lev, htf_frames=htf_frames, warmup=warmup)
     covered = plan[-1][1] if plan else 0
     uncovered = max(0, len(candles) - covered)
-    if len(plan) == 1 and len(candles) < window_bars:
+    if len(plan) == 1 and len(candles) < ctx.window_bars:
         notes.append("区间数据不足一个完整窗口，已退化为单窗口")
     summary = summarize_windows(windows, uncovered_bars=uncovered, notes=notes)
-    await repo.persist_walk_forward_result(session, parent, summary=summary, windows=windows,
-                                           start_ts=int(candles[0].ts), end_ts=int(candles[-1].ts))
+    await repo.persist_walk_forward_result(
+        session,
+        parent,
+        summary=summary,
+        windows=windows,
+        start_ts=int(candles[0].ts),
+        end_ts=int(candles[-1].ts),
+    )
     return {"runId": parent.id, "summary": summary, "windows": windows}
+
+
+async def _run_combo_walk_forward(
+    session: AsyncSession,
+    rest,
+    row: Strategy,
+    ctx: WalkForwardRunContext,
+) -> dict:
+    members_spec, policy_spec = _combo_spec_from_row(row)
+    notes: list[str] = []
+    validation_members = _build_members(members_spec, notes)
+    policy = _policy_from_spec(policy_spec)
+    costs = _resolve_costs(
+        get_settings(),
+        ctx.initial_capital,
+        ctx.fees,
+        ctx.slippage,
+        ctx.leverage,
+    )
+    icap, fee, slip, lev = costs
+    candles = await load_range_candles(
+        rest,
+        inst_id=ctx.inst_id,
+        bar=ctx.bar,
+        start_ts=ctx.start_ts,
+        end_ts=ctx.end_ts,
+        max_bars=ctx.max_bars,
+    )
+    await repo.upsert_candles(session, ctx.inst_id, ctx.bar, candles)
+    htf_by_member = await _load_member_htf(
+        session,
+        rest,
+        validation_members,
+        inst_id=ctx.inst_id,
+        bar=ctx.bar,
+        start_ts=ctx.start_ts,
+        end_ts=ctx.end_ts,
+    )
+    plan = plan_walk_forward_windows(len(candles), ctx.window_bars, ctx.step_bars)
+    if not plan:
+        raise HTTPException(400, detail={"code": "WF_RANGE_TOO_SHORT",
+                                         "message": "区间内无足够 K 线生成窗口"})
+    if len(plan) > get_settings().walk_forward_max_windows:
+        raise HTTPException(400, detail={"code": "WF_TOO_MANY_WINDOWS",
+                                         "message": "窗口数过多，请增大步长或缩短区间"})
+
+    parent = await repo.create_run(
+        session,
+        strategy_id=row.id,
+        inst_id=ctx.inst_id,
+        bar=ctx.bar,
+        mode="walkforward",
+        config={
+            "kind": "walkforward",
+            "subjectKind": "combo",
+            "combo": True,
+            "members": members_spec,
+            "policy": policy_spec,
+            "windowBars": ctx.window_bars,
+            "stepBars": ctx.step_bars,
+            "resetCapital": ctx.reset_capital,
+            "initialCapital": icap,
+            "fees": fee,
+            "slippage": slip,
+            "leverage": lev,
+            "startTs": ctx.start_ts,
+            "endTs": ctx.end_ts,
+            "effectiveCandleCount": len(candles),
+        },
+    )
+    window_ctx = ComboWalkForwardWindowContext(
+        members_spec=members_spec,
+        policy_spec=policy_spec,
+        candles=candles,
+        plan=plan,
+        run_ctx=ctx,
+        costs=(icap, fee, slip, lev),
+        htf_by_member=htf_by_member,
+        warmup=_combo_warmup_estimate(validation_members, policy),
+    )
+    windows, window_notes = await _run_combo_wf_windows(window_ctx)
+    covered = plan[-1][1] if plan else 0
+    uncovered = max(0, len(candles) - covered)
+    if len(plan) == 1 and len(candles) < ctx.window_bars:
+        notes.append("区间数据不足一个完整窗口，已退化为单窗口")
+    all_notes = list(dict.fromkeys(notes + window_notes))
+    summary = summarize_windows(windows, uncovered_bars=uncovered, notes=all_notes)
+    await repo.persist_walk_forward_result(
+        session,
+        parent,
+        summary=summary,
+        windows=windows,
+        start_ts=int(candles[0].ts),
+        end_ts=int(candles[-1].ts),
+    )
+    return {"runId": parent.id, "summary": summary, "windows": windows}
+
+
+async def run_walk_forward(session: AsyncSession, rest, *, strategy_id: int, inst_id: str, bar: str,
+                           start_ts: int, end_ts: int, window_bars: int, step_bars: int,
+                           reset_capital: bool, initial_capital: float | None = None,
+                           fees: float | None = None, slippage: float | None = None,
+                           leverage: float | None = None, max_bars: int | None = None) -> dict:
+    """滑动窗口高级回测编排：原子策略与保存后的组合策略共用同一路由。
+
+    Returns:
+        {runId, summary, windows}（与 POST /strategies/{id}/walk-forward 响应同构）。
+    """
+    row = await repo.get_strategy_row(session, strategy_id)
+    if row is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "策略不存在"})
+    ctx = WalkForwardRunContext(
+        inst_id=inst_id,
+        bar=bar,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        window_bars=window_bars,
+        step_bars=step_bars,
+        reset_capital=reset_capital,
+        initial_capital=initial_capital,
+        fees=fees,
+        slippage=slippage,
+        leverage=leverage,
+        max_bars=max_bars,
+    )
+    if _is_combo(row.template_key):
+        return await _run_combo_walk_forward(session, rest, row, ctx)
+    return await _run_atomic_walk_forward(session, rest, row, ctx)

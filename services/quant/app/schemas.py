@@ -105,10 +105,11 @@ class ComboPreviewReq(BaseModel):
 
 
 class WalkForwardReq(BaseModel):
-    """POST /strategies/{id}/walk-forward：滑动窗口（Walk-forward）高级回测入参（spec §5.1）。
+    """POST /strategies/{id}/walk-forward：滑动窗口（Walk-forward）高级回测入参。
 
-    继承基础回测字段并新增三项窗口参数。`windowBars` 下界 100（v2·P1-3：须显著大于策略 warmup，
-    防整窗口零成交）；`stepBars <= windowBars`（避免出现未覆盖空档）。
+    原子策略和保存后的组合策略 id 均使用同一请求 / 响应形状。`windowBars` 下界 100
+    （v2·P1-3：须显著大于策略 warmup，防整窗口零成交）；`stepBars <= windowBars`
+    （避免出现未覆盖空档）。
     """
 
     instId: str
@@ -216,7 +217,8 @@ def run_out(run: StrategyRun) -> dict:
 def walk_forward_out(run: StrategyRun) -> dict:
     """从 parent run 的 config_json 还原 {runId, summary, windows}（GET /runs/{id}/walk-forward）。
 
-    与 POST 响应同构；config 缺字段时回落空 summary / 空 windows（历史 run 损坏的稳妥兜底）。
+    与 POST 响应同构；原子策略和组合策略都用该形状。config 缺字段时回落空 summary /
+    空 windows（历史 run 损坏的稳妥兜底）。
     """
     import json
     try:

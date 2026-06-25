@@ -378,3 +378,50 @@ describe("app store — combo merged into backtest list (v14)", () => {
     expect(useAppStore.getState().mode).toBe("paper");
   });
 });
+
+describe("app store - strategy list tab (v15)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({ mode: "backtest", strategyListTab: "regular" });
+  });
+
+  it("setStrategyListTab updates state", () => {
+    useAppStore.getState().setStrategyListTab("combo");
+    expect(useAppStore.getState().strategyListTab).toBe("combo");
+  });
+
+  it("persists strategyListTab to localStorage", () => {
+    useAppStore.getState().setStrategyListTab("combo");
+    const persisted = JSON.parse(localStorage.getItem("aragon-ui") as string);
+    expect(persisted.state.strategyListTab).toBe("combo");
+  });
+
+  it("migrates v14 persisted state to regular tab by default", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({
+        state: { instId: "ETH-USDT-SWAP", mode: "backtest" },
+        version: 14,
+      }),
+    );
+    await useAppStore.persist.rehydrate();
+    const state = useAppStore.getState();
+    expect(state.strategyListTab).toBe("regular");
+    expect(state.instId).toBe("ETH-USDT-SWAP");
+  });
+
+  it("migrates legacy combo mode to backtest with combo tab selected", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({
+        state: { instId: "SOL-USDT-SWAP", mode: "combo" },
+        version: 13,
+      }),
+    );
+    await useAppStore.persist.rehydrate();
+    const state = useAppStore.getState();
+    expect(state.mode).toBe("backtest");
+    expect(state.strategyListTab).toBe("combo");
+    expect(state.instId).toBe("SOL-USDT-SWAP");
+  });
+});

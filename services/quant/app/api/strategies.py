@@ -103,7 +103,7 @@ async def backtest(strategy_id: int, body: BacktestReq,
 @router.post("/strategies/{strategy_id}/walk-forward")
 async def walk_forward(strategy_id: int, body: WalkForwardReq,
                        session: AsyncSession = Depends(get_session)) -> dict:
-    """高级回测：滑动窗口（Walk-forward）。不影响既有 /backtest（spec §5.1）。"""
+    """高级回测：原子策略和保存后的组合策略共用 Walk-forward 路径。"""
     return await services.run_walk_forward(
         session, get_rest_client(),
         strategy_id=strategy_id, inst_id=body.instId, bar=body.bar,

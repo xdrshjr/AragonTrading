@@ -186,6 +186,29 @@ async def _pick_atomic_no_htf(session) -> int:
     raise AssertionError("no atomic strategy without HTF found")
 
 
+async def _create_saved_combo(session) -> int:
+    from app.db import repositories as repo
+    created = await repo.create_strategy(
+        session,
+        "regime_rotation",
+        "Combo WF",
+        {
+            "members": [
+                {"templateKey": "long_shadow_reversal", "params": {}},
+                {"templateKey": "range_scalping_strategy", "params": {}},
+            ],
+            "rebalanceBars": 12,
+            "lookbackBars": 48,
+            "selectionMetric": "sharpe",
+            "minDwellBars": 12,
+            "switchMarginPct": 0.1,
+            "regimeGating": True,
+            "turnoverBps": 5,
+        },
+    )
+    return created["id"]
+
+
 async def test_run_walk_forward_window_count_and_boundaries(db):
     dispose_engine, get_sessionmaker, init_db = db
     await init_db()
@@ -255,23 +278,32 @@ async def test_run_walk_forward_degenerate_single_window_notes(db):
         await dispose_engine()
 
 
-async def test_run_walk_forward_rejects_combo(db):
-    from fastapi import HTTPException
+async def test_run_walk_forward_supports_combo(db):
     dispose_engine, get_sessionmaker, init_db = db
     await init_db()
     base = 1_700_000_000
     try:
         sm = get_sessionmaker()
         async with sm() as session:
-            from app.db import repositories as repo
-            combo = next(s for s in await repo.list_strategies(session) if s.get("kind") == "combo")
+            combo_id = await _create_saved_combo(session)
         async with sm() as session:
-            with pytest.raises(HTTPException) as exc:
-                await services.run_walk_forward(
-                    session, _PagingRest(start_ts=base, n=1500), strategy_id=combo["id"],
-                    inst_id="BTC-USDT-SWAP", bar="1H", start_ts=base, end_ts=base + 1400 * 3600,
-                    window_bars=500, step_bars=250, reset_capital=True)
-            assert exc.value.detail["code"] == "WF_COMBO_UNSUPPORTED"
+            out = await services.run_walk_forward(
+                session, _PagingRest(start_ts=base, n=1500), strategy_id=combo_id,
+                inst_id="BTC-USDT-SWAP", bar="1H", start_ts=base, end_ts=base + 1400 * 3600,
+                window_bars=500, step_bars=250, reset_capital=True)
+        assert out["runId"]
+        assert out["summary"]["windowCount"] > 0
+        for window in out["windows"]:
+            assert {"startTs", "endTs", "metrics", "tradeCount"} <= set(window)
+        async with sm() as session:
+            from app.db import repositories as repo
+            run = await repo.get_run(session, out["runId"])
+        cfg = json.loads(run.config_json)
+        assert run.mode == "walkforward"
+        assert run.strategy_id == combo_id
+        assert cfg["combo"] is True
+        assert cfg["subjectKind"] == "combo"
+        assert isinstance(cfg["members"], list) and cfg["members"]
     finally:
         await dispose_engine()
 
@@ -401,21 +433,40 @@ async def test_walk_forward_api_too_many_windows(monkeypatch, patch_okx):
         await dispose_engine()
 
 
-async def test_walk_forward_api_rejects_combo(patch_okx):
+async def test_walk_forward_api_accepts_combo(patch_okx):
     from app.db.session import dispose_engine, init_db
     await init_db()
     base = 1_700_000_000
     transport = ASGITransport(app=_load_app())
     try:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
-            combos = [s for s in (await client.get("/api/strategies")).json()
-                      if s.get("kind") == "combo"]
-            r = await client.post(f"/api/strategies/{combos[0]['id']}/walk-forward", json={
+            created = await client.post("/api/strategies", json={
+                "templateKey": "regime_rotation",
+                "name": "Combo WF",
+                "params": {
+                    "members": [
+                        {"templateKey": "long_shadow_reversal", "params": {}},
+                        {"templateKey": "range_scalping_strategy", "params": {}},
+                    ],
+                    "rebalanceBars": 12,
+                    "lookbackBars": 48,
+                    "selectionMetric": "sharpe",
+                },
+            })
+            assert created.status_code == 201, created.text
+            combo_id = created.json()["id"]
+            r = await client.post(f"/api/strategies/{combo_id}/walk-forward", json={
                 "instId": "BTC-USDT-SWAP", "bar": "1H", "startTs": base,
                 "endTs": base + 1400 * 3600, "windowBars": 500, "stepBars": 250,
                 "resetCapital": True})
-            assert r.status_code == 400
-            assert r.json()["error"]["code"] == "WF_COMBO_UNSUPPORTED"
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert "runId" in body
+            assert body["summary"]["windowCount"] > 0
+            assert {"startTs", "endTs", "metrics", "tradeCount"} <= set(body["windows"][0])
+            again = await client.get(f"/api/runs/{body['runId']}/walk-forward")
+            assert again.status_code == 200
+            assert again.json()["summary"]["windowCount"] == body["summary"]["windowCount"]
     finally:
         await dispose_engine()
 

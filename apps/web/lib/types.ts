@@ -1,5 +1,6 @@
 export type Bar = "1m" | "5m" | "15m" | "30m" | "1H" | "4H" | "1D";
 export type Mode = "backtest" | "compare" | "paper";
+export type StrategyListTab = "regular" | "combo";
 export type AccountMode = "sim" | "live";
 export type ChartView = "run-range" | "compare-range" | "live-follow";
 export type ChartPane = "price" | "equity";

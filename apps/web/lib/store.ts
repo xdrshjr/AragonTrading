@@ -14,6 +14,7 @@ import type {
   ChartView,
   Mode,
   PaperStrategySession,
+  StrategyListTab,
   WalkForwardResult,
 } from "./types";
 
@@ -76,6 +77,7 @@ interface AppState {
   bottomTab: BottomTab;
   paneTab: IndicatorKey | null;
   mode: Mode;
+  strategyListTab: StrategyListTab;
   // 回测子模式（普通回测 | 高级回测/滑动窗口）：持久化；高级回测下渲染窗口分布而非单条净值。
   backtestKind: BacktestKind;
   // 高级回测窗口参数（持久化）；运行结果 walkForwardResult 不持久化（避免刷新后陈旧）。
@@ -121,6 +123,7 @@ interface AppState {
   setBottomTab: (tab: BottomTab) => void;
   setPaneTab: (key: IndicatorKey | null) => void;
   setMode: (mode: Mode) => void;
+  setStrategyListTab: (tab: StrategyListTab) => void;
   setBacktestKind: (kind: BacktestKind) => void;
   setWfParams: (patch: Partial<WfParams>) => void;
   setWalkForwardResult: (result: WalkForwardResult | null) => void;
@@ -171,6 +174,7 @@ export const useAppStore = create<AppState>()(
       bottomTab: "trades",
       paneTab: null,
       mode: "backtest",
+      strategyListTab: "regular",
       backtestKind: "simple",
       wfParams: { ...DEFAULT_WF_PARAMS },
       walkForwardResult: null,
@@ -220,6 +224,7 @@ export const useAppStore = create<AppState>()(
           // 组合已并入回测列表：选中后由自动回测刷新绩效、由「运行回测」经 run-range 显式绘制单条净值。
           chartView: mode === "compare" ? "compare-range" : "live-follow",
         }),
+      setStrategyListTab: (strategyListTab) => set({ strategyListTab }),
       // 回测子模式（普通 | 高级/滑动窗口）：切到 walkforward 时**不**联动 chartView（无单条净值，
       // 左图维持 K 线视图，结果只在右侧面板呈现，§7.4）。
       setBacktestKind: (backtestKind) => set({ backtestKind }),
@@ -356,7 +361,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 14,
+      version: 15,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -364,6 +369,7 @@ export const useAppStore = create<AppState>()(
         bar: s.bar,
         strategyId: s.strategyId,
         mode: s.mode,
+        strategyListTab: s.strategyListTab,
         // 高级回测子模式与窗口参数持久化；walkForwardResult 为运行期产物，**不**持久化（避免刷新后陈旧）。
         backtestKind: s.backtestKind,
         wfParams: s.wfParams,
@@ -390,6 +396,7 @@ export const useAppStore = create<AppState>()(
       // 逐版补默认态（即便缺省 zustand 浅合并也回落初值，migrate 仅为显式稳妥，R7/R11）。
       migrate: (persisted, version) => {
         let next = persisted as Record<string, unknown>;
+        const hadLegacyComboMode = (next as { mode?: string }).mode === "combo";
         if (version < 2) {
           next = { ...next, indicators: { ...DEFAULT_INDICATORS } };
         }
@@ -440,6 +447,12 @@ export const useAppStore = create<AppState>()(
           // 「组合」模式页签已删（组合并入回测列表）：把历史持久化的 mode:"combo" 安全收敛到
           // "backtest"，避免水合到一个已不存在的视图（comboDraft/comboEditingId 形态不变，无需迁移）。
           if ((next as { mode?: string }).mode === "combo") next.mode = "backtest";
+        }
+        if (version < 15) {
+          next = {
+            ...next,
+            strategyListTab: hadLegacyComboMode ? "combo" : "regular",
+          };
         }
         return next as never;
       },

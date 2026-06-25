@@ -1,8 +1,9 @@
 "use client";
 
 import { summarizeComboMembers } from "@/lib/combo";
-import type { Strategy } from "@/lib/types";
+import type { BacktestKind, Strategy } from "@/lib/types";
 import { Badge, Button } from "@/components/ui";
+import WalkForwardForm from "./WalkForwardForm";
 
 /**
  * 列表选中「组合」行时的右栏紧凑详情：组合描述 + 成员/轮动摘要 + 运行回测 / 查看 / 编辑 / 删除。
@@ -10,19 +11,25 @@ import { Badge, Button } from "@/components/ui";
  */
 export default function ComboStrategyDetail({
   combo,
+  backtestKind = "simple",
   busy,
   onRunBacktest,
+  onRunWalkForward,
   onView,
   onEdit,
   onDelete,
 }: {
   combo: Strategy;
+  backtestKind?: BacktestKind;
   busy: boolean;
   onRunBacktest: (combo: Strategy) => void;
+  onRunWalkForward?: (combo: Strategy) => void;
   onView: (combo: Strategy) => void;
   onEdit: (combo: Strategy) => void;
   onDelete: (combo: Strategy) => void;
 }) {
+  const isWalkForward = backtestKind === "walkforward";
+
   return (
     <div className="flex flex-col gap-3">
       <div className="flex min-w-0 items-center gap-2">
@@ -36,10 +43,16 @@ export default function ComboStrategyDetail({
 
       <p className="text-[11px] text-[var(--muted)]">{summarizeComboMembers(combo)}</p>
 
+      {isWalkForward && (
+        <WalkForwardForm busy={busy} onRun={() => onRunWalkForward?.(combo)} />
+      )}
+
       <div className="flex flex-wrap gap-2">
-        <Button variant="primary" disabled={busy} onClick={() => onRunBacktest(combo)}>
-          {busy ? "运行中..." : "运行回测"}
-        </Button>
+        {!isWalkForward && (
+          <Button variant="primary" disabled={busy} onClick={() => onRunBacktest(combo)}>
+            {busy ? "运行中..." : "运行回测"}
+          </Button>
+        )}
         <Button variant="default" disabled={busy} onClick={() => onView(combo)}>
           查看详情
         </Button>

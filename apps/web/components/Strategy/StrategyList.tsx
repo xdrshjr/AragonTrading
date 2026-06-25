@@ -31,6 +31,7 @@ export default function StrategyList({
             key={s.id}
             onClick={() => onSelect(s.id)}
             disabled={s.unavailable}
+            aria-pressed={active}
             className={clsx(
               "group rounded-[10px] border px-3 py-2.5 text-left transition-all duration-150",
               active

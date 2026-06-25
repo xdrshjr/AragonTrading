@@ -293,7 +293,7 @@ function selectStrategy(name: string) {
 
 async function selectComboTab() {
   fireEvent.click(getButton(COMBO_TAB));
-  await screen.findByText("Combo One");
+  await waitFor(() => expect(screen.getAllByText("Combo One").length).toBeGreaterThan(0));
 }
 
 async function runAtomicBacktest() {
@@ -344,7 +344,7 @@ describe("StrategyPanel manual backtest trigger", () => {
     await selectComboTab();
 
     expect(screen.queryByText("Alpha Trend")).toBeNull();
-    expect(screen.getByText("Combo One")).toBeTruthy();
+    expect(screen.getAllByText("Combo One").length).toBeGreaterThan(0);
     expect(useAppStore.getState().strategyId).toBe(20);
   });
 
@@ -490,11 +490,12 @@ describe("StrategyPanel manual backtest trigger", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: DELETE }));
 
     await waitFor(() => expect(api.deleteStrategy).toHaveBeenCalledWith(20));
-    await waitFor(() => expect(useAppStore.getState().strategyId).toBe(1));
+    await waitFor(() => expect(useAppStore.getState().strategyId).toBeNull());
     await settleEffects();
     expect(api.backtest).not.toHaveBeenCalled();
     expect(useAppStore.getState().runId).toBeNull();
     expect(screen.queryByText("12.00%")).toBeNull();
+    expect(screen.getByText("暂无组合策略")).toBeTruthy();
   });
 
   it("keeps instrument, bar, and range changes passive while clearing stale results", async () => {

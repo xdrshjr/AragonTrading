@@ -16,22 +16,31 @@ const COMBO: Strategy = {
   paramsSchema: {},
 };
 
-function renderDetail(busy = false) {
+function renderDetail({
+  busy = false,
+  backtestKind = "simple",
+}: {
+  busy?: boolean;
+  backtestKind?: "simple" | "walkforward";
+} = {}) {
   const onRunBacktest = vi.fn();
+  const onRunWalkForward = vi.fn();
   const onView = vi.fn();
   const onEdit = vi.fn();
   const onDelete = vi.fn();
   render(
     <ComboStrategyDetail
       combo={COMBO}
+      backtestKind={backtestKind}
       busy={busy}
       onRunBacktest={onRunBacktest}
+      onRunWalkForward={onRunWalkForward}
       onView={onView}
       onEdit={onEdit}
       onDelete={onDelete}
     />,
   );
-  return { onRunBacktest, onView, onEdit, onDelete };
+  return { onRunBacktest, onRunWalkForward, onView, onEdit, onDelete };
 }
 
 describe("ComboStrategyDetail", () => {
@@ -60,7 +69,25 @@ describe("ComboStrategyDetail", () => {
   });
 
   it("disables the action buttons while busy", () => {
-    renderDetail(true);
+    renderDetail({ busy: true });
     expect((screen.getByText("运行中...") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("runs walk-forward in advanced mode while keeping management actions", () => {
+    const { onRunBacktest, onRunWalkForward, onView, onEdit, onDelete } = renderDetail({
+      backtestKind: "walkforward",
+    });
+
+    expect(screen.queryByText("运行回测")).toBeNull();
+    fireEvent.click(screen.getByText("运行高级回测"));
+    expect(onRunWalkForward).toHaveBeenCalledWith(COMBO);
+    expect(onRunBacktest).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText("查看详情"));
+    expect(onView).toHaveBeenCalledWith(COMBO);
+    fireEvent.click(screen.getByText("编辑"));
+    expect(onEdit).toHaveBeenCalledWith(COMBO);
+    fireEvent.click(screen.getByText("删除"));
+    expect(onDelete).toHaveBeenCalledWith(COMBO);
   });
 });

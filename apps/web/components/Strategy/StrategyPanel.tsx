@@ -3,13 +3,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiRequestError, api } from "@/lib/api";
-import { isCombo, isUserCombo } from "@/lib/combo";
+import { isCombo } from "@/lib/combo";
 import {
   colorForPaperStrategy,
   resolveMaxPaperSessions,
   sessionsFromBatch,
   sessionsFromReconcile,
 } from "@/lib/paperMulti";
+import {
+  STRATEGY_LIST_TABS,
+  resolveVisibleStrategyId,
+  splitStrategyCatalog,
+  visibleStrategiesForStrategyPanel,
+} from "@/lib/strategyCatalog";
 import { useAppStore } from "@/lib/store";
 import { downloadCsv, equityToCsv, tradesToCsv } from "@/lib/export";
 import type {
@@ -18,6 +24,7 @@ import type {
   PaperSessionRow,
   PaperStrategySession,
   Strategy,
+  StrategyListTab,
   WalkForwardResult,
 } from "@/lib/types";
 import { Button, Skeleton, Tabs } from "@/components/ui";
@@ -44,6 +51,7 @@ export default function StrategyPanel() {
     instId,
     bar,
     mode,
+    strategyListTab,
     backtestKind,
     wfParams,
     walkForwardResult,
@@ -59,6 +67,7 @@ export default function StrategyPanel() {
     comboEditingId,
     setComboEditingId,
     setMode,
+    setStrategyListTab,
     setStrategyId,
     setRunId,
     setChartView,
@@ -101,7 +110,7 @@ export default function StrategyPanel() {
     [mode, strategyId, setStrategyId, clearBacktestResult],
   );
 
-  const { data: strategies, isLoading, isFetching: strategiesFetching } = useQuery({
+  const { data: strategies, isLoading } = useQuery({
     queryKey: ["strategies"],
     queryFn: api.strategies,
   });
@@ -118,16 +127,27 @@ export default function StrategyPanel() {
     refetchOnWindowFocus: false,
   });
 
-  // 选中合法性守门按「当前模式的列表」校验：回测列表 = 原子 + 用户组合，实时/其余只列原子。
-  // 这同时解决「回测选中组合后切到实时，组合不在 paper 列表却仍 selected」的边界——切到 paper
-  // 自动把选择收敛到首个原子策略，避免对组合误启动 paper（组合不接 paper）。
+  // 选中合法性守门按「当前模式 + 当前分类页签」校验。空组合页签会清空旧结果，
+  // 避免显示隐藏策略的历史指标或 Walk-forward 输出。
   useEffect(() => {
-    if (!strategies?.length) return;
-    const atoms = strategies.filter((s) => s.kind !== "combo");
-    const list = mode === "backtest" ? [...atoms, ...strategies.filter(isUserCombo)] : atoms;
-    const exists = strategyId !== null && list.some((s) => s.id === strategyId);
-    if (!exists && !strategiesFetching) selectStrategyPassively(list[0]?.id ?? null);
-  }, [strategies, mode, strategyId, strategiesFetching, selectStrategyPassively]);
+    if (!strategies) return;
+    const resolvedId = resolveVisibleStrategyId({
+      strategies,
+      currentId: strategyId,
+      mode,
+      strategyListTab,
+    });
+    if (resolvedId === strategyId) return;
+    setStrategyId(resolvedId);
+    if (mode === "backtest") clearBacktestResult();
+  }, [
+    strategies,
+    mode,
+    strategyListTab,
+    strategyId,
+    setStrategyId,
+    clearBacktestResult,
+  ]);
 
   useEffect(() => {
     if (mode !== "paper" || !strategyId || paperSelectionIds.length > 0) return;
@@ -172,18 +192,17 @@ export default function StrategyPanel() {
     applyReconcile(paperSessionsQ.data);
   }, [mode, strategies, paperSessionsQ.data, paperSessionsByStrategyId, applyReconcile]);
 
-  const selected = strategies?.find((s) => s.id === strategyId);
-  // 组合并入回测列表后与原子策略平级：回测列表 = 原子 + 用户组合（组合靠「组合」徽标区分）；
-  // 实时（paper）列表仍只列原子（组合不接 paper）。对比模式由 CompareView 自己列全部策略。
-  const atomicStrategies = strategies?.filter((s) => s.kind !== "combo") ?? [];
-  const userCombos = strategies?.filter(isUserCombo) ?? [];
-  const listStrategies = mode === "backtest" ? [...atomicStrategies, ...userCombos] : atomicStrategies;
-  const enabledStrategies = atomicStrategies.filter((s) => !s.unavailable && s.enabled);
-  // 选中组合时分流到 ComboStrategyDetail，并强制普通回测（effectiveKind="simple"）：
-  // 后端对组合 walk-forward 显式抛 WF_COMBO_UNSUPPORTED，前端在「开关渲染 / 执行路径 /
-  // 结果区渲染分支 / 自动回测守卫」四处一致按 effectiveKind 收口，彻底绕开高级回测。
+  const catalog = splitStrategyCatalog(strategies ?? []);
+  const listStrategies = visibleStrategiesForStrategyPanel({
+    strategies: strategies ?? [],
+    mode,
+    strategyListTab,
+  });
+  const selected = listStrategies.find((s) => s.id === strategyId);
+  const enabledStrategies = catalog.regular.filter((s) => !s.unavailable && s.enabled);
   const selectedCombo = selected && isCombo(selected) ? selected : null;
-  const effectiveKind = selectedCombo ? "simple" : backtestKind;
+  const showEmptyComboTab =
+    mode === "backtest" && strategyListTab === "combo" && listStrategies.length === 0;
   const runningSessions = Object.values(paperSessionsByStrategyId);
   const selectedCount = paperSelectionIds.length;
   const capReached = selectedCount >= maxPaperSessions;
@@ -401,25 +420,54 @@ export default function StrategyPanel() {
               />
             )}
 
-            <StrategyList
-              strategies={listStrategies}
-              activeId={strategyId}
-              returnsById={returnsById}
-              onSelect={selectStrategyPassively}
-              multiSelectIds={mode === "paper" ? paperSelectionIds : undefined}
-              multiSelectDisabledIds={mode === "paper" ? disabledIds : undefined}
-              onToggleMultiSelect={mode === "paper" ? togglePaperSelectionId : undefined}
-            />
+            {mode === "backtest" && (
+              <div className="mb-3">
+                <Tabs
+                  tabs={STRATEGY_LIST_TABS}
+                  active={strategyListTab}
+                  onChange={(key) => setStrategyListTab(key as StrategyListTab)}
+                  variant="underline"
+                />
+              </div>
+            )}
+
+            {showEmptyComboTab ? (
+              <div className="flex flex-col gap-2 rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-3 py-4 text-xs text-[var(--muted)]">
+                <span>暂无组合策略</span>
+                <div>
+                  <Button size="sm" variant="default" onClick={openNewCombo}>
+                    新建组合
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <StrategyList
+                strategies={listStrategies}
+                activeId={strategyId}
+                returnsById={returnsById}
+                onSelect={selectStrategyPassively}
+                multiSelectIds={mode === "paper" ? paperSelectionIds : undefined}
+                multiSelectDisabledIds={mode === "paper" ? disabledIds : undefined}
+                onToggleMultiSelect={mode === "paper" ? togglePaperSelectionId : undefined}
+              />
+            )}
 
             {selected && (
               <>
                 <div className="my-3 border-t border-[var(--border)]" />
+                {mode === "backtest" && (
+                  <div className="mb-3">
+                    <BacktestModeSwitch />
+                  </div>
+                )}
                 {selectedCombo ? (
                   <>
                     <ComboStrategyDetail
                       combo={selectedCombo}
+                      backtestKind={backtestKind}
                       busy={actionBusy}
                       onRunBacktest={(c) => backtest.mutate({ id: c.id, showRunRange: true })}
+                      onRunWalkForward={(c) => walkForward.mutate({ id: c.id })}
                       onView={openComboDetail}
                       onEdit={openEditCombo}
                       onDelete={openDeleteCombo}
@@ -432,11 +480,6 @@ export default function StrategyPanel() {
                   </>
                 ) : (
                   <>
-                    {mode === "backtest" && (
-                      <div className="mb-3">
-                        <BacktestModeSwitch />
-                      </div>
-                    )}
                     <StrategyDetail
                       strategy={selected}
                       mode={mode === "paper" ? "paper" : "backtest"}
@@ -488,82 +531,87 @@ export default function StrategyPanel() {
               </>
             )}
 
-            {mode === "backtest" && effectiveKind === "walkforward" ? (
-              <>
-                <div className="my-3 border-t border-[var(--border)]" />
-                <WalkForwardResults
-                  result={walkForwardResult}
-                  loading={walkForward.isPending}
-                  error={walkForward.isError ? (walkForward.error as Error)?.message : null}
-                />
-              </>
-            ) : (
-              <>
-                <div className="my-3 border-t border-[var(--border)]" />
-                <div className="mb-2">
-                  <Tabs
-                    tabs={[
-                      { key: "metrics", label: "绩效指标" },
-                      { key: "trades", label: "成交明细" },
-                      { key: "history", label: "历史" },
-                    ]}
-                    active={tab}
-                    onChange={setTab}
+            {selected && (
+              mode === "backtest" && backtestKind === "walkforward" ? (
+                <>
+                  <div className="my-3 border-t border-[var(--border)]" />
+                  <WalkForwardResults
+                    result={walkForwardResult}
+                    loading={walkForward.isPending}
+                    error={walkForward.isError ? (walkForward.error as Error)?.message : null}
                   />
-                </div>
-                {tab === "metrics" ? (
-                  <>
-                    {coverage?.truncated && (
-                      <div className="mb-2 rounded-[8px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-[11px] text-[var(--muted)]">
-                        ⚠ 区间过长 / 历史不足，仅覆盖最近 {coverage.effectiveCandleCount} /{" "}
-                        {coverage.requestedBars} 根，收益率为部分区间结果。
+                </>
+              ) : (
+                <>
+                  <div className="my-3 border-t border-[var(--border)]" />
+                  <div className="mb-2">
+                    <Tabs
+                      tabs={[
+                        { key: "metrics", label: "绩效指标" },
+                        { key: "trades", label: "成交明细" },
+                        { key: "history", label: "历史" },
+                      ]}
+                      active={tab}
+                      onChange={setTab}
+                    />
+                  </div>
+                  {tab === "metrics" ? (
+                    <>
+                      {coverage?.truncated && (
+                        <div className="mb-2 rounded-[8px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-[11px] text-[var(--muted)]">
+                          ⚠ 区间过长 / 历史不足，仅覆盖最近 {coverage.effectiveCandleCount} /{" "}
+                          {coverage.requestedBars} 根，收益率为部分区间结果。
+                        </div>
+                      )}
+                      <div className="mb-2 flex justify-end">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={!equityQ.data?.length}
+                          onClick={() =>
+                            runId &&
+                            equityQ.data &&
+                            downloadCsv(
+                              `aragon-equity-run${runId}.csv`,
+                              equityToCsv(equityQ.data),
+                            )
+                          }
+                        >
+                          导出净值 CSV
+                        </Button>
                       </div>
-                    )}
-                    <div className="mb-2 flex justify-end">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        disabled={!equityQ.data?.length}
-                        onClick={() =>
-                          runId &&
-                          equityQ.data &&
-                          downloadCsv(`aragon-equity-run${runId}.csv`, equityToCsv(equityQ.data))
-                        }
-                      >
-                        导出净值 CSV
-                      </Button>
-                    </div>
-                    {selectedCombo && comboResult && metrics ? (
-                      <ComboResult
-                        result={{ metrics, combo: comboResult }}
-                        onGoCompare={() => setMode("compare")}
-                      />
-                    ) : (
-                      <MetricsCards metrics={metrics} loading={backtest.isPending} />
-                    )}
-                  </>
-                ) : tab === "trades" ? (
-                  <>
-                    <div className="mb-2 flex justify-end">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        disabled={!trades?.length}
-                        onClick={() =>
-                          runId &&
-                          trades &&
-                          downloadCsv(`aragon-trades-run${runId}.csv`, tradesToCsv(trades))
-                        }
-                      >
-                        导出 CSV
-                      </Button>
-                    </div>
-                    <TradesTable trades={trades} />
-                  </>
-                ) : (
-                  <RunHistory />
-                )}
-              </>
+                      {selectedCombo && comboResult && metrics ? (
+                        <ComboResult
+                          result={{ metrics, combo: comboResult }}
+                          onGoCompare={() => setMode("compare")}
+                        />
+                      ) : (
+                        <MetricsCards metrics={metrics} loading={backtest.isPending} />
+                      )}
+                    </>
+                  ) : tab === "trades" ? (
+                    <>
+                      <div className="mb-2 flex justify-end">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          disabled={!trades?.length}
+                          onClick={() =>
+                            runId &&
+                            trades &&
+                            downloadCsv(`aragon-trades-run${runId}.csv`, tradesToCsv(trades))
+                          }
+                        >
+                          导出 CSV
+                        </Button>
+                      </div>
+                      <TradesTable trades={trades} />
+                    </>
+                  ) : (
+                    <RunHistory />
+                  )}
+                </>
+              )
             )}
           </>
         )}
