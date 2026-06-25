@@ -16,6 +16,7 @@ import type {
   PaperStopAllResult,
   Run,
   Strategy,
+  StrategyKind,
   Trade,
   WalkForwardResult,
 } from "./types";
@@ -220,7 +221,7 @@ export const api = {
     priming?: boolean; // live 启动时预热回放建仓（warm-start，默认后端为 true）
     primingBars?: number; // 预热回看根数（默认后端 300）
   }) =>
-    request<{ sessionId: string; runId: number }>("/paper/start", {
+    request<{ sessionId: string; runId: number; strategyKind?: StrategyKind }>("/paper/start", {
       method: "POST",
       body: JSON.stringify(body),
     }),

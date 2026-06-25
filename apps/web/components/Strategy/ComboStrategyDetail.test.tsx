@@ -19,28 +19,46 @@ const COMBO: Strategy = {
 function renderDetail({
   busy = false,
   backtestKind = "simple",
+  mode = "backtest",
+  paperActive = false,
 }: {
   busy?: boolean;
   backtestKind?: "simple" | "walkforward";
+  mode?: "backtest" | "paper";
+  paperActive?: boolean;
 } = {}) {
   const onRunBacktest = vi.fn();
   const onRunWalkForward = vi.fn();
+  const onStartPaper = vi.fn();
+  const onStopPaper = vi.fn();
   const onView = vi.fn();
   const onEdit = vi.fn();
   const onDelete = vi.fn();
   render(
     <ComboStrategyDetail
       combo={COMBO}
+      mode={mode}
       backtestKind={backtestKind}
       busy={busy}
+      paperActive={paperActive}
       onRunBacktest={onRunBacktest}
       onRunWalkForward={onRunWalkForward}
+      onStartPaper={onStartPaper}
+      onStopPaper={onStopPaper}
       onView={onView}
       onEdit={onEdit}
       onDelete={onDelete}
     />,
   );
-  return { onRunBacktest, onRunWalkForward, onView, onEdit, onDelete };
+  return {
+    onRunBacktest,
+    onRunWalkForward,
+    onStartPaper,
+    onStopPaper,
+    onView,
+    onEdit,
+    onDelete,
+  };
 }
 
 describe("ComboStrategyDetail", () => {
@@ -89,5 +107,34 @@ describe("ComboStrategyDetail", () => {
     expect(onEdit).toHaveBeenCalledWith(COMBO);
     fireEvent.click(screen.getByText("删除"));
     expect(onDelete).toHaveBeenCalledWith(COMBO);
+  });
+
+  it("shows paper start controls without backtest controls in paper mode", () => {
+    const { onRunBacktest, onStartPaper, onView, onEdit, onDelete } = renderDetail({
+      mode: "paper",
+    });
+
+    expect(screen.queryByText("运行回测")).toBeNull();
+    fireEvent.click(screen.getByText("启动实时模拟"));
+    expect(onStartPaper).toHaveBeenCalledWith(COMBO, {
+      source: "live",
+      speed: 16,
+      replayBars: 300,
+    });
+    expect(onRunBacktest).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByText("查看详情"));
+    expect(onView).toHaveBeenCalledWith(COMBO);
+    fireEvent.click(screen.getByText("编辑"));
+    expect(onEdit).toHaveBeenCalledWith(COMBO);
+    fireEvent.click(screen.getByText("删除"));
+    expect(onDelete).toHaveBeenCalledWith(COMBO);
+  });
+
+  it("shows paper stop control for an active combo paper session", () => {
+    const { onStopPaper } = renderDetail({ mode: "paper", paperActive: true });
+
+    fireEvent.click(screen.getByText("停止模拟"));
+    expect(onStopPaper).toHaveBeenCalledOnce();
   });
 });

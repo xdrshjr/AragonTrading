@@ -15,8 +15,8 @@ from ..paper.manager import (
     PaperSessionLimitError,
     get_paper_manager,
 )
+from ..paper.strategy_factory import build_paper_strategy_spec
 from ..schemas import PaperBatchStartReq, PaperStartReq
-from ..strategies.base import get_strategy_class
 
 router = APIRouter(tags=["paper"])
 
@@ -27,25 +27,25 @@ async def paper_start(body: PaperStartReq,
     row = await repo.get_strategy_row(session, body.strategyId)
     if row is None:
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "策略不存在"})
-    cls = get_strategy_class(row.template_key)
-    if cls is None:
-        raise HTTPException(400, detail={"code": "UNAVAILABLE", "message": "策略模板已失效"})
-    try:
-        params = {**cls.meta.default_params, **json.loads(row.params_json or "{}")}
-    except json.JSONDecodeError:
-        params = dict(cls.meta.default_params)
-    strategy = cls(params)
+    strategy_spec = build_paper_strategy_spec(row)
 
     settings = get_settings()
     initial_capital = body.initialCapital or settings.initial_capital
     try:
         sess = await get_paper_manager().start(
-            strategy, body.strategyId, body.instId, body.bar, initial_capital,
+            strategy_spec.strategy, strategy_spec.strategy_id, body.instId, body.bar, initial_capital,
             source=body.source, speed=body.speed, replay_bars=body.replayBars,
-            priming=body.priming, priming_bars=body.primingBars)
+            priming=body.priming, priming_bars=body.primingBars,
+            strategy_name=strategy_spec.strategy_name,
+            strategy_kind=strategy_spec.strategy_kind,
+            config_extra=strategy_spec.config_extra)
     except PaperSessionLimitError as exc:
         raise HTTPException(429, detail={"code": "SESSION_LIMIT", "message": str(exc)})
-    return {"sessionId": sess.session_id, "runId": sess.run_id}
+    return {
+        "sessionId": sess.session_id,
+        "runId": sess.run_id,
+        "strategyKind": strategy_spec.strategy_kind,
+    }
 
 
 @router.post("/paper/batch/start")
@@ -66,17 +66,14 @@ async def paper_batch_start(body: PaperBatchStartReq,
         if row is None:
             missing_ids.append(strategy_id)
             continue
-        cls = get_strategy_class(row.template_key)
-        if cls is None:
-            raise HTTPException(400, detail={
-                "code": "UNAVAILABLE",
-                "message": f"strategy template unavailable: {row.template_key}",
-            })
-        try:
-            params = {**cls.meta.default_params, **json.loads(row.params_json or "{}")}
-        except json.JSONDecodeError:
-            params = dict(cls.meta.default_params)
-        batch_items.append(PaperBatchStrategy(strategy_id, row.name or cls.meta.name, cls(params)))
+        strategy_spec = build_paper_strategy_spec(row)
+        batch_items.append(PaperBatchStrategy(
+            strategy_spec.strategy_id,
+            strategy_spec.strategy_name,
+            strategy_spec.strategy_kind,
+            strategy_spec.strategy,
+            strategy_spec.config_extra,
+        ))
     if missing_ids:
         raise HTTPException(404, detail={
             "code": "NOT_FOUND",
@@ -203,6 +200,7 @@ def group_session_out(item) -> dict:
     return {
         "strategyId": item.strategy_id,
         "name": item.strategy_name,
+        "strategyKind": item.strategy_kind,
         "sessionId": item.session_id,
         "runId": item.run_id,
         "state": item.state,

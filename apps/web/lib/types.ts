@@ -1,6 +1,7 @@
 export type Bar = "1m" | "5m" | "15m" | "30m" | "1H" | "4H" | "1D";
 export type Mode = "backtest" | "compare" | "paper";
 export type StrategyListTab = "regular" | "combo";
+export type StrategyKind = "atomic" | "combo";
 export type AccountMode = "sim" | "live";
 export type ChartView = "run-range" | "compare-range" | "live-follow";
 export type ChartPane = "price" | "equity";
@@ -94,7 +95,7 @@ export interface Strategy {
   name: string;
   description: string;
   // 原子策略 "atomic" | 组合策略 "combo"（后端 merge_strategy 输出；旧前端忽略不影响）。
-  kind?: "atomic" | "combo";
+  kind?: StrategyKind;
   params: Record<string, unknown>;
   paramsSchema: ParamSchema;
   enabled: boolean;
@@ -258,6 +259,7 @@ export interface PaperSnapshot {
 export interface PaperStrategySession {
   strategyId: number;
   strategyName: string;
+  strategyKind?: StrategyKind;
   sessionId: string;
   runId: number;
   color: string;
@@ -277,6 +279,7 @@ export interface StrategyEquityPoint extends EquityPoint {
 export interface PaperBatchSessionResult {
   strategyId: number;
   name: string;
+  strategyKind?: StrategyKind;
   sessionId: string;
   runId: number;
   state: PaperStrategySession["state"];
@@ -348,6 +351,7 @@ export interface PaperSessionInfo {
 export interface PaperSessionRow extends PaperSessionInfo {
   strategyId: number;
   strategyName?: string;
+  strategyKind?: StrategyKind;
   groupId: string | null;
 }
 

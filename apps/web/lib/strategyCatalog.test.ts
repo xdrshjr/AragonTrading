@@ -61,8 +61,12 @@ describe("strategyCatalog", () => {
     expect(splitStrategyCatalog(STRATEGIES).combos.map((s) => s.id)).toEqual([20]);
   });
 
-  it("uses regular strategies in paper mode even when combo tab is active", () => {
-    expect(visible("paper", "combo")).toEqual([1, 2]);
+  it("uses regular strategies in paper mode when regular tab is active", () => {
+    expect(visible("paper", "regular")).toEqual([1, 2]);
+  });
+
+  it("uses user-created combos in paper mode when combo tab is active", () => {
+    expect(visible("paper", "combo")).toEqual([20]);
   });
 
   it("preserves a current id that remains visible", () => {
@@ -82,6 +86,17 @@ describe("strategyCatalog", () => {
         strategies: STRATEGIES,
         currentId: 1,
         mode: "backtest",
+        strategyListTab: "combo",
+      }),
+    ).toBe(20);
+  });
+
+  it("falls back to the first saved combo in paper mode when switching tabs", () => {
+    expect(
+      resolveVisibleStrategyId({
+        strategies: STRATEGIES,
+        currentId: 1,
+        mode: "paper",
         strategyListTab: "combo",
       }),
     ).toBe(20);

@@ -19,7 +19,8 @@ from ..okx.types import BAR_SECONDS, Candle
 from ..okx.ws_client import OKXWSClient
 from ..strategies.base import BaseStrategy
 
-_WINDOW_MAX = 600
+PAPER_WINDOW_MAX = 1200
+_WINDOW_MAX = PAPER_WINDOW_MAX
 _REPLAY_BASE_INTERVAL = 0.2   # 回放每根基准间隔（秒）；实际间隔 = BASE / speed (F5)
 _DEFAULT_PRIMING_BARS = 300   # 预热回放回看根数默认值（修复 P1-2：低频策略也有 seeded 动态）
 _SNAPSHOT_EQUITY_MAX = 1000   # snapshot 回放净值上限（订阅即重放末 N 条，R7）
@@ -60,15 +61,25 @@ class PaperSession:
             slippage_bps=settings.default_slippage_bps,
             leverage=settings.default_leverage,
         )
-        self._candles: deque[dict] = deque(maxlen=_WINDOW_MAX)
+        base_seconds = BAR_SECONDS.get(bar, 60)
+        self._htf_warmup = strategy.htf_warmup_bars()
+        self._window_max = min(
+            max(
+                self.strategy.warmup() + 5,
+                self.priming_bars,
+                self.replay_bars,
+                self._htf_warmup + 5,
+            ),
+            PAPER_WINDOW_MAX,
+        )
+        self._candles: deque[dict] = deque(maxlen=self._window_max)
         # 多周期（MTF §3.6/§6.4）：仅当策略声明了【严格高于基础周期】的高周期时才有开销。
         base_seconds = BAR_SECONDS.get(bar, 60)
         self._htf_bars: list[str] = [tf for tf in strategy.timeframes()
                                      if BAR_SECONDS.get(tf, 0) > base_seconds]
         self._htf_windows: dict[str, deque] = {
-            b: deque(maxlen=_WINDOW_MAX) for b in self._htf_bars}
+            b: deque(maxlen=self._window_max) for b in self._htf_bars}
         self._htf_last_bucket: dict[str, int] = {}   # 各高周期上次刷新所在桶（跨边界才刷新）
-        self._htf_warmup = strategy.htf_warmup_bars()
         self._last_confirmed_ts: int | None = None
         self._bar_index = -1
         self._trade_cursor = 0
@@ -124,7 +135,7 @@ class PaperSession:
         `prepare` 在增量增长的窗口上算指标，等价于对近端真实历史做一次因果微回测。
         回看根数夹取到 `[warmup+5, _WINDOW_MAX]`（修复 P1-2：低频策略也有现实概率体现持仓）。
         """
-        bars = max(self.strategy.warmup() + 5, min(self.priming_bars, _WINDOW_MAX))
+        bars = min(max(self.strategy.warmup() + 5, self.priming_bars), self._window_max)
         try:
             history = await get_rest_client().get_candles(self.inst_id, self.bar, limit=bars)
             for c in history:
@@ -142,7 +153,7 @@ class PaperSession:
 
     async def _load_warmup_window(self) -> None:
         """priming=False：沿用 v1 既有行为——整窗预填窗口但不回放（仅供指标暖机）。"""
-        warmup = max(self.strategy.warmup() + 5, 60)
+        warmup = min(max(self.strategy.warmup() + 5, 60), self._window_max)
         try:
             history = await get_rest_client().get_candles(self.inst_id, self.bar, limit=warmup)
             for c in history:
@@ -166,7 +177,7 @@ class PaperSession:
             if not secs:
                 continue
             span_htf = (int(base_span_bars) * base_seconds) // secs + 1
-            limit = min(_WINDOW_MAX, max(self._htf_warmup, span_htf) + 5)
+            limit = min(self._window_max, max(self._htf_warmup, span_htf) + 5)
             try:
                 candles = await get_rest_client().get_candles(self.inst_id, b, limit=limit)
             except Exception:  # noqa: BLE001 —— 取数失败：窗口留空，安全降级（绝不假数据）
@@ -193,7 +204,7 @@ class PaperSession:
                 continue   # 未跨边界：复用窗口
             try:
                 candles = await get_rest_client().get_candles(
-                    self.inst_id, b, limit=self._htf_warmup + 5)
+                    self.inst_id, b, limit=min(self._window_max, self._htf_warmup + 5))
             except Exception:  # noqa: BLE001 —— 取数失败：窗口不更新（降级，不阻塞撮合）
                 continue
             win = self._htf_windows[b]
@@ -209,9 +220,10 @@ class PaperSession:
         interval = max(0.0, _REPLAY_BASE_INTERVAL / self.speed)
         try:
             # 回放是固定历史区间：高周期窗口一次性预填即可，逐根回放不再刷新（§6.4-1/4）。
-            await self._prefill_htf(self.replay_bars)
+            replay_limit = min(self.replay_bars, self._window_max)
+            await self._prefill_htf(replay_limit)
             history = await get_rest_client().get_candles(
-                self.inst_id, self.bar, limit=self.replay_bars)
+                self.inst_id, self.bar, limit=replay_limit)
             for c in history:
                 if self.state != "running":
                     break

@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiRequestError, api } from "@/lib/api";
 import { isCombo } from "@/lib/combo";
 import {
@@ -91,6 +91,7 @@ export default function StrategyPanel() {
   // 组合回测结果（年化 / 轮动时间线 / 分体制贡献）：选中组合回测后接入绩效页签；原子回测回填 null。
   const [comboResult, setComboResult] = useState<ComboPreviewResult["combo"] | null>(null);
   const reconciledRef = useRef(false);
+  const seededPaperSelectionRef = useRef(false);
 
   const clearBacktestResult = useCallback(() => {
     setRunId(null);
@@ -150,7 +151,16 @@ export default function StrategyPanel() {
   ]);
 
   useEffect(() => {
-    if (mode !== "paper" || !strategyId || paperSelectionIds.length > 0) return;
+    if (mode !== "paper") {
+      seededPaperSelectionRef.current = false;
+      return;
+    }
+    if (paperSelectionIds.length > 0) {
+      seededPaperSelectionRef.current = true;
+      return;
+    }
+    if (seededPaperSelectionRef.current || !strategyId) return;
+    seededPaperSelectionRef.current = true;
     setPaperSelectionIds([strategyId]);
   }, [mode, strategyId, paperSelectionIds.length, setPaperSelectionIds]);
 
@@ -192,21 +202,49 @@ export default function StrategyPanel() {
     applyReconcile(paperSessionsQ.data);
   }, [mode, strategies, paperSessionsQ.data, paperSessionsByStrategyId, applyReconcile]);
 
-  const catalog = splitStrategyCatalog(strategies ?? []);
-  const listStrategies = visibleStrategiesForStrategyPanel({
-    strategies: strategies ?? [],
-    mode,
-    strategyListTab,
-  });
+  const baseStrategies = strategies ?? [];
+  const catalog = useMemo(() => splitStrategyCatalog(baseStrategies), [baseStrategies]);
+  const listStrategies = useMemo(
+    () =>
+      visibleStrategiesForStrategyPanel({
+        strategies: baseStrategies,
+        mode,
+        strategyListTab,
+      }),
+    [baseStrategies, mode, strategyListTab],
+  );
   const selected = listStrategies.find((s) => s.id === strategyId);
-  const enabledStrategies = catalog.regular.filter((s) => !s.unavailable && s.enabled);
+  const visibleSelectableStrategies = useMemo(
+    () => listStrategies.filter((s) => !s.unavailable && s.enabled),
+    [listStrategies],
+  );
+  const allSelectableStrategies = useMemo(
+    () => [...catalog.regular, ...catalog.combos].filter((s) => !s.unavailable && s.enabled),
+    [catalog],
+  );
+  const allSelectableIds = useMemo(
+    () => new Set(allSelectableStrategies.map((s) => s.id)),
+    [allSelectableStrategies],
+  );
+  const validPaperSelectionIds = useMemo(
+    () => paperSelectionIds.filter((id) => allSelectableIds.has(id)),
+    [paperSelectionIds, allSelectableIds],
+  );
   const selectedCombo = selected && isCombo(selected) ? selected : null;
   const showEmptyComboTab =
-    mode === "backtest" && strategyListTab === "combo" && listStrategies.length === 0;
+    (mode === "backtest" || mode === "paper") &&
+    strategyListTab === "combo" &&
+    listStrategies.length === 0;
   const runningSessions = Object.values(paperSessionsByStrategyId);
-  const selectedCount = paperSelectionIds.length;
+  const selectedCount = validPaperSelectionIds.length;
   const capReached = selectedCount >= maxPaperSessions;
   const busy = false;
+
+  useEffect(() => {
+    if (mode !== "paper") return;
+    if (validPaperSelectionIds.length === paperSelectionIds.length) return;
+    setPaperSelectionIds(validPaperSelectionIds);
+  }, [mode, paperSelectionIds.length, validPaperSelectionIds, setPaperSelectionIds]);
 
   const backtest = useMutation({
     mutationFn: (vars: { id: number; params?: Params; showRunRange?: boolean }) =>
@@ -259,12 +297,13 @@ export default function StrategyPanel() {
   });
 
   const paperStart = useMutation({
-    mutationFn: (vars: { params: Params; opts?: PaperOpts }) =>
+    mutationFn: (vars: { params?: Params; skipUpdate?: boolean; opts?: PaperOpts }) =>
       startPaperSelection({
         activeStrategyId: strategyId as number,
-        selectionIds: paperSelectionIds.length ? paperSelectionIds : [strategyId as number],
+        selectionIds: validPaperSelectionIds.length ? validPaperSelectionIds : [strategyId as number],
         namesById: Object.fromEntries(strategies?.map((item) => [item.id, item.name]) ?? []),
         params: vars.params,
+        skipUpdate: vars.skipUpdate,
         instId,
         bar,
         simBalance,
@@ -381,9 +420,11 @@ export default function StrategyPanel() {
         : null;
   const disabledIds =
     runningSessions.length > 0
-      ? enabledStrategies.map((s) => s.id)
+      ? listStrategies.map((s) => s.id)
       : capReached
-        ? enabledStrategies.filter((s) => !paperSelectionIds.includes(s.id)).map((s) => s.id)
+        ? visibleSelectableStrategies
+            .filter((s) => !validPaperSelectionIds.includes(s.id))
+            .map((s) => s.id)
         : [];
 
   return (
@@ -410,17 +451,22 @@ export default function StrategyPanel() {
             {mode === "paper" && (
               <PaperSelectionBar
                 selectedCount={selectedCount}
-                totalCount={enabledStrategies.length}
+                totalCount={allSelectableStrategies.length}
                 maxPaperSessions={maxPaperSessions}
                 disabled={runningSessions.length > 0}
-                onSelectAll={() =>
-                  setPaperSelectionIds(enabledStrategies.slice(0, maxPaperSessions).map((s) => s.id))
-                }
+                onSelectAll={() => {
+                  const next = [...validPaperSelectionIds];
+                  for (const strategy of visibleSelectableStrategies) {
+                    if (next.length >= maxPaperSessions) break;
+                    if (!next.includes(strategy.id)) next.push(strategy.id);
+                  }
+                  setPaperSelectionIds(next);
+                }}
                 onClear={() => setPaperSelectionIds([])}
               />
             )}
 
-            {mode === "backtest" && (
+            {(mode === "backtest" || mode === "paper") && (
               <div className="mb-3">
                 <Tabs
                   tabs={STRATEGY_LIST_TABS}
@@ -464,17 +510,50 @@ export default function StrategyPanel() {
                   <>
                     <ComboStrategyDetail
                       combo={selectedCombo}
+                      mode={mode === "paper" ? "paper" : "backtest"}
                       backtestKind={backtestKind}
                       busy={actionBusy}
+                      paperActive={runningSessions.length > 0 || !!paperSessionId}
                       onRunBacktest={(c) => backtest.mutate({ id: c.id, showRunRange: true })}
                       onRunWalkForward={(c) => walkForward.mutate({ id: c.id })}
+                      onStartPaper={(_combo, opts) => {
+                        if (!startDisabledReason) paperStart.mutate({ skipUpdate: true, opts });
+                      }}
+                      onStopPaper={() => {
+                        setPaperStreamsEnabled(false);
+                        paperStop.mutate();
+                      }}
                       onView={openComboDetail}
                       onEdit={openEditCombo}
                       onDelete={openDeleteCombo}
                     />
+                    {startDisabledReason && (
+                      <div className="mt-2 text-[11px] text-[var(--muted)]">{startDisabledReason}</div>
+                    )}
+                    {runningSessions.length > 0 && <PaperRunningList sessions={runningSessions} />}
                     {backtest.isError && (
                       <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
                         回测失败：{(backtest.error as Error)?.message}
+                      </div>
+                    )}
+                    {(paperStart.isError || stopError) && (
+                      <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+                        <div>
+                          操作失败：
+                          {stopError || (paperStart.error as Error)?.message}
+                        </div>
+                        {isSessionLimitError && (
+                          <div className="mt-1.5">
+                            <Button
+                              variant="danger"
+                              size="sm"
+                              disabled={paperStopAll.isPending || paperStart.isPending}
+                              onClick={stopAllAndRetry}
+                            >
+                              停止全部并重试
+                            </Button>
+                          </div>
+                        )}
                       </div>
                     )}
                   </>
@@ -646,10 +725,10 @@ function PaperSelectionBar({
       </span>
       <div className="flex gap-1">
         <Button variant="ghost" size="sm" disabled={disabled} onClick={onSelectAll}>
-          全选
+          全选当前页
         </Button>
         <Button variant="ghost" size="sm" disabled={disabled} onClick={onClear}>
-          清空
+          清空全部
         </Button>
       </div>
     </div>
@@ -711,6 +790,7 @@ async function startPaperSelection({
   selectionIds,
   namesById,
   params,
+  skipUpdate,
   instId,
   bar,
   simBalance,
@@ -719,13 +799,14 @@ async function startPaperSelection({
   activeStrategyId: number;
   selectionIds: number[];
   namesById: Record<number, string>;
-  params: Params;
+  params?: Params;
+  skipUpdate?: boolean;
   instId: string;
   bar: string;
   simBalance: number;
   opts?: PaperOpts;
 }): Promise<{ sessions: Record<number, PaperStrategySession>; groupId: string | null }> {
-  await api.updateStrategy(activeStrategyId, { params });
+  if (params && !skipUpdate) await api.updateStrategy(activeStrategyId, { params });
   const uniqueIds = Array.from(new Set(selectionIds));
   if (uniqueIds.length <= 1) {
     const id = uniqueIds[0] ?? activeStrategyId;
@@ -743,6 +824,7 @@ async function startPaperSelection({
         [id]: {
           strategyId: id,
           strategyName: namesById[id] ?? `Strategy ${id}`,
+          strategyKind: result.strategyKind,
           sessionId: result.sessionId,
           runId: result.runId,
           color: colorForPaperStrategy(0),

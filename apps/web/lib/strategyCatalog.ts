@@ -22,7 +22,7 @@ export function visibleStrategiesForStrategyPanel(args: {
   strategyListTab: StrategyListTab;
 }): Strategy[] {
   const { regular, combos } = splitStrategyCatalog(args.strategies);
-  if (args.mode !== "backtest") return regular;
+  if (args.mode !== "backtest" && args.mode !== "paper") return regular;
   return args.strategyListTab === "combo" ? combos : regular;
 }
 

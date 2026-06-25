@@ -24,6 +24,13 @@ from ..engine.mtf import bar_to_seconds
 from ..okx.types import Candle
 from ..schemas import combo_out, equity_out
 from ..strategies.base import BaseStrategy, get_strategy_class
+from ..strategies.combo_specs import (
+    build_members as _build_members,
+    combo_spec_from_row as _combo_spec_from_row,
+    is_combo as _is_combo,
+    policy_from_spec as _policy_from_spec,
+    validate_combo_params,
+)
 
 
 # ============================ 取数（边界处显式错误，C1） ============================
@@ -320,32 +327,6 @@ async def run_compare(session: AsyncSession, rest, *, strategy_ids: list[int], i
 
 
 # ============================ 组合编排（regime rotation） ============================
-MIN_COMBO_MEMBERS = 2
-MAX_COMBO_MEMBERS = 8
-
-
-def _is_combo(template_key: str) -> bool:
-    """该模板是否为组合策略（kind=="combo"）；模板失效 → False。"""
-    cls = get_strategy_class(template_key)
-    return cls is not None and getattr(cls.meta, "kind", "atomic") == "combo"
-
-
-def validate_combo_params(template_key: str, params: dict | None) -> None:
-    """保存 / 更新组合时的成员数边界校验（2..8）；非组合模板直接放行。
-
-    纵深防御（R6）：防绕过 UI 直接 POST/PUT 存出非法组合，与运行期 `_build_members` 的
-    `< 2` 兜底互补。越界即 400 `COMBO_MEMBERS`（与运行期同错误码，前端可统一处理）。
-    """
-    if not _is_combo(template_key):
-        return
-    members = (params or {}).get("members", [])
-    count = len(members) if isinstance(members, list) else 0
-    if count < MIN_COMBO_MEMBERS or count > MAX_COMBO_MEMBERS:
-        raise HTTPException(400, detail={
-            "code": "COMBO_MEMBERS",
-            "message": f"组合成员数须在 {MIN_COMBO_MEMBERS}..{MAX_COMBO_MEMBERS} 之间"})
-
-
 async def _combo_template_strategy_id(session: AsyncSession) -> int:
     """已 seed 的 regime_rotation builtin 行 id（预览 run 的 strategy_id 落点，R1）。
 
@@ -359,48 +340,6 @@ async def _combo_template_strategy_id(session: AsyncSession) -> int:
         raise HTTPException(500, detail={"code": "COMBO_TEMPLATE_MISSING",
                                          "message": "组合模板未初始化"})
     return sid
-
-
-def _policy_from_spec(spec: dict | None) -> ComboPolicy:
-    """camelCase 轮动参数 dict → ComboPolicy（缺省回落模板默认）。"""
-    spec = spec or {}
-    base = ComboPolicy()
-    return ComboPolicy(
-        rebalance_bars=int(spec.get("rebalanceBars", base.rebalance_bars)),
-        lookback_bars=int(spec.get("lookbackBars", base.lookback_bars)),
-        selection_metric=str(spec.get("selectionMetric", base.selection_metric)),
-        min_dwell_bars=int(spec.get("minDwellBars", base.min_dwell_bars)),
-        switch_margin=float(spec.get("switchMarginPct", base.switch_margin)),
-        regime_gating=bool(spec.get("regimeGating", base.regime_gating)),
-        turnover_bps=float(spec.get("turnoverBps", base.turnover_bps)),
-    )
-
-
-def _build_members(members_spec: list[dict], notes: list[str]) -> list[ComboMember]:
-    """逐 {templateKey, params} 实例化成员；模板失效/为组合则跳过并记 note；可用 < 2 → 400。
-
-    `template_key` 取自 spec（供体制 gating，R2）；同模板多份的展示 `key` 追加 `#序号` 去歧义。
-    """
-    members: list[ComboMember] = []
-    seen: dict[str, int] = {}
-    for spec in members_spec:
-        template_key = spec.get("templateKey")
-        cls = get_strategy_class(template_key)
-        if cls is None or getattr(cls.meta, "kind", "atomic") == "combo":
-            notes.append(f"成员模板 {template_key} 不可用，已跳过")
-            continue
-        params = {**cls.meta.default_params, **(spec.get("params") or {})}
-        count = seen.get(template_key, 0)
-        seen[template_key] = count + 1
-        display_key = template_key if count == 0 else f"{template_key}#{count + 1}"
-        strategy = cls(params)
-        members.append(ComboMember(
-            key=display_key, template_key=template_key, name=cls.meta.name,
-            strategy=strategy, timeframes=list(strategy.timeframes())))
-    if len(members) < 2:
-        raise HTTPException(400, detail={"code": "COMBO_MEMBERS",
-                                         "message": "组合至少需要 2 个可用成员"})
-    return members
 
 
 async def _load_member_htf(session: AsyncSession, rest, members: list[ComboMember], *,
@@ -465,23 +404,6 @@ async def run_combo_preview(session: AsyncSession, rest, *, members_spec: list[d
         config_extra={"preview": True, "members": members_spec, "policy": policy_spec or {}})
     combo_notes = list(dict.fromkeys(notes + list(result.notes)))
     return {"runId": run.id, "metrics": result.metrics, "combo": combo_out(result, combo_notes)}
-
-
-_COMBO_POLICY_KEYS = ("rebalanceBars", "lookbackBars", "selectionMetric", "minDwellBars",
-                      "switchMarginPct", "regimeGating", "turnoverBps")
-
-
-def _combo_spec_from_row(row: Strategy) -> tuple[list[dict], dict]:
-    """从保存组合行的 params_json 解出 (members_spec, policy_spec)（叠加模板默认）。"""
-    cls = get_strategy_class(row.template_key)
-    defaults = dict(cls.meta.default_params) if cls else {}
-    try:
-        params = {**defaults, **json.loads(row.params_json or "{}")}
-    except json.JSONDecodeError:
-        params = defaults
-    members_spec = params.get("members", [])
-    policy_spec = {key: params[key] for key in _COMBO_POLICY_KEYS if key in params}
-    return members_spec, policy_spec
 
 
 async def _run_saved_combo(session: AsyncSession, rest, row: Strategy, *, inst_id: str, bar: str,

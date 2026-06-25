@@ -21,13 +21,16 @@ class PaperSessionLimitError(Exception):
 class PaperBatchStrategy:
     strategy_id: int
     strategy_name: str
+    strategy_kind: str
     strategy: BaseStrategy
+    config_extra: dict | None = None
 
 
 @dataclass
 class PaperGroupSession:
     strategy_id: int
     strategy_name: str
+    strategy_kind: str
     session_id: str
     run_id: int
     state: str
@@ -53,20 +56,26 @@ class PaperManager:
     async def start(self, strategy: BaseStrategy, strategy_id: int, inst_id: str,
                     bar: str, initial_capital: float, *, source: str = "live",
                     speed: float = 1.0, replay_bars: int = 300,
-                    priming: bool = True, priming_bars: int = 300) -> PaperSession:
+                    priming: bool = True, priming_bars: int = 300,
+                    strategy_name: str | None = None,
+                    strategy_kind: str = "atomic",
+                    config_extra: dict | None = None) -> PaperSession:
         self._ensure_capacity(1)
 
         base_seconds = BAR_SECONDS.get(bar, 60)
         htf_bars = [tf for tf in strategy.timeframes()
                     if BAR_SECONDS.get(tf, 0) > base_seconds]   # §6.3/P2-2 透明追溯
+        config = {"initialCapital": initial_capital, "source": source,
+                  "speed": speed, "replayBars": replay_bars,
+                  "priming": priming, "primingBars": priming_bars,
+                  "htfBars": htf_bars, "strategyKind": strategy_kind}
+        if config_extra:
+            config.update(config_extra)
         sm = get_sessionmaker()
         async with sm() as s:
             run = await repo.create_run(
                 s, strategy_id=strategy_id, inst_id=inst_id, bar=bar, mode="paper",
-                config={"initialCapital": initial_capital, "source": source,
-                        "speed": speed, "replayBars": replay_bars,
-                        "priming": priming, "primingBars": priming_bars,
-                        "htfBars": htf_bars},
+                config=config,
                 status="running",
             )
             run_id = run.id
@@ -79,6 +88,8 @@ class PaperManager:
         self._sessions[session_id] = session
         self._session_meta[session_id] = {
             "strategyId": strategy_id,
+            "strategyName": strategy_name,
+            "strategyKind": strategy_kind,
             "runId": run_id,
             "groupId": None,
         }
@@ -110,17 +121,22 @@ class PaperManager:
                 session = await self.start(
                     item.strategy, item.strategy_id, inst_id, bar, initial_capital,
                     source=source, speed=speed, replay_bars=replay_bars,
-                    priming=priming, priming_bars=priming_bars)
+                    priming=priming, priming_bars=priming_bars,
+                    strategy_name=item.strategy_name,
+                    strategy_kind=item.strategy_kind,
+                    config_extra=item.config_extra)
                 started_session_ids.append(session.session_id)
                 self._session_meta[session.session_id] = {
                     "strategyId": item.strategy_id,
                     "strategyName": item.strategy_name,
+                    "strategyKind": item.strategy_kind,
                     "runId": session.run_id,
                     "groupId": group_id,
                 }
                 group_sessions.append(PaperGroupSession(
                     strategy_id=item.strategy_id,
                     strategy_name=item.strategy_name,
+                    strategy_kind=item.strategy_kind,
                     session_id=session.session_id,
                     run_id=session.run_id,
                     state=session.state,

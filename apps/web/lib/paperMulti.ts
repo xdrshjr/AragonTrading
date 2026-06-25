@@ -28,6 +28,7 @@ export function sessionsFromBatch(
     {
       strategyId: session.strategyId,
       strategyName: session.name,
+      strategyKind: session.strategyKind,
       sessionId: session.sessionId,
       runId: session.runId,
       color: colorForPaperStrategy(index),
@@ -51,6 +52,7 @@ export function sessionsFromReconcile(
     {
       strategyId: row.strategyId,
       strategyName: namesById[row.strategyId] ?? row.strategyName ?? `Strategy ${row.strategyId}`,
+      strategyKind: row.strategyKind,
       sessionId: row.sessionId,
       runId: row.runId,
       color: colorForPaperStrategy(index),

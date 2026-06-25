@@ -128,15 +128,16 @@ async def test_incremental_replay_has_no_duplicate_ts(monkeypatch):
 
 
 async def test_priming_bars_upper_clamp(monkeypatch):
-    """primingBars 上夹取到 _WINDOW_MAX=600（覆盖 P1-2）。"""
+    """primingBars 上夹取到 PAPER_WINDOW_MAX（覆盖 P1-2）。"""
     from app.db.session import dispose_engine, init_db
+    from app.paper.session import PAPER_WINDOW_MAX
     await init_db()
     try:
-        rest = _patch(monkeypatch, make_synthetic_candles(700))
-        sess, _ = await _make_session(priming_bars=1000)
+        rest = _patch(monkeypatch, make_synthetic_candles(PAPER_WINDOW_MAX + 100))
+        sess, _ = await _make_session(priming_bars=PAPER_WINDOW_MAX + 500)
         await sess.start()
-        assert rest.last_limit == 600
-        assert len(sess._candles) == 600
+        assert rest.last_limit == PAPER_WINDOW_MAX
+        assert len(sess._candles) == PAPER_WINDOW_MAX
     finally:
         await dispose_engine()
 

@@ -120,6 +120,7 @@ async def test_batch_start_creates_one_run_per_strategy(patch_paper_session):
             assert body["groupId"]
             assert [item["strategyId"] for item in body["sessions"]] == ids
             assert all(item["state"] == "running" for item in body["sessions"])
+            assert [item["strategyKind"] for item in body["sessions"]] == ["atomic", "atomic"]
 
             sm = get_sessionmaker()
             async with sm() as session:

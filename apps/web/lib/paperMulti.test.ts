@@ -6,6 +6,7 @@ import {
   paperSessionsToOverlays,
   resolveMaxPaperSessions,
   selectFirstAvailablePaperStrategy,
+  sessionsFromBatch,
   sessionsFromReconcile,
 } from "./paperMulti";
 import type {
@@ -124,10 +125,51 @@ describe("paper multi helpers", () => {
     expect(resolveMaxPaperSessions(12)).toBe(12);
   });
 
+  it("sessionsFromBatch preserves the backend strategy kind", () => {
+    const sessions = sessionsFromBatch({
+      groupId: "paper_g1",
+      instId: "BTC-USDT-SWAP",
+      bar: "1H",
+      sessions: [
+        {
+          strategyId: 1,
+          name: "Alpha",
+          strategyKind: "atomic",
+          sessionId: "s1",
+          runId: 11,
+          state: "running",
+        },
+        {
+          strategyId: 20,
+          name: "Combo",
+          strategyKind: "combo",
+          sessionId: "s20",
+          runId: 20,
+          state: "running",
+        },
+      ],
+    });
+
+    expect(sessions[1].strategyKind).toBe("atomic");
+    expect(sessions[20].strategyKind).toBe("combo");
+  });
+
   it("sessionsFromReconcile keeps only running rows, resolving name/color/group", () => {
     const rows: PaperSessionRow[] = [
-      paperSessionRow({ strategyId: 1, sessionId: "s1", runId: 11, groupId: "paper_g1" }),
-      paperSessionRow({ strategyId: 2, sessionId: "s2", runId: 22, groupId: "paper_g1" }),
+      paperSessionRow({
+        strategyId: 1,
+        sessionId: "s1",
+        runId: 11,
+        groupId: "paper_g1",
+        strategyKind: "atomic",
+      }),
+      paperSessionRow({
+        strategyId: 2,
+        sessionId: "s2",
+        runId: 22,
+        groupId: "paper_g1",
+        strategyKind: "combo",
+      }),
       paperSessionRow({ strategyId: 3, sessionId: "s3", runId: 33, state: "stopped" }),
     ];
 
@@ -142,9 +184,11 @@ describe("paper multi helpers", () => {
       runId: 11,
       color: "#6366f1",
       state: "running",
+      strategyKind: "atomic",
     });
     expect(sessions[2].strategyName).toBe("Beta");
     expect(sessions[2].color).toBe("#10b981");
+    expect(sessions[2].strategyKind).toBe("combo");
   });
 
   it("sessionsFromReconcile falls back on name and nulls group when single or mixed", () => {

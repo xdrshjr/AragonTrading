@@ -348,6 +348,108 @@ describe("StrategyPanel manual backtest trigger", () => {
     expect(useAppStore.getState().strategyId).toBe(20);
   });
 
+  it("renders strategy category tabs in paper mode and filters the realtime list", async () => {
+    await renderLoadedPanel({ mode: "paper" });
+
+    expect(getButton(REGULAR_TAB)).toBeTruthy();
+    expect(getButton(COMBO_TAB)).toBeTruthy();
+    expect(screen.getByText("Alpha Trend")).toBeTruthy();
+    expect(screen.queryByText("Combo One")).toBeNull();
+
+    await selectComboTab();
+
+    expect(screen.queryByText("Alpha Trend")).toBeNull();
+    expect(screen.getAllByText("Combo One").length).toBeGreaterThan(0);
+    expect(useAppStore.getState().strategyId).toBe(20);
+  });
+
+  it("keeps paper selections across tabs and batch starts atomic plus combo ids", async () => {
+    vi.mocked(api.paperBatchStart).mockResolvedValue({
+      groupId: "batch-mixed",
+      instId: "BTC-USDT-SWAP",
+      bar: "1H",
+      sessions: [
+        {
+          strategyId: 1,
+          name: "Alpha Trend",
+          strategyKind: "atomic",
+          sessionId: "s1",
+          runId: 301,
+          state: "running",
+        },
+        {
+          strategyId: 20,
+          name: "Combo One",
+          strategyKind: "combo",
+          sessionId: "s20",
+          runId: 320,
+          state: "running",
+        },
+      ],
+    });
+
+    await renderLoadedPanel({ mode: "paper" });
+    await waitFor(() => expect(useAppStore.getState().paperSelectionIds).toEqual([1]));
+
+    await selectComboTab();
+    fireEvent.click(screen.getByLabelText(/Combo One/));
+    await waitFor(() =>
+      expect(useAppStore.getState().paperSelectionIds).toEqual([1, 20]),
+    );
+
+    fireEvent.click(getButton("启动实时模拟"));
+
+    await waitFor(() => expect(api.paperBatchStart).toHaveBeenCalledTimes(1));
+    expect(api.paperBatchStart).toHaveBeenCalledWith({
+      strategyIds: [1, 20],
+      instId: "BTC-USDT-SWAP",
+      bar: "1H",
+      initialCapital: 10000,
+      priming: true,
+      source: "live",
+      speed: 16,
+      replayBars: 300,
+    });
+    expect(api.updateStrategy).not.toHaveBeenCalled();
+    expect(useAppStore.getState().paperSessionsByStrategyId[20].strategyKind).toBe("combo");
+  });
+
+  it("selects only the current paper tab when using select all", async () => {
+    await renderLoadedPanel({ mode: "paper", paperSelectionIds: [] });
+    fireEvent.click(getButton("全选当前页"));
+    expect(useAppStore.getState().paperSelectionIds).toEqual([1, 2]);
+
+    await selectComboTab();
+    fireEvent.click(getButton("全选当前页"));
+    expect(useAppStore.getState().paperSelectionIds).toEqual([1, 2, 20]);
+  });
+
+  it("keeps paper selection empty after clearing all selections", async () => {
+    await renderLoadedPanel({ mode: "paper" });
+    await waitFor(() => expect(useAppStore.getState().paperSelectionIds).toEqual([1]));
+
+    fireEvent.click(getButton("清空全部"));
+    await settleEffects();
+
+    expect(useAppStore.getState().paperSelectionIds).toEqual([]);
+    expect(screen.getByText("请选择至少一个策略")).toBeTruthy();
+
+    fireEvent.click(getButton("启动实时模拟"));
+    expect(api.paperStart).not.toHaveBeenCalled();
+    expect(api.paperBatchStart).not.toHaveBeenCalled();
+  });
+
+  it("drops stale paper selection ids without reselecting the active strategy", async () => {
+    await renderLoadedPanel({ mode: "paper", paperSelectionIds: [999] });
+
+    await waitFor(() => expect(useAppStore.getState().paperSelectionIds).toEqual([]));
+    expect(screen.getByText("请选择至少一个策略")).toBeTruthy();
+
+    fireEvent.click(getButton("启动实时模拟"));
+    expect(api.paperStart).not.toHaveBeenCalled();
+    expect(api.paperBatchStart).not.toHaveBeenCalled();
+  });
+
   it("shows an empty combo state without stale detail or results", async () => {
     mockApi(STRATEGIES.filter((strategy) => strategy.kind !== "combo"));
     await renderLoadedPanel();
