@@ -160,6 +160,54 @@ function Stop-RunningDistProcesses([string]$UnpackedDir, [bool]$StopProcesses) {
     Fail "旧 win-unpacked 进程未能退出：`n    $remainingSummary`n请手动关闭后重试。" 6
 }
 
+function Test-ElectronBuilderEbusyExeLockOutput([string]$Output) {
+    if (-not $Output) { return $false }
+
+    $comparison = [System.StringComparison]::OrdinalIgnoreCase
+    return (
+        $Output.IndexOf('EBUSY', $comparison) -ge 0 -and
+        $Output.IndexOf('win-unpacked', $comparison) -ge 0 -and
+        $Output.IndexOf('Aragon Trading.exe', $comparison) -ge 0
+    )
+}
+
+function Invoke-ElectronBuilderWithEbusyRetry([string[]]$BuilderArgs, [string]$UnpackedDir, [bool]$StopProcesses) {
+    $maxAttempts = 3
+
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $lines = New-Object 'System.Collections.Generic.List[string]'
+        & npx.cmd --no-install electron-builder @BuilderArgs 2>&1 |
+            ForEach-Object {
+                $line = if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { [string]$_ }
+                [void]$lines.Add($line)
+                Write-Host $line
+            }
+        $exitCode = $LASTEXITCODE
+
+        if ($exitCode -eq 0) {
+            $global:LASTEXITCODE = 0
+            return
+        }
+
+        $output = [string]::Join("`n", [string[]]$lines.ToArray())
+        if (-not (Test-ElectronBuilderEbusyExeLockOutput $output)) {
+            $global:LASTEXITCODE = $exitCode
+            return
+        }
+
+        if ($attempt -ge $maxAttempts) {
+            Write-Host '[pack.ps1] electron-builder 多次遇到 Aragon Trading.exe EBUSY，停止重试。' -ForegroundColor Yellow
+            $global:LASTEXITCODE = $exitCode
+            return
+        }
+
+        $nextAttempt = $attempt + 1
+        Write-Host "    electron-builder 遇到 Aragon Trading.exe EBUSY；释放旧进程并短暂等待后重试 ($nextAttempt/$maxAttempts)..." -ForegroundColor Yellow
+        Stop-RunningDistProcesses $UnpackedDir $StopProcesses
+        Start-Sleep -Seconds 2
+    }
+}
+
 Write-Host '────────────────────────────────────────────' -ForegroundColor DarkGray
 Write-Host ' Aragon Trading 桌面端打包  (desktop/pack.ps1)' -ForegroundColor Green
 Write-Host "  Target = $Target   Repo = $RepoRoot" -ForegroundColor DarkGray
@@ -252,7 +300,14 @@ try {
         Write-Host '    复用本地 electron 二进制（--config.electronDist），跳过下载。' -ForegroundColor DarkGray
     }
     $stepTitle = if ($Target -eq 'smoke') { '6) 打包免安装目录 (electron-builder --dir)' } else { '6) 打包安装包 (electron-builder)' }
-    Invoke-Native $stepTitle { npx --no-install electron-builder @builderArgs }
+    $unpackedDir = Join-Path $DesktopDir 'dist/win-unpacked'
+    Stop-RunningDistProcesses $unpackedDir (-not $NoStopRunningDist)
+    Invoke-Native $stepTitle {
+        Invoke-ElectronBuilderWithEbusyRetry `
+            -BuilderArgs $builderArgs `
+            -UnpackedDir $unpackedDir `
+            -StopProcesses (-not $NoStopRunningDist)
+    }
 
     # --- 7) release-check：构建后立刻端到端验收 ---
     if ($Target -eq 'release-check') {
