@@ -81,10 +81,27 @@ export default function StrategyPanel() {
   const [stopError, setStopError] = useState<string | null>(null);
   // 组合回测结果（年化 / 轮动时间线 / 分体制贡献）：选中组合回测后接入绩效页签；原子回测回填 null。
   const [comboResult, setComboResult] = useState<ComboPreviewResult["combo"] | null>(null);
-  const lastAutoKey = useRef("");
   const reconciledRef = useRef(false);
 
-  const { data: strategies, isLoading } = useQuery({
+  const clearBacktestResult = useCallback(() => {
+    setRunId(null);
+    setMetrics(undefined);
+    setCoverage(undefined);
+    setComboResult(null);
+    setWalkForwardResult(null);
+    setChartView("live-follow");
+  }, [setRunId, setWalkForwardResult, setChartView]);
+
+  const selectStrategyPassively = useCallback(
+    (id: number | null) => {
+      const changed = id !== strategyId;
+      setStrategyId(id);
+      if (mode === "backtest" && changed) clearBacktestResult();
+    },
+    [mode, strategyId, setStrategyId, clearBacktestResult],
+  );
+
+  const { data: strategies, isLoading, isFetching: strategiesFetching } = useQuery({
     queryKey: ["strategies"],
     queryFn: api.strategies,
   });
@@ -109,8 +126,8 @@ export default function StrategyPanel() {
     const atoms = strategies.filter((s) => s.kind !== "combo");
     const list = mode === "backtest" ? [...atoms, ...strategies.filter(isUserCombo)] : atoms;
     const exists = strategyId !== null && list.some((s) => s.id === strategyId);
-    if (!exists) setStrategyId(list[0]?.id ?? null);
-  }, [strategies, mode, strategyId, setStrategyId]);
+    if (!exists && !strategiesFetching) selectStrategyPassively(list[0]?.id ?? null);
+  }, [strategies, mode, strategyId, strategiesFetching, selectStrategyPassively]);
 
   useEffect(() => {
     if (mode !== "paper" || !strategyId || paperSelectionIds.length > 0) return;
@@ -202,15 +219,12 @@ export default function StrategyPanel() {
   });
 
   useEffect(() => {
-    // 普通回测随参自动跑；高级回测计算较重，仅手动触发（effectiveKind==="simple" 守卫）。
-    // 用 effectiveKind 而非 backtestKind：全局处于高级回测、但选中的是组合时仍走普通回测自动刷新。
-    if (mode !== "backtest" || effectiveKind !== "simple" || !strategyId || !strategies) return;
-    const key = `${strategyId}|${instId}|${bar}|${backtestStartTs}|${backtestEndTs}`;
-    if (lastAutoKey.current === key) return;
-    lastAutoKey.current = key;
-    backtest.mutate({ id: strategyId });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [strategyId, instId, bar, mode, effectiveKind, strategies, backtestStartTs, backtestEndTs]);
+    if (mode !== "backtest" || runId !== null) return;
+    setMetrics(undefined);
+    setCoverage(undefined);
+    setComboResult(null);
+    setWalkForwardResult(null);
+  }, [mode, runId, setWalkForwardResult]);
 
   const { data: trades } = useQuery({
     queryKey: ["trades", runId],
@@ -280,7 +294,7 @@ export default function StrategyPanel() {
       api.createStrategy({ templateKey: selected!.templateKey, name: vars.name, params: vars.params }),
     onSuccess: (created) => {
       qc.invalidateQueries({ queryKey: ["strategies"] });
-      setStrategyId(created.id);
+      selectStrategyPassively(created.id);
     },
   });
 
@@ -291,7 +305,7 @@ export default function StrategyPanel() {
       strategyId,
       comboEditingId,
       setComboEditingId,
-      setStrategyId,
+      setStrategyId: selectStrategyPassively,
     });
 
   const isSessionLimitError =
@@ -391,7 +405,7 @@ export default function StrategyPanel() {
               strategies={listStrategies}
               activeId={strategyId}
               returnsById={returnsById}
-              onSelect={(id) => setStrategyId(id)}
+              onSelect={selectStrategyPassively}
               multiSelectIds={mode === "paper" ? paperSelectionIds : undefined}
               multiSelectDisabledIds={mode === "paper" ? disabledIds : undefined}
               onToggleMultiSelect={mode === "paper" ? togglePaperSelectionId : undefined}
