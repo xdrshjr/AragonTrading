@@ -2,6 +2,7 @@
 
 import type { Trade } from "@/lib/types";
 import { fmtPrice, fmtQty, fmtTime, signed } from "@/lib/format";
+import { formatMaxHoldBars, formatRiskValue, riskColumnLabel } from "@/lib/riskDisplay";
 import { Badge } from "@/components/ui";
 
 const SIDE_LABEL: Record<Trade["side"], string> = { long: "开多", short: "开空", close: "平仓" };
@@ -11,30 +12,8 @@ const SIDE_TONE: Record<Trade["side"], "long" | "short" | "neutral"> = {
   close: "neutral",
 };
 
-function formatRiskPct(value: number | null | undefined): string | null {
-  if (value === null || value === undefined || !Number.isFinite(value)) {
-    return null;
-  }
-  return `${(value * 100).toFixed(2)}%`;
-}
-
-function formatRiskLevel(
-  pct: number | null | undefined,
-  price: number | null | undefined,
-): string {
-  const pctText = formatRiskPct(pct);
-  const hasPrice = price !== null && price !== undefined && Number.isFinite(price);
-  if (pctText && hasPrice) return `${pctText} @ ${fmtPrice(price)}`;
-  if (hasPrice) return fmtPrice(price);
-  if (pctText) return pctText;
-  return "-";
-}
-
 function riskTitle(trade: Trade): string {
-  if (trade.maxHoldBars === null || trade.maxHoldBars === undefined) {
-    return "";
-  }
-  return `Hold ${trade.maxHoldBars} bars`;
+  return formatMaxHoldBars(trade.maxHoldBars) ?? "";
 }
 
 export default function TradesTable({ trades, loading }: { trades?: Trade[]; loading?: boolean }) {
@@ -61,8 +40,12 @@ export default function TradesTable({ trades, loading }: { trades?: Trade[]; loa
             <th className="py-1.5 pr-2 text-right font-medium">价格</th>
             <th className="py-1.5 pr-2 text-right font-medium">数量</th>
             <th className="py-1.5 pr-2 text-right font-medium">盈亏</th>
-            <th className="py-1.5 pr-2 text-right font-medium">SL</th>
-            <th className="py-1.5 text-right font-medium">TP</th>
+            <th className="py-1.5 pr-2 text-right font-medium">
+              {riskColumnLabel("stopLoss")}
+            </th>
+            <th className="py-1.5 text-right font-medium">
+              {riskColumnLabel("takeProfit")}
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -97,10 +80,10 @@ export default function TradesTable({ trades, loading }: { trades?: Trade[]; loa
                 {t.side === "close" ? signed(t.pnl) : "—"}
               </td>
               <td className="py-1.5 pr-2 text-right tabular" title={riskTitle(t)}>
-                {formatRiskLevel(t.stopLossPct, t.stopLossPrice)}
+                {formatRiskValue(t.stopLossPct, t.stopLossPrice)}
               </td>
               <td className="py-1.5 text-right tabular" title={riskTitle(t)}>
-                {formatRiskLevel(t.takeProfitPct, t.takeProfitPrice)}
+                {formatRiskValue(t.takeProfitPct, t.takeProfitPrice)}
               </td>
             </tr>
           ))}

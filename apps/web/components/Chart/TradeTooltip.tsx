@@ -1,6 +1,7 @@
 "use client";
 
 import { fmtNum, fmtPrice, fmtQty, fmtTime, signed } from "@/lib/format";
+import { formatMaxHoldBars, formatRiskLine } from "@/lib/riskDisplay";
 import { tradeToneForEvent } from "@/lib/tradeTrails";
 import type { TradeMarkerEvent } from "@/lib/types";
 
@@ -17,26 +18,6 @@ const KIND_LABEL: Record<TradeMarkerEvent["kind"], string> = {
   "orphan-close": "CLOSE",
 };
 
-function formatRiskPct(value: number | null | undefined): string | null {
-  if (value === null || value === undefined || !Number.isFinite(value)) {
-    return null;
-  }
-  return `${(value * 100).toFixed(2)}%`;
-}
-
-function formatRiskLine(
-  label: string,
-  pct: number | null | undefined,
-  price: number | null | undefined,
-): string {
-  const pctText = formatRiskPct(pct);
-  const hasPrice = price !== null && price !== undefined && Number.isFinite(price);
-  if (pctText && hasPrice) return `${label} ${pctText} @ ${fmtPrice(price)}`;
-  if (hasPrice) return `${label} ${fmtPrice(price)}`;
-  if (pctText) return `${label} ${pctText}`;
-  return `${label} -`;
-}
-
 export default function TradeTooltip({ events, x, y }: TradeTooltipProps) {
   if (events.length === 0) return null;
 
@@ -49,7 +30,7 @@ export default function TradeTooltip({ events, x, y }: TradeTooltipProps) {
       }}
     >
       <div className="mb-1.5 flex items-center justify-between">
-        <span className="font-semibold">Backtest trades</span>
+        <span className="font-semibold">回测成交</span>
         <span className="tabular text-[var(--muted)]">{fmtTime(events[0].trade.ts)}</span>
       </div>
       <div className="space-y-1.5">
@@ -64,6 +45,7 @@ export default function TradeTooltip({ events, x, y }: TradeTooltipProps) {
 function TooltipRow({ event }: { event: TradeMarkerEvent }) {
   const strategy = event.trade as typeof event.trade & { strategyName?: string; color?: string };
   const tone = tradeToneForEvent(event);
+  const maxHoldText = formatMaxHoldBars(event.trade.maxHoldBars);
   const color =
     strategy.color ??
     tone === "long"
@@ -99,14 +81,12 @@ function TooltipRow({ event }: { event: TradeMarkerEvent }) {
       </div>
       <div className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 tabular text-[var(--muted)]">
         <span>
-          {formatRiskLine("SL", event.trade.stopLossPct, event.trade.stopLossPrice)}
+          {formatRiskLine("stopLoss", event.trade.stopLossPct, event.trade.stopLossPrice)}
         </span>
         <span>
-          {formatRiskLine("TP", event.trade.takeProfitPct, event.trade.takeProfitPrice)}
+          {formatRiskLine("takeProfit", event.trade.takeProfitPct, event.trade.takeProfitPrice)}
         </span>
-        {event.trade.maxHoldBars !== null && event.trade.maxHoldBars !== undefined && (
-          <span>Hold {event.trade.maxHoldBars}</span>
-        )}
+        {maxHoldText && <span>{maxHoldText}</span>}
       </div>
     </div>
   );

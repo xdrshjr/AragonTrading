@@ -40,16 +40,17 @@ describe("TradeTooltip risk details", () => {
       />,
     );
 
-    expect(markup).toContain("SL 2.00% @ 98.00");
-    expect(markup).toContain("TP 4.00% @ 104.00");
-    expect(markup).toContain("Hold 12");
+    expect(markup).toContain("回测成交");
+    expect(markup).toContain("止损(SL) 2.00% @ 98.00");
+    expect(markup).toContain("止盈(TP) 4.00% @ 104.00");
+    expect(markup).toContain("最长持有 12 根K线");
   });
 
   it("renders without risk values when fields are absent", () => {
     const markup = renderToStaticMarkup(<TradeTooltip events={[eventWithRisk()]} x={0} y={0} />);
 
-    expect(markup).toContain("SL -");
-    expect(markup).toContain("TP -");
-    expect(markup).not.toContain("Hold");
+    expect(markup).toContain("止损(SL) -");
+    expect(markup).toContain("止盈(TP) -");
+    expect(markup).not.toContain("最长持有");
   });
 });

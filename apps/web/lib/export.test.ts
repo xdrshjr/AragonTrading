@@ -70,11 +70,11 @@ describe("tradesToCsv", () => {
     const lines = tradesToCsv(trades).split("\r\n");
 
     expect(lines[0].split(",").slice(6, 11)).toEqual([
-      "stopLossPct",
-      "stopLossPrice",
-      "takeProfitPct",
-      "takeProfitPrice",
-      "maxHoldBars",
+      "止损比例(SL%)",
+      "止损价格(SL)",
+      "止盈比例(TP%)",
+      "止盈价格(TP)",
+      "最长持有K线",
     ]);
     expect(lines).toHaveLength(3);
     expect(lines[1]).toBe(

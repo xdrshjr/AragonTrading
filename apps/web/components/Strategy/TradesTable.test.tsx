@@ -31,10 +31,11 @@ describe("TradesTable risk columns", () => {
       />,
     );
 
-    expect(markup).toContain("SL");
-    expect(markup).toContain("TP");
+    expect(markup).toContain("止损(SL)");
+    expect(markup).toContain("止盈(TP)");
     expect(markup).toContain("2.00% @ 98.00");
     expect(markup).toContain("4.00% @ 104.00");
+    expect(markup).toContain("title=\"最长持有 12 根K线\"");
   });
 
   it("renders dashes for missing risk fields", () => {
