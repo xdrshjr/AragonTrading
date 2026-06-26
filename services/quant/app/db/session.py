@@ -5,7 +5,7 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from ..config import get_settings
@@ -28,9 +28,24 @@ def _db_url() -> str:
 def get_engine():
     global _engine, _sessionmaker
     if _engine is None:
-        _engine = create_async_engine(_db_url(), echo=False, future=True)
+        _engine = create_async_engine(
+            _db_url(),
+            echo=False,
+            future=True,
+            connect_args={"timeout": 5},
+        )
+        event.listen(_engine.sync_engine, "connect", _configure_sqlite)
         _sessionmaker = async_sessionmaker(_engine, expire_on_commit=False, class_=AsyncSession)
     return _engine
+
+
+def _configure_sqlite(dbapi_connection, _connection_record) -> None:
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA busy_timeout=5000")
+        cursor.execute("PRAGMA journal_mode=WAL")
+    finally:
+        cursor.close()
 
 
 def get_sessionmaker() -> async_sessionmaker[AsyncSession]:

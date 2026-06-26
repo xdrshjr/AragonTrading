@@ -9,6 +9,7 @@ import uuid
 from dataclasses import dataclass
 
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..engine.simulator import EquityRecord, TradeRecord
@@ -245,16 +246,32 @@ async def upsert_candles(session: AsyncSession, inst_id: str, bar: str, candles:
     """把真实 K 线写入缓存（按 inst+bar+ts 去重）。"""
     if not candles:
         return
-    existing_stmt = select(CandleCache.ts).where(
-        CandleCache.inst_id == inst_id, CandleCache.bar == bar,
-        CandleCache.ts.in_([c.ts for c in candles]),
+    by_ts = {c.ts: c for c in candles}
+    values = [
+        {
+            "inst_id": inst_id,
+            "bar": bar,
+            "ts": c.ts,
+            "o": c.o,
+            "h": c.h,
+            "l": c.l,
+            "c": c.c,
+            "vol": c.vol,
+        }
+        for c in by_ts.values()
+    ]
+    stmt = sqlite_insert(CandleCache).values(values)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["inst_id", "bar", "ts"],
+        set_={
+            "o": stmt.excluded.o,
+            "h": stmt.excluded.h,
+            "l": stmt.excluded.l,
+            "c": stmt.excluded.c,
+            "vol": stmt.excluded.vol,
+        },
     )
-    existing = {row[0] for row in (await session.execute(existing_stmt)).all()}
-    for c in candles:
-        if c.ts in existing:
-            continue
-        session.add(CandleCache(inst_id=inst_id, bar=bar, ts=c.ts,
-                                o=c.o, h=c.h, l=c.l, c=c.c, vol=c.vol))
+    await session.execute(stmt)
     await session.commit()
 
 

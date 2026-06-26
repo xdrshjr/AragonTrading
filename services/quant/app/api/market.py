@@ -5,7 +5,10 @@
 """
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
@@ -14,9 +17,14 @@ from ..db.session import get_session
 from ..okx.rest_client import OKXError, get_rest_client
 
 router = APIRouter(tags=["market"])
+logger = logging.getLogger(__name__)
 
 # 仅 OKX 公共行情支持的可枚举标的类型；非法值在边界处一次性拒绝（C1 显式错误）。
 _ALLOWED_INST_TYPES = {"SPOT", "SWAP", "FUTURES"}
+
+
+def _is_sqlite_locked(exc: OperationalError) -> bool:
+    return "database is locked" in str(exc).lower()
 
 
 @router.get("/health")
@@ -77,9 +85,6 @@ async def get_candles(
     rest = get_rest_client()
     try:
         candles = await rest.get_candles(instId, bar, limit, before=before, after=after)
-        await repo.upsert_candles(session, instId, bar, candles)
-        response.headers["X-Aragon-Data-Source"] = "live"
-        return [{"ts": c.ts, "o": c.o, "h": c.h, "l": c.l, "c": c.c, "vol": c.vol} for c in candles]
     except OKXError:
         settings = get_settings()
         if settings.allow_cached_fallback:
@@ -90,3 +95,35 @@ async def get_candles(
                 response.headers["X-Aragon-Stale"] = "1"
                 return cached
         raise  # 由 main 的异常处理器转为 5xx 显式错误态
+
+    try:
+        await repo.upsert_candles(session, instId, bar, candles)
+    except IntegrityError:
+        await session.rollback()
+        logger.warning(
+            "Candle cache write skipped after integrity conflict: instId=%s bar=%s "
+            "limit=%s before=%s after=%s",
+            instId,
+            bar,
+            limit,
+            before,
+            after,
+            exc_info=True,
+        )
+    except OperationalError as exc:
+        if not _is_sqlite_locked(exc):
+            raise
+        await session.rollback()
+        logger.warning(
+            "Candle cache write skipped after SQLite lock: instId=%s bar=%s "
+            "limit=%s before=%s after=%s",
+            instId,
+            bar,
+            limit,
+            before,
+            after,
+            exc_info=True,
+        )
+
+    response.headers["X-Aragon-Data-Source"] = "live"
+    return [{"ts": c.ts, "o": c.o, "h": c.h, "l": c.l, "c": c.c, "vol": c.vol} for c in candles]

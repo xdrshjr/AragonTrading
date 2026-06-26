@@ -12,8 +12,11 @@
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 from app.okx.rest_client import OKXError
 from app.okx.types import Candle, Instrument
@@ -74,6 +77,51 @@ async def test_candles_live_header(monkeypatch):
             assert r.headers.get("X-Aragon-Data-Source") == "live"
             assert "X-Aragon-Stale" not in r.headers
             assert len(r.json()) > 0
+    finally:
+        await dispose_engine()
+
+
+async def test_concurrent_candles_live_requests_do_not_500(monkeypatch):
+    """Concurrent live candle requests return live data and deduplicate cache rows."""
+    from app.db.models import CandleCache
+    from app.db.session import dispose_engine, get_sessionmaker, init_db
+
+    class _ConcurrentRest(_FlakyRest):
+        async def get_candles(self, inst_id, bar, limit=300, before=None, after=None):
+            await asyncio.sleep(0.05)
+            rows = make_synthetic_candles(min(limit, 300), start_ts=1_710_000_000, step=60)
+            return [
+                Candle(ts=r["ts"], o=r["o"], h=r["h"], l=r["l"], c=r["c"], vol=r["vol"])
+                for r in rows
+            ]
+
+    fake = _ConcurrentRest()
+    monkeypatch.setattr("app.api.market.get_rest_client", lambda: fake)
+    await init_db()
+    transport = ASGITransport(app=_load_app(), raise_app_exceptions=False)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            responses = await asyncio.gather(*[
+                client.get(
+                    "/api/candles",
+                    params={"instId": "BTC-USDT-RACE", "bar": "1m", "limit": 20},
+                )
+                for _ in range(20)
+            ])
+
+        assert [r.status_code for r in responses] == [200] * 20
+        assert {r.headers.get("X-Aragon-Data-Source") for r in responses} == {"live"}
+
+        sm = get_sessionmaker()
+        async with sm() as session:
+            stmt = (
+                select(CandleCache)
+                .where(CandleCache.inst_id == "BTC-USDT-RACE", CandleCache.bar == "1m")
+                .order_by(CandleCache.ts.asc())
+            )
+            rows = list((await session.execute(stmt)).scalars().all())
+        assert len(rows) == 20
+        assert len({row.ts for row in rows}) == 20
     finally:
         await dispose_engine()
 
