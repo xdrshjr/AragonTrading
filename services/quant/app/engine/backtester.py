@@ -90,6 +90,7 @@ def run_backtest(
         df = strategy.attach_timeframes(df, bar, frames)
     risk = strategy.risk_params()
     broker = SimBroker(initial_capital, taker_fee_bps, slippage_bps, leverage)
+    broker.set_risk(risk)
     warmup = max(strategy.warmup(), 1)
     ctx = None
 

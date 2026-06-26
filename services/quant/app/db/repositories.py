@@ -147,6 +147,9 @@ async def persist_backtest_result(session: AsyncSession, run: StrategyRun, *,
         session.add(Trade(
             run_id=run.id, ts=t.ts, side=t.side, price=t.price, qty=t.qty, fee=t.fee,
             pnl=t.pnl, position_after=t.position_after, reason=t.reason,
+            stop_loss_pct=t.stop_loss_pct, take_profit_pct=t.take_profit_pct,
+            max_hold_bars=t.max_hold_bars, stop_loss_price=t.stop_loss_price,
+            take_profit_price=t.take_profit_price,
         ))
     for e in equity:
         session.add(EquityPoint(run_id=run.id, ts=e.ts, equity=e.equity, drawdown=e.drawdown))
@@ -223,7 +226,10 @@ async def list_equity(session: AsyncSession, run_id: int) -> list[EquityPoint]:
 
 async def append_trade(session: AsyncSession, run_id: int, t: TradeRecord) -> None:
     session.add(Trade(run_id=run_id, ts=t.ts, side=t.side, price=t.price, qty=t.qty,
-                      fee=t.fee, pnl=t.pnl, position_after=t.position_after, reason=t.reason))
+                      fee=t.fee, pnl=t.pnl, position_after=t.position_after, reason=t.reason,
+                      stop_loss_pct=t.stop_loss_pct, take_profit_pct=t.take_profit_pct,
+                      max_hold_bars=t.max_hold_bars, stop_loss_price=t.stop_loss_price,
+                      take_profit_price=t.take_profit_price))
     await session.commit()
 
 

@@ -12,11 +12,14 @@ from app.engine.backtester import run_backtest
 from app.engine.combo import (
     ComboMember,
     ComboPolicy,
+    ComboSegment,
     _annualized_return,
+    _combo_trades,
     _warmup_floor,
     run_combo_backtest,
 )
 from app.strategies.base import get_strategy_class
+from app.engine.simulator import TradeRecord
 from tests.conftest import make_synthetic_candles
 
 _COSTS = dict(initial_capital=10_000.0, taker_fee_bps=5.0, slippage_bps=2.0, leverage=1.0)
@@ -122,6 +125,42 @@ def test_combo_metrics_and_equity_shape():
     ranges = [(s.start_ts, s.end_ts) for s in result.segments]
     for trade in result.trades:
         assert any(lo <= trade.ts <= hi for lo, hi in ranges)
+
+
+def test_combo_trades_preserve_member_risk_snapshots():
+    trade = TradeRecord(
+        ts=100,
+        side="long",
+        price=100.0,
+        qty=1.0,
+        fee=0.0,
+        pnl=0.0,
+        position_after=1.0,
+        reason="entry",
+        stop_loss_pct=0.02,
+        take_profit_pct=0.04,
+        max_hold_bars=12,
+        stop_loss_price=98.0,
+        take_profit_price=104.0,
+    )
+    segment = ComboSegment(
+        start_ts=0,
+        end_ts=200,
+        member_key="member-a",
+        member_name="Member A",
+        regime="range",
+        bars=10,
+        contribution=0.0,
+    )
+
+    [copied] = _combo_trades({"member-a": [trade]}, [segment])
+
+    assert copied.reason == "member-a:entry"
+    assert copied.stop_loss_pct == 0.02
+    assert copied.take_profit_pct == 0.04
+    assert copied.max_hold_bars == 12
+    assert copied.stop_loss_price == 98.0
+    assert copied.take_profit_price == 104.0
 
 
 def test_combo_annualized_return_guards():

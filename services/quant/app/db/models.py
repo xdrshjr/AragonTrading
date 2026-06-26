@@ -76,6 +76,11 @@ class Trade(Base):
     pnl: Mapped[float] = mapped_column(Float, default=0.0)   # 平仓净实现盈亏，开仓为 0
     position_after: Mapped[float] = mapped_column(Float, default=0.0)
     reason: Mapped[str] = mapped_column(String(64), default="")
+    stop_loss_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_hold_bars: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stop_loss_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     run: Mapped["StrategyRun"] = relationship(back_populates="trades")
 

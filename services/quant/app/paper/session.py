@@ -313,6 +313,7 @@ class PaperSession:
         risk = self.strategy.risk_params()
 
         # SimBroker 四阶段
+        self.broker.set_risk(risk)
         self.broker.fill_pending(open_price=float(r["o"]), ts=int(r["ts"]), bar_index=i)
         self.broker.apply_risk(i, r, risk)
         self.broker.mark(ts=int(r["ts"]), close=float(r["c"]))
@@ -450,4 +451,7 @@ def equity_out_record(e) -> dict:
 def _trade_record_out(t, seeded: bool = False) -> dict:
     return {"ts": t.ts, "side": t.side, "price": t.price, "qty": t.qty, "fee": t.fee,
             "pnl": t.pnl, "positionAfter": t.position_after, "reason": t.reason,
+            "stopLossPct": t.stop_loss_pct, "takeProfitPct": t.take_profit_pct,
+            "maxHoldBars": t.max_hold_bars, "stopLossPrice": t.stop_loss_price,
+            "takeProfitPrice": t.take_profit_price,
             "seeded": seeded}

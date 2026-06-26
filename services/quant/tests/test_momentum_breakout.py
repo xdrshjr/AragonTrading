@@ -74,6 +74,7 @@ def _run_paper_per_bar(candles: list[dict]) -> list:
     n = len(df0)
     risk = strat.risk_params()
     broker = SimBroker(INIT_CAP, FEE_BPS, SLIP_BPS, 1.0)
+    broker.set_risk(risk)
     warmup = max(strat.warmup(), 1)
     for i in range(n):
         df = strat.prepare(df0.copy(), BAR)        # ← 逐根 prepare（paper/live 真实行为）

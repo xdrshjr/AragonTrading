@@ -57,7 +57,7 @@ async def test_full_api_flow(patch_okx):
             builtins = [s for s in strategies if s["builtin"]]
             assert len(builtins) >= 5
             assert all("paramsSchema" in s and s["paramsSchema"] for s in builtins)
-            sid = builtins[0]["id"]
+            sid = next(s["id"] for s in builtins if s["templateKey"] == "ema_cross_scalper")
 
             # 触发回测
             r = await client.post(f"/api/strategies/{sid}/backtest",
@@ -74,6 +74,17 @@ async def test_full_api_flow(patch_okx):
             assert r.status_code == 200 and len(r.json()) > 0
             r = await client.get(f"/api/runs/{run_id}/trades")
             assert r.status_code == 200
+            trades = r.json()
+            risk_keys = {
+                "stopLossPct",
+                "takeProfitPct",
+                "maxHoldBars",
+                "stopLossPrice",
+                "takeProfitPrice",
+            }
+            assert trades and risk_keys <= set(trades[0].keys())
+            assert any(t["stopLossPct"] is not None and t["stopLossPrice"] is not None
+                       for t in trades)
 
             # 内置不可删 -> 409
             r = await client.delete(f"/api/strategies/{sid}")
@@ -88,6 +99,51 @@ async def test_full_api_flow(patch_okx):
             assert r.status_code == 204
     finally:
         await dispose_engine()
+
+
+async def test_init_db_upgrades_existing_trade_table_with_risk_columns(monkeypatch, tmp_path):
+    from sqlalchemy import text
+
+    from app.config import get_settings
+    from app.db.session import dispose_engine, get_engine, init_db
+
+    await dispose_engine()
+    get_settings.cache_clear()
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "old.db"))
+
+    engine = get_engine()
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "CREATE TABLE trades ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "run_id INTEGER, "
+            "ts INTEGER, "
+            "side VARCHAR(8), "
+            "price FLOAT, "
+            "qty FLOAT, "
+            "fee FLOAT, "
+            "pnl FLOAT DEFAULT 0.0, "
+            "position_after FLOAT DEFAULT 0.0, "
+            "reason VARCHAR(64) DEFAULT ''"
+            ")"
+        ))
+
+    try:
+        await init_db()
+        async with engine.begin() as conn:
+            rows = (await conn.execute(text("PRAGMA table_info(trades)"))).all()
+        columns = {row[1] for row in rows}
+
+        assert {
+            "stop_loss_pct",
+            "take_profit_pct",
+            "max_hold_bars",
+            "stop_loss_price",
+            "take_profit_price",
+        } <= columns
+    finally:
+        await dispose_engine()
+        get_settings.cache_clear()
 
 
 async def test_backtest_uses_requested_time_range(patch_okx):

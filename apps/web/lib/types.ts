@@ -200,6 +200,11 @@ export interface Trade {
   qty: number;
   fee: number;
   pnl: number;
+  stopLossPct?: number | null;
+  takeProfitPct?: number | null;
+  maxHoldBars?: number | null;
+  stopLossPrice?: number | null;
+  takeProfitPrice?: number | null;
   positionAfter: number;
   reason: string;
   seeded?: boolean;

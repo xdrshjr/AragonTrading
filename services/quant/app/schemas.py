@@ -193,7 +193,9 @@ def trade_out(t: Trade) -> dict:
     return {
         "id": t.id, "runId": t.run_id, "ts": t.ts, "side": t.side, "price": t.price,
         "qty": t.qty, "fee": t.fee, "pnl": t.pnl, "positionAfter": t.position_after,
-        "reason": t.reason,
+        "reason": t.reason, "stopLossPct": t.stop_loss_pct,
+        "takeProfitPct": t.take_profit_pct, "maxHoldBars": t.max_hold_bars,
+        "stopLossPrice": t.stop_loss_price, "takeProfitPrice": t.take_profit_price,
     }
 
 

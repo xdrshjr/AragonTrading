@@ -33,6 +33,11 @@ export function tradesToCsv(trades: Trade[]): string {
     { key: "qty", label: "数量" },
     { key: "fee", label: "手续费" },
     { key: "pnl", label: "盈亏" },
+    { key: "stopLossPct", label: "stopLossPct" },
+    { key: "stopLossPrice", label: "stopLossPrice" },
+    { key: "takeProfitPct", label: "takeProfitPct" },
+    { key: "takeProfitPrice", label: "takeProfitPrice" },
+    { key: "maxHoldBars", label: "maxHoldBars" },
     { key: "positionAfter", label: "持仓后" },
     { key: "reason", label: "原因" },
   ];
@@ -43,6 +48,11 @@ export function tradesToCsv(trades: Trade[]): string {
     qty: t.qty,
     fee: t.fee,
     pnl: t.pnl,
+    stopLossPct: t.stopLossPct,
+    stopLossPrice: t.stopLossPrice,
+    takeProfitPct: t.takeProfitPct,
+    takeProfitPrice: t.takeProfitPrice,
+    maxHoldBars: t.maxHoldBars,
     positionAfter: t.positionAfter,
     reason: t.reason,
   }));

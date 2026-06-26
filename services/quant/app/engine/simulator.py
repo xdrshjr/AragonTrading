@@ -8,7 +8,8 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import math
+from dataclasses import dataclass
 from typing import Literal
 
 
@@ -31,6 +32,11 @@ class TradeRecord:
     pnl: float         # 平仓净实现盈亏（开仓为 0）
     position_after: float
     reason: str
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
+    max_hold_bars: int | None = None
+    stop_loss_price: float | None = None
+    take_profit_price: float | None = None
 
 
 @dataclass
@@ -47,6 +53,11 @@ class _Position:
     entry_price: float = 0.0
     entry_bar: int = -1
     entry_fee: float = 0.0
+    stop_loss_pct: float | None = None
+    take_profit_pct: float | None = None
+    max_hold_bars: int | None = None
+    stop_loss_price: float | None = None
+    take_profit_price: float | None = None
 
 
 @dataclass
@@ -65,6 +76,22 @@ class _Order:
     side: Literal["long", "short"] | None = None
     strength: float = 1.0
     reason: str = ""
+
+
+def _positive_float(value) -> float | None:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    return n if math.isfinite(n) and n > 0 else None
+
+
+def _positive_int(value) -> int | None:
+    try:
+        n = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return n if n > 0 else None
 
 
 class SimBroker:
@@ -91,6 +118,15 @@ class SimBroker:
         self.equity_points: list[EquityRecord] = []
         self._pending: list[_Order] = []
         self._cur_bar = -1
+        self._risk = RiskParams()
+
+    def set_risk(self, risk: RiskParams) -> None:
+        """保存下一次开仓要使用的标准化风控快照。"""
+        self._risk = RiskParams(
+            stop_loss_pct=_positive_float(risk.stop_loss_pct),
+            take_profit_pct=_positive_float(risk.take_profit_pct),
+            max_hold_bars=_positive_int(risk.max_hold_bars),
+        )
 
     # ---- 对外只读上下文 ----
     def context(self) -> BrokerContext:
@@ -130,17 +166,17 @@ class SimBroker:
             elif od.action == "open" and self.pos.side == "flat":
                 self._open(od.side, od.strength, open_price, ts, bar_index, od.reason or "signal_open")
 
-    def apply_risk(self, bar_index: int, row, risk: RiskParams) -> None:
+    def apply_risk(self, bar_index: int, row, _risk: RiskParams) -> None:
         """阶段 2：本根内风控（止损/止盈触发价强平；max_hold 到期排队次根平）。"""
         self._cur_bar = bar_index
         if self.pos.side == "flat":
             return
         high, low, ts = float(row["h"]), float(row["l"]), int(row["ts"])
-        entry = self.pos.entry_price
+        stop_p = self.pos.stop_loss_price
+        tp_p = self.pos.take_profit_price
+        hold_bars = self.pos.max_hold_bars
 
         if self.pos.side == "long":
-            stop_p = entry * (1 - risk.stop_loss_pct) if risk.stop_loss_pct else None
-            tp_p = entry * (1 + risk.take_profit_pct) if risk.take_profit_pct else None
             if stop_p is not None and low <= stop_p:               # 止损优先（保守）
                 self._close_at(stop_p, ts, "stop_loss")
                 return
@@ -148,8 +184,6 @@ class SimBroker:
                 self._close_at(tp_p, ts, "take_profit")
                 return
         else:  # short
-            stop_p = entry * (1 + risk.stop_loss_pct) if risk.stop_loss_pct else None
-            tp_p = entry * (1 - risk.take_profit_pct) if risk.take_profit_pct else None
             if stop_p is not None and high >= stop_p:
                 self._close_at(stop_p, ts, "stop_loss")
                 return
@@ -158,7 +192,7 @@ class SimBroker:
                 return
 
         # max_hold：到期排队次根开盘平
-        if risk.max_hold_bars and (bar_index - self.pos.entry_bar) >= risk.max_hold_bars:
+        if hold_bars and (bar_index - self.pos.entry_bar) >= hold_bars:
             if not any(o.action == "close" for o in self._pending):
                 self._pending.append(_Order(action="close", reason="max_hold"))
 
@@ -221,11 +255,34 @@ class SimBroker:
         fee = qty * fill * self.fee_rate
         self.cash -= fee
         self.fees_paid += fee
-        self.pos = _Position(side=side, qty=qty, entry_price=fill, entry_bar=bar_index, entry_fee=fee)
+        risk = self._open_risk_snapshot(side, fill)
+        self.pos = _Position(side=side, qty=qty, entry_price=fill, entry_bar=bar_index,
+                             entry_fee=fee, **risk)
         self.trades.append(TradeRecord(
             ts=ts, side=side, price=fill, qty=qty, fee=fee, pnl=0.0,
-            position_after=(qty if side == "long" else -qty), reason=reason,
+            position_after=(qty if side == "long" else -qty), reason=reason, **risk,
         ))
+
+    def _open_risk_snapshot(self, side: str, entry_price: float) -> dict:
+        stop_loss_price = None
+        take_profit_price = None
+        if self._risk.stop_loss_pct is not None:
+            if side == "long":
+                stop_loss_price = entry_price * (1 - self._risk.stop_loss_pct)
+            else:
+                stop_loss_price = entry_price * (1 + self._risk.stop_loss_pct)
+        if self._risk.take_profit_pct is not None:
+            if side == "long":
+                take_profit_price = entry_price * (1 + self._risk.take_profit_pct)
+            else:
+                take_profit_price = entry_price * (1 - self._risk.take_profit_pct)
+        return {
+            "stop_loss_pct": self._risk.stop_loss_pct,
+            "take_profit_pct": self._risk.take_profit_pct,
+            "max_hold_bars": self._risk.max_hold_bars,
+            "stop_loss_price": stop_loss_price,
+            "take_profit_price": take_profit_price,
+        }
 
     def _close_at(self, ref_price, ts, reason) -> None:
         if self.pos.side == "flat":
@@ -242,5 +299,10 @@ class SimBroker:
         self.trades.append(TradeRecord(
             ts=ts, side="close", price=fill, qty=qty, fee=exit_fee, pnl=net_pnl,
             position_after=0.0, reason=reason,
+            stop_loss_pct=self.pos.stop_loss_pct,
+            take_profit_pct=self.pos.take_profit_pct,
+            max_hold_bars=self.pos.max_hold_bars,
+            stop_loss_price=self.pos.stop_loss_price,
+            take_profit_price=self.pos.take_profit_price,
         ))
         self.pos = _Position()

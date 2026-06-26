@@ -11,6 +11,32 @@ const SIDE_TONE: Record<Trade["side"], "long" | "short" | "neutral"> = {
   close: "neutral",
 };
 
+function formatRiskPct(value: number | null | undefined): string | null {
+  if (value === null || value === undefined || !Number.isFinite(value)) {
+    return null;
+  }
+  return `${(value * 100).toFixed(2)}%`;
+}
+
+function formatRiskLevel(
+  pct: number | null | undefined,
+  price: number | null | undefined,
+): string {
+  const pctText = formatRiskPct(pct);
+  const hasPrice = price !== null && price !== undefined && Number.isFinite(price);
+  if (pctText && hasPrice) return `${pctText} @ ${fmtPrice(price)}`;
+  if (hasPrice) return fmtPrice(price);
+  if (pctText) return pctText;
+  return "-";
+}
+
+function riskTitle(trade: Trade): string {
+  if (trade.maxHoldBars === null || trade.maxHoldBars === undefined) {
+    return "";
+  }
+  return `Hold ${trade.maxHoldBars} bars`;
+}
+
 export default function TradesTable({ trades, loading }: { trades?: Trade[]; loading?: boolean }) {
   if (loading) {
     return <div className="py-8 text-center text-xs text-[var(--muted)]">加载成交明细…</div>;
@@ -34,7 +60,9 @@ export default function TradesTable({ trades, loading }: { trades?: Trade[]; loa
             <th className="py-1.5 pr-2 font-medium">方向</th>
             <th className="py-1.5 pr-2 text-right font-medium">价格</th>
             <th className="py-1.5 pr-2 text-right font-medium">数量</th>
-            <th className="py-1.5 text-right font-medium">盈亏</th>
+            <th className="py-1.5 pr-2 text-right font-medium">盈亏</th>
+            <th className="py-1.5 pr-2 text-right font-medium">SL</th>
+            <th className="py-1.5 text-right font-medium">TP</th>
           </tr>
         </thead>
         <tbody>
@@ -63,10 +91,16 @@ export default function TradesTable({ trades, loading }: { trades?: Trade[]; loa
               <td className="py-1.5 pr-2 text-right tabular">{fmtPrice(t.price)}</td>
               <td className="py-1.5 pr-2 text-right tabular">{fmtQty(t.qty)}</td>
               <td
-                className="py-1.5 text-right tabular font-medium"
+                className="py-1.5 pr-2 text-right tabular font-medium"
                 style={{ color: t.pnl > 0 ? "var(--long)" : t.pnl < 0 ? "var(--short)" : "var(--muted)" }}
               >
                 {t.side === "close" ? signed(t.pnl) : "—"}
+              </td>
+              <td className="py-1.5 pr-2 text-right tabular" title={riskTitle(t)}>
+                {formatRiskLevel(t.stopLossPct, t.stopLossPrice)}
+              </td>
+              <td className="py-1.5 text-right tabular" title={riskTitle(t)}>
+                {formatRiskLevel(t.takeProfitPct, t.takeProfitPrice)}
               </td>
             </tr>
           ))}

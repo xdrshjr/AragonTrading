@@ -5,7 +5,7 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from sqlalchemy import event, select
+from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from ..config import get_settings
@@ -67,8 +67,26 @@ async def init_db() -> None:
     engine = get_engine()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await _ensure_trade_risk_columns(conn)
     await _seed_builtin_strategies()
     await _seed_agent_providers()
+
+
+async def _ensure_trade_risk_columns(conn) -> None:
+    rows = (await conn.execute(text("PRAGMA table_info(trades)"))).all()
+    columns = {row[1] for row in rows}
+    risk_columns = {
+        "stop_loss_pct": "FLOAT",
+        "take_profit_pct": "FLOAT",
+        "max_hold_bars": "INTEGER",
+        "stop_loss_price": "FLOAT",
+        "take_profit_price": "FLOAT",
+    }
+    for name, sql_type in risk_columns.items():
+        if name not in columns:
+            await conn.execute(
+                text(f"ALTER TABLE trades ADD COLUMN {name} {sql_type}")
+            )
 
 
 async def _seed_builtin_strategies() -> None:
