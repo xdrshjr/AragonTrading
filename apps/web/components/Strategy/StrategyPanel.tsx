@@ -17,7 +17,7 @@ import {
   visibleStrategiesForStrategyPanel,
 } from "@/lib/strategyCatalog";
 import { useAppStore } from "@/lib/store";
-import { downloadCsv, equityToCsv, tradesToCsv } from "@/lib/export";
+import { downloadCsv, equityToCsv } from "@/lib/export";
 import type {
   ComboPreviewResult,
   Metrics,
@@ -36,7 +36,6 @@ import MetricsCards from "./MetricsCards";
 import RunHistory from "./RunHistory";
 import StrategyDetail from "./StrategyDetail";
 import StrategyList from "./StrategyList";
-import TradesTable from "./TradesTable";
 import { useComboPanel } from "./useComboPanel";
 import WalkForwardResults from "./WalkForwardResults";
 
@@ -282,13 +281,6 @@ export default function StrategyPanel() {
     setComboResult(null);
     setWalkForwardResult(null);
   }, [mode, runId, setWalkForwardResult]);
-
-  const { data: trades } = useQuery({
-    queryKey: ["trades", runId],
-    queryFn: () => api.trades(runId as number),
-    enabled: !!runId,
-    refetchInterval: mode === "paper" && paperSessionId ? 3000 : false,
-  });
 
   const equityQ = useQuery({
     queryKey: ["equity", runId],
@@ -627,7 +619,6 @@ export default function StrategyPanel() {
                     <Tabs
                       tabs={[
                         { key: "metrics", label: "绩效指标" },
-                        { key: "trades", label: "成交明细" },
                         { key: "history", label: "历史" },
                       ]}
                       active={tab}
@@ -667,24 +658,6 @@ export default function StrategyPanel() {
                       ) : (
                         <MetricsCards metrics={metrics} loading={backtest.isPending} />
                       )}
-                    </>
-                  ) : tab === "trades" ? (
-                    <>
-                      <div className="mb-2 flex justify-end">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          disabled={!trades?.length}
-                          onClick={() =>
-                            runId &&
-                            trades &&
-                            downloadCsv(`aragon-trades-run${runId}.csv`, tradesToCsv(trades))
-                          }
-                        >
-                          导出 CSV
-                        </Button>
-                      </div>
-                      <TradesTable trades={trades} />
                     </>
                   ) : (
                     <RunHistory />

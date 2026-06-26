@@ -363,6 +363,12 @@ describe("StrategyPanel manual backtest trigger", () => {
     expect(useAppStore.getState().strategyId).toBe(20);
   });
 
+  it("does not render the duplicate trade details tab in paper mode", async () => {
+    await renderLoadedPanel({ mode: "paper" });
+
+    expect(screen.queryByText("成交明细")).toBeNull();
+  });
+
   it("keeps paper selections across tabs and batch starts atomic plus combo ids", async () => {
     vi.mocked(api.paperBatchStart).mockResolvedValue({
       groupId: "batch-mixed",
@@ -532,6 +538,15 @@ describe("StrategyPanel manual backtest trigger", () => {
     expect(api.backtest).not.toHaveBeenCalled();
     expect(useAppStore.getState().runId).toBeNull();
     expect(screen.queryByText("12.00%")).toBeNull();
+  });
+
+  it("does not render or fetch right-side trade details after a simple backtest", async () => {
+    await renderLoadedPanel();
+    vi.clearAllMocks();
+    await runAtomicBacktest();
+
+    expect(screen.queryByText("成交明细")).toBeNull();
+    expect(api.trades).not.toHaveBeenCalled();
   });
 
   it("keeps save-as and saved-combo creation selection passive", async () => {
