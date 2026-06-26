@@ -48,8 +48,31 @@ describe("app store — account mode & sim balance", () => {
     );
     await useAppStore.persist.rehydrate();
     const s = useAppStore.getState();
-    expect(s.accountMode).toBe("sim");
+    // v5 仅新增 simBalance 默认；accountMode 的默认在 v16 迁移翻为 "live"（见专属用例），故此处不断言。
     expect(s.simBalance).toBe(DEFAULT_SIM_BALANCE);
+    // 既有持久化字段仍恢复
+    expect(s.instId).toBe("ETH-USDT-SWAP");
+    expect(s.bar).toBe("4H");
+  });
+
+  it("initializes a fresh install with account mode defaulting to live", () => {
+    // 全新安装只走初始化器（不触发 migrate）：实盘模式默认开启。
+    // 读 initialState 而非 getState，避免依赖前序用例对单例 store 的改动顺序。
+    expect(useAppStore.getInitialState().accountMode).toBe("live");
+  });
+
+  it("migrates pre-v16 persisted account mode to live", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({
+        state: { instId: "ETH-USDT-SWAP", bar: "4H", accountMode: "sim" },
+        version: 15,
+      }),
+    );
+    await useAppStore.persist.rehydrate();
+    const s = useAppStore.getState();
+    // v16 迁移把老用户持久化的 "sim" 升到 "live"（无就绪账户时由 AccountModeSwitch 守门回落）。
+    expect(s.accountMode).toBe("live");
     // 既有持久化字段仍恢复
     expect(s.instId).toBe("ETH-USDT-SWAP");
     expect(s.bar).toBe("4H");

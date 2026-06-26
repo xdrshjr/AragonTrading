@@ -178,7 +178,8 @@ export const useAppStore = create<AppState>()(
       backtestKind: "simple",
       wfParams: { ...DEFAULT_WF_PARAMS },
       walkForwardResult: null,
-      accountMode: "sim",
+      // 本轮需求：实盘模式默认开启。无就绪默认账户时由 AccountModeSwitch 水合守门回落 sim。
+      accountMode: "live",
       liveAcknowledged: false,
       simBalance: DEFAULT_SIM_BALANCE,
       paperSessionId: null,
@@ -361,7 +362,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 15,
+      version: 16,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -453,6 +454,12 @@ export const useAppStore = create<AppState>()(
             ...next,
             strategyListTab: hadLegacyComboMode ? "combo" : "regular",
           };
+        }
+        if (version < 16) {
+          // 本轮需求：实盘模式默认开启。无差别把老用户持久化态升到 "live"（含曾主动选 sim 者，
+          // 持久化态无法区分「默认 sim」与「主动选 sim」）；无就绪默认账户者仍由 AccountModeSwitch
+          // 水合守门回落 sim，故不会静默进入无凭证的实盘。
+          next = { ...next, accountMode: "live" };
         }
         return next as never;
       },

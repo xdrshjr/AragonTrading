@@ -40,9 +40,11 @@ class Settings(BaseSettings):
     okx_account_timeout_seconds: float = 15.0  # 私有请求超时上限
 
     # ---- 实盘交易（Phase 2「guarded order placement」，实盘交易模式 spec §3）----
-    # 字段名即环境变量名（LIVE_*，大小写不敏感）；首跨「real trading disabled」红线，故默认全关。
+    # 字段名即环境变量名（LIVE_*，大小写不敏感）；本轮需求把实盘下单默认翻为开启。
     # 桌面端经 desktop/src/lib/config.js 白名单透传（C1-6），dev 经 services/quant/.env 读取。
-    live_trading_enabled: bool = False           # 总开关：False 时 /trading/order|leverage 一律 403
+    # 安全阀仍在：设 LIVE_TRADING_ENABLED=false 即一键回退「real trading disabled」安全姿态；
+    # 逐单二次确认、名义上限、标的 / net_mode 反向单本地拦截等护栏均未削弱。
+    live_trading_enabled: bool = True            # 总开关：False 时 /trading/order|leverage 一律 403
     # 单笔下单名义价值本地上限（USDT），越界本地拦截。C1-7：默认收紧至 1000，避免高默认值架空
     # §8 风险①护栏③；需放大须显式 env（LIVE_MAX_ORDER_NOTIONAL_USD）覆写。
     live_max_order_notional_usd: float = 1000.0
