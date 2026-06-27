@@ -58,8 +58,25 @@ async def okx_error_handler(request: Request, exc: OKXError) -> JSONResponse:
 
 
 # 统一把 HTTPException 的 dict detail 包成 {error:{...}}
-from fastapi.exceptions import HTTPException as _HTTPException  # noqa: E402
+from fastapi.exceptions import RequestValidationError  # noqa: E402
 from starlette.exceptions import HTTPException as _StarletteHTTPException  # noqa: E402
+
+
+def _validation_message(exc: RequestValidationError) -> str:
+    parts: list[str] = []
+    for error in exc.errors():
+        loc = ".".join(str(part) for part in error.get("loc", []) if part != "body")
+        msg = str(error.get("msg") or "Invalid value")
+        parts.append(f"{loc}: {msg}" if loc else msg)
+    return "; ".join(parts) or "Invalid request parameters"
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": "VALIDATION_ERROR", "message": _validation_message(exc)}},
+    )
 
 
 @app.exception_handler(_StarletteHTTPException)

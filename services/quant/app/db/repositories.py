@@ -8,7 +8,7 @@ import json
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, insert, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -143,16 +143,33 @@ async def persist_backtest_result(session: AsyncSession, run: StrategyRun, *,
                                   trades: list[TradeRecord], equity: list[EquityRecord],
                                   metrics: dict, start_ts: int, end_ts: int,
                                   status: str = "done") -> None:
-    for t in trades:
-        session.add(Trade(
-            run_id=run.id, ts=t.ts, side=t.side, price=t.price, qty=t.qty, fee=t.fee,
-            pnl=t.pnl, position_after=t.position_after, reason=t.reason,
-            stop_loss_pct=t.stop_loss_pct, take_profit_pct=t.take_profit_pct,
-            max_hold_bars=t.max_hold_bars, stop_loss_price=t.stop_loss_price,
-            take_profit_price=t.take_profit_price,
-        ))
-    for e in equity:
-        session.add(EquityPoint(run_id=run.id, ts=e.ts, equity=e.equity, drawdown=e.drawdown))
+    trade_rows = [
+        {
+            "run_id": run.id,
+            "ts": t.ts,
+            "side": t.side,
+            "price": t.price,
+            "qty": t.qty,
+            "fee": t.fee,
+            "pnl": t.pnl,
+            "position_after": t.position_after,
+            "reason": t.reason,
+            "stop_loss_pct": t.stop_loss_pct,
+            "take_profit_pct": t.take_profit_pct,
+            "max_hold_bars": t.max_hold_bars,
+            "stop_loss_price": t.stop_loss_price,
+            "take_profit_price": t.take_profit_price,
+        }
+        for t in trades
+    ]
+    equity_rows = [
+        {"run_id": run.id, "ts": e.ts, "equity": e.equity, "drawdown": e.drawdown}
+        for e in equity
+    ]
+    if trade_rows:
+        await session.execute(insert(Trade), trade_rows)
+    if equity_rows:
+        await session.execute(insert(EquityPoint), equity_rows)
     run.status = status
     run.start_ts = start_ts
     run.end_ts = end_ts

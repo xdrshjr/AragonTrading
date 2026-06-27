@@ -101,6 +101,28 @@ async def test_compare_rejects_single_strategy(patch_okx):
         await dispose_engine()
 
 
+async def test_compare_validation_errors_use_structured_error_body(patch_okx):
+    from app.db.session import dispose_engine, init_db
+    await init_db()
+    transport = ASGITransport(app=_load_app(), raise_app_exceptions=False)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            r = await client.post("/api/strategies/compare", json={
+                "strategyIds": list(range(1, 14)),
+                "instId": "BTC-USDT-SWAP",
+                "bar": "1H",
+                "limit": 120,
+                "startTs": 1_700_000_000,
+                "endTs": 1_700_000_000 + 80 * 3600,
+            })
+            assert r.status_code == 422
+            body = r.json()
+            assert body["error"]["code"] == "VALIDATION_ERROR"
+            assert "strategyIds" in body["error"]["message"]
+    finally:
+        await dispose_engine()
+
+
 async def test_compare_uses_requested_time_range(patch_okx):
     from app.db.session import dispose_engine, init_db
     await init_db()

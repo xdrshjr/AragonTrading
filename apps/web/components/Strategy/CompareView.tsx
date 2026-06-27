@@ -16,6 +16,8 @@ const COLUMNS: { key: SortKey; label: string }[] = [
   { key: "maxDrawdown", label: "最大回撤" },
   { key: "tradeCount", label: "交易数" },
 ];
+const MAX_COMPARE_SELECTIONS = 12;
+const MAX_COMPARE_SELECTION_MESSAGE = "已达 12 个策略上限";
 
 export default function CompareView() {
   const qc = useQueryClient();
@@ -30,7 +32,14 @@ export default function CompareView() {
   // 默认全选可用的内置策略
   useEffect(() => {
     if (strategies && selected.size === 0) {
-      setSelected(new Set(strategies.filter((s) => s.builtin && !s.unavailable).map((s) => s.id)));
+      setSelected(
+        new Set(
+          strategies
+            .filter((s) => s.builtin && !s.unavailable)
+            .slice(0, MAX_COMPARE_SELECTIONS)
+            .map((s) => s.id),
+        ),
+      );
     }
   }, [strategies]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -53,7 +62,11 @@ export default function CompareView() {
   const toggle = (id: number) =>
     setSelected((prev) => {
       const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
+      if (next.has(id)) {
+        next.delete(id);
+      } else if (next.size < MAX_COMPARE_SELECTIONS) {
+        next.add(id);
+      }
       return next;
     });
 
@@ -70,6 +83,7 @@ export default function CompareView() {
     (result?.items ?? []).map((it, i) => [it.strategyId, colorForIndex(i)]),
   );
   const rows = result ? sortCompareItems(result.items, sortKey, sortDir) : [];
+  const atSelectionLimit = selected.size >= MAX_COMPARE_SELECTIONS;
 
   const openDetail = (strategyId: number, runId: number) => {
     setStrategyId(strategyId);
@@ -100,7 +114,7 @@ export default function CompareView() {
             <input
               type="checkbox"
               checked={selected.has(s.id)}
-              disabled={s.unavailable}
+              disabled={s.unavailable || (!selected.has(s.id) && atSelectionLimit)}
               onChange={() => toggle(s.id)}
               className="h-3.5 w-3.5 accent-[var(--accent)]"
             />
@@ -115,13 +129,16 @@ export default function CompareView() {
         <Button
           variant="primary"
           size="sm"
-          disabled={selected.size < 2 || compare.isPending}
+          disabled={selected.size < 2 || selected.size > MAX_COMPARE_SELECTIONS || compare.isPending}
           onClick={() => compare.mutate()}
         >
           {compare.isPending ? "对比中…" : `运行对比（${selected.size}）`}
         </Button>
         {selected.size < 2 && (
           <span className="text-[11px] text-[var(--muted)]">至少选择 2 个策略</span>
+        )}
+        {atSelectionLimit && (
+          <span className="text-[11px] text-[var(--muted)]">{MAX_COMPARE_SELECTION_MESSAGE}</span>
         )}
       </div>
 

@@ -149,6 +149,7 @@ vi.mock("@/lib/api", () => {
       updateStrategy: vi.fn(),
       deleteStrategy: vi.fn(),
       backtest: vi.fn(),
+      compare: vi.fn(),
       walkForward: vi.fn(),
       trades: vi.fn(),
       equity: vi.fn(),
@@ -175,6 +176,11 @@ function mockApi(strategies: Strategy[] = STRATEGIES) {
   vi.mocked(api.updateStrategy).mockResolvedValue(STRATEGIES[0]);
   vi.mocked(api.deleteStrategy).mockResolvedValue(undefined);
   vi.mocked(api.backtest).mockResolvedValue(BACKTEST_RESULT);
+  vi.mocked(api.compare).mockResolvedValue({
+    instId: "BTC-USDT-SWAP",
+    bar: "1H",
+    items: [],
+  });
   vi.mocked(api.walkForward).mockResolvedValue({
     runId: 202,
     summary: {
@@ -244,6 +250,16 @@ function resetStore(state: Partial<ReturnType<typeof useAppStore.getState>> = {}
     comboEditingId: null,
     ...state,
   });
+}
+
+function makeCompareStrategies(count: number): Strategy[] {
+  return Array.from({ length: count }, (_, index) => ({
+    ...STRATEGIES[0],
+    id: index + 1,
+    templateKey: `compare_${index + 1}`,
+    name: `Strategy ${index + 1}`,
+    builtin: true,
+  }));
 }
 
 function renderPanel() {
@@ -367,6 +383,33 @@ describe("StrategyPanel manual backtest trigger", () => {
     await renderLoadedPanel({ mode: "paper" });
 
     expect(screen.queryByText("成交明细")).toBeNull();
+  });
+
+  it("caps compare selection at 12 and disables unchecked strategies at the cap", async () => {
+    const manyStrategies = makeCompareStrategies(13);
+    mockApi(manyStrategies);
+    resetStore({ mode: "compare" });
+    renderPanel();
+
+    await screen.findByText("Strategy 13");
+
+    const checkboxes = screen.getAllByRole("checkbox");
+    const checkedBoxes = checkboxes.filter((item) => (item as HTMLInputElement).checked);
+    expect(checkedBoxes).toHaveLength(12);
+
+    const extra = checkboxes[12] as HTMLInputElement;
+    expect(extra.checked).toBe(false);
+    expect(extra.disabled).toBe(true);
+    expect(screen.getByText("已达 12 个策略上限")).toBeTruthy();
+
+    fireEvent.click(getButton("运行对比"));
+
+    await waitFor(() => expect(api.compare).toHaveBeenCalledTimes(1));
+    expect(api.compare).toHaveBeenCalledWith(
+      expect.objectContaining({
+        strategyIds: manyStrategies.slice(0, 12).map((strategy) => strategy.id),
+      }),
+    );
   });
 
   it("keeps paper selections across tabs and batch starts atomic plus combo ids", async () => {

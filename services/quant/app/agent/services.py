@@ -35,6 +35,8 @@ from ..strategies.combo_specs import (
 
 # ============================ 取数（边界处显式错误，C1） ============================
 _PAGE_CHUNK = 1000   # 单次 get_candles 上限（其内部 history-candles 翻页累积到该数，rest_client.py:160）
+_COMPARE_SYNC_WORK_UNIT_LIMIT = 150_000
+_COMPARE_EQUITY_MAX_POINTS = 1000
 
 
 def _filter_range_candles(candles: list[Candle], start_ts: int, end_ts: int) -> list[Candle]:
@@ -248,6 +250,16 @@ def _dedupe_ids(ids: list[int]) -> list[int]:
     return out
 
 
+@dataclass(frozen=True)
+class CompareComboItem:
+    strategy_id: int
+    row: Strategy
+    members_spec: list[dict]
+    policy_spec: dict
+    members: list[ComboMember]
+    policy: ComboPolicy
+
+
 async def _prepare_compare(session: AsyncSession, ordered_ids: list[int]) -> list[tuple]:
     prepared: list[tuple] = []
     for sid in ordered_ids:
@@ -267,6 +279,102 @@ async def _prepare_compare(session: AsyncSession, ordered_ids: list[int]) -> lis
     return prepared
 
 
+async def _prepare_compare_combos(
+    session: AsyncSession,
+    ordered_ids: list[int],
+) -> list[CompareComboItem]:
+    prepared: list[CompareComboItem] = []
+    for sid in ordered_ids:
+        row = await repo.get_strategy_row(session, sid)
+        if row is None or not _is_combo(row.template_key):
+            continue
+        notes: list[str] = []
+        try:
+            members_spec, policy_spec = _combo_spec_from_row(row)
+            members = _build_members(members_spec, notes)
+        except HTTPException:
+            continue
+        prepared.append(CompareComboItem(
+            strategy_id=sid,
+            row=row,
+            members_spec=members_spec,
+            policy_spec=policy_spec,
+            members=members,
+            policy=_policy_from_spec(policy_spec),
+        ))
+    return prepared
+
+
+def _compare_effective_bars(*, bar: str, limit: int | None, start_ts: int, end_ts: int) -> int:
+    settings = get_settings()
+    requested = (end_ts - start_ts) // bar_to_seconds(bar) + 1
+    ceiling = settings.backtest_max_bars
+    if limit is not None:
+        ceiling = min(int(limit), ceiling)
+    return max(0, min(int(requested), int(ceiling)))
+
+
+def _guard_compare_workload(
+    prepared: list[tuple],
+    combos: list[CompareComboItem],
+    *,
+    bar: str,
+    limit: int | None,
+    start_ts: int,
+    end_ts: int,
+) -> None:
+    expanded_count = len(prepared) + sum(len(combo.members) for combo in combos)
+    if expanded_count <= 0:
+        return
+    effective_bars = _compare_effective_bars(
+        bar=bar,
+        limit=limit,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+    if expanded_count * effective_bars <= _COMPARE_SYNC_WORK_UNIT_LIMIT:
+        return
+    raise HTTPException(413, detail={
+        "code": "COMPARE_TOO_LARGE",
+        "message": (
+            "Compare request is too large for synchronous execution. "
+            "Narrow the range or select fewer combo strategies."
+        ),
+    })
+
+
+def _member_htf_from_union(
+    members: list[ComboMember],
+    union_frames: dict[str, list[Candle]],
+) -> dict[str, dict[str, list[Candle]]]:
+    return {
+        member.key: {
+            tf: union_frames[tf]
+            for tf in member.timeframes
+            if tf in union_frames
+        }
+        for member in members
+    }
+
+
+def _downsample_compare_equity(points: list) -> list:
+    if len(points) <= _COMPARE_EQUITY_MAX_POINTS:
+        return points
+    last_index = len(points) - 1
+    selected = []
+    previous_index = -1
+    for slot in range(_COMPARE_EQUITY_MAX_POINTS):
+        index = round(slot * last_index / (_COMPARE_EQUITY_MAX_POINTS - 1))
+        if index != previous_index:
+            selected.append(points[index])
+            previous_index = index
+    return selected
+
+
+def _compare_equity_out(points: list) -> list[dict]:
+    return [equity_out(e) for e in _downsample_compare_equity(points)]
+
+
 async def run_compare(session: AsyncSession, rest, *, strategy_ids: list[int], inst_id: str,
                       bar: str, limit: int | None = None, start_ts: int, end_ts: int,
                       initial_capital: float | None = None, fees: float | None = None,
@@ -278,16 +386,36 @@ async def run_compare(session: AsyncSession, rest, *, strategy_ids: list[int], i
         cancel_check: 可选协作式取消探针（H11）；逐策略前命中即提前返回已完成项，余者跳过。
             UI router 不传（None → 不检查 → 行为与原路由逐字节一致，R8）。
     """
+    ordered_ids = _dedupe_ids(strategy_ids)
     costs = _resolve_costs(get_settings(), initial_capital, fees, slippage, leverage)
+    prepared = await _prepare_compare(session, ordered_ids)
+    prepared_combos = await _prepare_compare_combos(session, ordered_ids)
+    _guard_compare_workload(
+        prepared,
+        prepared_combos,
+        bar=bar,
+        limit=limit,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
     candles = await load_range_candles(rest, inst_id=inst_id, bar=bar, start_ts=start_ts,
                                        end_ts=end_ts, max_bars=limit)
     await repo.upsert_candles(session, inst_id, bar, candles)
 
-    prepared = await _prepare_compare(session, _dedupe_ids(strategy_ids))
     base_seconds = bar_to_seconds(bar)
-    union_tfs = sorted({tf for _, _, s in prepared for tf in s.timeframes()
-                        if tf != bar and bar_to_seconds(tf) > base_seconds})
-    max_warmup = max((s.htf_warmup_bars() for _, _, s in prepared), default=60)
+    atomic_tfs = {tf for _, _, s in prepared for tf in s.timeframes()
+                  if tf != bar and bar_to_seconds(tf) > base_seconds}
+    combo_tfs = {tf for combo in prepared_combos for member in combo.members
+                 for tf in member.timeframes
+                 if tf != bar and bar_to_seconds(tf) > base_seconds}
+    union_tfs = sorted(atomic_tfs | combo_tfs)
+    atomic_warmups = [s.htf_warmup_bars() for _, _, s in prepared]
+    combo_warmups = [
+        member.strategy.htf_warmup_bars()
+        for combo in prepared_combos
+        for member in combo.members
+    ]
+    max_warmup = max(atomic_warmups + combo_warmups, default=60)
     union_frames: dict[str, list[Candle]] = {}
     if union_tfs:
         union_frames = await load_htf_frames(rest, inst_id=inst_id, start_ts=start_ts, end_ts=end_ts,
@@ -309,18 +437,17 @@ async def run_compare(session: AsyncSession, rest, *, strategy_ids: list[int], i
             "name": row.name or strategy.meta.name,
             "runId": run.id,
             "metrics": result.metrics,
-            "equity": [equity_out(e) for e in result.equity_points],
+            "equity": _compare_equity_out(result.equity_points),
         })
 
-    # 组合项：复用共享 base candles，各成员 HTF 并集自取（R7a）；与原子项同构可混排对比。
-    for sid in _dedupe_ids(strategy_ids):
-        row = await repo.get_strategy_row(session, sid)
-        if row is None or not _is_combo(row.template_key):
-            continue
+    # 组合项：复用共享 base candles 和共享 HTF 并集；与原子项同构可混排对比。
+    for combo in prepared_combos:
         if cancel_check is not None and cancel_check():
             break
-        item = await _compare_combo_item(session, rest, row, candles, inst_id=inst_id, bar=bar,
-                                         limit=limit, start_ts=start_ts, end_ts=end_ts, costs=costs)
+        htf_by_member = _member_htf_from_union(combo.members, union_frames)
+        item = await _compare_combo_item(
+            session, rest, combo, candles, inst_id=inst_id, bar=bar, limit=limit,
+            start_ts=start_ts, end_ts=end_ts, costs=costs, htf_by_member=htf_by_member)
         if item is not None:
             items.append(item)
     return {"instId": inst_id, "bar": bar, "items": items}
@@ -363,15 +490,17 @@ async def _load_member_htf(session: AsyncSession, rest, members: list[ComboMembe
 async def _run_combo(session: AsyncSession, rest, *, strategy_id: int, members: list[ComboMember],
                      policy: ComboPolicy, inst_id: str, bar: str, limit: int | None, start_ts: int,
                      end_ts: int, costs: tuple, config_extra: dict,
-                     candles: list[Candle] | None = None):
+                     candles: list[Candle] | None = None,
+                     htf_by_member: dict | None = None):
     """加载成员高周期（必要时含基础 K 线）→ 线程池组合回测 → 落库。返回 (run, result)。"""
     initial_capital, fees, slippage, leverage = costs
     if candles is None:
         candles = await load_range_candles(rest, inst_id=inst_id, bar=bar, start_ts=start_ts,
                                            end_ts=end_ts, max_bars=limit)
         await repo.upsert_candles(session, inst_id, bar, candles)
-    htf_by_member = await _load_member_htf(session, rest, members, inst_id=inst_id, bar=bar,
-                                           start_ts=start_ts, end_ts=end_ts)
+    if htf_by_member is None:
+        htf_by_member = await _load_member_htf(session, rest, members, inst_id=inst_id, bar=bar,
+                                               start_ts=start_ts, end_ts=end_ts)
     run = await repo.create_run(
         session, strategy_id=strategy_id, inst_id=inst_id, bar=bar, mode="backtest",
         config={"combo": True, **config_extra, "initialCapital": initial_capital, "fees": fees,
@@ -424,23 +553,24 @@ async def _run_saved_combo(session: AsyncSession, rest, row: Strategy, *, inst_i
     return {"runId": run.id, "metrics": result.metrics, "combo": combo_out(result, combo_notes)}
 
 
-async def _compare_combo_item(session: AsyncSession, rest, row: Strategy, candles: list[Candle], *,
+async def _compare_combo_item(session: AsyncSession, rest, combo: CompareComboItem,
+                              candles: list[Candle], *,
                               inst_id: str, bar: str, limit: int | None, start_ts: int, end_ts: int,
-                              costs: tuple) -> dict | None:
-    """compare 中的组合项：复用共享 base candles；不可构建（成员 < 2 等）则跳过（best-effort）。"""
-    notes: list[str] = []
-    try:
-        members_spec, policy_spec = _combo_spec_from_row(row)
-        members = _build_members(members_spec, notes)
-    except HTTPException:
-        return None
-    policy = _policy_from_spec(policy_spec)
+                              costs: tuple, htf_by_member: dict) -> dict | None:
+    """compare 中的组合项：复用共享 base candles 和共享 HTF frames。"""
     run, result = await _run_combo(
-        session, rest, strategy_id=row.id, members=members, policy=policy, inst_id=inst_id, bar=bar,
+        session, rest, strategy_id=combo.row.id, members=combo.members, policy=combo.policy,
+        inst_id=inst_id, bar=bar,
         limit=limit, start_ts=start_ts, end_ts=end_ts, costs=costs, candles=candles,
-        config_extra={"preview": False, "compare": True, "members": members_spec, "policy": policy_spec})
-    return {"strategyId": row.id, "name": row.name or "组合", "runId": run.id,
-            "metrics": result.metrics, "equity": [equity_out(e) for e in result.equity_points]}
+        htf_by_member=htf_by_member,
+        config_extra={
+            "preview": False,
+            "compare": True,
+            "members": combo.members_spec,
+            "policy": combo.policy_spec,
+        })
+    return {"strategyId": combo.row.id, "name": combo.row.name or "组合", "runId": run.id,
+            "metrics": result.metrics, "equity": _compare_equity_out(result.equity_points)}
 
 
 # ============================ 高级回测：滑动窗口 / Walk-forward（spec §3.3） ============================

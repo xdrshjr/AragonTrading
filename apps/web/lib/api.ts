@@ -33,6 +33,22 @@ export class ApiRequestError extends Error {
   }
 }
 
+function formatValidationDetail(detail: unknown): string | null {
+  if (!Array.isArray(detail)) return null;
+  const messages = detail
+    .map((item) => {
+      if (!item || typeof item !== "object") return null;
+      const record = item as Record<string, unknown>;
+      const loc = Array.isArray(record.loc)
+        ? record.loc.filter((part) => part !== "body").map(String).join(".")
+        : "";
+      const msg = typeof record.msg === "string" ? record.msg : "Invalid value";
+      return loc ? `${loc}: ${msg}` : msg;
+    })
+    .filter((message): message is string => Boolean(message));
+  return messages.length ? messages.join("; ") : null;
+}
+
 // 内部变体：同 request 的错误处理，但同时回传原始 Response 以便读取响应头（F2）。
 async function rawRequest<T>(
   path: string,
@@ -51,6 +67,12 @@ async function rawRequest<T>(
       if (body?.error) {
         code = body.error.code ?? code;
         message = body.error.message ?? message;
+      } else {
+        const validationMessage = formatValidationDetail(body?.detail);
+        if (validationMessage) {
+          code = "VALIDATION_ERROR";
+          message = validationMessage;
+        }
       }
     } catch {
       /* ignore parse error */

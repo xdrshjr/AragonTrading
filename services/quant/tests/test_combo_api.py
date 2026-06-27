@@ -11,10 +11,14 @@ from tests.conftest import make_synthetic_candles
 class _FakeRest:
     """对任意 bar/limit 返回确定性合成 K 线（无网络）。"""
 
+    def __init__(self):
+        self.calls = []
+
     async def health(self) -> bool:
         return True
 
     async def get_candles(self, inst_id, bar, limit=300, before=None, after=None):
+        self.calls.append({"bar": bar, "limit": limit, "before": before, "after": after})
         rows = make_synthetic_candles(min(limit, 300), start_ts=1_700_000_000, step=3600)
         return [Candle(ts=r["ts"], o=r["o"], h=r["h"], l=r["l"], c=r["c"], vol=r["vol"]) for r in rows]
 
@@ -187,5 +191,71 @@ async def test_combo_in_compare(patch_okx):
             for it in items:
                 assert "totalReturn" in it["metrics"]
                 assert isinstance(it["equity"], list) and len(it["equity"]) > 0
+    finally:
+        await dispose_engine()
+
+
+async def test_combo_compare_reuses_shared_member_htf_frames(patch_okx):
+    """Multiple saved combos in compare should share member HTF loading."""
+    from app.db.session import dispose_engine, init_db
+    await init_db()
+    transport = ASGITransport(app=_load_app())
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            combo_ids = []
+            for n in range(4):
+                r = await client.post("/api/strategies", json=_combo_body(_M2, f"combo-{n}"))
+                assert r.status_code == 201, r.text
+                combo_ids.append(r.json()["id"])
+
+            r = await client.post("/api/strategies/compare", json={
+                "strategyIds": combo_ids,
+                "instId": "BTC-USDT-SWAP",
+                "bar": "15m",
+                "limit": 300,
+                **_RANGE,
+            })
+            assert r.status_code == 200, r.text
+            assert len(r.json()["items"]) == 4
+            htf_calls = [c for c in patch_okx.calls if c["bar"] == "1H"]
+            assert len(htf_calls) <= 2
+    finally:
+        await dispose_engine()
+
+
+async def test_combo_compare_rejects_expanded_workload_over_budget(patch_okx):
+    """Expanded combo members times bars should fail before a huge sync compare."""
+    from app.db.session import dispose_engine, init_db
+    await init_db()
+    transport = ASGITransport(app=_load_app())
+    start_ts = 1_700_000_000
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            members = [
+                {"templateKey": "trend_pullback_long", "params": {}},
+                {"templateKey": "trend_pullback_short", "params": {}},
+                {"templateKey": "ema_cross_scalper", "params": {}},
+                {"templateKey": "momentum_breakout", "params": {}},
+                {"templateKey": "bollinger_reversion", "params": {}},
+                {"templateKey": "vwap_rsi_momentum", "params": {}},
+                {"templateKey": "range_scalping_strategy", "params": {}},
+                {"templateKey": "long_shadow_reversal", "params": {}},
+            ]
+            combo_ids = []
+            for n in range(2):
+                r = await client.post("/api/strategies", json=_combo_body(members, f"large-{n}"))
+                assert r.status_code == 201, r.text
+                combo_ids.append(r.json()["id"])
+
+            r = await client.post("/api/strategies/compare", json={
+                "strategyIds": combo_ids,
+                "instId": "BTC-USDT-SWAP",
+                "bar": "15m",
+                "limit": 200000,
+                "startTs": start_ts,
+                "endTs": start_ts + 19_999 * 900,
+            })
+            assert r.status_code == 413
+            assert r.json()["error"]["code"] == "COMPARE_TOO_LARGE"
     finally:
         await dispose_engine()
