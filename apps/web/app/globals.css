@@ -96,6 +96,40 @@ body {
 }
 
 /* ============================================================
+   实盘下单滑块（Slider 原语）拇指几何与端点内缩。
+   appearance:none 抹掉原生外观后必须自绘拇指，否则 value=0 / 100 端点的
+   原生拇指会越过控件边缘溢出（见 docs/diagnoses/live-long-short-order-panel-layout）。
+   左右各内缩半个拇指宽，使两端拇指都落在轨道内；webkit / moz 双覆盖。
+   仅作用于带 .range-slider 类名的 range，避免对未来其它 range 输入产生全局副作用。
+   ============================================================ */
+.range-slider {
+  padding-left: 7px;
+  padding-right: 7px;
+}
+.range-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 9999px;
+  background: var(--accent);
+  margin-top: -4px; /* (轨道 6px - 拇指 14px) / 2，使拇指垂直居中于轨道 */
+  cursor: pointer;
+}
+.range-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: 0;
+  border-radius: 9999px;
+  background: var(--accent);
+  cursor: pointer;
+}
+.range-slider:disabled::-webkit-slider-thumb,
+.range-slider:disabled::-moz-range-thumb {
+  cursor: not-allowed;
+}
+
+/* ============================================================
    桌面端自定义标题栏：拖拽 / 非拖拽区域（spec §4.10 / D5）。
    浏览器中 -webkit-app-region 为无副作用样式，自动降级——Web 端零回归。
    结构兜底：拖拽区内一切可交互元素自动置 no-drag，防漏标导致点击被拖拽层吞掉。

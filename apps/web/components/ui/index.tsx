@@ -224,7 +224,8 @@ export function Slider({
       aria-valuenow={value}
       onChange={(e) => onChange(Number(e.target.value))}
       className={clsx(
-        "h-1.5 w-full cursor-pointer appearance-none rounded-full bg-[var(--surface-2)]",
+        // range-slider：自绘拇指几何 + 两端内缩，避免 value=0/100 拇指溢出（globals.css）。
+        "range-slider h-1.5 w-full cursor-pointer appearance-none rounded-full bg-[var(--surface-2)]",
         "accent-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-40",
         className,
       )}

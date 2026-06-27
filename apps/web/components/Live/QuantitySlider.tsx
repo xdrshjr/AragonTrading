@@ -20,6 +20,7 @@ export default function QuantitySlider({
   margin,
   onChange,
   disabled,
+  error,
 }: {
   sz: number;
   maxSz: number;
@@ -30,6 +31,7 @@ export default function QuantitySlider({
   margin: number;
   onChange: (next: number) => void;
   disabled?: boolean;
+  error?: string;
 }) {
   // 输入框保留本地文本缓冲，便于编辑；sz 外部变更（滑块 / 快捷档）时回填。
   const [text, setText] = useState(() => (sz > 0 ? String(sz) : ""));
@@ -73,11 +75,16 @@ export default function QuantitySlider({
           step={lotSz}
           value={text}
           disabled={disabled}
+          invalid={!!error}
           aria-label="仓位数量（张）"
           onChange={(e) => onText(e.target.value)}
           className="w-20 text-right tabular"
         />
       </div>
+
+      {error && (
+        <span className="text-[11px] text-[var(--short)]">{error}</span>
+      )}
 
       <div className="grid grid-cols-4 gap-1">
         {QUICK_PCTS.map((quick) => (

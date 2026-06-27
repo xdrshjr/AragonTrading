@@ -47,7 +47,7 @@ export default function TpSlFields({
 
       {expanded && (
         <div className="flex flex-col gap-2">
-          <div className="flex items-center gap-1">
+          <div className="inline-flex gap-1 self-start rounded-[10px] bg-[var(--surface-2)] p-1">
             <ModeTab active={mode === "price"} onClick={() => onModeChange("price")} label="按价格" />
             <ModeTab active={mode === "amount"} onClick={() => onModeChange("amount")} label="按金额" />
           </div>
@@ -99,9 +99,10 @@ function ModeTab({ active, onClick, label }: { active: boolean; onClick: () => v
       type="button"
       onClick={onClick}
       className={clsx(
-        "rounded-[7px] px-2.5 py-1 text-[11px] font-medium transition-colors duration-150",
+        // 与限价/市价、全仓/逐仓同一种「填充式分段」语言：选中=surface 填充+阴影。
+        "rounded-[7px] px-3 py-1 text-[11px] font-medium transition-all duration-150",
         active
-          ? "bg-[var(--surface-2)] text-[var(--text)]"
+          ? "bg-[var(--surface)] text-[var(--text)] shadow-soft"
           : "text-[var(--muted)] hover:text-[var(--text)]",
       )}
     >

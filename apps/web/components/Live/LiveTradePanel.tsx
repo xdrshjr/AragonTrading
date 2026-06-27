@@ -257,6 +257,9 @@ export default function LiveTradePanel({
         </p>
       )}
 
+      {/* 分区：下单参数（方向 / 类型 / 价格）｜ 仓位（杠杆 / 数量 / 指标）。 */}
+      <Divider />
+
       <LeverageControl
         value={lever}
         maxLever={meta.maxLever}
@@ -274,10 +277,11 @@ export default function LiveTradePanel({
         margin={margin}
         onChange={setSz}
         disabled={controlsDisabled}
+        error={validation.errors.sz}
       />
-      {validation.errors.sz && (
-        <span className="text-[11px] text-[var(--short)]">{validation.errors.sz}</span>
-      )}
+
+      {/* 分区：仓位 ｜ 止盈止损。 */}
+      <Divider />
 
       <TpSlFields
         expanded={tpExpanded}
@@ -292,6 +296,9 @@ export default function LiveTradePanel({
         slTriggerPx={slTriggerPx}
         disabled={controlsDisabled}
       />
+
+      {/* 分区：止盈止损 ｜ 提交（真金白银操作，与上方风险参数显式隔开）。 */}
+      <Divider />
 
       <Button
         variant="primary"
@@ -332,6 +339,11 @@ export default function LiveTradePanel({
       />
     </div>
   );
+}
+
+// 分区细分隔线：在扁平面板里建立「下单参数 / 仓位 / 止盈止损 / 提交」的层次（P3）。
+function Divider() {
+  return <div className="border-t border-[var(--border)]" />;
 }
 
 function SegToggle({
