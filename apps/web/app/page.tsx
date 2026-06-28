@@ -8,6 +8,8 @@ import ChartWorkspace from "@/components/Chart/ChartWorkspace";
 import AppMenu from "@/components/Desktop/AppMenu";
 import WindowControls from "@/components/Desktop/WindowControls";
 import AccountModeSwitch from "@/components/Header/AccountModeSwitch";
+import FactorButton from "@/components/Factor/FactorButton";
+import FactorLab from "@/components/Factor/FactorLab";
 import RightPanel from "@/components/RightPanel/RightPanel";
 import SettingsGearButton from "@/components/Settings/SettingsGearButton";
 import SettingsPanel from "@/components/Settings/SettingsPanel";
@@ -71,6 +73,7 @@ export default function Page() {
     backtestEndTs,
     indicators,
     showSettings,
+    showFactorLab,
     rightPanelWidth,
     setChartView,
     setPaperActiveStrategyId,
@@ -482,6 +485,7 @@ export default function Page() {
           <Button variant="ghost" size="sm" onClick={toggleTheme} aria-label="切换主题">
             {theme === "light" ? "暗色" : "亮色"}
           </Button>
+          <FactorButton />
           <SettingsGearButton />
           <WindowControls />
         </div>
@@ -490,6 +494,10 @@ export default function Page() {
       {showSettings ? (
         <main className="no-drag min-h-0 flex-1 overflow-hidden">
           <SettingsPanel />
+        </main>
+      ) : showFactorLab ? (
+        <main className="no-drag min-h-0 flex-1 overflow-hidden">
+          <FactorLab />
         </main>
       ) : (
         <main

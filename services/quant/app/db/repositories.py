@@ -20,6 +20,8 @@ from .models import (
     AgentToolState,
     CandleCache,
     EquityPoint,
+    Factor,
+    FactorSet,
     LiveOrderAudit,
     OkxAccount,
     Strategy,
@@ -667,3 +669,198 @@ async def list_live_order_audit(session: AsyncSession, *, account_id: int | None
         stmt = stmt.where(LiveOrderAudit.account_id == account_id)
     stmt = stmt.order_by(LiveOrderAudit.id.desc()).limit(limit)
     return list((await session.execute(stmt)).scalars().all())
+
+
+# ============================ 因子（因子层 §5.1） ============================
+@dataclass(frozen=True)
+class FactorValues:
+    """新增因子的可写字段集合（聚合传参，避免位置参数堆叠）。"""
+
+    factor_key: str
+    name: str
+    params: dict
+    direction: str
+    category: str
+    source: str
+    notes: str = ""
+
+
+@dataclass(frozen=True)
+class FactorPatch:
+    """编辑因子的部分字段（None = 不改）。"""
+
+    name: str | None = None
+    params: dict | None = None
+    direction: str | None = None
+    enabled: bool | None = None
+    notes: str | None = None
+
+
+async def list_factors(session: AsyncSession, *, enabled: bool | None = None,
+                       category: str | None = None) -> list[Factor]:
+    """已存因子列表（builtin 在前、同类按 id 升序），支持激活态 / 类别过滤。"""
+    stmt = select(Factor).order_by((Factor.source != "builtin"), Factor.id.asc())
+    if enabled is not None:
+        stmt = stmt.where(Factor.enabled == enabled)
+    if category:
+        stmt = stmt.where(Factor.category == category)
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def get_factor(session: AsyncSession, factor_id: int) -> Factor | None:
+    return await session.get(Factor, factor_id)
+
+
+async def create_factor(session: AsyncSession, *, values: FactorValues) -> Factor:
+    row = Factor(
+        factor_key=values.factor_key, name=values.name,
+        params_json=json.dumps(values.params or {}, ensure_ascii=False),
+        direction=values.direction, category=values.category, source=values.source,
+        enabled=True, notes=values.notes or "")
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def update_factor(session: AsyncSession, factor_id: int, *,
+                        patch: FactorPatch) -> Factor | None:
+    """编辑因子（``enabled`` 即激活 / 取消）。"""
+    row = await session.get(Factor, factor_id)
+    if row is None:
+        return None
+    if patch.name is not None:
+        row.name = patch.name
+    if patch.params is not None:
+        row.params_json = json.dumps(patch.params, ensure_ascii=False)
+    if patch.direction is not None:
+        row.direction = patch.direction
+    if patch.enabled is not None:
+        row.enabled = patch.enabled
+    if patch.notes is not None:
+        row.notes = patch.notes
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def set_factor_eval(session: AsyncSession, factor_id: int, eval_summary: dict) -> None:
+    """缓存某因子最近一次评估摘要（不存在则静默跳过，缓存非关键路径）。"""
+    row = await session.get(Factor, factor_id)
+    if row is None:
+        return
+    row.eval_json = json.dumps(eval_summary, ensure_ascii=False)
+    await session.commit()
+
+
+async def delete_factor(session: AsyncSession, factor_id: int) -> str:
+    """返回 'ok' | 'not_found' | 'builtin'（内置因子只读，C6）。"""
+    row = await session.get(Factor, factor_id)
+    if row is None:
+        return "not_found"
+    if row.source == "builtin":
+        return "builtin"
+    await session.delete(row)
+    await session.commit()
+    return "ok"
+
+
+async def bulk_create_factors(session: AsyncSession, values: list[FactorValues]) -> list[Factor]:
+    """批量落因子（挖掘保存 top-N 用）；按 factor_key+params 去重已存的内置 / 同源行由调用方负责。"""
+    rows = [
+        Factor(factor_key=v.factor_key, name=v.name,
+               params_json=json.dumps(v.params or {}, ensure_ascii=False), direction=v.direction,
+               category=v.category, source=v.source, enabled=True, notes=v.notes or "")
+        for v in values
+    ]
+    session.add_all(rows)
+    await session.commit()
+    for row in rows:
+        await session.refresh(row)
+    return rows
+
+
+# ============================ 因子组合（factor_sets，因子层 §5.1） ============================
+@dataclass(frozen=True)
+class FactorSetValues:
+    """新增因子组合的可写字段集合（聚合传参）。"""
+
+    name: str
+    members: list
+    method: str
+    config: dict
+    model: dict
+    metrics: dict | None
+    enabled: bool = True
+
+
+@dataclass(frozen=True)
+class FactorSetPatch:
+    """编辑因子组合的部分字段（None = 不改）。"""
+
+    name: str | None = None
+    members: list | None = None
+    method: str | None = None
+    config: dict | None = None
+    model: dict | None = None
+    metrics: dict | None = None
+    enabled: bool | None = None
+
+
+async def list_factor_sets(session: AsyncSession, *, enabled: bool | None = None) -> list[FactorSet]:
+    stmt = select(FactorSet).order_by(FactorSet.id.asc())
+    if enabled is not None:
+        stmt = stmt.where(FactorSet.enabled == enabled)
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def get_factor_set(session: AsyncSession, set_id: int) -> FactorSet | None:
+    return await session.get(FactorSet, set_id)
+
+
+async def create_factor_set(session: AsyncSession, *, values: FactorSetValues) -> FactorSet:
+    row = FactorSet(
+        name=values.name,
+        members_json=json.dumps(values.members or [], ensure_ascii=False),
+        method=values.method, config_json=json.dumps(values.config or {}, ensure_ascii=False),
+        model_json=json.dumps(values.model or {}, ensure_ascii=False),
+        metrics_json=json.dumps(values.metrics, ensure_ascii=False) if values.metrics is not None else None,
+        enabled=values.enabled)
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def update_factor_set(session: AsyncSession, set_id: int, *,
+                            patch: FactorSetPatch) -> FactorSet | None:
+    row = await session.get(FactorSet, set_id)
+    if row is None:
+        return None
+    if patch.name is not None:
+        row.name = patch.name
+    if patch.members is not None:
+        row.members_json = json.dumps(patch.members, ensure_ascii=False)
+    if patch.method is not None:
+        row.method = patch.method
+    if patch.config is not None:
+        row.config_json = json.dumps(patch.config, ensure_ascii=False)
+    if patch.model is not None:
+        row.model_json = json.dumps(patch.model, ensure_ascii=False)
+    if patch.metrics is not None:
+        row.metrics_json = json.dumps(patch.metrics, ensure_ascii=False)
+    if patch.enabled is not None:
+        row.enabled = patch.enabled
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def delete_factor_set(session: AsyncSession, set_id: int) -> str:
+    """返回 'ok' | 'not_found'（组合自包含快照，删除不影响已创建的 factor_score 策略，R5）。"""
+    row = await session.get(FactorSet, set_id)
+    if row is None:
+        return "not_found"
+    await session.delete(row)
+    await session.commit()
+    return "ok"

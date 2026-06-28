@@ -18,6 +18,13 @@ export const TOOL_LABELS: Record<string, { label: string; icon: string }> = {
   get_run_metrics: { label: "绩效指标", icon: "📊" },
   get_run_trades: { label: "成交明细", icon: "🧾" },
   get_run_equity: { label: "净值曲线", icon: "💹" },
+  list_factors: { label: "因子目录", icon: "🧬" },
+  compute_factor: { label: "计算因子", icon: "🧮" },
+  evaluate_factor: { label: "评估因子", icon: "🔭" },
+  mine_factors: { label: "挖掘因子", icon: "⛏️" },
+  train_factor_weights: { label: "训练因子权重", icon: "🎛️" },
+  score_factor_combo: { label: "因子组合得分", icon: "🎯" },
+  show_factor: { label: "叠加因子", icon: "📐" },
 };
 
 export function labelFor(name: string): { label: string; icon: string } {
@@ -30,6 +37,7 @@ export const TOOL_CATEGORIES: Record<AgentToolCategory, { title: string; desc: s
   ui: { title: "界面控制", desc: "驱动左侧主图等工作台界面动作" },
   strategy: { title: "策略与回测", desc: "列出策略、运行回测与横向对比" },
   analysis: { title: "智能分析", desc: "市场体制识别与信号前瞻收益统计" },
+  factor: { title: "因子层", desc: "因子计算、评估、挖掘、权重训练与组合得分" },
   runs: { title: "运行历史", desc: "查询历史 run 的绩效、成交与净值" },
   general: { title: "其他工具", desc: "未归类的通用工具" },
 };
@@ -40,6 +48,7 @@ export const CATEGORY_ORDER: AgentToolCategory[] = [
   "ui",
   "strategy",
   "analysis",
+  "factor",
   "runs",
   "general",
 ];

@@ -1,10 +1,53 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Button } from "@/components/ui";
+import { Badge, Button } from "@/components/ui";
+import { directionLabel } from "@/lib/factor";
 import { fmtMoney } from "@/lib/format";
+import { useAppStore } from "@/lib/store";
 import type { BacktestKind, Strategy } from "@/lib/types";
 import WalkForwardForm from "./WalkForwardForm";
+
+interface FactorMemberSnapshot {
+  factorKey: string;
+  direction?: string;
+}
+
+// 因子组合得分策略（kind==="factor"）的内联快照摘要 + 编辑入口（评审 C-P1-5）。
+function FactorStrategyBanner({ strategy }: { strategy: Strategy }) {
+  const setShowFactorLab = useAppStore((s) => s.setShowFactorLab);
+  const setFactorLabSection = useAppStore((s) => s.setFactorLabSection);
+  const members = (strategy.params?.members as FactorMemberSnapshot[] | undefined) ?? [];
+  return (
+    <div className="flex flex-col gap-2 rounded-[10px] border border-[var(--accent-soft)] bg-[var(--accent-soft)]/40 px-3 py-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-semibold text-[var(--accent)]">因子组合得分策略</span>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => {
+            setFactorLabSection("builder");
+            setShowFactorLab(true);
+          }}
+        >
+          在因子实验室编辑
+        </Button>
+      </div>
+      <p className="text-[11px] text-[var(--muted)]">
+        消费独立因子层的复合得分做决策（内联快照 {members.length} 个因子成员，回测路径零改动）。
+      </p>
+      {members.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {members.map((m, i) => (
+            <Badge key={`${m.factorKey}-${i}`} tone={m.direction === "short" ? "short" : "long"}>
+              {m.factorKey}·{directionLabel(m.direction ?? "long")}
+            </Badge>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 type Params = Record<string, unknown>;
 type PaperOpts = { source?: "live" | "replay"; speed?: number; replayBars?: number };
@@ -54,6 +97,7 @@ export default function StrategyDetail({
 
   return (
     <div className="flex flex-col gap-3">
+      {strategy.kind === "factor" && <FactorStrategyBanner strategy={strategy} />}
       <p className="text-xs leading-relaxed text-[var(--muted)]">{strategy.description}</p>
 
       {htfBar && (

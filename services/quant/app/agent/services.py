@@ -469,6 +469,23 @@ async def _combo_template_strategy_id(session: AsyncSession) -> int:
     return sid
 
 
+async def _factor_score_template_strategy_id(session: AsyncSession) -> int:
+    """已 seed 的 factor_score builtin 行 id（预览未保存因子组合时落 runId 的 strategy_id，C-P2-4）。
+
+    与 ``_combo_template_strategy_id`` 同文件、同范式：init_db → _seed_builtin_strategies 必然种入且
+    builtin 不可删，行恒在；意外缺失 → 显式 500。**不**改 ``_prepare_strategy``——factor_score 以内联
+    快照存 params_json，既有回测路径直接实例化即可（评审 C-P1-2）。
+    """
+    stmt = (select(Strategy.id)
+            .where(Strategy.template_key == "factor_score", Strategy.builtin == True)  # noqa: E712
+            .limit(1))
+    sid = (await session.execute(stmt)).scalars().first()
+    if sid is None:
+        raise HTTPException(500, detail={"code": "FACTOR_TEMPLATE_MISSING",
+                                         "message": "因子组合得分模板未初始化"})
+    return sid
+
+
 async def _load_member_htf(session: AsyncSession, rest, members: list[ComboMember], *,
                            inst_id: str, bar: str, start_ts: int, end_ts: int) -> dict:
     """成员 timeframes 并集取真实高周期帧，按成员归集 {memberKey: {htf_bar: candles}}。"""

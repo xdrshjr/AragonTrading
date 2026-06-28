@@ -40,6 +40,15 @@ export interface ShowChartAction {
   runId?: number;
 }
 
+// show_factor ui-action directive（驱动因子实验室叠加因子值 / 组合复合得分）。
+export interface ShowFactorAction {
+  action: "show_factor";
+  factorKey?: string;
+  factorSetId?: number;
+  instId?: string;
+  bar?: Bar;
+}
+
 // 续流 resumed 控制事件的失败原因（RN-1）：run 已终结 / 缓冲空洞 / 会话不存在。
 export type ResumedReason = "completed" | "cancelled" | "gap" | "none";
 
@@ -54,7 +63,7 @@ export type AgentServerEvent =
   | { type: "thinking_delta"; seq?: number; data: { id: string; text: string } }
   | { type: "tool_call"; seq?: number; data: { id: string; name: string; input: Record<string, unknown> } }
   | { type: "tool_result"; seq?: number; data: { id: string; name: string; ok: boolean; summary: string } }
-  | { type: "ui_action"; seq?: number; data: ShowChartAction }
+  | { type: "ui_action"; seq?: number; data: ShowChartAction | ShowFactorAction }
   | { type: "message_end"; seq?: number; data: { id: string; usage?: AgentUsage } }
   | { type: "done"; seq?: number; data: { cancelled?: boolean } }
   | { type: "error"; seq?: number; data: { code: string; message: string } }
@@ -148,7 +157,14 @@ export interface ProvidersListResponse {
 }
 
 // ---------------- Agent 工具管理（设置中心 · Agent 工具管理） ----------------
-export type AgentToolCategory = "market" | "ui" | "strategy" | "analysis" | "runs" | "general";
+export type AgentToolCategory =
+  | "market"
+  | "ui"
+  | "strategy"
+  | "analysis"
+  | "factor"
+  | "runs"
+  | "general";
 
 // 单个工具（与后端 AgentToolOut 对齐）：元信息来自注册表 + 合并后的启用态。
 export interface AgentTool {

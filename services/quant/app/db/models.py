@@ -205,6 +205,51 @@ class LiveOrderAudit(Base):
     created_ts: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class Factor(Base):
+    """单个因子定义实例（因子层 §5.1）。
+
+    ``factor_key`` 指向 ``FACTOR_LIBRARY``（非真源——库才是真源 C6）；``params_json`` 覆盖库默认参数。
+    对应需求「看到所有挖掘出的因子、编辑、激活取消」：``enabled`` 即激活态，``source`` 区分内置 /
+    挖掘 / 自定义，``eval_json`` 缓存最近一次评估摘要。所有时间秒级 UTC（C2）。
+    """
+
+    __tablename__ = "factors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    factor_key: Mapped[str] = mapped_column(String(64), index=True)   # 指向 FACTOR_LIBRARY
+    name: Mapped[str] = mapped_column(String(128))
+    params_json: Mapped[str] = mapped_column(Text, default="{}")      # 覆盖库默认参数
+    direction: Mapped[str] = mapped_column(String(8), default="auto")  # long | short | auto
+    category: Mapped[str] = mapped_column(String(32), default="")     # 冗余存，便于列表过滤
+    source: Mapped[str] = mapped_column(String(16), default="custom")  # builtin | mined | custom
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)      # 激活 / 取消（需求显式）
+    eval_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # 最近评估摘要缓存
+    notes: Mapped[str] = mapped_column(String(256), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class FactorSet(Base):
+    """命名的因子组合（含训练出的权重 / 重要度 + 归一化统计 + 复合 IC）（因子层 §5.1）。
+
+    ``members_json`` 采用**自包含快照**（与 ``ComboMemberIn`` 同决策：不引用 ``factors.id``，避免因子被删 /
+    改后组合悬空，R5）。可被 ``FactorScoreStrategy`` 在创建时内联快照进 ``params_json``（引擎零 IO）。
+    """
+
+    __tablename__ = "factor_sets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128))
+    members_json: Mapped[str] = mapped_column(Text, default="[]")     # [{factorKey,params,weight,direction}]
+    method: Mapped[str] = mapped_column(String(24), default="linear")  # equal|ic_weight|linear|random_forest|xgboost
+    config_json: Mapped[str] = mapped_column(Text, default="{}")      # 训练配置 + thresholds
+    model_json: Mapped[str] = mapped_column(Text, default="{}")       # weights/importances/normStats/trainerVersion
+    metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # 复合得分样本内外 IC
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
 class CandleCache(Base):
     """OKX K 线本地缓存（降低调用、加速回测）。"""
 

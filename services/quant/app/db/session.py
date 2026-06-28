@@ -69,6 +69,7 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         await _ensure_trade_risk_columns(conn)
     await _seed_builtin_strategies()
+    await _seed_builtin_factors()
     await _seed_agent_providers()
 
 
@@ -107,6 +108,28 @@ async def _seed_builtin_strategies() -> None:
                 enabled=True,
                 builtin=True,
             ))
+        await session.commit()
+
+
+async def _seed_builtin_factors() -> None:
+    """空表时把因子库全部因子种成 source="builtin" 行，让「我的因子」首屏非空（幂等，按 source 判空）。
+
+    内置因子只读（不可删，可激活 / 取消）；用户仍可基于库新增自定义因子或保存挖掘结果。
+    """
+    # 延迟导入避免 db 模块层在加载期硬依赖 engine.factors（→ signal_edge → strategies）。
+    from ..engine.factors import FACTOR_LIBRARY
+    from .models import Factor
+
+    sm = get_sessionmaker()
+    async with sm() as session:
+        existing = (await session.execute(
+            select(Factor.id).where(Factor.source == "builtin").limit(1))).first()
+        if existing is not None:
+            return
+        for key, spec in FACTOR_LIBRARY.items():
+            session.add(Factor(
+                factor_key=key, name=spec.cn, params_json="{}", direction=spec.direction_hint,
+                category=spec.category, source="builtin", enabled=True))
         await session.commit()
 
 

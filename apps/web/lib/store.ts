@@ -113,6 +113,11 @@ interface AppState {
   // 设置中心（spec §5.3）：showSettings 为瞬态（不持久化，刷新回工作台）；settingsSection 持久化。
   showSettings: boolean;
   settingsSection: string;
+  // 因子实验室（因子层 §3.2）：showFactorLab 瞬态（刷新回工作台）；factorLabSection 持久化；
+  // factorOverlay 瞬态（show_factor ui-action 驱动主图叠加因子/得分 pane）。
+  showFactorLab: boolean;
+  factorLabSection: string;
+  factorOverlay: FactorOverlay | null;
 
   setInst: (instId: string) => void;
   setBar: (bar: Bar) => void;
@@ -160,6 +165,16 @@ interface AppState {
   setComboEditingId: (id: number | null) => void;
   setShowSettings: (show: boolean) => void;
   setSettingsSection: (section: string) => void;
+  setShowFactorLab: (show: boolean) => void;
+  setFactorLabSection: (section: string) => void;
+  setFactorOverlay: (overlay: FactorOverlay | null) => void;
+}
+
+// 主图因子叠加指令（show_factor ui-action / 因子实验室「上图」按钮设置）。
+export interface FactorOverlay {
+  kind: "factor" | "score";
+  factorKey?: string;
+  factorSetId?: number;
 }
 
 export const useAppStore = create<AppState>()(
@@ -208,6 +223,10 @@ export const useAppStore = create<AppState>()(
       // 设置中心：默认在工作台（showSettings=false）；默认设置项为「AI 模型服务」。
       showSettings: false,
       settingsSection: "ai-models",
+      // 因子实验室：默认在工作台（showFactorLab=false）；默认工作区为「因子目录」；无叠加。
+      showFactorLab: false,
+      factorLabSection: "catalog",
+      factorOverlay: null,
 
       setInst: (instId) => set({ instId, runId: null, chartView: "live-follow" }),
       setBar: (bar) => set({ bar, runId: null, chartView: "live-follow" }),
@@ -323,6 +342,10 @@ export const useAppStore = create<AppState>()(
       // 设置中心：切换设置面板（瞬态）/ 切换当前设置项（持久化）。
       setShowSettings: (showSettings) => set({ showSettings }),
       setSettingsSection: (settingsSection) => set({ settingsSection }),
+      // 因子实验室：切换面板（瞬态）/ 切换当前工作区（持久化）/ 设置主图叠加（瞬态）。
+      setShowFactorLab: (showFactorLab) => set({ showFactorLab }),
+      setFactorLabSection: (factorLabSection) => set({ factorLabSection }),
+      setFactorOverlay: (factorOverlay) => set({ factorOverlay }),
       // 纵向分栏比例：夹取到 [MIN, MAX]；非有限数忽略（守住边界，与 simBalance 同模式）。
       setChartSplitRatio: (n) =>
         set((s) =>
@@ -362,7 +385,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 16,
+      version: 17,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -393,6 +416,8 @@ export const useAppStore = create<AppState>()(
         comboDraft: s.comboDraft,
         // 持久化当前设置项；showSettings 为瞬态故**不**入 partialize（刷新默认回工作台，R-Migrate）。
         settingsSection: s.settingsSection,
+        // 持久化因子实验室当前工作区；showFactorLab/factorOverlay 为瞬态，**不**入 partialize。
+        factorLabSection: s.factorLabSection,
       }),
       // 逐版补默认态（即便缺省 zustand 浅合并也回落初值，migrate 仅为显式稳妥，R7/R11）。
       migrate: (persisted, version) => {
@@ -460,6 +485,10 @@ export const useAppStore = create<AppState>()(
           // 持久化态无法区分「默认 sim」与「主动选 sim」）；无就绪默认账户者仍由 AccountModeSwitch
           // 水合守门回落 sim，故不会静默进入无凭证的实盘。
           next = { ...next, accountMode: "live" };
+        }
+        if (version < 17) {
+          // 因子层：补因子实验室当前工作区默认（showFactorLab/factorOverlay 为瞬态，不入 partialize）。
+          next = { ...next, factorLabSection: "catalog" };
         }
         return next as never;
       },

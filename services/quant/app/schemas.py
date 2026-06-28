@@ -5,7 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from .db.models import AgentProvider, EquityPoint, OkxAccount, StrategyRun, Trade
+from .db.models import AgentProvider, EquityPoint, Factor, FactorSet, OkxAccount, StrategyRun, Trade
 from .engine.metrics import _empty_metrics
 from .paper.session import PAPER_WINDOW_MAX
 
@@ -678,6 +678,141 @@ class CloseAllOut(BaseModel):
     closedCount: int
     failedCount: int
     results: list[CloseAllResultRow]
+
+
+# ---------------- 因子层（因子计算 / 评估 / 挖掘 / 训练 / 组合，spec §4） ----------------
+def _load_json(raw: str | None, fallback: Any) -> Any:
+    import json
+    try:
+        return json.loads(raw) if raw else fallback
+    except (json.JSONDecodeError, TypeError):
+        return fallback
+
+
+def factor_out(row: Factor) -> dict:
+    """Factor 行 → 前端 dict（camelCase）。``enabled`` 即激活态；``builtin`` = source==builtin。"""
+    return {
+        "id": row.id, "factorKey": row.factor_key, "name": row.name,
+        "params": _load_json(row.params_json, {}), "direction": row.direction,
+        "category": row.category, "source": row.source, "enabled": bool(row.enabled),
+        "builtin": row.source == "builtin", "notes": row.notes,
+        "eval": _load_json(row.eval_json, None),
+        "createdTs": int(row.created_at.timestamp()) if row.created_at else 0,
+        "updatedTs": int(row.updated_at.timestamp()) if row.updated_at else 0,
+    }
+
+
+def factor_set_out(row: FactorSet) -> dict:
+    """FactorSet 行 → 前端 dict（camelCase；含成员快照 + 训练产物 + 复合 IC）。"""
+    return {
+        "id": row.id, "name": row.name, "members": _load_json(row.members_json, []),
+        "method": row.method, "config": _load_json(row.config_json, {}),
+        "model": _load_json(row.model_json, {}), "metrics": _load_json(row.metrics_json, None),
+        "enabled": bool(row.enabled),
+        "createdTs": int(row.created_at.timestamp()) if row.created_at else 0,
+        "updatedTs": int(row.updated_at.timestamp()) if row.updated_at else 0,
+    }
+
+
+class _FactorRange(BaseModel):
+    instId: str = Field(min_length=1, max_length=32)
+    bar: str = "1H"
+    startTs: int = Field(ge=0)
+    endTs: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "_FactorRange":
+        if self.startTs >= self.endTs:
+            raise ValueError("startTs must be less than endTs")
+        return self
+
+
+class FactorMemberIn(BaseModel):
+    """组合成员入参：自包含快照，方向必须冻结为 long/short（不接受 auto，评审 C-P1-1）。"""
+
+    factorKey: str = Field(min_length=1, max_length=64)
+    params: dict[str, Any] = Field(default_factory=dict)
+    weight: float = 0.0
+    direction: Literal["long", "short"]
+
+
+class FactorCreateReq(BaseModel):
+    factorKey: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=128)
+    params: dict[str, Any] = Field(default_factory=dict)
+    direction: Literal["long", "short", "auto"] = "auto"
+    source: Literal["custom", "mined"] = "custom"
+    notes: str = Field(default="", max_length=256)
+
+
+class FactorUpdateReq(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    params: dict[str, Any] | None = None
+    direction: Literal["long", "short", "auto"] | None = None
+    enabled: bool | None = None
+    notes: str | None = Field(default=None, max_length=256)
+
+
+class FactorComputeReq(_FactorRange):
+    factorKey: str = Field(min_length=1, max_length=64)
+    params: dict[str, Any] = Field(default_factory=dict)
+    maxBars: int | None = Field(default=None, ge=10, le=200000)
+
+
+class FactorEvaluateReq(_FactorRange):
+    factorKey: str | None = Field(default=None, max_length=64)
+    factorId: int | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+    direction: Literal["long", "short", "auto"] = "auto"
+    horizons: list[int] | None = Field(default=None, max_length=8)
+    quantiles: int = Field(default=5, ge=2, le=10)
+    maxBars: int | None = Field(default=None, ge=10, le=200000)
+
+
+class FactorMineReq(_FactorRange):
+    categories: list[str] | None = None
+    horizons: list[int] | None = Field(default=None, max_length=8)
+    topN: int = Field(default=20, ge=1, le=100)
+    persist: bool = False
+    maxBars: int | None = Field(default=None, ge=10, le=200000)
+
+
+class FactorTrainReq(_FactorRange):
+    members: list[FactorMemberIn] = Field(min_length=1, max_length=12)
+    method: Literal["equal", "ic_weight", "linear", "random_forest", "xgboost"] = "linear"
+    config: dict[str, Any] = Field(default_factory=dict)
+    horizon: int = Field(default=6, ge=1, le=100)
+    maxBars: int | None = Field(default=None, ge=10, le=200000)
+
+
+class FactorSetCreateReq(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    members: list[FactorMemberIn] = Field(min_length=1, max_length=12)
+    method: Literal["equal", "ic_weight", "linear", "random_forest", "xgboost"] = "linear"
+    modelJson: dict[str, Any] = Field(default_factory=dict)
+    metricsJson: dict[str, Any] | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class FactorSetUpdateReq(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    members: list[FactorMemberIn] | None = None
+    method: Literal["equal", "ic_weight", "linear", "random_forest", "xgboost"] | None = None
+    modelJson: dict[str, Any] | None = None
+    metricsJson: dict[str, Any] | None = None
+    config: dict[str, Any] | None = None
+    enabled: bool | None = None
+
+
+class FactorScoreReq(_FactorRange):
+    maxBars: int | None = Field(default=None, ge=10, le=200000)
+
+
+class FactorScoreInlineReq(_FactorRange):
+    members: list[FactorMemberIn] = Field(min_length=1, max_length=12)
+    thresholds: dict[str, Any] = Field(default_factory=dict)
+    maxBars: int | None = Field(default=None, ge=10, le=200000)
 
 
 class ErrorBody(BaseModel):

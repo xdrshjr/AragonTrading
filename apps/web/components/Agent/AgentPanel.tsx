@@ -151,7 +151,20 @@ export default function AgentPanel() {
           setMessages((prev) => reduceAgentEvent(prev, ev));
           break;
         case "ui_action":
-          applyShowChart(ev.data, uiActionStore());
+          if (ev.data.action === "show_factor") {
+            const st = useAppStore.getState();
+            if (ev.data.instId) st.setInst(ev.data.instId);
+            if (ev.data.bar) st.setBar(ev.data.bar);
+            st.setFactorOverlay({
+              kind: ev.data.factorSetId != null ? "score" : "factor",
+              factorKey: ev.data.factorKey,
+              factorSetId: ev.data.factorSetId,
+            });
+            st.setFactorLabSection(ev.data.factorSetId != null ? "builder" : "evaluate");
+            st.setShowFactorLab(true);
+          } else {
+            applyShowChart(ev.data, uiActionStore());
+          }
           break;
         case "resumed":
           handleResumed(ev.data);

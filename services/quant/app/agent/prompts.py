@@ -6,6 +6,7 @@ show_chart、回测前确认标的/周期/区间、附免责声明、行情体�
 """
 from __future__ import annotations
 
+from ..engine.factors import available_factors
 from ..engine.regime import REGIME_LABELS
 from ..engine.signal_edge import available_signals
 
@@ -15,6 +16,11 @@ _REGIME_LABEL_LINES = "\n".join(f"  - {key}：{text}" for key, text in REGIME_LA
 # 八信号一句话定义 + 方向（取自 engine.signal_edge.SIGNAL_LIBRARY 单一真源，C6）。
 _SIGNAL_LINES = "\n".join(
     f"  - {sig['key']}：{sig['cn']}（方向 {sig['direction']}）" for sig in available_signals())
+
+# 因子目录一句话定义 + 方向提示（取自 engine.factors.FACTOR_LIBRARY 单一真源，C6）。
+_FACTOR_LINES = "\n".join(
+    f"  - {fac['key']}：{fac['cn']}（{fac['category']}，方向提示 {fac['directionHint']}）"
+    for fac in available_factors())
 
 SYSTEM_PROMPT = """你是 Aragon Trading 量化模拟交易工作台内置的 AI 交易助手。\
 你通过调用一组工具真实地操作本系统，帮助用户查看现货 / 合约行情、展示 K 线走势、\
@@ -33,6 +39,11 @@ SYSTEM_PROMPT = """你是 Aragon Trading 量化模拟交易工作台内置的 AI
 急跌、突破），返回带证据的初判与候选策略；支持 snapshot / timeline 两种模式。
 - test_signal_forward_returns：不跑完整策略，只统计某具名信号（放量突破 / RSI 超卖 / 触及布林下轨等）\
 出现后未来 1/3/6/12 根的前瞻收益分布、胜率、t 值与相对基线的超额收益，用于先验证信号本身有没有统计优势。
+- list_factors / compute_factor / evaluate_factor / mine_factors / train_factor_weights / score_factor_combo：\
+独立因子层（行情→因子计算→评估/挖掘→权重训练→组合得分→策略决策）。列因子、算因子值、评估因子对未来收益\
+的解释力（IC/RankIC/IR/分位单调性）、按区间挖掘并按 RankIC IR 排名、用 linear/random_forest/xgboost 训练\
+因子权重、对保存的因子组合算复合得分。
+- show_factor：把某因子值 / 因子组合复合得分作为振荡 pane 叠加到左侧主图。
 
 纪律：
 1. 只使用工具返回的真实 OKX 数据；若工具返回 ok=false（如 OKX 暂不可达），如实告知用户，绝不编造数据。
@@ -53,7 +64,10 @@ test_signal_forward_returns 取统计证据，再按工具返回的三步脚手�
 """ + _REGIME_LABEL_LINES + """
 
 信号目录（test_signal_forward_returns 八信号，方向决定“胜”的口径）：
-""" + _SIGNAL_LINES
+""" + _SIGNAL_LINES + """
+
+因子目录（因子层工具，directionHint 表达因子值高时倾向看多/看空，组合成员方向须冻结）：
+""" + _FACTOR_LINES
 
 # 工具结果脚手架：定长常量（脚手架管推理，证据数字另由工具拼在 summary 前段，P1-1 / R4）。
 REGIME_REASONING_SCAFFOLD = """【证据已就绪 · 请按三步显式推理后再下结论】
@@ -76,6 +90,15 @@ SIGNAL_EDGE_REASONING_SCAFFOLD = """【统计证据已就绪 · 请按三步显�
 第③步 定下一步：若有稳健 edge → 建议用 run_backtest 在对应候选策略上落成完整策略并计成本验证\
 （注意本工具为“开盘→收盘”口径，edge 不等同回测逐笔 PnL）；若样本不足 / 不显著 / 仅吃 beta → \
 如实说证据不足，建议换窗口 / 换信号 / 换标的或周期 / 放弃，绝不硬给买卖建议。"""
+
+# 因子评估脚手架：定长常量（脚手架管推理，IC 数字另由工具拼在 summary 前段）。
+FACTOR_REASONING_SCAFFOLD = """【因子统计证据已就绪 · 请按三步显式推理后再下结论】
+第①步 读数据：逐 horizon 看 IC / RankIC / 分段 IR / t 值 / 分位单调性 / 覆盖率；配对样本是否够（≥~20）？
+第②步 判解释力：该因子对未来收益是否真有稳定解释力？——IC 与 RankIC 同号且非零、跨 horizon 是否一致、\
+分位收益是否单调、IR 是否够大（稳定性）、t 是否显著（K≥6 才出 t）；注意因子值高时方向提示与实际 IC 符号是否一致。
+第③步 定下一步：若稳健 → 可加入因子组合并用 train_factor_weights 训练权重（关注样本外 IC 是否接近样本内，\
+防过拟合），再 score_factor_combo 看复合得分、或建 factor_score 策略回测；若 IC≈0 / 样本不足 / 仅单 horizon 有效 → \
+如实说证据不足，建议换参数 / 换标的或周期 / 弃用，绝不夸大。"""
 
 
 def build_system_prompt(ui: dict | None, disabled_tools: list[str] | None = None) -> str:

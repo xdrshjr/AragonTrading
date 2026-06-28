@@ -20,6 +20,15 @@ from .run_tools import (
     GetRunTradesTool,
     ListRunsTool,
 )
+from .factor_tools import (
+    ComputeFactorTool,
+    EvaluateFactorTool,
+    ListFactorsTool,
+    MineFactorsTool,
+    ScoreFactorComboTool,
+    ShowFactorTool,
+    TrainFactorWeightsTool,
+)
 from .signal_tools import TestSignalForwardReturnsTool
 from .strategy_tools import CompareStrategiesTool, ListStrategiesTool, RunBacktestTool
 from .ui_tools import ShowChartTool
@@ -40,6 +49,13 @@ _ALL_TOOLS: list[Tool] = [
     GetRunMetricsTool(),
     GetRunTradesTool(),
     GetRunEquityTool(),
+    ListFactorsTool(),
+    ComputeFactorTool(),
+    EvaluateFactorTool(),
+    MineFactorsTool(),
+    TrainFactorWeightsTool(),
+    ScoreFactorComboTool(),
+    ShowFactorTool(),
 ]
 
 
