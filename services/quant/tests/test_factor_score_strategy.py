@@ -98,6 +98,22 @@ def test_snapshot_uses_trained_norm_window_over_thresholds():
     assert np.allclose(merged.iloc[:, 0].to_numpy(), merged.iloc[:, 1].to_numpy())
 
 
+def test_provenance_in_snapshot_does_not_affect_scoring():
+    """L4：快照带 provenance 仅供 UI 展示，prepare 打分与不带 provenance 时逐字一致（绝不参与打分）。"""
+    members = [{"factorKey": "mom_roc", "params": {"win": 20}, "direction": "long", "weight": 0.6},
+               {"factorKey": "rev_rsi", "params": {}, "direction": "short", "weight": 0.4}]
+    df = candles_to_df(make_synthetic_candles(320, step=3600))
+    snapshot = {"members": members, "thresholds": {"normWindow": 80, "squash": True},
+                "normStats": {"normWindow": 80, "clip": 4.0}}
+    base = FactorScoreStrategy({**snapshot})
+    with_prov = FactorScoreStrategy({**snapshot, "provenance": {
+        "instId": "BTC-USDT-SWAP", "bar": "1H", "startTs": 1, "endTs": 2, "horizon": 6}})
+    merged = pd.concat([base.prepare(df, "1H")["_score"], with_prov.prepare(df, "1H")["_score"]],
+                       axis=1).dropna()
+    assert len(merged) > 0
+    assert np.allclose(merged.iloc[:, 0].to_numpy(), merged.iloc[:, 1].to_numpy())
+
+
 def test_threshold_produces_long_and_short_signals():
     """构造得分穿越阈值 → 产出多 / 空 / 平信号（on_candle 逻辑直测）。"""
     import pandas as pd

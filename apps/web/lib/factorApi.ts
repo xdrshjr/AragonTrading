@@ -54,10 +54,19 @@ export const factorApi = {
   library: () => request<FactorLibraryItem[]>("/factors/library"),
   trainers: () => request<TrainerInfo[]>("/factors/trainers"),
 
-  list: (filter?: { enabled?: boolean; category?: string }) => {
+  list: (filter?: {
+    enabled?: boolean;
+    category?: string;
+    q?: string;
+    source?: FactorSource;
+    sort?: "rankic" | "name" | "created";
+  }) => {
     const params = new URLSearchParams();
     if (filter?.enabled != null) params.set("enabled", String(filter.enabled));
     if (filter?.category) params.set("category", filter.category);
+    if (filter?.q) params.set("q", filter.q);
+    if (filter?.source) params.set("source", filter.source);
+    if (filter?.sort) params.set("sort", filter.sort);
     const qs = params.toString();
     return request<Factor[]>(`/factors${qs ? `?${qs}` : ""}`);
   },

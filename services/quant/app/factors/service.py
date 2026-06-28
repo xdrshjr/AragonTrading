@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 
 import numpy as np
@@ -30,6 +32,7 @@ from ..engine.factors import (
     evaluate_factor_key,
     factor_meta,
     forward_return_label,
+    is_bar_compatible,
     mine_factors,
     mining_workload,
     resolve_norm_contract,
@@ -42,6 +45,7 @@ from .specs import (
     members_from_set_row,
     norm_stats_from_set_row,
     normalize_thresholds,
+    provenance_from_set_row,
     thresholds_from_set_row,
     validate_factor_key,
     validate_members,
@@ -59,12 +63,46 @@ class FactorWindow:
     max_bars: int | None = None
 
 
+# 多步因子工作流（mine→evaluate→train→score）同窗取数复用：有界、短 TTL、**仅缓存成功取到的真实
+# K 线**的进程内缓存（L6）。历史 K 线不可变，blast radius 小；未命中仍真实取数、OKX 不可达仍由
+# load_range_candles 显式报错（绝不以缓存假装实时）。命中返回 ``.copy()`` 防下游就地改列污染缓存（评审 P1-3）。
+_CANDLE_CACHE_TTL_SECONDS = 90.0
+_CANDLE_CACHE_CAP = 16
+_candle_cache: "OrderedDict[tuple, tuple[float, pd.DataFrame]]" = OrderedDict()
+
+
+def clear_candle_cache() -> None:
+    """清空进程内取数缓存（测试隔离用：测试共享进程，须能清缓存防串扰，呼应 aragon-quant-test-isolation）。"""
+    _candle_cache.clear()
+
+
+def _candle_cache_key(window: FactorWindow) -> tuple:
+    return (window.inst_id, window.bar, window.start_ts, window.end_ts, window.max_bars)
+
+
 async def _load_df(rest, window: FactorWindow) -> pd.DataFrame:
-    """全区间分页取真实 OKX K 线 → 升序 DataFrame（空区间由 load_range_candles 抛 400）。"""
+    """全区间分页取真实 OKX K 线 → 升序 DataFrame（空区间由 load_range_candles 抛 400）。
+
+    命中未过期缓存即复用（返回防御性拷贝）；未命中走真实取数后写缓存并按 LRU+TTL 淘汰（L6）。
+    """
+    key = _candle_cache_key(window)
+    now = time.monotonic()
+    cached = _candle_cache.get(key)
+    if cached is not None:
+        cached_at, cached_df = cached
+        if now - cached_at <= _CANDLE_CACHE_TTL_SECONDS:
+            _candle_cache.move_to_end(key)
+            return cached_df.copy()
+        del _candle_cache[key]
     candles = await load_range_candles(
         rest, inst_id=window.inst_id, bar=window.bar, start_ts=window.start_ts,
         end_ts=window.end_ts, max_bars=window.max_bars)
-    return candles_to_df(candles)
+    df = candles_to_df(candles)
+    _candle_cache[key] = (now, df)
+    _candle_cache.move_to_end(key)
+    while len(_candle_cache) > _CANDLE_CACHE_CAP:
+        _candle_cache.popitem(last=False)
+    return df.copy()
 
 
 def _series_points(df: pd.DataFrame, series: pd.Series) -> tuple[list[dict], float]:
@@ -77,13 +115,22 @@ def _series_points(df: pd.DataFrame, series: pd.Series) -> tuple[list[dict], flo
 
 
 # ============================ 计算 / 评估 / 挖掘 ============================
+def _members_bar_incompatible(members: list[dict], bar: str) -> bool:
+    """组合任一成员对当前 bar 不兼容（日内因子用于非日内 bar → 全 NaN）（L5）。"""
+    return any(not is_bar_compatible(m.get("factorKey", ""), bar) for m in members)
+
+
 async def compute(rest, window: FactorWindow, *, factor_key: str, params: dict | None) -> dict:
-    """计算单因子值序列（上图用）：``{instId,bar,points:[{ts,value}],coverage}``。"""
+    """计算单因子值序列（上图用）：``{instId,bar,points:[{ts,value}],coverage[,note]}``。"""
     validate_factor_key(factor_key)
     df = await _load_df(rest, window)
     series = await run_in_threadpool(compute_factor, df, factor_key, params, bar=window.bar)
     points, coverage = _series_points(df, series)
-    return {"instId": window.inst_id, "bar": window.bar, "points": points, "coverage": coverage}
+    out = {"instId": window.inst_id, "bar": window.bar, "points": points, "coverage": coverage}
+    # 日内限定因子用于非日内 bar → 全 NaN；如实标注而非静默空白（L5）。
+    if not is_bar_compatible(factor_key, window.bar):
+        out["note"] = "bar_incompatible"
+    return out
 
 
 async def evaluate(session: AsyncSession, rest, window: FactorWindow, *, factor_key: str,
@@ -97,6 +144,9 @@ async def evaluate(session: AsyncSession, rest, window: FactorWindow, *, factor_
         horizons=horizons, quantiles=quantiles)
     result.instId = window.inst_id
     payload = eval_result_to_dict(result)
+    # 日内限定因子用于非日内 bar → 全 NaN 评估，标注原因（与 samples_sparse 区分）（L5）。
+    if not is_bar_compatible(factor_key, window.bar):
+        payload["note"] = "bar_incompatible"
     if factor_id is not None:
         await repo.set_factor_eval(session, factor_id, payload)
     return payload
@@ -194,9 +244,13 @@ async def _train_weights_guarded(matrix, label, names, method: str, config: dict
 
 
 def resolve_set_to_spec(row: FactorSet) -> dict:
-    """因子组合行 → ``{members, thresholds, normStats}`` 自包含快照（创建 factor_score 策略时内联，C-P1-2/H2）。"""
+    """因子组合行 → ``{members, thresholds, normStats, provenance}`` 自包含快照（创建 factor_score 策略时内联，C-P1-2/H2）。
+
+    ``provenance`` 为单源 / 前瞻性补全（仅供 UI 展示训练区间，绝不参与打分）；当前唯一建策略入口是前端
+    createStrategy 内联快照，本解析器供未来「从已保存组合直接建策略」的服务端路径复用（评审 P2-2/L4）。
+    """
     return {"members": members_from_set_row(row), "thresholds": thresholds_from_set_row(row),
-            "normStats": norm_stats_from_set_row(row)}
+            "normStats": norm_stats_from_set_row(row), "provenance": provenance_from_set_row(row)}
 
 
 def _score_payload(df: pd.DataFrame, points: list[dict], norm_window: int) -> dict:
@@ -221,7 +275,12 @@ async def score_set(rest, window: FactorWindow, row: FactorSet) -> dict:
         compose_score, df, spec["members"], None,
         norm_window=norm_window, clip=clip,
         squash=bool(thresholds.get("squash", True)), bar=window.bar)
-    return _score_payload(df, score_points(df, score), norm_window)
+    payload = _score_payload(df, score_points(df, score), norm_window)
+    # 组合任一成员对当前 bar 不兼容 → bar_incompatible 优先于 window_too_short（L5）。
+    if _members_bar_incompatible(spec["members"], window.bar):
+        payload.pop("minBarsRequired", None)
+        payload["note"] = "bar_incompatible"
+    return payload
 
 
 async def score_inline(rest, window: FactorWindow, *, members: list[dict],
@@ -238,4 +297,9 @@ async def score_inline(rest, window: FactorWindow, *, members: list[dict],
         compose_score, df, members, None,
         norm_window=norm_window, clip=clip,
         squash=bool(resolved.get("squash", True)), bar=window.bar)
-    return _score_payload(df, score_points(df, score), norm_window)
+    payload = _score_payload(df, score_points(df, score), norm_window)
+    # 组合任一成员对当前 bar 不兼容 → bar_incompatible 优先于 window_too_short（L5）。
+    if _members_bar_incompatible(members, window.bar):
+        payload.pop("minBarsRequired", None)
+        payload["note"] = "bar_incompatible"
+    return payload

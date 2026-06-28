@@ -62,8 +62,11 @@ async def factor_trainers() -> list[dict]:
 
 @router.get("/factors")
 async def list_factors(enabled: bool | None = Query(None), category: str | None = Query(None),
+                       q: str | None = Query(None), source: str | None = Query(None),
+                       sort: str | None = Query(None),
                        session: AsyncSession = Depends(get_session)) -> list[dict]:
-    rows = await repo.list_factors(session, enabled=enabled, category=category)
+    rows = await repo.list_factors(session, enabled=enabled, category=category,
+                                   q=q, source=source, sort=sort)
     return [factor_out(r) for r in rows]
 
 

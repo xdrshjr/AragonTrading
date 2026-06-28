@@ -8,6 +8,8 @@ import {
   applyWeights,
   directionLabel,
   formatIc,
+  freezeMemberDirection,
+  memberIdentity,
   overfitWarning,
   validateMembers,
   weightBars,
@@ -16,6 +18,7 @@ import {
 import { factorApi } from "@/lib/factorApi";
 import {
   DEFAULT_THRESHOLDS,
+  type Factor,
   type FactorLibraryItem,
   type FactorMember,
   type FactorThresholds,
@@ -50,13 +53,19 @@ export default function FactorSetBuilder() {
   const [trained, setTrained] = useState<TrainResult | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  // 合并跨工作区「加入组合」的待入成员（去重后并入，随即清空待入队列防重复并入）。
+  // 合并跨工作区「加入组合」的待入成员（按 memberIdentity 去重后并入，随即清空待入队列防重复并入）。
+  // 去重键含规范化 params（评审 P1-1），避免静默丢弃同 key 不同参的挖掘变体。
   useEffect(() => {
     if (wb.pendingMembers.length === 0) return;
     setMembers((prev) => {
       const merged = [...prev];
+      const seen = new Set(merged.map(memberIdentity));
       for (const m of wb.pendingMembers) {
-        if (!merged.some((x) => x.factorKey === m.factorKey && x.direction === m.direction)) merged.push(m);
+        const id = memberIdentity(m);
+        if (!seen.has(id)) {
+          merged.push(m);
+          seen.add(id);
+        }
       }
       return merged;
     });
@@ -115,11 +124,13 @@ export default function FactorSetBuilder() {
       api.createStrategy({
         templateKey: "factor_score",
         name: `${name} · 得分策略`,
-        // 新建快照：训练权重烘焙进成员、不再写顶层 weights；带 normStats 供打分取同一归一化契约（H2/H3）。
+        // 新建快照（结构对齐 FactorScoreSnapshotParams）：训练权重烘焙进成员、不再写顶层 weights；带 normStats
+        // 供打分取同一归一化契约（H2/H3）；带 provenance 供 StrategyDetail 如实展示训练区间（仅 UI 展示，L4）。
         params: {
           members: applyWeights(members, trained?.weights),
           thresholds: { ...thresholds },
           normStats: trained?.normStats,
+          provenance: trained?.provenance,
         },
       }),
     onSuccess: (strategy) => {
@@ -136,7 +147,12 @@ export default function FactorSetBuilder() {
       <MemberPicker
         library={lib.data ?? []}
         members={members}
-        onAdd={(member) => setMembers((prev) => [...prev, member])}
+        onAdd={(member) =>
+          setMembers((prev) =>
+            // 同一身份（key+规范化 params+方向）只允许一条；同 key 不同参的挖掘变体均可加入（评审 P1-1）。
+            prev.some((x) => memberIdentity(x) === memberIdentity(member)) ? prev : [...prev, member],
+          )
+        }
         onRemove={(i) => setMembers((prev) => prev.filter((_, idx) => idx !== i))}
         onDirection={(i, direction) =>
           setMembers((prev) => prev.map((m, idx) => (idx === i ? { ...m, direction } : m)))
@@ -223,6 +239,116 @@ export default function FactorSetBuilder() {
   );
 }
 
+// 同 factorKey 的挖掘变体大量重名，用「名称 · key · 关键参数」消歧（评审 P1-1）。
+function myFactorOptionLabel(f: Factor): string {
+  const params =
+    f.params && Object.keys(f.params).length > 0
+      ? ` · ${Object.entries(f.params)
+          .map(([k, v]) => `${k}=${String(v)}`)
+          .join(",")}`
+      : "";
+  return `${f.name} · ${f.factorKey}${params}`;
+}
+
+// 来源「库目录」：从静态因子库选入（可发现性不受 enabled 影响——库是能力清单，不是启用清单）。
+function LibrarySourcePicker({
+  library,
+  onAdd,
+}: {
+  library: FactorLibraryItem[];
+  onAdd: (member: FactorMember) => void;
+}) {
+  const [pick, setPick] = useState("");
+  return (
+    <div className="flex items-center gap-1.5">
+      <Select value={pick} onChange={(e) => setPick(e.target.value)} className="py-1 text-xs">
+        <option value="">选择因子…</option>
+        {library.map((f) => (
+          <option key={f.key} value={f.key}>
+            {f.cn}
+            {f.intradayOnly ? "（仅日内）" : ""}
+          </option>
+        ))}
+      </Select>
+      <Button
+        variant="default"
+        size="sm"
+        disabled={!pick}
+        onClick={() => {
+          const item = library.find((f) => f.key === pick);
+          if (item) onAdd({ factorKey: item.key, params: {}, weight: 0, direction: item.directionHint });
+          setPick("");
+        }}
+      >
+        添加
+      </Button>
+    </div>
+  );
+}
+
+// 来源「我的因子」：候选仅为 enabled==true 的已存因子（"取消激活"真正阻止其进入新组合，L2 闭环）；
+// 选中即用该因子自己的 params + 冻结方向加入；同 key 不同参的挖掘变体均可加入（去重在父层按 memberIdentity 处理）。
+function MyFactorsSourcePicker({
+  library,
+  onAdd,
+}: {
+  library: FactorLibraryItem[];
+  onAdd: (member: FactorMember) => void;
+}) {
+  const [pick, setPick] = useState("");
+  const enabledFactors = useQuery({
+    queryKey: ["factor", "list", { enabled: true }],
+    queryFn: () => factorApi.list({ enabled: true }),
+  });
+  const factors = enabledFactors.data ?? [];
+  const empty = !enabledFactors.isLoading && !enabledFactors.isError && factors.length === 0;
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <div className="flex items-center gap-1.5">
+        <Select
+          value={pick}
+          onChange={(e) => setPick(e.target.value)}
+          className="max-w-[220px] py-1 text-xs"
+          disabled={factors.length === 0}
+        >
+          <option value="">选择激活因子…</option>
+          {factors.map((f) => (
+            <option key={f.id} value={String(f.id)}>
+              {myFactorOptionLabel(f)}
+            </option>
+          ))}
+        </Select>
+        <Button
+          variant="default"
+          size="sm"
+          disabled={!pick}
+          onClick={() => {
+            const f = factors.find((x) => String(x.id) === pick);
+            if (f)
+              onAdd({
+                factorKey: f.factorKey,
+                params: f.params,
+                weight: 0,
+                direction: freezeMemberDirection(f, library),
+              });
+            setPick("");
+          }}
+        >
+          添加
+        </Button>
+      </div>
+      {enabledFactors.isError && (
+        <span className="text-[10px] text-[var(--short)]">加载因子失败，请重试</span>
+      )}
+      {empty && (
+        <span className="max-w-[260px] text-right text-[10px] text-[var(--muted)]">
+          暂无激活因子，去「我的因子」启用或在「因子挖掘」保存结果
+        </span>
+      )}
+    </div>
+  );
+}
+
 function MemberPicker({
   library,
   members,
@@ -236,36 +362,45 @@ function MemberPicker({
   onRemove: (index: number) => void;
   onDirection: (index: number, direction: "long" | "short") => void;
 }) {
-  const [pick, setPick] = useState("");
+  const [source, setSource] = useState<"library" | "mine">("library");
   const cn = (key: string) => library.find((f) => f.key === key)?.cn ?? key;
   return (
     <div className="card flex flex-col gap-3 p-3">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="text-sm font-semibold text-[var(--text)]">组合成员（{members.length}）</span>
-        <div className="flex items-center gap-1.5">
-          <Select value={pick} onChange={(e) => setPick(e.target.value)} className="py-1 text-xs">
-            <option value="">选择因子…</option>
-            {library.map((f) => (
-              <option key={f.key} value={f.key}>{f.cn}</option>
+        <div className="flex items-center gap-2">
+          <div className="flex gap-0.5 rounded-[8px] bg-[var(--surface-2)] p-0.5">
+            {(
+              [
+                ["library", "库目录"],
+                ["mine", "我的因子"],
+              ] as const
+            ).map(([val, label]) => (
+              <button
+                key={val}
+                type="button"
+                onClick={() => setSource(val)}
+                className={
+                  "rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-all " +
+                  (source === val
+                    ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                    : "text-[var(--muted)] hover:text-[var(--text)]")
+                }
+              >
+                {label}
+              </button>
             ))}
-          </Select>
-          <Button
-            variant="default"
-            size="sm"
-            disabled={!pick}
-            onClick={() => {
-              const item = library.find((f) => f.key === pick);
-              if (item) onAdd({ factorKey: item.key, params: {}, weight: 0, direction: item.directionHint });
-              setPick("");
-            }}
-          >
-            添加
-          </Button>
+          </div>
+          {source === "library" ? (
+            <LibrarySourcePicker library={library} onAdd={onAdd} />
+          ) : (
+            <MyFactorsSourcePicker library={library} onAdd={onAdd} />
+          )}
         </div>
       </div>
       {members.length === 0 ? (
         <p className="py-3 text-center text-[11px] text-[var(--muted)]">
-          从上方选择因子，或在「因子评估」/「因子挖掘」中「加入组合」。
+          从上方「库目录」/「我的因子」选择，或在「因子评估」/「因子挖掘」中「加入组合」。
         </p>
       ) : (
         <ul className="flex flex-col gap-1.5">

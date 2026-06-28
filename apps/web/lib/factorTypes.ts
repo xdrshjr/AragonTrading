@@ -88,6 +88,8 @@ export interface FactorComputeResult {
   bar: string;
   points: FactorPoint[];
   coverage: number;
+  // 因子对当前 bar 不兼容（日内因子用于非日内周期）时后端附 note:"bar_incompatible"（L5）；旧响应无此字段，缺省安全。
+  note?: string;
 }
 
 // 挖掘结果（POST /factors/mine）。
@@ -195,9 +197,17 @@ export interface FactorScoreResult {
   points: ScorePoint[];
   latest: number | null;
   coverage: number;
-  // 区间过短时（无任何有效得分点）后端附此提示（H6）；旧响应无此字段，缺省安全。
+  // 区间过短（window_too_short，H6）或成员对当前 bar 不兼容（bar_incompatible，L5）时后端附此提示；旧响应无此字段，缺省安全。
   note?: string;
   minBarsRequired?: number;
+}
+
+// factor_score 策略内联快照 params（自包含；provenance 仅供 UI 展示训练区间，绝不参与打分，L4）。
+export interface FactorScoreSnapshotParams {
+  members: FactorMember[];
+  thresholds: FactorThresholds;
+  normStats?: { normWindow: number; clip: number };
+  provenance?: TrainProvenance;
 }
 
 export const DEFAULT_THRESHOLDS: FactorThresholds = {

@@ -696,15 +696,57 @@ class FactorPatch:
     notes: str | None = None
 
 
+_FACTOR_SOURCES = ("builtin", "mined", "custom")
+_FACTOR_SEARCH_MAX_LEN = 100    # q 长度上界（避免超长子串扫描，评审 P2-6）
+
+
+def _primary_rankic(row: Factor) -> float | None:
+    """因子缓存 ``eval_json`` 里**最小 horizon 的 ``rankIc``**（camelCase），无缓存 / 空则 ``None``（L3）。
+
+    必须与前端 ``primaryRankIc``（``factor.ts``：按 ``h`` 升序取首项 ``rankIc``）**逐字对齐**，否则
+    ``sort=rankic`` 服务端顺序会与列内显示值静默错位（评审 P1-2）。缓存键即 camelCase（``evaluation.py``）。
+    """
+    try:
+        cached = json.loads(row.eval_json or "")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    horizons = cached.get("horizons") if isinstance(cached, dict) else None
+    if not isinstance(horizons, list) or not horizons:
+        return None
+    first = min(horizons, key=lambda h: h.get("h", 0) if isinstance(h, dict) else 0)
+    value = first.get("rankIc") if isinstance(first, dict) else None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
 async def list_factors(session: AsyncSession, *, enabled: bool | None = None,
-                       category: str | None = None) -> list[Factor]:
-    """已存因子列表（builtin 在前、同类按 id 升序），支持激活态 / 类别过滤。"""
-    stmt = select(Factor).order_by((Factor.source != "builtin"), Factor.id.asc())
+                       category: str | None = None, q: str | None = None,
+                       source: str | None = None, sort: str | None = None) -> list[Factor]:
+    """已存因子列表，支持激活态 / 类别 / 名称·key 子串 / 来源过滤 + 排序（L3）。
+
+    ``q`` 子串匹配 name/factor_key（``ilike``，长度上界）；``source`` 仅接受白名单否则忽略该过滤；
+    ``sort`` ∈ {rankic,name,created}，``rankic`` 在 Python 层按 ``_primary_rankic`` 降序、``None`` 沉底
+    （SQL 取不到 JSON 内 RankIC）；缺省 / 未知排序保持「builtin 在前、id 升序」。
+    """
+    stmt = select(Factor)
     if enabled is not None:
         stmt = stmt.where(Factor.enabled == enabled)
     if category:
         stmt = stmt.where(Factor.category == category)
-    return list((await session.execute(stmt)).scalars().all())
+    if source in _FACTOR_SOURCES:
+        stmt = stmt.where(Factor.source == source)
+    if q:
+        needle = f"%{q.strip()[:_FACTOR_SEARCH_MAX_LEN]}%"
+        stmt = stmt.where(Factor.name.ilike(needle) | Factor.factor_key.ilike(needle))
+    if sort == "name":
+        stmt = stmt.order_by(Factor.name.asc())
+    elif sort == "created":
+        stmt = stmt.order_by(Factor.created_at.desc())
+    else:
+        stmt = stmt.order_by((Factor.source != "builtin"), Factor.id.asc())
+    rows = list((await session.execute(stmt)).scalars().all())
+    if sort == "rankic":
+        rows.sort(key=lambda r: (_primary_rankic(r) is None, -(_primary_rankic(r) or 0.0)))
+    return rows
 
 
 async def get_factor(session: AsyncSession, factor_id: int) -> Factor | None:
@@ -739,6 +781,10 @@ async def update_factor(session: AsyncSession, factor_id: int, *,
         row.enabled = patch.enabled
     if patch.notes is not None:
         row.notes = patch.notes
+    # 参数 / 方向变更使旧评估缓存失效（避免「我的因子」静默展示陈旧 / 符号错的 RankIC，L1）。
+    # 保守失效：PUT 同值也会清缓存（安全偏向，绝不展示陈旧）；重算交由显式 evaluate。
+    if patch.params is not None or patch.direction is not None:
+        row.eval_json = None
     await session.commit()
     await session.refresh(row)
     return row

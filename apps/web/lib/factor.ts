@@ -1,7 +1,9 @@
 // 因子层纯展示 / 几何 helper（IC 格式化、IC 曲线 / 分位条 / 权重条几何、组合校验、过拟合提示）。
 // 与 format.ts / combo.ts 同约定：纯函数 + 同名 factor.test.ts 单测，组件只消费此处逻辑。
 import type {
+  Factor,
   FactorHorizonStat,
+  FactorLibraryItem,
   FactorMember,
   FrozenDirection,
   QuantileBucket,
@@ -195,4 +197,38 @@ export function primaryRankIc(horizons: FactorHorizonStat[]): number | null {
   if (horizons.length === 0) return null;
   const sorted = [...horizons].sort((a, b) => a.h - b.h);
   return sorted[0].rankIc;
+}
+
+// 把已存因子的方向冻结为 long/short 以选入组合：long/short 复用 freezeDirection 保持口径一致；
+// auto（尚未评估定号）回落库 directionHint（合理默认），缺失再回落 "long"（绝不把 auto 带进组合，C-P1-1）。
+export function freezeMemberDirection(
+  factor: Pick<Factor, "factorKey" | "direction">,
+  library: FactorLibraryItem[],
+): FrozenDirection {
+  if (factor.direction === "long" || factor.direction === "short") return freezeDirection(factor.direction);
+  return library.find((f) => f.key === factor.factorKey)?.directionHint ?? "long";
+}
+
+// 稳定序列化（递归按键排序），让 memberIdentity 对同 params 不同书写顺序产出同一身份键。
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+  const obj = value as Record<string, unknown>;
+  return `{${Object.keys(obj)
+    .sort()
+    .map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`)
+    .join(",")}}`;
+}
+
+// 成员去重唯一身份键＝`factorKey | 规范化(params) | direction`，镜像后端 _factor_dedupe_key：含规范化 params，
+// 避免按 (key,direction) 去重时静默丢弃同 key 不同参的挖掘变体（评审 P1-1）。
+export function memberIdentity(
+  member: Pick<FactorMember, "factorKey" | "direction"> & { params?: Record<string, unknown> },
+): string {
+  return `${member.factorKey}|${stableStringify(member.params ?? {})}|${member.direction}`;
+}
+
+// 两个 [start,end] 区间是否重叠（相邻端点不算重叠）；用于判定回测区间与训练区间是否重叠（样本内提示，L4）。
+export function rangesOverlap(aStart: number, aEnd: number, bStart: number, bEnd: number): boolean {
+  return aStart < bEnd && bStart < aEnd;
 }

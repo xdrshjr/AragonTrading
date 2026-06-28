@@ -310,6 +310,168 @@ async def test_disabled_factor_excluded_from_enabled_filter(patch_okx):
         await dispose_engine()
 
 
+async def test_edit_params_or_direction_invalidates_eval(patch_okx):
+    """编辑 params / 翻方向使评估缓存失效（避免静默展示陈旧 / 符号错的 RankIC，L1）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    try:
+        async with client:
+            created = await client.post("/api/factors", json={
+                "factorKey": "mom_roc", "name": "L1 缓存", "params": {"win": 20}, "direction": "long"})
+            fid = created.json()["id"]
+            # 评估并缓存 eval_json（带 factorId）
+            await client.post("/api/factors/evaluate",
+                              json={"factorId": fid, "direction": "auto", **_RANGE})
+            assert (await client.get("/api/factors")).json()  # touch
+            before = next(f for f in (await client.get("/api/factors")).json() if f["id"] == fid)
+            assert before["eval"] is not None
+            # 翻方向 → 缓存清空
+            await client.put(f"/api/factors/{fid}", json={"direction": "short"})
+            after = next(f for f in (await client.get("/api/factors")).json() if f["id"] == fid)
+            assert after["eval"] is None
+    finally:
+        await dispose_engine()
+
+
+async def test_edit_name_preserves_eval(patch_okx):
+    """仅改 name（不影响评估结果）保留 eval 缓存（L1：只在 params/direction 变更时失效）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    try:
+        async with client:
+            created = await client.post("/api/factors", json={
+                "factorKey": "mom_roc", "name": "改名前", "params": {"win": 20}, "direction": "long"})
+            fid = created.json()["id"]
+            await client.post("/api/factors/evaluate",
+                              json={"factorId": fid, "direction": "auto", **_RANGE})
+            await client.put(f"/api/factors/{fid}", json={"name": "改名后"})
+            row = next(f for f in (await client.get("/api/factors")).json() if f["id"] == fid)
+            assert row["name"] == "改名后" and row["eval"] is not None
+            # 改 params → 失效
+            await client.put(f"/api/factors/{fid}", json={"params": {"win": 30}})
+            row2 = next(f for f in (await client.get("/api/factors")).json() if f["id"] == fid)
+            assert row2["eval"] is None
+    finally:
+        await dispose_engine()
+
+
+async def test_list_factors_search_and_source_filter(patch_okx):
+    """`q` 子串、`source` 白名单过滤（未知 source 忽略该过滤）（L3）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    try:
+        async with client:
+            await client.post("/api/factors", json={
+                "factorKey": "mom_roc", "name": "ZZUNIQUE marker", "direction": "long"})
+            await client.post("/api/factors/mine", json={**_RANGE, "topN": 5, "persist": True})
+            # q 子串命中唯一标记
+            found = (await client.get("/api/factors?q=ZZUNIQUE")).json()
+            assert len(found) == 1 and found[0]["name"] == "ZZUNIQUE marker"
+            # source=mined 只回挖掘项
+            mined = (await client.get("/api/factors?source=mined")).json()
+            assert mined and all(f["source"] == "mined" for f in mined)
+            # source=builtin 只回内置
+            builtin = (await client.get("/api/factors?source=builtin")).json()
+            assert builtin and all(f["source"] == "builtin" for f in builtin)
+            # 未知 source 忽略该过滤（等价无过滤）
+            bogus = (await client.get("/api/factors?source=bogus")).json()
+            allrows = (await client.get("/api/factors")).json()
+            assert len(bogus) == len(allrows)
+    finally:
+        await dispose_engine()
+
+
+def _primary_rankic_of(factor: dict) -> float | None:
+    """镜像前端 primaryRankIc：eval.horizons 按 h 升序取首项 rankIc（camelCase）；无缓存 → None。"""
+    ev = factor.get("eval")
+    horizons = ev.get("horizons") if isinstance(ev, dict) else None
+    if not horizons:
+        return None
+    return min(horizons, key=lambda h: h["h"]).get("rankIc")
+
+
+async def test_list_factors_sort_rankic_matches_primary_rankic(patch_okx):
+    """`sort=rankic` 服务端顺序 == 前端 primaryRankIc 降序、None 沉底（钉死 P1-2 对齐契约）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    try:
+        async with client:
+            # 造若干带 eval 的因子（评估并缓存）+ 大量内置无 eval 因子
+            for key, win in (("mom_roc", 10), ("mom_roc", 30), ("trend_ema_dist", None)):
+                body = {"factorKey": key, "name": f"sortcase {key} {win}", "direction": "long"}
+                if win is not None:
+                    body["params"] = {"win": win}
+                fid = (await client.post("/api/factors", json=body)).json()["id"]
+                await client.post("/api/factors/evaluate",
+                                  json={"factorId": fid, "direction": "auto", **_RANGE})
+            rows = (await client.get("/api/factors?sort=rankic")).json()
+            vals = [_primary_rankic_of(f) for f in rows]
+            non_none = [v for v in vals if v is not None]
+            assert len(non_none) >= 1                       # 至少一个评估出有限 RankIC
+            assert non_none == sorted(non_none, reverse=True)  # 非 None 段严格降序
+            first_none = next((i for i, v in enumerate(vals) if v is None), len(vals))
+            assert all(v is None for v in vals[first_none:])   # None 全部沉底
+    finally:
+        await dispose_engine()
+
+
+async def test_list_factors_sort_name_and_created(patch_okx):
+    """`sort=name` 升序、`sort=created` 降序（L3）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    try:
+        async with client:
+            named = (await client.get("/api/factors?sort=name")).json()
+            names = [f["name"] for f in named]
+            assert names == sorted(names)
+            created = (await client.get("/api/factors?sort=created")).json()
+            ts = [f["createdTs"] for f in created]
+            assert ts == sorted(ts, reverse=True)
+    finally:
+        await dispose_engine()
+
+
+async def test_intraday_only_factor_bar_incompatible_note(patch_okx):
+    """日内限定因子（px_vwap_dist）于日线 evaluate → note==bar_incompatible；日内 bar 无该 note（L5）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    daily = {"instId": "BTC-USDT-SWAP", "bar": "1D",
+             "startTs": 1_700_000_000, "endTs": 1_700_000_000 + 60 * 86400}
+    try:
+        async with client:
+            ev_daily = (await client.post("/api/factors/evaluate",
+                                          json={"factorKey": "px_vwap_dist", "direction": "auto",
+                                                **daily})).json()
+            assert ev_daily["note"] == "bar_incompatible"
+            ev_intraday = (await client.post("/api/factors/evaluate",
+                                             json={"factorKey": "px_vwap_dist", "direction": "auto",
+                                                   **_RANGE})).json()
+            assert ev_intraday["note"] != "bar_incompatible"
+    finally:
+        await dispose_engine()
+
+
+def test_resolve_set_to_spec_includes_provenance():
+    """resolve_set_to_spec 带出 provenance（单源/前瞻性）；旧快照无 provenance → 空 dict 向后兼容（L4）。"""
+    import json as _json
+
+    from app.db.models import FactorSet
+    from app.factors.service import resolve_set_to_spec
+    prov = {"instId": "BTC-USDT-SWAP", "bar": "1H", "startTs": 1, "endTs": 2, "horizon": 6}
+    row = FactorSet(
+        name="p", method="linear",
+        members_json=_json.dumps([{"factorKey": "mom_roc", "params": {}, "weight": 1.0,
+                                   "direction": "long"}]),
+        config_json=_json.dumps({"thresholds": {"normWindow": 80}}),
+        model_json=_json.dumps({"weights": {"mom_roc": 1.0},
+                                "normStats": {"normWindow": 80, "clip": 4.0}, "provenance": prov}),
+        metrics_json=None, enabled=True)
+    assert resolve_set_to_spec(row)["provenance"] == prov
+    old = FactorSet(name="old", method="equal", members_json="[]", config_json="{}",
+                    model_json="{}", metrics_json=None, enabled=True)
+    assert resolve_set_to_spec(old)["provenance"] == {}
+
+
 async def test_score_short_window_note(patch_okx):
     """短区间打分无有效点 → 响应带 window_too_short + minBarsRequired（取契约窗口，区间过短可观测，H6）。"""
     from app.db.session import dispose_engine

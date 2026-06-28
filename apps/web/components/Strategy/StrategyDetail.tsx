@@ -3,7 +3,8 @@
 import { useEffect, useState } from "react";
 import { Badge, Button } from "@/components/ui";
 import { directionLabel } from "@/lib/factor";
-import { fmtMoney } from "@/lib/format";
+import type { FactorScoreSnapshotParams } from "@/lib/factorTypes";
+import { fmtMoney, fmtTime } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 import type { BacktestKind, Strategy } from "@/lib/types";
 import WalkForwardForm from "./WalkForwardForm";
@@ -21,6 +22,9 @@ function FactorStrategyBanner({ strategy }: { strategy: Strategy }) {
   // 短窗护栏（H6）：策略暖机=normWindow+60；区间过短将安静空仓，此处如实标注最小所需根数。
   const thresholds = (strategy.params?.thresholds as { normWindow?: number } | undefined) ?? {};
   const minBars = Number(thresholds.normWindow ?? 200) + 60;
+  // 训练区间诚实提示（L4）：如实展示权重训练所用区间 + 样本内/外自查提示；旧快照无 provenance 时安全不展示。
+  const provenance = (strategy.params as Partial<FactorScoreSnapshotParams>)?.provenance;
+  const hasRange = provenance?.startTs != null && provenance?.endTs != null;
   return (
     <div className="flex flex-col gap-2 rounded-[10px] border border-[var(--accent-soft)] bg-[var(--accent-soft)]/40 px-3 py-2.5">
       <div className="flex items-center justify-between gap-2">
@@ -42,6 +46,17 @@ function FactorStrategyBanner({ strategy }: { strategy: Strategy }) {
       <p className="text-[11px] text-[var(--accent)]">
         至少需约 {minBars} 根数据才会产出信号（区间过短将安静空仓，请确保回测/对比区间足够长）。
       </p>
+      {hasRange && provenance && (
+        <div className="flex flex-col gap-0.5">
+          <p className="text-[11px] text-[var(--muted)]">
+            训练于 {provenance.instId ?? "—"} · {provenance.bar ?? "—"} · [{fmtTime(provenance.startTs)},{" "}
+            {fmtTime(provenance.endTs)}]{provenance.horizon != null ? ` · 前瞻 ${provenance.horizon} 根` : ""}
+          </p>
+          <p className="text-[11px] text-[var(--muted)]">
+            若回测 / 对比区间落在上述训练区间内即为样本内，结果可能偏乐观，建议用训练区间之后的样本外区间验证。
+          </p>
+        </div>
+      )}
       {members.length > 0 && (
         <div className="flex flex-wrap gap-1">
           {members.map((m, i) => (

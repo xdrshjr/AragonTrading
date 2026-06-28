@@ -111,6 +111,16 @@ def norm_stats_from_set_row(row: FactorSet) -> dict:
     return stats if isinstance(stats, dict) else {}
 
 
+def provenance_from_set_row(row: FactorSet) -> dict:
+    """解析 factor_set 行 model_json 里的 provenance（缺失为空，仅供 UI 展示训练区间，绝不参与打分）（L4）。"""
+    try:
+        model = json.loads(row.model_json or "{}")
+    except json.JSONDecodeError:
+        model = {}
+    prov = model.get("provenance") if isinstance(model, dict) else None
+    return prov if isinstance(prov, dict) else {}
+
+
 def assert_norm_contract(thresholds: dict, model: dict | None) -> None:
     """已训练组合的 ``thresholds.normWindow`` 必须 == ``model.normStats.normWindow``，否则 400（H2）。
 

@@ -21,6 +21,8 @@ import FactorScoreChart from "./FactorScoreChart";
 import { useWorkbench } from "./FactorLab";
 
 const HORIZONS = [1, 3, 6, 12];
+// 日内限定因子用于非日内 bar 的统一空态文案（L5）。
+const BAR_INCOMPATIBLE_NOTE = "该因子仅适用于日内周期，请切换到 1m/5m/15m/1H 等日内周期";
 
 /** 因子评估：选因子 + 方向 → IC 曲线 + 分位收益条形 + 逐 horizon 前瞻表 + 加入组合 / 上图。 */
 export default function FactorEvalPanel() {
@@ -90,7 +92,11 @@ export default function FactorEvalPanel() {
         <p className="text-[11px] text-[var(--short)]">评估失败：{(evaluate.error as Error)?.message}</p>
       )}
 
-      {series.length > 0 && <FactorScoreChart points={series} title={`${factorKey} 因子值`} />}
+      {compute.data?.note === "bar_incompatible" ? (
+        <FactorScoreChart points={[]} title={`${factorKey} 因子值`} emptyNote={BAR_INCOMPATIBLE_NOTE} />
+      ) : (
+        series.length > 0 && <FactorScoreChart points={series} title={`${factorKey} 因子值`} />
+      )}
 
       {result && <EvalResult result={result} onAddToCombo={() => {
         wb.addPendingMember({
@@ -106,6 +112,15 @@ export default function FactorEvalPanel() {
 }
 
 function EvalResult({ result, onAddToCombo }: { result: FactorEvalResult; onAddToCombo: () => void }) {
+  // 日内限定因子用于非日内 bar → 全 NaN：明确解释原因而非静默空白（L5）。
+  if (result.note === "bar_incompatible") {
+    return (
+      <div className="card flex flex-col gap-2 p-4 text-center">
+        <span className="text-[11px] font-medium text-[var(--accent)]">该因子仅适用于日内周期</span>
+        <span className="text-[11px] text-[var(--muted)]">{BAR_INCOMPATIBLE_NOTE}。</span>
+      </div>
+    );
+  }
   // 退化情形（无前瞻统计 / 零配对样本）不渲染空图，给出明确空态（H9 可靠性）。
   if (result.horizons.length === 0 || result.occurrences === 0) {
     return (

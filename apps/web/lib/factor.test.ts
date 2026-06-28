@@ -6,17 +6,20 @@ import {
   formatIc,
   formatPct,
   freezeDirection,
+  freezeMemberDirection,
   icCurvePoints,
   icTone,
+  memberIdentity,
   memberNames,
   overfitWarning,
   primaryRankIc,
   quantileBars,
+  rangesOverlap,
   validateMembers,
   weightBars,
   weightsCoverMembers,
 } from "./factor";
-import type { FactorHorizonStat, FactorMember, TrainMetrics } from "./factorTypes";
+import type { FactorHorizonStat, FactorLibraryItem, FactorMember, TrainMetrics } from "./factorTypes";
 
 function metrics(over: Partial<TrainMetrics>): TrainMetrics {
   return { icIn: 0.2, icOut: 0.18, r2In: null, r2Out: null, nTrain: 100, nValid: 40, ...over };
@@ -164,5 +167,57 @@ describe("validateMembers / freezeDirection / primaryRankIc", () => {
   it("primaryRankIc picks smallest horizon", () => {
     expect(primaryRankIc([horizon(6, 0.1), horizon(1, 0.3)])).toBe(0.3);
     expect(primaryRankIc([])).toBeNull();
+  });
+});
+
+const _LIBRARY: FactorLibraryItem[] = [
+  { key: "mom_roc", cn: "动量", category: "momentum", directionHint: "long", paramsSchema: {}, intradayOnly: false },
+  { key: "rev_rsi", cn: "RSI反转", category: "reversal", directionHint: "short", paramsSchema: {}, intradayOnly: false },
+];
+
+describe("freezeMemberDirection", () => {
+  it("keeps explicit long/short", () => {
+    expect(freezeMemberDirection({ factorKey: "mom_roc", direction: "short" }, _LIBRARY)).toBe("short");
+    expect(freezeMemberDirection({ factorKey: "mom_roc", direction: "long" }, _LIBRARY)).toBe("long");
+  });
+  it("auto falls back to library directionHint", () => {
+    expect(freezeMemberDirection({ factorKey: "rev_rsi", direction: "auto" }, _LIBRARY)).toBe("short");
+  });
+  it("auto with missing library entry falls back to long", () => {
+    expect(freezeMemberDirection({ factorKey: "unknown", direction: "auto" }, _LIBRARY)).toBe("long");
+  });
+});
+
+describe("memberIdentity", () => {
+  it("same key+params+direction → identical key, regardless of param order", () => {
+    expect(memberIdentity({ factorKey: "mom_roc", params: { a: 1, b: 2 }, direction: "long" })).toBe(
+      memberIdentity({ factorKey: "mom_roc", params: { b: 2, a: 1 }, direction: "long" }),
+    );
+  });
+  it("same key DIFFERENT params → different key (mining variants not silently dropped, P1-1)", () => {
+    expect(memberIdentity({ factorKey: "mom_roc", params: { win: 10 }, direction: "long" })).not.toBe(
+      memberIdentity({ factorKey: "mom_roc", params: { win: 30 }, direction: "long" }),
+    );
+  });
+  it("different direction → different key", () => {
+    expect(memberIdentity({ factorKey: "mom_roc", params: {}, direction: "long" })).not.toBe(
+      memberIdentity({ factorKey: "mom_roc", params: {}, direction: "short" }),
+    );
+  });
+});
+
+describe("rangesOverlap", () => {
+  it("adjacent ranges do not overlap (shared endpoint)", () => {
+    expect(rangesOverlap(0, 10, 10, 20)).toBe(false);
+    expect(rangesOverlap(10, 20, 0, 10)).toBe(false);
+  });
+  it("containment overlaps", () => {
+    expect(rangesOverlap(0, 100, 30, 40)).toBe(true);
+  });
+  it("partial overlap", () => {
+    expect(rangesOverlap(0, 15, 10, 20)).toBe(true);
+  });
+  it("disjoint ranges do not overlap", () => {
+    expect(rangesOverlap(0, 5, 10, 20)).toBe(false);
   });
 });
