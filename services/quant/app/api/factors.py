@@ -157,8 +157,17 @@ async def get_factor_set(set_id: int, session: AsyncSession = Depends(get_sessio
 @router.post("/factor-sets", status_code=201)
 async def create_factor_set(body: FactorSetCreateReq,
                             session: AsyncSession = Depends(get_session)) -> dict:
-    from ..factors.specs import validate_members
+    from ..factors.specs import (
+        assert_norm_contract,
+        assert_weights_cover,
+        normalize_thresholds,
+        validate_members,
+    )
     members = validate_members([m.model_dump() for m in body.members])
+    # 归一化契约/权重单源边界校验（H2/H3）：仅当 modelJson 带训练产物时生效，equal/未训练自动放行。
+    thresholds = normalize_thresholds((body.config or {}).get("thresholds"))
+    assert_norm_contract(thresholds, body.modelJson)
+    assert_weights_cover(members, body.modelJson)
     values = repo.FactorSetValues(
         name=body.name, members=members, method=body.method, config=body.config,
         model=body.modelJson, metrics=body.metricsJson, enabled=body.enabled)
@@ -168,10 +177,21 @@ async def create_factor_set(body: FactorSetCreateReq,
 @router.put("/factor-sets/{set_id}")
 async def update_factor_set(set_id: int, body: FactorSetUpdateReq,
                             session: AsyncSession = Depends(get_session)) -> dict:
+    from ..factors.specs import (
+        assert_norm_contract,
+        assert_weights_cover,
+        normalize_thresholds,
+        validate_members,
+    )
     members = None
     if body.members is not None:
-        from ..factors.specs import validate_members
         members = validate_members([m.model_dump() for m in body.members])
+    # partial update：仅在请求同时带上对应字段时校验，避免误伤局部更新（H2/H3，评审 §8）。
+    if body.modelJson is not None:
+        if body.config is not None:
+            assert_norm_contract(normalize_thresholds((body.config or {}).get("thresholds")), body.modelJson)
+        if members is not None:
+            assert_weights_cover(members, body.modelJson)
     row = await repo.update_factor_set(session, set_id, patch=repo.FactorSetPatch(
         name=body.name, members=members, method=body.method, config=body.config,
         model=body.modelJson, metrics=body.metricsJson, enabled=body.enabled))

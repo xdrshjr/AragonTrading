@@ -108,6 +108,10 @@ export interface RankedFactor {
 export interface FactorMineResult {
   items: RankedFactor[];
   truncated: boolean;
+  // 落库计数（H5，绝不静默丢弃）：evaluated=考虑落库的候选数，persisted=新写入，skipped=去重/无效。
+  evaluated?: number;
+  persisted?: number;
+  skipped?: number;
 }
 
 // 组合成员（自包含快照，方向冻结）。
@@ -128,6 +132,16 @@ export interface TrainMetrics {
   nValid: number;
 }
 
+// 训练溯源元数据（H7）：标的/周期/区间/horizon + 训练时刻（trainedAt 由前端注入秒级 UTC）。
+export interface TrainProvenance {
+  instId: string;
+  bar: string;
+  startTs: number;
+  endTs: number;
+  horizon: number;
+  trainedAt?: number;
+}
+
 export interface TrainResult {
   method: TrainMethod;
   weights: Record<string, number>;
@@ -136,6 +150,7 @@ export interface TrainResult {
   available: boolean;
   note: string;
   trainerVersion: string | null;
+  provenance?: TrainProvenance;
 }
 
 export interface TrainerInfo {
@@ -150,7 +165,12 @@ export interface FactorSet {
   members: FactorMember[];
   method: TrainMethod;
   config: { thresholds?: FactorThresholds } & Record<string, unknown>;
-  model: { weights?: Record<string, number>; normStats?: Record<string, number> } & Record<string, unknown>;
+  model: {
+    weights?: Record<string, number>;
+    normStats?: Record<string, number>;
+    provenance?: TrainProvenance;
+    trainedAt?: number;
+  } & Record<string, unknown>;
   metrics: TrainMetrics | null;
   enabled: boolean;
   createdTs: number;
@@ -175,6 +195,9 @@ export interface FactorScoreResult {
   points: ScorePoint[];
   latest: number | null;
   coverage: number;
+  // 区间过短时（无任何有效得分点）后端附此提示（H6）；旧响应无此字段，缺省安全。
+  note?: string;
+  minBarsRequired?: number;
 }
 
 export const DEFAULT_THRESHOLDS: FactorThresholds = {

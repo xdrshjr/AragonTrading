@@ -18,6 +18,9 @@ function FactorStrategyBanner({ strategy }: { strategy: Strategy }) {
   const setShowFactorLab = useAppStore((s) => s.setShowFactorLab);
   const setFactorLabSection = useAppStore((s) => s.setFactorLabSection);
   const members = (strategy.params?.members as FactorMemberSnapshot[] | undefined) ?? [];
+  // 短窗护栏（H6）：策略暖机=normWindow+60；区间过短将安静空仓，此处如实标注最小所需根数。
+  const thresholds = (strategy.params?.thresholds as { normWindow?: number } | undefined) ?? {};
+  const minBars = Number(thresholds.normWindow ?? 200) + 60;
   return (
     <div className="flex flex-col gap-2 rounded-[10px] border border-[var(--accent-soft)] bg-[var(--accent-soft)]/40 px-3 py-2.5">
       <div className="flex items-center justify-between gap-2">
@@ -35,6 +38,9 @@ function FactorStrategyBanner({ strategy }: { strategy: Strategy }) {
       </div>
       <p className="text-[11px] text-[var(--muted)]">
         消费独立因子层的复合得分做决策（内联快照 {members.length} 个因子成员，回测路径零改动）。
+      </p>
+      <p className="text-[11px] text-[var(--accent)]">
+        至少需约 {minBars} 根数据才会产出信号（区间过短将安静空仓，请确保回测/对比区间足够长）。
       </p>
       {members.length > 0 && (
         <div className="flex flex-wrap gap-1">

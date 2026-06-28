@@ -16,6 +16,10 @@ from .library import FACTOR_LIBRARY, is_bar_compatible
 # 工作量上界（候选数 × 有效根数）；超限由 service 抛 413（沿用 compare 413 语义，评审 C-P1-3）。
 MINE_WORK_UNIT_LIMIT = 3_000_000
 
+# 落库过滤阈值（H5）：默认仅过滤 ir=None 与零覆盖；调高 MINE_PERSIST_MIN_ABS_IR 可只留强因子。
+MINE_PERSIST_MIN_ABS_IR = 0.0
+MINE_MIN_COVERAGE = 0.0
+
 # 库 × 小参数网格（v1 固定、显式、有界；每因子取默认 + 至多一两个邻近值）。
 _MINE_GRID: dict[str, list[dict]] = {
     "mom_roc": [{"win": 10}, {"win": 20}, {"win": 40}],

@@ -765,14 +765,41 @@ async def delete_factor(session: AsyncSession, factor_id: int) -> str:
     return "ok"
 
 
+def _factor_dedupe_key(factor_key: str, params: dict | None, direction: str) -> str:
+    """落库去重键：``factor_key | 规范化(params) | direction``（键序/数值规范化，避免误判，H5）。"""
+    return f"{factor_key}|{json.dumps(params or {}, sort_keys=True, ensure_ascii=False)}|{direction}"
+
+
+def _params_of(row: Factor) -> dict:
+    try:
+        parsed = json.loads(row.params_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 async def bulk_create_factors(session: AsyncSession, values: list[FactorValues]) -> list[Factor]:
-    """批量落因子（挖掘保存 top-N 用）；按 factor_key+params 去重已存的内置 / 同源行由调用方负责。"""
-    rows = [
-        Factor(factor_key=v.factor_key, name=v.name,
-               params_json=json.dumps(v.params or {}, ensure_ascii=False), direction=v.direction,
-               category=v.category, source=v.source, enabled=True, notes=v.notes or "")
-        for v in values
-    ]
+    """批量落挖掘因子并**落库前去重**：同 ``(factor_key, 规范化 params, direction)`` 已存即跳过（H5）。
+
+    去重对照库内全部已存行（任何 source），并在批内自去重；返回**实际新写入**的行（计数透明）。
+    """
+    if not values:
+        return []
+    keys = {v.factor_key for v in values}
+    existing = (await session.execute(select(Factor).where(Factor.factor_key.in_(keys)))).scalars().all()
+    seen = {_factor_dedupe_key(r.factor_key, _params_of(r), r.direction) for r in existing}
+    rows: list[Factor] = []
+    for v in values:
+        dedupe_key = _factor_dedupe_key(v.factor_key, v.params, v.direction)
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        rows.append(Factor(
+            factor_key=v.factor_key, name=v.name,
+            params_json=json.dumps(v.params or {}, ensure_ascii=False), direction=v.direction,
+            category=v.category, source=v.source, enabled=True, notes=v.notes or ""))
+    if not rows:
+        return []
     session.add_all(rows)
     await session.commit()
     for row in rows:

@@ -5,7 +5,8 @@ import numpy as np
 import pandas as pd
 
 from app.engine.backtester import candles_to_df
-from app.engine.factors import causal_zscore, compose_score
+from app.engine.factors import causal_zscore, compose_score, resolve_norm_contract
+from app.engine.factors.scoring import DEFAULT_CLIP
 from tests.conftest import make_synthetic_candles
 
 
@@ -56,6 +57,36 @@ def test_compose_score_rejects_auto_direction():
         assert False, "auto 方向应抛 ValueError"
     except ValueError:
         pass
+
+
+def test_resolve_norm_contract_prefers_norm_stats():
+    """归一化契约（H1）：normStats 有 normWindow 时优先取它（含 clip），无视 thresholds 漂移。"""
+    nw, clip = resolve_norm_contract(norm_stats={"normWindow": 120, "clip": 3.0},
+                                     thresholds={"normWindow": 500})
+    assert nw == 120 and clip == 3.0
+
+
+def test_resolve_norm_contract_missing_clip_defaults():
+    """normStats 缺 clip → 回默认 clip（向后兼容旧训练产物）。"""
+    nw, clip = resolve_norm_contract(norm_stats={"normWindow": 80}, thresholds={"normWindow": 500})
+    assert nw == 80 and clip == DEFAULT_CLIP
+
+
+def test_resolve_norm_contract_falls_back_to_thresholds():
+    """无训练 normStats（equal/未训练/旧组合）→ 回落 thresholds.normWindow + 默认 clip。"""
+    nw, clip = resolve_norm_contract(norm_stats=None, thresholds={"normWindow": 333})
+    assert nw == 333 and clip == DEFAULT_CLIP
+    nw2, clip2 = resolve_norm_contract(norm_stats={}, thresholds={})
+    assert clip2 == DEFAULT_CLIP and nw2 == 200   # DEFAULT_NORM_WINDOW
+
+
+def test_clip_changes_zscore_so_contract_matters():
+    """非默认 clip 改变 z-score → 训练/打分 clip 不一致会错配；故 clip 须经契约单源（H1）。"""
+    df = _df()
+    tight = causal_zscore(df["c"], 60, clip=0.5).dropna()
+    loose = causal_zscore(df["c"], 60, clip=4.0).dropna()
+    assert tight.abs().max() <= 0.5 + 1e-9
+    assert loose.abs().max() > 0.5   # 夹断阈值不同 → 量纲不同，印证 clip 必须端到端一致
 
 
 def test_compose_score_weights_override_member_weight():

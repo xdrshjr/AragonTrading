@@ -12,22 +12,31 @@ export default function FactorScoreChart({
   title,
   height = 120,
   zeroBaseline = true,
+  emptyNote,
 }: {
   points: LinePoint[];
   title?: string;
   height?: number;
   zeroBaseline?: boolean;
+  // 空序列时的自定义提示（如区间过短 window_too_short）；提供时以黄色提示条呈现（H6/H9）。
+  emptyNote?: string;
 }) {
   const width = 640;
   const geom = useMemo(() => sparkline(points, width, height), [points, height]);
 
   if (points.length === 0) {
+    const warn = Boolean(emptyNote);
     return (
       <div
-        className="flex items-center justify-center rounded-[10px] border border-dashed border-[var(--border)] text-[11px] text-[var(--muted)]"
+        className={
+          "flex items-center justify-center rounded-[10px] border border-dashed px-3 text-center text-[11px] " +
+          (warn
+            ? "border-[var(--accent-soft)] bg-[var(--accent-soft)]/40 font-medium text-[var(--accent)]"
+            : "border-[var(--border)] text-[var(--muted)]")
+        }
         style={{ height }}
       >
-        暂无可上图的数据点
+        {emptyNote ?? "暂无可上图的数据点"}
       </div>
     );
   }

@@ -194,3 +194,141 @@ async def test_invalid_member_direction_rejected(patch_okx):
             assert r.status_code == 422
     finally:
         await dispose_engine()
+
+
+_TWO_MEMBERS = [{"factorKey": "mom_roc", "params": {"win": 20}, "direction": "long"},
+                {"factorKey": "rev_rsi", "params": {}, "direction": "short"}]
+
+
+async def test_train_returns_provenance(patch_okx):
+    """训练响应带溯源元数据（标的/周期/区间/horizon），供判断权重是否陈旧（H7）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    try:
+        async with client:
+            tr = (await client.post("/api/factor-sets/train",
+                                    json={"members": _TWO_MEMBERS, "method": "linear",
+                                          "horizon": 6, **_RANGE})).json()
+            prov = tr["provenance"]
+            assert prov["instId"] == "BTC-USDT-SWAP" and prov["bar"] == "1H"
+            assert prov["horizon"] == 6 and prov["startTs"] == _RANGE["startTs"]
+    finally:
+        await dispose_engine()
+
+
+async def test_norm_window_mismatch_400(patch_okx):
+    """已训练组合保存时 thresholds.normWindow != 训练 normStats.normWindow → 400（H2）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    try:
+        async with client:
+            tr = (await client.post("/api/factor-sets/train",
+                                    json={"members": _TWO_MEMBERS, "method": "linear",
+                                          "horizon": 6, **_RANGE})).json()
+            r = await client.post("/api/factor-sets", json={
+                "name": "mismatch", "members": _TWO_MEMBERS, "method": "linear",
+                "modelJson": {"weights": tr["weights"], "normStats": tr["normStats"]},
+                "metricsJson": tr["metrics"],
+                "config": {"thresholds": {"normWindow": tr["normStats"]["normWindow"] + 300}}})
+            assert r.status_code == 400
+            assert r.json()["error"]["code"] == "FACTOR_NORM_WINDOW_MISMATCH"
+    finally:
+        await dispose_engine()
+
+
+async def test_weights_stale_400(patch_okx):
+    """训练后增删成员、权重键集与成员不一致 → 保存触发 FACTOR_WEIGHTS_STALE 400（H3）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    try:
+        async with client:
+            tr = (await client.post("/api/factor-sets/train",
+                                    json={"members": _TWO_MEMBERS, "method": "linear",
+                                          "horizon": 6, **_RANGE})).json()
+            members3 = _TWO_MEMBERS + [{"factorKey": "trend_ema_dist", "direction": "long"}]
+            r = await client.post("/api/factor-sets", json={
+                "name": "stale", "members": members3, "method": "linear",
+                "modelJson": {"weights": tr["weights"], "normStats": tr["normStats"]},
+                "config": {"thresholds": {"normWindow": tr["normStats"]["normWindow"]}}})
+            assert r.status_code == 400
+            assert r.json()["error"]["code"] == "FACTOR_WEIGHTS_STALE"
+    finally:
+        await dispose_engine()
+
+
+async def test_save_trained_combo_consistent_ok(patch_okx):
+    """窗口一致 + 权重覆盖成员 → 正常 201（校验只拦漂移/陈旧，绝不误伤合法保存）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    try:
+        async with client:
+            tr = (await client.post("/api/factor-sets/train",
+                                    json={"members": _TWO_MEMBERS, "method": "linear",
+                                          "horizon": 6, **_RANGE})).json()
+            r = await client.post("/api/factor-sets", json={
+                "name": "ok", "members": _TWO_MEMBERS, "method": "linear",
+                "modelJson": {"weights": tr["weights"], "normStats": tr["normStats"]},
+                "metricsJson": tr["metrics"],
+                "config": {"thresholds": {"normWindow": tr["normStats"]["normWindow"]}}})
+            assert r.status_code == 201, r.text
+    finally:
+        await dispose_engine()
+
+
+async def test_mine_counts_and_dedupe(patch_okx):
+    """挖掘落库计数自洽 + 二次同区间去重 persisted=0（H5）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    try:
+        async with client:
+            d1 = (await client.post("/api/factors/mine",
+                                    json={**_RANGE, "topN": 6, "persist": True})).json()
+            assert d1["evaluated"] == d1["persisted"] + d1["skipped"]
+            # 二次同区间挖掘必全去重（与先前 DB 状态无关，落库幂等）
+            d2 = (await client.post("/api/factors/mine",
+                                    json={**_RANGE, "topN": 6, "persist": True})).json()
+            assert d2["evaluated"] == d2["persisted"] + d2["skipped"]
+            assert d2["persisted"] == 0 and d2["skipped"] == d2["evaluated"]
+    finally:
+        await dispose_engine()
+
+
+async def test_disabled_factor_excluded_from_enabled_filter(patch_okx):
+    """禁用某因子后 GET /factors?enabled=true 不含它（H4 enabled 真实下游：Agent 池 / 我的因子默认视图）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    try:
+        async with client:
+            created = await client.post("/api/factors", json={
+                "factorKey": "mom_roc", "name": "待禁用", "params": {"win": 9}, "direction": "long"})
+            fid = created.json()["id"]
+            await client.put(f"/api/factors/{fid}", json={"enabled": False})
+            enabled_ids = {f["id"] for f in (await client.get("/api/factors?enabled=true")).json()}
+            all_ids = {f["id"] for f in (await client.get("/api/factors")).json()}
+            assert fid not in enabled_ids and fid in all_ids
+    finally:
+        await dispose_engine()
+
+
+async def test_score_short_window_note(patch_okx):
+    """短区间打分无有效点 → 响应带 window_too_short + minBarsRequired（取契约窗口，区间过短可观测，H6）。"""
+    from app.db.session import dispose_engine
+    client = await _client()
+    try:
+        async with client:
+            tr = (await client.post("/api/factor-sets/train",
+                                    json={"members": _TWO_MEMBERS, "method": "linear",
+                                          "horizon": 6, "config": {"normWindow": 150}, **_RANGE})).json()
+            saved = await client.post("/api/factor-sets", json={
+                "name": "win", "members": _TWO_MEMBERS, "method": "linear",
+                "modelJson": {"weights": tr["weights"], "normStats": tr["normStats"]},
+                "config": {"thresholds": {"normWindow": tr["normStats"]["normWindow"]}}})
+            sid = saved.json()["id"]
+            # 区间根数 (≈100) < 训练契约窗口 150 → 全 NaN → 无有效点
+            short = {"instId": "BTC-USDT-SWAP", "bar": "1H",
+                     "startTs": 1_700_000_000, "endTs": 1_700_000_000 + 100 * 3600}
+            body = (await client.post(f"/api/factor-sets/{sid}/score", json=short)).json()
+            assert body["points"] == []
+            assert body["note"] == "window_too_short" and body["minBarsRequired"] == 150
+    finally:
+        await dispose_engine()

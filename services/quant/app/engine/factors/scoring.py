@@ -17,6 +17,27 @@ DEFAULT_NORM_WINDOW = 200
 DEFAULT_CLIP = 4.0
 
 
+def resolve_norm_contract(*, norm_stats: dict | None, thresholds: dict | None) -> tuple[int, float]:
+    """打分阶段归一化参数 ``(normWindow, clip)`` 的**唯一解析口径**（归一化契约 H1）。
+
+    训练产物 ``norm_stats={normWindow,clip}`` 是「权重所依赖的归一化变换」的真相；打分端必须取同值，
+    否则把已训练权重作用到不同量纲的特征上（评审 C-P0-1 的复活路径）。仅当组合无训练权重
+    （``equal`` 基线 / 未训练 / 旧组合无 ``normStats``）时，才回落到 ``thresholds.normWindow`` + 默认 clip。
+
+    Args:
+        norm_stats: 训练写入的契约 ``{normWindow, clip}``（缺 ``clip`` 时回默认）。
+        thresholds: 组合阈值（含 ``normWindow``），仅在无训练契约时作回落来源。
+
+    Returns:
+        ``(norm_window, clip)``：``norm_stats.normWindow`` 存在即优先取它，否则取 ``thresholds.normWindow``。
+    """
+    stats = norm_stats or {}
+    if stats.get("normWindow") is not None:
+        clip = stats.get("clip")
+        return int(stats["normWindow"]), float(clip) if clip is not None else DEFAULT_CLIP
+    return int((thresholds or {}).get("normWindow", DEFAULT_NORM_WINDOW)), DEFAULT_CLIP
+
+
 def causal_zscore(series: pd.Series, norm_window: int, clip: float = DEFAULT_CLIP) -> pd.Series:
     """因果滚动 z-score（窗口 ``norm_window``，只用 ≤ i 数据；归一化契约唯一真源 C-P0-1）。
 

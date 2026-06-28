@@ -92,6 +92,13 @@ export default function FactorMiningPanel() {
       {mine.isError && (
         <p className="text-[11px] text-[var(--short)]">挖掘失败：{(mine.error as Error)?.message}</p>
       )}
+      {mine.data && (
+        <p className="text-[11px] text-[var(--muted)]">
+          评估 {mine.data.evaluated ?? mine.data.items.length} 个候选
+          {((mine.data.persisted ?? 0) + (mine.data.skipped ?? 0) > 0) &&
+            ` · 落库 ${mine.data.persisted} · 去重/无效跳过 ${mine.data.skipped}`}
+        </p>
+      )}
       {mine.data?.truncated && (
         <p className="text-[11px] text-[var(--muted)]">已按 topN 截断返回行数（工作量未超限）。</p>
       )}

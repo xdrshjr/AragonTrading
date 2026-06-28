@@ -18,9 +18,9 @@ from ...engine.factors import (
     eval_result_to_dict,
     evaluate_factor_key,
     factor_meta,
+    resolve_norm_contract,
     score_points,
 )
-from ...engine.factors.scoring import DEFAULT_NORM_WINDOW
 from ...okx.rest_client import get_rest_client
 from .. import services
 from ..prompts import FACTOR_REASONING_SCAFFOLD
@@ -301,9 +301,11 @@ class ScoreFactorComboTool(Tool):
         if row is None:
             return ToolResult(False, f"因子组合 #{args['factorSetId']} 不存在。")
         spec = resolve_set_to_spec(row)
+        norm_window, clip = resolve_norm_contract(
+            norm_stats=spec.get("normStats"), thresholds=spec["thresholds"])
         df = await _load_df(args)
         score = compose_score(df, spec["members"], None,
-                              norm_window=int(spec["thresholds"].get("normWindow", DEFAULT_NORM_WINDOW)),
+                              norm_window=norm_window, clip=clip,
                               squash=bool(spec["thresholds"].get("squash", True)), bar=args["bar"])
         points = score_points(df, score)
         latest = points[-1]["score"] if points else None

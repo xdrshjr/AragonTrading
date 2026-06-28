@@ -71,7 +71,7 @@ class FactorScoreStrategy(BaseStrategy):
     def prepare(self, df: pd.DataFrame, bar: str) -> pd.DataFrame:
         # 延迟导入打破模块装载期循环：engine.factors → signal_edge → strategies →
         # factor_score_strategy（compose_score 仅在每次回测 prepare 调用一次，开销可忽略）。
-        from ..engine.factors import compose_score
+        from ..engine.factors import compose_score, resolve_norm_contract
 
         df = df.copy()
         members = self.params.get("members") or []
@@ -79,10 +79,15 @@ class FactorScoreStrategy(BaseStrategy):
         if not members:
             df["_score"] = float("nan")
             return df
+        # 归一化契约单一真源（H1/H2）：优先用训练写入快照的 normStats（窗口/clip），无则回落 thresholds。
+        norm_window, clip = resolve_norm_contract(
+            norm_stats=self.params.get("normStats"), thresholds=self._thresholds)
         try:
+            # 保留传 self.params.get("weights")（R-P0-1 向后兼容硬约束）：旧快照走顶层 weights、
+            # 新快照（weights=None）走成员烘焙 weight，绝不因「权重单源」让旧策略全员 0 权重静默不交易。
             score = compose_score(
                 df, members, self.params.get("weights"),
-                norm_window=int(self._thresholds.get("normWindow", 200)),
+                norm_window=norm_window, clip=clip,
                 squash=bool(self._thresholds.get("squash", True)), bar=bar)
             df["_score"] = score.to_numpy()
         except (ValueError, KeyError):

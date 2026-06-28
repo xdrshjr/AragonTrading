@@ -106,6 +106,17 @@ export default function FactorEvalPanel() {
 }
 
 function EvalResult({ result, onAddToCombo }: { result: FactorEvalResult; onAddToCombo: () => void }) {
+  // 退化情形（无前瞻统计 / 零配对样本）不渲染空图，给出明确空态（H9 可靠性）。
+  if (result.horizons.length === 0 || result.occurrences === 0) {
+    return (
+      <div className="card flex flex-col gap-2 p-4 text-center">
+        <span className="text-[11px] font-medium text-[var(--muted)]">评估无有效结果</span>
+        <span className="text-[11px] text-[var(--muted)]">
+          样本不足或区间过短（配对样本 {result.occurrences}）：请扩大区间或更换因子后重试。
+        </span>
+      </div>
+    );
+  }
   const primary = result.horizons.find((h) => h.quantiles.length > 0) ?? result.horizons[0];
   return (
     <div className="flex flex-col gap-4">

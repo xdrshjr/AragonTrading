@@ -52,6 +52,17 @@ def test_norm_stats_records_contract_only():
     assert norm["normWindow"] == 150
 
 
+def test_custom_clip_flows_into_norm_stats():
+    """非默认 clip 必须如实写进 normStats（H1）：打分端据此取同一 clip，端到端不漂移。"""
+    df = _df()
+    _, _, norm = build_factor_matrix(df, _MEMBERS, norm_window=100, clip=2.5, bar="1H")
+    assert norm["clip"] == 2.5
+    label = forward_return_label(df, 6)
+    matrix, names, norm = build_factor_matrix(df, _MEMBERS, norm_window=100, clip=2.5, bar="1H")
+    result = train_weights(matrix, label, names, method="linear", config={}, norm_stats=norm)
+    assert result.normStats["clip"] == 2.5   # 训练产物透传契约 clip
+
+
 def test_missing_library_degrades_explicitly(monkeypatch):
     """monkeypatch find_spec→None：xgboost 训练返回 available=False + 安装提示，绝不假权重。"""
     monkeypatch.setattr(training_mod.importlib.util, "find_spec", lambda name: None)

@@ -4,7 +4,15 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { Badge, Button, Input, Select, Switch } from "@/components/ui";
 import { api } from "@/lib/api";
-import { directionLabel, formatIc, overfitWarning, validateMembers, weightBars } from "@/lib/factor";
+import {
+  applyWeights,
+  directionLabel,
+  formatIc,
+  overfitWarning,
+  validateMembers,
+  weightBars,
+  weightsCoverMembers,
+} from "@/lib/factor";
 import { factorApi } from "@/lib/factorApi";
 import {
   DEFAULT_THRESHOLDS,
@@ -55,21 +63,45 @@ export default function FactorSetBuilder() {
     wb.clearPendingMembers();
   }, [wb.pendingMembers, wb]);
 
+  // 成员集合变化即作废上一轮训练结果（强制重训，杜绝「成员变了权重没变」的静默错配，H3）。
+  useEffect(() => {
+    setTrained(null);
+  }, [members]);
+
   const range = { instId: wb.instId, bar: wb.bar, startTs: wb.startTs, endTs: wb.endTs };
   const memberError = validateMembers(members);
 
   const train = useMutation({
     mutationFn: () =>
       factorApi.train({ ...range, members, method, config: { normWindow: thresholds.normWindow } }),
-    onSuccess: setTrained,
+    // 训练成功后把归一化窗口锁定为训练写入的 normStats.normWindow（改窗口=重训，归一化契约 H1/H2）。
+    onSuccess: (result) => {
+      setTrained(result);
+      setThresholds((prev) => ({ ...prev, normWindow: result.normStats.normWindow }));
+    },
   });
+  // 单源真相：训练新鲜（权重键集恰好覆盖当前成员）才可保存/建策略，否则提示原因（H3）。
+  const trainedFresh = !!trained && weightsCoverMembers(members, trained.weights);
+  const blockReason = memberError
+    ? memberError
+    : !trainedFresh
+      ? "请先训练权重（成员变化后需重新训练）"
+      : null;
   const save = useMutation({
     mutationFn: () =>
       factorApi.sets.create({
         name,
         members,
         method,
-        modelJson: trained ? { weights: trained.weights, normStats: trained.normStats } : {},
+        modelJson: trained
+          ? {
+              weights: trained.weights,
+              normStats: trained.normStats,
+              trainerVersion: trained.trainerVersion,
+              provenance: trained.provenance,
+              trainedAt: Math.floor(Date.now() / 1000),
+            }
+          : {},
         metricsJson: trained?.metrics ?? null,
         config: { thresholds },
       }),
@@ -83,10 +115,11 @@ export default function FactorSetBuilder() {
       api.createStrategy({
         templateKey: "factor_score",
         name: `${name} · 得分策略`,
+        // 新建快照：训练权重烘焙进成员、不再写顶层 weights；带 normStats 供打分取同一归一化契约（H2/H3）。
         params: {
-          members,
-          weights: trained?.weights,
+          members: applyWeights(members, trained?.weights),
           thresholds: { ...thresholds },
+          normStats: trained?.normStats,
         },
       }),
     onSuccess: (strategy) => {
@@ -143,29 +176,43 @@ export default function FactorSetBuilder() {
             </span>
           </div>
           {overfit && <p className="text-[11px] font-medium text-[var(--short)]">{overfit}</p>}
+          {trained.provenance && (
+            <p className="text-[11px] text-[var(--muted)]">
+              训练于 {trained.provenance.instId} · {trained.provenance.bar} · 前瞻 {trained.provenance.horizon} 根
+              ；归一化窗口 {trained.normStats.normWindow}（已锁定，改窗口需重新训练）
+            </p>
+          )}
           <WeightBars weights={trained.weights} />
         </div>
       )}
 
-      <ThresholdsEditor thresholds={thresholds} onChange={setThresholds} />
+      <ThresholdsEditor thresholds={thresholds} onChange={setThresholds} normWindowLocked={trainedFresh} />
 
       <div className="card flex flex-wrap items-end gap-3 p-3">
         <label className="flex flex-1 flex-col gap-1">
           <span className="text-[11px] text-[var(--muted)]">组合名称</span>
           <Input value={name} onChange={(e) => setName(e.target.value)} className="py-1.5 text-xs" />
         </label>
-        <Button variant="default" disabled={!!memberError || save.isPending} onClick={() => save.mutate()}>
+        <Button
+          variant="default"
+          disabled={!!blockReason || save.isPending}
+          title={blockReason ?? "保存因子组合"}
+          onClick={() => save.mutate()}
+        >
           {save.isPending ? "保存中..." : "保存组合"}
         </Button>
         <Button
           variant="primary"
-          disabled={!!memberError || createStrategy.isPending}
-          title="以内联快照创建 factor_score 策略，自动出现在策略列表 / 回测 / 对比"
+          disabled={!!blockReason || createStrategy.isPending}
+          title={blockReason ?? "以内联快照创建 factor_score 策略，自动出现在策略列表 / 回测 / 对比"}
           onClick={() => createStrategy.mutate()}
         >
           {createStrategy.isPending ? "创建中..." : "从组合新建策略"}
         </Button>
       </div>
+      {blockReason && !memberError && (
+        <p className="text-[11px] text-[var(--muted)]">{blockReason}</p>
+      )}
       {notice && <p className="text-[11px] font-medium text-[var(--accent)]">{notice}</p>}
       {(save.isError || createStrategy.isError) && (
         <p className="text-[11px] text-[var(--short)]">
@@ -272,20 +319,34 @@ function WeightBars({ weights }: { weights: Record<string, number> }) {
 function ThresholdsEditor({
   thresholds,
   onChange,
+  normWindowLocked = false,
 }: {
   thresholds: FactorThresholds;
   onChange: (next: FactorThresholds) => void;
+  // 训练后归一化窗口由 normStats 锁定（改窗口=重训，归一化契约 H1/H2）。
+  normWindowLocked?: boolean;
 }) {
   const set = (key: keyof FactorThresholds, value: number | boolean) => onChange({ ...thresholds, [key]: value });
-  const numField = (key: "enterLong" | "enterShort" | "exitBand" | "normWindow", label: string, step: number) => (
+  const numField = (
+    key: "enterLong" | "enterShort" | "exitBand" | "normWindow",
+    label: string,
+    step: number,
+    locked = false,
+  ) => (
     <label className="flex flex-col gap-1">
       <span className="text-[11px] text-[var(--muted)]">{label}</span>
       <input
         type="number"
         step={step}
         value={thresholds[key]}
+        readOnly={locked}
+        disabled={locked}
+        title={locked ? "归一化窗口由训练锁定，改窗口需重新训练" : undefined}
         onChange={(e) => set(key, Number(e.target.value))}
-        className="w-24 rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs tabular"
+        className={
+          "w-24 rounded-[8px] border border-[var(--border)] px-2 py-1 text-xs tabular " +
+          (locked ? "cursor-not-allowed bg-[var(--surface-2)] text-[var(--muted)]" : "bg-[var(--surface)]")
+        }
       />
     </label>
   );
@@ -295,11 +356,16 @@ function ThresholdsEditor({
       {numField("enterLong", "进多阈值", 0.05)}
       {numField("enterShort", "进空阈值", 0.05)}
       {numField("exitBand", "退出带", 0.05)}
-      {numField("normWindow", "归一化窗口", 10)}
+      {numField("normWindow", "归一化窗口", 10, normWindowLocked)}
       <label className="flex flex-col gap-1">
         <span className="text-[11px] text-[var(--muted)]">tanh 压缩</span>
         <Switch checked={thresholds.squash} onChange={(v) => set("squash", v)} label="tanh 压缩到[-1,1]" />
       </label>
+      {normWindowLocked && (
+        <span className="w-full text-[10px] text-[var(--muted)]">
+          归一化窗口已由训练锁定；若要改窗口，请改后重新训练以保持权重与打分契约一致。
+        </span>
+      )}
     </div>
   );
 }

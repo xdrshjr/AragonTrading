@@ -99,3 +99,49 @@ def thresholds_from_set_row(row: FactorSet) -> dict:
     except json.JSONDecodeError:
         config = {}
     return normalize_thresholds(config.get("thresholds") if isinstance(config, dict) else None)
+
+
+def norm_stats_from_set_row(row: FactorSet) -> dict:
+    """解析 factor_set 行 model_json 里的 normStats（缺失为空，供 resolve_norm_contract 回落）（H2）。"""
+    try:
+        model = json.loads(row.model_json or "{}")
+    except json.JSONDecodeError:
+        model = {}
+    stats = model.get("normStats") if isinstance(model, dict) else None
+    return stats if isinstance(stats, dict) else {}
+
+
+def assert_norm_contract(thresholds: dict, model: dict | None) -> None:
+    """已训练组合的 ``thresholds.normWindow`` 必须 == ``model.normStats.normWindow``，否则 400（H2）。
+
+    缺 ``model`` / 无 ``normStats`` / 无 ``normWindow``（equal、未训练、旧组合）时跳过——只在确有训练契约时校验，
+    兼容 partial update 与 equal 基线（评审 §8 误伤缓解）。
+
+    Raises:
+        HTTPException: 400 ``FACTOR_NORM_WINDOW_MISMATCH`` —— 阈值窗口与训练写入的归一化窗口漂移。
+    """
+    stats = model.get("normStats") if isinstance(model, dict) else None
+    trained_window = stats.get("normWindow") if isinstance(stats, dict) else None
+    if trained_window is None:
+        return
+    threshold_window = (thresholds or {}).get("normWindow")
+    if threshold_window is not None and int(threshold_window) != int(trained_window):
+        raise _bad("FACTOR_NORM_WINDOW_MISMATCH",
+                   f"归一化窗口漂移：阈值 normWindow={threshold_window} 与训练 normStats.normWindow="
+                   f"{trained_window} 不一致，请改用训练窗口或重新训练。")
+
+
+def assert_weights_cover(members: list[dict], model: dict | None) -> None:
+    """``model.weights`` 的键集必须 == 当前成员 ``member_names``，否则 400 ``FACTOR_WEIGHTS_STALE``（H3）。
+
+    缺 ``model`` / 无 ``weights``（equal、未训练、partial update）时跳过——只在确有训练权重时校验。
+
+    Raises:
+        HTTPException: 400 ``FACTOR_WEIGHTS_STALE`` —— 成员已变化、训练权重陈旧，需重新训练。
+    """
+    weights = model.get("weights") if isinstance(model, dict) else None
+    if not weights:
+        return
+    if set(weights.keys()) != set(member_names(members)):
+        raise _bad("FACTOR_WEIGHTS_STALE",
+                   "训练权重与当前成员不一致（成员已变化），请重新训练后再保存。")

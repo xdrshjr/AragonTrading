@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  applyWeights,
   categoryLabel,
   directionLabel,
   formatIc,
@@ -7,13 +8,19 @@ import {
   freezeDirection,
   icCurvePoints,
   icTone,
+  memberNames,
   overfitWarning,
   primaryRankIc,
   quantileBars,
   validateMembers,
   weightBars,
+  weightsCoverMembers,
 } from "./factor";
-import type { FactorHorizonStat, FactorMember } from "./factorTypes";
+import type { FactorHorizonStat, FactorMember, TrainMetrics } from "./factorTypes";
+
+function metrics(over: Partial<TrainMetrics>): TrainMetrics {
+  return { icIn: 0.2, icOut: 0.18, r2In: null, r2Out: null, nTrain: 100, nValid: 40, ...over };
+}
 
 function horizon(h: number, rankIc: number | null): FactorHorizonStat {
   return {
@@ -102,15 +109,40 @@ describe("quantileBars / weightBars", () => {
 
 describe("overfitWarning", () => {
   it("warns when out-of-sample IC collapses", () => {
-    expect(
-      overfitWarning({ icIn: 0.2, icOut: 0.05, r2In: null, r2Out: null, nTrain: 100, nValid: 40 }),
-    ).toMatch(/过拟合/);
+    expect(overfitWarning(metrics({ icOut: 0.05 }))).toMatch(/过拟合/);
   });
   it("no warning when out-of-sample holds", () => {
-    expect(
-      overfitWarning({ icIn: 0.2, icOut: 0.18, r2In: null, r2Out: null, nTrain: 100, nValid: 40 }),
-    ).toBeNull();
+    expect(overfitWarning(metrics({ icOut: 0.18 }))).toBeNull();
     expect(overfitWarning(null)).toBeNull();
+  });
+  it("warns when validation sample is too small (H7)", () => {
+    expect(overfitWarning(metrics({ nValid: 5 }))).toMatch(/样本量过小/);
+    expect(overfitWarning(metrics({ nTrain: 10 }))).toMatch(/样本量过小/);
+  });
+});
+
+describe("memberNames / applyWeights / weightsCoverMembers", () => {
+  const A: FactorMember = { factorKey: "mom_roc", params: {}, weight: 0, direction: "long" };
+  const B: FactorMember = { factorKey: "rev_rsi", params: {}, weight: 0, direction: "short" };
+
+  it("names repeated factorKey with #k suffix (mirrors backend member_names)", () => {
+    expect(memberNames([A, { ...A }, B])).toEqual(["mom_roc", "mom_roc#2", "rev_rsi"]);
+  });
+  it("bakes weights into members by name", () => {
+    const baked = applyWeights([A, B], { mom_roc: 0.6, rev_rsi: 0.4 });
+    expect(baked[0].weight).toBe(0.6);
+    expect(baked[1].weight).toBe(0.4);
+  });
+  it("keeps member weight when weights null/undefined", () => {
+    expect(applyWeights([{ ...A, weight: 0.9 }], null)[0].weight).toBe(0.9);
+  });
+  it("covers when keys exactly match member names", () => {
+    expect(weightsCoverMembers([A, B], { mom_roc: 0.6, rev_rsi: 0.4 })).toBe(true);
+  });
+  it("not covered when a member is missing / extra / weights absent", () => {
+    expect(weightsCoverMembers([A, B], { mom_roc: 1 })).toBe(false);
+    expect(weightsCoverMembers([A], { mom_roc: 0.5, rev_rsi: 0.5 })).toBe(false);
+    expect(weightsCoverMembers([A], null)).toBe(false);
   });
 });
 

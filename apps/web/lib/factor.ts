@@ -118,15 +118,58 @@ export function weightBars(weights: Record<string, number>): WeightGeom[] {
   }));
 }
 
-// 过拟合提示：样本外 IC 明显低于样本内（< 50%）→ 返回红字提示，否则 null。
+// 训练样本量下限（与后端 MIN_TRAIN_SAMPLES 同口径；低于即提示稳健性存疑，H7）。
+export const MIN_TRAIN_SAMPLES = 30;
+export const MIN_VALID_SAMPLES = 20;
+
+// 过拟合 / 样本不足提示：样本量过小 或 样本外 IC 明显低于样本内（< 50%）→ 返回红字提示，否则 null（H7）。
 export function overfitWarning(metrics: TrainMetrics | null | undefined): string | null {
   if (!metrics) return null;
-  const { icIn, icOut } = metrics;
+  const { icIn, icOut, nTrain, nValid } = metrics;
+  if ((nTrain != null && nTrain < MIN_TRAIN_SAMPLES) || (nValid != null && nValid < MIN_VALID_SAMPLES)) {
+    return `训练/验证样本量过小（n_train ${nTrain ?? "—"} · n_valid ${nValid ?? "—"}），权重稳健性存疑，建议扩大区间。`;
+  }
   if (icIn == null || icOut == null || icIn <= 0.02) return null;
   if (icOut < icIn * 0.5) {
     return `样本外 IC（${formatIc(icOut)}）明显低于样本内（${formatIc(icIn)}），存在过拟合风险。`;
   }
   return null;
+}
+
+// 成员稳定列名（与后端 member_names 同口径：重复 factorKey 追加 #k，训练/打分对齐权重）。
+export function memberNames(members: FactorMember[]): string[] {
+  const names: string[] = [];
+  const seen: Record<string, number> = {};
+  for (const m of members) {
+    const base = m.factorKey || "factor";
+    const count = seen[base] ?? 0;
+    seen[base] = count + 1;
+    names.push(count === 0 ? base : `${base}#${count + 1}`);
+  }
+  return names;
+}
+
+// 把训练权重按成员名烘焙进各成员 weight（自包含快照；无权重时原样返回）。与后端 apply_weights 同口径（H3）。
+export function applyWeights(
+  members: FactorMember[],
+  weights: Record<string, number> | null | undefined,
+): FactorMember[] {
+  if (!weights) return members.map((m) => ({ ...m }));
+  const names = memberNames(members);
+  return members.map((m, i) => ({ ...m, weight: weights[names[i]] ?? m.weight ?? 0 }));
+}
+
+// 训练权重键集是否恰好覆盖当前成员（成员变化后权重陈旧即 false；与后端 assert_weights_cover 同口径，H3）。
+export function weightsCoverMembers(
+  members: FactorMember[],
+  weights: Record<string, number> | null | undefined,
+): boolean {
+  if (!weights) return false;
+  const names = memberNames(members);
+  const keys = Object.keys(weights);
+  if (keys.length !== names.length) return false;
+  const nameSet = new Set(names);
+  return keys.every((k) => nameSet.has(k));
 }
 
 // 组合成员校验：至少 1 个、方向均冻结、factorKey 非空。合法返回 null，否则中文说明。
