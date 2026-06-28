@@ -160,21 +160,12 @@ async def get_factor_set(set_id: int, session: AsyncSession = Depends(get_sessio
 @router.post("/factor-sets", status_code=201)
 async def create_factor_set(body: FactorSetCreateReq,
                             session: AsyncSession = Depends(get_session)) -> dict:
-    from ..factors.specs import (
-        assert_norm_contract,
-        assert_weights_cover,
-        normalize_thresholds,
-        validate_members,
-    )
-    members = validate_members([m.model_dump() for m in body.members])
-    # 归一化契约/权重单源边界校验（H2/H3）：仅当 modelJson 带训练产物时生效，equal/未训练自动放行。
-    thresholds = normalize_thresholds((body.config or {}).get("thresholds"))
-    assert_norm_contract(thresholds, body.modelJson)
-    assert_weights_cover(members, body.modelJson)
-    values = repo.FactorSetValues(
-        name=body.name, members=members, method=body.method, config=body.config,
-        model=body.modelJson, metrics=body.metricsJson, enabled=body.enabled)
-    return factor_set_out(await repo.create_factor_set(session, values=values))
+    # 编排单源化到 service.create_set（与 Agent save_factor_set 共用，字节级等价，R2）：
+    # validate_members → normalize_thresholds → assert_norm_contract → assert_weights_cover → 落库 → factor_set_out。
+    return await service.create_set(
+        session, name=body.name, members_raw=[m.model_dump() for m in body.members],
+        method=body.method, config=body.config, model=body.modelJson,
+        metrics=body.metricsJson, enabled=body.enabled)
 
 
 @router.put("/factor-sets/{set_id}")

@@ -41,7 +41,10 @@ from ..engine.factors import (
 from ..engine.factors.mining import MINE_MIN_COVERAGE, MINE_PERSIST_MIN_ABS_IR
 from ..engine.factors.scoring import DEFAULT_CLIP, DEFAULT_NORM_WINDOW
 from ..engine.mtf import bar_to_seconds
+from ..schemas import factor_set_out
 from .specs import (
+    assert_norm_contract,
+    assert_weights_cover,
     members_from_set_row,
     norm_stats_from_set_row,
     normalize_thresholds,
@@ -241,6 +244,28 @@ async def _train_weights_guarded(matrix, label, names, method: str, config: dict
             train_weights, matrix, label, names, method=method, config=config, norm_stats=norm_stats)
     except ValueError as exc:
         raise HTTPException(400, detail={"code": "FACTOR_TRAIN_FAILED", "message": str(exc)}) from exc
+
+
+# ============================ 组合创建（单源编排，R2） ============================
+async def create_set(session: AsyncSession, *, name: str, members_raw: list[dict], method: str,
+                     config: dict | None, model: dict | None, metrics: dict | None,
+                     enabled: bool) -> dict:
+    """创建因子组合的**单一真源**编排，供 REST 路由与 Agent 工具共用（消除逻辑漂移，R2）。
+
+    顺序与原 ``api/factors.create_factor_set`` 字节级一致：``validate_members`` → ``normalize_thresholds``
+    → ``assert_norm_contract`` → ``assert_weights_cover`` → ``repo.create_factor_set`` → ``factor_set_out``。
+    归一化契约/权重单源校验仅当 ``model`` 带训练产物时生效（equal/未训练自动放行）。
+
+    Raises:
+        HTTPException: 400 —— 成员非法 / 归一化窗口漂移 / 训练权重陈旧（与 REST 同一错误码）。
+    """
+    members = validate_members(members_raw)
+    thresholds = normalize_thresholds((config or {}).get("thresholds"))
+    assert_norm_contract(thresholds, model)
+    assert_weights_cover(members, model)
+    values = repo.FactorSetValues(name=name, members=members, method=method, config=config,
+                                  model=model, metrics=metrics, enabled=enabled)
+    return factor_set_out(await repo.create_factor_set(session, values=values))
 
 
 def resolve_set_to_spec(row: FactorSet) -> dict:

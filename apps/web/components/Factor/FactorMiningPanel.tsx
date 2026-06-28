@@ -158,7 +158,9 @@ export default function FactorMiningPanel() {
               ))}
               {mine.data.items.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="px-3 py-6 text-center text-[var(--muted)]">本区间无有效因子</td>
+                  <td colSpan={8} className="px-3 py-6 text-center text-[var(--muted)]">
+                    该区间/类别下未发现有效因子，请调整区间或类别后重试。
+                  </td>
                 </tr>
               )}
             </tbody>

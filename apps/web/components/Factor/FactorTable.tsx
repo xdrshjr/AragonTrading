@@ -48,7 +48,7 @@ export default function FactorTable() {
     enabled: enabledFilter === "all" ? undefined : enabledFilter === "enabled",
     sort: sort || undefined,
   };
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: [...LIST_KEY, filter],
     queryFn: () => factorApi.list(filter),
   });
@@ -131,6 +131,13 @@ export default function FactorTable() {
 
       {isLoading ? (
         <Skeleton className="h-64" />
+      ) : isError ? (
+        <div className="card flex flex-col items-center gap-2 p-6 text-center">
+          <p className="text-xs text-[var(--short)]">加载因子失败，请重试</p>
+          <Button variant="default" size="sm" onClick={() => void refetch()}>
+            重试
+          </Button>
+        </div>
       ) : (
         <div className="overflow-x-auto rounded-[12px] border border-[var(--border)]">
           <table className="w-full min-w-[680px] text-left text-xs">

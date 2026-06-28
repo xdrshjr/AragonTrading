@@ -27,6 +27,7 @@ from ..prompts import FACTOR_REASONING_SCAFFOLD
 from ...db import repositories as repo
 from ...factors import service as factor_service
 from ...factors.service import FactorWindow, resolve_set_to_spec
+from ...factors.specs import normalize_thresholds, validate_factor_strategy_params
 from .base import (
     BAR_ENUM,
     Tool,
@@ -313,6 +314,85 @@ class ScoreFactorComboTool(Tool):
                    f"（{len(points)} 个有效点 / {len(df)} 根）。")
         return ToolResult(True, summary, payload={"factorSetId": row.id, "name": row.name,
                                                   "latest": latest, "validPoints": len(points)})
+
+
+class SaveFactorSetTool(Tool):
+    name = "save_factor_set"
+    category = "factor"
+    description = ("把一组（通常已训练的）因子成员持久化为可复用的因子组合，闭合「挖掘→评估→训练→保存」链路；"
+                  "成员方向须冻结 long/short，校验与 REST 完全同轨（非法成员/契约漂移即如实回报）。")
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "组合名称"},
+            "members": {"type": "array", "description": "成员 [{factorKey,direction(long/short),params?,weight?}]（1..12）",
+                        "items": {"type": "object"}},
+            "method": {"type": "string", "enum": list(_METHOD_ENUM), "description": "训练方法（默认 equal）"},
+            "modelJson": {"type": "object", "description": "训练产物（weights/normStats/provenance/trainerVersion）"},
+            "config": {"type": "object", "description": "组合配置（含 thresholds）"},
+            "metricsJson": {"type": "object", "description": "训练复合 IC 等指标"},
+            "enabled": {"type": "boolean", "description": "是否启用（默认 true）"},
+        },
+        "required": ["name", "members"],
+    }
+
+    def validate(self, args: dict) -> str | None:
+        members = args.get("members")
+        if not isinstance(members, list) or not members:
+            return "members 必须为非空数组"
+        return first_error(require_str(args, "name"), check_enum(args, "method", _METHOD_ENUM))
+
+    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        method = args.get("method", "equal")
+        async with ctx.session_factory() as session:
+            result = await factor_service.create_set(
+                session, name=args["name"], members_raw=args["members"], method=method,
+                config=args.get("config"), model=args.get("modelJson"),
+                metrics=args.get("metricsJson"), enabled=bool(args.get("enabled", True)))
+        summary = (f"已保存组合「{result['name']}」(#{result['id']})，成员 {len(result['members'])} 个，"
+                   f"方法 {result['method']}。")
+        return ToolResult(True, summary, payload=result)
+
+
+class CreateFactorStrategyTool(Tool):
+    name = "create_factor_strategy"
+    category = "factor"
+    description = ("以内联快照部署一个 factor_score 策略，使其立即可在回测/对比/Walk-forward 中使用，闭合"
+                  "「保存→部署」链路；成员方向须冻结、权重已烘焙，normStats/provenance 仅记录不参与打分。")
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "策略名称"},
+            "members": {"type": "array", "description": "成员 [{factorKey,direction(long/short),params?,weight}]（1..12）",
+                        "items": {"type": "object"}},
+            "thresholds": {"type": "object",
+                           "description": "交易阈值 enterLong/enterShort/exitBand/normWindow/squash（缺省取默认）"},
+            "normStats": {"type": "object", "description": "归一化契约 {normWindow,clip}（供打分取同窗口）"},
+            "provenance": {"type": "object", "description": "训练溯源（仅 UI 展示训练区间，绝不参与打分）"},
+        },
+        "required": ["name", "members"],
+    }
+
+    def validate(self, args: dict) -> str | None:
+        members = args.get("members")
+        if not isinstance(members, list) or not members:
+            return "members 必须为非空数组"
+        return require_str(args, "name")
+
+    async def execute(self, args: dict, ctx: ToolContext) -> ToolResult:
+        # 复用 R1 边界校验单源（冻结方向 / 已知 key / 成员数）；非法即 HTTPException → registry 收敛 ok=False。
+        validate_factor_strategy_params({"members": args["members"]})
+        params: dict = {"members": args["members"],
+                        "thresholds": normalize_thresholds(args.get("thresholds"))}
+        if args.get("normStats") is not None:
+            params["normStats"] = args["normStats"]
+        if args.get("provenance") is not None:
+            params["provenance"] = args["provenance"]
+        async with ctx.session_factory() as session:
+            strategy = await repo.create_strategy(session, "factor_score", args["name"], params)
+        summary = (f"已创建 factor_score 策略「{strategy['name']}」(#{strategy['id']})，"
+                   f"已可在回测/对比中使用。")
+        return ToolResult(True, summary, payload={"strategyId": strategy["id"], "name": strategy["name"]})
 
 
 class ShowFactorTool(Tool):

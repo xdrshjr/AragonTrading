@@ -22,9 +22,11 @@ from .run_tools import (
 )
 from .factor_tools import (
     ComputeFactorTool,
+    CreateFactorStrategyTool,
     EvaluateFactorTool,
     ListFactorsTool,
     MineFactorsTool,
+    SaveFactorSetTool,
     ScoreFactorComboTool,
     ShowFactorTool,
     TrainFactorWeightsTool,
@@ -55,6 +57,8 @@ _ALL_TOOLS: list[Tool] = [
     MineFactorsTool(),
     TrainFactorWeightsTool(),
     ScoreFactorComboTool(),
+    SaveFactorSetTool(),
+    CreateFactorStrategyTool(),
     ShowFactorTool(),
 ]
 

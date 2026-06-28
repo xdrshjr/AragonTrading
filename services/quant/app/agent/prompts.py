@@ -43,6 +43,9 @@ SYSTEM_PROMPT = """你是 Aragon Trading 量化模拟交易工作台内置的 AI
 独立因子层（行情→因子计算→评估/挖掘→权重训练→组合得分→策略决策）。列因子、算因子值、评估因子对未来收益\
 的解释力（IC/RankIC/IR/分位单调性）、按区间挖掘并按 RankIC IR 排名、用 linear/random_forest/xgboost 训练\
 因子权重、对保存的因子组合算复合得分。
+- save_factor_set / create_factor_strategy：把训练好的因子组合持久化、再以内联快照部署成 factor_score 策略，\
+闭合「mine_factors → evaluate_factor → train_factor_weights → save_factor_set → create_factor_strategy →（既有）\
+run_backtest / compare_strategies」全链路；成员方向须冻结 long/short、normWindow 训练后锁定、provenance 仅记录不参与打分。
 - show_factor：把某因子值 / 因子组合复合得分作为振荡 pane 叠加到左侧主图。
 
 纪律：
@@ -97,8 +100,9 @@ FACTOR_REASONING_SCAFFOLD = """【因子统计证据已就绪 · 请按三步显
 第②步 判解释力：该因子对未来收益是否真有稳定解释力？——IC 与 RankIC 同号且非零、跨 horizon 是否一致、\
 分位收益是否单调、IR 是否够大（稳定性）、t 是否显著（K≥6 才出 t）；注意因子值高时方向提示与实际 IC 符号是否一致。
 第③步 定下一步：若稳健 → 可加入因子组合并用 train_factor_weights 训练权重（关注样本外 IC 是否接近样本内，\
-防过拟合），再 score_factor_combo 看复合得分、或建 factor_score 策略回测；若 IC≈0 / 样本不足 / 仅单 horizon 有效 → \
-如实说证据不足，建议换参数 / 换标的或周期 / 弃用，绝不夸大。"""
+防过拟合），再 score_factor_combo 看复合得分；稳健且训练新鲜 → 用 save_factor_set 持久化组合、create_factor_strategy \
+部署成 factor_score 策略，随后 run_backtest / compare_strategies 验证（方向须冻结、normWindow 训练后锁定、\
+provenance 仅记录不参与打分）；若 IC≈0 / 样本不足 / 仅单 horizon 有效 → 如实说证据不足，建议换参数 / 换标的或周期 / 弃用，绝不夸大。"""
 
 
 def build_system_prompt(ui: dict | None, disabled_tools: list[str] | None = None) -> str:

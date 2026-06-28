@@ -123,6 +123,73 @@ async def test_score_factor_combo_tool(patch_okx):
         await dispose_engine()
 
 
+async def test_save_factor_set_tool(patch_okx):
+    """save_factor_set 合法成员 → 落库；随后 score_factor_combo 能对其打分（闭环，R2）。"""
+    from app.db.session import dispose_engine
+    await _init()
+    try:
+        reg = ToolRegistry()
+        members = [{"factorKey": "mom_roc", "direction": "long", "weight": 1.0},
+                   {"factorKey": "rev_rsi", "direction": "short", "weight": 1.0}]
+        saved = await reg.execute("save_factor_set",
+                                  {"name": "Agent组合", "members": members, "method": "equal"}, _ctx())
+        assert saved.ok and "已保存组合" in saved.summary
+        set_id = saved.payload["id"]
+        scored = await reg.execute("score_factor_combo",
+                                   {"factorSetId": set_id, "instId": "BTC-USDT-SWAP", "bar": "1H"}, _ctx())
+        assert scored.ok and scored.payload["factorSetId"] == set_id
+    finally:
+        await dispose_engine()
+
+
+async def test_save_factor_set_invalid_members_ok_false(patch_okx):
+    """非法成员（auto 方向）→ ok=False（HTTPException 经 registry 收敛，绝不落脏组合，R2/RR2）。"""
+    from app.db.session import dispose_engine
+    await _init()
+    try:
+        reg = ToolRegistry()
+        res = await reg.execute("save_factor_set",
+                                {"name": "bad", "members": [{"factorKey": "mom_roc", "direction": "auto"}]}, _ctx())
+        assert res.ok is False
+    finally:
+        await dispose_engine()
+
+
+async def test_create_factor_strategy_tool(patch_okx):
+    """create_factor_strategy → 新 factor_score 策略落库且可被回测/对比读取（R2）。"""
+    from app.db.session import dispose_engine, get_sessionmaker
+    from app.db import repositories as repo
+    await _init()
+    try:
+        reg = ToolRegistry()
+        members = [{"factorKey": "mom_roc", "direction": "long", "weight": 0.6},
+                   {"factorKey": "rev_rsi", "direction": "short", "weight": 0.4}]
+        res = await reg.execute("create_factor_strategy",
+                                {"name": "Agent得分策略", "members": members}, _ctx())
+        assert res.ok and "已创建 factor_score 策略" in res.summary
+        sid = res.payload["strategyId"]
+        async with get_sessionmaker()() as session:
+            row = await repo.get_strategy(session, sid)
+            listed = await repo.list_strategies(session, None)
+        assert row is not None and row["templateKey"] == "factor_score" and row["kind"] == "factor"
+        assert any(s["id"] == sid for s in listed)
+    finally:
+        await dispose_engine()
+
+
+async def test_create_factor_strategy_invalid_ok_false(patch_okx):
+    """非法成员（未知 key）→ ok=False（复用 R1 校验器，绝不部署非法策略，R2）。"""
+    from app.db.session import dispose_engine
+    await _init()
+    try:
+        reg = ToolRegistry()
+        res = await reg.execute("create_factor_strategy",
+                                {"name": "bad", "members": [{"factorKey": "nope", "direction": "long"}]}, _ctx())
+        assert res.ok is False
+    finally:
+        await dispose_engine()
+
+
 async def test_show_factor_ui_action(patch_okx):
     from app.db.session import dispose_engine
     await _init()

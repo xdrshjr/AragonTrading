@@ -12,6 +12,7 @@ from fastapi import HTTPException
 
 from ..db.models import FactorSet
 from ..engine.factors import FACTOR_LIBRARY, member_names
+from ..strategies.base import get_strategy_class
 from ..strategies.factor_score_strategy import DEFAULT_THRESHOLDS
 
 MIN_FACTOR_SET_MEMBERS = 1    # 单因子也可成组合（直接用某个因子打分）
@@ -60,6 +61,29 @@ def _safe_float(value: object, default: float) -> float:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
+
+
+def is_factor(template_key: str) -> bool:
+    """该注册表模板是否为 factor_score 类策略（镜像 ``combo_specs.is_combo``，含 None 守卫，R1）。
+
+    对孤儿模板行（``get_strategy_class`` 返回 ``None``）安全返回 ``False``，杜绝 ``.meta.kind``
+    触发 ``AttributeError``（评审 P2-3）。
+    """
+    cls = get_strategy_class(template_key)
+    return cls is not None and getattr(cls.meta, "kind", "atomic") == "factor"
+
+
+def validate_factor_strategy_params(params: dict | None) -> None:
+    """因子策略快照在策略创建/更新边界的唯一成员校验入口（复用 ``validate_members``，R1/R2）。
+
+    取 ``params.members`` 交给 ``validate_members``（未知 factorKey / 非冻结方向 / 成员数越界一律 400），
+    把回测期会被 ``prepare`` 兜底成「安静空仓」、被引擎「静默越界」的非法快照在**创建期**一次性拦下
+    （评审 P1-1：真实危害是静默失败，故在边界显式 400 而非任由其流到回测期）。
+
+    Raises:
+        HTTPException: 400 —— ``FACTOR_MEMBERS`` / ``FACTOR_DIRECTION`` / ``FACTOR_UNKNOWN``。
+    """
+    validate_members((params or {}).get("members"))
 
 
 def normalize_thresholds(raw: dict | None) -> dict:

@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..agent import services
 from ..db import repositories as repo
 from ..db.session import get_session
+from ..factors.specs import is_factor, validate_factor_strategy_params
 from ..okx.rest_client import get_rest_client
 from ..schemas import (
     BacktestReq,
@@ -46,6 +47,9 @@ async def create_strategy(body: CreateStrategyReq,
     if get_strategy_class(body.templateKey) is None:
         raise HTTPException(400, detail={"code": "BAD_TEMPLATE", "message": "模板不存在"})
     services.validate_combo_params(body.templateKey, body.params)
+    # factor_score 的内联快照在创建边界一次性校验成员（否则非法快照会被回测期静默兜底，R1/评审 P1-1）。
+    if is_factor(body.templateKey):
+        validate_factor_strategy_params(body.params)
     return await repo.create_strategy(session, body.templateKey, body.name, body.params)
 
 
@@ -57,6 +61,9 @@ async def update_strategy(strategy_id: int, body: UpdateStrategyReq,
         existing = await repo.get_strategy(session, strategy_id)
         if existing is not None:
             services.validate_combo_params(existing["templateKey"], body.params)
+            # factor_score 改成员同样在边界校验（is_factor 对孤儿模板返回 False，无 AttributeError，R1/P2-3）。
+            if is_factor(existing["templateKey"]):
+                validate_factor_strategy_params(body.params)
     s = await repo.update_strategy(session, strategy_id, name=body.name,
                                    params=body.params, enabled=body.enabled)
     if s is None:
