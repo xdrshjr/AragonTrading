@@ -30,7 +30,7 @@ export default function LeverageControl({
         <span className="text-[10px] text-[var(--muted)]">上限 {Math.floor(maxLever)}×</span>
       </div>
       <div className="flex items-center gap-1.5">
-        <div className="grid flex-1 grid-cols-5 gap-1">
+        <div className="grid min-w-0 flex-1 grid-cols-5 gap-1">
           {PRESETS.filter((p) => p <= Math.floor(maxLever)).map((preset) => (
             <button
               key={preset}
@@ -49,17 +49,19 @@ export default function LeverageControl({
             </button>
           ))}
         </div>
-        <Input
-          type="number"
-          min={1}
-          max={Math.floor(maxLever)}
-          step={1}
-          value={value}
-          disabled={disabled}
-          aria-label="杠杆倍率"
-          onChange={(e) => onChange(clamp(Number(e.target.value)))}
-          className="w-16 text-right tabular"
-        />
+        <div className="w-16 shrink-0">
+          <Input
+            type="number"
+            min={1}
+            max={Math.floor(maxLever)}
+            step={1}
+            value={value}
+            disabled={disabled}
+            aria-label="杠杆倍率"
+            onChange={(e) => onChange(clamp(Number(e.target.value)))}
+            className="text-right tabular"
+          />
+        </div>
       </div>
     </div>
   );

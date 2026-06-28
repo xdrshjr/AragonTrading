@@ -67,19 +67,21 @@ export default function QuantitySlider({
           disabled={disabled || !(maxSz > 0)}
           ariaLabel="仓位数量百分比"
           onChange={(next) => onChange(sliderPctToSize(next, maxSz, lotSz))}
-          className="flex-1"
+          className="min-w-0 flex-1"
         />
-        <Input
-          type="number"
-          min={0}
-          step={lotSz}
-          value={text}
-          disabled={disabled}
-          invalid={!!error}
-          aria-label="仓位数量（张）"
-          onChange={(e) => onText(e.target.value)}
-          className="w-20 text-right tabular"
-        />
+        <div className="w-20 shrink-0">
+          <Input
+            type="number"
+            min={0}
+            step={lotSz}
+            value={text}
+            disabled={disabled}
+            invalid={!!error}
+            aria-label="仓位数量（张）"
+            onChange={(e) => onText(e.target.value)}
+            className="text-right tabular"
+          />
+        </div>
       </div>
 
       {error && (
