@@ -62,6 +62,8 @@ export default function LiveTradePanel({
   const qc = useQueryClient();
   const liveAcknowledged = useAppStore((s) => s.liveAcknowledged);
   const setLiveAcknowledged = useAppStore((s) => s.setLiveAcknowledged);
+  // 自动交易进行中：禁用人工下单，防人工与 bot 争抢同标的自管持仓（live-auto-trading §3）。
+  const liveAutoSessionId = useAppStore((s) => s.liveAutoSessionId);
 
   const configQ = useQuery({
     queryKey: ["trading", "config", instId, accountId ?? null],
@@ -148,11 +150,13 @@ export default function LiveTradePanel({
     );
   }
 
-  const blockedReason = !config.liveTradingEnabled
-    ? "实盘下单未启用（需后端设置 LIVE_TRADING_ENABLED=true），当前仅可查看真实持仓 / 成交。"
-    : !config.instrumentSupported
-      ? "当前标的非 USDT 本位永续 / 交割合约，暂不支持实盘下单。"
-      : null;
+  const blockedReason = liveAutoSessionId
+    ? "自动交易进行中，人工下单已暂停（避免与自动策略争抢同标的持仓）。"
+    : !config.liveTradingEnabled
+      ? "实盘下单未启用（需后端设置 LIVE_TRADING_ENABLED=true），当前仅可查看真实持仓 / 成交。"
+      : !config.instrumentSupported
+        ? "当前标的非 USDT 本位永续 / 交割合约，暂不支持实盘下单。"
+        : null;
   const controlsDisabled = blockedReason !== null || submitting;
   const canSubmit = blockedReason === null && validation.valid && !submitting;
 

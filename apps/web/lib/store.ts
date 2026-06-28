@@ -13,10 +13,13 @@ import type {
   ChartPane,
   ChartView,
   Mode,
+  PaperPositionEvent,
   PaperStrategySession,
   StrategyListTab,
+  Trade,
   WalkForwardResult,
 } from "./types";
+import type { LiveAutoStatus } from "./liveAutoTypes";
 
 type Theme = "light" | "dark";
 // 标的侧边栏页签：自选 / 现货 / 合约（"swap" 承载 SWAP+FUTURES 合约页签，RV-10）。
@@ -94,6 +97,12 @@ interface AppState {
   paperBatchGroupId: string | null;
   paperSessionsByStrategyId: Record<number, PaperStrategySession>;
   paperStreamsEnabled: boolean;
+  // 实时自动交易运行期态（live-auto-trading §5.4，全部瞬态、不入 partialize，刷新即复位）。
+  liveAutoSessionId: string | null;
+  liveAutoStatus: LiveAutoStatus | null;
+  liveAutoTrades: Trade[];                        // → overlayTrades（图表 markers）
+  liveAutoPosition: PaperPositionEvent | null;
+  liveAutoAcknowledged: boolean;                  // 首启风险勾选会话记忆，刷新复位
   theme: Theme;
   backtestStartTs: number;
   backtestEndTs: number;
@@ -145,6 +154,13 @@ interface AppState {
   setPaperSessionsByStrategyId: (sessions: Record<number, PaperStrategySession>) => void;
   setPaperStreamsEnabled: (enabled: boolean) => void;
   clearPaperRuntime: () => void;
+  setLiveAutoSessionId: (id: string | null) => void;
+  setLiveAutoStatus: (status: LiveAutoStatus | null) => void;
+  setLiveAutoTrades: (trades: Trade[]) => void;
+  appendLiveAutoTrade: (trade: Trade) => void;
+  setLiveAutoPosition: (pos: PaperPositionEvent | null) => void;
+  setLiveAutoAcknowledged: (v: boolean) => void;
+  clearLiveAutoRuntime: () => void;
   setBacktestRange: (startTs: number, endTs: number) => void;
   toggleTheme: () => void;
   setTheme: (t: Theme) => void;
@@ -204,6 +220,12 @@ export const useAppStore = create<AppState>()(
       paperBatchGroupId: null,
       paperSessionsByStrategyId: {},
       paperStreamsEnabled: false,
+      // 实时自动交易运行期态（瞬态，刷新复位；句柄由挂载时 GET /live-auto/status 重发现）。
+      liveAutoSessionId: null,
+      liveAutoStatus: null,
+      liveAutoTrades: [],
+      liveAutoPosition: null,
+      liveAutoAcknowledged: false,
       theme: "light",
       backtestStartTs: defaultStartTs,
       backtestEndTs: defaultEndTs,
@@ -292,6 +314,27 @@ export const useAppStore = create<AppState>()(
           paperBatchGroupId: null,
           paperSessionsByStrategyId: {},
           paperStreamsEnabled: false,
+        }),
+      // 实时自动交易运行期态（瞬态）：句柄 / 状态 / 成交流 / 持仓 / 风险勾选记忆 + 清理。
+      setLiveAutoSessionId: (liveAutoSessionId) => set({ liveAutoSessionId }),
+      setLiveAutoStatus: (liveAutoStatus) => set({ liveAutoStatus }),
+      setLiveAutoTrades: (liveAutoTrades) => set({ liveAutoTrades }),
+      appendLiveAutoTrade: (trade) =>
+        set((s) =>
+          s.liveAutoTrades.some(
+            (t) => t.ts === trade.ts && t.side === trade.side && t.price === trade.price,
+          )
+            ? s
+            : { liveAutoTrades: [...s.liveAutoTrades, trade] },
+        ),
+      setLiveAutoPosition: (liveAutoPosition) => set({ liveAutoPosition }),
+      setLiveAutoAcknowledged: (liveAutoAcknowledged) => set({ liveAutoAcknowledged }),
+      clearLiveAutoRuntime: () =>
+        set({
+          liveAutoSessionId: null,
+          liveAutoStatus: null,
+          liveAutoTrades: [],
+          liveAutoPosition: null,
         }),
       setBacktestRange: (backtestStartTs, backtestEndTs) =>
         set({ backtestStartTs, backtestEndTs, runId: null }),
@@ -385,7 +428,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 17,
+      version: 18,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -489,6 +532,9 @@ export const useAppStore = create<AppState>()(
         if (version < 17) {
           // 因子层：补因子实验室当前工作区默认（showFactorLab/factorOverlay 为瞬态，不入 partialize）。
           next = { ...next, factorLabSection: "catalog" };
+        }
+        if (version < 18) {
+          // 实时自动交易：运行期态全部瞬态（不入 partialize），浅合并回落初值即可；此处仅显式占位稳妥。
         }
         return next as never;
       },

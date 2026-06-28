@@ -36,6 +36,8 @@ import {
   visiblePaperTrades,
 } from "@/lib/paperMulti";
 import { DEFAULT_RIGHT_PANEL_WIDTH, useAppStore } from "@/lib/store";
+import { liveAutoApi, liveAutoWS } from "@/lib/liveAutoApi";
+import type { LiveAutoSnapshot, LiveAutoStatus } from "@/lib/liveAutoTypes";
 import type {
   Candle,
   CompareResult,
@@ -63,11 +65,14 @@ export default function Page() {
     mode,
     runId,
     chartView,
+    accountMode,
     paperSessionId,
     paperSessionsByStrategyId,
     paperVisibleStrategyIds,
     paperActiveStrategyId,
     paperStreamsEnabled,
+    liveAutoSessionId,
+    liveAutoTrades,
     theme,
     backtestStartTs,
     backtestEndTs,
@@ -79,6 +84,11 @@ export default function Page() {
     setPaperActiveStrategyId,
     setPaperVisibleStrategyIds,
     togglePaperVisibleStrategyId,
+    setLiveAutoSessionId,
+    setLiveAutoStatus,
+    setLiveAutoTrades,
+    appendLiveAutoTrade,
+    setLiveAutoPosition,
     toggleTheme,
     setRightPanelWidth,
   } = useAppStore();
@@ -305,6 +315,54 @@ export default function Page() {
     return () => clients.forEach((client) => client.close());
   }, [mode, paperStreamsEnabled, paperStrategies]);
 
+  // 实时自动交易：挂载 / 切到实盘时 GET /live-auto/status 重发现孤儿会话（renderer 刷新后后端会话仍在跑）。
+  useEffect(() => {
+    if (accountMode !== "live") return;
+    let cancelled = false;
+    liveAutoApi
+      .status()
+      .then((res) => {
+        if (cancelled) return;
+        if (res.session && res.session.state === "running") {
+          setLiveAutoSessionId(res.session.sessionId);
+          setLiveAutoStatus({
+            state: res.session.state,
+            sessionPnlUsd: res.session.sessionPnlUsd,
+            positionSide: res.session.positionSide,
+            budgetUsd: res.session.budgetUsd,
+            leverage: res.session.leverage,
+          });
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [accountMode, setLiveAutoSessionId, setLiveAutoStatus]);
+
+  // 实时自动交易：会话句柄就绪即订阅 /ws/live-auto/{id}（事件协议与 paper 同构）。
+  useEffect(() => {
+    if (!liveAutoSessionId) return;
+    const ws = liveAutoWS(liveAutoSessionId, (event: WsEvent) => {
+      handleLiveAutoEvent(event, {
+        setLiveAutoTrades,
+        appendLiveAutoTrade,
+        setLiveAutoPosition,
+        setLiveAutoStatus,
+        setLive,
+        setForming,
+      });
+    });
+    ws.connect();
+    return () => ws.close();
+  }, [
+    liveAutoSessionId,
+    setLiveAutoTrades,
+    appendLiveAutoTrade,
+    setLiveAutoPosition,
+    setLiveAutoStatus,
+  ]);
+
   // 节流约束：ref 推进必须随入帧同步发生（ref 无渲染成本，candle 分支门控要读最新值），
   // 只有 setLastMarketTs 这个 state 写入才纳入节流（由 throttle 的 flush 统一落库）。
   const advanceMarketTs = (ts: number) => {
@@ -398,8 +456,10 @@ export default function Page() {
         : undefined;
   const overlays =
     mode === "paper" && paperEquityOverlays.length > 0 ? paperEquityOverlays : compareOverlays;
-  const overlayTrades =
-    mode === "paper"
+  // 实时自动交易活跃时，图表 markers 取自动交易成交流（live 模式本无策略 overlay，故为纯增量）。
+  const overlayTrades = liveAutoSessionId
+    ? liveAutoTrades
+    : mode === "paper"
       ? paperOverlayTrades
       : chartView === "run-range" && singleRunMode
         ? tradesQ.data
@@ -621,6 +681,47 @@ function handlePaperEvent(
       ...prev,
       [session.strategyId]: event.data as PaperPositionEvent,
     }));
+    return;
+  }
+  if (event.type === "candle") {
+    const candle = event.data as Candle;
+    if (candle.confirm) {
+      setters.setLive((prev) => mergeUnique(prev, [candle]));
+      setters.setForming(null);
+    } else {
+      setters.setForming(candle);
+    }
+  }
+}
+
+interface LiveAutoEventSetters {
+  setLiveAutoTrades: (trades: Trade[]) => void;
+  appendLiveAutoTrade: (trade: Trade) => void;
+  setLiveAutoPosition: (pos: PaperPositionEvent | null) => void;
+  setLiveAutoStatus: (status: LiveAutoStatus | null) => void;
+  setLive: Dispatch<SetStateAction<Candle[]>>;
+  setForming: Dispatch<SetStateAction<Candle | null>>;
+}
+
+// 自动交易 WS 事件 → store / 图表（事件协议与 paper 同构；candle 由市场 WS 兜底，这里仅作冗余对齐）。
+function handleLiveAutoEvent(event: WsEvent, setters: LiveAutoEventSetters) {
+  if (event.type === "snapshot") {
+    const snap = event.data as LiveAutoSnapshot;
+    setters.setLiveAutoTrades(snap.trades ?? []);
+    setters.setLiveAutoPosition(snap.position ?? null);
+    if (snap.status) setters.setLiveAutoStatus(snap.status);
+    return;
+  }
+  if (event.type === "trade") {
+    setters.appendLiveAutoTrade(event.data as Trade);
+    return;
+  }
+  if (event.type === "position") {
+    setters.setLiveAutoPosition(event.data as PaperPositionEvent);
+    return;
+  }
+  if (event.type === "status") {
+    setters.setLiveAutoStatus(event.data as LiveAutoStatus);
     return;
   }
   if (event.type === "candle") {

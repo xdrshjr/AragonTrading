@@ -13,8 +13,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .agent.manager import get_agent_manager
-from .api import accounts, agent, factors, market, paper, runs, strategies, trading, ws_market
+from .api import (
+    accounts,
+    agent,
+    factors,
+    live_auto,
+    market,
+    paper,
+    runs,
+    strategies,
+    trading,
+    ws_market,
+)
 from .db.session import dispose_engine, init_db
+from .live_auto.manager import get_live_auto_manager
 from .okx.rest_client import OKXError, get_rest_client
 from .paper.manager import get_paper_manager
 
@@ -29,6 +41,7 @@ async def lifespan(app: FastAPI):
     yield
     await get_agent_manager().shutdown()
     await get_paper_manager().shutdown()
+    await get_live_auto_manager().shutdown()
     await get_rest_client().aclose()
     await dispose_engine()
 
@@ -101,6 +114,7 @@ app.include_router(agent.router, prefix="/api")
 app.include_router(accounts.router, prefix="/api")
 app.include_router(trading.router, prefix="/api")
 app.include_router(factors.router, prefix="/api")   # 第 9 个路由（因子层 §3.1）
+app.include_router(live_auto.router, prefix="/api")  # 实时自动交易（live-auto-trading §4）
 
 
 @app.get("/")

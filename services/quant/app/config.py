@@ -51,6 +51,17 @@ class Settings(BaseSettings):
     live_default_td_mode: str = "cross"          # 合约默认保证金模式（cross | isolated）
     live_default_leverage: float = 3.0           # 下单面板默认杠杆
 
+    # ---- 实时自动交易（live-auto-trading spec §三/config，策略驱动无人值守下单）----
+    # 字段名即环境变量名（LIVE_AUTO_*，大小写不敏感）；桌面端经 desktop/src/lib/config.js
+    # 白名单 key.startsWith('LIVE_') 天然透传。安全：自动化总闸默认关闭（R1）——自动下单真正的
+    # 默认关闭闸是 live_auto_trading_enabled（live_trading_enabled 现默认 True），启动须 API 层
+    # 显式同时校验两闸皆为 True 方可放行。
+    live_auto_trading_enabled: bool = False      # 自动化专用总闸：False 时 /live-auto 写类一律 403
+    live_auto_max_sessions: int = 1              # 单会话独占（真实资金，绝不并发多策略自动下单）
+    live_auto_default_capital_frac: float = 0.01  # 预算留空时取可用 USDT 的 1%（保守默认）
+    live_auto_max_capital_frac: float = 0.05     # 预算对可用余额硬上限（前置门禁强制夹紧，R4）
+    live_auto_poll_interval_s: int = 5           # 持仓 reconcile / 会话盯市轮询基准间隔（秒）
+
     # ---- 代理（透传给 httpx / websockets）----
     http_proxy: str = ""
     https_proxy: str = ""

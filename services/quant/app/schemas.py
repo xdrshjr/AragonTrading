@@ -188,6 +188,54 @@ class PaperBatchStopOut(BaseModel):
     runs: list[PaperBatchStopRunOut]
 
 
+# ---------------- 实时自动交易（live-auto-trading §5.1，camelCase wire）----------------
+class LiveAutoStartIn(BaseModel):
+    """启动实时自动交易请求（全部金额字段可选，留空→服务端保守默认，§4.1）。"""
+
+    strategyId: int
+    instId: str = Field(min_length=1, max_length=32)
+    bar: str = "1H"
+    accountId: int | None = None                              # 省略=默认实盘账户
+    capitalUsd: float | None = Field(default=None, gt=0)      # 预算（USDT），留空→ availUsdt×默认 frac
+    leverage: float | None = Field(default=None, gt=0, le=125)
+    takeProfitUsd: float | None = Field(default=None, gt=0)   # 会话级止盈金额阈值；留空→不触发
+    stopLossUsd: float | None = Field(default=None, gt=0)     # 会话级止损金额阈值；留空→不触发
+    priming: bool = True
+    primingBars: int = Field(default=300, ge=10, le=PAPER_WINDOW_MAX)
+
+
+class LiveAutoStartOut(BaseModel):
+    sessionId: str
+    runId: int
+    strategyKind: str
+    instId: str
+    bar: str
+    budgetUsd: float           # 夹紧后的最终生效预算（可能 < 用户填值，R4）
+    leverage: float
+
+
+class LiveAutoSessionRow(BaseModel):
+    sessionId: str
+    runId: int
+    state: str
+    strategyId: int
+    strategyName: str
+    instId: str
+    bar: str
+    budgetUsd: float
+    leverage: float
+    takeProfitUsd: float | None
+    stopLossUsd: float | None
+    positionSide: str
+    sessionPnlUsd: float
+    startedTs: int
+
+
+class LiveAutoStatusOut(BaseModel):
+    session: LiveAutoSessionRow | None
+    liveAutoTradingEnabled: bool
+
+
 # ---------------- Response serializers ----------------
 def trade_out(t: Trade) -> dict:
     return {

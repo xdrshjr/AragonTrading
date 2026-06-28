@@ -255,6 +255,25 @@ async def append_equity(session: AsyncSession, run_id: int, e: EquityRecord) -> 
     await session.commit()
 
 
+async def finalize_run(session: AsyncSession, run_id: int, *, status: str,
+                       metrics: dict | None = None, end_ts: int | None = None) -> StrategyRun | None:
+    """更新 Run 终态 / 指标（仅 UPDATE，仿 append_* 提交模式，live-auto-trading R2）。
+
+    `create_run` 已建 running 行；本函数在自动会话停止 / 会话级止盈止损触发时落终态指标，
+    使运行历史可复现。Run 不存在返回 None（绝不静默新建）。
+    """
+    run = await session.get(StrategyRun, run_id)
+    if run is None:
+        return None
+    run.status = status
+    if metrics is not None:
+        run.metrics_json = json.dumps(metrics, ensure_ascii=False)
+    if end_ts is not None:
+        run.end_ts = end_ts
+    await session.commit()
+    return run
+
+
 # ============================ Candle cache ============================
 async def get_cached_candles(session: AsyncSession, inst_id: str, bar: str,
                              limit: int) -> list[dict]:
