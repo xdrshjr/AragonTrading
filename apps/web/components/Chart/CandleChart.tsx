@@ -23,6 +23,7 @@ import {
 import { normalizeEquity } from "@/lib/compare";
 import { buildIndicatorLegendItems } from "@/lib/indicatorLegend";
 import { INDICATORS, type IndicatorKey, type Plot, type ThemeColors } from "@/lib/indicators";
+import type { OrderPriceLine } from "@/lib/openOrders";
 import { selectActivePane } from "@/lib/paneTabs";
 import {
   buildTradeMarkerEvents,
@@ -40,8 +41,10 @@ import type {
 import { Tabs } from "@/components/ui";
 import IndicatorLegendOverlay from "./IndicatorLegendOverlay";
 import IndicatorPane from "./IndicatorPane";
+import OrderLineTag from "./OrderLineTag";
 import { reconcilePlots, type PlotSeries } from "./plots";
 import TradeTooltip from "./TradeTooltip";
+import { useOrderPriceLines } from "./useOrderPriceLines";
 
 type Props = {
   candles: Candle[];
@@ -60,6 +63,8 @@ type Props = {
   paneTab?: IndicatorKey | null;
   onPaneTabChange?: (key: IndicatorKey) => void;
   livePrice?: number | null;
+  // 实盘未结委托价格线（平仓 / 止盈 / 止损）：不同色彩虚线 + 右价轴常显价 + 悬停涨跌幅浮层。
+  orderLines?: OrderPriceLine[];
   // 切标的 / 切周期的离散复位键：用于在换标的时把主图价轴 autoScale 拨回 true
   //（chart-candles-disappear-on-symbol-switch，见下方 reset effect）。
   instId?: string;
@@ -96,6 +101,7 @@ export default function CandleChart({
   paneTab,
   onPaneTabChange,
   livePrice,
+  orderLines,
   instId,
   bar,
 }: Props) {
@@ -307,6 +313,10 @@ export default function CandleChart({
     });
   }, [livePrice, theme]);
 
+  // 实盘未结委托价格线 + 悬停涨跌幅（C4：reconcile / 命中逻辑收敛在 useOrderPriceLines）。
+  // 须置于上方创建图表 effect 之后，保证挂载时 chartRef / candleSeriesRef 已就绪。
+  const orderHover = useOrderPriceLines(chartRef, candleSeriesRef, orderLines, theme);
+
   // 切标的 / 切周期时复位主图价轴自适应（chart-candles-disappear-on-symbol-switch）。
   // 根因：用户拖动价轴缩放会把 autoScale 关掉（lwc scaleTo→setMode），此后切到价格量级相差很大的
   // 标的，下方 [candles] 的 setData 因库内 !isAutoScale() 短路而不再重拟合价区间，新 K 线落在旧价窗
@@ -511,6 +521,7 @@ export default function CandleChart({
       <div className="relative min-h-0 w-full flex-[4]">
         <div ref={containerRef} className="h-full w-full" />
         <IndicatorLegendOverlay items={legendItems} />
+        {orderHover && <OrderLineTag hover={orderHover} />}
       </div>
       {tradeTooltip && (
         <TradeTooltip events={tradeTooltip.events} x={tradeTooltip.x} y={tradeTooltip.y} />

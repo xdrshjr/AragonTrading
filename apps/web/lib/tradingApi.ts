@@ -2,7 +2,11 @@
 // 复用 accountApi 的 request 风格与错误体解析；绝不携带 / 返回明文凭证（C7）。
 import { ApiRequestError } from "./api";
 import type {
+  CloseAllResult,
+  ClosePositionReq,
+  ClosePositionResult,
   LiveFillsResponse,
+  LiveOpenOrdersResponse,
   LivePositionsResponse,
   PlaceOrderReq,
   PlaceOrderResult,
@@ -56,10 +60,22 @@ export const tradingApi = {
   // 真实成交明细（轮询源，8s）。
   fills: (instId?: string, accountId?: number, limit = 100) =>
     request<LiveFillsResponse>(`/trading/fills${qs({ instId, accountId, limit })}`),
+  // 未结委托（普通挂单 + 策略委托；轮询源，5s；前端不传 instId，客户端过滤）。
+  openOrders: (accountId?: number) =>
+    request<LiveOpenOrdersResponse>(`/trading/open-orders${qs({ accountId })}`),
   // 设杠杆（受 LIVE_TRADING_ENABLED 守门）。
   setLeverage: (req: SetLeverageReq) =>
     request<SetLeverageResult>("/trading/leverage", { method: "POST", body: JSON.stringify(req) }),
   // 实盘下单（受 LIVE_TRADING_ENABLED 守门）。
   placeOrder: (req: PlaceOrderReq) =>
     request<PlaceOrderResult>("/trading/order", { method: "POST", body: JSON.stringify(req) }),
+  // 单仓平仓（limit 挂单 / market 整仓；受 LIVE_TRADING_ENABLED 守门）。
+  closePosition: (req: ClosePositionReq) =>
+    request<ClosePositionResult>("/trading/close", { method: "POST", body: JSON.stringify(req) }),
+  // 一键市价全平（受 LIVE_TRADING_ENABLED 守门；逐仓诚实汇总）。
+  closeAll: (accountId?: number) =>
+    request<CloseAllResult>("/trading/close-all", {
+      method: "POST",
+      body: JSON.stringify({ accountId }),
+    }),
 };

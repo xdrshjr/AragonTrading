@@ -1,5 +1,6 @@
 "use client";
 
+import { useQuery } from "@tanstack/react-query";
 import dynamic from "next/dynamic";
 import { useEffect, useMemo, useRef, useState } from "react";
 import LiveBottomPanel from "@/components/Live/LiveBottomPanel";
@@ -9,8 +10,10 @@ import TradesTable from "@/components/Strategy/TradesTable";
 import { Tabs } from "@/components/ui";
 import PanelResizeHandle from "@/components/ui/PanelResizeHandle";
 import type { IndicatorKey } from "@/lib/indicators";
+import { buildOrderPriceLines, openOrdersKey } from "@/lib/openOrders";
 import { ratioFromRightEdge } from "@/lib/panelResize";
 import { buildPaperPositionRows } from "@/lib/paperMulti";
+import { tradingApi } from "@/lib/tradingApi";
 import {
   DEFAULT_CHART_SPLIT_RATIO,
   DEFAULT_DEPTH_PANEL_RATIO,
@@ -157,6 +160,20 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
   const prevClose = displayIndex > 0 ? candles[displayIndex - 1].c : (displayCandle?.o ?? null);
   const markPrice = lastPrice ?? candles.at(-1)?.c ?? null;
 
+  // 实盘模式下轮询未结委托（与持仓表共用 openOrdersKey 同源去重，C2），过滤当前 instId 构造图表虚线。
+  // 失败时 data 为空 → orderLines 退化为空数组，绝不阻断 K 线渲染（C6 错误隔离）。
+  const openOrdersQ = useQuery({
+    queryKey: openOrdersKey(),
+    queryFn: () => tradingApi.openOrders(),
+    enabled: accountMode === "live",
+    refetchInterval: 5_000,
+    refetchOnWindowFocus: true,
+  });
+  const orderLines = useMemo(
+    () => buildOrderPriceLines(openOrdersQ.data?.orders ?? [], instId, markPrice),
+    [openOrdersQ.data, instId, markPrice],
+  );
+
   const paperPositionRows = useMemo(
     () =>
       buildPaperPositionRows(
@@ -256,6 +273,7 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
                 paneTab={paneTab}
                 onPaneTabChange={setPaneTab}
                 livePrice={market.lastPrice}
+                orderLines={accountMode === "live" ? orderLines : undefined}
                 instId={instId}
                 bar={bar}
               />

@@ -63,6 +63,29 @@ class OKXTradeClient(OKXPrivateClient):
             raise OKXPrivateError(code, str(msg))
         return row
 
+    async def close_position(self, inst_id: str, pos_side: str, mgn_mode: str, *,
+                             auto_cxl: bool = True, cl_ord_id: str | None = None) -> dict:
+        """``POST /api/v5/trade/close-position``：按当前市价**整仓**平掉某持仓（平仓 spec §2.2）。
+
+        ``posSide`` 对冲取持仓方向、净持仓取 ``"net"``；``mgnMode`` 取该仓保证金模式；``autoCxl`` 撤掉该
+        合约未成交挂单。该接口**不返回 ordId**（返回 ``instId/posSide/clOrdId``）。判成功：顶层 ``code=="0"``
+        且 ``data[0].sCode`` 非错（P2-3，与 ``place_order`` 口径一致，防 OKX 在逐项位另带错误码）。
+        """
+        payload: dict = {"instId": inst_id, "mgnMode": mgn_mode, "posSide": pos_side,
+                         "autoCxl": auto_cxl}
+        if cl_ord_id:
+            payload["clOrdId"] = cl_ord_id
+        body = await self._post("/api/v5/trade/close-position", payload)
+        rows = body.get("data") or []
+        row = rows[0] if rows else {}
+        top_code = str(body.get("code"))
+        s_code = str(row.get("sCode") or "")
+        if top_code != "0" or (s_code and s_code != "0"):
+            code = s_code if s_code and s_code != "0" else top_code
+            msg = row.get("sMsg") or body.get("msg") or "OKX 平仓失败"
+            raise OKXPrivateError(code, str(msg))
+        return row
+
     async def set_leverage(self, inst_id: str, lever: float, mgn_mode: str,
                            pos_side: str | None = None) -> dict:
         """``POST /api/v5/account/set-leverage``：设杠杆（幂等）。
@@ -92,3 +115,13 @@ class OKXTradeClient(OKXPrivateClient):
         if inst_id:
             params["instId"] = inst_id
         return await self._get("/api/v5/trade/orders-pending", params)
+
+    async def get_algo_pending_orders(self, ord_type: str, inst_id: str | None = None) -> list:
+        """``GET /api/v5/trade/orders-algo-pending``：未触发的策略委托（签名 GET）。
+
+        ``ordType`` 为必填，常用 ``"oco"``（随单止盈止损）/ ``"conditional"``（单向条件单）。
+        """
+        params: dict[str, str] = {"ordType": ord_type}
+        if inst_id:
+            params["instId"] = inst_id
+        return await self._get("/api/v5/trade/orders-algo-pending", params)

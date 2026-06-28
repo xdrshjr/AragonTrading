@@ -48,7 +48,7 @@ export default function LiveBottomPanel({
           {rightTab === "trades" ? (
             <LiveFillsTable instId={instId} accountId={accountId} />
           ) : (
-            <LivePositionsTable accountId={accountId} />
+            <LivePositionsTable instId={instId} accountId={accountId} />
           )}
         </div>
       </div>

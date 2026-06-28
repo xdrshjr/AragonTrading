@@ -21,11 +21,14 @@ from ..config import Settings
 from ..db import repositories as repo
 from .accounts import AccountCredentials, _map_okx_code, _normalize_position, _redact
 from .order_builder import (
+    ClosePositionInput,
     InstrumentMeta,
     OrderInput,
+    build_close_order_payload,
     build_order_payload,
     ensure_instrument_supported,
     is_instrument_supported,
+    validate_close,
     validate_order,
 )
 from .private_client import OKXPrivateError
@@ -38,6 +41,10 @@ _MARKET_NOTIONAL_BUFFER = 0.02
 # 本地拦截类语义码（审计 status=rejected；非此集合的 OKX 业务失败 status=error）。
 _LOCAL_REJECT_CODES = {
     "LIVE_ORDER_REJECTED_LOCAL", "LIVE_WOULD_REDUCE_POSITION", "LIVE_INSTRUMENT_UNSUPPORTED"}
+# 平仓本地拦截类语义码（P1-1）：须显式纳入透传集合与审计分类，否则会被 accounts._map_okx_code
+# 对未知码一律拍平为 OKX_ERROR——既违反「原样回传前端」契约，又使本地拒被误判为 error 而非 rejected。
+_CLOSE_LOCAL_REJECT_CODES = {
+    "LIVE_CLOSE_REJECTED_LOCAL", "LIVE_CLOSE_SIZE_EXCEEDS", "LIVE_NO_POSITION"}
 # clOrdId 进程内单调序号（与毫秒时间戳拼接，确保同毫秒并发也唯一，C1-2）。
 _clord_counter = itertools.count()
 
@@ -53,7 +60,8 @@ def _map_trade_code(code: str) -> str:
     }
     if code in mapping:
         return mapping[code]
-    if code in _LOCAL_REJECT_CODES or code == "LIVE_TRADING_DISABLED":
+    if (code in _LOCAL_REJECT_CODES or code in _CLOSE_LOCAL_REJECT_CODES
+            or code == "LIVE_TRADING_DISABLED"):
         return code
     return _map_okx_code(code)
 
@@ -157,6 +165,143 @@ async def place_live_order(session: AsyncSession, creds: AccountCredentials, acc
             "code": None, "message": None}
 
 
+def _gen_close_cl_ord_id() -> str:
+    """生成唯一平仓 clOrdId（前缀 aragonc + 毫秒 hex + 序号；区分开 / 平仓以审计 ord_type 为准，P2-1）。"""
+    ms = int(time.time() * 1000)
+    seq = next(_clord_counter) % 0x1000
+    return f"aragonc{ms:x}{seq:03x}"
+
+
+def _closed_direction(pos_side: str, pos: float) -> str:
+    """被平持仓方向（审计 direction 用，§5）：对冲取 posSide；net 模式按 pos 符号映射。"""
+    if pos_side == "net":
+        return "long" if pos > 0 else "short"
+    return pos_side
+
+
+def _abs_open_pos(positions: list, inst_id: str, pos_side: str) -> float:
+    """实时持仓中该方向的 ``|pos|``（sz 上限的可信来源，绝不信前端 pos，§2.4）。
+
+    对冲模式按 ``(instId, posSide)`` 精确匹配；net 模式（``pos_side=="net"``）按 ``instId`` 匹配。
+    """
+    total = 0.0
+    for p in positions:
+        if str(p.get("instId")) != inst_id:
+            continue
+        if pos_side != "net" and str(p.get("posSide") or "") != pos_side:
+            continue
+        total += abs(_optional_float(p.get("pos")) or 0.0)
+    return total
+
+
+def _close_audit_values(account_id: int, inst_id: str, direction: str, ord_type: str,
+                        mgn_mode: str, px: float | None, sz: float, cl_ord_id: str, *,
+                        status: str, ord_id: str, error_code: str) -> repo.LiveOrderAuditValues:
+    """组装平仓审计行（复用 live_order_audit；lever / tp / sl 置空，§5；不含任何密钥，C7）。"""
+    return repo.LiveOrderAuditValues(
+        account_id=account_id, inst_id=inst_id, direction=direction, ord_type=ord_type,
+        td_mode=mgn_mode, px=px, sz=sz, lever=None, tp_trigger_px=None, sl_trigger_px=None,
+        status=status, cl_ord_id=cl_ord_id, ord_id=ord_id, error_code=error_code,
+        created_ts=int(time.time()))
+
+
+async def close_live_position(session: AsyncSession, creds: AccountCredentials, account_id: int,
+                              close: ClosePositionInput) -> dict:
+    """单仓平仓时序（§2.4）：守门→取 posMode / 实时 ``|pos|``→（限价校验+place_order / 市价 close_position）→留痕。
+
+    护栏差异（§2.3）：平仓**不**应用名义上限与反向减仓护栏（平仓即减仓，是动作目的）；仅以实时 ``|pos|``
+    二次校验 ``sz≤|pos|``（杜绝平成反向仓）。失败经 ``_map_trade_code`` 归一 + ``_redact`` 脱敏后审计上抛
+    （本地拒写 ``rejected``、OKX 业务失败写 ``error``），绝不假成功。
+    """
+    cl_ord_id = _gen_close_cl_ord_id()
+    direction = _closed_direction(close.pos_side, close.pos)
+    px_audit = close.px if close.ord_type == "limit" else None
+    sz_audit = close.sz or 0.0
+    client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
+    try:
+        pos_mode = str((await client.get_account_config()).get("posMode") or "long_short_mode")
+        abs_pos = _abs_open_pos(await client.get_positions(), close.inst_id, close.pos_side)
+        if abs_pos <= 0:
+            raise OKXPrivateError("LIVE_NO_POSITION", "该方向当前无可平持仓，无法平仓")
+        if close.ord_type == "market":
+            row = await client.close_position(close.inst_id, close.pos_side, close.mgn_mode,
+                                              auto_cxl=True, cl_ord_id=cl_ord_id)
+            ord_id, closed_sz = "", abs_pos
+            sz_audit = abs_pos
+        else:
+            meta = await _load_meta(close.inst_id)
+            ensure_instrument_supported(meta)
+            sz = validate_close(close, meta, abs_pos)["sz"]
+            row = await client.place_order(
+                build_close_order_payload(close, meta, pos_mode, sz, cl_ord_id))
+            ord_id, closed_sz = str(row.get("ordId") or ""), sz
+            sz_audit = sz
+    except OKXError as exc:
+        mapped = _map_trade_code(exc.code)
+        status = "rejected" if mapped in (_LOCAL_REJECT_CODES | _CLOSE_LOCAL_REJECT_CODES) else "error"
+        await repo.create_live_order_audit(session, values=_close_audit_values(
+            account_id, close.inst_id, direction, close.ord_type, close.mgn_mode,
+            px_audit, sz_audit, cl_ord_id, status=status, ord_id="", error_code=mapped))
+        raise OKXPrivateError(mapped, _redact(exc.message, creds.secret_key, creds.passphrase)) from exc
+    finally:
+        await client.aclose()
+    await repo.create_live_order_audit(session, values=_close_audit_values(
+        account_id, close.inst_id, direction, close.ord_type, close.mgn_mode,
+        px_audit, sz_audit, cl_ord_id, status="accepted", ord_id=ord_id, error_code=""))
+    return {"ok": True, "mode": close.ord_type, "ordId": ord_id or None,
+            "clOrdId": str(row.get("clOrdId") or cl_ord_id), "closedSz": closed_sz,
+            "code": None, "message": None}
+
+
+async def close_all_live_positions(session: AsyncSession, creds: AccountCredentials,
+                                   account_id: int) -> dict:
+    """一键市价全平时序（§2.5）：取实时持仓→逐仓 ``close_position``→单仓失败并入 ``results`` 不中断全批。
+
+    仅整批前置请求（取持仓，含鉴权 / 连通失败）失败才整体上抛 502；逐仓阶段单仓失败归一 + 脱敏后并入
+    结果行并继续。``ok`` 仅在全部成功（``failedCount==0``）为真——诚实汇总，绝不假报「全部成功」（R10）。
+    """
+    client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
+    try:
+        try:
+            positions = await client.get_positions()
+        except OKXError as exc:
+            raise OKXPrivateError(_map_trade_code(exc.code),
+                                  _redact(exc.message, creds.secret_key, creds.passphrase)) from exc
+        results: list[dict] = []
+        closed = failed = 0
+        for p in positions:
+            pos = _optional_float(p.get("pos")) or 0.0
+            if pos == 0:
+                continue
+            inst_id = str(p.get("instId") or "")
+            pos_side = str(p.get("posSide") or "net")
+            mgn_mode = str(p.get("mgnMode") or "cross")
+            direction = _closed_direction(pos_side, pos)
+            cl_ord_id = _gen_close_cl_ord_id()
+            try:
+                row = await client.close_position(inst_id, pos_side, mgn_mode,
+                                                  auto_cxl=True, cl_ord_id=cl_ord_id)
+                await repo.create_live_order_audit(session, values=_close_audit_values(
+                    account_id, inst_id, direction, "market", mgn_mode, None, abs(pos),
+                    cl_ord_id, status="accepted", ord_id="", error_code=""))
+                results.append({"instId": inst_id, "posSide": pos_side, "ok": True,
+                                "clOrdId": str(row.get("clOrdId") or cl_ord_id),
+                                "code": None, "message": None})
+                closed += 1
+            except OKXError as exc:
+                mapped = _map_trade_code(exc.code)
+                await repo.create_live_order_audit(session, values=_close_audit_values(
+                    account_id, inst_id, direction, "market", mgn_mode, None, abs(pos),
+                    cl_ord_id, status="error", ord_id="", error_code=mapped))
+                results.append({"instId": inst_id, "posSide": pos_side, "ok": False,
+                                "clOrdId": cl_ord_id, "code": mapped,
+                                "message": _redact(exc.message, creds.secret_key, creds.passphrase)})
+                failed += 1
+    finally:
+        await client.aclose()
+    return {"ok": failed == 0, "closedCount": closed, "failedCount": failed, "results": results}
+
+
 async def set_account_leverage(creds: AccountCredentials, inst_id: str, lever: float,
                                mgn_mode: str, pos_side: str | None = None) -> dict:
     """设杠杆（§4.2）：失败归一 + 脱敏后上抛。"""
@@ -209,6 +354,102 @@ def _normalize_fill(r: dict) -> dict:
         "fee": _optional_float(r.get("fee")) or 0.0,
         "ordId": str(r.get("ordId") or ""),
     }
+
+
+async def fetch_live_open_orders(creds: AccountCredentials,
+                                 inst_id: str | None = None) -> list[dict]:
+    """未结委托（普通挂单 + 策略委托）：聚合归一为统一形态。
+
+    并发查 ``orders-pending``（普通挂单）与 ``orders-algo-pending`` 的 ``oco`` / ``conditional`` 两类
+    （随单 TP/SL），按字段展开分类；OKX 不可达 → ``OKXPrivateError``（绝不假数据，C1）。
+    """
+    client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
+    try:
+        pending, oco, cond = await asyncio.gather(
+            client.get_pending_orders(inst_id),
+            client.get_algo_pending_orders("oco", inst_id),
+            client.get_algo_pending_orders("conditional", inst_id),
+        )
+    except OKXError as exc:
+        raise OKXPrivateError(_map_trade_code(exc.code),
+                              _redact(exc.message, creds.secret_key, creds.passphrase)) from exc
+    finally:
+        await client.aclose()
+    out: list[dict] = [_normalize_pending_order(r) for r in pending]
+    for r in (*oco, *cond):
+        out.extend(_normalize_algo_order(r))   # 一条 OCO 可展开成 tp + sl 两条
+    return out
+
+
+def _as_bool(value: object) -> bool:
+    """OKX 布尔字段（可能是 bool 或 "true"/"false" 字符串）→ Python bool。"""
+    return value is True or str(value).lower() == "true"
+
+
+def _algo_px(value: object) -> float | None:
+    """策略委托委托价：``"-1"``（触发后市价）/ 空 → ``None``，否则数值（§2.2b）。"""
+    text = str(value or "").strip()
+    if text in ("", "-1"):
+        return None
+    return _optional_float(text)
+
+
+def _classify_pending_kind(r: dict) -> str:
+    """普通挂单 kind 判定（R4）：reduceOnly 或对冲反向单 → ``limit_close``，否则 ``limit_open``。"""
+    if _as_bool(r.get("reduceOnly")):
+        return "limit_close"
+    pos_side = str(r.get("posSide") or "")
+    side = str(r.get("side") or "")
+    if (pos_side == "long" and side == "sell") or (pos_side == "short" and side == "buy"):
+        return "limit_close"
+    return "limit_open"
+
+
+def _normalize_pending_order(r: dict) -> dict:
+    """OKX orders-pending 单行 → 归一未结委托（camelCase，秒级 UTC，数值容错）。"""
+    return {
+        "kind": _classify_pending_kind(r),
+        "instId": str(r.get("instId") or ""),
+        "posSide": str(r.get("posSide") or "net"),
+        "side": str(r.get("side") or ""),
+        "px": _optional_float(r.get("px")),
+        "triggerPx": None,
+        "sz": _optional_float(r.get("sz")),
+        "state": str(r.get("state") or ""),
+        "reduceOnly": _as_bool(r.get("reduceOnly")),
+        "ordId": str(r.get("ordId") or "") or None,
+        "algoId": None,
+        "createdTs": int(r.get("cTime") or 0) // 1000,
+    }
+
+
+def _normalize_algo_order(r: dict) -> list[dict]:
+    """OKX orders-algo-pending 单行 → 归一未结委托列表。
+
+    一条策略委托可同时含 ``tpTriggerPx`` 与 ``slTriggerPx``（OCO），分别展开为 ``tp`` / ``sl`` 两条
+    归一记录并共享 ``algoId``；只含其一则产出一条（不依赖 ordType 名，对 oco/conditional 命名稳健）。
+    """
+    base = {
+        "instId": str(r.get("instId") or ""),
+        "posSide": str(r.get("posSide") or "net"),
+        "side": str(r.get("side") or ""),
+        "sz": _optional_float(r.get("sz")),
+        "state": str(r.get("state") or ""),
+        "reduceOnly": _as_bool(r.get("reduceOnly")),
+        "ordId": None,
+        "algoId": str(r.get("algoId") or "") or None,
+        "createdTs": int(r.get("cTime") or 0) // 1000,
+    }
+    out: list[dict] = []
+    tp_trigger = _optional_float(r.get("tpTriggerPx"))
+    if tp_trigger is not None:
+        out.append({**base, "kind": "tp", "triggerPx": tp_trigger,
+                    "px": _algo_px(r.get("tpOrdPx"))})
+    sl_trigger = _optional_float(r.get("slTriggerPx"))
+    if sl_trigger is not None:
+        out.append({**base, "kind": "sl", "triggerPx": sl_trigger,
+                    "px": _algo_px(r.get("slOrdPx"))})
+    return out
 
 
 async def fetch_trading_config(creds: AccountCredentials, account_id: int, inst_id: str, *,

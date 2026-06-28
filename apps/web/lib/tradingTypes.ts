@@ -86,6 +86,69 @@ export interface LiveFillsResponse {
   fills: LiveFill[];
 }
 
+// GET /trading/open-orders：未结委托归一形态（普通挂单 + 策略委托）。
+// kind 由后端派生：limit_close 限价平仓 / tp 止盈 / sl 止损 / limit_open 限价开仓（前端按 kind 过滤展示）。
+export type OpenOrderKind = "limit_close" | "tp" | "sl" | "limit_open";
+
+export interface LiveOpenOrder {
+  kind: OpenOrderKind;
+  instId: string;
+  posSide: "long" | "short" | "net";
+  side: "buy" | "sell";
+  px: number | null; // 限价委托价（tp/sl 触发后市价时为 null）
+  triggerPx: number | null; // 策略委托触发价（普通挂单为 null）
+  sz: number | null;
+  state: string; // live | partially_filled ...
+  reduceOnly: boolean;
+  ordId: string | null;
+  algoId: string | null;
+  createdTs: number; // 秒级 UTC
+}
+
+export interface LiveOpenOrdersResponse {
+  orders: LiveOpenOrder[];
+}
+
 export interface LivePositionsResponse {
   positions: LivePosition[];
+}
+
+// POST /trading/close 请求（单仓平仓；clOrdId 由后端生成，前端不传）。
+// limit=挂单平仓（须带 px、可选 sz）；market=整仓市价平（px/sz 忽略，OKX 自行整仓平）。
+export interface ClosePositionReq {
+  accountId?: number;
+  instId: string;
+  posSide: "long" | "short" | "net";
+  pos: number; // 带符号张数（net 判向参考；sz 上限以后端实时持仓为准）
+  mgnMode: TdMode;
+  ordType: OrderType;
+  px?: number;
+  sz?: number;
+}
+
+export interface ClosePositionResult {
+  ok: boolean;
+  mode: OrderType;
+  ordId?: string | null;
+  clOrdId?: string | null;
+  closedSz?: number | null; // 市价单回填本地 |pos|；限价单为「委托」平仓量（未必已成交）
+  code?: string | null;
+  message?: string | null;
+}
+
+// POST /trading/close-all 逐仓结果行（单仓失败不致整体失败，R10）。
+export interface CloseAllResultRow {
+  instId: string;
+  posSide: string;
+  ok: boolean;
+  clOrdId?: string | null;
+  code?: string | null;
+  message?: string | null;
+}
+
+export interface CloseAllResult {
+  ok: boolean; // 仅在全部成功为真（诚实汇总）
+  closedCount: number;
+  failedCount: number;
+  results: CloseAllResultRow[];
 }

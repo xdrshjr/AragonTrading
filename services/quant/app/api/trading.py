@@ -17,16 +17,24 @@ from ..config import Settings, get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
 from ..okx.accounts import AccountCredentials
-from ..okx.order_builder import OrderInput
+from ..okx.order_builder import ClosePositionInput, OrderInput
 from ..okx.trading import (
+    close_all_live_positions,
+    close_live_position,
     fetch_live_fills,
+    fetch_live_open_orders,
     fetch_live_positions,
     fetch_trading_config,
     place_live_order,
     set_account_leverage,
 )
 from ..schemas import (
+    CloseAllIn,
+    CloseAllOut,
+    ClosePositionIn,
+    ClosePositionOut,
     LiveFillsOut,
+    LiveOpenOrdersOut,
     LivePositionsOut,
     PlaceOrderIn,
     PlaceOrderOut,
@@ -93,6 +101,18 @@ async def trading_fills(accountId: int | None = Query(None), instId: str | None 
     return {"fills": await fetch_live_fills(_creds_from_row(row), instId, limit)}
 
 
+@router.get("/open-orders", response_model=LiveOpenOrdersOut)
+async def trading_open_orders(accountId: int | None = Query(None),
+                              instId: str | None = Query(None),
+                              session: AsyncSession = Depends(get_session)) -> dict:
+    """未结委托（普通挂单 + 策略委托）：真实 OKX，轮询源，鉴权失败→502（读类不守门）。
+
+    ``instId`` 缺省返回全量（前端不传、客户端按 instId 过滤）；传入则服务端透传过滤（C5）。
+    """
+    row = await _resolve_account(session, accountId)
+    return {"orders": await fetch_live_open_orders(_creds_from_row(row), instId)}
+
+
 @router.post("/leverage", response_model=SetLeverageOut)
 async def trading_leverage(body: SetLeverageIn, session: AsyncSession = Depends(get_session),
                            settings: Settings = Depends(get_settings)) -> dict:
@@ -114,3 +134,24 @@ async def trading_order(body: PlaceOrderIn, session: AsyncSession = Depends(get_
         td_mode=body.tdMode, px=body.px, sz=body.sz, lever=body.lever,
         tp_trigger_px=body.tpTriggerPx, sl_trigger_px=body.slTriggerPx)
     return await place_live_order(session, _creds_from_row(row), row.id, order, settings=settings)
+
+
+@router.post("/close", response_model=ClosePositionOut)
+async def trading_close(body: ClosePositionIn, session: AsyncSession = Depends(get_session),
+                        settings: Settings = Depends(get_settings)) -> dict:
+    """实盘平仓（limit 挂单 / market 整仓；受 LIVE_TRADING_ENABLED 守门；clOrdId 后端生成，每次留痕）。"""
+    _require_live_enabled(settings)
+    row = await _resolve_account(session, body.accountId)
+    close = ClosePositionInput(
+        inst_id=body.instId, pos_side=body.posSide, pos=body.pos, mgn_mode=body.mgnMode,
+        ord_type=body.ordType, px=body.px, sz=body.sz)
+    return await close_live_position(session, _creds_from_row(row), row.id, close)
+
+
+@router.post("/close-all", response_model=CloseAllOut)
+async def trading_close_all(body: CloseAllIn, session: AsyncSession = Depends(get_session),
+                            settings: Settings = Depends(get_settings)) -> dict:
+    """一键市价全平（受 LIVE_TRADING_ENABLED 守门；逐仓诚实汇总，单仓失败不致整体失败，R10）。"""
+    _require_live_enabled(settings)
+    row = await _resolve_account(session, body.accountId)
+    return await close_all_live_positions(session, _creds_from_row(row), row.id)

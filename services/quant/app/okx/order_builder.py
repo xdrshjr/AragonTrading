@@ -173,3 +173,78 @@ def validate_order(order: OrderInput, meta: InstrumentMeta, *, max_notional_usd:
             f"下单名义价值 {notional:.2f} USDT 超出本地上限 {max_notional_usd:.2f} USDT")
     return {"sz": sz, "notional": notional,
             "margin": compute_margin(notional, order.lever or 1.0)}
+
+
+@dataclass(frozen=True)
+class ClosePositionInput:
+    """归一化平仓意图（API 层校验后构造；clOrdId 由服务层生成后单独传入，平仓 spec §2.2/§5）。
+
+    限价平仓走 ``/trade/order``（对冲 posSide / 净持仓 reduceOnly 语义）；市价整仓平走
+    ``/trade/close-position``（不接受 sz，OKX 自行整仓平）。
+    """
+
+    inst_id: str
+    pos_side: str        # long | short | net（持仓行带出；net 模式靠 pos 符号判向）
+    pos: float           # 带符号张数（net 判向用；sz 上限仍以服务层实时 |pos| 为可信源）
+    mgn_mode: str        # cross | isolated
+    ord_type: str        # limit（挂单平仓）| market（整仓市价平）
+    px: float | None     # 限价价格（市价为 None）
+    sz: float | None     # 限价部分平仓张数（缺省=全仓 |pos|；市价忽略）
+
+
+def _close_side(pos_side: str, pos: float) -> str:
+    """平仓单 side（§2.2，一等安全约束）：平多 → ``sell``、平空 → ``buy``。
+
+    net 模式按 ``pos`` 符号判向（净多 → sell、净空 → buy）；对冲模式按 ``posSide``。
+    """
+    if pos_side == "net":
+        return "sell" if pos > 0 else "buy"
+    return "sell" if pos_side == "long" else "buy"
+
+
+def build_close_order_payload(close: ClosePositionInput, meta: InstrumentMeta, pos_mode: str,
+                              sz: float, cl_ord_id: str) -> dict:
+    """组装限价平仓 ``/api/v5/trade/order`` 请求体（§2.2/§5）。
+
+    对冲模式（long_short_mode）：带 ``posSide`` 锁侧、**不**带 ``reduceOnly``（posSide 已限定平该侧仓，
+    避免部分账户模式对 reduceOnly 的兼容性问题）。净持仓模式（net_mode）：带 ``reduceOnly=true``、
+    **不**带 ``posSide``。``sz`` 由调用方传入（已 ``validate_close`` 取整且 ``≤|pos|``）。
+    """
+    payload: dict = {
+        "instId": close.inst_id,
+        "tdMode": close.mgn_mode,
+        "side": _close_side(close.pos_side, close.pos),
+        "ordType": "limit",
+        "sz": fmt_step(snap_size(sz, meta.lot_sz), meta.lot_sz),
+        "clOrdId": cl_ord_id,
+    }
+    if pos_mode == "net_mode":
+        payload["reduceOnly"] = True
+    else:
+        payload["posSide"] = close.pos_side
+    if close.px is not None:
+        payload["px"] = fmt_step(snap_price(close.px, meta.tick_sz), meta.tick_sz)
+    return payload
+
+
+def validate_close(close: ClosePositionInput, meta: InstrumentMeta, abs_pos: float) -> dict:
+    """限价平仓本地越界拦截（§2.4，P1-2）：限价须有正价、取整后 ``sz>0``、``sz≥minSz``、``sz≤|pos|``。
+
+    ``abs_pos``：实时持仓的 ``|pos|``（服务层取自 OKX，作 ``sz`` 上限的可信来源——**绝不**信前端 pos）。
+    缺价 / 不足 minSz / 取整后 ≤0 抛 ``LIVE_CLOSE_REJECTED_LOCAL``；超出持仓抛 ``LIVE_CLOSE_SIZE_EXCEEDS``；
+    一律绝不发往 OKX。尾仓 ``abs_pos<minSz`` 时默认全仓亦会被 minSz 拦截，UI 应引导改用市价整仓（§2.6）。
+    返回取整后的 ``{sz}``。
+    """
+    if close.px is None or close.px <= 0:
+        raise OKXPrivateError("LIVE_CLOSE_REJECTED_LOCAL", "限价平仓必须填写大于 0 的委托价格")
+    requested = close.sz if close.sz is not None else abs_pos
+    sz = snap_size(requested, meta.lot_sz)
+    if sz <= 0 or sz < meta.min_sz:
+        raise OKXPrivateError(
+            "LIVE_CLOSE_REJECTED_LOCAL",
+            f"平仓数量需 ≥ 最小下单量 {fmt_step(meta.min_sz, meta.lot_sz)} 张")
+    if sz > abs_pos:
+        raise OKXPrivateError(
+            "LIVE_CLOSE_SIZE_EXCEEDS",
+            f"平仓数量 {fmt_step(sz, meta.lot_sz)} 张超过当前持仓 {fmt_step(abs_pos, meta.lot_sz)} 张")
+    return {"sz": sz}

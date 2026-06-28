@@ -586,10 +586,98 @@ class LiveFillsOut(BaseModel):
     fills: list[LiveFill]
 
 
+class LiveOpenOrder(BaseModel):
+    """未结委托单行（普通挂单 + 策略委托归一；GET /trading/open-orders）。
+
+    ``kind`` 由服务层 ``_classify_pending_kind`` / ``_normalize_algo_order`` 派生：
+    ``limit_close`` 限价平仓、``tp`` 止盈、``sl`` 止损、``limit_open`` 限价开仓（接口诚实返回，
+    前端按 kind 过滤展示）。``px`` 为限价委托价（tp/sl 触发后市价时为 ``None``），``triggerPx`` 为策略
+    委托触发价（普通挂单为 ``None``）。
+    """
+
+    kind: Literal["limit_close", "tp", "sl", "limit_open"]
+    instId: str
+    posSide: str                 # long | short | net
+    side: str                    # buy | sell
+    px: float | None = None
+    triggerPx: float | None = None
+    sz: float | None = None
+    state: str                   # live | partially_filled ...
+    reduceOnly: bool
+    ordId: str | None = None
+    algoId: str | None = None
+    createdTs: int               # 秒级 UTC
+
+
+class LiveOpenOrdersOut(BaseModel):
+    orders: list[LiveOpenOrder]
+
+
 class LivePositionsOut(BaseModel):
     """GET /trading/positions：真实持仓（行复用 OkxAccountPosition）。"""
 
     positions: list[OkxAccountPosition]
+
+
+class ClosePositionIn(BaseModel):
+    """POST /trading/close：单仓平仓（limit 挂单平仓 / market 整仓市价平）。clOrdId 由后端生成。
+
+    Pydantic 层仅做形态校验（px>0、sz>0）；``sz≥minSz`` / ``sz≤|pos|`` 等依赖合约元数据与实时持仓的
+    边界由服务层 ``validate_close`` 校验（P1-2，本层不掌握 minSz / |pos|）。
+    """
+
+    accountId: int | None = None
+    instId: str = Field(min_length=1, max_length=32)
+    posSide: Literal["long", "short", "net"]
+    pos: float                        # 带符号张数（net 判向参考；sz 上限以服务层实时持仓为准）
+    mgnMode: Literal["cross", "isolated"]
+    ordType: Literal["limit", "market"]
+    px: float | None = Field(default=None, gt=0)   # 限价必填、>0；市价忽略
+    sz: float | None = Field(default=None, gt=0)    # 限价部分平仓张数，缺省=全仓 |pos|；市价忽略
+
+    @model_validator(mode="after")
+    def validate_limit_price(self) -> "ClosePositionIn":
+        if self.ordType == "limit" and self.px is None:
+            raise ValueError("limit close requires px")
+        return self
+
+
+class ClosePositionOut(BaseModel):
+    """POST /trading/close 响应（市价单 OKX 不回 ordId，closedSz 回填本地 |pos|）。"""
+
+    ok: bool
+    mode: str                         # limit | market
+    ordId: str | None = None
+    clOrdId: str | None = None
+    closedSz: float | None = None
+    code: str | None = None
+    message: str | None = None
+
+
+class CloseAllIn(BaseModel):
+    """POST /trading/close-all：一键市价全平（accountId 可选，缺省回落默认账户）。"""
+
+    accountId: int | None = None
+
+
+class CloseAllResultRow(BaseModel):
+    """一键全平逐仓结果行（单仓失败不致整体失败，R10）。"""
+
+    instId: str
+    posSide: str
+    ok: bool
+    clOrdId: str | None = None
+    code: str | None = None
+    message: str | None = None
+
+
+class CloseAllOut(BaseModel):
+    """POST /trading/close-all 响应（诚实汇总：ok 仅在全部成功为真）。"""
+
+    ok: bool
+    closedCount: int
+    failedCount: int
+    results: list[CloseAllResultRow]
 
 
 class ErrorBody(BaseModel):
