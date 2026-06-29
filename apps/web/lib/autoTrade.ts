@@ -91,3 +91,20 @@ export function clampGroupBudgetToCap(budget: number, availUsdt: number): number
   const cap = Math.max(0, availUsdt) * LIVE_AUTO_MAX_CAPITAL_FRAC;
   return cap > 0 ? Math.min(budget, cap) : budget;
 }
+
+/** 分组预算 5% 硬上限（可用余额 × 5%）；avail 为 null / ≤0 时返回 0，表示无有效上限。 */
+export function groupBudgetCap(availUsdt: number | null): number {
+  if (availUsdt == null) return 0;
+  return Math.max(0, availUsdt) * LIVE_AUTO_MAX_CAPITAL_FRAC;
+}
+
+/**
+ * 用户所填总预算是否会被 5% 硬上限夹紧（驱动确认弹窗的就地夹紧提示）。
+ * 仅当存在有效上限（cap > 0，即余额已读取且 > 0）且填值严格超过上限时为真；
+ * 留空、余额读取中（avail == null）、余额为 0 时一律返回 false，与 clampGroupBudgetToCap 的实际行为保持一致
+ * （cap ≤ 0 时该函数原样返回不夹紧，故此处不得提示「已夹紧」）。
+ */
+export function isGroupBudgetClamped(capitalUsd: number | null, availUsdt: number | null): boolean {
+  const cap = groupBudgetCap(availUsdt);
+  return cap > 0 && capitalUsd != null && capitalUsd > cap;
+}

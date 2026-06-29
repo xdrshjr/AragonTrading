@@ -5,7 +5,9 @@ import {
   defaultAllocationOnAdd,
   deriveGroupDefaultBudget,
   evenSplit,
+  groupBudgetCap,
   isAutoTradable,
+  isGroupBudgetClamped,
   memberBudget,
   resolveGroupGate,
   totalAllocation,
@@ -61,6 +63,23 @@ describe("memberBudget / default budget", () => {
   it("clampGroupBudgetToCap clamps to 5% of avail", () => {
     expect(clampGroupBudgetToCap(500, 1000)).toBe(50);
     expect(clampGroupBudgetToCap(20, 1000)).toBe(20);
+  });
+});
+
+describe("budget cap / clamp detection", () => {
+  it("groupBudgetCap = avail × 5%, and 0 when avail is null / ≤0", () => {
+    expect(groupBudgetCap(1000)).toBe(50);
+    expect(groupBudgetCap(null)).toBe(0);
+    expect(groupBudgetCap(0)).toBe(0);
+    expect(groupBudgetCap(-100)).toBe(0); // negative avail → no valid cap
+  });
+  it("isGroupBudgetClamped is true only for a value strictly above a positive cap", () => {
+    expect(isGroupBudgetClamped(20, 1000)).toBe(false); // 20 < cap 50 → within cap, no hint
+    expect(isGroupBudgetClamped(50, 1000)).toBe(false); // == cap → passes through, no hint
+    expect(isGroupBudgetClamped(500, 1000)).toBe(true); // > cap 50 → clamped, hint shown
+    expect(isGroupBudgetClamped(null, 1000)).toBe(false); // empty input → uses default, no hint
+    expect(isGroupBudgetClamped(100, null)).toBe(false); // balance loading → no cap, no hint
+    expect(isGroupBudgetClamped(100, 0)).toBe(false); // avail 0 → cap 0, never "clamped to 0"
   });
 });
 

@@ -7,7 +7,9 @@ import { api } from "@/lib/api";
 import {
   clampGroupBudgetToCap,
   deriveGroupDefaultBudget,
+  groupBudgetCap,
   isAutoTradable,
+  isGroupBudgetClamped,
   memberBudget,
   totalAllocation,
 } from "@/lib/autoTrade";
@@ -102,6 +104,10 @@ export default function AutoTradeGroupConfirmModal({
     return clampGroupBudgetToCap(raw, availUsdt);
   }, [availUsdt, capital.value, members.length]);
 
+  // 填值超过可用余额 5% 硬上限时，previewTotal 会被静默夹回上限——显式回显「已夹紧」，避免用户误以为输入未生效。
+  const budgetCap = groupBudgetCap(availUsdt);
+  const isClamped = isGroupBudgetClamped(capital.value, availUsdt);
+
   const hasUnsupported = members.some((m) => !isAutoTradable(m.instId));
   const ready = !inputError && acknowledged && strategyId != null && members.length > 0 && !hasUnsupported;
 
@@ -156,7 +162,13 @@ export default function AutoTradeGroupConfirmModal({
             }
           />
           <Row
-            label={usingDefault ? "默认总预算（随成员数缩放）" : "生效总预算（预览）"}
+            label={
+              usingDefault
+                ? "默认总预算（随成员数缩放）"
+                : isClamped
+                  ? "生效总预算（预览 · 已按 5% 上限夹紧）"
+                  : "生效总预算（预览）"
+            }
             value={previewTotal != null ? `${fmtPrice(previewTotal)} USDT` : "—"}
           />
           <Row
@@ -206,7 +218,18 @@ export default function AutoTradeGroupConfirmModal({
         </p>
 
         <div className="grid grid-cols-2 gap-3">
-          <Field label="总预算（USDT）" placeholder="留空＝默认" value={capitalRaw} onChange={setCapitalRaw} disabled={submitting} />
+          <Field
+            label="总预算（USDT）"
+            placeholder="留空＝默认"
+            value={capitalRaw}
+            onChange={setCapitalRaw}
+            disabled={submitting}
+            hint={
+              isClamped && capital.value != null
+                ? `输入 ${fmtPrice(capital.value)} 超过可用余额 5% 上限（${fmtPrice(budgetCap)} USDT），已按上限 ${fmtPrice(budgetCap)} 计算`
+                : undefined
+            }
+          />
           <Field label="杠杆（×）" placeholder="留空＝默认" value={leverageRaw} onChange={setLeverageRaw} disabled={submitting} />
           <Field label="总止盈（USDT）" placeholder="留空＝不触发" value={takeProfitRaw} onChange={setTakeProfitRaw} disabled={submitting} />
           <Field label="总止损（USDT）" placeholder="留空＝不触发" value={stopLossRaw} onChange={setStopLossRaw} disabled={submitting} />
@@ -261,12 +284,14 @@ function Field({
   value,
   onChange,
   disabled,
+  hint,
 }: {
   label: string;
   placeholder: string;
   value: string;
   onChange: (v: string) => void;
   disabled?: boolean;
+  hint?: string;
 }) {
   return (
     <label className="flex flex-col gap-1 text-[11px] text-[var(--muted)]">
@@ -280,6 +305,7 @@ function Field({
         onChange={(e) => onChange(e.target.value)}
         className="rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] disabled:opacity-50"
       />
+      {hint && <span className="leading-relaxed text-[var(--short)]">{hint}</span>}
     </label>
   );
 }
