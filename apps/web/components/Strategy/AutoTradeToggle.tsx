@@ -14,14 +14,18 @@ import AutoTradeConfirmModal, { type AutoTradeConfirmOpts } from "./AutoTradeCon
 /**
  * 「自动交易」开关（live-auto-trading §3）：策略面板标题栏右上。
  *
- * 独立组件直接订阅全局 store（accountMode/strategyId/instId/bar/liveAutoSessionId）+ react-query
+ * 独立组件直接订阅全局 store（accountMode/paperSelectionIds/instId/bar/liveAutoSessionId）+ react-query
  * （账户列表判 hasReadyDefault、/live-auto/status 判 liveAutoEnabled）。开→弹确认弹窗，关→停会话。
  * 仅 mode==="paper" 时由 StrategyPanel 渲染；本组件再以 accountMode==="live" 等条件守门禁用态。
  */
 export default function AutoTradeToggle() {
   const qc = useQueryClient();
   const accountMode = useAppStore((s) => s.accountMode);
-  const strategyId = useAppStore((s) => s.strategyId);
+  // 自动交易的目标策略以用户在策略面板里的「复选框选择」(paperSelectionIds) 为准，而非「激活态」
+  // strategyId——后者仅「点击策略行主体」才更新、初值恒为列表第一个，与复选框选择解耦会导致用错策略
+  // （诊断 live-auto-trade-ignores-selected-strategy）。恰选 1 个时取之，0 / >1 由守门拦截。
+  const paperSelectionIds = useAppStore((s) => s.paperSelectionIds);
+  const effectiveStrategyId = paperSelectionIds.length === 1 ? paperSelectionIds[0] : null;
   const instId = useAppStore((s) => s.instId);
   const bar = useAppStore((s) => s.bar);
   const liveAutoSessionId = useAppStore((s) => s.liveAutoSessionId);
@@ -50,20 +54,20 @@ export default function AutoTradeToggle() {
 
   const strategiesQ = useQuery({ queryKey: ["strategies"], queryFn: api.strategies });
   const strategyName =
-    strategiesQ.data?.find((s) => s.id === strategyId)?.name ?? "";
+    strategiesQ.data?.find((s) => s.id === effectiveStrategyId)?.name ?? "";
 
   const active = !!liveAutoSessionId;
   const disabledReason = resolveAutoTradeGate({
     accountMode,
     hasReadyDefault,
     liveAutoEnabled,
-    strategyId,
+    selectedCount: paperSelectionIds.length,
   });
 
   const startM = useMutation({
     mutationFn: (opts: AutoTradeConfirmOpts) =>
       liveAutoApi.start({
-        strategyId: strategyId as number,
+        strategyId: effectiveStrategyId as number,
         instId,
         bar,
         capitalUsd: opts.capitalUsd,

@@ -15,7 +15,9 @@ export interface AutoTradeGateInput {
   accountMode: AccountMode;
   hasReadyDefault: boolean;
   liveAutoEnabled: boolean;
-  strategyId: number | null;
+  // 用户在策略面板里勾选（复选框，写 paperSelectionIds）的策略数量。自动交易为单会话独占
+  // （后端 cap=1），故仅「恰选 1 个」放行；0 / >1 各给明确守门文案，杜绝默默回落默认策略。
+  selectedCount: number;
 }
 
 /** 自动交易开关守门：返回禁用原因（中文），全部满足返回 null（可启用）。 */
@@ -23,7 +25,8 @@ export function resolveAutoTradeGate(input: AutoTradeGateInput): string | null {
   if (input.accountMode !== "live") return "请先切换到实盘账户模式";
   if (!input.hasReadyDefault) return "请先在设置中配置默认实盘账户";
   if (!input.liveAutoEnabled) return "实时自动交易未启用（需后端开启 LIVE_AUTO_TRADING_ENABLED）";
-  if (input.strategyId == null) return "请先选择一个交易策略";
+  if (input.selectedCount === 0) return "请先选择一个交易策略";
+  if (input.selectedCount > 1) return "自动交易仅支持单个策略，请只勾选一个";
   return null;
 }
 

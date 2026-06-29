@@ -9,7 +9,7 @@ import {
 } from "./liveAuto";
 
 describe("resolveAutoTradeGate", () => {
-  const ready = { accountMode: "live" as const, hasReadyDefault: true, liveAutoEnabled: true, strategyId: 7 };
+  const ready = { accountMode: "live" as const, hasReadyDefault: true, liveAutoEnabled: true, selectedCount: 1 };
 
   it("returns null when all gates pass", () => {
     expect(resolveAutoTradeGate(ready)).toBeNull();
@@ -27,8 +27,12 @@ describe("resolveAutoTradeGate", () => {
     expect(resolveAutoTradeGate({ ...ready, liveAutoEnabled: false })).toMatch(/未启用/);
   });
 
-  it("blocks when no strategy selected", () => {
-    expect(resolveAutoTradeGate({ ...ready, strategyId: null })).toMatch(/选择/);
+  it("blocks when no strategy selected (selectedCount=0)", () => {
+    expect(resolveAutoTradeGate({ ...ready, selectedCount: 0 })).toMatch(/选择/);
+  });
+
+  it("blocks when more than one strategy selected (selectedCount>1)", () => {
+    expect(resolveAutoTradeGate({ ...ready, selectedCount: 2 })).toMatch(/单个/);
   });
 });
 
