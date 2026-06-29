@@ -6,8 +6,11 @@ import hashlib
 import hmac
 import re
 
+import httpx
+import pytest
+
 from app.config import Settings
-from app.okx.private_client import OKXPrivateClient, _iso_timestamp, _sign
+from app.okx.private_client import OKXPrivateClient, OKXPrivateError, _iso_timestamp, _sign
 
 
 def test_sign_matches_known_vector():
@@ -57,3 +60,76 @@ def test_headers_add_simulated_trading_when_demo_enabled():
     client = OKXPrivateClient("ak", "sk-123456", "pass-123456", Settings(okx_account_demo=True))
     headers = client._headers(_iso_timestamp(), "GET", "/api/v5/account/config")
     assert headers["x-simulated-trading"] == "1"
+
+
+def _inject_transport(client: OKXPrivateClient, handler) -> None:
+    """注入 MockTransport：`_get_client` 见 `self._client` 已置则直接复用（测试用）。"""
+    client._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://www.okx.com")
+
+
+async def test_get_retries_on_429_then_succeeds(monkeypatch):
+    """限流回归：首发 429、次发 200 时，签名 GET 退避后**重试到成功**，不立即抛 OKX_HTTP_ERROR。
+
+    护栏修复前（无退避）会在首发 429 立即抛错，整组启动失败成 502。
+    """
+    calls = {"n": 0}
+
+    def handler(_request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, json={"msg": "Too Many Requests"})
+        return httpx.Response(200, json={"code": "0", "data": [{"uid": "u-123"}]})
+
+    monkeypatch.setattr("app.okx.private_client.asyncio.sleep", _no_sleep)
+    client = OKXPrivateClient("ak", "sk-123456", "pass-123456", Settings(okx_account_demo=False))
+    _inject_transport(client, handler)
+    try:
+        cfg = await client.get_account_config()
+    finally:
+        await client.aclose()
+    assert cfg == {"uid": "u-123"}
+    assert calls["n"] == 2   # 首发 429 被退避吞掉，次发 200 成功
+
+
+async def test_get_exhausts_429_raises_http_error(monkeypatch):
+    """限流回归：持续 429 至退避耗尽，须显式抛 `OKX_HTTP_ERROR / OKX HTTP 429`（非 last_exc=None 误导串）。"""
+    def handler(_request):
+        return httpx.Response(429, json={"msg": "rate"})
+
+    monkeypatch.setattr("app.okx.private_client.asyncio.sleep", _no_sleep)
+    client = OKXPrivateClient("ak", "sk-123456", "pass-123456", Settings(okx_account_demo=False))
+    _inject_transport(client, handler)
+    try:
+        with pytest.raises(OKXPrivateError) as excinfo:
+            await client.get_account_config()
+    finally:
+        await client.aclose()
+    assert excinfo.value.code == "OKX_HTTP_ERROR"
+    assert "429" in excinfo.value.message
+
+
+async def test_get_non_429_status_raises_immediately(monkeypatch):
+    """非 429 的 HTTP 错误（如 401）语义不变：立即抛 OKX_HTTP_ERROR，不退避重试。"""
+    calls = {"n": 0}
+
+    def handler(_request):
+        calls["n"] += 1
+        return httpx.Response(401, json={"msg": "unauthorized"})
+
+    monkeypatch.setattr("app.okx.private_client.asyncio.sleep", _no_sleep)
+    client = OKXPrivateClient("ak", "sk-123456", "pass-123456", Settings(okx_account_demo=False))
+    _inject_transport(client, handler)
+    try:
+        with pytest.raises(OKXPrivateError) as excinfo:
+            await client.get_account_config()
+    finally:
+        await client.aclose()
+    assert excinfo.value.code == "OKX_HTTP_ERROR"
+    assert "401" in excinfo.value.message
+    assert calls["n"] == 1   # 非 429 不重试
+
+
+async def _no_sleep(_seconds) -> None:
+    """退避桩：跳过真实 sleep，避免单测被指数退避拖慢。"""
+    return None

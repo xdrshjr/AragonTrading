@@ -5,6 +5,9 @@ OKX 调用全程打桩；会话用轻量假实现避免 WS / 网络。铁律：�
 """
 from __future__ import annotations
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, func, select
@@ -443,3 +446,42 @@ async def test_group_rollback_on_launch_failure(monkeypatch):
         get_live_auto_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()
+
+
+# ---------------- 回归：启动 fan-out 并发限流（live-auto-multi-symbol-rate-limit-429）----------------
+
+
+async def test_gather_context_caps_signing_fanout_concurrency(monkeypatch):
+    """8 成员启动时，`_gather_context` 同时在途的 `fetch_trading_config` 峰值 ≤ 2（并发上限 2）。
+
+    护栏修复前峰值会达 N（=8），把签名私有请求一次性打爆触发 OKX 429；限流后必须稳在 2。
+    """
+    inflight = 0
+    peak = 0
+
+    async def counting_config(_creds, _account_id, inst_id, *, settings=None):
+        nonlocal inflight, peak
+        inflight += 1
+        peak = max(peak, inflight)
+        await asyncio.sleep(0.02)   # 让多个调用真实重叠，暴露并发峰值
+        inflight -= 1
+        return dict(_BASE_CONFIG)
+
+    async def fake_positions(*_a, **_k):
+        return []
+
+    monkeypatch.setattr("app.live_auto.manager.fetch_trading_config", counting_config)
+    monkeypatch.setattr("app.live_auto.manager.fetch_live_positions", fake_positions)
+
+    members = [GroupMemberInput(f"SYM{i}-USDT-SWAP", 10.0) for i in range(8)]
+    req = GroupStartRequest(
+        strategy_spec=None, bar="1H", members_in=members,
+        account_row=SimpleNamespace(id=1),
+        settings=Settings(live_auto_start_concurrency=2))
+
+    avail, positions, config_map = await LiveAutoManager()._gather_context(None, req, members)
+
+    assert peak == 2, f"启动 fan-out 并发峰值应 ≤ 2，实测 {peak}"
+    assert len(config_map) == 8
+    assert avail == _BASE_CONFIG["availUsdt"]
+    assert positions == []

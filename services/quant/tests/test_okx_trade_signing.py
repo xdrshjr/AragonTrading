@@ -30,8 +30,9 @@ def test_post_sign_matches_known_vector():
 
 
 class _FakeResponse:
-    def __init__(self, payload: dict):
+    def __init__(self, payload: dict, status_code: int = 200):
         self._payload = payload
+        self.status_code = status_code   # _post 现先看 status_code（429 退避预检），桩须提供
 
     def raise_for_status(self) -> None:
         pass
@@ -90,3 +91,53 @@ async def test_place_order_returns_row_on_success():
         {"code": "0", "data": [{"sCode": "0", "ordId": "987", "clOrdId": "aragonx"}]})
     row = await client.place_order({"instId": "BTC-USDT-SWAP"})
     assert row["ordId"] == "987" and row["clOrdId"] == "aragonx"
+
+
+# ---------------- 回归：签名 POST 的 429 退避（live-auto-multi-symbol-rate-limit-429）----------------
+
+
+class _SequencedClient:
+    """假 httpx client：按预置状态码序列逐次返回，并记录每次发送的 content（验证重试复用同一 body）。"""
+
+    def __init__(self, statuses: list[int], payload: dict):
+        self._statuses = list(statuses)
+        self._payload = payload
+        self.sent_contents: list[str] = []
+
+    async def post(self, path, content=None, headers=None):  # noqa: D401 —— 仿 httpx 接口
+        self.sent_contents.append(content)
+        return _FakeResponse(self._payload, status_code=self._statuses.pop(0))
+
+
+async def test_post_retries_on_429_then_succeeds(monkeypatch):
+    """限流回归：首发 429、次发 200 时，签名 POST 退避后**重试到成功**，且重试复用同一 body。
+
+    复用同一 body 即同一 ``clOrdId``，OKX 按 ``clOrdId`` 去重，故重试幂等安全、不会重复下单。
+    护栏修复前（无退避）会在首发 429 立即抛 OKX_HTTP_ERROR。
+    """
+    monkeypatch.setattr("app.okx.trade_client.asyncio.sleep", _no_sleep)
+    client = OKXTradeClient("ak", "sk-post-vector-123456", "pp-123456")
+    fake = _SequencedClient([429, 200], {"code": "0", "data": [{"ordId": "1"}]})
+    client._client = fake   # 注入：绕过 _get_client 的真实 httpx
+    body = await client._post(
+        "/api/v5/trade/order", {"instId": "BTC-USDT-SWAP", "clOrdId": "aragonx1", "side": "buy"})
+    assert body == {"code": "0", "data": [{"ordId": "1"}]}
+    assert len(fake.sent_contents) == 2                       # 首发 429 退避吞掉，次发 200 成功
+    assert fake.sent_contents[0] == fake.sent_contents[1]     # 同一 body / 同一 clOrdId（幂等安全）
+
+
+async def test_post_exhausts_429_raises_http_error(monkeypatch):
+    """限流回归：持续 429 至退避耗尽，须显式抛 ``OKX_HTTP_ERROR / OKX HTTP 429``（非 last_exc=None 误导串）。"""
+    monkeypatch.setattr("app.okx.trade_client.asyncio.sleep", _no_sleep)
+    client = OKXTradeClient("ak", "sk-post-vector-123456", "pp-123456")
+    fake = _SequencedClient([429, 429, 429], {"code": "0", "data": []})
+    client._client = fake
+    with pytest.raises(OKXPrivateError) as exc:
+        await client._post("/api/v5/trade/order", {"instId": "BTC-USDT-SWAP"})
+    assert exc.value.code == "OKX_HTTP_ERROR"
+    assert "429" in exc.value.message
+
+
+async def _no_sleep(_seconds) -> None:
+    """退避桩：跳过真实 sleep，避免单测被指数退避拖慢。"""
+    return None

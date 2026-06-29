@@ -203,11 +203,22 @@ class LiveAutoManager:
 
     async def _gather_context(self, creds: AccountCredentials, req: GroupStartRequest,
                               members: list[GroupMemberInput]) -> tuple:
-        """P1-3：账户可用 USDT 与全账户持仓**整组各取一次**；逐成员仅取该标的 trading_config。"""
-        configs = await asyncio.gather(*[
-            fetch_trading_config(creds, req.account_row.id, m.inst_id, settings=req.settings)
-            for m in members])
-        positions = await fetch_live_positions(creds)
+        """P1-3：账户可用 USDT 与全账户持仓**整组各取一次**；逐成员仅取该标的 trading_config。
+
+        启动瞬间的签名私有请求按 `live_auto_start_concurrency`（默认 2）限流排队，避免一次性把
+        N×2 发 account/config + account/balance 打爆 OKX 私有限频触发 429（见 docs/diagnoses/
+        live-auto-multi-symbol-rate-limit-429）。`fetch_live_positions` 纳入同一信号量预算。
+        """
+        sem = asyncio.Semaphore(max(1, req.settings.live_auto_start_concurrency))
+
+        async def _bounded_config(inst_id: str) -> dict:
+            async with sem:
+                return await fetch_trading_config(
+                    creds, req.account_row.id, inst_id, settings=req.settings)
+
+        configs = await asyncio.gather(*[_bounded_config(m.inst_id) for m in members])
+        async with sem:
+            positions = await fetch_live_positions(creds)
         config_map = {m.inst_id: cfg for m, cfg in zip(members, configs)}
         avail = next((cfg.get("availUsdt") or 0.0 for cfg in configs), 0.0)
         return avail, positions, config_map

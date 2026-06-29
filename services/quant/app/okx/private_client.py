@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -102,17 +103,24 @@ class OKXPrivateClient:
     async def _get(self, path: str, params: dict | None = None) -> list:
         """签名 GET：返回 OKX ``data`` 数组；``code != "0"`` 或连通失败抛 ``OKXPrivateError``。
 
-        ``requestPath`` 须含 query string 并与签名串一致；对 ``httpx.TransportError`` 做**一次**重试。
+        ``requestPath`` 须含 query string 并与签名串一致。对 ``httpx.TransportError`` 重试，并对
+        HTTP ``429``（限流）做指数退避重试（镜像 ``rest_client._request``）——签名私有路径同样需自愈，
+        否则多标的自动交易启动瞬间撞限频会把 ``OKX HTTP 429`` 原样抛到 UI。非 429 的 4xx/5xx 仍立即上抛。
         """
         client = await self._get_client()
         query = httpx.QueryParams(params or {})
         request_path = path + (f"?{query}" if query else "")
         last_exc: Exception | None = None
-        for attempt in range(2):
+        rate_limited = False
+        for attempt in range(3):
             ts = _iso_timestamp()
             headers = self._headers(ts, "GET", request_path)
             try:
                 resp = await client.get(path, params=params, headers=headers)
+                if resp.status_code == 429:   # 限流：退避后重试，不直接抛
+                    rate_limited = True
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    continue
                 resp.raise_for_status()
                 body = resp.json()
                 if str(body.get("code")) != "0":
@@ -121,9 +129,12 @@ class OKXPrivateClient:
                 return body.get("data", [])
             except httpx.TransportError as exc:  # 仅传输层异常重试，鉴权/业务错误立即上抛
                 last_exc = exc
-            except httpx.HTTPStatusError as exc:
+                rate_limited = False
+            except httpx.HTTPStatusError as exc:  # 非 429 的 4xx/5xx：语义不变，立即上抛
                 raise OKXPrivateError("OKX_HTTP_ERROR",
                                       f"OKX HTTP {exc.response.status_code}") from exc
+        if rate_limited:   # 退避耗尽仍 429：显式回 OKX_HTTP_ERROR，避免 last_exc=None 的误导串
+            raise OKXPrivateError("OKX_HTTP_ERROR", "OKX HTTP 429")
         raise OKXPrivateError("OKX_UNREACHABLE", f"无法连接 OKX ({path}): {last_exc}")
 
     async def get_account_config(self) -> dict:

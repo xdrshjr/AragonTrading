@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -26,24 +27,34 @@ class OKXTradeClient(OKXPrivateClient):
     async def _post(self, path: str, payload: dict) -> dict:
         """签名 POST：返回 OKX 完整响应体（dict）；连通 / HTTP 失败抛 ``OKXPrivateError``。
 
-        业务码判定交由调用方（下单须同看顶层 ``code`` 与 ``data[0].sCode``，§2.2f）。
-        对 ``httpx.TransportError`` 做**一次**重试，与基类 ``_get`` 口径一致。
+        业务码判定交由调用方（下单须同看顶层 ``code`` 与 ``data[0].sCode``，§2.2f）。对
+        ``httpx.TransportError`` 重试，并对 HTTP ``429`` 做指数退避重试，与基类 ``_get`` 口径一致。
+        重试用同一 body / 同一 ``clOrdId``，OKX 按 ``clOrdId`` 去重，故即便首发已落地重试也不会重复下单
+        （幂等安全）。非 429 的 4xx/5xx 仍立即上抛。
         """
         client = await self._get_client()
         body = json.dumps(payload, separators=(",", ":"))
         last_exc: Exception | None = None
-        for _ in range(2):
+        rate_limited = False
+        for attempt in range(3):
             ts = _iso_timestamp()
             headers = self._headers(ts, "POST", path, body)
             try:
                 resp = await client.post(path, content=body, headers=headers)
+                if resp.status_code == 429:   # 限流：退避后重试，不直接抛
+                    rate_limited = True
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+                    continue
                 resp.raise_for_status()
                 return resp.json()
             except httpx.TransportError as exc:  # 仅传输层异常重试，业务错误立即上抛
                 last_exc = exc
-            except httpx.HTTPStatusError as exc:
+                rate_limited = False
+            except httpx.HTTPStatusError as exc:  # 非 429 的 4xx/5xx：语义不变，立即上抛
                 raise OKXPrivateError("OKX_HTTP_ERROR",
                                       f"OKX HTTP {exc.response.status_code}") from exc
+        if rate_limited:   # 退避耗尽仍 429：显式回 OKX_HTTP_ERROR，避免 last_exc=None 的误导串
+            raise OKXPrivateError("OKX_HTTP_ERROR", "OKX HTTP 429")
         raise OKXPrivateError("OKX_UNREACHABLE", f"无法连接 OKX ({path}): {last_exc}")
 
     async def place_order(self, payload: dict) -> dict:

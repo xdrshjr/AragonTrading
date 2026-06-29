@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     live_auto_max_sessions: int = 1              # （已弃用）旧「单会话独占」语义，现由单活跃分组取代
     # 单个活跃自动交易分组内的标的数硬上限（真实资金多标的并发的封顶护栏，R1/R6；前端拖入超限即拒绝）。
     live_auto_max_group_symbols: int = 8
+    # 分组启动时签名私有请求（account/config + account/balance）的并发上限：每 N 个标的一组排队，
+    # 避免启动瞬间把 N×2 发私有请求一次性打爆 OKX 私有限频触发 429（见 docs/diagnoses/
+    # live-auto-multi-symbol-rate-limit-429）。默认 2，可经 env LIVE_AUTO_START_CONCURRENCY 调参。
+    live_auto_start_concurrency: int = 2
     # 单标的旧路径留空默认（取可用 USDT 的 1%，保守）；分组路径不引用它（分组留空默认 = 上限本身）。
     live_auto_default_capital_frac: float = 0.01
     # 单标的旧路径绝对天花板（前置门禁强制夹紧，R4）。**保持 0.05 不变**——分组天花板见下一字段。
