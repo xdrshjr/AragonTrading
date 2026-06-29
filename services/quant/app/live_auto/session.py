@@ -63,6 +63,9 @@ class LiveAutoSession:
         self._last_candle_wall = 0.0          # H3/R-5：最近确认根墙钟（start 订阅 WS 时初始化）
         self._stale_degraded = False          # H3：行情停滞降级态（限频推送，避免刷屏）
         self._degraded_seen = False           # H4：会话期是否曾降级（落 Run metrics）
+        # A1：上次已随 status 事件推送的持仓方向。开/平/反手/外部平仓改变 executor.projected 后，
+        # 据此补推一条带 positionSide 的全量 status，使前端持仓真源刷新，修复持仓恒显「空仓」。
+        self._last_status_side = executor.projected
 
         self._window_max = min(max(strategy.warmup() + 5, priming_bars,
                                    strategy.htf_warmup_bars() + 5), PAPER_WINDOW_MAX)
@@ -241,6 +244,7 @@ class LiveAutoSession:
         now_ts = int(time.time())
         mark = await self._latest_mark_px()
         await self._dispatch(await self.executor.reconcile(mark, now_ts))
+        await self._push_status_if_side_changed()
         await self._emit_equity(mark, now_ts)
         await self._emit_position(mark)
         await self._check_staleness(now_ts)
@@ -317,6 +321,7 @@ class LiveAutoSession:
         events = await self._drive_signals(df, i, ref_px, ts)
         events += await self.executor.reconcile(ref_px, ts)
         await self._dispatch(events)
+        await self._push_status_if_side_changed()
         await self._emit_equity(ref_px, ts)
         await self._push({"type": "candle", "data": {**self._candles[-1], "confirm": True}})
         await self._emit_position(ref_px)
@@ -426,6 +431,21 @@ class LiveAutoSession:
         pos = self.executor.position_payload(ref_px)
         if pos is not None:
             await self._push({"type": "position", "data": pos})
+
+    async def _push_status_if_side_changed(self) -> None:
+        """持仓方向（executor.projected）较上次推送变化时补推一条全量 status（A1）。
+
+        `status.positionSide` 是持仓单一真源（经 reconcile 用真实 OKX 持仓校正），但正常开/平/反手
+        路径只推 trade / position、不刷新 status，导致前端 positionSide 冻结在连接时的 flat、持仓恒显
+        「空仓」。在持锁的 `_on_confirmed` / `_monitor_tick` 派发 executor 事件**之后**调用本方法：
+        方向变化即推全量 `_status_payload()`（含 positionSide），覆盖同轮可能出现的轻量 status；
+        方向不变则不推，避免冗余 WS 流量。读写 `_last_status_side` 在持锁路径内串行，无并发风险。
+        """
+        side = self.executor.projected
+        if side == self._last_status_side:
+            return
+        self._last_status_side = side
+        await self._push({"type": "status", "data": self._status_payload()})
 
     def _status_payload(self) -> dict:
         return {"state": self.state, "warmedBars": self._warmed_bars,

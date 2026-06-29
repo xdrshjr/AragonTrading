@@ -129,6 +129,41 @@ async def test_reconcile_corrects_projected_to_flat():
         await dispose_engine()
 
 
+async def test_open_pushes_status_with_position_side():
+    # A1：开仓使 projected flat→long 时须推一条带 positionSide=long 的全量 status，否则前端持仓恒显「空仓」
+    # (docs/diagnoses/live-auto-position-stale-and-redundant-toggle)。修复前订阅队列无此 status → 必失败。
+    await init_db()
+    session, calls, _ = _make_session({1: [Signal(side="long")]})
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))   # 暖机根，无信号，方向不变不推 status
+        await session.feed_candle(_candle(1))   # 首信号根 → 开多
+        assert session.executor.projected == "long"
+        sides = [e["data"].get("positionSide") for e in _drain(q) if e["type"] == "status"]
+        assert "long" in sides
+    finally:
+        await dispose_engine()
+
+
+async def test_monitor_tick_pushes_flat_status_on_external_close():
+    # A1（盯市循环路径）：reconcile 侦测外部平仓使 projected long→flat 时，亦须推 positionSide=flat 全量 status，
+    # 让前端持仓标签从「多」归位为「空仓」。覆盖 _monitor_tick 与 _on_confirmed 之外的第二条改 projected 路径。
+    await init_db()
+    session, calls, pos_state = _make_session({1: [Signal(side="long")]})
+    try:
+        await session.feed_candle(_candle(0))
+        await session.feed_candle(_candle(1))
+        assert session.executor.projected == "long"
+        q = session.subscribe()                  # 订阅在开仓后 → 只看盯市轮事件
+        pos_state["flat"] = True                  # 交易所侧已平（OCO 触发 / 外部干预）
+        await session._monitor_tick()
+        assert session.executor.projected == "flat"
+        sides = [e["data"].get("positionSide") for e in _drain(q) if e["type"] == "status"]
+        assert "flat" in sides
+    finally:
+        await dispose_engine()
+
+
 async def test_session_stop_loss_triggers_auto_stop():
     await init_db()
     sm = get_sessionmaker()
