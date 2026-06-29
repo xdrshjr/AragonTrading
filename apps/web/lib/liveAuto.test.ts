@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   clampBudgetToCap,
   deriveDefaultBudget,
+  describeStopReason,
   parseOptionalLeverage,
   parseOptionalUsd,
   resolveAutoTradeGate,
@@ -75,5 +76,22 @@ describe("parseOptionalLeverage", () => {
   it("rejects out of range", () => {
     expect(parseOptionalLeverage("200").error).toBeTruthy();
     expect(parseOptionalLeverage("0").error).toBeTruthy();
+  });
+});
+
+describe("describeStopReason (hardening H7/R-6)", () => {
+  it("maps every known stop reason to Chinese", () => {
+    expect(describeStopReason("user_stop")).toBe("手动停止");
+    expect(describeStopReason("session_stop_loss")).toBe("触发会话止损");
+    expect(describeStopReason("session_take_profit")).toBe("触发会话止盈");
+    expect(describeStopReason("shutdown")).toBe("服务重启");
+    expect(describeStopReason("stale_feed")).toBe("行情中断保护");
+    expect(describeStopReason("start_failed")).toBe("启动失败");
+  });
+
+  it("falls back to 已停止 for null / unknown values", () => {
+    expect(describeStopReason(null)).toBe("已停止");
+    expect(describeStopReason(undefined)).toBe("已停止");
+    expect(describeStopReason("some_future_reason")).toBe("已停止");
   });
 });

@@ -26,6 +26,8 @@ from ..okx.trading import close_live_position, fetch_live_positions, place_live_
 # net_mode 反手清算确认（R5）：close 返回后短轮询净仓直至 pos==0，避免 open 被反向单护栏误拒。
 _CLEAR_CONFIRM_MAX_TRIES = 6
 _CLEAR_CONFIRM_INTERVAL_S = 0.5
+# H4：停止会话平仓失败的有界重试间隔（次数由 settings.live_auto_flatten_max_retries 控制）。
+_FLATTEN_RETRY_INTERVAL_S = 0.5
 
 
 class LiveExecutor:
@@ -59,6 +61,8 @@ class LiveExecutor:
         self.realized_pnl_usd = 0.0        # 累计已实现（平仓回执累加）
         self.unrealized_usd = 0.0          # 最近一次 reconcile 的浮盈（OKX upl）
         self.trades: list[dict] = []       # 已执行真单→Trade（驱动图表 markers）
+        self._reconcile_fail_streak = 0    # H2：连续 reconcile 读取失败计数（成功即清零）
+        self.degraded = False              # H2：盯市降级标志（连续失败达阈→True，恢复→False）
 
         self._place_order = place_order_fn or self._default_place_order
         self._close_position = close_position_fn or self._default_close_position
@@ -216,8 +220,19 @@ class LiveExecutor:
 
     # ---------- reconcile / flatten ----------
     async def reconcile(self, mark_px: float, ts: int) -> list[dict]:
-        """持仓真源校正（§2.5）：拉 OKX 持仓校正 projected 并更新未实现盈亏。"""
-        positions = await self._read_positions()
+        """持仓真源校正（§2.5）：拉 OKX 持仓校正 projected 并更新未实现盈亏。
+
+        H2：读取一律经 `except OKXError` 兜住（传输层异常已被 private/trade_client 归一为
+        `OKXPrivateError(OKXError)`），失败不冒泡污染行情链路；连续失败达阈推降级事件，恢复后清零。
+        """
+        try:
+            positions = await self._read_positions()
+        except OKXError as exc:
+            return self._on_reconcile_failure(ts, exc)
+        return self._on_reconcile_ok(mark_px, positions)
+
+    def _on_reconcile_ok(self, mark_px: float, positions: list[dict]) -> list[dict]:
+        events = self._clear_degraded_if_recovered()
         abs_pos = self._net_abs_pos(positions)
         self.unrealized_usd = self._net_upl(positions)
         if self.projected != "flat" and abs_pos <= 0:
@@ -225,23 +240,59 @@ class LiveExecutor:
             self.unrealized_usd = 0.0
             self.projected = "flat"
             self.entry_qty_sz = 0.0
-            return [self._status_event("持仓已在交易所侧平仓 / 外部干预，已校正为 flat")]
+            events.append(self._status_event("持仓已在交易所侧平仓 / 外部干预，已校正为 flat"))
+        return events
+
+    def _clear_degraded_if_recovered(self) -> list[dict]:
+        """成功 reconcile：清零失败计数；若此前降级则消降级并推一条「已恢复」status。"""
+        self._reconcile_fail_streak = 0
+        if self.degraded:
+            self.degraded = False
+            return [self._status_event("账户连接已恢复，盯市校正恢复正常")]
         return []
 
+    def _on_reconcile_failure(self, ts: int, exc: OKXError) -> list[dict]:
+        """失败 reconcile：保留 projected / 上次浮盈不动；达阈仅推一次降级 error（避免刷屏）。"""
+        self._reconcile_fail_streak += 1
+        events: list[dict] = [self._status_event(
+            "账户 / 行情连接抖动，本次盯市跳过（不影响已挂交易所侧止盈止损）")]
+        if (self._reconcile_fail_streak >= self.settings.live_auto_reconcile_max_failures
+                and not self.degraded):
+            self.degraded = True
+            events.append({"type": "error", "data": {
+                "ts": int(ts), "code": "LIVE_AUTO_RECONCILE_DEGRADED",
+                "message": f"账户连接连续 {self._reconcile_fail_streak} 次读取失败，盯市已降级"
+                           f"（[{exc.code}]；交易所侧止盈止损仍生效，请检查网络 / 凭证）"}})
+        return events
+
     async def flatten(self, ref_px: float, ts: int) -> dict:
-        """停止会话时平掉自管持仓（市价，autoCxl 撤随单 OCO）。绝不触碰非自管持仓。"""
+        """停止会话时平掉自管持仓（市价，autoCxl 撤随单 OCO）。绝不触碰非自管持仓。
+
+        H4：平仓失败有界重试（`settings.live_auto_flatten_max_retries` 次 / `0.5s`）；仍失败则
+        **保留**残留仓（不改 projected）并结构化返回 `residual`，绝不假报干净停止。
+        """
         if self.projected == "flat":
             return {"ok": True, "closedSz": 0}
         close = ClosePositionInput(
             inst_id=self.inst_id, pos_side=self._pos_side(), pos=self._signed_pos(),
             mgn_mode=self.td_mode, ord_type="market", px=None, sz=None)
-        try:
-            result = await self._close_position(close)
-        except OKXError as exc:
-            if exc.code == "LIVE_NO_POSITION":
-                self._settle_benign_close(ref_px, ts)
-                return {"ok": True, "closedSz": 0, "note": "already_flat"}
-            return {"ok": False, "code": exc.code, "message": exc.message}
+        last_exc: OKXError | None = None
+        for attempt in range(self.settings.live_auto_flatten_max_retries + 1):
+            try:
+                result = await self._close_position(close)
+            except OKXError as exc:
+                if exc.code == "LIVE_NO_POSITION":
+                    self._settle_benign_close(ref_px, ts)
+                    return {"ok": True, "closedSz": 0, "note": "already_flat"}
+                last_exc = exc
+                if attempt < self.settings.live_auto_flatten_max_retries:
+                    await asyncio.sleep(_FLATTEN_RETRY_INTERVAL_S)
+                continue
+            return self._settle_flatten_ok(ref_px, ts, result)
+        return {"ok": False, "code": last_exc.code, "message": last_exc.message,
+                "residual": {"side": self.projected, "size": self.entry_qty_sz}}
+
+    def _settle_flatten_ok(self, ref_px: float, ts: int, result: dict) -> dict:
         events = self._settle_close(ref_px, ts, "session_stop", result)
         trade = events[0]["data"] if events else None
         return {"ok": True, "closedSz": trade["qty"] if trade else 0,

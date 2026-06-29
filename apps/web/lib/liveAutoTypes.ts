@@ -1,13 +1,15 @@
 // 实时自动交易类型（live-auto-trading §5.1，camelCase 与后端 wire 对齐）。
 import type { EquityPoint, PaperPositionEvent, Trade } from "./types";
 
-// 自动会话停止原因（用户手动 / 会话级止盈止损 / 进程关停 / 启动失败回滚）。
+// 自动会话停止原因（用户手动 / 会话级止盈止损 / 进程关停 / 启动失败回滚 / 行情中断保护）。
+// hardening R-6：扩充 stale_feed（看门狗 flatten_on_stale 触发的保护性停止）。
 export type AutoStopReason =
   | "user_stop"
   | "session_take_profit"
   | "session_stop_loss"
   | "shutdown"
-  | "start_failed";
+  | "start_failed"
+  | "stale_feed";
 
 // 启动请求（全部金额字段可选；留空→服务端保守默认）。
 export interface LiveAutoStartReq {
@@ -58,6 +60,7 @@ export interface LiveAutoStatusResponse {
 }
 
 // WS status 事件载荷（与 paper status 同构 + 自动交易扩展字段）。
+// hardening R-6：message?/stopReason? 已存在；新增 degraded?/flattenFailed?/residual?（向后兼容）。
 export interface LiveAutoStatus {
   state: string;
   warmedBars?: number;
@@ -67,6 +70,17 @@ export interface LiveAutoStatus {
   leverage?: number;
   stopReason?: string | null;
   message?: string;
+  degraded?: boolean;
+  flattenFailed?: boolean;
+  residual?: { side?: string; size?: number } | null;
+}
+
+// 自动交易事件流条目（hardening H6/H7）：error / status.message / 降级 等关键信息的轻量活动流载体。
+export interface LiveAutoEvent {
+  ts: number;
+  level: "info" | "warn" | "error";
+  code?: string;
+  message: string;
 }
 
 export interface LiveAutoFlattenResult {

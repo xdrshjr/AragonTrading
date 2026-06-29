@@ -5,6 +5,8 @@ import { type ReactNode, useMemo, useState } from "react";
 import { Badge, Button, Modal } from "@/components/ui";
 import { fmtPrice } from "@/lib/format";
 import {
+  LIVE_AUTO_DEFAULT_LEVERAGE,
+  LIVE_MAX_ORDER_NOTIONAL_USD,
   clampBudgetToCap,
   deriveDefaultBudget,
   parseOptionalLeverage,
@@ -111,9 +113,24 @@ export default function AutoTradeConfirmModal({
           label="生效预算（预览）"
           value={previewBudget != null ? `${fmtPrice(previewBudget)} USDT` : "—"}
         />
+        <Row
+          label="生效杠杆"
+          value={leverage.value != null ? `${leverage.value}×` : `默认 ${LIVE_AUTO_DEFAULT_LEVERAGE}×`}
+        />
+        <Row label="单笔名义上限" value={`≤ ${LIVE_MAX_ORDER_NOTIONAL_USD} USDT/单`} />
       </div>
 
       <div className="flex flex-col gap-3 px-5 py-4">
+        {/* H8：点明止盈止损为会话累计金额阈值，并说明每笔自带交易所侧 OCO，避免风险敞口误解。 */}
+        <p className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-2.5 py-2 text-[11px] leading-relaxed text-[var(--muted)]">
+          <strong className="text-[var(--text)]">止盈 / 止损为会话累计金额阈值</strong>
+          （达到即自动平仓并停止），留空则不按金额触发；每笔交易另自带策略止盈止损（交易所侧 OCO，进程退出后仍兜底）。
+        </p>
+        {configQ.isError && (
+          <p className="text-[11px] leading-relaxed text-[var(--muted)]">
+            可用余额读取失败，预算将由服务端按上限夹紧后生效，不影响启动。
+          </p>
+        )}
         <p className="text-[11px] leading-relaxed text-[var(--muted)]">
           以下均可留空，留空即用保守内置默认；硬上限为可用余额的 5%，超出将被服务端自动夹紧。
         </p>

@@ -169,5 +169,79 @@ async def test_close_no_position_is_benign():
     assert any(e["type"] == "status" for e in events)
 
 
+async def test_reconcile_swallows_read_error_and_emits_status():
+    # H2：reconcile 读取抛 OKXError 不冒泡，返回 status 事件、projected 不变、失败计数 +1。
+    ex, _ = _make_executor()
+    await ex.apply([_Sig("long")], ref_px=_REF_PX, bar_index=0, ts=1000)
+    assert ex.projected == "long"
+
+    async def boom():
+        raise OKXPrivateError("OKX_UNREACHABLE", "网络抖动")
+
+    ex._read_positions = boom
+    events = await ex.reconcile(_REF_PX, ts=2000)
+    assert ex.projected == "long"                       # 持仓状态机不被污染
+    assert any(e["type"] == "status" for e in events)
+    assert not [e for e in events if e["type"] == "error"]   # 未达阈不推 error
+    assert ex._reconcile_fail_streak == 1
+
+
+async def test_reconcile_degrades_after_consecutive_failures_then_recovers():
+    # H2：连续失败达阈 → degraded + 推一次 error；成功 reconcile 后 degraded 清零并推恢复 status。
+    ex, _ = _make_executor()
+    await ex.apply([_Sig("long")], ref_px=_REF_PX, bar_index=0, ts=1000)
+
+    async def boom():
+        raise OKXPrivateError("OKX_UNREACHABLE", "网络抖动")
+
+    ex._read_positions = boom
+    max_fail = ex.settings.live_auto_reconcile_max_failures
+    errors = []
+    for i in range(max_fail):
+        errors += [e for e in await ex.reconcile(_REF_PX, ts=2000 + i) if e["type"] == "error"]
+    assert ex.degraded is True
+    assert len(errors) == 1 and errors[0]["data"]["code"] == "LIVE_AUTO_RECONCILE_DEGRADED"
+
+    async def ok():
+        return [{"instId": "BTC-USDT-SWAP", "pos": ex.entry_qty_sz, "upl": 0.0}]
+
+    ex._read_positions = ok
+    recover = await ex.reconcile(_REF_PX, ts=3000)
+    assert ex.degraded is False and ex._reconcile_fail_streak == 0
+    assert any(e["type"] == "status" for e in recover)
+
+
+async def test_flatten_bounded_retry_returns_residual_on_persistent_failure(monkeypatch):
+    # H4：平仓持续失败 → 有界重试后返回 ok=False + residual，projected 未被假平（残留仓如实保留）。
+    monkeypatch.setattr("app.live_auto.executor.asyncio.sleep", _no_sleep)
+    ex, calls = _make_executor(raise_on_close=OKXPrivateError("51008", "余额不足"))
+    await ex.apply([_Sig("long")], ref_px=_REF_PX, bar_index=0, ts=1000)
+    result = await ex.flatten(_REF_PX, ts=2000)
+    assert result["ok"] is False
+    assert result["residual"] == {"side": "long", "size": ex.entry_qty_sz}
+    assert ex.projected == "long"                      # 残留仓未被改 flat
+    assert len(calls["closes"]) == ex.settings.live_auto_flatten_max_retries + 1
+
+
+async def test_flatten_succeeds_on_retry_after_transient_failure(monkeypatch):
+    # H4：首次平仓失败、重试成功 → ok=True，不留 residual。
+    monkeypatch.setattr("app.live_auto.executor.asyncio.sleep", _no_sleep)
+    ex, calls = _make_executor()
+    await ex.apply([_Sig("long")], ref_px=_REF_PX, bar_index=0, ts=1000)
+    attempts = {"n": 0}
+
+    async def flaky_close(close):
+        calls["closes"].append(close)
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise OKXPrivateError("OKX_UNREACHABLE", "瞬时抖动")
+        return {"ok": True, "clOrdId": "aragoncx"}
+
+    ex._close_position = flaky_close
+    result = await ex.flatten(_REF_PX, ts=2000)
+    assert result["ok"] is True and ex.projected == "flat"
+    assert attempts["n"] == 2
+
+
 async def _no_sleep(*_args, **_kwargs):
     return None

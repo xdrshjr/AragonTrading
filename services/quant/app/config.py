@@ -60,7 +60,16 @@ class Settings(BaseSettings):
     live_auto_max_sessions: int = 1              # 单会话独占（真实资金，绝不并发多策略自动下单）
     live_auto_default_capital_frac: float = 0.01  # 预算留空时取可用 USDT 的 1%（保守默认）
     live_auto_max_capital_frac: float = 0.05     # 预算对可用余额硬上限（前置门禁强制夹紧，R4）
-    live_auto_poll_interval_s: int = 5           # 持仓 reconcile / 会话盯市轮询基准间隔（秒）
+    live_auto_poll_interval_s: int = 5           # 持仓 reconcile / 会话盯市轮询基准间隔（秒，hardening H1 接线）
+    # ---- 加固增强（live-auto-trading-hardening）：独立盯市循环 + 容错 + 看门狗（H1/H2/H3/H4）----
+    # 行情停滞看门狗阈值 = bar_seconds × 该系数；超阈推降级 status（默认仅告警不平仓）。
+    live_auto_staleness_factor: float = 3.0
+    # 行情停滞是否自动平仓（默认 False：瞬时抖动平仓危害更大；仅运维显式开启且停滞超长才触发）。
+    live_auto_flatten_on_stale: bool = False
+    # reconcile 连续失败达此次数即推 degraded（默认 6 ≈ 30s @ poll_interval_s=5），恢复后清零。
+    live_auto_reconcile_max_failures: int = 6
+    # 停止会话平仓失败的有界重试次数（默认 2；仍失败则诚实返回 residual 并强提示人工平仓，H4）。
+    live_auto_flatten_max_retries: int = 2
 
     # ---- 代理（透传给 httpx / websockets）----
     http_proxy: str = ""

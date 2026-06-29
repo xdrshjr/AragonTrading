@@ -229,6 +229,9 @@ class LiveAutoSessionRow(BaseModel):
     positionSide: str
     sessionPnlUsd: float
     startedTs: int
+    # 加固增量（live-auto-trading-hardening H2/H3/H4）：供重载后即时呈现降级 / 平仓失败态（可选，向后兼容）。
+    degraded: bool | None = None
+    flattenFailed: bool | None = None
 
 
 class LiveAutoStatusOut(BaseModel):

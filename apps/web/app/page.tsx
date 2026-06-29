@@ -37,7 +37,7 @@ import {
 } from "@/lib/paperMulti";
 import { DEFAULT_RIGHT_PANEL_WIDTH, useAppStore } from "@/lib/store";
 import { liveAutoApi, liveAutoWS } from "@/lib/liveAutoApi";
-import type { LiveAutoSnapshot, LiveAutoStatus } from "@/lib/liveAutoTypes";
+import type { LiveAutoEvent, LiveAutoSnapshot, LiveAutoStatus } from "@/lib/liveAutoTypes";
 import type {
   Candle,
   CompareResult,
@@ -89,6 +89,7 @@ export default function Page() {
     setLiveAutoTrades,
     appendLiveAutoTrade,
     setLiveAutoPosition,
+    pushLiveAutoEvent,
     toggleTheme,
     setRightPanelWidth,
   } = useAppStore();
@@ -349,6 +350,7 @@ export default function Page() {
         appendLiveAutoTrade,
         setLiveAutoPosition,
         setLiveAutoStatus,
+        pushLiveAutoEvent,
         setLive,
         setForming,
       });
@@ -361,6 +363,7 @@ export default function Page() {
     appendLiveAutoTrade,
     setLiveAutoPosition,
     setLiveAutoStatus,
+    pushLiveAutoEvent,
   ]);
 
   // 节流约束：ref 推进必须随入帧同步发生（ref 无渲染成本，candle 分支门控要读最新值），
@@ -699,6 +702,7 @@ interface LiveAutoEventSetters {
   appendLiveAutoTrade: (trade: Trade) => void;
   setLiveAutoPosition: (pos: PaperPositionEvent | null) => void;
   setLiveAutoStatus: (status: LiveAutoStatus | null) => void;
+  pushLiveAutoEvent: (event: LiveAutoEvent) => void;
   setLive: Dispatch<SetStateAction<Candle[]>>;
   setForming: Dispatch<SetStateAction<Candle | null>>;
 }
@@ -720,8 +724,28 @@ function handleLiveAutoEvent(event: WsEvent, setters: LiveAutoEventSetters) {
     setters.setLiveAutoPosition(event.data as PaperPositionEvent);
     return;
   }
+  // H6：下单 / 平仓失败等 error 事件不再被丢弃 —— 推入事件流（错误级，组件置顶高亮）。
+  if (event.type === "error") {
+    const data = event.data as { ts?: number; code?: string; message?: string };
+    setters.pushLiveAutoEvent({
+      ts: data.ts ?? Math.floor(Date.now() / 1000),
+      level: "error",
+      code: data.code,
+      message: data.message ?? "自动交易发生错误",
+    });
+    return;
+  }
   if (event.type === "status") {
-    setters.setLiveAutoStatus(event.data as LiveAutoStatus);
+    const status = event.data as LiveAutoStatus;
+    setters.setLiveAutoStatus(status);
+    // H6：status 携带的中文诊断 message（含降级）入事件流，使「bot 此刻在做什么」对用户透明。
+    if (status.message) {
+      setters.pushLiveAutoEvent({
+        ts: Math.floor(Date.now() / 1000),
+        level: status.degraded ? "warn" : "info",
+        message: status.message,
+      });
+    }
     return;
   }
   if (event.type === "candle") {

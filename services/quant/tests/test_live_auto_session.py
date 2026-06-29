@@ -5,6 +5,8 @@ reconcile 校正 projected、会话级止损触发自动平仓 + 停。
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from app.config import Settings
@@ -14,6 +16,7 @@ from app.engine.simulator import RiskParams
 from app.live_auto.executor import LiveExecutor
 from app.live_auto.session import LiveAutoSession
 from app.okx.accounts import AccountCredentials
+from app.okx.private_client import OKXPrivateError
 from app.okx.types import Candle
 from app.strategies.base import BaseStrategy, Signal, StrategyMeta
 
@@ -73,6 +76,13 @@ def _make_session(signals_by_bar=None, *, run_id=1, stop_loss_usd=None,
                               "BTC-USDT-SWAP", "1H", executor, stop_loss_usd=stop_loss_usd,
                               priming=False)
     return session, calls, pos_state
+
+
+def _drain(q: asyncio.Queue) -> list[dict]:
+    out: list[dict] = []
+    while not q.empty():
+        out.append(q.get_nowait())
+    return out
 
 
 async def test_priming_window_does_not_trade(monkeypatch):
@@ -137,3 +147,91 @@ async def test_session_stop_loss_triggers_auto_stop():
         assert len(calls["closes"]) >= 1   # 自动平仓
     finally:
         await dispose_engine()
+
+
+async def test_monitor_loop_triggers_stop_loss_between_bars_and_completes_flatten():
+    # H1 + R-2(P0)：盯市循环（非收线）触发会话止损；循环内停止不自取消、flatten 完整执行 + Run 落终态。
+    await init_db()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        run = await repo.create_run(s, strategy_id=1, inst_id="BTC-USDT-SWAP", bar="1H",
+                                    mode="live-auto", config={"mode": "live-auto"})
+        run_id = run.id
+    session, calls, pos_state = _make_session({1: [Signal(side="long")]}, run_id=run_id,
+                                              stop_loss_usd=50.0)
+    try:
+        await session.feed_candle(_candle(0))
+        await session.feed_candle(_candle(1))   # 开多，此时浮亏为 0，收线不触发
+        assert session.executor.projected == "long" and session.state == "running"
+        pos_state["upl"] = -100.0               # 两根之间浮亏 100 > 止损 50
+        # 模拟「盯市任务即当前任务」：若 stop 不带 current_task 守卫，将取消自身中断 flatten（R-2）。
+        session._monitor_task = asyncio.current_task()
+        await session._monitor_tick()
+        assert session.state == "stopped"
+        assert session.stop_reason == "session_stop_loss"
+        assert len(calls["closes"]) >= 1                       # 真实平仓被执行
+        assert session.flatten_result and session.flatten_result.get("ok") is True
+        assert session.flatten_failed is False
+        async with sm() as s:
+            run = await repo.get_run(s, run_id)
+            assert run.status == "stopped"                     # _finalize_run 落终态未被跳过
+    finally:
+        session._monitor_task = None
+        await dispose_engine()
+
+
+async def test_monitor_loop_emits_degraded_status_on_stale_feed():
+    # H3：行情墙钟超阈 → 推 degraded status；flatten_on_stale=False 默认不平仓。
+    await init_db()
+    session, calls, pos_state = _make_session({1: [Signal(side="long")]})
+    try:
+        await session.feed_candle(_candle(0))
+        await session.feed_candle(_candle(1))
+        assert session.executor.projected == "long"
+        q = session.subscribe()
+        session._last_candle_wall = 1.0          # 远古墙钟 → 必然超阈
+        await session._monitor_tick()
+        assert session._stale_degraded is True
+        assert session.state == "running" and len(calls["closes"]) == 0
+        drained = _drain(q)
+        assert any(e["type"] == "status" and e["data"].get("degraded") for e in drained)
+    finally:
+        await dispose_engine()
+
+
+async def test_stop_flatten_failure_sets_flatten_failed_and_keeps_residual(monkeypatch):
+    # H4：停止平仓持续失败 → flattenFailed=True + residual 保留 + 推 LIVE_AUTO_FLATTEN_FAILED，不假报干净。
+    monkeypatch.setattr("app.live_auto.executor.asyncio.sleep", _no_sleep)
+    await init_db()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        run = await repo.create_run(s, strategy_id=1, inst_id="BTC-USDT-SWAP", bar="1H",
+                                    mode="live-auto", config={"mode": "live-auto"})
+        run_id = run.id
+    session, calls, pos_state = _make_session({1: [Signal(side="long")]}, run_id=run_id)
+
+    async def failing_close(close):
+        calls["closes"].append(close)
+        raise OKXPrivateError("51008", "余额不足无法平仓")
+
+    session.executor._close_position = failing_close
+    try:
+        await session.feed_candle(_candle(0))
+        await session.feed_candle(_candle(1))
+        assert session.executor.projected == "long"
+        q = session.subscribe()
+        result = await session.stop("user_stop")
+        assert result.get("ok") is False
+        assert session.flatten_failed is True
+        assert session.residual == {"side": "long", "size": session.executor.entry_qty_sz}
+        assert session.executor.projected == "long"           # 残留仓未被假平
+        assert session._status_payload()["flattenFailed"] is True
+        drained = _drain(q)
+        assert any(e["type"] == "error" and e["data"]["code"] == "LIVE_AUTO_FLATTEN_FAILED"
+                   for e in drained)
+    finally:
+        await dispose_engine()
+
+
+async def _no_sleep(*_args, **_kwargs):
+    return None

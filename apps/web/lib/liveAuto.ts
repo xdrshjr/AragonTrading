@@ -1,10 +1,15 @@
-// 实时自动交易纯件（live-auto-trading）：守门判定、预算派生 / 夹紧、金额输入校验。
-// 全部为无副作用纯函数，供 AutoTradeToggle / AutoTradeConfirmModal 复用并单测。
+// 实时自动交易纯件（live-auto-trading）：守门判定、预算派生 / 夹紧、金额输入校验、停止原因文案。
+// 全部为无副作用纯函数，供 AutoTradeToggle / AutoTradeConfirmModal / AutoTradeStatusBar 复用并单测。
+import type { AutoStopReason } from "./liveAutoTypes";
 import type { AccountMode } from "./types";
 
 // 预算默认 / 硬上限占可用余额比例（与后端 settings.live_auto_*_capital_frac 一致）。
 export const LIVE_AUTO_DEFAULT_CAPITAL_FRAC = 0.01;
 export const LIVE_AUTO_MAX_CAPITAL_FRAC = 0.05;
+// 生效杠杆默认值（与后端 settings.live_default_leverage 一致，弹窗摘要展示，H8）。
+export const LIVE_AUTO_DEFAULT_LEVERAGE = 3;
+// 单笔名义价值上限（与后端 settings.live_max_order_notional_usd 默认一致，弹窗摘要展示，H8）。
+export const LIVE_MAX_ORDER_NOTIONAL_USD = 1000;
 
 export interface AutoTradeGateInput {
   accountMode: AccountMode;
@@ -53,4 +58,20 @@ export function parseOptionalLeverage(raw: string): { value: number | null; erro
     return { value: null, error: "杠杆需在 1~125 之间，或留空使用默认" };
   }
   return { value: n, error: null };
+}
+
+// 自动会话停止原因 → 中文文案（hardening H7/R-6）；未知值回落「已停止」，杜绝枚举漂移导致空白。
+const STOP_REASON_LABELS: Record<AutoStopReason, string> = {
+  user_stop: "手动停止",
+  session_stop_loss: "触发会话止损",
+  session_take_profit: "触发会话止盈",
+  shutdown: "服务重启",
+  stale_feed: "行情中断保护",
+  start_failed: "启动失败",
+};
+
+/** 终止横幅文案：停止原因 → 中文（H7）；空 / 未知一律回落「已停止」。 */
+export function describeStopReason(reason: string | null | undefined): string {
+  if (!reason) return "已停止";
+  return STOP_REASON_LABELS[reason as AutoStopReason] ?? "已停止";
 }

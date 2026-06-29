@@ -5,6 +5,8 @@ OKX 调用全程打桩；会话用轻量假实现避免 WS/网络。铁律：占
 """
 from __future__ import annotations
 
+import asyncio
+
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
@@ -174,6 +176,28 @@ async def test_second_start_rejected_by_session_limit(monkeypatch):
             second = await client.post("/api/live-auto/start", json=_start_body(strategy_id))
             assert second.status_code == 409, second.text
             assert second.json()["error"]["code"] == "LIVE_AUTO_SESSION_LIMIT"
+    finally:
+        get_live_auto_manager()._session = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_concurrent_start_only_one_succeeds(monkeypatch):
+    # H5：并发两次 start 恰一个成功、另一个 409 LIVE_AUTO_SESSION_LIMIT（start 锁消除 TOCTOU）。
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch_okx(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r1, r2 = await asyncio.gather(
+                client.post("/api/live-auto/start", json=_start_body(strategy_id)),
+                client.post("/api/live-auto/start", json=_start_body(strategy_id)),
+            )
+            assert sorted([r1.status_code, r2.status_code]) == [200, 409], (r1.text, r2.text)
+            limit_resp = r1 if r1.status_code == 409 else r2
+            assert limit_resp.json()["error"]["code"] == "LIVE_AUTO_SESSION_LIMIT"
     finally:
         get_live_auto_manager()._session = None
         app.dependency_overrides.clear()

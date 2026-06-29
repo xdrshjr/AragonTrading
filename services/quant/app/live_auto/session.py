@@ -54,6 +54,12 @@ class LiveAutoSession:
         self.stop_reason: str | None = None
         self.started_ts = int(time.time())
         self.flatten_result: dict | None = None
+        self.flatten_failed = False           # H4：停止平仓失败标志（诚实上报，不假报干净）
+        self.residual: dict | None = None     # H4：平仓失败残留仓 {side,size}
+        self._monitor_task: asyncio.Task | None = None  # H1：独立盯市循环任务
+        self._last_candle_wall = 0.0          # H3/R-5：最近确认根墙钟（start 订阅 WS 时初始化）
+        self._stale_degraded = False          # H3：行情停滞降级态（限频推送，避免刷屏）
+        self._degraded_seen = False           # H4：会话期是否曾降级（落 Run metrics）
 
         self._window_max = min(max(strategy.warmup() + 5, priming_bars,
                                    strategy.htf_warmup_bars() + 5), PAPER_WINDOW_MAX)
@@ -66,11 +72,17 @@ class LiveAutoSession:
         self._last_confirmed_ts: int | None = None
         self._bar_index = -1
         self._warmed_bars = 0
-        self._equity: list[dict] = []
+        # R-3：净值缓冲有界（盯市循环秒级追加，maxlen 自动裁顶，杜绝多日实盘进程内存泄漏）。
+        self._equity: deque[dict] = deque(maxlen=_SNAPSHOT_EQUITY_MAX)
         self._peak_equity = executor.budget_usd
         self._subscribers: set[asyncio.Queue] = set()
         self._ws: OKXWSClient | None = None
         self._lock = asyncio.Lock()
+
+    @property
+    def poll_interval_s(self) -> int:
+        """盯市循环基准间隔（秒）；与 reconcile / 看门狗共用，源自会话级 settings。"""
+        return self.executor.settings.live_auto_poll_interval_s
 
     # ---------- fan-out ----------
     def subscribe(self) -> asyncio.Queue:
@@ -95,6 +107,10 @@ class LiveAutoSession:
         await self._prime_window()
         self._ws = OKXWSClient(self.inst_id, self.bar, self.feed_candle)
         self._ws.start()
+        # R-5：订阅 WS 即以墙钟初始化看门狗基准，避免首根实时确认根到来前误判停滞。
+        self._last_candle_wall = time.time()
+        # H1：独立盯市循环（reconcile + 盯市 + 会话止盈止损 + 推送），与收线信号驱动解耦。
+        self._monitor_task = asyncio.create_task(self._monitor_loop())
         await self._push({"type": "status", "data": self._status_payload()})
 
     async def _prime_window(self) -> None:
@@ -117,6 +133,7 @@ class LiveAutoSession:
             return self.flatten_result or {"ok": True, "closedSz": 0}
         self.state = "stopped"
         self.stop_reason = reason
+        self._cancel_monitor_task()
         if self._ws is not None:
             await self._ws.stop()
         ref_px = float(self._candles[-1]["c"]) if self._candles else self.executor.entry_price
@@ -125,11 +142,107 @@ class LiveAutoSession:
             self.flatten_result = await self.executor.flatten(ref_px, ts)
         except Exception as exc:  # noqa: BLE001 —— 平仓失败如实记录，仍完成停止流程
             self.flatten_result = {"ok": False, "message": str(exc)}
-        if self.flatten_result.get("trade"):
-            await self._push({"type": "trade", "data": self.flatten_result["trade"]})
+        await self._handle_flatten_result(ts)
         await self._finalize_run(ts)
         await self._push({"type": "status", "data": self._status_payload()})
         return self.flatten_result
+
+    def _cancel_monitor_task(self) -> None:
+        """取消盯市任务，但**绝不取消自身**（R-2，P0）。
+
+        会话金额止损正是在盯市循环内经 `_maybe_session_exit → stop()` 触发，此刻盯市任务即当前
+        任务；若直接 `cancel()` 等于取消自身，`CancelledError` 会在随后 `flatten` 的 await 抛出，
+        中断真实平仓并跳过 `_finalize_run`，重演 H4「停止却留下无人管理真实仓」漏洞。循环内触发
+        的停止靠 `_monitor_loop` 的 `while self.state=="running"` 守卫自然退出，无需自取消。
+        """
+        task = self._monitor_task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        self._monitor_task = None
+
+    async def _handle_flatten_result(self, ts: int) -> None:
+        """据 flatten 结果诚实置终态（H4）：成功推成交；失败置 flattenFailed + residual 并推 error。"""
+        result = self.flatten_result or {}
+        if result.get("trade"):
+            await self._push({"type": "trade", "data": result["trade"]})
+        if result.get("ok"):
+            return
+        self.flatten_failed = True
+        self.residual = result.get("residual")
+        await self._push({"type": "error", "data": {
+            "ts": ts, "code": "LIVE_AUTO_FLATTEN_FAILED",
+            "message": "自动平仓失败，请立即到下方实盘面板手动平仓", "residual": self.residual}})
+
+    # ---------- H1：独立盯市循环（reconcile / 盯市 / 会话止盈止损 / 推送）----------
+    async def _monitor_loop(self) -> None:
+        """按 `poll_interval_s` 独立轮询；不驱动策略信号（信号唯一驱动源仍是确认根）。
+
+        循环内触发的 `stop`（会话金额止损 / 停滞自动平仓）靠 `while self.state=="running"` 自然
+        退出（R-2，绝不自取消）；`CancelledError`（外部停止取消本任务）安静吞掉。
+        """
+        try:
+            while self.state == "running":
+                await asyncio.sleep(self.poll_interval_s)
+                async with self._lock:
+                    if self.state != "running":
+                        break
+                    await self._monitor_tick()
+        except asyncio.CancelledError:
+            pass
+
+    async def _monitor_tick(self) -> None:
+        """单轮盯市（持 `self._lock`，与 `_on_confirmed` 互斥，杜绝并发改 projected）。"""
+        now_ts = int(time.time())
+        mark = await self._latest_mark_px()
+        for event in await self.executor.reconcile(mark, now_ts):
+            await self._push(event)
+        await self._emit_equity(mark, now_ts)
+        await self._emit_position(mark)
+        await self._check_staleness(now_ts)
+        self._degraded_seen = (self._degraded_seen or self.executor.degraded
+                               or self._stale_degraded)
+        await self._maybe_session_exit(mark, now_ts)
+
+    async def _latest_mark_px(self) -> float:
+        """盯市标记价：优先最近确认根收盘；缺则 REST get_ticker。
+
+        R-4：`get_ticker` 无行情时**返回 None 而非抛错**，故对 None 与异常一并回落自管 entry_price，
+        绝不把 None 标记价传入 reconcile / 净值数学。
+        """
+        if self._candles:
+            return float(self._candles[-1]["c"])
+        try:
+            px = await get_rest_client().get_ticker(self.inst_id)
+        except Exception:  # noqa: BLE001 —— 取价失败回落 entry_price（降级，不阻塞盯市）
+            px = None
+        return float(px) if px is not None else self.executor.entry_price
+
+    async def _check_staleness(self, now_ts: int) -> None:
+        """行情停滞看门狗（H3/R-5）：墙钟比对最近确认根，超阈推降级 status（默认仅告警不平仓）。"""
+        if self.state != "running" or self._last_candle_wall <= 0:
+            return
+        settings = self.executor.settings
+        stale_after = BAR_SECONDS.get(self.bar, 60) * settings.live_auto_staleness_factor
+        elapsed = now_ts - self._last_candle_wall
+        if elapsed <= stale_after:
+            await self._clear_stale_if_recovered()
+            return
+        if settings.live_auto_flatten_on_stale and elapsed > stale_after * 4:
+            await self.stop("stale_feed")
+            return
+        if not self._stale_degraded:
+            self._stale_degraded = True
+            await self._push({"type": "status", "data": {
+                **self._status_payload(),
+                "message": "行情连接异常，自动交易暂停响应 K 线（交易所侧止盈止损仍生效）"}})
+
+    async def _clear_stale_if_recovered(self) -> None:
+        """行情恢复（墙钟回到阈值内）：消停滞降级态并推一条「已恢复」status。"""
+        if not self._stale_degraded:
+            return
+        self._stale_degraded = False
+        await self._push({"type": "status", "data": {
+            **self._status_payload(), "message": "行情已恢复，自动交易盯市恢复正常"}})
 
     # ---------- 核心：每根已确认 K 线驱动 ----------
     async def feed_candle(self, candle: Candle) -> None:
@@ -202,6 +315,7 @@ class LiveAutoSession:
         else:
             self._candles.append(row)
         self._last_confirmed_ts = candle.ts
+        self._last_candle_wall = time.time()   # H3：刷新看门狗墙钟（确认根到达即心跳）
 
     def _build_frame(self):
         df = self.strategy.prepare(candles_to_df(list(self._candles)), self.bar)
@@ -274,12 +388,14 @@ class LiveAutoSession:
                 "sessionPnlUsd": self.executor.session_pnl_usd,
                 "positionSide": self.executor.projected,
                 "budgetUsd": self.executor.budget_usd, "leverage": self.executor.leverage,
-                "stopReason": self.stop_reason}
+                "stopReason": self.stop_reason,
+                "degraded": self.executor.degraded or self._stale_degraded,
+                "flattenFailed": self.flatten_failed, "residual": self.residual}
 
     def snapshot(self) -> dict:
         mark = float(self._candles[-1]["c"]) if self._candles else self.executor.entry_price
         return {"trades": list(self.executor.trades),
-                "equity": self._equity[-_SNAPSHOT_EQUITY_MAX:],
+                "equity": list(self._equity),   # R-3：deque 不支持切片，maxlen 已自动裁顶
                 "position": self.executor.position_payload(mark),
                 "status": self._status_payload()}
 
@@ -290,7 +406,9 @@ class LiveAutoSession:
                 "budgetUsd": self.executor.budget_usd, "leverage": self.executor.leverage,
                 "takeProfitUsd": self.take_profit_usd, "stopLossUsd": self.stop_loss_usd,
                 "positionSide": self.executor.projected,
-                "sessionPnlUsd": self.executor.session_pnl_usd, "startedTs": self.started_ts}
+                "sessionPnlUsd": self.executor.session_pnl_usd, "startedTs": self.started_ts,
+                "degraded": self.executor.degraded or self._stale_degraded,
+                "flattenFailed": self.flatten_failed}
 
     # ---------- 持久化 ----------
     async def _finalize_run(self, end_ts: int) -> None:
@@ -299,7 +417,9 @@ class LiveAutoSession:
         metrics = {**_empty_metrics(),
                    "totalReturn": (realized / budget) if budget > 0 else 0.0,
                    "tradeCount": len(self.executor.trades),
-                   "avgPnl": realized / max(1, len(self.executor.trades))}
+                   "avgPnl": realized / max(1, len(self.executor.trades)),
+                   "flattenFailed": self.flatten_failed,   # H4：平仓失败留痕
+                   "degradedSeen": self._degraded_seen}     # H2/H3：会话期是否曾降级
         sm = get_sessionmaker()
         async with sm() as s:
             await repo.finalize_run(s, self.run_id, status="stopped", metrics=metrics,

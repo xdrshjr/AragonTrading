@@ -19,7 +19,7 @@ import type {
   Trade,
   WalkForwardResult,
 } from "./types";
-import type { LiveAutoStatus } from "./liveAutoTypes";
+import type { LiveAutoEvent, LiveAutoStatus } from "./liveAutoTypes";
 
 type Theme = "light" | "dark";
 // 标的侧边栏页签：自选 / 现货 / 合约（"swap" 承载 SWAP+FUTURES 合约页签，RV-10）。
@@ -70,6 +70,9 @@ export const DEFAULT_DEPTH_PANEL_RATIO = 0.15;
 const MIN_DEPTH_PANEL_RATIO = 0.1;
 const MAX_DEPTH_PANEL_RATIO = 0.3;
 
+// 自动交易事件流环形缓冲上限（hardening H6）：超限裁最旧，杜绝长跑无界增长。
+const LIVE_AUTO_EVENTS_MAX = 50;
+
 interface AppState {
   instId: string;
   bar: Bar;
@@ -102,6 +105,7 @@ interface AppState {
   liveAutoStatus: LiveAutoStatus | null;
   liveAutoTrades: Trade[];                        // → overlayTrades（图表 markers）
   liveAutoPosition: PaperPositionEvent | null;
+  liveAutoEvents: LiveAutoEvent[];                // 自动交易事件流（环形≤50，error/降级/终止可见性，H6）
   liveAutoAcknowledged: boolean;                  // 首启风险勾选会话记忆，刷新复位
   theme: Theme;
   backtestStartTs: number;
@@ -159,6 +163,7 @@ interface AppState {
   setLiveAutoTrades: (trades: Trade[]) => void;
   appendLiveAutoTrade: (trade: Trade) => void;
   setLiveAutoPosition: (pos: PaperPositionEvent | null) => void;
+  pushLiveAutoEvent: (event: LiveAutoEvent) => void;
   setLiveAutoAcknowledged: (v: boolean) => void;
   clearLiveAutoRuntime: () => void;
   setBacktestRange: (startTs: number, endTs: number) => void;
@@ -225,6 +230,7 @@ export const useAppStore = create<AppState>()(
       liveAutoStatus: null,
       liveAutoTrades: [],
       liveAutoPosition: null,
+      liveAutoEvents: [],
       liveAutoAcknowledged: false,
       theme: "light",
       backtestStartTs: defaultStartTs,
@@ -328,6 +334,11 @@ export const useAppStore = create<AppState>()(
             : { liveAutoTrades: [...s.liveAutoTrades, trade] },
         ),
       setLiveAutoPosition: (liveAutoPosition) => set({ liveAutoPosition }),
+      // 事件流环形追加：超上限裁最旧（H6，关键 error 由组件置顶高亮呈现）。
+      pushLiveAutoEvent: (event) =>
+        set((s) => ({
+          liveAutoEvents: [...s.liveAutoEvents, event].slice(-LIVE_AUTO_EVENTS_MAX),
+        })),
       setLiveAutoAcknowledged: (liveAutoAcknowledged) => set({ liveAutoAcknowledged }),
       clearLiveAutoRuntime: () =>
         set({
@@ -335,6 +346,7 @@ export const useAppStore = create<AppState>()(
           liveAutoStatus: null,
           liveAutoTrades: [],
           liveAutoPosition: null,
+          liveAutoEvents: [],
         }),
       setBacktestRange: (backtestStartTs, backtestEndTs) =>
         set({ backtestStartTs, backtestEndTs, runId: null }),
