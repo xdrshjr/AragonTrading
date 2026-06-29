@@ -26,10 +26,18 @@ const BASE = "/api/py";
 export class ApiRequestError extends Error {
   code: string;
   status: number;
-  constructor(code: string, message: string, status: number) {
+  // 分组前置门禁失败（LIVE_AUTO_GROUP_PREFLIGHT）携带的逐标的明细（可选，向后兼容）。
+  members?: { instId: string; code: string; message: string }[];
+  constructor(
+    code: string,
+    message: string,
+    status: number,
+    members?: { instId: string; code: string; message: string }[],
+  ) {
     super(message);
     this.code = code;
     this.status = status;
+    this.members = members;
   }
 }
 

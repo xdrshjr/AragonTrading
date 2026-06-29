@@ -68,7 +68,7 @@ def _load_app():
 async def _fresh() -> int:
     """建表 + 清账户 + 重置会话管理器；返回一个可用策略 id。"""
     await init_db()
-    get_live_auto_manager()._session = None
+    get_live_auto_manager()._group = None
     sm = get_sessionmaker()
     async with sm() as session:
         for row in await repo.list_okx_accounts(session):
@@ -177,7 +177,7 @@ async def test_second_start_rejected_by_session_limit(monkeypatch):
             assert second.status_code == 409, second.text
             assert second.json()["error"]["code"] == "LIVE_AUTO_SESSION_LIMIT"
     finally:
-        get_live_auto_manager()._session = None
+        get_live_auto_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()
 
@@ -199,7 +199,7 @@ async def test_concurrent_start_only_one_succeeds(monkeypatch):
             limit_resp = r1 if r1.status_code == 409 else r2
             assert limit_resp.json()["error"]["code"] == "LIVE_AUTO_SESSION_LIMIT"
     finally:
-        get_live_auto_manager()._session = None
+        get_live_auto_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()
 
@@ -218,7 +218,7 @@ async def test_budget_clamped_to_hard_cap(monkeypatch):
             assert r.status_code == 200, r.text
             assert r.json()["budgetUsd"] == 50.0
     finally:
-        get_live_auto_manager()._session = None
+        get_live_auto_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()
 
@@ -249,6 +249,6 @@ async def test_start_status_stop_lifecycle(monkeypatch):
             after = await client.get("/api/live-auto/status")
             assert after.json()["session"] is None
     finally:
-        get_live_auto_manager()._session = None
+        get_live_auto_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()

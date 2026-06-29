@@ -14,6 +14,12 @@ interface InstrumentRowProps {
   liveChangePct?: number | null; // 仅 active 行（区间涨跌，真实）
   onSelect: (instId: string) => void;
   onToggleStar: (instId: string) => void;
+  // 自选自动交易分组（watchlist-auto-trade-group §2.7）：可选拖拽 + 「加入自动交易」无障碍等价操作。
+  draggable?: boolean;
+  onDragStart?: (e: React.DragEvent, instId: string) => void;
+  // 提供则在行尾渲染「加入自动交易」按钮（拖拽的键盘等价操作）；canAddAuto=false 时禁用并提示。
+  onAddAuto?: (instId: string) => void;
+  canAddAuto?: boolean;
 }
 
 const INST_TYPE_LABEL: Record<Instrument["instType"], string> = {
@@ -46,17 +52,24 @@ export default function InstrumentRow({
   liveChangePct,
   onSelect,
   onToggleStar,
+  draggable,
+  onDragStart,
+  onAddAuto,
+  canAddAuto = true,
 }: InstrumentRowProps) {
   const price = active ? (livePrice ?? inst.last ?? null) : (inst.last ?? null);
   const pct = active ? (liveChangePct ?? inst.changePct ?? null) : (inst.changePct ?? null);
 
   return (
     <div
+      draggable={draggable}
+      onDragStart={draggable && onDragStart ? (e) => onDragStart(e, inst.instId) : undefined}
       className={clsx(
         "group flex items-center gap-2 border-l-2 pl-2 pr-3 transition-colors",
         active
           ? "border-[var(--accent)] bg-[var(--surface-2)]"
           : "border-transparent hover:bg-[var(--surface-2)]",
+        draggable && "cursor-grab",
       )}
     >
       <button
@@ -99,6 +112,28 @@ export default function InstrumentRow({
           )}
         </span>
       </button>
+      {onAddAuto && (
+        <button
+          type="button"
+          aria-label={`加入自动交易 ${inst.instId}`}
+          disabled={!canAddAuto}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (canAddAuto) onAddAuto(inst.instId);
+          }}
+          title={canAddAuto ? "加入自动交易" : "仅支持 USDT 本位永续 / 交割合约自动交易"}
+          className={clsx(
+            "shrink-0 rounded p-1 transition-colors",
+            canAddAuto
+              ? "text-[var(--muted)] opacity-60 hover:text-[var(--accent)] hover:opacity-100"
+              : "cursor-not-allowed text-[var(--muted)] opacity-25",
+          )}
+        >
+          <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+        </button>
+      )}
     </div>
   );
 }

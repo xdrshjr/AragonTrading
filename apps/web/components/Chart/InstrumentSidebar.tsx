@@ -17,6 +17,7 @@ import {
 import { type InstSidebarTab, useAppStore } from "@/lib/store";
 import type { Instrument } from "@/lib/types";
 import InstrumentRow from "./InstrumentRow";
+import WatchlistTab from "./WatchlistTab";
 
 // 三页签标的侧边栏（instrument-sidebar-tabs §4）：自选 / 现货 / 合约。
 // 各类型一次 REST + React Query 去重缓存；客户端模糊搜索 + 成交额降序 + 渲染上限；
@@ -181,8 +182,11 @@ export default function InstrumentSidebar({
     });
   }, [tab, query, quote, subtype, watchlist, spotQ.data, swapQ.data, futuresQ.data]);
 
-  const showRows = !isLoading && !isError && view.rows.length > 0;
-  const showEmpty = !isLoading && !isError && view.rows.length === 0;
+  const ready = !isLoading && !isError;
+  // 自选页签改渲染上下分区容器（WatchlistTab）；现货 / 合约维持单列表（rows / empty）。
+  const showWatch = ready && tab === "watch";
+  const showRows = ready && tab !== "watch" && view.rows.length > 0;
+  const showEmpty = ready && tab !== "watch" && view.rows.length === 0;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -197,7 +201,7 @@ export default function InstrumentSidebar({
         )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto">
+      <div className={clsx("min-h-0 flex-1", showWatch ? "flex flex-col" : "overflow-auto")}>
         {isLoading && (
           <div className="space-y-2 p-2">
             {Array.from({ length: 6 }).map((_, i) => (
@@ -224,14 +228,20 @@ export default function InstrumentSidebar({
           </div>
         )}
 
+        {showWatch && (
+          <WatchlistTab
+            rows={view.rows}
+            active={active}
+            onSelect={onSelect}
+            livePrice={livePrice}
+            changePct={changePct}
+          />
+        )}
+
         {showEmpty && (
           <div className="flex flex-col items-center gap-1.5 px-3 py-8 text-center">
             <p className="text-[11px] text-[var(--muted)]">
-              {tab === "watch"
-                ? "还没有自选标的，在现货 / 合约页签点 ★ 收藏"
-                : query
-                  ? `未找到匹配「${query}」的标的`
-                  : "暂无标的"}
+              {query ? `未找到匹配「${query}」的标的` : "暂无标的"}
             </p>
           </div>
         )}

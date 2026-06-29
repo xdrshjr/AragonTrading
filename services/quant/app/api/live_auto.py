@@ -18,12 +18,15 @@ from ..config import Settings, get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
 from ..live_auto.manager import (
+    GroupMemberInput,
+    GroupStartRequest,
+    LiveAutoGroupPreflightError,
     LiveAutoPreflightError,
     LiveAutoSessionLimitError,
     get_live_auto_manager,
 )
 from ..paper.strategy_factory import build_paper_strategy_spec
-from ..schemas import LiveAutoStartIn, run_out
+from ..schemas import LiveAutoGroupStartIn, LiveAutoStartIn, run_out
 
 router = APIRouter(tags=["live-auto"])
 
@@ -92,6 +95,66 @@ async def live_auto_stop(session_id: str,
 async def live_auto_status(settings: Settings = Depends(get_settings)) -> dict:
     """当前活跃自动会话（无则 session:null）；前端重载后据此重连 WS（只读，不守门）。"""
     return {"session": get_live_auto_manager().status_row(),
+            "liveAutoTradingEnabled": settings.live_auto_trading_enabled}
+
+
+@router.post("/live-auto/group/start")
+async def live_auto_group_start(body: LiveAutoGroupStartIn,
+                                session: AsyncSession = Depends(get_session),
+                                settings: Settings = Depends(get_settings)) -> dict:
+    """启动多标的自动交易分组（受双闸守门；两段式前置门禁 + 整组回滚，§2.4 / §4.1）。"""
+    _require_auto_enabled(settings)
+    account_row = await _resolve_account(session, body.accountId)
+    strategy_row = await repo.get_strategy_row(session, body.strategyId)
+    if strategy_row is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "策略不存在"})
+    strategy_spec = build_paper_strategy_spec(strategy_row)
+    req = GroupStartRequest(
+        strategy_spec=strategy_spec, bar=body.bar,
+        members_in=[GroupMemberInput(inst_id=m.instId, allocation_pct=m.allocationPct)
+                    for m in body.members],
+        account_row=account_row, settings=settings, total_capital_usd=body.totalCapitalUsd,
+        leverage=body.leverage, take_profit_usd=body.takeProfitUsd,
+        stop_loss_usd=body.stopLossUsd, priming=body.priming, priming_bars=body.primingBars)
+    try:
+        group = await get_live_auto_manager().start_group(req)
+    except LiveAutoGroupPreflightError as exc:
+        # P1-4：整组前置失败须透传逐标的 members 明细（全局处理器据此包成 {error:{code,message,members}}）。
+        raise HTTPException(exc.status, detail={
+            "code": exc.code, "message": exc.message, "members": exc.members})
+    except (LiveAutoSessionLimitError, LiveAutoPreflightError) as exc:
+        raise HTTPException(exc.status, detail={"code": exc.code, "message": exc.message})
+    return {
+        "groupId": group.group_id, "strategyId": group.strategy_id,
+        "strategyName": group.strategy_name, "strategyKind": group.strategy_kind,
+        "bar": group.bar, "totalBudgetUsd": group.total_budget_usd, "leverage": group.leverage,
+        "members": [{"instId": m.inst_id, "sessionId": m.session.session_id, "runId": m.run_id,
+                     "allocationPct": m.allocation_pct, "budgetUsd": m.budget_usd,
+                     "state": m.session.state} for m in group.members]}
+
+
+@router.post("/live-auto/group/{group_id}/stop")
+async def live_auto_group_stop(group_id: str) -> dict:
+    """停整组（停所有成员、各自平自管仓、落 Run 终态；刻意不守门，确保随时可停止平仓）。"""
+    result = await get_live_auto_manager().stop_group(group_id)
+    if result is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "分组不存在"})
+    return result
+
+
+@router.post("/live-auto/group/{group_id}/member/{inst_id}/stop")
+async def live_auto_group_member_stop(group_id: str, inst_id: str) -> dict:
+    """仅停某成员（其余续跑；不守门）；停后无运行成员则分组清空。"""
+    result = await get_live_auto_manager().stop_member(group_id, inst_id)
+    if result is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "分组或成员不存在"})
+    return result
+
+
+@router.get("/live-auto/group/status")
+async def live_auto_group_status(settings: Settings = Depends(get_settings)) -> dict:
+    """当前活跃分组（无则 group:null）；前端重载后据此重连各成员 WS（只读，不守门）。"""
+    return {"group": get_live_auto_manager().group_status(),
             "liveAutoTradingEnabled": settings.live_auto_trading_enabled}
 
 

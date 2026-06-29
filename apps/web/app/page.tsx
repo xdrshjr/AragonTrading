@@ -41,6 +41,7 @@ import {
 } from "@/lib/paperMulti";
 import { DEFAULT_RIGHT_PANEL_WIDTH, useAppStore } from "@/lib/store";
 import { liveAutoApi, liveAutoWS } from "@/lib/liveAutoApi";
+import { useLiveAutoGroupStream } from "@/lib/useLiveAutoGroupStream";
 import type { LiveAutoEvent, LiveAutoSnapshot, LiveAutoStatus } from "@/lib/liveAutoTypes";
 import type {
   Candle,
@@ -77,6 +78,7 @@ export default function Page() {
     paperStreamsEnabled,
     liveAutoSessionId,
     liveAutoTrades,
+    liveAutoGroup,
     theme,
     backtestStartTs,
     backtestEndTs,
@@ -97,6 +99,9 @@ export default function Page() {
     toggleTheme,
     setRightPanelWidth,
   } = useAppStore();
+
+  // 自选自动交易分组运行期流（重发现孤儿分组 + 每成员一条 WS，按 instId 路由进 store）。
+  useLiveAutoGroupStream();
 
   // 回测（含并入回测列表的用户组合）：用单条 run 净值 + 成交 markers 在左图渲染（run-range 链路）。
   // 组合回测产出真实 run（含 equity/trades/metrics），其 run.mode 落库即 "backtest"，故并入后绘制行为不变。
@@ -466,13 +471,16 @@ export default function Page() {
   const overlays =
     mode === "paper" && paperEquityOverlays.length > 0 ? paperEquityOverlays : compareOverlays;
   // 实时自动交易活跃时，图表 markers 取自动交易成交流（live 模式本无策略 overlay，故为纯增量）。
-  const overlayTrades = liveAutoSessionId
-    ? liveAutoTrades
-    : mode === "paper"
-      ? paperOverlayTrades
-      : chartView === "run-range" && singleRunMode
-        ? tradesQ.data
-        : undefined;
+  // 分组活跃时取**当前选中 instId** 对应成员的成交（切换标的即换 markers，§2.7 / R7）。
+  const overlayTrades = liveAutoGroup
+    ? (liveAutoGroup.members[instId]?.trades ?? [])
+    : liveAutoSessionId
+      ? liveAutoTrades
+      : mode === "paper"
+        ? paperOverlayTrades
+        : chartView === "run-range" && singleRunMode
+          ? tradesQ.data
+          : undefined;
   const bottomTrades = mode === "paper" ? activePaperTrades : overlayTrades;
   const tradeCapReached =
     chartView === "run-range" &&

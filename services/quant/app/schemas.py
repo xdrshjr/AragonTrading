@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .db.models import AgentProvider, EquityPoint, Factor, FactorSet, OkxAccount, StrategyRun, Trade
 from .engine.metrics import _empty_metrics
@@ -237,6 +237,83 @@ class LiveAutoSessionRow(BaseModel):
 class LiveAutoStatusOut(BaseModel):
     session: LiveAutoSessionRow | None
     liveAutoTradingEnabled: bool
+
+
+# ---------------- 自选自动交易分组（watchlist-auto-trade-group §五，camelCase wire）----------------
+class LiveAutoGroupMemberIn(BaseModel):
+    """分组成员入参：标的 + 该标的可用仓位百分比（总仓位之下，§2.3）。"""
+
+    instId: str = Field(min_length=1, max_length=32)
+    allocationPct: float = Field(gt=0, le=100)   # (0, 100]，整组 Σ ≤ 100（validator 校验）
+
+
+class LiveAutoGroupStartIn(BaseModel):
+    """启动多标的自动交易分组请求（金额字段可留空→服务端保守默认，§4.1）。"""
+
+    strategyId: int
+    bar: str = "1H"
+    members: list[LiveAutoGroupMemberIn]
+    accountId: int | None = None                              # 省略=默认实盘账户
+    totalCapitalUsd: float | None = Field(default=None, gt=0)  # 留空→ min(avail×1%×成员数, avail×5%)（P1-1）
+    leverage: float | None = Field(default=None, gt=0, le=125)
+    takeProfitUsd: float | None = Field(default=None, gt=0)   # 分组总止盈；按 pct/Σpct 归一分摊（P1-2）
+    stopLossUsd: float | None = Field(default=None, gt=0)     # 分组总止损；同上
+    priming: bool = True
+    primingBars: int = Field(default=300, ge=10, le=PAPER_WINDOW_MAX)
+
+    @field_validator("members")
+    @classmethod
+    def _check_members(cls, members: list[LiveAutoGroupMemberIn]) -> list[LiveAutoGroupMemberIn]:
+        """边界校验（§5.1）：非空、instId 唯一、Σ allocationPct ≤ 100。"""
+        if not members:
+            raise ValueError("members 不可为空")
+        inst_ids = [m.instId for m in members]
+        if len(set(inst_ids)) != len(inst_ids):
+            raise ValueError("members 含重复 instId")
+        if sum(m.allocationPct for m in members) > 100 + 1e-9:
+            raise ValueError("各标的可用仓位百分比之和不可超过 100%")
+        return members
+
+
+class LiveAutoGroupMemberRow(BaseModel):
+    instId: str
+    sessionId: str
+    runId: int
+    allocationPct: float
+    budgetUsd: float
+    state: str
+    positionSide: str | None = None
+    sessionPnlUsd: float | None = None
+    degraded: bool | None = None
+    flattenFailed: bool | None = None
+
+
+class LiveAutoGroupStartOut(BaseModel):
+    groupId: str
+    strategyId: int
+    strategyName: str
+    strategyKind: str
+    bar: str
+    totalBudgetUsd: float       # 夹紧后最终生效的分组总预算（可能 < 用户填值，R4）
+    leverage: float
+    members: list[LiveAutoGroupMemberRow]
+
+
+class LiveAutoGroupRow(BaseModel):
+    groupId: str
+    strategyId: int
+    strategyName: str
+    strategyKind: str
+    bar: str
+    totalBudgetUsd: float
+    leverage: float
+    createdTs: int
+    members: list[LiveAutoGroupMemberRow]
+
+
+class LiveAutoGroupStatusOut(BaseModel):
+    liveAutoTradingEnabled: bool
+    group: LiveAutoGroupRow | None
 
 
 # ---------------- Response serializers ----------------

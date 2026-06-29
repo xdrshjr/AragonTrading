@@ -57,7 +57,12 @@ class Settings(BaseSettings):
     # 默认关闭闸是 live_auto_trading_enabled（live_trading_enabled 现默认 True），启动须 API 层
     # 显式同时校验两闸皆为 True 方可放行。
     live_auto_trading_enabled: bool = False      # 自动化专用总闸：False 时 /live-auto 写类一律 403
-    live_auto_max_sessions: int = 1              # 单会话独占（真实资金，绝不并发多策略自动下单）
+    # 容量语义已由「单活跃分组（1..N 会话）+ live_auto_max_group_symbols」取代（watchlist-auto-trade-group
+    # §2.4 / P2-1）：一次至多一个活跃分组，分组内成员数受 live_auto_max_group_symbols 封顶。本字段现无
+    # 引用，仅作历史兼容保留（容量判定改由 manager 直接判 self._group），避免文档漂移。
+    live_auto_max_sessions: int = 1              # （已弃用）旧「单会话独占」语义，现由单活跃分组取代
+    # 单个活跃自动交易分组内的标的数硬上限（真实资金多标的并发的封顶护栏，R1/R6；前端拖入超限即拒绝）。
+    live_auto_max_group_symbols: int = 8
     live_auto_default_capital_frac: float = 0.01  # 预算留空时取可用 USDT 的 1%（保守默认）
     live_auto_max_capital_frac: float = 0.05     # 预算对可用余额硬上限（前置门禁强制夹紧，R4）
     live_auto_poll_interval_s: int = 5           # 持仓 reconcile / 会话盯市轮询基准间隔（秒，hardening H1 接线）

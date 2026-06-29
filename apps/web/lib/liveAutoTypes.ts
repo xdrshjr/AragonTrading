@@ -106,3 +106,100 @@ export interface LiveAutoSnapshot {
   position: PaperPositionEvent | null;
   status: LiveAutoStatus;
 }
+
+// ---------------- 自选自动交易分组（watchlist-auto-trade-group §五）----------------
+// 自动交易成员（持久化偏好态）：标的 + 可用仓位百分比（watchlist 的有序子集）。
+export interface AutoTradeMember {
+  instId: string;
+  allocationPct: number;
+}
+
+// 分组启动请求（金额字段可留空→服务端保守默认）。
+export interface LiveAutoGroupStartReq {
+  strategyId: number;
+  bar: string;
+  members: AutoTradeMember[];
+  accountId?: number | null;
+  totalCapitalUsd?: number | null;
+  leverage?: number | null;
+  takeProfitUsd?: number | null;
+  stopLossUsd?: number | null;
+  priming?: boolean;
+  primingBars?: number;
+}
+
+// 分组成员行（start 回执 / status 视图共用；可选运行期字段在 status 下回填）。
+export interface LiveAutoGroupMemberRow {
+  instId: string;
+  sessionId: string;
+  runId: number;
+  allocationPct: number;
+  budgetUsd: number;
+  state: string;
+  positionSide?: string | null;
+  sessionPnlUsd?: number | null;
+  degraded?: boolean | null;
+  flattenFailed?: boolean | null;
+}
+
+// 分组启动回执；totalBudgetUsd 为夹紧后的最终生效预算（可能 < 用户填值，R4）。
+export interface LiveAutoGroupStartResult {
+  groupId: string;
+  strategyId: number;
+  strategyName: string;
+  strategyKind: string;
+  bar: string;
+  totalBudgetUsd: number;
+  leverage: number;
+  members: LiveAutoGroupMemberRow[];
+}
+
+// 活跃分组只读视图（GET /live-auto/group/status 的 group 字段；前端重载后据此重连各成员 WS）。
+export interface LiveAutoGroupRow {
+  groupId: string;
+  strategyId: number;
+  strategyName: string;
+  strategyKind: string;
+  bar: string;
+  totalBudgetUsd: number;
+  leverage: number;
+  createdTs: number;
+  members: LiveAutoGroupMemberRow[];
+}
+
+export interface LiveAutoGroupStatusResponse {
+  liveAutoTradingEnabled: boolean;
+  group: LiveAutoGroupRow | null;
+}
+
+// 单标的平仓回执 + 成员条目（分组 / 单成员停止回执）。
+export interface LiveAutoGroupMemberStopRow {
+  instId: string;
+  sessionId: string;
+  runId: number;
+  flattened: LiveAutoFlattenResult;
+}
+
+export interface LiveAutoGroupStopResult {
+  groupId: string;
+  stopReason: string | null;
+  members: LiveAutoGroupMemberStopRow[];
+}
+
+export interface LiveAutoGroupMemberStopResult {
+  groupId: string;
+  instId: string;
+  flattened: LiveAutoFlattenResult;
+}
+
+// 单成员运行期态（瞬态，承载该 instId 会话的 WS 事件路由结果）。
+export interface LiveAutoMemberRuntime {
+  instId: string;
+  sessionId: string;
+  runId: number;
+  allocationPct: number;
+  budgetUsd: number;
+  status: LiveAutoStatus | null;
+  position: PaperPositionEvent | null;
+  trades: Trade[];
+}

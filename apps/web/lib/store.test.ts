@@ -490,3 +490,134 @@ describe("app store — left nav rail primary view (v19)", () => {
     expect(s.factorLabSection).toBe("catalog");
   });
 });
+
+describe("app store — auto-trade group members (v20)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({
+      watchlist: ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"],
+      autoTradeMembers: [],
+      liveAutoGroup: null,
+    });
+  });
+
+  it("addAutoTradeMember adds with the remaining headroom and only for watchlist items", () => {
+    useAppStore.getState().addAutoTradeMember("BTC-USDT-SWAP");
+    expect(useAppStore.getState().autoTradeMembers).toEqual([
+      { instId: "BTC-USDT-SWAP", allocationPct: 100 },
+    ]);
+    useAppStore.getState().addAutoTradeMember("ETH-USDT-SWAP");
+    expect(useAppStore.getState().autoTradeMembers.map((m) => m.allocationPct)).toEqual([100, 0]);
+    // 非自选标的不可加入
+    useAppStore.getState().addAutoTradeMember("DOGE-USDT-SWAP");
+    expect(useAppStore.getState().autoTradeMembers).toHaveLength(2);
+    // 重复加入幂等
+    useAppStore.getState().addAutoTradeMember("BTC-USDT-SWAP");
+    expect(useAppStore.getState().autoTradeMembers).toHaveLength(2);
+  });
+
+  it("setAutoTradeAllocation clamps to [1, 100 - others]", () => {
+    useAppStore.setState({
+      autoTradeMembers: [
+        { instId: "BTC-USDT-SWAP", allocationPct: 50 },
+        { instId: "ETH-USDT-SWAP", allocationPct: 30 },
+      ],
+    });
+    useAppStore.getState().setAutoTradeAllocation("BTC-USDT-SWAP", 95);
+    expect(useAppStore.getState().autoTradeMembers[0].allocationPct).toBe(70); // 100 - 30
+    useAppStore.getState().setAutoTradeAllocation("BTC-USDT-SWAP", 0);
+    expect(useAppStore.getState().autoTradeMembers[0].allocationPct).toBe(1);
+  });
+
+  it("evenSplitAutoTradeMembers splits to sum exactly 100", () => {
+    useAppStore.setState({
+      autoTradeMembers: [
+        { instId: "BTC-USDT-SWAP", allocationPct: 50 },
+        { instId: "ETH-USDT-SWAP", allocationPct: 30 },
+        { instId: "SOL-USDT-SWAP", allocationPct: 20 },
+      ],
+    });
+    useAppStore.getState().evenSplitAutoTradeMembers();
+    const pct = useAppStore.getState().autoTradeMembers.map((m) => m.allocationPct);
+    expect(pct).toEqual([34, 33, 33]);
+  });
+
+  it("removeFromWatchlist and toggleWatchlist-off drop the auto-trade member (invariant)", () => {
+    useAppStore.setState({
+      autoTradeMembers: [
+        { instId: "BTC-USDT-SWAP", allocationPct: 60 },
+        { instId: "ETH-USDT-SWAP", allocationPct: 40 },
+      ],
+    });
+    useAppStore.getState().removeFromWatchlist("BTC-USDT-SWAP");
+    expect(useAppStore.getState().autoTradeMembers.map((m) => m.instId)).toEqual(["ETH-USDT-SWAP"]);
+    useAppStore.getState().toggleWatchlist("ETH-USDT-SWAP"); // 关闭收藏
+    expect(useAppStore.getState().autoTradeMembers).toEqual([]);
+  });
+
+  it("liveAutoGroup member event routers patch only the targeted member", () => {
+    useAppStore.setState({
+      liveAutoGroup: {
+        groupId: "g1",
+        strategyId: 1,
+        strategyName: "s",
+        bar: "1H",
+        totalBudgetUsd: 100,
+        leverage: 3,
+        state: "running",
+        startedTs: 0,
+        members: {
+          "BTC-USDT-SWAP": {
+            instId: "BTC-USDT-SWAP",
+            sessionId: "a",
+            runId: 1,
+            allocationPct: 60,
+            budgetUsd: 60,
+            status: null,
+            position: null,
+            trades: [],
+          },
+        },
+      },
+    });
+    useAppStore.getState().setLiveAutoMemberStatus("BTC-USDT-SWAP", {
+      state: "running",
+      sessionPnlUsd: 12,
+    });
+    expect(useAppStore.getState().liveAutoGroup?.members["BTC-USDT-SWAP"].status?.sessionPnlUsd).toBe(12);
+    // 不存在的成员安全回落（不抛、不变更）
+    useAppStore.getState().setLiveAutoMemberStatus("NONE", { state: "running", sessionPnlUsd: 1 });
+    expect(useAppStore.getState().liveAutoGroup?.members["NONE"]).toBeUndefined();
+  });
+
+  it("does not persist liveAutoGroup but persists autoTradeMembers", () => {
+    useAppStore.getState().addAutoTradeMember("BTC-USDT-SWAP");
+    useAppStore.setState({
+      liveAutoGroup: {
+        groupId: "g1",
+        strategyId: 1,
+        strategyName: "s",
+        bar: "1H",
+        totalBudgetUsd: 100,
+        leverage: 3,
+        state: "running",
+        startedTs: 0,
+        members: {},
+      },
+    });
+    const persisted = JSON.parse(localStorage.getItem("aragon-ui") as string);
+    expect(persisted.state.autoTradeMembers).toEqual([{ instId: "BTC-USDT-SWAP", allocationPct: 100 }]);
+    expect(persisted.state.liveAutoGroup).toBeUndefined();
+  });
+
+  it("migrates pre-v20 persisted state to v20 with autoTradeMembers defaulting to []", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({ state: { instId: "ETH-USDT-SWAP" }, version: 19 }),
+    );
+    await useAppStore.persist.rehydrate();
+    const s = useAppStore.getState();
+    expect(s.autoTradeMembers).toEqual([]);
+    expect(s.instId).toBe("ETH-USDT-SWAP");
+  });
+});

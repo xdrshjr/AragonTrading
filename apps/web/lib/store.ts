@@ -19,7 +19,8 @@ import type {
   Trade,
   WalkForwardResult,
 } from "./types";
-import type { LiveAutoEvent, LiveAutoStatus } from "./liveAutoTypes";
+import type { AutoTradeMember, LiveAutoEvent, LiveAutoStatus } from "./liveAutoTypes";
+import { clampAllocationOnEdit, defaultAllocationOnAdd, evenSplit } from "./autoTrade";
 
 type Theme = "light" | "dark";
 // 标的侧边栏页签：自选 / 现货 / 合约（"swap" 承载 SWAP+FUTURES 合约页签，RV-10）。
@@ -109,6 +110,10 @@ interface AppState {
   liveAutoPosition: PaperPositionEvent | null;
   liveAutoEvents: LiveAutoEvent[];                // 自动交易事件流（环形≤50，error/降级/终止可见性，H6）
   liveAutoAcknowledged: boolean;                  // 首启风险勾选会话记忆，刷新复位
+  // 自选自动交易分组（watchlist-auto-trade-group）：autoTradeMembers 为持久化偏好态（watchlist 的有序
+  // 子集 + 各自百分比）；liveAutoGroup 为瞬态运行期态（刷新由 GET /live-auto/group/status 重发现）。
+  autoTradeMembers: AutoTradeMember[];
+  liveAutoGroup: LiveAutoGroupState | null;
   theme: Theme;
   backtestStartTs: number;
   backtestEndTs: number;
@@ -169,6 +174,19 @@ interface AppState {
   pushLiveAutoEvent: (event: LiveAutoEvent) => void;
   setLiveAutoAcknowledged: (v: boolean) => void;
   clearLiveAutoRuntime: () => void;
+  // 自动交易分组成员（持久化）增删 / 改百分比 / 平均分配 / 重排（含「移出自选即移出自动交易」不变量）。
+  addAutoTradeMember: (instId: string) => void;
+  removeAutoTradeMember: (instId: string) => void;
+  setAutoTradeAllocation: (instId: string, pct: number) => void;
+  evenSplitAutoTradeMembers: () => void;
+  reorderAutoTradeMembers: (fromIndex: number, toIndex: number) => void;
+  // 自动交易分组运行期态（瞬态）：整组写入 / 成员事件路由 / 清理。
+  setLiveAutoGroup: (group: LiveAutoGroupState | null) => void;
+  setLiveAutoMemberStatus: (instId: string, status: LiveAutoStatus | null) => void;
+  setLiveAutoMemberPosition: (instId: string, position: PaperPositionEvent | null) => void;
+  setLiveAutoMemberTrades: (instId: string, trades: Trade[]) => void;
+  appendLiveAutoMemberTrade: (instId: string, trade: Trade) => void;
+  clearLiveAutoGroup: () => void;
   setBacktestRange: (startTs: number, endTs: number) => void;
   toggleTheme: () => void;
   setTheme: (t: Theme) => void;
@@ -199,6 +217,42 @@ export interface FactorOverlay {
   kind: "factor" | "score";
   factorKey?: string;
   factorSetId?: number;
+}
+
+// 自选自动交易分组运行期态（watchlist-auto-trade-group §5.4，瞬态，不入 partialize，刷新由
+// GET /live-auto/group/status 重发现）。成员 runtime 按 instId 映射，承载各自会话的 WS 事件路由结果。
+export interface LiveAutoGroupMemberState {
+  instId: string;
+  sessionId: string;
+  runId: number;
+  allocationPct: number;
+  budgetUsd: number;
+  status: LiveAutoStatus | null;
+  position: PaperPositionEvent | null;
+  trades: Trade[];
+}
+export interface LiveAutoGroupState {
+  groupId: string;
+  strategyId: number;
+  strategyName: string;
+  bar: string;
+  totalBudgetUsd: number;
+  leverage: number;
+  state: "running" | "stopped";
+  startedTs: number;
+  members: Record<string, LiveAutoGroupMemberState>;
+}
+
+// 成员 runtime 局部更新（纯函数，缺组 / 缺成员安全回落不变更）。
+function patchLiveAutoMember(
+  group: LiveAutoGroupState | null,
+  instId: string,
+  updater: (m: LiveAutoGroupMemberState) => LiveAutoGroupMemberState,
+): { liveAutoGroup: LiveAutoGroupState | null } {
+  if (!group) return { liveAutoGroup: group };
+  const member = group.members[instId];
+  if (!member) return { liveAutoGroup: group };
+  return { liveAutoGroup: { ...group, members: { ...group.members, [instId]: updater(member) } } };
 }
 
 export const useAppStore = create<AppState>()(
@@ -235,6 +289,9 @@ export const useAppStore = create<AppState>()(
       liveAutoPosition: null,
       liveAutoEvents: [],
       liveAutoAcknowledged: false,
+      // 自动交易分组：成员持久化（默认空，老用户自动交易区初始为空）；运行期态瞬态（刷新复位）。
+      autoTradeMembers: [],
+      liveAutoGroup: null,
       theme: "light",
       backtestStartTs: defaultStartTs,
       backtestEndTs: defaultEndTs,
@@ -351,6 +408,65 @@ export const useAppStore = create<AppState>()(
           liveAutoPosition: null,
           liveAutoEvents: [],
         }),
+      // 自动交易成员（持久化）：加入仅当已在自选且未重复，按剩余额度给默认百分比（§2.3）。
+      addAutoTradeMember: (instId) =>
+        set((s) =>
+          !s.watchlist.includes(instId) || s.autoTradeMembers.some((m) => m.instId === instId)
+            ? s
+            : {
+                autoTradeMembers: [
+                  ...s.autoTradeMembers,
+                  { instId, allocationPct: defaultAllocationOnAdd(s.autoTradeMembers) },
+                ],
+              },
+        ),
+      removeAutoTradeMember: (instId) =>
+        set((s) => ({ autoTradeMembers: s.autoTradeMembers.filter((m) => m.instId !== instId) })),
+      // 手改百分比：夹取到 [1, 100 − Σ其余]（纯函数，杜绝和超限）。
+      setAutoTradeAllocation: (instId, pct) =>
+        set((s) => ({
+          autoTradeMembers: s.autoTradeMembers.map((m) =>
+            m.instId === instId
+              ? { ...m, allocationPct: clampAllocationOnEdit(s.autoTradeMembers, instId, pct) }
+              : m,
+          ),
+        })),
+      evenSplitAutoTradeMembers: () =>
+        set((s) => ({ autoTradeMembers: evenSplit(s.autoTradeMembers) })),
+      reorderAutoTradeMembers: (fromIndex, toIndex) =>
+        set((s) => {
+          const next = [...s.autoTradeMembers];
+          if (
+            fromIndex < 0 ||
+            fromIndex >= next.length ||
+            toIndex < 0 ||
+            toIndex >= next.length
+          ) {
+            return s;
+          }
+          const [moved] = next.splice(fromIndex, 1);
+          next.splice(toIndex, 0, moved);
+          return { autoTradeMembers: next };
+        }),
+      // 自动交易分组运行期态（瞬态）：整组写入 / 成员事件路由 / 清理。
+      setLiveAutoGroup: (liveAutoGroup) => set({ liveAutoGroup }),
+      setLiveAutoMemberStatus: (instId, status) =>
+        set((s) => patchLiveAutoMember(s.liveAutoGroup, instId, (m) => ({ ...m, status }))),
+      setLiveAutoMemberPosition: (instId, position) =>
+        set((s) => patchLiveAutoMember(s.liveAutoGroup, instId, (m) => ({ ...m, position }))),
+      setLiveAutoMemberTrades: (instId, trades) =>
+        set((s) => patchLiveAutoMember(s.liveAutoGroup, instId, (m) => ({ ...m, trades }))),
+      appendLiveAutoMemberTrade: (instId, trade) =>
+        set((s) =>
+          patchLiveAutoMember(s.liveAutoGroup, instId, (m) =>
+            m.trades.some(
+              (t) => t.ts === trade.ts && t.side === trade.side && t.price === trade.price,
+            )
+              ? m
+              : { ...m, trades: [...m.trades, trade] },
+          ),
+        ),
+      clearLiveAutoGroup: () => set({ liveAutoGroup: null }),
       setBacktestRange: (backtestStartTs, backtestEndTs) =>
         set({ backtestStartTs, backtestEndTs, runId: null }),
       toggleTheme: () =>
@@ -379,14 +495,21 @@ export const useAppStore = create<AppState>()(
             ? s
             : { watchlist: [instId, ...s.watchlist] },
         ),
+      // 取消收藏须同步移出自动交易成员（不变量：autoTradeMembers ⊆ watchlist，§2.2-1 / R5）。
       removeFromWatchlist: (instId) =>
-        set((s) => ({ watchlist: s.watchlist.filter((id) => id !== instId) })),
-      toggleWatchlist: (instId) =>
         set((s) => ({
-          watchlist: s.watchlist.includes(instId)
-            ? s.watchlist.filter((id) => id !== instId)
-            : [instId, ...s.watchlist],
+          watchlist: s.watchlist.filter((id) => id !== instId),
+          autoTradeMembers: s.autoTradeMembers.filter((m) => m.instId !== instId),
         })),
+      toggleWatchlist: (instId) =>
+        set((s) =>
+          s.watchlist.includes(instId)
+            ? {
+                watchlist: s.watchlist.filter((id) => id !== instId),
+                autoTradeMembers: s.autoTradeMembers.filter((m) => m.instId !== instId),
+              }
+            : { watchlist: [instId, ...s.watchlist] },
+        ),
       setInstSidebarTab: (instSidebarTab) => set({ instSidebarTab }),
       // 右侧页签切换（AI 助手 / 交易策略）；两面板各自持续挂载，切换不破坏状态（§6.2#1）。
       setRightTab: (rightTab) => set({ rightTab }),
@@ -444,7 +567,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 19,
+      version: 20,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -466,6 +589,9 @@ export const useAppStore = create<AppState>()(
         bottomTab: s.bottomTab,
         paneTab: s.paneTab,
         watchlist: s.watchlist,
+        // 自动交易成员（偏好态，持久化）；liveAutoGroup 为运行期瞬态，**不**入 partialize（刷新由
+        // GET /live-auto/group/status 重发现）。
+        autoTradeMembers: s.autoTradeMembers,
         instSidebarTab: s.instSidebarTab,
         chartSplitRatio: s.chartSplitRatio,
         rightPanelWidth: s.rightPanelWidth,
@@ -556,6 +682,11 @@ export const useAppStore = create<AppState>()(
         if (version < 19) {
           // 左侧主导航：补一级视图默认（老用户从未持久化过 showFactorLab，仅补 activeView 默认即可）。
           next = { ...next, activeView: "trade" };
+        }
+        if (version < 20) {
+          // 自选自动交易分组：补持久化 autoTradeMembers 默认（老用户自动交易区初始为空，自选不变）；
+          // liveAutoGroup 为瞬态（不入 partialize），浅合并回落 null 即可。
+          next = { ...next, autoTradeMembers: [] };
         }
         return next as never;
       },
