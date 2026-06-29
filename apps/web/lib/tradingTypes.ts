@@ -1,6 +1,7 @@
 // 实盘交易类型（与后端 schemas PlaceOrder*/SetLeverage*/TradingConfig*/LiveFill 对齐，camelCase）。
 // 订单真源在 OKX；前端绝不缓存 / 伪造成交（C1）。
 import type { OkxAccountPosition } from "./accountTypes";
+import type { TriggerExplain } from "./types";
 
 export type OrderDirection = "long" | "short"; // long=买多 | short=买空
 export type OrderType = "limit" | "market";
@@ -78,6 +79,9 @@ export interface LiveFill {
   fillSz: number;
   fee: number;
   ordId: string;
+  tradeId?: string; // OKX 每笔成交唯一 id（行 key / 展开态身份，RV2）
+  clOrdId?: string; // OKX 回带（自动交易为 aragon/aragonc 前缀）
+  explain?: TriggerExplain; // 命中自动交易触发解释时存在（live-fills-explainability）
 }
 
 export type LivePosition = OkxAccountPosition; // 复用 accountTypes（spec §5.2）

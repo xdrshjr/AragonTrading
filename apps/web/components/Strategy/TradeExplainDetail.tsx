@@ -11,9 +11,20 @@ import FactorContributionBars from "./FactorContributionBars";
  *
  * 渐进披露：一句话原因 + 类别角标 → 关键指标对照网格 → 风控快照（交易所侧 OCO）→
  * 条件渲染的因子归因图（仅 factor_score 且有断面）。配色复用既有 token，不新增全局变量。
+ *
+ * 入参 `explain` 优先（实盘成交表直接传已关联的解释，省去合成 Trade）；否则回落
+ * `resolveExplain(trade)`（既有策略面板 / 回测调用方，向后兼容）；两者皆无返回 null
+ * （live-fills-explainability §2.5）。
  */
-export default function TradeExplainDetail({ trade }: { trade: Trade }) {
-  const explain = resolveExplain(trade);
+export default function TradeExplainDetail({
+  trade,
+  explain: explainProp,
+}: {
+  trade?: Trade;
+  explain?: TriggerExplain;
+}) {
+  const explain = explainProp ?? (trade ? resolveExplain(trade) : null);
+  if (!explain) return null;
   return (
     <div className="flex flex-col gap-3 rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-3 py-3">
       <Header explain={explain} />

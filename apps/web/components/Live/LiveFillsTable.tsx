@@ -1,12 +1,20 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
+import clsx from "clsx";
+import { useState, type KeyboardEvent } from "react";
+import TradeExplainDetail from "@/components/Strategy/TradeExplainDetail";
 import { Badge } from "@/components/ui";
 import { fmtNum, fmtPrice, fmtTime } from "@/lib/format";
+import { explainKindLabel, explainKindTone } from "@/lib/tradeExplain";
 import { tradingApi } from "@/lib/tradingApi";
 import type { LiveFill } from "@/lib/tradingTypes";
 
-// 实盘成交表（§4.5）：8s 轮询真实 OKX 成交明细；鉴权失败显式错误态，绝不假数据（C1）。
+// chevron + 时间 + 方向 + 成交价 + 数量 + 手续费（展开行 colSpan 用）。
+const COL_COUNT = 6;
+
+// 实盘成交表（§4.5 / live-fills-explainability §2.5）：8s 轮询真实 OKX 成交明细，自动交易成交可
+// 逐行展开查看触发原因；鉴权失败显式错误态，绝不假数据（C1）。
 export default function LiveFillsTable({
   instId,
   accountId,
@@ -35,11 +43,36 @@ export default function LiveFillsTable({
   if (fills.length === 0) {
     return <div className="py-8 text-center text-xs text-[var(--muted)]">近三日无实盘成交记录。</div>;
   }
+  return <FillsTableView fills={fills} />;
+}
+
+/** 行 key 与展开态身份：OKX 每行唯一 tradeId 优先，缺失回落 ordId-ts-index（RV2）。 */
+function fillRowKey(fill: LiveFill, index: number): string {
+  return fill.tradeId || `${fill.ordId}-${fill.ts}-${index}`;
+}
+
+/**
+ * 可展开成交表（与 query 解耦，便于单测）。展开态由本组件持有为一个 `Set<string>`，按稳定行键
+ * 索引——故 8s 轮询刷新数据时已展开行保持展开、不闪烁、不错挂他行（RV2）。
+ */
+export function FillsTableView({ fills }: { fills: LiveFill[] }) {
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const toggle = (key: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
 
   return (
     <table className="w-full text-xs">
+      <caption className="pb-1.5 text-left text-[10px] text-[var(--muted)]">
+        点击带角标的成交行展开查看自动交易触发原因
+      </caption>
       <thead className="sticky top-0 bg-[var(--surface)] text-[var(--muted)]">
         <tr className="text-left">
+          <th className="w-5 py-1.5" aria-hidden />
           <th className="py-1.5 pr-2 font-medium">时间</th>
           <th className="py-1.5 pr-2 font-medium">方向</th>
           <th className="py-1.5 pr-2 text-right font-medium">成交价</th>
@@ -48,25 +81,111 @@ export default function LiveFillsTable({
         </tr>
       </thead>
       <tbody>
-        {fills.map((f, i) => (
-          <FillRow key={`${f.ordId}-${f.ts}-${i}`} fill={f} />
-        ))}
+        {fills.map((fill, i) => {
+          const key = fillRowKey(fill, i);
+          return (
+            <FillRow key={key} fill={fill} open={expanded.has(key)} onToggle={() => toggle(key)} />
+          );
+        })}
       </tbody>
     </table>
   );
 }
 
-function FillRow({ fill }: { fill: LiveFill }) {
+function FillRow({
+  fill,
+  open,
+  onToggle,
+}: {
+  fill: LiveFill;
+  open: boolean;
+  onToggle: () => void;
+}) {
   const isBuy = fill.side === "buy";
+  const explain = fill.explain;
+  const onKeyDown = (e: KeyboardEvent<HTMLTableRowElement>) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      onToggle();
+    }
+  };
+  // 有 explain → 整行可点、键盘可达、focus-visible 高亮（HCI）；无 explain → 朴素行不诱导展开。
+  const interactiveProps = explain
+    ? { role: "button", tabIndex: 0, "aria-expanded": open, onClick: onToggle, onKeyDown }
+    : {};
   return (
-    <tr className="border-t border-[var(--border)]">
-      <td className="py-1.5 pr-2 tabular text-[var(--muted)]">{fmtTime(fill.ts)}</td>
-      <td className="py-1.5 pr-2">
-        <Badge tone={isBuy ? "long" : "short"}>{isBuy ? "买入" : "卖出"}</Badge>
-      </td>
-      <td className="py-1.5 pr-2 text-right tabular">{fmtPrice(fill.fillPx)}</td>
-      <td className="py-1.5 pr-2 text-right tabular">{fmtNum(fill.fillSz, 4)}</td>
-      <td className="py-1.5 text-right tabular text-[var(--muted)]">{fmtNum(fill.fee, 4)}</td>
-    </tr>
+    <>
+      <tr
+        {...interactiveProps}
+        className={clsx(
+          "border-t border-[var(--border)]",
+          explain &&
+            "cursor-pointer hover:bg-[var(--surface-2)]/50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)]",
+        )}
+      >
+        <td className="py-1.5 align-middle">{explain && <Chevron open={open} />}</td>
+        <td className="py-1.5 pr-2 tabular text-[var(--muted)]">{fmtTime(fill.ts)}</td>
+        <td className="py-1.5 pr-2">
+          <div className="flex flex-col items-start gap-0.5">
+            <Badge tone={isBuy ? "long" : "short"}>{isBuy ? "买入" : "卖出"}</Badge>
+            <KindTag explain={explain} />
+          </div>
+        </td>
+        <td className="py-1.5 pr-2 text-right tabular">{fmtPrice(fill.fillPx)}</td>
+        <td className="py-1.5 pr-2 text-right tabular">{fmtNum(fill.fillSz, 4)}</td>
+        <td className="py-1.5 text-right tabular text-[var(--muted)]">{fmtNum(fill.fee, 4)}</td>
+      </tr>
+      {explain && open && (
+        <tr>
+          <td colSpan={COL_COUNT} className="px-2 pb-3 pt-0.5">
+            <TradeExplainDetail explain={explain} />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+/** 触发类别角标：有 explain → 按 kind 标签 + 色调；无 explain → 诚实标「手动」淡色标签。 */
+function KindTag({ explain }: { explain?: LiveFill["explain"] }) {
+  if (!explain) {
+    return (
+      <span className="rounded bg-[var(--surface-2)] px-1 py-px text-[9px] text-[var(--muted)]">
+        手动
+      </span>
+    );
+  }
+  const tone = explainKindTone(explain.kind);
+  return (
+    <span
+      className={clsx(
+        "rounded px-1 py-px text-[9px]",
+        tone === "warn" && "bg-[var(--accent-soft)] text-[var(--accent)]",
+        tone !== "warn" && "bg-[var(--surface-2)] text-[var(--muted)]",
+      )}
+    >
+      {explainKindLabel(explain.kind)}
+    </span>
+  );
+}
+
+function Chevron({ open }: { open: boolean }) {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 12 12"
+      className={clsx("text-[var(--muted)] transition-transform", open && "rotate-90")}
+      aria-hidden
+    >
+      <path
+        d="M4 2.5L8 6l-4 3.5"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
   );
 }

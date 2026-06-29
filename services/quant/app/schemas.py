@@ -713,7 +713,12 @@ class SetLeverageOut(BaseModel):
 
 
 class LiveFill(BaseModel):
-    """实盘成交明细单行（GET /trading/fills）。"""
+    """实盘成交明细单行（GET /trading/fills）。
+
+    ``clOrdId`` / ``tradeId`` / ``explain`` 为 live-fills-explainability 增量字段（向后兼容、
+    camelCase）。注意：未声明的字段会被 ``response_model`` 序列化丢弃，故服务端富化挂上的
+    ``explain`` / ``clOrdId`` / ``tradeId`` 必须在此声明（§三）。
+    """
 
     ts: int                # 秒级 UTC
     instId: str
@@ -722,6 +727,9 @@ class LiveFill(BaseModel):
     fillSz: float
     fee: float
     ordId: str
+    tradeId: str | None = None       # OKX 每笔成交唯一 id（前端行 key / 展开态身份，RV2）
+    clOrdId: str | None = None       # OKX 回带（自动交易为 aragon/aragonc 前缀；手动/外部可能为空）
+    explain: dict | None = None      # 命中自动交易触发解释时存在（TriggerExplain，§五）
 
 
 class LiveFillsOut(BaseModel):

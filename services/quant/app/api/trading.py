@@ -10,12 +10,15 @@ fills）不受该开关限制（仅查不写）。
 """
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import Settings, get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
+from ..live_auto.fills_explain import attach_explains, index_trade_explains
 from ..okx.accounts import AccountCredentials
 from ..okx.order_builder import ClosePositionInput, OrderInput
 from ..okx.trading import (
@@ -43,7 +46,16 @@ from ..schemas import (
     TradingConfigOut,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(tags=["trading"], prefix="/trading")
+
+# 成交 → 解释关联的时间窗 slack（秒，RV1/P0）：自动交易 trade 落库 ts 是确认根开盘时刻，
+# 真实成交在收线之后约一个 bar 周期才发生（最大 1D=86400s，见 okx.types.BAR_SECONDS）。
+# slack 须 ≥ 最大 bar 周期 + 余量（取 90000，约 25h），否则除 1m 外所有周期都会被 ts 下界整段筛掉。
+_FILL_JOIN_SLACK_SEC = 90000
+# 解释行查询的硬上限（真正的扫描硬边界）：OKX fills 仅回近三日 ≤100 行、解释行本就低频，
+# 时间窗只作粗筛、limit 兜底，二者叠加即小结果集。
+_FILL_JOIN_MAX = 1000
 
 
 def _creds_from_row(row: repo.OkxAccount) -> AccountCredentials:
@@ -96,9 +108,23 @@ async def trading_positions(accountId: int | None = Query(None),
 async def trading_fills(accountId: int | None = Query(None), instId: str | None = Query(None),
                         limit: int = Query(100, ge=1, le=100),
                         session: AsyncSession = Depends(get_session)) -> dict:
-    """真实成交明细（轮询源）。"""
+    """真实成交明细（轮询源），best-effort 富化自动交易触发解释（live-fills-explainability §2.4）。
+
+    取真实 OKX fills 后，按其时间窗查本地解释行 → 建 clOrdId/ordId 索引 → 逐 fill 关联挂 explain；
+    整段 try/except 隔离：任何异常仅 warning 并原样返回未富化 fills（成交永不因解释失败而不可见，R1）。
+    """
     row = await _resolve_account(session, accountId)
-    return {"fills": await fetch_live_fills(_creds_from_row(row), instId, limit)}
+    fills = await fetch_live_fills(_creds_from_row(row), instId, limit)
+    if not fills:
+        return {"fills": fills}                      # 无成交：免去多余 DB 读（RV3）
+    try:
+        since_ts = min(f["ts"] for f in fills) - _FILL_JOIN_SLACK_SEC
+        explained = await repo.list_explained_trades(session, since_ts=since_ts,
+                                                     limit=_FILL_JOIN_MAX)
+        fills = attach_explains(fills, index_trade_explains(explained))
+    except Exception as exc:    # noqa: BLE001 —— 解释富化失败绝不阻断成交可见
+        logger.warning("attach fills explain failed (account=%s): %s", row.id, exc)
+    return {"fills": fills}
 
 
 @router.get("/open-orders", response_model=LiveOpenOrdersOut)

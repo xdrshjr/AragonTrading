@@ -235,6 +235,20 @@ async def list_trades(session: AsyncSession, run_id: int, limit: int = 200,
     return list((await session.execute(stmt)).scalars().all())
 
 
+async def list_explained_trades(session: AsyncSession, *, since_ts: int | None = None,
+                                limit: int = 1000) -> list[Trade]:
+    """取「带解释」的 trade 行（explain_json 非空、可选 ts>=since_ts、按 ts 倒序限量）。
+
+    供实盘成交记录富化用（live-fills-explainability §2.3）：只回带自动交易解释行，自然排除
+    回测 / 无解释行；``since_ts`` 把扫描收敛到当前 fills 时间窗内，单查询、小结果集。
+    """
+    stmt = select(Trade).where(Trade.explain_json.is_not(None))
+    if since_ts is not None:
+        stmt = stmt.where(Trade.ts >= since_ts)
+    stmt = stmt.order_by(Trade.ts.desc()).limit(limit)
+    return list((await session.execute(stmt)).scalars().all())
+
+
 async def list_equity(session: AsyncSession, run_id: int) -> list[EquityPoint]:
     stmt = (select(EquityPoint).where(EquityPoint.run_id == run_id)
             .order_by(EquityPoint.ts.asc(), EquityPoint.id.asc()))
