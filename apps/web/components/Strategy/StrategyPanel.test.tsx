@@ -8,6 +8,7 @@ import type { BacktestResult, Health, Strategy } from "@/lib/types";
 import StrategyPanel from "./StrategyPanel";
 
 const RUN_BACKTEST = "运行回测";
+const MULTI_SAMPLE = "多样本回测";
 const SAVE_AS = "另存为";
 const NEW_COMBO = "新建组合";
 const SAVE_COMBO = "保存组合";
@@ -150,6 +151,7 @@ vi.mock("@/lib/api", () => {
       deleteStrategy: vi.fn(),
       backtest: vi.fn(),
       compare: vi.fn(),
+      multiBacktest: vi.fn(),
       walkForward: vi.fn(),
       trades: vi.fn(),
       equity: vi.fn(),
@@ -180,6 +182,16 @@ function mockApi(strategies: Strategy[] = STRATEGIES) {
     instId: "BTC-USDT-SWAP",
     bar: "1H",
     items: [],
+  });
+  vi.mocked(api.multiBacktest).mockResolvedValue({
+    strategyId: 1,
+    bar: "1H",
+    startTs: 1_700_000_000,
+    endTs: 1_700_086_400,
+    items: [
+      { instId: "BTC-USDT-SWAP", status: "ok", runId: 501, metrics: METRICS, truncated: false },
+      { instId: "ETH-USDT-SWAP", status: "ok", runId: 502, metrics: METRICS, truncated: false },
+    ],
   });
   vi.mocked(api.walkForward).mockResolvedValue({
     runId: 202,
@@ -666,6 +678,38 @@ describe("StrategyPanel manual backtest trigger", () => {
     expect(useAppStore.getState().runId).toBeNull();
     expect(screen.queryByText("12.00%")).toBeNull();
     expect(screen.getByText("暂无组合策略")).toBeTruthy();
+  });
+
+  it("shows the multi-sample button for simple backtest and opens the selection modal", async () => {
+    await renderLoadedPanel({ watchlist: ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"] });
+
+    expect(getButton(MULTI_SAMPLE)).toBeTruthy();
+
+    fireEvent.click(getButton(MULTI_SAMPLE));
+    const dialog = await screen.findByRole("dialog");
+    // 弹窗罗列全部自选标的（3 行复选框）。
+    expect(within(dialog).getAllByRole("checkbox")).toHaveLength(3);
+  });
+
+  it("hides the multi-sample button in walk-forward mode", async () => {
+    await renderLoadedPanel({ backtestKind: "walkforward" });
+    expect(
+      screen.getAllByRole("button").find((b) => b.textContent?.includes(MULTI_SAMPLE)),
+    ).toBeUndefined();
+  });
+
+  it("renders per-symbol result tabs after a multi-sample backtest succeeds", async () => {
+    await renderLoadedPanel({ watchlist: ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"] });
+    vi.clearAllMocks();
+
+    fireEvent.click(getButton(MULTI_SAMPLE));
+    await screen.findByRole("dialog");
+    fireEvent.click(screen.getByRole("button", { name: /确定/ }));
+
+    await waitFor(() => expect(api.multiBacktest).toHaveBeenCalledTimes(1));
+    // 结果区按标的分页签展示。
+    await screen.findByRole("tab", { name: /BTC-USDT-SWAP/ });
+    expect(screen.getByRole("tab", { name: /ETH-USDT-SWAP/ })).toBeTruthy();
   });
 
   it("keeps instrument, bar, and range changes passive while clearing stale results", async () => {

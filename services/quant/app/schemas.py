@@ -63,6 +63,26 @@ class CompareReq(BaseModel):
         return self
 
 
+class MultiSampleBacktestReq(BaseModel):
+    # 单策略 × 多标的（多样本回测）：1..20 个标的，服务端去重后逐一复用 run_single_backtest，
+    # per-symbol 错误隔离。字段用字面 camelCase 对齐 BacktestReq/CompareReq（不加 alias_generator）。
+    instIds: list[str] = Field(min_length=1, max_length=20)
+    bar: str = "1H"
+    limit: int | None = Field(default=None, ge=10, le=200000)   # 同 BacktestReq（仅作 max_bars 安全上限）
+    startTs: int = Field(ge=0)
+    endTs: int = Field(ge=0)
+    initialCapital: float | None = None
+    fees: float | None = None        # taker_fee_bps
+    slippage: float | None = None    # slippage_bps
+    leverage: float | None = None
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "MultiSampleBacktestReq":
+        if self.startTs >= self.endTs:
+            raise ValueError("startTs must be less than endTs")
+        return self
+
+
 class ComboMemberIn(BaseModel):
     """组合成员入参：自包含快照 {templateKey, params}（不引用其它策略行主键）。"""
 

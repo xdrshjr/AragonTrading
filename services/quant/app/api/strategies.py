@@ -19,6 +19,7 @@ from ..schemas import (
     ComboPreviewReq,
     CompareReq,
     CreateStrategyReq,
+    MultiSampleBacktestReq,
     UpdateStrategyReq,
     WalkForwardReq,
 )
@@ -102,6 +103,18 @@ async def backtest(strategy_id: int, body: BacktestReq,
     return await services.run_single_backtest(
         session, get_rest_client(),
         strategy_id=strategy_id, inst_id=body.instId, bar=body.bar, limit=body.limit,
+        start_ts=body.startTs, end_ts=body.endTs, initial_capital=body.initialCapital,
+        fees=body.fees, slippage=body.slippage, leverage=body.leverage,
+    )
+
+
+@router.post("/strategies/{strategy_id}/multi-backtest")
+async def multi_backtest(strategy_id: int, body: MultiSampleBacktestReq,
+                         session: AsyncSession = Depends(get_session)) -> dict:
+    """多样本回测：同一策略对多个标的逐一回测（顺序执行 + per-symbol 错误隔离）。"""
+    return await services.run_multi_sample_backtest(
+        session, get_rest_client(),
+        strategy_id=strategy_id, inst_ids=body.instIds, bar=body.bar, limit=body.limit,
         start_ts=body.startTs, end_ts=body.endTs, initial_capital=body.initialCapital,
         fees=body.fees, slippage=body.slippage, leverage=body.leverage,
     )

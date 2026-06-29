@@ -10,6 +10,7 @@ import type {
   EquityPoint,
   Health,
   Instrument,
+  MultiSampleResult,
   PaperBatchStartResult,
   PaperBatchStopResult,
   PaperSessionRow,
@@ -195,6 +196,26 @@ export const api = {
     leverage?: number;
   }) =>
     request<CompareResult>("/strategies/compare", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  // 多样本回测：同一策略对多个标的逐一回测（顺序执行，per-symbol 错误隔离），按标的聚合返回。
+  multiBacktest: (
+    id: number,
+    body: {
+      instIds: string[];
+      bar: string;
+      limit?: number;
+      startTs: number;
+      endTs: number;
+      initialCapital?: number;
+      fees?: number;
+      slippage?: number;
+      leverage?: number;
+    },
+  ) =>
+    request<MultiSampleResult>(`/strategies/${id}/multi-backtest`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

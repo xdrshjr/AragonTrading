@@ -21,6 +21,7 @@ import { downloadCsv, equityToCsv } from "@/lib/export";
 import type {
   ComboPreviewResult,
   Metrics,
+  MultiSampleResult,
   PaperSessionRow,
   PaperStrategySession,
   Strategy,
@@ -33,6 +34,7 @@ import ComboResult from "./ComboResult";
 import ComboStrategyDetail from "./ComboStrategyDetail";
 import CompareView from "./CompareView";
 import MetricsCards from "./MetricsCards";
+import MultiSampleResults from "./MultiSampleResults";
 import RunHistory from "./RunHistory";
 import StrategyDetail from "./StrategyDetail";
 import StrategyList from "./StrategyList";
@@ -50,6 +52,7 @@ export default function StrategyPanel() {
     instId,
     bar,
     mode,
+    watchlist,
     strategyListTab,
     backtestKind,
     wfParams,
@@ -89,6 +92,8 @@ export default function StrategyPanel() {
   const [stopError, setStopError] = useState<string | null>(null);
   // 组合回测结果（年化 / 轮动时间线 / 分体制贡献）：选中组合回测后接入绩效页签；原子回测回填 null。
   const [comboResult, setComboResult] = useState<ComboPreviewResult["combo"] | null>(null);
+  // 多样本回测结果（单策略 × 多标的）：与单回测态互斥，由 clearBacktestResult 统一清空（评审 R-P2-5）。
+  const [multiResult, setMultiResult] = useState<MultiSampleResult | null>(null);
   const reconciledRef = useRef(false);
   const seededPaperSelectionRef = useRef(false);
 
@@ -97,6 +102,7 @@ export default function StrategyPanel() {
     setMetrics(undefined);
     setCoverage(undefined);
     setComboResult(null);
+    setMultiResult(null);
     setWalkForwardResult(null);
     setChartView("live-follow");
   }, [setRunId, setWalkForwardResult, setChartView]);
@@ -261,6 +267,8 @@ export default function StrategyPanel() {
         truncated: data.truncated,
       });
       setReturnsById((prev) => ({ ...prev, [vars.id]: data.metrics.totalReturn }));
+      // 单回测成功清多样本态（两态互斥，评审 R-P2-5）。
+      setMultiResult(null);
     },
   });
 
@@ -271,6 +279,17 @@ export default function StrategyPanel() {
     onSuccess: (data) => {
       setRunId(data.runId);
       setWalkForwardResult(data);
+    },
+  });
+
+  // 多样本回测：同一策略对所选标的逐一回测；成功后清单回测态（含图表叠加）再写 multiResult，并切到绩效页签。
+  const multiBacktest = useMutation({
+    mutationFn: (vars: { id: number; instIds: string[]; params?: Params }) =>
+      runMultiSampleBacktest(vars.id, vars.params, vars.instIds, bar, backtestStartTs, backtestEndTs),
+    onSuccess: (data) => {
+      clearBacktestResult();
+      setMultiResult(data);
+      setTab("metrics");
     },
   });
 
@@ -400,6 +419,7 @@ export default function StrategyPanel() {
   const actionBusy =
     backtest.isPending ||
     walkForward.isPending ||
+    multiBacktest.isPending ||
     paperStart.isPending ||
     paperStop.isPending ||
     paperStopAll.isPending ||
@@ -558,6 +578,11 @@ export default function StrategyPanel() {
                       busy={actionBusy}
                       paperActive={runningSessions.length > 0 || !!paperSessionId}
                       simBalance={simBalance}
+                      watchlist={watchlist}
+                      instId={instId}
+                      bar={bar}
+                      backtestStartTs={backtestStartTs}
+                      backtestEndTs={backtestEndTs}
                       onApplyAndBacktest={(params) =>
                         backtest.mutate({ id: selected.id, params, showRunRange: true })
                       }
@@ -570,6 +595,9 @@ export default function StrategyPanel() {
                         paperStop.mutate();
                       }}
                       onSaveAs={(name, params) => saveAs.mutate({ name, params })}
+                      onMultiBacktest={(instIds, params) =>
+                        multiBacktest.mutate({ id: selected.id, instIds, params })
+                      }
                     />
                     {startDisabledReason && (
                       <div className="mt-2 text-[11px] text-[var(--muted)]">{startDisabledReason}</div>
@@ -626,39 +654,43 @@ export default function StrategyPanel() {
                     />
                   </div>
                   {tab === "metrics" ? (
-                    <>
-                      {coverage?.truncated && (
-                        <div className="mb-2 rounded-[8px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-[11px] text-[var(--muted)]">
-                          ⚠ 区间过长 / 历史不足，仅覆盖最近 {coverage.effectiveCandleCount} /{" "}
-                          {coverage.requestedBars} 根，收益率为部分区间结果。
+                    multiResult || multiBacktest.isPending ? (
+                      <MultiSampleResults result={multiResult} loading={multiBacktest.isPending} />
+                    ) : (
+                      <>
+                        {coverage?.truncated && (
+                          <div className="mb-2 rounded-[8px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-[11px] text-[var(--muted)]">
+                            ⚠ 区间过长 / 历史不足，仅覆盖最近 {coverage.effectiveCandleCount} /{" "}
+                            {coverage.requestedBars} 根，收益率为部分区间结果。
+                          </div>
+                        )}
+                        <div className="mb-2 flex justify-end">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            disabled={!equityQ.data?.length}
+                            onClick={() =>
+                              runId &&
+                              equityQ.data &&
+                              downloadCsv(
+                                `aragon-equity-run${runId}.csv`,
+                                equityToCsv(equityQ.data),
+                              )
+                            }
+                          >
+                            导出净值 CSV
+                          </Button>
                         </div>
-                      )}
-                      <div className="mb-2 flex justify-end">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          disabled={!equityQ.data?.length}
-                          onClick={() =>
-                            runId &&
-                            equityQ.data &&
-                            downloadCsv(
-                              `aragon-equity-run${runId}.csv`,
-                              equityToCsv(equityQ.data),
-                            )
-                          }
-                        >
-                          导出净值 CSV
-                        </Button>
-                      </div>
-                      {selectedCombo && comboResult && metrics ? (
-                        <ComboResult
-                          result={{ metrics, combo: comboResult }}
-                          onGoCompare={() => setMode("compare")}
-                        />
-                      ) : (
-                        <MetricsCards metrics={metrics} loading={backtest.isPending} />
-                      )}
-                    </>
+                        {selectedCombo && comboResult && metrics ? (
+                          <ComboResult
+                            result={{ metrics, combo: comboResult }}
+                            onGoCompare={() => setMode("compare")}
+                          />
+                        ) : (
+                          <MetricsCards metrics={metrics} loading={backtest.isPending} />
+                        )}
+                      </>
+                    )
                   ) : (
                     <RunHistory />
                   )}
@@ -735,6 +767,19 @@ async function runBacktest(
   if (params) await api.updateStrategy(id, { params });
   // 去掉硬编码 limit（v2·P1-1）：后端全区间分页保证 [startTs,endTs] 全覆盖，不再截断到最近 1000 根。
   return api.backtest(id, { instId, bar, startTs, endTs });
+}
+
+async function runMultiSampleBacktest(
+  id: number,
+  params: Params | undefined,
+  instIds: string[],
+  bar: string,
+  startTs: number,
+  endTs: number,
+) {
+  // 与单回测同口径：先持久化编辑过的参数，再对所选标的跑多样本回测（不传当前图表 instId，不劫持主图表）。
+  if (params) await api.updateStrategy(id, { params });
+  return api.multiBacktest(id, { instIds, bar, startTs, endTs });
 }
 
 async function runWalkForward(

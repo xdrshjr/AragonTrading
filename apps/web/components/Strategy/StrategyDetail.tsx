@@ -7,6 +7,7 @@ import type { FactorScoreSnapshotParams } from "@/lib/factorTypes";
 import { fmtMoney, fmtTime } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 import type { BacktestKind, Strategy } from "@/lib/types";
+import MultiSampleBacktestModal from "./MultiSampleBacktestModal";
 import WalkForwardForm from "./WalkForwardForm";
 
 interface FactorMemberSnapshot {
@@ -82,11 +83,17 @@ export default function StrategyDetail({
   busy,
   paperActive,
   simBalance,
+  watchlist = [],
+  instId = "",
+  bar = "1H",
+  backtestStartTs = 0,
+  backtestEndTs = 0,
   onApplyAndBacktest,
   onRunWalkForward,
   onStartPaper,
   onStopPaper,
   onSaveAs,
+  onMultiBacktest,
 }: {
   strategy: Strategy;
   mode: "backtest" | "paper";
@@ -94,15 +101,23 @@ export default function StrategyDetail({
   busy: boolean;
   paperActive: boolean;
   simBalance?: number;
+  // 多样本回测上下文（评审 R-P1-4：由 StrategyPanel 注入，StrategyDetail 不直接读 store）。
+  watchlist?: string[];
+  instId?: string;
+  bar?: string;
+  backtestStartTs?: number;
+  backtestEndTs?: number;
   onApplyAndBacktest: (params: Params) => void;
   onRunWalkForward?: (params: Params) => void;
   onStartPaper: (params: Params, opts?: PaperOpts) => void;
   onStopPaper: () => void;
   onSaveAs: (name: string, params: Params) => void;
+  onMultiBacktest?: (instIds: string[], params: Params) => void;
 }) {
   const [params, setParams] = useState<Params>(strategy.params);
   const [source, setSource] = useState<"live" | "replay">("live");
   const [speed, setSpeed] = useState(16);
+  const [multiOpen, setMultiOpen] = useState(false);
 
   useEffect(() => {
     setParams(strategy.params);
@@ -257,6 +272,12 @@ export default function StrategyDetail({
           </Button>
         )}
 
+        {mode === "backtest" && backtestKind !== "walkforward" && onMultiBacktest && (
+          <Button variant="default" disabled={busy} onClick={() => setMultiOpen(true)}>
+            多样本回测
+          </Button>
+        )}
+
         <Button
           variant="default"
           disabled={busy}
@@ -268,6 +289,24 @@ export default function StrategyDetail({
           另存为
         </Button>
       </div>
+
+      {onMultiBacktest && (
+        <MultiSampleBacktestModal
+          open={multiOpen}
+          onClose={() => setMultiOpen(false)}
+          watchlist={watchlist}
+          currentInstId={instId}
+          bar={bar}
+          startTs={backtestStartTs}
+          endTs={backtestEndTs}
+          strategyName={strategy.name}
+          busy={busy}
+          onConfirm={(instIds) => {
+            onMultiBacktest(instIds, params);
+            setMultiOpen(false);
+          }}
+        />
+      )}
     </div>
   );
 }

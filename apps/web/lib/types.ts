@@ -441,6 +441,27 @@ export interface CompareResult {
   items: CompareItem[];
 }
 
+// 多样本回测（multi-sample-backtest）：单策略 × 多标的，逐标的各落一条 run；items 顺序与请求 instIds 去重后一致。
+export interface MultiSampleItem {
+  instId: string;
+  status: "ok" | "error";
+  runId?: number; // status==="ok"
+  metrics?: Metrics; // status==="ok"，复用既有 Metrics
+  effectiveCandleCount?: number;
+  requestedBars?: number;
+  truncated?: boolean;
+  combo?: ComboPreviewResult["combo"]; // 组合策略多样本时透传（可选）
+  error?: string; // status==="error"，非空错误消息
+}
+
+export interface MultiSampleResult {
+  strategyId: number;
+  bar: string;
+  startTs: number;
+  endTs: number;
+  items: MultiSampleItem[];
+}
+
 export interface Health {
   status: string;
   okx: "up" | "down";

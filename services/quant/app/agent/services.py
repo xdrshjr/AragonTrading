@@ -21,6 +21,7 @@ from ..engine.backtester import BacktestResult, plan_walk_forward_windows, run_b
 from ..engine.combo import ComboMember, ComboPolicy, run_combo_backtest
 from ..engine.metrics import summarize_windows
 from ..engine.mtf import bar_to_seconds
+from ..okx.rest_client import OKXError
 from ..okx.types import Candle
 from ..schemas import combo_out, equity_out
 from ..strategies.base import BaseStrategy, get_strategy_class
@@ -238,6 +239,82 @@ async def run_single_backtest(session: AsyncSession, rest, *, strategy_id: int, 
         htf_frames=htf_frames)
     return {"runId": run.id, "metrics": result.metrics,
             **_coverage_fields(candles, bar=bar, start_ts=start_ts, end_ts=end_ts)}
+
+
+def _dedupe_strs(values: list[str]) -> list[str]:
+    """字符串去重保序（首次出现位置稳定）；多样本标的列表用。"""
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _http_error_message(exc: HTTPException) -> str:
+    """从 HTTPException 抽取面向用户的非空错误消息（项目约定 detail={code,message}，v2·R-P1-1/R-P1-3）。"""
+    detail = exc.detail
+    if isinstance(detail, dict):
+        return str(detail.get("message") or detail.get("code") or detail)
+    return str(detail)
+
+
+def _guard_multi_sample_workload(symbols: list[str], *, bar: str, limit: int | None,
+                                 start_ts: int, end_ts: int) -> None:
+    """计算护栏：标的数 × 区间根数超阈即 413（network 维度对策见 spec §4.1 / §八）。
+
+    复用 `_compare_effective_bars`（由区间 + bar 推算，无需预先 load_range_candles），故护栏可在
+    逐标的循环前求值。compare 只拉一次 K 线，多样本对每个标的各自分页拉取，故同等 150k 预算对本
+    端点偏紧是有意为之（叠加严格顺序执行 + per-symbol 429 隔离）。
+    """
+    if not symbols:
+        return
+    effective_bars = _compare_effective_bars(bar=bar, limit=limit, start_ts=start_ts, end_ts=end_ts)
+    if len(symbols) * effective_bars <= _COMPARE_SYNC_WORK_UNIT_LIMIT:
+        return
+    raise HTTPException(413, detail={
+        "code": "MULTI_SAMPLE_TOO_LARGE",
+        "message": ("Multi-sample request is too large for synchronous execution. "
+                    "Narrow the range or select fewer symbols."),
+    })
+
+
+async def run_multi_sample_backtest(session: AsyncSession, rest, *, strategy_id: int,
+                                    inst_ids: list[str], bar: str, limit: int | None = None,
+                                    start_ts: int, end_ts: int,
+                                    initial_capital: float | None = None, fees: float | None = None,
+                                    slippage: float | None = None,
+                                    leverage: float | None = None) -> dict:
+    """单策略 × 多标的：去重 + 工作量护栏后，**严格顺序**逐标的复用 `run_single_backtest`。
+
+    相对 `run_compare` 的增量是 per-symbol `try/except (HTTPException, OKXError)` 错误隔离（compare 的
+    标的内循环并无此能力）：单标的失败落 `items[].status="error"`（error 非空），不拖垮整批；其余标的照常返回。
+    策略不存在为整请求级 404（循环前显式抛出，区别于 compare 对未知 id 的静默跳过，spec §4.1）。
+
+    Returns:
+        {strategyId, bar, startTs, endTs, items:[{instId,status:"ok",runId,metrics,...}|{instId,status:"error",error}]}
+    """
+    row = await repo.get_strategy_row(session, strategy_id)
+    if row is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "策略不存在"})
+    symbols = _dedupe_strs(inst_ids)
+    _guard_multi_sample_workload(symbols, bar=bar, limit=limit, start_ts=start_ts, end_ts=end_ts)
+
+    items: list[dict] = []
+    for inst_id in symbols:
+        try:
+            res = await run_single_backtest(
+                session, rest, strategy_id=strategy_id, inst_id=inst_id, bar=bar, limit=limit,
+                start_ts=start_ts, end_ts=end_ts, initial_capital=initial_capital, fees=fees,
+                slippage=slippage, leverage=leverage)
+            items.append({"instId": inst_id, "status": "ok", **res})
+        except HTTPException as exc:
+            items.append({"instId": inst_id, "status": "error", "error": _http_error_message(exc)})
+        except OKXError as exc:
+            items.append({"instId": inst_id, "status": "error", "error": exc.message})
+    return {"strategyId": strategy_id, "bar": bar, "startTs": start_ts, "endTs": end_ts,
+            "items": items}
 
 
 def _dedupe_ids(ids: list[int]) -> list[int]:
