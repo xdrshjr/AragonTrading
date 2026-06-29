@@ -385,7 +385,7 @@ describe("StrategyPanel manual backtest trigger", () => {
     expect(screen.queryByText("成交明细")).toBeNull();
   });
 
-  it("caps compare selection at 12 and disables unchecked strategies at the cap", async () => {
+  it("defaults to no compare selection and caps manual selection at 12", async () => {
     const manyStrategies = makeCompareStrategies(13);
     mockApi(manyStrategies);
     resetStore({ mode: "compare" });
@@ -393,14 +393,24 @@ describe("StrategyPanel manual backtest trigger", () => {
 
     await screen.findByText("Strategy 13");
 
-    const checkboxes = screen.getAllByRole("checkbox");
-    const checkedBoxes = checkboxes.filter((item) => (item as HTMLInputElement).checked);
-    expect(checkedBoxes).toHaveLength(12);
+    // 需求 1：进入对比默认什么都不选。
+    expect(
+      screen.getAllByRole("checkbox").filter((item) => (item as HTMLInputElement).checked),
+    ).toHaveLength(0);
 
-    const extra = checkboxes[12] as HTMLInputElement;
+    // 手动勾选前 12 个，受 12 上限保护。
+    for (let i = 0; i < 12; i += 1) {
+      fireEvent.click(screen.getAllByRole("checkbox")[i]);
+    }
+
+    expect(
+      screen.getAllByRole("checkbox").filter((item) => (item as HTMLInputElement).checked),
+    ).toHaveLength(12);
+
+    const extra = screen.getAllByRole("checkbox")[12] as HTMLInputElement;
     expect(extra.checked).toBe(false);
     expect(extra.disabled).toBe(true);
-    expect(screen.getByText("已达 12 个策略上限")).toBeTruthy();
+    expect(screen.getByText(/已达上限/)).toBeTruthy();
 
     fireEvent.click(getButton("运行对比"));
 

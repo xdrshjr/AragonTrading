@@ -1,6 +1,7 @@
-// 多策略对比的纯函数：榜单排序键 + 净值归一化 + 稳定配色（F3, C6）。
+// 多策略对比的纯函数：榜单排序键 + 净值归一化 + 稳定配色（F3, C6），
+// 以及对比清单的批量选择 / 筛选纯逻辑（默认空选 + 顶部批量工具条）。
 // 与 format.ts 同约定：纯函数 + 同名 compare.test.ts 单测，组件仅消费此处逻辑。
-import type { CompareItem, EquityPoint, Metrics } from "./types";
+import type { CompareItem, EquityPoint, Metrics, Strategy, StrategyKind } from "./types";
 
 // 可作为榜单排序依据的指标键（均为 Metrics 的数值字段）
 export type SortKey = "totalReturn" | "sharpe" | "winRate" | "maxDrawdown" | "tradeCount";
@@ -49,4 +50,66 @@ export const OVERLAY_COLORS = [
 
 export function colorForIndex(i: number): string {
   return OVERLAY_COLORS[((i % OVERLAY_COLORS.length) + OVERLAY_COLORS.length) % OVERLAY_COLORS.length];
+}
+
+// ============================ 对比清单批量选择 / 筛选 ============================
+// 单一真源：选择上下限常量与筛选 / 全选 / 反选纯逻辑，CompareView 与 CompareSelectionBar 共享，
+// 避免组件层各自定义阈值或在 JSX 里手写分支算法（CLAUDE §六：复杂分支下沉纯函数 + 同名单测）。
+
+// 对比清单分类筛选：全部 / 原子（含因子）/ 组合。
+export type CompareFilter = "all" | "atomic" | "combo";
+
+// 多策略对比的选择上下限（替代 CompareView 私有常量，杜绝双份定义漂移）。
+export const MAX_COMPARE_SELECTIONS = 12;
+export const MIN_COMPARE_SELECTIONS = 2;
+
+// 可入选 = 非 unavailable（与对比清单 checkbox 的 disabled 口径一致）。
+export function isCompareEligible(s: Strategy): boolean {
+  return !s.unavailable;
+}
+
+// 当前筛选下的可见清单（保持原顺序）。语义统一为：
+//   all=全集；combo=kind==="combo"；atomic=kind!=="combo"（原子 + 因子，均归「原子」标签，
+//   确保因子策略不落入「无标签兜底」盲区）。
+export function filterCompareStrategies(list: Strategy[], filter: CompareFilter): Strategy[] {
+  if (filter === "combo") return list.filter((s) => s.kind === "combo");
+  if (filter === "atomic") return list.filter((s) => s.kind !== "combo");
+  return list;
+}
+
+// 全选（并集语义）：把当前筛选下可用项并入 current，不丢弃 current 中不在 visible 的已选项；
+// 按稳定顺序（current 在前、visible 列表序在后）夹取至 cap，返回 id 数组。
+export function selectAllEligible(
+  current: Set<number>,
+  visible: Strategy[],
+  cap: number = MAX_COMPARE_SELECTIONS,
+): number[] {
+  const result: number[] = [...current];
+  for (const s of visible) {
+    if (result.length >= cap) break;
+    if (isCompareEligible(s) && !current.has(s.id)) result.push(s.id);
+  }
+  return result.slice(0, cap);
+}
+
+// 反选：在当前筛选下的可用集合内反转选择（原选→去、原未选→入），可见集合外的已选项原样保留；
+// 按稳定顺序（可见外已选在前、反选入的可见项在后）夹取至 cap，返回 id 数组。
+export function invertSelection(
+  current: Set<number>,
+  visible: Strategy[],
+  cap: number = MAX_COMPARE_SELECTIONS,
+): number[] {
+  const visibleIds = new Set(visible.map((s) => s.id));
+  const kept = [...current].filter((id) => !visibleIds.has(id));
+  const toggledIn = visible
+    .filter((s) => isCompareEligible(s) && !current.has(s.id))
+    .map((s) => s.id);
+  return [...kept, ...toggledIn].slice(0, cap);
+}
+
+// 策略类型中文标签：atomic→原子 / combo→组合 / factor→因子（缺省按原子）。
+export function compareKindLabel(kind?: StrategyKind): string {
+  if (kind === "combo") return "组合";
+  if (kind === "factor") return "因子";
+  return "原子";
 }

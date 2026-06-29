@@ -1,13 +1,26 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { api } from "@/lib/api";
-import { colorForIndex, sortCompareItems, type SortDir, type SortKey } from "@/lib/compare";
+import {
+  colorForIndex,
+  filterCompareStrategies,
+  invertSelection,
+  MAX_COMPARE_SELECTIONS,
+  MIN_COMPARE_SELECTIONS,
+  selectAllEligible,
+  sortCompareItems,
+  type CompareFilter,
+  type SortDir,
+  type SortKey,
+} from "@/lib/compare";
 import { fmtNum, fmtPct } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
-import type { CompareResult } from "@/lib/types";
-import { Badge, Button } from "@/components/ui";
+import type { CompareResult, Strategy } from "@/lib/types";
+import CompareSelectionBar from "./CompareSelectionBar";
+import CompareStrategyRow from "./CompareStrategyRow";
+import StrategyDetailModal from "./StrategyDetailModal";
 
 const COLUMNS: { key: SortKey; label: string }[] = [
   { key: "totalReturn", label: "收益率" },
@@ -16,8 +29,6 @@ const COLUMNS: { key: SortKey; label: string }[] = [
   { key: "maxDrawdown", label: "最大回撤" },
   { key: "tradeCount", label: "交易数" },
 ];
-const MAX_COMPARE_SELECTIONS = 12;
-const MAX_COMPARE_SELECTION_MESSAGE = "已达 12 个策略上限";
 
 export default function CompareView() {
   const qc = useQueryClient();
@@ -26,26 +37,21 @@ export default function CompareView() {
   const { data: strategies } = useQuery({ queryKey: ["strategies"], queryFn: api.strategies });
 
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [filter, setFilter] = useState<CompareFilter>("all");
+  const [detail, setDetail] = useState<Strategy | null>(null);
   const [sortKey, setSortKey] = useState<SortKey>("totalReturn");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
 
-  // 默认全选可用的内置策略
-  useEffect(() => {
-    if (strategies && selected.size === 0) {
-      setSelected(
-        new Set(
-          strategies
-            .filter((s) => s.builtin && !s.unavailable)
-            .slice(0, MAX_COMPARE_SELECTIONS)
-            .map((s) => s.id),
-        ),
-      );
-    }
-  }, [strategies]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // 对比结果写入共享缓存（page.tsx 据此叠加 overlays），与本组件配色一致
+  // 对比结果写入共享缓存（page.tsx 据此叠加 overlays），与本组件配色一致。
+  // 响应式订阅（enabled:false + initialData:null + queryFn:()=>null）：与 app/page.tsx 同模式，
+  // 让「运行对比」/「清空结果」均即时反映到榜单与 hasResult（否则 setQueryData(null) 不触发重渲染）。
   const compareKey = ["compare", instId, bar, backtestStartTs, backtestEndTs];
-  const result = qc.getQueryData<CompareResult>(compareKey);
+  const { data: result } = useQuery<CompareResult | null>({
+    queryKey: compareKey,
+    queryFn: () => null,
+    enabled: false,
+    initialData: null,
+  });
   const compare = useMutation({
     mutationFn: () =>
       api.compare({
@@ -58,6 +64,8 @@ export default function CompareView() {
       }),
     onSuccess: (data) => qc.setQueryData(compareKey, data),
   });
+
+  const atSelectionLimit = selected.size >= MAX_COMPARE_SELECTIONS;
 
   const toggle = (id: number) =>
     setSelected((prev) => {
@@ -78,12 +86,11 @@ export default function CompareView() {
     }
   };
 
-  // 按结果原始顺序固定配色（与 CandleChart overlays 的 colorForIndex 一致）
+  // 按结果原始顺序固定配色（与 CandleChart overlays 的 colorForIndex 一致）。
   const colorById = new Map<number, string>(
     (result?.items ?? []).map((it, i) => [it.strategyId, colorForIndex(i)]),
   );
   const rows = result ? sortCompareItems(result.items, sortKey, sortDir) : [];
-  const atSelectionLimit = selected.size >= MAX_COMPARE_SELECTIONS;
 
   const openDetail = (strategyId: number, runId: number) => {
     setStrategyId(strategyId);
@@ -96,6 +103,8 @@ export default function CompareView() {
     return <div className="py-8 text-center text-xs text-[var(--muted)]">加载策略…</div>;
   }
 
+  const visible = filterCompareStrategies(strategies, filter);
+
   return (
     <div className="flex flex-col gap-3">
       <div>
@@ -105,40 +114,41 @@ export default function CompareView() {
         </p>
       </div>
 
-      <div className="flex flex-col gap-1">
-        {strategies.map((s) => (
-          <label
-            key={s.id}
-            className="flex items-center gap-2 rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs"
-          >
-            <input
-              type="checkbox"
+      <CompareSelectionBar
+        filter={filter}
+        onFilter={setFilter}
+        selectedCount={selected.size}
+        maxSelections={MAX_COMPARE_SELECTIONS}
+        minSelections={MIN_COMPARE_SELECTIONS}
+        hasResult={!!result}
+        running={compare.isPending}
+        onSelectAll={() => setSelected(new Set(selectAllEligible(selected, visible)))}
+        onInvert={() => setSelected(new Set(invertSelection(selected, visible)))}
+        onClear={() => setSelected(new Set())}
+        onRun={() => compare.mutate()}
+        onClearResult={() => qc.setQueryData(compareKey, null)}
+      />
+
+      {selected.size === 0 && (
+        <p className="rounded-[8px] border border-dashed border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--muted)]">
+          请从下方勾选 2–12 个策略后点「运行对比」。
+        </p>
+      )}
+
+      <div className="flex flex-col gap-1.5">
+        {visible.length === 0 ? (
+          <p className="px-1 py-2 text-[11px] text-[var(--muted)]">该分类暂无策略。</p>
+        ) : (
+          visible.map((s) => (
+            <CompareStrategyRow
+              key={s.id}
+              strategy={s}
               checked={selected.has(s.id)}
               disabled={s.unavailable || (!selected.has(s.id) && atSelectionLimit)}
-              onChange={() => toggle(s.id)}
-              className="h-3.5 w-3.5 accent-[var(--accent)]"
+              onToggle={toggle}
+              onOpenDetail={setDetail}
             />
-            <span className="flex-1 truncate text-[var(--text)]">{s.name}</span>
-            {s.kind === "combo" && <Badge tone="accent">组合</Badge>}
-            {s.builtin && <span className="text-[10px] text-[var(--muted)]">内置</span>}
-          </label>
-        ))}
-      </div>
-
-      <div className="flex items-center gap-2">
-        <Button
-          variant="primary"
-          size="sm"
-          disabled={selected.size < 2 || selected.size > MAX_COMPARE_SELECTIONS || compare.isPending}
-          onClick={() => compare.mutate()}
-        >
-          {compare.isPending ? "对比中…" : `运行对比（${selected.size}）`}
-        </Button>
-        {selected.size < 2 && (
-          <span className="text-[11px] text-[var(--muted)]">至少选择 2 个策略</span>
-        )}
-        {atSelectionLimit && (
-          <span className="text-[11px] text-[var(--muted)]">{MAX_COMPARE_SELECTION_MESSAGE}</span>
+          ))
         )}
       </div>
 
@@ -214,6 +224,15 @@ export default function CompareView() {
             左图按 净值/初始-1 归一化叠加各策略净值曲线，色块与表格对应。
           </p>
         </div>
+      )}
+
+      {detail && (
+        <StrategyDetailModal
+          strategy={detail}
+          strategies={strategies}
+          compareItem={result?.items.find((it) => it.strategyId === detail.id)}
+          onClose={() => setDetail(null)}
+        />
       )}
     </div>
   );

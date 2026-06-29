@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { colorForIndex, normalizeEquity, OVERLAY_COLORS, sortCompareItems } from "./compare";
-import type { CompareItem, Metrics } from "./types";
+import {
+  colorForIndex,
+  compareKindLabel,
+  filterCompareStrategies,
+  invertSelection,
+  isCompareEligible,
+  MAX_COMPARE_SELECTIONS,
+  normalizeEquity,
+  OVERLAY_COLORS,
+  selectAllEligible,
+  sortCompareItems,
+} from "./compare";
+import type { CompareItem, Metrics, Strategy, StrategyKind } from "./types";
 
 function metrics(p: Partial<Metrics>): Metrics {
   return {
@@ -84,5 +95,92 @@ describe("compare utils", () => {
     expect(colorForIndex(0)).toBe(OVERLAY_COLORS[0]);
     expect(colorForIndex(OVERLAY_COLORS.length)).toBe(OVERLAY_COLORS[0]);
     expect(colorForIndex(1)).toBe(colorForIndex(1 + OVERLAY_COLORS.length));
+  });
+});
+
+function strat(id: number, kind: StrategyKind, unavailable = false): Strategy {
+  return {
+    id,
+    templateKey: `t${id}`,
+    name: `策略${id}`,
+    description: "",
+    kind,
+    params: {},
+    paramsSchema: {},
+    enabled: true,
+    builtin: true,
+    unavailable,
+  };
+}
+
+describe("compare selection helpers", () => {
+  const list: Strategy[] = [
+    strat(1, "atomic"),
+    strat(2, "combo"),
+    strat(3, "factor"),
+    strat(4, "atomic", true), // unavailable
+  ];
+
+  it("isCompareEligible excludes unavailable strategies", () => {
+    expect(isCompareEligible(strat(1, "atomic"))).toBe(true);
+    expect(isCompareEligible(strat(4, "atomic", true))).toBe(false);
+  });
+
+  it("filterCompareStrategies: all is full set; combo is kind==combo; atomic includes factor", () => {
+    expect(filterCompareStrategies(list, "all").map((s) => s.id)).toEqual([1, 2, 3, 4]);
+    expect(filterCompareStrategies(list, "combo").map((s) => s.id)).toEqual([2]);
+    // atomic = kind !== "combo" → 原子 1/4 + 因子 3，因子可在「原子」标签下被发现
+    expect(filterCompareStrategies(list, "atomic").map((s) => s.id)).toEqual([1, 3, 4]);
+  });
+
+  it("selectAllEligible unions visible eligible into current and excludes unavailable", () => {
+    const result = selectAllEligible(new Set([2]), list);
+    // 并入可见可用项 1/3，排除 unavailable 4，保留已选的 2
+    expect(new Set(result)).toEqual(new Set([1, 2, 3]));
+    expect(result).not.toContain(4);
+  });
+
+  it("selectAllEligible clamps to cap by stable order keeping current first", () => {
+    const visible = Array.from({ length: 20 }, (_, i) => strat(i + 1, "atomic"));
+    const result = selectAllEligible(new Set([100]), visible, MAX_COMPARE_SELECTIONS);
+    expect(result.length).toBe(MAX_COMPARE_SELECTIONS);
+    // current 中不在 visible 的已选项（100）不被丢弃
+    expect(result).toContain(100);
+    expect(result[0]).toBe(100);
+  });
+
+  it("selectAllEligible does not drop current selections outside the visible filter", () => {
+    // 当前已选一个组合（在「原子」筛选下不可见），点「原子」标签的全选不应丢弃它
+    const atomicVisible = filterCompareStrategies(list, "atomic");
+    const result = selectAllEligible(new Set([2]), atomicVisible);
+    expect(result).toContain(2);
+  });
+
+  it("invertSelection inverts within visible eligible and keeps out-of-visible selections", () => {
+    const visible = [strat(1, "atomic"), strat(2, "atomic"), strat(3, "atomic")];
+    // current: 1（可见，反选移除）+ 9（可见外，保留）
+    const result = invertSelection(new Set([1, 9]), visible);
+    expect(new Set(result)).toEqual(new Set([9, 2, 3]));
+    expect(result).not.toContain(1);
+  });
+
+  it("invertSelection clamps to cap", () => {
+    const visible = Array.from({ length: 20 }, (_, i) => strat(i + 1, "atomic"));
+    const result = invertSelection(new Set(), visible, MAX_COMPARE_SELECTIONS);
+    expect(result.length).toBe(MAX_COMPARE_SELECTIONS);
+  });
+
+  it("selectAllEligible / invertSelection degrade to [] for empty or all-unavailable", () => {
+    expect(selectAllEligible(new Set(), [])).toEqual([]);
+    expect(selectAllEligible(new Set(), [strat(4, "atomic", true)])).toEqual([]);
+    expect(invertSelection(new Set(), [])).toEqual([]);
+    expect(invertSelection(new Set(), [strat(4, "atomic", true)])).toEqual([]);
+  });
+
+  it("compareKindLabel maps the three kinds", () => {
+    expect(compareKindLabel("atomic")).toBe("原子");
+    expect(compareKindLabel("combo")).toBe("组合");
+    expect(compareKindLabel("factor")).toBe("因子");
+    expect(compareKindLabel(undefined)).toBe("原子");
   });
 });
