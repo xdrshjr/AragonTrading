@@ -109,13 +109,19 @@ async def live_auto_group_start(body: LiveAutoGroupStartIn,
     if strategy_row is None:
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "策略不存在"})
     strategy_spec = build_paper_strategy_spec(strategy_row)
+    # 服务端为分组预算上限唯一权威（RN-1 / R3）：从 DB 读用户配置的总预算上限百分比，夹到分组运营天花板
+    # 得有效上限分数；留空默认 = 上限本身（不随成员数缩放）。**不**接受前端任何「上限」入参。
+    at_settings = await repo.get_auto_trade_settings(session)
+    cap_frac = min(at_settings["maxBudgetPct"] / 100.0, settings.live_auto_group_max_capital_frac)
     req = GroupStartRequest(
         strategy_spec=strategy_spec, bar=body.bar,
         members_in=[GroupMemberInput(inst_id=m.instId, allocation_pct=m.allocationPct)
                     for m in body.members],
         account_row=account_row, settings=settings, total_capital_usd=body.totalCapitalUsd,
         leverage=body.leverage, take_profit_usd=body.takeProfitUsd,
-        stop_loss_usd=body.stopLossUsd, priming=body.priming, priming_bars=body.primingBars)
+        stop_loss_usd=body.stopLossUsd, priming=body.priming, priming_bars=body.primingBars,
+        budget_cap_frac=cap_frac, default_budget_frac=cap_frac,
+        allocation_mode=body.allocationMode)
     try:
         group = await get_live_auto_manager().start_group(req)
     except LiveAutoGroupPreflightError as exc:

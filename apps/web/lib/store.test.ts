@@ -497,6 +497,7 @@ describe("app store — auto-trade group members (v20)", () => {
     useAppStore.setState({
       watchlist: ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"],
       autoTradeMembers: [],
+      autoTradeAllocationMode: "even",
       liveAutoGroup: null,
     });
   });
@@ -619,5 +620,54 @@ describe("app store — auto-trade group members (v20)", () => {
     const s = useAppStore.getState();
     expect(s.autoTradeMembers).toEqual([]);
     expect(s.instId).toBe("ETH-USDT-SWAP");
+  });
+});
+
+describe("app store — auto-trade allocation mode (v21)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({
+      watchlist: ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"],
+      autoTradeMembers: [],
+      autoTradeAllocationMode: "even",
+      liveAutoGroup: null,
+    });
+  });
+
+  it("setAutoTradeAllocationMode persists the preference", () => {
+    expect(useAppStore.getState().autoTradeAllocationMode).toBe("even");
+    useAppStore.getState().setAutoTradeAllocationMode("max_ratio");
+    expect(useAppStore.getState().autoTradeAllocationMode).toBe("max_ratio");
+    const persisted = JSON.parse(localStorage.getItem("aragon-ui") as string);
+    expect(persisted.state.autoTradeAllocationMode).toBe("max_ratio");
+  });
+
+  it("addAutoTradeMember uses the fixed conservative default in max_ratio mode", () => {
+    useAppStore.getState().setAutoTradeAllocationMode("max_ratio");
+    useAppStore.getState().addAutoTradeMember("BTC-USDT-SWAP");
+    useAppStore.getState().addAutoTradeMember("ETH-USDT-SWAP");
+    // 各标的独立默认 20%（不再按剩余额度 100/80…），合计可超 100。
+    expect(useAppStore.getState().autoTradeMembers.map((m) => m.allocationPct)).toEqual([20, 20]);
+  });
+
+  it("setAutoTradeAllocation in max_ratio clamps to [1,100] independent of others", () => {
+    useAppStore.getState().setAutoTradeAllocationMode("max_ratio");
+    useAppStore.setState({
+      autoTradeMembers: [
+        { instId: "BTC-USDT-SWAP", allocationPct: 80 },
+        { instId: "ETH-USDT-SWAP", allocationPct: 70 },
+      ],
+    });
+    useAppStore.getState().setAutoTradeAllocation("BTC-USDT-SWAP", 90);
+    expect(useAppStore.getState().autoTradeMembers[0].allocationPct).toBe(90); // not limited by ETH 70
+  });
+
+  it("migrates pre-v21 persisted state to v21 with allocationMode defaulting to even", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({ state: { instId: "ETH-USDT-SWAP" }, version: 20 }),
+    );
+    await useAppStore.persist.rehydrate();
+    expect(useAppStore.getState().autoTradeAllocationMode).toBe("even");
   });
 });

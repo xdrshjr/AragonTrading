@@ -72,10 +72,12 @@ export default function WatchlistTab({
   const bar = useAppStore((s) => s.bar);
   const strategyId = useAppStore((s) => s.strategyId);
   const autoTradeMembers = useAppStore((s) => s.autoTradeMembers);
+  const autoTradeAllocationMode = useAppStore((s) => s.autoTradeAllocationMode);
   const liveAutoGroup = useAppStore((s) => s.liveAutoGroup);
   const addAutoTradeMember = useAppStore((s) => s.addAutoTradeMember);
   const removeAutoTradeMember = useAppStore((s) => s.removeAutoTradeMember);
   const setAutoTradeAllocation = useAppStore((s) => s.setAutoTradeAllocation);
+  const setAutoTradeAllocationMode = useAppStore((s) => s.setAutoTradeAllocationMode);
   const evenSplitAutoTradeMembers = useAppStore((s) => s.evenSplitAutoTradeMembers);
   const setLiveAutoGroup = useAppStore((s) => s.setLiveAutoGroup);
   const setLiveAutoMemberStatus = useAppStore((s) => s.setLiveAutoMemberStatus);
@@ -138,6 +140,7 @@ export default function WatchlistTab({
     liveAutoEnabled,
     members: autoTradeMembers,
     running,
+    mode: autoTradeAllocationMode,
   });
 
   const startM = useMutation({
@@ -146,6 +149,7 @@ export default function WatchlistTab({
         strategyId: opts.strategyId,
         bar,
         members: autoTradeMembers,
+        allocationMode: autoTradeAllocationMode,
         totalCapitalUsd: opts.totalCapitalUsd,
         leverage: opts.leverage,
         takeProfitUsd: opts.takeProfitUsd,
@@ -244,6 +248,7 @@ export default function WatchlistTab({
         livePrice={livePrice}
         changePct={changePct}
         totalPct={totalPct}
+        allocationMode={autoTradeAllocationMode}
         running={running}
         submitting={startM.isPending || stopM.isPending}
         gateReason={gateReason}
@@ -251,6 +256,7 @@ export default function WatchlistTab({
         dropError={dropError}
         dragOver={dragOverZone === "auto"}
         onToggle={onToggle}
+        onAllocationModeChange={setAutoTradeAllocationMode}
         onEvenSplit={evenSplitAutoTradeMembers}
         onSelect={onSelect}
         onAllocationChange={setAutoTradeAllocation}
@@ -285,6 +291,7 @@ export default function WatchlistTab({
         acknowledged={acknowledged}
         onAcknowledge={setAcknowledged}
         members={autoTradeMembers}
+        mode={autoTradeAllocationMode}
         bar={bar}
         defaultStrategyId={strategyId}
         error={error}

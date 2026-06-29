@@ -8,11 +8,11 @@ from __future__ import annotations
 import asyncio
 
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.config import Settings, get_settings
 from app.db import repositories as repo
-from app.db.models import Strategy
+from app.db.models import AppSetting, Strategy
 from app.db.session import dispose_engine, get_sessionmaker, init_db
 from app.live_auto.manager import get_live_auto_manager
 
@@ -73,6 +73,7 @@ async def _fresh() -> int:
     async with sm() as session:
         for row in await repo.list_okx_accounts(session):
             await session.delete(row)
+        await session.execute(delete(AppSetting))   # R7：清自动交易设置，避免共享临时库串扰
         await session.commit()
         strategy_id = (await session.execute(
             select(Strategy.id).order_by(Strategy.id.asc()).limit(1))).scalar_one()
@@ -217,6 +218,46 @@ async def test_budget_clamped_to_hard_cap(monkeypatch):
                                   json=_start_body(strategy_id, capitalUsd=500.0))
             assert r.status_code == 200, r.text
             assert r.json()["budgetUsd"] == 50.0
+    finally:
+        get_live_auto_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_single_target_default_budget_unchanged(monkeypatch):
+    """RN-1 回归：单标的 /live-auto/start 留空预算 → budgetUsd == avail×1% = 10（不被分组天花板上调）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch_okx(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/live-auto/start", json=_start_body(strategy_id))
+            assert r.status_code == 200, r.text
+            assert r.json()["budgetUsd"] == 10.0
+    finally:
+        get_live_auto_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_group_start_respects_db_max_budget_pct(monkeypatch):
+    """服务端权威：DB maxBudgetPct=30 → 分组留空默认 = avail×30% = 300（不取前端任何上限）；allocationMode 透传。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch_okx(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            await client.put("/api/settings/auto-trade", json={"maxBudgetPct": 30})
+            body = {"strategyId": strategy_id, "bar": "1H",
+                    "members": [{"instId": "BTC-USDT-SWAP", "allocationPct": 100}],
+                    "allocationMode": "max_ratio"}
+            r = await client.post("/api/live-auto/group/start", json=body)
+            assert r.status_code == 200, r.text
+            assert r.json()["totalBudgetUsd"] == 300.0   # avail 1000 × 30%
     finally:
         get_live_auto_manager()._group = None
         app.dependency_overrides.clear()

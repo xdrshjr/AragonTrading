@@ -253,6 +253,21 @@ class FactorSet(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
+class AppSetting(Base):
+    """设置中心通用键值持久化（auto-trade-budget-and-allocation-settings §5.1）。
+
+    单行一个标量 / 对象设置（``value`` 为 JSON 编码），如 ``auto_trade.max_budget_pct``。
+    稀疏存储：无记录即默认（读取方负责回落默认值）。``create_all`` 自动建表、老库首次启动即补，
+    无数据迁移。为设置中心后续扩展（分配模式默认、最大比例默认等）留口。
+    """
+
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)   # e.g. "auto_trade.max_budget_pct"
+    value: Mapped[str] = mapped_column(Text, default="")             # JSON 编码标量 / 对象
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
 class CandleCache(Base):
     """OKX K 线本地缓存（降低调用、加速回测）。"""
 

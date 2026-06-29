@@ -248,31 +248,58 @@ class LiveAutoGroupMemberIn(BaseModel):
 
 
 class LiveAutoGroupStartIn(BaseModel):
-    """启动多标的自动交易分组请求（金额字段可留空→服务端保守默认，§4.1）。"""
+    """启动多标的自动交易分组请求（金额字段可留空→服务端保守默认，§4.1 / §4.2）。"""
 
     strategyId: int
     bar: str = "1H"
     members: list[LiveAutoGroupMemberIn]
     accountId: int | None = None                              # 省略=默认实盘账户
-    totalCapitalUsd: float | None = Field(default=None, gt=0)  # 留空→ min(avail×1%×成员数, avail×5%)（P1-1）
+    # 留空→服务端按 DB maxBudgetPct 派生默认（默认 100% = 全部可用余额，不随成员数缩放）。
+    totalCapitalUsd: float | None = Field(default=None, gt=0)
     leverage: float | None = Field(default=None, gt=0, le=125)
     takeProfitUsd: float | None = Field(default=None, gt=0)   # 分组总止盈；按 pct/Σpct 归一分摊（P1-2）
     stopLossUsd: float | None = Field(default=None, gt=0)     # 分组总止损；同上
+    # 分配模式（auto-trade-budget-and-allocation-settings §2.3）：even=份额（Σ≤100）；
+    # max_ratio=各标的对总预算的独立上限（Σ 可超 100）。省略=「even」（向后兼容）。
+    allocationMode: Literal["even", "max_ratio"] = "even"
     priming: bool = True
     primingBars: int = Field(default=300, ge=10, le=PAPER_WINDOW_MAX)
 
     @field_validator("members")
     @classmethod
     def _check_members(cls, members: list[LiveAutoGroupMemberIn]) -> list[LiveAutoGroupMemberIn]:
-        """边界校验（§5.1）：非空、instId 唯一、Σ allocationPct ≤ 100。"""
+        """边界校验（§5.1）：非空、instId 唯一（Σ 约束按 allocationMode 在 model_validator 决定）。"""
         if not members:
             raise ValueError("members 不可为空")
         inst_ids = [m.instId for m in members]
         if len(set(inst_ids)) != len(inst_ids):
             raise ValueError("members 含重复 instId")
-        if sum(m.allocationPct for m in members) > 100 + 1e-9:
-            raise ValueError("各标的可用仓位百分比之和不可超过 100%")
         return members
+
+    @model_validator(mode="after")
+    def _check_allocation_sum(self) -> "LiveAutoGroupStartIn":
+        """even 强制 Σ allocationPct ≤ 100；max_ratio 跳过 Σ 约束（各标的独立上限，可超 100%）。"""
+        if (self.allocationMode == "even"
+                and sum(m.allocationPct for m in self.members) > 100 + 1e-9):
+            raise ValueError("各标的可用仓位百分比之和不可超过 100%")
+        return self
+
+
+class AutoTradeSettingsIn(BaseModel):
+    """PUT /api/settings/auto-trade：总预算上限百分比（0<pct≤100，越界 422）。"""
+
+    maxBudgetPct: float = Field(gt=0, le=100)
+
+
+class AutoTradeSettingsOut(BaseModel):
+    """GET/PUT /api/settings/auto-trade 响应（§4.1）。
+
+    ``effectiveMaxBudgetPct`` 由路由按 ``settings.live_auto_group_max_capital_frac`` 计算注入
+    （= min(maxBudgetPct, 天花板×100)，RN-2 预览口径），不入库。
+    """
+
+    maxBudgetPct: float
+    effectiveMaxBudgetPct: float
 
 
 class LiveAutoGroupMemberRow(BaseModel):

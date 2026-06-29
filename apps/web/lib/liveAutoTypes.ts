@@ -108,10 +108,21 @@ export interface LiveAutoSnapshot {
 }
 
 // ---------------- 自选自动交易分组（watchlist-auto-trade-group §五）----------------
+// 分配模式（auto-trade-budget-and-allocation-settings §2.3）：even=份额切分（整组 Σ≤100）；
+// max_ratio=各标的对总预算的独立上限（互不影响，Σ 可超 100%）。默认 even（向后兼容）。
+export type AutoTradeAllocationMode = "even" | "max_ratio";
+
 // 自动交易成员（持久化偏好态）：标的 + 可用仓位百分比（watchlist 的有序子集）。
+// allocationPct 的语义随分组级 autoTradeAllocationMode 变化（不新增列，§5.2）。
 export interface AutoTradeMember {
   instId: string;
   allocationPct: number;
+}
+
+// 自动交易设置（设置中心 · 自动交易设置，§4.1）：总预算上限百分比 + 经分组运营天花板夹后的有效上限。
+export interface AutoTradeSettings {
+  maxBudgetPct: number;
+  effectiveMaxBudgetPct: number;
 }
 
 // 分组启动请求（金额字段可留空→服务端保守默认）。
@@ -119,6 +130,7 @@ export interface LiveAutoGroupStartReq {
   strategyId: number;
   bar: string;
   members: AutoTradeMember[];
+  allocationMode: AutoTradeAllocationMode;
   accountId?: number | null;
   totalCapitalUsd?: number | null;
   leverage?: number | null;

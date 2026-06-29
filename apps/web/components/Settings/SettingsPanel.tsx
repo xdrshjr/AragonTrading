@@ -6,6 +6,7 @@ import { useAppStore } from "@/lib/store";
 import AboutSection from "./AboutSection";
 import AgentToolsSection from "./AgentToolsSection";
 import AiModelsSection from "./AiModelsSection";
+import AutoTradeSettingsSection from "./AutoTradeSettingsSection";
 import OkxAccountsSection from "./OkxAccountsSection";
 import SettingsNav from "./SettingsNav";
 
@@ -59,6 +60,8 @@ export default function SettingsPanel() {
             <OkxAccountsSection />
           ) : section === "agent-tools" ? (
             <AgentToolsSection />
+          ) : section === "auto-trade" ? (
+            <AutoTradeSettingsSection />
           ) : section === "about" ? (
             <AboutSection />
           ) : (

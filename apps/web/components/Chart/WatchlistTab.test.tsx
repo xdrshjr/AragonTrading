@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { accountApi } from "@/lib/accountApi";
+import { autoTradeSettingsApi } from "@/lib/autoTradeSettingsApi";
 import { liveAutoGroupApi } from "@/lib/liveAutoGroupApi";
 import { type LiveAutoGroupState, useAppStore } from "@/lib/store";
 import type { Instrument } from "@/lib/types";
@@ -13,6 +14,9 @@ vi.mock("@/lib/liveAutoGroupApi", () => ({
 }));
 vi.mock("@/lib/accountApi", () => ({ accountApi: { accounts: { list: vi.fn() } } }));
 vi.mock("@/lib/tradingApi", () => ({ tradingApi: { config: vi.fn() } }));
+vi.mock("@/lib/autoTradeSettingsApi", () => ({
+  autoTradeSettingsApi: { get: vi.fn(), update: vi.fn() },
+}));
 vi.mock("@/lib/api", async (orig) => {
   const actual = (await orig()) as Record<string, unknown>;
   return {
@@ -62,10 +66,12 @@ beforeEach(() => {
     accountMode: "live", bar: "1H", strategyId: 1,
     watchlist: ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "ADA-USDT"],
     autoTradeMembers: [{ instId: "BTC-USDT-SWAP", allocationPct: 100 }],
+    autoTradeAllocationMode: "even",
     liveAutoGroup: null, liveAutoAcknowledged: false,
   });
   vi.mocked(accountApi.accounts.list).mockResolvedValue(READY_ACCOUNTS as never);
   vi.mocked(liveAutoGroupApi.status).mockResolvedValue({ group: null, liveAutoTradingEnabled: true });
+  vi.mocked(autoTradeSettingsApi.get).mockResolvedValue({ maxBudgetPct: 100, effectiveMaxBudgetPct: 100 });
 });
 afterEach(cleanup);
 
@@ -117,6 +123,41 @@ describe("WatchlistTab — gating", () => {
     useAppStore.setState({ accountMode: "sim" });
     renderTab();
     await waitFor(() => expect(screen.getByText(/请先切换到实盘账户模式/)).toBeTruthy());
+  });
+});
+
+describe("WatchlistTab — allocation mode", () => {
+  it("switches allocation mode via the segmented control and persists it", () => {
+    renderTab();
+    fireEvent.click(screen.getByRole("button", { name: "最大比例" }));
+    expect(useAppStore.getState().autoTradeAllocationMode).toBe("max_ratio");
+  });
+
+  it("max_ratio allows sum over 100 and starts with allocationMode in the request", async () => {
+    useAppStore.setState({
+      autoTradeAllocationMode: "max_ratio",
+      autoTradeMembers: [
+        { instId: "BTC-USDT-SWAP", allocationPct: 80 },
+        { instId: "ETH-USDT-SWAP", allocationPct: 70 },
+      ],
+      liveAutoAcknowledged: true,
+    });
+    vi.mocked(liveAutoGroupApi.start).mockResolvedValue({
+      groupId: "g1", strategyId: 1, strategyName: "s", strategyKind: "atomic", bar: "1H",
+      totalBudgetUsd: 100, leverage: 3, members: [],
+    } as never);
+    renderTab();
+    // 待账户 / 启用状态查询落定，守门清空（Σ=150 > 100 但 max_ratio 不拦截）→ 开关可点开弹窗。
+    await waitFor(() =>
+      expect(screen.queryByText(/未启用|默认实盘账户|实盘账户模式/)).toBeNull(),
+    );
+    fireEvent.click(screen.getByRole("switch", { name: "自动交易分组开关" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认并开始自动交易" }));
+    await waitFor(() =>
+      expect(liveAutoGroupApi.start).toHaveBeenCalledWith(
+        expect.objectContaining({ allocationMode: "max_ratio" }),
+      ),
+    );
   });
 });
 

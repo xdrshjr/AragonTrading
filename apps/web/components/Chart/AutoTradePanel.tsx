@@ -4,6 +4,7 @@ import clsx from "clsx";
 import { Switch } from "@/components/ui";
 import { LIVE_AUTO_MAX_GROUP_SYMBOLS } from "@/lib/autoTrade";
 import { colorForReturn, fmtMoney } from "@/lib/format";
+import type { AutoTradeAllocationMode } from "@/lib/liveAutoTypes";
 import type { LiveAutoGroupMemberState } from "@/lib/store";
 import type { Instrument } from "@/lib/types";
 import AutoTradeMemberRow from "./AutoTradeMemberRow";
@@ -22,6 +23,7 @@ interface AutoTradePanelProps {
   livePrice?: number | null;
   changePct?: number | null;
   totalPct: number;
+  allocationMode: AutoTradeAllocationMode;
   running: boolean;
   submitting: boolean;
   gateReason: string | null; // 非运行态的禁用原因（运行态恒可点以停止）
@@ -29,6 +31,7 @@ interface AutoTradePanelProps {
   dropError: string | null; // 拖入不可自动交易标的等的就地提示
   dragOver: boolean;
   onToggle: (next: boolean) => void;
+  onAllocationModeChange: (mode: AutoTradeAllocationMode) => void;
   onEvenSplit: () => void;
   onSelect: (instId: string) => void;
   onAllocationChange: (instId: string, pct: number) => void;
@@ -46,6 +49,7 @@ export default function AutoTradePanel({
   livePrice,
   changePct,
   totalPct,
+  allocationMode,
   running,
   submitting,
   gateReason,
@@ -53,6 +57,7 @@ export default function AutoTradePanel({
   dropError,
   dragOver,
   onToggle,
+  onAllocationModeChange,
   onEvenSplit,
   onSelect,
   onAllocationChange,
@@ -63,7 +68,8 @@ export default function AutoTradePanel({
   onDragLeave,
   onDrop,
 }: AutoTradePanelProps) {
-  const overLimit = totalPct > 100 + 1e-9;
+  // even 模式 Σ>100 才算超限（红）；max_ratio 各标的为独立上限、合计可超 100%，不标红。
+  const overLimit = allocationMode === "even" && totalPct > 100 + 1e-9;
   // 运行态恒可点（停止）；停止态由 gateReason 决定能否启动（含空成员 / 和超限 / 0% 成员）。
   const blocked = !running && !!gateReason;
 
@@ -108,22 +114,36 @@ export default function AutoTradePanel({
           </div>
         </div>
 
+        <div className="flex items-center justify-between gap-2">
+          <ModeToggle mode={allocationMode} disabled={running} onChange={onAllocationModeChange} />
+          {allocationMode === "even" && (
+            <button
+              type="button"
+              onClick={onEvenSplit}
+              disabled={running || members.length === 0}
+              className="rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:opacity-40"
+            >
+              均分
+            </button>
+          )}
+        </div>
+
         <div className="flex items-center justify-between gap-2 text-[10px]">
-          <span className="tabular text-[var(--muted)]">
-            已分配{" "}
-            <span className={clsx("font-semibold", overLimit ? "text-[var(--short)]" : "text-[var(--text)]")}>
-              {Math.round(totalPct * 100) / 100}%
+          {allocationMode === "even" ? (
+            <span className="tabular text-[var(--muted)]">
+              已分配{" "}
+              <span className={clsx("font-semibold", overLimit ? "text-[var(--short)]" : "text-[var(--text)]")}>
+                {Math.round(totalPct * 100) / 100}%
+              </span>
+              /100% · {members.length}/{LIVE_AUTO_MAX_GROUP_SYMBOLS}
             </span>
-            /100% · {members.length}/{LIVE_AUTO_MAX_GROUP_SYMBOLS}
-          </span>
-          <button
-            type="button"
-            onClick={onEvenSplit}
-            disabled={running || members.length === 0}
-            className="rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:opacity-40"
-          >
-            平均分配
-          </button>
+          ) : (
+            <span className="tabular text-[var(--muted)]">
+              合计上限{" "}
+              <span className="font-semibold text-[var(--text)]">{Math.round(totalPct * 100) / 100}%</span>
+              （各标的独立）· {members.length}/{LIVE_AUTO_MAX_GROUP_SYMBOLS}
+            </span>
+          )}
         </div>
 
         {/* 禁用 / 拖入错误就地可见原因（HCI：避免守门被误判为「按钮坏了」）。 */}
@@ -161,5 +181,48 @@ export default function AutoTradePanel({
         )}
       </div>
     </section>
+  );
+}
+
+// 分配模式切换（segmented）：平均分配（even，份额切分）/ 最大比例（max_ratio，各标的独立上限）。
+const MODE_LABELS: Record<AutoTradeAllocationMode, string> = {
+  even: "平均分配",
+  max_ratio: "最大比例",
+};
+
+function ModeToggle({
+  mode,
+  disabled,
+  onChange,
+}: {
+  mode: AutoTradeAllocationMode;
+  disabled: boolean;
+  onChange: (mode: AutoTradeAllocationMode) => void;
+}) {
+  return (
+    <div
+      role="group"
+      aria-label="分配模式"
+      className="flex items-center gap-0.5 rounded-md bg-[var(--surface-2)] p-0.5"
+    >
+      {(Object.keys(MODE_LABELS) as AutoTradeAllocationMode[]).map((m) => (
+        <button
+          key={m}
+          type="button"
+          disabled={disabled}
+          aria-pressed={mode === m}
+          onClick={() => onChange(m)}
+          className={clsx(
+            "rounded px-2 py-0.5 text-[10px] font-medium transition-colors",
+            mode === m
+              ? "bg-[var(--surface)] text-[var(--text)] shadow-sm"
+              : "text-[var(--muted)] hover:text-[var(--text)]",
+            disabled && "cursor-not-allowed opacity-50",
+          )}
+        >
+          {MODE_LABELS[m]}
+        </button>
+      ))}
+    </div>
   );
 }

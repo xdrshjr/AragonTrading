@@ -63,8 +63,16 @@ class Settings(BaseSettings):
     live_auto_max_sessions: int = 1              # （已弃用）旧「单会话独占」语义，现由单活跃分组取代
     # 单个活跃自动交易分组内的标的数硬上限（真实资金多标的并发的封顶护栏，R1/R6；前端拖入超限即拒绝）。
     live_auto_max_group_symbols: int = 8
-    live_auto_default_capital_frac: float = 0.01  # 预算留空时取可用 USDT 的 1%（保守默认）
-    live_auto_max_capital_frac: float = 0.05     # 预算对可用余额硬上限（前置门禁强制夹紧，R4）
+    # 单标的旧路径留空默认（取可用 USDT 的 1%，保守）；分组路径不引用它（分组留空默认 = 上限本身）。
+    live_auto_default_capital_frac: float = 0.01
+    # 单标的旧路径绝对天花板（前置门禁强制夹紧，R4）。**保持 0.05 不变**——分组天花板见下一字段。
+    live_auto_max_capital_frac: float = 0.05
+    # 分组路径运营天花板（auto-trade-budget-and-allocation-settings RN-1）：默认 1.0 = 不额外限制；
+    # 运营可经 env LIVE_AUTO_GROUP_MAX_CAPITAL_FRAC 收紧（如生产设 0.2 强制分组 ≤ 20%，无视前端配置）。
+    # 与「自动交易设置 · 总预算上限百分比」取 min 得分组有效上限分数；服务端权威，前端不可越过。
+    live_auto_group_max_capital_frac: float = 1.0
+    # max_ratio（最大比例）分配模式下新增成员的保守默认上限百分比（前端 store 同名常量与之对齐）。
+    live_auto_default_max_ratio_pct: float = 20.0
     live_auto_poll_interval_s: int = 5           # 持仓 reconcile / 会话盯市轮询基准间隔（秒，hardening H1 接线）
     # ---- 加固增强（live-auto-trading-hardening）：独立盯市循环 + 容错 + 看门狗（H1/H2/H3/H4）----
     # 行情停滞看门狗阈值 = bar_seconds × 该系数；超阈推降级 status（默认仅告警不平仓）。

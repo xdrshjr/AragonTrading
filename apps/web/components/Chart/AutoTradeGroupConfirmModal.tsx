@@ -6,6 +6,7 @@ import { Badge, Button, Modal, Select } from "@/components/ui";
 import { api } from "@/lib/api";
 import {
   clampGroupBudgetToCap,
+  DEFAULT_AUTO_TRADE_MAX_BUDGET_PCT,
   deriveGroupDefaultBudget,
   groupBudgetCap,
   isAutoTradable,
@@ -13,6 +14,7 @@ import {
   memberBudget,
   totalAllocation,
 } from "@/lib/autoTrade";
+import { autoTradeSettingsApi } from "@/lib/autoTradeSettingsApi";
 import { fmtPrice } from "@/lib/format";
 import {
   LIVE_AUTO_DEFAULT_LEVERAGE,
@@ -20,7 +22,7 @@ import {
   parseOptionalLeverage,
   parseOptionalUsd,
 } from "@/lib/liveAuto";
-import type { AutoTradeMember } from "@/lib/liveAutoTypes";
+import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
 import { tradingApi } from "@/lib/tradingApi";
 
 export interface AutoTradeGroupConfirmOpts {
@@ -43,6 +45,7 @@ export default function AutoTradeGroupConfirmModal({
   acknowledged,
   onAcknowledge,
   members,
+  mode,
   bar,
   defaultStrategyId,
   error,
@@ -54,6 +57,7 @@ export default function AutoTradeGroupConfirmModal({
   acknowledged: boolean;
   onAcknowledge: (value: boolean) => void;
   members: AutoTradeMember[];
+  mode: AutoTradeAllocationMode;
   bar: string;
   defaultStrategyId: number | null;
   error?: string | null;
@@ -65,6 +69,13 @@ export default function AutoTradeGroupConfirmModal({
   const [stopLossRaw, setStopLossRaw] = useState("");
 
   const strategiesQ = useQuery({ queryKey: ["strategies"], queryFn: api.strategies });
+  const settingsQ = useQuery({
+    queryKey: ["settings", "auto-trade"],
+    queryFn: autoTradeSettingsApi.get,
+    enabled: open,
+  });
+  // 预览一律用 effectiveMaxBudgetPct（已含分组运营天花板，RN-2）；未读到时兜底默认 100%。
+  const maxBudgetPct = settingsQ.data?.effectiveMaxBudgetPct ?? DEFAULT_AUTO_TRADE_MAX_BUDGET_PCT;
   const firstInst = members[0]?.instId;
   const configQ = useQuery({
     queryKey: ["trading", "config", firstInst, null],
@@ -96,17 +107,20 @@ export default function AutoTradeGroupConfirmModal({
   const inputError = capital.error || leverage.error || takeProfit.error || stopLoss.error || null;
   const sumPct = totalAllocation(members);
   const usingDefault = capital.value == null;
+  // max_ratio 下各标的为独立上限，Σ 可超 100% → 同时触发可能令组合敞口超过总预算（超额订阅提示）。
+  const oversubscribed = mode === "max_ratio" && sumPct > 100 + 1e-9;
 
-  // 生效总预算预览：填值按硬上限夹紧；留空展示随成员数缩放的默认（P1-1），最终以服务端回执为准。
+  // 生效总预算预览：填值按硬上限夹紧；留空展示默认（可用余额 × maxBudgetPct%，不随成员数缩放），
+  // 最终以服务端回执为准。预览口径统一用 effectiveMaxBudgetPct（含运营天花板）。
   const previewTotal = useMemo(() => {
     if (availUsdt == null) return null;
-    const raw = capital.value ?? deriveGroupDefaultBudget(availUsdt, members.length);
-    return clampGroupBudgetToCap(raw, availUsdt);
-  }, [availUsdt, capital.value, members.length]);
+    const raw = capital.value ?? deriveGroupDefaultBudget(availUsdt, maxBudgetPct);
+    return clampGroupBudgetToCap(raw, availUsdt, maxBudgetPct);
+  }, [availUsdt, capital.value, maxBudgetPct]);
 
-  // 填值超过可用余额 5% 硬上限时，previewTotal 会被静默夹回上限——显式回显「已夹紧」，避免用户误以为输入未生效。
-  const budgetCap = groupBudgetCap(availUsdt);
-  const isClamped = isGroupBudgetClamped(capital.value, availUsdt);
+  // 填值超过硬上限时，previewTotal 会被静默夹回上限——显式回显「已夹紧」，避免用户误以为输入未生效。
+  const budgetCap = groupBudgetCap(availUsdt, maxBudgetPct);
+  const isClamped = isGroupBudgetClamped(capital.value, availUsdt, maxBudgetPct);
 
   const hasUnsupported = members.some((m) => !isAutoTradable(m.instId));
   const ready = !inputError && acknowledged && strategyId != null && members.length > 0 && !hasUnsupported;
@@ -164,9 +178,9 @@ export default function AutoTradeGroupConfirmModal({
           <Row
             label={
               usingDefault
-                ? "默认总预算（随成员数缩放）"
+                ? `默认总预算（可用余额 × ${maxBudgetPct}%）`
                 : isClamped
-                  ? "生效总预算（预览 · 已按 5% 上限夹紧）"
+                  ? `生效总预算（预览 · 已按 ${maxBudgetPct}% 上限夹紧）`
                   : "生效总预算（预览）"
             }
             value={previewTotal != null ? `${fmtPrice(previewTotal)} USDT` : "—"}
@@ -182,7 +196,7 @@ export default function AutoTradeGroupConfirmModal({
         <div className="overflow-hidden rounded-md border border-[var(--border)]">
           <div className="flex items-center justify-between bg-[var(--surface-2)] px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
             <span>标的</span>
-            <span>百分比 · 预算预览</span>
+            <span>{mode === "max_ratio" ? "上限 · 预算预览" : "百分比 · 预算预览"}</span>
           </div>
           {members.map((m) => (
             <div
@@ -213,9 +227,28 @@ export default function AutoTradeGroupConfirmModal({
           每笔交易另自带策略止盈止损（交易所侧 OCO，进程退出后仍兜底）。
         </p>
         <p className="text-[11px] leading-relaxed text-[var(--muted)]">
-          以下均可留空（留空即用保守内置默认）；总预算硬上限为可用余额的 5%，超出将被服务端自动夹紧。已分配{" "}
-          <span className="font-medium text-[var(--text)]">{Math.round(sumPct * 100) / 100}%</span>/100%。
+          以下均可留空（留空即用默认）；总预算硬上限为可用余额的{" "}
+          <span className="font-medium text-[var(--text)]">{maxBudgetPct}%</span>
+          （可在设置中心 · 自动交易设置调整），超出将被服务端自动夹紧。
+          {mode === "even" ? (
+            <>
+              {" "}已分配{" "}
+              <span className="font-medium text-[var(--text)]">{Math.round(sumPct * 100) / 100}%</span>/100%。
+            </>
+          ) : (
+            <>
+              {" "}各标的为独立上限，合计{" "}
+              <span className="font-medium text-[var(--text)]">{Math.round(sumPct * 100) / 100}%</span>
+              （可超 100%）。
+            </>
+          )}
         </p>
+        {oversubscribed && (
+          <p className="rounded-md border border-[var(--warning,#d97706)] bg-[var(--surface-2)] px-2.5 py-2 text-[11px] leading-relaxed text-[var(--warning,#d97706)]">
+            各标的上限合计 {Math.round(sumPct * 100) / 100}%（&gt; 100%）：多标的同时触发时组合敞口可能超过总预算，
+            真实敞口仍受单笔名义上限与保证金兜底约束。
+          </p>
+        )}
 
         <div className="grid grid-cols-2 gap-3">
           <Field
@@ -226,7 +259,7 @@ export default function AutoTradeGroupConfirmModal({
             disabled={submitting}
             hint={
               isClamped && capital.value != null
-                ? `输入 ${fmtPrice(capital.value)} 超过可用余额 5% 上限（${fmtPrice(budgetCap)} USDT），已按上限 ${fmtPrice(budgetCap)} 计算`
+                ? `输入 ${fmtPrice(capital.value)} 超过可用余额 ${maxBudgetPct}% 上限（${fmtPrice(budgetCap)} USDT），已按上限 ${fmtPrice(budgetCap)} 计算`
                 : undefined
             }
           />

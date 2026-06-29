@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.config import Settings, get_settings
 from app.db import repositories as repo
-from app.db.models import Strategy, StrategyRun
+from app.db.models import AppSetting, Strategy, StrategyRun
 from app.db.session import dispose_engine, get_sessionmaker, init_db
 from app.live_auto.manager import (
     GroupMemberInput,
@@ -85,14 +85,17 @@ async def _fresh() -> int:
     async with sm() as session:
         for row in await repo.list_okx_accounts(session):
             await session.delete(row)
+        await session.execute(delete(AppSetting))   # R7：清自动交易设置，避免共享临时库串扰
         await session.commit()
         return (await session.execute(
             select(Strategy.id).order_by(Strategy.id.asc()).limit(1))).scalar_one()
 
 
-def _override(app, *, auto: bool = True, live: bool = True) -> None:
+def _override(app, *, auto: bool = True, live: bool = True,
+              group_cap_frac: float = 1.0) -> None:
     app.dependency_overrides[get_settings] = lambda: Settings(
-        live_trading_enabled=live, live_auto_trading_enabled=auto)
+        live_trading_enabled=live, live_auto_trading_enabled=auto,
+        live_auto_group_max_capital_frac=group_cap_frac)
 
 
 async def _client(app) -> AsyncClient:
@@ -126,15 +129,21 @@ def _group_body(strategy_id: int, members, **over) -> dict:
     return body
 
 
-# ---------------- 纯函数：默认预算缩放（P1-1）与止盈止损归一分摊（P1-2）----------------
-def test_resolve_budget_group_scales_with_member_count():
-    s = Settings(live_trading_enabled=True, live_auto_trading_enabled=True)
-    # 留空 + 3 成员：min(1000×1%×3, 1000×5%) = min(30, 50) = 30
-    assert LiveAutoManager._resolve_budget_group(None, 1000.0, 3, s) == 30.0
-    # N=1 回退到单标的旧默认 avail×1% = 10
-    assert LiveAutoManager._resolve_budget_group(None, 1000.0, 1, s) == 10.0
-    # 非空按硬上限夹紧：500 → min(500, 50) = 50
-    assert LiveAutoManager._resolve_budget_group(500.0, 1000.0, 3, s) == 50.0
+# ---------------- 纯函数：参数化预算解析（RN-1）与止盈止损归一分摊（P1-2）----------------
+def test_resolve_budget_group_parametrized_no_member_scaling():
+    """新签名 (capital_usd, avail, cap_frac, default_frac)：留空=avail×default_frac、非空夹 avail×cap_frac，
+    **不随成员数缩放**（RN-5：删除旧 member_count 缩放断言）。"""
+    f = LiveAutoManager._resolve_budget_group
+    # 分组默认（cap=default=1.0）：留空 → 全额可用余额；非空超上限 → 夹到 avail
+    assert f(None, 1000.0, 1.0, 1.0) == 1000.0
+    assert f(5000.0, 1000.0, 1.0, 1.0) == 1000.0
+    assert f(300.0, 1000.0, 1.0, 1.0) == 300.0
+    # 分组天花板收紧到 20%（cap=default=0.2）：留空与硬上限同为 avail×0.2
+    assert f(None, 1000.0, 0.2, 0.2) == 200.0
+    assert f(5000.0, 1000.0, 0.2, 0.2) == 200.0
+    # RN-1 回归：单标的旧路径分数（cap=0.05 / default=0.01）→ 留空 1% / 填值夹 5%，行为逐位不变
+    assert f(None, 1000.0, 0.05, 0.01) == 10.0
+    assert f(500.0, 1000.0, 0.05, 0.01) == 50.0
 
 
 def test_scale_threshold_normalizes_by_sum_pct():
@@ -160,6 +169,19 @@ def test_validate_members_boundaries():
     assert over.value.code == "LIVE_AUTO_ALLOCATION_INVALID"
     with pytest.raises(LiveAutoGroupTooLargeError):
         mgr._validate_members([GroupMemberInput(f"X{i}-USDT-SWAP", 5) for i in range(9)], s)
+
+
+def test_validate_members_max_ratio_allows_sum_over_100():
+    mgr = LiveAutoManager()
+    s = Settings(live_trading_enabled=True, live_auto_trading_enabled=True)
+    members = [GroupMemberInput("A-USDT-SWAP", 80), GroupMemberInput("B-USDT-SWAP", 70)]  # Σ=150
+    # even 模式拒绝 Σ>100
+    with pytest.raises(LiveAutoAllocationError):
+        mgr._validate_members(members, s, "even")
+    # max_ratio 模式放行（各标的独立上限）；其余闸（单成员 (0,100]）仍生效
+    assert len(mgr._validate_members(members, s, "max_ratio")) == 2
+    with pytest.raises(LiveAutoAllocationError):
+        mgr._validate_members([GroupMemberInput("A-USDT-SWAP", 120)], s, "max_ratio")
 
 
 # ---------------- 集成：分组 start / 预算分摊 / 门禁聚合 / 独占 / 停止 ----------------
@@ -312,6 +334,72 @@ async def test_group_take_profit_split(monkeypatch):
             assert tp["BTC-USDT-SWAP"] == 32.0
             assert tp["ETH-USDT-SWAP"] == 24.0
             assert tp["SOL-USDT-SWAP"] == 24.0
+    finally:
+        get_live_auto_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_group_max_ratio_sum_over_100_allowed_default_full_budget(monkeypatch):
+    """max_ratio 下 Σ=150 放行；默认 maxBudgetPct=100 + 留空 → 总预算 = 全额可用余额（不随成员数缩放）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch_okx(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            members = [("BTC-USDT-SWAP", 80), ("ETH-USDT-SWAP", 70)]   # Σ=150
+            r = await client.post("/api/live-auto/group/start",
+                                  json=_group_body(strategy_id, members, allocationMode="max_ratio"))
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["totalBudgetUsd"] == 1000.0   # 全额 avail（默认 100%、不缩放）
+            by_inst = {m["instId"]: m for m in body["members"]}
+            assert by_inst["BTC-USDT-SWAP"]["budgetUsd"] == 800.0   # 1000 × 80%
+            assert by_inst["ETH-USDT-SWAP"]["budgetUsd"] == 700.0   # 1000 × 70%（合计 > 总预算，超额订阅）
+    finally:
+        get_live_auto_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_group_even_sum_over_100_rejected_422(monkeypatch):
+    """even 模式 Σ=150 → schema model_validator 422（VALIDATION_ERROR）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch_okx(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            members = [("BTC-USDT-SWAP", 80), ("ETH-USDT-SWAP", 70)]   # Σ=150，默认 even
+            r = await client.post("/api/live-auto/group/start",
+                                  json=_group_body(strategy_id, members))
+            assert r.status_code == 422, r.text
+            assert r.json()["error"]["code"] == "VALIDATION_ERROR"
+            assert get_live_auto_manager()._group is None
+    finally:
+        get_live_auto_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_group_budget_clamped_by_group_ceiling(monkeypatch):
+    """分组运营天花板 0.2 → 即便 maxBudgetPct=100，留空默认 / 上限均为 avail×20% = 200（RN-2 服务端权威）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app, group_cap_frac=0.2)
+    _patch_okx(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            members = [("BTC-USDT-SWAP", 100)]
+            # 填 900 > 上限 200 → 夹到 200
+            r = await client.post("/api/live-auto/group/start",
+                                  json=_group_body(strategy_id, members, totalCapitalUsd=900))
+            assert r.status_code == 200, r.text
+            assert r.json()["totalBudgetUsd"] == 200.0
     finally:
         get_live_auto_manager()._group = None
         app.dependency_overrides.clear()

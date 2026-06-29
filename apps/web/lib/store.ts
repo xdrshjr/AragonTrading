@@ -19,7 +19,12 @@ import type {
   Trade,
   WalkForwardResult,
 } from "./types";
-import type { AutoTradeMember, LiveAutoEvent, LiveAutoStatus } from "./liveAutoTypes";
+import type {
+  AutoTradeAllocationMode,
+  AutoTradeMember,
+  LiveAutoEvent,
+  LiveAutoStatus,
+} from "./liveAutoTypes";
 import { clampAllocationOnEdit, defaultAllocationOnAdd, evenSplit } from "./autoTrade";
 
 type Theme = "light" | "dark";
@@ -113,6 +118,9 @@ interface AppState {
   // 自选自动交易分组（watchlist-auto-trade-group）：autoTradeMembers 为持久化偏好态（watchlist 的有序
   // 子集 + 各自百分比）；liveAutoGroup 为瞬态运行期态（刷新由 GET /live-auto/group/status 重发现）。
   autoTradeMembers: AutoTradeMember[];
+  // 分配模式偏好（auto-trade-budget-and-allocation-settings §5.2，持久化，默认 "even"）：决定成员
+  // 百分比的夹取 / 默认语义与守门口径；max_ratio 下各标的为独立上限（Σ 可超 100）。
+  autoTradeAllocationMode: AutoTradeAllocationMode;
   liveAutoGroup: LiveAutoGroupState | null;
   theme: Theme;
   backtestStartTs: number;
@@ -178,6 +186,7 @@ interface AppState {
   addAutoTradeMember: (instId: string) => void;
   removeAutoTradeMember: (instId: string) => void;
   setAutoTradeAllocation: (instId: string, pct: number) => void;
+  setAutoTradeAllocationMode: (mode: AutoTradeAllocationMode) => void;
   evenSplitAutoTradeMembers: () => void;
   reorderAutoTradeMembers: (fromIndex: number, toIndex: number) => void;
   // 自动交易分组运行期态（瞬态）：整组写入 / 成员事件路由 / 清理。
@@ -291,6 +300,7 @@ export const useAppStore = create<AppState>()(
       liveAutoAcknowledged: false,
       // 自动交易分组：成员持久化（默认空，老用户自动交易区初始为空）；运行期态瞬态（刷新复位）。
       autoTradeMembers: [],
+      autoTradeAllocationMode: "even",
       liveAutoGroup: null,
       theme: "light",
       backtestStartTs: defaultStartTs,
@@ -408,7 +418,7 @@ export const useAppStore = create<AppState>()(
           liveAutoPosition: null,
           liveAutoEvents: [],
         }),
-      // 自动交易成员（持久化）：加入仅当已在自选且未重复，按剩余额度给默认百分比（§2.3）。
+      // 自动交易成员（持久化）：加入仅当已在自选且未重复，按当前分配模式给默认百分比（§2.3）。
       addAutoTradeMember: (instId) =>
         set((s) =>
           !s.watchlist.includes(instId) || s.autoTradeMembers.some((m) => m.instId === instId)
@@ -416,21 +426,37 @@ export const useAppStore = create<AppState>()(
             : {
                 autoTradeMembers: [
                   ...s.autoTradeMembers,
-                  { instId, allocationPct: defaultAllocationOnAdd(s.autoTradeMembers) },
+                  {
+                    instId,
+                    allocationPct: defaultAllocationOnAdd(
+                      s.autoTradeMembers,
+                      s.autoTradeAllocationMode,
+                    ),
+                  },
                 ],
               },
         ),
       removeAutoTradeMember: (instId) =>
         set((s) => ({ autoTradeMembers: s.autoTradeMembers.filter((m) => m.instId !== instId) })),
-      // 手改百分比：夹取到 [1, 100 − Σ其余]（纯函数，杜绝和超限）。
+      // 手改百分比：按当前模式夹取（even → [1, 100 − Σ其余]；max_ratio → [1, 100]，各自独立）。
       setAutoTradeAllocation: (instId, pct) =>
         set((s) => ({
           autoTradeMembers: s.autoTradeMembers.map((m) =>
             m.instId === instId
-              ? { ...m, allocationPct: clampAllocationOnEdit(s.autoTradeMembers, instId, pct) }
+              ? {
+                  ...m,
+                  allocationPct: clampAllocationOnEdit(
+                    s.autoTradeMembers,
+                    instId,
+                    pct,
+                    s.autoTradeAllocationMode,
+                  ),
+                }
               : m,
           ),
         })),
+      // 切换分配模式（持久化偏好）：仅改模式；既有成员值保留，后续编辑 / 默认随新模式生效（§2.4-2）。
+      setAutoTradeAllocationMode: (autoTradeAllocationMode) => set({ autoTradeAllocationMode }),
       evenSplitAutoTradeMembers: () =>
         set((s) => ({ autoTradeMembers: evenSplit(s.autoTradeMembers) })),
       reorderAutoTradeMembers: (fromIndex, toIndex) =>
@@ -567,7 +593,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 20,
+      version: 21,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -592,6 +618,7 @@ export const useAppStore = create<AppState>()(
         // 自动交易成员（偏好态，持久化）；liveAutoGroup 为运行期瞬态，**不**入 partialize（刷新由
         // GET /live-auto/group/status 重发现）。
         autoTradeMembers: s.autoTradeMembers,
+        autoTradeAllocationMode: s.autoTradeAllocationMode,
         instSidebarTab: s.instSidebarTab,
         chartSplitRatio: s.chartSplitRatio,
         rightPanelWidth: s.rightPanelWidth,
@@ -687,6 +714,10 @@ export const useAppStore = create<AppState>()(
           // 自选自动交易分组：补持久化 autoTradeMembers 默认（老用户自动交易区初始为空，自选不变）；
           // liveAutoGroup 为瞬态（不入 partialize），浅合并回落 null 即可。
           next = { ...next, autoTradeMembers: [] };
+        }
+        if (version < 21) {
+          // 自动交易分配模式：补默认 "even"（老用户行为不变；max_ratio 为新增可选模式）。
+          next = { ...next, autoTradeAllocationMode: "even" };
         }
         return next as never;
       },

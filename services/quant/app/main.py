@@ -16,6 +16,7 @@ from .agent.manager import get_agent_manager
 from .api import (
     accounts,
     agent,
+    app_settings,
     factors,
     live_auto,
     market,
@@ -114,7 +115,8 @@ app.include_router(agent.router, prefix="/api")
 app.include_router(accounts.router, prefix="/api")
 app.include_router(trading.router, prefix="/api")
 app.include_router(factors.router, prefix="/api")   # 第 9 个路由（因子层 §3.1）
-app.include_router(live_auto.router, prefix="/api")  # 实时自动交易（live-auto-trading §4）
+app.include_router(live_auto.router, prefix="/api")  # 第 10 个路由（实时自动交易，live-auto-trading §4）
+app.include_router(app_settings.router, prefix="/api")  # 第 11 个路由（设置中心 · 自动交易设置 §4.1）
 
 
 @app.get("/")

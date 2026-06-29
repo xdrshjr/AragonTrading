@@ -79,7 +79,13 @@ class GroupMemberInput:
 
 @dataclass
 class GroupStartRequest:
-    """`start_group` 聚合形参（P2-2：避免位置堆参，满足 CLAUDE.md ≤5 形参）。"""
+    """`start_group` 聚合形参（P2-2：避免位置堆参，满足 CLAUDE.md ≤5 形参）。
+
+    `budget_cap_frac` / `default_budget_frac` / `allocation_mode` 由各入口解析后填入
+    （auto-trade-budget-and-allocation-settings RN-1）：分组路由按 DB maxBudgetPct 夹分组天花板，
+    单标的兼容 wrapper 传旧 0.05 / 0.01 → 单标的行为逐位不变。默认值取分组语义（上限 100% / 留空=上限 /
+    even），使直接构造的请求与分组面板默认一致。
+    """
 
     strategy_spec: object
     bar: str
@@ -92,6 +98,9 @@ class GroupStartRequest:
     stop_loss_usd: float | None = None
     priming: bool = True
     priming_bars: int = 300
+    budget_cap_frac: float = 1.0       # 预算硬上限分数（avail×该值），由入口解析
+    default_budget_frac: float = 1.0   # 留空默认分数（avail×该值），分组路径 = 上限本身
+    allocation_mode: str = "even"      # even | max_ratio（§2.3）
 
 
 @dataclass
@@ -156,11 +165,11 @@ class LiveAutoManager:
         self._require_enabled(req.settings)
         async with self._start_lock:
             self._require_capacity()
-            members = self._validate_members(req.members_in, req.settings)
+            members = self._validate_members(req.members_in, req.settings, req.allocation_mode)
             creds = _creds(req.account_row)
             avail, positions, configs = await self._gather_context(creds, req, members)
             total = self._resolve_budget_group(
-                req.total_capital_usd, avail, len(members), req.settings)
+                req.total_capital_usd, avail, req.budget_cap_frac, req.default_budget_frac)
             lever = req.leverage or req.settings.live_default_leverage
             plans = self._preflight_group(members, configs, positions, total, lever)
             group = await self._build_group(req, creds, plans, total, lever)
@@ -168,8 +177,14 @@ class LiveAutoManager:
             return await self._launch_group_or_rollback(group)
 
     def _validate_members(self, members_in: list[GroupMemberInput],
-                          settings: Settings) -> list[GroupMemberInput]:
-        """容量 / 百分比 / 去重边界校验（边界一次性校验，进入内部即信任，§五）。"""
+                          settings: Settings,
+                          mode: str = "even") -> list[GroupMemberInput]:
+        """容量 / 百分比 / 去重边界校验（边界一次性校验，进入内部即信任，§五）。
+
+        `mode == "even"` 强制 Σ allocationPct ≤ 100；`mode == "max_ratio"` 跳过 Σ 校验
+        （各标的对总预算的独立上限，可超 100%，§2.3）。其余闸（非空 / 去重 / 超标的数上限 /
+        单成员 ∈ (0,100]）两模式一致。
+        """
         if not members_in:
             raise LiveAutoAllocationError("LIVE_AUTO_GROUP_EMPTY", "自动交易分组为空", 400)
         seen: set[str] = set()
@@ -181,7 +196,7 @@ class LiveAutoManager:
         if any(not (0 < m.allocation_pct <= 100) for m in unique):
             raise LiveAutoAllocationError(
                 "LIVE_AUTO_ALLOCATION_INVALID", "每个标的可用仓位百分比须在 (0, 100] 之间", 400)
-        if sum(m.allocation_pct for m in unique) > 100 + 1e-9:
+        if mode == "even" and sum(m.allocation_pct for m in unique) > 100 + 1e-9:
             raise LiveAutoAllocationError(
                 "LIVE_AUTO_ALLOCATION_INVALID", "各标的可用仓位百分比之和不可超过 100%", 400)
         return unique
@@ -375,7 +390,11 @@ class LiveAutoManager:
             members_in=[GroupMemberInput(inst_id=inst_id, allocation_pct=100.0)],
             account_row=account_row, settings=settings, total_capital_usd=capital_usd,
             leverage=leverage, take_profit_usd=take_profit_usd, stop_loss_usd=stop_loss_usd,
-            priming=priming, priming_bars=priming_bars)
+            priming=priming, priming_bars=priming_bars,
+            # RN-1：单标的旧路径绝对天花板 5% / 留空默认 1%（**不**引用分组天花板与 maxBudgetPct）。
+            budget_cap_frac=settings.live_auto_max_capital_frac,
+            default_budget_frac=settings.live_auto_default_capital_frac,
+            allocation_mode="even")
         try:
             group = await self.start_group(req)
         except LiveAutoGroupPreflightError as exc:
@@ -432,14 +451,15 @@ class LiveAutoManager:
                    for p in positions)
 
     @staticmethod
-    def _resolve_budget_group(capital_usd: float | None, avail: float, member_count: int,
-                              settings: Settings) -> float:
-        """P1-1：留空→ min(avail×default_frac×N, avail×max_frac)；非空→ 夹到 ≤ avail×max_frac。"""
-        hard_cap = avail * settings.live_auto_max_capital_frac
-        if capital_usd and capital_usd > 0:
-            budget = capital_usd
-        else:
-            budget = avail * settings.live_auto_default_capital_frac * member_count
+    def _resolve_budget_group(capital_usd: float | None, avail: float,
+                              cap_frac: float, default_frac: float) -> float:
+        """留空→ avail×default_frac；非空→ 夹到 ≤ avail×cap_frac（RN-1：两路径共用，分数由各入口解析）。
+
+        分组入口传 cap_frac=default_frac=min(maxBudgetPct/100, 分组天花板)（留空=上限、不随成员数缩放）；
+        单标的兼容 wrapper 传旧 0.05 / 0.01（行为逐位不变）。
+        """
+        hard_cap = avail * cap_frac
+        budget = capital_usd if (capital_usd and capital_usd > 0) else avail * default_frac
         return min(budget, hard_cap) if hard_cap > 0 else budget
 
     @staticmethod
@@ -476,6 +496,7 @@ class LiveAutoManager:
                         "leverage": ctx.lever, "takeProfitUsd": take_profit_usd,
                         "stopLossUsd": stop_loss_usd, "groupId": ctx.group_id,
                         "allocationPct": plan.allocation_pct,
+                        "allocationMode": ctx.req.allocation_mode,
                         "totalBudgetUsd": ctx.total_budget_usd},
                 status="running")
             return run.id

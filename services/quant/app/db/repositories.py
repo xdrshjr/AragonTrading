@@ -18,6 +18,7 @@ from .models import (
     AgentMessage,
     AgentProvider,
     AgentToolState,
+    AppSetting,
     CandleCache,
     EquityPoint,
     LiveOrderAudit,
@@ -379,6 +380,51 @@ async def clear_agent_messages(session: AsyncSession, conversation_id: str) -> i
     result = await session.execute(stmt)
     await session.commit()
     return result.rowcount or 0
+
+
+# ============================ App settings（设置中心通用 KV） ============================
+_AUTO_TRADE_MAX_BUDGET_KEY = "auto_trade.max_budget_pct"
+_DEFAULT_AUTO_TRADE_MAX_BUDGET_PCT = 100.0
+
+
+async def get_app_setting(session: AsyncSession, key: str, default: object = None) -> object:
+    """读单个设置（JSON 解码）；无记录 / 坏 JSON → 回 ``default``（稀疏表，C6 风格容错）。"""
+    row = await session.get(AppSetting, key)
+    if row is None:
+        return default
+    try:
+        return json.loads(row.value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return default
+
+
+async def set_app_setting(session: AsyncSession, key: str, value: object) -> None:
+    """按 key upsert 单个设置（JSON 编码）后 ``commit``（select-then-update / 否则 insert）。"""
+    encoded = json.dumps(value, ensure_ascii=False)
+    row = await session.get(AppSetting, key)
+    if row is None:
+        session.add(AppSetting(key=key, value=encoded))
+    else:
+        row.value = encoded
+    await session.commit()
+
+
+async def get_auto_trade_settings(session: AsyncSession) -> dict:
+    """读自动交易设置（缺记录 / 越界回默认 maxBudgetPct=100）。服务端为分组预算上限唯一权威。"""
+    raw = await get_app_setting(session, _AUTO_TRADE_MAX_BUDGET_KEY, _DEFAULT_AUTO_TRADE_MAX_BUDGET_PCT)
+    try:
+        pct = float(raw)
+    except (TypeError, ValueError):
+        pct = _DEFAULT_AUTO_TRADE_MAX_BUDGET_PCT
+    if not (0 < pct <= 100):
+        pct = _DEFAULT_AUTO_TRADE_MAX_BUDGET_PCT
+    return {"maxBudgetPct": pct}
+
+
+async def set_auto_trade_settings(session: AsyncSession, *, max_budget_pct: float) -> dict:
+    """写自动交易总预算上限百分比（边界已由 schema 在路由层校验 0<pct≤100），返回回写后值。"""
+    await set_app_setting(session, _AUTO_TRADE_MAX_BUDGET_KEY, max_budget_pct)
+    return {"maxBudgetPct": max_budget_pct}
 
 
 # ============================ Agent providers（设置中心 · AI 模型服务） ============================
