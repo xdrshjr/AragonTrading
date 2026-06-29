@@ -27,6 +27,9 @@ let win = null;
 let pm = null;
 let quitting = false;
 let enginesReady = false; // 两个子进程均就绪并已开窗后置真，作为「运行期崩溃」判据（P2-4）
+// G1（诊断 desktop-packaged-wco-header-right-still-unclickable）：渲染层经 IPC 回传的 Window Controls
+// Overlay 运行期状态；供「关于」展示「WCO 是否真接管 caption」，把不可观测的命中托管变为可读事实。
+let lastOverlayState = null;
 
 // ----------------------------- 日志 -----------------------------
 function openLogStreams() {
@@ -198,11 +201,29 @@ function webSpec() {
   };
 }
 
+// Windows 系统标题栏控件叠加（titleBarOverlay）配色：color=顶栏背景(--bg)、symbolColor=三键字形(--text)，
+// 与 apps/web/app/globals.css 的明/暗 token 对齐；高度等于顶栏 h-12=48px。
+// 主题切换时由渲染层经 aragon:win:set-overlay-theme 调 win.setTitleBarOverlay 同步（避免三键配色突兀）。
+const TITLEBAR_OVERLAY = {
+  dark: { color: '#1a1915', symbolColor: '#ece8df' },
+  light: { color: '#f7f5f2', symbolColor: '#1f1e1b' },
+};
+const TITLEBAR_OVERLAY_HEIGHT = 48;
+function overlayForTheme(theme) {
+  const c = theme === 'light' ? TITLEBAR_OVERLAY.light : TITLEBAR_OVERLAY.dark;
+  return { color: c.color, symbolColor: c.symbolColor, height: TITLEBAR_OVERLAY_HEIGHT };
+}
+
 // ----------------------------- 窗口 -----------------------------
 function createWindow() {
-  // 去系统框架（spec §4.1 / D1）：win/linux 完全无边框、右侧自绘控制键；
-  // mac 保留左侧红绿灯并整合进内容区（titleBarStyle:'hidden' + 红绿灯位移）。
+  // 标题栏按平台分流（诊断 desktop-header-right-and-live-toggle-unclickable）：
+  //   win  → 系统托管标题栏 + Controls Overlay（titleBarStyle:'hidden' + titleBarOverlay）。caption 命中
+  //          交还系统，根治「无边框(frame:false)+默认可缩放」在还原态把顶栏右簇（模拟盘/实盘、主题、
+  //          设置、窗口键）吞为 caption 致单击不下发的缺陷（三轮 -webkit-app-region CSS 补丁均未根治）。
+  //   mac  → 隐藏标题栏 + 系统左侧红绿灯（titleBarStyle:'hidden' + 红绿灯位移）。
+  //   linux→ 完全无边框、右侧自绘控制键（titleBarOverlay 在 Linux 支持不全，维持原路径不动）。
   const isMac = process.platform === 'darwin';
+  const isWin = process.platform === 'win32';
   const opts = {
     width: 1440,
     height: 900,
@@ -213,14 +234,19 @@ function createWindow() {
     backgroundColor: '#0b0d12',
     title: 'Aragon Trading',
     show: true,
-    frame: false,
-    ...(isMac
+    ...(isWin
       ? {
-          frame: true,
+          // 初始用暗色叠加匹配 loading.html / backgroundColor；渲染层挂载后据实际主题再同步。
           titleBarStyle: 'hidden',
-          trafficLightPosition: { x: 16, y: 16 },
+          titleBarOverlay: overlayForTheme('dark'),
         }
-      : {}),
+      : isMac
+        ? {
+            frame: true,
+            titleBarStyle: 'hidden',
+            trafficLightPosition: { x: 16, y: 16 },
+          }
+        : { frame: false }),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -250,6 +276,19 @@ function createWindow() {
   });
 }
 
+// 构建溯源戳来源：构建期注入的 ARAGON_COMMIT（dev/CI 可设）优先；其次取打包期 electron-builder
+// extraMetadata 烤进 package.json 的 aragonCommit（由 pack.ps1 经 --config.extraMetadata 注入）。
+function buildCommit() {
+  if (process.env.ARAGON_COMMIT) return process.env.ARAGON_COMMIT;
+  try {
+    const pkg = require('../package.json');
+    if (pkg && pkg.aragonCommit) return String(pkg.aragonCommit);
+  } catch {
+    /* 未注入则省略，不强依赖 */
+  }
+  return null;
+}
+
 // 「关于 Aragon Trading」对话框（G3，§4.3 / §6.3）：版本 / 运行期版本 / appId / 端口 /
 // 数据来源诚实声明 / 一键打开日志目录。放在桌面外壳（不碰渲染层），维持 apps/web 零源码改动（D4）。
 function showAbout() {
@@ -265,8 +304,26 @@ function showAbout() {
     '数据来源：仅采用 OKX 真实行情；OKX 不可达时显式报错，绝不使用假数据兜底。',
     `日志目录：${paths.logsDir()}`,
   ];
-  // 构建 commit 可选——构建期注入了 ARAGON_COMMIT 才附上，否则省略（不强依赖）。
-  if (process.env.ARAGON_COMMIT) lines.push(`构建：${process.env.ARAGON_COMMIT}`);
+  // 构建溯源戳（诊断 desktop-header-right-and-live-toggle-unclickable §六.4）：让运行中的 app 显示其构建
+  // commit，便于把「跑了旧会话」与「真代码 bug」一眼区分。优先取构建期注入的 env，其次取打包期
+  // electron-builder extraMetadata 烤进 package.json 的 aragonCommit；二者皆缺则省略（不强依赖）。
+  const commit = buildCommit();
+  if (commit) lines.push(`构建：${commit}`);
+  // WCO 运行期断言（G1，诊断 desktop-packaged-wco-header-right-still-unclickable）：展示渲染层经
+  // aragon:win:report-overlay 回传的实际 Window Controls Overlay 状态，把「系统是否真接管顶栏 caption」
+  // 从盲区变为可读，让真机人工门可判别（仅 win 平台有意义，其它平台 supported 恒 false 故不展示）。
+  if (process.platform === 'win32') {
+    const wco = lastOverlayState;
+    if (!wco) {
+      lines.push('WCO active：未上报（渲染层尚未回传）');
+    } else if (wco.supported) {
+      const r = wco.rect;
+      const rectStr = r ? `  ·  安全区 ${r.width}×${r.height} @(${r.x},${r.y})` : '';
+      lines.push(`WCO active：${wco.visible ? 'true' : 'false'}${rectStr}`);
+    } else {
+      lines.push('WCO active：不支持（navigator.windowControlsOverlay 缺失）');
+    }
+  }
 
   dialog
     .showMessageBox(win, {
@@ -473,6 +530,15 @@ if (!gotLock) {
   });
   ipcMain.on('aragon:win:close', () => win && win.close());
   ipcMain.handle('aragon:win:is-maximized', () => !!win && win.isMaximized());
+  // 主题切换时同步 Windows 系统标题栏控件叠加配色（仅 win，且窗口以 titleBarOverlay 创建时可用）。
+  ipcMain.on('aragon:win:set-overlay-theme', (_e, theme) => {
+    if (process.platform !== 'win32' || !win || typeof win.setTitleBarOverlay !== 'function') return;
+    win.setTitleBarOverlay(overlayForTheme(theme === 'light' ? 'light' : 'dark'));
+  });
+  // G1：记录渲染层回传的 Window Controls Overlay 运行期状态（feature-detect 在渲染层完成，主进程仅存值）。
+  ipcMain.on('aragon:win:report-overlay', (_e, state) => {
+    lastOverlayState = state && typeof state === 'object' ? state : null;
+  });
   ipcMain.on('aragon:show-about', () => showAbout());
 
   app.whenReady().then(bootstrap);

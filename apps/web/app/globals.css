@@ -145,3 +145,11 @@ body {
 .drag-region [role="switch"] {
   -webkit-app-region: no-drag;
 }
+
+/* Windows 系统标题栏控件叠加（titleBarOverlay，诊断 desktop-header-right-and-live-toggle-unclickable）：
+   系统三键占据右上角，顶栏右簇须让位到安全区，避免被系统按钮覆盖。
+   padding-right = 窗口宽 - 可用标题栏宽 = 系统三键带宽，由 env(titlebar-area-*) 实测得到。
+   非 WCO 环境（Web / mac / linux）下 env() 未定义 → 回退值使 padding 归零，零回归。 */
+.win-titlebar-safe {
+  padding-right: calc(100vw - env(titlebar-area-width, 100vw) - env(titlebar-area-x, 0px));
+}

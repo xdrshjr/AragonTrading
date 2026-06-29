@@ -20,6 +20,11 @@ contextBridge.exposeInMainWorld('aragon', {
     toggleMaximize: () => ipcRenderer.send('aragon:win:maximize-toggle'),
     close: () => ipcRenderer.send('aragon:win:close'),
     isMaximized: () => ipcRenderer.invoke('aragon:win:is-maximized'),
+    // 同步 Windows 系统标题栏控件叠加(titleBarOverlay)配色到明/暗主题（非 win 平台主进程内 no-op）。
+    setOverlayTheme: (theme) => ipcRenderer.send('aragon:win:set-overlay-theme', theme),
+    // G1（诊断 desktop-packaged-wco-header-right-still-unclickable）：渲染层把观测到的 Window Controls
+    // Overlay 运行期状态（是否生效 / 安全区矩形）回传主进程，「关于」据此展示 WCO 是否真激活，便于真机判别。
+    reportOverlay: (state) => ipcRenderer.send('aragon:win:report-overlay', state),
     // 订阅最大化态变化，返回取消订阅函数（组件卸载时调用以移除监听）。
     onMaximizeChange: (cb) => {
       const handler = (_e, value) => cb(!!value);

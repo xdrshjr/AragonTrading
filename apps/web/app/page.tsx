@@ -16,7 +16,11 @@ import SettingsPanel from "@/components/Settings/SettingsPanel";
 import { Button } from "@/components/ui";
 import PanelResizeHandle from "@/components/ui/PanelResizeHandle";
 import { api } from "@/lib/api";
-import { getDesktopPlatform, getWindowControls } from "@/lib/desktop";
+import {
+  getDesktopPlatform,
+  getWindowControls,
+  subscribeWindowControlsOverlay,
+} from "@/lib/desktop";
 import {
   LATEST_CANDLE_LIMIT,
   liveCandleRefreshIntervalMs,
@@ -479,13 +483,28 @@ export default function Page() {
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
+    // Windows 系统标题栏控件叠加(titleBarOverlay)配色随主题同步（非 win 平台主进程内 no-op）。
+    getWindowControls()?.setOverlayTheme?.(theme);
   }, [theme]);
 
-  // 桌面端自定义标题栏（spec §4.9 / D4 / RV-3）：mac 红绿灯安全区 padding 必须由挂载后状态驱动，
-  // 不得在渲染期直接读 platform 决定 className，否则 mac 上 React 水合不一致。
+  // 桌面端自定义标题栏（spec §4.9 / D4 / RV-3）：平台相关的安全区 padding 必须由挂载后状态驱动，
+  // 不得在渲染期直接读 platform 决定 className，否则 React 水合不一致。
+  // mac → 左侧红绿灯安全区；win → 右上角系统 titleBarOverlay 三键安全区（让位右簇，避免被覆盖）。
   const [macSafeArea, setMacSafeArea] = useState(false);
+  const [winOverlay, setWinOverlay] = useState(false);
   useEffect(() => {
-    setMacSafeArea(getDesktopPlatform() === "darwin");
+    const platform = getDesktopPlatform();
+    setMacSafeArea(platform === "darwin");
+    setWinOverlay(platform === "win32");
+  }, []);
+
+  // G1（诊断 desktop-packaged-wco-header-right-still-unclickable）：把渲染层观测到的 Window Controls
+  // Overlay 运行期状态（是否真激活 / 安全区矩形）回传主进程，「关于」据此展示 WCO 是否生效，使真机人工门
+  // 可判别。subscribeWindowControlsOverlay 内部 feature-detect，非 WCO 平台仅回调一次 supported:false。
+  useEffect(() => {
+    const report = getWindowControls()?.reportOverlay;
+    if (!report) return;
+    return subscribeWindowControlsOverlay((state) => report(state));
   }, []);
 
   // 双击拖拽面切换最大化（spec §4.9 / D6）。反转拖拽契约后（诊断
@@ -518,7 +537,7 @@ export default function Page() {
         className={clsx(
           "flex h-12 shrink-0 items-center",
           "border-b border-[var(--border)]",
-          macSafeArea ? "pl-[84px] pr-4" : "px-4",
+          macSafeArea ? "pl-[84px] pr-4" : winOverlay ? "win-titlebar-safe pl-4" : "px-4",
         )}
         onDoubleClick={onTitleDoubleClick}
       >

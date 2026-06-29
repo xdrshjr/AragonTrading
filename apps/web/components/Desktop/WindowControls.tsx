@@ -7,8 +7,9 @@ import { getDesktopPlatform, getWindowControls, useIsDesktop } from "@/lib/deskt
 /**
  * 自定义标题栏右侧窗口控制带（spec §4.7）：最小化 / 最大化↔还原 / 关闭。
  *
- * - 仅桌面端（`window.aragon`）且非 macOS 渲染；浏览器与 mac 均降级为 `null`
- *   （mac 红绿灯由系统在左侧绘制）。
+ * - 仅桌面端（`window.aragon`）的 Linux 渲染自绘三键；浏览器、mac、Windows 均降级为 `null`
+ *   （mac 红绿灯由系统在左侧绘制；Windows 改用系统 titleBarOverlay 在右上角绘制三键，
+ *   见诊断 desktop-header-right-and-live-toggle-unclickable——自绘三键会与系统叠加重影）。
  * - 图标随窗口最大化态切换：初始读 `isMaximized()`，并订阅 `onMaximizeChange`。
  */
 export default function WindowControls() {
@@ -22,7 +23,8 @@ export default function WindowControls() {
     return controls.onMaximizeChange(setMaximized);
   }, []);
 
-  if (!isDesktop || getDesktopPlatform() === "darwin") return null;
+  const platform = getDesktopPlatform();
+  if (!isDesktop || platform === "darwin" || platform === "win32") return null;
   const controls = getWindowControls();
   if (!controls) return null;
 

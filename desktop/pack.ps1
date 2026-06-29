@@ -299,6 +299,27 @@ try {
         $builderArgs += '--config.electronDist=node_modules/electron/dist'
         Write-Host '    复用本地 electron 二进制（--config.electronDist），跳过下载。' -ForegroundColor DarkGray
     }
+
+    # 构建溯源戳（诊断 desktop-header-right-and-live-toggle-unclickable §六.4）：把当前 git short commit 经
+    # extraMetadata 烤进打包产物的 package.json(aragonCommit)，让运行中的 app 在「关于」对话框显示其构建
+    # commit，便于把「跑了旧会话」与「真代码 bug」一眼区分。git 不可用时静默跳过（不强依赖）。
+    $aragonCommit = ''
+    try {
+        $rev = & git -C $RepoRoot rev-parse --short HEAD 2>$null
+        if ($LASTEXITCODE -eq 0 -and $rev) {
+            $aragonCommit = "$rev".Trim()
+            # dirty 感知（诊断 desktop-packaged-wco-header-right-still-unclickable §五.F1）：工作树有未提交
+            # 改动时追加 -dirty，使「含未提交补丁的构建」与「干净 HEAD 构建」在「关于」里显示不同溯源戳，
+            # 避免 WCO 等未提交修复令 HEAD 不变、构建身份不可辨识、人工门无法判别测的是哪一版而迭代环卡死。
+            $dirty = & git -C $RepoRoot status --porcelain 2>$null
+            if ($LASTEXITCODE -eq 0 -and "$dirty".Trim()) { $aragonCommit = "$aragonCommit-dirty" }
+        }
+    }
+    catch {}
+    if ($aragonCommit) {
+        $builderArgs += "--config.extraMetadata.aragonCommit=$aragonCommit"
+        Write-Host "    构建溯源戳 aragonCommit=$aragonCommit" -ForegroundColor DarkGray
+    }
     $stepTitle = if ($Target -eq 'smoke') { '6) 打包免安装目录 (electron-builder --dir)' } else { '6) 打包安装包 (electron-builder)' }
     $unpackedDir = Join-Path $DesktopDir 'dist/win-unpacked'
     Stop-RunningDistProcesses $unpackedDir (-not $NoStopRunningDist)
