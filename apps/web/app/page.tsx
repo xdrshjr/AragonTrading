@@ -522,10 +522,11 @@ export default function Page() {
         )}
         onDoubleClick={onTitleDoubleClick}
       >
-        {/* 反转拖拽契约（spec §4.10 / 诊断 desktop-titlebar-buttons-unclickable-when-restored）：
-            顶栏整体不再 drag，仅「无交互控件」的品牌簇与中部空白标 drag 作为拖拽面，
-            交互控件留在默认/no-drag 区（HTCLIENT），规避无边框可缩放窗口还原态下
-            「drag 区内 no-drag 洞不被 OS 命中测试生效」的缺陷。 */}
+        {/* 反转拖拽契约（spec §4.10 / 诊断 desktop-titlebar-buttons-unclickable-when-restored、
+            desktop-header-right-and-auto-trade-toggle-unresponsive）：顶栏整体不再 drag，
+            仅最左「无交互控件」品牌簇标 drag 作为唯一拖拽手柄；中部空白与右簇均不 drag。
+            残留的中部 flex-1 拖拽面紧邻右簇，还原态下其 OS 命中区外溢到窗口右缘、把整片右簇
+            （模拟盘/实盘、主题、Factor、设置、窗口键）吞为 caption 致单击不下发，故去其 drag。 */}
         <div className="flex items-center gap-2">
           <div className="drag-region flex items-center gap-2 self-stretch">
             <img
@@ -542,7 +543,7 @@ export default function Page() {
           </div>
           <AppMenu />
         </div>
-        <div className="drag-region flex-1 self-stretch" />
+        <div className="flex-1 self-stretch" />
         <div className="no-drag flex items-center gap-2">
           <AccountModeSwitch />
           <Button variant="ghost" size="sm" onClick={toggleTheme} aria-label="切换主题">

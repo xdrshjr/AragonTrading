@@ -124,6 +124,16 @@ export default function AutoTradeToggle() {
           label="自动交易"
         />
       </div>
+      {/* 禁用态就地可见原因（B2 / 诊断 desktop-header-right-and-auto-trade-toggle-unresponsive）：
+          避免守门拦截被误判为「按钮坏了」；完整原因仍保留在 title 悬浮。 */}
+      {blocked && disabledReason ? (
+        <span
+          className="max-w-[200px] truncate text-[11px] text-[var(--muted)]"
+          title={disabledReason}
+        >
+          {disabledReason}
+        </span>
+      ) : null}
 
       <AutoTradeConfirmModal
         open={modalOpen}

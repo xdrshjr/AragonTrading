@@ -41,8 +41,12 @@ function proxyEnv() {
  * - DB_PATH：仅 prod 注入到 userData（资源目录只读，D6）；dev 不设走仓库默认。
  * - AGENT_* / LIVE_*：仅 prod 注入（由 main.js 经 agent-env 解析 userData/agent.env 传入 agentEnv）；
  *   pydantic Settings 从进程 env 读取，prod 无需 .env 文件（dev 经 services/quant/.env 读取）。
- *   LIVE_*（LIVE_TRADING_ENABLED / LIVE_MAX_ORDER_NOTIONAL_USD / LIVE_DEFAULT_TD_MODE /
- *   LIVE_DEFAULT_LEVERAGE）须同 AGENT_* 一并透传，否则打包桌面无法启用实盘下单（C1-6）。
+ *   LIVE_*（LIVE_AUTO_TRADING_ENABLED / LIVE_TRADING_ENABLED / LIVE_MAX_ORDER_NOTIONAL_USD /
+ *   LIVE_DEFAULT_TD_MODE / LIVE_DEFAULT_LEVERAGE）须同 AGENT_* 一并透传，否则打包桌面无法启用实盘下单（C1-6）。
+ * - LIVE_AUTO_TRADING_ENABLED：打包链 agent.env 不产出该键、后端默认 False 致「自动交易」开关恒灰
+ *   （诊断 desktop-header-right-and-auto-trade-toggle-unresponsive）。故 prod 注入默认 'true' 作为唯一缺失的源，
+ *   置于 agentEnv 透传之前——userData/agent.env 的显式值仍可经下方循环覆盖；写类仍受单会话 /
+ *   名义上限 / 二次确认 / 审计等既有 guard 约束，config.py 通用默认（关）不变，安全姿态保持。
  * - ALLOW_CACHED_FALLBACK：默认不设（=false），保持诚实默认——OKX 不可达即显式报错，不假数据。
  */
 function backendEnv({ mode, dbPath, agentEnv } = {}) {
@@ -54,6 +58,10 @@ function backendEnv({ mode, dbPath, agentEnv } = {}) {
   };
   if (mode === 'prod' && dbPath) {
     env.DB_PATH = dbPath;
+  }
+  // prod 默认开启自动交易总闸（缺失的唯一源）。置于 agentEnv 透传之前，使用户 userData/agent.env 的显式值可覆盖。
+  if (mode === 'prod') {
+    env.LIVE_AUTO_TRADING_ENABLED ??= 'true';
   }
   // prod：把 AGENT_* / LIVE_* 注入后端子进程 env（密钥仅在后端，绝不下发前端，R3/R4；实盘开关 C1-6）。
   if (mode === 'prod' && agentEnv && typeof agentEnv === 'object') {
