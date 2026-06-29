@@ -26,6 +26,8 @@ type Theme = "light" | "dark";
 export type InstSidebarTab = "watch" | "spot" | "swap";
 // 右侧面板页签：AI 助手 / 交易策略（Agent Trading Copilot §5.3，默认 "agent"）。
 export type RightTab = "agent" | "strategy";
+// 一级功能视图（左侧主导航 NavRail 驱动）：trade=交易工作台，factor=因子实验室；持久化跨刷新恢复。
+export type WorkbenchView = "trade" | "factor";
 
 // 生成新会话 id（SSR 安全：crypto 不可用时回落空串，由组件挂载后补）。
 function makeConversationId(): string {
@@ -126,9 +128,10 @@ interface AppState {
   // 设置中心（spec §5.3）：showSettings 为瞬态（不持久化，刷新回工作台）；settingsSection 持久化。
   showSettings: boolean;
   settingsSection: string;
-  // 因子实验室（因子层 §3.2）：showFactorLab 瞬态（刷新回工作台）；factorLabSection 持久化；
+  // 一级功能视图（左侧主导航 NavRail）：activeView 持久化（刷新恢复上次视图）；
+  // 因子实验室可见性由 activeView === "factor" 派生。factorLabSection 持久化；
   // factorOverlay 瞬态（show_factor ui-action 驱动主图叠加因子/得分 pane）。
-  showFactorLab: boolean;
+  activeView: WorkbenchView;
   factorLabSection: string;
   factorOverlay: FactorOverlay | null;
 
@@ -186,7 +189,7 @@ interface AppState {
   setComboEditingId: (id: number | null) => void;
   setShowSettings: (show: boolean) => void;
   setSettingsSection: (section: string) => void;
-  setShowFactorLab: (show: boolean) => void;
+  setActiveView: (view: WorkbenchView) => void;
   setFactorLabSection: (section: string) => void;
   setFactorOverlay: (overlay: FactorOverlay | null) => void;
 }
@@ -251,8 +254,8 @@ export const useAppStore = create<AppState>()(
       // 设置中心：默认在工作台（showSettings=false）；默认设置项为「AI 模型服务」。
       showSettings: false,
       settingsSection: "ai-models",
-      // 因子实验室：默认在工作台（showFactorLab=false）；默认工作区为「因子目录」；无叠加。
-      showFactorLab: false,
+      // 一级视图：默认「交易」工作台；因子实验室默认工作区为「因子目录」；无叠加。
+      activeView: "trade",
       factorLabSection: "catalog",
       factorOverlay: null,
 
@@ -397,8 +400,9 @@ export const useAppStore = create<AppState>()(
       // 设置中心：切换设置面板（瞬态）/ 切换当前设置项（持久化）。
       setShowSettings: (showSettings) => set({ showSettings }),
       setSettingsSection: (settingsSection) => set({ settingsSection }),
-      // 因子实验室：切换面板（瞬态）/ 切换当前工作区（持久化）/ 设置主图叠加（瞬态）。
-      setShowFactorLab: (showFactorLab) => set({ showFactorLab }),
+      // 一级视图切换（左侧 NavRail）：写入 activeView（持久化，跨切换/刷新保态）；
+      // 切换当前因子工作区（持久化）/ 设置主图叠加（瞬态）。
+      setActiveView: (activeView) => set({ activeView }),
       setFactorLabSection: (factorLabSection) => set({ factorLabSection }),
       setFactorOverlay: (factorOverlay) => set({ factorOverlay }),
       // 纵向分栏比例：夹取到 [MIN, MAX]；非有限数忽略（守住边界，与 simBalance 同模式）。
@@ -440,7 +444,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 18,
+      version: 19,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -471,7 +475,8 @@ export const useAppStore = create<AppState>()(
         comboDraft: s.comboDraft,
         // 持久化当前设置项；showSettings 为瞬态故**不**入 partialize（刷新默认回工作台，R-Migrate）。
         settingsSection: s.settingsSection,
-        // 持久化因子实验室当前工作区；showFactorLab/factorOverlay 为瞬态，**不**入 partialize。
+        // 持久化一级视图（NavRail）与因子实验室当前工作区；factorOverlay 为瞬态，**不**入 partialize。
+        activeView: s.activeView,
         factorLabSection: s.factorLabSection,
       }),
       // 逐版补默认态（即便缺省 zustand 浅合并也回落初值，migrate 仅为显式稳妥，R7/R11）。
@@ -547,6 +552,10 @@ export const useAppStore = create<AppState>()(
         }
         if (version < 18) {
           // 实时自动交易：运行期态全部瞬态（不入 partialize），浅合并回落初值即可；此处仅显式占位稳妥。
+        }
+        if (version < 19) {
+          // 左侧主导航：补一级视图默认（老用户从未持久化过 showFactorLab，仅补 activeView 默认即可）。
+          next = { ...next, activeView: "trade" };
         }
         return next as never;
       },

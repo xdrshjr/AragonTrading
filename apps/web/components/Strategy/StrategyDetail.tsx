@@ -16,7 +16,7 @@ interface FactorMemberSnapshot {
 
 // 因子组合得分策略（kind==="factor"）的内联快照摘要 + 编辑入口（评审 C-P1-5）。
 function FactorStrategyBanner({ strategy }: { strategy: Strategy }) {
-  const setShowFactorLab = useAppStore((s) => s.setShowFactorLab);
+  const setActiveView = useAppStore((s) => s.setActiveView);
   const setFactorLabSection = useAppStore((s) => s.setFactorLabSection);
   const members = (strategy.params?.members as FactorMemberSnapshot[] | undefined) ?? [];
   // 短窗护栏（H6）：策略暖机=normWindow+60；区间过短将安静空仓，此处如实标注最小所需根数。
@@ -34,7 +34,7 @@ function FactorStrategyBanner({ strategy }: { strategy: Strategy }) {
           size="sm"
           onClick={() => {
             setFactorLabSection("builder");
-            setShowFactorLab(true);
+            setActiveView("factor");
           }}
         >
           在因子实验室编辑

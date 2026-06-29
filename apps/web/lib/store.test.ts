@@ -448,3 +448,45 @@ describe("app store - strategy list tab (v15)", () => {
     expect(state.instId).toBe("SOL-USDT-SWAP");
   });
 });
+
+describe("app store — left nav rail primary view (v19)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    // store 为模块单例：复位一级视图，避免跨用例残留。
+    useAppStore.setState({ activeView: "trade" });
+  });
+
+  it("defaults activeView to trade on a fresh install", () => {
+    // 全新安装只走初始化器（不触发 migrate）：默认在「交易」工作台。
+    expect(useAppStore.getInitialState().activeView).toBe("trade");
+  });
+
+  it("setActiveView switches the primary view", () => {
+    useAppStore.getState().setActiveView("factor");
+    expect(useAppStore.getState().activeView).toBe("factor");
+    useAppStore.getState().setActiveView("trade");
+    expect(useAppStore.getState().activeView).toBe("trade");
+  });
+
+  it("persists activeView to localStorage", () => {
+    useAppStore.getState().setActiveView("factor");
+    const persisted = JSON.parse(localStorage.getItem("aragon-ui") as string);
+    expect(persisted.state.activeView).toBe("factor");
+  });
+
+  it("migrates pre-v19 persisted state to v19 with activeView defaulting to trade", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({
+        state: { instId: "ETH-USDT-SWAP", factorLabSection: "catalog" },
+        version: 18,
+      }),
+    );
+    await useAppStore.persist.rehydrate();
+    const s = useAppStore.getState();
+    expect(s.activeView).toBe("trade");
+    // 既有持久化字段仍恢复
+    expect(s.instId).toBe("ETH-USDT-SWAP");
+    expect(s.factorLabSection).toBe("catalog");
+  });
+});

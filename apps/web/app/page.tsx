@@ -8,8 +8,8 @@ import ChartWorkspace from "@/components/Chart/ChartWorkspace";
 import AppMenu from "@/components/Desktop/AppMenu";
 import WindowControls from "@/components/Desktop/WindowControls";
 import AccountModeSwitch from "@/components/Header/AccountModeSwitch";
-import FactorButton from "@/components/Factor/FactorButton";
 import FactorLab from "@/components/Factor/FactorLab";
+import NavRail from "@/components/Nav/NavRail";
 import RightPanel from "@/components/RightPanel/RightPanel";
 import SettingsGearButton from "@/components/Settings/SettingsGearButton";
 import SettingsPanel from "@/components/Settings/SettingsPanel";
@@ -82,7 +82,7 @@ export default function Page() {
     backtestEndTs,
     indicators,
     showSettings,
-    showFactorLab,
+    activeView,
     rightPanelWidth,
     setChartView,
     setPaperActiveStrategyId,
@@ -125,6 +125,8 @@ export default function Page() {
     Record<number, PaperPositionEvent | null>
   >({});
   const [jumpToTs, setJumpToTs] = useState<number | null>(null);
+  // 因子实验室「首激活后常驻」惰性挂载：从未打开者不触发因子查询；一旦打开即保持挂载（hidden）以保态。
+  const [hasOpenedFactor, setHasOpenedFactor] = useState(false);
   const loadingMore = useRef(false);
   const lastMarketTsRef = useRef<number | null>(null);
   // 右侧面板调宽：以 <main> 右边缘为锚，宽度 = 右边缘 − 指针 X（store 负责夹取 [320,640]）。
@@ -481,6 +483,11 @@ export default function Page() {
     useAppStore.persist.rehydrate();
   }, []);
 
+  // 首激活后常驻：activeView 首次为 "factor" 时置位，置位后即便切回交易也保持 FactorLab 挂载（hidden）。
+  useEffect(() => {
+    if (activeView === "factor") setHasOpenedFactor(true);
+  }, [activeView]);
+
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
     // Windows 系统标题栏控件叠加(titleBarOverlay)配色随主题同步（非 win 平台主进程内 no-op）。
@@ -568,74 +575,85 @@ export default function Page() {
           <Button variant="ghost" size="sm" onClick={toggleTheme} aria-label="切换主题">
             {theme === "light" ? "暗色" : "亮色"}
           </Button>
-          <FactorButton />
           <SettingsGearButton />
           <WindowControls />
         </div>
       </header>
 
-      {showSettings ? (
-        <main className="no-drag min-h-0 flex-1 overflow-hidden">
-          <SettingsPanel />
-        </main>
-      ) : showFactorLab ? (
-        <main className="no-drag min-h-0 flex-1 overflow-hidden">
-          <FactorLab />
-        </main>
-      ) : (
-        <main
-          ref={mainRef}
-          className="no-drag grid flex-1 overflow-hidden"
-          style={{ gridTemplateColumns: `minmax(0,1fr) 6px ${rightPanelWidth}px` }}
-        >
-          <ChartWorkspace
-            candles={candles}
-            overlayEquity={overlayEquity}
-            overlays={overlays}
-            overlayTrades={overlayTrades}
-            bottomTrades={bottomTrades}
-            tradeCapReached={tradeCapReached}
-            indicators={indicators}
-            theme={theme}
-            lastPrice={streamMarket ? lastPrice : null}
-            market={market}
-            dataSource={dataSource}
-            chartLoading={(runQ.isFetching || candlesQ.isFetching) && candles.length === 0}
-            chartError={chartError}
-            onLoadMore={loadMore}
-            jumpToTs={jumpToTs}
-            paperStrategies={paperStrategies}
-            activePaperStrategyId={effectiveActivePaperStrategyId}
-            visiblePaperStrategyIds={effectiveVisibleIds}
-            onActivePaperStrategyChange={setPaperActiveStrategyId}
-            onToggleVisiblePaperStrategy={togglePaperVisibleStrategyId}
-            paperPositionsByStrategyId={paperPositionsByStrategyId}
-            paperEquityByStrategyId={paperEquityByStrategyId}
-            paperTradesByStrategyId={paperTradesByStrategyId}
-            toolbar={{
-              okxUp,
-              latencyMs,
-              lastOkTs,
-              liveWsOpen: streamMarket ? liveWsOpen : undefined,
-              lastPrice: streamMarket ? lastPrice : undefined,
-              chartView,
-              rangeAvailable,
-              onChartViewChange: setChartView,
-              onJumpDate: setJumpToTs,
-            }}
-          />
+      {/* header 之下：左侧常驻 NavRail + 右侧内容区。交易/因子两视图始终挂载、用 hidden 互斥切换以保态
+          （镜像 RightPanel 惯用法）；承载 hidden 的 wrapper 绝不带 display 工具类（评审 C-1/P0），grid 与
+          mainRef 下沉内层 <main>；设置中心为「覆盖」——打开时仅给两 wrapper 追加 hidden，严禁卸载（C-2）。 */}
+      <div className="flex min-h-0 flex-1">
+        <NavRail />
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="min-h-0 flex-1" hidden={showSettings || activeView !== "trade"}>
+            <main
+              ref={mainRef}
+              className="no-drag grid h-full overflow-hidden"
+              style={{ gridTemplateColumns: `minmax(0,1fr) 6px ${rightPanelWidth}px` }}
+            >
+              <ChartWorkspace
+                candles={candles}
+                overlayEquity={overlayEquity}
+                overlays={overlays}
+                overlayTrades={overlayTrades}
+                bottomTrades={bottomTrades}
+                tradeCapReached={tradeCapReached}
+                indicators={indicators}
+                theme={theme}
+                lastPrice={streamMarket ? lastPrice : null}
+                market={market}
+                dataSource={dataSource}
+                chartLoading={(runQ.isFetching || candlesQ.isFetching) && candles.length === 0}
+                chartError={chartError}
+                onLoadMore={loadMore}
+                jumpToTs={jumpToTs}
+                paperStrategies={paperStrategies}
+                activePaperStrategyId={effectiveActivePaperStrategyId}
+                visiblePaperStrategyIds={effectiveVisibleIds}
+                onActivePaperStrategyChange={setPaperActiveStrategyId}
+                onToggleVisiblePaperStrategy={togglePaperVisibleStrategyId}
+                paperPositionsByStrategyId={paperPositionsByStrategyId}
+                paperEquityByStrategyId={paperEquityByStrategyId}
+                paperTradesByStrategyId={paperTradesByStrategyId}
+                toolbar={{
+                  okxUp,
+                  latencyMs,
+                  lastOkTs,
+                  liveWsOpen: streamMarket ? liveWsOpen : undefined,
+                  lastPrice: streamMarket ? lastPrice : undefined,
+                  chartView,
+                  rangeAvailable,
+                  onChartViewChange: setChartView,
+                  onJumpDate: setJumpToTs,
+                }}
+              />
 
-          <PanelResizeHandle
-            onResize={onResizeRight}
-            onReset={() => setRightPanelWidth(DEFAULT_RIGHT_PANEL_WIDTH)}
-            ariaLabel="拖动调整右侧面板宽度，双击复位"
-          />
+              <PanelResizeHandle
+                onResize={onResizeRight}
+                onReset={() => setRightPanelWidth(DEFAULT_RIGHT_PANEL_WIDTH)}
+                ariaLabel="拖动调整右侧面板宽度，双击复位"
+              />
 
-          <aside className="min-h-[300px] min-w-0 overflow-hidden bg-[var(--surface)]/40">
-            <RightPanel />
-          </aside>
-        </main>
-      )}
+              <aside className="min-h-[300px] min-w-0 overflow-hidden bg-[var(--surface)]/40">
+                <RightPanel />
+              </aside>
+            </main>
+          </div>
+
+          {hasOpenedFactor && (
+            <div className="min-h-0 flex-1" hidden={showSettings || activeView !== "factor"}>
+              <FactorLab active={activeView === "factor" && !showSettings} />
+            </div>
+          )}
+
+          {showSettings && (
+            <main className="no-drag min-h-0 flex-1 overflow-hidden">
+              <SettingsPanel />
+            </main>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

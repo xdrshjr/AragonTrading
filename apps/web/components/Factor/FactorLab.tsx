@@ -62,11 +62,14 @@ function dateToTs(value: string, endOfDay = false): number {
 }
 
 /**
- * 因子实验室全屏面板（镜像 SettingsPanel：左导航 + 右内容；Esc 关闭；挂载焦点入标题，卸载交还入口按钮）。
+ * 因子实验室面板（左导航 + 右内容；Esc 返回交易）。常驻挂载、由左侧 NavRail 的 activeView 切显隐，
  * 顶部工作台条统一标的 / 周期 / 区间，五个工作区共享（因子层 §3.2）。
+ *
+ * @param active 该视图当前是否可见（= activeView==="factor" && !showSettings）。焦点 / Esc 仅在
+ *   active 为真时响应，避免隐藏态抢焦点。
  */
-export default function FactorLab() {
-  const setShowFactorLab = useAppStore((s) => s.setShowFactorLab);
+export default function FactorLab({ active }: { active: boolean }) {
+  const setActiveView = useAppStore((s) => s.setActiveView);
   const section = useAppStore((s) => s.factorLabSection);
   const setSection = useAppStore((s) => s.setFactorLabSection);
   const headingRef = useRef<HTMLHeadingElement>(null);
@@ -109,20 +112,20 @@ export default function FactorLab() {
     [instId, bar, startTs, endTs, evalTarget, pendingMembers],
   );
 
+  // 焦点：从「挂载即聚焦」改为「active 变真时聚焦标题」，避免隐藏态抢焦点（入口按钮已移除，无须回焦）。
   useEffect(() => {
-    headingRef.current?.focus();
-    return () => {
-      document.getElementById("factor-lab-button")?.focus();
-    };
-  }, []);
+    if (active) headingRef.current?.focus();
+  }, [active]);
 
+  // Esc 仅在 active（可见）时响应，返回交易工作台。
   useEffect(() => {
+    if (!active) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setShowFactorLab(false);
+      if (e.key === "Escape") setActiveView("trade");
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [setShowFactorLab]);
+  }, [active, setActiveView]);
 
   const rangeValid = startTs < endTs;
 
@@ -142,7 +145,7 @@ export default function FactorLab() {
               行情 → 因子计算 → 评估/挖掘 → 权重训练 → 组合得分 → 策略决策
             </span>
           </div>
-          <Button variant="ghost" size="sm" onClick={() => setShowFactorLab(false)} aria-label="返回工作台">
+          <Button variant="ghost" size="sm" onClick={() => setActiveView("trade")} aria-label="返回工作台">
             返回工作台
           </Button>
         </header>

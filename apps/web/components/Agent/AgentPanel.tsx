@@ -161,7 +161,7 @@ export default function AgentPanel() {
               factorSetId: ev.data.factorSetId,
             });
             st.setFactorLabSection(ev.data.factorSetId != null ? "builder" : "evaluate");
-            st.setShowFactorLab(true);
+            st.setActiveView("factor");
           } else {
             applyShowChart(ev.data, uiActionStore());
           }

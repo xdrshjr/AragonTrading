@@ -40,7 +40,7 @@ const METHODS: { value: TrainMethod; label: string }[] = [
 export default function FactorSetBuilder() {
   const qc = useQueryClient();
   const wb = useWorkbench();
-  const setShowFactorLab = useAppStore((s) => s.setShowFactorLab);
+  const setActiveView = useAppStore((s) => s.setActiveView);
   const setStrategyId = useAppStore((s) => s.setStrategyId);
 
   const lib = useQuery({ queryKey: ["factor", "library"], queryFn: factorApi.library });
@@ -135,7 +135,7 @@ export default function FactorSetBuilder() {
       }),
     onSuccess: (strategy) => {
       setStrategyId(strategy.id);
-      setShowFactorLab(false);
+      setActiveView("trade");
     },
   });
 
