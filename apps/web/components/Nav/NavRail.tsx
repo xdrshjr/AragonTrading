@@ -66,7 +66,7 @@ export default function NavRail() {
   return (
     <nav
       aria-label="主功能导航"
-      className="flex w-16 shrink-0 flex-col gap-1 border-r border-[var(--border)] bg-[var(--surface)]/60 px-2 py-3"
+      className="flex w-12 shrink-0 flex-col gap-1 border-r border-[var(--border)] bg-[var(--surface)]/60 px-2 py-3"
     >
       {ITEMS.map((item) => {
         // 设置浮层打开时两项均不显选中，避免误导（高亮以 !showSettings && activeView 计算）。
@@ -95,7 +95,7 @@ export default function NavRail() {
             )}
             {item.icon}
             {/* 默认仅图标；hover/focus 时右侧弹出文字气泡。aria-hidden：可访问名仍由 aria-label 提供，
-                不重复朗读；pointer-events-none + 绝对定位：不撑开 64px 栏宽、不拦截命中。 */}
+                不重复朗读；pointer-events-none + 绝对定位：不撑开 48px 栏宽、不拦截命中。 */}
             <span
               aria-hidden="true"
               className={clsx(

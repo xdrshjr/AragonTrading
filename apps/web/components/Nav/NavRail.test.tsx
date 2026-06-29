@@ -50,6 +50,15 @@ describe("NavRail — 左侧主功能导航", () => {
     expect(tip.className).toContain("opacity-0");
     expect(tip.className).toContain("group-hover:opacity-100");
   });
+
+  it("constrains the rail to w-12 (48px = 3/4 of the former 64px)", () => {
+    // 尺寸契约护栏：第 3 轮把栏宽由 w-16(64px) 收窄为 w-12(48px=精确 3/4)。锁定该类，
+    // 防止未来误改回 w-16 等更宽刻度（CLAUDE.md §7 把已修尺寸固化为回归护栏）。
+    render(<NavRail />);
+    const rail = screen.getByRole("navigation", { name: "主功能导航" });
+    expect(rail.className).toContain("w-12");
+    expect(rail.className).not.toContain("w-16");
+  });
 });
 
 describe("NavRail 隐藏机制回归护栏（评审 C-3 / 守 C-1 P0）", () => {
