@@ -8,6 +8,7 @@ const SECTIONS = [
   { key: "ai-models", label: "AI 模型服务", desc: "API 与默认服务" },
   { key: "agent-tools", label: "Agent 工具管理", desc: "查看与开关可用工具" },
   { key: "okx-accounts", label: "实盘账户", desc: "欧易 API 凭证与连通性" },
+  { key: "about", label: "关于 / 诊断", desc: "版本信息与日志目录" },
 ];
 
 export default function SettingsNav() {

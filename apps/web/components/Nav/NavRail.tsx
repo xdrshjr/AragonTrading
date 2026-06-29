@@ -79,9 +79,8 @@ export default function NavRail() {
             onClick={() => select(item.key)}
             aria-current={active ? "page" : undefined}
             aria-label={item.label}
-            title={item.label}
             className={clsx(
-              "relative flex flex-col items-center gap-1 rounded-[12px] px-1 py-2.5",
+              "group relative flex h-11 items-center justify-center rounded-[12px]",
               "transition-all duration-150 ease-smooth",
               active
                 ? "bg-[var(--accent-soft)] text-[var(--accent)]"
@@ -95,7 +94,20 @@ export default function NavRail() {
               />
             )}
             {item.icon}
-            <span className="text-center text-[10px] leading-tight">{item.label}</span>
+            {/* 默认仅图标；hover/focus 时右侧弹出文字气泡。aria-hidden：可访问名仍由 aria-label 提供，
+                不重复朗读；pointer-events-none + 绝对定位：不撑开 64px 栏宽、不拦截命中。 */}
+            <span
+              aria-hidden="true"
+              className={clsx(
+                "pointer-events-none absolute left-full top-1/2 z-50 ml-2 -translate-y-1/2",
+                "whitespace-nowrap rounded-md border border-[var(--border)] bg-[var(--surface)]",
+                "px-2 py-1 text-xs font-medium text-[var(--text)] shadow-sm",
+                "opacity-0 transition-opacity duration-150 ease-smooth",
+                "group-hover:opacity-100 group-focus-visible:opacity-100",
+              )}
+            >
+              {item.label}
+            </span>
           </button>
         );
       })}

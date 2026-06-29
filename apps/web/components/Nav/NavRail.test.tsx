@@ -39,6 +39,17 @@ describe("NavRail — 左侧主功能导航", () => {
     expect(useAppStore.getState().showSettings).toBe(false);
     expect(useAppStore.getState().activeView).toBe("factor");
   });
+
+  it("renders the item label only as a hover/focus tooltip (icon-only by default)", () => {
+    // 锁定「默认仅图标、文字仅悬浮」契约：改后 label 文本仅存在于气泡 span，按钮可访问名来自
+    // aria-label（属性，不被 getByText 命中），故 getByText 唯一命中气泡 span（评审 P2-4）。
+    render(<NavRail />);
+    const tip = screen.getByText("交易");
+    expect(tip).toHaveAttribute("aria-hidden", "true");
+    // jsdom 不计算 :hover/:focus-visible 的实际可见性，故只断言「默认隐藏 + 触发类存在」。
+    expect(tip.className).toContain("opacity-0");
+    expect(tip.className).toContain("group-hover:opacity-100");
+  });
 });
 
 describe("NavRail 隐藏机制回归护栏（评审 C-3 / 守 C-1 P0）", () => {

@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import { Button } from "@/components/ui";
 import { useAppStore } from "@/lib/store";
+import AboutSection from "./AboutSection";
 import AgentToolsSection from "./AgentToolsSection";
 import AiModelsSection from "./AiModelsSection";
 import OkxAccountsSection from "./OkxAccountsSection";
@@ -58,6 +59,8 @@ export default function SettingsPanel() {
             <OkxAccountsSection />
           ) : section === "agent-tools" ? (
             <AgentToolsSection />
+          ) : section === "about" ? (
+            <AboutSection />
           ) : (
             <AiModelsSection />
           )}

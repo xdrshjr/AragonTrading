@@ -5,7 +5,6 @@ import clsx from "clsx";
 import type { Dispatch, MouseEventHandler, SetStateAction } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import ChartWorkspace from "@/components/Chart/ChartWorkspace";
-import AppMenu from "@/components/Desktop/AppMenu";
 import WindowControls from "@/components/Desktop/WindowControls";
 import AccountModeSwitch from "@/components/Header/AccountModeSwitch";
 import FactorLab from "@/components/Factor/FactorLab";
@@ -551,7 +550,6 @@ export default function Page() {
       <header
         className={clsx(
           "flex h-12 shrink-0 items-center",
-          "border-b border-[var(--border)]",
           macSafeArea ? "pl-[84px] pr-4" : winOverlay ? "win-titlebar-safe pl-4" : "px-4",
         )}
         onDoubleClick={onTitleDoubleClick}
@@ -561,21 +559,15 @@ export default function Page() {
             仅最左「无交互控件」品牌簇标 drag 作为唯一拖拽手柄；中部空白与右簇均不 drag。
             残留的中部 flex-1 拖拽面紧邻右簇，还原态下其 OS 命中区外溢到窗口右缘、把整片右簇
             （模拟盘/实盘、主题、Factor、设置、窗口键）吞为 caption 致单击不下发，故去其 drag。 */}
-        <div className="flex items-center gap-2">
-          <div className="drag-region flex items-center gap-2 self-stretch">
-            <img
-              src="/brand/logo.png"
-              alt="Aragon Trading"
-              width="24"
-              height="24"
-              className="h-6 w-6 shrink-0"
-            />
-            <span className="text-sm font-semibold tracking-tight">Aragon Trading</span>
-            <span className="hidden text-[11px] text-[var(--muted)] sm:inline">
-              多策略量化模拟交易 · OKX 真实行情
-            </span>
-          </div>
-          <AppMenu />
+        <div className="drag-region flex items-center gap-2 self-stretch">
+          <img
+            src="/brand/logo.png"
+            alt="Aragon Trading"
+            width="24"
+            height="24"
+            className="h-6 w-6 shrink-0"
+          />
+          <span className="text-sm font-semibold tracking-tight">Aragon Trading</span>
         </div>
         <div className="flex-1 self-stretch" />
         <div className="no-drag flex items-center gap-2">
@@ -587,6 +579,11 @@ export default function Page() {
           <WindowControls />
         </div>
       </header>
+
+      {/* 全宽分隔线（替代 header 自身 border-b）：作为 header 之后的同层流式元素落在 y≈48，
+          严格位于 Windows titleBarOverlay 48px 叠加矩形（[0,48)）之外，故三键正下方亦连续不缺线
+          （spec §2.3）；Web/mac/linux 无叠加矩形，视觉等价于原 border-b。 */}
+      <div aria-hidden="true" className="h-px w-full shrink-0 bg-[var(--border)]" />
 
       {/* header 之下：左侧常驻 NavRail + 右侧内容区。交易/因子两视图始终挂载、用 hidden 互斥切换以保态
           （镜像 RightPanel 惯用法）；承载 hidden 的 wrapper 绝不带 display 工具类（评审 C-1/P0），grid 与
