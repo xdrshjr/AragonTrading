@@ -192,6 +192,68 @@ export interface WalkForwardResult {
   windows: WalkForwardWindow[];
 }
 
+// 自动交易触发解释（auto-trade-explainability §5.2）：与后端 TriggerExplain wire/DB JSON 同构。
+export type TriggerExplainKind =
+  | "factor_score"
+  | "atomic"
+  | "risk_exit"
+  | "reverse"
+  | "session_stop"
+  | "external_close";
+
+export interface TriggerMetric {
+  label: string;
+  value: string;
+  tone?: "long" | "short" | "neutral" | "warn";
+  hint?: string;
+}
+
+export interface FactorContribution {
+  factorKey: string;
+  name: string;
+  direction: "long" | "short";
+  value: number; // 方向化原始值 dir·raw
+  zscore: number; // 因果滚动 z（与训练 / 打分同窗口、同 clip）
+  weight: number;
+  contribution: number; // weight * zscore（pre-squash 贡献）
+  share: number; // |contribution| / Σ|contribution| ∈ [0,1]
+  isTopDriver: boolean; // 主要驱动因子（前 3 且 share≥0.15）
+}
+
+export interface TriggerExplain {
+  schema: number;
+  kind: TriggerExplainKind;
+  side: "long" | "short" | "close";
+  headline: string;
+  summary?: string;
+  metrics: TriggerMetric[];
+  composite?: {
+    score: number;
+    preSquash: number;
+    squash: boolean;
+    enterLong?: number;
+    enterShort?: number;
+    exitBand?: number;
+  };
+  factors?: FactorContribution[];
+  risk?: {
+    stopLossPrice?: number | null;
+    takeProfitPrice?: number | null;
+    stopLossPct?: number | null;
+    takeProfitPct?: number | null;
+    maxHoldBars?: number | null;
+  };
+  meta?: {
+    strategyName?: string;
+    strategyKind?: string;
+    instId?: string;
+    bar?: string;
+    barTs?: number;
+    clOrdId?: string;
+    ordId?: string;
+  };
+}
+
 export interface Trade {
   id?: number;
   runId?: number;
@@ -209,6 +271,10 @@ export interface Trade {
   positionAfter: number;
   reason: string;
   seeded?: boolean;
+  // 自动交易可解释性（auto-trade-explainability）：可空，历史 / 非自动交易成交无该字段。
+  explain?: TriggerExplain | null;
+  clOrdId?: string;
+  ordId?: string;
 }
 
 export type TradeDirection = "long" | "short";

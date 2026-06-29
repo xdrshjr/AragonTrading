@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 
@@ -26,6 +27,8 @@ from ..paper.session import PAPER_WINDOW_MAX
 from .executor import LiveExecutor
 
 _SNAPSHOT_EQUITY_MAX = 1000   # snapshot 回放净值上限（订阅即重放末 N 条）
+
+logger = logging.getLogger(__name__)
 
 
 class LiveAutoSession:
@@ -100,6 +103,49 @@ class LiveAutoSession:
             except asyncio.QueueFull:
                 pass
 
+    # ---------- 事件分发 + 可持久审计（auto-trade-explainability §2.5）----------
+    async def _dispatch(self, events: list[dict]) -> None:
+        """统一分发 executor 事件：trade 事件先注入 explain.meta + best-effort 落库，再 WS 扇出。
+
+        三处原内联 `_push`（`_on_confirmed` / `_monitor_tick` / `_handle_flatten_result`）统一改走本方法，
+        使每笔成交（含 v2 新增的 external_close）都带可追溯元信息并持久化到 `trades.explain_json`。
+        """
+        for event in events:
+            if event.get("type") == "trade" and isinstance(event.get("data"), dict):
+                trade = event["data"]
+                self._inject_explain_meta(trade)
+                await self._persist_trade(trade)
+            await self._push(event)
+
+    def _inject_explain_meta(self, trade: dict) -> None:
+        """给 trade.explain 注入会话级可追溯元信息（strategyName/kind/instId/bar/barTs + best-effort 单号）。"""
+        explain = trade.get("explain")
+        if not isinstance(explain, dict):
+            return
+        meta = dict(explain.get("meta") or {})
+        meta.setdefault("strategyName", self.strategy_name)
+        meta.setdefault("strategyKind", self.strategy_kind)
+        meta.setdefault("instId", self.inst_id)
+        meta.setdefault("bar", self.bar)
+        meta.setdefault("barTs", trade.get("ts"))
+        if trade.get("clOrdId"):
+            meta.setdefault("clOrdId", trade["clOrdId"])
+        if trade.get("ordId"):
+            meta.setdefault("ordId", trade["ordId"])
+        explain["meta"] = meta
+
+    async def _persist_trade(self, trade: dict) -> None:
+        """落 trades 行 + explain_json（短生命周期 session，镜像 append_trade 自带 commit）。
+
+        best-effort：落库失败仅 `logger.warning`，**绝不**因审计落库中断真实交易 / 平仓（H4 诚实降级）。
+        """
+        try:
+            sm = get_sessionmaker()
+            async with sm() as s:
+                await repo.append_live_trade(s, self.run_id, trade)
+        except Exception as exc:  # noqa: BLE001 —— best-effort 审计落库，失败不阻塞热路径
+            logger.warning("append_live_trade failed (run_id=%s): %s", self.run_id, exc)
+
     # ---------- lifecycle ----------
     async def start(self) -> None:
         """暖机窗口（仅热指标，不下单）后订阅实时 WS。"""
@@ -164,7 +210,7 @@ class LiveAutoSession:
         """据 flatten 结果诚实置终态（H4）：成功推成交；失败置 flattenFailed + residual 并推 error。"""
         result = self.flatten_result or {}
         if result.get("trade"):
-            await self._push({"type": "trade", "data": result["trade"]})
+            await self._dispatch([{"type": "trade", "data": result["trade"]}])
         if result.get("ok"):
             return
         self.flatten_failed = True
@@ -194,8 +240,7 @@ class LiveAutoSession:
         """单轮盯市（持 `self._lock`，与 `_on_confirmed` 互斥，杜绝并发改 projected）。"""
         now_ts = int(time.time())
         mark = await self._latest_mark_px()
-        for event in await self.executor.reconcile(mark, now_ts):
-            await self._push(event)
+        await self._dispatch(await self.executor.reconcile(mark, now_ts))
         await self._emit_equity(mark, now_ts)
         await self._emit_position(mark)
         await self._check_staleness(now_ts)
@@ -271,8 +316,7 @@ class LiveAutoSession:
 
         events = await self._drive_signals(df, i, ref_px, ts)
         events += await self.executor.reconcile(ref_px, ts)
-        for event in events:
-            await self._push(event)
+        await self._dispatch(events)
         await self._emit_equity(ref_px, ts)
         await self._push({"type": "candle", "data": {**self._candles[-1], "confirm": True}})
         await self._emit_position(ref_px)

@@ -30,10 +30,13 @@ from .mining import (  # noqa: F401
 from .scoring import (  # noqa: F401
     DEFAULT_CLIP,
     DEFAULT_NORM_WINDOW,
+    MemberContribution,
+    ScoreBreakdown,
     causal_zscore,
     compose_score,
     member_names,
     resolve_norm_contract,
+    score_breakdown,
     score_points,
 )
 from .training import (  # noqa: F401

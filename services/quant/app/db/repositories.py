@@ -250,6 +250,27 @@ async def append_trade(session: AsyncSession, run_id: int, t: TradeRecord) -> No
     await session.commit()
 
 
+async def append_live_trade(session: AsyncSession, run_id: int, trade: dict) -> None:
+    """把实盘自动交易的 trade dict（含 explain）落 Trade 行 + explain_json（auto-trade-explainability §2.5）。
+
+    trade 为 LiveExecutor 产出的 camelCase dict（与 WS 扇出同构）；explain 序列化进 explain_json，
+    缺失则置 NULL。**镜像 append_trade 的「自带 commit」语义**——否则 best-effort 落库不持久、
+    刷新后历史触发丢失（R12）。调用方（session._persist_trade）已 try/except 兜底，落库失败不阻塞交易。
+    """
+    explain = trade.get("explain")
+    explain_json = json.dumps(explain, ensure_ascii=False) if explain is not None else None
+    session.add(Trade(
+        run_id=run_id, ts=int(trade.get("ts", 0)), side=str(trade.get("side", "")),
+        price=float(trade.get("price", 0.0)), qty=float(trade.get("qty", 0.0)),
+        fee=float(trade.get("fee", 0.0) or 0.0), pnl=float(trade.get("pnl", 0.0) or 0.0),
+        position_after=float(trade.get("positionAfter", 0.0) or 0.0),
+        reason=str(trade.get("reason", ""))[:64],
+        stop_loss_pct=trade.get("stopLossPct"), take_profit_pct=trade.get("takeProfitPct"),
+        max_hold_bars=trade.get("maxHoldBars"), stop_loss_price=trade.get("stopLossPrice"),
+        take_profit_price=trade.get("takeProfitPrice"), explain_json=explain_json))
+    await session.commit()
+
+
 async def append_equity(session: AsyncSession, run_id: int, e: EquityRecord) -> None:
     session.add(EquityPoint(run_id=run_id, ts=e.ts, equity=e.equity, drawdown=e.drawdown))
     await session.commit()

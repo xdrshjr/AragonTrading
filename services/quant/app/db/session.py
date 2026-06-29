@@ -82,6 +82,8 @@ async def _ensure_trade_risk_columns(conn) -> None:
         "max_hold_bars": "INTEGER",
         "stop_loss_price": "FLOAT",
         "take_profit_price": "FLOAT",
+        # auto-trade-explainability §5.1：实盘自动交易触发解释 JSON，老库幂等补列（与风控列同机制）。
+        "explain_json": "TEXT",
     }
     for name, sql_type in risk_columns.items():
         if name not in columns:

@@ -31,6 +31,7 @@ import { Button, Skeleton, Tabs } from "@/components/ui";
 import AutoTradeEventLog from "./AutoTradeEventLog";
 import AutoTradeStatusBar from "./AutoTradeStatusBar";
 import AutoTradeToggle from "./AutoTradeToggle";
+import AutoTradeTradesTable from "./AutoTradeTradesTable";
 import BacktestModeSwitch from "./BacktestModeSwitch";
 import ComboResult from "./ComboResult";
 import ComboStrategyDetail from "./ComboStrategyDetail";
@@ -442,6 +443,7 @@ export default function StrategyPanel() {
 
       {mode === "paper" && <AutoTradeStatusBar />}
       {mode === "paper" && <AutoTradeEventLog />}
+      {mode === "paper" && <AutoTradeTradesTable />}
 
       <div className="flex-1 overflow-auto px-4 py-3">
         {mode === "compare" ? (

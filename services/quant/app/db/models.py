@@ -81,6 +81,9 @@ class Trade(Base):
     max_hold_bars: Mapped[int | None] = mapped_column(Integer, nullable=True)
     stop_loss_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     take_profit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 序列化的 TriggerExplain（auto-trade-explainability §5.1）：实盘自动交易逐笔触发解释，
+    # 历史行 / 非自动交易行为 NULL。绝不含凭证。老库经 _ensure_trade_risk_columns 幂等补列。
+    explain_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     run: Mapped["StrategyRun"] = relationship(back_populates="trades")
 

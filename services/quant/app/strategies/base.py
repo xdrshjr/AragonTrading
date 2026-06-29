@@ -20,6 +20,9 @@ class Signal(BaseModel):
     side: Literal["long", "short", "close"]
     strength: float = Field(default=1.0, ge=0.0, le=1.0)  # 0~1 仓位比例
     reason: str = ""                                       # marker tooltip 用
+    # 结构化触发解释（auto-trade-explainability §2.3）：默认 None，全策略向后兼容；
+    # 仅因子组合等策略在 on_candle 填入 TriggerExplain（含因子归因断面），供执行器透传到 trade。
+    explain: dict | None = None
 
 
 class StrategyMeta(BaseModel):

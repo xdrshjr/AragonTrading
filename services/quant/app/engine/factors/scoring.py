@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
 
@@ -15,6 +17,32 @@ from .library import compute_factor
 
 DEFAULT_NORM_WINDOW = 200
 DEFAULT_CLIP = 4.0
+
+
+@dataclass
+class MemberContribution:
+    """单成员对复合得分的逐根贡献明细（解释期的单一因果真源）。
+
+    各 ``pd.Series`` 与打分 df 等长、暖机段 NaN；``contribution = weight * zscore``（pre-squash）。
+    """
+
+    name: str            # member_names() 的稳定列名（与权重对齐）
+    factor_key: str
+    direction: str       # long | short（冻结）
+    weight: float
+    value: pd.Series     # 方向化原始值 dir·raw（directional_values）
+    zscore: pd.Series    # causal_zscore(value, norm_window, clip)
+    contribution: pd.Series  # weight * zscore（pre-squash 贡献）
+
+
+@dataclass
+class ScoreBreakdown:
+    """复合得分的逐成员分解：``compose_score`` 的解释期超集，数值与之逐位等价。"""
+
+    composite: pd.Series  # Σ contribution（pre-squash）
+    score: pd.Series      # squash 后（= compose_score 输出）
+    members: list[MemberContribution]
+    squash: bool
 
 
 def resolve_norm_contract(*, norm_stats: dict | None, thresholds: dict | None) -> tuple[int, float]:
@@ -79,6 +107,51 @@ def directional_values(df: pd.DataFrame, member: dict, *, bar: str = "") -> pd.S
     return mult * raw
 
 
+def score_breakdown(df: pd.DataFrame, members: list[dict], weights: dict[str, float] | None = None,
+                    *, norm_window: int = DEFAULT_NORM_WINDOW, clip: float = DEFAULT_CLIP,
+                    squash: bool = True, bar: str = "") -> ScoreBreakdown:
+    """复合得分的逐成员分解（``compose_score`` 的解释期超集，单一因果真源）。
+
+    把 ``compose_score`` 的「逐成员加权 z-score 求和」循环抽出来并额外产出逐成员明细，
+    再由 ``compose_score`` 调它取 ``.score`` —— 二者**数值逐位等价**，杜绝「解释一套、决策另一套」
+    的双口径风险（与项目「因子层单一归一化契约」一致）。权重解析、方向冻结、weight==0 跳过、
+    暖机 NaN 等语义与 ``compose_score`` 完全相同。
+
+    Returns:
+        ``ScoreBreakdown``：``composite`` 为 pre-squash 求和，``score`` 与 ``compose_score`` 输出等价，
+        ``members`` 为参与求和（weight≠0）的成员逐根贡献明细。空成员 / 全员 0 权重时 score 全 NaN。
+    """
+    work = df.reset_index(drop=True)
+    nan_series = pd.Series(np.nan, index=work.index)
+    if not members:
+        return ScoreBreakdown(composite=nan_series, score=nan_series.copy(),
+                              members=[], squash=squash)
+    names = member_names(members)
+    contributions: list[MemberContribution] = []
+    total = pd.Series(0.0, index=work.index)
+    used = False
+    for name, member in zip(names, members):
+        raw_weight = (weights or {}).get(name, member.get("weight"))
+        weight = float(raw_weight) if raw_weight is not None else 0.0
+        if weight == 0.0:
+            continue
+        value = directional_values(work, member, bar=bar)
+        z = causal_zscore(value, norm_window, clip)
+        contribution = weight * z
+        total = total + contribution
+        used = True
+        contributions.append(MemberContribution(
+            name=name, factor_key=member["factorKey"],
+            direction=member.get("direction", "long"), weight=weight,
+            value=value, zscore=z, contribution=contribution))
+    if not used:
+        return ScoreBreakdown(composite=nan_series, score=nan_series.copy(),
+                              members=contributions, squash=squash)
+    score = (pd.Series(np.tanh(total.to_numpy(dtype=float)), index=work.index)
+             if squash else total)
+    return ScoreBreakdown(composite=total, score=score, members=contributions, squash=squash)
+
+
 def compose_score(df: pd.DataFrame, members: list[dict], weights: dict[str, float] | None = None,
                   *, norm_window: int = DEFAULT_NORM_WINDOW, squash: bool = True,
                   bar: str = "", clip: float = DEFAULT_CLIP) -> pd.Series:
@@ -94,25 +167,9 @@ def compose_score(df: pd.DataFrame, members: list[dict], weights: dict[str, floa
     Returns:
         与 ``df`` 等长的复合得分 ``pd.Series``（任一成员暖机 NaN 即该根 NaN，需全部成员就绪）。
     """
-    work = df.reset_index(drop=True)
-    if not members:
-        return pd.Series(np.nan, index=work.index)
-    names = member_names(members)
-    total = pd.Series(0.0, index=work.index)
-    used = False
-    for name, member in zip(names, members):
-        raw_weight = (weights or {}).get(name, member.get("weight"))
-        weight = float(raw_weight) if raw_weight is not None else 0.0
-        if weight == 0.0:
-            continue
-        z = causal_zscore(directional_values(work, member, bar=bar), norm_window, clip)
-        total = total + weight * z
-        used = True
-    if not used:
-        return pd.Series(np.nan, index=work.index)
-    if squash:
-        total = pd.Series(np.tanh(total.to_numpy(dtype=float)), index=work.index)
-    return total
+    # 委托 score_breakdown 单源求和（数值逐位等价），杜绝解释 / 决策双口径（评审 R2）。
+    return score_breakdown(df, members, weights, norm_window=norm_window, clip=clip,
+                           squash=squash, bar=bar).score
 
 
 def score_points(df: pd.DataFrame, score: pd.Series) -> list[dict]:

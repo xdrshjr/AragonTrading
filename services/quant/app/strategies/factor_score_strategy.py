@@ -26,10 +26,56 @@ DEFAULT_THRESHOLDS: dict = {
     "squash": True,
 }
 
+# 主要驱动因子判定（auto-trade-explainability §四）：贡献绝对值前 N 且占比达阈即标记为 top driver。
+_TOP_DRIVER_COUNT = 3
+_TOP_DRIVER_SHARE = 0.15
+
 
 def resolve_thresholds(params: dict) -> dict:
     """叠加默认阈值（缺字段回落默认），供 prepare / warmup / on_candle 共用单一口径。"""
     return {**DEFAULT_THRESHOLDS, **(params.get("thresholds") or {})}
+
+
+def _finite_at(series: pd.Series, i: int) -> float | None:
+    """取第 i 根有限值（暖机 NaN / 越界回 None），供因子断面提取防御性读取。"""
+    try:
+        value = series.iat[i]
+    except (IndexError, KeyError):
+        return None
+    return float(value) if pd.notna(value) else None
+
+
+def _factor_metrics(value: float, thresholds: dict) -> list[dict]:
+    """复合得分 vs 阈值的通用指标对照（进多 / 进空 / 退出带 / 仓位强度）。"""
+    tone = "long" if value > 0 else ("short" if value < 0 else "neutral")
+    return [
+        {"label": "复合得分", "value": f"{value:.4f}", "tone": tone},
+        {"label": "进多阈值", "value": f"{float(thresholds.get('enterLong', 0.3)):.2f}"},
+        {"label": "进空阈值", "value": f"-{float(thresholds.get('enterShort', 0.3)):.2f}"},
+        {"label": "退出带", "value": f"±{float(thresholds.get('exitBand', 0.1)):.2f}"},
+        {"label": "仓位强度", "value": f"{min(abs(value), 1.0):.2f}"},
+    ]
+
+
+def _factor_rows(breakdown, i: int) -> list[dict]:
+    """从 ScoreBreakdown 第 i 根断面抽出逐成员归因行（含 share / isTopDriver）。"""
+    rows: list[dict] = []
+    for member in breakdown.members:
+        rows.append({
+            "factorKey": member.factor_key, "name": member.name,
+            "direction": member.direction, "weight": round(member.weight, 6),
+            "value": round(_finite_at(member.value, i) or 0.0, 6),
+            "zscore": round(_finite_at(member.zscore, i) or 0.0, 6),
+            "contribution": round(_finite_at(member.contribution, i) or 0.0, 6),
+        })
+    total_abs = sum(abs(r["contribution"]) for r in rows)
+    ranked = sorted(range(len(rows)), key=lambda k: abs(rows[k]["contribution"]), reverse=True)
+    top = set(ranked[:_TOP_DRIVER_COUNT])
+    for idx, row in enumerate(rows):
+        share = (abs(row["contribution"]) / total_abs) if total_abs > 0 else 0.0
+        row["share"] = round(share, 6)
+        row["isTopDriver"] = idx in top and share >= _TOP_DRIVER_SHARE
+    return rows
 
 
 @register_strategy
@@ -70,12 +116,15 @@ class FactorScoreStrategy(BaseStrategy):
 
     def prepare(self, df: pd.DataFrame, bar: str) -> pd.DataFrame:
         # 延迟导入打破模块装载期循环：engine.factors → signal_edge → strategies →
-        # factor_score_strategy（compose_score 仅在每次回测 prepare 调用一次，开销可忽略）。
-        from ..engine.factors import compose_score, resolve_norm_contract
+        # factor_score_strategy（score_breakdown 仅在每次回测 prepare 调用一次，开销可忽略）。
+        from ..engine.factors import resolve_norm_contract, score_breakdown
 
         df = df.copy()
         members = self.params.get("members") or []
         self._thresholds = resolve_thresholds(self.params)
+        # 因子归因断面缓存（与 df 等长，暖机段 NaN）：on_candle 据此组装 Signal.explain；
+        # 空成员 / 解析失败回 None，解释回落执行器通用构造器（不影响信号本身）。
+        self._breakdown = None
         if not members:
             df["_score"] = float("nan")
             return df
@@ -85,11 +134,13 @@ class FactorScoreStrategy(BaseStrategy):
         try:
             # 保留传 self.params.get("weights")（R-P0-1 向后兼容硬约束）：旧快照走顶层 weights、
             # 新快照（weights=None）走成员烘焙 weight，绝不因「权重单源」让旧策略全员 0 权重静默不交易。
-            score = compose_score(
+            # 改调 score_breakdown 取 .score（与旧 compose_score 数值逐位等价）并缓存逐成员明细。
+            breakdown = score_breakdown(
                 df, members, self.params.get("weights"),
                 norm_window=norm_window, clip=clip,
                 squash=bool(self._thresholds.get("squash", True)), bar=bar)
-            df["_score"] = score.to_numpy()
+            df["_score"] = breakdown.score.to_numpy()
+            self._breakdown = breakdown
         except (ValueError, KeyError):
             # 未知 factorKey / 非法 direction：回测期安静空仓（边界校验由创建/编辑 API 负责）。
             df["_score"] = float("nan")
@@ -103,12 +154,48 @@ class FactorScoreStrategy(BaseStrategy):
         exit_band = float(thresholds.get("exitBand", 0.1))
         value = float(score)
         if ctx.position_side == "long":
-            return [Signal(side="close", reason="得分落入退出带")] if value <= exit_band else []
+            if value <= exit_band:
+                return [Signal(side="close", reason="得分落入退出带",
+                               explain=self._build_explain(i, "close", value, thresholds))]
+            return []
         if ctx.position_side == "short":
-            return [Signal(side="close", reason="得分落入退出带")] if value >= -exit_band else []
+            if value >= -exit_band:
+                return [Signal(side="close", reason="得分落入退出带",
+                               explain=self._build_explain(i, "close", value, thresholds))]
+            return []
         strength = min(abs(value), 1.0)
         if value >= float(thresholds.get("enterLong", 0.3)):
-            return [Signal(side="long", strength=strength, reason="复合得分多头")]
+            return [Signal(side="long", strength=strength, reason="复合得分多头",
+                           explain=self._build_explain(i, "long", value, thresholds))]
         if value <= -float(thresholds.get("enterShort", 0.3)):
-            return [Signal(side="short", strength=strength, reason="复合得分空头")]
+            return [Signal(side="short", strength=strength, reason="复合得分空头",
+                           explain=self._build_explain(i, "short", value, thresholds))]
         return []
+
+    def _build_explain(self, i: int, side: str, value: float, thresholds: dict) -> dict | None:
+        """组装 kind="factor_score" 的 TriggerExplain（第 i 根因子归因断面 + 复合得分对照）。
+
+        全程异常隔离：构建失败回 None（执行器随后回落通用构造器据 reason 合成），绝不影响信号本身。
+        """
+        breakdown = getattr(self, "_breakdown", None)
+        if breakdown is None:
+            return None
+        try:
+            headline = {"long": "复合得分多头", "short": "复合得分空头",
+                        "close": "得分落入退出带"}.get(side, "因子组合信号")
+            return {
+                "schema": 1, "kind": "factor_score", "side": side, "headline": headline,
+                "summary": "因子组合复合得分触发；下方为本次决策各成员因子的方向化归因。",
+                "metrics": _factor_metrics(value, thresholds),
+                "composite": {
+                    "score": round(value, 6),
+                    "preSquash": round(_finite_at(breakdown.composite, i) or value, 6),
+                    "squash": bool(breakdown.squash),
+                    "enterLong": float(thresholds.get("enterLong", 0.3)),
+                    "enterShort": float(thresholds.get("enterShort", 0.3)),
+                    "exitBand": float(thresholds.get("exitBand", 0.1)),
+                },
+                "factors": _factor_rows(breakdown, i),
+            }
+        except Exception:  # noqa: BLE001 —— 解释构建失败不拖累信号（异常隔离，R1）
+            return None

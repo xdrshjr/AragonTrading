@@ -240,6 +240,18 @@ class LiveAutoStatusOut(BaseModel):
 
 
 # ---------------- Response serializers ----------------
+def _parse_explain(raw: str | None) -> dict | None:
+    """explain_json → dict（缺列 / 空 / 坏 JSON 安全回 None，与既有 run_out 容错风格一致）。"""
+    if not raw:
+        return None
+    import json
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def trade_out(t: Trade) -> dict:
     return {
         "id": t.id, "runId": t.run_id, "ts": t.ts, "side": t.side, "price": t.price,
@@ -247,6 +259,8 @@ def trade_out(t: Trade) -> dict:
         "reason": t.reason, "stopLossPct": t.stop_loss_pct,
         "takeProfitPct": t.take_profit_pct, "maxHoldBars": t.max_hold_bars,
         "stopLossPrice": t.stop_loss_price, "takeProfitPrice": t.take_profit_price,
+        # explain 键恒在（缺列 / 坏 JSON → None），与既有恒含全键风格一致（§5.2 / P2-6）。
+        "explain": _parse_explain(getattr(t, "explain_json", None)),
     }
 
 

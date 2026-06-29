@@ -22,6 +22,15 @@ from ..okx.accounts import AccountCredentials
 from ..okx.order_builder import ClosePositionInput, OrderInput, snap_size
 from ..okx.rest_client import OKXError
 from ..okx.trading import close_live_position, fetch_live_positions, place_live_order
+from .explain import (
+    as_close,
+    build_atomic_explain,
+    build_external_close_explain,
+    build_reverse_explain,
+    build_risk_exit_explain,
+    build_session_stop_explain,
+    with_risk,
+)
 
 # net_mode 反手清算确认（R5）：close 返回后短轮询净仓直至 pos==0，避免 open 被反向单护栏误拒。
 _CLEAR_CONFIRM_MAX_TRIES = 6
@@ -111,15 +120,21 @@ class LiveExecutor:
         events += await self._maybe_time_exit(ref_px, ts)
         for action in self._project_signals(signals):
             if action[0] == "close":
-                events += await self._do_close(ref_px, ts, action[1])
+                _, reason, sig, close_kind = action
+                events += await self._do_close(ref_px, ts, reason, signal=sig,
+                                               close_kind=close_kind)
             else:
-                _, side, strength, reason, reverse = action
+                _, side, strength, reason, reverse, sig = action
                 events += await self._do_open(side, strength, ref_px, bar_index, ts,
-                                              reason, require_clear=reverse)
+                                              reason, require_clear=reverse, signal=sig)
         return events
 
     def _project_signals(self, signals: list) -> list[tuple]:
-        """收敛信号为有序动作（镜像 SimBroker.submit）：同向跳过、反向先平后开、平仓即平。"""
+        """收敛信号为有序动作（镜像 SimBroker.submit）：同向跳过、反向先平后开、平仓即平。
+
+        动作元组透传原始 `Signal`（携 `.explain`）与平仓类别 `close_kind`，使开 / 平能挂上
+        对应解释（factor_score 满因子归因 / 反手 / 信号平仓），下游解耦于决策来源。
+        """
         projected = self.projected
         actions: list[tuple] = []
         for sig in signals:
@@ -128,15 +143,15 @@ class LiveExecutor:
             strength = max(0.0, min(float(getattr(sig, "strength", 1.0) or 1.0), 1.0))
             if side == "close":
                 if projected != "flat":
-                    actions.append(("close", reason or "signal_close"))
+                    actions.append(("close", reason or "signal_close", sig, "signal"))
                     projected = "flat"
             elif side in ("long", "short"):
                 if projected == side:
                     continue
                 reverse = projected != "flat"
                 if reverse:
-                    actions.append(("close", reason or "reverse"))
-                actions.append(("open", side, strength, reason or "signal_open", reverse))
+                    actions.append(("close", reason or "reverse", sig, "reverse"))
+                actions.append(("open", side, strength, reason or "signal_open", reverse, sig))
                 projected = side
         return actions
 
@@ -147,11 +162,11 @@ class LiveExecutor:
             return []
         if (self._cur_bar - self.entry_bar) < hold:
             return []
-        return await self._do_close(ref_px, ts, "max_hold")
+        return await self._do_close(ref_px, ts, "max_hold", close_kind="max_hold")
 
     # ---------- 开 / 平 ----------
     async def _do_open(self, side: str, strength: float, ref_px: float, bar_index: int,
-                       ts: int, reason: str, *, require_clear: bool) -> list[dict]:
+                       ts: int, reason: str, *, require_clear: bool, signal=None) -> list[dict]:
         sz = self._compute_sz(strength, ref_px)
         if sz <= 0 or sz < self.min_sz:
             return [self._status_event(
@@ -163,49 +178,63 @@ class LiveExecutor:
                            td_mode=self.td_mode, px=None, sz=sz, lever=self.leverage,
                            tp_trigger_px=tp, sl_trigger_px=sl)
         try:
-            await self._place_order(order)
+            result = await self._place_order(order)
         except OKXError as exc:
             return [self._error_event(ts, exc)]
         self.projected = side
         self.entry_price = ref_px
         self.entry_bar = bar_index
         self.entry_qty_sz = sz
-        trade = self._make_trade(ts, side, ref_px, sz, pnl=0.0, reason=reason, tp=tp, sl=sl)
+        explain = self._open_explain(side, reason, signal, tp, sl)
+        cl_ord_id, ord_id = self._order_ids(result)
+        trade = self._make_trade(ts, side, ref_px, sz, pnl=0.0, reason=reason, tp=tp, sl=sl,
+                                 explain=explain, cl_ord_id=cl_ord_id, ord_id=ord_id)
         self.trades.append(trade)
         return [{"type": "trade", "data": trade}]
 
-    async def _do_close(self, ref_px: float, ts: int, reason: str) -> list[dict]:
+    async def _do_close(self, ref_px: float, ts: int, reason: str, *, signal=None,
+                        close_kind: str = "signal") -> list[dict]:
         if self.projected == "flat":
             return []
         close = ClosePositionInput(
             inst_id=self.inst_id, pos_side=self._pos_side(), pos=self._signed_pos(),
             mgn_mode=self.td_mode, ord_type="market", px=None, sz=None)
+        # 解释须在 _settle_close 复位 projected / entry 前据当前持仓断面合成（信号平仓优先用因子解释）。
+        explain = self._close_explain(close_kind, reason, signal, ref_px)
         try:
             result = await self._close_position(close)
         except OKXError as exc:
             if exc.code == "LIVE_NO_POSITION":
                 return self._settle_benign_close(ref_px, ts)
             return [self._error_event(ts, exc)]
-        return self._settle_close(ref_px, ts, reason, result)
+        return self._settle_close(ref_px, ts, reason, result, explain=explain)
 
-    def _settle_close(self, ref_px: float, ts: int, reason: str, result: dict) -> list[dict]:
+    def _settle_close(self, ref_px: float, ts: int, reason: str, result: dict, *,
+                      explain: dict | None = None) -> list[dict]:
         pnl = self._close_pnl(ref_px)
         qty = self.entry_qty_sz
         self.realized_pnl_usd += pnl
         self.unrealized_usd = 0.0
         self.projected = "flat"
         self.entry_qty_sz = 0.0
-        trade = self._make_trade(ts, "close", ref_px, qty, pnl=pnl, reason=reason)
+        cl_ord_id, ord_id = self._order_ids(result)
+        trade = self._make_trade(ts, "close", ref_px, qty, pnl=pnl, reason=reason,
+                                 explain=explain, cl_ord_id=cl_ord_id, ord_id=ord_id)
         self.trades.append(trade)
         return [{"type": "trade", "data": trade}]
 
     def _settle_benign_close(self, ref_px: float, ts: int) -> list[dict]:
-        """平仓收 LIVE_NO_POSITION（交易所侧 OCO 已先平）：良性归 flat，不作 error（R8）。"""
+        """平仓收 LIVE_NO_POSITION（交易所侧 OCO 已先平）：合成只读外部平仓成交 + 良性归 flat（R8）。
+
+        v2（P1-1）：在归 flat 前合成一条 kind="external_close" 成交，记录已发生的交易所侧平仓；
+        **不调用任何下单 / 平仓接口**，best-effort + 异常隔离。
+        """
+        events = self._synthesize_external_close(ref_px, ts, source="oco")
         self.realized_pnl_usd += self._close_pnl(ref_px)
         self.unrealized_usd = 0.0
         self.projected = "flat"
         self.entry_qty_sz = 0.0
-        return [self._status_event("标的已在交易所侧平仓（OCO 触发），自管持仓归 flat")]
+        return events + [self._status_event("标的已在交易所侧平仓（OCO 触发），自管持仓归 flat")]
 
     async def _confirm_net_cleared(self) -> bool:
         """net_mode 反手：短轮询确认该 instId 净仓 pos==0 再 open（R5）。"""
@@ -229,13 +258,15 @@ class LiveExecutor:
             positions = await self._read_positions()
         except OKXError as exc:
             return self._on_reconcile_failure(ts, exc)
-        return self._on_reconcile_ok(mark_px, positions)
+        return self._on_reconcile_ok(mark_px, positions, ts)
 
-    def _on_reconcile_ok(self, mark_px: float, positions: list[dict]) -> list[dict]:
+    def _on_reconcile_ok(self, mark_px: float, positions: list[dict], ts: int) -> list[dict]:
         events = self._clear_degraded_if_recovered()
         abs_pos = self._net_abs_pos(positions)
         self.unrealized_usd = self._net_upl(positions)
         if self.projected != "flat" and abs_pos <= 0:
+            # v2（P1-1）：侦测到交易所侧 / 外部已平仓，合成只读 external_close 成交后再校正为 flat。
+            events += self._synthesize_external_close(mark_px, ts, source="external")
             self.realized_pnl_usd += self._close_pnl(mark_px)
             self.unrealized_usd = 0.0
             self.projected = "flat"
@@ -282,8 +313,9 @@ class LiveExecutor:
                 result = await self._close_position(close)
             except OKXError as exc:
                 if exc.code == "LIVE_NO_POSITION":
-                    self._settle_benign_close(ref_px, ts)
-                    return {"ok": True, "closedSz": 0, "note": "already_flat"}
+                    benign = self._settle_benign_close(ref_px, ts)
+                    trade = next((e["data"] for e in benign if e["type"] == "trade"), None)
+                    return {"ok": True, "closedSz": 0, "note": "already_flat", "trade": trade}
                 last_exc = exc
                 if attempt < self.settings.live_auto_flatten_max_retries:
                     await asyncio.sleep(_FLATTEN_RETRY_INTERVAL_S)
@@ -293,7 +325,11 @@ class LiveExecutor:
                 "residual": {"side": self.projected, "size": self.entry_qty_sz}}
 
     def _settle_flatten_ok(self, ref_px: float, ts: int, result: dict) -> dict:
-        events = self._settle_close(ref_px, ts, "session_stop", result)
+        # session_stop 解释须在复位前据当前持仓断面合成（会话停止 / 会话级金额止盈止损的整仓平）。
+        explain = build_session_stop_explain(
+            pos_side=self.projected, entry_price=self.entry_price, exit_price=ref_px,
+            pnl=self._close_pnl(ref_px), session_pnl=self.session_pnl_usd)
+        events = self._settle_close(ref_px, ts, "session_stop", result, explain=explain)
         trade = events[0]["data"] if events else None
         return {"ok": True, "closedSz": trade["qty"] if trade else 0,
                 "clOrdId": result.get("clOrdId"), "trade": trade}
@@ -352,15 +388,81 @@ class LiveExecutor:
                    if str(p.get("instId")) == self.inst_id)
 
     def _make_trade(self, ts: int, side: str, price: float, sz: float, *, pnl: float,
-                    reason: str, tp: float | None = None,
-                    sl: float | None = None) -> dict:
+                    reason: str, tp: float | None = None, sl: float | None = None,
+                    explain: dict | None = None, cl_ord_id: str | None = None,
+                    ord_id: str | None = None, seeded: bool = False) -> dict:
         position_after = sz if side == "long" else (-sz if side == "short" else 0.0)
-        return {"ts": int(ts), "side": side, "price": float(price), "qty": float(sz),
-                "fee": 0.0, "pnl": float(pnl), "positionAfter": position_after,
-                "reason": reason, "stopLossPct": self.risk.stop_loss_pct,
+        trade = {"ts": int(ts), "side": side, "price": float(price), "qty": float(sz),
+                 "fee": 0.0, "pnl": float(pnl), "positionAfter": position_after,
+                 "reason": reason, "stopLossPct": self.risk.stop_loss_pct,
+                 "takeProfitPct": self.risk.take_profit_pct,
+                 "maxHoldBars": self.risk.max_hold_bars,
+                 "stopLossPrice": sl, "takeProfitPrice": tp, "seeded": seeded,
+                 "explain": explain}
+        # clOrdId / ordId 为 best-effort 可选（开仓取 _place_order 回执、平仓取 result.clOrdId）：
+        # 缺失即省略键，绝不阻塞 trade / explain（P1-2）。
+        if cl_ord_id:
+            trade["clOrdId"] = cl_ord_id
+        if ord_id:
+            trade["ordId"] = ord_id
+        return trade
+
+    # ---------- 解释合成（纯函数、异常隔离，绝不进入 place / close 调用栈，R1）----------
+    def _risk_snapshot(self, tp: float | None, sl: float | None) -> dict:
+        """开仓时的风控快照（交易所侧 OCO 触发价 + 策略 pct + max_hold），随 explain 落库。"""
+        return {"stopLossPrice": sl, "takeProfitPrice": tp,
+                "stopLossPct": self.risk.stop_loss_pct,
                 "takeProfitPct": self.risk.take_profit_pct,
-                "maxHoldBars": self.risk.max_hold_bars,
-                "stopLossPrice": sl, "takeProfitPrice": tp, "seeded": False}
+                "maxHoldBars": self.risk.max_hold_bars}
+
+    def _open_explain(self, side: str, reason: str, signal, tp: float | None,
+                      sl: float | None) -> dict | None:
+        """开仓解释：factor_score 用信号满因子归因 + 风控快照；原子策略走通用构造器。"""
+        risk = self._risk_snapshot(tp, sl)
+        sig_explain = getattr(signal, "explain", None) if signal is not None else None
+        if sig_explain:
+            return with_risk(sig_explain, risk)
+        return build_atomic_explain(side, reason or "signal_open", risk=risk)
+
+    def _close_explain(self, close_kind: str, reason: str, signal, ref_px: float) -> dict | None:
+        """平仓解释：按类别选构造器（max_hold / reverse / 信号平仓优先用因子断面）。"""
+        pnl = self._close_pnl(ref_px)
+        if close_kind == "max_hold":
+            return build_risk_exit_explain(
+                bars_held=self._cur_bar - self.entry_bar, max_hold_bars=self.risk.max_hold_bars,
+                entry_price=self.entry_price, exit_price=ref_px, pnl=pnl)
+        if close_kind == "reverse":
+            return build_reverse_explain(pos_side=self.projected, entry_price=self.entry_price,
+                                         exit_price=ref_px, pnl=pnl)
+        sig_explain = getattr(signal, "explain", None) if signal is not None else None
+        if sig_explain:
+            return as_close(sig_explain)
+        return build_atomic_explain("close", reason or "signal_close")
+
+    def _synthesize_external_close(self, ref_px: float, ts: int, *, source: str) -> list[dict]:
+        """合成一条交易所侧 / 外部平仓的只读成交（仅记录已发生的平仓，不下任何单；best-effort，R11）。"""
+        if self.projected == "flat" or self.entry_qty_sz <= 0:
+            return []
+        try:
+            pnl = self._close_pnl(ref_px)
+            explain = build_external_close_explain(
+                pos_side=self.projected, source=source, entry_price=self.entry_price,
+                exit_price=ref_px, pnl=pnl)
+            trade = self._make_trade(ts, "close", ref_px, self.entry_qty_sz, pnl=pnl,
+                                     reason="external_close", explain=explain)
+            self.trades.append(trade)
+            return [{"type": "trade", "data": trade}]
+        except Exception:  # noqa: BLE001 —— 合成失败回落原 status，绝不影响 reconcile / flatten 主流程
+            return []
+
+    @staticmethod
+    def _order_ids(result) -> tuple[str | None, str | None]:
+        """从下单 / 平仓回执 best-effort 取 (clOrdId, ordId)；非 dict 或缺失安全留空（P1-2）。"""
+        if not isinstance(result, dict):
+            return None, None
+        cl = result.get("clOrdId")
+        od = result.get("ordId")
+        return (str(cl) if cl else None), (str(od) if od else None)
 
     def _status_event(self, message: str) -> dict:
         return {"type": "status", "data": {"state": "running", "message": message,
