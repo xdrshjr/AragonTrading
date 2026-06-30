@@ -450,6 +450,17 @@ export function trainedFromSnapshot(
   };
 }
 
+/**
+ * 把「当前选中标的」协调到「自选标的下拉」可呈现的合法值：
+ * - current 在 watchlist 内 → 原样返回（尊重用户已选）；
+ * - 否则回落到 watchlist[0]（下拉首项），保证原生 select 的 value 恒命中一个 option；
+ * - watchlist 为空 → 返回 ""（由 UI 渲染禁用态 + 空态提示）。
+ */
+export function resolveWatchlistInstId(current: string, watchlist: string[]): string {
+  if (watchlist.includes(current)) return current;
+  return watchlist[0] ?? "";
+}
+
 // 阈值摘要文案（详情卡片用，稳定可单测）：进多/进空/退出带/归一化窗口/压缩开关。
 export function thresholdsSummary(thresholds: FactorThresholds): string {
   const squash = thresholds.squash ? " · tanh 压缩" : "";

@@ -3,6 +3,7 @@
 import clsx from "clsx";
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Button, Select } from "@/components/ui";
+import { resolveWatchlistInstId } from "@/lib/factor";
 import { useAppStore } from "@/lib/store";
 import FactorCatalog from "./FactorCatalog";
 import FactorEvalPanel from "./FactorEvalPanel";
@@ -80,8 +81,10 @@ export default function FactorLab({ active }: { active: boolean }) {
   const storeBar = useAppStore((s) => s.bar);
   const storeStart = useAppStore((s) => s.backtestStartTs);
   const storeEnd = useAppStore((s) => s.backtestEndTs);
+  const watchlist = useAppStore((s) => s.watchlist);
 
-  const [instId, setInstId] = useState(storeInst);
+  // 标的初值经纯函数协调到自选下拉的合法值（命中自选则用之，否则回落首项 / 空列表回落 ""）。
+  const [instId, setInstId] = useState(() => resolveWatchlistInstId(storeInst, watchlist));
   const [bar, setBar] = useState<string>(storeBar);
   const [startTs, setStartTs] = useState(storeStart);
   const [endTs, setEndTs] = useState(storeEnd);
@@ -113,6 +116,12 @@ export default function FactorLab({ active }: { active: boolean }) {
     }),
     [instId, bar, startTs, endTs, evalTarget, pendingMembers],
   );
+
+  // 重协调：watchlist 变化（如在别处取消收藏当前标的、或 persist 补水）致 instId 掉出列表时拉回合法值，
+  // 保证原生 select 的 value 恒命中一个 option。有意只跟踪 watchlist 而非 storeInst，保持 lab 本地态不回写主工作台的解耦。
+  useEffect(() => {
+    setInstId((cur) => resolveWatchlistInstId(cur, watchlist));
+  }, [watchlist]);
 
   // 焦点：从「挂载即聚焦」改为「active 变真时聚焦标题」，避免隐藏态抢焦点（入口按钮已移除，无须回焦）。
   useEffect(() => {
@@ -155,11 +164,20 @@ export default function FactorLab({ active }: { active: boolean }) {
         <div className="flex shrink-0 flex-wrap items-end gap-3 border-b border-[var(--border)] px-6 py-2.5">
           <label className="flex flex-col gap-1">
             <span className="text-[11px] text-[var(--muted)]">标的</span>
-            <input
+            <Select
               value={instId}
-              onChange={(e) => setInstId(e.target.value.toUpperCase())}
-              className="w-44 rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs tabular"
-            />
+              onChange={(e) => setInstId(e.target.value)}
+              disabled={watchlist.length === 0}
+              className="w-44 py-1 text-xs"
+            >
+              {watchlist.length === 0 ? (
+                <option value="">无自选标的</option>
+              ) : (
+                watchlist.map((id) => (
+                  <option key={id} value={id}>{id}</option>
+                ))
+              )}
+            </Select>
           </label>
           <label className="flex flex-col gap-1">
             <span className="text-[11px] text-[var(--muted)]">周期</span>
@@ -187,6 +205,9 @@ export default function FactorLab({ active }: { active: boolean }) {
               className="rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs tabular"
             />
           </label>
+          {watchlist.length === 0 && (
+            <span className="pb-1 text-[11px] text-[var(--muted)]">请先在交易工作台添加自选标的</span>
+          )}
           {!rangeValid && (
             <span className="pb-1 text-[11px] text-[var(--short)]">起始须早于结束</span>
           )}

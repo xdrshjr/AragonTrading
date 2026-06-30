@@ -24,6 +24,7 @@ import {
   quantileBars,
   rangesOverlap,
   resolveThresholds,
+  resolveWatchlistInstId,
   thresholdsSummary,
   toggleMember,
   trainedFromSet,
@@ -452,6 +453,20 @@ describe("buildEditTargetFromStrategy", () => {
     if (target.source !== "snapshot") throw new Error("expected snapshot target");
     expect(target.snapshot.members).toEqual([]);
     expect(target.snapshot.thresholds).toEqual(DEFAULT_THRESHOLDS);
+  });
+});
+
+describe("resolveWatchlistInstId", () => {
+  const watchlist = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"];
+  it("resolves_current_when_in_watchlist", () => {
+    expect(resolveWatchlistInstId("ETH-USDT-SWAP", watchlist)).toBe("ETH-USDT-SWAP");
+  });
+  it("falls_back_to_first_when_current_absent", () => {
+    expect(resolveWatchlistInstId("DOGE-USDT-SWAP", watchlist)).toBe("BTC-USDT-SWAP");
+  });
+  it("returns_empty_for_empty_watchlist", () => {
+    expect(resolveWatchlistInstId("BTC-USDT-SWAP", [])).toBe("");
+    expect(resolveWatchlistInstId("", [])).toBe("");
   });
 });
 
