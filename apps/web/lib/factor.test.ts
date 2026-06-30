@@ -1,20 +1,27 @@
 import { describe, expect, it } from "vitest";
 import {
+  addMembersCapped,
   applyWeights,
+  candidateIdentity,
   categoryLabel,
   directionLabel,
+  factorRowToMember,
+  filterLibraryItems,
   formatIc,
   formatPct,
   freezeDirection,
   freezeMemberDirection,
   icCurvePoints,
   icTone,
+  isCandidateSelected,
+  libraryItemToMember,
   memberIdentity,
   memberNames,
   overfitWarning,
   primaryRankIc,
   quantileBars,
   rangesOverlap,
+  toggleMember,
   validateMembers,
   weightBars,
   weightsCoverMembers,
@@ -219,5 +226,103 @@ describe("rangesOverlap", () => {
   });
   it("disjoint ranges do not overlap", () => {
     expect(rangesOverlap(0, 5, 10, 20)).toBe(false);
+  });
+});
+
+const _MROC: FactorMember = { factorKey: "mom_roc", params: { win: 10 }, weight: 0, direction: "long" };
+
+describe("candidateIdentity / isCandidateSelected", () => {
+  it("ignores direction: same key+params, different direction → same identity (R1)", () => {
+    const flipped: FactorMember = { ..._MROC, direction: "short" };
+    expect(candidateIdentity(_MROC)).toBe(candidateIdentity(flipped));
+  });
+  it("same key DIFFERENT params → different identity (mining variants distinct)", () => {
+    expect(candidateIdentity(_MROC)).not.toBe(candidateIdentity({ ..._MROC, params: { win: 30 } }));
+  });
+  it("selected even after basket direction flip (R1)", () => {
+    expect(isCandidateSelected([{ ..._MROC, direction: "short" }], _MROC)).toBe(true);
+  });
+  it("not selected for a different-params variant, and empty members → false", () => {
+    expect(isCandidateSelected([_MROC], { ..._MROC, params: { win: 30 } })).toBe(false);
+    expect(isCandidateSelected([], _MROC)).toBe(false);
+  });
+});
+
+describe("toggleMember", () => {
+  const a: FactorMember = { factorKey: "mom_roc", params: {}, weight: 0, direction: "long" };
+  const b: FactorMember = { factorKey: "rev_rsi", params: {}, weight: 0, direction: "short" };
+  it("adds when not selected and under cap", () => {
+    const r = toggleMember([a], b, 12);
+    expect(r.added).toBe(true);
+    expect(r.capped).toBe(false);
+    expect(r.next).toHaveLength(2);
+  });
+  it("removes when already selected, even if basket direction was flipped (R1)", () => {
+    const r = toggleMember([{ ...a, direction: "short" }, b], a, 12);
+    expect(r.added).toBe(false);
+    expect(r.capped).toBe(false);
+    expect(r.next).toEqual([b]);
+  });
+  it("refuses to add when full (capped), returns members unchanged", () => {
+    const full = [a, b];
+    const r = toggleMember(full, { factorKey: "x", params: {}, weight: 0, direction: "long" }, 2);
+    expect(r.added).toBe(false);
+    expect(r.capped).toBe(true);
+    expect(r.next).toBe(full);
+  });
+});
+
+describe("addMembersCapped", () => {
+  const a: FactorMember = { factorKey: "a", params: {}, weight: 0, direction: "long" };
+  const b: FactorMember = { factorKey: "b", params: {}, weight: 0, direction: "long" };
+  const c: FactorMember = { factorKey: "c", params: {}, weight: 0, direction: "long" };
+  it("merges new, dedupes against existing and within the batch", () => {
+    const r = addMembersCapped([a], [a, b, b, c], 12);
+    expect(r.next.map((m) => m.factorKey)).toEqual(["a", "b", "c"]);
+    expect(r.skipped).toBe(2); // duplicate of existing a + duplicate b within batch
+  });
+  it("treats direction-only difference as a duplicate, not a new member (R1)", () => {
+    const r = addMembersCapped([a], [{ ...a, direction: "short" }], 12);
+    expect(r.next).toHaveLength(1);
+    expect(r.skipped).toBe(1);
+  });
+  it("truncates to cap and counts the skipped overflow", () => {
+    const r = addMembersCapped([], [a, b, c], 2);
+    expect(r.next).toHaveLength(2);
+    expect(r.skipped).toBe(1);
+  });
+  it("empty candidates → original members, skipped 0", () => {
+    const r = addMembersCapped([a], [], 12);
+    expect(r.next).toEqual([a]);
+    expect(r.skipped).toBe(0);
+  });
+});
+
+describe("filterLibraryItems", () => {
+  it("matches cn / key case-insensitively", () => {
+    expect(filterLibraryItems(_LIBRARY, "RSI", "").map((i) => i.key)).toEqual(["rev_rsi"]);
+    expect(filterLibraryItems(_LIBRARY, "动量", "").map((i) => i.key)).toEqual(["mom_roc"]);
+  });
+  it("filters by category", () => {
+    expect(filterLibraryItems(_LIBRARY, "", "reversal").map((i) => i.key)).toEqual(["rev_rsi"]);
+  });
+  it("empty q + empty category → original set", () => {
+    expect(filterLibraryItems(_LIBRARY, "", "")).toHaveLength(_LIBRARY.length);
+  });
+});
+
+describe("libraryItemToMember / factorRowToMember", () => {
+  it("library item → member (default params + directionHint, weight 0)", () => {
+    expect(libraryItemToMember(_LIBRARY[1])).toEqual({
+      factorKey: "rev_rsi",
+      params: {},
+      weight: 0,
+      direction: "short",
+    });
+  });
+  it("factor row passes params, freezes auto via library hint, weight 0", () => {
+    expect(
+      factorRowToMember({ factorKey: "mom_roc", params: { win: 14 }, direction: "auto" }, _LIBRARY),
+    ).toEqual({ factorKey: "mom_roc", params: { win: 14 }, weight: 0, direction: "long" });
   });
 });

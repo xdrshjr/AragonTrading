@@ -232,3 +232,87 @@ export function memberIdentity(
 export function rangesOverlap(aStart: number, aEnd: number, bStart: number, bEnd: number): boolean {
   return aStart < bEnd && bStart < aEnd;
 }
+
+// 候选身份键＝`factorKey | 规范化(params)`（**不含 direction**，评审 R1）。调色板用它做「已选回显 /
+// 单击切换 / 批量去重」：同一因子在调色板里只对应一个已选态，direction 仅是加入时默认值，加入篮子后
+// 可翻转而不改候选已选态。与含 direction 的后端对齐键 memberIdentity 职责不同、并存不冲突。
+export function candidateIdentity(
+  member: Pick<FactorMember, "factorKey"> & { params?: Record<string, unknown> },
+): string {
+  return `${member.factorKey}|${stableStringify(member.params ?? {})}`;
+}
+
+// 候选是否已在 members 中（按 candidateIdentity 判定，忽略 direction）。
+export function isCandidateSelected(members: FactorMember[], candidate: FactorMember): boolean {
+  const id = candidateIdentity(candidate);
+  return members.some((m) => candidateIdentity(m) === id);
+}
+
+// 切换候选：命中 candidateIdentity 则移除所有匹配该因子的成员；否则在未满时以候选默认方向追加。
+// added=发生追加；capped=因已满而拒绝追加（供调用方提示上限，绝不静默吞）。
+export function toggleMember(
+  members: FactorMember[],
+  candidate: FactorMember,
+  max: number,
+): { next: FactorMember[]; added: boolean; capped: boolean } {
+  const id = candidateIdentity(candidate);
+  if (members.some((m) => candidateIdentity(m) === id)) {
+    return { next: members.filter((m) => candidateIdentity(m) !== id), added: false, capped: false };
+  }
+  if (members.length >= max) return { next: members, added: false, capped: true };
+  return { next: [...members, candidate], added: true, capped: false };
+}
+
+// 批量并入：按 candidateIdentity 对「候选 vs 既有」与「候选之间」双重去重并截断到 max。
+// skipped=被去重或越上限丢弃的条数（绝不静默吞，供调用方提示）。
+export function addMembersCapped(
+  members: FactorMember[],
+  candidates: FactorMember[],
+  max: number,
+): { next: FactorMember[]; skipped: number } {
+  const next = [...members];
+  const seen = new Set(next.map((m) => candidateIdentity(m)));
+  let skipped = 0;
+  for (const candidate of candidates) {
+    const id = candidateIdentity(candidate);
+    if (seen.has(id) || next.length >= max) {
+      skipped += 1;
+      continue;
+    }
+    next.push(candidate);
+    seen.add(id);
+  }
+  return { next, skipped };
+}
+
+// 客户端过滤库目录：按中文名 / key 命中 q（大小写不敏感）+ 类别匹配（""=全部）。
+export function filterLibraryItems(
+  items: FactorLibraryItem[],
+  q: string,
+  category: string,
+): FactorLibraryItem[] {
+  const needle = q.trim().toLowerCase();
+  return items.filter((item) => {
+    if (category && item.category !== category) return false;
+    if (!needle) return true;
+    return item.cn.toLowerCase().includes(needle) || item.key.toLowerCase().includes(needle);
+  });
+}
+
+// 库目录条目 → 组合成员（默认参数 + directionHint，weight=0）。
+export function libraryItemToMember(item: FactorLibraryItem): FactorMember {
+  return { factorKey: item.key, params: {}, weight: 0, direction: item.directionHint };
+}
+
+// 已存因子行 → 组合成员（自带 params + 冻结方向，weight=0；方向冻结复用 freezeMemberDirection）。
+export function factorRowToMember(
+  factor: Pick<Factor, "factorKey" | "params" | "direction">,
+  library: FactorLibraryItem[],
+): FactorMember {
+  return {
+    factorKey: factor.factorKey,
+    params: factor.params,
+    weight: 0,
+    direction: freezeMemberDirection(factor, library),
+  };
+}

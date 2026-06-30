@@ -5,12 +5,12 @@ import { useEffect, useState } from "react";
 import { Badge, Button, Input, Select, Switch } from "@/components/ui";
 import { api } from "@/lib/api";
 import {
+  addMembersCapped,
   applyWeights,
-  directionLabel,
   formatIc,
-  freezeMemberDirection,
   memberIdentity,
   overfitWarning,
+  toggleMember,
   validateMembers,
   weightBars,
   weightsCoverMembers,
@@ -18,15 +18,17 @@ import {
 import { factorApi } from "@/lib/factorApi";
 import {
   DEFAULT_THRESHOLDS,
-  type Factor,
-  type FactorLibraryItem,
   type FactorMember,
   type FactorThresholds,
   type TrainMethod,
   type TrainResult,
 } from "@/lib/factorTypes";
 import { useAppStore } from "@/lib/store";
+import MemberPalette from "./MemberPalette";
 import { useWorkbench } from "./FactorLab";
+
+// 组合成员数上限（与 validateMembers 同口径，作为批量并入 / 切换的护栏入参）。
+const MAX_MEMBERS = 12;
 
 const METHODS: { value: TrainMethod; label: string }[] = [
   { value: "linear", label: "线性岭回归" },
@@ -142,21 +144,37 @@ export default function FactorSetBuilder() {
   const overfit = overfitWarning(trained?.metrics);
   const trainerOf = (m: TrainMethod) => trainers.data?.find((t) => t.method === m)?.available ?? true;
 
+  // 单击候选切换：命中则移除该因子，否则在未满时追加；已满拒绝并提示上限（不静默吞，评审 R1 / §3.4）。
+  const handleToggle = (member: FactorMember) => {
+    const { next, capped } = toggleMember(members, member, MAX_MEMBERS);
+    if (capped) {
+      setNotice(`最多 ${MAX_MEMBERS} 个因子成员`);
+      return;
+    }
+    setMembers(next);
+  };
+  // 「全选当前结果」批量并入：去重 + 截断到上限，被丢弃条数显式提示（§3.4）。
+  const handleAddMany = (candidates: FactorMember[]) => {
+    const { next, skipped } = addMembersCapped(members, candidates, MAX_MEMBERS);
+    setMembers(next);
+    if (skipped > 0) {
+      setNotice(`已加入候选；${skipped} 个因重复或超出上限（最多 ${MAX_MEMBERS} 个）未加入`);
+    }
+  };
+
   return (
     <div className="flex flex-col gap-4 pb-6">
-      <MemberPicker
+      <MemberPalette
         library={lib.data ?? []}
         members={members}
-        onAdd={(member) =>
-          setMembers((prev) =>
-            // 同一身份（key+规范化 params+方向）只允许一条；同 key 不同参的挖掘变体均可加入（评审 P1-1）。
-            prev.some((x) => memberIdentity(x) === memberIdentity(member)) ? prev : [...prev, member],
-          )
-        }
+        onToggle={handleToggle}
+        onAddMany={handleAddMany}
+        onClear={() => setMembers([])}
         onRemove={(i) => setMembers((prev) => prev.filter((_, idx) => idx !== i))}
         onDirection={(i, direction) =>
           setMembers((prev) => prev.map((m, idx) => (idx === i ? { ...m, direction } : m)))
         }
+        maxMembers={MAX_MEMBERS}
       />
 
       <div className="card flex flex-wrap items-end gap-3 p-3">
@@ -234,192 +252,6 @@ export default function FactorSetBuilder() {
         <p className="text-[11px] text-[var(--short)]">
           操作失败：{((save.error || createStrategy.error) as Error)?.message}
         </p>
-      )}
-    </div>
-  );
-}
-
-// 同 factorKey 的挖掘变体大量重名，用「名称 · key · 关键参数」消歧（评审 P1-1）。
-function myFactorOptionLabel(f: Factor): string {
-  const params =
-    f.params && Object.keys(f.params).length > 0
-      ? ` · ${Object.entries(f.params)
-          .map(([k, v]) => `${k}=${String(v)}`)
-          .join(",")}`
-      : "";
-  return `${f.name} · ${f.factorKey}${params}`;
-}
-
-// 来源「库目录」：从静态因子库选入（可发现性不受 enabled 影响——库是能力清单，不是启用清单）。
-function LibrarySourcePicker({
-  library,
-  onAdd,
-}: {
-  library: FactorLibraryItem[];
-  onAdd: (member: FactorMember) => void;
-}) {
-  const [pick, setPick] = useState("");
-  return (
-    <div className="flex items-center gap-1.5">
-      <Select value={pick} onChange={(e) => setPick(e.target.value)} className="py-1 text-xs">
-        <option value="">选择因子…</option>
-        {library.map((f) => (
-          <option key={f.key} value={f.key}>
-            {f.cn}
-            {f.intradayOnly ? "（仅日内）" : ""}
-          </option>
-        ))}
-      </Select>
-      <Button
-        variant="default"
-        size="sm"
-        disabled={!pick}
-        onClick={() => {
-          const item = library.find((f) => f.key === pick);
-          if (item) onAdd({ factorKey: item.key, params: {}, weight: 0, direction: item.directionHint });
-          setPick("");
-        }}
-      >
-        添加
-      </Button>
-    </div>
-  );
-}
-
-// 来源「我的因子」：候选仅为 enabled==true 的已存因子（"取消激活"真正阻止其进入新组合，L2 闭环）；
-// 选中即用该因子自己的 params + 冻结方向加入；同 key 不同参的挖掘变体均可加入（去重在父层按 memberIdentity 处理）。
-function MyFactorsSourcePicker({
-  library,
-  onAdd,
-}: {
-  library: FactorLibraryItem[];
-  onAdd: (member: FactorMember) => void;
-}) {
-  const [pick, setPick] = useState("");
-  const enabledFactors = useQuery({
-    queryKey: ["factor", "list", { enabled: true }],
-    queryFn: () => factorApi.list({ enabled: true }),
-  });
-  const factors = enabledFactors.data ?? [];
-  const empty = !enabledFactors.isLoading && !enabledFactors.isError && factors.length === 0;
-  return (
-    <div className="flex flex-col items-end gap-1">
-      <div className="flex items-center gap-1.5">
-        <Select
-          value={pick}
-          onChange={(e) => setPick(e.target.value)}
-          className="max-w-[220px] py-1 text-xs"
-          disabled={factors.length === 0}
-        >
-          <option value="">选择激活因子…</option>
-          {factors.map((f) => (
-            <option key={f.id} value={String(f.id)}>
-              {myFactorOptionLabel(f)}
-            </option>
-          ))}
-        </Select>
-        <Button
-          variant="default"
-          size="sm"
-          disabled={!pick}
-          onClick={() => {
-            const f = factors.find((x) => String(x.id) === pick);
-            if (f)
-              onAdd({
-                factorKey: f.factorKey,
-                params: f.params,
-                weight: 0,
-                direction: freezeMemberDirection(f, library),
-              });
-            setPick("");
-          }}
-        >
-          添加
-        </Button>
-      </div>
-      {enabledFactors.isError && (
-        <span className="text-[10px] text-[var(--short)]">加载因子失败，请重试</span>
-      )}
-      {empty && (
-        <span className="max-w-[260px] text-right text-[10px] text-[var(--muted)]">
-          暂无激活因子，去「我的因子」启用或在「因子挖掘」保存结果
-        </span>
-      )}
-    </div>
-  );
-}
-
-function MemberPicker({
-  library,
-  members,
-  onAdd,
-  onRemove,
-  onDirection,
-}: {
-  library: FactorLibraryItem[];
-  members: FactorMember[];
-  onAdd: (member: FactorMember) => void;
-  onRemove: (index: number) => void;
-  onDirection: (index: number, direction: "long" | "short") => void;
-}) {
-  const [source, setSource] = useState<"library" | "mine">("library");
-  const cn = (key: string) => library.find((f) => f.key === key)?.cn ?? key;
-  return (
-    <div className="card flex flex-col gap-3 p-3">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <span className="text-sm font-semibold text-[var(--text)]">组合成员（{members.length}）</span>
-        <div className="flex items-center gap-2">
-          <div className="flex gap-0.5 rounded-[8px] bg-[var(--surface-2)] p-0.5">
-            {(
-              [
-                ["library", "库目录"],
-                ["mine", "我的因子"],
-              ] as const
-            ).map(([val, label]) => (
-              <button
-                key={val}
-                type="button"
-                onClick={() => setSource(val)}
-                className={
-                  "rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-all " +
-                  (source === val
-                    ? "bg-[var(--accent-soft)] text-[var(--accent)]"
-                    : "text-[var(--muted)] hover:text-[var(--text)]")
-                }
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-          {source === "library" ? (
-            <LibrarySourcePicker library={library} onAdd={onAdd} />
-          ) : (
-            <MyFactorsSourcePicker library={library} onAdd={onAdd} />
-          )}
-        </div>
-      </div>
-      {members.length === 0 ? (
-        <p className="py-3 text-center text-[11px] text-[var(--muted)]">
-          从上方「库目录」/「我的因子」选择，或在「因子评估」/「因子挖掘」中「加入组合」。
-        </p>
-      ) : (
-        <ul className="flex flex-col gap-1.5">
-          {members.map((m, i) => (
-            <li key={`${m.factorKey}-${i}`} className="flex items-center gap-2 rounded-[8px] bg-[var(--surface-2)] px-2.5 py-1.5">
-              <span className="flex-1 text-xs font-medium text-[var(--text)]">{cn(m.factorKey)}</span>
-              <code className="text-[10px] text-[var(--muted)]">{m.factorKey}</code>
-              <Select
-                value={m.direction}
-                onChange={(e) => onDirection(i, e.target.value as "long" | "short")}
-                className="px-1.5 py-0.5 text-[11px]"
-              >
-                <option value="long">看多</option>
-                <option value="short">看空</option>
-              </Select>
-              <Button variant="danger" size="sm" onClick={() => onRemove(i)}>移除</Button>
-            </li>
-          ))}
-        </ul>
       )}
     </div>
   );
