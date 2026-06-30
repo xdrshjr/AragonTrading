@@ -1,9 +1,11 @@
-"""因子权重训练（training.py）—— 可插拔训练器注册表 + 能力探测 (spec §2.5)。
+"""因子权重训练（training.py）—— 有序多后端训练器注册表 + 能力探测 (spec §2.4/§2.5)。
 
-核心训练器 ``linear``（numpy 岭回归，默认）/ ``equal`` / ``ic_weight`` **恒可用**（仅 numpy/pandas）；
-``random_forest`` / ``xgboost`` 为**可选**训练器，运行时用 ``importlib.util.find_spec`` 探测，缺库即如实
-返回 ``available=False`` + 安装提示，**绝不假权重、绝不静默降级**（C1）。时序切分（默认前 70% 训练）
-**绝不打乱**（杜绝未来泄漏）；同时回样本内 / 外复合得分 IC，UI 据此提示过拟合风险。
+核心训练器 ``linear``（numpy 岭回归，默认）/ ``equal`` / ``ic_weight`` **恒可用**（仅 numpy/pandas，
+``kind="native"``）。``random_forest`` / ``xgboost`` 升级为**双后端**：真实 sklearn/xgboost 在场则优先
+（``kind="library"``，高保真 + 加速），缺库则回落内置纯 numpy 树集成（``kind="builtin"``，恒可用兜底）。
+两后端**复用单源默认超参**（``RF_DEFAULTS`` / ``GBDT_DEFAULTS``），令「装库与否」只切换保真度/速度、
+不切换模型粗形态（评审 P1-2）；实际生效后端经 ``trainerVersion`` 如实回报前端，**绝不假权重、绝不静默
+降级**（C1）。时序切分（默认前 70% 训练）**绝不打乱**（杜绝未来泄漏）；同时回样本内 / 外复合得分 IC。
 
 归一化契约（评审 C-P0-1）：``build_factor_matrix`` 施加与打分端 ``compose_score`` **逐字一致**的
 因果滚动 z-score（同 ``norm_window``、同 clip），权重在该变换后的特征上学习。
@@ -13,12 +15,23 @@ from __future__ import annotations
 import importlib.util
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 
 from .evaluation import _pearson, _spearman, forward_return
 from .scoring import DEFAULT_CLIP, DEFAULT_NORM_WINDOW, causal_zscore, directional_values, member_names
+from .tree_ensemble import (
+    BUILTIN_GBDT_VERSION,
+    BUILTIN_RF_VERSION,
+    BUILTIN_SEED,
+    GBDT_DEFAULTS,
+    RF_DEFAULTS,
+    fit_gbdt_importances,
+    fit_rf_importances,
+    resolve_tree_params,
+)
 
 MIN_TRAIN_SAMPLES = 30   # 对齐 dropna 后的最小样本数；不足显式报错而非静默（R9）
 DEFAULT_SPLIT = 0.7
@@ -38,17 +51,34 @@ class TrainResult:
     note: str = ""
 
 
+Kind = Literal["native", "library", "builtin"]  # 评审 P1-1：显式标签，消除 native↔builtin 派生歧义
+
+
 @dataclass(frozen=True)
-class Trainer:
-    """单个训练器：能力探测 + 拟合（返回未归一化的原始权重，符号已含在方向化特征里）。"""
+class Backend:
+    """单个训练后端：能力探测 + 拟合（返回未归一化原始权重，符号已含在方向化特征里）+ 版本标签。"""
 
     fit: Callable[[np.ndarray, np.ndarray, dict], np.ndarray]
-    probe_module: str | None = None   # None=恒可用；否则 find_spec 探测该模块
+    kind: Kind                           # native=核心训练器；library=sklearn/xgboost；builtin=内置树兜底
+    probe_module: str | None             # None → 无需探测、恒可用（native / builtin）
+    version: Callable[[], "str | None"]  # 后端版本标签（native 恒 None）
 
     def available(self) -> bool:
-        if self.probe_module is None:
-            return True
-        return importlib.util.find_spec(self.probe_module) is not None
+        return self.probe_module is None or importlib.util.find_spec(self.probe_module) is not None
+
+
+@dataclass(frozen=True)
+class Trainer:
+    """有序多后端训练器：按序取首个可用后端（内置 / 核心兜底恒可用，故 rf/xgb 永真）。"""
+
+    backends: tuple[Backend, ...]
+
+    def available(self) -> bool:
+        return any(b.available() for b in self.backends)
+
+    def resolve(self) -> Backend:
+        """取首个 available 后端（库优先、内置兜底；rf/xgb 至少命中 builtin）。"""
+        return next(b for b in self.backends if b.available())
 
 
 # ============================ 训练数据构建（归一化契约） ============================
@@ -107,38 +137,77 @@ def _fit_linear(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.nd
     return np.linalg.solve(gram, x_train.T @ y_train)
 
 
-def _fit_random_forest(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
-    """sklearn 随机森林 → feature_importances_ 作权重（可选探测）。"""
+def _fit_rf_sklearn(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """sklearn 随机森林 → feature_importances_ 作权重（库后端，复用单源默认 RF_DEFAULTS，评审 P1-2）。"""
     from sklearn.ensemble import RandomForestRegressor
 
+    params = resolve_tree_params(config, RF_DEFAULTS)
     model = RandomForestRegressor(
-        n_estimators=int(config.get("nEstimators", 200)),
-        max_depth=config.get("maxDepth"), random_state=0, n_jobs=-1)
+        n_estimators=params["n_estimators"], max_depth=params["max_depth"],
+        min_samples_leaf=params["min_samples_leaf"], random_state=0, n_jobs=-1)
     model.fit(x_train, y_train)
     return np.asarray(model.feature_importances_, dtype=float)
 
 
-def _fit_xgboost(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
-    """xgboost 回归 → gain 重要度作权重（可选探测）。"""
+def _fit_xgb_native(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """xgboost 回归 → gain 重要度作权重（库后端，复用 GBDT_DEFAULTS + 显式 importance_type="gain"，评审 P1-2）。"""
     from xgboost import XGBRegressor
 
+    params = resolve_tree_params(config, GBDT_DEFAULTS)
     model = XGBRegressor(
-        n_estimators=int(config.get("nEstimators", 200)),
-        max_depth=int(config.get("maxDepth", 3)), learning_rate=0.1,
-        random_state=0, verbosity=0)
+        n_estimators=params["n_estimators"], max_depth=params["max_depth"],
+        learning_rate=GBDT_DEFAULTS["learning_rate"], min_child_weight=params["min_samples_leaf"],
+        importance_type="gain", random_state=0, verbosity=0)
     model.fit(x_train, y_train)
     return np.asarray(model.feature_importances_, dtype=float)
+
+
+def _fit_rf_builtin(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """内置纯 numpy 随机森林重要度（恒可用兜底；缺 sklearn 时生效，评审 §2.3）。"""
+    params = resolve_tree_params(config, RF_DEFAULTS)
+    return fit_rf_importances(
+        x_train, y_train, n_estimators=params["n_estimators"], max_depth=params["max_depth"],
+        min_samples_leaf=params["min_samples_leaf"], seed=BUILTIN_SEED)
+
+
+def _fit_gbdt_builtin(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """内置纯 numpy 梯度提升 gain 重要度（恒可用兜底；缺 xgboost 时生效，评审 §2.3）。"""
+    params = resolve_tree_params(config, GBDT_DEFAULTS)
+    return fit_gbdt_importances(
+        x_train, y_train, n_estimators=params["n_estimators"], max_depth=params["max_depth"],
+        learning_rate=GBDT_DEFAULTS["learning_rate"], min_samples_leaf=params["min_samples_leaf"],
+        seed=BUILTIN_SEED)
+
+
+def _library_version(module: str) -> str:
+    """库后端版本标签（如 ``"sklearn 1.6.1"``）；导入失败回退裸模块名（resolve 后调用，通常已在场）。"""
+    try:
+        return f"{module} {importlib.import_module(module).__version__}"
+    except (ImportError, AttributeError):
+        return module
+
+
+def _native_backend(fit: Callable[[np.ndarray, np.ndarray, dict], np.ndarray]) -> Backend:
+    """核心训练器单后端工厂：``kind="native"``、恒可用、版本恒 ``None``（对外行为字节级不变）。"""
+    return Backend(fit=fit, kind="native", probe_module=None, version=lambda: None)
 
 
 TRAINERS: dict[str, Trainer] = {
-    "equal": Trainer(_fit_equal),
-    "ic_weight": Trainer(_fit_ic_weight),
-    "linear": Trainer(_fit_linear),
-    "random_forest": Trainer(_fit_random_forest, probe_module="sklearn"),
-    "xgboost": Trainer(_fit_xgboost, probe_module="xgboost"),
+    "equal": Trainer((_native_backend(_fit_equal),)),
+    "ic_weight": Trainer((_native_backend(_fit_ic_weight),)),
+    "linear": Trainer((_native_backend(_fit_linear),)),
+    "random_forest": Trainer((
+        Backend(_fit_rf_sklearn, "library", "sklearn", lambda: _library_version("sklearn")),
+        Backend(_fit_rf_builtin, "builtin", None, lambda: BUILTIN_RF_VERSION),
+    )),
+    "xgboost": Trainer((
+        Backend(_fit_xgb_native, "library", "xgboost", lambda: _library_version("xgboost")),
+        Backend(_fit_gbdt_builtin, "builtin", None, lambda: BUILTIN_GBDT_VERSION),
+    )),
 }
 
 _INSTALL_HINT = "训练器不可用：请安装可选依赖 requirements-ml.txt（pip install -r requirements-ml.txt）。"
+_BUILTIN_NOTE = "使用内置实现；安装 requirements-ml.txt（pip install -r requirements-ml.txt）可启用 sklearn/xgboost 加速。"
 
 
 def trainer_available(method: str) -> bool:
@@ -147,8 +216,13 @@ def trainer_available(method: str) -> bool:
 
 
 def available_trainers() -> list[dict]:
-    """训练器目录 ``[{method, available}]``（UI / 工具据此提示可选项）。"""
-    return [{"method": name, "available": trainer.available()} for name, trainer in TRAINERS.items()]
+    """训练器目录 ``[{method, available, backend}]``：``backend=resolve().kind``（rf/xgb 因内置兜底恒可用）。"""
+    out: list[dict] = []
+    for name, trainer in TRAINERS.items():
+        available = trainer.available()
+        out.append({"method": name, "available": available,
+                    "backend": trainer.resolve().kind if available else None})
+    return out
 
 
 def _normalize_weights(raw: np.ndarray, names: list[str]) -> dict[str, float]:
@@ -183,16 +257,20 @@ def _round(value: float | None) -> float | None:
 def train_weights(matrix: np.ndarray, label: np.ndarray, names: list[str], *,
                   method: str = "linear", config: dict | None = None,
                   norm_stats: dict | None = None) -> TrainResult:
-    """按 ``method`` 取训练器拟合权重（时序切分不打乱）；缺库即 available=False，绝不假权重。
+    """按 ``method`` 取训练器首个可用后端拟合权重（时序切分不打乱）；后端经 ``trainerVersion`` 如实回报。
+
+    rf/xgb 因内置树兜底**恒可用**：库在场走库（高保真），缺库走内置实现（``note`` 提示、``trainerVersion``
+    为 ``builtin-*``），绝不假权重、绝不静默降级（C1）。``available=False`` 分支保留作前向兼容（现实中
+    rf/xgb 永真；仅未来若新增「纯探测无兜底」训练器才会触达）。
 
     Args:
         matrix / label / names: ``build_factor_matrix`` 与 ``forward_return_label`` 产物。
         method: equal | ic_weight | linear | random_forest | xgboost。
-        config: 训练配置（split / l2 / nEstimators 等）。
+        config: 训练配置（split / l2 / nEstimators / maxDepth 等）。
         norm_stats: 归一化契约参数（透传进结果，供打分端取同窗口）。
 
     Returns:
-        ``TrainResult``（不可用即 ``available=False`` + 安装提示）。
+        ``TrainResult``：``trainerVersion`` 取实际后端（库版本 / ``builtin-*`` / ``None``）；内置后端附 ``note``。
 
     Raises:
         ValueError: 未知 method / dropna 后样本不足（显式报错，绝不静默）。
@@ -210,20 +288,11 @@ def train_weights(matrix: np.ndarray, label: np.ndarray, names: list[str], *,
         raise ValueError(f"训练样本不足：dropna 后仅 {len(aligned_y)} 行（需 ≥{MIN_TRAIN_SAMPLES}）")
     split = float(config.get("split", DEFAULT_SPLIT))
     cut = max(1, min(len(aligned_y) - 1, int(np.floor(len(aligned_y) * split))))
-    raw = trainer.fit(aligned_x[:cut], aligned_y[:cut], config)
+    backend = trainer.resolve()
+    raw = backend.fit(aligned_x[:cut], aligned_y[:cut], config)
     weights = _normalize_weights(np.asarray(raw, dtype=float), names)
     weight_vec = np.asarray([weights[name] for name in names], dtype=float)
     metrics = _split_metrics(aligned_x, aligned_y, cut, weight_vec)
+    note = _BUILTIN_NOTE if backend.kind == "builtin" else ""
     return TrainResult(method=method, weights=weights, normStats=norm, metrics=metrics,
-                       available=True, trainerVersion=_trainer_version(method))
-
-
-def _trainer_version(method: str) -> str | None:
-    """可选训练器的库版本（用于审计 / 复现；核心训练器返回 None）。"""
-    module = {"random_forest": "sklearn", "xgboost": "xgboost"}.get(method)
-    if module is None:
-        return None
-    try:
-        return importlib.import_module(module).__version__
-    except (ImportError, AttributeError):
-        return None
+                       available=True, trainerVersion=backend.version(), note=note)

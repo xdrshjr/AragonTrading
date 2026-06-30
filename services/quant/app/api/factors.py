@@ -56,7 +56,11 @@ async def factor_library() -> list[dict]:
 
 @router.get("/factors/trainers")
 async def factor_trainers() -> list[dict]:
-    """训练器目录 + 可用性（rf/xgb 缺库即 available=false，前端据此禁用选项）。"""
+    """训练器目录 + 可用性 + 生效后端 ``[{method, available, backend}]``（评审 P2-1）。
+
+    rf/xgb 因内置树集成兜底**恒 available=true**：``backend`` 为 ``library``（sklearn/xgboost 在场）
+    或 ``builtin``（缺库回落）；核心训练器 ``backend="native"``。前端据 ``backend`` 提示生效后端。
+    """
     return available_trainers()
 
 

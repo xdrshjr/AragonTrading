@@ -203,6 +203,8 @@ export default function FactorSetBuilder() {
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-semibold text-[var(--text)]">训练结果</span>
             <Badge tone="accent">{method}</Badge>
+            {/* 生效后端徽标（评审 P2-6）：内置兜底显示 builtin-rf@1 等、库后端显示库版本；核心训练器 trainerVersion=null 时短路不渲染。 */}
+            {trained.trainerVersion && <Badge tone="neutral">{trained.trainerVersion}</Badge>}
             <Badge tone="neutral">样本内 IC {formatIc(trained.metrics.icIn)}</Badge>
             <Badge tone="neutral">样本外 IC {formatIc(trained.metrics.icOut)}</Badge>
             <span className="text-[11px] text-[var(--muted)]">

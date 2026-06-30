@@ -155,9 +155,12 @@ export interface TrainResult {
   provenance?: TrainProvenance;
 }
 
+// 生效后端（评审 P2-3）：native=核心 numpy 训练器，library=sklearn/xgboost 在场，builtin=内置树集成兜底。
+// 旧响应无此字段，缺省安全（UI 仅在 available=false 时禁用选项）。
 export interface TrainerInfo {
   method: TrainMethod;
   available: boolean;
+  backend?: "native" | "library" | "builtin";
 }
 
 // 因子组合（GET /factor-sets）。

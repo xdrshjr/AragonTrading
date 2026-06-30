@@ -236,7 +236,8 @@ class MineFactorsTool(Tool):
 class TrainFactorWeightsTool(Tool):
     name = "train_factor_weights"
     category = "factor"
-    description = ("对一组因子成员训练组合权重（linear 默认恒可用；random_forest/xgboost 需可选依赖，缺库如实回报），"
+    description = ("对一组因子成员训练组合权重（linear/equal/ic_weight/random_forest/xgboost 均恒可用："
+                  "rf/xgb 缺可选依赖时自动回落内置树集成、装库则加速，经 trainerVersion 如实回报后端），"
                   "返回权重与样本内/外复合得分 IC（样本外显著低于样本内 = 过拟合风险）。")
     input_schema = {
         "type": "object",

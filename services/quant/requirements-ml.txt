@@ -1,10 +1,10 @@
-# Aragon Trading — 因子层可选 ML 依赖（因子层 spec §2.5 / §3.1 / R1）
+# Aragon Trading — 因子层可选「加速 / 高保真」后端依赖（因子层 spec §2.3 / §2.4 / R1）
 #
-# 核心因子能力（linear / equal / ic_weight 训练器）仅依赖 requirements.txt 的 numpy/pandas，
-# 恒可用、零新增强制依赖；本文件仅供需要 random_forest / xgboost 训练器的进阶用户按需安装：
+# random_forest / xgboost 训练器为**双后端**：本文件所列库在场则优先走真实库（高保真 + 加速），
+# 缺库则自动回落内置纯 numpy 树集成（builtin-rf / builtin-gbdt），功能**恒可用**、产出真实权重，
+# 经 trainerVersion 如实回报实际后端，绝不假数据、绝不静默降级（C1）。本文件仅供希望提升保真度 /
+# 速度的进阶用户按需安装：
 #   pip install -r requirements-ml.txt
-# 未安装时训练器经 importlib.util.find_spec 探测缺库，如实返回 available=False + 本安装提示
-# （HTTP 400 FACTOR_TRAINER_UNAVAILABLE / 工具 ok=False），绝不假数据、绝不静默降级（C1）。
-# 体量较大，刻意不进桌面端 PyInstaller 默认冻结包。
+# 体量较大，刻意不进桌面端 PyInstaller 默认冻结包（缺库时内置后端兜底，冻结包环境功能不受影响）。
 scikit-learn==1.6.1
 xgboost==2.1.3

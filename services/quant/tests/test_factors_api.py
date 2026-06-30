@@ -165,8 +165,8 @@ async def test_train_and_factor_set_lifecycle(patch_okx):
         await dispose_engine()
 
 
-async def test_train_unavailable_returns_400(patch_okx, monkeypatch):
-    """缺 xgboost 库 → 400 FACTOR_TRAINER_UNAVAILABLE（绝不回假权重）。"""
+async def test_train_missing_lib_falls_back_to_builtin(patch_okx, monkeypatch):
+    """缺 xgboost 库 → 回落内置兜底 200 + builtin-* 版本 + 真实归一权重（恒可用，绝不假权重/400）。"""
     from app.db.session import dispose_engine
     from app.engine.factors import training as training_mod
     monkeypatch.setattr(training_mod.importlib.util, "find_spec", lambda name: None)
@@ -177,8 +177,11 @@ async def test_train_unavailable_returns_400(patch_okx, monkeypatch):
         async with client:
             r = await client.post("/api/factor-sets/train",
                                   json={"members": members, "method": "xgboost", **_RANGE})
-            assert r.status_code == 400
-            assert r.json()["error"]["code"] == "FACTOR_TRAINER_UNAVAILABLE"
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["available"] is True
+            assert body["trainerVersion"].startswith("builtin-gbdt")
+            assert abs(sum(abs(w) for w in body["weights"].values()) - 1.0) < 1e-3
     finally:
         await dispose_engine()
 

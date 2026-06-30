@@ -85,8 +85,8 @@ async def test_mine_and_train_tools(patch_okx):
         await dispose_engine()
 
 
-async def test_train_tool_missing_lib_ok_false(patch_okx, monkeypatch):
-    """缺 xgboost → 工具 ok=False（registry 收敛 HTTPException），绝不假权重。"""
+async def test_train_tool_missing_lib_falls_back_to_builtin(patch_okx, monkeypatch):
+    """缺 xgboost → 工具回落内置兜底 ok=True + builtin-* 版本（恒可用，绝不假权重）。"""
     from app.db.session import dispose_engine
     from app.engine.factors import training as training_mod
     monkeypatch.setattr(training_mod.importlib.util, "find_spec", lambda name: None)
@@ -97,7 +97,9 @@ async def test_train_tool_missing_lib_ok_false(patch_okx, monkeypatch):
                    {"factorKey": "rev_rsi", "direction": "short"}]
         res = await reg.execute("train_factor_weights",
                                 {"members": members, "method": "xgboost", **_RANGE}, _ctx())
-        assert res.ok is False
+        assert res.ok is True
+        assert res.payload["available"] is True
+        assert res.payload["trainerVersion"].startswith("builtin-gbdt")
     finally:
         await dispose_engine()
 
