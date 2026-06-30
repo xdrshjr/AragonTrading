@@ -35,6 +35,15 @@ from .tree_ensemble import (
 
 MIN_TRAIN_SAMPLES = 30   # 对齐 dropna 后的最小样本数；不足显式报错而非静默（R9）
 DEFAULT_SPLIT = 0.7
+
+
+class InsufficientSamplesError(ValueError):
+    """对齐 dropna 后样本不足（< ``MIN_TRAIN_SAMPLES``）的专用异常（weight-model-workspace-hardening H-B5/R-05）。
+
+    继承 ``ValueError`` 保持既有调用方 ``except ValueError`` 行为不破坏；新增子类仅用于把「样本不足」与
+    「越界 config 解析失败」等其它 ``ValueError`` 区分开，使流式作业能把前者精确映射为
+    ``WEIGHT_TRAIN_INSUFFICIENT_SAMPLES``、后者照常落 ``WEIGHT_TRAIN_FAILED``（绝不误标）。
+    """
 DEFAULT_L2 = 1.0
 DEFAULT_CURVE_STEPS = 6   # 扩样本学习曲线默认 fraction 网格步数（末点恒 1.0，weight-model-workspace R-10）
 _CURVE_START_FRACTION = 0.2  # 网格起点（最早子样本占训练段比例）
@@ -305,11 +314,11 @@ def prepare_curve_sample(matrix: np.ndarray, label: np.ndarray, config: dict) ->
     """对齐 dropna + 时序切分 → ``TrainSample``，供流式作业逐 fraction 复用同一样本（与 ``train_weights`` 同口径）。
 
     Raises:
-        ValueError: dropna 后样本不足（< ``MIN_TRAIN_SAMPLES``），调用方据此判失败（绝不空成功 / 卡 running，R-07）。
+        InsufficientSamplesError: dropna 后样本不足（< ``MIN_TRAIN_SAMPLES``），调用方据此判失败（绝不空成功 / 卡 running，R-07）。
     """
     aligned_x, aligned_y = _aligned(matrix, label)
     if len(aligned_y) < MIN_TRAIN_SAMPLES:
-        raise ValueError(f"训练样本不足：对齐后仅 {len(aligned_y)} 行（需 ≥{MIN_TRAIN_SAMPLES}）")
+        raise InsufficientSamplesError(f"训练样本不足：对齐后仅 {len(aligned_y)} 行（需 ≥{MIN_TRAIN_SAMPLES}）")
     return TrainSample(aligned_x, aligned_y, _train_cut(len(aligned_y), config))
 
 

@@ -2,7 +2,9 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
-import { Badge, Button } from "@/components/ui";
+import { useState } from "react";
+import { Badge, Button, Switch } from "@/components/ui";
+import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import { formatIc } from "@/lib/factor";
 import { fmtTime } from "@/lib/format";
 import { methodLabel, runStatusLabel, runStatusTone, sortModelsByUpdated } from "@/lib/weightModel";
@@ -11,7 +13,9 @@ import type { WeightModel } from "@/lib/weightModelTypes";
 
 /**
  * 「权重模型」列表 + CRUD（镜像 FactorSetList shell）：卡片呈现名称 / 标的·周期 / 方法 / 成员数 /
- * 最佳验证 IC / 最近训练态 / 启用；支持训练（进实时视图）/ 查看（详情）/ 编辑 / 删除（二次确认）/ 新建。
+ * 最佳验证 IC / 最近训练态 / 启用；支持训练（进实时视图）/ 查看（详情）/ 编辑 / 删除（应用内二次确认）/ 新建。
+ *
+ * 加固：H-F10 显示已停用开关 + running 卡片轮询刷新 + 删除按钮去抖；H-F8 删除改用应用内 ConfirmDialog。
  */
 export default function WeightModelList({
   onTrain,
@@ -25,7 +29,17 @@ export default function WeightModelList({
   onNew: () => void;
 }) {
   const qc = useQueryClient();
-  const models = useQuery({ queryKey: ["weight-models"], queryFn: () => weightModelApi.list() });
+  const [showDisabled, setShowDisabled] = useState(false);   // H-F10：默认仅显示启用，开关纳入已停用
+  const [pendingDelete, setPendingDelete] = useState<WeightModel | null>(null);   // H-F8：应用内确认
+  const models = useQuery({
+    queryKey: ["weight-models", { enabled: showDisabled ? undefined : true }],
+    queryFn: () => weightModelApi.list(showDisabled ? undefined : true),
+    // H-F10：任一卡片处于 running 时轮询刷新（4s）；无 running 则不轮询（省资源）。
+    refetchInterval: (query) => {
+      const data = query.state.data as WeightModel[] | undefined;
+      return data?.some((m) => m.latestRun?.status === "running") ? 4000 : false;
+    },
+  });
   const remove = useMutation({
     mutationFn: (id: number) => weightModelApi.remove(id),
     onSuccess: () => void qc.invalidateQueries({ queryKey: ["weight-models"] }),
@@ -46,12 +60,18 @@ export default function WeightModelList({
   const items = sortModelsByUpdated(models.data ?? []);
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2">
         <div className="flex flex-col">
           <span className="text-sm font-semibold text-[var(--text)]">权重模型</span>
           <span className="text-[11px] text-[var(--muted)]">管理模型并实时观测每次训练的 loss / IC 曲线</span>
         </div>
-        <Button variant="primary" size="sm" onClick={onNew}>新建模型</Button>
+        <div className="flex items-center gap-3">
+          <label className="flex items-center gap-1.5 text-[11px] text-[var(--muted)]">
+            <Switch checked={showDisabled} onChange={setShowDisabled} label="显示已停用" />
+            显示已停用
+          </label>
+          <Button variant="primary" size="sm" onClick={onNew}>新建模型</Button>
+        </div>
       </div>
 
       {items.length === 0 ? (
@@ -68,12 +88,11 @@ export default function WeightModelList({
             <ModelCard
               key={model.id}
               model={model}
+              deleting={remove.isPending && remove.variables === model.id}
               onTrain={() => onTrain(model)}
               onView={() => onView(model)}
               onEdit={() => onEdit(model)}
-              onDelete={() => {
-                if (window.confirm(`确定删除模型「${model.name}」？将一并删除其全部训练记录。`)) remove.mutate(model.id);
-              }}
+              onDelete={() => setPendingDelete(model)}
             />
           ))}
         </div>
@@ -81,18 +100,32 @@ export default function WeightModelList({
       {remove.isError && (
         <p className="text-[11px] text-[var(--short)]">删除失败：{(remove.error as Error)?.message}</p>
       )}
+
+      <ConfirmDialog
+        open={pendingDelete != null}
+        title="删除权重模型"
+        message={pendingDelete ? `确定删除模型「${pendingDelete.name}」？将一并删除其全部训练记录，且无法恢复。` : ""}
+        confirmText="删除"
+        onConfirm={() => {
+          if (pendingDelete) remove.mutate(pendingDelete.id);
+          setPendingDelete(null);
+        }}
+        onCancel={() => setPendingDelete(null)}
+      />
     </div>
   );
 }
 
 function ModelCard({
   model,
+  deleting,
   onTrain,
   onView,
   onEdit,
   onDelete,
 }: {
   model: WeightModel;
+  deleting: boolean;
   onTrain: () => void;
   onView: () => void;
   onEdit: () => void;
@@ -127,7 +160,9 @@ function ModelCard({
         <Button variant="primary" size="sm" onClick={onTrain}>训练</Button>
         <Button variant="default" size="sm" onClick={onView}>查看</Button>
         <Button variant="default" size="sm" onClick={onEdit}>编辑</Button>
-        <Button variant="ghost" size="sm" onClick={onDelete}>删除</Button>
+        <Button variant="ghost" size="sm" disabled={deleting} onClick={onDelete}>
+          {deleting ? "删除中..." : "删除"}
+        </Button>
       </div>
     </div>
   );

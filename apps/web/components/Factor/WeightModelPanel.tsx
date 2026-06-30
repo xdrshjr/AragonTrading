@@ -40,39 +40,43 @@ export default function WeightModelPanel() {
   const enterTraining = (model: WeightModel) =>
     setView({ kind: "live", target: modelToTrainTarget(model, range) });
 
-  if (view.kind === "live") {
-    return (
+  // H-F8：视图切换时把焦点迁移到内容容器（tabIndex=-1），便于键盘 / 读屏定位新视图（参照 FactorLab headingRef）。
+  const containerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    containerRef.current?.focus();
+  }, [view.kind]);
+
+  const content =
+    view.kind === "live" ? (
       <WeightTrainLive
         target={view.target}
         onBack={() => setView({ kind: "list" })}
         onViewModel={(modelId) => setView({ kind: "detail", modelId })}
       />
-    );
-  }
-  if (view.kind === "detail") {
-    return (
+    ) : view.kind === "detail" ? (
       <WeightModelDetail
         modelId={view.modelId}
         onBack={() => setView({ kind: "list" })}
         onTrain={enterTraining}
       />
-    );
-  }
-  if (view.kind === "editor") {
-    return (
+    ) : view.kind === "editor" ? (
       <WeightModelEditor
         editingId={view.editingId}
         onSaved={() => setView({ kind: "list" })}
         onCancel={() => setView({ kind: "list" })}
       />
+    ) : (
+      <WeightModelList
+        onTrain={enterTraining}
+        onView={(model) => setView({ kind: "detail", modelId: model.id })}
+        onEdit={(model) => setView({ kind: "editor", editingId: model.id })}
+        onNew={() => setView({ kind: "editor", editingId: null })}
+      />
     );
-  }
+
   return (
-    <WeightModelList
-      onTrain={enterTraining}
-      onView={(model) => setView({ kind: "detail", modelId: model.id })}
-      onEdit={(model) => setView({ kind: "editor", editingId: model.id })}
-      onNew={() => setView({ kind: "editor", editingId: null })}
-    />
+    <div ref={containerRef} tabIndex={-1} className="outline-none">
+      {content}
+    </div>
   );
 }

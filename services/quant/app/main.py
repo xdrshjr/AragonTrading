@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -44,7 +45,9 @@ async def lifespan(app: FastAPI):
     logger.info("DB initialized; builtin strategies seeded.")
     await _backfill_companion_strategies()
     await _reconcile_weight_train_runs()
+    sweeper = asyncio.create_task(_weight_train_sweeper())   # H-B6：周期回收过期终态作业（cancel-safe）
     yield
+    sweeper.cancel()                                         # 关停先取消清扫协程（与 manager.shutdown 同段）
     await get_agent_manager().shutdown()
     await get_paper_manager().shutdown()
     await get_live_auto_manager().shutdown()
@@ -88,6 +91,24 @@ async def _reconcile_weight_train_runs() -> None:
             logger.info("reconciled %d dangling weight-train runs to failed", reconciled)
     except Exception as exc:  # noqa: BLE001 —— 启动对账非关键，绝不因它拖垮服务启动
         logger.warning("weight-train run reconcile skipped: %s", exc)
+
+
+async def _weight_train_sweeper() -> None:
+    """周期回收过期终态训练作业（H-B6/R-08）：仅按 TTL/数量回收终态作业（``_prune_finished``），
+
+    **绝不**触碰在跑 run、**绝不**调用全局 ``reconcile_dangling_weight_runs``（那会把同进程内正在跑的 run
+    误判 failed）。cancel-safe：关停取消时干净退出、不外抛；其余异常仅 warning 不让协程死亡。
+    """
+    manager = get_weight_train_manager()
+    try:
+        while True:
+            await asyncio.sleep(120)
+            try:
+                manager._prune_finished()
+            except Exception as exc:  # noqa: BLE001 —— 单次清扫失败不得拖垮常驻协程
+                logger.warning("weight-train sweeper prune skipped: %s", exc)
+    except asyncio.CancelledError:    # R-08：关停取消时干净退出
+        return
 
 
 app = FastAPI(title="Aragon Trading Quant API", version="0.1.0", lifespan=lifespan)

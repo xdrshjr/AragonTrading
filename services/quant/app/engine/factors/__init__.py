@@ -41,6 +41,7 @@ from .scoring import (  # noqa: F401
 )
 from .training import (  # noqa: F401
     MIN_TRAIN_SAMPLES,
+    InsufficientSamplesError,
     TrainResult,
     TrainSample,
     available_trainers,

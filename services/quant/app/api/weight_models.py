@@ -22,6 +22,7 @@ router = APIRouter(tags=["weight-models"])
 
 _TERMINAL_TYPES = ("done", "error", "cancelled")
 _NOT_FOUND = {"code": "NOT_FOUND", "message": "权重模型不存在"}
+_WS_HEARTBEAT_SECONDS = 20.0   # H-B7：静默此秒数后下发 ping（半开探测 + 满队列丢终态兜底）
 
 
 # ============================ 模型 CRUD（§5.1） ============================
@@ -132,7 +133,18 @@ async def ws_weight_train(websocket: WebSocket, job_id: str) -> None:
             await websocket.close()
             return
         while True:
-            event = await queue.get()
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=_WS_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                # H-B7：静默超时 → 下发 ping 兼做半开探测；并兜底检查终态（满队列若丢终态也不悬挂）。
+                await websocket.send_text(json.dumps({"type": "ping"}))
+                if job.is_terminal:
+                    buf = job.snapshot()
+                    if buf and buf[-1].get("type") in _TERMINAL_TYPES:
+                        await websocket.send_text(json.dumps(buf[-1]))
+                    await websocket.close()
+                    break
+                continue
             await websocket.send_text(json.dumps(event))
             if event.get("type") in _TERMINAL_TYPES:
                 await websocket.close()

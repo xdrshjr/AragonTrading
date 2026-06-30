@@ -1,9 +1,10 @@
 "use client";
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 import { useEffect, useState } from "react";
 import { Badge, Button } from "@/components/ui";
+import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import { directionLabel, formatIc } from "@/lib/factor";
 import { fmtTime } from "@/lib/format";
 import { latestRun, methodLabel, runStatusLabel, runStatusTone, runToTrained } from "@/lib/weightModel";
@@ -29,6 +30,14 @@ export default function WeightModelDetail({
   const model = useQuery({ queryKey: ["weight-models", modelId], queryFn: () => weightModelApi.get(modelId) });
   const runs = useQuery({ queryKey: ["weight-models", modelId, "runs"], queryFn: () => weightModelApi.runs(modelId) });
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
+  const [pendingDeleteRunId, setPendingDeleteRunId] = useState<number | null>(null);   // H-F8：应用内确认
+
+  const deleteRun = async (runId: number) => {
+    await weightModelApi.removeRun(modelId, runId);
+    if (selectedRunId === runId) setSelectedRunId(null);
+    void qc.invalidateQueries({ queryKey: ["weight-models", modelId] });
+    void qc.invalidateQueries({ queryKey: ["weight-models", modelId, "runs"] });
+  };
 
   // 默认选中最近一次记录（含未成功，便于看失败原因）。
   useEffect(() => {
@@ -76,17 +85,27 @@ export default function WeightModelDetail({
       <RunHistoryTable
         runs={runs.data ?? []}
         loading={runs.isPending}
+        error={runs.isError}
+        errorMessage={(runs.error as Error)?.message}
+        onRetry={() => void runs.refetch()}
         selectedId={selectedRunId}
         onSelect={setSelectedRunId}
-        onDelete={async (runId) => {
-          await weightModelApi.removeRun(modelId, runId);
-          if (selectedRunId === runId) setSelectedRunId(null);
-          void qc.invalidateQueries({ queryKey: ["weight-models", modelId] });
-          void qc.invalidateQueries({ queryKey: ["weight-models", modelId, "runs"] });
-        }}
+        onRequestDelete={setPendingDeleteRunId}
       />
 
       {selectedRunId != null && <RunReplay modelId={modelId} runId={selectedRunId} />}
+
+      <ConfirmDialog
+        open={pendingDeleteRunId != null}
+        title="删除训练记录"
+        message="删除这条训练记录后将无法恢复，确定继续？"
+        confirmText="删除"
+        onConfirm={() => {
+          if (pendingDeleteRunId != null) void deleteRun(pendingDeleteRunId);
+          setPendingDeleteRunId(null);
+        }}
+        onCancel={() => setPendingDeleteRunId(null)}
+      />
     </div>
   );
 }
@@ -94,17 +113,32 @@ export default function WeightModelDetail({
 function RunHistoryTable({
   runs,
   loading,
+  error,
+  errorMessage,
+  onRetry,
   selectedId,
   onSelect,
-  onDelete,
+  onRequestDelete,
 }: {
   runs: WeightTrainRun[];
   loading: boolean;
+  error?: boolean;
+  errorMessage?: string;
+  onRetry?: () => void;
   selectedId: number | null;
   onSelect: (id: number) => void;
-  onDelete: (id: number) => void;
+  onRequestDelete: (id: number) => void;
 }) {
   if (loading) return <p className="py-6 text-center text-[11px] text-[var(--muted)]">加载训练记录...</p>;
+  // H-F1：加载失败显式为错误态（含重试），绝不渲染成「没有记录」空状态误导用户。
+  if (error) {
+    return (
+      <div className="card flex flex-col items-center gap-2 p-6 text-center">
+        <span className="text-[11px] text-[var(--short)]">加载训练记录失败：{errorMessage ?? "未知错误"}</span>
+        {onRetry && <Button variant="default" size="sm" onClick={onRetry}>重试</Button>}
+      </div>
+    );
+  }
   if (runs.length === 0) {
     return (
       <div className="card flex flex-col items-center gap-2 p-6 text-center">
@@ -129,9 +163,15 @@ function RunHistoryTable({
           {runs.map((run) => (
             <tr
               key={run.id}
+              role="button"
+              tabIndex={0}
+              aria-label={`训练记录 ${runStatusLabel(run.status)} ${methodLabel(run.method)}`}
               onClick={() => onSelect(run.id)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(run.id); }
+              }}
               className={clsx(
-                "cursor-pointer border-b border-[var(--border)] transition-colors",
+                "cursor-pointer border-b border-[var(--border)] outline-none transition-colors focus-visible:bg-[var(--accent-soft)]/30",
                 selectedId === run.id ? "bg-[var(--accent-soft)]/40" : "hover:bg-[var(--surface-2)]",
               )}
             >
@@ -144,7 +184,7 @@ function RunHistoryTable({
                 {run.status !== "running" && (
                   <button
                     type="button"
-                    onClick={(e) => { e.stopPropagation(); if (window.confirm("删除这条训练记录？")) onDelete(run.id); }}
+                    onClick={(e) => { e.stopPropagation(); onRequestDelete(run.id); }}
                     className="text-[var(--muted)] underline hover:text-[var(--short)]"
                   >
                     删除
@@ -173,6 +213,14 @@ function RunReplay({ modelId, runId }: { modelId: number; runId: number }) {
     return (
       <p className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] text-[var(--short)]">
         该次训练失败（{data.errorCode ?? "ERROR"}）：{data.errorMessage ?? "无详情"}
+      </p>
+    );
+  }
+  // H-F7：取消态专门呈现中性提示，不再含糊地展示「空权重回放」，与「成功但空权重」区分。
+  if (data.status === "cancelled") {
+    return (
+      <p className="rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-[11px] text-[var(--muted)]">
+        该次训练已取消（用户主动中止），未产出最终权重。
       </p>
     );
   }

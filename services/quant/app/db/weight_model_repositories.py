@@ -255,14 +255,24 @@ async def repoint_weight_model(session: AsyncSession, model: WeightModel) -> Non
     await session.flush()
 
 
+def _best_ic_run_id(rows: list[WeightTrainRun]) -> int | None:
+    """当前持有 ``best_valid_ic`` 的 succeeded run id（H-B8：自动剪枝永不删它，否则「历史最佳」会静默退化为「保留集内最佳」）。"""
+    scored = [(run.id, _valid_ic_of(run)) for run in rows if run.status == "succeeded"]
+    scored = [(run_id, ic) for run_id, ic in scored if ic is not None]
+    if not scored:
+        return None
+    return max(scored, key=lambda item: item[1])[0]
+
+
 async def _prune_runs(session: AsyncSession, model: WeightModel, cap: int) -> int:
-    """删超出 ``cap`` 的最旧记录，**永不删 ``latest_run_id`` 指向或 running 记录**（R-05）；返回丢弃数并显式 log。"""
+    """删超出 ``cap`` 的最旧记录，**永不删 ``latest_run_id`` 指向 / running / 当前 best-IC 记录**（R-05/H-B8）；返回丢弃数并显式 log。"""
     rows = (await session.execute(
         select(WeightTrainRun).where(WeightTrainRun.model_id == model.id)
         .order_by(WeightTrainRun.id.desc()))).scalars().all()
+    best_id = _best_ic_run_id(rows)   # H-B8：保护当前最佳 IC 记录，使自动剪枝不令「历史最佳」失真
     dropped = 0
     for idx, run in enumerate(rows):
-        if idx < cap or run.id == model.latest_run_id or run.status == "running":
+        if idx < cap or run.id == model.latest_run_id or run.status == "running" or run.id == best_id:
             continue
         await session.delete(run)
         dropped += 1

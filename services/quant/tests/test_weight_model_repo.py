@@ -147,6 +147,40 @@ async def test_delete_pointer_run_repoints(monkeypatch):
         await dispose_engine()
 
 
+async def test_prune_preserves_best_ic_run():
+    """H-B8：自动剪枝永不删当前持 best_valid_ic 的 succeeded run → 「历史最佳」绝不静默退化。"""
+    sm = await _fresh()
+    try:
+        async with sm() as s:
+            model = await repo.create_weight_model(s, spec=_SPEC)
+            best = await repo.add_weight_run(s, start=_run_start(model.id))   # 最旧但 IC 最高
+            await repo.finalize_weight_run(s, best.id, outcome=_success(0.9), run_cap=3)
+            for _ in range(4):   # 后续 4 条低 IC，超 cap=3 触发剪枝
+                run = await repo.add_weight_run(s, start=_run_start(model.id))
+                await repo.finalize_weight_run(s, run.id, outcome=_success(0.1), run_cap=3)
+            refreshed = await repo.get_weight_model(s, model.id)
+            assert abs(refreshed.best_valid_ic - 0.9) < 1e-9   # 历史最佳不退化（best-IC run 受保护）
+            assert await repo.get_weight_run(s, model.id, best.id) is not None   # best-IC run 未被自动剪
+    finally:
+        await dispose_engine()
+
+
+async def test_prune_logs_dropped_count(caplog):
+    """剪枝有删除即显式 log 丢弃数（无静默截断，呼应清洁度「绝不静默」）。"""
+    import logging
+    sm = await _fresh()
+    try:
+        caplog.set_level(logging.INFO, logger="aragon")
+        async with sm() as s:
+            model = await repo.create_weight_model(s, spec=_SPEC)
+            for _ in range(5):   # 超 cap=2 必有剪枝
+                run = await repo.add_weight_run(s, start=_run_start(model.id))
+                await repo.finalize_weight_run(s, run.id, outcome=_success(0.2), run_cap=2)
+        assert any("pruned" in rec.message for rec in caplog.records)
+    finally:
+        await dispose_engine()
+
+
 async def test_delete_running_run_rejected():
     sm = await _fresh()
     try:

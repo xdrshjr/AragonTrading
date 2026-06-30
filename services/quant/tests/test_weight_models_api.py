@@ -160,6 +160,12 @@ async def test_gate_busy_429_no_orphan(patch_okx, monkeypatch):
                 def active_count(self):
                     return 99
 
+                def reserve(self):   # H-B3：同步预占硬上限——繁忙时拒绝（返回 False → 429）
+                    return False
+
+                def release(self):
+                    pass
+
             monkeypatch.setattr("app.factors.weight_model_service.get_weight_train_manager",
                                 lambda: _BusyManager())
             r = await client.post("/api/weight-models/train", json=_train_body())

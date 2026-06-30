@@ -61,13 +61,15 @@ export default function WeightModelEditor({
   }, [editingId, existing.data]);
 
   const memberError = validateMembers(members);
+  const nameError = !name.trim() ? "请填写模型名称" : "";   // H-F6：模型名必填校验
 
   const save = useMutation({
     mutationFn: () => {
-      const body = editorToCreateBody({ name, instId: wb.instId, bar: wb.bar, members, method, horizon, notes });
+      const trimmed = name.trim();
+      const body = editorToCreateBody({ name: trimmed, instId: wb.instId, bar: wb.bar, members, method, horizon, notes });
       return editingId == null
         ? weightModelApi.create(body)
-        : weightModelApi.update(editingId, { name, members, method, horizon, notes });
+        : weightModelApi.update(editingId, { name: trimmed, members, method, horizon, notes });
     },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["weight-models"] });
@@ -108,7 +110,13 @@ export default function WeightModelEditor({
       <div className="card flex flex-wrap items-end gap-3 p-3">
         <label className="flex flex-1 flex-col gap-1" style={{ minWidth: 180 }}>
           <span className="text-[11px] text-[var(--muted)]">模型名称</span>
-          <Input value={name} onChange={(e) => setName(e.target.value)} className="py-1.5 text-xs" />
+          <Input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            invalid={!!nameError}
+            className="py-1.5 text-xs"
+          />
+          {nameError && <span className="text-[11px] text-[var(--short)]">{nameError}</span>}
         </label>
         <label className="flex flex-col gap-1">
           <span className="text-[11px] text-[var(--muted)]">训练方法</span>
@@ -135,7 +143,7 @@ export default function WeightModelEditor({
       </label>
 
       <div className="flex flex-wrap items-center gap-2">
-        <Button variant="primary" disabled={!!memberError || save.isPending} onClick={() => save.mutate()}>
+        <Button variant="primary" disabled={!!memberError || !!nameError || save.isPending} onClick={() => save.mutate()}>
           {save.isPending ? "保存中..." : editingId == null ? "创建模型" : "保存修改"}
         </Button>
         {memberError && <span className="text-[11px] text-[var(--short)]">{memberError}</span>}

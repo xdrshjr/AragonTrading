@@ -141,6 +141,7 @@ export default function FactorSetBuilder() {
       skipTrainResetRef.current = true; // 跳过本次水合触发的 [members] 训练作废（H3）
       retrainedRef.current = false; // 水合的 trained 视为「未在本会话重训」（更新时不重打戳，P2-1）
       loadedTrainedAtRef.current = next.loadedTrainedAt;
+      setBoundModelId(null); // H-F2：载入不同组合即复位绑定模型，杜绝跨上下文污染下一次「训练权重」
       setMembers(next.members);
       if (next.method) setMethod(next.method);
       setName(next.name);
@@ -362,12 +363,19 @@ export default function FactorSetBuilder() {
     setEditStrategyId(null);
     loadedTrainedAtRef.current = null;
     retrainedRef.current = false;
+    setBoundModelId(null); // H-F2：新建组合即复位绑定模型
     setMembers([]);
     setMethod("linear");
     setName("我的因子组合");
     setThresholds({ ...DEFAULT_THRESHOLDS });
     setTrained(null);
     setNotice(null);
+  };
+
+  // 清空成员即复位绑定模型（成员集变化=新上下文，杜绝陈旧 boundModelId 污染，H-F2）。
+  const clearMembers = () => {
+    setMembers([]);
+    setBoundModelId(null);
   };
 
   return (
@@ -384,7 +392,7 @@ export default function FactorSetBuilder() {
         members={members}
         onToggle={handleToggle}
         onAddMany={handleAddMany}
-        onClear={() => setMembers([])}
+        onClear={clearMembers}
         onRemove={(i) => setMembers((prev) => prev.filter((_, idx) => idx !== i))}
         onDirection={(i, direction) =>
           setMembers((prev) => prev.map((m, idx) => (idx === i ? { ...m, direction } : m)))

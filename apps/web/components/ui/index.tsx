@@ -19,6 +19,8 @@ export function Button({
     <button
       className={clsx(
         "inline-flex items-center justify-center gap-1.5 rounded-[10px] font-medium transition-all duration-150 ease-smooth disabled:opacity-40 disabled:cursor-not-allowed",
+        // H-F8：键盘聚焦可见环（仅 focus-visible，鼠标点击不显，不改既有视觉）。
+        "outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg)]",
         size === "sm" ? "px-2.5 py-1 text-xs" : "px-3.5 py-2 text-sm",
         variant === "primary" &&
           "bg-[var(--accent)] text-white hover:brightness-105 active:brightness-95 shadow-soft",

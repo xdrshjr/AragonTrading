@@ -87,6 +87,9 @@ export interface WeightTrainTarget {
   name: string;
   modelId?: number;
   factorSetId?: number;
+  // 发起来源（瞬态，不持久化）：builder = 搭建台「训练权重」（同会话复用记忆 boundModelId）；
+  // model = 列表/详情「训练」已存模型（不写 boundModelId，杜绝跨上下文污染，H-F2）。
+  origin: "builder" | "model";
 }
 
 // 训练产物回流载荷（瞬态 store.weightTrainResult）：WeightTrainLive「应用到组合并返回」写入，

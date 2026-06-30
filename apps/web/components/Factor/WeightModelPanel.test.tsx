@@ -186,6 +186,40 @@ describe("WeightModelPanel — 路由与交接消费", () => {
   });
 });
 
+describe("WeightModelPanel — 列表三态与训练拒绝回灌（H-T3）", () => {
+  it("renders loading state while list query is pending", () => {
+    api.list.mockReturnValue(new Promise(() => {}));   // 永不 resolve → pending
+    wrap(<WeightModelPanel />);
+    expect(screen.getByText("加载权重模型...")).toBeTruthy();
+  });
+
+  it("renders empty state when list is empty", async () => {
+    api.list.mockResolvedValue([]);
+    wrap(<WeightModelPanel />);
+    await waitFor(() => expect(screen.getByText("还没有权重模型")).toBeTruthy());
+  });
+
+  it("renders error state (not empty) when list query fails", async () => {
+    api.list.mockRejectedValue(new Error("后端不可达"));
+    wrap(<WeightModelPanel />);
+    await waitFor(() => expect(screen.getByText(/加载权重模型失败：后端不可达/)).toBeTruthy());
+    expect(screen.getByRole("button", { name: "重试" })).toBeTruthy();
+  });
+
+  it("surfaces a 429/413 train rejection in the live view (回灌可返回列表)", async () => {
+    api.train.mockRejectedValue(new Error("并发训练作业已达上限 4，请稍后重试。"));
+    const target = buildTrainTarget({
+      members: MEMBERS, method: "linear", thresholds: DEFAULT_THRESHOLDS, horizon: 6,
+      instId: "BTC-USDT-SWAP", bar: "1H", startTs: 1, endTs: 2, name: "繁忙组合",
+    });
+    useAppStore.setState({ weightTrainTarget: target });
+    wrap(<WeightModelPanel />);
+
+    await waitFor(() => expect(screen.getByText(/并发训练作业已达上限/)).toBeTruthy());
+    expect(screen.getByRole("button", { name: "← 返回列表" })).toBeTruthy();   // 可回灌列表
+  });
+});
+
 describe("FactorSetBuilder ⇄ 权重模型工作区 交接", () => {
   it("训练权重 writes the handoff target and switches to the models section", async () => {
     (factorApi.sets.get as ReturnType<typeof vi.fn>).mockResolvedValue(trainedSet());

@@ -1,4 +1,4 @@
-"""权重模型流式训练作业管理（weight-model-workspace §3.3）。
+"""权重模型流式训练作业管理（weight-model-workspace §3.3 + hardening 主线 A）。
 
 进程内单例 ``WeightTrainManager`` **只持作业注册表**（镜像 ``paper/manager.py``）；asyncio.Queue 扇出 +
 全量事件缓冲（含终态，供晚订阅 / 重连 / 快作业无损回放，R-06）落在 per-job ``_TrainJob`` 上（镜像
@@ -9,6 +9,10 @@
 末步 ``f=1.0`` 经 ``train_weights`` 装配最终产物，与 ``POST /factor-sets/train`` 对相同输入字节级等价
 （放行条件 1）。取数一律走真实 OKX（复用 ``service._load_df`` 的进程内 K 线缓存），CPU 工作交
 ``run_in_threadpool``（绝不阻塞事件循环）。每条 run 必达终态之一（succeeded / failed / cancelled）。
+
+加固（hardening 主线 A）：H-B1 落库失败也必达终态（``_persist`` 尽力而为不抛 + 有界重试一次，绝不让 WS
+永久悬挂 / run 永久卡 running）；H-B2 取消在加载 / 构建阶段也及时响应；H-B3 并发上限改同步预占硬上限；
+H-B4 关停先置标志、再带超时 join、最后 ``force_cancel`` 兜底；H-B6 注入时钟使 TTL 淘汰可确定性测试。
 """
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ import asyncio
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from fastapi.concurrency import run_in_threadpool
@@ -24,6 +29,7 @@ from ..config import get_settings
 from ..db import repositories as repo
 from ..db.session import get_sessionmaker
 from ..engine.factors import (
+    InsufficientSamplesError,
     build_factor_matrix,
     fit_at_fraction,
     forward_return_label,
@@ -41,6 +47,8 @@ logger = logging.getLogger("aragon")
 _TERMINAL_TYPES = ("done", "error", "cancelled")
 _FINISHED_TTL_SECONDS = 600.0   # 终态作业在注册表保留时长（供晚订阅 / 重连回放后回收）
 _FINISHED_JOBS_CAP = 64         # 终态作业保留数上限（超出按完成时间淘汰最旧）
+_PERSIST_RETRY_DELAY = 0.2      # H-B1/R-02：瞬态 SQLite 锁多在数十~数百 ms 内自清，单次有界重试
+_SHUTDOWN_JOIN_TIMEOUT = 5.0    # H-B4：关停 join 单作业超时，超时则 task.cancel() 硬取消兜底
 
 
 @dataclass(frozen=True)
@@ -62,12 +70,13 @@ class JobSpec:
 class _TrainJob:
     """单个流式训练作业：扇出 + 全量事件缓冲（含终态）+ async 训练协程（镜像 PaperSession 分层）。"""
 
-    def __init__(self, job_id: str, spec: JobSpec):
+    def __init__(self, job_id: str, spec: JobSpec, *, clock: Callable[[], float] = time.monotonic):
         self.job_id = job_id
         self.run_id = spec.run_id
         self.model_id = spec.model_id
         self.status = "running"
         self._spec = spec
+        self._clock = clock                       # H-B6：可注入单调时钟（TTL 确定性测试）
         self._buffer: list[dict] = []
         self._subscribers: set[asyncio.Queue] = set()
         self._cancel = False
@@ -108,6 +117,12 @@ class _TrainJob:
         if not self.is_terminal:
             self._cancel = True
 
+    def force_cancel(self) -> None:
+        """硬取消（H-B4）：取消协程任务，由 ``_run`` 的 ``except CancelledError`` 落 ``cancelled`` 终态。"""
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+
     async def join(self) -> None:
         task = self._task
         if task is not None and not task.done():
@@ -124,12 +139,16 @@ class _TrainJob:
                 "runId": self.run_id, "modelId": self.model_id, "status": "running"}})
             self._emit_phase("loading", 5)
             df = await service._load_df(spec.rest, spec.window)
+            if self._cancel:                       # H-B2：取消在最长的 OKX 取数后立即生效
+                return await self._finalize_cancelled()
             self._emit_phase("building", 25)
             norm_window = int(spec.config.get("normWindow", DEFAULT_NORM_WINDOW))
             clip = float(spec.config.get("clip", DEFAULT_CLIP))
             matrix, names, norm = await run_in_threadpool(
                 build_factor_matrix, df, spec.members, norm_window=norm_window, clip=clip,
                 bar=spec.window.bar)
+            if self._cancel:                       # H-B2：构建（线程池）后立即生效
+                return await self._finalize_cancelled()
             label = forward_return_label(df, spec.horizon)
             await self._fit_and_finalize(matrix, label, names, norm)
         except OKXError as exc:
@@ -145,7 +164,7 @@ class _TrainJob:
         spec = self._spec
         try:
             sample = await run_in_threadpool(prepare_curve_sample, matrix, label, spec.config)
-        except ValueError as exc:
+        except InsufficientSamplesError as exc:    # H-B5/R-05：仅样本不足落 INSUFFICIENT_SAMPLES
             await self._fail("WEIGHT_TRAIN_INSUFFICIENT_SAMPLES", str(exc))
             return
         steps = learning_curve_steps(sample.cut, steps=spec.curve_steps)
@@ -202,14 +221,38 @@ class _TrainJob:
             status="failed", finished_ts=_now(), error_code=code, error_message=message))
         self._push({"type": "error", "data": {"code": code, "message": message, "runId": self.run_id}})
 
-    async def _persist(self, outcome: repo.WeightRunOutcome) -> None:
-        """一次性 sessionmaker session 落终态（与 ``_backfill_companion_strategies`` 同范式）+ 维护模型指针。"""
-        sm = get_sessionmaker()
-        async with sm() as session:
-            await repo.finalize_weight_run(session, self.run_id, outcome=outcome,
-                                    run_cap=self._spec.run_cap)
-        self.status = outcome.status
-        self.finished_mono = time.monotonic()
+    async def _persist(self, outcome: repo.WeightRunOutcome) -> bool:
+        """落终态记录（**尽力而为、绝不抛**）+ 维护模型指针；H-B1/R-02：失败先有界重试一次，仍失败则记错放弃。
+
+        无论落库成败都把作业转终态并推终态事件（解耦 DB 结果），否则 DB 写失败会让 WS 订阅者永久卡
+        ``await queue.get()`` 且 run 永久 ``running``（P0 故障链）。返回是否落库成功（调用方目前不依赖，
+        留待精确重试增强）。
+        """
+        ok = await self._try_finalize(outcome)
+        if not ok:
+            await asyncio.sleep(_PERSIST_RETRY_DELAY)   # R-02：瞬态锁一次有界重试
+            ok = await self._try_finalize(outcome)
+        if not ok:
+            # R-02：重试仍失败 → 显式记错并放弃；run 行真实留 running（绝不静默假成功），
+            # 由启动对账（reconcile_dangling_weight_runs）在下次启动改判 failed。
+            logger.error(
+                "weight run %d 落库失败（已重试 1 次），仍发终态事件并转终态；run 行留 running 待启动对账修正",
+                self.run_id)
+        self.status = outcome.status            # 无论成败都转终态（is_terminal=true → 可回收、WS 可关）
+        self.finished_mono = self._clock()
+        return ok
+
+    async def _try_finalize(self, outcome: repo.WeightRunOutcome) -> bool:
+        """单次落库尝试（一次性 sessionmaker session，与 ``_backfill_companion_strategies`` 同范式）；成功 True，异常 False。"""
+        try:
+            sm = get_sessionmaker()
+            async with sm() as session:
+                await repo.finalize_weight_run(session, self.run_id, outcome=outcome,
+                                               run_cap=self._spec.run_cap)
+            return True
+        except Exception as exc:  # noqa: BLE001 —— DB 落库失败不得吞掉终态事件，否则 WS 永久悬挂
+            logger.warning("weight run %d finalize 尝试失败：%s", self.run_id, exc)
+            return False
 
     def _emit_phase(self, phase: str, pct: int) -> None:
         self._push({"type": "phase", "data": {"phase": phase, "pct": pct}})
@@ -222,17 +265,36 @@ def _now() -> int:
 class WeightTrainManager:
     """流式训练作业注册表（进程内单例，job-capped，lifespan 关闭）。"""
 
-    def __init__(self):
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic):
         self._jobs: dict[str, _TrainJob] = {}
+        self._reserved = 0                   # H-B3：同步预占名额（覆盖守门→注册之间的 await 窗口）
+        self._clock = clock                  # H-B6：可注入单调时钟（TTL 确定性测试）
 
     def active_count(self) -> int:
         return sum(1 for job in self._jobs.values() if job.status == "running")
 
+    def reserve(self) -> bool:
+        """同步、无 await 预占一个并发名额（H-B3）：守门即占名额，杜绝 ``active_count`` 判定到注册之间的 TOCTOU。
+
+        R-03：动态读 ``settings``——manager 为惰性单例，**不缓存** cap（缓存会与运行期 settings 覆写脱钩，
+        并使「并发 cap+1」回归测试无法确定性控制上限），与既有 service 层动态读取保持一致。
+        """
+        cap = get_settings().max_weight_train_jobs
+        if self.active_count() + self._reserved >= cap:
+            return False
+        self._reserved += 1
+        return True
+
+    def release(self) -> None:
+        """释放一个预占名额（守门后任何失败路径调用；``start_job`` 注册成功后亦调一次转 running 计数）。"""
+        self._reserved = max(0, self._reserved - 1)
+
     def start_job(self, spec: JobSpec) -> _TrainJob:
         """注册并启动一个流式训练作业（此刻起即开缓冲，R-01 守门已在 service 层全过）。"""
         self._prune_finished()
-        job = _TrainJob(uuid.uuid4().hex, spec)
+        job = _TrainJob(uuid.uuid4().hex, spec, clock=self._clock)
         self._jobs[job.job_id] = job
+        self.release()                       # 预占转为 running 计数（job.status=="running" 即被 active_count 计入）
         job.start()
         return job
 
@@ -250,14 +312,21 @@ class WeightTrainManager:
         return "cancelling"
 
     async def shutdown(self) -> None:
-        for job in list(self._jobs.values()):
+        """关停（H-B4）：① 先把所有作业一次性置取消标志 → ② 带超时 join，超时则 ``force_cancel`` 兜底。"""
+        jobs = list(self._jobs.values())
+        for job in jobs:                       # ① 先置全部取消标志（不再串行等待）
             job.request_cancel()
-            await job.join()
+        for job in jobs:                       # ② 带超时 join；超时则硬取消兜底
+            try:
+                await asyncio.wait_for(job.join(), timeout=_SHUTDOWN_JOIN_TIMEOUT)
+            except asyncio.TimeoutError:
+                job.force_cancel()
+                await job.join()
         self._jobs.clear()
 
     def _prune_finished(self) -> None:
         """淘汰过期终态作业（TTL + 数量上限）；running 作业绝不淘汰（作业与 socket 解耦，续跑可靠）。"""
-        now = time.monotonic()
+        now = self._clock()
         finished = [(jid, job) for jid, job in self._jobs.items()
                     if job.is_terminal and job.finished_mono is not None]
         for jid, job in finished:

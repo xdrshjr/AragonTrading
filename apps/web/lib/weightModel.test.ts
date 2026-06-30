@@ -6,6 +6,7 @@ import {
   buildTrainTarget,
   latestRun,
   metricGeometry,
+  modelToTrainTarget,
   runToTrained,
   sortModelsByUpdated,
   trainStartBody,
@@ -59,6 +60,33 @@ describe("metricGeometry", () => {
     ];
     const geom = metricGeometry(curve, "trainLoss", "validLoss", 100, 50);
     expect(geom.validPath).toHaveLength(1); // null 段断线
+  });
+
+  // H-T7：单点 / 全 null / 空曲线的几何稳健性（绝不崩、绝不补假点）。
+  it("handles a single point (degenerate domain expands)", () => {
+    const geom = metricGeometry([curvePoint({ step: 0, fraction: 1.0, validIc: 0.2, trainIc: 0.2 })],
+      "trainIc", "validIc", 100, 50);
+    expect(geom.trainPath).toHaveLength(1);
+    expect(geom.validPath).toHaveLength(1);
+    expect(geom.max).toBeGreaterThan(geom.min); // min===max → 人为撑开避免除零
+  });
+
+  it("returns empty geometry when all values are null", () => {
+    const curve = [
+      curvePoint({ step: 0, fraction: 0.2, trainIc: null, validIc: null }),
+      curvePoint({ step: 1, fraction: 1.0, trainIc: null, validIc: null }),
+    ];
+    const geom = metricGeometry(curve, "trainIc", "validIc", 100, 50);
+    expect(geom.trainPath).toHaveLength(0);
+    expect(geom.validPath).toHaveLength(0);
+    expect(geom.min).toBe(0);
+    expect(geom.max).toBe(0);
+  });
+
+  it("returns empty geometry for an empty curve", () => {
+    const geom = metricGeometry([], "trainLoss", "validLoss", 100, 50);
+    expect(geom.trainPath).toHaveLength(0);
+    expect(geom.validPath).toHaveLength(0);
   });
 });
 
@@ -125,6 +153,31 @@ describe("handoff construction", () => {
   it("runToTrained returns null for non-succeeded run", () => {
     expect(runToTrained(run({ status: "failed", weights: {} }))).toBeNull();
     expect(runToTrained(run({}))?.weights).toEqual({ mom_roc: 1 });
+  });
+
+  // H-F5/H-F2：列表/详情发起训练用模型自身标的/周期（非工作台），时间窗仍取工作台区间，origin=model。
+  it("modelToTrainTarget uses the model's own instId/bar and tags origin=model", () => {
+    const m: WeightModel = {
+      id: 5, name: "动量", instId: "SOL-USDT-SWAP", bar: "15m", members: MEMBERS, method: "linear",
+      config: {}, horizon: 6, source: "manual", factorSetId: 7, latestRunId: null, bestValidIc: null,
+      notes: "", enabled: true, latestRun: null, createdTs: 0, updatedTs: 0,
+    };
+    const target = modelToTrainTarget(m, { instId: "BTC-USDT-SWAP", bar: "1H", startTs: 100, endTs: 200 });
+    expect(target.instId).toBe("SOL-USDT-SWAP");   // 模型自身标的（非工作台 BTC）
+    expect(target.bar).toBe("15m");                // 模型自身周期（非工作台 1H）
+    expect(target.startTs).toBe(100);              // 时间窗仍取工作台区间
+    expect(target.endTs).toBe(200);
+    expect(target.origin).toBe("model");
+    expect(target.modelId).toBe(5);
+    expect(target.factorSetId).toBe(7);
+  });
+
+  it("buildTrainTarget defaults origin to builder", () => {
+    const target = buildTrainTarget({
+      members: MEMBERS, method: "linear", thresholds: DEFAULT_THRESHOLDS, horizon: 6,
+      instId: "BTC-USDT-SWAP", bar: "1H", startTs: 1, endTs: 2, name: "x",
+    });
+    expect(target.origin).toBe("builder");
   });
 });
 

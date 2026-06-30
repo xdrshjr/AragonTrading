@@ -151,6 +151,7 @@ export function formatLoss(value: number | null | undefined): string {
 export { formatIc };
 
 // builder「训练权重」→ 交接载荷（瞬态 store.weightTrainTarget）。携带完整 builder 状态供回流无损水合。
+// origin 缺省 "builder"（搭建台发起，记忆 boundModelId）；列表/详情发起经 modelToTrainTarget 显式置 "model"。
 export function buildTrainTarget(params: {
   members: FactorMember[];
   method: TrainMethod;
@@ -163,6 +164,7 @@ export function buildTrainTarget(params: {
   name: string;
   modelId?: number;
   factorSetId?: number;
+  origin?: "builder" | "model";
 }): WeightTrainTarget {
   return {
     members: params.members,
@@ -175,6 +177,7 @@ export function buildTrainTarget(params: {
     startTs: params.startTs,
     endTs: params.endTs,
     name: params.name,
+    origin: params.origin ?? "builder",
     ...(params.modelId != null ? { modelId: params.modelId } : {}),
     ...(params.factorSetId != null ? { factorSetId: params.factorSetId } : {}),
   };
@@ -197,7 +200,9 @@ export function trainStartBody(target: WeightTrainTarget): WeightTrainStartBody 
   };
 }
 
-// 模型 → 新建训练交接载荷（在列表「训练」直接进实时视图，复用模型当前 spec）。
+// 模型 → 新建训练交接载荷（在列表/详情「训练」直接进实时视图，复用模型当前 spec）。
+// H-F5：标的/周期取**模型自身**（与卡片所示一致，消除静默漂移）；时间窗仍取工作台当前区间（用户当下选择）。
+// H-F2：origin="model" → 不写 boundModelId（杜绝跨上下文污染）。
 export function modelToTrainTarget(model: WeightModel, range: {
   instId: string;
   bar: string;
@@ -210,11 +215,12 @@ export function modelToTrainTarget(model: WeightModel, range: {
     method: model.method,
     thresholds,
     horizon: model.horizon,
-    instId: range.instId,
-    bar: range.bar,
+    instId: model.instId,   // ← 用模型自身的标的（原为 range.instId，H-F5）
+    bar: model.bar,         // ← 用模型自身的周期（原为 range.bar，H-F5）
     startTs: range.startTs,
     endTs: range.endTs,
     name: model.name,
+    origin: "model",
     modelId: model.id,
     factorSetId: model.factorSetId ?? undefined,
   });

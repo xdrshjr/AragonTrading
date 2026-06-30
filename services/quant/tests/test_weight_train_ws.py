@@ -62,6 +62,44 @@ class _DisconnectWS(_FakeWS):
             raise WebSocketDisconnect()
 
 
+class _PingThenDisconnectWS(_FakeWS):
+    """收到首个 ping 心跳即模拟断线，使 ``ws_weight_train`` 返回（H-B7 心跳测试免无限阻塞）。"""
+
+    async def send_text(self, text):
+        await super().send_text(text)
+        if json.loads(text).get("type") == "ping":
+            raise WebSocketDisconnect()
+
+
+class _GateRest(_FakeRest):
+    """``get_candles`` 阻塞在 gate 上直到放行——使作业可停在加载阶段（仅 run/phase 缓冲），供 H-B7/取消测试。"""
+
+    def __init__(self):
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+
+    async def get_candles(self, inst_id, bar, limit=300, before=None, after=None):
+        self.entered.set()
+        await self.gate.wait()
+        return await super().get_candles(inst_id, bar, limit=limit, before=before, after=after)
+
+
+async def _start_with_rest(rest) -> dict:
+    factor_service.clear_candle_cache()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        return await wms.start_training(s, rest, _req())
+
+
+async def _start_failing_job() -> dict:
+    """启动一个必然失败的作业（normWindow > 可用根数 → 样本不足 → error 终态）。"""
+    factor_service.clear_candle_cache()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        return await wms.start_training(s, _FakeRest(), _req(config={"normWindow": 400}))
+
+
 def _req(**extra) -> WeightTrainStartReq:
     return WeightTrainStartReq(**{**_RANGE, "members": _MEMBERS, "method": "linear",
                                   "config": {"normWindow": 100}, "horizon": 6, **extra})
@@ -143,5 +181,55 @@ async def test_ws_disconnect_still_persists_history():
         ws2 = _FakeWS()
         await asyncio.wait_for(ws_weight_train(ws2, started["jobId"]), timeout=5.0)
         assert [e["type"] for e in ws2.sent][-1] == "done"
+    finally:
+        await dispose_engine()
+
+
+async def test_ws_late_subscribe_replays_error_terminal():
+    """H-T4：失败作业终态后才订阅 → 完整回放至 error 终态并关闭，绝不悬挂。"""
+    await init_db()
+    try:
+        started = await _start_failing_job()
+        await _await_terminal(started["jobId"])
+        ws = _FakeWS()
+        await asyncio.wait_for(ws_weight_train(ws, started["jobId"]), timeout=5.0)
+        types = [e["type"] for e in ws.sent]
+        assert types[0] == "run" and types[-1] == "error" and ws.closed
+        assert ws.sent[-1]["data"]["code"] == "WEIGHT_TRAIN_INSUFFICIENT_SAMPLES"
+    finally:
+        await dispose_engine()
+
+
+async def test_ws_late_subscribe_replays_cancelled_terminal():
+    """H-T4：取消作业终态后才订阅 → 完整回放至 cancelled 终态并关闭，绝不悬挂。"""
+    await init_db()
+    try:
+        rest = _GateRest()
+        started = await _start_with_rest(rest)
+        await asyncio.wait_for(rest.entered.wait(), timeout=2.0)
+        get_weight_train_manager().cancel(started["jobId"])   # 加载阶段置取消标志
+        rest.gate.set()                                       # 放行 → 加载后取消检查命中 → cancelled
+        await _await_terminal(started["jobId"])
+        ws = _FakeWS()
+        await asyncio.wait_for(ws_weight_train(ws, started["jobId"]), timeout=5.0)
+        types = [e["type"] for e in ws.sent]
+        assert types[-1] == "cancelled" and ws.closed
+    finally:
+        await dispose_engine()
+
+
+async def test_ws_heartbeat_ping_on_silence(monkeypatch):
+    """H-B7：流式静默超 _WS_HEARTBEAT_SECONDS → 下发 ping 心跳（半开探测）。"""
+    await init_db()
+    try:
+        monkeypatch.setattr("app.api.weight_models._WS_HEARTBEAT_SECONDS", 0.05)
+        rest = _GateRest()
+        started = await _start_with_rest(rest)
+        await asyncio.wait_for(rest.entered.wait(), timeout=2.0)   # 作业卡在 _load_df，仅 run/phase 缓冲
+        ws = _PingThenDisconnectWS()
+        await asyncio.wait_for(ws_weight_train(ws, started["jobId"]), timeout=5.0)
+        assert any(e["type"] == "ping" for e in ws.sent)
+        rest.gate.set()                                           # 放行作业跑完，清理
+        await _await_terminal(started["jobId"])
     finally:
         await dispose_engine()
