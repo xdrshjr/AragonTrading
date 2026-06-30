@@ -322,6 +322,42 @@ class AutoTradeSettingsOut(BaseModel):
     effectiveMaxBudgetPct: float
 
 
+# ---------------- Workspace 偏好持久化（watchlist-auto-trade-persistence §3 / §4）----------------
+class AutoTradeMemberIo(BaseModel):
+    """workspace 偏好里的自动交易成员（仅**类型**校验，P1-A）。
+
+    刻意**不**照搬 ``LiveAutoGroupMemberIn`` 的 ``Field(gt=0, le=100)`` 区间约束——区间夹取 / 去重 /
+    ``members ⊆ watchlist`` 全部交给 repo sanitizer，否则越界值会先抛 422 使夹取分支不可达。
+    """
+
+    instId: str
+    allocationPct: float
+
+
+class WorkspaceWatchlistIn(BaseModel):
+    """PUT /api/workspace/watchlist 入参：自选 + 自动交易成员 + 分配模式（仅类型校验，P1-A）。
+
+    422 仅留给类型错误（如 ``allocationPct`` 是字符串、``watchlist`` 不是数组）；越界但类型正确的值
+    （``allocationPct=150``、超长 ``watchlist``）一律由 repo sanitizer 夹取 / 截断，不在此拒绝。
+    """
+
+    watchlist: list[str]
+    autoTradeMembers: list[AutoTradeMemberIo]
+    autoTradeAllocationMode: str
+
+
+class WorkspaceWatchlistOut(BaseModel):
+    """GET/PUT /api/workspace/watchlist 响应：``present`` 标志 + 夹取后的 workspace 偏好文档。
+
+    ``present`` 区分「从未保存」（前端 seed）与「保存为空」（前端 respect），故用显式标志而非「列表为空」。
+    """
+
+    present: bool
+    watchlist: list[str]
+    autoTradeMembers: list[AutoTradeMemberIo]
+    autoTradeAllocationMode: str
+
+
 class LiveAutoGroupMemberRow(BaseModel):
     instId: str
     sessionId: str

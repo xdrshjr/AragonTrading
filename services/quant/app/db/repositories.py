@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 import uuid
 from dataclasses import dataclass
 
@@ -425,6 +426,102 @@ async def set_auto_trade_settings(session: AsyncSession, *, max_budget_pct: floa
     """写自动交易总预算上限百分比（边界已由 schema 在路由层校验 0<pct≤100），返回回写后值。"""
     await set_app_setting(session, _AUTO_TRADE_MAX_BUDGET_KEY, max_budget_pct)
     return {"maxBudgetPct": max_budget_pct}
+
+
+# ===================== Workspace 偏好（自选 + 自动交易成员，watchlist-auto-trade-persistence §2） =====================
+_WORKSPACE_WATCHLIST_KEY = "workspace.watchlist_prefs"
+_WATCHLIST_MAX = 500                 # 自选标的上限（防无界增长，§2.3-1 / §8）
+_INST_ID_MAX_LEN = 64                # 单个 instId 截断长度（同上）
+_ALLOCATION_MODES = ("even", "max_ratio")
+
+
+def _sanitize_workspace_watchlist(raw: object) -> dict:
+    """把任意（可能跨版本写入 / 手改）文档夹取为可信的 workspace 偏好（§2.3，唯一规整执行点）。
+
+    职责切分（P1-A）：schema 只做类型校验，区间夹取 / 去重 / 截断 / ``members ⊆ watchlist`` 不变量
+    全部在此完成。读写两侧各跑一次本函数——读时再跑**不是**内部冗余校验（CLAUDE.md §五 所禁），
+    而是 DB 作为跨版本 / 手改信任边界的一次性边界规整；规整后内部信任。
+
+    Args:
+        raw: 入库前的请求文档或读出的原始 JSON（dict；非 dict 视作空文档）。
+
+    Returns:
+        ``{"watchlist": list[str], "autoTradeMembers": [{"instId", "allocationPct"}],
+        "autoTradeAllocationMode": "even"|"max_ratio"}``，全部字段已规整。
+    """
+    doc = raw if isinstance(raw, dict) else {}
+
+    # 1) watchlist：转 str、去空白、单 id 截断、按首现去重、整表截断。
+    watchlist: list[str] = []
+    seen_inst: set[str] = set()
+    raw_watchlist = doc.get("watchlist")
+    for item in raw_watchlist if isinstance(raw_watchlist, list) else []:
+        if not isinstance(item, str):
+            continue
+        inst = item.strip()[:_INST_ID_MAX_LEN]
+        if not inst or inst in seen_inst:
+            continue
+        seen_inst.add(inst)
+        watchlist.append(inst)
+        if len(watchlist) >= _WATCHLIST_MAX:
+            break
+
+    # 2) autoTradeMembers：丢弃不在 watchlist 内的成员（不变量）、按 instId 去重、百分比夹到 [0,100]。
+    members: list[dict] = []
+    seen_member: set[str] = set()
+    raw_members = doc.get("autoTradeMembers")
+    for member in raw_members if isinstance(raw_members, list) else []:
+        if not isinstance(member, dict):
+            continue
+        inst_raw = member.get("instId")
+        if not isinstance(inst_raw, str):
+            continue
+        inst = inst_raw.strip()[:_INST_ID_MAX_LEN]
+        if inst not in seen_inst or inst in seen_member:
+            continue
+        try:
+            pct = float(member.get("allocationPct"))
+        except (TypeError, ValueError):
+            pct = 0.0
+        if not math.isfinite(pct):
+            pct = 0.0
+        pct = min(max(pct, 0.0), 100.0)
+        seen_member.add(inst)
+        members.append({"instId": inst, "allocationPct": pct})
+
+    # 3) allocationMode：非法值回落 "even"（向后兼容默认）。
+    mode = doc.get("autoTradeAllocationMode")
+    if mode not in _ALLOCATION_MODES:
+        mode = "even"
+
+    return {"watchlist": watchlist, "autoTradeMembers": members, "autoTradeAllocationMode": mode}
+
+
+async def get_workspace_watchlist(session: AsyncSession) -> dict | None:
+    """读 workspace 偏好（自选 + 自动交易成员 + 分配模式）；无记录回 ``None``（驱动 ``present`` 标志）。"""
+    raw = await get_app_setting(session, _WORKSPACE_WATCHLIST_KEY, None)
+    if raw is None:
+        return None
+    return _sanitize_workspace_watchlist(raw)
+
+
+async def set_workspace_watchlist(
+    session: AsyncSession,
+    *,
+    watchlist: object,
+    members: object,
+    allocation_mode: object,
+) -> dict:
+    """整文档 upsert workspace 偏好（按 §2.3 夹取后入库 + ``commit``），返回夹取后的文档。"""
+    doc = _sanitize_workspace_watchlist(
+        {
+            "watchlist": watchlist,
+            "autoTradeMembers": members,
+            "autoTradeAllocationMode": allocation_mode,
+        }
+    )
+    await set_app_setting(session, _WORKSPACE_WATCHLIST_KEY, doc)
+    return doc
 
 
 # ============================ Agent providers（设置中心 · AI 模型服务） ============================

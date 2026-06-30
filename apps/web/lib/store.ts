@@ -26,6 +26,7 @@ import type {
   LiveAutoStatus,
 } from "./liveAutoTypes";
 import type { FactorEditTarget } from "./factorTypes";
+import type { WorkspacePrefs } from "./workspaceTypes";
 import { clampAllocationOnEdit, defaultAllocationOnAdd, evenSplit } from "./autoTrade";
 
 type Theme = "light" | "dark";
@@ -219,6 +220,9 @@ interface AppState {
   addToWatchlist: (instId: string) => void;
   removeFromWatchlist: (instId: string) => void;
   toggleWatchlist: (instId: string) => void;
+  // 后端水合：用后端权威值整体覆盖 workspace 偏好切片（watchlist-auto-trade-persistence §2.2），
+  // 并重申不变量 autoTradeMembers ⊆ watchlist。仅由 useWorkspaceSync 首次 GET 调用（写穿不回写，P1-B）。
+  hydrateWorkspace: (prefs: WorkspacePrefs) => void;
   setInstSidebarTab: (tab: InstSidebarTab) => void;
   setChartSplitRatio: (ratio: number) => void;
   setChartIndicatorRatio: (ratio: number) => void;
@@ -555,6 +559,17 @@ export const useAppStore = create<AppState>()(
               }
             : { watchlist: [instId, ...s.watchlist] },
         ),
+      // 后端权威水合（§2.2）：整体覆盖三字段切片，并重申 autoTradeMembers ⊆ watchlist（丢弃不在
+      // 自选内的成员，与 removeFromWatchlist 同口径），避免后端跨版本 / 手改文档把游离成员带回。
+      hydrateWorkspace: ({ watchlist, autoTradeMembers, autoTradeAllocationMode }) =>
+        set(() => {
+          const inWatchlist = new Set(watchlist);
+          return {
+            watchlist,
+            autoTradeMembers: autoTradeMembers.filter((m) => inWatchlist.has(m.instId)),
+            autoTradeAllocationMode,
+          };
+        }),
       setInstSidebarTab: (instSidebarTab) => set({ instSidebarTab }),
       // 右侧页签切换（AI 助手 / 交易策略）；两面板各自持续挂载，切换不破坏状态（§6.2#1）。
       setRightTab: (rightTab) => set({ rightTab }),

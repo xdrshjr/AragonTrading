@@ -726,3 +726,50 @@ describe("app store — auto-trade allocation mode (v21)", () => {
     expect(useAppStore.getState().autoTradeAllocationMode).toBe("even");
   });
 });
+
+describe("app store — hydrateWorkspace (watchlist-auto-trade-persistence)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({
+      watchlist: ["LOCAL-USDT-SWAP"],
+      autoTradeMembers: [],
+      autoTradeAllocationMode: "even",
+    });
+  });
+
+  it("overwrites the slice atomically with the backend values", () => {
+    useAppStore.getState().hydrateWorkspace({
+      watchlist: ["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+      autoTradeMembers: [{ instId: "BTC-USDT-SWAP", allocationPct: 60 }],
+      autoTradeAllocationMode: "max_ratio",
+    });
+    const s = useAppStore.getState();
+    expect(s.watchlist).toEqual(["BTC-USDT-SWAP", "ETH-USDT-SWAP"]);
+    expect(s.autoTradeMembers).toEqual([{ instId: "BTC-USDT-SWAP", allocationPct: 60 }]);
+    expect(s.autoTradeAllocationMode).toBe("max_ratio");
+  });
+
+  it("re-asserts the members ⊆ watchlist invariant by dropping orphan members", () => {
+    useAppStore.getState().hydrateWorkspace({
+      watchlist: ["BTC-USDT-SWAP"],
+      autoTradeMembers: [
+        { instId: "BTC-USDT-SWAP", allocationPct: 50 },
+        { instId: "GHOST-USDT-SWAP", allocationPct: 50 }, // not in watchlist → dropped
+      ],
+      autoTradeAllocationMode: "even",
+    });
+    expect(useAppStore.getState().autoTradeMembers).toEqual([
+      { instId: "BTC-USDT-SWAP", allocationPct: 50 },
+    ]);
+  });
+
+  it("respects a backend-saved empty watchlist (does not fall back to defaults)", () => {
+    useAppStore.getState().hydrateWorkspace({
+      watchlist: [],
+      autoTradeMembers: [],
+      autoTradeAllocationMode: "even",
+    });
+    expect(useAppStore.getState().watchlist).toEqual([]);
+    expect(useAppStore.getState().autoTradeMembers).toEqual([]);
+  });
+});

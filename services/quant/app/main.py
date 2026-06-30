@@ -24,6 +24,7 @@ from .api import (
     runs,
     strategies,
     trading,
+    workspace,
     ws_market,
 )
 from .db.session import dispose_engine, init_db
@@ -137,6 +138,7 @@ app.include_router(trading.router, prefix="/api")
 app.include_router(factors.router, prefix="/api")   # 第 9 个路由（因子层 §3.1）
 app.include_router(live_auto.router, prefix="/api")  # 第 10 个路由（实时自动交易，live-auto-trading §4）
 app.include_router(app_settings.router, prefix="/api")  # 第 11 个路由（设置中心 · 自动交易设置 §4.1）
+app.include_router(workspace.router, prefix="/api")  # 第 12 个路由（workspace 偏好持久化，watchlist-auto-trade-persistence §3）
 
 
 @app.get("/")

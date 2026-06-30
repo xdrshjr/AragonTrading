@@ -41,6 +41,7 @@ import {
 import { DEFAULT_RIGHT_PANEL_WIDTH, useAppStore } from "@/lib/store";
 import { liveAutoApi, liveAutoWS } from "@/lib/liveAutoApi";
 import { useLiveAutoGroupStream } from "@/lib/useLiveAutoGroupStream";
+import { useWorkspaceSync } from "@/lib/useWorkspaceSync";
 import type { LiveAutoEvent, LiveAutoSnapshot, LiveAutoStatus } from "@/lib/liveAutoTypes";
 import type {
   Candle,
@@ -101,6 +102,10 @@ export default function Page() {
 
   // 自选自动交易分组运行期流（重发现孤儿分组 + 每成员一条 WS，按 instId 路由进 store）。
   useLiveAutoGroupStream();
+
+  // workspace 偏好后端同步（watchlist-auto-trade-persistence §6）：启动以后端为权威水合自选 +
+  // 自动交易成员，之后去抖写穿，使关闭 / 强杀重启后偏好不丢（与下方 rehydrate() effect 协同）。
+  useWorkspaceSync();
 
   // 回测（含并入回测列表的用户组合）：用单条 run 净值 + 成交 markers 在左图渲染（run-range 链路）。
   // 组合回测产出真实 run（含 equity/trades/metrics），其 run.mode 落库即 "backtest"，故并入后绘制行为不变。
