@@ -30,6 +30,7 @@ interface AutoTradePanelProps {
   aggregatePnl: number | null;
   dropError: string | null; // 拖入不可自动交易标的等的就地提示
   dragOver: boolean;
+  onOpenRecords: () => void; // 打开「自动交易收益」记录面板（按时间维度汇总每次完整交易）
   onToggle: (next: boolean) => void;
   onAllocationModeChange: (mode: AutoTradeAllocationMode) => void;
   onEvenSplit: () => void;
@@ -56,6 +57,7 @@ export default function AutoTradePanel({
   aggregatePnl,
   dropError,
   dragOver,
+  onOpenRecords,
   onToggle,
   onAllocationModeChange,
   onEvenSplit,
@@ -101,6 +103,22 @@ export default function AutoTradePanel({
                 {fmtMoney(aggregatePnl)}
               </span>
             )}
+            <button
+              type="button"
+              onClick={onOpenRecords}
+              title="按时间维度查看每次完整交易的收益与总收益率"
+              className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)] transition-colors hover:bg-[var(--accent-soft)]"
+            >
+              <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden>
+                <path
+                  d="M2 13.5V9.5M6 13.5V5.5M10 13.5V7.5M14 13.5V3.5"
+                  stroke="currentColor"
+                  strokeWidth="1.6"
+                  strokeLinecap="round"
+                />
+              </svg>
+              收益记录
+            </button>
           </span>
           <div
             title={gateReason ?? (running ? "停止全部自动交易并平仓" : "启动整组自动交易")}

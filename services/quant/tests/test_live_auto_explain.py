@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from app.config import Settings
 from app.db import repositories as repo
 from app.db.models import Trade
@@ -219,6 +221,28 @@ async def test_append_live_trade_persists_explain_and_round_trips_through_trade_
             out = trade_out(rows[0])
             assert out["explain"]["kind"] == "factor_score"
             assert out["explain"]["factors"][0]["factorKey"] == "mom_roc"
+    finally:
+        await dispose_engine()
+
+
+async def test_append_live_trade_ignores_pnl_pct_key_without_regression():
+    # auto-trade-pnl-records R1：trade dict 新增派生键 pnlPct，append_live_trade 显式字段映射应静默
+    # 忽略（不入库、无 TypeError），落库不回归。
+    await init_db()
+    try:
+        sm = get_sessionmaker()
+        async with sm() as s:
+            run = await repo.create_run(s, strategy_id=1, inst_id="BTC-USDT-SWAP", bar="1H",
+                                        mode="live-auto", config={"mode": "live-auto"})
+            run_id = run.id
+        trade = {"ts": 2000, "side": "close", "price": 31500.0, "qty": 0.03, "fee": 0.0,
+                 "pnl": 19.05, "pnlPct": 0.0148, "positionAfter": 0.0, "reason": "signal_close",
+                 "explain": None}
+        async with sm() as s:
+            await repo.append_live_trade(s, run_id, trade)   # 含 pnlPct，不得抛
+        async with sm() as s:
+            rows = await repo.list_trades(s, run_id)
+            assert len(rows) == 1 and rows[0].pnl == pytest.approx(19.05)
     finally:
         await dispose_engine()
 

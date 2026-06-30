@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import type { Trade } from "@/lib/types";
-import { fmtPrice, fmtQty, fmtTime, signed } from "@/lib/format";
+import { colorForReturn, fmtPct, fmtPrice, fmtQty, fmtTime, signed } from "@/lib/format";
 import { formatMaxHoldBars, formatRiskValue, riskColumnLabel } from "@/lib/riskDisplay";
 import { Badge } from "@/components/ui";
 import TradeExplainDetail from "./TradeExplainDetail";
@@ -114,9 +114,17 @@ function TradeRow({ trade: t }: { trade: Trade }) {
         <td className="py-1.5 pr-2 text-right tabular">{fmtQty(t.qty)}</td>
         <td
           className="py-1.5 pr-2 text-right tabular font-medium"
-          style={{ color: t.pnl > 0 ? "var(--long)" : t.pnl < 0 ? "var(--short)" : "var(--muted)" }}
+          style={{ color: colorForReturn(t.pnl) }}
         >
-          {t.side === "close" ? signed(t.pnl) : "—"}
+          {t.side === "close" ? (
+            <span className="flex flex-col items-end leading-tight">
+              <span>{signed(t.pnl)}</span>
+              {/* 实盘自动交易平仓携带收益率 pnlPct（已实现盈亏/开仓保证金）；回测 / 模拟无此字段则仅显金额。 */}
+              {t.pnlPct != null && <span className="text-[10px] font-normal">{fmtPct(t.pnlPct)}</span>}
+            </span>
+          ) : (
+            "—"
+          )}
         </td>
         <td className="py-1.5 pr-2 text-right tabular" title={riskTitle(t)}>
           {formatRiskValue(t.stopLossPct, t.stopLossPrice)}

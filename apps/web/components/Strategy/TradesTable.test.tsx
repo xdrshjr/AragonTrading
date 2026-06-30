@@ -45,3 +45,25 @@ describe("TradesTable risk columns", () => {
     expect(markup).toContain("<td class=\"py-1.5 text-right tabular\" title=\"\">-</td>");
   });
 });
+
+describe("TradesTable realized return percentage", () => {
+  it("renders the realized return percentage on a close row carrying pnlPct", () => {
+    const markup = renderToStaticMarkup(
+      <TradesTable
+        trades={[{ ...BASE_TRADE, side: "close", pnl: 19.05, pnlPct: 0.0148, positionAfter: 0 }]}
+      />,
+    );
+
+    expect(markup).toContain("+19.05");
+    expect(markup).toContain("1.48%");
+  });
+
+  it("omits the percentage when a close row has no pnlPct (backtest / paper)", () => {
+    const markup = renderToStaticMarkup(
+      <TradesTable trades={[{ ...BASE_TRADE, side: "close", pnl: 5, positionAfter: 0 }]} />,
+    );
+
+    expect(markup).toContain("+5.00");
+    expect(markup).not.toContain("%");
+  });
+});

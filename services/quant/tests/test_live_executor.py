@@ -243,5 +243,51 @@ async def test_flatten_succeeds_on_retry_after_transient_failure(monkeypatch):
     assert attempts["n"] == 2
 
 
+# ---------- per-trade 收益率 pnlPct（auto-trade-pnl-records §3.2 / §7.1）----------
+async def test_close_trade_carries_pnl_pct_for_long_profit():
+    # 多头盈利平仓携带 pnlPct = (exit/entry - 1) × leverage（保证金回报口径）；开仓行不含 pnlPct。
+    ex, _ = _make_executor(leverage=3.0)
+    open_trade = _trade_events(
+        await ex.apply([_Sig("long")], ref_px=30000.0, bar_index=0, ts=1000))[0]["data"]
+    assert "pnlPct" not in open_trade
+    close = _trade_events(
+        await ex.apply([_Sig("close")], ref_px=31500.0, bar_index=1, ts=2000))[0]["data"]
+    assert close["side"] == "close" and close["pnl"] > 0
+    assert close["pnlPct"] == pytest.approx(0.15)   # (31500/30000 - 1) × 3
+
+
+async def test_close_trade_pnl_pct_sign_correct_for_short_win():
+    # 空头盈利（价跌为盈）平仓：pnlPct 为正、符号正确。
+    ex, _ = _make_executor(leverage=3.0)
+    await ex.apply([_Sig("short")], ref_px=30000.0, bar_index=0, ts=1000)
+    close = _trade_events(
+        await ex.apply([_Sig("close")], ref_px=28500.0, bar_index=1, ts=2000))[0]["data"]
+    assert close["pnl"] > 0 and close["pnlPct"] == pytest.approx(0.15)
+
+
+async def test_close_trade_pnl_pct_scales_with_leverage():
+    # 同价差下 leverage=5 的 pnlPct ≈ leverage=1 的 5 倍（杠杆敏感）。
+    ex1, _ = _make_executor(leverage=1.0)
+    await ex1.apply([_Sig("long")], ref_px=30000.0, bar_index=0, ts=1000)
+    c1 = _trade_events(
+        await ex1.apply([_Sig("close")], ref_px=31500.0, bar_index=1, ts=2000))[0]["data"]
+    ex5, _ = _make_executor(leverage=5.0)
+    await ex5.apply([_Sig("long")], ref_px=30000.0, bar_index=0, ts=1000)
+    c5 = _trade_events(
+        await ex5.apply([_Sig("close")], ref_px=31500.0, bar_index=1, ts=2000))[0]["data"]
+    assert c5["pnlPct"] == pytest.approx(c1["pnlPct"] * 5)
+
+
+async def test_close_return_pct_returns_none_on_nonpositive_leverage_without_zero_division():
+    # v2（P1-2）：杠杆 / 名义价值非正 → 先校验后相除返回 None，绝不抛 ZeroDivisionError；close 省略 pnlPct。
+    ex, _ = _make_executor(leverage=3.0)
+    await ex.apply([_Sig("long")], ref_px=30000.0, bar_index=0, ts=1000)
+    ex.leverage = 0.0                                  # 退化断面：守卫须真正生效
+    assert ex._close_return_pct(31500.0) is None
+    close = _trade_events(
+        await ex.apply([_Sig("close")], ref_px=31500.0, bar_index=1, ts=2000))[0]["data"]
+    assert "pnlPct" not in close and ex.projected == "flat"   # 退化省略键、平仓正常完成
+
+
 async def _no_sleep(*_args, **_kwargs):
     return None

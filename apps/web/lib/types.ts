@@ -263,6 +263,8 @@ export interface Trade {
   qty: number;
   fee: number;
   pnl: number;
+  // 平仓收益率（已实现盈亏 / 开仓占用保证金）。仅实盘自动交易平仓携带；开仓 / 回测 / 模拟成交无此字段。
+  pnlPct?: number | null;
   stopLossPct?: number | null;
   takeProfitPct?: number | null;
   maxHoldBars?: number | null;

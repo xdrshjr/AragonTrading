@@ -212,14 +212,16 @@ class LiveExecutor:
     def _settle_close(self, ref_px: float, ts: int, reason: str, result: dict, *,
                       explain: dict | None = None) -> list[dict]:
         pnl = self._close_pnl(ref_px)
+        pnl_pct = self._close_return_pct(ref_px)   # v2（P1-2）：须在复位 entry/projected 前算
         qty = self.entry_qty_sz
         self.realized_pnl_usd += pnl
         self.unrealized_usd = 0.0
         self.projected = "flat"
         self.entry_qty_sz = 0.0
         cl_ord_id, ord_id = self._order_ids(result)
-        trade = self._make_trade(ts, "close", ref_px, qty, pnl=pnl, reason=reason,
-                                 explain=explain, cl_ord_id=cl_ord_id, ord_id=ord_id)
+        trade = self._make_trade(ts, "close", ref_px, qty, pnl=pnl, pnl_pct=pnl_pct,
+                                 reason=reason, explain=explain, cl_ord_id=cl_ord_id,
+                                 ord_id=ord_id)
         self.trades.append(trade)
         return [{"type": "trade", "data": trade}]
 
@@ -366,6 +368,17 @@ class LiveExecutor:
             return qty_coin * (self.entry_price - exit_px)
         return 0.0
 
+    def _close_return_pct(self, exit_px: float) -> float | None:
+        """平仓收益率：已实现盈亏 / 开仓占用保证金（等价于方向化价格变动% × 杠杆）。
+
+        v2（P1-2）：先校验后相除——杠杆或名义价值非正（异常断面）直接返回 None，杜绝在
+        未被 try/except 包裹的 _settle_close 调用栈抛 ZeroDivisionError；缺收益率即省略 pnlPct 键。
+        """
+        notional = self.entry_qty_sz * self.ct_val * self.entry_price
+        if self.leverage <= 0 or notional <= 0:
+            return None
+        return self._close_pnl(exit_px) / (notional / self.leverage)
+
     def _unrealized_at(self, mark_px: float) -> float:
         if self.projected == "long":
             return self.entry_qty_sz * self.ct_val * (mark_px - self.entry_price)
@@ -388,9 +401,10 @@ class LiveExecutor:
                    if str(p.get("instId")) == self.inst_id)
 
     def _make_trade(self, ts: int, side: str, price: float, sz: float, *, pnl: float,
-                    reason: str, tp: float | None = None, sl: float | None = None,
-                    explain: dict | None = None, cl_ord_id: str | None = None,
-                    ord_id: str | None = None, seeded: bool = False) -> dict:
+                    reason: str, pnl_pct: float | None = None, tp: float | None = None,
+                    sl: float | None = None, explain: dict | None = None,
+                    cl_ord_id: str | None = None, ord_id: str | None = None,
+                    seeded: bool = False) -> dict:
         position_after = sz if side == "long" else (-sz if side == "short" else 0.0)
         trade = {"ts": int(ts), "side": side, "price": float(price), "qty": float(sz),
                  "fee": 0.0, "pnl": float(pnl), "positionAfter": position_after,
@@ -399,6 +413,9 @@ class LiveExecutor:
                  "maxHoldBars": self.risk.max_hold_bars,
                  "stopLossPrice": sl, "takeProfitPrice": tp, "seeded": seeded,
                  "explain": explain}
+        # pnlPct 为平仓派生收益率（开仓 / 退化断面省略键，与 clOrdId/ordId 同样的「缺失即省略」风格）。
+        if pnl_pct is not None:
+            trade["pnlPct"] = float(pnl_pct)
         # clOrdId / ordId 为 best-effort 可选（开仓取 _place_order 回执、平仓取 result.clOrdId）：
         # 缺失即省略键，绝不阻塞 trade / explain（P1-2）。
         if cl_ord_id:
@@ -445,11 +462,12 @@ class LiveExecutor:
             return []
         try:
             pnl = self._close_pnl(ref_px)
+            pnl_pct = self._close_return_pct(ref_px)   # v2（P1-2）：复位前算，先校验后相除
             explain = build_external_close_explain(
                 pos_side=self.projected, source=source, entry_price=self.entry_price,
                 exit_price=ref_px, pnl=pnl)
             trade = self._make_trade(ts, "close", ref_px, self.entry_qty_sz, pnl=pnl,
-                                     reason="external_close", explain=explain)
+                                     pnl_pct=pnl_pct, reason="external_close", explain=explain)
             self.trades.append(trade)
             return [{"type": "trade", "data": trade}]
         except Exception:  # noqa: BLE001 —— 合成失败回落原 status，绝不影响 reconcile / flatten 主流程

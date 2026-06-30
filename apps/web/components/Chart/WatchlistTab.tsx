@@ -13,6 +13,7 @@ import AutoTradeGroupConfirmModal, {
   type AutoTradeGroupConfirmOpts,
 } from "./AutoTradeGroupConfirmModal";
 import AutoTradePanel, { type AutoTradeMemberView } from "./AutoTradePanel";
+import AutoTradePnlPanel from "./AutoTradePnlPanel";
 import WatchOtherPanel from "./WatchOtherPanel";
 
 // 自选页签上下分区容器（watchlist-auto-trade-group §2.7）：上 AutoTradePanel（自动交易，置顶）/
@@ -87,6 +88,7 @@ export default function WatchlistTab({
   const setAcknowledged = useAppStore((s) => s.setLiveAutoAcknowledged);
 
   const [modalOpen, setModalOpen] = useState(false);
+  const [recordsOpen, setRecordsOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dropError, setDropError] = useState<string | null>(null);
   const [dragOverZone, setDragOverZone] = useState<"auto" | "other" | null>(null);
@@ -255,6 +257,7 @@ export default function WatchlistTab({
         aggregatePnl={aggregatePnl}
         dropError={dropError}
         dragOver={dragOverZone === "auto"}
+        onOpenRecords={() => setRecordsOpen(true)}
         onToggle={onToggle}
         onAllocationModeChange={setAutoTradeAllocationMode}
         onEvenSplit={evenSplitAutoTradeMembers}
@@ -296,6 +299,8 @@ export default function WatchlistTab({
         defaultStrategyId={strategyId}
         error={error}
       />
+
+      <AutoTradePnlPanel open={recordsOpen} onClose={() => setRecordsOpen(false)} />
     </div>
   );
 }
