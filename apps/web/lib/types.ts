@@ -1,6 +1,6 @@
 export type Bar = "1m" | "5m" | "15m" | "30m" | "1H" | "4H" | "1D";
 export type Mode = "backtest" | "compare" | "paper";
-export type StrategyListTab = "regular" | "combo";
+export type StrategyListTab = "regular" | "combo" | "factor";
 // 原子 / 组合 / 因子组合得分（后端 merge_strategy 透传 kind；评审 C-P1-5）。
 export type StrategyKind = "atomic" | "combo" | "factor";
 export type AccountMode = "sim" | "live";

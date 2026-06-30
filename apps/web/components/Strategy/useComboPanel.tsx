@@ -6,7 +6,7 @@ import { api } from "@/lib/api";
 import type { Strategy } from "@/lib/types";
 import ComboDetailModal from "./ComboDetailModal";
 import ComboEditorModal from "./ComboEditorModal";
-import DeleteComboConfirm from "./DeleteComboConfirm";
+import DeleteStrategyConfirm from "./DeleteStrategyConfirm";
 
 /**
  * 组合面板的三弹窗开关态（编辑器 / 详情 / 删除二次确认）+ 删除 mutation + 渲染，自 StrategyPanel
@@ -94,8 +94,8 @@ export function useComboPanel({
       )}
 
       {deleteTarget && (
-        <DeleteComboConfirm
-          combo={deleteTarget}
+        <DeleteStrategyConfirm
+          strategy={deleteTarget}
           pending={removeCombo.isPending}
           error={removeCombo.isError ? (removeCombo.error as Error).message : null}
           onCancel={() => setDeleteTarget(null)}

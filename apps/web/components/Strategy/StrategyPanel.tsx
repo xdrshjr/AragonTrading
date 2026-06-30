@@ -11,7 +11,6 @@ import {
   sessionsFromReconcile,
 } from "@/lib/paperMulti";
 import {
-  STRATEGY_LIST_TABS,
   resolveVisibleStrategyId,
   splitStrategyCatalog,
   visibleStrategiesForStrategyPanel,
@@ -25,7 +24,6 @@ import type {
   PaperSessionRow,
   PaperStrategySession,
   Strategy,
-  StrategyListTab,
   WalkForwardResult,
 } from "@/lib/types";
 import { Button, Skeleton, Tabs } from "@/components/ui";
@@ -37,8 +35,9 @@ import MetricsCards from "./MetricsCards";
 import MultiSampleResults from "./MultiSampleResults";
 import RunHistory from "./RunHistory";
 import StrategyDetail from "./StrategyDetail";
-import StrategyList from "./StrategyList";
+import StrategyListSection from "./StrategyListSection";
 import { useComboPanel } from "./useComboPanel";
+import { useStrategyDelete } from "./useStrategyDelete";
 import WalkForwardResults from "./WalkForwardResults";
 
 type CoverageMeta = { effectiveCandleCount?: number; requestedBars?: number; truncated?: boolean };
@@ -224,7 +223,10 @@ export default function StrategyPanel() {
     [listStrategies],
   );
   const allSelectableStrategies = useMemo(
-    () => [...catalog.regular, ...catalog.combos].filter((s) => !s.unavailable && s.enabled),
+    () =>
+      [...catalog.regular, ...catalog.combos, ...catalog.factors].filter(
+        (s) => !s.unavailable && s.enabled,
+      ),
     [catalog],
   );
   const allSelectableIds = useMemo(
@@ -236,10 +238,6 @@ export default function StrategyPanel() {
     [paperSelectionIds, allSelectableIds],
   );
   const selectedCombo = selected && isCombo(selected) ? selected : null;
-  const showEmptyComboTab =
-    (mode === "backtest" || mode === "paper") &&
-    strategyListTab === "combo" &&
-    listStrategies.length === 0;
   const runningSessions = Object.values(paperSessionsByStrategyId);
   const selectedCount = validPaperSelectionIds.length;
   const capReached = selectedCount >= maxPaperSessions;
@@ -383,6 +381,13 @@ export default function StrategyPanel() {
       setStrategyId: selectStrategyPassively,
     });
 
+  // 卡片删除（原子 / 因子）态 + 双路 mutation（factor_set 级联 vs 直接删策略）+ 确认弹窗。删后置空选中，
+  // 由守门 useEffect 回落首个剩余策略；组合删除不经此 hook（分流回 useComboPanel）。
+  const { requestDelete, deleteModal } = useStrategyDelete({
+    strategyId,
+    onAfterDelete: () => selectStrategyPassively(null),
+  });
+
   const isSessionLimitError =
     paperStart.error instanceof ApiRequestError && paperStart.error.code === "SESSION_LIMIT";
 
@@ -484,37 +489,22 @@ export default function StrategyPanel() {
               />
             )}
 
-            {(mode === "backtest" || mode === "paper") && (
-              <div className="mb-3">
-                <Tabs
-                  tabs={STRATEGY_LIST_TABS}
-                  active={strategyListTab}
-                  onChange={(key) => setStrategyListTab(key as StrategyListTab)}
-                  variant="underline"
-                />
-              </div>
-            )}
-
-            {showEmptyComboTab ? (
-              <div className="flex flex-col gap-2 rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-3 py-4 text-xs text-[var(--muted)]">
-                <span>暂无组合策略</span>
-                <div>
-                  <Button size="sm" variant="default" onClick={openNewCombo}>
-                    新建组合
-                  </Button>
-                </div>
-              </div>
-            ) : (
-              <StrategyList
-                strategies={listStrategies}
-                activeId={strategyId}
-                returnsById={returnsById}
-                onSelect={selectStrategyPassively}
-                multiSelectIds={mode === "paper" ? paperSelectionIds : undefined}
-                multiSelectDisabledIds={mode === "paper" ? disabledIds : undefined}
-                onToggleMultiSelect={mode === "paper" ? togglePaperSelectionId : undefined}
-              />
-            )}
+            <StrategyListSection
+              mode={mode}
+              strategyListTab={strategyListTab}
+              setStrategyListTab={setStrategyListTab}
+              listStrategies={listStrategies}
+              strategyId={strategyId}
+              returnsById={returnsById}
+              onSelect={selectStrategyPassively}
+              multiSelectIds={mode === "paper" ? paperSelectionIds : undefined}
+              multiSelectDisabledIds={mode === "paper" ? disabledIds : undefined}
+              onToggleMultiSelect={mode === "paper" ? togglePaperSelectionId : undefined}
+              openNewCombo={openNewCombo}
+              openEditCombo={openEditCombo}
+              openDeleteCombo={openDeleteCombo}
+              requestDelete={requestDelete}
+            />
 
             {selected && (
               <>
@@ -710,6 +700,9 @@ export default function StrategyPanel() {
       {/* 组合弹窗（Portal 居中，复用 Modal 原语）：新建 / 编辑 · 查看 · 删除二次确认。
           开关态与渲染在 useComboPanel 内，由列表选中态 / 头部「+ 新建组合」入口驱动。 */}
       {comboModals}
+
+      {/* 卡片删除（原子 / 因子）二次确认弹窗：开关态与双路 mutation 在 useStrategyDelete 内。 */}
+      {deleteModal}
     </div>
   );
 }

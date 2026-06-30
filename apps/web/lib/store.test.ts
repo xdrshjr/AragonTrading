@@ -467,6 +467,13 @@ describe("app store - strategy list tab (v15)", () => {
     expect(persisted.state.strategyListTab).toBe("combo");
   });
 
+  it("setStrategyListTab supports the factor tab and persists it", () => {
+    useAppStore.getState().setStrategyListTab("factor");
+    expect(useAppStore.getState().strategyListTab).toBe("factor");
+    const persisted = JSON.parse(localStorage.getItem("aragon-ui") as string);
+    expect(persisted.state.strategyListTab).toBe("factor");
+  });
+
   it("migrates v14 persisted state to regular tab by default", async () => {
     localStorage.setItem(
       "aragon-ui",

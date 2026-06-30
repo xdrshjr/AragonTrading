@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_COMBO_POLICY } from "@/lib/combo";
 import { api } from "@/lib/api";
+import { factorApi } from "@/lib/factorApi";
 import { useAppStore } from "@/lib/store";
 import type { BacktestResult, Health, Strategy } from "@/lib/types";
 import StrategyPanel from "./StrategyPanel";
@@ -15,6 +16,7 @@ const SAVE_COMBO = "保存组合";
 const DELETE = "删除";
 const REGULAR_TAB = "常规策略";
 const COMBO_TAB = "组合策略";
+const FACTOR_TAB = "因子策略";
 
 const METRICS = vi.hoisted(() => ({
   totalReturn: 0.12,
@@ -129,6 +131,30 @@ const STRATEGIES = vi.hoisted(
   ],
 );
 
+const FACTOR_STRATEGY: Strategy = {
+  id: 50,
+  templateKey: "factor_score",
+  name: "因子组合甲",
+  description: "因子组合得分策略",
+  kind: "factor",
+  params: {
+    members: [{ factorKey: "mom_roc", params: {}, weight: 1, direction: "long" }],
+    thresholds: { enterLong: 0.3, enterShort: 0.3, exitBand: 0.1, normWindow: 200, squash: true },
+    factorSetId: 7,
+  },
+  paramsSchema: {},
+  enabled: true,
+  builtin: false,
+};
+
+const USER_ATOMIC: Strategy = {
+  ...STRATEGIES[0],
+  id: 60,
+  templateKey: "alpha_trend",
+  name: "Alpha 副本",
+  builtin: false,
+};
+
 vi.mock("@/lib/api", () => {
   class ApiRequestError extends Error {
     code: string;
@@ -165,6 +191,14 @@ vi.mock("@/lib/api", () => {
     },
   };
 });
+
+vi.mock("@/lib/factorApi", () => ({
+  factorApi: {
+    sets: {
+      remove: vi.fn(),
+    },
+  },
+}));
 
 function mockApi(strategies: Strategy[] = STRATEGIES) {
   vi.mocked(api.health).mockResolvedValue(HEALTH);
@@ -233,6 +267,7 @@ function mockApi(strategies: Strategy[] = STRATEGIES) {
   });
   vi.mocked(api.paperBatchStop).mockResolvedValue({ groupId: "batch-1", runs: [] });
   vi.mocked(api.paperStopAll).mockResolvedValue({ stopped: 0, runs: [] });
+  vi.mocked(factorApi.sets.remove).mockResolvedValue(undefined);
 }
 
 function resetStore(state: Partial<ReturnType<typeof useAppStore.getState>> = {}) {
@@ -316,7 +351,9 @@ function getButton(text: string) {
 }
 
 function selectStrategy(name: string) {
-  fireEvent.click(screen.getByRole("button", { name: new RegExp(name) }));
+  // 锚定到行首：卡片选择 button 的可访问名以策略名开头，而编辑/删除动作按钮以「编辑/删除」开头，
+  // 锚定可避免误命中同卡片右侧的动作按钮（动作簇为选择 button 的兄弟节点）。
+  fireEvent.click(screen.getByRole("button", { name: new RegExp(`^${name}`) }));
 }
 
 async function selectComboTab() {
@@ -463,7 +500,7 @@ describe("StrategyPanel manual backtest trigger", () => {
     await waitFor(() => expect(useAppStore.getState().paperSelectionIds).toEqual([1]));
 
     await selectComboTab();
-    fireEvent.click(screen.getByLabelText(/Combo One/));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Combo One/ }));
     await waitFor(() =>
       expect(useAppStore.getState().paperSelectionIds).toEqual([1, 20]),
     );
@@ -674,7 +711,8 @@ describe("StrategyPanel manual backtest trigger", () => {
       builtin: false,
     };
     mockApi([...STRATEGIES, factorStrategy]);
-    resetStore({ strategyId: 50 });
+    // 因子策略现归「因子策略」页签：须选中该页签该策略才可见（不再混入常规页签）。
+    resetStore({ strategyId: 50, strategyListTab: "factor" });
     renderPanel();
     await screen.findByText(/参数由因子实验室的因子组合管理/);
     await settleEffects();
@@ -713,6 +751,93 @@ describe("StrategyPanel manual backtest trigger", () => {
     expect(useAppStore.getState().runId).toBeNull();
     expect(screen.queryByText("12.00%")).toBeNull();
     expect(screen.getByText("暂无组合策略")).toBeTruthy();
+  });
+
+  it("renders three strategy category tabs including the factor tab", async () => {
+    await renderLoadedPanel();
+
+    expect(getButton(REGULAR_TAB)).toBeTruthy();
+    expect(getButton(COMBO_TAB)).toBeTruthy();
+    expect(getButton(FACTOR_TAB)).toBeTruthy();
+  });
+
+  it("shows factor strategies only on the factor tab, never on the regular tab", async () => {
+    mockApi([...STRATEGIES, FACTOR_STRATEGY]);
+    await renderLoadedPanel();
+
+    expect(screen.queryByText("因子组合甲")).toBeNull();
+    expect(screen.getByText("Alpha Trend")).toBeTruthy();
+
+    fireEvent.click(getButton(FACTOR_TAB));
+    await waitFor(() => expect(useAppStore.getState().strategyId).toBe(50));
+    expect(screen.getAllByText("因子组合甲").length).toBeGreaterThan(0);
+    expect(screen.queryByText("Alpha Trend")).toBeNull();
+  });
+
+  it("shows the factor empty state and a lab CTA when no factor strategies exist", async () => {
+    await renderLoadedPanel();
+
+    fireEvent.click(getButton(FACTOR_TAB));
+    await screen.findByText(/暂无因子策略/);
+    await waitFor(() => expect(useAppStore.getState().strategyId).toBeNull());
+
+    fireEvent.click(getButton("去因子实验室"));
+    expect(useAppStore.getState().activeView).toBe("factor");
+    expect(useAppStore.getState().factorLabSection).toBe("builder");
+  });
+
+  it("deletes a factor strategy through its source factor set (cascade), not deleteStrategy", async () => {
+    mockApi([...STRATEGIES, FACTOR_STRATEGY]);
+    await renderLoadedPanel();
+
+    fireEvent.click(getButton(FACTOR_TAB));
+    const deleteBtn = await screen.findByRole("button", { name: "删除 因子组合甲" });
+    fireEvent.click(deleteBtn);
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/将同时移除因子实验室中对应的因子组合/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: DELETE }));
+
+    await waitFor(() => expect(factorApi.sets.remove).toHaveBeenCalledWith(7));
+    expect(api.deleteStrategy).not.toHaveBeenCalled();
+  });
+
+  it("deletes a non-builtin atomic strategy directly via deleteStrategy", async () => {
+    mockApi([...STRATEGIES, USER_ATOMIC]);
+    await renderLoadedPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: "删除 Alpha 副本" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: DELETE }));
+
+    await waitFor(() => expect(api.deleteStrategy).toHaveBeenCalledWith(60));
+    expect(factorApi.sets.remove).not.toHaveBeenCalled();
+  });
+
+  it("deletes a combo from its card through the combo panel (single source)", async () => {
+    await renderLoadedPanel();
+    await selectComboTab();
+
+    fireEvent.click(screen.getByRole("button", { name: "删除 Combo One" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/确认删除组合/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: DELETE }));
+
+    await waitFor(() => expect(api.deleteStrategy).toHaveBeenCalledWith(20));
+    expect(factorApi.sets.remove).not.toHaveBeenCalled();
+  });
+
+  it("keeps the delete dialog open and surfaces the error when deletion fails", async () => {
+    mockApi([...STRATEGIES, USER_ATOMIC]);
+    vi.mocked(api.deleteStrategy).mockRejectedValueOnce(new Error("boom"));
+    await renderLoadedPanel();
+
+    fireEvent.click(screen.getByRole("button", { name: "删除 Alpha 副本" }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: DELETE }));
+
+    await screen.findByText(/删除失败：boom/);
+    expect(screen.queryByRole("dialog")).toBeTruthy();
   });
 
   it("shows the multi-sample button for simple backtest and opens the selection modal", async () => {

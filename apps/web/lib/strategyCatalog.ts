@@ -4,15 +4,24 @@ import type { Mode, Strategy, StrategyListTab } from "./types";
 export const STRATEGY_LIST_TABS: { key: StrategyListTab; label: string }[] = [
   { key: "regular", label: "常规策略" },
   { key: "combo", label: "组合策略" },
+  { key: "factor", label: "因子策略" },
 ];
+
+// 因子组合得分策略（kind==="factor"，后端 factor_score 模板透传）：归入「因子策略」页签，
+// 从「常规策略」排除，与因子实验室的「配方 ↔ 按配方做的菜」一一对应。
+export function isFactorStrategy(s: Strategy): boolean {
+  return s.kind === "factor";
+}
 
 export function splitStrategyCatalog(strategies: Strategy[]): {
   regular: Strategy[];
   combos: Strategy[];
+  factors: Strategy[];
 } {
   return {
-    regular: strategies.filter((strategy) => strategy.kind !== "combo"),
+    regular: strategies.filter((strategy) => strategy.kind !== "combo" && !isFactorStrategy(strategy)),
     combos: strategies.filter(isUserCombo),
+    factors: strategies.filter(isFactorStrategy),
   };
 }
 
@@ -21,9 +30,11 @@ export function visibleStrategiesForStrategyPanel(args: {
   mode: Mode;
   strategyListTab: StrategyListTab;
 }): Strategy[] {
-  const { regular, combos } = splitStrategyCatalog(args.strategies);
+  const { regular, combos, factors } = splitStrategyCatalog(args.strategies);
   if (args.mode !== "backtest" && args.mode !== "paper") return regular;
-  return args.strategyListTab === "combo" ? combos : regular;
+  if (args.strategyListTab === "combo") return combos;
+  if (args.strategyListTab === "factor") return factors;
+  return regular;
 }
 
 export function resolveVisibleStrategyId(args: {
