@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_COMBO_POLICY } from "./combo";
 import { FALLBACK_INSTRUMENTS } from "./instruments";
 import {
+  DEFAULT_CHART_INDICATOR_RATIO,
   DEFAULT_DEPTH_PANEL_RATIO,
   DEFAULT_RIGHT_PANEL_WIDTH,
   DEFAULT_SIM_BALANCE,
@@ -289,6 +290,53 @@ describe("app store — workstation panel sizes (v12)", () => {
     const s = useAppStore.getState();
     expect(s.rightPanelWidth).toBe(DEFAULT_RIGHT_PANEL_WIDTH);
     expect(s.depthPanelRatio).toBe(DEFAULT_DEPTH_PANEL_RATIO);
+    // 既有持久化字段仍恢复
+    expect(s.instId).toBe("ETH-USDT-SWAP");
+    expect(s.chartSplitRatio).toBe(0.7);
+  });
+});
+
+describe("app store — chart indicator pane split (v22)", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    // store 为模块单例：把主图/副图分栏比例复位到默认，避免跨用例残留。
+    useAppStore.setState({ chartIndicatorRatio: DEFAULT_CHART_INDICATOR_RATIO });
+  });
+
+  it("setChartIndicatorRatio clamps to [0.40, 0.85]", () => {
+    useAppStore.getState().setChartIndicatorRatio(0);
+    expect(useAppStore.getState().chartIndicatorRatio).toBeCloseTo(0.4, 10);
+    useAppStore.getState().setChartIndicatorRatio(1);
+    expect(useAppStore.getState().chartIndicatorRatio).toBeCloseTo(0.85, 10);
+    useAppStore.getState().setChartIndicatorRatio(0.6);
+    expect(useAppStore.getState().chartIndicatorRatio).toBeCloseTo(0.6, 10);
+  });
+
+  it("setChartIndicatorRatio ignores non-finite input", () => {
+    useAppStore.getState().setChartIndicatorRatio(0.6);
+    useAppStore.getState().setChartIndicatorRatio(Number.NaN);
+    expect(useAppStore.getState().chartIndicatorRatio).toBeCloseTo(0.6, 10);
+    useAppStore.getState().setChartIndicatorRatio(Number.POSITIVE_INFINITY);
+    expect(useAppStore.getState().chartIndicatorRatio).toBeCloseTo(0.6, 10);
+  });
+
+  it("persists chartIndicatorRatio", () => {
+    useAppStore.getState().setChartIndicatorRatio(0.65);
+    const persisted = JSON.parse(localStorage.getItem("aragon-ui") as string);
+    expect(persisted.state.chartIndicatorRatio).toBeCloseTo(0.65, 10);
+  });
+
+  it("migrates v21 persisted state to v22 with default ratio", async () => {
+    localStorage.setItem(
+      "aragon-ui",
+      JSON.stringify({
+        state: { instId: "ETH-USDT-SWAP", chartSplitRatio: 0.7 },
+        version: 21,
+      }),
+    );
+    await useAppStore.persist.rehydrate();
+    const s = useAppStore.getState();
+    expect(s.chartIndicatorRatio).toBe(DEFAULT_CHART_INDICATOR_RATIO);
     // 既有持久化字段仍恢复
     expect(s.instId).toBe("ETH-USDT-SWAP");
     expect(s.chartSplitRatio).toBe(0.7);

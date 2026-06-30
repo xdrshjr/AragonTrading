@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ratioFromRightEdge, widthFromRightEdge } from "./panelResize";
+import { ratioFromRightEdge, ratioFromTopEdge, widthFromRightEdge } from "./panelResize";
 
 describe("panelResize — widthFromRightEdge", () => {
   it("widthFromRightEdge_subtracts_pointer_from_right", () => {
@@ -25,5 +25,19 @@ describe("panelResize — ratioFromRightEdge", () => {
     // 除零守卫：宽度为 0（或负）时返回 0，不产生 NaN / Infinity。
     expect(ratioFromRightEdge(1000, 0, 850)).toBe(0);
     expect(ratioFromRightEdge(1000, -10, 850)).toBe(0);
+  });
+});
+
+describe("panelResize — ratioFromTopEdge", () => {
+  it("ratioFromTopEdge_maps_pointer_offset_to_ratio", () => {
+    // 上锚除法方向：上区占比随指针下移而增大。
+    expect(ratioFromTopEdge(100, 400, 300)).toBeCloseTo(0.5, 10);
+    expect(ratioFromTopEdge(0, 500, 400)).toBeCloseTo(0.8, 10);
+  });
+
+  it("ratioFromTopEdge_guards_zero_height", () => {
+    // 除零守卫：高度为 0（或负）时返回 0，不产生 NaN / Infinity。
+    expect(ratioFromTopEdge(100, 0, 300)).toBe(0);
+    expect(ratioFromTopEdge(100, -10, 300)).toBe(0);
   });
 });

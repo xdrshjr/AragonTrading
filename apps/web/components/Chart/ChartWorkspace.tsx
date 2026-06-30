@@ -8,13 +8,15 @@ import PaperPositionsTable from "@/components/Strategy/PaperPositionsTable";
 import PositionPanel from "@/components/Strategy/PositionPanel";
 import TradesTable from "@/components/Strategy/TradesTable";
 import { Tabs } from "@/components/ui";
+import PaneSplitHandle from "@/components/ui/PaneSplitHandle";
 import PanelResizeHandle from "@/components/ui/PanelResizeHandle";
 import type { IndicatorKey } from "@/lib/indicators";
 import { buildOrderPriceLines, openOrdersKey } from "@/lib/openOrders";
-import { ratioFromRightEdge } from "@/lib/panelResize";
+import { ratioFromRightEdge, ratioFromTopEdge } from "@/lib/panelResize";
 import { buildPaperPositionRows } from "@/lib/paperMulti";
 import { tradingApi } from "@/lib/tradingApi";
 import {
+  DEFAULT_CHART_INDICATOR_RATIO,
   DEFAULT_CHART_SPLIT_RATIO,
   DEFAULT_DEPTH_PANEL_RATIO,
   useAppStore,
@@ -109,12 +111,14 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     paneTab,
     paperSessionId,
     chartSplitRatio,
+    chartIndicatorRatio,
     depthPanelRatio,
     setInst,
     setChartPane,
     setBottomTab,
     setPaneTab,
     setChartSplitRatio,
+    setChartIndicatorRatio,
     setDepthPanelRatio,
   } = useAppStore();
 
@@ -122,25 +126,12 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
   useEffect(() => setHoverTs(null), [instId, bar]);
 
   // 纵向分栏拖拽：以 section 为测量容器，比例 = 指针 Y 相对 section 顶部的占比（store 负责夹取）。
-  // setPointerCapture 把拖拽期事件锁定到手柄，卸载即自动释放，无需手动清理 window 监听。
+  // 手柄生命周期收敛到可复用 PaneSplitHandle（含 Pointer 捕获 / 取消复位），父组件仅做几何换算。
   const splitContainerRef = useRef<HTMLElement>(null);
-  const splitDraggingRef = useRef(false);
-  const onSplitPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    splitDraggingRef.current = true;
-  };
-  const onSplitPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!splitDraggingRef.current) return;
+  const onSplitResize = (clientY: number) => {
     const rect = splitContainerRef.current?.getBoundingClientRect();
     if (!rect || rect.height <= 0) return;
-    setChartSplitRatio((e.clientY - rect.top) / rect.height);
-  };
-  const onSplitPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
-    splitDraggingRef.current = false;
-    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-      e.currentTarget.releasePointerCapture(e.pointerId);
-    }
+    setChartSplitRatio(ratioFromTopEdge(rect.top, rect.height, clientY));
   };
   const onSplitReset = () => setChartSplitRatio(DEFAULT_CHART_SPLIT_RATIO);
 
@@ -276,6 +267,11 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
                 orderLines={accountMode === "live" ? orderLines : undefined}
                 instId={instId}
                 bar={bar}
+                chartIndicatorRatio={chartIndicatorRatio}
+                onChartIndicatorRatioChange={setChartIndicatorRatio}
+                onChartIndicatorRatioReset={() =>
+                  setChartIndicatorRatio(DEFAULT_CHART_INDICATOR_RATIO)
+                }
               />
             ) : (
               <EquityChart
@@ -302,19 +298,11 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
         </div>
       </div>
 
-      <div
-        role="separator"
-        aria-orientation="horizontal"
-        title="拖动调整图表与下方面板高度，双击复位"
-        onPointerDown={onSplitPointerDown}
-        onPointerMove={onSplitPointerMove}
-        onPointerUp={onSplitPointerUp}
-        onDoubleClick={onSplitReset}
-        style={{ touchAction: "none" }}
-        className="group flex h-1.5 shrink-0 cursor-row-resize items-center justify-center border-t border-[var(--border)] bg-[var(--surface-2)] hover:bg-[var(--accent-soft)]"
-      >
-        <div className="h-0.5 w-8 rounded-full bg-[var(--border)] group-hover:bg-[var(--accent)]" />
-      </div>
+      <PaneSplitHandle
+        onResize={onSplitResize}
+        onReset={onSplitReset}
+        ariaLabel="拖动调整图表与下方面板高度，双击复位"
+      />
 
       <div
         className="flex min-h-[140px] flex-col"

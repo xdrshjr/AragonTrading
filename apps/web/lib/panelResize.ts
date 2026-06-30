@@ -28,3 +28,20 @@ export function ratioFromRightEdge(
 ): number {
   return containerWidth > 0 ? (containerRight - clientX) / containerWidth : 0;
 }
+
+/**
+ * 上锚行占比（行向分栏）：上区贴容器顶部，比例 = (指针 Y − 顶边缘) / 容器高。
+ *
+ * @param containerTop 容器顶边缘的视口 Y 坐标（getBoundingClientRect().top）。
+ * @param containerHeight 容器高度（getBoundingClientRect().height）。
+ * @param clientY 指针的视口 Y 坐标（PointerEvent.clientY）。
+ * @returns 上区占容器高度的比例；`containerHeight <= 0` 时返回 0（除零守卫，避免 NaN/Infinity，
+ *   调用方 store setter 会把 0 夹取到下限）。
+ */
+export function ratioFromTopEdge(
+  containerTop: number,
+  containerHeight: number,
+  clientY: number,
+): number {
+  return containerHeight > 0 ? (clientY - containerTop) / containerHeight : 0;
+}

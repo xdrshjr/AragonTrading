@@ -24,7 +24,9 @@ import { normalizeEquity } from "@/lib/compare";
 import { buildIndicatorLegendItems } from "@/lib/indicatorLegend";
 import { INDICATORS, type IndicatorKey, type Plot, type ThemeColors } from "@/lib/indicators";
 import type { OrderPriceLine } from "@/lib/openOrders";
+import { ratioFromTopEdge } from "@/lib/panelResize";
 import { selectActivePane } from "@/lib/paneTabs";
+import { DEFAULT_CHART_INDICATOR_RATIO } from "@/lib/store";
 import {
   buildTradeMarkerEvents,
   buildTradeTrailSegments,
@@ -39,6 +41,7 @@ import type {
   TradeTrailSegment,
 } from "@/lib/types";
 import { Tabs } from "@/components/ui";
+import PaneSplitHandle from "@/components/ui/PaneSplitHandle";
 import IndicatorLegendOverlay from "./IndicatorLegendOverlay";
 import IndicatorPane from "./IndicatorPane";
 import OrderLineTag from "./OrderLineTag";
@@ -69,6 +72,11 @@ type Props = {
   //（chart-candles-disappear-on-symbol-switch，见下方 reset effect）。
   instId?: string;
   bar?: string;
+  // 主图占内部列高比例（chart-indicator-pane-resize）：缺省回退 DEFAULT_CHART_INDICATOR_RATIO；
+  // 拖拽 / 双击复位回调由 ChartWorkspace 从 store 透传（与 paneTab/onPaneTabChange 同范式）。
+  chartIndicatorRatio?: number;
+  onChartIndicatorRatioChange?: (ratio: number) => void;
+  onChartIndicatorRatioReset?: () => void;
 };
 
 function cssVar(name: string): string {
@@ -104,8 +112,13 @@ export default function CandleChart({
   orderLines,
   instId,
   bar,
+  chartIndicatorRatio,
+  onChartIndicatorRatioChange,
+  onChartIndicatorRatioReset,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  // 主图/副图分栏测量容器（绑定到根 flex-col），拖拽时据其 rect 把指针 Y 换算为比例。
+  const splitContainerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
   const priceLineRef = useRef<IPriceLine | null>(null);
@@ -516,9 +529,21 @@ export default function CandleChart({
     if (syncRef.current) alignPriceScaleWidths(syncRef.current.getCharts());
   }, [priceMagnitude, activeKey, hasPane, theme, hasEquity]);
 
+  // 主图占内部列高比例：props 缺省时回退默认（避免 undefined 落到 flexGrow）；副图占 1-ratio。
+  const ratio = chartIndicatorRatio ?? DEFAULT_CHART_INDICATOR_RATIO;
+  // 拖拽手柄回吐 clientY → 据根列容器 rect 换算为比例 → 透传给 store setter 夹取（夹取不在此处）。
+  const onSplitResize = (clientY: number) => {
+    const rect = splitContainerRef.current?.getBoundingClientRect();
+    if (!rect || rect.height <= 0) return;
+    onChartIndicatorRatioChange?.(ratioFromTopEdge(rect.top, rect.height, clientY));
+  };
+
   return (
-    <div className="relative flex h-full w-full flex-col">
-      <div className="relative min-h-0 w-full flex-[4]">
+    <div ref={splitContainerRef} className="relative flex h-full w-full flex-col">
+      <div
+        className="relative min-h-[120px] w-full"
+        style={{ flexGrow: ratio, flexShrink: 1, flexBasis: 0 }}
+      >
         <div ref={containerRef} className="h-full w-full" />
         <IndicatorLegendOverlay items={legendItems} />
         {orderHover && <OrderLineTag hover={orderHover} />}
@@ -527,31 +552,42 @@ export default function CandleChart({
         <TradeTooltip events={tradeTooltip.events} x={tradeTooltip.x} y={tradeTooltip.y} />
       )}
 
-      {/* 副图指标容器（≈20% 高）：顶部靠左短标签页签 + 下方仅渲染当前选中的单个窗格（单显切换）。 */}
+      {/* 主图与副图之间的可拖拽分隔手柄 + 副图容器（评审 R2：同条件、同片段、手柄在前，随副图原子开关）。
+          副图指标容器：顶部靠左短标签页签 + 下方仅渲染当前选中的单个窗格（单显切换）。 */}
       {hasPane && activePaneDef && (
-        <div className="flex min-h-[120px] flex-1 flex-col border-t border-[var(--border)]">
-          <div className="shrink-0 px-2">
-            {/* 评审 R-1：页签用短标签（指标键大写：MACD/RSI/KDJ/VOL），与 §2 示意图一致；
-                注册表 d.label 为长名（如「RSI 相对强弱」）会撑宽容器顶部，违背「靠左紧凑」。 */}
-            <Tabs
-              variant="underline"
-              tabs={enabledPaneDefs.map((d) => ({ key: d.key, label: d.key.toUpperCase() }))}
-              active={activePaneDef.key}
-              onChange={(k) => onPaneTabChange?.(k as IndicatorKey)}
-            />
+        <>
+          <PaneSplitHandle
+            onResize={onSplitResize}
+            onReset={onChartIndicatorRatioReset}
+            ariaLabel="拖动调整主图与副图高度，双击复位"
+          />
+          <div
+            className="flex min-h-[120px] flex-col"
+            style={{ flexGrow: 1 - ratio, flexShrink: 1, flexBasis: 0 }}
+          >
+            <div className="shrink-0 px-2">
+              {/* 评审 R-1：页签用短标签（指标键大写：MACD/RSI/KDJ/VOL），与 §2 示意图一致；
+                  注册表 d.label 为长名（如「RSI 相对强弱」）会撑宽容器顶部，违背「靠左紧凑」。 */}
+              <Tabs
+                variant="underline"
+                tabs={enabledPaneDefs.map((d) => ({ key: d.key, label: d.key.toUpperCase() }))}
+                active={activePaneDef.key}
+                onChange={(k) => onPaneTabChange?.(k as IndicatorKey)}
+              />
+            </div>
+            <div className="relative min-h-0 flex-1">
+              <IndicatorPane
+                key={activePaneDef.key}
+                candles={candles}
+                def={activePaneDef}
+                theme={theme}
+                sync={syncRef.current as SyncGroup}
+                showTimeAxis
+                showLeftAxis={hasEquity}
+              />
+            </div>
           </div>
-          <div className="relative min-h-0 flex-1">
-            <IndicatorPane
-              key={activePaneDef.key}
-              candles={candles}
-              def={activePaneDef}
-              theme={theme}
-              sync={syncRef.current as SyncGroup}
-              showTimeAxis
-              showLeftAxis={hasEquity}
-            />
-          </div>
-        </div>
+        </>
       )}
 
       {loading && !error && (
