@@ -24,10 +24,12 @@ from .api import (
     runs,
     strategies,
     trading,
+    weight_models,
     workspace,
     ws_market,
 )
 from .db.session import dispose_engine, init_db
+from .factors.weight_train_manager import get_weight_train_manager
 from .live_auto.manager import get_live_auto_manager
 from .okx.rest_client import OKXError, get_rest_client
 from .paper.manager import get_paper_manager
@@ -41,10 +43,12 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("DB initialized; builtin strategies seeded.")
     await _backfill_companion_strategies()
+    await _reconcile_weight_train_runs()
     yield
     await get_agent_manager().shutdown()
     await get_paper_manager().shutdown()
     await get_live_auto_manager().shutdown()
+    await get_weight_train_manager().shutdown()
     await get_rest_client().aclose()
     await dispose_engine()
 
@@ -66,6 +70,24 @@ async def _backfill_companion_strategies() -> None:
             logger.info("backfilled %d companion factor_score strategies", created)
     except Exception as exc:  # noqa: BLE001 —— 启动补建非关键，绝不因它拖垮服务启动
         logger.warning("companion strategy backfill skipped: %s", exc)
+
+
+async def _reconcile_weight_train_runs() -> None:
+    """启动对账（weight-model-workspace R-04）：把上轮进程残留的 ``running`` 训练记录批量改判 ``failed``。
+
+    仿 ``_backfill_companion_strategies`` 一次性 session；**整段 try/except 包裹，失败仅 warning 不阻断启动**
+    （对账为非关键收敛，避免悬挂 running 让详情页假「训练中」）。
+    """
+    try:
+        from .db import repositories as repo
+        from .db.session import get_sessionmaker
+
+        async with get_sessionmaker()() as session:
+            reconciled = await repo.reconcile_dangling_weight_runs(session)
+        if reconciled:
+            logger.info("reconciled %d dangling weight-train runs to failed", reconciled)
+    except Exception as exc:  # noqa: BLE001 —— 启动对账非关键，绝不因它拖垮服务启动
+        logger.warning("weight-train run reconcile skipped: %s", exc)
 
 
 app = FastAPI(title="Aragon Trading Quant API", version="0.1.0", lifespan=lifespan)
@@ -139,6 +161,7 @@ app.include_router(factors.router, prefix="/api")   # 第 9 个路由（因子�
 app.include_router(live_auto.router, prefix="/api")  # 第 10 个路由（实时自动交易，live-auto-trading §4）
 app.include_router(app_settings.router, prefix="/api")  # 第 11 个路由（设置中心 · 自动交易设置 §4.1）
 app.include_router(workspace.router, prefix="/api")  # 第 12 个路由（workspace 偏好持久化，watchlist-auto-trade-persistence §3）
+app.include_router(weight_models.router, prefix="/api")  # 权重模型工作区（weight-model-workspace §五；含 WS /ws/weight-train/{jobId}）
 
 
 @app.get("/")

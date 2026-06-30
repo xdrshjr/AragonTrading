@@ -5,7 +5,17 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .db.models import AgentProvider, EquityPoint, Factor, FactorSet, OkxAccount, StrategyRun, Trade
+from .db.models import (
+    AgentProvider,
+    EquityPoint,
+    Factor,
+    FactorSet,
+    OkxAccount,
+    StrategyRun,
+    Trade,
+    WeightModel,
+    WeightTrainRun,
+)
 from .engine.metrics import _empty_metrics
 from .paper.session import PAPER_WINDOW_MAX
 
@@ -1050,6 +1060,80 @@ class FactorScoreReq(_FactorRange):
 class FactorScoreInlineReq(_FactorRange):
     members: list[FactorMemberIn] = Field(min_length=1, max_length=12)
     thresholds: dict[str, Any] = Field(default_factory=dict)
+    maxBars: int | None = Field(default=None, ge=10, le=200000)
+
+
+# ---------------- 权重模型工作区（weight-model-workspace §五，流式训练 + 模型管理） ----------------
+_WEIGHT_METHODS = Literal["equal", "ic_weight", "linear", "random_forest", "xgboost"]
+
+
+def weight_train_run_out(row: WeightTrainRun, *, with_curve: bool = True) -> dict:
+    """WeightTrainRun 行 → 前端 dict（camelCase）。列表态 ``with_curve=False`` 仅回曲线点数，详情回完整 ``curve``。"""
+    curve = _load_json(row.curve_json, [])
+    curve = curve if isinstance(curve, list) else []
+    out = {
+        "id": row.id, "modelId": row.model_id, "status": row.status, "method": row.method,
+        "instId": row.inst_id, "bar": row.bar, "startTs": row.start_ts, "endTs": row.end_ts,
+        "horizon": row.horizon, "config": _load_json(row.config_json, {}),
+        "weights": _load_json(row.weights_json, {}), "normStats": _load_json(row.norm_stats_json, {}),
+        "metrics": _load_json(row.metrics_json, None), "provenance": _load_json(row.provenance_json, {}),
+        "trainerVersion": row.trainer_version, "note": row.note,
+        "errorCode": row.error_code or None, "errorMessage": row.error_message or None,
+        "curveCount": len(curve), "startedTs": row.started_ts, "finishedTs": row.finished_ts,
+    }
+    out["curve"] = curve if with_curve else None
+    return out
+
+
+def weight_model_out(row: WeightModel, *, latest_run: WeightTrainRun | None = None) -> dict:
+    """WeightModel 行 → 前端 dict（camelCase；含可选最近成功训练记录概要）。"""
+    return {
+        "id": row.id, "name": row.name, "instId": row.inst_id, "bar": row.bar,
+        "members": _load_json(row.members_json, []), "method": row.method,
+        "config": _load_json(row.config_json, {}), "horizon": row.horizon, "source": row.source,
+        "factorSetId": row.factor_set_id, "latestRunId": row.latest_run_id,
+        "bestValidIc": row.best_valid_ic, "notes": row.notes, "enabled": bool(row.enabled),
+        "latestRun": weight_train_run_out(latest_run, with_curve=False) if latest_run is not None else None,
+        "createdTs": int(row.created_at.timestamp()) if row.created_at else 0,
+        "updatedTs": int(row.updated_at.timestamp()) if row.updated_at else 0,
+    }
+
+
+class WeightModelCreateReq(BaseModel):
+    name: str = Field(min_length=1, max_length=128)
+    instId: str = Field(min_length=1, max_length=32)
+    bar: str = "1H"
+    members: list[FactorMemberIn] = Field(min_length=1, max_length=12)
+    method: _WEIGHT_METHODS = "linear"
+    config: dict[str, Any] = Field(default_factory=dict)
+    horizon: int = Field(default=6, ge=1, le=100)
+    notes: str = Field(default="", max_length=256)
+    factorSetId: int | None = None
+    enabled: bool = True
+
+
+class WeightModelUpdateReq(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    instId: str | None = Field(default=None, min_length=1, max_length=32)
+    bar: str | None = None
+    members: list[FactorMemberIn] | None = None
+    method: _WEIGHT_METHODS | None = None
+    config: dict[str, Any] | None = None
+    horizon: int | None = Field(default=None, ge=1, le=100)
+    notes: str | None = Field(default=None, max_length=256)
+    enabled: bool | None = None
+
+
+class WeightTrainStartReq(_FactorRange):
+    """启动流式训练入参（继承 ``_FactorRange`` 区间校验，weight-model-workspace §5.3）。"""
+
+    members: list[FactorMemberIn] = Field(min_length=1, max_length=12)
+    method: _WEIGHT_METHODS = "linear"
+    config: dict[str, Any] = Field(default_factory=dict)
+    horizon: int = Field(default=6, ge=1, le=100)
+    modelId: int | None = None
+    factorSetId: int | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=128)
     maxBars: int | None = Field(default=None, ge=10, le=200000)
 
 

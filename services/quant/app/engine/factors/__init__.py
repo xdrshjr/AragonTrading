@@ -40,10 +40,16 @@ from .scoring import (  # noqa: F401
     score_points,
 )
 from .training import (  # noqa: F401
+    MIN_TRAIN_SAMPLES,
     TrainResult,
+    TrainSample,
     available_trainers,
     build_factor_matrix,
+    build_train_result,
+    fit_at_fraction,
     forward_return_label,
+    learning_curve_steps,
+    prepare_curve_sample,
     train_weights,
     trainer_available,
 )

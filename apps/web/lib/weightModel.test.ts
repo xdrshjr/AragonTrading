@@ -1,0 +1,141 @@
+import { describe, expect, it } from "vitest";
+import { DEFAULT_THRESHOLDS, type FactorMember } from "./factorTypes";
+import {
+  bestRun,
+  buildTrainResult,
+  buildTrainTarget,
+  latestRun,
+  metricGeometry,
+  runToTrained,
+  sortModelsByUpdated,
+  trainStartBody,
+  weightResultToTrained,
+} from "./weightModel";
+import type {
+  TrainCurvePoint,
+  TrainResultEvent,
+  WeightModel,
+  WeightTrainRun,
+} from "./weightModelTypes";
+
+const MEMBERS: FactorMember[] = [
+  { factorKey: "mom_roc", params: {}, weight: 0, direction: "long" },
+  { factorKey: "rev_rsi", params: {}, weight: 0, direction: "short" },
+];
+
+function curvePoint(over: Partial<TrainCurvePoint>): TrainCurvePoint {
+  return { step: 0, fraction: 0.2, nTrain: 40, trainLoss: 1, validLoss: 1, trainIc: 0.1, validIc: 0.1, ...over };
+}
+
+function run(over: Partial<WeightTrainRun>): WeightTrainRun {
+  return {
+    id: 1, modelId: 1, status: "succeeded", method: "linear", instId: "BTC-USDT-SWAP", bar: "1H",
+    startTs: 0, endTs: 1, horizon: 6, config: {}, weights: { mom_roc: 1 }, normStats: { normWindow: 100, clip: 4 },
+    metrics: { icIn: 0.3, icOut: 0.2, r2In: null, r2Out: null, nTrain: 100, nValid: 40 },
+    provenance: {}, trainerVersion: null, note: "", errorCode: null, errorMessage: null,
+    curveCount: 0, startedTs: 0, finishedTs: 1, curve: null, ...over,
+  };
+}
+
+describe("metricGeometry", () => {
+  it("maps train/valid series and shares one domain", () => {
+    const curve = [
+      curvePoint({ step: 0, fraction: 0.2, validLoss: 0.4, trainLoss: 0.1 }),
+      curvePoint({ step: 1, fraction: 1.0, validLoss: 0.2, trainLoss: 0.05 }),
+    ];
+    const geom = metricGeometry(curve, "trainLoss", "validLoss", 100, 50);
+    expect(geom.trainPath).toHaveLength(2);
+    expect(geom.validPath).toHaveLength(2);
+    expect(geom.min).toBeCloseTo(0.05);
+    expect(geom.max).toBeCloseTo(0.4);
+    // x 按 fraction 归一填满宽度：首点贴左、末点贴右。
+    expect(geom.trainPath[0].x).toBeLessThan(geom.trainPath[1].x);
+  });
+
+  it("skips null points (no zero-fill)", () => {
+    const curve = [
+      curvePoint({ step: 0, fraction: 0.2, validLoss: null }),
+      curvePoint({ step: 1, fraction: 1.0, validLoss: 0.3 }),
+    ];
+    const geom = metricGeometry(curve, "trainLoss", "validLoss", 100, 50);
+    expect(geom.validPath).toHaveLength(1); // null 段断线
+  });
+});
+
+describe("run selectors", () => {
+  it("bestRun picks max icOut among succeeded", () => {
+    const runs = [run({ id: 1, metrics: { ...run({}).metrics!, icOut: 0.1 } }),
+                  run({ id: 2, metrics: { ...run({}).metrics!, icOut: 0.4 } }),
+                  run({ id: 3, status: "failed", metrics: null })];
+    expect(bestRun(runs)?.id).toBe(2);
+  });
+
+  it("latestRun picks max id (incl non-succeeded)", () => {
+    const runs = [run({ id: 1 }), run({ id: 5, status: "failed" })];
+    expect(latestRun(runs)?.id).toBe(5);
+  });
+
+  it("bestRun returns null when none succeeded with icOut", () => {
+    expect(bestRun([run({ status: "failed", metrics: null })])).toBeNull();
+  });
+});
+
+describe("handoff construction", () => {
+  it("buildTrainTarget carries full builder state + reuse ids", () => {
+    const target = buildTrainTarget({
+      members: MEMBERS, method: "linear", thresholds: DEFAULT_THRESHOLDS, horizon: 6,
+      instId: "BTC-USDT-SWAP", bar: "1H", startTs: 10, endTs: 20, name: "组合A",
+      modelId: 3, factorSetId: 7,
+    });
+    expect(target.config.normWindow).toBe(DEFAULT_THRESHOLDS.normWindow);
+    expect(target.thresholds).toEqual(DEFAULT_THRESHOLDS);
+    expect(target.modelId).toBe(3);
+    expect(target.factorSetId).toBe(7);
+
+    const body = trainStartBody(target);
+    expect(body.instId).toBe("BTC-USDT-SWAP");
+    expect(body.members).toBe(MEMBERS);
+    expect(body.modelId).toBe(3);
+  });
+
+  it("buildTrainResult merges WS produce + target context for lossless round-trip", () => {
+    const target = buildTrainTarget({
+      members: MEMBERS, method: "linear", thresholds: DEFAULT_THRESHOLDS, horizon: 6,
+      instId: "BTC-USDT-SWAP", bar: "1H", startTs: 10, endTs: 20, name: "组合A", factorSetId: 7,
+    });
+    const event: TrainResultEvent = {
+      method: "linear", weights: { mom_roc: 0.6, rev_rsi: -0.4 }, normStats: { normWindow: 150, clip: 4 },
+      metrics: { icIn: 0.3, icOut: 0.2, r2In: null, r2Out: null, nTrain: 100, nValid: 40 },
+      trainerVersion: "sklearn 1.6", note: "", provenance: { instId: "BTC-USDT-SWAP", bar: "1H", startTs: 10, endTs: 20, horizon: 6 },
+    };
+    const result = buildTrainResult(event, target, { modelId: 9, runId: 4 });
+    expect(result.members).toBe(MEMBERS);
+    expect(result.name).toBe("组合A");
+    expect(result.factorSetId).toBe(7);
+    expect(result.weights).toEqual({ mom_roc: 0.6, rev_rsi: -0.4 });
+    expect(result.modelId).toBe(9);
+
+    // 回流 → factorTypes.TrainResult（builder 水合用）：normStats.normWindow 锁定。
+    const trained = weightResultToTrained(result);
+    expect(trained.available).toBe(true);
+    expect(trained.normStats.normWindow).toBe(150);
+    expect(trained.weights).toEqual(result.weights);
+  });
+
+  it("runToTrained returns null for non-succeeded run", () => {
+    expect(runToTrained(run({ status: "failed", weights: {} }))).toBeNull();
+    expect(runToTrained(run({}))?.weights).toEqual({ mom_roc: 1 });
+  });
+});
+
+describe("sortModelsByUpdated", () => {
+  it("sorts by updatedTs desc", () => {
+    const mk = (id: number, ts: number): WeightModel => ({
+      id, name: `m${id}`, instId: "BTC-USDT-SWAP", bar: "1H", members: [], method: "linear",
+      config: {}, horizon: 6, source: "manual", factorSetId: null, latestRunId: null,
+      bestValidIc: null, notes: "", enabled: true, latestRun: null, createdTs: 0, updatedTs: ts,
+    });
+    const sorted = sortModelsByUpdated([mk(1, 10), mk(2, 30), mk(3, 20)]);
+    expect(sorted.map((m) => m.id)).toEqual([2, 3, 1]);
+  });
+});

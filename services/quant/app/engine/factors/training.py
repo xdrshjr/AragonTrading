@@ -36,6 +36,8 @@ from .tree_ensemble import (
 MIN_TRAIN_SAMPLES = 30   # 对齐 dropna 后的最小样本数；不足显式报错而非静默（R9）
 DEFAULT_SPLIT = 0.7
 DEFAULT_L2 = 1.0
+DEFAULT_CURVE_STEPS = 6   # 扩样本学习曲线默认 fraction 网格步数（末点恒 1.0，weight-model-workspace R-10）
+_CURVE_START_FRACTION = 0.2  # 网格起点（最早子样本占训练段比例）
 
 
 @dataclass
@@ -49,6 +51,19 @@ class TrainResult:
     available: bool
     trainerVersion: str | None = None
     note: str = ""
+
+
+@dataclass(frozen=True)
+class TrainSample:
+    """对齐后的训练样本矩阵 + 时序切分点（``cut``=训练段长度）。
+
+    供「权重 → 指标 → 结果」等价装配（``build_train_result``）与扩样本学习曲线（``fit_at_fraction``）共用，
+    保证流式末步与同步 ``train_weights`` 对相同输入字节级等价（weight-model-workspace 放行条件 1）。
+    """
+
+    matrix: np.ndarray
+    label: np.ndarray
+    cut: int
 
 
 Kind = Literal["native", "library", "builtin"]  # 评审 P1-1：显式标签，消除 native↔builtin 派生歧义
@@ -254,6 +269,96 @@ def _round(value: float | None) -> float | None:
     return None if value is None else round(float(value), 6)
 
 
+def _train_cut(n: int, config: dict) -> int:
+    """时序切分点 ``cut=max(1,min(n-1,floor(n*split)))``（默认 split=0.7，绝不打乱，杜绝未来泄漏）。
+
+    单源钳制公式：``train_weights`` 与 ``fit_at_fraction`` 共用，保证 ``f=1.0`` 末步与同步训练字节级等价（R-09）。
+    """
+    split = float(config.get("split", DEFAULT_SPLIT))
+    return max(1, min(n - 1, int(np.floor(n * split))))
+
+
+def _standardized_mse(pred: np.ndarray, actual: np.ndarray) -> float | None:
+    """标准化后均方误差 ``mse(zscore(pred), zscore(actual)) = 2*(1-pearson)``，落在 [0,4]。
+
+    拟合越好越小（pearson→1 则 →0）；样本 <2 或任一退化（方差 0）→ ``None``（绝不假装为 0，R-07/C1）。
+    """
+    corr = _pearson(pred, actual)
+    return None if corr is None else round(2.0 * (1.0 - corr), 6)
+
+
+def build_train_result(method: str, weights: dict[str, float], names: list[str], *,
+                       sample: TrainSample, norm_stats: dict,
+                       trainer_version: str | None = None, note: str = "") -> TrainResult:
+    """从已拟合权重装配 ``TrainResult``（权重 → 样本内 / 外 IC + r2 指标 → 结果）。
+
+    ``train_weights`` 与流式训练「末步」共用本装配，保证两路径对相同 ``(weights, sample)`` 产出**逐字段相等**的
+    ``metrics``（守护「不破坏既有契约」，weight-model-workspace 放行条件 1）。
+    """
+    weight_vec = np.asarray([weights[name] for name in names], dtype=float)
+    metrics = _split_metrics(sample.matrix, sample.label, sample.cut, weight_vec)
+    return TrainResult(method=method, weights=weights, normStats=norm_stats, metrics=metrics,
+                       available=True, trainerVersion=trainer_version, note=note)
+
+
+def prepare_curve_sample(matrix: np.ndarray, label: np.ndarray, config: dict) -> TrainSample:
+    """对齐 dropna + 时序切分 → ``TrainSample``，供流式作业逐 fraction 复用同一样本（与 ``train_weights`` 同口径）。
+
+    Raises:
+        ValueError: dropna 后样本不足（< ``MIN_TRAIN_SAMPLES``），调用方据此判失败（绝不空成功 / 卡 running，R-07）。
+    """
+    aligned_x, aligned_y = _aligned(matrix, label)
+    if len(aligned_y) < MIN_TRAIN_SAMPLES:
+        raise ValueError(f"训练样本不足：对齐后仅 {len(aligned_y)} 行（需 ≥{MIN_TRAIN_SAMPLES}）")
+    return TrainSample(aligned_x, aligned_y, _train_cut(len(aligned_y), config))
+
+
+def learning_curve_steps(cut: int, *, steps: int = DEFAULT_CURVE_STEPS) -> list[float]:
+    """扩样本学习曲线的 fraction 网格（在 [0.2,1.0] 线性取 ``steps`` 点，末点恒 1.0）。
+
+    剔除子样本 ``int(f*cut) < MIN_TRAIN_SAMPLES`` 的早期步（样本太少损失 / IC 无统计意义），但**末步 1.0 恒保留**
+    （= 规范训练段全量拟合，与 ``train_weights`` 等价）。``cut`` 自身 < MIN 时网格仅含 1.0（曲线退化为单点，
+    诚实呈现「样本太少无法画学习曲线」，绝不补假点，R-07/R-10）。
+    """
+    count = max(2, int(steps))
+    grid = [round(_CURVE_START_FRACTION + (1.0 - _CURVE_START_FRACTION) * i / (count - 1), 4)
+            for i in range(count)]
+    kept = [f for f in grid if int(np.floor(f * cut)) >= MIN_TRAIN_SAMPLES]
+    if not kept or kept[-1] != 1.0:
+        kept.append(1.0)
+    return kept
+
+
+def fit_at_fraction(matrix: np.ndarray, label: np.ndarray, names: list[str], *,
+                    cut: int, frac: float, method: str, config: dict) -> tuple[dict[str, float], dict]:
+    """在训练段前 ``int(frac*cut)`` 行上拟合权重，并在留出验证段上度量真实损失 / IC（纯函数，绝不伪造）。
+
+    返回 ``(weights, curvePoint)``：``curvePoint`` 不含 ``step``（由编排层按序赋）。``trainLoss/validLoss`` 为
+    复合得分与前瞻收益标准化后的均方误差（验证段为严格更晚时间，无未来泄漏）；``trainIc/validIc`` 为 RankIC。
+    ``equal`` 法权重与样本无关，故其验证段曲线跨 fraction 恒定（R-11 构造性恒定，诚实真实行为，非 bug）。
+
+    Raises:
+        ValueError: 未知 method。
+    """
+    trainer = TRAINERS.get(method)
+    if trainer is None:
+        raise ValueError(f"未知训练方法：{method}")
+    backend = trainer.resolve()
+    k = max(1, int(np.floor(float(frac) * cut)))
+    raw = backend.fit(matrix[:k], label[:k], config)
+    weights = _normalize_weights(np.asarray(raw, dtype=float), names)
+    weight_vec = np.asarray([weights[name] for name in names], dtype=float)
+    composite = matrix @ weight_vec
+    point = {
+        "fraction": round(float(frac), 4), "nTrain": int(k),
+        "trainLoss": _standardized_mse(composite[:k], label[:k]),
+        "validLoss": _standardized_mse(composite[cut:], label[cut:]),
+        "trainIc": _round(_spearman(composite[:k], label[:k])),
+        "validIc": _round(_spearman(composite[cut:], label[cut:])),
+    }
+    return weights, point
+
+
 def train_weights(matrix: np.ndarray, label: np.ndarray, names: list[str], *,
                   method: str = "linear", config: dict | None = None,
                   norm_stats: dict | None = None) -> TrainResult:
@@ -286,13 +391,10 @@ def train_weights(matrix: np.ndarray, label: np.ndarray, names: list[str], *,
     aligned_x, aligned_y = _aligned(matrix, label)
     if len(aligned_y) < MIN_TRAIN_SAMPLES:
         raise ValueError(f"训练样本不足：dropna 后仅 {len(aligned_y)} 行（需 ≥{MIN_TRAIN_SAMPLES}）")
-    split = float(config.get("split", DEFAULT_SPLIT))
-    cut = max(1, min(len(aligned_y) - 1, int(np.floor(len(aligned_y) * split))))
+    cut = _train_cut(len(aligned_y), config)
     backend = trainer.resolve()
     raw = backend.fit(aligned_x[:cut], aligned_y[:cut], config)
     weights = _normalize_weights(np.asarray(raw, dtype=float), names)
-    weight_vec = np.asarray([weights[name] for name in names], dtype=float)
-    metrics = _split_metrics(aligned_x, aligned_y, cut, weight_vec)
     note = _BUILTIN_NOTE if backend.kind == "builtin" else ""
-    return TrainResult(method=method, weights=weights, normStats=norm, metrics=metrics,
-                       available=True, trainerVersion=backend.version(), note=note)
+    return build_train_result(method, weights, names, sample=TrainSample(aligned_x, aligned_y, cut),
+                              norm_stats=norm, trainer_version=backend.version(), note=note)

@@ -26,6 +26,7 @@ import type {
   LiveAutoStatus,
 } from "./liveAutoTypes";
 import type { FactorEditTarget } from "./factorTypes";
+import type { WeightTrainResult, WeightTrainTarget } from "./weightModelTypes";
 import type { WorkspacePrefs } from "./workspaceTypes";
 import { clampAllocationOnEdit, defaultAllocationOnAdd, evenSplit } from "./autoTrade";
 
@@ -162,6 +163,13 @@ interface AppState {
   // 跨视图编辑交接载荷（瞬态，不入 partialize）：「因子组合策略」列表 / 交易面板「在因子实验室编辑」
   // 写入，FactorSetBuilder 挂载时消费一次性水合并立即清空。不持久化（避免刷新后水合到陈旧编辑指针）。
   factorEditTarget: FactorEditTarget | null;
+  // 权重模型工作区交接态（瞬态，不入 partialize，weight-model-workspace §3.4）：
+  // weightTrainTarget —— builder 点「训练权重」写入，WeightModelPanel 消费一次性切到实时训练视图；
+  // weightTrainResult —— WeightTrainLive「应用到组合并返回」写入，FactorSetBuilder 消费水合 trained；
+  // boundModelId —— 同搭建会话内反复训练复用同一模型（R-02 去重记忆），刷新即复位。
+  weightTrainTarget: WeightTrainTarget | null;
+  weightTrainResult: WeightTrainResult | null;
+  boundModelId: number | null;
 
   setInst: (instId: string) => void;
   setBar: (bar: Bar) => void;
@@ -239,6 +247,9 @@ interface AppState {
   setFactorLabSection: (section: string) => void;
   setFactorOverlay: (overlay: FactorOverlay | null) => void;
   setFactorEditTarget: (target: FactorEditTarget | null) => void;
+  setWeightTrainTarget: (target: WeightTrainTarget | null) => void;
+  setWeightTrainResult: (result: WeightTrainResult | null) => void;
+  setBoundModelId: (id: number | null) => void;
 }
 
 // 主图因子叠加指令（show_factor ui-action / 因子实验室「上图」按钮设置）。
@@ -348,6 +359,10 @@ export const useAppStore = create<AppState>()(
       factorOverlay: null,
       // 编辑交接载荷默认空（瞬态，不持久化）。
       factorEditTarget: null,
+      // 权重模型工作区交接态默认空（瞬态，不持久化）。
+      weightTrainTarget: null,
+      weightTrainResult: null,
+      boundModelId: null,
 
       setInst: (instId) => set({ instId, runId: null, chartView: "live-follow" }),
       setBar: (bar) => set({ bar, runId: null, chartView: "live-follow" }),
@@ -590,6 +605,10 @@ export const useAppStore = create<AppState>()(
       setFactorOverlay: (factorOverlay) => set({ factorOverlay }),
       // 编辑交接载荷（瞬态）：写入后由 FactorSetBuilder 消费一次性水合并清空（不入 partialize）。
       setFactorEditTarget: (factorEditTarget) => set({ factorEditTarget }),
+      // 权重模型交接态（瞬态）：builder ⇄ 实时训练视图一次性消费载荷 + 同会话模型复用记忆。
+      setWeightTrainTarget: (weightTrainTarget) => set({ weightTrainTarget }),
+      setWeightTrainResult: (weightTrainResult) => set({ weightTrainResult }),
+      setBoundModelId: (boundModelId) => set({ boundModelId }),
       // 纵向分栏比例：夹取到 [MIN, MAX]；非有限数忽略（守住边界，与 simBalance 同模式）。
       setChartSplitRatio: (n) =>
         set((s) =>
@@ -641,7 +660,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 22,
+      version: 23,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -771,6 +790,10 @@ export const useAppStore = create<AppState>()(
         if (version < 22) {
           // 主图/副图内部分栏比例：补默认 0.8（追加字段，浅合并本就回落初值，迁移显式稳妥）。
           next = { ...next, chartIndicatorRatio: DEFAULT_CHART_INDICATOR_RATIO };
+        }
+        if (version < 23) {
+          // 权重模型工作区：交接态（weightTrainTarget/weightTrainResult/boundModelId）全为瞬态、不入
+          // partialize，浅合并回落 null 即可；此处显式占位稳妥（与既有迭代同范式，R-12）。
         }
         return next as never;
       },

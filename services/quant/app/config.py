@@ -120,6 +120,12 @@ class Settings(BaseSettings):
     # 20000 而沦为 no-op；默认 8000（≈80 次 OKX 串行请求、≥10s 限频地板，落在多数链路超时窗口内），可经
     # 环境变量 FACTOR_TRAIN_MAX_BARS 调参。
     factor_train_max_bars: int = Field(default=8000, ge=1000)
+    # ---- 权重模型工作区（weight-model-workspace §四/config，流式训练 + 模型管理）----
+    # 字段名即环境变量名（MAX_WEIGHT_TRAIN_JOBS 等，大小写不敏感）。流式训练作业与 socket 解耦，
+    # 故并发上限独立于同步训练护栏：超出即 429 WEIGHT_TRAIN_BUSY（守门优先，绝不先落库再拒，R-01）。
+    max_weight_train_jobs: int = Field(default=4, ge=1)        # 同时在跑的流式训练作业上限（R-01 429 守门）
+    weight_train_curve_steps: int = Field(default=6, ge=2)     # 扩样本学习曲线的 fraction 网格步数（末点恒 1.0）
+    weight_model_run_cap: int = Field(default=50, ge=1)        # 单模型训练记录上限；超出按时间剪枝且显式 log 丢弃数（R-05）
 
     # ---- Agent（对话式 AI 助手）LLM 接入 (Agent Trading Copilot spec §3.1) ----
     # 字段名即环境变量名（AGENT_*，大小写不敏感）；密钥仅存后端，绝不下发前端 / 不入库 / 不进日志。

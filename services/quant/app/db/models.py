@@ -253,6 +253,70 @@ class FactorSet(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
+class WeightModel(Base):
+    """权重模型（权重训练与组合的一等实体）（weight-model-workspace §6.1）。
+
+    承载「成员快照 + 方法 + 配置 + 当前最佳产物指针」，与 ``FactorSet`` **解耦但可弱关联**
+    （``factor_set_id`` 仅溯源，不加外键）。``latest_run_id`` 用普通整数不加外键（规避 model↔run
+    循环依赖，仿 ``LiveOrderAudit.account_id``）；剪枝 / 删除指向记录前须先 ``repoint_model`` 重算
+    指针与 ``best_valid_ic``，绝不留悬挂指针（R-05）。``create_all`` 加法建表、零数据迁移。
+    所有时间秒级 UTC 经 created/updated 落 ``DateTime``，与全系统统一（C2）。
+    """
+
+    __tablename__ = "weight_models"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128))
+    inst_id: Mapped[str] = mapped_column(String(32))                  # 训练标的
+    bar: Mapped[str] = mapped_column(String(8))                       # 周期
+    members_json: Mapped[str] = mapped_column(Text, default="[]")     # 自包含成员快照 [{factorKey,params,weight,direction}]
+    method: Mapped[str] = mapped_column(String(24), default="linear")  # equal|ic_weight|linear|random_forest|xgboost
+    config_json: Mapped[str] = mapped_column(Text, default="{}")      # {normWindow,clip,split,horizon,thresholds?...}
+    horizon: Mapped[int] = mapped_column(Integer, default=6)          # 前瞻收益根数
+    source: Mapped[str] = mapped_column(String(16), default="manual")  # builder | manual（来源标识）
+    factor_set_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 弱关联来源组合 id（仅溯源，不加外键）
+    latest_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 最近成功训练记录 id（普通整数、不加外键）
+    best_valid_ic: Mapped[float | None] = mapped_column(Float, nullable=True)  # 反范式冗余：历史最佳验证 IC（列表排序用）
+    notes: Mapped[str] = mapped_column(String(256), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class WeightTrainRun(Base):
+    """一次权重训练记录（状态机：running→succeeded|failed|cancelled）（weight-model-workspace §6.2）。
+
+    归属某 ``WeightModel``（``model_id`` 真外键，cascade delete 由 service 单事务保证）。承载训练窗口
+    快照 + loss/IC 学习曲线 + 归一化权重 + 指标 + 溯源 + 失败 / 取消信息。每条 run 必达终态之一，含
+    lifespan 启动对账（悬挂 ``running`` → ``failed``，error_code=WEIGHT_TRAIN_INTERRUPTED，R-04）。
+    """
+
+    __tablename__ = "weight_train_runs"
+    __table_args__ = (Index("ix_weight_run_model", "model_id", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    model_id: Mapped[int] = mapped_column(ForeignKey("weight_models.id"), index=True)
+    status: Mapped[str] = mapped_column(String(16), default="running")  # running|succeeded|failed|cancelled
+    method: Mapped[str] = mapped_column(String(24))
+    inst_id: Mapped[str] = mapped_column(String(32))
+    bar: Mapped[str] = mapped_column(String(8))
+    start_ts: Mapped[int] = mapped_column(Integer, default=0)
+    end_ts: Mapped[int] = mapped_column(Integer, default=0)
+    horizon: Mapped[int] = mapped_column(Integer, default=6)
+    config_json: Mapped[str] = mapped_column(Text, default="{}")          # 训练配置快照
+    curve_json: Mapped[str] = mapped_column(Text, default="[]")           # TrainCurvePoint[]（loss/IC 学习曲线）
+    weights_json: Mapped[str] = mapped_column(Text, default="{}")         # 归一化权重 {name:weight}
+    norm_stats_json: Mapped[str] = mapped_column(Text, default="{}")      # {normWindow,clip}（不存固定 mean/std）
+    metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # {icIn,icOut,r2In,r2Out,nTrain,nValid}
+    provenance_json: Mapped[str] = mapped_column(Text, default="{}")      # {instId,bar,startTs,endTs,horizon}
+    trainer_version: Mapped[str | None] = mapped_column(String(64), nullable=True)  # 库版本 / builtin-* / None
+    note: Mapped[str] = mapped_column(String(256), default="")
+    error_code: Mapped[str] = mapped_column(String(64), default="")       # 失败时填，成功为空
+    error_message: Mapped[str] = mapped_column(String(256), default="")
+    started_ts: Mapped[int] = mapped_column(Integer, default=0)
+    finished_ts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
 class AppSetting(Base):
     """设置中心通用键值持久化（auto-trade-budget-and-allocation-settings §5.1）。
 

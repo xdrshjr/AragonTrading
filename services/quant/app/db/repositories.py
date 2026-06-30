@@ -893,3 +893,25 @@ from .strategy_repositories import (  # noqa: E402,F401
     add_strategy, apply_strategy,
     list_factor_score_rows_for_set, map_companion_strategy_ids,
 )
+# weight_model_repositories：权重模型 + 训练记录 CRUD / 状态机 / 指针完整性（weight-model-workspace §四）。
+# 运行记录函数一律带 `weight` 限定名，避免 re-export 遮蔽既有 `get_run/list_runs/finalize_run`（策略运行）同名符号。
+from .weight_model_repositories import (  # noqa: E402,F401
+    WeightModelPatch,
+    WeightModelSpec,
+    WeightRunOutcome,
+    WeightRunStart,
+    add_weight_run,
+    create_weight_model,
+    delete_weight_model,
+    delete_weight_run,
+    finalize_weight_run,
+    find_weight_model_by_factor_set,
+    get_weight_model,
+    get_weight_run,
+    list_weight_models,
+    list_weight_runs,
+    reconcile_dangling_weight_runs,
+    refresh_weight_model_spec,
+    repoint_weight_model,
+    update_weight_model,
+)

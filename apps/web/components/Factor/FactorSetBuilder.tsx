@@ -26,6 +26,7 @@ import {
   type TrainMethod,
   type TrainResult,
 } from "@/lib/factorTypes";
+import { buildTrainTarget, weightResultToTrained } from "@/lib/weightModel";
 import { useAppStore } from "@/lib/store";
 import MemberPalette from "./MemberPalette";
 import WeightBars from "./WeightBars";
@@ -58,6 +59,13 @@ export default function FactorSetBuilder() {
   const setStrategyId = useAppStore((s) => s.setStrategyId);
   const factorEditTarget = useAppStore((s) => s.factorEditTarget);
   const setFactorEditTarget = useAppStore((s) => s.setFactorEditTarget);
+  // 权重模型工作区交接：训练权重跳转 + 回流水合（weight-model-workspace §3.4）。
+  const setSection = useAppStore((s) => s.setFactorLabSection);
+  const setWeightTrainTarget = useAppStore((s) => s.setWeightTrainTarget);
+  const weightTrainResult = useAppStore((s) => s.weightTrainResult);
+  const setWeightTrainResult = useAppStore((s) => s.setWeightTrainResult);
+  const boundModelId = useAppStore((s) => s.boundModelId);
+  const setBoundModelId = useAppStore((s) => s.setBoundModelId);
 
   const lib = useQuery({ queryKey: ["factor", "library"], queryFn: factorApi.library });
   const trainers = useQuery({ queryKey: ["factor", "trainers"], queryFn: factorApi.trainers });
@@ -79,6 +87,8 @@ export default function FactorSetBuilder() {
   // 已消费的交接目标引用（一次性 + 防重入，P2-2）：清空 store 后 effect 会以 null 重跑、被早返回挡下；
   // async set 拉取回来后据此判断是否被更新的目标取代（避免陈旧水合）。
   const consumedTargetRef = useRef<typeof factorEditTarget>(null);
+  // 权重模型回流的一次性消费引用（防重入，模式同 consumedTargetRef）。
+  const consumedResultRef = useRef<typeof weightTrainResult>(null);
 
   // 合并跨工作区「加入组合」的待入成员（按 memberIdentity 去重，含规范化 params，评审 P1-1）。
   useEffect(() => {
@@ -202,16 +212,52 @@ export default function FactorSetBuilder() {
   const range = { instId: wb.instId, bar: wb.bar, startTs: wb.startTs, endTs: wb.endTs };
   const memberError = validateMembers(members);
 
-  const train = useMutation({
-    mutationFn: () =>
-      factorApi.train({ ...range, members, method, config: { normWindow: thresholds.normWindow } }),
-    // 训练成功后把归一化窗口锁定为训练写入的 normStats.normWindow（改窗口=重训，归一化契约 H1/H2）。
-    onSuccess: (result) => {
-      retrainedRef.current = true;
-      setTrained(result);
-      setThresholds((prev) => ({ ...prev, normWindow: result.normStats.normWindow }));
-    },
-  });
+  // 「训练权重」改为跳转「权重模型」实时训练视图（不再原地阻塞）：写交接载荷（含完整 builder 状态供无损回流，
+  // R-02 携 boundModelId/editingSetId 复用同模型）→ 切到 models section（weight-model-workspace §3.4-A）。
+  const goTrain = () => {
+    if (memberError) {
+      setNotice(memberError);
+      return;
+    }
+    setWeightTrainTarget(
+      buildTrainTarget({
+        members,
+        method,
+        thresholds,
+        horizon: 6,
+        instId: range.instId,
+        bar: range.bar,
+        startTs: range.startTs,
+        endTs: range.endTs,
+        name,
+        modelId: boundModelId ?? undefined,
+        factorSetId: editingSetId ?? undefined,
+      }),
+    );
+    setSection("models");
+  };
+
+  // 消费权重模型回流：完整水合 members/method/name/thresholds/trained + 编辑指针（builder 重挂载已丢本地态，
+  // 故载荷自包含；一次性 + 防重入，模式同 factorEditTarget）。trainedFresh 由既有 weightsCoverMembers 守门。
+  useEffect(() => {
+    const result = weightTrainResult;
+    if (!result || consumedResultRef.current === result) return;
+    consumedResultRef.current = result;
+    setWeightTrainResult(null);
+    skipTrainResetRef.current = true; // 跳过本次水合触发的 [members] 训练作废（H3）
+    retrainedRef.current = true; // 视为本会话已重训：保存时重打 trainedAt（P2-1）
+    loadedTrainedAtRef.current = null;
+    setBoundModelId(result.modelId); // 记忆复用同一模型（R-02）
+    setMembers(result.members);
+    setMethod(result.method);
+    setName(result.name);
+    setThresholds({ ...result.thresholds, normWindow: result.normStats.normWindow });
+    setTrained(weightResultToTrained(result));
+    setEditingSetId(result.factorSetId ?? null);
+    setEditStrategyId(null);
+    setNotice("已应用训练权重，可保存 / 更新组合并自动同步交易策略");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [weightTrainResult]);
 
   // 单源真相：训练新鲜（权重键集恰好覆盖当前成员）才可保存/更新/建策略，否则提示原因（H3）。
   const trainedFresh = !!trained && weightsCoverMembers(members, trained.weights);
@@ -357,15 +403,13 @@ export default function FactorSetBuilder() {
             ))}
           </Select>
         </label>
-        <Button variant="primary" disabled={!!memberError || train.isPending} onClick={() => train.mutate()}>
-          {train.isPending ? "训练中..." : "训练权重"}
+        <Button variant="primary" disabled={!!memberError} onClick={goTrain}>
+          训练权重
         </Button>
-        {memberError && <span className="pb-1 text-[11px] text-[var(--short)]">{memberError}</span>}
+        <span className="pb-1 text-[11px] text-[var(--muted)]">
+          {memberError ?? "点「训练权重」跳转到「权重模型」实时观测 loss/IC 曲线，完成后一键回流"}
+        </span>
       </div>
-
-      {train.isError && (
-        <p className="text-[11px] text-[var(--short)]">训练失败：{(train.error as Error)?.message}</p>
-      )}
 
       {trained && (
         <div className="card flex flex-col gap-3 p-3">
