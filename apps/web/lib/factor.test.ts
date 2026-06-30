@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   addMembersCapped,
   applyWeights,
+  buildEditTargetFromStrategy,
   candidateIdentity,
   categoryLabel,
   directionLabel,
   factorRowToMember,
+  factorSetToBuilderState,
   filterLibraryItems,
   formatIc,
   formatPct,
@@ -21,12 +23,23 @@ import {
   primaryRankIc,
   quantileBars,
   rangesOverlap,
+  resolveThresholds,
+  thresholdsSummary,
   toggleMember,
+  trainedFromSet,
   validateMembers,
   weightBars,
   weightsCoverMembers,
 } from "./factor";
-import type { FactorHorizonStat, FactorLibraryItem, FactorMember, TrainMetrics } from "./factorTypes";
+import { DEFAULT_THRESHOLDS } from "./factorTypes";
+import type {
+  FactorHorizonStat,
+  FactorLibraryItem,
+  FactorMember,
+  FactorSet,
+  FactorThresholds,
+  TrainMetrics,
+} from "./factorTypes";
 
 function metrics(over: Partial<TrainMetrics>): TrainMetrics {
   return { icIn: 0.2, icOut: 0.18, r2In: null, r2Out: null, nTrain: 100, nValid: 40, ...over };
@@ -324,5 +337,133 @@ describe("libraryItemToMember / factorRowToMember", () => {
     expect(
       factorRowToMember({ factorKey: "mom_roc", params: { win: 14 }, direction: "auto" }, _LIBRARY),
     ).toEqual({ factorKey: "mom_roc", params: { win: 14 }, weight: 0, direction: "long" });
+  });
+});
+
+// ---- 因子组合策略：编辑回链 / 组合 → builder 初态 / 重建训练 / 阈值摘要 ----
+
+const _SET_MEMBERS: FactorMember[] = [
+  { factorKey: "mom_roc", params: {}, weight: 0.6, direction: "long" },
+  { factorKey: "ema_slope", params: {}, weight: 0.4, direction: "long" },
+];
+
+function makeSet(over: Partial<FactorSet> = {}): FactorSet {
+  return {
+    id: 7,
+    name: "我的组合",
+    members: _SET_MEMBERS,
+    method: "linear",
+    config: { thresholds: { ...DEFAULT_THRESHOLDS, enterLong: 0.5, normWindow: 150 } },
+    model: {
+      weights: { mom_roc: 0.6, ema_slope: 0.4 },
+      normStats: { normWindow: 150, clip: 4 },
+      provenance: { instId: "BTC-USDT-SWAP", bar: "1H", startTs: 1, endTs: 2, horizon: 6, trainedAt: 9 },
+      trainerVersion: "linear@1",
+    },
+    metrics: { icIn: 0.2, icOut: 0.18, r2In: null, r2Out: null, nTrain: 100, nValid: 40 },
+    enabled: true,
+    createdTs: 1,
+    updatedTs: 2,
+    ...over,
+  };
+}
+
+describe("resolveThresholds", () => {
+  it("fills missing fields from DEFAULT_THRESHOLDS", () => {
+    expect(resolveThresholds({ enterLong: 0.5 })).toEqual({ ...DEFAULT_THRESHOLDS, enterLong: 0.5 });
+  });
+  it("null / undefined → all defaults", () => {
+    expect(resolveThresholds(null)).toEqual(DEFAULT_THRESHOLDS);
+    expect(resolveThresholds(undefined)).toEqual(DEFAULT_THRESHOLDS);
+  });
+});
+
+describe("trainedFromSet", () => {
+  it("rebuilds a fresh TrainResult when weights cover members", () => {
+    const trained = trainedFromSet(makeSet());
+    expect(trained).not.toBeNull();
+    expect(trained && weightsCoverMembers(_SET_MEMBERS, trained.weights)).toBe(true);
+    expect(trained?.method).toBe("linear");
+    expect(trained?.available).toBe(true);
+    expect(trained?.normStats).toEqual({ normWindow: 150, clip: 4 });
+    expect(trained?.trainerVersion).toBe("linear@1");
+  });
+  it("returns null when weights are missing or do not cover members", () => {
+    expect(trainedFromSet(makeSet({ model: {} }))).toBeNull();
+    expect(trainedFromSet(makeSet({ model: { weights: { mom_roc: 0.6 } } }))).toBeNull();
+  });
+  it("falls back to zero metrics when set.metrics is null (P2-1)", () => {
+    const trained = trainedFromSet(makeSet({ metrics: null }));
+    expect(trained?.metrics).toEqual({ icIn: null, icOut: null, r2In: null, r2Out: null, nTrain: 0, nValid: 0 });
+  });
+  it("falls back clip/normWindow when model.normStats is incomplete", () => {
+    const trained = trainedFromSet(makeSet({ model: { weights: { mom_roc: 0.6, ema_slope: 0.4 } } }));
+    expect(trained?.normStats).toEqual({ normWindow: DEFAULT_THRESHOLDS.normWindow, clip: 4 });
+  });
+});
+
+describe("factorSetToBuilderState", () => {
+  it("maps members / method / name / thresholds and rebuilds trained", () => {
+    const state = factorSetToBuilderState(makeSet());
+    expect(state.members).toEqual(_SET_MEMBERS);
+    expect(state.method).toBe("linear");
+    expect(state.name).toBe("我的组合");
+    expect(state.thresholds.enterLong).toBe(0.5);
+    expect(state.thresholds.normWindow).toBe(150);
+    expect(state.trained).not.toBeNull();
+  });
+  it("falls back to DEFAULT_THRESHOLDS when set.config.thresholds is absent", () => {
+    const state = factorSetToBuilderState(makeSet({ config: {} }));
+    expect(state.thresholds).toEqual(DEFAULT_THRESHOLDS);
+  });
+});
+
+describe("buildEditTargetFromStrategy", () => {
+  const thresholds: FactorThresholds = { ...DEFAULT_THRESHOLDS, enterLong: 0.4 };
+  const baseParams = {
+    members: _SET_MEMBERS,
+    thresholds,
+    normStats: { normWindow: 200, clip: 4 },
+    provenance: { instId: "BTC-USDT-SWAP", bar: "1H", startTs: 1, endTs: 2, horizon: 6 },
+  };
+
+  it("with factorSetId → set target that STILL carries snapshot fallback (P1-1)", () => {
+    const target = buildEditTargetFromStrategy({ id: 3, name: "因子组合 · 得分策略", params: { ...baseParams, factorSetId: 7 } });
+    expect(target.source).toBe("set");
+    if (target.source !== "set") throw new Error("expected set target");
+    expect(target).toMatchObject({ setId: 7, strategyId: 3, name: "因子组合 · 得分策略" });
+    expect(target.snapshot?.members).toEqual(_SET_MEMBERS);
+    expect(target.snapshot?.factorSetId).toBe(7);
+  });
+
+  it("without factorSetId → snapshot target consistent with strategy params", () => {
+    const target = buildEditTargetFromStrategy({ id: 5, name: "旧因子策略", params: baseParams });
+    expect(target.source).toBe("snapshot");
+    if (target.source !== "snapshot") throw new Error("expected snapshot target");
+    expect(target).toMatchObject({ strategyId: 5, name: "旧因子策略" });
+    expect(target.snapshot.members).toEqual(_SET_MEMBERS);
+    expect(target.snapshot.thresholds).toEqual(thresholds);
+    expect(target.snapshot.factorSetId).toBeUndefined();
+  });
+
+  it("tolerates missing members / thresholds (defaults applied)", () => {
+    const target = buildEditTargetFromStrategy({ id: 9, name: "x", params: {} });
+    expect(target.source).toBe("snapshot");
+    if (target.source !== "snapshot") throw new Error("expected snapshot target");
+    expect(target.snapshot.members).toEqual([]);
+    expect(target.snapshot.thresholds).toEqual(DEFAULT_THRESHOLDS);
+  });
+});
+
+describe("thresholdsSummary", () => {
+  it("renders a stable summary including tanh flag", () => {
+    expect(thresholdsSummary({ ...DEFAULT_THRESHOLDS, enterLong: 0.3, enterShort: 0.3, exitBand: 0.1, normWindow: 200, squash: true })).toBe(
+      "进多 0.3 · 进空 0.3 · 退出带 0.1 · 归一化窗口 200 · tanh 压缩",
+    );
+  });
+  it("omits tanh flag when squash is false", () => {
+    expect(thresholdsSummary({ ...DEFAULT_THRESHOLDS, squash: false })).toBe(
+      "进多 0.3 · 进空 0.3 · 退出带 0.1 · 归一化窗口 200",
+    );
   });
 });

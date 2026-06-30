@@ -211,7 +211,18 @@ export interface FactorScoreSnapshotParams {
   thresholds: FactorThresholds;
   normStats?: { normWindow: number; clip: number };
   provenance?: TrainProvenance;
+  // 弱关联来源组合（factor_set）id：仅供「在因子实验室编辑」回链定位，不参与打分（prepare/on_candle
+  // 不读它，被后端透传忽略）；旧快照缺省安全 → buildEditTargetFromStrategy 回落 snapshot 分支。
+  factorSetId?: number;
 }
+
+// 跨视图编辑交接载荷（瞬态 store.factorEditTarget）：从「因子组合策略」列表或交易面板「在因子实验室
+// 编辑」发起，由 FactorSetBuilder 挂载时消费一次性水合。set 分支额外携带 snapshot 兜底（P1-1）：
+// setId 指向的组合若已删（sets.get 404），builder 回落用 snapshot 水合并提示。从 builder「编辑」入口
+// 发起时 strategyId/name/snapshot 可缺省（直接有 set）；从交易面板发起时三者必带（兜底所需）。
+export type FactorEditTarget =
+  | { source: "set"; setId: number; strategyId?: number; name?: string; snapshot?: FactorScoreSnapshotParams }
+  | { source: "snapshot"; strategyId: number; name: string; snapshot: FactorScoreSnapshotParams };
 
 export const DEFAULT_THRESHOLDS: FactorThresholds = {
   enterLong: 0.3,

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Badge, Button } from "@/components/ui";
-import { directionLabel } from "@/lib/factor";
+import { buildEditTargetFromStrategy, directionLabel } from "@/lib/factor";
 import type { FactorScoreSnapshotParams } from "@/lib/factorTypes";
 import { fmtMoney, fmtTime } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
@@ -19,6 +19,7 @@ interface FactorMemberSnapshot {
 function FactorStrategyBanner({ strategy }: { strategy: Strategy }) {
   const setActiveView = useAppStore((s) => s.setActiveView);
   const setFactorLabSection = useAppStore((s) => s.setFactorLabSection);
+  const setFactorEditTarget = useAppStore((s) => s.setFactorEditTarget);
   const members = (strategy.params?.members as FactorMemberSnapshot[] | undefined) ?? [];
   // 短窗护栏（H6）：策略暖机=normWindow+60；区间过短将安静空仓，此处如实标注最小所需根数。
   const thresholds = (strategy.params?.thresholds as { normWindow?: number } | undefined) ?? {};
@@ -34,6 +35,9 @@ function FactorStrategyBanner({ strategy }: { strategy: Strategy }) {
           variant="ghost"
           size="sm"
           onClick={() => {
+            // 把当前策略映射为编辑交接目标（含 factorSetId → set 分支 + snapshot 兜底；旧策略 → snapshot
+            // 分支），由 FactorSetBuilder 挂载时消费水合（P1-1）。
+            setFactorEditTarget(buildEditTargetFromStrategy(strategy));
             setFactorLabSection("builder");
             setActiveView("factor");
           }}

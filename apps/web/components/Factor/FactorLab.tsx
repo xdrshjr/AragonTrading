@@ -8,6 +8,7 @@ import FactorCatalog from "./FactorCatalog";
 import FactorEvalPanel from "./FactorEvalPanel";
 import FactorMiningPanel from "./FactorMiningPanel";
 import FactorSetBuilder from "./FactorSetBuilder";
+import FactorSetList from "./FactorSetList";
 import FactorTable from "./FactorTable";
 import type { FactorDirection, FactorMember } from "@/lib/factorTypes";
 
@@ -50,6 +51,7 @@ const SECTIONS = [
   { key: "evaluate", label: "因子评估", desc: "IC 曲线 + 分位收益" },
   { key: "mining", label: "因子挖掘", desc: "区间扫描按 IR 排名" },
   { key: "builder", label: "权重训练与组合", desc: "选成员 → 训练 → 保存" },
+  { key: "sets", label: "因子组合策略", desc: "查看 / 编辑已建组合" },
 ];
 
 function tsToDate(ts: number): string {
@@ -219,6 +221,8 @@ export default function FactorLab({ active }: { active: boolean }) {
               <FactorMiningPanel />
             ) : section === "builder" ? (
               <FactorSetBuilder />
+            ) : section === "sets" ? (
+              <FactorSetList />
             ) : (
               <FactorCatalog />
             )}

@@ -1,30 +1,34 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Badge, Button, Input, Select, Switch } from "@/components/ui";
 import { api } from "@/lib/api";
 import {
   addMembersCapped,
   applyWeights,
+  factorSetToBuilderState,
   formatIc,
   memberIdentity,
   overfitWarning,
+  resolveThresholds,
   toggleMember,
+  trainedFromSnapshot,
   validateMembers,
-  weightBars,
   weightsCoverMembers,
 } from "@/lib/factor";
 import { factorApi } from "@/lib/factorApi";
 import {
   DEFAULT_THRESHOLDS,
   type FactorMember,
+  type FactorScoreSnapshotParams,
   type FactorThresholds,
   type TrainMethod,
   type TrainResult,
 } from "@/lib/factorTypes";
 import { useAppStore } from "@/lib/store";
 import MemberPalette from "./MemberPalette";
+import WeightBars from "./WeightBars";
 import { useWorkbench } from "./FactorLab";
 
 // 组合成员数上限（与 validateMembers 同口径，作为批量并入 / 切换的护栏入参）。
@@ -38,12 +42,22 @@ const METHODS: { value: TrainMethod; label: string }[] = [
   { value: "xgboost", label: "XGBoost" },
 ];
 
-/** 权重训练与组合：选成员 + 方法 → 训练 → 权重条 + 复合 IC → 保存组合 / 从组合新建策略。 */
+function nowTs(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+/**
+ * 权重训练与组合（新建 | 编辑双模）：选成员 + 方法 → 训练 → 权重条 + 复合 IC → 保存 / 更新组合 / 从组合
+ * 新建策略。挂载时消费 store.factorEditTarget 一次性水合（set 失败回落策略内联快照，P1-1），顶部呈现
+ * 编辑态横幅 +「新建组合」清空（P1-3）。
+ */
 export default function FactorSetBuilder() {
   const qc = useQueryClient();
   const wb = useWorkbench();
   const setActiveView = useAppStore((s) => s.setActiveView);
   const setStrategyId = useAppStore((s) => s.setStrategyId);
+  const factorEditTarget = useAppStore((s) => s.factorEditTarget);
+  const setFactorEditTarget = useAppStore((s) => s.setFactorEditTarget);
 
   const lib = useQuery({ queryKey: ["factor", "library"], queryFn: factorApi.library });
   const trainers = useQuery({ queryKey: ["factor", "trainers"], queryFn: factorApi.trainers });
@@ -54,9 +68,19 @@ export default function FactorSetBuilder() {
   const [thresholds, setThresholds] = useState<FactorThresholds>({ ...DEFAULT_THRESHOLDS });
   const [trained, setTrained] = useState<TrainResult | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // 编辑指针：editingSetId!=null → 更新组合态；editStrategyId!=null → 来自交易面板旧策略快照（可更新该策略）。
+  const [editingSetId, setEditingSetId] = useState<number | null>(null);
+  const [editStrategyId, setEditStrategyId] = useState<number | null>(null);
+  // 仅跳过「水合那一帧」的 [members] 训练作废（H3）；retrained 标记本会话是否重训过（决定更新组合的 trainedAt
+  // 是否重打戳，P2-1）；loadedTrainedAt 保留载入组合的原 trainedAt 以便无重训更新时原样回传（P2-1）。
+  const skipTrainResetRef = useRef(false);
+  const retrainedRef = useRef(false);
+  const loadedTrainedAtRef = useRef<number | null>(null);
+  // 已消费的交接目标引用（一次性 + 防重入，P2-2）：清空 store 后 effect 会以 null 重跑、被早返回挡下；
+  // async set 拉取回来后据此判断是否被更新的目标取代（避免陈旧水合）。
+  const consumedTargetRef = useRef<typeof factorEditTarget>(null);
 
-  // 合并跨工作区「加入组合」的待入成员（按 memberIdentity 去重后并入，随即清空待入队列防重复并入）。
-  // 去重键含规范化 params（评审 P1-1），避免静默丢弃同 key 不同参的挖掘变体。
+  // 合并跨工作区「加入组合」的待入成员（按 memberIdentity 去重，含规范化 params，评审 P1-1）。
   useEffect(() => {
     if (wb.pendingMembers.length === 0) return;
     setMembers((prev) => {
@@ -74,10 +98,106 @@ export default function FactorSetBuilder() {
     wb.clearPendingMembers();
   }, [wb.pendingMembers, wb]);
 
-  // 成员集合变化即作废上一轮训练结果（强制重训，杜绝「成员变了权重没变」的静默错配，H3）。
+  // 成员集合变化即作废上一轮训练结果（H3）；唯独跳过「水合那一帧」（编辑态载入已训练组合时勿误清）。
   useEffect(() => {
+    if (skipTrainResetRef.current) {
+      skipTrainResetRef.current = false;
+      return;
+    }
     setTrained(null);
   }, [members]);
+
+  // 跨视图编辑交接：挂载消费 factorEditTarget，第一时间清空（一次性 + 防重入，P2-2），再分支水合。
+  // 用 consumedTargetRef 而非「清空触发的卸载 cancelled」做防重入：清空 store 会以 null 重跑本 effect，
+  // 若用 cleanup 置 cancelled 会在 async set 拉取返回前就把它取消（静默丢水合）；改为只在「目标被更新的
+  // 目标取代」时跳过陈旧结果。
+  useEffect(() => {
+    const target = factorEditTarget;
+    if (!target || consumedTargetRef.current === target) return;
+    consumedTargetRef.current = target;
+    setFactorEditTarget(null);
+
+    const applyHydration = (next: {
+      members: FactorMember[];
+      method?: TrainMethod;
+      name: string;
+      thresholds: FactorThresholds;
+      trained: TrainResult | null;
+      editingSetId: number | null;
+      editStrategyId: number | null;
+      loadedTrainedAt: number | null;
+      notice: string | null;
+    }) => {
+      skipTrainResetRef.current = true; // 跳过本次水合触发的 [members] 训练作废（H3）
+      retrainedRef.current = false; // 水合的 trained 视为「未在本会话重训」（更新时不重打戳，P2-1）
+      loadedTrainedAtRef.current = next.loadedTrainedAt;
+      setMembers(next.members);
+      if (next.method) setMethod(next.method);
+      setName(next.name);
+      setThresholds(next.thresholds);
+      setTrained(next.trained);
+      setEditingSetId(next.editingSetId);
+      setEditStrategyId(next.editStrategyId);
+      setNotice(next.notice);
+    };
+
+    const hydrateFromSnapshot = (
+      snap: FactorScoreSnapshotParams,
+      opts: { name: string; editStrategyId: number | null; notice: string | null },
+    ) =>
+      applyHydration({
+        members: snap.members,
+        name: opts.name,
+        thresholds: resolveThresholds(snap.thresholds),
+        trained: trainedFromSnapshot(snap, method),
+        editingSetId: null,
+        editStrategyId: opts.editStrategyId,
+        loadedTrainedAt: null,
+        notice: opts.notice,
+      });
+
+    if (target.source === "snapshot") {
+      hydrateFromSnapshot(target.snapshot, {
+        name: target.name,
+        editStrategyId: target.strategyId,
+        notice: null,
+      });
+      return;
+    }
+
+    // source === "set"：拉取组合；失败回落内联快照兜底（P1-1）。仅在该目标仍是最新被消费目标时落地。
+    void (async () => {
+      try {
+        const set = await factorApi.sets.get(target.setId);
+        if (consumedTargetRef.current !== target) return;
+        const state = factorSetToBuilderState(set);
+        applyHydration({
+          members: state.members,
+          method: state.method,
+          name: state.name,
+          thresholds: state.thresholds,
+          trained: state.trained,
+          editingSetId: set.id,
+          editStrategyId: null,
+          loadedTrainedAt: typeof set.model?.trainedAt === "number" ? set.model.trainedAt : null,
+          notice: null,
+        });
+      } catch {
+        if (consumedTargetRef.current !== target) return;
+        if (target.snapshot) {
+          hydrateFromSnapshot(target.snapshot, {
+            name: target.name ?? "我的因子组合",
+            editStrategyId: target.strategyId ?? null,
+            notice: "来源组合已删除，已按策略快照载入。",
+          });
+        } else {
+          setNotice("载入组合失败：该组合可能已被删除，请返回列表刷新。");
+        }
+      }
+    })();
+    // 其余 setter / method 为水合内部读取，故意不入依赖（仅交接载荷变化时消费）。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [factorEditTarget]);
 
   const range = { instId: wb.instId, bar: wb.bar, startTs: wb.startTs, endTs: wb.endTs };
   const memberError = validateMembers(members);
@@ -87,53 +207,99 @@ export default function FactorSetBuilder() {
       factorApi.train({ ...range, members, method, config: { normWindow: thresholds.normWindow } }),
     // 训练成功后把归一化窗口锁定为训练写入的 normStats.normWindow（改窗口=重训，归一化契约 H1/H2）。
     onSuccess: (result) => {
+      retrainedRef.current = true;
       setTrained(result);
       setThresholds((prev) => ({ ...prev, normWindow: result.normStats.normWindow }));
     },
   });
-  // 单源真相：训练新鲜（权重键集恰好覆盖当前成员）才可保存/建策略，否则提示原因（H3）。
+
+  // 单源真相：训练新鲜（权重键集恰好覆盖当前成员）才可保存/更新/建策略，否则提示原因（H3）。
   const trainedFresh = !!trained && weightsCoverMembers(members, trained.weights);
   const blockReason = memberError
     ? memberError
     : !trainedFresh
       ? "请先训练权重（成员变化后需重新训练）"
       : null;
+
+  // 组合 model_json：无重训更新时原样回传载入的 trainedAt（不重打戳，P2-1），否则盖当前时刻。
+  const buildModelJson = (): Record<string, unknown> => {
+    if (!trained) return {};
+    const trainedAt = retrainedRef.current ? nowTs() : loadedTrainedAtRef.current ?? nowTs();
+    return {
+      weights: trained.weights,
+      normStats: trained.normStats,
+      trainerVersion: trained.trainerVersion,
+      provenance: trained.provenance,
+      trainedAt,
+    };
+  };
+  const setBody = () => ({
+    name,
+    members,
+    method,
+    modelJson: buildModelJson(),
+    metricsJson: trained?.metrics ?? null,
+    config: { thresholds },
+  });
+  // 落库后进入该组合编辑态：刷新编辑指针并重置 trainedAt 来源（后续无重训更新即原样回传）。
+  const enterEditingSet = (set: { id: number; model?: { trainedAt?: number } }) => {
+    setEditingSetId(set.id);
+    loadedTrainedAtRef.current = typeof set.model?.trainedAt === "number" ? set.model.trainedAt : null;
+    retrainedRef.current = false;
+    void qc.invalidateQueries({ queryKey: ["factor", "sets"] });
+  };
+  const strategyParams = (factorSetId?: number): Record<string, unknown> => ({
+    // 训练权重烘焙进成员、不写顶层 weights；带 normStats（打分取同一归一化契约 H2/H3）、provenance（仅 UI 展示
+    // 训练区间 L4）、可选 factorSetId（弱关联来源组合，回链稳健 set 分支）。
+    members: applyWeights(members, trained?.weights),
+    thresholds: { ...thresholds },
+    normStats: trained?.normStats,
+    provenance: trained?.provenance,
+    ...(factorSetId != null ? { factorSetId } : {}),
+  });
+
   const save = useMutation({
-    mutationFn: () =>
-      factorApi.sets.create({
-        name,
-        members,
-        method,
-        modelJson: trained
-          ? {
-              weights: trained.weights,
-              normStats: trained.normStats,
-              trainerVersion: trained.trainerVersion,
-              provenance: trained.provenance,
-              trainedAt: Math.floor(Date.now() / 1000),
-            }
-          : {},
-        metricsJson: trained?.metrics ?? null,
-        config: { thresholds },
-      }),
-    onSuccess: () => {
+    mutationFn: () => factorApi.sets.create(setBody()),
+    onSuccess: (created) => {
+      enterEditingSet(created);
       setNotice("因子组合已保存");
+    },
+  });
+  const update = useMutation({
+    mutationFn: () => factorApi.sets.update(editingSetId as number, setBody()),
+    onSuccess: (updated) => {
+      loadedTrainedAtRef.current =
+        typeof updated.model?.trainedAt === "number" ? updated.model.trainedAt : loadedTrainedAtRef.current;
+      retrainedRef.current = false;
+      setNotice("因子组合已更新");
       void qc.invalidateQueries({ queryKey: ["factor", "sets"] });
     },
   });
+  // 从组合新建策略：未保存组合（editingSetId==null）时先自动落库该组合再带 factorSetId（无孤儿，P1-2）。
   const createStrategy = useMutation({
-    mutationFn: () =>
-      api.createStrategy({
+    mutationFn: async () => {
+      let setId = editingSetId;
+      if (setId == null) {
+        const created = await factorApi.sets.create(setBody());
+        setId = created.id;
+        enterEditingSet(created);
+      }
+      return api.createStrategy({
         templateKey: "factor_score",
         name: `${name} · 得分策略`,
-        // 新建快照（结构对齐 FactorScoreSnapshotParams）：训练权重烘焙进成员、不再写顶层 weights；带 normStats
-        // 供打分取同一归一化契约（H2/H3）；带 provenance 供 StrategyDetail 如实展示训练区间（仅 UI 展示，L4）。
-        params: {
-          members: applyWeights(members, trained?.weights),
-          thresholds: { ...thresholds },
-          normStats: trained?.normStats,
-          provenance: trained?.provenance,
-        },
+        params: strategyParams(setId ?? undefined),
+      });
+    },
+    onSuccess: (strategy) => {
+      setStrategyId(strategy.id);
+      setActiveView("trade");
+    },
+  });
+  // 更新该策略（仅 snapshot 分支旧策略）：写回当前快照；若已「另存为组合」则顺带回链 factorSetId。
+  const updateStrategy = useMutation({
+    mutationFn: () =>
+      api.updateStrategy(editStrategyId as number, {
+        params: strategyParams(editingSetId ?? undefined),
       }),
     onSuccess: (strategy) => {
       setStrategyId(strategy.id);
@@ -153,7 +319,6 @@ export default function FactorSetBuilder() {
     }
     setMembers(next);
   };
-  // 「全选当前结果」批量并入：去重 + 截断到上限，被丢弃条数显式提示（§3.4）。
   const handleAddMany = (candidates: FactorMember[]) => {
     const { next, skipped } = addMembersCapped(members, candidates, MAX_MEMBERS);
     setMembers(next);
@@ -161,9 +326,29 @@ export default function FactorSetBuilder() {
       setNotice(`已加入候选；${skipped} 个因重复或超出上限（最多 ${MAX_MEMBERS} 个）未加入`);
     }
   };
+  // 「新建组合」清空：从编辑态显式回到全新搭建（杜绝静默从「更新」回落「新建」，P1-3）。
+  const resetToNew = () => {
+    setEditingSetId(null);
+    setEditStrategyId(null);
+    loadedTrainedAtRef.current = null;
+    retrainedRef.current = false;
+    setMembers([]);
+    setMethod("linear");
+    setName("我的因子组合");
+    setThresholds({ ...DEFAULT_THRESHOLDS });
+    setTrained(null);
+    setNotice(null);
+  };
 
   return (
     <div className="flex flex-col gap-4 pb-6">
+      <EditBanner
+        editingSetId={editingSetId}
+        editStrategyId={editStrategyId}
+        name={name}
+        onReset={resetToNew}
+      />
+
       <MemberPalette
         library={lib.data ?? []}
         members={members}
@@ -203,7 +388,6 @@ export default function FactorSetBuilder() {
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-semibold text-[var(--text)]">训练结果</span>
             <Badge tone="accent">{method}</Badge>
-            {/* 生效后端徽标（评审 P2-6）：内置兜底显示 builtin-rf@1 等、库后端显示库版本；核心训练器 trainerVersion=null 时短路不渲染。 */}
             {trained.trainerVersion && <Badge tone="neutral">{trained.trainerVersion}</Badge>}
             <Badge tone="neutral">样本内 IC {formatIc(trained.metrics.icIn)}</Badge>
             <Badge tone="neutral">样本外 IC {formatIc(trained.metrics.icOut)}</Badge>
@@ -229,59 +413,123 @@ export default function FactorSetBuilder() {
           <span className="text-[11px] text-[var(--muted)]">组合名称</span>
           <Input value={name} onChange={(e) => setName(e.target.value)} className="py-1.5 text-xs" />
         </label>
-        <Button
-          variant="default"
-          disabled={!!blockReason || save.isPending}
-          title={blockReason ?? "保存因子组合"}
-          onClick={() => save.mutate()}
-        >
-          {save.isPending ? "保存中..." : "保存组合"}
-        </Button>
-        <Button
-          variant="primary"
-          disabled={!!blockReason || createStrategy.isPending}
-          title={blockReason ?? "以内联快照创建 factor_score 策略，自动出现在策略列表 / 回测 / 对比"}
-          onClick={() => createStrategy.mutate()}
-        >
-          {createStrategy.isPending ? "创建中..." : "从组合新建策略"}
-        </Button>
+        <SaveActions
+          blockReason={blockReason}
+          editingSetId={editingSetId}
+          editStrategyId={editStrategyId}
+          savePending={save.isPending}
+          updatePending={update.isPending}
+          createStrategyPending={createStrategy.isPending}
+          updateStrategyPending={updateStrategy.isPending}
+          onSave={() => save.mutate()}
+          onUpdate={() => update.mutate()}
+          onCreateStrategy={() => createStrategy.mutate()}
+          onUpdateStrategy={() => updateStrategy.mutate()}
+        />
       </div>
       {blockReason && !memberError && (
         <p className="text-[11px] text-[var(--muted)]">{blockReason}</p>
       )}
       {notice && <p className="text-[11px] font-medium text-[var(--accent)]">{notice}</p>}
-      {(save.isError || createStrategy.isError) && (
+      {(save.isError || update.isError || createStrategy.isError || updateStrategy.isError) && (
         <p className="text-[11px] text-[var(--short)]">
-          操作失败：{((save.error || createStrategy.error) as Error)?.message}
+          操作失败：
+          {((save.error || update.error || createStrategy.error || updateStrategy.error) as Error)?.message}
         </p>
       )}
     </div>
   );
 }
 
-function WeightBars({ weights }: { weights: Record<string, number> }) {
-  const bars = weightBars(weights);
+// 编辑态横幅（P1-3）：显著呈现当前是「更新组合」还是「从交易策略载入快照」，并提供「新建组合」清空退路。
+function EditBanner({
+  editingSetId,
+  editStrategyId,
+  name,
+  onReset,
+}: {
+  editingSetId: number | null;
+  editStrategyId: number | null;
+  name: string;
+  onReset: () => void;
+}) {
+  if (editingSetId == null && editStrategyId == null) return null;
+  const label =
+    editingSetId != null
+      ? `正在编辑组合「${name}」 — 保存将更新该组合（#${editingSetId}）`
+      : `已从交易策略「${name}」载入内联快照 — 可「另存为组合」或「更新该策略」`;
   return (
-    <div className="flex flex-col gap-1.5">
-      {bars.map((b) => (
-        <div key={b.name} className="flex items-center gap-2">
-          <span className="w-32 shrink-0 truncate text-[11px] text-[var(--muted)]">{b.name}</span>
-          <div className="relative h-3 flex-1 rounded-full bg-[var(--surface-2)]">
-            <div
-              className="absolute top-0 h-3 rounded-full"
-              style={{
-                width: `${b.widthPct / 2}%`,
-                left: b.positive ? "50%" : undefined,
-                right: b.positive ? undefined : "50%",
-                background: b.positive ? "var(--long)" : "var(--short)",
-              }}
-            />
-            <div className="absolute left-1/2 top-0 h-3 w-px bg-[var(--border)]" />
-          </div>
-          <span className="w-14 shrink-0 text-right text-[11px] tabular text-[var(--text)]">{b.weight.toFixed(3)}</span>
-        </div>
-      ))}
+    <div className="flex flex-wrap items-center justify-between gap-2 rounded-[10px] border border-[var(--accent)] bg-[var(--accent-soft)]/50 px-3 py-2">
+      <span className="text-[11px] font-medium text-[var(--accent)]">{label}</span>
+      <Button variant="ghost" size="sm" onClick={onReset}>新建组合</Button>
     </div>
+  );
+}
+
+// 保存区动作：按当前模式（新建 / 更新组合 / 旧策略快照）渲染按钮，全部复用同一 blockReason 禁用门（P1-3）。
+function SaveActions({
+  blockReason,
+  editingSetId,
+  editStrategyId,
+  savePending,
+  updatePending,
+  createStrategyPending,
+  updateStrategyPending,
+  onSave,
+  onUpdate,
+  onCreateStrategy,
+  onUpdateStrategy,
+}: {
+  blockReason: string | null;
+  editingSetId: number | null;
+  editStrategyId: number | null;
+  savePending: boolean;
+  updatePending: boolean;
+  createStrategyPending: boolean;
+  updateStrategyPending: boolean;
+  onSave: () => void;
+  onUpdate: () => void;
+  onCreateStrategy: () => void;
+  onUpdateStrategy: () => void;
+}) {
+  const disabled = !!blockReason;
+  // 新建态主按钮「保存组合」；来自交易面板旧策略快照时为「另存为组合」（流程B，§2.3）；编辑组合态为「更新组合」。
+  const saveLabel = editStrategyId != null ? "另存为组合" : "保存组合";
+  return (
+    <>
+      {editingSetId != null ? (
+        <Button variant="primary" disabled={disabled || updatePending} title={blockReason ?? "更新该因子组合"} onClick={onUpdate}>
+          {updatePending ? "更新中..." : "更新组合"}
+        </Button>
+      ) : (
+        <Button variant="default" disabled={disabled || savePending} title={blockReason ?? "保存因子组合"} onClick={onSave}>
+          {savePending ? "保存中..." : saveLabel}
+        </Button>
+      )}
+      {editingSetId != null && (
+        <Button variant="default" disabled={disabled || savePending} title={blockReason ?? "另存为一个新的因子组合"} onClick={onSave}>
+          {savePending ? "保存中..." : "另存为新组合"}
+        </Button>
+      )}
+      {editStrategyId != null && (
+        <Button
+          variant="default"
+          disabled={disabled || updateStrategyPending}
+          title={blockReason ?? "把当前快照写回该 factor_score 策略"}
+          onClick={onUpdateStrategy}
+        >
+          {updateStrategyPending ? "更新中..." : "更新该策略"}
+        </Button>
+      )}
+      <Button
+        variant="primary"
+        disabled={disabled || createStrategyPending}
+        title={blockReason ?? "以内联快照创建 factor_score 策略，自动出现在策略列表 / 回测 / 对比"}
+        onClick={onCreateStrategy}
+      >
+        {createStrategyPending ? "创建中..." : "从组合新建策略"}
+      </Button>
+    </>
   );
 }
 

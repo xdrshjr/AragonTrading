@@ -1,14 +1,26 @@
 // 因子层纯展示 / 几何 helper（IC 格式化、IC 曲线 / 分位条 / 权重条几何、组合校验、过拟合提示）。
 // 与 format.ts / combo.ts 同约定：纯函数 + 同名 factor.test.ts 单测，组件只消费此处逻辑。
+import { DEFAULT_THRESHOLDS } from "./factorTypes";
 import type {
   Factor,
+  FactorEditTarget,
   FactorHorizonStat,
   FactorLibraryItem,
   FactorMember,
+  FactorScoreSnapshotParams,
+  FactorSet,
+  FactorThresholds,
   FrozenDirection,
   QuantileBucket,
   TrainMetrics,
+  TrainMethod,
+  TrainProvenance,
+  TrainResult,
 } from "./factorTypes";
+
+// 复合得分 / 训练默认 clip（与后端 engine.factors.scoring.DEFAULT_CLIP 同口径）：组合 model.normStats
+// 缺 clip 时回落，保证从组合重建 TrainResult.normStats 始终带完整 {normWindow, clip}。
+const DEFAULT_CLIP = 4;
 
 // 类别 key → 中文标题（与后端 FACTOR_LIBRARY.category 对齐）。
 export const CATEGORY_LABELS: Record<string, string> = {
@@ -315,4 +327,134 @@ export function factorRowToMember(
     weight: 0,
     direction: freezeMemberDirection(factor, library),
   };
+}
+
+// ---- 因子组合策略：列表/详情/编辑回链的纯逻辑（与 factor.test.ts 同约定，组件只消费此处） ----
+
+// 阈值回落：缺字段一律回落 DEFAULT_THRESHOLDS（单一口径，与后端 normalize_thresholds / 策略
+// resolve_thresholds 一致），供 builder 水合与详情摘要共用。
+export function resolveThresholds(raw: Partial<FactorThresholds> | null | undefined): FactorThresholds {
+  return { ...DEFAULT_THRESHOLDS, ...(raw ?? {}) };
+}
+
+// 缺失指标回落零值（P2-1）：set.metrics 为 null 时仍给出完整 TrainMetrics，避免重建 TrainResult 缺字段。
+function zeroTrainMetrics(): TrainMetrics {
+  return { icIn: null, icOut: null, r2In: null, r2Out: null, nTrain: 0, nValid: 0 };
+}
+
+// 从已存组合的 model 重建一个「等价于刚训练完」的 TrainResult：仅当权重键集恰好覆盖成员（H3 单源真相）
+// 才返回，否则 null（用户需重训才能再保存/更新）。normStats 缺字段回落 {DEFAULT_NORM_WINDOW, DEFAULT_CLIP}，
+// metrics 缺失回落零值（P2-1），provenance/trainerVersion 原样回传（无重训纯改名时不重打戳，P2-1）。
+export function trainedFromSet(set: FactorSet, thresholds?: FactorThresholds): TrainResult | null {
+  const members = set.members ?? [];
+  const weights = set.model?.weights;
+  if (!weightsCoverMembers(members, weights)) return null;
+  const ns = set.model?.normStats ?? {};
+  const normWindow =
+    typeof ns.normWindow === "number" ? ns.normWindow : thresholds?.normWindow ?? DEFAULT_THRESHOLDS.normWindow;
+  const clip = typeof ns.clip === "number" ? ns.clip : DEFAULT_CLIP;
+  const trainerVersion = set.model?.trainerVersion;
+  return {
+    method: set.method,
+    weights: weights as Record<string, number>,
+    normStats: { normWindow, clip },
+    metrics: set.metrics ?? zeroTrainMetrics(),
+    available: true,
+    note: "",
+    trainerVersion: typeof trainerVersion === "string" ? trainerVersion : null,
+    provenance: set.model?.provenance,
+  };
+}
+
+// builder 编辑态初值：把一条组合映射为 {成员, 方法, 名称, 阈值, 训练结果}（trained 为 null 时须重训）。
+export interface BuilderStateFromSet {
+  members: FactorMember[];
+  method: TrainMethod;
+  name: string;
+  thresholds: FactorThresholds;
+  trained: TrainResult | null;
+}
+
+export function factorSetToBuilderState(set: FactorSet): BuilderStateFromSet {
+  const thresholds = resolveThresholds(set.config?.thresholds);
+  return {
+    members: set.members ?? [],
+    method: set.method,
+    name: set.name,
+    thresholds,
+    trained: trainedFromSet(set, thresholds),
+  };
+}
+
+// 策略内联快照 params → 规范化 FactorScoreSnapshotParams（成员/阈值/归一化/溯源/来源组合 id）。
+function snapshotFromParams(params: Record<string, unknown>): FactorScoreSnapshotParams {
+  const members = Array.isArray(params.members) ? (params.members as FactorMember[]) : [];
+  const normStats = params.normStats as { normWindow: number; clip: number } | undefined;
+  const provenance = params.provenance as TrainProvenance | undefined;
+  const factorSetId = typeof params.factorSetId === "number" ? params.factorSetId : undefined;
+  return {
+    members,
+    thresholds: resolveThresholds(params.thresholds as Partial<FactorThresholds> | undefined),
+    ...(normStats ? { normStats } : {}),
+    ...(provenance ? { provenance } : {}),
+    ...(factorSetId != null ? { factorSetId } : {}),
+  };
+}
+
+// 交易面板「在因子实验室编辑」：把一条 factor_score 策略映射为编辑交接目标。
+// 含 factorSetId → set 分支（**仍带 snapshot 兜底**，组合被删时 builder 回落快照，P1-1）；
+// 缺省（旧快照）→ snapshot 分支，用内联快照重建 builder。
+export function buildEditTargetFromStrategy(
+  strategy: { id: number; name: string; params: Record<string, unknown> },
+): FactorEditTarget {
+  const snapshot = snapshotFromParams(strategy.params ?? {});
+  if (typeof snapshot.factorSetId === "number") {
+    return {
+      source: "set",
+      setId: snapshot.factorSetId,
+      strategyId: strategy.id,
+      name: strategy.name,
+      snapshot,
+    };
+  }
+  return { source: "snapshot", strategyId: strategy.id, name: strategy.name, snapshot };
+}
+
+// 从 factor_score 策略内联快照重建 TrainResult：快照成员已烘焙权重、无顶层 weights 表，故按 memberNames
+// 反推权重表，使旧策略（无 factorSetId）「在因子实验室编辑」走快照分支时无需强制重训即可「另存为组合 /
+// 更新该策略」（DoD #4）。method 由调用方传入（快照不含训练方法）；metrics 缺失回落零值（P2-1）。
+export function trainedFromSnapshot(
+  snapshot: FactorScoreSnapshotParams,
+  method: TrainMethod,
+): TrainResult | null {
+  const members = snapshot.members ?? [];
+  if (members.length === 0) return null;
+  const names = memberNames(members);
+  const weights: Record<string, number> = {};
+  members.forEach((m, i) => {
+    weights[names[i]] = typeof m.weight === "number" ? m.weight : 0;
+  });
+  const ns = snapshot.normStats;
+  return {
+    method,
+    weights,
+    normStats: {
+      normWindow: ns?.normWindow ?? snapshot.thresholds?.normWindow ?? DEFAULT_THRESHOLDS.normWindow,
+      clip: ns?.clip ?? DEFAULT_CLIP,
+    },
+    metrics: zeroTrainMetrics(),
+    available: true,
+    note: "",
+    trainerVersion: null,
+    provenance: snapshot.provenance,
+  };
+}
+
+// 阈值摘要文案（详情卡片用，稳定可单测）：进多/进空/退出带/归一化窗口/压缩开关。
+export function thresholdsSummary(thresholds: FactorThresholds): string {
+  const squash = thresholds.squash ? " · tanh 压缩" : "";
+  return (
+    `进多 ${thresholds.enterLong} · 进空 ${thresholds.enterShort} · ` +
+    `退出带 ${thresholds.exitBand} · 归一化窗口 ${thresholds.normWindow}${squash}`
+  );
 }

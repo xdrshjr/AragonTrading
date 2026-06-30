@@ -125,7 +125,8 @@ export const factorApi = {
         members?: FactorMember[];
         method?: TrainMethod;
         modelJson?: Record<string, unknown>;
-        metricsJson?: Record<string, unknown> | null;
+        // 与 create 对齐：除任意 JSON 外也接受 TrainMetrics（编辑组合复用同一 metrics 形态，落库前序列化为 JSON）。
+        metricsJson?: TrainMetrics | Record<string, unknown> | null;
         config?: Record<string, unknown>;
         enabled?: boolean;
       },

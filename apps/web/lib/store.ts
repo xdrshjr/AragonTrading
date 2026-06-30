@@ -25,6 +25,7 @@ import type {
   LiveAutoEvent,
   LiveAutoStatus,
 } from "./liveAutoTypes";
+import type { FactorEditTarget } from "./factorTypes";
 import { clampAllocationOnEdit, defaultAllocationOnAdd, evenSplit } from "./autoTrade";
 
 type Theme = "light" | "dark";
@@ -157,6 +158,9 @@ interface AppState {
   activeView: WorkbenchView;
   factorLabSection: string;
   factorOverlay: FactorOverlay | null;
+  // 跨视图编辑交接载荷（瞬态，不入 partialize）：「因子组合策略」列表 / 交易面板「在因子实验室编辑」
+  // 写入，FactorSetBuilder 挂载时消费一次性水合并立即清空。不持久化（避免刷新后水合到陈旧编辑指针）。
+  factorEditTarget: FactorEditTarget | null;
 
   setInst: (instId: string) => void;
   setBar: (bar: Bar) => void;
@@ -230,6 +234,7 @@ interface AppState {
   setActiveView: (view: WorkbenchView) => void;
   setFactorLabSection: (section: string) => void;
   setFactorOverlay: (overlay: FactorOverlay | null) => void;
+  setFactorEditTarget: (target: FactorEditTarget | null) => void;
 }
 
 // 主图因子叠加指令（show_factor ui-action / 因子实验室「上图」按钮设置）。
@@ -337,6 +342,8 @@ export const useAppStore = create<AppState>()(
       activeView: "trade",
       factorLabSection: "catalog",
       factorOverlay: null,
+      // 编辑交接载荷默认空（瞬态，不持久化）。
+      factorEditTarget: null,
 
       setInst: (instId) => set({ instId, runId: null, chartView: "live-follow" }),
       setBar: (bar) => set({ bar, runId: null, chartView: "live-follow" }),
@@ -566,6 +573,8 @@ export const useAppStore = create<AppState>()(
       setActiveView: (activeView) => set({ activeView }),
       setFactorLabSection: (factorLabSection) => set({ factorLabSection }),
       setFactorOverlay: (factorOverlay) => set({ factorOverlay }),
+      // 编辑交接载荷（瞬态）：写入后由 FactorSetBuilder 消费一次性水合并清空（不入 partialize）。
+      setFactorEditTarget: (factorEditTarget) => set({ factorEditTarget }),
       // 纵向分栏比例：夹取到 [MIN, MAX]；非有限数忽略（守住边界，与 simBalance 同模式）。
       setChartSplitRatio: (n) =>
         set((s) =>
