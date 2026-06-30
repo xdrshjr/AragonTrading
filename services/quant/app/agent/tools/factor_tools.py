@@ -351,15 +351,18 @@ class SaveFactorSetTool(Tool):
                 config=args.get("config"), model=args.get("modelJson"),
                 metrics=args.get("metricsJson"), enabled=bool(args.get("enabled", True)))
         summary = (f"已保存组合「{result['name']}」(#{result['id']})，成员 {len(result['members'])} 个，"
-                   f"方法 {result['method']}。")
+                   f"方法 {result['method']}，并已自动部署为交易策略（伴生 factor_score 策略 "
+                   f"#{result.get('strategyId')}），无需再手动新建。")
         return ToolResult(True, summary, payload=result)
 
 
 class CreateFactorStrategyTool(Tool):
     name = "create_factor_strategy"
     category = "factor"
-    description = ("以内联快照部署一个 factor_score 策略，使其立即可在回测/对比/Walk-forward 中使用，闭合"
-                  "「保存→部署」链路；成员方向须冻结、权重已烘焙，normStats/provenance 仅记录不参与打分。")
+    description = ("以内联快照部署一个 factor_score 策略，使其立即可在回测/对比/Walk-forward 中使用；"
+                  "成员方向须冻结、权重已烘焙，normStats/provenance 仅记录不参与打分。"
+                  "注意：本工具产出**无 factorSetId 的孤儿策略**（与交易面板「另存为」副本同类，不参与"
+                  "组合↔策略 1:1 同步、无重复风险）；因 save_factor_set 现已自动部署伴生策略，本工具属冗余但保留。")
     input_schema = {
         "type": "object",
         "properties": {

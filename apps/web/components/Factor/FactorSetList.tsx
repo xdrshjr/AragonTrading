@@ -4,8 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 import { useState } from "react";
 import { Badge, Button } from "@/components/ui";
-import { api } from "@/lib/api";
-import { applyWeights, formatIc, resolveThresholds, trainedFromSet } from "@/lib/factor";
+import { formatIc } from "@/lib/factor";
 import { factorApi } from "@/lib/factorApi";
 import type { FactorSet } from "@/lib/factorTypes";
 import { fmtTime } from "@/lib/format";
@@ -16,29 +15,18 @@ function sortByUpdated(sets: FactorSet[]): FactorSet[] {
   return [...sets].sort((a, b) => b.updatedTs - a.updatedTs);
 }
 
-// 从一条已存组合构造 factor_score 策略内联快照 params：成员烘焙训练权重、带归一化契约 / 溯源 +
-// 来源组合 factorSetId（回链稳健 set 分支，无孤儿，P1-2）。复用 builder 同口径（applyWeights + trainedFromSet）。
-function setToStrategyParams(set: FactorSet): Record<string, unknown> {
-  const trained = trainedFromSet(set);
-  return {
-    members: applyWeights(set.members, trained?.weights),
-    thresholds: resolveThresholds(set.config?.thresholds),
-    normStats: trained?.normStats,
-    provenance: trained?.provenance,
-    factorSetId: set.id,
-  };
-}
-
 /**
  * 「因子组合策略」工作区：列出用户已建的全部因子组合，支持选择 / 查看（FactorSetDetail）/ 编辑（载入
- * builder）/ 删除（二次确认）/ 从组合新建得分策略。读取 GET /factor-sets（TanStack Query）。
+ * builder）/ 删除（二次确认）。读取 GET /factor-sets（TanStack Query）。
+ *
+ * 因子组合现与交易面板的因子组合得分策略**自动 1:1 同步**（保存即部署、删除即移除，后端单事务），
+ * 故移除了旧「从组合新建策略」手动按钮；删除成功后**双失效** ["factor","sets"] 与 ["strategies"]，
+ * 让交易面板下次激活即重新拉取到同步后的策略列表（factor-combo-strategy-sync）。
  */
 export default function FactorSetList() {
   const qc = useQueryClient();
   const setSection = useAppStore((s) => s.setFactorLabSection);
   const setEditTarget = useAppStore((s) => s.setFactorEditTarget);
-  const setStrategyId = useAppStore((s) => s.setStrategyId);
-  const setActiveView = useAppStore((s) => s.setActiveView);
 
   const sets = useQuery({ queryKey: ["factor", "sets"], queryFn: () => factorApi.sets.list() });
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -47,15 +35,9 @@ export default function FactorSetList() {
     mutationFn: (id: number) => factorApi.sets.remove(id),
     onSuccess: (_data, id) => {
       if (selectedId === id) setSelectedId(null);
+      // 双失效：组合列表 + 交易策略列表（删组合连带删伴生策略，两视图须同步刷新）。
       void qc.invalidateQueries({ queryKey: ["factor", "sets"] });
-    },
-  });
-  const createStrategy = useMutation({
-    mutationFn: (set: FactorSet) =>
-      api.createStrategy({ templateKey: "factor_score", name: `${set.name} · 得分策略`, params: setToStrategyParams(set) }),
-    onSuccess: (strategy) => {
-      setStrategyId(strategy.id);
-      setActiveView("trade");
+      void qc.invalidateQueries({ queryKey: ["strategies"] });
     },
   });
 
@@ -66,7 +48,7 @@ export default function FactorSetList() {
   };
   const onDelete = (set: FactorSet) => {
     const ok = window.confirm(
-      `确定删除组合「${set.name}」？已基于它创建的得分策略不受影响（内联快照自包含），但其「在因子实验室编辑」回链将回落到策略内联快照。`,
+      `确定删除组合「${set.name}」？将同时移除其在交易策略面板中对应的因子组合得分策略（数据保持一致）。`,
     );
     if (ok) remove.mutate(set.id);
   };
@@ -109,8 +91,6 @@ export default function FactorSetList() {
             onSelect={() => setSelectedId(set.id)}
             onEdit={() => onEdit(set)}
             onDelete={() => onDelete(set)}
-            onCreateStrategy={() => createStrategy.mutate(set)}
-            creating={createStrategy.isPending}
           />
         ))}
       </div>
@@ -122,9 +102,9 @@ export default function FactorSetList() {
             选择左侧的因子组合查看成员、权重、复合得分曲线与训练溯源。
           </div>
         )}
-        {(remove.isError || createStrategy.isError) && (
+        {remove.isError && (
           <p className="mt-2 text-[11px] text-[var(--short)]">
-            操作失败：{((remove.error || createStrategy.error) as Error)?.message}
+            操作失败：{(remove.error as Error)?.message}
           </p>
         )}
       </div>
@@ -138,16 +118,12 @@ function FactorSetCard({
   onSelect,
   onEdit,
   onDelete,
-  onCreateStrategy,
-  creating,
 }: {
   set: FactorSet;
   selected: boolean;
   onSelect: () => void;
   onEdit: () => void;
   onDelete: () => void;
-  onCreateStrategy: () => void;
-  creating: boolean;
 }) {
   return (
     <div
@@ -169,9 +145,6 @@ function FactorSetCard({
       </button>
       <div className="flex flex-wrap gap-1.5">
         <Button variant="primary" size="sm" onClick={onEdit}>编辑</Button>
-        <Button variant="default" size="sm" disabled={creating} onClick={onCreateStrategy}>
-          {creating ? "创建中..." : "新建策略"}
-        </Button>
         <Button variant="ghost" size="sm" onClick={onDelete}>删除</Button>
       </div>
     </div>

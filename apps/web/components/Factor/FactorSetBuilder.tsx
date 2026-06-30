@@ -262,7 +262,9 @@ export default function FactorSetBuilder() {
     mutationFn: () => factorApi.sets.create(setBody()),
     onSuccess: (created) => {
       enterEditingSet(created);
-      setNotice("因子组合已保存");
+      // 保存组合即自动部署伴生交易策略（后端单事务），失效交易策略列表使其同步出现（无需手动新建）。
+      void qc.invalidateQueries({ queryKey: ["strategies"] });
+      setNotice("因子组合已保存并同步到交易策略");
     },
   });
   const update = useMutation({
@@ -271,28 +273,10 @@ export default function FactorSetBuilder() {
       loadedTrainedAtRef.current =
         typeof updated.model?.trainedAt === "number" ? updated.model.trainedAt : loadedTrainedAtRef.current;
       retrainedRef.current = false;
-      setNotice("因子组合已更新");
+      setNotice("因子组合已更新并同步到交易策略");
+      // 双失效：组合更新连带刷新伴生策略快照与名称，两视图须同步。
       void qc.invalidateQueries({ queryKey: ["factor", "sets"] });
-    },
-  });
-  // 从组合新建策略：未保存组合（editingSetId==null）时先自动落库该组合再带 factorSetId（无孤儿，P1-2）。
-  const createStrategy = useMutation({
-    mutationFn: async () => {
-      let setId = editingSetId;
-      if (setId == null) {
-        const created = await factorApi.sets.create(setBody());
-        setId = created.id;
-        enterEditingSet(created);
-      }
-      return api.createStrategy({
-        templateKey: "factor_score",
-        name: `${name} · 得分策略`,
-        params: strategyParams(setId ?? undefined),
-      });
-    },
-    onSuccess: (strategy) => {
-      setStrategyId(strategy.id);
-      setActiveView("trade");
+      void qc.invalidateQueries({ queryKey: ["strategies"] });
     },
   });
   // 更新该策略（仅 snapshot 分支旧策略）：写回当前快照；若已「另存为组合」则顺带回链 factorSetId。
@@ -419,22 +403,23 @@ export default function FactorSetBuilder() {
           editStrategyId={editStrategyId}
           savePending={save.isPending}
           updatePending={update.isPending}
-          createStrategyPending={createStrategy.isPending}
           updateStrategyPending={updateStrategy.isPending}
           onSave={() => save.mutate()}
           onUpdate={() => update.mutate()}
-          onCreateStrategy={() => createStrategy.mutate()}
           onUpdateStrategy={() => updateStrategy.mutate()}
         />
       </div>
+      <p className="text-[11px] text-[var(--muted)]">
+        保存 / 更新组合后会自动同步到交易策略面板的「因子组合得分策略」，无需手动新建。
+      </p>
       {blockReason && !memberError && (
         <p className="text-[11px] text-[var(--muted)]">{blockReason}</p>
       )}
       {notice && <p className="text-[11px] font-medium text-[var(--accent)]">{notice}</p>}
-      {(save.isError || update.isError || createStrategy.isError || updateStrategy.isError) && (
+      {(save.isError || update.isError || updateStrategy.isError) && (
         <p className="text-[11px] text-[var(--short)]">
           操作失败：
-          {((save.error || update.error || createStrategy.error || updateStrategy.error) as Error)?.message}
+          {((save.error || update.error || updateStrategy.error) as Error)?.message}
         </p>
       )}
     </div>
@@ -467,17 +452,16 @@ function EditBanner({
 }
 
 // 保存区动作：按当前模式（新建 / 更新组合 / 旧策略快照）渲染按钮，全部复用同一 blockReason 禁用门（P1-3）。
+// 组合保存即自动部署伴生交易策略，故不再有「从组合新建策略」手动按钮（factor-combo-strategy-sync）。
 function SaveActions({
   blockReason,
   editingSetId,
   editStrategyId,
   savePending,
   updatePending,
-  createStrategyPending,
   updateStrategyPending,
   onSave,
   onUpdate,
-  onCreateStrategy,
   onUpdateStrategy,
 }: {
   blockReason: string | null;
@@ -485,11 +469,9 @@ function SaveActions({
   editStrategyId: number | null;
   savePending: boolean;
   updatePending: boolean;
-  createStrategyPending: boolean;
   updateStrategyPending: boolean;
   onSave: () => void;
   onUpdate: () => void;
-  onCreateStrategy: () => void;
   onUpdateStrategy: () => void;
 }) {
   const disabled = !!blockReason;
@@ -502,7 +484,7 @@ function SaveActions({
           {updatePending ? "更新中..." : "更新组合"}
         </Button>
       ) : (
-        <Button variant="default" disabled={disabled || savePending} title={blockReason ?? "保存因子组合"} onClick={onSave}>
+        <Button variant="primary" disabled={disabled || savePending} title={blockReason ?? "保存因子组合"} onClick={onSave}>
           {savePending ? "保存中..." : saveLabel}
         </Button>
       )}
@@ -521,14 +503,6 @@ function SaveActions({
           {updateStrategyPending ? "更新中..." : "更新该策略"}
         </Button>
       )}
-      <Button
-        variant="primary"
-        disabled={disabled || createStrategyPending}
-        title={blockReason ?? "以内联快照创建 factor_score 策略，自动出现在策略列表 / 回测 / 对比"}
-        onClick={onCreateStrategy}
-      >
-        {createStrategyPending ? "创建中..." : "从组合新建策略"}
-      </Button>
     </>
   );
 }

@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { factorApi } from "@/lib/factorApi";
 import type { FactorSet } from "@/lib/factorTypes";
@@ -36,7 +36,10 @@ vi.mock("@/lib/factorApi", () => ({
 }));
 vi.mock("@/lib/api", () => ({ api: { createStrategy: vi.fn(), updateStrategy: vi.fn() } }));
 
-const setsApi = factorApi.sets as unknown as { get: ReturnType<typeof vi.fn> };
+const setsApi = factorApi.sets as unknown as {
+  get: ReturnType<typeof vi.fn>;
+  update: ReturnType<typeof vi.fn>;
+};
 
 function trainedSet(): FactorSet {
   return {
@@ -68,6 +71,7 @@ function renderBuilder() {
       <FactorSetBuilder />
     </QueryClientProvider>,
   );
+  return client;
 }
 
 beforeEach(() => {
@@ -90,8 +94,27 @@ describe("FactorSetBuilder — 编辑态水合", () => {
     // H3：水合的训练结果未被 [members] effect 清掉 → trainedFresh 为真 → 「更新组合」可点。
     const updateBtn = screen.getByRole("button", { name: "更新组合" }) as HTMLButtonElement;
     expect(updateBtn.disabled).toBe(false);
+    // 组合保存即自动同步交易策略，故移除了「从组合新建策略」手动按钮。
+    expect(screen.queryByRole("button", { name: "从组合新建策略" })).toBeNull();
     // 一次性消费：交接载荷已清空（P2-2）。
     expect(useAppStore.getState().factorEditTarget).toBeNull();
+  });
+
+  it("double-invalidates ['factor','sets'] + ['strategies'] after 更新组合 succeeds", async () => {
+    setsApi.get.mockResolvedValue(trainedSet());
+    setsApi.update.mockResolvedValue(trainedSet());
+    useAppStore.setState({ factorEditTarget: { source: "set", setId: 7 } });
+    const client = renderBuilder();
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "更新组合" })).toBeTruthy());
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+    fireEvent.click(screen.getByRole("button", { name: "更新组合" }));
+
+    await waitFor(() => expect(setsApi.update).toHaveBeenCalledWith(7, expect.any(Object)));
+    await waitFor(() =>
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["strategies"] }),
+    );
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["factor", "sets"] });
   });
 
   it("hydrates a snapshot edit target and offers 更新该策略 + 另存为组合 (DoD #4)", async () => {

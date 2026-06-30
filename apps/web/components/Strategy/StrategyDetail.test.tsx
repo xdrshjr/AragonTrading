@@ -64,6 +64,17 @@ describe("StrategyDetail — 因子策略「在因子实验室编辑」回链", 
     expect(useAppStore.getState().activeView).toBe("factor");
   });
 
+  it("banner reminds that params are managed in the factor lab (set is the source of truth)", () => {
+    renderDetail(
+      factorStrategy({
+        members: MEMBERS,
+        thresholds: { enterLong: 0.3, enterShort: 0.3, exitBand: 0.1, normWindow: 200, squash: true },
+        factorSetId: 7,
+      }),
+    );
+    expect(screen.getByText(/参数由因子实验室的因子组合管理/)).toBeTruthy();
+  });
+
   it("without factorSetId → snapshot handoff target with members from the strategy", () => {
     renderDetail(
       factorStrategy({

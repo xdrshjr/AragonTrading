@@ -48,6 +48,9 @@ function FactorStrategyBanner({ strategy }: { strategy: Strategy }) {
       <p className="text-[11px] text-[var(--muted)]">
         消费独立因子层的复合得分做决策（内联快照 {members.length} 个因子成员，回测路径零改动）。
       </p>
+      <p className="text-[11px] text-[var(--muted)]">
+        参数由因子实验室的因子组合管理，请在因子实验室编辑；此处临时改参仅用于即时回测，下次组合更新会以快照覆盖。
+      </p>
       <p className="text-[11px] text-[var(--accent)]">
         至少需约 {minBars} 根数据才会产出信号（区间过短将安静空仓，请确保回测/对比区间足够长）。
       </p>

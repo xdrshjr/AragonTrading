@@ -769,13 +769,16 @@ async def list_live_order_audit(session: AsyncSession, *, account_id: int | None
     return list((await session.execute(stmt)).scalars().all())
 
 
-# ============================ 因子（因子层 §5.1） —— 已拆至 factor_repositories.py（R5） ============================
+# ============================ 因子 / 策略原语 —— 已拆至 factor_repositories / strategy_repositories（R5） ============================
 # 显式 re-export 全部公开符号，保持所有现有 repo.X 调用点零改动（私有 _* 随模块内引用走，不外露）。
+# strategy_repositories：因子组合 ↔ 交易策略单事务同步用的不提交策略原语 + 反查（R1/R2/R5）。
 from .factor_repositories import (  # noqa: E402,F401
     FactorPatch,
     FactorSetPatch,
     FactorSetValues,
     FactorValues,
+    add_factor_set,
+    apply_factor_set_patch,
     bulk_create_factors,
     create_factor,
     create_factor_set,
@@ -788,4 +791,8 @@ from .factor_repositories import (  # noqa: E402,F401
     set_factor_eval,
     update_factor,
     update_factor_set,
+)
+from .strategy_repositories import (  # noqa: E402,F401
+    add_strategy, apply_strategy,
+    list_factor_score_rows_for_set, map_companion_strategy_ids,
 )

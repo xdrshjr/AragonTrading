@@ -45,6 +45,7 @@ function renderList() {
       <FactorSetList />
     </QueryClientProvider>,
   );
+  return client;
 }
 
 beforeEach(() => {
@@ -80,11 +81,19 @@ describe("FactorSetList", () => {
     expect(useAppStore.getState().factorLabSection).toBe("builder");
   });
 
-  it("deletes after confirm, calls sets.remove and clears the selected detail", async () => {
+  it("no longer renders a 新建策略 button (组合保存即自动同步交易策略)", async () => {
+    setsApi.list.mockResolvedValue([makeSet({ id: 7, name: "组合A" })]);
+    renderList();
+    await waitFor(() => expect(screen.getByText("组合A")).toBeTruthy());
+    expect(screen.queryByRole("button", { name: "新建策略" })).toBeNull();
+  });
+
+  it("deletes after confirm, double-invalidates sets + strategies, clears the selected detail", async () => {
     setsApi.list.mockResolvedValue([makeSet({ id: 7, name: "组合A" })]);
     setsApi.remove.mockResolvedValue(undefined);
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
-    renderList();
+    const client = renderList();
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
     await waitFor(() => expect(screen.getByText("组合A")).toBeTruthy());
 
     // 选中卡片 → 详情桩出现，随后删除应清空选中（详情桩消失）。
@@ -93,7 +102,14 @@ describe("FactorSetList", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "删除" }));
     expect(confirmSpy).toHaveBeenCalled();
+    // 删除确认文案明确「将同时移除对应交易策略」（有意反转旧不变量，R3）。
+    expect(String(confirmSpy.mock.calls[0]?.[0])).toContain("将同时移除");
     await waitFor(() => expect(setsApi.remove).toHaveBeenCalledWith(7));
+    // 双失效：组合列表 + 交易策略列表（R1/§2.3）。
+    await waitFor(() =>
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["factor", "sets"] }),
+    );
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["strategies"] });
     await waitFor(() => expect(screen.queryByTestId("detail")).toBeNull());
   });
 

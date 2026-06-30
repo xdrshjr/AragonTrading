@@ -657,6 +657,41 @@ describe("StrategyPanel manual backtest trigger", () => {
     expect(screen.queryByText("12.00%")).toBeNull();
   });
 
+  it("strips factorSetId when saving a factor_score strategy as a copy (守 1:1)", async () => {
+    const factorStrategy: Strategy = {
+      id: 50,
+      templateKey: "factor_score",
+      name: "因子组合 · 得分策略",
+      description: "因子组合得分策略",
+      kind: "factor",
+      params: {
+        members: [{ factorKey: "mom_roc", params: {}, weight: 1, direction: "long" }],
+        thresholds: { enterLong: 0.3, enterShort: 0.3, exitBand: 0.1, normWindow: 200, squash: true },
+        factorSetId: 7,
+      },
+      paramsSchema: {},
+      enabled: true,
+      builtin: false,
+    };
+    mockApi([...STRATEGIES, factorStrategy]);
+    resetStore({ strategyId: 50 });
+    renderPanel();
+    await screen.findByText(/参数由因子实验室的因子组合管理/);
+    await settleEffects();
+
+    vi.mocked(api.createStrategy).mockResolvedValueOnce({ ...factorStrategy, id: 51, name: "副本X" });
+    const promptSpy = vi.spyOn(window, "prompt").mockReturnValue("副本X");
+    fireEvent.click(getButton(SAVE_AS));
+
+    await waitFor(() => expect(api.createStrategy).toHaveBeenCalledTimes(1));
+    const arg = vi.mocked(api.createStrategy).mock.calls[0][0];
+    expect(arg.templateKey).toBe("factor_score");
+    expect("factorSetId" in (arg.params as Record<string, unknown>)).toBe(false);
+    // 非 factorSetId 字段保留（成员快照仍在），仅剥离来源组合弱关联。
+    expect((arg.params as Record<string, unknown>).members).toBeTruthy();
+    promptSpy.mockRestore();
+  });
+
   it("keeps deleting the selected combo passive and clears the current result", async () => {
     await renderLoadedPanel();
     await selectComboTab();

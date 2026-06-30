@@ -39,12 +39,32 @@ logger = logging.getLogger("aragon")
 async def lifespan(app: FastAPI):
     await init_db()
     logger.info("DB initialized; builtin strategies seeded.")
+    await _backfill_companion_strategies()
     yield
     await get_agent_manager().shutdown()
     await get_paper_manager().shutdown()
     await get_live_auto_manager().shutdown()
     await get_rest_client().aclose()
     await dispose_engine()
+
+
+async def _backfill_companion_strategies() -> None:
+    """启动后对历史无伴生的因子组合幂等补建伴生 factor_score 策略（factor-combo-strategy-sync，R6）。
+
+    lifespan 不开 ``Depends(get_session)``，故用 ``get_sessionmaker()`` 开一次性 session；**整段
+    ``try/except`` 包裹，补建失败仅 ``logger.warning`` 不阻断启动**（补建为非关键收敛，下次组合更新
+    经 ``update_set`` 自愈）。延迟导入避免应用加载期与 factors/service 的层间硬依赖。
+    """
+    try:
+        from .db.session import get_sessionmaker
+        from .factors import service as factor_service
+
+        async with get_sessionmaker()() as session:
+            created = await factor_service.backfill_companions(session)
+        if created:
+            logger.info("backfilled %d companion factor_score strategies", created)
+    except Exception as exc:  # noqa: BLE001 —— 启动补建非关键，绝不因它拖垮服务启动
+        logger.warning("companion strategy backfill skipped: %s", exc)
 
 
 app = FastAPI(title="Aragon Trading Quant API", version="0.1.0", lifespan=lifespan)

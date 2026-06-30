@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..agent.services import load_range_candles
 from ..config import get_settings
 from ..db import repositories as repo
-from ..db.models import FactorSet
+from ..db.models import FactorSet, Strategy
 from ..engine.backtester import candles_to_df
 from ..engine.factors import (
     MINE_WORK_UNIT_LIMIT,
@@ -246,15 +246,53 @@ async def _train_weights_guarded(matrix, label, names, method: str, config: dict
         raise HTTPException(400, detail={"code": "FACTOR_TRAIN_FAILED", "message": str(exc)}) from exc
 
 
-# ============================ 组合创建（单源编排，R2） ============================
+# ============================ 组合 ↔ 伴生策略 单事务同步编排（R2/R3/R5） ============================
+def _set_out_with_strategy(row: FactorSet, strategy_id: int | None) -> dict:
+    """``factor_set_out`` 纯函数输出 + 读路径附加的 ``strategyId``（无伴生为 ``None``，R1）。
+
+    ``factor_set_out`` 本体保持纯同步、不增 IO；``strategyId`` 一律在 service / 路由包装层附加。
+    """
+    return {**factor_set_out(row), "strategyId": strategy_id}
+
+
+def _companion_name(set_row: FactorSet) -> str:
+    """伴生策略名称 = ``{组合名} · 得分策略``（与前端旧手动建策略口径一致，便于识别）。"""
+    return f"{set_row.name} · 得分策略"
+
+
+async def ensure_companion_strategy(session: AsyncSession, set_row: FactorSet) -> Strategy:
+    """把组合的伴生 ``factor_score`` 策略收敛到「正典（min id）」并以组合快照刷新（R2）。
+
+    ``list_factor_score_rows_for_set`` 按 ``id`` 升序 → 取首条为正典，``apply_strategy`` 以
+    ``resolve_set_to_spec(set_row) + {factorSetId}`` 刷新其 ``params``、以 ``{name} · 得分策略`` 刷新
+    ``name``；其余重复伴生一并 ``session.delete``（历史多伴生坍缩为恰好一条）。一条都没有则
+    ``add_strategy`` 补建（新建 / 自愈）。**不触 ``enabled``（保留用户启停，R9），不在此 commit**
+    （提交收口在编排末尾，保证原子性）。
+    """
+    name = _companion_name(set_row)
+    params = {**resolve_set_to_spec(set_row), "factorSetId": set_row.id}
+    rows = await repo.list_factor_score_rows_for_set(session, set_row.id)
+    if not rows:
+        return await repo.add_strategy(session, "factor_score", name, params)
+    canonical, *extras = rows
+    await repo.apply_strategy(session, canonical, name=name, params=params)
+    for extra in extras:
+        await session.delete(extra)
+    return canonical
+
+
 async def create_set(session: AsyncSession, *, name: str, members_raw: list[dict], method: str,
                      config: dict | None, model: dict | None, metrics: dict | None,
                      enabled: bool) -> dict:
-    """创建因子组合的**单一真源**编排，供 REST 路由与 Agent 工具共用（消除逻辑漂移，R2）。
+    """创建因子组合的**单一真源**编排，连带建伴生 ``factor_score`` 策略（单事务），REST 与 Agent 共用。
 
-    顺序与原 ``api/factors.create_factor_set`` 字节级一致：``validate_members`` → ``normalize_thresholds``
-    → ``assert_norm_contract`` → ``assert_weights_cover`` → ``repo.create_factor_set`` → ``factor_set_out``。
-    归一化契约/权重单源校验仅当 ``model`` 带训练产物时生效（equal/未训练自动放行）。
+    ``validate_members`` → ``normalize_thresholds`` → ``assert_norm_contract`` → ``assert_weights_cover``
+    → ``add_factor_set``（flush 取 id）→ ``ensure_companion_strategy``（落伴生策略）→ **单次 commit**。
+    任一步抛 ``HTTPException`` 时事务未提交，组合与策略均不落（原子回滚，P0）。归一化契约/权重单源校验
+    仅当 ``model`` 带训练产物时生效（equal/未训练自动放行）。
+
+    Returns:
+        ``factor_set_out`` + ``strategyId``（伴生策略 id）。
 
     Raises:
         HTTPException: 400 —— 成员非法 / 归一化窗口漂移 / 训练权重陈旧（与 REST 同一错误码）。
@@ -265,7 +303,75 @@ async def create_set(session: AsyncSession, *, name: str, members_raw: list[dict
     assert_weights_cover(members, model)
     values = repo.FactorSetValues(name=name, members=members, method=method, config=config,
                                   model=model, metrics=metrics, enabled=enabled)
-    return factor_set_out(await repo.create_factor_set(session, values=values))
+    row = await repo.add_factor_set(session, values=values)
+    companion = await ensure_companion_strategy(session, row)
+    await session.commit()
+    await session.refresh(row)
+    return _set_out_with_strategy(row, companion.id)
+
+
+async def update_set(session: AsyncSession, set_id: int, *, name: str | None, members_raw: list[dict] | None,
+                     method: str | None, config: dict | None, model: dict | None,
+                     metrics: dict | None, enabled: bool | None) -> dict | None:
+    """更新组合并同步刷新 / 自愈伴生策略（单事务）；组合不存在 → ``None``（路由转 404）。
+
+    校验顺序与原 ``api.update_factor_set`` 一致（partial：仅在请求带对应字段时校验）：校验 →
+    ``apply_factor_set_patch``（flush）→ ``ensure_companion_strategy``（坍缩到正典 + 刷新 / 缺失则补建）
+    → **单次 commit**。``enabled`` 字段对组合按 patch 生效，但伴生策略的 ``enabled`` 不被覆盖（R9）。
+
+    Raises:
+        HTTPException: 400 —— 成员非法 / 归一化窗口漂移 / 训练权重陈旧。
+    """
+    members = validate_members(members_raw) if members_raw is not None else None
+    if model is not None:
+        if config is not None:
+            assert_norm_contract(normalize_thresholds((config or {}).get("thresholds")), model)
+        if members is not None:
+            assert_weights_cover(members, model)
+    row = await repo.get_factor_set(session, set_id)
+    if row is None:
+        return None
+    patch = repo.FactorSetPatch(name=name, members=members, method=method, config=config,
+                                model=model, metrics=metrics, enabled=enabled)
+    await repo.apply_factor_set_patch(session, row, patch=patch)
+    companion = await ensure_companion_strategy(session, row)
+    await session.commit()
+    await session.refresh(row)
+    return _set_out_with_strategy(row, companion.id)
+
+
+async def delete_set(session: AsyncSession, set_id: int) -> str:
+    """删除组合并**连带删除其全部伴生 ``factor_score`` 策略**（单事务）；'ok' | 'not_found'。
+
+    有意反转旧「删组合不影响策略」不变量（R3，用户明确要求 1:1 生命周期）：按 ``factorSetId`` 反查全部
+    伴生 → 逐条 ``session.delete`` → 删组合行 → **单次 commit**。本机 SQLite 未开外键，删带 run 的
+    ``factor_score`` 行与 ``repo.delete_strategy``（交易面板删用户策略）同口径、不因 ``strategy_runs``
+    外键失败；已发起的 run 自包含、不受影响（历史经 ``strategy_id`` 仍可查阅）。
+    """
+    row = await repo.get_factor_set(session, set_id)
+    if row is None:
+        return "not_found"
+    for strategy_row in await repo.list_factor_score_rows_for_set(session, set_id):
+        await session.delete(strategy_row)
+    await session.delete(row)
+    await session.commit()
+    return "ok"
+
+
+async def backfill_companions(session: AsyncSession) -> int:
+    """对历史**无伴生**的组合幂等补建一条伴生 ``factor_score`` 策略；返回补建条数（启动 lifespan 调用）。
+
+    遍历全部组合，仅对 ``list_factor_score_rows_for_set`` 为空者 ``ensure_companion_strategy`` 补建
+    （已有伴生即跳过，不重复建、不改动）。补建后**单次 commit**；幂等、可重复运行。
+    """
+    created = 0
+    for set_row in await repo.list_factor_sets(session):
+        if not await repo.list_factor_score_rows_for_set(session, set_row.id):
+            await ensure_companion_strategy(session, set_row)
+            created += 1
+    if created:
+        await session.commit()
+    return created
 
 
 def resolve_set_to_spec(row: FactorSet) -> dict:

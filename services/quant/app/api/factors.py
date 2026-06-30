@@ -149,8 +149,10 @@ async def mine_factors(body: FactorMineReq,
 @router.get("/factor-sets")
 async def list_factor_sets(enabled: bool | None = Query(None),
                            session: AsyncSession = Depends(get_session)) -> list[dict]:
+    # strategyId 在读路径经**批量**反查回填，避免刷新后恒 null 与逐行 N+1（评审 R1）。
     rows = await repo.list_factor_sets(session, enabled=enabled)
-    return [factor_set_out(r) for r in rows]
+    id_map = await repo.map_companion_strategy_ids(session, [r.id for r in rows])
+    return [{**factor_set_out(r), "strategyId": id_map.get(r.id)} for r in rows]
 
 
 @router.get("/factor-sets/{set_id}")
@@ -158,7 +160,8 @@ async def get_factor_set(set_id: int, session: AsyncSession = Depends(get_sessio
     row = await repo.get_factor_set(session, set_id)
     if row is None:
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "因子组合不存在"})
-    return factor_set_out(row)
+    id_map = await repo.map_companion_strategy_ids(session, [row.id])
+    return {**factor_set_out(row), "strategyId": id_map.get(row.id)}
 
 
 @router.post("/factor-sets", status_code=201)
@@ -175,32 +178,21 @@ async def create_factor_set(body: FactorSetCreateReq,
 @router.put("/factor-sets/{set_id}")
 async def update_factor_set(set_id: int, body: FactorSetUpdateReq,
                             session: AsyncSession = Depends(get_session)) -> dict:
-    from ..factors.specs import (
-        assert_norm_contract,
-        assert_weights_cover,
-        normalize_thresholds,
-        validate_members,
-    )
-    members = None
-    if body.members is not None:
-        members = validate_members([m.model_dump() for m in body.members])
-    # partial update：仅在请求同时带上对应字段时校验，避免误伤局部更新（H2/H3，评审 §8）。
-    if body.modelJson is not None:
-        if body.config is not None:
-            assert_norm_contract(normalize_thresholds((body.config or {}).get("thresholds")), body.modelJson)
-        if members is not None:
-            assert_weights_cover(members, body.modelJson)
-    row = await repo.update_factor_set(session, set_id, patch=repo.FactorSetPatch(
-        name=body.name, members=members, method=body.method, config=body.config,
-        model=body.modelJson, metrics=body.metricsJson, enabled=body.enabled))
+    # 校验 + 单事务同步（刷新 / 自愈伴生策略）下沉 service.update_set（与 create 同源，路由变薄）。
+    row = await service.update_set(
+        session, set_id, name=body.name,
+        members_raw=[m.model_dump() for m in body.members] if body.members is not None else None,
+        method=body.method, config=body.config, model=body.modelJson,
+        metrics=body.metricsJson, enabled=body.enabled)
     if row is None:
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "因子组合不存在"})
-    return factor_set_out(row)
+    return row
 
 
 @router.delete("/factor-sets/{set_id}", status_code=204)
 async def delete_factor_set(set_id: int, session: AsyncSession = Depends(get_session)) -> Response:
-    result = await repo.delete_factor_set(session, set_id)
+    # 连带删除伴生 factor_score 策略（有意反转旧不变量，R3）下沉 service.delete_set。
+    result = await service.delete_set(session, set_id)
     if result == "not_found":
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "因子组合不存在"})
     return Response(status_code=204)

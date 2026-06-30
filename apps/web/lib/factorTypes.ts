@@ -180,6 +180,9 @@ export interface FactorSet {
   enabled: boolean;
   createdTs: number;
   updatedTs: number;
+  // 对应的伴生交易策略 id（factor_score 策略，params.factorSetId == this.id）：由后端读路径批量反查
+  // 回填（factor-combo-strategy-sync R1）；无伴生 / 旧响应缺省为 undefined（null），安全。
+  strategyId?: number | null;
 }
 
 export interface FactorThresholds {

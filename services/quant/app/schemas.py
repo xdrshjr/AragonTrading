@@ -900,7 +900,12 @@ def factor_out(row: Factor) -> dict:
 
 
 def factor_set_out(row: FactorSet) -> dict:
-    """FactorSet 行 → 前端 dict（camelCase；含成员快照 + 训练产物 + 复合 IC）。"""
+    """FactorSet 行 → 前端 dict（camelCase；含成员快照 + 训练产物 + 复合 IC）。
+
+    保持**纯同步、不增 IO**：伴生交易策略 ``strategyId`` 不写入此处，而由读路径（GET 列表/单条与
+    create/update 编排）经 ``repo.map_companion_strategy_ids`` 批量反查后在包装层附加，缺省 ``None``
+    （评审 R1/R5，避免 N+1 与刷新后恒 null）。
+    """
     return {
         "id": row.id, "name": row.name, "members": _load_json(row.members_json, []),
         "method": row.method, "config": _load_json(row.config_json, {}),

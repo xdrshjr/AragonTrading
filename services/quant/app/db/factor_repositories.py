@@ -235,25 +235,35 @@ async def get_factor_set(session: AsyncSession, set_id: int) -> FactorSet | None
     return await session.get(FactorSet, set_id)
 
 
-async def create_factor_set(session: AsyncSession, *, values: FactorSetValues) -> FactorSet:
-    row = FactorSet(
+def _factor_set_row(values: FactorSetValues) -> FactorSet:
+    """FactorSetValues → 未入会话的 FactorSet 行（``create_factor_set`` 与 ``add_factor_set`` 共用）。"""
+    return FactorSet(
         name=values.name,
         members_json=json.dumps(values.members or [], ensure_ascii=False),
         method=values.method, config_json=json.dumps(values.config or {}, ensure_ascii=False),
         model_json=json.dumps(values.model or {}, ensure_ascii=False),
         metrics_json=json.dumps(values.metrics, ensure_ascii=False) if values.metrics is not None else None,
         enabled=values.enabled)
+
+
+async def create_factor_set(session: AsyncSession, *, values: FactorSetValues) -> FactorSet:
+    row = _factor_set_row(values)
     session.add(row)
     await session.commit()
     await session.refresh(row)
     return row
 
 
-async def update_factor_set(session: AsyncSession, set_id: int, *,
-                            patch: FactorSetPatch) -> FactorSet | None:
-    row = await session.get(FactorSet, set_id)
-    if row is None:
-        return None
+async def add_factor_set(session: AsyncSession, *, values: FactorSetValues) -> FactorSet:
+    """新增组合行（add + flush 取 ``id``，**不 commit**）：供 ``service.create_set`` 单事务连带建伴生策略（R5）。"""
+    row = _factor_set_row(values)
+    session.add(row)
+    await session.flush()
+    return row
+
+
+def _apply_factor_set_patch(row: FactorSet, patch: FactorSetPatch) -> None:
+    """就地改组合行字段（``None`` = 不改）；``update_factor_set`` 与 ``apply_factor_set_patch`` 共用。"""
     if patch.name is not None:
         row.name = patch.name
     if patch.members is not None:
@@ -268,13 +278,33 @@ async def update_factor_set(session: AsyncSession, set_id: int, *,
         row.metrics_json = json.dumps(patch.metrics, ensure_ascii=False)
     if patch.enabled is not None:
         row.enabled = patch.enabled
+
+
+async def update_factor_set(session: AsyncSession, set_id: int, *,
+                            patch: FactorSetPatch) -> FactorSet | None:
+    row = await session.get(FactorSet, set_id)
+    if row is None:
+        return None
+    _apply_factor_set_patch(row, patch)
     await session.commit()
     await session.refresh(row)
     return row
 
 
+async def apply_factor_set_patch(session: AsyncSession, row: FactorSet, *,
+                                 patch: FactorSetPatch) -> None:
+    """就地改已取出的组合行（flush，**不 commit**）：供 ``service.update_set`` 单事务编排（R5）。"""
+    _apply_factor_set_patch(row, patch)
+    await session.flush()
+
+
 async def delete_factor_set(session: AsyncSession, set_id: int) -> str:
-    """返回 'ok' | 'not_found'（组合自包含快照，删除不影响已创建的 factor_score 策略，R5）。"""
+    """返回 'ok' | 'not_found'。
+
+    **仅删组合行本身，不连带任何 factor_score 策略**——保留供非组合调用点。组合 DELETE 主链路改走
+    ``service.delete_set``，那里按用户「数据保持一致」要求连带删除伴生策略（有意反转旧「删组合不影响
+    策略」不变量，R3）。
+    """
     row = await session.get(FactorSet, set_id)
     if row is None:
         return "not_found"

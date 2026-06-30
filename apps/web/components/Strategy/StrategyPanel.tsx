@@ -360,7 +360,13 @@ export default function StrategyPanel() {
 
   const saveAs = useMutation({
     mutationFn: (vars: { name: string; params: Params }) =>
-      api.createStrategy({ templateKey: selected!.templateKey, name: vars.name, params: vars.params }),
+      api.createStrategy({
+        templateKey: selected!.templateKey,
+        name: vars.name,
+        // 「另存为」factor_score 副本剥离 factorSetId：副本为独立孤儿、不被来源组合同步增删改影响，
+        // 守住组合 ↔ 伴生策略 1:1（factor-combo-strategy-sync §2.6）。
+        params: selected!.templateKey === "factor_score" ? stripFactorSetId(vars.params) : vars.params,
+      }),
     onSuccess: (created) => {
       qc.invalidateQueries({ queryKey: ["strategies"] });
       selectStrategyPassively(created.id);
@@ -754,6 +760,13 @@ function PaperRunningList({ sessions }: { sessions: PaperStrategySession[] }) {
       ))}
     </div>
   );
+}
+
+// 剥离 params.factorSetId（「另存为」factor_score 副本守 1:1，factor-combo-strategy-sync §2.6）。
+function stripFactorSetId(params: Params): Params {
+  if (!("factorSetId" in params)) return params;
+  const { factorSetId: _omit, ...rest } = params;
+  return rest;
 }
 
 async function runBacktest(
