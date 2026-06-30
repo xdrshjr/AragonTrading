@@ -214,13 +214,33 @@ def _guard_mine_workload(candidates: list[dict], window: FactorWindow) -> None:
 
 
 # ============================ 训练 / 打分 ============================
+def _guard_train_workload(window: FactorWindow) -> None:
+    """同步训练有效根数超 ``factor_train_max_bars`` → 413（绝不让无界长请求被传输层切断成 socket hang up）。
+
+    与 ``mine`` 不同：train 把 ≤12 个成员合成单矩阵、无候选维度，故以纯「有效根数」度量（照搬
+    ``mining_workload`` 的候选数×根数会因 12×20000≪3M 而成 no-op 护栏）。有效根数口径与
+    ``load_range_candles``/``_guard_mine_workload`` 一致（``backtest_max_bars`` 二次夹取、``expected≤0`` 归零）。
+    """
+    settings = get_settings()
+    requested = (window.end_ts - window.start_ts) // bar_to_seconds(window.bar) + 1
+    ceiling = settings.backtest_max_bars
+    if window.max_bars is not None:
+        ceiling = min(int(window.max_bars), ceiling)
+    effective = max(0, min(int(requested), int(ceiling)))
+    if effective > settings.factor_train_max_bars:
+        raise HTTPException(413, detail={
+            "code": "FACTOR_TRAIN_TOO_LARGE",
+            "message": "训练区间过长，请缩短区间（或调高上限）后重试。"})
+
+
 async def train(rest, window: FactorWindow, *, members: list[dict], method: str,
                 config: dict | None, horizon: int) -> dict:
-    """训练因子权重：缺 rf/xgb 库 → 400 FACTOR_TRAINER_UNAVAILABLE，绝不回假权重。"""
+    """训练因子权重：区间过长 → 413 FACTOR_TRAIN_TOO_LARGE；缺 rf/xgb 库 → 400 FACTOR_TRAINER_UNAVAILABLE，绝不回假权重。"""
     members = validate_members(members)
     config = config or {}
     norm_window = int(config.get("normWindow", DEFAULT_NORM_WINDOW))
     clip = float(config.get("clip", DEFAULT_CLIP))
+    _guard_train_workload(window)
     df = await _load_df(rest, window)
     matrix, names, norm_stats = await run_in_threadpool(
         build_factor_matrix, df, members, norm_window=norm_window, clip=clip, bar=window.bar)

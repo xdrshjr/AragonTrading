@@ -219,6 +219,26 @@ async def test_train_returns_provenance(patch_okx):
         await dispose_engine()
 
 
+async def test_train_long_range_rejected_413(patch_okx):
+    """长区间训练（有效根数超 factor_train_max_bars）→ 取数前 413 FACTOR_TRAIN_TOO_LARGE 快速失败，
+    而非无界长请求被传输层切断成 socket hang up（docs/diagnoses/factor-lab-train-long-range-socket-hang-up）。"""
+    from app.config import get_settings
+    from app.db.session import dispose_engine
+    client = await _client()
+    budget = get_settings().factor_train_max_bars
+    long_range = {"instId": "BTC-USDT-SWAP", "bar": "1H", "startTs": 1_700_000_000,
+                  "endTs": 1_700_000_000 + (budget + 1000) * 3600}  # 有效根数严格 > 预算
+    try:
+        async with client:
+            r = await client.post("/api/factor-sets/train",
+                                  json={"members": _TWO_MEMBERS, "method": "linear",
+                                        "horizon": 6, **long_range})
+            assert r.status_code == 413, r.text
+            assert r.json()["error"]["code"] == "FACTOR_TRAIN_TOO_LARGE"
+    finally:
+        await dispose_engine()
+
+
 async def test_norm_window_mismatch_400(patch_okx):
     """已训练组合保存时 thresholds.normWindow != 训练 normStats.normWindow → 400（H2）。"""
     from app.db.session import dispose_engine

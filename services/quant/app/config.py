@@ -114,6 +114,12 @@ class Settings(BaseSettings):
     # 字段名即环境变量名（BACKTEST_MAX_BARS / WALK_FORWARD_MAX_WINDOWS，大小写不敏感）。
     backtest_max_bars: int = Field(default=20000, ge=1000)   # 单次回测取数安全上限（防超长区间拖垮）
     walk_forward_max_windows: int = Field(default=200, ge=1)  # 高级回测窗口数硬上限
+    # 同步权重训练（/api/factor-sets/train）的有效根数预算：超出即取数前 413 FACTOR_TRAIN_TOO_LARGE 快速
+    # 失败，而非让无界长请求被传输层窗口切断成 socket hang up（docs/diagnoses/
+    # factor-lab-train-long-range-socket-hang-up）。须严格 < backtest_max_bars，否则因 target 早被夹到
+    # 20000 而沦为 no-op；默认 8000（≈80 次 OKX 串行请求、≥10s 限频地板，落在多数链路超时窗口内），可经
+    # 环境变量 FACTOR_TRAIN_MAX_BARS 调参。
+    factor_train_max_bars: int = Field(default=8000, ge=1000)
 
     # ---- Agent（对话式 AI 助手）LLM 接入 (Agent Trading Copilot spec §3.1) ----
     # 字段名即环境变量名（AGENT_*，大小写不敏感）；密钥仅存后端，绝不下发前端 / 不入库 / 不进日志。
