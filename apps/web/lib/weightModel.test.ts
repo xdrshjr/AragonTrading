@@ -4,11 +4,13 @@ import {
   bestRun,
   buildTrainResult,
   buildTrainTarget,
+  canBacktestModel,
   codeLabel,
   hasCurveData,
   latestRun,
   metricGeometry,
   modelToTrainTarget,
+  runIsBacktestable,
   runToTrained,
   sortModelsByUpdated,
   trainStartBody,
@@ -213,6 +215,27 @@ describe("handoff construction", () => {
       instId: "BTC-USDT-SWAP", bar: "1H", startTs: 1, endTs: 2, name: "x",
     });
     expect(target.origin).toBe("builder");
+  });
+});
+
+describe("backtest gating (weight-model-backtest-replay)", () => {
+  const mk = (over: Partial<WeightModel> = {}): WeightModel => ({
+    id: 1, name: "m", instId: "BTC-USDT-SWAP", bar: "1H", members: [], method: "linear",
+    config: {}, horizon: 6, source: "manual", factorSetId: null, latestRunId: null,
+    bestValidIc: null, notes: "", enabled: true, latestRun: null, createdTs: 0, updatedTs: 0, ...over,
+  });
+
+  it("canBacktestModel is true only when latestRunId is present", () => {
+    expect(canBacktestModel(mk({ latestRunId: 7 }))).toBe(true);
+    expect(canBacktestModel(mk({ latestRunId: null }))).toBe(false);
+  });
+
+  it("runIsBacktestable requires succeeded status and non-empty weights", () => {
+    expect(runIsBacktestable(run({ status: "succeeded", weights: { mom_roc: 1 } }))).toBe(true);
+    expect(runIsBacktestable(run({ status: "succeeded", weights: {} }))).toBe(false);
+    expect(runIsBacktestable(run({ status: "failed", weights: { mom_roc: 1 } }))).toBe(false);
+    expect(runIsBacktestable(run({ status: "cancelled", weights: { mom_roc: 1 } }))).toBe(false);
+    expect(runIsBacktestable(run({ status: "running", weights: {} }))).toBe(false);
   });
 });
 

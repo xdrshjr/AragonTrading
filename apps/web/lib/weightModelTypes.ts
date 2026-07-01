@@ -7,6 +7,7 @@ import type {
   TrainMetrics,
   TrainProvenance,
 } from "./factorTypes";
+import type { Candle, EquityPoint, Metrics, Trade } from "./types";
 
 export type WeightModelSource = "builder" | "manual";
 export type WeightRunStatus = "running" | "succeeded" | "failed" | "cancelled";
@@ -132,3 +133,23 @@ export type TrainStreamEvent =
   | { type: "done"; data: { runId: number; finishedTs: number } }
   | { type: "cancelled"; data: { runId: number; finishedTs: number } }
   | { type: "error"; data: { code: string; message: string; runId?: number } };
+
+// 一键回测打包体（POST /weight-models/{id}/runs/{runId}/backtest）：复用策略回测同一渲染契约
+// （Candle/Trade/EquityPoint/Metrics 取自 lib/types），meta 携带标的 / 周期 / 区间 / 前瞻 / 有效根数 / 本金。
+export interface WeightBacktestMeta {
+  instId: string;
+  bar: string;
+  startTs: number;
+  endTs: number;
+  horizon: number;
+  effectiveCandleCount: number;
+  initialCapital: number;
+}
+
+export interface WeightBacktestResult {
+  candles: Candle[];
+  trades: Trade[];
+  equity: EquityPoint[];
+  metrics: Metrics;
+  meta: WeightBacktestMeta;
+}

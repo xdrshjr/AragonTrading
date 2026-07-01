@@ -16,7 +16,12 @@ from ..db.session import get_session
 from ..factors import weight_model_service as service
 from ..factors.weight_train_manager import get_weight_train_manager
 from ..okx.rest_client import get_rest_client
-from ..schemas import WeightModelCreateReq, WeightModelUpdateReq, WeightTrainStartReq
+from ..schemas import (
+    WeightBacktestReq,
+    WeightModelCreateReq,
+    WeightModelUpdateReq,
+    WeightTrainStartReq,
+)
 
 router = APIRouter(tags=["weight-models"])
 
@@ -114,6 +119,20 @@ async def delete_weight_run(model_id: int, run_id: int,
     if result == "running":
         raise HTTPException(409, detail={"code": "WEIGHT_RUN_RUNNING", "message": "训练进行中，无法删除"})
     return Response(status_code=204)
+
+
+# 一键回测：路径多一段 /backtest，天然不与 GET/DELETE /{run_id} 冲突（weight-model-backtest-replay §三）。
+@router.post("/weight-models/{model_id}/runs/{run_id}/backtest")
+async def backtest_weight_run(model_id: int, run_id: int, body: WeightBacktestReq,
+                              session: AsyncSession = Depends(get_session)) -> dict:
+    """对某模型某条成功训练记录做一次性回测（不落库）：模型/记录缺失 404；非成功记录 409；成员漂移 400。"""
+    result = await service.backtest_run(
+        session, get_rest_client(), model_id, run_id,
+        start_ts=body.startTs, end_ts=body.endTs, initial_capital=body.initialCapital,
+        fees=body.fees, slippage=body.slippage, leverage=body.leverage, max_bars=body.maxBars)
+    if result is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "权重模型或训练记录不存在"})
+    return result
 
 
 # ============================ 训练实时流（§5.4，抄 ws_paper） ============================

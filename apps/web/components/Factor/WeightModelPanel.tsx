@@ -12,7 +12,7 @@ import WeightTrainLive from "./WeightTrainLive";
 
 type View =
   | { kind: "list" }
-  | { kind: "detail"; modelId: number }
+  | { kind: "detail"; modelId: number; autoBacktestRunId?: number }   // autoBacktestRunId：卡片「回测」进入时自动回测该记录
   | { kind: "live"; target: WeightTrainTarget; seq: number }   // G-F10：seq 作 key 隔离每次实时训练实例
   | { kind: "editor"; editingId: number | null };
 
@@ -58,6 +58,7 @@ export default function WeightModelPanel() {
     ) : view.kind === "detail" ? (
       <WeightModelDetail
         modelId={view.modelId}
+        autoBacktestRunId={view.autoBacktestRunId}
         onBack={() => setView({ kind: "list" })}
         onTrain={enterTraining}
         trainRange={{ startTs: range.startTs, endTs: range.endTs }}
@@ -72,6 +73,9 @@ export default function WeightModelPanel() {
       <WeightModelList
         onTrain={enterTraining}
         onView={(model) => setView({ kind: "detail", modelId: model.id })}
+        onBacktest={(model) =>
+          setView({ kind: "detail", modelId: model.id, autoBacktestRunId: model.latestRunId ?? undefined })
+        }
         onEdit={(model) => setView({ kind: "editor", editingId: model.id })}
         onNew={() => setView({ kind: "editor", editingId: null })}
       />

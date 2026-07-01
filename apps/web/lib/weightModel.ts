@@ -102,6 +102,18 @@ export function sortModelsByUpdated(models: WeightModel[]): WeightModel[] {
   return [...models].sort((a, b) => b.updatedTs - a.updatedTs);
 }
 
+// 卡片「回测」按钮可用性单一口径：模型已完成至少一次成功训练（latestRunId 非空即指向一条成功记录，
+// repoint_weight_model 保证；成员漂移则 latestRunId 被作废置 null）。
+export function canBacktestModel(model: WeightModel): boolean {
+  return model.latestRunId != null;
+}
+
+// 详情回测区块可见性单一口径：复用 runToTrained(:311) 同款守卫（含 !run.weights 运行时防御，P2-7），
+// 失败 / 取消 / 进行中 / 空权重记录一律不可回测（绝不出空图误导）。
+export function runIsBacktestable(run: WeightTrainRun): boolean {
+  return run.status === "succeeded" && !!run.weights && Object.keys(run.weights).length > 0;
+}
+
 const METHOD_LABELS: Record<TrainMethod, string> = {
   linear: "线性岭回归",
   equal: "等权",
@@ -133,6 +145,8 @@ const CODE_LABELS: Record<string, string> = {
   WEIGHT_TRAIN_FAILED: "训练失败",
   WEIGHT_TRAIN_BUSY: "并发训练已达上限，请稍后重试",
   WEIGHT_RUN_RUNNING: "训练进行中，请先取消训练",
+  WEIGHT_RUN_NOT_BACKTESTABLE: "该训练记录不可回测（未成功或缺权重 / 归一化契约），请改用成功记录",
+  FACTOR_WEIGHTS_STALE: "成员已变化，训练权重已失效，请重新训练后回测",
   OKX_UNREACHABLE: "行情服务不可达，请稍后重试",
   EMPTY_RANGE: "所选区间内没有已确认的行情，请调整日期段",
   FACTOR_TRAIN_TOO_LARGE: "训练区间过长，请缩短区间后重试",

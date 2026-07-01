@@ -8,10 +8,11 @@ import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import { ApiRequestError } from "@/lib/api";
 import { directionLabel, formatIc } from "@/lib/factor";
 import { fmtTime } from "@/lib/format";
-import { codeLabel, latestRun, methodLabel, runStatusLabel, runStatusTone, runToTrained } from "@/lib/weightModel";
+import { codeLabel, latestRun, methodLabel, runIsBacktestable, runStatusLabel, runStatusTone, runToTrained } from "@/lib/weightModel";
 import { weightModelApi } from "@/lib/weightModelApi";
 import type { WeightModel, WeightTrainRun } from "@/lib/weightModelTypes";
 import TrainingCurveChart from "./TrainingCurveChart";
+import WeightBacktestPanel from "./WeightBacktestPanel";
 import WeightBars from "./WeightBars";
 
 const RUNS_PAGE = 50;   // G-F3：历史记录分页步长（避免重度训练模型一次性渲染数百行）
@@ -22,11 +23,13 @@ const RUNS_PAGE = 50;   // G-F3：历史记录分页步长（避免重度训练�
  */
 export default function WeightModelDetail({
   modelId,
+  autoBacktestRunId,
   onBack,
   onTrain,
   trainRange,
 }: {
   modelId: number;
+  autoBacktestRunId?: number;   // 卡片「回测」进入时自动选中并回测该记录（P1-2）；查看 / 训练入口缺省不传
   onBack: () => void;
   onTrain: (model: WeightModel) => void;
   trainRange?: { startTs: number; endTs: number };   // G-F7：训练新版本将用的工作台时间窗（panel 注入；缺省不显）
@@ -58,7 +61,12 @@ export default function WeightModelDetail({
     }
   };
 
-  // 默认选中最近一次记录（含未成功，便于看失败原因）。
+  // 卡片「回测」进入：以 autoBacktestRunId 播种选中记录（先于默认最近记录，P1-2）。
+  useEffect(() => {
+    if (autoBacktestRunId != null) setSelectedRunId(autoBacktestRunId);
+  }, [autoBacktestRunId]);
+
+  // 默认选中最近一次记录（含未成功，便于看失败原因）；autoBacktestRunId 已播种时 selectedRunId 非空即跳过。
   useEffect(() => {
     if (selectedRunId == null && runs.data && runs.data.length > 0) {
       setSelectedRunId(latestRun(runs.data)?.id ?? null);
@@ -126,7 +134,9 @@ export default function WeightModelDetail({
         onLoadMore={() => setLimit((l) => l + RUNS_PAGE)}
       />
 
-      {selectedRunId != null && <RunReplay modelId={modelId} runId={selectedRunId} />}
+      {selectedRunId != null && (
+        <RunReplay modelId={modelId} runId={selectedRunId} autoBacktestRunId={autoBacktestRunId} />
+      )}
 
       <ConfirmDialog
         open={pendingDeleteRunId != null}
@@ -241,7 +251,15 @@ function RunHistoryTable({
   );
 }
 
-function RunReplay({ modelId, runId }: { modelId: number; runId: number }) {
+function RunReplay({
+  modelId,
+  runId,
+  autoBacktestRunId,
+}: {
+  modelId: number;
+  runId: number;
+  autoBacktestRunId?: number;
+}) {
   const run = useQuery({
     queryKey: ["weight-models", modelId, "runs", runId],
     queryFn: () => weightModelApi.run(modelId, runId),
@@ -284,6 +302,10 @@ function RunReplay({ modelId, runId }: { modelId: number; runId: number }) {
           </div>
           <WeightBars weights={data.weights} />
         </div>
+      )}
+      {/* 「学习曲线回放」下方的 K 线回测区块：仅可回测记录渲染（失败 / 取消 / 空权重经门禁上方已早退，绝不出空图）。 */}
+      {runIsBacktestable(data) && (
+        <WeightBacktestPanel modelId={modelId} runId={runId} autoRun={runId === autoBacktestRunId} />
       )}
     </div>
   );

@@ -2,7 +2,7 @@
 // 复用 api.ts 的 ApiRequestError 与同款错误解包（与 factorApi 同范式）。
 import { ApiRequestError } from "./api";
 import type { FactorMember, TrainMethod } from "./factorTypes";
-import type { WeightModel, WeightTrainRun } from "./weightModelTypes";
+import type { WeightBacktestResult, WeightModel, WeightTrainRun } from "./weightModelTypes";
 
 const BASE = "/api/py";
 
@@ -75,6 +75,17 @@ export interface WeightTrainStartResult {
   modelId: number;
 }
 
+// 一键回测入参（全部可选）：区间缺省回落训练区间；成本缺省回落后端 settings；maxBars 超限静默钳制。
+export interface WeightBacktestBody {
+  startTs?: number;
+  endTs?: number;
+  initialCapital?: number;
+  fees?: number;
+  slippage?: number;
+  leverage?: number;
+  maxBars?: number;
+}
+
 export const weightModelApi = {
   list: (enabled?: boolean) =>
     request<WeightModel[]>(`/weight-models${enabled != null ? `?enabled=${enabled}` : ""}`),
@@ -96,6 +107,12 @@ export const weightModelApi = {
     request<WeightTrainRun>(`/weight-models/${id}/runs/${runId}`),
   removeRun: (id: number, runId: number) =>
     request<void>(`/weight-models/${id}/runs/${runId}`, { method: "DELETE" }),
+
+  backtest: (modelId: number, runId: number, body?: WeightBacktestBody) =>
+    request<WeightBacktestResult>(`/weight-models/${modelId}/runs/${runId}/backtest`, {
+      method: "POST",
+      body: JSON.stringify(body ?? {}),
+    }),
 
   train: (body: WeightTrainStartBody) =>
     request<WeightTrainStartResult>("/weight-models/train", {

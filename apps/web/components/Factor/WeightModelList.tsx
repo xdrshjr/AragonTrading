@@ -7,7 +7,7 @@ import { Badge, Button, Switch } from "@/components/ui";
 import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import { formatIc } from "@/lib/factor";
 import { fmtTime } from "@/lib/format";
-import { methodLabel, runStatusLabel, runStatusTone, sortModelsByUpdated } from "@/lib/weightModel";
+import { canBacktestModel, methodLabel, runStatusLabel, runStatusTone, sortModelsByUpdated } from "@/lib/weightModel";
 import { weightModelApi } from "@/lib/weightModelApi";
 import type { WeightModel } from "@/lib/weightModelTypes";
 
@@ -20,11 +20,13 @@ import type { WeightModel } from "@/lib/weightModelTypes";
 export default function WeightModelList({
   onTrain,
   onView,
+  onBacktest,
   onEdit,
   onNew,
 }: {
   onTrain: (model: WeightModel) => void;
   onView: (model: WeightModel) => void;
+  onBacktest: (model: WeightModel) => void;
   onEdit: (model: WeightModel) => void;
   onNew: () => void;
 }) {
@@ -93,6 +95,7 @@ export default function WeightModelList({
               deleting={remove.isPending && remove.variables === model.id}
               onTrain={() => onTrain(model)}
               onView={() => onView(model)}
+              onBacktest={() => onBacktest(model)}
               onEdit={() => onEdit(model)}
               onDelete={() => setPendingDelete(model)}
             />
@@ -123,6 +126,7 @@ function ModelCard({
   deleting,
   onTrain,
   onView,
+  onBacktest,
   onEdit,
   onDelete,
 }: {
@@ -130,11 +134,13 @@ function ModelCard({
   deleting: boolean;
   onTrain: () => void;
   onView: () => void;
+  onBacktest: () => void;
   onEdit: () => void;
   onDelete: () => void;
 }) {
   const latest = model.latestRun;
   const isRunning = latest?.status === "running";   // G-F10：在跑模型禁「训练」，杜绝重叠 run
+  const canBacktest = canBacktestModel(model);      // 至少一次成功训练（latestRunId 非空）方可回测
   return (
     <div className={clsx("card flex flex-col gap-2 p-3 transition-colors hover:border-[var(--accent-soft)]")}>
       <button type="button" onClick={onView} className="flex flex-col gap-1 text-left">
@@ -163,6 +169,8 @@ function ModelCard({
         <Button variant="primary" size="sm" disabled={isRunning}
           title={isRunning ? "该模型正在训练" : undefined} onClick={onTrain}>训练</Button>
         <Button variant="default" size="sm" onClick={onView}>查看</Button>
+        <Button variant="default" size="sm" disabled={!canBacktest}
+          title={canBacktest ? undefined : "请先完成一次成功训练"} onClick={onBacktest}>回测</Button>
         <Button variant="default" size="sm" onClick={onEdit}>编辑</Button>
         <Button variant="ghost" size="sm" disabled={deleting} onClick={onDelete}>
           {deleting ? "删除中..." : "删除"}

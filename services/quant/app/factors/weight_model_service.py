@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import json
+
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,12 +19,22 @@ from ..schemas import (
     WeightModelCreateReq,
     WeightModelUpdateReq,
     WeightTrainStartReq,
+    weight_backtest_out,
     weight_model_out,
     weight_train_run_out,
 )
 from .service import FactorWindow, _load_df  # noqa: F401  —— 复用进程内 K 线缓存（注册表，间接经 manager）
-from .specs import validate_members
+from .specs import apply_weights, assert_weights_cover, normalize_thresholds, validate_members
 from .weight_train_manager import JobSpec, get_weight_train_manager
+
+
+def _load_json(raw: str | None, fallback):
+    """JSON 字段安全解析（缺 / 空 / 坏 JSON 回落，与 schemas._load_json 同容错口径）。"""
+    try:
+        value = json.loads(raw) if raw else fallback
+    except (json.JSONDecodeError, TypeError):
+        return fallback
+    return value
 
 
 # ============================ 模型 CRUD ============================
@@ -107,6 +119,67 @@ async def get_run(session: AsyncSession, model_id: int, run_id: int) -> dict | N
 
 async def delete_run(session: AsyncSession, model_id: int, run_id: int) -> str:
     return await repo.delete_weight_run(session, model_id, run_id)
+
+
+# ============================ 一键回测（组装 factor_score 快照 → 复用既有回测链路，不落库，weight-model-backtest-replay §2.2） ============================
+async def backtest_run(session: AsyncSession, rest, model_id: int, run_id: int, *,
+                       start_ts: int | None = None, end_ts: int | None = None,
+                       initial_capital: float | None = None, fees: float | None = None,
+                       slippage: float | None = None, leverage: float | None = None,
+                       max_bars: int | None = None) -> dict | None:
+    """对某模型某条**成功训练记录**的权重做一次性回测（同步、不落库）。
+
+    把训练记录组装成 factor_score 自包含快照（成员 + 烘焙权重 + 归一化契约 + 阈值），局部 import 调
+    ``agent.services.run_factor_score_backtest`` 复用既有 ``run_backtest`` 链路，再 ``weight_backtest_out`` 打包。
+    区间缺省回落训练区间（样本内、确定性可复现）；``max_bars`` 由取数层静默钳制到 ``settings.backtest_max_bars``。
+
+    Returns:
+        ``{candles, trades, equity, metrics, meta}`` 打包体；模型或训练记录不存在 → ``None``（路由转 404）。
+
+    Raises:
+        HTTPException: 409 ``WEIGHT_RUN_NOT_BACKTESTABLE``（非 succeeded / 空权重 / 缺 normStats）；
+            400 ``FACTOR_WEIGHTS_STALE``（成员漂移，``assert_weights_cover``）；400 ``EMPTY_RANGE``（透传）。
+    """
+    model = await repo.get_weight_model(session, model_id)
+    if model is None:
+        return None
+    run = await repo.get_weight_run(session, model_id, run_id)
+    if run is None:
+        return None
+    weights = _load_json(run.weights_json, {})
+    norm_stats = _load_json(run.norm_stats_json, {})
+    if run.status != "succeeded" or not weights:
+        raise HTTPException(409, detail={
+            "code": "WEIGHT_RUN_NOT_BACKTESTABLE",
+            "message": "该训练记录未成功或未产出权重，无法回测，请改用一条成功的训练记录。"})
+    if not norm_stats:   # P2-9：极旧无 normStats 记录保守拒绝，杜绝归一化窗口与训练期漂移
+        raise HTTPException(409, detail={
+            "code": "WEIGHT_RUN_NOT_BACKTESTABLE",
+            "message": "该训练记录缺少归一化契约（normStats），请重新训练后再回测。"})
+
+    members = _load_json(model.members_json, [])
+    config = _load_json(model.config_json, {})
+    thresholds = normalize_thresholds(config.get("thresholds") if isinstance(config, dict) else None)
+    # 令阈值窗口与训练 normStats 自洽（冗余保险，resolve_norm_contract 本就优先 normStats.normWindow，P2-4）。
+    if norm_stats.get("normWindow") is not None:
+        thresholds["normWindow"] = norm_stats["normWindow"]
+    assert_weights_cover(members, {"weights": weights})   # 成员漂移 → 400 FACTOR_WEIGHTS_STALE
+    baked = apply_weights(members, weights)               # 权重烘焙进各成员 weight（自包含新式快照）
+    params = {"members": baked, "thresholds": thresholds, "normStats": norm_stats}
+
+    range_start = start_ts if start_ts is not None else run.start_ts
+    range_end = end_ts if end_ts is not None else run.end_ts
+
+    from ..agent import services as bt_services   # 局部 import 破潜在装载期环（方向本单向，加固仿 factor_score 延迟 import）
+    candles, result, costs = await bt_services.run_factor_score_backtest(
+        session, rest, params=params, inst_id=run.inst_id, bar=run.bar,
+        start_ts=range_start, end_ts=range_end, initial_capital=initial_capital, fees=fees,
+        slippage=slippage, leverage=leverage, limit=max_bars)
+    meta = {
+        "instId": run.inst_id, "bar": run.bar, "startTs": range_start, "endTs": range_end,
+        "horizon": run.horizon, "effectiveCandleCount": len(candles), "initialCapital": costs[0],
+    }
+    return weight_backtest_out(candles, result, meta=meta)
 
 
 # ============================ 训练启动（守门优先 → 去重解析 → 落库 → 注册作业，R-01/R-02） ============================

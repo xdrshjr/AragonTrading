@@ -145,6 +145,42 @@ def _resolve_costs(settings, initial_capital, fees, slippage, leverage) -> tuple
     )
 
 
+async def run_factor_score_backtest(session: AsyncSession, rest, *, params: dict, inst_id: str,
+                                    bar: str, start_ts: int, end_ts: int,
+                                    initial_capital: float | None = None, fees: float | None = None,
+                                    slippage: float | None = None, leverage: float | None = None,
+                                    limit: int | None = None) -> tuple:
+    """内联 factor_score 自包含快照的一次性回测编排（**不落库**，weight-model-backtest-replay §2.2）。
+
+    以组装好的 ``params``（members + 烘焙权重 + thresholds + normStats）实例化 factor_score 策略，在
+    ``[start_ts, end_ts]`` 真实区间跑一次 ``run_backtest``（``htf_frames={}``，factor_score 无高周期）。绝不写
+    ``strategy_runs`` / ``trades`` / ``equity_points``，也不污染 seed 的 factor_score builtin 运行历史。
+
+    Args:
+        params: factor_score 快照 ``{members, thresholds, normStats}``；与既有回测同一打分链路消费。
+        limit: 取数根数安全上限（``load_range_candles`` 内再被 ``settings.backtest_max_bars`` 二次钳制）。
+
+    Returns:
+        ``(candles, result, costs)``：区间已确认 K 线、``BacktestResult``、生效成本四元组，供调用方序列化。
+
+    Raises:
+        HTTPException: 400 EMPTY_RANGE —— 区间内无已确认 K 线（``load_range_candles`` 透传）。
+    """
+    icap, fee, slip, lev = _resolve_costs(get_settings(), initial_capital, fees, slippage, leverage)
+    cls = get_strategy_class("factor_score")
+    if cls is None:   # factor_score 为 builtin，注册表恒在；缺失属装载损坏，显式 500 而非 NoneType 崩
+        raise HTTPException(500, detail={"code": "FACTOR_TEMPLATE_MISSING",
+                                         "message": "因子组合得分模板未初始化"})
+    strategy = cls({**cls.meta.default_params, **params})
+    candles = await load_range_candles(rest, inst_id=inst_id, bar=bar, start_ts=start_ts,
+                                       end_ts=end_ts, max_bars=limit)
+    await repo.upsert_candles(session, inst_id, bar, candles)   # 仅暖进程内 K 线缓存（与既有回测一致）
+    result = await run_in_threadpool(
+        run_backtest, strategy, candles, bar, initial_capital=icap, taker_fee_bps=fee,
+        slippage_bps=slip, leverage=lev, htf_frames={})
+    return candles, result, (icap, fee, slip, lev)
+
+
 async def _prepare_strategy(session: AsyncSession, strategy_id: int,
                             params_override: dict | None):
     """取策略行 + 注册表类并实例化；未找到 / 模板失效抛显式 HTTPException。"""

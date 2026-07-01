@@ -1099,6 +1099,37 @@ def weight_model_out(row: WeightModel, *, latest_run: WeightTrainRun | None = No
     }
 
 
+def _bt_candle_out(candle) -> dict:
+    """内存态 Candle → 前端 ``{ts,o,h,l,c,vol}``（现网无命名 candle_out 助手，本轮新建，weight-model-backtest-replay P1-3）。"""
+    return {"ts": candle.ts, "o": candle.o, "h": candle.h, "l": candle.l, "c": candle.c, "vol": candle.vol}
+
+
+def _bt_trade_out(trade) -> dict:
+    """内存态 ``TradeRecord`` → ``Trade`` 打包体（镜像 ``trade_out`` 去掉 ORM 独有 ``id``/``run_id``/``explain_json``，P1-3）。"""
+    return {
+        "ts": trade.ts, "side": trade.side, "price": trade.price, "qty": trade.qty,
+        "fee": trade.fee, "pnl": trade.pnl, "positionAfter": trade.position_after,
+        "reason": trade.reason, "stopLossPct": trade.stop_loss_pct,
+        "takeProfitPct": trade.take_profit_pct, "maxHoldBars": trade.max_hold_bars,
+        "stopLossPrice": trade.stop_loss_price, "takeProfitPrice": trade.take_profit_price,
+    }
+
+
+def weight_backtest_out(candles: list, result, *, meta: dict) -> dict:
+    """权重模型一次性回测打包体：``candles/trades/equity/metrics/meta``（camelCase，不落库）。
+
+    ``equity`` 复用 ``equity_out``（内存态 ``EquityRecord`` 与 ORM ``EquityPoint`` 字段同名，P1-3）；``metrics``
+    透传 ``compute_metrics`` 的 7 键（含 ``avgPnl``，即便 ``MetricsCards`` 只显示 6，P2-6）。
+    """
+    return {
+        "candles": [_bt_candle_out(c) for c in candles],
+        "trades": [_bt_trade_out(t) for t in result.trades],
+        "equity": [equity_out(e) for e in result.equity_points],
+        "metrics": result.metrics,
+        "meta": meta,
+    }
+
+
 class WeightModelCreateReq(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     instId: str = Field(min_length=1, max_length=32)
@@ -1135,6 +1166,31 @@ class WeightTrainStartReq(_FactorRange):
     factorSetId: int | None = None
     name: str | None = Field(default=None, min_length=1, max_length=128)
     maxBars: int | None = Field(default=None, ge=10, le=200000)
+
+
+class WeightBacktestReq(BaseModel):
+    """权重模型某条成功训练记录的一次性回测入参（全部可选，weight-model-backtest-replay §四）。
+
+    ``startTs``/``endTs`` 须同现同缺（both-or-neither）且 ``startTs < endTs``，缺省回落训练区间；成本缺省
+    回落 ``settings``。``maxBars`` 超限由 service 静默钳制到 ``settings.backtest_max_bars``（默认 20000），
+    **不报 413**、不挪用训练码 ``FACTOR_TRAIN_TOO_LARGE``（语义不符，P2-5）。
+    """
+
+    startTs: int | None = Field(default=None, ge=0)
+    endTs: int | None = Field(default=None, ge=0)
+    initialCapital: float | None = Field(default=None, gt=0)
+    fees: float | None = Field(default=None, ge=0)
+    slippage: float | None = Field(default=None, ge=0)
+    leverage: float | None = Field(default=None, gt=0)
+    maxBars: int | None = Field(default=None, ge=10, le=200000)
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "WeightBacktestReq":
+        if (self.startTs is None) != (self.endTs is None):
+            raise ValueError("startTs and endTs must be provided together")
+        if self.startTs is not None and self.endTs is not None and self.startTs >= self.endTs:
+            raise ValueError("startTs must be less than endTs")
+        return self
 
 
 class ErrorBody(BaseModel):
