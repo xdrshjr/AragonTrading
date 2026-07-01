@@ -123,9 +123,11 @@ class Settings(BaseSettings):
     # ---- 权重模型工作区（weight-model-workspace §四/config，流式训练 + 模型管理）----
     # 字段名即环境变量名（MAX_WEIGHT_TRAIN_JOBS 等，大小写不敏感）。流式训练作业与 socket 解耦，
     # 故并发上限独立于同步训练护栏：超出即 429 WEIGHT_TRAIN_BUSY（守门优先，绝不先落库再拒，R-01）。
-    max_weight_train_jobs: int = Field(default=4, ge=1)        # 同时在跑的流式训练作业上限（R-01 429 守门）
-    weight_train_curve_steps: int = Field(default=6, ge=2)     # 扩样本学习曲线的 fraction 网格步数（末点恒 1.0）
-    weight_model_run_cap: int = Field(default=50, ge=1)        # 单模型训练记录上限；超出按时间剪枝且显式 log 丢弃数（R-05）
+    # G-B9：补 le 上限（宽松、远高于合理用值），仅拦截病态超大值——过高 curve_steps 膨胀缓冲 + WS 事件数，
+    # 过高 max_weight_train_jobs 抹掉保护性并发上限；默认值不变，既有部署不受影响。
+    max_weight_train_jobs: int = Field(default=4, ge=1, le=16)      # 同时在跑的流式训练作业上限（R-01 429 守门）
+    weight_train_curve_steps: int = Field(default=6, ge=2, le=20)   # 扩样本学习曲线的 fraction 网格步数（末点恒 1.0）
+    weight_model_run_cap: int = Field(default=50, ge=1, le=500)     # 单模型训练记录上限；超出按时间剪枝且显式 log（R-05）
 
     # ---- Agent（对话式 AI 助手）LLM 接入 (Agent Trading Copilot spec §3.1) ----
     # 字段名即环境变量名（AGENT_*，大小写不敏感）；密钥仅存后端，绝不下发前端 / 不入库 / 不进日志。

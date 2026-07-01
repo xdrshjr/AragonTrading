@@ -48,6 +48,7 @@ async def create_model(session: AsyncSession, req: WeightModelCreateReq) -> dict
     """手动新建模型（编辑器）：成员边界校验（400）→ bar 校验（400，H-B5）→ 落库 → 序列化。"""
     members = validate_members([m.model_dump() for m in req.members])
     _validate_bar(req.bar)
+    _validate_train_config(req.config or {})   # G-B10：手动建模型亦校验 config，杜绝非法 config 落库
     spec = repo.WeightModelSpec(
         name=req.name, inst_id=req.instId, bar=req.bar, members=members, method=req.method,
         config=req.config, horizon=req.horizon, source="manual",
@@ -60,6 +61,8 @@ async def update_model(session: AsyncSession, model_id: int, req: WeightModelUpd
     members = validate_members([m.model_dump() for m in req.members]) if req.members is not None else None
     if req.bar is not None:
         _validate_bar(req.bar)   # H-B5：手动改模型亦校验 bar 白名单
+    if req.config is not None:
+        _validate_train_config(req.config)   # G-B10：改模型 config 亦校验
     patch = repo.WeightModelPatch(
         name=req.name, inst_id=req.instId, bar=req.bar, members=members, method=req.method,
         config=req.config, horizon=req.horizon, notes=req.notes, enabled=req.enabled)
@@ -68,7 +71,22 @@ async def update_model(session: AsyncSession, model_id: int, req: WeightModelUpd
 
 
 async def delete_model(session: AsyncSession, model_id: int) -> str:
-    return await repo.delete_weight_model(session, model_id)
+    """删模型（G-B1/R-01）：真·在跑（manager 有非终态 job）→ ``"running"``（路由 409）；孤儿 running
+    （DB=running 但无在跑 job）→ 删除路径就地对账 ``failed`` + repoint 再删；否则直接既有级联删。
+
+    返回 ``"not_found"`` | ``"running"`` | ``"ok"``。
+    """
+    model = await repo.get_weight_model(session, model_id)
+    if model is None:
+        return "not_found"
+    running = await repo.list_weight_runs(session, model_id, status="running")
+    if running:
+        alive = get_weight_train_manager().active_run_ids()
+        if any(run.id in alive for run in running):
+            return "running"                                                # 真·在跑 → 409
+        await repo.fail_orphan_running_runs(session, model_id, alive=alive)  # 孤儿 → 就地对账 failed
+        await session.commit()
+    return await repo.delete_weight_model(session, model_id)                 # 已无 running → 既有级联删
 
 
 # ============================ 训练记录读 / 删 ============================
@@ -115,9 +133,9 @@ def _config_num(config: dict, key: str) -> float | None:
 
 
 def _validate_train_config(config: dict) -> None:
-    """边界校验 config 中**真实且出现**的 camelCase 键（H-B5/R-01）：仅 ``split∈(0,1)`` / ``l2≥0`` /
-    ``nEstimators``·``maxDepth`` 正整数；**不**校验 ``clip``（``clip≤0`` 是关闭裁剪的合法哨兵）、**不**要求
-    ``normWindow``（``causal_zscore`` 内已 ``max(_,2)`` 钳制）。全部可选、缺省合法。"""
+    """边界校验 config 中**真实且出现**的 camelCase 键（H-B5/R-01/G-B5）：``split∈(0,1)`` / ``l2≥0`` /
+    ``nEstimators``·``maxDepth``·``normWindow`` 正整数；``clip`` 仅断言可转数值（``clip≤0`` 是关闭裁剪的
+    合法哨兵，不限范围）。全部可选、缺省合法；非数值 / 越界在请求边界即 400，不漏到 ``_run`` 抛 ValueError。"""
     split = _config_num(config, "split")
     if split is not None and not (0.0 < split < 1.0):
         raise HTTPException(400, detail={
@@ -132,6 +150,12 @@ def _validate_train_config(config: dict) -> None:
             raise HTTPException(400, detail={
                 "code": "FACTOR_TRAIN_INVALID_CONFIG",
                 "message": f"{key} 须为正整数，收到：{config[key]!r}"})
+    nw = _config_num(config, "normWindow")       # G-B5：present 时须正整数（_run 对它做 int()，漏校验会落 FAILED）
+    if nw is not None and (nw != int(nw) or nw <= 0):
+        raise HTTPException(400, detail={
+            "code": "FACTOR_TRAIN_INVALID_CONFIG",
+            "message": f"normWindow 须为正整数，收到：{config['normWindow']!r}"})
+    _config_num(config, "clip")                  # G-B5：present 时仅断言可转数值（clip≤0 是关闭裁剪合法哨兵，不限范围）
 
 
 def _guard_range(window: FactorWindow) -> None:

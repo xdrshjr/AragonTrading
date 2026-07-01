@@ -125,6 +125,28 @@ export function phaseLabel(phase: TrainPhase): string {
   return PHASE_LABELS[phase] ?? phase;
 }
 
+// 错误码 → 友好中文（G-F6，落地迭代 2 标称未实装的 H-F9）；未知码回落原串（原始码可作 title tooltip 保留排障线索）。
+const CODE_LABELS: Record<string, string> = {
+  WEIGHT_TRAIN_INSUFFICIENT_SAMPLES: "样本不足，无法拟合权重（请缩短前瞻或加长区间）",
+  WEIGHT_TRAIN_INTERRUPTED: "训练在进程退出时被中断",
+  WEIGHT_TRAIN_CANCELLED: "训练已取消",
+  WEIGHT_TRAIN_FAILED: "训练失败",
+  WEIGHT_TRAIN_BUSY: "并发训练已达上限，请稍后重试",
+  WEIGHT_RUN_RUNNING: "训练进行中，请先取消训练",
+  OKX_UNREACHABLE: "行情服务不可达，请稍后重试",
+  EMPTY_RANGE: "所选区间内没有已确认的行情，请调整日期段",
+  FACTOR_TRAIN_TOO_LARGE: "训练区间过长，请缩短区间后重试",
+  FACTOR_TRAIN_INVALID_CONFIG: "训练参数非法",
+  FACTOR_INVALID_BAR: "不支持的周期",
+  CANCEL_TIMEOUT: "取消未确认，可重试或等待训练完成",
+  CANCEL_FAILED: "取消请求失败，可重试",
+};
+
+export function codeLabel(code: string | null | undefined): string {
+  if (!code) return "未知错误";
+  return CODE_LABELS[code] ?? code;
+}
+
 const STATUS_LABELS: Record<WeightRunStatus, string> = {
   running: "训练中",
   succeeded: "成功",

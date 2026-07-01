@@ -79,12 +79,30 @@ def test_validate_config_rejects_real_keys_out_of_range():
 
 
 def test_validate_config_keeps_clip_sentinel_and_ignores_norm_window():
-    # clip<=0 是「关闭裁剪」的合法哨兵，绝不被拒；normWindow 不校验；缺省 / 合法值全过。
+    # clip<=0 是「关闭裁剪」的合法哨兵，绝不被拒；normWindow 正整数过；缺省 / 合法值全过。
     _validate_train_config({"clip": 0})
     _validate_train_config({"clip": -4.0})
     _validate_train_config({"normWindow": 1})
     _validate_train_config({})
     _validate_train_config({"split": 0.7, "l2": 1.0, "nEstimators": 100, "maxDepth": 6})
+
+
+def test_validate_config_rejects_non_numeric_norm_window_and_clip():
+    """G-B5：normWindow/clip 非数值、normWindow≤0 / 非整数 → 400（不再漏到 _run 抛 ValueError 落 FAILED）。"""
+    for bad in ({"normWindow": "x"}, {"clip": "x"}, {"normWindow": 0},
+                {"normWindow": -5}, {"normWindow": 1.5}):
+        with pytest.raises(HTTPException) as ei:
+            _validate_train_config(bad)
+        assert ei.value.status_code == 400
+        assert ei.value.detail["code"] == "FACTOR_TRAIN_INVALID_CONFIG"
+
+
+def test_validate_config_accepts_clip_sentinel_and_missing_norm_window():
+    """G-B5：clip≤0（合法哨兵）与缺省 normWindow 绝不被拒。"""
+    _validate_train_config({"clip": -1})
+    _validate_train_config({"clip": 0})
+    _validate_train_config({"normWindow": 200})
+    _validate_train_config({})
 
 
 # ---------------- 守门序与端到端（R-04 / H-T5） ----------------
@@ -115,6 +133,29 @@ async def test_invalid_config_400_zero_side_effect():
         assert ei.value.status_code == 400 and ei.value.detail["code"] == "FACTOR_TRAIN_INVALID_CONFIG"
         async with sm() as s:
             assert await wms.list_models(s) == []
+    finally:
+        await dispose_engine()
+
+
+async def test_create_update_model_validate_config_400():
+    """G-B10：手动建 / 改模型亦校验 config（如 split:5）→ 400，绝不让非法 config 落库。"""
+    from app.schemas import WeightModelCreateReq, WeightModelUpdateReq
+    sm = await _fresh()
+    try:
+        async with sm() as s:
+            with pytest.raises(HTTPException) as ei:
+                await wms.create_model(s, WeightModelCreateReq(
+                    name="非法config", instId="BTC-USDT-SWAP", bar="1H",
+                    members=_MEMBERS, method="linear", config={"split": 5}))
+            assert ei.value.status_code == 400 and ei.value.detail["code"] == "FACTOR_TRAIN_INVALID_CONFIG"
+            # 合法 config 建模型成功，再以非法 config PUT → 400。
+            created = await wms.create_model(s, WeightModelCreateReq(
+                name="合法", instId="BTC-USDT-SWAP", bar="1H", members=_MEMBERS, method="linear"))
+            with pytest.raises(HTTPException) as ei2:
+                await wms.update_model(s, created["id"], WeightModelUpdateReq(config={"normWindow": "x"}))
+            assert ei2.value.detail["code"] == "FACTOR_TRAIN_INVALID_CONFIG"
+        async with sm() as s:
+            assert all(m["name"] != "非法config" for m in await wms.list_models(s))
     finally:
         await dispose_engine()
 

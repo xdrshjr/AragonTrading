@@ -23,6 +23,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 
 from ..config import get_settings
@@ -134,6 +135,8 @@ class _TrainJob:
     # ---------- 训练协程 ----------
     async def _run(self) -> None:
         spec = self._spec
+        logger.info("weight run %d 启动流式训练：method=%s inst=%s bar=%s",   # G-B8：启动可观测
+                    self.run_id, spec.method, spec.window.inst_id, spec.window.bar)
         try:
             self._push({"type": "run", "data": {
                 "runId": self.run_id, "modelId": self.model_id, "status": "running"}})
@@ -153,6 +156,9 @@ class _TrainJob:
             await self._fit_and_finalize(matrix, label, names, norm)
         except OKXError as exc:
             await self._fail("OKX_UNREACHABLE", exc.message)
+        except HTTPException as exc:               # G-B2：数据加载层 HTTPException（如 EMPTY_RANGE）如实分类，
+            code, message = _http_detail(exc)      # 不再吞成 WEIGHT_TRAIN_FAILED + dict repr 外泄。
+            await self._fail(code, message)
         except asyncio.CancelledError:
             await self._finalize_cancelled()
             raise
@@ -205,6 +211,9 @@ class _TrainJob:
             "metrics": result.metrics, "trainerVersion": result.trainerVersion,
             "note": result.note, "provenance": provenance}})
         self._push({"type": "done", "data": {"runId": self.run_id, "finishedTs": _now()}})
+        logger.info("weight run %d 训练完成 succeeded：method=%s backend=%s nTrain=%s",   # G-B8
+                    self.run_id, result.method, result.trainerVersion,
+                    (result.metrics or {}).get("nTrain"))
 
     async def _finalize_cancelled(self) -> None:
         if self.is_terminal:
@@ -213,6 +222,7 @@ class _TrainJob:
             status="cancelled", finished_ts=_now(), error_code="WEIGHT_TRAIN_CANCELLED",
             error_message="用户取消训练。"))
         self._push({"type": "cancelled", "data": {"runId": self.run_id, "finishedTs": _now()}})
+        logger.info("weight run %d 训练已取消 cancelled", self.run_id)   # G-B8
 
     async def _fail(self, code: str, message: str) -> None:
         if self.is_terminal:
@@ -220,6 +230,7 @@ class _TrainJob:
         await self._persist(repo.WeightRunOutcome(
             status="failed", finished_ts=_now(), error_code=code, error_message=message))
         self._push({"type": "error", "data": {"code": code, "message": message, "runId": self.run_id}})
+        logger.info("weight run %d 训练失败 failed：code=%s", self.run_id, code)   # G-B8
 
     async def _persist(self, outcome: repo.WeightRunOutcome) -> bool:
         """落终态记录（**尽力而为、绝不抛**）+ 维护模型指针；H-B1/R-02：失败先有界重试一次，仍失败则记错放弃。
@@ -262,6 +273,14 @@ def _now() -> int:
     return int(time.time())
 
 
+def _http_detail(exc: HTTPException) -> tuple[str, str]:
+    """从 ``HTTPException.detail`` 安全提取 ``(code, message)``（detail 可为统一错误 dict 或裸 str），G-B2。"""
+    detail = exc.detail
+    if isinstance(detail, dict):
+        return str(detail.get("code", "WEIGHT_TRAIN_FAILED")), str(detail.get("message", ""))
+    return "WEIGHT_TRAIN_FAILED", str(detail)
+
+
 class WeightTrainManager:
     """流式训练作业注册表（进程内单例，job-capped，lifespan 关闭）。"""
 
@@ -272,6 +291,10 @@ class WeightTrainManager:
 
     def active_count(self) -> int:
         return sum(1 for job in self._jobs.values() if job.status == "running")
+
+    def active_run_ids(self) -> set[int]:
+        """当前**非终态**作业（真·在跑）的 ``run_id`` 集（G-B1/R-01：删模型守门借此区分真·在跑 vs 孤儿）。"""
+        return {job.run_id for job in self._jobs.values() if not job.is_terminal}
 
     def reserve(self) -> bool:
         """同步、无 await 预占一个并发名额（H-B3）：守门即占名额，杜绝 ``active_count`` 判定到注册之间的 TOCTOU。
@@ -294,8 +317,12 @@ class WeightTrainManager:
         self._prune_finished()
         job = _TrainJob(uuid.uuid4().hex, spec, clock=self._clock)
         self._jobs[job.job_id] = job
-        self.release()                       # 预占转为 running 计数（job.status=="running" 即被 active_count 计入）
-        job.start()
+        try:
+            self.release()                   # 预占转为 running 计数（job.status=="running" 即被 active_count 计入）
+            job.start()
+        except Exception:                    # G-B6：半注册自愈——start() 罕见抛（无事件循环）则回滚注册，
+            self._jobs.pop(job.job_id, None)  # 杜绝永不终态的幽灵 running 计入 active_count。
+            raise
         return job
 
     def get(self, job_id: str) -> _TrainJob | None:

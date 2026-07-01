@@ -26,7 +26,7 @@ import {
   type TrainMethod,
   type TrainResult,
 } from "@/lib/factorTypes";
-import { buildTrainTarget, weightResultToTrained } from "@/lib/weightModel";
+import { buildTrainTarget, methodLabel, weightResultToTrained } from "@/lib/weightModel";
 import { useAppStore } from "@/lib/store";
 import MemberPalette from "./MemberPalette";
 import WeightBars from "./WeightBars";
@@ -423,12 +423,13 @@ export default function FactorSetBuilder() {
         <div className="card flex flex-col gap-3 p-3">
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-sm font-semibold text-[var(--text)]">训练结果</span>
-            <Badge tone="accent">{method}</Badge>
+            {/* G-F8：与直播 ResultSummary 同口径——方法本地化、「训练样本 / 验证样本」本地化（去原始 key / n_train）。 */}
+            <Badge tone="accent">{methodLabel(method)}</Badge>
             {trained.trainerVersion && <Badge tone="neutral">{trained.trainerVersion}</Badge>}
             <Badge tone="neutral">样本内 IC {formatIc(trained.metrics.icIn)}</Badge>
             <Badge tone="neutral">样本外 IC {formatIc(trained.metrics.icOut)}</Badge>
             <span className="text-[11px] text-[var(--muted)]">
-              n_train {trained.metrics.nTrain} · n_valid {trained.metrics.nValid}
+              训练样本 {trained.metrics.nTrain} · 验证样本 {trained.metrics.nValid}
             </span>
           </div>
           {overfit && <p className="text-[11px] font-medium text-[var(--short)]">{overfit}</p>}
@@ -467,7 +468,7 @@ export default function FactorSetBuilder() {
       {blockReason && !memberError && (
         <p className="text-[11px] text-[var(--muted)]">{blockReason}</p>
       )}
-      {notice && <p className="text-[11px] font-medium text-[var(--accent)]">{notice}</p>}
+      {notice && <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--accent)]">{notice}</p>}
       {(save.isError || update.isError || updateStrategy.isError) && (
         <p className="text-[11px] text-[var(--short)]">
           操作失败：

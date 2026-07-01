@@ -5,13 +5,16 @@ import clsx from "clsx";
 import { useEffect, useState } from "react";
 import { Badge, Button } from "@/components/ui";
 import ConfirmDialog from "@/components/ui/ConfirmDialog";
+import { ApiRequestError } from "@/lib/api";
 import { directionLabel, formatIc } from "@/lib/factor";
 import { fmtTime } from "@/lib/format";
-import { latestRun, methodLabel, runStatusLabel, runStatusTone, runToTrained } from "@/lib/weightModel";
+import { codeLabel, latestRun, methodLabel, runStatusLabel, runStatusTone, runToTrained } from "@/lib/weightModel";
 import { weightModelApi } from "@/lib/weightModelApi";
 import type { WeightModel, WeightTrainRun } from "@/lib/weightModelTypes";
 import TrainingCurveChart from "./TrainingCurveChart";
 import WeightBars from "./WeightBars";
+
+const RUNS_PAGE = 50;   // G-F3：历史记录分页步长（避免重度训练模型一次性渲染数百行）
 
 /**
  * 权重模型详情：概要（成员 / 方法 / 最佳验证 IC）+ 历史训练记录表（状态 / 方法 / 区间 / IC / 时间）+
@@ -21,22 +24,38 @@ export default function WeightModelDetail({
   modelId,
   onBack,
   onTrain,
+  trainRange,
 }: {
   modelId: number;
   onBack: () => void;
   onTrain: (model: WeightModel) => void;
+  trainRange?: { startTs: number; endTs: number };   // G-F7：训练新版本将用的工作台时间窗（panel 注入；缺省不显）
 }) {
   const qc = useQueryClient();
+  const [limit, setLimit] = useState(RUNS_PAGE);   // G-F3：分页 limit
   const model = useQuery({ queryKey: ["weight-models", modelId], queryFn: () => weightModelApi.get(modelId) });
-  const runs = useQuery({ queryKey: ["weight-models", modelId, "runs"], queryFn: () => weightModelApi.runs(modelId) });
+  const runs = useQuery({
+    queryKey: ["weight-models", modelId, "runs", { limit }],
+    queryFn: () => weightModelApi.runs(modelId, { limit }),
+    // G-F2：任一记录 running 时轮询刷新（4s）——打开他处发起训练的模型也能实时更新，否则永久停在「训练中」。
+    refetchInterval: (q) => (q.state.data?.some((r) => r.status === "running") ? 4000 : false),
+  });
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null);
   const [pendingDeleteRunId, setPendingDeleteRunId] = useState<number | null>(null);   // H-F8：应用内确认
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);   // G-F4：删除失败应用内提示
 
   const deleteRun = async (runId: number) => {
-    await weightModelApi.removeRun(modelId, runId);
-    if (selectedRunId === runId) setSelectedRunId(null);
-    void qc.invalidateQueries({ queryKey: ["weight-models", modelId] });
-    void qc.invalidateQueries({ queryKey: ["weight-models", modelId, "runs"] });
+    try {
+      await weightModelApi.removeRun(modelId, runId);
+      if (selectedRunId === runId) setSelectedRunId(null);
+      void qc.invalidateQueries({ queryKey: ["weight-models", modelId] });
+      void qc.invalidateQueries({ queryKey: ["weight-models", modelId, "runs"] });
+      void qc.invalidateQueries({ queryKey: ["weight-models"] });   // G-F4：覆盖列表键，删最佳 / 最近 run 后卡片即时更新
+    } catch (err) {
+      // G-F4：删除失败（如 409 训练中）给应用内提示，绝不静默吞错。
+      const code = (err as ApiRequestError)?.code;
+      setDeleteNotice(code === "WEIGHT_RUN_RUNNING" ? "训练进行中，请先取消训练" : codeLabel(code));
+    }
   };
 
   // 默认选中最近一次记录（含未成功，便于看失败原因）。
@@ -58,7 +77,13 @@ export default function WeightModelDetail({
           <span className="text-sm font-semibold text-[var(--text)]">{model.data?.name ?? "模型详情"}</span>
           {model.data && <Badge tone="accent">{methodLabel(model.data.method)}</Badge>}
         </div>
-        <Button variant="primary" size="sm" disabled={!model.data} onClick={() => model.data && onTrain(model.data)}>训练新版本</Button>
+        <div className="flex items-center gap-2">
+          {/* G-F7：呈现「训练新版本」将采用的工作台时间窗，便于用户核对日期段。 */}
+          {trainRange && (
+            <span className="text-[11px] text-[var(--muted)]">区间 {fmtTime(trainRange.startTs)} – {fmtTime(trainRange.endTs)}</span>
+          )}
+          <Button variant="primary" size="sm" disabled={!model.data} onClick={() => model.data && onTrain(model.data)}>训练新版本</Button>
+        </div>
       </div>
 
       {model.data && (
@@ -82,6 +107,12 @@ export default function WeightModelDetail({
         </div>
       )}
 
+      {deleteNotice && (
+        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short)]">
+          删除失败：{deleteNotice}
+        </p>
+      )}
+
       <RunHistoryTable
         runs={runs.data ?? []}
         loading={runs.isPending}
@@ -91,6 +122,8 @@ export default function WeightModelDetail({
         selectedId={selectedRunId}
         onSelect={setSelectedRunId}
         onRequestDelete={setPendingDeleteRunId}
+        hasMore={(runs.data?.length ?? 0) >= limit}
+        onLoadMore={() => setLimit((l) => l + RUNS_PAGE)}
       />
 
       {selectedRunId != null && <RunReplay modelId={modelId} runId={selectedRunId} />}
@@ -119,6 +152,8 @@ function RunHistoryTable({
   selectedId,
   onSelect,
   onRequestDelete,
+  hasMore,
+  onLoadMore,
 }: {
   runs: WeightTrainRun[];
   loading: boolean;
@@ -128,6 +163,8 @@ function RunHistoryTable({
   selectedId: number | null;
   onSelect: (id: number) => void;
   onRequestDelete: (id: number) => void;
+  hasMore?: boolean;
+  onLoadMore?: () => void;
 }) {
   if (loading) return <p className="py-6 text-center text-[11px] text-[var(--muted)]">加载训练记录...</p>;
   // H-F1：加载失败显式为错误态（含重试），绝不渲染成「没有记录」空状态误导用户。
@@ -195,6 +232,11 @@ function RunHistoryTable({
           ))}
         </tbody>
       </table>
+      {hasMore && onLoadMore && (
+        <div className="flex justify-center border-t border-[var(--border)] p-2">
+          <Button variant="ghost" size="sm" onClick={onLoadMore}>加载更多</Button>
+        </div>
+      )}
     </div>
   );
 }
@@ -211,8 +253,9 @@ function RunReplay({ modelId, runId }: { modelId: number; runId: number }) {
   const data = run.data;
   if (data.status === "failed") {
     return (
-      <p className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] text-[var(--short)]">
-        该次训练失败（{data.errorCode ?? "ERROR"}）：{data.errorMessage ?? "无详情"}
+      // G-F6：错误码经 codeLabel 友好呈现，原始码作 title 保留排障线索。
+      <p role="alert" title={data.errorCode ?? undefined} className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] text-[var(--short)]">
+        该次训练失败（{codeLabel(data.errorCode)}）：{data.errorMessage ?? "无详情"}
       </p>
     );
   }

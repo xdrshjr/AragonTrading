@@ -76,8 +76,12 @@ async def update_weight_model(model_id: int, body: WeightModelUpdateReq,
 @router.delete("/weight-models/{model_id}", status_code=204)
 async def delete_weight_model(model_id: int,
                               session: AsyncSession = Depends(get_session)) -> Response:
-    if await service.delete_model(session, model_id) == "not_found":
+    result = await service.delete_model(session, model_id)
+    if result == "not_found":
         raise HTTPException(404, detail=_NOT_FOUND)
+    if result == "running":   # G-B1：真·在跑训练 → 409（镜像 delete_weight_run，恢复「训练中不可删」不变量）
+        raise HTTPException(409, detail={
+            "code": "WEIGHT_RUN_RUNNING", "message": "训练进行中，请先取消训练再删除模型"})
     return Response(status_code=204)
 
 
@@ -140,6 +144,10 @@ async def ws_weight_train(websocket: WebSocket, job_id: str) -> None:
                 await websocket.send_text(json.dumps({"type": "ping"}))
                 if job.is_terminal:
                     buf = job.snapshot()
+                    # G-B3：满队列若曾丢 result（权重载荷），关闭前补发最后一条 result（客户端 setResult 幂等覆盖）。
+                    last_result = next((e for e in reversed(buf) if e.get("type") == "result"), None)
+                    if last_result is not None:
+                        await websocket.send_text(json.dumps(last_result))
                     if buf and buf[-1].get("type") in _TERMINAL_TYPES:
                         await websocket.send_text(json.dumps(buf[-1]))
                     await websocket.close()

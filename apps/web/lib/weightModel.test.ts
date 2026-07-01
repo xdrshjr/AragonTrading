@@ -4,6 +4,8 @@ import {
   bestRun,
   buildTrainResult,
   buildTrainTarget,
+  codeLabel,
+  hasCurveData,
   latestRun,
   metricGeometry,
   modelToTrainTarget,
@@ -87,6 +89,39 @@ describe("metricGeometry", () => {
     const geom = metricGeometry([], "trainLoss", "validLoss", 100, 50);
     expect(geom.trainPath).toHaveLength(0);
     expect(geom.validPath).toHaveLength(0);
+  });
+
+  // G-T10：NaN / Infinity 与 null 同口径剔除（绝不画到非有限坐标，绝不补假点）。
+  it("treats NaN/Infinity values as missing (skipped, not plotted)", () => {
+    const curve = [
+      curvePoint({ step: 0, fraction: 0.2, validLoss: Number.NaN, trainLoss: 0.3 }),
+      curvePoint({ step: 1, fraction: 0.6, validLoss: Number.POSITIVE_INFINITY, trainLoss: 0.2 }),
+      curvePoint({ step: 2, fraction: 1.0, validLoss: 0.1, trainLoss: 0.05 }),
+    ];
+    const geom = metricGeometry(curve, "trainLoss", "validLoss", 100, 50);
+    expect(geom.validPath).toHaveLength(1);   // 仅末点有限
+    expect(Number.isFinite(geom.min) && Number.isFinite(geom.max)).toBe(true);
+    expect(geom.trainPath.every((p) => Number.isFinite(p.x) && Number.isFinite(p.y))).toBe(true);
+  });
+
+  it("hasCurveData ignores NaN/Infinity-only series", () => {
+    expect(hasCurveData([curvePoint({ trainLoss: Number.NaN, validLoss: Number.POSITIVE_INFINITY,
+      trainIc: Number.NaN, validIc: Number.NaN })])).toBe(false);
+    expect(hasCurveData([curvePoint({ validIc: 0.1 })])).toBe(true);
+  });
+});
+
+describe("codeLabel (G-F6)", () => {
+  it("maps known error codes to friendly Chinese labels", () => {
+    expect(codeLabel("EMPTY_RANGE")).toMatch(/已确认的行情/);
+    expect(codeLabel("WEIGHT_TRAIN_INSUFFICIENT_SAMPLES")).toMatch(/样本不足/);
+    expect(codeLabel("CANCEL_TIMEOUT")).toMatch(/取消未确认/);
+  });
+
+  it("falls back to the raw code for unknown codes and to a default for empty", () => {
+    expect(codeLabel("SOME_NEW_CODE")).toBe("SOME_NEW_CODE");   // 未知码回落原串
+    expect(codeLabel(null)).toBe("未知错误");
+    expect(codeLabel(undefined)).toBe("未知错误");
   });
 });
 

@@ -93,6 +93,15 @@ def _dump(value) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _norm(value) -> str:
+    """规范化序列化（键有序）——用于「spec 语义是否变更」判定（G-B4/R-02）。
+
+    ``_dump`` 无 ``sort_keys``，直接串比对会因键序差异把 no-op PUT 误判为变更而误清当前权重指针；
+    判定一律走本规范化比对，**仅改判定逻辑、不改落库写入**（落库仍用 ``_dump``，保字段写入口径不变）。
+    """
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
 def _valid_ic_of(run: WeightTrainRun) -> float | None:
     """某 run 的「验证 IC」= ``metrics.icOut``（样本外复合得分 IC，与 UI「样本外 IC」同口径）。"""
     try:
@@ -132,8 +141,15 @@ async def create_weight_model(session: AsyncSession, *, spec: WeightModelSpec) -
     return row
 
 
-def _apply_spec_refresh(row: WeightModel, spec: WeightModelSpec) -> None:
-    """复用模型时仅刷新训练规格（成员 / 方法 / 配置 / 标的 / 周期 / horizon / 来源链接），保留用户 name/notes/enabled。"""
+def _apply_spec_refresh(row: WeightModel, spec: WeightModelSpec) -> bool:
+    """复用模型时仅刷新训练规格（成员 / 方法 / 配置 / 标的 / 周期 / horizon / 来源链接），保留用户 name/notes/enabled。
+
+    返回 members/method/config 是否实际变更（G-B4/R-03：变更则调用方作废陈旧权重指针，与编辑路径同构）。
+    """
+    spec_changed = (
+        _norm(spec.members or []) != _norm(json.loads(row.members_json))
+        or spec.method != row.method
+        or _norm(spec.config or {}) != _norm(json.loads(row.config_json or "{}")))
     row.inst_id = spec.inst_id
     row.bar = spec.bar
     row.members_json = _dump(spec.members or [])
@@ -142,12 +158,19 @@ def _apply_spec_refresh(row: WeightModel, spec: WeightModelSpec) -> None:
     row.horizon = int(spec.horizon)
     if spec.factor_set_id is not None:
         row.factor_set_id = spec.factor_set_id
+    return spec_changed
 
 
 async def refresh_weight_model_spec(session: AsyncSession, row: WeightModel, *,
                                     spec: WeightModelSpec) -> WeightModel:
-    """以最新训练入参刷新已存模型的 spec（复用语义，R-02）并提交。"""
-    _apply_spec_refresh(row, spec)
+    """以最新训练入参刷新已存模型的 spec（复用语义，R-02）并提交。
+
+    G-B4/R-03：重训入参的 spec 一旦变更，立刻作废陈旧权重指针——避免「新成员 + 旧权重指针」在整个
+    异步训练时长内已提交且对外可见（详情 / 列表会读到旧权重卡）；新 run 落库后由 ``repoint`` 重指。
+    """
+    if _apply_spec_refresh(row, spec):
+        row.latest_run_id = None
+        row.best_valid_ic = None
     await session.commit()
     await session.refresh(row)
     return row
@@ -165,18 +188,23 @@ async def update_weight_model(session: AsyncSession, model_id: int, *,
     row = await session.get(WeightModel, model_id)
     if row is None:
         return None
+    spec_changed = False
+    # G-B4/R-02：仅 members/method/config **实际改动**（规范化比对，键序无关）才视为 spec 变更。
+    if patch.members is not None and _norm(patch.members) != _norm(json.loads(row.members_json)):
+        row.members_json = _dump(patch.members)
+        spec_changed = True
+    if patch.method is not None and patch.method != row.method:
+        row.method = patch.method
+        spec_changed = True
+    if patch.config is not None and _norm(patch.config) != _norm(json.loads(row.config_json or "{}")):
+        row.config_json = _dump(patch.config)
+        spec_changed = True
     if patch.name is not None:
         row.name = patch.name
     if patch.inst_id is not None:
         row.inst_id = patch.inst_id
     if patch.bar is not None:
         row.bar = patch.bar
-    if patch.members is not None:
-        row.members_json = _dump(patch.members)
-    if patch.method is not None:
-        row.method = patch.method
-    if patch.config is not None:
-        row.config_json = _dump(patch.config)
     if patch.horizon is not None:
         row.horizon = int(patch.horizon)
     if patch.notes is not None:
@@ -185,21 +213,29 @@ async def update_weight_model(session: AsyncSession, model_id: int, *,
         row.enabled = patch.enabled
     if patch.factor_set_id is not None:
         row.factor_set_id = patch.factor_set_id
+    if spec_changed:                  # G-B4：spec 一变旧权重对新成员失效 → 作废当前产物指针（历史 run 全保留）
+        row.latest_run_id = None
+        row.best_valid_ic = None
     await session.commit()
     await session.refresh(row)
     return row
 
 
 async def delete_weight_model(session: AsyncSession, model_id: int) -> str:
-    """删模型并**连带删其全部训练记录**（单事务）；返回 'ok' | 'not_found'。
+    """删模型并**连带删其全部训练记录**（单事务）；返回 'ok' | 'not_found' | 'running'。
 
     本机 SQLite 未开外键约束，先删 run 行再删 model 行与 ``factor_score`` 删除同口径，不因 FK 失败。
+
+    G-B1 防御纵深：仍有 ``running`` run → 返 ``"running"``（镜像 ``delete_weight_run``，使**直接 repo 调用**亦安全）。
+    service 层删除前已对账孤儿（``fail_orphan_running_runs``），故正常路径此兜底只对**真·在跑**触发。
     """
     row = await session.get(WeightModel, model_id)
     if row is None:
         return "not_found"
     runs = (await session.execute(
         select(WeightTrainRun).where(WeightTrainRun.model_id == model_id))).scalars().all()
+    if any(run.status == "running" for run in runs):
+        return "running"
     for run in runs:
         await session.delete(run)
     await session.delete(row)
@@ -328,6 +364,27 @@ async def delete_weight_run(session: AsyncSession, model_id: int, run_id: int) -
         await repoint_weight_model(session, model)
     await session.commit()
     return "ok"
+
+
+async def fail_orphan_running_runs(session: AsyncSession, model_id: int, *, alive: set[int]) -> int:
+    """删模型前 scoped 对账（G-B1/R-01）：某 model 的孤儿 running 行（``id`` 不在 ``alive`` 在跑集）置 ``failed``
+    并 ``repoint`` 指针；**不 commit**（调用方单事务内随删除一并提交，flush 即可）。返回对账条数。
+
+    仿 ``reconcile_dangling_weight_runs`` 但 scoped 到单 model + 仅孤儿（``alive`` 来自 ``manager.active_run_ids()``，
+    真·在跑 run 绝不误杀——真·在跑由 service 提前返 409）。
+    """
+    rows = (await session.execute(select(WeightTrainRun).where(
+        WeightTrainRun.model_id == model_id, WeightTrainRun.status == "running"))).scalars().all()
+    orphans = [r for r in rows if r.id not in alive]
+    for run in orphans:
+        run.status = "failed"
+        run.error_code = "WEIGHT_TRAIN_INTERRUPTED"
+        run.error_message = "训练作业已不在运行（删除前进程内对账改判）。"
+    if orphans:
+        model = await session.get(WeightModel, model_id)
+        if model is not None:
+            await repoint_weight_model(session, model)
+    return len(orphans)
 
 
 async def reconcile_dangling_weight_runs(session: AsyncSession) -> int:

@@ -193,6 +193,70 @@ async def test_factor_set_dedupe_reuses_model(patch_okx):
         await dispose_engine()
 
 
+class _GateRest(_FakeRest):
+    """``get_candles`` 阻塞在 gate 上（真·在跑作业卡在加载阶段，非终态 job 占住 run_id）。"""
+
+    def __init__(self):
+        self.entered = asyncio.Event()
+        self.gate = asyncio.Event()
+
+    async def get_candles(self, inst_id, bar, limit=300, before=None, after=None):
+        self.entered.set()
+        await self.gate.wait()
+        return await super().get_candles(inst_id, bar, limit=limit, before=before, after=after)
+
+
+async def test_delete_model_real_running_409_then_ok_after_terminal(monkeypatch):
+    """G-B1/R-01：真·在跑（manager 有非终态 job 含该 run_id）→ DELETE 409、模型 / run 仍在；run 终态后可删 204。"""
+    from app.db.session import dispose_engine
+    from app.factors import service as factor_service
+    gate = _GateRest()
+    monkeypatch.setattr("app.api.weight_models.get_rest_client", lambda: gate)
+    monkeypatch.setattr("app.api.factors.get_rest_client", lambda: gate)
+    factor_service.clear_candle_cache()
+    client = await _client()
+    try:
+        async with client:
+            started = (await client.post("/api/weight-models/train", json=_train_body())).json()
+            mid, rid = started["modelId"], started["runId"]
+            await asyncio.wait_for(gate.entered.wait(), timeout=3.0)   # 作业真·在跑（卡在加载）
+            r = await client.delete(f"/api/weight-models/{mid}")
+            assert r.status_code == 409 and r.json()["error"]["code"] == "WEIGHT_RUN_RUNNING"
+            assert (await client.get(f"/api/weight-models/{mid}")).status_code == 200   # 模型仍在
+            gate.gate.set()                                            # 放行 → 跑完 → run 终态
+            await _wait_run(client, mid, rid)
+            assert (await client.delete(f"/api/weight-models/{mid}")).status_code == 204   # 终态后可删
+            assert (await client.get(f"/api/weight-models/{mid}")).status_code == 404
+    finally:
+        await dispose_engine()
+
+
+async def test_delete_model_orphan_running_reconciles_then_deletes(patch_okx):
+    """G-B1/R-01：仅孤儿 running run（DB=running 但 manager 无在跑 job）→ DELETE 对账 failed 后 204 可删
+    （专防「孤儿致永久不可删」回归）。"""
+    from app.db import repositories as repo
+    from app.db.session import dispose_engine, get_sessionmaker
+    client = await _client()
+    try:
+        async with client:
+            created = (await client.post("/api/weight-models", json={
+                "name": "孤儿模型", "instId": "BTC-USDT-SWAP", "bar": "1H",
+                "members": _MEMBERS, "method": "linear"})).json()
+            mid = created["id"]
+            async with get_sessionmaker()() as s:   # DB 直插 running run，manager 无对应 job = 孤儿
+                run = await repo.add_weight_run(s, start=repo.WeightRunStart(
+                    model_id=mid, method="linear", inst_id="BTC-USDT-SWAP", bar="1H",
+                    start_ts=1, end_ts=2, horizon=6, config={}, started_ts=1))
+                rid = run.id
+            assert (await client.delete(f"/api/weight-models/{mid}")).status_code == 204   # 孤儿不卡 409
+            assert (await client.get(f"/api/weight-models/{mid}")).status_code == 404
+            # 删后随级联清（run 也不在）。
+            async with get_sessionmaker()() as s:
+                assert await repo.get_weight_run(s, mid, rid) is None
+    finally:
+        await dispose_engine()
+
+
 async def test_run_detail_404_and_list_404(patch_okx):
     from app.db.session import dispose_engine
     client = await _client()

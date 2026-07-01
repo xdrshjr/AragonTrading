@@ -218,6 +218,42 @@ async def test_ws_late_subscribe_replays_cancelled_terminal():
         await dispose_engine()
 
 
+async def test_ws_terminal_fallback_replays_dropped_result(monkeypatch):
+    """G-B3/G-T3：满队列丢 result（权重载荷）后，终态兜底路径在关闭前补发最后一条 result + 终态 done，
+    客户端仍拿到权重（``setResult`` 幂等覆盖，重投安全）。"""
+    from app.factors.service import FactorWindow
+    from app.factors.weight_train_manager import JobSpec, _TrainJob, get_weight_train_manager
+    await init_db()
+    try:
+        monkeypatch.setattr("app.api.weight_models._WS_HEARTBEAT_SECONDS", 0.05)
+        spec = JobSpec(run_id=1, model_id=1, rest=None, members=[], method="linear", config={},
+                       window=FactorWindow(inst_id="BTC-USDT-SWAP", bar="1H", start_ts=1, end_ts=2,
+                                           max_bars=None), horizon=6, run_cap=50, curve_steps=6)
+        job = _TrainJob("gb3-job", spec)
+        job._push({"type": "run", "data": {"runId": 1}})        # 非终态前缀缓冲（snapshot 不含终态）
+        get_weight_train_manager()._jobs["gb3-job"] = job
+
+        ws = _FakeWS()
+        task = asyncio.create_task(ws_weight_train(ws, "gb3-job"))
+        await asyncio.sleep(0.02)                                # WS 已发 snapshot、进入等待循环
+        sub_q = next(iter(job._subscribers))
+        while not sub_q.full():                                  # 填满该订阅者队列（无 await，原子）
+            sub_q.put_nowait({"type": "filler"})
+        job._push({"type": "result", "data": {                  # 队列满 → result/done 被 _push 丢弃
+            "method": "linear", "weights": {"mom_roc": 1.0}, "normStats": {}, "metrics": {},
+            "trainerVersion": None, "note": "", "provenance": {}}})
+        job._push({"type": "done", "data": {"runId": 1}})
+        job.status = "succeeded"                                 # 转终态 → 触发兜底分支
+        await asyncio.wait_for(task, timeout=5.0)
+        types = [e["type"] for e in ws.sent]
+        assert "result" in types and types[-1] == "done" and ws.closed
+        replayed = [e for e in ws.sent if e["type"] == "result"][-1]
+        assert replayed["data"]["weights"] == {"mom_roc": 1.0}  # 补发的 result 含权重载荷
+    finally:
+        get_weight_train_manager()._jobs.pop("gb3-job", None)
+        await dispose_engine()
+
+
 async def test_ws_heartbeat_ping_on_silence(monkeypatch):
     """H-B7：流式静默超 _WS_HEARTBEAT_SECONDS → 下发 ping 心跳（半开探测）。"""
     await init_db()

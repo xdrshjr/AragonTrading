@@ -51,7 +51,12 @@ function MetricPanel({
   const fmin = Math.min(...fracs);
   const fspan = Math.max(...fracs) - fmin || 1;
   const innerW = Math.max(1, WIDTH - PAD * 2);
+  const innerH = Math.max(1, HEIGHT - PAD * 2);
   const xAt = (i: number) => PAD + ((curve[i].fraction - fmin) / fspan) * innerW;
+  // RankIC 零基线参考线（增强）：仅当 0 落在值域内才画，便于一眼判别正 / 负 IC（损失面板无零基线意义）。
+  const isIc = validKey === "validIc";
+  const span = geom.max - geom.min || 1;
+  const zeroY = isIc && geom.min < 0 && geom.max > 0 ? PAD + innerH - ((0 - geom.min) / span) * innerH : null;
 
   return (
     <div className="flex flex-col gap-1">
@@ -72,6 +77,9 @@ function MetricPanel({
         <svg viewBox={`0 0 ${WIDTH} ${HEIGHT}`} className="h-auto w-full" role="img" aria-label={`${title}学习曲线`}>
           <text x={PAD} y={PAD + 8} className="fill-[var(--muted)]" fontSize={9}>{geom.max.toFixed(3)}</text>
           <text x={PAD} y={HEIGHT - PAD} className="fill-[var(--muted)]" fontSize={9}>{geom.min.toFixed(3)}</text>
+          {zeroY != null && (
+            <line x1={PAD} x2={WIDTH - PAD} y1={zeroY} y2={zeroY} stroke="var(--border)" strokeWidth={1} strokeDasharray="3 3" />
+          )}
           {trainPath && (
             <path d={trainPath} fill="none" stroke="var(--muted)" strokeWidth={1.4} strokeDasharray="4 3" strokeLinejoin="round" />
           )}

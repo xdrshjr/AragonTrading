@@ -13,7 +13,7 @@ import WeightTrainLive from "./WeightTrainLive";
 type View =
   | { kind: "list" }
   | { kind: "detail"; modelId: number }
-  | { kind: "live"; target: WeightTrainTarget }
+  | { kind: "live"; target: WeightTrainTarget; seq: number }   // G-F10：seq 作 key 隔离每次实时训练实例
   | { kind: "editor"; editingId: number | null };
 
 /**
@@ -26,6 +26,7 @@ export default function WeightModelPanel() {
   const setWeightTrainTarget = useAppStore((s) => s.setWeightTrainTarget);
   const [view, setView] = useState<View>({ kind: "list" });
   const consumedRef = useRef<WeightTrainTarget | null>(null);
+  const liveSeq = useRef(0);   // G-F10：每次进入实时训练自增，作 WeightTrainLive 的 key（按 target 隔离实例）
 
   // 消费交接载荷：挂载 / 载荷变化时第一时间清空 store 并切到实时训练（一次性 + 防重入，模式同 factorEditTarget）。
   useEffect(() => {
@@ -33,12 +34,12 @@ export default function WeightModelPanel() {
     if (!target || consumedRef.current === target) return;
     consumedRef.current = target;
     setWeightTrainTarget(null);
-    setView({ kind: "live", target });
+    setView({ kind: "live", target, seq: ++liveSeq.current });
   }, [weightTrainTarget, setWeightTrainTarget]);
 
   const range = { instId: wb.instId, bar: wb.bar, startTs: wb.startTs, endTs: wb.endTs };
   const enterTraining = (model: WeightModel) =>
-    setView({ kind: "live", target: modelToTrainTarget(model, range) });
+    setView({ kind: "live", target: modelToTrainTarget(model, range), seq: ++liveSeq.current });
 
   // H-F8：视图切换时把焦点迁移到内容容器（tabIndex=-1），便于键盘 / 读屏定位新视图（参照 FactorLab headingRef）。
   const containerRef = useRef<HTMLDivElement>(null);
@@ -49,6 +50,7 @@ export default function WeightModelPanel() {
   const content =
     view.kind === "live" ? (
       <WeightTrainLive
+        key={view.seq}
         target={view.target}
         onBack={() => setView({ kind: "list" })}
         onViewModel={(modelId) => setView({ kind: "detail", modelId })}
@@ -58,6 +60,7 @@ export default function WeightModelPanel() {
         modelId={view.modelId}
         onBack={() => setView({ kind: "list" })}
         onTrain={enterTraining}
+        trainRange={{ startTs: range.startTs, endTs: range.endTs }}
       />
     ) : view.kind === "editor" ? (
       <WeightModelEditor

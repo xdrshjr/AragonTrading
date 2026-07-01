@@ -132,6 +132,49 @@ async def test_persist_persistent_failure_still_reaches_terminal(monkeypatch):
         await dispose_engine()
 
 
+async def test_load_empty_range_classified_as_empty_range(monkeypatch):
+    """G-B2：数据加载抛 HTTPException(EMPTY_RANGE) → run failed/errorCode==EMPTY_RANGE，且 errorMessage
+    绝不外泄 ``"400: {...}"`` Python dict repr（与同步 POST /factor-sets/train 干净 400 对齐）。"""
+    await init_db()
+    try:
+        class _EmptyRest(_FakeRest):
+            async def get_candles(self, inst_id, bar, limit=300, before=None, after=None):
+                return []   # 区间内无 K 线 → load_range_candles 抛 400 EMPTY_RANGE
+
+        started = await _start(_EmptyRest())
+        await _await_terminal(started["jobId"])
+        sm = get_sessionmaker()
+        async with sm() as s:
+            run = await wms.get_run(s, started["modelId"], started["runId"])
+        assert run["status"] == "failed"
+        assert run["errorCode"] == "EMPTY_RANGE"               # 真实码不再被吞成 WEIGHT_TRAIN_FAILED
+        assert "400: {" not in (run["errorMessage"] or "")     # 不外泄 dict repr
+    finally:
+        await dispose_engine()
+
+
+async def test_start_job_self_heals_on_start_failure(monkeypatch):
+    """G-B6：start_job 中 job.start() 罕见抛 → 半注册回滚，active_count 不虚高（无永不终态的幽灵 running）。"""
+    from app.factors import weight_train_manager as wtm
+    from app.factors.service import FactorWindow
+    manager = wtm.WeightTrainManager()
+    assert manager.reserve()                                   # 预占 1
+
+    def _boom(self):
+        raise RuntimeError("no running event loop")
+
+    monkeypatch.setattr(wtm._TrainJob, "start", _boom)
+    spec = wtm.JobSpec(
+        run_id=1, model_id=1, rest=None, members=[], method="linear", config={},
+        window=FactorWindow(inst_id="BTC-USDT-SWAP", bar="1H", start_ts=1, end_ts=2, max_bars=None),
+        horizon=6, run_cap=50, curve_steps=6)
+    import pytest
+    with pytest.raises(RuntimeError):
+        manager.start_job(spec)
+    assert manager.active_count() == 0       # 幽灵 job 已回滚，未计入并发
+    assert manager._reserved == 0            # 预占已释放
+
+
 async def test_shutdown_force_cancels_stuck_job(monkeypatch):
     """H-B4：卡死作业在关停时带超时 join，超时 force_cancel 兜底，run 终为 cancelled，关停不被无限拖。"""
     await init_db()

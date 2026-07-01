@@ -229,3 +229,104 @@ async def test_find_model_by_factor_set():
             assert await repo.find_weight_model_by_factor_set(s, 999) is None
     finally:
         await dispose_engine()
+
+
+# ---------------- G-B4：编辑 spec 清陈旧指针（R-02 规范化比对 / R-03 重训同清） ----------------
+_MULTI_KEY_SPEC = repo.WeightModelSpec(
+    name="多键config模型", inst_id="BTC-USDT-SWAP", bar="1H",
+    members=[{"factorKey": "mom_roc", "params": {}, "weight": 0.0, "direction": "long"}],
+    method="linear", config={"normWindow": 100, "split": 0.7}, horizon=6, source="manual")
+
+
+async def _model_with_pointer(s, spec=_SPEC):
+    model = await repo.create_weight_model(s, spec=spec)
+    run = await repo.add_weight_run(s, start=_run_start(model.id))
+    await repo.finalize_weight_run(s, run.id, outcome=_success(0.30), run_cap=50)
+    return model, run
+
+
+async def test_update_members_clears_pointer_keeps_history():
+    """G-B4：改成员 → latest_run_id/best_valid_ic 作废，历史 run 仍保留。"""
+    sm = await _fresh()
+    try:
+        async with sm() as s:
+            model, run = await _model_with_pointer(s)
+            updated = await repo.update_weight_model(s, model.id, patch=repo.WeightModelPatch(
+                members=[{"factorKey": "trend_ema_dist", "params": {}, "weight": 0.0, "direction": "long"}]))
+            assert updated.latest_run_id is None and updated.best_valid_ic is None
+            assert await repo.get_weight_run(s, model.id, run.id) is not None   # 历史 run 保留
+    finally:
+        await dispose_engine()
+
+
+async def test_update_name_enabled_and_reordered_config_keep_pointer():
+    """G-B4/R-02：仅改 name/enabled 及**键序不同的等价 config** → 规范化比对判定 no-op，不清指针。"""
+    sm = await _fresh()
+    try:
+        async with sm() as s:
+            model, run = await _model_with_pointer(s, spec=_MULTI_KEY_SPEC)
+            updated = await repo.update_weight_model(s, model.id, patch=repo.WeightModelPatch(
+                name="改名", enabled=False, config={"split": 0.7, "normWindow": 100}))   # 键序颠倒、语义相同
+            assert updated.latest_run_id == run.id            # 指针未被键序差异误清（R-02）
+            assert abs(updated.best_valid_ic - 0.30) < 1e-9
+            assert updated.name == "改名" and updated.enabled is False
+    finally:
+        await dispose_engine()
+
+
+async def test_refresh_spec_change_clears_pointer_same_spec_keeps():
+    """G-B4/R-03：重训复用路径改 spec 同清指针；同 spec 重训不清（取舍 a）。"""
+    sm = await _fresh()
+    try:
+        async with sm() as s:
+            model, run = await _model_with_pointer(s)
+            changed = repo.WeightModelSpec(
+                name=_SPEC.name, inst_id=_SPEC.inst_id, bar=_SPEC.bar,
+                members=[{"factorKey": "rev_rsi", "params": {}, "weight": 0.0, "direction": "short"}],
+                method=_SPEC.method, config=_SPEC.config, horizon=_SPEC.horizon,
+                source="builder", factor_set_id=_SPEC.factor_set_id)
+            row = await repo.get_weight_model(s, model.id)
+            refreshed = await repo.refresh_weight_model_spec(s, row, spec=changed)
+            assert refreshed.latest_run_id is None and refreshed.best_valid_ic is None   # 改 spec 清指针
+            run2 = await repo.add_weight_run(s, start=_run_start(model.id))
+            await repo.finalize_weight_run(s, run2.id, outcome=_success(0.2), run_cap=50)
+            row2 = await repo.get_weight_model(s, model.id)
+            kept = await repo.refresh_weight_model_spec(s, row2, spec=changed)   # 同 spec 重训
+            assert kept.latest_run_id == run2.id                                  # 不清指针
+    finally:
+        await dispose_engine()
+
+
+# ---------------- G-B1/R-01：孤儿 running 对账（真·在跑由 active_run_ids 区分，service/api 测） ----------------
+async def test_fail_orphan_running_runs_reconciles_and_skips_alive():
+    sm = await _fresh()
+    try:
+        async with sm() as s:
+            model = await repo.create_weight_model(s, spec=_SPEC)
+            ok = await repo.add_weight_run(s, start=_run_start(model.id))
+            await repo.finalize_weight_run(s, ok.id, outcome=_success(0.3), run_cap=50)
+            orphan = await repo.add_weight_run(s, start=_run_start(model.id))   # running 孤儿（不在 alive）
+            n = await repo.fail_orphan_running_runs(s, model.id, alive=set())
+            await s.commit()
+            assert n == 1
+            stored = await repo.get_weight_run(s, model.id, orphan.id)
+            assert stored.status == "failed" and stored.error_code == "WEIGHT_TRAIN_INTERRUPTED"
+            assert (await repo.get_weight_model(s, model.id)).latest_run_id == ok.id   # repoint 回退到 succeeded
+            # 真·在跑（id 在 alive）绝不被对账。
+            alive_run = await repo.add_weight_run(s, start=_run_start(model.id))
+            assert await repo.fail_orphan_running_runs(s, model.id, alive={alive_run.id}) == 0
+            assert (await repo.get_weight_run(s, model.id, alive_run.id)).status == "running"
+    finally:
+        await dispose_engine()
+
+
+async def test_delete_model_rejects_running_run():
+    """G-B1 防御纵深：repo 直接删带 running run 的模型 → 'running'（镜像 delete_weight_run）。"""
+    sm = await _fresh()
+    try:
+        async with sm() as s:
+            model = await repo.create_weight_model(s, spec=_SPEC)
+            await repo.add_weight_run(s, start=_run_start(model.id))   # running
+            assert await repo.delete_weight_model(s, model.id) == "running"
+    finally:
+        await dispose_engine()

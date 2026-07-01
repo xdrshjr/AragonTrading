@@ -904,6 +904,7 @@ from .weight_model_repositories import (  # noqa: E402,F401
     create_weight_model,
     delete_weight_model,
     delete_weight_run,
+    fail_orphan_running_runs,
     finalize_weight_run,
     find_weight_model_by_factor_set,
     get_weight_model,

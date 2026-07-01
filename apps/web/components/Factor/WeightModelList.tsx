@@ -66,10 +66,12 @@ export default function WeightModelList({
           <span className="text-[11px] text-[var(--muted)]">管理模型并实时观测每次训练的 loss / IC 曲线</span>
         </div>
         <div className="flex items-center gap-3">
-          <label className="flex items-center gap-1.5 text-[11px] text-[var(--muted)]">
-            <Switch checked={showDisabled} onChange={setShowDisabled} label="显示已停用" />
-            显示已停用
-          </label>
+          {/* G-F11：Switch 不再带冗余 aria-label；改用 <label htmlFor> 关联（button 为可标注元素），
+              名称只念一遍且点可见文即可切换。 */}
+          <span className="flex items-center gap-1.5 text-[11px] text-[var(--muted)]">
+            <Switch checked={showDisabled} onChange={setShowDisabled} id="wm-show-disabled" />
+            <label htmlFor="wm-show-disabled" className="cursor-pointer">显示已停用</label>
+          </span>
           <Button variant="primary" size="sm" onClick={onNew}>新建模型</Button>
         </div>
       </div>
@@ -132,6 +134,7 @@ function ModelCard({
   onDelete: () => void;
 }) {
   const latest = model.latestRun;
+  const isRunning = latest?.status === "running";   // G-F10：在跑模型禁「训练」，杜绝重叠 run
   return (
     <div className={clsx("card flex flex-col gap-2 p-3 transition-colors hover:border-[var(--accent-soft)]")}>
       <button type="button" onClick={onView} className="flex flex-col gap-1 text-left">
@@ -157,7 +160,8 @@ function ModelCard({
         </div>
       </button>
       <div className="flex flex-wrap gap-1.5">
-        <Button variant="primary" size="sm" onClick={onTrain}>训练</Button>
+        <Button variant="primary" size="sm" disabled={isRunning}
+          title={isRunning ? "该模型正在训练" : undefined} onClick={onTrain}>训练</Button>
         <Button variant="default" size="sm" onClick={onView}>查看</Button>
         <Button variant="default" size="sm" onClick={onEdit}>编辑</Button>
         <Button variant="ghost" size="sm" disabled={deleting} onClick={onDelete}>

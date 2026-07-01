@@ -69,6 +69,39 @@ describe("WeightTrainLive — origin 记忆 / 连接恢复 / 卸载守卫", () =
     expect(useAppStore.getState().boundModelId).toBeNull(); // 卸载后不 setState 全局
   });
 
+  const RESULT = {
+    method: "linear", weights: { mom_roc: 1 }, normStats: { normWindow: 200, clip: 4 },
+    metrics: { icIn: 0.1, icOut: 0.2, r2In: 0, r2Out: 0, nTrain: 10, nValid: 5 },
+    trainerVersion: null, note: "", provenance: { instId: "BTC-USDT-SWAP", bar: "1H", startTs: 1, endTs: 2, horizon: 6 },
+  };
+
+  async function driveToSucceeded() {
+    await waitFor(() => expect(wsMock).toHaveBeenCalled());
+    const onEvent = wsMock.mock.calls[0][1] as (e: unknown) => void;
+    await act(async () => {
+      onEvent({ type: "result", data: RESULT });
+      onEvent({ type: "done", data: { runId: 1, finishedTs: 9 } });
+    });
+  }
+
+  it("model-origin succeeded does NOT render apply button and never back-flows (G-F1)", async () => {
+    api.train.mockResolvedValue({ jobId: "j1", runId: 1, modelId: 7 });
+    wrap(<WeightTrainLive target={target("model")} onBack={() => {}} onViewModel={() => {}} />);
+    await driveToSucceeded();
+    await waitFor(() => expect(screen.getByText("训练完成")).toBeTruthy());
+    expect(screen.queryByText("应用到组合并返回")).toBeNull();   // model-origin 不渲染回流按钮
+    expect(useAppStore.getState().weightTrainResult).toBeNull(); // 绝不回流覆盖草稿
+  });
+
+  it("builder-origin succeeded renders apply button and back-flows on click (G-F1)", async () => {
+    api.train.mockResolvedValue({ jobId: "j1", runId: 1, modelId: 7 });
+    wrap(<WeightTrainLive target={target("builder")} onBack={() => {}} onViewModel={() => {}} />);
+    await driveToSucceeded();
+    const apply = await screen.findByText("应用到组合并返回");
+    fireEvent.click(apply);
+    expect(useAppStore.getState().weightTrainResult?.modelId).toBe(7);   // builder-origin 正常回流
+  });
+
   it("recovers to streaming and surfaces an error when cancel fails (H-F3)", async () => {
     api.train.mockResolvedValue({ jobId: "j1", runId: 1, modelId: 7 });
     api.cancel.mockRejectedValue(new Error("delete failed"));

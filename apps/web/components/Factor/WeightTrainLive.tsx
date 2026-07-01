@@ -5,8 +5,10 @@ import { useEffect, useRef, useState } from "react";
 import { Badge, Button } from "@/components/ui";
 import { ApiRequestError } from "@/lib/api";
 import { formatIc } from "@/lib/factor";
+import { fmtTime } from "@/lib/format";
 import {
   buildTrainResult,
+  codeLabel,
   formatLoss,
   methodLabel,
   phaseLabel,
@@ -58,6 +60,8 @@ export default function WeightTrainLive({
   const setSection = useAppStore((s) => s.setFactorLabSection);
 
   const [status, setStatus] = useState<LiveStatus>("starting");
+  const statusRef = useRef<LiveStatus>("starting");   // G-F9：取消超时守卫读最新 status（去闭包陈旧依赖）
+  statusRef.current = status;
   const [phase, setPhase] = useState<{ phase: TrainPhase; pct: number } | null>(null);
   const [curve, setCurve] = useState<TrainCurvePoint[]>([]);
   const [liveWeights, setLiveWeights] = useState<Record<string, number> | null>(null);
@@ -159,8 +163,9 @@ export default function WeightTrainLive({
       setStatus("cancelling");
       setError(null);
       if (cancelTimerRef.current) clearTimeout(cancelTimerRef.current);
-      cancelTimerRef.current = setTimeout(() => {   // H-F3：超时未达终态 → 解禁可重试
-        if (mountedRef.current && status !== "succeeded" && status !== "failed" && status !== "cancelled") {
+      cancelTimerRef.current = setTimeout(() => {   // H-F3/G-F9：超时未达终态 → 解禁可重试（读 statusRef 去闭包陈旧）
+        const s = statusRef.current;
+        if (mountedRef.current && s !== "succeeded" && s !== "failed" && s !== "cancelled") {
           setStatus("streaming");
           setError({ code: "CANCEL_TIMEOUT", message: "取消未确认，可重试或等待训练完成" });
         }
@@ -174,7 +179,11 @@ export default function WeightTrainLive({
     },
   });
 
+  // G-F1：仅**组合搭建发起**的训练（origin==="builder"）可回流；model-origin（列表 / 详情发起）训练完成后
+  // 绝不回流——否则会静默覆盖用户当前组合搭建草稿并把 builder 劫持进编辑一个用户从未打开过的组合。
+  const canApply = target.origin === "builder";
   const applyToBuilder = () => {
+    if (!canApply) return;                       // 防御：model-origin 绝不回流
     const ids = handlesRef.current;
     if (!result || !ids) return;
     setWeightTrainResult(buildTrainResult(result, target, ids));
@@ -193,6 +202,8 @@ export default function WeightTrainLive({
           <span className="text-sm font-semibold text-[var(--text)]">实时训练</span>
           <Badge tone="accent">{methodLabel(target.method)}</Badge>
           <span className="text-[11px] text-[var(--muted)]">{target.instId} · {target.bar} · {target.members.length} 成员</span>
+          {/* G-F7：呈现训练时间窗，便于用户核对日期段（窗口取自工作台顶栏，原先静默不显）。 */}
+          <span className="text-[11px] text-[var(--muted)]">区间 {fmtTime(target.startTs)} – {fmtTime(target.endTs)}</span>
         </div>
         {running && handlesRef.current && (
           <Button variant="ghost" size="sm" disabled={status === "cancelling"} onClick={() => cancel.mutate()}>
@@ -204,19 +215,20 @@ export default function WeightTrainLive({
       <ProgressBar status={status} phase={phase?.phase ?? null} pct={pct} />
 
       {streamingLike && !connected && (
-        <p className="rounded-[10px] border border-[var(--accent)]/40 bg-[var(--accent-soft)]/40 px-3 py-2 text-[11px] font-medium text-[var(--accent)]">
+        <p aria-live="polite" className="rounded-[10px] border border-[var(--accent)]/40 bg-[var(--accent-soft)]/40 px-3 py-2 text-[11px] font-medium text-[var(--accent)]">
           连接中断，正在重连…（训练在后端继续，恢复后自动续显）
         </p>
       )}
       {streamingLike && connected && stale && (
-        <p className="rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-[11px] text-[var(--muted)]">
+        <p aria-live="polite" className="rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-[11px] text-[var(--muted)]">
           等待训练数据…（网络或后端较慢，请稍候）
         </p>
       )}
 
       {error && (
-        <p className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short)]">
-          训练{status === "failed" ? "失败" : "异常"}（{error.code}）：{error.message}
+        // G-F5：role=alert 让读屏在失败 / 断连时即时播报；G-F6：错误码经 codeLabel 友好呈现，原始码作 title。
+        <p role="alert" title={error.code} className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short)]">
+          训练{status === "failed" ? "失败" : "异常"}（{codeLabel(error.code)}）：{error.message}
         </p>
       )}
 
@@ -228,7 +240,8 @@ export default function WeightTrainLive({
       {liveWeights && Object.keys(liveWeights).length > 0 && (
         <div className="card flex flex-col gap-2 p-3">
           <div className="flex items-center gap-2">
-            <span className="text-[11px] font-medium text-[var(--muted)]">{status === "succeeded" ? "最终权重" : "收敛中的权重"}</span>
+            {/* G-F9：失败后不再误标「收敛中的权重」（拟合并未收敛）；succeeded 才是最终权重。 */}
+            <span className="text-[11px] font-medium text-[var(--muted)]">{weightsLabel(status)}</span>
             {result?.trainerVersion && <Badge tone="neutral">{result.trainerVersion}</Badge>}
           </div>
           <WeightBars weights={liveWeights} />
@@ -240,14 +253,17 @@ export default function WeightTrainLive({
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        <Button
-          variant="primary"
-          disabled={status !== "succeeded" || !result}
-          title={status === "succeeded" ? "把训练权重应用到组合并返回" : "训练完成后可用"}
-          onClick={applyToBuilder}
-        >
-          应用到组合并返回
-        </Button>
+        {/* G-F1：仅 builder-origin 训练渲染「应用到组合并返回」；model-origin 只提供「查看模型详情」，杜绝劫持草稿。 */}
+        {canApply && (
+          <Button
+            variant="primary"
+            disabled={status !== "succeeded" || !result}
+            title={status === "succeeded" ? "把训练权重应用到组合并返回" : "训练完成后可用"}
+            onClick={applyToBuilder}
+          >
+            应用到组合并返回
+          </Button>
+        )}
         {handlesRef.current && (
           <Button variant="default" disabled={running} onClick={() => onViewModel(handlesRef.current!.modelId)}>
             查看模型详情
@@ -266,7 +282,7 @@ function ProgressBar({ status, phase, pct }: { status: LiveStatus; phase: TrainP
     : phase ? phaseLabel(phase) : "启动中...";
   const tone = status === "failed" ? "var(--short)" : status === "succeeded" ? "var(--long)" : "var(--accent)";
   return (
-    <div className="flex flex-col gap-1">
+    <div className="flex flex-col gap-1" role="status" aria-live="polite">
       <div className="flex items-center justify-between text-[11px] text-[var(--muted)]">
         <span>{label}</span>
         <span className="tabular">{Math.round(pct)}%</span>
@@ -281,7 +297,7 @@ function ProgressBar({ status, phase, pct }: { status: LiveStatus; phase: TrainP
 function ResultSummary({ result }: { result: TrainResultEvent }) {
   const m = result.metrics;
   return (
-    <div className="card flex flex-wrap items-center gap-2 p-3">
+    <div className="card flex flex-wrap items-center gap-2 p-3" role="status" aria-live="polite">
       <span className="text-sm font-semibold text-[var(--text)]">训练结果</span>
       <Badge tone="neutral">样本内 IC {formatIc(m.icIn)}</Badge>
       <Badge tone="neutral">样本外 IC {formatIc(m.icOut)}</Badge>
@@ -289,6 +305,14 @@ function ResultSummary({ result }: { result: TrainResultEvent }) {
       {result.note && <span className="text-[11px] text-[var(--muted)]">{result.note}</span>}
     </div>
   );
+}
+
+// 权重卡标签（G-F9）：succeeded=最终权重；failed=失败前最后权重（绝不误称「收敛中」）；其余=收敛中的权重。
+function weightsLabel(status: LiveStatus): string {
+  if (status === "succeeded") return "最终权重";
+  if (status === "failed") return "失败前最后权重";
+  if (status === "cancelled") return "取消前最后权重";
+  return "收敛中的权重";
 }
 
 // 曲线点按 step upsert（重连回放时同 step 覆盖，避免重复堆叠）。
