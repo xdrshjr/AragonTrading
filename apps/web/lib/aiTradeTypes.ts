@@ -16,7 +16,26 @@ export interface StrategySignalView {
   reason: string;
 }
 
-// 本轮 AI 决策（受约束）：action + 可选仓位占比/置信度 + 理由 + 信号板 + 执行结果。
+// 市场体制上下文（E1）：engine/regime.classify_regime 的紧凑视图（取值∈真实 regime 枚举）。
+export interface MarketContext {
+  primary: string;      // trend_up | trend_down | range
+  volatility: string;   // high_volatility | low_volatility | normal
+  event: string;        // crash | breakout | none
+  confidence: number;
+  labels: string[];
+}
+
+// 策略共识度（E2）：信号板逐策略持久立场聚合出的多/空/空仓票 + 净立场 + 一致度。
+export interface Consensus {
+  longVotes: number;
+  shortVotes: number;
+  flatVotes: number;
+  total: number;
+  netStance: AiStance;
+  agreement: number;    // max(long,short)/total ∈ [0,1]
+}
+
+// 本轮 AI 决策（受约束）：action + 可选仓位占比/置信度 + 理由 + 信号板 + 执行结果 + 体制/共识/降级（E1/E2/E3）。
 export interface AiTradeDecision {
   ts: number;
   round: number;
@@ -25,7 +44,18 @@ export interface AiTradeDecision {
   confidence?: number | null;
   reason: string;
   signalBoard: StrategySignalView[];
-  executed?: { ok?: boolean; skipped?: boolean; reason?: string; side?: string; qty?: number } | null;
+  executed?: {
+    ok?: boolean;
+    skipped?: boolean;
+    traded?: boolean;
+    reason?: string;
+    side?: string;
+    qty?: number;
+    positionAfter?: string;
+  } | null;
+  marketContext?: MarketContext | null;   // E1（可为 null）
+  consensus?: Consensus | null;           // E2
+  degradeReason?: string | null;          // E3（low_consensus(k/n) / decision_timeout / … 或 null）
 }
 
 // GET /ai-trade/status 与 WS snapshot 的会话只读视图（info()）。
@@ -77,6 +107,8 @@ export interface AiTradeStartReq {
   leverage?: number | null;
   takeProfitUsd?: number | null;
   stopLossUsd?: number | null;
+  stopLossPct?: number | null;      // E4：单仓 OCO 止损%（留空→config 默认；越界服务端夹紧）
+  takeProfitPct?: number | null;    // E4：单仓 OCO 止盈%
   contextRefreshRounds: number;
   priming?: boolean;
   primingBars?: number;
@@ -92,6 +124,8 @@ export interface AiTradeStartResult {
   budgetUsd: number;
   leverage: number;
   contextRefreshRounds: number;
+  stopLossPct?: number | null;      // E4：executor 生效止损%（夹紧后回执）
+  takeProfitPct?: number | null;    // E4：executor 生效止盈%
 }
 
 export interface AiTradeStatusResponse {

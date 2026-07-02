@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   clampBudgetToCap,
+  clampPct,
   deriveDefaultBudget,
   describeStopReason,
   parseOptionalLeverage,
+  parseOptionalPct,
   parseOptionalUsd,
   resolveAutoTradeGate,
 } from "./liveAuto";
@@ -80,6 +82,32 @@ describe("parseOptionalLeverage", () => {
   it("rejects out of range", () => {
     expect(parseOptionalLeverage("200").error).toBeTruthy();
     expect(parseOptionalLeverage("0").error).toBeTruthy();
+  });
+});
+
+describe("parseOptionalPct (E4)", () => {
+  it("empty string → null (use default), no error", () => {
+    expect(parseOptionalPct("")).toEqual({ value: null, error: null });
+    expect(parseOptionalPct("   ")).toEqual({ value: null, error: null });
+  });
+
+  it("valid positive fraction", () => {
+    expect(parseOptionalPct("0.05")).toEqual({ value: 0.05, error: null });
+  });
+
+  it("rejects non-positive / non-numeric (越界不在此拦，交由 clampPct)", () => {
+    expect(parseOptionalPct("0").error).toBeTruthy();
+    expect(parseOptionalPct("-0.1").error).toBeTruthy();
+    expect(parseOptionalPct("abc").error).toBeTruthy();
+    expect(parseOptionalPct("0.9").error).toBeNull(); // 越界仍解析成功，夹紧交给 clampPct
+  });
+});
+
+describe("clampPct (E4)", () => {
+  it("clamps to [0, max]", () => {
+    expect(clampPct(0.9, 0.2)).toBe(0.2);
+    expect(clampPct(0.03, 0.2)).toBe(0.03);
+    expect(clampPct(-1, 0.2)).toBe(0);
   });
 });
 

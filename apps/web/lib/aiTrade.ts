@@ -2,7 +2,13 @@
 // 预算派生/夹紧复用 live-auto 同款（0.01 默认 / 0.05 上限，与后端 ai_trade_default/max_capital_frac 对齐）。
 import { clampBudgetToCap, deriveDefaultBudget } from "./liveAuto";
 import type { AccountMode } from "./types";
-import type { AiTradeAction, AiTradeStopReason } from "./aiTradeTypes";
+import type {
+  AiTradeAction,
+  AiTradeDecision,
+  AiTradeStopReason,
+  Consensus,
+  MarketContext,
+} from "./aiTradeTypes";
 
 export { clampBudgetToCap, deriveDefaultBudget };
 
@@ -11,6 +17,9 @@ export const AI_TRADE_MIN_CONTEXT_ROUNDS = 3;
 export const AI_TRADE_MAX_CONTEXT_ROUNDS = 200;
 export const AI_TRADE_DEFAULT_CONTEXT_ROUNDS = 10;
 export const AI_TRADE_MAX_STRATEGIES = 8;
+// 单仓 OCO 比例夹紧上限（fraction，与后端 ai_trade_max_sl_pct/tp_pct 对齐，E4 弹窗预览用）。
+export const AI_TRADE_MAX_SL_PCT = 0.2;
+export const AI_TRADE_MAX_TP_PCT = 0.5;
 
 // 开关守门输入（不含策略数——策略在启动弹窗内多选；运行态开关恒可点用于停止）。
 export interface AiTradeGateInput {
@@ -87,4 +96,72 @@ const STOP_REASON_LABELS: Record<AiTradeStopReason, string> = {
 export function describeStopReason(reason: string | null | undefined): string {
   if (!reason) return "已停止";
   return STOP_REASON_LABELS[reason as AiTradeStopReason] ?? "已停止";
+}
+
+// 市场体制真实枚举 → 中文（R-P1-2：映射 engine/regime 真值，缺省回原值不臆造）。
+const REGIME_PRIMARY_LABELS: Record<string, string> = {
+  trend_up: "上升趋势",
+  trend_down: "下降趋势",
+  range: "震荡",
+};
+const REGIME_VOLATILITY_LABELS: Record<string, string> = {
+  high_volatility: "高波动",
+  low_volatility: "低波动",
+  normal: "常波动",
+};
+const REGIME_EVENT_LABELS: Record<string, string> = {
+  breakout: "突破",
+  crash: "急跌",
+};
+
+/**
+ * 市场体制上下文中文化（E1）：`趋势结构 · 波动 · 事件`（如「上升趋势 · 高波动 · 突破」）。
+ * 事件为 none 时省略；任一未知枚举缺省回原值（不臆造，R-P1-2）；空上下文返回空串。
+ */
+export function describeRegime(mc: MarketContext | null | undefined): string {
+  if (!mc) return "";
+  const parts = [
+    REGIME_PRIMARY_LABELS[mc.primary] ?? mc.primary,
+    REGIME_VOLATILITY_LABELS[mc.volatility] ?? mc.volatility,
+  ];
+  if (mc.event && mc.event !== "none") {
+    parts.push(REGIME_EVENT_LABELS[mc.event] ?? mc.event);
+  }
+  return parts.filter(Boolean).join(" · ");
+}
+
+/**
+ * 策略共识度中文化（E2）：`<N>多/<M>空/<K>空仓 · 一致度 <p>%`（如「3多/1空/1空仓 · 一致度 60%」）。
+ * 空共识返回空串。
+ */
+export function describeConsensus(consensus: Consensus | null | undefined): string {
+  if (!consensus) return "";
+  const pct = Math.round((consensus.agreement ?? 0) * 100);
+  return `${consensus.longVotes}多/${consensus.shortVotes}空/${consensus.flatVotes}空仓 · 一致度 ${pct}%`;
+}
+
+export type AiExecTone = "long" | "short" | "muted";
+
+export interface AiExecutedView {
+  label: string;    // 已成交 / 已跳过 / 已降级观望（reason） / 观望
+  tone: AiExecTone; // 净立场着色（long/short/muted）
+}
+
+/**
+ * 执行结果态中文化（E3）：把本轮 `executed`/`degradeReason` 归一为四态状态点（+着色）。
+ * 优先级：已跳过（decision_in_flight）> 已降级观望（含 reason）> 已成交（按方向着色）> 观望。
+ */
+export function describeExecuted(
+  action: string,
+  executed: AiTradeDecision["executed"],
+  degradeReason?: string | null,
+): AiExecutedView {
+  if (executed?.skipped) return { label: "已跳过", tone: "muted" };
+  if (degradeReason) return { label: `已降级观望（${degradeReason}）`, tone: "short" };
+  if (executed?.traded) {
+    const tone: AiExecTone =
+      action === "open_long" ? "long" : action === "open_short" ? "short" : "muted";
+    return { label: "已成交", tone };
+  }
+  return { label: "观望", tone: "muted" };
 }

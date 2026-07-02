@@ -52,6 +52,26 @@ export function parseOptionalUsd(raw: string): { value: number | null; error: st
   return { value: n, error: null };
 }
 
+/**
+ * 解析可选单仓 OCO 比例（fraction，如 0.05=5%）：空串→null（用默认）；非正 / 非数→错误。
+ * 越界不在此处拦（不阻断确认），交由 `clampPct` 预览与服务端权威夹紧（E4，语义同 parseOptionalUsd）。
+ */
+export function parseOptionalPct(raw: string): { value: number | null; error: string | null } {
+  const text = raw.trim();
+  if (text === "") return { value: null, error: null };
+  const n = Number(text);
+  if (!Number.isFinite(n) || n <= 0) {
+    return { value: null, error: "请输入大于 0 的比例（如 0.05＝5%），或留空使用默认" };
+  }
+  return { value: n, error: null };
+}
+
+/** 单仓 OCO 比例夹紧到 [0, max]（前端预览口径；最终仍以服务端回执生效 pct 为准，E4）。 */
+export function clampPct(value: number, max: number): number {
+  if (value < 0) return 0;
+  return value > max ? max : value;
+}
+
 /** 解析可选杠杆输入：空串→null（用默认）；区间 (0,125]。 */
 export function parseOptionalLeverage(raw: string): { value: number | null; error: string | null } {
   const text = raw.trim();

@@ -60,6 +60,13 @@ class MarketWindow:
         """当前窗口位置索引（`len-1`）；暖机与实时段统一用它驱动影子 broker（避免滑窗漂移）。"""
         return len(self._candles) - 1
 
+    def base_df(self) -> pd.DataFrame:
+        """当前基础周期窗口 → `candles_to_df`（供 E1 市场体制判定，与逐策略帧解耦）。
+
+        用公有 `candles` 属性构造，不碰逐策略 `prepare`/MTF（体制判定只需原始 OHLCV）。
+        """
+        return candles_to_df(list(self._candles))
+
     # ---------- 追加 ----------
     def is_duplicate(self, candle: Candle) -> bool:
         return (self._last_confirmed_ts is not None and candle.ts <= self._last_confirmed_ts

@@ -6,7 +6,9 @@ import { Badge, Button, Modal } from "@/components/ui";
 import { api } from "@/lib/api";
 import {
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
+  AI_TRADE_MAX_SL_PCT,
   AI_TRADE_MAX_STRATEGIES,
+  AI_TRADE_MAX_TP_PCT,
   clampBudgetToCap,
   deriveDefaultBudget,
   validateContextRounds,
@@ -15,9 +17,11 @@ import {
 import { isAutoTradable } from "@/lib/autoTrade";
 import { fmtPrice } from "@/lib/format";
 import {
+  clampPct,
   LIVE_AUTO_DEFAULT_LEVERAGE,
   LIVE_MAX_ORDER_NOTIONAL_USD,
   parseOptionalLeverage,
+  parseOptionalPct,
   parseOptionalUsd,
 } from "@/lib/liveAuto";
 import { tradingApi } from "@/lib/tradingApi";
@@ -29,6 +33,8 @@ export interface AiTradeLaunchOpts {
   leverage: number | null;
   takeProfitUsd: number | null;
   stopLossUsd: number | null;
+  stopLossPct: number | null;      // E4：单仓 OCO 止损%（fraction，留空＝config 默认）
+  takeProfitPct: number | null;    // E4：单仓 OCO 止盈%
   contextRefreshRounds: number;
 }
 
@@ -67,6 +73,8 @@ export default function AiTradeLaunchModal({
   const [leverageRaw, setLeverageRaw] = useState("");
   const [takeProfitRaw, setTakeProfitRaw] = useState("");
   const [stopLossRaw, setStopLossRaw] = useState("");
+  const [stopLossPctRaw, setStopLossPctRaw] = useState("");
+  const [takeProfitPctRaw, setTakeProfitPctRaw] = useState("");
   const [roundsRaw, setRoundsRaw] = useState(String(defaultContextRounds || AI_TRADE_DEFAULT_CONTEXT_ROUNDS));
 
   const strategiesQ = useQuery({ queryKey: ["strategies"], queryFn: api.strategies });
@@ -87,6 +95,8 @@ export default function AiTradeLaunchModal({
     setLeverageRaw("");
     setTakeProfitRaw("");
     setStopLossRaw("");
+    setStopLossPctRaw("");
+    setTakeProfitPctRaw("");
   }, [open, defaultInstId, defaultContextRounds]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleId = (id: number) =>
@@ -96,8 +106,12 @@ export default function AiTradeLaunchModal({
   const leverage = parseOptionalLeverage(leverageRaw);
   const takeProfit = parseOptionalUsd(takeProfitRaw);
   const stopLoss = parseOptionalUsd(stopLossRaw);
+  const stopLossPct = parseOptionalPct(stopLossPctRaw);
+  const takeProfitPct = parseOptionalPct(takeProfitPctRaw);
   const roundsValue = Number.parseInt(roundsRaw, 10);
-  const inputError = capital.error || leverage.error || takeProfit.error || stopLoss.error || null;
+  const inputError =
+    capital.error || leverage.error || takeProfit.error || stopLoss.error ||
+    stopLossPct.error || takeProfitPct.error || null;
   const strategyError = validateStrategySelection(selectedIds);
   const roundsError = validateContextRounds(roundsValue);
   const instSupported = isAutoTradable(instId);
@@ -121,6 +135,8 @@ export default function AiTradeLaunchModal({
       leverage: leverage.value,
       takeProfitUsd: takeProfit.value,
       stopLossUsd: stopLoss.value,
+      stopLossPct: stopLossPct.value,
+      takeProfitPct: takeProfitPct.value,
       contextRefreshRounds: roundsValue,
     });
   };
@@ -208,6 +224,10 @@ export default function AiTradeLaunchModal({
             value={leverage.value != null ? `${leverage.value}×` : `默认 ${LIVE_AUTO_DEFAULT_LEVERAGE}×`}
           />
           <Row label="单笔名义上限" value={`≤ ${LIVE_MAX_ORDER_NOTIONAL_USD} USDT/单`} />
+          <Row
+            label="单仓兜底 OCO（交易所侧）"
+            value={`SL ${fmtOcoPct(stopLossPct.value, AI_TRADE_MAX_SL_PCT)} / TP ${fmtOcoPct(takeProfitPct.value, AI_TRADE_MAX_TP_PCT)}`}
+          />
         </div>
 
         <div className="grid grid-cols-2 gap-3">
@@ -215,6 +235,8 @@ export default function AiTradeLaunchModal({
           <Field label="杠杆（×）" placeholder="留空＝默认" value={leverageRaw} onChange={setLeverageRaw} disabled={submitting} />
           <Field label="总止盈（USDT）" placeholder="留空＝不触发" value={takeProfitRaw} onChange={setTakeProfitRaw} disabled={submitting} />
           <Field label="总止损（USDT）" placeholder="留空＝不触发" value={stopLossRaw} onChange={setStopLossRaw} disabled={submitting} />
+          <Field label="单仓止损%（如 0.05＝5%）" placeholder="留空＝默认" value={stopLossPctRaw} onChange={setStopLossPctRaw} disabled={submitting} />
+          <Field label="单仓止盈%（如 0.10＝10%）" placeholder="留空＝默认" value={takeProfitPctRaw} onChange={setTakeProfitPctRaw} disabled={submitting} />
         </div>
 
         <Field
@@ -258,6 +280,12 @@ export default function AiTradeLaunchModal({
       </div>
     </Modal>
   );
+}
+
+/** 单仓 OCO 比例预览：留空→「默认」；有值→夹紧到 max 后按百分比展示（如 0.9→「20%」）。 */
+function fmtOcoPct(value: number | null, max: number): string {
+  if (value == null) return "默认";
+  return `${+(clampPct(value, max) * 100).toFixed(2)}%`;
 }
 
 function Row({ label, value }: { label: string; value: ReactNode }) {

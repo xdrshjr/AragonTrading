@@ -63,7 +63,8 @@ def _candle(idx: int, price: float = 30000.0) -> Candle:
 
 
 def _make_session(*, action="hold", size=0.5, run_id=1, stop_loss_usd=None,
-                  pos_state=None, context_rounds=10, priming=False):
+                  pos_state=None, context_rounds=10, priming=False, settings=None):
+    settings = settings or Settings()
     pos_state = pos_state if pos_state is not None else {"flat": False, "upl": 0.0}
     calls = {"orders": [], "closes": []}
 
@@ -86,11 +87,11 @@ def _make_session(*, action="hold", size=0.5, run_id=1, stop_loss_usd=None,
         creds=AccountCredentials("ak", "sk-000000", "pp-000000"), account_id=1,
         inst_id="BTC-USDT-SWAP", td_mode="cross", pos_mode="long_short_mode",
         leverage=3.0, budget_usd=1000.0, risk=RiskParams(), ct_val=0.01,
-        lot_sz=0.01, min_sz=0.01, settings=Settings(),
+        lot_sz=0.01, min_sz=0.01, settings=settings,
         place_order_fn=place_order_fn, close_position_fn=close_position_fn,
         positions_fn=positions_fn)
     decider = AiTradeDecider(_StubLLM(action, size), "sys",
-                             context_refresh_rounds=context_rounds, settings=Settings())
+                             context_refresh_rounds=context_rounds, settings=settings)
     spec = PaperStrategySpec(1, "S", "atomic", _StubStrategy({}), {})
     session = AiTradeSession("aitrade_test", run_id, [spec], "BTC-USDT-SWAP", "1H", executor,
                              decider, stop_loss_usd=stop_loss_usd, priming=priming,
@@ -217,6 +218,44 @@ async def test_decision_in_flight_skips_overlapping_round():
         assert skipped and skipped[0]["data"]["executed"]["reason"] == "decision_in_flight"
         assert calls["orders"] == []             # 跳过轮不下单
         assert session._decision_task is None     # 未启动新决策任务
+    finally:
+        await dispose_engine()
+
+
+async def test_decision_event_carries_context_fields():
+    """E2/E3：decision 事件含 marketContext/consensus/degradeReason 三键（向后兼容增补）。"""
+    await init_db()
+    session, _, _ = _make_session(action="hold")
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        data = [e for e in _drain(q) if e["type"] == "decision"][-1]["data"]
+        assert "marketContext" in data          # 窗口 <60 根 → None，但键存在
+        assert "consensus" in data and data["consensus"]["total"] == 1
+        assert "degradeReason" in data and data["degradeReason"] is None  # 正常 hold 非降级
+    finally:
+        await dispose_engine()
+
+
+async def test_consensus_gate_downgrades_open_to_hold_and_records_hold():
+    """E2/E3 + R-P1-3：低共识开仓被硬降级 hold，executor.apply 未调用，且 journal 记录降级后的 hold。"""
+    await init_db()
+    # 桩策略从不交易 → 影子 stance 恒 flat → long_votes=0；min_consensus=1 使 open_long 必被拦。
+    session, calls, _ = _make_session(action="open_long",
+                                      settings=Settings(ai_trade_min_consensus=1))
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        assert calls["orders"] == []                    # executor.apply 未下单（门禁在其之前拦下）
+        assert session.executor.projected == "flat"
+        data = [e for e in _drain(q) if e["type"] == "decision"][-1]["data"]
+        assert data["action"] == "hold"
+        assert data["degradeReason"].startswith("low_consensus")
+        assert "0/1" in data["degradeReason"]
+        # R-P1-3：commit_round/journal 记录的是降级后的 hold（而非从未开过的仓），保持上下文纯净。
+        assert session.decider._journal[-1]["decision"]["action"] == "hold"
     finally:
         await dispose_engine()
 

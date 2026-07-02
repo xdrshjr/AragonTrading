@@ -81,16 +81,19 @@ async def ai_trade_start(body: AiTradeStartIn, session: AsyncSession = Depends(g
         settings=settings, context_refresh_rounds=body.contextRefreshRounds,
         capital_usd=body.capitalUsd, leverage=body.leverage,
         take_profit_usd=body.takeProfitUsd, stop_loss_usd=body.stopLossUsd,
+        stop_loss_pct=body.stopLossPct, take_profit_pct=body.takeProfitPct,  # E4：单仓 OCO 入参
         priming=body.priming, priming_bars=body.primingBars)
     try:
         sess = await get_ai_trade_manager().start(req)
     except (AiTradeSessionLimitError, AiTradePreflightError) as exc:
         raise HTTPException(exc.status, detail={"code": exc.code, "message": exc.message})
+    risk = sess.executor.risk       # E4：回执生效 pct（服务端夹紧后的实际值，供前端确认夹紧结果）
     return {"sessionId": sess.session_id, "runId": sess.run_id, "instId": body.instId,
             "bar": body.bar, "strategyIds": sess.strategy_ids,
             "strategyNames": sess.strategy_names,
             "budgetUsd": sess.executor.budget_usd, "leverage": sess.executor.leverage,
-            "contextRefreshRounds": sess.context_refresh_rounds}
+            "contextRefreshRounds": sess.context_refresh_rounds,
+            "stopLossPct": risk.stop_loss_pct, "takeProfitPct": risk.take_profit_pct}
 
 
 @router.post("/ai-trade/{session_id}/stop")

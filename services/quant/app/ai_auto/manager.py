@@ -52,6 +52,11 @@ def _creds(account_row: repo.OkxAccount) -> AccountCredentials:
                              passphrase=account_row.passphrase)
 
 
+def _clamp(value: float, low: float, high: float) -> float:
+    """把 `value` 夹到 `[low, high]`（E4 单仓 pct 越界夹紧）。"""
+    return low if value < low else high if value > high else value
+
+
 @dataclass
 class AiTradeStartRequest:
     """`start` 聚合形参（避免位置堆参，满足 CLAUDE.md ≤5 形参；镜像 live-auto `GroupStartRequest`）。"""
@@ -66,6 +71,8 @@ class AiTradeStartRequest:
     leverage: float | None = None
     take_profit_usd: float | None = None
     stop_loss_usd: float | None = None
+    stop_loss_pct: float | None = None       # E4：单仓交易所侧 OCO 止损%（留空→config 默认；越界服务端夹紧）
+    take_profit_pct: float | None = None     # E4：单仓 OCO 止盈%（留空→config 默认）
     priming: bool = True
     priming_bars: int = 300
 
@@ -220,14 +227,26 @@ class AiTradeManager:
         return min(budget, hard_cap) if hard_cap > 0 else budget
 
     @staticmethod
+    def _resolve_trade_risk(req: AiTradeStartRequest, settings: Settings) -> RiskParams:
+        """E4：入参 sl/tp% 夹紧到 `ai_trade_max_sl_pct/tp_pct`，留空回落 config 默认；构造期 OCO。
+
+        不改 `LiveExecutor` 任何代码（其构造本就收 `risk`），只把原写死的 config 默认变为
+        「用户可在夹紧区间内设定」；`max_hold_bars` 仍取 config 默认。
+        """
+        sl = (_clamp(req.stop_loss_pct, 0.0, settings.ai_trade_max_sl_pct)
+              if req.stop_loss_pct is not None else settings.ai_trade_default_sl_pct)
+        tp = (_clamp(req.take_profit_pct, 0.0, settings.ai_trade_max_tp_pct)
+              if req.take_profit_pct is not None else settings.ai_trade_default_tp_pct)
+        return RiskParams(stop_loss_pct=sl or None, take_profit_pct=tp or None,
+                          max_hold_bars=settings.ai_trade_default_max_hold_bars or None)
+
+    @staticmethod
     def _build_executor(creds: AccountCredentials, req: AiTradeStartRequest, config: dict,
                         budget: float, lever: float) -> LiveExecutor:
-        """镜像 live-auto `_build_executor`，但 `risk` 传会话固定默认 OCO（与单策略解耦，§2.6/P2-2）。"""
+        """镜像 live-auto `_build_executor`，但 `risk` 由 E4 入参夹紧后覆盖（与单策略解耦，§2.6/P2-2）。"""
         meta = config.get("instMeta") or {}
         settings = req.settings
-        risk = RiskParams(stop_loss_pct=settings.ai_trade_default_sl_pct or None,
-                          take_profit_pct=settings.ai_trade_default_tp_pct or None,
-                          max_hold_bars=settings.ai_trade_default_max_hold_bars or None)
+        risk = AiTradeManager._resolve_trade_risk(req, settings)
         return LiveExecutor(
             creds=creds, account_id=req.account_row.id, inst_id=req.inst_id,
             td_mode=settings.live_default_td_mode,

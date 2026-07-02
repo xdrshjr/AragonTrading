@@ -74,6 +74,8 @@ export default function AiTradeToggle() {
         leverage: opts.leverage,
         takeProfitUsd: opts.takeProfitUsd,
         stopLossUsd: opts.stopLossUsd,
+        stopLossPct: opts.stopLossPct,       // E4：单仓 OCO 止损%（透传，服务端夹紧）
+        takeProfitPct: opts.takeProfitPct,   // E4：单仓 OCO 止盈%
         contextRefreshRounds: opts.contextRefreshRounds,
       }),
     onSuccess: (res, opts) => {

@@ -12,6 +12,7 @@ import json
 
 from app.agent.llm.base import StreamEvent
 from app.ai_auto.decider import AiTradeDecider
+from app.ai_auto.prompts import build_decision_prompt
 from app.config import Settings
 
 
@@ -48,6 +49,25 @@ def _payload(round_no: int) -> dict:
             "takeProfitUsd": None, "stopLossUsd": None,
             "signalBoard": [{"strategyId": 1, "name": "S", "stance": "flat",
                              "latestSignal": "open_long", "strength": 1.0, "reason": "r"}]}
+
+
+def test_decision_prompt_includes_market_context_and_consensus():
+    """E1/E2 契约：payload 含 marketContext/consensus 时，prompt 输出对应两段真实枚举文本。"""
+    payload = _payload(1)
+    payload["marketContext"] = {"primary": "trend_up", "volatility": "high_volatility",
+                                "event": "breakout", "confidence": 0.62, "labels": []}
+    payload["consensus"] = {"longVotes": 3, "shortVotes": 1, "flatVotes": 1, "total": 5,
+                            "netStance": "long", "agreement": 0.6}
+    text = build_decision_prompt(payload)
+    assert "市场体制" in text and "trend_up" in text and "high_volatility" in text
+    assert "策略共识" in text and "3多" in text and "净立场=long" in text
+
+
+def test_decision_prompt_omits_segments_when_absent():
+    """None/缺省时不输出残段（保持 prompt 纯净，不出现半截空信息）。"""
+    text = build_decision_prompt(_payload(1))       # 无 marketContext/consensus 键
+    assert "市场体制" not in text
+    assert "策略共识" not in text
 
 
 async def test_valid_open_long_parsed_and_mapped():

@@ -42,7 +42,8 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
         "决策纪律：\n"
         "1. **每轮必须且只能调用一次** `submit_trade_decision` 工具提交决策；不要只回文字。\n"
         "2. 综合而非盲从：多个策略立场（stance=持久多/空/空仓）与本轮边沿信号（latestSignal）可能"
-        "冲突，你要权衡信号一致度、当前持仓与会话盈亏，避免频繁反手与过度交易。\n"
+        "冲突，你要权衡信号一致度、当前持仓与会话盈亏，避免频繁反手与过度交易；"
+        "同时参考本轮『市场体制』与『策略共识』作为宏观背景，与策略立场综合研判。\n"
         "3. 只使用输入中提供的真实数据，绝不臆造行情或指标；不确定时选择 hold（持币观望）。\n"
         "4. 风险优先：已持仓且多数策略转为反向或平仓立场时，优先 close 保护利润 / 止损；"
         "空仓且多数策略同向且理由充分时才开仓，sizeFraction 保守（默认 ≤0.5）。\n"
@@ -70,11 +71,29 @@ def _format_board(board: list[dict]) -> str:
     return "\n".join(lines) if lines else "（无策略信号）"
 
 
+def _format_market_context(mc: dict | None) -> str:
+    """把市场体制上下文压成一行（E1）；`mc is None` 时返回空串（整段省略，保持 prompt 纯净）。"""
+    if not mc:
+        return ""
+    return (f"市场体制：趋势结构={mc.get('primary')}，波动={mc.get('volatility')}，"
+            f"事件={mc.get('event')}（判定置信 {mc.get('confidence')}）")
+
+
+def _format_consensus(consensus: dict | None) -> str:
+    """把策略共识度压成一行（E2）；`consensus is None` 时返回空串（该段省略）。"""
+    if not consensus:
+        return ""
+    return (f"策略共识：{consensus.get('longVotes')}多 / {consensus.get('shortVotes')}空 / "
+            f"{consensus.get('flatVotes')}空仓，净立场={consensus.get('netStance')}，"
+            f"一致度={consensus.get('agreement')}")
+
+
 def build_decision_prompt(payload: dict) -> str:
-    """把本轮决策输入（信号板 + 真实持仓 + 会话盈亏 + 摘要）压成紧凑文本喂决策器。
+    """把本轮决策输入（体制/共识 + 信号板 + 真实持仓 + 会话盈亏 + 摘要）压成紧凑文本喂决策器。
 
     `payload` 由决策器/会话装配：round, barTs, lastPx, position, sessionPnlUsd, budgetUsd,
-    takeProfitUsd, stopLossUsd, signalBoard(list[dict]), summary。
+    takeProfitUsd, stopLossUsd, signalBoard(list[dict]), summary，
+    以及可选 marketContext(dict|None, E1) / consensus(wire dict|None, E2)。
     """
     summary = payload.get("summary")
     tp = payload.get("takeProfitUsd")
@@ -84,6 +103,14 @@ def build_decision_prompt(payload: dict) -> str:
         _format_position(payload.get("position")),
         (f"会话累计盈亏≈{payload.get('sessionPnlUsd')} USDT / 预算 {payload.get('budgetUsd')} USDT；"
          f"会话止盈阈值={'不触发' if tp is None else tp}，止损阈值={'不触发' if sl is None else sl}"),
+    ]
+    market_line = _format_market_context(payload.get("marketContext"))
+    if market_line:                          # E1：mc 为 None 时整段省略（不出现半截空信息）
+        parts.append(market_line)
+    consensus_line = _format_consensus(payload.get("consensus"))
+    if consensus_line:                       # E2：consensus 为 None 时省略；空板则如实呈现 0 票
+        parts.append(consensus_line)
+    parts += [
         "策略信号板（综合研判以下各策略此刻立场与本轮意图）：",
         _format_board(payload.get("signalBoard") or []),
     ]

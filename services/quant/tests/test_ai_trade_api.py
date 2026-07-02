@@ -269,6 +269,49 @@ async def test_lifecycle_start_status_stop_with_budget_clamp(monkeypatch):
         await dispose_engine()
 
 
+async def test_start_clamps_out_of_range_per_position_pct(monkeypatch):
+    """E4：越界单仓 pct（0.9）→ executor 生效值夹紧到 ai_trade_max_sl/tp_pct，回执如实告知。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start",
+                                  json=_start_body(strategy_id, stopLossPct=0.9, takeProfitPct=0.9))
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert abs(body["stopLossPct"] - 0.20) < 1e-9    # 夹到 ai_trade_max_sl_pct
+            assert abs(body["takeProfitPct"] - 0.50) < 1e-9  # 夹到 ai_trade_max_tp_pct
+            sess = get_ai_trade_manager()._session
+            assert abs(sess.executor.risk.stop_loss_pct - 0.20) < 1e-9
+    finally:
+        get_ai_trade_manager()._session = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_start_pct_falls_back_to_config_default_when_omitted(monkeypatch):
+    """E4：留空 stopLossPct/takeProfitPct → executor 回落 config 默认（0.05 / 0.10），回执含默认值。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(strategy_id))
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert abs(body["stopLossPct"] - 0.05) < 1e-9    # ai_trade_default_sl_pct
+            assert abs(body["takeProfitPct"] - 0.10) < 1e-9  # ai_trade_default_tp_pct
+    finally:
+        get_ai_trade_manager()._session = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
 async def test_second_start_rejected_by_session_limit(monkeypatch):
     strategy_id = await _fresh()
     app = _load_app()

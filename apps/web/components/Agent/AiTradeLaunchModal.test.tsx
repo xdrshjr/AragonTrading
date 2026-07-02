@@ -99,4 +99,32 @@ describe("AiTradeLaunchModal", () => {
     fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[0], { target: { value: "-5" } });
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
   });
+
+  it("confirms with per-position pct as null when blank (E4)", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.stopLossPct).toBeNull();
+    expect(opts.takeProfitPct).toBeNull();
+  });
+
+  it("blocks confirm on an invalid per-position stop-loss pct (E4)", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    // 「留空＝默认」占位顺序：[0]总预算 [1]杠杆 [2]单仓止损% [3]单仓止盈%
+    fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[2], { target: { value: "-1" } });
+    expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
+  });
+
+  it("clamps an out-of-range per-position pct in the preview, without blocking (E4)", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[2], { target: { value: "0.9" } });
+    expect(screen.getByText(/SL 20% \/ TP 默认/)).toBeInTheDocument(); // 0.9 夹到 max 0.2 → 20%
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+  });
 });

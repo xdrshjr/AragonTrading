@@ -41,6 +41,42 @@ class StrategySignalView:
     risk_params: RiskParams  # 策略风控（供 AI 参考，不入 WS 线格式）
 
 
+@dataclass
+class Consensus:
+    """策略共识度（E2）：信号板逐策略持久立场聚合出的多/空/空仓票 + 净立场 + 一致度。"""
+
+    long_votes: int
+    short_votes: int
+    flat_votes: int
+    total: int
+    net_stance: str        # long | short | flat（多空票差决定；相等 → flat）
+    agreement: float       # max(long,short)/total ∈ [0,1]（最大同向占比；空板 → 0）
+
+
+def compute_consensus(board: list["StrategySignalView"]) -> Consensus:
+    """把信号板逐策略持久立场 `stance` 聚合为共识度（纯聚合、无副作用、易单测，E2）。
+
+    Args:
+        board: 本轮信号板（每项 `stance ∈ {long, short, flat}`）。
+
+    Returns:
+        `Consensus`——票数分布 + 净立场（多空票差；相等即 flat）+ 一致度（最大同向占比）。
+    """
+    long_votes = sum(1 for v in board if v.stance == "long")
+    short_votes = sum(1 for v in board if v.stance == "short")
+    flat_votes = sum(1 for v in board if v.stance == "flat")
+    total = len(board)
+    if long_votes > short_votes:
+        net_stance = "long"
+    elif short_votes > long_votes:
+        net_stance = "short"
+    else:
+        net_stance = "flat"
+    agreement = max(long_votes, short_votes) / total if total else 0.0
+    return Consensus(long_votes=long_votes, short_votes=short_votes, flat_votes=flat_votes,
+                     total=total, net_stance=net_stance, agreement=round(agreement, 4))
+
+
 def make_shadow_broker(leverage: float = 1.0) -> SimBroker:
     """构造一个影子 `SimBroker`（每策略一个，读立场专用）。"""
     return SimBroker(_SHADOW_CAPITAL, taker_fee_bps=_SHADOW_FEE_BPS,

@@ -109,6 +109,15 @@ class Settings(BaseSettings):
     ai_trade_max_context_messages: int = Field(default=40, ge=2)
     ai_trade_decision_timeout_s: float = 60.0    # 单轮 LLM 决策超时（超时一律回落 hold）
     ai_trade_min_confidence: float = 0.0         # 置信度门槛（<该值降级 hold）；默认 0=不启用
+    # ---- 综合研判增强包（ai-auto-trading-enhancements v4 · E1/E2/E4）----
+    # E1 市场体制上下文：默认开（只读输入增强，向决策 prompt 注入一行市场体制；数据不足/异常自动省略）。
+    ai_trade_regime_context: bool = True         # E1：每轮注入市场体制上下文（只读；False=不注入）
+    # E2 共识门禁：默认 0=关闭（等价 v2）。>0 时开仓方向同向策略数不足即硬降级 hold（独立于 LLM，仅更保守）。
+    # 与既有 ai_trade_min_confidence 独立叠加：开仓须同时过「置信度 ≥ min_confidence」与「同向共识 ≥ min_consensus」。
+    ai_trade_min_consensus: int = Field(default=0, ge=0)   # E2：开仓最小同向策略数门禁（0=关闭）
+    # E4 单仓 OCO pct 夹紧上限：入参 stopLossPct/takeProfitPct 越界即夹到这里（留空则回落上方 default_sl/tp_pct）。
+    ai_trade_max_sl_pct: float = 0.20            # E4：单仓止损 pct 硬上限（入参越界夹紧）
+    ai_trade_max_tp_pct: float = 0.50            # E4：单仓止盈 pct 硬上限（入参越界夹紧）
 
     # ---- 代理（透传给 httpx / websockets）----
     http_proxy: str = ""

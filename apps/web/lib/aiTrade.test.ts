@@ -4,12 +4,16 @@ import {
   clampBudgetToCap,
   deriveDefaultBudget,
   describeAiAction,
+  describeConsensus,
+  describeExecuted,
+  describeRegime,
   describeStance,
   describeStopReason,
   resolveAiTradeGate,
   validateContextRounds,
   validateStrategySelection,
 } from "./aiTrade";
+import type { Consensus, MarketContext } from "./aiTradeTypes";
 
 const ready = {
   accountMode: "live" as const,
@@ -101,5 +105,74 @@ describe("describe helpers", () => {
     expect(describeStopReason("session_stop_loss")).toMatch(/止损/);
     expect(describeStopReason(null)).toBe("已停止");
     expect(describeStopReason("unknown_reason")).toBe("已停止");
+  });
+});
+
+const mc = (over: Partial<MarketContext> = {}): MarketContext => ({
+  primary: "trend_up",
+  volatility: "high_volatility",
+  event: "breakout",
+  confidence: 0.6,
+  labels: [],
+  ...over,
+});
+
+describe("describeRegime (E1, real regime enum, R-P1-2)", () => {
+  it("localizes the real regime enum", () => {
+    expect(describeRegime(mc())).toBe("上升趋势 · 高波动 · 突破");
+    expect(describeRegime(mc({ primary: "trend_down", volatility: "low_volatility", event: "crash" }))).toBe(
+      "下降趋势 · 低波动 · 急跌",
+    );
+  });
+  it("omits the event segment when none", () => {
+    expect(describeRegime(mc({ primary: "range", volatility: "normal", event: "none" }))).toBe("震荡 · 常波动");
+  });
+  it("falls back to the raw value for unknown enums (no fabrication)", () => {
+    expect(describeRegime(mc({ primary: "weird_regime", event: "none" }))).toBe("weird_regime · 高波动");
+  });
+  it("returns empty string for null/undefined", () => {
+    expect(describeRegime(null)).toBe("");
+    expect(describeRegime(undefined)).toBe("");
+  });
+});
+
+const consensus = (over: Partial<Consensus> = {}): Consensus => ({
+  longVotes: 3,
+  shortVotes: 1,
+  flatVotes: 1,
+  total: 5,
+  netStance: "long",
+  agreement: 0.6,
+  ...over,
+});
+
+describe("describeConsensus (E2)", () => {
+  it("renders votes and agreement percent", () => {
+    expect(describeConsensus(consensus())).toBe("3多/1空/1空仓 · 一致度 60%");
+  });
+  it("returns empty string when absent", () => {
+    expect(describeConsensus(null)).toBe("");
+  });
+});
+
+describe("describeExecuted (E3, four states + tone)", () => {
+  it("skipped in-flight round", () => {
+    expect(describeExecuted("hold", { skipped: true, reason: "decision_in_flight" }, null)).toEqual({
+      label: "已跳过",
+      tone: "muted",
+    });
+  });
+  it("consensus-gate downgrade shows reason with short tone", () => {
+    const view = describeExecuted("open_long", { traded: false }, "low_consensus(0/1)");
+    expect(view.tone).toBe("short");
+    expect(view.label).toMatch(/已降级观望/);
+    expect(view.label).toMatch(/low_consensus\(0\/1\)/);
+  });
+  it("filled open colored by side", () => {
+    expect(describeExecuted("open_long", { traded: true }, null)).toEqual({ label: "已成交", tone: "long" });
+    expect(describeExecuted("open_short", { traded: true }, null)).toEqual({ label: "已成交", tone: "short" });
+  });
+  it("plain hold is muted 观望", () => {
+    expect(describeExecuted("hold", { traded: false }, null)).toEqual({ label: "观望", tone: "muted" });
   });
 });

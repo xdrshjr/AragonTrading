@@ -345,6 +345,8 @@ class AiTradeStartIn(BaseModel):
     leverage: float | None = Field(default=None, gt=0, le=125)
     takeProfitUsd: float | None = Field(default=None, gt=0)  # 会话级止盈金额阈值；留空→不触发
     stopLossUsd: float | None = Field(default=None, gt=0)    # 会话级止损金额阈值；留空→不触发
+    stopLossPct: float | None = Field(default=None, gt=0)    # E4：单仓 OCO 止损%（服务端夹紧到 max）
+    takeProfitPct: float | None = Field(default=None, gt=0)  # E4：单仓 OCO 止盈%（服务端夹紧到 max）
     contextRefreshRounds: int = Field(default=10, ge=1)   # 精确区间在服务端按 min/max 校验
     priming: bool = True
     primingBars: int = Field(default=300, ge=10, le=PAPER_WINDOW_MAX)
@@ -360,6 +362,8 @@ class AiTradeStartOut(BaseModel):
     budgetUsd: float           # 夹紧后的最终生效预算（可能 < 用户填值）
     leverage: float
     contextRefreshRounds: int
+    stopLossPct: float | None = None    # E4：executor 生效止损%（服务端夹紧后回执）
+    takeProfitPct: float | None = None  # E4：executor 生效止盈%
 
 
 class StrategySignalViewOut(BaseModel):
@@ -380,6 +384,11 @@ class AiTradeDecisionOut(BaseModel):
     reason: str
     signalBoard: list[StrategySignalViewOut] = Field(default_factory=list)
     executed: dict | None = None   # {ok, skipped?, side?, qty?}
+    # E1/E2/E3 增量（可选，向后兼容）——注：decision WS 事件由 session._emit_decision 手工构 dict、不经
+    # 本模型序列化，故此三键仅为契约/文档镜像，真正上线以 _emit_decision 为准（R-P1-1）。
+    marketContext: dict | None = None   # E1：{primary,volatility,event,confidence,labels} 或 None
+    consensus: dict | None = None       # E2：{longVotes,shortVotes,flatVotes,total,netStance,agreement}
+    degradeReason: str | None = None    # E3：安全回落/共识门禁原因（low_consensus(k/n)/decision_timeout/…）
 
 
 class AiTradeSessionRow(BaseModel):

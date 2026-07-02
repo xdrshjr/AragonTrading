@@ -30,8 +30,15 @@ from ..okx.ws_client import OKXWSClient
 from ..paper.strategy_factory import PaperStrategySpec
 from ..strategies.base import Signal
 from .decider import AiTradeDecider, TradeDecision
+from .market_context import build_market_context
 from .market_window import MarketWindow
-from .signals import StrategySignalView, evaluate_signal_board, make_shadow_broker
+from .signals import (
+    Consensus,
+    StrategySignalView,
+    compute_consensus,
+    evaluate_signal_board,
+    make_shadow_broker,
+)
 
 _SNAPSHOT_EQUITY_MAX = 1000
 _DECISIONS_MAX = 50
@@ -313,11 +320,18 @@ class AiTradeSession:
         try:
             round_no = self.rounds_completed + 1
             payload = self._build_decision_payload(round_no, ts, ref_px, board)
+            consensus = compute_consensus(board)                 # E2：每轮只算一次（供门禁 + wire）
+            payload["consensus"] = self._consensus_wire(consensus)
             decision, degrade = await self.decider.decide(payload)
+            decision, degrade = self._apply_consensus_gate(decision, consensus, degrade)  # E2 门禁
             executed = await self._execute_decision(decision, ref_px, i, ts)
             self.rounds_completed = round_no
+            # R-P1-3：commit_round 收门禁后的最终 decision，journal/摘要据此记真实动作（保持上下文纯净）。
             summary = await self.decider.commit_round(payload, decision, executed)
-            await self._emit_decision(round_no, ts, decision, board, executed)
+            await self._emit_decision(round_no, ts, decision, board, executed,
+                                      market_context=payload.get("marketContext"),
+                                      consensus=payload.get("consensus"),
+                                      degrade_reason=degrade)
             if degrade:
                 await self._emit_degraded(ts, degrade)
             if summary is not None:
@@ -331,6 +345,23 @@ class AiTradeSession:
                 "ts": ts, "code": "AI_TRADE_ROUND_FAILED", "message": "本轮决策异常，已跳过"}})
         finally:
             self._deciding = False
+
+    def _apply_consensus_gate(self, decision: TradeDecision, consensus: Consensus,
+                              degrade: str | None) -> tuple[TradeDecision, str | None]:
+        """共识不足则把开仓硬降级为 hold（E2 补偿控制，独立于 LLM，仅更保守）。
+
+        入参 `consensus` 为 `Consensus` dataclass；门禁只作用于 `open_long/open_short`——
+        `close`/`hold` 从不被拦（保证「共识不足也永远能平仓保护」）。与既有置信度门独立叠加。
+        """
+        need = self.executor.settings.ai_trade_min_consensus
+        if need <= 0 or decision.action not in ("open_long", "open_short"):
+            return decision, degrade
+        votes = consensus.long_votes if decision.action == "open_long" else consensus.short_votes
+        if votes < need:
+            reason = f"low_consensus({votes}/{need})"          # 带计数，作 degradeReason（R-P2-4）
+            hold = TradeDecision(action="hold", size_fraction=None, confidence=None, reason=reason)
+            return hold, (degrade or reason)
+        return decision, degrade
 
     async def _execute_decision(self, decision: TradeDecision, ref_px: float, i: int,
                                 ts: int) -> dict:
@@ -409,7 +440,16 @@ class AiTradeSession:
             "sessionPnlUsd": round(self.executor.session_pnl_usd, 4),
             "budgetUsd": self.executor.budget_usd,
             "takeProfitUsd": self.take_profit_usd, "stopLossUsd": self.stop_loss_usd,
+            "marketContext": build_market_context(         # E1：只读；数据不足/禁用/异常 → None
+                self._window.base_df(), self.bar, self.executor.settings),
             "signalBoard": [self._view_full(v) for v in board]}
+
+    @staticmethod
+    def _consensus_wire(consensus: Consensus) -> dict:
+        """`Consensus` dataclass → camelCase wire dict（供 prompt 与 decision 事件，E2）。"""
+        return {"longVotes": consensus.long_votes, "shortVotes": consensus.short_votes,
+                "flatVotes": consensus.flat_votes, "total": consensus.total,
+                "netStance": consensus.net_stance, "agreement": consensus.agreement}
 
     @staticmethod
     def _view_full(v: StrategySignalView) -> dict:
@@ -426,11 +466,16 @@ class AiTradeSession:
                 "reason": v.reason}
 
     async def _emit_decision(self, round_no: int, ts: int, decision: TradeDecision,
-                             board: list[StrategySignalView], executed: dict) -> None:
+                             board: list[StrategySignalView], executed: dict, *,
+                             market_context: dict | None = None,
+                             consensus: dict | None = None,
+                             degrade_reason: str | None = None) -> None:
+        """推 decision 事件；E1/E2/E3 三个可选字段搭顺风车下发（旧前端忽略未知字段，向前兼容）。"""
         data = {"ts": ts, "round": round_no, "action": decision.action,
                 "sizeFraction": decision.size_fraction, "confidence": decision.confidence,
                 "reason": decision.reason, "signalBoard": [self._view_slim(v) for v in board],
-                "executed": executed}
+                "executed": executed, "marketContext": market_context,
+                "consensus": consensus, "degradeReason": degrade_reason}
         self._last_decision = data
         self._decisions.append(data)
         await self._push({"type": "decision", "data": data})
@@ -439,7 +484,8 @@ class AiTradeSession:
         data = {"ts": ts, "round": self.rounds_completed, "action": "hold",
                 "sizeFraction": None, "confidence": None, "reason": "上一轮决策仍在进行，本轮跳过",
                 "signalBoard": [self._view_slim(v) for v in board],
-                "executed": {"ok": True, "skipped": True, "reason": "decision_in_flight"}}
+                "executed": {"ok": True, "skipped": True, "reason": "decision_in_flight"},
+                "marketContext": None, "consensus": None, "degradeReason": None}
         self._last_decision = data
         self._decisions.append(data)
         await self._push({"type": "decision", "data": data})
