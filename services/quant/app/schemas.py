@@ -14,6 +14,7 @@ from .db.models import (
     StrategyRun,
     Trade,
     WeightModel,
+    WeightTrainBatch,
     WeightTrainRun,
 )
 from .engine.metrics import _empty_metrics
@@ -1233,6 +1234,117 @@ class WeightBacktestReq(BaseModel):
         if self.startTs is not None and self.endTs is not None and self.startTs >= self.endTs:
             raise ValueError("startTs must be less than endTs")
         return self
+
+
+# ---------------- 多模型训练竞技场（weight-multi-model-training §四/五，批次并行训练 + 择优） ----------------
+def _run_metric(row: WeightTrainRun, key: str) -> float | None:
+    """取某 run 的 ``metrics_json`` 内数值键（icOut/icIn/nTrain）；缺 / 坏 JSON / 非数值 → ``None``（R7 桥接）。"""
+    import json
+    try:
+        metrics = json.loads(row.metrics_json or "")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    value = metrics.get(key) if isinstance(metrics, dict) else None
+    return float(value) if isinstance(value, (int, float)) else None
+
+
+def weight_batch_ranking(runs: list[WeightTrainRun]) -> list[dict]:
+    """派生排行榜（weight-multi-model-training §2.5）：succeeded 按 icOut 降序（tie: icIn→nTrain→runId 升序），
+    非成功候选（running/queued/failed/cancelled/无 icOut）殿后；仅首个 succeeded 置 ``isBest``。
+
+    无成功候选时全无 ``isBest``（前端择优 / 应用最佳按此禁用，§4.1）。
+    """
+    entries = [{
+        "runId": r.id, "method": r.method, "variantLabel": r.variant_label or "",
+        "status": r.status, "icOut": _run_metric(r, "icOut"), "icIn": _run_metric(r, "icIn"),
+        "nTrain": _run_metric(r, "nTrain"),
+    } for r in runs]
+    scored = [e for e in entries if e["status"] == "succeeded" and e["icOut"] is not None]
+    scored.sort(key=lambda e: (
+        e["icOut"], e["icIn"] if e["icIn"] is not None else float("-inf"),
+        e["nTrain"] if e["nTrain"] is not None else 0.0, -e["runId"]), reverse=True)
+    scored_ids = {e["runId"] for e in scored}
+    rest = [e for e in entries if e["runId"] not in scored_ids]
+    ranking = scored + rest
+    for idx, entry in enumerate(ranking):
+        entry["isBest"] = idx == 0 and entry["runId"] in scored_ids
+    return ranking
+
+
+def weight_batch_status(runs: list[WeightTrainRun]) -> str:
+    """批次派生状态（weight-multi-model-training §4.1，不单独落库）：存在 queued/running → running；
+    全终态且 ≥1 succeeded → succeeded；无 succeeded 且有 cancelled → cancelled；否则（全 failed）→ failed。"""
+    statuses = [r.status for r in runs]
+    if any(s in ("queued", "running") for s in statuses):
+        return "running"
+    if any(s == "succeeded" for s in statuses):
+        return "succeeded"
+    if any(s == "cancelled" for s in statuses):
+        return "cancelled"
+    return "failed"
+
+
+def weight_batch_out(batch: WeightTrainBatch, runs: list[WeightTrainRun]) -> dict:
+    """WeightTrainBatch 行 + 候选 run 行 → 前端详情 dict（camelCase）。候选复用 ``weight_train_run_out``（不含 curve）。"""
+    return {
+        "batchId": batch.id, "label": batch.label, "instId": batch.inst_id, "bar": batch.bar,
+        "startTs": batch.start_ts, "endTs": batch.end_ts, "horizon": batch.horizon,
+        "members": _load_json(batch.members_json, []), "config": _load_json(batch.config_json, {}),
+        "parentModelId": batch.parent_model_id, "factorSetId": batch.factor_set_id,
+        "origin": batch.origin, "selectedRunId": batch.selected_run_id,
+        "status": weight_batch_status(runs),
+        "candidates": [weight_train_run_out(r, with_curve=False) for r in runs],
+        "ranking": weight_batch_ranking(runs),
+        "createdTs": int(batch.created_at.timestamp()) if batch.created_at else 0,
+        "updatedTs": int(batch.updated_at.timestamp()) if batch.updated_at else 0,
+    }
+
+
+def weight_batch_summary_out(batch: WeightTrainBatch, runs: list[WeightTrainRun]) -> dict:
+    """WeightTrainBatch 行 → 前端列表概要 dict（camelCase；含候选计数 + 最优候选摘要，不含逐候选详情）。"""
+    ranking = weight_batch_ranking(runs)
+    best = next((e for e in ranking if e.get("isBest")), None)
+    return {
+        "batchId": batch.id, "label": batch.label, "instId": batch.inst_id, "bar": batch.bar,
+        "startTs": batch.start_ts, "endTs": batch.end_ts, "horizon": batch.horizon,
+        "parentModelId": batch.parent_model_id, "factorSetId": batch.factor_set_id,
+        "origin": batch.origin, "selectedRunId": batch.selected_run_id,
+        "status": weight_batch_status(runs), "candidateCount": len(runs),
+        "succeededCount": sum(1 for r in runs if r.status == "succeeded"), "best": best,
+        "createdTs": int(batch.created_at.timestamp()) if batch.created_at else 0,
+        "updatedTs": int(batch.updated_at.timestamp()) if batch.updated_at else 0,
+    }
+
+
+class WeightBatchCandidateIn(BaseModel):
+    """一个批次候选：方法 + 可选超参变体（config 覆盖共享配置）+ 显示标签。"""
+
+    method: _WEIGHT_METHODS
+    config: dict[str, Any] = Field(default_factory=dict)
+    variantLabel: str = Field(default="", max_length=64)
+
+
+class WeightBatchStartReq(_FactorRange):
+    """启动多模型训练批次入参（继承 ``_FactorRange`` 区间校验，weight-multi-model-training §4.1）。
+
+    共享规格（members/instId/bar/区间/horizon/config）+ 候选数组（2..max_weight_batch_candidates，方法可重复
+    以承载同方法多变体）。``origin`` 决定是否可回流组合（仅 builder），``factorSetId`` 弱溯源。
+    """
+
+    members: list[FactorMemberIn] = Field(min_length=1, max_length=12)
+    config: dict[str, Any] = Field(default_factory=dict)
+    horizon: int = Field(default=6, ge=1, le=100)
+    candidates: list[WeightBatchCandidateIn] = Field(min_length=1, max_length=16)
+    factorSetId: int | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    origin: Literal["builder", "model"] = "model"
+    maxBars: int | None = Field(default=None, ge=10, le=200000)
+
+
+class WeightBatchSelectReq(BaseModel):
+    """择优入参：把某成功候选记为批次显式最优（写 ``selected_run_id``）。"""
+
+    runId: int
 
 
 class ErrorBody(BaseModel):

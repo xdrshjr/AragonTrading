@@ -135,6 +135,9 @@ class Settings(BaseSettings):
     max_weight_train_jobs: int = Field(default=4, ge=1, le=16)      # 同时在跑的流式训练作业上限（R-01 429 守门）
     weight_train_curve_steps: int = Field(default=6, ge=2, le=20)   # 扩样本学习曲线的 fraction 网格步数（末点恒 1.0）
     weight_model_run_cap: int = Field(default=50, ge=1, le=500)     # 单模型训练记录上限；超出按时间剪枝且显式 log（R-05）
+    # 多模型训练竞技场（weight-multi-model-training §3.2/config）：单个批次可勾选的候选方法 / 超参变体数上限，
+    # 界定单批资源上界（候选超可用名额时进服务端 FIFO 队列，名额释放即泵起，绝不突破 max_weight_train_jobs）。
+    max_weight_batch_candidates: int = Field(default=8, ge=2, le=16)  # 单批候选数上限（超出即 400 守门，绝不无界扇出）
 
     # ---- Agent（对话式 AI 助手）LLM 接入 (Agent Trading Copilot spec §3.1) ----
     # 字段名即环境变量名（AGENT_*，大小写不敏感）；密钥仅存后端，绝不下发前端 / 不入库 / 不进日志。

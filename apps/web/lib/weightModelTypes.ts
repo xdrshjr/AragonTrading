@@ -9,8 +9,10 @@ import type {
 } from "./factorTypes";
 import type { Candle, EquityPoint, Metrics, Trade } from "./types";
 
-export type WeightModelSource = "builder" | "manual";
-export type WeightRunStatus = "running" | "succeeded" | "failed" | "cancelled";
+// "batch" = 多模型训练竞技场的批次父模型来源（weight-multi-model-training）；主列表默认过滤。
+export type WeightModelSource = "builder" | "manual" | "batch";
+// "queued" = 已落库、等待名额、尚未启动作业（批次候选，weight-multi-model-training §5.3）。
+export type WeightRunStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 export type NormStats = { normWindow: number; clip: number };
 
 // 扩样本学习曲线点（GET runs/{id}.curve + WS curve 事件）。损失 / IC 任一段样本不足记 null（绝不假装 0）。

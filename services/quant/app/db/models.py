@@ -283,21 +283,60 @@ class WeightModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 
 
+class WeightTrainBatch(Base):
+    """一次多模型训练批次（多模型训练竞技场，weight-multi-model-training §5.1）。
+
+    承载共享规格（成员 / 标的·周期 / 时间窗 / 前瞻 / 阈值）+ 批次父模型指针 + 用户显式择优记录。
+    K 个候选训练记录（``WeightTrainRun.batch_id`` 指向本行、``model_id`` 指向 ``parent_model_id``）在同一份
+    规格下并行训练。``parent_model_id`` 用普通整数不加外键（仿 ``WeightModel.latest_run_id``，级联删由
+    service 单事务保证，绝不依赖 DB 级联）。``create_all`` 加法建表、零数据迁移。所有时间秒级 UTC（C2）。
+    """
+
+    __tablename__ = "weight_train_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    label: Mapped[str] = mapped_column(String(128))                   # 批次名（缺省 = 成员摘要 + "多模型对比"）
+    inst_id: Mapped[str] = mapped_column(String(32))                  # 共享标的
+    bar: Mapped[str] = mapped_column(String(8))                       # 共享周期
+    start_ts: Mapped[int] = mapped_column(Integer, default=0)         # 共享训练窗口起
+    end_ts: Mapped[int] = mapped_column(Integer, default=0)           # 共享训练窗口止
+    horizon: Mapped[int] = mapped_column(Integer, default=6)          # 共享前瞻根数
+    members_json: Mapped[str] = mapped_column(Text, default="[]")     # 共享成员快照（JSON）
+    config_json: Mapped[str] = mapped_column(Text, default="{}")      # 共享配置（thresholds/normWindow 等，JSON）
+    parent_model_id: Mapped[int] = mapped_column(Integer)             # 批次父模型 id（普通整数、不加外键，仿 latest_run_id）
+    factor_set_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 弱溯源来源组合
+    origin: Mapped[str] = mapped_column(String(16), default="model")  # builder|model（回流门禁用，缺省 model）
+    selected_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 用户显式择优的候选 run（缺省 null，读取回落 best）
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
 class WeightTrainRun(Base):
-    """一次权重训练记录（状态机：running→succeeded|failed|cancelled）（weight-model-workspace §6.2）。
+    """一次权重训练记录（状态机：queued→running→succeeded|failed|cancelled）（weight-model-workspace §6.2）。
 
     归属某 ``WeightModel``（``model_id`` 真外键，cascade delete 由 service 单事务保证）。承载训练窗口
     快照 + loss/IC 学习曲线 + 归一化权重 + 指标 + 溯源 + 失败 / 取消信息。每条 run 必达终态之一，含
-    lifespan 启动对账（悬挂 ``running`` → ``failed``，error_code=WEIGHT_TRAIN_INTERRUPTED，R-04）。
+    lifespan 启动对账（悬挂 ``running``/``queued`` → ``failed``，error_code=WEIGHT_TRAIN_INTERRUPTED，R-04）。
+
+    多模型训练竞技场扩展（weight-multi-model-training §5.2）：``batch_id`` 归属批次（独立训练为 NULL、
+    零影响既有行为），``queued`` = 已落库、等待名额、尚未启动作业。**注意**：``batch_id`` / ``variant_label``
+    是**既有**表的新增列，``create_all`` 不给已存在的表补列——须靠 ``session.py::_ensure_weight_run_columns``
+    启动时 ``ALTER TABLE ADD COLUMN`` 幂等补齐（仿 ``_ensure_trade_risk_columns``），否则老库 INSERT 立即
+    ``OperationalError: no such column``（R1/P0）。
     """
 
     __tablename__ = "weight_train_runs"
-    __table_args__ = (Index("ix_weight_run_model", "model_id", "id"),)
+    __table_args__ = (
+        Index("ix_weight_run_model", "model_id", "id"),
+        Index("ix_weight_run_batch", "batch_id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     model_id: Mapped[int] = mapped_column(ForeignKey("weight_models.id"), index=True)
-    status: Mapped[str] = mapped_column(String(16), default="running")  # running|succeeded|failed|cancelled
+    batch_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 归属批次；独立训练为 NULL（既有行为零影响）
+    status: Mapped[str] = mapped_column(String(16), default="running")  # queued|running|succeeded|failed|cancelled
     method: Mapped[str] = mapped_column(String(24))
+    variant_label: Mapped[str] = mapped_column(String(64), default="")   # 同方法多超参变体的显示标签
     inst_id: Mapped[str] = mapped_column(String(32))
     bar: Mapped[str] = mapped_column(String(8))
     start_ts: Mapped[int] = mapped_column(Integer, default=0)

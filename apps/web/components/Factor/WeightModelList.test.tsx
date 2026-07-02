@@ -50,7 +50,7 @@ afterEach(cleanup);
 
 describe("WeightModelList — H-F10 守护 + 缓存失效（G-T1）", () => {
   it("toggling 显示已停用 re-queries the list with enabled=undefined", async () => {
-    wrap(<WeightModelList onTrain={noop} onView={noop} onBacktest={noop} onEdit={noop} onNew={noop} />);
+    wrap(<WeightModelList onTrain={noop} onView={noop} onBacktest={noop} onEdit={noop} onNew={noop} onNewBatch={noop} onOpenBatch={noop} />);
     await waitFor(() => expect(screen.getByText("动量组合")).toBeTruthy());   // 列表已渲染
     expect(api.list).toHaveBeenCalledWith(true);                              // 默认仅启用
     fireEvent.click(screen.getByRole("switch"));                             // 切到「显示已停用」
@@ -59,14 +59,14 @@ describe("WeightModelList — H-F10 守护 + 缓存失效（G-T1）", () => {
 
   it("disables the 训练 button for a model whose latest run is running (G-F10)", async () => {
     api.list.mockResolvedValue([model({ latestRun: runningRun() })]);
-    wrap(<WeightModelList onTrain={noop} onView={noop} onBacktest={noop} onEdit={noop} onNew={noop} />);
+    wrap(<WeightModelList onTrain={noop} onView={noop} onBacktest={noop} onEdit={noop} onNew={noop} onNewBatch={noop} onOpenBatch={noop} />);
     await waitFor(() => expect(screen.getByText("动量组合")).toBeTruthy());
     const train = screen.getByRole("button", { name: "训练" }) as HTMLButtonElement;
     expect(train.disabled).toBe(true);   // 在跑模型禁「训练」，杜绝重叠 run
   });
 
   it("switch has no redundant aria-label and is associated via <label htmlFor> (G-F11)", async () => {
-    wrap(<WeightModelList onTrain={noop} onView={noop} onBacktest={noop} onEdit={noop} onNew={noop} />);
+    wrap(<WeightModelList onTrain={noop} onView={noop} onBacktest={noop} onEdit={noop} onNew={noop} onNewBatch={noop} onOpenBatch={noop} />);
     await waitFor(() => expect(screen.getByText("动量组合")).toBeTruthy());
     const sw = screen.getByRole("switch");
     expect(sw).toHaveAttribute("id", "wm-show-disabled");
@@ -78,7 +78,7 @@ describe("WeightModelList — H-F10 守护 + 缓存失效（G-T1）", () => {
     const spy = vi.spyOn(client, "invalidateQueries");
     render(
       <QueryClientProvider client={client}>
-        <WeightModelList onTrain={noop} onView={noop} onBacktest={noop} onEdit={noop} onNew={noop} />
+        <WeightModelList onTrain={noop} onView={noop} onBacktest={noop} onEdit={noop} onNew={noop} onNewBatch={noop} onOpenBatch={noop} />
       </QueryClientProvider>,
     );
     await waitFor(() => expect(screen.getByText("动量组合")).toBeTruthy());
@@ -90,7 +90,7 @@ describe("WeightModelList — H-F10 守护 + 缓存失效（G-T1）", () => {
   });
 
   it("cancelling the ConfirmDialog does not delete", async () => {
-    wrap(<WeightModelList onTrain={noop} onView={noop} onBacktest={noop} onEdit={noop} onNew={noop} />);
+    wrap(<WeightModelList onTrain={noop} onView={noop} onBacktest={noop} onEdit={noop} onNew={noop} onNewBatch={noop} onOpenBatch={noop} />);
     await waitFor(() => expect(screen.getByText("动量组合")).toBeTruthy());
     fireEvent.click(screen.getByRole("button", { name: "删除" }));
     const dialog = await screen.findByRole("dialog");
@@ -102,7 +102,7 @@ describe("WeightModelList — H-F10 守护 + 缓存失效（G-T1）", () => {
 describe("WeightModelList — 卡片一键回测入口（weight-model-backtest-replay §六）", () => {
   it("disables the 回测 button for a model with no successful run (latestRunId=null)", async () => {
     api.list.mockResolvedValue([model({ latestRunId: null })]);
-    wrap(<WeightModelList onTrain={noop} onView={noop} onBacktest={noop} onEdit={noop} onNew={noop} />);
+    wrap(<WeightModelList onTrain={noop} onView={noop} onBacktest={noop} onEdit={noop} onNew={noop} onNewBatch={noop} onOpenBatch={noop} />);
     await waitFor(() => expect(screen.getByText("动量组合")).toBeTruthy());
     const backtest = screen.getByRole("button", { name: "回测" }) as HTMLButtonElement;
     expect(backtest.disabled).toBe(true);
@@ -112,7 +112,7 @@ describe("WeightModelList — 卡片一键回测入口（weight-model-backtest-r
   it("enables 回测 and fires onBacktest with the model when latestRunId is present", async () => {
     const onBacktest = vi.fn();
     api.list.mockResolvedValue([model({ latestRunId: 42 })]);
-    wrap(<WeightModelList onTrain={noop} onView={noop} onBacktest={onBacktest} onEdit={noop} onNew={noop} />);
+    wrap(<WeightModelList onTrain={noop} onView={noop} onBacktest={onBacktest} onEdit={noop} onNew={noop} onNewBatch={noop} onOpenBatch={noop} />);
     await waitFor(() => expect(screen.getByText("动量组合")).toBeTruthy());
     const backtest = screen.getByRole("button", { name: "回测" }) as HTMLButtonElement;
     expect(backtest.disabled).toBe(false);

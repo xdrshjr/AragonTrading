@@ -68,6 +68,7 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await _ensure_trade_risk_columns(conn)
+        await _ensure_weight_run_columns(conn)
     await _seed_builtin_strategies()
     await _seed_builtin_factors()
     await _seed_agent_providers()
@@ -90,6 +91,27 @@ async def _ensure_trade_risk_columns(conn) -> None:
             await conn.execute(
                 text(f"ALTER TABLE trades ADD COLUMN {name} {sql_type}")
             )
+
+
+async def _ensure_weight_run_columns(conn) -> None:
+    """老库幂等补列（weight-multi-model-training R1/P0）：``weight_train_runs`` 是既有表，
+    ``create_all`` 不会为其补 ``batch_id``/``variant_label`` 两列——须此处 ``ALTER TABLE ADD COLUMN``
+    幂等补齐（仿 ``_ensure_trade_risk_columns``），否则老库 INSERT/SELECT 立即 ``no such column``、
+    连既有单次训练一并崩。补列后 ``CREATE INDEX IF NOT EXISTS`` 建批次索引（幂等、老库安全）。
+    """
+    rows = (await conn.execute(text("PRAGMA table_info(weight_train_runs)"))).all()
+    columns = {row[1] for row in rows}
+    batch_columns = {
+        "batch_id": "INTEGER",
+        "variant_label": "VARCHAR(64) DEFAULT ''",
+    }
+    for name, sql_type in batch_columns.items():
+        if name not in columns:
+            await conn.execute(
+                text(f"ALTER TABLE weight_train_runs ADD COLUMN {name} {sql_type}")
+            )
+    await conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_weight_run_batch ON weight_train_runs(batch_id)"))
 
 
 async def _seed_builtin_strategies() -> None:

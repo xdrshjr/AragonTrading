@@ -20,7 +20,9 @@ from .models import WeightModel, WeightTrainRun
 
 logger = logging.getLogger("aragon")
 
-WEIGHT_MODEL_SOURCES = ("builder", "manual")
+# "batch" = 多模型训练竞技场的批次父模型来源（weight-multi-model-training R4）；主列表默认过滤，
+# run/backtest/delete 路径把 batch 父模型当普通模型对待，无 source 分支耦合。
+WEIGHT_MODEL_SOURCES = ("builder", "manual", "batch")
 
 
 # ============================ 聚合传参（frozen dataclass，仿 FactorSetValues） ============================
@@ -59,7 +61,11 @@ class WeightModelPatch:
 
 @dataclass(frozen=True)
 class WeightRunStart:
-    """启动一次训练记录的快照入参（落 ``running`` 记录）。"""
+    """启动一次训练记录的快照入参（落 ``running``/``queued`` 记录）。
+
+    ``batch_id``/``variant_label``（weight-multi-model-training §5.2）：批次候选归属批次 + 变体标签；
+    独立训练留缺省（``None``/``""``，既有行为零影响）。
+    """
 
     model_id: int
     method: str
@@ -70,6 +76,8 @@ class WeightRunStart:
     horizon: int
     config: dict
     started_ts: int
+    batch_id: int | None = None
+    variant_label: str = ""
 
 
 @dataclass(frozen=True)
@@ -234,7 +242,8 @@ async def delete_weight_model(session: AsyncSession, model_id: int) -> str:
         return "not_found"
     runs = (await session.execute(
         select(WeightTrainRun).where(WeightTrainRun.model_id == model_id))).scalars().all()
-    if any(run.status == "running" for run in runs):
+    # weight-multi-model-training §5.3：queued 视同 running（不可删，须先取消）。
+    if any(run.status in ("running", "queued") for run in runs):
         return "running"
     for run in runs:
         await session.delete(run)
@@ -244,17 +253,45 @@ async def delete_weight_model(session: AsyncSession, model_id: int) -> str:
 
 
 # ============================ 训练记录 + 指针完整性（R-05） ============================
-async def add_weight_run(session: AsyncSession, *, start: WeightRunStart) -> WeightTrainRun:
-    """落一条 ``running`` 训练记录并提交（注册作业前持久化，R-01）。"""
+async def add_weight_run(session: AsyncSession, *, start: WeightRunStart,
+                         status: str = "running") -> WeightTrainRun:
+    """落一条训练记录并提交（注册作业前持久化，R-01）。
+
+    ``status`` 缺省 ``running``（独立训练：先落库再注册作业）；批次候选传 ``queued``（等待名额，尚未起作业，
+    weight-multi-model-training §5.3）。约束：仅接受 ``running``/``queued``（终态经 ``finalize_weight_run``）。
+    """
+    if status not in ("running", "queued"):
+        raise ValueError(f"add_weight_run status must be running|queued, got {status!r}")
     row = WeightTrainRun(
-        model_id=start.model_id, status="running", method=start.method,
-        inst_id=start.inst_id, bar=start.bar, start_ts=start.start_ts, end_ts=start.end_ts,
-        horizon=int(start.horizon), config_json=_dump(start.config or {}),
-        started_ts=start.started_ts)
+        model_id=start.model_id, batch_id=start.batch_id, status=status, method=start.method,
+        variant_label=start.variant_label or "", inst_id=start.inst_id, bar=start.bar,
+        start_ts=start.start_ts, end_ts=start.end_ts, horizon=int(start.horizon),
+        config_json=_dump(start.config or {}), started_ts=start.started_ts)
     session.add(row)
     await session.commit()
     await session.refresh(row)
     return row
+
+
+async def add_queued_weight_run(session: AsyncSession, *, start: WeightRunStart) -> WeightTrainRun:
+    """落一条 ``queued`` 训练记录（批次候选等待名额，weight-multi-model-training §5.3）。"""
+    return await add_weight_run(session, start=start, status="queued")
+
+
+async def mark_run_running(session: AsyncSession, run_id: int, *, started_ts: int) -> WeightTrainRun | None:
+    """把 ``queued`` 候选转 ``running`` 并盖启动时刻（调度泵取得名额、注册作业前，§2.3）；不存在 → ``None``。
+
+    仅当当前为 ``queued`` 时迁移（幂等守门：已 running/终态则不动，避免覆盖）。
+    """
+    run = await session.get(WeightTrainRun, run_id)
+    if run is None:
+        return None
+    if run.status == "queued":
+        run.status = "running"
+        run.started_ts = started_ts
+        await session.commit()
+        await session.refresh(run)
+    return run
 
 
 async def get_weight_run(session: AsyncSession, model_id: int, run_id: int) -> WeightTrainRun | None:
@@ -308,7 +345,9 @@ async def _prune_runs(session: AsyncSession, model: WeightModel, cap: int) -> in
     best_id = _best_ic_run_id(rows)   # H-B8：保护当前最佳 IC 记录，使自动剪枝不令「历史最佳」失真
     dropped = 0
     for idx, run in enumerate(rows):
-        if idx < cap or run.id == model.latest_run_id or run.status == "running" or run.id == best_id:
+        # weight-multi-model-training §5.3：queued 与 running 同守，绝不剪未跑 / 在跑候选。
+        if (idx < cap or run.id == model.latest_run_id or run.status in ("running", "queued")
+                or run.id == best_id):
             continue
         await session.delete(run)
         dropped += 1
@@ -374,7 +413,8 @@ async def fail_orphan_running_runs(session: AsyncSession, model_id: int, *, aliv
     真·在跑 run 绝不误杀——真·在跑由 service 提前返 409）。
     """
     rows = (await session.execute(select(WeightTrainRun).where(
-        WeightTrainRun.model_id == model_id, WeightTrainRun.status == "running"))).scalars().all()
+        WeightTrainRun.model_id == model_id,
+        WeightTrainRun.status.in_(("running", "queued"))))).scalars().all()
     orphans = [r for r in rows if r.id not in alive]
     for run in orphans:
         run.status = "failed"
@@ -388,12 +428,15 @@ async def fail_orphan_running_runs(session: AsyncSession, model_id: int, *, aliv
 
 
 async def reconcile_dangling_weight_runs(session: AsyncSession) -> int:
-    """启动对账（R-04）：上轮进程残留的 ``running`` 记录批量改判 ``failed``，并按 R-05 修受影响模型指针。
+    """启动对账（R-04）：上轮进程残留的 ``running``/``queued`` 记录批量改判 ``failed``，并按 R-05 修受影响模型指针。
+
+    weight-multi-model-training §2.6：``queued`` 与 ``running`` 同判——上轮未及启动的批次候选亦须收口，绝不留悬挂。
 
     仿 ``factors/service.backfill_companions`` 一次性 session；返回改判条数（lifespan 启动调用，幂等）。
     """
     rows = (await session.execute(
-        select(WeightTrainRun).where(WeightTrainRun.status == "running"))).scalars().all()
+        select(WeightTrainRun).where(
+            WeightTrainRun.status.in_(("running", "queued"))))).scalars().all()
     if not rows:
         return 0
     affected: set[int] = set()

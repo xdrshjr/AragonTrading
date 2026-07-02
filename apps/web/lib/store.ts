@@ -27,6 +27,7 @@ import type {
 } from "./liveAutoTypes";
 import type { FactorEditTarget, FactorTargetRef, SymbolGroup } from "./factorTypes";
 import type { WeightTrainResult, WeightTrainTarget } from "./weightModelTypes";
+import type { WeightBatchTarget } from "./weightBatchTypes";
 import type { WorkspacePrefs } from "./workspaceTypes";
 import { clampAllocationOnEdit, defaultAllocationOnAdd, evenSplit } from "./autoTrade";
 
@@ -173,6 +174,9 @@ interface AppState {
   // boundModelId —— 同搭建会话内反复训练复用同一模型（R-02 去重记忆），刷新即复位。
   weightTrainTarget: WeightTrainTarget | null;
   weightTrainResult: WeightTrainResult | null;
+  // weightBatchTarget —— builder / 列表点「多模型训练」写入，WeightModelPanel 消费一次性切到竞技场启动器
+  // （瞬态，不入 partialize，随 weightTrainTarget 一并复位，weight-multi-model-training §3.4）。
+  weightBatchTarget: WeightBatchTarget | null;
   boundModelId: number | null;
 
   setInst: (instId: string) => void;
@@ -258,6 +262,7 @@ interface AppState {
   setFactorOverlay: (overlay: FactorOverlay | null) => void;
   setFactorEditTarget: (target: FactorEditTarget | null) => void;
   setWeightTrainTarget: (target: WeightTrainTarget | null) => void;
+  setWeightBatchTarget: (target: WeightBatchTarget | null) => void;
   setWeightTrainResult: (result: WeightTrainResult | null) => void;
   setBoundModelId: (id: number | null) => void;
 }
@@ -374,6 +379,7 @@ export const useAppStore = create<AppState>()(
       factorEditTarget: null,
       // 权重模型工作区交接态默认空（瞬态，不持久化）。
       weightTrainTarget: null,
+      weightBatchTarget: null,
       weightTrainResult: null,
       boundModelId: null,
 
@@ -632,6 +638,7 @@ export const useAppStore = create<AppState>()(
       setFactorEditTarget: (factorEditTarget) => set({ factorEditTarget }),
       // 权重模型交接态（瞬态）：builder ⇄ 实时训练视图一次性消费载荷 + 同会话模型复用记忆。
       setWeightTrainTarget: (weightTrainTarget) => set({ weightTrainTarget }),
+      setWeightBatchTarget: (weightBatchTarget) => set({ weightBatchTarget }),
       setWeightTrainResult: (weightTrainResult) => set({ weightTrainResult }),
       setBoundModelId: (boundModelId) => set({ boundModelId }),
       // 纵向分栏比例：夹取到 [MIN, MAX]；非有限数忽略（守住边界，与 simBalance 同模式）。

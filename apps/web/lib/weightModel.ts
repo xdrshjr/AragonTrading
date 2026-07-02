@@ -102,6 +102,16 @@ export function sortModelsByUpdated(models: WeightModel[]): WeightModel[] {
   return [...models].sort((a, b) => b.updatedTs - a.updatedTs);
 }
 
+// 是否批次父模型（多模型训练竞技场产物，weight-multi-model-training）：主列表默认过滤，仅「训练批次」tab 可见。
+export function isBatchModel(model: WeightModel): boolean {
+  return model.source === "batch";
+}
+
+// 过滤出用户真·可复用模型（排除批次父模型，杜绝污染主列表；批次父模型经「训练批次」tab 管理）。
+export function filterUserModels(models: WeightModel[]): WeightModel[] {
+  return models.filter((m) => !isBatchModel(m));
+}
+
 // 卡片「回测」按钮可用性单一口径：模型已完成至少一次成功训练（latestRunId 非空即指向一条成功记录，
 // repoint_weight_model 保证；成员漂移则 latestRunId 被作废置 null）。
 export function canBacktestModel(model: WeightModel): boolean {
@@ -169,6 +179,7 @@ export function codeLabel(code: string | null | undefined): string {
 }
 
 const STATUS_LABELS: Record<WeightRunStatus, string> = {
+  queued: "排队中",
   running: "训练中",
   succeeded: "成功",
   failed: "失败",
@@ -183,7 +194,7 @@ export function runStatusTone(status: WeightRunStatus): "long" | "short" | "neut
   if (status === "succeeded") return "long";
   if (status === "failed") return "short";
   if (status === "running") return "accent";
-  return "neutral";
+  return "neutral";   // queued / cancelled → 中性
 }
 
 // 损失数值格式化：null → "—"，否则三位小数（缺测显式，绝不假装 0）。

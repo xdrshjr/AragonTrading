@@ -965,6 +965,7 @@ from .weight_model_repositories import (  # noqa: E402,F401
     WeightModelSpec,
     WeightRunOutcome,
     WeightRunStart,
+    add_queued_weight_run,
     add_weight_run,
     create_weight_model,
     delete_weight_model,
@@ -976,8 +977,19 @@ from .weight_model_repositories import (  # noqa: E402,F401
     get_weight_run,
     list_weight_models,
     list_weight_runs,
+    mark_run_running,
     reconcile_dangling_weight_runs,
     refresh_weight_model_spec,
     repoint_weight_model,
     update_weight_model,
+)
+# weight_batch_repositories：多模型训练批次 CRUD / 子候选查询 / 择优写入 / 单事务级联删（weight-multi-model-training §3.1）。
+from .weight_batch_repositories import (  # noqa: E402,F401
+    WeightBatchSpec,
+    cascade_delete_weight_batch,
+    create_weight_batch,
+    get_weight_batch,
+    list_batch_runs,
+    list_weight_batches,
+    set_batch_selected_run,
 )

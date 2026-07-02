@@ -27,6 +27,7 @@ import {
   type TrainResult,
 } from "@/lib/factorTypes";
 import { buildTrainTarget, methodLabel, weightResultToTrained } from "@/lib/weightModel";
+import { buildBatchTarget } from "@/lib/weightBatch";
 import { useAppStore } from "@/lib/store";
 import MemberPalette from "./MemberPalette";
 import WeightBars from "./WeightBars";
@@ -62,6 +63,7 @@ export default function FactorSetBuilder() {
   // 权重模型工作区交接：训练权重跳转 + 回流水合（weight-model-workspace §3.4）。
   const setSection = useAppStore((s) => s.setFactorLabSection);
   const setWeightTrainTarget = useAppStore((s) => s.setWeightTrainTarget);
+  const setWeightBatchTarget = useAppStore((s) => s.setWeightBatchTarget);
   const weightTrainResult = useAppStore((s) => s.weightTrainResult);
   const setWeightTrainResult = useAppStore((s) => s.setWeightTrainResult);
   const boundModelId = useAppStore((s) => s.boundModelId);
@@ -236,6 +238,30 @@ export default function FactorSetBuilder() {
         // 标的组训练（factor-lab-symbol-groups §3.5）：wb.symbols 含焦点，group 目标随来源组 id。
         symbols: wb.symbols,
         symbolGroupId: wb.target.kind === "group" ? wb.target.groupId : undefined,
+      }),
+    );
+    setSection("models");
+  };
+
+  // 「多模型训练」→ 跳转「权重模型」竞技场启动器：写批次交接载荷（共享成员/标的/周期/时间窗，origin=builder
+  // 供最佳候选回流组合，weight-multi-model-training §3.4）→ 切 models section。
+  const goBatch = () => {
+    if (memberError) {
+      setNotice(memberError);
+      return;
+    }
+    setWeightBatchTarget(
+      buildBatchTarget({
+        members,
+        thresholds,
+        horizon: 6,
+        instId: range.instId,
+        bar: range.bar,
+        startTs: range.startTs,
+        endTs: range.endTs,
+        name,
+        factorSetId: editingSetId ?? undefined,
+        origin: "builder",
       }),
     );
     setSection("models");
@@ -417,8 +443,12 @@ export default function FactorSetBuilder() {
         <Button variant="primary" disabled={!!memberError} onClick={goTrain}>
           训练权重
         </Button>
+        <Button variant="default" disabled={!!memberError} onClick={goBatch}
+          title="在同一份成员 / 标的 / 周期 / 时间窗下并行训练多个方法，完成后按样本外 IC 择优">
+          多模型训练
+        </Button>
         <span className="pb-1 text-[11px] text-[var(--muted)]">
-          {memberError ?? "点「训练权重」跳转到「权重模型」实时观测 loss/IC 曲线，完成后一键回流"}
+          {memberError ?? "「训练权重」训单个方法；「多模型训练」并行训多个方法并择优，完成后一键回流"}
         </span>
       </div>
 

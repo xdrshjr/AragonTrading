@@ -2,14 +2,17 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import { Badge, Button, Switch } from "@/components/ui";
 import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import { formatIc } from "@/lib/factor";
 import { fmtTime } from "@/lib/format";
-import { canBacktestModel, methodLabel, runStatusLabel, runStatusTone, sortModelsByUpdated, symbolsSummary } from "@/lib/weightModel";
+import { canBacktestModel, filterUserModels, methodLabel, runStatusLabel, runStatusTone, sortModelsByUpdated, symbolsSummary } from "@/lib/weightModel";
 import { weightModelApi } from "@/lib/weightModelApi";
 import type { WeightModel } from "@/lib/weightModelTypes";
+import WeightBatchList from "./WeightBatchList";
+
+type ModelTab = "models" | "batches";
 
 /**
  * 「权重模型」列表 + CRUD（镜像 FactorSetList shell）：卡片呈现名称 / 标的·周期 / 方法 / 成员数 /
@@ -23,14 +26,19 @@ export default function WeightModelList({
   onBacktest,
   onEdit,
   onNew,
+  onNewBatch,
+  onOpenBatch,
 }: {
   onTrain: (model: WeightModel) => void;
   onView: (model: WeightModel) => void;
   onBacktest: (model: WeightModel) => void;
   onEdit: (model: WeightModel) => void;
   onNew: () => void;
+  onNewBatch: () => void;                    // 顶栏「多模型训练」入口
+  onOpenBatch: (batchId: number) => void;    // 「训练批次」tab 打开某批次进竞技场
 }) {
   const qc = useQueryClient();
+  const [tab, setTab] = useState<ModelTab>("models");   // 权重模型 / 训练批次 tab
   const [showDisabled, setShowDisabled] = useState(false);   // H-F10：默认仅显示启用，开关纳入已停用
   const [pendingDelete, setPendingDelete] = useState<WeightModel | null>(null);   // H-F8：应用内确认
   const models = useQuery({
@@ -47,38 +55,39 @@ export default function WeightModelList({
     onSuccess: () => void qc.invalidateQueries({ queryKey: ["weight-models"] }),
   });
 
-  if (models.isPending) {
-    return <p className="py-8 text-center text-[11px] text-[var(--muted)]">加载权重模型...</p>;
-  }
-  if (models.isError) {
-    return (
-      <div className="flex flex-col items-center gap-2 py-8">
-        <p className="text-[11px] text-[var(--short)]">加载权重模型失败：{(models.error as Error)?.message}</p>
-        <Button variant="default" size="sm" onClick={() => models.refetch()}>重试</Button>
-      </div>
-    );
-  }
-
-  const items = sortModelsByUpdated(models.data ?? []);
+  // 主列表默认过滤批次父模型（source==="batch"），杜绝污染；批次经「训练批次」tab 管理（R4）。
+  const items = filterUserModels(sortModelsByUpdated(models.data ?? []));
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex flex-col">
-          <span className="text-sm font-semibold text-[var(--text)]">权重模型</span>
-          <span className="text-[11px] text-[var(--muted)]">管理模型并实时观测每次训练的 loss / IC 曲线</span>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <TabButton active={tab === "models"} onClick={() => setTab("models")}>权重模型</TabButton>
+          <TabButton active={tab === "batches"} onClick={() => setTab("batches")}>训练批次</TabButton>
         </div>
         <div className="flex items-center gap-3">
-          {/* G-F11：Switch 不再带冗余 aria-label；改用 <label htmlFor> 关联（button 为可标注元素），
-              名称只念一遍且点可见文即可切换。 */}
-          <span className="flex items-center gap-1.5 text-[11px] text-[var(--muted)]">
-            <Switch checked={showDisabled} onChange={setShowDisabled} id="wm-show-disabled" />
-            <label htmlFor="wm-show-disabled" className="cursor-pointer">显示已停用</label>
-          </span>
-          <Button variant="primary" size="sm" onClick={onNew}>新建模型</Button>
+          {tab === "models" && (
+            // G-F11：Switch 用 <label htmlFor> 关联（名称只念一遍且点可见文即可切换）。
+            <span className="flex items-center gap-1.5 text-[11px] text-[var(--muted)]">
+              <Switch checked={showDisabled} onChange={setShowDisabled} id="wm-show-disabled" />
+              <label htmlFor="wm-show-disabled" className="cursor-pointer">显示已停用</label>
+            </span>
+          )}
+          <Button variant="default" size="sm" onClick={onNewBatch}
+            title="并行训练多个方法并按样本外 IC 择优">多模型训练</Button>
+          {tab === "models" && <Button variant="primary" size="sm" onClick={onNew}>新建模型</Button>}
         </div>
       </div>
 
-      {items.length === 0 ? (
+      {tab === "batches" ? (
+        <WeightBatchList onOpen={onOpenBatch} />
+      ) : models.isPending ? (
+        <p className="py-8 text-center text-[11px] text-[var(--muted)]">加载权重模型...</p>
+      ) : models.isError ? (
+        <div className="flex flex-col items-center gap-2 py-8">
+          <p className="text-[11px] text-[var(--short)]">加载权重模型失败：{(models.error as Error)?.message}</p>
+          <Button variant="default" size="sm" onClick={() => models.refetch()}>重试</Button>
+        </div>
+      ) : items.length === 0 ? (
         <div className="card flex flex-col items-center gap-3 p-8 text-center">
           <span className="text-sm font-medium text-[var(--text)]">还没有权重模型</span>
           <span className="text-[11px] text-[var(--muted)]">
@@ -102,7 +111,7 @@ export default function WeightModelList({
           ))}
         </div>
       )}
-      {remove.isError && (
+      {tab === "models" && remove.isError && (
         <p className="text-[11px] text-[var(--short)]">删除失败：{(remove.error as Error)?.message}</p>
       )}
 
@@ -118,6 +127,28 @@ export default function WeightModelList({
         onCancel={() => setPendingDelete(null)}
       />
     </div>
+  );
+}
+
+function TabButton({ active, onClick, children }: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-current={active ? "page" : undefined}
+      className={clsx(
+        "rounded-[8px] px-3 py-1 text-xs font-medium transition-colors",
+        active
+          ? "bg-[var(--accent-soft)]/60 text-[var(--text)]"
+          : "text-[var(--muted)] hover:text-[var(--text)]",
+      )}
+    >
+      {children}
+    </button>
   );
 }
 

@@ -25,11 +25,13 @@ from .api import (
     runs,
     strategies,
     trading,
+    weight_batches,
     weight_models,
     workspace,
     ws_market,
 )
 from .db.session import dispose_engine, init_db
+from .factors.weight_batch_manager import get_weight_batch_manager
 from .factors.weight_train_manager import get_weight_train_manager
 from .live_auto.manager import get_live_auto_manager
 from .okx.rest_client import OKXError, get_rest_client
@@ -51,6 +53,8 @@ async def lifespan(app: FastAPI):
     await get_agent_manager().shutdown()
     await get_paper_manager().shutdown()
     await get_live_auto_manager().shutdown()
+    # 关停顺序（weight-multi-model-training §2.6）：先停批次泵、再停底层作业，避免泵在作业消失后空转。
+    await get_weight_batch_manager().shutdown()
     await get_weight_train_manager().shutdown()
     await get_rest_client().aclose()
     await dispose_engine()
@@ -100,11 +104,13 @@ async def _weight_train_sweeper() -> None:
     误判 failed）。cancel-safe：关停取消时干净退出、不外抛；其余异常仅 warning 不让协程死亡。
     """
     manager = get_weight_train_manager()
+    batch_manager = get_weight_batch_manager()
     try:
         while True:
             await asyncio.sleep(120)
             try:
                 manager._prune_finished()
+                batch_manager._prune_finished()   # 批次运行时同周期按 TTL/数量回收（weight-multi-model-training §2.6）
             except Exception as exc:  # noqa: BLE001 —— 单次清扫失败不得拖垮常驻协程
                 logger.warning("weight-train sweeper prune skipped: %s", exc)
     except asyncio.CancelledError:    # R-08：关停取消时干净退出
@@ -183,6 +189,7 @@ app.include_router(live_auto.router, prefix="/api")  # 第 10 个路由（实时
 app.include_router(app_settings.router, prefix="/api")  # 第 11 个路由（设置中心 · 自动交易设置 §4.1）
 app.include_router(workspace.router, prefix="/api")  # 第 12 个路由（workspace 偏好持久化，watchlist-auto-trade-persistence §3）
 app.include_router(weight_models.router, prefix="/api")  # 权重模型工作区（weight-model-workspace §五；含 WS /ws/weight-train/{jobId}）
+app.include_router(weight_batches.router, prefix="/api")  # 多模型训练竞技场（weight-multi-model-training §四；含 WS /ws/weight-batch/{batchId}）
 
 
 @app.get("/")

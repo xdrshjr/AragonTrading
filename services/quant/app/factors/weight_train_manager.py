@@ -76,13 +76,17 @@ class JobSpec:
 class _TrainJob:
     """单个流式训练作业：扇出 + 全量事件缓冲（含终态）+ async 训练协程（镜像 PaperSession 分层）。"""
 
-    def __init__(self, job_id: str, spec: JobSpec, *, clock: Callable[[], float] = time.monotonic):
+    def __init__(self, job_id: str, spec: JobSpec, *, clock: Callable[[], float] = time.monotonic,
+                 on_terminal: Callable[[], None] | None = None):
         self.job_id = job_id
         self.run_id = spec.run_id
         self.model_id = spec.model_id
         self.status = "running"
         self._spec = spec
         self._clock = clock                       # H-B6：可注入单调时钟（TTL 确定性测试）
+        # 转终态回调（weight-multi-model-training R2）：在 _persist **置终态之后**触发，通知等待名额者名额已空出。
+        # 顺序关键——此刻 active_count 已不再计入本作业，被唤醒者 reserve() 方能见到空名额，否则空转。
+        self._on_terminal = on_terminal
         self._buffer: list[dict] = []
         self._subscribers: set[asyncio.Queue] = set()
         self._cancel = False
@@ -304,6 +308,11 @@ class _TrainJob:
                 self.run_id)
         self.status = outcome.status            # 无论成败都转终态（is_terminal=true → 可回收、WS 可关）
         self.finished_mono = self._clock()
+        if self._on_terminal is not None:       # R2：置终态之后再通知名额释放（此刻 active_count 已不计本作业）
+            try:
+                self._on_terminal()
+            except Exception as exc:  # noqa: BLE001 —— 通知失败绝不影响本作业已达终态
+                logger.warning("weight run %d on_terminal 回调失败：%s", self.run_id, exc)
         return ok
 
     async def _try_finalize(self, outcome: repo.WeightRunOutcome) -> bool:
@@ -341,6 +350,10 @@ class WeightTrainManager:
         self._jobs: dict[str, _TrainJob] = {}
         self._reserved = 0                   # H-B3：同步预占名额（覆盖守门→注册之间的 await 窗口）
         self._clock = clock                  # H-B6：可注入单调时钟（TTL 确定性测试）
+        # 名额释放条件变量（weight-multi-model-training R2）：调度泵在此「检查-等待」原子闭环里等空名额，
+        # 任一作业转终态即 notify_all 唤醒，杜绝丢唤醒。跨来源（不同批次 / 独立训练）竞争同一名额的唯一等待点。
+        self._slot_cond = asyncio.Condition()
+        self._notify_tasks: set[asyncio.Task] = set()   # 持唤醒任务强引用防其首步前被 GC（RUF006），否则重现丢唤醒
 
     def active_count(self) -> int:
         return sum(1 for job in self._jobs.values() if job.status == "running")
@@ -365,10 +378,40 @@ class WeightTrainManager:
         """释放一个预占名额（守门后任何失败路径调用；``start_job`` 注册成功后亦调一次转 running 计数）。"""
         self._reserved = max(0, self._reserved - 1)
 
+    async def reserve_when_free(self, cancelled: Callable[[], bool]) -> bool:
+        """预占-等待原子闭环（weight-multi-model-training R2）：把「检查」与「等待」收进同一把锁，杜绝丢唤醒。
+
+        ``reserve()`` 同步、锁内调用期间不让出；不成功则 ``wait()``（释放锁并挂起，被 ``notify_all`` 唤醒后重判）。
+        任一终态转迁要么 happens-before 本次 ``reserve()``（直接见空名额），要么发生在挂起进 ``wait()`` 之后
+        （必被唤醒）——经典条件变量范式。等待期间被取消（``cancelled()`` 为真）则返回 ``False``（未持名额，安全退出）；
+        返回 ``True`` 即已持有一个预占名额（调用方必须走到 ``start_job``/``release``，绝不在其间 break，防泄漏）。
+        """
+        async with self._slot_cond:
+            while not self.reserve():         # reserve() 同步，锁内调用期间不让出
+                if cancelled():
+                    return False              # 等待期间被取消：未持名额，安全退出
+                await self._slot_cond.wait()  # 释放锁并挂起；被 notify_all 唤醒后重判
+            return True                       # 已持有一个预占名额
+
+    def notify_slot_free(self) -> None:
+        """名额释放通知（R2）：从 ``_TrainJob`` 终态钩子（同步）触发，调度协程在锁下 ``notify_all`` 唤醒等待者；
+        整批取消时亦显式调用，唤醒卡在 ``reserve_when_free`` 的泵（泵醒后见 ``cancelled()`` 为真即退）。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:                  # 无运行中事件循环（罕见，如同步关停）→ 无等待者可唤醒，静默跳过
+            return
+        task = loop.create_task(self._notify_slot_free())
+        self._notify_tasks.add(task)          # 持强引用直到完成（防 RUF006 任务被 GC 于首步前 → 重现丢唤醒 R2）
+        task.add_done_callback(self._notify_tasks.discard)
+
+    async def _notify_slot_free(self) -> None:
+        async with self._slot_cond:
+            self._slot_cond.notify_all()
+
     def start_job(self, spec: JobSpec) -> _TrainJob:
         """注册并启动一个流式训练作业（此刻起即开缓冲，R-01 守门已在 service 层全过）。"""
         self._prune_finished()
-        job = _TrainJob(uuid.uuid4().hex, spec, clock=self._clock)
+        job = _TrainJob(uuid.uuid4().hex, spec, clock=self._clock, on_terminal=self.notify_slot_free)
         self._jobs[job.job_id] = job
         try:
             self.release()                   # 预占转为 running 计数（job.status=="running" 即被 active_count 计入）
