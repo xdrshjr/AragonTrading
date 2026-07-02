@@ -40,6 +40,9 @@ export interface WeightModelCreateBody {
   notes?: string;
   factorSetId?: number;
   enabled?: boolean;
+  // 标的组训练（factor-lab-symbol-groups §3.5）：缺省回落 [instId] 单标的。
+  symbols?: string[];
+  symbolGroupId?: string;
 }
 
 export interface WeightModelUpdateBody {
@@ -52,6 +55,8 @@ export interface WeightModelUpdateBody {
   horizon?: number;
   notes?: string;
   enabled?: boolean;
+  symbols?: string[];
+  symbolGroupId?: string;
 }
 
 export interface WeightTrainStartBody {
@@ -67,6 +72,9 @@ export interface WeightTrainStartBody {
   factorSetId?: number;
   name?: string;
   maxBars?: number;
+  // 标的组训练（factor-lab-symbol-groups §3.5）：缺省回落 [instId] 单标的（等价性门禁不受影响）。
+  symbols?: string[];
+  symbolGroupId?: string;
 }
 
 export interface WeightTrainStartResult {

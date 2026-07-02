@@ -23,9 +23,23 @@ from ..schemas import (
     weight_model_out,
     weight_train_run_out,
 )
-from .service import FactorWindow, _load_df  # noqa: F401  —— 复用进程内 K 线缓存（注册表，间接经 manager）
+from .service import FactorWindow, _effective_symbols, _load_df  # noqa: F401  —— 复用进程内 K 线缓存 + 标的规整
 from .specs import apply_weights, assert_weights_cover, normalize_thresholds, validate_members
 from .weight_train_manager import JobSpec, get_weight_train_manager
+
+
+def _guard_train_symbols(symbols: list[str]) -> None:
+    """训练标的数超 ``max_train_symbols`` → 400（**取数前**判定，绝不无界扇出 OKX 请求，factor-lab-symbol-groups C-1）。"""
+    limit = get_settings().max_train_symbols
+    if len(symbols) > limit:
+        raise HTTPException(400, detail={
+            "code": "FACTOR_TRAIN_TOO_MANY_SYMBOLS",
+            "message": f"标的组过大：训练最多支持 {limit} 个标的，请缩减标的组后重试。"})
+
+
+def _inject_symbols(config: dict | None, symbols: list[str], group_id: str | None) -> dict:
+    """把标的组成员与来源组注入模型 ``config``（落 config_json，零 DB 迁移，§3.5）；新值覆盖原 config 同名键。"""
+    return {**(config or {}), "symbols": list(symbols), "symbolGroupId": group_id}
 
 
 def _load_json(raw: str | None, fallback):
@@ -57,13 +71,20 @@ async def get_model(session: AsyncSession, model_id: int) -> dict | None:
 
 
 async def create_model(session: AsyncSession, req: WeightModelCreateReq) -> dict:
-    """手动新建模型（编辑器）：成员边界校验（400）→ bar 校验（400，H-B5）→ 落库 → 序列化。"""
+    """手动新建模型（编辑器）：成员边界校验（400）→ bar 校验（400，H-B5）→ 落库 → 序列化。
+
+    标的组（``symbols``）注入 ``config_json`` 且 ``inst_id`` 取焦点（组内首个），零 DB 迁移（§3.5）；
+    缺省回落 ``[instId]`` 单标的（行为不变）。
+    """
     members = validate_members([m.model_dump() for m in req.members])
     _validate_bar(req.bar)
     _validate_train_config(req.config or {})   # G-B10：手动建模型亦校验 config，杜绝非法 config 落库
+    symbols = _effective_symbols(req.symbols, req.instId)
+    _guard_train_symbols(symbols)
+    config = _inject_symbols(req.config, symbols, req.symbolGroupId)
     spec = repo.WeightModelSpec(
-        name=req.name, inst_id=req.instId, bar=req.bar, members=members, method=req.method,
-        config=req.config, horizon=req.horizon, source="manual",
+        name=req.name, inst_id=symbols[0], bar=req.bar, members=members, method=req.method,
+        config=config, horizon=req.horizon, source="manual",
         factor_set_id=req.factorSetId, notes=req.notes, enabled=req.enabled)
     row = await repo.create_weight_model(session, spec=spec)
     return await _model_out(session, row)
@@ -75,9 +96,18 @@ async def update_model(session: AsyncSession, model_id: int, req: WeightModelUpd
         _validate_bar(req.bar)   # H-B5：手动改模型亦校验 bar 白名单
     if req.config is not None:
         _validate_train_config(req.config)   # G-B10：改模型 config 亦校验
+    inst_id = req.instId
+    config = req.config
+    # 标的组显式变更（§3.5）：把组成员注入 config、焦点作为 inst_id；未变更则保持既有 patch 语义（None=不改）。
+    if req.symbols is not None or req.symbolGroupId is not None:
+        symbols = _effective_symbols(req.symbols, req.instId or (req.symbols[0] if req.symbols else ""))
+        if symbols and symbols[0]:
+            _guard_train_symbols(symbols)
+            config = _inject_symbols(req.config, symbols, req.symbolGroupId)
+            inst_id = symbols[0]
     patch = repo.WeightModelPatch(
-        name=req.name, inst_id=req.instId, bar=req.bar, members=members, method=req.method,
-        config=req.config, horizon=req.horizon, notes=req.notes, enabled=req.enabled)
+        name=req.name, inst_id=inst_id, bar=req.bar, members=members, method=req.method,
+        config=config, horizon=req.horizon, notes=req.notes, enabled=req.enabled)
     row = await repo.update_weight_model(session, model_id, patch=patch)
     return await _model_out(session, row) if row is not None else None
 
@@ -254,11 +284,16 @@ def _members_summary(members: list[dict]) -> str:
 
 
 async def _resolve_model(session: AsyncSession, req: WeightTrainStartReq,
-                         members: list[dict]) -> WeightModel:
-    """模型去重解析（R-02）：modelId 复用 → factorSetId 复用-或-建 → 否则按 name/成员摘要新建。"""
+                         members: list[dict], *, symbols: list[str]) -> WeightModel:
+    """模型去重解析（R-02）：modelId 复用 → factorSetId 复用-或-建 → 否则按 name/成员摘要新建。
+
+    标的组成员注入 ``config_json``（``symbols`` / ``symbolGroupId``），``inst_id`` 取焦点（组内首个）；
+    零 DB 迁移（§3.5）。复用既有模型时 ``refresh_weight_model_spec`` 以本次组 spec 刷新。
+    """
     spec = repo.WeightModelSpec(
-        name=req.name or _members_summary(members), inst_id=req.instId, bar=req.bar,
-        members=members, method=req.method, config=req.config, horizon=req.horizon,
+        name=req.name or _members_summary(members), inst_id=symbols[0], bar=req.bar,
+        members=members, method=req.method,
+        config=_inject_symbols(req.config, symbols, req.symbolGroupId), horizon=req.horizon,
         source="builder", factor_set_id=req.factorSetId)
     if req.modelId is not None:
         existing = await repo.get_weight_model(session, req.modelId)
@@ -274,21 +309,25 @@ async def _resolve_model(session: AsyncSession, req: WeightTrainStartReq,
 async def start_training(session: AsyncSession, rest, req: WeightTrainStartReq) -> dict:
     """启动流式训练：**守门优先、全过后才落库 / 注册作业**（R-01，杜绝孤儿）。
 
-    守门序固定（R-04）：① 成员 400 → ② bar 400 → ③ config 400 → ④ 区间 413 → ⑤ 并发 429（同步预占）。
+    守门序固定（R-04）：① 成员 400 → ② bar 400 → ③ config 400 → ④ 区间 413 → ④.5 标的数 400 → ⑤ 并发 429（同步预占）。
     bar/config 的 400 **必须先于** 区间 413（``_guard_range`` 自身调 ``bar_to_seconds``，非法 bar 否则抛 500）。
+    标的组（``symbols``）逐标的沿用 ``_guard_range``（各标的同区间，故等价单次校验）；焦点 = 组内首个。
 
     Returns:
         ``{jobId, runId, modelId}``。
 
     Raises:
-        HTTPException: 400 成员 / bar / config 非法 ｜ 413 区间过长 ｜ 429 作业繁忙。
+        HTTPException: 400 成员 / bar / config / 标的数非法 ｜ 413 区间过长 ｜ 429 作业繁忙。
     """
     members = validate_members([m.model_dump() for m in req.members])   # ① 成员 400
     _validate_bar(req.bar)                                              # ② bar 400（先于 413）
     _validate_train_config(req.config)                                 # ③ config 400（先于 413）
-    window = FactorWindow(inst_id=req.instId, bar=req.bar, start_ts=req.startTs,
+    symbols = _effective_symbols(req.symbols, req.instId)               # 去空去重（[0]=焦点）
+    focus = symbols[0]
+    window = FactorWindow(inst_id=focus, bar=req.bar, start_ts=req.startTs,
                           end_ts=req.endTs, max_bars=req.maxBars)
-    _guard_range(window)                                                # ④ 区间 413
+    _guard_range(window)                                                # ④ 区间 413（各标的同区间）
+    _guard_train_symbols(symbols)                                       # ④.5 标的数 400（取数前，C-1）
     settings = get_settings()
     manager = get_weight_train_manager()
     if not manager.reserve():                                           # ⑤ 并发 429（同步预占硬上限，H-B3）
@@ -298,14 +337,14 @@ async def start_training(session: AsyncSession, rest, req: WeightTrainStartReq) 
     # 守门全过（已预占名额）→ 解析 / 建模型（R-02）→ 落 running 记录 → 注册作业（此刻起即开缓冲，R-06）。
     # 预占后任何失败路径都 release，杜绝名额泄漏致长期假 429。
     try:
-        model = await _resolve_model(session, req, members)
+        model = await _resolve_model(session, req, members, symbols=symbols)
         run = await repo.add_weight_run(session, start=repo.WeightRunStart(
-            model_id=model.id, method=req.method, inst_id=req.instId, bar=req.bar,
+            model_id=model.id, method=req.method, inst_id=focus, bar=req.bar,
             start_ts=req.startTs, end_ts=req.endTs, horizon=req.horizon, config=req.config,
             started_ts=_now()))
         job = manager.start_job(JobSpec(                                # 内部 release()（预占转 running 计数）
             run_id=run.id, model_id=model.id, rest=rest, members=members, method=req.method,
-            config=req.config, window=window, horizon=req.horizon,
+            config=req.config, window=window, horizon=req.horizon, symbols=symbols,
             run_cap=settings.weight_model_run_cap, curve_steps=settings.weight_train_curve_steps))
     except Exception:
         manager.release()

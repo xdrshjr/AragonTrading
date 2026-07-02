@@ -21,10 +21,13 @@ export default function FactorMiningPanel() {
 
   const allCategories = useMemo(() => uniqueCategories(lib.data ?? []), [lib.data]);
   const range = { instId: wb.instId, bar: wb.bar, startTs: wb.startTs, endTs: wb.endTs };
+  // 标的组（>1）时逐标的取数挖掘并归并；单标的省略 symbols 走原路径（factor-lab-symbol-groups §3.4）。
+  const groupSymbols = wb.symbols.length > 1 ? wb.symbols : undefined;
 
   const mine = useMutation({
     mutationFn: () =>
-      factorApi.mine({ ...range, categories: categories.length ? categories : undefined, topN }),
+      factorApi.mine({ ...range, categories: categories.length ? categories : undefined, topN,
+        ...(groupSymbols ? { symbols: groupSymbols } : {}) }),
   });
   const saveAsFactor = useMutation({
     mutationFn: (item: RankedFactor) =>
@@ -85,6 +88,9 @@ export default function FactorMiningPanel() {
           <Button variant="primary" disabled={mine.isPending} onClick={() => mine.mutate()}>
             {mine.isPending ? "扫描中..." : "开始挖掘"}
           </Button>
+          {groupSymbols && (
+            <Badge tone="accent">组内均值 · {groupSymbols.length} 标的</Badge>
+          )}
         </div>
       </div>
 
@@ -95,6 +101,8 @@ export default function FactorMiningPanel() {
       {mine.data && (
         <p className="text-[11px] text-[var(--muted)]">
           评估 {mine.data.evaluated ?? mine.data.items.length} 个候选
+          {mine.data.symbols && mine.data.symbols.length > 1 &&
+            ` · 组内 ${mine.data.symbols.length} 标的均值`}
           {((mine.data.persisted ?? 0) + (mine.data.skipped ?? 0) > 0) &&
             ` · 落库 ${mine.data.persisted} · 去重/无效跳过 ${mine.data.skipped}`}
         </p>

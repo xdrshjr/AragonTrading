@@ -407,3 +407,79 @@ def train_weights(matrix: np.ndarray, label: np.ndarray, names: list[str], *,
     note = _BUILTIN_NOTE if backend.kind == "builtin" else ""
     return build_train_result(method, weights, names, sample=TrainSample(aligned_x, aligned_y, cut),
                               norm_stats=norm, trainer_version=backend.version(), note=note)
+
+
+# ============================ 多标的池化训练（factor-lab-symbol-groups §3.5，绝不改上方等价性门禁函数） ============================
+def build_pooled_sample(parts: list[tuple[np.ndarray, np.ndarray]], config: dict) -> TrainSample:
+    """把逐标的 ``(matrix, label)`` 池化为单 ``TrainSample``：各自 ``_aligned`` 去 NaN → 各自 ``_train_cut``
+    时序切分 → 拼「全体训练块 ‖ 全体验证块」，``cut = Σ`` 各标的训练段长（无未来泄漏：任意 fraction 前缀只取
+    训练块，验证块恒为各标的留出段之并集）。
+
+    单标的输入与 ``prepare_curve_sample`` **字节级等价**（``vstack([aligned[:cut], aligned[cut:]]) == aligned``、
+    ``cut`` 相同），故多标的走本函数、单标的仍走原路径时权重训练等价性门禁不受影响（§十 不变量 1/2）。
+    空 / 单行标的（对齐后 < 2 行、无法时序切分）跳过——其余标的照常池化，绝不因单标的退化整体失败。
+
+    Args:
+        parts: 逐标的 ``(build_factor_matrix 矩阵, forward_return_label 标签)``；[0] 为焦点标的。
+        config: 训练配置（``split`` 决定各标的时序切分比例）。
+
+    Returns:
+        池化 ``TrainSample``（``matrix`` = 训练块拼验证块，``cut`` = Σ 各标的训练段长）。
+
+    Raises:
+        InsufficientSamplesError: 池化后对齐样本不足（< ``MIN_TRAIN_SAMPLES``），调用方据此判失败（绝不空成功）。
+    """
+    train_x: list[np.ndarray] = []
+    train_y: list[np.ndarray] = []
+    valid_x: list[np.ndarray] = []
+    valid_y: list[np.ndarray] = []
+    total_cut = 0
+    width = 0
+    for matrix, label in parts:
+        aligned_x, aligned_y = _aligned(matrix, label)
+        if len(aligned_y) < 2:
+            continue
+        cut_i = _train_cut(len(aligned_y), config)
+        train_x.append(aligned_x[:cut_i])
+        train_y.append(aligned_y[:cut_i])
+        valid_x.append(aligned_x[cut_i:])
+        valid_y.append(aligned_y[cut_i:])
+        total_cut += cut_i
+        if aligned_x.ndim == 2:
+            width = aligned_x.shape[1]
+    blocks_x = train_x + valid_x
+    blocks_y = train_y + valid_y
+    pooled_x = np.vstack(blocks_x) if blocks_x else np.empty((0, width))
+    pooled_y = np.concatenate(blocks_y) if blocks_y else np.empty(0)
+    if len(pooled_y) < MIN_TRAIN_SAMPLES:
+        raise InsufficientSamplesError(
+            f"池化训练样本不足：对齐后仅 {len(pooled_y)} 行（需 ≥{MIN_TRAIN_SAMPLES}）")
+    return TrainSample(pooled_x, pooled_y, total_cut)
+
+
+def train_weights_on_sample(sample: TrainSample, names: list[str], *, method: str = "linear",
+                            config: dict | None = None, norm_stats: dict | None = None) -> TrainResult:
+    """在**已对齐 / 已切分**的 ``TrainSample`` 上拟合并装配 ``TrainResult``（池化末步 = 曲线末步 f=1.0 等价）。
+
+    与 ``train_weights`` 的差别仅在于：样本已由 ``build_pooled_sample`` 池化对齐（不再重复 ``_aligned`` / ``_train_cut``）。
+    复用 ``build_train_result``（不改），拟合仅取训练块 ``sample.matrix[:cut]``（绝不触碰验证块，无未来泄漏）。
+
+    Raises:
+        ValueError: 未知 method / 样本不足（显式报错，绝不静默）。
+    """
+    config = config or {}
+    trainer = TRAINERS.get(method)
+    if trainer is None:
+        raise ValueError(f"未知训练方法：{method}")
+    norm = norm_stats or {"normWindow": DEFAULT_NORM_WINDOW, "clip": DEFAULT_CLIP}
+    if not trainer.available():
+        return TrainResult(method=method, weights={}, normStats=norm, metrics={},
+                           available=False, note=_INSTALL_HINT)
+    if len(sample.label) < MIN_TRAIN_SAMPLES:
+        raise ValueError(f"训练样本不足：池化后仅 {len(sample.label)} 行（需 ≥{MIN_TRAIN_SAMPLES}）")
+    backend = trainer.resolve()
+    raw = backend.fit(sample.matrix[:sample.cut], sample.label[:sample.cut], config)
+    weights = _normalize_weights(np.asarray(raw, dtype=float), names)
+    note = _BUILTIN_NOTE if backend.kind == "builtin" else ""
+    return build_train_result(method, weights, names, sample=sample, norm_stats=norm,
+                              trainer_version=backend.version(), note=note)

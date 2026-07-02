@@ -7,6 +7,7 @@ from __future__ import annotations
 from .evaluation import (  # noqa: F401
     FactorEvalResult,
     FactorHorizonStat,
+    aggregate_eval_results,
     eval_result_to_dict,
     evaluate_factor,
     evaluate_factor_key,
@@ -23,6 +24,7 @@ from .library import (  # noqa: F401
 )
 from .mining import (  # noqa: F401
     MINE_WORK_UNIT_LIMIT,
+    aggregate_mine_results,
     default_candidates,
     mine_factors,
     mining_workload,
@@ -46,11 +48,13 @@ from .training import (  # noqa: F401
     TrainSample,
     available_trainers,
     build_factor_matrix,
+    build_pooled_sample,
     build_train_result,
     fit_at_fraction,
     forward_return_label,
     learning_curve_steps,
     prepare_curve_sample,
     train_weights,
+    train_weights_on_sample,
     trainer_available,
 )

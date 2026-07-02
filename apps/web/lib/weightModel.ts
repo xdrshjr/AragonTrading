@@ -126,6 +126,13 @@ export function methodLabel(method: TrainMethod): string {
   return METHOD_LABELS[method] ?? method;
 }
 
+// 组信息头部标签（factor-lab-symbol-groups §3.5）：单标的 → instId；标的组 → 「焦点 +K」（title 悬浮全部成员）。
+export function symbolsSummary(instId: string, symbols?: string[]): { label: string; title: string } {
+  const list = symbols && symbols.length > 0 ? symbols : [instId];
+  if (list.length <= 1) return { label: list[0] ?? instId, title: list[0] ?? instId };
+  return { label: `${list[0]} +${list.length - 1}`, title: list.join("、") };
+}
+
 const PHASE_LABELS: Record<TrainPhase, string> = {
   loading: "加载真实行情",
   building: "构建因子矩阵",
@@ -201,6 +208,9 @@ export function buildTrainTarget(params: {
   modelId?: number;
   factorSetId?: number;
   origin?: "builder" | "model";
+  // 标的组训练（factor-lab-symbol-groups §3.5）：symbols 含焦点（[0]=instId）；symbolGroupId 为来源组。
+  symbols?: string[];
+  symbolGroupId?: string;
 }): WeightTrainTarget {
   return {
     members: params.members,
@@ -216,10 +226,12 @@ export function buildTrainTarget(params: {
     origin: params.origin ?? "builder",
     ...(params.modelId != null ? { modelId: params.modelId } : {}),
     ...(params.factorSetId != null ? { factorSetId: params.factorSetId } : {}),
+    ...(params.symbols && params.symbols.length > 1 ? { symbols: params.symbols } : {}),
+    ...(params.symbolGroupId ? { symbolGroupId: params.symbolGroupId } : {}),
   };
 }
 
-// 交接载荷 → POST /weight-models/train 请求体。
+// 交接载荷 → POST /weight-models/train 请求体（标的组 symbols / symbolGroupId 贯通，§3.5）。
 export function trainStartBody(target: WeightTrainTarget): WeightTrainStartBody {
   return {
     instId: target.instId,
@@ -233,6 +245,8 @@ export function trainStartBody(target: WeightTrainTarget): WeightTrainStartBody 
     ...(target.modelId != null ? { modelId: target.modelId } : {}),
     ...(target.factorSetId != null ? { factorSetId: target.factorSetId } : {}),
     ...(target.name ? { name: target.name } : {}),
+    ...(target.symbols && target.symbols.length > 1 ? { symbols: target.symbols } : {}),
+    ...(target.symbolGroupId ? { symbolGroupId: target.symbolGroupId } : {}),
   };
 }
 
@@ -259,10 +273,13 @@ export function modelToTrainTarget(model: WeightModel, range: {
     origin: "model",
     modelId: model.id,
     factorSetId: model.factorSetId ?? undefined,
+    // 复用模型自身的组成员（H-F5 同口径：训练标的取模型自身，消除静默漂移，factor-lab-symbol-groups §3.5）。
+    symbols: model.symbols,
+    symbolGroupId: model.symbolGroupId ?? undefined,
   });
 }
 
-// 模型编辑器 → 新建模型请求体。
+// 模型编辑器 → 新建模型请求体（标的组 symbols / symbolGroupId 贯通，§3.5；单标的省略保持原路径）。
 export function editorToCreateBody(form: {
   name: string;
   instId: string;
@@ -271,6 +288,8 @@ export function editorToCreateBody(form: {
   method: TrainMethod;
   horizon: number;
   notes: string;
+  symbols?: string[];
+  symbolGroupId?: string;
 }): WeightModelCreateBody {
   return {
     name: form.name,
@@ -280,6 +299,8 @@ export function editorToCreateBody(form: {
     method: form.method,
     horizon: form.horizon,
     notes: form.notes,
+    ...(form.symbols && form.symbols.length > 1 ? { symbols: form.symbols } : {}),
+    ...(form.symbolGroupId ? { symbolGroupId: form.symbolGroupId } : {}),
   };
 }
 

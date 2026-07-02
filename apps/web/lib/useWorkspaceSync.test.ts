@@ -17,6 +17,7 @@ function out(over: Partial<WorkspaceWatchlistOut> = {}): WorkspaceWatchlistOut {
     watchlist: ["AAA-USDT-SWAP"],
     autoTradeMembers: [],
     autoTradeAllocationMode: "even",
+    symbolGroups: [],
     ...over,
   };
 }

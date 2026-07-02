@@ -17,6 +17,7 @@ vi.mock("./FactorEvalPanel", () => ({ default: () => <div data-testid="evaluate"
 vi.mock("./FactorMiningPanel", () => ({ default: () => <div data-testid="mining" /> }));
 vi.mock("./FactorSetBuilder", () => ({ default: () => <div data-testid="builder" /> }));
 vi.mock("./FactorSetList", () => ({ default: () => <div data-testid="sets" /> }));
+vi.mock("./SymbolGroupModal", () => ({ default: () => <div data-testid="symbol-group-modal" /> }));
 
 beforeEach(() => {
   localStorage.clear();
@@ -24,26 +25,43 @@ beforeEach(() => {
     instId: "BTC-USDT-SWAP",
     factorLabSection: "catalog",
     watchlist: ["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+    symbolGroups: [],
+    factorLabTarget: null,
   });
 });
 afterEach(cleanup);
 
-describe("FactorLab — 标的下拉（自选标的）", () => {
+describe("FactorLab — 目标选择器（单标的 / 标的组）", () => {
   it("renders_watchlist_options", () => {
     render(<FactorLab active={false} />);
     const select = screen.getByLabelText("标的") as HTMLSelectElement;
     const options = within(select).getAllByRole("option").map((o) => o.textContent);
     expect(options).toEqual(["BTC-USDT-SWAP", "ETH-USDT-SWAP"]);
-    // 默认选中 store 的 instId（在自选列表内）。
-    expect(select.value).toBe("BTC-USDT-SWAP");
+    // 默认选中 store 的 instId（single 指针，value=`single:<instId>`）。
+    expect(select.value).toBe("single:BTC-USDT-SWAP");
   });
 
-  it("switching_option_updates_workbench", () => {
+  it("switching_single_option_updates_workbench_focus", () => {
     render(<FactorLab active={false} />);
     const select = screen.getByLabelText("标的") as HTMLSelectElement;
-    fireEvent.change(select, { target: { value: "ETH-USDT-SWAP" } });
-    expect(select.value).toBe("ETH-USDT-SWAP");
+    fireEvent.change(select, { target: { value: "single:ETH-USDT-SWAP" } });
+    expect(select.value).toBe("single:ETH-USDT-SWAP");
     expect(screen.getByTestId("wb-inst").textContent).toBe("ETH-USDT-SWAP");
+  });
+
+  it("selecting_group_sets_focus_to_first_member", () => {
+    useAppStore.setState({
+      symbolGroups: [
+        { id: "g1", name: "主流币", symbols: ["ETH-USDT-SWAP", "BTC-USDT-SWAP"], createdTs: 1, updatedTs: 1 },
+      ],
+    });
+    render(<FactorLab active={false} />);
+    const select = screen.getByLabelText("标的") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "group:g1" } });
+    expect(select.value).toBe("group:g1");
+    // 焦点标的 = 组内首个成员（ETH），驱动图表 / 单标的语义。
+    expect(screen.getByTestId("wb-inst").textContent).toBe("ETH-USDT-SWAP");
+    expect(screen.getByText("2 标的")).toBeInTheDocument();
   });
 
   it("empty_watchlist_disables_select", () => {

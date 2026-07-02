@@ -7,6 +7,7 @@ const PREFS: WorkspaceWatchlistIn = {
   watchlist: ["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
   autoTradeMembers: [{ instId: "BTC-USDT-SWAP", allocationPct: 50 }],
   autoTradeAllocationMode: "even",
+  symbolGroups: [],
 };
 
 describe("workspaceApi", () => {

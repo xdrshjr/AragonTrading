@@ -63,6 +63,14 @@ export interface FactorHorizonStat {
   quantiles: QuantileBucket[];
 }
 
+// 标的组聚合的逐标的贡献（factor-lab-symbol-groups §3.3）：聚合态透明呈现哪些标的入了组内均值，绝不静默丢弃。
+export interface PerSymbolEval {
+  instId: string;
+  occurrences: number;
+  primaryRankIc: number | null;
+  coverage: number;
+}
+
 export interface FactorEvalResult {
   factorKey: string;
   direction: FrozenDirection;
@@ -75,6 +83,10 @@ export interface FactorEvalResult {
   instId: string | null;
   bar: string | null;
   note: string;
+  // 标的组聚合态附加字段（factor-lab-symbol-groups §3.3）；单标的响应缺省，缺省安全。
+  symbols?: string[];
+  perSymbol?: PerSymbolEval[];
+  aggregated?: boolean;
 }
 
 // 计算结果（POST /factors/compute）。
@@ -114,6 +126,8 @@ export interface FactorMineResult {
   evaluated?: number;
   persisted?: number;
   skipped?: number;
+  // 标的组聚合态回显聚合标的（factor-lab-symbol-groups §3.4）；单标的缺省安全。
+  symbols?: string[];
 }
 
 // 组合成员（自包含快照，方向冻结）。
@@ -142,6 +156,8 @@ export interface TrainProvenance {
   endTs: number;
   horizon: number;
   trainedAt?: number;
+  // 标的组训练时随 run 溯源的组成员（factor-lab-symbol-groups §3.5）；单标的缺省安全。
+  symbols?: string[];
 }
 
 export interface TrainResult {
@@ -234,3 +250,26 @@ export const DEFAULT_THRESHOLDS: FactorThresholds = {
   normWindow: 200,
   squash: true,
 };
+
+// ---- 因子实验室「标的组」多标的目标（factor-lab-symbol-groups §3.1/§3.2） ----
+
+// 标的组：从自选标的挑选并命名的一组 instId，供因子实验室按组评估 / 挖掘 / 训练。成员**有序**（决定
+// 焦点标的 / 方向锚点，§3.1）；持久化后**不**因自选变动被强制裁剪（§3.2 决策，避免静默掏空）。
+export interface SymbolGroup {
+  id: string;          // 客户端生成的 uuid（crypto.randomUUID）
+  name: string;
+  symbols: string[];   // 创建时来自自选标的
+  createdTs: number;
+  updatedTs: number;
+}
+
+// 当前工作台目标：单标的 或 标的组（group 携带解析后的成员快照，供派生 symbols / 焦点）。
+export type FactorTarget =
+  | { kind: "single"; instId: string }
+  | { kind: "group"; groupId: string; name: string; symbols: string[] };
+
+// 持久化的目标指针（瞬态语义但为记忆选择而 persist）：仅存指针，运行期经 resolveFactorTarget 解析为
+// 合法 FactorTarget（组已删 / 成员全失效则回落焦点单标的）。
+export type FactorTargetRef =
+  | { kind: "single"; instId: string }
+  | { kind: "group"; groupId: string };

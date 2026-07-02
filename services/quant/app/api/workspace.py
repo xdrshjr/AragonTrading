@@ -22,7 +22,8 @@ from ..schemas import WorkspaceWatchlistIn, WorkspaceWatchlistOut
 router = APIRouter(tags=["workspace"])
 
 # 无记录时回给前端的空默认（present:false → 前端 seed 当前本地切片，§2.2）。
-_EMPTY_PREFS = {"watchlist": [], "autoTradeMembers": [], "autoTradeAllocationMode": "even"}
+_EMPTY_PREFS = {"watchlist": [], "autoTradeMembers": [], "autoTradeAllocationMode": "even",
+                "symbolGroups": []}
 
 
 @router.get("/workspace/watchlist", response_model=WorkspaceWatchlistOut)
@@ -46,5 +47,10 @@ async def update_workspace_watchlist(body: WorkspaceWatchlistIn,
         watchlist=body.watchlist,
         members=[{"instId": m.instId, "allocationPct": m.allocationPct} for m in body.autoTradeMembers],
         allocation_mode=body.autoTradeAllocationMode,
+        symbol_groups=[
+            {"id": g.id, "name": g.name, "symbols": g.symbols,
+             "createdTs": g.createdTs, "updatedTs": g.updatedTs}
+            for g in body.symbolGroups
+        ],
     )
     return {"present": True, **prefs}

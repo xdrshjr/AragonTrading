@@ -8,6 +8,10 @@
 """
 from __future__ import annotations
 
+import json
+from collections import OrderedDict
+
+import numpy as np
 import pandas as pd
 
 from .evaluation import DEFAULT_HORIZONS, evaluate_factor_key
@@ -91,3 +95,87 @@ def mine_factors(df: pd.DataFrame, candidates: list[dict], *, bar: str = "",
               for cand in candidates]
     ranked.sort(key=lambda row: abs(row["ir"]) if row.get("ir") is not None else -1.0, reverse=True)
     return ranked
+
+
+# ============================ 标的组聚合（组内均值排名，factor-lab-symbol-groups §3.4） ============================
+def _merge_key(item: dict) -> str:
+    """归并键 = ``factorKey | 规范化(params)``（**不含 direction**，C-3）：避免同一候选在不同标的上方向不同被拆键。"""
+    return f"{item.get('factorKey', '')}|{json.dumps(item.get('params') or {}, sort_keys=True)}"
+
+
+def _wmean(pairs: list[tuple]) -> float | None:
+    """``(value, weight)`` 列表 → 加权均值；跳过 None / 非有限值 / 非正权重；无有效对 → None（绝不臆造 0）。"""
+    num = den = 0.0
+    for value, weight in pairs:
+        if value is None:
+            continue
+        fv, fw = float(value), float(weight)
+        if not (np.isfinite(fv) and fw > 0.0):
+            continue
+        num += fv * fw
+        den += fw
+    return num / den if den > 0.0 else None
+
+
+def _mean(values: list) -> float | None:
+    """非空有限值的简单均值；全空 → None。"""
+    finite = [float(v) for v in values if v is not None and np.isfinite(float(v))]
+    return sum(finite) / len(finite) if finite else None
+
+
+def _round6(value: float | None) -> float | None:
+    return None if value is None else round(float(value), 6)
+
+
+def aggregate_mine_results(per_symbol_ranked: list[list[dict]], symbols: list[str],
+                           top_n: int) -> list[dict]:
+    """把逐标的挖掘排名按 ``(factorKey, canonical(params))`` 归并为「组内均值」候选并按 abs(组 IR) 降序取 topN。
+
+    归并键**不含 direction**（C-3）：同一候选的方向统一取自**焦点标的**（``per_symbol_ranked[0]``）的解析结果，
+    焦点缺该候选则回落聚合 IR 符号。组分 = 各标的 IR **非空按 coverage 加权均值**（全空丢弃该候选），
+    ``rankIc``/``ic``/``monotonicity`` 同法，``coverage`` 取逐标的均值，``occurrences`` 求和。
+
+    Args:
+        per_symbol_ranked: 逐标的 ``mine_factors`` 产物（顺序即 ``symbols`` 顺序，[0] 为焦点标的）。
+        symbols: 参与聚合的有效标的（回显用；实际归并以逐标的排名为准）。
+        top_n: 截断上限。
+
+    Returns:
+        归并后的 ``[RankedFactor]``（≤ topN；每候选回填统一 ``direction``）。
+    """
+    _ = symbols
+    if not per_symbol_ranked:
+        return []
+    focus_dir = {_merge_key(item): item.get("direction", "long") for item in per_symbol_ranked[0]}
+    grouped: "OrderedDict[str, dict]" = OrderedDict()
+    for ranked in per_symbol_ranked:
+        for item in ranked:
+            key = _merge_key(item)
+            bucket = grouped.get(key)
+            if bucket is None:
+                bucket = {"base": item, "ir": [], "rankIc": [], "ic": [], "mono": [], "cov": [], "occ": 0}
+                grouped[key] = bucket
+            cov = float(item.get("coverage") or 0.0)
+            bucket["ir"].append((item.get("ir"), cov))
+            bucket["rankIc"].append((item.get("rankIc"), cov))
+            bucket["ic"].append((item.get("ic"), cov))
+            bucket["mono"].append((item.get("monotonicity"), cov))
+            bucket["cov"].append(item.get("coverage"))
+            bucket["occ"] += int(item.get("occurrences") or 0)
+    out: list[dict] = []
+    for key, bucket in grouped.items():
+        ir = _wmean(bucket["ir"])
+        if ir is None:
+            continue   # 全标的该候选 IR 皆空 → 丢弃（绝不臆造 0）
+        base = bucket["base"]
+        direction = focus_dir.get(key) or ("short" if ir < 0 else "long")
+        out.append({
+            "factorKey": base["factorKey"], "params": base.get("params") or {},
+            "direction": direction, "category": base.get("category", ""),
+            "ic": _round6(_wmean(bucket["ic"])), "rankIc": _round6(_wmean(bucket["rankIc"])),
+            "ir": _round6(ir), "monotonicity": _round6(_wmean(bucket["mono"])),
+            "coverage": round(_mean(bucket["cov"]) or 0.0, 4), "occurrences": bucket["occ"],
+            "note": "",
+        })
+    out.sort(key=lambda row: abs(row["ir"]) if row.get("ir") is not None else -1.0, reverse=True)
+    return out[:top_n]

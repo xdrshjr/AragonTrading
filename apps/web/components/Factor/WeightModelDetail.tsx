@@ -8,7 +8,7 @@ import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import { ApiRequestError } from "@/lib/api";
 import { directionLabel, formatIc } from "@/lib/factor";
 import { fmtTime } from "@/lib/format";
-import { codeLabel, latestRun, methodLabel, runIsBacktestable, runStatusLabel, runStatusTone, runToTrained } from "@/lib/weightModel";
+import { codeLabel, latestRun, methodLabel, runIsBacktestable, runStatusLabel, runStatusTone, runToTrained, symbolsSummary } from "@/lib/weightModel";
 import { weightModelApi } from "@/lib/weightModelApi";
 import type { WeightModel, WeightTrainRun } from "@/lib/weightModelTypes";
 import TrainingCurveChart from "./TrainingCurveChart";
@@ -97,7 +97,9 @@ export default function WeightModelDetail({
       {model.data && (
         <div className="card flex flex-col gap-2 p-3">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-[var(--muted)]">
-            <span>{model.data.instId} · {model.data.bar}</span>
+            <span title={symbolsSummary(model.data.instId, model.data.symbols).title}>
+              {symbolsSummary(model.data.instId, model.data.symbols).label} · {model.data.bar}
+            </span>
             <span>{model.data.members.length} 成员</span>
             <span>前瞻 {model.data.horizon} 根</span>
             <span>最佳验证 IC <span className="text-[var(--text)]">{formatIc(model.data.bestValidIc)}</span></span>

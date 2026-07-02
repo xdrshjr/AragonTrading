@@ -12,8 +12,9 @@ import WeightModelEditor from "./WeightModelEditor";
 // 工作台 + 候选交互桩；模型名校验（H-F6）聚焦提交禁用门，不拉起整个实验室。
 vi.mock("./FactorLab", () => ({
   useWorkbench: () => ({
+    target: { kind: "single", instId: "BTC-USDT-SWAP" }, symbols: ["BTC-USDT-SWAP"],
     instId: "BTC-USDT-SWAP", bar: "1H", startTs: 1, endTs: 2,
-    setInstId: () => {}, setBar: () => {}, setRange: () => {},
+    setTarget: () => {}, setBar: () => {}, setRange: () => {},
     evalTarget: null, setEvalTarget: () => {},
     pendingMembers: [], addPendingMember: () => {}, clearPendingMembers: () => {},
   }),

@@ -66,6 +66,9 @@ export interface WeightModel {
   bestValidIc: number | null;
   notes: string;
   enabled: boolean;
+  // 标的组训练模型的组成员与来源组（factor-lab-symbol-groups §3.5，从 config 派生）；单标的模型 symbols=[instId]。
+  symbols?: string[];
+  symbolGroupId?: string | null;
   latestRun: WeightTrainRun | null;
   createdTs: number;
   updatedTs: number;
@@ -88,6 +91,10 @@ export interface WeightTrainTarget {
   name: string;
   modelId?: number;
   factorSetId?: number;
+  // 标的组训练（factor-lab-symbol-groups §3.5）：symbols 由 wb.symbols 填充（含焦点，[0]=instId）；
+  // symbolGroupId 为来源组（若目标是组）。缺省 / 单元素走单标的原路径（等价性门禁不受影响）。
+  symbols?: string[];
+  symbolGroupId?: string;
   // 发起来源（瞬态，不持久化）：builder = 搭建台「训练权重」（同会话复用记忆 boundModelId）；
   // model = 列表/详情「训练」已存模型（不写 boundModelId，杜绝跨上下文污染，H-F2）。
   origin: "builder" | "model";

@@ -433,6 +433,65 @@ _WORKSPACE_WATCHLIST_KEY = "workspace.watchlist_prefs"
 _WATCHLIST_MAX = 500                 # 自选标的上限（防无界增长，§2.3-1 / §8）
 _INST_ID_MAX_LEN = 64                # 单个 instId 截断长度（同上）
 _ALLOCATION_MODES = ("even", "max_ratio")
+# 标的组（factor-lab-symbol-groups §3.2）：整表组数上限 + 每组成员上限 + 组名 / 组 id 截断长度。
+_SYMBOL_GROUPS_MAX = 50              # 整表标的组数量上限（超出按序截断）
+_GROUP_SYMBOLS_MAX = 100            # 单组成员数上限（超出按序截断）
+_GROUP_NAME_MAX = 64               # 组名截断长度
+_GROUP_ID_MAX_LEN = 64            # 组 id 截断长度
+
+
+def _sanitize_symbol_groups(raw: object) -> list[dict]:
+    """把任意（可能跨版本 / 手改）标的组文档夹取为可信列表（唯一规整点，读写各跑一次，§3.2）。
+
+    每组：``id`` 转 str 去空、按 id **去重**（首现保留）；``name`` 转 str trim 截断（≤ ``_GROUP_NAME_MAX``）；
+    ``symbols`` 转 str trim 单 id 截断（≤ ``_INST_ID_MAX_LEN``）、组内**去重**、每组上限 ``_GROUP_SYMBOLS_MAX``、
+    **保序**（决定焦点 / 方向锚点，§3.1）；``createdTs`` / ``updatedTs`` 转非负 int（缺省 0）。整表上限
+    ``_SYMBOL_GROUPS_MAX``。**丢弃退化组**：``name`` 为空**或** ``symbols`` 为空的组（空组无意义）。
+
+    **决策（不强制 ``⊆ watchlist``）**：与 ``autoTradeMembers`` 不同，标的组成员**不**按当前自选裁剪——避免用户
+    临时取消某自选标的时静默掏空已保存组（绝不静默丢弃，R4）；候选来源限自选由前端编辑器负责。
+    """
+    groups: list[dict] = []
+    seen_id: set[str] = set()
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        gid_raw = item.get("id")
+        gid = str(gid_raw).strip()[:_GROUP_ID_MAX_LEN] if gid_raw is not None else ""
+        if not gid or gid in seen_id:
+            continue
+        name = str(item.get("name") or "").strip()[:_GROUP_NAME_MAX]
+        symbols: list[str] = []
+        seen_sym: set[str] = set()
+        raw_symbols = item.get("symbols")
+        for sym in raw_symbols if isinstance(raw_symbols, list) else []:
+            if not isinstance(sym, str):
+                continue
+            inst = sym.strip()[:_INST_ID_MAX_LEN]
+            if not inst or inst in seen_sym:
+                continue
+            seen_sym.add(inst)
+            symbols.append(inst)
+            if len(symbols) >= _GROUP_SYMBOLS_MAX:
+                break
+        if not name or not symbols:   # 退化组丢弃
+            continue
+        seen_id.add(gid)
+        groups.append({"id": gid, "name": name, "symbols": symbols,
+                       "createdTs": _non_negative_int(item.get("createdTs")),
+                       "updatedTs": _non_negative_int(item.get("updatedTs"))})
+        if len(groups) >= _SYMBOL_GROUPS_MAX:
+            break
+    return groups
+
+
+def _non_negative_int(value: object) -> int:
+    """转非负整数（非数值 / 负值 / 非有限 → 0），供标的组时间戳规整。"""
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return out if out >= 0 else 0
 
 
 def _sanitize_workspace_watchlist(raw: object) -> dict:
@@ -494,7 +553,11 @@ def _sanitize_workspace_watchlist(raw: object) -> dict:
     if mode not in _ALLOCATION_MODES:
         mode = "even"
 
-    return {"watchlist": watchlist, "autoTradeMembers": members, "autoTradeAllocationMode": mode}
+    # 4) symbolGroups：标的组去重 / 截断 / 丢空组（唯一规整点，成员**不**按自选裁剪，§3.2 决策 R4）。
+    symbol_groups = _sanitize_symbol_groups(doc.get("symbolGroups"))
+
+    return {"watchlist": watchlist, "autoTradeMembers": members, "autoTradeAllocationMode": mode,
+            "symbolGroups": symbol_groups}
 
 
 async def get_workspace_watchlist(session: AsyncSession) -> dict | None:
@@ -511,6 +574,7 @@ async def set_workspace_watchlist(
     watchlist: object,
     members: object,
     allocation_mode: object,
+    symbol_groups: object = None,
 ) -> dict:
     """整文档 upsert workspace 偏好（按 §2.3 夹取后入库 + ``commit``），返回夹取后的文档。"""
     doc = _sanitize_workspace_watchlist(
@@ -518,6 +582,7 @@ async def set_workspace_watchlist(
             "watchlist": watchlist,
             "autoTradeMembers": members,
             "autoTradeAllocationMode": allocation_mode,
+            "symbolGroups": symbol_groups,
         }
     )
     await set_app_setting(session, _WORKSPACE_WATCHLIST_KEY, doc)

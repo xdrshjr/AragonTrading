@@ -120,6 +120,13 @@ class Settings(BaseSettings):
     # 20000 而沦为 no-op；默认 8000（≈80 次 OKX 串行请求、≥10s 限频地板，落在多数链路超时窗口内），可经
     # 环境变量 FACTOR_TRAIN_MAX_BARS 调参。
     factor_train_max_bars: int = Field(default=8000, ge=1000)
+    # ---- 因子实验室「标的组」多标的扇出上限（factor-lab-symbol-groups §五，取数前判定，绝不无界扇出）----
+    # 字段名即环境变量名（MAX_TRAIN_SYMBOLS / MAX_EVAL_SYMBOLS，大小写不敏感）。多标的评估 / 训练逐标的
+    # 串行取真实 OKX K 线，标的数越界即取数前 400 快速失败（评估 FACTOR_EVAL_TOO_MANY_SYMBOLS / 训练
+    # FACTOR_TRAIN_TOO_MANY_SYMBOLS），把逐标的 OKX 请求压回 _candle_cache 量级附近，重演 429 / socket 压力
+    # 的风险受控（C-1）。挖掘扇出由既有 413 工作量护栏（计入标的数）在取数前拦截，无需独立标的数上限。
+    max_train_symbols: int = Field(default=20, ge=1)   # 单次权重训练的标的组成员数上限
+    max_eval_symbols: int = Field(default=30, ge=1)    # 单次因子评估的标的组成员数上限
     # ---- 权重模型工作区（weight-model-workspace §四/config，流式训练 + 模型管理）----
     # 字段名即环境变量名（MAX_WEIGHT_TRAIN_JOBS 等，大小写不敏感）。流式训练作业与 socket 解耦，
     # 故并发上限独立于同步训练护栏：超出即 429 WEIGHT_TRAIN_BUSY（守门优先，绝不先落库再拒，R-01）。

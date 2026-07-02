@@ -9,9 +9,12 @@ import type {
   FactorMember,
   FactorScoreSnapshotParams,
   FactorSet,
+  FactorTarget,
+  FactorTargetRef,
   FactorThresholds,
   FrozenDirection,
   QuantileBucket,
+  SymbolGroup,
   TrainMetrics,
   TrainMethod,
   TrainProvenance,
@@ -459,6 +462,64 @@ export function trainedFromSnapshot(
 export function resolveWatchlistInstId(current: string, watchlist: string[]): string {
   if (watchlist.includes(current)) return current;
   return watchlist[0] ?? "";
+}
+
+// 去空去重后的标的组成员（保序，[0]=焦点/方向锚点，§3.1）。
+function normalizeGroupSymbols(symbols: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of symbols) {
+    const inst = (raw ?? "").trim();
+    if (inst && !seen.has(inst)) {
+      seen.add(inst);
+      out.push(inst);
+    }
+  }
+  return out;
+}
+
+/**
+ * 把持久化的目标指针解析为合法 `FactorTarget`（factor-lab-symbol-groups §3.1，类比 resolveWatchlistInstId）：
+ * - group 指针：组存在且去空去重后成员非空 → 返回带成员快照的 group；组已删 / 成员全失效 → 回落焦点单标的；
+ * - single 指针（或 null）：经 resolveWatchlistInstId 夹取到自选合法值。
+ *
+ * 保证选择器 `value` 恒命中一个 option、派生 `symbols` 恒非空（group 成员**不**按自选裁剪，§3.2 决策）。
+ */
+export function resolveFactorTarget(
+  ref: FactorTargetRef | null | undefined,
+  watchlist: string[],
+  groups: SymbolGroup[],
+): FactorTarget {
+  if (ref?.kind === "group") {
+    const group = groups.find((g) => g.id === ref.groupId);
+    if (group) {
+      const symbols = normalizeGroupSymbols(group.symbols);
+      if (symbols.length > 0) {
+        return { kind: "group", groupId: group.id, name: group.name, symbols };
+      }
+    }
+    return { kind: "single", instId: resolveWatchlistInstId("", watchlist) };
+  }
+  const current = ref?.kind === "single" ? ref.instId : "";
+  return { kind: "single", instId: resolveWatchlistInstId(current, watchlist) };
+}
+
+// FactorTarget → 派生 symbols（多标的统计消费方；single→[instId]，group→成员快照，保证非空即回退 [instId]）。
+export function factorTargetSymbols(target: FactorTarget): string[] {
+  if (target.kind === "group") {
+    const symbols = normalizeGroupSymbols(target.symbols);
+    return symbols.length > 0 ? symbols : [];
+  }
+  return target.instId ? [target.instId] : [];
+}
+
+// FactorTarget → 焦点标的（single→instId，group→symbols[0]；图表 / 打分 / 建模默认标的，§3.1）。
+export function factorTargetFocus(target: FactorTarget): string {
+  if (target.kind === "group") {
+    const symbols = normalizeGroupSymbols(target.symbols);
+    return symbols[0] ?? "";
+  }
+  return target.instId;
 }
 
 // 阈值摘要文案（详情卡片用，稳定可单测）：进多/进空/退出带/归一化窗口/压缩开关。

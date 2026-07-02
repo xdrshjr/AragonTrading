@@ -233,6 +233,9 @@ export default function FactorSetBuilder() {
         name,
         modelId: boundModelId ?? undefined,
         factorSetId: editingSetId ?? undefined,
+        // 标的组训练（factor-lab-symbol-groups §3.5）：wb.symbols 含焦点，group 目标随来源组 id。
+        symbols: wb.symbols,
+        symbolGroupId: wb.target.kind === "group" ? wb.target.groupId : undefined,
       }),
     );
     setSection("models");

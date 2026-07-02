@@ -3,6 +3,7 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Select } from "@/components/ui";
+import type { PerSymbolEval } from "@/lib/factorTypes";
 import {
   directionLabel,
   formatIc,
@@ -44,8 +45,12 @@ export default function FactorEvalPanel() {
   }, [wb.evalTarget]);
 
   const range = { instId: wb.instId, bar: wb.bar, startTs: wb.startTs, endTs: wb.endTs };
+  // 标的组（>1）时把组成员下发后端逐标的取数聚合；单标的省略 symbols 走原路径（factor-lab-symbol-groups §3.3）。
+  const groupSymbols = wb.symbols.length > 1 ? wb.symbols : undefined;
   const evaluate = useMutation({
-    mutationFn: () => factorApi.evaluate({ ...range, factorKey, direction, horizons: HORIZONS }),
+    mutationFn: () =>
+      factorApi.evaluate({ ...range, factorKey, direction, horizons: HORIZONS,
+        ...(groupSymbols ? { symbols: groupSymbols } : {}) }),
     onSuccess: setResult,
   });
   const compute = useMutation({ mutationFn: () => factorApi.compute({ ...range, factorKey }) });
@@ -136,6 +141,9 @@ function EvalResult({ result, onAddToCombo }: { result: FactorEvalResult; onAddT
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center gap-2">
+        {result.aggregated && (
+          <Badge tone="accent">组内均值 · {result.symbols?.length ?? result.perSymbol?.length ?? 0} 标的</Badge>
+        )}
         <Badge tone={result.direction === "long" ? "long" : "short"}>方向 {directionLabel(result.direction)}</Badge>
         <Badge tone="neutral">覆盖 {formatPct(result.coverage)}</Badge>
         <Badge tone="neutral">配对样本 {result.occurrences}</Badge>
@@ -144,6 +152,10 @@ function EvalResult({ result, onAddToCombo }: { result: FactorEvalResult; onAddT
           <Button variant="primary" size="sm" onClick={onAddToCombo}>加入组合</Button>
         </div>
       </div>
+
+      {result.aggregated && result.perSymbol && result.perSymbol.length > 0 && (
+        <PerSymbolDrawer rows={result.perSymbol} />
+      )}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <div className="card flex flex-col gap-2 p-3">
@@ -159,6 +171,48 @@ function EvalResult({ result, onAddToCombo }: { result: FactorEvalResult; onAddT
       </div>
 
       <HorizonTable horizons={result.horizons} />
+    </div>
+  );
+}
+
+// 逐标的贡献抽屉（factor-lab-symbol-groups §3.3）：透明呈现哪些标的入了组内均值（配对样本 / 主 RankIC / 覆盖），
+// 绝不隐藏聚合来源。默认展开首屏可见，可折叠收起。
+function PerSymbolDrawer({ rows }: { rows: PerSymbolEval[] }) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="rounded-[12px] border border-[var(--border)]">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center justify-between px-3 py-2 text-left text-[11px] font-medium text-[var(--muted)]"
+      >
+        <span>逐标的贡献（{rows.length} 标的）</span>
+        <span aria-hidden>{open ? "收起 ▲" : "展开 ▼"}</span>
+      </button>
+      {open && (
+        <div className="overflow-x-auto border-t border-[var(--border)]">
+          <table className="w-full min-w-[420px] text-left text-xs tabular">
+            <thead className="bg-[var(--surface-2)] text-[var(--muted)]">
+              <tr>
+                {["标的", "配对样本", "主 RankIC", "覆盖"].map((c) => (
+                  <th key={c} className="px-3 py-1.5 font-medium">{c}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.instId} className="border-t border-[var(--border)]">
+                  <td className="px-3 py-1.5 font-medium text-[var(--text)]">{r.instId}</td>
+                  <td className="px-3 py-1.5 text-[var(--muted)]">{r.occurrences}</td>
+                  <td className={cellTone(r.primaryRankIc)}>{formatIc(r.primaryRankIc)}</td>
+                  <td className="px-3 py-1.5 text-[var(--muted)]">{formatPct(r.coverage)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

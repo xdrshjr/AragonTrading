@@ -15,11 +15,13 @@ import WeightModelPanel from "./WeightModelPanel";
 // 固定工作台（panel 取 range；builder 取 instId/bar/范围），避免拉起整个实验室。
 vi.mock("./FactorLab", () => ({
   useWorkbench: () => ({
+    target: { kind: "single", instId: "BTC-USDT-SWAP" },
+    symbols: ["BTC-USDT-SWAP"],
     instId: "BTC-USDT-SWAP",
     bar: "1H",
     startTs: 1,
     endTs: 2,
-    setInstId: () => {},
+    setTarget: () => {},
     setBar: () => {},
     setRange: () => {},
     evalTarget: null,

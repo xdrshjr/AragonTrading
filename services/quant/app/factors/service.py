@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import pandas as pd
@@ -24,7 +24,10 @@ from ..db.models import FactorSet, Strategy
 from ..engine.backtester import candles_to_df
 from ..engine.factors import (
     MINE_WORK_UNIT_LIMIT,
+    aggregate_eval_results,
+    aggregate_mine_results,
     build_factor_matrix,
+    build_pooled_sample,
     compose_score,
     compute_factor,
     default_candidates,
@@ -37,6 +40,7 @@ from ..engine.factors import (
     mining_workload,
     resolve_norm_contract,
     score_points,
+    train_weights_on_sample,
 )
 from ..engine.factors.mining import MINE_MIN_COVERAGE, MINE_PERSIST_MIN_ABS_IR
 from ..engine.factors.scoring import DEFAULT_CLIP, DEFAULT_NORM_WINDOW
@@ -136,23 +140,78 @@ async def compute(rest, window: FactorWindow, *, factor_key: str, params: dict |
     return out
 
 
-async def evaluate(session: AsyncSession, rest, window: FactorWindow, *, factor_key: str,
-                   params: dict | None, direction: str, horizons: tuple[int, ...],
-                   quantiles: int, factor_id: int | None = None) -> dict:
-    """评估单因子（IC/RankIC/IR/分位）；给 ``factor_id`` 时把摘要缓存进 ``factors.eval_json``。"""
-    validate_factor_key(factor_key)
-    df = await _load_df(rest, window)
+def _effective_symbols(symbols: list[str] | None, focus: str) -> list[str]:
+    """去空去重后的有效标的（保序，[0] 为焦点）；缺省 / 全空回落焦点单标的（factor-lab-symbol-groups §3.3）。"""
+    if not symbols:
+        return [focus]
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in symbols:
+        inst = (raw or "").strip()
+        if inst and inst not in seen:
+            seen.add(inst)
+            out.append(inst)
+    return out or [focus]
+
+
+def _guard_eval_symbols(symbols: list[str]) -> None:
+    """评估标的数超 ``max_eval_symbols`` → 400（**取数前**判定，绝不无界扇出 OKX 请求，C-1）。"""
+    limit = get_settings().max_eval_symbols
+    if len(symbols) > limit:
+        raise HTTPException(400, detail={
+            "code": "FACTOR_EVAL_TOO_MANY_SYMBOLS",
+            "message": f"标的组过大：评估最多支持 {limit} 个标的，请缩减标的组后重试。"})
+
+
+async def _evaluate_one(rest, window: FactorWindow, inst_id: str, *, factor_key: str,
+                        params: dict | None, direction: str, horizons: tuple[int, ...],
+                        quantiles: int) -> dict:
+    """对单标的取真实 OKX 数据并评估 → payload（``instId`` 落该标的；bar 不兼容如实标注）。"""
+    df = await _load_df(rest, replace(window, inst_id=inst_id))
     result = await run_in_threadpool(
         evaluate_factor_key, df, factor_key, params, direction, bar=window.bar,
         horizons=horizons, quantiles=quantiles)
-    result.instId = window.inst_id
+    result.instId = inst_id
     payload = eval_result_to_dict(result)
-    # 日内限定因子用于非日内 bar → 全 NaN 评估，标注原因（与 samples_sparse 区分）（L5）。
     if not is_bar_compatible(factor_key, window.bar):
         payload["note"] = "bar_incompatible"
-    if factor_id is not None:
-        await repo.set_factor_eval(session, factor_id, payload)
     return payload
+
+
+async def evaluate(session: AsyncSession, rest, window: FactorWindow, *, factor_key: str,
+                   params: dict | None, direction: str, horizons: tuple[int, ...],
+                   quantiles: int, factor_id: int | None = None,
+                   symbols: list[str] | None = None) -> dict:
+    """评估单因子 / 标的组（IC/RankIC/IR/分位）；给 ``factor_id`` 时把摘要缓存进 ``factors.eval_json``。
+
+    单标的（含缺省 ``symbols``）走原路径，行为字节级不变（回归护栏）。标的组（``len>1``）先扇出护栏
+    （C-1）→ 焦点标的解析并冻结方向一次（C-2）→ 其余标的以冻结方向逐一取真实数据评估 → occurrences
+    加权聚合（``aggregate_eval_results``）。逐标的贡献经 ``perSymbol`` 可见，绝不静默丢弃标的。
+    """
+    validate_factor_key(factor_key)
+    effective = _effective_symbols(symbols, window.inst_id)
+    if len(effective) == 1:
+        payload = await _evaluate_one(
+            rest, window, effective[0], factor_key=factor_key, params=params, direction=direction,
+            horizons=horizons, quantiles=quantiles)
+        if factor_id is not None:
+            await repo.set_factor_eval(session, factor_id, payload)
+        return payload
+    # 标的组：取数前扇出护栏 → 焦点标的一次性解析冻结方向（auto 仅在此定号）→ 逐标的同向评估 → 聚合。
+    _guard_eval_symbols(effective)
+    focus_payload = await _evaluate_one(
+        rest, window, effective[0], factor_key=factor_key, params=params, direction=direction,
+        horizons=horizons, quantiles=quantiles)
+    frozen = focus_payload["direction"]   # evaluate_factor 已把 auto 定号为 long/short（C-2 焦点锚点）
+    results = [focus_payload]
+    for sym in effective[1:]:
+        results.append(await _evaluate_one(
+            rest, window, sym, factor_key=factor_key, params=params, direction=frozen,
+            horizons=horizons, quantiles=quantiles))
+    aggregated = aggregate_eval_results(results, effective, frozen)
+    if factor_id is not None:
+        await repo.set_factor_eval(session, factor_id, aggregated)
+    return aggregated
 
 
 def _mined_factor_values(items: list[dict]) -> list[repo.FactorValues]:
@@ -181,12 +240,28 @@ def _mined_factor_values(items: list[dict]) -> list[repo.FactorValues]:
 
 async def mine(session: AsyncSession, rest, window: FactorWindow, *,
                categories: list[str] | None, horizons: tuple[int, ...], top_n: int,
-               persist: bool) -> dict:
-    """库 × 网格挖掘并按 RankIC IR 排名；工作量超限 413（绝不静默少算，评审 C-P1-3）。"""
+               persist: bool, symbols: list[str] | None = None) -> dict:
+    """库 × 网格挖掘并按 RankIC IR 排名；工作量超限 413（绝不静默少算，评审 C-P1-3）。
+
+    单标的走原路径。标的组（``len>1``）逐标的取真实数据挖掘 → 按 ``(factorKey, canonical(params))`` 归并
+    （方向统一取焦点标的，C-3），组分 = 各标的 IR coverage 加权均值。413 工作量护栏**计入标的数**且在
+    ``_load_df`` **之前**执行，故大组先 413、再取数，扇出天然受限（C-1/C-3）。
+    """
     candidates = default_candidates(window.bar, categories)
-    _guard_mine_workload(candidates, window)
-    df = await _load_df(rest, window)
-    ranked = await run_in_threadpool(mine_factors, df, candidates, bar=window.bar, horizons=horizons)
+    effective = _effective_symbols(symbols, window.inst_id)
+    _guard_mine_workload(candidates, window, symbol_count=len(effective))
+    if len(effective) == 1:
+        df = await _load_df(rest, window)
+        ranked = await run_in_threadpool(mine_factors, df, candidates, bar=window.bar, horizons=horizons)
+    else:
+        per_symbol: list[list[dict]] = []
+        for sym in effective:
+            df = await _load_df(rest, replace(window, inst_id=sym))
+            per_symbol.append(await run_in_threadpool(
+                mine_factors, df, candidates, bar=window.bar, horizons=horizons))
+        # 归并取全量（top_n 截断留待下方与单标的同口径处理，len(candidates) 上界即「不截断」）。
+        ranked = await run_in_threadpool(
+            aggregate_mine_results, per_symbol, effective, len(candidates))
     items = ranked[:top_n]
     truncated = len(ranked) > top_n
     persisted = 0
@@ -195,22 +270,26 @@ async def mine(session: AsyncSession, rest, window: FactorWindow, *,
         persisted = len(inserted)
     # 计数透明：evaluated=本次考虑落库的候选数；persisted=实际新写入；skipped=去重+无效（绝不静默丢弃，H5）。
     skipped = (len(items) - persisted) if persist else 0
-    return {"items": items, "truncated": truncated, "evaluated": len(items),
-            "persisted": persisted, "skipped": skipped}
+    out = {"items": items, "truncated": truncated, "evaluated": len(items),
+           "persisted": persisted, "skipped": skipped}
+    if len(effective) > 1:
+        out["symbols"] = effective   # 回显聚合标的（前端组态提示）
+    return out
 
 
-def _guard_mine_workload(candidates: list[dict], window: FactorWindow) -> None:
-    """候选数 × 有效根数超 ``MINE_WORK_UNIT_LIMIT`` → 413（沿用 compare 413 语义）。"""
+def _guard_mine_workload(candidates: list[dict], window: FactorWindow, *,
+                         symbol_count: int = 1) -> None:
+    """候选数 × 有效根数 × 标的数超 ``MINE_WORK_UNIT_LIMIT`` → 413（沿用 compare 413 语义；标的组计入扇出，C-3）。"""
     settings = get_settings()
     requested = (window.end_ts - window.start_ts) // bar_to_seconds(window.bar) + 1
     ceiling = settings.backtest_max_bars
     if window.max_bars is not None:
         ceiling = min(int(window.max_bars), ceiling)
     effective = max(0, min(int(requested), int(ceiling)))
-    if mining_workload(len(candidates), effective) > MINE_WORK_UNIT_LIMIT:
+    if mining_workload(len(candidates), effective) * max(1, int(symbol_count)) > MINE_WORK_UNIT_LIMIT:
         raise HTTPException(413, detail={
             "code": "FACTOR_MINE_TOO_LARGE",
-            "message": "挖掘工作量过大，请缩短区间或限定类别后重试。"})
+            "message": "挖掘工作量过大，请缩短区间、限定类别或缩减标的组后重试。"})
 
 
 # ============================ 训练 / 打分 ============================
@@ -234,23 +313,41 @@ def _guard_train_workload(window: FactorWindow) -> None:
 
 
 async def train(rest, window: FactorWindow, *, members: list[dict], method: str,
-                config: dict | None, horizon: int) -> dict:
-    """训练因子权重：区间过长 → 413 FACTOR_TRAIN_TOO_LARGE；缺 rf/xgb 库 → 400 FACTOR_TRAINER_UNAVAILABLE，绝不回假权重。"""
+                config: dict | None, horizon: int, symbols: list[str] | None = None) -> dict:
+    """训练因子权重：区间过长 → 413 FACTOR_TRAIN_TOO_LARGE；缺 rf/xgb 库 → 400 FACTOR_TRAINER_UNAVAILABLE，绝不回假权重。
+
+    单标的走原路径（``train_weights``，字节级不变，等价性门禁保持）。标的组（``len>1``）逐标的
+    ``build_factor_matrix``（各自因果 z-score，绝不跨标的拼原始 K 线）→ ``build_pooled_sample`` 池化 →
+    ``train_weights_on_sample`` 末步装配，绝不改被门禁守护的 ``train_weights`` / ``build_train_result``。
+    """
     members = validate_members(members)
     config = config or {}
     norm_window = int(config.get("normWindow", DEFAULT_NORM_WINDOW))
     clip = float(config.get("clip", DEFAULT_CLIP))
+    effective = _effective_symbols(symbols, window.inst_id)
     _guard_train_workload(window)
-    df = await _load_df(rest, window)
-    matrix, names, norm_stats = await run_in_threadpool(
-        build_factor_matrix, df, members, norm_window=norm_window, clip=clip, bar=window.bar)
-    label = forward_return_label(df, horizon)
-    result = await _train_weights_guarded(matrix, label, names, method, config, norm_stats)
+    if len(effective) == 1:
+        df = await _load_df(rest, window)
+        matrix, names, norm_stats = await run_in_threadpool(
+            build_factor_matrix, df, members, norm_window=norm_window, clip=clip, bar=window.bar)
+        label = forward_return_label(df, horizon)
+        result = await _train_weights_guarded(matrix, label, names, method, config, norm_stats)
+    else:
+        parts: list[tuple] = []
+        names, norm_stats = [], {}
+        for sym in effective:
+            df = await _load_df(rest, replace(window, inst_id=sym))
+            matrix, names, norm_stats = await run_in_threadpool(
+                build_factor_matrix, df, members, norm_window=norm_window, clip=clip, bar=window.bar)
+            parts.append((matrix, forward_return_label(df, horizon)))
+        result = await _pooled_train_guarded(parts, names, method, config, norm_stats)
     if not result.available:
         raise HTTPException(400, detail={"code": "FACTOR_TRAINER_UNAVAILABLE", "message": result.note})
     # 溯源元数据（H7）：取数窗口 + horizon；trainedAt 由前端/路由注入秒级 UTC（引擎/服务不取时钟）。
     provenance = {"instId": window.inst_id, "bar": window.bar, "startTs": window.start_ts,
                   "endTs": window.end_ts, "horizon": int(horizon)}
+    if len(effective) > 1:
+        provenance["symbols"] = effective
     return {"method": result.method, "weights": result.weights, "normStats": result.normStats,
             "metrics": result.metrics, "available": True, "note": result.note,
             "trainerVersion": result.trainerVersion, "provenance": provenance}
@@ -262,6 +359,16 @@ async def _train_weights_guarded(matrix, label, names, method: str, config: dict
     try:
         return await run_in_threadpool(
             train_weights, matrix, label, names, method=method, config=config, norm_stats=norm_stats)
+    except ValueError as exc:
+        raise HTTPException(400, detail={"code": "FACTOR_TRAIN_FAILED", "message": str(exc)}) from exc
+
+
+async def _pooled_train_guarded(parts, names, method: str, config: dict, norm_stats: dict):
+    """多标的池化训练（线程池）：池化不足 / 样本不足 / 未知方法的 ValueError 收敛为 400（C1 显式错误）。"""
+    try:
+        sample = await run_in_threadpool(build_pooled_sample, parts, config)
+        return await run_in_threadpool(
+            train_weights_on_sample, sample, names, method=method, config=config, norm_stats=norm_stats)
     except ValueError as exc:
         raise HTTPException(400, detail={"code": "FACTOR_TRAIN_FAILED", "message": str(exc)}) from exc
 

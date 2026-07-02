@@ -25,7 +25,7 @@ import type {
   LiveAutoEvent,
   LiveAutoStatus,
 } from "./liveAutoTypes";
-import type { FactorEditTarget } from "./factorTypes";
+import type { FactorEditTarget, FactorTargetRef, SymbolGroup } from "./factorTypes";
 import type { WeightTrainResult, WeightTrainTarget } from "./weightModelTypes";
 import type { WorkspacePrefs } from "./workspaceTypes";
 import { clampAllocationOnEdit, defaultAllocationOnAdd, evenSplit } from "./autoTrade";
@@ -138,6 +138,10 @@ interface AppState {
   backtestEndTs: number;
   indicators: Record<IndicatorKey, boolean>;
   watchlist: string[];
+  // 因子实验室标的组（factor-lab-symbol-groups §3.2）：持久化偏好态 + 后端权威水合；成员来自自选标的但
+  // **不**按当前自选裁剪（§3.2 决策，避免静默掏空）。factorLabTarget 为工作台目标指针（记忆上次选择）。
+  symbolGroups: SymbolGroup[];
+  factorLabTarget: FactorTargetRef | null;
   instSidebarTab: InstSidebarTab;
   chartSplitRatio: number;
   // 主图 K 线与副图技术指标的内部分栏比例（主图占内部列高，1-ratio 即副图高）；持久化偏好。
@@ -228,6 +232,12 @@ interface AppState {
   addToWatchlist: (instId: string) => void;
   removeFromWatchlist: (instId: string) => void;
   toggleWatchlist: (instId: string) => void;
+  // 标的组增删改（factor-lab-symbol-groups §3.2）：不可变纯 CRUD（id / updatedTs 由调用方注入）；写穿后端 + localStorage。
+  addSymbolGroup: (group: SymbolGroup) => void;
+  updateSymbolGroup: (id: string, patch: Partial<Omit<SymbolGroup, "id">>) => void;
+  removeSymbolGroup: (id: string) => void;
+  // 工作台目标指针（记忆上次选择，跨会话恢复）：null=默认焦点单标的。
+  setFactorLabTarget: (target: FactorTargetRef | null) => void;
   // 后端水合：用后端权威值整体覆盖 workspace 偏好切片（watchlist-auto-trade-persistence §2.2），
   // 并重申不变量 autoTradeMembers ⊆ watchlist。仅由 useWorkspaceSync 首次 GET 调用（写穿不回写，P1-B）。
   hydrateWorkspace: (prefs: WorkspacePrefs) => void;
@@ -339,6 +349,9 @@ export const useAppStore = create<AppState>()(
       indicators: { ...DEFAULT_INDICATORS },
       // 全新安装兜底（RV-1 / C-1）：只走初始化器、不触发 migrate，故默认值必须写在此处。
       watchlist: [...FALLBACK_INSTRUMENTS],
+      // 标的组默认空、目标指针默认 null（全新安装只走初始化器、不触发 migrate，故默认值必须写在此处）。
+      symbolGroups: [],
+      factorLabTarget: null,
       instSidebarTab: "watch",
       chartSplitRatio: DEFAULT_CHART_SPLIT_RATIO,
       // 全新安装只走初始化器、不触发 migrate，故面板尺寸默认值必须写在此处（与 chartSplitRatio 并列）。
@@ -574,17 +587,29 @@ export const useAppStore = create<AppState>()(
               }
             : { watchlist: [instId, ...s.watchlist] },
         ),
-      // 后端权威水合（§2.2）：整体覆盖三字段切片，并重申 autoTradeMembers ⊆ watchlist（丢弃不在
-      // 自选内的成员，与 removeFromWatchlist 同口径），避免后端跨版本 / 手改文档把游离成员带回。
-      hydrateWorkspace: ({ watchlist, autoTradeMembers, autoTradeAllocationMode }) =>
+      // 后端权威水合（§2.2）：整体覆盖切片，并重申 autoTradeMembers ⊆ watchlist（丢弃不在自选内的成员，
+      // 与 removeFromWatchlist 同口径）。标的组**不**按自选裁剪（§3.2 决策：避免临时取消自选静默掏空已保存组），
+      // 直接覆盖（后端 sanitizer 已规整）；旧后端文档缺 symbolGroups 时回落 []（缺省安全）。
+      hydrateWorkspace: ({ watchlist, autoTradeMembers, autoTradeAllocationMode, symbolGroups }) =>
         set(() => {
           const inWatchlist = new Set(watchlist);
           return {
             watchlist,
             autoTradeMembers: autoTradeMembers.filter((m) => inWatchlist.has(m.instId)),
             autoTradeAllocationMode,
+            symbolGroups: symbolGroups ?? [],
           };
         }),
+      // 标的组不可变 CRUD（factor-lab-symbol-groups §3.2）：id / updatedTs 由调用方注入；切片变更触发写穿后端。
+      addSymbolGroup: (group) => set((s) => ({ symbolGroups: [...s.symbolGroups, group] })),
+      updateSymbolGroup: (id, patch) =>
+        set((s) => ({
+          symbolGroups: s.symbolGroups.map((g) => (g.id === id ? { ...g, ...patch } : g)),
+        })),
+      removeSymbolGroup: (id) =>
+        set((s) => ({ symbolGroups: s.symbolGroups.filter((g) => g.id !== id) })),
+      // 工作台目标指针（持久化，记忆上次选择）：由 FactorLab.setTarget 双写（本地态 + 此指针）。
+      setFactorLabTarget: (factorLabTarget) => set({ factorLabTarget }),
       setInstSidebarTab: (instSidebarTab) => set({ instSidebarTab }),
       // 右侧页签切换（AI 助手 / 交易策略）；两面板各自持续挂载，切换不破坏状态（§6.2#1）。
       setRightTab: (rightTab) => set({ rightTab }),
@@ -660,7 +685,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 23,
+      version: 24,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -682,6 +707,9 @@ export const useAppStore = create<AppState>()(
         bottomTab: s.bottomTab,
         paneTab: s.paneTab,
         watchlist: s.watchlist,
+        // 标的组与工作台目标指针（偏好态，持久化 + 后端权威水合，factor-lab-symbol-groups §3.2）。
+        symbolGroups: s.symbolGroups,
+        factorLabTarget: s.factorLabTarget,
         // 自动交易成员（偏好态，持久化）；liveAutoGroup 为运行期瞬态，**不**入 partialize（刷新由
         // GET /live-auto/group/status 重发现）。
         autoTradeMembers: s.autoTradeMembers,
@@ -794,6 +822,11 @@ export const useAppStore = create<AppState>()(
         if (version < 23) {
           // 权重模型工作区：交接态（weightTrainTarget/weightTrainResult/boundModelId）全为瞬态、不入
           // partialize，浅合并回落 null 即可；此处显式占位稳妥（与既有迭代同范式，R-12）。
+        }
+        if (version < 24) {
+          // 因子实验室标的组：回填持久化 symbolGroups 默认（老用户初始为空）与目标指针 factorLabTarget=null
+          // （resolveFactorTarget 对缺失指针回落焦点单标的，缺省安全，factor-lab-symbol-groups §3.2 / R3）。
+          next = { ...next, symbolGroups: [], factorLabTarget: null };
         }
         return next as never;
       },

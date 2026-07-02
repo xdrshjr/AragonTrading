@@ -44,6 +44,7 @@ async def test_get_returns_present_false_when_unset():
                 "watchlist": [],
                 "autoTradeMembers": [],
                 "autoTradeAllocationMode": "even",
+                "symbolGroups": [],
             }
     finally:
         await dispose_engine()
@@ -213,5 +214,40 @@ async def test_repo_set_get_roundtrip_and_sanitize():
         async with sm() as s2:
             got = await repo.get_workspace_watchlist(s2)
             assert got == doc
+    finally:
+        await dispose_engine()
+
+
+async def test_symbol_groups_roundtrip_and_sanitize():
+    # 标的组 PUT/GET 往返 + sanitizer：id 去重、组名截断、成员去重去空、丢空组、成员**不**按自选裁剪（§3.2 R4）。
+    await _fresh()
+    app = _load_app()
+    body = {
+        "watchlist": ["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
+        "autoTradeMembers": [],
+        "autoTradeAllocationMode": "even",
+        "symbolGroups": [
+            {"id": "g1", "name": "主流币",
+             "symbols": ["BTC-USDT-SWAP", "BTC-USDT-SWAP", "  ", "DOGE-USDT-SWAP"],  # 去重去空 + 保留非自选成员
+             "createdTs": 100, "updatedTs": 200},
+            {"id": "g1", "name": "重复 id 丢弃", "symbols": ["ETH-USDT-SWAP"]},          # 同 id → 丢弃
+            {"id": "g2", "name": "", "symbols": ["ETH-USDT-SWAP"]},                    # 空名 → 丢弃
+            {"id": "g3", "name": "空组", "symbols": []},                                 # 空成员 → 丢弃
+        ],
+    }
+    try:
+        async with await _client(app) as client:
+            put = await client.put("/api/workspace/watchlist", json=body)
+            assert put.status_code == 200, put.text
+            groups = put.json()["symbolGroups"]
+            assert len(groups) == 1
+            assert groups[0]["id"] == "g1"
+            assert groups[0]["name"] == "主流币"
+            # 成员不因不在自选（DOGE）被裁剪；去重去空后保序。
+            assert groups[0]["symbols"] == ["BTC-USDT-SWAP", "DOGE-USDT-SWAP"]
+            assert groups[0]["createdTs"] == 100 and groups[0]["updatedTs"] == 200
+
+            got = (await client.get("/api/workspace/watchlist")).json()
+            assert got["symbolGroups"] == groups   # GET 回读经同一 sanitizer，稳定
     finally:
         await dispose_engine()

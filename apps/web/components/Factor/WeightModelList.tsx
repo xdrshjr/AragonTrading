@@ -7,7 +7,7 @@ import { Badge, Button, Switch } from "@/components/ui";
 import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import { formatIc } from "@/lib/factor";
 import { fmtTime } from "@/lib/format";
-import { canBacktestModel, methodLabel, runStatusLabel, runStatusTone, sortModelsByUpdated } from "@/lib/weightModel";
+import { canBacktestModel, methodLabel, runStatusLabel, runStatusTone, sortModelsByUpdated, symbolsSummary } from "@/lib/weightModel";
 import { weightModelApi } from "@/lib/weightModelApi";
 import type { WeightModel } from "@/lib/weightModelTypes";
 
@@ -150,7 +150,9 @@ function ModelCard({
           {!model.enabled && <Badge tone="neutral">已停用</Badge>}
         </div>
         <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-[var(--muted)]">
-          <span>{model.instId} · {model.bar}</span>
+          <span title={symbolsSummary(model.instId, model.symbols).title}>
+            {symbolsSummary(model.instId, model.symbols).label} · {model.bar}
+          </span>
           <span>{model.members.length} 成员</span>
           <span>最佳验证 IC <span className="text-[var(--text)]">{formatIc(model.bestValidIc)}</span></span>
         </div>

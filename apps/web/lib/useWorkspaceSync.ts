@@ -16,16 +16,18 @@ function sliceOf(state: ReturnType<typeof useAppStore.getState>): WorkspaceSlice
     watchlist: state.watchlist,
     autoTradeMembers: state.autoTradeMembers,
     autoTradeAllocationMode: state.autoTradeAllocationMode,
+    symbolGroups: state.symbolGroups,
   };
 }
 
-// 三字段引用比对（P1-D）：store 走不可变更新，引用相等即未变；裸 subscribe 会在任意 store 变更
+// 四字段引用比对（P1-D）：store 走不可变更新，引用相等即未变；裸 subscribe 会在任意 store 变更
 // （含 liveAutoTrades / status / events 等高频运行期态）触发，故必须先按切片过滤再决定是否写穿。
 function sliceChanged(a: WorkspaceSlice, b: WorkspaceSlice): boolean {
   return (
     a.watchlist !== b.watchlist ||
     a.autoTradeMembers !== b.autoTradeMembers ||
-    a.autoTradeAllocationMode !== b.autoTradeAllocationMode
+    a.autoTradeAllocationMode !== b.autoTradeAllocationMode ||
+    a.symbolGroups !== b.symbolGroups
   );
 }
 

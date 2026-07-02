@@ -24,6 +24,9 @@ import {
   quantileBars,
   rangesOverlap,
   resolveThresholds,
+  factorTargetFocus,
+  factorTargetSymbols,
+  resolveFactorTarget,
   resolveWatchlistInstId,
   thresholdsSummary,
   toggleMember,
@@ -467,6 +470,59 @@ describe("resolveWatchlistInstId", () => {
   it("returns_empty_for_empty_watchlist", () => {
     expect(resolveWatchlistInstId("BTC-USDT-SWAP", [])).toBe("");
     expect(resolveWatchlistInstId("", [])).toBe("");
+  });
+});
+
+describe("resolveFactorTarget", () => {
+  const watchlist = ["BTC-USDT-SWAP", "ETH-USDT-SWAP"];
+  const groups = [
+    { id: "g1", name: "主流币", symbols: ["ETH-USDT-SWAP", "BTC-USDT-SWAP"], createdTs: 1, updatedTs: 1 },
+  ];
+
+  it("resolves_single_pointer_clamped_to_watchlist", () => {
+    expect(resolveFactorTarget({ kind: "single", instId: "ETH-USDT-SWAP" }, watchlist, groups)).toEqual({
+      kind: "single",
+      instId: "ETH-USDT-SWAP",
+    });
+    // 不在自选 → 回落首项。
+    expect(resolveFactorTarget({ kind: "single", instId: "DOGE-USDT-SWAP" }, watchlist, groups)).toEqual({
+      kind: "single",
+      instId: "BTC-USDT-SWAP",
+    });
+  });
+
+  it("resolves_group_pointer_with_member_snapshot", () => {
+    const t = resolveFactorTarget({ kind: "group", groupId: "g1" }, watchlist, groups);
+    expect(t).toEqual({ kind: "group", groupId: "g1", name: "主流币", symbols: ["ETH-USDT-SWAP", "BTC-USDT-SWAP"] });
+    // 焦点 = 首个成员；派生 symbols = 全部成员。
+    expect(factorTargetFocus(t)).toBe("ETH-USDT-SWAP");
+    expect(factorTargetSymbols(t)).toEqual(["ETH-USDT-SWAP", "BTC-USDT-SWAP"]);
+  });
+
+  it("falls_back_to_focus_single_when_group_deleted", () => {
+    expect(resolveFactorTarget({ kind: "group", groupId: "gone" }, watchlist, groups)).toEqual({
+      kind: "single",
+      instId: "BTC-USDT-SWAP",
+    });
+  });
+
+  it("falls_back_when_group_members_all_empty", () => {
+    const emptyGroups = [{ id: "g2", name: "空组", symbols: ["  ", ""], createdTs: 1, updatedTs: 1 }];
+    expect(resolveFactorTarget({ kind: "group", groupId: "g2" }, watchlist, emptyGroups)).toEqual({
+      kind: "single",
+      instId: "BTC-USDT-SWAP",
+    });
+  });
+
+  it("null_pointer_resolves_to_first_watchlist", () => {
+    expect(resolveFactorTarget(null, watchlist, groups)).toEqual({ kind: "single", instId: "BTC-USDT-SWAP" });
+  });
+
+  it("group_members_not_clipped_to_watchlist", () => {
+    // §3.2 决策：组成员含已移出自选的标的（DOGE 不在自选）仍保留，不静默掏空。
+    const g = [{ id: "g3", name: "含离场", symbols: ["DOGE-USDT-SWAP", "BTC-USDT-SWAP"], createdTs: 1, updatedTs: 1 }];
+    const t = resolveFactorTarget({ kind: "group", groupId: "g3" }, watchlist, g);
+    expect(factorTargetSymbols(t)).toEqual(["DOGE-USDT-SWAP", "BTC-USDT-SWAP"]);
   });
 });
 

@@ -742,6 +742,7 @@ describe("app store — hydrateWorkspace (watchlist-auto-trade-persistence)", ()
       watchlist: ["BTC-USDT-SWAP", "ETH-USDT-SWAP"],
       autoTradeMembers: [{ instId: "BTC-USDT-SWAP", allocationPct: 60 }],
       autoTradeAllocationMode: "max_ratio",
+      symbolGroups: [],
     });
     const s = useAppStore.getState();
     expect(s.watchlist).toEqual(["BTC-USDT-SWAP", "ETH-USDT-SWAP"]);
@@ -757,6 +758,7 @@ describe("app store — hydrateWorkspace (watchlist-auto-trade-persistence)", ()
         { instId: "GHOST-USDT-SWAP", allocationPct: 50 }, // not in watchlist → dropped
       ],
       autoTradeAllocationMode: "even",
+      symbolGroups: [],
     });
     expect(useAppStore.getState().autoTradeMembers).toEqual([
       { instId: "BTC-USDT-SWAP", allocationPct: 50 },
@@ -768,6 +770,7 @@ describe("app store — hydrateWorkspace (watchlist-auto-trade-persistence)", ()
       watchlist: [],
       autoTradeMembers: [],
       autoTradeAllocationMode: "even",
+      symbolGroups: [],
     });
     expect(useAppStore.getState().watchlist).toEqual([]);
     expect(useAppStore.getState().autoTradeMembers).toEqual([]);

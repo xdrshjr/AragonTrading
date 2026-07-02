@@ -344,16 +344,32 @@ class AutoTradeMemberIo(BaseModel):
     allocationPct: float
 
 
+class SymbolGroupIo(BaseModel):
+    """workspace 偏好里的标的组（仅**类型**校验，factor-lab-symbol-groups §3.2）。
+
+    刻意**不**加长度 / 数量约束——去重 / 截断 / 丢空组 / 组数与组容量上限全部交给 repo sanitizer，
+    否则越界值会先抛 422 使夹取分支不可达（与 ``AutoTradeMemberIo`` 同 P1-A 职责切分）。``symbols`` 成员**有序**
+    （决定焦点 / 方向锚点，见 §3.1）。``createdTs`` / ``updatedTs`` 缺省为 0（sanitizer 兜底非负整数）。
+    """
+
+    id: str
+    name: str
+    symbols: list[str]
+    createdTs: int = 0
+    updatedTs: int = 0
+
+
 class WorkspaceWatchlistIn(BaseModel):
-    """PUT /api/workspace/watchlist 入参：自选 + 自动交易成员 + 分配模式（仅类型校验，P1-A）。
+    """PUT /api/workspace/watchlist 入参：自选 + 自动交易成员 + 分配模式 + 标的组（仅类型校验，P1-A）。
 
     422 仅留给类型错误（如 ``allocationPct`` 是字符串、``watchlist`` 不是数组）；越界但类型正确的值
-    （``allocationPct=150``、超长 ``watchlist``）一律由 repo sanitizer 夹取 / 截断，不在此拒绝。
+    （``allocationPct=150``、超长 ``watchlist``、超量标的组）一律由 repo sanitizer 夹取 / 截断，不在此拒绝。
     """
 
     watchlist: list[str]
     autoTradeMembers: list[AutoTradeMemberIo]
     autoTradeAllocationMode: str
+    symbolGroups: list[SymbolGroupIo] = Field(default_factory=list)
 
 
 class WorkspaceWatchlistOut(BaseModel):
@@ -366,6 +382,7 @@ class WorkspaceWatchlistOut(BaseModel):
     watchlist: list[str]
     autoTradeMembers: list[AutoTradeMemberIo]
     autoTradeAllocationMode: str
+    symbolGroups: list[SymbolGroupIo] = Field(default_factory=list)
 
 
 class LiveAutoGroupMemberRow(BaseModel):
@@ -1015,6 +1032,9 @@ class FactorEvaluateReq(_FactorRange):
     horizons: list[int] | None = Field(default=None, max_length=8)
     quantiles: int = Field(default=5, ge=2, le=10)
     maxBars: int | None = Field(default=None, ge=10, le=200000)
+    # 标的组多标的评估（factor-lab-symbol-groups §3.3）：缺省 / 单元素回落 instId 焦点路径（行为不变）；
+    # 标的数上限由 service 层 max_eval_symbols 400 护栏在取数前判定（此处仅类型 + 元素长度上界，绝不静默扇出）。
+    symbols: list[str] | None = Field(default=None, max_length=100)
 
 
 class FactorMineReq(_FactorRange):
@@ -1023,6 +1043,8 @@ class FactorMineReq(_FactorRange):
     topN: int = Field(default=20, ge=1, le=100)
     persist: bool = False
     maxBars: int | None = Field(default=None, ge=10, le=200000)
+    # 标的组多标的挖掘（factor-lab-symbol-groups §3.4）：扇出由 413 工作量护栏（计入标的数）在取数前拦截。
+    symbols: list[str] | None = Field(default=None, max_length=100)
 
 
 class FactorTrainReq(_FactorRange):
@@ -1086,13 +1108,24 @@ def weight_train_run_out(row: WeightTrainRun, *, with_curve: bool = True) -> dic
 
 
 def weight_model_out(row: WeightModel, *, latest_run: WeightTrainRun | None = None) -> dict:
-    """WeightModel 行 → 前端 dict（camelCase；含可选最近成功训练记录概要）。"""
+    """WeightModel 行 → 前端 dict（camelCase；含可选最近成功训练记录概要）。
+
+    标的组训练模型的组成员与来源组从 ``config_json`` 派生（``symbols`` / ``symbolGroupId``，零 DB 迁移，
+    factor-lab-symbol-groups §3.5）；单标的 / 旧模型 ``symbols`` 回落 ``[inst_id]``、``symbolGroupId`` 为 None，
+    缺省安全。
+    """
+    config = _load_json(row.config_json, {})
+    config = config if isinstance(config, dict) else {}
+    raw_symbols = config.get("symbols")
+    symbols = [str(s) for s in raw_symbols] if isinstance(raw_symbols, list) and raw_symbols else [row.inst_id]
+    group_id = config.get("symbolGroupId")
     return {
         "id": row.id, "name": row.name, "instId": row.inst_id, "bar": row.bar,
         "members": _load_json(row.members_json, []), "method": row.method,
-        "config": _load_json(row.config_json, {}), "horizon": row.horizon, "source": row.source,
+        "config": config, "horizon": row.horizon, "source": row.source,
         "factorSetId": row.factor_set_id, "latestRunId": row.latest_run_id,
         "bestValidIc": row.best_valid_ic, "notes": row.notes, "enabled": bool(row.enabled),
+        "symbols": symbols, "symbolGroupId": group_id if isinstance(group_id, str) else None,
         "latestRun": weight_train_run_out(latest_run, with_curve=False) if latest_run is not None else None,
         "createdTs": int(row.created_at.timestamp()) if row.created_at else 0,
         "updatedTs": int(row.updated_at.timestamp()) if row.updated_at else 0,
@@ -1141,6 +1174,9 @@ class WeightModelCreateReq(BaseModel):
     notes: str = Field(default="", max_length=256)
     factorSetId: int | None = None
     enabled: bool = True
+    # 标的组训练（factor-lab-symbol-groups §3.5）：缺省回落 [instId] 单标的；组成员落 config_json（零 DB 迁移）。
+    symbols: list[str] | None = Field(default=None, max_length=100)
+    symbolGroupId: str | None = Field(default=None, max_length=64)
 
 
 class WeightModelUpdateReq(BaseModel):
@@ -1153,6 +1189,8 @@ class WeightModelUpdateReq(BaseModel):
     horizon: int | None = Field(default=None, ge=1, le=100)
     notes: str | None = Field(default=None, max_length=256)
     enabled: bool | None = None
+    symbols: list[str] | None = Field(default=None, max_length=100)
+    symbolGroupId: str | None = Field(default=None, max_length=64)
 
 
 class WeightTrainStartReq(_FactorRange):
@@ -1166,6 +1204,10 @@ class WeightTrainStartReq(_FactorRange):
     factorSetId: int | None = None
     name: str | None = Field(default=None, min_length=1, max_length=128)
     maxBars: int | None = Field(default=None, ge=10, le=200000)
+    # 标的组训练（factor-lab-symbol-groups §3.5）：缺省回落 [instId] 单标的（等价性门禁不受影响）；
+    # 标的数上限由 weight_model_service 层 max_train_symbols 400 护栏在取数前判定。
+    symbols: list[str] | None = Field(default=None, max_length=100)
+    symbolGroupId: str | None = Field(default=None, max_length=64)
 
 
 class WeightBacktestReq(BaseModel):

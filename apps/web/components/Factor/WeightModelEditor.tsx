@@ -66,10 +66,17 @@ export default function WeightModelEditor({
   const save = useMutation({
     mutationFn: () => {
       const trimmed = name.trim();
-      const body = editorToCreateBody({ name: trimmed, instId: wb.instId, bar: wb.bar, members, method, horizon, notes });
+      // 建模从 wb.symbols 取组（factor-lab-symbol-groups §3.5）：焦点 = wb.instId；group 目标随来源组 id。
+      const symbolGroupId = wb.target.kind === "group" ? wb.target.groupId : undefined;
+      const body = editorToCreateBody({
+        name: trimmed, instId: wb.instId, bar: wb.bar, members, method, horizon, notes,
+        symbols: wb.symbols, symbolGroupId });
       return editingId == null
         ? weightModelApi.create(body)
-        : weightModelApi.update(editingId, { name: trimmed, members, method, horizon, notes });
+        : weightModelApi.update(editingId, {
+            name: trimmed, members, method, horizon, notes,
+            ...(wb.symbols.length > 1 ? { symbols: wb.symbols } : {}),
+            ...(symbolGroupId ? { symbolGroupId } : {}) });
     },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["weight-models"] });

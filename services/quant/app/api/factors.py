@@ -134,7 +134,7 @@ async def evaluate_factor(body: FactorEvaluateReq,
     return await service.evaluate(
         session, get_rest_client(), _window(body), factor_key=factor_key, params=params,
         direction=direction, horizons=_horizons(body.horizons), quantiles=body.quantiles,
-        factor_id=body.factorId)
+        factor_id=body.factorId, symbols=body.symbols)
 
 
 @router.post("/factors/mine")
@@ -142,7 +142,8 @@ async def mine_factors(body: FactorMineReq,
                        session: AsyncSession = Depends(get_session)) -> dict:
     return await service.mine(
         session, get_rest_client(), _window(body), categories=body.categories,
-        horizons=_horizons(body.horizons), top_n=body.topN, persist=body.persist)
+        horizons=_horizons(body.horizons), top_n=body.topN, persist=body.persist,
+        symbols=body.symbols)
 
 
 # ============================ 因子组合（factor sets）与训练（§4.3） ============================

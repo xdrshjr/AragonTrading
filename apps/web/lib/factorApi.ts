@@ -99,10 +99,19 @@ export const factorApi = {
       direction?: FactorDirection;
       horizons?: number[];
       quantiles?: number;
+      // 标的组多标的评估（factor-lab-symbol-groups §3.3）：缺省 / 单元素走单标的路径；instId 为焦点。
+      symbols?: string[];
     },
   ) => request<FactorEvalResult>("/factors/evaluate", { method: "POST", body: JSON.stringify(body) }),
   mine: (
-    body: FactorRange & { categories?: string[]; horizons?: number[]; topN?: number; persist?: boolean },
+    body: FactorRange & {
+      categories?: string[];
+      horizons?: number[];
+      topN?: number;
+      persist?: boolean;
+      // 标的组多标的挖掘（factor-lab-symbol-groups §3.4）。
+      symbols?: string[];
+    },
   ) => request<FactorMineResult>("/factors/mine", { method: "POST", body: JSON.stringify(body) }),
 
   sets: {

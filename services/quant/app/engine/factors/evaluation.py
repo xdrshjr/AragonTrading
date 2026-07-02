@@ -247,3 +247,120 @@ def evaluate_factor_key(df: pd.DataFrame, key: str, params: dict | None, directi
 def eval_result_to_dict(result: FactorEvalResult) -> dict:
     """序列化为 camelCase dict（字段即 dataclass 字段，§5.2 唯一真源）。"""
     return asdict(result)
+
+
+# ============================ 标的组聚合（组内均值 IC，factor-lab-symbol-groups §3.3） ============================
+_EVAL_METRIC_KEYS = ("ic", "rankIc", "icMean", "icStd", "ir", "tStat", "monotonicity", "topBottomSpread")
+
+
+def _weighted_mean(pairs: list[tuple]) -> float | None:
+    """``(value, weight)`` 列表 → 加权均值；跳过 None / 非有限值 / 非正权重；无有效对 → None（绝不臆造 0）。"""
+    num = 0.0
+    den = 0.0
+    for value, weight in pairs:
+        if value is None:
+            continue
+        fv = float(value)
+        fw = float(weight)
+        if not (np.isfinite(fv) and fw > 0.0):
+            continue
+        num += fv * fw
+        den += fw
+    return num / den if den > 0.0 else None
+
+
+def _find_horizon(horizons: list[dict], h: int | None) -> dict | None:
+    return next((stat for stat in horizons if stat.get("h") == h), None)
+
+
+def _aggregate_quantiles(stats: list[tuple[dict, int]]) -> list[dict]:
+    """逐分位 index ``q``：``meanRet`` 按 count 加权、``count`` 求和（各标的分位档可不全，按 q 对齐）。"""
+    by_q: dict[int, list[tuple]] = {}
+    for stat, _occ in stats:
+        for bucket in stat.get("quantiles") or []:
+            by_q.setdefault(bucket.get("q"), []).append((bucket.get("meanRet"), bucket.get("count") or 0))
+    out: list[dict] = []
+    for q in sorted(by_q.keys()):
+        pairs = by_q[q]
+        mean_ret = _weighted_mean(pairs)
+        if mean_ret is None:
+            continue
+        out.append({"q": q, "meanRet": _round(mean_ret), "count": sum(int(c or 0) for _v, c in pairs)})
+    return out
+
+
+def _aggregate_horizons(results: list[dict]) -> list[dict]:
+    """逐 horizon 对齐（以焦点标的顺序为基准，各标的同 horizons 集）→ 逐指标 occurrences 加权、分位 count 加权。"""
+    focus_horizons = results[0].get("horizons") or []
+    out: list[dict] = []
+    for base in focus_horizons:
+        h = base.get("h")
+        stats = [(stat, int(r.get("occurrences") or 0))
+                 for r in results if (stat := _find_horizon(r.get("horizons") or [], h)) is not None]
+        agg: dict = {"h": h}
+        for key in _EVAL_METRIC_KEYS:
+            agg[key] = _round(_weighted_mean([(s.get(key), w) for s, w in stats]))
+        agg["quantiles"] = _aggregate_quantiles(stats)
+        out.append(agg)
+    return out
+
+
+def _primary_rank_ic(result: dict) -> float | None:
+    """主 horizon（最小，评估已升序）的 RankIC，供 perSymbol 逐标的贡献展示。"""
+    horizons = result.get("horizons") or []
+    return horizons[0].get("rankIc") if horizons else None
+
+
+def aggregate_eval_results(results: list[dict], symbols: list[str], direction: str) -> dict:
+    """把逐标的（均已同向）评估结果聚合为「组内均值」结果 dict（factor-lab-symbol-groups §3.3）。
+
+    各标的结果须已在**同一冻结方向**下评估（``auto`` 由焦点标的解析一次后冻结下发，见 ``service.evaluate``），
+    否则符号相反的逐标的指标混入同一均值不自洽。逐指标只对**非空**值按 ``occurrences`` 加权平均，全空→null
+    （绝不臆造 0）；分位桶逐档 count 加权；``perSymbol`` 回填逐标的贡献（绝不静默丢弃入聚合的标的）。
+
+    Args:
+        results: 逐标的 ``eval_result_to_dict`` 产物（顺序即 ``symbols`` 顺序，[0] 为焦点标的）。
+        symbols: 参与聚合的有效标的（去空去重后）。
+        direction: 冻结后的方向（``long`` | ``short``），顶层回显。
+
+    Returns:
+        与 ``FactorEvalResult`` 同形的 dict + 附加 ``symbols`` / ``perSymbol`` / ``aggregated``；
+        ``instId`` 置焦点标的。
+
+    Raises:
+        ValueError: ``results`` 为空。
+    """
+    if not results:
+        raise ValueError("aggregate_eval_results 需至少一个标的评估结果")
+    focus = results[0]
+    occ_total = sum(int(r.get("occurrences") or 0) for r in results)
+    bars_total = sum(int(r.get("bars") or 0) for r in results)
+    coverage = _weighted_mean([(r.get("coverage"), r.get("bars") or 0) for r in results])
+    if any(r.get("note") == "bar_incompatible" for r in results):
+        note = "bar_incompatible"
+    elif occ_total < MIN_SIGNALS:
+        note = "samples_sparse"
+    else:
+        note = ""
+    per_symbol = [{
+        "instId": r.get("instId"),
+        "occurrences": int(r.get("occurrences") or 0),
+        "primaryRankIc": _primary_rank_ic(r),
+        "coverage": r.get("coverage"),
+    } for r in results]
+    return {
+        "factorKey": focus.get("factorKey", ""),
+        "direction": direction,
+        "bars": bars_total,
+        "windowStartTs": focus.get("windowStartTs", 0),
+        "windowEndTs": focus.get("windowEndTs", 0),
+        "coverage": round(coverage, 4) if coverage is not None else 0.0,
+        "occurrences": occ_total,
+        "horizons": _aggregate_horizons(results),
+        "instId": symbols[0] if symbols else focus.get("instId"),
+        "bar": focus.get("bar"),
+        "note": note,
+        "symbols": list(symbols),
+        "perSymbol": per_symbol,
+        "aggregated": len(results) > 1,
+    }

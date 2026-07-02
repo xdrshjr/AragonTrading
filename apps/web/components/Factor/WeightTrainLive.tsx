@@ -12,6 +12,7 @@ import {
   formatLoss,
   methodLabel,
   phaseLabel,
+  symbolsSummary,
   trainStartBody,
 } from "@/lib/weightModel";
 import { weightModelApi } from "@/lib/weightModelApi";
@@ -201,7 +202,9 @@ export default function WeightTrainLive({
           <Button variant="ghost" size="sm" onClick={onBack}>← 返回列表</Button>
           <span className="text-sm font-semibold text-[var(--text)]">实时训练</span>
           <Badge tone="accent">{methodLabel(target.method)}</Badge>
-          <span className="text-[11px] text-[var(--muted)]">{target.instId} · {target.bar} · {target.members.length} 成员</span>
+          <span className="text-[11px] text-[var(--muted)]" title={symbolsSummary(target.instId, target.symbols).title}>
+            {symbolsSummary(target.instId, target.symbols).label} · {target.bar} · {target.members.length} 成员
+          </span>
           {/* G-F7：呈现训练时间窗，便于用户核对日期段（窗口取自工作台顶栏，原先静默不显）。 */}
           <span className="text-[11px] text-[var(--muted)]">区间 {fmtTime(target.startTs)} – {fmtTime(target.endTs)}</span>
         </div>

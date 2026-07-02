@@ -21,7 +21,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -32,11 +32,13 @@ from ..db.session import get_sessionmaker
 from ..engine.factors import (
     InsufficientSamplesError,
     build_factor_matrix,
+    build_pooled_sample,
     fit_at_fraction,
     forward_return_label,
     learning_curve_steps,
     prepare_curve_sample,
     train_weights,
+    train_weights_on_sample,
 )
 from ..engine.factors.scoring import DEFAULT_CLIP, DEFAULT_NORM_WINDOW
 from ..okx.rest_client import OKXError
@@ -66,6 +68,9 @@ class JobSpec:
     horizon: int
     run_cap: int
     curve_steps: int
+    # 标的组成员（factor-lab-symbol-groups §3.5）：``window`` 仍承载焦点标的与区间；缺省 / 单元素走单标的原路径
+    # （等价性门禁不受影响），多标的走池化路径。默认 () 保后向兼容（旧构造点无须改）。
+    symbols: tuple[str, ...] = ()
 
 
 class _TrainJob:
@@ -135,25 +140,29 @@ class _TrainJob:
     # ---------- 训练协程 ----------
     async def _run(self) -> None:
         spec = self._spec
-        logger.info("weight run %d 启动流式训练：method=%s inst=%s bar=%s",   # G-B8：启动可观测
-                    self.run_id, spec.method, spec.window.inst_id, spec.window.bar)
+        symbols = self._symbols()
+        logger.info("weight run %d 启动流式训练：method=%s symbols=%s bar=%s",   # G-B8：启动可观测
+                    self.run_id, spec.method, ",".join(symbols), spec.window.bar)
         try:
             self._push({"type": "run", "data": {
                 "runId": self.run_id, "modelId": self.model_id, "status": "running"}})
-            self._emit_phase("loading", 5)
-            df = await service._load_df(spec.rest, spec.window)
-            if self._cancel:                       # H-B2：取消在最长的 OKX 取数后立即生效
-                return await self._finalize_cancelled()
+            dfs = await self._load_symbol_frames(symbols)
+            if dfs is None:                        # 取消（内部已 finalize_cancelled）
+                return
             self._emit_phase("building", 25)
             norm_window = int(spec.config.get("normWindow", DEFAULT_NORM_WINDOW))
             clip = float(spec.config.get("clip", DEFAULT_CLIP))
-            matrix, names, norm = await run_in_threadpool(
-                build_factor_matrix, df, spec.members, norm_window=norm_window, clip=clip,
-                bar=spec.window.bar)
+            parts: list[tuple] = []
+            names: list[str] = []
+            norm: dict = {"normWindow": norm_window, "clip": clip}
+            for df in dfs:                         # 逐标的构建因子矩阵（各自因果 z-score，绝不跨标的拼原始 K 线）
+                matrix, names, norm = await run_in_threadpool(
+                    build_factor_matrix, df, spec.members, norm_window=norm_window, clip=clip,
+                    bar=spec.window.bar)
+                parts.append((matrix, forward_return_label(df, spec.horizon)))
             if self._cancel:                       # H-B2：构建（线程池）后立即生效
                 return await self._finalize_cancelled()
-            label = forward_return_label(df, spec.horizon)
-            await self._fit_and_finalize(matrix, label, names, norm)
+            await self._fit_and_finalize(parts, names, norm)
         except OKXError as exc:
             await self._fail("OKX_UNREACHABLE", exc.message)
         except HTTPException as exc:               # G-B2：数据加载层 HTTPException（如 EMPTY_RANGE）如实分类，
@@ -165,11 +174,45 @@ class _TrainJob:
         except Exception as exc:  # noqa: BLE001 —— 作业内任何失败都收口为 failed 终态，绝不卡 running
             await self._fail("WEIGHT_TRAIN_FAILED", str(exc))
 
-    async def _fit_and_finalize(self, matrix, label, names, norm) -> None:
-        """对齐守门（R-07）→ 逐 fraction 推真实曲线（步间检查取消，R-03）→ 末步等价装配并落库。"""
+    def _symbols(self) -> list[str]:
+        """有效标的（[0]=焦点，与 window.inst_id 一致）；缺省 / 空回落焦点单标的（§3.5）。"""
+        return list(self._spec.symbols) if self._spec.symbols else [self._spec.window.inst_id]
+
+    async def _load_symbol_frames(self, symbols: list[str]) -> list | None:
+        """逐标的取真实 OKX K 线（复用 ``_candle_cache``）；取消即 finalize 并返回 None。
+
+        多标的期间 ``loading`` 阶段在 ``[5%, 25%]`` 按已取标的数线性推进，杜绝 ≤N 标的顺序取数疑似
+        「卡在 5%」（C-8）；单标的保持仅一次 ``loading@5%``（事件与原路径一致，回归护栏）。
+        """
         spec = self._spec
+        total = len(symbols)
+        self._emit_phase("loading", 5)
+        dfs: list = []
+        for index, sym in enumerate(symbols):
+            window = spec.window if sym == spec.window.inst_id else replace(spec.window, inst_id=sym)
+            df = await service._load_df(spec.rest, window)
+            dfs.append(df)
+            if self._cancel:                       # H-B2：取消在最长的 OKX 取数后立即生效
+                await self._finalize_cancelled()
+                return None
+            if total > 1:
+                self._emit_phase("loading", 5 + int(20 * (index + 1) / total))
+        return dfs
+
+    async def _fit_and_finalize(self, parts: list[tuple], names, norm) -> None:
+        """对齐守门（R-07）→ 逐 fraction 推真实曲线（步间检查取消，R-03）→ 末步等价装配并落库。
+
+        单标的（``len(parts)==1``）走 ``prepare_curve_sample`` + ``train_weights`` **原路径**（等价性门禁保持）；
+        标的组走 ``build_pooled_sample`` + ``train_weights_on_sample`` 池化路径（曲线共用 ``fit_at_fraction``）。
+        """
+        spec = self._spec
+        multi = len(parts) > 1
         try:
-            sample = await run_in_threadpool(prepare_curve_sample, matrix, label, spec.config)
+            if multi:
+                sample = await run_in_threadpool(build_pooled_sample, parts, spec.config)
+            else:
+                matrix, label = parts[0]
+                sample = await run_in_threadpool(prepare_curve_sample, matrix, label, spec.config)
         except InsufficientSamplesError as exc:    # H-B5/R-05：仅样本不足落 INSUFFICIENT_SAMPLES
             await self._fail("WEIGHT_TRAIN_INSUFFICIENT_SAMPLES", str(exc))
             return
@@ -191,10 +234,17 @@ class _TrainJob:
             await self._finalize_cancelled()
             return
         self._emit_phase("evaluating", 90)
-        # 末步等价：以**原始** matrix/label 经 train_weights 装配最终产物（= 同步 POST /factor-sets/train 字节级等价）。
-        result = await run_in_threadpool(
-            train_weights, matrix, label, names, method=spec.method, config=spec.config,
-            norm_stats=norm)
+        # 末步等价：单标的以**原始** matrix/label 经 train_weights 装配（= 同步 POST /factor-sets/train 字节级等价）；
+        # 多标的以池化 sample 经 train_weights_on_sample 装配（绝不改被门禁守护的 train_weights）。
+        if multi:
+            result = await run_in_threadpool(
+                train_weights_on_sample, sample, names, method=spec.method, config=spec.config,
+                norm_stats=norm)
+        else:
+            matrix, label = parts[0]
+            result = await run_in_threadpool(
+                train_weights, matrix, label, names, method=spec.method, config=spec.config,
+                norm_stats=norm)
         await self._finalize_success(result, curve)
 
     async def _finalize_success(self, result, curve: list[dict]) -> None:
@@ -202,6 +252,9 @@ class _TrainJob:
         provenance = {"instId": spec.window.inst_id, "bar": spec.window.bar,
                       "startTs": spec.window.start_ts, "endTs": spec.window.end_ts,
                       "horizon": int(spec.horizon)}
+        # 标的组随 run 溯源（§3.5）；单标的**不**加 symbols 键，保持与同步 train 溯源字节一致（等价性门禁）。
+        if len(spec.symbols) > 1:
+            provenance["symbols"] = list(spec.symbols)
         await self._persist(repo.WeightRunOutcome(
             status="succeeded", finished_ts=_now(), curve=curve, weights=result.weights,
             norm_stats=result.normStats, metrics=result.metrics, provenance=provenance,

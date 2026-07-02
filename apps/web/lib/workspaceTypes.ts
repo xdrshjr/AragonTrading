@@ -1,11 +1,14 @@
 // workspace 偏好持久化类型（watchlist-auto-trade-persistence §4，camelCase 与后端 wire 对齐）。
+import type { SymbolGroup } from "./factorTypes";
 import type { AutoTradeAllocationMode, AutoTradeMember } from "./liveAutoTypes";
 
-// 持久化到后端的 workspace 偏好：自选标的 + 自动交易成员（watchlist 有序子集）+ 分配模式。
+// 持久化到后端的 workspace 偏好：自选标的 + 自动交易成员（watchlist 有序子集）+ 分配模式 + 标的组。
 export interface WorkspacePrefs {
   watchlist: string[];
   autoTradeMembers: AutoTradeMember[];
   autoTradeAllocationMode: AutoTradeAllocationMode;
+  // 因子实验室标的组（factor-lab-symbol-groups §3.2）：与自选同域，扩展本文档而非新建端点/表。
+  symbolGroups: SymbolGroup[];
 }
 
 // GET/PUT 响应：present 区分「从未保存」（前端 seed）与「保存为空」（前端 respect），§2.2。
