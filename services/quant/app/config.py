@@ -138,6 +138,11 @@ class Settings(BaseSettings):
     # 多模型训练竞技场（weight-multi-model-training §3.2/config）：单个批次可勾选的候选方法 / 超参变体数上限，
     # 界定单批资源上界（候选超可用名额时进服务端 FIFO 队列，名额释放即泵起，绝不突破 max_weight_train_jobs）。
     max_weight_batch_candidates: int = Field(default=8, ge=2, le=16)  # 单批候选数上限（超出即 400 守门，绝不无界扇出）
+    # 因子组合探索训练（factor-combo-exploration §2.3/§4.1/§7）：单次探索展开的「组合 × 方法」候选数上限。
+    # 探索走自有端点（不受 WeightBatchStartReq.candidates 的 max_length=16 约束），故上限独立在此界定。默认 12
+    # （约为 arena max_weight_batch_candidates=8 的 1.5×），并发仍受 max_weight_train_jobs=4 限、墙钟随候选数
+    # 线性增长；超限一律显式 400 WEIGHT_EXPLORE_TOO_MANY_CANDIDATES 阻断，绝不静默截断（P1-3）。
+    max_weight_explore_candidates: int = Field(default=12, ge=2, le=24)
 
     # ---- Agent（对话式 AI 助手）LLM 接入 (Agent Trading Copilot spec §3.1) ----
     # 字段名即环境变量名（AGENT_*，大小写不敏感）；密钥仅存后端，绝不下发前端 / 不入库 / 不进日志。

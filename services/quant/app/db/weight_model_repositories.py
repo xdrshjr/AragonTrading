@@ -64,7 +64,8 @@ class WeightRunStart:
     """启动一次训练记录的快照入参（落 ``running``/``queued`` 记录）。
 
     ``batch_id``/``variant_label``（weight-multi-model-training §5.2）：批次候选归属批次 + 变体标签；
-    独立训练留缺省（``None``/``""``，既有行为零影响）。
+    独立训练留缺省（``None``/``""``，既有行为零影响）。``members``（factor-combo-exploration §2.5）：探索候选
+    自有组合成员快照；``None`` = 沿用父模型成员（既有单次训练 / 多方法批次全部为 ``None``，向后兼容）。
     """
 
     model_id: int
@@ -78,6 +79,7 @@ class WeightRunStart:
     started_ts: int
     batch_id: int | None = None
     variant_label: str = ""
+    members: list | None = None
 
 
 @dataclass(frozen=True)
@@ -266,7 +268,8 @@ async def add_weight_run(session: AsyncSession, *, start: WeightRunStart,
         model_id=start.model_id, batch_id=start.batch_id, status=status, method=start.method,
         variant_label=start.variant_label or "", inst_id=start.inst_id, bar=start.bar,
         start_ts=start.start_ts, end_ts=start.end_ts, horizon=int(start.horizon),
-        config_json=_dump(start.config or {}), started_ts=start.started_ts)
+        config_json=_dump(start.config or {}), started_ts=start.started_ts,
+        members_json=_dump(start.members) if start.members is not None else None)
     session.add(row)
     await session.commit()
     await session.refresh(row)

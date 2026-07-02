@@ -187,7 +187,9 @@ async def backtest_run(session: AsyncSession, rest, model_id: int, run_id: int, 
             "code": "WEIGHT_RUN_NOT_BACKTESTABLE",
             "message": "该训练记录缺少归一化契约（normStats），请重新训练后再回测。"})
 
-    members = _load_json(model.members_json, [])
+    # 成员读取优先候选自有组合（factor-combo-exploration §2.5/C-3）：探索候选成员=池子集，须用其自身组合回测；
+    # run.members_json 为空（既有单次训练 / 多方法批次）时回落父模型成员——既有行为字节不变。
+    members = _load_json(run.members_json, None) or _load_json(model.members_json, [])
     config = _load_json(model.config_json, {})
     thresholds = normalize_thresholds(config.get("thresholds") if isinstance(config, dict) else None)
     # 令阈值窗口与训练 normStats 自洽（冗余保险，resolve_norm_contract 本就优先 normStats.normWindow，P2-4）。

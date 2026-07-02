@@ -14,6 +14,10 @@ import type {
 import type { TrainCurvePoint, TrainStreamEvent } from "./weightModelTypes";
 import type { WeightBatchCandidate as RosterCandidate } from "./weightBatchTypes";
 
+// 全部可选训练方法（共享导出，factor-combo-exploration P2-6/C-5）：launcher 与探索弹窗方法多选复用同一真源，
+// 杜绝两份漂移。可用性仍由 factorApi.trainers 逐项判定（未安装置灰）。
+export const ALL_METHODS: TrainMethod[] = ["linear", "equal", "ic_weight", "random_forest", "xgboost"];
+
 // 默认多模型候选方法（launcher 初始勾选）：覆盖线性 / 树集成主流，用户可增删。
 export const DEFAULT_BATCH_METHODS: TrainMethod[] = ["linear", "random_forest", "xgboost"];
 

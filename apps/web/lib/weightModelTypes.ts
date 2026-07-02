@@ -50,6 +50,10 @@ export interface WeightTrainRun {
   startedTs: number;
   finishedTs: number | null;
   curve: TrainCurvePoint[] | null;
+  // 多模型 / 探索批次候选（weight-multi-model-training / factor-combo-exploration §2.5）：变体标签（探索=组合 id
+  // C0/C1…）与候选自有组合成员（探索候选=池子集；非探索候选 null / 缺省）。旧响应缺省安全。
+  variantLabel?: string;
+  members?: FactorMember[] | null;
 }
 
 // 权重模型（GET /weight-models[...]）。
@@ -116,7 +120,9 @@ export interface WeightTrainResult {
   provenance?: TrainProvenance;
   trainerVersion?: string | null;
   note?: string;
-  modelId: number;
+  // 复用同一模型的记忆指针（R-02）；探索回流为 null = 全新未保存草稿（不绑定探索父模型，factor-combo-exploration
+  // P0-1）——消费方 setBoundModelId(result.modelId) 即得 null，保存后生成全新 source="builder" 模型。
+  modelId: number | null;
   runId: number;
   factorSetId?: number;
 }

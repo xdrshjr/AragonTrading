@@ -35,6 +35,8 @@ interface MemberPaletteProps {
   onDirection: (index: number, direction: FrozenDirection) => void;
   /** 成员数上限（默认 12，与 validateMembers 同口径）。 */
   maxMembers?: number;
+  /** 打开「探索训练」弹窗（factor-combo-exploration §2.7）：从已选因子挖掘更优子集组合；缺省不渲染该按钮。 */
+  onExplore?: () => void;
 }
 
 /**
@@ -51,13 +53,34 @@ export default function MemberPalette({
   onRemove,
   onDirection,
   maxMembers = 12,
+  onExplore,
 }: MemberPaletteProps) {
   const cn = (key: string) => library.find((f) => f.key === key)?.cn ?? key;
+  // 探索训练至少需 2 个因子方可挖掘子集组合（<2 无「组合」可探索）。
+  const canExplore = members.length >= 2;
   return (
     <div className="card flex flex-col gap-3 p-3">
-      <span className="text-sm font-semibold text-[var(--text)]">
-        组合成员（已选 {members.length} / 上限 {maxMembers}）
-      </span>
+      {/* 标题行：左标题 + 右「探索训练」入口（factor-combo-exploration §2.7；先包 flex 行才能放按钮）。 */}
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-sm font-semibold text-[var(--text)]">
+          组合成员（已选 {members.length} / 上限 {maxMembers}）
+        </span>
+        {onExplore && (
+          <Button
+            variant="default"
+            size="sm"
+            disabled={!canExplore}
+            title={
+              canExplore
+                ? "从已选因子中挖掘更优子集组合：在不同训练方法下自动探索组合效果并择优"
+                : "至少选择 2 个因子后可探索更优子集组合"
+            }
+            onClick={onExplore}
+          >
+            探索训练
+          </Button>
+        )}
+      </div>
       <div className="flex flex-col gap-4 lg:flex-row">
         <CandidatePalette
           library={library}

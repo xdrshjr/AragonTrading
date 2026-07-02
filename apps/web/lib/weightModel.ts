@@ -320,7 +320,9 @@ export function editorToCreateBody(form: {
 export function buildTrainResult(
   event: TrainResultEvent,
   target: WeightTrainTarget,
-  ids: { modelId: number; runId: number },
+  // modelId 可为 null（探索回流 = 全新未保存草稿，不绑定探索父模型，factor-combo-exploration P0-1）；
+  // arena / 直播回流仍传真实 modelId（既有行为不变）。
+  ids: { modelId: number | null; runId: number },
 ): WeightTrainResult {
   return {
     members: target.members,

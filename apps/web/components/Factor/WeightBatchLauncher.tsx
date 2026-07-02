@@ -7,12 +7,11 @@ import { ApiRequestError } from "@/lib/api";
 import { fmtTime } from "@/lib/format";
 import { factorApi } from "@/lib/factorApi";
 import type { TrainMethod } from "@/lib/factorTypes";
-import { DEFAULT_BATCH_METHODS, batchStartBody, methodLabel } from "@/lib/weightBatch";
+import { ALL_METHODS, DEFAULT_BATCH_METHODS, batchStartBody, methodLabel } from "@/lib/weightBatch";
 import { codeLabel } from "@/lib/weightModel";
 import { weightBatchApi } from "@/lib/weightBatchApi";
 import type { WeightBatchStartResult, WeightBatchTarget } from "@/lib/weightBatchTypes";
 
-const ALL_METHODS: TrainMethod[] = ["linear", "equal", "ic_weight", "random_forest", "xgboost"];
 const MAX_BATCH_CANDIDATES = 8;   // 与后端默认 max_weight_batch_candidates 对齐（前端护栏）
 const MIN_BATCH_CANDIDATES = 2;   // 多模型对比至少 2 个候选
 

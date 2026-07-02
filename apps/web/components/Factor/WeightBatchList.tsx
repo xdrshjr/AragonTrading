@@ -85,10 +85,14 @@ export default function WeightBatchList({ onOpen }: { onOpen: (batchId: number) 
             <button type="button" onClick={() => onOpen(batch.batchId)} className="flex flex-col gap-1 text-left">
               <div className="flex items-center gap-2">
                 <span className="truncate text-sm font-medium text-[var(--text)]">{batch.label}</span>
+                {batch.kind === "explore" && <Badge tone="accent">探索</Badge>}
                 <Badge tone={STATUS_TONE[batch.status]}>{STATUS_LABEL[batch.status]}</Badge>
               </div>
               <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-[var(--muted)]">
                 <span>{batch.instId} · {batch.bar}</span>
+                {batch.kind === "explore" && batch.comboCount != null && batch.methodCount != null && (
+                  <span>{batch.comboCount} 组合 × {batch.methodCount} 方法</span>
+                )}
                 <span>{batch.succeededCount}/{batch.candidateCount} 成功</span>
                 {batch.best && (
                   <span>最优 {candidateLabel(batch.best.method, batch.best.variantLabel)} · IC <span className="text-[var(--text)]">{formatIc(batch.best.icOut)}</span></span>

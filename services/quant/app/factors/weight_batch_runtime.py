@@ -31,12 +31,17 @@ def _now() -> int:
 
 @dataclass(frozen=True)
 class CandidateSpec:
-    """一个批次候选的内存态（run_id 已落 queued 记录 + 方法 + 超参变体 config + 显示标签）。"""
+    """一个批次候选的内存态（run_id 已落 queued 记录 + 方法 + 超参变体 config + 显示标签）。
+
+    ``members``（factor-combo-exploration §2.4）：探索候选携各自组合成员；``None`` = 沿用共享
+    ``BatchSharedSpec.members``（既有多方法批次全部为 ``None``，零影响）。
+    """
 
     run_id: int
     method: str
     config: dict
     variant_label: str = ""
+    members: list | None = None
 
 
 @dataclass(frozen=True)
@@ -161,7 +166,7 @@ class WeightBatchRuntime:
         spec = self._spec
         job = self._manager.start_job(JobSpec(     # 内部 release() 把预占转成 running 计数
             run_id=cand.run_id, model_id=self.parent_model_id, rest=self._rest,
-            members=spec.members, method=cand.method, config={**spec.config, **cand.config},
+            members=cand.members or spec.members, method=cand.method, config={**spec.config, **cand.config},
             window=FactorWindow(inst_id=spec.inst_id, bar=spec.bar, start_ts=spec.start_ts,
                                 end_ts=spec.end_ts, max_bars=spec.max_bars),
             horizon=spec.horizon, run_cap=spec.run_cap, curve_steps=spec.curve_steps))

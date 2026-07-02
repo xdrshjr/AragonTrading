@@ -1103,6 +1103,10 @@ def weight_train_run_out(row: WeightTrainRun, *, with_curve: bool = True) -> dic
         "trainerVersion": row.trainer_version, "note": row.note,
         "errorCode": row.error_code or None, "errorMessage": row.error_message or None,
         "curveCount": len(curve), "startedTs": row.started_ts, "finishedTs": row.finished_ts,
+        # 多模型 / 探索批次候选（weight-multi-model-training §5.2 / factor-combo-exploration §2.5）：变体标签
+        # （探索批次 = 组合 id C0/C1…）与候选自有组合成员（探索候选=池子集；非探索候选为 None）。均加法向后兼容。
+        "variantLabel": row.variant_label or "",
+        "members": _load_json(row.members_json, None),
     }
     out["curve"] = curve if with_curve else None
     return out
@@ -1258,6 +1262,8 @@ def weight_batch_ranking(runs: list[WeightTrainRun]) -> list[dict]:
         "runId": r.id, "method": r.method, "variantLabel": r.variant_label or "",
         "status": r.status, "icOut": _run_metric(r, "icOut"), "icIn": _run_metric(r, "icIn"),
         "nTrain": _run_metric(r, "nTrain"),
+        # 探索批次排行榜显示组合名（factor-combo-exploration §2.5）：候选自有组合成员（非探索候选为 None）。
+        "members": _load_json(r.members_json, None),
     } for r in runs]
     scored = [e for e in entries if e["status"] == "succeeded" and e["icOut"] is not None]
     scored.sort(key=lambda e: (
@@ -1292,6 +1298,9 @@ def weight_batch_out(batch: WeightTrainBatch, runs: list[WeightTrainRun]) -> dic
         "members": _load_json(batch.members_json, []), "config": _load_json(batch.config_json, {}),
         "parentModelId": batch.parent_model_id, "factorSetId": batch.factor_set_id,
         "origin": batch.origin, "selectedRunId": batch.selected_run_id,
+        # 探索批次标识 + 计划快照（factor-combo-exploration §2.5）：多方法批次 kind="multi_method"、explorePlan=None。
+        "kind": getattr(batch, "kind", "multi_method") or "multi_method",
+        "explorePlan": _load_json(getattr(batch, "explore_plan_json", None), None) or None,
         "status": weight_batch_status(runs),
         "candidates": [weight_train_run_out(r, with_curve=False) for r in runs],
         "ranking": weight_batch_ranking(runs),
@@ -1301,14 +1310,24 @@ def weight_batch_out(batch: WeightTrainBatch, runs: list[WeightTrainRun]) -> dic
 
 
 def weight_batch_summary_out(batch: WeightTrainBatch, runs: list[WeightTrainRun]) -> dict:
-    """WeightTrainBatch 行 → 前端列表概要 dict（camelCase；含候选计数 + 最优候选摘要，不含逐候选详情）。"""
+    """WeightTrainBatch 行 → 前端列表概要 dict（camelCase；含候选计数 + 最优候选摘要，不含逐候选详情）。
+
+    探索批次（factor-combo-exploration §2.5）额外回 ``kind`` 与 ``comboCount``（组合数，供列表「M 组合 × N 方法」
+    概要）；多方法批次 ``kind="multi_method"``、``comboCount=None``。
+    """
     ranking = weight_batch_ranking(runs)
     best = next((e for e in ranking if e.get("isBest")), None)
+    plan = _load_json(getattr(batch, "explore_plan_json", None), None)
+    combos = plan.get("combos") if isinstance(plan, dict) else None
+    methods = plan.get("methods") if isinstance(plan, dict) else None
     return {
         "batchId": batch.id, "label": batch.label, "instId": batch.inst_id, "bar": batch.bar,
         "startTs": batch.start_ts, "endTs": batch.end_ts, "horizon": batch.horizon,
         "parentModelId": batch.parent_model_id, "factorSetId": batch.factor_set_id,
         "origin": batch.origin, "selectedRunId": batch.selected_run_id,
+        "kind": getattr(batch, "kind", "multi_method") or "multi_method",
+        "comboCount": len(combos) if isinstance(combos, list) else None,
+        "methodCount": len(methods) if isinstance(methods, list) else None,
         "status": weight_batch_status(runs), "candidateCount": len(runs),
         "succeededCount": sum(1 for r in runs if r.status == "succeeded"), "best": best,
         "createdTs": int(batch.created_at.timestamp()) if batch.created_at else 0,
@@ -1345,6 +1364,39 @@ class WeightBatchSelectReq(BaseModel):
     """择优入参：把某成功候选记为批次显式最优（写 ``selected_run_id``）。"""
 
     runId: int
+
+
+# ---------------- 因子组合探索训练（factor-combo-exploration §四，组合 × 方法笛卡尔探索） ----------------
+_EXPLORE_STRATEGIES = Literal["sizes", "topk_prefix", "leave_one_out", "manual"]
+
+
+class WeightExploreStartReq(_FactorRange):
+    """启动因子组合探索训练入参（继承 ``_FactorRange`` 区间校验，factor-combo-exploration §4.1）。
+
+    在因子池上按 ``strategy``（子集大小穷举 / IC 排序前缀 / 留一法 / 手动指定）展开组合，与 ``methods`` 做笛卡尔
+    积得候选集，复用批次运行时并行训练。``methods`` 按 ``_WEIGHT_METHODS`` Literal 在解析期校验合法性
+    （P2-1：``_WEIGHT_METHODS`` 是 typing.Literal 非运行时集合，服务层不做 ``⊆`` 判定）+ 服务层去重。
+    """
+
+    pool: list[FactorMemberIn] = Field(min_length=1, max_length=12)
+    strategy: _EXPLORE_STRATEGIES
+    params: dict[str, Any] = Field(default_factory=dict)
+    methods: list[_WEIGHT_METHODS] = Field(min_length=1, max_length=5)
+    config: dict[str, Any] = Field(default_factory=dict)
+    horizon: int = Field(default=6, ge=1, le=100)
+    factorSetId: int | None = None
+    origin: Literal["builder", "model"] = "builder"
+    maxBars: int | None = Field(default=None, ge=10, le=200000)
+
+
+def weight_explore_start_out(batch: WeightTrainBatch, plan_json: dict,
+                             candidates: list[dict]) -> dict:
+    """探索启动响应（factor-combo-exploration §4.1）：批次指针 + 计划快照 + 逐候选 roster（含组合展示名）。"""
+    return {
+        "batchId": batch.id, "parentModelId": batch.parent_model_id, "label": batch.label,
+        "kind": "explore", "origin": batch.origin, "explorePlan": plan_json,
+        "candidates": candidates,
+    }
 
 
 class ErrorBody(BaseModel):

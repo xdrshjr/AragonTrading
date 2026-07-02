@@ -35,6 +35,9 @@ class WeightBatchSpec:
     parent_model_id: int
     factor_set_id: int | None = None
     origin: str = "model"
+    # factor-combo-exploration §2.5：kind 区分多方法批次 / 探索批次；explore_plan 存探索计划快照（多方法批次缺省空）。
+    kind: str = "multi_method"
+    explore_plan: dict | None = None
 
 
 async def create_weight_batch(session: AsyncSession, *, spec: WeightBatchSpec) -> WeightTrainBatch:
@@ -43,7 +46,8 @@ async def create_weight_batch(session: AsyncSession, *, spec: WeightBatchSpec) -
         label=spec.label, inst_id=spec.inst_id, bar=spec.bar, start_ts=spec.start_ts,
         end_ts=spec.end_ts, horizon=int(spec.horizon), members_json=_dump(spec.members or []),
         config_json=_dump(spec.config or {}), parent_model_id=spec.parent_model_id,
-        factor_set_id=spec.factor_set_id, origin=spec.origin)
+        factor_set_id=spec.factor_set_id, origin=spec.origin,
+        kind=spec.kind, explore_plan_json=_dump(spec.explore_plan or {}))
     session.add(row)
     await session.commit()
     await session.refresh(row)

@@ -10,8 +10,12 @@ import type {
   WeightTrainRun,
 } from "./weightModelTypes";
 
+import type { ExplorePlan } from "./weightExplore";
+
 export type WeightBatchStatus = "running" | "succeeded" | "failed" | "cancelled";
 export type WeightBatchOrigin = "builder" | "model";
+// 批次类型（factor-combo-exploration §2.5）：多方法批次 | 探索批次（组合 × 方法笛卡尔）。
+export type WeightBatchKind = "multi_method" | "explore";
 
 // 排行榜条目（后端 batchDone.ranking + 前端实时派生同构）。
 export interface WeightBatchRankRow {
@@ -23,6 +27,8 @@ export interface WeightBatchRankRow {
   icIn: number | null;
   nTrain: number | null;
   isBest: boolean;
+  // 探索批次排行榜显示组合名（factor-combo-exploration §2.5）：候选自有组合成员；非探索候选 null / 缺省。
+  members?: FactorMember[] | null;
 }
 
 // roster 候选（WS batch 事件 + start 响应）。
@@ -50,6 +56,11 @@ export interface WeightBatchSummary {
   candidateCount: number;
   succeededCount: number;
   best: WeightBatchRankRow | null;
+  // 探索批次概要（factor-combo-exploration §2.5）：kind + 组合数 / 方法数（供列表「M 组合 × N 方法」徽标）；
+  // 多方法批次 kind="multi_method"、comboCount/methodCount 为 null。旧响应缺省安全。
+  kind?: WeightBatchKind;
+  comboCount?: number | null;
+  methodCount?: number | null;
   createdTs: number;
   updatedTs: number;
 }
@@ -70,6 +81,9 @@ export interface WeightBatchDetail {
   origin: WeightBatchOrigin;
   selectedRunId: number | null;
   status: WeightBatchStatus;
+  // 探索批次标识 + 计划快照（factor-combo-exploration §2.5）；多方法批次 kind="multi_method"、explorePlan=null。
+  kind?: WeightBatchKind;
+  explorePlan?: ExplorePlan | null;
   candidates: WeightTrainRun[];
   ranking: WeightBatchRankRow[];
   createdTs: number;

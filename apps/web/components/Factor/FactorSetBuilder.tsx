@@ -31,6 +31,7 @@ import { buildBatchTarget } from "@/lib/weightBatch";
 import { useAppStore } from "@/lib/store";
 import MemberPalette from "./MemberPalette";
 import WeightBars from "./WeightBars";
+import WeightExploreModal from "./WeightExploreModal";
 import { useWorkbench } from "./FactorLab";
 
 // 组合成员数上限（与 validateMembers 同口径，作为批量并入 / 切换的护栏入参）。
@@ -81,6 +82,8 @@ export default function FactorSetBuilder() {
   // 编辑指针：editingSetId!=null → 更新组合态；editStrategyId!=null → 来自交易面板旧策略快照（可更新该策略）。
   const [editingSetId, setEditingSetId] = useState<number | null>(null);
   const [editStrategyId, setEditStrategyId] = useState<number | null>(null);
+  // 因子组合探索训练弹窗开合（factor-combo-exploration §2.7）：builder 内本地 modal（非 arena view.kind/store 交接）。
+  const [showExplore, setShowExplore] = useState(false);
   // 仅跳过「水合那一帧」的 [members] 训练作废（H3）；retrained 标记本会话是否重训过（决定更新组合的 trainedAt
   // 是否重打戳，P2-1）；loadedTrainedAt 保留载入组合的原 trainedAt 以便无重训更新时原样回传（P2-1）。
   const skipTrainResetRef = useRef(false);
@@ -427,6 +430,7 @@ export default function FactorSetBuilder() {
           setMembers((prev) => prev.map((m, idx) => (idx === i ? { ...m, direction } : m)))
         }
         maxMembers={MAX_MEMBERS}
+        onExplore={() => setShowExplore(true)}
       />
 
       <div className="card flex flex-wrap items-end gap-3 p-3">
@@ -507,6 +511,25 @@ export default function FactorSetBuilder() {
           操作失败：
           {((save.error || update.error || updateStrategy.error) as Error)?.message}
         </p>
+      )}
+
+      {/* 探索训练弹窗（factor-combo-exploration §2.7）：仅打开时挂载（每次全新态）；回流经 store.weightTrainResult
+          既有消费 effect + consumedResultRef 防重入自动水合，modelId=null → 保存生成全新 source="builder" 组合。 */}
+      {showExplore && (
+        <WeightExploreModal
+          onClose={() => setShowExplore(false)}
+          ctx={{
+            library: lib.data ?? [],
+            members,
+            thresholds,
+            name,
+            instId: range.instId,
+            bar: range.bar,
+            startTs: range.startTs,
+            endTs: range.endTs,
+            factorSetId: editingSetId ?? undefined,
+          }}
+        />
       )}
     </div>
   );

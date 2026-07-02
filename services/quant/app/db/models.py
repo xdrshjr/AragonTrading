@@ -307,6 +307,12 @@ class WeightTrainBatch(Base):
     factor_set_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 弱溯源来源组合
     origin: Mapped[str] = mapped_column(String(16), default="model")  # builder|model（回流门禁用，缺省 model）
     selected_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 用户显式择优的候选 run（缺省 null，读取回落 best）
+    # 因子组合探索训练（factor-combo-exploration §2.5/§5.1）：kind 区分多方法批次 / 探索批次；explore_plan_json
+    # 存探索计划快照（strategy/params/methods/combos 展示元数据）。**注意**：``weight_train_batches`` 虽是既有表，
+    # ``create_all`` 不给已存在的表补列——须靠 ``session.py::_ensure_weight_batch_columns`` 启动时幂等 ALTER 补齐
+    # （仿 ``_ensure_weight_run_columns``），否则既有多模型库 INSERT/SELECT 立即 ``no such column``（P0/C-2）。
+    kind: Mapped[str] = mapped_column(String(16), default="multi_method")  # multi_method | explore
+    explore_plan_json: Mapped[str] = mapped_column(Text, default="{}")  # 探索计划快照（非探索批次为 "{}"）
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
 
@@ -334,6 +340,10 @@ class WeightTrainRun(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     model_id: Mapped[int] = mapped_column(ForeignKey("weight_models.id"), index=True)
     batch_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 归属批次；独立训练为 NULL（既有行为零影响）
+    # 候选自有组合成员快照（factor-combo-exploration §2.5/§5.1）：探索候选（成员=池子集）写各自组合；
+    # NULL = 沿用父模型成员（既有单次训练 / 多方法批次全部为 NULL，向后兼容）。既有表新增列，须靠
+    # ``_ensure_weight_run_columns`` 幂等 ALTER 补齐（否则老库 INSERT ``no such column``，P0/C-2）。
+    members_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="running")  # queued|running|succeeded|failed|cancelled
     method: Mapped[str] = mapped_column(String(24))
     variant_label: Mapped[str] = mapped_column(String(64), default="")   # 同方法多超参变体的显示标签

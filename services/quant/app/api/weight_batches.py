@@ -14,9 +14,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db.session import get_session
 from ..factors import weight_batch_service as service
+from ..factors import weight_explore_service as explore_service
 from ..factors.weight_batch_manager import get_weight_batch_manager
 from ..okx.rest_client import get_rest_client
-from ..schemas import WeightBatchSelectReq, WeightBatchStartReq
+from ..schemas import WeightBatchSelectReq, WeightBatchStartReq, WeightExploreStartReq
 
 router = APIRouter(tags=["weight-batches"])
 
@@ -34,6 +35,16 @@ def _json_response(payload: dict, status_code: int) -> Response:
 async def start_weight_batch(body: WeightBatchStartReq,
                              session: AsyncSession = Depends(get_session)) -> dict:
     return await service.start_batch(session, get_rest_client(), body)
+
+
+@router.post("/weight-models/explorations", status_code=201)
+async def start_weight_exploration(body: WeightExploreStartReq,
+                                   session: AsyncSession = Depends(get_session)) -> dict:
+    """因子组合探索训练启动（factor-combo-exploration §4.1）：委托 ``weight_explore_service.start_exploration``。
+
+    探索批次 = ``kind="explore"`` 批次，读 / 择优 / 取消 / 删除 / WS 全部复用上方既有批次端点。
+    """
+    return await explore_service.start_exploration(session, get_rest_client(), body)
 
 
 @router.get("/weight-models/batches")

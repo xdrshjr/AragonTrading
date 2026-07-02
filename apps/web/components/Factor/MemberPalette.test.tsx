@@ -148,4 +148,24 @@ describe("MemberPalette", () => {
     fireEvent.click(screen.getByRole("button", { name: "我的因子" }));
     await waitFor(() => expect(screen.getByText(/暂无激活因子/)).toBeTruthy());
   });
+
+  it("renders 探索训练 and fires onExplore when there are ≥2 members (factor-combo-exploration §2.7)", () => {
+    const onExplore = vi.fn();
+    const members = [libraryItemToMember(LIBRARY[0]), libraryItemToMember(LIBRARY[1])];
+    renderPalette({ members, onExplore });
+    const btn = screen.getByRole("button", { name: "探索训练" }) as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    fireEvent.click(btn);
+    expect(onExplore).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables 探索训练 when fewer than 2 members", () => {
+    renderPalette({ members: [libraryItemToMember(LIBRARY[0])], onExplore: vi.fn() });
+    expect((screen.getByRole("button", { name: "探索训练" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("omits 探索训练 entirely when onExplore is not provided", () => {
+    renderPalette({ members: [libraryItemToMember(LIBRARY[0]), libraryItemToMember(LIBRARY[1])] });
+    expect(screen.queryByRole("button", { name: "探索训练" })).toBeNull();
+  });
 });
