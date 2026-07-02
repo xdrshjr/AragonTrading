@@ -24,6 +24,7 @@ import AgentComposer from "./AgentComposer";
 import AgentEmptyState from "./AgentEmptyState";
 import AgentMessageList from "./AgentMessageList";
 import AgentUnconfigured from "./AgentUnconfigured";
+import AiTradeToggle from "./AiTradeToggle";
 
 interface AgentConfig {
   configured: boolean;
@@ -292,9 +293,12 @@ export default function AgentPanel() {
             <span className="text-[10px] text-[var(--muted)]">{config.model}</span>
           )}
         </div>
-        <Button variant="ghost" size="sm" onClick={newConversation} aria-label="新对话">
-          新对话
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="ghost" size="sm" onClick={newConversation} aria-label="新对话">
+            新对话
+          </Button>
+          <AiTradeToggle />
+        </div>
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto">

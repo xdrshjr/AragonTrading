@@ -333,6 +333,83 @@ class AutoTradeSettingsOut(BaseModel):
     effectiveMaxBudgetPct: float
 
 
+# ---------------- AI 自动交易（ai-auto-trading §4 / §5，camelCase wire）----------------
+class AiTradeStartIn(BaseModel):
+    """启动 AI 自动交易请求（金额/杠杆字段可留空→服务端保守默认，§4.1）。"""
+
+    instId: str = Field(min_length=1, max_length=32)
+    bar: str = "1H"
+    strategyIds: list[int] = Field(min_length=1)         # 多选；上限按 ai_trade_max_strategies 服务端校验
+    accountId: int | None = None                         # 省略=默认实盘账户
+    capitalUsd: float | None = Field(default=None, gt=0)  # 预算(USDT)，留空→ availUsdt×默认 frac
+    leverage: float | None = Field(default=None, gt=0, le=125)
+    takeProfitUsd: float | None = Field(default=None, gt=0)  # 会话级止盈金额阈值；留空→不触发
+    stopLossUsd: float | None = Field(default=None, gt=0)    # 会话级止损金额阈值；留空→不触发
+    contextRefreshRounds: int = Field(default=10, ge=1)   # 精确区间在服务端按 min/max 校验
+    priming: bool = True
+    primingBars: int = Field(default=300, ge=10, le=PAPER_WINDOW_MAX)
+
+
+class AiTradeStartOut(BaseModel):
+    sessionId: str
+    runId: int
+    instId: str
+    bar: str
+    strategyIds: list[int]
+    strategyNames: list[str]
+    budgetUsd: float           # 夹紧后的最终生效预算（可能 < 用户填值）
+    leverage: float
+    contextRefreshRounds: int
+
+
+class StrategySignalViewOut(BaseModel):
+    strategyId: int
+    name: str
+    stance: str                # long|short|flat（影子 broker 持久立场，P0-1）
+    latestSignal: str          # open_long|open_short|close|none（本根边沿）
+    strength: float
+    reason: str
+
+
+class AiTradeDecisionOut(BaseModel):
+    ts: int
+    round: int
+    action: str                # open_long|open_short|close|hold
+    sizeFraction: float | None = None
+    confidence: float | None = None
+    reason: str
+    signalBoard: list[StrategySignalViewOut] = Field(default_factory=list)
+    executed: dict | None = None   # {ok, skipped?, side?, qty?}
+
+
+class AiTradeSessionRow(BaseModel):
+    sessionId: str
+    runId: int
+    state: str
+    instId: str
+    bar: str
+    strategyIds: list[int]
+    strategyNames: list[str]
+    budgetUsd: float
+    leverage: float
+    takeProfitUsd: float | None = None
+    stopLossUsd: float | None = None
+    contextRefreshRounds: int
+    roundsCompleted: int
+    roundsSinceSummary: int
+    positionSide: str
+    sessionPnlUsd: float
+    startedTs: int
+    lastDecision: AiTradeDecisionOut | None = None
+    contextSummary: str | None = None
+    degraded: bool | None = None
+
+
+class AiTradeStatusOut(BaseModel):
+    session: AiTradeSessionRow | None = None
+    aiTradeEnabled: bool
+
+
 # ---------------- Workspace 偏好持久化（watchlist-auto-trade-persistence §3 / §4）----------------
 class AutoTradeMemberIo(BaseModel):
     """workspace 偏好里的自动交易成员（仅**类型**校验，P1-A）。

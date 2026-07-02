@@ -12,6 +12,7 @@ import type { Instrument } from "@/lib/types";
 import AutoTradeGroupConfirmModal, {
   type AutoTradeGroupConfirmOpts,
 } from "./AutoTradeGroupConfirmModal";
+import AiTradePanel from "./AiTradePanel";
 import AutoTradePanel, { type AutoTradeMemberView } from "./AutoTradePanel";
 import AutoTradePnlPanel from "./AutoTradePnlPanel";
 import WatchOtherPanel from "./WatchOtherPanel";
@@ -244,6 +245,8 @@ export default function WatchlistTab({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {/* AI 自动交易运行期面板（P1-7）：仅当存在活跃 AI 会话时呈现，置于自选分区之上。 */}
+      <AiTradePanel />
       <AutoTradePanel
         members={memberViews}
         active={active}

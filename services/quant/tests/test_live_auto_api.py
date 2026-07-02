@@ -13,6 +13,7 @@ from sqlalchemy import delete, select
 from app.config import Settings, get_settings
 from app.db import repositories as repo
 from app.db.models import AppSetting, Strategy
+from app.ai_auto.manager import get_ai_trade_manager
 from app.db.session import dispose_engine, get_sessionmaker, init_db
 from app.live_auto.manager import get_live_auto_manager
 
@@ -289,6 +290,26 @@ async def test_start_status_stop_lifecycle(monkeypatch):
             # 停止后无活跃会话
             after = await client.get("/api/live-auto/status")
             assert after.json()["session"] is None
+    finally:
+        get_live_auto_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_start_rejected_when_ai_trade_session_active(monkeypatch):
+    # P1-4 反向互斥：存在活跃 AI 自动交易会话时，live-auto 启动 → 409 LIVE_AUTO_SESSION_LIMIT
+    # （_require_capacity 单一 choke point 反向校验 get_ai_trade_manager().status()）。
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch_okx(monkeypatch)
+    monkeypatch.setattr(get_ai_trade_manager(), "status", lambda: {"sessionId": "aitrade_x"})
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/live-auto/start", json=_start_body(strategy_id))
+            assert r.status_code == 409, r.text
+            assert r.json()["error"]["code"] == "LIVE_AUTO_SESSION_LIMIT"
     finally:
         get_live_auto_manager()._group = None
         app.dependency_overrides.clear()

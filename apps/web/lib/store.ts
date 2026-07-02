@@ -25,6 +25,11 @@ import type {
   LiveAutoEvent,
   LiveAutoStatus,
 } from "./liveAutoTypes";
+import type {
+  AiTradeConfig,
+  AiTradeDecision,
+  AiTradeSessionRow,
+} from "./aiTradeTypes";
 import type { FactorEditTarget, FactorTargetRef, SymbolGroup } from "./factorTypes";
 import type { WeightTrainResult, WeightTrainTarget } from "./weightModelTypes";
 import type { WeightBatchTarget } from "./weightBatchTypes";
@@ -92,6 +97,8 @@ const MAX_DEPTH_PANEL_RATIO = 0.3;
 
 // 自动交易事件流环形缓冲上限（hardening H6）：超限裁最旧，杜绝长跑无界增长。
 const LIVE_AUTO_EVENTS_MAX = 50;
+// AI 自动交易决策日志环形缓冲上限（同 live-auto，超限裁最旧）。
+const AI_TRADE_DECISIONS_MAX = 50;
 
 interface AppState {
   instId: string;
@@ -134,6 +141,16 @@ interface AppState {
   // 百分比的夹取 / 默认语义与守门口径；max_ratio 下各标的为独立上限（Σ 可超 100）。
   autoTradeAllocationMode: AutoTradeAllocationMode;
   liveAutoGroup: LiveAutoGroupState | null;
+  // AI 自动交易运行期态（ai-auto-trading §5.4，全部瞬态、不入 partialize，刷新由 GET /ai-trade/status
+  // 重发现）。aiTradeConfig 为持久化偏好（记忆上次选的策略集合与刷新轮数，进 partialize）。
+  aiTradeSessionId: string | null;
+  aiTradeSession: AiTradeSessionRow | null;       // 会话只读视图（status/info），WS status/decision/summary 增量合并
+  aiTradeTrades: Trade[];                         // → overlayTrades（图表 markers）
+  aiTradePosition: PaperPositionEvent | null;
+  aiTradeDecisions: AiTradeDecision[];            // 决策日志（环形≤50）
+  aiTradeSummary: string | null;                  // 当前上下文摘要（AI 长期记忆）
+  aiTradeAcknowledged: boolean;                   // 首启风险勾选会话记忆，刷新复位
+  aiTradeConfig: AiTradeConfig | null;            // 持久化偏好（进 partialize）
   theme: Theme;
   backtestStartTs: number;
   backtestEndTs: number;
@@ -227,6 +244,20 @@ interface AppState {
   setLiveAutoMemberTrades: (instId: string, trades: Trade[]) => void;
   appendLiveAutoMemberTrade: (instId: string, trade: Trade) => void;
   clearLiveAutoGroup: () => void;
+  // AI 自动交易运行期态（瞬态）：句柄 / 会话视图 / 成交流 / 持仓 / 决策日志 / 摘要 / 风险勾选 + 清理；
+  // aiTradeConfig 为持久化偏好 setter。
+  setAiTradeSessionId: (id: string | null) => void;
+  setAiTradeSession: (session: AiTradeSessionRow | null) => void;
+  patchAiTradeSession: (patch: Partial<AiTradeSessionRow>) => void;
+  setAiTradeTrades: (trades: Trade[]) => void;
+  appendAiTradeTrade: (trade: Trade) => void;
+  setAiTradePosition: (pos: PaperPositionEvent | null) => void;
+  pushAiTradeDecision: (decision: AiTradeDecision) => void;
+  setAiTradeDecisions: (decisions: AiTradeDecision[]) => void;
+  setAiTradeSummary: (summary: string | null) => void;
+  setAiTradeAcknowledged: (v: boolean) => void;
+  clearAiTradeRuntime: () => void;
+  setAiTradeConfig: (config: AiTradeConfig | null) => void;
   setBacktestRange: (startTs: number, endTs: number) => void;
   toggleTheme: () => void;
   setTheme: (t: Theme) => void;
@@ -348,6 +379,16 @@ export const useAppStore = create<AppState>()(
       autoTradeMembers: [],
       autoTradeAllocationMode: "even",
       liveAutoGroup: null,
+      // AI 自动交易：运行期态瞬态（刷新由 GET /ai-trade/status 重发现）；aiTradeConfig 偏好默认 null
+      // （全新安装只走初始化器、不触发 migrate，故默认值须写在此处）。
+      aiTradeSessionId: null,
+      aiTradeSession: null,
+      aiTradeTrades: [],
+      aiTradePosition: null,
+      aiTradeDecisions: [],
+      aiTradeSummary: null,
+      aiTradeAcknowledged: false,
+      aiTradeConfig: null,
       theme: "light",
       backtestStartTs: defaultStartTs,
       backtestEndTs: defaultEndTs,
@@ -550,6 +591,40 @@ export const useAppStore = create<AppState>()(
           ),
         ),
       clearLiveAutoGroup: () => set({ liveAutoGroup: null }),
+      // AI 自动交易运行期态（瞬态）：句柄 / 会话视图（含增量合并 patch）/ 成交流 / 持仓 / 决策日志（环形）
+      // / 摘要 / 风险勾选 + 清理；aiTradeConfig 为持久化偏好。
+      setAiTradeSessionId: (aiTradeSessionId) => set({ aiTradeSessionId }),
+      setAiTradeSession: (aiTradeSession) => set({ aiTradeSession }),
+      patchAiTradeSession: (patch) =>
+        set((s) => (s.aiTradeSession ? { aiTradeSession: { ...s.aiTradeSession, ...patch } } : s)),
+      setAiTradeTrades: (aiTradeTrades) => set({ aiTradeTrades }),
+      appendAiTradeTrade: (trade) =>
+        set((s) =>
+          s.aiTradeTrades.some(
+            (t) => t.ts === trade.ts && t.side === trade.side && t.price === trade.price,
+          )
+            ? s
+            : { aiTradeTrades: [...s.aiTradeTrades, trade] },
+        ),
+      setAiTradePosition: (aiTradePosition) => set({ aiTradePosition }),
+      pushAiTradeDecision: (decision) =>
+        set((s) => ({
+          aiTradeDecisions: [...s.aiTradeDecisions, decision].slice(-AI_TRADE_DECISIONS_MAX),
+        })),
+      setAiTradeDecisions: (decisions) =>
+        set({ aiTradeDecisions: decisions.slice(-AI_TRADE_DECISIONS_MAX) }),
+      setAiTradeSummary: (aiTradeSummary) => set({ aiTradeSummary }),
+      setAiTradeAcknowledged: (aiTradeAcknowledged) => set({ aiTradeAcknowledged }),
+      clearAiTradeRuntime: () =>
+        set({
+          aiTradeSessionId: null,
+          aiTradeSession: null,
+          aiTradeTrades: [],
+          aiTradePosition: null,
+          aiTradeDecisions: [],
+          aiTradeSummary: null,
+        }),
+      setAiTradeConfig: (aiTradeConfig) => set({ aiTradeConfig }),
       setBacktestRange: (backtestStartTs, backtestEndTs) =>
         set({ backtestStartTs, backtestEndTs, runId: null }),
       toggleTheme: () =>
@@ -692,7 +767,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 24,
+      version: 25,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -721,6 +796,9 @@ export const useAppStore = create<AppState>()(
         // GET /live-auto/group/status 重发现）。
         autoTradeMembers: s.autoTradeMembers,
         autoTradeAllocationMode: s.autoTradeAllocationMode,
+        // AI 自动交易偏好（持久化）；aiTrade 运行期态全瞬态，**不**入 partialize（刷新由
+        // GET /ai-trade/status 重发现）。
+        aiTradeConfig: s.aiTradeConfig,
         instSidebarTab: s.instSidebarTab,
         chartSplitRatio: s.chartSplitRatio,
         chartIndicatorRatio: s.chartIndicatorRatio,
@@ -834,6 +912,11 @@ export const useAppStore = create<AppState>()(
           // 因子实验室标的组：回填持久化 symbolGroups 默认（老用户初始为空）与目标指针 factorLabTarget=null
           // （resolveFactorTarget 对缺失指针回落焦点单标的，缺省安全，factor-lab-symbol-groups §3.2 / R3）。
           next = { ...next, symbolGroups: [], factorLabTarget: null };
+        }
+        if (version < 25) {
+          // AI 自动交易：运行期态全瞬态（不入 partialize），浅合并回落初值即可；偏好 aiTradeConfig
+          // 进 partialize，补默认 null（缺失时启动弹窗回落默认策略与刷新轮数）。
+          next = { ...next, aiTradeConfig: null };
         }
         return next as never;
       },

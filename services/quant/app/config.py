@@ -88,6 +88,28 @@ class Settings(BaseSettings):
     # 停止会话平仓失败的有界重试次数（默认 2；仍失败则诚实返回 residual 并强提示人工平仓，H4）。
     live_auto_flatten_max_retries: int = 2
 
+    # ---- AI 自动交易（ai-auto-trading spec §三/config：AI Agent 作为多策略信号的决策者）----
+    # 字段名即环境变量名（AI_TRADE_*，大小写不敏感）。**必须真的声明这些字段**：Settings 为
+    # extra="ignore"，未声明的 AI_TRADE_* env 会被静默丢弃（P1-6）。桌面打包须在
+    # desktop/src/lib/config.js prod 白名单补 key.startsWith('AI_TRADE_') 方能透传（P1-6）。
+    # 安全：自动化专用总闸 ai_trade_enabled 默认关闭（AI 下单默认关闭闸）；启动须 API 层显式同时
+    # 校验 ai_trade_enabled 与 live_trading_enabled 皆为 True 方可放行（双闸）。
+    ai_trade_enabled: bool = False               # 自动化专用总闸：False 时 /ai-trade 写类一律 403
+    ai_trade_default_capital_frac: float = 0.01  # 留空默认预算 = availUsdt × 该值（保守 1%）
+    ai_trade_max_capital_frac: float = 0.05      # 预算绝对天花板 = availUsdt × 该值（前置门禁强制夹紧）
+    ai_trade_default_sl_pct: float = 0.05        # 会话默认单仓止损 pct（交易所侧 OCO 兜底；0 即不挂）
+    ai_trade_default_tp_pct: float = 0.10        # 会话默认单仓止盈 pct（交易所侧 OCO 兜底；0 即不挂）
+    ai_trade_default_max_hold_bars: int = 0      # 默认强制时间平仓根数（0=禁用，退出交由 AI close + 会话止盈止损）
+    ai_trade_max_strategies: int = 8             # 单会话可喂给 AI 的策略数上限（超出即 400 守门）
+    ai_trade_default_context_rounds: int = 10    # 上下文刷新轮数默认值
+    ai_trade_min_context_rounds: int = Field(default=3, ge=1)    # 上下文刷新轮数下限
+    ai_trade_max_context_rounds: int = Field(default=200, ge=1)  # 上下文刷新轮数上限（与下方 messages 相互独立，P1-3）
+    # 喂给决策模型的滚动窗口硬上限（与 ai_trade_max_context_rounds 解耦：摘要真源是 _journal 而非
+    # 模型窗口 _context，P1-3）。仅为「回喂 LLM 的近 N 条」护栏，防极端参数下越界。
+    ai_trade_max_context_messages: int = Field(default=40, ge=2)
+    ai_trade_decision_timeout_s: float = 60.0    # 单轮 LLM 决策超时（超时一律回落 hold）
+    ai_trade_min_confidence: float = 0.0         # 置信度门槛（<该值降级 hold）；默认 0=不启用
+
     # ---- 代理（透传给 httpx / websockets）----
     http_proxy: str = ""
     https_proxy: str = ""

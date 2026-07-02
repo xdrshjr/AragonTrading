@@ -14,9 +14,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .agent.manager import get_agent_manager
+from .ai_auto import get_ai_trade_manager
 from .api import (
     accounts,
     agent,
+    ai_auto,
     app_settings,
     factors,
     live_auto,
@@ -52,6 +54,7 @@ async def lifespan(app: FastAPI):
     sweeper.cancel()                                         # 关停先取消清扫协程（与 manager.shutdown 同段）
     await get_agent_manager().shutdown()
     await get_paper_manager().shutdown()
+    await get_ai_trade_manager().shutdown()   # AI 自动交易（紧随 live-auto 关停，含平仓）
     await get_live_auto_manager().shutdown()
     # 关停顺序（weight-multi-model-training §2.6）：先停批次泵、再停底层作业，避免泵在作业消失后空转。
     await get_weight_batch_manager().shutdown()
@@ -186,6 +189,7 @@ app.include_router(accounts.router, prefix="/api")
 app.include_router(trading.router, prefix="/api")
 app.include_router(factors.router, prefix="/api")   # 第 9 个路由（因子层 §3.1）
 app.include_router(live_auto.router, prefix="/api")  # 第 10 个路由（实时自动交易，live-auto-trading §4）
+app.include_router(ai_auto.router, prefix="/api")   # AI 自动交易（ai-auto-trading §4；含 WS /ws/ai-trade/{sid}）
 app.include_router(app_settings.router, prefix="/api")  # 第 11 个路由（设置中心 · 自动交易设置 §4.1）
 app.include_router(workspace.router, prefix="/api")  # 第 12 个路由（workspace 偏好持久化，watchlist-auto-trade-persistence §3）
 app.include_router(weight_models.router, prefix="/api")  # 权重模型工作区（weight-model-workspace §五；含 WS /ws/weight-train/{jobId}）

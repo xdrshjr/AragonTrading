@@ -14,6 +14,7 @@ import time
 import uuid
 from dataclasses import dataclass
 
+from ..ai_auto.admission import get_admission_lock
 from ..config import Settings
 from ..db import repositories as repo
 from ..db.session import get_sessionmaker
@@ -161,9 +162,14 @@ class LiveAutoManager:
 
     # ---------- 分组启动（两段式：全量门禁 → 建会话 → 起会话 / 回滚）----------
     async def start_group(self, req: GroupStartRequest) -> LiveAutoGroup:
-        """§2.4：双闸 → 容量 → 百分比校验 → 账户级数据各取一次 → 两段式门禁 → 整组回滚启动。"""
+        """§2.4：双闸 → 容量 → 百分比校验 → 账户级数据各取一次 → 两段式门禁 → 整组回滚启动。
+
+        P1-4：「检查对方空闲 + 注册自己」临界区包在与 AI 自动交易共享的 `AUTO_TRADE_ADMISSION_LOCK`
+        内（外层），再叠既有 `_start_lock`（内层）；反向 AI 互斥校验落 `_require_capacity` 单一 choke
+        point，使 AI/live-auto 两侧准入串行、check-and-register 原子化，杜绝并发 start 双双通过。
+        """
         self._require_enabled(req.settings)
-        async with self._start_lock:
+        async with get_admission_lock(), self._start_lock:
             self._require_capacity()
             members = self._validate_members(req.members_in, req.settings, req.allocation_mode)
             creds = _creds(req.account_row)
@@ -451,10 +457,18 @@ class LiveAutoManager:
                 "LIVE_AUTO_TRADING_DISABLED", "实时自动交易未启用", 403)
 
     def _require_capacity(self) -> None:
+        """单活跃分组独占 + 反向与 AI 自动交易互斥（P1-4，须在共享准入锁内调用）。
+
+        对 `get_ai_trade_manager` 采用**函数内延迟导入**避免 `live_auto ↔ ai_auto` 循环 import。
+        """
         group = self._group
         if group is not None and any(m.session.state == "running" for m in group.members):
             raise LiveAutoSessionLimitError(
                 "LIVE_AUTO_SESSION_LIMIT", "已有活跃自动交易分组（单活跃分组独占，请先停止）", 409)
+        from ..ai_auto import get_ai_trade_manager
+        if get_ai_trade_manager().status() is not None:
+            raise LiveAutoSessionLimitError(
+                "LIVE_AUTO_SESSION_LIMIT", "检测到活跃 AI 自动交易会话（与策略自动交易互斥，请先停止）", 409)
 
     @staticmethod
     def _has_position(positions: list[dict], inst_id: str) -> bool:
