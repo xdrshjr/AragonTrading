@@ -4,9 +4,12 @@ import { useState } from "react";
 import { Badge, Button } from "@/components/ui";
 import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import { formatIc } from "@/lib/factor";
+import type { FactorMember } from "@/lib/factorTypes";
+import type { ExploreInsights } from "@/lib/exploreInsights";
 import { candidateIcOut, candidateLabel } from "@/lib/weightBatch";
 import type { CandidateState, WeightBatchRankRow } from "@/lib/weightBatchTypes";
 import type { ExploreMatrix as ExploreMatrixShape } from "@/lib/weightExplore";
+import ExploreInsightsPanel from "./ExploreInsightsPanel";
 import ExploreMatrix from "./ExploreMatrix";
 import { CandidateDetail } from "./ExploreRunningPanel";
 import WeightBatchCompare from "./WeightBatchCompare";
@@ -20,7 +23,11 @@ export default function ExploreResultPanel({
   states,
   ranking,
   bestId,
+  insights,
+  labelOf,
   onApplyBest,
+  onRefine,
+  refineDisabledReason,
   onDelete,
   deleting,
 }: {
@@ -28,12 +35,19 @@ export default function ExploreResultPanel({
   states: CandidateState[];
   ranking: WeightBatchRankRow[];
   bestId: number | null;
+  // 洞察由弹窗外壳 computeInsights 算好后注入（P0-1）；面板保持纯展示、不自持 states/localCombos。
+  insights: ExploreInsights;
+  labelOf: (m: FactorMember) => string;
   onApplyBest: (runId: number) => void;
+  // 据洞察精修（下一轮）：零参触发器，建议与禁用原因均由外壳算好；省略则不渲染精修按钮（向后兼容）。
+  onRefine?: () => void;
+  refineDisabledReason?: string | null;
   onDelete: () => void;
   deleting: boolean;
 }) {
   const [openRunId, setOpenRunId] = useState<number | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [showInsights, setShowInsights] = useState(true);
   const succeeded = states.filter((s) => s.status === "succeeded").length;
   const best = states.find((s) => s.runId === bestId) ?? null;
   const bestLabel = best ? matrix.rows.find((r) => r.comboId === best.variantLabel)?.label ?? best.variantLabel : null;
@@ -61,11 +75,41 @@ export default function ExploreResultPanel({
             应用最佳组合到组合成员
           </Button>
         )}
+        {onRefine && (
+          <Button
+            variant="default"
+            size="sm"
+            disabled={!!refineDisabledReason}
+            title={refineDisabledReason ?? undefined}
+            onClick={onRefine}
+          >
+            据洞察精修探索（下一轮）
+          </Button>
+        )}
         <Button variant="ghost" size="sm" disabled={deleting} onClick={() => setConfirmDelete(true)}>
           {deleting ? "删除中…" : "删除本次探索"}
         </Button>
         <span className="text-[11px] text-[var(--muted)]">{succeeded} / {states.length} 成功</span>
       </div>
+
+      {showInsights ? (
+        <div className="flex flex-col gap-1">
+          <div className="flex justify-end">
+            <button type="button" className="text-[10px] text-[var(--muted)] hover:text-[var(--text)]" onClick={() => setShowInsights(false)}>
+              收起洞察 ▴
+            </button>
+          </div>
+          <ExploreInsightsPanel insights={insights} labelOf={labelOf} />
+        </div>
+      ) : (
+        <button
+          type="button"
+          className="card p-2 text-left text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--text)]"
+          onClick={() => setShowInsights(true)}
+        >
+          展开因子贡献洞察 ▾
+        </button>
+      )}
 
       <ExploreMatrix matrix={matrix} bestRunId={bestId} onCell={(s) => setOpenRunId(s.runId)} />
 

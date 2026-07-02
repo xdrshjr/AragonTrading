@@ -2,9 +2,12 @@
 
 import { useState } from "react";
 import { Button } from "@/components/ui";
+import type { FactorMember } from "@/lib/factorTypes";
+import type { ExploreInsights } from "@/lib/exploreInsights";
 import { candidateLabel } from "@/lib/weightBatch";
 import type { CandidateState, WeightBatchRankRow } from "@/lib/weightBatchTypes";
 import type { ExploreMatrix as ExploreMatrixShape } from "@/lib/weightExplore";
+import ExploreInsightsPanel from "./ExploreInsightsPanel";
 import ExploreMatrix from "./ExploreMatrix";
 import TrainingCurveChart from "./TrainingCurveChart";
 import WeightBatchCompare from "./WeightBatchCompare";
@@ -21,6 +24,8 @@ export default function ExploreRunningPanel({
   bestId,
   connected,
   stale,
+  insights,
+  labelOf,
   onCancelAll,
   cancelling,
 }: {
@@ -30,12 +35,17 @@ export default function ExploreRunningPanel({
   bestId: number | null;
   connected: boolean;
   stale: boolean;
+  // 实时（部分）洞察（可选 P2）：由外壳下传同一 insights；成功候选达半数才显示，避免早期少样本的噪声归因。
+  insights?: ExploreInsights | null;
+  labelOf?: (m: FactorMember) => string;
   onCancelAll: () => void;
   cancelling: boolean;
 }) {
   const [openRunId, setOpenRunId] = useState<number | null>(null);
   const total = states.length;
   const done = states.filter((s) => s.status === "succeeded" || s.status === "failed" || s.status === "cancelled").length;
+  const succeeded = states.filter((s) => s.status === "succeeded").length;
+  const showPartialInsights = !!insights && !!labelOf && total > 0 && succeeded >= Math.ceil(total / 2);
   const opened = states.find((s) => s.runId === openRunId) ?? null;
 
   return (
@@ -60,6 +70,8 @@ export default function ExploreRunningPanel({
           {cancelling ? "取消中…" : "全部取消"}
         </Button>
       </div>
+
+      {showPartialInsights && insights && labelOf && <ExploreInsightsPanel insights={insights} labelOf={labelOf} partial />}
 
       <ExploreMatrix matrix={matrix} bestRunId={bestId} onCell={(s) => setOpenRunId(s.runId)} />
 

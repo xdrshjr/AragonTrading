@@ -22,6 +22,7 @@ import {
   type ExploreParams,
   type ExploreStrategy,
 } from "@/lib/weightExplore";
+import ManualComboBuilder from "./ManualComboBuilder";
 
 // 探索启动配置（config 态回填给弹窗构造请求体）。
 export interface ExploreConfig {
@@ -35,6 +36,7 @@ const STRATEGIES: { value: ExploreStrategy; label: string; hint: string }[] = [
   { value: "sizes", label: "指定子集大小", hint: "对每个所选大小 k，穷举池中全部 C(池,k) 子集组合" },
   { value: "topk_prefix", label: "IC 排序前缀", hint: "按当前池顺序取各大小的嵌套前缀子集（少而稳，非贪心搜索）" },
   { value: "leave_one_out", label: "留一法", hint: "全池 + 逐一去掉单因子，定位拖后腿的因子" },
+  { value: "manual", label: "手动指定", hint: "亲手勾选要对比的具体组合" },
 ];
 
 const DEFAULT_METHODS: TrainMethod[] = ["linear", "random_forest", "xgboost"];
@@ -59,6 +61,8 @@ export default function ExploreConfigPanel({
   const [pool, setPool] = useState<FactorMember[]>(initialPool);
   const [strategy, setStrategy] = useState<ExploreStrategy>("sizes");
   const [sizes, setSizes] = useState<number[]>([]);
+  const [combos, setCombos] = useState<number[][]>([]); // 手动指定组合的池内下标（manual 策略）
+  const labelOf = (m: FactorMember) => library.find((f) => f.key === m.factorKey)?.cn ?? m.factorKey;
   const trainers = useQuery({ queryKey: ["factor", "trainers"], queryFn: factorApi.trainers });
   const available = (m: TrainMethod) => trainers.data?.find((t) => t.method === m)?.available ?? true;
   const [methods, setMethods] = useState<TrainMethod[]>(DEFAULT_METHODS);
@@ -71,7 +75,8 @@ export default function ExploreConfigPanel({
     return pool.length >= 2 ? [Math.max(2, pool.length - 1), pool.length].filter((v, i, a) => a.indexOf(v) === i) : [];
   }, [sizes, pool.length]);
 
-  const params: ExploreParams = usesSizes ? { sizes: effectiveSizes } : {};
+  // P2-1：manual 是新增第三分支（非替代 usesSizes 分支）；漏成 {} 会让 planCombos("manual",{}) 抛错→永久阻断。
+  const params: ExploreParams = strategy === "manual" ? { combos } : usesSizes ? { sizes: effectiveSizes } : {};
   const activeMethods = methods.filter(available);
   const comboCount = safeCount(pool, strategy, params);
   const candidateCount = comboCount * activeMethods.length;
@@ -112,6 +117,8 @@ export default function ExploreConfigPanel({
         </div>
         {usesSizes ? (
           <SizePicker poolSize={pool.length} selected={effectiveSizes} onToggle={(k) => setSizes((prev) => togglePick(prev, k, effectiveSizes))} />
+        ) : strategy === "manual" ? (
+          <ManualComboBuilder pool={pool} labelOf={labelOf} value={combos} onChange={setCombos} />
         ) : (
           <p className="text-[11px] text-[var(--muted)]">
             将训练 全池（1 个）+ 逐一去 1（{pool.length} 个）= 共 {pool.length + 1} 个组合。
