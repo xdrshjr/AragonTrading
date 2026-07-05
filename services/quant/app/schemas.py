@@ -478,6 +478,8 @@ class AiBacktestResultOut(BaseModel):
     endTs: int
     barsProcessed: int
     notes: list[str] = Field(default_factory=list)
+    extendedMetrics: dict = Field(default_factory=dict)   # B1 扩展绩效指标（旧版结果为 {}，向后兼容）
+    benchmark: dict = Field(default_factory=dict)          # B2 买入持有基准 + alpha（无法计算为 {}）
 
 
 class AiBacktestStatusOut(BaseModel):

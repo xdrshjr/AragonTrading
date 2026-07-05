@@ -119,6 +119,69 @@ async def test_full_run_produces_trades_metrics_aistats_and_persists(monkeypatch
         await dispose_engine()
 
 
+_EXT_KEYS = ("annualizedReturn", "annualizedVolatility", "sortino", "calmar", "maxDrawdownBars",
+             "maxDrawdownSecs", "timeInMarketPct", "avgWin", "avgLoss", "payoffRatio", "largestWin",
+             "largestLoss", "maxConsecutiveWins", "maxConsecutiveLosses", "avgHoldBars",
+             "tradesPerWeek")
+_BENCH_KEYS = ("equity", "totalReturn", "maxDrawdown", "sharpe", "annualizedReturn", "alpha")
+
+
+async def test_extended_metrics_and_benchmark_present_persisted_and_in_snapshot(monkeypatch):
+    """[B1/B2] result/落库/GET 快照均含 extendedMetrics + benchmark；alpha 语义正确；在场根分母对齐。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        _patch_loaders(monkeypatch, candles, _StubLLM(_alternating))
+        runner = AiBacktestRunner(_spec(sid, paper, candles, every=40, refresh=3))
+        job = _BacktestJob("aibt_ext", runner)
+        await runner.run(job)
+
+        result = job.result
+        ext, bench = result["extendedMetrics"], result["benchmark"]
+        assert all(k in ext for k in _EXT_KEYS)
+        assert all(k in bench for k in _BENCH_KEYS)
+        # alpha == 策略 totalReturn − 基准 totalReturn
+        assert abs(bench["alpha"] - (result["metrics"]["totalReturn"] - bench["totalReturn"])) < 1e-9
+        # 在场根计数为分母 len(equity) 的子集（0 ≤ bars_in_market ≤ 权益点数）
+        assert 0 <= runner._bars_in_market <= len(result["equity"])
+        assert ext["timeInMarketPct"] == round(runner._bars_in_market / len(result["equity"]), 6)
+        # [P2-3] GET 快照（status_dict.result）亦透传两键
+        snap = job.status_dict()["result"]
+        assert "extendedMetrics" in snap and "benchmark" in snap
+        # 落库 metrics_json 含两键（自由 JSON，无迁移）
+        async with get_sessionmaker()() as s:
+            run = await repo.get_run(s, job.run_id)
+            metrics_json = json.loads(run.metrics_json)
+            assert "extendedMetrics" in metrics_json and "benchmark" in metrics_json
+    finally:
+        await dispose_engine()
+
+
+async def test_analytics_derivation_failure_does_not_break_result(monkeypatch):
+    """[P2-2] 派生抛错 → 回落空 dict、主 result/落库/终态不受影响（warning 已在实现内记）。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        _patch_loaders(monkeypatch, candles, _StubLLM(_alternating))
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("synthetic derive failure")
+
+        monkeypatch.setattr("app.ai_auto.backtest.compute_extended_metrics", _boom)
+        monkeypatch.setattr("app.ai_auto.backtest.compute_buy_hold", _boom)
+        runner = AiBacktestRunner(_spec(sid, paper, candles, every=40, refresh=3))
+        job = _BacktestJob("aibt_boom", runner)
+        await runner.run(job)
+
+        assert job.state == "completed"                 # 分析层异常不阻断主流程
+        assert job.result["extendedMetrics"] == {}      # 回落空 dict
+        assert job.result["benchmark"] == {}
+        assert "totalReturn" in job.result["metrics"]   # 既有七项照常
+        assert job.run_id is not None                   # 落库照常
+    finally:
+        await dispose_engine()
+
+
 async def test_decision_bars_align_to_interval(monkeypatch):
     """决策根严格对齐 decisionEveryBars（相邻决策 barIndex 差恒为间隔）。"""
     try:

@@ -72,6 +72,36 @@ export interface AiBacktestSummary {
   summary: string;
 }
 
+// B1 扩展绩效指标（后端 engine/metrics_ext 派生，随 result / metrics_json 下发；旧版结果缺失）。
+export interface AiBacktestExtendedMetrics {
+  annualizedReturn: number;
+  annualizedVolatility: number;
+  sortino: number;
+  calmar: number;
+  maxDrawdownBars: number;
+  maxDrawdownSecs: number;
+  timeInMarketPct: number;
+  avgWin: number;
+  avgLoss: number;
+  payoffRatio: number; // 盈亏比·赔率（平均盈利/平均亏损，区别于 Metrics.profitFactor 盈利因子）
+  largestWin: number;
+  largestLoss: number;
+  maxConsecutiveWins: number;
+  maxConsecutiveLosses: number;
+  avgHoldBars: number;
+  tradesPerWeek: number;
+}
+
+// B2 买入持有基准 + 超额 alpha（同窗口逐根盯市；无法计算时后端回落 {}，前端 benchmark? 缺失）。
+export interface AiBacktestBenchmark {
+  equity: EquityPoint[];
+  totalReturn: number;
+  maxDrawdown: number;
+  sharpe: number;
+  annualizedReturn: number;
+  alpha: number; // 策略 totalReturn − 基准 totalReturn
+}
+
 // 完成结果（result 事件全量 + 落库摘要版共用形）。
 export interface AiBacktestResult {
   runId: number | null;
@@ -85,6 +115,8 @@ export interface AiBacktestResult {
   endTs: number;
   barsProcessed: number;
   notes: string[];
+  extendedMetrics?: AiBacktestExtendedMetrics; // B1（可选：旧版落库结果缺失时前端优雅降级）
+  benchmark?: AiBacktestBenchmark; // B2（可选：无法计算或旧版结果缺失）
 }
 
 // 作业只读状态（GET /ai-trade/backtest/{jobId} 与 WS snapshot 的 job 字段）。

@@ -1,5 +1,6 @@
 // 成交 / 净值导出 CSV（纯函数，对齐 format.ts 约定）(spec §4.4 / F4)。
 // 用户原始诉求："查看不同策略实际的交易情况以及收益"——导出便于离线 Excel / Pandas 分析。
+import type { AiBacktestResult } from "./aiBacktestTypes";
 import type { EquityPoint, Trade } from "./types";
 
 type Column = { key: string; label: string };
@@ -75,8 +76,24 @@ export function equityToCsv(equity: EquityPoint[]): string {
 
 // 触发浏览器下载：前置 BOM 便于 Excel 正确识别 UTF-8；SSR / 测试无 document 时直接返回。
 export function downloadCsv(filename: string, content: string): void {
+  triggerDownload(filename, BOM + content, "text/csv;charset=utf-8");
+}
+
+// 完整回测结果序列化为 JSON（缩进 2，便于离线 Pandas / jq 复算）。
+export function resultToJson(result: AiBacktestResult): string {
+  return JSON.stringify(result, null, 2);
+}
+
+// 下载 JSON：MIME application/json、**不前置 BOM**（BOM 会破坏严格 JSON.parse 回读，§P1-4）。
+export function downloadJson(filename: string, obj: unknown): void {
+  const content = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
+  triggerDownload(filename, content, "application/json;charset=utf-8");
+}
+
+// 统一的 Blob 下载触发器（SSR / 测试无 document 时安全返回）。
+function triggerDownload(filename: string, content: string, mime: string): void {
   if (typeof document === "undefined") return;
-  const blob = new Blob([BOM + content], { type: "text/csv;charset=utf-8" });
+  const blob = new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;

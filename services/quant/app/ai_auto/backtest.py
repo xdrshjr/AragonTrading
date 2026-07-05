@@ -28,7 +28,9 @@ from ..config import Settings
 from ..db import repositories as repo
 from ..db.session import get_sessionmaker
 from ..engine.backtester import candles_to_df
+from ..engine.benchmark import compute_buy_hold
 from ..engine.metrics import compute_metrics
+from ..engine.metrics_ext import compute_extended_metrics
 from ..engine.mtf import bar_to_seconds
 from ..engine.simulator import RiskParams, SimBroker, TradeRecord
 from ..paper.strategy_factory import PaperStrategySpec
@@ -175,6 +177,7 @@ class AiBacktestRunner:
         self._exit_reason: str | None = None
         self._trades_emitted = 0
         self._bars_processed = 0
+        self._bars_in_market = 0                      # 在场根计数（供 timeInMarketPct 权威分子）
         self._last_ts = 0
         self._last_close = 0.0
         self._decisions_digest: deque[dict] = deque(maxlen=_DECISIONS_BUFFER_MAX)
@@ -260,6 +263,8 @@ class AiBacktestRunner:
             self.main.fill_pending(open_price=float(row["o"]), ts=int(row["ts"]), bar_index=i)
             self.main.apply_risk(i, row, self._oco_risk)
             self.main.mark(ts=int(row["ts"]), close=float(row["c"]))
+            if self.main.pos.side != "flat":         # [B1] 在场根计数（timeInMarketPct 分子）
+                self._bars_in_market += 1
             self._bars_processed = i - first + 1
             self._last_ts, self._last_close = int(row["ts"]), float(row["c"])
             self._emit_new_trades(job)
@@ -407,13 +412,41 @@ class AiBacktestRunner:
         metrics = compute_metrics(self.main.equity_points, self.main.trades, self.bar,
                                   self.initial_capital)
         ai_stats = self._aggregate_stats()
+        ext = self._extended_metrics(job)                     # [B1] 扩展绩效指标（派生失败回落 {}）
+        bench = self._buy_hold_benchmark(job, main_df, first, metrics)  # [B2] 买入持有基准 + alpha
         notes = self._build_notes(main_df, first)
         result = self._build_result(metrics, ai_stats, notes)
-        run_id = await self._persist(metrics, ai_stats, state)
+        result["extendedMetrics"] = ext                       # 追加两键（旧版结果为 {}，向后兼容）
+        result["benchmark"] = bench
+        run_id = await self._persist(metrics, ai_stats, state, ext, bench)
         result["runId"] = run_id
         job.publish({"type": "result", "data": result})
         terminal = "cancelled" if state == "cancelled" else "completed"
         job.mark_terminal(terminal, {"jobId": job.job_id, "runId": run_id})
+
+    def _extended_metrics(self, job: "_BacktestJob") -> dict:
+        """B1 扩展绩效指标（派生失败记 warning 回落空 dict，绝不影响主 result/落库，CLAUDE.md §5）。"""
+        try:
+            return compute_extended_metrics(
+                self.main.equity_points, self.main.trades, self.bar,
+                self.initial_capital, bars_in_market=self._bars_in_market)
+        except Exception as exc:  # noqa: BLE001 —— 分析层异常不得静默吞、不得波及主结果
+            logger.warning("ai-backtest extended-metrics failed (job %s): %s", job.job_id, exc)
+            return {}
+
+    def _buy_hold_benchmark(self, job: "_BacktestJob", main_df: pd.DataFrame, first: int,
+                            metrics: dict) -> dict:
+        """B2 买入持有基准 + 超额 alpha（同窗口 iloc[first:]；派生失败记 warning 回落空 dict）。"""
+        try:
+            closes = main_df["c"].iloc[first:].astype(float).tolist()
+            stamps = main_df["ts"].iloc[first:].astype(int).tolist()
+            bench = compute_buy_hold(closes, stamps, self.initial_capital, self.bar)
+            if bench:
+                bench["alpha"] = round(metrics["totalReturn"] - bench["totalReturn"], 6)
+            return bench
+        except Exception as exc:  # noqa: BLE001 —— 同上：warning + 回落，不阻断
+            logger.warning("ai-backtest benchmark failed (job %s): %s", job.job_id, exc)
+            return {}
 
     def _aggregate_stats(self) -> dict:
         total = self.rounds_done
@@ -448,7 +481,8 @@ class AiBacktestRunner:
             "startTs": self.start_ts, "endTs": self.end_ts, "barsProcessed": self._bars_processed,
             "notes": notes}
 
-    async def _persist(self, metrics: dict, ai_stats: dict, state: str) -> int | None:
+    async def _persist(self, metrics: dict, ai_stats: dict, state: str,
+                       ext: dict, bench: dict) -> int | None:
         """落 Run（mode=ai-backtest，strategy_id 用主策略占位）+ trades + equity（尽力而为，失败不崩）。"""
         status = {"completed": "completed", "cancelled": "cancelled"}.get(state, "failed")
         try:
@@ -458,7 +492,8 @@ class AiBacktestRunner:
                     mode="ai-backtest", config=self._run_config(), status="running")
                 metrics_full = {**metrics, "aiStats": ai_stats,
                                 "finalSummary": self.decider.summary,
-                                "decisionsDigest": list(self._decisions_digest)}
+                                "decisionsDigest": list(self._decisions_digest),
+                                "extendedMetrics": ext, "benchmark": bench}
                 await repo.persist_backtest_result(
                     session, run, trades=self.main.trades, equity=self.main.equity_points,
                     metrics=metrics_full, start_ts=self.start_ts, end_ts=self.end_ts, status=status)

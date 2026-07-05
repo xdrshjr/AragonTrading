@@ -5,6 +5,7 @@ import {
   CrosshairMode,
   type IChartApi,
   type ISeriesApi,
+  LineStyle,
   type UTCTimestamp,
   createChart,
 } from "lightweight-charts";
@@ -19,6 +20,7 @@ import type { EquityPoint, Overlay } from "@/lib/types";
 interface EquityChartProps {
   equity?: EquityPoint[]; // 回测 / 实时单条
   overlays?: Overlay[]; // 对比多条（归一化）
+  benchmark?: EquityPoint[]; // 买入持有基准（虚线、muted、绝对右轴）；仅单条 equity 分支渲染
   theme: "light" | "dark";
   loading?: boolean;
   error?: string | null;
@@ -33,6 +35,7 @@ function cssVar(name: string): string {
 export default function EquityChart({
   equity,
   overlays,
+  benchmark,
   theme,
   loading,
   error,
@@ -41,6 +44,7 @@ export default function EquityChart({
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const equitySeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const benchmarkSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
   const overlaySeriesRef = useRef<Map<number, ISeriesApi<"Line">>>(new Map());
 
   const hasOverlays = !!overlays && overlays.length > 0;
@@ -74,10 +78,20 @@ export default function EquityChart({
       lastValueVisible: true,
       title: "净值",
     });
+    // 买入持有基准：与净值共绝对右轴、虚线 muted；默认无数据（undefined 时 setData([]) 不可见）。
+    benchmarkSeriesRef.current = chart.addLineSeries({
+      color: cssVar("--muted"),
+      lineWidth: 1,
+      lineStyle: LineStyle.Dashed,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      title: "买入持有",
+    });
     return () => {
       chart.remove();
       chartRef.current = null;
       equitySeriesRef.current = null;
+      benchmarkSeriesRef.current = null;
       overlaySeriesRef.current.clear();
     };
   }, []);
@@ -92,6 +106,7 @@ export default function EquityChart({
       },
     });
     equitySeriesRef.current?.applyOptions({ color: cssVar("--accent") });
+    benchmarkSeriesRef.current?.applyOptions({ color: cssVar("--muted") });
   }, [theme]);
 
   // 单条净值折线（有 overlays 时清空，让位给对比曲线）。
@@ -109,6 +124,21 @@ export default function EquityChart({
     data.sort((a, b) => (a.time as number) - (b.time as number));
     series.setData(data);
   }, [equity, hasOverlays]);
+
+  // 买入持有基准虚线（仅单条 equity 分支：有 overlays / 无基准数据时清空，§2.5）。
+  useEffect(() => {
+    const series = benchmarkSeriesRef.current;
+    if (!series) return;
+    if (hasOverlays || !benchmark || benchmark.length === 0) {
+      series.setData([]);
+      return;
+    }
+    const byTs = new Map<number, number>();
+    for (const p of benchmark) byTs.set(p.ts, p.equity);
+    const data = Array.from(byTs, ([ts, value]) => ({ time: ts as UTCTimestamp, value }));
+    data.sort((a, b) => (a.time as number) - (b.time as number));
+    series.setData(data);
+  }, [benchmark, hasOverlays]);
 
   // 多策略对比净值叠加（compare 模式）：归一化为百分比，挂右价轴。
   useEffect(() => {

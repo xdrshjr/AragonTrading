@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { downloadCsv, equityToCsv, toCsv, tradesToCsv } from "./export";
+import {
+  downloadCsv,
+  downloadJson,
+  equityToCsv,
+  resultToJson,
+  toCsv,
+  tradesToCsv,
+} from "./export";
+import type { AiBacktestResult } from "./aiBacktestTypes";
 import type { EquityPoint, Trade } from "./types";
 
 describe("toCsv", () => {
@@ -111,6 +119,66 @@ describe("equityToCsv", () => {
     expect(lines[0].split(",")).toHaveLength(3);
     expect(lines).toHaveLength(3);
     expect(lines[2]).toBe("2021-01-01T01:00:00.000Z,10120.5,-0.01");
+  });
+});
+
+function minimalResult(): AiBacktestResult {
+  return {
+    runId: 1,
+    metrics: { totalReturn: 0.1, winRate: 0.5, profitFactor: 1.2, maxDrawdown: -0.05, sharpe: 1, tradeCount: 2, avgPnl: 5 },
+    aiStats: {
+      decisionRounds: 2, actionCounts: { open_long: 1, open_short: 0, close: 1, hold: 0 },
+      holdRate: 0, avgConfidence: 0.8, degradedRounds: 0, timeoutRounds: 0, summaryCount: 0,
+      decisionEveryBars: 1, plannedRounds: 2, reachedRoundCap: false,
+    },
+    equity: [{ ts: 1, equity: 10000, drawdown: 0 }],
+    trades: [], decisionsDigest: [], summaries: [],
+    startTs: 1, endTs: 2, barsProcessed: 2, notes: [],
+    benchmark: { equity: [], totalReturn: 0.05, maxDrawdown: -0.02, sharpe: 0.9, annualizedReturn: 0.1, alpha: 0.05 },
+  };
+}
+
+describe("resultToJson", () => {
+  it("serializes a result that round-trips through JSON.parse with all keys", () => {
+    const result = minimalResult();
+    const json = resultToJson(result);
+    const parsed = JSON.parse(json);
+    expect(parsed).toEqual(result);
+    expect(parsed.benchmark.alpha).toBe(0.05);
+  });
+});
+
+describe("downloadJson", () => {
+  it("emits BOM-free application/json that JSON.parse can read directly", () => {
+    const captured: { parts: BlobPart[]; opts?: BlobPropertyBag }[] = [];
+    const OrigBlob = globalThis.Blob;
+    const OrigCreate = URL.createObjectURL;
+    const OrigRevoke = URL.revokeObjectURL;
+    const OrigClick = HTMLAnchorElement.prototype.click;
+    // @ts-expect-error test replacement
+    globalThis.Blob = class {
+      parts: BlobPart[];
+      constructor(parts: BlobPart[], opts?: BlobPropertyBag) {
+        this.parts = parts;
+        captured.push({ parts, opts });
+      }
+    };
+    URL.createObjectURL = () => "blob:mock";
+    URL.revokeObjectURL = () => {};
+    HTMLAnchorElement.prototype.click = () => {};
+    try {
+      downloadJson("ai-backtest.json", resultToJson(minimalResult()));
+      expect(captured).toHaveLength(1);
+      const content = String(captured[0].parts[0]);
+      expect(content.charCodeAt(0)).not.toBe(0xfeff); // 无前导 BOM（不破坏 JSON.parse）
+      expect(() => JSON.parse(content)).not.toThrow();
+      expect(captured[0].opts?.type).toContain("application/json");
+    } finally {
+      globalThis.Blob = OrigBlob;
+      URL.createObjectURL = OrigCreate;
+      URL.revokeObjectURL = OrigRevoke;
+      HTMLAnchorElement.prototype.click = OrigClick;
+    }
   });
 });
 

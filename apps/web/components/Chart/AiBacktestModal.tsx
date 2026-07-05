@@ -1,9 +1,12 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { Badge, Button, Modal } from "@/components/ui";
+import { useState } from "react";
+import { Badge, Button, Modal, Tabs } from "@/components/ui";
 import MetricsCards from "@/components/Strategy/MetricsCards";
 import TradesTable from "@/components/Strategy/TradesTable";
+import { BenchmarkCompareCard, ExtendedMetricsGrid, KPIHero } from "./aiBacktest/panels";
+import { PeriodReturnBars, UnderwaterChart } from "./aiBacktest/charts";
 import {
   actionDistribution,
   describeBacktestPhase,
@@ -11,15 +14,22 @@ import {
   progressPercent,
 } from "@/lib/aiBacktest";
 import { aiBacktestApi } from "@/lib/aiBacktestApi";
+import { maxDrawdownWindow } from "@/lib/backtestStats";
 import {
   describeAiAction,
   describeConsensus,
   describeExecuted,
   describeRegime,
 } from "@/lib/aiTrade";
-import type { AiBacktestSummary } from "@/lib/aiBacktestTypes";
+import type {
+  AiBacktestBenchmark,
+  AiBacktestExtendedMetrics,
+  AiBacktestStatus,
+  AiBacktestSummary,
+} from "@/lib/aiBacktestTypes";
 import type { AiTradeDecision } from "@/lib/aiTradeTypes";
-import { fmtMoney, fmtNum, fmtTime } from "@/lib/format";
+import { downloadCsv, downloadJson, equityToCsv, resultToJson, tradesToCsv } from "@/lib/export";
+import { fmtMoney, fmtNum, fmtPct, fmtTime } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 import { useAiBacktestJob } from "@/lib/useAiBacktestJob";
 
@@ -94,7 +104,7 @@ export default function AiBacktestModal({ jobId, onClose }: { jobId: string; onC
         {running ? (
           <RunningView decisions={decisions} summary={summaries.at(-1)?.summary ?? null} jobId={jobId} />
         ) : (
-          result && <CompleteView result={result} theme={theme} decisions={decisions} />
+          result && <CompleteView result={result} theme={theme} decisions={decisions} status={status} />
         )}
       </div>
 
@@ -259,19 +269,63 @@ function DecisionCard({ d }: { d: AiTradeDecision }) {
   );
 }
 
+type BacktestResult = NonNullable<ReturnType<typeof useAiBacktestJob>>["result"];
+
+const COMPLETE_TABS = [
+  { key: "overview", label: "概览" },
+  { key: "advanced", label: "进阶指标" },
+  { key: "trades", label: "成交" },
+  { key: "ai", label: "AI 决策" },
+  { key: "context", label: "上下文" },
+];
+
+// 缺省/空 dict（旧版落库结果或派生失败回落 {}）→ undefined，供各分区优雅隐藏而非报错。
+function present<T>(value: T | undefined): T | undefined {
+  return value && Object.keys(value).length > 0 ? value : undefined;
+}
+
 function CompleteView({
   result,
   theme,
   decisions,
+  status,
 }: {
-  result: NonNullable<ReturnType<typeof useAiBacktestJob>>["result"];
+  result: BacktestResult;
   theme: "light" | "dark";
   decisions: AiTradeDecision[];
+  status: AiBacktestStatus | null;
 }) {
+  const [tab, setTab] = useState("overview");
   if (!result) return null;
   const timeline = result.decisionsDigest.length > 0 ? result.decisionsDigest : decisions;
+  const ext = present<AiBacktestExtendedMetrics>(result.extendedMetrics);
+  const benchmark = present<AiBacktestBenchmark>(result.benchmark);
+  const fileBase = `ai-backtest-${status?.instId ?? "run"}-${status?.bar ?? ""}-${result.startTs}-${result.endTs}`;
+  return (
+    <div className="flex flex-col gap-3">
+      <Tabs tabs={COMPLETE_TABS} active={tab} onChange={setTab} variant="underline" />
+      {tab === "overview" && <OverviewTab result={result} theme={theme} benchmark={benchmark} />}
+      {tab === "advanced" && <AdvancedTab result={result} ext={ext} benchmark={benchmark} />}
+      {tab === "trades" && <TradesTab result={result} fileBase={fileBase} />}
+      {tab === "ai" && <AiDecisionTab result={result} timeline={timeline} />}
+      {tab === "context" && <SummaryTimeline summaries={result.summaries} />}
+    </div>
+  );
+}
+
+function OverviewTab({
+  result,
+  theme,
+  benchmark,
+}: {
+  result: NonNullable<BacktestResult>;
+  theme: "light" | "dark";
+  benchmark?: AiBacktestBenchmark;
+}) {
+  const ddWin = maxDrawdownWindow(result.equity);
   return (
     <div className="flex flex-col gap-4">
+      <KPIHero metrics={result.metrics} benchmark={benchmark} />
       {result.notes.length > 0 && (
         <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-[11px] text-[var(--muted)]">
           {result.notes.map((n, i) => (
@@ -279,29 +333,94 @@ function CompleteView({
           ))}
         </div>
       )}
-
-      <MetricsCards metrics={result.metrics} />
-      <AiStatsCard result={result} />
-
       <section className="flex flex-col gap-1">
-        <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">权益曲线</span>
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">
+          权益曲线{benchmark ? "（含买入持有基准）" : ""}
+        </span>
         <div className="h-56 rounded-md border border-[var(--border)]">
-          <EquityChart equity={result.equity} theme={theme} emptyHint="无权益数据" />
+          <EquityChart equity={result.equity} benchmark={benchmark?.equity} theme={theme} emptyHint="无权益数据" />
         </div>
       </section>
+      <section className="flex flex-col gap-1">
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">水下回撤</span>
+          {ddWin && (
+            <span className="tabular text-[10px] text-[var(--muted)]">
+              最深 {fmtPct(ddWin.depth)} · {fmtTime(ddWin.startTs, false)}→{fmtTime(ddWin.endTs, false)}
+            </span>
+          )}
+        </div>
+        <div className="h-20 rounded-md border border-[var(--border)] bg-[var(--surface-2)] p-1">
+          <UnderwaterChart equity={result.equity} />
+        </div>
+      </section>
+    </div>
+  );
+}
 
+function AdvancedTab({
+  result,
+  ext,
+  benchmark,
+}: {
+  result: NonNullable<BacktestResult>;
+  ext?: AiBacktestExtendedMetrics;
+  benchmark?: AiBacktestBenchmark;
+}) {
+  return (
+    <div className="flex flex-col gap-4">
+      <section className="flex flex-col gap-1">
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">核心指标</span>
+        <MetricsCards metrics={result.metrics} />
+      </section>
+      {ext && (
+        <section className="flex flex-col gap-1">
+          <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">进阶风险 / 质量指标</span>
+          <ExtendedMetricsGrid ext={ext} />
+        </section>
+      )}
+      {benchmark && <BenchmarkCompareCard metrics={result.metrics} benchmark={benchmark} />}
+      <section className="flex flex-col gap-1">
+        <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">周期收益分布</span>
+        <PeriodReturnBars equity={result.equity} />
+      </section>
+    </div>
+  );
+}
+
+function TradesTab({ result, fileBase }: { result: NonNullable<BacktestResult>; fileBase: string }) {
+  const hasTrades = result.trades.length > 0;
+  const hasEquity = result.equity.length > 0;
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Button variant="ghost" size="sm" disabled={!hasTrades}
+          onClick={() => downloadCsv(`${fileBase}-trades.csv`, tradesToCsv(result.trades))}>
+          导出成交 CSV
+        </Button>
+        <Button variant="ghost" size="sm" disabled={!hasEquity}
+          onClick={() => downloadCsv(`${fileBase}-equity.csv`, equityToCsv(result.equity))}>
+          导出净值 CSV
+        </Button>
+        <Button variant="ghost" size="sm"
+          onClick={() => downloadJson(`${fileBase}.json`, resultToJson(result))}>
+          导出完整 JSON
+        </Button>
+      </div>
+      <TradesTable trades={result.trades} />
+    </div>
+  );
+}
+
+function AiDecisionTab({ result, timeline }: { result: NonNullable<BacktestResult>; timeline: AiTradeDecision[] }) {
+  return (
+    <div className="flex flex-col gap-4">
+      <AiStatsCard result={result} />
       <section className="flex flex-col gap-1">
         <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">动作分布</span>
         <ActionBars counts={result.aiStats.actionCounts} />
       </section>
-
-      <section className="flex flex-col gap-1">
-        <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">成交记录</span>
-        <TradesTable trades={result.trades} />
-      </section>
-
       <DecisionTimeline decisions={timeline} />
-      <SummaryTimeline summaries={result.summaries} />
     </div>
   );
 }
