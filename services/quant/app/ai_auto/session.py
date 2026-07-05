@@ -35,7 +35,9 @@ from .market_window import MarketWindow
 from .signals import (
     Consensus,
     StrategySignalView,
+    apply_consensus_gate,
     compute_consensus,
+    decision_to_signals,
     evaluate_signal_board,
     make_shadow_broker,
 )
@@ -348,20 +350,14 @@ class AiTradeSession:
 
     def _apply_consensus_gate(self, decision: TradeDecision, consensus: Consensus,
                               degrade: str | None) -> tuple[TradeDecision, str | None]:
-        """共识不足则把开仓硬降级为 hold（E2 补偿控制，独立于 LLM，仅更保守）。
+        """薄封装 `signals.apply_consensus_gate`（§2.8/R1）：传 `settings.ai_trade_min_consensus`。
 
-        入参 `consensus` 为 `Consensus` dataclass；门禁只作用于 `open_long/open_short`——
-        `close`/`hold` 从不被拦（保证「共识不足也永远能平仓保护」）。与既有置信度门独立叠加。
+        对外行为逐字不变——门禁降级则 `degradeReason` 归并为 `degrade or gate_reason`（保留决策器
+        先前的回落原因，如 timeout），否则透传原 `degrade`。共识门禁纯核心已上移至 `signals` 供回测共用。
         """
-        need = self.executor.settings.ai_trade_min_consensus
-        if need <= 0 or decision.action not in ("open_long", "open_short"):
-            return decision, degrade
-        votes = consensus.long_votes if decision.action == "open_long" else consensus.short_votes
-        if votes < need:
-            reason = f"low_consensus({votes}/{need})"          # 带计数，作 degradeReason（R-P2-4）
-            hold = TradeDecision(action="hold", size_fraction=None, confidence=None, reason=reason)
-            return hold, (degrade or reason)
-        return decision, degrade
+        decision, gate_reason = apply_consensus_gate(
+            decision, consensus, self.executor.settings.ai_trade_min_consensus)
+        return decision, (degrade or gate_reason)
 
     async def _execute_decision(self, decision: TradeDecision, ref_px: float, i: int,
                                 ts: int) -> dict:
@@ -387,18 +383,19 @@ class AiTradeSession:
                 "positionAfter": self.executor.projected}
 
     def _decision_to_signals(self, decision: TradeDecision, *, board_digest: str) -> list[Signal]:
-        """决策 → Signal（open_long/short 带 sizeFraction+AI explain；close 带 explain；hold=[]）。"""
-        action = decision.action
-        if action == "hold":
-            return []
-        explain = self._ai_explain(action, decision.reason, decision.confidence, board_digest)
-        if action == "open_long":
-            return [Signal(side="long", strength=decision.size_fraction or 0.0,
-                           reason=decision.reason, explain=explain)]
-        if action == "open_short":
-            return [Signal(side="short", strength=decision.size_fraction or 0.0,
-                           reason=decision.reason, explain=explain)]
-        return [Signal(side="close", reason=decision.reason or "ai_close", explain=explain)]
+        """决策 → Signal：调纯核心 `signals.decision_to_signals` + 补 AI explain 富化（§2.8/R1）。
+
+        对外行为逐字不变——实盘的 `board_digest`/atomic-explain 富化保留（回测不需该富化，直接用纯核心）。
+        `open_long/short` 带 sizeFraction，`close` 带理由，均补 `explain`；`hold=[]`。
+        """
+        signals = decision_to_signals(decision)
+        if not signals:
+            return signals
+        explain = self._ai_explain(decision.action, decision.reason, decision.confidence,
+                                   board_digest)
+        for sig in signals:
+            sig.explain = explain
+        return signals
 
     @staticmethod
     def _ai_explain(action: str, reason: str, confidence: float | None,

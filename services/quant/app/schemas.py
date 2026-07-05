@@ -419,6 +419,86 @@ class AiTradeStatusOut(BaseModel):
     aiTradeEnabled: bool
 
 
+# ---------------- AI 自动交易 · 回测模式（ai-auto-trading-backtest §5.1，camelCase wire）----------------
+class AiBacktestStartIn(BaseModel):
+    """启动 AI 回测请求（金额/杠杆/OCO 可留空→服务端保守默认，§4.1）。"""
+
+    instId: str = Field(min_length=1, max_length=32)
+    bar: str = "1H"
+    strategyIds: list[int] = Field(min_length=1)          # 上限按 ai_trade_max_strategies 服务端校验
+    startTs: int = Field(gt=0)                             # 回测区间起（UTC 秒）
+    endTs: int = Field(gt=0)                               # 回测区间止（UTC 秒）
+    decisionEveryBars: int | None = Field(default=None, ge=1, le=1000)  # 留空→config 默认
+    initialCapital: float | None = Field(default=None, gt=0)  # 留空→settings.initial_capital
+    leverage: float | None = Field(default=None, gt=0, le=125)
+    stopLossPct: float | None = Field(default=None, gt=0)     # 单仓 OCO 止损%（服务端夹紧到 max）
+    takeProfitPct: float | None = Field(default=None, gt=0)   # 单仓 OCO 止盈%（服务端夹紧到 max）
+    takeProfitUsd: float | None = Field(default=None, gt=0)   # 会话级止盈金额阈值；留空→不触发
+    stopLossUsd: float | None = Field(default=None, gt=0)     # 会话级止损金额阈值；留空→不触发
+    contextRefreshRounds: int = Field(default=10, ge=1)       # 精确区间在服务端按 min/max 校验
+    minConsensus: int | None = Field(default=None, ge=0)      # 共识门槛；留空→ai_trade_min_consensus
+
+
+class AiBacktestStartOut(BaseModel):
+    jobId: str
+    instId: str
+    bar: str
+    strategyIds: list[int]
+    startTs: int
+    endTs: int
+    decisionEveryBars: int
+    plannedRounds: int
+    initialCapital: float
+    leverage: float
+
+
+class AiBacktestAiStatsOut(BaseModel):
+    decisionRounds: int
+    actionCounts: dict                 # {open_long,open_short,close,hold}
+    holdRate: float
+    avgConfidence: float
+    degradedRounds: int
+    timeoutRounds: int
+    summaryCount: int
+    finalSummary: str | None = None
+    decisionEveryBars: int
+    plannedRounds: int
+    reachedRoundCap: bool
+
+
+class AiBacktestResultOut(BaseModel):
+    runId: int | None = None
+    metrics: dict                      # compute_metrics 七项
+    aiStats: AiBacktestAiStatsOut
+    equity: list[dict] = Field(default_factory=list)          # [{ts,equity,drawdown}]
+    trades: list[dict] = Field(default_factory=list)          # camelCase TradeRecord
+    decisionsDigest: list[dict] = Field(default_factory=list)  # 近 N 条决策（时间线复看）
+    summaries: list[dict] = Field(default_factory=list)       # [{round,ts,summary}]
+    startTs: int
+    endTs: int
+    barsProcessed: int
+    notes: list[str] = Field(default_factory=list)
+
+
+class AiBacktestStatusOut(BaseModel):
+    jobId: str
+    state: str                         # running|completed|cancelled|failed
+    phase: str                         # loading|priming|running|finalizing
+    progress: float
+    barIndex: int
+    totalBars: int
+    decisionRound: int
+    plannedRounds: int
+    instId: str
+    bar: str
+    strategyIds: list[int]
+    startTs: int
+    endTs: int
+    startedTs: int
+    runId: int | None = None
+    result: AiBacktestResultOut | None = None
+
+
 # ---------------- Workspace 偏好持久化（watchlist-auto-trade-persistence §3 / §4）----------------
 class AutoTradeMemberIo(BaseModel):
     """workspace 偏好里的自动交易成员（仅**类型**校验，P1-A）。

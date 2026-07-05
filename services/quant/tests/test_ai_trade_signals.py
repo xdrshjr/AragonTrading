@@ -5,7 +5,14 @@ latestSignal 仅在边沿根非 none；状态化 close 立场经暖机可达；�
 """
 from __future__ import annotations
 
-from app.ai_auto.signals import evaluate_signal_board, make_shadow_broker
+from app.ai_auto.decider import TradeDecision
+from app.ai_auto.signals import (
+    Consensus,
+    apply_consensus_gate,
+    decision_to_signals,
+    evaluate_signal_board,
+    make_shadow_broker,
+)
 from app.engine.backtester import candles_to_df
 from app.paper.strategy_factory import PaperStrategySpec
 from app.strategies.base import BaseStrategy, Signal, StrategyMeta
@@ -86,3 +93,53 @@ def test_short_stance_reachable_and_strength_reason_passthrough():
     assert abs(views[1].strength - 0.4) < 1e-9
     assert views[1].reason == "edge"
     assert views[2].stance == "short"   # 空头持久立场可达
+
+
+# ============================ 共识门禁 + 决策→信号（§2.8/R1 上移的纯函数）============================
+def _consensus(long_v: int, short_v: int, flat_v: int = 0) -> Consensus:
+    total = long_v + short_v + flat_v
+    net = "long" if long_v > short_v else "short" if short_v > long_v else "flat"
+    agreement = max(long_v, short_v) / total if total else 0.0
+    return Consensus(long_v, short_v, flat_v, total, net, round(agreement, 4))
+
+
+def test_apply_consensus_gate_disabled_when_min_zero():
+    """min_consensus=0（默认）→ 门禁关闭：开仓原样通过，gate_reason 为 None。"""
+    dec = TradeDecision("open_long", 0.5, 0.8, "r")
+    out, reason = apply_consensus_gate(dec, _consensus(1, 0), 0)
+    assert out is dec and reason is None
+
+
+def test_apply_consensus_gate_downgrades_open_when_votes_below_min():
+    """同向共识不足 → 开仓硬降级为 hold，gate_reason 带 low_consensus(k/n) 计数。"""
+    dec = TradeDecision("open_long", 0.5, 0.8, "r")
+    out, reason = apply_consensus_gate(dec, _consensus(1, 2), 2)
+    assert out.action == "hold"
+    assert reason == "low_consensus(1/2)"
+
+
+def test_apply_consensus_gate_passes_when_votes_meet_min():
+    """同向共识达标 → 开仓通过，gate_reason None。"""
+    dec = TradeDecision("open_short", 0.5, 0.8, "r")
+    out, reason = apply_consensus_gate(dec, _consensus(0, 3), 2)
+    assert out is dec and reason is None
+
+
+def test_apply_consensus_gate_never_blocks_close_or_hold():
+    """close/hold 从不被门禁拦（共识不足也永远能平仓保护）。"""
+    for action in ("close", "hold"):
+        dec = TradeDecision(action, None, None, "r")
+        out, reason = apply_consensus_gate(dec, _consensus(0, 0, 5), 3)
+        assert out is dec and reason is None
+
+
+def test_decision_to_signals_maps_pure_core_without_explain():
+    """纯核心映射：open→带 strength/reason，close→带 reason，hold→[]，且不设 explain（富化在 session 层）。"""
+    assert decision_to_signals(TradeDecision("hold", None, None, "r")) == []
+    longs = decision_to_signals(TradeDecision("open_long", 0.4, 0.9, "up"))
+    assert longs[0].side == "long" and abs(longs[0].strength - 0.4) < 1e-9
+    assert longs[0].explain is None
+    shorts = decision_to_signals(TradeDecision("open_short", 0.3, 0.9, "dn"))
+    assert shorts[0].side == "short" and abs(shorts[0].strength - 0.3) < 1e-9
+    closes = decision_to_signals(TradeDecision("close", None, None, "exit"))
+    assert closes[0].side == "close" and closes[0].reason == "exit"

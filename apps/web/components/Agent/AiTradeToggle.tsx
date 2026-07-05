@@ -5,6 +5,7 @@ import { useState } from "react";
 import { Switch } from "@/components/ui";
 import { accountApi } from "@/lib/accountApi";
 import { agentApi } from "@/lib/agentApi";
+import { aiBacktestApi } from "@/lib/aiBacktestApi";
 import { aiTradeApi } from "@/lib/aiTradeApi";
 import {
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
@@ -15,22 +16,29 @@ import { useAppStore } from "@/lib/store";
 import AiTradeLaunchModal, { type AiTradeLaunchOpts } from "./AiTradeLaunchModal";
 
 /**
- * AI 自动交易开关（ai-auto-trading §5.3）：挂 AgentPanel 头部「新对话」右侧。守门文案矩阵通过则开启
- * 弹窗多选策略并启动；运行中开关用于停止（确认平掉自管持仓）。与策略自动交易分组互斥（守门 + 后端准入锁）。
+ * AI 自动交易开关（ai-auto-trading §5.3 + backtest §2.10）：挂 AgentPanel 头部「新对话」右侧。
+ * 只要 Agent 已配置模型即可点开弹窗（回测门禁独立于 resolveAiTradeGate）；弹窗内「实盘 / 回测」段控——
+ * 实盘段走完整 resolveAiTradeGate 门禁（缺账户/双闸/互斥就地禁用），回测段仅需 Agent 已配置。
+ * 运行中开关用于停止实盘会话；回测确认→启动 job 并打开 AiBacktestModal（开关不 latch，回测非持久会话）。
  */
 export default function AiTradeToggle() {
   const accountMode = useAppStore((s) => s.accountMode);
   const instId = useAppStore((s) => s.instId);
   const bar = useAppStore((s) => s.bar);
   const strategyId = useAppStore((s) => s.strategyId);
+  const backtestStartTs = useAppStore((s) => s.backtestStartTs);
+  const backtestEndTs = useAppStore((s) => s.backtestEndTs);
   const aiTradeSessionId = useAppStore((s) => s.aiTradeSessionId);
   const liveAutoGroup = useAppStore((s) => s.liveAutoGroup);
   const aiTradeAcknowledged = useAppStore((s) => s.aiTradeAcknowledged);
   const aiTradeConfig = useAppStore((s) => s.aiTradeConfig);
+  const aiBacktestConfig = useAppStore((s) => s.aiBacktestConfig);
   const setAiTradeSessionId = useAppStore((s) => s.setAiTradeSessionId);
   const setAiTradeSession = useAppStore((s) => s.setAiTradeSession);
   const setAiTradeAcknowledged = useAppStore((s) => s.setAiTradeAcknowledged);
   const setAiTradeConfig = useAppStore((s) => s.setAiTradeConfig);
+  const setAiBacktestJobId = useAppStore((s) => s.setAiBacktestJobId);
+  const setAiBacktestConfig = useAppStore((s) => s.setAiBacktestConfig);
   const clearAiTradeRuntime = useAppStore((s) => s.clearAiTradeRuntime);
 
   const qc = useQueryClient();
@@ -55,7 +63,8 @@ export default function AiTradeToggle() {
   const aiTradeEnabled = statusQ.data?.aiTradeEnabled ?? false;
 
   const running = !!aiTradeSessionId;
-  const gateReason = resolveAiTradeGate({
+  // 实盘段门禁（传入弹窗，实盘 tab 据此禁用 + 悬浮说明）；回测段仅需 agentConfigured。
+  const liveGateReason = resolveAiTradeGate({
     accountMode,
     hasReadyDefault,
     aiTradeEnabled,
@@ -63,6 +72,8 @@ export default function AiTradeToggle() {
     liveAutoActive: !!liveAutoGroup,
     hasActiveSession: running,
   });
+  // 打开弹窗的最小门禁（独立于 resolveAiTradeGate）：Agent 已配置即可（回测在模拟账户模式也可用，R6）。
+  const openBlockedReason = running ? null : !agentConfigured ? "请先在设置中心配置 AI 模型" : null;
 
   const startM = useMutation({
     mutationFn: (opts: AiTradeLaunchOpts) =>
@@ -113,6 +124,37 @@ export default function AiTradeToggle() {
       setError(e instanceof ApiRequestError ? e.message : "启动失败，请稍后重试"),
   });
 
+  const startBacktestM = useMutation({
+    mutationFn: (opts: AiTradeLaunchOpts) =>
+      aiBacktestApi.start({
+        instId: opts.instId,
+        bar,
+        strategyIds: opts.strategyIds,
+        startTs: opts.startTs ?? 0,
+        endTs: opts.endTs ?? 0,
+        decisionEveryBars: opts.decisionEveryBars ?? null,
+        initialCapital: opts.capitalUsd,
+        leverage: opts.leverage,
+        stopLossPct: opts.stopLossPct,
+        takeProfitPct: opts.takeProfitPct,
+        takeProfitUsd: opts.takeProfitUsd,
+        stopLossUsd: opts.stopLossUsd,
+        contextRefreshRounds: opts.contextRefreshRounds,
+        minConsensus: opts.minConsensus ?? null,
+      }),
+    onSuccess: (res, opts) => {
+      setAiBacktestJobId(res.jobId);
+      setAiBacktestConfig({
+        decisionEveryBars: res.decisionEveryBars,
+        contextRefreshRounds: opts.contextRefreshRounds,
+      });
+      setModalOpen(false);
+      setError(null);
+    },
+    onError: (e) =>
+      setError(e instanceof ApiRequestError ? e.message : "回测启动失败，请稍后重试"),
+  });
+
   const stopM = useMutation({
     mutationFn: (id: string) => aiTradeApi.stop(id),
     onSettled: () => {
@@ -124,7 +166,7 @@ export default function AiTradeToggle() {
   const onToggle = (next: boolean) => {
     setError(null);
     if (next) {
-      if (gateReason) return;
+      if (openBlockedReason) return;
       setModalOpen(true);
     } else if (aiTradeSessionId) {
       stopM.mutate(aiTradeSessionId);
@@ -141,7 +183,9 @@ export default function AiTradeToggle() {
   return (
     <div
       className="flex items-center gap-1.5"
-      title={gateReason ?? (running ? "点击停止 AI 自动交易并平掉自管持仓" : "开启 AI 自动交易")}
+      title={
+        openBlockedReason ?? (running ? "点击停止 AI 自动交易并平掉自管持仓" : "开启 AI 自动交易 / 回测")
+      }
     >
       <span
         className={
@@ -156,7 +200,7 @@ export default function AiTradeToggle() {
         checked={running}
         onChange={onToggle}
         label="AI 自动交易开关"
-        className={gateReason && !running ? "opacity-40" : undefined}
+        className={openBlockedReason && !running ? "opacity-40" : undefined}
       />
       <AiTradeLaunchModal
         open={modalOpen}
@@ -164,8 +208,8 @@ export default function AiTradeToggle() {
           setModalOpen(false);
           setError(null);
         }}
-        onConfirm={(opts) => startM.mutate(opts)}
-        submitting={startM.isPending}
+        onConfirm={(opts) => (opts.mode === "backtest" ? startBacktestM.mutate(opts) : startM.mutate(opts))}
+        submitting={startM.isPending || startBacktestM.isPending}
         acknowledged={aiTradeAcknowledged}
         onAcknowledge={setAiTradeAcknowledged}
         bar={bar}
@@ -173,6 +217,10 @@ export default function AiTradeToggle() {
         defaultStrategyIds={defaultStrategyIds}
         defaultContextRounds={aiTradeConfig?.contextRefreshRounds ?? AI_TRADE_DEFAULT_CONTEXT_ROUNDS}
         error={error}
+        liveGateReason={liveGateReason}
+        defaultStartTs={backtestStartTs}
+        defaultEndTs={backtestEndTs}
+        defaultDecisionEveryBars={aiBacktestConfig?.decisionEveryBars}
       />
     </div>
   );

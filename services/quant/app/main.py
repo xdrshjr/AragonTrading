@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from .agent.manager import get_agent_manager
 from .ai_auto import get_ai_trade_manager
+from .ai_auto.backtest_manager import get_ai_backtest_manager
 from .api import (
     accounts,
     agent,
@@ -55,6 +56,7 @@ async def lifespan(app: FastAPI):
     await get_agent_manager().shutdown()
     await get_paper_manager().shutdown()
     await get_ai_trade_manager().shutdown()   # AI 自动交易（紧随 live-auto 关停，含平仓）
+    await get_ai_backtest_manager().shutdown()   # AI 回测作业（取消所有在跑 job，无真单）
     await get_live_auto_manager().shutdown()
     # 关停顺序（weight-multi-model-training §2.6）：先停批次泵、再停底层作业，避免泵在作业消失后空转。
     await get_weight_batch_manager().shutdown()

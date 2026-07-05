@@ -63,20 +63,33 @@ describe("AiTradeToggle", () => {
     expect(screen.getByRole("switch")).toHaveAttribute("aria-checked", "false");
   });
 
-  it("opens the launch modal when all gates pass", async () => {
+  it("opens the launch modal in live mode when all gates pass", async () => {
     renderToggle();
     // 守门通过后包裹容器 title 变为「开启…」，据此等三条查询（账户/模型/AI 开关）都已水合再点击。
-    await screen.findByTitle("开启 AI 自动交易");
+    await screen.findByTitle("开启 AI 自动交易 / 回测");
     fireEvent.click(screen.getByRole("switch"));
     expect(await screen.findByText("启动 AI 自动交易")).toBeInTheDocument();
   });
 
-  it("does not open the modal when AI trading is disabled backend-side", async () => {
+  it("opens in backtest mode when live AI trading is gated but agent is configured (R6)", async () => {
+    // AI 开关后端未开 → 实盘段禁用，但 Agent 已配置 → 弹窗仍可开，默认落回测段。
     vi.mocked(aiTradeApi.status).mockResolvedValue({ session: null, aiTradeEnabled: false } as never);
     renderToggle();
-    await waitFor(() => expect(aiTradeApi.status).toHaveBeenCalled());
+    // agent 已配置 → openBlockedReason 为 null，容器 title 仍为「开启…」；据此等 agentApi.config 水合。
+    await screen.findByTitle("开启 AI 自动交易 / 回测");
+    fireEvent.click(screen.getByRole("switch"));
+    expect(await screen.findByText("AI 自动交易 · 回测")).toBeInTheDocument();
+    expect(screen.queryByText("启动 AI 自动交易")).not.toBeInTheDocument();
+  });
+
+  it("does not open the modal when the agent model is not configured", async () => {
+    vi.mocked(agentApi.config).mockResolvedValue({ configured: false } as never);
+    renderToggle();
+    // 未配置模型 → 容器 title 变为提示语；据此确保门禁已水合再点击。
+    await screen.findByTitle("请先在设置中心配置 AI 模型");
     fireEvent.click(screen.getByRole("switch"));
     expect(screen.queryByText("启动 AI 自动交易")).not.toBeInTheDocument();
+    expect(screen.queryByText("AI 自动交易 · 回测")).not.toBeInTheDocument();
   });
 
   it("stops the session when toggled off while running", async () => {

@@ -30,6 +30,7 @@ import type {
   AiTradeDecision,
   AiTradeSessionRow,
 } from "./aiTradeTypes";
+import type { AiBacktestConfig } from "./aiBacktestTypes";
 import type { FactorEditTarget, FactorTargetRef, SymbolGroup } from "./factorTypes";
 import type { WeightTrainResult, WeightTrainTarget } from "./weightModelTypes";
 import type { WeightBatchTarget } from "./weightBatchTypes";
@@ -151,6 +152,10 @@ interface AppState {
   aiTradeSummary: string | null;                  // 当前上下文摘要（AI 长期记忆）
   aiTradeAcknowledged: boolean;                   // 首启风险勾选会话记忆，刷新复位
   aiTradeConfig: AiTradeConfig | null;            // 持久化偏好（进 partialize）
+  // AI 回测（ai-auto-trading-backtest §5.4）：aiBacktestJobId 瞬态（GET /ai-trade/backtest/{id} 重发现）；
+  // aiBacktestConfig 为持久化偏好（记忆决策间隔 / 刷新轮数，进 partialize，v25 承载无需升版）。
+  aiBacktestJobId: string | null;
+  aiBacktestConfig: AiBacktestConfig | null;
   theme: Theme;
   backtestStartTs: number;
   backtestEndTs: number;
@@ -258,6 +263,9 @@ interface AppState {
   setAiTradeAcknowledged: (v: boolean) => void;
   clearAiTradeRuntime: () => void;
   setAiTradeConfig: (config: AiTradeConfig | null) => void;
+  // AI 回测：活跃作业句柄（瞬态，断线重发现）+ 持久化偏好 setter。
+  setAiBacktestJobId: (id: string | null) => void;
+  setAiBacktestConfig: (config: AiBacktestConfig | null) => void;
   setBacktestRange: (startTs: number, endTs: number) => void;
   toggleTheme: () => void;
   setTheme: (t: Theme) => void;
@@ -389,6 +397,8 @@ export const useAppStore = create<AppState>()(
       aiTradeSummary: null,
       aiTradeAcknowledged: false,
       aiTradeConfig: null,
+      aiBacktestJobId: null,
+      aiBacktestConfig: null,
       theme: "light",
       backtestStartTs: defaultStartTs,
       backtestEndTs: defaultEndTs,
@@ -625,6 +635,8 @@ export const useAppStore = create<AppState>()(
           aiTradeSummary: null,
         }),
       setAiTradeConfig: (aiTradeConfig) => set({ aiTradeConfig }),
+      setAiBacktestJobId: (aiBacktestJobId) => set({ aiBacktestJobId }),
+      setAiBacktestConfig: (aiBacktestConfig) => set({ aiBacktestConfig }),
       setBacktestRange: (backtestStartTs, backtestEndTs) =>
         set({ backtestStartTs, backtestEndTs, runId: null }),
       toggleTheme: () =>
@@ -799,6 +811,8 @@ export const useAppStore = create<AppState>()(
         // AI 自动交易偏好（持久化）；aiTrade 运行期态全瞬态，**不**入 partialize（刷新由
         // GET /ai-trade/status 重发现）。
         aiTradeConfig: s.aiTradeConfig,
+        // AI 回测偏好（持久化）；aiBacktestJobId 瞬态**不**入 partialize（刷新由 GET 重发现）。
+        aiBacktestConfig: s.aiBacktestConfig,
         instSidebarTab: s.instSidebarTab,
         chartSplitRatio: s.chartSplitRatio,
         chartIndicatorRatio: s.chartIndicatorRatio,

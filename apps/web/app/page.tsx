@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import clsx from "clsx";
 import type { Dispatch, MouseEventHandler, SetStateAction } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import AiBacktestModal from "@/components/Chart/AiBacktestModal";
 import ChartWorkspace from "@/components/Chart/ChartWorkspace";
 import WindowControls from "@/components/Desktop/WindowControls";
 import AccountModeSwitch from "@/components/Header/AccountModeSwitch";
@@ -83,6 +84,8 @@ export default function Page() {
     aiTradeSessionId,
     aiTradeTrades,
     aiTradeSession,
+    aiBacktestJobId,
+    setAiBacktestJobId,
     theme,
     backtestStartTs,
     backtestEndTs,
@@ -675,6 +678,9 @@ export default function Page() {
           )}
         </div>
       </div>
+      {aiBacktestJobId && (
+        <AiBacktestModal jobId={aiBacktestJobId} onClose={() => setAiBacktestJobId(null)} />
+      )}
     </div>
   );
 }

@@ -14,6 +14,11 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisco
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai_auto import get_ai_trade_manager
+from ..ai_auto.backtest_manager import (
+    AiBacktestError,
+    AiBacktestStartRequest,
+    get_ai_backtest_manager,
+)
 from ..ai_auto.manager import (
     AiTradePreflightError,
     AiTradeSessionLimitError,
@@ -23,9 +28,12 @@ from ..config import Settings, get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
 from ..paper.strategy_factory import build_paper_strategy_spec
-from ..schemas import AiTradeStartIn, run_out
+from ..schemas import AiBacktestStartIn, AiTradeStartIn, run_out
 
 router = APIRouter(tags=["ai-trade"])
+
+_WS_HEARTBEAT_SECONDS = 20.0   # 静默此秒数后下发 ping（半开探测 + 满队列丢终态兜底，镜像 weight-train）
+_BACKTEST_TERMINAL_TYPES = ("done", "cancelled", "error")
 
 
 def _require_ai_enabled(settings: Settings) -> None:
@@ -138,3 +146,94 @@ async def ws_ai_trade(websocket: WebSocket, session_id: str) -> None:
         pass
     finally:
         session.unsubscribe(queue)
+
+
+# ============================ AI 回测模式（ai-auto-trading-backtest §4）============================
+# 回测子路由**仅**校验 Agent 已配置（在 AiBacktestManager.start 内经 resolve_active_provider），
+# **不**校验 AI_TRADE_ENABLED/LIVE_TRADING_ENABLED 双闸——回测走纯模拟 SimBroker、不下真单、无真实资金面。
+@router.post("/ai-trade/backtest/start")
+async def ai_backtest_start(body: AiBacktestStartIn, session: AsyncSession = Depends(get_session),
+                            settings: Settings = Depends(get_settings)) -> dict:
+    """启动一个 AI 自动交易回测作业（§2.9 前置门禁；回执含 plannedRounds 与夹紧后生效资金/杠杆）。"""
+    specs = await _build_specs(session, body.strategyIds)
+    req = AiBacktestStartRequest(
+        specs=specs, inst_id=body.instId, bar=body.bar, start_ts=body.startTs, end_ts=body.endTs,
+        settings=settings, context_refresh_rounds=body.contextRefreshRounds,
+        decision_every_bars=body.decisionEveryBars, initial_capital=body.initialCapital,
+        leverage=body.leverage, stop_loss_pct=body.stopLossPct, take_profit_pct=body.takeProfitPct,
+        take_profit_usd=body.takeProfitUsd, stop_loss_usd=body.stopLossUsd,
+        min_consensus=body.minConsensus)
+    try:
+        job = await get_ai_backtest_manager().start(req)
+    except AiBacktestError as exc:
+        raise HTTPException(exc.status, detail={"code": exc.code, "message": exc.message})
+    runner = job.runner
+    return {"jobId": job.job_id, "instId": runner.inst_id, "bar": runner.bar,
+            "strategyIds": runner.strategy_ids, "startTs": runner.start_ts, "endTs": runner.end_ts,
+            "decisionEveryBars": runner.decision_every_bars, "plannedRounds": runner.planned_rounds,
+            "initialCapital": runner.initial_capital, "leverage": runner.leverage}
+
+
+@router.post("/ai-trade/backtest/{job_id}/cancel")
+async def ai_backtest_cancel(job_id: str) -> dict:
+    """协作式取消回测作业（不存在 → 404）；实际终态经 WS `cancelled` 事件驱动前端。"""
+    outcome = get_ai_backtest_manager().cancel(job_id)
+    if outcome == "unknown":
+        raise HTTPException(404, detail={"code": "AI_BACKTEST_JOB_NOT_FOUND",
+                                         "message": "无此回测任务"})
+    job = get_ai_backtest_manager().get(job_id)
+    return {"jobId": job_id, "state": job.state if job is not None else "cancelled"}
+
+
+@router.get("/ai-trade/backtest/{job_id}")
+async def ai_backtest_get(job_id: str) -> dict:
+    """回测作业只读状态（前端重载后据此重发现 + 重连 WS）。"""
+    job = get_ai_backtest_manager().get(job_id)
+    if job is None:
+        raise HTTPException(404, detail={"code": "AI_BACKTEST_JOB_NOT_FOUND",
+                                         "message": "无此回测任务"})
+    return {"job": job.status_dict()}
+
+
+@router.websocket("/ws/ai-backtest/{job_id}")
+async def ws_ai_backtest(websocket: WebSocket, job_id: str) -> None:
+    """回测事件流（同信封 {type,data}，镜像 weight-train）：连接即原子 subscribe→snapshot 回放→续订新事件。"""
+    await websocket.accept()
+    job = get_ai_backtest_manager().get(job_id)
+    if job is None:
+        await websocket.send_text(json.dumps({
+            "type": "error", "data": {"code": "AI_BACKTEST_JOB_NOT_FOUND",
+                                      "message": "无此回测任务或已过期"}}))
+        await websocket.close()
+        return
+    queue = job.subscribe()                       # subscribe() 与 snapshot_events() 间无 await：单线程下原子
+    snapshot = job.snapshot_events()
+    try:
+        for event in snapshot:
+            await websocket.send_text(json.dumps(event))
+        if snapshot and snapshot[-1].get("type") in _BACKTEST_TERMINAL_TYPES:
+            await websocket.close()               # 已终态（快作业先于连线结束）：回放完即关，绝不悬挂
+            return
+        while True:
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=_WS_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                await websocket.send_text(json.dumps({"type": "ping"}))
+                if job.is_terminal:               # 满队列若丢终态：关闭前补发 result + 终态事件
+                    tail = job.snapshot_events()
+                    last_result = next((e for e in reversed(tail) if e.get("type") == "result"), None)
+                    if last_result is not None:
+                        await websocket.send_text(json.dumps(last_result))
+                    if tail and tail[-1].get("type") in _BACKTEST_TERMINAL_TYPES:
+                        await websocket.send_text(json.dumps(tail[-1]))
+                    await websocket.close()
+                    break
+                continue
+            await websocket.send_text(json.dumps(event))
+            if event.get("type") in _BACKTEST_TERMINAL_TYPES:
+                await websocket.close()
+                break
+    except (WebSocketDisconnect, asyncio.CancelledError):
+        pass
+    finally:
+        job.unsubscribe(queue)

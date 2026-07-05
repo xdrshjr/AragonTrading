@@ -21,6 +21,8 @@ import pandas as pd
 
 from ..engine.simulator import RiskParams, SimBroker
 from ..paper.strategy_factory import PaperStrategySpec
+from ..strategies.base import Signal
+from .decider import TradeDecision
 
 # 影子 broker 名义资金（仅用于读立场；stance 只取决于开/平信号，与具体权益无关）。
 _SHADOW_CAPITAL = 10_000.0
@@ -128,3 +130,53 @@ def evaluate_signal_board(specs: list[PaperStrategySpec], shadows: list[SimBroke
     """
     return [step_strategy_shadow(spec, shadow, df, i)
             for spec, shadow, df in zip(specs, shadows, dfs)]
+
+
+# ============================ 共识门禁 + 决策→信号（session 与 backtest 共用核心，§2.8/R1） ============================
+def apply_consensus_gate(decision: TradeDecision, consensus: Consensus,
+                         min_consensus: int) -> tuple[TradeDecision, str | None]:
+    """共识不足则把开仓硬降级为 hold（E2 补偿控制，独立于 LLM，仅更保守）。
+
+    `min_consensus` 为**显式入参**（调用方从 settings 或用户覆盖值传入，§2.8/R1），使本函数为纯函数，
+    供实盘 session 与回测 runner 共用。门禁只作用于 `open_long/open_short`——`close`/`hold` 从不被拦
+    （保证「共识不足也永远能平仓保护」）。
+
+    Args:
+        decision: 决策器本轮产出（已过安全回落与置信度门）。
+        consensus: 本轮共识度（`compute_consensus` 产物）。
+        min_consensus: 开仓最小同向策略数门槛；≤0 即关闭门禁。
+
+    Returns:
+        `(decision, gate_reason)`——`gate_reason` 非 None 表示本轮被共识门禁降级为 hold
+        （带 `low_consensus(k/n)` 计数）；未降级则 `gate_reason is None`。
+    """
+    if min_consensus <= 0 or decision.action not in ("open_long", "open_short"):
+        return decision, None
+    votes = consensus.long_votes if decision.action == "open_long" else consensus.short_votes
+    if votes < min_consensus:
+        reason = f"low_consensus({votes}/{min_consensus})"
+        hold = TradeDecision(action="hold", size_fraction=None, confidence=None, reason=reason)
+        return hold, reason
+    return decision, None
+
+
+def decision_to_signals(decision: TradeDecision) -> list[Signal]:
+    """决策 → `Signal` **纯核心映射**（无 explain 富化；session 调本核心后再补富化，§2.8/R1）。
+
+    `open_long/open_short` 带 `size_fraction` 作 `strength`；`close` 带理由；`hold` 为空列表。
+    `TradeDecision.size_fraction` 为 snake_case（决策器 dataclass 字段）。
+
+    Args:
+        decision: 本轮最终决策（共识门禁后）。
+
+    Returns:
+        供 `SimBroker.submit` / `LiveExecutor.apply` 消费的信号列表（hold → `[]`）。
+    """
+    action = decision.action
+    if action == "hold":
+        return []
+    if action == "open_long":
+        return [Signal(side="long", strength=decision.size_fraction or 0.0, reason=decision.reason)]
+    if action == "open_short":
+        return [Signal(side="short", strength=decision.size_fraction or 0.0, reason=decision.reason)]
+    return [Signal(side="close", reason=decision.reason or "ai_close")]
