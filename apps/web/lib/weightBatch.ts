@@ -15,11 +15,16 @@ import type { TrainCurvePoint, TrainStreamEvent } from "./weightModelTypes";
 import type { WeightBatchCandidate as RosterCandidate } from "./weightBatchTypes";
 
 // 全部可选训练方法（共享导出，factor-combo-exploration P2-6/C-5）：launcher 与探索弹窗方法多选复用同一真源，
-// 杜绝两份漂移。可用性仍由 factorApi.trainers 逐项判定（未安装置灰）。
-export const ALL_METHODS: TrainMethod[] = ["linear", "equal", "ic_weight", "random_forest", "xgboost"];
+// 杜绝两份漂移。可用性仍由 factorApi.trainers 逐项判定（未安装置灰）。追加顶级 · 含非线性 6 款
+// （weight-model-nonlinear-trainers §四）。
+export const ALL_METHODS: TrainMethod[] = [
+  "linear", "equal", "ic_weight", "random_forest", "xgboost",
+  "extra_trees", "mlp", "kernel_ridge", "knn", "mutual_info", "elastic_net",
+];
 
-// 默认多模型候选方法（launcher 初始勾选）：覆盖线性 / 树集成主流，用户可增删。
-export const DEFAULT_BATCH_METHODS: TrainMethod[] = ["linear", "random_forest", "xgboost"];
+// 默认多模型候选方法（launcher 初始勾选）：覆盖线性 / 树集成 / 一款非线性示例；取较快的 extra_trees 而非
+// O(n³) 的 kernel_ridge，以免默认批次体感变慢（评审 v2 P2-6）。用户可增删。
+export const DEFAULT_BATCH_METHODS: TrainMethod[] = ["linear", "random_forest", "extra_trees"];
 
 // roster 候选 → 初始候选态（queued，未有任何流事件）。
 export function emptyCandidate(entry: RosterCandidate): CandidateState {

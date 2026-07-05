@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_THRESHOLDS, type FactorMember } from "./factorTypes";
+import { DEFAULT_THRESHOLDS, type FactorMember, type TrainMethod } from "./factorTypes";
 import {
   bestRun,
   buildTrainResult,
@@ -8,6 +8,8 @@ import {
   codeLabel,
   hasCurveData,
   latestRun,
+  methodDescription,
+  methodLabel,
   metricGeometry,
   modelToTrainTarget,
   runIsBacktestable,
@@ -110,6 +112,30 @@ describe("metricGeometry", () => {
     expect(hasCurveData([curvePoint({ trainLoss: Number.NaN, validLoss: Number.POSITIVE_INFINITY,
       trainIc: Number.NaN, validIc: Number.NaN })])).toBe(false);
     expect(hasCurveData([curvePoint({ validIc: 0.1 })])).toBe(true);
+  });
+});
+
+describe("methodLabel / methodDescription（weight-model-nonlinear-trainers）", () => {
+  const ALL: TrainMethod[] = [
+    "equal", "ic_weight", "linear", "random_forest", "xgboost",
+    "extra_trees", "mlp", "kernel_ridge", "knn", "mutual_info", "elastic_net",
+  ];
+
+  it("11 款方法都有非空中文标签与说明（无 undefined，无回落原始 key）", () => {
+    for (const m of ALL) {
+      expect(methodLabel(m)).toBeTruthy();
+      expect(methodLabel(m)).not.toBe(m);         // 有真中文标签
+      expect(methodDescription(m)).toBeTruthy();
+    }
+  });
+
+  it("新增 6 款有专属标签", () => {
+    expect(methodLabel("extra_trees")).toBe("极端随机树");
+    expect(methodLabel("mlp")).toBe("神经网络(MLP)");
+    expect(methodLabel("kernel_ridge")).toBe("核岭回归(RBF)");
+    expect(methodLabel("knn")).toBe("K近邻回归");
+    expect(methodLabel("mutual_info")).toBe("互信息加权");
+    expect(methodLabel("elastic_net")).toBe("弹性网络");
   });
 });
 

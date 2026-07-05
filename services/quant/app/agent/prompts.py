@@ -41,8 +41,8 @@ SYSTEM_PROMPT = """你是 Aragon Trading 量化模拟交易工作台内置的 AI
 出现后未来 1/3/6/12 根的前瞻收益分布、胜率、t 值与相对基线的超额收益，用于先验证信号本身有没有统计优势。
 - list_factors / compute_factor / evaluate_factor / mine_factors / train_factor_weights / score_factor_combo：\
 独立因子层（行情→因子计算→评估/挖掘→权重训练→组合得分→策略决策）。列因子、算因子值、评估因子对未来收益\
-的解释力（IC/RankIC/IR/分位单调性）、按区间挖掘并按 RankIC IR 排名、用 linear/random_forest/xgboost 训练\
-因子权重、对保存的因子组合算复合得分。
+的解释力（IC/RankIC/IR/分位单调性）、按区间挖掘并按 RankIC IR 排名、用 11 款训练器（线性/树集成/神经网络\
+/核回归/kNN/互信息/弹性网络等，含非线性）训练因子权重、对保存的因子组合算复合得分。
 - save_factor_set / create_factor_strategy：把训练好的因子组合持久化、再以内联快照部署成 factor_score 策略，\
 闭合「mine_factors → evaluate_factor → train_factor_weights → save_factor_set → create_factor_strategy →（既有）\
 run_backtest / compare_strategies」全链路；成员方向须冻结 long/short、normWindow 训练后锁定、provenance 仅记录不参与打分。

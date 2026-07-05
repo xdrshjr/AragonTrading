@@ -244,7 +244,7 @@ class FactorSet(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(128))
     members_json: Mapped[str] = mapped_column(Text, default="[]")     # [{factorKey,params,weight,direction}]
-    method: Mapped[str] = mapped_column(String(24), default="linear")  # equal|ic_weight|linear|random_forest|xgboost
+    method: Mapped[str] = mapped_column(String(24), default="linear")  # equal|ic_weight|linear|random_forest|xgboost|extra_trees|mlp|kernel_ridge|knn|mutual_info|elastic_net（最长 kernel_ridge=12≤24，无迁移）
     config_json: Mapped[str] = mapped_column(Text, default="{}")      # 训练配置 + thresholds
     model_json: Mapped[str] = mapped_column(Text, default="{}")       # weights/importances/normStats/trainerVersion
     metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # 复合得分样本内外 IC
@@ -270,7 +270,7 @@ class WeightModel(Base):
     inst_id: Mapped[str] = mapped_column(String(32))                  # 训练标的
     bar: Mapped[str] = mapped_column(String(8))                       # 周期
     members_json: Mapped[str] = mapped_column(Text, default="[]")     # 自包含成员快照 [{factorKey,params,weight,direction}]
-    method: Mapped[str] = mapped_column(String(24), default="linear")  # equal|ic_weight|linear|random_forest|xgboost
+    method: Mapped[str] = mapped_column(String(24), default="linear")  # equal|ic_weight|linear|random_forest|xgboost|extra_trees|mlp|kernel_ridge|knn|mutual_info|elastic_net（最长 kernel_ridge=12≤24，无迁移）
     config_json: Mapped[str] = mapped_column(Text, default="{}")      # {normWindow,clip,split,horizon,thresholds?...}
     horizon: Mapped[int] = mapped_column(Integer, default=6)          # 前瞻收益根数
     source: Mapped[str] = mapped_column(String(16), default="manual")  # builder | manual（来源标识）
@@ -345,7 +345,7 @@ class WeightTrainRun(Base):
     # ``_ensure_weight_run_columns`` 幂等 ALTER 补齐（否则老库 INSERT ``no such column``，P0/C-2）。
     members_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(16), default="running")  # queued|running|succeeded|failed|cancelled
-    method: Mapped[str] = mapped_column(String(24))
+    method: Mapped[str] = mapped_column(String(24))  # equal|ic_weight|linear|random_forest|xgboost|extra_trees|mlp|kernel_ridge|knn|mutual_info|elastic_net（最长 kernel_ridge=12≤24，无迁移）
     variant_label: Mapped[str] = mapped_column(String(64), default="")   # 同方法多超参变体的显示标签
     inst_id: Mapped[str] = mapped_column(String(32))
     bar: Mapped[str] = mapped_column(String(8))

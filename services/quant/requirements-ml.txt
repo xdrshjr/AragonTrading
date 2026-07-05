@@ -6,5 +6,11 @@
 # 速度的进阶用户按需安装：
 #   pip install -r requirements-ml.txt
 # 体量较大，刻意不进桌面端 PyInstaller 默认冻结包（缺库时内置后端兜底，冻结包环境功能不受影响）。
+#
+# 顶级 · 含非线性模型库（weight-model-nonlinear-trainers）：extra_trees / mlp / kernel_ridge / knn /
+# mutual_info / elastic_net 六款新训练器的库后端**全部落在已列的 scikit-learn**（ExtraTreesRegressor /
+# MLPRegressor / KernelRidge / KNeighborsRegressor / mutual_info_regression / ElasticNet +
+# inspection.permutation_importance），**不新增任何依赖**；缺 sklearn 时各自回落 builtin-et / builtin-mlp /
+# builtin-krr / builtin-knn / builtin-mi / builtin-en 纯 numpy 兜底，冻结包环境功能恒可用不降级。
 scikit-learn==1.6.1
 xgboost==2.1.3

@@ -6,19 +6,15 @@ import { Button, Input, Select } from "@/components/ui";
 import { addMembersCapped, toggleMember, validateMembers } from "@/lib/factor";
 import { factorApi } from "@/lib/factorApi";
 import type { FactorMember, TrainMethod } from "@/lib/factorTypes";
-import { editorToCreateBody } from "@/lib/weightModel";
+import { ALL_METHODS } from "@/lib/weightBatch";
+import { editorToCreateBody, methodDescription, methodLabel } from "@/lib/weightModel";
 import { weightModelApi } from "@/lib/weightModelApi";
 import { useWorkbench } from "./FactorLab";
 import MemberPalette from "./MemberPalette";
 
 const MAX_MEMBERS = 12;
-const METHODS: { value: TrainMethod; label: string }[] = [
-  { value: "linear", label: "线性岭回归" },
-  { value: "equal", label: "等权" },
-  { value: "ic_weight", label: "IC 加权" },
-  { value: "random_forest", label: "随机森林" },
-  { value: "xgboost", label: "XGBoost" },
-];
+// 方法下拉由 ALL_METHODS + methodLabel 派生（单源，消除本地标签重复漂移，评审 v2 P2-3）。
+const METHODS: { value: TrainMethod; label: string }[] = ALL_METHODS.map((m) => ({ value: m, label: methodLabel(m) }));
 
 /**
  * 权重模型编辑器（新建 | 编辑）：成员选择复用 MemberPalette、方法复用既有 METHODS。保存后回列表。
@@ -127,8 +123,8 @@ export default function WeightModelEditor({
         </label>
         <label className="flex flex-col gap-1">
           <span className="text-[11px] text-[var(--muted)]">训练方法</span>
-          <Select value={method} onChange={(e) => setMethod(e.target.value as TrainMethod)} className="py-1 text-xs">
-            {METHODS.map((m) => (<option key={m.value} value={m.value}>{m.label}</option>))}
+          <Select value={method} onChange={(e) => setMethod(e.target.value as TrainMethod)} className="py-1 text-xs" title={methodDescription(method)}>
+            {METHODS.map((m) => (<option key={m.value} value={m.value} title={methodDescription(m.value)}>{m.label}</option>))}
           </Select>
         </label>
         <label className="flex flex-col gap-1">

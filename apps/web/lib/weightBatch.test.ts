@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_THRESHOLDS } from "./factorTypes";
 import type { TrainMetrics } from "./factorTypes";
 import {
+  ALL_METHODS,
+  DEFAULT_BATCH_METHODS,
   allSettled,
   applyCandidateEvent,
   batchDerivedStatus,
@@ -9,6 +11,7 @@ import {
   bestRunId,
   buildBatchTarget,
   emptyCandidate,
+  methodLabel,
   rankCandidates,
 } from "./weightBatch";
 import type { CandidateState } from "./weightBatchTypes";
@@ -23,6 +26,28 @@ function candidate(runId: number, patch: Partial<CandidateState> = {}): Candidat
     ...patch,
   };
 }
+
+describe("ALL_METHODS / DEFAULT_BATCH_METHODS（weight-model-nonlinear-trainers）", () => {
+  it("ALL_METHODS 含 11 款且每款有本地化标签（无回落原始 key）", () => {
+    expect(ALL_METHODS).toHaveLength(11);
+    for (const m of ALL_METHODS) {
+      expect(methodLabel(m)).toBeTruthy();
+      expect(methodLabel(m)).not.toBe(m);
+    }
+  });
+
+  it("ALL_METHODS 含全部 6 款顶级 · 含非线性新方法", () => {
+    for (const m of ["extra_trees", "mlp", "kernel_ridge", "knn", "mutual_info", "elastic_net"] as const) {
+      expect(ALL_METHODS).toContain(m);
+    }
+  });
+
+  it("DEFAULT_BATCH_METHODS 示例取较快的 extra_trees（不含 O(n³) 的 kernel_ridge）", () => {
+    expect(DEFAULT_BATCH_METHODS).toContain("extra_trees");
+    expect(DEFAULT_BATCH_METHODS).not.toContain("kernel_ridge");
+    for (const m of DEFAULT_BATCH_METHODS) expect(ALL_METHODS).toContain(m);
+  });
+});
 
 describe("applyCandidateEvent — 单候选内部事件归约", () => {
   it("run → running；phase → 记录 phase", () => {

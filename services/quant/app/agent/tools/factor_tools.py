@@ -51,7 +51,8 @@ _MAX_HORIZONS = 8
 _MAX_HORIZON_VAL = 100
 _DIRECTION_ENUM = ("long", "short", "auto")
 _FROZEN_DIRECTION_ENUM = ("long", "short")
-_METHOD_ENUM = ("equal", "ic_weight", "linear", "random_forest", "xgboost")
+_METHOD_ENUM = ("equal", "ic_weight", "linear", "random_forest", "xgboost",
+                "extra_trees", "mlp", "kernel_ridge", "knn", "mutual_info", "elastic_net")
 
 
 async def _load_df(args: dict):
@@ -236,9 +237,10 @@ class MineFactorsTool(Tool):
 class TrainFactorWeightsTool(Tool):
     name = "train_factor_weights"
     category = "factor"
-    description = ("对一组因子成员训练组合权重（linear/equal/ic_weight/random_forest/xgboost 均恒可用："
-                  "rf/xgb 缺可选依赖时自动回落内置树集成、装库则加速，经 trainerVersion 如实回报后端），"
-                  "返回权重与样本内/外复合得分 IC（样本外显著低于样本内 = 过拟合风险）。")
+    description = ("对一组因子成员训练组合权重（11 款训练器均恒可用："
+                  "linear/equal/ic_weight/random_forest/xgboost + 顶级含非线性 extra_trees/mlp/kernel_ridge/"
+                  "knn/mutual_info/elastic_net；库缺可选依赖时自动回落内置纯 numpy 兜底、装库则加速，经 "
+                  "trainerVersion 如实回报后端），返回权重与样本内/外复合得分 IC（样本外显著低于样本内 = 过拟合风险）。")
     input_schema = {
         "type": "object",
         "properties": {

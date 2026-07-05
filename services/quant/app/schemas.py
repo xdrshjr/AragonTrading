@@ -1134,9 +1134,18 @@ class FactorMineReq(_FactorRange):
     symbols: list[str] | None = Field(default=None, max_length=100)
 
 
+# 权重训练方法单源（weight-model-nonlinear-trainers §四）：上移集中维护，所有请求体 method 校验共用；
+# 追加 6 款顶级模型（5 非线性 extra_trees/mlp/kernel_ridge/knn/mutual_info + 1 稀疏线性 elastic_net）。
+# 后端训练器双后端恒可用（库缺失走内置 numpy 兜底），故此处 Literal 放开即被接受，不再 422。
+_WEIGHT_METHODS = Literal[
+    "equal", "ic_weight", "linear", "random_forest", "xgboost",
+    "extra_trees", "mlp", "kernel_ridge", "knn", "mutual_info", "elastic_net",
+]
+
+
 class FactorTrainReq(_FactorRange):
     members: list[FactorMemberIn] = Field(min_length=1, max_length=12)
-    method: Literal["equal", "ic_weight", "linear", "random_forest", "xgboost"] = "linear"
+    method: _WEIGHT_METHODS = "linear"
     config: dict[str, Any] = Field(default_factory=dict)
     horizon: int = Field(default=6, ge=1, le=100)
     maxBars: int | None = Field(default=None, ge=10, le=200000)
@@ -1145,7 +1154,7 @@ class FactorTrainReq(_FactorRange):
 class FactorSetCreateReq(BaseModel):
     name: str = Field(min_length=1, max_length=128)
     members: list[FactorMemberIn] = Field(min_length=1, max_length=12)
-    method: Literal["equal", "ic_weight", "linear", "random_forest", "xgboost"] = "linear"
+    method: _WEIGHT_METHODS = "linear"
     modelJson: dict[str, Any] = Field(default_factory=dict)
     metricsJson: dict[str, Any] | None = None
     config: dict[str, Any] = Field(default_factory=dict)
@@ -1155,7 +1164,7 @@ class FactorSetCreateReq(BaseModel):
 class FactorSetUpdateReq(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     members: list[FactorMemberIn] | None = None
-    method: Literal["equal", "ic_weight", "linear", "random_forest", "xgboost"] | None = None
+    method: _WEIGHT_METHODS | None = None
     modelJson: dict[str, Any] | None = None
     metricsJson: dict[str, Any] | None = None
     config: dict[str, Any] | None = None
@@ -1173,7 +1182,7 @@ class FactorScoreInlineReq(_FactorRange):
 
 
 # ---------------- 权重模型工作区（weight-model-workspace §五，流式训练 + 模型管理） ----------------
-_WEIGHT_METHODS = Literal["equal", "ic_weight", "linear", "random_forest", "xgboost"]
+# 注：``_WEIGHT_METHODS`` 单源已上移至 FactorTrainReq 之前集中定义（weight-model-nonlinear-trainers §四）。
 
 
 def weight_train_run_out(row: WeightTrainRun, *, with_curve: bool = True) -> dict:
@@ -1467,7 +1476,7 @@ class WeightExploreStartReq(_FactorRange):
     pool: list[FactorMemberIn] = Field(min_length=1, max_length=12)
     strategy: _EXPLORE_STRATEGIES
     params: dict[str, Any] = Field(default_factory=dict)
-    methods: list[_WEIGHT_METHODS] = Field(min_length=1, max_length=5)
+    methods: list[_WEIGHT_METHODS] = Field(min_length=1, max_length=11)
     config: dict[str, Any] = Field(default_factory=dict)
     horizon: int = Field(default=6, ge=1, le=100)
     factorSetId: int | None = None

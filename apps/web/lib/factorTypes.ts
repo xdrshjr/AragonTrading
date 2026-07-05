@@ -4,7 +4,19 @@
 export type FactorDirection = "long" | "short" | "auto";
 export type FrozenDirection = "long" | "short";
 export type FactorSource = "builtin" | "mined" | "custom";
-export type TrainMethod = "equal" | "ic_weight" | "linear" | "random_forest" | "xgboost";
+// 训练方法（后端 _WEIGHT_METHODS 单源镜像）：核心 5 款 + 顶级 · 含非线性 6 款（weight-model-nonlinear-trainers）。
+export type TrainMethod =
+  | "equal"
+  | "ic_weight"
+  | "linear"
+  | "random_forest"
+  | "xgboost"
+  | "extra_trees"
+  | "mlp"
+  | "kernel_ridge"
+  | "knn"
+  | "mutual_info"
+  | "elastic_net";
 
 // 因子库目录条目（GET /factors/library）。
 export interface FactorLibraryItem {

@@ -130,10 +130,37 @@ const METHOD_LABELS: Record<TrainMethod, string> = {
   ic_weight: "IC 加权",
   random_forest: "随机森林",
   xgboost: "XGBoost",
+  // 顶级 · 含非线性模型库（weight-model-nonlinear-trainers §3.1）：标签单源，编辑器 / 探索 / 竞技场共用。
+  extra_trees: "极端随机树",
+  mlp: "神经网络(MLP)",
+  kernel_ridge: "核岭回归(RBF)",
+  knn: "K近邻回归",
+  mutual_info: "互信息加权",
+  elastic_net: "弹性网络",
+};
+
+// 方法说明（UI tooltip）：非线性体现在「权重学习」，部署组合打分仍线性加权（诚实契约，与后端 note 同口径）。
+const METHOD_DESCRIPTIONS: Record<TrainMethod, string> = {
+  linear: "岭回归闭式解，线性组合权重的稳健基线。",
+  equal: "等权基线，各因子权重相同（零训练）。",
+  ic_weight: "权重 ∝ 各因子与前瞻收益的 RankIC。",
+  random_forest: "随机森林不纯度下降重要度（树装袋）。",
+  xgboost: "梯度提升 gain 重要度（树提升）。",
+  extra_trees: "极端随机树：随机阈值分裂的树装袋，捕捉非线性、方差更低、建树更快。",
+  mlp: "单隐层神经网络置换重要度，捕捉非线性 / 交互依赖。",
+  kernel_ridge: "RBF 核岭回归置换重要度，捕捉平滑非线性关系。",
+  knn: "K 近邻局部非参回归置换重要度，捕捉局部非线性结构。",
+  mutual_info: "逐因子与前瞻收益的互信息，捕捉任意（含非单调）依赖。",
+  elastic_net: "L1+L2 稀疏线性系数，做因子选择、抑制共线性。",
 };
 
 export function methodLabel(method: TrainMethod): string {
   return METHOD_LABELS[method] ?? method;
+}
+
+// 方法说明（tooltip）：未知方法回落方法本地化标签（绝不 undefined）。
+export function methodDescription(method: TrainMethod): string {
+  return METHOD_DESCRIPTIONS[method] ?? methodLabel(method);
 }
 
 // 组信息头部标签（factor-lab-symbol-groups §3.5）：单标的 → instId；标的组 → 「焦点 +K」（title 悬浮全部成员）。

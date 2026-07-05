@@ -14,6 +14,7 @@ import {
 import { factorApi } from "@/lib/factorApi";
 import type { Factor, FactorLibraryItem, FactorMember, TrainMethod } from "@/lib/factorTypes";
 import { ALL_METHODS, methodLabel } from "@/lib/weightBatch";
+import { methodDescription } from "@/lib/weightModel";
 import {
   MAX_EXPLORE_CANDIDATES,
   MAX_EXPLORE_POOL,
@@ -39,7 +40,9 @@ const STRATEGIES: { value: ExploreStrategy; label: string; hint: string }[] = [
   { value: "manual", label: "手动指定", hint: "亲手勾选要对比的具体组合" },
 ];
 
-const DEFAULT_METHODS: TrainMethod[] = ["linear", "random_forest", "xgboost"];
+// 默认探索方法：覆盖线性 / 树集成 + 一款非线性示例；取较快的 extra_trees 而非 O(n³) 的 kernel_ridge，
+// 以免默认探索体感变慢（评审 v2 P2-6）。
+const DEFAULT_METHODS: TrainMethod[] = ["linear", "random_forest", "extra_trees"];
 
 /**
  * 探索训练配置态（factor-combo-exploration §2.7）：编辑因子池 + 组合生成策略 + 训练方法 + 候选数实时预览。
@@ -135,6 +138,7 @@ export default function ExploreConfigPanel({
             return (
               <label
                 key={m}
+                title={methodDescription(m)}
                 className={clsx(
                   "flex cursor-pointer items-center gap-2 rounded-[10px] border px-3 py-1.5 text-xs transition-colors",
                   disabled

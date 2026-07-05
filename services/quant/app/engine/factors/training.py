@@ -21,13 +21,42 @@ import numpy as np
 import pandas as pd
 
 from .evaluation import _pearson, _spearman, forward_return
+from .nonlinear import (
+    BUILTIN_EN_VERSION,
+    BUILTIN_KNN_VERSION,
+    BUILTIN_KRR_VERSION,
+    BUILTIN_MI_VERSION,
+    BUILTIN_MLP_VERSION,
+    EN_MAX_TRAIN_ROWS,
+    KNN_MAX_TRAIN_ROWS,
+    KRR_MAX_TRAIN_ROWS,
+    MI_MAX_TRAIN_ROWS,
+    MLP_MAX_TRAIN_ROWS,
+    PERM_REPEATS,
+    _rbf_gamma,
+    cap_train_rows,
+    fit_elastic_net_coefficients,
+    fit_kernel_ridge_permutation_importances,
+    fit_knn_permutation_importances,
+    fit_mlp_permutation_importances,
+    fit_mutual_info_importances,
+    resolve_en_params,
+    resolve_knn_params,
+    resolve_krr_params,
+    resolve_mi_params,
+    resolve_mlp_params,
+)
 from .scoring import DEFAULT_CLIP, DEFAULT_NORM_WINDOW, causal_zscore, directional_values, member_names
 from .tree_ensemble import (
+    BUILTIN_ET_VERSION,
     BUILTIN_GBDT_VERSION,
+    BUILTIN_MAX_TRAIN_ROWS,
     BUILTIN_RF_VERSION,
     BUILTIN_SEED,
+    ET_DEFAULTS,
     GBDT_DEFAULTS,
     RF_DEFAULTS,
+    fit_extra_trees_importances,
     fit_gbdt_importances,
     fit_rf_importances,
     resolve_tree_params,
@@ -203,6 +232,125 @@ def _fit_gbdt_builtin(x_train: np.ndarray, y_train: np.ndarray, config: dict) ->
         seed=BUILTIN_SEED)
 
 
+# ---------------- 新增顶级训练器（5 非线性 + 1 稀疏线性，weight-model-nonlinear-trainers §3.2/§3.4） ----------------
+# 成本护栏对齐两后端（评审 v2 P1-2）：每个 ``_fit_*_sklearn`` 入口先按各自 ``*_MAX_TRAIN_ROWS`` 行封顶
+# （``training.py`` 框架层把整段 ``aligned_x[:cut]`` 原样传后端、并不封顶），令库/内置成本上界一致。
+# 确定性对齐两后端（评审 v2 P1-1）：凡含随机性的 sklearn 估计器一律显式播种 ``random_state=BUILTIN_SEED``。
+def _sklearn_perm_importance(model, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """无原生逐特征重要度的库模型（mlp/kernel_ridge/knn）走 sklearn 置换重要度；显式 ``random_state`` 保确定性。"""
+    from sklearn.inspection import permutation_importance as sk_permutation_importance
+
+    result = sk_permutation_importance(model, x, y, n_repeats=PERM_REPEATS, random_state=BUILTIN_SEED)
+    return np.clip(np.asarray(result.importances_mean, dtype=float), 0.0, None)
+
+
+def _fit_extra_trees_sklearn(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """sklearn 极端随机树 → feature_importances_（库后端；行封顶 4000 对齐内置，评审 P1-2）。"""
+    from sklearn.ensemble import ExtraTreesRegressor
+
+    x, y = cap_train_rows(x_train, y_train, BUILTIN_MAX_TRAIN_ROWS)
+    params = resolve_tree_params(config, ET_DEFAULTS)
+    model = ExtraTreesRegressor(
+        n_estimators=params["n_estimators"], max_depth=params["max_depth"],
+        min_samples_leaf=params["min_samples_leaf"], random_state=0, n_jobs=-1)
+    model.fit(x, y)
+    return np.asarray(model.feature_importances_, dtype=float)
+
+
+def _fit_extra_trees_builtin(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """内置纯 numpy 极端随机树重要度（恒可用兜底；缺 sklearn 时生效）。"""
+    params = resolve_tree_params(config, ET_DEFAULTS)
+    return fit_extra_trees_importances(
+        x_train, y_train, n_estimators=params["n_estimators"], max_depth=params["max_depth"],
+        min_samples_leaf=params["min_samples_leaf"], seed=BUILTIN_SEED)
+
+
+def _fit_mlp_sklearn(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """sklearn MLP → 置换重要度（库后端；tanh 单隐层，行封顶 4000，random_state=0）。"""
+    from sklearn.neural_network import MLPRegressor
+
+    x, y = cap_train_rows(x_train, y_train, MLP_MAX_TRAIN_ROWS)
+    params = resolve_mlp_params(config)
+    model = MLPRegressor(
+        hidden_layer_sizes=(params["hidden"],), activation="tanh", solver="adam",
+        alpha=params["l2"], learning_rate_init=params["lr"], max_iter=params["epochs"], random_state=0)
+    model.fit(x, y)
+    return _sklearn_perm_importance(model, x, y)
+
+
+def _fit_mlp_builtin(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """内置纯 numpy MLP 置换重要度（恒可用兜底；缺 sklearn 时生效）。"""
+    return fit_mlp_permutation_importances(x_train, y_train, seed=BUILTIN_SEED, **resolve_mlp_params(config))
+
+
+def _fit_kernel_ridge_sklearn(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """sklearn 核岭回归(RBF) → 置换重要度（库后端；O(n³) 行封顶收紧到 1200，评审 P1-2）。"""
+    from sklearn.kernel_ridge import KernelRidge
+
+    x, y = cap_train_rows(x_train, y_train, KRR_MAX_TRAIN_ROWS)
+    params = resolve_krr_params(config)
+    gamma = _rbf_gamma(x) if params["gamma"] is None else params["gamma"]   # 与内置同 scale 口径
+    model = KernelRidge(kernel="rbf", alpha=params["alpha"], gamma=gamma)
+    model.fit(x, y)
+    return _sklearn_perm_importance(model, x, y)
+
+
+def _fit_kernel_ridge_builtin(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """内置纯 numpy 核岭回归置换重要度（恒可用兜底；缺 sklearn 时生效）。"""
+    return fit_kernel_ridge_permutation_importances(
+        x_train, y_train, seed=BUILTIN_SEED, **resolve_krr_params(config))
+
+
+def _fit_knn_sklearn(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """sklearn K 近邻回归 → 置换重要度（库后端；行封顶 2500，k 钳到 n−1，评审 P2-5）。"""
+    from sklearn.neighbors import KNeighborsRegressor
+
+    x, y = cap_train_rows(x_train, y_train, KNN_MAX_TRAIN_ROWS)
+    params = resolve_knn_params(config)
+    k = max(1, min(params["k"], x.shape[0] - 1))
+    model = KNeighborsRegressor(n_neighbors=k)
+    model.fit(x, y)
+    return _sklearn_perm_importance(model, x, y)
+
+
+def _fit_knn_builtin(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """内置纯 numpy K 近邻留一置换重要度（恒可用兜底；缺 sklearn 时生效）。"""
+    return fit_knn_permutation_importances(x_train, y_train, seed=BUILTIN_SEED, **resolve_knn_params(config))
+
+
+def _fit_mutual_info_sklearn(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """sklearn 互信息回归 → 逐因子 MI（库后端；**必须显式 random_state=0**，否则 kNN 型 MI 非确定性，评审 P1-1）。"""
+    from sklearn.feature_selection import mutual_info_regression
+
+    _ = config
+    x, y = cap_train_rows(x_train, y_train, MI_MAX_TRAIN_ROWS)
+    mi = mutual_info_regression(x, y, random_state=BUILTIN_SEED)
+    return np.clip(np.asarray(mi, dtype=float), 0.0, None)
+
+
+def _fit_mutual_info_builtin(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """内置纯 numpy 直方图互信息（恒可用兜底；缺 sklearn 时生效；天然确定性）。"""
+    return fit_mutual_info_importances(x_train, y_train, seed=BUILTIN_SEED, **resolve_mi_params(config))
+
+
+def _fit_elastic_net_sklearn(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """sklearn 弹性网络 → |coef|（库后端；cyclic 更新确定性，行封顶 4000）。返回带符号系数，_normalize_weights 保号。"""
+    from sklearn.linear_model import ElasticNet
+
+    x, y = cap_train_rows(x_train, y_train, EN_MAX_TRAIN_ROWS)
+    params = resolve_en_params(config)
+    model = ElasticNet(
+        alpha=params["alpha"], l1_ratio=params["l1_ratio"],
+        max_iter=params["max_iter"], tol=params["tol"], selection="cyclic")
+    model.fit(x, y)
+    return np.asarray(model.coef_, dtype=float)
+
+
+def _fit_elastic_net_builtin(x_train: np.ndarray, y_train: np.ndarray, config: dict) -> np.ndarray:
+    """内置纯 numpy 坐标下降弹性网络系数（恒可用兜底；缺 sklearn 时生效）。"""
+    return fit_elastic_net_coefficients(x_train, y_train, seed=BUILTIN_SEED, **resolve_en_params(config))
+
+
 def _library_version(module: str) -> str:
     """库后端版本标签（如 ``"sklearn 1.6.1"``）；导入失败回退裸模块名（resolve 后调用，通常已在场）。"""
     try:
@@ -227,6 +375,32 @@ TRAINERS: dict[str, Trainer] = {
     "xgboost": Trainer((
         Backend(_fit_xgb_native, "library", "xgboost", lambda: _library_version("xgboost")),
         Backend(_fit_gbdt_builtin, "builtin", None, lambda: BUILTIN_GBDT_VERSION),
+    )),
+    # 顶级 · 含非线性模型库（weight-model-nonlinear-trainers）：库后端全落已列 scikit-learn、均有纯 numpy 兜底，
+    # 故目录中 available 恒 True（library 或 builtin），与 rf/xgb 现状一致。
+    "extra_trees": Trainer((
+        Backend(_fit_extra_trees_sklearn, "library", "sklearn", lambda: _library_version("sklearn")),
+        Backend(_fit_extra_trees_builtin, "builtin", None, lambda: BUILTIN_ET_VERSION),
+    )),
+    "mlp": Trainer((
+        Backend(_fit_mlp_sklearn, "library", "sklearn", lambda: _library_version("sklearn")),
+        Backend(_fit_mlp_builtin, "builtin", None, lambda: BUILTIN_MLP_VERSION),
+    )),
+    "kernel_ridge": Trainer((
+        Backend(_fit_kernel_ridge_sklearn, "library", "sklearn", lambda: _library_version("sklearn")),
+        Backend(_fit_kernel_ridge_builtin, "builtin", None, lambda: BUILTIN_KRR_VERSION),
+    )),
+    "knn": Trainer((
+        Backend(_fit_knn_sklearn, "library", "sklearn", lambda: _library_version("sklearn")),
+        Backend(_fit_knn_builtin, "builtin", None, lambda: BUILTIN_KNN_VERSION),
+    )),
+    "mutual_info": Trainer((
+        Backend(_fit_mutual_info_sklearn, "library", "sklearn", lambda: _library_version("sklearn")),
+        Backend(_fit_mutual_info_builtin, "builtin", None, lambda: BUILTIN_MI_VERSION),
+    )),
+    "elastic_net": Trainer((
+        Backend(_fit_elastic_net_sklearn, "library", "sklearn", lambda: _library_version("sklearn")),
+        Backend(_fit_elastic_net_builtin, "builtin", None, lambda: BUILTIN_EN_VERSION),
     )),
 }
 
@@ -379,7 +553,8 @@ def train_weights(matrix: np.ndarray, label: np.ndarray, names: list[str], *,
 
     Args:
         matrix / label / names: ``build_factor_matrix`` 与 ``forward_return_label`` 产物。
-        method: equal | ic_weight | linear | random_forest | xgboost。
+        method: equal | ic_weight | linear | random_forest | xgboost | extra_trees | mlp |
+            kernel_ridge | knn | mutual_info | elastic_net（后 6 款为顶级 · 含非线性模型库，双后端恒可用）。
         config: 训练配置（split / l2 / nEstimators / maxDepth 等）。
         norm_stats: 归一化契约参数（透传进结果，供打分端取同窗口）。
 
