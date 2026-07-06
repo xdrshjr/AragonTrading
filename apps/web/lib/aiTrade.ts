@@ -141,6 +141,35 @@ export function describeConsensus(consensus: Consensus | null | undefined): stri
 }
 
 export type AiExecTone = "long" | "short" | "muted";
+export type AiTraceTone = AiExecTone | "accent";
+
+export interface AiTraceStateChip {
+  label: string; // 研判中… / 已执行 / 已决策 / 降级观望 / 已跳过 / 异常
+  tone: AiTraceTone;
+}
+
+/**
+ * 轮次状态 chip（轨迹轮头右上角）：把已装配轮次的 state + 执行/降级归一为一枚状态徽标。
+ * 优先级：异常 > 已跳过 > 研判中（deciding）> 降级观望（degradeReason）> 已执行（traded，按方向着色）> 已决策。
+ */
+export function describeTraceState(trace: {
+  state: string;
+  toolCall?: { action?: string } | null;
+  executed?: AiTradeDecision["executed"];
+  degradeReason?: string | null;
+}): AiTraceStateChip {
+  if (trace.state === "error") return { label: "异常", tone: "short" };
+  if (trace.state === "skipped") return { label: "已跳过", tone: "muted" };
+  if (trace.state === "deciding") return { label: "研判中…", tone: "accent" };
+  if (trace.degradeReason) return { label: "降级观望", tone: "short" };
+  if (trace.executed?.traded) {
+    const action = trace.toolCall?.action;
+    const tone: AiTraceTone =
+      action === "open_long" ? "long" : action === "open_short" ? "short" : "muted";
+    return { label: "已执行", tone };
+  }
+  return { label: "已决策", tone: "muted" };
+}
 
 export interface AiExecutedView {
   label: string;    // 已成交 / 已跳过 / 已降级观望（reason） / 观望

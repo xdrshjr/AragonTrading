@@ -5,9 +5,11 @@ import { useEffect } from "react";
 import { aiTradeApi, aiTradeWS } from "./aiTradeApi";
 import type {
   AiTradeDecision,
+  AiTradeRoundTrace,
   AiTradeSessionRow,
   AiTradeSnapshot,
   AiTradeStatusEvent,
+  AiTradeTraceEvent,
 } from "./aiTradeTypes";
 import { useAppStore } from "./store";
 import type { PaperPositionEvent, Trade } from "./types";
@@ -24,6 +26,8 @@ export function useAiTradeStream() {
   const setAiTradePosition = useAppStore((s) => s.setAiTradePosition);
   const pushAiTradeDecision = useAppStore((s) => s.pushAiTradeDecision);
   const setAiTradeDecisions = useAppStore((s) => s.setAiTradeDecisions);
+  const setAiTradeTraces = useAppStore((s) => s.setAiTradeTraces);
+  const upsertAiTradeTracePhase = useAppStore((s) => s.upsertAiTradeTracePhase);
   const setAiTradeSummary = useAppStore((s) => s.setAiTradeSummary);
 
   // 重发现：实盘模式下拉活跃 AI 会话，重建瞬态运行期态（已有同会话本地态则不覆盖成交流）。
@@ -56,6 +60,8 @@ export function useAiTradeStream() {
         setAiTradePosition,
         pushAiTradeDecision,
         setAiTradeDecisions,
+        setAiTradeTraces,
+        upsertAiTradeTracePhase,
         setAiTradeSummary,
       }),
     );
@@ -69,6 +75,8 @@ export function useAiTradeStream() {
     setAiTradePosition,
     pushAiTradeDecision,
     setAiTradeDecisions,
+    setAiTradeTraces,
+    upsertAiTradeTracePhase,
     setAiTradeSummary,
   ]);
 }
@@ -80,6 +88,8 @@ interface AiTradeSetters {
   setAiTradePosition: (pos: PaperPositionEvent | null) => void;
   pushAiTradeDecision: (decision: AiTradeDecision) => void;
   setAiTradeDecisions: (decisions: AiTradeDecision[]) => void;
+  setAiTradeTraces: (traces: AiTradeRoundTrace[]) => void;
+  upsertAiTradeTracePhase: (evt: AiTradeTraceEvent) => void;
   setAiTradeSummary: (summary: string | null) => void;
 }
 
@@ -90,10 +100,14 @@ function routeEvent(event: WsEvent, setters: AiTradeSetters) {
       setters.setAiTradeTrades(snap.trades ?? []);
       setters.setAiTradePosition((snap.position as PaperPositionEvent) ?? null);
       setters.setAiTradeDecisions(snap.decisions ?? []);
+      setters.setAiTradeTraces(snap.agentTraces ?? []);
       setters.setAiTradeSummary(snap.contextSummary ?? null);
       if (snap.status) setters.patchAiTradeSession(snap.status as Partial<AiTradeSessionRow>);
       return;
     }
+    case "agent_trace":
+      setters.upsertAiTradeTracePhase(event.data as AiTradeTraceEvent);
+      return;
     case "trade":
       setters.appendAiTradeTrade(event.data as Trade);
       return;

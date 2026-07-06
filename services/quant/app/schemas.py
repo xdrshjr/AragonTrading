@@ -391,6 +391,28 @@ class AiTradeDecisionOut(BaseModel):
     degradeReason: str | None = None    # E3：安全回落/共识门禁原因（low_consensus(k/n)/decision_timeout/…）
 
 
+class AiTradeRoundTraceOut(BaseModel):
+    """快照 agentTraces 的单轮已装配决策轨迹（ai-auto-trading-agent-trace §5.4）。
+
+    契约 / 文档镜像：真正 WS `agent_trace` 事件与 `snapshot.agentTraces` 由 session 手工构 dict、
+    不经本模型序列化（沿用 `AiTradeDecisionOut` 既有「文档镜像」范式）。
+    """
+    round: int
+    ts: int
+    lastPx: float | None = None
+    position: dict | None = None
+    signalBoard: list[StrategySignalViewOut] = Field(default_factory=list)
+    marketContext: dict | None = None
+    consensus: dict | None = None
+    thinking: str = ""
+    analysis: str = ""
+    toolCall: dict | None = None
+    executed: dict | None = None
+    degradeReason: str | None = None
+    summary: str | None = None
+    state: str = "deciding"     # deciding|done|skipped|error
+
+
 class AiTradeSessionRow(BaseModel):
     sessionId: str
     runId: int

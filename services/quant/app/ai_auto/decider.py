@@ -39,6 +39,7 @@ from .prompts import (
     build_summary_prompt,
     build_summary_system_prompt,
 )
+from .trace import TraceEmit, _TraceCoalescer
 
 logger = logging.getLogger(__name__)
 
@@ -94,12 +95,17 @@ class AiTradeDecider:
         return self._rounds_since_summary
 
     # ---------- 决策 ----------
-    async def decide(self, payload: dict) -> tuple[TradeDecision, str | None]:
-        """出本轮决策；返回 `(decision, degrade_reason)`——degrade_reason 非 None 表示安全回落 hold。"""
+    async def decide(self, payload: dict, *, emit: TraceEmit | None = None
+                     ) -> tuple[TradeDecision, str | None]:
+        """出本轮决策；返回 `(decision, degrade_reason)`——degrade_reason 非 None 表示安全回落 hold。
+
+        可选 `emit`（由 session 注入）承接决策器流式认知（分析 / 思考 / 工具起始）经合并后扇出；
+        默认 `None` 保证回测 / 单测等既有位置调用零改动、零回归（合并器全程空转，行为逐字不变）。
+        """
         user_msg = LlmMessage("user", [TextBlock(build_decision_prompt(payload))])
         try:
             raw = await asyncio.wait_for(
-                self._stream_decision(user_msg),
+                self._stream_decision(user_msg, emit),
                 timeout=self.settings.ai_trade_decision_timeout_s)
         except asyncio.TimeoutError:
             return _hold("decision_timeout"), "decision_timeout"
@@ -108,22 +114,36 @@ class AiTradeDecider:
             return _hold("llm_error"), "llm_error"
         return self._map_decision(raw)
 
-    async def _stream_decision(self, user_msg: LlmMessage) -> dict | None:
-        """流式累积首个 `submit_trade_decision` 的 partial_json 并解析（P1-5）；无工具调用→None。"""
+    async def _stream_decision(self, user_msg: LlmMessage,
+                               emit: TraceEmit | None = None) -> dict | None:
+        """流式累积首个 `submit_trade_decision` 的 partial_json 并解析（P1-5）；无工具调用→None。
+
+        旁路：text_delta（分析）/ thinking_delta（深度思考）经 `_TraceCoalescer` 合并后 `emit`；
+        `emit is None` 时合并器空转，取工具入参逻辑与今日逐字不变（安全契约不受影响）。
+        """
         accs: dict[str, dict] = {}
         order: list[str] = []
+        pump = _TraceCoalescer(emit)             # emit=None → 全程空转（回测 / 单测无订阅）
         async for ev in self._llm.stream(system=self.system_prompt,
                                           messages=self._context + [user_msg],
                                           tools=[self._tool]):
-            if ev.kind == "tool_use_start":
+            if ev.kind == "text_delta":
+                await pump.feed("analysis", ev.text or "")
+            elif ev.kind == "thinking_delta":
+                await pump.feed("thinking", ev.text or "")
+            elif ev.kind == "tool_use_start":
+                await pump.flush()               # 文本段结束，先冲刷再发工具起始占位
                 accs[ev.id] = {"name": ev.name or "", "parts": []}
                 order.append(ev.id)
+                await pump.mark(ev.name or "")
             elif ev.kind == "tool_use_args_delta":
                 if ev.id in accs:
                     accs[ev.id]["parts"].append(ev.partial_json or "")
             elif ev.kind == "error":
+                await pump.flush()
                 raise RuntimeError(ev.message or ev.code or "LLM_ERROR")
             elif ev.kind == "message_done":
+                await pump.flush()
                 break
         for tid in order:                       # 取首条有效 submit_trade_decision（多调用取其一）
             if accs[tid]["name"] == DECISION_TOOL_NAME:

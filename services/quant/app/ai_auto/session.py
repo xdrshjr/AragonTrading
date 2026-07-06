@@ -32,6 +32,7 @@ from ..strategies.base import Signal
 from .decider import AiTradeDecider, TradeDecision
 from .market_context import build_market_context
 from .market_window import MarketWindow
+from .prompts import DECISION_TOOL_NAME
 from .signals import (
     Consensus,
     StrategySignalView,
@@ -41,6 +42,7 @@ from .signals import (
     evaluate_signal_board,
     make_shadow_broker,
 )
+from .trace import _TRACES_MAX, TraceEmit, new_round_trace, trace_event
 
 _SNAPSHOT_EQUITY_MAX = 1000
 _DECISIONS_MAX = 50
@@ -98,6 +100,9 @@ class AiTradeSession:
         self._peak_equity = executor.budget_usd
         self._decisions: deque[dict] = deque(maxlen=_DECISIONS_MAX)
         self._last_decision: dict | None = None
+        # 决策认知轨迹（ai-auto-trading-agent-trace §3.3）：瞬态环形，仅内存 / 快照回放。
+        self._traces: deque[dict] = deque(maxlen=_TRACES_MAX)
+        self._round_trace: dict | None = None   # 当前在飞轮次（原地累积；snapshot 出口防御性拷贝冻结）
         self._subscribers: set[asyncio.Queue] = set()
         self._ws: OKXWSClient | None = None
 
@@ -318,18 +323,22 @@ class AiTradeSession:
 
     async def _run_decision_round(self, board: list[StrategySignalView], i: int,
                                   ref_px: float, ts: int) -> None:
-        """一个决策轮：装配输入 → AI 决策 → 映射 Signal 守护执行 → 记录/摘要 → 推事件。"""
+        """一个决策轮：装配输入 → AI 决策 → 映射 Signal 守护执行 → 记录/摘要 → 推事件（含认知轨迹）。"""
+        round_no = self.rounds_completed + 1     # RV-5：try 之前绑定，except 可安全引用
         try:
-            round_no = self.rounds_completed + 1
             payload = self._build_decision_payload(round_no, ts, ref_px, board)
             consensus = compute_consensus(board)                 # E2：每轮只算一次（供门禁 + wire）
             payload["consensus"] = self._consensus_wire(consensus)
-            decision, degrade = await self.decider.decide(payload)
+            await self._begin_round_trace(round_no, ts, ref_px, payload, board)  # RV-7：consensus 之后
+            decision, degrade = await self.decider.decide(
+                payload, emit=self._make_trace_emit(round_no, ts))
             decision, degrade = self._apply_consensus_gate(decision, consensus, degrade)  # E2 门禁
             executed = await self._execute_decision(decision, ref_px, i, ts)
             self.rounds_completed = round_no
             # R-P1-3：commit_round 收门禁后的最终 decision，journal/摘要据此记真实动作（保持上下文纯净）。
             summary = await self.decider.commit_round(payload, decision, executed)
+            await self._emit_tool_call_trace(round_no, ts, decision)
+            await self._emit_result_trace(round_no, ts, executed, degrade)
             await self._emit_decision(round_no, ts, decision, board, executed,
                                       market_context=payload.get("marketContext"),
                                       consensus=payload.get("consensus"),
@@ -337,16 +346,85 @@ class AiTradeSession:
             if degrade:
                 await self._emit_degraded(ts, degrade)
             if summary is not None:
+                await self._emit_summary_trace(round_no, ts, summary)
                 await self._emit_summary(round_no, ts, summary)
             await self._post_round(ref_px, ts)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 —— 决策轮异常不崩会话：记 error 事件，等下一根
             logger.warning("ai-trade decision round failed: %s", exc)
+            await self._emit_error_trace(round_no, ts, "本轮决策异常，已跳过")
             await self._push({"type": "error", "data": {
                 "ts": ts, "code": "AI_TRADE_ROUND_FAILED", "message": "本轮决策异常，已跳过"}})
         finally:
             self._deciding = False
+
+    # ---------- 决策认知轨迹（ai-auto-trading-agent-trace §3.3）----------
+    async def _begin_round_trace(self, round_no: int, ts: int, ref_px: float,
+                                 payload: dict, board: list[StrategySignalView]) -> None:
+        """round_start：装配在飞轮次（引用入环、后续原地累积）+ 推输入快照（RV-7：须在 consensus 之后）。"""
+        slim = [self._view_slim(v) for v in board]
+        self._round_trace = new_round_trace(round_no, ts, ref_px, payload, slim)
+        self._traces.append(self._round_trace)
+        trace = self._round_trace
+        await self._push(trace_event(
+            "round_start", round_no, ts, lastPx=ref_px, position=trace["position"],
+            signalBoard=trace["signalBoard"], marketContext=trace["marketContext"],
+            consensus=trace["consensus"]))
+
+    def _make_trace_emit(self, round_no: int, ts: int) -> TraceEmit:
+        """返回注入 decider 的 emit 闭包：补 round/ts、原地累积 thinking/analysis、扇出 agent_trace。"""
+        async def _emit(part: dict) -> None:
+            phase = part.get("phase")
+            data = {"phase": phase, "round": round_no, "ts": ts}
+            trace = self._round_trace
+            delta = part.get("delta")
+            if delta is not None:
+                data["delta"] = delta
+                if trace is not None and phase in ("thinking", "analysis"):
+                    trace[phase] += delta
+            name = part.get("name")
+            if name is not None:
+                data["name"] = name
+                if trace is not None and phase == "tool_call_start":
+                    trace["toolCallPending"] = True
+            await self._push({"type": "agent_trace", "data": data})
+        return _emit
+
+    async def _emit_tool_call_trace(self, round_no: int, ts: int,
+                                    decision: TradeDecision) -> None:
+        """tool_call：门禁后最终决策工具入参（与真实执行一致，降级则如实呈现 hold）。"""
+        tool_input = {"action": decision.action, "sizeFraction": decision.size_fraction,
+                      "confidence": decision.confidence, "reason": decision.reason}
+        if self._round_trace is not None:
+            self._round_trace["toolCall"] = tool_input
+            self._round_trace["toolCallPending"] = False
+        await self._push(trace_event("tool_call", round_no, ts,
+                                     name=DECISION_TOOL_NAME, input=tool_input))
+
+    async def _emit_result_trace(self, round_no: int, ts: int, executed: dict,
+                                 degrade: str | None) -> None:
+        """result：守护执行结果 + 降级原因；state=skipped→"skipped"，否则"done"。"""
+        state = "skipped" if executed.get("skipped") else "done"
+        if self._round_trace is not None:
+            self._round_trace["executed"] = executed
+            self._round_trace["degradeReason"] = degrade
+            self._round_trace["state"] = state
+        await self._push(trace_event("result", round_no, ts,
+                                     executed=executed, degradeReason=degrade))
+
+    async def _emit_summary_trace(self, round_no: int, ts: int, summary: str) -> None:
+        """summary：到期上下文刷新（历史执行摘要），呼应「上下文纯净」机制（G2）。"""
+        if self._round_trace is not None:
+            self._round_trace["summary"] = summary
+        await self._push(trace_event("summary", round_no, ts, summary=summary))
+
+    async def _emit_error_trace(self, round_no: int, ts: int, message: str) -> None:
+        """error：本轮决策异常兜底（不崩会话），state="error"。"""
+        if self._round_trace is not None:
+            self._round_trace["errorMessage"] = message
+            self._round_trace["state"] = "error"
+        await self._push(trace_event("error", round_no, ts, message=message))
 
     def _apply_consensus_gate(self, decision: TradeDecision, consensus: Consensus,
                               degrade: str | None) -> tuple[TradeDecision, str | None]:
@@ -532,12 +610,16 @@ class AiTradeSession:
 
     def snapshot(self) -> dict:
         mark = self._ref_px()
+        # RV-1：在飞轮 _round_trace 是被原地 mutate 的引用；对每轮做浅拷贝（顶层键即冻结，
+        # thinking/analysis 为不可变 str 且 mutate 走键重绑定，不回灌拷贝出的 dict），避免快照握手
+        # await 期间决策任务续写导致重连客户端对同段文字二次追加（每段增量恰好下发一次）。
         return {"trades": list(self.executor.trades),
                 "equity": list(self._equity),
                 "position": self.executor.position_payload(mark),
                 "status": self._status_payload(),
                 "decisions": list(self._decisions),
-                "contextSummary": self.decider.summary}
+                "contextSummary": self.decider.summary,
+                "agentTraces": [dict(t) for t in self._traces]}
 
     def info(self) -> dict:
         return {"sessionId": self.session_id, "runId": self.run_id, "state": self.state,

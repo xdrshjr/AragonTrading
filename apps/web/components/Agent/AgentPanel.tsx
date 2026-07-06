@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui";
 import { applyShowChart } from "@/lib/agentActions";
 import { agentApi } from "@/lib/agentApi";
@@ -24,7 +24,10 @@ import AgentComposer from "./AgentComposer";
 import AgentEmptyState from "./AgentEmptyState";
 import AgentMessageList from "./AgentMessageList";
 import AgentUnconfigured from "./AgentUnconfigured";
+import AiTradeAgentTrace from "./AiTradeAgentTrace";
 import AiTradeToggle from "./AiTradeToggle";
+
+type PanelView = "chat" | "aitrade";
 
 interface AgentConfig {
   configured: boolean;
@@ -55,6 +58,12 @@ function newUserId(): string {
 export default function AgentPanel() {
   const conversationId = useAppStore((s) => s.agentConversationId);
   const newConversation = useAppStore((s) => s.newConversation);
+  // AI 自动交易「决策执行轨迹」视图（ai-auto-trading-agent-trace §3.7）：与交互式对话共存的分段视图。
+  const aiTradeSession = useAppStore((s) => s.aiTradeSession);
+  const aiTradeTraces = useAppStore((s) => s.aiTradeTraces);
+  const [panelView, setPanelView] = useState<PanelView>("chat");
+  // 记忆「已自动切入过」的 sessionId：自动切换每会话仅一次，之后尊重用户手动来回切换（R7）。
+  const autoSwitchedRef = useRef<string | null>(null);
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [config, setConfig] = useState<AgentConfig | null>(null);
@@ -89,6 +98,20 @@ export default function AgentPanel() {
   useEffect(() => {
     if (!conversationId) newConversation();
   }, [conversationId, newConversation]);
+
+  // AI 自动交易会话出现→自动切入「执行轨迹」（每 sessionId 仅一次）；清空→回落「对话」（R7）。
+  const aiTradeSessionId = aiTradeSession?.sessionId ?? null;
+  useEffect(() => {
+    if (aiTradeSessionId) {
+      if (autoSwitchedRef.current !== aiTradeSessionId) {
+        autoSwitchedRef.current = aiTradeSessionId;
+        setPanelView("aitrade");
+      }
+    } else {
+      autoSwitchedRef.current = null;
+      setPanelView("chat");
+    }
+  }, [aiTradeSessionId]);
 
   // 缓冲空洞兜底（RS-11 gap）：经既有 REST 拉权威历史重建（零新端点，最终一致）。
   const reconcileViaRest = useCallback(async () => {
@@ -279,6 +302,8 @@ export default function AgentPanel() {
   }, [running, newConversation]);
 
   const unconfigured = config !== null && !config.configured;
+  // RV-8：会话存在时 aitrade 视图优先于 unconfigured 空态渲染（后端 LLM 必已配置，否则会话无法启动）。
+  const showTrace = panelView === "aitrade" && !!aiTradeSession;
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -301,8 +326,33 @@ export default function AgentPanel() {
         </div>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-y-auto">
-        {unconfigured ? (
+      {aiTradeSession && (
+        <div
+          role="tablist"
+          aria-label="AI 助手视图"
+          className="flex items-center gap-1 border-b border-[var(--border)] px-3 py-1.5"
+        >
+          <ViewTab active={panelView === "chat"} onClick={() => setPanelView("chat")}>
+            对话
+          </ViewTab>
+          <ViewTab active={panelView === "aitrade"} onClick={() => setPanelView("aitrade")}>
+            <span className="flex items-center gap-1.5">
+              执行轨迹
+              {aiTradeSession.state === "running" && (
+                <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--long)]" />
+              )}
+              <span className="tabular rounded-full bg-[var(--surface)] px-1.5 text-[10px] text-[var(--muted)]">
+                第 {aiTradeSession.roundsCompleted ?? 0} 轮
+              </span>
+            </span>
+          </ViewTab>
+        </div>
+      )}
+
+      <div className={`min-h-0 flex-1 ${showTrace ? "" : "overflow-y-auto"}`}>
+        {showTrace ? (
+          <AiTradeAgentTrace session={aiTradeSession} traces={aiTradeTraces} />
+        ) : unconfigured ? (
           <AgentUnconfigured provider={config.provider} model={config.model} />
         ) : messages.length === 0 ? (
           <AgentEmptyState onPick={send} />
@@ -311,7 +361,7 @@ export default function AgentPanel() {
         )}
       </div>
 
-      {error && (
+      {error && !showTrace && (
         <div className="flex items-center justify-between gap-2 border-t border-[var(--border)] bg-[color-mix(in_srgb,var(--short)_10%,transparent)] px-3 py-1.5 text-[11px] text-[var(--short)]">
           <span className="min-w-0 flex-1 truncate">{error}</span>
           {lastUserTextRef.current && !running && (
@@ -326,7 +376,7 @@ export default function AgentPanel() {
         </div>
       )}
 
-      {!unconfigured && (
+      {!unconfigured && !showTrace && (
         <AgentComposer
           value={input}
           onChange={setInput}
@@ -338,5 +388,32 @@ export default function AgentPanel() {
         />
       )}
     </div>
+  );
+}
+
+/** 视图分段按钮（对话 / 执行轨迹）：置于标题行下方子行，与既有 AiTradeToggle 启停开关区分（RV-3）。 */
+function ViewTab({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={active}
+      onClick={onClick}
+      className={`rounded-[7px] px-2 py-1 text-[11px] font-medium transition-colors duration-150 ease-smooth ${
+        active
+          ? "bg-[var(--surface-2)] text-[var(--text)]"
+          : "text-[var(--muted)] hover:text-[var(--text)]"
+      }`}
+    >
+      {children}
+    </button>
   );
 }

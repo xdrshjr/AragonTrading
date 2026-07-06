@@ -46,6 +46,7 @@ export interface AiTradeDecision {
   signalBoard: StrategySignalView[];
   executed?: {
     ok?: boolean;
+    action?: string;                        // 门禁后最终动作（后端 _execute_decision 回带；与 wire §5.1 一致）
     skipped?: boolean;
     traded?: boolean;
     reason?: string;
@@ -56,6 +57,61 @@ export interface AiTradeDecision {
   marketContext?: MarketContext | null;   // E1（可为 null）
   consensus?: Consensus | null;           // E2
   degradeReason?: string | null;          // E3（low_consensus(k/n) / decision_timeout / … 或 null）
+}
+
+// 决策认知轨迹阶段（ai-auto-trading-agent-trace §5.3；与后端 trace.PHASES 镜像）。
+export type AiTradeTracePhase =
+  | "round_start"
+  | "thinking"
+  | "analysis"
+  | "tool_call_start"
+  | "tool_call"
+  | "result"
+  | "summary"
+  | "error";
+
+// agent_trace 事件 data（各字段按 phase 可选；前端 reducer 按 phase 归约）。
+export interface AiTradeTraceEvent {
+  phase: AiTradeTracePhase;
+  round: number;
+  ts: number;
+  delta?: string; // thinking / analysis 合并增量
+  name?: string; // tool_call_start / tool_call 工具名
+  input?: {
+    action: AiTradeAction;
+    sizeFraction?: number | null;
+    confidence?: number | null;
+    reason: string;
+  }; // tool_call：门禁后最终决策工具入参
+  executed?: AiTradeDecision["executed"]; // result（复用既有 executed 形状）
+  degradeReason?: string | null; // result
+  summary?: string; // summary
+  message?: string; // error
+  lastPx?: number; // round_start
+  position?: unknown | null; // round_start
+  signalBoard?: StrategySignalView[]; // round_start
+  marketContext?: MarketContext | null; // round_start
+  consensus?: Consensus | null; // round_start
+}
+
+// store / snapshot 的已装配单轮轨迹（thinking/analysis 累积；env 环形 ≤20）。
+export interface AiTradeRoundTrace {
+  round: number;
+  ts: number;
+  lastPx?: number;
+  position?: unknown | null;
+  signalBoard: StrategySignalView[];
+  marketContext?: MarketContext | null;
+  consensus?: Consensus | null;
+  thinking: string; // 累积深度思考（未开启扩展思考时通常为空）
+  analysis: string; // 累积自然语言研判分析（流式主可见内容）
+  toolCallPending?: boolean;
+  toolCall?: AiTradeTraceEvent["input"] | null;
+  executed?: AiTradeDecision["executed"];
+  degradeReason?: string | null;
+  summary?: string | null;
+  errorMessage?: string | null;
+  state: "deciding" | "done" | "skipped" | "error";
 }
 
 // GET /ai-trade/status 与 WS snapshot 的会话只读视图（info()）。
@@ -148,6 +204,7 @@ export interface AiTradeSnapshot {
   status: AiTradeStatusEvent;
   decisions: AiTradeDecision[];
   contextSummary: string | null;
+  agentTraces?: AiTradeRoundTrace[]; // 最近 ≤20 轮已装配轨迹（重连回放，已防御性冻结）
 }
 
 // 持久化偏好（进 partialize）：记忆上次选的策略集合与刷新轮数。

@@ -28,7 +28,9 @@ import type {
 import type {
   AiTradeConfig,
   AiTradeDecision,
+  AiTradeRoundTrace,
   AiTradeSessionRow,
+  AiTradeTraceEvent,
 } from "./aiTradeTypes";
 import type { AiBacktestConfig } from "./aiBacktestTypes";
 import type { FactorEditTarget, FactorTargetRef, SymbolGroup } from "./factorTypes";
@@ -100,6 +102,83 @@ const MAX_DEPTH_PANEL_RATIO = 0.3;
 const LIVE_AUTO_EVENTS_MAX = 50;
 // AI 自动交易决策日志环形缓冲上限（同 live-auto，超限裁最旧）。
 const AI_TRADE_DECISIONS_MAX = 50;
+// AI 自动交易决策认知轨迹环形上限（与后端 trace._TRACES_MAX 镜像；超限裁最旧）。
+const AI_TRADE_TRACES_MAX = 20;
+
+/** 依 agent_trace 事件构造在飞轮次桩（输入快照 + 空 thinking/analysis + deciding 态）。 */
+function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
+  return {
+    round: evt.round,
+    ts: evt.ts,
+    lastPx: evt.lastPx,
+    position: evt.position ?? null,
+    signalBoard: evt.signalBoard ?? [],
+    marketContext: evt.marketContext ?? null,
+    consensus: evt.consensus ?? null,
+    thinking: "",
+    analysis: "",
+    toolCallPending: false,
+    toolCall: null,
+    executed: null,
+    degradeReason: null,
+    summary: null,
+    errorMessage: null,
+    state: "deciding",
+  };
+}
+
+/** 单轮 phase 归约（纯函数）：把一条非 round_start 事件应用到已定位的轮次对象上。 */
+function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTradeRoundTrace {
+  switch (evt.phase) {
+    case "thinking":
+      return { ...t, thinking: t.thinking + (evt.delta ?? "") };
+    case "analysis":
+      return { ...t, analysis: t.analysis + (evt.delta ?? "") };
+    case "tool_call_start":
+      return { ...t, toolCallPending: true };
+    case "tool_call":
+      return { ...t, toolCall: evt.input ?? null, toolCallPending: false };
+    case "result":
+      return {
+        ...t,
+        executed: evt.executed ?? null,
+        degradeReason: evt.degradeReason ?? null,
+        state: evt.executed?.skipped ? "skipped" : "done",
+      };
+    case "summary":
+      return { ...t, summary: evt.summary ?? null };
+    case "error":
+      return { ...t, state: "error", errorMessage: evt.message ?? null };
+    default:
+      return t;
+  }
+}
+
+/**
+ * 轨迹归约（纯函数、幂等、容乱序）：把一条 agent_trace 事件应用到轮次列表。
+ * round_start 按 round 去重新建（已存在则刷新输入快照、保留累积文本）；其余 phase 定位该轮追加，
+ * 若该轮不存在（丢过 round_start）则以事件补建桩轮次；超环形容量裁最旧。
+ */
+export function applyAiTradeTracePhase(
+  traces: AiTradeRoundTrace[],
+  evt: AiTradeTraceEvent,
+): AiTradeRoundTrace[] {
+  const idx = traces.findIndex((t) => t.round === evt.round);
+  if (evt.phase === "round_start") {
+    const seed = emptyRoundTrace(evt);
+    const next =
+      idx >= 0
+        ? traces.map((t, i) =>
+            i === idx ? { ...seed, thinking: t.thinking, analysis: t.analysis } : t,
+          )
+        : [...traces, seed];
+    return next.slice(-AI_TRADE_TRACES_MAX);
+  }
+  const base = idx >= 0 ? traces[idx] : emptyRoundTrace(evt);
+  const updated = reduceRoundPhase(base, evt);
+  if (idx >= 0) return traces.map((t, i) => (i === idx ? updated : t));
+  return [...traces, updated].slice(-AI_TRADE_TRACES_MAX);
+}
 
 interface AppState {
   instId: string;
@@ -149,6 +228,7 @@ interface AppState {
   aiTradeTrades: Trade[];                         // → overlayTrades（图表 markers）
   aiTradePosition: PaperPositionEvent | null;
   aiTradeDecisions: AiTradeDecision[];            // 决策日志（环形≤50）
+  aiTradeTraces: AiTradeRoundTrace[];             // 决策认知轨迹（环形≤20，右侧 AI 助手面板呈现）
   aiTradeSummary: string | null;                  // 当前上下文摘要（AI 长期记忆）
   aiTradeAcknowledged: boolean;                   // 首启风险勾选会话记忆，刷新复位
   aiTradeConfig: AiTradeConfig | null;            // 持久化偏好（进 partialize）
@@ -259,6 +339,8 @@ interface AppState {
   setAiTradePosition: (pos: PaperPositionEvent | null) => void;
   pushAiTradeDecision: (decision: AiTradeDecision) => void;
   setAiTradeDecisions: (decisions: AiTradeDecision[]) => void;
+  setAiTradeTraces: (traces: AiTradeRoundTrace[]) => void;
+  upsertAiTradeTracePhase: (evt: AiTradeTraceEvent) => void;
   setAiTradeSummary: (summary: string | null) => void;
   setAiTradeAcknowledged: (v: boolean) => void;
   clearAiTradeRuntime: () => void;
@@ -394,6 +476,7 @@ export const useAppStore = create<AppState>()(
       aiTradeTrades: [],
       aiTradePosition: null,
       aiTradeDecisions: [],
+      aiTradeTraces: [],
       aiTradeSummary: null,
       aiTradeAcknowledged: false,
       aiTradeConfig: null,
@@ -623,6 +706,10 @@ export const useAppStore = create<AppState>()(
         })),
       setAiTradeDecisions: (decisions) =>
         set({ aiTradeDecisions: decisions.slice(-AI_TRADE_DECISIONS_MAX) }),
+      setAiTradeTraces: (traces) =>
+        set({ aiTradeTraces: traces.slice(-AI_TRADE_TRACES_MAX) }),
+      upsertAiTradeTracePhase: (evt) =>
+        set((s) => ({ aiTradeTraces: applyAiTradeTracePhase(s.aiTradeTraces, evt) })),
       setAiTradeSummary: (aiTradeSummary) => set({ aiTradeSummary }),
       setAiTradeAcknowledged: (aiTradeAcknowledged) => set({ aiTradeAcknowledged }),
       clearAiTradeRuntime: () =>
@@ -632,6 +719,7 @@ export const useAppStore = create<AppState>()(
           aiTradeTrades: [],
           aiTradePosition: null,
           aiTradeDecisions: [],
+          aiTradeTraces: [],
           aiTradeSummary: null,
         }),
       setAiTradeConfig: (aiTradeConfig) => set({ aiTradeConfig }),
