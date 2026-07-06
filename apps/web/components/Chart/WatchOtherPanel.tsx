@@ -13,6 +13,10 @@ interface WatchOtherPanelProps {
   changePct?: number | null;
   locked: boolean; // 分组运行中：禁用拖拽 / 加入
   dragOver: boolean;
+  // 可见 header 文案与无障碍标签（缺省「其他自选」，向后兼容）；AI 会话下复用为「自选标的」列表。
+  title?: string;
+  // 空态提示文案（缺省沿用 locked/unlocked 现文案）；AI 会话下传专用文案。
+  emptyHint?: string;
   onSelect: (instId: string) => void;
   onToggleStar: (instId: string) => void;
   onAddAuto: (instId: string) => void;
@@ -29,6 +33,8 @@ export default function WatchOtherPanel({
   changePct,
   locked,
   dragOver,
+  title = "其他自选",
+  emptyHint,
   onSelect,
   onToggleStar,
   onAddAuto,
@@ -37,9 +43,14 @@ export default function WatchOtherPanel({
   onDragLeave,
   onDrop,
 }: WatchOtherPanelProps) {
+  const resolvedEmptyHint =
+    emptyHint ??
+    (locked
+      ? "自选标的均在自动交易中"
+      : "把上方标的拖到这里即移出自动交易；在现货 / 合约页签点 ★ 收藏更多");
   return (
     <section
-      aria-label="其他自选"
+      aria-label={title}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
@@ -50,16 +61,14 @@ export default function WatchOtherPanel({
     >
       <header className="flex shrink-0 items-center justify-between px-2 py-1">
         <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
-          其他自选
+          {title}
         </span>
         <span className="text-[10px] tabular text-[var(--muted)]">{rows.length}</span>
       </header>
       <div className="min-h-0 flex-1 overflow-auto pb-1">
         {rows.length === 0 ? (
           <p className="px-3 py-4 text-center text-[11px] leading-relaxed text-[var(--muted)]">
-            {locked
-              ? "自选标的均在自动交易中"
-              : "把上方标的拖到这里即移出自动交易；在现货 / 合约页签点 ★ 收藏更多"}
+            {resolvedEmptyHint}
           </p>
         ) : (
           rows.map((inst) => (

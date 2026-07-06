@@ -76,6 +76,7 @@ export default function WatchlistTab({
   const autoTradeMembers = useAppStore((s) => s.autoTradeMembers);
   const autoTradeAllocationMode = useAppStore((s) => s.autoTradeAllocationMode);
   const liveAutoGroup = useAppStore((s) => s.liveAutoGroup);
+  const aiTradeSession = useAppStore((s) => s.aiTradeSession);
   const addAutoTradeMember = useAppStore((s) => s.addAutoTradeMember);
   const removeAutoTradeMember = useAppStore((s) => s.removeAutoTradeMember);
   const setAutoTradeAllocation = useAppStore((s) => s.setAutoTradeAllocation);
@@ -127,6 +128,16 @@ export default function WatchlistTab({
     }
     return { memberViews: views, otherRows: rows.filter((r) => !memberIds.has(r.instId)) };
   }, [rows, autoTradeMembers, liveAutoGroup]);
+
+  // [P1-1] AI 会话期下半区取全量自选行 rows，仅剔除会话标的（不可用 otherRows——其已剔除
+  // autoTradeMembers，会导致曾拖入策略分组的自选标的在 AI 会话期从侧栏静默丢失）。
+  const aiOtherRows = useMemo(
+    () => rows.filter((r) => r.instId !== aiTradeSession?.instId),
+    [rows, aiTradeSession?.instId],
+  );
+  // [P2-3] 仅当无运行中分组时才隐藏策略式 AutoTradePanel（正常路径 liveAutoGroup 恒为 null，
+  // 门禁已保证 AI 与分组互斥；此护栏保留并发极端下的分组「停止」入口）。
+  const showStrategyAutoPanel = !aiTradeSession || !!liveAutoGroup;
 
   const totalPct = totalAllocation(autoTradeMembers);
   const aggregatePnl = useMemo(() => {
@@ -245,41 +256,57 @@ export default function WatchlistTab({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      {/* AI 自动交易运行期面板（P1-7）：仅当存在活跃 AI 会话时呈现，置于自选分区之上。 */}
-      <AiTradePanel />
-      <AutoTradePanel
-        members={memberViews}
-        active={active}
-        livePrice={livePrice}
-        changePct={changePct}
-        totalPct={totalPct}
-        allocationMode={autoTradeAllocationMode}
-        running={running}
-        submitting={startM.isPending || stopM.isPending}
-        gateReason={gateReason}
-        aggregatePnl={aggregatePnl}
-        dropError={dropError}
-        dragOver={dragOverZone === "auto"}
-        onOpenRecords={() => setRecordsOpen(true)}
-        onToggle={onToggle}
-        onAllocationModeChange={setAutoTradeAllocationMode}
-        onEvenSplit={evenSplitAutoTradeMembers}
-        onSelect={onSelect}
-        onAllocationChange={setAutoTradeAllocation}
-        onRemove={removeAutoTradeMember}
-        onStopMember={(instId) => groupId && stopMemberM.mutate({ id: groupId, instId })}
-        onDragStartMember={handleDragStart}
-        onDragOver={allowDrop("auto")}
-        onDragLeave={() => setDragOverZone(null)}
-        onDrop={handleDropToAuto}
-      />
+      {/* AI 自动交易「标的面板」：仅当存在活跃 AI 会话时呈现，置于自选分区之上（上=自动交易标的）。 */}
+      {aiTradeSession && (
+        <AiTradePanel
+          rows={rows}
+          active={active}
+          livePrice={livePrice}
+          changePct={changePct}
+          onSelect={onSelect}
+        />
+      )}
+      {/* 策略式多标的自动交易分组：AI 会话活跃且无运行中分组时隐藏（P2-3），二者语义互斥。 */}
+      {showStrategyAutoPanel && (
+        <AutoTradePanel
+          members={memberViews}
+          active={active}
+          livePrice={livePrice}
+          changePct={changePct}
+          totalPct={totalPct}
+          allocationMode={autoTradeAllocationMode}
+          running={running}
+          submitting={startM.isPending || stopM.isPending}
+          gateReason={gateReason}
+          aggregatePnl={aggregatePnl}
+          dropError={dropError}
+          dragOver={dragOverZone === "auto"}
+          onOpenRecords={() => setRecordsOpen(true)}
+          onToggle={onToggle}
+          onAllocationModeChange={setAutoTradeAllocationMode}
+          onEvenSplit={evenSplitAutoTradeMembers}
+          onSelect={onSelect}
+          onAllocationChange={setAutoTradeAllocation}
+          onRemove={removeAutoTradeMember}
+          onStopMember={(instId) => groupId && stopMemberM.mutate({ id: groupId, instId })}
+          onDragStartMember={handleDragStart}
+          onDragOver={allowDrop("auto")}
+          onDragLeave={() => setDragOverZone(null)}
+          onDrop={handleDropToAuto}
+        />
+      )}
+      {/* 下半区「自选标的」：AI 会话期取全量自选行剔除会话标的（P1-1）并锁拖拽；否则维持现状。 */}
       <WatchOtherPanel
-        rows={otherRows}
+        rows={aiTradeSession ? aiOtherRows : otherRows}
         active={active}
         livePrice={livePrice}
         changePct={changePct}
-        locked={running}
+        locked={aiTradeSession ? true : running}
         dragOver={dragOverZone === "other"}
+        title={aiTradeSession ? "自选标的" : undefined}
+        emptyHint={
+          aiTradeSession ? "收藏更多标的以在此展示（AI 自动交易进行中）" : undefined
+        }
         onSelect={onSelect}
         onToggleStar={toggleWatchlist}
         onAddAuto={handleAddAuto}

@@ -92,6 +92,12 @@ export const DEFAULT_RIGHT_PANEL_WIDTH = 380;
 const MIN_RIGHT_PANEL_WIDTH = 320;
 const MAX_RIGHT_PANEL_WIDTH = 640;
 
+// 左侧标的侧栏像素宽：用户拖拽右边框调宽，夹取 [200, 460]，双击复位到默认，持久化刷新恢复。
+// 与 rightPanelWidth 同套包络策略（有限数守卫 + 夹取 + partialize + 版本迁移补默认）。
+export const DEFAULT_INSTRUMENT_SIDEBAR_WIDTH = 240;
+const MIN_INSTRUMENT_SIDEBAR_WIDTH = 200;
+const MAX_INSTRUMENT_SIDEBAR_WIDTH = 460;
+
 // 盘口列占上区宽度比例：盘口面板移到 K 线右侧后默认约 15%，夹取 [0.10, 0.30]；
 // 像素安全边界（min-w 160 / max-w 420）由组件兜底，与比例取较小 / 较大者，互不冲突。
 export const DEFAULT_DEPTH_PANEL_RATIO = 0.15;
@@ -250,6 +256,8 @@ interface AppState {
   // 主图 K 线与副图技术指标的内部分栏比例（主图占内部列高，1-ratio 即副图高）；持久化偏好。
   chartIndicatorRatio: number;
   rightPanelWidth: number;
+  // 左侧标的侧栏像素宽（用户可拖拽右边框调宽，双击复位）；持久化偏好。
+  instrumentSidebarWidth: number;
   depthPanelRatio: number;
   rightTab: RightTab;
   agentConversationId: string;
@@ -370,6 +378,7 @@ interface AppState {
   setChartSplitRatio: (ratio: number) => void;
   setChartIndicatorRatio: (ratio: number) => void;
   setRightPanelWidth: (px: number) => void;
+  setInstrumentSidebarWidth: (px: number) => void;
   setDepthPanelRatio: (ratio: number) => void;
   setRightTab: (tab: RightTab) => void;
   setAgentConversationId: (id: string) => void;
@@ -496,6 +505,7 @@ export const useAppStore = create<AppState>()(
       // 全新安装只走初始化器、不触发 migrate，故面板尺寸默认值必须写在此处（与 chartSplitRatio 并列）。
       chartIndicatorRatio: DEFAULT_CHART_INDICATOR_RATIO,
       rightPanelWidth: DEFAULT_RIGHT_PANEL_WIDTH,
+      instrumentSidebarWidth: DEFAULT_INSTRUMENT_SIDEBAR_WIDTH,
       depthPanelRatio: DEFAULT_DEPTH_PANEL_RATIO,
       // 右侧默认激活「AI 助手」页签；会话 id 首次为空，挂载时生成并落盘以便重连恢复。
       rightTab: "agent",
@@ -852,6 +862,18 @@ export const useAppStore = create<AppState>()(
               }
             : { rightPanelWidth: s.rightPanelWidth },
         ),
+      // 左侧标的侧栏宽：夹取到 [MIN, MAX] 像素；非有限数忽略（镜像 setRightPanelWidth）。
+      setInstrumentSidebarWidth: (n) =>
+        set((s) =>
+          Number.isFinite(n)
+            ? {
+                instrumentSidebarWidth: Math.min(
+                  Math.max(n, MIN_INSTRUMENT_SIDEBAR_WIDTH),
+                  MAX_INSTRUMENT_SIDEBAR_WIDTH,
+                ),
+              }
+            : { instrumentSidebarWidth: s.instrumentSidebarWidth },
+        ),
       // 盘口列比例：夹取到 [MIN, MAX]；非有限数忽略（像素安全边界由组件 min-w/max-w 兜底）。
       setDepthPanelRatio: (n) =>
         set((s) =>
@@ -867,7 +889,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 25,
+      version: 26,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -905,6 +927,7 @@ export const useAppStore = create<AppState>()(
         chartSplitRatio: s.chartSplitRatio,
         chartIndicatorRatio: s.chartIndicatorRatio,
         rightPanelWidth: s.rightPanelWidth,
+        instrumentSidebarWidth: s.instrumentSidebarWidth,
         depthPanelRatio: s.depthPanelRatio,
         rightTab: s.rightTab,
         agentConversationId: s.agentConversationId,
@@ -1019,6 +1042,10 @@ export const useAppStore = create<AppState>()(
           // AI 自动交易：运行期态全瞬态（不入 partialize），浅合并回落初值即可；偏好 aiTradeConfig
           // 进 partialize，补默认 null（缺失时启动弹窗回落默认策略与刷新轮数）。
           next = { ...next, aiTradeConfig: null };
+        }
+        if (version < 26) {
+          // 左侧标的侧栏可拖拽调宽：补像素宽默认（追加字段，浅合并本就回落初值，迁移显式稳妥）。
+          next = { ...next, instrumentSidebarWidth: DEFAULT_INSTRUMENT_SIDEBAR_WIDTH };
         }
         return next as never;
       },

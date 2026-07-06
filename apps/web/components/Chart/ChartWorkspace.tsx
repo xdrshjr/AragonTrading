@@ -12,13 +12,14 @@ import PaneSplitHandle from "@/components/ui/PaneSplitHandle";
 import PanelResizeHandle from "@/components/ui/PanelResizeHandle";
 import type { IndicatorKey } from "@/lib/indicators";
 import { buildOrderPriceLines, openOrdersKey } from "@/lib/openOrders";
-import { ratioFromRightEdge, ratioFromTopEdge } from "@/lib/panelResize";
+import { ratioFromRightEdge, ratioFromTopEdge, widthFromLeftEdge } from "@/lib/panelResize";
 import { buildPaperPositionRows } from "@/lib/paperMulti";
 import { tradingApi } from "@/lib/tradingApi";
 import {
   DEFAULT_CHART_INDICATOR_RATIO,
   DEFAULT_CHART_SPLIT_RATIO,
   DEFAULT_DEPTH_PANEL_RATIO,
+  DEFAULT_INSTRUMENT_SIDEBAR_WIDTH,
   useAppStore,
 } from "@/lib/store";
 import type {
@@ -113,6 +114,7 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     chartSplitRatio,
     chartIndicatorRatio,
     depthPanelRatio,
+    instrumentSidebarWidth,
     setInst,
     setChartPane,
     setBottomTab,
@@ -120,6 +122,7 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     setChartSplitRatio,
     setChartIndicatorRatio,
     setDepthPanelRatio,
+    setInstrumentSidebarWidth,
   } = useAppStore();
 
   const [hoverTs, setHoverTs] = useState<number | null>(null);
@@ -143,6 +146,14 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     setDepthPanelRatio(ratioFromRightEdge(rect.right, rect.width, clientX));
   };
   const onDepthReset = () => setDepthPanelRatio(DEFAULT_DEPTH_PANEL_RATIO);
+
+  // 左侧标的侧栏调宽（左锚）：复用上区 topRef 的左边缘，宽度 = 指针 X − 左边缘（store 负责夹取）。
+  const onResizeSidebar = (clientX: number) => {
+    const rect = topRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    setInstrumentSidebarWidth(widthFromLeftEdge(rect.left, clientX));
+  };
+  const onSidebarReset = () => setInstrumentSidebarWidth(DEFAULT_INSTRUMENT_SIDEBAR_WIDTH);
 
   const byTs = useMemo(() => new Map(candles.map((c) => [c.ts, c])), [candles]);
   const tsIndex = useMemo(() => new Map(candles.map((c, i) => [c.ts, i])), [candles]);
@@ -215,7 +226,11 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
         style={{ flexGrow: chartSplitRatio, flexShrink: 1, flexBasis: 0 }}
       >
         {/* 左栏：盘口面板已迁出到 K 线右侧（需求二），此处仅保留标的列表并占满整列高度。 */}
-        <div className="flex min-h-0 shrink-0 basis-[16%] min-w-[220px] max-w-[300px] flex-col border-r border-[var(--border)]">
+        {/* 需求二（本轮）：改像素宽，右边框可拖调宽（夹取 [200,460] + min-w-[200px] CSS 兜底），双击复位默认。 */}
+        <div
+          className="flex min-h-0 shrink-0 min-w-[200px] flex-col"
+          style={{ width: instrumentSidebarWidth }}
+        >
           <div className="min-h-0 flex-1">
             <InstrumentSidebar
               active={instId}
@@ -225,6 +240,11 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
             />
           </div>
         </div>
+        <PanelResizeHandle
+          onResize={onResizeSidebar}
+          onReset={onSidebarReset}
+          ariaLabel="拖动调整标的侧栏宽度，双击复位"
+        />
         <div className="flex min-h-[320px] min-w-0 flex-1 flex-col">
           <div className="shrink-0 border-b border-[var(--border)] px-4 py-2.5">
             <ChartToolbar {...toolbar} />

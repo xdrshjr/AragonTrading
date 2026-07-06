@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { ratioFromRightEdge, ratioFromTopEdge, widthFromRightEdge } from "./panelResize";
+import {
+  ratioFromRightEdge,
+  ratioFromTopEdge,
+  widthFromLeftEdge,
+  widthFromRightEdge,
+} from "./panelResize";
 
 describe("panelResize — widthFromRightEdge", () => {
   it("widthFromRightEdge_subtracts_pointer_from_right", () => {
@@ -12,6 +17,20 @@ describe("panelResize — widthFromRightEdge", () => {
     // 指针越过右边缘 → 非正值，交由 store 夹取到下限（防符号错时仍可被守住）。
     expect(widthFromRightEdge(1000, 1000)).toBe(0);
     expect(widthFromRightEdge(1000, 1200)).toBe(-200);
+  });
+});
+
+describe("panelResize — widthFromLeftEdge", () => {
+  it("widthFromLeftEdge_adds_pointer_from_left", () => {
+    // 左锚加法方向：宽度随指针右移而增大（与右锚对偶）。
+    expect(widthFromLeftEdge(200, 440)).toBe(240);
+    expect(widthFromLeftEdge(200, 620)).toBe(420);
+  });
+
+  it("widthFromLeftEdge_returns_non_positive_when_pointer_past_left_edge", () => {
+    // 指针越过左边缘 → 非正值，交由 store 夹取到下限（防符号错时仍可被守住）。
+    expect(widthFromLeftEdge(200, 200)).toBe(0);
+    expect(widthFromLeftEdge(200, 120)).toBe(-80);
   });
 });
 

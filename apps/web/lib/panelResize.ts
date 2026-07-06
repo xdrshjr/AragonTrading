@@ -13,6 +13,17 @@ export function widthFromRightEdge(containerRight: number, clientX: number): num
 }
 
 /**
+ * 左锚面板宽度：面板占据 [containerLeft, clientX]，其宽度 = 指针 X − 左边缘（对偶于 widthFromRightEdge）。
+ *
+ * @param containerLeft 容器左边缘的视口 X 坐标（getBoundingClientRect().left）。
+ * @param clientX 指针的视口 X 坐标（PointerEvent.clientX）。
+ * @returns 面板像素宽（可能为非正或越界，由调用方 store setter 夹取）。
+ */
+export function widthFromLeftEdge(containerLeft: number, clientX: number): number {
+  return clientX - containerLeft;
+}
+
+/**
  * 右锚列占比：列贴容器右侧，比例 = (右边缘 − 指针 X) / 容器宽。
  *
  * @param containerRight 容器右边缘的视口 X 坐标。
