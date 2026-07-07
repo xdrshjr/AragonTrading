@@ -81,13 +81,14 @@ class _TraceCoalescer:
 
 def new_round_trace(round_no: int, ts: int, ref_px: float,
                     payload: dict, signal_board: list[dict]) -> dict:
-    """装配「在飞轮次」初值：输入快照（价/持仓/信号板/体制/共识）+ 空 thinking/analysis + deciding 态。"""
+    """装配「在飞轮次」初值：输入快照（价/持仓/信号板/体制/共识/证据摘要）+ 空 thinking/analysis + deciding 态。"""
     return {
         "round": round_no, "ts": ts, "lastPx": ref_px,
         "position": payload.get("position"),
         "signalBoard": signal_board,
         "marketContext": payload.get("marketContext"),
         "consensus": payload.get("consensus"),
+        "marketDigest": payload.get("marketDigest"),   # R1：round_start/trace 承载证据摘要（RC-9）
         "thinking": "", "analysis": "",
         "toolCallPending": False, "toolCall": None,
         "executed": None, "degradeReason": None,

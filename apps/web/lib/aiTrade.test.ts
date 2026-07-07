@@ -6,14 +6,23 @@ import {
   describeAiAction,
   describeConsensus,
   describeExecuted,
+  describeFactors,
+  describePriceAction,
   describeRegime,
   describeStance,
   describeStopReason,
+  describeVolume,
   resolveAiTradeGate,
   validateContextRounds,
   validateStrategySelection,
 } from "./aiTrade";
-import type { Consensus, MarketContext } from "./aiTradeTypes";
+import type {
+  Consensus,
+  FactorReadings,
+  MarketContext,
+  PriceAction,
+  VolumeContext,
+} from "./aiTradeTypes";
 
 const ready = {
   accountMode: "live" as const,
@@ -152,6 +161,93 @@ describe("describeConsensus (E2)", () => {
   });
   it("returns empty string when absent", () => {
     expect(describeConsensus(null)).toBe("");
+  });
+});
+
+const priceAction = (over: Partial<PriceAction> = {}): PriceAction => ({
+  changePct: 1.2,
+  trend: "up",
+  emaFast: 101,
+  emaSlow: 100,
+  emaRelation: "fast_above",
+  emaSlopePct: 0.4,
+  rangePos: 0.78,
+  swingHigh: 110,
+  swingLow: 90,
+  consecUp: 3,
+  consecDown: 0,
+  lastBar: { o: 100, h: 102, l: 99, c: 101, bodyPct: 1 },
+  ...over,
+});
+
+describe("describePriceAction (R1)", () => {
+  it("localizes trend / ema structure / range position", () => {
+    const text = describePriceAction(priceAction());
+    expect(text).toContain("走势 上行(+1.2%)");
+    expect(text).toContain("多头排列");
+    expect(text).toContain("区间位 78%");
+  });
+  it("omits range position when null and falls back on unknown trend", () => {
+    const text = describePriceAction(priceAction({ trend: "weird", rangePos: null }));
+    expect(text).toContain("weird");
+    expect(text).not.toContain("区间位");
+  });
+  it("returns empty string for null/undefined", () => {
+    expect(describePriceAction(null)).toBe("");
+    expect(describePriceAction(undefined)).toBe("");
+  });
+});
+
+const volumeCtx = (over: Partial<VolumeContext> = {}): VolumeContext => ({
+  last: 180,
+  sma: 100,
+  ratio: 1.8,
+  zscore: 1.2,
+  trend: "rising",
+  spike: false,
+  ...over,
+});
+
+describe("describeVolume (R1)", () => {
+  it("localizes volume trend and ratio", () => {
+    const text = describeVolume(volumeCtx());
+    expect(text).toContain("量能 放量");
+    expect(text).toContain("量比 1.8");
+    expect(text).not.toContain("异常放量");
+  });
+  it("appends spike marker and omits ratio when null", () => {
+    const text = describeVolume(volumeCtx({ ratio: null, spike: true }));
+    expect(text).toContain("异常放量");
+    expect(text).not.toContain("量比");
+  });
+  it("returns empty string when absent", () => {
+    expect(describeVolume(null)).toBe("");
+  });
+});
+
+const factorReadings = (over: Partial<FactorReadings> = {}): FactorReadings => ({
+  rsi14: { value: 63.2, label: "neutral" },
+  macdHist: { value: 12.4, label: "bullish" },
+  bollPctB: { value: 0.82, label: "upper_half" },
+  atrPct: { value: 1.1, label: "normal" },
+  rocPct: { value: 2.3, label: "positive" },
+  ...over,
+});
+
+describe("describeFactors (R1)", () => {
+  it("localizes the fixed factor readings", () => {
+    const text = describeFactors(factorReadings());
+    expect(text).toContain("RSI 中性");
+    expect(text).toContain("MACD 偏多");
+    expect(text).toContain("布林 上半区");
+    expect(text).toContain("动量 正向");
+  });
+  it("falls back to the raw label for unknown enums (no fabrication)", () => {
+    const text = describeFactors(factorReadings({ rsi14: { value: null, label: "mystery" } }));
+    expect(text).toContain("RSI mystery");
+  });
+  it("returns empty string when absent", () => {
+    expect(describeFactors(null)).toBe("");
   });
 });
 

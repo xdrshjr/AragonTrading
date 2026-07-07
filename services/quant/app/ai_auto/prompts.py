@@ -26,31 +26,38 @@ DECISION_TOOL_SCHEMA: dict = {
 }
 
 DECISION_TOOL_DESCRIPTION = (
-    "提交本轮唯一的自动交易决策。综合研判所有策略信号与当前真实持仓后，"
-    "选择 open_long（开多）/ open_short（开空）/ close（平当前持仓）/ hold（持币观望）之一，"
-    "并给出简短理由（reason）。开仓可给 sizeFraction（预算名义占比，0~1）与 confidence（0~1）。"
+    "提交本轮唯一的自动交易决策。综合并**独立批判研判**所有策略信号、因子读数、价格走势/成交量与当前"
+    "真实持仓后（这些信号仅供参考、可推翻），选择 open_long（开多）/ open_short（开空）/ close（平当前"
+    "持仓）/ hold（持币观望）之一，并给出简短理由（reason）。开仓可给 sizeFraction（预算名义占比，0~1）"
+    "与 confidence（0~1）。"
 )
 
 
 def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
                                  leverage: float) -> str:
-    """决策者系统 prompt：角色 / 纪律 / 风险偏好 / 只用真数据 / 强力引导调用一次决策工具。"""
+    """决策者系统 prompt：信号仅供参考 + 分步思维链纪律 + 风险偏好 + 只用真数据 + 收尾必调决策工具。"""
     return (
-        "你是一名严谨、纪律性极强的加密合约自动交易决策者。你不是聊天助手——你的**唯一职责**"
-        f"是在每个决策轮，综合研判多个交易策略的实时信号与当前真实持仓，为标的 {inst_id}（周期 {bar}）"
-        f"做出一个受严格约束的交易决策。会话预算约 {budget_usd:.2f} USDT，杠杆约 {leverage:g}×。\n\n"
+        "你是一名严谨、纪律性极强的加密合约自动交易决策者。你不是聊天助手，也不是信号复读机——你的"
+        f"**唯一职责**是在每个决策轮，为标的 {inst_id}（周期 {bar}）做出一个受严格约束的交易决策。"
+        f"会话预算约 {budget_usd:.2f} USDT，杠杆约 {leverage:g}×。\n\n"
+        "**首要原则——信号是参考，不是指令**：交给你的多个策略信号、因子读数、市场体制、共识度都**只是"
+        "决策的参考与触发线索，不是必须执行的确定性指令**。它们可能正确，也可能错误、滞后或相互矛盾。"
+        "你的职责不是复述或跟随它们，而是**像一名资深交易员那样，独立地、一步一步地综合研判所有证据后"
+        "自己下判断**——你有权采纳、存疑或**推翻**任何单一信号。\n\n"
         "决策纪律：\n"
-        "1. **每轮先用 2–4 句话简要说明你的综合研判分析（作为可观测的思考过程），随后必须且只能调用"
-        "一次** `submit_trade_decision` 工具提交本轮决策。**分析之后必须以工具调用收尾——绝不允许只输出"
-        "分析文字而不调用决策工具**；分析仅供人类观察，真正生效的只有工具调用。\n"
-        "2. 综合而非盲从：多个策略立场（stance=持久多/空/空仓）与本轮边沿信号（latestSignal）可能"
-        "冲突，你要权衡信号一致度、当前持仓与会话盈亏，避免频繁反手与过度交易；"
-        "同时参考本轮『市场体制』与『策略共识』作为宏观背景，与策略立场综合研判。\n"
-        "3. 只使用输入中提供的真实数据，绝不臆造行情或指标；不确定时选择 hold（持币观望）。\n"
-        "4. 风险优先：已持仓且多数策略转为反向或平仓立场时，优先 close 保护利润 / 止损；"
-        "空仓且多数策略同向且理由充分时才开仓，sizeFraction 保守（默认 ≤0.5）。\n"
-        "5. action 取值仅限 open_long / open_short / close / hold；close/hold 忽略 sizeFraction。\n"
-        "真实下单由系统的守护执行器落地并继承全部资金护栏，你只需给出决策与理由。"
+        "1. **每轮必须先输出一段分步骤的研判（思维链），依次思考：① 价格走势（方向、动量、均线结构、"
+        "区间位置）；② 成交量（量能、量比、放缩、异常放量）；③ 市场体制（趋势/震荡/高低波动/事件）；"
+        "④ 技术因子读数（RSI/MACD/布林/ATR/动量各说明什么）；⑤ 逐一批判各策略信号——每个策略此刻的"
+        "立场与本轮意图在当前语境下**是否可信**，你采纳、存疑还是推翻，为什么；⑥ 信号冲突与权衡；"
+        "⑦ 当前真实持仓、会话盈亏与风险约束；⑧ 结论。**研判供人类观察，真正生效的只有工具调用。**\n"
+        "2. 只使用输入中提供的真实数据（价格/成交量/因子/信号板/持仓/盈亏），绝不臆造行情或指标；"
+        "证据不足或相互矛盾、无把握时选择 hold（持币观望）。\n"
+        "3. 风险优先：已持仓且多数证据转为反向时，优先 close 保护利润 / 止损；空仓且多数证据同向、"
+        "研判充分时才开仓，sizeFraction 保守（默认 ≤0.5），避免频繁反手与过度交易。\n"
+        "4. action 取值仅限 open_long / open_short / close / hold；close/hold 忽略 sizeFraction。"
+        "真实下单由系统的守护执行器落地并继承全部资金护栏，你只需给出决策与理由。\n"
+        "5. **收尾硬约束（务必遵守）：每轮在完成上述分步研判之后，必须且只能调用一次 "
+        "`submit_trade_decision` 工具提交本轮决策——绝不允许只输出研判文字而不调用决策工具。**"
     )
 
 
@@ -90,12 +97,44 @@ def _format_consensus(consensus: dict | None) -> str:
             f"一致度={consensus.get('agreement')}")
 
 
+def _format_price_action(pa: dict | None) -> str:
+    """把价格走势证据压成一行（R1）；`pa is None` 时返回空串（整段省略，同 _format_market_context）。"""
+    if not pa:
+        return ""
+    return (f"价格走势：趋势={pa.get('trend')}（近窗涨跌 {pa.get('changePct')}%），"
+            f"均线={pa.get('emaRelation')}（快线斜率 {pa.get('emaSlopePct')}%），"
+            f"区间位置={pa.get('rangePos')}，末端连阳/连阴={pa.get('consecUp')}/{pa.get('consecDown')}")
+
+
+def _format_volume(vol: dict | None) -> str:
+    """把成交量证据压成一行（R1）；`vol is None` 时返回空串（整段省略）。"""
+    if not vol:
+        return ""
+    spike = "，异常放量" if vol.get("spike") else ""
+    return (f"成交量：量比={vol.get('ratio')}（zscore {vol.get('zscore')}），"
+            f"放缩趋势={vol.get('trend')}{spike}")
+
+
+def _format_factors(factors: dict | None) -> str:
+    """把技术因子读数压成一行（R1）；`factors is None` 时返回空串（整段省略）。"""
+    if not factors:
+        return ""
+
+    def _reading(key: str) -> str:
+        r = factors.get(key) or {}
+        return f"{r.get('value')}({r.get('label')})"
+
+    return (f"技术因子：RSI14={_reading('rsi14')}，MACD柱={_reading('macdHist')}，"
+            f"布林%B={_reading('bollPctB')}，ATR%={_reading('atrPct')}，动量ROC={_reading('rocPct')}")
+
+
 def build_decision_prompt(payload: dict) -> str:
     """把本轮决策输入（体制/共识 + 信号板 + 真实持仓 + 会话盈亏 + 摘要）压成紧凑文本喂决策器。
 
     `payload` 由决策器/会话装配：round, barTs, lastPx, position, sessionPnlUsd, budgetUsd,
     takeProfitUsd, stopLossUsd, signalBoard(list[dict]), summary，
-    以及可选 marketContext(dict|None, E1) / consensus(wire dict|None, E2)。
+    以及可选 marketContext(dict|None, E1) / consensus(wire dict|None, E2) /
+    marketDigest(dict|None, R1：{priceAction, volume, factors}，禁用/数据不足时整体省略)。
     """
     summary = payload.get("summary")
     tp = payload.get("takeProfitUsd")
@@ -112,13 +151,21 @@ def build_decision_prompt(payload: dict) -> str:
     consensus_line = _format_consensus(payload.get("consensus"))
     if consensus_line:                       # E2：consensus 为 None 时省略；空板则如实呈现 0 票
         parts.append(consensus_line)
+    digest = payload.get("marketDigest") or {}   # R1：各段 None 时整段省略（同 E1/E2 降级范式）
+    for line in (_format_price_action(digest.get("priceAction")),
+                 _format_volume(digest.get("volume")),
+                 _format_factors(digest.get("factors"))):
+        if line:
+            parts.append(line)
     parts += [
-        "策略信号板（综合研判以下各策略此刻立场与本轮意图）：",
+        "策略信号板（仅供参考的触发线索，请逐条批判研判，可推翻）：",
         _format_board(payload.get("signalBoard") or []),
     ]
     if summary:
         parts.append(f"\n【此前执行摘要（你的长期记忆）】\n{summary}")
-    parts.append(f"\n请综合上述信息，调用一次 {DECISION_TOOL_NAME} 提交本轮决策。")
+    parts.append(
+        f"\n请先按上述纪律逐步研判（思维链），再必须且只能调用一次 {DECISION_TOOL_NAME} "
+        "提交本轮决策——不得只输出研判文字。")
     return "\n".join(parts)
 
 
@@ -133,8 +180,9 @@ def build_summary_system_prompt() -> str:
 def build_summary_prompt(prev_summary: str | None, journal: list[dict]) -> str:
     """以结构化 `_journal`（每轮 {round,signalBoard,decision,executed,positionAfter,sessionPnl}）
     为唯一素材（P1-3，与可能被裁剪的模型窗口 `_context` 解耦）拼成摘要输入文本。"""
-    head = "总结迄今的自动交易执行情况：决策序列与结果、持仓与盈亏演变、哪些策略信号被验证有效/无效、" \
-           "关键经验教训与当前策略偏好，形成简洁的执行摘要作为后续决策的背景，不要罗列每一轮细节。"
+    head = "总结迄今的自动交易执行情况：决策序列与结果、持仓与盈亏演变、**哪些策略/因子信号被你采纳或被" \
+           "推翻、事后又被行情验证为对或错**（作为经验教训）、当前策略偏好，形成简洁的执行摘要作为后续" \
+           "决策的背景，不要罗列每一轮细节。"
     prev = f"\n上一段执行摘要（请在其基础上滚动累积）：\n{prev_summary}" if prev_summary else ""
     digest = json.dumps(journal, ensure_ascii=False)
     return f"{head}{prev}\n\n逐轮执行流水（JSON）：\n{digest}"

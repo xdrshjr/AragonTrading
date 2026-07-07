@@ -6,9 +6,12 @@ import {
   describeAiAction,
   describeConsensus,
   describeExecuted,
+  describeFactors,
+  describePriceAction,
   describeRegime,
   describeStance,
   describeTraceState,
+  describeVolume,
 } from "@/lib/aiTrade";
 import type { AiTradeRoundTrace } from "@/lib/aiTradeTypes";
 import { fmtNum, fmtPrice, fmtTime } from "@/lib/format";
@@ -152,12 +155,16 @@ function ResultRow({ trace }: { trace: AiTradeRoundTrace }) {
   );
 }
 
-/** 输入信号板 / 体制 / 共识（紧凑折叠，复用左栏同款 describe）。 */
+/** 输入信号板 / 体制 / 共识 / 市场证据摘要（紧凑折叠，复用左栏同款 describe）。 */
 function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
   const regime = describeRegime(trace.marketContext);
   const consensus = describeConsensus(trace.consensus ?? null);
+  const digest = trace.marketDigest ?? null;
+  const price = describePriceAction(digest?.priceAction);
+  const volume = describeVolume(digest?.volume);
+  const factors = describeFactors(digest?.factors);
   const board = trace.signalBoard ?? [];
-  if (!board.length && !regime && !consensus) return null;
+  if (!board.length && !regime && !consensus && !price && !volume && !factors) return null;
   return (
     <details className="text-[11px] text-[var(--muted)]">
       <summary className="cursor-pointer select-none text-[var(--text)]">
@@ -168,6 +175,13 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
           <div className="flex flex-wrap gap-x-2 gap-y-0.5">
             {regime && <span>{regime}</span>}
             {consensus && <span>{consensus}</span>}
+          </div>
+        )}
+        {(price || volume || factors) && (
+          <div className="flex flex-col gap-0.5">
+            {price && <span>{price}</span>}
+            {volume && <span>{volume}</span>}
+            {factors && <span>{factors}</span>}
           </div>
         )}
         {board.map((s) => (

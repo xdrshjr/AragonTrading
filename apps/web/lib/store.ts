@@ -124,6 +124,7 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     signalBoard: evt.signalBoard ?? [],
     marketContext: evt.marketContext ?? null,
     consensus: evt.consensus ?? null,
+    marketDigest: evt.marketDigest ?? null,
     thinking: "",
     analysis: "",
     toolCallPending: false,

@@ -137,6 +137,68 @@ async def test_size_fraction_clamped_to_unit_interval():
     assert decision.size_fraction == 1.0
 
 
+async def test_last_analysis_captured_from_text_deltas():
+    """R3：流式 text_delta 累积为 last_analysis（与 emit 解耦——decide 默认 emit=None 也留痕）。"""
+    events = ([StreamEvent("text_delta", text="第一步：价格走势向上。"),
+               StreamEvent("text_delta", text="结论：开多。")]
+              + _tool_events({"action": "open_long", "sizeFraction": 0.3, "reason": "trend"}))
+    d = _decider([events])
+    await d.decide(_payload(1))
+    assert "价格走势向上" in d.last_analysis
+    assert "开多" in d.last_analysis
+
+
+async def test_last_analysis_cleared_on_error_round_no_cross_round_bleed():
+    """RC-1 串轮防护：上一轮有研判文本，本轮 _stream_decision 抛错回落 hold → last_analysis 不残留上一轮。"""
+    first = ([StreamEvent("text_delta", text="上一轮研判：偏多。")]
+             + _tool_events({"action": "hold", "reason": "r"}))
+    second = [StreamEvent("text_delta", text="本轮部分研判文字"),
+              StreamEvent("error", code="LLM_ERROR", message="boom")]
+    d = _decider([first, second])
+    await d.decide(_payload(1))
+    assert "偏多" in d.last_analysis
+    _, degrade = await d.decide(_payload(2))
+    assert degrade == "llm_error"
+    assert d.last_analysis == ""              # 入口清零 + 提前退出不赋值 → 空串，不错贴上一轮
+
+
+async def test_last_analysis_cleared_on_timeout_round():
+    """RC-1：本轮流超时（被 wait_for 取消）→ last_analysis 恒为空串（降级轮 analysis 语义正确）。"""
+    first = ([StreamEvent("text_delta", text="上一轮研判文本")]
+             + _tool_events({"action": "hold", "reason": "r"}))
+    d = _decider([first], settings=Settings(ai_trade_decision_timeout_s=0.1))
+    await d.decide(_payload(1))
+    assert d.last_analysis != ""
+
+    async def _slow_stream(*, system, messages, tools):
+        await asyncio.sleep(1.0)
+        yield StreamEvent("message_done", stop_reason="end")
+
+    d._llm.stream = _slow_stream   # type: ignore[attr-defined]
+    _, degrade = await d.decide(_payload(2))
+    assert degrade == "decision_timeout"
+    assert d.last_analysis == ""
+
+
+async def test_commit_round_stores_analysis_excerpt_in_journal():
+    """RC-2/RC-3：commit_round(analysis=excerpt) 使 journal 末条含该摘录（供滚动摘要素材）。"""
+    d = _decider([_tool_events({"action": "hold", "reason": "r"})])
+    decision, _ = await d.decide(_payload(1))
+    excerpt = "研判摘录片段。" * 20
+    executed = {"ok": True, "action": decision.action, "positionAfter": "flat"}
+    await d.commit_round(_payload(1), decision, executed, analysis=excerpt)
+    assert d._journal[-1]["analysis"] == excerpt
+
+
+async def test_commit_round_defaults_analysis_to_none_for_legacy_callers():
+    """回测/旧调用不传 analysis → journal 条目 analysis 为 None（零回归）。"""
+    d = _decider([_tool_events({"action": "hold", "reason": "r"})])
+    decision, _ = await d.decide(_payload(1))
+    executed = {"ok": True, "action": decision.action, "positionAfter": "flat"}
+    await d.commit_round(_payload(1), decision, executed)
+    assert d._journal[-1]["analysis"] is None
+
+
 async def test_summarize_triggers_every_n_rounds_from_journal_and_resets_context():
     # contextRefreshRounds=15 > 12（40 条模型窗口硬上限对应约 13 轮）：证摘要素材是完整 _journal 而非
     # 可能被裁剪的 _context（P1-3）。前 15 轮每轮出决策；第 15 轮 commit 触发摘要（脚本第 16 个是摘要流）。

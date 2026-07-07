@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 
 _ACTIONS = ("open_long", "open_short", "close", "hold")
 
+# 本轮研判思维链全文的硬上限（ai-trade-reasoning-chain §2.5）：`_last_analysis` 只经 agent_trace 流与
+# _traces(≤20) 承载给 UI，超出即截断；进 journal / decision 事件的是调用方派生的有界摘录（≤400，RC-2/3）。
+_ANALYSIS_MAX_CHARS = 4000
+
 
 @dataclass
 class TradeDecision:
@@ -84,6 +88,7 @@ class AiTradeDecider:
         self._journal: list[dict] = []
         self._rounds_since_summary = 0
         self._last_round = 0
+        self._last_analysis: str = ""      # 本轮研判思维链全文（R3；每轮 decide() 入口清零，RC-1）
 
     # ---------- 只读状态（供 status / snapshot）----------
     @property
@@ -94,6 +99,11 @@ class AiTradeDecider:
     def rounds_since_summary(self) -> int:
         return self._rounds_since_summary
 
+    @property
+    def last_analysis(self) -> str:
+        """本轮研判思维链全文（供 session 派生有界摘录入 journal/decision 事件）；降级轮为空串。"""
+        return self._last_analysis
+
     # ---------- 决策 ----------
     async def decide(self, payload: dict, *, emit: TraceEmit | None = None
                      ) -> tuple[TradeDecision, str | None]:
@@ -102,6 +112,7 @@ class AiTradeDecider:
         可选 `emit`（由 session 注入）承接决策器流式认知（分析 / 思考 / 工具起始）经合并后扇出；
         默认 `None` 保证回测 / 单测等既有位置调用零改动、零回归（合并器全程空转，行为逐字不变）。
         """
+        self._last_analysis = ""     # RC-1：入口清零——本轮若超时/异常/被取消回落 hold，不残留上一轮研判
         user_msg = LlmMessage("user", [TextBlock(build_decision_prompt(payload))])
         try:
             raw = await asyncio.wait_for(
@@ -123,11 +134,13 @@ class AiTradeDecider:
         """
         accs: dict[str, dict] = {}
         order: list[str] = []
+        analysis_parts: list[str] = []           # R3：累积研判全文（与 emit 解耦，回测 emit=None 也留痕）
         pump = _TraceCoalescer(emit)             # emit=None → 全程空转（回测 / 单测无订阅）
         async for ev in self._llm.stream(system=self.system_prompt,
                                           messages=self._context + [user_msg],
                                           tools=[self._tool]):
             if ev.kind == "text_delta":
+                analysis_parts.append(ev.text or "")
                 await pump.feed("analysis", ev.text or "")
             elif ev.kind == "thinking_delta":
                 await pump.feed("thinking", ev.text or "")
@@ -145,6 +158,8 @@ class AiTradeDecider:
             elif ev.kind == "message_done":
                 await pump.flush()
                 break
+        # R3：流正常结束才落全文（超时/取消/error 提前退出则不赋值，_last_analysis 维持入口清零的空串）。
+        self._last_analysis = "".join(analysis_parts).strip()[:_ANALYSIS_MAX_CHARS]
         for tid in order:                       # 取首条有效 submit_trade_decision（多调用取其一）
             if accs[tid]["name"] == DECISION_TOOL_NAME:
                 raw = "".join(accs[tid]["parts"]).strip() or "{}"
@@ -174,8 +189,13 @@ class AiTradeDecider:
 
     # ---------- 轮次记录 + 滚动摘要 ----------
     async def commit_round(self, payload: dict, decision: TradeDecision,
-                           executed: dict) -> str | None:
-        """记录本轮（追加 _context + _journal），到期触发摘要重置；返回新摘要文本或 None。"""
+                           executed: dict, *, analysis: str | None = None) -> str | None:
+        """记录本轮（追加 _context + _journal），到期触发摘要重置；返回新摘要文本或 None。
+
+        `analysis`（keyword-only，默认 None → 回测/单测既有调用零回归）：本轮研判的**有界摘录**
+        （由调用方从 `last_analysis` 截到 ≤`_ANALYSIS_EXCERPT_CHARS`，RC-2/RC-3），入 journal 供滚动摘要
+        沉淀「哪些信号被采纳/推翻」；完整思维链只走 agent_trace 流与 `_traces`，绝不入 journal（防膨胀）。
+        """
         self._last_round = int(payload.get("round") or self._last_round + 1)
         tool_id = uuid.uuid4().hex
         decision_input = {"action": decision.action, "sizeFraction": decision.size_fraction,
@@ -190,7 +210,7 @@ class AiTradeDecider:
             "round": self._last_round, "signalBoard": payload.get("signalBoard"),
             "decision": decision_input, "executed": executed,
             "positionAfter": executed.get("positionAfter"),
-            "sessionPnl": payload.get("sessionPnlUsd")})
+            "sessionPnl": payload.get("sessionPnlUsd"), "analysis": analysis})
         self._rounds_since_summary += 1
         self._trim_context()
         if self._rounds_since_summary >= self.context_refresh_rounds:

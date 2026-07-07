@@ -35,6 +35,55 @@ export interface Consensus {
   agreement: number;    // max(long,short)/total ∈ [0,1]
 }
 
+// 市场证据摘要（R1，ai-trade-reasoning-chain）：与后端 market_digest.build_market_digest 产物 wire 镜像。
+// 单技术因子读数：value 可为 null（数据不足/除零），label 为定性枚举（前端另做中文化）。
+export interface FactorReading {
+  value: number | null;
+  label: string;
+}
+
+// 价格走势证据：趋势 / 动量 / 均线结构 / 摆动结构 / 区间位置（分母 0 时对应字段为 null）。
+export interface PriceAction {
+  changePct: number;
+  trend: string;               // up | down | flat
+  emaFast: number;
+  emaSlow: number;
+  emaRelation: string;         // fast_above | fast_below
+  emaSlopePct: number | null;
+  rangePos: number | null;     // ∈[0,1]
+  swingHigh: number;
+  swingLow: number;
+  consecUp: number;
+  consecDown: number;
+  lastBar: { o: number; h: number; l: number; c: number; bodyPct: number | null };
+}
+
+// 成交量证据：量能水平 / 量比 / zscore / 放缩趋势 / 异常放量。
+export interface VolumeContext {
+  last: number;
+  sma: number;
+  ratio: number | null;
+  zscore: number | null;
+  trend: string;               // rising | falling | flat
+  spike: boolean;
+}
+
+// 一组固定经典技术因子读数（RSI/MACD 柱/布林%B/ATR%/动量 ROC）。
+export interface FactorReadings {
+  rsi14: FactorReading;
+  macdHist: FactorReading;
+  bollPctB: FactorReading;
+  atrPct: FactorReading;
+  rocPct: FactorReading;
+}
+
+// 市场证据摘要（R1）：任一子段可为 null（数据不足），整体在禁用/窗口不足时为 null（prompt/前端省略该段）。
+export interface MarketDigest {
+  priceAction: PriceAction | null;
+  volume: VolumeContext | null;
+  factors: FactorReadings | null;
+}
+
 // 本轮 AI 决策（受约束）：action + 可选仓位占比/置信度 + 理由 + 信号板 + 执行结果 + 体制/共识/降级（E1/E2/E3）。
 export interface AiTradeDecision {
   ts: number;
@@ -57,6 +106,8 @@ export interface AiTradeDecision {
   marketContext?: MarketContext | null;   // E1（可为 null）
   consensus?: Consensus | null;           // E2
   degradeReason?: string | null;          // E3（low_consensus(k/n) / decision_timeout / … 或 null）
+  analysis?: string | null;               // R1：研判思维链有界摘录（≤400 字；完整全文见 agentTraces）
+  marketDigest?: MarketDigest | null;     // R1：价格走势/成交量/因子证据摘要（可为 null）
 }
 
 // 决策认知轨迹阶段（ai-auto-trading-agent-trace §5.3；与后端 trace.PHASES 镜像）。
@@ -92,6 +143,7 @@ export interface AiTradeTraceEvent {
   signalBoard?: StrategySignalView[]; // round_start
   marketContext?: MarketContext | null; // round_start
   consensus?: Consensus | null; // round_start
+  marketDigest?: MarketDigest | null; // round_start（R1：价格走势/成交量/因子证据摘要）
 }
 
 // store / snapshot 的已装配单轮轨迹（thinking/analysis 累积；env 环形 ≤20）。
@@ -103,6 +155,7 @@ export interface AiTradeRoundTrace {
   signalBoard: StrategySignalView[];
   marketContext?: MarketContext | null;
   consensus?: Consensus | null;
+  marketDigest?: MarketDigest | null; // R1：价格走势/成交量/因子证据摘要（round_start 承载）
   thinking: string; // 累积深度思考（未开启扩展思考时通常为空）
   analysis: string; // 累积自然语言研判分析（流式主可见内容）
   toolCallPending?: boolean;

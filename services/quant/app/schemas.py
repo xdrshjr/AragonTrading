@@ -389,6 +389,9 @@ class AiTradeDecisionOut(BaseModel):
     marketContext: dict | None = None   # E1：{primary,volatility,event,confidence,labels} 或 None
     consensus: dict | None = None       # E2：{longVotes,shortVotes,flatVotes,total,netStance,agreement}
     degradeReason: str | None = None    # E3：安全回落/共识门禁原因（low_consensus(k/n)/decision_timeout/…）
+    # R1 思维链研判增量（ai-trade-reasoning-chain，可选、向后兼容）：
+    analysis: str | None = None         # 研判思维链的有界摘录（≤400 字，供左栏决策卡首段；完整全文走 agentTraces）
+    marketDigest: dict | None = None    # {priceAction,volume,factors} 价格走势/成交量/因子证据摘要，或 None
 
 
 class AiTradeRoundTraceOut(BaseModel):
@@ -404,6 +407,7 @@ class AiTradeRoundTraceOut(BaseModel):
     signalBoard: list[StrategySignalViewOut] = Field(default_factory=list)
     marketContext: dict | None = None
     consensus: dict | None = None
+    marketDigest: dict | None = None    # R1：round_start/trace 承载的价格走势/成交量/因子证据摘要，或 None（RC-9）
     thinking: str = ""
     analysis: str = ""
     toolCall: dict | None = None

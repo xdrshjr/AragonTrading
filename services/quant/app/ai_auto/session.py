@@ -31,6 +31,7 @@ from ..paper.strategy_factory import PaperStrategySpec
 from ..strategies.base import Signal
 from .decider import AiTradeDecider, TradeDecision
 from .market_context import build_market_context
+from .market_digest import build_market_digest
 from .market_window import MarketWindow
 from .prompts import DECISION_TOOL_NAME
 from .signals import (
@@ -46,6 +47,9 @@ from .trace import _TRACES_MAX, TraceEmit, new_round_trace, trace_event
 
 _SNAPSHOT_EQUITY_MAX = 1000
 _DECISIONS_MAX = 50
+# 研判思维链有界摘录长度（ai-trade-reasoning-chain §2.5，RC-2/RC-3）：进 journal（摘要素材）与 decision
+# 事件（_decisions 环形 + WS snapshot 重放）的一律为此摘录；完整全文只走 agent_trace 流与 _traces(≤20)。
+_ANALYSIS_EXCERPT_CHARS = 400
 
 logger = logging.getLogger(__name__)
 
@@ -335,14 +339,18 @@ class AiTradeSession:
             decision, degrade = self._apply_consensus_gate(decision, consensus, degrade)  # E2 门禁
             executed = await self._execute_decision(decision, ref_px, i, ts)
             self.rounds_completed = round_no
+            # RC-2/RC-3：研判全文只走 agent_trace/_traces；进 journal 与 decision 事件的取有界摘录（≤400）。
+            # 降级轮 last_analysis 恒为空串（RC-1）→ excerpt=None（journal/事件不带残段）。
+            excerpt = self.decider.last_analysis[:_ANALYSIS_EXCERPT_CHARS] or None
             # R-P1-3：commit_round 收门禁后的最终 decision，journal/摘要据此记真实动作（保持上下文纯净）。
-            summary = await self.decider.commit_round(payload, decision, executed)
+            summary = await self.decider.commit_round(payload, decision, executed, analysis=excerpt)
             await self._emit_tool_call_trace(round_no, ts, decision)
             await self._emit_result_trace(round_no, ts, executed, degrade)
             await self._emit_decision(round_no, ts, decision, board, executed,
                                       market_context=payload.get("marketContext"),
                                       consensus=payload.get("consensus"),
-                                      degrade_reason=degrade)
+                                      degrade_reason=degrade, analysis=excerpt,
+                                      market_digest=payload.get("marketDigest"))
             if degrade:
                 await self._emit_degraded(ts, degrade)
             if summary is not None:
@@ -370,7 +378,7 @@ class AiTradeSession:
         await self._push(trace_event(
             "round_start", round_no, ts, lastPx=ref_px, position=trace["position"],
             signalBoard=trace["signalBoard"], marketContext=trace["marketContext"],
-            consensus=trace["consensus"]))
+            consensus=trace["consensus"], marketDigest=trace["marketDigest"]))
 
     def _make_trace_emit(self, round_no: int, ts: int) -> TraceEmit:
         """返回注入 decider 的 emit 闭包：补 round/ts、原地累积 thinking/analysis、扇出 agent_trace。"""
@@ -517,6 +525,8 @@ class AiTradeSession:
             "takeProfitUsd": self.take_profit_usd, "stopLossUsd": self.stop_loss_usd,
             "marketContext": build_market_context(         # E1：只读；数据不足/禁用/异常 → None
                 self._window.base_df(), self.bar, self.executor.settings),
+            "marketDigest": build_market_digest(           # R1：价格走势/成交量/因子证据；同样安全降级 → None
+                self._window.base_df(), self.bar, self.executor.settings),
             "signalBoard": [self._view_full(v) for v in board]}
 
     @staticmethod
@@ -544,13 +554,20 @@ class AiTradeSession:
                              board: list[StrategySignalView], executed: dict, *,
                              market_context: dict | None = None,
                              consensus: dict | None = None,
-                             degrade_reason: str | None = None) -> None:
-        """推 decision 事件；E1/E2/E3 三个可选字段搭顺风车下发（旧前端忽略未知字段，向前兼容）。"""
+                             degrade_reason: str | None = None,
+                             analysis: str | None = None,
+                             market_digest: dict | None = None) -> None:
+        """推 decision 事件；E1/E2/E3 + R1 研判摘录/证据摘要搭顺风车下发（旧前端忽略未知字段，向前兼容）。
+
+        `analysis` 为有界摘录（≤`_ANALYSIS_EXCERPT_CHARS`，供左栏决策卡首段；完整思维链见 agent_trace/
+        snapshot.agentTraces，RC-3）；`market_digest` 为本轮价格走势/成交量/因子证据（小、~10 数值）。
+        """
         data = {"ts": ts, "round": round_no, "action": decision.action,
                 "sizeFraction": decision.size_fraction, "confidence": decision.confidence,
                 "reason": decision.reason, "signalBoard": [self._view_slim(v) for v in board],
                 "executed": executed, "marketContext": market_context,
-                "consensus": consensus, "degradeReason": degrade_reason}
+                "consensus": consensus, "degradeReason": degrade_reason,
+                "analysis": analysis, "marketDigest": market_digest}
         self._last_decision = data
         self._decisions.append(data)
         await self._push({"type": "decision", "data": data})
@@ -560,7 +577,8 @@ class AiTradeSession:
                 "sizeFraction": None, "confidence": None, "reason": "上一轮决策仍在进行，本轮跳过",
                 "signalBoard": [self._view_slim(v) for v in board],
                 "executed": {"ok": True, "skipped": True, "reason": "decision_in_flight"},
-                "marketContext": None, "consensus": None, "degradeReason": None}
+                "marketContext": None, "consensus": None, "degradeReason": None,
+                "analysis": None, "marketDigest": None}
         self._last_decision = data
         self._decisions.append(data)
         await self._push({"type": "decision", "data": data})

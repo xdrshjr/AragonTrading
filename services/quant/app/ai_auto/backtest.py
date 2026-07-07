@@ -17,7 +17,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pandas as pd
 from fastapi import HTTPException
@@ -39,6 +39,7 @@ from ..agent.services import load_htf_frames, load_range_candles
 from .backtest_frames import build_backtest_frames
 from .decider import AiTradeDecider, TradeDecision
 from .market_context import build_market_context
+from .market_digest import build_market_digest
 from .prompts import build_ai_trade_system_prompt
 from .signals import (
     Consensus,
@@ -344,6 +345,8 @@ class AiBacktestRunner:
             "sessionPnlUsd": round(session_pnl, 4), "budgetUsd": self.initial_capital,
             "takeProfitUsd": self.take_profit_usd, "stopLossUsd": self.stop_loss_usd,
             "marketContext": build_market_context(main_df.iloc[:i + 1], self.bar, self.settings),
+            "marketDigest": build_market_digest(         # R1：因果切片 iloc[:i+1]，末行=当前决策根（无未来函数）
+                main_df.iloc[:i + 1], self.bar, self.settings),
             "consensus": _consensus_wire(consensus),
             "signalBoard": [_view_full(v) for v in board]}
 
@@ -375,6 +378,7 @@ class AiBacktestRunner:
                 "confidence": decision.confidence, "reason": decision.reason,
                 "signalBoard": [_view_slim(v) for v in board],
                 "marketContext": payload.get("marketContext"), "consensus": payload.get("consensus"),
+                "marketDigest": payload.get("marketDigest"),   # RC-10：与实盘 decision 事件对称
                 "degradeReason": degrade, "executed": executed}
         self._decisions_digest.append(data)
         job.publish({"type": "decision", "data": data})

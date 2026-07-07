@@ -7,7 +7,11 @@ import type {
   AiTradeDecision,
   AiTradeStopReason,
   Consensus,
+  FactorReading,
+  FactorReadings,
   MarketContext,
+  PriceAction,
+  VolumeContext,
 } from "./aiTradeTypes";
 
 export { clampBudgetToCap, deriveDefaultBudget };
@@ -141,6 +145,76 @@ export function describeConsensus(consensus: Consensus | null | undefined): stri
   if (!consensus) return "";
   const pct = Math.round((consensus.agreement ?? 0) * 100);
   return `${consensus.longVotes}多/${consensus.shortVotes}空/${consensus.flatVotes}空仓 · 一致度 ${pct}%`;
+}
+
+// ---- R1 市场证据摘要中文化（镜像 describeRegime：空→""、未知枚举缺省回原值不臆造）----
+const TREND_LABELS: Record<string, string> = { up: "上行", down: "下行", flat: "横盘" };
+const EMA_RELATION_LABELS: Record<string, string> = { fast_above: "多头排列", fast_below: "空头排列" };
+const VOL_TREND_LABELS: Record<string, string> = { rising: "放量", falling: "缩量", flat: "平稳" };
+// 因子定性枚举 → 中文（RSI/MACD/布林/ATR/动量共用一张表；缺省回原值）。
+const FACTOR_LABELS: Record<string, string> = {
+  overbought: "超买",
+  oversold: "超卖",
+  neutral: "中性",
+  bullish: "偏多",
+  bearish: "偏空",
+  upper_break: "上破",
+  lower_break: "下破",
+  upper_half: "上半区",
+  lower_half: "下半区",
+  high: "偏高",
+  low: "偏低",
+  normal: "常态",
+  positive: "正向",
+  negative: "负向",
+};
+
+/**
+ * 价格走势证据中文化（R1）：`价格 · 走势 上行(+1.2%) · 多头排列 · 区间位 78%`。
+ * 空→""；未知 trend/emaRelation 缺省回原值；rangePos 为 null 时省略该段。
+ */
+export function describePriceAction(pa: PriceAction | null | undefined): string {
+  if (!pa) return "";
+  const trend = TREND_LABELS[pa.trend] ?? pa.trend;
+  const sign = pa.changePct > 0 ? "+" : "";
+  const parts = [`走势 ${trend}(${sign}${pa.changePct}%)`];
+  if (pa.emaRelation) parts.push(EMA_RELATION_LABELS[pa.emaRelation] ?? pa.emaRelation);
+  if (pa.rangePos != null) parts.push(`区间位 ${Math.round(pa.rangePos * 100)}%`);
+  return `价格 · ${parts.join(" · ")}`;
+}
+
+/**
+ * 成交量证据中文化（R1）：`成交量 · 放量 · 量比 1.8 · 异常放量`。
+ * 空→""；未知 trend 缺省回原值；量比 null 时省略；spike 时追加「异常放量」。
+ */
+export function describeVolume(vol: VolumeContext | null | undefined): string {
+  if (!vol) return "";
+  const trend = VOL_TREND_LABELS[vol.trend] ?? vol.trend;
+  const parts = [`量能 ${trend}`];
+  if (vol.ratio != null) parts.push(`量比 ${vol.ratio}`);
+  if (vol.spike) parts.push("异常放量");
+  return `成交量 · ${parts.join(" · ")}`;
+}
+
+function describeFactorReading(name: string, r: FactorReading | undefined): string | null {
+  if (!r) return null;
+  return `${name} ${FACTOR_LABELS[r.label] ?? r.label}`;
+}
+
+/**
+ * 技术因子读数中文化（R1）：`因子 · RSI 中性 · MACD 偏多 · 布林 上半区 · ATR 常态 · 动量 正向`。
+ * 空→""；未知 label 缺省回原值。
+ */
+export function describeFactors(factors: FactorReadings | null | undefined): string {
+  if (!factors) return "";
+  const parts = [
+    describeFactorReading("RSI", factors.rsi14),
+    describeFactorReading("MACD", factors.macdHist),
+    describeFactorReading("布林", factors.bollPctB),
+    describeFactorReading("ATR", factors.atrPct),
+    describeFactorReading("动量", factors.rocPct),
+  ].filter((p): p is string => Boolean(p));
+  return parts.length ? `因子 · ${parts.join(" · ")}` : "";
 }
 
 export type AiExecTone = "long" | "short" | "muted";
