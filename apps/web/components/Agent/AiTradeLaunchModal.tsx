@@ -2,7 +2,7 @@
 
 import { useQuery } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
-import { Badge, Button, Modal } from "@/components/ui";
+import { Badge, Button, Modal, Select } from "@/components/ui";
 import { api } from "@/lib/api";
 import {
   AI_BACKTEST_DEFAULT_DECISION_EVERY,
@@ -15,13 +15,14 @@ import {
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
   AI_TRADE_MAX_SL_PCT,
   AI_TRADE_MAX_STRATEGIES,
+  AI_TRADE_MAX_SYMBOLS,
   AI_TRADE_MAX_TP_PCT,
   clampBudgetToCap,
   deriveDefaultBudget,
   validateContextRounds,
   validateStrategySelection,
 } from "@/lib/aiTrade";
-import { isAutoTradable } from "@/lib/autoTrade";
+import { isAutoTradable, memberBudget, totalAllocation } from "@/lib/autoTrade";
 import { fmtPrice } from "@/lib/format";
 import {
   clampPct,
@@ -31,15 +32,23 @@ import {
   parseOptionalPct,
   parseOptionalUsd,
 } from "@/lib/liveAuto";
+import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
 import { tradingApi } from "@/lib/tradingApi";
+import type { Bar } from "@/lib/types";
 
 export type AiTradeLaunchMode = "live" | "backtest";
 
+// 时间级别候选（镜像 ChartToolbar 的 BARS；弹窗「时间级别」下拉可编辑）。
+const BARS: Bar[] = ["1m", "5m", "15m", "30m", "1H", "4H", "1D"];
+
 export interface AiTradeLaunchOpts {
   mode: AiTradeLaunchMode;
-  instId: string;
+  members: { instId: string; allocationPct: number }[]; // 实盘多标的（回测取 members[0] 兜底）
+  allocationMode: AutoTradeAllocationMode;               // even | max_ratio
+  instId: string;                                        // 回测单标的（members[0] 兜底）
+  bar: string;                                           // 可编辑周期（取代对 store.bar 的直读）
   strategyIds: number[];
-  capitalUsd: number | null;       // live=总预算；backtest=初始资金（留空＝服务端默认）
+  capitalUsd: number | null;       // live=分组总预算；backtest=初始资金（留空＝服务端默认）
   leverage: number | null;
   takeProfitUsd: number | null;
   stopLossUsd: number | null;
@@ -56,10 +65,10 @@ export interface AiTradeLaunchOpts {
 const DAY = 86_400;
 
 /**
- * 启动 AI 自动交易弹窗（ai-auto-trading §2.7 + backtest §2.10）：顶部「实盘 / 回测」段控。
- * 实盘段：多选策略 + 标的 + 预算/杠杆/OCO/总止盈损 + 上下文轮数 + 真实资金勾选（走 resolveAiTradeGate 门禁）。
- * 回测段：多选策略 + 标的 + 回测区间 + 决策间隔 + 初始资金/杠杆/OCO/会话止盈损 + 上下文轮数 + 共识门槛
- * + 计划轮数只读预览（纯模拟、无真实资金、去 acknowledged 依赖）。
+ * 启动 AI 自动交易弹窗（ai-trade-multi-symbol-and-timeframe §4.2/§4.3）：顶部「实盘 / 回测」段控。
+ * 实盘段：**多标的选择器**（默认回填左侧「自动交易」面板的 autoTradeMembers，至多 AI_TRADE_MAX_SYMBOLS 个、
+ * 超出提示并禁增；每成员 allocation% + 移除 + 均分 + even/max_ratio 段控）+ **可编辑时间级别** + 多选策略 +
+ * 预算/杠杆/OCO/总止盈损 + 上下文轮数 + 真实资金勾选。回测段：仍单标的（默认 members[0]），同享可编辑周期。
  */
 export default function AiTradeLaunchModal({
   open,
@@ -68,7 +77,9 @@ export default function AiTradeLaunchModal({
   submitting,
   acknowledged,
   onAcknowledge,
-  bar,
+  bar: propBar,
+  defaultMembers,
+  defaultAllocationMode,
   defaultInstId,
   defaultStrategyIds,
   defaultContextRounds,
@@ -84,8 +95,10 @@ export default function AiTradeLaunchModal({
   submitting: boolean;
   acknowledged: boolean;
   onAcknowledge: (value: boolean) => void;
-  bar: string;
-  defaultInstId: string;
+  bar: string;                        // K 线所选周期（回填「时间级别」下拉默认值）
+  defaultMembers: AutoTradeMember[];  // 来自 autoTradeMembers（可 > 上限，弹窗内截断并提示，P1-2）
+  defaultAllocationMode: AutoTradeAllocationMode;   // 来自 store.autoTradeAllocationMode（P1-2）
+  defaultInstId: string;              // 当前图表标的（autoTradeMembers 空时回退单成员）
   defaultStrategyIds: number[];
   defaultContextRounds: number;
   error?: string | null;
@@ -96,7 +109,12 @@ export default function AiTradeLaunchModal({
 }) {
   const liveAvailable = liveGateReason == null;
   const [mode, setMode] = useState<AiTradeLaunchMode>(liveAvailable ? "live" : "backtest");
-  const [instId, setInstId] = useState(defaultInstId);
+  const [members, setMembers] = useState<AutoTradeMember[]>([]);
+  const [allocationMode, setAllocationMode] = useState<AutoTradeAllocationMode>(defaultAllocationMode);
+  const [bar, setBar] = useState<Bar>(propBar as Bar);
+  const [instId, setInstId] = useState(defaultInstId);   // 回测单标的
+  const [addSymbolRaw, setAddSymbolRaw] = useState("");
+  const [addError, setAddError] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<number[]>(defaultStrategyIds);
   const [capitalRaw, setCapitalRaw] = useState("");
   const [leverageRaw, setLeverageRaw] = useState("");
@@ -110,19 +128,33 @@ export default function AiTradeLaunchModal({
   const [everyRaw, setEveryRaw] = useState("");
   const [minConsensusRaw, setMinConsensusRaw] = useState("");
 
+  // 回填种子：autoTradeMembers 非空则取前 AI_TRADE_MAX_SYMBOLS 个；否则回退当前图表标的单成员 100%（P1-2）。
+  const seededMembers = useMemo<AutoTradeMember[]>(() => {
+    const src = defaultMembers.length > 0 ? defaultMembers : [{ instId: defaultInstId, allocationPct: 100 }];
+    return src.slice(0, AI_TRADE_MAX_SYMBOLS).map((m) => ({ ...m }));
+  }, [defaultMembers, defaultInstId]);
+  const truncated = defaultMembers.length > AI_TRADE_MAX_SYMBOLS;
+  const atCap = members.length >= AI_TRADE_MAX_SYMBOLS;
+
   const strategiesQ = useQuery({ queryKey: ["strategies"], queryFn: api.strategies });
+  const budgetInst = mode === "live" ? (members[0]?.instId ?? "") : instId;
   const configQ = useQuery({
-    queryKey: ["trading", "config", instId, null],
-    queryFn: () => tradingApi.config(instId),
-    enabled: open && !!instId && mode === "live",
+    queryKey: ["trading", "config", budgetInst, null],
+    queryFn: () => tradingApi.config(budgetInst),
+    enabled: open && !!budgetInst && mode === "live",
   });
   const availUsdt = configQ.data?.availUsdt ?? null;
 
-  // 弹窗每次打开：回落默认段 / 标的 / 策略 / 轮数 / 区间并清空金额输入。
+  // 弹窗每次打开：回落默认段 / 成员 / 分配模式 / 周期 / 策略 / 轮数 / 区间并清空金额输入。
   useEffect(() => {
     if (!open) return;
     setMode(liveAvailable ? "live" : "backtest");
-    setInstId(defaultInstId);
+    setMembers(seededMembers);
+    setAllocationMode(defaultAllocationMode);
+    setBar(propBar as Bar);
+    setInstId(seededMembers[0]?.instId ?? defaultInstId);
+    setAddSymbolRaw("");
+    setAddError(null);
     setSelectedIds(defaultStrategyIds);
     setRoundsRaw(String(defaultContextRounds || AI_TRADE_DEFAULT_CONTEXT_ROUNDS));
     setCapitalRaw("");
@@ -136,10 +168,43 @@ export default function AiTradeLaunchModal({
     setEndInput(toLocalInput(defaultEndTs ?? nowSec));
     setEveryRaw(defaultDecisionEveryBars ? String(defaultDecisionEveryBars) : "");
     setMinConsensusRaw("");
-  }, [open, defaultInstId, defaultContextRounds, defaultStartTs, defaultEndTs, defaultDecisionEveryBars, liveAvailable]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open, propBar, defaultAllocationMode, defaultInstId, seededMembers, defaultStrategyIds, defaultContextRounds, defaultStartTs, defaultEndTs, defaultDecisionEveryBars, liveAvailable]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleId = (id: number) =>
     setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+
+  // ---------- 成员编辑（实盘多标的）----------
+  const updateAllocation = (target: string, raw: string) => {
+    const n = Number(raw);
+    setMembers((prev) =>
+      prev.map((m) => (m.instId === target ? { ...m, allocationPct: Number.isFinite(n) ? n : 0 } : m)),
+    );
+  };
+  const removeMember = (target: string) =>
+    setMembers((prev) => prev.filter((m) => m.instId !== target));
+  const applyEvenSplit = () =>
+    setMembers((prev) => {
+      if (prev.length === 0) return prev;
+      const each = Math.floor((100 / prev.length) * 100) / 100;
+      return prev.map((m) => ({ ...m, allocationPct: each }));
+    });
+  const handleAddSymbol = () => {
+    const sym = addSymbolRaw.trim().toUpperCase();
+    if (!sym || atCap) return;
+    if (!isAutoTradable(sym)) {
+      setAddError("仅支持 USDT 本位永续 / 交割合约自动交易");
+      return;
+    }
+    if (members.some((m) => m.instId === sym)) {
+      setAddError("标的已在列表中");
+      return;
+    }
+    setAddError(null);
+    const remaining = Math.max(1, Math.round(100 - totalAllocation(members)));
+    const pct = allocationMode === "even" ? Math.min(100, remaining) : 100;
+    setMembers((prev) => [...prev, { instId: sym, allocationPct: pct }]);
+    setAddSymbolRaw("");
+  };
 
   const capital = parseOptionalUsd(capitalRaw);
   const leverage = parseOptionalLeverage(leverageRaw);
@@ -153,7 +218,23 @@ export default function AiTradeLaunchModal({
     stopLossPct.error || takeProfitPct.error || null;
   const strategyError = validateStrategySelection(selectedIds);
   const roundsError = validateContextRounds(roundsValue);
-  const instSupported = isAutoTradable(instId);
+
+  // 成员校验（实盘）：非空、皆可自动交易、各 pct ∈ (0,100]，even 模式 Σ ≤ 100（避免提交即 422）。
+  const sumPct = totalAllocation(members);
+  const hasUnsupportedMember = members.some((m) => !isAutoTradable(m.instId));
+  const membersError =
+    members.length === 0
+      ? "请至少保留一个自动交易标的"
+      : hasUnsupportedMember
+        ? "含不支持自动交易的标的（仅 USDT 本位永续 / 交割合约）"
+        : members.some((m) => !(m.allocationPct > 0 && m.allocationPct <= 100))
+          ? "每个标的百分比须在 (0, 100] 之间"
+          : allocationMode === "even" && sumPct > 100 + 1e-9
+            ? "各标的百分比之和不可超过 100%（或切换为「独立上限」）"
+            : null;
+  const oversubscribed = allocationMode === "max_ratio" && sumPct > 100 + 1e-9;
+
+  const instSupported = isAutoTradable(instId);   // 回测单标的
 
   // 回测区间 + 决策间隔 + 计划轮数（R5：UI 默认永不越界自拒）。
   const startTs = fromLocalInput(startInput);
@@ -184,6 +265,7 @@ export default function AiTradeLaunchModal({
       ? `计划决策轮数 ${plannedRounds} 超上限 ${AI_BACKTEST_MAX_ROUNDS}，请缩短区间或增大决策间隔`
       : null;
 
+  // 生效总预算预览（分组总额；availUsdt 取 members[0] 的 config，账户级，P2-2）。
   const previewBudget = useMemo(() => {
     if (availUsdt == null) return null;
     const raw = capital.value ?? deriveDefaultBudget(availUsdt);
@@ -191,16 +273,15 @@ export default function AiTradeLaunchModal({
   }, [availUsdt, capital.value]);
 
   const usingDefault = capital.value == null;
-  const commonValid = !inputError && !strategyError && !roundsError && instSupported && !!instId;
+  const baseValid = !inputError && !strategyError && !roundsError;
   const ready =
     mode === "live"
-      ? commonValid && acknowledged
-      : commonValid && !rangeError && !everyError && !minConsensusError && !roundsCapError;
+      ? baseValid && !membersError && acknowledged
+      : baseValid && instSupported && !!instId && !rangeError && !everyError && !minConsensusError && !roundsCapError;
 
   const handleConfirm = () => {
     if (!ready || submitting) return;
     const base = {
-      instId,
       strategyIds: selectedIds,
       capitalUsd: capital.value,
       leverage: leverage.value,
@@ -209,13 +290,17 @@ export default function AiTradeLaunchModal({
       stopLossPct: stopLossPct.value,
       takeProfitPct: takeProfitPct.value,
       contextRefreshRounds: roundsValue,
+      bar,                                          // 可编辑周期真正生效（不再被 store.bar 覆盖）
     };
     if (mode === "live") {
-      onConfirm({ mode: "live", ...base });
+      onConfirm({ mode: "live", members, allocationMode, instId: members[0]?.instId ?? instId, ...base });
       return;
     }
     onConfirm({
       mode: "backtest",
+      members,
+      allocationMode,
+      instId,
       ...base,
       startTs: startTs ?? undefined,
       endTs: endTs ?? undefined,
@@ -228,9 +313,9 @@ export default function AiTradeLaunchModal({
     strategyError ||
     roundsError ||
     inputError ||
+    (mode === "live" ? membersError : instSupported ? null : "标的不支持自动交易（仅 USDT 本位永续 / 交割合约）") ||
     (mode === "backtest" ? rangeError || everyError || minConsensusError || roundsCapError : null) ||
-    error ||
-    (!instSupported ? "标的不支持自动交易（仅 USDT 本位永续 / 交割合约）" : null);
+    error;
 
   const title = mode === "backtest" ? "AI 自动交易 · 回测" : "启动 AI 自动交易";
 
@@ -244,7 +329,7 @@ export default function AiTradeLaunchModal({
       </div>
 
       <div className="flex max-h-[62vh] flex-col gap-3 overflow-auto px-5 py-4">
-        {/* 模式段控（实盘 / 回测）——满足需求「弹窗中可选择回测模式」。 */}
+        {/* 模式段控（实盘 / 回测）。 */}
         <div className="flex gap-1 rounded-md bg-[var(--surface-2)] p-0.5">
           <ModeTab
             active={mode === "live"}
@@ -268,10 +353,29 @@ export default function AiTradeLaunchModal({
           ) : (
             <>
               AI 助手将作为决策者，综合研判所选<strong className="text-[var(--text)]">多个策略</strong>的实时信号，
-              在每根 K 线上决定开多 / 开空 / 平仓 / 观望，真单经既有守护执行器落地并继承全部资金护栏。
+              对下方<strong className="text-[var(--text)]">全部标的</strong>同时在每根 K 线上决定开多 / 开空 /
+              平仓 / 观望，真单经既有守护执行器落地并继承全部资金护栏。
             </>
           )}
         </p>
+
+        {/* 时间级别（默认 K 线所选周期，可修改，两模式共用）。 */}
+        <label className="flex flex-col gap-1 text-[11px] text-[var(--muted)]">
+          <span>时间级别（默认 K 线所选周期，可修改）</span>
+          <Select
+            value={bar}
+            disabled={submitting}
+            onChange={(e) => setBar(e.target.value as Bar)}
+            className="text-xs"
+            aria-label="时间级别"
+          >
+            {BARS.map((b) => (
+              <option key={b} value={b}>
+                {b}
+              </option>
+            ))}
+          </Select>
+        </label>
 
         {/* 多选策略清单（≥1、≤上限，两模式共用）。 */}
         <div className="flex flex-col gap-1 text-[11px] text-[var(--muted)]">
@@ -303,17 +407,128 @@ export default function AiTradeLaunchModal({
           </div>
         </div>
 
-        {/* 标的（默认当前图表标的，可改，两模式共用）。 */}
-        <label className="flex flex-col gap-1 text-[11px] text-[var(--muted)]">
-          <span>标的（默认当前图表标的，仅 USDT 本位永续 / 交割合约）</span>
-          <input
-            type="text"
-            value={instId}
-            disabled={submitting}
-            onChange={(e) => setInstId(e.target.value.trim().toUpperCase())}
-            className="rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-xs uppercase text-[var(--text)] outline-none focus:border-[var(--accent)] disabled:opacity-50"
-          />
-        </label>
+        {mode === "live" ? (
+          /* 实盘：多标的分配选择器（默认回填 autoTradeMembers）。 */
+          <div className="flex flex-col gap-1.5 text-[11px] text-[var(--muted)]">
+            <div className="flex items-center justify-between gap-2">
+              <span>
+                自动交易标的（默认取自左侧「自动交易」面板）· 已选{" "}
+                <span className="font-medium text-[var(--text)]">{members.length}</span>/{AI_TRADE_MAX_SYMBOLS}
+              </span>
+              <div className="flex items-center gap-1">
+                <AllocModeTab active={allocationMode === "even"} disabled={submitting} onClick={() => setAllocationMode("even")}>
+                  均分份额
+                </AllocModeTab>
+                <AllocModeTab active={allocationMode === "max_ratio"} disabled={submitting} onClick={() => setAllocationMode("max_ratio")}>
+                  独立上限
+                </AllocModeTab>
+                <button
+                  type="button"
+                  disabled={submitting || members.length === 0}
+                  onClick={applyEvenSplit}
+                  className="rounded border border-[var(--border)] px-2 py-0.5 text-[10px] text-[var(--text)] hover:bg-[var(--surface-2)] disabled:opacity-40"
+                >
+                  均分
+                </button>
+              </div>
+            </div>
+            {truncated && (
+              <p className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1 text-[10px] leading-relaxed text-[var(--muted)]">
+                左侧已配置 {defaultMembers.length} 个标的，已达 AI 自动交易标的上限 {AI_TRADE_MAX_SYMBOLS}，
+                仅前 {AI_TRADE_MAX_SYMBOLS} 个入选（可在此手动增删）。
+              </p>
+            )}
+            <div className="overflow-hidden rounded-md border border-[var(--border)]">
+              <div className="flex items-center justify-between bg-[var(--surface-2)] px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
+                <span>标的</span>
+                <span>{allocationMode === "max_ratio" ? "上限% · 预算预览" : "百分比% · 预算预览"}</span>
+              </div>
+              {members.map((m) => (
+                <div
+                  key={m.instId}
+                  className="flex items-center justify-between gap-2 border-t border-[var(--border)] px-3 py-1.5 text-xs"
+                >
+                  <span className="flex items-center gap-1.5 truncate text-[var(--text)]">
+                    {m.instId}
+                    {!isAutoTradable(m.instId) && (
+                      <span className="text-[10px] text-[var(--short)]">不支持</span>
+                    )}
+                  </span>
+                  <span className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      value={String(m.allocationPct)}
+                      disabled={submitting}
+                      onChange={(e) => updateAllocation(m.instId, e.target.value)}
+                      aria-label={`${m.instId} 百分比`}
+                      className="w-14 rounded border border-[var(--border)] bg-[var(--bg)] px-1.5 py-1 text-right text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] disabled:opacity-50"
+                    />
+                    <span className="tabular text-[10px] text-[var(--muted)]">
+                      {previewBudget != null
+                        ? `${fmtPrice(memberBudget(previewBudget, m.allocationPct))} USDT`
+                        : "—"}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={submitting}
+                      onClick={() => removeMember(m.instId)}
+                      aria-label={`移除 ${m.instId}`}
+                      className="rounded px-1 text-[var(--muted)] hover:text-[var(--short)] disabled:opacity-40"
+                    >
+                      ✕
+                    </button>
+                  </span>
+                </div>
+              ))}
+              {/* 新增标的（达上限即禁用）。 */}
+              <div className="flex items-center gap-2 border-t border-[var(--border)] px-3 py-1.5">
+                <input
+                  type="text"
+                  value={addSymbolRaw}
+                  placeholder={atCap ? `已达上限 ${AI_TRADE_MAX_SYMBOLS} 个` : "新增标的（USDT 永续 / 交割）"}
+                  disabled={submitting || atCap}
+                  onChange={(e) => setAddSymbolRaw(e.target.value.trim().toUpperCase())}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      handleAddSymbol();
+                    }
+                  }}
+                  aria-label="新增自动交易标的"
+                  className="flex-1 rounded border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-xs uppercase text-[var(--text)] outline-none focus:border-[var(--accent)] disabled:opacity-50"
+                />
+                <button
+                  type="button"
+                  disabled={submitting || atCap || !addSymbolRaw.trim()}
+                  onClick={handleAddSymbol}
+                  className="rounded border border-[var(--border)] px-2 py-1 text-[11px] text-[var(--text)] hover:bg-[var(--surface-2)] disabled:opacity-40"
+                >
+                  添加
+                </button>
+              </div>
+            </div>
+            {addError && <span className="text-[10px] text-[var(--short)]">{addError}</span>}
+            {oversubscribed && (
+              <p className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1 text-[10px] leading-relaxed text-[var(--muted)]">
+                各标的上限合计 {Math.round(sumPct * 100) / 100}%（&gt; 100%）：多标的同时触发时组合敞口可能超过总预算，
+                真实敞口仍受总预算 5% 天花板、单笔名义上限与单仓 OCO 约束。
+              </p>
+            )}
+          </div>
+        ) : (
+          /* 回测：仍单标的（默认 members[0]），同享上方可编辑周期。 */
+          <label className="flex flex-col gap-1 text-[11px] text-[var(--muted)]">
+            <span>标的（回测单标的，默认首个自动交易标的，仅 USDT 本位永续 / 交割合约）</span>
+            <input
+              type="text"
+              value={instId}
+              disabled={submitting}
+              onChange={(e) => setInstId(e.target.value.trim().toUpperCase())}
+              className="rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-xs uppercase text-[var(--text)] outline-none focus:border-[var(--accent)] disabled:opacity-50"
+            />
+          </label>
+        )}
 
         {mode === "backtest" && (
           <div className="grid grid-cols-2 gap-3">
@@ -324,7 +539,6 @@ export default function AiTradeLaunchModal({
 
         {mode === "live" ? (
           <div className="flex flex-col gap-px overflow-hidden rounded-md bg-[var(--border)]">
-            <Row label="周期" value={bar} />
             <Row label="交易账户" value="设置中心 · 默认实盘账户" />
             <Row
               label="可用余额"
@@ -337,7 +551,7 @@ export default function AiTradeLaunchModal({
               }
             />
             <Row
-              label={usingDefault ? "默认预算（可用余额 × 1%）" : "生效预算（预览 · 已按 5% 上限夹紧）"}
+              label={usingDefault ? "默认总预算（可用余额 × 1%）" : "生效总预算（预览 · 已按 5% 上限夹紧）"}
               value={previewBudget != null ? `${fmtPrice(previewBudget)} USDT` : "—"}
             />
             <Row
@@ -352,7 +566,6 @@ export default function AiTradeLaunchModal({
           </div>
         ) : (
           <div className="flex flex-col gap-px overflow-hidden rounded-md bg-[var(--border)]">
-            <Row label="周期" value={bar} />
             <Row
               label="计划决策轮数"
               value={
@@ -427,7 +640,7 @@ export default function AiTradeLaunchModal({
             />
             <span>
               我已知晓这是<strong className="text-[var(--short)]">真实资金 AI 自动交易</strong>
-              ，AI 将据所选策略信号自主决定开仓 / 平仓，盈亏由本人承担。
+              ，AI 将对上述全部标的据所选策略信号自主决定开仓 / 平仓，盈亏由本人承担。
             </span>
           </label>
         )}
@@ -497,6 +710,33 @@ function ModeTab({
       title={title}
       onClick={onClick}
       className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${
+        active
+          ? "bg-[var(--surface)] text-[var(--text)] shadow-sm"
+          : "text-[var(--muted)] hover:text-[var(--text)]"
+      } ${disabled && !active ? "cursor-not-allowed opacity-40" : ""}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function AllocModeTab({
+  active,
+  disabled,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+      className={`rounded px-2 py-0.5 text-[10px] font-medium transition-colors ${
         active
           ? "bg-[var(--surface)] text-[var(--text)] shadow-sm"
           : "text-[var(--muted)] hover:text-[var(--text)]"

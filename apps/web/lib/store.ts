@@ -28,8 +28,10 @@ import type {
 import type {
   AiTradeConfig,
   AiTradeDecision,
+  AiTradeGroupState,
   AiTradeRoundTrace,
   AiTradeSessionRow,
+  AiTradeStatusEvent,
   AiTradeTraceEvent,
 } from "./aiTradeTypes";
 import type { AiBacktestConfig } from "./aiBacktestTypes";
@@ -227,15 +229,10 @@ interface AppState {
   // 百分比的夹取 / 默认语义与守门口径；max_ratio 下各标的为独立上限（Σ 可超 100）。
   autoTradeAllocationMode: AutoTradeAllocationMode;
   liveAutoGroup: LiveAutoGroupState | null;
-  // AI 自动交易运行期态（ai-auto-trading §5.4，全部瞬态、不入 partialize，刷新由 GET /ai-trade/status
-  // 重发现）。aiTradeConfig 为持久化偏好（记忆上次选的策略集合与刷新轮数，进 partialize）。
-  aiTradeSessionId: string | null;
-  aiTradeSession: AiTradeSessionRow | null;       // 会话只读视图（status/info），WS status/decision/summary 增量合并
-  aiTradeTrades: Trade[];                         // → overlayTrades（图表 markers）
-  aiTradePosition: PaperPositionEvent | null;
-  aiTradeDecisions: AiTradeDecision[];            // 决策日志（环形≤50）
-  aiTradeTraces: AiTradeRoundTrace[];             // 决策认知轨迹（环形≤20，右侧 AI 助手面板呈现）
-  aiTradeSummary: string | null;                  // 当前上下文摘要（AI 长期记忆）
+  // AI 自动交易「分组」运行期态（ai-trade-multi-symbol-and-timeframe §4.2，瞬态、不入 partialize，
+  // 刷新由 GET /ai-trade/status 重发现）。成员按 instId 映射，各承载会话视图 / 成交 / 持仓 / 决策 / 轨迹 /
+  // 摘要（镜像 liveAutoGroup）。aiTradeConfig 为持久化偏好（记忆上次策略集合与刷新轮数，进 partialize）。
+  aiTradeGroup: AiTradeGroupState | null;
   aiTradeAcknowledged: boolean;                   // 首启风险勾选会话记忆，刷新复位
   aiTradeConfig: AiTradeConfig | null;            // 持久化偏好（进 partialize）
   // AI 回测（ai-auto-trading-backtest §5.4）：aiBacktestJobId 瞬态（GET /ai-trade/backtest/{id} 重发现）；
@@ -337,19 +334,20 @@ interface AppState {
   setLiveAutoMemberTrades: (instId: string, trades: Trade[]) => void;
   appendLiveAutoMemberTrade: (instId: string, trade: Trade) => void;
   clearLiveAutoGroup: () => void;
-  // AI 自动交易运行期态（瞬态）：句柄 / 会话视图 / 成交流 / 持仓 / 决策日志 / 摘要 / 风险勾选 + 清理；
-  // aiTradeConfig 为持久化偏好 setter。
-  setAiTradeSessionId: (id: string | null) => void;
-  setAiTradeSession: (session: AiTradeSessionRow | null) => void;
-  patchAiTradeSession: (patch: Partial<AiTradeSessionRow>) => void;
-  setAiTradeTrades: (trades: Trade[]) => void;
-  appendAiTradeTrade: (trade: Trade) => void;
-  setAiTradePosition: (pos: PaperPositionEvent | null) => void;
-  pushAiTradeDecision: (decision: AiTradeDecision) => void;
-  setAiTradeDecisions: (decisions: AiTradeDecision[]) => void;
-  setAiTradeTraces: (traces: AiTradeRoundTrace[]) => void;
-  upsertAiTradeTracePhase: (evt: AiTradeTraceEvent) => void;
-  setAiTradeSummary: (summary: string | null) => void;
+  // AI 自动交易「分组」运行期态（瞬态）：分组视图 + 逐成员 setter（会话视图 / 成交 / 持仓 / 决策 / 轨迹 /
+  // 摘要，按 instId 路由，镜像 liveAutoGroup member setter）+ 风险勾选 + 清理；aiTradeConfig 为持久化偏好。
+  setAiTradeGroup: (group: AiTradeGroupState | null) => void;
+  setAiTradeMemberSession: (instId: string, session: AiTradeSessionRow | null) => void;
+  patchAiTradeMemberSession: (instId: string, patch: Partial<AiTradeSessionRow>) => void;
+  patchAiTradeMemberStatus: (instId: string, status: AiTradeStatusEvent) => void;
+  setAiTradeMemberTrades: (instId: string, trades: Trade[]) => void;
+  appendAiTradeMemberTrade: (instId: string, trade: Trade) => void;
+  setAiTradeMemberPosition: (instId: string, pos: PaperPositionEvent | null) => void;
+  pushAiTradeMemberDecision: (instId: string, decision: AiTradeDecision) => void;
+  setAiTradeMemberDecisions: (instId: string, decisions: AiTradeDecision[]) => void;
+  setAiTradeMemberTraces: (instId: string, traces: AiTradeRoundTrace[]) => void;
+  upsertAiTradeMemberTracePhase: (instId: string, evt: AiTradeTraceEvent) => void;
+  setAiTradeMemberSummary: (instId: string, summary: string | null) => void;
   setAiTradeAcknowledged: (v: boolean) => void;
   clearAiTradeRuntime: () => void;
   setAiTradeConfig: (config: AiTradeConfig | null) => void;
@@ -440,6 +438,18 @@ function patchLiveAutoMember(
   return { liveAutoGroup: { ...group, members: { ...group.members, [instId]: updater(member) } } };
 }
 
+// AI 分组成员 runtime 局部更新（纯函数，缺组 / 缺成员安全回落不变更；镜像 patchLiveAutoMember）。
+function patchAiTradeMember(
+  group: AiTradeGroupState | null,
+  instId: string,
+  updater: (m: AiTradeGroupState["members"][string]) => AiTradeGroupState["members"][string],
+): { aiTradeGroup: AiTradeGroupState | null } {
+  if (!group) return { aiTradeGroup: group };
+  const member = group.members[instId];
+  if (!member) return { aiTradeGroup: group };
+  return { aiTradeGroup: { ...group, members: { ...group.members, [instId]: updater(member) } } };
+}
+
 export const useAppStore = create<AppState>()(
   persist(
     (set) => ({
@@ -478,15 +488,9 @@ export const useAppStore = create<AppState>()(
       autoTradeMembers: [],
       autoTradeAllocationMode: "even",
       liveAutoGroup: null,
-      // AI 自动交易：运行期态瞬态（刷新由 GET /ai-trade/status 重发现）；aiTradeConfig 偏好默认 null
+      // AI 自动交易：分组运行期态瞬态（刷新由 GET /ai-trade/status 重发现）；aiTradeConfig 偏好默认 null
       // （全新安装只走初始化器、不触发 migrate，故默认值须写在此处）。
-      aiTradeSessionId: null,
-      aiTradeSession: null,
-      aiTradeTrades: [],
-      aiTradePosition: null,
-      aiTradeDecisions: [],
-      aiTradeTraces: [],
-      aiTradeSummary: null,
+      aiTradeGroup: null,
       aiTradeAcknowledged: false,
       aiTradeConfig: null,
       aiBacktestJobId: null,
@@ -694,44 +698,71 @@ export const useAppStore = create<AppState>()(
           ),
         ),
       clearLiveAutoGroup: () => set({ liveAutoGroup: null }),
-      // AI 自动交易运行期态（瞬态）：句柄 / 会话视图（含增量合并 patch）/ 成交流 / 持仓 / 决策日志（环形）
-      // / 摘要 / 风险勾选 + 清理；aiTradeConfig 为持久化偏好。
-      setAiTradeSessionId: (aiTradeSessionId) => set({ aiTradeSessionId }),
-      setAiTradeSession: (aiTradeSession) => set({ aiTradeSession }),
-      patchAiTradeSession: (patch) =>
-        set((s) => (s.aiTradeSession ? { aiTradeSession: { ...s.aiTradeSession, ...patch } } : s)),
-      setAiTradeTrades: (aiTradeTrades) => set({ aiTradeTrades }),
-      appendAiTradeTrade: (trade) =>
+      // AI 自动交易「分组」运行期态（瞬态）：分组视图 + 逐成员 setter（会话视图含增量合并 / 成交流 /
+      // 持仓 / 决策日志（环形）/ 轨迹（环形）/ 摘要，按 instId 路由）+ 风险勾选 + 清理；aiTradeConfig 持久化。
+      setAiTradeGroup: (aiTradeGroup) => set({ aiTradeGroup }),
+      setAiTradeMemberSession: (instId, session) =>
+        set((s) => patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({ ...m, session }))),
+      patchAiTradeMemberSession: (instId, patch) =>
         set((s) =>
-          s.aiTradeTrades.some(
-            (t) => t.ts === trade.ts && t.side === trade.side && t.price === trade.price,
-          )
-            ? s
-            : { aiTradeTrades: [...s.aiTradeTrades, trade] },
+          patchAiTradeMember(s.aiTradeGroup, instId, (m) =>
+            m.session ? { ...m, session: { ...m.session, ...patch } } : m,
+          ),
         ),
-      setAiTradePosition: (aiTradePosition) => set({ aiTradePosition }),
-      pushAiTradeDecision: (decision) =>
-        set((s) => ({
-          aiTradeDecisions: [...s.aiTradeDecisions, decision].slice(-AI_TRADE_DECISIONS_MAX),
-        })),
-      setAiTradeDecisions: (decisions) =>
-        set({ aiTradeDecisions: decisions.slice(-AI_TRADE_DECISIONS_MAX) }),
-      setAiTradeTraces: (traces) =>
-        set({ aiTradeTraces: traces.slice(-AI_TRADE_TRACES_MAX) }),
-      upsertAiTradeTracePhase: (evt) =>
-        set((s) => ({ aiTradeTraces: applyAiTradeTracePhase(s.aiTradeTraces, evt) })),
-      setAiTradeSummary: (aiTradeSummary) => set({ aiTradeSummary }),
+      patchAiTradeMemberStatus: (instId, status) =>
+        set((s) =>
+          patchAiTradeMember(s.aiTradeGroup, instId, (m) =>
+            m.session
+              ? { ...m, session: { ...m.session, ...(status as Partial<AiTradeSessionRow>) } }
+              : m,
+          ),
+        ),
+      setAiTradeMemberTrades: (instId, trades) =>
+        set((s) => patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({ ...m, trades }))),
+      appendAiTradeMemberTrade: (instId, trade) =>
+        set((s) =>
+          patchAiTradeMember(s.aiTradeGroup, instId, (m) =>
+            m.trades.some(
+              (t) => t.ts === trade.ts && t.side === trade.side && t.price === trade.price,
+            )
+              ? m
+              : { ...m, trades: [...m.trades, trade] },
+          ),
+        ),
+      setAiTradeMemberPosition: (instId, position) =>
+        set((s) => patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({ ...m, position }))),
+      pushAiTradeMemberDecision: (instId, decision) =>
+        set((s) =>
+          patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({
+            ...m,
+            decisions: [...m.decisions, decision].slice(-AI_TRADE_DECISIONS_MAX),
+          })),
+        ),
+      setAiTradeMemberDecisions: (instId, decisions) =>
+        set((s) =>
+          patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({
+            ...m,
+            decisions: decisions.slice(-AI_TRADE_DECISIONS_MAX),
+          })),
+        ),
+      setAiTradeMemberTraces: (instId, traces) =>
+        set((s) =>
+          patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({
+            ...m,
+            traces: traces.slice(-AI_TRADE_TRACES_MAX),
+          })),
+        ),
+      upsertAiTradeMemberTracePhase: (instId, evt) =>
+        set((s) =>
+          patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({
+            ...m,
+            traces: applyAiTradeTracePhase(m.traces, evt),
+          })),
+        ),
+      setAiTradeMemberSummary: (instId, summary) =>
+        set((s) => patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({ ...m, summary }))),
       setAiTradeAcknowledged: (aiTradeAcknowledged) => set({ aiTradeAcknowledged }),
-      clearAiTradeRuntime: () =>
-        set({
-          aiTradeSessionId: null,
-          aiTradeSession: null,
-          aiTradeTrades: [],
-          aiTradePosition: null,
-          aiTradeDecisions: [],
-          aiTradeTraces: [],
-          aiTradeSummary: null,
-        }),
+      clearAiTradeRuntime: () => set({ aiTradeGroup: null }),
       setAiTradeConfig: (aiTradeConfig) => set({ aiTradeConfig }),
       setAiBacktestJobId: (aiBacktestJobId) => set({ aiBacktestJobId }),
       setAiBacktestConfig: (aiBacktestConfig) => set({ aiBacktestConfig }),

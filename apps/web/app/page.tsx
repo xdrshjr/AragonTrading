@@ -42,7 +42,7 @@ import {
 import { DEFAULT_RIGHT_PANEL_WIDTH, useAppStore } from "@/lib/store";
 import { liveAutoApi, liveAutoWS } from "@/lib/liveAutoApi";
 import { useLiveAutoGroupStream } from "@/lib/useLiveAutoGroupStream";
-import { useAiTradeStream } from "@/lib/useAiTradeStream";
+import { useAiTradeGroupStream } from "@/lib/useAiTradeGroupStream";
 import { useWorkspaceSync } from "@/lib/useWorkspaceSync";
 import type { LiveAutoEvent, LiveAutoSnapshot, LiveAutoStatus } from "@/lib/liveAutoTypes";
 import type {
@@ -81,9 +81,7 @@ export default function Page() {
     liveAutoSessionId,
     liveAutoTrades,
     liveAutoGroup,
-    aiTradeSessionId,
-    aiTradeTrades,
-    aiTradeSession,
+    aiTradeGroup,
     aiBacktestJobId,
     setAiBacktestJobId,
     theme,
@@ -110,8 +108,8 @@ export default function Page() {
   // 自选自动交易分组运行期流（重发现孤儿分组 + 每成员一条 WS，按 instId 路由进 store）。
   useLiveAutoGroupStream();
 
-  // AI 自动交易运行期流（重发现孤儿会话 + 单会话 WS，事件路由进 store，含 decision/summary）。
-  useAiTradeStream();
+  // AI 自动交易「分组」运行期流（重发现孤儿分组 + 每成员一条 WS，按 instId 路由进 store）。
+  useAiTradeGroupStream();
 
   // workspace 偏好后端同步（watchlist-auto-trade-persistence §6）：启动以后端为权威水合自选 +
   // 自动交易成员，之后去抖写穿，使关闭 / 强杀重启后偏好不丢（与下方 rehydrate() effect 协同）。
@@ -486,10 +484,10 @@ export default function Page() {
     mode === "paper" && paperEquityOverlays.length > 0 ? paperEquityOverlays : compareOverlays;
   // 实时自动交易活跃时，图表 markers 取自动交易成交流（live 模式本无策略 overlay，故为纯增量）。
   // 分组活跃时取**当前选中 instId** 对应成员的成交（切换标的即换 markers，§2.7 / R7）。
-  // AI 自动交易活跃且当前图表标的即会话标的时，markers 取 AI 成交流（单会话单标的，切走即不显示，避免误绘）。
-  const aiTradeActive = !!aiTradeSessionId && aiTradeSession?.instId === instId;
-  const overlayTrades = aiTradeActive
-    ? aiTradeTrades
+  // AI 自动交易分组：当前图表标的命中某成员时取该成员成交流（切走即不显示，避免误绘）。
+  const aiTradeMember = aiTradeGroup ? (aiTradeGroup.members[instId] ?? null) : null;
+  const overlayTrades = aiTradeMember
+    ? aiTradeMember.trades
     : liveAutoGroup
       ? (liveAutoGroup.members[instId]?.trades ?? [])
       : liveAutoSessionId

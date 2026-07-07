@@ -17,6 +17,9 @@ export const AI_TRADE_MIN_CONTEXT_ROUNDS = 3;
 export const AI_TRADE_MAX_CONTEXT_ROUNDS = 200;
 export const AI_TRADE_DEFAULT_CONTEXT_ROUNDS = 10;
 export const AI_TRADE_MAX_STRATEGIES = 8;
+// AI 自动交易「分组」标的数上限（与后端 ai_trade_max_symbols=5 对齐）：弹窗回填 autoTradeMembers 时至多取
+// 前 N 个（超出提示并禁增，P1-2）。刻意 < live_auto_max_group_symbols(8)：N 个 decider 每轮各一次 LLM 调用。
+export const AI_TRADE_MAX_SYMBOLS = 5;
 // 单仓 OCO 比例夹紧上限（fraction，与后端 ai_trade_max_sl_pct/tp_pct 对齐，E4 弹窗预览用）。
 export const AI_TRADE_MAX_SL_PCT = 0.2;
 export const AI_TRADE_MAX_TP_PCT = 0.5;

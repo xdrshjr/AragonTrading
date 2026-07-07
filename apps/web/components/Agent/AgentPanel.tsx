@@ -58,9 +58,10 @@ function newUserId(): string {
 export default function AgentPanel() {
   const conversationId = useAppStore((s) => s.agentConversationId);
   const newConversation = useAppStore((s) => s.newConversation);
-  // AI 自动交易「决策执行轨迹」视图（ai-auto-trading-agent-trace §3.7）：与交互式对话共存的分段视图。
-  const aiTradeSession = useAppStore((s) => s.aiTradeSession);
-  const aiTradeTraces = useAppStore((s) => s.aiTradeTraces);
+  // AI 自动交易「决策执行轨迹」视图（ai-trade-multi-symbol-and-timeframe §4.2）：与交互式对话共存的分段
+  // 视图。泛化为「分组」：右侧轨迹按聚焦标的展示各成员逐轮思考（AiTradeAgentTrace 内含标的段控）。
+  const aiTradeGroup = useAppStore((s) => s.aiTradeGroup);
+  const instId = useAppStore((s) => s.instId);
   const [panelView, setPanelView] = useState<PanelView>("chat");
   // 记忆「已自动切入过」的 sessionId：自动切换每会话仅一次，之后尊重用户手动来回切换（R7）。
   const autoSwitchedRef = useRef<string | null>(null);
@@ -99,19 +100,19 @@ export default function AgentPanel() {
     if (!conversationId) newConversation();
   }, [conversationId, newConversation]);
 
-  // AI 自动交易会话出现→自动切入「执行轨迹」（每 sessionId 仅一次）；清空→回落「对话」（R7）。
-  const aiTradeSessionId = aiTradeSession?.sessionId ?? null;
+  // AI 自动交易分组出现→自动切入「执行轨迹」（每 groupId 仅一次）；清空→回落「对话」（R7）。
+  const aiTradeGroupId = aiTradeGroup?.groupId ?? null;
   useEffect(() => {
-    if (aiTradeSessionId) {
-      if (autoSwitchedRef.current !== aiTradeSessionId) {
-        autoSwitchedRef.current = aiTradeSessionId;
+    if (aiTradeGroupId) {
+      if (autoSwitchedRef.current !== aiTradeGroupId) {
+        autoSwitchedRef.current = aiTradeGroupId;
         setPanelView("aitrade");
       }
     } else {
       autoSwitchedRef.current = null;
       setPanelView("chat");
     }
-  }, [aiTradeSessionId]);
+  }, [aiTradeGroupId]);
 
   // 缓冲空洞兜底（RS-11 gap）：经既有 REST 拉权威历史重建（零新端点，最终一致）。
   const reconcileViaRest = useCallback(async () => {
@@ -302,8 +303,15 @@ export default function AgentPanel() {
   }, [running, newConversation]);
 
   const unconfigured = config !== null && !config.configured;
-  // RV-8：会话存在时 aitrade 视图优先于 unconfigured 空态渲染（后端 LLM 必已配置，否则会话无法启动）。
-  const showTrace = panelView === "aitrade" && !!aiTradeSession;
+  // RV-8：分组存在时 aitrade 视图优先于 unconfigured 空态渲染（后端 LLM 必已配置，否则分组无法启动）。
+  const showTrace = panelView === "aitrade" && !!aiTradeGroup;
+  // 分组聚合：任一成员运行中即视为运行；轮次徽标取各成员最大 roundsCompleted（单成员时等价旧行为）。
+  const aiTradeMembers = aiTradeGroup ? Object.values(aiTradeGroup.members) : [];
+  const aiTradeAnyRunning = aiTradeMembers.some((m) => m.session?.state === "running");
+  const aiTradeMaxRounds = aiTradeMembers.reduce(
+    (max, m) => Math.max(max, m.session?.roundsCompleted ?? 0),
+    0,
+  );
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -326,7 +334,7 @@ export default function AgentPanel() {
         </div>
       </header>
 
-      {aiTradeSession && (
+      {aiTradeGroup && (
         <div
           role="tablist"
           aria-label="AI 助手视图"
@@ -338,11 +346,11 @@ export default function AgentPanel() {
           <ViewTab active={panelView === "aitrade"} onClick={() => setPanelView("aitrade")}>
             <span className="flex items-center gap-1.5">
               执行轨迹
-              {aiTradeSession.state === "running" && (
+              {aiTradeAnyRunning && (
                 <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--long)]" />
               )}
               <span className="tabular rounded-full bg-[var(--surface)] px-1.5 text-[10px] text-[var(--muted)]">
-                第 {aiTradeSession.roundsCompleted ?? 0} 轮
+                第 {aiTradeMaxRounds} 轮
               </span>
             </span>
           </ViewTab>
@@ -351,7 +359,7 @@ export default function AgentPanel() {
 
       <div className={`min-h-0 flex-1 ${showTrace ? "" : "overflow-y-auto"}`}>
         {showTrace ? (
-          <AiTradeAgentTrace session={aiTradeSession} traces={aiTradeTraces} />
+          <AiTradeAgentTrace group={aiTradeGroup} activeInstId={instId} />
         ) : unconfigured ? (
           <AgentUnconfigured provider={config.provider} model={config.model} />
         ) : messages.length === 0 ? (

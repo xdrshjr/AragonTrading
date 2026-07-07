@@ -11,8 +11,9 @@ import asyncio
 from types import SimpleNamespace
 
 from app.ai_auto.manager import (
+    AiTradeGroupMemberInput,
+    AiTradeGroupStartRequest,
     AiTradeSessionLimitError,
-    AiTradeStartRequest,
     get_ai_trade_manager,
 )
 from app.config import Settings
@@ -107,22 +108,23 @@ async def _spec():
 
 async def test_concurrent_ai_and_live_auto_start_only_one_succeeds(monkeypatch):
     await init_db()
-    get_ai_trade_manager()._session = None
+    get_ai_trade_manager()._group = None
     get_live_auto_manager()._group = None
     _patch(monkeypatch)
     settings = Settings(live_trading_enabled=True, ai_trade_enabled=True,
                         live_auto_trading_enabled=True)
     spec = await _spec()
-    ai_req = AiTradeStartRequest(specs=[spec], inst_id="BTC-USDT-SWAP", bar="1H",
-                                 account_row=_ACCOUNT, settings=settings,
-                                 context_refresh_rounds=10)
+    ai_req = AiTradeGroupStartRequest(
+        specs=[spec],
+        members_in=[AiTradeGroupMemberInput(inst_id="BTC-USDT-SWAP", allocation_pct=100.0)],
+        bar="1H", account_row=_ACCOUNT, settings=settings, context_refresh_rounds=10)
     live_req = GroupStartRequest(
         strategy_spec=spec, bar="1H",
         members_in=[GroupMemberInput(inst_id="BTC-USDT-SWAP", allocation_pct=100.0)],
         account_row=_ACCOUNT, settings=settings)
     try:
         results = await asyncio.gather(
-            get_ai_trade_manager().start(ai_req),
+            get_ai_trade_manager().start_group(ai_req),
             get_live_auto_manager().start_group(live_req),
             return_exceptions=True)
         successes = [r for r in results if not isinstance(r, Exception)]
@@ -131,9 +133,10 @@ async def test_concurrent_ai_and_live_auto_start_only_one_succeeds(monkeypatch):
         assert len(failures) == 1, results
         assert isinstance(failures[0], (AiTradeSessionLimitError, LiveAutoSessionLimitError))
     finally:
-        ai = get_ai_trade_manager()._session
-        if ai is not None:
-            await ai.stop("cleanup")
-        get_ai_trade_manager()._session = None
+        grp = get_ai_trade_manager()._group
+        if grp is not None:
+            for member in grp.members:
+                await member.session.stop("cleanup")
+        get_ai_trade_manager()._group = None
         get_live_auto_manager()._group = None
         await dispose_engine()

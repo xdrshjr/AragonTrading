@@ -207,6 +207,95 @@ export interface AiTradeSnapshot {
   agentTraces?: AiTradeRoundTrace[]; // 最近 ≤20 轮已装配轨迹（重连回放，已防御性冻结）
 }
 
+// ---------------- AI 自动交易「分组」（ai-trade-multi-symbol-and-timeframe §6.3，镜像 live-auto 分组）----------------
+// 分组成员入参：标的 + 该标的可用仓位百分比（(0,100]，even 模式整组 Σ ≤ 100）。
+export interface AiTradeGroupMemberInput {
+  instId: string;
+  allocationPct: number;
+}
+
+// 分组启动请求（camelCase，与后端 AiTradeGroupStartIn 同构；capitalUsd 为分组总预算，按 pct 切分）。
+export interface AiTradeGroupStartReq {
+  members: AiTradeGroupMemberInput[];
+  bar: string;
+  strategyIds: number[];
+  accountId?: number | null;
+  allocationMode: "even" | "max_ratio";
+  capitalUsd?: number | null;
+  leverage?: number | null;
+  takeProfitUsd?: number | null;
+  stopLossUsd?: number | null;
+  stopLossPct?: number | null;      // E4：单仓 OCO 止损%（各成员同值，服务端夹紧）
+  takeProfitPct?: number | null;    // E4：单仓 OCO 止盈%（各成员同值）
+  contextRefreshRounds: number;
+  priming?: boolean;
+  primingBars?: number;
+}
+
+// 分组成员行（start 回执 / status 视图共用）：完整会话行 + 分配占比。
+export interface AiTradeGroupMemberRow extends AiTradeSessionRow {
+  allocationPct: number;
+}
+
+// 分组只读视图（GET /ai-trade/status 与 start 回执同构）。
+export interface AiTradeGroupRow {
+  groupId: string;
+  bar: string;
+  strategyIds: number[];
+  strategyNames: string[];
+  totalBudgetUsd: number;       // 夹紧后最终生效的分组总预算（可能 < 用户填值）
+  leverage: number;
+  contextRefreshRounds: number;
+  createdTs: number;
+  members: AiTradeGroupMemberRow[];
+}
+
+export type AiTradeGroupStartResult = AiTradeGroupRow;
+
+export interface AiTradeGroupStatusResponse {
+  group: AiTradeGroupRow | null;
+  aiTradeEnabled: boolean;
+}
+
+export interface AiTradeGroupStopResult {
+  groupId: string;
+  stopReason: string | null;
+  members: { instId: string; sessionId: string; runId: number; flattened?: unknown }[];
+}
+
+export interface AiTradeGroupMemberStopResult {
+  groupId: string;
+  instId: string;
+  flattened?: unknown;
+}
+
+// 运行期成员槽（瞬态；镜像 LiveAutoGroupMemberState + AI 专属轨迹 / 决策 / 摘要）。
+export interface AiTradeGroupMemberState {
+  instId: string;
+  sessionId: string;
+  allocationPct: number;
+  session: AiTradeSessionRow | null;   // 会话只读视图（info + WS status/decision/summary 增量合并）
+  trades: Trade[];
+  position: unknown | null;
+  decisions: AiTradeDecision[];
+  traces: AiTradeRoundTrace[];
+  summary: string | null;
+}
+
+// 分组运行期态（瞬态，不入 partialize，刷新由 GET /ai-trade/status 重发现）。
+export interface AiTradeGroupState {
+  groupId: string;
+  bar: string;
+  strategyIds: number[];
+  strategyNames: string[];
+  totalBudgetUsd: number;
+  leverage: number;
+  contextRefreshRounds: number;
+  state: "running" | "stopped";
+  startedTs: number;
+  members: Record<string, AiTradeGroupMemberState>;
+}
+
 // 持久化偏好（进 partialize）：记忆上次选的策略集合与刷新轮数。
 export interface AiTradeConfig {
   strategyIds: number[];

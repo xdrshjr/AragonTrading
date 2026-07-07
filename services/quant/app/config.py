@@ -101,6 +101,11 @@ class Settings(BaseSettings):
     ai_trade_default_tp_pct: float = 0.10        # 会话默认单仓止盈 pct（交易所侧 OCO 兜底；0 即不挂）
     ai_trade_default_max_hold_bars: int = 0      # 默认强制时间平仓根数（0=禁用，退出交由 AI close + 会话止盈止损）
     ai_trade_max_strategies: int = 8             # 单会话可喂给 AI 的策略数上限（超出即 400 守门）
+    # AI 自动交易「分组」标的数上限（ai-trade-multi-symbol-and-timeframe §4.1）：一个 AI 分组内至多 N 个
+    # 标的，每标的各是一个独立 AiTradeSession（各自一次/轮 LLM 决策）。刻意 < live_auto_max_group_symbols(8)：
+    # N 个 decider 每轮各一次 LLM 调用，成本随标的数线性上升。分组总预算按 allocationPct **切分**（非倍增），
+    # 故总账户敞口仍受 ai_trade_max_capital_frac(5%) 单一天花板约束——**不新增**分组专用天花板配置（P0-1）。
+    ai_trade_max_symbols: int = Field(default=5, ge=1)
     ai_trade_default_context_rounds: int = 10    # 上下文刷新轮数默认值
     ai_trade_min_context_rounds: int = Field(default=3, ge=1)    # 上下文刷新轮数下限
     ai_trade_max_context_rounds: int = Field(default=200, ge=1)  # 上下文刷新轮数上限（与下方 messages 相互独立，P1-3）

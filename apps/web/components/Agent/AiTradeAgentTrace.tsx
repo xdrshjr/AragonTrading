@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui";
 import { describeConsensus, describeRegime, describeStance } from "@/lib/aiTrade";
-import type { AiTradeRoundTrace, AiTradeSessionRow } from "@/lib/aiTradeTypes";
+import type { AiTradeGroupState, AiTradeRoundTrace, AiTradeSessionRow } from "@/lib/aiTradeTypes";
 import { fmtMoney, fmtNum } from "@/lib/format";
 import AiTradeTraceRound from "./AiTradeTraceRound";
 
@@ -74,31 +74,94 @@ function TraceEmpty({ stopped }: { stopped: boolean }) {
   );
 }
 
+/** 分组成员段控：多标的时顶部切换要查看轨迹的标的（各成员轨迹独立留存，切换不丢历史）。 */
+function SymbolTabs({
+  instIds,
+  focused,
+  onSelect,
+}: {
+  instIds: string[];
+  focused: string;
+  onSelect: (instId: string) => void;
+}) {
+  return (
+    <div
+      role="tablist"
+      aria-label="自动交易标的"
+      className="flex flex-wrap items-center gap-1 border-b border-[var(--border)] px-3 py-1.5"
+    >
+      {instIds.map((instId) => (
+        <button
+          key={instId}
+          type="button"
+          role="tab"
+          aria-selected={instId === focused}
+          onClick={() => onSelect(instId)}
+          className={`rounded px-2 py-0.5 text-[11px] font-medium transition-colors ${
+            instId === focused
+              ? "bg-[var(--surface)] text-[var(--text)] shadow-sm"
+              : "text-[var(--muted)] hover:text-[var(--text)]"
+          }`}
+        >
+          {instId}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 /**
- * AI 自动交易「决策执行轨迹」视图（ai-auto-trading-agent-trace §3.7）：右侧 AI 助手面板的分段视图之一。
- * 概览条 + 轮次时间线（贴底跟随 + aria-live 播报流式增量 + 「↓ 回到最新」，尊重用户上滚）。
+ * AI 自动交易「决策执行轨迹」视图（ai-trade-multi-symbol-and-timeframe §4.2）：右侧 AI 助手面板分段视图之一。
+ * 多标的分组：顶部标的段控（默认聚焦当前图表标的·若在组内否则首成员）；展示聚焦成员的逐轮轨迹。
+ * 概览条 + 轮次时间线（贴底跟随 + aria-live 播报流式增量 + 「↓ 回到最新」，尊重用户上滚）。单成员时不显段控。
  */
 export default function AiTradeAgentTrace({
-  session,
-  traces,
+  group,
+  activeInstId,
 }: {
-  session: AiTradeSessionRow | null;
-  traces: AiTradeRoundTrace[];
+  group: AiTradeGroupState | null;
+  activeInstId: string;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
   const [pinned, setPinned] = useState(true);
+  const [focused, setFocused] = useState<string | null>(null);
 
-  // 流式增量到达即变化（累积文本长度 / 状态 / 工具卡到位）。
-  const signature = traces
-    .map((t) => `${t.round}:${t.thinking.length}:${t.analysis.length}:${t.state}:${t.toolCall ? 1 : 0}`)
-    .join("|");
+  const instIds = group ? Object.keys(group.members) : [];
+  const instKey = instIds.join(",");
+
+  // 默认聚焦当前图表标的（若在组内）否则首成员；成员集变化后若聚焦项消失则复位（切换不丢历史）。
+  useEffect(() => {
+    if (!group) {
+      setFocused(null);
+      return;
+    }
+    setFocused((prev) =>
+      prev && instIds.includes(prev)
+        ? prev
+        : instIds.includes(activeInstId)
+          ? activeInstId
+          : (instIds[0] ?? null),
+    );
+  }, [group?.groupId, instKey, activeInstId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const focusedMember = group && focused ? group.members[focused] : null;
+  const session = focusedMember?.session ?? null;
+  const traces: AiTradeRoundTrace[] = focusedMember?.traces ?? [];
+
+  // 流式增量到达即变化（累积文本长度 / 状态 / 工具卡到位）；含聚焦标的，切换即重新贴底。
+  const signature =
+    focused +
+    "|" +
+    traces
+      .map((t) => `${t.round}:${t.thinking.length}:${t.analysis.length}:${t.state}:${t.toolCall ? 1 : 0}`)
+      .join("|");
 
   useEffect(() => {
     if (pinned) endRef.current?.scrollIntoView({ block: "end" });
   }, [signature, pinned]);
 
-  if (!session) return null;
+  if (!group || !session) return null;
   const stopped = session.state === "stopped";
 
   const onScroll = () => {
@@ -114,6 +177,9 @@ export default function AiTradeAgentTrace({
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
+      {instIds.length > 1 && focused && (
+        <SymbolTabs instIds={instIds} focused={focused} onSelect={setFocused} />
+      )}
       <TraceOverview session={session} />
       <div ref={containerRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div

@@ -20,15 +20,17 @@ from ..ai_auto.backtest_manager import (
     get_ai_backtest_manager,
 )
 from ..ai_auto.manager import (
+    AiTradeGroupMemberInput,
+    AiTradeGroupPreflightError,
+    AiTradeGroupStartRequest,
     AiTradePreflightError,
     AiTradeSessionLimitError,
-    AiTradeStartRequest,
 )
 from ..config import Settings, get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
 from ..paper.strategy_factory import build_paper_strategy_spec
-from ..schemas import AiBacktestStartIn, AiTradeStartIn, run_out
+from ..schemas import AiBacktestStartIn, AiTradeGroupStartIn
 
 router = APIRouter(tags=["ai-trade"])
 
@@ -78,49 +80,63 @@ async def _build_specs(session: AsyncSession, strategy_ids: list[int]) -> list:
 
 
 @router.post("/ai-trade/start")
-async def ai_trade_start(body: AiTradeStartIn, session: AsyncSession = Depends(get_session),
+async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depends(get_session),
                          settings: Settings = Depends(get_settings)) -> dict:
-    """启动 AI 自动交易（受双闸守门；§2.5 前置门禁；回执 budgetUsd 为夹紧后最终生效预算）。"""
+    """启动 AI 自动交易「分组」（受双闸守门；§4.1 两段式前置门禁 + 整组回滚；回执含逐成员夹紧后预算）。
+
+    P0-1（安全红线）：预算总额天花板由服务端解析 `cap_frac = min(maxBudgetPct/100, ai_trade_max_capital_frac)`
+    （5%），留空默认 `default_frac = ai_trade_default_capital_frac`（1%）；**绝不**引用 live-auto 的
+    100% 分组天花板，前端任何「上限」入参一概不接受。成员总预算按 allocationPct 切分（非倍增）。
+    """
     _require_ai_enabled(settings)
     account_row = await _resolve_account(session, body.accountId)
     specs = await _build_specs(session, body.strategyIds)
-    req = AiTradeStartRequest(
-        specs=specs, inst_id=body.instId, bar=body.bar, account_row=account_row,
-        settings=settings, context_refresh_rounds=body.contextRefreshRounds,
-        capital_usd=body.capitalUsd, leverage=body.leverage,
+    at = await repo.get_auto_trade_settings(session)
+    cap_frac = min(at["maxBudgetPct"] / 100.0, settings.ai_trade_max_capital_frac)
+    req = AiTradeGroupStartRequest(
+        specs=specs,
+        members_in=[AiTradeGroupMemberInput(inst_id=m.instId, allocation_pct=m.allocationPct)
+                    for m in body.members],
+        bar=body.bar, account_row=account_row, settings=settings,
+        context_refresh_rounds=body.contextRefreshRounds, allocation_mode=body.allocationMode,
+        total_capital_usd=body.capitalUsd, leverage=body.leverage,
         take_profit_usd=body.takeProfitUsd, stop_loss_usd=body.stopLossUsd,
         stop_loss_pct=body.stopLossPct, take_profit_pct=body.takeProfitPct,  # E4：单仓 OCO 入参
-        priming=body.priming, priming_bars=body.primingBars)
+        priming=body.priming, priming_bars=body.primingBars,
+        budget_cap_frac=cap_frac, default_budget_frac=settings.ai_trade_default_capital_frac)
     try:
-        sess = await get_ai_trade_manager().start(req)
+        await get_ai_trade_manager().start_group(req)
+    except AiTradeGroupPreflightError as exc:
+        # 整组前置失败须透传逐标的 members 明细（全局处理器据此包成 {error:{code,message,members}}）。
+        raise HTTPException(exc.status, detail={
+            "code": exc.code, "message": exc.message, "members": exc.members})
     except (AiTradeSessionLimitError, AiTradePreflightError) as exc:
         raise HTTPException(exc.status, detail={"code": exc.code, "message": exc.message})
-    risk = sess.executor.risk       # E4：回执生效 pct（服务端夹紧后的实际值，供前端确认夹紧结果）
-    return {"sessionId": sess.session_id, "runId": sess.run_id, "instId": body.instId,
-            "bar": body.bar, "strategyIds": sess.strategy_ids,
-            "strategyNames": sess.strategy_names,
-            "budgetUsd": sess.executor.budget_usd, "leverage": sess.executor.leverage,
-            "contextRefreshRounds": sess.context_refresh_rounds,
-            "stopLossPct": risk.stop_loss_pct, "takeProfitPct": risk.take_profit_pct}
+    return get_ai_trade_manager().group_status()
 
 
-@router.post("/ai-trade/{session_id}/stop")
-async def ai_trade_stop(session_id: str,
-                        session: AsyncSession = Depends(get_session)) -> dict:
-    """平掉自管持仓 + 停会话 + 落 Run 终态（刻意不守门，确保任何时候可停止平仓）。"""
-    result = await get_ai_trade_manager().stop(session_id)
+@router.post("/ai-trade/{group_id}/stop")
+async def ai_trade_stop(group_id: str) -> dict:
+    """停整组（停所有成员、各自平自管仓、落 Run 终态；刻意不守门，确保随时可停止平仓）。"""
+    result = await get_ai_trade_manager().stop_group(group_id)
     if result is None:
-        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "会话不存在"})
-    sess, flattened = result
-    run = await repo.get_run(session, sess.run_id)
-    return {"sessionId": session_id, "stopReason": sess.stop_reason,
-            "run": run_out(run) if run is not None else None, "flattened": flattened}
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "分组不存在"})
+    return result
+
+
+@router.post("/ai-trade/{group_id}/member/{inst_id}/stop")
+async def ai_trade_member_stop(group_id: str, inst_id: str) -> dict:
+    """仅停某成员（其余续跑；不守门）；停后无运行成员则分组清空。"""
+    result = await get_ai_trade_manager().stop_member(group_id, inst_id)
+    if result is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "分组或成员不存在"})
+    return result
 
 
 @router.get("/ai-trade/status")
 async def ai_trade_status(settings: Settings = Depends(get_settings)) -> dict:
-    """当前活跃 AI 会话（无则 session:null）；前端重载后据此重连 WS（只读，不守门）。"""
-    return {"session": get_ai_trade_manager().status(),
+    """当前活跃 AI 分组（无则 group:null）；前端重载后据此重连各成员 WS（只读，不守门）。"""
+    return {"group": get_ai_trade_manager().group_status(),
             "aiTradeEnabled": settings.ai_trade_enabled}
 
 

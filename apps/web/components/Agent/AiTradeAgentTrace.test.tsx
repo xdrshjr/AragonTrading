@@ -1,7 +1,7 @@
 import "@testing-library/jest-dom/vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AiTradeRoundTrace, AiTradeSessionRow } from "@/lib/aiTradeTypes";
+import type { AiTradeGroupState, AiTradeRoundTrace, AiTradeSessionRow } from "@/lib/aiTradeTypes";
 import { useAppStore } from "@/lib/store";
 import AgentPanel from "./AgentPanel";
 import AiTradeAgentTrace from "./AiTradeAgentTrace";
@@ -41,6 +41,34 @@ const SESSION: AiTradeSessionRow = {
   startedTs: 0,
 };
 
+// 分组封装：把单会话视图包成 1 成员分组（AiTradeAgentTrace 现按分组 + 聚焦标的渲染）。
+function groupWith(session: AiTradeSessionRow, traces: AiTradeRoundTrace[] = []): AiTradeGroupState {
+  return {
+    groupId: "g1",
+    bar: session.bar,
+    strategyIds: session.strategyIds,
+    strategyNames: session.strategyNames,
+    totalBudgetUsd: session.budgetUsd,
+    leverage: session.leverage,
+    contextRefreshRounds: session.contextRefreshRounds,
+    state: session.state === "stopped" ? "stopped" : "running",
+    startedTs: session.startedTs,
+    members: {
+      [session.instId]: {
+        instId: session.instId,
+        sessionId: session.sessionId,
+        allocationPct: 100,
+        session,
+        trades: [],
+        position: null,
+        decisions: [],
+        traces,
+        summary: null,
+      },
+    },
+  };
+}
+
 function round(overrides: Partial<AiTradeRoundTrace>): AiTradeRoundTrace {
   return {
     round: 1,
@@ -64,7 +92,7 @@ afterEach(() => cleanup());
 
 describe("AiTradeAgentTrace", () => {
   it("running session with no traces shows the waiting empty state", () => {
-    render(<AiTradeAgentTrace session={SESSION} traces={[]} />);
+    render(<AiTradeAgentTrace group={groupWith(SESSION)} activeInstId="BTC-USDT-SWAP" />);
     expect(screen.getByText(/正在等待首个确认 K 线/)).toBeInTheDocument();
     expect(screen.getByText("运行中")).toBeInTheDocument();
   });
@@ -72,8 +100,8 @@ describe("AiTradeAgentTrace", () => {
   it("streaming round renders analysis text under a 研判中 chip", () => {
     render(
       <AiTradeAgentTrace
-        session={SESSION}
-        traces={[round({ analysis: "多数策略维持多头立场", state: "deciding" })]}
+        group={groupWith(SESSION, [round({ analysis: "多数策略维持多头立场", state: "deciding" })])}
+        activeInstId="BTC-USDT-SWAP"
       />,
     );
     expect(screen.getByText("多数策略维持多头立场")).toBeInTheDocument();
@@ -83,15 +111,15 @@ describe("AiTradeAgentTrace", () => {
   it("executed round shows the decision tool card and long-toned result", () => {
     render(
       <AiTradeAgentTrace
-        session={SESSION}
-        traces={[
+        group={groupWith(SESSION, [
           round({
             state: "done",
             analysis: "开多",
             toolCall: { action: "open_long", sizeFraction: 0.4, confidence: 0.72, reason: "顺势" },
             executed: { ok: true, traded: true, positionAfter: "long", action: "open_long" },
           }),
-        ]}
+        ])}
+        activeInstId="BTC-USDT-SWAP"
       />,
     );
     expect(screen.getByText("决策工具 · 开多")).toBeInTheDocument();
@@ -103,15 +131,15 @@ describe("AiTradeAgentTrace", () => {
   it("degraded round shows the downgrade result", () => {
     render(
       <AiTradeAgentTrace
-        session={SESSION}
-        traces={[
+        group={groupWith(SESSION, [
           round({
             state: "done",
             toolCall: { action: "hold", reason: "共识不足" },
             executed: { ok: true, traded: false, positionAfter: "flat", action: "hold" },
             degradeReason: "low_consensus(0/1)",
           }),
-        ]}
+        ])}
+        activeInstId="BTC-USDT-SWAP"
       />,
     );
     expect(screen.getByText(/已降级观望/)).toBeInTheDocument();
@@ -120,8 +148,8 @@ describe("AiTradeAgentTrace", () => {
   it("summary round renders an expandable context-refresh node", () => {
     render(
       <AiTradeAgentTrace
-        session={SESSION}
-        traces={[round({ state: "done", summary: "截至第1轮：偏多" })]}
+        group={groupWith(SESSION, [round({ state: "done", summary: "截至第1轮：偏多" })])}
+        activeInstId="BTC-USDT-SWAP"
       />,
     );
     expect(screen.getByText(/上下文已刷新（第 1 轮摘要）/)).toBeInTheDocument();
@@ -129,32 +157,51 @@ describe("AiTradeAgentTrace", () => {
   });
 
   it("stopped session with no traces reads as a stopped empty state", () => {
-    render(<AiTradeAgentTrace session={{ ...SESSION, state: "stopped" }} traces={[]} />);
+    render(
+      <AiTradeAgentTrace group={groupWith({ ...SESSION, state: "stopped" })} activeInstId="BTC-USDT-SWAP" />,
+    );
     expect(screen.getByText(/会话已停止/)).toBeInTheDocument();
     expect(screen.getByText("已停止")).toBeInTheDocument();
+  });
+
+  it("shows a symbol switcher for a multi-symbol group and switches focus", () => {
+    const eth: AiTradeSessionRow = { ...SESSION, sessionId: "s2", instId: "ETH-USDT-SWAP" };
+    const group = groupWith(SESSION, [round({ analysis: "BTC 分析", state: "deciding" })]);
+    group.members["ETH-USDT-SWAP"] = {
+      instId: "ETH-USDT-SWAP",
+      sessionId: "s2",
+      allocationPct: 50,
+      session: eth,
+      trades: [],
+      position: null,
+      decisions: [],
+      traces: [round({ analysis: "ETH 分析", state: "deciding" })],
+      summary: null,
+    };
+    render(<AiTradeAgentTrace group={group} activeInstId="BTC-USDT-SWAP" />);
+    expect(screen.getByText("BTC 分析")).toBeInTheDocument();
+    // 切到 ETH 标的段控 → 展示该成员轨迹（切换不丢历史）。
+    fireEvent.click(screen.getByRole("tab", { name: "ETH-USDT-SWAP" }));
+    expect(screen.getByText("ETH 分析")).toBeInTheDocument();
   });
 });
 
 describe("AgentPanel segmented view", () => {
   beforeEach(() => {
     localStorage.clear();
-    useAppStore.setState({
-      agentConversationId: "conv-test",
-      aiTradeSession: null,
-      aiTradeTraces: [],
-    });
+    useAppStore.setState({ agentConversationId: "conv-test", aiTradeGroup: null });
   });
 
-  it("hides the 执行轨迹 tab and renders chat when there is no AI trade session", () => {
+  it("hides the 执行轨迹 tab and renders chat when there is no AI trade group", () => {
     render(<AgentPanel />);
     expect(screen.queryByRole("tab", { name: /执行轨迹/ })).not.toBeInTheDocument();
     expect(screen.getByText("AI 交易助手")).toBeInTheDocument(); // 聊天空态逐字不变
   });
 
-  it("auto-switches to the trace view when a session appears", () => {
+  it("auto-switches to the trace view when a group appears", () => {
     render(<AgentPanel />);
     act(() => {
-      useAppStore.setState({ aiTradeSession: SESSION });
+      useAppStore.setState({ aiTradeGroup: groupWith(SESSION) });
     });
     expect(screen.getByRole("tab", { name: /执行轨迹/ })).toBeInTheDocument();
     expect(screen.getByText("运行中")).toBeInTheDocument(); // 轨迹概览条已呈现
@@ -163,20 +210,20 @@ describe("AgentPanel segmented view", () => {
   it("respects a manual switch back to 对话 and does not auto-steal", () => {
     render(<AgentPanel />);
     act(() => {
-      useAppStore.setState({ aiTradeSession: SESSION });
+      useAppStore.setState({ aiTradeGroup: groupWith(SESSION) });
     });
     fireEvent.click(screen.getByRole("tab", { name: "对话" }));
     expect(screen.queryByText("运行中")).not.toBeInTheDocument();
     expect(screen.getByText("AI 交易助手")).toBeInTheDocument();
   });
 
-  it("falls back to 对话 when the session clears", () => {
+  it("falls back to 对话 when the group clears", () => {
     render(<AgentPanel />);
     act(() => {
-      useAppStore.setState({ aiTradeSession: SESSION });
+      useAppStore.setState({ aiTradeGroup: groupWith(SESSION) });
     });
     act(() => {
-      useAppStore.setState({ aiTradeSession: null });
+      useAppStore.setState({ aiTradeGroup: null });
     });
     expect(screen.queryByRole("tab", { name: /执行轨迹/ })).not.toBeInTheDocument();
     expect(screen.getByText("AI 交易助手")).toBeInTheDocument();

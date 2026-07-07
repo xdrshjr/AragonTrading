@@ -1,7 +1,9 @@
-"""AI 自动交易 REST 单测（ai-auto-trading §4）：双闸守门 403、Agent 未配置 400、既有持仓 409、
-策略/轮数越界 400、与 live-auto 互斥 409、start→status→stop 生命周期 + 预算夹紧 + 停止平仓。
+"""AI 自动交易 REST 单测（ai-trade-multi-symbol-and-timeframe §4）：双闸守门 403、Agent 未配置 400、
+既有持仓整组拒绝 409（AI_TRADE_GROUP_PREFLIGHT）、策略/轮数越界 400、与 live-auto 互斥 409、
+分组 start→status→stop 生命周期 + 预算夹紧 + 停止平仓 + 单仓 OCO pct 夹紧。
 
-OKX / LLM / 会话全程打桩；铁律：占位假凭证，绝不写真实凭证。
+start/status/stop 均为「分组」契约（单标的=1 成员 100% 分配分组）。OKX / LLM / 会话全程打桩；
+铁律：占位假凭证，绝不写真实凭证。
 """
 from __future__ import annotations
 
@@ -69,7 +71,7 @@ def _load_app():
 
 async def _fresh() -> int:
     await init_db()
-    get_ai_trade_manager()._session = None
+    get_ai_trade_manager()._group = None
     get_live_auto_manager()._group = None
     sm = get_sessionmaker()
     async with sm() as session:
@@ -99,8 +101,9 @@ def _account_body(**over) -> dict:
 
 
 def _start_body(strategy_id: int, **over) -> dict:
-    body = {"instId": "BTC-USDT-SWAP", "bar": "1H", "strategyIds": [strategy_id],
-            "contextRefreshRounds": 10}
+    """分组启动体（单标的=1 成员 100% 分配分组）。members 可经 over 覆盖为多标的。"""
+    body = {"members": [{"instId": "BTC-USDT-SWAP", "allocationPct": 100}], "bar": "1H",
+            "strategyIds": [strategy_id], "contextRefreshRounds": 10}
     body.update(over)
     return body
 
@@ -182,9 +185,13 @@ async def test_start_rejected_with_preexisting_position(monkeypatch):
             await _seed_account(client)
             r = await client.post("/api/ai-trade/start", json=_start_body(strategy_id))
             assert r.status_code == 409, r.text
-            assert r.json()["error"]["code"] == "AI_TRADE_PREEXISTING_POSITION"
+            err = r.json()["error"]
+            assert err["code"] == "AI_TRADE_GROUP_PREFLIGHT"
+            codes = {m["instId"]: m["code"] for m in err["members"]}
+            assert codes["BTC-USDT-SWAP"] == "AI_TRADE_PREEXISTING_POSITION"
+            assert get_ai_trade_manager()._group is None
     finally:
-        get_ai_trade_manager()._session = None
+        get_ai_trade_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()
 
@@ -250,21 +257,23 @@ async def test_lifecycle_start_status_stop_with_budget_clamp(monkeypatch):
             start = await client.post("/api/ai-trade/start", json=_start_body(strategy_id))
             assert start.status_code == 200, start.text
             body = start.json()
+            group_id = body["groupId"]
+            member = body["members"][0]
             # 预算夹紧：留空→ avail(1000)×default_frac(0.01)=10，夹到 ≤ avail×min(1.0,0.05)=50 → 10
-            assert abs(body["budgetUsd"] - 10.0) < 1e-6
-            sid = body["sessionId"]
+            assert abs(member["budgetUsd"] - 10.0) < 1e-6
+            assert member["allocationPct"] == 100
 
             status = await client.get("/api/ai-trade/status")
-            assert status.json()["session"]["sessionId"] == sid
+            assert status.json()["group"]["groupId"] == group_id
             assert status.json()["aiTradeEnabled"] is True
 
-            stop = await client.post(f"/api/ai-trade/{sid}/stop")
+            stop = await client.post(f"/api/ai-trade/{group_id}/stop")
             assert stop.status_code == 200, stop.text
-            assert stop.json()["flattened"]["ok"] is True
+            assert stop.json()["members"][0]["flattened"]["ok"] is True
             # 停止后 status 归 None
-            assert (await client.get("/api/ai-trade/status")).json()["session"] is None
+            assert (await client.get("/api/ai-trade/status")).json()["group"] is None
     finally:
-        get_ai_trade_manager()._session = None
+        get_ai_trade_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()
 
@@ -281,13 +290,12 @@ async def test_start_clamps_out_of_range_per_position_pct(monkeypatch):
             r = await client.post("/api/ai-trade/start",
                                   json=_start_body(strategy_id, stopLossPct=0.9, takeProfitPct=0.9))
             assert r.status_code == 200, r.text
-            body = r.json()
-            assert abs(body["stopLossPct"] - 0.20) < 1e-9    # 夹到 ai_trade_max_sl_pct
-            assert abs(body["takeProfitPct"] - 0.50) < 1e-9  # 夹到 ai_trade_max_tp_pct
-            sess = get_ai_trade_manager()._session
-            assert abs(sess.executor.risk.stop_loss_pct - 0.20) < 1e-9
+            # 回执为分组只读视图（无顶层 pct）；生效 pct 从成员会话 executor.risk 核验（服务端夹紧后）。
+            member = get_ai_trade_manager()._group.members[0]
+            assert abs(member.session.executor.risk.stop_loss_pct - 0.20) < 1e-9  # ai_trade_max_sl_pct
+            assert abs(member.session.executor.risk.take_profit_pct - 0.50) < 1e-9  # ai_trade_max_tp_pct
     finally:
-        get_ai_trade_manager()._session = None
+        get_ai_trade_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()
 
@@ -303,11 +311,11 @@ async def test_start_pct_falls_back_to_config_default_when_omitted(monkeypatch):
             await _seed_account(client)
             r = await client.post("/api/ai-trade/start", json=_start_body(strategy_id))
             assert r.status_code == 200, r.text
-            body = r.json()
-            assert abs(body["stopLossPct"] - 0.05) < 1e-9    # ai_trade_default_sl_pct
-            assert abs(body["takeProfitPct"] - 0.10) < 1e-9  # ai_trade_default_tp_pct
+            member = get_ai_trade_manager()._group.members[0]
+            assert abs(member.session.executor.risk.stop_loss_pct - 0.05) < 1e-9   # default_sl_pct
+            assert abs(member.session.executor.risk.take_profit_pct - 0.10) < 1e-9  # default_tp_pct
     finally:
-        get_ai_trade_manager()._session = None
+        get_ai_trade_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()
 
@@ -326,6 +334,6 @@ async def test_second_start_rejected_by_session_limit(monkeypatch):
             assert second.status_code == 409, second.text
             assert second.json()["error"]["code"] == "AI_TRADE_SESSION_LIMIT"
     finally:
-        get_ai_trade_manager()._session = None
+        get_ai_trade_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()

@@ -436,8 +436,79 @@ class AiTradeSessionRow(BaseModel):
     degraded: bool | None = None
 
 
-class AiTradeStatusOut(BaseModel):
-    session: AiTradeSessionRow | None = None
+# ---- AI 自动交易「分组」（ai-trade-multi-symbol-and-timeframe §6.2，镜像 live-auto 分组）----
+# 路由手搓 dict、不设 response_model；schema 仅作契约 / TS 对齐镜像。
+class AiTradeGroupMemberIn(BaseModel):
+    """分组成员入参：标的 + 该标的可用仓位百分比（(0,100]，even 模式整组 Σ ≤ 100）。"""
+
+    instId: str = Field(min_length=1, max_length=32)
+    allocationPct: float = Field(gt=0, le=100)
+
+
+class AiTradeGroupStartIn(BaseModel):
+    """启动 AI 自动交易分组请求（金额/杠杆字段可留空→服务端保守默认，§4.1）。
+
+    预算总额天花板由服务端解析 min(maxBudgetPct/100, ai_trade_max_capital_frac=5%)（P0-1），
+    前端任何「上限」入参一概不接受；capitalUsd 为分组**总**预算，按各成员 allocationPct 切分（非倍增）。
+    """
+
+    members: list[AiTradeGroupMemberIn]
+    bar: str = "1H"
+    strategyIds: list[int] = Field(min_length=1)         # 多选；上限按 ai_trade_max_strategies 服务端校验
+    accountId: int | None = None                         # 省略=默认实盘账户
+    allocationMode: Literal["even", "max_ratio"] = "even"
+    capitalUsd: float | None = Field(default=None, gt=0)  # 分组总预算，留空→ availUsdt×默认 frac(1%)
+    leverage: float | None = Field(default=None, gt=0, le=125)
+    takeProfitUsd: float | None = Field(default=None, gt=0)  # 分组总止盈；按 pct/Σpct 归一分摊
+    stopLossUsd: float | None = Field(default=None, gt=0)    # 分组总止损；同上
+    stopLossPct: float | None = Field(default=None, gt=0)    # E4：单仓 OCO 止损%（各成员同值，服务端夹紧）
+    takeProfitPct: float | None = Field(default=None, gt=0)  # E4：单仓 OCO 止盈%（各成员同值）
+    contextRefreshRounds: int = Field(default=10, ge=1)   # 精确区间在服务端按 min/max 校验
+    priming: bool = True
+    primingBars: int = Field(default=300, ge=10, le=PAPER_WINDOW_MAX)
+
+    @field_validator("members")
+    @classmethod
+    def _check_members(cls, members: list[AiTradeGroupMemberIn]) -> list[AiTradeGroupMemberIn]:
+        """边界校验：非空、instId 唯一（Σ 约束按 allocationMode 在 model_validator 决定）。"""
+        if not members:
+            raise ValueError("members 不可为空")
+        inst_ids = [m.instId for m in members]
+        if len(set(inst_ids)) != len(inst_ids):
+            raise ValueError("members 含重复 instId")
+        return members
+
+    @model_validator(mode="after")
+    def _check_allocation_sum(self) -> "AiTradeGroupStartIn":
+        """even 强制 Σ allocationPct ≤ 100；max_ratio 跳过 Σ 约束（各标的独立上限，可超 100%）。"""
+        if (self.allocationMode == "even"
+                and sum(m.allocationPct for m in self.members) > 100 + 1e-9):
+            raise ValueError("各标的可用仓位百分比之和不可超过 100%")
+        return self
+
+
+class AiTradeGroupMemberRow(AiTradeSessionRow):   # 复用单会话行全字段 + 分配占比
+    allocationPct: float
+
+
+class AiTradeGroupRow(BaseModel):
+    groupId: str
+    bar: str
+    strategyIds: list[int]
+    strategyNames: list[str]
+    totalBudgetUsd: float
+    leverage: float
+    contextRefreshRounds: int
+    createdTs: int
+    members: list[AiTradeGroupMemberRow]
+
+
+class AiTradeGroupStartOut(AiTradeGroupRow):
+    """start 回执与 status 视图同构（totalBudgetUsd 为夹紧后最终生效值，可能 < 用户填值）。"""
+
+
+class AiTradeStatusOut(BaseModel):     # 改：session → group（分组化，ai-trade-multi-symbol §6.2）
+    group: AiTradeGroupRow | None = None
     aiTradeEnabled: bool
 
 

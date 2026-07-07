@@ -33,6 +33,8 @@ function renderModal(props: Partial<React.ComponentProps<typeof AiTradeLaunchMod
         acknowledged
         onAcknowledge={vi.fn()}
         bar="1H"
+        defaultMembers={[]}
+        defaultAllocationMode="even"
         defaultInstId="BTC-USDT-SWAP"
         defaultStrategyIds={[]}
         defaultContextRounds={10}
@@ -65,7 +67,7 @@ describe("AiTradeLaunchModal", () => {
     expect(screen.getByText("请至少选择一个交易策略")).toBeInTheDocument();
   });
 
-  it("confirms with the selected strategy ids", async () => {
+  it("confirms with the selected strategy ids and bar", async () => {
     const { onConfirm } = renderModal();
     fireEvent.click(await screen.findByText("均线策略"));
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
@@ -75,7 +77,105 @@ describe("AiTradeLaunchModal", () => {
     const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
     expect(opts.strategyIds).toEqual([1]);
     expect(opts.instId).toBe("BTC-USDT-SWAP");
+    expect(opts.bar).toBe("1H");
     expect(opts.contextRefreshRounds).toBe(10);
+  });
+
+  it("auto-fills the member list from defaultMembers", async () => {
+    renderModal({
+      defaultStrategyIds: [1],
+      defaultMembers: [
+        { instId: "BTC-USDT-SWAP", allocationPct: 60 },
+        { instId: "ETH-USDT-SWAP", allocationPct: 40 },
+      ],
+    });
+    await screen.findByText("均线策略");
+    expect(screen.getByText("BTC-USDT-SWAP")).toBeInTheDocument();
+    expect(screen.getByText("ETH-USDT-SWAP")).toBeInTheDocument();
+  });
+
+  it("confirms with members auto-filled from defaultMembers", async () => {
+    const { onConfirm } = renderModal({
+      defaultStrategyIds: [1],
+      defaultMembers: [
+        { instId: "BTC-USDT-SWAP", allocationPct: 60 },
+        { instId: "ETH-USDT-SWAP", allocationPct: 40 },
+      ],
+    });
+    await screen.findByText("均线策略");
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.members).toEqual([
+      { instId: "BTC-USDT-SWAP", allocationPct: 60 },
+      { instId: "ETH-USDT-SWAP", allocationPct: 40 },
+    ]);
+  });
+
+  it("falls back to the current chart instId when defaultMembers is empty", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1], defaultMembers: [] });
+    await screen.findByText("均线策略");
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.members).toEqual([{ instId: "BTC-USDT-SWAP", allocationPct: 100 }]);
+  });
+
+  it("caps auto-filled members at AI_TRADE_MAX_SYMBOLS and disables adding more", async () => {
+    renderModal({
+      defaultStrategyIds: [1],
+      defaultMembers: Array.from({ length: 7 }, (_, i) => ({
+        instId: `S${i}-USDT-SWAP`,
+        allocationPct: 10,
+      })),
+    });
+    await screen.findByText("均线策略");
+    expect(screen.getByText("S0-USDT-SWAP")).toBeInTheDocument();
+    expect(screen.getByText("S4-USDT-SWAP")).toBeInTheDocument();
+    expect(screen.queryByText("S5-USDT-SWAP")).toBeNull(); // 仅前 5 个入选
+    expect(screen.getByText(/已达 AI 自动交易标的上限 5/)).toBeInTheDocument();
+    expect(screen.getByPlaceholderText(/已达上限 5 个/)).toBeDisabled();
+  });
+
+  it("seeds allocationMode from defaultAllocationMode (max_ratio)", async () => {
+    const { onConfirm } = renderModal({
+      defaultStrategyIds: [1],
+      defaultAllocationMode: "max_ratio",
+      defaultMembers: [{ instId: "BTC-USDT-SWAP", allocationPct: 100 }],
+    });
+    await screen.findByText("均线策略");
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.allocationMode).toBe("max_ratio");
+  });
+
+  it("even-splits allocations to 100 across members", async () => {
+    renderModal({
+      defaultStrategyIds: [1],
+      defaultMembers: [
+        { instId: "BTC-USDT-SWAP", allocationPct: 10 },
+        { instId: "ETH-USDT-SWAP", allocationPct: 10 },
+      ],
+    });
+    await screen.findByText("均线策略");
+    fireEvent.click(screen.getByRole("button", { name: "均分" }));
+    expect(screen.getByLabelText("BTC-USDT-SWAP 百分比")).toHaveValue("50");
+    expect(screen.getByLabelText("ETH-USDT-SWAP 百分比")).toHaveValue("50");
+  });
+
+  it("changing the editable timeframe flows into onConfirm", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.change(screen.getByLabelText("时间级别"), { target: { value: "4H" } });
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.bar).toBe("4H");
   });
 
   it("blocks confirm on an out-of-range context refresh count", async () => {
@@ -85,10 +185,13 @@ describe("AiTradeLaunchModal", () => {
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
   });
 
-  it("blocks confirm when the instrument is not auto-tradable (spot)", async () => {
-    renderModal({ defaultInstId: "ADA-USDT", defaultStrategyIds: [1] });
+  it("blocks confirm when a member is not auto-tradable (spot)", async () => {
+    renderModal({
+      defaultStrategyIds: [1],
+      defaultMembers: [{ instId: "ADA-USDT", allocationPct: 100 }],
+    });
     await screen.findByText("均线策略");
-    expect(screen.getByText(/标的不支持自动交易/)).toBeInTheDocument();
+    expect(screen.getByText("不支持")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
   });
 
@@ -144,7 +247,17 @@ describe("AiTradeLaunchModal · backtest mode", () => {
     expect(screen.getByText("模拟回测")).toBeInTheDocument();
   });
 
-  it("backtest confirm does NOT require acknowledged and passes mode+range", async () => {
+  it("defaults the backtest instId to the first auto-trade member", async () => {
+    renderModal({
+      defaultStrategyIds: [1],
+      defaultMembers: [{ instId: "ETH-USDT-SWAP", allocationPct: 100 }],
+    });
+    await screen.findByText("均线策略");
+    fireEvent.click(screen.getByRole("button", { name: "回测" }));
+    expect(screen.getByDisplayValue("ETH-USDT-SWAP")).toBeInTheDocument();
+  });
+
+  it("backtest confirm does NOT require acknowledged and passes mode+range+bar", async () => {
     const { onConfirm } = renderModal({
       acknowledged: false,
       defaultStrategyIds: [1],
@@ -160,6 +273,7 @@ describe("AiTradeLaunchModal · backtest mode", () => {
     const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
     expect(opts.mode).toBe("backtest");
     expect(opts.strategyIds).toEqual([1]);
+    expect(opts.bar).toBe("1H");
     expect(opts.startTs).toBe(START);
     expect(opts.endTs).toBe(START + 100 * HOUR);
     expect(opts.decisionEveryBars).toBeGreaterThanOrEqual(1);

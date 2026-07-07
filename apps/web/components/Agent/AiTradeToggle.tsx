@@ -12,14 +12,15 @@ import {
   resolveAiTradeGate,
 } from "@/lib/aiTrade";
 import { ApiRequestError } from "@/lib/api";
+import { groupStateFromStatus } from "@/lib/useAiTradeGroupStream";
 import { useAppStore } from "@/lib/store";
 import AiTradeLaunchModal, { type AiTradeLaunchOpts } from "./AiTradeLaunchModal";
 
 /**
- * AI 自动交易开关（ai-auto-trading §5.3 + backtest §2.10）：挂 AgentPanel 头部「新对话」右侧。
+ * AI 自动交易开关（ai-trade-multi-symbol-and-timeframe §4.2）：挂 AgentPanel 头部「新对话」右侧。
  * 只要 Agent 已配置模型即可点开弹窗（回测门禁独立于 resolveAiTradeGate）；弹窗内「实盘 / 回测」段控——
- * 实盘段走完整 resolveAiTradeGate 门禁（缺账户/双闸/互斥就地禁用），回测段仅需 Agent 已配置。
- * 运行中开关用于停止实盘会话；回测确认→启动 job 并打开 AiBacktestModal（开关不 latch，回测非持久会话）。
+ * 实盘段走完整 resolveAiTradeGate 门禁并**自动填入左侧「自动交易」面板的 autoTradeMembers 多标的**（分组
+ * 启动），回测段仅需 Agent 已配置。运行中开关用于停止整组；回测确认→启动 job（开关不 latch）。
  */
 export default function AiTradeToggle() {
   const accountMode = useAppStore((s) => s.accountMode);
@@ -28,13 +29,14 @@ export default function AiTradeToggle() {
   const strategyId = useAppStore((s) => s.strategyId);
   const backtestStartTs = useAppStore((s) => s.backtestStartTs);
   const backtestEndTs = useAppStore((s) => s.backtestEndTs);
-  const aiTradeSessionId = useAppStore((s) => s.aiTradeSessionId);
+  const aiTradeGroup = useAppStore((s) => s.aiTradeGroup);
   const liveAutoGroup = useAppStore((s) => s.liveAutoGroup);
+  const autoTradeMembers = useAppStore((s) => s.autoTradeMembers);
+  const autoTradeAllocationMode = useAppStore((s) => s.autoTradeAllocationMode);
   const aiTradeAcknowledged = useAppStore((s) => s.aiTradeAcknowledged);
   const aiTradeConfig = useAppStore((s) => s.aiTradeConfig);
   const aiBacktestConfig = useAppStore((s) => s.aiBacktestConfig);
-  const setAiTradeSessionId = useAppStore((s) => s.setAiTradeSessionId);
-  const setAiTradeSession = useAppStore((s) => s.setAiTradeSession);
+  const setAiTradeGroup = useAppStore((s) => s.setAiTradeGroup);
   const setAiTradeAcknowledged = useAppStore((s) => s.setAiTradeAcknowledged);
   const setAiTradeConfig = useAppStore((s) => s.setAiTradeConfig);
   const setAiBacktestJobId = useAppStore((s) => s.setAiBacktestJobId);
@@ -62,7 +64,8 @@ export default function AiTradeToggle() {
   });
   const aiTradeEnabled = statusQ.data?.aiTradeEnabled ?? false;
 
-  const running = !!aiTradeSessionId;
+  const running = !!aiTradeGroup;
+  const groupId = aiTradeGroup?.groupId ?? null;
   // 实盘段门禁（传入弹窗，实盘 tab 据此禁用 + 悬浮说明）；回测段仅需 agentConfigured。
   const liveGateReason = resolveAiTradeGate({
     accountMode,
@@ -78,9 +81,10 @@ export default function AiTradeToggle() {
   const startM = useMutation({
     mutationFn: (opts: AiTradeLaunchOpts) =>
       aiTradeApi.start({
-        instId: opts.instId,
-        bar,
+        members: opts.members,
+        bar: opts.bar,                       // 可编辑周期真正生效（不再直读 store.bar）
         strategyIds: opts.strategyIds,
+        allocationMode: opts.allocationMode,
         capitalUsd: opts.capitalUsd,
         leverage: opts.leverage,
         takeProfitUsd: opts.takeProfitUsd,
@@ -89,46 +93,22 @@ export default function AiTradeToggle() {
         takeProfitPct: opts.takeProfitPct,   // E4：单仓 OCO 止盈%
         contextRefreshRounds: opts.contextRefreshRounds,
       }),
-    onSuccess: (res, opts) => {
-      const now = Math.floor(Date.now() / 1000);
-      setAiTradeSessionId(res.sessionId);
-      setAiTradeSession({
-        sessionId: res.sessionId,
-        runId: res.runId,
-        state: "running",
-        instId: res.instId,
-        bar: res.bar,
-        strategyIds: res.strategyIds,
-        strategyNames: res.strategyNames,
-        budgetUsd: res.budgetUsd,
-        leverage: res.leverage,
-        takeProfitUsd: opts.takeProfitUsd,
-        stopLossUsd: opts.stopLossUsd,
-        contextRefreshRounds: res.contextRefreshRounds,
-        roundsCompleted: 0,
-        roundsSinceSummary: 0,
-        positionSide: "flat",
-        sessionPnlUsd: 0,
-        startedTs: now,
-        lastDecision: null,
-        contextSummary: null,
-        degraded: false,
-      });
+    onSuccess: (res) => {
+      setAiTradeGroup(groupStateFromStatus(res));
       // 记忆偏好（策略集合 + 刷新轮数），下次启动回填。
       setAiTradeConfig({ strategyIds: res.strategyIds, contextRefreshRounds: res.contextRefreshRounds });
       setModalOpen(false);
       setError(null);
       qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
     },
-    onError: (e) =>
-      setError(e instanceof ApiRequestError ? e.message : "启动失败，请稍后重试"),
+    onError: (e) => setError(e instanceof ApiRequestError ? describeStartError(e) : "启动失败，请稍后重试"),
   });
 
   const startBacktestM = useMutation({
     mutationFn: (opts: AiTradeLaunchOpts) =>
       aiBacktestApi.start({
         instId: opts.instId,
-        bar,
+        bar: opts.bar,                       // 回测同享可编辑周期
         strategyIds: opts.strategyIds,
         startTs: opts.startTs ?? 0,
         endTs: opts.endTs ?? 0,
@@ -156,7 +136,7 @@ export default function AiTradeToggle() {
   });
 
   const stopM = useMutation({
-    mutationFn: (id: string) => aiTradeApi.stop(id),
+    mutationFn: (id: string) => aiTradeApi.stopGroup(id),
     onSettled: () => {
       clearAiTradeRuntime();
       qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
@@ -168,8 +148,8 @@ export default function AiTradeToggle() {
     if (next) {
       if (openBlockedReason) return;
       setModalOpen(true);
-    } else if (aiTradeSessionId) {
-      stopM.mutate(aiTradeSessionId);
+    } else if (groupId) {
+      stopM.mutate(groupId);
     }
   };
 
@@ -213,6 +193,8 @@ export default function AiTradeToggle() {
         acknowledged={aiTradeAcknowledged}
         onAcknowledge={setAiTradeAcknowledged}
         bar={bar}
+        defaultMembers={autoTradeMembers}
+        defaultAllocationMode={autoTradeAllocationMode}
         defaultInstId={instId}
         defaultStrategyIds={defaultStrategyIds}
         defaultContextRounds={aiTradeConfig?.contextRefreshRounds ?? AI_TRADE_DEFAULT_CONTEXT_ROUNDS}
@@ -224,4 +206,12 @@ export default function AiTradeToggle() {
       />
     </div>
   );
+}
+
+/** 整组前置失败（AI_TRADE_GROUP_PREFLIGHT）逐标的明细中文化；否则回落 message。 */
+function describeStartError(err: ApiRequestError): string {
+  if (err.code === "AI_TRADE_GROUP_PREFLIGHT" && err.members?.length) {
+    return err.members.map((m) => `${m.instId}：${m.message}`).join("；");
+  }
+  return err.message;
 }

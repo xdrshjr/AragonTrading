@@ -5,12 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { accountApi } from "@/lib/accountApi";
 import { agentApi } from "@/lib/agentApi";
 import { aiTradeApi } from "@/lib/aiTradeApi";
+import type { AiTradeGroupState } from "@/lib/aiTradeTypes";
 import { useAppStore } from "@/lib/store";
 import { tradingApi } from "@/lib/tradingApi";
 import AiTradeToggle from "./AiTradeToggle";
 
 vi.mock("@/lib/aiTradeApi", () => ({
-  aiTradeApi: { start: vi.fn(), stop: vi.fn(), status: vi.fn() },
+  aiTradeApi: { start: vi.fn(), stopGroup: vi.fn(), stopMember: vi.fn(), status: vi.fn() },
   aiTradeWS: vi.fn(() => ({ connect: vi.fn(), close: vi.fn() })),
 }));
 vi.mock("@/lib/accountApi", () => ({ accountApi: { accounts: { list: vi.fn() } } }));
@@ -25,6 +26,38 @@ vi.mock("@/lib/api", async (orig) => {
 });
 
 const READY_ACCOUNTS = { accounts: [{ id: 1, hasSecret: true, hasPassphrase: true }], defaultId: 1 };
+
+function makeGroup(): AiTradeGroupState {
+  return {
+    groupId: "grp-1",
+    bar: "1H",
+    strategyIds: [1],
+    strategyNames: ["S1"],
+    totalBudgetUsd: 100,
+    leverage: 3,
+    contextRefreshRounds: 10,
+    state: "running",
+    startedTs: 0,
+    members: {
+      "BTC-USDT-SWAP": {
+        instId: "BTC-USDT-SWAP",
+        sessionId: "sess-1",
+        allocationPct: 100,
+        session: {
+          sessionId: "sess-1", runId: 1, state: "running", instId: "BTC-USDT-SWAP", bar: "1H",
+          strategyIds: [1], strategyNames: ["S1"], budgetUsd: 100, leverage: 3,
+          contextRefreshRounds: 10, roundsCompleted: 0, roundsSinceSummary: 0,
+          positionSide: "flat", sessionPnlUsd: 0, startedTs: 0,
+        },
+        trades: [],
+        position: null,
+        decisions: [],
+        traces: [],
+        summary: null,
+      },
+    },
+  };
+}
 
 function renderToggle() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -43,22 +76,23 @@ beforeEach(() => {
     instId: "BTC-USDT-SWAP",
     bar: "1H",
     strategyId: 1,
-    aiTradeSessionId: null,
-    aiTradeSession: null,
+    aiTradeGroup: null,
+    autoTradeMembers: [],
+    autoTradeAllocationMode: "even",
     liveAutoGroup: null,
     aiTradeAcknowledged: false,
     aiTradeConfig: null,
   });
   vi.mocked(accountApi.accounts.list).mockResolvedValue(READY_ACCOUNTS as never);
   vi.mocked(agentApi.config).mockResolvedValue({ configured: true, provider: "x", model: "y" } as never);
-  vi.mocked(aiTradeApi.status).mockResolvedValue({ session: null, aiTradeEnabled: true } as never);
+  vi.mocked(aiTradeApi.status).mockResolvedValue({ group: null, aiTradeEnabled: true } as never);
   vi.mocked(tradingApi.config).mockResolvedValue({ availUsdt: 1000 } as never);
 });
 
 afterEach(() => cleanup());
 
 describe("AiTradeToggle", () => {
-  it("renders an off switch when no session is active", () => {
+  it("renders an off switch when no group is active", () => {
     renderToggle();
     expect(screen.getByRole("switch")).toHaveAttribute("aria-checked", "false");
   });
@@ -73,9 +107,8 @@ describe("AiTradeToggle", () => {
 
   it("opens in backtest mode when live AI trading is gated but agent is configured (R6)", async () => {
     // AI 开关后端未开 → 实盘段禁用，但 Agent 已配置 → 弹窗仍可开，默认落回测段。
-    vi.mocked(aiTradeApi.status).mockResolvedValue({ session: null, aiTradeEnabled: false } as never);
+    vi.mocked(aiTradeApi.status).mockResolvedValue({ group: null, aiTradeEnabled: false } as never);
     renderToggle();
-    // agent 已配置 → openBlockedReason 为 null，容器 title 仍为「开启…」；据此等 agentApi.config 水合。
     await screen.findByTitle("开启 AI 自动交易 / 回测");
     fireEvent.click(screen.getByRole("switch"));
     expect(await screen.findByText("AI 自动交易 · 回测")).toBeInTheDocument();
@@ -85,28 +118,21 @@ describe("AiTradeToggle", () => {
   it("does not open the modal when the agent model is not configured", async () => {
     vi.mocked(agentApi.config).mockResolvedValue({ configured: false } as never);
     renderToggle();
-    // 未配置模型 → 容器 title 变为提示语；据此确保门禁已水合再点击。
     await screen.findByTitle("请先在设置中心配置 AI 模型");
     fireEvent.click(screen.getByRole("switch"));
     expect(screen.queryByText("启动 AI 自动交易")).not.toBeInTheDocument();
     expect(screen.queryByText("AI 自动交易 · 回测")).not.toBeInTheDocument();
   });
 
-  it("stops the session when toggled off while running", async () => {
-    useAppStore.setState({
-      aiTradeSessionId: "sess-1",
-      aiTradeSession: {
-        sessionId: "sess-1", runId: 1, state: "running", instId: "BTC-USDT-SWAP", bar: "1H",
-        strategyIds: [1], strategyNames: ["S1"], budgetUsd: 100, leverage: 3,
-        contextRefreshRounds: 10, roundsCompleted: 0, roundsSinceSummary: 0,
-        positionSide: "flat", sessionPnlUsd: 0, startedTs: 0,
-      },
-    });
-    vi.mocked(aiTradeApi.stop).mockResolvedValue({ sessionId: "sess-1", stopReason: "user_stop" } as never);
+  it("stops the whole group when toggled off while running", async () => {
+    useAppStore.setState({ aiTradeGroup: makeGroup() });
+    vi.mocked(aiTradeApi.stopGroup).mockResolvedValue({
+      groupId: "grp-1", stopReason: "user_stop", members: [],
+    } as never);
     renderToggle();
     const sw = screen.getByRole("switch");
     expect(sw).toHaveAttribute("aria-checked", "true");
     fireEvent.click(sw);
-    await waitFor(() => expect(aiTradeApi.stop).toHaveBeenCalledWith("sess-1"));
+    await waitFor(() => expect(aiTradeApi.stopGroup).toHaveBeenCalledWith("grp-1"));
   });
 });
