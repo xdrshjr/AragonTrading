@@ -7,6 +7,7 @@ import { DEFAULT_INDICATORS, type IndicatorKey } from "./indicators";
 import { FALLBACK_INSTRUMENTS } from "./instruments";
 import type {
   AccountMode,
+  BacktestConfig,
   BacktestKind,
   Bar,
   BottomTab,
@@ -205,6 +206,9 @@ interface AppState {
   wfParams: WfParams;
   walkForwardResult: WalkForwardResult | null;
   accountMode: AccountMode;
+  // 运行回测配置弹窗偏好（strategy-backtest-config-modal §五）：区间预设/周期/成本/杠杆；持久化跨刷新恢复。
+  // 只持久化 preset 与自定义值本身；预设区间在打开弹窗时按 now 重派生（绝不持久化陈旧绝对时间当预设结果）。
+  backtestConfig: BacktestConfig | null;
   // 实盘「真实下单」风险勾选的会话记忆（瞬态，不持久化，刷新即复位 → 每会话首单仍需勾选，C1-3）。
   liveAcknowledged: boolean;
   simBalance: number;
@@ -299,6 +303,7 @@ interface AppState {
   setBacktestKind: (kind: BacktestKind) => void;
   setWfParams: (patch: Partial<WfParams>) => void;
   setWalkForwardResult: (result: WalkForwardResult | null) => void;
+  setBacktestConfig: (cfg: BacktestConfig) => void;
   setAccountMode: (m: AccountMode) => void;
   setLiveAcknowledged: (v: boolean) => void;
   setSimBalance: (n: number) => void;
@@ -468,6 +473,8 @@ export const useAppStore = create<AppState>()(
       walkForwardResult: null,
       // 本轮需求：实盘模式默认开启。无就绪默认账户时由 AccountModeSwitch 水合守门回落 sim。
       accountMode: "live",
+      // 运行回测配置偏好默认 null（全新安装只走初始化器、不触发 migrate，首开弹窗回落默认成本 + 当前区间）。
+      backtestConfig: null,
       liveAcknowledged: false,
       simBalance: DEFAULT_SIM_BALANCE,
       paperSessionId: null,
@@ -554,6 +561,8 @@ export const useAppStore = create<AppState>()(
       // 高级回测窗口参数局部更新（合并 patch）。
       setWfParams: (patch) => set((s) => ({ wfParams: { ...s.wfParams, ...patch } })),
       setWalkForwardResult: (walkForwardResult) => set({ walkForwardResult }),
+      // 运行回测配置偏好写：弹窗内成功运行后乐观持久化（strategy-backtest-config-modal §三）。
+      setBacktestConfig: (backtestConfig) => set({ backtestConfig }),
       // 账户模式写：选「实盘」时联动 chartView="live-follow"（§5.3）；「模拟盘」保持现状，
       // setMode("paper") 由组件另行编排。实盘进入由组件做凭证 / 开关守门（C1-5），此处只落状态。
       setAccountMode: (accountMode) =>
@@ -920,7 +929,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 26,
+      version: 27,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -933,6 +942,8 @@ export const useAppStore = create<AppState>()(
         backtestKind: s.backtestKind,
         wfParams: s.wfParams,
         accountMode: s.accountMode,
+        // 运行回测配置偏好（strategy-backtest-config-modal §五，持久化跨刷新恢复）。
+        backtestConfig: s.backtestConfig,
         simBalance: s.simBalance,
         theme: s.theme,
         backtestStartTs: s.backtestStartTs,
@@ -1077,6 +1088,10 @@ export const useAppStore = create<AppState>()(
         if (version < 26) {
           // 左侧标的侧栏可拖拽调宽：补像素宽默认（追加字段，浅合并本就回落初值，迁移显式稳妥）。
           next = { ...next, instrumentSidebarWidth: DEFAULT_INSTRUMENT_SIDEBAR_WIDTH };
+        }
+        if (version < 27) {
+          // 运行回测配置弹窗偏好：补默认 null（缺失时首开弹窗回落默认成本 + 当前区间，不臆造陈旧绝对时间）。
+          next = { ...next, backtestConfig: null };
         }
         return next as never;
       },

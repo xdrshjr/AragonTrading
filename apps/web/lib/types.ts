@@ -1,4 +1,6 @@
 export type Bar = "1m" | "5m" | "15m" | "30m" | "1H" | "4H" | "1D";
+// 回测区间预设（strategy-backtest-config-modal §4.2）：预设换算在打开弹窗时按 now 派生，custom 走用户起止。
+export type RangePreset = "7d" | "30d" | "90d" | "180d" | "1y" | "custom";
 export type Mode = "backtest" | "compare" | "paper";
 export type StrategyListTab = "regular" | "combo" | "factor";
 // 原子 / 组合 / 因子组合得分（后端 merge_strategy 透传 kind；评审 C-P1-5）。
@@ -156,10 +158,46 @@ export interface ComboPreviewResult {
 export interface BacktestResult {
   runId: number;
   metrics: Metrics;
+  // 专业扩展绩效指标（strategy-backtest-config-modal §2.5）：原子/因子/组合回测路径加法式回传；
+  // 旧数据或形状不齐时缺省（前端渲染「—」）。契约与 engine/metrics_ext.compute_extended_metrics 同构。
+  extendedMetrics?: ExtendedMetrics;
   effectiveCandleCount?: number; // 实际参与回测的已确认 K 线根数
   requestedBars?: number; // (endTs-startTs)/barSec + 1，请求区间应有根数
   truncated?: boolean; // 未覆盖到 startTs（撞 max_bars 上限或 OKX 历史不足）
   combo?: ComboPreviewResult["combo"];
+}
+
+// 回测配置（弹窗态 + store 持久化偏好，strategy-backtest-config-modal §4.2）。
+export interface BacktestConfig {
+  bar: Bar;
+  rangePreset: RangePreset;
+  startTs: number; // UTC 秒；preset!=="custom" 时打开弹窗按 now 重派生
+  endTs: number;
+  initialCapital: number; // > 0
+  feesBps: number; // taker_fee_bps, >= 0
+  slippageBps: number; // slippage_bps, >= 0
+  leverage: number; // >= 1
+}
+
+// 专业扩展绩效指标（与后端 engine/metrics_ext 派生同构，camelCase）。payoffRatio 为赔率
+//（平均盈利/平均亏损），区别于 Metrics.profitFactor（盈利因子＝毛盈利/毛亏损）。
+export interface ExtendedMetrics {
+  annualizedReturn: number;
+  annualizedVolatility: number;
+  sortino: number;
+  calmar: number;
+  maxDrawdownBars: number;
+  maxDrawdownSecs: number;
+  timeInMarketPct: number;
+  avgWin: number;
+  avgLoss: number;
+  payoffRatio: number;
+  largestWin: number;
+  largestLoss: number;
+  maxConsecutiveWins: number;
+  maxConsecutiveLosses: number;
+  avgHoldBars: number;
+  tradesPerWeek: number;
 }
 
 // ---- 高级回测：滑动窗口 / Walk-forward（spec advanced-backtest-walk-forward §6.2）----

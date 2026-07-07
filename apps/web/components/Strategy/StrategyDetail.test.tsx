@@ -1,10 +1,19 @@
 import "@testing-library/jest-dom/vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_BACKTEST_CONFIG } from "@/lib/backtestConfig";
 import type { FactorMember } from "@/lib/factorTypes";
 import { useAppStore } from "@/lib/store";
-import type { Strategy } from "@/lib/types";
+import type { BacktestConfig, Strategy } from "@/lib/types";
 import StrategyDetail from "./StrategyDetail";
+
+const BACKTEST_CONFIG: BacktestConfig = {
+  ...DEFAULT_BACKTEST_CONFIG,
+  rangePreset: "custom",
+  startTs: 1_700_000_000,
+  endTs: 1_700_086_400,
+};
 
 const MEMBERS: FactorMember[] = [
   { factorKey: "mom_roc", params: {}, weight: 0.6, direction: "long" },
@@ -26,17 +35,22 @@ function factorStrategy(params: Record<string, unknown>): Strategy {
 }
 
 function renderDetail(strategy: Strategy) {
+  // StrategyDetail 挂载 BacktestConfigModal（内部 useQuery），故需 QueryClientProvider 祖先。
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <StrategyDetail
-      strategy={strategy}
-      mode="backtest"
-      busy={false}
-      paperActive={false}
-      onApplyAndBacktest={vi.fn()}
-      onStartPaper={vi.fn()}
-      onStopPaper={vi.fn()}
-      onSaveAs={vi.fn()}
-    />,
+    <QueryClientProvider client={queryClient}>
+      <StrategyDetail
+        strategy={strategy}
+        mode="backtest"
+        busy={false}
+        paperActive={false}
+        backtestConfig={BACKTEST_CONFIG}
+        onRunBacktest={vi.fn()}
+        onStartPaper={vi.fn()}
+        onStopPaper={vi.fn()}
+        onSaveAs={vi.fn()}
+      />
+    </QueryClientProvider>,
   );
 }
 

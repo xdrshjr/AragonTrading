@@ -2,8 +2,9 @@
 
 import { useState } from "react";
 import { summarizeComboMembers } from "@/lib/combo";
-import type { BacktestKind, Strategy } from "@/lib/types";
+import type { BacktestConfig, BacktestKind, BacktestResult, Strategy } from "@/lib/types";
 import { Badge, Button } from "@/components/ui";
+import BacktestConfigModal from "./BacktestConfigModal";
 import WalkForwardForm from "./WalkForwardForm";
 
 type PaperOpts = { source?: "live" | "replay"; speed?: number; replayBars?: number };
@@ -20,6 +21,11 @@ export default function ComboStrategyDetail({
   backtestKind = "simple",
   busy,
   paperActive = false,
+  instId = "",
+  backtestConfig,
+  backtestRunning = false,
+  backtestResult,
+  backtestError,
   onRunBacktest,
   onRunWalkForward,
   onStartPaper,
@@ -33,7 +39,13 @@ export default function ComboStrategyDetail({
   backtestKind?: BacktestKind;
   busy: boolean;
   paperActive?: boolean;
-  onRunBacktest: (combo: Strategy) => void;
+  instId?: string;
+  // 运行回测配置弹窗（strategy-backtest-config-modal §4.4）：组合无策略参数表单，仅区间/周期/成本。
+  backtestConfig: BacktestConfig;
+  backtestRunning?: boolean;
+  backtestResult?: BacktestResult;
+  backtestError?: string | null;
+  onRunBacktest: (cfg: BacktestConfig) => void;
   onRunWalkForward?: (combo: Strategy) => void;
   onStartPaper?: (combo: Strategy, opts?: PaperOpts) => void;
   onStopPaper?: () => void;
@@ -44,6 +56,7 @@ export default function ComboStrategyDetail({
   const isWalkForward = backtestKind === "walkforward";
   const [source, setSource] = useState<"live" | "replay">("live");
   const [speed, setSpeed] = useState(16);
+  const [configOpen, setConfigOpen] = useState(false);
   const isPaper = mode === "paper";
 
   return (
@@ -126,7 +139,7 @@ export default function ComboStrategyDetail({
             </Button>
           )
         ) : !isWalkForward ? (
-          <Button variant="primary" disabled={busy} onClick={() => onRunBacktest(combo)}>
+          <Button variant="primary" disabled={busy} onClick={() => setConfigOpen(true)}>
             {busy ? "运行中..." : "运行回测"}
           </Button>
         ) : null}
@@ -140,6 +153,18 @@ export default function ComboStrategyDetail({
           删除
         </Button>
       </div>
+
+      <BacktestConfigModal
+        open={configOpen}
+        onClose={() => setConfigOpen(false)}
+        strategyName={combo.name}
+        instId={instId}
+        initialConfig={backtestConfig}
+        running={backtestRunning}
+        result={backtestResult}
+        errorMessage={backtestError}
+        onRun={(cfg) => onRunBacktest(cfg)}
+      />
     </div>
   );
 }

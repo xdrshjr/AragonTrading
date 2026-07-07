@@ -293,6 +293,7 @@ function resetStore(state: Partial<ReturnType<typeof useAppStore.getState>> = {}
     paperStreamsEnabled: false,
     backtestStartTs: 1_700_000_000,
     backtestEndTs: 1_700_086_400,
+    backtestConfig: null,
     comboDraft: { memberIds: [], policy: { ...DEFAULT_COMBO_POLICY } },
     comboEditingId: null,
     ...state,
@@ -362,9 +363,16 @@ async function selectComboTab() {
 }
 
 async function runAtomicBacktest() {
+  // 「运行回测」现打开配置弹窗；须在弹窗内点「开始回测」才真正触发回测（strategy-backtest-config-modal）。
   fireEvent.click(getButton(RUN_BACKTEST));
+  const dialog = await screen.findByRole("dialog");
+  fireEvent.click(within(dialog).getByRole("button", { name: "开始回测" }));
   await waitFor(() => expect(api.backtest).toHaveBeenCalledTimes(1));
-  await screen.findByText("12.00%");
+  // 结果同时在弹窗指标网格与内联绩效区呈现，故用 findAllByText。
+  await screen.findAllByText("12.00%");
+  // 关闭弹窗，避免遮挡后续列表操作并消除结果区与内联区「12.00%」的重复匹配。
+  fireEvent.keyDown(window, { key: "Escape" });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
 }
 
 describe("StrategyPanel manual backtest trigger", () => {
@@ -585,17 +593,25 @@ describe("StrategyPanel manual backtest trigger", () => {
     expect(api.backtest).not.toHaveBeenCalled();
 
     fireEvent.click(getButton(RUN_BACKTEST));
+    // 「运行回测」现打开配置弹窗；弹窗内「开始回测」才真正触发回测（strategy-backtest-config-modal）。
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "开始回测" }));
 
     await waitFor(() => expect(api.updateStrategy).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(api.backtest).toHaveBeenCalledTimes(1));
     expect(api.updateStrategy).toHaveBeenCalledWith(1, {
       params: { threshold: 33, enabled: true },
     });
+    // 弹窗真正下发区间/周期/成本/杠杆（种子=默认成本 + 当前图表 bar 与回测区间）。
     expect(api.backtest).toHaveBeenCalledWith(1, {
       instId: "BTC-USDT-SWAP",
       bar: "1H",
       startTs: 1_700_000_000,
       endTs: 1_700_086_400,
+      initialCapital: 10000,
+      fees: 5,
+      slippage: 2,
+      leverage: 1,
     });
     const updateOrder = vi.mocked(api.updateStrategy).mock.invocationCallOrder[0];
     const backtestOrder = vi.mocked(api.backtest).mock.invocationCallOrder[0];
@@ -616,6 +632,9 @@ describe("StrategyPanel manual backtest trigger", () => {
     expect(api.updateStrategy).not.toHaveBeenCalled();
 
     fireEvent.click(getButton(RUN_BACKTEST));
+    // 组合「运行回测」同样先开配置弹窗，弹窗内「开始回测」才触发（无策略参数表单，不 updateStrategy）。
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "开始回测" }));
 
     await waitFor(() => expect(api.backtest).toHaveBeenCalledTimes(1));
     expect(api.backtest).toHaveBeenCalledWith(20, {
@@ -623,6 +642,10 @@ describe("StrategyPanel manual backtest trigger", () => {
       bar: "1H",
       startTs: 1_700_000_000,
       endTs: 1_700_086_400,
+      initialCapital: 10000,
+      fees: 5,
+      slippage: 2,
+      leverage: 1,
     });
     expect(api.updateStrategy).not.toHaveBeenCalled();
   });

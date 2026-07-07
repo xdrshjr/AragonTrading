@@ -17,7 +17,9 @@ import {
 } from "@/lib/strategyCatalog";
 import { useAppStore } from "@/lib/store";
 import { downloadCsv, equityToCsv } from "@/lib/export";
+import { seedBacktestConfig } from "@/lib/backtestConfig";
 import type {
+  BacktestConfig,
   ComboPreviewResult,
   Metrics,
   MultiSampleResult,
@@ -65,6 +67,8 @@ export default function StrategyPanel() {
     paperSessionsByStrategyId,
     backtestStartTs,
     backtestEndTs,
+    backtestConfig,
+    setBacktestConfig,
     comboEditingId,
     setComboEditingId,
     setMode,
@@ -243,6 +247,18 @@ export default function StrategyPanel() {
   const capReached = selectedCount >= maxPaperSessions;
   const busy = false;
 
+  // 运行回测弹窗种子配置：有持久化偏好则复用，否则默认成本 + 自定义区间承接当前图表 bar 与回测区间。
+  const seedBacktestCfg = useMemo(
+    () =>
+      seedBacktestConfig({
+        stored: backtestConfig,
+        bar,
+        startTs: backtestStartTs,
+        endTs: backtestEndTs,
+      }),
+    [backtestConfig, bar, backtestStartTs, backtestEndTs],
+  );
+
   useEffect(() => {
     if (mode !== "paper") return;
     if (validPaperSelectionIds.length === paperSelectionIds.length) return;
@@ -250,11 +266,13 @@ export default function StrategyPanel() {
   }, [mode, paperSelectionIds.length, validPaperSelectionIds, setPaperSelectionIds]);
 
   const backtest = useMutation({
-    mutationFn: (vars: { id: number; params?: Params; showRunRange?: boolean }) =>
-      runBacktest(vars.id, vars.params, instId, bar, backtestStartTs, backtestEndTs),
+    mutationFn: (vars: { id: number; params?: Params; config?: BacktestConfig; showRunRange?: boolean }) =>
+      runBacktest(vars.id, vars.params, vars.config, instId, bar, backtestStartTs, backtestEndTs),
     onSuccess: (data, vars) => {
       setRunId(data.runId);
       if (vars.showRunRange) setChartView("run-range");
+      // 弹窗内成功运行后乐观持久化配置偏好（下次打开弹窗以此为种子，strategy-backtest-config-modal §三）。
+      if (vars.config) setBacktestConfig(vars.config);
       setMetrics(data.metrics);
       // 组合行后端追加 combo（年化 / 时间线 / 分体制）；原子行 combo 为 undefined → 回填 null 清陈旧。
       setComboResult(data.combo ?? null);
@@ -522,7 +540,14 @@ export default function StrategyPanel() {
                       backtestKind={backtestKind}
                       busy={actionBusy}
                       paperActive={runningSessions.length > 0 || !!paperSessionId}
-                      onRunBacktest={(c) => backtest.mutate({ id: c.id, showRunRange: true })}
+                      instId={instId}
+                      backtestConfig={seedBacktestCfg}
+                      backtestRunning={backtest.isPending}
+                      backtestResult={backtest.data}
+                      backtestError={backtest.isError ? (backtest.error as Error)?.message : null}
+                      onRunBacktest={(cfg) =>
+                        backtest.mutate({ id: selectedCombo.id, config: cfg, showRunRange: true })
+                      }
                       onRunWalkForward={(c) => walkForward.mutate({ id: c.id })}
                       onStartPaper={(_combo, opts) => {
                         if (!startDisabledReason) paperStart.mutate({ skipUpdate: true, opts });
@@ -579,8 +604,12 @@ export default function StrategyPanel() {
                       bar={bar}
                       backtestStartTs={backtestStartTs}
                       backtestEndTs={backtestEndTs}
-                      onApplyAndBacktest={(params) =>
-                        backtest.mutate({ id: selected.id, params, showRunRange: true })
+                      backtestConfig={seedBacktestCfg}
+                      backtestRunning={backtest.isPending}
+                      backtestResult={backtest.data}
+                      backtestError={backtest.isError ? (backtest.error as Error)?.message : null}
+                      onRunBacktest={(params, cfg) =>
+                        backtest.mutate({ id: selected.id, params, config: cfg, showRunRange: true })
                       }
                       onRunWalkForward={(params) => walkForward.mutate({ id: selected.id, params })}
                       onStartPaper={(params, opts) => {
@@ -765,6 +794,7 @@ function stripFactorSetId(params: Params): Params {
 async function runBacktest(
   id: number,
   params: Params | undefined,
+  config: BacktestConfig | undefined,
   instId: string,
   bar: string,
   startTs: number,
@@ -772,6 +802,19 @@ async function runBacktest(
 ) {
   if (params) await api.updateStrategy(id, { params });
   // 去掉硬编码 limit（v2·P1-1）：后端全区间分页保证 [startTs,endTs] 全覆盖，不再截断到最近 1000 根。
+  // 弹窗配置在则真正下发区间/周期/成本/杠杆（strategy-backtest-config-modal §2.3）；缺省回退全局图表区间。
+  if (config) {
+    return api.backtest(id, {
+      instId,
+      bar: config.bar,
+      startTs: config.startTs,
+      endTs: config.endTs,
+      initialCapital: config.initialCapital,
+      fees: config.feesBps,
+      slippage: config.slippageBps,
+      leverage: config.leverage,
+    });
+  }
   return api.backtest(id, { instId, bar, startTs, endTs });
 }
 

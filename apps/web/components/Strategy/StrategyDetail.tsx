@@ -6,7 +6,8 @@ import { buildEditTargetFromStrategy, directionLabel } from "@/lib/factor";
 import type { FactorScoreSnapshotParams } from "@/lib/factorTypes";
 import { fmtMoney, fmtTime } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
-import type { BacktestKind, Strategy } from "@/lib/types";
+import type { BacktestConfig, BacktestKind, BacktestResult, Strategy } from "@/lib/types";
+import BacktestConfigModal from "./BacktestConfigModal";
 import MultiSampleBacktestModal from "./MultiSampleBacktestModal";
 import WalkForwardForm from "./WalkForwardForm";
 
@@ -95,7 +96,11 @@ export default function StrategyDetail({
   bar = "1H",
   backtestStartTs = 0,
   backtestEndTs = 0,
-  onApplyAndBacktest,
+  backtestConfig,
+  onRunBacktest,
+  backtestRunning = false,
+  backtestResult,
+  backtestError,
   onRunWalkForward,
   onStartPaper,
   onStopPaper,
@@ -114,7 +119,12 @@ export default function StrategyDetail({
   bar?: string;
   backtestStartTs?: number;
   backtestEndTs?: number;
-  onApplyAndBacktest: (params: Params) => void;
+  // 运行回测配置弹窗（strategy-backtest-config-modal §4.4）：种子配置 + 运行回调 + 运行态/结果/错误观测。
+  backtestConfig: BacktestConfig;
+  onRunBacktest: (params: Params, cfg: BacktestConfig) => void;
+  backtestRunning?: boolean;
+  backtestResult?: BacktestResult;
+  backtestError?: string | null;
   onRunWalkForward?: (params: Params) => void;
   onStartPaper: (params: Params, opts?: PaperOpts) => void;
   onStopPaper: () => void;
@@ -125,6 +135,7 @@ export default function StrategyDetail({
   const [source, setSource] = useState<"live" | "replay">("live");
   const [speed, setSpeed] = useState(16);
   const [multiOpen, setMultiOpen] = useState(false);
+  const [configOpen, setConfigOpen] = useState(false);
 
   useEffect(() => {
     setParams(strategy.params);
@@ -137,6 +148,24 @@ export default function StrategyDetail({
   // 多周期：策略声明了高周期参考时展示信息性徽标（不改任何请求路径，仅帮助理解综合多周期）。
   const htfFilterOn = params.htf_trend_filter !== false;
   const htfBar = typeof params.htf_bar === "string" && htfFilterOn ? params.htf_bar : null;
+
+  // 运行回测弹窗上下文：factor_score 暖机最小根数（normWindow+60，沿用横幅口径）+ 权重训练区间
+  //（样本内/外自查），非因子策略省略。
+  const isFactor = strategy.kind === "factor";
+  const factorThresholds = (strategy.params?.thresholds as { normWindow?: number } | undefined) ?? {};
+  const warmupBars = isFactor ? Number(factorThresholds.normWindow ?? 200) + 60 : undefined;
+  const provenance = isFactor
+    ? (strategy.params as Partial<FactorScoreSnapshotParams>)?.provenance
+    : undefined;
+  const provenanceHint =
+    provenance?.startTs != null && provenance?.endTs != null
+      ? {
+          startTs: provenance.startTs,
+          endTs: provenance.endTs,
+          instId: provenance.instId,
+          bar: provenance.bar,
+        }
+      : null;
 
   return (
     <div className="flex flex-col gap-3">
@@ -261,7 +290,7 @@ export default function StrategyDetail({
       <div className="flex flex-wrap gap-2">
         {mode === "backtest" ? (
           backtestKind === "walkforward" ? null : (
-            <Button variant="primary" disabled={busy} onClick={() => onApplyAndBacktest(params)}>
+            <Button variant="primary" disabled={busy} onClick={() => setConfigOpen(true)}>
               {busy ? "运行中..." : "运行回测"}
             </Button>
           )
@@ -314,6 +343,20 @@ export default function StrategyDetail({
           }}
         />
       )}
+
+      <BacktestConfigModal
+        open={configOpen}
+        onClose={() => setConfigOpen(false)}
+        strategyName={strategy.name}
+        instId={instId}
+        warmupBars={warmupBars}
+        provenanceHint={provenanceHint}
+        initialConfig={backtestConfig}
+        running={backtestRunning}
+        result={backtestResult}
+        errorMessage={backtestError}
+        onRun={(cfg) => onRunBacktest(params, cfg)}
+      />
     </div>
   );
 }

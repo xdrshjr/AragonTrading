@@ -20,6 +20,7 @@ from ..db.models import Strategy, StrategyRun
 from ..engine.backtester import BacktestResult, plan_walk_forward_windows, run_backtest
 from ..engine.combo import ComboMember, ComboPolicy, run_combo_backtest
 from ..engine.metrics import summarize_windows
+from ..engine.metrics_ext import compute_extended_metrics
 from ..engine.mtf import bar_to_seconds
 from ..okx.rest_client import OKXError
 from ..okx.types import Candle
@@ -273,7 +274,9 @@ async def run_single_backtest(session: AsyncSession, rest, *, strategy_id: int, 
         session, strategy_id=strategy_id, strategy=strategy, inst_id=inst_id, bar=bar,
         limit=limit, start_ts=start_ts, end_ts=end_ts, costs=costs, candles=candles,
         htf_frames=htf_frames)
-    return {"runId": run.id, "metrics": result.metrics,
+    # 附带专业扩展绩效指标（复用现成纯函数；不落库、对既有 metrics 契约零影响，strategy-backtest-config-modal §2.6）。
+    extended = compute_extended_metrics(result.equity_points, result.trades, bar, costs[0])
+    return {"runId": run.id, "metrics": result.metrics, "extendedMetrics": extended,
             **_coverage_fields(candles, bar=bar, start_ts=start_ts, end_ts=end_ts)}
 
 
@@ -680,7 +683,10 @@ async def _run_saved_combo(session: AsyncSession, rest, row: Strategy, *, inst_i
         limit=limit, start_ts=start_ts, end_ts=end_ts, costs=costs,
         config_extra={"preview": False, "members": members_spec, "policy": policy_spec})
     combo_notes = list(dict.fromkeys(notes + list(result.notes)))
-    return {"runId": run.id, "metrics": result.metrics, "combo": combo_out(result, combo_notes)}
+    # 组合级 equity/trades 同源 SimBroker，附带扩展指标（形状齐时；退化输入 compute_extended_metrics 回落 0）。
+    extended = compute_extended_metrics(result.equity_points, result.trades, bar, costs[0])
+    return {"runId": run.id, "metrics": result.metrics, "extendedMetrics": extended,
+            "combo": combo_out(result, combo_notes)}
 
 
 async def _compare_combo_item(session: AsyncSession, rest, combo: CompareComboItem,

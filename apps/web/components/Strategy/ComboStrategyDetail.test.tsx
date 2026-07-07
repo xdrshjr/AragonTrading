@@ -1,7 +1,13 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Strategy } from "@/lib/types";
+import { DEFAULT_BACKTEST_CONFIG } from "@/lib/backtestConfig";
+import type { BacktestConfig, Strategy } from "@/lib/types";
 import ComboStrategyDetail from "./ComboStrategyDetail";
+
+vi.mock("@/lib/api", () => ({
+  api: { equity: vi.fn().mockResolvedValue([]) },
+}));
 
 const COMBO: Strategy = {
   id: 20, templateKey: "regime_rotation", name: "我的组合A", description: "趋势·震荡自适应",
@@ -14,6 +20,13 @@ const COMBO: Strategy = {
     selectionMetric: "sharpe", regimeGating: true,
   },
   paramsSchema: {},
+};
+
+const BACKTEST_CONFIG: BacktestConfig = {
+  ...DEFAULT_BACKTEST_CONFIG,
+  rangePreset: "custom",
+  startTs: 1_700_000_000,
+  endTs: 1_700_086_400,
 };
 
 function renderDetail({
@@ -34,21 +47,26 @@ function renderDetail({
   const onView = vi.fn();
   const onEdit = vi.fn();
   const onDelete = vi.fn();
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
-    <ComboStrategyDetail
-      combo={COMBO}
-      mode={mode}
-      backtestKind={backtestKind}
-      busy={busy}
-      paperActive={paperActive}
-      onRunBacktest={onRunBacktest}
-      onRunWalkForward={onRunWalkForward}
-      onStartPaper={onStartPaper}
-      onStopPaper={onStopPaper}
-      onView={onView}
-      onEdit={onEdit}
-      onDelete={onDelete}
-    />,
+    <QueryClientProvider client={queryClient}>
+      <ComboStrategyDetail
+        combo={COMBO}
+        mode={mode}
+        backtestKind={backtestKind}
+        busy={busy}
+        paperActive={paperActive}
+        instId="BTC-USDT-SWAP"
+        backtestConfig={BACKTEST_CONFIG}
+        onRunBacktest={onRunBacktest}
+        onRunWalkForward={onRunWalkForward}
+        onStartPaper={onStartPaper}
+        onStopPaper={onStopPaper}
+        onView={onView}
+        onEdit={onEdit}
+        onDelete={onDelete}
+      />
+    </QueryClientProvider>,
   );
   return {
     onRunBacktest,
@@ -74,10 +92,18 @@ describe("ComboStrategyDetail", () => {
     expect(screen.queryByText("另存为")).toBeNull();
   });
 
-  it("fires the right callback for each action button", () => {
+  it("opens the config modal and runs the backtest with the config from it", () => {
     const { onRunBacktest, onView, onEdit, onDelete } = renderDetail();
+    // 「运行回测」现打开配置弹窗；弹窗内「开始回测」才触发回调（携带回测配置）。
     fireEvent.click(screen.getByText("运行回测"));
-    expect(onRunBacktest).toHaveBeenCalledWith(COMBO);
+    fireEvent.click(screen.getByRole("button", { name: "开始回测" }));
+    expect(onRunBacktest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        bar: "1H",
+        startTs: 1_700_000_000,
+        endTs: 1_700_086_400,
+      }),
+    );
     fireEvent.click(screen.getByText("查看详情"));
     expect(onView).toHaveBeenCalledWith(COMBO);
     fireEvent.click(screen.getByText("编辑"));
