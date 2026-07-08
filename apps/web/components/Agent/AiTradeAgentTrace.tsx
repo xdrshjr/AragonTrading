@@ -9,8 +9,10 @@ import AiTradeTraceRound from "./AiTradeTraceRound";
 
 // 距底阈值（px）：镜像 AgentMessageList 的贴底跟随 pin 逻辑。
 const PIN_THRESHOLD = 48;
+// 用户离底后静置达此时长即自动恢复贴底跟随（第 3 轮 R2：2 分钟）。
+const AUTO_FOLLOW_RESUME_MS = 120_000;
 
-/** 会话概览条：标的·周期、状态、体制、累计盈亏、持仓/预算/轮次/共识、降级提示。 */
+/** 会话概览条：标的·周期、状态、体制、累计盈亏、持仓/预算/距上下文刷新/共识、降级提示。 */
 function TraceOverview({ session }: { session: AiTradeSessionRow }) {
   const pnl = session.sessionPnlUsd ?? 0;
   const stopped = session.state === "stopped";
@@ -46,9 +48,7 @@ function TraceOverview({ session }: { session: AiTradeSessionRow }) {
         <span>
           预算 {fmtNum(session.budgetUsd)} · {session.leverage}×
         </span>
-        <span>
-          第 {session.roundsCompleted} 轮 · 距下次摘要 {roundsToSummary} 轮
-        </span>
+        {roundsToSummary > 0 ? <span>距上下文刷新 {roundsToSummary} 根K线</span> : null}
         {consensus && <span>{consensus}</span>}
       </div>
       {session.degraded && (
@@ -124,8 +124,25 @@ export default function AiTradeAgentTrace({
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [pinned, setPinned] = useState(true);
   const [focused, setFocused] = useState<string | null>(null);
+
+  // 空闲恢复计时器：用户离底浏览历史后启动，静置满 AUTO_FOLLOW_RESUME_MS 自动交还「跟随最新」（R2）。
+  const clearIdleTimer = () => {
+    if (idleTimerRef.current != null) {
+      clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+    }
+  };
+
+  const armIdleTimer = () => {
+    clearIdleTimer();
+    idleTimerRef.current = setTimeout(() => {
+      idleTimerRef.current = null;
+      setPinned(true); // 恢复跟随；下方 [signature, pinned] effect 会滚到最新
+    }, AUTO_FOLLOW_RESUME_MS);
+  };
 
   const instIds = group ? Object.keys(group.members) : [];
   const instKey = instIds.join(",");
@@ -161,18 +178,30 @@ export default function AiTradeAgentTrace({
     if (pinned) endRef.current?.scrollIntoView({ block: "end" });
   }, [signature, pinned]);
 
+  // 卸载清理，避免计时器泄漏。
+  useEffect(() => () => clearIdleTimer(), []);
+  // 切换聚焦标的：复位为跟随并清除上一标的的倒计时（切换即看新标的最新记录）。
+  useEffect(() => {
+    clearIdleTimer();
+    setPinned(true);
+  }, [focused]); // eslint-disable-line react-hooks/exhaustive-deps
+
   if (!group || !session) return null;
   const stopped = session.state === "stopped";
 
   const onScroll = () => {
     const el = containerRef.current;
     if (!el) return;
-    setPinned(el.scrollHeight - el.scrollTop - el.clientHeight < PIN_THRESHOLD);
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < PIN_THRESHOLD;
+    setPinned(nearBottom);
+    if (nearBottom) clearIdleTimer(); // 回到底部 → 跟随，取消恢复倒计时
+    else armIdleTimer(); // 离底浏览历史 → (重)启恢复倒计时
   };
 
   const jumpToLatest = () => {
+    clearIdleTimer();
     setPinned(true);
-    endRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
+    endRef.current?.scrollIntoView({ block: "end" });
   };
 
   return (
@@ -181,7 +210,12 @@ export default function AiTradeAgentTrace({
         <SymbolTabs instIds={instIds} focused={focused} onSelect={setFocused} />
       )}
       <TraceOverview session={session} />
-      <div ref={containerRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
+      <div
+        ref={containerRef}
+        onScroll={onScroll}
+        data-testid="ai-trade-trace-scroll"
+        className="min-h-0 flex-1 overflow-y-auto"
+      >
         <div
           role="log"
           aria-live="polite"

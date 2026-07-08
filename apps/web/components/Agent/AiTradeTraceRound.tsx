@@ -11,6 +11,7 @@ import {
   describeRegime,
   describeStance,
   describeTraceState,
+  describeTrigger,
   describeVolume,
 } from "@/lib/aiTrade";
 import type { AiTradeRoundTrace } from "@/lib/aiTradeTypes";
@@ -28,15 +29,18 @@ function toneSoft(tone: AiTraceTone): string {
   return `color-mix(in srgb, ${TONE_VAR[tone]} 14%, transparent)`;
 }
 
-/** 轮头：第 N 轮 · 时间 · 最新价 + 右侧状态 chip（deciding 附脉冲点）。 */
+/** 轮头：时间（主）· 触发原因（着色）· 最新价（次要）+ 右侧状态 chip（deciding 附脉冲点）。 */
 function RoundHeader({ trace }: { trace: AiTradeRoundTrace }) {
   const chip = describeTraceState(trace);
+  const trigger = describeTrigger(trace);
   return (
     <div className="flex items-center justify-between gap-2">
-      <span className="flex items-center gap-1.5 text-[11px] text-[var(--muted)]">
-        <span className="font-semibold text-[var(--text)]">第 {trace.round} 轮</span>
-        <span className="tabular">{fmtTime(trace.ts, false)}</span>
-        {trace.lastPx != null && <span className="tabular">· {fmtPrice(trace.lastPx)}</span>}
+      <span className="flex min-w-0 items-center gap-1.5 text-[11px] text-[var(--muted)]">
+        <span className="tabular shrink-0 font-medium text-[var(--text)]">{fmtTime(trace.ts, false)}</span>
+        <span className="min-w-0 truncate" style={{ color: TONE_VAR[trigger.tone] }}>
+          {trigger.label}
+        </span>
+        {trace.lastPx != null && <span className="tabular shrink-0">· {fmtPrice(trace.lastPx)}</span>}
       </span>
       <span
         className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
@@ -228,11 +232,11 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
 }
 
 /** 上下文刷新节点（G2）：醒目分隔 + 可展开摘要全文，直观体现「上下文纯净」机制。 */
-function SummaryNode({ round, summary }: { round: number; summary: string }) {
+function SummaryNode({ summary }: { summary: string }) {
   return (
     <details className="rounded-[8px] border border-[var(--accent-soft)] bg-[var(--accent-soft)] px-2.5 py-1.5 text-[11px]">
       <summary className="cursor-pointer select-none font-medium text-[var(--accent)]">
-        🔄 上下文已刷新（第 {round} 轮摘要）
+        🔄 上下文已刷新
       </summary>
       <p className="mt-1 whitespace-pre-wrap leading-relaxed text-[var(--text)]">{summary}</p>
     </details>
@@ -252,7 +256,7 @@ export default function AiTradeTraceRound({ trace }: { trace: AiTradeRoundTrace 
       <DecisionToolCard trace={trace} />
       <ResultRow trace={trace} />
       <SignalContext trace={trace} />
-      {trace.summary && <SummaryNode round={trace.round} summary={trace.summary} />}
+      {trace.summary && <SummaryNode summary={trace.summary} />}
     </div>
   );
 }

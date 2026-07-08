@@ -5,6 +5,7 @@ import type { AccountMode } from "./types";
 import type {
   AiTradeAction,
   AiTradeDecision,
+  AiTradeRoundTrace,
   AiTradeStopReason,
   Consensus,
   FactorReading,
@@ -270,4 +271,49 @@ export function describeExecuted(
     return { label: "已成交", tone };
   }
   return { label: "观望", tone: "muted" };
+}
+
+export interface AiTradeTriggerView {
+  label: string; // 触发原因短语
+  tone: AiTraceTone; // long | short | muted | accent（复用轮头着色体系）
+}
+
+// 触发方向 → 轮头着色 tone（open_long 绿 / open_short 红 / close 及未知边沿 accent）。
+function toneForTriggerAction(action: string): AiTraceTone {
+  if (action === "open_long") return "long";
+  if (action === "open_short") return "short";
+  return "accent"; // close 或未知边沿
+}
+
+/**
+ * 触发原因派生（第 3 轮 R1）：由本轮信号板边沿信号（latestSignal）归纳「是什么触发了这一轮」。
+ * 无边沿 → 常规复盘（muted）；单策略触发 → 「<动作>信号 · <策略名>」；多策略同向 → 「N 策略<动作>信号」；
+ * 多策略分歧 → 「信号分歧 · a开多/b开空」（沿用 describeConsensus 计数风格）。着色取多/空/其它。
+ * 动作中文化复用既有 describeAiAction（同文件），不再自建标签表。
+ */
+export function describeTrigger(
+  trace: Pick<AiTradeRoundTrace, "signalBoard">,
+): AiTradeTriggerView {
+  const fired = (trace.signalBoard ?? []).filter((s) => s.latestSignal !== "none");
+  if (fired.length === 0) {
+    return { label: "K 线收盘 · 常规复盘", tone: "muted" };
+  }
+  if (fired.length === 1) {
+    const s = fired[0];
+    return {
+      label: `${describeAiAction(s.latestSignal)}信号 · ${s.name}`,
+      tone: toneForTriggerAction(s.latestSignal),
+    };
+  }
+  const counts = new Map<string, number>();
+  for (const s of fired) counts.set(s.latestSignal, (counts.get(s.latestSignal) ?? 0) + 1);
+  if (counts.size === 1) {
+    const action = [...counts.keys()][0];
+    return { label: `${fired.length} 策略${describeAiAction(action)}信号`, tone: toneForTriggerAction(action) };
+  }
+  const tally = ["open_long", "open_short", "close"]
+    .filter((a) => counts.get(a))
+    .map((a) => `${counts.get(a)}${describeAiAction(a)}`)
+    .join("/");
+  return { label: `信号分歧 · ${tally}`, tone: "accent" };
 }

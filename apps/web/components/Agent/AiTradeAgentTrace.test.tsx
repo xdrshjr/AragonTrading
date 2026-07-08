@@ -152,7 +152,7 @@ describe("AiTradeAgentTrace", () => {
         activeInstId="BTC-USDT-SWAP"
       />,
     );
-    expect(screen.getByText(/上下文已刷新（第 1 轮摘要）/)).toBeInTheDocument();
+    expect(screen.getByText(/上下文已刷新/)).toBeInTheDocument();
     expect(screen.getByText("截至第1轮：偏多")).toBeInTheDocument();
   });
 
@@ -184,6 +184,95 @@ describe("AiTradeAgentTrace", () => {
     fireEvent.click(screen.getByRole("tab", { name: "ETH-USDT-SWAP" }));
     expect(screen.getByText("ETH 分析")).toBeInTheDocument();
   });
+
+  it("round header shows the trigger reason and time without a round number (R1)", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            state: "done",
+            analysis: "顺势维持多头",
+            signalBoard: [
+              { strategyId: 1, name: "均线突破", stance: "long", latestSignal: "open_long", strength: 0.8, reason: "" },
+            ],
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText(/开多信号/)).toBeInTheDocument();
+    expect(screen.getByText(/\d{2}:\d{2}/)).toBeInTheDocument();
+    expect(screen.queryByText(/第\s*\d+\s*轮/)).not.toBeInTheDocument();
+  });
+
+  it("overview omits the round-number badge and reads as a refresh countdown (R1)", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [round({ state: "done", analysis: "常规复盘" })])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText(/距上下文刷新/)).toBeInTheDocument();
+    expect(screen.queryByText(/第\s*\d+\s*轮/)).not.toBeInTheDocument();
+  });
+
+  it("auto-resumes bottom-follow after 2 minutes idle and re-scrolls to latest (R2)", () => {
+    vi.useFakeTimers();
+    try {
+      render(
+        <AiTradeAgentTrace
+          group={groupWith(SESSION, [round({ state: "done", analysis: "复盘" })])}
+          activeInstId="BTC-USDT-SWAP"
+        />,
+      );
+      const el = screen.getByTestId("ai-trade-trace-scroll");
+      Object.defineProperty(el, "scrollHeight", { value: 1000, configurable: true });
+      Object.defineProperty(el, "clientHeight", { value: 200, configurable: true });
+      Object.defineProperty(el, "scrollTop", { value: 0, configurable: true });
+      fireEvent.scroll(el);
+      expect(screen.getByRole("button", { name: "回到最新" })).toBeInTheDocument();
+      (Element.prototype.scrollIntoView as unknown as ReturnType<typeof vi.fn>).mockClear();
+      act(() => {
+        vi.advanceTimersByTime(120_000);
+      });
+      expect(screen.queryByRole("button", { name: "回到最新" })).not.toBeInTheDocument();
+      expect(Element.prototype.scrollIntoView).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("resets the 2-minute idle timer on each further scroll (R2)", () => {
+    vi.useFakeTimers();
+    try {
+      render(
+        <AiTradeAgentTrace
+          group={groupWith(SESSION, [round({ state: "done", analysis: "复盘" })])}
+          activeInstId="BTC-USDT-SWAP"
+        />,
+      );
+      const el = screen.getByTestId("ai-trade-trace-scroll");
+      Object.defineProperty(el, "scrollHeight", { value: 1000, configurable: true });
+      Object.defineProperty(el, "clientHeight", { value: 200, configurable: true });
+      Object.defineProperty(el, "scrollTop", { value: 0, configurable: true });
+      fireEvent.scroll(el);
+      expect(screen.getByRole("button", { name: "回到最新" })).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(60_000);
+      });
+      fireEvent.scroll(el); // 仍离底 → 重置 120s 倒计时
+      act(() => {
+        vi.advanceTimersByTime(90_000); // 距上次滚动仅 90s < 120s
+      });
+      expect(screen.getByRole("button", { name: "回到最新" })).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(30_000); // 距上次滚动累计 120s
+      });
+      expect(screen.queryByRole("button", { name: "回到最新" })).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("AgentPanel segmented view", () => {
@@ -205,6 +294,15 @@ describe("AgentPanel segmented view", () => {
     });
     expect(screen.getByRole("tab", { name: /执行轨迹/ })).toBeInTheDocument();
     expect(screen.getByText("运行中")).toBeInTheDocument(); // 轨迹概览条已呈现
+  });
+
+  it("shows no round-number badge on the 执行轨迹 tab (R1, P0-1)", () => {
+    render(<AgentPanel />);
+    act(() => {
+      useAppStore.setState({ aiTradeGroup: groupWith(SESSION) });
+    });
+    expect(screen.getByRole("tab", { name: /执行轨迹/ })).toBeInTheDocument();
+    expect(screen.queryByText(/第\s*\d+\s*轮/)).not.toBeInTheDocument();
   });
 
   it("respects a manual switch back to 对话 and does not auto-steal", () => {

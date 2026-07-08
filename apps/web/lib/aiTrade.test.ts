@@ -11,6 +11,7 @@ import {
   describeRegime,
   describeStance,
   describeStopReason,
+  describeTrigger,
   describeVolume,
   resolveAiTradeGate,
   validateContextRounds,
@@ -21,6 +22,7 @@ import type {
   FactorReadings,
   MarketContext,
   PriceAction,
+  StrategySignalView,
   VolumeContext,
 } from "./aiTradeTypes";
 
@@ -270,5 +272,63 @@ describe("describeExecuted (E3, four states + tone)", () => {
   });
   it("plain hold is muted 观望", () => {
     expect(describeExecuted("hold", { traded: false }, null)).toEqual({ label: "观望", tone: "muted" });
+  });
+});
+
+const signal = (over: Partial<StrategySignalView> = {}): StrategySignalView => ({
+  strategyId: 1,
+  name: "均线突破",
+  stance: "long",
+  latestSignal: "open_long",
+  strength: 0.8,
+  reason: "",
+  ...over,
+});
+
+describe("describeTrigger (R1, trigger reason derived from signalBoard)", () => {
+  it("falls back to a routine review when no strategy fired (empty / all none)", () => {
+    expect(describeTrigger({ signalBoard: [] })).toEqual({
+      label: "K 线收盘 · 常规复盘",
+      tone: "muted",
+    });
+    expect(
+      describeTrigger({ signalBoard: [signal({ latestSignal: "none" }), signal({ latestSignal: "none" })] }),
+    ).toEqual({ label: "K 线收盘 · 常规复盘", tone: "muted" });
+  });
+
+  it("labels a single open_long trigger with the strategy name and long tone", () => {
+    expect(
+      describeTrigger({ signalBoard: [signal({ name: "均线突破", latestSignal: "open_long" })] }),
+    ).toEqual({ label: "开多信号 · 均线突破", tone: "long" });
+  });
+
+  it("colors a single open_short trigger short and close accent", () => {
+    expect(describeTrigger({ signalBoard: [signal({ latestSignal: "open_short" })] }).tone).toBe("short");
+    const close = describeTrigger({ signalBoard: [signal({ name: "反转", latestSignal: "close" })] });
+    expect(close).toEqual({ label: "平仓信号 · 反转", tone: "accent" });
+  });
+
+  it("aggregates multiple same-direction triggers into a strategy count", () => {
+    expect(
+      describeTrigger({
+        signalBoard: [
+          signal({ strategyId: 1, latestSignal: "open_long" }),
+          signal({ strategyId: 2, latestSignal: "open_long" }),
+          signal({ strategyId: 3, latestSignal: "open_long" }),
+        ],
+      }),
+    ).toEqual({ label: "3 策略开多信号", tone: "long" });
+  });
+
+  it("reports a divergence tally for conflicting triggers with accent tone", () => {
+    expect(
+      describeTrigger({
+        signalBoard: [
+          signal({ strategyId: 1, latestSignal: "open_long" }),
+          signal({ strategyId: 2, latestSignal: "open_long" }),
+          signal({ strategyId: 3, latestSignal: "open_short" }),
+        ],
+      }),
+    ).toEqual({ label: "信号分歧 · 2开多/1开空", tone: "accent" });
   });
 });

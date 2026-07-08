@@ -305,13 +305,9 @@ export default function AgentPanel() {
   const unconfigured = config !== null && !config.configured;
   // RV-8：分组存在时 aitrade 视图优先于 unconfigured 空态渲染（后端 LLM 必已配置，否则分组无法启动）。
   const showTrace = panelView === "aitrade" && !!aiTradeGroup;
-  // 分组聚合：任一成员运行中即视为运行；轮次徽标取各成员最大 roundsCompleted（单成员时等价旧行为）。
+  // 分组聚合：任一成员运行中即视为运行（tab 上仅以脉冲点表征运行状态，不再显示具体轮数）。
   const aiTradeMembers = aiTradeGroup ? Object.values(aiTradeGroup.members) : [];
   const aiTradeAnyRunning = aiTradeMembers.some((m) => m.session?.state === "running");
-  const aiTradeMaxRounds = aiTradeMembers.reduce(
-    (max, m) => Math.max(max, m.session?.roundsCompleted ?? 0),
-    0,
-  );
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -349,9 +345,6 @@ export default function AgentPanel() {
               {aiTradeAnyRunning && (
                 <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--long)]" />
               )}
-              <span className="tabular rounded-full bg-[var(--surface)] px-1.5 text-[10px] text-[var(--muted)]">
-                第 {aiTradeMaxRounds} 轮
-              </span>
             </span>
           </ViewTab>
         </div>
