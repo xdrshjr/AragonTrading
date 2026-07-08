@@ -60,25 +60,33 @@ function renderModal(props: Partial<React.ComponentProps<typeof BacktestConfigMo
   const onClose = vi.fn();
   const onRun = vi.fn();
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  render(
+  const base: React.ComponentProps<typeof BacktestConfigModal> = {
+    open: true,
+    onClose,
+    strategyName: "Alpha Trend",
+    instId: "BTC-USDT-SWAP",
+    initialConfig: CONFIG,
+    running: false,
+    onRun,
+    ...props,
+  };
+  const view = render(
     <QueryClientProvider client={queryClient}>
-      <BacktestConfigModal
-        open
-        onClose={onClose}
-        strategyName="Alpha Trend"
-        instId="BTC-USDT-SWAP"
-        initialConfig={CONFIG}
-        running={false}
-        onRun={onRun}
-        {...props}
-      />
+      <BacktestConfigModal {...base} />
     </QueryClientProvider>,
   );
-  return { onClose, onRun };
+  // rerender 保留组件内部 step 状态，用于模拟父层 running/result 的异步到达。
+  const rerender = (next: Partial<React.ComponentProps<typeof BacktestConfigModal>>) =>
+    view.rerender(
+      <QueryClientProvider client={queryClient}>
+        <BacktestConfigModal {...base} {...next} />
+      </QueryClientProvider>,
+    );
+  return { onClose, onRun, rerender };
 }
 
 describe("BacktestConfigModal", () => {
-  it("renders the title, instrument and preset / bar chips", () => {
+  it("renders the title, instrument, chips and the config step as current", () => {
     renderModal();
     expect(screen.getByRole("heading", { name: "运行回测" })).toBeInTheDocument();
     expect(screen.getByText(/BTC-USDT-SWAP/)).toBeInTheDocument();
@@ -89,6 +97,8 @@ describe("BacktestConfigModal", () => {
     expect(screen.getByRole("button", { name: "1 小时" })).toBeInTheDocument();
     // 运行按钮存在且可用（区间合法）。
     expect(screen.getByRole("button", { name: "开始回测" })).toBeEnabled();
+    // 步骤指示器：① 配置 为当前步。
+    expect(screen.getByRole("button", { name: /配置/ })).toHaveAttribute("aria-current", "step");
   });
 
   it("disables run and shows the reason when the range is invalid", () => {
@@ -115,26 +125,60 @@ describe("BacktestConfigModal", () => {
     );
   });
 
-  it("shows a running label while the backtest is pending", () => {
-    renderModal({ running: true });
-    expect(screen.getByRole("button", { name: "回测中…" })).toBeInTheDocument();
-    // 运行中结果区不显示空态占位（页脚提示常驻，故按空态独有文案精确匹配）。
-    expect(screen.queryByText(/指标将在此呈现/)).not.toBeInTheDocument();
-  });
-
-  it("renders the metrics grid and coverage banner after a run completes", () => {
+  it("advances to a dedicated result step with metrics and coverage banner", () => {
     renderModal({ result: RESULT });
-    // 结果区在弹窗内触发运行后才展示（避免跨策略陈旧结果误显）。
+    // 结果独立成第二步，仅在弹窗内触发运行后才进入（避免跨策略陈旧结果误显）。
     fireEvent.click(screen.getByRole("button", { name: "开始回测" }));
+    expect(screen.getByText("回测结果")).toBeInTheDocument(); // 第二步小标题
     expect(screen.getByText("12.00%")).toBeInTheDocument(); // 总收益
     expect(screen.getByText("年化收益")).toBeInTheDocument(); // 扩展指标
-    expect(screen.getByText(/仅覆盖最近 200 \/ 720 根/)).toBeInTheDocument(); // 覆盖横幅
+    expect(screen.getByText(/仅覆盖最近 200 \/ 720 根/)).toBeInTheDocument(); // 覆盖横幅（子串匹配）
+    // 第二步页脚出现「返回上一步」；步骤指示器「② 结果」为当前步。
+    expect(screen.getByRole("button", { name: /返回上一步/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /结果/ })).toHaveAttribute("aria-current", "step");
   });
 
-  it("renders the error state when a backtest fails", () => {
+  it("returns to the config step without re-running when back is clicked", () => {
+    const { onRun } = renderModal({ result: RESULT });
+    fireEvent.click(screen.getByRole("button", { name: "开始回测" }));
+    fireEvent.click(screen.getByRole("button", { name: /返回上一步/ }));
+    // 回到第一步：区间 chips 再次可见，指标网格从文档移除。
+    expect(screen.getByRole("button", { name: "近 30 天" })).toBeInTheDocument();
+    expect(screen.queryByText("12.00%")).not.toBeInTheDocument();
+    expect(onRun).toHaveBeenCalledTimes(1); // 返回不触发重跑
+  });
+
+  it("does not render results until the user runs from the modal", () => {
+    renderModal({ result: RESULT });
+    // 未点运行：仍在第一步，指标 / 覆盖横幅不在文档（守防陈旧）。
+    expect(screen.queryByText("12.00%")).not.toBeInTheDocument();
+    expect(screen.queryByText(/仅覆盖最近 200 \/ 720 根/)).not.toBeInTheDocument();
+    expect(screen.queryByText("回测结果")).not.toBeInTheDocument();
+  });
+
+  it("shows the running skeleton on the result step while pending", () => {
+    const { rerender } = renderModal();
+    fireEvent.click(screen.getByRole("button", { name: "开始回测" })); // 推进到第二步
+    rerender({ running: true }); // 模拟父层 mutation 置真
+    // 正向断言：运行骨架出现；已删除的空态占位文案不再出现。
+    expect(document.querySelectorAll(".skeleton").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/指标将在此呈现/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /返回上一步/ })).toBeEnabled();
+  });
+
+  it("keeps the run button labeled 回测中… on the config step when running externally", () => {
+    // R-4：父层外部把 running 置真而用户仍在第一步（未点运行）→ 不自动跳步。
+    renderModal({ running: true });
+    expect(screen.getByRole("button", { name: "回测中…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "近 30 天" })).toBeInTheDocument(); // 仍在配置屏
+    expect(screen.queryByText("回测结果")).not.toBeInTheDocument();
+  });
+
+  it("renders the error state and a retry action on the result step", () => {
     renderModal({ errorMessage: "boom" });
     fireEvent.click(screen.getByRole("button", { name: "开始回测" }));
     expect(screen.getByText(/回测失败：boom/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新回测" })).toBeInTheDocument();
   });
 
   it("calls onClose on Escape and on overlay click", () => {
@@ -145,5 +189,23 @@ describe("BacktestConfigModal", () => {
     const overlay = screen.getByRole("dialog").parentElement as HTMLElement;
     fireEvent.click(overlay);
     expect(onClose).toHaveBeenCalledTimes(2);
+  });
+
+  it("moves focus to the result heading when advancing to the result step", () => {
+    renderModal({ result: RESULT });
+    fireEvent.click(screen.getByRole("button", { name: "开始回测" }));
+    expect(screen.getByText("回测结果")).toHaveFocus();
+  });
+
+  it("lets the user revisit existing results via the step indicator without re-running", () => {
+    const { onRun } = renderModal({ result: RESULT });
+    fireEvent.click(screen.getByRole("button", { name: "开始回测" })); // → 第二步
+    expect(screen.getByText("12.00%")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /返回上一步/ })); // → 第一步
+    expect(screen.queryByText("12.00%")).not.toBeInTheDocument();
+    // 已运行后「② 结果」可点前进，直接回看现有结果、不重跑。
+    fireEvent.click(screen.getByRole("button", { name: /结果/ }));
+    expect(screen.getByText("12.00%")).toBeInTheDocument();
+    expect(onRun).toHaveBeenCalledTimes(1);
   });
 });
