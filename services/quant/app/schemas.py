@@ -452,7 +452,8 @@ class AiTradeGroupMemberIn(BaseModel):
 class AiTradeGroupStartIn(BaseModel):
     """启动 AI 自动交易分组请求（金额/杠杆字段可留空→服务端保守默认，§4.1）。
 
-    预算总额天花板由服务端解析 min(maxBudgetPct/100, ai_trade_max_capital_frac=5%)（P0-1），
+    预算总额天花板由服务端解析 min(maxBudgetPct/100, ai_trade_max_capital_frac(默认 1.0=不约束),
+    live_auto_group_max_capital_frac)（= 前端 effectiveMaxBudgetPct/100，maxBudgetPct 与运营天花板共同主导），
     前端任何「上限」入参一概不接受；capitalUsd 为分组**总**预算，按各成员 allocationPct 切分（非倍增）。
     """
 

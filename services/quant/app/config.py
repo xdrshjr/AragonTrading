@@ -96,7 +96,10 @@ class Settings(BaseSettings):
     # 校验 ai_trade_enabled 与 live_trading_enabled 皆为 True 方可放行（双闸）。
     ai_trade_enabled: bool = False               # 自动化专用总闸：False 时 /ai-trade 写类一律 403
     ai_trade_default_capital_frac: float = 0.01  # 留空默认预算 = availUsdt × 该值（保守 1%）
-    ai_trade_max_capital_frac: float = 0.05      # 预算绝对天花板 = availUsdt × 该值（前置门禁强制夹紧）
+    # AI 分组预算的**可选**绝对天花板分数（默认 1.0=不约束，实际天花板委托给账户级 maxBudgetPct 与分组运营
+    # 天花板 live_auto_group_max_capital_frac，与非 AI 多标的分组口径统一）；运维如需 AI 专属更紧的绝对上限
+    # （如恢复历史 5% 红线），可经 env AI_TRADE_MAX_CAPITAL_FRAC 下调本值（min 只能收紧、绝不放大天花板）。
+    ai_trade_max_capital_frac: float = 1.0
     ai_trade_default_sl_pct: float = 0.05        # 会话默认单仓止损 pct（交易所侧 OCO 兜底；0 即不挂）
     ai_trade_default_tp_pct: float = 0.10        # 会话默认单仓止盈 pct（交易所侧 OCO 兜底；0 即不挂）
     ai_trade_default_max_hold_bars: int = 0      # 默认强制时间平仓根数（0=禁用，退出交由 AI close + 会话止盈止损）
@@ -104,7 +107,9 @@ class Settings(BaseSettings):
     # AI 自动交易「分组」标的数上限（ai-trade-multi-symbol-and-timeframe §4.1）：一个 AI 分组内至多 N 个
     # 标的，每标的各是一个独立 AiTradeSession（各自一次/轮 LLM 决策）。刻意 < live_auto_max_group_symbols(8)：
     # N 个 decider 每轮各一次 LLM 调用，成本随标的数线性上升。分组总预算按 allocationPct **切分**（非倍增），
-    # 故总账户敞口仍受 ai_trade_max_capital_frac(5%) 单一天花板约束——**不新增**分组专用天花板配置（P0-1）。
+    # 故总账户敞口仍受分组总预算天花板约束——该天花板 = min(maxBudgetPct/100, ai_trade_max_capital_frac(默认
+    # 1.0=不约束), live_auto_group_max_capital_frac)，由账户级 maxBudgetPct 与运营天花板共同主导（与非 AI 分组
+    # 口径统一，ai-trade-total-budget-allocation 有意放开历史 5% 绝对红线）。
     ai_trade_max_symbols: int = Field(default=5, ge=1)
     ai_trade_default_context_rounds: int = 10    # 上下文刷新轮数默认值
     ai_trade_min_context_rounds: int = Field(default=3, ge=1)    # 上下文刷新轮数下限

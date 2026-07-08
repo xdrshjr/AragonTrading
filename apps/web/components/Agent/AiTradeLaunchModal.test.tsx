@@ -2,10 +2,13 @@ import "@testing-library/jest-dom/vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { autoTradeSettingsApi } from "@/lib/autoTradeSettingsApi";
 import { tradingApi } from "@/lib/tradingApi";
 import AiTradeLaunchModal, { type AiTradeLaunchOpts } from "./AiTradeLaunchModal";
 
 vi.mock("@/lib/tradingApi", () => ({ tradingApi: { config: vi.fn() } }));
+// 模块级 mock（P2-1）：写在文件顶层与 tradingApi mock 同级，否则其余用例的 settings 查询会触发真实 fetch。
+vi.mock("@/lib/autoTradeSettingsApi", () => ({ autoTradeSettingsApi: { get: vi.fn() } }));
 vi.mock("@/lib/api", async (orig) => {
   const actual = (await orig()) as Record<string, unknown>;
   return {
@@ -48,6 +51,7 @@ function renderModal(props: Partial<React.ComponentProps<typeof AiTradeLaunchMod
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(tradingApi.config).mockResolvedValue({ availUsdt: 1000 } as never);
+  vi.mocked(autoTradeSettingsApi.get).mockResolvedValue({ maxBudgetPct: 100, effectiveMaxBudgetPct: 100 });
 });
 
 afterEach(() => cleanup());
@@ -229,6 +233,52 @@ describe("AiTradeLaunchModal", () => {
     expect(screen.getByText(/SL 20% \/ TP 默认/)).toBeInTheDocument(); // 0.9 夹到 max 0.2 → 20%
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
+  });
+
+  // 第 7 轮预算联动（ai-trade-total-budget-allocation §8.2）：改总预算即按 total×pct/100 重算每标的分配，
+  // 天花板由账户级 effectiveMaxBudgetPct 主导（默认 100%），留空默认仍保守 1%。
+  it("re-allocates each member budget from the edited total budget (AC-1)", async () => {
+    renderModal({
+      defaultStrategyIds: [1],
+      defaultMembers: [
+        { instId: "BTC-USDT-SWAP", allocationPct: 50 },
+        { instId: "ETH-USDT-SWAP", allocationPct: 50 },
+      ],
+    });
+    await screen.findByText("均线策略");
+    // availUsdt=1000、maxBudgetPct=100 → 总预算改 800 后每标的 = 800×50% = 400（修复前压死在 avail×5% 的小值）。
+    fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[0], { target: { value: "800" } });
+    await waitFor(() => expect(screen.getAllByText("400.00 USDT")).toHaveLength(2));
+  });
+
+  it("shows the clamp notice and clamps member previews when total exceeds the cap (AC-2)", async () => {
+    vi.mocked(autoTradeSettingsApi.get).mockResolvedValue({ maxBudgetPct: 100, effectiveMaxBudgetPct: 5 });
+    renderModal({
+      defaultStrategyIds: [1],
+      defaultMembers: [
+        { instId: "BTC-USDT-SWAP", allocationPct: 50 },
+        { instId: "ETH-USDT-SWAP", allocationPct: 50 },
+      ],
+    });
+    await screen.findByText("均线策略");
+    // 输入 800 > avail(1000)×effectiveMaxBudgetPct(5%)=50 → 夹到 50，每标的 50×50% = 25，并回显「已按 5% 上限夹紧」。
+    fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[0], { target: { value: "800" } });
+    await waitFor(() => expect(screen.getAllByText("25.00 USDT")).toHaveLength(2));
+    expect(screen.getByText(/已按 5% 上限夹紧/)).toBeInTheDocument();
+  });
+
+  it("keeps the blank-total default at 1% of the available balance (AC-3)", async () => {
+    renderModal({
+      defaultStrategyIds: [1],
+      defaultMembers: [
+        { instId: "BTC-USDT-SWAP", allocationPct: 50 },
+        { instId: "ETH-USDT-SWAP", allocationPct: 50 },
+      ],
+    });
+    await screen.findByText("均线策略");
+    // 留空总预算 → 默认 avail(1000)×1% = 10，标签保持「可用余额 × 1%」，每标的 10×50% = 5。
+    expect(screen.getByText("默认总预算（可用余额 × 1%）")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByText("5.00 USDT")).toHaveLength(2));
   });
 });
 

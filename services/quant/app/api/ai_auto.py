@@ -84,15 +84,21 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
                          settings: Settings = Depends(get_settings)) -> dict:
     """启动 AI 自动交易「分组」（受双闸守门；§4.1 两段式前置门禁 + 整组回滚；回执含逐成员夹紧后预算）。
 
-    P0-1（安全红线）：预算总额天花板由服务端解析 `cap_frac = min(maxBudgetPct/100, ai_trade_max_capital_frac)`
-    （5%），留空默认 `default_frac = ai_trade_default_capital_frac`（1%）；**绝不**引用 live-auto 的
-    100% 分组天花板，前端任何「上限」入参一概不接受。成员总预算按 allocationPct 切分（非倍增）。
+    预算总额天花板由服务端解析 `cap_frac = min(maxBudgetPct/100, ai_trade_max_capital_frac(默认 1.0=不约束),
+    live_auto_group_max_capital_frac)`，与非 AI 多标的分组口径统一（ai-trade-total-budget-allocation 有意放开
+    历史 5% 绝对红线）：该式恒等于前端预览所读 `effectiveMaxBudgetPct/100`，故「弹窗预览 == 落地」逐配置严格
+    相等。留空默认 `default_frac = ai_trade_default_capital_frac`（1%，保守）；前端任何「上限」入参一概不接受。
+    成员总预算按 allocationPct 切分（非倍增）。
     """
     _require_ai_enabled(settings)
     account_row = await _resolve_account(session, body.accountId)
     specs = await _build_specs(session, body.strategyIds)
     at = await repo.get_auto_trade_settings(session)
-    cap_frac = min(at["maxBudgetPct"] / 100.0, settings.ai_trade_max_capital_frac)
+    # 天花板委托给账户级 maxBudgetPct 与运营天花板（与 effectiveMaxBudgetPct 同源，min 只收紧不放大）；
+    # ai_trade_max_capital_frac 默认 1.0=不额外约束，运维可下调为 AI 专属更紧的绝对上限。
+    cap_frac = min(at["maxBudgetPct"] / 100.0,
+                   settings.ai_trade_max_capital_frac,          # AI 专属可选绝对天花板（默认 1.0=不约束）
+                   settings.live_auto_group_max_capital_frac)   # 分组运营天花板（与 effectiveMaxBudgetPct 同源）
     req = AiTradeGroupStartRequest(
         specs=specs,
         members_in=[AiTradeGroupMemberInput(inst_id=m.instId, allocation_pct=m.allocationPct)

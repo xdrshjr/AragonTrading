@@ -17,12 +17,20 @@ import {
   AI_TRADE_MAX_STRATEGIES,
   AI_TRADE_MAX_SYMBOLS,
   AI_TRADE_MAX_TP_PCT,
-  clampBudgetToCap,
   deriveDefaultBudget,
   validateContextRounds,
   validateStrategySelection,
 } from "@/lib/aiTrade";
-import { isAutoTradable, memberBudget, totalAllocation } from "@/lib/autoTrade";
+import {
+  clampGroupBudgetToCap,
+  DEFAULT_AUTO_TRADE_MAX_BUDGET_PCT,
+  groupBudgetCap,
+  isAutoTradable,
+  isGroupBudgetClamped,
+  memberBudget,
+  totalAllocation,
+} from "@/lib/autoTrade";
+import { autoTradeSettingsApi } from "@/lib/autoTradeSettingsApi";
 import { fmtPrice } from "@/lib/format";
 import {
   clampPct,
@@ -137,6 +145,14 @@ export default function AiTradeLaunchModal({
   const atCap = members.length >= AI_TRADE_MAX_SYMBOLS;
 
   const strategiesQ = useQuery({ queryKey: ["strategies"], queryFn: api.strategies });
+  // 账户级总预算上限百分比（设置中心可调，默认 100%）：与非 AI 多标的弹窗同源，让「改总预算即联动每标的分配」。
+  // 仅实盘用总预算天花板；回测走 initialCapital，故 enabled 收敛到 live 段。
+  const settingsQ = useQuery({
+    queryKey: ["settings", "auto-trade"],
+    queryFn: autoTradeSettingsApi.get,
+    enabled: open && mode === "live",
+  });
+  const maxBudgetPct = settingsQ.data?.effectiveMaxBudgetPct ?? DEFAULT_AUTO_TRADE_MAX_BUDGET_PCT;
   const budgetInst = mode === "live" ? (members[0]?.instId ?? "") : instId;
   const configQ = useQuery({
     queryKey: ["trading", "config", budgetInst, null],
@@ -265,12 +281,17 @@ export default function AiTradeLaunchModal({
       ? `计划决策轮数 ${plannedRounds} 超上限 ${AI_BACKTEST_MAX_ROUNDS}，请缩短区间或增大决策间隔`
       : null;
 
-  // 生效总预算预览（分组总额；availUsdt 取 members[0] 的 config，账户级，P2-2）。
+  // 生效总预算预览（分组总额；availUsdt 取 members[0] 的 config，账户级，P2-2）。留空默认仍取保守 avail×1%
+  // （deriveDefaultBudget），天花板改用账户级 maxBudgetPct（avail×maxBudgetPct%，原写死 5%）——故改总预算
+  // 即按 total×pct/100 联动每标的分配；口径与后端 cap_frac 逐配置严格相等（effectiveMaxBudgetPct/100）。
   const previewBudget = useMemo(() => {
     if (availUsdt == null) return null;
     const raw = capital.value ?? deriveDefaultBudget(availUsdt);
-    return clampBudgetToCap(raw, availUsdt);
-  }, [availUsdt, capital.value]);
+    return clampGroupBudgetToCap(raw, availUsdt, maxBudgetPct);
+  }, [availUsdt, capital.value, maxBudgetPct]);
+  // 填值超过硬上限时 previewBudget 被静默夹回上限——显式回显「已夹紧」，避免用户误以为输入未生效。
+  const isClamped = isGroupBudgetClamped(capital.value, availUsdt, maxBudgetPct);
+  const budgetCap = groupBudgetCap(availUsdt, maxBudgetPct);
 
   const usingDefault = capital.value == null;
   const baseValid = !inputError && !strategyError && !roundsError;
@@ -512,7 +533,7 @@ export default function AiTradeLaunchModal({
             {oversubscribed && (
               <p className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1 text-[10px] leading-relaxed text-[var(--muted)]">
                 各标的上限合计 {Math.round(sumPct * 100) / 100}%（&gt; 100%）：多标的同时触发时组合敞口可能超过总预算，
-                真实敞口仍受总预算 5% 天花板、单笔名义上限与单仓 OCO 约束。
+                真实敞口仍受总预算上限（可用余额 × {maxBudgetPct}%）、单笔名义上限与单仓 OCO 约束。
               </p>
             )}
           </div>
@@ -551,7 +572,13 @@ export default function AiTradeLaunchModal({
               }
             />
             <Row
-              label={usingDefault ? "默认总预算（可用余额 × 1%）" : "生效总预算（预览 · 已按 5% 上限夹紧）"}
+              label={
+                usingDefault
+                  ? "默认总预算（可用余额 × 1%）"
+                  : isClamped
+                    ? `生效总预算（预览 · 已按 ${maxBudgetPct}% 上限夹紧）`
+                    : "生效总预算（预览）"
+              }
               value={previewBudget != null ? `${fmtPrice(previewBudget)} USDT` : "—"}
             />
             <Row
@@ -590,6 +617,11 @@ export default function AiTradeLaunchModal({
             value={capitalRaw}
             onChange={setCapitalRaw}
             disabled={submitting}
+            hint={
+              mode === "live" && isClamped && capital.value != null
+                ? `输入 ${fmtPrice(capital.value)} 超过可用余额 ${maxBudgetPct}% 上限（${fmtPrice(budgetCap)} USDT），已按上限 ${fmtPrice(budgetCap)} 计算`
+                : undefined
+            }
           />
           <Field label="杠杆（×）" placeholder="留空＝默认" value={leverageRaw} onChange={setLeverageRaw} disabled={submitting} />
           <Field label={mode === "backtest" ? "会话止盈（USDT）" : "总止盈（USDT）"} placeholder="留空＝不触发" value={takeProfitRaw} onChange={setTakeProfitRaw} disabled={submitting} />

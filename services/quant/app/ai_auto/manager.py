@@ -7,8 +7,9 @@
 
 多标的范式镜像已上线、已验证的 live-auto「分组」：一个分组内每个标的各自是一个**保持不变的**
 `AiTradeSession`（各有独立 decider / executor / MarketWindow / WS / 轨迹），总预算按成员 `allocation_pct`
-**切分**（非按标的倍增），故**总账户敞口仍受 `ai_trade_max_capital_frac`（默认 5%）单一天花板约束**
-（P0-1）。`AiTradeSession` 及其下游 decider / consensus / trace / backtest **零改动**。
+**切分**（非按标的倍增），故**总账户敞口仍受分组总预算天花板约束**——该天花板由账户级 `maxBudgetPct` 与运营
+天花板 `live_auto_group_max_capital_frac` 共同主导（与非 AI 分组口径统一，ai-trade-total-budget-allocation
+有意放开历史 5% 绝对红线）。`AiTradeSession` 及其下游 decider / consensus / trace / backtest **零改动**。
 
 与 live-auto 的互斥（安全关键）：二者共用同一实盘账户预算，绝不同时下单。AI 侧 `_require_capacity`
 在共享准入锁内「检查无活跃 AI 分组 且 无活跃 live-auto 分组 + 注册自己」；live-auto 侧
@@ -95,9 +96,10 @@ class AiTradeGroupMemberInput:
 class AiTradeGroupStartRequest:
     """`start_group` 聚合形参（避免位置堆参，满足 CLAUDE.md ≤5 形参；镜像 live-auto `GroupStartRequest`）。
 
-    `budget_cap_frac` / `default_budget_frac` 由 `api/ai_auto.py` 预解析后填入（P0-1/P1-1）：
-    `budget_cap_frac = min(maxBudgetPct/100, ai_trade_max_capital_frac=5%)`、
-    `default_budget_frac = ai_trade_default_capital_frac=1%`。**绝不**引用 live-auto 的 100% 天花板。
+    `budget_cap_frac` / `default_budget_frac` 由 `api/ai_auto.py` 预解析后填入：
+    `budget_cap_frac = min(maxBudgetPct/100, ai_trade_max_capital_frac(默认 1.0=不约束),
+    live_auto_group_max_capital_frac)`（= 前端 `effectiveMaxBudgetPct/100`，maxBudgetPct 与运营天花板共同主导）、
+    `default_budget_frac = ai_trade_default_capital_frac=1%`（留空默认，保守）。
     """
 
     specs: list[PaperStrategySpec]
@@ -115,7 +117,7 @@ class AiTradeGroupStartRequest:
     take_profit_pct: float | None = None     # E4：单仓 OCO 止盈%（各成员同值）
     priming: bool = True
     priming_bars: int = 300
-    budget_cap_frac: float = 0.05            # 预算硬上限分数（avail×该值），由 api 解析（默认 5%）
+    budget_cap_frac: float = 1.0             # 预算硬上限分数（avail×该值），恒由 api 层显式覆盖（默认 1.0=不约束）
     default_budget_frac: float = 0.01        # 留空默认分数（avail×该值），由 api 解析（默认 1%）
 
 
@@ -474,10 +476,11 @@ class AiTradeManager:
     @staticmethod
     def _resolve_budget_group(capital_usd: float | None, avail: float,
                               cap_frac: float, default_frac: float) -> float:
-        """留空→ avail×default_frac（1%）；非空→ 夹到 ≤ avail×cap_frac（min(maxBudgetPct,5%)）。
+        """留空→ avail×default_frac（1%）；非空→ 夹到 ≤ avail×cap_frac（maxBudgetPct 与运营天花板共同主导）。
 
-        分数由 `api/ai_auto.py` 预解析（P0-1/P1-1）；成员预算再按 pct **切分**（budget_i=total×pct/100，
-        非倍增），故开 N 个标的的 AI 交易总账户敞口仍 ≤ ai_trade_max_capital_frac（默认 5%）。
+        分数由 `api/ai_auto.py` 预解析（cap_frac = min(maxBudgetPct/100, ai_trade_max_capital_frac,
+        live_auto_group_max_capital_frac)）；成员预算再按 pct **切分**（budget_i=total×pct/100，非倍增），
+        故开 N 个标的的 AI 交易总账户敞口仍 ≤ avail×cap_frac。
         """
         hard_cap = avail * cap_frac
         budget = capital_usd if (capital_usd and capital_usd > 0) else avail * default_frac

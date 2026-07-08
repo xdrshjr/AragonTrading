@@ -1,6 +1,7 @@
-"""AI 自动交易「分组」单测（ai-trade-multi-symbol-and-timeframe §8.1）：多标的启动 / 预算切分 /
-逐成员预检失败整组拒绝 / 敞口天花板锚定 5%（P0-1）/ 留空默认 1%（P1-1）/ budget-too-small（P1-3）/
-与 live-auto 互斥 / status()==group_status() / stop_group 清组不留僵尸（P2-4）/ 单成员等价。
+"""AI 自动交易「分组」单测（ai-trade-multi-symbol-and-timeframe §8.1 + ai-trade-total-budget-allocation §8.1）：
+多标的启动 / 预算切分 / 逐成员预检失败整组拒绝 / 总预算 honor 到 maxBudgetPct（第 7 轮放开历史 5% 绝对红线，
+天花板改由 maxBudgetPct 与运营天花板 live_auto_group_max_capital_frac 共同主导）/ 留空默认 1%（P1-1）/
+budget-too-small（P1-3）/ 与 live-auto 互斥 / status()==group_status() / stop_group 清组不留僵尸（P2-4）/ 单成员等价。
 
 多标的范式镜像 live-auto 分组，成员为**零改动的** AiTradeSession（此处以轻量假实现避免 WS / 网络）。
 OKX / LLM / 会话全程打桩；铁律：占位假凭证，绝不写真实凭证。
@@ -90,9 +91,13 @@ async def _fresh() -> int:
             select(Strategy.id).order_by(Strategy.id.asc()).limit(1))).scalar_one()
 
 
-def _override(app, *, ai: bool = True, live: bool = True) -> None:
+def _override(app, *, ai: bool = True, live: bool = True,
+              group_cap_frac: float | None = None) -> None:
+    # group_cap_frac 显式传入即覆盖 live_auto_group_max_capital_frac（运营天花板），用于锁死 AI 落地
+    # = min(maxBudgetPct/100, ai_trade_max_capital_frac, live_auto_group_max_capital_frac) 的运营分支。
+    extra = {} if group_cap_frac is None else {"live_auto_group_max_capital_frac": group_cap_frac}
     app.dependency_overrides[get_settings] = lambda: Settings(
-        live_trading_enabled=live, ai_trade_enabled=ai)
+        live_trading_enabled=live, ai_trade_enabled=ai, **extra)
 
 
 async def _client(app) -> AsyncClient:
@@ -133,13 +138,14 @@ def _group_body(strategy_id: int, members, **over) -> dict:
 
 # ---------------- 纯函数：参数化预算解析（P0-1/P1-1）与止盈止损归一分摊 ----------------
 def test_resolve_budget_group_anchors_ai_ceiling():
-    """AI 分组分数：cap=min(maxBudgetPct/100, 5%)、default=1%。留空=avail×1%、填值夹 avail×cap。"""
+    """纯函数契约：cap_frac 由调用方给定（= min(maxBudgetPct/100, ai_trade_max_capital_frac,
+    live_auto_group_max_capital_frac)），default=1%。留空=avail×1%、填值夹 avail×cap_frac。"""
     f = AiTradeManager._resolve_budget_group
-    # 默认 maxBudgetPct=100 → cap=0.05：留空 1% / 填 900 夹到 5%（**非** 100%）
+    # cap_frac=0.05 这一档：留空 1% / 填 900 夹到 avail×5%（=50）/ 小额原样透传
     assert f(None, 1000.0, 0.05, 0.01) == 10.0
     assert f(900.0, 1000.0, 0.05, 0.01) == 50.0
     assert f(30.0, 1000.0, 0.05, 0.01) == 30.0
-    # 用户把 maxBudgetPct 收紧到 2% → cap=0.02：留空仍 1%、填值夹 2%
+    # 更紧的 cap_frac=0.02 一档：留空仍 1%、填值夹 avail×2%（=20）
     assert f(None, 1000.0, 0.02, 0.01) == 10.0
     assert f(900.0, 1000.0, 0.02, 0.01) == 20.0
 
@@ -199,8 +205,8 @@ async def test_starts_group_over_multiple_symbols(monkeypatch):
         await dispose_engine()
 
 
-async def test_total_exposure_capped_at_five_percent(monkeypatch):
-    """P0-1 敞口门禁：maxBudgetPct=100、填 900 → total 夹到 avail×5%(=50)，**非** 100%(=1000)。"""
+async def test_total_budget_honored_up_to_max_budget_pct(monkeypatch):
+    """第 7 轮放开 5% 红线：默认 maxBudgetPct=100、填 900 → total honor 900（不再夹到 avail×5%=50）。"""
     strategy_id = await _fresh()
     app = _load_app()
     _override(app)
@@ -213,7 +219,36 @@ async def test_total_exposure_capped_at_five_percent(monkeypatch):
                                   json=_group_body(strategy_id, members, capitalUsd=900))
             assert r.status_code == 200, r.text
             body = r.json()
-            assert body["totalBudgetUsd"] == 50.0   # avail(1000)×5%，绝非 900 或 1000
+            assert body["totalBudgetUsd"] == 900.0   # 默认天花板 = avail×100%(=1000) ≥ 900 → 原样 honor
+            assert sum(m["budgetUsd"] for m in body["members"]) == 900.0
+            by_inst = {m["instId"]: m["budgetUsd"] for m in body["members"]}
+            assert by_inst["BTC-USDT-SWAP"] == 450.0   # 900 × 50%
+            assert by_inst["ETH-USDT-SWAP"] == 270.0   # 900 × 30%
+            assert by_inst["SOL-USDT-SWAP"] == 180.0   # 900 × 20%
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_budget_capped_by_max_budget_pct(monkeypatch):
+    """maxBudgetPct 才是有效天花板：收紧到 5%、填 900 → total 夹到 avail×5%(=50)。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            sm = get_sessionmaker()
+            async with sm() as s:                     # 把账户级总预算上限收紧到 5%（服务端权威）
+                await repo.set_auto_trade_settings(s, max_budget_pct=5)
+            members = [("BTC-USDT-SWAP", 50), ("ETH-USDT-SWAP", 50)]
+            r = await client.post("/api/ai-trade/start",
+                                  json=_group_body(strategy_id, members, capitalUsd=900))
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["totalBudgetUsd"] == 50.0     # avail(1000)×maxBudgetPct(5%)，非 900
             assert sum(m["budgetUsd"] for m in body["members"]) == 50.0
     finally:
         get_ai_trade_manager()._group = None
@@ -221,8 +256,31 @@ async def test_total_exposure_capped_at_five_percent(monkeypatch):
         await dispose_engine()
 
 
+async def test_ai_budget_honors_group_operational_ceiling(monkeypatch):
+    """运营天花板并入 AI 落地（ai-trade-total-budget-allocation P1-2）：live_auto_group_max_capital_frac=0.5、
+    默认 maxBudgetPct=100、填 900 → total 夹到 avail×50%(=500)，锁死「AI 落地 = effectiveMaxBudgetPct」。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app, group_cap_frac=0.5)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            members = [("BTC-USDT-SWAP", 50), ("ETH-USDT-SWAP", 50)]
+            r = await client.post("/api/ai-trade/start",
+                                  json=_group_body(strategy_id, members, capitalUsd=900))
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["totalBudgetUsd"] == 500.0    # avail(1000)×min(100%, 1.0, 0.5)=50%，非 900
+            assert sum(m["budgetUsd"] for m in body["members"]) == 500.0
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
 async def test_blank_capital_defaults_to_one_percent(monkeypatch):
-    """P1-1：留空 capitalUsd → total = avail×1%(=10)，非打满 5% 上限。"""
+    """P1-1：留空 capitalUsd → total = avail×1%(=10)，非打满总预算天花板（留空默认恒保守 1%）。"""
     strategy_id = await _fresh()
     app = _load_app()
     _override(app)
