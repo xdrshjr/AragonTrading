@@ -53,7 +53,7 @@ function TraceOverview({ session }: { session: AiTradeSessionRow }) {
       </div>
       {session.degraded && (
         <p className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1 text-[10px] text-[var(--short)]">
-          决策降级中（LLM 超时 / 未产出有效决策 → 本轮回落观望，资金安全优先）
+          决策降级观望（多次重试仍失败 / 置信度不足 / 未产出有效决策 → 本轮回落观望，资金安全优先）
         </p>
       )}
     </div>

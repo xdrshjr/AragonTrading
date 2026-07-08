@@ -119,7 +119,8 @@ export type AiTradeTracePhase =
   | "tool_call"
   | "result"
   | "summary"
-  | "error";
+  | "error"
+  | "retry";
 
 // agent_trace 事件 data（各字段按 phase 可选；前端 reducer 按 phase 归约）。
 export interface AiTradeTraceEvent {
@@ -144,6 +145,9 @@ export interface AiTradeTraceEvent {
   marketContext?: MarketContext | null; // round_start
   consensus?: Consensus | null; // round_start
   marketDigest?: MarketDigest | null; // round_start（R1：价格走势/成交量/因子证据摘要）
+  attempt?: number; // retry：当前重试序号（1-based）
+  maxAttempts?: number; // retry：本轮最大重试次数
+  reason?: string; // retry：触发本次重试的上一次 degrade 原因
 }
 
 // store / snapshot 的已装配单轮轨迹（thinking/analysis 累积；env 环形 ≤20）。
@@ -164,6 +168,8 @@ export interface AiTradeRoundTrace {
   degradeReason?: string | null;
   summary?: string | null;
   errorMessage?: string | null;
+  retries?: number; // §4.4：本轮已重试次数（retry 阶段累加）
+  lastRetryReason?: string | null; // 最近一次触发重试的 degrade 原因
   state: "deciding" | "done" | "skipped" | "error";
 }
 

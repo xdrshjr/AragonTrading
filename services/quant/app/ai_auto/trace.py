@@ -15,8 +15,9 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 
 # 轨迹阶段常量（前后端镜像；session 按此织入，前端 reducer 按此归约）。
+# retry：可重试失败降级前的重试面包屑（ai-trade-decision-llm-retry §4.4），前端据此重置本轮累积。
 PHASES = ("round_start", "thinking", "analysis", "tool_call_start",
-          "tool_call", "result", "summary", "error")
+          "tool_call", "result", "summary", "error", "retry")
 
 # 合并冲刷阈值：累计 ≥48 字符 / 相变 / 工具起始 / 收尾 即冲刷一条 delta（轮间隔以分钟计，量级极低）。
 _TRACE_FLUSH_CHARS = 48
@@ -93,6 +94,7 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         "toolCallPending": False, "toolCall": None,
         "executed": None, "degradeReason": None,
         "summary": None, "errorMessage": None,
+        "retries": 0, "lastRetryReason": None,   # §4.4：本轮重试计数 + 最近一次触发原因
         "state": "deciding",
     }
 

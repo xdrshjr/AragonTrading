@@ -82,6 +82,36 @@ describe("applyAiTradeTracePhase", () => {
     expect(e[0].errorMessage).toBe("本轮决策异常");
   });
 
+  it("retry 阶段重置累积研判并计数（清工具挂起指示）", () => {
+    let t = applyAiTradeTracePhase([], ev("round_start", 1));
+    t = applyAiTradeTracePhase(t, ev("tool_call_start", 1, { name: "submit_trade_decision" }));
+    t = applyAiTradeTracePhase(t, ev("analysis", 1, { delta: "A" }));
+    expect(t[0].toolCallPending).toBe(true);
+    expect(t[0].analysis).toBe("A");
+    // 失败尝试后重试：重置本轮累积（研判文本 + 工具挂起指示）、复位 deciding、计数 +1、记原因。
+    t = applyAiTradeTracePhase(
+      t,
+      ev("retry", 1, { attempt: 1, maxAttempts: 3, reason: "llm_error" }),
+    );
+    expect(t[0].analysis).toBe("");
+    expect(t[0].thinking).toBe("");
+    expect(t[0].toolCallPending).toBe(false); // R-1：失败尝试的工具挂起指示已清
+    expect(t[0].state).toBe("deciding");
+    expect(t[0].retries).toBe(1);
+    expect(t[0].lastRetryReason).toBe("llm_error");
+    // 重试后成功尝试的新研判独立累积（非与失败尝试拼接）。
+    t = applyAiTradeTracePhase(t, ev("analysis", 1, { delta: "B" }));
+    expect(t[0].analysis).toBe("B");
+  });
+
+  it("未知 phase 走 default 容错（向后兼容，不崩）", () => {
+    let t = applyAiTradeTracePhase([], ev("round_start", 1));
+    t = applyAiTradeTracePhase(t, ev("analysis", 1, { delta: "X" }));
+    // @ts-expect-error 故意注入未知 phase，模拟老前端遇新事件。
+    const out = applyAiTradeTracePhase(t, ev("totally_unknown", 1, { delta: "Y" }));
+    expect(out[0].analysis).toBe("X"); // default: 原样返回，不误改
+  });
+
   it("环形容量：超过 20 轮裁最旧", () => {
     let t: AiTradeRoundTrace[] = [];
     for (let r = 1; r <= 25; r++) t = applyAiTradeTracePhase(t, ev("round_start", r));

@@ -113,6 +113,12 @@ class Settings(BaseSettings):
     # 模型窗口 _context，P1-3）。仅为「回喂 LLM 的近 N 条」护栏，防极端参数下越界。
     ai_trade_max_context_messages: int = Field(default=40, ge=2)
     ai_trade_decision_timeout_s: float = 60.0    # 单轮 LLM 决策超时（超时一律回落 hold）
+    # 单轮决策重试护栏（round-2）：仅对「瞬时 LLM 失败 / 未产出有效决策」类回落重试，穷尽后才降级 hold。
+    # 语义：首次尝试之外的最多重试次数——默认 3（即最多 4 次 LLM 调用）；0=沿用旧行为「首次失败即降级」。
+    # genuine 决策（合法动作 / 刻意 hold / low_confidence 风险门禁）不计入、不重试。
+    ai_trade_decision_max_retries: int = Field(default=3, ge=0)
+    ai_trade_retry_base_ms: int = 500     # 指数退避基数（复用 agent.llm.retry.backoff_delay_ms 语义）
+    ai_trade_retry_max_ms: int = 8000     # 单次退避封顶
     ai_trade_min_confidence: float = 0.0         # 置信度门槛（<该值降级 hold）；默认 0=不启用
     # ---- 综合研判增强包（ai-auto-trading-enhancements v4 · E1/E2/E4）----
     # E1 市场体制上下文：默认开（只读输入增强，向决策 prompt 注入一行市场体制；数据不足/异常自动省略）。

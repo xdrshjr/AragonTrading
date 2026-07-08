@@ -54,6 +54,33 @@ function RoundHeader({ trace }: { trace: AiTradeRoundTrace }) {
   );
 }
 
+/**
+ * 重试面包屑（ai-trade-decision-llm-retry §4.4/§五）：本轮发生过重试时如实呈现进度 + 上次触发原因。
+ * 研判中（deciding）显示「⚠ 重试中 · 第 n 次…」并附脉冲点；已结算显示「↻ 本轮重试 n 次」。
+ * 注：round trace 仅持久化 retries/lastRetryReason（§七），故以已重试次数 n 呈现（不含 m）。
+ */
+function RetryBreadcrumb({ trace }: { trace: AiTradeRoundTrace }) {
+  const retries = trace.retries ?? 0;
+  if (retries <= 0) return null;
+  const active = trace.state === "deciding";
+  const reason = trace.lastRetryReason;
+  return (
+    <p
+      className="flex items-center gap-1 text-[10px]"
+      style={{ color: active ? "var(--accent)" : "var(--muted)" }}
+    >
+      <span>{active ? "⚠" : "↻"}</span>
+      <span>
+        {active ? `重试中 · 第 ${retries} 次…` : `本轮重试 ${retries} 次`}
+        {reason ? `（${reason}）` : ""}
+      </span>
+      {active && (
+        <span className="inline-block h-1 w-1 animate-pulse rounded-full bg-[var(--accent)]" />
+      )}
+    </p>
+  );
+}
+
 /** 思考/分析：深度思考折叠置于其上；分析流式走 pre-wrap + 光标，轮结束走安全 markdown。 */
 function AnalysisBlock({ trace }: { trace: AiTradeRoundTrace }) {
   const streaming = trace.state === "deciding";
@@ -220,6 +247,7 @@ export default function AiTradeTraceRound({ trace }: { trace: AiTradeRoundTrace 
   return (
     <div className="flex flex-col gap-2 rounded-[12px] border border-[var(--border)] bg-[var(--surface)] px-3 py-2.5">
       <RoundHeader trace={trace} />
+      <RetryBreadcrumb trace={trace} />
       <AnalysisBlock trace={trace} />
       <DecisionToolCard trace={trace} />
       <ResultRow trace={trace} />

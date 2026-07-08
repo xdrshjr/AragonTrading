@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import uuid
 from dataclasses import dataclass
 
@@ -30,6 +31,7 @@ from ..agent.llm.base import (
     ToolSchema,
     ToolUseBlock,
 )
+from ..agent.llm.retry import backoff_delay_ms
 from ..config import Settings
 from .prompts import (
     DECISION_TOOL_DESCRIPTION,
@@ -48,6 +50,24 @@ _ACTIONS = ("open_long", "open_short", "close", "hold")
 # 本轮研判思维链全文的硬上限（ai-trade-reasoning-chain §2.5）：`_last_analysis` 只经 agent_trace 流与
 # _traces(≤20) 承载给 UI，超出即截断；进 journal / decision 事件的是调用方派生的有界摘录（≤400，RC-2/3）。
 _ANALYSIS_MAX_CHARS = 4000
+
+# 「可重试」degrade 原因白名单（瞬时 LLM 失败 / 未产出有效决策）；其余（low_confidence 等）为终态决策，
+# 绝不重试（ai-trade-decision-llm-retry §4.1）。
+_RETRYABLE_DEGRADE_REASONS = frozenset(
+    {"decision_timeout", "llm_error", "no_tool_call", "invalid_action", "missing_size"})
+# 每次重试前退避的抖动上限（ms），镜像 agent/llm/retry.py 的 _JITTER_MS 语义（§4.3）。
+_RETRY_JITTER_MS = 250
+
+
+def _is_retryable_degrade(reason: str | None) -> bool:
+    """该 degrade 原因是否属于瞬时/无有效产出（可重试）；None 与 low_confidence 返回 False。"""
+    return reason in _RETRYABLE_DEGRADE_REASONS
+
+
+def _retry_hint_suffix(reason: str) -> str:
+    """重试时追加进瞬时 user_msg 的一次性纠偏提示（不落 _context/_journal，§4.5）。"""
+    return (f"\n\n【系统提示】上一次未产出有效决策（{reason}）。"
+            f"请务必**只调用一次** submit_trade_decision 并给出完整合法入参。")
 
 
 @dataclass
@@ -88,7 +108,7 @@ class AiTradeDecider:
         self._journal: list[dict] = []
         self._rounds_since_summary = 0
         self._last_round = 0
-        self._last_analysis: str = ""      # 本轮研判思维链全文（R3；每轮 decide() 入口清零，RC-1）
+        self._last_analysis: str = ""      # 本轮研判思维链全文（R3；每次尝试入口清零，RC-1，§4.2/R-6）
 
     # ---------- 只读状态（供 status / snapshot）----------
     @property
@@ -107,23 +127,67 @@ class AiTradeDecider:
     # ---------- 决策 ----------
     async def decide(self, payload: dict, *, emit: TraceEmit | None = None
                      ) -> tuple[TradeDecision, str | None]:
-        """出本轮决策；返回 `(decision, degrade_reason)`——degrade_reason 非 None 表示安全回落 hold。
+        """出本轮决策；可重试失败先带退避重试，穷尽后才降级 hold。签名不变（RC/RV 契约，§4.2）。
 
-        可选 `emit`（由 session 注入）承接决策器流式认知（分析 / 思考 / 工具起始）经合并后扇出；
-        默认 `None` 保证回测 / 单测等既有位置调用零改动、零回归（合并器全程空转，行为逐字不变）。
+        返回 `(decision, degrade_reason)`——degrade_reason 非 None 表示安全回落 hold。可选 `emit`
+        （由 session 注入）承接决策器流式认知（分析 / 思考 / 工具起始 / 重试面包屑）经合并后扇出；
+        默认 `None` 保证回测 / 单测等既有位置调用零改动、零回归（合并器全程空转）。
+
+        瞬时失败（超时 / LLM 错误 / 未产出有效决策）先带有界指数退避重试至多
+        `ai_trade_decision_max_retries` 次，全部失败才降级；模型真实终态决策（合法动作 / 刻意 hold /
+        low_confidence 门禁）零重试、行为逐字不变；`asyncio.CancelledError` 立即向上抛（绝不吞、绝不降级）。
+        `max_retries=0` 逐字回退旧行为「首次失败即降级」。
         """
-        self._last_analysis = ""     # RC-1：入口清零——本轮若超时/异常/被取消回落 hold，不残留上一轮研判
-        user_msg = LlmMessage("user", [TextBlock(build_decision_prompt(payload))])
+        max_retries = max(0, int(self.settings.ai_trade_decision_max_retries))
+        decision, degrade = await self._attempt_decision(payload, emit)   # 首次：hint=None
+        attempt = 0
+        while (degrade is not None and _is_retryable_degrade(degrade)
+               and attempt < max_retries):
+            attempt += 1
+            await self._emit_retry(emit, attempt, max_retries, degrade)   # 面包屑 + 前端本轮累积重置
+            await self._retry_backoff(attempt)                            # 可被 cancel 中断
+            decision, degrade = await self._attempt_decision(payload, emit, hint=degrade)
+        return decision, degrade
+
+    async def _attempt_decision(self, payload: dict, emit: TraceEmit | None = None,
+                                *, hint: str | None = None
+                                ) -> tuple[TradeDecision, str | None]:
+        """单次决策尝试（= 今日 decide 主体）：入口清零 last_analysis → 流式研判 → 映射。
+
+        `hint`（keyword-only，默认 None → 与今日首次尝试逐字一致）：上一次失败的 degrade 原因，
+        仅追加进**当次瞬时** user_msg（§4.5），绝不落 `_context/_journal`——上下文零污染。
+        """
+        self._last_analysis = ""     # RC-1（跨尝试版）：每次尝试入口清零，重试不残留上一次尝试的研判
+        prompt_text = build_decision_prompt(payload)
+        if hint:
+            prompt_text += _retry_hint_suffix(hint)   # §4.5：仅当次重试的一次性纠偏提示（首次不触发）
+        user_msg = LlmMessage("user", [TextBlock(prompt_text)])
         try:
             raw = await asyncio.wait_for(
                 self._stream_decision(user_msg, emit),
                 timeout=self.settings.ai_trade_decision_timeout_s)
         except asyncio.TimeoutError:
             return _hold("decision_timeout"), "decision_timeout"
-        except Exception as exc:  # noqa: BLE001 —— 任何 LLM/网络失败一律回落 hold（绝不在不确定时下单）
-            logger.warning("ai-trade decide failed: %s", exc)
+        except asyncio.CancelledError:
+            raise                    # 会话停止：绝不吞、绝不降级，向上抛（BaseException，不入下方 except）
+        except Exception as exc:  # noqa: BLE001 —— 任何 LLM/网络失败回落 hold（绝不在不确定时下单）
+            logger.warning("ai-trade decide attempt failed: %s", exc)
             return _hold("llm_error"), "llm_error"
         return self._map_decision(raw)
+
+    async def _retry_backoff(self, attempt: int) -> None:
+        """第 `attempt` 次（1-based）重试前的有界指数退避 + 抖动；可被 cancel / 会话停止中断（§4.3）。"""
+        base = backoff_delay_ms(attempt - 1, self.settings.ai_trade_retry_base_ms,
+                                self.settings.ai_trade_retry_max_ms)
+        await asyncio.sleep((base + random.uniform(0, _RETRY_JITTER_MS)) / 1000.0)
+
+    async def _emit_retry(self, emit: TraceEmit | None, attempt: int, max_retries: int,
+                          reason: str) -> None:
+        """重试前发一条 retry 轨迹（emit=None 空转，回测/单测零副作用，§4.4）。"""
+        if emit is None:
+            return
+        await emit({"phase": "retry", "attempt": attempt,
+                    "maxAttempts": max_retries, "reason": reason})
 
     async def _stream_decision(self, user_msg: LlmMessage,
                                emit: TraceEmit | None = None) -> dict | None:

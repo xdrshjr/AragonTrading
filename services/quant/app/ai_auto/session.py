@@ -386,6 +386,10 @@ class AiTradeSession:
             phase = part.get("phase")
             data = {"phase": phase, "round": round_no, "ts": ts}
             trace = self._round_trace
+            if phase == "retry":                 # §4.4：重试面包屑——重置本轮累积 + 计数后扇出
+                self._apply_retry_marker(trace, part, data)
+                await self._push({"type": "agent_trace", "data": data})
+                return
             delta = part.get("delta")
             if delta is not None:
                 data["delta"] = delta
@@ -398,6 +402,23 @@ class AiTradeSession:
                     trace["toolCallPending"] = True
             await self._push({"type": "agent_trace", "data": data})
         return _emit
+
+    @staticmethod
+    def _apply_retry_marker(trace: dict | None, part: dict, data: dict) -> None:
+        """retry 阶段（§4.4）：把面包屑字段写入外发 `data`，并把在飞轮次累积重置——
+        丢弃失败尝试的 thinking/analysis、复位 toolCallPending（R-1：清失败尝试残留的工具挂起指示）、
+        state 回 deciding、累加本轮重试计数并记 lastRetryReason。"""
+        data["attempt"] = part.get("attempt")
+        data["maxAttempts"] = part.get("maxAttempts")
+        data["reason"] = part.get("reason")
+        if trace is None:
+            return
+        trace["thinking"] = ""
+        trace["analysis"] = ""
+        trace["toolCallPending"] = False
+        trace["state"] = "deciding"
+        trace["retries"] = int(trace.get("retries", 0)) + 1
+        trace["lastRetryReason"] = part.get("reason")
 
     async def _emit_tool_call_trace(self, round_no: int, ts: int,
                                     decision: TradeDecision) -> None:

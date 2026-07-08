@@ -133,6 +133,8 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     degradeReason: null,
     summary: null,
     errorMessage: null,
+    retries: 0,
+    lastRetryReason: null,
     state: "deciding",
   };
 }
@@ -159,6 +161,17 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
       return { ...t, summary: evt.summary ?? null };
     case "error":
       return { ...t, state: "error", errorMessage: evt.message ?? null };
+    case "retry":
+      // §4.4：重试前重置本轮累积（丢弃失败尝试的研判文本 + 工具挂起指示）、复位 deciding、累加计数。
+      return {
+        ...t,
+        thinking: "",
+        analysis: "",
+        toolCallPending: false, // R-1：与后端一致，清失败尝试残留的工具挂起指示
+        state: "deciding",
+        retries: (t.retries ?? 0) + 1,
+        lastRetryReason: evt.reason ?? null,
+      };
     default:
       return t;
   }

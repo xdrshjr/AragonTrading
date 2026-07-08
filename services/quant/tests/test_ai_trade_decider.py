@@ -10,20 +10,24 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from app.agent.llm.base import StreamEvent
-from app.ai_auto.decider import AiTradeDecider
+from app.ai_auto.decider import AiTradeDecider, _retry_hint_suffix
 from app.ai_auto.prompts import build_decision_prompt
 from app.config import Settings
 
 
 class _ScriptedLLM:
-    """按预置脚本逐次响应 stream；记录最近一次 messages（供摘要素材断言）。"""
+    """按预置脚本逐次响应 stream；记录最近一次 messages（供摘要素材断言）与总调用次数。"""
 
     def __init__(self, scripts: list[list[StreamEvent]]):
         self._scripts = list(scripts)
         self.last_messages = None
+        self.calls = 0                 # 累计 stream() 调用次数 = LLM 调用次数（供重试次数断言）
 
     async def stream(self, *, system, messages, tools):
+        self.calls += 1
         self.last_messages = messages
         script = self._scripts.pop(0) if self._scripts else [
             StreamEvent("message_done", stop_reason="end")]
@@ -39,8 +43,11 @@ def _tool_events(args: dict, tool_id: str = "t1"):
 
 
 def _decider(scripts, *, rounds=10, settings=None):
+    # 既有（前重试特性）单测默认走「零重试」路径：max_retries=0 即旧行为「首次失败即降级」——使这些用例
+    # 成为『零回归门禁』（AI_TRADE_DECISION_MAX_RETRIES=0 时逐字通过，§八）。重试特性用例显式传入自己的
+    # settings（_retry_settings）开启重试。
     return AiTradeDecider(_ScriptedLLM(scripts), "sys", context_refresh_rounds=rounds,
-                          settings=settings or Settings())
+                          settings=settings or Settings(ai_trade_decision_max_retries=0))
 
 
 def _payload(round_no: int) -> dict:
@@ -124,7 +131,8 @@ async def test_timeout_falls_back_to_hold():
         await asyncio.sleep(1.0)
         yield StreamEvent("message_done", stop_reason="end")
 
-    d = _decider([], settings=Settings(ai_trade_decision_timeout_s=0.01))
+    d = _decider([], settings=Settings(ai_trade_decision_timeout_s=0.01,
+                                       ai_trade_decision_max_retries=0))
     d._llm.stream = _slow_stream   # type: ignore[attr-defined]
     decision, degrade = await d.decide(_payload(1))
     assert decision.action == "hold"
@@ -166,7 +174,8 @@ async def test_last_analysis_cleared_on_timeout_round():
     """RC-1：本轮流超时（被 wait_for 取消）→ last_analysis 恒为空串（降级轮 analysis 语义正确）。"""
     first = ([StreamEvent("text_delta", text="上一轮研判文本")]
              + _tool_events({"action": "hold", "reason": "r"}))
-    d = _decider([first], settings=Settings(ai_trade_decision_timeout_s=0.1))
+    d = _decider([first], settings=Settings(ai_trade_decision_timeout_s=0.1,
+                                            ai_trade_decision_max_retries=0))
     await d.decide(_payload(1))
     assert d.last_analysis != ""
 
@@ -222,3 +231,158 @@ async def test_summarize_triggers_every_n_rounds_from_journal_and_resets_context
     assert d._journal == []
     assert d.rounds_since_summary == 0
     assert d.summary == "综合摘要：偏多"
+
+
+# ---------- LLM 失败先重试三次再降级（ai-trade-decision-llm-retry §八）----------
+
+def _error_script():
+    """一条「流内 error → llm_error（可重试）」脚本。"""
+    return [StreamEvent("error", code="LLM_ERROR", message="boom")]
+
+
+def _valid_open_long(size: float = 0.4):
+    return _tool_events({"action": "open_long", "sizeFraction": size,
+                         "confidence": 0.8, "reason": "trend"})
+
+
+def _retry_settings(**kw):
+    """重试单测统一 settings：退避基数/封顶置 0（仅剩 ≤250ms 抖动），保证快速且确定。"""
+    base = {"ai_trade_retry_base_ms": 0, "ai_trade_retry_max_ms": 0}
+    base.update(kw)
+    return Settings(**base)
+
+
+async def test_retries_then_succeeds():
+    """瞬时 error → error → valid：重试后成功、degrade 清空、恰好消费 3 条脚本（1 首次 + 2 重试）。"""
+    d = _decider([_error_script(), _error_script(), _valid_open_long()],
+                 settings=_retry_settings(ai_trade_decision_max_retries=3))
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade is None
+    assert decision.action == "open_long"
+    assert d._llm.calls == 3
+
+
+async def test_degrades_after_exhausting_retries():
+    """4 条全 error、max_retries=3 → 穷尽后才降级 llm_error/hold，共消费 4 条脚本（1 首次 + 3 重试）。"""
+    d = _decider([_error_script() for _ in range(4)],
+                 settings=_retry_settings(ai_trade_decision_max_retries=3))
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade == "llm_error"
+    assert decision.action == "hold"
+    assert d._llm.calls == 4
+
+
+async def test_no_retry_on_valid_first_attempt():
+    """首次即产出合法决策 → 不重试，只调用一次。"""
+    d = _decider([_valid_open_long(0.5)],
+                 settings=_retry_settings(ai_trade_decision_max_retries=3))
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade is None
+    assert d._llm.calls == 1
+
+
+async def test_no_retry_on_low_confidence():
+    """low_confidence 是模型真实终态决策（非瞬时失败）→ 不重试，只调用一次（§4.1 白名单排除）。"""
+    d = _decider([_tool_events({"action": "open_long", "sizeFraction": 0.5,
+                                "confidence": 0.5, "reason": "weak"})],
+                 settings=_retry_settings(ai_trade_decision_max_retries=3,
+                                          ai_trade_min_confidence=0.9))
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade == "low_confidence"
+    assert decision.action == "hold"
+    assert d._llm.calls == 1
+
+
+async def test_retries_on_no_tool_call_then_succeeds():
+    """只回文本无工具（no_tool_call，可重试）→ 重试后成功，调用两次。"""
+    scripts = [[StreamEvent("text_delta", text="只回文本无工具"),
+                StreamEvent("message_done", stop_reason="end")],
+               _valid_open_long(0.3)]
+    d = _decider(scripts, settings=_retry_settings(ai_trade_decision_max_retries=3))
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade is None
+    assert decision.action == "open_long"
+    assert d._llm.calls == 2
+
+
+async def test_retries_on_missing_size_then_succeeds():
+    """open_long 缺 sizeFraction（missing_size，可重试）→ 重试后成功，调用两次。"""
+    scripts = [_tool_events({"action": "open_long", "reason": "no size"}),
+               _valid_open_long(0.5)]
+    d = _decider(scripts, settings=_retry_settings(ai_trade_decision_max_retries=3))
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade is None
+    assert abs(decision.size_fraction - 0.5) < 1e-9
+    assert d._llm.calls == 2
+
+
+async def test_retries_on_timeout_then_succeeds():
+    """首次 stream 挂起触发 wait_for 超时（可重试）→ 重试成功；有状态 stub + 调小 timeout + base/max=0
+    保证快且确定（_ScriptedLLM 事件零耗时，无法制造超时，§八 #7）。"""
+    state = {"n": 0}
+    valid = _valid_open_long(0.3)
+
+    async def _stub(*, system, messages, tools):
+        state["n"] += 1
+        if state["n"] == 1:
+            await asyncio.sleep(1.0)              # > timeout(0.05) → 首次尝试超时
+            yield StreamEvent("message_done", stop_reason="end")
+            return
+        for ev in valid:
+            yield ev
+
+    d = _decider([], settings=_retry_settings(ai_trade_decision_max_retries=3,
+                                              ai_trade_decision_timeout_s=0.05))
+    d._llm.stream = _stub   # type: ignore[attr-defined]
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade is None
+    assert decision.action == "open_long"
+    assert state["n"] == 2                        # 1 超时 + 1 成功
+
+
+async def test_cancelled_error_propagates_without_retry_or_degrade():
+    """stream 抛 CancelledError（会话 STOP）→ 直接向上抛，不重试、不降级，仅尝试 1 次（§4.2 + 单测 #8）。"""
+    state = {"n": 0}
+
+    async def _stub(*, system, messages, tools):
+        state["n"] += 1
+        raise asyncio.CancelledError
+        yield   # pragma: no cover —— 使 _stub 成为 async generator
+
+    d = _decider([], settings=_retry_settings(ai_trade_decision_max_retries=3))
+    d._llm.stream = _stub   # type: ignore[attr-defined]
+    with pytest.raises(asyncio.CancelledError):
+        await d.decide(_payload(1))
+    assert state["n"] == 1
+
+
+async def test_max_retries_zero_preserves_legacy_direct_degrade():
+    """max_retries=0 → 首次 error 即降级（旧行为逐字回归），只调用一次（零回归门禁，§八）。"""
+    d = _decider([_error_script()],
+                 settings=_retry_settings(ai_trade_decision_max_retries=0))
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade == "llm_error"
+    assert decision.action == "hold"
+    assert d._llm.calls == 1
+
+
+async def test_last_analysis_reset_between_retries():
+    """RC-1 跨尝试版：失败尝试产半截研判后 error、重试尝试产新研判并成功 → last_analysis 仅含成功尝试研判。"""
+    first = [StreamEvent("text_delta", text="失败尝试的半截研判"),
+             StreamEvent("error", code="LLM_ERROR", message="boom")]
+    second = ([StreamEvent("text_delta", text="成功尝试的研判：开多。")]
+              + _valid_open_long(0.3))
+    d = _decider([first, second],
+                 settings=_retry_settings(ai_trade_decision_max_retries=3))
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade is None
+    assert "成功尝试的研判" in d.last_analysis
+    assert "失败尝试的半截研判" not in d.last_analysis
+
+
+def test_retry_hint_suffix_mentions_reason():
+    """§4.5：提示含 reason 与「只调用一次」；首次（hint=None）prompt 不含系统提示（逐字一致）。"""
+    suffix = _retry_hint_suffix("missing_size")
+    assert "missing_size" in suffix
+    assert "只调用一次" in suffix
+    assert "【系统提示】" not in build_decision_prompt(_payload(1))
