@@ -562,8 +562,8 @@ export default function Page() {
     updatedTs: lastMarketTs,
   };
 
-  // 顶栏右簇应用控件（模拟盘/实盘切换、主题键、设置齿轮、窗口键）。Windows(WCO) 下下沉到标题栏
-  // 之下的客户区工具条、其余平台留在标题栏行内——见下方 return 中依 winOverlay 的条件渲染。
+  // 顶栏右簇应用控件（模拟盘/实盘切换、主题键、设置齿轮、窗口键）。所有平台均单行内联在标题栏行内、
+  // 置于系统三键左侧（第 2 轮回退 round-1 的两段式布局，诊断 desktop-header-app-controls-inline-single-row）。
   const appControls = (
     <>
       <AccountModeSwitch />
@@ -600,27 +600,17 @@ export default function Page() {
           <span className="text-sm font-semibold tracking-tight">Aragon Trading</span>
         </div>
         <div className="flex-1 self-stretch" />
-        {/* Windows(WCO) 两段式顶栏（诊断 desktop-header-app-controls-unclickable-wco / P1）：顶部 48px
-            标题栏行 = WCO caption 矩形 [0,48)。还原态 inset=0（内容紧贴顶边、WS_THICKFRAME 顶边 resize 带仍在）
-            下该矩形内的 NC 命中换算未归零，落其中的应用控件（无论 DOM 标 drag/no-drag）单击被 OS 判作 caption
-            拖拽/顶边 resize、不下发到渲染层。故此行只留品牌拖拽簇 + 右上角系统三键（WCO 绘制、走独立高优先级
-            NC 路径不受影响）；应用控件下沉到 header 之后的 no-drag 客户区工具条。mac/linux/纯 Web 无此几何
-            缺陷，保持单行、右簇仍在 header 内。 */}
-        {!winOverlay && (
-          <div className="no-drag flex items-center gap-2">{appControls}</div>
-        )}
+        {/* 单行内联右簇（第 2 轮回退：应用控件回到与系统三键同一行、置于其左侧；诊断
+            desktop-header-app-controls-inline-single-row）。右簇为显式 no-drag 岛：反转拖拽契约下除最左
+            品牌簇（唯一 .drag-region）外无任何 drag 区覆盖它；header 的 win-titlebar-safe 让出系统三键带宽，
+            使右簇整体落在三键左侧安全区。标准 WCO 语义下标题栏内 no-drag 区判为 HTCLIENT、可点（VS Code 等
+            生产 WCO 应用即如此）。Windows 还原态单击是否下发不可 headless 验证——以真实 Windows 还原/最大化
+            两态人工点击为终审门（诊断 §六 强制人工验收门）。 */}
+        <div className="no-drag flex items-center gap-2">{appControls}</div>
       </header>
 
-      {/* Windows 应用控件工具条：整行落在 y≥48（WCO overlay 矩形 [0,48) 之外的纯 HTCLIENT），故还原/
-          最大化任何窗口态都可点，与 -webkit-app-region 减除、Chromium 版本全部解耦。 */}
-      {winOverlay && (
-        <div className="no-drag flex h-11 shrink-0 items-center justify-end gap-2 px-4">
-          {appControls}
-        </div>
-      )}
-
-      {/* 全宽分隔线（替代 header 自身 border-b）：作为 header（Windows 下再叠加工具条）之后的同层流式
-          元素，严格位于 Windows titleBarOverlay 48px 叠加矩形（[0,48)）之外，故三键正下方亦连续不缺线
+      {/* 全宽分隔线（替代 header 自身 border-b）：作为 header 之后的同层流式元素落在 y≈48，
+          严格位于 Windows titleBarOverlay 48px 叠加矩形（[0,48)）之外，故三键正下方亦连续不缺线
           （spec §2.3）；Web/mac/linux 无叠加矩形，视觉等价于原 border-b。 */}
       <div aria-hidden="true" className="h-px w-full shrink-0 bg-[var(--border)]" />
 
