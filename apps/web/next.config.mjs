@@ -12,6 +12,17 @@ const nextConfig = {
   // EPERM symlink，故本机 `pnpm build` 默认走普通产物保持绿；Linux 容器 / CI 无此限制
   // （实施发现，见 spec §11 D2）。
   output: process.env.NEXT_OUTPUT_STANDALONE === "1" ? "standalone" : undefined,
+  // 桌面端「回测失败」根因修复：Next 14.2.15 standalone 代理对每个 /api/py/* 请求默认施加
+  // 30s proxyTimeout（proxy-request.js:31 ← router-server.js:269 ← 未设的
+  // config.experimental.proxyTimeout），单次墙钟 > 30s 的长回测被其在传输层重置
+  // （socket hang up / ECONNRESET），UI 误报失败而后端实际已跑完并落库 done。此处抬高到
+  // 300000ms（5 分钟，覆盖有界回测最坏墙钟 ~1~3min）。取值必须为正数：schema 为
+  // z.number().gte(0)，null 非法；0 会被 `proxyTimeout || 30000` 退回 30s。改动须重建
+  // build:web 才能烤进 standalone 的 required-server-files.json。不影响 WS（ws.ts:6 直连）。
+  // 详见 docs/diagnoses/desktop-backtest-proxy-timeout-socket-hang-up/analysis.md
+  experimental: {
+    proxyTimeout: 300000,
+  },
   async rewrites() {
     return [
       {
