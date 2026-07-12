@@ -119,6 +119,7 @@ class AiTradeGroupStartRequest:
     priming_bars: int = 300
     budget_cap_frac: float = 1.0             # 预算硬上限分数（avail×该值），恒由 api 层显式覆盖（默认 1.0=不约束）
     default_budget_frac: float = 0.01        # 留空默认分数（avail×该值），由 api 解析（默认 1%）
+    position_step_pct: float = 0.0           # 仓位操作档位步长（fraction；0=连续，直接构造该 dataclass 的既有测试零回归）
 
 
 @dataclass
@@ -333,8 +334,10 @@ class AiTradeManager:
         sl_i = self._scale_threshold(req.stop_loss_usd, plan.allocation_pct, ctx.sum_pct)
         decider = AiTradeDecider(
             make_llm_client_from_config(ctx.provider),
-            build_ai_trade_system_prompt(plan.inst_id, req.bar, plan.budget_usd, ctx.lever),
-            context_refresh_rounds=req.context_refresh_rounds, settings=req.settings)
+            build_ai_trade_system_prompt(plan.inst_id, req.bar, plan.budget_usd, ctx.lever,
+                                         position_step_pct=req.position_step_pct),
+            context_refresh_rounds=req.context_refresh_rounds, settings=req.settings,
+            position_step_pct=req.position_step_pct)
         run_id = await self._create_group_run(ctx, plan, tp_i, sl_i)
         session = AiTradeSession(
             f"aitrade_{uuid.uuid4().hex}", run_id, req.specs, plan.inst_id, req.bar, executor,
@@ -541,7 +544,8 @@ class AiTradeManager:
                         "contextRefreshRounds": req.context_refresh_rounds,
                         "groupId": ctx.group_id, "allocationPct": plan.allocation_pct,
                         "allocationMode": req.allocation_mode,
-                        "totalBudgetUsd": ctx.total_budget_usd},
+                        "totalBudgetUsd": ctx.total_budget_usd,
+                        "positionStepPct": req.position_step_pct},   # P2 观测：档位落 free-form config（零列迁移）
                 status="running")
             return run.id
 

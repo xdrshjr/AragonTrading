@@ -46,6 +46,15 @@ def _require_ai_enabled(settings: Settings) -> None:
             "message": "AI 自动交易未启用（需 AI_TRADE_ENABLED 与 LIVE_TRADING_ENABLED 均开启）"})
 
 
+def _resolve_position_step(raw: float | None, settings: Settings) -> float:
+    """仓位操作档位步长解析（[R-2] **仅**缺省回填）：`None → settings 默认`，否则原样返回。
+
+    不复夹 `[0,1]`——边界已由 schema `Field(ge=0, le=1)` 在入口拒绝（越界 422，与既有 `leverage:
+    Field(gt=0, le=125)` 只在 schema 兜边界、API 不复夹的惯例一致）。`0` 为显式连续退出口，被接受。
+    """
+    return settings.ai_trade_default_position_step_pct if raw is None else raw
+
+
 async def _resolve_account(session: AsyncSession, account_id: int | None) -> repo.OkxAccount:
     """取指定账户或回落默认账户；缺失 → 404，凭证不全 → 400（绝不假数据，对齐 trading 路由）。"""
     if account_id is not None:
@@ -109,7 +118,8 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
         take_profit_usd=body.takeProfitUsd, stop_loss_usd=body.stopLossUsd,
         stop_loss_pct=body.stopLossPct, take_profit_pct=body.takeProfitPct,  # E4：单仓 OCO 入参
         priming=body.priming, priming_bars=body.primingBars,
-        budget_cap_frac=cap_frac, default_budget_frac=settings.ai_trade_default_capital_frac)
+        budget_cap_frac=cap_frac, default_budget_frac=settings.ai_trade_default_capital_frac,
+        position_step_pct=_resolve_position_step(body.positionStepPct, settings))
     try:
         await get_ai_trade_manager().start_group(req)
     except AiTradeGroupPreflightError as exc:
@@ -184,7 +194,8 @@ async def ai_backtest_start(body: AiBacktestStartIn, session: AsyncSession = Dep
         decision_every_bars=body.decisionEveryBars, initial_capital=body.initialCapital,
         leverage=body.leverage, stop_loss_pct=body.stopLossPct, take_profit_pct=body.takeProfitPct,
         take_profit_usd=body.takeProfitUsd, stop_loss_usd=body.stopLossUsd,
-        min_consensus=body.minConsensus)
+        min_consensus=body.minConsensus,
+        position_step_pct=_resolve_position_step(body.positionStepPct, settings))
     try:
         job = await get_ai_backtest_manager().start(req)
     except AiBacktestError as exc:

@@ -289,6 +289,7 @@ export interface AiTradeGroupStartReq {
   contextRefreshRounds: number;
   priming?: boolean;
   primingBars?: number;
+  positionStepPct?: number | null;  // 仓位操作档位步长（fraction；留空→服务端默认；0→连续）
 }
 
 // 分组成员行（start 回执 / status 视图共用）：完整会话行 + 分配占比。
@@ -355,10 +356,13 @@ export interface AiTradeGroupState {
   members: Record<string, AiTradeGroupMemberState>;
 }
 
-// 持久化偏好（进 partialize）：记忆上次选的策略集合与刷新轮数。
+// 持久化偏好（进 partialize）：记忆上次选的策略集合与刷新轮数与仓位操作档位。
 export interface AiTradeConfig {
   strategyIds: number[];
   contextRefreshRounds: number;
+  // 仓位操作档位步长（fraction）；[R-7] 声明为**可选**——与「老配置无此键 / aiTradeConfig 可为 null」一致，
+  // 读点一律 `aiTradeConfig?.positionStepPct ?? AI_TRADE_DEFAULT_POSITION_STEP` 兜底。
+  positionStepPct?: number;
 }
 
 // 别名（spec §3 类型清单）：会话运行期视图 / 轻量状态负载，供 store 与流式路由语义化引用。

@@ -29,6 +29,35 @@ export const AI_TRADE_MAX_SYMBOLS = 5;
 export const AI_TRADE_MAX_SL_PCT = 0.2;
 export const AI_TRADE_MAX_TP_PCT = 0.5;
 
+// ---- 仓位操作档位（ai-trade-position-sizing-steps §2.1/§4.4）----
+// 用户在启动弹窗选择离散档位步长；AI 每次开仓的 sizeFraction 被服务端量化吸附到档位阶梯上（硬保证在
+// signals.quantize_size_fraction）。默认 0.25 与后端 ai_trade_default_position_step_pct 对齐。
+export const AI_TRADE_DEFAULT_POSITION_STEP = 0.25;
+
+// 弹窗预设档位（[R-6] 仅 10/20/25/50/100%，**不含**「连续/AI 自由」——需求明确判定该行为错误）。
+// value 为 fraction 步长；连续（step=0）仅作后端零回归默认 + API 退出口，不在此露出。
+export const AI_TRADE_POSITION_STEP_OPTIONS: { value: number; label: string }[] = [
+  { value: 0.1, label: "每档 10%（10/20/…/100%）" },
+  { value: 0.2, label: "每档 20%（20/40/…/100%）" },
+  { value: 0.25, label: "每档 25%（25/50/75/100%）" },
+  { value: 0.5, label: "每档 50%（50/100%）" },
+  { value: 1, label: "每次全仓（100%）" },
+];
+
+const AI_TRADE_STEP_EPS = 1e-9;
+
+/**
+ * 档位阶梯（[R-5] 后端 signals.position_ladder 的等价前端镜像，预览文案用）：`{k·step | k=1..maxGears}`，
+ * 顶格 ≤ 100%。`step<=0` → `[]`（连续/不约束）。`maxGears=floor((1+eps)/step)` 保证顶格不越 100%。
+ */
+export function positionLadder(step: number): number[] {
+  if (step <= 0) return [];
+  const maxGears = Math.floor((1 + AI_TRADE_STEP_EPS) / step);
+  const ladder: number[] = [];
+  for (let k = 1; k <= maxGears; k += 1) ladder.push(Number((k * step).toFixed(6)));
+  return ladder;
+}
+
 // 开关守门输入（不含策略数——策略在启动弹窗内多选；运行态开关恒可点用于停止）。
 export interface AiTradeGateInput {
   accountMode: AccountMode;

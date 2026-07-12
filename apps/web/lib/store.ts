@@ -41,6 +41,7 @@ import type { WeightTrainResult, WeightTrainTarget } from "./weightModelTypes";
 import type { WeightBatchTarget } from "./weightBatchTypes";
 import type { WorkspacePrefs } from "./workspaceTypes";
 import { clampAllocationOnEdit, defaultAllocationOnAdd, evenSplit } from "./autoTrade";
+import { AI_TRADE_DEFAULT_POSITION_STEP } from "./aiTrade";
 
 type Theme = "light" | "dark";
 // 标的侧边栏页签：自选 / 现货 / 合约（"swap" 承载 SWAP+FUTURES 合约页签，RV-10）。
@@ -943,7 +944,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 27,
+      version: 28,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -1106,6 +1107,18 @@ export const useAppStore = create<AppState>()(
         if (version < 27) {
           // 运行回测配置弹窗偏好：补默认 null（缺失时首开弹窗回落默认成本 + 当前区间，不臆造陈旧绝对时间）。
           next = { ...next, backtestConfig: null };
+        }
+        if (version < 28) {
+          // 仓位操作档位偏好（[R-11] 防御性——读点已 `?? AI_TRADE_DEFAULT_POSITION_STEP` 兜底，新增可选
+          // 字段本不强制迁移）。**[R-3] 必须 null 守卫**：aiTradeConfig 初始值 / 多版本落点均为 null，
+          // 对 null 取属性赋值会抛 TypeError 致水合崩溃；仅在其为对象时补默认。
+          const cfg = next.aiTradeConfig as AiTradeConfig | null;
+          if (cfg) {
+            next = {
+              ...next,
+              aiTradeConfig: { ...cfg, positionStepPct: cfg.positionStepPct ?? AI_TRADE_DEFAULT_POSITION_STEP },
+            };
+          }
         }
         return next as never;
       },

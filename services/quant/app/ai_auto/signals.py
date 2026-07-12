@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import pandas as pd
@@ -180,3 +181,48 @@ def decision_to_signals(decision: TradeDecision) -> list[Signal]:
     if action == "open_short":
         return [Signal(side="short", strength=decision.size_fraction or 0.0, reason=decision.reason)]
     return [Signal(side="close", reason=decision.reason or "ai_close")]
+
+
+# ============================ 仓位操作档位（ai-trade-position-sizing-steps §2.2，实盘/回测共用）============================
+_STEP_EPS = 1e-9
+
+
+def position_ladder(step: float) -> list[float]:
+    """档位阶梯的**唯一真源**（[R-5]）：`{k·step | k=1..max_gears}`，顶格 ≤ 100%。
+
+    `quantize_size_fraction` 的顶格、决策工具 schema 的 `enum`、系统 prompt 的档位文案、前端
+    `positionLadder` 全部由本函数派生，杜绝三处各自 `floor(1/step)` 漂移、破坏「顶格恰为 100%」不变式。
+
+    Args:
+        step: 档位步长（fraction，如 0.25=每格 25%）。`step<=0` → 连续/不约束（无离散档位）。
+
+    Returns:
+        升序档位列表；`step<=0` 时为 `[]`。`max_gears=floor((1+eps)/step)` 保证顶格不越 100%
+        （step=0.25→`[.25,.5,.75,1.0]`；step=0.3→`[.3,.6,.9]`，故预设只放能整除 100 的 10/20/25/50/100）。
+    """
+    if step <= 0:
+        return []
+    max_gears = int(math.floor((1.0 + _STEP_EPS) / step))
+    return [round(k * step, 6) for k in range(1, max_gears + 1)]
+
+
+def quantize_size_fraction(raw: float, step: float) -> float:
+    """把开仓仓位占比吸附到最近的合法档位（`step` 的整数倍），夹到 `[step, 顶格]`（唯一硬约束点）。
+
+    `step<=0` → 连续（仅夹到 `[0,1]` 直通，逐字等价旧行为）。`max(1, …)` 使任何 `>0` 的开仓意图**至少**
+    落到最小一格——绝不因四舍五入到 0 被 `_map_decision` 误判 `missing_size`（回退仍只由 `_clamp01` 的
+    `None/≤0` 决定，回归安全）。顶格取自 `position_ladder`（≤100%），与真源同源封顶。
+
+    Args:
+        raw: LLM 给出的开仓仓位占比（已过 `_clamp01`，`∈[0,1]`）。
+        step: 档位步长（fraction）。
+
+    Returns:
+        吸附后的合法档位值（必 `∈ position_ladder(step)`）；`step<=0` 时为 `clamp01(raw)`。
+    """
+    lo = max(0.0, min(raw, 1.0))
+    ladder = position_ladder(step)
+    if not ladder:                       # step<=0：连续直通
+        return lo
+    gears = max(1, min(round(lo / step), len(ladder)))   # 顶格 = 阶梯长度（真源一致）
+    return ladder[gears - 1]

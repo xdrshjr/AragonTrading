@@ -134,6 +134,12 @@ class Settings(BaseSettings):
     # E4 单仓 OCO pct 夹紧上限：入参 stopLossPct/takeProfitPct 越界即夹到这里（留空则回落上方 default_sl/tp_pct）。
     ai_trade_max_sl_pct: float = 0.20            # E4：单仓止损 pct 硬上限（入参越界夹紧）
     ai_trade_max_tp_pct: float = 0.50            # E4：单仓止盈 pct 硬上限（入参越界夹紧）
+    # ---- 用户可配置仓位操作档位（ai-trade-position-sizing-steps §2.1/§五）----
+    # 请求 positionStepPct 留空时的默认档位步长（fraction，0.25=每次 25% 一格 → 档位 {25,50,75,100}%）。
+    # 决策器把 LLM 给出的连续 sizeFraction 吸附到 {k·step} 档位（唯一真源 signals.position_ladder）；
+    # 0=连续（旧行为，仅后端零回归默认 / API 退出口，弹窗不露出）。env 名 AI_TRADE_DEFAULT_POSITION_STEP_PCT
+    # 已在 desktop config.js prod 透传白名单内（AI_TRADE_ 前缀），此处声明后方不被 extra="ignore" 静默丢弃。
+    ai_trade_default_position_step_pct: float = 0.25
     # ---- 思维链研判增强（ai-trade-reasoning-chain §2.8）----
     # 向决策 prompt 注入「价格走势 / 成交量 / 技术因子」三段紧凑证据摘要，配合分步思维链研判纪律：策略/因子
     # 信号只作参考与触发线索、可被 Agent 推翻。默认开（只读输入增强；禁用 / 数据不足 / 异常自动省略该段，

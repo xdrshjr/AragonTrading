@@ -471,6 +471,9 @@ class AiTradeGroupStartIn(BaseModel):
     contextRefreshRounds: int = Field(default=10, ge=1)   # 精确区间在服务端按 min/max 校验
     priming: bool = True
     primingBars: int = Field(default=300, ge=10, le=PAPER_WINDOW_MAX)
+    # 仓位操作档位步长（fraction）：null/缺省→服务端默认；0→连续（仅 API/后端退出口，UI 不露出）。
+    # 越界（>1 / <0）在入口即 422（与既有 leverage 同惯例）；服务端仅 None→默认回填，不复夹（[R-2]）。
+    positionStepPct: float | None = Field(default=None, ge=0, le=1)
 
     @field_validator("members")
     @classmethod
@@ -535,6 +538,8 @@ class AiBacktestStartIn(BaseModel):
     stopLossUsd: float | None = Field(default=None, gt=0)     # 会话级止损金额阈值；留空→不触发
     contextRefreshRounds: int = Field(default=10, ge=1)       # 精确区间在服务端按 min/max 校验
     minConsensus: int | None = Field(default=None, ge=0)      # 共识门槛；留空→ai_trade_min_consensus
+    # 仓位操作档位步长（fraction）：null/缺省→服务端默认；0→连续。越界即 422，服务端仅缺省回填（[R-2]）。
+    positionStepPct: float | None = Field(default=None, ge=0, le=1)
 
 
 class AiBacktestStartOut(BaseModel):

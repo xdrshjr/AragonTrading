@@ -34,8 +34,13 @@ DECISION_TOOL_DESCRIPTION = (
 
 
 def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
-                                 leverage: float) -> str:
-    """决策者系统 prompt：信号仅供参考 + 分步思维链纪律 + 风险偏好 + 只用真数据 + 收尾必调决策工具。"""
+                                 leverage: float, position_step_pct: float = 0.0) -> str:
+    """决策者系统 prompt：信号仅供参考 + 分步思维链纪律 + 风险偏好 + 只用真数据 + 收尾必调决策工具。
+
+    `position_step_pct`（末位 keyword，默认 0.0 → 连续、原文逐字不变、零回归）：当 `>0` 时把决策纪律 #3 的
+    「sizeFraction 保守（默认 ≤0.5）」整句**替换**为「只能从允许档位中选择」（[R-8]，非追加——否则与档位
+    约束并存自相矛盾）。软引导，服务端 `quantize_size_fraction` 才是硬保证。
+    """
     return (
         "你是一名严谨、纪律性极强的加密合约自动交易决策者。你不是聊天助手，也不是信号复读机——你的"
         f"**唯一职责**是在每个决策轮，为标的 {inst_id}（周期 {bar}）做出一个受严格约束的交易决策。"
@@ -52,13 +57,42 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
         "⑦ 当前真实持仓、会话盈亏与风险约束；⑧ 结论。**研判供人类观察，真正生效的只有工具调用。**\n"
         "2. 只使用输入中提供的真实数据（价格/成交量/因子/信号板/持仓/盈亏），绝不臆造行情或指标；"
         "证据不足或相互矛盾、无把握时选择 hold（持币观望）。\n"
-        "3. 风险优先：已持仓且多数证据转为反向时，优先 close 保护利润 / 止损；空仓且多数证据同向、"
-        "研判充分时才开仓，sizeFraction 保守（默认 ≤0.5），避免频繁反手与过度交易。\n"
+        f"3. 风险优先：已持仓且多数证据转为反向时，优先 close 保护利润 / 止损；空仓且多数证据同向、"
+        f"研判充分时才开仓，{_size_discipline(position_step_pct)}，避免频繁反手与过度交易。\n"
         "4. action 取值仅限 open_long / open_short / close / hold；close/hold 忽略 sizeFraction。"
         "真实下单由系统的守护执行器落地并继承全部资金护栏，你只需给出决策与理由。\n"
         "5. **收尾硬约束（务必遵守）：每轮在完成上述分步研判之后，必须且只能调用一次 "
         "`submit_trade_decision` 工具提交本轮决策——绝不允许只输出研判文字而不调用决策工具。**"
     )
+
+
+def _size_discipline(position_step_pct: float) -> str:
+    """决策纪律 #3 的开仓规模子句：`step<=0` 保持原文（连续）；`step>0` 换为「只能取允许档位」（[R-8]）。"""
+    step = max(0.0, float(position_step_pct))
+    if step <= 0:
+        return "sizeFraction 保守（默认 ≤0.5）"
+    from .signals import position_ladder   # 延迟导入打破 signals→decider→prompts 模块级循环（§2.2）
+    ladder_text = " / ".join(f"{g:g}" for g in position_ladder(step))
+    return (f"开仓 sizeFraction **只能**从允许档位中选择：{ladder_text}"
+            "（系统会把你给出的值吸附到最近的合法档位，非档位值一律被量化）")
+
+
+def build_decision_tool_schema(position_step_pct: float) -> dict:
+    """按档位步长构造决策工具 `input_schema`（[R-5] `enum` 取自 `position_ladder` 真源，软引导）。
+
+    `step>0` 时返回浅拷贝并把 `sizeFraction` 替换为带 `enum` 的定义；`step<=0`（含默认）原样返回模块常量
+    `DECISION_TOOL_SCHEMA`（本身**不改**——回退兜底 + 现有引用不破）。硬保证仍是服务端 `quantize`。
+    """
+    step = max(0.0, float(position_step_pct))
+    if step <= 0:
+        return DECISION_TOOL_SCHEMA
+    from .signals import position_ladder   # 延迟导入打破 signals→decider→prompts 模块级循环（§2.2）
+    schema = dict(DECISION_TOOL_SCHEMA)
+    props = dict(DECISION_TOOL_SCHEMA["properties"])   # 独立浅拷贝，杜绝改动泄漏回模块常量
+    props["sizeFraction"] = {"type": "number", "enum": position_ladder(step),
+                             "description": "开仓仓位占比，只能取列出的档位"}
+    schema["properties"] = props
+    return schema
 
 
 def _format_position(position: dict | None) -> str:

@@ -13,11 +13,14 @@ import {
 } from "@/lib/aiBacktest";
 import {
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
+  AI_TRADE_DEFAULT_POSITION_STEP,
   AI_TRADE_MAX_SL_PCT,
   AI_TRADE_MAX_STRATEGIES,
   AI_TRADE_MAX_SYMBOLS,
   AI_TRADE_MAX_TP_PCT,
+  AI_TRADE_POSITION_STEP_OPTIONS,
   deriveDefaultBudget,
+  positionLadder,
   validateContextRounds,
   validateStrategySelection,
 } from "@/lib/aiTrade";
@@ -62,6 +65,7 @@ export interface AiTradeLaunchOpts {
   stopLossUsd: number | null;
   stopLossPct: number | null;      // E4：单仓 OCO 止损%（fraction，留空＝config 默认）
   takeProfitPct: number | null;    // E4：单仓 OCO 止盈%
+  positionStepPct: number;         // 仓位操作档位步长（fraction；AI 每次开仓规模只能落在该档位阶梯上）
   contextRefreshRounds: number;
   // 回测专属（mode==="backtest" 时有效）
   startTs?: number;
@@ -91,6 +95,7 @@ export default function AiTradeLaunchModal({
   defaultInstId,
   defaultStrategyIds,
   defaultContextRounds,
+  defaultPositionStepPct,
   error,
   liveGateReason = null,
   defaultStartTs,
@@ -109,6 +114,7 @@ export default function AiTradeLaunchModal({
   defaultInstId: string;              // 当前图表标的（autoTradeMembers 空时回退单成员）
   defaultStrategyIds: number[];
   defaultContextRounds: number;
+  defaultPositionStepPct: number;     // 上次所选仓位操作档位（aiTradeConfig?.positionStepPct ?? 默认，回填弹窗）
   error?: string | null;
   liveGateReason?: string | null;     // 实盘不可用原因（非 null → 段控禁用实盘、默认落回测，R6）
   defaultStartTs?: number;
@@ -131,6 +137,7 @@ export default function AiTradeLaunchModal({
   const [stopLossPctRaw, setStopLossPctRaw] = useState("");
   const [takeProfitPctRaw, setTakeProfitPctRaw] = useState("");
   const [roundsRaw, setRoundsRaw] = useState(String(defaultContextRounds || AI_TRADE_DEFAULT_CONTEXT_ROUNDS));
+  const [positionStep, setPositionStep] = useState(defaultPositionStepPct || AI_TRADE_DEFAULT_POSITION_STEP);
   const [startInput, setStartInput] = useState("");
   const [endInput, setEndInput] = useState("");
   const [everyRaw, setEveryRaw] = useState("");
@@ -173,6 +180,7 @@ export default function AiTradeLaunchModal({
     setAddError(null);
     setSelectedIds(defaultStrategyIds);
     setRoundsRaw(String(defaultContextRounds || AI_TRADE_DEFAULT_CONTEXT_ROUNDS));
+    setPositionStep(defaultPositionStepPct || AI_TRADE_DEFAULT_POSITION_STEP);
     setCapitalRaw("");
     setLeverageRaw("");
     setTakeProfitRaw("");
@@ -310,6 +318,7 @@ export default function AiTradeLaunchModal({
       stopLossUsd: stopLoss.value,
       stopLossPct: stopLossPct.value,
       takeProfitPct: takeProfitPct.value,
+      positionStepPct: positionStep,                // 仓位操作档位（实盘/回测两 tab 同得）
       contextRefreshRounds: roundsValue,
       bar,                                          // 可编辑周期真正生效（不再被 store.bar 覆盖）
     };
@@ -629,6 +638,28 @@ export default function AiTradeLaunchModal({
           <Field label="单仓止损%（如 0.05＝5%）" placeholder="留空＝默认" value={stopLossPctRaw} onChange={setStopLossPctRaw} disabled={submitting} />
           <Field label="单仓止盈%（如 0.10＝10%）" placeholder="留空＝默认" value={takeProfitPctRaw} onChange={setTakeProfitPctRaw} disabled={submitting} />
         </div>
+
+        {/* 仓位操作档位（两模式共用）：约束 AI 每次开仓规模只能落在离散档位阶梯上，而非任意小数金额。 */}
+        <label className="flex flex-col gap-1 text-[11px] text-[var(--muted)]">
+          <span>仓位操作档位（AI 每次开仓规模）</span>
+          <Select
+            value={String(positionStep)}
+            disabled={submitting}
+            onChange={(e) => setPositionStep(Number(e.target.value))}
+            className="text-xs"
+            aria-label="仓位操作档位"
+          >
+            {AI_TRADE_POSITION_STEP_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </Select>
+          <span className="leading-relaxed text-[var(--muted)]">
+            可用档位：{positionLadder(positionStep).map((g) => `${Math.round(g * 100)}%`).join(" / ")}；档位仅约束
+            <strong className="text-[var(--text)]">开仓规模</strong>（非分批加/减仓，平仓为全平），AI 每次开仓将吸附到最近的合法档位。
+          </span>
+        </label>
 
         {mode === "backtest" && (
           <div className="grid grid-cols-2 gap-3">

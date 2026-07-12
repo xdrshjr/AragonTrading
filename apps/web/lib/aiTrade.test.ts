@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  AI_TRADE_DEFAULT_POSITION_STEP,
+  AI_TRADE_POSITION_STEP_OPTIONS,
   clampBudgetToCap,
   deriveDefaultBudget,
   describeAiAction,
@@ -13,6 +15,7 @@ import {
   describeStopReason,
   describeTrigger,
   describeVolume,
+  positionLadder,
   resolveAiTradeGate,
   validateContextRounds,
   validateStrategySelection,
@@ -283,6 +286,35 @@ const signal = (over: Partial<StrategySignalView> = {}): StrategySignalView => (
   strength: 0.8,
   reason: "",
   ...over,
+});
+
+describe("positionLadder (ai-trade-position-sizing-steps, backend position_ladder mirror [R-5])", () => {
+  it("mirrors the backend ladder table exactly", () => {
+    expect(positionLadder(0.1)).toEqual([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]);
+    expect(positionLadder(0.2)).toEqual([0.2, 0.4, 0.6, 0.8, 1.0]);
+    expect(positionLadder(0.25)).toEqual([0.25, 0.5, 0.75, 1.0]);
+    expect(positionLadder(0.5)).toEqual([0.5, 1.0]);
+    expect(positionLadder(1)).toEqual([1.0]);
+  });
+  it("returns an empty ladder for the continuous / non-positive sentinel", () => {
+    expect(positionLadder(0)).toEqual([]);
+    expect(positionLadder(-0.5)).toEqual([]);
+  });
+  it("caps the top gear at 100% for non-divisor steps (no 99%-style top)", () => {
+    expect(positionLadder(0.3)).toEqual([0.3, 0.6, 0.9]); // 顶格 0.9 < 1.0
+  });
+});
+
+describe("AI_TRADE_POSITION_STEP_OPTIONS ([R-6] discrete only, no continuous)", () => {
+  it("exposes exactly 10/20/25/50/100% and excludes 0 (continuous / AI-free)", () => {
+    const values = AI_TRADE_POSITION_STEP_OPTIONS.map((o) => o.value);
+    expect(new Set(values)).toEqual(new Set([0.1, 0.2, 0.25, 0.5, 1]));
+    expect(values).not.toContain(0); // 需求明确排斥「AI 自由决定金额」，不作一等选项暴露
+  });
+  it("defaults the step to 0.25 (aligned with backend ai_trade_default_position_step_pct)", () => {
+    expect(AI_TRADE_DEFAULT_POSITION_STEP).toBe(0.25);
+    expect(AI_TRADE_POSITION_STEP_OPTIONS.some((o) => o.value === AI_TRADE_DEFAULT_POSITION_STEP)).toBe(true);
+  });
 });
 
 describe("describeTrigger (R1, trigger reason derived from signalBoard)", () => {

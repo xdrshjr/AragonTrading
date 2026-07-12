@@ -26,7 +26,8 @@ vi.mock("@/lib/api", async (orig) => {
 function renderModal(props: Partial<React.ComponentProps<typeof AiTradeLaunchModal>> = {}) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const onConfirm = vi.fn();
-  render(
+  // 每次调用都用全新的 [] 字面量播种 default 数组，方便回归测试模拟父树重渲染时传入的新引用。
+  const element = (over: Partial<React.ComponentProps<typeof AiTradeLaunchModal>> = {}) => (
     <QueryClientProvider client={qc}>
       <AiTradeLaunchModal
         open
@@ -41,11 +42,18 @@ function renderModal(props: Partial<React.ComponentProps<typeof AiTradeLaunchMod
         defaultInstId="BTC-USDT-SWAP"
         defaultStrategyIds={[]}
         defaultContextRounds={10}
+        defaultPositionStepPct={0.25}
         {...props}
+        {...over}
       />
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
-  return { onConfirm };
+  const { rerender } = render(element());
+  return {
+    onConfirm,
+    rerender: (over: Partial<React.ComponentProps<typeof AiTradeLaunchModal>> = {}) =>
+      rerender(element(over)),
+  };
 }
 
 beforeEach(() => {
@@ -279,6 +287,57 @@ describe("AiTradeLaunchModal", () => {
     // 留空总预算 → 默认 avail(1000)×1% = 10，标签保持「可用余额 × 1%」，每标的 10×50% = 5。
     expect(screen.getByText("默认总预算（可用余额 × 1%）")).toBeInTheDocument();
     await waitFor(() => expect(screen.getAllByText("5.00 USDT")).toHaveLength(2));
+  });
+
+  // 仓位操作档位（ai-trade-position-sizing-steps §六·7）：AI 每次开仓规模只能落在用户所选离散档位上。
+  it("renders the position-step select seeded from defaultPositionStepPct", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    const select = screen.getByLabelText("仓位操作档位") as HTMLSelectElement;
+    expect(select.value).toBe("0.25"); // 默认（aiTradeConfig 缺省 → AI_TRADE_DEFAULT_POSITION_STEP）
+    expect(screen.getByText(/可用档位：25% \/ 50% \/ 75% \/ 100%/)).toBeInTheDocument();
+    expect(screen.getByText(/非分批加\/减仓，平仓为全平/)).toBeInTheDocument(); // [R-10] 提示文案
+  });
+
+  it("seeds the position step from the persisted preference prop", async () => {
+    renderModal({ defaultStrategyIds: [1], defaultPositionStepPct: 0.5 });
+    await screen.findByText("均线策略");
+    expect((screen.getByLabelText("仓位操作档位") as HTMLSelectElement).value).toBe("0.5");
+    expect(screen.getByText(/可用档位：50% \/ 100%/)).toBeInTheDocument();
+  });
+
+  it("flows the chosen position step into onConfirm (live path)", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.change(screen.getByLabelText("仓位操作档位"), { target: { value: "0.5" } });
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    expect((onConfirm.mock.calls[0][0] as AiTradeLaunchOpts).positionStepPct).toBe(0.5);
+  });
+
+  it("carries the position step into onConfirm on the backtest path too", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.click(screen.getByRole("button", { name: "回测" }));
+    fireEvent.change(screen.getByLabelText("仓位操作档位"), { target: { value: "0.1" } });
+    const confirm = screen.getByRole("button", { name: /开始 AI 回测/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.mode).toBe("backtest");
+    expect(opts.positionStepPct).toBe(0.1);
+  });
+
+  it("resets the position step to default when the modal reopens (guards inputs-revert)", async () => {
+    const { rerender } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.change(screen.getByLabelText("仓位操作档位"), { target: { value: "1" } });
+    expect((screen.getByLabelText("仓位操作档位") as HTMLSelectElement).value).toBe("1");
+    // 关闭后重开：seed effect 依赖 [open]，false→true 复位回默认档位。
+    rerender({ defaultStrategyIds: [1], open: false });
+    rerender({ defaultStrategyIds: [1], open: true });
+    expect((screen.getByLabelText("仓位操作档位") as HTMLSelectElement).value).toBe("0.25");
   });
 });
 

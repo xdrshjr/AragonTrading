@@ -9,6 +9,7 @@ import { aiBacktestApi } from "@/lib/aiBacktestApi";
 import { aiTradeApi } from "@/lib/aiTradeApi";
 import {
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
+  AI_TRADE_DEFAULT_POSITION_STEP,
   resolveAiTradeGate,
 } from "@/lib/aiTrade";
 import { ApiRequestError } from "@/lib/api";
@@ -91,12 +92,18 @@ export default function AiTradeToggle() {
         stopLossUsd: opts.stopLossUsd,
         stopLossPct: opts.stopLossPct,       // E4：单仓 OCO 止损%（透传，服务端夹紧）
         takeProfitPct: opts.takeProfitPct,   // E4：单仓 OCO 止盈%
+        positionStepPct: opts.positionStepPct,   // 仓位操作档位（透传，服务端默认回填/量化）
         contextRefreshRounds: opts.contextRefreshRounds,
       }),
-    onSuccess: (res) => {
+    onSuccess: (res, opts) => {
       setAiTradeGroup(groupStateFromStatus(res));
-      // 记忆偏好（策略集合 + 刷新轮数），下次启动回填。
-      setAiTradeConfig({ strategyIds: res.strategyIds, contextRefreshRounds: res.contextRefreshRounds });
+      // 记忆偏好（策略集合 + 刷新轮数 + 仓位档位），下次启动回填。[R-4] positionStepPct 须取自 opts——
+      // setAiTradeConfig 是整对象替换且 res 不回显该键，取 res 会让所选档位每次重开都回落默认、永不持久。
+      setAiTradeConfig({
+        strategyIds: res.strategyIds,
+        contextRefreshRounds: res.contextRefreshRounds,
+        positionStepPct: opts.positionStepPct,
+      });
       setModalOpen(false);
       setError(null);
       qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
@@ -121,6 +128,7 @@ export default function AiTradeToggle() {
         stopLossUsd: opts.stopLossUsd,
         contextRefreshRounds: opts.contextRefreshRounds,
         minConsensus: opts.minConsensus ?? null,
+        positionStepPct: opts.positionStepPct,   // 回测同享档位约束（决策脑单点收口，实盘/回测同生效）
       }),
     onSuccess: (res, opts) => {
       setAiBacktestJobId(res.jobId);
@@ -198,6 +206,7 @@ export default function AiTradeToggle() {
         defaultInstId={instId}
         defaultStrategyIds={defaultStrategyIds}
         defaultContextRounds={aiTradeConfig?.contextRefreshRounds ?? AI_TRADE_DEFAULT_CONTEXT_ROUNDS}
+        defaultPositionStepPct={aiTradeConfig?.positionStepPct ?? AI_TRADE_DEFAULT_POSITION_STEP}
         error={error}
         liveGateReason={liveGateReason}
         defaultStartTs={backtestStartTs}

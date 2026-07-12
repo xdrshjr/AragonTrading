@@ -36,8 +36,8 @@ from ..config import Settings
 from .prompts import (
     DECISION_TOOL_DESCRIPTION,
     DECISION_TOOL_NAME,
-    DECISION_TOOL_SCHEMA,
     build_decision_prompt,
+    build_decision_tool_schema,
     build_summary_prompt,
     build_summary_system_prompt,
 )
@@ -96,13 +96,16 @@ class AiTradeDecider:
     """持 LLMClient + 滚动上下文的决策器；每轮 `decide` 出决策，`commit_round` 记录并按需摘要。"""
 
     def __init__(self, llm: LLMClient, system_prompt: str, *,
-                 context_refresh_rounds: int, settings: Settings):
+                 context_refresh_rounds: int, settings: Settings,
+                 position_step_pct: float = 0.0):
         self._llm = llm
         self.system_prompt = system_prompt
         self.context_refresh_rounds = max(1, int(context_refresh_rounds))
         self.settings = settings
+        # 仓位操作档位步长（fraction；0=连续，保证所有既有直接构造 AiTradeDecider(...) 的位置零回归）。
+        self._position_step = max(0.0, float(position_step_pct))
         self._tool = ToolSchema(name=DECISION_TOOL_NAME, description=DECISION_TOOL_DESCRIPTION,
-                                input_schema=DECISION_TOOL_SCHEMA)
+                                input_schema=build_decision_tool_schema(self._position_step))
         self._context: list[LlmMessage] = []
         self._summary: str = ""
         self._journal: list[dict] = []
@@ -248,6 +251,11 @@ class AiTradeDecider:
                 return _hold("missing_size"), "missing_size"
             if confidence is not None and confidence < self.settings.ai_trade_min_confidence:
                 return _hold("low_confidence"), "low_confidence"
+            # [R-5/R-9] 唯一硬约束点：过完 low_confidence 门禁后把开仓规模吸附到用户所选档位（实盘/回测同生效）。
+            # 延迟导入打破 signals→decider 模块级循环；quantize 的 max(1,…) 保证 >0 输入不被吸附回 0（不新触发
+            # missing_size）；step=0 时逐字等价旧行为（连续直通）。
+            from .signals import quantize_size_fraction
+            size = quantize_size_fraction(size, self._position_step)
             return TradeDecision(action, size, confidence, reason), None
         return TradeDecision(action, None, confidence, reason), None
 

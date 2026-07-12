@@ -86,6 +86,7 @@ class AiBacktestSpec:
     settings: Settings
     rest: object                # OKX rest client（取历史区间用）
     provider: object            # LlmProviderConfig（造决策 LLMClient 用）
+    position_step_pct: float = 0.0   # 仓位操作档位步长（fraction；0=连续，直接构造该 dataclass 的既有测试零回归）
 
 
 # ============================ 线格式序列化助手（纯函数） ============================
@@ -152,12 +153,15 @@ class AiBacktestRunner:
         self.max_rounds = spec.settings.ai_backtest_max_rounds
         self.settings = spec.settings
         self.rest = spec.rest
+        self.position_step_pct = spec.position_step_pct   # 档位吸附（实盘/回测经共享决策脑单点收口，§2.3）
 
         self.warmup = _compute_warmup(self.specs, spec.settings.ai_trade_regime_context)
         self.decider = AiTradeDecider(
             make_llm_client_from_config(spec.provider),
-            build_ai_trade_system_prompt(self.inst_id, self.bar, self.initial_capital, self.leverage),
-            context_refresh_rounds=self.context_refresh_rounds, settings=self.settings)
+            build_ai_trade_system_prompt(self.inst_id, self.bar, self.initial_capital, self.leverage,
+                                         position_step_pct=self.position_step_pct),
+            context_refresh_rounds=self.context_refresh_rounds, settings=self.settings,
+            position_step_pct=self.position_step_pct)
         self._oco_risk = RiskParams(
             stop_loss_pct=spec.stop_loss_pct or None, take_profit_pct=spec.take_profit_pct or None,
             max_hold_bars=self.settings.ai_trade_default_max_hold_bars or None)
@@ -516,7 +520,8 @@ class AiBacktestRunner:
                 "stopLossPct": self._oco_risk.stop_loss_pct,
                 "takeProfitPct": self._oco_risk.take_profit_pct,
                 "takeProfitUsd": self.take_profit_usd, "stopLossUsd": self.stop_loss_usd,
-                "minConsensus": self.min_consensus}
+                "minConsensus": self.min_consensus,
+                "positionStepPct": self.position_step_pct}
 
 
 def _compute_warmup(specs: list[PaperStrategySpec], regime_enabled: bool) -> int:

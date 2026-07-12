@@ -22,6 +22,7 @@ export interface AiBacktestStartReq {
   stopLossUsd?: number | null;
   contextRefreshRounds: number;
   minConsensus?: number | null;
+  positionStepPct?: number | null;  // 仓位操作档位步长（fraction；留空→服务端默认；0→连续）
 }
 
 export interface AiBacktestStartResult {

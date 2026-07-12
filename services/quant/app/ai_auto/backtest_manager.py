@@ -62,6 +62,7 @@ class AiBacktestStartRequest:
     take_profit_usd: float | None = None
     stop_loss_usd: float | None = None
     min_consensus: int | None = None
+    position_step_pct: float = 0.0     # 仓位操作档位步长（fraction；0=连续，直接构造该 dataclass 的既有测试零回归）
 
 
 class AiBacktestManager:
@@ -125,7 +126,8 @@ class AiBacktestManager:
             context_refresh_rounds=req.context_refresh_rounds,
             min_consensus=(req.min_consensus if req.min_consensus is not None
                            else settings.ai_trade_min_consensus),
-            planned_rounds=planned, settings=settings, rest=get_rest_client(), provider=provider)
+            planned_rounds=planned, settings=settings, rest=get_rest_client(), provider=provider,
+            position_step_pct=req.position_step_pct)
 
     # ---------- 前置门禁辅助 ----------
     @staticmethod
