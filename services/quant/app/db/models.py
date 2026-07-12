@@ -44,6 +44,8 @@ class StrategyRun(Base):
     """一次回测 / 实时模拟运行。"""
 
     __tablename__ = "strategy_runs"
+    # 自动交易分组索引（auto-trading-earnings-persistence §5.2）：按 group_id 聚合「一次 AI 交易」历史。
+    __table_args__ = (Index("ix_strategy_runs_group", "group_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     strategy_id: Mapped[int] = mapped_column(ForeignKey("strategies.id"), index=True)
@@ -55,6 +57,13 @@ class StrategyRun(Base):
     end_ts: Mapped[int | None] = mapped_column(Integer, nullable=True)
     config_json: Mapped[str] = mapped_column(Text, default="{}")
     metrics_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 自动交易分组归属（auto-trading-earnings-persistence §5.2，全部可空）：一次 live-auto start_group
+    # 派生的 N 个成员 run 共享同一 group_id / group_started_ts / group_total_budget_usd；非 live-auto /
+    # 老行为 NULL（历史列表对 NULL group_id 按单成员会话展示，不伪造分组）。老库经
+    # _ensure_live_auto_group_columns 幂等补列（create_all 不给既有表补列）。
+    group_id: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    group_started_ts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    group_total_budget_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
     trades: Mapped[list["Trade"]] = relationship(back_populates="run", cascade="all, delete-orphan")

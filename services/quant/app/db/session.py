@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -11,6 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from ..config import get_settings
 from ..strategies import BUILTIN_ORDER, STRATEGY_REGISTRY
 from .models import Base, Strategy
+
+logger = logging.getLogger(__name__)
 
 _engine = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
@@ -70,9 +73,11 @@ async def init_db() -> None:
         await _ensure_trade_risk_columns(conn)
         await _ensure_weight_run_columns(conn)
         await _ensure_weight_batch_columns(conn)
+        await _ensure_live_auto_group_columns(conn)
     await _seed_builtin_strategies()
     await _seed_builtin_factors()
     await _seed_agent_providers()
+    await _reconcile_orphan_ai_trade_runs()
 
 
 async def _ensure_trade_risk_columns(conn) -> None:
@@ -134,6 +139,47 @@ async def _ensure_weight_batch_columns(conn) -> None:
             await conn.execute(
                 text(f"ALTER TABLE weight_train_batches ADD COLUMN {name} {sql_type}")
             )
+
+
+async def _ensure_live_auto_group_columns(conn) -> None:
+    """老库幂等补列（auto-trading-earnings-persistence §5.2）：``strategy_runs`` 是既有表，
+    ``create_all`` 不会给它补 ``group_id``/``group_started_ts``/``group_total_budget_usd`` 三列——
+    须此处 ``ALTER TABLE ADD COLUMN`` 幂等补齐（仿 ``_ensure_trade_risk_columns``），否则老库读到
+    历史聚合查询立即 ``no such column``。补列后 ``CREATE INDEX IF NOT EXISTS`` 建 group 索引（幂等、
+    老库安全），支撑按 group_id 检索历史会话。
+    """
+    rows = (await conn.execute(text("PRAGMA table_info(strategy_runs)"))).all()
+    columns = {row[1] for row in rows}
+    group_columns = {
+        "group_id": "VARCHAR(48)",              # 一次自动交易分组；非 live-auto / 老行为 NULL
+        "group_started_ts": "INTEGER",          # 分组启动秒级 UTC（会话区间起点）
+        "group_total_budget_usd": "FLOAT",      # 分组总投入预算（收益率分母，P1-4）
+    }
+    for name, sql_type in group_columns.items():
+        if name not in columns:
+            await conn.execute(
+                text(f"ALTER TABLE strategy_runs ADD COLUMN {name} {sql_type}")
+            )
+    await conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_strategy_runs_group ON strategy_runs(group_id)"))
+
+
+async def _reconcile_orphan_ai_trade_runs() -> None:
+    """启动对账（ai-trade-stats-dashboard §3.5 / R-3）：把上轮进程残留的
+    ``mode='ai-trade' AND status='running'`` 孤儿 run 回填 ``end_ts`` 并置 ``stopped``。
+
+    进程启动时内存管理器为空，任何仍标 ``running`` 的 ai-trade run 必是上次崩溃 / 强杀遗留，
+    否则历史列表会出现「幽灵进行中」。仿 ``_reconcile_orphan_live_auto_runs`` 用一次性 session，
+    **整段 try/except 包裹、失败仅 warning 不阻断启动**（对账为非关键收敛，二次运行幂等）。
+    """
+    try:
+        from . import repositories as repo
+        async with get_sessionmaker()() as session:
+            reconciled = await repo.reconcile_orphan_ai_trade_runs(session)
+        if reconciled:
+            logger.info("reconciled %d orphan ai-trade runs to stopped", reconciled)
+    except Exception as exc:  # noqa: BLE001 —— 启动对账非关键，绝不因它拖垮服务启动
+        logger.warning("ai-trade orphan reconcile skipped: %s", exc)
 
 
 async def _seed_builtin_strategies() -> None:

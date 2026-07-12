@@ -47,6 +47,9 @@ from .trace import _TRACES_MAX, TraceEmit, new_round_trace, trace_event
 
 _SNAPSHOT_EQUITY_MAX = 1000
 _DECISIONS_MAX = 50
+# ai-trade-stats-dashboard §3.3：finalize 时权益快照下采样上限（≤此值原样，超出等距抽样保留首尾），
+# 避免长会话 metrics_json 膨胀（R-8）。决策摘要沿用 _DECISIONS_MAX（=50）。
+_EQUITY_DIGEST_MAX = 500
 # 研判思维链有界摘录长度（ai-trade-reasoning-chain §2.5，RC-2/RC-3）：进 journal（摘要素材）与 decision
 # 事件（_decisions 环形 + WS snapshot 重放）的一律为此摘录；完整全文只走 agent_trace 流与 _traces(≤20)。
 _ANALYSIS_EXCERPT_CHARS = 400
@@ -687,7 +690,91 @@ class AiTradeSession:
                    "finalSummary": self.decider.summary,
                    "flattenFailed": self.flatten_failed,
                    "degradedSeen": self._degraded_seen}
+        # ai-trade-stats-dashboard §3.3 / P1-1 / R-4：加法富化 metrics（供历史详情画权益曲线 + AI 决策概况）。
+        # 三段 digest 构造包在就地 try/except——调用点 stop() 的 flatten try 不覆盖本函数，故富化一旦抛错
+        # 会中断 stop() 收尾并使 run 卡在 running。异常只 warning 并退回不含富化字段的基础 metrics，无论如何
+        # 都照常 finalize_run，绝不阻断真实资金平仓后的落库收尾（保持既有 best-effort 落库风格）。
+        try:
+            metrics["equityDigest"] = _downsample_equity(self._equity, cap=_EQUITY_DIGEST_MAX)
+            metrics["decisionsDigest"] = _digest_decisions(self._decisions, cap=_DECISIONS_MAX)
+            metrics["aiStats"] = _compute_ai_stats(self._decisions, self.rounds_completed)
+        except Exception as exc:  # noqa: BLE001 —— 富化对 finalize 是加法且可失败，绝不阻断落库收尾
+            logger.warning("ai-trade finalize enrichment skipped for run %s: %s", self.run_id, exc)
+            for key in ("equityDigest", "decisionsDigest", "aiStats"):
+                metrics.pop(key, None)
         sm = get_sessionmaker()
         async with sm() as s:
             await repo.finalize_run(s, self.run_id, status="stopped", metrics=metrics,
                                     end_ts=end_ts)
+
+
+# ---------- ai-trade-stats-dashboard §3.3：finalize metrics 富化纯函数（模块级、可单测、绝不抛）----------
+_DECISION_REASON_CHARS = 160        # decisionsDigest.reason 截断长度（剥离全文，只留近况提示）
+_ACTION_KEYS = ("open_long", "open_short", "close", "hold")   # actionCounts 的规范键（匹配 decision.action 枚举）
+
+
+def _downsample_equity(records, cap: int) -> list[dict]:
+    """权益快照下采样：≤cap 原样，>cap 等距抽样并**保留首尾**（供历史详情画权益 / 回撤图）。
+
+    records 为 ``{ts, equity, drawdown}`` 序列（``self._equity`` deque）；空输入回 ``[]``。
+    纯函数、绝不抛（防御性 ``dict(r)`` 拷贝，避免回灌内部引用）。
+    """
+    items = [dict(r) for r in records]
+    n = len(items)
+    if cap < 2 or n <= cap:
+        return items
+    step = (n - 1) / (cap - 1)
+    idx = sorted({int(round(i * step)) for i in range(cap)})   # i=0→首、i=cap-1→末，去重后 ≤cap 点
+    return [items[i] for i in idx]
+
+
+def _executed_flag(payload) -> bool:
+    """决策是否真正落到成交：跳过轮 / 无成交回执 → False（``traded`` 为 executor 真实成交标记）。绝不抛。"""
+    if not isinstance(payload, dict) or payload.get("skipped"):
+        return False
+    return bool(payload.get("traded", False))
+
+
+def _digest_decisions(records, cap: int) -> list[dict]:
+    """取最近 ≤cap 条决策的紧凑摘要，剥离 signalBoard / analysis 等大字段（供详情近况列表）。空→[]。"""
+    recent = list(records)[-cap:] if cap > 0 else []
+    out: list[dict] = []
+    for d in recent:
+        reason = d.get("reason")
+        out.append({
+            "ts": d.get("ts"), "round": d.get("round"), "action": d.get("action"),
+            "executed": _executed_flag(d.get("executed")),
+            "confidence": d.get("confidence"),
+            "reason": reason[:_DECISION_REASON_CHARS] if isinstance(reason, str) else None,
+        })
+    return out
+
+
+def _compute_ai_stats(records, rounds: int) -> dict:
+    """镜像 backtest ``_aggregate_stats`` 口径子集（P2-5）：动作计数 / 观望占比 / 平均置信度 / 降级轮数。
+
+    计数在**保留的 ≤50 条决策样本**上求（``_decisions`` 环形）；``decisionRounds`` 取会话真实完成轮数
+    ``rounds``（可 > 样本量）。``actionCounts`` 键匹配 ``decision.action`` 实际枚举；``avgConfidence`` 跳过
+    ``None``；``degradedRounds`` 计 ``degradeReason`` 非空条数（``_decisions`` 无布尔 ``degraded`` 字段）。绝不抛。
+    """
+    decisions = list(records)
+    counts = {k: 0 for k in _ACTION_KEYS}
+    confidences: list[float] = []
+    degraded = 0
+    for d in decisions:
+        action = d.get("action")
+        if action in counts:
+            counts[action] += 1
+        conf = d.get("confidence")
+        if isinstance(conf, (int, float)):
+            confidences.append(float(conf))
+        if d.get("degradeReason"):
+            degraded += 1
+    sample = len(decisions)
+    return {
+        "decisionRounds": int(rounds),
+        "actionCounts": counts,
+        "holdRate": round(counts["hold"] / sample, 4) if sample else 0.0,
+        "avgConfidence": round(sum(confidences) / len(confidences), 4) if confidences else 0.0,
+        "degradedRounds": degraded,
+    }

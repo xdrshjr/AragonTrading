@@ -702,6 +702,83 @@ class LiveAutoGroupStatusOut(BaseModel):
     group: LiveAutoGroupRow | None
 
 
+# ---------------- AI 自动交易统计历史（ai-trade-stats-dashboard §3.6，camelCase wire）----------------
+class AiTradeHistoryEntry(BaseModel):
+    """历史会话列表单行（GET /ai-trade/history）：一个 group = 一次 AI 自动交易的 KPI 概览。
+
+    汇总由后端按 group 逐成员配对得出（realizedPnlUsd=Σ 平仓已实现盈亏、winRate、best/worst；
+    returnPct=realizedPnlUsd/totalBudgetUsd，分母 = 原始投入预算，口径同 _finalize_run）。
+    """
+
+    groupId: str
+    strategyName: str
+    bar: str
+    instIds: list[str]
+    startedTs: int
+    endedTs: int
+    status: str
+    totalBudgetUsd: float
+    realizedPnlUsd: float
+    returnPct: float
+    tradeCount: int
+    winRate: float
+    bestUsd: float
+    worstUsd: float
+
+
+class AiTradeHistoryListOut(BaseModel):
+    """GET /ai-trade/history 响应：分页历史会话列表（按 startedTs DESC，排除当前运行组）。"""
+
+    items: list[AiTradeHistoryEntry]
+    total: int
+    limit: int
+    offset: int
+
+
+class AiTradeHistorySummary(BaseModel):
+    """单会话聚合 KPI（与列表行汇总同口径；前端亦可据 members[].trades 复算校验）。"""
+
+    realizedPnlUsd: float
+    returnPct: float
+    tradeCount: int
+    winRate: float
+    bestUsd: float
+    worstUsd: float
+
+
+class AiTradeHistoryMember(BaseModel):
+    """单会话内一个成员（标的）run 明细：杠杆 / 预算 / 占比 / 策略名 / 状态 / metrics + 该成员成交行。
+
+    ``trades`` 用 ``list[dict]`` 透传 ``trade_out`` 全字段（含 explain）；``metrics`` 用 ``dict`` 透传
+    解析后的 metrics_json（含可选 equityDigest/decisionsDigest/aiStats/finalSummary/reconciled），供详情页
+    画权益图 + AI 决策概况，缺失即优雅降级。
+    """
+
+    runId: int
+    instId: str
+    leverage: float
+    budgetUsd: float
+    allocationPct: float
+    strategyNames: list[str] = Field(default_factory=list)
+    status: str
+    metrics: dict[str, Any] = Field(default_factory=dict)
+    trades: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AiTradeHistoryDetailOut(BaseModel):
+    """GET /ai-trade/history/{groupId} 响应：会话头 + 逐成员成交 / metrics + 后端聚合 summary。"""
+
+    groupId: str
+    strategyName: str
+    bar: str
+    startedTs: int
+    endedTs: int
+    status: str
+    totalBudgetUsd: float
+    members: list[AiTradeHistoryMember]
+    summary: AiTradeHistorySummary
+
+
 # ---------------- Response serializers ----------------
 def _parse_explain(raw: str | None) -> dict | None:
     """explain_json → dict（缺列 / 空 / 坏 JSON 安全回 None，与既有 run_out 容错风格一致）。"""

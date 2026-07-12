@@ -546,7 +546,11 @@ class AiTradeManager:
                         "allocationMode": req.allocation_mode,
                         "totalBudgetUsd": ctx.total_budget_usd,
                         "positionStepPct": req.position_step_pct},   # P2 观测：档位落 free-form config（零列迁移）
-                status="running")
+                status="running",
+                # ai-trade-stats-dashboard §3.2：填既有 group_* 列（零迁移），使 ai-trade run 可按组聚合
+                # 出历史会话；各成员冗余同值。组级秒级起点为 ctx.created_ts（P1-3；ctx 无 started_ts）。
+                group_id=ctx.group_id, group_started_ts=ctx.created_ts,
+                group_total_budget_usd=ctx.total_budget_usd)
             return run.id
 
 

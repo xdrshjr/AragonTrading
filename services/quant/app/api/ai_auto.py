@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai_auto import get_ai_trade_manager
@@ -30,7 +30,13 @@ from ..config import Settings, get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
 from ..paper.strategy_factory import build_paper_strategy_spec
-from ..schemas import AiBacktestStartIn, AiTradeGroupStartIn
+from ..schemas import (
+    AiBacktestStartIn,
+    AiTradeGroupStartIn,
+    AiTradeHistoryDetailOut,
+    AiTradeHistoryListOut,
+    trade_out,
+)
 
 router = APIRouter(tags=["ai-trade"])
 
@@ -154,6 +160,30 @@ async def ai_trade_status(settings: Settings = Depends(get_settings)) -> dict:
     """当前活跃 AI 分组（无则 group:null）；前端重载后据此重连各成员 WS（只读，不守门）。"""
     return {"group": get_ai_trade_manager().group_status(),
             "aiTradeEnabled": settings.ai_trade_enabled}
+
+
+@router.get("/ai-trade/history", response_model=AiTradeHistoryListOut)
+async def ai_trade_history(limit: int = Query(20, ge=1, le=100),
+                          offset: int = Query(0, ge=0),
+                          session: AsyncSession = Depends(get_session)) -> dict:
+    """历史 AI 自动交易会话列表（ai-trade-stats-dashboard §3.7）：按 group 聚合、startedTs DESC、
+    分页；排除当前运行中分组（其在「当前」视图展示）。只读，不守门（历史查看不涉及下单）。"""
+    active = get_ai_trade_manager().group_status()
+    exclude = active["groupId"] if active else None
+    return await repo.list_ai_trade_groups(
+        session, limit=limit, offset=offset, exclude_group_id=exclude)
+
+
+@router.get("/ai-trade/history/{group_id}", response_model=AiTradeHistoryDetailOut)
+async def ai_trade_history_detail(group_id: str,
+                                 session: AsyncSession = Depends(get_session)) -> dict:
+    """单次 AI 自动交易历史详情（§3.7）：会话头 + 逐成员成交（trade_out）/ metrics + 后端聚合 KPI；组不存在 → 404。"""
+    detail = await repo.get_ai_trade_group_detail(session, group_id)
+    if detail is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "历史会话不存在"})
+    for member in detail["members"]:
+        member["trades"] = [trade_out(t) for t in member["trades"]]
+    return detail
 
 
 @router.websocket("/ws/ai-trade/{session_id}")

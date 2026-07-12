@@ -130,10 +130,16 @@ async def delete_strategy(session: AsyncSession, strategy_id: int) -> str:
 
 # ============================ Runs ============================
 async def create_run(session: AsyncSession, *, strategy_id: int, inst_id: str, bar: str,
-                     mode: str, config: dict, status: str = "running") -> StrategyRun:
+                     mode: str, config: dict, status: str = "running",
+                     group_id: str | None = None, group_started_ts: int | None = None,
+                     group_total_budget_usd: float | None = None) -> StrategyRun:
+    """建一行 run。``group_*`` 仅 live-auto 分组成员传入（auto-trading-earnings-persistence §5.2）；
+    其余调用方省略 → NULL（历史列表按单成员会话展示，不伪造分组）。"""
     run = StrategyRun(
         strategy_id=strategy_id, inst_id=inst_id, bar=bar, mode=mode, status=status,
         config_json=json.dumps(config, ensure_ascii=False),
+        group_id=group_id, group_started_ts=group_started_ts,
+        group_total_budget_usd=group_total_budget_usd,
     )
     session.add(run)
     await session.commit()
@@ -992,4 +998,11 @@ from .weight_batch_repositories import (  # noqa: E402,F401
     list_batch_runs,
     list_weight_batches,
     set_batch_selected_run,
+)
+# ai_auto_repositories：AI 自动交易「历史会话」按 group_id 聚合读端点 + 启动期孤儿对账
+# （ai-trade-stats-dashboard §3.4/§3.5；自包含镜像 live_auto 版，不 import 在制模块，调用点仍用 repo.X）。
+from .ai_auto_repositories import (  # noqa: E402,F401
+    get_ai_trade_group_detail,
+    list_ai_trade_groups,
+    reconcile_orphan_ai_trade_runs,
 )

@@ -25,6 +25,7 @@ import AgentEmptyState from "./AgentEmptyState";
 import AgentMessageList from "./AgentMessageList";
 import AgentUnconfigured from "./AgentUnconfigured";
 import AiTradeAgentTrace from "./AiTradeAgentTrace";
+import AiTradeStatsButton from "./AiTradeStatsButton";
 import AiTradeToggle from "./AiTradeToggle";
 
 type PanelView = "chat" | "aitrade";
@@ -326,6 +327,7 @@ export default function AgentPanel() {
           <Button variant="ghost" size="sm" onClick={newConversation} aria-label="新对话">
             新对话
           </Button>
+          <AiTradeStatsButton />
           <AiTradeToggle />
         </div>
       </header>
