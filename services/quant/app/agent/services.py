@@ -203,14 +203,22 @@ async def _prepare_strategy(session: AsyncSession, strategy_id: int,
 async def _execute_and_persist(session: AsyncSession, *, strategy_id: int, strategy: BaseStrategy,
                                inst_id: str, bar: str, limit: int | None, start_ts: int, end_ts: int,
                                costs: tuple, candles: list[Candle],
-                               htf_frames: dict[str, list[Candle]]) -> tuple[StrategyRun, BacktestResult]:
-    """落 run → 线程池回测 → 落库结果（与 router 原行为一致，R8）。"""
+                               htf_frames: dict[str, list[Candle]],
+                               risk_override: dict | None = None) -> tuple[StrategyRun, BacktestResult]:
+    """落 run → 线程池回测 → 落库结果（与 router 原行为一致，R8）。
+
+    `risk_override` 非空时把本次一次性止盈止损覆盖记入 `config.riskOverride`（加法、可复现留痕）；
+    为空则不写入，历史 run 的 config 形状不变（backtest-stop-loss-take-profit §2.4 / §五）。
+    """
     initial_capital, fees, slippage, leverage = costs
+    config = {"initialCapital": initial_capital, "fees": fees, "slippage": slippage,
+              "leverage": leverage, "limit": limit, "startTs": start_ts, "endTs": end_ts,
+              "effectiveCandleCount": len(candles), "htfBars": list(htf_frames.keys())}
+    if risk_override:
+        config["riskOverride"] = dict(risk_override)
     run = await repo.create_run(
         session, strategy_id=strategy_id, inst_id=inst_id, bar=bar, mode="backtest",
-        config={"initialCapital": initial_capital, "fees": fees, "slippage": slippage,
-                "leverage": leverage, "limit": limit, "startTs": start_ts, "endTs": end_ts,
-                "effectiveCandleCount": len(candles), "htfBars": list(htf_frames.keys())},
+        config=config,
     )
     result = await run_in_threadpool(
         run_backtest, strategy, candles, bar,
@@ -240,13 +248,18 @@ async def run_single_backtest(session: AsyncSession, rest, *, strategy_id: int, 
                               bar: str, limit: int | None = None, start_ts: int, end_ts: int,
                               initial_capital: float | None = None, fees: float | None = None,
                               slippage: float | None = None, leverage: float | None = None,
-                              params: dict | None = None) -> dict:
+                              params: dict | None = None,
+                              risk_override: dict | None = None) -> dict:
     """单策略回测：返回 {runId, metrics, effectiveCandleCount, requestedBars, truncated}（v2·P1-1）。
 
     全区间分页保证 `[startTs, endTs]` 全覆盖；覆盖情况经响应字段透明回传（前端据 `truncated` 显示横幅，
     绝不静默截断）。`limit` 若给出仅作 `max_bars` 安全上限覆盖（不再当覆盖上限）。若该策略是组合
     （kind=="combo"），内部转 combo 路径，响应在 {runId, metrics} 基础上**追加** `combo` 字段
     （combo 路径不强制回包覆盖字段，避免响应形状漂移，§3.2）。组合仅用已存 params_json，不透传 `params`（R7）。
+
+    `risk_override`（backtest-stop-loss-take-profit §2.4）为一次性止盈止损覆盖（键 stop_loss_pct /
+    take_profit_pct，小数）：非 combo 分支并入 `_prepare_strategy` 的 params 覆盖，经既有 `risk_params()`
+    → `SimBroker` 生效；不写回策略行。combo 分支不透传（前端已 wire 隔离、v1 不支持，§八 / R-3）。
     """
     row = await repo.get_strategy_row(session, strategy_id)
     if row is not None and _is_combo(row.template_key):
@@ -254,7 +267,9 @@ async def run_single_backtest(session: AsyncSession, rest, *, strategy_id: int, 
             session, rest, row, inst_id=inst_id, bar=bar, limit=limit,
             start_ts=start_ts, end_ts=end_ts, initial_capital=initial_capital, fees=fees,
             slippage=slippage, leverage=leverage)
-    _row, strategy = await _prepare_strategy(session, strategy_id, params)
+    # 只合并非空覆盖键：双空 → override=={} → _prepare_strategy 内 `if params_override:` 假值短路 → 字节级等价（R-6）。
+    override = {**(params or {}), **(risk_override or {})}
+    _row, strategy = await _prepare_strategy(session, strategy_id, override)
     costs = _resolve_costs(get_settings(), initial_capital, fees, slippage, leverage)
     candles = await load_range_candles(rest, inst_id=inst_id, bar=bar, start_ts=start_ts,
                                        end_ts=end_ts, max_bars=limit)
@@ -273,7 +288,7 @@ async def run_single_backtest(session: AsyncSession, rest, *, strategy_id: int, 
     run, result = await _execute_and_persist(
         session, strategy_id=strategy_id, strategy=strategy, inst_id=inst_id, bar=bar,
         limit=limit, start_ts=start_ts, end_ts=end_ts, costs=costs, candles=candles,
-        htf_frames=htf_frames)
+        htf_frames=htf_frames, risk_override=risk_override)
     # 附带专业扩展绩效指标（复用现成纯函数；不落库、对既有 metrics 契约零影响，strategy-backtest-config-modal §2.6）。
     extended = compute_extended_metrics(result.equity_points, result.trades, bar, costs[0])
     return {"runId": run.id, "metrics": result.metrics, "extendedMetrics": extended,

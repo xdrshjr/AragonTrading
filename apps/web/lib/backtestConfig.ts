@@ -65,6 +65,7 @@ export function estimateBars(bar: Bar, startTs: number, endTs: number): number {
 }
 
 // 默认成本与周期（与后端 settings 默认对齐：资金 10000、费 5bps、滑点 2bps、杠杆 1x、周期 1H、区间 近30天）。
+// 止盈止损默认 null（=不覆盖，沿用策略自带风控，backtest-stop-loss-take-profit §五）。
 export const DEFAULT_BACKTEST_CONFIG: Omit<BacktestConfig, "startTs" | "endTs"> = {
   bar: "1H",
   rangePreset: "30d",
@@ -72,6 +73,8 @@ export const DEFAULT_BACKTEST_CONFIG: Omit<BacktestConfig, "startTs" | "endTs"> 
   feesBps: 5,
   slippageBps: 2,
   leverage: 1,
+  stopLossPct: null,
+  takeProfitPct: null,
 };
 
 export interface ConfigValidation {
@@ -81,7 +84,14 @@ export interface ConfigValidation {
 }
 
 // 边界校验：start<end、cap>0、fee/slip>=0、lev>=1 为硬错误（禁用运行）；估算根数 < 暖机为软告警（仍可运行）。
-export function validateConfig(cfg: BacktestConfig, warmupBars?: number): ConfigValidation {
+// `riskOverrideEnabled`（backtest-stop-loss-take-profit §2.4）：仅在开启（原子/因子）时校验止盈止损百分比
+// 边界；关闭（组合）时跳过——组合弹窗不渲染该分区，永不因看不见的字段被禁用「开始回测」（R-2）。
+// 百分数边界（SL (0,100)、TP (0,1000)）与后端 Field(gt=0, lt=1/10) 小数边界逐一互为镜像（R-5）。
+export function validateConfig(
+  cfg: BacktestConfig,
+  warmupBars?: number,
+  riskOverrideEnabled = true,
+): ConfigValidation {
   const errors: string[] = [];
   const warnings: string[] = [];
   if (!(cfg.startTs < cfg.endTs)) errors.push("起始时间必须早于结束时间");
@@ -89,6 +99,12 @@ export function validateConfig(cfg: BacktestConfig, warmupBars?: number): Config
   if (!(cfg.feesBps >= 0)) errors.push("手续费不能为负");
   if (!(cfg.slippageBps >= 0)) errors.push("滑点不能为负");
   if (!(cfg.leverage >= 1)) errors.push("杠杆不能小于 1");
+  if (riskOverrideEnabled) {
+    const sl = cfg.stopLossPct;
+    if (sl != null && !(sl > 0 && sl < 100)) errors.push("止损百分比需大于 0 且小于 100");
+    const tp = cfg.takeProfitPct;
+    if (tp != null && !(tp > 0 && tp < 1000)) errors.push("止盈百分比需大于 0 且小于 1000");
+  }
   if (warmupBars && cfg.startTs < cfg.endTs) {
     const bars = estimateBars(cfg.bar, cfg.startTs, cfg.endTs);
     if (bars < warmupBars) {
@@ -137,4 +153,17 @@ export function tsToLocalInput(tsSec: number): string {
 export function localInputToTs(value: string): number | null {
   const ms = Date.parse(value);
   return Number.isFinite(ms) ? Math.floor(ms / 1000) : null;
+}
+
+// 止盈止损覆盖请求体（backtest-stop-loss-take-profit §4.4）：把 cfg 里的**百分数**（5）换算为线上
+// 契约的**小数**（0.05），并丢弃 null/NaN/<=0 的空值——单位转换仅在此单点发生（集中、可单测，R-5）。
+export function riskOverrideBody(
+  cfg: BacktestConfig,
+): { stopLossPct?: number; takeProfitPct?: number } {
+  const body: { stopLossPct?: number; takeProfitPct?: number } = {};
+  const sl = cfg.stopLossPct;
+  if (sl != null && Number.isFinite(sl) && sl > 0) body.stopLossPct = sl / 100;
+  const tp = cfg.takeProfitPct;
+  if (tp != null && Number.isFinite(tp) && tp > 0) body.takeProfitPct = tp / 100;
+  return body;
 }

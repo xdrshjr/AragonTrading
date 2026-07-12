@@ -148,6 +148,9 @@ export const api = {
       fees?: number;
       slippage?: number;
       leverage?: number;
+      // 止盈止损一次性覆盖（backtest-stop-loss-take-profit §4.2）：**小数**（0.05=5%），缺省即不出现在 JSON。
+      stopLossPct?: number;
+      takeProfitPct?: number;
     },
   ) =>
     request<BacktestResult>(`/strategies/${id}/backtest`, {

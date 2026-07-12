@@ -100,11 +100,18 @@ async def combo_preview(body: ComboPreviewReq,
 @router.post("/strategies/{strategy_id}/backtest")
 async def backtest(strategy_id: int, body: BacktestReq,
                    session: AsyncSession = Depends(get_session)) -> dict:
+    # 止盈止损一次性覆盖（backtest-stop-loss-take-profit §4.1）：仅并入非 None 键，键名对齐 RiskParams；
+    # 两者皆空则 risk_override=None（下游 _prepare_strategy 空值短路 → 与现状字节级等价）。
+    risk_override = {
+        k: v for k, v in (("stop_loss_pct", body.stopLossPct),
+                          ("take_profit_pct", body.takeProfitPct)) if v is not None
+    } or None
     return await services.run_single_backtest(
         session, get_rest_client(),
         strategy_id=strategy_id, inst_id=body.instId, bar=body.bar, limit=body.limit,
         start_ts=body.startTs, end_ts=body.endTs, initial_capital=body.initialCapital,
         fees=body.fees, slippage=body.slippage, leverage=body.leverage,
+        risk_override=risk_override,
     )
 
 

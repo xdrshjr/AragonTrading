@@ -650,6 +650,52 @@ describe("StrategyPanel manual backtest trigger", () => {
     expect(api.updateStrategy).not.toHaveBeenCalled();
   });
 
+  it("injects risk override on atomic backtests but never leaks it into combo requests (R-1 wire isolation)", async () => {
+    // 持久化的 backtestConfig 残留百分数止盈止损（模拟用户在原子会话设过、又被单例持久化）。
+    const withRisk = {
+      bar: "1H" as const,
+      rangePreset: "custom" as const,
+      startTs: 1_700_000_000,
+      endTs: 1_700_086_400,
+      initialCapital: 10000,
+      feesBps: 5,
+      slippageBps: 2,
+      leverage: 1,
+      stopLossPct: 3,
+      takeProfitPct: 5,
+    };
+    await renderLoadedPanel({ backtestConfig: withRisk });
+    vi.clearAllMocks();
+
+    // 原子路径（riskOverrideEnabled 默认 true）：请求体带 %→小数换算后的 SL/TP。
+    fireEvent.click(getButton(RUN_BACKTEST));
+    let dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "开始回测" }));
+    await waitFor(() => expect(api.backtest).toHaveBeenCalledTimes(1));
+    expect(api.backtest).toHaveBeenCalledWith(
+      1,
+      expect.objectContaining({ stopLossPct: 0.03, takeProfitPct: 0.05 }),
+    );
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+
+    // 组合路径（riskOverrideEnabled=false）：即便持久化 cfg 残留 SL/TP，请求体永不携带（R-1）。
+    vi.clearAllMocks();
+    await selectComboTab();
+    selectStrategy("Combo One");
+    await waitFor(() => expect(useAppStore.getState().strategyId).toBe(20));
+    await settleEffects();
+    vi.clearAllMocks();
+
+    fireEvent.click(getButton(RUN_BACKTEST));
+    dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "开始回测" }));
+    await waitFor(() => expect(api.backtest).toHaveBeenCalledTimes(1));
+    const comboBody = vi.mocked(api.backtest).mock.calls[0][1];
+    expect(comboBody).not.toHaveProperty("stopLossPct");
+    expect(comboBody).not.toHaveProperty("takeProfitPct");
+  });
+
   it("clears displayed run results when a passive strategy selection changes", async () => {
     await renderLoadedPanel();
     vi.clearAllMocks();

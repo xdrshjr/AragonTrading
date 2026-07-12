@@ -46,6 +46,10 @@ class BacktestReq(BaseModel):
     fees: float | None = None        # taker_fee_bps
     slippage: float | None = None    # slippage_bps
     leverage: float | None = None
+    # 止盈止损一次性覆盖（backtest-stop-loss-take-profit §4.1）：小数契约（0.03=3%），留空=不覆盖
+    # 策略自带风控。边界与前端 validateConfig 百分数边界互为镜像（SL (0,100)%⇔(0,1)；TP (0,1000)%⇔(0,10)）。
+    stopLossPct: float | None = Field(default=None, gt=0, lt=1)
+    takeProfitPct: float | None = Field(default=None, gt=0, lt=10)
 
     @model_validator(mode="after")
     def validate_time_range(self) -> "BacktestReq":

@@ -69,6 +69,40 @@ function CostField({
   );
 }
 
+// 可空百分比输入（止盈止损用）：空串 → null（而非 NaN），供「留空＝沿用策略自带」语义（§三 #8）。
+function OptionalPctField({
+  label,
+  value,
+  placeholder,
+  onChange,
+}: {
+  label: string;
+  value: number | null | undefined;
+  placeholder?: string;
+  onChange: (n: number | null) => void;
+}) {
+  return (
+    <label className="flex flex-col gap-1">
+      <span className="text-[11px] text-[var(--muted)]">{label}</span>
+      <div className="flex items-center gap-1.5">
+        <input
+          type="number"
+          value={value == null || !Number.isFinite(value) ? "" : value}
+          min={0}
+          step="any"
+          placeholder={placeholder}
+          onChange={(e) => {
+            const raw = e.target.value;
+            onChange(raw === "" ? null : parseFloat(raw));
+          }}
+          className="tabular w-full rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs outline-none focus:border-[var(--accent)]"
+        />
+        <span className="shrink-0 text-[11px] text-[var(--muted)]">%</span>
+      </div>
+    </label>
+  );
+}
+
 /**
  * 运行回测配置 + 运行 + 结果弹窗（backtest-modal-two-step-results §2）。
  *
@@ -90,6 +124,7 @@ export default function BacktestConfigModal({
   result,
   errorMessage,
   onRun,
+  riskOverrideEnabled = true,
 }: {
   open: boolean;
   onClose: () => void;
@@ -102,6 +137,9 @@ export default function BacktestConfigModal({
   result?: BacktestResult;
   errorMessage?: string | null;
   onRun: (cfg: BacktestConfig) => void;
+  // 止盈止损分区门控（backtest-stop-loss-take-profit §2.4）：原子/因子默认 true（渲染 + 校验 SL/TP）；
+  // 组合显式 false（不渲染、跳过校验）。wire 层隔离在 StrategyPanel.runBacktest（R-1）。
+  riskOverrideEnabled?: boolean;
 }) {
   const [cfg, setCfg] = useState<BacktestConfig>(initialConfig);
   // 当前展示的步骤（config=配置屏，result=结果屏）。
@@ -173,7 +211,7 @@ export default function BacktestConfigModal({
 
   const isCustom = cfg.rangePreset === "custom";
   const bars = estimateBars(cfg.bar, cfg.startTs, cfg.endTs);
-  const { ok, errors, warnings } = validateConfig(cfg, warmupBars);
+  const { ok, errors, warnings } = validateConfig(cfg, warmupBars, riskOverrideEnabled);
   const runDisabled = !ok || running;
 
   // 样本内 / 外自查（因子权重训练区间重叠即偏乐观，沿用 StrategyDetail 口径）。
@@ -233,6 +271,7 @@ export default function BacktestConfigModal({
             provenanceHint={provenanceHint}
             inSample={inSample}
             instId={instId}
+            riskOverrideEnabled={riskOverrideEnabled}
           />
         ) : (
           <ResultStep
@@ -415,6 +454,7 @@ function ConfigStep({
   provenanceHint,
   inSample,
   instId,
+  riskOverrideEnabled,
 }: {
   bodyRef: React.RefObject<HTMLDivElement>;
   cfg: BacktestConfig;
@@ -428,6 +468,7 @@ function ConfigStep({
   provenanceHint?: ProvenanceHint | null;
   inSample: boolean;
   instId: string;
+  riskOverrideEnabled: boolean;
 }) {
   return (
     <div ref={bodyRef} tabIndex={-1} className="flex flex-col gap-4 outline-none">
@@ -523,6 +564,31 @@ function ConfigStep({
           />
         </div>
       </section>
+
+      {/* 止盈止损（可选，backtest-stop-loss-take-profit §2.4）：仅原子/因子渲染；两输入默认留空＝沿用策略自带风控。
+          组合（riskOverrideEnabled=false）不渲染——语义不清且 wire 已隔离，避免「显示却不生效」的 UX 陷阱。 */}
+      {riskOverrideEnabled && (
+        <section className="flex flex-col gap-2 rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] p-3">
+          <div className="text-[11px] font-semibold text-[var(--muted)]">止盈止损（可选）</div>
+          <div className="grid grid-cols-2 gap-2.5">
+            <OptionalPctField
+              label="止盈%"
+              value={cfg.takeProfitPct}
+              placeholder="留空＝用策略自带"
+              onChange={(n) => patch({ takeProfitPct: n })}
+            />
+            <OptionalPctField
+              label="止损%"
+              value={cfg.stopLossPct}
+              placeholder="留空＝用策略自带"
+              onChange={(n) => patch({ stopLossPct: n })}
+            />
+          </div>
+          <p className="text-[11px] text-[var(--muted)]">
+            仅本次回测临时生效，不写回策略参数；留空则完全沿用策略自带止盈止损。
+          </p>
+        </section>
+      )}
 
       {/* 即时反馈：校验错误 / 暖机告警 / 样本内外提示 */}
       {errors.length > 0 && (

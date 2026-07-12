@@ -5,6 +5,7 @@ import {
   estimateBars,
   presetToRange,
   refreshPresetRange,
+  riskOverrideBody,
   seedBacktestConfig,
   validateConfig,
 } from "./backtestConfig";
@@ -78,6 +79,48 @@ describe("validateConfig", () => {
     const v = validateConfig(cfg({ startTs: NOW - 86400, endTs: NOW }), 260);
     expect(v.ok).toBe(true);
     expect(v.warnings).toHaveLength(1);
+  });
+
+  it("accepts empty (null) stop-loss / take-profit as unset", () => {
+    const v = validateConfig(cfg({ stopLossPct: null, takeProfitPct: null }));
+    expect(v.ok).toBe(true);
+    expect(v.errors).toHaveLength(0);
+  });
+
+  it("rejects out-of-range stop-loss / take-profit percentages", () => {
+    // SL 边界 (0,100)、TP 边界 (0,1000)：<=0 或越界均为硬错误（镜像后端 Field(gt=0, lt=1/10)）。
+    expect(validateConfig(cfg({ stopLossPct: 0 })).ok).toBe(false);
+    expect(validateConfig(cfg({ stopLossPct: 100 })).ok).toBe(false);
+    expect(validateConfig(cfg({ takeProfitPct: -1 })).ok).toBe(false);
+    expect(validateConfig(cfg({ takeProfitPct: 1000 })).ok).toBe(false);
+    // 合法百分数放行。
+    expect(validateConfig(cfg({ stopLossPct: 3, takeProfitPct: 5 })).ok).toBe(true);
+  });
+
+  it("skips stop-loss / take-profit validation when risk override is disabled (combo gate)", () => {
+    // riskOverrideEnabled=false（组合）：即便残留越界 SL/TP，也不报错、不禁用运行（R-2）。
+    const v = validateConfig(cfg({ stopLossPct: 999, takeProfitPct: 9999 }), undefined, false);
+    expect(v.ok).toBe(true);
+    expect(v.errors).toHaveLength(0);
+  });
+});
+
+describe("riskOverrideBody", () => {
+  it("converts percentages to fractions and drops empty values", () => {
+    // 5% → 0.05、3% → 0.03（%→小数单点转换）。
+    expect(riskOverrideBody(cfg({ takeProfitPct: 5, stopLossPct: 3 }))).toEqual({
+      takeProfitPct: 0.05,
+      stopLossPct: 0.03,
+    });
+  });
+
+  it("omits null / NaN / non-positive fields", () => {
+    expect(riskOverrideBody(cfg({ stopLossPct: null, takeProfitPct: null }))).toEqual({});
+    expect(riskOverrideBody(cfg({ stopLossPct: 0, takeProfitPct: Number.NaN }))).toEqual({});
+    // 仅止盈填入：只带 takeProfitPct。
+    expect(riskOverrideBody(cfg({ stopLossPct: null, takeProfitPct: 8 }))).toEqual({
+      takeProfitPct: 0.08,
+    });
   });
 });
 

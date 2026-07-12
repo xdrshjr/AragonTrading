@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BacktestConfig, BacktestResult } from "@/lib/types";
 import BacktestConfigModal from "./BacktestConfigModal";
@@ -207,5 +207,23 @@ describe("BacktestConfigModal", () => {
     fireEvent.click(screen.getByRole("button", { name: /结果/ }));
     expect(screen.getByText("12.00%")).toBeInTheDocument();
     expect(onRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the risk override section and carries typed stop-loss / take-profit in onRun", () => {
+    // riskOverrideEnabled 默认 true（原子/因子）：渲染「止盈止损（可选）」分区，填入后 onRun 携带两字段。
+    const { onRun } = renderModal();
+    const section = screen.getByText("止盈止损（可选）").closest("section") as HTMLElement;
+    const inputs = within(section).getAllByRole("spinbutton"); // [止盈%, 止损%]（DOM 顺序）
+    fireEvent.change(inputs[0], { target: { value: "5" } });
+    fireEvent.change(inputs[1], { target: { value: "3" } });
+    fireEvent.click(screen.getByRole("button", { name: "开始回测" }));
+    expect(onRun).toHaveBeenCalledWith(
+      expect.objectContaining({ takeProfitPct: 5, stopLossPct: 3 }),
+    );
+  });
+
+  it("hides the risk override section when riskOverrideEnabled is false (combo)", () => {
+    renderModal({ riskOverrideEnabled: false });
+    expect(screen.queryByText("止盈止损（可选）")).not.toBeInTheDocument();
   });
 });

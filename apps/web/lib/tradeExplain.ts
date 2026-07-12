@@ -42,10 +42,18 @@ export function explainKindTone(
   return KIND_TONE[kind] ?? "neutral";
 }
 
+// 引擎风控出场原因 → 可读中文 headline（backtest-stop-loss-take-profit §三 #10）：止盈止损覆盖触发
+// 强平时成交带 reason=stop_loss/take_profit，回落解释译为中文，避免成交表直显英文。
+const RISK_REASON_HEADLINE: Record<string, string> = {
+  stop_loss: "触发止损平仓",
+  take_profit: "触发止盈平仓",
+};
+
 /** 据 legacy `reason` 推断类别（仅用于无 explain 的历史成交回落）。 */
 function inferKindFromReason(trade: Trade): TriggerExplainKind {
   const reason = trade.reason || "";
-  if (reason === "max_hold") return "risk_exit";
+  // 止损 / 止盈触发价强平与 max_hold 同属风控离场（warn 色调），统一归 risk_exit。
+  if (reason === "max_hold" || reason === "stop_loss" || reason === "take_profit") return "risk_exit";
   if (reason === "session_stop") return "session_stop";
   if (reason === "external_close") return "external_close";
   if (reason === "reverse") return "reverse";
@@ -69,7 +77,10 @@ export function resolveExplain(trade: Trade): TriggerExplain {
     schema: 1,
     kind,
     side: trade.side,
-    headline: trade.reason || (trade.side === "close" ? "平仓" : "开仓"),
+    headline:
+      RISK_REASON_HEADLINE[trade.reason || ""] ||
+      trade.reason ||
+      (trade.side === "close" ? "平仓" : "开仓"),
     summary: "该成交无结构化触发解释（历史成交或非自动交易），以下为可得信息回落。",
     metrics,
     risk: {

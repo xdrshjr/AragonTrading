@@ -177,6 +177,10 @@ export interface BacktestConfig {
   feesBps: number; // taker_fee_bps, >= 0
   slippageBps: number; // slippage_bps, >= 0
   leverage: number; // >= 1
+  // 止盈止损一次性覆盖（backtest-stop-loss-take-profit §2.2）：存**百分数**（5 表示 5%），留空=null=不覆盖
+  // 策略自带风控。%→小数的转换仅在 riskOverrideBody 单点发生（线上契约 / RiskParams 均为小数）。
+  stopLossPct?: number | null;
+  takeProfitPct?: number | null;
 }
 
 // 专业扩展绩效指标（与后端 engine/metrics_ext 派生同构，camelCase）。payoffRatio 为赔率

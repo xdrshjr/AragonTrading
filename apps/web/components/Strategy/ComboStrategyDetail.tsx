@@ -164,6 +164,9 @@ export default function ComboStrategyDetail({
         result={backtestResult}
         errorMessage={backtestError}
         onRun={(cfg) => onRunBacktest(cfg)}
+        // 组合不支持止盈止损覆盖（backtest-stop-loss-take-profit §2.4）：不渲染分区 + 跳过 SL/TP 校验；
+        // wire 层隔离（请求体不含 SL/TP）在 StrategyPanel 的组合 mutate 调用点（riskOverrideEnabled=false）。
+        riskOverrideEnabled={false}
       />
     </div>
   );

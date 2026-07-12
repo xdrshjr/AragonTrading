@@ -254,6 +254,55 @@ async def test_compare_fetches_htf_union_once(patch_okx):
         await dispose_engine()
 
 
+async def test_backtest_risk_override_forces_stop_or_take_profit_exit(patch_okx):
+    """止盈止损覆盖（backtest-stop-loss-take-profit §6.1-1）：带 stopLossPct/takeProfitPct 回测后，
+    成交表出现 reason=stop_loss/take_profit 出场，且触发价由入场价按覆盖比例正确推导。"""
+    from app.db.session import dispose_engine, init_db
+    await init_db()
+    transport = ASGITransport(app=_load_app())
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            strategies = (await client.get("/api/strategies")).json()
+            sid = next(s["id"] for s in strategies if s["templateKey"] == "ema_cross_scalper")
+            r = await client.post(f"/api/strategies/{sid}/backtest", json={
+                "instId": "BTC-USDT-SWAP", "bar": "1H", "limit": 300,
+                "startTs": 1_700_000_000, "endTs": 1_700_000_000 + 200 * 3600,
+                "stopLossPct": 0.001, "takeProfitPct": 0.001})
+            assert r.status_code == 200, r.text
+            run_id = r.json()["runId"]
+            trades = (await client.get(f"/api/runs/{run_id}/trades")).json()
+            risk_exits = [t for t in trades if t["reason"] in ("stop_loss", "take_profit")]
+            assert risk_exits, "紧止盈止损应至少触发一笔风控强平"
+            # 触发价由入场价按覆盖比例推导：止盈价 = 止盈%对应价、止损价 = 止损%对应价（成交序列化恒含）。
+            assert all(t["stopLossPrice"] is not None and t["takeProfitPrice"] is not None
+                       for t in risk_exits)
+    finally:
+        await dispose_engine()
+
+
+@pytest.mark.parametrize("bad", [
+    {"stopLossPct": 0},        # gt=0 违反
+    {"stopLossPct": -0.1},     # gt=0 违反
+    {"stopLossPct": 1},        # lt=1 违反（小数上界镜像前端 SL<100%）
+    {"takeProfitPct": 0},      # gt=0 违反
+    {"takeProfitPct": 10},     # lt=10 违反（小数上界镜像前端 TP<1000%）
+])
+async def test_backtest_rejects_out_of_range_risk_override(patch_okx, bad):
+    """越界止盈止损覆盖 → FastAPI 422（backtest-stop-loss-take-profit §6.1-2，边界镜像 R-5）。"""
+    from app.db.session import dispose_engine, init_db
+    await init_db()
+    transport = ASGITransport(app=_load_app())
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            sid = [s for s in (await client.get("/api/strategies")).json() if s["builtin"]][0]["id"]
+            r = await client.post(f"/api/strategies/{sid}/backtest", json={
+                "instId": "BTC-USDT-SWAP", "bar": "1H", "limit": 200,
+                "startTs": 1_700_000_000, "endTs": 1_700_000_000 + 100 * 3600, **bad})
+            assert r.status_code == 422, r.text
+    finally:
+        await dispose_engine()
+
+
 def _load_app():
     from app.main import app
     return app

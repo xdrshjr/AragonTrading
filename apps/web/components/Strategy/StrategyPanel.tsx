@@ -17,7 +17,7 @@ import {
 } from "@/lib/strategyCatalog";
 import { useAppStore } from "@/lib/store";
 import { downloadCsv, equityToCsv } from "@/lib/export";
-import { seedBacktestConfig } from "@/lib/backtestConfig";
+import { riskOverrideBody, seedBacktestConfig } from "@/lib/backtestConfig";
 import type {
   BacktestConfig,
   ComboPreviewResult,
@@ -266,8 +266,17 @@ export default function StrategyPanel() {
   }, [mode, paperSelectionIds.length, validPaperSelectionIds, setPaperSelectionIds]);
 
   const backtest = useMutation({
-    mutationFn: (vars: { id: number; params?: Params; config?: BacktestConfig; showRunRange?: boolean }) =>
-      runBacktest(vars.id, vars.params, vars.config, instId, bar, backtestStartTs, backtestEndTs),
+    // riskOverrideEnabled（backtest-stop-loss-take-profit §2.4）：组合调用点显式传 false，止盈止损
+    // 覆盖永不进入组合请求体（原子/因子缺省 true）。是「渲染/校验/wire」同源门控的 wire 层信号（R-1）。
+    mutationFn: (vars: {
+      id: number;
+      params?: Params;
+      config?: BacktestConfig;
+      showRunRange?: boolean;
+      riskOverrideEnabled?: boolean;
+    }) =>
+      runBacktest(vars.id, vars.params, vars.config, instId, bar, backtestStartTs, backtestEndTs,
+        vars.riskOverrideEnabled ?? true),
     onSuccess: (data, vars) => {
       setRunId(data.runId);
       if (vars.showRunRange) setChartView("run-range");
@@ -546,7 +555,12 @@ export default function StrategyPanel() {
                       backtestResult={backtest.data}
                       backtestError={backtest.isError ? (backtest.error as Error)?.message : null}
                       onRunBacktest={(cfg) =>
-                        backtest.mutate({ id: selectedCombo.id, config: cfg, showRunRange: true })
+                        backtest.mutate({
+                          id: selectedCombo.id,
+                          config: cfg,
+                          showRunRange: true,
+                          riskOverrideEnabled: false, // 组合 wire 隔离：请求体永不含止盈止损（R-1）
+                        })
                       }
                       onRunWalkForward={(c) => walkForward.mutate({ id: c.id })}
                       onStartPaper={(_combo, opts) => {
@@ -799,11 +813,14 @@ async function runBacktest(
   bar: string,
   startTs: number,
   endTs: number,
+  riskOverrideEnabled = true,
 ) {
   if (params) await api.updateStrategy(id, { params });
   // 去掉硬编码 limit（v2·P1-1）：后端全区间分页保证 [startTs,endTs] 全覆盖，不再截断到最近 1000 根。
   // 弹窗配置在则真正下发区间/周期/成本/杠杆（strategy-backtest-config-modal §2.3）；缺省回退全局图表区间。
   if (config) {
+    // 止盈止损覆盖仅在开启（原子/因子）时并入 body（%→小数）；组合（false）请求体永不含 SL/TP（R-1）。
+    const riskBody = riskOverrideEnabled ? riskOverrideBody(config) : {};
     return api.backtest(id, {
       instId,
       bar: config.bar,
@@ -813,6 +830,7 @@ async function runBacktest(
       fees: config.feesBps,
       slippage: config.slippageBps,
       leverage: config.leverage,
+      ...riskBody,
     });
   }
   return api.backtest(id, { instId, bar, startTs, endTs });
