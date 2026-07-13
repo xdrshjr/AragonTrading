@@ -3,6 +3,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Badge, Button } from "@/components/ui";
+import { autoTradePositionPct } from "@/lib/autoTradePositionPct";
 import { colorForReturn, fmtNum, fmtPct, fmtPrice, signed } from "@/lib/format";
 import {
   groupOrdersByPosition,
@@ -11,6 +12,7 @@ import {
 } from "@/lib/openOrders";
 import { tradingApi } from "@/lib/tradingApi";
 import type { LiveOpenOrder, LivePosition } from "@/lib/tradingTypes";
+import { useAppStore } from "@/lib/store";
 import ClosePositionModal from "./ClosePositionModal";
 import MarketCloseAllConfirm from "./MarketCloseAllConfirm";
 import PositionOrdersRow from "./PositionOrdersRow";
@@ -25,6 +27,11 @@ export default function LivePositionsTable({
   accountId?: number;
 }) {
   const qc = useQueryClient();
+  const aiTradeGroup = useAppStore((state) => state.aiTradeGroup);
+  const liveAutoGroup = useAppStore((state) => state.liveAutoGroup);
+  const liveAutoSessionId = useAppStore((state) => state.liveAutoSessionId);
+  const liveAutoStatus = useAppStore((state) => state.liveAutoStatus);
+  const liveAutoPosition = useAppStore((state) => state.liveAutoPosition);
   const { data, isLoading, isError, error } = useQuery({
     queryKey: ["trading", "positions", accountId ?? null],
     queryFn: () => tradingApi.positions(accountId),
@@ -109,6 +116,7 @@ export default function LivePositionsTable({
             <th className="py-1.5 pr-2 font-medium">合约</th>
             <th className="py-1.5 pr-2 font-medium">方向</th>
             <th className="py-1.5 pr-2 text-right font-medium">持仓</th>
+            <th className="py-1.5 pr-2 text-right font-medium">仓位占比</th>
             <th className="py-1.5 pr-2 text-right font-medium">开仓均价</th>
             <th className="py-1.5 pr-2 text-right font-medium">标记价</th>
             <th className="py-1.5 pr-2 text-right font-medium">浮动盈亏</th>
@@ -118,10 +126,18 @@ export default function LivePositionsTable({
         <tbody>
           {open.map((p, i) => {
             const key = positionKey(p.instId, p.posSide);
+            const positionPct = autoTradePositionPct(p, {
+              aiMembers: aiTradeGroup?.state === "running" ? aiTradeGroup.members : undefined,
+              liveMembers: liveAutoGroup?.state === "running" ? liveAutoGroup.members : undefined,
+              single: liveAutoSessionId && liveAutoStatus?.state !== "stopped" && instId
+                ? { instId, position: liveAutoPosition }
+                : undefined,
+            });
             return (
               <PositionRow
                 key={`${p.instId}-${p.posSide}-${i}`}
                 pos={p}
+                positionPct={positionPct}
                 orders={grouped.get(key) ?? []}
                 expanded={!collapsed.has(key)}
                 onToggle={() => toggleCollapsed(key)}
@@ -158,6 +174,7 @@ export default function LivePositionsTable({
 
 function PositionRow({
   pos,
+  positionPct,
   orders,
   expanded,
   onToggle,
@@ -166,6 +183,7 @@ function PositionRow({
   onClose,
 }: {
   pos: LivePosition;
+  positionPct: number | null;
   orders: LiveOpenOrder[];
   expanded: boolean;
   onToggle: () => void;
@@ -192,6 +210,7 @@ function PositionRow({
             <span className="ml-1 text-[10px] text-[var(--muted)]">{pos.lever}×</span>
           ) : null}
         </td>
+        <td className="py-1.5 pr-2 text-right tabular">{fmtPct(positionPct)}</td>
         <td className="py-1.5 pr-2 text-right tabular">{fmtPrice(pos.avgPx)}</td>
         <td className="py-1.5 pr-2 text-right tabular">{fmtPrice(pos.last)}</td>
         <td
@@ -215,7 +234,7 @@ function PositionRow({
       </tr>
       {expanded && (
         <tr>
-          <td colSpan={7} className="bg-[var(--surface-2)]/40 px-2 pb-2">
+          <td colSpan={8} className="bg-[var(--surface-2)]/40 px-2 pb-2">
             <PositionOrdersRow orders={orders} refPx={pos.last ?? null} />
           </td>
         </tr>

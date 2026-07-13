@@ -74,6 +74,91 @@ async def test_open_long_from_flat_places_one_order():
     assert len(trades) == 1 and trades[0]["data"]["side"] == "long"
 
 
+async def test_open_position_pct_uses_snapped_order_size_and_position_payload():
+    ex, calls = _make_executor(
+        leverage=2.0,
+        budget_usd=1000.0,
+        ct_val=1.0,
+        lot_sz=1.0,
+        min_sz=1.0,
+    )
+    events = await ex.apply(
+        [_Sig("long", strength=0.4)],
+        ref_px=33.0,
+        bar_index=0,
+        ts=1000,
+    )
+
+    assert calls["orders"][0].sz == 24.0
+    expected = 24.0 * 33.0 / (1000.0 * 2.0)
+    trade = _trade_events(events)[0]["data"]
+    assert trade["positionPct"] == pytest.approx(expected)
+    assert ex.entry_position_pct == pytest.approx(expected)
+    assert ex.position_payload(34.0)["positionPct"] == pytest.approx(expected)
+
+
+async def test_close_inherits_entry_position_pct_then_clears_state():
+    ex, _ = _make_executor()
+    opened = _trade_events(
+        await ex.apply([_Sig("long", 0.4)], ref_px=_REF_PX, bar_index=0, ts=1000)
+    )[0]["data"]
+
+    closed = _trade_events(
+        await ex.apply([_Sig("close")], ref_px=_REF_PX, bar_index=1, ts=2000)
+    )[0]["data"]
+
+    assert closed["positionPct"] == pytest.approx(opened["positionPct"])
+    assert ex.entry_position_pct is None
+
+
+async def test_reverse_close_keeps_old_pct_and_new_open_uses_new_pct():
+    ex, _ = _make_executor()
+    first = _trade_events(
+        await ex.apply([_Sig("long", 0.4)], ref_px=_REF_PX, bar_index=0, ts=1000)
+    )[0]["data"]
+    reversed_trades = _trade_events(
+        await ex.apply([_Sig("short", 0.7)], ref_px=_REF_PX, bar_index=1, ts=2000)
+    )
+
+    assert reversed_trades[0]["data"]["positionPct"] == pytest.approx(
+        first["positionPct"]
+    )
+    assert reversed_trades[1]["data"]["positionPct"] != pytest.approx(
+        first["positionPct"]
+    )
+    assert ex.entry_position_pct == pytest.approx(
+        reversed_trades[1]["data"]["positionPct"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("sz", "ct_val", "price", "budget", "leverage"),
+    [
+        (float("nan"), 1.0, 1.0, 1.0, 1.0),
+        (float("inf"), 1.0, 1.0, 1.0, 1.0),
+        (1.0, 0.0, 1.0, 1.0, 1.0),
+        (1.0, 1.0, -1.0, 1.0, 1.0),
+        (1.0, 1.0, 1.0, 0.0, 1.0),
+        (1.0, 1.0, 1.0, 1.0, float("inf")),
+    ],
+)
+def test_position_pct_for_size_rejects_nonfinite_or_nonpositive_inputs(
+    sz, ct_val, price, budget, leverage
+):
+    assert LiveExecutor._position_pct_for_size(
+        sz=sz,
+        ct_val=ct_val,
+        reference_price=price,
+        member_budget_usd=budget,
+        leverage=leverage,
+    ) is None
+
+
+def test_compute_sz_returns_zero_when_finite_inputs_overflow_intermediate():
+    ex, _ = _make_executor(budget_usd=1e308, leverage=1e308)
+    assert ex._compute_sz(1.0, 1.0) == 0.0
+
+
 async def test_same_side_signal_is_skipped():
     ex, calls = _make_executor()
     await ex.apply([_Sig("long")], ref_px=_REF_PX, bar_index=0, ts=1000)
@@ -216,10 +301,12 @@ async def test_flatten_bounded_retry_returns_residual_on_persistent_failure(monk
     monkeypatch.setattr("app.live_auto.executor.asyncio.sleep", _no_sleep)
     ex, calls = _make_executor(raise_on_close=OKXPrivateError("51008", "余额不足"))
     await ex.apply([_Sig("long")], ref_px=_REF_PX, bar_index=0, ts=1000)
+    entry_position_pct = ex.entry_position_pct
     result = await ex.flatten(_REF_PX, ts=2000)
     assert result["ok"] is False
     assert result["residual"] == {"side": "long", "size": ex.entry_qty_sz}
     assert ex.projected == "long"                      # 残留仓未被改 flat
+    assert ex.entry_position_pct == entry_position_pct
     assert len(calls["closes"]) == ex.settings.live_auto_flatten_max_retries + 1
 
 

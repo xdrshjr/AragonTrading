@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 
 from ..config import Settings
 from ..db.session import get_sessionmaker
@@ -67,6 +68,7 @@ class LiveExecutor:
         self.entry_price = 0.0
         self.entry_bar = -1
         self.entry_qty_sz = 0.0            # 自管持仓张数（contracts）
+        self.entry_position_pct: float | None = None
         self.realized_pnl_usd = 0.0        # 累计已实现（平仓回执累加）
         self.unrealized_usd = 0.0          # 最近一次 reconcile 的浮盈（OKX upl）
         self.trades: list[dict] = []       # 已执行真单→Trade（驱动图表 markers）
@@ -107,9 +109,12 @@ class LiveExecutor:
     def position_payload(self, mark_px: float) -> dict | None:
         if self.projected == "flat":
             return None
-        return {"side": self.projected, "size": self.entry_qty_sz,
-                "avgEntry": self.entry_price, "markPrice": mark_px,
-                "unrealizedPnl": self.unrealized_usd or self._unrealized_at(mark_px)}
+        payload = {"side": self.projected, "size": self.entry_qty_sz,
+                   "avgEntry": self.entry_price, "markPrice": mark_px,
+                   "unrealizedPnl": self.unrealized_usd or self._unrealized_at(mark_px)}
+        if self.entry_position_pct is not None:
+            payload["positionPct"] = self.entry_position_pct
+        return payload
 
     # ---------- 核心：每根确认 K 线驱动 ----------
     async def apply(self, signals: list, *, ref_px: float, bar_index: int,
@@ -185,10 +190,14 @@ class LiveExecutor:
         self.entry_price = ref_px
         self.entry_bar = bar_index
         self.entry_qty_sz = sz
+        self.entry_position_pct = self._position_pct_for_size(
+            sz=sz, ct_val=self.ct_val, reference_price=ref_px,
+            member_budget_usd=self.budget_usd, leverage=self.leverage)
         explain = self._open_explain(side, reason, signal, tp, sl)
         cl_ord_id, ord_id = self._order_ids(result)
         trade = self._make_trade(ts, side, ref_px, sz, pnl=0.0, reason=reason, tp=tp, sl=sl,
-                                 explain=explain, cl_ord_id=cl_ord_id, ord_id=ord_id)
+                                 explain=explain, cl_ord_id=cl_ord_id, ord_id=ord_id,
+                                 position_pct=self.entry_position_pct)
         self.trades.append(trade)
         return [{"type": "trade", "data": trade}]
 
@@ -214,14 +223,16 @@ class LiveExecutor:
         pnl = self._close_pnl(ref_px)
         pnl_pct = self._close_return_pct(ref_px)   # v2（P1-2）：须在复位 entry/projected 前算
         qty = self.entry_qty_sz
+        position_pct = self.entry_position_pct
         self.realized_pnl_usd += pnl
         self.unrealized_usd = 0.0
         self.projected = "flat"
         self.entry_qty_sz = 0.0
+        self.entry_position_pct = None
         cl_ord_id, ord_id = self._order_ids(result)
         trade = self._make_trade(ts, "close", ref_px, qty, pnl=pnl, pnl_pct=pnl_pct,
                                  reason=reason, explain=explain, cl_ord_id=cl_ord_id,
-                                 ord_id=ord_id)
+                                 ord_id=ord_id, position_pct=position_pct)
         self.trades.append(trade)
         return [{"type": "trade", "data": trade}]
 
@@ -236,6 +247,7 @@ class LiveExecutor:
         self.unrealized_usd = 0.0
         self.projected = "flat"
         self.entry_qty_sz = 0.0
+        self.entry_position_pct = None
         return events + [self._status_event("标的已在交易所侧平仓（OCO 触发），自管持仓归 flat")]
 
     async def _confirm_net_cleared(self) -> bool:
@@ -273,6 +285,7 @@ class LiveExecutor:
             self.unrealized_usd = 0.0
             self.projected = "flat"
             self.entry_qty_sz = 0.0
+            self.entry_position_pct = None
             events.append(self._status_event("持仓已在交易所侧平仓 / 外部干预，已校正为 flat"))
         return events
 
@@ -343,11 +356,34 @@ class LiveExecutor:
         return getattr(self, "_bar_cursor", self.entry_bar)
 
     def _compute_sz(self, strength: float, ref_px: float) -> float:
+        values = (strength, ref_px, self.ct_val, self.budget_usd, self.leverage)
+        if not all(math.isfinite(value) for value in values):
+            return 0.0
         if ref_px <= 0 or self.ct_val <= 0:
             return 0.0
         target_notional = max(0.0, min(strength, 1.0)) * self.budget_usd * self.leverage
+        if not math.isfinite(target_notional):
+            return 0.0
         raw = target_notional / (self.ct_val * ref_px)
+        if not math.isfinite(raw):
+            return 0.0
         return snap_size(raw, self.lot_sz)
+
+    @staticmethod
+    def _position_pct_for_size(*, sz: float, ct_val: float,
+                               reference_price: float, member_budget_usd: float,
+                               leverage: float) -> float | None:
+        values = (sz, ct_val, reference_price, member_budget_usd, leverage)
+        if not all(math.isfinite(value) and value > 0 for value in values):
+            return None
+        order_notional = sz * ct_val * reference_price
+        budget_margin = order_notional / leverage
+        if not math.isfinite(order_notional) or not math.isfinite(budget_margin):
+            return None
+        position_pct = budget_margin / member_budget_usd
+        if not math.isfinite(position_pct):
+            return None
+        return max(0.0, min(position_pct, 1.0))
 
     def _risk_trigger_px(self, side: str, fill: float) -> tuple[float | None, float | None]:
         """策略风控 pct → 交易所侧 OCO 触发价（多空对称，对齐 SimBroker._open_risk_snapshot）。"""
@@ -404,7 +440,7 @@ class LiveExecutor:
                     reason: str, pnl_pct: float | None = None, tp: float | None = None,
                     sl: float | None = None, explain: dict | None = None,
                     cl_ord_id: str | None = None, ord_id: str | None = None,
-                    seeded: bool = False) -> dict:
+                    seeded: bool = False, position_pct: float | None = None) -> dict:
         position_after = sz if side == "long" else (-sz if side == "short" else 0.0)
         trade = {"ts": int(ts), "side": side, "price": float(price), "qty": float(sz),
                  "fee": 0.0, "pnl": float(pnl), "positionAfter": position_after,
@@ -416,6 +452,8 @@ class LiveExecutor:
         # pnlPct 为平仓派生收益率（开仓 / 退化断面省略键，与 clOrdId/ordId 同样的「缺失即省略」风格）。
         if pnl_pct is not None:
             trade["pnlPct"] = float(pnl_pct)
+        if position_pct is not None and math.isfinite(position_pct):
+            trade["positionPct"] = float(position_pct)
         # clOrdId / ordId 为 best-effort 可选（开仓取 _place_order 回执、平仓取 result.clOrdId）：
         # 缺失即省略键，绝不阻塞 trade / explain（P1-2）。
         if cl_ord_id:
@@ -467,7 +505,8 @@ class LiveExecutor:
                 pos_side=self.projected, source=source, entry_price=self.entry_price,
                 exit_price=ref_px, pnl=pnl)
             trade = self._make_trade(ts, "close", ref_px, self.entry_qty_sz, pnl=pnl,
-                                     pnl_pct=pnl_pct, reason="external_close", explain=explain)
+                                     pnl_pct=pnl_pct, reason="external_close", explain=explain,
+                                     position_pct=self.entry_position_pct)
             self.trades.append(trade)
             return [{"type": "trade", "data": trade}]
         except Exception:  # noqa: BLE001 —— 合成失败回落原 status，绝不影响 reconcile / flatten 主流程

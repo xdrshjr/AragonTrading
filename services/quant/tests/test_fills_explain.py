@@ -32,16 +32,21 @@ def _explain(*, cl_ord_id: str = "aragonX", ord_id: str = "ord-1",
     return explain
 
 
-def _trade(explain: dict | None) -> SimpleNamespace:
-    """轻量 trade 桩：index_trade_explains 仅经 getattr 读 explain_json。"""
+def _trade(
+    explain: dict | None,
+    *,
+    position_pct: float | None = None,
+    qty: float = 0.05,
+) -> SimpleNamespace:
+    """轻量 trade 桩：索引只经 getattr 读取解释与仓位快照字段。"""
     raw = json.dumps(explain, ensure_ascii=False) if explain is not None else None
-    return SimpleNamespace(explain_json=raw)
+    return SimpleNamespace(explain_json=raw, position_pct=position_pct, qty=qty)
 
 
 def test_index_maps_both_clordid_and_ordid_to_same_explain():
     explain = _explain(cl_ord_id="aragonA", ord_id="ord-A")
     index = index_trade_explains([_trade(explain)])
-    assert index["aragonA"]["headline"] == "复合得分多头"
+    assert index["aragonA"]["explain"]["headline"] == "复合得分多头"
     assert index["ord-A"] is index["aragonA"]
 
 
@@ -50,7 +55,7 @@ def test_index_keeps_newest_on_duplicate_key():
     newest = _trade(_explain(cl_ord_id="dup", ord_id="o-new", headline="NEW"))
     older = _trade(_explain(cl_ord_id="dup", ord_id="o-old", headline="OLD"))
     index = index_trade_explains([newest, older])
-    assert index["dup"]["headline"] == "NEW"
+    assert index["dup"]["explain"]["headline"] == "NEW"
 
 
 def test_index_skips_bad_json_empty_and_missing_meta():
@@ -72,26 +77,31 @@ def _fill(**over) -> dict:
 
 
 def test_attach_hits_by_clordid_primary():
-    index = {"aragonA": _explain(cl_ord_id="aragonA")}
+    index = {"aragonA": {"explain": _explain(cl_ord_id="aragonA"),
+                         "positionPct": None, "orderQty": 0.05}}
     out = attach_explains([_fill()], index)
     assert out[0]["explain"]["kind"] == "factor_score"
 
 
 def test_attach_falls_back_to_ordid_secondary():
     """clOrdId 不中、ordId 中 → 走副键命中（覆盖市价平仓 clOrdId 为空场景的反向亦然）。"""
-    index = {"ord-1": _explain(ord_id="ord-1")}
+    index = {"ord-1": {"explain": _explain(ord_id="ord-1"),
+                       "positionPct": None, "orderQty": 0.05}}
     out = attach_explains([_fill(clOrdId="")], index)
     assert out[0]["explain"] is not None
 
 
 def test_attach_leaves_none_when_no_match():
-    out = attach_explains([_fill(clOrdId="nope", ordId="nope")], {"other": _explain()})
+    payload = {"explain": _explain(), "positionPct": None, "orderQty": 0.05}
+    out = attach_explains([_fill(clOrdId="nope", ordId="nope")], {"other": payload})
     assert out[0]["explain"] is None
+    assert out[0]["positionPct"] is None
 
 
 def test_attach_shares_explain_across_partial_fills():
     """同 clOrdId 的两条 partial fill → 都挂同一 explain（语义：同单多成交同因）。"""
-    index = {"aragonA": _explain(cl_ord_id="aragonA")}
+    index = {"aragonA": {"explain": _explain(cl_ord_id="aragonA"),
+                         "positionPct": None, "orderQty": 0.05}}
     out = attach_explains([_fill(tradeId="t-1"), _fill(tradeId="t-2", fillSz=0.02)], index)
     assert out[0]["explain"] is not None and out[1]["explain"] is not None
 
@@ -100,6 +110,55 @@ def test_attach_does_not_mutate_input_fills():
     original = _fill()
     attach_explains([original], {})
     assert "explain" not in original
+
+
+def test_index_and_attach_position_pct_without_explain():
+    trade = _trade(
+        {"meta": {"clOrdId": "pct-only", "ordId": "ord-pct"}},
+        position_pct=0.4,
+        qty=0.05,
+    )
+
+    index = index_trade_explains([trade])
+    out = attach_explains([_fill(clOrdId="pct-only", fillSz=0.05)], index)
+
+    assert out[0]["explain"] is None
+    assert out[0]["positionPct"] == 0.4
+
+
+def test_partial_fills_split_order_position_pct_by_fill_size():
+    payload = {"explain": None, "positionPct": 0.4, "orderQty": 0.05}
+    fills = [
+        _fill(tradeId="part-1", fillSz=0.015),
+        _fill(tradeId="part-2", fillSz=0.035),
+    ]
+
+    out = attach_explains(fills, {"aragonA": payload})
+
+    assert out[0]["positionPct"] == 0.12
+    assert out[1]["positionPct"] == 0.28
+    assert sum(row["positionPct"] for row in out) == 0.4
+
+
+def test_incomplete_and_oversized_fills_are_bounded_by_order_pct():
+    payload = {"explain": None, "positionPct": 0.4, "orderQty": 0.05}
+    partial = attach_explains([_fill(fillSz=0.01)], {"aragonA": payload})[0]
+    oversized = attach_explains([_fill(fillSz=0.5)], {"aragonA": payload})[0]
+
+    assert partial["positionPct"] == 0.08
+    assert oversized["positionPct"] == 0.4
+
+
+def test_bad_position_values_degrade_to_none_without_losing_explain():
+    explain = _explain(cl_ord_id="aragonA")
+    for payload, fill in [
+        ({"explain": explain, "positionPct": float("nan"), "orderQty": 0.05}, _fill()),
+        ({"explain": explain, "positionPct": 0.4, "orderQty": 0.0}, _fill()),
+        ({"explain": explain, "positionPct": 0.4, "orderQty": 0.05}, _fill(fillSz=float("inf"))),
+    ]:
+        out = attach_explains([fill], {"aragonA": payload})[0]
+        assert out["positionPct"] is None
+        assert out["explain"] == explain
 
 
 # ============================ _normalize_fill 连接键回带 ============================
@@ -161,12 +220,14 @@ def _fake_fetch(fills: list[dict]):
     return _inner
 
 
-async def _seed_explained_trade(*, cl_ord_id: str, ts: int, ord_id: str = "ord-1") -> None:
+async def _seed_explained_trade(*, cl_ord_id: str, ts: int, ord_id: str = "ord-1",
+                                position_pct: float | None = None) -> None:
     sm = get_sessionmaker()
     explain = _explain(cl_ord_id=cl_ord_id, ord_id=ord_id)
     async with sm() as session:
         session.add(Trade(run_id=1, ts=ts, side="long", price=64000.0, qty=0.03, fee=0.0,
                           pnl=0.0, position_after=0.03, reason="factor_score",
+                          position_pct=position_pct,
                           explain_json=json.dumps(explain, ensure_ascii=False)))
         await session.commit()
 
@@ -186,7 +247,8 @@ async def test_endpoint_joins_explain_across_one_bar_period_gap(monkeypatch):
     fill_ts = 1_751_200_000
     monkeypatch.setattr("app.api.trading.fetch_live_fills",
                         _fake_fetch([_fill_row(ts=fill_ts, clOrdId="aragonjoin")]))
-    await _seed_explained_trade(cl_ord_id="aragonjoin", ts=fill_ts - 900)
+    await _seed_explained_trade(cl_ord_id="aragonjoin", ts=fill_ts - 900,
+                                position_pct=0.4)
     try:
         async with await _client(app) as client:
             await _seed_account(client)
@@ -196,6 +258,7 @@ async def test_endpoint_joins_explain_across_one_bar_period_gap(monkeypatch):
             assert len(fills) == 1
             assert fills[0]["explain"] is not None
             assert fills[0]["explain"]["kind"] == "factor_score"
+            assert fills[0]["positionPct"] == 0.4
             # 解释富化不得回显凭证（沿用 explain 不含凭证不变量）。
             assert "test-sk-demo-secret-0001" not in r.text
             assert "test-pp-123456" not in r.text

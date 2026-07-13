@@ -6,7 +6,7 @@ import type { AiTradeGroupState } from "@/lib/aiTradeTypes";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
 import type { AiTradeHistoryDetailOut, AiTradeHistoryListOut } from "@/lib/aiTradeHistoryTypes";
 import { useAppStore } from "@/lib/store";
-import type { Trade } from "@/lib/types";
+import type { PaperPositionEvent, Trade } from "@/lib/types";
 import AiTradeStatsPanel from "./AiTradeStatsPanel";
 
 vi.mock("@/lib/aiTradeHistoryApi", () => ({
@@ -28,7 +28,16 @@ function trade(o: Partial<Trade> & Pick<Trade, "ts" | "side">): Trade {
 }
 
 // 单成员组：15 天前亏 4、10 分钟前盈 12；当前持仓浮盈由 position.unrealizedPnl 提供（可覆盖）。
-function makeGroup(position: unknown = { side: "long", unrealizedPnl: 7 }): AiTradeGroupState {
+function makeGroup(
+  position: Partial<PaperPositionEvent> | null = { side: "long", unrealizedPnl: 7 },
+): AiTradeGroupState {
+  const runtimePosition: PaperPositionEvent | null = position
+    ? {
+        side: "long", size: 1, avgEntry: 100, markPrice: 100,
+        ...position,
+        unrealizedPnl: position.unrealizedPnl as number,
+      }
+    : null;
   return {
     groupId: "g1", bar: "1H", strategyIds: [1], strategyNames: ["动量"],
     totalBudgetUsd: 100, leverage: 3, contextRefreshRounds: 10, state: "running",
@@ -36,7 +45,7 @@ function makeGroup(position: unknown = { side: "long", unrealizedPnl: 7 }): AiTr
     members: {
       "BTC-USDT-SWAP": {
         instId: "BTC-USDT-SWAP", sessionId: "s1", allocationPct: 100, session: null,
-        position, decisions: [], traces: [], summary: null,
+        position: runtimePosition, decisions: [], traces: [], summary: null,
         trades: [
           trade({ id: 1, ts: NOW_SEC - 15 * DAY - 100, side: "long", price: 100 }),
           trade({ id: 2, ts: NOW_SEC - 15 * DAY, side: "close", price: 96, pnl: -4, pnlPct: -0.12 }),

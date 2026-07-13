@@ -789,7 +789,7 @@ def _parse_explain(raw: str | None) -> dict | None:
         parsed = json.loads(raw)
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
-    return parsed if isinstance(parsed, dict) else None
+    return parsed if isinstance(parsed, dict) and parsed.get("kind") else None
 
 
 def trade_out(t: Trade) -> dict:
@@ -799,6 +799,7 @@ def trade_out(t: Trade) -> dict:
         "reason": t.reason, "stopLossPct": t.stop_loss_pct,
         "takeProfitPct": t.take_profit_pct, "maxHoldBars": t.max_hold_bars,
         "stopLossPrice": t.stop_loss_price, "takeProfitPrice": t.take_profit_price,
+        "positionPct": getattr(t, "position_pct", None),
         # explain 键恒在（缺列 / 坏 JSON → None），与既有恒含全键风格一致（§5.2 / P2-6）。
         "explain": _parse_explain(getattr(t, "explain_json", None)),
     }
@@ -1193,6 +1194,7 @@ class LiveFill(BaseModel):
     tradeId: str | None = None       # OKX 每笔成交唯一 id（前端行 key / 展开态身份，RV2）
     clOrdId: str | None = None       # OKX 回带（自动交易为 aragon/aragonc 前缀；手动/外部可能为空）
     explain: dict | None = None      # 命中自动交易触发解释时存在（TriggerExplain，§五）
+    positionPct: float | None = None # 该真实 fill 分摊到的自动订单仓位比例（fraction）
 
 
 class LiveFillsOut(BaseModel):

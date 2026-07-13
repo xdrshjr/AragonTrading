@@ -81,7 +81,8 @@ export interface LiveFill {
   ordId: string;
   tradeId?: string; // OKX 每笔成交唯一 id（行 key / 展开态身份，RV2）
   clOrdId?: string; // OKX 回带（自动交易为 aragon/aragonc 前缀）
-  explain?: TriggerExplain; // 命中自动交易触发解释时存在（live-fills-explainability）
+  explain?: TriggerExplain | null; // 命中自动交易触发解释时存在（live-fills-explainability）
+  positionPct?: number | null; // 当前真实 fill 分摊到的自动订单仓位比例（fraction）
 }
 
 export type LivePosition = OkxAccountPosition; // 复用 accountTypes（spec §5.2）

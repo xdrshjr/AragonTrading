@@ -1,6 +1,6 @@
 // AI 自动交易 wire 类型（camelCase，与后端 schemas.py 的 AiTrade* 同构）。
 // 运行期句柄（sessionId 等）为瞬态（store 不入 partialize）；aiTradeConfig 为持久化偏好。
-import type { Trade } from "./types";
+import type { PaperPositionEvent, Trade } from "./types";
 
 export type AiTradeAction = "open_long" | "open_short" | "close" | "hold";
 export type AiStance = "long" | "short" | "flat";
@@ -259,7 +259,7 @@ export interface AiTradeStopResult {
 export interface AiTradeSnapshot {
   trades: Trade[];
   equity: unknown[];
-  position: unknown | null;
+  position: PaperPositionEvent | null;
   status: AiTradeStatusEvent;
   decisions: AiTradeDecision[];
   contextSummary: string | null;
@@ -336,7 +336,7 @@ export interface AiTradeGroupMemberState {
   allocationPct: number;
   session: AiTradeSessionRow | null;   // 会话只读视图（info + WS status/decision/summary 增量合并）
   trades: Trade[];
-  position: unknown | null;
+  position: PaperPositionEvent | null;
   decisions: AiTradeDecision[];
   traces: AiTradeRoundTrace[];
   summary: string | null;

@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from app.agent.llm.base import StreamEvent
 from app.ai_auto.decider import AiTradeDecider
 from app.ai_auto.session import AiTradeSession
@@ -150,6 +152,30 @@ async def test_first_candle_triggers_decision_and_opens():
         assert session.executor.projected == "long"
         assert len(calls["orders"]) == 1
         assert session.rounds_completed == 1
+    finally:
+        await dispose_engine()
+
+
+async def test_ai_size_fraction_reaches_trade_position_and_snapshot():
+    await init_db()
+    session, _, _ = _make_session(action="open_long", size=0.4)
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+
+        events = _drain(q)
+        trade = next(event["data"] for event in events if event["type"] == "trade")
+        position = next(event["data"] for event in events if event["type"] == "position")
+        snapshot = session.snapshot()
+
+        assert trade["positionPct"] == pytest.approx(position["positionPct"])
+        assert snapshot["trades"][-1]["positionPct"] == pytest.approx(
+            trade["positionPct"]
+        )
+        assert snapshot["position"]["positionPct"] == pytest.approx(
+            trade["positionPct"]
+        )
     finally:
         await dispose_engine()
 

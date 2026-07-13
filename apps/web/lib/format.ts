@@ -1,7 +1,7 @@
 // 数字 / 时间 / 百分比格式化 (spec §8.2)。
 
 export function fmtPct(v: number | null | undefined, digits = 2): string {
-  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  if (v === null || v === undefined || !Number.isFinite(v)) return "—";
   return `${(v * 100).toFixed(digits)}%`;
 }
 

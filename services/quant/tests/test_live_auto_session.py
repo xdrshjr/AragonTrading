@@ -115,6 +115,30 @@ async def test_first_live_candle_triggers_open():
         await dispose_engine()
 
 
+async def test_trade_position_and_snapshot_preserve_position_pct():
+    await init_db()
+    session, _, _ = _make_session({1: [Signal(side="long", strength=0.4)]})
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await session.feed_candle(_candle(1))
+
+        events = _drain(q)
+        trade = next(event["data"] for event in events if event["type"] == "trade")
+        position = next(event["data"] for event in events if event["type"] == "position")
+        snapshot = session.snapshot()
+
+        assert trade["positionPct"] == pytest.approx(position["positionPct"])
+        assert snapshot["trades"][-1]["positionPct"] == pytest.approx(
+            trade["positionPct"]
+        )
+        assert snapshot["position"]["positionPct"] == pytest.approx(
+            trade["positionPct"]
+        )
+    finally:
+        await dispose_engine()
+
+
 async def test_reconcile_corrects_projected_to_flat():
     await init_db()
     session, calls, pos_state = _make_session({1: [Signal(side="long")]})

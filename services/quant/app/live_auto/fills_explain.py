@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:        # 仅类型标注用，避免运行期反依赖 db.models（RV4）
@@ -25,7 +26,7 @@ def _safe_parse_explain(raw: str | None) -> dict | None:
 
 
 def index_trade_explains(trades: list[Trade]) -> dict[str, dict]:
-    """按 clOrdId / ordId 把「带解释的 trade」建成 {key: explain} 索引。
+    """按 clOrdId / ordId 建立成交注解索引。
 
     同键保留最新（输入须按 ts 倒序，遇已存在键则跳过）；空键 / 坏 JSON / 无 meta 安全跳过。
     """
@@ -35,16 +36,45 @@ def index_trade_explains(trades: list[Trade]) -> dict[str, dict]:
         if explain is None:
             continue
         meta = explain.get("meta") or {}
+        payload = {
+            "explain": explain if explain.get("kind") else None,
+            "positionPct": getattr(trade, "position_pct", None),
+            "orderQty": getattr(trade, "qty", None),
+        }
         for key in (meta.get("clOrdId"), meta.get("ordId")):
             if key and key not in index:
-                index[key] = explain
+                index[key] = payload
     return index
 
 
 def attach_explains(fills: list[dict], index: dict[str, dict]) -> list[dict]:
-    """逐 fill：clOrdId 主、ordId 副命中则挂 explain，未中置 None；返回新列表（不就地改）。"""
+    """关联解释，并按真实 fill 数量分摊整单仓位比例。"""
     out: list[dict] = []
     for fill in fills:
-        explain = index.get(fill.get("clOrdId") or "") or index.get(fill.get("ordId") or "")
-        out.append({**fill, "explain": explain})
+        payload = index.get(fill.get("clOrdId") or "") or index.get(fill.get("ordId") or "")
+        out.append({
+            **fill,
+            "explain": payload.get("explain") if payload else None,
+            "positionPct": _fill_position_pct(fill, payload),
+        })
     return out
+
+
+def _fill_position_pct(fill: dict, payload: dict | None) -> float | None:
+    if payload is None:
+        return None
+    try:
+        order_pct = float(payload.get("positionPct"))
+        order_qty = float(payload.get("orderQty"))
+        fill_sz = float(fill.get("fillSz"))
+    except (TypeError, ValueError):
+        return None
+    values = (order_pct, order_qty, fill_sz)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    if not 0 <= order_pct <= 1 or order_qty <= 0 or fill_sz <= 0:
+        return None
+    allocated = order_pct * fill_sz / order_qty
+    if not math.isfinite(allocated):
+        return None
+    return max(0.0, min(allocated, order_pct))

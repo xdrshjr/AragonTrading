@@ -46,6 +46,7 @@ function factorFill(over: Partial<LiveFill> = {}): LiveFill {
     ordId: "1234567890",
     tradeId: "tid-1",
     clOrdId: "aragon18f3a2b1c004",
+    positionPct: 0.12,
     explain: factorExplain(),
     ...over,
   };
@@ -70,6 +71,8 @@ afterEach(cleanup);
 describe("FillsTableView — expand / collapse", () => {
   it("renders an explain fill collapsed with its trigger-kind badge by default", () => {
     render(<FillsTableView fills={[factorFill()]} />);
+    expect(screen.getByText("仓位占比")).toBeTruthy();
+    expect(screen.getByText("12.00%")).toBeTruthy();
     const toggle = screen.getByRole("button", { expanded: false });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     expect(screen.getByText("因子组合")).toBeTruthy();
@@ -85,11 +88,21 @@ describe("FillsTableView — expand / collapse", () => {
     expect(screen.getByText(/因子组合复合得分触发/)).toBeTruthy();
     expect(screen.getByText("动量 ROC")).toBeTruthy();
     expect(screen.getByText(/因子归因/)).toBeTruthy();
+    expect(screen.getByText(/因子组合复合得分触发/).closest("td")?.getAttribute("colspan")).toBe("7");
   });
 
   it("renders a fill without explain as a plain '手动' row that is not expandable", () => {
     render(<FillsTableView fills={[manualFill()]} />);
     expect(screen.getByText("手动")).toBeTruthy();
+    expect(screen.getByText("—")).toBeTruthy();
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("labels a position-percentage-only fill as automatic without making it expandable", () => {
+    render(<FillsTableView fills={[manualFill({ positionPct: 0.08 })]} />);
+    expect(screen.getByText("自动")).toBeTruthy();
+    expect(screen.queryByText("手动")).toBeNull();
+    expect(screen.getByText("8.00%")).toBeTruthy();
     expect(screen.queryByRole("button")).toBeNull();
   });
 });

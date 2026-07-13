@@ -5,13 +5,13 @@ import clsx from "clsx";
 import { useState, type KeyboardEvent } from "react";
 import TradeExplainDetail from "@/components/Strategy/TradeExplainDetail";
 import { Badge } from "@/components/ui";
-import { fmtNum, fmtPrice, fmtTime } from "@/lib/format";
+import { fmtNum, fmtPct, fmtPrice, fmtTime } from "@/lib/format";
 import { explainKindLabel, explainKindTone } from "@/lib/tradeExplain";
 import { tradingApi } from "@/lib/tradingApi";
 import type { LiveFill } from "@/lib/tradingTypes";
 
-// chevron + 时间 + 方向 + 成交价 + 数量 + 手续费（展开行 colSpan 用）。
-const COL_COUNT = 6;
+// chevron + 时间 + 方向 + 成交价 + 数量 + 仓位占比 + 手续费（展开行 colSpan 用）。
+const COL_COUNT = 7;
 
 // 实盘成交表（§4.5 / live-fills-explainability §2.5）：8s 轮询真实 OKX 成交明细，自动交易成交可
 // 逐行展开查看触发原因；鉴权失败显式错误态，绝不假数据（C1）。
@@ -77,6 +77,7 @@ export function FillsTableView({ fills }: { fills: LiveFill[] }) {
           <th className="py-1.5 pr-2 font-medium">方向</th>
           <th className="py-1.5 pr-2 text-right font-medium">成交价</th>
           <th className="py-1.5 pr-2 text-right font-medium">数量</th>
+          <th className="py-1.5 pr-2 text-right font-medium">仓位占比</th>
           <th className="py-1.5 text-right font-medium">手续费</th>
         </tr>
       </thead>
@@ -103,6 +104,10 @@ function FillRow({
 }) {
   const isBuy = fill.side === "buy";
   const explain = fill.explain;
+  const hasPositionPct = fill.positionPct != null
+    && Number.isFinite(fill.positionPct)
+    && fill.positionPct >= 0
+    && fill.positionPct <= 1;
   const onKeyDown = (e: KeyboardEvent<HTMLTableRowElement>) => {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
@@ -128,11 +133,12 @@ function FillRow({
         <td className="py-1.5 pr-2">
           <div className="flex flex-col items-start gap-0.5">
             <Badge tone={isBuy ? "long" : "short"}>{isBuy ? "买入" : "卖出"}</Badge>
-            <KindTag explain={explain} />
+            <KindTag explain={explain} automatic={hasPositionPct} />
           </div>
         </td>
         <td className="py-1.5 pr-2 text-right tabular">{fmtPrice(fill.fillPx)}</td>
         <td className="py-1.5 pr-2 text-right tabular">{fmtNum(fill.fillSz, 4)}</td>
+        <td className="py-1.5 pr-2 text-right tabular">{fmtPct(fill.positionPct)}</td>
         <td className="py-1.5 text-right tabular text-[var(--muted)]">{fmtNum(fill.fee, 4)}</td>
       </tr>
       {explain && open && (
@@ -146,12 +152,15 @@ function FillRow({
   );
 }
 
-/** 触发类别角标：有 explain → 按 kind 标签 + 色调；无 explain → 诚实标「手动」淡色标签。 */
-function KindTag({ explain }: { explain?: LiveFill["explain"] }) {
+/** 有解释时展示触发类型；仅有关联仓位比例时仍应标为自动成交，而不是误标手动。 */
+function KindTag({ explain, automatic }: {
+  explain?: LiveFill["explain"];
+  automatic: boolean;
+}) {
   if (!explain) {
     return (
       <span className="rounded bg-[var(--surface-2)] px-1 py-px text-[9px] text-[var(--muted)]">
-        手动
+        {automatic ? "自动" : "手动"}
       </span>
     );
   }

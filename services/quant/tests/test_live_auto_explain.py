@@ -124,20 +124,28 @@ async def test_reverse_close_has_reverse_explain_and_open_keeps_signal_explain()
 
 async def test_session_stop_close_via_flatten_has_session_stop_explain():
     ex, _ = _make_executor()
-    await ex.apply([Signal(side="long")], ref_px=_REF_PX, bar_index=0, ts=1000)
+    opened = _trade_events(
+        await ex.apply([Signal(side="long", strength=0.4)],
+                       ref_px=_REF_PX, bar_index=0, ts=1000)
+    )[0]["data"]
     result = await ex.flatten(_REF_PX, ts=2000)
     trade = result["trade"]
     assert trade is not None
     assert trade["explain"]["kind"] == "session_stop"
     assert trade["side"] == "close"
     assert trade["reason"] == "session_stop"
+    assert trade["positionPct"] == pytest.approx(opened["positionPct"])
+    assert ex.entry_position_pct is None
 
 
 # ------------------------------ external_close（v2 合成成交） ------------------------------
 async def test_external_close_synthesized_on_reconcile_without_any_orders():
     """_on_reconcile_ok 侦测持仓归零：产生且仅产生一条 external_close 成交，且不调用 place/close 桩。"""
     ex, calls = _make_executor()
-    await ex.apply([Signal(side="long")], ref_px=_REF_PX, bar_index=0, ts=1000)
+    opened = _trade_events(
+        await ex.apply([Signal(side="long", strength=0.4)],
+                       ref_px=_REF_PX, bar_index=0, ts=1000)
+    )[0]["data"]
     orders_before, closes_before = len(calls["orders"]), len(calls["closes"])
 
     async def flat_positions():
@@ -148,7 +156,9 @@ async def test_external_close_synthesized_on_reconcile_without_any_orders():
     ext = [e for e in _trade_events(events) if e["data"]["explain"]["kind"] == "external_close"]
     assert len(ext) == 1
     assert ext[0]["data"]["side"] == "close"
+    assert ext[0]["data"]["positionPct"] == pytest.approx(opened["positionPct"])
     assert ex.projected == "flat"
+    assert ex.entry_position_pct is None
     assert len(calls["orders"]) == orders_before    # 仅读持仓合成只读成交，绝不下单
     assert len(calls["closes"]) == closes_before
 
@@ -156,13 +166,18 @@ async def test_external_close_synthesized_on_reconcile_without_any_orders():
 async def test_external_close_synthesized_on_benign_oco_close():
     """_settle_benign_close（LIVE_NO_POSITION）：合成 external_close，且合成本身不新增下单。"""
     ex, calls = _make_executor(raise_on_close=OKXPrivateError("LIVE_NO_POSITION", "无可平持仓"))
-    await ex.apply([Signal(side="long")], ref_px=_REF_PX, bar_index=0, ts=1000)
+    opened = _trade_events(
+        await ex.apply([Signal(side="long", strength=0.4)],
+                       ref_px=_REF_PX, bar_index=0, ts=1000)
+    )[0]["data"]
     orders_before = len(calls["orders"])
     events = await ex.apply([Signal(side="close")], ref_px=_REF_PX, bar_index=1, ts=2000)
     ext = [e for e in _trade_events(events) if e["data"]["explain"]["kind"] == "external_close"]
     assert len(ext) == 1
     assert ext[0]["data"]["side"] == "close"
+    assert ext[0]["data"]["positionPct"] == pytest.approx(opened["positionPct"])
     assert ex.projected == "flat"
+    assert ex.entry_position_pct is None
     assert len(calls["orders"]) == orders_before    # 合成只记录已发生平仓，绝不新增下单
     assert not [e for e in events if e["type"] == "error"]
 
@@ -211,7 +226,7 @@ async def test_append_live_trade_persists_explain_and_round_trips_through_trade_
             run_id = run.id
         trade = {"ts": 1000, "side": "long", "price": 30000.0, "qty": 0.03, "fee": 0.0,
                  "pnl": 0.0, "positionAfter": 0.03, "reason": "复合得分多头",
-                 "explain": _factor_explain("long")}
+                 "positionPct": 0.4, "explain": _factor_explain("long")}
         async with sm() as s:
             await repo.append_live_trade(s, run_id, trade)
         # 另开 session 读回 —— 若仅 flush 未 commit，这里将读不到（钉死 R12）。
@@ -221,6 +236,8 @@ async def test_append_live_trade_persists_explain_and_round_trips_through_trade_
             out = trade_out(rows[0])
             assert out["explain"]["kind"] == "factor_score"
             assert out["explain"]["factors"][0]["factorKey"] == "mom_roc"
+            assert rows[0].position_pct == pytest.approx(0.4)
+            assert out["positionPct"] == pytest.approx(0.4)
     finally:
         await dispose_engine()
 
@@ -243,6 +260,47 @@ async def test_append_live_trade_ignores_pnl_pct_key_without_regression():
         async with sm() as s:
             rows = await repo.list_trades(s, run_id)
             assert len(rows) == 1 and rows[0].pnl == pytest.approx(19.05)
+    finally:
+        await dispose_engine()
+
+
+async def test_append_live_trade_keeps_join_ids_when_explain_is_missing():
+    await init_db()
+    try:
+        sm = get_sessionmaker()
+        async with sm() as s:
+            run = await repo.create_run(
+                s,
+                strategy_id=1,
+                inst_id="BTC-USDT-SWAP",
+                bar="1H",
+                mode="live-auto",
+                config={"mode": "live-auto"},
+            )
+            run_id = run.id
+        trade = {
+            "ts": 3000,
+            "side": "long",
+            "price": 30000.0,
+            "qty": 0.05,
+            "fee": 0.0,
+            "pnl": 0.0,
+            "positionAfter": 0.05,
+            "positionPct": 0.4,
+            "reason": "signal_open",
+            "clOrdId": "pct-only",
+            "ordId": "ord-pct",
+            "explain": None,
+        }
+        async with sm() as s:
+            await repo.append_live_trade(s, run_id, trade)
+        async with sm() as s:
+            rows = await repo.list_explained_trades(s)
+            row = next(item for item in rows if item.run_id == run_id)
+            stored = json.loads(row.explain_json)
+            assert stored["meta"]["clOrdId"] == "pct-only"
+            assert trade_out(row)["explain"] is None
+            assert trade_out(row)["positionPct"] == pytest.approx(0.4)
     finally:
         await dispose_engine()
 

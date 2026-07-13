@@ -7,6 +7,12 @@ describe("format utils", () => {
     expect(fmtPct(undefined)).toBe("—");
   });
 
+  it("fmtPct rejects every non-finite value", () => {
+    expect(fmtPct(Number.NaN)).toBe("—");
+    expect(fmtPct(Number.POSITIVE_INFINITY)).toBe("—");
+    expect(fmtPct(Number.NEGATIVE_INFINITY)).toBe("—");
+  });
+
   it("signed prefixes positives with +", () => {
     expect(signed(1.5)).toBe("+1.50");
     expect(signed(-2)).toBe("-2.00");

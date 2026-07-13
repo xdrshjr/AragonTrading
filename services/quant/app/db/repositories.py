@@ -9,7 +9,7 @@ import math
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import delete, insert, select
+from sqlalchemy import delete, insert, or_, select
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -245,12 +245,15 @@ async def list_trades(session: AsyncSession, run_id: int, limit: int = 200,
 
 async def list_explained_trades(session: AsyncSession, *, since_ts: int | None = None,
                                 limit: int = 1000) -> list[Trade]:
-    """取「带解释」的 trade 行（explain_json 非空、可选 ts>=since_ts、按 ts 倒序限量）。
+    """取带成交注解的 trade 行（解释或仓位比例任一存在）。
 
     供实盘成交记录富化用（live-fills-explainability §2.3）：只回带自动交易解释行，自然排除
     回测 / 无解释行；``since_ts`` 把扫描收敛到当前 fills 时间窗内，单查询、小结果集。
     """
-    stmt = select(Trade).where(Trade.explain_json.is_not(None))
+    stmt = select(Trade).where(or_(
+        Trade.explain_json.is_not(None),
+        Trade.position_pct.is_not(None),
+    ))
     if since_ts is not None:
         stmt = stmt.where(Trade.ts >= since_ts)
     stmt = stmt.order_by(Trade.ts.desc()).limit(limit)
@@ -280,6 +283,13 @@ async def append_live_trade(session: AsyncSession, run_id: int, trade: dict) -> 
     刷新后历史触发丢失（R12）。调用方（session._persist_trade）已 try/except 兜底，落库失败不阻塞交易。
     """
     explain = trade.get("explain")
+    if explain is None and (trade.get("clOrdId") or trade.get("ordId")):
+        # 仓位比例不依赖触发解释；仍复用既有 JSON 列保留 fill 关联键。
+        # schemas.trade_out 会把这种仅含 meta 的内部信封隐藏为 explain=null。
+        explain = {"meta": {
+            "clOrdId": trade.get("clOrdId"),
+            "ordId": trade.get("ordId"),
+        }}
     explain_json = json.dumps(explain, ensure_ascii=False) if explain is not None else None
     session.add(Trade(
         run_id=run_id, ts=int(trade.get("ts", 0)), side=str(trade.get("side", "")),
@@ -289,7 +299,8 @@ async def append_live_trade(session: AsyncSession, run_id: int, trade: dict) -> 
         reason=str(trade.get("reason", ""))[:64],
         stop_loss_pct=trade.get("stopLossPct"), take_profit_pct=trade.get("takeProfitPct"),
         max_hold_bars=trade.get("maxHoldBars"), stop_loss_price=trade.get("stopLossPrice"),
-        take_profit_price=trade.get("takeProfitPrice"), explain_json=explain_json))
+        take_profit_price=trade.get("takeProfitPrice"),
+        position_pct=trade.get("positionPct"), explain_json=explain_json))
     await session.commit()
 
 

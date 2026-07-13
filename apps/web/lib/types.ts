@@ -307,6 +307,8 @@ export interface Trade {
   pnl: number;
   // 平仓收益率（已实现盈亏 / 开仓占用保证金）。仅实盘自动交易平仓携带；开仓 / 回测 / 模拟成交无此字段。
   pnlPct?: number | null;
+  // 本次自动订单按成员最终预算折算的仓位比例（fraction）。
+  positionPct?: number | null;
   stopLossPct?: number | null;
   takeProfitPct?: number | null;
   maxHoldBars?: number | null;
@@ -356,6 +358,7 @@ export interface PaperPositionEvent {
   avgEntry: number;
   markPrice: number;
   unrealizedPnl: number;
+  positionPct?: number | null;
 }
 
 export interface PaperStatus {
