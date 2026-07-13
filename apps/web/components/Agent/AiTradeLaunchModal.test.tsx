@@ -339,6 +339,37 @@ describe("AiTradeLaunchModal", () => {
     rerender({ defaultStrategyIds: [1], open: true });
     expect((screen.getByLabelText("仓位操作档位") as HTMLSelectElement).value).toBe("0.25");
   });
+
+  // 复发根因回归护栏（ai-trade-launch-modal-inputs-revert-recurrence，方案 A）：
+  // seed effect 依赖收敛为 [open] 后，弹窗 open 恒为真、父树以 ~1Hz 重渲染并传入全新的
+  // defaultStrategyIds/defaultMembers 引用时，effect 不再重跑，用户正在编辑的字段不被冲回默认。
+  // 缺陷版（依赖含 seededMembers/defaultStrategyIds）下本用例会失败：编辑约 1 帧后即被重置。
+  it("keeps user edits while open when the parent re-renders with new default refs (guards inputs-revert recurrence)", async () => {
+    const { onConfirm, rerender } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+
+    // 用户编辑多个字段：追加勾选策略、改仓位档位、改时间级别、填总预算。
+    fireEvent.click(screen.getByText("动量策略")); // selectedIds: [1] → [1, 2]
+    fireEvent.change(screen.getByLabelText("仓位操作档位"), { target: { value: "0.5" } });
+    fireEvent.change(screen.getByLabelText("时间级别"), { target: { value: "4H" } });
+    fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[0], { target: { value: "500" } });
+
+    // 模拟行情流节流 flush 引发的父树重渲染：open 恒为真，但每帧传入全新的默认数组引用。
+    rerender({ defaultStrategyIds: [1], defaultMembers: [{ instId: "ETH-USDT-SWAP", allocationPct: 100 }] });
+    rerender({ defaultStrategyIds: [1], defaultMembers: [{ instId: "ETH-USDT-SWAP", allocationPct: 100 }] });
+
+    // 未发生 open false→true 转换 → seed effect 不重跑，全部编辑保持不变。
+    expect((screen.getByLabelText("仓位操作档位") as HTMLSelectElement).value).toBe("0.5");
+    expect((screen.getByLabelText("时间级别") as HTMLSelectElement).value).toBe("4H");
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.strategyIds).toEqual([1, 2]); // 未被冲回默认 [1]
+    expect(opts.bar).toBe("4H");
+    expect(opts.positionStepPct).toBe(0.5);
+    expect(opts.capitalUsd).toBe(500);
+  });
 });
 
 const HOUR = 3600;

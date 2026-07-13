@@ -192,7 +192,9 @@ export default function AiTradeLaunchModal({
     setEndInput(toLocalInput(defaultEndTs ?? nowSec));
     setEveryRaw(defaultDecisionEveryBars ? String(defaultDecisionEveryBars) : "");
     setMinConsensusRaw("");
-  }, [open, propBar, defaultAllocationMode, defaultInstId, seededMembers, defaultStrategyIds, defaultContextRounds, defaultStartTs, defaultEndTs, defaultDecisionEveryBars, liveAvailable]); // eslint-disable-line react-hooks/exhaustive-deps
+    // 依赖收敛为 [open]：seed 只在弹窗 open false→true 的那一次转换执行，避免父树重渲染/非稳定
+    // 默认引用（seededMembers、defaultStrategyIds 等）把正在编辑的表单每秒冲回默认（inputs-revert 复发根因）。
+  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const toggleId = (id: number) =>
     setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
