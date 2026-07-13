@@ -338,11 +338,14 @@ class AutoTradeSettingsOut(BaseModel):
 
 
 # ---------------- AI 自动交易（ai-auto-trading §4 / §5，camelCase wire）----------------
+AiExecutionBar = Literal["1m", "5m", "15m", "30m", "1H", "4H", "1D"]
+
+
 class AiTradeStartIn(BaseModel):
     """启动 AI 自动交易请求（金额/杠杆字段可留空→服务端保守默认，§4.1）。"""
 
     instId: str = Field(min_length=1, max_length=32)
-    bar: str = "1H"
+    bar: AiExecutionBar = "1H"
     strategyIds: list[int] = Field(min_length=1)         # 多选；上限按 ai_trade_max_strategies 服务端校验
     accountId: int | None = None                         # 省略=默认实盘账户
     capitalUsd: float | None = Field(default=None, gt=0)  # 预算(USDT)，留空→ availUsdt×默认 frac
@@ -396,6 +399,7 @@ class AiTradeDecisionOut(BaseModel):
     # R1 思维链研判增量（ai-trade-reasoning-chain，可选、向后兼容）：
     analysis: str | None = None         # 研判思维链的有界摘录（≤400 字，供左栏决策卡首段；完整全文走 agentTraces）
     marketDigest: dict | None = None    # {priceAction,volume,factors} 价格走势/成交量/因子证据摘要，或 None
+    multiTimeframeContext: dict | None = None
 
 
 class AiTradeRoundTraceOut(BaseModel):
@@ -412,6 +416,7 @@ class AiTradeRoundTraceOut(BaseModel):
     marketContext: dict | None = None
     consensus: dict | None = None
     marketDigest: dict | None = None    # R1：round_start/trace 承载的价格走势/成交量/因子证据摘要，或 None（RC-9）
+    multiTimeframeContext: dict | None = None
     thinking: str = ""
     analysis: str = ""
     toolCall: dict | None = None
@@ -462,7 +467,7 @@ class AiTradeGroupStartIn(BaseModel):
     """
 
     members: list[AiTradeGroupMemberIn]
-    bar: str = "1H"
+    bar: AiExecutionBar = "1H"
     strategyIds: list[int] = Field(min_length=1)         # 多选；上限按 ai_trade_max_strategies 服务端校验
     accountId: int | None = None                         # 省略=默认实盘账户
     allocationMode: Literal["even", "max_ratio"] = "even"
@@ -529,7 +534,7 @@ class AiBacktestStartIn(BaseModel):
     """启动 AI 回测请求（金额/杠杆/OCO 可留空→服务端保守默认，§4.1）。"""
 
     instId: str = Field(min_length=1, max_length=32)
-    bar: str = "1H"
+    bar: AiExecutionBar = "1H"
     strategyIds: list[int] = Field(min_length=1)          # 上限按 ai_trade_max_strategies 服务端校验
     startTs: int = Field(gt=0)                             # 回测区间起（UTC 秒）
     endTs: int = Field(gt=0)                               # 回测区间止（UTC 秒）

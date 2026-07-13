@@ -8,9 +8,11 @@ import type {
   AiTradeRoundTrace,
   AiTradeStopReason,
   Consensus,
+  CandidateLevel,
   FactorReading,
   FactorReadings,
   MarketContext,
+  MultiTimeframeFrame,
   PriceAction,
   VolumeContext,
 } from "./aiTradeTypes";
@@ -245,6 +247,38 @@ export function describeFactors(factors: FactorReadings | null | undefined): str
     describeFactorReading("动量", factors.rocPct),
   ].filter((p): p is string => Boolean(p));
   return parts.length ? `因子 · ${parts.join(" · ")}` : "";
+}
+
+const MTF_ALIGNMENT_LABELS: Record<string, string> = {
+  bullish: "整体偏多",
+  bearish: "整体偏空",
+  mixed: "多空混合",
+  range: "整体震荡",
+  insufficient: "证据不足",
+};
+
+/** 多周期趋势汇总中文化；未知枚举原样回显。 */
+export function describeMultiTimeframeAlignment(status: string): string {
+  return MTF_ALIGNMENT_LABELS[status] ?? status;
+}
+
+/** 候选支撑/阻力中文化；空值明确显示暂无。 */
+export function describeCandidateLevel(level: CandidateLevel | null | undefined): string {
+  if (!level) return "暂无";
+  const bars = level.bars.length ? ` · ${level.bars.join("/")}` : "";
+  return `${level.price} · 距现价 ${level.distancePct}%${bars}`;
+}
+
+/** 单个决策背景周期的只读证据摘要。 */
+export function describeMultiTimeframeFrame(frame: MultiTimeframeFrame): string {
+  const primary = frame.regime?.primary;
+  const regime = primary ? (REGIME_PRIMARY_LABELS[primary] ?? primary) : "体制不足";
+  const rsi = frame.digest?.factors?.rsi14;
+  const rsiText = rsi ? (FACTOR_LABELS[rsi.label] ?? rsi.label) : "RSI不足";
+  const rangePos = frame.digest?.priceAction?.rangePos;
+  const rangeText = rangePos == null ? "" : ` · 区间位 ${Math.round(rangePos * 100)}%`;
+  const stale = frame.stale ? " · 数据陈旧" : "";
+  return `${frame.bar} · ${regime} · ${rsiText}${rangeText} · ${frame.sampleCount} 根${stale}`;
 }
 
 export type AiExecTone = "long" | "short" | "muted";

@@ -33,6 +33,7 @@ from .decider import AiTradeDecider, TradeDecision
 from .market_context import build_market_context
 from .market_digest import build_market_digest
 from .market_window import MarketWindow
+from .multi_timeframe_context import build_multi_timeframe_context
 from .prompts import DECISION_TOOL_NAME
 from .signals import (
     Consensus,
@@ -91,7 +92,13 @@ class AiTradeSession:
         self.residual: dict | None = None
         self.degraded = False
 
-        self._window = MarketWindow(inst_id, bar, specs, priming_bars)
+        self._window = MarketWindow(
+            inst_id,
+            bar,
+            specs,
+            priming_bars,
+            context_enabled=executor.settings.ai_trade_multi_timeframe_context,
+        )
         self._shadows = [make_shadow_broker() for _ in specs]
         self._exec_lock = asyncio.Lock()      # P1-1：串行化一切 executor 写
         self._deciding = False                # P1-2：决策轮 in-flight 守卫
@@ -315,7 +322,8 @@ class AiTradeSession:
             return
         row = self._window.append_confirmed(candle)
         self._last_candle_wall = time.time()
-        await self._window.maybe_refresh_htf(int(candle.ts))
+        decision_as_of_ts = int(candle.ts) + BAR_SECONDS[self.bar]
+        await self._window.maybe_refresh_htf(decision_as_of_ts)
         frames = self._window.build_strategy_frames()
         i = self._window.cur_index()
         ref_px = float(row["c"])
@@ -353,7 +361,8 @@ class AiTradeSession:
                                       market_context=payload.get("marketContext"),
                                       consensus=payload.get("consensus"),
                                       degrade_reason=degrade, analysis=excerpt,
-                                      market_digest=payload.get("marketDigest"))
+                                      market_digest=payload.get("marketDigest"),
+                                      multi_timeframe_context=payload.get("multiTimeframeContext"))
             if degrade:
                 await self._emit_degraded(ts, degrade)
             if summary is not None:
@@ -381,6 +390,7 @@ class AiTradeSession:
         await self._push(trace_event(
             "round_start", round_no, ts, lastPx=ref_px, position=trace["position"],
             signalBoard=trace["signalBoard"], marketContext=trace["marketContext"],
+            multiTimeframeContext=trace["multiTimeframeContext"],
             consensus=trace["consensus"], marketDigest=trace["marketDigest"]))
 
     def _make_trace_emit(self, round_no: int, ts: int) -> TraceEmit:
@@ -551,7 +561,24 @@ class AiTradeSession:
                 self._window.base_df(), self.bar, self.executor.settings),
             "marketDigest": build_market_digest(           # R1：价格走势/成交量/因子证据；同样安全降级 → None
                 self._window.base_df(), self.bar, self.executor.settings),
+            "multiTimeframeContext": self._build_multi_timeframe_context(ts, ref_px),
             "signalBoard": [self._view_full(v) for v in board]}
+
+    def _build_multi_timeframe_context(self, ts: int, ref_px: float) -> dict | None:
+        try:
+            return build_multi_timeframe_context(
+                execution_bar=self.bar,
+                frames=self._window.context_frames(),
+                as_of_ts=ts + BAR_SECONDS[self.bar],
+                last_px=ref_px,
+                settings=self.executor.settings,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "invalid multi-timeframe context contract: bar=%s ts=%s price=%s (%s)",
+                self.bar, ts, ref_px, exc,
+            )
+            return None
 
     @staticmethod
     def _consensus_wire(consensus: Consensus) -> dict:
@@ -580,7 +607,8 @@ class AiTradeSession:
                              consensus: dict | None = None,
                              degrade_reason: str | None = None,
                              analysis: str | None = None,
-                             market_digest: dict | None = None) -> None:
+                             market_digest: dict | None = None,
+                             multi_timeframe_context: dict | None = None) -> None:
         """推 decision 事件；E1/E2/E3 + R1 研判摘录/证据摘要搭顺风车下发（旧前端忽略未知字段，向前兼容）。
 
         `analysis` 为有界摘录（≤`_ANALYSIS_EXCERPT_CHARS`，供左栏决策卡首段；完整思维链见 agent_trace/
@@ -591,7 +619,8 @@ class AiTradeSession:
                 "reason": decision.reason, "signalBoard": [self._view_slim(v) for v in board],
                 "executed": executed, "marketContext": market_context,
                 "consensus": consensus, "degradeReason": degrade_reason,
-                "analysis": analysis, "marketDigest": market_digest}
+                "analysis": analysis, "marketDigest": market_digest,
+                "multiTimeframeContext": multi_timeframe_context}
         self._last_decision = data
         self._decisions.append(data)
         await self._push({"type": "decision", "data": data})
@@ -602,7 +631,8 @@ class AiTradeSession:
                 "signalBoard": [self._view_slim(v) for v in board],
                 "executed": {"ok": True, "skipped": True, "reason": "decision_in_flight"},
                 "marketContext": None, "consensus": None, "degradeReason": None,
-                "analysis": None, "marketDigest": None}
+                "analysis": None, "marketDigest": None,
+                "multiTimeframeContext": None}
         self._last_decision = data
         self._decisions.append(data)
         await self._push({"type": "decision", "data": data})

@@ -21,6 +21,26 @@ describe("applyAiTradeTracePhase", () => {
     expect(out[0].lastPx).toBe(100);
   });
 
+  it("round_start and later phases preserve multi-timeframe context", () => {
+    const context = {
+      executionBar: "1H", asOfTs: 1, frames: [],
+      trendAlignment: { status: "insufficient" as const, bullishBars: [], bearishBars: [], rangeBars: [] },
+      rsiOverboughtBars: [], rsiOversoldBars: [], nearestSupport: null, nearestResistance: null,
+      missingBars: ["1D", "12H", "4H"], staleBars: [],
+    };
+    let traces = applyAiTradeTracePhase(
+      [], ev("round_start", 1, { multiTimeframeContext: context }),
+    );
+    traces = applyAiTradeTracePhase(traces, ev("analysis", 1, { delta: "继续研判" }));
+    expect(traces[0].multiTimeframeContext).toBe(context);
+
+    traces = applyAiTradeTracePhase(
+      traces, ev("round_start", 1, { lastPx: 200, multiTimeframeContext: context }),
+    );
+    expect(traces[0].multiTimeframeContext).toBe(context);
+    expect(traces[0].analysis).toBe("继续研判");
+  });
+
   it("analysis / thinking 增量追加到对应轮", () => {
     let t = applyAiTradeTracePhase([], ev("round_start", 1));
     t = applyAiTradeTracePhase(t, ev("analysis", 1, { delta: "多头" }));

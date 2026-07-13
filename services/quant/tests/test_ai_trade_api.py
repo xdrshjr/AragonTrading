@@ -159,6 +159,23 @@ async def test_start_rejected_when_live_disabled():
         await dispose_engine()
 
 
+async def test_start_rejects_12h_before_group_side_effects():
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    try:
+        async with await _client(app) as client:
+            response = await client.post(
+                "/api/ai-trade/start",
+                json=_start_body(strategy_id, bar="12H"),
+            )
+            assert response.status_code == 422, response.text
+            assert get_ai_trade_manager()._group is None
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
 async def test_start_rejected_when_agent_not_configured(monkeypatch):
     strategy_id = await _fresh()
     app = _load_app()

@@ -126,6 +126,7 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     marketContext: evt.marketContext ?? null,
     consensus: evt.consensus ?? null,
     marketDigest: evt.marketDigest ?? null,
+    multiTimeframeContext: evt.multiTimeframeContext ?? null,
     thinking: "",
     analysis: "",
     toolCallPending: false,

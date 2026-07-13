@@ -5,6 +5,7 @@ import pandas as pd
 import pytest
 
 from app.engine.mtf import bar_to_seconds, causal_htf_merge, seconds_to_bar
+from app.okx.types import BAR_TO_WS_CHANNEL
 from app.strategies import _trend_structure as ts
 
 _T0 = 1_700_000_000
@@ -39,6 +40,12 @@ def test_seconds_to_bar_roundtrip_and_nonstandard():
     assert seconds_to_bar(7200) is None        # 非标准秒数 → None（调用方回退重采样）
     with pytest.raises(ValueError):
         bar_to_seconds("7m")                   # 未知 bar 一次性抛错（边界校验）
+
+
+def test_12h_is_rest_only_not_an_execution_ws_bar():
+    assert bar_to_seconds("12H") == 43_200
+    assert seconds_to_bar(43_200) == "12H"
+    assert "12H" not in BAR_TO_WS_CHANNEL
 
 
 # ---------------- T1：因果对齐，无未来函数（核心红线 R4）----------------

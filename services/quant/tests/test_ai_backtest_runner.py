@@ -119,6 +119,92 @@ async def test_full_run_produces_trades_metrics_aistats_and_persists(monkeypatch
         await dispose_engine()
 
 
+async def test_load_htf_merges_decision_bars_with_80_bar_warmup(monkeypatch):
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(100)
+        monkeypatch.setattr(
+            "app.ai_auto.backtest.make_llm_client_from_config",
+            lambda _cfg: _StubLLM(lambda _call: {"action": "hold", "reason": "h"}),
+        )
+        runner = AiBacktestRunner(_spec(sid, paper, candles))
+        captured = {}
+
+        async def fake_htf(*_args, **kwargs):
+            captured.update(kwargs)
+            return {}
+
+        monkeypatch.setattr("app.ai_auto.backtest.load_htf_frames", fake_htf)
+        await runner._load_htf(candles[0]["ts"], 3600)
+
+        assert captured["timeframes"] == ["4H", "12H", "1D"]
+        assert captured["htf_warmup_bars"] >= 80
+    finally:
+        await dispose_engine()
+
+
+async def test_load_htf_skips_decision_bars_when_context_is_disabled(monkeypatch):
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(100)
+        monkeypatch.setattr(
+            "app.ai_auto.backtest.make_llm_client_from_config",
+            lambda _cfg: _StubLLM(lambda _call: {"action": "hold", "reason": "h"}),
+        )
+        runner = AiBacktestRunner(_spec(sid, paper, candles))
+        runner.settings.ai_trade_multi_timeframe_context = False
+        calls = []
+
+        async def fake_htf(*_args, **kwargs):
+            calls.append(kwargs)
+            return {}
+
+        monkeypatch.setattr("app.ai_auto.backtest.load_htf_frames", fake_htf)
+        result = await runner._load_htf(candles[0]["ts"], 3600)
+
+        assert result == {}
+        assert calls == []
+    finally:
+        await dispose_engine()
+
+
+async def test_backtest_decider_and_digest_share_multi_timeframe_context(monkeypatch):
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(180)
+        llm = _StubLLM(lambda _call: {"action": "hold", "reason": "h"})
+        _patch_loaders(monkeypatch, candles, llm)
+        expected = {"executionBar": "1H", "asOfTs": 123, "frames": []}
+        calls = []
+
+        def fake_context(**kwargs):
+            calls.append(kwargs)
+            return expected
+
+        monkeypatch.setattr(
+            "app.ai_auto.backtest.build_multi_timeframe_context", fake_context)
+        runner = AiBacktestRunner(_spec(sid, paper, candles, every=60, refresh=100))
+        original_decide = runner.decider.decide
+        seen_payloads = []
+
+        async def capture_decide(payload, *args, **kwargs):
+            seen_payloads.append(payload)
+            return await original_decide(payload, *args, **kwargs)
+
+        runner.decider.decide = capture_decide
+        job = _BacktestJob("aibt_mtf", runner)
+        await runner.run(job)
+
+        assert calls
+        assert all(call["as_of_ts"] == decision["ts"] + 3600
+                   for call, decision in zip(calls, job.result["decisionsDigest"]))
+        assert all(payload["multiTimeframeContext"] is expected for payload in seen_payloads)
+        assert all(decision["multiTimeframeContext"] is expected
+                   for decision in job.result["decisionsDigest"])
+    finally:
+        await dispose_engine()
+
+
 _EXT_KEYS = ("annualizedReturn", "annualizedVolatility", "sortino", "calmar", "maxDrawdownBars",
              "maxDrawdownSecs", "timeInMarketPct", "avgWin", "avgLoss", "payoffRatio", "largestWin",
              "largestLoss", "maxConsecutiveWins", "maxConsecutiveLosses", "avgHoldBars",

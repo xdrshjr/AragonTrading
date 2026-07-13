@@ -98,7 +98,21 @@ def _make_session(*, action="hold", size=0.5, run_id=1, stop_loss_usd=None,
     session = AiTradeSession("aitrade_test", run_id, [spec], "BTC-USDT-SWAP", "1H", executor,
                              decider, stop_loss_usd=stop_loss_usd, priming=priming,
                              priming_bars=10, context_refresh_rounds=context_rounds)
+
+    async def no_htf_data(*_args, **_kwargs):
+        return []
+
+    session._window._safe_get_candles = no_htf_data
     return session, calls, pos_state
+
+
+def test_disabled_multi_timeframe_context_does_not_allocate_policy_windows():
+    session, _, _ = _make_session(
+        settings=Settings(ai_trade_multi_timeframe_context=False),
+    )
+
+    assert session._window._context_bars == ()
+    assert session._window._htf_bars == []
 
 
 async def _settle(session) -> None:
@@ -152,6 +166,38 @@ async def test_first_candle_triggers_decision_and_opens():
         assert session.executor.projected == "long"
         assert len(calls["orders"]) == 1
         assert session.rounds_completed == 1
+    finally:
+        await dispose_engine()
+
+
+async def test_multi_timeframe_context_reaches_payload_trace_and_decision(monkeypatch):
+    await init_db()
+    session, _, _ = _make_session(action="hold")
+    expected = {"executionBar": "1H", "asOfTs": _START_TS + _STEP,
+                "frames": [], "missingBars": ["1D", "12H", "4H"]}
+    captured = {}
+
+    def fake_build(**kwargs):
+        captured.update(kwargs)
+        return expected
+
+    monkeypatch.setattr("app.ai_auto.session.build_multi_timeframe_context", fake_build)
+    try:
+        queue = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        events = _drain(queue)
+        round_start = next(
+            event["data"] for event in events
+            if event["type"] == "agent_trace" and event["data"]["phase"] == "round_start"
+        )
+        decision = next(event["data"] for event in events if event["type"] == "decision")
+
+        assert captured["as_of_ts"] == _START_TS + _STEP
+        assert captured["execution_bar"] == "1H"
+        assert round_start["multiTimeframeContext"] is expected
+        assert decision["multiTimeframeContext"] is expected
+        assert session._round_trace["multiTimeframeContext"] is expected
     finally:
         await dispose_engine()
 

@@ -6,11 +6,14 @@ import {
   clampBudgetToCap,
   deriveDefaultBudget,
   describeAiAction,
+  describeCandidateLevel,
   describeConsensus,
   describeExecuted,
   describeFactors,
   describePriceAction,
   describeRegime,
+  describeMultiTimeframeAlignment,
+  describeMultiTimeframeFrame,
   describeStance,
   describeStopReason,
   describeTrigger,
@@ -24,10 +27,39 @@ import type {
   Consensus,
   FactorReadings,
   MarketContext,
+  MultiTimeframeFrame,
   PriceAction,
   StrategySignalView,
   VolumeContext,
 } from "./aiTradeTypes";
+
+const MTF_FRAME: MultiTimeframeFrame = {
+  bar: "1D",
+  sampleCount: 80,
+  closeTs: 1,
+  ageSeconds: 100,
+  stale: true,
+  regime: { primary: "trend_up", volatility: "normal", event: "none", confidence: 0.8, labels: [] },
+  digest: { priceAction: null, volume: null, factors: { rsi14: { value: 72, label: "overbought" },
+    macdHist: { value: 1, label: "bullish" }, bollPctB: { value: 1, label: "upper_half" },
+    atrPct: { value: 1, label: "normal" }, rocPct: { value: 1, label: "positive" } } },
+};
+
+describe("multi-timeframe context formatting", () => {
+  it("formats alignment, candidate levels, and stale frame evidence", () => {
+    expect(describeMultiTimeframeAlignment("mixed")).toBe("多空混合");
+    expect(describeMultiTimeframeAlignment("future_state")).toBe("future_state");
+    expect(describeCandidateLevel({ price: 100, distancePct: 2.5, bars: ["1D", "4H"] }))
+      .toContain("100");
+    expect(describeCandidateLevel(null)).toBe("暂无");
+    const text = describeMultiTimeframeFrame(MTF_FRAME);
+    expect(text).toContain("1D");
+    expect(text).toContain("上升趋势");
+    expect(text).toContain("超买");
+    expect(text).toContain("80 根");
+    expect(text).toContain("数据陈旧");
+  });
+});
 
 const ready = {
   accountMode: "live" as const,

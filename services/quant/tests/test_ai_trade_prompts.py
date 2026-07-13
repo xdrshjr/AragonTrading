@@ -34,11 +34,35 @@ def _payload_with_digest() -> dict:
     }
 
 
+def _multi_timeframe_context() -> dict:
+    return {
+        "trendAlignment": {"status": "mixed"},
+        "nearestSupport": {"price": 29000.0, "distancePct": 3.33, "bars": ["1D"]},
+        "nearestResistance": {"price": 31000.0, "distancePct": 3.33, "bars": ["1H"]},
+        "frames": [
+            {"bar": "1H", "sampleCount": 80, "stale": False,
+             "regime": {"primary": "trend_down"},
+             "digest": {"priceAction": {"rangePos": 0.2},
+                        "factors": {"rsi14": {"value": 28, "label": "oversold"}}}},
+            {"bar": "1D", "sampleCount": 90, "stale": True,
+             "regime": {"primary": "trend_up"},
+             "digest": {"priceAction": {"rangePos": 0.8},
+                        "factors": {"rsi14": {"value": 72, "label": "overbought"}}}},
+        ],
+        "missingBars": ["12H", "4H"],
+        "staleBars": ["1D"],
+    }
+
+
 def test_system_prompt_declares_signals_as_reference_and_step_by_step():
     p = build_ai_trade_system_prompt("BTC-USDT-SWAP", "1H", 100.0, 3.0)
     assert "参考" in p and "推翻" in p
     assert "一步一步" in p or "思维链" in p
     assert "① 价格走势" in p and "⑧ 结论" in p          # 8 步分步研判
+    assert "1D → 12H → 4H → 1H" in p
+    assert "高周期" in p and "优先 hold" in p
+    assert "超买/超卖" in p and "不是单独开仓指令" in p
+    assert "陈旧" in p and "不得补猜" in p
 
 
 def test_system_prompt_tool_close_constraint_is_last():
@@ -79,3 +103,23 @@ def test_decision_prompt_omits_digest_when_none():
     payload["marketDigest"] = None
     text = build_decision_prompt(payload)
     assert "价格走势" not in text and "技术因子" not in text
+
+
+def test_decision_prompt_formats_multi_timeframe_long_to_short():
+    payload = _payload_with_digest()
+    payload["multiTimeframeContext"] = _multi_timeframe_context()
+    text = build_decision_prompt(payload)
+    assert "中线背景" in text and "整体=mixed" in text
+    assert text.index("1D：") < text.index("1H：")
+    assert "数据陈旧" in text
+    assert "缺失周期=12H/4H" in text
+    assert "候选支撑" in text and "候选阻力" in text
+
+
+def test_decision_prompt_reports_all_context_missing_without_guessing():
+    payload = _payload_with_digest()
+    payload["multiTimeframeContext"] = {
+        "frames": [], "missingBars": ["1D", "12H", "4H", "1H"]}
+    text = build_decision_prompt(payload)
+    assert "中线背景暂不可用，已回退基础周期" in text
+    assert "不得补猜" in text

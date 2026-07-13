@@ -33,6 +33,7 @@ from ..engine.metrics import compute_metrics
 from ..engine.metrics_ext import compute_extended_metrics
 from ..engine.mtf import bar_to_seconds
 from ..engine.simulator import RiskParams, SimBroker, TradeRecord
+from ..okx.types import BAR_SECONDS
 from ..paper.strategy_factory import PaperStrategySpec
 from ..strategies.base import Signal
 from ..agent.services import load_htf_frames, load_range_candles
@@ -40,6 +41,10 @@ from .backtest_frames import build_backtest_frames
 from .decider import AiTradeDecider, TradeDecision
 from .market_context import build_market_context
 from .market_digest import build_market_digest
+from .multi_timeframe_context import (
+    build_multi_timeframe_context,
+    decision_timeframes,
+)
 from .prompts import build_ai_trade_system_prompt
 from .signals import (
     Consensus,
@@ -196,9 +201,9 @@ class AiBacktestRunner:
             if setup is None:                        # setup 期间被取消
                 job.mark_terminal("cancelled", {"jobId": job.job_id})
                 return
-            main_df, dfs, first = setup
+            main_df, dfs, context_frames, first = setup
             job.publish({"type": "phase", "data": {"phase": "running"}})
-            state = await self._run_loop(job, main_df, dfs, first)
+            state = await self._run_loop(job, main_df, dfs, context_frames, first)
             job.publish({"type": "phase", "data": {"phase": "finalizing"}})
             await self._finalize(job, main_df, first, state)
         except asyncio.CancelledError:
@@ -213,7 +218,10 @@ class AiBacktestRunner:
                                          "message": "回测执行异常", "jobId": job.job_id})
 
     # ---------- setup（重同步件经 run_in_threadpool 卸载，R4）----------
-    async def _setup(self, job: "_BacktestJob") -> tuple[pd.DataFrame, list[pd.DataFrame], int] | None:
+    async def _setup(
+        self,
+        job: "_BacktestJob",
+    ) -> tuple[pd.DataFrame, list[pd.DataFrame], dict[str, pd.DataFrame], int] | None:
         job.publish({"type": "phase", "data": {"phase": "loading"}})
         bar_sec = bar_to_seconds(self.bar)
         left = self.start_ts - self.warmup * bar_sec
@@ -226,19 +234,33 @@ class AiBacktestRunner:
         main_df = candles_to_df(range_rows)
         dfs = await run_in_threadpool(build_backtest_frames, self.specs, range_rows, htf_frames,
                                       self.bar)
+        context_frames = {
+            bar: candles_to_df(htf_frames[bar])
+            for bar in (decision_timeframes(self.bar)
+                        if self.settings.ai_trade_multi_timeframe_context else ())
+            if htf_frames.get(bar)
+        }
         first = self._first_decision_index(main_df)
         job.publish({"type": "phase", "data": {"phase": "priming"}})
         await run_in_threadpool(self._prime_shadows, dfs, first)
         if job.cancelled:
             return None
-        return main_df, dfs, first
+        return main_df, dfs, context_frames, first
 
     async def _load_htf(self, left: int, base_sec: int) -> dict:
-        tfs = sorted({tf for spec in self.specs for tf in spec.strategy.timeframes()
-                      if tf != self.bar and bar_to_seconds(tf) > base_sec})
+        strategy_tfs = {
+            tf for spec in self.specs for tf in spec.strategy.timeframes()
+            if tf != self.bar and bar_to_seconds(tf) > base_sec
+        }
+        context_tfs = (set(decision_timeframes(self.bar))
+                       if self.settings.ai_trade_multi_timeframe_context else set())
+        tfs = sorted(strategy_tfs | context_tfs,
+                     key=bar_to_seconds)
         if not tfs:
             return {}
-        max_warmup = max((spec.strategy.htf_warmup_bars() for spec in self.specs), default=60)
+        strategy_warmup = max(
+            (spec.strategy.htf_warmup_bars() for spec in self.specs), default=60)
+        max_warmup = max(80, strategy_warmup)
         return await load_htf_frames(self.rest, inst_id=self.inst_id, start_ts=left,
                                      end_ts=self.end_ts, base_seconds=base_sec, timeframes=tfs,
                                      htf_warmup_bars=max_warmup)
@@ -257,7 +279,8 @@ class AiBacktestRunner:
 
     # ---------- 逐根循环 ----------
     async def _run_loop(self, job: "_BacktestJob", main_df: pd.DataFrame,
-                        dfs: list[pd.DataFrame], first: int) -> str:
+                        dfs: list[pd.DataFrame], context_frames: dict[str, pd.DataFrame],
+                        first: int) -> str:
         """镜像 run_backtest 的 fill/risk/mark 四阶段，把 on_candle→submit 换成 AI 决策→submit。"""
         n = len(main_df)
         total = max(1, n - first)
@@ -276,7 +299,7 @@ class AiBacktestRunner:
             board = evaluate_signal_board(self.specs, self.shadows, dfs, i)  # 每根步进影子（快，无 LLM）
             self._maybe_session_exit(row, i, n)
             if not self._session_exited and self._is_decision_bar(i, first, n):
-                await self._run_decision(job, main_df, i, board)
+                await self._run_decision(job, main_df, context_frames, i, board)
                 self._emit_new_trades(job)
             self._emit_progress(job, i, first, total, row)
             if (i - first) % _YIELD_EVERY_BARS == 0:
@@ -294,14 +317,16 @@ class AiBacktestRunner:
             return False
         return True
 
-    async def _run_decision(self, job: "_BacktestJob", main_df: pd.DataFrame, i: int,
+    async def _run_decision(self, job: "_BacktestJob", main_df: pd.DataFrame,
+                            context_frames: dict[str, pd.DataFrame], i: int,
                             board: list[StrategySignalView]) -> None:
         """一个决策轮：装配 payload → AI 决策 → 共识门禁 → 映射 Signal→main.submit → 记录/摘要 → 推事件。"""
         round_no = self.rounds_done + 1
         row = main_df.iloc[i]
         ts, ref_px = int(row["ts"]), float(row["c"])
         consensus = compute_consensus(board)
-        payload = self._build_payload(round_no, ts, ref_px, main_df, i, board, consensus)
+        payload = self._build_payload(
+            round_no, ts, ref_px, main_df, context_frames, i, board, consensus)
         decision, decide_degrade = await self.decider.decide(payload)          # 唯一 async（LLM）
         decision, gate_reason = apply_consensus_gate(decision, consensus, self.min_consensus)
         executed = self._execute(decision)
@@ -340,7 +365,8 @@ class AiBacktestRunner:
             self._exit_reason = reason
 
     # ---------- payload / 统计 / 事件 ----------
-    def _build_payload(self, round_no: int, ts: int, ref_px: float, main_df: pd.DataFrame, i: int,
+    def _build_payload(self, round_no: int, ts: int, ref_px: float, main_df: pd.DataFrame,
+                       context_frames: dict[str, pd.DataFrame], i: int,
                        board: list[StrategySignalView], consensus: Consensus) -> dict:
         session_pnl = self.main.equity_at(ref_px) - self.initial_capital
         return {
@@ -351,8 +377,31 @@ class AiBacktestRunner:
             "marketContext": build_market_context(main_df.iloc[:i + 1], self.bar, self.settings),
             "marketDigest": build_market_digest(         # R1：因果切片 iloc[:i+1]，末行=当前决策根（无未来函数）
                 main_df.iloc[:i + 1], self.bar, self.settings),
+            "multiTimeframeContext": self._build_multi_timeframe_context(
+                context_frames, ts, ref_px),
             "consensus": _consensus_wire(consensus),
             "signalBoard": [_view_full(v) for v in board]}
+
+    def _build_multi_timeframe_context(
+        self,
+        context_frames: dict[str, pd.DataFrame],
+        ts: int,
+        ref_px: float,
+    ) -> dict | None:
+        try:
+            return build_multi_timeframe_context(
+                execution_bar=self.bar,
+                frames=context_frames,
+                as_of_ts=ts + BAR_SECONDS[self.bar],
+                last_px=ref_px,
+                settings=self.settings,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "invalid backtest multi-timeframe contract: bar=%s ts=%s price=%s (%s)",
+                self.bar, ts, ref_px, exc,
+            )
+            return None
 
     def _position_payload(self, ref_px: float) -> dict | None:
         """主账户持仓视图（盯市未实现盈亏用 `equity_at-cash`，R7：context() 无未实现盈亏字段）。"""
@@ -383,6 +432,7 @@ class AiBacktestRunner:
                 "signalBoard": [_view_slim(v) for v in board],
                 "marketContext": payload.get("marketContext"), "consensus": payload.get("consensus"),
                 "marketDigest": payload.get("marketDigest"),   # RC-10：与实盘 decision 事件对称
+                "multiTimeframeContext": payload.get("multiTimeframeContext"),
                 "degradeReason": degrade, "executed": executed}
         self._decisions_digest.append(data)
         job.publish({"type": "decision", "data": data})

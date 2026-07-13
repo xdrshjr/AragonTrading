@@ -50,13 +50,17 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
         "你的职责不是复述或跟随它们，而是**像一名资深交易员那样，独立地、一步一步地综合研判所有证据后"
         "自己下判断**——你有权采纳、存疑或**推翻**任何单一信号。\n\n"
         "决策纪律：\n"
-        "1. **每轮必须先输出一段分步骤的研判（思维链），依次思考：① 价格走势（方向、动量、均线结构、"
+        "1. **每轮必须先输出一段分步骤的研判（思维链）**。输入提供可用多周期证据时，先按 "
+        "1D → 12H → 4H → 1H 研判中线背景、趋势一致性、候选支撑阻力与超买/超卖，再依次思考："
+        "① 价格走势（方向、动量、均线结构、"
         "区间位置）；② 成交量（量能、量比、放缩、异常放量）；③ 市场体制（趋势/震荡/高低波动/事件）；"
         "④ 技术因子读数（RSI/MACD/布林/ATR/动量各说明什么）；⑤ 逐一批判各策略信号——每个策略此刻的"
         "立场与本轮意图在当前语境下**是否可信**，你采纳、存疑还是推翻，为什么；⑥ 信号冲突与权衡；"
         "⑦ 当前真实持仓、会话盈亏与风险约束；⑧ 结论。**研判供人类观察，真正生效的只有工具调用。**\n"
         "2. 只使用输入中提供的真实数据（价格/成交量/因子/信号板/持仓/盈亏），绝不臆造行情或指标；"
-        "证据不足或相互矛盾、无把握时选择 hold（持币观望）。\n"
+        "证据不足或相互矛盾、无把握时选择 hold（持币观望）。高周期强冲突时短线开仓应优先 hold，"
+        "除非证据充分且采用保守档位；超买/超卖不是单独开仓指令；已有持仓同时出现短线失效与高周期"
+        "反转时优先考虑 close；陈旧或缺失周期不得补猜。\n"
         f"3. 风险优先：已持仓且多数证据转为反向时，优先 close 保护利润 / 止损；空仓且多数证据同向、"
         f"研判充分时才开仓，{_size_discipline(position_step_pct)}，避免频繁反手与过度交易。\n"
         "4. action 取值仅限 open_long / open_short / close / hold；close/hold 忽略 sizeFraction。"
@@ -162,6 +166,47 @@ def _format_factors(factors: dict | None) -> str:
             f"布林%B={_reading('bollPctB')}，ATR%={_reading('atrPct')}，动量ROC={_reading('rocPct')}")
 
 
+def _format_candidate(label: str, candidate: dict | None) -> str:
+    if not candidate:
+        return f"{label}=无"
+    bars = "/".join(candidate.get("bars") or []) or "未知"
+    return (f"{label}={candidate.get('price')}（距离 {candidate.get('distancePct')}%，"
+            f"来源 {bars}）")
+
+
+def _format_multi_timeframe_frame(frame: dict) -> str:
+    regime = (frame.get("regime") or {}).get("primary")
+    digest = frame.get("digest") or {}
+    rsi = ((digest.get("factors") or {}).get("rsi14") or {})
+    range_pos = (digest.get("priceAction") or {}).get("rangePos")
+    stale = "，数据陈旧" if frame.get("stale") else ""
+    return (f"- {frame.get('bar')}：体制={regime}，RSI14={rsi.get('value')}"
+            f"({rsi.get('label')})，区间位置={range_pos}，样本={frame.get('sampleCount')}"
+            f"{stale}")
+
+
+def _format_multi_timeframe(context: dict | None) -> list[str]:
+    if context is None:
+        return []
+    frames = context.get("frames") or []
+    if not frames:
+        return ["中线背景暂不可用，已回退基础周期；缺失或陈旧周期不得补猜。"]
+    alignment = (context.get("trendAlignment") or {}).get("status")
+    header = "；".join((
+        f"中线背景：整体={alignment}",
+        _format_candidate("候选支撑", context.get("nearestSupport")),
+        _format_candidate("候选阻力", context.get("nearestResistance")),
+    ))
+    order = {bar: index for index, bar in enumerate(("1D", "12H", "4H", "1H"))}
+    lines = [header]
+    lines.extend(_format_multi_timeframe_frame(frame)
+                 for frame in sorted(frames, key=lambda item: order.get(item.get("bar"), 99)))
+    missing = context.get("missingBars") or []
+    if missing:
+        lines.append(f"缺失周期={'/'.join(missing)}；不得补猜。")
+    return lines
+
+
 def build_decision_prompt(payload: dict) -> str:
     """把本轮决策输入（体制/共识 + 信号板 + 真实持仓 + 会话盈亏 + 摘要）压成紧凑文本喂决策器。
 
@@ -179,6 +224,7 @@ def build_decision_prompt(payload: dict) -> str:
         (f"会话累计盈亏≈{payload.get('sessionPnlUsd')} USDT / 预算 {payload.get('budgetUsd')} USDT；"
          f"会话止盈阈值={'不触发' if tp is None else tp}，止损阈值={'不触发' if sl is None else sl}"),
     ]
+    parts.extend(_format_multi_timeframe(payload.get("multiTimeframeContext")))
     market_line = _format_market_context(payload.get("marketContext"))
     if market_line:                          # E1：mc 为 None 时整段省略（不出现半截空信息）
         parts.append(market_line)

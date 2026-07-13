@@ -7,6 +7,9 @@ import {
   describeConsensus,
   describeExecuted,
   describeFactors,
+  describeCandidateLevel,
+  describeMultiTimeframeAlignment,
+  describeMultiTimeframeFrame,
   describePriceAction,
   describeRegime,
   describeStance,
@@ -14,7 +17,7 @@ import {
   describeTrigger,
   describeVolume,
 } from "@/lib/aiTrade";
-import type { AiTradeRoundTrace } from "@/lib/aiTradeTypes";
+import type { AiTradeRoundTrace, MultiTimeframeContext } from "@/lib/aiTradeTypes";
 import { fmtNum, fmtPrice, fmtTime } from "@/lib/format";
 import { renderMarkdown } from "@/lib/markdown";
 
@@ -186,7 +189,33 @@ function ResultRow({ trace }: { trace: AiTradeRoundTrace }) {
   );
 }
 
-/** 输入信号板 / 体制 / 共识 / 市场证据摘要（紧凑折叠，复用左栏同款 describe）。 */
+const MTF_ORDER = new Map(["1D", "12H", "4H", "1H"].map((bar, index) => [bar, index]));
+
+function MultiTimeframeEvidence({ context }: { context: MultiTimeframeContext }) {
+  if (!context.frames.length) {
+    return <div>中线背景暂不可用，已回退基础周期</div>;
+  }
+  const frames = [...context.frames].sort(
+    (left, right) => (MTF_ORDER.get(left.bar) ?? 99) - (MTF_ORDER.get(right.bar) ?? 99),
+  );
+  return (
+    <div className="flex flex-col gap-0.5">
+      <div className="font-medium text-[var(--text)]">
+        中线背景 · {describeMultiTimeframeAlignment(context.trendAlignment.status)}
+      </div>
+      <div>候选支撑：{describeCandidateLevel(context.nearestSupport)}</div>
+      <div>候选阻力：{describeCandidateLevel(context.nearestResistance)}</div>
+      {frames.map((frame) => (
+        <div key={frame.bar} data-testid="mtf-frame">
+          {describeMultiTimeframeFrame(frame)}
+        </div>
+      ))}
+      {context.missingBars.length ? <div>缺失周期：{context.missingBars.join("、")}</div> : null}
+    </div>
+  );
+}
+
+/** 输入信号板 / 中线背景 / 体制 / 共识 / 市场证据摘要。 */
 function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
   const regime = describeRegime(trace.marketContext);
   const consensus = describeConsensus(trace.consensus ?? null);
@@ -194,14 +223,18 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
   const price = describePriceAction(digest?.priceAction);
   const volume = describeVolume(digest?.volume);
   const factors = describeFactors(digest?.factors);
+  const multiTimeframe = trace.multiTimeframeContext ?? null;
   const board = trace.signalBoard ?? [];
-  if (!board.length && !regime && !consensus && !price && !volume && !factors) return null;
+  if (!board.length && !regime && !consensus && !price && !volume && !factors && !multiTimeframe) {
+    return null;
+  }
   return (
     <details className="text-[11px] text-[var(--muted)]">
       <summary className="cursor-pointer select-none text-[var(--text)]">
         输入信号板{board.length ? `（${board.length}）` : ""}
       </summary>
       <div className="mt-1 flex flex-col gap-1">
+        {multiTimeframe ? <MultiTimeframeEvidence context={multiTimeframe} /> : null}
         {(regime || consensus) && (
           <div className="flex flex-wrap gap-x-2 gap-y-0.5">
             {regime && <span>{regime}</span>}

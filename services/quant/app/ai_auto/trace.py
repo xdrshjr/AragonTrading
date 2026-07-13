@@ -88,6 +88,7 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         "position": payload.get("position"),
         "signalBoard": signal_board,
         "marketContext": payload.get("marketContext"),
+        "multiTimeframeContext": payload.get("multiTimeframeContext"),
         "consensus": payload.get("consensus"),
         "marketDigest": payload.get("marketDigest"),   # R1：round_start/trace 承载证据摘要（RC-9）
         "thinking": "", "analysis": "",

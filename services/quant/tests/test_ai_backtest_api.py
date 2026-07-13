@@ -100,6 +100,21 @@ async def test_start_rejected_on_invalid_range(monkeypatch):
         await _cleanup(app)
 
 
+async def test_start_rejects_12h_before_job_creation():
+    sid = await _fresh()
+    app = _load_app()
+    try:
+        async with await _client(app) as client:
+            response = await client.post(
+                "/api/ai-trade/backtest/start",
+                json=_bt_body(sid, bar="12H"),
+            )
+            assert response.status_code == 422, response.text
+            assert get_ai_backtest_manager()._jobs == {}
+    finally:
+        await _cleanup(app)
+
+
 async def test_start_rejected_on_too_many_rounds(monkeypatch):
     sid = await _fresh()
     app = _load_app()

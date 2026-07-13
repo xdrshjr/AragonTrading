@@ -216,6 +216,36 @@ describe("AiTradeAgentTrace", () => {
     expect(screen.queryByText(/第\s*\d+\s*轮/)).not.toBeInTheDocument();
   });
 
+  it("shows multi-timeframe evidence long-to-short with stale and missing states", () => {
+    const frame = (bar: string, stale: boolean) => ({
+      bar, sampleCount: 80, closeTs: 1, ageSeconds: stale ? 999999 : 0, stale,
+      regime: { primary: "trend_up", volatility: "normal", event: "none", confidence: 0.8, labels: [] },
+      digest: { priceAction: null, volume: null, factors: null },
+    });
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [round({
+          state: "done",
+          multiTimeframeContext: {
+            executionBar: "1H", asOfTs: 1,
+            frames: [frame("1H", false), frame("1D", true)],
+            trendAlignment: { status: "bullish", bullishBars: ["1D", "1H"], bearishBars: [], rangeBars: [] },
+            rsiOverboughtBars: [], rsiOversoldBars: [],
+            nearestSupport: { price: 62000, distancePct: 1.59, bars: ["1D"] },
+            nearestResistance: null, missingBars: ["12H", "4H"], staleBars: ["1D"],
+          },
+        })])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    const frames = screen.getAllByTestId("mtf-frame");
+    expect(frames[0]).toHaveTextContent("1D");
+    expect(frames[1]).toHaveTextContent("1H");
+    expect(frames[0]).toHaveTextContent("数据陈旧");
+    expect(screen.getByText(/缺失周期.*12H.*4H/)).toBeInTheDocument();
+    expect(screen.getByText(/候选支撑/)).toBeInTheDocument();
+  });
+
   it("auto-resumes bottom-follow after 2 minutes idle and re-scrolls to latest (R2)", () => {
     vi.useFakeTimers();
     try {

@@ -146,6 +146,7 @@ class Settings(BaseSettings):
     # 确定性行为零回归）。指标周期（RSI14/EMA9,21/MACD12,26,9/BB20,2/ATR14）与 _MIN_BARS=35 作为模块级常量
     # 写在 market_digest.py（规避「AI_TRADE_ env 三处联动」既知易踩点，与 trace.py 阈值常量同风格）。
     ai_trade_market_digest: bool = True          # 总开关：注入价格走势/成交量/因子证据摘要（False=不注入）
+    ai_trade_multi_timeframe_context: bool = True  # 多周期中线背景总开关（只读；缺数时显式降级）
     ai_trade_digest_trend_window: int = Field(default=20, ge=2)  # 价格走势/区间位置回看根数
     ai_trade_digest_vol_window: int = Field(default=20, ge=2)    # 成交量均值/zscore 回看根数
     # ---- AI 自动交易 · 回测模式（ai-auto-trading-backtest §2.5，三重决策成本护栏）----

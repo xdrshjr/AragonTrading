@@ -16,30 +16,41 @@ from ..okx.rest_client import get_rest_client
 from ..okx.types import BAR_SECONDS, Candle
 from ..paper.session import PAPER_WINDOW_MAX
 from ..paper.strategy_factory import PaperStrategySpec
+from .multi_timeframe_context import decision_timeframes
+
+_CONTEXT_WARMUP = 80
 
 
 class MarketWindow:
     """共享 K 线滚动窗口 + 各高周期窗口 + 逐策略建帧（多策略并集上界）。"""
 
     def __init__(self, inst_id: str, bar: str, specs: list[PaperStrategySpec],
-                 priming_bars: int):
+                 priming_bars: int, *, context_enabled: bool = True):
         self.inst_id = inst_id
         self.bar = bar
         self._specs = specs
         base_seconds = BAR_SECONDS.get(bar, 60)
         warmup = max((s.strategy.warmup() for s in specs), default=20)
         htf_warmup = max((s.strategy.htf_warmup_bars() for s in specs), default=60)
-        self._window_max = min(max(warmup + 5, priming_bars, htf_warmup + 5), PAPER_WINDOW_MAX)
+        self._context_bars = decision_timeframes(bar) if context_enabled else ()
+        self._window_max = min(
+            max(warmup + 5, priming_bars, htf_warmup + 5,
+                _CONTEXT_WARMUP if self._context_bars else 0),
+            PAPER_WINDOW_MAX,
+        )
         self._candles: deque[dict] = deque(maxlen=self._window_max)
-        htf_set: set[str] = set()
+        strategy_bars: set[str] = set()
         for spec in specs:
             for tf in spec.strategy.timeframes():
                 if BAR_SECONDS.get(tf, 0) > base_seconds:
-                    htf_set.add(tf)
+                    strategy_bars.add(tf)
+        self._strategy_bars = tuple(
+            sorted(strategy_bars, key=lambda b: BAR_SECONDS.get(b, 0)))
+        htf_set = strategy_bars | set(self._context_bars)
         self._htf_bars = sorted(htf_set, key=lambda b: BAR_SECONDS.get(b, 0))
         self._htf_windows: dict[str, deque] = {b: deque(maxlen=self._window_max)
                                                for b in self._htf_bars}
-        self._htf_last_bucket: dict[str, int] = {}
+        self._htf_next_refresh_ts: dict[str, int] = {}
         self._last_confirmed_ts: int | None = None
         self._htf_warmup = htf_warmup
 
@@ -66,6 +77,14 @@ class MarketWindow:
         用公有 `candles` 属性构造，不碰逐策略 `prepare`/MTF（体制判定只需原始 OHLCV）。
         """
         return candles_to_df(list(self._candles))
+
+    def context_frames(self) -> dict[str, pd.DataFrame]:
+        """Return raw OHLCV copies for decision-context bars only."""
+        return {
+            bar: candles_to_df(list(self._htf_windows[bar])).copy()
+            for bar in self._context_bars
+            if self._htf_windows.get(bar)
+        }
 
     # ---------- 追加 ----------
     def is_duplicate(self, candle: Candle) -> bool:
@@ -131,36 +150,52 @@ class MarketWindow:
             if not secs:
                 continue
             span_htf = (int(base_span_bars) * base_seconds) // secs + 1
-            limit = min(self._window_max, max(self._htf_warmup, span_htf) + 5)
+            warmup = max(
+                self._htf_warmup,
+                _CONTEXT_WARMUP if b in self._context_bars else 0,
+                span_htf,
+            )
+            limit = min(PAPER_WINDOW_MAX, warmup + 5)
             candles = await self._safe_get_candles(b, limit)
+            if not candles:
+                continue
             win = self._htf_windows[b]
-            for c in candles:
-                if getattr(c, "confirm", True):
+            existing = {row["ts"] for row in win}
+            for c in sorted(candles, key=lambda item: item.ts):
+                if getattr(c, "confirm", True) and c.ts not in existing:
                     win.append({"ts": c.ts, "o": c.o, "h": c.h, "l": c.l, "c": c.c, "vol": c.vol})
-            if win:
-                self._htf_last_bucket[b] = int(win[-1]["ts"]) // secs  # noqa: E501
+                    existing.add(c.ts)
+            latest_raw = max(candles, key=lambda item: item.ts)
+            self._htf_next_refresh_ts[b] = int(latest_raw.ts) + secs
 
-    async def maybe_refresh_htf(self, base_ts: int) -> None:
-        """实时段按高周期边界限频刷新（未跨边界复用窗口，避免每根打 OKX）。"""
+    async def maybe_refresh_htf(self, decision_as_of_ts: int) -> None:
+        """Refresh on exchange-reported bar anchors; failures retry next base bar."""
         for b in self._htf_bars:
             secs = BAR_SECONDS.get(b)
             if not secs:
                 continue
-            bucket = base_ts // secs
-            if self._htf_last_bucket.get(b) == bucket:
+            next_refresh = self._htf_next_refresh_ts.get(b)
+            if next_refresh is not None and decision_as_of_ts < next_refresh:
                 continue
             candles = await self._safe_get_candles(
-                b, min(self._window_max, self._htf_warmup + 5))
+                b, min(PAPER_WINDOW_MAX, max(
+                    self._htf_warmup,
+                    _CONTEXT_WARMUP if b in self._context_bars else 0,
+                ) + 5))
+            if not candles:
+                continue
             win = self._htf_windows[b]
             existing = {row["ts"] for row in win}
-            for c in candles:
+            for c in sorted(candles, key=lambda item: item.ts):
                 if getattr(c, "confirm", True) and c.ts not in existing:
                     win.append({"ts": c.ts, "o": c.o, "h": c.h, "l": c.l, "c": c.c, "vol": c.vol})
-            self._htf_last_bucket[b] = bucket
+                    existing.add(c.ts)
+            latest_raw = max(candles, key=lambda item: item.ts)
+            self._htf_next_refresh_ts[b] = int(latest_raw.ts) + secs
 
-    async def _safe_get_candles(self, bar: str, limit: int) -> list:
-        """按 `self.inst_id` 拉某高周期 K 线；取数失败回空表（降级，不阻塞撮合）。"""
+    async def _safe_get_candles(self, bar: str, limit: int) -> list | None:
+        """Fetch one timeframe; failures return None so refresh is not advanced."""
         try:
             return await get_rest_client().get_candles(self.inst_id, bar, limit=limit)
         except Exception:  # noqa: BLE001 —— 取数失败：窗口不更新（安全降级，绝不假数据）
-            return []
+            return None

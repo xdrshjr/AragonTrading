@@ -84,6 +84,40 @@ export interface MarketDigest {
   factors: FactorReadings | null;
 }
 
+export interface CandidateLevel {
+  price: number;
+  distancePct: number;
+  bars: string[];
+}
+
+export interface MultiTimeframeFrame {
+  bar: string;
+  sampleCount: number;
+  closeTs: number;
+  ageSeconds: number;
+  stale: boolean;
+  regime: MarketContext | null;
+  digest: MarketDigest | null;
+}
+
+export interface MultiTimeframeContext {
+  executionBar: string;
+  asOfTs: number;
+  frames: MultiTimeframeFrame[];
+  trendAlignment: {
+    status: "bullish" | "bearish" | "mixed" | "range" | "insufficient";
+    bullishBars: string[];
+    bearishBars: string[];
+    rangeBars: string[];
+  };
+  rsiOverboughtBars: string[];
+  rsiOversoldBars: string[];
+  nearestSupport: CandidateLevel | null;
+  nearestResistance: CandidateLevel | null;
+  missingBars: string[];
+  staleBars: string[];
+}
+
 // 本轮 AI 决策（受约束）：action + 可选仓位占比/置信度 + 理由 + 信号板 + 执行结果 + 体制/共识/降级（E1/E2/E3）。
 export interface AiTradeDecision {
   ts: number;
@@ -108,6 +142,7 @@ export interface AiTradeDecision {
   degradeReason?: string | null;          // E3（low_consensus(k/n) / decision_timeout / … 或 null）
   analysis?: string | null;               // R1：研判思维链有界摘录（≤400 字；完整全文见 agentTraces）
   marketDigest?: MarketDigest | null;     // R1：价格走势/成交量/因子证据摘要（可为 null）
+  multiTimeframeContext?: MultiTimeframeContext | null;
 }
 
 // 决策认知轨迹阶段（ai-auto-trading-agent-trace §5.3；与后端 trace.PHASES 镜像）。
@@ -145,6 +180,7 @@ export interface AiTradeTraceEvent {
   marketContext?: MarketContext | null; // round_start
   consensus?: Consensus | null; // round_start
   marketDigest?: MarketDigest | null; // round_start（R1：价格走势/成交量/因子证据摘要）
+  multiTimeframeContext?: MultiTimeframeContext | null; // round_start（决策级中线背景）
   attempt?: number; // retry：当前重试序号（1-based）
   maxAttempts?: number; // retry：本轮最大重试次数
   reason?: string; // retry：触发本次重试的上一次 degrade 原因
@@ -160,6 +196,7 @@ export interface AiTradeRoundTrace {
   marketContext?: MarketContext | null;
   consensus?: Consensus | null;
   marketDigest?: MarketDigest | null; // R1：价格走势/成交量/因子证据摘要（round_start 承载）
+  multiTimeframeContext?: MultiTimeframeContext | null;
   thinking: string; // 累积深度思考（未开启扩展思考时通常为空）
   analysis: string; // 累积自然语言研判分析（流式主可见内容）
   toolCallPending?: boolean;
