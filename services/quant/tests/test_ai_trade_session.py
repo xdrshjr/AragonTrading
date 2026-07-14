@@ -11,6 +11,7 @@ import pytest
 
 from app.agent.llm.base import StreamEvent
 from app.ai_auto.decider import AiTradeDecider
+from app.ai_auto.prompts import REFLECTION_TOOL_NAME
 from app.ai_auto.session import AiTradeSession
 from app.config import Settings
 from app.db import repositories as repo
@@ -344,5 +345,176 @@ async def test_summary_emitted_every_n_rounds():
         summaries = [e for e in _drain(q) if e["type"] == "summary"]
         assert summaries and summaries[0]["data"]["summary"] == "综合摘要：偏多"
         assert session.decider.summary == "综合摘要：偏多"
+    finally:
+        await dispose_engine()
+
+
+# ---------- 下单前二次反思校验（ai-trade-pre-trade-reflection §6.2）----------
+class _ReflectStubLLM:
+    """决策流返回 submit_trade_decision；反思流返回 submit_trade_reflection；摘要流返回文本。
+
+    以 tools[0].name 区分决策 / 反思两种工具流；记录 reflection_calls 供「hold 轮不反思」断言。
+    """
+
+    def __init__(self, *, action="open_long", size=0.5, verdict="confirm",
+                 adjusted=None, summary="综合摘要：偏多"):
+        self.action = action
+        self.size = size
+        self.verdict = verdict
+        self.adjusted = adjusted
+        self.summary = summary
+        self.reflection_calls = 0
+
+    async def stream(self, *, system, messages, tools):
+        if not tools:                                  # 摘要流
+            yield StreamEvent("text_delta", text=self.summary)
+            yield StreamEvent("message_done", stop_reason="end")
+            return
+        if tools[0].name == REFLECTION_TOOL_NAME:      # 反思流
+            self.reflection_calls += 1
+            args = {"verdict": self.verdict, "reason": "复核结论"}
+            if self.adjusted is not None:
+                args["adjustedSizeFraction"] = self.adjusted
+            yield StreamEvent("tool_use_start", id="rf", name=REFLECTION_TOOL_NAME)
+            yield StreamEvent("tool_use_args_delta", id="rf",
+                              partial_json=json.dumps(args, ensure_ascii=False))
+            yield StreamEvent("message_done", stop_reason="tool_use")
+            return
+        args = {"action": self.action, "reason": "r", "confidence": 0.7}   # 决策流
+        if self.action in ("open_long", "open_short"):
+            args["sizeFraction"] = self.size
+        yield StreamEvent("tool_use_start", id="d", name="submit_trade_decision")
+        yield StreamEvent("tool_use_args_delta", id="d",
+                          partial_json=json.dumps(args, ensure_ascii=False))
+        yield StreamEvent("message_done", stop_reason="tool_use")
+
+
+def _make_reflect_session(*, action="open_long", size=0.5, verdict="confirm",
+                          adjusted=None, run_id=1):
+    """构造一个**打开反思**的会话（decider reflection_enabled=True，桩 LLM 区分决策/反思流）。"""
+    settings = Settings()
+    calls = {"orders": [], "closes": []}
+
+    async def place_order_fn(order):
+        calls["orders"].append(order)
+        return {"ok": True, "ordId": "x", "clOrdId": "aragonx"}
+
+    async def close_position_fn(close):
+        calls["closes"].append(close)
+        return {"ok": True, "clOrdId": "aragoncx"}
+
+    async def positions_fn():
+        ex = session.executor
+        if ex.projected == "flat":
+            return []
+        return [{"instId": "BTC-USDT-SWAP", "pos": ex.entry_qty_sz, "upl": 0.0}]
+
+    executor = LiveExecutor(
+        creds=AccountCredentials("ak", "sk-000000", "pp-000000"), account_id=1,
+        inst_id="BTC-USDT-SWAP", td_mode="cross", pos_mode="long_short_mode",
+        leverage=3.0, budget_usd=1000.0, risk=RiskParams(), ct_val=0.01,
+        lot_sz=0.01, min_sz=0.01, settings=settings,
+        place_order_fn=place_order_fn, close_position_fn=close_position_fn,
+        positions_fn=positions_fn)
+    llm = _ReflectStubLLM(action=action, size=size, verdict=verdict, adjusted=adjusted)
+    decider = AiTradeDecider(llm, "sys", context_refresh_rounds=10, settings=settings,
+                             reflection_enabled=True)
+    spec = PaperStrategySpec(1, "S", "atomic", _StubStrategy({}), {})
+    session = AiTradeSession("aitrade_reflect", run_id, [spec], "BTC-USDT-SWAP", "1H", executor,
+                             decider, priming=False, priming_bars=10, context_refresh_rounds=10)
+
+    async def no_htf_data(*_args, **_kwargs):
+        return []
+
+    session._window._safe_get_candles = no_htf_data
+    return session, calls, llm
+
+
+async def test_reflection_confirm_lets_open_land():
+    """反思 confirm → 开仓仍落地；发生了一次反思子调用；decision 事件 reflectionVerdict=confirm。"""
+    await init_db()
+    session, calls, llm = _make_reflect_session(action="open_long", verdict="confirm")
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        assert session.executor.projected == "long"
+        assert len(calls["orders"]) == 1
+        assert llm.reflection_calls == 1
+        data = [e for e in _drain(q) if e["type"] == "decision"][-1]["data"]
+        assert data["reflectionVerdict"] == "confirm"
+    finally:
+        await dispose_engine()
+
+
+async def test_reflection_abort_blocks_real_order():
+    """反思 abort → executor 未被调用（无真实下单）+ 降级 hold + decision 事件 reflectionVerdict=abort。"""
+    await init_db()
+    session, calls, llm = _make_reflect_session(action="open_long", verdict="abort")
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        assert calls["orders"] == []                     # 真实资金零动作
+        assert session.executor.projected == "flat"
+        assert llm.reflection_calls == 1
+        data = [e for e in _drain(q) if e["type"] == "decision"][-1]["data"]
+        assert data["action"] == "hold"
+        assert data["degradeReason"] == "reflection_abort"
+        assert data["reflectionVerdict"] == "abort"
+        # commit_round/journal 记录的是反思后的 hold（保持上下文纯净）。
+        assert session.decider._journal[-1]["decision"]["action"] == "hold"
+    finally:
+        await dispose_engine()
+
+
+async def test_reflection_skipped_for_hold_decision():
+    """hold 决策无交易意愿 → reflect 从不被调用（reflection_calls==0），无反思轨迹。"""
+    await init_db()
+    session, calls, llm = _make_reflect_session(action="hold")
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        assert llm.reflection_calls == 0
+        assert calls["orders"] == []
+        traces = [e for e in _drain(q)
+                  if e["type"] == "agent_trace"
+                  and e["data"]["phase"] in ("reflection_start", "reflection_verdict")]
+        assert traces == []                              # hold 轮无反思轨迹
+    finally:
+        await dispose_engine()
+
+
+async def test_reflection_confirm_shrinks_position_size():
+    """反思 confirm + 更小 adjustedSizeFraction → 开仓仓位被收缩（只减不增），轨迹落收缩后仓位。"""
+    await init_db()
+    session, _, llm = _make_reflect_session(action="open_long", size=0.8,
+                                            verdict="confirm", adjusted=0.2)
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        verdict_evt = next(
+            e["data"] for e in _drain(q)
+            if e["type"] == "agent_trace" and e["data"]["phase"] == "reflection_verdict")
+        assert verdict_evt["verdict"] == "confirm"
+        assert abs(verdict_evt["adjustedSizeFraction"] - 0.2) < 1e-9
+        assert abs(session._round_trace["reflectionAdjustedSize"] - 0.2) < 1e-9
+    finally:
+        await dispose_engine()
+
+
+async def test_reflection_emits_start_and_verdict_trace_phases():
+    """交易意愿轮反思发 reflection_start + reflection_verdict 两阶段轨迹（ReAct 复核留痕）。"""
+    await init_db()
+    session, _, _ = _make_reflect_session(action="open_long", verdict="confirm")
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        phases = [e["data"]["phase"] for e in _drain(q) if e["type"] == "agent_trace"]
+        assert "reflection_start" in phases
+        assert "reflection_verdict" in phases
     finally:
         await dispose_engine()

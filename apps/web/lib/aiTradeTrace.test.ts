@@ -124,6 +124,49 @@ describe("applyAiTradeTracePhase", () => {
     expect(t[0].analysis).toBe("B");
   });
 
+  it("reflection 三阶段：start 置 pending、reflection 累积、verdict 落裁决并清 pending", () => {
+    let t = applyAiTradeTracePhase([], ev("round_start", 1));
+    // reflection_start：进入二次反思，置在飞指示。
+    t = applyAiTradeTracePhase(
+      t,
+      ev("reflection_start", 1, {
+        input: { action: "open_long", sizeFraction: 0.5, confidence: 0.8, reason: "顺势" },
+      }),
+    );
+    expect(t[0].reflectionPending).toBe(true);
+    // reflection：复核推理流式累积。
+    t = applyAiTradeTracePhase(t, ev("reflection", 1, { delta: "高周期" }));
+    t = applyAiTradeTracePhase(t, ev("reflection", 1, { delta: "顶背离" }));
+    expect(t[0].reflection).toBe("高周期顶背离");
+    // reflection_verdict：落 abort 裁决、理由、收缩后仓位并清 pending。
+    t = applyAiTradeTracePhase(
+      t,
+      ev("reflection_verdict", 1, { verdict: "abort", reason: "追多风险高", adjustedSizeFraction: null }),
+    );
+    expect(t[0].reflectionPending).toBe(false);
+    expect(t[0].reflectionVerdict).toBe("abort");
+    expect(t[0].reflectionReason).toBe("追多风险高");
+    expect(t[0].reflectionAdjustedSize).toBeNull();
+  });
+
+  it("reflection_verdict confirm 携收缩后仓位", () => {
+    let t = applyAiTradeTracePhase([], ev("round_start", 1));
+    t = applyAiTradeTracePhase(
+      t,
+      ev("reflection_verdict", 1, { verdict: "confirm", reason: "减仓更稳", adjustedSizeFraction: 0.2 }),
+    );
+    expect(t[0].reflectionVerdict).toBe("confirm");
+    expect(t[0].reflectionAdjustedSize).toBe(0.2);
+  });
+
+  it("round_start 幂等刷新保留已累积反思文本", () => {
+    let t = applyAiTradeTracePhase([], ev("round_start", 1));
+    t = applyAiTradeTracePhase(t, ev("reflection", 1, { delta: "复核中" }));
+    t = applyAiTradeTracePhase(t, ev("round_start", 1, { lastPx: 200 }));
+    expect(t[0].reflection).toBe("复核中"); // 与 thinking/analysis 同：幂等刷新不丢累积
+    expect(t[0].lastPx).toBe(200);
+  });
+
   it("未知 phase 走 default 容错（向后兼容，不崩）", () => {
     let t = applyAiTradeTracePhase([], ev("round_start", 1));
     t = applyAiTradeTracePhase(t, ev("analysis", 1, { delta: "X" }));

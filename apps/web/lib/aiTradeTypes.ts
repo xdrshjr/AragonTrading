@@ -144,9 +144,16 @@ export interface AiTradeDecision {
   marketDigest?: MarketDigest | null;     // R1：价格走势/成交量/因子证据摘要（可为 null）
   multiTimeframeContext?: MultiTimeframeContext | null;
   trigger?: "candle" | "interval";        // wake-interval：唤醒来源（K 线唤醒 / 墙钟定时唤醒）
+  // 下单前二次反思裁决（ai-trade-pre-trade-reflection §2.6）：无反思轮（hold / 关闭）为 null。
+  reflectionVerdict?: "confirm" | "abort" | null;
+  reflectionReason?: string | null;
 }
 
+// 反思裁决枚举（与后端 ReflectionVerdict.verdict 镜像）。
+export type AiReflectionVerdict = "confirm" | "abort";
+
 // 决策认知轨迹阶段（ai-auto-trading-agent-trace §5.3；与后端 trace.PHASES 镜像）。
+// reflection_*：下单前二次反思三阶段（ai-trade-pre-trade-reflection §4.4）。
 export type AiTradeTracePhase =
   | "round_start"
   | "thinking"
@@ -156,7 +163,10 @@ export type AiTradeTracePhase =
   | "result"
   | "summary"
   | "error"
-  | "retry";
+  | "retry"
+  | "reflection_start"
+  | "reflection"
+  | "reflection_verdict";
 
 // agent_trace 事件 data（各字段按 phase 可选；前端 reducer 按 phase 归约）。
 export interface AiTradeTraceEvent {
@@ -184,8 +194,10 @@ export interface AiTradeTraceEvent {
   multiTimeframeContext?: MultiTimeframeContext | null; // round_start（决策级中线背景）
   attempt?: number; // retry：当前重试序号（1-based）
   maxAttempts?: number; // retry：本轮最大重试次数
-  reason?: string; // retry：触发本次重试的上一次 degrade 原因
+  reason?: string; // retry：触发本次重试的上一次 degrade 原因 / reflection_verdict：反思理由
   trigger?: "candle" | "interval"; // round_start：唤醒来源（K 线唤醒 / 墙钟定时唤醒）
+  verdict?: AiReflectionVerdict; // reflection_verdict：反思裁决（confirm/abort）
+  adjustedSizeFraction?: number | null; // reflection_verdict：实际收缩后的开仓仓位占比（无收缩为 null）
 }
 
 // store / snapshot 的已装配单轮轨迹（thinking/analysis 累积；env 环形 ≤20）。
@@ -210,6 +222,12 @@ export interface AiTradeRoundTrace {
   errorMessage?: string | null;
   retries?: number; // §4.4：本轮已重试次数（retry 阶段累加）
   lastRetryReason?: string | null; // 最近一次触发重试的 degrade 原因
+  // 下单前二次反思（ai-trade-pre-trade-reflection §5.2）：仅交易意愿轮被写入，hold/关闭轮维持初值。
+  reflection?: string; // 累积反思复核推理文本（默认 ""）
+  reflectionPending?: boolean; // 反思在飞指示（默认 false）
+  reflectionVerdict?: AiReflectionVerdict | null; // 反思裁决（默认 null）
+  reflectionReason?: string | null;
+  reflectionAdjustedSize?: number | null; // 实际收缩后的仓位占比（无收缩为 null）
   state: "deciding" | "done" | "skipped" | "error";
 }
 

@@ -35,6 +35,7 @@ from .market_digest import build_market_digest
 from .market_window import MarketWindow
 from .multi_timeframe_context import build_multi_timeframe_context
 from .prompts import DECISION_TOOL_NAME
+from .reflection import apply_reflection, applied_shrink
 from .signals import (
     Consensus,
     StrategySignalView,
@@ -44,7 +45,14 @@ from .signals import (
     evaluate_signal_board,
     make_shadow_broker,
 )
-from .trace import _TRACES_MAX, TraceEmit, new_round_trace, trace_event
+from .trace import (
+    _TRACES_MAX,
+    TraceEmit,
+    new_round_trace,
+    reflection_start_event,
+    reflection_verdict_event,
+    trace_event,
+)
 
 _SNAPSHOT_EQUITY_MAX = 1000
 _DECISIONS_MAX = 50
@@ -399,6 +407,9 @@ class AiTradeSession:
             decision, degrade = await self.decider.decide(
                 payload, emit=self._make_trace_emit(round_no, ts))
             decision, degrade = self._apply_consensus_gate(decision, consensus, degrade)  # E2 门禁
+            # 二次反思（ReAct 复核，仅交易意愿触发；只会更保守）——共识门禁后、真实执行前。
+            decision, degrade = await self._reflect_before_execute(
+                round_no, ts, payload, decision, degrade)
             executed = await self._execute_decision(decision, ref_px, i, ts)
             self.rounds_completed = round_no
             # RC-2/RC-3：研判全文只走 agent_trace/_traces；进 journal 与 decision 事件的取有界摘录（≤400）。
@@ -408,13 +419,15 @@ class AiTradeSession:
             summary = await self.decider.commit_round(payload, decision, executed, analysis=excerpt)
             await self._emit_tool_call_trace(round_no, ts, decision)
             await self._emit_result_trace(round_no, ts, executed, degrade)
+            reflection_verdict, reflection_reason = self._round_reflection_summary()
             await self._emit_decision(round_no, ts, decision, board, executed,
                                       market_context=payload.get("marketContext"),
                                       consensus=payload.get("consensus"),
                                       degrade_reason=degrade, analysis=excerpt,
                                       market_digest=payload.get("marketDigest"),
                                       multi_timeframe_context=payload.get("multiTimeframeContext"),
-                                      trigger=trigger)
+                                      trigger=trigger, reflection_verdict=reflection_verdict,
+                                      reflection_reason=reflection_reason)
             if degrade:
                 await self._emit_degraded(ts, degrade)
             if summary is not None:
@@ -446,8 +459,49 @@ class AiTradeSession:
             consensus=trace["consensus"], marketDigest=trace["marketDigest"],
             trigger=trace["trigger"]))
 
+    # ---------- 下单前二次反思编排（ai-trade-pre-trade-reflection §2.3；精简，装配下沉 trace.py）----------
+    async def _reflect_before_execute(self, round_no: int, ts: int, payload: dict,
+                                      decision: TradeDecision, degrade: str | None
+                                      ) -> tuple[TradeDecision, str | None]:
+        """交易意愿决策在真实下单前经一次独立反思复核（只会更保守）；hold/关闭反思时原样直通。"""
+        if not self.decider.reflection_enabled or decision.action == "hold":
+            return decision, degrade                 # 关闭 或 无交易意愿 → 无 LLM、无轨迹
+        await self._begin_reflection_trace(round_no, ts, decision)
+        verdict = await self.decider.reflect(
+            payload, decision, emit=self._make_trace_emit(round_no, ts))
+        final, new_degrade = apply_reflection(decision, degrade, verdict, self.decider.position_step)
+        await self._emit_reflection_verdict_trace(round_no, ts, verdict, decision, final)
+        return final, new_degrade
+
+    async def _begin_reflection_trace(self, round_no: int, ts: int,
+                                      decision: TradeDecision) -> None:
+        """reflection_start：置在飞指示 + 推被复核决策快照（装配走 trace.py builder，RV-2）。"""
+        if self._round_trace is not None:
+            self._round_trace["reflectionPending"] = True
+        await self._push(reflection_start_event(round_no, ts, decision))
+
+    async def _emit_reflection_verdict_trace(self, round_no: int, ts: int, verdict,
+                                             original: TradeDecision,
+                                             final: TradeDecision) -> None:
+        """reflection_verdict：落裁决/理由/实际收缩后仓位并清在飞指示（装配走 trace.py builder，RV-2）。"""
+        adjusted = applied_shrink(original, final)
+        trace = self._round_trace
+        if trace is not None:
+            trace["reflectionVerdict"] = verdict.verdict
+            trace["reflectionReason"] = verdict.reason
+            trace["reflectionAdjustedSize"] = adjusted
+            trace["reflectionPending"] = False
+        await self._push(reflection_verdict_event(round_no, ts, verdict, adjusted))
+
+    def _round_reflection_summary(self) -> tuple[str | None, str | None]:
+        """从在飞轮次取本轮反思裁决/理由（供 decision 事件搭顺风车；hold/关闭轮为 (None, None)）。"""
+        trace = self._round_trace
+        if trace is None:
+            return None, None
+        return trace.get("reflectionVerdict"), trace.get("reflectionReason")
+
     def _make_trace_emit(self, round_no: int, ts: int) -> TraceEmit:
-        """返回注入 decider 的 emit 闭包：补 round/ts、原地累积 thinking/analysis、扇出 agent_trace。"""
+        """返回注入 decider 的 emit 闭包：补 round/ts、原地累积 thinking/analysis/reflection、扇出 agent_trace。"""
         async def _emit(part: dict) -> None:
             phase = part.get("phase")
             data = {"phase": phase, "round": round_no, "ts": ts}
@@ -459,7 +513,7 @@ class AiTradeSession:
             delta = part.get("delta")
             if delta is not None:
                 data["delta"] = delta
-                if trace is not None and phase in ("thinking", "analysis"):
+                if trace is not None and phase in ("thinking", "analysis", "reflection"):
                     trace[phase] += delta
             name = part.get("name")
             if name is not None:
@@ -663,12 +717,15 @@ class AiTradeSession:
                              analysis: str | None = None,
                              market_digest: dict | None = None,
                              multi_timeframe_context: dict | None = None,
-                             trigger: str = "candle") -> None:
+                             trigger: str = "candle",
+                             reflection_verdict: str | None = None,
+                             reflection_reason: str | None = None) -> None:
         """推 decision 事件；E1/E2/E3 + R1 研判摘录/证据摘要搭顺风车下发（旧前端忽略未知字段，向前兼容）。
 
         `analysis` 为有界摘录（≤`_ANALYSIS_EXCERPT_CHARS`，供左栏决策卡首段；完整思维链见 agent_trace/
         snapshot.agentTraces，RC-3）；`market_digest` 为本轮价格走势/成交量/因子证据（小、~10 数值）；
-        `trigger` 为本轮唤醒来源（candle/interval，供前端区分周期唤醒）。
+        `trigger` 为本轮唤醒来源（candle/interval，供前端区分周期唤醒）；`reflection_verdict/reason` 为
+        下单前二次反思裁决（无反思轮为 None）。
         """
         data = {"ts": ts, "round": round_no, "action": decision.action,
                 "sizeFraction": decision.size_fraction, "confidence": decision.confidence,
@@ -676,7 +733,8 @@ class AiTradeSession:
                 "executed": executed, "marketContext": market_context,
                 "consensus": consensus, "degradeReason": degrade_reason,
                 "analysis": analysis, "marketDigest": market_digest,
-                "multiTimeframeContext": multi_timeframe_context, "trigger": trigger}
+                "multiTimeframeContext": multi_timeframe_context, "trigger": trigger,
+                "reflectionVerdict": reflection_verdict, "reflectionReason": reflection_reason}
         self._last_decision = data
         self._decisions.append(data)
         await self._push({"type": "decision", "data": data})
@@ -688,7 +746,8 @@ class AiTradeSession:
                 "executed": {"ok": True, "skipped": True, "reason": "decision_in_flight"},
                 "marketContext": None, "consensus": None, "degradeReason": None,
                 "analysis": None, "marketDigest": None,
-                "multiTimeframeContext": None, "trigger": "candle"}
+                "multiTimeframeContext": None, "trigger": "candle",
+                "reflectionVerdict": None, "reflectionReason": None}
         self._last_decision = data
         self._decisions.append(data)
         await self._push({"type": "decision", "data": data})
@@ -838,6 +897,7 @@ def _digest_decisions(records, cap: int) -> list[dict]:
             "executed": _executed_flag(d.get("executed")),
             "confidence": d.get("confidence"),
             "reason": reason[:_DECISION_REASON_CHARS] if isinstance(reason, str) else None,
+            "reflectionVerdict": d.get("reflectionVerdict"),   # §2.6：反思裁决随历史近况下发（缺省 None）
         })
     return out
 

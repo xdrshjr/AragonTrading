@@ -125,6 +125,17 @@ class Settings(BaseSettings):
     ai_trade_retry_base_ms: int = 500     # 指数退避基数（复用 agent.llm.retry.backoff_delay_ms 语义）
     ai_trade_retry_max_ms: int = 8000     # 单次退避封顶
     ai_trade_min_confidence: float = 0.0         # 置信度门槛（<该值降级 hold）；默认 0=不启用
+    # ---- 下单前二次反思校验（ai-trade-pre-trade-reflection §4.3）----
+    # 决策与真实下单之间插入一次独立的反思 LLM 子调用：仅对交易意愿（open_long/open_short/close）触发，
+    # hold 跳过。反思只会更保守（否决→hold 或收缩仓位，绝不放大/反向），fail-closed（超时/错误→hold）。
+    # 总闸默认开（真实交易理应经校验，用户明确诉求）；False 逐字回退当前「决策即下单」行为。决策器直接
+    # 构造默认关（reflection_enabled: bool=False），生产装配（manager/backtest_manager）从此处显式打开。
+    # env 名 AI_TRADE_REFLECTION_* 已在 desktop config.js prod 透传白名单内（AI_TRADE_ 前缀）。
+    ai_trade_reflection_enabled: bool = True      # 反思总闸；False 逐字回退「决策即下单」
+    ai_trade_reflection_timeout_s: float = 45.0   # 单次反思 LLM 超时（超时 fail-closed → hold）
+    # 反思瞬时失败（超时/LLM 错误/无工具/非法裁决）重试次数，复用决策同款退避基建；穷尽后 fail-closed。
+    # abort 是模型真实终态裁决，零重试。默认 2（即最多 3 次反思 LLM 调用）。
+    ai_trade_reflection_max_retries: int = Field(default=2, ge=0)
     # ---- 综合研判增强包（ai-auto-trading-enhancements v4 · E1/E2/E4）----
     # E1 市场体制上下文：默认开（只读输入增强，向决策 prompt 注入一行市场体制；数据不足/异常自动省略）。
     ai_trade_regime_context: bool = True         # E1：每轮注入市场体制上下文（只读；False=不注入）

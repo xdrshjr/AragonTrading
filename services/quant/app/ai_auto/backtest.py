@@ -46,6 +46,7 @@ from .multi_timeframe_context import (
     decision_timeframes,
 )
 from .prompts import build_ai_trade_system_prompt
+from .reflection import apply_reflection
 from .signals import (
     Consensus,
     StrategySignalView,
@@ -92,6 +93,7 @@ class AiBacktestSpec:
     rest: object                # OKX rest client（取历史区间用）
     provider: object            # LlmProviderConfig（造决策 LLMClient 用）
     position_step_pct: float = 0.0   # 仓位操作档位步长（fraction；0=连续，直接构造该 dataclass 的既有测试零回归）
+    reflection_enabled: bool = False   # 下单前二次反思（默认关 → 直接构造该 dataclass 的既有回测测试零回归，RV-1）
 
 
 # ============================ 线格式序列化助手（纯函数） ============================
@@ -159,6 +161,9 @@ class AiBacktestRunner:
         self.settings = spec.settings
         self.rest = spec.rest
         self.position_step_pct = spec.position_step_pct   # 档位吸附（实盘/回测经共享决策脑单点收口，§2.3）
+        # 下单前二次反思（RV-1：经数据类字段传参，__init__ 一次性构造决策器时接收；默认关 → 直接构造
+        # AiBacktestSpec/Runner 且用默认 Settings 的既有回测测试零回归，不平白多一次未脚本化反思调用）。
+        self.reflection_enabled = spec.reflection_enabled
 
         self.warmup = _compute_warmup(self.specs, spec.settings.ai_trade_regime_context)
         self.decider = AiTradeDecider(
@@ -166,7 +171,7 @@ class AiBacktestRunner:
             build_ai_trade_system_prompt(self.inst_id, self.bar, self.initial_capital, self.leverage,
                                          position_step_pct=self.position_step_pct),
             context_refresh_rounds=self.context_refresh_rounds, settings=self.settings,
-            position_step_pct=self.position_step_pct)
+            position_step_pct=self.position_step_pct, reflection_enabled=self.reflection_enabled)
         self._oco_risk = RiskParams(
             stop_loss_pct=spec.stop_loss_pct or None, take_profit_pct=spec.take_profit_pct or None,
             max_hold_bars=self.settings.ai_trade_default_max_hold_bars or None)
@@ -180,6 +185,10 @@ class AiBacktestRunner:
         self.action_counts: dict[str, int] = {"open_long": 0, "open_short": 0, "close": 0, "hold": 0}
         self.degraded_rounds = 0
         self.timeout_rounds = 0
+        # 下单前二次反思观测计数（§2.5；reflection_enabled=False 时恒 0，逐字等价旧行为）。
+        self.reflection_runs = 0          # 真跑过反思的轮数（交易意愿轮）
+        self.reflection_aborts = 0        # 反思否决（abort / fail-closed）→ 降级 hold 的轮数
+        self.reflection_adjustments = 0   # 反思确认但收缩了仓位的轮数
         self.summary_count = 0
         self._confidences: list[float] = []
         self._reached_cap = False
@@ -329,13 +338,23 @@ class AiBacktestRunner:
             round_no, ts, ref_px, main_df, context_frames, i, board, consensus)
         decision, decide_degrade = await self.decider.decide(payload)          # 唯一 async（LLM）
         decision, gate_reason = apply_consensus_gate(decision, consensus, self.min_consensus)
+        # 二次反思（决策脑不变式：回测复用同一 decider.reflect，emit=None 轨迹全程空转）。verdict 须在分支外
+        # 预置 None（RV-3），否则 hold 轮走 else 分支时 _tally_reflection(verdict) 会 NameError。
+        verdict = None
+        reflect_reason = gate_reason
+        size_before = decision.size_fraction if decision.action in ("open_long", "open_short") else None
+        if self.decider.reflection_enabled and decision.action != "hold":
+            verdict = await self.decider.reflect(payload, decision)             # emit 缺省 None
+            decision, reflect_reason = apply_reflection(
+                decision, gate_reason, verdict, self.position_step_pct)         # 复用 session 同款纯函数
         executed = self._execute(decision)
         self.rounds_done = round_no
         self._tally(decision, decide_degrade, gate_reason)
+        self._tally_reflection(verdict, size_before, decision)   # verdict is None → 空转（不递增计数）
         # R-P1-3：commit_round 收门禁后的最终 decision，journal/摘要据此记真实动作（保持上下文纯净）。
         summary = await self.decider.commit_round(payload, decision, executed)
         self._emit_decision(job, round_no, ts, decision, board, executed, payload,
-                            decide_degrade or gate_reason)
+                            decide_degrade or reflect_reason, verdict)
         if summary is not None:
             self._emit_summary(job, round_no, ts, summary)
 
@@ -423,9 +442,22 @@ class AiBacktestRunner:
         if decide_degrade in ("decision_timeout", "llm_error"):   # LLM 超时/失败回落 hold 的轮数
             self.timeout_rounds += 1
 
+    def _tally_reflection(self, verdict, size_before: float | None,
+                          decision_after: TradeDecision) -> None:
+        """反思观测计数（§2.5）：`verdict is None`（关闭/hold 轮）→ 空转，保证 reflection_enabled=False
+        逐字等价旧行为。否则计 runs，并据裁决计 aborts（→hold）或 adjustments（confirm 且严格收缩）。"""
+        if verdict is None or not verdict.ran:
+            return
+        self.reflection_runs += 1
+        if verdict.degrade_reason is not None or verdict.verdict == "abort":
+            self.reflection_aborts += 1
+        elif (size_before is not None and decision_after.size_fraction is not None
+              and decision_after.size_fraction < size_before):
+            self.reflection_adjustments += 1
+
     def _emit_decision(self, job: "_BacktestJob", round_no: int, ts: int, decision: TradeDecision,
                        board: list[StrategySignalView], executed: dict, payload: dict,
-                       degrade: str | None) -> None:
+                       degrade: str | None, verdict=None) -> None:
         data = {"ts": ts, "round": round_no, "barIndex": self._bars_processed,
                 "action": decision.action, "sizeFraction": decision.size_fraction,
                 "confidence": decision.confidence, "reason": decision.reason,
@@ -433,7 +465,8 @@ class AiBacktestRunner:
                 "marketContext": payload.get("marketContext"), "consensus": payload.get("consensus"),
                 "marketDigest": payload.get("marketDigest"),   # RC-10：与实盘 decision 事件对称
                 "multiTimeframeContext": payload.get("multiTimeframeContext"),
-                "degradeReason": degrade, "executed": executed}
+                "degradeReason": degrade, "executed": executed,
+                "reflectionVerdict": verdict.verdict if verdict is not None and verdict.ran else None}
         self._decisions_digest.append(data)
         job.publish({"type": "decision", "data": data})
 
@@ -514,6 +547,8 @@ class AiBacktestRunner:
             "holdRate": round(self.action_counts["hold"] / total, 4) if total else 0.0,
             "avgConfidence": round(sum(confidences) / len(confidences), 4) if confidences else 0.0,
             "degradedRounds": self.degraded_rounds, "timeoutRounds": self.timeout_rounds,
+            "reflectionRuns": self.reflection_runs, "reflectionAborts": self.reflection_aborts,
+            "reflectionAdjustments": self.reflection_adjustments,
             "summaryCount": self.summary_count, "finalSummary": self.decider.summary,
             "decisionEveryBars": self.decision_every_bars, "plannedRounds": self.planned_rounds,
             "reachedRoundCap": self._reached_cap}

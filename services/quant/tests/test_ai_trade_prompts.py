@@ -6,10 +6,14 @@
 """
 from __future__ import annotations
 
+from app.ai_auto.decider import TradeDecision
 from app.ai_auto.prompts import (
     DECISION_TOOL_NAME,
+    REFLECTION_TOOL_NAME,
     build_ai_trade_system_prompt,
     build_decision_prompt,
+    build_reflection_prompt,
+    build_reflection_system_prompt,
 )
 
 
@@ -123,3 +127,25 @@ def test_decision_prompt_reports_all_context_missing_without_guessing():
     text = build_decision_prompt(payload)
     assert "中线背景暂不可用，已回退基础周期" in text
     assert "不得补猜" in text
+
+
+# ---------- 下单前二次反思 prompt（ai-trade-pre-trade-reflection §4.2）----------
+def test_reflection_system_prompt_is_reviewer_role_only_tightens():
+    p = build_reflection_system_prompt()
+    assert "风控复核官" in p and "批判性地复核" in p
+    assert "只能" in p and ("收紧" in p or "调小仓位" in p)
+    assert "无权" in p and ("放大" in p or "改变方向" in p)
+    assert "必须且只能调用一次" in p and REFLECTION_TOOL_NAME in p
+
+
+def test_reflection_prompt_carries_evidence_and_proposed_decision():
+    """反思输入含本轮证据（复用决策证据装配）+ 被复核的提议决策 + 反思工具指令。"""
+    payload = _payload_with_digest()
+    decision = TradeDecision("open_long", 0.5, 0.8, "顺势开多")
+    text = build_reflection_prompt(payload, decision)
+    assert "价格走势" in text and "技术因子" in text      # 复用决策证据装配
+    assert "待复核的交易决策" in text and "开多" in text and "顺势开多" in text
+    assert REFLECTION_TOOL_NAME in text
+    # 明确中和原决策工具指令，避免复核官误调 submit_trade_decision。
+    assert f"不要**调用 {DECISION_TOOL_NAME}" in text or "与你无关" in text
+    assert text.rstrip().endswith("也不得调用其它工具。")

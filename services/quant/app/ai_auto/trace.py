@@ -13,11 +13,17 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:                       # 仅类型标注用，运行期不导入（with future annotations 不触发环）
+    from .decider import ReflectionVerdict, TradeDecision
 
 # 轨迹阶段常量（前后端镜像；session 按此织入，前端 reducer 按此归约）。
 # retry：可重试失败降级前的重试面包屑（ai-trade-decision-llm-retry §4.4），前端据此重置本轮累积。
+# reflection_*：下单前二次反思三阶段（ai-trade-pre-trade-reflection §2.6），仅交易意愿轮出现。
 PHASES = ("round_start", "thinking", "analysis", "tool_call_start",
-          "tool_call", "result", "summary", "error", "retry")
+          "tool_call", "result", "summary", "error", "retry",
+          "reflection_start", "reflection", "reflection_verdict")
 
 # 合并冲刷阈值：累计 ≥48 字符 / 相变 / 工具起始 / 收尾 即冲刷一条 delta（轮间隔以分钟计，量级极低）。
 _TRACE_FLUSH_CHARS = 48
@@ -97,6 +103,9 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         "executed": None, "degradeReason": None,
         "summary": None, "errorMessage": None,
         "retries": 0, "lastRetryReason": None,   # §4.4：本轮重试计数 + 最近一次触发原因
+        # 下单前二次反思（ai-trade-pre-trade-reflection §5.2）：仅交易意愿轮被写入，hold/关闭轮维持初值。
+        "reflection": "", "reflectionPending": False,
+        "reflectionVerdict": None, "reflectionReason": None, "reflectionAdjustedSize": None,
         "state": "deciding",
     }
 
@@ -105,3 +114,18 @@ def trace_event(phase: str, round_no: int, ts: int, **data) -> dict:
     """构造 `agent_trace` WS 事件信封（沿用既有 `{type,data}`；老前端忽略未知 type，向后兼容）。"""
     return {"type": "agent_trace",
             "data": {"phase": phase, "round": round_no, "ts": ts, **data}}
+
+
+# ---------- 下单前二次反思轨迹装配（RV-2：下沉 trace.py 控 session.py 增量）----------
+def reflection_start_event(round_no: int, ts: int, decision: "TradeDecision") -> dict:
+    """reflection_start：进入二次反思，携被复核决策快照（仅交易意愿轮出现）。"""
+    return trace_event("reflection_start", round_no, ts, input={
+        "action": decision.action, "sizeFraction": decision.size_fraction,
+        "confidence": decision.confidence, "reason": decision.reason})
+
+
+def reflection_verdict_event(round_no: int, ts: int, verdict: "ReflectionVerdict",
+                             adjusted_size_fraction: float | None = None) -> dict:
+    """reflection_verdict：反思裁决（confirm/abort）+ 实际收缩后仓位（若有）+ 理由。"""
+    return trace_event("reflection_verdict", round_no, ts, verdict=verdict.verdict,
+                       adjustedSizeFraction=adjusted_size_fraction, reason=verdict.reason)

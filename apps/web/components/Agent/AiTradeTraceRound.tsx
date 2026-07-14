@@ -11,6 +11,7 @@ import {
   describeMultiTimeframeAlignment,
   describeMultiTimeframeFrame,
   describePriceAction,
+  describeReflection,
   describeRegime,
   describeStance,
   describeTraceState,
@@ -162,6 +163,63 @@ function DecisionToolCard({ trace }: { trace: AiTradeRoundTrace }) {
   );
 }
 
+/**
+ * 二次反思（ReAct 校验）段（ai-trade-pre-trade-reflection §三）：置于决策工具卡与执行结果之间——
+ * 流式反思复核文本（markdown）+ 裁决 chip + 理由 + 收缩后仓位。仅交易意愿轮（有反思在飞/文本/裁决）渲染。
+ */
+function ReflectionBlock({ trace }: { trace: AiTradeRoundTrace }) {
+  const view = describeReflection(trace);
+  const text = trace.reflection ?? "";
+  const streaming = Boolean(trace.reflectionPending);
+  if (!view && !text) return null; // hold / 关闭反思轮：不渲染反思段
+  const adjusted = trace.reflectionAdjustedSize;
+  return (
+    <div className="flex flex-col gap-1.5 rounded-[10px] border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] px-2.5 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1 text-[11px] font-medium text-[var(--text)]">
+          <span className="leading-none">🔎</span>二次反思（ReAct 校验）
+        </span>
+        {view && (
+          <span
+            className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+            style={{ color: TONE_VAR[view.tone], backgroundColor: toneSoft(view.tone) }}
+          >
+            {streaming && (
+              <span
+                className="inline-block h-1.5 w-1.5 animate-pulse rounded-full"
+                style={{ backgroundColor: TONE_VAR[view.tone] }}
+              />
+            )}
+            {view.label}
+          </span>
+        )}
+      </div>
+      {(text || streaming) && (
+        <div className="text-[11px] leading-relaxed text-[var(--muted)]">
+          {!text ? (
+            <span>正在复核…</span>
+          ) : streaming ? (
+            <span className="whitespace-pre-wrap">
+              {text}
+              <span className="ml-0.5 inline-block h-3 w-[2px] translate-y-0.5 animate-pulse bg-current align-middle" />
+            </span>
+          ) : (
+            <div className="flex flex-col">{renderMarkdown(text)}</div>
+          )}
+        </div>
+      )}
+      {trace.reflectionReason && !streaming && (
+        <p className="text-[11px] leading-relaxed text-[var(--text)]">{trace.reflectionReason}</p>
+      )}
+      {adjusted != null && (
+        <p className="text-[10px] text-[var(--muted)]">
+          收缩后仓位 {fmtNum(adjusted * 100, 0)}%
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** 执行结果行：按 AiExecTone 着色的状态点 + 中文标签 + 结果持仓方向；异常轮显示 errorMessage。 */
 function ResultRow({ trace }: { trace: AiTradeRoundTrace }) {
   if (trace.errorMessage) {
@@ -287,6 +345,7 @@ export default function AiTradeTraceRound({ trace }: { trace: AiTradeRoundTrace 
       <RetryBreadcrumb trace={trace} />
       <AnalysisBlock trace={trace} />
       <DecisionToolCard trace={trace} />
+      <ReflectionBlock trace={trace} />
       <ResultRow trace={trace} />
       <SignalContext trace={trace} />
       {trace.summary && <SummaryNode summary={trace.summary} />}

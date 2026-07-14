@@ -36,8 +36,13 @@ from ..config import Settings
 from .prompts import (
     DECISION_TOOL_DESCRIPTION,
     DECISION_TOOL_NAME,
+    REFLECTION_TOOL_DESCRIPTION,
+    REFLECTION_TOOL_NAME,
+    REFLECTION_TOOL_SCHEMA,
     build_decision_prompt,
     build_decision_tool_schema,
+    build_reflection_prompt,
+    build_reflection_system_prompt,
     build_summary_prompt,
     build_summary_system_prompt,
 )
@@ -58,10 +63,20 @@ _RETRYABLE_DEGRADE_REASONS = frozenset(
 # 每次重试前退避的抖动上限（ms），镜像 agent/llm/retry.py 的 _JITTER_MS 语义（§4.3）。
 _RETRY_JITTER_MS = 250
 
+# 反思专属「可重试」原因白名单（瞬时反思失败）；`reflection_abort` **不在集内**——它是模型的真实终态
+# 裁决，零重试（对齐 decider 对 low_confidence 的处理，ai-trade-pre-trade-reflection §2.4/RV-5）。
+_RETRYABLE_REFLECTION_REASONS = frozenset(
+    {"reflection_timeout", "reflection_llm_error", "reflection_no_tool", "reflection_invalid"})
+
 
 def _is_retryable_degrade(reason: str | None) -> bool:
     """该 degrade 原因是否属于瞬时/无有效产出（可重试）；None 与 low_confidence 返回 False。"""
     return reason in _RETRYABLE_DEGRADE_REASONS
+
+
+def _is_retryable_reflection(reason: str | None) -> bool:
+    """该反思 fail-closed 原因是否可重试；None 与 reflection_abort（终态裁决）返回 False（§2.4/RV-5）。"""
+    return reason in _RETRYABLE_REFLECTION_REASONS
 
 
 def _retry_hint_suffix(reason: str) -> str:
@@ -84,6 +99,12 @@ def _hold(reason: str) -> TradeDecision:
     return TradeDecision(action="hold", size_fraction=None, confidence=None, reason=reason)
 
 
+def _fail_closed(reason: str) -> "ReflectionVerdict":
+    """反思瞬时失败/非法裁决的安全回落：等价 abort（本轮不下单），`degrade_reason` 为可重试原因（§2.2）。"""
+    return ReflectionVerdict(verdict="abort", adjusted_size_fraction=None, confidence=None,
+                             reason=reason, degrade_reason=reason, ran=True)
+
+
 def _clamp01(value) -> float | None:
     try:
         n = float(value)
@@ -92,20 +113,39 @@ def _clamp01(value) -> float | None:
     return max(0.0, min(n, 1.0))
 
 
+@dataclass
+class ReflectionVerdict:
+    """下单前二次反思裁决（ai-trade-pre-trade-reflection §5.1）：confirm/abort + 可选收缩仓位 + 理由。"""
+
+    verdict: str                          # "confirm" | "abort"
+    adjusted_size_fraction: float | None  # 仅 confirm 且模型给了收缩值时有值（原始 [0,1] 提议，量化在 apply）
+    confidence: float | None
+    reason: str
+    degrade_reason: str | None            # 非空 = fail-closed（等价 abort），如 reflection_timeout；abort 为 None
+    ran: bool                             # True=真跑过反思；False=关闭/未触发（供 apply_reflection 直通 + 轨迹判定）
+
+
 class AiTradeDecider:
     """持 LLMClient + 滚动上下文的决策器；每轮 `decide` 出决策，`commit_round` 记录并按需摘要。"""
 
     def __init__(self, llm: LLMClient, system_prompt: str, *,
                  context_refresh_rounds: int, settings: Settings,
-                 position_step_pct: float = 0.0):
+                 position_step_pct: float = 0.0, reflection_enabled: bool = False):
         self._llm = llm
         self.system_prompt = system_prompt
         self.context_refresh_rounds = max(1, int(context_refresh_rounds))
         self.settings = settings
         # 仓位操作档位步长（fraction；0=连续，保证所有既有直接构造 AiTradeDecider(...) 的位置零回归）。
         self._position_step = max(0.0, float(position_step_pct))
+        # 下单前二次反思总闸（默认关；直接构造该决策器的既有测试/回测 → reflect 无副作用直通、逐字零回归。
+        # 生产装配 manager/backtest_manager 从 req.settings.ai_trade_reflection_enabled 显式打开，§2.3）。
+        self.reflection_enabled = bool(reflection_enabled)
         self._tool = ToolSchema(name=DECISION_TOOL_NAME, description=DECISION_TOOL_DESCRIPTION,
                                 input_schema=build_decision_tool_schema(self._position_step))
+        # 反思唯一放行工具（镜像决策工具的「唯一放行」范式，安全由回落兜底，§2.2）。
+        self._reflection_tool = ToolSchema(name=REFLECTION_TOOL_NAME,
+                                           description=REFLECTION_TOOL_DESCRIPTION,
+                                           input_schema=REFLECTION_TOOL_SCHEMA)
         self._context: list[LlmMessage] = []
         self._summary: str = ""
         self._journal: list[dict] = []
@@ -126,6 +166,11 @@ class AiTradeDecider:
     def last_analysis(self) -> str:
         """本轮研判思维链全文（供 session 派生有界摘录入 journal/decision 事件）；降级轮为空串。"""
         return self._last_analysis
+
+    @property
+    def position_step(self) -> float:
+        """开仓档位步长（fraction，只读）；供 session 反思收缩量化吸附到合法档位（§2.3/RV-4）。"""
+        return self._position_step
 
     # ---------- 决策 ----------
     async def decide(self, payload: dict, *, emit: TraceEmit | None = None
@@ -258,6 +303,103 @@ class AiTradeDecider:
             size = quantize_size_fraction(size, self._position_step)
             return TradeDecision(action, size, confidence, reason), None
         return TradeDecision(action, None, confidence, reason), None
+
+    # ---------- 下单前二次反思（ai-trade-pre-trade-reflection §2.2/§2.4）----------
+    async def reflect(self, payload: dict, decision: TradeDecision, *,
+                      emit: TraceEmit | None = None) -> ReflectionVerdict:
+        """对本轮**交易意愿**决策做一次独立的下单前复核；返回 `ReflectionVerdict`（只会更保守）。
+
+        无状态子调用：用独立 system prompt + 单轮 messages（**不拼 `_context/_journal`**），只传
+        `submit_trade_reflection` 一个工具、无 `tool_choice`；安全由回落兜底（超时/LLM 错误/无工具/非法
+        裁决 → fail-closed，等价 abort）。瞬时失败先带有界退避重试至多 `ai_trade_reflection_max_retries`
+        次（复用 decide 同款退避），穷尽才 fail-closed；`abort` 是终态裁决、零重试；`asyncio.CancelledError`
+        立即上抛（绝不吞、绝不降级，使 stop() 能干净取消在飞反思）。
+
+        `reflection_enabled=False`（直接构造决策器的既有测试/回测）→ 无副作用直通（不调 LLM），返回
+        `ran=False` 的确认裁决，`apply_reflection` 据此原样透传（逐字零回归，§2.3）。
+        """
+        if not self.reflection_enabled:
+            return ReflectionVerdict("confirm", None, None, "", None, ran=False)
+        max_retries = max(0, int(self.settings.ai_trade_reflection_max_retries))
+        verdict = await self._attempt_reflection(payload, decision, emit)
+        attempt = 0
+        while (verdict.degrade_reason is not None
+               and _is_retryable_reflection(verdict.degrade_reason)
+               and attempt < max_retries):
+            attempt += 1
+            await self._retry_backoff(attempt)                # 复用 decide 退避（可被 cancel 中断）
+            verdict = await self._attempt_reflection(payload, decision, emit)
+        return verdict
+
+    async def _attempt_reflection(self, payload: dict, decision: TradeDecision,
+                                  emit: TraceEmit | None) -> ReflectionVerdict:
+        """单次反思尝试：流式复核 → 映射裁决；任一瞬时失败回 fail-closed（可重试原因）。"""
+        try:
+            raw = await asyncio.wait_for(
+                self._stream_reflection(payload, decision, emit),
+                timeout=self.settings.ai_trade_reflection_timeout_s)
+        except asyncio.TimeoutError:
+            return _fail_closed("reflection_timeout")
+        except asyncio.CancelledError:
+            raise                    # 会话停止：绝不吞、绝不降级，向上抛（先于下方 except Exception）
+        except Exception as exc:  # noqa: BLE001 —— 任何 LLM/网络失败 fail-closed（校验不可用时不下单）
+            logger.warning("ai-trade reflect attempt failed: %s", exc)
+            return _fail_closed("reflection_llm_error")
+        return self._map_reflection(raw)
+
+    async def _stream_reflection(self, payload: dict, decision: TradeDecision,
+                                 emit: TraceEmit | None = None) -> dict | None:
+        """流式累积首个 `submit_trade_reflection` 的 partial_json 并解析（镜像 `_stream_decision`）。
+
+        复核推理经 `phase="reflection"` 合并后 `emit`（`emit is None` 时空转，回测/单测零副作用）；反思
+        工具起始**不**发 tool_call_start（裁决经 reflection_verdict 呈现，非工具卡）。无有效工具调用 → None。
+        """
+        system = build_reflection_system_prompt()
+        user_msg = LlmMessage("user", [TextBlock(build_reflection_prompt(payload, decision))])
+        accs: dict[str, dict] = {}
+        order: list[str] = []
+        pump = _TraceCoalescer(emit)             # emit=None → 全程空转
+        async for ev in self._llm.stream(system=system, messages=[user_msg],
+                                          tools=[self._reflection_tool]):
+            if ev.kind in ("text_delta", "thinking_delta"):
+                await pump.feed("reflection", ev.text or "")
+            elif ev.kind == "tool_use_start":
+                await pump.flush()               # 复核文本段结束，先冲刷（反思无 tool_call_start 占位）
+                accs[ev.id] = {"name": ev.name or "", "parts": []}
+                order.append(ev.id)
+            elif ev.kind == "tool_use_args_delta":
+                if ev.id in accs:
+                    accs[ev.id]["parts"].append(ev.partial_json or "")
+            elif ev.kind == "error":
+                await pump.flush()
+                raise RuntimeError(ev.message or ev.code or "LLM_ERROR")
+            elif ev.kind == "message_done":
+                await pump.flush()
+                break
+        for tid in order:                        # 取首条有效 submit_trade_reflection
+            if accs[tid]["name"] == REFLECTION_TOOL_NAME:
+                raw = "".join(accs[tid]["parts"]).strip() or "{}"
+                try:
+                    return json.loads(raw)
+                except json.JSONDecodeError:
+                    return None                  # 入参非法 → fail-closed（invalid）
+        return None                              # 未产生工具调用 → fail-closed（no_tool）
+
+    def _map_reflection(self, raw: dict | None) -> ReflectionVerdict:
+        """把反思工具入参映射为 `ReflectionVerdict`；任一不合法一律 fail-closed（安全关键，只会更保守）。"""
+        if not isinstance(raw, dict):
+            return _fail_closed("reflection_no_tool")
+        verdict = raw.get("verdict")
+        reason = str(raw.get("reason") or "")
+        if verdict not in ("confirm", "abort"):
+            return _fail_closed("reflection_invalid")
+        confidence = _clamp01(raw.get("confidence"))
+        if verdict == "abort":                   # 模型真实终态否决（degrade_reason=None → 零重试）
+            return ReflectionVerdict("abort", None, confidence, reason or "reflection_abort",
+                                     None, ran=True)
+        # confirm：adjustedSizeFraction 只作「收缩」提议（apply_reflection 量化后对原值取 min，只减不增）。
+        adjusted = _clamp01(raw.get("adjustedSizeFraction"))
+        return ReflectionVerdict("confirm", adjusted, confidence, reason, None, ran=True)
 
     # ---------- 轮次记录 + 滚动摘要 ----------
     async def commit_round(self, payload: dict, decision: TradeDecision,

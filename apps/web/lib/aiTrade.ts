@@ -360,6 +360,25 @@ export function describeExecuted(
   return { label: "观望", tone: "muted" };
 }
 
+export interface AiReflectionView {
+  label: string; // 复核中… / 二次反思确认 / 二次反思否决 · 观望
+  tone: AiTraceTone;
+}
+
+/**
+ * 下单前二次反思裁决中文化（ai-trade-pre-trade-reflection §三 describeReflection 单点）：把在飞/裁决态归一
+ * 为一枚标签 + tone。复核中（pending）→ accent；confirm → long（绿·校验通过放行）；abort → short（红·否决
+ * 观望）。无反思（hold/关闭轮，两者皆空）→ null（组件不渲染反思段）。
+ */
+export function describeReflection(
+  trace: Pick<AiTradeRoundTrace, "reflectionPending" | "reflectionVerdict">,
+): AiReflectionView | null {
+  if (trace.reflectionPending) return { label: "二次反思复核中…", tone: "accent" };
+  if (trace.reflectionVerdict === "confirm") return { label: "二次反思确认执行", tone: "long" };
+  if (trace.reflectionVerdict === "abort") return { label: "二次反思否决 · 观望", tone: "short" };
+  return null;
+}
+
 export interface AiTradeTriggerView {
   label: string; // 触发原因短语
   tone: AiTraceTone; // long | short | muted | accent（复用轮头着色体系）

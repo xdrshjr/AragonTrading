@@ -13,6 +13,7 @@ from sqlalchemy import select
 
 from app.ai_auto.backtest import AiBacktestRunner, AiBacktestSpec, _BacktestJob
 from app.agent.llm.base import StreamEvent
+from app.ai_auto.prompts import REFLECTION_TOOL_NAME
 from app.config import Settings
 from app.db import repositories as repo
 from app.db.models import Strategy
@@ -57,7 +58,7 @@ async def _seed_spec():
 
 
 def _spec(sid, paper_spec, candles, *, every=40, refresh=3, max_rounds=400,
-          tp_usd=None, sl_usd=None) -> AiBacktestSpec:
+          tp_usd=None, sl_usd=None, reflection_enabled=False) -> AiBacktestSpec:
     start_ts = candles[60]["ts"]          # 前 60 根作暖机（regime min_bars=60），用户区间自 60 起
     end_ts = candles[-1]["ts"]
     return AiBacktestSpec(
@@ -66,7 +67,8 @@ def _spec(sid, paper_spec, candles, *, every=40, refresh=3, max_rounds=400,
         initial_capital=10000.0, leverage=3.0, stop_loss_pct=0.05, take_profit_pct=0.1,
         take_profit_usd=tp_usd, stop_loss_usd=sl_usd, context_refresh_rounds=refresh,
         min_consensus=0, planned_rounds=6,
-        settings=Settings(ai_backtest_max_rounds=max_rounds), rest=object(), provider=object())
+        settings=Settings(ai_backtest_max_rounds=max_rounds), rest=object(), provider=object(),
+        reflection_enabled=reflection_enabled)
 
 
 def _patch_loaders(monkeypatch, candles, llm):
@@ -334,5 +336,99 @@ async def test_session_stop_loss_halts_decisions_and_notes(monkeypatch):
         assert job.state == "completed"
         # 触发会话止损后不再决策，末段仅盯市 → notes 记因
         assert any("会话级" in n for n in job.result["notes"])
+    finally:
+        await dispose_engine()
+
+
+# ---------- 下单前二次反思（ai-trade-pre-trade-reflection §6.2 回测同步）----------
+class _ReflectStubLLM:
+    """回测桩：决策流 submit_trade_decision（奇开多/偶平仓）；反思流 submit_trade_reflection（固定裁决）。"""
+
+    def __init__(self, verdict: str):
+        self._verdict = verdict
+        self.reflection_calls = 0
+        self.decision_calls = 0
+
+    async def stream(self, *, system, messages, tools):
+        if not tools:                                  # 摘要流
+            yield StreamEvent("text_delta", text="综合执行摘要")
+            yield StreamEvent("message_done", stop_reason="end")
+            return
+        if tools[0].name == REFLECTION_TOOL_NAME:      # 反思流
+            self.reflection_calls += 1
+            args = {"verdict": self._verdict, "reason": "复核结论"}
+            yield StreamEvent("tool_use_start", id="rf", name=REFLECTION_TOOL_NAME)
+            yield StreamEvent("tool_use_args_delta", id="rf", partial_json=json.dumps(args))
+            yield StreamEvent("message_done", stop_reason="tool_use")
+            return
+        self.decision_calls += 1                       # 决策流
+        args = _alternating(self.decision_calls)
+        yield StreamEvent("tool_use_start", id="d", name="submit_trade_decision")
+        yield StreamEvent("tool_use_args_delta", id="d", partial_json=json.dumps(args))
+        yield StreamEvent("message_done", stop_reason="tool_use")
+
+
+async def test_reflection_abort_blocks_submit_and_counts(monkeypatch):
+    """reflection_enabled=True + 反思全 abort → 所有交易意愿被否决为 hold（无成交）、reflectionAborts>0。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        llm = _ReflectStubLLM("abort")
+        _patch_loaders(monkeypatch, candles, llm)
+        runner = AiBacktestRunner(
+            _spec(sid, paper, candles, every=40, refresh=3, reflection_enabled=True))
+        job = _BacktestJob("aibt_reflect_abort", runner)
+        await runner.run(job)
+        assert job.state == "completed"
+        stats = job.result["aiStats"]
+        # 6 决策轮，奇数轮 open_long 被反思否决 → 反思只在交易意愿轮触发（open_long=3、close=3 → 6 次）
+        assert llm.reflection_calls == 6
+        assert stats["reflectionRuns"] == 6
+        assert stats["reflectionAborts"] == 6
+        assert stats["reflectionAdjustments"] == 0
+        # 全部意愿被否 → 主账户从未真正成交（无 trades）
+        assert len(job.result["trades"]) == 0
+        assert stats["actionCounts"]["hold"] == 6      # 全轮最终动作为 hold（否决后）
+    finally:
+        await dispose_engine()
+
+
+async def test_reflection_confirm_lets_trades_land(monkeypatch):
+    """reflection_enabled=True + 反思全 confirm → 交易照常落地，reflectionRuns 计数、Aborts=0。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        llm = _ReflectStubLLM("confirm")
+        _patch_loaders(monkeypatch, candles, llm)
+        runner = AiBacktestRunner(
+            _spec(sid, paper, candles, every=40, refresh=3, reflection_enabled=True))
+        job = _BacktestJob("aibt_reflect_confirm", runner)
+        await runner.run(job)
+        assert job.state == "completed"
+        stats = job.result["aiStats"]
+        assert stats["reflectionRuns"] == 6
+        assert stats["reflectionAborts"] == 0
+        assert len(job.result["trades"]) > 0           # confirm → 开多/平仓照常成交
+    finally:
+        await dispose_engine()
+
+
+async def test_reflection_disabled_default_no_calls_zero_counts(monkeypatch):
+    """零回归门禁：默认 reflection_enabled=False（直接构造 spec）→ 无反思调用、三计数恒 0、行为等价旧版。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        llm = _ReflectStubLLM("abort")                 # 即便脚本备了 abort，也绝不被调用
+        _patch_loaders(monkeypatch, candles, llm)
+        runner = AiBacktestRunner(_spec(sid, paper, candles, every=40, refresh=3))  # 默认关
+        job = _BacktestJob("aibt_reflect_off", runner)
+        await runner.run(job)
+        assert job.state == "completed"
+        stats = job.result["aiStats"]
+        assert llm.reflection_calls == 0
+        assert stats["reflectionRuns"] == 0
+        assert stats["reflectionAborts"] == 0
+        assert stats["reflectionAdjustments"] == 0
+        assert len(job.result["trades"]) > 0           # 与旧行为一致：交易照常落地
     finally:
         await dispose_engine()

@@ -340,7 +340,8 @@ class AiTradeManager:
             build_ai_trade_system_prompt(plan.inst_id, req.bar, plan.budget_usd, ctx.lever,
                                          position_step_pct=req.position_step_pct),
             context_refresh_rounds=req.context_refresh_rounds, settings=req.settings,
-            position_step_pct=req.position_step_pct)
+            position_step_pct=req.position_step_pct,
+            reflection_enabled=req.settings.ai_trade_reflection_enabled)   # 生产实盘显式开（默认 True）
         run_id = await self._create_group_run(ctx, plan, tp_i, sl_i)
         session = AiTradeSession(
             f"aitrade_{uuid.uuid4().hex}", run_id, req.specs, plan.inst_id, req.bar, executor,

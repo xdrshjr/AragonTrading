@@ -138,6 +138,12 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     errorMessage: null,
     retries: 0,
     lastRetryReason: null,
+    // 下单前二次反思（ai-trade-pre-trade-reflection §5.2）：仅交易意愿轮被写入，hold/关闭轮维持初值。
+    reflection: "",
+    reflectionPending: false,
+    reflectionVerdict: null,
+    reflectionReason: null,
+    reflectionAdjustedSize: null,
     state: "deciding",
   };
 }
@@ -175,6 +181,21 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
         retries: (t.retries ?? 0) + 1,
         lastRetryReason: evt.reason ?? null,
       };
+    case "reflection_start":
+      // 进入二次反思：置在飞指示（携被复核决策快照仅走 WS，不入轮次；轮次只留 pending 与后续累积）。
+      return { ...t, reflectionPending: true };
+    case "reflection":
+      // 反思复核推理流式增量累积。
+      return { ...t, reflection: (t.reflection ?? "") + (evt.delta ?? "") };
+    case "reflection_verdict":
+      // 反思裁决：落 verdict/reason/实际收缩后仓位并清在飞指示。
+      return {
+        ...t,
+        reflectionPending: false,
+        reflectionVerdict: evt.verdict ?? null,
+        reflectionReason: evt.reason ?? null,
+        reflectionAdjustedSize: evt.adjustedSizeFraction ?? null,
+      };
     default:
       return t;
   }
@@ -195,7 +216,9 @@ export function applyAiTradeTracePhase(
     const next =
       idx >= 0
         ? traces.map((t, i) =>
-            i === idx ? { ...seed, thinking: t.thinking, analysis: t.analysis } : t,
+            i === idx
+              ? { ...seed, thinking: t.thinking, analysis: t.analysis, reflection: t.reflection }
+              : t,
           )
         : [...traces, seed];
     return next.slice(-AI_TRADE_TRACES_MAX);

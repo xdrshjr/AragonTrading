@@ -11,6 +11,7 @@ import {
   describeExecuted,
   describeFactors,
   describePriceAction,
+  describeReflection,
   describeRegime,
   describeMultiTimeframeAlignment,
   describeMultiTimeframeFrame,
@@ -327,6 +328,31 @@ describe("describeExecuted (E3, four states + tone)", () => {
   });
   it("plain hold is muted 观望", () => {
     expect(describeExecuted("hold", { traded: false }, null)).toEqual({ label: "观望", tone: "muted" });
+  });
+});
+
+describe("describeReflection (下单前二次反思裁决态)", () => {
+  it("pending reflection reads as accent 复核中", () => {
+    expect(describeReflection({ reflectionPending: true, reflectionVerdict: null })).toEqual({
+      label: "二次反思复核中…",
+      tone: "accent",
+    });
+  });
+  it("confirm verdict reads as long-toned 确认执行", () => {
+    expect(describeReflection({ reflectionPending: false, reflectionVerdict: "confirm" })).toEqual({
+      label: "二次反思确认执行",
+      tone: "long",
+    });
+  });
+  it("abort verdict reads as short-toned 否决观望", () => {
+    expect(describeReflection({ reflectionPending: false, reflectionVerdict: "abort" })).toEqual({
+      label: "二次反思否决 · 观望",
+      tone: "short",
+    });
+  });
+  it("returns null for a round without reflection (hold / disabled)", () => {
+    expect(describeReflection({ reflectionPending: false, reflectionVerdict: null })).toBeNull();
+    expect(describeReflection({})).toBeNull();
   });
 });
 

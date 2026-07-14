@@ -249,6 +249,76 @@ def build_decision_prompt(payload: dict) -> str:
     return "\n".join(parts)
 
 
+# ============================ 下单前二次反思校验（ai-trade-pre-trade-reflection §4.1/§4.2）============================
+# 反思决策工具名（决策器据 tool_use_start.name 匹配；反思系统 prompt 亦引用）。
+REFLECTION_TOOL_NAME = "submit_trade_reflection"
+
+# `submit_trade_reflection` 的 input_schema（JSON Schema）。verdict/reason 必填；abort 忽略 adjustedSizeFraction。
+REFLECTION_TOOL_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["confirm", "abort"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "adjustedSizeFraction": {"type": "number", "minimum": 0, "maximum": 1},
+        "reason": {"type": "string", "maxLength": 500},
+    },
+    "required": ["verdict", "reason"],
+}
+
+REFLECTION_TOOL_DESCRIPTION = (
+    "提交本轮下单前的二次反思裁决。你是独立的风控复核官——对刚才另一名交易员基于同样证据给出的**交易决策**"
+    "（会真实下单、动用真金）做批判性复核。verdict=confirm 确认执行、abort 否决（本轮降级为观望不下单）。"
+    "confirm 时可给 adjustedSizeFraction（**仅当 < 原仓位时收缩**，否则忽略；绝不放大）。reason 给出复核结论。"
+    "你只能收紧（否决或调小仓位），无权放大或改变方向。"
+)
+
+
+def build_reflection_system_prompt() -> str:
+    """反思复核官系统 prompt：批判性复核提议决策是否稳健，只可收紧（否决/收缩），收尾必调反思工具。"""
+    return (
+        "你是一名独立的下单前风控复核官。刚才另一名交易员基于同样的证据给出了一个**交易决策**（会真实"
+        "下单、动用真金）。你的职责**不是**重新交易，而是**批判性地复核这个决策是否稳健**："
+        "① 方向是否被证据支持、有无更强的反向信号被忽略；② 是否与更高周期中线背景 / 市场体制冲突；"
+        "③ 结合当前真实持仓与会话累计盈亏，这笔交易的风险敞口是否可接受、是否在追高/杀跌/频繁反手；"
+        "④ 仓位是否偏重、能否更保守；⑤ 是否存在证据不足却强行交易。"
+        "若发现任何足以令你不放心的问题，选择 `abort`（宁可错过，不可做错）；只有当你确信该决策稳健时"
+        "才 `confirm`。你**只能**收紧（否决或调小仓位），**无权**放大仓位或改变方向。"
+        "收尾必须且只能调用一次 `submit_trade_reflection` 提交裁决——绝不允许只输出复核文字而不调用工具。"
+    )
+
+
+def _format_reflection_decision(decision) -> str:
+    """把被复核的提议决策压成一行（供反思输入）。"""
+    action_label = {"open_long": "开多", "open_short": "开空", "close": "平仓"}.get(
+        decision.action, decision.action)
+    size = ("" if decision.size_fraction is None
+            else f"，仓位占比={decision.size_fraction}")
+    conf = ("" if decision.confidence is None
+            else f"，置信度={decision.confidence}")
+    return (f"待复核的交易决策：{action_label}（{decision.action}）{size}{conf}。"
+            f"该决策的理由：{decision.reason or '（未给出）'}")
+
+
+def build_reflection_prompt(payload: dict, decision) -> str:
+    """把「本轮全部证据 + 提议决策」压成复核输入（复用决策 prompt 的证据装配 + 追加提议决策与复核指令）。
+
+    反思是无状态子调用：**不拼 `_context`**，只把本轮证据（体制/共识/多周期/信号板/持仓/盈亏）与刚给出的
+    决策一次性传入，让复核官在同一证据面上独立批判研判（ai-trade-pre-trade-reflection §八 RV-5 落地）。
+    """
+    evidence = build_decision_prompt(payload)
+    return (
+        "【以下是原交易员看到的本轮全部证据（含其收尾调用 submit_trade_decision 的任务指令）——仅供你复核"
+        "时参考其判断依据；那条决策指令**是给原交易员的、与你无关**，你**不要**调用 submit_trade_decision】\n"
+        f"{evidence}\n\n"
+        "————\n"
+        f"{_format_reflection_decision(decision)}\n\n"
+        "请以资深风控/交易员的批判视角复核上述交易决策是否稳健（方向、与高周期背景是否冲突、当前持仓与"
+        "会话盈亏下风险敞口是否可接受、仓位是否偏重、有无证据不足强行交易）。若确有不放心处则 `abort`"
+        "（宁可错过不可做错），确信稳健才 `confirm`；只能收紧、不得放大或改向。"
+        f"你的**唯一任务**是必须且只能调用一次 {REFLECTION_TOOL_NAME} 提交裁决——不得只输出复核文字，"
+        "也不得调用其它工具。")
+
+
 def build_summary_system_prompt() -> str:
     """摘要器系统 prompt：把执行历程压成简洁背景，供后续轮以纯净上下文继续。"""
     return (

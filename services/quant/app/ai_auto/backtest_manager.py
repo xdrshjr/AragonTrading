@@ -127,7 +127,8 @@ class AiBacktestManager:
             min_consensus=(req.min_consensus if req.min_consensus is not None
                            else settings.ai_trade_min_consensus),
             planned_rounds=planned, settings=settings, rest=get_rest_client(), provider=provider,
-            position_step_pct=req.position_step_pct)
+            position_step_pct=req.position_step_pct,
+            reflection_enabled=settings.ai_trade_reflection_enabled)   # RV-1：生产回测显式开（默认 True）
 
     # ---------- 前置门禁辅助 ----------
     @staticmethod

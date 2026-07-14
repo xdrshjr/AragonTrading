@@ -145,6 +145,66 @@ describe("AiTradeAgentTrace", () => {
     expect(screen.getByText(/已降级观望/)).toBeInTheDocument();
   });
 
+  it("trade-intent round renders the 二次反思 segment with an abort verdict chip", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            state: "done",
+            analysis: "开多",
+            toolCall: { action: "hold", reason: "追多风险高" },
+            executed: { ok: true, traded: false, positionAfter: "flat", action: "hold" },
+            degradeReason: "reflection_abort",
+            reflection: "高周期顶背离，追多风险高",
+            reflectionVerdict: "abort",
+            reflectionReason: "追多风险高",
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText(/二次反思（ReAct 校验）/)).toBeInTheDocument();
+    expect(screen.getByText("二次反思否决 · 观望")).toBeInTheDocument();
+    expect(screen.getByText("高周期顶背离，追多风险高")).toBeInTheDocument();
+  });
+
+  it("hold round without reflection does not render the 二次反思 segment", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            state: "done",
+            toolCall: { action: "hold", reason: "观望" },
+            executed: { ok: true, traded: false, positionAfter: "flat", action: "hold" },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.queryByText(/二次反思（ReAct 校验）/)).not.toBeInTheDocument();
+  });
+
+  it("confirm-with-shrink round shows the reflection confirm chip and shrunk size", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            state: "done",
+            toolCall: { action: "open_long", sizeFraction: 0.2, confidence: 0.7, reason: "顺势" },
+            executed: { ok: true, traded: true, positionAfter: "long", action: "open_long" },
+            reflection: "方向可，仓位略重",
+            reflectionVerdict: "confirm",
+            reflectionReason: "减仓更稳",
+            reflectionAdjustedSize: 0.2,
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText("二次反思确认执行")).toBeInTheDocument();
+    expect(screen.getByText(/收缩后仓位\s*20%/)).toBeInTheDocument();
+  });
+
   it("summary round renders an expandable context-refresh node", () => {
     render(
       <AiTradeAgentTrace
