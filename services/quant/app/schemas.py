@@ -447,6 +447,7 @@ class AiTradeSessionRow(BaseModel):
     lastDecision: AiTradeDecisionOut | None = None
     contextSummary: str | None = None
     degraded: bool | None = None
+    wakeIntervalMinutes: float | None = None   # Agent 墙钟定时唤醒周期（分钟；null=关闭），契约镜像
 
 
 # ---- AI 自动交易「分组」（ai-trade-multi-symbol-and-timeframe §6.2，镜像 live-auto 分组）----
@@ -478,6 +479,9 @@ class AiTradeGroupStartIn(BaseModel):
     stopLossPct: float | None = Field(default=None, gt=0)    # E4：单仓 OCO 止损%（各成员同值，服务端夹紧）
     takeProfitPct: float | None = Field(default=None, gt=0)  # E4：单仓 OCO 止盈%（各成员同值）
     contextRefreshRounds: int = Field(default=10, ge=1)   # 精确区间在服务端按 min/max 校验
+    # Agent 墙钟定时唤醒周期（分钟）：null/缺省→服务端默认(2)；0→关闭定时唤醒；>0→服务端夹到 [floor_s, ceil_min]。
+    # 入口仅校验 ge=0（0 合法=关闭）；越界不拒绝、由 _resolve_wake_interval_s 防御性夹紧（UX 友好）。
+    wakeIntervalMinutes: float | None = Field(default=None, ge=0)
     priming: bool = True
     primingBars: int = Field(default=300, ge=10, le=PAPER_WINDOW_MAX)
     # 仓位操作档位步长（fraction）：null/缺省→服务端默认；0→连续（仅 API/后端退出口，UI 不露出）。
@@ -518,6 +522,7 @@ class AiTradeGroupRow(BaseModel):
     contextRefreshRounds: int
     createdTs: int
     members: list[AiTradeGroupMemberRow]
+    wakeIntervalMinutes: float | None = None   # Agent 墙钟定时唤醒周期（分钟；null=关闭），契约镜像
 
 
 class AiTradeGroupStartOut(AiTradeGroupRow):

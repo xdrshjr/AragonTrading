@@ -44,6 +44,7 @@ export function groupStateFromStatus(row: AiTradeGroupRow): AiTradeGroupState {
     totalBudgetUsd: row.totalBudgetUsd,
     leverage: row.leverage,
     contextRefreshRounds: row.contextRefreshRounds,
+    wakeIntervalMinutes: row.wakeIntervalMinutes,   // wake-interval：供面板显示「唤醒周期 N 分钟」
     state: "running",
     startedTs: row.createdTs,
     members,

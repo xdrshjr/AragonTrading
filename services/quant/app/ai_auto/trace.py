@@ -91,6 +91,7 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         "multiTimeframeContext": payload.get("multiTimeframeContext"),
         "consensus": payload.get("consensus"),
         "marketDigest": payload.get("marketDigest"),   # R1：round_start/trace 承载证据摘要（RC-9）
+        "trigger": payload.get("trigger"),   # wake-interval：唤醒来源 candle/interval（round_start 轨迹带来源）
         "thinking": "", "analysis": "",
         "toolCallPending": False, "toolCall": None,
         "executed": None, "degradeReason": None,

@@ -31,6 +31,13 @@ export const AI_TRADE_MAX_SYMBOLS = 5;
 export const AI_TRADE_MAX_SL_PCT = 0.2;
 export const AI_TRADE_MAX_TP_PCT = 0.5;
 
+// ---- Agent 墙钟定时唤醒周期（ai-auto-trading-wake-interval §2.7）----
+// 在既有「确认 K 线 / 策略触发 → 决策」之外叠加第三个唤醒源：墙钟定时唤醒。默认 2 分钟、用户可设任意分钟；
+// 区间与后端 ai_trade_wake_interval_floor_s(30s=0.5min) / ceil_min(240) 对齐（前端越界即时报错、后端防御性夹紧）。
+export const AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN = 2;
+export const AI_TRADE_WAKE_INTERVAL_FLOOR_MIN = 0.5;
+export const AI_TRADE_WAKE_INTERVAL_CEIL_MIN = 240;
+
 // ---- 仓位操作档位（ai-trade-position-sizing-steps §2.1/§4.4）----
 // 用户在启动弹窗选择离散档位步长；AI 每次开仓的 sizeFraction 被服务端量化吸附到档位阶梯上（硬保证在
 // signals.quantize_size_fraction）。默认 0.25 与后端 ai_trade_default_position_step_pct 对齐。
@@ -99,6 +106,23 @@ export function validateContextRounds(
 ): string | null {
   if (!Number.isInteger(rounds) || rounds < min || rounds > max) {
     return `上下文刷新轮数需为 ${min}~${max} 的整数`;
+  }
+  return null;
+}
+
+/**
+ * 校验 Agent 墙钟定时唤醒周期（分钟）：空（null）/0 = 关闭定时唤醒，合法；否则须为 [min, max] 内有限数。
+ * 前端越界即时报错（与 validateContextRounds 前端报错范式一致），后端 _resolve_wake_interval_s 另做防御性
+ * 夹紧——二者区间一致、职责互补（前端给即时反馈、后端兜边界），RN-9。返回错误文案或 null。
+ */
+export function validateWakeInterval(
+  minutes: number | null,
+  min: number = AI_TRADE_WAKE_INTERVAL_FLOOR_MIN,
+  max: number = AI_TRADE_WAKE_INTERVAL_CEIL_MIN,
+): string | null {
+  if (minutes == null || minutes === 0) return null; // 空/0 = 关闭，合法
+  if (!Number.isFinite(minutes) || minutes < min || minutes > max) {
+    return `Agent 唤醒周期需为 ${min}~${max} 分钟（留空或 0 表示关闭）`;
   }
   return null;
 }
@@ -349,16 +373,20 @@ function toneForTriggerAction(action: string): AiTraceTone {
 }
 
 /**
- * 触发原因派生（第 3 轮 R1）：由本轮信号板边沿信号（latestSignal）归纳「是什么触发了这一轮」。
- * 无边沿 → 常规复盘（muted）；单策略触发 → 「<动作>信号 · <策略名>」；多策略同向 → 「N 策略<动作>信号」；
- * 多策略分歧 → 「信号分歧 · a开多/b开空」（沿用 describeConsensus 计数风格）。着色取多/空/其它。
- * 动作中文化复用既有 describeAiAction（同文件），不再自建标签表。
+ * 触发原因派生（第 3 轮 R1 + wake-interval）：由本轮信号板边沿信号（latestSignal）与唤醒来源（trigger）
+ * 归纳「是什么触发了这一轮」。无边沿且 trigger==="interval" → 「周期唤醒 · 常规复盘」（accent）；无边沿且
+ * 其余 → 「K 线收盘 · 常规复盘」（muted）；单策略触发 → 「<动作>信号 · <策略名>」；多策略同向 →
+ * 「N 策略<动作>信号」；多策略分歧 → 「信号分歧 · a开多/b开空」（沿用 describeConsensus 计数风格）。
+ * 着色取多/空/其它。动作中文化复用既有 describeAiAction（同文件），不再自建标签表。
  */
 export function describeTrigger(
-  trace: Pick<AiTradeRoundTrace, "signalBoard">,
+  trace: Pick<AiTradeRoundTrace, "signalBoard" | "trigger">,
 ): AiTradeTriggerView {
   const fired = (trace.signalBoard ?? []).filter((s) => s.latestSignal !== "none");
   if (fired.length === 0) {
+    if (trace.trigger === "interval") {
+      return { label: "周期唤醒 · 常规复盘", tone: "accent" };
+    }
     return { label: "K 线收盘 · 常规复盘", tone: "muted" };
   }
   if (fired.length === 1) {

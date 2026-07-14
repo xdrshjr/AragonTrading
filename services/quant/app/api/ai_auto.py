@@ -61,6 +61,22 @@ def _resolve_position_step(raw: float | None, settings: Settings) -> float:
     return settings.ai_trade_default_position_step_pct if raw is None else raw
 
 
+def _resolve_wake_interval_s(minutes: float | None, settings: Settings) -> float:
+    """Agent 墙钟定时唤醒周期解析（分钟 → 秒并**夹紧**，与 `_resolve_position_step` 同风格但夹紧而非仅回填）。
+
+    `None → 默认（ai_trade_wake_interval_default_min）`；`<=0 → 0`（关闭定时唤醒，退出口）；否则夹到
+    `[ai_trade_wake_interval_floor_s, ai_trade_wake_interval_ceil_min*60]` 秒（越界不拒绝，向 UX 友好收敛；
+    前端 validateWakeInterval 另做即时报错，二者区间一致、职责互补，RN-9）。
+    """
+    if minutes is None:
+        minutes = settings.ai_trade_wake_interval_default_min
+    if minutes <= 0:
+        return 0.0
+    lo = settings.ai_trade_wake_interval_floor_s
+    hi = settings.ai_trade_wake_interval_ceil_min * 60.0
+    return min(max(minutes * 60.0, lo), hi)
+
+
 async def _resolve_account(session: AsyncSession, account_id: int | None) -> repo.OkxAccount:
     """取指定账户或回落默认账户；缺失 → 404，凭证不全 → 400（绝不假数据，对齐 trading 路由）。"""
     if account_id is not None:
@@ -125,7 +141,8 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
         stop_loss_pct=body.stopLossPct, take_profit_pct=body.takeProfitPct,  # E4：单仓 OCO 入参
         priming=body.priming, priming_bars=body.primingBars,
         budget_cap_frac=cap_frac, default_budget_frac=settings.ai_trade_default_capital_frac,
-        position_step_pct=_resolve_position_step(body.positionStepPct, settings))
+        position_step_pct=_resolve_position_step(body.positionStepPct, settings),
+        wake_interval_s=_resolve_wake_interval_s(body.wakeIntervalMinutes, settings))
     try:
         await get_ai_trade_manager().start_group(req)
     except AiTradeGroupPreflightError as exc:

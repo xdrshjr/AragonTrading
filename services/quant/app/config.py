@@ -149,6 +149,14 @@ class Settings(BaseSettings):
     ai_trade_multi_timeframe_context: bool = True  # 多周期中线背景总开关（只读；缺数时显式降级）
     ai_trade_digest_trend_window: int = Field(default=20, ge=2)  # 价格走势/区间位置回看根数
     ai_trade_digest_vol_window: int = Field(default=20, ge=2)    # 成交量均值/zscore 回看根数
+    # ---- Agent 墙钟定时唤醒（ai-auto-trading-wake-interval §2.5）----
+    # 在既有「确认 K 线 → 决策」触发之外叠加第三个唤醒源：一个独立于 K 线周期的墙钟定时唤醒，默认每 2
+    # 分钟让 Agent 用「当前实时价 + 最近信号板 + 持仓」重新研判（两根 K 线之间也能及时止盈损/调仓）。
+    # 复用同一决策管线与全部资金/并发护栏，仅多一种「何时唤醒」的来源。env 名 AI_TRADE_WAKE_INTERVAL_*
+    # 已在 desktop config.js prod 透传白名单内（AI_TRADE_ 前缀），此处声明后方不被 extra="ignore" 静默丢弃。
+    ai_trade_wake_interval_default_min: float = 2.0    # 未显式传值时的默认唤醒周期（分钟）
+    ai_trade_wake_interval_floor_s: float = 30.0       # 唤醒周期硬下限（秒），防高频 LLM 烧钱 / 抖动占比过大
+    ai_trade_wake_interval_ceil_min: float = 240.0     # 唤醒周期硬上限（分钟，= 4h）
     # ---- AI 自动交易 · 回测模式（ai-auto-trading-backtest §2.5，三重决策成本护栏）----
     # 回测每决策根调一次 LLM，成本/时长敏感；三重护栏：决策间隔（降频）+ 决策轮数硬上限（越界启动前
     # 拒绝，绝不静默截断）+ 并发闸（限同时消耗 LLM 的回测数）。字段名即环境变量名（AI_BACKTEST_*，

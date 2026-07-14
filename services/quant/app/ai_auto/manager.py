@@ -120,6 +120,7 @@ class AiTradeGroupStartRequest:
     budget_cap_frac: float = 1.0             # 预算硬上限分数（avail×该值），恒由 api 层显式覆盖（默认 1.0=不约束）
     default_budget_frac: float = 0.01        # 留空默认分数（avail×该值），由 api 解析（默认 1%）
     position_step_pct: float = 0.0           # 仓位操作档位步长（fraction；0=连续，直接构造该 dataclass 的既有测试零回归）
+    wake_interval_s: float = 0.0             # 墙钟定时唤醒周期（秒；0=关闭，直接构造该 dataclass 的既有测试零回归）
 
 
 @dataclass
@@ -146,6 +147,7 @@ class AiTradeGroup:
     context_refresh_rounds: int
     created_ts: int
     members: list[AiTradeGroupMember]
+    wake_interval_s: float = 0.0             # 墙钟定时唤醒周期（秒；0=关闭），group_status 回显换算为分钟
 
 
 @dataclass
@@ -318,7 +320,8 @@ class AiTradeManager:
             strategy_names=[s.strategy_name for s in req.specs],
             total_budget_usd=total, leverage=lever,
             context_refresh_rounds=req.context_refresh_rounds,
-            created_ts=created_ts, members=members)
+            created_ts=created_ts, members=members,
+            wake_interval_s=req.wake_interval_s)
 
     async def _build_member(self, ctx: _GroupBuildCtx, plan: _MemberPlan) -> AiTradeGroupMember:
         """建单成员会话：Executor（按 budget_i）+ Decider + Run（含 groupId/allocationPct）+ Session。
@@ -343,7 +346,8 @@ class AiTradeManager:
             f"aitrade_{uuid.uuid4().hex}", run_id, req.specs, plan.inst_id, req.bar, executor,
             decider, take_profit_usd=tp_i, stop_loss_usd=sl_i,
             priming=req.priming, priming_bars=req.priming_bars,
-            context_refresh_rounds=req.context_refresh_rounds)
+            context_refresh_rounds=req.context_refresh_rounds,
+            wake_interval_s=req.wake_interval_s)
         return AiTradeGroupMember(inst_id=plan.inst_id, allocation_pct=plan.allocation_pct,
                                   budget_usd=plan.budget_usd, session=session, run_id=run_id)
 
@@ -418,6 +422,8 @@ class AiTradeManager:
                 "strategyIds": group.strategy_ids, "strategyNames": group.strategy_names,
                 "totalBudgetUsd": group.total_budget_usd, "leverage": group.leverage,
                 "contextRefreshRounds": group.context_refresh_rounds,
+                "wakeIntervalMinutes": (round(group.wake_interval_s / 60, 4)
+                                        if group.wake_interval_s > 0 else None),
                 "createdTs": group.created_ts,
                 "members": [self._member_row(m) for m in group.members]}
 
@@ -545,7 +551,10 @@ class AiTradeManager:
                         "groupId": ctx.group_id, "allocationPct": plan.allocation_pct,
                         "allocationMode": req.allocation_mode,
                         "totalBudgetUsd": ctx.total_budget_usd,
-                        "positionStepPct": req.position_step_pct},   # P2 观测：档位落 free-form config（零列迁移）
+                        "positionStepPct": req.position_step_pct,   # P2 观测：档位落 free-form config（零列迁移）
+                        # 墙钟定时唤醒周期（分钟；关闭态存 None，与 group_status/info 回执口径一致，RN-7）。
+                        "wakeIntervalMinutes": (round(req.wake_interval_s / 60, 4)
+                                                if req.wake_interval_s > 0 else None)},
                 status="running",
                 # ai-trade-stats-dashboard §3.2：填既有 group_* 列（零迁移），使 ai-trade run 可按组聚合
                 # 出历史会话；各成员冗余同值。组级秒级起点为 ctx.created_ts（P1-3；ctx 无 started_ts）。

@@ -143,6 +143,7 @@ export interface AiTradeDecision {
   analysis?: string | null;               // R1：研判思维链有界摘录（≤400 字；完整全文见 agentTraces）
   marketDigest?: MarketDigest | null;     // R1：价格走势/成交量/因子证据摘要（可为 null）
   multiTimeframeContext?: MultiTimeframeContext | null;
+  trigger?: "candle" | "interval";        // wake-interval：唤醒来源（K 线唤醒 / 墙钟定时唤醒）
 }
 
 // 决策认知轨迹阶段（ai-auto-trading-agent-trace §5.3；与后端 trace.PHASES 镜像）。
@@ -184,6 +185,7 @@ export interface AiTradeTraceEvent {
   attempt?: number; // retry：当前重试序号（1-based）
   maxAttempts?: number; // retry：本轮最大重试次数
   reason?: string; // retry：触发本次重试的上一次 degrade 原因
+  trigger?: "candle" | "interval"; // round_start：唤醒来源（K 线唤醒 / 墙钟定时唤醒）
 }
 
 // store / snapshot 的已装配单轮轨迹（thinking/analysis 累积；env 环形 ≤20）。
@@ -197,6 +199,7 @@ export interface AiTradeRoundTrace {
   consensus?: Consensus | null;
   marketDigest?: MarketDigest | null; // R1：价格走势/成交量/因子证据摘要（round_start 承载）
   multiTimeframeContext?: MultiTimeframeContext | null;
+  trigger?: "candle" | "interval"; // wake-interval：唤醒来源（供 describeTrigger 区分周期唤醒）
   thinking: string; // 累积深度思考（未开启扩展思考时通常为空）
   analysis: string; // 累积自然语言研判分析（流式主可见内容）
   toolCallPending?: boolean;
@@ -232,6 +235,7 @@ export interface AiTradeSessionRow {
   lastDecision?: AiTradeDecision | null;
   contextSummary?: string | null;
   degraded?: boolean | null;
+  wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭）
 }
 
 // WS status 事件负载（_status_payload / 轻量 status，会话视图的可增量合并子集）。
@@ -244,6 +248,7 @@ export interface AiTradeStatusEvent {
   roundsCompleted?: number;
   roundsSinceSummary?: number;
   contextRefreshRounds?: number;
+  wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭）
   degraded?: boolean;
   stopReason?: string | null;
   flattenFailed?: boolean;
@@ -327,6 +332,7 @@ export interface AiTradeGroupStartReq {
   priming?: boolean;
   primingBars?: number;
   positionStepPct?: number | null;  // 仓位操作档位步长（fraction；留空→服务端默认；0→连续）
+  wakeIntervalMinutes?: number | null;  // Agent 墙钟定时唤醒周期（分钟；留空→服务端默认 2；0→关闭）
 }
 
 // 分组成员行（start 回执 / status 视图共用）：完整会话行 + 分配占比。
@@ -345,6 +351,7 @@ export interface AiTradeGroupRow {
   contextRefreshRounds: number;
   createdTs: number;
   members: AiTradeGroupMemberRow[];
+  wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭）
 }
 
 export type AiTradeGroupStartResult = AiTradeGroupRow;
@@ -388,6 +395,7 @@ export interface AiTradeGroupState {
   totalBudgetUsd: number;
   leverage: number;
   contextRefreshRounds: number;
+  wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭，面板显示）
   state: "running" | "stopped";
   startedTs: number;
   members: Record<string, AiTradeGroupMemberState>;
@@ -400,6 +408,8 @@ export interface AiTradeConfig {
   // 仓位操作档位步长（fraction）；[R-7] 声明为**可选**——与「老配置无此键 / aiTradeConfig 可为 null」一致，
   // 读点一律 `aiTradeConfig?.positionStepPct ?? AI_TRADE_DEFAULT_POSITION_STEP` 兜底。
   positionStepPct?: number;
+  // Agent 墙钟定时唤醒周期（分钟）；同样声明为**可选**——读点一律 `?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN` 兜底。
+  wakeIntervalMinutes?: number;
 }
 
 // 别名（spec §3 类型清单）：会话运行期视图 / 轻量状态负载，供 store 与流式路由语义化引用。

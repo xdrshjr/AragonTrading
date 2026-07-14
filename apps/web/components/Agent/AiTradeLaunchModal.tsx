@@ -14,6 +14,7 @@ import {
 import {
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
   AI_TRADE_DEFAULT_POSITION_STEP,
+  AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN,
   AI_TRADE_MAX_SL_PCT,
   AI_TRADE_MAX_STRATEGIES,
   AI_TRADE_MAX_SYMBOLS,
@@ -23,6 +24,7 @@ import {
   positionLadder,
   validateContextRounds,
   validateStrategySelection,
+  validateWakeInterval,
 } from "@/lib/aiTrade";
 import {
   clampGroupBudgetToCap,
@@ -67,6 +69,9 @@ export interface AiTradeLaunchOpts {
   takeProfitPct: number | null;    // E4：单仓 OCO 止盈%
   positionStepPct: number;         // 仓位操作档位步长（fraction；AI 每次开仓规模只能落在该档位阶梯上）
   contextRefreshRounds: number;
+  // Agent 墙钟定时唤醒周期（分钟）：[RN-1] 声明为**可选**（对齐 backtest-only 可选字段），仅 live 分支透传、
+  // base 不含、回测省略——若定为非可选，回测 onConfirm 不带该键将 tsc 编译失败。0/关闭 = 仅按 K 线与策略触发。
+  wakeIntervalMinutes?: number | null;
   // 回测专属（mode==="backtest" 时有效）
   startTs?: number;
   endTs?: number;
@@ -96,6 +101,7 @@ export default function AiTradeLaunchModal({
   defaultStrategyIds,
   defaultContextRounds,
   defaultPositionStepPct,
+  defaultWakeIntervalMinutes,
   error,
   liveGateReason = null,
   defaultStartTs,
@@ -115,6 +121,7 @@ export default function AiTradeLaunchModal({
   defaultStrategyIds: number[];
   defaultContextRounds: number;
   defaultPositionStepPct: number;     // 上次所选仓位操作档位（aiTradeConfig?.positionStepPct ?? 默认，回填弹窗）
+  defaultWakeIntervalMinutes: number; // 上次所选 Agent 唤醒周期（aiTradeConfig?.wakeIntervalMinutes ?? 默认，回填弹窗）
   error?: string | null;
   liveGateReason?: string | null;     // 实盘不可用原因（非 null → 段控禁用实盘、默认落回测，R6）
   defaultStartTs?: number;
@@ -138,6 +145,10 @@ export default function AiTradeLaunchModal({
   const [takeProfitPctRaw, setTakeProfitPctRaw] = useState("");
   const [roundsRaw, setRoundsRaw] = useState(String(defaultContextRounds || AI_TRADE_DEFAULT_CONTEXT_ROUNDS));
   const [positionStep, setPositionStep] = useState(defaultPositionStepPct || AI_TRADE_DEFAULT_POSITION_STEP);
+  // Agent 墙钟定时唤醒周期（分钟，仅实盘段）：初值取 defaultWakeIntervalMinutes（用 ?? 保留 0=关闭偏好）。
+  const [wakeIntervalRaw, setWakeIntervalRaw] = useState(
+    String(defaultWakeIntervalMinutes ?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN),
+  );
   const [startInput, setStartInput] = useState("");
   const [endInput, setEndInput] = useState("");
   const [everyRaw, setEveryRaw] = useState("");
@@ -181,6 +192,7 @@ export default function AiTradeLaunchModal({
     setSelectedIds(defaultStrategyIds);
     setRoundsRaw(String(defaultContextRounds || AI_TRADE_DEFAULT_CONTEXT_ROUNDS));
     setPositionStep(defaultPositionStepPct || AI_TRADE_DEFAULT_POSITION_STEP);
+    setWakeIntervalRaw(String(defaultWakeIntervalMinutes ?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN));
     setCapitalRaw("");
     setLeverageRaw("");
     setTakeProfitRaw("");
@@ -244,6 +256,9 @@ export default function AiTradeLaunchModal({
     stopLossPct.error || takeProfitPct.error || null;
   const strategyError = validateStrategySelection(selectedIds);
   const roundsError = validateContextRounds(roundsValue);
+  // Agent 唤醒周期（仅实盘生效）：空→null（关闭）、否则解析为数；越界即时报错（后端另做防御性夹紧，RN-9）。
+  const wakeMinutes = wakeIntervalRaw.trim() === "" ? null : Number(wakeIntervalRaw);
+  const wakeError = validateWakeInterval(wakeMinutes);
 
   // 成员校验（实盘）：非空、皆可自动交易、各 pct ∈ (0,100]，even 模式 Σ ≤ 100（避免提交即 422）。
   const sumPct = totalAllocation(members);
@@ -307,7 +322,7 @@ export default function AiTradeLaunchModal({
   const baseValid = !inputError && !strategyError && !roundsError;
   const ready =
     mode === "live"
-      ? baseValid && !membersError && acknowledged
+      ? baseValid && !membersError && !wakeError && acknowledged
       : baseValid && instSupported && !!instId && !rangeError && !everyError && !minConsensusError && !roundsCapError;
 
   const handleConfirm = () => {
@@ -325,7 +340,11 @@ export default function AiTradeLaunchModal({
       bar,                                          // 可编辑周期真正生效（不再被 store.bar 覆盖）
     };
     if (mode === "live") {
-      onConfirm({ mode: "live", members, allocationMode, instId: members[0]?.instId ?? instId, ...base });
+      // [RN-1] wakeIntervalMinutes 仅 live 分支带上（base 不含、回测省略）；空→0=关闭定时唤醒。
+      onConfirm({
+        mode: "live", members, allocationMode, instId: members[0]?.instId ?? instId,
+        ...base, wakeIntervalMinutes: wakeMinutes ?? 0,
+      });
       return;
     }
     onConfirm({
@@ -345,7 +364,11 @@ export default function AiTradeLaunchModal({
     strategyError ||
     roundsError ||
     inputError ||
-    (mode === "live" ? membersError : instSupported ? null : "标的不支持自动交易（仅 USDT 本位永续 / 交割合约）") ||
+    (mode === "live"
+      ? membersError || wakeError
+      : instSupported
+        ? null
+        : "标的不支持自动交易（仅 USDT 本位永续 / 交割合约）") ||
     (mode === "backtest" ? rangeError || everyError || minConsensusError || roundsCapError : null) ||
     error;
 
@@ -662,6 +685,28 @@ export default function AiTradeLaunchModal({
             <strong className="text-[var(--text)]">开仓规模</strong>（非分批加/减仓，平仓为全平），AI 每次开仓将吸附到最近的合法档位。
           </span>
         </label>
+
+        {/* Agent 唤醒周期（仅实盘段）：在「确认 K 线 / 策略触发 → 决策」之外叠加墙钟定时唤醒；回测走逐根决策、
+            与墙钟无关，故不露出。留空 / 0 = 关闭定时唤醒。 */}
+        {mode === "live" && (
+          <label className="flex flex-col gap-1 text-[11px] text-[var(--muted)]">
+            <span>Agent 唤醒周期（分钟）</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              value={wakeIntervalRaw}
+              placeholder={String(AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN)}
+              disabled={submitting}
+              onChange={(e) => setWakeIntervalRaw(e.target.value)}
+              aria-label="Agent 唤醒周期（分钟）"
+              className="rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] disabled:opacity-50"
+            />
+            <span className="leading-relaxed text-[var(--muted)]">
+              除按 K 线与策略触发外，每隔此分钟数 Agent 也会用<strong className="text-[var(--text)]">当前实时价</strong>重新研判；
+              越小唤醒越频繁、LLM 调用越多；留空 / 0 = 仅按 K 线与策略触发。
+            </span>
+          </label>
+        )}
 
         {mode === "backtest" && (
           <div className="grid grid-cols-2 gap-3">

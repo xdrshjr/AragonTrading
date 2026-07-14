@@ -4,8 +4,9 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { accountApi } from "@/lib/accountApi";
 import { agentApi } from "@/lib/agentApi";
+import { api } from "@/lib/api";
 import { aiTradeApi } from "@/lib/aiTradeApi";
-import type { AiTradeGroupState } from "@/lib/aiTradeTypes";
+import type { AiTradeGroupRow, AiTradeGroupState } from "@/lib/aiTradeTypes";
 import { useAppStore } from "@/lib/store";
 import { tradingApi } from "@/lib/tradingApi";
 import AiTradeToggle from "./AiTradeToggle";
@@ -122,6 +123,31 @@ describe("AiTradeToggle", () => {
     fireEvent.click(screen.getByRole("switch"));
     expect(screen.queryByText("启动 AI 自动交易")).not.toBeInTheDocument();
     expect(screen.queryByText("AI 自动交易 · 回测")).not.toBeInTheDocument();
+  });
+
+  // wake-interval（ai-auto-trading-wake-interval §6.2）：startM 请求体携 wakeIntervalMinutes（默认 2），
+  // 成功后取自 opts 写入 aiTradeConfig（res 不回显该键，取 res 会让偏好每次重开回落默认）。
+  it("sends wakeIntervalMinutes in the start body and persists it to aiTradeConfig", async () => {
+    vi.mocked(api.strategies).mockResolvedValue([{ id: 1, name: "均线策略" }] as never);
+    const groupRow: AiTradeGroupRow = {
+      groupId: "grp-1", bar: "1H", strategyIds: [1], strategyNames: ["均线策略"],
+      totalBudgetUsd: 100, leverage: 3, contextRefreshRounds: 10, createdTs: 0,
+      members: [], wakeIntervalMinutes: 2,
+    };
+    vi.mocked(aiTradeApi.start).mockResolvedValue(groupRow);
+    useAppStore.setState({ aiTradeAcknowledged: true });
+    renderToggle();
+    await screen.findByTitle("开启 AI 自动交易 / 回测");
+    fireEvent.click(screen.getByRole("switch"));
+    await screen.findByText("均线策略");
+    const confirm = await screen.findByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    await waitFor(() => expect(aiTradeApi.start).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(aiTradeApi.start).mock.calls[0][0].wakeIntervalMinutes).toBe(2);
+    await waitFor(() =>
+      expect(useAppStore.getState().aiTradeConfig?.wakeIntervalMinutes).toBe(2),
+    );
   });
 
   it("stops the whole group when toggled off while running", async () => {

@@ -10,6 +10,7 @@ import { aiTradeApi } from "@/lib/aiTradeApi";
 import {
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
   AI_TRADE_DEFAULT_POSITION_STEP,
+  AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN,
   resolveAiTradeGate,
 } from "@/lib/aiTrade";
 import { ApiRequestError } from "@/lib/api";
@@ -93,16 +94,19 @@ export default function AiTradeToggle() {
         stopLossPct: opts.stopLossPct,       // E4：单仓 OCO 止损%（透传，服务端夹紧）
         takeProfitPct: opts.takeProfitPct,   // E4：单仓 OCO 止盈%
         positionStepPct: opts.positionStepPct,   // 仓位操作档位（透传，服务端默认回填/量化）
+        wakeIntervalMinutes: opts.wakeIntervalMinutes,   // Agent 墙钟定时唤醒周期（透传，服务端默认回填/夹紧）
         contextRefreshRounds: opts.contextRefreshRounds,
       }),
     onSuccess: (res, opts) => {
       setAiTradeGroup(groupStateFromStatus(res));
-      // 记忆偏好（策略集合 + 刷新轮数 + 仓位档位），下次启动回填。[R-4] positionStepPct 须取自 opts——
-      // setAiTradeConfig 是整对象替换且 res 不回显该键，取 res 会让所选档位每次重开都回落默认、永不持久。
+      // 记忆偏好（策略集合 + 刷新轮数 + 仓位档位 + 唤醒周期），下次启动回填。[R-4] positionStepPct/
+      // wakeIntervalMinutes 须取自 opts——setAiTradeConfig 是整对象替换且 res 不回显此二键，取 res 会让
+      // 所选偏好每次重开都回落默认、永不持久。
       setAiTradeConfig({
         strategyIds: res.strategyIds,
         contextRefreshRounds: res.contextRefreshRounds,
         positionStepPct: opts.positionStepPct,
+        wakeIntervalMinutes: opts.wakeIntervalMinutes ?? undefined,
       });
       setModalOpen(false);
       setError(null);
@@ -207,6 +211,7 @@ export default function AiTradeToggle() {
         defaultStrategyIds={defaultStrategyIds}
         defaultContextRounds={aiTradeConfig?.contextRefreshRounds ?? AI_TRADE_DEFAULT_CONTEXT_ROUNDS}
         defaultPositionStepPct={aiTradeConfig?.positionStepPct ?? AI_TRADE_DEFAULT_POSITION_STEP}
+        defaultWakeIntervalMinutes={aiTradeConfig?.wakeIntervalMinutes ?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN}
         error={error}
         liveGateReason={liveGateReason}
         defaultStartTs={backtestStartTs}

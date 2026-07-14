@@ -67,7 +67,7 @@ class AiTradeSession:
                  inst_id: str, bar: str, executor: LiveExecutor, decider: AiTradeDecider, *,
                  take_profit_usd: float | None = None, stop_loss_usd: float | None = None,
                  priming: bool = True, priming_bars: int = 300,
-                 context_refresh_rounds: int = 10):
+                 context_refresh_rounds: int = 10, wake_interval_s: float = 0.0):
         self.session_id = session_id
         self.run_id = run_id
         self._specs = specs
@@ -82,6 +82,9 @@ class AiTradeSession:
         self.priming = priming
         self.priming_bars = priming_bars
         self.context_refresh_rounds = context_refresh_rounds
+        # 墙钟定时唤醒周期（秒；0=关闭）。默认 0 → 定时唤醒关闭，既有直接构造会话的单测行为逐字不变
+        # （与 position_step_pct=0.0 同零回归范式，仅经启动请求显式开启）。
+        self.wake_interval_s = wake_interval_s
 
         self.state = "running"
         self.stop_reason: str | None = None
@@ -105,6 +108,12 @@ class AiTradeSession:
         self._decision_task: asyncio.Task | None = None
         self._monitor_task: asyncio.Task | None = None
         self._last_candle_wall = 0.0
+        # 墙钟定时唤醒复用态（wake-interval §五）：最近一次确认根信号板快照 + 其窗口索引 + 最近实时价 +
+        # 最近一轮决策开始的墙钟（定时器基准，任一轮决策开始即刷新以与 K 线唤醒合流去重）。
+        self._last_board: list[StrategySignalView] | None = None
+        self._last_bar_index = 0
+        self._last_live_px: float | None = None
+        self._last_decision_started_wall = 0.0
         self._stale_degraded = False
         self._degraded_seen = False
         self._last_status_side = executor.projected
@@ -178,7 +187,10 @@ class AiTradeSession:
         await self._prime()
         self._ws = OKXWSClient(self.inst_id, self.bar, self.feed_candle)
         self._ws.start()
-        self._last_candle_wall = time.time()
+        now = time.time()
+        self._last_candle_wall = now
+        # 首次定时唤醒在启动后约 wake_interval_s 触发（而非 t=0 立刻，R-8）。
+        self._last_decision_started_wall = now
         self._monitor_task = asyncio.create_task(self._monitor_loop())
         await self._push({"type": "status", "data": self._status_payload()})
 
@@ -192,10 +204,17 @@ class AiTradeSession:
         if not self.priming or not rows:
             return
         frames = self._window.build_strategy_frames()   # 各策略在整段暖机窗口上的因果帧
-        for i in range(len(self._window.candles)):
-            evaluate_signal_board(self._specs, self._shadows, frames, i)  # 仅种入影子，丢弃视图
+        board: list[StrategySignalView] | None = None
+        n = len(self._window.candles)
+        for i in range(n):
+            board = evaluate_signal_board(self._specs, self._shadows, frames, i)  # 仅种入影子
             if i % 50 == 0:
                 await asyncio.sleep(0)                   # 周期让出事件循环，避免暖机长阻塞
+        # 捕获暖机末根返回视图供定时唤醒复用（不额外多调一次 evaluate_signal_board，避免末根被双重步进）：
+        # 首次定时唤醒可在会话启动 ~wake_interval_s 后即触发，无需干等第一根实时确认 K 线收盘。
+        self._last_board = board
+        self._last_bar_index = n - 1
+        self._last_live_px = self._ref_px()
 
     async def stop(self, reason: str = "user_stop") -> dict:
         """平掉自管持仓 + 停 WS/monitor/决策 + 落 Run 终态（幂等：非 running 直接返回上次结果）。"""
@@ -272,6 +291,28 @@ class AiTradeSession:
         self._degraded_seen = (self._degraded_seen or self.executor.degraded
                                or self._stale_degraded)
         await self._maybe_session_exit(mark, now_ts)
+        await self._maybe_interval_wake()
+
+    async def _maybe_interval_wake(self) -> None:
+        """墙钟定时唤醒（第三触发源，wake-interval §2.2）：满足全部条件时用「最近确认根信号板 + 当前
+        实时价」触发一轮标准决策。in-flight/关闭/非运行/行情陈旧/尚无信号板 → 一律不唤醒。"""
+        if (self.wake_interval_s <= 0 or self.state != "running" or self._deciding
+                or self._stale_degraded or self._last_board is None):
+            return
+        now = time.time()
+        if now - self._last_decision_started_wall < self.wake_interval_s:
+            return
+        self._deciding = True                 # 同步认领槽位：check→set 间无 await（与 feed_candle 同范式，P1-2）
+        ref_px = self._current_px()           # 纯同步取实时价（不 await）
+        self._last_decision_started_wall = now
+        self._decision_task = asyncio.create_task(
+            self._run_decision_round(self._last_board, self._last_bar_index, ref_px,
+                                     int(now), trigger="interval"))
+
+    def _current_px(self) -> float:
+        """定时唤醒取实时价：优先最近未确认/确认根实时价（`is not None` 判定，防 0 价异常断面误回落），
+        回落到最近确认收盘价（`_ref_px`）。价恒 > 0 时二者等价，此处更防御性。"""
+        return self._last_live_px if self._last_live_px is not None else self._ref_px()
 
     async def _latest_mark_px(self) -> float:
         c = self._window.candles
@@ -314,6 +355,7 @@ class AiTradeSession:
         if self.state != "running":
             return
         if not candle.confirm:
+            self._last_live_px = float(candle.c)   # 两根 K 线之间的当前价（供定时唤醒研判最新价位）
             await self._push({"type": "candle", "data": {
                 "ts": candle.ts, "o": candle.o, "h": candle.h, "l": candle.l,
                 "c": candle.c, "vol": candle.vol, "confirm": False}})
@@ -329,19 +371,28 @@ class AiTradeSession:
         ref_px = float(row["c"])
         ts = int(row["ts"])
         board = evaluate_signal_board(self._specs, self._shadows, frames, i)  # 步进影子（快，无 LLM）
+        self._last_board = board                 # 存最近确认根信号板快照 + 索引 + 实时价（供定时唤醒复用）
+        self._last_bar_index = i
+        self._last_live_px = ref_px
         await self._push({"type": "candle", "data": {**row, "confirm": True}})
         if self._deciding:                       # P1-2：上一轮未完成→跳过本轮，不并发
             await self._emit_decision_skipped(ts, board)
             return
         self._deciding = True
-        self._decision_task = asyncio.create_task(self._run_decision_round(board, i, ref_px, ts))
+        self._last_decision_started_wall = time.time()   # 任一轮决策开始即刷新计时器，与定时唤醒合流去重
+        self._decision_task = asyncio.create_task(
+            self._run_decision_round(board, i, ref_px, ts, trigger="candle"))
 
     async def _run_decision_round(self, board: list[StrategySignalView], i: int,
-                                  ref_px: float, ts: int) -> None:
-        """一个决策轮：装配输入 → AI 决策 → 映射 Signal 守护执行 → 记录/摘要 → 推事件（含认知轨迹）。"""
+                                  ref_px: float, ts: int, trigger: str = "candle") -> None:
+        """一个决策轮：装配输入 → AI 决策 → 映射 Signal 守护执行 → 记录/摘要 → 推事件（含认知轨迹）。
+
+        `trigger`（默认 "candle"，K 线唤醒；"interval"=墙钟定时唤醒）透传到 payload / round_start 轨迹 /
+        decision 事件，供 prompt 与前端区分唤醒来源；决策安全性不依赖它。
+        """
         round_no = self.rounds_completed + 1     # RV-5：try 之前绑定，except 可安全引用
         try:
-            payload = self._build_decision_payload(round_no, ts, ref_px, board)
+            payload = self._build_decision_payload(round_no, ts, ref_px, board, trigger)
             consensus = compute_consensus(board)                 # E2：每轮只算一次（供门禁 + wire）
             payload["consensus"] = self._consensus_wire(consensus)
             await self._begin_round_trace(round_no, ts, ref_px, payload, board)  # RV-7：consensus 之后
@@ -362,7 +413,8 @@ class AiTradeSession:
                                       consensus=payload.get("consensus"),
                                       degrade_reason=degrade, analysis=excerpt,
                                       market_digest=payload.get("marketDigest"),
-                                      multi_timeframe_context=payload.get("multiTimeframeContext"))
+                                      multi_timeframe_context=payload.get("multiTimeframeContext"),
+                                      trigger=trigger)
             if degrade:
                 await self._emit_degraded(ts, degrade)
             if summary is not None:
@@ -391,7 +443,8 @@ class AiTradeSession:
             "round_start", round_no, ts, lastPx=ref_px, position=trace["position"],
             signalBoard=trace["signalBoard"], marketContext=trace["marketContext"],
             multiTimeframeContext=trace["multiTimeframeContext"],
-            consensus=trace["consensus"], marketDigest=trace["marketDigest"]))
+            consensus=trace["consensus"], marketDigest=trace["marketDigest"],
+            trigger=trace["trigger"]))
 
     def _make_trace_emit(self, round_no: int, ts: int) -> TraceEmit:
         """返回注入 decider 的 emit 闭包：补 round/ts、原地累积 thinking/analysis、扇出 agent_trace。"""
@@ -550,9 +603,10 @@ class AiTradeSession:
 
     # ---------- decision / summary 事件 ----------
     def _build_decision_payload(self, round_no: int, ts: int, ref_px: float,
-                                board: list[StrategySignalView]) -> dict:
+                                board: list[StrategySignalView],
+                                trigger: str = "candle") -> dict:
         return {
-            "round": round_no, "barTs": ts, "lastPx": ref_px,
+            "round": round_no, "barTs": ts, "lastPx": ref_px, "trigger": trigger,
             "position": self.executor.position_payload(ref_px),
             "sessionPnlUsd": round(self.executor.session_pnl_usd, 4),
             "budgetUsd": self.executor.budget_usd,
@@ -608,11 +662,13 @@ class AiTradeSession:
                              degrade_reason: str | None = None,
                              analysis: str | None = None,
                              market_digest: dict | None = None,
-                             multi_timeframe_context: dict | None = None) -> None:
+                             multi_timeframe_context: dict | None = None,
+                             trigger: str = "candle") -> None:
         """推 decision 事件；E1/E2/E3 + R1 研判摘录/证据摘要搭顺风车下发（旧前端忽略未知字段，向前兼容）。
 
         `analysis` 为有界摘录（≤`_ANALYSIS_EXCERPT_CHARS`，供左栏决策卡首段；完整思维链见 agent_trace/
-        snapshot.agentTraces，RC-3）；`market_digest` 为本轮价格走势/成交量/因子证据（小、~10 数值）。
+        snapshot.agentTraces，RC-3）；`market_digest` 为本轮价格走势/成交量/因子证据（小、~10 数值）；
+        `trigger` 为本轮唤醒来源（candle/interval，供前端区分周期唤醒）。
         """
         data = {"ts": ts, "round": round_no, "action": decision.action,
                 "sizeFraction": decision.size_fraction, "confidence": decision.confidence,
@@ -620,7 +676,7 @@ class AiTradeSession:
                 "executed": executed, "marketContext": market_context,
                 "consensus": consensus, "degradeReason": degrade_reason,
                 "analysis": analysis, "marketDigest": market_digest,
-                "multiTimeframeContext": multi_timeframe_context}
+                "multiTimeframeContext": multi_timeframe_context, "trigger": trigger}
         self._last_decision = data
         self._decisions.append(data)
         await self._push({"type": "decision", "data": data})
@@ -632,7 +688,7 @@ class AiTradeSession:
                 "executed": {"ok": True, "skipped": True, "reason": "decision_in_flight"},
                 "marketContext": None, "consensus": None, "degradeReason": None,
                 "analysis": None, "marketDigest": None,
-                "multiTimeframeContext": None}
+                "multiTimeframeContext": None, "trigger": "candle"}
         self._last_decision = data
         self._decisions.append(data)
         await self._push({"type": "decision", "data": data})
@@ -676,9 +732,14 @@ class AiTradeSession:
                 "roundsCompleted": self.rounds_completed,
                 "roundsSinceSummary": self.decider.rounds_since_summary,
                 "contextRefreshRounds": self.context_refresh_rounds,
+                "wakeIntervalMinutes": self._wake_interval_minutes(),
                 "stopReason": self.stop_reason,
                 "degraded": self.executor.degraded or self._stale_degraded or self.degraded,
                 "flattenFailed": self.flatten_failed, "residual": self.residual}
+
+    def _wake_interval_minutes(self) -> float | None:
+        """墙钟定时唤醒周期回执换算（秒→分，关闭态存 None，与分组/config 口径统一，RN-7）。"""
+        return round(self.wake_interval_s / 60, 4) if self.wake_interval_s > 0 else None
 
     def snapshot(self) -> dict:
         mark = self._ref_px()
@@ -700,6 +761,7 @@ class AiTradeSession:
                 "budgetUsd": self.executor.budget_usd, "leverage": self.executor.leverage,
                 "takeProfitUsd": self.take_profit_usd, "stopLossUsd": self.stop_loss_usd,
                 "contextRefreshRounds": self.context_refresh_rounds,
+                "wakeIntervalMinutes": self._wake_interval_minutes(),
                 "roundsCompleted": self.rounds_completed,
                 "roundsSinceSummary": self.decider.rounds_since_summary,
                 "positionSide": self.executor.projected,

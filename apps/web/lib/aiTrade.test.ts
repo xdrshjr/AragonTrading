@@ -22,6 +22,7 @@ import {
   resolveAiTradeGate,
   validateContextRounds,
   validateStrategySelection,
+  validateWakeInterval,
 } from "./aiTrade";
 import type {
   Consensus,
@@ -124,6 +125,25 @@ describe("validateContextRounds", () => {
   });
   it("accepts a valid value", () => {
     expect(validateContextRounds(10)).toBeNull();
+  });
+});
+
+describe("validateWakeInterval (wake-interval, blank/0 = disabled, out-of-range errors)", () => {
+  it("treats blank (null) and 0 as a legal disable", () => {
+    expect(validateWakeInterval(null)).toBeNull();
+    expect(validateWakeInterval(0)).toBeNull();
+  });
+  it("accepts values within [0.5, 240] minutes", () => {
+    expect(validateWakeInterval(2)).toBeNull();
+    expect(validateWakeInterval(0.5)).toBeNull();
+    expect(validateWakeInterval(240)).toBeNull();
+  });
+  it("rejects below the floor and above the ceiling", () => {
+    expect(validateWakeInterval(0.1)).toMatch(/唤醒周期/);
+    expect(validateWakeInterval(9999)).toMatch(/唤醒周期/);
+  });
+  it("rejects a non-finite value", () => {
+    expect(validateWakeInterval(Number.NaN)).toMatch(/唤醒周期/);
   });
 });
 
@@ -358,6 +378,17 @@ describe("describeTrigger (R1, trigger reason derived from signalBoard)", () => 
     expect(
       describeTrigger({ signalBoard: [signal({ latestSignal: "none" }), signal({ latestSignal: "none" })] }),
     ).toEqual({ label: "K 线收盘 · 常规复盘", tone: "muted" });
+  });
+
+  it("labels an interval wake with no edge signal as a periodic review (accent)", () => {
+    expect(describeTrigger({ signalBoard: [], trigger: "interval" })).toEqual({
+      label: "周期唤醒 · 常规复盘",
+      tone: "accent",
+    });
+    // 有边沿信号时，即便 trigger=interval 仍按信号板派生（周期唤醒只改「无边沿」分支）。
+    expect(
+      describeTrigger({ signalBoard: [signal({ latestSignal: "open_long" })], trigger: "interval" }).label,
+    ).toContain("开多信号");
   });
 
   it("labels a single open_long trigger with the strategy name and long tone", () => {

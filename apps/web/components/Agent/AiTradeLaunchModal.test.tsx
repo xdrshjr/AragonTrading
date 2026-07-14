@@ -43,6 +43,7 @@ function renderModal(props: Partial<React.ComponentProps<typeof AiTradeLaunchMod
         defaultStrategyIds={[]}
         defaultContextRounds={10}
         defaultPositionStepPct={0.25}
+        defaultWakeIntervalMinutes={2}
         {...props}
         {...over}
       />
@@ -329,6 +330,57 @@ describe("AiTradeLaunchModal", () => {
     expect(opts.positionStepPct).toBe(0.1);
   });
 
+  // Agent 墙钟定时唤醒周期（ai-auto-trading-wake-interval §6.2）：仅实盘段露出，默认 2 分钟；
+  // 空/0 = 关闭（合法、送 0）；越界即时报错阻止提交；改值随 onConfirm 的 live opts 透传（回测段不渲染）。
+  it("renders the wake-interval input in the live segment seeded from the default (2 min)", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    const input = screen.getByLabelText("Agent 唤醒周期（分钟）") as HTMLInputElement;
+    expect(input.value).toBe("2");
+    expect(screen.getByText(/仅按 K 线与策略触发/)).toBeInTheDocument();
+  });
+
+  it("seeds the wake interval from the persisted preference prop", async () => {
+    renderModal({ defaultStrategyIds: [1], defaultWakeIntervalMinutes: 5 });
+    await screen.findByText("均线策略");
+    expect((screen.getByLabelText("Agent 唤醒周期（分钟）") as HTMLInputElement).value).toBe("5");
+  });
+
+  it("does NOT render the wake-interval input in the backtest segment", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.click(screen.getByRole("button", { name: "回测" }));
+    expect(screen.queryByLabelText("Agent 唤醒周期（分钟）")).toBeNull();
+  });
+
+  it("flows the chosen wake interval into onConfirm (live path)", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.change(screen.getByLabelText("Agent 唤醒周期（分钟）"), { target: { value: "3" } });
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    expect((onConfirm.mock.calls[0][0] as AiTradeLaunchOpts).wakeIntervalMinutes).toBe(3);
+  });
+
+  it("treats a blank wake interval as disabled (sends 0) and stays submittable", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.change(screen.getByLabelText("Agent 唤醒周期（分钟）"), { target: { value: "" } });
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    expect((onConfirm.mock.calls[0][0] as AiTradeLaunchOpts).wakeIntervalMinutes).toBe(0);
+  });
+
+  it("blocks confirm on an out-of-range wake interval", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.change(screen.getByLabelText("Agent 唤醒周期（分钟）"), { target: { value: "9999" } });
+    expect(screen.getByText(/Agent 唤醒周期需为/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
+  });
+
   it("resets the position step to default when the modal reopens (guards inputs-revert)", async () => {
     const { rerender } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
@@ -340,6 +392,17 @@ describe("AiTradeLaunchModal", () => {
     expect((screen.getByLabelText("仓位操作档位") as HTMLSelectElement).value).toBe("0.25");
   });
 
+  it("resets the wake interval to default when the modal reopens (RN-2 guards inputs-revert)", async () => {
+    const { rerender } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.change(screen.getByLabelText("Agent 唤醒周期（分钟）"), { target: { value: "9" } });
+    expect((screen.getByLabelText("Agent 唤醒周期（分钟）") as HTMLInputElement).value).toBe("9");
+    // 关闭后重开：seed 只在 open false→true 那一次转换执行（单行 setWakeIntervalRaw 在既有 [open] effect 内）。
+    rerender({ defaultStrategyIds: [1], open: false });
+    rerender({ defaultStrategyIds: [1], open: true });
+    expect((screen.getByLabelText("Agent 唤醒周期（分钟）") as HTMLInputElement).value).toBe("2");
+  });
+
   // 复发根因回归护栏（ai-trade-launch-modal-inputs-revert-recurrence，方案 A）：
   // seed effect 依赖收敛为 [open] 后，弹窗 open 恒为真、父树以 ~1Hz 重渲染并传入全新的
   // defaultStrategyIds/defaultMembers 引用时，effect 不再重跑，用户正在编辑的字段不被冲回默认。
@@ -348,9 +411,10 @@ describe("AiTradeLaunchModal", () => {
     const { onConfirm, rerender } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
 
-    // 用户编辑多个字段：追加勾选策略、改仓位档位、改时间级别、填总预算。
+    // 用户编辑多个字段：追加勾选策略、改仓位档位、改唤醒周期、改时间级别、填总预算。
     fireEvent.click(screen.getByText("动量策略")); // selectedIds: [1] → [1, 2]
     fireEvent.change(screen.getByLabelText("仓位操作档位"), { target: { value: "0.5" } });
+    fireEvent.change(screen.getByLabelText("Agent 唤醒周期（分钟）"), { target: { value: "7" } });
     fireEvent.change(screen.getByLabelText("时间级别"), { target: { value: "4H" } });
     fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[0], { target: { value: "500" } });
 
@@ -358,8 +422,9 @@ describe("AiTradeLaunchModal", () => {
     rerender({ defaultStrategyIds: [1], defaultMembers: [{ instId: "ETH-USDT-SWAP", allocationPct: 100 }] });
     rerender({ defaultStrategyIds: [1], defaultMembers: [{ instId: "ETH-USDT-SWAP", allocationPct: 100 }] });
 
-    // 未发生 open false→true 转换 → seed effect 不重跑，全部编辑保持不变。
+    // 未发生 open false→true 转换 → seed effect 不重跑，全部编辑保持不变（RN-2：新增唤醒周期字段同守护）。
     expect((screen.getByLabelText("仓位操作档位") as HTMLSelectElement).value).toBe("0.5");
+    expect((screen.getByLabelText("Agent 唤醒周期（分钟）") as HTMLInputElement).value).toBe("7");
     expect((screen.getByLabelText("时间级别") as HTMLSelectElement).value).toBe("4H");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
@@ -368,6 +433,7 @@ describe("AiTradeLaunchModal", () => {
     expect(opts.strategyIds).toEqual([1, 2]); // 未被冲回默认 [1]
     expect(opts.bar).toBe("4H");
     expect(opts.positionStepPct).toBe(0.5);
+    expect(opts.wakeIntervalMinutes).toBe(7);
     expect(opts.capitalUsd).toBe(500);
   });
 });
