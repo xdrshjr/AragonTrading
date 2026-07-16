@@ -8,10 +8,34 @@ export function openOrdersKey(accountId?: number) {
   return ["trading", "openOrders", accountId ?? null] as const;
 }
 
-// 持仓相关委托（图表虚线与持仓子行展示）：过滤掉 limit_open 开仓挂单。
+// 持仓相关委托（持仓子行展示）：过滤掉 limit_open 开仓挂单（开仓挂单不属于任何持仓）。
 const POSITION_KINDS: readonly OpenOrderKind[] = ["limit_close", "tp", "sl"];
 export function isPositionOrder(kind: OpenOrderKind): boolean {
   return POSITION_KINDS.includes(kind);
+}
+
+// 图表价格线委托（F-6）：在持仓相关委托之上纳入 limit_open——AI 挂出的开仓限价单在成交前
+// 没有对应持仓，但其价位线是「挂单可见」的核心诉求；持仓子行语义不变（仍走 POSITION_KINDS）。
+export const CHART_LINE_KINDS: readonly OpenOrderKind[] = ["limit_close", "tp", "sl", "limit_open"];
+export function isChartLineOrder(kind: OpenOrderKind): boolean {
+  return CHART_LINE_KINDS.includes(kind);
+}
+
+// kind → 委托列表页签的中文标签（F-5）。不复用 orderKindMeta.label：那套是图表线短标签
+// （挂单/平仓/止盈/止损），语境不同，改它会波及既有图表 / 持仓子行文案。
+export function openOrderKindLabel(kind: OpenOrderKind): string {
+  switch (kind) {
+    case "limit_open":
+      return "限价开仓";
+    case "limit_close":
+      return "限价平仓";
+    case "tp":
+      return "止盈委托";
+    case "sl":
+      return "止损委托";
+    default:
+      return kind;
+  }
 }
 
 // 持仓 ↔ 委托关联键：(instId, posSide)；net 模式 posSide 统一为 "net"。
@@ -44,6 +68,8 @@ export interface OrderKindMeta {
 }
 
 // kind → 展示元数据（颜色互不相同，满足「不同色彩虚线」）。
+// limit_open 用既有 --muted（评审 R-3：--accent-2 在 globals.css 明暗两套主题均不存在，指名会写出
+// 解析失败的 var()）——与 tp --long / sl --short / limit_close --accent 三色互异，label + 虚线再区分。
 export function orderKindMeta(kind: OpenOrderKind): OrderKindMeta {
   switch (kind) {
     case "tp":
@@ -52,6 +78,8 @@ export function orderKindMeta(kind: OpenOrderKind): OrderKindMeta {
       return { label: "止损", colorVar: "--short", lineStyle: 3 };
     case "limit_close":
       return { label: "平仓", colorVar: "--accent", lineStyle: 2 };
+    case "limit_open":
+      return { label: "开仓挂单", colorVar: "--muted", lineStyle: 2 };
     default:
       return { label: "挂单", colorVar: "--muted", lineStyle: 2 };
   }
@@ -73,7 +101,7 @@ export interface OrderPriceLine {
   changePct: number | null; // 相对 refPx（图表线取 ChartWorkspace markPrice）
 }
 
-// 构造当前 instId 的图表价格线：仅取该标的的持仓相关委托，price = triggerPx ?? px。
+// 构造当前 instId 的图表价格线：仅取该标的的图表线委托（F-6 起含 limit_open），price = triggerPx ?? px。
 export function buildOrderPriceLines(
   orders: LiveOpenOrder[],
   instId: string | undefined,
@@ -81,7 +109,7 @@ export function buildOrderPriceLines(
 ): OrderPriceLine[] {
   const lines: OrderPriceLine[] = [];
   for (const order of orders) {
-    if (!isPositionOrder(order.kind)) continue;
+    if (!isChartLineOrder(order.kind)) continue;
     if (instId && order.instId !== instId) continue;
     const price = order.triggerPx ?? order.px;
     if (price == null) continue;

@@ -84,11 +84,16 @@ def _patch(monkeypatch) -> None:
     async def positions(*_a, **_k):
         return []
 
+    async def open_orders(*_a, **_k):
+        return []
+
     async def resolve(*_a, **_k):
         return object()
 
     monkeypatch.setattr("app.ai_auto.manager.fetch_trading_config", ai_config)
     monkeypatch.setattr("app.ai_auto.manager.fetch_live_positions", positions)
+    # ai-trade-limit-orders §2.9：启动前置校验新增「已有普通挂单即拒」，须一并桩掉，否则用例出网。
+    monkeypatch.setattr("app.ai_auto.manager.fetch_live_open_orders", open_orders)
     monkeypatch.setattr("app.ai_auto.manager.resolve_active_provider", resolve)
     monkeypatch.setattr("app.ai_auto.manager.make_llm_client_from_config", lambda cfg: object())
     monkeypatch.setattr("app.ai_auto.manager.AiTradeSession", _FakeAiSession)

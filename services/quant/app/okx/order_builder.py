@@ -192,6 +192,23 @@ class ClosePositionInput:
     sz: float | None     # 限价部分平仓张数（缺省=全仓 |pos|；市价忽略）
 
 
+@dataclass(frozen=True)
+class CancelOrderInput:
+    """归一化撤单意图（ai-trade-limit-orders §4.4）。
+
+    撤单本身只需 ``inst_id`` + ``cl_ord_id``，但 ``live_order_audit`` 留痕需要 direction / px / sz
+    这些**撤单请求里没有天然取值**的字段——它们一律取自调用方持有的挂单快照（`RestingOrder`）。
+    聚合为值对象而非堆形参，以守 CLAUDE.md 的「形参 ≤5」（镜像 ``ClosePositionInput`` 的既有范式）。
+    """
+
+    inst_id: str
+    cl_ord_id: str       # 我方自定义订单 ID（挂单归属判定的主键）
+    direction: str       # 审计用：被撤挂单的方向（long | short）
+    td_mode: str         # cross | isolated
+    px: float | None     # 审计用：被撤挂单的委托价
+    sz: float | None     # 审计用：被撤挂单的张数
+
+
 def _close_side(pos_side: str, pos: float) -> str:
     """平仓单 side（§2.2，一等安全约束）：平多 → ``sell``、平空 → ``buy``。
 

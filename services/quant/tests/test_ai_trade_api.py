@@ -108,18 +108,24 @@ def _start_body(strategy_id: int, **over) -> dict:
     return body
 
 
-def _patch(monkeypatch, *, positions=None, config=None, provider=object()) -> None:
+def _patch(monkeypatch, *, positions=None, config=None, provider=object(),
+           pending=None) -> None:
     async def fake_config(*_a, **_k):
         return dict(config or _CONFIG)
 
     async def fake_positions(*_a, **_k):
         return list(positions or [])
 
+    async def fake_open_orders(*_a, **_k):
+        return list(pending or [])
+
     async def fake_resolve(*_a, **_k):
         return provider
 
     monkeypatch.setattr("app.ai_auto.manager.fetch_trading_config", fake_config)
     monkeypatch.setattr("app.ai_auto.manager.fetch_live_positions", fake_positions)
+    # ai-trade-limit-orders §2.9：启动前置校验新增「已有普通挂单即拒」，须一并桩掉，否则用例出网。
+    monkeypatch.setattr("app.ai_auto.manager.fetch_live_open_orders", fake_open_orders)
     monkeypatch.setattr("app.ai_auto.manager.resolve_active_provider", fake_resolve)
     monkeypatch.setattr("app.ai_auto.manager.make_llm_client_from_config", lambda cfg: object())
     monkeypatch.setattr("app.ai_auto.manager.AiTradeSession", _FakeSession)

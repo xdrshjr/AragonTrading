@@ -33,7 +33,7 @@ from ..engine.simulator import RiskParams
 from ..live_auto.executor import LiveExecutor
 from ..okx.accounts import AccountCredentials
 from ..okx.order_builder import snap_size
-from ..okx.trading import fetch_live_positions, fetch_trading_config
+from ..okx.trading import fetch_live_open_orders, fetch_live_positions, fetch_trading_config
 from ..paper.strategy_factory import PaperStrategySpec
 from .admission import get_admission_lock
 from .decider import AiTradeDecider
@@ -200,11 +200,11 @@ class AiTradeManager:
             self._require_capacity()
             members = self._validate_members(req.members_in, req.settings, req.allocation_mode)
             creds = _creds(req.account_row)
-            avail, positions, configs = await self._gather_context(creds, req, members)
+            avail, positions, configs, pending = await self._gather_context(creds, req, members)
             total = self._resolve_budget_group(
                 req.total_capital_usd, avail, req.budget_cap_frac, req.default_budget_frac)
             lever = req.leverage or req.settings.live_default_leverage
-            plans = self._preflight_group(members, configs, positions, total, lever)
+            plans = self._preflight_group(members, configs, positions, total, lever, pending)
             group = await self._build_group(req, creds, provider, plans, total, lever)
             self._group = group
             return await self._launch_group_or_rollback(group)
@@ -251,19 +251,37 @@ class AiTradeManager:
         configs = await asyncio.gather(*[_bounded_config(m.inst_id) for m in members])
         async with sem:
             positions = await fetch_live_positions(creds)
+        async with sem:                       # 复用同一并发预算（规避已知的启动 429）
+            pending = await self._fetch_blocking_pending(creds)
         config_map = {m.inst_id: cfg for m, cfg in zip(members, configs)}
         avail = next((cfg.get("availUsdt") or 0.0 for cfg in configs), 0.0)
-        return avail, positions, config_map
+        return avail, positions, config_map, pending
+
+    @staticmethod
+    async def _fetch_blocking_pending(creds: AccountCredentials) -> list[dict]:
+        """全账户未结**普通**挂单（ai-trade-limit-orders §2.9）。
+
+        **必须按 `kind` 过滤，不能用「非空」判定**（P1-4/R-14）：`fetch_live_open_orders` 并非只返回
+        普通挂单——它同时并发查 `orders-algo-pending` 的 `oco`/`conditional` 并把每条 OCO **展开成
+        `tp`/`sl` 两条**归一记录一并返回。而随单 OCO 正是**本项目自己**在每次开仓时附的，只要该标的
+        上有任何带止盈止损的持仓、或有一条残留未清的 OCO，非空判定就会把带随单止盈止损的正常账户
+        用一个自己也看不懂的 409 挡在门外。`tp`/`sl` 算法委托与本特性的「普通限价挂单」是两类不同
+        对象，本就不该参与该判定。`kind` 的分类真源是 `_classify_pending_kind`，此处直接复用。
+        """
+        orders = await fetch_live_open_orders(creds)
+        return [o for o in orders if o.get("kind") in ("limit_open", "limit_close")]
 
     def _preflight_group(self, members: list[AiTradeGroupMemberInput], configs: dict,
-                         positions: list[dict], total: float, lever: float) -> list[_MemberPlan]:
+                         positions: list[dict], total: float, lever: float,
+                         pending: list[dict] | None = None) -> list[_MemberPlan]:
         """第一阶段·全量前置门禁（**不下任何单**）：任一成员失败即整组拒绝并携明细。"""
         failures: list[dict] = []
         plans: list[_MemberPlan] = []
         for m in members:
             cfg = configs[m.inst_id]
             budget_i = total * m.allocation_pct / 100.0
-            fail = self._member_preflight_fail(m.inst_id, cfg, positions, budget_i, lever)
+            fail = self._member_preflight_fail(m.inst_id, cfg, positions, budget_i, lever,
+                                               pending or [])
             if fail is not None:
                 failures.append(fail)
             else:
@@ -273,14 +291,18 @@ class AiTradeManager:
         return plans
 
     def _member_preflight_fail(self, inst_id: str, cfg: dict, positions: list[dict],
-                               budget_i: float, lever: float) -> dict | None:
-        """单成员门禁：不支持 / 已有持仓 / 预算过小 → 返回明细；通过 → None（失败码对齐既有实现）。"""
+                               budget_i: float, lever: float,
+                               pending: list[dict] | None = None) -> dict | None:
+        """单成员门禁：不支持 / 已有持仓 / 已有挂单 / 预算过小 → 明细；通过 → None（码对齐既有实现）。"""
         if not cfg.get("instrumentSupported"):
             return {"instId": inst_id, "code": "LIVE_INSTRUMENT_UNSUPPORTED",
                     "message": "仅支持 USDT 本位永续 / 交割合约自动交易"}
         if self._has_position(positions, inst_id):
             return {"instId": inst_id, "code": "AI_TRADE_PREEXISTING_POSITION",
                     "message": "该标的已有持仓，AI 自动交易拒绝启动（请先平仓或换标的）"}
+        if self._has_pending_order(pending or [], inst_id):
+            return {"instId": inst_id, "code": "AI_TRADE_PENDING_ORDER_EXISTS",
+                    "message": "该标的已有未成交挂单，AI 自动交易拒绝启动（请先在实盘面板撤单或换标的）"}
         if self._budget_too_small(cfg, budget_i, lever):
             return {"instId": inst_id, "code": "AI_TRADE_MEMBER_BUDGET_TOO_SMALL",
                     "message": "分配预算不足最小下单量，请提高总预算或该标的百分比"}
@@ -290,6 +312,15 @@ class AiTradeManager:
     def _has_position(positions: list[dict], inst_id: str) -> bool:
         return any(str(p.get("instId")) == inst_id and abs(p.get("pos") or 0.0) > 0
                    for p in positions)
+
+    @staticmethod
+    def _has_pending_order(pending: list[dict], inst_id: str) -> bool:
+        """该标的是否已有未结**普通**挂单（§2.9；`pending` 已由 `_fetch_blocking_pending` 按 kind 过滤）。
+
+        会话以 in-memory `resting` 跟踪挂单，若交易所侧已有来路不明的挂单，自管状态与真实状态从第一
+        秒就不一致——**绝不静默接管来路不明的挂单**，显式拒绝启动并提示先在 OKX 侧处理（§5.2）。
+        """
+        return any(str(o.get("instId")) == inst_id for o in pending)
 
     @staticmethod
     def _budget_too_small(cfg: dict, budget_i: float, lever: float) -> bool:
@@ -335,13 +366,21 @@ class AiTradeManager:
                                         plan.budget_usd, ctx.lever)
         tp_i = self._scale_threshold(req.take_profit_usd, plan.allocation_pct, ctx.sum_pct)
         sl_i = self._scale_threshold(req.stop_loss_usd, plan.allocation_pct, ctx.sum_pct)
+        # ai-trade-limit-orders §5.3：限价总闸只在**生产实盘装配**处显式打开（决策器与回测均默认
+        # False）——schema 露出 orderType/limitPrice、动作枚举加 cancel_order，皆由此单点决定。
+        allow_limit = req.settings.ai_trade_limit_orders_enabled
         decider = AiTradeDecider(
             make_llm_client_from_config(ctx.provider),
             build_ai_trade_system_prompt(plan.inst_id, req.bar, plan.budget_usd, ctx.lever,
-                                         position_step_pct=req.position_step_pct),
+                                         position_step_pct=req.position_step_pct,
+                                         allow_limit=allow_limit,
+                                         # F-3：价带文案与本地门禁同源（settings 唯一真源）
+                                         limit_band_pct=req.settings
+                                         .ai_trade_limit_price_max_deviation_pct),
             context_refresh_rounds=req.context_refresh_rounds, settings=req.settings,
             position_step_pct=req.position_step_pct,
-            reflection_enabled=req.settings.ai_trade_reflection_enabled)   # 生产实盘显式开（默认 True）
+            reflection_enabled=req.settings.ai_trade_reflection_enabled,   # 生产实盘显式开（默认 True）
+            allow_limit=allow_limit)
         run_id = await self._create_group_run(ctx, plan, tp_i, sl_i)
         session = AiTradeSession(
             f"aitrade_{uuid.uuid4().hex}", run_id, req.specs, plan.inst_id, req.bar, executor,

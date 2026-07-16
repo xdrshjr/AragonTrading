@@ -74,6 +74,74 @@ class OKXTradeClient(OKXPrivateClient):
             raise OKXPrivateError(code, str(msg))
         return row
 
+    async def cancel_order(self, inst_id: str, *, ord_id: str | None = None,
+                           cl_ord_id: str | None = None) -> dict:
+        """``POST /api/v5/trade/cancel-order``：撤一笔未成交挂单；``ordId`` 与 ``clOrdId`` 二选一。
+
+        与 ``place_order`` 同口径：顶层 ``code`` 与 ``data[0].sCode`` 皆须为 ``"0"``，否则以更具体的
+        sCode 抛 ``OKXPrivateError``。本层**只忠实上抛原始 sCode，不做良性 / 非良性的价值判断**——
+        「已撤销(51401) / 已成交(51402) / 不存在(51400)」的三态归因由服务层 ``cancel_live_order``
+        与 ``LiveExecutor._cancel_resting`` 负责（ai-trade-limit-orders §2.5 / §4.3）。
+
+        Args:
+            inst_id: 合约 ID（OKX 撤单必填）。
+            ord_id: OKX 订单 ID（与 ``cl_ord_id`` 至少给一个）。
+            cl_ord_id: 我方自定义订单 ID。
+
+        Returns:
+            ``data[0]``（含 ``ordId`` / ``clOrdId``）。
+
+        Raises:
+            OKXPrivateError: 二者皆缺（本地拦截）、连通失败、或业务码非 ``"0"``（带原始 sCode）。
+        """
+        if not ord_id and not cl_ord_id:
+            raise OKXPrivateError("ORDER_PARAM_INVALID", "撤单必须提供 ordId 或 clOrdId 之一")
+        payload: dict = {"instId": inst_id}
+        if ord_id:
+            payload["ordId"] = ord_id
+        if cl_ord_id:
+            payload["clOrdId"] = cl_ord_id
+        body = await self._post("/api/v5/trade/cancel-order", payload)
+        rows = body.get("data") or []
+        row = rows[0] if rows else {}
+        top_code = str(body.get("code"))
+        s_code = str(row.get("sCode") or "")
+        if top_code != "0" or (s_code and s_code != "0"):
+            code = s_code if s_code and s_code != "0" else top_code
+            msg = row.get("sMsg") or body.get("msg") or "OKX 撤单失败"
+            raise OKXPrivateError(code, str(msg))
+        return row
+
+    async def get_order(self, inst_id: str, *, ord_id: str | None = None,
+                        cl_ord_id: str | None = None) -> dict:
+        """``GET /api/v5/trade/order``：单条订单的**权威**状态（签名 GET，复用基类 ``_get``）。
+
+        关键回读字段：``state`` ∈ {live, partially_filled, filled, canceled, mmp_canceled}、
+        ``avgPx``（成交均价）、``accFillSz``（累计成交张数）、``px`` / ``sz`` / ``ordId`` / ``clOrdId``
+        / ``uTime``。之所以用本接口而非 ``orders-pending``：后者只能回答「还挂着吗」，「不在挂单列表」
+        对「已成交」与「已撤销」是**二义**的（§2.3）。
+
+        Args:
+            inst_id: 合约 ID（OKX 必填）。
+            ord_id: OKX 订单 ID（与 ``cl_ord_id`` 至少给一个）。
+            cl_ord_id: 我方自定义订单 ID。
+
+        Returns:
+            单条订单 dict；OKX 回空数组（订单不存在）时为 ``{}``。
+
+        Raises:
+            OKXPrivateError: 二者皆缺（本地拦截）、连通失败、或业务码非 ``"0"``。
+        """
+        if not ord_id and not cl_ord_id:
+            raise OKXPrivateError("ORDER_PARAM_INVALID", "查询订单必须提供 ordId 或 clOrdId 之一")
+        params: dict[str, str] = {"instId": inst_id}
+        if ord_id:
+            params["ordId"] = ord_id
+        if cl_ord_id:
+            params["clOrdId"] = cl_ord_id
+        rows = await self._get("/api/v5/trade/order", params)
+        return rows[0] if rows else {}
+
     async def close_position(self, inst_id: str, pos_side: str, mgn_mode: str, *,
                              auto_cxl: bool = True, cl_ord_id: str | None = None) -> dict:
         """``POST /api/v5/trade/close-position``：按当前市价**整仓**平掉某持仓（平仓 spec §2.2）。

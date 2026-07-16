@@ -93,6 +93,9 @@ function MemberRow({
   const { instId } = member;
   const session = member.session;
   const positionSide = session?.positionSide ?? "flat";
+  // 「当前挂单」取最新一轮决策随附的挂单断面（后端 _emit_decision 与决策 prompt 同源 resting_payload）。
+  // 无挂单 / 跳过轮（该事件不带此段）→ 整行省略，绝不据 orderType 反推「挂单还在」（可能已成交/撤销）。
+  const resting = session?.lastDecision?.restingOrder ?? null;
   // 标的行情解析：命中自选行则富化（且 active 标的用 WS 实时价覆盖快照）；未收藏则优雅降级不造价。
   const inst = rows.find((r) => r.instId === instId) ?? null;
   const isActive = instId === active;
@@ -114,6 +117,11 @@ function MemberRow({
         <span className="truncate text-[10px] text-[var(--muted)]">
           预算 {fmtNum(session?.budgetUsd ?? 0)} USDT · {session?.leverage ?? 0}× · {member.allocationPct}%
         </span>
+        {resting && (
+          <span className="tabular truncate text-[10px] text-[var(--accent)]">
+            当前挂单 {fmtPrice(resting.px)} · {fmtNum(resting.sz, 0)} 张 · 剩余 {resting.expiresInS}s
+          </span>
+        )}
       </span>
       <span className="flex shrink-0 items-center gap-2">
         <Badge tone={positionTone(positionSide)}>{describePosition(positionSide)}</Badge>

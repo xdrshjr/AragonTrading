@@ -175,6 +175,82 @@ async def test_open_orders_okx_error_maps_to_502_and_redacts(monkeypatch):
         await dispose_engine()
 
 
+async def test_pending_order_exposes_attached_tp_sl(monkeypatch):
+    """F-4：挂单回带 attachAlgoOrds（随单 OCO）时透出 tp/sl 触发价；"-1"/缺失 → None（_algo_px）。"""
+    with_attach = dict(_LIMIT_OPEN, ordId="1004", cTime="1719500004000",
+                       attachAlgoOrds=[{"tpTriggerPx": "70000", "slTriggerPx": "58000"}])
+    tp_only_market = dict(_LIMIT_OPEN, ordId="1005", cTime="1719500005000",
+                          attachAlgoOrds=[{"tpTriggerPx": "70000", "slTriggerPx": "-1"}])
+    await _fresh()
+    app = _load_app()
+    _override_settings(app, live_enabled=True)
+    _patch_trading(monkeypatch, pending=[with_attach, tp_only_market], oco=[], conditional=[])
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.get("/api/trading/open-orders")
+            assert r.status_code == 200, r.text
+            by_ord = {o["ordId"]: o for o in r.json()["orders"]}
+            assert by_ord["1004"]["attachTpTriggerPx"] == 70000.0
+            assert by_ord["1004"]["attachSlTriggerPx"] == 58000.0
+            assert by_ord["1005"]["attachTpTriggerPx"] == 70000.0
+            assert by_ord["1005"]["attachSlTriggerPx"] is None    # "-1" 触发后市价 → None
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_pending_order_without_attach_yields_none_fields(monkeypatch):
+    """F-4：无 attachAlgoOrds 的挂单两字段恒 None；策略委托行（tp/sl）同样 None（Pydantic 兜底）。"""
+    await _fresh()
+    app = _load_app()
+    _override_settings(app, live_enabled=True)
+    _patch_trading(monkeypatch)          # 默认三行 pending（均无 attach）+ 一条 OCO
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.get("/api/trading/open-orders")
+            assert r.status_code == 200, r.text
+            for order in r.json()["orders"]:
+                assert order["attachTpTriggerPx"] is None
+                assert order["attachSlTriggerPx"] is None
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_pending_order_malformed_attach_never_breaks_endpoint(monkeypatch):
+    """F-4 畸形态（评审 R-2）：attach 非 list / 空 list / **list 元素非 dict** / 价格畸形。
+
+    `_normalize_pending_order` 跑在列表推导里——任何一行抛异常都会炸掉**整个**端点（持仓子行/
+    图表虚线/新页签三处同灭），故畸形一律静默落 None、端点必须仍 200。
+    """
+    rows = [
+        dict(_LIMIT_OPEN, ordId="2001", attachAlgoOrds="oops"),          # 非 list
+        dict(_LIMIT_OPEN, ordId="2002", attachAlgoOrds=[]),              # 空 list
+        dict(_LIMIT_OPEN, ordId="2003", attachAlgoOrds=["not-a-dict"]),  # 元素非 dict（R-2 核心用例）
+        dict(_LIMIT_OPEN, ordId="2004",
+             attachAlgoOrds=[{"tpTriggerPx": "abc", "slTriggerPx": ""}]),  # 价格不可解析/空
+    ]
+    await _fresh()
+    app = _load_app()
+    _override_settings(app, live_enabled=True)
+    _patch_trading(monkeypatch, pending=rows, oco=[], conditional=[])
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.get("/api/trading/open-orders")
+            assert r.status_code == 200, r.text
+            orders = r.json()["orders"]
+            assert len(orders) == 4                       # 无一行被畸形 attach 炸掉
+            for order in orders:
+                assert order["attachTpTriggerPx"] is None
+                assert order["attachSlTriggerPx"] is None
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
 async def test_open_orders_passes_inst_id_through_to_client(monkeypatch):
     """C5：传 instId 时服务端透传给普通挂单 + 两类策略委托查询（避免未测死入参）。"""
     await _fresh()

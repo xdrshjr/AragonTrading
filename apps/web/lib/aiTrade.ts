@@ -132,11 +132,23 @@ const ACTION_LABELS: Record<AiTradeAction, string> = {
   open_short: "开空",
   close: "平仓",
   hold: "观望",
+  cancel_order: "撤单",
 };
 
 /** AI 决策动作中文化（open_long→「开多」…）。 */
 export function describeAiAction(action: string): string {
   return ACTION_LABELS[action as AiTradeAction] ?? action;
+}
+
+const ORDER_TYPE_LABELS: Record<string, string> = { market: "市价", limit: "限价" };
+
+/**
+ * 委托方式中文化（ai-trade-limit-orders §2.2）：market→「市价」、limit→「限价」。
+ * 缺省（旧快照无此键 / 总闸关闭）视同市价；未知取值缺省回原值（不臆造，同 describeRegime）。
+ */
+export function describeOrderType(orderType: string | null | undefined): string {
+  if (!orderType) return ORDER_TYPE_LABELS.market;
+  return ORDER_TYPE_LABELS[orderType] ?? orderType;
 }
 
 const STANCE_LABELS: Record<string, string> = { long: "多", short: "空", flat: "空仓" };

@@ -382,12 +382,28 @@ class StrategySignalViewOut(BaseModel):
     reason: str
 
 
+class AiTradeRestingOrderOut(BaseModel):
+    """当前挂着的限价委托（ai-trade-limit-orders §4.2；无挂单时整段为 None）。"""
+
+    intent: str                  # open | close
+    side: str                    # long | short
+    px: float                    # 委托价（USDT）
+    sz: float                    # 张数
+    ageS: int                    # 已挂秒数
+    expiresInS: int              # 距 TTL 自动撤销的剩余秒数
+    filledSz: float = 0.0        # 已成交（已采纳）张数；未成交为 0
+
+
 class AiTradeDecisionOut(BaseModel):
     ts: int
     round: int
-    action: str                # open_long|open_short|close|hold
+    action: str                # open_long|open_short|close|hold|cancel_order
     sizeFraction: float | None = None
     confidence: float | None = None
+    orderType: str | None = None    # market|limit（ai-trade-limit-orders §2.2；总闸关时恒 market）
+    limitPrice: float | None = None  # 限价委托价；市价决策为 None
+    # 本轮结束时的挂单断面（§4.2）；无挂单 / 总闸关闭时恒 None，前端整行省略。
+    restingOrder: AiTradeRestingOrderOut | None = None
     reason: str
     signalBoard: list[StrategySignalViewOut] = Field(default_factory=list)
     executed: dict | None = None   # {ok, skipped?, side?, qty?}
@@ -1230,8 +1246,13 @@ class LiveOpenOrder(BaseModel):
     state: str                   # live | partially_filled ...
     reduceOnly: bool
     ordId: str | None = None
+    clOrdId: str | None = None   # 我方自定义订单 ID（挂单归属判定的前提；策略委托无此值）
     algoId: str | None = None
     createdTs: int               # 秒级 UTC
+    # 随单 OCO 触发价（ai-trade-limit-orders-fix F-4，加法式）：仅普通挂单可能非 None——随单
+    # OCO 在挂单成交前不出现在 orders-algo-pending，这是未成交挂单止盈止损的唯一可见来源。
+    attachTpTriggerPx: float | None = None
+    attachSlTriggerPx: float | None = None
 
 
 class LiveOpenOrdersOut(BaseModel):

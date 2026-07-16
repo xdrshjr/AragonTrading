@@ -283,3 +283,27 @@ def test_applied_shrink_only_when_strictly_smaller():
     assert applied_shrink(orig, _open_long(0.2)) == 0.2
     assert applied_shrink(orig, _open_long(0.5)) is None          # 等值非收缩
     assert applied_shrink(orig, TradeDecision("hold", None, None, "x")) is None
+
+
+# ============================ F-1 复现（ai-trade-limit-orders-fix §2.2，先红后绿）============================
+def test_reflection_shrink_preserves_limit_intent():
+    """收缩仓位时 `ord_type`/`limit_px` 必须原样保留——位置重建丢字段是「限价静默变市价」的 P0 根因。"""
+    decision = TradeDecision("open_long", 0.5, 0.9, "r", "limit", 100.0)
+    v = ReflectionVerdict("confirm", 0.25, None, "减仓更稳", None, ran=True)
+    out, degrade = apply_reflection(decision, None, v)
+    assert out.ord_type == "limit"
+    assert out.limit_px == 100.0
+    assert abs(out.size_fraction - 0.25) < 1e-9
+    assert out.action == "open_long" and degrade is None
+
+
+def test_reflection_shrink_market_decision_behavior_unchanged():
+    """零回归钉：市价决策的收缩行为逐字不变（默认 ord_type=market / limit_px=None 原样带过）。"""
+    decision = _open_long(0.5)
+    v = ReflectionVerdict("confirm", 0.2, None, "减仓", None, ran=True)
+    out, degrade = apply_reflection(decision, None, v)
+    assert out.action == "open_long"
+    assert abs(out.size_fraction - 0.2) < 1e-9
+    assert out.ord_type == "market" and out.limit_px is None
+    assert out.confidence == decision.confidence and out.reason == decision.reason
+    assert degrade is None

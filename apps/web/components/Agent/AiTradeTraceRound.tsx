@@ -10,6 +10,7 @@ import {
   describeCandidateLevel,
   describeMultiTimeframeAlignment,
   describeMultiTimeframeFrame,
+  describeOrderType,
   describePriceAction,
   describeReflection,
   describeRegime,
@@ -135,6 +136,13 @@ function DecisionToolCard({ trace }: { trace: AiTradeRoundTrace }) {
     );
   }
   const isOpen = call.action === "open_long" || call.action === "open_short";
+  // 委托方式仅对 open_* / close 有意义（hold / cancel_order 不下单，§2.2），故其余动作不展示。
+  const isOrder = isOpen || call.action === "close";
+  const orderType = describeOrderType(call.orderType);
+  const orderText =
+    call.orderType === "limit" && call.limitPrice != null
+      ? `${orderType} @ ${fmtPrice(call.limitPrice)}`
+      : orderType;
   return (
     <div className="overflow-hidden rounded-[10px] border border-[var(--border)] bg-[var(--surface)] text-xs">
       <button
@@ -143,6 +151,9 @@ function DecisionToolCard({ trace }: { trace: AiTradeRoundTrace }) {
       >
         <span className="text-sm leading-none">🛠️</span>
         <span className="font-medium text-[var(--text)]">决策工具 · {describeAiAction(call.action)}</span>
+        {isOrder && (
+          <span className="tabular shrink-0 text-[10px] text-[var(--muted)]">{orderText}</span>
+        )}
         <span className="ml-auto tabular text-[10px] text-[var(--muted)]">
           {isOpen && call.sizeFraction != null ? `仓位 ${fmtNum(call.sizeFraction * 100, 0)}% · ` : ""}
           {call.confidence != null ? `置信 ${fmtNum(call.confidence * 100, 0)}%` : ""}

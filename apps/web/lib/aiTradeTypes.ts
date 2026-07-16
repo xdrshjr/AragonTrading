@@ -2,7 +2,8 @@
 // 运行期句柄（sessionId 等）为瞬态（store 不入 partialize）；aiTradeConfig 为持久化偏好。
 import type { PaperPositionEvent, Trade } from "./types";
 
-export type AiTradeAction = "open_long" | "open_short" | "close" | "hold";
+// cancel_order（ai-trade-limit-orders M-11）：撤回本会话未成交的限价挂单，不开不平。
+export type AiTradeAction = "open_long" | "open_short" | "close" | "hold" | "cancel_order";
 export type AiStance = "long" | "short" | "flat";
 export type AiLatestSignal = "open_long" | "open_short" | "close" | "none";
 
@@ -118,6 +119,18 @@ export interface MultiTimeframeContext {
   staleBars: string[];
 }
 
+// 当前挂着的限价委托（ai-trade-limit-orders §4.2；与后端 AiTradeRestingOrderOut / resting_payload 同构）。
+// 会话至多一笔（不变式 I-1）；ageS/expiresInS 为后端装配时刻的断面秒数，非前端实时倒计时。
+export interface AiTradeRestingOrder {
+  intent: string;        // open | close
+  side: string;          // long | short
+  px: number;            // 委托价（USDT）
+  sz: number;            // 张数
+  ageS: number;          // 已挂秒数
+  expiresInS: number;    // 距 TTL 自动撤销的剩余秒数
+  filledSz: number;      // 已成交（已采纳）张数；未成交为 0
+}
+
 // 本轮 AI 决策（受约束）：action + 可选仓位占比/置信度 + 理由 + 信号板 + 执行结果 + 体制/共识/降级（E1/E2/E3）。
 export interface AiTradeDecision {
   ts: number;
@@ -125,6 +138,11 @@ export interface AiTradeDecision {
   action: AiTradeAction;
   sizeFraction?: number | null;
   confidence?: number | null;
+  // 委托方式（ai-trade-limit-orders §2.2）：总闸关闭 / 旧快照无此键 → 视同 market。
+  orderType?: "market" | "limit" | null;
+  limitPrice?: number | null;             // 限价委托价；市价决策恒为 null
+  // 本轮结束时的挂单断面（无挂单 → null）；跳过轮不带此段（_emit_decision_skipped）。
+  restingOrder?: AiTradeRestingOrder | null;
   reason: string;
   signalBoard: StrategySignalView[];
   executed?: {
@@ -180,6 +198,8 @@ export interface AiTradeTraceEvent {
     sizeFraction?: number | null;
     confidence?: number | null;
     reason: string;
+    orderType?: "market" | "limit" | null; // 委托方式（缺省 market）
+    limitPrice?: number | null;
   }; // tool_call：门禁后最终决策工具入参
   executed?: AiTradeDecision["executed"]; // result（复用既有 executed 形状）
   degradeReason?: string | null; // result

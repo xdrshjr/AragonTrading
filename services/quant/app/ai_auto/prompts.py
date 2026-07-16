@@ -30,16 +30,47 @@ DECISION_TOOL_DESCRIPTION = (
     "真实持仓后（这些信号仅供参考、可推翻），选择 open_long（开多）/ open_short（开空）/ close（平当前"
     "持仓）/ hold（持币观望）之一，并给出简短理由（reason）。开仓可给 sizeFraction（预算名义占比，0~1）"
     "与 confidence（0~1）。"
+    # ai-trade-limit-orders §2.2/M-4：限价能力开启时（allow_limit=True）追加的散文说明。基础文案
+    # **一字不改**——总闸关闭时描述与本特性合入前逐字相同。
 )
+
+def _fmt_band_pct(band: float) -> str:
+    """价带比例 → 中文文案里的百分数（F-3）：`0.02→"2%"`、`0.015→"1.5%"`（%g 去尾零）。
+
+    默认值 0.02 的渲染与参数化前的硬编码「2%」**逐字节相同**（冻结字面量门禁作证）。
+    """
+    return f"{band * 100:g}%"
+
+
+def _limit_tool_description_suffix(band_pct: float) -> str:
+    """限价能力开启时追加进决策工具描述的散文说明（F-3：价带比例由 settings 派生，不再硬编码）。"""
+    return (
+        "另可给 orderType 选择委托方式：market（市价，立即成交、价格不可控、吃掉买卖价差与滑点）或 "
+        "limit（限价挂单，按你指定的 limitPrice 排队等待成交，**可能不成交**）。orderType=limit 时"
+        f"必须给 limitPrice（USDT），且须在最新价 ±{_fmt_band_pct(band_pct)} 以内，"
+        "超出会被系统拒绝并要求你重新研判。"
+        "第五个动作 cancel_order 用于**撤回你自己此前挂出、尚未成交的限价委托**——它既不开仓也不平仓，"
+        "无挂单时为安全的空操作。若行情已走反、你那笔挂单再等下去已无意义，就用 cancel_order 撤回它。"
+    )
 
 
 def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
-                                 leverage: float, position_step_pct: float = 0.0) -> str:
+                                 leverage: float, position_step_pct: float = 0.0,
+                                 allow_limit: bool = False,
+                                 limit_band_pct: float = 0.02) -> str:
     """决策者系统 prompt：信号仅供参考 + 分步思维链纪律 + 风险偏好 + 只用真数据 + 收尾必调决策工具。
 
-    `position_step_pct`（末位 keyword，默认 0.0 → 连续、原文逐字不变、零回归）：当 `>0` 时把决策纪律 #3 的
+    `position_step_pct`（默认 0.0 → 连续、原文逐字不变、零回归）：当 `>0` 时把决策纪律 #3 的
     「sizeFraction 保守（默认 ≤0.5）」整句**替换**为「只能从允许档位中选择」（[R-8]，非追加——否则与档位
     约束并存自相矛盾）。软引导，服务端 `quantize_size_fraction` 才是硬保证。
+
+    `allow_limit`（默认 False → 原文逐字不变、零回归）：当 `True` 时把纪律 #4 的动作清单整句
+    **替换**为含 `cancel_order` 与限价说明的版本（M-5，同样是替换而非追加——否则新旧动作清单并存
+    自相矛盾）。
+
+    `limit_band_pct`（末位，默认 0.02）：价带比例文案（F-3）。签名默认**只是零回归垫片**（保证既有
+    直连调用逐字不变），运行时唯一真源恒为 `settings.ai_trade_limit_price_max_deviation_pct`——
+    生产调用点（manager 装配）显式传参；`allow_limit=False` 路径不消费该参数。
     """
     return (
         "你是一名严谨、纪律性极强的加密合约自动交易决策者。你不是聊天助手，也不是信号复读机——你的"
@@ -63,11 +94,27 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
         "反转时优先考虑 close；陈旧或缺失周期不得补猜。\n"
         f"3. 风险优先：已持仓且多数证据转为反向时，优先 close 保护利润 / 止损；空仓且多数证据同向、"
         f"研判充分时才开仓，{_size_discipline(position_step_pct)}，避免频繁反手与过度交易。\n"
-        "4. action 取值仅限 open_long / open_short / close / hold；close/hold 忽略 sizeFraction。"
+        f"4. {_action_discipline(allow_limit, limit_band_pct)}"
         "真实下单由系统的守护执行器落地并继承全部资金护栏，你只需给出决策与理由。\n"
         "5. **收尾硬约束（务必遵守）：每轮在完成上述分步研判之后，必须且只能调用一次 "
         "`submit_trade_decision` 工具提交本轮决策——绝不允许只输出研判文字而不调用决策工具。**"
     )
+
+
+def _action_discipline(allow_limit: bool, band_pct: float = 0.02) -> str:
+    """决策纪律 #4 的动作清单子句：`allow_limit=False` 保持原文；`True` 换为含撤单 / 限价的版本（M-5）。
+
+    `band_pct`（F-3）：价带比例文案，默认 0.02 渲染与参数化前逐字节相同（False 分支不消费）。
+    """
+    if not allow_limit:
+        return ("action 取值仅限 open_long / open_short / close / hold；close/hold 忽略 sizeFraction。")
+    return ("action 取值仅限 open_long / open_short / close / hold / cancel_order；"
+            "close/hold/cancel_order 忽略 sizeFraction。委托方式由 orderType 决定："
+            "market（市价，立即成交但价格不可控）或 limit（限价挂单，须给 limitPrice，按你的价格排队、"
+            f"**可能不成交**；委托价须在最新价 ±{_fmt_band_pct(band_pct)} 内，"
+            "超出会被拒绝并要求重新研判）。若你此前挂出的"
+            "限价单仍未成交且行情已走反、再等无意义，用 cancel_order 撤回它（不开不平；无挂单时为"
+            "空操作）。限价适合有明确点位、愿意等待的入场/离场；急需立即成交（如止损保护）请用市价。")
 
 
 def _size_discipline(position_step_pct: float) -> str:
@@ -81,22 +128,66 @@ def _size_discipline(position_step_pct: float) -> str:
             "（系统会把你给出的值吸附到最近的合法档位，非档位值一律被量化）")
 
 
-def build_decision_tool_schema(position_step_pct: float) -> dict:
-    """按档位步长构造决策工具 `input_schema`（[R-5] `enum` 取自 `position_ladder` 真源，软引导）。
+def build_decision_tool_description(allow_limit: bool = False, *,
+                                    limit_band_pct: float = 0.02) -> str:
+    """决策工具散文描述；`allow_limit=False`（默认）**恒等**返回既有模块常量（零回归，M-4）。
 
-    `step>0` 时返回浅拷贝并把 `sizeFraction` 替换为带 `enum` 的定义；`step<=0`（含默认）原样返回模块常量
-    `DECISION_TOOL_SCHEMA`（本身**不改**——回退兜底 + 现有引用不破）。硬保证仍是服务端 `quantize`。
+    `limit_band_pct`（keyword-only，F-3）：价带比例文案；默认 0.02 渲染与参数化前逐字节相同。
+    """
+    if not allow_limit:
+        return DECISION_TOOL_DESCRIPTION
+    return DECISION_TOOL_DESCRIPTION + _limit_tool_description_suffix(limit_band_pct)
+
+
+def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = False,
+                               limit_band_pct: float = 0.02) -> dict:
+    """按档位步长 + 限价总闸构造决策工具 `input_schema`（[R-5] `enum` 取自 `position_ladder` 真源）。
+
+    `step<=0` **且** `allow_limit=False`（含全部默认调用）原样返回模块常量 `DECISION_TOOL_SCHEMA`
+    ——既有恒等断言 `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA`
+    （`test_ai_trade_position_step.py:132`）据此零改动通过，这正是 `allow_limit` **必须默认 False**
+    的硬约束来源（P1-3）。其余情形返回新 dict，且 `properties` 与被替换的 `action` 条目都是**新建
+    对象**——绝不就地改模块常量（`step>0` 时泄漏回常量的老坑，本函数早有前科）。
+
+    Args:
+        position_step_pct: 档位步长（fraction）；`>0` 时把 `sizeFraction` 换为带 `enum` 的定义。
+        allow_limit: 限价总闸（keyword-only，默认 False）。`True` 时 `action` enum 追加
+            `cancel_order`，并露出 `orderType` / `limitPrice` 两个新字段。
+        limit_band_pct: 价带比例文案（keyword-only，F-3）；仅 `allow_limit=True` 分支消费，
+            默认 0.02 渲染与参数化前逐字节相同（恒等断言据此原样通过）。
+
+    Returns:
+        决策工具的 `input_schema`（JSON Schema）。硬保证仍在服务端（`quantize_size_fraction` 与
+        `validate_limit_intent`），本 schema 只是软引导。
     """
     step = max(0.0, float(position_step_pct))
-    if step <= 0:
+    if step <= 0 and not allow_limit:
         return DECISION_TOOL_SCHEMA
-    from .signals import position_ladder   # 延迟导入打破 signals→decider→prompts 模块级循环（§2.2）
     schema = dict(DECISION_TOOL_SCHEMA)
     props = dict(DECISION_TOOL_SCHEMA["properties"])   # 独立浅拷贝，杜绝改动泄漏回模块常量
-    props["sizeFraction"] = {"type": "number", "enum": position_ladder(step),
-                             "description": "开仓仓位占比，只能取列出的档位"}
+    if step > 0:
+        from .signals import position_ladder   # 延迟导入打破 signals→decider→prompts 模块级循环（§2.2）
+        props["sizeFraction"] = {"type": "number", "enum": position_ladder(step),
+                                 "description": "开仓仓位占比，只能取列出的档位"}
+    if allow_limit:
+        _apply_limit_properties(props, limit_band_pct)
     schema["properties"] = props
     return schema
+
+
+def _apply_limit_properties(props: dict, band_pct: float = 0.02) -> None:
+    """就地给**调用方自己的 props 浅拷贝**补限价字段（§4.1）；动作枚举派生自常量真源，不再抄一份。
+
+    `band_pct`（F-3）：limitPrice 字段描述的价带比例，默认 0.02 渲染与参数化前逐字节相同。
+    """
+    base_actions = list(DECISION_TOOL_SCHEMA["properties"]["action"]["enum"])
+    props["action"] = {"type": "string", "enum": [*base_actions, "cancel_order"]}
+    props["orderType"] = {
+        "type": "string", "enum": ["market", "limit"],
+        "description": "market=立即成交、价格不可控；limit=挂单等待，可能不成交。缺省 market"}
+    props["limitPrice"] = {
+        "type": "number", "exclusiveMinimum": 0,
+        "description": f"限价委托价（USDT），orderType=limit 时必填；须在最新价 ±{_fmt_band_pct(band_pct)} 内"}
 
 
 def _format_position(position: dict | None) -> str:
@@ -104,6 +195,22 @@ def _format_position(position: dict | None) -> str:
         return "当前无自管持仓（flat）"
     return (f"当前自管持仓：方向={position.get('side')}，均价={position.get('avgEntry')}，"
             f"张数={position.get('size')}，未实现盈亏≈{position.get('unrealizedPnl')} USDT")
+
+
+def _format_resting_order(resting: dict | None) -> str:
+    """把当前挂单压成一行中文（§4.2）；无挂单时返回空串（整段省略，同 E1/E2 降级范式）。
+
+    Agent 看不见自己的挂单就无法就它做任何决策——**这是 `cancel_order` 可用的前提**。
+    """
+    if not resting:
+        return ""
+    intent = "买" if resting.get("intent") == "open" else "平"
+    side = {"long": "多", "short": "空"}.get(str(resting.get("side")), str(resting.get("side")))
+    filled = resting.get("filledSz") or 0.0
+    fill_text = "未成交" if not filled else f"已成交 {filled} 张"
+    return (f"当前挂单：限价{intent}{side} {resting.get('sz')} 张 @ {resting.get('px')}"
+            f"（已挂 {resting.get('ageS')}s，剩余 {resting.get('expiresInS')}s 到期自动撤销，"
+            f"{fill_text}）。如需撤回请用 action=cancel_order。")
 
 
 def _format_board(board: list[dict]) -> str:
@@ -224,6 +331,9 @@ def build_decision_prompt(payload: dict) -> str:
         (f"会话累计盈亏≈{payload.get('sessionPnlUsd')} USDT / 预算 {payload.get('budgetUsd')} USDT；"
          f"会话止盈阈值={'不触发' if tp is None else tp}，止损阈值={'不触发' if sl is None else sl}"),
     ]
+    resting_line = _format_resting_order(payload.get("restingOrder"))
+    if resting_line:                         # 无挂单时整段省略（不出现「当前挂单：无」的噪音）
+        parts.append(resting_line)
     parts.extend(_format_multi_timeframe(payload.get("multiTimeframeContext")))
     market_line = _format_market_context(payload.get("marketContext"))
     if market_line:                          # E1：mc 为 None 时整段省略（不出现半截空信息）

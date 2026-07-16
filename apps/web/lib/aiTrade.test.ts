@@ -10,6 +10,7 @@ import {
   describeConsensus,
   describeExecuted,
   describeFactors,
+  describeOrderType,
   describePriceAction,
   describeReflection,
   describeRegime,
@@ -163,6 +164,7 @@ describe("describe helpers", () => {
     expect(describeAiAction("open_short")).toBe("开空");
     expect(describeAiAction("close")).toBe("平仓");
     expect(describeAiAction("hold")).toBe("观望");
+    expect(describeAiAction("cancel_order")).toBe("撤单");
   });
   it("localizes stances", () => {
     expect(describeStance("long")).toBe("多");
@@ -172,6 +174,20 @@ describe("describe helpers", () => {
     expect(describeStopReason("session_stop_loss")).toMatch(/止损/);
     expect(describeStopReason(null)).toBe("已停止");
     expect(describeStopReason("unknown_reason")).toBe("已停止");
+  });
+});
+
+describe("describeOrderType (ai-trade-limit-orders, 委托方式文案)", () => {
+  it("localizes the order type enum", () => {
+    expect(describeOrderType("market")).toBe("市价");
+    expect(describeOrderType("limit")).toBe("限价");
+  });
+  it("treats an absent order type as market (old snapshots / limit orders disabled)", () => {
+    expect(describeOrderType(null)).toBe("市价");
+    expect(describeOrderType(undefined)).toBe("市价");
+  });
+  it("falls back to the raw value for unknown enums (no fabrication)", () => {
+    expect(describeOrderType("post_only")).toBe("post_only");
   });
 });
 

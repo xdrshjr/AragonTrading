@@ -21,6 +21,7 @@ from ..config import Settings
 from ..db import repositories as repo
 from .accounts import AccountCredentials, _map_okx_code, _normalize_position, _redact
 from .order_builder import (
+    CancelOrderInput,
     ClosePositionInput,
     InstrumentMeta,
     OrderInput,
@@ -50,13 +51,24 @@ _clord_counter = itertools.count()
 
 
 def _map_trade_code(code: str) -> str:
-    """OKX 下单 / 本地拦截码 → 稳定对外语义码（在 accounts._map_okx_code 基础上补下单类，§6）。"""
+    """OKX 下单 / 撤单 / 本地拦截码 → 稳定对外语义码（在 accounts._map_okx_code 基础上补，§6）。
+
+    撤单三码（``51400``/``51401``/``51402``）**必须三分、绝不合并**（ai-trade-limit-orders §4.4 P0-2）：
+    「已撤销」意味着无持仓、「已成交」意味着有真实持仓，两者的持仓后果完全相反。把它们压成同一个
+    「订单不在了」的归一码，正是本仓选用 ``GET /trade/order`` 而非 ``orders-pending`` 时所要规避的
+    同一个二义陷阱。
+    """
     mapping = {
         "51008": "INSUFFICIENT_BALANCE",   # 可用余额 / 保证金不足
         "51004": "LEVERAGE_EXCEEDS",       # 数量超当前杠杆可开上限
         "51000": "ORDER_PARAM_INVALID",    # 下单参数不合法
         "51001": "ORDER_PARAM_INVALID",
         "51010": "ACCT_MODE_MISMATCH",     # 账户模式与下单方式不匹配
+        "51006": "LIMIT_PRICE_OUT_OF_RANGE",  # 委托价超交易所限价带（本地 ±band 门禁之后的第二层）
+        "51121": "ORDER_SIZE_NOT_MULTIPLE",   # 委托张数须为下单单位整数倍
+        "51400": "ORDER_NOT_FOUND",           # 撤单失败：订单不存在（状态未知，不可当良性丢弃）
+        "51401": "ORDER_ALREADY_CANCELED",    # 撤单失败：订单已撤销（良性幂等，无持仓）
+        "51402": "ORDER_ALREADY_FILLED",      # 撤单失败：订单已成交（**有真实持仓**，调用方须采纳）
     }
     if code in mapping:
         return mapping[code]
@@ -253,6 +265,116 @@ async def close_live_position(session: AsyncSession, creds: AccountCredentials, 
             "code": None, "message": None}
 
 
+# 撤单三态归因（ai-trade-limit-orders §2.5/§4.4，P0-2）：撤单**不是**成功/失败两态——第三态是
+# 「撤单请求发出的同时那笔挂单成交了」。归一码 → 三态；未列入者一律 "unknown"（状态未知，保留挂单
+# 待下轮 _poll_resting 再判），**绝不**乐观当作良性撤销——那会丢失真实持仓并在 cancel-replace 下双开。
+_CANCEL_OUTCOME_BY_CODE = {
+    "ORDER_ALREADY_CANCELED": "canceled",   # 51401：良性幂等，单子确实没了且无持仓
+    "ORDER_ALREADY_FILLED": "filled",       # 51402：单子成了，调用方必须采纳成交且绝不下新单
+}
+# 三态 → live_order_audit.status（自由 String 列，无 CHECK，新增取值无需迁移）。
+# 注意 "filled" 写 "accepted"：它是一笔**成功的成交**，绝不是拒单。
+_CANCEL_AUDIT_STATUS = {"canceled": "canceled", "filled": "accepted", "unknown": "error"}
+
+
+def _cancel_outcome(mapped_code: str) -> str:
+    """撤单归一码 → 三态 ``"canceled" | "filled" | "unknown"``（纯查表，§4.4）。"""
+    return _CANCEL_OUTCOME_BY_CODE.get(mapped_code, "unknown")
+
+
+async def cancel_live_order(session: AsyncSession, creds: AccountCredentials, account_id: int,
+                            cancel: CancelOrderInput) -> dict:
+    """撤一笔未成交挂单（§4.4）：撤单 → 归一三态 → ``live_order_audit`` 留痕 → 脱敏。
+
+    **返回三态而非 bool**（P0-2）：``{"outcome": "canceled"|"filled"|"unknown", "code": str|None}``。
+    调用方**一律**只在 ``"canceled"`` 时才继续原计划（下新单 / 早退）；收到 ``"filled"`` 必须先采纳
+    成交再放弃本轮新单——否则会在一笔已成交的真实仓位之上再开一笔，敞口翻倍（§2.5）。
+
+    Args:
+        session: 短生命周期 DB session（仅落审计）。
+        creds: 账户凭证（脱敏用，绝不落库）。
+        account_id: 审计归属账户。
+        cancel: 撤单意图 + 供审计的挂单快照（`RestingOrder` 派生）。
+
+    Returns:
+        ``{"outcome": 三态, "code": 归一码或 None, "ordId": str|None, "clOrdId": str}``。
+        本函数**不抛** OKX 业务错误——撤单失败是常态（单子可能已成/已撤），一律归入三态由调用方分派。
+
+    Raises:
+        OKXPrivateError: 仅连通类失败（`OKX_UNREACHABLE` / `OKX_HTTP_ERROR`）经 "unknown" 三态吸收，
+            故实际不外抛；DB 落审计失败按既有风格上抛。
+    """
+    client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
+    try:
+        row = await client.cancel_order(cancel.inst_id, cl_ord_id=cancel.cl_ord_id)
+    except OKXError as exc:
+        mapped = _map_trade_code(exc.code)
+        outcome = _cancel_outcome(mapped)
+        await _audit_cancel(session, account_id, cancel,
+                            status=_CANCEL_AUDIT_STATUS[outcome], ord_id="", error_code=mapped)
+        return {"outcome": outcome, "code": mapped, "ordId": None,
+                "clOrdId": cancel.cl_ord_id,
+                "message": _redact(exc.message, creds.secret_key, creds.passphrase)}
+    finally:
+        await client.aclose()
+    ord_id = str(row.get("ordId") or "")
+    await _audit_cancel(session, account_id, cancel, status="canceled", ord_id=ord_id,
+                        error_code="")
+    return {"outcome": "canceled", "code": None, "ordId": ord_id or None,
+            "clOrdId": str(row.get("clOrdId") or cancel.cl_ord_id), "message": None}
+
+
+async def _audit_cancel(session: AsyncSession, account_id: int, cancel: CancelOrderInput, *,
+                        status: str, ord_id: str, error_code: str) -> None:
+    """撤单留痕（复用 ``_close_audit_values`` 形态；direction/px/sz 取自调用方的挂单快照，§4.4）。"""
+    await repo.create_live_order_audit(session, values=_close_audit_values(
+        account_id, cancel.inst_id, cancel.direction, "limit", cancel.td_mode,
+        cancel.px, cancel.sz or 0.0, cancel.cl_ord_id, status=status, ord_id=ord_id,
+        error_code=error_code))
+
+
+async def fetch_live_order(creds: AccountCredentials, inst_id: str, *, cl_ord_id: str) -> dict:
+    """单条订单的权威状态（§4.4，只读）：``GET /trade/order`` → 归一。
+
+    之所以不用 ``orders-pending``：「不在挂单列表」对「已成交」与「已撤销」是**二义**的，按它归因
+    会把撤单记成成交（§2.3）。本接口直接给权威 ``state`` 与 ``avgPx`` / ``accFillSz``，无歧义。
+
+    Args:
+        creds: 账户凭证。
+        inst_id: 合约 ID。
+        cl_ord_id: 我方自定义订单 ID。
+
+    Returns:
+        ``{state, px, sz, avgPx, accFillSz, ordId, clOrdId, updatedTs}``；订单不存在时 ``state=""``。
+
+    Raises:
+        OKXPrivateError: OKX 不可达 / 业务码非 0（归一 + 脱敏后上抛；绝不假数据，C1）。
+    """
+    client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
+    try:
+        row = await client.get_order(inst_id, cl_ord_id=cl_ord_id)
+    except OKXError as exc:
+        raise OKXPrivateError(_map_trade_code(exc.code),
+                              _redact(exc.message, creds.secret_key, creds.passphrase)) from exc
+    finally:
+        await client.aclose()
+    return _normalize_order(row)
+
+
+def _normalize_order(r: dict) -> dict:
+    """OKX ``trade/order`` 单行 → 归一订单状态（camelCase，秒级 UTC，数值容错）。"""
+    return {
+        "state": str(r.get("state") or ""),
+        "px": _optional_float(r.get("px")),
+        "sz": _optional_float(r.get("sz")),
+        "avgPx": _optional_float(r.get("avgPx")),
+        "accFillSz": _optional_float(r.get("accFillSz")) or 0.0,
+        "ordId": str(r.get("ordId") or "") or None,
+        "clOrdId": str(r.get("clOrdId") or "") or None,
+        "updatedTs": int(r.get("uTime") or 0) // 1000,
+    }
+
+
 async def close_all_live_positions(session: AsyncSession, creds: AccountCredentials,
                                    account_id: int) -> dict:
     """一键市价全平时序（§2.5）：取实时持仓→逐仓 ``close_position``→单仓失败并入 ``results`` 不中断全批。
@@ -401,6 +523,18 @@ def _algo_px(value: object) -> float | None:
     return _optional_float(text)
 
 
+def _attach_px(value: object) -> float | None:
+    """随单 OCO 触发价的**防御式**解析（F-4，评审 R-2/R-3）：畸形（不可解析字符串等）一律 None。
+
+    与 `_algo_px` 的差别只在异常姿态：本函数跑在 `fetch_live_open_orders` 的列表推导里，一行
+    抛错会炸掉整个 open-orders 端点（持仓子行/图表虚线/委托页签三处同灭），故绝不上抛。
+    """
+    try:
+        return _algo_px(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _classify_pending_kind(r: dict) -> str:
     """普通挂单 kind 判定（R4）：reduceOnly 或对冲反向单 → ``limit_close``，否则 ``limit_open``。"""
     if _as_bool(r.get("reduceOnly")):
@@ -413,7 +547,21 @@ def _classify_pending_kind(r: dict) -> str:
 
 
 def _normalize_pending_order(r: dict) -> dict:
-    """OKX orders-pending 单行 → 归一未结委托（camelCase，秒级 UTC，数值容错）。"""
+    """OKX orders-pending 单行 → 归一未结委托（camelCase，秒级 UTC，数值容错）。
+
+    额外回带 ``clOrdId``（下单时我方写入、挂单读回时 OKX 回显）——它是**挂单归属判定的前提**：
+    没有它就无法分辨一笔挂单是本会话挂的还是来路不明的（ai-trade-limit-orders §八.6）。仅「停止
+    丢弃」，缺失容错为 None，不改变任何既有调用（同 `_normalize_fill` 回带 clOrdId 的既有范式）。
+
+    随单 OCO（``attachAlgoOrds``）在**挂单成交前**不会出现在 orders-algo-pending——透出其 tp/sl
+    触发价是「挂单的止盈止损情况」的唯一可见来源（ai-trade-limit-orders-fix F-4）。防御式解析须做
+    **元素级**类型守卫（评审 R-2）：本函数跑在 `fetch_live_open_orders` 的列表推导里，任何一行抛
+    异常都会炸掉整个 GET /trading/open-orders；attach 元素非 dict 时静默落 ``{}``。只取首条：
+    本系统自挂单恒单条 OCO（`build_order_payload`），外部分批挂单仅显示首条（已知局限，评审 R-4）。
+    """
+    raw_attach = r.get("attachAlgoOrds")
+    first = raw_attach[0] if isinstance(raw_attach, list) and raw_attach else None
+    attach = first if isinstance(first, dict) else {}
     return {
         "kind": _classify_pending_kind(r),
         "instId": str(r.get("instId") or ""),
@@ -425,8 +573,11 @@ def _normalize_pending_order(r: dict) -> dict:
         "state": str(r.get("state") or ""),
         "reduceOnly": _as_bool(r.get("reduceOnly")),
         "ordId": str(r.get("ordId") or "") or None,
+        "clOrdId": str(r.get("clOrdId") or "") or None,
         "algoId": None,
         "createdTs": int(r.get("cTime") or 0) // 1000,
+        "attachTpTriggerPx": _attach_px(attach.get("tpTriggerPx")),
+        "attachSlTriggerPx": _attach_px(attach.get("slTriggerPx")),
     }
 
 

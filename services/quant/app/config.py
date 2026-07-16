@@ -151,6 +151,21 @@ class Settings(BaseSettings):
     # 0=连续（旧行为，仅后端零回归默认 / API 退出口，弹窗不露出）。env 名 AI_TRADE_DEFAULT_POSITION_STEP_PCT
     # 已在 desktop config.js prod 透传白名单内（AI_TRADE_ 前缀），此处声明后方不被 extra="ignore" 静默丢弃。
     ai_trade_default_position_step_pct: float = 0.25
+    # ---- 限价委托挂单（ai-trade-limit-orders §5.3）----
+    # 给 AI 决策链路补齐限价能力：Agent 可在 submit_trade_decision 里给 orderType=limit + limitPrice，
+    # 并用新动作 cancel_order 撤回自己未成交的挂单；仍可照旧市价委托（需求原文「之后 Agent 可以限价
+    # 委托，也可以市价委托」）。总闸 False ⇒ schema 不露出 orderType/limitPrice、动作枚举回退 4 值、
+    # order_plan 恒 None ⇒ 行为**逐字回退**到本特性合入前的 market-only。默认 True 与既有 ai_trade_enabled /
+    # ai_trade_reflection_enabled 的「默认即生效」约定一致（拍板记录见 spec 文末〈实施过程发现的方案缺陷〉）。
+    # env 名 AI_TRADE_LIMIT_* 已在 desktop config.js prod 透传白名单内（AI_TRADE_ 前缀），此处须真的声明
+    # ——Settings extra="ignore" 会静默丢弃未声明的 env。
+    ai_trade_limit_orders_enabled: bool = True    # 限价总闸；False 逐字回退 market-only
+    # 本地价带门禁：|limitPx-lastPx|/lastPx 超此值即降级 hold（可重试）。比 OKX 侧 ±5% 限价带
+    # （错误码 51006）更紧、先触发、给中文可解释原因、不消耗 API 配额。
+    ai_trade_limit_price_max_deviation_pct: float = 0.02
+    # 挂单存活上限（秒），到期由 _poll_resting 自动撤销。Agent 唤醒是离散的，一笔永不成交的挂单会长期
+    # 占用保证金与会话预算；TTL 是兜底，Agent 的 cancel_order 是主动手段，二者互补。
+    ai_trade_limit_order_ttl_s: float = 300.0
     # ---- 思维链研判增强（ai-trade-reasoning-chain §2.8）----
     # 向决策 prompt 注入「价格走势 / 成交量 / 技术因子」三段紧凑证据摘要，配合分步思维链研判纪律：策略/因子
     # 信号只作参考与触发线索、可被 Agent 推翻。默认开（只读输入增强；禁用 / 数据不足 / 异常自动省略该段，

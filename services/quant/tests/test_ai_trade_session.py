@@ -390,8 +390,12 @@ class _ReflectStubLLM:
 
 
 def _make_reflect_session(*, action="open_long", size=0.5, verdict="confirm",
-                          adjusted=None, run_id=1):
-    """构造一个**打开反思**的会话（decider reflection_enabled=True，桩 LLM 区分决策/反思流）。"""
+                          adjusted=None, run_id=1, allow_limit=False):
+    """构造一个**打开反思**的会话（decider reflection_enabled=True，桩 LLM 区分决策/反思流）。
+
+    `allow_limit`（默认 False → 既有反思剧本零回归）：True 时决策器放行 `cancel_order`
+    （F-7 复现测试需要，ai-trade-limit-orders-fix §2.8）。
+    """
     settings = Settings()
     calls = {"orders": [], "closes": []}
 
@@ -418,7 +422,7 @@ def _make_reflect_session(*, action="open_long", size=0.5, verdict="confirm",
         positions_fn=positions_fn)
     llm = _ReflectStubLLM(action=action, size=size, verdict=verdict, adjusted=adjusted)
     decider = AiTradeDecider(llm, "sys", context_refresh_rounds=10, settings=settings,
-                             reflection_enabled=True)
+                             reflection_enabled=True, allow_limit=allow_limit)
     spec = PaperStrategySpec(1, "S", "atomic", _StubStrategy({}), {})
     session = AiTradeSession("aitrade_reflect", run_id, [spec], "BTC-USDT-SWAP", "1H", executor,
                              decider, priming=False, priming_bars=10, context_refresh_rounds=10)
@@ -516,5 +520,27 @@ async def test_reflection_emits_start_and_verdict_trace_phases():
         phases = [e["data"]["phase"] for e in _drain(q) if e["type"] == "agent_trace"]
         assert "reflection_start" in phases
         assert "reflection_verdict" in phases
+    finally:
+        await dispose_engine()
+
+
+async def test_cancel_order_bypasses_reflection():
+    """F-7 复现（ai-trade-limit-orders-fix §2.8，先红后绿）：撤单不进反思。
+
+    `cancel_order` 不产生任何委托（order_plan 恒 None），无「下单前」可复核；反思复核官的
+    词汇表只认识 open/close，abort 剧本（或生产网络抖动 fail-closed）会把撤单降级 hold——
+    挂单敞口反而多活到 TTL。故撤单须与 hold 一样直通：零反思子调用、动作不被降级。
+    """
+    await init_db()
+    session, calls, llm = _make_reflect_session(action="cancel_order", verdict="abort",
+                                                allow_limit=True)
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        assert llm.reflection_calls == 0                 # 撤单绝不触发反思子调用
+        data = [e for e in _drain(q) if e["type"] == "decision"][-1]["data"]
+        assert data["action"] == "cancel_order"          # abort 剧本下也不被降级 hold
+        assert calls["orders"] == [] and calls["closes"] == []   # 撤单不开不平
     finally:
         await dispose_engine()

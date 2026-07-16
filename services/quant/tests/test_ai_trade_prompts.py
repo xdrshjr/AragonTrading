@@ -149,3 +149,45 @@ def test_reflection_prompt_carries_evidence_and_proposed_decision():
     # 明确中和原决策工具指令，避免复核官误调 submit_trade_decision。
     assert f"不要**调用 {DECISION_TOOL_NAME}" in text or "与你无关" in text
     assert text.rstrip().endswith("也不得调用其它工具。")
+
+
+# ---------- F-3 价带比例单一真源化（ai-trade-limit-orders-fix §2.4，先红后绿）----------
+# 冻结字面量（P1-3 教训：绝不与模块常量自比，防「改坏常量后自比恒真」空测）——
+# 与本特性合入前 `_LIMIT_TOOL_DESCRIPTION_SUFFIX` 的今日全文逐字相同。
+_FROZEN_LIMIT_SUFFIX_AT_2PCT = (
+    "另可给 orderType 选择委托方式：market（市价，立即成交、价格不可控、吃掉买卖价差与滑点）或 "
+    "limit（限价挂单，按你指定的 limitPrice 排队等待成交，**可能不成交**）。orderType=limit 时"
+    "必须给 limitPrice（USDT），且须在最新价 ±2% 以内，超出会被系统拒绝并要求你重新研判。"
+    "第五个动作 cancel_order 用于**撤回你自己此前挂出、尚未成交的限价委托**——它既不开仓也不平仓，"
+    "无挂单时为安全的空操作。若行情已走反、你那笔挂单再等下去已无意义，就用 cancel_order 撤回它。"
+)
+
+
+def test_limit_prompt_band_default_binary_identical():
+    """默认 band=0.02 的渲染与冻结字面量**逐字节相同**（默认文案零漂移的硬门禁）。"""
+    from app.ai_auto.prompts import _limit_tool_description_suffix
+    assert _limit_tool_description_suffix(0.02) == _FROZEN_LIMIT_SUFFIX_AT_2PCT
+
+
+def test_limit_prompt_band_follows_setting():
+    """band=0.05 时系统 prompt / 工具描述 / schema 字段描述同步渲染「±5%」且不含「±2%」。"""
+    from app.ai_auto.prompts import (
+        build_decision_tool_description,
+        build_decision_tool_schema,
+    )
+    desc = build_decision_tool_description(True, limit_band_pct=0.05)
+    assert "±5%" in desc and "±2%" not in desc
+    schema = build_decision_tool_schema(0.0, allow_limit=True, limit_band_pct=0.05)
+    assert "±5%" in schema["properties"]["limitPrice"]["description"]
+    assert "±2%" not in schema["properties"]["limitPrice"]["description"]
+    sysp = build_ai_trade_system_prompt("BTC-USDT-SWAP", "1H", 100.0, 3.0,
+                                        allow_limit=True, limit_band_pct=0.05)
+    assert "±5%" in sysp and "±2%" not in sysp
+
+
+def test_limit_prompt_band_fmt_renders_trailing_zero_free():
+    """`_fmt_band_pct`：0.02→"2%"、0.015→"1.5%"（%g 去尾零，默认值渲染与今日文案逐字节相同）。"""
+    from app.ai_auto.prompts import _fmt_band_pct
+    assert _fmt_band_pct(0.02) == "2%"
+    assert _fmt_band_pct(0.015) == "1.5%"
+    assert _fmt_band_pct(0.05) == "5%"

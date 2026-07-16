@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   buildOrderPriceLines,
   groupOrdersByPosition,
+  isChartLineOrder,
   isPositionOrder,
+  openOrderKindLabel,
   openOrdersKey,
+  orderKindMeta,
   pctChange,
   positionKey,
 } from "./openOrders";
@@ -60,6 +63,39 @@ describe("isPositionOrder", () => {
   });
 });
 
+describe("isChartLineOrder (F-6)", () => {
+  it("includes limit_open on top of the position kinds (图表线纳入开仓挂单)", () => {
+    expect(isChartLineOrder("limit_close")).toBe(true);
+    expect(isChartLineOrder("tp")).toBe(true);
+    expect(isChartLineOrder("sl")).toBe(true);
+    expect(isChartLineOrder("limit_open")).toBe(true);
+  });
+});
+
+describe("openOrderKindLabel (F-5 页签中文标签)", () => {
+  it("maps the four kinds to tab labels distinct from chart-line short labels", () => {
+    expect(openOrderKindLabel("limit_open")).toBe("限价开仓");
+    expect(openOrderKindLabel("limit_close")).toBe("限价平仓");
+    expect(openOrderKindLabel("tp")).toBe("止盈委托");
+    expect(openOrderKindLabel("sl")).toBe("止损委托");
+  });
+});
+
+describe("orderKindMeta — limit_open explicit branch (F-6, 评审 R-3)", () => {
+  it("uses the existing --muted theme var (never the nonexistent --accent-2)", () => {
+    const meta = orderKindMeta("limit_open");
+    expect(meta.label).toBe("开仓挂单");
+    expect(meta.colorVar).toBe("--muted");
+    expect(meta.lineStyle).toBe(2);
+  });
+
+  it("keeps the three existing kinds' colors distinct and unchanged", () => {
+    expect(orderKindMeta("tp").colorVar).toBe("--long");
+    expect(orderKindMeta("sl").colorVar).toBe("--short");
+    expect(orderKindMeta("limit_close").colorVar).toBe("--accent");
+  });
+});
+
 describe("groupOrdersByPosition", () => {
   it("groups orders by (instId, posSide) and drops limit_open / unmatched positions", () => {
     const positions = [mockPos(), mockPos({ instId: "ETH-USDT-SWAP", posSide: "short" })];
@@ -101,18 +137,21 @@ describe("pctChange", () => {
 });
 
 describe("buildOrderPriceLines", () => {
-  it("keeps only current instId position orders, price = triggerPx ?? px", () => {
+  it("keeps current instId chart-line orders incl. limit_open (F-6), price = triggerPx ?? px", () => {
     const orders = [
       mockOrder({ ordId: "1001", px: 64000, triggerPx: null }),
       mockOrder({ kind: "tp", ordId: null, algoId: "987", px: null, triggerPx: 70000 }),
-      mockOrder({ kind: "limit_open", ordId: "open1" }), // 过滤
+      mockOrder({ kind: "limit_open", ordId: "open1", px: 60000, reduceOnly: false }), // F-6 起纳入
       mockOrder({ instId: "ETH-USDT-SWAP", ordId: "eth1" }), // 非当前 instId
     ];
     const lines = buildOrderPriceLines(orders, "BTC-USDT-SWAP", 65000);
-    expect(lines.map((l) => l.id)).toEqual(["1001:limit_close", "987:tp"]);
+    expect(lines.map((l) => l.id)).toEqual(["1001:limit_close", "987:tp", "open1:limit_open"]);
     expect(lines[0].price).toBe(64000);
     expect(lines[1].price).toBe(70000);
     expect(lines[0].changePct).toBeCloseTo((64000 - 65000) / 65000);
+    expect(lines[2].price).toBe(60000);
+    expect(lines[2].label).toBe("开仓挂单");
+    expect(lines[2].colorVar).toBe("--muted");
   });
 
   it("gives OCO tp/sl distinct ids that do not collide (shared algoId)", () => {

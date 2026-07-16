@@ -24,6 +24,7 @@ from ..db.session import get_sessionmaker
 from ..engine.metrics import _empty_metrics
 from ..live_auto.executor import LiveExecutor
 from ..live_auto.explain import build_atomic_explain
+from ..live_auto.resting import resting_payload
 from ..okx.rest_client import get_rest_client
 from ..okx.types import BAR_SECONDS, Candle
 from ..okx.ws_client import OKXWSClient
@@ -34,6 +35,7 @@ from .market_context import build_market_context
 from .market_digest import build_market_digest
 from .market_window import MarketWindow
 from .multi_timeframe_context import build_multi_timeframe_context
+from .order_plan import decision_to_order_plan
 from .prompts import DECISION_TOOL_NAME
 from .reflection import apply_reflection, applied_shrink
 from .signals import (
@@ -65,7 +67,10 @@ _ANALYSIS_EXCERPT_CHARS = 400
 
 logger = logging.getLogger(__name__)
 
-_ACTION_LABEL = {"open_long": "开多", "open_short": "开空", "close": "平仓", "hold": "观望"}
+_ACTION_LABEL = {"open_long": "开多", "open_short": "开空", "close": "平仓", "hold": "观望",
+                 "cancel_order": "撤单"}
+# 决策动作 → `Signal.side`（M-6：原为 `_ai_explain` 内的裸下标，新动作当轮即 KeyError）。
+_ACTION_SIDE = {"open_long": "long", "open_short": "short", "close": "close"}
 
 
 class AiTradeSession:
@@ -255,6 +260,10 @@ class AiTradeSession:
 
     async def _handle_flatten_result(self, ts: int) -> None:
         result = self.flatten_result or {}
+        # §2.8：flatten 先撤挂单——撤单 / 「最后一刻成交」的采纳事件须如实扇出（缺键即无挂单，
+        # 与本特性合入前逐字相同）。
+        if result.get("events"):
+            await self._dispatch(result["events"])
         if result.get("trade"):
             await self._dispatch([{"type": "trade", "data": result["trade"]}])
         if result.get("ok"):
@@ -463,9 +472,13 @@ class AiTradeSession:
     async def _reflect_before_execute(self, round_no: int, ts: int, payload: dict,
                                       decision: TradeDecision, degrade: str | None
                                       ) -> tuple[TradeDecision, str | None]:
-        """交易意愿决策在真实下单前经一次独立反思复核（只会更保守）；hold/关闭反思时原样直通。"""
-        if not self.decider.reflection_enabled or decision.action == "hold":
-            return decision, degrade                 # 关闭 或 无交易意愿 → 无 LLM、无轨迹
+        """交易意愿决策在真实下单前经一次独立反思复核（只会更保守）；hold/撤单/关闭反思时原样直通。"""
+        # F-7（ai-trade-limit-orders-fix §2.8）：cancel_order 与 hold 同列直通——反思宪章是「下单前
+        # 二次复核」，撤单不产生任何委托（order_plan 恒 None）、本身即风险收敛动作；拦截它反而反保守
+        # （abort/fail-closed 会把撤单降级 hold，挂单敞口多活到 TTL）。勿回改为单值门控。
+        if (not self.decider.reflection_enabled
+                or decision.action in ("hold", "cancel_order")):
+            return decision, degrade                 # 关闭 或 不下单动作 → 无 LLM、无轨迹
         await self._begin_reflection_trace(round_no, ts, decision)
         verdict = await self.decider.reflect(
             payload, decision, emit=self._make_trace_emit(round_no, ts))
@@ -544,7 +557,8 @@ class AiTradeSession:
                                     decision: TradeDecision) -> None:
         """tool_call：门禁后最终决策工具入参（与真实执行一致，降级则如实呈现 hold）。"""
         tool_input = {"action": decision.action, "sizeFraction": decision.size_fraction,
-                      "confidence": decision.confidence, "reason": decision.reason}
+                      "confidence": decision.confidence, "reason": decision.reason,
+                      "orderType": decision.ord_type, "limitPrice": decision.limit_px}
         if self._round_trace is not None:
             self._round_trace["toolCall"] = tool_input
             self._round_trace["toolCallPending"] = False
@@ -588,24 +602,50 @@ class AiTradeSession:
 
     async def _execute_decision(self, decision: TradeDecision, ref_px: float, i: int,
                                 ts: int) -> dict:
-        """映射决策为 Signal 并经 LiveExecutor 守护执行（一切写经 _exec_lock 串行，P1-1）。"""
+        """映射决策为 Signal 并经 LiveExecutor 守护执行（一切写经 _exec_lock 串行，P1-1）。
+
+        `cancel_order` 在**进入信号翻译之前**先行分发（ai-trade-limit-orders §2.2a 第一层防线）：
+        它根本不调用 `decision_to_signals`。第二层是 `decision_to_signals` 自身的白名单（M-12）——
+        任一层单独成立即可阻断「Agent 说撤单 → 被静默翻译成市价平掉真实持仓」。
+        """
+        if decision.action == "cancel_order":
+            return await self._execute_cancel(decision, ts)
         signals = self._decision_to_signals(decision, board_digest=self._board_digest())
         if not signals:
             return {"ok": True, "action": decision.action, "skipped": False,
                     "side": self.executor.projected, "qty": self.executor.entry_qty_sz,
                     "positionAfter": self.executor.projected}
+        order_plan = decision_to_order_plan(decision)
         async with self._exec_lock:
             if self.state != "running":       # stop() 抢先置 stopped：本轮不再下单（避免停止竞态下多此一举的开仓+随即被 flatten 平掉，白付手续费）
                 return {"ok": True, "action": decision.action, "skipped": True,
                         "reason": "stopped", "side": self.executor.projected,
                         "qty": self.executor.entry_qty_sz,
                         "positionAfter": self.executor.projected}
-            events = await self.executor.apply(signals, ref_px=ref_px, bar_index=i, ts=ts)
+            events = await self.executor.apply(signals, ref_px=ref_px, bar_index=i, ts=ts,
+                                               order_plan=order_plan)
             events += await self.executor.reconcile(ref_px, ts)
         await self._dispatch(events)
         await self._push_status_if_side_changed()
         traded = any(e.get("type") == "trade" for e in events)
         return {"ok": True, "action": decision.action, "skipped": False, "traded": traded,
+                "side": self.executor.projected, "qty": self.executor.entry_qty_sz,
+                "positionAfter": self.executor.projected}
+
+    async def _execute_cancel(self, decision: TradeDecision, ts: int) -> dict:
+        """`cancel_order` 前置分发（§2.2a 第一层）：只撤挂单，**绝不触碰任何持仓**。
+
+        无挂单时为良性 no-op（回 status 事件、不报错、不改 `projected`）。
+        """
+        async with self._exec_lock:
+            if self.state != "running":
+                return {"ok": True, "action": decision.action, "skipped": True,
+                        "reason": "stopped", "side": self.executor.projected,
+                        "qty": self.executor.entry_qty_sz,
+                        "positionAfter": self.executor.projected}
+            events = await self.executor.cancel_resting("agent", ts)
+        await self._dispatch(events)
+        return {"ok": True, "action": decision.action, "skipped": False, "traded": False,
                 "side": self.executor.projected, "qty": self.executor.entry_qty_sz,
                 "positionAfter": self.executor.projected}
 
@@ -627,8 +667,14 @@ class AiTradeSession:
     @staticmethod
     def _ai_explain(action: str, reason: str, confidence: float | None,
                     digest: str) -> dict:
-        """AI 决策归因（透传到 trade.explain，面板展示「AI 决策」来源 + 置信度 + 信号板摘要）。"""
-        side = {"open_long": "long", "open_short": "short", "close": "close"}[action]
+        """AI 决策归因（透传到 trade.explain，面板展示「AI 决策」来源 + 置信度 + 信号板摘要）。
+
+        M-6：此处原为**裸下标** `{...}[action]`（仅 3 键、连 `hold` 都没有），任何新动作当轮即
+        KeyError。改 `.get()` 并显式回落——本函数只在 `_decision_to_signals` 产出了非空信号后才被
+        调用（即 action ∈ {open_long, open_short, close}），故回落分支实为不可达的防御，但**绝不**
+        再让一个新动作把整轮决策炸掉。
+        """
+        side = _ACTION_SIDE.get(action, "close")
         headline = f"AI 决策 · {_ACTION_LABEL.get(action, action)}"
         explain = build_atomic_explain(side, reason or headline,
                                        summary="AI 综合多策略信号板研判后的自动交易决策")
@@ -662,6 +708,9 @@ class AiTradeSession:
         return {
             "round": round_no, "barTs": ts, "lastPx": ref_px, "trigger": trigger,
             "position": self.executor.position_payload(ref_px),
+            # §4.2：当前挂单只读上下文（无挂单 → None，prompt 整段省略）。Agent 看不见自己的挂单
+            # 就无法就它做任何决策——这是 `cancel_order` 可用的前提。
+            "restingOrder": resting_payload(self.executor.resting, int(time.time())),
             "sessionPnlUsd": round(self.executor.session_pnl_usd, 4),
             "budgetUsd": self.executor.budget_usd,
             "takeProfitUsd": self.take_profit_usd, "stopLossUsd": self.stop_loss_usd,
@@ -729,6 +778,10 @@ class AiTradeSession:
         """
         data = {"ts": ts, "round": round_no, "action": decision.action,
                 "sizeFraction": decision.size_fraction, "confidence": decision.confidence,
+                "orderType": decision.ord_type, "limitPrice": decision.limit_px,
+                # §4.2：本轮结束时的挂单断面（无挂单 → None，前端整行省略）。与喂给 Agent 的
+                # prompt 同一个 `resting_payload` 真源，故人看到的与 Agent 看到的逐字一致。
+                "restingOrder": resting_payload(self.executor.resting, int(time.time())),
                 "reason": decision.reason, "signalBoard": [self._view_slim(v) for v in board],
                 "executed": executed, "marketContext": market_context,
                 "consensus": consensus, "degradeReason": degrade_reason,
@@ -861,7 +914,8 @@ class AiTradeSession:
 
 # ---------- ai-trade-stats-dashboard §3.3：finalize metrics 富化纯函数（模块级、可单测、绝不抛）----------
 _DECISION_REASON_CHARS = 160        # decisionsDigest.reason 截断长度（剥离全文，只留近况提示）
-_ACTION_KEYS = ("open_long", "open_short", "close", "hold")   # actionCounts 的规范键（匹配 decision.action 枚举）
+# actionCounts 的规范键（匹配 decision.action 枚举；cancel_order 为限价特性新增动作，M-7）。
+_ACTION_KEYS = ("open_long", "open_short", "close", "hold", "cancel_order")
 
 
 def _downsample_equity(records, cap: int) -> list[dict]:

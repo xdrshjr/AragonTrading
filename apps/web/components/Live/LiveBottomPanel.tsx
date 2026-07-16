@@ -3,20 +3,24 @@
 import { useState } from "react";
 import { Tabs } from "@/components/ui";
 import LiveFillsTable from "./LiveFillsTable";
+import LiveOpenOrdersTable from "./LiveOpenOrdersTable";
 import LivePositionsTable from "./LivePositionsTable";
 import LiveTradePanel from "./LiveTradePanel";
 
 const RIGHT_TABS = [
   { key: "positions", label: "当前持仓" },
   { key: "trades", label: "成交记录" },
+  { key: "orders", label: "委托交易" },
 ];
 
-type RightTab = "positions" | "trades";
+type RightTab = "positions" | "trades" | "orders";
 
 /**
  * 实盘下方面板（需求 · 切到实盘后下方左右分栏）：
  * - 左栏：下单面板 `<LiveTradePanel>`（输入价格 / 杠杆 / 数量 / 止盈止损，买多 / 买空、市价）。
- * - 右栏：成交记录 / 当前持仓页签，数据源为该实盘账户真实 OKX（轮询，C1 绝不假数据）。
+ * - 右栏：当前持仓 / 成交记录 / 委托交易页签，数据源为该实盘账户真实 OKX（轮询，C1 绝不假数据）。
+ *   委托交易（ai-trade-limit-orders-fix F-5）展示账户全部未结委托——AI 挂出的开仓限价单成交前
+ *   没有持仓，持仓子行与图表虚线之外唯有这里可见。
  */
 export default function LiveBottomPanel({
   instId,
@@ -47,6 +51,8 @@ export default function LiveBottomPanel({
         <div className="min-h-0 flex-1 overflow-auto px-3 py-2">
           {rightTab === "trades" ? (
             <LiveFillsTable instId={instId} accountId={accountId} />
+          ) : rightTab === "orders" ? (
+            <LiveOpenOrdersTable instId={instId} accountId={accountId} />
           ) : (
             <LivePositionsTable instId={instId} accountId={accountId} />
           )}

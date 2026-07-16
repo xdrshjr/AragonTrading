@@ -212,7 +212,10 @@ def test_compute_ai_stats_matches_backtest_shape() -> None:
            {"action": "hold", "confidence": 0.6, "degradeReason": None}]
     st = _compute_ai_stats(dec, 3)
     assert st["decisionRounds"] == 3
-    assert st["actionCounts"] == {"open_long": 1, "open_short": 0, "close": 0, "hold": 2}
+    # cancel_order 为 ai-trade-limit-orders 新增动作（session._ACTION_KEYS 与 backtest.action_counts
+    # 同步扩为 5 键）；本断言与 backtest 形状保持一致。
+    assert st["actionCounts"] == {"open_long": 1, "open_short": 0, "close": 0, "hold": 2,
+                                  "cancel_order": 0}
     assert st["holdRate"] == pytest.approx(0.6667, abs=1e-4)
     assert st["avgConfidence"] == pytest.approx(0.7)
     assert st["degradedRounds"] == 1

@@ -6,6 +6,8 @@ hold 变交易。结构上只实现「否决 / 收缩」两种收敛操作，方
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 from .decider import ReflectionVerdict, TradeDecision, _hold
 
 _OPEN_ACTIONS = ("open_long", "open_short")
@@ -46,8 +48,10 @@ def apply_reflection(decision: TradeDecision, degrade: str | None,
         quantized = quantize_size_fraction(adjusted, position_step)
         new_size = min(decision.size_fraction, quantized)   # RV-4：量化在前、对原值 clamp 收口（只减不增）
         if new_size < decision.size_fraction:
-            return TradeDecision(decision.action, new_size, decision.confidence,
-                                 decision.reason), degrade
+            # ai-trade-limit-orders-fix F-1（P0）：位置重建是「加字段就丢一遍」的复发根——曾把
+            # ord_type/limit_px 静默落回 market/None（限价单被反思收缩后变市价成交）。`replace`
+            # 只改仓位、其余字段（含未来新增）原样保留，根治该复发模式，勿回改为位置构造。
+            return replace(decision, size_fraction=new_size), degrade
     return decision, degrade
 
 

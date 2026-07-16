@@ -164,23 +164,32 @@ def apply_consensus_gate(decision: TradeDecision, consensus: Consensus,
 def decision_to_signals(decision: TradeDecision) -> list[Signal]:
     """决策 → `Signal` **纯核心映射**（无 explain 富化；session 调本核心后再补富化，§2.8/R1）。
 
-    `open_long/open_short` 带 `size_fraction` 作 `strength`；`close` 带理由；`hold` 为空列表。
+    `open_long/open_short` 带 `size_fraction` 作 `strength`；`close` 带理由；其余一律 `[]`。
     `TradeDecision.size_fraction` 为 snake_case（决策器 dataclass 字段）。
+
+    **显式 action 白名单（ai-trade-limit-orders §2.2a / M-12，P0-1）**：本函数此前的末行是裸兜底
+    `return [Signal(side="close", …)]`——任何未知 action 都会被**静默**翻译成平仓信号。加入新动作
+    `cancel_order` 后，一旦 session 层漏了前置分发，Agent 说「撤掉我那笔没成交的挂单」就会被系统
+    执行成「市价平掉真实持仓」：不抛异常、不留错误、盈亏照记，事后只能靠人肉看流水才发现。
+
+    故改为白名单：未列出的动作（含 `hold` / `cancel_order` / 未来新增动作 / 空串）一律返回 `[]`
+    ——空信号即「什么都不做」。**兜底的方向必须是「不动」，不能是「动」**：`hold` 之所以能当全部
+    降级路径的落点，正因为它无副作用；一个会下真单的兜底分支不配做兜底。
 
     Args:
         decision: 本轮最终决策（共识门禁后）。
 
     Returns:
-        供 `SimBroker.submit` / `LiveExecutor.apply` 消费的信号列表（hold → `[]`）。
+        供 `SimBroker.submit` / `LiveExecutor.apply` 消费的信号列表；非交易动作 → `[]`。
     """
     action = decision.action
-    if action == "hold":
-        return []
     if action == "open_long":
         return [Signal(side="long", strength=decision.size_fraction or 0.0, reason=decision.reason)]
     if action == "open_short":
         return [Signal(side="short", strength=decision.size_fraction or 0.0, reason=decision.reason)]
-    return [Signal(side="close", reason=decision.reason or "ai_close")]
+    if action == "close":
+        return [Signal(side="close", reason=decision.reason or "ai_close")]
+    return []      # hold / cancel_order / 未知动作：绝不兜底成 close（P0-1）
 
 
 # ============================ 仓位操作档位（ai-trade-position-sizing-steps §2.2，实盘/回测共用）============================

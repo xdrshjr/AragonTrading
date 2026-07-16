@@ -33,13 +33,14 @@ from ..agent.llm.base import (
 )
 from ..agent.llm.retry import backoff_delay_ms
 from ..config import Settings
+from ..live_auto.resting import validate_limit_intent
 from .prompts import (
-    DECISION_TOOL_DESCRIPTION,
     DECISION_TOOL_NAME,
     REFLECTION_TOOL_DESCRIPTION,
     REFLECTION_TOOL_NAME,
     REFLECTION_TOOL_SCHEMA,
     build_decision_prompt,
+    build_decision_tool_description,
     build_decision_tool_schema,
     build_reflection_prompt,
     build_reflection_system_prompt,
@@ -51,6 +52,14 @@ from .trace import TraceEmit, _TraceCoalescer
 logger = logging.getLogger(__name__)
 
 _ACTIONS = ("open_long", "open_short", "close", "hold")
+# 限价总闸开启时额外放行的动作（ai-trade-limit-orders §2.2/M-3）。`_ACTIONS` 与决策工具 schema 的
+# `action.enum` 是**两个真源**，必须同改——否则新动作会被 `_map_decision` 判为 `invalid_action` 而
+# 静默降级 hold，症状是「Agent 说撤单但什么也没发生」（§八.5）。总闸关闭时不放行，逐字回退 4 值。
+_LIMIT_ACTIONS = ("cancel_order",)
+# 会产生真实委托的动作（ai-trade-limit-orders-fix F-2）：限价解析/价带门禁**只**对它们执行——
+# hold/cancel_order 无委托语义，LLM 残留的 orderType 字段绝不能把撤单/观望整轮降级吞掉。
+# 单一真源：order_plan.decision_to_order_plan 同引本常量判「是否产生 OrderPlan」。
+ORDERING_ACTIONS = ("open_long", "open_short", "close")
 
 # 本轮研判思维链全文的硬上限（ai-trade-reasoning-chain §2.5）：`_last_analysis` 只经 agent_trace 流与
 # _traces(≤20) 承载给 UI，超出即截断；进 journal / decision 事件的是调用方派生的有界摘录（≤400，RC-2/3）。
@@ -58,8 +67,12 @@ _ANALYSIS_MAX_CHARS = 4000
 
 # 「可重试」degrade 原因白名单（瞬时 LLM 失败 / 未产出有效决策）；其余（low_confidence 等）为终态决策，
 # 绝不重试（ai-trade-decision-llm-retry §4.1）。
+# ai-trade-limit-orders §2.6：三个限价类降级原因同属「LLM 的瞬时失误」——重试一次极可能给出合理价，
+# 比直接降级 hold 更有价值，故一并归入可重试集合（R-15：门禁必须在 _map_decision 内，重试循环只认
+# 它返回的 degrade）。
 _RETRYABLE_DEGRADE_REASONS = frozenset(
-    {"decision_timeout", "llm_error", "no_tool_call", "invalid_action", "missing_size"})
+    {"decision_timeout", "llm_error", "no_tool_call", "invalid_action", "missing_size",
+     "missing_limit_price", "limit_price_out_of_band", "invalid_order_type"})
 # 每次重试前退避的抖动上限（ms），镜像 agent/llm/retry.py 的 _JITTER_MS 语义（§4.3）。
 _RETRY_JITTER_MS = 250
 
@@ -87,12 +100,18 @@ def _retry_hint_suffix(reason: str) -> str:
 
 @dataclass
 class TradeDecision:
-    """AI 本轮决策（受约束）：action + 可选仓位占比 / 置信度 + 理由。"""
+    """AI 本轮决策（受约束）：action + 可选仓位占比 / 置信度 + 理由 + 委托方式。
 
-    action: str                    # open_long | open_short | close | hold
-    size_fraction: float | None    # 预算名义占比（open_* 用；close/hold 为 None）
+    `ord_type` / `limit_px` 为末位带默认值的字段（ai-trade-limit-orders §2.2）——全部既有的
+    `TradeDecision(action, size, conf, reason)` 位置构造与四元组解包**零改动**，默认即市价。
+    """
+
+    action: str                    # open_long | open_short | close | hold | cancel_order
+    size_fraction: float | None    # 预算名义占比（open_* 用；close/hold/cancel_order 为 None）
     confidence: float | None
     reason: str
+    ord_type: str = "market"       # market | limit（仅 open_* / close 有意义）
+    limit_px: float | None = None  # 已过价带门禁的委托价；market 恒 None
 
 
 def _hold(reason: str) -> TradeDecision:
@@ -130,18 +149,30 @@ class AiTradeDecider:
 
     def __init__(self, llm: LLMClient, system_prompt: str, *,
                  context_refresh_rounds: int, settings: Settings,
-                 position_step_pct: float = 0.0, reflection_enabled: bool = False):
+                 position_step_pct: float = 0.0, reflection_enabled: bool = False,
+                 allow_limit: bool = False):
         self._llm = llm
         self.system_prompt = system_prompt
         self.context_refresh_rounds = max(1, int(context_refresh_rounds))
         self.settings = settings
         # 仓位操作档位步长（fraction；0=连续，保证所有既有直接构造 AiTradeDecider(...) 的位置零回归）。
         self._position_step = max(0.0, float(position_step_pct))
+        # 限价委托总闸（默认 **False**，P1-3）：默认 True 会让既有恒等断言
+        # `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA` 当场失败。回测恒为 False（§2.10：
+        # SimBroker 每单必成，放任限价进回测会系统性高估）；生产装配从 settings 显式打开。
+        self.allow_limit = bool(allow_limit)
         # 下单前二次反思总闸（默认关；直接构造该决策器的既有测试/回测 → reflect 无副作用直通、逐字零回归。
         # 生产装配 manager/backtest_manager 从 req.settings.ai_trade_reflection_enabled 显式打开，§2.3）。
         self.reflection_enabled = bool(reflection_enabled)
-        self._tool = ToolSchema(name=DECISION_TOOL_NAME, description=DECISION_TOOL_DESCRIPTION,
-                                input_schema=build_decision_tool_schema(self._position_step))
+        # F-3：价带比例文案由 settings 派生（运行时唯一真源），prompt 与本地门禁恒同一口径。
+        band_pct = settings.ai_trade_limit_price_max_deviation_pct
+        self._tool = ToolSchema(
+            name=DECISION_TOOL_NAME,
+            description=build_decision_tool_description(self.allow_limit,
+                                                        limit_band_pct=band_pct),
+            input_schema=build_decision_tool_schema(self._position_step,
+                                                    allow_limit=self.allow_limit,
+                                                    limit_band_pct=band_pct))
         # 反思唯一放行工具（镜像决策工具的「唯一放行」范式，安全由回落兜底，§2.2）。
         self._reflection_tool = ToolSchema(name=REFLECTION_TOOL_NAME,
                                            description=REFLECTION_TOOL_DESCRIPTION,
@@ -221,7 +252,8 @@ class AiTradeDecider:
         except Exception as exc:  # noqa: BLE001 —— 任何 LLM/网络失败回落 hold（绝不在不确定时下单）
             logger.warning("ai-trade decide attempt failed: %s", exc)
             return _hold("llm_error"), "llm_error"
-        return self._map_decision(raw)
+        # §2.6：last_px 取自 payload（`_build_decision_payload` 已含 lastPx）——与喂给 prompt 的价同源。
+        return self._map_decision(raw, last_px=payload.get("lastPx"))
 
     async def _retry_backoff(self, attempt: int) -> None:
         """第 `attempt` 次（1-based）重试前的有界指数退避 + 抖动；可被 cancel / 会话停止中断（§4.3）。"""
@@ -281,15 +313,44 @@ class AiTradeDecider:
                     return None                 # 入参非法 → hold
         return None                             # 未产生工具调用 → hold
 
-    def _map_decision(self, raw: dict | None) -> tuple[TradeDecision, str | None]:
-        """把工具入参映射为受约束 `TradeDecision`；任一不合法一律回落 hold（安全关键）。"""
+    @property
+    def _allowed_actions(self) -> tuple[str, ...]:
+        """本决策器放行的动作枚举；总闸关闭时**不含** `cancel_order`，逐字回退 4 值（§一 (2)）。"""
+        return _ACTIONS + _LIMIT_ACTIONS if self.allow_limit else _ACTIONS
+
+    def _resolve_limit(self, raw: dict,
+                       last_px: float | None) -> tuple[str, float | None, str | None]:
+        """解析 + 校验委托方式（含价带门禁）；总闸关闭时恒直通市价（零回归，§2.6/P1-5）。"""
+        if not self.allow_limit:
+            return "market", None, None
+        return validate_limit_intent(
+            raw, last_px, self.settings.ai_trade_limit_price_max_deviation_pct)
+
+    def _map_decision(self, raw: dict | None, *,
+                      last_px: float | None = None) -> tuple[TradeDecision, str | None]:
+        """把工具入参映射为受约束 `TradeDecision`；任一不合法一律回落 hold（安全关键）。
+
+        `last_px`（keyword-only，默认 None → 既有直接调用零改动）：本轮最新价，**取自决策 payload 的
+        `lastPx`**（`_attempt_decision` 传入）——与喂给 prompt 的价天然同源，无需任何新的取价通路，
+        也保证 Agent 看到的价与被校验的价逐字一致（§2.6）。价带门禁**必须在本方法内**：重试循环在
+        `decide` 里且只认本方法返回的 degrade，门禁若落在下游 `order_plan.py`，「可重试」承诺会静默
+        失效（P1-5/R-15）。
+        """
         if not isinstance(raw, dict):
             return _hold("no_tool_call"), "no_tool_call"
         action = raw.get("action")
         reason = str(raw.get("reason") or "")
-        if action not in _ACTIONS:
+        if action not in self._allowed_actions:
             return _hold("invalid_action"), "invalid_action"
         confidence = _clamp01(raw.get("confidence"))
+        # F-2：限价解析/价带门禁只对下单动作执行——hold/cancel_order 无委托语义，LLM 残留的
+        # orderType/limitPrice 一律忽略（否则撤单意图会被 missing_limit_price 整轮降级吞掉）。
+        if action in ORDERING_ACTIONS:
+            ord_type, limit_px, limit_degrade = self._resolve_limit(raw, last_px)
+            if limit_degrade is not None:  # 缺价 / 离谱价 / 非法 orderType → 降级 hold（可重试）
+                return _hold(limit_degrade), limit_degrade
+        else:
+            ord_type, limit_px = "market", None
         if action in ("open_long", "open_short"):
             size = _clamp01(raw.get("sizeFraction"))
             if size is None or size <= 0:
@@ -301,8 +362,8 @@ class AiTradeDecider:
             # missing_size）；step=0 时逐字等价旧行为（连续直通）。
             from .signals import quantize_size_fraction
             size = quantize_size_fraction(size, self._position_step)
-            return TradeDecision(action, size, confidence, reason), None
-        return TradeDecision(action, None, confidence, reason), None
+            return TradeDecision(action, size, confidence, reason, ord_type, limit_px), None
+        return TradeDecision(action, None, confidence, reason, ord_type, limit_px), None
 
     # ---------- 下单前二次反思（ai-trade-pre-trade-reflection §2.2/§2.4）----------
     async def reflect(self, payload: dict, decision: TradeDecision, *,
@@ -412,8 +473,10 @@ class AiTradeDecider:
         """
         self._last_round = int(payload.get("round") or self._last_round + 1)
         tool_id = uuid.uuid4().hex
+        # M-9：委托方式随 journal 落痕，否则滚动摘要会丢失挂单史（Agent 记不得自己挂过什么价）。
         decision_input = {"action": decision.action, "sizeFraction": decision.size_fraction,
-                          "confidence": decision.confidence, "reason": decision.reason}
+                          "confidence": decision.confidence, "reason": decision.reason,
+                          "orderType": decision.ord_type, "limitPrice": decision.limit_px}
         self._context.append(LlmMessage("user", [TextBlock(build_decision_prompt(payload))]))
         self._context.append(LlmMessage(
             "assistant", [ToolUseBlock(id=tool_id, name=DECISION_TOOL_NAME, input=decision_input)]))

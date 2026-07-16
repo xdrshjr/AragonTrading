@@ -20,9 +20,20 @@ from ..config import Settings
 from ..db.session import get_sessionmaker
 from ..engine.simulator import BrokerContext, RiskParams
 from ..okx.accounts import AccountCredentials
-from ..okx.order_builder import ClosePositionInput, OrderInput, snap_size
+from ..okx.order_builder import (
+    CancelOrderInput,
+    ClosePositionInput,
+    OrderInput,
+    snap_size,
+)
 from ..okx.rest_client import OKXError
-from ..okx.trading import close_live_position, fetch_live_positions, place_live_order
+from ..okx.trading import (
+    cancel_live_order,
+    close_live_position,
+    fetch_live_order,
+    fetch_live_positions,
+    place_live_order,
+)
 from .explain import (
     as_close,
     build_atomic_explain,
@@ -32,6 +43,15 @@ from .explain import (
     build_session_stop_explain,
     with_risk,
 )
+from .resting import (
+    RestingOrder,
+    adopt_fill_delta,
+    build_resting,
+    classify_state,
+    fill_delta,
+    is_expired,
+    is_same_intent,
+)
 
 # net_mode 反手清算确认（R5）：close 返回后短轮询净仓直至 pos==0，避免 open 被反向单护栏误拒。
 _CLEAR_CONFIRM_MAX_TRIES = 6
@@ -40,17 +60,29 @@ _CLEAR_CONFIRM_INTERVAL_S = 0.5
 _FLATTEN_RETRY_INTERVAL_S = 0.5
 
 
+def _plan_limit_px(order_plan) -> float | None:
+    """`OrderPlan | None` → 限价委托价；市价 / 无计划一律 None（= 今日行为，逐字零回归）。"""
+    if order_plan is None or getattr(order_plan, "ord_type", "market") != "limit":
+        return None
+    return getattr(order_plan, "px", None)
+
+
 class LiveExecutor:
     """编排层：持有会话级凭证 / 预算 / 杠杆 / 标的元数据与自管持仓状态机。
 
-    OKX 调用经三个可注入回调（默认走 `okx/trading.py` 服务层），便于纯/桩单测。
+    OKX 调用经五个可注入回调（默认走 `okx/trading.py` 服务层），便于纯/桩单测。
+
+    限价挂单（ai-trade-limit-orders）：`apply(..., order_plan=None)` 默认市价——`live_auto` 的全部
+    调用点一字不改，payload 逐字节相同（R-9）。仅 `ai_auto` 会传 `order_plan`，届时至多一笔挂单
+    （`self.resting`，不变式 I-1）经 `_poll_resting` 向 OKX 权威核对成交 / 撤销 / 超时。
     """
 
     def __init__(self, *, creds: AccountCredentials, account_id: int, inst_id: str,
                  td_mode: str, pos_mode: str, leverage: float, budget_usd: float,
                  risk: RiskParams, ct_val: float, lot_sz: float, min_sz: float,
                  settings: Settings,
-                 place_order_fn=None, close_position_fn=None, positions_fn=None):
+                 place_order_fn=None, close_position_fn=None, positions_fn=None,
+                 cancel_order_fn=None, get_order_fn=None):
         self.creds = creds
         self.account_id = account_id
         self.inst_id = inst_id
@@ -74,10 +106,18 @@ class LiveExecutor:
         self.trades: list[dict] = []       # 已执行真单→Trade（驱动图表 markers）
         self._reconcile_fail_streak = 0    # H2：连续 reconcile 读取失败计数（成功即清零）
         self.degraded = False              # H2：盯市降级标志（连续失败达阈→True，恢复→False）
+        # 当前挂着的那一笔限价委托（不变式 I-1：单会话至多一笔）。恒为 None ⇒ 市价路径 ⇒ live_auto
+        # 的每一处判定都短路，行为与本特性合入前逐字相同。
+        self.resting: RestingOrder | None = None
+        # 刚采纳完开仓成交的一轮宽限（O-3，见 `_on_reconcile_ok`）。恒为 False ⇒ live_auto 零影响。
+        self._fill_grace = False
 
         self._place_order = place_order_fn or self._default_place_order
         self._close_position = close_position_fn or self._default_close_position
         self._read_positions = positions_fn or self._default_read_positions
+        # P1-2：挂单生命周期依赖的两个新缝（镜像上方三缝的既有范式）——没有它们，限价整组单测无法脱网。
+        self._cancel_order = cancel_order_fn or self._default_cancel_order
+        self._get_order = get_order_fn or self._default_get_order
 
     # ---------- 默认 OKX 调用（短生命周期 session，R3）----------
     async def _default_place_order(self, order: OrderInput) -> dict:
@@ -93,6 +133,14 @@ class LiveExecutor:
 
     async def _default_read_positions(self) -> list[dict]:
         return await fetch_live_positions(self.creds)
+
+    async def _default_cancel_order(self, cancel: CancelOrderInput) -> dict:
+        sm = get_sessionmaker()
+        async with sm() as s:
+            return await cancel_live_order(s, self.creds, self.account_id, cancel)
+
+    async def _default_get_order(self, cl_ord_id: str) -> dict:
+        return await fetch_live_order(self.creds, self.inst_id, cl_ord_id=cl_ord_id)
 
     # ---------- 对外只读上下文（供 strategy.on_candle）----------
     @property
@@ -118,20 +166,30 @@ class LiveExecutor:
 
     # ---------- 核心：每根确认 K 线驱动 ----------
     async def apply(self, signals: list, *, ref_px: float, bar_index: int,
-                    ts: int) -> list[dict]:
-        """把信号翻译为真实订单，返回供 WS 扇出的事件列表（先时间止盈再处理信号）。"""
+                    ts: int, order_plan=None) -> list[dict]:
+        """把信号翻译为真实订单，返回供 WS 扇出的事件列表（先时间止盈再处理信号）。
+
+        `order_plan`（keyword-only，默认 None → 市价，`live_auto` 全部调用点一字不改、payload 逐字节
+        相同，R-9）：本轮的订单类型意图。**只绑定终态腿**（`_project_signals` 产出的最后一个动作，
+        P1-6）——反手的 close 腿一律强制市价：它是「为开新仓而必须先清掉的障碍」，不是 Agent 的价格
+        意图所在；且若 close 腿挂起，`_confirm_net_cleared` 必然失败 → open 腿被跳过 → 会话陷入
+        「一笔挂着的平仓单 + 没开成的新仓」的半反手态，还占掉了 I-1 的唯一挂单额度。
+        """
         self._bar_cursor = bar_index
         events: list[dict] = []
         events += await self._maybe_time_exit(ref_px, ts)
-        for action in self._project_signals(signals):
+        actions = self._project_signals(signals)
+        for index, action in enumerate(actions):
+            plan = order_plan if index == len(actions) - 1 else None   # P1-6：只绑终态腿
             if action[0] == "close":
                 _, reason, sig, close_kind = action
                 events += await self._do_close(ref_px, ts, reason, signal=sig,
-                                               close_kind=close_kind)
+                                               close_kind=close_kind, order_plan=plan)
             else:
                 _, side, strength, reason, reverse, sig = action
                 events += await self._do_open(side, strength, ref_px, bar_index, ts,
-                                              reason, require_clear=reverse, signal=sig)
+                                              reason, require_clear=reverse, signal=sig,
+                                              order_plan=plan)
         return events
 
     def _project_signals(self, signals: list) -> list[tuple]:
@@ -171,21 +229,34 @@ class LiveExecutor:
 
     # ---------- 开 / 平 ----------
     async def _do_open(self, side: str, strength: float, ref_px: float, bar_index: int,
-                       ts: int, reason: str, *, require_clear: bool, signal=None) -> list[dict]:
+                       ts: int, reason: str, *, require_clear: bool, signal=None,
+                       order_plan=None) -> list[dict]:
         sz = self._compute_sz(strength, ref_px)
         if sz <= 0 or sz < self.min_sz:
             return [self._status_event(
                 f"预算 / 杠杆过小，单笔不足最小下单量（{side}），已跳过该信号")]
+        limit_px = _plan_limit_px(order_plan)
+        pre, slot_free = await self._prepare_resting_slot(ts, "open", side, limit_px)
+        if not slot_free:
+            return pre
         if require_clear and not await self._confirm_net_cleared():
-            return [self._status_event("反手平仓尚未在交易所侧清算，本根跳过开仓，待下一根重试")]
-        tp, sl = self._risk_trigger_px(side, ref_px)
-        order = OrderInput(inst_id=self.inst_id, direction=side, ord_type="market",
-                           td_mode=self.td_mode, px=None, sz=sz, lever=self.leverage,
+            return pre + [self._status_event(
+                "反手平仓尚未在交易所侧清算，本根跳过开仓，待下一根重试")]
+        # §2.7：限价单的**预期成交价是 limit_px 而非 ref_px**——随单 OCO 若仍以 ref_px 为基准，
+        # 止损距离会系统性偏移（挂单越远偏得越多）。这是限价特有的正确性要求，非可选优化。
+        tp, sl = self._risk_trigger_px(side, ref_px if limit_px is None else limit_px)
+        order = OrderInput(inst_id=self.inst_id, direction=side,
+                           ord_type="market" if limit_px is None else "limit",
+                           td_mode=self.td_mode, px=limit_px, sz=sz, lever=self.leverage,
                            tp_trigger_px=tp, sl_trigger_px=sl)
         try:
             result = await self._place_order(order)
         except OKXError as exc:
-            return [self._error_event(ts, exc)]
+            return pre + [self._error_event(ts, exc)]
+        if limit_px is not None:      # I-2a：挂单期间**不写 projected**，绕开幻影成交陷阱（R-1）
+            return pre + self._enter_resting(result, ts, intent="open", side=side,
+                                             px=limit_px, sz=sz, strength=strength,
+                                             reason=reason)
         self.projected = side
         self.entry_price = ref_px
         self.entry_bar = bar_index
@@ -199,24 +270,234 @@ class LiveExecutor:
                                  explain=explain, cl_ord_id=cl_ord_id, ord_id=ord_id,
                                  position_pct=self.entry_position_pct)
         self.trades.append(trade)
-        return [{"type": "trade", "data": trade}]
+        return pre + [{"type": "trade", "data": trade}]
 
     async def _do_close(self, ref_px: float, ts: int, reason: str, *, signal=None,
-                        close_kind: str = "signal") -> list[dict]:
+                        close_kind: str = "signal", order_plan=None) -> list[dict]:
         if self.projected == "flat":
             return []
+        limit_px = _plan_limit_px(order_plan)
+        pre, slot_free = await self._prepare_resting_slot(ts, "close", self.projected, limit_px)
+        if not slot_free:
+            return pre
         close = ClosePositionInput(
             inst_id=self.inst_id, pos_side=self._pos_side(), pos=self._signed_pos(),
-            mgn_mode=self.td_mode, ord_type="market", px=None, sz=None)
+            mgn_mode=self.td_mode, ord_type="market" if limit_px is None else "limit",
+            px=limit_px, sz=None if limit_px is None else self.entry_qty_sz)
         # 解释须在 _settle_close 复位 projected / entry 前据当前持仓断面合成（信号平仓优先用因子解释）。
         explain = self._close_explain(close_kind, reason, signal, ref_px)
         try:
             result = await self._close_position(close)
         except OKXError as exc:
             if exc.code == "LIVE_NO_POSITION":
-                return self._settle_benign_close(ref_px, ts)
+                return pre + self._settle_benign_close(ref_px, ts)
+            return pre + [self._error_event(ts, exc)]
+        if limit_px is not None:      # I-2b：平仓挂单期间 projected **保持原方向**（真仓确实还在）
+            # sz 取服务层回执的 closedSz（已按 lotSz 取整且 ≤ 实时 |pos|），而非本地 entry_qty_sz。
+            resting_sz = float(result.get("closedSz") or self.entry_qty_sz)
+            return pre + self._enter_resting(result, ts, intent="close", side=self.projected,
+                                             px=limit_px, sz=resting_sz, strength=0.0,
+                                             reason=reason)
+        return pre + self._settle_close(ref_px, ts, reason, result, explain=explain)
+
+    # ---------- 挂单生命周期（ai-trade-limit-orders §2.3/§2.5；resting is None 时全部短路）----------
+    def _enter_resting(self, result: dict, ts: int, *, intent: str, side: str, px: float,
+                       sz: float, strength: float, reason: str) -> list[dict]:
+        """下单回执 → `self.resting`；**绝不**乐观置位 projected（I-2a/I-2b，R-1 的正面防线）。"""
+        cl_ord_id, ord_id = self._order_ids(result)
+        self.resting = build_resting(
+            cl_ord_id=cl_ord_id or "", ord_id=ord_id or "", intent=intent, side=side,
+            px=px, sz=sz, strength=strength, reason=reason, now_ts=ts,
+            ttl_s=self.settings.ai_trade_limit_order_ttl_s)
+        label = "限价开仓" if intent == "open" else "限价平仓"
+        return [self._status_event(
+            f"已挂出{label}委托：{sz} 张 @ {px}（{int(self.settings.ai_trade_limit_order_ttl_s)}s "
+            f"未成交则自动撤销）")]
+
+    def _cancel_input(self, order: RestingOrder) -> CancelOrderInput:
+        """撤单意图 + 供审计的挂单快照（撤单请求本身没有 direction/px/sz 的天然取值，§4.4）。"""
+        return CancelOrderInput(inst_id=self.inst_id, cl_ord_id=order.cl_ord_id,
+                                direction=order.side, td_mode=self.td_mode,
+                                px=order.px, sz=order.sz)
+
+    async def _prepare_resting_slot(self, ts: int, intent: str, side: str,
+                                    limit_px: float | None) -> tuple[list[dict], bool]:
+        """下新单前腾出 I-1 的唯一挂单额度：撤旧挂新（§2.5）。返回 `(events, 可否下新单)`。
+
+        三态撤单的第一个红利：收到 `"filled"` 时**绝不**继续下新单——否则会在一笔已经成交的真实
+        仓位之上再开一笔，敞口翻倍、预算失控，而自管 `projected` 还以为自己是 flat（R-2b）。
+        """
+        order = self.resting
+        if order is None:
+            return [], True
+        if limit_px is not None and is_same_intent(order, intent=intent, side=side, px=limit_px):
+            return [self._status_event(          # P2-3 幂等：同向同价不重挂，保住 maker 排队优先级
+                f"同向同价挂单仍在排队（{limit_px}），本轮保留原单不撤不重挂")], False
+        outcome, events = await self._cancel_resting("replace", ts)
+        if outcome == "canceled":
+            return events, True
+        if outcome == "filled":
+            return events + [self._status_event(
+                "撤单时原挂单已成交，已采纳该成交；本轮不再下新单（避免在已成交仓位上重复开仓）")], False
+        return events + [self._status_event(
+            "原挂单撤销未确认，本轮不下新单（绝不双挂），待下轮核对挂单状态")], False
+
+    async def cancel_resting(self, reason: str, ts: int) -> list[dict]:
+        """撤回本会话当前挂着的未成交委托（Agent `cancel_order` 动作的落点）。
+
+        无挂单时为**良性 no-op**（回 status 事件、不报错、**不改 `projected`**、不触碰任何持仓）。
+        """
+        if self.resting is None:
+            return [self._status_event("当前没有未成交挂单，撤单请求无需执行（未改变任何持仓）")]
+        _, events = await self._cancel_resting(reason, ts)
+        return events
+
+    async def _cancel_resting(self, reason: str, ts: int) -> tuple[str, list[dict]]:
+        """撤单**三态**（`"canceled"|"filled"|"unknown"`，P0-2）——刻意不是 bool。
+
+        真实的第三态是「撤单请求发出的同时，那笔挂单成交了」（OKX `51402`）。把它当成「良性幂等」
+        丢弃 resting，会丢失真实持仓；在 cancel-replace 路径下更会双开。故调用方**一律**只在
+        `"canceled"` 时才继续原计划。
+        """
+        order = self.resting
+        if order is None:
+            return "canceled", []
+        try:
+            result = await self._cancel_order(self._cancel_input(order))
+        except OKXError as exc:      # 连通类失败：状态未知 → 保留挂单，下轮 _poll_resting 再判
+            return "unknown", [self._error_event(ts, exc)]
+        outcome = str(result.get("outcome") or "unknown")
+        if outcome == "canceled":
+            self.resting = None
+            return "canceled", [self._status_event(f"已撤销未成交挂单（{reason}）")]
+        if outcome == "filled":
+            return "filled", await self._adopt_resting_fill(ts)
+        return "unknown", [self._status_event(
+            f"撤单未获确认（{result.get('code')}），保留挂单待下轮核对状态")]
+
+    async def _adopt_resting_fill(self, ts: int) -> list[dict]:
+        """撤单撞成交（`51402`）：回查 `get_order` 取权威 `avgPx`/`accFillSz` 并采纳。
+
+        回查失败时**保留 resting 并不采纳**（绝不猜成交价）——下一轮 `_poll_resting` 会再采纳一次，
+        代价只是延后一轮；而调用方已因 `"filled"` 放弃本轮新单，敞口不会翻倍。
+        """
+        order = self.resting
+        if order is None:
+            return []
+        try:
+            state = await self._get_order(order.cl_ord_id)
+        except OKXError as exc:
             return [self._error_event(ts, exc)]
-        return self._settle_close(ref_px, ts, reason, result, explain=explain)
+        return self._settle_resting_fill(order, state, ts)
+
+    async def _poll_resting(self, ts: int) -> list[dict]:
+        """向 OKX 核对挂单权威状态并收敛（成交 / 撤销 / 超时）。**必须在 reconcile 内最先执行**（O-1）。
+
+        异常**自行隔离**：`get_order` 失败绝不外泄进 `reconcile()` 既有的 `except OKXError`——否则一次
+        读单失败会被误归因为「持仓读取失败」，污染 `_reconcile_fail_streak` 并触发假降级。
+        """
+        order = self.resting
+        if order is None:
+            return []
+        try:
+            state = await self._get_order(order.cl_ord_id)
+        except OKXError as exc:
+            return [self._status_event(
+                f"挂单状态本轮读取失败（[{exc.code}]），保留挂单待下轮核对")]
+        return await self._advance_resting(order, state, ts)
+
+    async def _advance_resting(self, order: RestingOrder, state: dict,
+                               ts: int) -> list[dict]:
+        """按归一生命周期态推进挂单（状态分派走 `resting.classify_state` 查找表，守复杂度红线）。"""
+        phase = classify_state(state.get("state"))
+        if phase == "filled":
+            return self._settle_resting_fill(order, state, ts)
+        if phase == "partial":
+            return self._adopt_partial(order, state, ts)
+        if phase == "canceled":
+            self.resting = None
+            return [self._status_event("挂单已撤销（我方或交易所侧），已收敛为无挂单")]
+        if phase == "live" and is_expired(order, ts):
+            _, events = await self._cancel_resting("expired", ts)
+            return events
+        return []       # live 未到期 / unknown：保持挂单，下轮再判（兜底方向恒为「不动」）
+
+    def _settle_resting_fill(self, order: RestingOrder, state: dict, ts: int) -> list[dict]:
+        """挂单**全部成交**：按 intent 分派采纳，清空 resting 并推 trade 事件。"""
+        self.resting = None
+        avg_px = float(state.get("avgPx") or order.px)
+        acc = float(state.get("accFillSz") or order.sz)
+        delta = fill_delta(order, acc)
+        if delta <= 0:      # 已在此前的 partially_filled 轮全额采纳过，本轮只做收敛
+            return [self._status_event("挂单已全部成交（成交量此前已采纳），已收敛为无挂单")]
+        if order.intent == "open":
+            return self._adopt_fill(order, avg_px, acc, ts)
+        return self._adopt_close_fill(order, avg_px, ts)
+
+    def _adopt_partial(self, order: RestingOrder, state: dict, ts: int) -> list[dict]:
+        """部分成交：按**增量** `accFillSz - adopted_sz` 采纳，剩余继续挂到 TTL（R-19 防重复计入）。
+
+        仅开仓路径做增量采纳。平仓路径**刻意不做**部分结算：`_settle_close` 是「先算 pnl 再复位
+        entry」的全额结算，另写一份部分结算逻辑会立刻产生第二个盈亏口径真源——这正是 §2.3 明令
+        禁止的。平仓挂单一律等全额成交或 TTL 撤单（残余偏差见 spec 文末〈实施过程发现的方案缺陷〉）。
+        """
+        acc = float(state.get("accFillSz") or 0.0)
+        delta = fill_delta(order, acc)
+        self.resting = adopt_fill_delta(order, acc)
+        if delta <= 0 or order.intent != "open":
+            return []
+        avg_px = float(state.get("avgPx") or order.px)
+        return self._adopt_fill(order, avg_px, acc, ts, delta_sz=delta)
+
+    def _adopt_fill(self, order: RestingOrder, avg_px: float, total_sz: float, ts: int,
+                    *, delta_sz: float | None = None) -> list[dict]:
+        """采纳**开仓**挂单成交：projected 置位 + `entry_price` 取真实成交价 `avgPx`（非 `ref_px`）。
+
+        这是 I-2a 的代价所偿：挂单期间 projected 恒为 flat 使幻影成交分支不成立，成交便只能由本方法
+        （经 `_poll_resting`）侦测——它是成交侦测的**唯一**路径，没有第二道网（A-14/R-2）。
+
+        置 `_fill_grace`（O-3）：本方法把 projected 从 flat 置为有仓，而 `reconcile` 紧接着就会用
+        **可能尚未跟上的**持仓读数去判「自管有仓、交易所无仓」——详见 `_on_reconcile_ok` 的 O-3 注释。
+        """
+        self._fill_grace = True
+        self.projected = order.side
+        self.entry_price = avg_px
+        self.entry_bar = self._cur_bar
+        self.entry_qty_sz = total_sz
+        self.entry_position_pct = self._position_pct_for_size(
+            sz=total_sz, ct_val=self.ct_val, reference_price=avg_px,
+            member_budget_usd=self.budget_usd, leverage=self.leverage)
+        # OCO 触发价随单在下单时已按 limit_px 附于交易所侧（§2.7），此处如实回显同一基准。
+        tp, sl = self._risk_trigger_px(order.side, order.px)
+        explain = self._open_explain(order.side, order.reason, None, tp, sl)
+        trade = self._make_trade(ts, order.side, avg_px, delta_sz if delta_sz is not None
+                                 else total_sz, pnl=0.0, reason=order.reason or "signal_open",
+                                 tp=tp, sl=sl, explain=explain, cl_ord_id=order.cl_ord_id,
+                                 ord_id=order.ord_id, position_pct=self.entry_position_pct)
+        self.trades.append(trade)
+        return [{"type": "trade", "data": trade}]
+
+    def _adopt_close_fill(self, order: RestingOrder, avg_px: float, ts: int) -> list[dict]:
+        """采纳**平仓**挂单成交：复用既有 `_settle_close(ref_px=avgPx, …)`（P0-3/P1-1）。
+
+        关键：`ref_px` 传**真实成交价 `avgPx`** 而非 `mark_px`，盈亏才是真的。复用 `_settle_close`
+        而非另写，是刻意的——它已封装「先算 pnl/pnlPct 再复位 entry」这个**顺序敏感**的既有约束
+        （`executor.py` v2 的 P1-2 修复过一次）。另起炉灶必然重蹈覆辙，且会产生第二个盈亏口径真源。
+        """
+        explain = self._close_explain("signal", order.reason, None, avg_px)
+        result = {"clOrdId": order.cl_ord_id, "ordId": order.ord_id}
+        return self._settle_close(avg_px, ts, order.reason or "signal_close", result,
+                                  explain=explain)
+
+    def _external_close_suppressed(self) -> bool:
+        """O-2 兜底：平仓挂单在飞时禁用 `external_close` 合成分支（§2.3）。
+
+        O-1（`_poll_resting` 先于 `_on_reconcile_ok`）保正确——同一轮里成交总是先被 `_adopt_close_fill`
+        正确采纳、projected 已归 flat，该分支自然不触发。本条保**安全**：即便 O-1 因异常 / 时序被绕过
+        （如 `_poll_resting` 本轮读取失败），最坏也只是延后一轮采纳，绝不把我方主动的限价平仓误记成
+        「外部干预平仓」并按 mark_px 捏造盈亏。两者都要。
+        """
+        return self.resting is not None and self.resting.intent == "close"
 
     def _settle_close(self, ref_px: float, ts: int, reason: str, result: dict, *,
                       explain: dict | None = None) -> list[dict]:
@@ -267,18 +548,38 @@ class LiveExecutor:
 
         H2：读取一律经 `except OKXError` 兜住（传输层异常已被 private/trade_client 归一为
         `OKXPrivateError(OKXError)`），失败不冒泡污染行情链路；连续失败达阈推降级事件，恢复后清零。
+
+        O-1（ai-trade-limit-orders §2.3，P0-3）：`_poll_resting` 必须在此**最先**执行，先于
+        `_read_positions` 与 `_on_reconcile_ok`。这样同一轮里挂单成交总是先被正确采纳（平仓成交后
+        projected 已归 flat），`_on_reconcile_ok` 随后便不会把我方主动的限价平仓合成为幻影
+        `external_close`。`reconcile()` 是全部 6 处调用点的**唯一收口**，在此处收口即全覆盖。
+        `resting is None`（含 `live_auto` 全部场景）时 `_poll_resting` 返回 `[]`，行为逐字不变。
         """
+        events = await self._poll_resting(ts)          # O-1：必须最先；异常已在内部自隔离
         try:
             positions = await self._read_positions()
         except OKXError as exc:
-            return self._on_reconcile_failure(ts, exc)
-        return self._on_reconcile_ok(mark_px, positions, ts)
+            return events + self._on_reconcile_failure(ts, exc)
+        return events + self._on_reconcile_ok(mark_px, positions, ts)
 
     def _on_reconcile_ok(self, mark_px: float, positions: list[dict], ts: int) -> list[dict]:
+        """持仓读数 → 校正自管立场（幻影成交分支见 O-2 / O-3）。
+
+        O-3（ai-trade-limit-orders，Subtask #3 终审补）：`_adopt_fill` 刚把 projected 由 flat 置为
+        有仓时，**本轮**的持仓读数可能尚未跟上（OKX 的 `/trade/order` 与 `/account/positions` 之间
+        存在最终一致性窗口，而 O-1 令二者在同一轮里仅相隔一次网络往返）。此时下方分支会把一笔**刚
+        采纳的真实持仓**合成为 `external_close` 幻影平仓、按 mark_px 捏造盈亏并归 flat——即 R-1 在
+        开仓路径上的原样复发，且比市价路径危险得多（市价路径的两次调用相隔一整个 5s 轮询周期）。
+        故给刚成交的那一轮一次宽限：本轮不判幻影，下一轮持仓读数若仍为空再判（延后一轮，代价与
+        O-2 同）。宽限**恒被消费**（不受下方短路影响），绝不跨轮累积成永久豁免。
+        """
         events = self._clear_degraded_if_recovered()
+        grace = self._fill_grace
+        self._fill_grace = False
         abs_pos = self._net_abs_pos(positions)
         self.unrealized_usd = self._net_upl(positions)
-        if self.projected != "flat" and abs_pos <= 0:
+        if (self.projected != "flat" and abs_pos <= 0 and not grace
+                and not self._external_close_suppressed()):
             # v2（P1-1）：侦测到交易所侧 / 外部已平仓，合成只读 external_close 成交后再校正为 flat。
             events += self._synthesize_external_close(mark_px, ts, source="external")
             self.realized_pnl_usd += self._close_pnl(mark_px)
@@ -316,9 +617,19 @@ class LiveExecutor:
 
         H4：平仓失败有界重试（`settings.live_auto_flatten_max_retries` 次 / `0.5s`）；仍失败则
         **保留**残留仓（不改 projected）并结构化返回 `residual`，绝不假报干净停止。
+
+        §2.8：**先撤挂单，且撤单必须先于早退判定**。`close_position(auto_cxl=True)` 确会撤掉该合约
+        全部挂单，但它仅在**有持仓**时被调用——「无持仓 + 有挂单」（挂单从未成交）恰恰命中下方
+        `projected == "flat"` 早退，会把挂单遗留在交易所（孤儿单，R-3）。更要紧的是三态撤单的第二个
+        红利：停止瞬间挂单恰好成交（`51402`）时，采纳成交会把 projected 置为非 flat，早退**自然不再
+        命中**，第 4 步照常把这笔刚成交的仓位平掉——否则会「报告干净停止，却在交易所留一笔无人看管
+        的真实持仓」，与本函数承诺的「绝不假报干净停止」直接冲突。
         """
+        events: list[dict] = []
+        if self.resting is not None:
+            _, events = await self._cancel_resting("session_stop", ts)   # 采纳成交会改写 projected
         if self.projected == "flat":
-            return {"ok": True, "closedSz": 0}
+            return self._with_cancel_events({"ok": True, "closedSz": 0}, events)
         close = ClosePositionInput(
             inst_id=self.inst_id, pos_side=self._pos_side(), pos=self._signed_pos(),
             mgn_mode=self.td_mode, ord_type="market", px=None, sz=None)
@@ -330,14 +641,24 @@ class LiveExecutor:
                 if exc.code == "LIVE_NO_POSITION":
                     benign = self._settle_benign_close(ref_px, ts)
                     trade = next((e["data"] for e in benign if e["type"] == "trade"), None)
-                    return {"ok": True, "closedSz": 0, "note": "already_flat", "trade": trade}
+                    return self._with_cancel_events(
+                        {"ok": True, "closedSz": 0, "note": "already_flat", "trade": trade},
+                        events)
                 last_exc = exc
                 if attempt < self.settings.live_auto_flatten_max_retries:
                     await asyncio.sleep(_FLATTEN_RETRY_INTERVAL_S)
                 continue
-            return self._settle_flatten_ok(ref_px, ts, result)
-        return {"ok": False, "code": last_exc.code, "message": last_exc.message,
-                "residual": {"side": self.projected, "size": self.entry_qty_sz}}
+            return self._with_cancel_events(self._settle_flatten_ok(ref_px, ts, result), events)
+        return self._with_cancel_events(
+            {"ok": False, "code": last_exc.code, "message": last_exc.message,
+             "residual": {"side": self.projected, "size": self.entry_qty_sz}}, events)
+
+    @staticmethod
+    def _with_cancel_events(result: dict, events: list[dict]) -> dict:
+        """把 flatten 期间的撤单 / 采纳成交事件挂上结果（**空则不加键**，`live_auto` 结果逐字不变）。"""
+        if events:
+            result["events"] = events
+        return result
 
     def _settle_flatten_ok(self, ref_px: float, ts: int, result: dict) -> dict:
         # session_stop 解释须在复位前据当前持仓断面合成（会话停止 / 会话级金额止盈止损的整仓平）。

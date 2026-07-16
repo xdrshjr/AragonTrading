@@ -108,6 +108,8 @@ export interface LiveOpenOrder {
   ordId: string | null;
   algoId: string | null;
   createdTs: number; // 秒级 UTC
+  attachTpTriggerPx?: number | null; // 随单止盈触发价（挂单成交前唯一可见来源，F-4 加法字段）
+  attachSlTriggerPx?: number | null; // 随单止损触发价（同上）
 }
 
 export interface LiveOpenOrdersResponse {

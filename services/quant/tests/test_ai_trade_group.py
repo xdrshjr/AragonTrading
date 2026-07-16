@@ -104,18 +104,24 @@ async def _client(app) -> AsyncClient:
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
 
-def _patch(monkeypatch, *, positions=None, config_for=None, provider=object()) -> None:
+def _patch(monkeypatch, *, positions=None, config_for=None, provider=object(),
+           pending=None) -> None:
     async def fake_config(_creds, _account_id, inst_id, *, settings=None):
         return dict((config_for or {}).get(inst_id, _CONFIG))
 
     async def fake_positions(*_a, **_k):
         return list(positions or [])
 
+    async def fake_open_orders(*_a, **_k):
+        return list(pending or [])
+
     async def fake_resolve(*_a, **_k):
         return provider
 
     monkeypatch.setattr("app.ai_auto.manager.fetch_trading_config", fake_config)
     monkeypatch.setattr("app.ai_auto.manager.fetch_live_positions", fake_positions)
+    # ai-trade-limit-orders §2.9：启动前置校验新增「已有普通挂单即拒」，须一并桩掉，否则用例出网。
+    monkeypatch.setattr("app.ai_auto.manager.fetch_live_open_orders", fake_open_orders)
     monkeypatch.setattr("app.ai_auto.manager.resolve_active_provider", fake_resolve)
     monkeypatch.setattr("app.ai_auto.manager.make_llm_client_from_config", lambda cfg: object())
     monkeypatch.setattr("app.ai_auto.manager.AiTradeSession", _FakeSession)
@@ -315,6 +321,57 @@ async def test_rejects_group_when_any_member_has_position(monkeypatch):
             codes = {m["instId"]: m["code"] for m in err["members"]}
             assert codes["ETH-USDT-SWAP"] == "AI_TRADE_PREEXISTING_POSITION"
             assert get_ai_trade_manager()._group is None
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_rejects_group_when_any_member_has_pending_limit_order(monkeypatch):
+    """ai-trade-limit-orders §2.9：某成员已有未结**普通**挂单 → 整组拒绝、指名该 instId。
+
+    会话以 in-memory `resting` 跟踪挂单，交易所侧若已有来路不明的挂单，自管状态与真实状态从第一秒
+    就不一致——绝不静默接管，显式拒绝并提示先在实盘面板处理。
+    """
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch, pending=[{"instId": "ETH-USDT-SWAP", "kind": "limit_open"}])
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            members = [("BTC-USDT-SWAP", 50), ("ETH-USDT-SWAP", 50)]
+            r = await client.post("/api/ai-trade/start", json=_group_body(strategy_id, members))
+            assert r.status_code == 409, r.text
+            err = r.json()["error"]
+            codes = {m["instId"]: m["code"] for m in err["members"]}
+            assert codes["ETH-USDT-SWAP"] == "AI_TRADE_PENDING_ORDER_EXISTS"
+            assert get_ai_trade_manager()._group is None
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_attached_oco_orders_do_not_block_group_start(monkeypatch):
+    """【P1-4/R-14 守门】随单止盈止损的 `tp`/`sl` 行**不得**参与「已有挂单」判定。
+
+    `fetch_live_open_orders` 会把每条 OCO 展开成 `tp`/`sl` 两条一并返回，而随单 OCO 正是本项目自己
+    在每次开仓时附的。若按「非空即拒」，任何带止盈止损的正常账户都会被一个自己也看不懂的 409 挡在
+    门外——故必须按 `kind in {"limit_open","limit_close"}` 过滤。
+    """
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch, pending=[{"instId": "BTC-USDT-SWAP", "kind": "tp"},
+                                 {"instId": "BTC-USDT-SWAP", "kind": "sl"},
+                                 {"instId": "ETH-USDT-SWAP", "kind": "conditional"}])
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            members = [("BTC-USDT-SWAP", 50), ("ETH-USDT-SWAP", 50)]
+            r = await client.post("/api/ai-trade/start", json=_group_body(strategy_id, members))
+            assert r.status_code == 200, r.text      # 正常启动，绝不被自家 OCO 误拒
     finally:
         get_ai_trade_manager()._group = None
         app.dependency_overrides.clear()

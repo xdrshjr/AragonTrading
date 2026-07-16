@@ -166,12 +166,18 @@ class AiBacktestRunner:
         self.reflection_enabled = spec.reflection_enabled
 
         self.warmup = _compute_warmup(self.specs, spec.settings.ai_trade_regime_context)
+        # allow_limit 恒 False（ai-trade-limit-orders §2.10，Non-goal）：`SimBroker._pending` 是「次根
+        # 开盘无条件成交」的一根队列、`_Order` 连价格字段都没有。放任 Agent 在回测里挂限价而每单必成，
+        # 会**系统性高估**限价策略——这比「回测不支持限价」严重得多。故回测里 Agent 根本看不到
+        # orderType/limitPrice，只能市价：零分歧、诚实。此处显式写出（而非依赖默认值）以表明是决策。
         self.decider = AiTradeDecider(
             make_llm_client_from_config(spec.provider),
             build_ai_trade_system_prompt(self.inst_id, self.bar, self.initial_capital, self.leverage,
-                                         position_step_pct=self.position_step_pct),
+                                         position_step_pct=self.position_step_pct,
+                                         allow_limit=False),
             context_refresh_rounds=self.context_refresh_rounds, settings=self.settings,
-            position_step_pct=self.position_step_pct, reflection_enabled=self.reflection_enabled)
+            position_step_pct=self.position_step_pct, reflection_enabled=self.reflection_enabled,
+            allow_limit=False)
         self._oco_risk = RiskParams(
             stop_loss_pct=spec.stop_loss_pct or None, take_profit_pct=spec.take_profit_pct or None,
             max_hold_bars=self.settings.ai_trade_default_max_hold_bars or None)
@@ -182,7 +188,10 @@ class AiBacktestRunner:
         self.shadows = [make_shadow_broker() for _ in self.specs]
 
         self.rounds_done = 0
-        self.action_counts: dict[str, int] = {"open_long": 0, "open_short": 0, "close": 0, "hold": 0}
+        # M-8：动作字典须容纳新动作（回测 allow_limit=False ⇒ cancel_order 恒被 `_map_decision` 判为
+        # invalid_action，该计数恒 0；但字典不该在新动作出现时才被动扩张）。
+        self.action_counts: dict[str, int] = {"open_long": 0, "open_short": 0, "close": 0,
+                                              "hold": 0, "cancel_order": 0}
         self.degraded_rounds = 0
         self.timeout_rounds = 0
         # 下单前二次反思观测计数（§2.5；reflection_enabled=False 时恒 0，逐字等价旧行为）。
