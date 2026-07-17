@@ -544,3 +544,199 @@ async def test_cancel_order_bypasses_reflection():
         assert calls["orders"] == [] and calls["closes"] == []   # 撤单不开不平
     finally:
         await dispose_engine()
+
+
+# ---------- F2 否决意图记忆保真（ai-trade-reflection-hold-inertia-fix §六-2，先红后绿复现）----------
+def _last_tool_result_text(session) -> str:
+    """取 decider._context 末条 tool_result 文本（commit_round 写入的执行回执）。"""
+    return session.decider._context[-1].content[0].content
+
+
+async def test_journal_preserves_vetoed_intent():
+    """反思否决轮：journal 带 reflection.vetoed=True + 原提议动作；_context tool_result 含注记；
+    同时保持既有断言 journal.decision.action == "hold"（R-P1-3 不变式仍成立）。"""
+    await init_db()
+    session, calls, _ = _make_reflect_session(action="open_long", size=0.5, verdict="abort")
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        assert calls["orders"] == []                     # 否决轮真实资金零动作
+        entry = session.decider._journal[-1]
+        assert entry["decision"]["action"] == "hold"     # R-P1-3：journal 记最终 hold
+        note = entry["reflection"]
+        assert note["vetoed"] is True
+        assert note["failClosed"] is False
+        assert note["proposedAction"] == "open_long"
+        assert abs(note["proposedSizeFraction"] - 0.5) < 1e-9
+        assert note["finalAction"] == "hold"
+        assert entry["trigger"] == "candle"
+        assert '"reflection"' in _last_tool_result_text(session)   # 短窗口上下文可见否决注记
+    finally:
+        await dispose_engine()
+
+
+async def test_non_vetoed_round_tool_result_frozen_byte_identical():
+    """R-05 冻结守门：confirm 直通轮与未触发反思轮的 tool_result 文本 ==
+    json.dumps(executed, ensure_ascii=False) 且不含 "reflection"——钉死「非否决轮内容逐字不变」，
+    防「加字段就全轮富化」型复发。"""
+    await init_db()
+    # confirm 直通轮（触发了反思但未否决）
+    session, _, llm = _make_reflect_session(action="open_long", verdict="confirm")
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        assert llm.reflection_calls == 1
+        entry = session.decider._journal[-1]
+        assert entry["reflection"]["vetoed"] is False    # journal 保真注记
+        text = _last_tool_result_text(session)
+        assert text == json.dumps(entry["executed"], ensure_ascii=False)
+        assert "reflection" not in text
+    finally:
+        await dispose_engine()
+    await init_db()
+    # 未触发反思的 hold 轮（reflection 注记为 None）
+    session, _, llm = _make_reflect_session(action="hold")
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        assert llm.reflection_calls == 0
+        entry = session.decider._journal[-1]
+        assert entry["reflection"] is None
+        text = _last_tool_result_text(session)
+        assert text == json.dumps(entry["executed"], ensure_ascii=False)
+        assert "reflection" not in text
+    finally:
+        await dispose_engine()
+
+
+# ---------- F5 aiStats 反思四计数（hold-inertia-fix §2.5，R-04 aborts/failClosed 分流）----------
+def test_compute_ai_stats_reflection_counters_split_fail_closed():
+    """reflectionAborts 只计模型真实否决（degradeReason=="reflection_abort"）；四个基础设施码计入
+    reflectionFailClosed——一次 529 类过载抖动不得抬高否决率（R-04 口径）。"""
+    from app.ai_auto.session import _compute_ai_stats
+    dec = [
+        {"action": "open_long", "confidence": 0.8, "degradeReason": None,
+         "reflectionVerdict": "confirm"},                                  # 真实确认
+        {"action": "hold", "confidence": None, "degradeReason": "reflection_abort",
+         "reflectionVerdict": "abort"},                                    # 模型真实否决
+        {"action": "hold", "confidence": None, "degradeReason": "reflection_timeout",
+         "reflectionVerdict": "abort"},                                    # fail-closed（非真实否决）
+        {"action": "hold", "confidence": None, "degradeReason": "reflection_llm_error",
+         "reflectionVerdict": "abort"},                                    # fail-closed
+        {"action": "hold", "confidence": 0.6, "degradeReason": None,
+         "reflectionVerdict": None},                                       # 未触发反思
+    ]
+    st = _compute_ai_stats(dec, 5)
+    assert st["reflectionRuns"] == 4                     # reflectionVerdict 非 None 的样本数
+    assert st["reflectionConfirms"] == 1
+    assert st["reflectionAborts"] == 1                   # 只计真实否决，不含 fail-closed
+    assert st["reflectionFailClosed"] == 2
+    # 既有键零回归
+    assert st["decisionRounds"] == 5
+    assert st["degradedRounds"] == 3
+    assert st["holdRate"] == pytest.approx(0.8)
+
+
+def test_compute_ai_stats_reflection_counters_zero_on_legacy_records():
+    """legacy 决策记录（无 reflectionVerdict 键）与空样本：四计数恒 0、绝不抛。"""
+    from app.ai_auto.session import _compute_ai_stats
+    legacy = [{"action": "hold", "confidence": None, "degradeReason": None}]
+    st = _compute_ai_stats(legacy, 1)
+    assert st["reflectionRuns"] == 0
+    assert st["reflectionConfirms"] == 0
+    assert st["reflectionAborts"] == 0
+    assert st["reflectionFailClosed"] == 0
+    empty = _compute_ai_stats([], 0)
+    assert empty["reflectionRuns"] == 0 and empty["reflectionFailClosed"] == 0
+
+
+# ---------- N2/N3/N5 连续观望自察（ai-trade-hold-inertia-observability §六-1/2/4）----------
+def test_hold_streak_rules():
+    """N2 表驱动：非 hold 归零 / 真实 hold +1（max 跟随）/ 降级轮不变——含 low_confidence 分支（R2-03，
+    decide() 置信度门禁改写轮按弱意愿中性处理，不归零）；被门禁/反思否决的轮以第一阶段意愿为准。"""
+    session, _, _ = _make_session(action="hold")
+    cases = [
+        # (stage1_action, stage1_degrade, expected_streak)
+        ("hold", None, 1),                        # 真实观望 +1
+        ("hold", None, 2),                        # 连续累积
+        ("hold", "llm_error", 2),                 # 安全回退降级轮：不变
+        ("hold", "low_confidence", 2),            # 置信度门禁改写轮：不变（R2-03 语义钉）
+        ("hold", None, 3),                        # 恢复累积，max 跟随至 3
+        ("open_long", None, 0),                   # 交易意愿 → 归零
+        ("hold", None, 1),
+        ("open_short", "reflection_abort", 0),    # 否决轮以第一阶段意愿为准 → 仍归零
+    ]
+    for action, degrade, expected in cases:
+        session._update_hold_streak(action, degrade)
+        assert session.hold_streak == expected, (action, degrade)
+    assert session.max_hold_streak == 3           # 会话级全程最大值
+
+
+def test_payload_hold_streak_threshold():
+    """N3：显式 Settings(ai_trade_hold_streak_note_after=2)（防默认值漂移，沿 R-03 显式构造范式）——
+    达阈注入 holdStreak；未达无键；=0 关闭时 hold_streak=99 也无键（prompt 逐字节回退口）。"""
+    session, _, _ = _make_session(settings=Settings(ai_trade_hold_streak_note_after=2))
+    session.hold_streak = 2
+    payload = session._build_decision_payload(1, _START_TS, 30000.0, [], "candle")
+    assert payload["holdStreak"] == 2
+    session.hold_streak = 1
+    payload = session._build_decision_payload(2, _START_TS, 30000.0, [], "candle")
+    assert "holdStreak" not in payload
+    session_off, _, _ = _make_session(settings=Settings(ai_trade_hold_streak_note_after=0))
+    session_off.hold_streak = 99
+    payload = session_off._build_decision_payload(3, _START_TS, 30000.0, [], "candle")
+    assert "holdStreak" not in payload
+
+
+async def test_decision_event_and_status_carry_hold_streak():
+    """N5：桩 LLM 连续 hold → decision 事件 data["holdStreak"] 随轮递增、_status_payload 同步；
+    _finalize_run 后 metrics.aiStats.maxHoldStreak == 历史最大值（会话级直取，非样本口径）。"""
+    await init_db()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        run = await repo.create_run(s, strategy_id=1, inst_id="BTC-USDT-SWAP", bar="1H",
+                                    mode="ai-trade", config={"mode": "ai-trade"})
+        run_id = run.id
+    session, _, _ = _make_session(action="hold", run_id=run_id)
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        await session.feed_candle(_candle(1))
+        await _settle(session)
+        decisions = [e["data"] for e in _drain(q) if e["type"] == "decision"]
+        assert [d["holdStreak"] for d in decisions] == [1, 2]
+        assert session._status_payload()["holdStreak"] == 2
+        await session.stop("user_stop")
+        async with sm() as s:
+            row = await repo.get_run(s, run_id)
+        stats = json.loads(row.metrics_json)["aiStats"]
+        assert stats["maxHoldStreak"] == 2
+    finally:
+        await dispose_engine()
+
+
+async def test_finalize_run_persists_reflection_counters_and_wake_skips():
+    """会话停止后 metrics.aiStats 含反思四键与 wakeSkips（R-07：事后可验证 F4c 生效）。"""
+    await init_db()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        run = await repo.create_run(s, strategy_id=1, inst_id="BTC-USDT-SWAP", bar="1H",
+                                    mode="ai-trade", config={"mode": "ai-trade"})
+        run_id = run.id
+    session, _, _ = _make_reflect_session(action="open_long", verdict="abort", run_id=run_id)
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        session.wake_skips = 7                           # 模拟守卫抑制过 7 次唤醒
+        await session.stop("user_stop")
+        async with sm() as s:
+            row = await repo.get_run(s, run_id)
+        stats = json.loads(row.metrics_json)["aiStats"]
+        assert stats["reflectionRuns"] == 1
+        assert stats["reflectionAborts"] == 1
+        assert stats["reflectionConfirms"] == 0
+        assert stats["reflectionFailClosed"] == 0
+        assert stats["wakeSkips"] == 7
+    finally:
+        await dispose_engine()

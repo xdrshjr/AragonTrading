@@ -52,6 +52,7 @@ export interface AiTradeRunMetrics {
     executed?: boolean;
     confidence?: number | null;
     reason?: string | null;
+    reflectionVerdict?: string | null; // R2-07：后端 _digest_decisions 已下发（缺省 null）
   }[];
   aiStats?: {
     decisionRounds: number;
@@ -59,6 +60,14 @@ export interface AiTradeRunMetrics {
     holdRate: number;
     avgConfidence: number;
     degradedRounds: number;
+    // hold-inertia-observability O2（全可选，老记录缺键即优雅降级——aggregate 全缺返 null 隐藏整行）：
+    // 反思四计数为近 50 轮保留样本口径；wakeSkips / maxHoldStreak 为会话级全程直取。
+    reflectionRuns?: number;
+    reflectionConfirms?: number;
+    reflectionAborts?: number;
+    reflectionFailClosed?: number;
+    wakeSkips?: number;
+    maxHoldStreak?: number;
   };
 }
 

@@ -129,9 +129,15 @@ def _elapse_timer(session) -> None:
 
 
 async def test_interval_wake_triggers_decision_between_candles():
-    """wake_interval_s=120：一根确认根决策后回拨计时器 → _maybe_interval_wake 起一轮 interval 决策。"""
+    """wake_interval_s=120：一根确认根决策后回拨计时器 → _maybe_interval_wake 起一轮 interval 决策。
+
+    R-03（hold-inertia-fix）适配：本用例价格恒 30000、无新根——F4c 守卫默认阈值（0.05%）下必命中
+    跳过，故显式 `ai_trade_wake_skip_unchanged_pct=0.0` 关闭守卫构造；断言语义 =「守卫关闭时定时
+    唤醒行为与升级前逐字相同」（断言本体原样保留，不得删除或放松）。
+    """
     await init_db()
-    session = _make_session(action="hold", wake_interval_s=120)
+    session = _make_session(action="hold", wake_interval_s=120,
+                            settings=Settings(ai_trade_wake_skip_unchanged_pct=0.0))
     try:
         q = session.subscribe()
         await session.feed_candle(_candle(0))
@@ -255,3 +261,146 @@ def test_resolve_wake_interval_clamps():
     assert _resolve_wake_interval_s(0.1, settings) == pytest.approx(30.0)   # 6s < floor 30s → 夹到 30
     assert _resolve_wake_interval_s(9999, settings) == pytest.approx(14400.0)  # > ceil 240min → 夹到 4h
     assert _resolve_wake_interval_s(5, settings) == pytest.approx(300.0)
+
+
+# ---------- F4c 空仓重复唤醒跳过守卫（ai-trade-reflection-hold-inertia-fix §六-4 / §六-8）----------
+async def test_interval_wake_skips_when_flat_and_unchanged():
+    """空仓+无挂单+无新确认根+价格微动（<0.05%）→ 不创建决策任务、wake_skips 恰 +1、计时器未刷新；
+    同一唤醒周期窗口内紧接着再调 → 仍跳过且 wake_skips **不再递增**（R-02 计数节流）。"""
+    await init_db()
+    session = _make_session(action="hold", wake_interval_s=120)   # 默认 Settings → 守卫开启（0.05%）
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        assert session.rounds_completed == 1
+        session._last_live_px = 30003.0            # 相对 30000 仅 +0.01% < 0.05% → 微动
+        _elapse_timer(session)
+        wall_before = session._last_decision_started_wall
+        task_before = session._decision_task
+        await session._maybe_interval_wake()
+        assert session._decision_task is task_before               # 未起新决策任务
+        assert session.rounds_completed == 1
+        assert session.wake_skips == 1
+        assert session._last_decision_started_wall == wall_before  # 计时器未刷新（下个 tick 重评估）
+        await session._maybe_interval_wake()       # 同窗口第二次：仍跳过、不再递增（节流）
+        assert session.rounds_completed == 1
+        assert session.wake_skips == 1
+        assert session._status_payload()["wakeSkips"] == 1         # status 加法键随行
+    finally:
+        await dispose_engine()
+
+
+async def test_interval_wake_not_skipped_when_holding_position():
+    """持仓轮任何阈值下都不跳过（盯市职责不受守卫影响）：开多后价格纹丝不动仍照常唤醒。"""
+    await init_db()
+    session = _make_session(action="open_long", wake_interval_s=120)
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        assert session.executor.projected == "long"
+        _elapse_timer(session)
+        await session._maybe_interval_wake()
+        await _settle(session)
+        assert session.rounds_completed == 2       # 照常唤醒
+        assert session.wake_skips == 0
+    finally:
+        await dispose_engine()
+
+
+async def test_interval_wake_not_skipped_with_resting_order():
+    """挂单轮不跳过：空仓但有未成交限价挂单 → Agent 须能盯它并择机撤单。"""
+    from app.live_auto.resting import RestingOrder
+    await init_db()
+    session = _make_session(action="hold", wake_interval_s=120)
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        session.executor.resting = RestingOrder(
+            cl_ord_id="aragon-1", ord_id="okx-1", intent="open", side="long",
+            px=29900.0, sz=0.03, strength=0.5, reason="r",
+            created_ts=_START_TS, expire_ts=_START_TS + 900, adopted_sz=0.0)
+        _elapse_timer(session)
+        await session._maybe_interval_wake()
+        await _settle(session)
+        assert session.rounds_completed == 2       # 照常唤醒
+        assert session.wake_skips == 0
+    finally:
+        await dispose_engine()
+
+
+async def test_interval_wake_resumes_when_price_crosses_threshold():
+    """价格越阈（≥0.05%）即恢复唤醒——守卫命中不刷新计时器，下个 tick 价格一越阈立即唤醒。"""
+    await init_db()
+    session = _make_session(action="hold", wake_interval_s=120)
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        session._last_live_px = 30003.0            # 微动 → 先被跳过
+        _elapse_timer(session)
+        await session._maybe_interval_wake()
+        assert session.rounds_completed == 1 and session.wake_skips == 1
+        session._last_live_px = 30030.0            # +0.1% ≥ 0.05% → 越阈
+        await session._maybe_interval_wake()       # 计时器未刷新 → 「到点」仍成立，立即恢复
+        await _settle(session)
+        assert session.rounds_completed == 2
+    finally:
+        await dispose_engine()
+
+
+async def test_interval_wake_resumes_on_new_confirmed_bar():
+    """自上一决策轮以来出现新确认根（如 in-flight 跳过轮已推进信号板）→ 守卫放行。"""
+    await init_db()
+    session = _make_session(action="hold", wake_interval_s=120)
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        session._deciding = True                   # 模拟决策在飞：新根被 in-flight 跳过但推进窗口
+        await session.feed_candle(_candle(1))
+        session._deciding = False
+        assert session._last_bar_index == 1 and session._last_round_bar_index == 0
+        _elapse_timer(session)
+        await session._maybe_interval_wake()       # 价格未动但有新根 → 不跳过
+        await _settle(session)
+        assert session.rounds_completed == 2
+        assert session.wake_skips == 0
+    finally:
+        await dispose_engine()
+
+
+async def test_wake_skip_pushes_status_once_per_window():
+    """O1（hold-inertia-observability）：守卫命中且计数成功 → 恰推一条 status（含递增后的 wakeSkips）；
+    同一唤醒周期窗口内再次命中 → 不再推送、计数不再递增（R-02 节流语义对事件与计数一致）。"""
+    await init_db()
+    session = _make_session(action="hold", wake_interval_s=120)
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        q = session.subscribe()                    # 决策轮后再订阅：队列只看守卫命中期间的事件
+        session._last_live_px = 30003.0            # +0.01% < 0.05% → 守卫命中
+        _elapse_timer(session)
+        await session._maybe_interval_wake()
+        statuses = [e for e in _drain(q) if e["type"] == "status"]
+        assert len(statuses) == 1                  # 计数成功恰推一条 status
+        assert statuses[0]["data"]["wakeSkips"] == 1
+        await session._maybe_interval_wake()       # 同窗口第二次：计数被节流 → 不再推送
+        assert session.wake_skips == 1
+        assert [e for e in _drain(q) if e["type"] == "status"] == []
+    finally:
+        await dispose_engine()
+
+
+async def test_interval_wake_guard_disabled_at_zero_threshold():
+    """ai_trade_wake_skip_unchanged_pct=0 → 守卫关闭：数据完全未变也照常唤醒（一键回退口）。"""
+    await init_db()
+    session = _make_session(action="hold", wake_interval_s=120,
+                            settings=Settings(ai_trade_wake_skip_unchanged_pct=0.0))
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        _elapse_timer(session)
+        await session._maybe_interval_wake()
+        await _settle(session)
+        assert session.rounds_completed == 2
+        assert session.wake_skips == 0
+    finally:
+        await dispose_engine()

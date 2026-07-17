@@ -91,7 +91,8 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
         "2. 只使用输入中提供的真实数据（价格/成交量/因子/信号板/持仓/盈亏），绝不臆造行情或指标；"
         "证据不足或相互矛盾、无把握时选择 hold（持币观望）。高周期强冲突时短线开仓应优先 hold，"
         "除非证据充分且采用保守档位；超买/超卖不是单独开仓指令；已有持仓同时出现短线失效与高周期"
-        "反转时优先考虑 close；陈旧或缺失周期不得补猜。\n"
+        "反转时优先考虑 close；陈旧或缺失周期不得补猜。观望是需要当前证据支撑的主动决策，不是默认"
+        "答案；不要因历史摘要中长期观望而路径依赖。\n"
         f"3. 风险优先：已持仓且多数证据转为反向时，优先 close 保护利润 / 止损；空仓且多数证据同向、"
         f"研判充分时才开仓，{_size_discipline(position_step_pct)}，避免频繁反手与过度交易。\n"
         f"4. {_action_discipline(allow_limit, limit_band_pct)}"
@@ -314,6 +315,35 @@ def _format_multi_timeframe(context: dict | None) -> list[str]:
     return lines
 
 
+def _trigger_suffix(trigger) -> str:
+    """决策 prompt 首行的触发源标注（hold-inertia-fix F4a）：仅 `trigger == "interval"` 时追加。
+
+    措辞必须**条件化**（「若…相同」）而非断言数据未变（R-01）：与 F4c 守卫组合后，能到达 prompt 的
+    interval 轮多为持仓/挂单轮、价格越阈轮、或 in-flight 跳过后信号板已含新根的轮——断言式「数据未变」
+    在这些轮失实并会反向强化观望。`"candle"` / 缺失 / 其他值一律返回空串（首行逐字节不变，零回归；
+    回测 payload 无 trigger 键，天然不受影响）。
+    """
+    if trigger != "interval":
+        return ""
+    return ("｜触发源=定时唤醒（墙钟到点，非新 K 线确认触发；**若**本轮行情数据与上一决策轮相同"
+            "或仅实时价微动，重复数据下的观望不构成新的独立证据）")
+
+
+def _format_hold_streak(hold_streak) -> str:
+    """连续观望自察注记（hold-inertia-observability N4）：payload 无键/非正整数 → 空串（逐字节冻结）。
+
+    措辞必须**对称**（R-01 教训的正向应用）：既打断「历史观望→继续观望」的路径依赖，也明确
+    「不是必须开仓的指令」——防止注记本身变成过度交易的推手；要求给出具体证据与 F1 的
+    「有名有姓才否决」同构，方向相反。
+    """
+    if not isinstance(hold_streak, int) or hold_streak <= 0:
+        return ""
+    return (f"连续观望自察：截至上一轮，你已连续 {hold_streak} 轮维持观望（不含系统降级轮）。"
+            "历史观望不构成继续观望的理由，这也不是必须开仓的指令——请只以本轮最新证据独立重估"
+            "开多/开空/平仓/观望；若研判后仍选择观望，请在研判中指名当前最关键的一条反对开仓的"
+            "具体证据（不得以「此前观望被验证正确」作为理由）。")
+
+
 def build_decision_prompt(payload: dict) -> str:
     """把本轮决策输入（体制/共识 + 信号板 + 真实持仓 + 会话盈亏 + 摘要）压成紧凑文本喂决策器。
 
@@ -326,11 +356,15 @@ def build_decision_prompt(payload: dict) -> str:
     tp = payload.get("takeProfitUsd")
     sl = payload.get("stopLossUsd")
     parts = [
-        f"决策轮 #{payload.get('round')}｜barTs={payload.get('barTs')}｜最新价={payload.get('lastPx')}",
+        f"决策轮 #{payload.get('round')}｜barTs={payload.get('barTs')}｜最新价={payload.get('lastPx')}"
+        + _trigger_suffix(payload.get("trigger")),
         _format_position(payload.get("position")),
         (f"会话累计盈亏≈{payload.get('sessionPnlUsd')} USDT / 预算 {payload.get('budgetUsd')} USDT；"
          f"会话止盈阈值={'不触发' if tp is None else tp}，止损阈值={'不触发' if sl is None else sl}"),
     ]
+    streak_line = _format_hold_streak(payload.get("holdStreak"))
+    if streak_line:                          # 键缺失时整段省略（零回归；回测 payload 无此键，N3）
+        parts.append(streak_line)
     resting_line = _format_resting_order(payload.get("restingOrder"))
     if resting_line:                         # 无挂单时整段省略（不出现「当前挂单：无」的噪音）
         parts.append(resting_line)
@@ -377,22 +411,39 @@ REFLECTION_TOOL_SCHEMA: dict = {
 
 REFLECTION_TOOL_DESCRIPTION = (
     "提交本轮下单前的二次反思裁决。你是独立的风控复核官——对刚才另一名交易员基于同样证据给出的**交易决策**"
-    "（会真实下单、动用真金）做批判性复核。verdict=confirm 确认执行、abort 否决（本轮降级为观望不下单）。"
-    "confirm 时可给 adjustedSizeFraction（**仅当 < 原仓位时收缩**，否则忽略；绝不放大）。reason 给出复核结论。"
+    "（会真实下单、动用真金）做批判性复核。verdict=confirm 确认执行（提议决策与证据大体一致即确认）；"
+    "verdict=abort 否决（本轮降级为观望不下单）——**仅当存在具体可指明的实质性缺陷时**使用，"
+    "泛化的不放心不构成否决理由。confirm 时可给 adjustedSizeFraction（**仅当 < 原仓位时收缩**，否则忽略；"
+    "绝不放大）——对仓位偏重的疑虑优先用收缩而非否决。reason 给出复核结论并引用具体证据。"
     "你只能收紧（否决或调小仓位），无权放大或改变方向。"
 )
 
 
 def build_reflection_system_prompt() -> str:
-    """反思复核官系统 prompt：批判性复核提议决策是否稳健，只可收紧（否决/收缩），收尾必调反思工具。"""
+    """反思复核官系统 prompt：分级复核标准（有名有姓才否决，收缩优先），只可收紧，收尾必调反思工具。
+
+    hold-inertia-fix F1：删除「任何不放心即 abort（宁可错过不可做错）」的不对称保守标准——它把 abort
+    设成默认答案（历史样本 7/7 全否决），是「永不开单」因果链的根因 ①。替换为分级复核标准（默认
+    confirm / 收缩优先 / abort 须指名实质性缺陷 / 机会成本对称）；确定性安全层（apply_reflection、
+    只能收紧、fail-closed）逐字不变。
+    """
     return (
         "你是一名独立的下单前风控复核官。刚才另一名交易员基于同样的证据给出了一个**交易决策**（会真实"
         "下单、动用真金）。你的职责**不是**重新交易，而是**批判性地复核这个决策是否稳健**："
         "① 方向是否被证据支持、有无更强的反向信号被忽略；② 是否与更高周期中线背景 / 市场体制冲突；"
         "③ 结合当前真实持仓与会话累计盈亏，这笔交易的风险敞口是否可接受、是否在追高/杀跌/频繁反手；"
-        "④ 仓位是否偏重、能否更保守；⑤ 是否存在证据不足却强行交易。"
-        "若发现任何足以令你不放心的问题，选择 `abort`（宁可错过，不可做错）；只有当你确信该决策稳健时"
-        "才 `confirm`。你**只能**收紧（否决或调小仓位），**无权**放大仓位或改变方向。"
+        "④ 仓位是否偏重、能否更保守；⑤ 是否存在证据不足却强行交易。\n"
+        "分级复核标准：\n"
+        "1. **默认立场**：提议决策与证据大体一致、风险敞口可控 → `confirm`；仅对仓位偏重有疑虑 → "
+        "**优先**用 `confirm` + `adjustedSizeFraction` 收缩仓位（收缩是你的首选保守工具，而非 abort）。\n"
+        "2. **abort 门槛**：仅当你能**指名一条实质性缺陷**时才 `abort`——(a) 方向与关键证据直接矛盾；"
+        "(b) 与更高周期背景强冲突且决策未给出对冲理由；(c) 当前持仓与会话盈亏下新增敞口不可接受；"
+        "(d) 明显追高/杀跌/频繁反手；(e) 证据严重不足却重仓。`reason` 必须引用具体证据；"
+        "「泛化的不放心」不构成否决理由。\n"
+        "3. **机会成本对称**：错过一笔证据充分的交易与做错一笔交易同样是损失；你的职责是拦截"
+        "**错误交易**，不是消灭交易。另注意：`close` 是风险收敛动作，否决 close 等于延长敞口，"
+        "须有极强理由。\n"
+        "你**只能**收紧（否决或调小仓位），**无权**放大仓位或改变方向。"
         "收尾必须且只能调用一次 `submit_trade_reflection` 提交裁决——绝不允许只输出复核文字而不调用工具。"
     )
 
@@ -423,8 +474,11 @@ def build_reflection_prompt(payload: dict, decision) -> str:
         "————\n"
         f"{_format_reflection_decision(decision)}\n\n"
         "请以资深风控/交易员的批判视角复核上述交易决策是否稳健（方向、与高周期背景是否冲突、当前持仓与"
-        "会话盈亏下风险敞口是否可接受、仓位是否偏重、有无证据不足强行交易）。若确有不放心处则 `abort`"
-        "（宁可错过不可做错），确信稳健才 `confirm`；只能收紧、不得放大或改向。"
+        "会话盈亏下风险敞口是否可接受、仓位是否偏重、有无证据不足强行交易）。提议决策与证据大体一致即 "
+        "`confirm`；对仓位偏重有疑虑时**优先**以 `confirm` + `adjustedSizeFraction` 收缩；仅当能指名一条"
+        "实质性缺陷（方向与关键证据矛盾 / 与高周期强冲突且无对冲理由 / 敞口不可接受 / 明显追高杀跌频繁"
+        "反手 / 证据严重不足却重仓）时才 `abort`，`reason` 须引用具体证据。错过一笔证据充分的交易与做错"
+        "一笔同样是损失；只能收紧、不得放大或改向。"
         f"你的**唯一任务**是必须且只能调用一次 {REFLECTION_TOOL_NAME} 提交裁决——不得只输出复核文字，"
         "也不得调用其它工具。")
 
@@ -434,15 +488,67 @@ def build_summary_system_prompt() -> str:
     return (
         "你是自动交易执行历程的摘要器。请把给定的逐轮执行流水压缩成一段**简洁**的中文执行摘要，"
         "用作后续决策的背景记忆。"
+        "摘要须同时记录做了什么与**没做什么**（被否决、被错过的机会），保持对未来决策中性，"
+        "不得美化观望。"
     )
+
+
+def compact_journal_for_summary(journal: list[dict]) -> list[dict]:
+    """摘要素材视图：把**连续**的「interval + hold + 未成交 + 无反思注记」轮折叠为一条（F4b）。
+
+    重复定时唤醒轮携带同一份行情数据，逐条呈现会让摘要器把「继续观望」当作被反复验证的独立证据
+    （根因 ③）。折叠仅发生在本瞬态视图——`_journal` 本体、decision 事件、trace 一律逐轮原样。
+    纯函数、不改入参；开/平仓轮、candle 轮、含 reflection 注记轮、legacy 无 trigger 条目永不折叠；
+    单条可折叠条目保留原样（仅连续 ≥2 条才折叠）。
+    """
+    def _foldable(entry: dict) -> bool:
+        return (entry.get("trigger") == "interval"
+                and (entry.get("decision") or {}).get("action") == "hold"
+                and not (entry.get("executed") or {}).get("traded")
+                and entry.get("reflection") is None)
+
+    out: list[dict] = []
+    run: list[dict] = []
+
+    def _flush() -> None:
+        if len(run) >= 2:
+            first, last = run[0], run[-1]
+            out.append({"rounds": f"{first.get('round')}-{last.get('round')}",
+                        "repeatedRounds": len(run), "trigger": "interval",
+                        "note": "同一份行情数据下的重复定时唤醒，均维持观望",
+                        "decision": last.get("decision"), "sessionPnl": last.get("sessionPnl")})
+        else:
+            out.extend(run)
+        run.clear()
+
+    for entry in journal:
+        if _foldable(entry):
+            run.append(entry)
+            continue
+        _flush()
+        out.append(entry)
+    _flush()
+    return out
 
 
 def build_summary_prompt(prev_summary: str | None, journal: list[dict]) -> str:
     """以结构化 `_journal`（每轮 {round,signalBoard,decision,executed,positionAfter,sessionPnl}）
-    为唯一素材（P1-3，与可能被裁剪的模型窗口 `_context` 解耦）拼成摘要输入文本。"""
-    head = "总结迄今的自动交易执行情况：决策序列与结果、持仓与盈亏演变、**哪些策略/因子信号被你采纳或被" \
-           "推翻、事后又被行情验证为对或错**（作为经验教训）、当前策略偏好，形成简洁的执行摘要作为后续" \
-           "决策的背景，不要罗列每一轮细节。"
+    为唯一素材（P1-3，与可能被裁剪的模型窗口 `_context` 解耦）拼成摘要输入文本。
+
+    素材先经 `compact_journal_for_summary` 折叠连续重复的 interval-hold 轮（F4b，单点收口，
+    实盘/回测共用）；head 指令含反自我强化三条（F3：被否决意图须记录并对照行情验证、空仓零回撤
+    不是成绩、折叠条目只算一次观望证据）。
+    """
+    head = ("总结迄今的自动交易执行情况：决策序列与结果、持仓与盈亏演变、**哪些策略/因子信号被你采纳或被"
+            "推翻、事后又被行情验证为对或错**（作为经验教训）、当前策略偏好，形成简洁的执行摘要作为后续"
+            "决策的背景，不要罗列每一轮细节。"
+            "若流水含 `reflection` 注记：必须记录**被否决的开仓意图**（方向/仓位/否决理由），并对照其后"
+            "行情走向写明**该否决事后被验证为正确还是错误**（`failClosed=true` 的是系统故障保守跳过，"
+            "不代表模型判断，不得当作否决被验证）。"
+            "空仓期间的零回撤**不是成绩**：若期间行情朝被否决或未执行的方向走出明显趋势，必须如实记为"
+            "『错失』并总结教训；禁止把长期观望总结为表现完美。"
+            "`repeatedRounds` 折叠条目表示同一份行情数据下的重复定时唤醒：它们合计只算**一次**观望证据，"
+            "不得按轮数强化观望倾向。")
     prev = f"\n上一段执行摘要（请在其基础上滚动累积）：\n{prev_summary}" if prev_summary else ""
-    digest = json.dumps(journal, ensure_ascii=False)
+    digest = json.dumps(compact_journal_for_summary(journal), ensure_ascii=False)
     return f"{head}{prev}\n\n逐轮执行流水（JSON）：\n{digest}"

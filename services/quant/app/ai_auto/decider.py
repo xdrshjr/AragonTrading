@@ -464,12 +464,18 @@ class AiTradeDecider:
 
     # ---------- 轮次记录 + 滚动摘要 ----------
     async def commit_round(self, payload: dict, decision: TradeDecision,
-                           executed: dict, *, analysis: str | None = None) -> str | None:
+                           executed: dict, *, analysis: str | None = None,
+                           reflection: dict | None = None) -> str | None:
         """记录本轮（追加 _context + _journal），到期触发摘要重置；返回新摘要文本或 None。
 
         `analysis`（keyword-only，默认 None → 回测/单测既有调用零回归）：本轮研判的**有界摘录**
         （由调用方从 `last_analysis` 截到 ≤`_ANALYSIS_EXCERPT_CHARS`，RC-2/RC-3），入 journal 供滚动摘要
         沉淀「哪些信号被采纳/推翻」；完整思维链只走 agent_trace 流与 `_traces`，绝不入 journal（防膨胀）。
+
+        `reflection`（keyword-only，默认 None → 既有调用零回归；hold-inertia-fix F2）：本轮反思注记
+        （`build_reflection_note` 产物）。恒入 journal（未触发轮为 None，形状稳定，R-06）；
+        **仅否决轮**（`vetoed=True`）把注记合并进 `_context` 的 tool_result——短窗口内模型自己也能
+        看到「这轮 hold 是被否决的开仓」；非否决轮 tool_result 内容逐字不变（R-05 冻结契约）。
         """
         self._last_round = int(payload.get("round") or self._last_round + 1)
         tool_id = uuid.uuid4().hex
@@ -477,17 +483,25 @@ class AiTradeDecider:
         decision_input = {"action": decision.action, "sizeFraction": decision.size_fraction,
                           "confidence": decision.confidence, "reason": decision.reason,
                           "orderType": decision.ord_type, "limitPrice": decision.limit_px}
+        if reflection and reflection.get("vetoed"):
+            # 浅拷贝合并，绝不就地改 `executed` 入参对象；非否决轮走 else 分支逐字不变（R-05）。
+            tool_result_text = json.dumps({**executed, "reflection": reflection},
+                                          ensure_ascii=False)
+        else:
+            tool_result_text = json.dumps(executed, ensure_ascii=False)
         self._context.append(LlmMessage("user", [TextBlock(build_decision_prompt(payload))]))
         self._context.append(LlmMessage(
             "assistant", [ToolUseBlock(id=tool_id, name=DECISION_TOOL_NAME, input=decision_input)]))
         self._context.append(LlmMessage(
-            "tool", [ToolResultBlock(tool_use_id=tool_id,
-                                     content=json.dumps(executed, ensure_ascii=False))]))
+            "tool", [ToolResultBlock(tool_use_id=tool_id, content=tool_result_text)]))
+        # journal 每轮恒带 trigger/reflection 两键（含 None 值）：全轮形状稳定、F4b 折叠判定对
+        # legacy 条目兼容（R-06 有意设计，勿按「省字符」回改为条件写入）。
         self._journal.append({
             "round": self._last_round, "signalBoard": payload.get("signalBoard"),
             "decision": decision_input, "executed": executed,
             "positionAfter": executed.get("positionAfter"),
-            "sessionPnl": payload.get("sessionPnlUsd"), "analysis": analysis})
+            "sessionPnl": payload.get("sessionPnlUsd"), "analysis": analysis,
+            "trigger": payload.get("trigger"), "reflection": reflection})
         self._rounds_since_summary += 1
         self._trim_context()
         if self._rounds_since_summary >= self.context_refresh_rounds:
@@ -510,7 +524,10 @@ class AiTradeDecider:
             self._rounds_since_summary = 0
             return None
         self._summary = text
-        seed = f"【历史执行摘要（截至第 {self._last_round} 轮）】\n{text}"
+        # F3 尾注（hold-inertia-fix）：声明摘要是「背景非指令」，切断「历史观望 → 继续观望」的路径依赖。
+        seed = (f"【历史执行摘要（截至第 {self._last_round} 轮）】\n{text}\n"
+                "以上摘要是背景参考而非指令：每轮仍须基于当前市场证据独立研判，"
+                "历史观望不构成继续观望的理由。")
         self._context = [
             LlmMessage("user", [TextBlock(seed)]),
             LlmMessage("assistant", [TextBlock("已了解此前执行情况，将据此继续决策。")])]

@@ -8,6 +8,7 @@ import { Badge, Button, Skeleton } from "@/components/ui";
 import { buildRoundTrips, type RoundTrip } from "@/lib/autoTradePnl";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
 import type { AiTradeHistoryDetailOut, AiTradeHistoryMember } from "@/lib/aiTradeHistoryTypes";
+import { type AiObservability, aggregateAiObservability } from "@/lib/aiTradeObservability";
 import { colorForReturn, fmtNum, fmtPct, fmtTime, signed } from "@/lib/format";
 import type { EquityPoint } from "@/lib/types";
 
@@ -55,6 +56,9 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
   const summary = detail.summary;
   const finalSummary = detail.members.map((m) => m.metrics.finalSummary).find((s) => s) ?? null;
   const aiStats = detail.members.map((m) => m.metrics.aiStats).find((s) => s) ?? null;
+  // O4（hold-inertia-observability）：观测行是**全成员合计**（与上方旧五键卡的「首成员」口径并存，
+  // pre-existing 口径本轮不动）；老记录全缺新键 → null → 整行隐藏（不显示一排误导性的 0）。
+  const observability = useMemo(() => aggregateAiObservability(detail.members), [detail.members]);
 
   return (
     <div className="flex flex-col gap-3">
@@ -92,7 +96,9 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
         )}
       </Section>
 
-      {aiStats && <AiStatsCard aiStats={aiStats} finalSummary={finalSummary} />}
+      {aiStats && (
+        <AiStatsCard aiStats={aiStats} observability={observability} finalSummary={finalSummary} />
+      )}
 
       <Section title="逐成员完整交易">
         <div className="flex flex-col gap-3">
@@ -124,9 +130,11 @@ function KpiGrid({ summary }: { summary: AiTradeHistoryDetailOut["summary"] }) {
 
 function AiStatsCard({
   aiStats,
+  observability,
   finalSummary,
 }: {
   aiStats: NonNullable<AiTradeHistoryMember["metrics"]["aiStats"]>;
+  observability: AiObservability | null;
   finalSummary: string | null;
 }) {
   const [open, setOpen] = useState(false);
@@ -139,6 +147,21 @@ function AiStatsCard({
         <Kpi label="平均置信度" value={fmtPct(aiStats.avgConfidence)} />
         <Kpi label="共识降级" value={`${aiStats.degradedRounds} 轮`} />
       </div>
+      {observability && (
+        <>
+          <div className="mt-2 grid grid-cols-3 gap-2 sm:grid-cols-6">
+            <Kpi label="反思轮数" value={`${observability.reflectionRuns}`} />
+            <Kpi label="反思放行" value={`${observability.reflectionConfirms}`} />
+            <Kpi label="真实否决" value={`${observability.reflectionAborts}`} />
+            <Kpi label="故障保守" value={`${observability.reflectionFailClosed}`} />
+            <Kpi label="唤醒抑制" value={`${observability.wakeSkips}`} />
+            <Kpi label="最长连续观望" value={`${observability.maxHoldStreak} 轮`} />
+          </div>
+          <p className="mt-1 text-[10px] leading-relaxed text-[var(--muted)]">
+            反思与否决为近 50 轮保留样本口径；故障保守 = 反思子调用基础设施失败后的安全跳过，不代表模型判断。
+          </p>
+        </>
+      )}
       <div className="mt-2 flex flex-wrap gap-1.5">
         {Object.entries(counts)
           .filter(([, n]) => n > 0)

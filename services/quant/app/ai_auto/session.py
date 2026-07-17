@@ -37,7 +37,7 @@ from .market_window import MarketWindow
 from .multi_timeframe_context import build_multi_timeframe_context
 from .order_plan import decision_to_order_plan
 from .prompts import DECISION_TOOL_NAME
-from .reflection import apply_reflection, applied_shrink
+from .reflection import applied_shrink, apply_reflection, build_reflection_note
 from .signals import (
     Consensus,
     StrategySignalView,
@@ -55,6 +55,7 @@ from .trace import (
     reflection_verdict_event,
     trace_event,
 )
+from .wake_guard import should_skip_interval_wake
 
 _SNAPSHOT_EQUITY_MAX = 1000
 _DECISIONS_MAX = 50
@@ -127,6 +128,16 @@ class AiTradeSession:
         self._last_bar_index = 0
         self._last_live_px: float | None = None
         self._last_decision_started_wall = 0.0
+        # 空仓重复唤醒守卫态（hold-inertia-fix F4c）：最近一次**决策轮启动时**的确认根索引 / 参考价
+        # （None=尚无决策轮 → 守卫直通）+ 被抑制的唤醒计数 + 计数节流墙钟（R-02：每唤醒周期至多计一次）。
+        self._last_round_bar_index: int | None = None
+        self._last_round_px: float | None = None
+        self.wake_skips = 0
+        self._last_skip_counted_wall = 0.0
+        # 连续真实观望计数（hold-inertia-observability N2）：第一阶段连续 hold 轮数 + 会话级全程最大值
+        # （max 供 finalize 落 aiStats.maxHoldStreak——环形样本算不出全程最大值，与 wake_skips 同为会话级直取）。
+        self.hold_streak = 0
+        self.max_hold_streak = 0
         self._stale_degraded = False
         self._degraded_seen = False
         self._last_status_side = executor.projected
@@ -312,19 +323,73 @@ class AiTradeSession:
 
     async def _maybe_interval_wake(self) -> None:
         """墙钟定时唤醒（第三触发源，wake-interval §2.2）：满足全部条件时用「最近确认根信号板 + 当前
-        实时价」触发一轮标准决策。in-flight/关闭/非运行/行情陈旧/尚无信号板 → 一律不唤醒。"""
+        实时价」触发一轮标准决策。in-flight/关闭/非运行/行情陈旧/尚无信号板 → 一律不唤醒。
+
+        F4c（hold-inertia-fix）：既有条件通过后、认领 `_deciding` 槽位之前，先过空仓重复唤醒守卫
+        （纯同步，守卫与认领之间无 await、无竞态）——空仓+无挂单+无新确认根+价格微动时跳过本次唤醒，
+        且**不刷新** `_last_decision_started_wall`：下个 monitor tick（默认 ~5s）重新评估，价格一越过
+        阈值或新 K 线到来即恢复唤醒；持仓轮/挂单轮永不跳过（盯市职责不受影响）。
+        """
         if (self.wake_interval_s <= 0 or self.state != "running" or self._deciding
                 or self._stale_degraded or self._last_board is None):
             return
         now = time.time()
         if now - self._last_decision_started_wall < self.wake_interval_s:
             return
-        self._deciding = True                 # 同步认领槽位：check→set 间无 await（与 feed_candle 同范式，P1-2）
         ref_px = self._current_px()           # 纯同步取实时价（不 await）
+        if should_skip_interval_wake(
+                position_side=self.executor.projected,
+                has_resting=self.executor.resting is not None,
+                bar_index=self._last_bar_index,
+                last_round_bar_index=self._last_round_bar_index,
+                px=ref_px, last_round_px=self._last_round_px,
+                threshold=self.executor.settings.ai_trade_wake_skip_unchanged_pct):
+            # O1（hold-inertia-observability）：守卫命中期间没有任何事件发出，live 面板的 wakeSkips
+            # 只能停在连接时 snapshot 的旧值；计数成功即补推一次 status（频率被 R-02 节流天然封顶：
+            # 每唤醒周期至多一条，不新增节流机制）。
+            if self._count_wake_skip(now):
+                await self._push({"type": "status", "data": self._status_payload()})
+            return
+        self._deciding = True                 # 同步认领槽位：check→set 间无 await（与 feed_candle 同范式，P1-2）
+        self._last_round_bar_index = self._last_bar_index
+        self._last_round_px = ref_px
         self._last_decision_started_wall = now
         self._decision_task = asyncio.create_task(
             self._run_decision_round(self._last_board, self._last_bar_index, ref_px,
                                      int(now), trigger="interval"))
+
+    def _count_wake_skip(self, now: float) -> bool:
+        """守卫命中计数（R-02 节流）：每个唤醒周期至多计数+日志一次。
+
+        守卫命中不刷新计时器（为价格越阈即恢复），「到点」判定此后每个 ~5s monitor tick 恒成立；
+        若按 tick 裸计数，3 分钟周期下 1 小时静止行情会虚计 ~720 次（老行为仅 ~20 次唤醒），F5 观测
+        口径失真且 debug 日志刷屏。节流后语义 =「被抑制的、原本会发生的唤醒次数」。
+        """
+        if now - max(self._last_decision_started_wall,
+                     self._last_skip_counted_wall) < self.wake_interval_s:
+            return False
+        self.wake_skips += 1
+        self._last_skip_counted_wall = now
+        logger.debug("ai-trade interval wake skipped (flat, unchanged data): session=%s total=%d",
+                     self.session_id, self.wake_skips)
+        return True
+
+    def _update_hold_streak(self, stage1_action: str, stage1_degrade: str | None) -> None:
+        """连续真实观望计数（hold-inertia-observability N2）。
+
+        以**第一阶段**（decider.decide 直接返回值，共识门禁/反思之前）为准：
+        - 非 hold → 归零（模型已展示交易意愿——即使随后被共识门禁或反思否决，惯性已在第一阶段打破）；
+        - hold 且无降级 → +1（模型真实观望）；
+        - hold 且有降级 → 不变（既非充分意愿也非真实观望，不计入亦不打断）。该分支覆盖两类：
+          llm_error/timeout 等安全回退，以及 low_confidence 风险门禁改写轮——decide() 对置信度
+          不达标的开仓意愿返回 ("hold", "low_confidence")（decider.py:359），弱意愿按中性处理，
+          **不归零**（R2-03 语义钉，勿按「已展示意愿→归零」走样）。
+        """
+        if stage1_action != "hold":
+            self.hold_streak = 0
+        elif stage1_degrade is None:
+            self.hold_streak += 1
+            self.max_hold_streak = max(self.max_hold_streak, self.hold_streak)
 
     def _current_px(self) -> float:
         """定时唤醒取实时价：优先最近未确认/确认根实时价（`is not None` 判定，防 0 价异常断面误回落），
@@ -396,6 +461,8 @@ class AiTradeSession:
             await self._emit_decision_skipped(ts, board)
             return
         self._deciding = True
+        self._last_round_bar_index = i           # F4c：记录本决策轮启动断面（根索引 + 参考价）
+        self._last_round_px = ref_px
         self._last_decision_started_wall = time.time()   # 任一轮决策开始即刷新计时器，与定时唤醒合流去重
         self._decision_task = asyncio.create_task(
             self._run_decision_round(board, i, ref_px, ts, trigger="candle"))
@@ -415,9 +482,13 @@ class AiTradeSession:
             await self._begin_round_trace(round_no, ts, ref_px, payload, board)  # RV-7：consensus 之后
             decision, degrade = await self.decider.decide(
                 payload, emit=self._make_trace_emit(round_no, ts))
+            # N2（hold-inertia-observability）：以第一阶段原始输出立即更新连续观望计数——须在共识门禁
+            # 与反思之前（此时的 decision/degrade 正是第一阶段输出，惯性以模型真实意愿为准）。
+            self._update_hold_streak(decision.action, degrade)
             decision, degrade = self._apply_consensus_gate(decision, consensus, degrade)  # E2 门禁
             # 二次反思（ReAct 复核，仅交易意愿触发；只会更保守）——共识门禁后、真实执行前。
-            decision, degrade = await self._reflect_before_execute(
+            # F2（hold-inertia-fix）：第三元 reflection_note 保真「提议了什么、为何被否决」。
+            decision, degrade, reflection_note = await self._reflect_before_execute(
                 round_no, ts, payload, decision, degrade)
             executed = await self._execute_decision(decision, ref_px, i, ts)
             self.rounds_completed = round_no
@@ -425,7 +496,8 @@ class AiTradeSession:
             # 降级轮 last_analysis 恒为空串（RC-1）→ excerpt=None（journal/事件不带残段）。
             excerpt = self.decider.last_analysis[:_ANALYSIS_EXCERPT_CHARS] or None
             # R-P1-3：commit_round 收门禁后的最终 decision，journal/摘要据此记真实动作（保持上下文纯净）。
-            summary = await self.decider.commit_round(payload, decision, executed, analysis=excerpt)
+            summary = await self.decider.commit_round(payload, decision, executed,
+                                                      analysis=excerpt, reflection=reflection_note)
             await self._emit_tool_call_trace(round_no, ts, decision)
             await self._emit_result_trace(round_no, ts, executed, degrade)
             reflection_verdict, reflection_reason = self._round_reflection_summary()
@@ -471,20 +543,25 @@ class AiTradeSession:
     # ---------- 下单前二次反思编排（ai-trade-pre-trade-reflection §2.3；精简，装配下沉 trace.py）----------
     async def _reflect_before_execute(self, round_no: int, ts: int, payload: dict,
                                       decision: TradeDecision, degrade: str | None
-                                      ) -> tuple[TradeDecision, str | None]:
-        """交易意愿决策在真实下单前经一次独立反思复核（只会更保守）；hold/撤单/关闭反思时原样直通。"""
+                                      ) -> tuple[TradeDecision, str | None, dict | None]:
+        """交易意愿决策在真实下单前经一次独立反思复核（只会更保守）；hold/撤单/关闭反思时原样直通。
+
+        返回三元组 `(final, degrade, reflection_note)`（hold-inertia-fix F2）：第三元为
+        `build_reflection_note` 注记（直通分支为 None），由 `_run_decision_round` 透传给
+        `commit_round`，使 journal/摘要素材保真「曾提议开仓但被否决」。
+        """
         # F-7（ai-trade-limit-orders-fix §2.8）：cancel_order 与 hold 同列直通——反思宪章是「下单前
         # 二次复核」，撤单不产生任何委托（order_plan 恒 None）、本身即风险收敛动作；拦截它反而反保守
         # （abort/fail-closed 会把撤单降级 hold，挂单敞口多活到 TTL）。勿回改为单值门控。
         if (not self.decider.reflection_enabled
                 or decision.action in ("hold", "cancel_order")):
-            return decision, degrade                 # 关闭 或 不下单动作 → 无 LLM、无轨迹
+            return decision, degrade, None           # 关闭 或 不下单动作 → 无 LLM、无轨迹、无注记
         await self._begin_reflection_trace(round_no, ts, decision)
         verdict = await self.decider.reflect(
             payload, decision, emit=self._make_trace_emit(round_no, ts))
         final, new_degrade = apply_reflection(decision, degrade, verdict, self.decider.position_step)
         await self._emit_reflection_verdict_trace(round_no, ts, verdict, decision, final)
-        return final, new_degrade
+        return final, new_degrade, build_reflection_note(decision, verdict, final)
 
     async def _begin_reflection_trace(self, round_no: int, ts: int,
                                       decision: TradeDecision) -> None:
@@ -705,7 +782,7 @@ class AiTradeSession:
     def _build_decision_payload(self, round_no: int, ts: int, ref_px: float,
                                 board: list[StrategySignalView],
                                 trigger: str = "candle") -> dict:
-        return {
+        payload = {
             "round": round_no, "barTs": ts, "lastPx": ref_px, "trigger": trigger,
             "position": self.executor.position_payload(ref_px),
             # §4.2：当前挂单只读上下文（无挂单 → None，prompt 整段省略）。Agent 看不见自己的挂单
@@ -720,6 +797,14 @@ class AiTradeSession:
                 self._window.base_df(), self.bar, self.executor.settings),
             "multiTimeframeContext": self._build_multi_timeframe_context(ts, ref_px),
             "signalBoard": [self._view_full(v) for v in board]}
+        # N3（hold-inertia-observability）：连续观望达到阈值才注入（0=关闭）。payload 在 decide 之前
+        # 装配，故值 = 截至上一轮的连续观望数。阈值未达/关闭/回测（backtest.py 自建 payload）→ 键缺失
+        # → prompt 逐字节不变（F4a 冻结范式）。注记文本会经 commit_round 重放进 _context 该轮 user
+        # 消息（R2-04 有意行为：模型上下文如实保留它当轮看到的输入，随窗口裁剪/摘要自然消退）。
+        threshold = self.executor.settings.ai_trade_hold_streak_note_after
+        if threshold > 0 and self.hold_streak >= threshold:
+            payload["holdStreak"] = self.hold_streak
+        return payload
 
     def _build_multi_timeframe_context(self, ts: int, ref_px: float) -> dict | None:
         try:
@@ -787,7 +872,10 @@ class AiTradeSession:
                 "consensus": consensus, "degradeReason": degrade_reason,
                 "analysis": analysis, "marketDigest": market_digest,
                 "multiTimeframeContext": multi_timeframe_context, "trigger": trigger,
-                "reflectionVerdict": reflection_verdict, "reflectionReason": reflection_reason}
+                "reflectionVerdict": reflection_verdict, "reflectionReason": reflection_reason,
+                # N5（hold-inertia-observability）：decide 后已更新，语义=「截至本轮」的连续真实观望；
+                # 每轮随 decision 事件下发，是前端 live 值的最新真源（跳过轮事件不带此键）。
+                "holdStreak": self.hold_streak}
         self._last_decision = data
         self._decisions.append(data)
         await self._push({"type": "decision", "data": data})
@@ -845,6 +933,8 @@ class AiTradeSession:
                 "roundsSinceSummary": self.decider.rounds_since_summary,
                 "contextRefreshRounds": self.context_refresh_rounds,
                 "wakeIntervalMinutes": self._wake_interval_minutes(),
+                "wakeSkips": self.wake_skips,
+                "holdStreak": self.hold_streak,
                 "stopReason": self.stop_reason,
                 "degraded": self.executor.degraded or self._stale_degraded or self.degraded,
                 "flattenFailed": self.flatten_failed, "residual": self.residual}
@@ -902,6 +992,11 @@ class AiTradeSession:
             metrics["equityDigest"] = _downsample_equity(self._equity, cap=_EQUITY_DIGEST_MAX)
             metrics["decisionsDigest"] = _digest_decisions(self._decisions, cap=_DECISIONS_MAX)
             metrics["aiStats"] = _compute_ai_stats(self._decisions, self.rounds_completed)
+            # R-07（hold-inertia-fix）：wakeSkips 落 metrics 供会话停止后事后验证 F4c 生效（加法）。
+            metrics["aiStats"]["wakeSkips"] = self.wake_skips
+            # N5（hold-inertia-observability）：会话级全程最大连续观望——环形样本算不出全程最大值，
+            # 与 wakeSkips 同为会话级直取（非 _compute_ai_stats 样本口径）。
+            metrics["aiStats"]["maxHoldStreak"] = self.max_hold_streak
         except Exception as exc:  # noqa: BLE001 —— 富化对 finalize 是加法且可失败，绝不阻断落库收尾
             logger.warning("ai-trade finalize enrichment skipped for run %s: %s", self.run_id, exc)
             for key in ("equityDigest", "decisionsDigest", "aiStats"):
@@ -916,6 +1011,14 @@ class AiTradeSession:
 _DECISION_REASON_CHARS = 160        # decisionsDigest.reason 截断长度（剥离全文，只留近况提示）
 # actionCounts 的规范键（匹配 decision.action 枚举；cancel_order 为限价特性新增动作，M-7）。
 _ACTION_KEYS = ("open_long", "open_short", "close", "hold", "cancel_order")
+# 反思 fail-closed 的四个基础设施码（hold-inertia-fix F5/R-04）：与模型真实否决（reflection_abort）
+# 分流计数——否则一次 529 类过载抖动就会抬高否决率、污染 reflectionAborts/reflectionRuns 验收指标。
+# 注意：回测侧 backtest.reflection_aborts 历来是 abort+fail-closed 的**合计口径**且保持零改动；实盘
+# aiStats 用本处分流口径。两侧口径差有意保留，不得再引入第三种口径。
+# 前端 apps/web/lib/aiTradeObservability.ts 逐字镜像本口径（四码集合 + failClosed 判定独立于
+# verdict 存在性的分支位置），改动须双侧同步（hold-inertia-observability O3/R-2）。
+_REFLECTION_FAIL_CLOSED_REASONS = frozenset(
+    {"reflection_timeout", "reflection_llm_error", "reflection_no_tool", "reflection_invalid"})
 
 
 def _downsample_equity(records, cap: int) -> list[dict]:
@@ -962,11 +1065,17 @@ def _compute_ai_stats(records, rounds: int) -> dict:
     计数在**保留的 ≤50 条决策样本**上求（``_decisions`` 环形）；``decisionRounds`` 取会话真实完成轮数
     ``rounds``（可 > 样本量）。``actionCounts`` 键匹配 ``decision.action`` 实际枚举；``avgConfidence`` 跳过
     ``None``；``degradedRounds`` 计 ``degradeReason`` 非空条数（``_decisions`` 无布尔 ``degraded`` 字段）。绝不抛。
+
+    反思四计数（hold-inertia-fix F5，加法键）：``reflectionRuns`` 计 ``reflectionVerdict`` 非 None 样本；
+    ``reflectionAborts`` **只计模型真实否决**（verdict=="abort" 且 ``degradeReason=="reflection_abort"``）；
+    ``reflectionFailClosed`` 计四个基础设施码（R-04 分流——反思轮进入前 degrade 恒为 None，故样本上
+    二者可严格区分）；``reflectionConfirms`` 计 ``=="confirm"``。
     """
     decisions = list(records)
     counts = {k: 0 for k in _ACTION_KEYS}
     confidences: list[float] = []
     degraded = 0
+    reflection_runs = reflection_confirms = reflection_aborts = reflection_fail_closed = 0
     for d in decisions:
         action = d.get("action")
         if action in counts:
@@ -974,8 +1083,18 @@ def _compute_ai_stats(records, rounds: int) -> dict:
         conf = d.get("confidence")
         if isinstance(conf, (int, float)):
             confidences.append(float(conf))
-        if d.get("degradeReason"):
+        degrade_reason = d.get("degradeReason")
+        if degrade_reason:
             degraded += 1
+        verdict = d.get("reflectionVerdict")
+        if verdict is not None:
+            reflection_runs += 1
+            if verdict == "confirm":
+                reflection_confirms += 1
+            elif verdict == "abort" and degrade_reason == "reflection_abort":
+                reflection_aborts += 1
+        if degrade_reason in _REFLECTION_FAIL_CLOSED_REASONS:
+            reflection_fail_closed += 1
     sample = len(decisions)
     return {
         "decisionRounds": int(rounds),
@@ -983,4 +1102,8 @@ def _compute_ai_stats(records, rounds: int) -> dict:
         "holdRate": round(counts["hold"] / sample, 4) if sample else 0.0,
         "avgConfidence": round(sum(confidences) / len(confidences), 4) if confidences else 0.0,
         "degradedRounds": degraded,
+        "reflectionRuns": reflection_runs,
+        "reflectionConfirms": reflection_confirms,
+        "reflectionAborts": reflection_aborts,
+        "reflectionFailClosed": reflection_fail_closed,
     }

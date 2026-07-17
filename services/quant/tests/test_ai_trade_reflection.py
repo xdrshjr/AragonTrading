@@ -18,7 +18,7 @@ import pytest
 from app.agent.llm.base import StreamEvent
 from app.ai_auto.decider import AiTradeDecider, ReflectionVerdict, TradeDecision, _fail_closed
 from app.ai_auto.prompts import REFLECTION_TOOL_NAME, build_reflection_prompt
-from app.ai_auto.reflection import applied_shrink, apply_reflection
+from app.ai_auto.reflection import applied_shrink, apply_reflection, build_reflection_note
 from app.config import Settings
 
 
@@ -307,3 +307,55 @@ def test_reflection_shrink_market_decision_behavior_unchanged():
     assert out.ord_type == "market" and out.limit_px is None
     assert out.confidence == decision.confidence and out.reason == decision.reason
     assert degrade is None
+
+
+# ============================ F2 build_reflection_note（hold-inertia-fix §2.2）============================
+def test_note_none_when_verdict_missing_or_not_ran():
+    """直通分支：verdict=None（反思关闭/hold 轮）或 ran=False → None（journal 该键为 None）。"""
+    decision = _open_long(0.5)
+    assert build_reflection_note(decision, None, decision) is None
+    not_ran = ReflectionVerdict("confirm", None, None, "", None, ran=False)
+    assert build_reflection_note(decision, not_ran, decision) is None
+
+
+def test_note_records_vetoed_open_intent():
+    """否决轮：vetoed=True 且原提议（方向/仓位/置信度）与最终 hold 双双保真——「曾想开仓但被否决」
+    不再从记忆里蒸发（根因 ② 复现钉）。"""
+    original = _open_long(0.5)
+    verdict = ReflectionVerdict("abort", None, None, "顶背离追多风险高", None, ran=True)
+    final, _ = apply_reflection(original, None, verdict)
+    note = build_reflection_note(original, verdict, final)
+    assert note is not None
+    assert note["vetoed"] is True
+    assert note["failClosed"] is False               # 模型真实否决 ≠ 基础设施故障
+    assert note["verdict"] == "abort"
+    assert note["reason"] == "顶背离追多风险高"
+    assert note["proposedAction"] == "open_long"
+    assert abs(note["proposedSizeFraction"] - 0.5) < 1e-9
+    assert abs(note["proposedConfidence"] - 0.8) < 1e-9
+    assert note["finalAction"] == "hold"
+    assert note["finalSizeFraction"] is None
+
+
+def test_note_confirm_with_shrink_not_vetoed():
+    """收缩确认轮：动作未变 → vetoed=False，final 仓位记收缩后档位（proposed 保留原值）。"""
+    original = _open_long(0.5)
+    verdict = ReflectionVerdict("confirm", 0.2, None, "减仓更稳", None, ran=True)
+    final, _ = apply_reflection(original, None, verdict)
+    note = build_reflection_note(original, verdict, final)
+    assert note["vetoed"] is False
+    assert note["verdict"] == "confirm"
+    assert abs(note["proposedSizeFraction"] - 0.5) < 1e-9
+    assert abs(note["finalSizeFraction"] - 0.2) < 1e-9
+
+
+def test_note_fail_closed_flagged_distinct_from_model_abort():
+    """fail-closed 轮：vetoed=True 但 failClosed=True——摘要器须把系统故障保守跳过与模型真实否决
+    区分开（F3 head 指令依赖此位）。"""
+    original = _open_long(0.5)
+    verdict = _fail_closed("reflection_timeout")
+    final, _ = apply_reflection(original, None, verdict)
+    note = build_reflection_note(original, verdict, final)
+    assert note["vetoed"] is True
+    assert note["failClosed"] is True
+    assert note["finalAction"] == "hold"

@@ -183,6 +183,15 @@ class Settings(BaseSettings):
     ai_trade_wake_interval_default_min: float = 2.0    # 未显式传值时的默认唤醒周期（分钟）
     ai_trade_wake_interval_floor_s: float = 30.0       # 唤醒周期硬下限（秒），防高频 LLM 烧钱 / 抖动占比过大
     ai_trade_wake_interval_ceil_min: float = 240.0     # 唤醒周期硬上限（分钟，= 4h）
+    # 空仓重复唤醒跳过守卫（ai-trade-reflection-hold-inertia-fix F4c）：空仓+无挂单+无新确认根且价格
+    # 相对上一决策轮变动 < 此比例（fraction，0.0005=0.05%）时跳过定时唤醒——同一份行情数据反复决策只会
+    # 产出重复 hold 流水、强化观望惯性。0=完全关闭守卫（逐字回退现行为）；持仓/挂单轮永不跳过。
+    # env 名 AI_TRADE_WAKE_SKIP_UNCHANGED_PCT 已被 desktop config.js 的 AI_TRADE_ 前缀透传白名单覆盖。
+    ai_trade_wake_skip_unchanged_pct: float = Field(default=0.0005, ge=0.0)
+    # AI 自动交易连续观望自察阈值（hold-inertia-observability N1）：第一阶段连续真实观望（非降级轮）
+    # 达到该轮数后，决策 prompt 注入一条对称措辞的自察注记；0 = 完全关闭（prompt 逐字节回退现行为）。
+    # env 名 AI_TRADE_HOLD_STREAK_NOTE_AFTER 已被 desktop config.js 的 AI_TRADE_ 前缀透传白名单覆盖。
+    ai_trade_hold_streak_note_after: int = Field(default=10, ge=0)
     # ---- AI 自动交易 · 回测模式（ai-auto-trading-backtest §2.5，三重决策成本护栏）----
     # 回测每决策根调一次 LLM，成本/时长敏感；三重护栏：决策间隔（降频）+ 决策轮数硬上限（越界启动前
     # 拒绝，绝不静默截断）+ 并发闸（限同时消耗 LLM 的回测数）。字段名即环境变量名（AI_BACKTEST_*，

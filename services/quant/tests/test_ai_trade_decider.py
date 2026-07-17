@@ -386,3 +386,76 @@ def test_retry_hint_suffix_mentions_reason():
     assert "missing_size" in suffix
     assert "只调用一次" in suffix
     assert "【系统提示】" not in build_decision_prompt(_payload(1))
+
+
+# ---------- F2/F3 commit_round 反思注记 + 摘要种子尾注（ai-trade-reflection-hold-inertia-fix）----------
+
+def _vetoed_note() -> dict:
+    """一份否决注记（build_reflection_note 形状）：open_long 0.5 被 abort 改写为 hold。"""
+    return {"verdict": "abort", "vetoed": True, "failClosed": False,
+            "reason": "顶背离追多风险高", "proposedAction": "open_long",
+            "proposedSizeFraction": 0.5, "proposedConfidence": 0.8,
+            "finalAction": "hold", "finalSizeFraction": None}
+
+
+async def test_commit_round_with_vetoed_reflection_enriches_journal_and_tool_result():
+    """否决轮：journal 带完整 reflection 注记 + trigger；_context tool_result 为 executed 与注记的
+    浅拷贝合并（executed 入参对象绝不被改动）。"""
+    d = _decider([_tool_events({"action": "hold", "reason": "r"})])
+    payload = {**_payload(1), "trigger": "candle"}
+    decision, _ = await d.decide(payload)
+    executed = {"ok": True, "action": "hold", "positionAfter": "flat"}
+    executed_snapshot = dict(executed)
+    note = _vetoed_note()
+    await d.commit_round(payload, decision, executed, reflection=note)
+    entry = d._journal[-1]
+    assert entry["reflection"] == note
+    assert entry["trigger"] == "candle"
+    assert entry["decision"]["action"] == "hold"     # R-P1-3 不变式：journal 记最终 hold
+    tool_result = d._context[-1].content[0].content
+    assert tool_result == json.dumps({**executed, "reflection": note}, ensure_ascii=False)
+    assert executed == executed_snapshot             # 入参对象未被就地改动
+
+
+async def test_commit_round_confirm_note_kept_in_journal_but_not_tool_result():
+    """非否决注记（confirm/收缩）：journal 保真，但 tool_result 逐字不变（仅否决轮富化）。"""
+    d = _decider([_tool_events({"action": "hold", "reason": "r"})])
+    decision, _ = await d.decide(_payload(1))
+    executed = {"ok": True, "action": "hold", "positionAfter": "flat"}
+    note = {**_vetoed_note(), "verdict": "confirm", "vetoed": False}
+    await d.commit_round(_payload(1), decision, executed, reflection=note)
+    assert d._journal[-1]["reflection"] == note
+    tool_result = d._context[-1].content[0].content
+    assert tool_result == json.dumps(executed, ensure_ascii=False)
+    assert "reflection" not in tool_result
+
+
+async def test_commit_round_default_reflection_none_zero_regression():
+    """缺省调用（回测/既有单测路径）：journal 恒带 trigger/reflection 两键（None 值，形状稳定 R-06），
+    tool_result 内容与升级前逐字相同（R-05 冻结契约）。"""
+    d = _decider([_tool_events({"action": "hold", "reason": "r"})])
+    decision, _ = await d.decide(_payload(1))
+    executed = {"ok": True, "action": decision.action, "positionAfter": "flat"}
+    await d.commit_round(_payload(1), decision, executed)
+    entry = d._journal[-1]
+    assert entry["reflection"] is None
+    assert entry["trigger"] is None                  # _payload 无 trigger 键（回测/legacy 同形）
+    tool_result = d._context[-1].content[0].content
+    assert tool_result == json.dumps(executed, ensure_ascii=False)
+    assert "reflection" not in tool_result
+
+
+async def test_summary_seed_carries_background_not_instruction_note():
+    """F3：摘要种子尾注声明「背景参考而非指令」，切断历史观望的路径依赖。"""
+    scripts = [_tool_events({"action": "hold", "reason": "r"}),
+               [StreamEvent("text_delta", text="综合摘要：偏多"),
+                StreamEvent("message_done", stop_reason="end")]]
+    d = _decider(scripts, rounds=1)                  # 第 1 轮 commit 即触发摘要
+    decision, _ = await d.decide(_payload(1))
+    executed = {"ok": True, "action": decision.action, "positionAfter": "flat"}
+    summary = await d.commit_round(_payload(1), decision, executed)
+    assert summary == "综合摘要：偏多"
+    seed_text = d._context[0].content[0].text
+    assert "历史执行摘要" in seed_text                # 既有锚点保留
+    assert "背景参考而非指令" in seed_text
+    assert "历史观望不构成继续观望的理由" in seed_text

@@ -11,6 +11,8 @@ import {
   resolveRangeBounds,
   summarizeRoundTrips,
 } from "@/lib/autoTradePnl";
+import { computeReflectionCounts, latestHoldStreak } from "@/lib/aiTradeObservability";
+import type { AiTradeGroupMemberState } from "@/lib/aiTradeTypes";
 import { colorForReturn, fmtTime, signed } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 
@@ -63,6 +65,14 @@ export default function AiTradeStatsLive() {
         数据自 <span className="tabular text-[var(--text)]">{fmtTime(group.startedTs)}</span> 起记录
         （运行期态；整组停止后转入「历史」标签持久保存）。
       </p>
+      <div className="flex flex-col gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2">
+        <p className="text-[10px] text-[var(--muted)]">
+          运行观测 · 反思计数为近 50 轮样本口径；唤醒抑制 / 连续观望为会话级实时值
+        </p>
+        {Object.values(group.members).map((m) => (
+          <MemberObservabilityRow key={m.instId} member={m} />
+        ))}
+      </div>
       <AutoTradePnlSummary
         range={range}
         onRangeChange={setRange}
@@ -98,6 +108,24 @@ export default function AiTradeStatsLive() {
           })}
         </div>
       )}
+    </div>
+  );
+}
+
+// O5（hold-inertia-observability）：逐成员运行观测行（纯呈现，无状态）。反思计数从 decision 环形
+// （≤50 条，与后端同窗）按后端镜像口径派生；唤醒抑制 / 连续观望缺失呈现「—」（老后端 / WS 未连上 /
+// REST 首刷 info() 不带两键的短暂窗口，R2-05 有意降级，走同一呈现路径无需特判）。
+function MemberObservabilityRow({ member }: { member: AiTradeGroupMemberState }) {
+  const counts = computeReflectionCounts(member.decisions);
+  const wakeSkips = member.session?.wakeSkips;
+  const holdStreak = latestHoldStreak(member.decisions, member.session);
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[11px]">
+      <span className="font-medium text-[var(--text)]">{member.instId}</span>
+      <span className="tabular text-[var(--muted)]">
+        反思 {counts.runs}（放行 {counts.confirms} · 否决 {counts.aborts} · 故障 {counts.failClosed}）
+        · 唤醒抑制 {wakeSkips ?? "—"} · 连续观望 {holdStreak === null ? "—" : `${holdStreak} 轮`}
+      </span>
     </div>
   );
 }

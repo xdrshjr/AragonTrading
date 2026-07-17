@@ -55,6 +55,34 @@ def apply_reflection(decision: TradeDecision, degrade: str | None,
     return decision, degrade
 
 
+def build_reflection_note(original: TradeDecision, verdict: ReflectionVerdict | None,
+                          final: TradeDecision) -> dict | None:
+    """把本轮反思结果压成记忆注记（hold-inertia-fix F2，session/backtest 共用纯函数）。
+
+    否决把开仓候选改写成普通 hold 后，journal/摘要素材里「曾经想开仓但被否决」完全蒸发，摘要器
+    反而把长期空仓总结为「观望被验证正确」——本注记随 `commit_round(reflection=…)` 落 journal
+    （并在否决轮富化 tool_result），让摘要器与短窗口上下文都能看到被否决的原意图。
+
+    Args:
+        original: 反思前的提议决策（须在 `apply_reflection` 之前留存引用）。
+        verdict: 反思裁决；`None` 或 `ran=False`（关闭/未触发）→ 返回 `None`（journal 该键为 None）。
+        final: `apply_reflection` 后的最终决策。
+
+    Returns:
+        注记 dict 或 `None`。`failClosed=True` 表示基础设施故障（timeout/llm_error/no_tool/invalid）
+        的保守跳过而非模型真实否决——摘要器须区分（F3 head 指令）。
+    """
+    if verdict is None or not verdict.ran:
+        return None
+    return {"verdict": verdict.verdict,
+            "vetoed": final.action != original.action,   # 被否决（open_*/close → hold）
+            "failClosed": verdict.degrade_reason is not None,
+            "reason": verdict.reason,
+            "proposedAction": original.action, "proposedSizeFraction": original.size_fraction,
+            "proposedConfidence": original.confidence,
+            "finalAction": final.action, "finalSizeFraction": final.size_fraction}
+
+
 def applied_shrink(original: TradeDecision, final: TradeDecision) -> float | None:
     """反思实际生效的收缩后开仓仓位（仅 `open_*` 且严格变小时返回，否则 None；供轨迹展示实际档位）。"""
     if (final.action in _OPEN_ACTIONS and final.size_fraction is not None

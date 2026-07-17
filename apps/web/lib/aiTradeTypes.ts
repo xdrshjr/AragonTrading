@@ -165,6 +165,8 @@ export interface AiTradeDecision {
   // 下单前二次反思裁决（ai-trade-pre-trade-reflection §2.6）：无反思轮（hold / 关闭）为 null。
   reflectionVerdict?: "confirm" | "abort" | null;
   reflectionReason?: string | null;
+  // 截至本轮的连续真实观望轮数（hold-inertia-observability N5）；跳过轮事件 / 老后端无此键。
+  holdStreak?: number;
 }
 
 // 反思裁决枚举（与后端 ReflectionVerdict.verdict 镜像）。
@@ -274,6 +276,10 @@ export interface AiTradeSessionRow {
   contextSummary?: string | null;
   degraded?: boolean | null;
   wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭）
+  // hold-inertia-observability O2：唤醒守卫抑制计数 / 连续真实观望轮数（status/snapshot.status 经
+  // 全量 spread 合并进 member.session；REST info() 不带 → WS 连上前短暂 undefined，呈现「—」）。
+  wakeSkips?: number;
+  holdStreak?: number;
 }
 
 // WS status 事件负载（_status_payload / 轻量 status，会话视图的可增量合并子集）。
@@ -287,6 +293,9 @@ export interface AiTradeStatusEvent {
   roundsSinceSummary?: number;
   contextRefreshRounds?: number;
   wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭）
+  // hold-inertia-observability O2：第 1 轮后端已发 wakeSkips（本轮补齐类型）；holdStreak 为本轮新增。
+  wakeSkips?: number;
+  holdStreak?: number;
   degraded?: boolean;
   stopReason?: string | null;
   flattenFailed?: boolean;

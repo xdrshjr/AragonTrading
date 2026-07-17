@@ -46,7 +46,7 @@ from .multi_timeframe_context import (
     decision_timeframes,
 )
 from .prompts import build_ai_trade_system_prompt
-from .reflection import apply_reflection
+from .reflection import apply_reflection, build_reflection_note
 from .signals import (
     Consensus,
     StrategySignalView,
@@ -351,6 +351,8 @@ class AiBacktestRunner:
         # 预置 None（RV-3），否则 hold 轮走 else 分支时 _tally_reflection(verdict) 会 NameError。
         verdict = None
         reflect_reason = gate_reason
+        # F2（hold-inertia-fix）：apply_reflection 前留存 original 引用（decision 随后可能被改写为 hold）。
+        original = decision
         size_before = decision.size_fraction if decision.action in ("open_long", "open_short") else None
         if self.decider.reflection_enabled and decision.action != "hold":
             verdict = await self.decider.reflect(payload, decision)             # emit 缺省 None
@@ -361,7 +363,10 @@ class AiBacktestRunner:
         self._tally(decision, decide_degrade, gate_reason)
         self._tally_reflection(verdict, size_before, decision)   # verdict is None → 空转（不递增计数）
         # R-P1-3：commit_round 收门禁后的最终 decision，journal/摘要据此记真实动作（保持上下文纯净）。
-        summary = await self.decider.commit_round(payload, decision, executed)
+        # F2：反思注记随 journal 保真被否决意图（verdict None/未跑 → note=None，零回归）。
+        summary = await self.decider.commit_round(
+            payload, decision, executed,
+            reflection=build_reflection_note(original, verdict, decision))
         self._emit_decision(job, round_no, ts, decision, board, executed, payload,
                             decide_degrade or reflect_reason, verdict)
         if summary is not None:

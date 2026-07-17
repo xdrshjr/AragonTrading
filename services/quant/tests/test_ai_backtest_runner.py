@@ -432,3 +432,49 @@ async def test_reflection_disabled_default_no_calls_zero_counts(monkeypatch):
         assert len(job.result["trades"]) > 0           # 与旧行为一致：交易照常落地
     finally:
         await dispose_engine()
+
+
+async def test_reflection_vetoed_note_lands_in_backtest_journal(monkeypatch):
+    """F2（ai-trade-reflection-hold-inertia-fix）：回测反思否决轮 journal 保真被否决意图——
+    decision 记最终 hold（R-P1-3 不变式），reflection 注记带原提议动作；trigger=None（回测/legacy 同形）。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        llm = _ReflectStubLLM("abort")
+        _patch_loaders(monkeypatch, candles, llm)
+        # refresh=10 > 6 轮 → 全程不触发摘要，journal 不被清空，可直接断言全部 6 条。
+        runner = AiBacktestRunner(
+            _spec(sid, paper, candles, every=40, refresh=10, reflection_enabled=True))
+        job = _BacktestJob("aibt_reflect_note", runner)
+        await runner.run(job)
+        assert job.state == "completed"
+        journal = runner.decider._journal
+        assert len(journal) == 6
+        first = journal[0]                             # 首轮提议 open_long 被否决
+        assert first["decision"]["action"] == "hold"
+        note = first["reflection"]
+        assert note["vetoed"] is True and note["failClosed"] is False
+        assert note["proposedAction"] == "open_long"
+        assert note["finalAction"] == "hold"
+        assert first["trigger"] is None                # 回测 payload 无 trigger 键
+        assert all(e["reflection"]["vetoed"] is True for e in journal)   # 全轮意愿均被否决
+    finally:
+        await dispose_engine()
+
+
+async def test_reflection_disabled_backtest_journal_reflection_none(monkeypatch):
+    """零回归伴生：反思关闭时回测 journal 恒带 reflection/trigger 两键且值为 None（形状稳定 R-06）。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        llm = _ReflectStubLLM("abort")
+        _patch_loaders(monkeypatch, candles, llm)
+        runner = AiBacktestRunner(_spec(sid, paper, candles, every=40, refresh=10))  # 默认关
+        job = _BacktestJob("aibt_reflect_none", runner)
+        await runner.run(job)
+        assert job.state == "completed"
+        journal = runner.decider._journal
+        assert len(journal) == 6
+        assert all(e["reflection"] is None and e["trigger"] is None for e in journal)
+    finally:
+        await dispose_engine()
