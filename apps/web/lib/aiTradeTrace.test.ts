@@ -175,6 +175,33 @@ describe("applyAiTradeTracePhase", () => {
     expect(out[0].analysis).toBe("X"); // default: 原样返回，不误改
   });
 
+  it("base_rule 相位落 4 个字段（【基础策略】铁律门禁，§6.2 用例 28）", () => {
+    let t = applyAiTradeTracePhase([], ev("round_start", 1));
+    expect(t[0].baseRuleStatus).toBeNull();          // 未收到该相位前恒为初值
+    t = applyAiTradeTracePhase(
+      t,
+      ev("base_rule", 1, {
+        status: "veto",
+        zone: null,
+        pctB: 0.42,
+        reason: "base_rule_ma_band(pctB=0.42)",
+      }),
+    );
+    expect(t[0].baseRuleStatus).toBe("veto");
+    expect(t[0].baseRuleZone).toBeNull();
+    expect(t[0].baseRulePctB).toBe(0.42);
+    expect(t[0].baseRuleReason).toBe("base_rule_ma_band(pctB=0.42)");
+  });
+
+  it("base_rule 放行轮落 pass + 锚区，不影响其它累积", () => {
+    let t = applyAiTradeTracePhase([], ev("round_start", 1));
+    t = applyAiTradeTracePhase(t, ev("analysis", 1, { delta: "研判" }));
+    t = applyAiTradeTracePhase(t, ev("base_rule", 1, { status: "pass", zone: "mid", pctB: 0.5 }));
+    expect(t[0].baseRuleStatus).toBe("pass");
+    expect(t[0].baseRuleZone).toBe("mid");
+    expect(t[0].analysis).toBe("研判");
+  });
+
   it("环形容量：超过 20 轮裁最旧", () => {
     let t: AiTradeRoundTrace[] = [];
     for (let r = 1; r <= 25; r++) t = applyAiTradeTracePhase(t, ev("round_start", r));

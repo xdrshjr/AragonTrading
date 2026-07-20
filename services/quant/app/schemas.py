@@ -475,6 +475,27 @@ class AiTradeGroupMemberIn(BaseModel):
     allocationPct: float = Field(gt=0, le=100)
 
 
+class AiTradeMaBandRuleIn(BaseModel):
+    """【基础策略】MA 通道开单约束入参（ai-trade-base-strategy-ma-band §4.1）。
+
+    各数值字段留空 ⇒ 由服务端按 settings 回填（唯一默认真源在 config，不在此处硬编码）；越界即 422。
+    `enabled=false` 是用户在启动弹窗**手动关闭**该铁律的唯一途径。
+    """
+
+    enabled: bool = True
+    period: int | None = Field(default=None, ge=2, le=200)      # 中轨 SMA 周期
+    stdMult: float | None = Field(default=None, gt=0, le=5)     # 上下轨标准差倍数
+    # %B 锚区容差；0.25 = 三锚区首尾相接 ⇒ 退化为「仅限带内」，故锁死上界，不接受更大值。
+    tolerance: float | None = Field(default=None, gt=0, le=0.25)
+    directional: bool | None = None                             # 做多不追顶 / 做空不杀底（默认关）
+
+
+class AiTradeBaseRulesIn(BaseModel):
+    """【基础策略】铁律集合入参：本期只有一条预置规则；整个字段缺省 ⇒ 服务端按 settings 装配为开启态。"""
+
+    maBandEntry: AiTradeMaBandRuleIn | None = None
+
+
 class AiTradeGroupStartIn(BaseModel):
     """启动 AI 自动交易分组请求（金额/杠杆字段可留空→服务端保守默认，§4.1）。
 
@@ -503,6 +524,9 @@ class AiTradeGroupStartIn(BaseModel):
     # 仓位操作档位步长（fraction）：null/缺省→服务端默认；0→连续（仅 API/后端退出口，UI 不露出）。
     # 越界（>1 / <0）在入口即 422（与既有 leverage 同惯例）；服务端仅 None→默认回填，不复夹（[R-2]）。
     positionStepPct: float | None = Field(default=None, ge=0, le=1)
+    # 【基础策略】铁律（默认开启）：**字段缺省 ⇒ 开启**（老客户端不发该字段也默认开启，语义在 API 层
+    # `_resolve_base_rules` 单点解析）；`{"maBandEntry":{"enabled":false}}` ⇒ 该会话不装配。
+    baseRules: AiTradeBaseRulesIn | None = None
 
     @field_validator("members")
     @classmethod
@@ -539,6 +563,7 @@ class AiTradeGroupRow(BaseModel):
     createdTs: int
     members: list[AiTradeGroupMemberRow]
     wakeIntervalMinutes: float | None = None   # Agent 墙钟定时唤醒周期（分钟；null=关闭），契约镜像
+    baseRules: dict | None = None              # 【基础策略】铁律回执镜像（null=未装配）
 
 
 class AiTradeGroupStartOut(AiTradeGroupRow):
@@ -570,6 +595,9 @@ class AiBacktestStartIn(BaseModel):
     minConsensus: int | None = Field(default=None, ge=0)      # 共识门槛；留空→ai_trade_min_consensus
     # 仓位操作档位步长（fraction）：null/缺省→服务端默认；0→连续。越界即 422，服务端仅缺省回填（[R-2]）。
     positionStepPct: float | None = Field(default=None, ge=0, le=1)
+    # 【基础策略】铁律：与实盘同字段同语义、同一 `_resolve_base_rules` 解析——**实盘与回测的默认必须
+    # 一致**，否则用户用回测调出的参数在实盘直接失真（P1-4）。
+    baseRules: AiTradeBaseRulesIn | None = None
 
 
 class AiBacktestStartOut(BaseModel):

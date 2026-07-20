@@ -192,6 +192,20 @@ class Settings(BaseSettings):
     # 达到该轮数后，决策 prompt 注入一条对称措辞的自察注记；0 = 完全关闭（prompt 逐字节回退现行为）。
     # env 名 AI_TRADE_HOLD_STREAK_NOTE_AFTER 已被 desktop config.js 的 AI_TRADE_ 前缀透传白名单覆盖。
     ai_trade_hold_streak_note_after: int = Field(default=10, ge=0)
+    # ---- 【基础策略】铁律层（ai-trade-base-strategy-ma-band §5.3）----
+    # 与常规/组合/因子策略并列的第四种「策略类型」，但**不是**策略库里的行：它是信号板之外的硬约束层
+    # （宪章 prompt 软引导 + base_rules.py 确定性门禁硬保证），默认开启、可在启动弹窗关闭、优先级最高。
+    # 预置规则 ma_band_entry：开仓的**参考成交价**（限价判委托价）必须落在执行周期 MA 通道的上轨/中轨/
+    # 下轨任一锚区内，否则本轮开仓降级为 hold。总闸 False ⇒ 规则一律不装配、prompt 不注入、门禁不调用、
+    # 轨迹不发 ⇒ **逐字回退**到本特性合入前。env 名 AI_TRADE_BASE_RULE* 已在 desktop config.js prod 透传
+    # 白名单内（AI_TRADE_ 前缀），此处须真的声明——Settings extra="ignore" 会静默丢弃未声明的 env。
+    ai_trade_base_rules_enabled: bool = True     # 基础策略总闸；False 逐字回退
+    ai_trade_base_rule_ma_period: int = Field(default=20, ge=2, le=200)   # 中轨 SMA 周期
+    ai_trade_base_rule_ma_std_mult: float = Field(default=2.0, gt=0, le=5)  # 上下轨标准差倍数
+    # %B 锚区容差（「附近」的量纲自适应判据）；0.25 时三锚区首尾相接 ⇒ 退化为「仅限带内」，故锁死上界。
+    ai_trade_base_rule_band_tolerance: float = Field(default=0.15, gt=0, le=0.25)
+    # 方向性模式（做多不追顶 / 做空不杀底）默认关：开启会与突破/趋势跟随类策略正面冲突。
+    ai_trade_base_rule_directional: bool = False
     # ---- AI 自动交易 · 回测模式（ai-auto-trading-backtest §2.5，三重决策成本护栏）----
     # 回测每决策根调一次 LLM，成本/时长敏感；三重护栏：决策间隔（降频）+ 决策轮数硬上限（越界启动前
     # 拒绝，绝不静默截断）+ 并发闸（限同时消耗 LLM 的回测数）。字段名即环境变量名（AI_BACKTEST_*，

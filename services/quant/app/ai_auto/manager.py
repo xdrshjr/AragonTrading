@@ -36,6 +36,7 @@ from ..okx.order_builder import snap_size
 from ..okx.trading import fetch_live_open_orders, fetch_live_positions, fetch_trading_config
 from ..paper.strategy_factory import PaperStrategySpec
 from .admission import get_admission_lock
+from .base_rules import MaBandRule, format_charter, rule_wire
 from .decider import AiTradeDecider
 from .prompts import build_ai_trade_system_prompt
 from .session import AiTradeSession
@@ -121,6 +122,9 @@ class AiTradeGroupStartRequest:
     default_budget_frac: float = 0.01        # 留空默认分数（avail×该值），由 api 解析（默认 1%）
     position_step_pct: float = 0.0           # 仓位操作档位步长（fraction；0=连续，直接构造该 dataclass 的既有测试零回归）
     wake_interval_s: float = 0.0             # 墙钟定时唤醒周期（秒；0=关闭，直接构造该 dataclass 的既有测试零回归）
+    # 【基础策略】MA 通道开单铁律：默认 **None=不装配**（直接构造该 dataclass 的既有测试零回归，P1-5）。
+    # 「缺省即开启」的语义**只在 API 层解析**（`_resolve_base_rules`），绝不在此给开启默认值。
+    base_rule: MaBandRule | None = None
 
 
 @dataclass
@@ -148,6 +152,7 @@ class AiTradeGroup:
     created_ts: int
     members: list[AiTradeGroupMember]
     wake_interval_s: float = 0.0             # 墙钟定时唤醒周期（秒；0=关闭），group_status 回显换算为分钟
+    base_rule: MaBandRule | None = None      # 【基础策略】铁律（None=未装配），group_status 回显 baseRules
 
 
 @dataclass
@@ -352,7 +357,7 @@ class AiTradeManager:
             total_budget_usd=total, leverage=lever,
             context_refresh_rounds=req.context_refresh_rounds,
             created_ts=created_ts, members=members,
-            wake_interval_s=req.wake_interval_s)
+            wake_interval_s=req.wake_interval_s, base_rule=req.base_rule)
 
     async def _build_member(self, ctx: _GroupBuildCtx, plan: _MemberPlan) -> AiTradeGroupMember:
         """建单成员会话：Executor（按 budget_i）+ Decider + Run（含 groupId/allocationPct）+ Session。
@@ -376,7 +381,9 @@ class AiTradeManager:
                                          allow_limit=allow_limit,
                                          # F-3：价带文案与本地门禁同源（settings 唯一真源）
                                          limit_band_pct=req.settings
-                                         .ai_trade_limit_price_max_deviation_pct),
+                                         .ai_trade_limit_price_max_deviation_pct,
+                                         # 【基础策略】宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变
+                                         base_rules_text=format_charter(req.base_rule)),
             context_refresh_rounds=req.context_refresh_rounds, settings=req.settings,
             position_step_pct=req.position_step_pct,
             reflection_enabled=req.settings.ai_trade_reflection_enabled,   # 生产实盘显式开（默认 True）
@@ -387,7 +394,7 @@ class AiTradeManager:
             decider, take_profit_usd=tp_i, stop_loss_usd=sl_i,
             priming=req.priming, priming_bars=req.priming_bars,
             context_refresh_rounds=req.context_refresh_rounds,
-            wake_interval_s=req.wake_interval_s)
+            wake_interval_s=req.wake_interval_s, base_rule=req.base_rule)
         return AiTradeGroupMember(inst_id=plan.inst_id, allocation_pct=plan.allocation_pct,
                                   budget_usd=plan.budget_usd, session=session, run_id=run_id)
 
@@ -464,6 +471,7 @@ class AiTradeManager:
                 "contextRefreshRounds": group.context_refresh_rounds,
                 "wakeIntervalMinutes": (round(group.wake_interval_s / 60, 4)
                                         if group.wake_interval_s > 0 else None),
+                "baseRules": rule_wire(group.base_rule),   # 【基础策略】回执镜像（未装配→ null）
                 "createdTs": group.created_ts,
                 "members": [self._member_row(m) for m in group.members]}
 
@@ -594,7 +602,9 @@ class AiTradeManager:
                         "positionStepPct": req.position_step_pct,   # P2 观测：档位落 free-form config（零列迁移）
                         # 墙钟定时唤醒周期（分钟；关闭态存 None，与 group_status/info 回执口径一致，RN-7）。
                         "wakeIntervalMinutes": (round(req.wake_interval_s / 60, 4)
-                                                if req.wake_interval_s > 0 else None)},
+                                                if req.wake_interval_s > 0 else None),
+                        # 【基础策略】铁律配置随 config_json 落库（零列迁移，A-12；未装配存 None）。
+                        "baseRules": rule_wire(req.base_rule)},
                 status="running",
                 # ai-trade-stats-dashboard §3.2：填既有 group_* 列（零迁移），使 ai-trade run 可按组聚合
                 # 出历史会话；各成员冗余同值。组级秒级起点为 ctx.created_ts（P1-3；ctx 无 started_ts）。

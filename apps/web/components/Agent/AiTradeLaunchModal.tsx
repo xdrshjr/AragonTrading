@@ -12,6 +12,8 @@ import {
   validateBacktestRange,
 } from "@/lib/aiBacktest";
 import {
+  AI_TRADE_BAND_TOLERANCE_OPTIONS,
+  AI_TRADE_BASE_RULE_DEFAULTS,
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
   AI_TRADE_DEFAULT_POSITION_STEP,
   AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN,
@@ -45,6 +47,7 @@ import {
   parseOptionalPct,
   parseOptionalUsd,
 } from "@/lib/liveAuto";
+import type { AiTradeBaseRules, AiTradeMaBandRule } from "@/lib/aiTradeTypes";
 import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
 import { tradingApi } from "@/lib/tradingApi";
 import type { Bar } from "@/lib/types";
@@ -68,6 +71,9 @@ export interface AiTradeLaunchOpts {
   stopLossPct: number | null;      // E4：单仓 OCO 止损%（fraction，留空＝config 默认）
   takeProfitPct: number | null;    // E4：单仓 OCO 止盈%
   positionStepPct: number;         // 仓位操作档位步长（fraction；AI 每次开仓规模只能落在该档位阶梯上）
+  // 【基础策略】铁律（实盘/回测两 tab 同得，实盘与回测的默认必须一致，P1-4）：勾选 ⇒ 带完整参数；
+  // 取消勾选 ⇒ `{maBandEntry:{enabled:false}}`（**显式关闭**，与「字段缺省=默认开启」语义严格区分）。
+  baseRules: AiTradeBaseRules;
   contextRefreshRounds: number;
   // Agent 墙钟定时唤醒周期（分钟）：[RN-1] 声明为**可选**（对齐 backtest-only 可选字段），仅 live 分支透传、
   // base 不含、回测省略——若定为非可选，回测 onConfirm 不带该键将 tsc 编译失败。0/关闭 = 仅按 K 线与策略触发。
@@ -102,6 +108,7 @@ export default function AiTradeLaunchModal({
   defaultContextRounds,
   defaultPositionStepPct,
   defaultWakeIntervalMinutes,
+  defaultBaseRule,
   error,
   liveGateReason = null,
   defaultStartTs,
@@ -122,6 +129,7 @@ export default function AiTradeLaunchModal({
   defaultContextRounds: number;
   defaultPositionStepPct: number;     // 上次所选仓位操作档位（aiTradeConfig?.positionStepPct ?? 默认，回填弹窗）
   defaultWakeIntervalMinutes: number; // 上次所选 Agent 唤醒周期（aiTradeConfig?.wakeIntervalMinutes ?? 默认，回填弹窗）
+  defaultBaseRule: AiTradeMaBandRule; // 上次所选【基础策略】参数（aiTradeConfig?.baseRules ?? 默认，回填弹窗）
   error?: string | null;
   liveGateReason?: string | null;     // 实盘不可用原因（非 null → 段控禁用实盘、默认落回测，R6）
   defaultStartTs?: number;
@@ -148,6 +156,22 @@ export default function AiTradeLaunchModal({
   // Agent 墙钟定时唤醒周期（分钟，仅实盘段）：初值取 defaultWakeIntervalMinutes（用 ?? 保留 0=关闭偏好）。
   const [wakeIntervalRaw, setWakeIntervalRaw] = useState(
     String(defaultWakeIntervalMinutes ?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN),
+  );
+  // 【基础策略】铁律（默认开启；数值走 raw 串以免输入中途被 Number 归一，与既有金额输入同风格）。
+  const [baseRuleEnabled, setBaseRuleEnabled] = useState(
+    defaultBaseRule.enabled ?? AI_TRADE_BASE_RULE_DEFAULTS.enabled,
+  );
+  const [baseRulePeriodRaw, setBaseRulePeriodRaw] = useState(
+    String(defaultBaseRule.period ?? AI_TRADE_BASE_RULE_DEFAULTS.period),
+  );
+  const [baseRuleStdRaw, setBaseRuleStdRaw] = useState(
+    String(defaultBaseRule.stdMult ?? AI_TRADE_BASE_RULE_DEFAULTS.stdMult),
+  );
+  const [baseRuleTolerance, setBaseRuleTolerance] = useState(
+    defaultBaseRule.tolerance ?? AI_TRADE_BASE_RULE_DEFAULTS.tolerance,
+  );
+  const [baseRuleDirectional, setBaseRuleDirectional] = useState(
+    defaultBaseRule.directional ?? AI_TRADE_BASE_RULE_DEFAULTS.directional,
   );
   const [startInput, setStartInput] = useState("");
   const [endInput, setEndInput] = useState("");
@@ -193,6 +217,11 @@ export default function AiTradeLaunchModal({
     setRoundsRaw(String(defaultContextRounds || AI_TRADE_DEFAULT_CONTEXT_ROUNDS));
     setPositionStep(defaultPositionStepPct || AI_TRADE_DEFAULT_POSITION_STEP);
     setWakeIntervalRaw(String(defaultWakeIntervalMinutes ?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN));
+    setBaseRuleEnabled(defaultBaseRule.enabled ?? AI_TRADE_BASE_RULE_DEFAULTS.enabled);
+    setBaseRulePeriodRaw(String(defaultBaseRule.period ?? AI_TRADE_BASE_RULE_DEFAULTS.period));
+    setBaseRuleStdRaw(String(defaultBaseRule.stdMult ?? AI_TRADE_BASE_RULE_DEFAULTS.stdMult));
+    setBaseRuleTolerance(defaultBaseRule.tolerance ?? AI_TRADE_BASE_RULE_DEFAULTS.tolerance);
+    setBaseRuleDirectional(defaultBaseRule.directional ?? AI_TRADE_BASE_RULE_DEFAULTS.directional);
     setCapitalRaw("");
     setLeverageRaw("");
     setTakeProfitRaw("");
@@ -260,6 +289,28 @@ export default function AiTradeLaunchModal({
   const wakeMinutes = wakeIntervalRaw.trim() === "" ? null : Number(wakeIntervalRaw);
   const wakeError = validateWakeInterval(wakeMinutes);
 
+  // 【基础策略】参数（两模式共用；关闭勾选时不校验——关闭态提交体只含 enabled:false）。
+  const baseRulePeriod = Number.parseInt(baseRulePeriodRaw, 10);
+  const baseRuleStd = Number(baseRuleStdRaw);
+  const baseRuleError = !baseRuleEnabled
+    ? null
+    : !Number.isInteger(baseRulePeriod) || baseRulePeriod < 2 || baseRulePeriod > 200
+      ? "基础策略均线周期需为 2~200 的整数"
+      : !Number.isFinite(baseRuleStd) || baseRuleStd <= 0 || baseRuleStd > 5
+        ? "基础策略标准差倍数需在 (0, 5] 之间"
+        : null;
+  const baseRulesPayload: AiTradeBaseRules = {
+    maBandEntry: baseRuleEnabled
+      ? {
+          enabled: true,
+          period: baseRulePeriod,
+          stdMult: baseRuleStd,
+          tolerance: baseRuleTolerance,
+          directional: baseRuleDirectional,
+        }
+      : { enabled: false },
+  };
+
   // 成员校验（实盘）：非空、皆可自动交易、各 pct ∈ (0,100]，even 模式 Σ ≤ 100（避免提交即 422）。
   const sumPct = totalAllocation(members);
   const hasUnsupportedMember = members.some((m) => !isAutoTradable(m.instId));
@@ -319,7 +370,7 @@ export default function AiTradeLaunchModal({
   const budgetCap = groupBudgetCap(availUsdt, maxBudgetPct);
 
   const usingDefault = capital.value == null;
-  const baseValid = !inputError && !strategyError && !roundsError;
+  const baseValid = !inputError && !strategyError && !roundsError && !baseRuleError;
   const ready =
     mode === "live"
       ? baseValid && !membersError && !wakeError && acknowledged
@@ -336,6 +387,7 @@ export default function AiTradeLaunchModal({
       stopLossPct: stopLossPct.value,
       takeProfitPct: takeProfitPct.value,
       positionStepPct: positionStep,                // 仓位操作档位（实盘/回测两 tab 同得）
+      baseRules: baseRulesPayload,                  // 【基础策略】铁律（实盘/回测同源，P1-4）
       contextRefreshRounds: roundsValue,
       bar,                                          // 可编辑周期真正生效（不再被 store.bar 覆盖）
     };
@@ -364,6 +416,7 @@ export default function AiTradeLaunchModal({
     strategyError ||
     roundsError ||
     inputError ||
+    baseRuleError ||
     (mode === "live"
       ? membersError || wakeError
       : instSupported
@@ -431,6 +484,94 @@ export default function AiTradeLaunchModal({
             ))}
           </Select>
         </label>
+
+        {/* 【基础策略】铁律区块（ai-trade-base-strategy-ma-band §三）：刻意置于「交易策略」清单**之上**
+            ——它不是策略库里的第四个条目，而是凌驾于所选全部策略之上的开单纪律。默认勾选，可取消。 */}
+        <div className="flex flex-col gap-1.5 rounded-md border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_5%,transparent)] px-3 py-2">
+          <label className="flex cursor-pointer items-start gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={baseRuleEnabled}
+              disabled={submitting}
+              onChange={(e) => setBaseRuleEnabled(e.target.checked)}
+              className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[var(--accent)]"
+              aria-label="基础策略（铁律 · 默认开启）"
+            />
+            <span className="flex flex-col gap-0.5">
+              <span className="font-medium text-[var(--text)]">基础策略（铁律 · 默认开启）</span>
+              <span className="text-[11px] leading-relaxed text-[var(--muted)]">
+                <strong className="text-[var(--text)]">MA 通道开单约束</strong>：无论选了哪些交易策略，
+                开多 / 开空只允许在所选时间级别 MA 通道的
+                <strong className="text-[var(--text)]">上轨、中轨或下轨附近</strong>发生，
+                不满足即由系统直接降级为观望（限价委托按<strong className="text-[var(--text)]">委托价</strong>判定）。
+                平仓与撤单不受限制。
+              </span>
+            </span>
+          </label>
+          {baseRuleEnabled && (
+            <details className="text-[11px] text-[var(--muted)]">
+              <summary className="cursor-pointer select-none text-[var(--accent)]">高级参数</summary>
+              <div className="mt-1.5 flex flex-col gap-1.5">
+                <div className="flex items-center gap-2">
+                  <label className="flex flex-1 items-center gap-1.5">
+                    <span className="shrink-0">均线周期</span>
+                    <input
+                      type="text"
+                      inputMode="numeric"
+                      value={baseRulePeriodRaw}
+                      disabled={submitting}
+                      onChange={(e) => setBaseRulePeriodRaw(e.target.value)}
+                      aria-label="基础策略均线周期"
+                      className="w-full rounded border border-[var(--border)] bg-[var(--bg)] px-1.5 py-1 text-right text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] disabled:opacity-50"
+                    />
+                  </label>
+                  <label className="flex flex-1 items-center gap-1.5">
+                    <span className="shrink-0">带宽倍数 σ</span>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      value={baseRuleStdRaw}
+                      disabled={submitting}
+                      onChange={(e) => setBaseRuleStdRaw(e.target.value)}
+                      aria-label="基础策略带宽倍数"
+                      className="w-full rounded border border-[var(--border)] bg-[var(--bg)] px-1.5 py-1 text-right text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] disabled:opacity-50"
+                    />
+                  </label>
+                </div>
+                <label className="flex flex-col gap-1">
+                  <span>「附近」的容差（带宽归一，跨周期同义）</span>
+                  <Select
+                    value={String(baseRuleTolerance)}
+                    disabled={submitting}
+                    onChange={(e) => setBaseRuleTolerance(Number(e.target.value))}
+                    className="text-xs"
+                    aria-label="基础策略容差"
+                  >
+                    {AI_TRADE_BAND_TOLERANCE_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </Select>
+                </label>
+                <label className="flex cursor-pointer items-start gap-2">
+                  <input
+                    type="checkbox"
+                    checked={baseRuleDirectional}
+                    disabled={submitting}
+                    onChange={(e) => setBaseRuleDirectional(e.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[var(--accent)]"
+                    aria-label="基础策略方向性模式"
+                  />
+                  <span className="leading-relaxed">
+                    方向性（做多只许下轨 / 中轨，做空只许上轨 / 中轨）——
+                    <strong className="text-[var(--text)]">保守模式，趋势突破类策略慎用</strong>。
+                  </span>
+                </label>
+              </div>
+            </details>
+          )}
+        </div>
 
         {/* 多选策略清单（≥1、≤上限，两模式共用）。 */}
         <div className="flex flex-col gap-1 text-[11px] text-[var(--muted)]">

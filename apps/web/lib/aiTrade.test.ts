@@ -6,8 +6,10 @@ import {
   clampBudgetToCap,
   deriveDefaultBudget,
   describeAiAction,
+  describeBaseRule,
   describeCandidateLevel,
   describeConsensus,
+  describeDegradeReason,
   describeExecuted,
   describeFactors,
   describeOrderType,
@@ -467,5 +469,65 @@ describe("describeTrigger (R1, trigger reason derived from signalBoard)", () => 
         ],
       }),
     ).toEqual({ label: "信号分歧 · 2开多/1开空", tone: "accent" });
+  });
+});
+
+
+// ---------- 【基础策略】铁律中文化（ai-trade-base-strategy-ma-band §6.2 用例 26/27）----------
+describe("describeBaseRule", () => {
+  it("放行轮给出锚区名 + muted 常态着色", () => {
+    expect(describeBaseRule({ baseRuleStatus: "pass", baseRuleZone: "mid" })).toEqual({
+      label: "基础策略 · 中轨锚区 · 放行",
+      tone: "muted",
+    });
+    expect(describeBaseRule({ baseRuleStatus: "pass", baseRuleZone: "lower" })?.label).toBe(
+      "基础策略 · 下轨锚区 · 放行",
+    );
+  });
+
+  it("否决 / 数据不足两态均为红（静默的保守会被用户当成故障）", () => {
+    expect(describeBaseRule({ baseRuleStatus: "veto", baseRuleZone: null })).toEqual({
+      label: "基础策略否决 · 观望",
+      tone: "short",
+    });
+    expect(describeBaseRule({ baseRuleStatus: "unavailable", baseRuleZone: null })).toEqual({
+      label: "基础策略 · 数据不足 · 观望",
+      tone: "short",
+    });
+  });
+
+  it("规则未装配（无 baseRuleStatus）→ null，组件整段不渲染", () => {
+    expect(describeBaseRule({})).toBeNull();
+    expect(describeBaseRule({ baseRuleStatus: null, baseRuleZone: null })).toBeNull();
+  });
+});
+
+describe("describeDegradeReason", () => {
+  it("命中三个基础策略码 → 中文说明（保留括号内参数供排查）", () => {
+    expect(describeDegradeReason("base_rule_ma_band(pctB=0.42)")).toBe(
+      "基础策略否决：开单价不在均线通道上/中/下轨附近(pctB=0.42)",
+    );
+    expect(describeDegradeReason("base_rule_ma_band_direction(zone=upper)")).toBe(
+      "基础策略否决：方向与所处均线锚区不符(zone=upper)",
+    );
+    expect(describeDegradeReason("base_rule_band_unavailable")).toBe(
+      "基础策略否决：均线通道数据不足，无法验证开单位置",
+    );
+  });
+
+  it("未命中一律原样回退（既有 low_consensus / decision_timeout 展示逐字不变，P1-9）", () => {
+    expect(describeDegradeReason("low_consensus(1/2)")).toBe("low_consensus(1/2)");
+    expect(describeDegradeReason("decision_timeout")).toBe("decision_timeout");
+    expect(describeDegradeReason(null)).toBe("");
+    expect(describeDegradeReason(undefined)).toBe("");
+  });
+
+  it("describeExecuted 经其渲染：既有码逐字不变，新码中文化", () => {
+    expect(describeExecuted("hold", null, "low_consensus(1/2)").label).toBe(
+      "已降级观望（low_consensus(1/2)）",
+    );
+    expect(describeExecuted("hold", null, "base_rule_band_unavailable").label).toContain(
+      "基础策略否决",
+    );
   });
 });

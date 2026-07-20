@@ -30,6 +30,7 @@ from ..okx.types import BAR_SECONDS, Candle
 from ..okx.ws_client import OKXWSClient
 from ..paper.strategy_factory import PaperStrategySpec
 from ..strategies.base import Signal
+from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, gate_status
 from .decider import AiTradeDecider, TradeDecision
 from .market_context import build_market_context
 from .market_digest import build_market_digest
@@ -50,6 +51,7 @@ from .signals import (
 from .trace import (
     _TRACES_MAX,
     TraceEmit,
+    base_rule_event,
     new_round_trace,
     reflection_start_event,
     reflection_verdict_event,
@@ -65,6 +67,9 @@ _EQUITY_DIGEST_MAX = 500
 # 研判思维链有界摘录长度（ai-trade-reasoning-chain §2.5，RC-2/RC-3）：进 journal（摘要素材）与 decision
 # 事件（_decisions 环形 + WS snapshot 重放）的一律为此摘录；完整全文只走 agent_trace 流与 _traces(≤20)。
 _ANALYSIS_EXCERPT_CHARS = 400
+# 【基础策略】通道连续不可用告警阈值（ai-trade-base-strategy-ma-band §2.6/P0-4）：连续这么多轮算不出
+# 通道即追发一条 error 事件，使「为什么一直不开单」在 UI 上自解释——静默的保守 = 用户眼中的故障。
+_BAND_UNAVAILABLE_ALERT_ROUNDS = 3
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +86,8 @@ class AiTradeSession:
                  inst_id: str, bar: str, executor: LiveExecutor, decider: AiTradeDecider, *,
                  take_profit_usd: float | None = None, stop_loss_usd: float | None = None,
                  priming: bool = True, priming_bars: int = 300,
-                 context_refresh_rounds: int = 10, wake_interval_s: float = 0.0):
+                 context_refresh_rounds: int = 10, wake_interval_s: float = 0.0,
+                 base_rule: MaBandRule | None = None):
         self.session_id = session_id
         self.run_id = run_id
         self._specs = specs
@@ -99,6 +105,11 @@ class AiTradeSession:
         # 墙钟定时唤醒周期（秒；0=关闭）。默认 0 → 定时唤醒关闭，既有直接构造会话的单测行为逐字不变
         # （与 position_step_pct=0.0 同零回归范式，仅经启动请求显式开启）。
         self.wake_interval_s = wake_interval_s
+        # 【基础策略】MA 通道开单铁律（ai-trade-base-strategy-ma-band §2.5）。默认 None=不装配 ⇒ payload
+        # 不带 baseRules 键、prompt 逐字节不变、门禁直通、轨迹零条（既有直接构造会话的单测零回归）；
+        # 生产装配由 manager 从 API 层解析结果显式传入（默认开启只在 API 层解析，P1-5）。
+        self.base_rule = base_rule
+        self._band_unavailable_streak = 0     # 连续通道不可用轮数（§2.6 告警升级）
 
         self.state = "running"
         self.stop_reason: str | None = None
@@ -485,6 +496,11 @@ class AiTradeSession:
             # N2（hold-inertia-observability）：以第一阶段原始输出立即更新连续观望计数——须在共识门禁
             # 与反思之前（此时的 decision/degrade 正是第一阶段输出，惯性以模型真实意愿为准）。
             self._update_hold_streak(decision.action, degrade)
+            # ★【基础策略】铁律门禁（ai-trade-base-strategy-ma-band §2.5）：必须落在 decide **之后**
+            # （重试循环只认 _map_decision 的 degrade，落进去会每轮白烧 LLM，P1-1）、共识门禁与反思
+            # **之前**（被否轮此时已是 hold，反思对 hold 本就直通 ⇒ 自动零 LLM 成本，P1-2）。
+            decision, degrade = await self._apply_base_rule_gate(
+                round_no, ts, payload, decision, degrade)
             decision, degrade = self._apply_consensus_gate(decision, consensus, degrade)  # E2 门禁
             # 二次反思（ReAct 复核，仅交易意愿触发；只会更保守）——共识门禁后、真实执行前。
             # F2（hold-inertia-fix）：第三元 reflection_note 保真「提议了什么、为何被否决」。
@@ -666,6 +682,44 @@ class AiTradeSession:
             self._round_trace["state"] = "error"
         await self._push(trace_event("error", round_no, ts, message=message))
 
+    async def _apply_base_rule_gate(self, round_no: int, ts: int, payload: dict,
+                                    decision: TradeDecision, degrade: str | None
+                                    ) -> tuple[TradeDecision, str | None]:
+        """薄封装 `base_rules.apply_ma_band_gate`（§2.5）：未装配 ⇒ 原样直通、零轨迹、零副作用。
+
+        判定价与通道均取自本轮 payload（与喂给 prompt 的逐字同源）；铁律优先级最高，故与共识门禁并存时
+        由 `degrade or reason` 的**先执行者胜出**语义报告铁律的原因。
+        """
+        if self.base_rule is None:
+            return decision, degrade
+        band = (payload.get("baseRules") or {}).get("maBand")
+        decision, reason = apply_ma_band_gate(decision, band, self.base_rule,
+                                              last_px=payload.get("lastPx"))
+        await self._emit_base_rule_trace(round_no, ts, band, reason)
+        return decision, (degrade or reason)
+
+    async def _emit_base_rule_trace(self, round_no: int, ts: int, band: dict | None,
+                                    reason: str | None) -> None:
+        """base_rule 轨迹段 + 连续不可用告警升级（§2.6/§2.9）；仅规则装配时被调用。"""
+        status = gate_status(band, reason)
+        trace = self._round_trace
+        if trace is not None:
+            trace["baseRuleStatus"] = status
+            trace["baseRuleZone"] = (band or {}).get("zone")
+            trace["baseRulePctB"] = (band or {}).get("pctB")
+            trace["baseRuleReason"] = reason
+        await self._push(base_rule_event(round_no, ts, band, status, reason))
+        if band is not None:
+            self._band_unavailable_streak = 0
+            return
+        self._band_unavailable_streak += 1
+        if self._band_unavailable_streak == _BAND_UNAVAILABLE_ALERT_ROUNDS:
+            await self._push({"type": "error", "data": {
+                "ts": ts, "code": "AI_TRADE_BASE_RULE_UNAVAILABLE",
+                "message": (f"基础策略的 MA 通道已连续 {self._band_unavailable_streak} 轮无法计算"
+                            f"（需至少 {self.base_rule.period + 1} 根 K 线），期间开仓一律降级观望；"
+                            "平仓与撤单不受影响")}})
+
     def _apply_consensus_gate(self, decision: TradeDecision, consensus: Consensus,
                               degrade: str | None) -> tuple[TradeDecision, str | None]:
         """薄封装 `signals.apply_consensus_gate`（§2.8/R1）：传 `settings.ai_trade_min_consensus`。
@@ -804,6 +858,11 @@ class AiTradeSession:
         threshold = self.executor.settings.ai_trade_hold_streak_note_after
         if threshold > 0 and self.hold_streak >= threshold:
             payload["holdStreak"] = self.hold_streak
+        # 【基础策略】通道快照（§2.2/§4.2）：规则未装配 ⇒ **整键缺席**（不是 None）⇒ prompt 渲染与
+        # 回测 payload 逐字节回退。band 每轮现算现用，与 lastPx / marketDigest 同一份因果窗口。
+        if self.base_rule is not None:
+            payload["baseRules"] = {
+                "maBand": build_ma_band(self._window.base_df(), self.base_rule)}
         return payload
 
     def _build_multi_timeframe_context(self, ts: int, ref_px: float) -> dict | None:

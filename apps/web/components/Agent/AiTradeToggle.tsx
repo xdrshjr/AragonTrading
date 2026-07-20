@@ -8,6 +8,7 @@ import { agentApi } from "@/lib/agentApi";
 import { aiBacktestApi } from "@/lib/aiBacktestApi";
 import { aiTradeApi } from "@/lib/aiTradeApi";
 import {
+  AI_TRADE_BASE_RULE_DEFAULTS,
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
   AI_TRADE_DEFAULT_POSITION_STEP,
   AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN,
@@ -95,6 +96,7 @@ export default function AiTradeToggle() {
         takeProfitPct: opts.takeProfitPct,   // E4：单仓 OCO 止盈%
         positionStepPct: opts.positionStepPct,   // 仓位操作档位（透传，服务端默认回填/量化）
         wakeIntervalMinutes: opts.wakeIntervalMinutes,   // Agent 墙钟定时唤醒周期（透传，服务端默认回填/夹紧）
+        baseRules: opts.baseRules,               // 【基础策略】铁律（透传；取消勾选即 enabled:false）
         contextRefreshRounds: opts.contextRefreshRounds,
       }),
     onSuccess: (res, opts) => {
@@ -107,6 +109,8 @@ export default function AiTradeToggle() {
         contextRefreshRounds: res.contextRefreshRounds,
         positionStepPct: opts.positionStepPct,
         wakeIntervalMinutes: opts.wakeIntervalMinutes ?? undefined,
+        // [R-4] 同理：res 不回显完整规则参数，取 opts 才能让所选铁律参数真正持久（回执只镜像装配态）。
+        baseRules: opts.baseRules.maBandEntry ?? undefined,
       });
       setModalOpen(false);
       setError(null);
@@ -133,6 +137,7 @@ export default function AiTradeToggle() {
         contextRefreshRounds: opts.contextRefreshRounds,
         minConsensus: opts.minConsensus ?? null,
         positionStepPct: opts.positionStepPct,   // 回测同享档位约束（决策脑单点收口，实盘/回测同生效）
+        baseRules: opts.baseRules,               // 回测同享铁律（P1-4：默认必须与实盘一致，否则调参失真）
       }),
     onSuccess: (res, opts) => {
       setAiBacktestJobId(res.jobId);
@@ -212,6 +217,7 @@ export default function AiTradeToggle() {
         defaultContextRounds={aiTradeConfig?.contextRefreshRounds ?? AI_TRADE_DEFAULT_CONTEXT_ROUNDS}
         defaultPositionStepPct={aiTradeConfig?.positionStepPct ?? AI_TRADE_DEFAULT_POSITION_STEP}
         defaultWakeIntervalMinutes={aiTradeConfig?.wakeIntervalMinutes ?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN}
+        defaultBaseRule={aiTradeConfig?.baseRules ?? AI_TRADE_BASE_RULE_DEFAULTS}
         error={error}
         liveGateReason={liveGateReason}
         defaultStartTs={backtestStartTs}

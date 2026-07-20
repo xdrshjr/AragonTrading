@@ -4,7 +4,9 @@ import { useState } from "react";
 import {
   type AiTraceTone,
   describeAiAction,
+  describeBaseRule,
   describeConsensus,
+  describeDegradeReason,
   describeExecuted,
   describeFactors,
   describeCandidateLevel,
@@ -169,6 +171,49 @@ function DecisionToolCard({ trace }: { trace: AiTradeRoundTrace }) {
         <pre className="overflow-x-auto whitespace-pre-wrap break-all border-t border-[var(--border)] bg-[var(--surface-2)] px-2.5 py-2 text-[10px] leading-relaxed text-[var(--muted)]">
           {JSON.stringify(call, null, 2)}
         </pre>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 【基础策略】铁律段（ai-trade-base-strategy-ma-band §2.9）：置于决策工具卡与二次反思之间——铁律先于
+ * 反思执行，卡片顺序即管线顺序。三态徽标 + 通道断面（上/中/下轨 + %B）；否决轮另给一行人话理由。
+ * 规则未装配的会话 `baseRuleStatus` 恒为空 ⇒ 整段不渲染（老会话与老快照零影响）。
+ */
+function BaseRuleBlock({ trace }: { trace: AiTradeRoundTrace }) {
+  const view = describeBaseRule(trace);
+  if (!view) return null;
+  const hasBand = trace.baseRulePctB != null;
+  return (
+    <div className="flex flex-col gap-1.5 rounded-[10px] border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] px-2.5 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1 text-[11px] font-medium text-[var(--text)]">
+          <span className="leading-none">📏</span>基础策略（MA 通道开单铁律）
+        </span>
+        <span
+          className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+          style={{ color: TONE_VAR[view.tone], backgroundColor: toneSoft(view.tone) }}
+        >
+          {view.label}
+        </span>
+      </div>
+      {hasBand ? (
+        <p className="text-[10px] leading-relaxed text-[var(--muted)]">
+          通道内位置 %B={fmtNum(trace.baseRulePctB, 2)}
+          {trace.baseRuleZone ? "（0=下轨 / 0.5=中轨 / 1=上轨）" : " · 不在任何锚区附近"}
+        </p>
+      ) : (
+        <p className="text-[10px] leading-relaxed text-[var(--muted)]">
+          通道数据不足，本轮开仓一律降级观望；平仓与撤单不受影响。
+        </p>
+      )}
+      {trace.baseRuleReason && (
+        // P1-9：降级码经 describeDegradeReason 中文化后再展示（与 describeExecuted 同一真源），
+        // 否则用户在此看到的是裸 `base_rule_ma_band(pctB=0.42)`，与本段「人话理由」的职责相悖。
+        <p className="text-[11px] leading-relaxed text-[var(--text)]">
+          {describeDegradeReason(trace.baseRuleReason)}
+        </p>
       )}
     </div>
   );
@@ -356,6 +401,7 @@ export default function AiTradeTraceRound({ trace }: { trace: AiTradeRoundTrace 
       <RetryBreadcrumb trace={trace} />
       <AnalysisBlock trace={trace} />
       <DecisionToolCard trace={trace} />
+      <BaseRuleBlock trace={trace} />
       <ReflectionBlock trace={trace} />
       <ResultRow trace={trace} />
       <SignalContext trace={trace} />

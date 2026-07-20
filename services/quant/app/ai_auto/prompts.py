@@ -57,7 +57,8 @@ def _limit_tool_description_suffix(band_pct: float) -> str:
 def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
                                  leverage: float, position_step_pct: float = 0.0,
                                  allow_limit: bool = False,
-                                 limit_band_pct: float = 0.02) -> str:
+                                 limit_band_pct: float = 0.02,
+                                 base_rules_text: str = "") -> str:
     """决策者系统 prompt：信号仅供参考 + 分步思维链纪律 + 风险偏好 + 只用真数据 + 收尾必调决策工具。
 
     `position_step_pct`（默认 0.0 → 连续、原文逐字不变、零回归）：当 `>0` 时把决策纪律 #3 的
@@ -71,7 +72,12 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
     `limit_band_pct`（末位，默认 0.02）：价带比例文案（F-3）。签名默认**只是零回归垫片**（保证既有
     直连调用逐字不变），运行时唯一真源恒为 `settings.ai_trade_limit_price_max_deviation_pct`——
     生产调用点（manager 装配）显式传参；`allow_limit=False` 路径不消费该参数。
+
+    `base_rules_text`（末位，默认 `""` → 渲染逐字节不变、零回归，ai-trade-base-strategy-ma-band P1-3）：
+    【基础策略】铁律章（`base_rules.format_charter` 产物）。非空时插在「首要原则」之后、「决策纪律」
+    之前——**位置本身就是优先级声明**：信号可被推翻，铁律不可违反。
     """
+    charter = f"{base_rules_text}\n\n" if base_rules_text else ""
     return (
         "你是一名严谨、纪律性极强的加密合约自动交易决策者。你不是聊天助手，也不是信号复读机——你的"
         f"**唯一职责**是在每个决策轮，为标的 {inst_id}（周期 {bar}）做出一个受严格约束的交易决策。"
@@ -80,6 +86,7 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
         "决策的参考与触发线索，不是必须执行的确定性指令**。它们可能正确，也可能错误、滞后或相互矛盾。"
         "你的职责不是复述或跟随它们，而是**像一名资深交易员那样，独立地、一步一步地综合研判所有证据后"
         "自己下判断**——你有权采纳、存疑或**推翻**任何单一信号。\n\n"
+        f"{charter}"
         "决策纪律：\n"
         "1. **每轮必须先输出一段分步骤的研判（思维链）**。输入提供可用多周期证据时，先按 "
         "1D → 12H → 4H → 1H 研判中线背景、趋势一致性、候选支撑阻力与超买/超卖，再依次思考："
@@ -344,6 +351,19 @@ def _format_hold_streak(hold_streak) -> str:
             "具体证据（不得以「此前观望被验证正确」作为理由）。")
 
 
+def _format_base_rules(base_rules: dict | None) -> str:
+    """【基础策略】铁律的每轮只读上下文段（ai-trade-base-strategy-ma-band §2.7 (b)）。
+
+    `payload["baseRules"]` **键缺失**（规则未装配 / 回测自建 payload 不带）⇒ 返回空串 ⇒ 整段省略 ⇒
+    既有决策 prompt 冻结断言与回测 payload 逐字节不变。渲染委托 `base_rules.format_band_for_prompt`
+    ——通道、判据、文案三者共用同一真源，杜绝「UI 说合规、门禁判否决」的信任崩塌。
+    """
+    if not base_rules:
+        return ""
+    from .base_rules import format_band_for_prompt   # 延迟导入打破 base_rules→decider→prompts 循环
+    return format_band_for_prompt(base_rules.get("maBand"))
+
+
 def build_decision_prompt(payload: dict) -> str:
     """把本轮决策输入（体制/共识 + 信号板 + 真实持仓 + 会话盈亏 + 摘要）压成紧凑文本喂决策器。
 
@@ -381,6 +401,9 @@ def build_decision_prompt(payload: dict) -> str:
                  _format_factors(digest.get("factors"))):
         if line:
             parts.append(line)
+    base_rules_line = _format_base_rules(payload.get("baseRules"))
+    if base_rules_line:                      # 键缺失时整段省略（零回归；规则未装配 / 回测老 payload）
+        parts.append(base_rules_line)
     parts += [
         "策略信号板（仅供参考的触发线索，请逐条批判研判，可推翻）：",
         _format_board(payload.get("signalBoard") or []),

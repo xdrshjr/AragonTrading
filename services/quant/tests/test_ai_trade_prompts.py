@@ -372,3 +372,34 @@ def test_summary_material_folds_repeated_interval_holds():
     assert '"rounds": "1-5"' in text
     for r in range(1, 6):
         assert f'"round": {r},' not in text                     # 独立轮条目已被折叠
+
+
+# ---------- 【基础策略】prompt 零回归冻结（ai-trade-base-strategy-ma-band §6.1 用例 18/19）----------
+def test_system_prompt_byte_identical_without_base_rules():
+    """不传 `base_rules_text`（默认空垫片）⇒ 系统 prompt 与传空串**逐字节相等**（P1-3 零回归）。"""
+    baseline = build_ai_trade_system_prompt("BTC-USDT-SWAP", "1H", 100.0, 3.0)
+    assert baseline == build_ai_trade_system_prompt(
+        "BTC-USDT-SWAP", "1H", 100.0, 3.0, base_rules_text="")
+    assert "最高优先级铁律" not in baseline
+
+
+def test_system_prompt_injects_charter_between_principle_and_discipline():
+    """非空铁律章插在「首要原则」之后、「决策纪律」之前——位置本身就是优先级声明。"""
+    from app.ai_auto.base_rules import MaBandRule, format_charter
+
+    text = build_ai_trade_system_prompt("BTC-USDT-SWAP", "1H", 100.0, 3.0,
+                                        base_rules_text=format_charter(MaBandRule()))
+    assert text.index("首要原则") < text.index("最高优先级铁律") < text.index("决策纪律：")
+
+
+def test_decision_prompt_unchanged_without_base_rules_key():
+    """payload 无 `baseRules` 键 ⇒ 决策 prompt 渲染逐字节不变（回测老 payload / 规则未装配）。"""
+    payload = _payload_with_digest()
+    baseline = build_decision_prompt(payload)
+    assert "基础策略" not in baseline
+    with_band = build_decision_prompt({**payload, "baseRules": {"maBand": {
+        "ruleId": "ma_band_entry", "period": 20, "stdMult": 2.0, "tolerance": 0.15,
+        "upper": 200.0, "mid": 150.0, "lower": 100.0, "bandWidthPct": 66.67,
+        "pctB": 0.5, "zone": "mid", "directional": False}}})
+    assert "基础策略 · MA 通道开单约束（铁律）" in with_band
+    assert "允许开仓" in with_band and "合规开单价区间" in with_band

@@ -53,6 +53,26 @@ export const AI_TRADE_POSITION_STEP_OPTIONS: { value: number; label: string }[] 
   { value: 1, label: "每次全仓（100%）" },
 ];
 
+// ---- 【基础策略】铁律层（ai-trade-base-strategy-ma-band §三 前端）----
+// 与后端 ai_trade_base_rule_* 默认值对齐；弹窗初值与所有读点的兜底真源（[R-7] 偏好键为可选）。
+export const AI_TRADE_BASE_RULE_DEFAULTS: {
+  enabled: boolean;
+  period: number;
+  stdMult: number;
+  tolerance: number;
+  directional: boolean;
+} = { enabled: true, period: 20, stdMult: 2, tolerance: 0.15, directional: false };
+
+// 「附近」的容差档位（%B 带宽归一，跨周期同义）。0.25 是**退化点**——三锚区首尾相接后规则等价于
+// 「只要在带内即可开单」，故文案直书「仅限带内（最宽松）」，且后端锁死上界不接受更大值（R-4）。
+export const AI_TRADE_BAND_TOLERANCE_OPTIONS: { value: number; label: string }[] = [
+  { value: 0.05, label: "极严（贴轨 ±5% 带宽）" },
+  { value: 0.1, label: "严格（±10% 带宽）" },
+  { value: 0.15, label: "标准（默认，±15% 带宽）" },
+  { value: 0.2, label: "宽松（±20% 带宽）" },
+  { value: 0.25, label: "仅限带内（最宽松）" },
+];
+
 const AI_TRADE_STEP_EPS = 1e-9;
 
 /**
@@ -348,6 +368,54 @@ export function describeTraceState(trace: {
   return { label: "已决策", tone: "muted" };
 }
 
+// 降级原因的中文前缀映射（ai-trade-base-strategy-ma-band P1-9）：键为**码前缀**，因为基础策略的码带
+// 参数后缀（`base_rule_ma_band(pctB=0.42)`，与既有 `low_consensus(k/n)` 同风格）。
+const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
+  { prefix: "base_rule_ma_band_direction", label: "基础策略否决：方向与所处均线锚区不符" },
+  { prefix: "base_rule_band_unavailable", label: "基础策略否决：均线通道数据不足，无法验证开单位置" },
+  { prefix: "base_rule_ma_band", label: "基础策略否决：开单价不在均线通道上/中/下轨附近" },
+];
+
+/**
+ * 降级原因中文化（P1-9）：裸英文码会直接怼到用户脸上，而基础策略是**高频**触发项（震荡市里大多数轮
+ * 都可能被否）。命中前缀 → 中文说明（保留原始括号内参数供排查）；**未命中一律原样回退**——既有
+ * `low_consensus(1/2)` / `decision_timeout` 等断言与展示逐字不变。
+ */
+export function describeDegradeReason(reason?: string | null): string {
+  if (!reason) return "";
+  const hit = DEGRADE_REASON_LABELS.find((item) => reason.startsWith(item.prefix));
+  if (!hit) return reason;
+  const suffix = reason.slice(hit.prefix.length);
+  return suffix ? `${hit.label}${suffix}` : hit.label;
+}
+
+export interface AiBaseRuleView {
+  label: string; // 基础策略 · 中轨锚区 · 放行 / 基础策略否决 · 观望 / 基础策略 · 数据不足 · 观望
+  tone: AiTraceTone;
+}
+
+const BASE_RULE_ZONE_LABEL: Record<string, string> = {
+  lower: "下轨",
+  mid: "中轨",
+  upper: "上轨",
+};
+
+/**
+ * 【基础策略】铁律判定中文化（ai-trade-base-strategy-ma-band §2.9 单点）：三态标签 + tone。
+ * 放行 → muted（常态，不抢眼）；否决 / 数据不足 → short（红，须显眼——静默的保守会被用户当成故障）。
+ * 未装配（`baseRuleStatus` 为空）→ null（组件整段不渲染，老会话与老快照零影响）。
+ */
+export function describeBaseRule(
+  trace: Pick<AiTradeRoundTrace, "baseRuleStatus" | "baseRuleZone">,
+): AiBaseRuleView | null {
+  const status = trace.baseRuleStatus;
+  if (!status) return null;
+  if (status === "unavailable") return { label: "基础策略 · 数据不足 · 观望", tone: "short" };
+  if (status === "veto") return { label: "基础策略否决 · 观望", tone: "short" };
+  const zone = BASE_RULE_ZONE_LABEL[trace.baseRuleZone ?? ""];
+  return { label: zone ? `基础策略 · ${zone}锚区 · 放行` : "基础策略 · 放行", tone: "muted" };
+}
+
 export interface AiExecutedView {
   label: string;    // 已成交 / 已跳过 / 已降级观望（reason） / 观望
   tone: AiExecTone; // 净立场着色（long/short/muted）
@@ -363,7 +431,8 @@ export function describeExecuted(
   degradeReason?: string | null,
 ): AiExecutedView {
   if (executed?.skipped) return { label: "已跳过", tone: "muted" };
-  if (degradeReason) return { label: `已降级观望（${degradeReason}）`, tone: "short" };
+  // P1-9：经 describeDegradeReason 渲染（未命中原样回退 ⇒ 既有 `low_consensus(1/2)` 展示逐字不变）。
+  if (degradeReason) return { label: `已降级观望（${describeDegradeReason(degradeReason)}）`, tone: "short" };
   if (executed?.traded) {
     const tone: AiExecTone =
       action === "open_long" ? "long" : action === "open_short" ? "short" : "muted";

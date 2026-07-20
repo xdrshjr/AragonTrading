@@ -360,3 +360,85 @@ async def test_second_start_rejected_by_session_limit(monkeypatch):
         get_ai_trade_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()
+
+
+# ---------- 【基础策略】默认开启语义（ai-trade-base-strategy-ma-band §6.1 用例 21~24 / P1-5）----------
+async def test_base_rules_default_on_when_field_absent(monkeypatch):
+    """请求不带 `baseRules`（含桌面旧包 / 老客户端）⇒ 按 settings 装配为**开启**态，回执如实镜像。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(strategy_id))
+            assert r.status_code == 200, r.text
+            assert r.json()["baseRules"] == {"maBandEntry": {
+                "enabled": True, "period": 20, "stdMult": 2.0,
+                "tolerance": 0.15, "directional": False}}
+            rule = get_ai_trade_manager()._group.base_rule
+            assert rule is not None and rule.enabled and rule.period == 20
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_explicit_disable_turns_rule_off(monkeypatch):
+    """启动弹窗取消勾选 ⇒ `{"maBandEntry":{"enabled":false}}` ⇒ 该会话不装配、回执 baseRules 为 null。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, baseRules={"maBandEntry": {"enabled": False}}))
+            assert r.status_code == 200, r.text
+            assert r.json()["baseRules"] is None
+            assert get_ai_trade_manager()._group.base_rule is None
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_master_switch_off_never_assembles(monkeypatch):
+    """运维总闸关 ⇒ 即便请求显式开启也恒不装配（逐字回退到本特性合入前）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        live_trading_enabled=True, ai_trade_enabled=True, ai_trade_base_rules_enabled=False)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, baseRules={"maBandEntry": {"enabled": True, "tolerance": 0.1}}))
+            assert r.status_code == 200, r.text
+            assert r.json()["baseRules"] is None
+            assert get_ai_trade_manager()._group.base_rule is None
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_out_of_range_tolerance_returns_422(monkeypatch):
+    """容差越界（>0.25，规则会退化为形同虚设）在入口即 422（与既有 leverage 同惯例）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, baseRules={"maBandEntry": {"enabled": True, "tolerance": 0.4}}))
+            assert r.status_code == 422, r.text
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()

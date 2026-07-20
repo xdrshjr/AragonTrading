@@ -459,3 +459,19 @@ async def test_summary_seed_carries_background_not_instruction_note():
     assert "历史执行摘要" in seed_text                # 既有锚点保留
     assert "背景参考而非指令" in seed_text
     assert "历史观望不构成继续观望的理由" in seed_text
+
+
+# ---------- 【基础策略】降级码冻结（ai-trade-base-strategy-ma-band §6.1 用例 17 / P1-1）----------
+def test_base_rule_reasons_are_not_retryable():
+    """三个 `base_rule_*` 码是**确定性终态**，绝不可进入重试白名单。
+
+    同一轮内价格与 MA 通道都是常量，重试必然被同样否决——每次重试白烧一次 LLM 调用与最多 60s 超时
+    预算。这条断言是「门禁必须落在 `decide()` 之后」这一架构决策的回归防线（R-5）。
+    """
+    from app.ai_auto.decider import _RETRYABLE_DEGRADE_REASONS, _is_retryable_degrade
+
+    codes = {"base_rule_ma_band", "base_rule_ma_band_direction", "base_rule_band_unavailable"}
+    assert codes & _RETRYABLE_DEGRADE_REASONS == set()
+    assert not _is_retryable_degrade("base_rule_ma_band(pctB=0.4)")
+    assert not _is_retryable_degrade("base_rule_ma_band_direction(zone=upper)")
+    assert not _is_retryable_degrade("base_rule_band_unavailable")

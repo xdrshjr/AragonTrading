@@ -70,6 +70,11 @@ _ANALYSIS_MAX_CHARS = 4000
 # ai-trade-limit-orders §2.6：三个限价类降级原因同属「LLM 的瞬时失误」——重试一次极可能给出合理价，
 # 比直接降级 hold 更有价值，故一并归入可重试集合（R-15：门禁必须在 _map_decision 内，重试循环只认
 # 它返回的 degrade）。
+# ⚠️ ai-trade-base-strategy-ma-band P1-1：`base_rule_*` 三个码（`base_rule_ma_band(...)` /
+# `base_rule_ma_band_direction(...)` / `base_rule_band_unavailable`）为**确定性终态**，严禁加入本集合
+# ——同一轮内价格与 MA 通道都是常量，重试必然被同样否决，每次重试白烧一次 LLM 调用与最多 60s 超时
+# 预算。基础策略门禁因此刻意落在 `decide()` **之后**（session/backtest 调 base_rules 纯核心），
+# 而不是 `_map_decision` 内。冻结断言见 tests/test_ai_trade_decider.py。
 _RETRYABLE_DEGRADE_REASONS = frozenset(
     {"decision_timeout", "llm_error", "no_tool_call", "invalid_action", "missing_size",
      "missing_limit_price", "limit_price_out_of_band", "invalid_order_type"})

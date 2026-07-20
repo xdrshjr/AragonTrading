@@ -38,6 +38,7 @@ from ..paper.strategy_factory import PaperStrategySpec
 from ..strategies.base import Signal
 from ..agent.services import load_htf_frames, load_range_candles
 from .backtest_frames import build_backtest_frames
+from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, format_charter
 from .decider import AiTradeDecider, TradeDecision
 from .market_context import build_market_context
 from .market_digest import build_market_digest
@@ -94,6 +95,9 @@ class AiBacktestSpec:
     provider: object            # LlmProviderConfig（造决策 LLMClient 用）
     position_step_pct: float = 0.0   # 仓位操作档位步长（fraction；0=连续，直接构造该 dataclass 的既有测试零回归）
     reflection_enabled: bool = False   # 下单前二次反思（默认关 → 直接构造该 dataclass 的既有回测测试零回归，RV-1）
+    # 【基础策略】MA 通道开单铁律（ai-trade-base-strategy-ma-band §2.8/P1-4）：与实盘**共用同一纯核心**，
+    # 严禁在本文件复制一份判定逻辑。默认 None=不装配 ⇒ payload 与 prompt 逐字节回退（既有回测测试零回归）。
+    base_rule: MaBandRule | None = None
 
 
 # ============================ 线格式序列化助手（纯函数） ============================
@@ -164,6 +168,9 @@ class AiBacktestRunner:
         # 下单前二次反思（RV-1：经数据类字段传参，__init__ 一次性构造决策器时接收；默认关 → 直接构造
         # AiBacktestSpec/Runner 且用默认 Settings 的既有回测测试零回归，不平白多一次未脚本化反思调用）。
         self.reflection_enabled = spec.reflection_enabled
+        # 【基础策略】铁律：回测与实盘**同源生效**（P1-4）——否则 AI 回测会系统性地比实盘更容易开仓，
+        # 用户据此调出的参数在实盘直接失真。规则来源与实盘同一个 `_resolve_base_rules`。
+        self.base_rule = spec.base_rule
 
         self.warmup = _compute_warmup(self.specs, spec.settings.ai_trade_regime_context)
         # allow_limit 恒 False（ai-trade-limit-orders §2.10，Non-goal）：`SimBroker._pending` 是「次根
@@ -174,7 +181,9 @@ class AiBacktestRunner:
             make_llm_client_from_config(spec.provider),
             build_ai_trade_system_prompt(self.inst_id, self.bar, self.initial_capital, self.leverage,
                                          position_step_pct=self.position_step_pct,
-                                         allow_limit=False),
+                                         allow_limit=False,
+                                         # 铁律宪章同源注入；未装配 → "" ⇒ 渲染逐字节不变
+                                         base_rules_text=format_charter(self.base_rule)),
             context_refresh_rounds=self.context_refresh_rounds, settings=self.settings,
             position_step_pct=self.position_step_pct, reflection_enabled=self.reflection_enabled,
             allow_limit=False)
@@ -346,7 +355,13 @@ class AiBacktestRunner:
         payload = self._build_payload(
             round_no, ts, ref_px, main_df, context_frames, i, board, consensus)
         decision, decide_degrade = await self.decider.decide(payload)          # 唯一 async（LLM）
-        decision, gate_reason = apply_consensus_gate(decision, consensus, self.min_consensus)
+        # 【基础策略】铁律门禁（§2.8/P1-4）：与实盘同一纯核心、同一判定价、同一降级码，且同样排在共识
+        # 门禁与反思**之前**（被否轮已是 hold ⇒ 下方反思分支天然跳过，零多余 LLM 调用）。
+        decision, base_reason = apply_ma_band_gate(
+            decision, (payload.get("baseRules") or {}).get("maBand"), self.base_rule,
+            last_px=ref_px)
+        decision, consensus_reason = apply_consensus_gate(decision, consensus, self.min_consensus)
+        gate_reason = base_reason or consensus_reason   # 铁律优先级最高：并存时报告铁律的原因
         # 二次反思（决策脑不变式：回测复用同一 decider.reflect，emit=None 轨迹全程空转）。verdict 须在分支外
         # 预置 None（RV-3），否则 hold 轮走 else 分支时 _tally_reflection(verdict) 会 NameError。
         verdict = None
@@ -402,7 +417,7 @@ class AiBacktestRunner:
                        context_frames: dict[str, pd.DataFrame], i: int,
                        board: list[StrategySignalView], consensus: Consensus) -> dict:
         session_pnl = self.main.equity_at(ref_px) - self.initial_capital
-        return {
+        payload = {
             "round": round_no, "barTs": ts, "lastPx": ref_px,
             "position": self._position_payload(ref_px),
             "sessionPnlUsd": round(session_pnl, 4), "budgetUsd": self.initial_capital,
@@ -414,6 +429,12 @@ class AiBacktestRunner:
                 context_frames, ts, ref_px),
             "consensus": _consensus_wire(consensus),
             "signalBoard": [_view_full(v) for v in board]}
+        # 【基础策略】通道快照：未装配 ⇒ **整键缺席**（prompt 逐字节回退）；band 取回测帧到当前根的
+        # 因果切片 iloc[:i+1]，与 marketContext/marketDigest 同一取数姿态（绝不引入未来根）。
+        if self.base_rule is not None:
+            payload["baseRules"] = {
+                "maBand": build_ma_band(main_df.iloc[:i + 1], self.base_rule)}
+        return payload
 
     def _build_multi_timeframe_context(
         self,

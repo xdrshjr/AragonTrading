@@ -150,6 +150,34 @@ describe("AiTradeToggle", () => {
     );
   });
 
+  // 【基础策略】铁律（ai-trade-base-strategy-ma-band §6.2 用例 30）：start 请求体携 baseRules，
+  // 成功后取自 opts 写入 aiTradeConfig（回执只镜像装配态，不回显完整参数，[R-4] 同理）。
+  it("sends baseRules in the start body and persists the rule to aiTradeConfig", async () => {
+    vi.mocked(api.strategies).mockResolvedValue([{ id: 1, name: "均线策略" }] as never);
+    const groupRow: AiTradeGroupRow = {
+      groupId: "grp-1", bar: "1H", strategyIds: [1], strategyNames: ["均线策略"],
+      totalBudgetUsd: 100, leverage: 3, contextRefreshRounds: 10, createdTs: 0,
+      members: [], wakeIntervalMinutes: 2,
+      baseRules: { maBandEntry: { enabled: true } },
+    };
+    vi.mocked(aiTradeApi.start).mockResolvedValue(groupRow);
+    useAppStore.setState({ aiTradeAcknowledged: true });
+    renderToggle();
+    await screen.findByTitle("开启 AI 自动交易 / 回测");
+    fireEvent.click(screen.getByRole("switch"));
+    await screen.findByText("均线策略");
+    const confirm = await screen.findByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    await waitFor(() => expect(aiTradeApi.start).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(aiTradeApi.start).mock.calls[0][0].baseRules).toEqual({
+      maBandEntry: { enabled: true, period: 20, stdMult: 2, tolerance: 0.15, directional: false },
+    });
+    await waitFor(() =>
+      expect(useAppStore.getState().aiTradeConfig?.baseRules?.enabled).toBe(true),
+    );
+  });
+
   it("stops the whole group when toggled off while running", async () => {
     useAppStore.setState({ aiTradeGroup: makeGroup() });
     vi.mocked(aiTradeApi.stopGroup).mockResolvedValue({

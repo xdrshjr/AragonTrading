@@ -22,6 +22,7 @@ from ..engine.mtf import bar_to_seconds
 from ..okx.rest_client import get_rest_client
 from ..paper.strategy_factory import PaperStrategySpec
 from .backtest import AiBacktestRunner, AiBacktestSpec, _BacktestJob
+from .base_rules import MaBandRule
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,9 @@ class AiBacktestStartRequest:
     stop_loss_usd: float | None = None
     min_consensus: int | None = None
     position_step_pct: float = 0.0     # 仓位操作档位步长（fraction；0=连续，直接构造该 dataclass 的既有测试零回归）
+    # 【基础策略】MA 通道开单铁律（默认 None=不装配，直接构造该 dataclass 的既有测试零回归）；
+    # 「缺省即开启」由 API 层 `_resolve_base_rules` 单点解析，与实盘同一函数、同一默认（P1-4/P1-5）。
+    base_rule: MaBandRule | None = None
 
 
 class AiBacktestManager:
@@ -128,7 +132,8 @@ class AiBacktestManager:
                            else settings.ai_trade_min_consensus),
             planned_rounds=planned, settings=settings, rest=get_rest_client(), provider=provider,
             position_step_pct=req.position_step_pct,
-            reflection_enabled=settings.ai_trade_reflection_enabled)   # RV-1：生产回测显式开（默认 True）
+            reflection_enabled=settings.ai_trade_reflection_enabled,   # RV-1：生产回测显式开（默认 True）
+            base_rule=req.base_rule)                                   # 【基础策略】与实盘同源（P1-4）
 
     # ---------- 前置门禁辅助 ----------
     @staticmethod

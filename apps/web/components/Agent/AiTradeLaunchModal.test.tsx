@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AI_TRADE_BASE_RULE_DEFAULTS } from "@/lib/aiTrade";
 import { autoTradeSettingsApi } from "@/lib/autoTradeSettingsApi";
 import { tradingApi } from "@/lib/tradingApi";
 import AiTradeLaunchModal, { type AiTradeLaunchOpts } from "./AiTradeLaunchModal";
@@ -37,6 +38,7 @@ function renderModal(props: Partial<React.ComponentProps<typeof AiTradeLaunchMod
         acknowledged
         onAcknowledge={vi.fn()}
         bar="1H"
+        defaultBaseRule={AI_TRADE_BASE_RULE_DEFAULTS}
         defaultMembers={[]}
         defaultAllocationMode="even"
         defaultInstId="BTC-USDT-SWAP"
@@ -92,6 +94,67 @@ describe("AiTradeLaunchModal", () => {
     expect(opts.instId).toBe("BTC-USDT-SWAP");
     expect(opts.bar).toBe("1H");
     expect(opts.contextRefreshRounds).toBe(10);
+  });
+
+  // ---------- 【基础策略】铁律区块（ai-trade-base-strategy-ma-band §6.2 用例 29）----------
+  it("默认勾选基础策略，提交体带完整规则参数", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    const box = screen.getByRole("checkbox", { name: "基础策略（铁律 · 默认开启）" });
+    expect(box).toBeChecked();
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.baseRules).toEqual({
+      maBandEntry: { enabled: true, period: 20, stdMult: 2, tolerance: 0.15, directional: false },
+    });
+  });
+
+  it("取消勾选后提交体为显式 enabled:false（与「字段缺省=默认开启」严格区分）", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.click(screen.getByRole("checkbox", { name: "基础策略（铁律 · 默认开启）" }));
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.baseRules).toEqual({ maBandEntry: { enabled: false } });
+  });
+
+  it("高级参数回填上次所选并可编辑，越界周期即时报错并禁用确认", async () => {
+    const { onConfirm } = renderModal({
+      defaultStrategyIds: [1],
+      defaultBaseRule: { enabled: true, period: 30, stdMult: 2.5, tolerance: 0.05, directional: true },
+    });
+    await screen.findByText("均线策略");
+    const period = screen.getByLabelText("基础策略均线周期") as HTMLInputElement;
+    expect(period.value).toBe("30");
+    expect(screen.getByLabelText("基础策略方向性模式")).toBeChecked();
+
+    fireEvent.change(period, { target: { value: "1" } });
+    expect(screen.getByText("基础策略均线周期需为 2~200 的整数")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
+
+    fireEvent.change(period, { target: { value: "40" } });
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.baseRules.maBandEntry).toEqual({
+      enabled: true, period: 40, stdMult: 2.5, tolerance: 0.05, directional: true,
+    });
+  });
+
+  it("[R-7] 父树重渲染不冲掉正在编辑的基础策略参数（seed effect 依赖仍为 [open]）", async () => {
+    const { rerender } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    const period = screen.getByLabelText("基础策略均线周期") as HTMLInputElement;
+    fireEvent.change(period, { target: { value: "55" } });
+    rerender({ defaultStrategyIds: [1] });          // 新引用的 default 数组，模拟父树每秒重渲染
+    await waitFor(() =>
+      expect((screen.getByLabelText("基础策略均线周期") as HTMLInputElement).value).toBe("55"),
+    );
   });
 
   it("auto-fills the member list from defaultMembers", async () => {

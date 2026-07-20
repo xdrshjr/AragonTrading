@@ -21,9 +21,10 @@ if TYPE_CHECKING:                       # 仅类型标注用，运行期不导�
 # 轨迹阶段常量（前后端镜像；session 按此织入，前端 reducer 按此归约）。
 # retry：可重试失败降级前的重试面包屑（ai-trade-decision-llm-retry §4.4），前端据此重置本轮累积。
 # reflection_*：下单前二次反思三阶段（ai-trade-pre-trade-reflection §2.6），仅交易意愿轮出现。
+# base_rule：【基础策略】铁律门禁段（ai-trade-base-strategy-ma-band §2.9），**仅在规则装配时**每轮一条。
 PHASES = ("round_start", "thinking", "analysis", "tool_call_start",
           "tool_call", "result", "summary", "error", "retry",
-          "reflection_start", "reflection", "reflection_verdict")
+          "reflection_start", "reflection", "reflection_verdict", "base_rule")
 
 # 合并冲刷阈值：累计 ≥48 字符 / 相变 / 工具起始 / 收尾 即冲刷一条 delta（轮间隔以分钟计，量级极低）。
 _TRACE_FLUSH_CHARS = 48
@@ -106,6 +107,9 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         # 下单前二次反思（ai-trade-pre-trade-reflection §5.2）：仅交易意愿轮被写入，hold/关闭轮维持初值。
         "reflection": "", "reflectionPending": False,
         "reflectionVerdict": None, "reflectionReason": None, "reflectionAdjustedSize": None,
+        # 【基础策略】铁律门禁（ai-trade-base-strategy-ma-band §2.9）：规则未装配的会话恒为初值。
+        "baseRuleStatus": None, "baseRuleZone": None,
+        "baseRulePctB": None, "baseRuleReason": None,
         "state": "deciding",
     }
 
@@ -129,3 +133,18 @@ def reflection_verdict_event(round_no: int, ts: int, verdict: "ReflectionVerdict
     """reflection_verdict：反思裁决（confirm/abort）+ 实际收缩后仓位（若有）+ 理由。"""
     return trace_event("reflection_verdict", round_no, ts, verdict=verdict.verdict,
                        adjustedSizeFraction=adjusted_size_fraction, reason=verdict.reason)
+
+
+# ---------- 【基础策略】铁律门禁轨迹装配（ai-trade-base-strategy-ma-band §2.9）----------
+def base_rule_event(round_no: int, ts: int, band: dict | None,
+                    status: str, reason: str | None = None) -> dict:
+    """base_rule：本轮铁律判定（pass/veto/unavailable）+ 通道断面 + 降级原因。
+
+    静默的保守会被用户当成故障（`ai-trade-reflection-hold-inertia` 是本仓库的前科），故**每轮**都发一条
+    ——通道位置与放行 / 否决必须在 UI 上自解释。`band is None` 时三条通道线为 None（不假数据）。
+    """
+    band = band or {}
+    return trace_event("base_rule", round_no, ts, status=status,
+                       zone=band.get("zone"), pctB=band.get("pctB"),
+                       upper=band.get("upper"), mid=band.get("mid"),
+                       lower=band.get("lower"), reason=reason)

@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 
 import pytest
 
 from app.agent.llm.base import StreamEvent
+from app.ai_auto.base_rules import MaBandRule
 from app.ai_auto.decider import AiTradeDecider
 from app.ai_auto.prompts import REFLECTION_TOOL_NAME
 from app.ai_auto.session import AiTradeSession
@@ -66,7 +68,8 @@ def _candle(idx: int, price: float = 30000.0) -> Candle:
 
 
 def _make_session(*, action="hold", size=0.5, run_id=1, stop_loss_usd=None,
-                  pos_state=None, context_rounds=10, priming=False, settings=None):
+                  pos_state=None, context_rounds=10, priming=False, settings=None,
+                  base_rule=None):
     settings = settings or Settings()
     pos_state = pos_state if pos_state is not None else {"flat": False, "upl": 0.0}
     calls = {"orders": [], "closes": []}
@@ -98,7 +101,8 @@ def _make_session(*, action="hold", size=0.5, run_id=1, stop_loss_usd=None,
     spec = PaperStrategySpec(1, "S", "atomic", _StubStrategy({}), {})
     session = AiTradeSession("aitrade_test", run_id, [spec], "BTC-USDT-SWAP", "1H", executor,
                              decider, stop_loss_usd=stop_loss_usd, priming=priming,
-                             priming_bars=10, context_refresh_rounds=context_rounds)
+                             priming_bars=10, context_refresh_rounds=context_rounds,
+                             base_rule=base_rule)
 
     async def no_htf_data(*_args, **_kwargs):
         return []
@@ -390,7 +394,7 @@ class _ReflectStubLLM:
 
 
 def _make_reflect_session(*, action="open_long", size=0.5, verdict="confirm",
-                          adjusted=None, run_id=1, allow_limit=False):
+                          adjusted=None, run_id=1, allow_limit=False, base_rule=None):
     """构造一个**打开反思**的会话（decider reflection_enabled=True，桩 LLM 区分决策/反思流）。
 
     `allow_limit`（默认 False → 既有反思剧本零回归）：True 时决策器放行 `cancel_order`
@@ -425,7 +429,8 @@ def _make_reflect_session(*, action="open_long", size=0.5, verdict="confirm",
                              reflection_enabled=True, allow_limit=allow_limit)
     spec = PaperStrategySpec(1, "S", "atomic", _StubStrategy({}), {})
     session = AiTradeSession("aitrade_reflect", run_id, [spec], "BTC-USDT-SWAP", "1H", executor,
-                             decider, priming=False, priming_bars=10, context_refresh_rounds=10)
+                             decider, priming=False, priming_bars=10, context_refresh_rounds=10,
+                             base_rule=base_rule)
 
     async def no_htf_data(*_args, **_kwargs):
         return []
@@ -738,5 +743,139 @@ async def test_finalize_run_persists_reflection_counters_and_wake_skips():
         assert stats["reflectionConfirms"] == 0
         assert stats["reflectionFailClosed"] == 0
         assert stats["wakeSkips"] == 7
+    finally:
+        await dispose_engine()
+
+
+# ---------- 【基础策略】铁律门禁（ai-trade-base-strategy-ma-band §6.1 用例 13~16）----------
+_BASE_RULE = MaBandRule()
+_SEED_BARS = 24                   # > period+1，保证通道可算
+
+
+def _seed_window(session, closes: list[float]) -> None:
+    """直接种入行情窗口（**不触发决策轮**），使随后 feed 的那一根落在可控价位。"""
+    for i, close in enumerate(closes):
+        session._window.prime_append({"ts": _START_TS + i * _STEP, "o": close,
+                                      "h": close + 1, "l": close - 1,
+                                      "c": close, "vol": 100.0})
+
+
+def _wavy_closes(n: int = _SEED_BARS) -> list[float]:
+    return [30000.0 + 120.0 * math.sin(i / 2.0) for i in range(n)]
+
+
+def _mid_price(closes: list[float], period: int = 20) -> float:
+    """使 `feed` 后的收盘价**恰为中轨**（%B=0.5）的解析解：p = mean(最后 period-1 根)。
+
+    中轨 = SMA(period) 含被喂入的这根本身，故 p = (Σ前 period-1 根 + p)/period ⇒ p = Σ/(period-1)。
+    """
+    tail = closes[-(period - 1):]
+    return sum(tail) / len(tail)
+
+
+async def test_base_rule_gate_runs_before_consensus_and_reflection():
+    """带外开仓被铁律否决 ⇒ 最终 hold + base_rule 降级码 + **反思调用次数 == 0**（P1-2 顺序冻结）。"""
+    await init_db()
+    session, calls, llm = _make_reflect_session(action="open_long", base_rule=_BASE_RULE)
+    try:
+        closes = _wavy_closes()
+        _seed_window(session, closes)
+        q = session.subscribe()
+        far = _mid_price(closes) * 1.05          # 高出中轨 5%（带宽仅约 1%）⇒ 必在带外
+        await session.feed_candle(_candle(_SEED_BARS, price=far))
+        await _settle(session)
+        data = next(e["data"] for e in _drain(q) if e["type"] == "decision")
+        assert data["action"] == "hold"
+        assert data["degradeReason"].startswith("base_rule_ma_band(pctB=")
+        assert llm.reflection_calls == 0          # 被否轮绝不烧一次反思 LLM 调用
+        assert calls["orders"] == []              # 反手两腿都不发生
+    finally:
+        await dispose_engine()
+
+
+async def test_base_rule_gate_lets_anchor_zone_entry_through():
+    """参考价恰在中轨锚区 ⇒ 铁律放行、开仓照常落地、轨迹状态为 pass。"""
+    await init_db()
+    session, calls, _ = _make_session(action="open_long", base_rule=_BASE_RULE)
+    try:
+        closes = _wavy_closes()
+        _seed_window(session, closes)
+        q = session.subscribe()
+        await session.feed_candle(_candle(_SEED_BARS, price=_mid_price(closes)))
+        await _settle(session)
+        events = _drain(q)
+        data = next(e["data"] for e in events if e["type"] == "decision")
+        assert data["action"] == "open_long" and data["degradeReason"] is None
+        gate = next(e["data"] for e in events
+                    if e["type"] == "agent_trace" and e["data"]["phase"] == "base_rule")
+        assert gate["status"] == "pass" and gate["zone"] == "mid"
+        assert len(calls["orders"]) == 1
+    finally:
+        await dispose_engine()
+
+
+async def test_hold_streak_counts_model_intent_not_gate():
+    """被铁律否决的轮次不增加 hold_streak（N2：惯性以模型第一阶段真实意愿为准）。"""
+    await init_db()
+    session, _, _ = _make_session(action="open_long", base_rule=_BASE_RULE)
+    try:
+        closes = _wavy_closes()
+        _seed_window(session, closes)
+        await session.feed_candle(_candle(_SEED_BARS, price=_mid_price(closes) * 1.05))
+        await _settle(session)
+        assert session._last_decision["degradeReason"].startswith("base_rule_ma_band(")
+        assert session.hold_streak == 0
+    finally:
+        await dispose_engine()
+
+
+async def test_emits_base_rule_trace_each_round():
+    """规则装配 ⇒ 每轮一条 `base_rule` 轨迹；未装配 ⇒ **零条**（老 UI 与既有断言零影响）。"""
+    await init_db()
+    session, _, _ = _make_session(action="hold", base_rule=_BASE_RULE)
+    try:
+        _seed_window(session, _wavy_closes())
+        q = session.subscribe()
+        await session.feed_candle(_candle(_SEED_BARS))
+        await _settle(session)
+        assert sum(1 for e in _drain(q)
+                   if e["type"] == "agent_trace" and e["data"]["phase"] == "base_rule") == 1
+        assert session._round_trace["baseRuleStatus"] == "pass"
+    finally:
+        await dispose_engine()
+
+    await init_db()
+    plain, _, _ = _make_session(action="hold")
+    try:
+        q = plain.subscribe()
+        await plain.feed_candle(_candle(0))
+        await _settle(plain)
+        assert not [e for e in _drain(q)
+                    if e["type"] == "agent_trace" and e["data"]["phase"] == "base_rule"]
+        assert plain._round_trace["baseRuleStatus"] is None
+        assert "baseRules" not in plain._build_decision_payload(1, 0, 1.0, [], "candle")
+    finally:
+        await dispose_engine()
+
+
+async def test_three_consecutive_unavailable_rounds_emit_error_event():
+    """通道连续 3 轮算不出 ⇒ fail-closed 否决开仓 + 第 3 轮追发 AI_TRADE_BASE_RULE_UNAVAILABLE（P0-4）。"""
+    await init_db()
+    session, calls, _ = _make_session(action="open_long", base_rule=_BASE_RULE)
+    try:
+        q = session.subscribe()
+        for i in range(3):                        # 窗口远不足 period+1 ⇒ band 恒 None
+            await session.feed_candle(_candle(i))
+            await _settle(session)
+        events = _drain(q)
+        decisions = [e["data"] for e in events if e["type"] == "decision"]
+        assert [d["degradeReason"] for d in decisions] == ["base_rule_band_unavailable"] * 3
+        assert calls["orders"] == []
+        errors = [e["data"] for e in events
+                  if e["type"] == "error" and e["data"].get("code") == "AI_TRADE_BASE_RULE_UNAVAILABLE"]
+        assert len(errors) == 1                   # 恰一条（阈值等号触发，不每轮刷屏）
+        assert [e["data"]["status"] for e in events
+                if e["type"] == "agent_trace"
+                and e["data"]["phase"] == "base_rule"] == ["unavailable"] * 3
     finally:
         await dispose_engine()

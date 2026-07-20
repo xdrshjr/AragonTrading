@@ -144,6 +144,11 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     reflectionVerdict: null,
     reflectionReason: null,
     reflectionAdjustedSize: null,
+    // 【基础策略】铁律门禁（ai-trade-base-strategy-ma-band §2.9）：规则未装配的会话恒为初值 null。
+    baseRuleStatus: null,
+    baseRuleZone: null,
+    baseRulePctB: null,
+    baseRuleReason: null,
     state: "deciding",
   };
 }
@@ -187,6 +192,15 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
     case "reflection":
       // 反思复核推理流式增量累积。
       return { ...t, reflection: (t.reflection ?? "") + (evt.delta ?? "") };
+    case "base_rule":
+      // 【基础策略】铁律门禁判定：落 status/zone/%B/降级码（每轮一条；未装配会话根本收不到此相位）。
+      return {
+        ...t,
+        baseRuleStatus: evt.status ?? null,
+        baseRuleZone: evt.zone ?? null,
+        baseRulePctB: evt.pctB ?? null,
+        baseRuleReason: evt.reason ?? null,
+      };
     case "reflection_verdict":
       // 反思裁决：落 verdict/reason/实际收缩后仓位并清在飞指示。
       return {

@@ -1,6 +1,6 @@
 // AI 自动交易 · 回测模式 wire 类型（camelCase，与后端 schemas.py 的 AiBacktest* 同构）。
 // 决策/摘要复用 aiTradeTypes 的 AiTradeDecision；aiBacktestJobId 为瞬态（store 不入 partialize，GET 重发现）。
-import type { AiTradeDecision } from "./aiTradeTypes";
+import type { AiTradeBaseRules, AiTradeDecision } from "./aiTradeTypes";
 import type { EquityPoint, Metrics, Trade } from "./types";
 
 export type AiBacktestPhase = "loading" | "priming" | "running" | "finalizing";
@@ -23,6 +23,9 @@ export interface AiBacktestStartReq {
   contextRefreshRounds: number;
   minConsensus?: number | null;
   positionStepPct?: number | null;  // 仓位操作档位步长（fraction；留空→服务端默认；0→连续）
+  // 【基础策略】铁律：与实盘同字段同语义、同一服务端解析——实盘与回测的默认必须一致，否则用回测调出
+  // 的参数在实盘直接失真（ai-trade-base-strategy-ma-band P1-4）。
+  baseRules?: AiTradeBaseRules | null;
 }
 
 export interface AiBacktestStartResult {

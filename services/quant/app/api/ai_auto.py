@@ -19,6 +19,7 @@ from ..ai_auto.backtest_manager import (
     AiBacktestStartRequest,
     get_ai_backtest_manager,
 )
+from ..ai_auto.base_rules import MaBandRule, resolve_ma_band_rule
 from ..ai_auto.manager import (
     AiTradeGroupMemberInput,
     AiTradeGroupPreflightError,
@@ -32,6 +33,7 @@ from ..db.session import get_session
 from ..paper.strategy_factory import build_paper_strategy_spec
 from ..schemas import (
     AiBacktestStartIn,
+    AiTradeBaseRulesIn,
     AiTradeGroupStartIn,
     AiTradeHistoryDetailOut,
     AiTradeHistoryListOut,
@@ -75,6 +77,22 @@ def _resolve_wake_interval_s(minutes: float | None, settings: Settings) -> float
     lo = settings.ai_trade_wake_interval_floor_s
     hi = settings.ai_trade_wake_interval_ceil_min * 60.0
     return min(max(minutes * 60.0, lo), hi)
+
+
+def _resolve_base_rules(raw: AiTradeBaseRulesIn | None,
+                        settings: Settings) -> MaBandRule | None:
+    """【基础策略】默认开启语义的**唯一解析点**（ai-trade-base-strategy-ma-band §2.10/P1-5）。
+
+    字段缺省 ⇒ 按 settings 装配开启态（老客户端 / 桌面旧包不发该字段也默认开启，符合需求「默认开启」）；
+    显式 `enabled=false` ⇒ `None`（该会话不装配）；运维总闸关 ⇒ 恒 `None`。
+
+    **刻意不在 dataclass 层给开启默认值**：`AiTradeGroupStartRequest.base_rule` / `AiBacktestSpec`
+    的字段默认仍是 `None`，故既有直接构造它们的单测行为逐字不变。实盘与回测共用本函数，保证「用回测
+    调出的参数在实盘不失真」（P1-4）。
+    """
+    raw_rule = raw.maBandEntry if raw is not None else None
+    return resolve_ma_band_rule(
+        raw_rule.model_dump() if raw_rule is not None else None, settings)
 
 
 async def _resolve_account(session: AsyncSession, account_id: int | None) -> repo.OkxAccount:
@@ -142,7 +160,8 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
         priming=body.priming, priming_bars=body.primingBars,
         budget_cap_frac=cap_frac, default_budget_frac=settings.ai_trade_default_capital_frac,
         position_step_pct=_resolve_position_step(body.positionStepPct, settings),
-        wake_interval_s=_resolve_wake_interval_s(body.wakeIntervalMinutes, settings))
+        wake_interval_s=_resolve_wake_interval_s(body.wakeIntervalMinutes, settings),
+        base_rule=_resolve_base_rules(body.baseRules, settings))
     try:
         await get_ai_trade_manager().start_group(req)
     except AiTradeGroupPreflightError as exc:
@@ -242,7 +261,8 @@ async def ai_backtest_start(body: AiBacktestStartIn, session: AsyncSession = Dep
         leverage=body.leverage, stop_loss_pct=body.stopLossPct, take_profit_pct=body.takeProfitPct,
         take_profit_usd=body.takeProfitUsd, stop_loss_usd=body.stopLossUsd,
         min_consensus=body.minConsensus,
-        position_step_pct=_resolve_position_step(body.positionStepPct, settings))
+        position_step_pct=_resolve_position_step(body.positionStepPct, settings),
+        base_rule=_resolve_base_rules(body.baseRules, settings))
     try:
         job = await get_ai_backtest_manager().start(req)
     except AiBacktestError as exc:

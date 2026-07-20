@@ -18,6 +18,7 @@ from app.config import Settings
 from app.db import repositories as repo
 from app.db.models import Strategy
 from app.db.session import dispose_engine, get_sessionmaker, init_db
+from app.engine.backtester import candles_to_df
 from app.paper.strategy_factory import build_paper_strategy_spec
 
 from tests.conftest import make_synthetic_candles
@@ -476,5 +477,60 @@ async def test_reflection_disabled_backtest_journal_reflection_none(monkeypatch)
         journal = runner.decider._journal
         assert len(journal) == 6
         assert all(e["reflection"] is None and e["trigger"] is None for e in journal)
+    finally:
+        await dispose_engine()
+
+
+# ---------- 【基础策略】回测与实盘同源（ai-trade-base-strategy-ma-band §6.1 用例 25 / P1-4）----------
+async def test_backtest_applies_same_gate_as_live(monkeypatch):
+    """回测调**同一个** `apply_ma_band_gate` 纯核心：同一 band + 同一决策 ⇒ 同一 degradeReason。
+
+    回测若不同源，AI 回测会系统性地比实盘更容易开仓，用户据此调出的参数在实盘直接失真。本用例逐轮
+    比对回测产出的降级码与直接调纯核心的结果——严禁在 backtest.py 里复制一份判定逻辑。
+    """
+    from app.ai_auto.base_rules import MaBandRule, apply_ma_band_gate, build_ma_band
+    from app.ai_auto.decider import TradeDecision
+
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        llm = _StubLLM(lambda call: {"action": "open_long", "sizeFraction": 0.5,
+                                     "confidence": 0.9, "reason": f"r{call}"})
+        _patch_loaders(monkeypatch, candles, llm)
+        rule = MaBandRule()
+        spec = _spec(sid, paper, candles, every=40)
+        spec.base_rule = rule
+        runner = AiBacktestRunner(spec)
+        job = _BacktestJob("bt_base_rule", runner)
+        await runner.run(job)
+
+        decisions = list(runner._decisions_digest)
+        assert decisions, "回测未产出决策"
+        main_df = candles_to_df(candles)
+        for d in decisions:
+            i = next(k for k in range(len(main_df)) if int(main_df.iloc[k]["ts"]) == d["ts"])
+            band = build_ma_band(main_df.iloc[:i + 1], rule)
+            expected = apply_ma_band_gate(
+                TradeDecision("open_long", 0.5, 0.9, "r"), band, rule,
+                last_px=float(main_df.iloc[i]["c"]))[1]
+            assert d["degradeReason"] == expected
+            if expected is not None:
+                assert d["action"] == "hold"        # 被否轮真的没下单
+    finally:
+        await dispose_engine()
+
+
+async def test_backtest_without_base_rule_is_unchanged(monkeypatch):
+    """未装配（默认 None）⇒ payload 无 `baseRules` 键、无任何 base_rule 降级（既有回测零回归）。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        llm = _StubLLM(_alternating)
+        _patch_loaders(monkeypatch, candles, llm)
+        runner = AiBacktestRunner(_spec(sid, paper, candles, every=40))
+        await runner.run(_BacktestJob("bt_no_base_rule", runner))
+        assert runner.base_rule is None
+        assert not [d for d in runner._decisions_digest
+                    if (d.get("degradeReason") or "").startswith("base_rule_")]
     finally:
         await dispose_engine()

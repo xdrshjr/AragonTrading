@@ -186,7 +186,26 @@ export type AiTradeTracePhase =
   | "retry"
   | "reflection_start"
   | "reflection"
-  | "reflection_verdict";
+  | "reflection_verdict"
+  // 【基础策略】铁律门禁段（ai-trade-base-strategy-ma-band §2.9）：仅规则装配的会话每轮一条。
+  | "base_rule";
+
+// 【基础策略】MA 通道开单约束（与后端 base_rules.MaBandRule 镜像；数值字段留空→服务端按 settings 回填）。
+export interface AiTradeMaBandRule {
+  enabled: boolean;
+  period?: number | null;      // 中轨 SMA 周期（2~200）
+  stdMult?: number | null;     // 上下轨标准差倍数（0~5）
+  tolerance?: number | null;   // %B 锚区容差（0~0.25；0.25=仅限带内）
+  directional?: boolean | null; // 做多不追顶 / 做空不杀底（默认关）
+}
+
+// 【基础策略】铁律集合（本期只有一条预置规则）；整个字段省略 ⇒ 服务端默认**开启**。
+export interface AiTradeBaseRules {
+  maBandEntry?: AiTradeMaBandRule | null;
+}
+
+// 铁律门禁判定态：放行 / 否决 / 通道数据不可用（fail-closed）。
+export type AiTradeBaseRuleStatus = "pass" | "veto" | "unavailable";
 
 // agent_trace 事件 data（各字段按 phase 可选；前端 reducer 按 phase 归约）。
 export interface AiTradeTraceEvent {
@@ -220,6 +239,13 @@ export interface AiTradeTraceEvent {
   trigger?: "candle" | "interval"; // round_start：唤醒来源（K 线唤醒 / 墙钟定时唤醒）
   verdict?: AiReflectionVerdict; // reflection_verdict：反思裁决（confirm/abort）
   adjustedSizeFraction?: number | null; // reflection_verdict：实际收缩后的开仓仓位占比（无收缩为 null）
+  // base_rule：【基础策略】铁律门禁判定 + 本轮通道断面（band 不可用时三条线为 null，不假数据）。
+  status?: AiTradeBaseRuleStatus;
+  zone?: "lower" | "mid" | "upper" | null;
+  pctB?: number | null;
+  upper?: number | null;
+  mid?: number | null;
+  lower?: number | null;
 }
 
 // store / snapshot 的已装配单轮轨迹（thinking/analysis 累积；env 环形 ≤20）。
@@ -250,6 +276,11 @@ export interface AiTradeRoundTrace {
   reflectionVerdict?: AiReflectionVerdict | null; // 反思裁决（默认 null）
   reflectionReason?: string | null;
   reflectionAdjustedSize?: number | null; // 实际收缩后的仓位占比（无收缩为 null）
+  // 【基础策略】铁律门禁（ai-trade-base-strategy-ma-band §2.9）：规则未装配的会话恒为 null。
+  baseRuleStatus?: AiTradeBaseRuleStatus | null;
+  baseRuleZone?: "lower" | "mid" | "upper" | null;
+  baseRulePctB?: number | null;
+  baseRuleReason?: string | null;
   state: "deciding" | "done" | "skipped" | "error";
 }
 
@@ -380,6 +411,7 @@ export interface AiTradeGroupStartReq {
   primingBars?: number;
   positionStepPct?: number | null;  // 仓位操作档位步长（fraction；留空→服务端默认；0→连续）
   wakeIntervalMinutes?: number | null;  // Agent 墙钟定时唤醒周期（分钟；留空→服务端默认 2；0→关闭）
+  baseRules?: AiTradeBaseRules | null;  // 【基础策略】铁律（字段省略→服务端默认开启）
 }
 
 // 分组成员行（start 回执 / status 视图共用）：完整会话行 + 分配占比。
@@ -399,6 +431,7 @@ export interface AiTradeGroupRow {
   createdTs: number;
   members: AiTradeGroupMemberRow[];
   wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭）
+  baseRules?: AiTradeBaseRules | null; // 【基础策略】铁律回执镜像（null=未装配）
 }
 
 export type AiTradeGroupStartResult = AiTradeGroupRow;
@@ -457,6 +490,9 @@ export interface AiTradeConfig {
   positionStepPct?: number;
   // Agent 墙钟定时唤醒周期（分钟）；同样声明为**可选**——读点一律 `?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN` 兜底。
   wakeIntervalMinutes?: number;
+  // 【基础策略】铁律偏好；[R-7] 同样声明为**可选**——老用户 localStorage 无此键，读点一律
+  // `?? AI_TRADE_BASE_RULE_DEFAULTS` 兜底（**不**为此改 persist version，避免动 migration 链）。
+  baseRules?: AiTradeMaBandRule;
 }
 
 // 别名（spec §3 类型清单）：会话运行期视图 / 轻量状态负载，供 store 与流式路由语义化引用。
