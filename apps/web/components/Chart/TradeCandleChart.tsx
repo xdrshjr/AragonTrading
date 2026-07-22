@@ -3,6 +3,7 @@
 import {
   ColorType,
   type IChartApi,
+  type ISeriesApi,
   type LineStyle,
   type SeriesMarker,
   type Time,
@@ -64,6 +65,7 @@ export default function TradeCandleChart({
       borderDownColor: cssVar("--short"),
       wickUpColor: cssVar("--long"),
       wickDownColor: cssVar("--short"),
+      priceLineVisible: false, // P1-2：关闭默认末值价线，令图上只剩开仓 / 平仓两条有语义的参考线
     });
     candleSeries.setData(
       candles.map((c) => ({
@@ -78,6 +80,8 @@ export default function TradeCandleChart({
     // 买卖 / 平仓 markers（BUY 上箭下沿 / SELL 下箭上沿 / CLOSE 圆点含 pnl）。
     const events = buildTradeMarkerEvents(trades);
     candleSeries.setMarkers(events.map((event) => markerForEvent(event)));
+
+    drawTradeReferenceLines(candleSeries, trades); // E2-a：叠加开仓价 / 平仓价两条水平参考线（右轴带价签、直观醒目）
 
     // 开→平成交连线：盈实线、亏虚线（复用 tradeTrails 段落几何；颜色按方向本地解析）。
     for (const segment of buildTradeTrailSegments(trades)) {
@@ -107,6 +111,34 @@ export default function TradeCandleChart({
 function cssVar(name: string): string {
   if (typeof window === "undefined") return "#000";
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+// E2-a 开 / 平价水平参考线（模块级 helper，镜像 markerForEvent / cssVar 范式，避免撑破建图 effect 的方法长度阈值）。
+// Trade.pnl 为必填 number、side 为 "long"|"short"|"close"（types.ts）；唯一调用点恒传 [entry, exit]（TradeCandleChartPanel），
+// 故直接解构、按真实契约取值，不做可空兜底。参考线随 chart.remove() 整体销毁，零泄漏。
+function drawTradeReferenceLines(candleSeries: ISeriesApi<"Candlestick">, trades: Trade[]): void {
+  const [entryTrade, exitTrade] = trades;
+  if (entryTrade) {
+    candleSeries.createPriceLine({
+      price: entryTrade.price,
+      color: cssVar("--muted"),
+      lineWidth: 1,
+      lineStyle: 2 /* Dashed */ as LineStyle,
+      axisLabelVisible: true,
+      title: "开仓",
+    });
+  }
+  if (exitTrade && exitTrade !== entryTrade) {
+    candleSeries.createPriceLine({
+      price: exitTrade.price,
+      // 平仓价参考线按盈亏着色（P2-5：与 CLOSE marker 的 pnl 语义一致）。
+      color: exitTrade.pnl >= 0 ? cssVar("--long") : cssVar("--short"),
+      lineWidth: 1,
+      lineStyle: 2 /* Dashed */ as LineStyle,
+      axisLabelVisible: true,
+      title: "平仓",
+    });
+  }
 }
 
 function markerForEvent(event: TradeMarkerEvent): SeriesMarker<Time> {

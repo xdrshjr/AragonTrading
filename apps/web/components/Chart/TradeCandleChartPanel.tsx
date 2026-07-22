@@ -2,10 +2,10 @@
 
 import { useQuery } from "@tanstack/react-query";
 import dynamic from "next/dynamic";
-import { Skeleton } from "@/components/ui";
+import { Button, Skeleton } from "@/components/ui";
 import { api } from "@/lib/api";
 import { barSeconds } from "@/lib/aiBacktest";
-import { fmtPrice } from "@/lib/format";
+import { colorForReturn, fmtPrice, fmtTime, signed } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 import type { Trade } from "@/lib/types";
 
@@ -58,18 +58,35 @@ export default function TradeCandleChartPanel({
     return <Skeleton className="h-[240px] w-full rounded-[10px]" />;
   }
   if (query.isError || !query.data || query.data.length === 0) {
+    // E3-a：静态降级文案下补一个用户主动触发的「重试」（保留 retry:false 的自动不重试克制策略）。
     return (
-      <p className="rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-6 text-center text-[11px] leading-relaxed text-[var(--muted)]">
-        该时段 K 线暂不可用（历史窗口超出行情保留期或行情源暂不可达）。
-      </p>
+      <div className="flex flex-col items-center gap-2 rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-6 text-center">
+        <p className="text-[11px] leading-relaxed text-[var(--muted)]">
+          该时段 K 线暂不可用（历史窗口超出行情保留期或行情源暂不可达）。
+        </p>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => query.refetch()}
+          disabled={query.isFetching}
+        >
+          {query.isFetching ? "重试中…" : "重试"}
+        </Button>
+      </div>
     );
   }
+
+  const candles = query.data;
+  // E3-b：极长窗口被行情条数上限（Math.min(1000, …)）截断时，首根 K 线晚于开仓 → 诚实提示只显示临近平仓的一段。
+  const truncated = candles.length > 0 && candles[0].ts > entry.ts;
+  const holdSec = Math.max(0, exit.ts - entry.ts);
 
   return (
     <div className="flex flex-col gap-1.5">
       <div className="rounded-[10px] border border-[var(--border)] bg-[var(--surface)] p-1">
-        <TradeCandleChart candles={query.data} trades={[entry, exit]} theme={theme} />
+        <TradeCandleChart candles={candles} trades={[entry, exit]} theme={theme} />
       </div>
+      {/* E2-b 交易事实条：方向 · 开仓价@时间 · 平仓价@时间 · 持仓时长 · 盈亏（USDT + 收益率），即需求③的「相应的信息」。 */}
       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 px-0.5 text-[10px] text-[var(--muted)]">
         <span
           className="tabular font-medium"
@@ -78,10 +95,36 @@ export default function TradeCandleChartPanel({
           {direction === "long" ? "开多" : "开空"}
         </span>
         <span className="tabular">
-          开仓 {fmtPrice(entry.price)} → 平仓 {fmtPrice(exit.price)}
+          开仓 {fmtPrice(entry.price)} @ {fmtTime(entry.ts)}
         </span>
-        <span>· BUY/SELL 为开仓、CLOSE 为平仓，连线示开→平点位</span>
+        <span className="tabular">
+          平仓 {fmtPrice(exit.price)} @ {fmtTime(exit.ts)}
+        </span>
+        <span className="tabular">持仓 {fmtHoldSpan(holdSec)}</span>
+        <span className="tabular font-medium" style={{ color: colorForReturn(exit.pnl) }}>
+          盈亏 {signed(exit.pnl)}
+        </span>
+        {truncated && (
+          <span className="text-[var(--muted)]">· 窗口较长，仅显示临近平仓的一段</span>
+        )}
       </div>
     </div>
   );
+}
+
+// 局部持仓时长格式化（分 / 时 / 天，至多两段）：有意镜像 AutoTradeRoundTripRow.formatHoldDuration，
+// 不抽公共函数——集中化会改共享行组件的渲染路径引回归面，trivial 小工具局部复制成本更低（§3.3 R-5）。
+function fmtHoldSpan(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  if (s < 60) return `${s}秒`;
+  const minutes = Math.floor(s / 60);
+  if (minutes < 60) return `${minutes}分`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    const rem = minutes % 60;
+    return rem > 0 ? `${hours}时${rem}分` : `${hours}时`;
+  }
+  const days = Math.floor(hours / 24);
+  const remHours = hours % 24;
+  return remHours > 0 ? `${days}天${remHours}时` : `${days}天`;
 }

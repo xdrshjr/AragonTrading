@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
@@ -89,6 +89,47 @@ describe("TradeCandleChartPanel (ai-trade-stats-two-column-and-kline §3.4)", ()
     wrap(<TradeCandleChartPanel instId="BTC-USDT-SWAP" bar="1H" entry={ENTRY} exit={EXIT} />, newClient());
 
     expect(await screen.findByText(/该时段 K 线暂不可用/)).toBeInTheDocument();
+  });
+
+  // ---------- 迭代 2 打磨：E2-b 交易事实条 / E3-a 重试 / E3-b 截断提示 ----------
+  it("renders a complete trade fact bar: direction / prices@time / hold / pnl (E2-b)", async () => {
+    candlesMock.mockResolvedValue({ source: "live", candles: [candle(1000), candle(4600)] });
+    wrap(<TradeCandleChartPanel instId="BTC-USDT-SWAP" bar="1H" entry={ENTRY} exit={EXIT} />, newClient());
+
+    await waitFor(() => expect(screen.getByTestId("trade-candle-chart")).toBeInTheDocument());
+    expect(screen.getByText("开多")).toBeInTheDocument(); // entry.side=long → 开多
+    expect(screen.getByText(/开仓 100\.00/)).toBeInTheDocument(); // fmtPrice(entry.price)
+    expect(screen.getByText(/平仓 110\.00/)).toBeInTheDocument(); // fmtPrice(exit.price)
+    expect(screen.getByText(/持仓/)).toBeInTheDocument(); // 持仓时长段
+    expect(screen.getByText(/盈亏 \+12\.00/)).toBeInTheDocument(); // signed(exit.pnl)
+  });
+
+  it("offers a manual retry that refetches when the window is unavailable (E3-a)", async () => {
+    candlesMock.mockRejectedValue(new Error("okx history unavailable"));
+    wrap(<TradeCandleChartPanel instId="BTC-USDT-SWAP" bar="1H" entry={ENTRY} exit={EXIT} />, newClient());
+
+    const retry = await screen.findByRole("button", { name: /重试/ });
+    expect(candlesMock).toHaveBeenCalledTimes(1); // 自动不重试（retry:false）保持不变
+    fireEvent.click(retry);
+    await waitFor(() => expect(candlesMock).toHaveBeenCalledTimes(2)); // 用户主动 refetch 再取一次
+  });
+
+  it("flags a truncated window when the first candle is later than entry (E3-b)", async () => {
+    // 首根 K 线晚于开仓（candles[0].ts=2000 > entry.ts=1000）→ 显式诚实提示。
+    candlesMock.mockResolvedValue({ source: "live", candles: [candle(2000), candle(4600)] });
+    wrap(<TradeCandleChartPanel instId="BTC-USDT-SWAP" bar="1H" entry={ENTRY} exit={EXIT} />, newClient());
+
+    await waitFor(() => expect(screen.getByTestId("trade-candle-chart")).toBeInTheDocument());
+    expect(screen.getByText(/仅显示临近平仓的一段/)).toBeInTheDocument();
+  });
+
+  it("omits the truncation note when the window covers the entry (E3-b)", async () => {
+    // 首根 K 线即开仓时刻（candles[0].ts=1000 == entry.ts）→ 不显示提示。
+    candlesMock.mockResolvedValue({ source: "live", candles: [candle(1000), candle(4600)] });
+    wrap(<TradeCandleChartPanel instId="BTC-USDT-SWAP" bar="1H" entry={ENTRY} exit={EXIT} />, newClient());
+
+    await waitFor(() => expect(screen.getByTestId("trade-candle-chart")).toBeInTheDocument());
+    expect(screen.queryByText(/仅显示临近平仓的一段/)).toBeNull();
   });
 
   it("hits the immutable cache on re-mount with the same window (no duplicate request)", async () => {

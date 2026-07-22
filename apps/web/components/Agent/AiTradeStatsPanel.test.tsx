@@ -267,6 +267,17 @@ describe("AiTradeStatsPanel", () => {
     expect(within(dialog).getByText("交易记录")).toBeInTheDocument(); // 右栏标题
   });
 
+  it("collapses the left-column secondary KPIs to two columns (E1 kpiCols={2})", () => {
+    useAppStore.setState({ aiTradeGroup: makeGroup() });
+    renderPanel();
+    const dialog = screen.getByRole("dialog");
+    // 「完整交易」次级 KPI 所在的 grid 容器：窄栏恒两列，不再在 sm 断点起拥挤为四列。
+    const grid = within(dialog).getByText("完整交易").closest("div.grid");
+    expect(grid).not.toBeNull();
+    expect(grid).toHaveClass("grid-cols-2"); // 断分立类（P2-2：clsx 会重排类名顺序，勿写精确串断言）
+    expect(grid).not.toHaveClass("sm:grid-cols-4");
+  });
+
   it("degrades the annualized projection to a sample-insufficient notice instead of a wild number (P1-2)", () => {
     // makeGroup 仅 2 笔完整交易（<3 门禁）→ 不出数字，显式降级。
     useAppStore.setState({ aiTradeGroup: makeGroup() });
@@ -274,6 +285,7 @@ describe("AiTradeStatsPanel", () => {
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getByText("样本不足以估算年化")).toBeInTheDocument();
     expect(within(dialog).queryByText(/按当前已实现收益线性外推一年/)).toBeNull();
+    expect(within(dialog).queryByText(/可信度/)).toBeNull(); // E4：降级时不显可信度徽标
   });
 
   it("projects an annualized number once the sample clears the gates (≥6h and ≥3 trades)", () => {
@@ -288,6 +300,8 @@ describe("AiTradeStatsPanel", () => {
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).queryByText("样本不足以估算年化")).toBeNull();
     expect(within(dialog).getByText(/按当前已实现收益线性外推一年/)).toBeInTheDocument();
+    // E4：出数字时并排样本可信度徽标（30 天但仅 3 笔 → 取笔数低档 → 可信度 低）。
+    expect(within(dialog).getByText("可信度 低")).toBeInTheDocument();
   });
 
   it("expands a trade record into an inline K-line panel when a bar is supplied", async () => {

@@ -58,3 +58,24 @@ export function projectAnnualizedReturn(params: {
   const annualizedPct = returnPct * (YEAR_SECONDS / elapsedSec);
   return { ok: true, annualizedPct, elapsedSec, tradeCount };
 }
+
+export type AnnualizedConfidence = "low" | "medium" | "high";
+
+const DAY_SECONDS = 86_400;
+const CONFIDENCE_ORDER: Record<AnnualizedConfidence, number> = { low: 0, medium: 1, high: 2 };
+
+/**
+ * 年化外推的样本可信度分档（纯函数，绝不抛）：据经历时长与完整交易笔数各自分档，取两者的较低者，
+ * 避免任一维度（时长或笔数）虚高。阈值为经验值（可调，调整须在 .claude-index/config.md 记录）。
+ *
+ * high：≥30 天 且 ≥30 笔；medium：≥7 天 且 ≥10 笔；否则 low。仅影响提示语，不改任何年化数值口径。
+ *
+ * @param elapsedSec 真实经历时长（秒）
+ * @param tradeCount 完整交易往返数
+ */
+export function annualizedConfidence(elapsedSec: number, tradeCount: number): AnnualizedConfidence {
+  const days = elapsedSec / DAY_SECONDS;
+  const timeTier: AnnualizedConfidence = days >= 30 ? "high" : days >= 7 ? "medium" : "low";
+  const tradeTier: AnnualizedConfidence = tradeCount >= 30 ? "high" : tradeCount >= 10 ? "medium" : "low";
+  return CONFIDENCE_ORDER[timeTier] <= CONFIDENCE_ORDER[tradeTier] ? timeTier : tradeTier;
+}

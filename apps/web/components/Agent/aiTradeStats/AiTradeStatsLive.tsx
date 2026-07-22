@@ -97,6 +97,7 @@ export default function AiTradeStatsLive() {
           custom={custom}
           onCustomChange={setCustom}
           summary={summary}
+          kpiCols={2}
         />
         <AnnualizedProjectionCard
           returnPct={fullSummary.totalReturnPct}

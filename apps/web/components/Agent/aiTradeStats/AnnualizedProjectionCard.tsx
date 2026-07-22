@@ -1,9 +1,12 @@
 "use client";
 
+import clsx from "clsx";
 import {
   MIN_ELAPSED_SEC,
   MIN_TRADES,
+  type AnnualizedConfidence,
   type AnnualizedReason,
+  annualizedConfidence,
   projectAnnualizedReturn,
 } from "@/lib/annualized";
 import { colorForReturn, fmtPct } from "@/lib/format";
@@ -14,6 +17,13 @@ const REASON_HINTS: Record<AnnualizedReason, string> = {
   "too-short": `运行需满 ${Math.round(MIN_ELAPSED_SEC / 3600)} 小时后方可估算（样本过短的外推会严重失真）。`,
   "too-few-trades": `完整交易需满 ${MIN_TRADES} 笔后方可估算（样本过少的外推不可信）。`,
   wipeout: "本金已接近归零，年化外推无意义。",
+};
+
+// E4 样本可信度徽标（低 / 中 / 高）：仅在年化出数字时并排展示，一眼提示这次外推有多可信。
+const CONFIDENCE_BADGE: Record<AnnualizedConfidence, { label: string; cls: string }> = {
+  low: { label: "可信度 低", cls: "text-[var(--short)] border-[var(--short)]" },
+  medium: { label: "可信度 中", cls: "text-[var(--muted)] border-[var(--border)]" },
+  high: { label: "可信度 高", cls: "text-[var(--long)] border-[var(--long)]" },
 };
 
 /**
@@ -31,6 +41,7 @@ export default function AnnualizedProjectionCard({
   tradeCount: number;
 }) {
   const projection = projectAnnualizedReturn({ returnPct, elapsedSec, tradeCount });
+  const confidence = CONFIDENCE_BADGE[annualizedConfidence(elapsedSec, tradeCount)];
 
   return (
     <div className="flex flex-col gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2.5">
@@ -39,12 +50,22 @@ export default function AnnualizedProjectionCard({
       </span>
       {projection.ok && projection.annualizedPct !== null ? (
         <>
-          <span
-            className="tabular text-xl font-semibold"
-            style={{ color: colorForReturn(projection.annualizedPct) }}
-          >
-            {fmtPct(projection.annualizedPct)}
-          </span>
+          <div className="flex items-center gap-2">
+            <span
+              className="tabular text-xl font-semibold"
+              style={{ color: colorForReturn(projection.annualizedPct) }}
+            >
+              {fmtPct(projection.annualizedPct)}
+            </span>
+            <span
+              className={clsx(
+                "rounded-full border px-1.5 py-0.5 text-[9px] font-medium",
+                confidence.cls,
+              )}
+            >
+              {confidence.label}
+            </span>
+          </div>
           <span className="text-[10px] leading-relaxed text-[var(--muted)]">
             按当前已实现收益线性外推一年（估算，非未来承诺）· 基于{" "}
             <span className="tabular text-[var(--text)]">{fmtElapsed(elapsedSec)}</span> /{" "}

@@ -20,12 +20,15 @@ export default function AutoTradePnlSummary({
   custom,
   onCustomChange,
   summary,
+  kpiCols = 4,
 }: {
   range: AutoTradeRange;
   onRangeChange: (range: AutoTradeRange) => void;
   custom: { startTs?: number; endTs?: number };
   onCustomChange: (custom: { startTs?: number; endTs?: number }) => void;
   summary: PnlSummary;
+  // 次级 KPI 列数：默认 4（既有调用点类名等价、行为零回归）；窄栏（AI 统计看板左栏）传 2 避免拥挤。
+  kpiCols?: 2 | 4;
 }) {
   return (
     <div className="flex flex-col gap-3">
@@ -94,7 +97,7 @@ export default function AutoTradePnlSummary({
         />
       </div>
 
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+      <div className={clsx("grid gap-2", kpiCols === 2 ? "grid-cols-2" : "grid-cols-2 sm:grid-cols-4")}>
         <Kpi label="完整交易" value={`${summary.count} 笔`} />
         <Kpi label="胜率" value={fmtPct(summary.winRate)} />
         <Kpi label="最大单笔盈" value={signed(summary.bestUsd)} color={colorForReturn(summary.bestUsd)} />
