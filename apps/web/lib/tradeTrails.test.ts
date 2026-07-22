@@ -51,17 +51,63 @@ describe("trade trail helpers", () => {
     expect(segments[0].pnl).toBe(8);
   });
 
-  it("sorts trades by timestamp and stable fallback index before pairing", () => {
+  it("sorts trades by timestamp for rendering while pairing follows arrival order", () => {
+    // sortTradesForTrail 是渲染顺序（ts 升序，markers 必须升序喂给 lightweight-charts）；
+    // 配对走因果序——无 id 时数组序即到达序，所以「先到的 close」是孤儿平仓，不倒配后到的 open。
     const close = trade({ ts: 20, side: "close", price: 110, pnl: 10 });
     const entry = trade({ ts: 10, side: "long", price: 100 });
 
     const sorted = sortTradesForTrail([close, entry]);
-    const segments = buildTradeTrailSegments([close, entry]);
 
     expect(sorted).toEqual([entry, close]);
+    expect(buildTradeTrailSegments([close, entry])).toEqual([]);
+    expect(buildTradeTrailSegments([entry, close])).toHaveLength(1);
+  });
+
+  it("pairs by db id, not ts, when the two clocks write ts out of causal order", () => {
+    // 回归门禁（ai-trade-stats-missing-round-trips）：AI 自动交易的 ts 由 bar 开盘时刻与墙钟两套
+    // 时钟写入，平仓 ts 可能早于开仓 ts；按 ts 排序会把这笔完整交易整笔丢弃。
+    const entry = trade({ id: 50914, ts: 1784701626, side: "long", price: 1912.94 });
+    const exit = trade({ id: 50915, ts: 1784700900, side: "close", price: 1913.64, pnl: 0.0574 });
+
+    const segments = buildTradeTrailSegments([entry, exit]);
+
     expect(segments).toHaveLength(1);
     expect(segments[0].entry).toBe(entry);
-    expect(segments[0].exit).toBe(close);
+    expect(segments[0].exit).toBe(exit);
+    expect(segments[0].canRenderLine).toBe(false); // 双时钟残留：ts 逆序故不画开→平连线
+  });
+
+  it("still emits markers in ts ascending order while pairing by db id", () => {
+    // 配对改因果序后，渲染顺序必须仍由 indexTrades 保持 ts 升序：lightweight-charts 的
+    // setMarkers 断言 markers 按 time 升序，喂入逆序会让 dev 构建直接抛异常、图表崩。
+    const entry = trade({ id: 50914, ts: 1784701626, side: "long", price: 1912.94 });
+    const exit = trade({ id: 50915, ts: 1784700900, side: "close", price: 1913.64, pnl: 0.0574 });
+
+    const markers = buildTradeMarkerEvents([entry, exit]);
+
+    expect(markers.map((m) => m.trade.ts)).toEqual([1784700900, 1784701626]);
+    // 被救回的平仓不再是 orphan-close，两个 marker 都指向同一段
+    expect(markers.map((m) => m.kind)).toEqual(["close", "entry-long"]);
+    expect(markers[0].pairedSegmentId).toBe(markers[1].pairedSegmentId);
+    expect(markers[0].pairedSegmentId).toBeDefined();
+  });
+
+  it("pairs a merged multi-strategy array block by block instead of interleaving by ts", () => {
+    // paper 多策略把各策略成交块 flatMap 成一个无 id 数组（visiblePaperTrades）。因果序 = 数组序
+    // ⇒ 逐块配对；此前按 ts 交织会让 A 策略的开仓配上 B 策略的平仓。
+    const aEntry = trade({ ts: 10, side: "long", price: 100 });
+    const aExit = trade({ ts: 30, side: "close", price: 110, pnl: 5 });
+    const bEntry = trade({ ts: 20, side: "short", price: 50 });
+    const bExit = trade({ ts: 40, side: "close", price: 45, pnl: 3 });
+
+    const segments = buildTradeTrailSegments([aEntry, aExit, bEntry, bExit]);
+
+    expect(segments).toHaveLength(2);
+    expect(segments[0].entry).toBe(aEntry);
+    expect(segments[0].exit).toBe(aExit);
+    expect(segments[1].entry).toBe(bEntry);
+    expect(segments[1].exit).toBe(bExit);
   });
 
   it("handles a same-timestamp reverse without crossing old and new entries", () => {

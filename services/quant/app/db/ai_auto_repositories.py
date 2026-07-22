@@ -48,14 +48,21 @@ def _num(value: object) -> float:
 
 
 def _pair_round_trips(trades: list[Trade]) -> list[tuple[Trade, Trade]]:
-    """逐字移植前端 buildPairedTrails：按 (ts, id) 排序后单持仓 open→close 配对。
+    """逐字移植前端 buildPairedTrails：按**因果序**（id 升序 = 落库序）单持仓 open→close 配对。
 
     side ∈ {long, short} 记为开仓；其余（close）在有未配对开仓时成对，孤儿平仓 / 悬挂开仓丢弃。
     绝不跨 instId——调用方按 run_id（=单一 instId 成员）分桶后逐桶调用（R-2）。
+
+    排序键不能用 ``ts``：AI 自动交易的 ``trades.ts`` 由两套时钟写入（K 线轮 = bar 开盘时刻 /
+    定时唤醒轮与 monitor 轮 = 墙钟），按 ts 排序会破坏真实的开→平交替 —— 对内逆序整笔丢弃、
+    跨对重叠则错配加丢弃（诊断 ai-trade-stats-missing-round-trips）。``trades.id`` 是落库自增，
+    即真实发生顺序，实测生产库按 id 配对 161 笔平仓零孤儿。仅本函数改排序键：
+    ``_load_trades_by_run`` 的 SQL 仍按 (ts, id) 升序，故 ``_aggregate_group`` 的 endedTs 与
+    ``_group_started_ts`` 的「首元素 == 最早 ts」语义原样成立。
     """
     pairs: list[tuple[Trade, Trade]] = []
     open_trade: Trade | None = None
-    for t in sorted(trades, key=lambda x: (x.ts, x.id or 0)):
+    for t in sorted(trades, key=lambda x: x.id or 0):
         if t.side in ("long", "short"):
             open_trade = t
         elif open_trade is not None:

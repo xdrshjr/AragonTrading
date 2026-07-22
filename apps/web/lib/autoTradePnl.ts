@@ -47,7 +47,7 @@ export interface LedgerMember {
 }
 
 /**
- * 单个标的成交流 → 完整交易往返。复用 buildTradeTrailSegments 的因果配对（按 ts+id 排序、单持仓配对）；
+ * 单个标的成交流 → 完整交易往返。复用 buildTradeTrailSegments 的因果配对（按落库/到达序、单持仓配对）；
  * seeded（历史预热）成交在配对前过滤——非真实成交不计入收益（当前 live-auto 无 seeded，前瞻保护）。
  */
 export function buildRoundTrips(

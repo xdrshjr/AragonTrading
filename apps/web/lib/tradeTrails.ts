@@ -72,7 +72,7 @@ function buildPairedTrails(trades: Trade[]): PairedTrail[] {
   const pairs: PairedTrail[] = [];
   let open: IndexedTrade | null = null;
 
-  for (const item of indexTrades(trades)) {
+  for (const item of causalOrderTrades(trades)) {
     const { trade } = item;
     if (trade.side === "long" || trade.side === "short") {
       open = item;
@@ -107,6 +107,7 @@ function segmentFor(entry: IndexedTrade, exit: IndexedTrade): TradeTrailSegment 
   };
 }
 
+// 渲染顺序：按 ts 升序（lightweight-charts 的 setMarkers 要求 markers 按 time 升序，dev 构建有断言）。
 function indexTrades(trades: Trade[]): IndexedTrade[] {
   return trades
     .map((trade, index) => ({ trade, index }))
@@ -114,6 +115,17 @@ function indexTrades(trades: Trade[]): IndexedTrade[] {
       if (a.trade.ts !== b.trade.ts) return a.trade.ts - b.trade.ts;
       return tradeOrder(a) - tradeOrder(b);
     });
+}
+
+// 配对顺序：按**因果序**，绝不用 ts。AI 自动交易的 trade.ts 由两套时钟写入（K 线轮 = bar 开盘时刻 /
+// 定时唤醒轮 = 墙钟），按 ts 排序会破坏真实的开→平交替，导致完整交易整笔丢弃或张冠李戴
+// （诊断 ai-trade-stats-missing-round-trips）。整数组二选一判定：全员带 id（历史 DB 路径）→ 按 id
+// 升序 = 落库序；否则（实时 WS 快照 / 追加）数组原序即到达序 = 因果序。不做逐元素回退，避免把 DB
+// 主键空间与数组下标空间混进同一个比较器。配对与渲染天然解耦——PairedTrail 记的是原数组下标。
+function causalOrderTrades(trades: Trade[]): IndexedTrade[] {
+  const items = trades.map((trade, index) => ({ trade, index }));
+  if (!items.every((item) => item.trade.id != null)) return items;
+  return items.sort((a, b) => (a.trade.id as number) - (b.trade.id as number));
 }
 
 function tradeOrder(item: IndexedTrade): number {

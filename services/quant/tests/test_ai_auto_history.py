@@ -183,6 +183,51 @@ async def test_detail_members_and_summary() -> None:
     assert len(btc["trades"]) == 2 and len(eth["trades"]) == 2   # ORM Trade（API 层再 trade_out）
 
 
+# ---------------- 双时钟 ts 的因果配对回归（ai-trade-stats-missing-round-trips）----------------
+async def test_pairs_by_causal_order_when_ts_is_written_by_two_clocks() -> None:
+    """AI 自动交易的 trades.ts 由两套时钟写入（K 线轮=bar 开盘时刻 / 定时唤醒轮=墙钟）。
+
+    按 ts 排序做单持仓配对会打乱真实的开→平交替：对内逆序整笔丢弃，跨对重叠则张冠李戴 + 丢一笔。
+    配对必须按落库顺序（id 升序 = 因果序）。两组夹具均取自生产库真实成交。
+    """
+    sid = await _reset()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        # 形态一（生产库 run_id=1557）：平仓 ts 比开仓早 12 分钟 —— 整笔被丢弃
+        inverted = await _add_run(s, strategy_id=sid, group_id="aihist_dualclock",
+                                  inst_id="ETH-USDT-SWAP", budget=100, alloc_pct=50,
+                                  strategy_names=["动量"], total_budget=200,
+                                  group_started_ts=1784699234, start_ts=1784699234,
+                                  end_ts=1784702000)
+        await _add_trade(s, inverted, 1784701626, "long", 1912.94)          # 墙钟 06:27:06
+        await _add_trade(s, inverted, 1784700900, "close", 1913.64, pnl=0.0574)  # bar 06:15:00
+
+        # 形态二（生产库 run_id=1548）：两对对内均正序，但后一对开仓 ts 早于前一对平仓 —— 错配 + 丢弃
+        overlap = await _add_run(s, strategy_id=sid, group_id="aihist_dualclock",
+                                 inst_id="BTC-USDT-SWAP", budget=100, alloc_pct=50,
+                                 strategy_names=["动量"], total_budget=200,
+                                 group_started_ts=1784699234, start_ts=1784654000,
+                                 end_ts=1784659083)
+        await _add_trade(s, overlap, 1784654324, "short", 66409.2)
+        await _add_trade(s, overlap, 1784656025, "close", 66200.0, pnl=0.3347)
+        await _add_trade(s, overlap, 1784655900, "short", 66186.5)          # ts 倒退 2 分 05 秒
+        await _add_trade(s, overlap, 1784659083, "close", 66265.0, pnl=-0.1256)
+
+        listed = await list_ai_trade_groups(s, limit=20, offset=0)
+        detail = await get_ai_trade_group_detail(s, "aihist_dualclock")
+
+    item = next(i for i in listed["items"] if i["groupId"] == "aihist_dualclock")
+    # 3 笔完整交易全部计入：0.0574 + 0.3347 - 0.1256
+    assert item["tradeCount"] == 3
+    assert item["realizedPnlUsd"] == pytest.approx(0.2665)
+    assert item["bestUsd"] == pytest.approx(0.3347)
+    assert item["worstUsd"] == pytest.approx(-0.1256)
+    assert detail["summary"]["tradeCount"] == 3
+    assert detail["summary"]["realizedPnlUsd"] == pytest.approx(0.2665)
+    # startedTs / endedTs 取自 group_started_ts 与成交 ts 最大值，配对排序键变化不得波及
+    assert detail["startedTs"] == 1784699234 and detail["endedTs"] == 1784702000
+
+
 # ---------------- finalize 富化纯函数 ----------------
 def test_downsample_equity_keeps_endpoints_and_never_throws() -> None:
     assert _downsample_equity([], 500) == []

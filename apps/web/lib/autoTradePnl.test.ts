@@ -99,6 +99,68 @@ describe("buildRoundTrips", () => {
     );
     expect(rts[0].pnlPct).toBeNull();
   });
+
+  // 回归门禁（ai-trade-stats-missing-round-trips）：AI 自动交易的 trades.ts 由两套时钟写入
+  // （K 线轮 = bar 开盘时刻 / 定时唤醒轮 = 墙钟），按 ts 排序会打乱真实的开→平交替。
+  // 配对必须按因果序（落库 id 升序 / 数组到达序），否则整笔丢弃或张冠李戴。
+  it("keeps a completed trade whose close.ts precedes open.ts (dual-clock ts)", () => {
+    // 生产库 run_id=1557（ETH-USDT-SWAP / 15m）真实两行：
+    // 开仓来自定时唤醒轮（墙钟 06:27:06），平仓来自 K 线轮（bar 开盘 06:15:00）。
+    const rts = buildRoundTrips(
+      "ETH-USDT-SWAP",
+      [
+        trade({ id: 50914, ts: 1784701626, side: "long", price: 1912.94, qty: 0.82,
+          positionAfter: 0.82 }),
+        trade({ id: 50915, ts: 1784700900, side: "close", price: 1913.64, qty: 0.82,
+          pnl: 0.0574 }),
+      ],
+      5,
+    );
+    expect(rts).toHaveLength(1);
+    expect(rts[0].entry.id).toBe(50914);
+    expect(rts[0].exit.id).toBe(50915);
+    expect(rts[0].pnlUsd).toBeCloseTo(0.0574, 10);
+  });
+
+  it("does not mis-pair when a bar-ts open follows a wall-clock close", () => {
+    // 生产库 run_id=1548（BTC-USDT-SWAP / 15m）真实四行：两对对内均正序，但跨对重叠 ——
+    // 50896 开仓（bar 17:45:00）的 ts 早于 50894 平仓（墙钟 17:47:05）。
+    const rts = buildRoundTrips(
+      "BTC-USDT-SWAP",
+      [
+        trade({ id: 50892, ts: 1784654324, side: "short", price: 66409.2, qty: 0.16,
+          positionAfter: -0.16 }),
+        trade({ id: 50894, ts: 1784656025, side: "close", price: 66200.0, qty: 0.16,
+          pnl: 0.3347 }),
+        trade({ id: 50896, ts: 1784655900, side: "short", price: 66186.5, qty: 0.16,
+          positionAfter: -0.16 }),
+        trade({ id: 50898, ts: 1784659083, side: "close", price: 66265.0, qty: 0.16,
+          pnl: -0.1256 }),
+      ],
+      5,
+    );
+    expect(rts.map((r) => [r.entry.id, r.exit.id])).toEqual([
+      [50892, 50894],
+      [50896, 50898],
+    ]);
+    expect(rts[0].entry.price).toBe(66409.2);   // 张冠李戴时这里会是 66186.5
+  });
+
+  it("keeps a dual-clock round trip on the live snapshot path (trades carry no id)", () => {
+    // 「当前」页的成交来自 WS 快照 / 尾部追加，executor 构造的成交字典**无 id**，
+    // 因果序只能取数组到达序——这条路径与上面带 id 的历史路径必须同样救回这笔交易。
+    const rts = buildRoundTrips(
+      "ETH-USDT-SWAP",
+      [
+        trade({ ts: 1784701626, side: "long", price: 1912.94, qty: 0.82, positionAfter: 0.82 }),
+        trade({ ts: 1784700900, side: "close", price: 1913.64, qty: 0.82, pnl: 0.0574 }),
+      ],
+      5,
+    );
+    expect(rts).toHaveLength(1);
+    expect(rts[0].openedTs).toBe(1784701626);
+    expect(rts[0].pnlUsd).toBeCloseTo(0.0574, 10);
+  });
 });
 
 describe("buildLedger", () => {
