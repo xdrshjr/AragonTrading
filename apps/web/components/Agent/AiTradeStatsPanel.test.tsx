@@ -2,9 +2,12 @@ import "@testing-library/jest-dom/vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import AutoTradeRoundTripRow from "@/components/Chart/AutoTradeRoundTripRow";
 import type { AiTradeDecision, AiTradeGroupState, AiTradeSessionRow } from "@/lib/aiTradeTypes";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
 import type { AiTradeHistoryDetailOut, AiTradeHistoryListOut } from "@/lib/aiTradeHistoryTypes";
+import { api } from "@/lib/api";
+import type { RoundTrip } from "@/lib/autoTradePnl";
 import { useAppStore } from "@/lib/store";
 import type { PaperPositionEvent, Trade } from "@/lib/types";
 import AiTradeStatsPanel from "./AiTradeStatsPanel";
@@ -13,8 +16,19 @@ vi.mock("@/lib/aiTradeHistoryApi", () => ({
   aiTradeHistoryApi: { list: vi.fn(), detail: vi.fn() },
 }));
 
+// 行内 K 线：纯图经 next/dynamic(ssr:false) 引入 → stub 掉（规避 lightweight-charts 在 jsdom 的异步加载）；
+// 数据层 api.candlesWithMeta 部分 mock（保留其余 api 真实，避免 store 等依赖断裂）。
+vi.mock("next/dynamic", () => ({
+  default: () => () => <div data-testid="trade-candle-chart" />,
+}));
+vi.mock("@/lib/api", async (importActual) => {
+  const actual = await importActual<typeof import("@/lib/api")>();
+  return { ...actual, api: { ...actual.api, candlesWithMeta: vi.fn() } };
+});
+
 const listMock = vi.mocked(aiTradeHistoryApi.list);
 const detailMock = vi.mocked(aiTradeHistoryApi.detail);
+const candlesMock = vi.mocked(api.candlesWithMeta);
 
 const NOW_SEC = 1_790_000_000;
 const DAY = 86_400;
@@ -96,6 +110,7 @@ beforeEach(() => {
   useAppStore.setState({ aiTradeGroup: null });
   listMock.mockReset().mockResolvedValue(EMPTY_LIST);
   detailMock.mockReset();
+  candlesMock.mockReset().mockResolvedValue({ source: "live", candles: [] });
 });
 afterEach(() => {
   cleanup();
@@ -239,6 +254,100 @@ describe("AiTradeStatsPanel", () => {
     expect(await screen.findByText("决策轮数")).toBeInTheDocument(); // 旧五键卡照常渲染
     expect(screen.queryByText("反思轮数")).toBeNull(); // 老记录不显示一排误导性的 0
     expect(screen.queryByText("唤醒抑制")).toBeNull();
+  });
+
+  // ---------- ai-trade-stats-two-column-and-kline：60vw 双栏 / 预计年化 / 行内 K 线 ----------
+  it("widens to a 60vw two-column layout with stats on the left and a trade-record column on the right", () => {
+    useAppStore.setState({ aiTradeGroup: makeGroup() });
+    renderPanel();
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveClass("max-w-[60vw]");
+    expect(within(dialog).getByText("总收益（USDT）")).toBeInTheDocument(); // 左栏 KPI
+    expect(within(dialog).getByText(/预计年化收益/)).toBeInTheDocument(); // 左栏年化卡
+    expect(within(dialog).getByText("交易记录")).toBeInTheDocument(); // 右栏标题
+  });
+
+  it("degrades the annualized projection to a sample-insufficient notice instead of a wild number (P1-2)", () => {
+    // makeGroup 仅 2 笔完整交易（<3 门禁）→ 不出数字，显式降级。
+    useAppStore.setState({ aiTradeGroup: makeGroup() });
+    renderPanel();
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("样本不足以估算年化")).toBeInTheDocument();
+    expect(within(dialog).queryByText(/按当前已实现收益线性外推一年/)).toBeNull();
+  });
+
+  it("projects an annualized number once the sample clears the gates (≥6h and ≥3 trades)", () => {
+    const group = makeGroup();
+    // 追加第三笔完整交易过 minTrades=3（elapsed 已 30 天，过 minElapsed）。
+    group.members["BTC-USDT-SWAP"].trades.push(
+      trade({ id: 5, ts: NOW_SEC - 500, side: "long", price: 100 }),
+      trade({ id: 6, ts: NOW_SEC - 400, side: "close", price: 105, pnl: 5, pnlPct: 0.15 }),
+    );
+    useAppStore.setState({ aiTradeGroup: group });
+    renderPanel();
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).queryByText("样本不足以估算年化")).toBeNull();
+    expect(within(dialog).getByText(/按当前已实现收益线性外推一年/)).toBeInTheDocument();
+  });
+
+  it("expands a trade record into an inline K-line panel when a bar is supplied", async () => {
+    candlesMock.mockResolvedValue({
+      source: "live",
+      candles: [
+        { ts: NOW_SEC - 700, o: 100, h: 101, l: 99, c: 100, vol: 1 },
+        { ts: NOW_SEC - 600, o: 100, h: 111, l: 99, c: 110, vol: 1 },
+      ],
+    });
+    useAppStore.setState({ aiTradeGroup: makeGroup() });
+    renderPanel();
+    const dialog = screen.getByRole("dialog");
+    // 往返行携 bar → 可展开（aria-expanded 出现于折叠态）；点最新一行（+12，窗口含 mock K 线）。
+    const rows = within(dialog).getAllByRole("button", { expanded: false });
+    fireEvent.click(rows[0]);
+    expect(await screen.findByTestId("trade-candle-chart")).toBeInTheDocument();
+    expect(candlesMock).toHaveBeenCalled();
+  });
+});
+
+// P1-3 零回归门控：`AutoTradeRoundTripRow` 的行内 K 线**仅**由可选 `bar` 开启；不传 `bar` 的既有调用点
+// （live-auto / paper 面板）行为逐字节不变——`expandable` 仍 = `Boolean(rt.exit.explain)`、绝不挂 K 线。
+describe("AutoTradeRoundTripRow bar-gated inline K-line (zero regression)", () => {
+  function roundTrip(): RoundTrip {
+    return {
+      instId: "BTC-USDT-SWAP",
+      direction: "long",
+      entry: trade({ id: 1, ts: NOW_SEC - 700, side: "long", price: 100 }),
+      exit: trade({ id: 2, ts: NOW_SEC - 600, side: "close", price: 110, pnl: 12 }),
+      pnlUsd: 12,
+      pnlPct: 0.36,
+      openedTs: NOW_SEC - 700,
+      closedTs: NOW_SEC - 600,
+      isWin: true,
+    };
+  }
+  function renderRow(bar?: string) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(
+      <QueryClientProvider client={qc}>
+        <AutoTradeRoundTripRow rt={roundTrip()} open onToggle={() => {}} bar={bar} />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("stays non-expandable and mounts no K-line without a bar (unchanged legacy behavior)", () => {
+    renderRow(undefined); // 夹具 exit.explain=null 且无 bar
+    expect(screen.getByRole("button")).not.toHaveAttribute("aria-expanded");
+    expect(screen.queryByTestId("trade-candle-chart")).toBeNull();
+  });
+
+  it("mounts the inline K-line only once a bar is supplied", async () => {
+    candlesMock.mockResolvedValue({
+      source: "live",
+      candles: [{ ts: NOW_SEC - 700, o: 100, h: 101, l: 99, c: 100, vol: 1 }],
+    });
+    renderRow("1H");
+    expect(screen.getByRole("button")).toHaveAttribute("aria-expanded", "true");
+    expect(await screen.findByTestId("trade-candle-chart")).toBeInTheDocument();
   });
 });
 

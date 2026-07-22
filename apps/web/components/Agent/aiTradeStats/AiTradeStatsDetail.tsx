@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { PeriodReturnBars, UnderwaterChart } from "@/components/Chart/aiBacktest/charts";
 import AutoTradeRoundTripRow from "@/components/Chart/AutoTradeRoundTripRow";
+import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
 import { Badge, Button, Skeleton } from "@/components/ui";
 import { buildRoundTrips, type RoundTrip } from "@/lib/autoTradePnl";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
@@ -60,53 +61,67 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
   // pre-existing 口径本轮不动）；老记录全缺新键 → null → 整行隐藏（不显示一排误导性的 0）。
   const observability = useMemo(() => aggregateAiObservability(detail.members), [detail.members]);
 
+  // §3.6 双栏：左栏 = KPI + 权益/回撤 + AI 决策概况 + 预计年化；右栏 = 逐成员完整交易（可展开行内 K 线）。
+  // 「当前」页与「历史·详情」页同构。窄屏（<md）上下堆叠；左右各自 `overflow-y-auto`（避免嵌套双滚动 P2-3）。
   return (
-    <div className="flex flex-col gap-3">
+    <div className="flex min-h-0 flex-1 flex-col gap-3">
       <div className="flex items-center justify-between">
         <BackButton onBack={onBack} />
         {reconciled && <Badge tone="accent">已对账</Badge>}
       </div>
 
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-[12px] border border-[var(--border)] bg-[var(--surface-2)] px-3.5 py-2.5 text-[11px] text-[var(--muted)]">
-        <span className="tabular text-[var(--text)]">
-          {fmtTime(detail.startedTs)} → {fmtTime(detail.endedTs)}
-        </span>
-        <span>· {detail.bar}</span>
-        {detail.strategyName && <span>· {detail.strategyName}</span>}
-        <span>· 投入预算 <span className="tabular text-[var(--text)]">{fmtNum(detail.totalBudgetUsd, 0)}</span> USDT</span>
-        <span>· {detail.status === "error" ? "异常结束" : "已停止"}</span>
-      </div>
-
-      <KpiGrid summary={summary} />
-
-      <Section title="权益 / 回撤">
-        {combinedEquity.length >= 2 ? (
-          <div className="flex flex-col gap-3">
-            <div className="h-24">
-              <PeriodReturnBars equity={combinedEquity} />
-            </div>
-            <div className="h-12">
-              <UnderwaterChart equity={combinedEquity} />
-            </div>
+      <div className="flex min-h-0 flex-1 gap-4 max-md:flex-col">
+        <aside className="flex w-[40%] shrink-0 flex-col gap-3 overflow-y-auto pr-1 max-md:w-full max-md:overflow-visible">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-[12px] border border-[var(--border)] bg-[var(--surface-2)] px-3.5 py-2.5 text-[11px] text-[var(--muted)]">
+            <span className="tabular text-[var(--text)]">
+              {fmtTime(detail.startedTs)} → {fmtTime(detail.endedTs)}
+            </span>
+            <span>· {detail.bar}</span>
+            {detail.strategyName && <span>· {detail.strategyName}</span>}
+            <span>· 投入预算 <span className="tabular text-[var(--text)]">{fmtNum(detail.totalBudgetUsd, 0)}</span> USDT</span>
+            <span>· {detail.status === "error" ? "异常结束" : "已停止"}</span>
           </div>
-        ) : (
-          <p className="px-2 py-6 text-center text-[11px] leading-relaxed text-[var(--muted)]">
-            本次会话未落权益快照（崩溃 / 对账会话），仅按成交汇总上方 KPI 与下方往返明细。
-          </p>
-        )}
-      </Section>
 
-      {aiStats && (
-        <AiStatsCard aiStats={aiStats} observability={observability} finalSummary={finalSummary} />
-      )}
+          <KpiGrid summary={summary} />
 
-      <Section title="逐成员完整交易">
-        <div className="flex flex-col gap-3">
-          {detail.members.map((m) => (
-            <MemberTrades key={m.runId} member={m} />
-          ))}
-        </div>
-      </Section>
+          <Section title="权益 / 回撤">
+            {combinedEquity.length >= 2 ? (
+              <div className="flex flex-col gap-3">
+                <div className="h-24">
+                  <PeriodReturnBars equity={combinedEquity} />
+                </div>
+                <div className="h-12">
+                  <UnderwaterChart equity={combinedEquity} />
+                </div>
+              </div>
+            ) : (
+              <p className="px-2 py-6 text-center text-[11px] leading-relaxed text-[var(--muted)]">
+                本次会话未落权益快照（崩溃 / 对账会话），仅按成交汇总上方 KPI 与右侧往返明细。
+              </p>
+            )}
+          </Section>
+
+          {aiStats && (
+            <AiStatsCard aiStats={aiStats} observability={observability} finalSummary={finalSummary} />
+          )}
+
+          {/* P2-5：年化口径 = 会话已实现收益 + 真实经历时长（endedTs-startedTs），与筛选无关。 */}
+          <AnnualizedProjectionCard
+            returnPct={summary.returnPct}
+            elapsedSec={detail.endedTs - detail.startedTs}
+            tradeCount={summary.tradeCount}
+          />
+        </aside>
+
+        <section className="flex min-w-0 flex-1 flex-col gap-2 overflow-y-auto max-md:overflow-visible">
+          <h3 className="text-[10px] font-medium uppercase tracking-wide text-[var(--muted)]">逐成员完整交易</h3>
+          <div className="flex flex-col gap-3">
+            {detail.members.map((m) => (
+              <MemberTrades key={m.runId} member={m} bar={detail.bar} />
+            ))}
+          </div>
+        </section>
+      </div>
     </div>
   );
 }
@@ -118,7 +133,8 @@ function KpiGrid({ summary }: { summary: AiTradeHistoryDetailOut["summary"] }) {
         <PrimaryKpi label="已实现总收益（USDT）" value={signed(summary.realizedPnlUsd)} color={colorForReturn(summary.realizedPnlUsd)} />
         <PrimaryKpi label="总收益率（基于投入预算）" value={fmtPct(summary.returnPct)} color={colorForReturn(summary.returnPct)} />
       </div>
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+      {/* P2-3：左栏偏窄，次级 KPI 收敛为两列（本 KpiGrid 为 Detail 局部组件，非共享，收敛不影响其它面板）。 */}
+      <div className="grid grid-cols-2 gap-2">
         <Kpi label="完整交易" value={`${summary.tradeCount} 笔`} />
         <Kpi label="胜率" value={fmtPct(summary.winRate)} />
         <Kpi label="最大单笔盈" value={signed(summary.bestUsd)} color={colorForReturn(summary.bestUsd)} />
@@ -192,7 +208,8 @@ function AiStatsCard({
   );
 }
 
-function MemberTrades({ member }: { member: AiTradeHistoryMember }) {
+// P2-6：`bar` 为**组级**（同组成员共享一个周期，源自 detail.bar），逐成员传同值正确。
+function MemberTrades({ member, bar }: { member: AiTradeHistoryMember; bar: string }) {
   const [openRowKey, setOpenRowKey] = useState<string | null>(null);
   const roundTrips = useMemo(
     () => buildRoundTrips(member.instId, member.trades, member.leverage).sort((a, b) => b.closedTs - a.closedTs),
@@ -218,6 +235,7 @@ function MemberTrades({ member }: { member: AiTradeHistoryMember }) {
                 rt={rt}
                 open={openRowKey === key}
                 onToggle={() => setOpenRowKey((prev) => (prev === key ? null : key))}
+                bar={bar}
               />
             );
           })}

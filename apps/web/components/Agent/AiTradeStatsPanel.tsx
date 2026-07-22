@@ -20,7 +20,12 @@ export default function AiTradeStatsPanel({ open, onClose }: { open: boolean; on
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
 
   return (
-    <Modal open={open} onClose={onClose} labelledBy={TITLE_ID} className="max-w-3xl">
+    <Modal
+      open={open}
+      onClose={onClose}
+      labelledBy={TITLE_ID}
+      className="max-w-[60vw] max-md:max-w-[94vw]"
+    >
       <div className="flex items-center justify-between border-b border-[var(--border)] px-5 py-3.5">
         <h2 id={TITLE_ID} className="text-sm font-semibold text-[var(--text)]">
           AI 自动交易统计
@@ -39,13 +44,18 @@ export default function AiTradeStatsPanel({ open, onClose }: { open: boolean; on
         <Tabs tabs={TABS} active={active} onChange={setActive} variant="underline" />
       </div>
 
-      <div className="flex max-h-[72vh] flex-col overflow-auto px-5 py-4">
+      {/* 双栏改造（§3.2）：body 为有界 flex 壳。宽屏（md+）body 不滚、滚动下放两栏各自 `overflow-y-auto`
+          （避免嵌套双滚动 P2-3）；窄屏（<md）两栏上下堆叠、由 body 整体滚动（栏内 `max-md:overflow-visible`）。
+          历史·列表不分栏，单独包一层滚动。 */}
+      <div className="flex min-h-0 max-h-[72vh] flex-col overflow-y-auto px-5 py-4 md:overflow-hidden">
         {active === "live" ? (
           <AiTradeStatsLive />
         ) : selectedGroupId ? (
           <AiTradeStatsDetail groupId={selectedGroupId} onBack={() => setSelectedGroupId(null)} />
         ) : (
-          <AiTradeStatsHistoryList onSelect={setSelectedGroupId} />
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            <AiTradeStatsHistoryList onSelect={setSelectedGroupId} />
+          </div>
         )}
       </div>
     </Modal>

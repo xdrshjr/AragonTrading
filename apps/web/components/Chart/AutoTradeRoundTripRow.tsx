@@ -5,20 +5,27 @@ import { Badge } from "@/components/ui";
 import { colorForReturn, fmtPct, fmtPrice, fmtTime, signed } from "@/lib/format";
 import type { RoundTrip } from "@/lib/autoTradePnl";
 import TradeExplainDetail from "../Strategy/TradeExplainDetail";
+import TradeCandleChartPanel from "./TradeCandleChartPanel";
 
 // 一条「完整交易」往返（开→平）行（auto-trade-pnl-records §3.4）：折叠态以盈亏 / 收益率为视觉焦点，
 // 整行可展开查看平仓触发原因（复用 TradeExplainDetail）。键盘可达、渐进披露。
+//
+// ai-trade-stats-two-column-and-kline §3.5 / P1-3：新增**可选** `bar?`。仅 AI 统计看板向 row 传 `bar` →
+// 放宽可展开并在展开态额外渲染该往返窗口的行内 K 线；其它调用点（live-auto / paper 面板）不传 `bar`，
+// `expandable` 仍 = `Boolean(rt.exit.explain)`、展开仍只有 `TradeExplainDetail` → 逐字节不变（零回归）。
 export default function AutoTradeRoundTripRow({
   rt,
   open,
   onToggle,
+  bar,
 }: {
   rt: RoundTrip;
   open: boolean;
   onToggle: () => void;
+  bar?: string;
 }) {
   const tone = colorForReturn(rt.pnlUsd);
-  const expandable = Boolean(rt.exit.explain);
+  const expandable = Boolean(bar) || Boolean(rt.exit.explain);
   return (
     <div className="border-t border-[var(--border)] first:border-t-0">
       <button
@@ -55,8 +62,11 @@ export default function AutoTradeRoundTripRow({
         </div>
       </button>
       {expandable && open && (
-        <div className="px-3 pb-3 pt-0.5">
-          <TradeExplainDetail trade={rt.exit} />
+        <div className="flex flex-col gap-2 px-3 pb-3 pt-0.5">
+          {bar && (
+            <TradeCandleChartPanel instId={rt.instId} bar={bar} entry={rt.entry} exit={rt.exit} />
+          )}
+          {rt.exit.explain && <TradeExplainDetail trade={rt.exit} />}
         </div>
       )}
     </div>

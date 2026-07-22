@@ -1,10 +1,12 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
 import AutoTradePnlSummary from "@/components/Chart/AutoTradePnlSummary";
 import AutoTradeRoundTripRow from "@/components/Chart/AutoTradeRoundTripRow";
 import {
   type AutoTradeRange,
+  type PnlSummary,
   type RoundTrip,
   buildLedger,
   filterRoundTrips,
@@ -39,18 +41,31 @@ export default function AiTradeStatsLive() {
       : null;
   }, [group]);
 
-  const { visible, summary, bounds } = useMemo(() => {
+  const { visible, summary, bounds, fullSummary } = useMemo<{
+    visible: RoundTrip[];
+    summary: PnlSummary;
+    bounds: { startTs: number; endTs: number };
+    fullSummary: PnlSummary;
+  }>(() => {
     if (!group) {
-      return { visible: [], summary: summarizeRoundTrips([], 0), bounds: { startTs: 0, endTs: nowSec } };
+      const empty = summarizeRoundTrips([], 0);
+      return { visible: [], summary: empty, bounds: { startTs: 0, endTs: nowSec }, fullSummary: empty };
     }
     const members = Object.values(group.members).map((m) => ({
       instId: m.instId,
       trades: m.trades,
       leverage: group.leverage,
     }));
+    const ledger = buildLedger(members);
     const b = resolveRangeBounds(range, nowSec, custom);
-    const vis = filterRoundTrips(buildLedger(members), b).sort((a, c) => c.closedTs - a.closedTs);
-    return { visible: vis, summary: summarizeRoundTrips(vis, capitalBaseUsd), bounds: b };
+    const vis = filterRoundTrips(ledger, b).sort((a, c) => c.closedTs - a.closedTs);
+    // P2-5：年化口径与时间筛选解耦——用**未筛选全会话**汇总（returnPct/tradeCount），避免切窗口令年化跳变。
+    return {
+      visible: vis,
+      summary: summarizeRoundTrips(vis, capitalBaseUsd),
+      bounds: b,
+      fullSummary: summarizeRoundTrips(ledger, capitalBaseUsd),
+    };
   }, [group, range, custom, nowSec, capitalBaseUsd]);
 
   if (group == null) {
@@ -59,55 +74,69 @@ export default function AiTradeStatsLive() {
     );
   }
 
+  // §3.2 双栏骨架：左栏承载统计数据（起始提示 / 运行观测 / KPI 概览 / 预计年化 / 持仓浮盈），
+  // 右栏承载交易记录（倒序完整往返，可展开行内 K 线）。窄屏（<md）上下堆叠。左右各自 `overflow-y-auto`。
   return (
-    <div className="flex flex-col gap-3">
-      <p className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-2.5 py-1.5 text-[10px] leading-relaxed text-[var(--muted)]">
-        数据自 <span className="tabular text-[var(--text)]">{fmtTime(group.startedTs)}</span> 起记录
-        （运行期态；整组停止后转入「历史」标签持久保存）。
-      </p>
-      <div className="flex flex-col gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2">
-        <p className="text-[10px] text-[var(--muted)]">
-          运行观测 · 反思计数为近 50 轮样本口径；唤醒抑制 / 连续观望为会话级实时值
+    <div className="flex min-h-0 flex-1 gap-4 max-md:flex-col">
+      <aside className="flex w-[40%] shrink-0 flex-col gap-3 overflow-y-auto pr-1 max-md:w-full max-md:overflow-visible">
+        <p className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-2.5 py-1.5 text-[10px] leading-relaxed text-[var(--muted)]">
+          数据自 <span className="tabular text-[var(--text)]">{fmtTime(group.startedTs)}</span> 起记录
+          （运行期态；整组停止后转入「历史」标签持久保存）。
         </p>
-        {Object.values(group.members).map((m) => (
-          <MemberObservabilityRow key={m.instId} member={m} />
-        ))}
-      </div>
-      <AutoTradePnlSummary
-        range={range}
-        onRangeChange={setRange}
-        custom={custom}
-        onCustomChange={setCustom}
-        summary={summary}
-      />
-      {unrealizedUsd !== null && (
-        <div className="flex items-center justify-between rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs">
-          <span className="text-[var(--muted)]">
-            当前持仓浮盈（未实现，全局）
-            <span className="ml-1 text-[10px]">· 与时间窗口无关，不计入上方已实现总收益</span>
-          </span>
-          <span className="tabular font-semibold" style={{ color: colorForReturn(unrealizedUsd) }}>
-            {signed(unrealizedUsd)} USDT
-          </span>
+        <div className="flex flex-col gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2">
+          <p className="text-[10px] text-[var(--muted)]">
+            运行观测 · 反思计数为近 50 轮样本口径；唤醒抑制 / 连续观望为会话级实时值
+          </p>
+          {Object.values(group.members).map((m) => (
+            <MemberObservabilityRow key={m.instId} member={m} />
+          ))}
         </div>
-      )}
-      {visible.length === 0 ? (
-        <WindowEmpty earlierThanStart={bounds.endTs < group.startedTs} startedTs={group.startedTs} />
-      ) : (
-        <div className="overflow-hidden rounded-md border border-[var(--border)] bg-[var(--surface)]">
-          {visible.map((rt) => {
-            const key = rowKey(rt);
-            return (
-              <AutoTradeRoundTripRow
-                key={key}
-                rt={rt}
-                open={openRowKey === key}
-                onToggle={() => setOpenRowKey((prev) => (prev === key ? null : key))}
-              />
-            );
-          })}
-        </div>
-      )}
+        <AutoTradePnlSummary
+          range={range}
+          onRangeChange={setRange}
+          custom={custom}
+          onCustomChange={setCustom}
+          summary={summary}
+        />
+        <AnnualizedProjectionCard
+          returnPct={fullSummary.totalReturnPct}
+          elapsedSec={nowSec - group.startedTs}
+          tradeCount={fullSummary.count}
+        />
+        {unrealizedUsd !== null && (
+          <div className="flex items-center justify-between rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs">
+            <span className="text-[var(--muted)]">
+              当前持仓浮盈（未实现，全局）
+              <span className="ml-1 text-[10px]">· 与时间窗口无关，不计入上方已实现总收益</span>
+            </span>
+            <span className="tabular font-semibold" style={{ color: colorForReturn(unrealizedUsd) }}>
+              {signed(unrealizedUsd)} USDT
+            </span>
+          </div>
+        )}
+      </aside>
+
+      <section className="flex min-w-0 flex-1 flex-col gap-2 overflow-y-auto max-md:overflow-visible">
+        <h3 className="text-[10px] font-medium uppercase tracking-wide text-[var(--muted)]">交易记录</h3>
+        {visible.length === 0 ? (
+          <WindowEmpty earlierThanStart={bounds.endTs < group.startedTs} startedTs={group.startedTs} />
+        ) : (
+          <div className="overflow-hidden rounded-md border border-[var(--border)] bg-[var(--surface)]">
+            {visible.map((rt) => {
+              const key = rowKey(rt);
+              return (
+                <AutoTradeRoundTripRow
+                  key={key}
+                  rt={rt}
+                  open={openRowKey === key}
+                  onToggle={() => setOpenRowKey((prev) => (prev === key ? null : key))}
+                  bar={group.bar}
+                />
+              );
+            })}
+          </div>
+        )}
+      </section>
     </div>
   );
 }
