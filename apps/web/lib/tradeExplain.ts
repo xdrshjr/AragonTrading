@@ -56,7 +56,8 @@ function inferKindFromReason(trade: Trade): TriggerExplainKind {
   const reason = trade.reason || "";
   // 止损 / 止盈触发价强平与 max_hold 同属风控离场（warn 色调），统一归 risk_exit。
   if (reason === "max_hold" || reason === "stop_loss" || reason === "take_profit") return "risk_exit";
-  // 利润保护三码（ai-trade-profit-protection §2.7）：老成交无 explain 时也能正确归类为「利润保护」。
+  // 利润保护四码（含 commitment 的 `profit_guard_committed_exit`，ai-trade-profit-protection §2.7 /
+  // commitment §2.4）：`profit_guard_` 前缀**自动**把承诺退出线码归入「利润保护」kind，分类零改。
   if (reason.startsWith("profit_guard_")) return "profit_guard";
   if (reason === "session_stop") return "session_stop";
   if (reason === "external_close") return "external_close";

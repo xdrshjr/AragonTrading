@@ -14,7 +14,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .profit_cooldown import CooldownState, build_cooldown_view
 from .profit_guard import (
@@ -25,6 +25,9 @@ from .profit_guard import (
     advance_state,
     build_idle_snapshot,
     build_snapshot,
+    clamp_commitment,
+    is_commit_armed,
+    ratchet_commitment,
     unavailable_reason_for,
 )
 
@@ -99,6 +102,10 @@ class ProfitGuardRuntime:
         last_peak_pnl_usd: 最近一次**可用**快照的峰值浮盈（F4；读取即消费）。
         warned_seq: 平仓未成交 warn 的每持仓周期节流游标（P2-8）。
         pending_protect_note: 下一轮 payload 的一次性平仓回执（读取即消费，P1-7）。
+        committed_exit_px: 已棘轮的承诺退出线（本轮 C2；None=本 epoch 尚无承诺）。
+        committed_exit_basis: 当前承诺线被哪条约束定住（展示用）。
+        committed_exit_epoch: 承诺线所属 epoch 的 `(side, seq)` 身份戳（[P0-1]）——承诺线**是** epoch
+            作用域状态，必须与 `peak_px` 共用 `(side, seq)` 身份，随 `advance_state` 的新 epoch 复位。
     """
 
     def __init__(self, rule: ProfitGuardRule | None):
@@ -111,11 +118,22 @@ class ProfitGuardRuntime:
         self.last_peak_pnl_usd: float | None = None
         self.warned_seq: int | None = None
         self.pending_protect_note: dict | None = None
+        self.committed_exit_px: float | None = None
+        self.committed_exit_basis: str | None = None
+        self.committed_exit_epoch: tuple | None = None
 
     # ---------- 状态推进 / 快照 ----------
     def clear_state(self) -> None:
-        """持仓已消失（flat / 保护平仓成交）：丢弃 epoch 状态，下一仓从 entry 重新起算。"""
+        """持仓已消失（flat / 保护平仓成交）：丢弃 epoch 状态与承诺线，下一仓从 entry 重新起算。
+
+        [P0-1] 承诺线**三清**：epoch 结束（flat / 保护平仓）时承诺线随 `peak_px` 一并作废。但仅靠此处
+        清空**不够**——原子反手 `long→short` 不经 flat、`clear_state()` 不触发，故 `refresh` 还须按
+        `committed_exit_epoch` 与新 epoch 比对再作废一次（见 `refresh`）。
+        """
         self.state = None
+        self.committed_exit_px = None
+        self.committed_exit_basis = None
+        self.committed_exit_epoch = None
 
     def refresh(self, facts: PositionFacts, *, stale_feed: bool) -> dict | None:
         """推进 epoch / 峰值价并组装 wire 快照（**纯同步、无 await**）；未装配 → None。
@@ -135,12 +153,44 @@ class ProfitGuardRuntime:
         reason = unavailable_reason_for(facts, self.rule, px_age_s=facts.px_age_s,
                                         stale_feed=stale_feed)
         self.state = advance_state(self.state, facts)
+        # [P0-1] 承诺线绑定 `(side, seq)` epoch 身份：`advance_state` 一旦因反手（side 变）/ 同向重开
+        # （seq 变）/ 首仓（state 曾 None）产出新 epoch，旧承诺线**必须先作废**——否则旧多头承诺线会
+        # 被带进新空头 epoch 并当场强平新仓（executor 的原子反手不经 flat、clear_state 不触发）。
+        epoch = (self.state.side, self.state.seq)
+        if self.committed_exit_epoch != epoch:
+            self.committed_exit_px = None
+            self.committed_exit_basis = None
+            self.committed_exit_epoch = epoch
+        # 把当前棘轮值注入本轮断面（承诺线经此进 build_snapshot 的第三条下方线与归因）。
+        facts = replace(facts, committed_exit_px=self.committed_exit_px,
+                        committed_exit_basis=self.committed_exit_basis)
         snapshot = build_snapshot(self.rule, self.state, facts, unavailable_reason=reason)
         if reason is None:
             # F4：只缓存**可用**快照的峰值浮盈——unavailable 快照的派生量一律 None，缓存它等于用
             # 一个不作数的数字去当捕获率分母。
             self.last_peak_pnl_usd = snapshot.get("peakUnrealizedPnlUsd")
         return snapshot
+
+    def record_commitment(self, proposed_px, snapshot: dict | None) -> None:
+        """把模型本轮承诺的退出线经**武装门控 → 纯几何夹紧 → 单调棘轮**记进运行时（本轮 C2）。
+
+        读的是**本轮快照**（模型据以决策的那一份），故承诺线与模型看到的现价 / 保本线 / ATR 同源、
+        可解释。未装配 / 承诺关 / 无快照 / 未武装一律短路（承诺线不会覆盖前值——棘轮的执行力来自此）。
+
+        [P1-1] 武装门控用**唯一谓词** `is_commit_armed`（与回测同一份）；[P1-1] `clamp_commitment` 纯
+        几何、不传 armed；[P1-2] 棘轮只此一处 `ratchet_commitment`（实盘与回测同 import 同调）。
+        """
+        if self.rule is None or not self.rule.commit_enabled or not snapshot:
+            return
+        if not is_commit_armed(snapshot.get("status")):
+            return
+        line, basis = clamp_commitment(
+            proposed_px, side=snapshot.get("side"), mark_px=snapshot.get("livePx"),
+            entry_px=snapshot.get("entryPx"), breakeven_px=snapshot.get("breakevenPx"),
+            atr_px=snapshot.get("atrPx"), atr_floor_mult=self.rule.atr_floor_mult)
+        self.committed_exit_px, self.committed_exit_basis = ratchet_commitment(
+            self.committed_exit_px, self.committed_exit_basis, line, basis,
+            side=snapshot.get("side"))
 
     # ---------- 计数 / 注入 ----------
     def update_hold_streak(self, stage1_action: str, stage1_degrade: str | None,

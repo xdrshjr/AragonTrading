@@ -399,7 +399,9 @@ class AiTradeManager:
             context_refresh_rounds=req.context_refresh_rounds, settings=req.settings,
             position_step_pct=req.position_step_pct,
             reflection_enabled=req.settings.ai_trade_reflection_enabled,   # 生产实盘显式开（默认 True）
-            allow_limit=allow_limit)
+            allow_limit=allow_limit,
+            # C1 §2.4：承诺退出线总闸经既有 profit_rule 通路派生（装配保护层且承诺开启时露出 holdExitPx）。
+            allow_hold_exit=(req.profit_rule is not None and req.profit_rule.commit_enabled))
         run_id = await self._create_group_run(ctx, plan, tp_i, sl_i)
         session = AiTradeSession(
             f"aitrade_{uuid.uuid4().hex}", run_id, req.specs, plan.inst_id, req.bar, executor,

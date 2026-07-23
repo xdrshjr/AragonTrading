@@ -12,6 +12,10 @@
 from __future__ import annotations
 
 from .profit_guard import (
+    COMMIT_BASIS_ADOPTED,
+    COMMIT_BASIS_ATR_FLOOR,
+    COMMIT_BASIS_CLAMPED_BREAKEVEN,
+    REASON_COMMITTED_EXIT,
     STATUS_FLAT,
     STATUS_UNAVAILABLE,
     TRAIL_BASIS_ATR_CAP,
@@ -51,7 +55,7 @@ def format_profit_guard_charter(rule: ProfitGuardRule | None) -> str:
         "**另须知悉：保护层在行情或持仓读数异常时会主动不动作**（宁可不动，也绝不据脏数据平掉一笔"
         "真实持仓），届时每轮输入会明确标注「保护层当前不可用」。因此它**不是一条你可以依赖的保证**，"
         "你的退出计划必须在没有它的前提下也成立。"
-        f"{_charter_adaptive(rule)}{_charter_cooldown(rule)}"
+        f"{_charter_adaptive(rule)}{_charter_cooldown(rule)}{_charter_commitment(rule)}"
     )
 
 
@@ -73,6 +77,26 @@ def _charter_adaptive(rule: ProfitGuardRule) -> str:
             f"{tier_text}{atr_text}"
             "每轮输入的「利润保护」段会如实给出本轮**有效回吐阈**与**这条线被哪条约束定住**，"
             "请据那个数字而不是宪章里的基准值来规划退出。")
+
+
+def _charter_commitment(rule: ProfitGuardRule) -> str:
+    """宪章的承诺退出线披露段（C1/C3 §2.3.1）；`commit_enabled=False` ⇒ **空串** ⇒ 逐字节回退（G-2）。
+
+    两层诚实语义**不可删**（同 v1 P1-5 道德风险约束）：① 明说「只收紧不放松」，否则模型会以为可随时
+    放宽而据一条它以为可变的线延长持有；② [P2-4] 明说它只是进程内兜底、让位于既有 fail-open 条款，
+    绝不宣称无条件保证。
+    """
+    if not rule.commit_enabled:
+        return ""
+    return (
+        "\n**你许下的退出线会被兑现（在保护层可用的前提下）**：当你选择继续持有并给出 `holdExitPx`"
+        "（退出价位）时，系统会把它采集为一条保护线，价格触及即**由系统直接市价平仓**。这条线**只能随你"
+        "收紧、不能放松**（同一持仓周期内你可以报一条更靠近现价的新线覆盖旧线，但报更松的线不会生效），"
+        "且**绝不会劣于保本线**。它不是对你的惩罚，而是替你守住你自己的判断——给了它，你就不必每轮盯盘等"
+        "回吐；不给它，则仅由系统的移动止盈线兜底。被你自己的承诺线平出，说明价格确实走到了你说要离场的"
+        "位置。**但它和移动止盈线一样只是进程内的兜底**：与上文 fail-open 条款一致，行情或读数异常时保护"
+        "层会主动不动作，进程若关闭则这条承诺线随之失效、只剩开仓随单 OCO——所以它**不是**一条你可以无"
+        "条件依赖的保证，你的退出计划必须在没有它时也成立。")
 
 
 def _charter_cooldown(rule: ProfitGuardRule) -> str:
@@ -184,6 +208,25 @@ def _format_lines(snapshot: dict) -> str:
     return f"  {_format_trail_line(snapshot)}｜{breakeven_text}｜{hard_text}"
 
 
+# 承诺线 basis 的中文后缀（[P2-5]，独立映射，勿复用 `_TRAIL_BASIS_SUFFIX` 以免语义漂移）；
+# `adopted` 须显式含此键（无后缀），否则会走 `.get(default)` 兜底。
+_COMMIT_BASIS_SUFFIX = {
+    COMMIT_BASIS_ATR_FLOOR: "（已按波动率放宽至下界）",
+    COMMIT_BASIS_CLAMPED_BREAKEVEN: "（已夹至保本线）",
+    COMMIT_BASIS_ADOPTED: "",
+}
+
+
+def _format_committed_line(snapshot: dict) -> str:
+    """承诺退出线一行（§2.3.2）；`committedExitPx` 为空 ⇒ 空串（调用方 join 时整行省略、逐字节回退）。"""
+    committed = snapshot.get("committedExitPx")
+    if committed is None:
+        return ""
+    suffix = _COMMIT_BASIS_SUFFIX.get(snapshot.get("committedExitBasis"), "")
+    return (f"  你的承诺退出线 {_fmt_px(committed)}{suffix}"
+            "——价格触及即由系统平仓（这是你上一轮许下的）")
+
+
 def format_profit_guard_for_prompt(snapshot: dict | None) -> str:
     """决策 prompt 的每轮只读上下文段（§2.6 b）。
 
@@ -205,7 +248,7 @@ def format_profit_guard_for_prompt(snapshot: dict | None) -> str:
                 f"{_format_unavailable_fallback(snapshot)}")
         return "\n".join(part for part in (head, last_exit_line) if part)
     bars = snapshot.get("barsInPosition")
-    body = (
+    head_block = (
         "【利润保护 · 移动止盈 / 保本（系统强制执行）】\n"
         f"  持仓 {snapshot.get('holdSeconds'):.0f}s"
         f"{'' if bars is None else f'（{bars} 根）'}"
@@ -215,10 +258,11 @@ def format_profit_guard_for_prompt(snapshot: dict | None) -> str:
         f"  峰值浮盈 {_fmt_usd(snapshot.get('peakUnrealizedPnlUsd'))}"
         f"（保证金收益 {_fmt_pct(snapshot.get('peakReturnPct'))}，"
         f"峰值价 {_fmt_px(snapshot.get('peakPx'))}）→ 已回吐 "
-        f"{float(snapshot.get('givebackRatio') or 0.0) * 100:.1f}%\n"
-        f"{_format_lines(snapshot)}\n"
-        f"{_format_effective_exit(snapshot)}\n"
-        f"  {_format_exchange_oco(snapshot)}")
+        f"{float(snapshot.get('givebackRatio') or 0.0) * 100:.1f}%")
+    # 承诺退出线一行仅在非空时进 body（§2.3.2）：为空时 join 跳过 ⇒ 与 v2 逐字节一致（G-1）。
+    body = "\n".join(part for part in (
+        head_block, _format_lines(snapshot), _format_committed_line(snapshot),
+        _format_effective_exit(snapshot), f"  {_format_exchange_oco(snapshot)}") if part)
     return "\n".join(part for part in (body, last_exit_line) if part)
 
 
@@ -226,7 +270,11 @@ def _format_effective_exit(snapshot: dict) -> str:
     exit_px = snapshot.get("effectiveExitPx")
     if exit_px is None:
         return "  ★ 有效退出线：尚未武装，本轮保护层不会平仓——退出完全由你负责"
-    return (f"  ★ 有效退出线 {_fmt_px(exit_px)}：价格**向下触及**（做空为向上）即由系统市价平仓，"
+    # [P1-3] 归因只读后端 `effectiveExitSource`（唯一真源），不前端比价推断；非承诺线定住时后缀为空
+    # ⇒ 逐字节回退 v2（G-1）。
+    src = ("（当前由你的承诺线定住）"
+           if snapshot.get("effectiveExitSource") == REASON_COMMITTED_EXIT else "")
+    return (f"  ★ 有效退出线 {_fmt_px(exit_px)}{src}：价格**向下触及**（做空为向上）即由系统市价平仓，"
             "你无需等待")
 
 
@@ -241,9 +289,15 @@ def format_profit_hold_note(snapshot: dict | None, rounds) -> str:
     return_pct = snapshot.get("returnPct")
     if return_pct is None or return_pct <= 0:
         return ""
+    # C1 §2.3.4：已有承诺线时把「散文索要退出线」升级为「结构化收紧」引导；无承诺线时逐字节回退 v2。
+    committed = snapshot.get("committedExitPx")
+    exit_ask = (f"① 你当前的承诺退出线是 {_fmt_px(committed)}，如需收紧请给出更靠近现价的 `holdExitPx`"
+                "（系统只会据它向现价收紧、不会放松），"
+                if committed is not None
+                else "① **你的退出线**（具体价位或条件），")
     return (f"盈利持仓自察：你已连续 {rounds} 轮在浮盈状态下选择继续持有"
             f"（当前保证金收益 {_fmt_pct(return_pct)}，"
             f"自峰值已回吐 {float(snapshot.get('givebackRatio') or 0.0) * 100:.1f}%）。"
-            "若本轮仍选择持有，请在研判中明确给出：① **你的退出线**（具体价位或条件），"
+            f"若本轮仍选择持有，请在研判中明确给出：{exit_ask}"
             "② 为什么此刻继续承担利润回吐风险优于兑现。这不是必须平仓的指令；"
             "但「浮盈还在」本身不构成继续持有的理由。")

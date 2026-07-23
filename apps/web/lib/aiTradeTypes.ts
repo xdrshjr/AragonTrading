@@ -234,6 +234,9 @@ export interface AiTradeProfitGuardRule {
   atrCapMult?: number | null;                // 回吐**距离**上界 = 该倍数 × ATR；0 = 关闭上界
   cooldownSeconds?: number | null;           // 保护性平仓后的冷却秒数；0 = 关闭冷却
   cooldownScope?: "same_side" | "both" | null;
+  // 承诺退出线总闸（ai-trade-profit-protection-commitment C1）：仅**只读回执**（后端 rule_wire 下发），
+  // 前端据此决定是否展示承诺线区块；不作为可提交的会话参数（承诺是系统能力、由运维 settings 控制）。
+  commitEnabled?: boolean | null;
 }
 
 // 利润阶梯的一档：峰值保证金收益率越过 `peakReturnPct` 即改用该档的 `givebackPct`。

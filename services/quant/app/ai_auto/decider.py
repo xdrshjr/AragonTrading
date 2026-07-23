@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import random
 import uuid
 from dataclasses import dataclass
@@ -117,6 +118,9 @@ class TradeDecision:
     reason: str
     ord_type: str = "market"       # market | limit（仅 open_* / close 有意义）
     limit_px: float | None = None  # 已过价带门禁的委托价；market 恒 None
+    # 承诺退出线（ai-trade-profit-protection-commitment C1）：仅 `action=hold` 携带的合法值有意义
+    # （非法值 / 非 hold 恒 None，绝不因此降级 hold）。末位带默认值 ⇒ 既有位置/六元构造零改动。
+    hold_exit_px: float | None = None
 
 
 def _hold(reason: str) -> TradeDecision:
@@ -137,6 +141,19 @@ def _clamp01(value) -> float | None:
     return max(0.0, min(n, 1.0))
 
 
+def _finite_px(value) -> float | None:
+    """把工具入参里的报价解析为**正有限**浮点，否则 None（C1 承诺退出线解析用）。
+
+    与 `orderType/limitPrice` 对非法值「一律忽略、绝不据它降级」同理（`decider.py` F-2 先例）：
+    一条读不懂的退出线不该把最安全的 hold 动作降级。
+    """
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    return n if math.isfinite(n) and n > 0 else None
+
+
 @dataclass
 class ReflectionVerdict:
     """下单前二次反思裁决（ai-trade-pre-trade-reflection §5.1）：confirm/abort + 可选收缩仓位 + 理由。"""
@@ -155,7 +172,7 @@ class AiTradeDecider:
     def __init__(self, llm: LLMClient, system_prompt: str, *,
                  context_refresh_rounds: int, settings: Settings,
                  position_step_pct: float = 0.0, reflection_enabled: bool = False,
-                 allow_limit: bool = False):
+                 allow_limit: bool = False, allow_hold_exit: bool = False):
         self._llm = llm
         self.system_prompt = system_prompt
         self.context_refresh_rounds = max(1, int(context_refresh_rounds))
@@ -166,6 +183,10 @@ class AiTradeDecider:
         # `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA` 当场失败。回测恒为 False（§2.10：
         # SimBroker 每单必成，放任限价进回测会系统性高估）；生产装配从 settings 显式打开。
         self.allow_limit = bool(allow_limit)
+        # 承诺退出线总闸（默认 **False**，镜像 allow_limit）：默认 False 是硬约束——它让
+        # `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA` 恒等断言原样通过（§2.1.2）。生产
+        # 装配点从 `profit_rule.commit_enabled` 派生（manager/backtest 各自决定）。
+        self.allow_hold_exit = bool(allow_hold_exit)
         # 下单前二次反思总闸（默认关；直接构造该决策器的既有测试/回测 → reflect 无副作用直通、逐字零回归。
         # 生产装配 manager/backtest_manager 从 req.settings.ai_trade_reflection_enabled 显式打开，§2.3）。
         self.reflection_enabled = bool(reflection_enabled)
@@ -174,10 +195,12 @@ class AiTradeDecider:
         self._tool = ToolSchema(
             name=DECISION_TOOL_NAME,
             description=build_decision_tool_description(self.allow_limit,
-                                                        limit_band_pct=band_pct),
+                                                        limit_band_pct=band_pct,
+                                                        allow_hold_exit=self.allow_hold_exit),
             input_schema=build_decision_tool_schema(self._position_step,
                                                     allow_limit=self.allow_limit,
-                                                    limit_band_pct=band_pct))
+                                                    limit_band_pct=band_pct,
+                                                    allow_hold_exit=self.allow_hold_exit))
         # 反思唯一放行工具（镜像决策工具的「唯一放行」范式，安全由回落兜底，§2.2）。
         self._reflection_tool = ToolSchema(name=REFLECTION_TOOL_NAME,
                                            description=REFLECTION_TOOL_DESCRIPTION,
@@ -348,6 +371,10 @@ class AiTradeDecider:
         if action not in self._allowed_actions:
             return _hold("invalid_action"), "invalid_action"
         confidence = _clamp01(raw.get("confidence"))
+        # C1（[P2-3]）：`_map_decision` 无字面 `action == "hold"` 分支（hold/close/cancel_order 同走
+        # 下方 fall-through），故承诺退出线**必须显式以 `action == "hold"` 为条件**解析——否则残留的
+        # holdExitPx 会泄漏到 close/cancel_order。非法值 ⇒ None，绝不降级（hold 已是最安全动作）。
+        hold_exit_px = _finite_px(raw.get("holdExitPx")) if action == "hold" else None
         # F-2：限价解析/价带门禁只对下单动作执行——hold/cancel_order 无委托语义，LLM 残留的
         # orderType/limitPrice 一律忽略（否则撤单意图会被 missing_limit_price 整轮降级吞掉）。
         if action in ORDERING_ACTIONS:
@@ -368,7 +395,8 @@ class AiTradeDecider:
             from .signals import quantize_size_fraction
             size = quantize_size_fraction(size, self._position_step)
             return TradeDecision(action, size, confidence, reason, ord_type, limit_px), None
-        return TradeDecision(action, None, confidence, reason, ord_type, limit_px), None
+        return (TradeDecision(action, None, confidence, reason, ord_type, limit_px,
+                              hold_exit_px), None)
 
     # ---------- 下单前二次反思（ai-trade-pre-trade-reflection §2.2/§2.4）----------
     async def reflect(self, payload: dict, decision: TradeDecision, *,
@@ -487,7 +515,10 @@ class AiTradeDecider:
         # M-9：委托方式随 journal 落痕，否则滚动摘要会丢失挂单史（Agent 记不得自己挂过什么价）。
         decision_input = {"action": decision.action, "sizeFraction": decision.size_fraction,
                           "confidence": decision.confidence, "reason": decision.reason,
-                          "orderType": decision.ord_type, "limitPrice": decision.limit_px}
+                          "orderType": decision.ord_type, "limitPrice": decision.limit_px,
+                          # C1：承诺退出线随 journal 落痕，否则滚动摘要重置后问责回路断裂（模型记不得
+                          # 自己许过什么退出线）——与 orderType/limitPrice 当初落 journal 同理（M-9）。
+                          "holdExitPx": decision.hold_exit_px}
         if reflection and reflection.get("vetoed"):
             # 浅拷贝合并，绝不就地改 `executed` 入参对象；非否决轮走 else 分支逐字不变（R-05）。
             tool_result_text = json.dumps({**executed, "reflection": reflection},

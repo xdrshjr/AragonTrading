@@ -192,6 +192,32 @@ describe("AiTradePanel · 利润保护行", () => {
     expect(row).toHaveTextContent("利润保护暂不可用（行情数据陈旧）");
     expect(row).not.toHaveTextContent("退出线");
   });
+
+  it("承诺退出线（commitment C4）→ 展示承诺线 + 「当前由它定住」（只读 effectiveExitSource）", () => {
+    seedGuardGroup(
+      {
+        ...GUARD,
+        committedExitPx: 0.07298,
+        committedExitBasis: "adopted",
+        effectiveExitSource: "profit_guard_committed_exit",
+      },
+      "long",
+    );
+    render(
+      <AiTradePanel rows={ROWS} active="BTC-USDT-SWAP" livePrice={null} changePct={null} onSelect={noop} />,
+    );
+    const committed = screen.getByTestId("ai-profit-guard-committed");
+    expect(committed).toHaveTextContent("承诺退出线 0.07298");
+    expect(committed).toHaveTextContent("当前由它定住");
+  });
+
+  it("无承诺线 → 承诺行不渲染", () => {
+    seedGuardGroup(GUARD, "long");
+    render(
+      <AiTradePanel rows={ROWS} active="BTC-USDT-SWAP" livePrice={null} changePct={null} onSelect={noop} />,
+    );
+    expect(screen.queryByTestId("ai-profit-guard-committed")).not.toBeInTheDocument();
+  });
 });
 
 // 冷却 chip 的门控是 `member.profitGuardCooldown`（与 position 平级），**不是** position 之下的

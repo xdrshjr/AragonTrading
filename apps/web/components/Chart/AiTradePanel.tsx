@@ -2,10 +2,12 @@
 
 import { Badge } from "@/components/ui";
 import {
+  describeCommittedExit,
   describeProfitGuardCooldown,
   describeProfitGuardFallback,
   describeProfitGuardStatus,
   describeProfitGuardTrail,
+  isEffectiveExitCommitted,
 } from "@/lib/aiTrade";
 import { colorForReturn, fmtMoney, fmtNum, fmtPct, fmtPrice } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
@@ -173,6 +175,8 @@ function ProfitGuardRow({ guard }: { guard: ProfitGuardSnapshot | null }) {
   const exitPx = guard.effectiveExitPx;
   // 「这条线被谁定住」必须写出来：自适应之后用户已无法心算出这条线，看不懂就不会信它（R-11）。
   const trail = describeProfitGuardTrail(guard);
+  // 承诺退出线（commitment C4）：模型自己许下的第三条保护线；「当前由它定住」只读后端归因（[P1-3]）。
+  const committed = describeCommittedExit(guard);
   return (
     <span className="tabular truncate text-[10px] text-[var(--muted)]" data-testid="ai-profit-guard">
       峰值 {peak == null ? "—" : `${peak >= 0 ? "+" : ""}${fmtMoney(peak)}`}
@@ -181,6 +185,12 @@ function ProfitGuardRow({ guard }: { guard: ProfitGuardSnapshot | null }) {
       {" ｜ 退出线 "}
       {exitPx == null ? "未武装" : `${fmtPrice(exitPx)}（${view.label.replace("利润保护 · ", "")}）`}
       {trail && <span className="block truncate">{trail}</span>}
+      {committed && (
+        <span className="block truncate" data-testid="ai-profit-guard-committed">
+          {committed}
+          {isEffectiveExitCommitted(guard) ? "（当前由它定住）" : ""}
+        </span>
+      )}
     </span>
   );
 }

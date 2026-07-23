@@ -246,6 +246,10 @@ class Settings(BaseSettings):
     ai_trade_profit_guard_cooldown_scope: str = "same_side"      # same_side | both
     # AI 回测侧总闸：false ⇒ 回测恒不装配保护层（逐字回到第 1 轮的回测行为，含 payload 无键、prompt 回退）。
     ai_trade_profit_guard_backtest_enabled: bool = True
+    # ---- 承诺退出线棘轮（ai-trade-profit-protection-commitment C1/C3）----
+    # 承诺退出线总闸：把模型每轮被索要、却从不被系统采集/执行的退出线做成结构化、单调棘轮、确定性兑现
+    # 的第三条保护线。False ⇒ 决策工具字段 / 宪章段 / 判定逐字节回退 v2（G-1/G-2）。
+    ai_trade_profit_guard_commitment_enabled: bool = True
     # ---- AI 自动交易 · 回测模式（ai-auto-trading-backtest §2.5，三重决策成本护栏）----
     # 回测每决策根调一次 LLM，成本/时长敏感；三重护栏：决策间隔（降频）+ 决策轮数硬上限（越界启动前
     # 拒绝，绝不静默截断）+ 并发闸（限同时消耗 LLM 的回测数）。字段名即环境变量名（AI_BACKTEST_*，

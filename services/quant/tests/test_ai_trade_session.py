@@ -1292,3 +1292,77 @@ async def test_profit_guard_status_message_is_derived_from_pnl_sign():
         assert any(m and "锁定利润" in m for m in messages)   # 本例确为正浮盈出场
     finally:
         await dispose_engine()
+
+
+# ============ 承诺退出线实盘接线（ai-trade-profit-protection-commitment C1/C2）============
+async def test_session_records_commitment_only_for_hold_with_value():
+    """C1 §2.2.4：_record_profit_commitment 仅 hold + 有值时记进运行时棘轮；非 hold / 无值 ⇒ 不记。"""
+    await init_db()
+    rule = _pg_rule(commit_enabled=True, atr_floor_mult=0.0)
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        _open_long(session)
+        peak = _pg_peak_px(0.20)
+        _arm_peak(session, peak)
+        snap = session._refresh_profit_state(time.time())
+        assert snap["status"] in ("armed", "breakeven_armed")
+        trail = _pg_trail_px(peak, rule)
+        proposed = trail + (peak - trail) * 0.5           # 现价下方、更靠近现价的合法承诺线
+        session._record_profit_commitment("hold", proposed, snap)
+        assert session._guard.committed_exit_px is not None
+        before = session._guard.committed_exit_px
+        session._record_profit_commitment("open_long", proposed * 1.001, snap)   # 非 hold ⇒ 不动
+        assert session._guard.committed_exit_px == before
+        session._record_profit_commitment("hold", None, snap)                    # 无值 ⇒ 不动
+        assert session._guard.committed_exit_px == before
+    finally:
+        await dispose_engine()
+
+
+async def test_session_commitment_exit_closes_with_committed_reason():
+    """T-1 实盘：承诺线比移动止盈线更紧时，现价触及承诺线即经**既有** _maybe_profit_exit 平仓（承诺归因）。"""
+    await init_db()
+    rule = _pg_rule(commit_enabled=True, atr_floor_mult=0.0)
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        _open_long(session)
+        q = session.subscribe()
+        peak = _pg_peak_px(0.20)
+        _arm_peak(session, peak)
+        trail = _pg_trail_px(peak, rule)
+        committed = trail + (peak - trail) * 0.5
+        snap = session._refresh_profit_state(time.time())
+        session._record_profit_commitment("hold", committed, snap)
+        session._last_live_px = committed - (committed - trail) * 0.5   # 触及承诺线、未触及更低的 trail
+        await session._maybe_profit_exit(_START_TS)
+        trades = [e["data"] for e in _drain(q) if e["type"] == "trade"]
+        assert [t["side"] for t in trades] == ["close"]
+        assert trades[0]["reason"] == "profit_guard_committed_exit"
+        assert session.profit_guard_exits == 1
+    finally:
+        await dispose_engine()
+
+
+async def test_session_commitment_resets_on_reopen_same_side():
+    """T-6 实盘（[P0-1]）：保护平仓 → 同向重开后，旧承诺线归零，绝不据它强平新仓。"""
+    await init_db()
+    rule = _pg_rule(commit_enabled=True, atr_floor_mult=0.0)
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        _open_long(session)
+        peak = _pg_peak_px(0.20)
+        _arm_peak(session, peak)
+        trail = _pg_trail_px(peak, rule)
+        committed = trail + (peak - trail) * 0.5
+        snap = session._refresh_profit_state(time.time())
+        session._record_profit_commitment("hold", committed, snap)
+        session._last_live_px = committed - (committed - trail) * 0.5
+        await session._maybe_profit_exit(_START_TS)
+        assert session.profit_guard_exits == 1
+        assert session._guard.committed_exit_px is None            # clear_state 三清
+        # 同向重开：seq 前进（close 成交驱动），新 epoch ⇒ 承诺线仍为 None
+        _open_long(session)
+        session._refresh_profit_state(time.time())
+        assert session._guard.committed_exit_px is None
+    finally:
+        await dispose_engine()

@@ -38,6 +38,12 @@ TRAIL_BASIS_ATR_CAP = "atr_cap"
 TRAIL_BASIS_CLAMPED_BREAKEVEN = "clamped_breakeven"
 TRAIL_BASIS_SUPPRESSED_AT_ENTRY = "suppressed_at_entry"
 
+# 承诺退出线（commitment）被哪条约束定住（§2.2.1）。**独立命名空间**（[P2-5]）：绝不复用 trail 侧字面，
+# 免得「夹至保本」在两条线上语义漂移；前端 `COMMIT_BASIS_SUFFIX` 须为这三个字面各配后缀（adopted=空后缀）。
+COMMIT_BASIS_ADOPTED = "adopted"
+COMMIT_BASIS_ATR_FLOOR = "atr_floor"
+COMMIT_BASIS_CLAMPED_BREAKEVEN = "clamped_breakeven"
+
 # 利润阶梯硬约束（§2.1.1 第 1 条）：档数上限 + 比例值域。阈值严格递增、回吐单调不增在
 # `normalize_giveback_tiers` 里强制——赚得越多却允许回吐得越多，等于把本轮要修的 bug 写进配置（R-2）。
 GIVEBACK_TIERS_MAX = 6
@@ -46,11 +52,15 @@ GIVEBACK_TIERS_MAX = 6
 REASON_TRAILING = "profit_guard_trailing"
 REASON_BREAKEVEN = "profit_guard_breakeven"
 REASON_HARD_TAKE_PROFIT = "profit_guard_hard_take_profit"
+# 第四条触发码（§2.2.3）：模型自己许下、经棘轮兑现的承诺退出线。`inferKindFromReason` 的
+# `profit_guard_` 前缀会自动把它归入 profit_guard kind（前端分类零改）。
+REASON_COMMITTED_EXIT = "profit_guard_committed_exit"
 
 _REASON_LABEL = {
     REASON_TRAILING: "移动止盈",
     REASON_BREAKEVEN: "保本线",
     REASON_HARD_TAKE_PROFIT: "硬止盈",
+    REASON_COMMITTED_EXIT: "承诺退出线",
 }
 
 # 快照状态机（§4.2）：flat=无持仓（仅承载 lastExit 回执）；unavailable=本轮零动作（§2.4 第 0/0b 条）。
@@ -82,8 +92,10 @@ class ProfitGuardRule:
         atr_cap_mult: 回吐**距离**上界 = 该倍数 × ATR；`0` = 关闭上界。
         cooldown_s: 保护性平仓后的冷却秒数；`0` = 关闭冷却。
         cooldown_scope: `same_side`（只拦同向开仓）| `both`。
+        commit_enabled: 承诺退出线总闸（本轮 C2/C3）；`False`（末位默认）⇒ 承诺码/宪章段/决策字段
+            逐字节回退 v2，任何既有 `ProfitGuardRule(...)` 构造零回归。
 
-    本轮新增的五个字段**全部带 dataclass 默认值 = v1 行为**（阶梯空、上下界关、冷却关），故任何直接
+    本轮新增字段带 dataclass 默认值 = v1/v2 行为（阶梯空、上下界关、冷却关、承诺关），故任何直接
     `ProfitGuardRule(...)` 的既有构造点与用例判定结果逐字节等价（G-1）。
     """
 
@@ -100,6 +112,7 @@ class ProfitGuardRule:
     atr_cap_mult: float = 0.0
     cooldown_s: float = 0.0
     cooldown_scope: str = "same_side"
+    commit_enabled: bool = False
 
 
 @dataclass
@@ -142,6 +155,8 @@ class PositionFacts:
         atr_px: 确认根 ATR(period)（价格单位）；`None` ⇒ 上下界整体不生效（退化为纯阶梯回吐）。
             **只进入回吐距离计算，绝不参与任何触发判定的比较**（G-5）；允许滞后一根（波动尺度天然是
             确认根统计量），与 `mark_px` 的实时性要求刻意不同源。
+        committed_exit_px: 已棘轮的承诺退出线（§2.2.3）；`None` ⇒ 本 epoch 尚无承诺，判定退化为 v2 两线。
+        committed_exit_basis: 承诺线被哪条约束定住（`COMMIT_BASIS_*`，仅展示）。
     """
 
     seq: int
@@ -157,6 +172,9 @@ class PositionFacts:
     exchange_oco_source: str | None = None
     px_age_s: float | None = None
     atr_px: float | None = None
+    # 承诺退出线（§2.2.3，第三条下方保护线）；默认 None ⇒ 既有构造零改、判定零变化（G-1/G-3）。
+    committed_exit_px: float | None = None
+    committed_exit_basis: str | None = None
 
 
 @dataclass(frozen=True)
@@ -337,7 +355,10 @@ def resolve_profit_guard_rule(raw: dict | None, settings: Settings) -> ProfitGua
         cooldown_s=float(_fallback(raw.get("cooldownSeconds"),
                                    settings.ai_trade_profit_guard_cooldown_s)),
         cooldown_scope=str(_fallback(raw.get("cooldownScope"),
-                                     settings.ai_trade_profit_guard_cooldown_scope)))
+                                     settings.ai_trade_profit_guard_cooldown_scope)),
+        # 承诺退出线总闸（本轮 C2/C3）：唯一来源是运维 settings（请求体不暴露此键——它是系统能力，
+        # 不是每会话可调参数）；关则承诺码/宪章段/决策字段逐字节回退 v2（G-1）。
+        commit_enabled=bool(settings.ai_trade_profit_guard_commitment_enabled))
 
 
 def rule_wire(rule: ProfitGuardRule | None) -> dict | None:
@@ -353,7 +374,8 @@ def rule_wire(rule: ProfitGuardRule | None) -> dict | None:
             "maxPriceAgeSeconds": rule.max_px_age_s,
             "givebackTiers": tiers_wire(rule.giveback_tiers),
             "atrFloorMult": rule.atr_floor_mult, "atrCapMult": rule.atr_cap_mult,
-            "cooldownSeconds": rule.cooldown_s, "cooldownScope": rule.cooldown_scope}
+            "cooldownSeconds": rule.cooldown_s, "cooldownScope": rule.cooldown_scope,
+            "commitEnabled": rule.commit_enabled}
 
 
 def advance_state(state: ProfitGuardState | None,
@@ -499,17 +521,101 @@ def _derive(rule: ProfitGuardRule, state: ProfitGuardState, facts: PositionFacts
             "breakevenPx": breakeven_px, "hardTakeProfitPx": hard_tp_px, **trail}
 
 
-def _effective_exit_px(side: str, trail_px: float | None,
-                       breakeven_px: float | None) -> float | None:
-    """有效退出线 = 两条**下方**保护线中更靠近现价的一条（long 取 max，short 取 min）。
+def _effective_exit(side: str, trail_px: float | None, breakeven_px: float | None,
+                    committed_px: float | None) -> tuple[float | None, str | None]:
+    """有效退出线 = 三条**下方**保护线中最靠近现价者，返回 `(px, reason_code)`（§2.2.3）。
 
     硬止盈**刻意不参与**：它是上方目标位（向上触及即止盈），与「向下触及即平仓」的退出线语义相反，
     混进 max/min 会得到一个既非目标也非保护的数（P2-5）。
+
+    候选顺序即同价并列时的**归因优先级**：移动止盈 > 承诺线 > 保本（与既有固定序兼容，见 §2.2.3
+    的 G-3 逐字节等价证明）。本函数是「当前由哪条线定住」的**唯一归因真源**（[P1-3]），前端只读不推。
     """
-    lines = [px for px in (trail_px, breakeven_px) if px is not None]
-    if not lines:
-        return None
-    return max(lines) if side == "long" else min(lines)
+    cands = [(trail_px, REASON_TRAILING), (committed_px, REASON_COMMITTED_EXIT),
+             (breakeven_px, REASON_BREAKEVEN)]
+    cands = [(px, code) for px, code in cands if px is not None]
+    if not cands:
+        return None, None
+    pick = max if side == "long" else min                 # 最靠近现价的下方线
+    # [P2-2] **必须**用 key=按价取极值：Python max/min 在 key 并列时返回**列表首个**达标元素，故
+    # tie-break 恰按 cands 的先后=上面的优先级。**严禁**写成 `pick(cands)`（真元组比较）——那会在价
+    # 相等时按 reason 字符串字典序 tie-break（breakeven<committed<trailing），空头 min 会错选。
+    return pick(cands, key=lambda c: c[0])
+
+
+def is_commit_armed(status: str | None) -> bool:
+    """承诺是否已武装到可采纳（[P1-1] 单一武装谓词，实盘与回测同一份、同阈值）。
+
+    与 `peak_return ≥ breakeven_arm_return_pct`（默认 3%）等价——`ARMED_STATUSES` 即
+    `(armed, breakeven_armed)`。未武装（idle / unavailable / flat / None）恒不采纳承诺。
+    """
+    return status in ARMED_STATUSES
+
+
+def clamp_commitment(proposed_px, *, side: str, mark_px: float | None,
+                     entry_px: float | None, breakeven_px: float | None,
+                     atr_px: float | None, atr_floor_mult: float) -> tuple[float | None, str]:
+    """把模型的**一次原始退出报价**夹成一条可采纳的保护线，或判定本次不采纳（返回 `(None, reason)`）。
+
+    **纯几何**函数（[P1-1]）：不做武装判定（调用方经 `is_commit_armed` 门控）、不做棘轮
+    （`ratchet_commitment`）。判定顺序**不可换**，每步对应一条 v1/v2 已确立的安全不变式（§2.2.1）。
+
+    Args:
+        proposed_px: 模型本轮 `holdExitPx` 原始报价。
+        side: `long` | `short`。
+        mark_px: 判定现价（承诺线相对它论「保护性 / 抗噪距离」）。
+        entry_px: 持仓均价（保本线关时的安全底线）。
+        breakeven_px: 已武装的保本线（在则为安全底线，夹到它而非入场价）。
+        atr_px: 本轮 ATR（价格单位）；`None` / `atr_floor_mult<=0` ⇒ 抗噪下界不生效。
+        atr_floor_mult: 抗噪下界倍数（复用 v2 同一参数）。
+
+    Returns:
+        `(line, basis)`——采纳时 basis ∈ `COMMIT_BASIS_*`；不采纳时 `(None, reason)`
+        （`not_finite` / `not_protective` / `no_floor` / `suppressed_at_floor`）。
+    """
+    # 0. 输入合法性（武装与否由调用方在此之前门控，clamp 不自带 arm 阈值——[P1-1]）。
+    if proposed_px is None or not math.isfinite(proposed_px) or proposed_px <= 0:
+        return None, "not_finite"
+    line = float(proposed_px)
+    # 1. 方向必须是保护性的：多头须在现价下方（止损保护），空头须在上方；否则给的是目标位而非保护位。
+    protective = line < mark_px if side == "long" else line > mark_px
+    if not protective:
+        return None, "not_protective"
+    # 2. 抗噪下界（复用 v2 ATR 尺度）：离现价太近的承诺线会被分钟级噪音扫掉；过近则推离至恰好该下界。
+    basis = COMMIT_BASIS_ADOPTED
+    if atr_px is not None and atr_floor_mult > 0:
+        floor_dist = atr_floor_mult * atr_px
+        if abs(mark_px - line) < floor_dist:
+            line = mark_px - floor_dist if side == "long" else mark_px + floor_dist
+            basis = COMMIT_BASIS_ATR_FLOOR
+    # 3. 安全底线（复用 v2 入场价夹紧 / 抑制，v1 P0-1 止血范式）：绝不采纳一条会把持仓在入场价之下强平
+    #    的「保护」线。[P2-1] fail-open：`floor_line is None`（保本线关且 entry 也缺）⇒ 直接 no_floor，
+    #    绝不抛（回测直调 clamp，None 比较会 TypeError）。
+    floor_line = breakeven_px if breakeven_px is not None else entry_px
+    if floor_line is None:
+        return None, "no_floor"
+    worse = line < floor_line if side == "long" else line > floor_line
+    if worse:
+        if breakeven_px is not None:
+            return float(breakeven_px), COMMIT_BASIS_CLAMPED_BREAKEVEN
+        return None, "suppressed_at_floor"      # 保本线关且报价 < 入场价 ⇒ 抑制不采纳
+    return line, basis
+
+
+def ratchet_commitment(prev_px: float | None, prev_basis: str | None,
+                       cand_px: float | None, cand_basis: str | None, *,
+                       side: str) -> tuple[float | None, str | None]:
+    """单调棘轮（[P1-2] 唯一棘轮真源，实盘与回测同调）：只能向现价收紧、绝不放松。
+
+    `cand_px is None`（本次候选不可采纳）⇒ 前值原样保留；`prev_px is None`（本 epoch 首次承诺）⇒
+    直接采纳候选；否则多头取更高 / 空头取更低（更松或相等一律拒绝，前值原样保留）。
+    """
+    if cand_px is None:
+        return prev_px, prev_basis
+    if prev_px is None:
+        return cand_px, cand_basis
+    tighter = cand_px > prev_px if side == "long" else cand_px < prev_px
+    return (cand_px, cand_basis) if tighter else (prev_px, prev_basis)
 
 
 def _round_px(value: float | None) -> float | None:
@@ -549,12 +655,16 @@ def build_snapshot(rule: ProfitGuardRule, state: ProfitGuardState, facts: Positi
              "givebackPctEffective": None, "trailBasis": None, "trailDistancePx": None,
              "trailClampedAtEntry": None}
         status = STATUS_UNAVAILABLE
-        exit_px = None
+        exit_px, exit_src = None, None
     else:
         d = _derive(rule, state, facts)
         status = (STATUS_ARMED if d["armed"]
                   else STATUS_BREAKEVEN_ARMED if d["breakevenArmed"] else STATUS_IDLE)
-        exit_px = _effective_exit_px(facts.side, d["trailStopPx"], d["breakevenPx"])
+        exit_px, exit_src = _effective_exit(facts.side, d["trailStopPx"], d["breakevenPx"],
+                                            facts.committed_exit_px)
+    # 承诺线三键与三条退出线同待遇：unavailable ⇒ **一律 None**（[P1-3]，绝不下发算得出却不作数的价位）。
+    committed_px = None if unavailable_reason is not None else facts.committed_exit_px
+    committed_basis = None if unavailable_reason is not None else facts.committed_exit_basis
     return {
         "ruleId": PROFIT_GUARD_RULE_ID, "status": status,
         "unavailableReason": unavailable_reason,
@@ -582,6 +692,11 @@ def build_snapshot(rule: ProfitGuardRule, state: ProfitGuardState, facts: Positi
         "trailDistancePx": _round_px(d["trailDistancePx"]),
         "trailClampedAtEntry": d["trailClampedAtEntry"],
         "atrPx": None if unavailable_reason is not None else _round_px(facts.atr_px),
+        # 承诺退出线三键（纯加法，§2.2.3 / §4.3）：已棘轮的承诺线、它被哪条约束定住、以及有效退出线
+        # 当前**由哪条线定住**（[P1-3] 后端单点归因真源，前端只读不推）。unavailable ⇒ 三键皆 None。
+        "committedExitPx": _round_px(committed_px),
+        "committedExitBasis": committed_basis,
+        "effectiveExitSource": exit_src,
         "lastExit": None,
     }
 
@@ -638,8 +753,13 @@ def evaluate_profit_guard(snapshot: dict | None, rule: ProfitGuardRule | None, *
     if (allowed(REASON_HARD_TAKE_PROFIT) and rule.hard_tp_return_pct > 0
             and return_pct is not None and return_pct >= rule.hard_tp_return_pct):
         return _verdict(REASON_HARD_TAKE_PROFIT, snapshot, hard_tp_px)
-    if allowed(REASON_TRAILING) and _touched(side, px, snapshot.get("trailStopPx")):
-        return _verdict(REASON_TRAILING, snapshot, snapshot.get("trailStopPx"))
-    if allowed(REASON_BREAKEVEN) and _touched(side, px, snapshot.get("breakevenPx")):
-        return _verdict(REASON_BREAKEVEN, snapshot, snapshot.get("breakevenPx"))
+    # 三条**下方**保护线（移动止盈 / 承诺线 / 保本）合一：取最靠近现价者**一次**判定，命中即以其归因码
+    # 出裁决（§2.2.3）。[P2-2] 不变式：本单次判定等价逐线判定的前提是三码在 `allow` 中**一致放行**——
+    # 现有调用方均满足（实盘 allow=None 全放；回测回撤三线全放；回测目标仅硬止盈、下方块 exit_src 必被
+    # `allowed` 挡掉）。若未来出现非一致 allow，须改回「按靠近程度遍历、返回首个 allowed 且 touched 者」。
+    exit_px, exit_src = _effective_exit(side, snapshot.get("trailStopPx"),
+                                        snapshot.get("breakevenPx"),
+                                        snapshot.get("committedExitPx"))
+    if exit_src is not None and allowed(exit_src) and _touched(side, px, exit_px):
+        return _verdict(exit_src, snapshot, exit_px)
     return None

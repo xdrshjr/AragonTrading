@@ -388,6 +388,51 @@ describe("AiTradeAgentTrace · 利润保护段", () => {
     expect(screen.getByText("利润保护 · 移动止盈已武装")).toBeInTheDocument();
   });
 
+  it("承诺退出线（commitment C4）在保护段可见 + 「当前由它定住」（只读 effectiveExitSource）", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            profitGuard: {
+              ruleId: "profit_trailing",
+              status: "armed",
+              peakUnrealizedPnlUsd: 0.302,
+              givebackRatio: 0.2,
+              effectiveExitPx: 0.07298,
+              committedExitPx: 0.07298,
+              committedExitBasis: "adopted",
+              effectiveExitSource: "profit_guard_committed_exit",
+            },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    const committed = screen.getByTestId("trace-profit-committed");
+    expect(committed).toHaveTextContent("承诺退出线 0.07298");
+    expect(committed).toHaveTextContent("当前由它定住");
+  });
+
+  it("无承诺线 → 承诺行不渲染（缺省逐字节回退）", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            profitGuard: {
+              ruleId: "profit_trailing",
+              status: "armed",
+              peakUnrealizedPnlUsd: 0.302,
+              givebackRatio: 0.2,
+              effectiveExitPx: 0.0729,
+            },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.queryByTestId("trace-profit-committed")).not.toBeInTheDocument();
+  });
+
   it("平仓后的 flat 空壳快照仍渲染 lastExit 回执（P1-7 的唯一展示点）", () => {
     // 回执只在保护平仓后的那一轮出现，彼时仓位已平 ⇒ status 恒为 flat。若整段按状态徽标早退，
     // 「上一笔仓位为何消失」就会在 UI 上被悄悄吞掉——本用例是该回归的护栏。

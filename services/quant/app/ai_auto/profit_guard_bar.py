@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from .profit_guard import (
     REASON_BREAKEVEN,
+    REASON_COMMITTED_EXIT,
     REASON_HARD_TAKE_PROFIT,
     REASON_TRAILING,
     PositionFacts,
@@ -38,8 +39,9 @@ from .profit_guard import (
     evaluate_profit_guard,
 )
 
-# 第 1 步只判两条**下方**保护线（long 语义；short 对称），第 2 步只判上方目标位。
-_DRAWDOWN_RULES = (REASON_TRAILING, REASON_BREAKEVEN)
+# 第 1 步只判三条**下方**保护线（long 语义；short 对称）——含 C5 承诺退出线（与实盘同一 allow 白名单，
+# 使承诺线经**同一** `evaluate_profit_guard` 进 bar 内极值保守成交序）；第 2 步只判上方目标位。
+_DRAWDOWN_RULES = (REASON_TRAILING, REASON_BREAKEVEN, REASON_COMMITTED_EXIT)
 _TARGET_RULES = (REASON_HARD_TAKE_PROFIT,)
 
 
@@ -57,6 +59,7 @@ class BarFacts:
         opened_ts: 开仓根 ts（`state.opened_wall` 的来源）。
         open_px / high_px / low_px: 本根 OHL（跳空成交价规则用）。
         atr_px: 本根可用的 ATR，取 `iloc[i-1]`（含本根 h/l 的 ATR 是未来函数）；None ⇒ 上下界不生效。
+        committed_exit_px: 本根生效的承诺退出线（C5）；None ⇒ 无承诺，判定退化为 v2 两线（G-4）。
     """
 
     seq: int
@@ -70,6 +73,7 @@ class BarFacts:
     high_px: float
     low_px: float
     atr_px: float | None = None
+    committed_exit_px: float | None = None
 
 
 @dataclass(frozen=True)
@@ -86,7 +90,7 @@ def _facts(bar: BarFacts, mark_px: float) -> PositionFacts:
     return PositionFacts(
         seq=bar.seq, side=bar.side, entry_px=bar.entry_px, leverage=bar.leverage,
         qty_coin=bar.qty_coin, mark_px=mark_px, now_wall=float(bar.ts),
-        atr_px=bar.atr_px)
+        atr_px=bar.atr_px, committed_exit_px=bar.committed_exit_px)
 
 
 def _is_new_epoch(state: ProfitGuardState | None, bar: BarFacts) -> bool:

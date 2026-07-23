@@ -561,6 +561,10 @@ class AiTradeSession:
             # 同上落点（§2.6 c）：盈利持有链条同样以第一阶段真实意愿为准，据本轮保护快照的浮盈正负推进。
             self._update_profit_hold_streak(decision.action, degrade,
                                             payload.get("profitGuard"))
+            # C1 §2.2.4：把模型本轮承诺的退出线记进运行时棘轮——同以**第一阶段**决策为准（门禁 / 反思
+            # 之前）：门禁只会把 open_* 降级成 hold、绝不凭空造出 hold_exit_px，故用真实意愿采集最纯。
+            self._record_profit_commitment(decision.action, decision.hold_exit_px,
+                                           payload.get("profitGuard"))
             # ★【基础策略】铁律门禁（ai-trade-base-strategy-ma-band §2.5）：必须落在 decide **之后**
             # （重试循环只认 _map_decision 的 degrade，落进去会每轮白烧 LLM，P1-1）、共识门禁与反思
             # **之前**（被否轮此时已是 hold，反思对 hold 本就直通 ⇒ 自动零 LLM 成本，P1-2）。
@@ -1024,6 +1028,13 @@ class AiTradeSession:
                                    snapshot: dict | None) -> None:
         """连续「浮盈状态下继续持有」计数（F0：判定下沉运行时，调用点与语义零变化）。"""
         self._guard.update_hold_streak(stage1_action, stage1_degrade, snapshot)
+
+    def _record_profit_commitment(self, stage1_action: str, hold_exit_px: float | None,
+                                  snapshot: dict | None) -> None:
+        """把模型本轮承诺的退出线记进运行时棘轮（C1 §2.2.4；仅 hold + 有值时）；未装配/未开启 ⇒ 内部短路。"""
+        if stage1_action != "hold" or hold_exit_px is None:
+            return
+        self._guard.record_commitment(hold_exit_px, snapshot)
 
     def _inject_profit_guard(self, payload: dict) -> None:
         """注入保护快照 / 一次性回执 / 冷却视图（F0 下沉运行时）；未装配 ⇒ 整键缺席 ⇒ prompt 逐字回退。"""

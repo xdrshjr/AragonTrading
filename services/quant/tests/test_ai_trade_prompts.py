@@ -476,3 +476,52 @@ def _guard_snapshot() -> dict:
     state = advance_state(state, facts)
     return build_snapshot(rule, state, facts)
 
+
+
+# ---------- 承诺退出线 schema / 描述 / 宪章（commitment C1/C3）----------
+def test_hold_exit_tool_description_suffix_gated():
+    """G-2：allow_hold_exit=False ⇒ 工具描述恒等模块常量；True ⇒ 尾部追加承诺退出线说明。"""
+    from app.ai_auto.prompts import (
+        DECISION_TOOL_DESCRIPTION,
+        build_decision_tool_description,
+    )
+
+    assert build_decision_tool_description(False) is DECISION_TOOL_DESCRIPTION
+    assert build_decision_tool_description(False, allow_hold_exit=False) is DECISION_TOOL_DESCRIPTION
+    text = build_decision_tool_description(False, allow_hold_exit=True)
+    assert text != DECISION_TOOL_DESCRIPTION
+    assert text.startswith(DECISION_TOOL_DESCRIPTION)          # 基础文案一字不改
+    assert "holdExitPx" in text and "只能随你收紧、不能放松" in text
+
+
+def test_hold_exit_schema_property_shape_and_optional():
+    """C1 §2.1.2：holdExitPx 为可选 number、exclusiveMinimum=0；required 不变（承诺永远可选）。"""
+    from app.ai_auto.prompts import build_decision_tool_schema
+
+    schema = build_decision_tool_schema(0.0, allow_hold_exit=True)
+    prop = schema["properties"]["holdExitPx"]
+    assert prop["type"] == "number" and prop["exclusiveMinimum"] == 0
+    assert schema["required"] == ["action", "reason"]
+
+
+def test_hold_exit_composes_with_limit_without_clobbering():
+    """C1：allow_limit 与 allow_hold_exit 同开时两组字段并存、动作枚举含 cancel_order、模块常量不被污染。"""
+    from app.ai_auto.prompts import DECISION_TOOL_SCHEMA, build_decision_tool_schema
+
+    schema = build_decision_tool_schema(0.0, allow_limit=True, allow_hold_exit=True)
+    props = schema["properties"]
+    assert "holdExitPx" in props and "limitPrice" in props and "orderType" in props
+    assert "cancel_order" in props["action"]["enum"]
+    assert "holdExitPx" not in DECISION_TOOL_SCHEMA["properties"]      # 模块常量零污染
+
+
+def test_charter_commitment_section_gated_on_commit_enabled():
+    """G-2：宪章承诺段仅 commit_enabled=True 时出现（关闭逐字节回退 v2）。"""
+    from app.ai_auto.profit_guard import ProfitGuardRule
+    from app.ai_auto.profit_guard_text import format_profit_guard_charter
+
+    off = format_profit_guard_charter(ProfitGuardRule(commit_enabled=False))
+    on = format_profit_guard_charter(ProfitGuardRule(commit_enabled=True))
+    assert "你许下的退出线会被兑现" not in off
+    assert "你许下的退出线会被兑现" in on and "只能随你收紧、不能放松" in on
+    assert on.startswith(off)                                  # 承诺段是纯追加，基础宪章一字不改

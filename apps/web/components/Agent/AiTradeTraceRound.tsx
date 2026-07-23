@@ -11,6 +11,7 @@ import {
   describeFactors,
   describeCandidateLevel,
   describeMultiTimeframeAlignment,
+  describeCommittedExit,
   describeMultiTimeframeFrame,
   describeOrderType,
   describePriceAction,
@@ -21,6 +22,7 @@ import {
   describeReflection,
   describeRegime,
   describeStance,
+  isEffectiveExitCommitted,
   describeTraceState,
   describeTrigger,
   describeVolume,
@@ -243,6 +245,8 @@ function ProfitGuardBlock({ trace }: { trace: AiTradeRoundTrace }) {
   if (guard && !view && !guard.lastExit && !cooldown) return null;
   const unavailable = guard?.status === "unavailable";
   const trail = describeProfitGuardTrail(guard);
+  // 承诺退出线（commitment C4）：模型自己许下的第三条保护线；「当前由它定住」只读后端归因（[P1-3]）。
+  const committed = describeCommittedExit(guard);
   const lastExit = guard?.lastExit ?? null;
   return (
     <div className="flex flex-col gap-1.5 rounded-[10px] border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] px-2.5 py-2">
@@ -273,6 +277,12 @@ function ProfitGuardBlock({ trace }: { trace: AiTradeRoundTrace }) {
             {" · 有效退出线 "}
             {guard.effectiveExitPx == null ? "未武装" : fmtPrice(guard.effectiveExitPx)}
             {trail && <span className="block">{trail}</span>}
+            {committed && (
+              <span className="block" data-testid="trace-profit-committed">
+                {committed}
+                {isEffectiveExitCommitted(guard) ? "（当前由它定住）" : ""}
+              </span>
+            )}
           </p>
         ))}
       {lastExit && (

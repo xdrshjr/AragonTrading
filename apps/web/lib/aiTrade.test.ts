@@ -9,6 +9,7 @@ import {
   describeAiAction,
   describeBaseRule,
   describeCandidateLevel,
+  describeCommittedExit,
   describeConsensus,
   describeDegradeReason,
   describeExecuted,
@@ -21,6 +22,7 @@ import {
   describeProfitGuardStatus,
   describeProfitGuardTrail,
   describeProfitGuardUnavailable,
+  isEffectiveExitCommitted,
   describeReflection,
   describeRegime,
   describeMultiTimeframeAlignment,
@@ -797,5 +799,62 @@ describe("describeDegradeReason · 冷却降级码", () => {
     expect(describeDegradeReason("profit_cooldown(120s,long)")).toBe(
       "利润保护冷却：刚锁住利润，暂停同向开仓(120s,long)",
     );
+  });
+});
+
+// 承诺退出线（ai-trade-profit-protection-commitment C4）
+describe("describeCommittedExit", () => {
+  const base = {
+    ruleId: "profit_trailing",
+    status: "armed" as const,
+    side: "long" as const,
+    committedExitPx: 0.07436,
+  };
+
+  it("按 basis 各配后缀（adopted 无后缀 / atr_floor / clamped_breakeven）", () => {
+    expect(describeCommittedExit({ ...base, committedExitBasis: "adopted" })).toBe(
+      "承诺退出线 0.07436",
+    );
+    expect(describeCommittedExit({ ...base, committedExitBasis: "atr_floor" })).toContain(
+      "已按波动率放宽至下界",
+    );
+    expect(describeCommittedExit({ ...base, committedExitBasis: "clamped_breakeven" })).toContain(
+      "已夹至保本线",
+    );
+  });
+
+  it("无承诺 / unavailable / flat / 无快照 → null（整行不渲染）", () => {
+    expect(describeCommittedExit({ ...base, committedExitPx: null })).toBeNull();
+    expect(describeCommittedExit({ ...base, status: "unavailable" })).toBeNull();
+    expect(describeCommittedExit({ ...base, status: "flat" })).toBeNull();
+    expect(describeCommittedExit(null)).toBeNull();
+    expect(describeCommittedExit(undefined)).toBeNull();
+  });
+});
+
+describe("isEffectiveExitCommitted", () => {
+  it("只读后端 effectiveExitSource 归因，不比价推断（[P1-3]）", () => {
+    expect(
+      isEffectiveExitCommitted({
+        ruleId: "profit_trailing",
+        status: "armed",
+        effectiveExitSource: "profit_guard_committed_exit",
+      }),
+    ).toBe(true);
+    expect(
+      isEffectiveExitCommitted({
+        ruleId: "profit_trailing",
+        status: "armed",
+        effectiveExitSource: "profit_guard_trailing",
+      }),
+    ).toBe(false);
+    expect(isEffectiveExitCommitted(null)).toBe(false);
+    expect(isEffectiveExitCommitted({ ruleId: "profit_trailing", status: "armed" })).toBe(false);
+  });
+});
+
+describe("describeProfitGuardReason: 承诺退出线码", () => {
+  it("profit_guard_committed_exit → 承诺退出线", () => {
+    expect(describeProfitGuardReason("profit_guard_committed_exit")).toBe("承诺退出线");
   });
 });

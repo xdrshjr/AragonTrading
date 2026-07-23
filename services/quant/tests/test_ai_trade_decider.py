@@ -475,3 +475,58 @@ def test_base_rule_reasons_are_not_retryable():
     assert not _is_retryable_degrade("base_rule_ma_band(pctB=0.4)")
     assert not _is_retryable_degrade("base_rule_ma_band_direction(zone=upper)")
     assert not _is_retryable_degrade("base_rule_band_unavailable")
+
+
+# ---------- 承诺退出线 holdExitPx（ai-trade-profit-protection-commitment C1）----------
+async def test_hold_exit_px_parsed_only_for_hold_and_illegal_ignored():
+    """C1：action=hold 携带的合法 holdExitPx 被采集；非法值忽略且**不降级**；close/非 hold 恒 None。"""
+    d = _decider([_tool_events({"action": "hold", "reason": "wait", "holdExitPx": 29500.0})])
+    decision, degrade = await d.decide(_payload(1))
+    assert decision.action == "hold" and degrade is None
+    assert decision.hold_exit_px == 29500.0
+
+    d2 = _decider([_tool_events({"action": "hold", "reason": "wait", "holdExitPx": -1})])
+    decision2, degrade2 = await d2.decide(_payload(1))
+    assert decision2.action == "hold" and degrade2 is None and decision2.hold_exit_px is None
+
+    d3 = _decider([_tool_events({"action": "close", "reason": "exit", "holdExitPx": 29500.0})])
+    decision3, _ = await d3.decide(_payload(1))
+    assert decision3.action == "close" and decision3.hold_exit_px is None
+
+    d4 = _decider([_tool_events({"action": "open_long", "sizeFraction": 0.5, "confidence": 0.9,
+                                 "reason": "go", "holdExitPx": 29500.0})])
+    decision4, _ = await d4.decide(_payload(1))
+    assert decision4.action == "open_long" and decision4.hold_exit_px is None
+
+
+async def test_hold_exit_px_lands_in_commit_round_journal():
+    """C1：holdExitPx 随 journal 落痕（滚动摘要重置后问责回路不断，同 orderType/limitPrice 先例）。"""
+    d = _decider([_tool_events({"action": "hold", "reason": "wait", "holdExitPx": 29500.0})])
+    decision, _ = await d.decide(_payload(1))
+    await d.commit_round(_payload(1), decision, {"ok": True})
+    assert d._journal[-1]["decision"]["holdExitPx"] == 29500.0
+
+
+def test_allow_hold_exit_preserves_schema_identity_when_false():
+    """G-1/R-5：allow_hold_exit 默认 False ⇒ build_decision_tool_schema(0.0) 恒等模块常量；True 露出可选字段。"""
+    from app.ai_auto.prompts import DECISION_TOOL_SCHEMA, build_decision_tool_schema
+
+    assert build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA
+    assert build_decision_tool_schema(0.0, allow_hold_exit=False) is DECISION_TOOL_SCHEMA
+    schema = build_decision_tool_schema(0.0, allow_hold_exit=True)
+    assert schema is not DECISION_TOOL_SCHEMA
+    assert "holdExitPx" in schema["properties"]
+    assert "holdExitPx" not in DECISION_TOOL_SCHEMA["properties"]      # 绝不改模块常量
+    assert schema["required"] == ["action", "reason"]                 # 承诺退出线永远可选
+
+
+def test_decider_exposes_hold_exit_field_only_when_allowed():
+    """C1：装配点开启 allow_hold_exit ⇒ 决策器工具 schema 露出 holdExitPx；默认关闭则不露出。"""
+    from app.config import Settings as _S
+
+    llm = _ScriptedLLM([])
+    off = AiTradeDecider(llm, "sys", context_refresh_rounds=10, settings=_S())
+    on = AiTradeDecider(llm, "sys", context_refresh_rounds=10, settings=_S(),
+                        allow_hold_exit=True)
+    assert "holdExitPx" not in off._tool.input_schema["properties"]
+    assert "holdExitPx" in on._tool.input_schema["properties"]

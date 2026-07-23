@@ -422,6 +422,21 @@ export interface ProfitGuardSnapshot {
   trailClampedAtEntry?: boolean | null;
   /** 本轮 ATR（价格单位）；样本不足 / 非有限 ⇒ null ⇒ 上下界整体不生效。 */
   atrPx?: number | null;
+  /**
+   * 已棘轮的承诺退出线（ai-trade-profit-protection-commitment C2）：模型自己许下、经单调棘轮兑现的
+   * 第三条下方保护线；无承诺 / unavailable / flat ⇒ null。
+   */
+  committedExitPx?: number | null;
+  /** 承诺线被哪条约束定住（`adopted` / `atr_floor` / `clamped_breakeven`）；后端下发，前端不重算。 */
+  committedExitBasis?: "adopted" | "atr_floor" | "clamped_breakeven" | null;
+  /**
+   * 有效退出线**当前由哪条线定住**（[P1-3] 后端单点归因真源，前端只读不推）：移动止盈 / 承诺线 / 保本。
+   */
+  effectiveExitSource?:
+    | "profit_guard_trailing"
+    | "profit_guard_committed_exit"
+    | "profit_guard_breakeven"
+    | null;
   /** 上一次保护性平仓回执（一次性，仅紧接的下一轮出现）。 */
   lastExit?: {
     ts?: number;

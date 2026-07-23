@@ -137,11 +137,12 @@ describe("profit_guard kind (ai-trade-profit-protection §2.7)", () => {
     expect(explainKindTone("profit_guard")).toBe("warn");
   });
 
-  it("infers profit_guard from the three legacy reason codes", () => {
+  it("infers profit_guard from the four reason codes (含 commitment 承诺退出线)", () => {
     for (const reason of [
       "profit_guard_trailing",
       "profit_guard_breakeven",
       "profit_guard_hard_take_profit",
+      "profit_guard_committed_exit",
     ]) {
       expect(resolveExplain(trade({ side: "close", explain: undefined, reason })).kind).toBe(
         "profit_guard",

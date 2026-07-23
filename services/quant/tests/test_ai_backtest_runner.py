@@ -641,3 +641,66 @@ async def test_backtest_cooldown_gate_composes_three_reasons(monkeypatch):
         assert job.result["aiStats"]["degradedRounds"] >= len(degraded)
     finally:
         await dispose_engine()
+
+
+# ============ C5 回测承诺退出线（ai-trade-profit-protection-commitment §2.5）============
+def test_backtest_diff_notes_include_commitment_caveat():
+    """C5：回测差异清单追加承诺退出线免责句（bar 内极值保守 + holdExitPx 来自回测 LLM）。"""
+    from app.ai_auto.backtest import _PROFIT_GUARD_BACKTEST_NOTE
+
+    assert "承诺退出线同样为 bar 内极值保守近似" in _PROFIT_GUARD_BACKTEST_NOTE
+    assert "holdExitPx 来自回测 LLM" in _PROFIT_GUARD_BACKTEST_NOTE
+
+
+async def test_backtest_commitment_records_via_same_ratchet(monkeypatch):
+    """C5/[P1-2]：回测 holdExitPx 经**同一** clamp+ratchet 记进 runner；更松被拒、更紧覆盖、epoch 复位三清。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        _patch_loaders(monkeypatch, candles, _StubLLM(lambda _c: {"action": "hold", "reason": "h"}))
+        runner = AiBacktestRunner(_spec(sid, paper, candles,
+                                        profit_rule=_pg_rule(commit_enabled=True)))
+        from app.ai_auto.decider import TradeDecision
+        from app.ai_auto.profit_guard import STATUS_ARMED, STATUS_IDLE
+
+        snap = {"status": STATUS_ARMED, "side": "long", "livePx": 100.0, "entryPx": 98.0,
+                "breakevenPx": None, "atrPx": None}
+        runner._record_commitment(TradeDecision("hold", None, None, "h", hold_exit_px=99.0), snap)
+        assert runner._committed_exit_px == 99.0
+        runner._record_commitment(TradeDecision("hold", None, None, "h", hold_exit_px=98.5), snap)
+        assert runner._committed_exit_px == 99.0                # 更松被拒
+        runner._record_commitment(TradeDecision("hold", None, None, "h", hold_exit_px=99.5), snap)
+        assert runner._committed_exit_px == 99.5                # 更紧覆盖
+        # epoch 复位（flat / 保护平仓）⇒ 承诺线三清（[P0-1]）
+        runner._reset_guard_epoch()
+        assert runner._committed_exit_px is None and runner._committed_exit_basis is None
+        # 门控：未武装 / 非 hold ⇒ 不记
+        runner._record_commitment(
+            TradeDecision("hold", None, None, "h", hold_exit_px=99.0),
+            {**snap, "status": STATUS_IDLE})
+        assert runner._committed_exit_px is None
+        runner._record_commitment(TradeDecision("close", None, None, "x"), snap)
+        assert runner._committed_exit_px is None
+    finally:
+        await dispose_engine()
+
+
+async def test_backtest_commitment_disabled_keeps_committed_none(monkeypatch):
+    """G-4：commit_enabled=False（或不给 holdExitPx）⇒ runner 承诺线恒 None ⇒ 判定逐字回退 v2。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        _patch_loaders(monkeypatch, candles, _StubLLM(lambda _c: {"action": "hold", "reason": "h"}))
+        runner = AiBacktestRunner(_spec(sid, paper, candles,
+                                        profit_rule=_pg_rule(commit_enabled=False)))
+        from app.ai_auto.decider import TradeDecision
+        from app.ai_auto.profit_guard import STATUS_ARMED
+
+        snap = {"status": STATUS_ARMED, "side": "long", "livePx": 100.0, "entryPx": 98.0,
+                "breakevenPx": None, "atrPx": None}
+        runner._record_commitment(TradeDecision("hold", None, None, "h", hold_exit_px=99.0), snap)
+        assert runner._committed_exit_px is None               # 承诺关 ⇒ 不记
+        # 决策器也不该露出 holdExitPx（回测 allow_hold_exit 随 commit_enabled）
+        assert "holdExitPx" not in runner.decider._tool.input_schema["properties"]
+    finally:
+        await dispose_engine()

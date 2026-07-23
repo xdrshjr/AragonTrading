@@ -54,6 +54,19 @@ def _limit_tool_description_suffix(band_pct: float) -> str:
     )
 
 
+def _hold_exit_tool_description_suffix() -> str:
+    """承诺退出线能力开启时（allow_hold_exit=True）追加进决策工具描述的散文说明（C1 §2.1.2）。
+
+    基础文案（`DECISION_TOOL_DESCRIPTION`）**一字不改**——总闸关闭时描述与本特性合入前逐字相同（G-2）。
+    """
+    return (
+        "另可在 action=hold（继续持有）时给出 holdExitPx：你承诺的退出价位。系统会把它采集为一条保护线，"
+        "价格触及即**由系统直接市价平仓**——这条线**只能随你收紧、不能放松**（可报更靠近现价的新线覆盖旧线，"
+        "报更松的线不会生效），且**绝不会劣于保本线**。给了它等于让系统替你守住你自己的判断，你无需每轮盯盘；"
+        "不给它则仅由系统的移动止盈线兜底。多头填低于现价的价、空头填高于现价的价。"
+    )
+
+
 def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
                                  leverage: float, position_step_pct: float = 0.0,
                                  allow_limit: bool = False,
@@ -142,25 +155,33 @@ def _size_discipline(position_step_pct: float) -> str:
 
 
 def build_decision_tool_description(allow_limit: bool = False, *,
-                                    limit_band_pct: float = 0.02) -> str:
-    """决策工具散文描述；`allow_limit=False`（默认）**恒等**返回既有模块常量（零回归，M-4）。
+                                    limit_band_pct: float = 0.02,
+                                    allow_hold_exit: bool = False) -> str:
+    """决策工具散文描述；`allow_limit` / `allow_hold_exit` 皆假（默认）**恒等**返回模块常量（零回归，M-4）。
 
     `limit_band_pct`（keyword-only，F-3）：价带比例文案；默认 0.02 渲染与参数化前逐字节相同。
+    `allow_hold_exit`（keyword-only，C1）：为真时在尾部追加承诺退出线说明；关闭时逐字节回退（G-2）。
     """
-    if not allow_limit:
+    if not allow_limit and not allow_hold_exit:
         return DECISION_TOOL_DESCRIPTION
-    return DECISION_TOOL_DESCRIPTION + _limit_tool_description_suffix(limit_band_pct)
+    text = DECISION_TOOL_DESCRIPTION
+    if allow_limit:
+        text += _limit_tool_description_suffix(limit_band_pct)
+    if allow_hold_exit:
+        text += _hold_exit_tool_description_suffix()
+    return text
 
 
 def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = False,
-                               limit_band_pct: float = 0.02) -> dict:
-    """按档位步长 + 限价总闸构造决策工具 `input_schema`（[R-5] `enum` 取自 `position_ladder` 真源）。
+                               limit_band_pct: float = 0.02,
+                               allow_hold_exit: bool = False) -> dict:
+    """按档位步长 + 限价总闸 + 承诺退出线总闸构造决策工具 `input_schema`（[R-5] `enum` 取真源）。
 
-    `step<=0` **且** `allow_limit=False`（含全部默认调用）原样返回模块常量 `DECISION_TOOL_SCHEMA`
-    ——既有恒等断言 `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA`
-    （`test_ai_trade_position_step.py:132`）据此零改动通过，这正是 `allow_limit` **必须默认 False**
-    的硬约束来源（P1-3）。其余情形返回新 dict，且 `properties` 与被替换的 `action` 条目都是**新建
-    对象**——绝不就地改模块常量（`step>0` 时泄漏回常量的老坑，本函数早有前科）。
+    `step<=0` **且** `allow_limit=False` **且** `allow_hold_exit=False`（含全部默认调用）原样返回模块
+    常量 `DECISION_TOOL_SCHEMA`——既有恒等断言 `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA`
+    （`test_ai_trade_position_step.py:132`）据此零改动通过，这正是 `allow_limit` / `allow_hold_exit`
+    **必须默认 False** 的硬约束来源（P1-3 / R-5）。其余情形返回新 dict，且 `properties` 与被替换的
+    `action` 条目都是**新建对象**——绝不就地改模块常量（`step>0` 时泄漏回常量的老坑，本函数早有前科）。
 
     Args:
         position_step_pct: 档位步长（fraction）；`>0` 时把 `sizeFraction` 换为带 `enum` 的定义。
@@ -168,13 +189,15 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
             `cancel_order`，并露出 `orderType` / `limitPrice` 两个新字段。
         limit_band_pct: 价带比例文案（keyword-only，F-3）；仅 `allow_limit=True` 分支消费，
             默认 0.02 渲染与参数化前逐字节相同（恒等断言据此原样通过）。
+        allow_hold_exit: 承诺退出线总闸（keyword-only，C1，默认 False）。`True` 时露出可选
+            `holdExitPx` 字段（`required` 不变，承诺退出线永远可选）。
 
     Returns:
         决策工具的 `input_schema`（JSON Schema）。硬保证仍在服务端（`quantize_size_fraction` 与
         `validate_limit_intent`），本 schema 只是软引导。
     """
     step = max(0.0, float(position_step_pct))
-    if step <= 0 and not allow_limit:
+    if step <= 0 and not allow_limit and not allow_hold_exit:
         return DECISION_TOOL_SCHEMA
     schema = dict(DECISION_TOOL_SCHEMA)
     props = dict(DECISION_TOOL_SCHEMA["properties"])   # 独立浅拷贝，杜绝改动泄漏回模块常量
@@ -184,6 +207,13 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
                                  "description": "开仓仓位占比，只能取列出的档位"}
     if allow_limit:
         _apply_limit_properties(props, limit_band_pct)
+    if allow_hold_exit:
+        # C1 §2.1.2：可选承诺退出线（`required` 不变）。仅在调用方自己的 props 浅拷贝上补，绝不改常量。
+        props["holdExitPx"] = {
+            "type": "number", "exclusiveMinimum": 0,
+            "description": "（可选）继续持有时你承诺的退出价位：价格向此价靠拢并触及即由系统市价平仓。"
+                           "多头填低于现价的止盈保护价、空头填高于现价的价；系统只会据它把保护线收得更紧、"
+                           "绝不放松，且不会劣于保本线。给了它等于让系统替你守住这条线，你无需每轮盯盘。"}
     schema["properties"] = props
     return schema
 

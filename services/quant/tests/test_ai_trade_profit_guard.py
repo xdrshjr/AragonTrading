@@ -16,20 +16,29 @@ import pytest
 
 from app.ai_auto.profit_guard import (
     ARMED_STATUSES,
+    COMMIT_BASIS_ADOPTED,
+    COMMIT_BASIS_ATR_FLOOR,
+    COMMIT_BASIS_CLAMPED_BREAKEVEN,
     REASON_BREAKEVEN,
+    REASON_COMMITTED_EXIT,
     REASON_HARD_TAKE_PROFIT,
     REASON_TRAILING,
     STATUS_ARMED,
     STATUS_BREAKEVEN_ARMED,
+    STATUS_FLAT,
     STATUS_IDLE,
     STATUS_UNAVAILABLE,
     PositionFacts,
     ProfitGuardRule,
+    _effective_exit,
     advance_state,
     build_idle_snapshot,
     build_snapshot,
+    clamp_commitment,
     evaluate_profit_guard,
+    is_commit_armed,
     parse_giveback_tiers,
+    ratchet_commitment,
     resolve_giveback_pct,
     resolve_profit_guard_rule,
     rule_wire,
@@ -637,3 +646,277 @@ def test_safe_atr_degrades_instead_of_guessing():
     assert safe_atr(df, 14) == pytest.approx(2.0, rel=1e-6)
     assert safe_atr(df.iloc[:5], 14) is None            # 样本不足 ⇒ 降级
     assert safe_atr(None, 14) is None
+
+
+# ================= 承诺退出线棘轮（ai-trade-profit-protection-commitment C2/C3）=================
+from app.ai_auto.profit_guard_runtime import ProfitGuardRuntime  # noqa: E402
+
+_ATR = 0.00080
+_ATR_FLOOR_MULT = 0.8
+
+
+def _commit_rule(**kwargs) -> ProfitGuardRule:
+    base = {"commit_enabled": True, "atr_floor_mult": _ATR_FLOOR_MULT, "atr_cap_mult": 3.0}
+    base.update(kwargs)
+    return _rule(**base)
+
+
+def _clamp_long(proposed, mark, *, breakeven=None, atr=_ATR, floor_mult=_ATR_FLOOR_MULT):
+    return clamp_commitment(proposed, side="long", mark_px=mark, entry_px=_ENTRY,
+                            breakeven_px=breakeven, atr_px=atr, atr_floor_mult=floor_mult)
+
+
+# ---------------- T-7：is_commit_armed / ratchet_commitment 纯函数 ----------------
+def test_is_commit_armed_truth_table():
+    """T-7：单一武装谓词——armed / breakeven_armed 为真；idle/unavailable/flat/None 为假。"""
+    assert is_commit_armed(STATUS_ARMED) and is_commit_armed(STATUS_BREAKEVEN_ARMED)
+    assert not is_commit_armed(STATUS_IDLE)
+    assert not is_commit_armed(STATUS_UNAVAILABLE)
+    assert not is_commit_armed(STATUS_FLAT)
+    assert not is_commit_armed(None)
+    assert all(is_commit_armed(s) for s in ARMED_STATUSES)
+
+
+def test_ratchet_commitment_only_tightens_never_loosens():
+    """T-3/T-7：棘轮只收紧（多头取更高 / 空头取更低）；首采直通、更松或相等一律拒绝、cand None 保前值。"""
+    assert ratchet_commitment(None, None, 0.07431, COMMIT_BASIS_ATR_FLOOR, side="long") == (
+        0.07431, COMMIT_BASIS_ATR_FLOOR)
+    assert ratchet_commitment(0.07431, COMMIT_BASIS_ATR_FLOOR, 0.07436, COMMIT_BASIS_ADOPTED,
+                              side="long") == (0.07436, COMMIT_BASIS_ADOPTED)
+    assert ratchet_commitment(0.07436, COMMIT_BASIS_ADOPTED, 0.07400, COMMIT_BASIS_ADOPTED,
+                              side="long") == (0.07436, COMMIT_BASIS_ADOPTED)   # 更松被拒
+    assert ratchet_commitment(0.07436, COMMIT_BASIS_ADOPTED, 0.07436, COMMIT_BASIS_ATR_FLOOR,
+                              side="long") == (0.07436, COMMIT_BASIS_ADOPTED)   # 相等被拒
+    assert ratchet_commitment(0.07436, "x", None, "not_protective", side="long") == (0.07436, "x")
+    assert ratchet_commitment(0.0800, COMMIT_BASIS_ADOPTED, 0.0795, COMMIT_BASIS_ADOPTED,
+                              side="short") == (0.0795, COMMIT_BASIS_ADOPTED)   # short 更低=更紧
+    assert ratchet_commitment(0.0795, COMMIT_BASIS_ADOPTED, 0.0800, COMMIT_BASIS_ADOPTED,
+                              side="short") == (0.0795, COMMIT_BASIS_ADOPTED)   # short 更高被拒
+
+
+# ---------------- T-2 / T-4 / G-6：clamp_commitment 纯几何 ----------------
+def test_clamp_commitment_rejects_non_protective_and_non_finite():
+    """T-4：非有限 / ≤0 / None ⇒ not_finite；现价上方（多头）= 目标位 ⇒ not_protective。"""
+    assert _clamp_long(float("nan"), _ENTRY)[0] is None
+    assert _clamp_long(0.0, _ENTRY) == (None, "not_finite")
+    assert _clamp_long(None, _ENTRY) == (None, "not_finite")
+    assert _clamp_long(_ENTRY * 1.01, _ENTRY) == (None, "not_protective")
+
+
+def test_clamp_commitment_pushes_off_noise_floor():
+    """T-2：离现价 < atr_floor_mult×ATR ⇒ 推离至恰好该下界（basis=atr_floor）；已在界外则原样采纳。"""
+    mark = _ENTRY * 1.03
+    floor_dist = _ATR_FLOOR_MULT * _ATR
+    be = _breakeven_px_for(_commit_rule())
+    line, basis = _clamp_long(mark - floor_dist * 0.4, mark, breakeven=be)
+    assert basis == COMMIT_BASIS_ATR_FLOOR and line == pytest.approx(mark - floor_dist)
+    far = mark - floor_dist * 1.5
+    line2, basis2 = _clamp_long(far, mark, breakeven=be)
+    assert basis2 == COMMIT_BASIS_ADOPTED and line2 == pytest.approx(far)
+
+
+def test_clamp_commitment_clamps_to_breakeven_or_suppresses():
+    """T-2/R-1：低于安全底线的报价 ⇒ 保本线在时夹到保本线；保本线关且 < 入场价 ⇒ 抑制不采纳。"""
+    rule = _commit_rule()
+    be = _breakeven_px_for(rule)
+    mark = _ENTRY * 1.02
+    below = _ENTRY * 0.999
+    line, basis = clamp_commitment(below, side="long", mark_px=mark, entry_px=_ENTRY,
+                                   breakeven_px=be, atr_px=None, atr_floor_mult=0.0)
+    assert basis == COMMIT_BASIS_CLAMPED_BREAKEVEN and line == pytest.approx(be)
+    line2, reason2 = clamp_commitment(below, side="long", mark_px=mark, entry_px=_ENTRY,
+                                      breakeven_px=None, atr_px=None, atr_floor_mult=0.0)
+    assert line2 is None and reason2 == "suppressed_at_floor"
+
+
+def test_clamp_commitment_no_floor_guard_never_raises():
+    """P2-1 fail-open：保本线与入场价皆缺 ⇒ (None, no_floor)，绝不 TypeError。"""
+    assert clamp_commitment(0.0700, side="long", mark_px=0.0710, entry_px=None,
+                            breakeven_px=None, atr_px=None, atr_floor_mult=0.0) == (None, "no_floor")
+
+
+def test_clamp_commitment_line_never_worse_than_floor():
+    """G-6 never 净亏强平：任意采纳的多头承诺线恒 ≥ 保本线（跨保本线上下 + ATR 推离都成立）。"""
+    rule = _commit_rule()
+    be = _breakeven_px_for(rule)
+    mark = _ENTRY * 1.03
+    for proposed in (mark * 0.999, _ENTRY * 1.001, be * 1.0001, _ENTRY * 0.998, _ENTRY * 0.95):
+        line, _ = clamp_commitment(proposed, side="long", mark_px=mark, entry_px=_ENTRY,
+                                   breakeven_px=be, atr_px=_ATR, atr_floor_mult=0.8)
+        if line is not None:
+            assert line >= be - 1e-12
+
+
+# ---------------- _effective_exit 三线归因 + tie-break（[P2-2]）+ G-3 / G-5 ----------------
+def test_effective_exit_attribution_and_tiebreak():
+    """P2-2：三线取最靠近现价者 + 归因；同价并列按 trail > committed > breakeven（key 取极值，非元组比较）。"""
+    assert _effective_exit("long", 0.0743, 0.0743, 0.0743) == (0.0743, REASON_TRAILING)
+    assert _effective_exit("long", 0.0741, 0.0724, 0.0743) == (0.0743, REASON_COMMITTED_EXIT)
+    assert _effective_exit("short", 0.0800, 0.0800, 0.0800) == (0.0800, REASON_TRAILING)
+    assert _effective_exit("short", 0.0805, 0.0820, 0.0800) == (0.0800, REASON_COMMITTED_EXIT)
+    assert _effective_exit("long", None, None, None) == (None, None)
+
+
+def test_effective_exit_matches_v2_when_no_commitment():
+    """G-3：committed=None 时 `_effective_exit` 与 v2 两线判定逐字节一致。"""
+    assert _effective_exit("long", 0.0742, 0.0724, None) == (0.0742, REASON_TRAILING)
+    assert _effective_exit("long", None, 0.0724, None) == (0.0724, REASON_BREAKEVEN)
+    assert _effective_exit("short", 0.0800, 0.0820, None) == (0.0800, REASON_TRAILING)
+    assert _effective_exit("short", None, 0.0820, None) == (0.0820, REASON_BREAKEVEN)
+
+
+def test_effective_exit_never_worse_with_commitment():
+    """G-5 never-worse：承诺线只进 max/min 候选 ⇒ 含承诺线的有效退出线不劣于 v2（long ≥ / short ≤）。"""
+    for committed in (0.0743, 0.0741, 0.07425):
+        with_c, _ = _effective_exit("long", 0.0742, 0.0724, committed)
+        without_c, _ = _effective_exit("long", 0.0742, 0.0724, None)
+        assert with_c >= without_c
+    for committed in (0.0800, 0.0805, 0.0798):
+        with_c, _ = _effective_exit("short", 0.0801, 0.0820, committed)
+        without_c, _ = _effective_exit("short", 0.0801, 0.0820, None)
+        assert with_c <= without_c
+
+
+# ---------------- T-1：承诺线兑现平仓（同断面 v2 不平）----------------
+def test_committed_exit_triggers_where_v2_would_hold():
+    """T-1：承诺线比移动止盈线更紧时，现价触及承诺线即出 REASON_COMMITTED_EXIT；同断面无承诺线（v2）不平。"""
+    rule = _commit_rule()
+    peak_px = _peak_px_for(0.20)
+    trail_px = _trail_px_for(peak_px, rule)
+    committed = trail_px + (peak_px - trail_px) * 0.5          # 严格高于 trail、更靠近现价
+    mark = committed - (committed - trail_px) * 0.5           # 触及 committed、未触及 trail
+    state = advance_state(None, _facts(_ENTRY, now_wall=_WALL))
+    state = advance_state(state, _facts(peak_px, now_wall=_WALL + _STEP))
+    facts = _facts(mark, now_wall=_WALL + 2 * _STEP, committed_exit_px=committed,
+                   committed_exit_basis=COMMIT_BASIS_ADOPTED)
+    snap = build_snapshot(rule, state, facts)
+    assert snap["committedExitPx"] == pytest.approx(round(committed, 8))
+    assert snap["effectiveExitSource"] == REASON_COMMITTED_EXIT
+    verdict = evaluate_profit_guard(snap, rule)
+    assert verdict is not None and verdict.reason_code == REASON_COMMITTED_EXIT
+    snap_v2 = build_snapshot(rule, state, _facts(mark, now_wall=_WALL + 2 * _STEP))
+    assert snap_v2["committedExitPx"] is None
+    assert evaluate_profit_guard(snap_v2, rule) is None       # v2 尚未触及更低的移动止盈线 ⇒ 持有
+
+
+def test_snapshot_commitment_keys_none_when_unavailable():
+    """[P1-3]：unavailable 快照的三个承诺键一律 None（绝不下发算得出却不作数的价位）。"""
+    rule = _commit_rule()
+    state = advance_state(None, _facts(_ENTRY, now_wall=_WALL))
+    facts = _facts(_ENTRY, now_wall=_WALL + 100, committed_exit_px=_ENTRY * 1.0,
+                   committed_exit_basis=COMMIT_BASIS_ADOPTED)
+    snap = build_snapshot(rule, state, facts, unavailable_reason="stale_feed")
+    assert snap["committedExitPx"] is None
+    assert snap["committedExitBasis"] is None
+    assert snap["effectiveExitSource"] is None
+
+
+# ---------------- resolve / rule_wire commitEnabled ----------------
+def test_resolve_and_wire_commit_enabled_follows_settings_only():
+    """commit_enabled 唯一来源是运维 settings（请求体不暴露此键）；rule_wire 回执含 commitEnabled。"""
+    on = resolve_profit_guard_rule(None, Settings(ai_trade_profit_guard_commitment_enabled=True))
+    off = resolve_profit_guard_rule(None, Settings(ai_trade_profit_guard_commitment_enabled=False))
+    assert on.commit_enabled is True and off.commit_enabled is False
+    assert rule_wire(on)["commitEnabled"] is True and rule_wire(off)["commitEnabled"] is False
+    forced = resolve_profit_guard_rule({"commitEnabled": True},
+                                       Settings(ai_trade_profit_guard_commitment_enabled=False))
+    assert forced.commit_enabled is False
+
+
+# ---------------- 宪章 / prompt 渲染（C3）----------------
+def test_charter_commitment_gated_and_discloses_ratchet_and_failopen():
+    """G-2：承诺段仅 commit_enabled=True 时出现（关闭逐字节回退）；开启须披露「只收紧」+ fail-open 让位。"""
+    assert "承诺退出线" not in format_profit_guard_charter(_rule(commit_enabled=False))
+    text = format_profit_guard_charter(_rule(commit_enabled=True))
+    assert "只能随你收紧、不能放松" in text
+    assert "进程内的兜底" in text
+
+
+def test_prompt_renders_committed_line_and_attribution():
+    """C3：committedExitPx 非空 ⇒ prompt 出承诺线一行（basis 后缀）+ 有效退出线由承诺线定住时注明；无则省略。"""
+    rule = _commit_rule()
+    peak_px = _peak_px_for(0.20)
+    trail_px = _trail_px_for(peak_px, rule)
+    committed = trail_px + (peak_px - trail_px) * 0.5
+    state = advance_state(None, _facts(_ENTRY, now_wall=_WALL))
+    state = advance_state(state, _facts(peak_px, now_wall=_WALL + _STEP))
+    facts = _facts(peak_px, now_wall=_WALL + 2 * _STEP, committed_exit_px=committed,
+                   committed_exit_basis=COMMIT_BASIS_ATR_FLOOR)
+    snap = build_snapshot(rule, state, facts)
+    text = format_profit_guard_for_prompt(snap)
+    assert "你的承诺退出线" in text and "（已按波动率放宽至下界）" in text
+    assert snap["effectiveExitSource"] == REASON_COMMITTED_EXIT
+    assert "当前由你的承诺线定住" in text
+    snap_none = build_snapshot(rule, state, _facts(peak_px, now_wall=_WALL + 2 * _STEP))
+    assert "你的承诺退出线" not in format_profit_guard_for_prompt(snap_none)   # G-1 逐字节回退
+
+
+def test_profit_hold_note_upgrades_to_structured_tighten_with_commitment():
+    """C1 §2.3.4：有承诺线时把散文索要升级为结构化收紧引导；无承诺线逐字节回退 v2。"""
+    rule = _commit_rule()
+    peak_px = _peak_px_for(0.04)
+    state = advance_state(None, _facts(_ENTRY, now_wall=_WALL))
+    facts = _facts(peak_px, now_wall=_WALL + 100, committed_exit_px=_ENTRY * 1.001,
+                   committed_exit_basis=COMMIT_BASIS_ADOPTED)
+    state = advance_state(state, facts)
+    snap = build_snapshot(rule, state, facts)
+    note = format_profit_hold_note(snap, 3)
+    assert "你当前的承诺退出线是" in note and "如需收紧请给出更靠近现价的" in note
+    snap_none = build_snapshot(rule, state, _facts(peak_px, now_wall=_WALL + 100))
+    assert "① **你的退出线**" in format_profit_hold_note(snap_none, 3)
+
+
+# ---------------- T-6 / 运行时棘轮 + epoch 复位（[P0-1] 实盘安全关键）----------------
+def _record_via_refresh(rt: ProfitGuardRuntime, *, side: str, seq: int) -> None:
+    """在给定 epoch 上跑两次 refresh 建立 armed 快照，再据它记一条承诺线。"""
+    peak_px = _peak_px_for(0.20, side=side, entry=_ENTRY)
+    rt.refresh(_facts(_ENTRY, now_wall=_WALL, side=side, seq=seq, atr_px=_ATR), stale_feed=False)
+    snap = rt.refresh(_facts(peak_px, now_wall=_WALL + _STEP, side=side, seq=seq, atr_px=_ATR),
+                      stale_feed=False)
+    proposed = snap["livePx"] - 3 * _ATR if side == "long" else snap["livePx"] + 3 * _ATR
+    rt.record_commitment(proposed, snap)
+
+
+def test_runtime_commitment_resets_on_reverse_and_reopen():
+    """T-6（[P0-1]，全轮最高危回归点）：反手（side 变）/ 同向重开（seq 变）后承诺线随 peak 一并归零。"""
+    rt = ProfitGuardRuntime(_commit_rule())
+    _record_via_refresh(rt, side="long", seq=1)
+    assert rt.committed_exit_px is not None
+    snap = rt.refresh(_facts(_ENTRY, now_wall=_WALL + 9 * _STEP, side="short", seq=1, atr_px=_ATR),
+                      stale_feed=False)
+    assert rt.committed_exit_px is None and snap["committedExitPx"] is None
+    assert evaluate_profit_guard(snap, rt.rule) is None        # 绝不据旧多头承诺线强平新空头
+
+    rt2 = ProfitGuardRuntime(_commit_rule())
+    _record_via_refresh(rt2, side="long", seq=1)
+    assert rt2.committed_exit_px is not None
+    snap2 = rt2.refresh(_facts(_ENTRY, now_wall=_WALL + 9 * _STEP, side="long", seq=2, atr_px=_ATR),
+                        stale_feed=False)
+    assert rt2.committed_exit_px is None and snap2["committedExitPx"] is None
+
+
+def test_runtime_record_commitment_short_circuits():
+    """记录门控：承诺关 / 未武装 / 无快照 ⇒ 不记（棘轮值保持 None）。"""
+    off = ProfitGuardRuntime(_rule(commit_enabled=False))
+    off.committed_exit_epoch = ("long", 1)
+    off.record_commitment(_ENTRY * 0.99, {"status": STATUS_ARMED, "side": "long",
+                                          "livePx": _ENTRY, "entryPx": _ENTRY})
+    assert off.committed_exit_px is None
+    idle = ProfitGuardRuntime(_commit_rule())
+    idle.record_commitment(_ENTRY * 0.99, {"status": STATUS_IDLE, "side": "long",
+                                           "livePx": _ENTRY, "entryPx": _ENTRY})
+    assert idle.committed_exit_px is None
+    none_snap = ProfitGuardRuntime(_commit_rule())
+    none_snap.record_commitment(_ENTRY * 0.99, None)
+    assert none_snap.committed_exit_px is None
+
+
+def test_runtime_clear_state_three_clears_commitment():
+    """clear_state 三清：flat / 保护平仓成交时承诺线随 state 一并作废。"""
+    rt = ProfitGuardRuntime(_commit_rule())
+    _record_via_refresh(rt, side="long", seq=1)
+    assert rt.committed_exit_px is not None
+    rt.clear_state()
+    assert rt.state is None
+    assert rt.committed_exit_px is None and rt.committed_exit_basis is None
+    assert rt.committed_exit_epoch is None

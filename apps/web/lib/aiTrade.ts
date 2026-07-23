@@ -448,6 +448,8 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
   { prefix: "profit_guard_trailing", label: "利润保护：浮盈自峰值回吐超阈，已按保护线离场" },
   { prefix: "profit_guard_breakeven", label: "利润保护：价格跌回保本线，已离场保住本金" },
   { prefix: "profit_guard_hard_take_profit", label: "利润保护：已达硬止盈目标位" },
+  // 承诺退出线（commitment C2/C3）：模型自己许下、经棘轮兑现的第三条保护线触发平仓。
+  { prefix: "profit_guard_committed_exit", label: "利润保护：已触及你承诺的退出线，按承诺离场" },
   // 冷却降级码带参数后缀（profit_cooldown(120s,long)），与基础策略同为**前缀**匹配。
   { prefix: "profit_cooldown", label: "利润保护冷却：刚锁住利润，暂停同向开仓" },
 ];
@@ -616,6 +618,36 @@ export function describeProfitGuardTrail(
   return `移动止盈线 ${snapshot.trailStopPx}${threshold}${suffix}`;
 }
 
+// 承诺线 basis 的中文后缀（commitment [P2-5]，**独立映射**，勿复用 `TRAIL_BASIS_SUFFIX` 以免语义漂移）；
+// `adopted` 须显式含此键（无后缀），否则会走 `?? ""` 兜底——但显式在测试里钉死三种 basis 各自渲染。
+const COMMIT_BASIS_SUFFIX: Record<string, string> = {
+  adopted: "",
+  atr_floor: "（已按波动率放宽至下界）",
+  clamped_breakeven: "（已夹至保本线）",
+};
+
+/**
+ * 承诺退出线的中文化（单点真源，`committedExitBasis` 由后端下发、前端**不重算**）。
+ *
+ * 模型自己许下、经单调棘轮兑现的第三条下方保护线；`committedExitPx` 为空 / unavailable / flat → null
+ * （整行不渲染）。是否「当前由承诺线定住」另由 `effectiveExitSource` 归因（[P1-3]，不在此比价推断）。
+ */
+export function describeCommittedExit(
+  snapshot: ProfitGuardSnapshot | null | undefined,
+): string | null {
+  if (!snapshot || snapshot.status === "unavailable" || snapshot.status === "flat") return null;
+  if (snapshot.committedExitPx == null) return null;
+  const suffix = COMMIT_BASIS_SUFFIX[snapshot.committedExitBasis ?? "adopted"] ?? "";
+  return `承诺退出线 ${snapshot.committedExitPx}${suffix}`;
+}
+
+/** 有效退出线当前是否由承诺线定住（[P1-3] 只读后端 `effectiveExitSource`，不比价推断）。 */
+export function isEffectiveExitCommitted(
+  snapshot: ProfitGuardSnapshot | null | undefined,
+): boolean {
+  return snapshot?.effectiveExitSource === "profit_guard_committed_exit";
+}
+
 /**
  * 冷却期中文化（与后端 `format_profit_cooldown` 同语义）；未激活 → null（chip 整块不渲染）。
  *
@@ -637,6 +669,7 @@ const PROFIT_GUARD_REASON_LABELS: Record<string, string> = {
   profit_guard_trailing: "移动止盈",
   profit_guard_breakeven: "保本线",
   profit_guard_hard_take_profit: "硬止盈",
+  profit_guard_committed_exit: "承诺退出线",
 };
 
 /** 保护触发码中文化（成交列表 / 轨迹 / 回执共用）；未知码原样回退。 */

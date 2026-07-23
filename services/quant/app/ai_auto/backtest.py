@@ -57,6 +57,9 @@ from .profit_guard import (
     ProfitGuardRule,
     ProfitGuardState,
     build_snapshot,
+    clamp_commitment,
+    is_commit_armed,
+    ratchet_commitment,
     rule_wire,
     sanitize_atr,
 )
@@ -91,7 +94,12 @@ _PROFIT_GUARD_BACKTEST_NOTE = (
     "更细；④ 回测无部分成交、无挂单撤改、无交易所降级态；⑤ 开仓当根不判回撤（min_hold 在 bar 时钟下"
     "等价于「至少持有一根」），且冷却秒数若短于一根 K 线（默认 180s < 15m）在回测里几乎恒于次根即已"
     "过期——回测无法验证冷却期的实际效果。故回测的保护触发次数与落袋结果相对实盘偏保守，"
-    "不得据此推断实盘一定更好或更差。")
+    "不得据此推断实盘一定更好或更差。"
+    # C5 §2.5：承诺退出线同样为 bar 内极值保守近似，且回测里的 holdExitPx 来自**回测 LLM** 的决策，
+    # 与实盘的模型判断可能不同——回测用于验证「承诺线一旦给出、系统会如何兑现」的机制，不保证实盘
+    # 模型会给出相同的线。
+    "⑥ 承诺退出线同样为 bar 内极值保守近似，且回测中的 holdExitPx 来自回测 LLM 的决策、与实盘可能"
+    "不同——回测验证的是「承诺线一旦给出系统如何兑现」的机制，不保证实盘模型会给出相同的线。")
 
 
 @dataclass
@@ -204,6 +212,10 @@ class AiBacktestRunner:
         self.profit_rule = spec.profit_rule
         self._guard_state: ProfitGuardState | None = None
         self._cooldown: CooldownState | None = None
+        # C2/C5：承诺退出线棘轮状态。[P0-1] **必须在每处 `self._guard_state=None` 同步清零**——否则
+        # 回测里反手/重开会继承旧承诺线、与实盘同缺陷（见 `_apply_profit_guard_bar` 两处复位）。
+        self._committed_exit_px: float | None = None
+        self._committed_exit_basis: str | None = None
         self.profit_guard_exits = 0
         self._atr_series = None            # `_setup` 里一次性向量化；第 i 根用 iloc[i-1]（无未来函数）
         self._bar_ts_index: list[int] | None = None   # 根索引 → ts（把开仓根 ts 当 opened_wall，§2.3.2）
@@ -225,7 +237,10 @@ class AiBacktestRunner:
                                              self.profit_rule)),
             context_refresh_rounds=self.context_refresh_rounds, settings=self.settings,
             position_step_pct=self.position_step_pct, reflection_enabled=self.reflection_enabled,
-            allow_limit=False)
+            allow_limit=False,
+            # C5 §2.5：回测决策器同样露出 holdExitPx（allow_limit 恒 False 不变）——承诺退出线是决策
+            # 语义、与限价的「回测每单必成」高估问题无关，故只随 commit_enabled 派生。
+            allow_hold_exit=(self.profit_rule is not None and self.profit_rule.commit_enabled))
         self._oco_risk = RiskParams(
             stop_loss_pct=spec.stop_loss_pct or None, take_profit_pct=spec.take_profit_pct or None,
             max_hold_bars=self.settings.ai_trade_default_max_hold_bars or None)
@@ -391,13 +406,20 @@ class AiBacktestRunner:
             return None
         return sanitize_atr(self._atr_series.iloc[i - 1])
 
+    def _reset_guard_epoch(self) -> None:
+        """[P0-1] epoch 结束（flat / 保护平仓）：state 与承诺线棘轮**同步三清**（镜像 runtime.clear_state
+        的三清）——否则回测里反手/重开会继承旧承诺线、与实盘同缺陷（T-6 回测侧对称覆盖）。"""
+        self._guard_state = None
+        self._committed_exit_px = None
+        self._committed_exit_basis = None
+
     def _apply_profit_guard_bar(self, i: int, row: pd.Series) -> None:
         """本根的保守保护判定；命中即按触发价平仓并开启冷却。未装配 / 空仓 ⇒ 完全空转（G-3）。"""
         if self.profit_rule is None:
             return
         pos = self.main.pos
         if pos.side == "flat":
-            self._guard_state = None
+            self._reset_guard_epoch()
             return
         bar_ts = int(row["ts"])
         entry_ts = self._bar_ts(pos.entry_bar, default=bar_ts)
@@ -405,19 +427,35 @@ class AiBacktestRunner:
             seq=pos.entry_bar, side=pos.side, entry_px=float(pos.entry_price),
             qty_coin=float(pos.qty), leverage=self.leverage, ts=bar_ts, opened_ts=entry_ts,
             open_px=float(row["o"]), high_px=float(row["h"]), low_px=float(row["l"]),
-            atr_px=self._atr_at(i)))
+            atr_px=self._atr_at(i), committed_exit_px=self._committed_exit_px))
         self._guard_state = result.state
         if result.verdict is None:
             return
         self.main.close_at_price(float(result.fill_px), bar_ts, result.verdict.reason_code)
         self.profit_guard_exits += 1
-        self._guard_state = None
+        self._reset_guard_epoch()
         if self.profit_rule.cooldown_s > 0:
             # F2 §2.3.3a：写点唯一——**确实产生了保护性平仓**之后才开冷却（bar ts 当墙钟）。
             self._cooldown = CooldownState(
                 until_wall=bar_ts + self.profit_rule.cooldown_s, side=result.verdict.note["side"],
                 reason_code=result.verdict.reason_code, label=result.verdict.label,
                 scope=self.profit_rule.cooldown_scope)
+
+    def _record_commitment(self, decision: TradeDecision, snapshot: dict | None) -> None:
+        """回测侧承诺退出线采集（C5 §2.5）：与实盘 `record_commitment` **同一** `is_commit_armed` +
+        `clamp_commitment`（纯几何）+ `ratchet_commitment`（唯一棘轮真源）——同 import、同阈值、同棘轮，
+        绝不在此内联另写收紧比较（[P1-1]/[P1-2]）。未装配 / 承诺关 / 非 hold / 无值 / 无快照 / 未武装 ⇒ 短路。"""
+        if (self.profit_rule is None or not self.profit_rule.commit_enabled
+                or decision.action != "hold" or decision.hold_exit_px is None
+                or not snapshot or not is_commit_armed(snapshot.get("status"))):
+            return
+        line, basis = clamp_commitment(
+            decision.hold_exit_px, side=snapshot.get("side"), mark_px=snapshot.get("livePx"),
+            entry_px=snapshot.get("entryPx"), breakeven_px=snapshot.get("breakevenPx"),
+            atr_px=snapshot.get("atrPx"), atr_floor_mult=self.profit_rule.atr_floor_mult)
+        self._committed_exit_px, self._committed_exit_basis = ratchet_commitment(
+            self._committed_exit_px, self._committed_exit_basis, line, basis,
+            side=snapshot.get("side"))
 
     def _bar_ts(self, bar_index: int, *, default: int) -> int:
         """开仓根 ts（`state.opened_wall` 的来源）；索引越界 / 未记录 ⇒ 回落当前根（⇒ holdSeconds=0）。"""
@@ -440,7 +478,10 @@ class AiBacktestRunner:
             seq=pos.entry_bar, side=pos.side, entry_px=float(pos.entry_price),
             leverage=self.leverage, qty_coin=float(pos.qty), mark_px=float(ref_px),
             now_wall=float(self._last_ts), bars_in_position=i - pos.entry_bar,
-            atr_px=self._atr_at(i))
+            atr_px=self._atr_at(i),
+            # C5：当前棘轮承诺线进快照（模型每轮看到自己的承诺线 + 有效退出线归因，与实盘 refresh 同款）。
+            committed_exit_px=self._committed_exit_px,
+            committed_exit_basis=self._committed_exit_basis)
         return build_snapshot(self.profit_rule, self._guard_state, facts)
 
     def _is_decision_bar(self, i: int, first: int, n: int) -> bool:
@@ -465,6 +506,9 @@ class AiBacktestRunner:
         payload = self._build_payload(
             round_no, ts, ref_px, main_df, context_frames, i, board, consensus)
         decision, decide_degrade = await self.decider.decide(payload)          # 唯一 async（LLM）
+        # C5 §2.5：把回测 LLM 本轮承诺的退出线记进 runner 棘轮——第一阶段决策为准（门禁前，同实盘落点）；
+        # 快照取自 payload（模型据以决策的那一份），下一根 `_apply_profit_guard_bar` 即据它保守成交序判定。
+        self._record_commitment(decision, payload.get("profitGuard"))
         # 【基础策略】铁律门禁（§2.8/P1-4）：与实盘同一纯核心、同一判定价、同一降级码，且同样排在共识
         # 门禁与反思**之前**（被否轮已是 hold ⇒ 下方反思分支天然跳过，零多余 LLM 调用）。
         decision, base_reason = apply_ma_band_gate(
