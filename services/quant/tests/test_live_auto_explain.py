@@ -392,3 +392,38 @@ async def test_persist_failure_does_not_block_trade_dispatch(monkeypatch):
         assert trade_events[0]["data"]["explain"]["meta"]["instId"] == "BTC-USDT-SWAP"
     finally:
         await dispose_engine()
+
+
+def test_profit_guard_explain_shape_and_values():
+    """利润保护平仓解释（ai-trade-profit-protection §2.7）：新 kind、六项 metrics、绝不含凭证。"""
+    from app.live_auto.explain import build_profit_guard_explain
+
+    explain = build_profit_guard_explain(
+        pos_side="long", trigger_label="移动止盈", entry_price=0.07245,
+        exit_price=0.0729, peak_pnl=0.302, giveback_ratio=0.4, pnl=0.181)
+
+    assert explain["kind"] == "profit_guard" and explain["side"] == "close"
+    assert "移动止盈" in explain["headline"]
+    labels = [m["label"] for m in explain["metrics"]]
+    assert labels == ["触发规则", "原持仓方向", "峰值浮盈", "自峰值回吐", "入场价",
+                      "平仓价", "触发时浮盈"]
+    by_label = {m["label"]: m["value"] for m in explain["metrics"]}
+    assert by_label["自峰值回吐"] == "40.0%"
+    assert by_label["峰值浮盈"] == "+0.30 USDT"
+    # 本地派生口径必须标注（不含手续费 / 资金费，比交易所 upl 略乐观）——绝不冒充已实现盈亏。
+    trigger_pnl = next(m for m in explain["metrics"] if m["label"] == "触发时浮盈")
+    assert "不含手续费" in trigger_pnl["hint"]
+    assert "sk-" not in str(explain) and "passphrase" not in str(explain)
+
+
+def test_profit_guard_explain_degrades_without_numbers():
+    """峰值 / 回吐算不出时如实降级为「—」，绝不补零假装有数（诚实约束）。"""
+    from app.live_auto.explain import build_profit_guard_explain
+
+    explain = build_profit_guard_explain(
+        pos_side="short", trigger_label="保本线", entry_price=1.0, exit_price=1.0,
+        peak_pnl=None, giveback_ratio=None, pnl=None)
+    by_label = {m["label"]: m["value"] for m in explain["metrics"]}
+    assert by_label["峰值浮盈"] == "—" and by_label["自峰值回吐"] == "—"
+    assert by_label["原持仓方向"] == "空"
+

@@ -365,6 +365,76 @@ describe("AiTradeAgentTrace", () => {
   });
 });
 
+// ---------------- 利润保护段（ai-trade-profit-protection §2.7 / §六.4）----------------
+describe("AiTradeAgentTrace · 利润保护段", () => {
+  it("armed 快照渲染峰值 / 已回吐 / 有效退出线", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            profitGuard: {
+              ruleId: "profit_trailing",
+              status: "armed",
+              peakUnrealizedPnlUsd: 0.302,
+              givebackRatio: 0.2,
+              effectiveExitPx: 0.0729,
+            },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText(/已回吐 20\.0%/)).toBeInTheDocument();
+    expect(screen.getByText("利润保护 · 移动止盈已武装")).toBeInTheDocument();
+  });
+
+  it("平仓后的 flat 空壳快照仍渲染 lastExit 回执（P1-7 的唯一展示点）", () => {
+    // 回执只在保护平仓后的那一轮出现，彼时仓位已平 ⇒ status 恒为 flat。若整段按状态徽标早退，
+    // 「上一笔仓位为何消失」就会在 UI 上被悄悄吞掉——本用例是该回归的护栏。
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            profitGuard: {
+              ruleId: "profit_trailing",
+              status: "flat",
+              lastExit: { label: "移动止盈", exitPx: 0.0729, pnlUsd: 0.181 },
+            },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText(/上一笔持仓已由利润保护层强制平仓（移动止盈）/)).toBeInTheDocument();
+  });
+
+  it("交易所侧未挂 OCO 时，不可用文案不得宣称「仍生效」", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            profitGuard: {
+              ruleId: "profit_trailing",
+              status: "unavailable",
+              unavailableReason: "stale_feed",
+            },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText(/没有任何自动兜底/)).toBeInTheDocument();
+    expect(screen.queryByText(/仅交易所侧止盈止损仍生效/)).not.toBeInTheDocument();
+  });
+
+  it("快照缺失（规则未装配 / 老轨迹）→ 整段不渲染", () => {
+    render(
+      <AiTradeAgentTrace group={groupWith(SESSION, [round({})])} activeInstId="BTC-USDT-SWAP" />,
+    );
+    expect(screen.queryByText(/利润保护（移动止盈 \/ 保本）/)).not.toBeInTheDocument();
+  });
+});
+
 describe("AgentPanel segmented view", () => {
   beforeEach(() => {
     localStorage.clear();

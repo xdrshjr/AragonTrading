@@ -130,3 +130,32 @@ describe("resolveExplain", () => {
     expect(pnl?.tone).toBe("long");
   });
 });
+
+describe("profit_guard kind (ai-trade-profit-protection §2.7)", () => {
+  it("labels and tones the new kind（与 risk_exit 分列：一个是持仓根数到了，一个是浮盈在回吐）", () => {
+    expect(explainKindLabel("profit_guard")).toBe("利润保护");
+    expect(explainKindTone("profit_guard")).toBe("warn");
+  });
+
+  it("infers profit_guard from the three legacy reason codes", () => {
+    for (const reason of [
+      "profit_guard_trailing",
+      "profit_guard_breakeven",
+      "profit_guard_hard_take_profit",
+    ]) {
+      expect(resolveExplain(trade({ side: "close", explain: undefined, reason })).kind).toBe(
+        "profit_guard",
+      );
+    }
+  });
+
+  it("keeps other close reasons untouched（新前缀不吞既有归类）", () => {
+    expect(resolveExplain(trade({ side: "close", explain: undefined, reason: "max_hold" })).kind).toBe(
+      "risk_exit",
+    );
+    expect(resolveExplain(trade({ side: "close", explain: undefined, reason: "profit" })).kind).toBe(
+      "atomic",
+    );
+  });
+});
+

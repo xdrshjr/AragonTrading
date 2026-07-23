@@ -206,6 +206,29 @@ class Settings(BaseSettings):
     ai_trade_base_rule_band_tolerance: float = Field(default=0.15, gt=0, le=0.25)
     # 方向性模式（做多不追顶 / 做空不杀底）默认关：开启会与突破/趋势跟随类策略正面冲突。
     ai_trade_base_rule_directional: bool = False
+    # ---- 利润保护层（ai-trade-profit-protection §4.3）----
+    # 与【基础策略】铁律层同构的第二条铁律，但极性相反（fail-open）：持仓浮盈达阈值后记录峰值，回吐
+    # 超比例或跌回保本线即由系统**直接市价平仓**，判定只用实时价（不等 K 线收盘）。总闸 False ⇒ 规则
+    # 一律不装配、prompt 不注入、盯市不判定 ⇒ **逐字回退**到本特性合入前。全部阈值为**保证金收益率
+    # 口径**（诊断根因 ②：5× 杠杆下标的 10% ≈ 保证金 +50%，用标的口径根本触发不到）。env 名
+    # AI_TRADE_PROFIT_GUARD_* 已在 desktop config.js prod 透传白名单内（AI_TRADE_ 前缀），此处须真的
+    # 声明——Settings extra="ignore" 会静默丢弃未声明的 env。
+    ai_trade_profit_guard_enabled: bool = True   # 利润保护总闸；False 逐字回退
+    ai_trade_profit_guard_arm_return_pct: float = Field(default=0.05, gt=0, le=5)
+    ai_trade_profit_guard_giveback_pct: float = Field(default=0.40, gt=0, le=1)
+    # 0 = 关闭保本线（保本专治「一路回吐直到翻负才平」的 DOGE R91 情形）。
+    ai_trade_profit_guard_breakeven_arm_return_pct: float = Field(default=0.03, ge=0, le=5)
+    # 保本线相对入场的正向偏移（覆盖双边手续费——本地派生浮盈不含费用，比交易所 upl 略乐观）。
+    ai_trade_profit_guard_breakeven_offset_return_pct: float = Field(default=0.002, ge=0, le=1)
+    ai_trade_profit_guard_min_hold_s: float = Field(default=30.0, ge=0, le=3600)
+    # 0 = 关闭硬止盈（请求体的 null 在 resolve_profit_guard_rule 归一为此值）。
+    ai_trade_profit_guard_hard_tp_return_pct: float = Field(default=0.0, ge=0, le=20)
+    # 判定价最大允许年龄（秒）：超龄或行情降级 ⇒ 快照 status="unavailable" 且**零动作**（fail-open）。
+    # 90s = 18 个盯市周期（live_auto_poll_interval_s=5）无任何实时价推送，足以判定断流；远小于
+    # _check_staleness 的既有阈值，使保护层在会话级降级反应之前就先行停手。
+    ai_trade_profit_guard_max_px_age_s: float = Field(default=90.0, gt=0, le=3600)
+    # 盈利持仓自察注记阈值（连续几轮浮盈持有后要求模型给出退出线）；0 = 关闭（prompt 逐字节回退）。
+    ai_trade_profit_guard_note_after_rounds: int = Field(default=1, ge=0)
     # ---- AI 自动交易 · 回测模式（ai-auto-trading-backtest §2.5，三重决策成本护栏）----
     # 回测每决策根调一次 LLM，成本/时长敏感；三重护栏：决策间隔（降频）+ 决策轮数硬上限（越界启动前
     # 拒绝，绝不静默截断）+ 并发闸（限同时消耗 LLM 的回测数）。字段名即环境变量名（AI_BACKTEST_*，

@@ -378,3 +378,19 @@ async def test_close_return_pct_returns_none_on_nonpositive_leverage_without_zer
 
 async def _no_sleep(*_args, **_kwargs):
     return None
+
+
+def test_risk_trigger_px_public_forward_matches_private():
+    """只读转发 `risk_trigger_px` 与既有 `_risk_trigger_px` 同值、零行为改动（G-1）。"""
+    ex, _ = _make_executor(risk=RiskParams(stop_loss_pct=0.05, take_profit_pct=0.10))
+
+    for side in ("long", "short"):
+        assert ex.risk_trigger_px(side, 100.0) == ex._risk_trigger_px(side, 100.0)
+    assert ex.risk_trigger_px("long", 100.0) == pytest.approx((110.0, 95.0))
+    assert ex.risk_trigger_px("short", 100.0) == pytest.approx((90.0, 105.0))
+
+
+def test_risk_trigger_px_forward_is_none_without_risk_pct():
+    ex, _ = _make_executor(risk=RiskParams())
+    assert ex.risk_trigger_px("long", 100.0) == (None, None)
+

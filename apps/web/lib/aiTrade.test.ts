@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   AI_TRADE_DEFAULT_POSITION_STEP,
+  AI_TRADE_PROFIT_GUARD_DEFAULTS,
   AI_TRADE_POSITION_STEP_OPTIONS,
   clampBudgetToCap,
   deriveDefaultBudget,
@@ -14,6 +15,10 @@ import {
   describeFactors,
   describeOrderType,
   describePriceAction,
+  describeProfitGuardReason,
+  describeProfitGuardFallback,
+  describeProfitGuardStatus,
+  describeProfitGuardUnavailable,
   describeReflection,
   describeRegime,
   describeMultiTimeframeAlignment,
@@ -22,9 +27,12 @@ import {
   describeStopReason,
   describeTrigger,
   describeVolume,
+  marginReturnFromPricePct,
   positionLadder,
+  priceMoveFromMarginPct,
   resolveAiTradeGate,
   validateContextRounds,
+  validateProfitGuard,
   validateStrategySelection,
   validateWakeInterval,
 } from "./aiTrade";
@@ -529,5 +537,125 @@ describe("describeDegradeReason", () => {
     expect(describeExecuted("hold", null, "base_rule_band_unavailable").label).toContain(
       "基础策略否决",
     );
+  });
+});
+
+
+// ---------------- 利润保护层纯件（ai-trade-profit-protection §3.3）----------------
+describe("validateProfitGuard", () => {
+  it("默认参数合法", () => {
+    expect(validateProfitGuard({ ...AI_TRADE_PROFIT_GUARD_DEFAULTS })).toBeNull();
+  });
+
+  it("关闭时忽略其余输入（残留值不该阻塞提交）", () => {
+    expect(validateProfitGuard({ enabled: false, armReturnPct: Number.NaN })).toBeNull();
+  });
+
+  it("越界逐项报错（与后端 schema Field 边界一致）", () => {
+    expect(validateProfitGuard({ enabled: true, armReturnPct: 0 })).toContain("武装阈值");
+    expect(validateProfitGuard({ enabled: true, givebackPct: 1.5 })).toContain("回吐");
+    expect(validateProfitGuard({ enabled: true, breakevenArmReturnPct: -1 })).toContain("保本");
+    expect(validateProfitGuard({ enabled: true, minHoldSeconds: 99999 })).toContain("最短持有");
+    expect(validateProfitGuard({ enabled: true, armReturnPct: Number.NaN })).toContain("武装阈值");
+  });
+
+  it("保本阈值 0 = 关闭保本，合法", () => {
+    expect(validateProfitGuard({ enabled: true, breakevenArmReturnPct: 0 })).toBeNull();
+  });
+});
+
+describe("describeProfitGuardStatus", () => {
+  it("三态武装标签 + 色调（unavailable 用 short：保护此刻不生效必须显眼）", () => {
+    expect(describeProfitGuardStatus({ ruleId: "profit_trailing", status: "armed" })).toEqual({
+      label: "利润保护 · 移动止盈已武装",
+      tone: "long",
+    });
+    expect(
+      describeProfitGuardStatus({ ruleId: "profit_trailing", status: "breakeven_armed" }),
+    ).toEqual({ label: "利润保护 · 保本线已武装", tone: "accent" });
+    expect(describeProfitGuardStatus({ ruleId: "profit_trailing", status: "idle" })).toEqual({
+      label: "利润保护 · 未武装",
+      tone: "muted",
+    });
+    expect(
+      describeProfitGuardStatus({
+        ruleId: "profit_trailing",
+        status: "unavailable",
+        unavailableReason: "stale_feed",
+      }),
+    ).toEqual({ label: "利润保护暂不可用（行情数据陈旧）", tone: "short" });
+  });
+
+  it("未装配（快照缺失）与 flat 一律 null，组件整段不渲染", () => {
+    expect(describeProfitGuardStatus(null)).toBeNull();
+    expect(describeProfitGuardStatus(undefined)).toBeNull();
+    expect(describeProfitGuardStatus({ ruleId: "profit_trailing", status: "flat" })).toBeNull();
+  });
+});
+
+describe("describeProfitGuardFallback", () => {
+  it("交易所侧确实挂了 OCO 才写「仍生效」，没挂就必须如实说没有兜底", () => {
+    expect(
+      describeProfitGuardFallback({
+        ruleId: "r", status: "unavailable", exchangeStopLossPx: 0.0688,
+      }),
+    ).toContain("仅交易所侧止盈止损仍生效");
+    // 运维把 AI_TRADE_DEFAULT_SL_PCT/_TP_PCT 置 0 ⇒ 后端根本不挂 OCO：此刻宣称有兜底是最坏的失灵
+    // （既没有保护层、又以为有防线）。
+    const bare = describeProfitGuardFallback({ ruleId: "r", status: "unavailable" });
+    expect(bare).toContain("没有任何自动兜底");
+    expect(bare).not.toContain("仍生效");
+  });
+});
+
+describe("describeProfitGuardUnavailable", () => {
+  it("三个原因码中文化；未知码回落「数据异常」（绝不显示裸英文）", () => {
+    expect(
+      describeProfitGuardUnavailable({ ruleId: "r", status: "unavailable", unavailableReason: "no_price" }),
+    ).toBe("实时价不可用");
+    expect(
+      describeProfitGuardUnavailable({ ruleId: "r", status: "unavailable", unavailableReason: "bad_position" }),
+    ).toBe("持仓读数异常");
+    expect(describeProfitGuardUnavailable({ ruleId: "r", status: "unavailable" })).toBe("数据异常");
+    expect(describeProfitGuardUnavailable(null)).toBe("数据异常");
+  });
+});
+
+describe("describeProfitGuardReason", () => {
+  it("三个触发码中文化；未知码原样回退", () => {
+    expect(describeProfitGuardReason("profit_guard_trailing")).toBe("移动止盈");
+    expect(describeProfitGuardReason("profit_guard_breakeven")).toBe("保本线");
+    expect(describeProfitGuardReason("profit_guard_hard_take_profit")).toBe("硬止盈");
+    expect(describeProfitGuardReason("something_else")).toBe("something_else");
+    expect(describeProfitGuardReason(null)).toBe("");
+  });
+});
+
+describe("marginReturnFromPricePct / priceMoveFromMarginPct", () => {
+  it("价格口径 × 杠杆 = 保证金口径（5× 下标的 10% ⇒ 保证金 50%，诊断根因 ②）", () => {
+    expect(marginReturnFromPricePct(0.1, 5)).toBeCloseTo(0.5, 10);
+    expect(priceMoveFromMarginPct(0.05, 5)).toBeCloseTo(0.01, 10);
+  });
+
+  it("杠杆留空（null）必须返回 null——绝不硬编码后端 live_default_leverage（[P1-9]）", () => {
+    expect(marginReturnFromPricePct(0.1, null)).toBeNull();
+    expect(marginReturnFromPricePct(0.1, undefined)).toBeNull();
+    expect(priceMoveFromMarginPct(0.05, null)).toBeNull();
+  });
+
+  it("非法输入（NaN / 非正杠杆 / 空值）一律 null，绝不假数据", () => {
+    expect(marginReturnFromPricePct(null, 5)).toBeNull();
+    expect(marginReturnFromPricePct(Number.NaN, 5)).toBeNull();
+    expect(marginReturnFromPricePct(0.1, 0)).toBeNull();
+    expect(marginReturnFromPricePct(0.1, -3)).toBeNull();
+    expect(priceMoveFromMarginPct(0.05, 0)).toBeNull();
+  });
+});
+
+describe("describeDegradeReason · 利润保护码", () => {
+  it("三个保护码中文化（成交列表的原因位不再是裸英文）", () => {
+    expect(describeDegradeReason("profit_guard_trailing")).toContain("浮盈自峰值回吐超阈");
+    expect(describeDegradeReason("profit_guard_breakeven")).toContain("跌回保本线");
+    expect(describeDegradeReason("profit_guard_hard_take_profit")).toContain("硬止盈");
   });
 });

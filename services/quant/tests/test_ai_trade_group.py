@@ -8,6 +8,8 @@ OKX / LLM / 会话全程打桩；铁律：占位假凭证，绝不写真实凭�
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select
@@ -544,3 +546,33 @@ async def test_single_member_group_equivalent(monkeypatch):
         get_ai_trade_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()
+
+
+async def test_profit_guard_mirrors_into_group_status_and_run_config(monkeypatch):
+    """利润保护回执镜像（ai-trade-profit-protection §5.2）：group_status 与 run config_json 同形状。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            members = [("BTC-USDT-SWAP", 100)]
+            r = await client.post("/api/ai-trade/start", json=_group_body(
+                strategy_id, members, capitalUsd=40,
+                profitGuard={"enabled": True, "armReturnPct": 0.07}))
+            assert r.status_code == 200, r.text
+            status = get_ai_trade_manager().group_status()
+            assert status["profitGuard"]["armReturnPct"] == 0.07
+            assert r.json()["profitGuard"] == status["profitGuard"]
+
+            run_id = get_ai_trade_manager()._group.members[0].run_id
+            sm = get_sessionmaker()
+            async with sm() as s:
+                run = await repo.get_run(s, run_id)
+            assert json.loads(run.config_json)["profitGuard"] == status["profitGuard"]
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+

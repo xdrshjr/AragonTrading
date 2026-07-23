@@ -5,7 +5,8 @@
 - ``risk_exit``：``max_hold`` 时间止盈；
 - ``reverse``：反手「先平后开」的平仓侧；
 - ``session_stop``：会话停止 / 会话级金额止盈止损的整仓平；
-- ``external_close``：交易所侧 OCO / 外部干预平仓的只读合成成交。
+- ``external_close``：交易所侧 OCO / 外部干预平仓的只读合成成交；
+- ``profit_guard``：利润保护层（移动止盈 / 保本 / 硬止盈）触发的强制平仓。
 
 所有构造器为**纯函数、无副作用**，只含行情 / 风控数值与公开标签，**绝不含任何凭证**（C7）：
 凭证只在 ``okx/*`` 下单链路使用，本模块从不接收 api_key / secret / passphrase。
@@ -133,6 +134,33 @@ def build_external_close_explain(*, pos_side: str, source: str, entry_price: flo
     ]
     return _base("external_close", "close", "交易所侧 / 外部平仓",
                  summary="本系统据 reconcile / flatten 侦测到交易所侧已平仓并据此校正；非策略主动下单",
+                 metrics=metrics)
+
+
+def build_profit_guard_explain(*, pos_side: str, trigger_label: str, entry_price: float,
+                               exit_price: float, peak_pnl: float | None,
+                               giveback_ratio: float | None, pnl: float | None) -> dict:
+    """利润保护层强制平仓（ai-trade-profit-protection §2.7）：移动止盈 / 保本 / 硬止盈触发。
+
+    与 ``risk_exit``（时间止盈）刻意分列一个新 kind：前者是「持仓根数到了」，本条是「已到手的浮盈
+    正在回吐」——归因语义不同，前端色调与文案也不同，混用会让用户看不出利润是被谁锁住的。
+
+    ``pnl`` 为触发瞬间的**本地派生浮盈**（不含手续费 / 资金费，比交易所 upl 略乐观），故标注为
+    「触发时浮盈」而非「本笔盈亏」——真实已实现盈亏以 trade.pnl 为准，绝不在此冒充。
+    """
+    giveback = "—" if giveback_ratio is None else f"{float(giveback_ratio) * 100:.1f}%"
+    metrics = [
+        _metric("触发规则", trigger_label, tone="short"),
+        _metric("原持仓方向", _side_label(pos_side)),
+        _metric("峰值浮盈", _fmt_usd(peak_pnl), tone=_pnl_tone(peak_pnl)),
+        _metric("自峰值回吐", giveback),
+        _metric("入场价", _fmt_px(entry_price)),
+        _metric("平仓价", _fmt_px(exit_price)),
+        _metric("触发时浮盈", _fmt_usd(pnl), tone=_pnl_tone(pnl),
+                hint="本地派生口径，不含手续费与资金费"),
+    ]
+    return _base("profit_guard", "close", f"利润保护平仓（{trigger_label}）",
+                 summary="持仓浮盈自峰值回吐触及系统保护线，由利润保护层直接市价平仓锁定利润",
                  metrics=metrics)
 
 

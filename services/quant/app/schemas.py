@@ -496,6 +496,24 @@ class AiTradeBaseRulesIn(BaseModel):
     maBandEntry: AiTradeMaBandRuleIn | None = None
 
 
+class AiTradeProfitGuardIn(BaseModel):
+    """利润保护层入参（ai-trade-profit-protection §4.1）：移动止盈 + 保本 + 可选硬止盈。
+
+    各数值字段留空 ⇒ 由服务端按 settings 回填（唯一默认真源在 config，不在此处硬编码）；越界即 422。
+    全部收益率为**保证金收益率口径**（诊断根因 ②）。`enabled=false` 是用户在启动弹窗手动关闭本层的
+    唯一途径——字段整体缺省表示「默认开启」，与显式关闭严格区分。
+    """
+
+    enabled: bool = True
+    armReturnPct: float | None = Field(default=None, gt=0, le=5)        # 武装移动止盈的峰值收益率
+    givebackPct: float | None = Field(default=None, gt=0, le=1)         # 自峰值允许回吐比例
+    breakevenArmReturnPct: float | None = Field(default=None, ge=0, le=5)   # 0 = 关闭保本
+    breakevenOffsetReturnPct: float | None = Field(default=None, ge=0, le=1)  # 保本线正向偏移
+    minHoldSeconds: float | None = Field(default=None, ge=0, le=3600)
+    # null 与 0 等价，均表关闭硬止盈（归一点在 resolve_profit_guard_rule，此后不可再分辨）。
+    hardTakeProfitReturnPct: float | None = Field(default=None, ge=0, le=20)
+
+
 class AiTradeGroupStartIn(BaseModel):
     """启动 AI 自动交易分组请求（金额/杠杆字段可留空→服务端保守默认，§4.1）。
 
@@ -527,6 +545,9 @@ class AiTradeGroupStartIn(BaseModel):
     # 【基础策略】铁律（默认开启）：**字段缺省 ⇒ 开启**（老客户端不发该字段也默认开启，语义在 API 层
     # `_resolve_base_rules` 单点解析）；`{"maBandEntry":{"enabled":false}}` ⇒ 该会话不装配。
     baseRules: AiTradeBaseRulesIn | None = None
+    # 利润保护层（默认开启，同上「字段缺省 ⇒ 开启」语义，解析点 `_resolve_profit_guard`）；
+    # `{"enabled":false}` ⇒ 该会话不装配。**只挂实盘启动**，回测显式非目标（§1.3）。
+    profitGuard: AiTradeProfitGuardIn | None = None
 
     @field_validator("members")
     @classmethod
@@ -564,6 +585,7 @@ class AiTradeGroupRow(BaseModel):
     members: list[AiTradeGroupMemberRow]
     wakeIntervalMinutes: float | None = None   # Agent 墙钟定时唤醒周期（分钟；null=关闭），契约镜像
     baseRules: dict | None = None              # 【基础策略】铁律回执镜像（null=未装配）
+    profitGuard: dict | None = None            # 利润保护层回执镜像（null=未装配）
 
 
 class AiTradeGroupStartOut(AiTradeGroupRow):

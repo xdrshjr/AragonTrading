@@ -14,6 +14,8 @@ import {
   describeMultiTimeframeFrame,
   describeOrderType,
   describePriceAction,
+  describeProfitGuardFallback,
+  describeProfitGuardStatus,
   describeReflection,
   describeRegime,
   describeStance,
@@ -220,6 +222,60 @@ function BaseRuleBlock({ trace }: { trace: AiTradeRoundTrace }) {
 }
 
 /**
+ * 利润保护段（ai-trade-profit-protection §2.7）：与基础策略段并列，置于其后——两者都是「系统强制执行」
+ * 的层，但一个管「在哪能开」、一个管「利润何时被强制锁定」。快照缺失（规则未装配 / 老快照）⇒ 整段不渲染。
+ *
+ * `unavailable` 只出一句「暂不可用」，**绝不显示退出线**：一条算得出来却不作数的价位比没有更危险。
+ *
+ * `status="flat"` 的空壳快照（`describeProfitGuardStatus` 对该态恒返回 null）**仍须渲染**：它是
+ * `lastExit` 回执唯一的载体，而回执又只在保护平仓后的那一轮出现（P1-7 读取即消费）——彼时仓位已平、
+ * 状态恰恰就是 flat。只按 `view` 早退会把「上一笔仓位为何消失」这条回执在 UI 上悄悄吞掉。
+ */
+function ProfitGuardBlock({ trace }: { trace: AiTradeRoundTrace }) {
+  const guard = trace.profitGuard ?? null;
+  const view = describeProfitGuardStatus(guard);
+  if (!guard || (!view && !guard.lastExit)) return null;
+  const unavailable = guard.status === "unavailable";
+  return (
+    <div className="flex flex-col gap-1.5 rounded-[10px] border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] px-2.5 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1 text-[11px] font-medium text-[var(--text)]">
+          <span className="leading-none">🛡️</span>利润保护（移动止盈 / 保本）
+        </span>
+        {view && (
+          <span
+            className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+            style={{ color: TONE_VAR[view.tone], backgroundColor: toneSoft(view.tone) }}
+          >
+            {view.label}
+          </span>
+        )}
+      </div>
+      {view &&
+        (unavailable ? (
+          <p className="text-[10px] leading-relaxed text-[var(--muted)]">
+            {describeProfitGuardFallback(guard)}。
+          </p>
+        ) : (
+          <p className="tabular text-[10px] leading-relaxed text-[var(--muted)]">
+            峰值浮盈 {guard.peakUnrealizedPnlUsd == null ? "—" : fmtNum(guard.peakUnrealizedPnlUsd, 3)} USDT
+            {" · 已回吐 "}
+            {guard.givebackRatio == null ? "—" : `${(guard.givebackRatio * 100).toFixed(1)}%`}
+            {" · 有效退出线 "}
+            {guard.effectiveExitPx == null ? "未武装" : fmtPrice(guard.effectiveExitPx)}
+          </p>
+        ))}
+      {guard.lastExit && (
+        <p className="text-[11px] leading-relaxed text-[var(--text)]">
+          上一笔持仓已由利润保护层强制平仓（{guard.lastExit.label ?? "利润保护"}）
+          {guard.lastExit.exitPx == null ? "" : ` @ ${fmtPrice(guard.lastExit.exitPx)}`}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
  * 二次反思（ReAct 校验）段（ai-trade-pre-trade-reflection §三）：置于决策工具卡与执行结果之间——
  * 流式反思复核文本（markdown）+ 裁决 chip + 理由 + 收缩后仓位。仅交易意愿轮（有反思在飞/文本/裁决）渲染。
  */
@@ -402,6 +458,7 @@ export default function AiTradeTraceRound({ trace }: { trace: AiTradeRoundTrace 
       <AnalysisBlock trace={trace} />
       <DecisionToolCard trace={trace} />
       <BaseRuleBlock trace={trace} />
+      <ProfitGuardBlock trace={trace} />
       <ReflectionBlock trace={trace} />
       <ResultRow trace={trace} />
       <SignalContext trace={trace} />

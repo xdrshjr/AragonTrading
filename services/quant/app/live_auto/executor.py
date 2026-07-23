@@ -164,6 +164,18 @@ class LiveExecutor:
             payload["positionPct"] = self.entry_position_pct
         return payload
 
+    def risk_trigger_px(self, side: str, fill: float) -> tuple[float | None, float | None]:
+        """交易所侧 OCO 触发价的**只读**转发（ai-trade-profit-protection §2.1）。
+
+        存在的唯一理由是让「UI / prompt 展示的兜底价」与「真实下单时附的那两个价」共用同一份公式；
+        零行为改动、零既有调用点变更，`live_auto` payload 逐字节相同。
+
+        **它只是回落路径**（P1-4）：限价成交时 `entry_price` 被 `_adopt_fill` 置为真实成交价 `avgPx`，
+        而随单 OCO 是按**挂单价** `order.px` 附的，照 `entry_price` 现算会得到一个交易所侧根本不存在
+        的价。首选真源恒为最近一笔开仓 `trade` 的 `takeProfitPrice` / `stopLossPrice`。
+        """
+        return self._risk_trigger_px(side, fill)
+
     # ---------- 核心：每根确认 K 线驱动 ----------
     async def apply(self, signals: list, *, ref_px: float, bar_index: int,
                     ts: int, order_plan=None) -> list[dict]:

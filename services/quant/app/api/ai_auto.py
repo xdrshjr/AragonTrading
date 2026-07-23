@@ -27,6 +27,7 @@ from ..ai_auto.manager import (
     AiTradePreflightError,
     AiTradeSessionLimitError,
 )
+from ..ai_auto.profit_guard import ProfitGuardRule, resolve_profit_guard_rule
 from ..config import Settings, get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
@@ -37,6 +38,7 @@ from ..schemas import (
     AiTradeGroupStartIn,
     AiTradeHistoryDetailOut,
     AiTradeHistoryListOut,
+    AiTradeProfitGuardIn,
     trade_out,
 )
 
@@ -93,6 +95,20 @@ def _resolve_base_rules(raw: AiTradeBaseRulesIn | None,
     raw_rule = raw.maBandEntry if raw is not None else None
     return resolve_ma_band_rule(
         raw_rule.model_dump() if raw_rule is not None else None, settings)
+
+
+def _resolve_profit_guard(raw: AiTradeProfitGuardIn | None,
+                          settings: Settings) -> ProfitGuardRule | None:
+    """利润保护层「默认开启」语义的**唯一解析点**（ai-trade-profit-protection §2.8）。
+
+    字段缺省 ⇒ 按 settings 装配开启态（老客户端 / 桌面旧包不发该字段也受保护）；显式 `enabled=false`
+    ⇒ `None`（该会话不装配）；运维总闸关 ⇒ 恒 `None`。
+
+    **[P2-4] 只接 `ai_trade_start`，绝不接 `ai_backtest_start`**——与两处共用的 `_resolve_base_rules`
+    刻意不同：回测按根推进，峰值浮盈的真值需要 bar 内 OHLC 级建模，用收盘价近似会低估触发频次并产出
+    一份「比实盘保守却看起来同构」的曲线（§1.3 非目标，属假数据）。
+    """
+    return resolve_profit_guard_rule(raw.model_dump() if raw is not None else None, settings)
 
 
 async def _resolve_account(session: AsyncSession, account_id: int | None) -> repo.OkxAccount:
@@ -161,7 +177,8 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
         budget_cap_frac=cap_frac, default_budget_frac=settings.ai_trade_default_capital_frac,
         position_step_pct=_resolve_position_step(body.positionStepPct, settings),
         wake_interval_s=_resolve_wake_interval_s(body.wakeIntervalMinutes, settings),
-        base_rule=_resolve_base_rules(body.baseRules, settings))
+        base_rule=_resolve_base_rules(body.baseRules, settings),
+        profit_rule=_resolve_profit_guard(body.profitGuard, settings))
     try:
         await get_ai_trade_manager().start_group(req)
     except AiTradeGroupPreflightError as exc:

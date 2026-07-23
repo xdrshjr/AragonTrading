@@ -22,9 +22,13 @@ import {
   AI_TRADE_MAX_SYMBOLS,
   AI_TRADE_MAX_TP_PCT,
   AI_TRADE_POSITION_STEP_OPTIONS,
+  AI_TRADE_PROFIT_GUARD_DEFAULTS,
   deriveDefaultBudget,
+  marginReturnFromPricePct,
   positionLadder,
+  priceMoveFromMarginPct,
   validateContextRounds,
+  validateProfitGuard,
   validateStrategySelection,
   validateWakeInterval,
 } from "@/lib/aiTrade";
@@ -47,7 +51,11 @@ import {
   parseOptionalPct,
   parseOptionalUsd,
 } from "@/lib/liveAuto";
-import type { AiTradeBaseRules, AiTradeMaBandRule } from "@/lib/aiTradeTypes";
+import type {
+  AiTradeBaseRules,
+  AiTradeMaBandRule,
+  AiTradeProfitGuardRule,
+} from "@/lib/aiTradeTypes";
 import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
 import { tradingApi } from "@/lib/tradingApi";
 import type { Bar } from "@/lib/types";
@@ -74,6 +82,9 @@ export interface AiTradeLaunchOpts {
   // 【基础策略】铁律（实盘/回测两 tab 同得，实盘与回测的默认必须一致，P1-4）：勾选 ⇒ 带完整参数；
   // 取消勾选 ⇒ `{maBandEntry:{enabled:false}}`（**显式关闭**，与「字段缺省=默认开启」语义严格区分）。
   baseRules: AiTradeBaseRules;
+  // 利润保护层（**仅实盘**：回测按根推进、峰值浮盈需 bar 内 OHLC 建模，收盘价近似即假数据，故显式非目标）。
+  // 与 wakeIntervalMinutes 同为可选，回测分支省略该键。勾选 ⇒ 带完整参数；取消勾选 ⇒ `{enabled:false}`（显式关闭）。
+  profitGuard?: AiTradeProfitGuardRule;
   contextRefreshRounds: number;
   // Agent 墙钟定时唤醒周期（分钟）：[RN-1] 声明为**可选**（对齐 backtest-only 可选字段），仅 live 分支透传、
   // base 不含、回测省略——若定为非可选，回测 onConfirm 不带该键将 tsc 编译失败。0/关闭 = 仅按 K 线与策略触发。
@@ -86,6 +97,12 @@ export interface AiTradeLaunchOpts {
 }
 
 const DAY = 86_400;
+
+// 服务端单仓 OCO 默认值（与后端 ai_trade_default_sl_pct=0.05 / ai_trade_default_tp_pct=0.10 对齐）。
+// 本轮**不改这两个数值**（它们是进程崩溃 / 断网时唯一还生效的交易所侧兜底，静默收紧会让存量会话止损
+// 前移），只做「显性化 + 可记忆」——把「留空＝默认」这条隐藏语义写成用户看得见的具体数字。
+const AI_TRADE_DEFAULT_OCO_SL_PCT = 0.05;
+const AI_TRADE_DEFAULT_OCO_TP_PCT = 0.1;
 
 /**
  * 启动 AI 自动交易弹窗（ai-trade-multi-symbol-and-timeframe §4.2/§4.3）：顶部「实盘 / 回测」段控。
@@ -109,6 +126,9 @@ export default function AiTradeLaunchModal({
   defaultPositionStepPct,
   defaultWakeIntervalMinutes,
   defaultBaseRule,
+  defaultProfitGuard,
+  defaultStopLossPct,
+  defaultTakeProfitPct,
   error,
   liveGateReason = null,
   defaultStartTs,
@@ -130,6 +150,10 @@ export default function AiTradeLaunchModal({
   defaultPositionStepPct: number;     // 上次所选仓位操作档位（aiTradeConfig?.positionStepPct ?? 默认，回填弹窗）
   defaultWakeIntervalMinutes: number; // 上次所选 Agent 唤醒周期（aiTradeConfig?.wakeIntervalMinutes ?? 默认，回填弹窗）
   defaultBaseRule: AiTradeMaBandRule; // 上次所选【基础策略】参数（aiTradeConfig?.baseRules ?? 默认，回填弹窗）
+  defaultProfitGuard: AiTradeProfitGuardRule; // 上次所选利润保护参数（aiTradeConfig?.profitGuard ?? 默认）
+  // 上次填过的单仓 OCO（诊断根因 ③：每次都被清空 ⇒ 用户不知不觉一直用 10%/5% 的宽默认）。
+  defaultStopLossPct?: number;
+  defaultTakeProfitPct?: number;
   error?: string | null;
   liveGateReason?: string | null;     // 实盘不可用原因（非 null → 段控禁用实盘、默认落回测，R6）
   defaultStartTs?: number;
@@ -149,8 +173,8 @@ export default function AiTradeLaunchModal({
   const [leverageRaw, setLeverageRaw] = useState("");
   const [takeProfitRaw, setTakeProfitRaw] = useState("");
   const [stopLossRaw, setStopLossRaw] = useState("");
-  const [stopLossPctRaw, setStopLossPctRaw] = useState("");
-  const [takeProfitPctRaw, setTakeProfitPctRaw] = useState("");
+  const [stopLossPctRaw, setStopLossPctRaw] = useState(pctToRaw(defaultStopLossPct));
+  const [takeProfitPctRaw, setTakeProfitPctRaw] = useState(pctToRaw(defaultTakeProfitPct));
   const [roundsRaw, setRoundsRaw] = useState(String(defaultContextRounds || AI_TRADE_DEFAULT_CONTEXT_ROUNDS));
   const [positionStep, setPositionStep] = useState(defaultPositionStepPct || AI_TRADE_DEFAULT_POSITION_STEP);
   // Agent 墙钟定时唤醒周期（分钟，仅实盘段）：初值取 defaultWakeIntervalMinutes（用 ?? 保留 0=关闭偏好）。
@@ -173,6 +197,18 @@ export default function AiTradeLaunchModal({
   const [baseRuleDirectional, setBaseRuleDirectional] = useState(
     defaultBaseRule.directional ?? AI_TRADE_BASE_RULE_DEFAULTS.directional,
   );
+  // 利润保护层（默认开启）：四个数值输入一律走**百分数**（用户口径），提交时统一 /100 转 fraction。
+  const [profitGuardEnabled, setProfitGuardEnabled] = useState(
+    defaultProfitGuard.enabled ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.enabled,
+  );
+  const [armReturnRaw, setArmReturnRaw] = useState(pctToRaw100(defaultProfitGuard.armReturnPct,
+    AI_TRADE_PROFIT_GUARD_DEFAULTS.armReturnPct));
+  const [givebackRaw, setGivebackRaw] = useState(pctToRaw100(defaultProfitGuard.givebackPct,
+    AI_TRADE_PROFIT_GUARD_DEFAULTS.givebackPct));
+  const [breakevenArmRaw, setBreakevenArmRaw] = useState(pctToRaw100(
+    defaultProfitGuard.breakevenArmReturnPct, AI_TRADE_PROFIT_GUARD_DEFAULTS.breakevenArmReturnPct));
+  const [minHoldRaw, setMinHoldRaw] = useState(String(
+    defaultProfitGuard.minHoldSeconds ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.minHoldSeconds));
   const [startInput, setStartInput] = useState("");
   const [endInput, setEndInput] = useState("");
   const [everyRaw, setEveryRaw] = useState("");
@@ -222,12 +258,22 @@ export default function AiTradeLaunchModal({
     setBaseRuleStdRaw(String(defaultBaseRule.stdMult ?? AI_TRADE_BASE_RULE_DEFAULTS.stdMult));
     setBaseRuleTolerance(defaultBaseRule.tolerance ?? AI_TRADE_BASE_RULE_DEFAULTS.tolerance);
     setBaseRuleDirectional(defaultBaseRule.directional ?? AI_TRADE_BASE_RULE_DEFAULTS.directional);
+    setProfitGuardEnabled(defaultProfitGuard.enabled ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.enabled);
+    setArmReturnRaw(pctToRaw100(defaultProfitGuard.armReturnPct,
+      AI_TRADE_PROFIT_GUARD_DEFAULTS.armReturnPct));
+    setGivebackRaw(pctToRaw100(defaultProfitGuard.givebackPct,
+      AI_TRADE_PROFIT_GUARD_DEFAULTS.givebackPct));
+    setBreakevenArmRaw(pctToRaw100(defaultProfitGuard.breakevenArmReturnPct,
+      AI_TRADE_PROFIT_GUARD_DEFAULTS.breakevenArmReturnPct));
+    setMinHoldRaw(String(defaultProfitGuard.minHoldSeconds
+      ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.minHoldSeconds));
     setCapitalRaw("");
     setLeverageRaw("");
     setTakeProfitRaw("");
     setStopLossRaw("");
-    setStopLossPctRaw("");
-    setTakeProfitPctRaw("");
+    // 诊断根因 ③：这两项过去恒被清空，用户便在不知情下一直吃 10%/5% 的宽默认；改为回填上次偏好。
+    setStopLossPctRaw(pctToRaw(defaultStopLossPct));
+    setTakeProfitPctRaw(pctToRaw(defaultTakeProfitPct));
     const nowSec = Math.floor(Date.now() / 1000);
     setStartInput(toLocalInput(defaultStartTs ?? nowSec - 30 * DAY));
     setEndInput(toLocalInput(defaultEndTs ?? nowSec));
@@ -311,6 +357,24 @@ export default function AiTradeLaunchModal({
       : { enabled: false },
   };
 
+  // 利润保护参数（**仅实盘**，回测不装配也不露出）：UI 收百分数，此处统一 /100 转 fraction。
+  const profitGuardPayload: AiTradeProfitGuardRule = profitGuardEnabled
+    ? {
+        enabled: true,
+        armReturnPct: rawPctToFraction(armReturnRaw),
+        givebackPct: rawPctToFraction(givebackRaw),
+        breakevenArmReturnPct: rawPctToFraction(breakevenArmRaw),
+        minHoldSeconds: Number(minHoldRaw),
+      }
+    : { enabled: false };
+  const profitGuardError = mode === "live" ? validateProfitGuard(profitGuardPayload) : null;
+  // 双口径换算的唯一真源；杠杆留空 ⇒ null ⇒ 只显示保证金口径并附一句「填写杠杆后显示」（诚实降级，不猜默认杠杆）。
+  const armPriceMovePct = priceMoveFromMarginPct(profitGuardPayload.armReturnPct ?? null, leverage.value);
+  const slMarginPct = marginReturnFromPricePct(
+    stopLossPct.value ?? AI_TRADE_DEFAULT_OCO_SL_PCT, leverage.value);
+  const tpMarginPct = marginReturnFromPricePct(
+    takeProfitPct.value ?? AI_TRADE_DEFAULT_OCO_TP_PCT, leverage.value);
+
   // 成员校验（实盘）：非空、皆可自动交易、各 pct ∈ (0,100]，even 模式 Σ ≤ 100（避免提交即 422）。
   const sumPct = totalAllocation(members);
   const hasUnsupportedMember = members.some((m) => !isAutoTradable(m.instId));
@@ -373,7 +437,7 @@ export default function AiTradeLaunchModal({
   const baseValid = !inputError && !strategyError && !roundsError && !baseRuleError;
   const ready =
     mode === "live"
-      ? baseValid && !membersError && !wakeError && acknowledged
+      ? baseValid && !membersError && !wakeError && !profitGuardError && acknowledged
       : baseValid && instSupported && !!instId && !rangeError && !everyError && !minConsensusError && !roundsCapError;
 
   const handleConfirm = () => {
@@ -395,7 +459,7 @@ export default function AiTradeLaunchModal({
       // [RN-1] wakeIntervalMinutes 仅 live 分支带上（base 不含、回测省略）；空→0=关闭定时唤醒。
       onConfirm({
         mode: "live", members, allocationMode, instId: members[0]?.instId ?? instId,
-        ...base, wakeIntervalMinutes: wakeMinutes ?? 0,
+        ...base, wakeIntervalMinutes: wakeMinutes ?? 0, profitGuard: profitGuardPayload,
       });
       return;
     }
@@ -418,7 +482,7 @@ export default function AiTradeLaunchModal({
     inputError ||
     baseRuleError ||
     (mode === "live"
-      ? membersError || wakeError
+      ? membersError || wakeError || profitGuardError
       : instSupported
         ? null
         : "标的不支持自动交易（仅 USDT 本位永续 / 交割合约）") ||
@@ -763,7 +827,7 @@ export default function AiTradeLaunchModal({
             <Row label="单笔名义上限" value={`≤ ${LIVE_MAX_ORDER_NOTIONAL_USD} USDT/单`} />
             <Row
               label="单仓兜底 OCO（交易所侧）"
-              value={`SL ${fmtOcoPct(stopLossPct.value, AI_TRADE_MAX_SL_PCT)} / TP ${fmtOcoPct(takeProfitPct.value, AI_TRADE_MAX_TP_PCT)}`}
+              value={`SL ${fmtOcoDual(stopLossPct.value, AI_TRADE_MAX_SL_PCT, AI_TRADE_DEFAULT_OCO_SL_PCT, slMarginPct)} / TP ${fmtOcoDual(takeProfitPct.value, AI_TRADE_MAX_TP_PCT, AI_TRADE_DEFAULT_OCO_TP_PCT, tpMarginPct)}`}
             />
           </div>
         ) : (
@@ -779,7 +843,7 @@ export default function AiTradeLaunchModal({
             <Row label="初始资金" value={capital.value != null ? `${fmtPrice(capital.value)} USDT` : "默认"} />
             <Row
               label="单仓 OCO（模拟撮合）"
-              value={`SL ${fmtOcoPct(stopLossPct.value, AI_TRADE_MAX_SL_PCT)} / TP ${fmtOcoPct(takeProfitPct.value, AI_TRADE_MAX_TP_PCT)}`}
+              value={`SL ${fmtOcoDual(stopLossPct.value, AI_TRADE_MAX_SL_PCT, AI_TRADE_DEFAULT_OCO_SL_PCT, slMarginPct)} / TP ${fmtOcoDual(takeProfitPct.value, AI_TRADE_MAX_TP_PCT, AI_TRADE_DEFAULT_OCO_TP_PCT, tpMarginPct)}`}
             />
             <Row label="手续费 / 滑点" value="taker 5bps / 2bps（同其它回测）" />
           </div>
@@ -801,8 +865,21 @@ export default function AiTradeLaunchModal({
           <Field label="杠杆（×）" placeholder="留空＝默认" value={leverageRaw} onChange={setLeverageRaw} disabled={submitting} />
           <Field label={mode === "backtest" ? "会话止盈（USDT）" : "总止盈（USDT）"} placeholder="留空＝不触发" value={takeProfitRaw} onChange={setTakeProfitRaw} disabled={submitting} />
           <Field label={mode === "backtest" ? "会话止损（USDT）" : "总止损（USDT）"} placeholder="留空＝不触发" value={stopLossRaw} onChange={setStopLossRaw} disabled={submitting} />
-          <Field label="单仓止损%（如 0.05＝5%）" placeholder="留空＝默认" value={stopLossPctRaw} onChange={setStopLossPctRaw} disabled={submitting} />
-          <Field label="单仓止盈%（如 0.10＝10%）" placeholder="留空＝默认" value={takeProfitPctRaw} onChange={setTakeProfitPctRaw} disabled={submitting} />
+          <Field
+            label="单仓止损%（如 0.05＝5%）"
+            placeholder={ocoPlaceholder(AI_TRADE_DEFAULT_OCO_SL_PCT, leverage.value, "-")}
+            value={stopLossPctRaw}
+            onChange={setStopLossPctRaw}
+            disabled={submitting}
+            hint={leverage.value == null ? "保证金口径按下单杠杆换算，填写杠杆后显示" : undefined}
+          />
+          <Field
+            label="单仓止盈%（如 0.10＝10%）"
+            placeholder={ocoPlaceholder(AI_TRADE_DEFAULT_OCO_TP_PCT, leverage.value, "+")}
+            value={takeProfitPctRaw}
+            onChange={setTakeProfitPctRaw}
+            disabled={submitting}
+          />
         </div>
 
         {/* 仓位操作档位（两模式共用）：约束 AI 每次开仓规模只能落在离散档位阶梯上，而非任意小数金额。 */}
@@ -847,6 +924,64 @@ export default function AiTradeLaunchModal({
               越小唤醒越频繁、LLM 调用越多；留空 / 0 = 仅按 K 线与策略触发。
             </span>
           </label>
+        )}
+
+        {/* 利润保护层（**仅实盘**）：回测按根推进、峰值浮盈需 bar 内 OHLC 建模，收盘价近似会低估触发频次，
+            产出一份「比实盘保守却看起来同构」的曲线——属假数据，故回测段整块不渲染（§1.3 非目标）。 */}
+        {mode === "live" && (
+          <div className="flex flex-col gap-1.5 rounded-md border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_5%,transparent)] px-3 py-2">
+            <label className="flex cursor-pointer items-start gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={profitGuardEnabled}
+                disabled={submitting}
+                onChange={(e) => setProfitGuardEnabled(e.target.checked)}
+                className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[var(--accent)]"
+                aria-label="利润保护（推荐开启）"
+              />
+              <span className="flex flex-col gap-0.5">
+                <span className="font-medium text-[var(--text)]">利润保护（推荐开启）</span>
+                <span className="text-[11px] leading-relaxed text-[var(--muted)]">
+                  <strong className="text-[var(--text)]">移动止盈 + 保本</strong>：持仓浮盈达阈值后系统记录峰值，
+                  利润自峰值<strong className="text-[var(--text)]">回吐超比例</strong>或价格
+                  <strong className="text-[var(--text)]">跌回保本线</strong>时由系统直接市价平仓。
+                  判定只用<strong className="text-[var(--text)]">实时价</strong>，不等 K 线收盘；
+                  行情异常时保护层会主动不动作（届时仅交易所侧止盈止损生效）。
+                </span>
+              </span>
+            </label>
+            {profitGuardEnabled && (
+              <div className="mt-1 flex flex-col gap-1.5 text-[11px] text-[var(--muted)]">
+                <div className="grid grid-cols-2 gap-2">
+                  <GuardField
+                    label="武装阈值（保证金收益 %）"
+                    value={armReturnRaw}
+                    onChange={setArmReturnRaw}
+                    disabled={submitting}
+                  />
+                  <GuardField
+                    label="允许回吐（%）"
+                    value={givebackRaw}
+                    onChange={setGivebackRaw}
+                    disabled={submitting}
+                  />
+                  <GuardField
+                    label="保本阈值（保证金收益 %，0=关）"
+                    value={breakevenArmRaw}
+                    onChange={setBreakevenArmRaw}
+                    disabled={submitting}
+                  />
+                  <GuardField
+                    label="最短持有（秒）"
+                    value={minHoldRaw}
+                    onChange={setMinHoldRaw}
+                    disabled={submitting}
+                  />
+                </div>
+                <span className="leading-relaxed">{guardPreview(armReturnRaw, givebackRaw, armPriceMovePct)}</span>
+              </div>
+            )}
+          </div>
         )}
 
         {mode === "backtest" && (
@@ -939,6 +1074,87 @@ function toLocalInput(ts: number): string {
 function fmtOcoPct(value: number | null, max: number): string {
   if (value == null) return "默认";
   return `${+(clampPct(value, max) * 100).toFixed(2)}%`;
+}
+
+/**
+ * 单仓 OCO 的**双口径**渲染（诊断根因 ②/⑤）：价格口径 +「≈保证金 ±X%」。
+ * 留空时不再只写「默认」——那正是让用户不知不觉吃下 10%/5% 宽阈值的元凶，改为如实写出生效默认值。
+ * 杠杆留空 ⇒ `marginPct` 为 null ⇒ 只出价格口径（绝不猜后端的 live_default_leverage，[P1-9]）。
+ */
+function fmtOcoDual(
+  value: number | null,
+  max: number,
+  fallback: number,
+  marginPct: number | null,
+): string {
+  const effective = value == null ? fallback : clampPct(value, max);
+  const head = `${+(effective * 100).toFixed(2)}%${value == null ? "（默认）" : ""}`;
+  if (marginPct == null) return head;
+  return `${head}（≈保证金 ${marginPct >= 0 ? "" : "-"}${+(Math.abs(marginPct) * 100).toFixed(1)}%）`;
+}
+
+/** OCO 输入框 placeholder：把「留空＝默认」的隐藏语义写成具体数值（+ 已知杠杆时的保证金口径）。 */
+function ocoPlaceholder(fallback: number, leverage: number | null, sign: string): string {
+  const margin = marginReturnFromPricePct(fallback, leverage);
+  const base = `留空＝默认 ${+(fallback * 100).toFixed(2)}%`;
+  return margin == null ? base : `${base}（≈保证金 ${sign}${+(margin * 100).toFixed(0)}%）`;
+}
+
+/** 百分数输入串 → fraction（空串 / 非数 → NaN，交由 validateProfitGuard 报错，不静默吞）。 */
+function rawPctToFraction(raw: string): number {
+  const n = Number(raw);
+  return Number.isFinite(n) ? n / 100 : Number.NaN;
+}
+
+/** fraction → 百分数输入串（缺省回落给定默认，保证输入框永不出现空白/NaN）。 */
+function pctToRaw100(value: number | null | undefined, fallback: number): string {
+  const n = value ?? fallback;
+  return String(+(n * 100).toFixed(4));
+}
+
+/** fraction → 单仓 OCO 输入串（缺省 ⇒ 空串＝沿用服务端默认，保持「留空」这一合法退出口）。 */
+function pctToRaw(value: number | null | undefined): string {
+  return value == null ? "" : String(value);
+}
+
+/** 利润保护实时预览（纯前端派生，无请求）；杠杆未知时诚实省略标的涨跌幅换算（[P1-9]）。 */
+function guardPreview(armRaw: string, givebackRaw: string, armPriceMovePct: number | null): string {
+  const arm = Number(armRaw);
+  const giveback = Number(givebackRaw);
+  if (!Number.isFinite(arm) || !Number.isFinite(giveback)) return "";
+  const scope =
+    armPriceMovePct == null
+      ? `浮盈达 ${+arm.toFixed(2)}%（保证金口径）`
+      : `浮盈达 ${+arm.toFixed(2)}%（≈标的 ${+(armPriceMovePct * 100).toFixed(2)}%）`;
+  return `${scope}即武装 → 自峰值回吐 ${+giveback.toFixed(2)}% 或跌回保本线即由系统平仓。`;
+}
+
+/** 利润保护的数值输入框（与「高级参数」同风格的紧凑右对齐输入）。 */
+function GuardField({
+  label,
+  value,
+  onChange,
+  disabled,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  disabled: boolean;
+}) {
+  return (
+    <label className="flex flex-col gap-1">
+      <span>{label}</span>
+      <input
+        type="text"
+        inputMode="decimal"
+        value={value}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value)}
+        aria-label={label}
+        className="rounded border border-[var(--border)] bg-[var(--bg)] px-1.5 py-1 text-right text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] disabled:opacity-50"
+      />
+    </label>
+  );
 }
 
 function ModeTab({
@@ -1057,6 +1273,9 @@ function Field({
         placeholder={placeholder}
         disabled={disabled}
         onChange={(e) => onChange(e.target.value)}
+        // 显式 aria-label：本组件的 <label> 还包着可选 hint 文本，仅靠包裹关系解析出的可访问名会被 hint
+        // 污染（既影响读屏也影响按标签取元素），故以字段名为准显式声明。
+        aria-label={label}
         className="rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] disabled:opacity-50"
       />
       {hint && <span className="leading-relaxed text-[var(--muted)]">{hint}</span>}

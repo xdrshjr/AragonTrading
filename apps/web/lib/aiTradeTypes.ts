@@ -1,6 +1,10 @@
 // AI 自动交易 wire 类型（camelCase，与后端 schemas.py 的 AiTrade* 同构）。
 // 运行期句柄（sessionId 等）为瞬态（store 不入 partialize）；aiTradeConfig 为持久化偏好。
-import type { PaperPositionEvent, Trade } from "./types";
+import type { PaperPositionEvent, ProfitGuardSnapshot, Trade } from "./types";
+
+// 保护快照的形状真源在 types.ts（aiTradeTypes 已 import 它，反向 import 会成环）；此处只做转出口，
+// 使 AI 自动交易侧的消费点无需跨文件二次 import。
+export type { ProfitGuardSnapshot } from "./types";
 
 // cancel_order（ai-trade-limit-orders M-11）：撤回本会话未成交的限价挂单，不开不平。
 export type AiTradeAction = "open_long" | "open_short" | "close" | "hold" | "cancel_order";
@@ -207,6 +211,18 @@ export interface AiTradeBaseRules {
 // 铁律门禁判定态：放行 / 否决 / 通道数据不可用（fail-closed）。
 export type AiTradeBaseRuleStatus = "pass" | "veto" | "unavailable";
 
+// 利润保护层入参（与后端 profit_guard.ProfitGuardRule 镜像；数值字段留空→服务端按 settings 回填）。
+// 全部收益率为**保证金收益率口径**（5× 杠杆下标的 10% ≈ 保证金 +50%，用标的口径根本触发不到）。
+export interface AiTradeProfitGuardRule {
+  enabled: boolean;
+  armReturnPct?: number | null;              // 武装移动止盈的峰值保证金收益率（0~5）
+  givebackPct?: number | null;               // 自峰值允许回吐比例（0~1）
+  breakevenArmReturnPct?: number | null;     // 武装保本线的峰值收益率（0=关闭保本）
+  breakevenOffsetReturnPct?: number | null;  // 保本线正向偏移（覆盖手续费）
+  minHoldSeconds?: number | null;            // 最短持有期（秒）
+  hardTakeProfitReturnPct?: number | null;   // 硬止盈收益率（null 与 0 等价，均表关闭）
+}
+
 // agent_trace 事件 data（各字段按 phase 可选；前端 reducer 按 phase 归约）。
 export interface AiTradeTraceEvent {
   phase: AiTradeTracePhase;
@@ -233,6 +249,7 @@ export interface AiTradeTraceEvent {
   consensus?: Consensus | null; // round_start
   marketDigest?: MarketDigest | null; // round_start（R1：价格走势/成交量/因子证据摘要）
   multiTimeframeContext?: MultiTimeframeContext | null; // round_start（决策级中线背景）
+  profitGuard?: ProfitGuardSnapshot | null; // round_start：利润保护断面（未装配→ null）
   attempt?: number; // retry：当前重试序号（1-based）
   maxAttempts?: number; // retry：本轮最大重试次数
   reason?: string; // retry：触发本次重试的上一次 degrade 原因 / reflection_verdict：反思理由
@@ -281,6 +298,9 @@ export interface AiTradeRoundTrace {
   baseRuleZone?: "lower" | "mid" | "upper" | null;
   baseRulePctB?: number | null;
   baseRuleReason?: string | null;
+  // 利润保护快照（ai-trade-profit-protection §2.7）：规则未装配的会话恒为 null；**不新增 trace phase**
+  // ——保护层跑在 5s 盯市上、不是轮级判定，只随 round_start 带一份断面。
+  profitGuard?: ProfitGuardSnapshot | null;
   state: "deciding" | "done" | "skipped" | "error";
 }
 
@@ -412,6 +432,7 @@ export interface AiTradeGroupStartReq {
   positionStepPct?: number | null;  // 仓位操作档位步长（fraction；留空→服务端默认；0→连续）
   wakeIntervalMinutes?: number | null;  // Agent 墙钟定时唤醒周期（分钟；留空→服务端默认 2；0→关闭）
   baseRules?: AiTradeBaseRules | null;  // 【基础策略】铁律（字段省略→服务端默认开启）
+  profitGuard?: AiTradeProfitGuardRule | null;  // 利润保护层（字段省略→服务端默认开启）
 }
 
 // 分组成员行（start 回执 / status 视图共用）：完整会话行 + 分配占比。
@@ -432,6 +453,7 @@ export interface AiTradeGroupRow {
   members: AiTradeGroupMemberRow[];
   wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭）
   baseRules?: AiTradeBaseRules | null; // 【基础策略】铁律回执镜像（null=未装配）
+  profitGuard?: AiTradeProfitGuardRule | null; // 利润保护层回执镜像（null=未装配）
 }
 
 export type AiTradeGroupStartResult = AiTradeGroupRow;
@@ -493,6 +515,11 @@ export interface AiTradeConfig {
   // 【基础策略】铁律偏好；[R-7] 同样声明为**可选**——老用户 localStorage 无此键，读点一律
   // `?? AI_TRADE_BASE_RULE_DEFAULTS` 兜底（**不**为此改 persist version，避免动 migration 链）。
   baseRules?: AiTradeMaBandRule;
+  // 利润保护偏好 + 单仓 OCO 偏好（诊断根因 ③：留空 = 悄悄用 10%/5%）；同为**可选**，读点一律兜底
+  // （**不**为此改 persist version，沿用 baseRules 先例，避免动 migration 链）。
+  profitGuard?: AiTradeProfitGuardRule;
+  stopLossPct?: number;
+  takeProfitPct?: number;
 }
 
 // 别名（spec §3 类型清单）：会话运行期视图 / 轻量状态负载，供 store 与流式路由语义化引用。

@@ -7,12 +7,14 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import time
 
 import pytest
 
 from app.agent.llm.base import StreamEvent
 from app.ai_auto.base_rules import MaBandRule
 from app.ai_auto.decider import AiTradeDecider
+from app.ai_auto.profit_guard import ProfitGuardRule, format_profit_guard_for_prompt
 from app.ai_auto.prompts import REFLECTION_TOOL_NAME
 from app.ai_auto.session import AiTradeSession
 from app.config import Settings
@@ -21,6 +23,7 @@ from app.db.session import dispose_engine, get_sessionmaker, init_db
 from app.engine.simulator import RiskParams
 from app.live_auto.executor import LiveExecutor
 from app.okx.accounts import AccountCredentials
+from app.okx.rest_client import OKXError
 from app.okx.types import Candle
 from app.paper.strategy_factory import PaperStrategySpec
 from app.strategies.base import BaseStrategy, StrategyMeta
@@ -69,7 +72,7 @@ def _candle(idx: int, price: float = 30000.0) -> Candle:
 
 def _make_session(*, action="hold", size=0.5, run_id=1, stop_loss_usd=None,
                   pos_state=None, context_rounds=10, priming=False, settings=None,
-                  base_rule=None):
+                  base_rule=None, profit_rule=None):
     settings = settings or Settings()
     pos_state = pos_state if pos_state is not None else {"flat": False, "upl": 0.0}
     calls = {"orders": [], "closes": []}
@@ -102,7 +105,7 @@ def _make_session(*, action="hold", size=0.5, run_id=1, stop_loss_usd=None,
     session = AiTradeSession("aitrade_test", run_id, [spec], "BTC-USDT-SWAP", "1H", executor,
                              decider, stop_loss_usd=stop_loss_usd, priming=priming,
                              priming_bars=10, context_refresh_rounds=context_rounds,
-                             base_rule=base_rule)
+                             base_rule=base_rule, profit_rule=profit_rule)
 
     async def no_htf_data(*_args, **_kwargs):
         return []
@@ -879,3 +882,290 @@ async def test_three_consecutive_unavailable_rounds_emit_error_event():
                 and e["data"]["phase"] == "base_rule"] == ["unavailable"] * 3
     finally:
         await dispose_engine()
+
+
+# ============================ 利润保护层（ai-trade-profit-protection §7.1）============================
+_PG_ENTRY = 0.07245
+_PG_LEV = 5.0
+_PG_QTY = 100.0
+
+
+def _pg_rule(**kwargs) -> ProfitGuardRule:
+    return ProfitGuardRule(**kwargs)
+
+
+def _pg_peak_px(return_pct: float, *, entry: float = _PG_ENTRY) -> float:
+    """由目标峰值保证金收益率反算峰值价（构造式基准，[P1-3]：不写死任何字面价）。"""
+    return entry * (1 + return_pct / _PG_LEV)
+
+
+def _pg_trail_px(peak_px: float, rule: ProfitGuardRule, *, entry: float = _PG_ENTRY) -> float:
+    return entry + (peak_px - entry) * (1 - rule.giveback_pct)
+
+
+def _open_long(session, *, entry: float = _PG_ENTRY, qty: float = _PG_QTY) -> None:
+    """把自管持仓直接置为一笔多头（镜像 `_do_open` 市价分支的状态跃迁，不经 LLM / 下单桩）。"""
+    ex = session.executor
+    ex.leverage = _PG_LEV
+    ex.projected = "long"
+    ex.entry_price = entry
+    ex.entry_qty_sz = qty
+    ex.entry_bar = 0
+    ex.entry_position_pct = 0.5
+    session._last_live_px = entry
+    session._last_px_wall = time.time()
+
+
+def _arm_peak(session, peak_px: float, *, aged_s: float = 300.0) -> None:
+    """把峰值推到 `peak_px` 并让最短持有期过去（`opened_wall` 回拨）。"""
+    session._last_live_px = peak_px
+    session._refresh_profit_state(time.time())
+    session._profit_state.opened_wall -= aged_s
+
+
+async def test_profit_guard_absent_rule_is_byte_identical():
+    """G-4：`profit_rule=None` ⇒ payload 无 profitGuard 键、position 无保护段、盯市零事件。"""
+    await init_db()
+    session, _, _ = _make_session(action="hold")
+    try:
+        _open_long(session)
+        q = session.subscribe()
+        payload = session._build_decision_payload(1, 0, _PG_ENTRY, [], "candle")
+        assert "profitGuard" not in payload and "profitHoldRounds" not in payload
+        assert "profitGuard" not in (session._position_payload(_PG_ENTRY) or {})
+        await session._maybe_profit_exit(_START_TS)
+        assert _drain(q) == [] and session.profit_guard_exits == 0
+    finally:
+        await dispose_engine()
+
+
+async def test_profit_guard_trailing_exit_closes_position_and_counts():
+    """验收 #1：浮盈自峰值回吐超阈 ⇒ 在浮盈仍为正时产生 close 成交（reason/explain 为保护码）。"""
+    await init_db()
+    rule = _pg_rule()
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        _open_long(session)
+        q = session.subscribe()
+        peak = _pg_peak_px(0.10)
+        _arm_peak(session, peak)
+        session._last_live_px = _pg_trail_px(peak, rule)
+
+        await session._maybe_profit_exit(_START_TS)
+
+        trades = [e["data"] for e in _drain(q) if e["type"] == "trade"]
+        assert [t["side"] for t in trades] == ["close"]
+        assert trades[0]["reason"] == "profit_guard_trailing"
+        assert trades[0]["explain"]["kind"] == "profit_guard"
+        assert trades[0]["pnl"] > 0                      # 锁定的是正浮盈，不是翻负后的止损
+        assert session.executor.projected == "flat"
+        assert session.profit_guard_exits == 1
+        assert session._position_seq == 1                # P0-1：close 成交驱动持仓序号
+    finally:
+        await dispose_engine()
+
+
+async def test_profit_guard_reopen_same_side_starts_new_epoch():
+    """T-3 [P0-1]：保护平仓后同向立即重开的新仓，peak 从新入场价起算且 min_hold 内不被平掉。"""
+    await init_db()
+    rule = _pg_rule()
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        _open_long(session)
+        peak = _pg_peak_px(0.10)
+        trail = _pg_trail_px(peak, rule)
+        _arm_peak(session, peak)
+        session._last_live_px = trail
+        await session._maybe_profit_exit(_START_TS)
+        assert session.executor.projected == "flat" and session._position_seq == 1
+
+        _open_long(session, entry=trail)                 # 同一 monitor 间隔内同向重开
+        snapshot = session._refresh_profit_state(time.time())
+        assert snapshot["holdSeconds"] < 1.0             # 持仓时长从 0 起算
+        assert snapshot["peakPx"] == pytest.approx(trail)   # 旧峰值未被继承
+        assert snapshot["status"] == "idle"
+
+        await session._maybe_profit_exit(_START_TS + 1)
+
+        assert session.executor.projected == "long"      # min_hold 重新生效 ⇒ 新仓不被强平
+        assert session.profit_guard_exits == 1
+    finally:
+        await dispose_engine()
+
+
+async def test_profit_guard_failed_close_does_not_count_or_claim_success():
+    """T-4 [P1-1]：平仓请求失败 ⇒ 不计数、不写 lastExit、文案不含「已市价平仓」，下轮自动重试。"""
+    await init_db()
+    rule = _pg_rule()
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        attempts = {"n": 0}
+
+        async def failing_close(_close):
+            attempts["n"] += 1
+            raise OKXError("LIVE_ORDER_FAILED", "交易所拒绝")
+
+        session.executor._close_position = failing_close
+        _open_long(session)
+        q = session.subscribe()
+        peak = _pg_peak_px(0.10)
+        _arm_peak(session, peak)
+        session._last_live_px = _pg_trail_px(peak, rule)
+
+        await session._maybe_profit_exit(_START_TS)
+        await session._maybe_profit_exit(_START_TS + 5)   # 下一次盯市自动重试
+
+        events = _drain(q)
+        assert attempts["n"] == 2                         # 失败即保留状态、下轮重试
+        assert session.profit_guard_exits == 0
+        assert session._pending_protect_note is None
+        assert session.executor.projected == "long"
+        messages = [e["data"].get("message") or "" for e in events if e["type"] == "status"]
+        assert not any("已市价平仓" in m for m in messages)
+        warns = [m for m in messages if "平仓未成交" in m]
+        assert len(warns) == 1                            # P2-8：每个持仓周期至多一条 warn
+    finally:
+        await dispose_engine()
+
+
+async def test_profit_guard_stale_price_takes_no_action():
+    """T-5 [P1-6]：判定价超龄 ⇒ 零事件、快照 unavailable(stale_feed)、prompt 不渲染任何退出线。"""
+    await init_db()
+    rule = _pg_rule()
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        _open_long(session)
+        peak = _pg_peak_px(0.10)
+        _arm_peak(session, peak)
+        session._last_live_px = _pg_trail_px(peak, rule)
+        session._last_px_wall = time.time() - (rule.max_px_age_s + 30)
+        q = session.subscribe()
+
+        await session._maybe_profit_exit(_START_TS)
+
+        assert _drain(q) == [] and session.executor.projected == "long"
+        snapshot = session._refresh_profit_state(time.time())
+        assert snapshot["status"] == "unavailable"
+        assert snapshot["unavailableReason"] == "stale_feed"
+        text = format_profit_guard_for_prompt(snapshot)
+        assert "当前不可用" in text and "有效退出线" not in text
+    finally:
+        await dispose_engine()
+
+
+async def test_profit_guard_last_exit_is_consumed_after_one_round():
+    """T-6 [P1-7]：一次保护平仓只在紧接的下一轮 payload 出现一次 lastExit，再下一轮不再出现。"""
+    await init_db()
+    rule = _pg_rule()
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        _open_long(session)
+        peak = _pg_peak_px(0.10)
+        _arm_peak(session, peak)
+        session._last_live_px = _pg_trail_px(peak, rule)
+        await session._maybe_profit_exit(_START_TS)
+        assert session.profit_guard_exits == 1
+
+        first = session._build_decision_payload(1, _START_TS, _PG_ENTRY, [], "candle")
+        second = session._build_decision_payload(2, _START_TS, _PG_ENTRY, [], "candle")
+
+        assert first["profitGuard"]["lastExit"]["reasonCode"] == "profit_guard_trailing"
+        assert first["profitGuard"]["status"] == "flat"   # 已平仓：空壳快照只承载回执
+        assert "profitGuard" not in second                # 回执读取即消费，不再重复注入
+    finally:
+        await dispose_engine()
+
+
+async def test_profit_guard_snapshot_ignores_caller_mark_px():
+    """G-6 [P1-2]：判定价单源——不同 mark_px 传参下保护段逐键相等且 livePx 恒为 `_current_px()`。"""
+    await init_db()
+    rule = _pg_rule()
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        _open_long(session)
+        live = _pg_peak_px(0.06)
+        session._last_live_px = live
+
+        first = session._position_payload(_PG_ENTRY * 0.90)["profitGuard"]
+        second = session._position_payload(_PG_ENTRY * 1.30)["profitGuard"]
+
+        assert first == second
+        assert first["livePx"] == pytest.approx(session._current_px())
+        assert first["livePx"] == pytest.approx(live)
+        snapshot = session._refresh_profit_state(time.time())
+        assert snapshot["effectiveExitPx"] == first["effectiveExitPx"]
+    finally:
+        await dispose_engine()
+
+
+async def test_profit_guard_triggers_between_confirmed_candles():
+    """验收 #2：保护判定不等 K 线确认——两根之间注入实时价即可在 `_monitor_tick` 内触发。"""
+    await init_db()
+    rule = _pg_rule()
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        await session.feed_candle(_candle(0))            # 建立窗口（hold 轮，不开仓）
+        await _settle(session)
+        _open_long(session)
+        peak = _pg_peak_px(0.10)
+        _arm_peak(session, peak)
+        q = session.subscribe()
+        trail = _pg_trail_px(peak, rule)
+        unconfirmed = Candle(ts=_START_TS + _STEP, o=peak, h=peak, l=trail,
+                             c=trail, vol=1.0, confirm=False)
+
+        await session.feed_candle(unconfirmed)           # 未确认根：只更新实时价
+        await session._monitor_tick()
+
+        trades = [e["data"] for e in _drain(q) if e["type"] == "trade"]
+        assert [t["reason"] for t in trades] == ["profit_guard_trailing"]
+        assert session.executor.projected == "flat"
+    finally:
+        await dispose_engine()
+
+
+async def test_profit_guard_metrics_land_in_ai_stats():
+    """验收 #9：`profitGuardExits` = 实际成交次数；`profitGuardArmedRounds` = 轮级武装计数。"""
+    await init_db()
+    rule = _pg_rule()
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        sm = get_sessionmaker()
+        async with sm() as s:
+            run = await repo.create_run(s, strategy_id=1, inst_id="BTC-USDT-SWAP", bar="1H",
+                                        mode="ai-trade", config={}, status="running")
+            session.run_id = run.id
+        _open_long(session)
+        peak = _pg_peak_px(0.10)
+        _arm_peak(session, peak)
+        session._build_decision_payload(1, _START_TS, _PG_ENTRY, [], "candle")
+        session._last_live_px = _pg_trail_px(peak, rule)
+        await session._maybe_profit_exit(_START_TS)
+
+        await session._finalize_run(_START_TS)
+
+        async with sm() as s:
+            row = await repo.get_run(s, session.run_id)
+        stats = json.loads(row.metrics_json)["aiStats"]
+        assert stats["profitGuardExits"] == 1
+        assert stats["profitGuardArmedRounds"] == 1
+    finally:
+        await dispose_engine()
+
+
+async def test_profit_hold_streak_only_counts_undegraded_profitable_holds():
+    """§2.6(c) 逐分支：hold+浮盈 → +1；hold+降级 → 不变；非 hold → 归零；浮亏 → 归零。"""
+    session, _, _ = _make_session(action="hold", profit_rule=_pg_rule())
+    profitable = {"returnPct": 0.02}
+    losing = {"returnPct": -0.01}
+
+    session._update_profit_hold_streak("hold", None, profitable)
+    session._update_profit_hold_streak("hold", None, profitable)
+    assert session._profit_hold_streak == 2
+    session._update_profit_hold_streak("hold", "llm_error", profitable)
+    assert session._profit_hold_streak == 2               # 降级轮不变
+    session._update_profit_hold_streak("hold", None, losing)
+    assert session._profit_hold_streak == 0
+    session._update_profit_hold_streak("hold", None, profitable)
+    session._update_profit_hold_streak("open_long", None, profitable)
+    assert session._profit_hold_streak == 0               # 已展示交易意愿 ⇒ 归零

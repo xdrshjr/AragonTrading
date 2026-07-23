@@ -5,6 +5,7 @@ import type { AccountMode } from "./types";
 import type {
   AiTradeAction,
   AiTradeDecision,
+  AiTradeProfitGuardRule,
   AiTradeRoundTrace,
   AiTradeStopReason,
   Consensus,
@@ -14,6 +15,7 @@ import type {
   MarketContext,
   MultiTimeframeFrame,
   PriceAction,
+  ProfitGuardSnapshot,
   VolumeContext,
 } from "./aiTradeTypes";
 
@@ -72,6 +74,28 @@ export const AI_TRADE_BAND_TOLERANCE_OPTIONS: { value: number; label: string }[]
   { value: 0.2, label: "宽松（±20% 带宽）" },
   { value: 0.25, label: "仅限带内（最宽松）" },
 ];
+
+// ---- 利润保护层（ai-trade-profit-protection §三 前端）----
+// 与后端 ai_trade_profit_guard_* 默认值对齐；弹窗初值与所有读点的兜底真源（偏好键为可选）。
+// 全部收益率为**保证金收益率口径**：诊断根因 ② —— 5× 杠杆下标的 10% 等于保证金 +50%，
+// 用标的口径写阈值，普通的小幅盈利根本触发不到。
+export const AI_TRADE_PROFIT_GUARD_DEFAULTS: {
+  enabled: boolean;
+  armReturnPct: number;
+  givebackPct: number;
+  breakevenArmReturnPct: number;
+  breakevenOffsetReturnPct: number;
+  minHoldSeconds: number;
+  hardTakeProfitReturnPct: number;
+} = {
+  enabled: true,
+  armReturnPct: 0.05,
+  givebackPct: 0.4,
+  breakevenArmReturnPct: 0.03,
+  breakevenOffsetReturnPct: 0.002,
+  minHoldSeconds: 30,
+  hardTakeProfitReturnPct: 0,
+};
 
 const AI_TRADE_STEP_EPS = 1e-9;
 
@@ -374,6 +398,10 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
   { prefix: "base_rule_ma_band_direction", label: "基础策略否决：方向与所处均线锚区不符" },
   { prefix: "base_rule_band_unavailable", label: "基础策略否决：均线通道数据不足，无法验证开单位置" },
   { prefix: "base_rule_ma_band", label: "基础策略否决：开单价不在均线通道上/中/下轨附近" },
+  // 利润保护三码：它们不是「降级」而是**系统主动平仓**的成交原因，但同样会出现在成交列表的原因位上。
+  { prefix: "profit_guard_trailing", label: "利润保护：浮盈自峰值回吐超阈，已锁定利润" },
+  { prefix: "profit_guard_breakeven", label: "利润保护：价格跌回保本线，已离场保住本金" },
+  { prefix: "profit_guard_hard_take_profit", label: "利润保护：已达硬止盈目标位" },
 ];
 
 /**
@@ -387,6 +415,129 @@ export function describeDegradeReason(reason?: string | null): string {
   if (!hit) return reason;
   const suffix = reason.slice(hit.prefix.length);
   return suffix ? `${hit.label}${suffix}` : hit.label;
+}
+
+/**
+ * 校验利润保护参数：区间与后端 schema 的 Field 边界一致（前端即时报错，后端越界 422），返回错误文案或 null。
+ * `enabled=false` 时其余输入被忽略，一律合法——关闭态的残留值不该阻塞提交。
+ */
+export function validateProfitGuard(rule: AiTradeProfitGuardRule): string | null {
+  if (!rule.enabled) return null;
+  const arm = rule.armReturnPct ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.armReturnPct;
+  const giveback = rule.givebackPct ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.givebackPct;
+  const breakeven = rule.breakevenArmReturnPct ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.breakevenArmReturnPct;
+  const minHold = rule.minHoldSeconds ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.minHoldSeconds;
+  if (!Number.isFinite(arm) || arm <= 0 || arm > 5) return "武装阈值需为 0~500% 的保证金收益率";
+  if (!Number.isFinite(giveback) || giveback <= 0 || giveback > 1) {
+    return "允许回吐比例需为 0~100%";
+  }
+  if (!Number.isFinite(breakeven) || breakeven < 0 || breakeven > 5) {
+    return "保本武装阈值需为 0~500%（0 表示关闭保本）";
+  }
+  if (!Number.isFinite(minHold) || minHold < 0 || minHold > 3600) {
+    return "最短持有需为 0~3600 秒";
+  }
+  return null;
+}
+
+export interface AiProfitGuardView {
+  label: string;
+  tone: AiTraceTone;
+}
+
+/**
+ * 保护层状态中文化（单点真源，判定 / prompt / UI 共用同一份语义）。未装配（快照缺失）→ null，
+ * 组件整段不渲染。`unavailable` 用 short（红）——「保护层此刻不生效」必须显眼，静默的失灵最危险。
+ */
+export function describeProfitGuardStatus(
+  snapshot: ProfitGuardSnapshot | null | undefined,
+): AiProfitGuardView | null {
+  if (!snapshot) return null;
+  switch (snapshot.status) {
+    case "unavailable":
+      return { label: `利润保护暂不可用（${describeProfitGuardUnavailable(snapshot)}）`, tone: "short" };
+    case "armed":
+      return { label: "利润保护 · 移动止盈已武装", tone: "long" };
+    case "breakeven_armed":
+      return { label: "利润保护 · 保本线已武装", tone: "accent" };
+    case "flat":
+      return null;
+    default:
+      return { label: "利润保护 · 未武装", tone: "muted" };
+  }
+}
+
+const PROFIT_GUARD_UNAVAILABLE_LABELS: Record<string, string> = {
+  stale_feed: "行情数据陈旧",
+  no_price: "实时价不可用",
+  bad_position: "持仓读数异常",
+};
+
+/**
+ * 保护层不可用时的**兜底责任归属**文案（单点真源，与后端 `_format_unavailable_fallback` 同语义）。
+ *
+ * 只有交易所侧确实挂着 OCO 才写「仍生效」：运维把 `AI_TRADE_DEFAULT_SL_PCT`/`_TP_PCT` 置 0 时后端
+ * 根本不挂单，此时照写「仅交易所侧止盈止损生效」等于在保护层已停手的那一刻，告诉用户还有一条**并不
+ * 存在**的防线——既没有保护层又以为有兜底，是最坏的一种失灵。
+ */
+export function describeProfitGuardFallback(
+  snapshot: ProfitGuardSnapshot | null | undefined,
+): string {
+  const hasOco =
+    snapshot?.exchangeTakeProfitPx != null || snapshot?.exchangeStopLossPx != null;
+  return hasOco
+    ? "本轮不会自动平仓，仅交易所侧止盈止损仍生效"
+    : "本轮不会自动平仓，且交易所侧未挂止盈止损——此刻没有任何自动兜底";
+}
+
+/** 不可用原因中文化；未知码回落「数据异常」（绝不显示裸英文）。 */
+export function describeProfitGuardUnavailable(
+  snapshot: ProfitGuardSnapshot | null | undefined,
+): string {
+  const reason = snapshot?.unavailableReason ?? "";
+  return PROFIT_GUARD_UNAVAILABLE_LABELS[reason] ?? "数据异常";
+}
+
+const PROFIT_GUARD_REASON_LABELS: Record<string, string> = {
+  profit_guard_trailing: "移动止盈",
+  profit_guard_breakeven: "保本线",
+  profit_guard_hard_take_profit: "硬止盈",
+};
+
+/** 保护触发码中文化（成交列表 / 轨迹 / 回执共用）；未知码原样回退。 */
+export function describeProfitGuardReason(reason?: string | null): string {
+  if (!reason) return "";
+  return PROFIT_GUARD_REASON_LABELS[reason] ?? reason;
+}
+
+/**
+ * 标的价格口径 % → 保证金收益率口径 %（单仓 TP/SL 双口径换算的**唯一真源**）。
+ *
+ * 杠杆为 null（用户留空）时**必须返回 null**：留空时后端回落 `settings.live_default_leverage`，
+ * 而前端没有任何途径读到它（`tradingApi.config` 只回 `instMeta.maxLever`）。硬编码一个默认杠杆即制造
+ * 第二真源——一旦运维改了 LIVE_DEFAULT_LEVERAGE，UI 会**静默**显示错误的保证金收益率，正是本特性要
+ * 根治的那类信任崩塌。渲染层据 null 只显示价格口径并附一句「填写杠杆后显示保证金口径」。
+ */
+export function marginReturnFromPricePct(
+  pct: number | null | undefined,
+  leverage: number | null | undefined,
+): number | null {
+  if (pct == null || !Number.isFinite(pct)) return null;
+  if (leverage == null || !Number.isFinite(leverage) || leverage <= 0) return null;
+  return pct * leverage;
+}
+
+/**
+ * 保证金收益率口径 % → 标的价格口径 %（`marginReturnFromPricePct` 的逆向，同一模块内成对，避免第二真源）。
+ * 杠杆未知（用户留空）时同样返回 null——渲染层据此只写保证金口径，不给标的涨跌幅换算。
+ */
+export function priceMoveFromMarginPct(
+  pct: number | null | undefined,
+  leverage: number | null | undefined,
+): number | null {
+  if (pct == null || !Number.isFinite(pct)) return null;
+  if (leverage == null || !Number.isFinite(leverage) || leverage <= 0) return null;
+  return pct / leverage;
 }
 
 export interface AiBaseRuleView {

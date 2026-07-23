@@ -10,6 +10,7 @@ from app.ai_auto.decider import TradeDecision
 from app.ai_auto.prompts import (
     DECISION_TOOL_NAME,
     REFLECTION_TOOL_NAME,
+    _format_position,
     build_ai_trade_system_prompt,
     build_decision_prompt,
     build_reflection_prompt,
@@ -403,3 +404,74 @@ def test_decision_prompt_unchanged_without_base_rules_key():
         "pctB": 0.5, "zone": "mid", "directional": False}}})
     assert "基础策略 · MA 通道开单约束（铁律）" in with_band
     assert "允许开仓" in with_band and "合规开单价区间" in with_band
+
+
+# ---------- 利润保护 prompt 零回归冻结 + 三段渲染（ai-trade-profit-protection §7.2 G-2）----------
+def test_system_prompt_byte_identical_without_profit_guard():
+    """不传 `profit_guard_text`（默认空垫片）⇒ 系统 prompt 与传空串**逐字节相等**（零回归）。"""
+    baseline = build_ai_trade_system_prompt("BTC-USDT-SWAP", "1H", 100.0, 3.0)
+    assert baseline == build_ai_trade_system_prompt(
+        "BTC-USDT-SWAP", "1H", 100.0, 3.0, profit_guard_text="")
+    assert "利润保护层" not in baseline
+
+
+def test_system_prompt_stacks_charters_in_priority_order():
+    """两章共存时：基础策略铁律章在前、利润保护章在后，两者均在「决策纪律」之前。"""
+    from app.ai_auto.base_rules import MaBandRule, format_charter
+    from app.ai_auto.profit_guard import ProfitGuardRule, format_profit_guard_charter
+
+    text = build_ai_trade_system_prompt(
+        "BTC-USDT-SWAP", "1H", 100.0, 3.0,
+        base_rules_text=format_charter(MaBandRule()),
+        profit_guard_text=format_profit_guard_charter(ProfitGuardRule()))
+    assert text.index("最高优先级铁律") < text.index("利润保护层") < text.index("决策纪律：")
+    assert "决策失误" in text and "不是一条你可以依赖的保证" in text
+
+
+def test_decision_prompt_unchanged_without_profit_guard_key():
+    """payload 无 `profitGuard` 键 ⇒ 决策 prompt 渲染逐字节不变（回测 payload / 规则未装配）。"""
+    payload = _payload_with_digest()
+    baseline = build_decision_prompt(payload)
+    assert "利润保护" not in baseline
+
+    with_guard = build_decision_prompt({**payload, "profitGuard": _guard_snapshot()})
+    assert "利润保护 · 移动止盈 / 保本（系统强制执行）" in with_guard
+    assert "有效退出线" in with_guard and "峰值浮盈" in with_guard
+    # 保护段紧跟持仓段之后、会话盈亏段之前（位置即优先级：退出线先于会话阈值被看到）。
+    position_line = _format_position(payload.get("position"))
+    assert (with_guard.index(position_line) < with_guard.index("利润保护")
+            < with_guard.index("会话累计盈亏"))
+
+
+def test_decision_prompt_profit_hold_note_is_opt_in():
+    """自察段由会话按阈值注入 `profitHoldRounds`：键缺失即整段省略（零回归）。"""
+    payload = {**_payload_with_digest(), "profitGuard": _guard_snapshot()}
+    assert "盈利持仓自察" not in build_decision_prompt(payload)
+
+    noted = build_decision_prompt({**payload, "profitHoldRounds": 3})
+    assert "盈利持仓自察：你已连续 3 轮" in noted
+    assert "这不是必须平仓的指令" in noted
+
+
+def _guard_snapshot() -> dict:
+    """一份自洽的保护快照（entry 0.07245 / lev 5 / peak 0.0732 / giveback 0.40）。"""
+    from app.ai_auto.profit_guard import (
+        PositionFacts,
+        ProfitGuardRule,
+        advance_state,
+        build_snapshot,
+    )
+
+    rule = ProfitGuardRule()
+    entry, lev, qty = 0.07245, 5.0, 402.7
+    def _facts(px, wall):
+        return PositionFacts(seq=1, side="long", entry_px=entry, leverage=lev, qty_coin=qty,
+                             mark_px=px, now_wall=wall, bars_in_position=4,
+                             exchange_tp_px=entry * 1.10, exchange_sl_px=entry * 0.95,
+                             exchange_oco_source="trade")
+    state = advance_state(None, _facts(entry, 0.0))
+    state = advance_state(state, _facts(entry * (1 + 0.0518 / lev), 60.0))
+    facts = _facts(entry * (1 + 0.0414 / lev), 930.0)
+    state = advance_state(state, facts)
+    return build_snapshot(rule, state, facts)
+

@@ -241,7 +241,10 @@ export type TriggerExplainKind =
   | "risk_exit"
   | "reverse"
   | "session_stop"
-  | "external_close";
+  | "external_close"
+  // 利润保护层（移动止盈 / 保本 / 硬止盈）触发的强制平仓（ai-trade-profit-protection §2.7）。
+  // 与 risk_exit（时间止盈）刻意分列：一个是「持仓根数到了」，一个是「已到手的浮盈正在回吐」。
+  | "profit_guard";
 
 export interface TriggerMetric {
   label: string;
@@ -352,6 +355,59 @@ export interface EquityPoint {
   transient?: boolean;
 }
 
+/**
+ * 利润保护层的持仓断面快照（ai-trade-profit-protection §4.2；搭 `position` 事件顺风车下发）。
+ *
+ * **必须定义在本文件**：`aiTradeTypes.ts` 已 import 本文件，反向 import 会成环。
+ *
+ * 判定价 `livePx` 恒为后端 `_current_px()`（未确认根实时价），**不是** `markPrice`——后者由调用方
+ * 传入的 ref_px 决定、可能是上一根确认收盘价，二者在 15m 周期上最坏差一整根。
+ */
+export interface ProfitGuardSnapshot {
+  ruleId: string;
+  /** flat=无持仓（仅承载 lastExit）｜idle=未武装｜armed=移动止盈已武装｜breakeven_armed=仅保本已武装｜unavailable=本轮零动作 */
+  status: "flat" | "idle" | "armed" | "breakeven_armed" | "unavailable";
+  /** status="unavailable" 时的原因码（行情陈旧 / 无实时价 / 持仓读数异常）。 */
+  unavailableReason?: "stale_feed" | "no_price" | "bad_position" | null;
+  side?: "long" | "short" | null;
+  entryPx?: number | null;
+  livePx?: number | null;
+  peakPx?: number | null;
+  holdSeconds?: number | null;
+  barsInPosition?: number | null;
+  /** 保证金收益率口径（= 方向化价格变动% × 杠杆），不是标的涨跌幅。 */
+  returnPct?: number | null;
+  priceMovePct?: number | null;
+  peakReturnPct?: number | null;
+  /** 自峰值已回吐比例（无量纲，两种口径下数值相同）。 */
+  givebackRatio?: number | null;
+  /** 本地派生浮盈（不含手续费 / 资金费），与 position.unrealizedPnl（交易所 upl）口径不同，不得互相冒充。 */
+  unrealizedPnlUsd?: number | null;
+  peakUnrealizedPnlUsd?: number | null;
+  trailStopPx?: number | null;
+  breakevenPx?: number | null;
+  hardTakeProfitPx?: number | null;
+  /** 有效退出线：价格向下（做空为向上）触及即由系统市价平仓；未武装 / 不可用时为 null。 */
+  effectiveExitPx?: number | null;
+  exchangeTakeProfitPx?: number | null;
+  exchangeStopLossPx?: number | null;
+  /** trade=取自开仓成交回执（首选真源）｜derived=只读转发现算（须在 UI 标「估算」）。 */
+  exchangeOcoSource?: "trade" | "derived" | null;
+  armReturnPct?: number | null;
+  givebackPct?: number | null;
+  minHoldSeconds?: number | null;
+  pxAgeSeconds?: number | null;
+  /** 上一次保护性平仓回执（一次性，仅紧接的下一轮出现）。 */
+  lastExit?: {
+    ts?: number;
+    reasonCode?: string;
+    label?: string;
+    exitPx?: number | null;
+    pnlUsd?: number | null;
+    peakPnlUsd?: number | null;
+  } | null;
+}
+
 export interface PaperPositionEvent {
   side: "long" | "short" | "flat";
   size: number;
@@ -359,6 +415,8 @@ export interface PaperPositionEvent {
   markPrice: number;
   unrealizedPnl: number;
   positionPct?: number | null;
+  /** 利润保护快照（AI 自动交易且规则已装配时才有；旧前端忽略未知键，向前兼容）。 */
+  profitGuard?: ProfitGuardSnapshot | null;
 }
 
 export interface PaperStatus {

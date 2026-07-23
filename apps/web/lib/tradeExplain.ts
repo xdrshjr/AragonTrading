@@ -14,6 +14,7 @@ const KIND_LABEL: Record<TriggerExplainKind, string> = {
   reverse: "反手",
   session_stop: "会话止盈/止损",
   external_close: "外部平仓",
+  profit_guard: "利润保护",
 };
 
 const KIND_TONE: Record<TriggerExplainKind, "long" | "short" | "neutral" | "warn"> = {
@@ -23,6 +24,7 @@ const KIND_TONE: Record<TriggerExplainKind, "long" | "short" | "neutral" | "warn
   reverse: "neutral",
   session_stop: "warn",
   external_close: "warn",
+  profit_guard: "warn",
 };
 
 const TOP_DRIVER_COUNT = 3;
@@ -54,6 +56,8 @@ function inferKindFromReason(trade: Trade): TriggerExplainKind {
   const reason = trade.reason || "";
   // 止损 / 止盈触发价强平与 max_hold 同属风控离场（warn 色调），统一归 risk_exit。
   if (reason === "max_hold" || reason === "stop_loss" || reason === "take_profit") return "risk_exit";
+  // 利润保护三码（ai-trade-profit-protection §2.7）：老成交无 explain 时也能正确归类为「利润保护」。
+  if (reason.startsWith("profit_guard_")) return "profit_guard";
   if (reason === "session_stop") return "session_stop";
   if (reason === "external_close") return "external_close";
   if (reason === "reverse") return "reverse";

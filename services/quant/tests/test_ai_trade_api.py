@@ -442,3 +442,116 @@ async def test_out_of_range_tolerance_returns_422(monkeypatch):
         get_ai_trade_manager()._group = None
         app.dependency_overrides.clear()
         await dispose_engine()
+
+
+# ---------- 利润保护默认开启语义（ai-trade-profit-protection §7.2 / §4.1）----------
+async def test_profit_guard_default_on_when_field_absent(monkeypatch):
+    """请求不带 `profitGuard`（含桌面旧包 / 老客户端）⇒ 按 settings 装配为**开启**态，回执如实镜像。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(strategy_id))
+            assert r.status_code == 200, r.text
+            guard = r.json()["profitGuard"]
+            assert guard["enabled"] is True and guard["armReturnPct"] == 0.05
+            assert guard["givebackPct"] == 0.40 and guard["hardTakeProfitReturnPct"] == 0.0
+            rule = get_ai_trade_manager()._group.profit_rule
+            assert rule is not None and rule.enabled and rule.min_hold_s == 30.0
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_profit_guard_explicit_disable_turns_layer_off(monkeypatch):
+    """启动弹窗取消勾选 ⇒ `{"enabled":false}` ⇒ 该会话不装配、回执 profitGuard 为 null。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, profitGuard={"enabled": False}))
+            assert r.status_code == 200, r.text
+            assert r.json()["profitGuard"] is None
+            assert get_ai_trade_manager()._group.profit_rule is None
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_profit_guard_master_switch_off_never_assembles(monkeypatch):
+    """运维总闸关 ⇒ 即便请求显式开启也恒不装配（逐字回退到本特性合入前，验收 #10）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        live_trading_enabled=True, ai_trade_enabled=True,
+        ai_trade_profit_guard_enabled=False)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, profitGuard={"enabled": True, "armReturnPct": 0.1}))
+            assert r.status_code == 200, r.text
+            assert r.json()["profitGuard"] is None
+            assert get_ai_trade_manager()._group.profit_rule is None
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_profit_guard_custom_values_are_honored(monkeypatch):
+    """显式入参逐字生效（只回填缺省字段，不复夹）；留空的 giveback 回落 settings 默认。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, profitGuard={"enabled": True, "armReturnPct": 0.08,
+                                          "minHoldSeconds": 0}))
+            assert r.status_code == 200, r.text
+            guard = r.json()["profitGuard"]
+            assert guard["armReturnPct"] == 0.08 and guard["minHoldSeconds"] == 0.0
+            assert guard["givebackPct"] == 0.40
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_profit_guard_out_of_range_giveback_returns_422(monkeypatch):
+    """回吐比例越界（>1，语义上不成立）在入口即 422（边界在 schema，API 层不复夹）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, profitGuard={"enabled": True, "givebackPct": 1.5}))
+            assert r.status_code == 422, r.text
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_backtest_start_never_assembles_profit_guard(monkeypatch):
+    """[P2-4] 回测显式非目标：`AiBacktestStartIn` 无该字段，回测请求体带 `profitGuard` 一律被忽略。"""
+    from app.schemas import AiBacktestStartIn
+
+    assert "profitGuard" not in AiBacktestStartIn.model_fields
+

@@ -178,6 +178,40 @@ describe("AiTradeToggle", () => {
     );
   });
 
+  // 利润保护（ai-trade-profit-protection §3.3）：start 请求体携 profitGuard，成功后**取自 opts**
+  // 写入 aiTradeConfig 并在下次打开弹窗回填——诊断根因 ③ 的闭环（回执不回显完整参数，取 res 会让
+  // 偏好每次重开都回落默认）。单仓 TP/SL 同理一并记忆。
+  it("sends profitGuard in the start body and persists it (with per-position OCO) to aiTradeConfig", async () => {
+    vi.mocked(api.strategies).mockResolvedValue([{ id: 1, name: "均线策略" }] as never);
+    const groupRow: AiTradeGroupRow = {
+      groupId: "grp-1", bar: "1H", strategyIds: [1], strategyNames: ["均线策略"],
+      totalBudgetUsd: 100, leverage: 3, contextRefreshRounds: 10, createdTs: 0,
+      members: [], wakeIntervalMinutes: 2,
+      baseRules: { maBandEntry: { enabled: true } },
+      profitGuard: { enabled: true },
+    };
+    vi.mocked(aiTradeApi.start).mockResolvedValue(groupRow);
+    useAppStore.setState({ aiTradeAcknowledged: true });
+    renderToggle();
+    await screen.findByTitle("开启 AI 自动交易 / 回测");
+    fireEvent.click(screen.getByRole("switch"));
+    await screen.findByText("均线策略");
+    fireEvent.change(screen.getByLabelText("允许回吐（%）"), { target: { value: "35" } });
+    fireEvent.change(screen.getByLabelText("单仓止损%（如 0.05＝5%）"), { target: { value: "0.03" } });
+    const confirm = await screen.findByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    await waitFor(() => expect(aiTradeApi.start).toHaveBeenCalledTimes(1));
+    const body = vi.mocked(aiTradeApi.start).mock.calls[0][0];
+    expect(body.profitGuard?.enabled).toBe(true);
+    expect(body.profitGuard?.givebackPct).toBeCloseTo(0.35, 10);
+    expect(body.stopLossPct).toBeCloseTo(0.03, 10);
+    await waitFor(() =>
+      expect(useAppStore.getState().aiTradeConfig?.profitGuard?.givebackPct).toBeCloseTo(0.35, 10),
+    );
+    expect(useAppStore.getState().aiTradeConfig?.stopLossPct).toBeCloseTo(0.03, 10);
+  });
+
   it("stops the whole group when toggled off while running", async () => {
     useAppStore.setState({ aiTradeGroup: makeGroup() });
     vi.mocked(aiTradeApi.stopGroup).mockResolvedValue({

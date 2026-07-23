@@ -12,6 +12,7 @@ import {
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
   AI_TRADE_DEFAULT_POSITION_STEP,
   AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN,
+  AI_TRADE_PROFIT_GUARD_DEFAULTS,
   resolveAiTradeGate,
 } from "@/lib/aiTrade";
 import { ApiRequestError } from "@/lib/api";
@@ -97,6 +98,7 @@ export default function AiTradeToggle() {
         positionStepPct: opts.positionStepPct,   // 仓位操作档位（透传，服务端默认回填/量化）
         wakeIntervalMinutes: opts.wakeIntervalMinutes,   // Agent 墙钟定时唤醒周期（透传，服务端默认回填/夹紧）
         baseRules: opts.baseRules,               // 【基础策略】铁律（透传；取消勾选即 enabled:false）
+        profitGuard: opts.profitGuard,           // 利润保护层（仅实盘透传；取消勾选即 enabled:false）
         contextRefreshRounds: opts.contextRefreshRounds,
       }),
     onSuccess: (res, opts) => {
@@ -111,6 +113,11 @@ export default function AiTradeToggle() {
         wakeIntervalMinutes: opts.wakeIntervalMinutes ?? undefined,
         // [R-4] 同理：res 不回显完整规则参数，取 opts 才能让所选铁律参数真正持久（回执只镜像装配态）。
         baseRules: opts.baseRules.maBandEntry ?? undefined,
+        // 同上取 opts：诊断根因 ③ 的根治点——单仓 OCO 与利润保护偏好从此被记住并回填，
+        // 不再每次重开都清空、让用户在不知情下一直吃 10%/5% 的宽默认。
+        profitGuard: opts.profitGuard,
+        stopLossPct: opts.stopLossPct ?? undefined,
+        takeProfitPct: opts.takeProfitPct ?? undefined,
       });
       setModalOpen(false);
       setError(null);
@@ -217,6 +224,9 @@ export default function AiTradeToggle() {
         defaultContextRounds={aiTradeConfig?.contextRefreshRounds ?? AI_TRADE_DEFAULT_CONTEXT_ROUNDS}
         defaultPositionStepPct={aiTradeConfig?.positionStepPct ?? AI_TRADE_DEFAULT_POSITION_STEP}
         defaultWakeIntervalMinutes={aiTradeConfig?.wakeIntervalMinutes ?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN}
+        defaultProfitGuard={aiTradeConfig?.profitGuard ?? AI_TRADE_PROFIT_GUARD_DEFAULTS}
+        defaultStopLossPct={aiTradeConfig?.stopLossPct ?? undefined}
+        defaultTakeProfitPct={aiTradeConfig?.takeProfitPct ?? undefined}
         defaultBaseRule={aiTradeConfig?.baseRules ?? AI_TRADE_BASE_RULE_DEFAULTS}
         error={error}
         liveGateReason={liveGateReason}

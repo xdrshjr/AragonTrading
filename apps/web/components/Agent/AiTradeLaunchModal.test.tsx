@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AI_TRADE_BASE_RULE_DEFAULTS } from "@/lib/aiTrade";
+import { AI_TRADE_BASE_RULE_DEFAULTS, AI_TRADE_PROFIT_GUARD_DEFAULTS } from "@/lib/aiTrade";
 import { autoTradeSettingsApi } from "@/lib/autoTradeSettingsApi";
 import { tradingApi } from "@/lib/tradingApi";
 import AiTradeLaunchModal, { type AiTradeLaunchOpts } from "./AiTradeLaunchModal";
@@ -39,6 +39,7 @@ function renderModal(props: Partial<React.ComponentProps<typeof AiTradeLaunchMod
         onAcknowledge={vi.fn()}
         bar="1H"
         defaultBaseRule={AI_TRADE_BASE_RULE_DEFAULTS}
+        defaultProfitGuard={AI_TRADE_PROFIT_GUARD_DEFAULTS}
         defaultMembers={[]}
         defaultAllocationMode="even"
         defaultInstId="BTC-USDT-SWAP"
@@ -293,16 +294,17 @@ describe("AiTradeLaunchModal", () => {
   it("blocks confirm on an invalid per-position stop-loss pct (E4)", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
-    // 「留空＝默认」占位顺序：[0]总预算 [1]杠杆 [2]单仓止损% [3]单仓止盈%
-    fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[2], { target: { value: "-1" } });
+    // 单仓 OCO 的占位文案已被利润保护特性改写为具体默认值，故按标签取元素（比占位序号稳）。
+    fireEvent.change(screen.getByLabelText("单仓止损%（如 0.05＝5%）"), { target: { value: "-1" } });
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
   });
 
   it("clamps an out-of-range per-position pct in the preview, without blocking (E4)", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
-    fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[2], { target: { value: "0.9" } });
-    expect(screen.getByText(/SL 20% \/ TP 默认/)).toBeInTheDocument(); // 0.9 夹到 max 0.2 → 20%
+    fireEvent.change(screen.getByLabelText("单仓止损%（如 0.05＝5%）"), { target: { value: "0.9" } });
+    // 双口径显性化后：填值夹到 max 0.2 → 20%；留空侧如实写出生效默认 10%（不再只写「默认」）。
+    expect(screen.getByText(/SL 20% \/ TP 10%（默认）/)).toBeInTheDocument();
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
   });
@@ -480,6 +482,7 @@ describe("AiTradeLaunchModal", () => {
     fireEvent.change(screen.getByLabelText("Agent 唤醒周期（分钟）"), { target: { value: "7" } });
     fireEvent.change(screen.getByLabelText("时间级别"), { target: { value: "4H" } });
     fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[0], { target: { value: "500" } });
+    fireEvent.change(screen.getByLabelText("允许回吐（%）"), { target: { value: "55" } });
 
     // 模拟行情流节流 flush 引发的父树重渲染：open 恒为真，但每帧传入全新的默认数组引用。
     rerender({ defaultStrategyIds: [1], defaultMembers: [{ instId: "ETH-USDT-SWAP", allocationPct: 100 }] });
@@ -489,6 +492,8 @@ describe("AiTradeLaunchModal", () => {
     expect((screen.getByLabelText("仓位操作档位") as HTMLSelectElement).value).toBe("0.5");
     expect((screen.getByLabelText("Agent 唤醒周期（分钟）") as HTMLInputElement).value).toBe("7");
     expect((screen.getByLabelText("时间级别") as HTMLSelectElement).value).toBe("4H");
+    // 本轮新增的利润保护输入同守（复发性缺陷的教训：每加一个新字段就要在此加一条断言）。
+    expect((screen.getByLabelText("允许回吐（%）") as HTMLInputElement).value).toBe("55");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -498,6 +503,90 @@ describe("AiTradeLaunchModal", () => {
     expect(opts.positionStepPct).toBe(0.5);
     expect(opts.wakeIntervalMinutes).toBe(7);
     expect(opts.capitalUsd).toBe(500);
+    expect(opts.profitGuard?.givebackPct).toBeCloseTo(0.55, 10);
+  });
+
+  // ---------- 利润保护区块（ai-trade-profit-protection §3.3 / §六）----------
+  it("默认勾选利润保护，提交体带完整参数（UI 百分数 → wire fraction）", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    expect(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" })).toBeChecked();
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.profitGuard).toEqual({
+      enabled: true,
+      armReturnPct: 0.05,
+      givebackPct: 0.4,
+      breakevenArmReturnPct: 0.03,
+      minHoldSeconds: 30,
+    });
+  });
+
+  it("取消勾选后提交体为显式 enabled:false（与「字段缺省=默认开启」严格区分）", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.click(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" }));
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.profitGuard).toEqual({ enabled: false });
+  });
+
+  it("越界回吐比例即时报错并禁用确认（前端即时反馈，后端另有 422 兜边界）", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.change(screen.getByLabelText("允许回吐（%）"), { target: { value: "150" } });
+    expect(screen.getByText("允许回吐比例需为 0~100%")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
+  });
+
+  it("回填上次所选利润保护参数（诊断根因 ③ 的记忆闭环）", async () => {
+    renderModal({
+      defaultStrategyIds: [1],
+      defaultProfitGuard: { enabled: true, armReturnPct: 0.08, givebackPct: 0.3,
+        breakevenArmReturnPct: 0.02, minHoldSeconds: 45 },
+    });
+    await screen.findByText("均线策略");
+    expect((screen.getByLabelText("武装阈值（保证金收益 %）") as HTMLInputElement).value).toBe("8");
+    expect((screen.getByLabelText("允许回吐（%）") as HTMLInputElement).value).toBe("30");
+    expect((screen.getByLabelText("最短持有（秒）") as HTMLInputElement).value).toBe("45");
+  });
+
+  it("单仓 TP/SL 回填上次值，且 placeholder 把「留空＝默认」写成具体数值（诊断根因 ⑤）", async () => {
+    renderModal({ defaultStrategyIds: [1], defaultStopLossPct: 0.03, defaultTakeProfitPct: 0.06 });
+    await screen.findByText("均线策略");
+    expect((screen.getByLabelText("单仓止损%（如 0.05＝5%）") as HTMLInputElement).value).toBe("0.03");
+    expect((screen.getByLabelText("单仓止盈%（如 0.10＝10%）") as HTMLInputElement).value).toBe("0.06");
+  });
+
+  it("杠杆留空时只显示价格口径 + 一句诚实提示；填写杠杆后才出保证金口径（[P1-9]）", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    const sl = screen.getByLabelText("单仓止损%（如 0.05＝5%）") as HTMLInputElement;
+    expect(sl.placeholder).toBe("留空＝默认 5%");
+    expect(screen.getByText("保证金口径按下单杠杆换算，填写杠杆后显示")).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("杠杆（×）"), { target: { value: "5" } });
+    expect((screen.getByLabelText("单仓止损%（如 0.05＝5%）") as HTMLInputElement).placeholder).toBe(
+      "留空＝默认 5%（≈保证金 -25%）",
+    );
+    expect(screen.queryByText("保证金口径按下单杠杆换算，填写杠杆后显示")).not.toBeInTheDocument();
+  });
+
+  it("回测段整块隐藏利润保护 UI 且提交体不带该键（§1.3 非目标，不得暗示回测已含保护）", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.click(screen.getByRole("button", { name: "回测" }));
+    expect(screen.queryByRole("checkbox", { name: "利润保护（推荐开启）" })).not.toBeInTheDocument();
+    const confirm = screen.getByRole("button", { name: /开始 AI 回测/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.mode).toBe("backtest");
+    expect(opts.profitGuard).toBeUndefined();
   });
 });
 

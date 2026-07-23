@@ -1,9 +1,10 @@
 "use client";
 
 import { Badge } from "@/components/ui";
+import { describeProfitGuardFallback, describeProfitGuardStatus } from "@/lib/aiTrade";
 import { colorForReturn, fmtMoney, fmtNum, fmtPct, fmtPrice } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
-import type { AiTradeGroupMemberState } from "@/lib/aiTradeTypes";
+import type { AiTradeGroupMemberState, ProfitGuardSnapshot } from "@/lib/aiTradeTypes";
 import type { Instrument } from "@/lib/types";
 
 // AI 自动交易「标的面板」（ai-trade-multi-symbol-and-timeframe §4.2）：泛化为「多标的」分组视图。
@@ -96,6 +97,10 @@ function MemberRow({
   // 「当前挂单」取最新一轮决策随附的挂单断面（后端 _emit_decision 与决策 prompt 同源 resting_payload）。
   // 无挂单 / 跳过轮（该事件不带此段）→ 整行省略，绝不据 orderType 反推「挂单还在」（可能已成交/撤销）。
   const resting = session?.lastDecision?.restingOrder ?? null;
+  // 利润保护行的渲染门控**必须**是「确实还持仓」且「快照存在」二者同时成立：`member.position` 在平仓后
+  // 不会被清空（后端 `_emit_position` 无仓时不发事件、`store.setAiTradeMemberPosition` 也无复位路径），
+  // 只判快照存在会在空仓后继续显示一个已不存在持仓的峰值与退出线。
+  const guard = positionSide !== "flat" ? (member.position?.profitGuard ?? null) : null;
   // 标的行情解析：命中自选行则富化（且 active 标的用 WS 实时价覆盖快照）；未收藏则优雅降级不造价。
   const inst = rows.find((r) => r.instId === instId) ?? null;
   const isActive = instId === active;
@@ -122,6 +127,7 @@ function MemberRow({
             当前挂单 {fmtPrice(resting.px)} · {fmtNum(resting.sz, 0)} 张 · 剩余 {resting.expiresInS}s
           </span>
         )}
+        <ProfitGuardRow guard={guard} />
       </span>
       <span className="flex shrink-0 items-center gap-2">
         <Badge tone={positionTone(positionSide)}>{describePosition(positionSide)}</Badge>
@@ -137,6 +143,36 @@ function MemberRow({
         )}
       </span>
     </button>
+  );
+}
+
+/**
+ * 利润保护行（ai-trade-profit-protection §六.4）：峰值浮盈 / 已回吐% / 有效退出线 + 武装徽标。
+ *
+ * `unavailable` 只出一句「暂不可用」，**绝不显示退出线**——一条算得出来却不作数的价位比没有更危险。
+ * 峰值浮盈为**本地派生**口径（不含手续费 / 资金费），与持仓行的交易所 upl 并列而非互相冒充。
+ */
+function ProfitGuardRow({ guard }: { guard: ProfitGuardSnapshot | null }) {
+  const view = describeProfitGuardStatus(guard);
+  if (!guard || !view) return null;
+  if (guard.status === "unavailable") {
+    return (
+      <span className="truncate text-[10px] text-[var(--short)]" data-testid="ai-profit-guard">
+        {view.label}（{describeProfitGuardFallback(guard)}）
+      </span>
+    );
+  }
+  const peak = guard.peakUnrealizedPnlUsd;
+  const giveback = guard.givebackRatio;
+  const exitPx = guard.effectiveExitPx;
+  return (
+    <span className="tabular truncate text-[10px] text-[var(--muted)]" data-testid="ai-profit-guard">
+      峰值 {peak == null ? "—" : `${peak >= 0 ? "+" : ""}${fmtMoney(peak)}`}
+      {" ｜ 已回吐 "}
+      {giveback == null ? "—" : `${(giveback * 100).toFixed(1)}%`}
+      {" ｜ 退出线 "}
+      {exitPx == null ? "未武装" : `${fmtPrice(exitPx)}（${view.label.replace("利润保护 · ", "")}）`}
+    </span>
   );
 }
 

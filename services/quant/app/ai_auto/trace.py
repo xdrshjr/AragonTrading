@@ -110,6 +110,9 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         # 【基础策略】铁律门禁（ai-trade-base-strategy-ma-band §2.9）：规则未装配的会话恒为初值。
         "baseRuleStatus": None, "baseRuleZone": None,
         "baseRulePctB": None, "baseRuleReason": None,
+        # 利润保护快照（ai-trade-profit-protection §2.7）：**刻意不新增 trace phase**——基础策略是逐轮
+        # 门禁故每轮一条事件，保护层跑在 5s 盯市上、不是轮级判定，只随 round_start 带一份断面。
+        "profitGuard": payload.get("profitGuard"),
         "state": "deciding",
     }
 

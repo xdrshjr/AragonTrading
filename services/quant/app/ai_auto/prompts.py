@@ -58,7 +58,8 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
                                  leverage: float, position_step_pct: float = 0.0,
                                  allow_limit: bool = False,
                                  limit_band_pct: float = 0.02,
-                                 base_rules_text: str = "") -> str:
+                                 base_rules_text: str = "",
+                                 profit_guard_text: str = "") -> str:
     """决策者系统 prompt：信号仅供参考 + 分步思维链纪律 + 风险偏好 + 只用真数据 + 收尾必调决策工具。
 
     `position_step_pct`（默认 0.0 → 连续、原文逐字不变、零回归）：当 `>0` 时把决策纪律 #3 的
@@ -76,8 +77,12 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
     `base_rules_text`（末位，默认 `""` → 渲染逐字节不变、零回归，ai-trade-base-strategy-ma-band P1-3）：
     【基础策略】铁律章（`base_rules.format_charter` 产物）。非空时插在「首要原则」之后、「决策纪律」
     之前——**位置本身就是优先级声明**：信号可被推翻，铁律不可违反。
+
+    `profit_guard_text`（末位，默认 `""` → 渲染逐字节不变、零回归，ai-trade-profit-protection §2.6 a）：
+    利润保护宪章章（`profit_guard.format_profit_guard_charter` 产物）。非空时紧随基础策略铁律章之后
+    ——两者都是「系统强制执行」的层，但语义互补：一个约束在哪开仓，一个约束利润何时被强制锁定。
     """
-    charter = f"{base_rules_text}\n\n" if base_rules_text else ""
+    charter = "".join(f"{text}\n\n" for text in (base_rules_text, profit_guard_text) if text)
     return (
         "你是一名严谨、纪律性极强的加密合约自动交易决策者。你不是聊天助手，也不是信号复读机——你的"
         f"**唯一职责**是在每个决策轮，为标的 {inst_id}（周期 {bar}）做出一个受严格约束的交易决策。"
@@ -364,6 +369,28 @@ def _format_base_rules(base_rules: dict | None) -> str:
     return format_band_for_prompt(base_rules.get("maBand"))
 
 
+def _format_profit_guard(snapshot: dict | None) -> str:
+    """利润保护的每轮只读上下文段（ai-trade-profit-protection §2.6 b）。
+
+    `payload["profitGuard"]` **键缺失**（规则未装配 / 回测自建 payload 不带）⇒ 返回空串 ⇒ 整段省略 ⇒
+    既有决策 prompt 冻结断言与回测 payload 逐字节不变。渲染委托 `profit_guard` 纯核心——退出线、
+    判定、UI 三者共用同一真源。
+    """
+    if not snapshot:
+        return ""
+    from .profit_guard import format_profit_guard_for_prompt   # 延迟导入，与 _format_base_rules 同范式
+    return format_profit_guard_for_prompt(snapshot)
+
+
+def _format_profit_hold_note(payload: dict) -> str:
+    """盈利持仓自察段（§2.6 c / F3）：`profitHoldRounds` 键缺失即整段省略（会话侧按阈值决定注入）。"""
+    rounds = payload.get("profitHoldRounds")
+    if not rounds:
+        return ""
+    from .profit_guard import format_profit_hold_note
+    return format_profit_hold_note(payload.get("profitGuard"), rounds)
+
+
 def build_decision_prompt(payload: dict) -> str:
     """把本轮决策输入（体制/共识 + 信号板 + 真实持仓 + 会话盈亏 + 摘要）压成紧凑文本喂决策器。
 
@@ -379,12 +406,19 @@ def build_decision_prompt(payload: dict) -> str:
         f"决策轮 #{payload.get('round')}｜barTs={payload.get('barTs')}｜最新价={payload.get('lastPx')}"
         + _trigger_suffix(payload.get("trigger")),
         _format_position(payload.get("position")),
-        (f"会话累计盈亏≈{payload.get('sessionPnlUsd')} USDT / 预算 {payload.get('budgetUsd')} USDT；"
-         f"会话止盈阈值={'不触发' if tp is None else tp}，止损阈值={'不触发' if sl is None else sl}"),
     ]
+    guard_line = _format_profit_guard(payload.get("profitGuard"))
+    if guard_line:                           # 键缺失时整段省略（零回归；回测 payload 无此键，§1.3）
+        parts.append(guard_line)
+    parts.append(
+        f"会话累计盈亏≈{payload.get('sessionPnlUsd')} USDT / 预算 {payload.get('budgetUsd')} USDT；"
+        f"会话止盈阈值={'不触发' if tp is None else tp}，止损阈值={'不触发' if sl is None else sl}")
     streak_line = _format_hold_streak(payload.get("holdStreak"))
     if streak_line:                          # 键缺失时整段省略（零回归；回测 payload 无此键，N3）
         parts.append(streak_line)
+    profit_hold_line = _format_profit_hold_note(payload)
+    if profit_hold_line:                     # 同上：阈值未达 / 无浮盈 / 未装配 ⇒ 整段省略
+        parts.append(profit_hold_line)
     resting_line = _format_resting_order(payload.get("restingOrder"))
     if resting_line:                         # 无挂单时整段省略（不出现「当前挂单：无」的噪音）
         parts.append(resting_line)
