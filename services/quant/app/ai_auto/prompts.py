@@ -79,7 +79,7 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
     之前——**位置本身就是优先级声明**：信号可被推翻，铁律不可违反。
 
     `profit_guard_text`（末位，默认 `""` → 渲染逐字节不变、零回归，ai-trade-profit-protection §2.6 a）：
-    利润保护宪章章（`profit_guard.format_profit_guard_charter` 产物）。非空时紧随基础策略铁律章之后
+    利润保护宪章章（`profit_guard_text.format_profit_guard_charter` 产物）。非空时紧随基础策略铁律章之后
     ——两者都是「系统强制执行」的层，但语义互补：一个约束在哪开仓，一个约束利润何时被强制锁定。
     """
     charter = "".join(f"{text}\n\n" for text in (base_rules_text, profit_guard_text) if text)
@@ -378,8 +378,20 @@ def _format_profit_guard(snapshot: dict | None) -> str:
     """
     if not snapshot:
         return ""
-    from .profit_guard import format_profit_guard_for_prompt   # 延迟导入，与 _format_base_rules 同范式
+    from .profit_guard_text import format_profit_guard_for_prompt   # 延迟导入，同 _format_base_rules
     return format_profit_guard_for_prompt(snapshot)
+
+
+def _format_profit_cooldown(cooldown: dict | None) -> str:
+    """保护性平仓冷却段（ai-trade-profit-protection-adaptive §2.2.3）。
+
+    `payload["profitGuardCooldown"]` **键缺失 / None**（未装配 / 冷却已过期）⇒ 返回空串 ⇒ 整段省略
+    ⇒ 逐字节回退。渲染委托 `profit_cooldown` 纯核心（门禁与文案同一真源，避免「说在拦其实没拦」）。
+    """
+    if not cooldown:
+        return ""
+    from .profit_cooldown import format_profit_cooldown   # 延迟导入，与 _format_profit_guard 同范式
+    return format_profit_cooldown(cooldown)
 
 
 def _format_profit_hold_note(payload: dict) -> str:
@@ -387,7 +399,7 @@ def _format_profit_hold_note(payload: dict) -> str:
     rounds = payload.get("profitHoldRounds")
     if not rounds:
         return ""
-    from .profit_guard import format_profit_hold_note
+    from .profit_guard_text import format_profit_hold_note
     return format_profit_hold_note(payload.get("profitGuard"), rounds)
 
 
@@ -408,8 +420,11 @@ def build_decision_prompt(payload: dict) -> str:
         _format_position(payload.get("position")),
     ]
     guard_line = _format_profit_guard(payload.get("profitGuard"))
-    if guard_line:                           # 键缺失时整段省略（零回归；回测 payload 无此键，§1.3）
+    if guard_line:                           # 键缺失时整段省略（零回归；未装配的会话无此键）
         parts.append(guard_line)
+    cooldown_line = _format_profit_cooldown(payload.get("profitGuardCooldown"))
+    if cooldown_line:                        # 冷却未激活 ⇒ 整段省略（不写「当前无冷却」的噪音）
+        parts.append(cooldown_line)
     parts.append(
         f"会话累计盈亏≈{payload.get('sessionPnlUsd')} USDT / 预算 {payload.get('budgetUsd')} USDT；"
         f"会话止盈阈值={'不触发' if tp is None else tp}，止损阈值={'不触发' if sl is None else sl}")

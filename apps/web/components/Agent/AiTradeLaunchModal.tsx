@@ -17,6 +17,7 @@ import {
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
   AI_TRADE_DEFAULT_POSITION_STEP,
   AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN,
+  AI_TRADE_GIVEBACK_TIER_PRESETS,
   AI_TRADE_MAX_SL_PCT,
   AI_TRADE_MAX_STRATEGIES,
   AI_TRADE_MAX_SYMBOLS,
@@ -53,12 +54,14 @@ import {
 } from "@/lib/liveAuto";
 import type {
   AiTradeBaseRules,
+  AiTradeGivebackTier,
   AiTradeMaBandRule,
   AiTradeProfitGuardRule,
 } from "@/lib/aiTradeTypes";
 import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
 import { tradingApi } from "@/lib/tradingApi";
 import type { Bar } from "@/lib/types";
+import ProfitGuardFields from "./ProfitGuardFields";
 
 export type AiTradeLaunchMode = "live" | "backtest";
 
@@ -82,8 +85,8 @@ export interface AiTradeLaunchOpts {
   // 【基础策略】铁律（实盘/回测两 tab 同得，实盘与回测的默认必须一致，P1-4）：勾选 ⇒ 带完整参数；
   // 取消勾选 ⇒ `{maBandEntry:{enabled:false}}`（**显式关闭**，与「字段缺省=默认开启」语义严格区分）。
   baseRules: AiTradeBaseRules;
-  // 利润保护层（**仅实盘**：回测按根推进、峰值浮盈需 bar 内 OHLC 建模，收盘价近似即假数据，故显式非目标）。
-  // 与 wakeIntervalMinutes 同为可选，回测分支省略该键。勾选 ⇒ 带完整参数；取消勾选 ⇒ `{enabled:false}`（显式关闭）。
+  // 利润保护层（**实盘与回测同源**，adaptive §7.2a）：回测改用 bar 内 OHLC 极值 + 保守成交序后，
+  // 该字段两模式都提交。勾选 ⇒ 带完整参数；取消勾选 ⇒ `{enabled:false}`（显式关闭，与「字段缺省=默认开启」区分）。
   profitGuard?: AiTradeProfitGuardRule;
   contextRefreshRounds: number;
   // Agent 墙钟定时唤醒周期（分钟）：[RN-1] 声明为**可选**（对齐 backtest-only 可选字段），仅 live 分支透传、
@@ -209,6 +212,15 @@ export default function AiTradeLaunchModal({
     defaultProfitGuard.breakevenArmReturnPct, AI_TRADE_PROFIT_GUARD_DEFAULTS.breakevenArmReturnPct));
   const [minHoldRaw, setMinHoldRaw] = useState(String(
     defaultProfitGuard.minHoldSeconds ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.minHoldSeconds));
+  // 自适应四项（本轮新增）：阶梯走预设下拉（阶梯是结构化数组，逐档手填对用户毫无收益）；
+  // ATR 上下界与冷却秒同走 raw 串，避免输入中途被 Number 归一（与既有金额输入同风格）。
+  const [tierPreset, setTierPreset] = useState(() => matchTierPreset(defaultProfitGuard.givebackTiers));
+  const [atrFloorRaw, setAtrFloorRaw] = useState(String(
+    defaultProfitGuard.atrFloorMult ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.atrFloorMult));
+  const [atrCapRaw, setAtrCapRaw] = useState(String(
+    defaultProfitGuard.atrCapMult ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.atrCapMult));
+  const [cooldownRaw, setCooldownRaw] = useState(String(
+    defaultProfitGuard.cooldownSeconds ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.cooldownSeconds));
   const [startInput, setStartInput] = useState("");
   const [endInput, setEndInput] = useState("");
   const [everyRaw, setEveryRaw] = useState("");
@@ -267,6 +279,15 @@ export default function AiTradeLaunchModal({
       AI_TRADE_PROFIT_GUARD_DEFAULTS.breakevenArmReturnPct));
     setMinHoldRaw(String(defaultProfitGuard.minHoldSeconds
       ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.minHoldSeconds));
+    // 本轮新增的四个受控输入**必须塞进这个既有 [open] effect**（绝不另写 effect：非稳定依赖的第二个
+    // reset effect 正是 ai-trade-modal-revert-recurrence 的复发根因——输入约 1 秒后被冲回默认）。
+    setTierPreset(matchTierPreset(defaultProfitGuard.givebackTiers));
+    setAtrFloorRaw(String(defaultProfitGuard.atrFloorMult
+      ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.atrFloorMult));
+    setAtrCapRaw(String(defaultProfitGuard.atrCapMult
+      ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.atrCapMult));
+    setCooldownRaw(String(defaultProfitGuard.cooldownSeconds
+      ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.cooldownSeconds));
     setCapitalRaw("");
     setLeverageRaw("");
     setTakeProfitRaw("");
@@ -357,7 +378,8 @@ export default function AiTradeLaunchModal({
       : { enabled: false },
   };
 
-  // 利润保护参数（**仅实盘**，回测不装配也不露出）：UI 收百分数，此处统一 /100 转 fraction。
+  // 利润保护参数（**实盘与回测同源**，adaptive §7.2a I-1/I-2）：UI 收百分数，此处统一 /100 转 fraction；
+  // ATR 倍数与冷却秒是原始量纲，不做换算。
   const profitGuardPayload: AiTradeProfitGuardRule = profitGuardEnabled
     ? {
         enabled: true,
@@ -365,9 +387,14 @@ export default function AiTradeLaunchModal({
         givebackPct: rawPctToFraction(givebackRaw),
         breakevenArmReturnPct: rawPctToFraction(breakevenArmRaw),
         minHoldSeconds: Number(minHoldRaw),
+        givebackTiers: tiersForPreset(tierPreset),
+        atrFloorMult: Number(atrFloorRaw),
+        atrCapMult: Number(atrCapRaw),
+        cooldownSeconds: Number(cooldownRaw),
       }
     : { enabled: false };
-  const profitGuardError = mode === "live" ? validateProfitGuard(profitGuardPayload) : null;
+  // 两模式都校验（P2-8：只改校验不改 canSubmit / 错误横幅，回测下校验会跑但拦不住提交）。
+  const profitGuardError = validateProfitGuard(profitGuardPayload);
   // 双口径换算的唯一真源；杠杆留空 ⇒ null ⇒ 只显示保证金口径并附一句「填写杠杆后显示」（诚实降级，不猜默认杠杆）。
   const armPriceMovePct = priceMoveFromMarginPct(profitGuardPayload.armReturnPct ?? null, leverage.value);
   const slMarginPct = marginReturnFromPricePct(
@@ -434,10 +461,12 @@ export default function AiTradeLaunchModal({
   const budgetCap = groupBudgetCap(availUsdt, maxBudgetPct);
 
   const usingDefault = capital.value == null;
-  const baseValid = !inputError && !strategyError && !roundsError && !baseRuleError;
+  // 利润保护校验并入 baseValid：两模式共用（P2-8），避免回测下「校验会跑但拦不住提交」。
+  const baseValid =
+    !inputError && !strategyError && !roundsError && !baseRuleError && !profitGuardError;
   const ready =
     mode === "live"
-      ? baseValid && !membersError && !wakeError && !profitGuardError && acknowledged
+      ? baseValid && !membersError && !wakeError && acknowledged
       : baseValid && instSupported && !!instId && !rangeError && !everyError && !minConsensusError && !roundsCapError;
 
   const handleConfirm = () => {
@@ -469,6 +498,8 @@ export default function AiTradeLaunchModal({
       allocationMode,
       instId,
       ...base,
+      // F3：回测提交体也带 profitGuard（与实盘同字段同语义、同一服务端解析点）。
+      profitGuard: profitGuardPayload,
       startTs: startTs ?? undefined,
       endTs: endTs ?? undefined,
       decisionEveryBars: everyValue,          // 已解析为智能默认，永不越界自拒（R5）
@@ -481,8 +512,9 @@ export default function AiTradeLaunchModal({
     roundsError ||
     inputError ||
     baseRuleError ||
+    profitGuardError ||
     (mode === "live"
-      ? membersError || wakeError || profitGuardError
+      ? membersError || wakeError
       : instSupported
         ? null
         : "标的不支持自动交易（仅 USDT 本位永续 / 交割合约）") ||
@@ -926,63 +958,32 @@ export default function AiTradeLaunchModal({
           </label>
         )}
 
-        {/* 利润保护层（**仅实盘**）：回测按根推进、峰值浮盈需 bar 内 OHLC 建模，收盘价近似会低估触发频次，
-            产出一份「比实盘保守却看起来同构」的曲线——属假数据，故回测段整块不渲染（§1.3 非目标）。 */}
-        {mode === "live" && (
-          <div className="flex flex-col gap-1.5 rounded-md border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_5%,transparent)] px-3 py-2">
-            <label className="flex cursor-pointer items-start gap-2 text-xs">
-              <input
-                type="checkbox"
-                checked={profitGuardEnabled}
-                disabled={submitting}
-                onChange={(e) => setProfitGuardEnabled(e.target.checked)}
-                className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[var(--accent)]"
-                aria-label="利润保护（推荐开启）"
-              />
-              <span className="flex flex-col gap-0.5">
-                <span className="font-medium text-[var(--text)]">利润保护（推荐开启）</span>
-                <span className="text-[11px] leading-relaxed text-[var(--muted)]">
-                  <strong className="text-[var(--text)]">移动止盈 + 保本</strong>：持仓浮盈达阈值后系统记录峰值，
-                  利润自峰值<strong className="text-[var(--text)]">回吐超比例</strong>或价格
-                  <strong className="text-[var(--text)]">跌回保本线</strong>时由系统直接市价平仓。
-                  判定只用<strong className="text-[var(--text)]">实时价</strong>，不等 K 线收盘；
-                  行情异常时保护层会主动不动作（届时仅交易所侧止盈止损生效）。
-                </span>
-              </span>
-            </label>
-            {profitGuardEnabled && (
-              <div className="mt-1 flex flex-col gap-1.5 text-[11px] text-[var(--muted)]">
-                <div className="grid grid-cols-2 gap-2">
-                  <GuardField
-                    label="武装阈值（保证金收益 %）"
-                    value={armReturnRaw}
-                    onChange={setArmReturnRaw}
-                    disabled={submitting}
-                  />
-                  <GuardField
-                    label="允许回吐（%）"
-                    value={givebackRaw}
-                    onChange={setGivebackRaw}
-                    disabled={submitting}
-                  />
-                  <GuardField
-                    label="保本阈值（保证金收益 %，0=关）"
-                    value={breakevenArmRaw}
-                    onChange={setBreakevenArmRaw}
-                    disabled={submitting}
-                  />
-                  <GuardField
-                    label="最短持有（秒）"
-                    value={minHoldRaw}
-                    onChange={setMinHoldRaw}
-                    disabled={submitting}
-                  />
-                </div>
-                <span className="leading-relaxed">{guardPreview(armReturnRaw, givebackRaw, armPriceMovePct)}</span>
-              </div>
-            )}
-          </div>
-        )}
+        {/* 利润保护层（**实盘与回测两段都渲染**，adaptive §7.2a I-2）：第 1 轮把回测列为非目标，是因为
+            当时只想得到「用收盘价近似」这一种做法；本轮 F3 改用 bar 内 OHLC 极值 + 保守成交序，故回测
+            段照常露出，但文案必须写明是**保守近似**，不得让用户以为回测 = 实盘。 */}
+        <ProfitGuardFields
+          mode={mode}
+          enabled={profitGuardEnabled}
+          onEnabledChange={setProfitGuardEnabled}
+          armReturnRaw={armReturnRaw}
+          onArmReturnChange={setArmReturnRaw}
+          givebackRaw={givebackRaw}
+          onGivebackChange={setGivebackRaw}
+          breakevenArmRaw={breakevenArmRaw}
+          onBreakevenArmChange={setBreakevenArmRaw}
+          minHoldRaw={minHoldRaw}
+          onMinHoldChange={setMinHoldRaw}
+          tierPreset={tierPreset}
+          onTierPresetChange={setTierPreset}
+          atrFloorRaw={atrFloorRaw}
+          onAtrFloorChange={setAtrFloorRaw}
+          atrCapRaw={atrCapRaw}
+          onAtrCapChange={setAtrCapRaw}
+          cooldownRaw={cooldownRaw}
+          onCooldownChange={setCooldownRaw}
+          disabled={submitting}
+          preview={guardPreview(armReturnRaw, givebackRaw, armPriceMovePct)}
+        />
 
         {mode === "backtest" && (
           <div className="grid grid-cols-2 gap-3">
@@ -1129,32 +1130,19 @@ function guardPreview(armRaw: string, givebackRaw: string, armPriceMovePct: numb
   return `${scope}即武装 → 自峰值回吐 ${+giveback.toFixed(2)}% 或跌回保本线即由系统平仓。`;
 }
 
-/** 利润保护的数值输入框（与「高级参数」同风格的紧凑右对齐输入）。 */
-function GuardField({
-  label,
-  value,
-  onChange,
-  disabled,
-}: {
-  label: string;
-  value: string;
-  onChange: (v: string) => void;
-  disabled: boolean;
-}) {
-  return (
-    <label className="flex flex-col gap-1">
-      <span>{label}</span>
-      <input
-        type="text"
-        inputMode="decimal"
-        value={value}
-        disabled={disabled}
-        onChange={(e) => onChange(e.target.value)}
-        aria-label={label}
-        className="rounded border border-[var(--border)] bg-[var(--bg)] px-1.5 py-1 text-right text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] disabled:opacity-50"
-      />
-    </label>
-  );
+/** 阶梯预设 → 阶梯数组（未知 key 回落标准预设，绝不静默提交一个空阶梯）。 */
+function tiersForPreset(value: string): AiTradeGivebackTier[] {
+  const hit = AI_TRADE_GIVEBACK_TIER_PRESETS.find((preset) => preset.value === value);
+  return (hit ?? AI_TRADE_GIVEBACK_TIER_PRESETS[0]).tiers;
+}
+
+/** 阶梯数组 → 预设 key（回填上次偏好；无匹配预设时回落标准，UI 不显示一个不存在的选项）。 */
+function matchTierPreset(tiers: AiTradeGivebackTier[] | null | undefined): string {
+  if (tiers == null) return AI_TRADE_GIVEBACK_TIER_PRESETS[0].value;
+  const key = (list: AiTradeGivebackTier[]) =>
+    list.map((t) => `${t.peakReturnPct}:${t.givebackPct}`).join(",");
+  const hit = AI_TRADE_GIVEBACK_TIER_PRESETS.find((preset) => key(preset.tiers) === key(tiers));
+  return (hit ?? AI_TRADE_GIVEBACK_TIER_PRESETS[0]).value;
 }
 
 function ModeTab({

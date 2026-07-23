@@ -324,3 +324,64 @@ async def test_history_endpoints() -> None:
     # trade_out 序列化：成交行为 wire dict（含 explain 键），非 ORM
     assert "explain" in dbody["members"][0]["trades"][0]
     assert not_found.status_code == 404
+
+
+# ============ F4 利润捕获率聚合（ai-trade-profit-protection-adaptive §2.4.3）============
+def test_capture_ratio_only_counts_pairs_with_a_positive_peak():
+    """口径：`captureRatio = Σrealized / Σpeak`，仅 `peak > 0` 的往返入分母；缺失 / ≤0 单列计数。"""
+    from app.db.ai_auto_repositories import _summarize_pairs
+
+    class _T:
+        def __init__(self, side, pnl=0.0, peak_pnl=None, tid=0):
+            self.side, self.pnl, self.peak_pnl, self.id = side, pnl, peak_pnl, tid
+
+    pairs = [
+        (_T("long", tid=1), _T("close", pnl=0.6, peak_pnl=1.0, tid=2)),    # 捕获 60%
+        (_T("long", tid=3), _T("close", pnl=0.9, peak_pnl=1.0, tid=4)),    # 捕获 90%
+        (_T("long", tid=5), _T("close", pnl=-0.2, peak_pnl=None, tid=6)),  # 无峰值：不入分母
+        (_T("long", tid=7), _T("close", pnl=-0.3, peak_pnl=0.0, tid=8)),   # 峰值 ≤0：不入分母
+    ]
+
+    summary = _summarize_pairs(pairs, 1000.0)
+
+    assert summary["peakPnlUsd"] == 2.0
+    assert summary["capturedPnlUsd"] == pytest.approx(1.5)
+    assert summary["captureRatio"] == pytest.approx(0.75)
+    assert summary["capturePairs"] == 2 and summary["noPeakCount"] == 2
+    # 既有五键口径逐字不变（纯加法）。
+    assert summary["tradeCount"] == 4 and summary["realizedPnlUsd"] == pytest.approx(1.0)
+
+
+def test_capture_ratio_tolerates_legacy_rows_without_the_column():
+    """G-6：老库缺 `peak_pnl` 列 ⇒ `getattr` 兜底为 None ⇒ 全部计入 noPeakCount，比率为 0（不炸）。"""
+    from app.db.ai_auto_repositories import _summarize_pairs
+
+    class _Legacy:
+        def __init__(self, side, pnl=0.0, tid=0):
+            self.side, self.pnl, self.id = side, pnl, tid
+
+    summary = _summarize_pairs([(_Legacy("long", tid=1), _Legacy("close", pnl=0.5, tid=2))], 100.0)
+
+    assert summary["captureRatio"] == 0.0 and summary["capturePairs"] == 0
+    assert summary["noPeakCount"] == 1
+
+
+def test_capture_ratio_denominator_is_revalued_at_final_average_price():
+    """[P1-7] 口径瑕疵留档：epoch 内加过仓的往返，`peak` 是**按最终均价重估**值，不是账户真实拥有过的浮盈。
+
+    本用例把这一点钉成**已知且被接受**的行为（而不是某次实现走样）：同一笔往返里 peak 由保护层用
+    当前 qty × (peak_px − 漂移后均价) 得到，聚合层原样采信、不做任何 rebase。
+    """
+    from app.db.ai_auto_repositories import _summarize_pairs
+
+    class _T:
+        def __init__(self, side, pnl=0.0, peak_pnl=None, tid=0):
+            self.side, self.pnl, self.peak_pnl, self.id = side, pnl, peak_pnl, tid
+
+    # 加仓后均价上移、手数变大 ⇒ 重估峰值 2.4 大于任何单一时刻真实浮盈；聚合仍原样使用。
+    summary = _summarize_pairs(
+        [(_T("long", tid=1), _T("close", pnl=1.2, peak_pnl=2.4, tid=2))], 1000.0)
+
+    assert summary["peakPnlUsd"] == 2.4
+    assert summary["captureRatio"] == pytest.approx(0.5)
+    assert summary["capturePairs"] == 1

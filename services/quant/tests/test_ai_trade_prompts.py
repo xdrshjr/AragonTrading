@@ -418,7 +418,8 @@ def test_system_prompt_byte_identical_without_profit_guard():
 def test_system_prompt_stacks_charters_in_priority_order():
     """两章共存时：基础策略铁律章在前、利润保护章在后，两者均在「决策纪律」之前。"""
     from app.ai_auto.base_rules import MaBandRule, format_charter
-    from app.ai_auto.profit_guard import ProfitGuardRule, format_profit_guard_charter
+    from app.ai_auto.profit_guard import ProfitGuardRule
+    from app.ai_auto.profit_guard_text import format_profit_guard_charter
 
     text = build_ai_trade_system_prompt(
         "BTC-USDT-SWAP", "1H", 100.0, 3.0,

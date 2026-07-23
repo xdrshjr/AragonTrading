@@ -29,6 +29,7 @@ from ..db import repositories as repo
 from ..db.session import get_sessionmaker
 from ..engine.backtester import candles_to_df
 from ..engine.benchmark import compute_buy_hold
+from ..engine.indicators import atr
 from ..engine.metrics import compute_metrics
 from ..engine.metrics_ext import compute_extended_metrics
 from ..engine.mtf import bar_to_seconds
@@ -46,6 +47,21 @@ from .multi_timeframe_context import (
     build_multi_timeframe_context,
     decision_timeframes,
 )
+from .profit_cooldown import (
+    CooldownState,
+    apply_profit_cooldown,
+    build_cooldown_view,
+)
+from .profit_guard import (
+    PositionFacts,
+    ProfitGuardRule,
+    ProfitGuardState,
+    build_snapshot,
+    rule_wire,
+    sanitize_atr,
+)
+from .profit_guard_bar import BarFacts, evaluate_bar
+from .profit_guard_text import format_profit_guard_charter
 from .prompts import build_ai_trade_system_prompt
 from .reflection import apply_reflection, build_reflection_note
 from .signals import (
@@ -67,6 +83,15 @@ _DECISIONS_BUFFER_MAX = 200    # 决策环形缓冲上限（重连仅回放近�
 _SUMMARIES_BUFFER_MAX = 64     # 摘要缓冲上限
 _EQUITY_BUFFER_MAX = 1000      # 权益缓冲上限（滚动迷你图重连回放）
 _TERMINAL_TYPES = ("done", "cancelled", "error")
+# 回测保护层的**保守近似免责**（adaptive §2.3.5）：与前端 aiBacktest/panels.tsx 同源文案。绝不宣称
+# 等同实盘——回测接入保护层最大的风险恰恰是「曲线变好看 ⇒ 用户高估实盘」（R-4）。
+_PROFIT_GUARD_BACKTEST_NOTE = (
+    "利润保护在回测中为 bar 内极值保守近似：① 同一根内的新高不会立即抬高移动止盈线（先判回撤、"
+    "后推峰值）；② 跳空穿越按开盘价成交；③ 回测按根推进，实盘每 5 秒盯市一次，触发时机必然更早、"
+    "更细；④ 回测无部分成交、无挂单撤改、无交易所降级态；⑤ 开仓当根不判回撤（min_hold 在 bar 时钟下"
+    "等价于「至少持有一根」），且冷却秒数若短于一根 K 线（默认 180s < 15m）在回测里几乎恒于次根即已"
+    "过期——回测无法验证冷却期的实际效果。故回测的保护触发次数与落袋结果相对实盘偏保守，"
+    "不得据此推断实盘一定更好或更差。")
 
 
 @dataclass
@@ -98,6 +123,10 @@ class AiBacktestSpec:
     # 【基础策略】MA 通道开单铁律（ai-trade-base-strategy-ma-band §2.8/P1-4）：与实盘**共用同一纯核心**，
     # 严禁在本文件复制一份判定逻辑。默认 None=不装配 ⇒ payload 与 prompt 逐字节回退（既有回测测试零回归）。
     base_rule: MaBandRule | None = None
+    # 利润保护层（adaptive §2.3/F3）：同样与实盘**共用同一纯核心**（`profit_guard` + `profit_guard_bar`
+    # + `profit_cooldown`），差异只在「谁提供行情断面」。默认 None=不装配 ⇒ `_run_loop` 的 SimBroker
+    # 调用序与 payload/prompt 逐字节回退（G-3，既有直接构造该 dataclass 的回测测试零回归）。
+    profit_rule: ProfitGuardRule | None = None
 
 
 # ============================ 线格式序列化助手（纯函数） ============================
@@ -171,6 +200,13 @@ class AiBacktestRunner:
         # 【基础策略】铁律：回测与实盘**同源生效**（P1-4）——否则 AI 回测会系统性地比实盘更容易开仓，
         # 用户据此调出的参数在实盘直接失真。规则来源与实盘同一个 `_resolve_base_rules`。
         self.base_rule = spec.base_rule
+        # 利润保护层（F3）：规则、逐根状态、冷却态与触发计数。规则为 None ⇒ 全部路径空转（G-3）。
+        self.profit_rule = spec.profit_rule
+        self._guard_state: ProfitGuardState | None = None
+        self._cooldown: CooldownState | None = None
+        self.profit_guard_exits = 0
+        self._atr_series = None            # `_setup` 里一次性向量化；第 i 根用 iloc[i-1]（无未来函数）
+        self._bar_ts_index: list[int] | None = None   # 根索引 → ts（把开仓根 ts 当 opened_wall，§2.3.2）
 
         self.warmup = _compute_warmup(self.specs, spec.settings.ai_trade_regime_context)
         # allow_limit 恒 False（ai-trade-limit-orders §2.10，Non-goal）：`SimBroker._pending` 是「次根
@@ -183,7 +219,10 @@ class AiBacktestRunner:
                                          position_step_pct=self.position_step_pct,
                                          allow_limit=False,
                                          # 铁律宪章同源注入；未装配 → "" ⇒ 渲染逐字节不变
-                                         base_rules_text=format_charter(self.base_rule)),
+                                         base_rules_text=format_charter(self.base_rule),
+                                         # 利润保护宪章同源注入（F3）；未装配 → "" ⇒ 同上零回归
+                                         profit_guard_text=format_profit_guard_charter(
+                                             self.profit_rule)),
             context_refresh_rounds=self.context_refresh_rounds, settings=self.settings,
             position_step_pct=self.position_step_pct, reflection_enabled=self.reflection_enabled,
             allow_limit=False)
@@ -268,6 +307,10 @@ class AiBacktestRunner:
             if htf_frames.get(bar)
         }
         first = self._first_decision_index(main_df)
+        if self.profit_rule is not None:
+            # F1/F3：ATR 一次性向量化（第 i 根取 iloc[i-1]，含本根 h/l 的 ATR 是未来函数）。
+            self._atr_series = atr(main_df, self.settings.ai_trade_profit_guard_atr_period)
+            self._bar_ts_index = main_df["ts"].astype(int).tolist()
         job.publish({"type": "phase", "data": {"phase": "priming"}})
         await run_in_threadpool(self._prime_shadows, dfs, first)
         if job.cancelled:
@@ -317,6 +360,9 @@ class AiBacktestRunner:
             row = main_df.iloc[i]
             self.main.fill_pending(open_price=float(row["o"]), ts=int(row["ts"]), bar_index=i)
             self.main.apply_risk(i, row, self._oco_risk)
+            # ★ 利润保护（F3 §2.3.3）：排在 apply_risk **之后**（交易所侧 OCO 物理上先于本进程存在，
+            # 同根同时命中按更保守的先手记因）、mark **之前**（本根内的平仓必须反映进本根权益点）。
+            self._apply_profit_guard_bar(i, row)
             self.main.mark(ts=int(row["ts"]), close=float(row["c"]))
             if self.main.pos.side != "flat":         # [B1] 在场根计数（timeInMarketPct 分子）
                 self._bars_in_market += 1
@@ -332,6 +378,70 @@ class AiBacktestRunner:
             if (i - first) % _YIELD_EVERY_BARS == 0:
                 await asyncio.sleep(0)               # R4：周期让出，避免拖住其它 WS/请求
         return "completed"
+
+    # ---------- 利润保护（F3：与实盘共用纯核心，本文件只提供行情断面）----------
+    def _atr_at(self, i: int) -> float | None:
+        """第 `i` 根可用的 ATR：取 `iloc[i-1]`（含本根 h/l 的 ATR 是未来函数）。
+
+        `i-1 < 0`、`NaN`（`ewm(min_periods=period)` 的前 `period-1` 行恒为 NaN，而暖机在「无 HTF +
+        关闭体制上下文 + 策略暖机很小」的组合下可以小于 14）、≤0 一律 `None` ⇒ 上下界整体不生效，
+        与实盘走**同一条降级判据** `sanitize_atr`（P2-5）。
+        """
+        if self._atr_series is None or i - 1 < 0:
+            return None
+        return sanitize_atr(self._atr_series.iloc[i - 1])
+
+    def _apply_profit_guard_bar(self, i: int, row: pd.Series) -> None:
+        """本根的保守保护判定；命中即按触发价平仓并开启冷却。未装配 / 空仓 ⇒ 完全空转（G-3）。"""
+        if self.profit_rule is None:
+            return
+        pos = self.main.pos
+        if pos.side == "flat":
+            self._guard_state = None
+            return
+        bar_ts = int(row["ts"])
+        entry_ts = self._bar_ts(pos.entry_bar, default=bar_ts)
+        result = evaluate_bar(self._guard_state, self.profit_rule, BarFacts(
+            seq=pos.entry_bar, side=pos.side, entry_px=float(pos.entry_price),
+            qty_coin=float(pos.qty), leverage=self.leverage, ts=bar_ts, opened_ts=entry_ts,
+            open_px=float(row["o"]), high_px=float(row["h"]), low_px=float(row["l"]),
+            atr_px=self._atr_at(i)))
+        self._guard_state = result.state
+        if result.verdict is None:
+            return
+        self.main.close_at_price(float(result.fill_px), bar_ts, result.verdict.reason_code)
+        self.profit_guard_exits += 1
+        self._guard_state = None
+        if self.profit_rule.cooldown_s > 0:
+            # F2 §2.3.3a：写点唯一——**确实产生了保护性平仓**之后才开冷却（bar ts 当墙钟）。
+            self._cooldown = CooldownState(
+                until_wall=bar_ts + self.profit_rule.cooldown_s, side=result.verdict.note["side"],
+                reason_code=result.verdict.reason_code, label=result.verdict.label,
+                scope=self.profit_rule.cooldown_scope)
+
+    def _bar_ts(self, bar_index: int, *, default: int) -> int:
+        """开仓根 ts（`state.opened_wall` 的来源）；索引越界 / 未记录 ⇒ 回落当前根（⇒ holdSeconds=0）。"""
+        if bar_index is None or bar_index < 0 or self._bar_ts_index is None:
+            return default
+        if bar_index >= len(self._bar_ts_index):
+            return default
+        return int(self._bar_ts_index[bar_index])
+
+    def _profit_guard_wire(self, i: int, ref_px: float) -> dict | None:
+        """决策 payload 用的只读保护快照（不推进状态）；未装配 / 空仓 / 无 state ⇒ None ⇒ 整键缺席。
+
+        与实盘的差别只在判定价来源：实盘是 5s 盯市的实时价，回测按根推进只有本根收盘价可用（这条
+        差异已写进 §2.3.5 的差异清单，不得让用户以为两者等同）。
+        """
+        pos = self.main.pos
+        if self.profit_rule is None or pos.side == "flat" or self._guard_state is None:
+            return None
+        facts = PositionFacts(
+            seq=pos.entry_bar, side=pos.side, entry_px=float(pos.entry_price),
+            leverage=self.leverage, qty_coin=float(pos.qty), mark_px=float(ref_px),
+            now_wall=float(self._last_ts), bars_in_position=i - pos.entry_bar,
+            atr_px=self._atr_at(i))
+        return build_snapshot(self.profit_rule, self._guard_state, facts)
 
     def _is_decision_bar(self, i: int, first: int, n: int) -> bool:
         """决策根门控（严格无未来函数）：i<n-1（末根不决策）+ 对齐决策间隔 + 未达轮数硬上限。"""
@@ -360,8 +470,12 @@ class AiBacktestRunner:
         decision, base_reason = apply_ma_band_gate(
             decision, (payload.get("baseRules") or {}).get("maBand"), self.base_rule,
             last_px=ref_px)
+        # ★ 利润保护冷却门禁（F2 §2.3.3a）：与实盘同序（铁律后、共识前）、**同一个纯函数**——严禁在
+        # 回测侧复制一份判定（那正是 v1 P1-4 给【基础策略】铁律定下的规矩）。未装配 ⇒ 原样直通（G-3）。
+        decision, cooldown_reason = apply_profit_cooldown(decision, self._cooldown, now_wall=ts)
         decision, consensus_reason = apply_consensus_gate(decision, consensus, self.min_consensus)
-        gate_reason = base_reason or consensus_reason   # 铁律优先级最高：并存时报告铁律的原因
+        # 三元合成，先执行者胜出：铁律优先级最高，冷却次之（本系统刚亲手做过的动作，解释力强于票数）。
+        gate_reason = base_reason or cooldown_reason or consensus_reason
         # 二次反思（决策脑不变式：回测复用同一 decider.reflect，emit=None 轨迹全程空转）。verdict 须在分支外
         # 预置 None（RV-3），否则 hold 轮走 else 分支时 _tally_reflection(verdict) 会 NameError。
         verdict = None
@@ -434,6 +548,14 @@ class AiBacktestRunner:
         if self.base_rule is not None:
             payload["baseRules"] = {
                 "maBand": build_ma_band(main_df.iloc[:i + 1], self.base_rule)}
+        # 利润保护快照 + 冷却视图（F3 §2.3.4）：未装配 / 空仓 / 冷却未激活 ⇒ **整键缺席** ⇒
+        # `prompts.py` 的既有渲染管线整段省略 ⇒ prompt 模板零改动、逐字节回退。
+        guard = self._profit_guard_wire(i, ref_px)
+        if guard is not None:
+            payload["profitGuard"] = guard
+        cooldown = build_cooldown_view(self._cooldown, now_wall=ts)
+        if cooldown is not None:
+            payload["profitGuardCooldown"] = cooldown
         return payload
 
     def _build_multi_timeframe_context(
@@ -586,7 +708,13 @@ class AiBacktestRunner:
             "reflectionAdjustments": self.reflection_adjustments,
             "summaryCount": self.summary_count, "finalSummary": self.decider.summary,
             "decisionEveryBars": self.decision_every_bars, "plannedRounds": self.planned_rounds,
-            "reachedRoundCap": self._reached_cap}
+            "reachedRoundCap": self._reached_cap,
+            # F3：与实盘 aiStats 同名同义（事件级触发次数）；未装配的回测恒 0。
+            "profitGuardExits": self.profit_guard_exits,
+            # 本次回测**是否真的装配了保护层**（RV-1）：`profitGuardExits` 恒下发且未装配时也是 0，
+            # 只凭它无法把「装了但没触发」与「压根没装」分开——UI 据此才不会在一次没有保护层的回测上
+            # 挂出「利润保护（保守近似）」的卡片，宣称一条并不存在的防线（v1 终审 RV-1 的同一条教训）。
+            "profitGuardEnabled": self.profit_rule is not None}
 
     def _build_notes(self, main_df: pd.DataFrame, first: int) -> list[str]:
         notes: list[str] = []
@@ -597,6 +725,8 @@ class AiBacktestRunner:
             notes.append(f"已触发会话级{label}，触发后次根开盘平仓，末段仅盯市至区间末。")
         if 0 <= first < len(main_df) and int(main_df.iloc[first]["ts"]) > self.start_ts:
             notes.append("历史深度或暖机不足，首个决策晚于所选区间起点，起始若干根未参与决策。")
+        if self.profit_rule is not None:
+            notes.append(_PROFIT_GUARD_BACKTEST_NOTE)
         return notes
 
     def _build_result(self, metrics: dict, ai_stats: dict, notes: list[str]) -> dict:
@@ -641,7 +771,10 @@ class AiBacktestRunner:
                 "takeProfitPct": self._oco_risk.take_profit_pct,
                 "takeProfitUsd": self.take_profit_usd, "stopLossUsd": self.stop_loss_usd,
                 "minConsensus": self.min_consensus,
-                "positionStepPct": self.position_step_pct}
+                "positionStepPct": self.position_step_pct,
+                # P2-6：回填本次保护参数，否则 run 的 config_json 无法复现这次回测（与 §4.1 的
+                # 「回执与 config_json 由 rule_wire 镜像全部字段」承诺矛盾）。未装配 → None。
+                "profitGuard": rule_wire(self.profit_rule)}
 
 
 def _compute_warmup(specs: list[PaperStrategySpec], regime_enabled: bool) -> int:

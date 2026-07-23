@@ -169,3 +169,27 @@ class _DummyRunner:
 
 async def _async_obj():
     return object()
+
+
+async def test_profit_rule_is_forwarded_to_spec(monkeypatch):
+    """[adaptive P1-1] `AiBacktestStartRequest.profit_rule` 必须透传到 `AiBacktestSpec`。
+
+    不透传就是**整条断路**：API 层解析出的规则到不了 runner，F3 全部代码都在但永不生效
+    （跑不出错、功能静默缺失）——这类缺陷只有守门用例逮得到。
+    """
+    from app.ai_auto.profit_guard import ProfitGuardRule
+
+    spec = await _seed_spec()
+    mgr = _reset_manager()
+    monkeypatch.setattr(AiBacktestRunner, "run", _idle_run)
+    rule = ProfitGuardRule(giveback_pct=0.25, cooldown_s=120.0)
+    try:
+        req = _req(spec)
+        req.profit_rule = rule
+        job = await mgr.start(req)
+        assert job.runner.profit_rule is rule
+
+        default_job = await mgr.start(_req(spec))       # 默认仍是 None（既有直构造零回归）
+        assert default_job.runner.profit_rule is None
+    finally:
+        await _teardown(mgr)

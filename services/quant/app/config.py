@@ -229,6 +229,23 @@ class Settings(BaseSettings):
     ai_trade_profit_guard_max_px_age_s: float = Field(default=90.0, gt=0, le=3600)
     # 盈利持仓自察注记阈值（连续几轮浮盈持有后要求模型给出退出线）；0 = 关闭（prompt 逐字节回退）。
     ai_trade_profit_guard_note_after_rounds: int = Field(default=1, ge=0)
+    # ---- 自适应利润保护（ai-trade-profit-protection-adaptive §4.3）----
+    # 一刀切的回吐比例在两端都不对：浮盈很小时 40% 回吐折合标的价格不到 0.5%（低于分钟级噪音，会在趋势
+    # 还在时把仓位扫掉）；浮盈很大时又意味着眼看着 20 个点利润溜走。故回吐比例走**利润阶梯**、回吐
+    # 距离再经 **ATR 上下界**归一。全部字段的「关闭值」都让本层逐字回退到第 1 轮行为。
+    # 阶梯串格式 `阈值:回吐` 逗号分隔；空串 = 关闭阶梯（退回固定 giveback_pct）。解析与校验的唯一真源是
+    # `profit_guard.parse_giveback_tiers`（阈值严格递增 + 回吐单调不增，违反即启动失败 / 422）。
+    ai_trade_profit_guard_giveback_tiers: str = "0.10:0.35,0.25:0.28,0.50:0.20"
+    # ATR 周期：与 market_digest._ATR_PERIOD 同值但**各自独立**（后者是展示读数，共享配置会让一改两处
+    # 语义漂移）。
+    ai_trade_profit_guard_atr_period: int = Field(default=14, ge=2, le=200)
+    ai_trade_profit_guard_atr_floor_mult: float = Field(default=0.8, ge=0, le=10)   # 0 = 关下界
+    ai_trade_profit_guard_atr_cap_mult: float = Field(default=3.0, ge=0, le=50)     # 0 = 关上界
+    # 保护性平仓后的冷却秒数（0 = 关闭）：防「保护层刚锁住利润 → 同根内反手同向重开 → 二次止损」。
+    ai_trade_profit_guard_cooldown_s: float = Field(default=180.0, ge=0, le=86400)
+    ai_trade_profit_guard_cooldown_scope: str = "same_side"      # same_side | both
+    # AI 回测侧总闸：false ⇒ 回测恒不装配保护层（逐字回到第 1 轮的回测行为，含 payload 无键、prompt 回退）。
+    ai_trade_profit_guard_backtest_enabled: bool = True
     # ---- AI 自动交易 · 回测模式（ai-auto-trading-backtest §2.5，三重决策成本护栏）----
     # 回测每决策根调一次 LLM，成本/时长敏感；三重护栏：决策间隔（降频）+ 决策轮数硬上限（越界启动前
     # 拒绝，绝不静默截断）+ 并发闸（限同时消耗 LLM 的回测数）。字段名即环境变量名（AI_BACKTEST_*，

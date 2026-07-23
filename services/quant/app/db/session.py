@@ -93,6 +93,9 @@ async def _ensure_trade_risk_columns(conn) -> None:
         "position_pct": "FLOAT",
         # auto-trade-explainability §5.1：实盘自动交易触发解释 JSON，老库幂等补列（与风控列同机制）。
         "explain_json": "TEXT",
+        # ai-trade-profit-protection-adaptive §2.4.3：持仓周期峰值浮盈（利润捕获率分母）。
+        # 类型串沿用本字典的 FLOAT 惯例（勿写 REAL）；老库缺列时读侧一律 getattr 兜底为 None。
+        "peak_pnl": "FLOAT",
     }
     for name, sql_type in risk_columns.items():
         if name not in columns:

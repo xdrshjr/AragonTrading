@@ -312,6 +312,12 @@ export interface Trade {
   pnlPct?: number | null;
   // 本次自动订单按成员最终预算折算的仓位比例（fraction）。
   positionPct?: number | null;
+  /**
+   * 本持仓周期的**峰值浮盈**（USD，随平仓成交落库；ai-trade-profit-protection-adaptive §2.4）。
+   * 保护层未装配 / 快照一路不可用 / 老库缺列 ⇒ `null`——**绝不是 0**（0 会被聚合当成
+   * 「峰值就是 0」，把捕获率算成 0 或 ∞）。开仓成交无此字段。
+   */
+  peakPnlUsd?: number | null;
   stopLossPct?: number | null;
   takeProfitPct?: number | null;
   maxHoldBars?: number | null;
@@ -397,6 +403,25 @@ export interface ProfitGuardSnapshot {
   givebackPct?: number | null;
   minHoldSeconds?: number | null;
   pxAgeSeconds?: number | null;
+  /** 本轮**有效**回吐阈（利润阶梯选档后）；UI 必须显示这个数而不是基准 givebackPct。 */
+  givebackPctEffective?: number | null;
+  /**
+   * 这条移动止盈线被谁定住：回吐比例 / ATR 下界 / ATR 上界 / 夹至保本线 / 本轮作废。
+   * 由后端下发，前端**不重算**（三处各算一份必然漂移，[R-5] 教训）。
+   */
+  trailBasis?:
+    | "giveback"
+    | "atr_floor"
+    | "atr_cap"
+    | "clamped_breakeven"
+    | "suppressed_at_entry"
+    | null;
+  /** 移动止盈线距峰值的价格距离；`suppressed_at_entry` 时为 null（线作废即距离作废）。 */
+  trailDistancePx?: number | null;
+  /** 入场价夹紧是否绑定（夹至保本线或整条线作废两种情形均为 true）。 */
+  trailClampedAtEntry?: boolean | null;
+  /** 本轮 ATR（价格单位）；样本不足 / 非有限 ⇒ null ⇒ 上下界整体不生效。 */
+  atrPx?: number | null;
   /** 上一次保护性平仓回执（一次性，仅紧接的下一轮出现）。 */
   lastExit?: {
     ts?: number;
@@ -406,6 +431,23 @@ export interface ProfitGuardSnapshot {
     pnlUsd?: number | null;
     peakPnlUsd?: number | null;
   } | null;
+}
+
+/**
+ * 保护性平仓后的冷却期视图（ai-trade-profit-protection-adaptive §4.2）。
+ *
+ * **不挂 `position`**：冷却期内按定义已无持仓（`position` 恒 null），挂上去等于永远送不出去。
+ * 载体是 `status` 事件 → `member.profitGuardCooldown`（与 position 平级的独立字段）。
+ * `remainingSeconds` 是下发瞬间的快照值，仅用于显示；是否仍在冷却一律以后端每轮重算为准
+ * （前后端两个时钟各自过期必然漂移）。
+ */
+export interface ProfitGuardCooldown {
+  activeUntilTs: number;
+  remainingSeconds: number;
+  scope: "same_side" | "both";
+  blockedSide: "long" | "short";
+  reasonCode: string;
+  label: string;
 }
 
 export interface PaperPositionEvent {

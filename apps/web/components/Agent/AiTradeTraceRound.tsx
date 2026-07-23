@@ -14,8 +14,10 @@ import {
   describeMultiTimeframeFrame,
   describeOrderType,
   describePriceAction,
+  describeProfitGuardCooldown,
   describeProfitGuardFallback,
   describeProfitGuardStatus,
+  describeProfitGuardTrail,
   describeReflection,
   describeRegime,
   describeStance,
@@ -234,8 +236,14 @@ function BaseRuleBlock({ trace }: { trace: AiTradeRoundTrace }) {
 function ProfitGuardBlock({ trace }: { trace: AiTradeRoundTrace }) {
   const guard = trace.profitGuard ?? null;
   const view = describeProfitGuardStatus(guard);
-  if (!guard || (!view && !guard.lastExit)) return null;
-  const unavailable = guard.status === "unavailable";
+  const cooldown = describeProfitGuardCooldown(trace.profitGuardCooldown);
+  // 冷却轮里持仓已平（guard 多为 flat 空壳甚至缺席），但「本轮为什么被降级为观望」恰恰要在这里说清楚
+  // ——否则用户只看到一个没有理由的 hold。故冷却单独构成一条渲染条件。
+  if (!guard && !cooldown) return null;
+  if (guard && !view && !guard.lastExit && !cooldown) return null;
+  const unavailable = guard?.status === "unavailable";
+  const trail = describeProfitGuardTrail(guard);
+  const lastExit = guard?.lastExit ?? null;
   return (
     <div className="flex flex-col gap-1.5 rounded-[10px] border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] px-2.5 py-2">
       <div className="flex items-center justify-between gap-2">
@@ -251,7 +259,8 @@ function ProfitGuardBlock({ trace }: { trace: AiTradeRoundTrace }) {
           </span>
         )}
       </div>
-      {view &&
+      {guard &&
+        view &&
         (unavailable ? (
           <p className="text-[10px] leading-relaxed text-[var(--muted)]">
             {describeProfitGuardFallback(guard)}。
@@ -263,12 +272,18 @@ function ProfitGuardBlock({ trace }: { trace: AiTradeRoundTrace }) {
             {guard.givebackRatio == null ? "—" : `${(guard.givebackRatio * 100).toFixed(1)}%`}
             {" · 有效退出线 "}
             {guard.effectiveExitPx == null ? "未武装" : fmtPrice(guard.effectiveExitPx)}
+            {trail && <span className="block">{trail}</span>}
           </p>
         ))}
-      {guard.lastExit && (
+      {lastExit && (
         <p className="text-[11px] leading-relaxed text-[var(--text)]">
-          上一笔持仓已由利润保护层强制平仓（{guard.lastExit.label ?? "利润保护"}）
-          {guard.lastExit.exitPx == null ? "" : ` @ ${fmtPrice(guard.lastExit.exitPx)}`}
+          上一笔持仓已由利润保护层强制平仓（{lastExit.label ?? "利润保护"}）
+          {lastExit.exitPx == null ? "" : ` @ ${fmtPrice(lastExit.exitPx)}`}
+        </p>
+      )}
+      {cooldown && (
+        <p className="text-[10px] leading-relaxed text-[var(--accent)]" data-testid="trace-profit-cooldown">
+          {cooldown}
         </p>
       )}
     </div>

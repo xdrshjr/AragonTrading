@@ -37,17 +37,18 @@ from .market_digest import build_market_digest
 from .market_window import MarketWindow
 from .multi_timeframe_context import build_multi_timeframe_context
 from .order_plan import decision_to_order_plan
+from .profit_cooldown import apply_profit_cooldown, build_cooldown_view
 from .profit_guard import (
-    ARMED_STATUSES,
     STATUS_UNAVAILABLE,
-    PositionFacts,
     ProfitGuardRule,
-    ProfitGuardState,
-    advance_state,
-    build_idle_snapshot,
-    build_snapshot,
     evaluate_profit_guard,
-    unavailable_reason_for,
+    safe_atr,
+)
+from .profit_guard_text import describe_exit_outcome
+from .profit_guard_runtime import (
+    ProfitGuardRuntime,
+    SessionReadings,
+    build_position_facts,
 )
 from .prompts import DECISION_TOOL_NAME
 from .reflection import applied_shrink, apply_reflection, build_reflection_note
@@ -127,15 +128,13 @@ class AiTradeSession:
         # prompt 逐字节不变、盯市不判定、零事件（既有直接构造会话的单测零回归，与 base_rule 同款垫片）；
         # 生产装配由 manager 从 API 层解析结果显式传入（默认开启只在 API 层解析）。
         self.profit_rule = profit_rule
-        self._profit_state: ProfitGuardState | None = None   # 当前持仓周期状态（无仓时 None）
-        self._profit_hold_streak = 0          # 连续「浮盈状态下继续持有」轮数（§2.6 c）
-        self.profit_guard_exits = 0           # **实际产生了平仓成交**的保护触发次数（事件级，P1-1）
-        self.profit_guard_armed_rounds = 0    # 快照曾处于 armed/breakeven_armed 的轮数（轮级，P2-2）
-        self._pending_protect_note: dict | None = None       # 下一轮 payload 一次性回执（读取即消费，P1-7）
+        # F0（adaptive §2.0）：状态 / 快照 / 计数 / payload 注入全部下沉 `ProfitGuardRuntime`（纯同步）；
+        # 会话只留三个 async 编排点（_maybe/_apply/_report_profit_exit）与时钟读数打包。
+        self._guard = ProfitGuardRuntime(profit_rule)
+        self._atr_px: float | None = None     # 确认根 ATR（F1）；None ⇒ 回吐距离上下界不生效
         # P0-1：会话级单调持仓序号——`_dispatch` 观察到任一 `side=="close"` 成交即 +1。epoch 身份的一半，
         # 没有它，「保护平仓 → 同一 tick 内同向重开」的新仓会继承旧峰值并被当场强平（真实资金）。
         self._position_seq = 0
-        self._profit_exit_warned_seq: int | None = None      # 平仓未成交 warn 的每周期节流（P2-8）
 
         self.state = "running"
         self.stop_reason: str | None = None
@@ -199,6 +198,17 @@ class AiTradeSession:
     def poll_interval_s(self) -> int:
         return self.executor.settings.live_auto_poll_interval_s
 
+    # F0：计数迁入 `ProfitGuardRuntime` 后，既有读点（finalize 的 aiStats / 用例）零改动地继续走这里。
+    @property
+    def profit_guard_exits(self) -> int:
+        """**实际产生了平仓成交**的保护触发次数（事件级，P1-1）。"""
+        return self._guard.exits
+
+    @property
+    def profit_guard_armed_rounds(self) -> int:
+        """快照曾 armed/breakeven_armed 的轮数（轮级，P2-2；与 exits 不可换算）。"""
+        return self._guard.armed_rounds
+
     # ---------- fan-out ----------
     def subscribe(self) -> asyncio.Queue:
         q: asyncio.Queue = asyncio.Queue(maxsize=1000)
@@ -228,6 +238,9 @@ class AiTradeSession:
                 trade = event["data"]
                 if trade.get("side") == "close":
                     self._position_seq += 1     # 任一平仓成交 = 一个持仓周期终结
+                    if "peakPnlUsd" not in trade:      # 绝不用 setdefault（P2-7：恒求值实参 ⇒
+                        # 键已存在时也会把峰值消费掉，让下一笔平仓静默拿到 None）
+                        trade["peakPnlUsd"] = self._guard.take_peak_pnl()
                 self._inject_explain_meta(trade)
                 await self._persist_trade(trade)
             await self._push(event)
@@ -372,6 +385,7 @@ class AiTradeSession:
         # 利润保护先于会话止盈（§2.5）：一次保护性平仓可能正好把会话累计盈亏推过 TP，随后
         # `_maybe_session_exit` 自然停会话；反序则会先停会话、保护层再无机会锁住这笔利润。
         await self._maybe_profit_exit(now_ts)
+        await self._expire_profit_cooldown()
         await self._maybe_session_exit(mark, now_ts)
         await self._maybe_interval_wake()
 
@@ -501,6 +515,10 @@ class AiTradeSession:
             return
         row = self._window.append_confirmed(candle)
         self._last_candle_wall = self._last_px_wall = time.time()
+        # F1（§2.1.2）：ATR 是波动**尺度**，只在确认根刷新（允许滞后一根）；不可用 ⇒ None ⇒
+        # 上下界整体不生效，退化为纯阶梯回吐（与本层 fail-open 极性一致）。
+        self._atr_px = safe_atr(self._window.base_df(),
+                                self.executor.settings.ai_trade_profit_guard_atr_period)
         decision_as_of_ts = int(candle.ts) + BAR_SECONDS[self.bar]
         await self._window.maybe_refresh_htf(decision_as_of_ts)
         frames = self._window.build_strategy_frames()
@@ -548,6 +566,8 @@ class AiTradeSession:
             # **之前**（被否轮此时已是 hold，反思对 hold 本就直通 ⇒ 自动零 LLM 成本，P1-2）。
             decision, degrade = await self._apply_base_rule_gate(
                 round_no, ts, payload, decision, degrade)
+            # ★ 利润保护冷却门禁（adaptive §2.2.2）：铁律后、共识前（见 _apply_profit_cooldown_gate）。
+            decision, degrade = self._apply_profit_cooldown_gate(decision, degrade)
             decision, degrade = self._apply_consensus_gate(decision, consensus, degrade)  # E2 门禁
             # 二次反思（ReAct 复核，仅交易意愿触发；只会更保守）——共识门禁后、真实执行前。
             # F2（hold-inertia-fix）：第三元 reflection_note 保真「提议了什么、为何被否决」。
@@ -601,7 +621,8 @@ class AiTradeSession:
             signalBoard=trace["signalBoard"], marketContext=trace["marketContext"],
             multiTimeframeContext=trace["multiTimeframeContext"],
             consensus=trace["consensus"], marketDigest=trace["marketDigest"],
-            trigger=trace["trigger"], profitGuard=trace["profitGuard"]))
+            trigger=trace["trigger"], profitGuard=trace["profitGuard"],
+            profitGuardCooldown=trace["profitGuardCooldown"]))
 
     # ---------- 下单前二次反思编排（ai-trade-pre-trade-reflection §2.3；精简，装配下沉 trace.py）----------
     async def _reflect_before_execute(self, round_no: int, ts: int, payload: dict,
@@ -896,53 +917,27 @@ class AiTradeSession:
         snap = self._refresh_profit_state(time.time())
         return pos if snap is None else {**pos, "profitGuard": snap}
 
-    def _position_facts(self, now_wall: float) -> PositionFacts:
-        """读取一次评估所需的持仓 / 行情断面（判定价恒取 `_current_px()`，绝不取确认根收盘价）。"""
-        ex = self.executor
-        tp_px, sl_px, oco_source = self._exchange_oco_px(ex.projected)
-        return PositionFacts(
-            seq=self._position_seq, side=ex.projected, entry_px=ex.entry_price,
-            leverage=ex.leverage, qty_coin=ex.entry_qty_sz * ex.ct_val,
-            mark_px=self._current_px(), now_wall=now_wall,
-            # barsInPosition **仅供展示**，绝不参与判定（时钟单一性，§2.2）。
-            bars_in_position=(self._last_bar_index - ex.entry_bar) if ex.entry_bar >= 0 else None,
-            exchange_tp_px=tp_px, exchange_sl_px=sl_px, exchange_oco_source=oco_source,
-            px_age_s=(max(0.0, now_wall - self._last_px_wall) if self._last_px_wall > 0 else 0.0))
-
-    def _exchange_oco_px(self, side: str) -> tuple[float | None, float | None, str]:
-        """交易所侧兜底 OCO 触发价（P1-4）：**首选最近一笔开仓成交回执**，取不到才只读转发现算。
-
-        限价成交路径下 `entry_price` 被 `_adopt_fill` 置为真实成交价 `avgPx`，而随单 OCO 是按**挂单价**
-        附的——照 `entry_price` 现算会得到一个交易所侧根本不存在的价。`_make_trade` 已把下单时的真实
-        触发价如实落进 trade，那才是事实真源。
-        """
-        for trade in reversed(self.executor.trades):
-            if trade.get("side") not in ("long", "short"):
-                continue
-            tp_px, sl_px = trade.get("takeProfitPrice"), trade.get("stopLossPrice")
-            if tp_px is not None or sl_px is not None:
-                return tp_px, sl_px, "trade"
-            break        # 最近一笔开仓确实没挂 OCO：现算也只会得到同样的空，不再回溯更早的持仓
-        tp_px, sl_px = self.executor.risk_trigger_px(side, self.executor.entry_price)
-        return tp_px, sl_px, "derived"
+    def _session_readings(self, now_wall: float) -> SessionReadings:
+        """把会话侧的六个时钟 / 断面读数打包（F1：ATR 只进上下界计算，绝不参与触发判定，G-5）。"""
+        return SessionReadings(
+            seq=self._position_seq, now_wall=now_wall, mark_px=self._current_px(),
+            bar_index=self._last_bar_index,
+            px_age_s=(max(0.0, now_wall - self._last_px_wall) if self._last_px_wall > 0 else 0.0),
+            atr_px=self._atr_px)
 
     def _refresh_profit_state(self, now_wall: float) -> dict | None:
-        """推进 epoch / 峰值价并组装 wire 快照（**纯同步、无 await**）；未装配或无持仓 → None。
+        """组装本轮持仓断面并交给 `ProfitGuardRuntime.refresh`；未装配或无持仓 → None。
 
-        epoch 身份判定与峰值单调推进全部委托 `profit_guard.advance_state`（§2.3.1 的 `(side, seq)`）；
-        fail-open 前置校验委托 `unavailable_reason_for`，其结论如实进快照而非被静默吞掉。
+        F0 之后本方法只剩「有没有仓 → 组装 facts → 委托运行时」三步；epoch 身份判定、峰值推进与
+        fail-open 前置校验全部在纯核心里（`advance_state` / `unavailable_reason_for`）。
         """
         if self.profit_rule is None:
             return None
         if self.executor.projected == "flat":
-            self._profit_state = None
+            self._guard.clear_state()
             return None
-        facts = self._position_facts(now_wall)
-        reason = unavailable_reason_for(facts, self.profit_rule, px_age_s=facts.px_age_s,
-                                        stale_feed=self._stale_degraded)
-        self._profit_state = advance_state(self._profit_state, facts)
-        return build_snapshot(self.profit_rule, self._profit_state, facts,
-                              unavailable_reason=reason)
+        facts = build_position_facts(self.executor, self._session_readings(now_wall))
+        return self._guard.refresh(facts, stale_feed=self._stale_degraded)
 
     async def _maybe_profit_exit(self, ts: int) -> None:
         """确定性利润保护：峰值回吐 / 保本 / 硬止盈触发即市价平仓（§2.5）。
@@ -979,7 +974,10 @@ class AiTradeSession:
             pos_side=snap.get("side") or "", trigger_label=verdict.label,
             entry_price=snap.get("entryPx") or 0.0, exit_price=px,
             peak_pnl=snap.get("peakUnrealizedPnlUsd"),
-            giveback_ratio=snap.get("givebackRatio"), pnl=snap.get("unrealizedPnlUsd"))
+            giveback_ratio=snap.get("givebackRatio"), pnl=snap.get("unrealizedPnlUsd"),
+            # 只传**规则量**断面：捕获率是成交后量，此刻 trade.pnl 尚不存在（P1-5）。
+            trail={"givebackPctEffective": snap.get("givebackPctEffective"),
+                   "trailBasis": snap.get("trailBasis")})
         async with self._exec_lock:
             if self.state != "running" or self.executor.projected == "flat":
                 return None       # LLM 决策轮可能在等锁期间已平仓——目的已达成，复检非防御性噪音
@@ -998,17 +996,25 @@ class AiTradeSession:
         closed = any(e.get("type") == "trade" and (e.get("data") or {}).get("side") == "close"
                      for e in events)
         if closed:
-            self.profit_guard_exits += 1
-            self._profit_hold_streak = 0      # 该仓已不存在，连续盈利持有链条终结（§2.6 c）
-            self._profit_state = None
-            self._pending_protect_note = {**verdict.note, "ts": int(ts)}
+            self._guard.exits += 1
+            self._guard.hold_streak = 0       # 该仓已不存在，连续盈利持有链条终结（§2.6 c）
+            self._guard.clear_state()
+            self._guard.pending_protect_note = {**verdict.note, "ts": int(ts)}
+            # F2（§2.2.1）：**只有保护层自己确实平掉了一笔**才开启冷却（Agent 主动 close / 会话级
+            # 止盈止损 / 外部平仓一律不开启——冷却是补偿，不是对模型正常交易的惩罚）。
+            self._guard.start_cooldown(side=str(verdict.note.get("side") or ""),
+                                       reason_code=verdict.reason_code, label=verdict.label,
+                                       now_wall=time.time())
             await self._push({"type": "status", "data": {
                 **self._status_payload(),
-                "message": f"利润保护触发（{verdict.label}）：已市价平仓锁定利润"}})
+                # §六.1b / P0-1：措辞一律由 pnl **符号**派生。硬编码「锁定利润」在保本线触发、硬止盈
+                # 滑点不利、或 ATR 下界把线压到入场价附近时都会说谎。
+                "message": (f"利润保护触发（{verdict.label}）：已市价平仓，"
+                            f"{describe_exit_outcome(verdict.note.get('pnlUsd'))}")}})
             return
-        if self._profit_exit_warned_seq == self._position_seq:
+        if self._guard.warned_seq == self._position_seq:
             return                            # P2-8：每个持仓周期至多推一条 warn，避免 5s 刷屏
-        self._profit_exit_warned_seq = self._position_seq
+        self._guard.warned_seq = self._position_seq
         await self._push({"type": "status", "data": {
             **self._status_payload(),
             "message": (f"利润保护已触发（{verdict.label}）但本次平仓未成交，"
@@ -1016,44 +1022,32 @@ class AiTradeSession:
 
     def _update_profit_hold_streak(self, stage1_action: str, stage1_degrade: str | None,
                                    snapshot: dict | None) -> None:
-        """连续「浮盈状态下继续持有」计数（§2.6 c 的逐分支枚举，不留二义）。
-
-        与 `_update_hold_streak` 同以**第一阶段**决策为准（共识门禁 / 反思之前）：非 hold ⇒ 归零；
-        hold 且降级 ⇒ 不变（既非真实观望也非交易意愿）；hold 无降级则按当前浮盈正负 +1 / 归零。
-        """
-        if stage1_action != "hold":
-            self._profit_hold_streak = 0
-            return
-        if stage1_degrade is not None:
-            return
-        return_pct = (snapshot or {}).get("returnPct")
-        if return_pct is not None and return_pct > 0:
-            self._profit_hold_streak += 1
-        else:
-            self._profit_hold_streak = 0
+        """连续「浮盈状态下继续持有」计数（F0：判定下沉运行时，调用点与语义零变化）。"""
+        self._guard.update_hold_streak(stage1_action, stage1_degrade, snapshot)
 
     def _inject_profit_guard(self, payload: dict) -> None:
-        """把保护快照与一次性平仓回执注入本轮 payload（未装配 ⇒ **整键缺席** ⇒ prompt 逐字节回退）。
+        """注入保护快照 / 一次性回执 / 冷却视图（F0 下沉运行时）；未装配 ⇒ 整键缺席 ⇒ prompt 逐字回退。"""
+        now_wall = time.time()
+        self._guard.inject(
+            payload, self._refresh_profit_state(now_wall),
+            note_after_rounds=self.executor.settings.ai_trade_profit_guard_note_after_rounds,
+            now_wall=now_wall)
 
-        [P1-7] `lastExit` **读取即消费**：它是一次性事件回执，若只写不清会每轮都注入同一条早已过去的
-        强平，并经 `commit_round` 反复写进 `_context`/`_journal`——既污染上下文窗口，又会让模型误以为
-        自己反复被强平。这与每轮重算的 `holdStreak` 注入范式不同，勿照抄。
+    def _apply_profit_cooldown_gate(self, decision: TradeDecision,
+                                    degrade: str | None) -> tuple[TradeDecision, str | None]:
+        """★ 利润保护冷却门禁（F2 §2.2.2）：铁律**之后**、共识**之前**，`degrade or reason` 先手胜出。
+
+        排在共识之前，是因为冷却是**本系统刚刚亲手做过的动作**的直接后果，解释力强于共识票数；
+        三个豁免动作由 `apply_profit_cooldown` 纯核心保证，此处不复判。
         """
-        if self.profit_rule is None:
-            return
-        snap = self._refresh_profit_state(time.time())
-        note, self._pending_protect_note = self._pending_protect_note, None
-        if snap is None and note is None:
-            return
-        # 平仓后已 flat 但仍欠一条回执时，用空壳快照承载它——否则模型永远不知道仓位为何消失。
-        wire = dict(snap) if snap is not None else build_idle_snapshot(self.profit_rule)
-        wire["lastExit"] = note
-        if wire.get("status") in ARMED_STATUSES:
-            self.profit_guard_armed_rounds += 1      # 轮级口径（P2-2），与事件级 exits 不可换算
-        payload["profitGuard"] = wire
-        threshold = self.executor.settings.ai_trade_profit_guard_note_after_rounds
-        if threshold > 0 and self._profit_hold_streak >= threshold:
-            payload["profitHoldRounds"] = self._profit_hold_streak
+        decision, reason = apply_profit_cooldown(decision, self._guard.cooldown,
+                                                 now_wall=time.time())
+        return decision, degrade or reason
+
+    async def _expire_profit_cooldown(self) -> None:
+        """冷却到期主动补推一次 `status`（§4.2）——不推则前端 chip 会一直挂着（后端已不再拦，UI 却说在拦）。"""
+        if self._guard.expire_cooldown(time.time()):
+            await self._push({"type": "status", "data": self._status_payload()})
 
     # ---------- decision / summary 事件 ----------
     def _build_decision_payload(self, round_no: int, ts: int, ref_px: float,
@@ -1086,8 +1080,7 @@ class AiTradeSession:
         if self.base_rule is not None:
             payload["baseRules"] = {
                 "maBand": build_ma_band(self._window.base_df(), self.base_rule)}
-        # 利润保护快照 + 一次性平仓回执（§2.6 b/d）：未装配 ⇒ 整键缺席 ⇒ prompt 与回测 payload 逐字节回退。
-        self._inject_profit_guard(payload)
+        self._inject_profit_guard(payload)      # §2.6 b/d：未装配 ⇒ 整键缺席 ⇒ prompt 逐字回退
         return payload
 
     def _build_multi_timeframe_context(self, ts: int, ref_px: float) -> dict | None:
@@ -1219,6 +1212,9 @@ class AiTradeSession:
                 "wakeIntervalMinutes": self._wake_interval_minutes(),
                 "wakeSkips": self.wake_skips,
                 "holdStreak": self.hold_streak,
+                # F2 冷却三载体之一（§4.2）：**不挂 position**——冷却期内按定义已无持仓。
+                "profitGuardCooldown": build_cooldown_view(self._guard.cooldown,
+                                                           now_wall=time.time()),
                 "stopReason": self.stop_reason,
                 "degraded": self.executor.degraded or self._stale_degraded or self.degraded,
                 "flattenFailed": self.flatten_failed, "residual": self.residual}

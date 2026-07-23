@@ -72,11 +72,21 @@ def _pair_round_trips(trades: list[Trade]) -> list[tuple[Trade, Trade]]:
 
 
 def _summarize_pairs(pairs: list[tuple[Trade, Trade]], total_budget_usd: float) -> dict:
-    """汇总往返（口径同前端 summarizeRoundTrips）：realized=Σexit.pnl、winRate、best/worst（无样本 0）。"""
+    """汇总往返（口径同前端 summarizeRoundTrips）：realized=Σexit.pnl、winRate、best/worst（无样本 0）。
+
+    另出**利润捕获率**五键（ai-trade-profit-protection-adaptive §2.4.3，口径同前端
+    ``summarizeProfitCapture`` 且公式逐字对应）：``captureRatio = Σrealized / Σpeak``，只统计
+    ``peak > 0`` 的往返；``peak`` 缺失（保护层未装配 / 老库缺列）或 ≤0（全程未浮盈）的往返计入
+    ``noPeakCount`` 单列，**不进分母**——把它们按 0 计入会让捕获率变成 0 或 ∞。
+    """
     realized = 0.0
     wins = 0
     best = 0.0
     worst = 0.0
+    peak_total = 0.0
+    captured_total = 0.0
+    capture_pairs = 0
+    no_peak = 0
     for _entry, exit_trade in pairs:
         pnl = exit_trade.pnl or 0.0
         realized += pnl
@@ -86,6 +96,13 @@ def _summarize_pairs(pairs: list[tuple[Trade, Trade]], total_budget_usd: float) 
             best = pnl
         if pnl < worst:
             worst = pnl
+        peak = getattr(exit_trade, "peak_pnl", None)   # 老库缺列读到 None 而非 AttributeError
+        if peak is not None and peak > 0:
+            peak_total += float(peak)
+            captured_total += pnl
+            capture_pairs += 1
+        else:
+            no_peak += 1
     count = len(pairs)
     return {
         "realizedPnlUsd": realized,
@@ -94,6 +111,11 @@ def _summarize_pairs(pairs: list[tuple[Trade, Trade]], total_budget_usd: float) 
         "winRate": wins / count if count > 0 else 0.0,
         "bestUsd": best,
         "worstUsd": worst,
+        "peakPnlUsd": peak_total,
+        "capturedPnlUsd": captured_total,
+        "captureRatio": captured_total / peak_total if peak_total > 0 else 0.0,
+        "capturePairs": capture_pairs,
+        "noPeakCount": no_peak,
     }
 
 

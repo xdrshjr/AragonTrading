@@ -1,6 +1,10 @@
 // AI 自动交易 · 回测模式 wire 类型（camelCase，与后端 schemas.py 的 AiBacktest* 同构）。
 // 决策/摘要复用 aiTradeTypes 的 AiTradeDecision；aiBacktestJobId 为瞬态（store 不入 partialize，GET 重发现）。
-import type { AiTradeBaseRules, AiTradeDecision } from "./aiTradeTypes";
+import type {
+  AiTradeBaseRules,
+  AiTradeDecision,
+  AiTradeProfitGuardRule,
+} from "./aiTradeTypes";
 import type { EquityPoint, Metrics, Trade } from "./types";
 
 export type AiBacktestPhase = "loading" | "priming" | "running" | "finalizing";
@@ -26,6 +30,9 @@ export interface AiBacktestStartReq {
   // 【基础策略】铁律：与实盘同字段同语义、同一服务端解析——实盘与回测的默认必须一致，否则用回测调出
   // 的参数在实盘直接失真（ai-trade-base-strategy-ma-band P1-4）。
   baseRules?: AiTradeBaseRules | null;
+  // 利润保护层：本轮 F3 起回测也接该字段（bar 内 OHLC 极值 + 保守成交序，不再是收盘价近似）。
+  // 与实盘同一服务端解析点；运维总闸关闭时服务端恒不装配，结果 notes 会写明保守近似免责。
+  profitGuard?: AiTradeProfitGuardRule | null;
 }
 
 export interface AiBacktestStartResult {
@@ -54,6 +61,12 @@ export interface AiBacktestAiStats {
   decisionEveryBars: number;
   plannedRounds: number;
   reachedRoundCap: boolean;
+  // F3：回测里保护层**实际产生平仓成交**的次数（与实盘 aiStats 同名同义）；未装配的回测恒 0，
+  // 老结果缺该键 ⇒ 读点一律按 0 兜底。
+  profitGuardExits?: number;
+  // 本次回测是否真的装配了保护层：`profitGuardExits` 未装配时也是 0，只凭它分不出「装了没触发」与
+  // 「压根没装」。保护层的免责卡片一律以这一键门控，绝不在没有保护层的回测上宣称有防线。
+  profitGuardEnabled?: boolean;
 }
 
 // 进度事件（驱动进度头 / 滚动权益迷你图）。

@@ -7,6 +7,7 @@ import AutoTradeRoundTripRow from "@/components/Chart/AutoTradeRoundTripRow";
 import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
 import { Badge, Button, Skeleton } from "@/components/ui";
 import { buildRoundTrips, type RoundTrip } from "@/lib/autoTradePnl";
+import { formatProfitCapture, PROFIT_CAPTURE_HINT } from "@/lib/aiTradeCapture";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
 import type { AiTradeHistoryDetailOut, AiTradeHistoryMember } from "@/lib/aiTradeHistoryTypes";
 import { type AiObservability, aggregateAiObservability } from "@/lib/aiTradeObservability";
@@ -139,6 +140,23 @@ function KpiGrid({ summary }: { summary: AiTradeHistoryDetailOut["summary"] }) {
         <Kpi label="胜率" value={fmtPct(summary.winRate)} />
         <Kpi label="最大单笔盈" value={signed(summary.bestUsd)} color={colorForReturn(summary.bestUsd)} />
         <Kpi label="最大单笔亏" value={signed(summary.worstUsd)} color={colorForReturn(summary.worstUsd)} />
+      </div>
+      {/* F4 利润捕获率：**取后端 summary 的聚合值，不在前端重算历史**（两份实现必然漂移；实时页
+          才用前端纯函数）。老会话 / 老库缺列时后端下发全 0 ⇒ 走同一条「样本不足」降级路径。 */}
+      <div className="flex flex-col gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2">
+        <div className="flex items-center justify-between gap-2 text-xs">
+          <span className="text-[var(--muted)]">利润捕获率</span>
+          <span className="tabular font-semibold text-[var(--text)]" data-testid="ai-profit-capture">
+            {formatProfitCapture({
+              peakPnlUsd: summary.peakPnlUsd ?? 0,
+              capturedPnlUsd: summary.capturedPnlUsd ?? 0,
+              captureRatio: summary.captureRatio ?? 0,
+              capturePairs: summary.capturePairs ?? 0,
+              noPeakCount: summary.noPeakCount ?? 0,
+            })}
+          </span>
+        </div>
+        <p className="text-[10px] leading-relaxed text-[var(--muted)]">{PROFIT_CAPTURE_HINT}</p>
       </div>
     </div>
   );

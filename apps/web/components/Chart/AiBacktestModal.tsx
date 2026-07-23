@@ -5,7 +5,12 @@ import { useState } from "react";
 import { Badge, Button, Modal, Tabs } from "@/components/ui";
 import MetricsCards from "@/components/Strategy/MetricsCards";
 import TradesTable from "@/components/Strategy/TradesTable";
-import { BenchmarkCompareCard, ExtendedMetricsGrid, KPIHero } from "./aiBacktest/panels";
+import {
+  BenchmarkCompareCard,
+  ExtendedMetricsGrid,
+  KPIHero,
+  ProfitGuardBacktestCard,
+} from "./aiBacktest/panels";
 import { PeriodReturnBars, UnderwaterChart } from "./aiBacktest/charts";
 import {
   actionDistribution,
@@ -416,6 +421,10 @@ function AiDecisionTab({ result, timeline }: { result: NonNullable<BacktestResul
   return (
     <div className="flex flex-col gap-4">
       <AiStatsCard result={result} />
+      <ProfitGuardBacktestCard
+        enabled={result.aiStats.profitGuardEnabled}
+        exits={result.aiStats.profitGuardExits}
+      />
       <section className="flex flex-col gap-1">
         <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">动作分布</span>
         <ActionBars counts={result.aiStats.actionCounts} />

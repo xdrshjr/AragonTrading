@@ -34,6 +34,14 @@ export interface AiTradeHistorySummary {
   winRate: number;
   bestUsd: number;
   worstUsd: number;
+  // 利润捕获率五键（ai-trade-profit-protection-adaptive §2.4.3）：与前端 summarizeProfitCapture
+  // 公式逐字对应。**历史页一律取后端这份，不在前端重算**（老库缺列时后端已按 getattr 降级为 0）。
+  // 老后端不下发这五键 ⇒ 读点一律 `?? 0` 兜底，故全部可选。
+  peakPnlUsd?: number;
+  capturedPnlUsd?: number;
+  captureRatio?: number;
+  capturePairs?: number;
+  noPeakCount?: number;
 }
 
 // metrics_json 解析（全可选，缺失即优雅降级——崩溃 / 对账会话没有富化字段）。

@@ -59,7 +59,8 @@ async def _seed_spec():
 
 
 def _spec(sid, paper_spec, candles, *, every=40, refresh=3, max_rounds=400,
-          tp_usd=None, sl_usd=None, reflection_enabled=False) -> AiBacktestSpec:
+          tp_usd=None, sl_usd=None, reflection_enabled=False,
+          profit_rule=None) -> AiBacktestSpec:
     start_ts = candles[60]["ts"]          # 前 60 根作暖机（regime min_bars=60），用户区间自 60 起
     end_ts = candles[-1]["ts"]
     return AiBacktestSpec(
@@ -69,7 +70,7 @@ def _spec(sid, paper_spec, candles, *, every=40, refresh=3, max_rounds=400,
         take_profit_usd=tp_usd, stop_loss_usd=sl_usd, context_refresh_rounds=refresh,
         min_consensus=0, planned_rounds=6,
         settings=Settings(ai_backtest_max_rounds=max_rounds), rest=object(), provider=object(),
-        reflection_enabled=reflection_enabled)
+        reflection_enabled=reflection_enabled, profit_rule=profit_rule)
 
 
 def _patch_loaders(monkeypatch, candles, llm):
@@ -532,5 +533,111 @@ async def test_backtest_without_base_rule_is_unchanged(monkeypatch):
         assert runner.base_rule is None
         assert not [d for d in runner._decisions_digest
                     if (d.get("degradeReason") or "").startswith("base_rule_")]
+    finally:
+        await dispose_engine()
+
+
+# ============ F3 回测接入利润保护（ai-trade-profit-protection-adaptive §2.3 / §7.3-5）============
+def _pg_rule(**over):
+    from app.ai_auto.profit_guard import ProfitGuardRule
+
+    base = {"arm_return_pct": 0.001, "giveback_pct": 0.2, "breakeven_arm_return_pct": 0.0,
+            "min_hold_s": 0.0}
+    base.update(over)
+    return ProfitGuardRule(**base)
+
+
+async def test_profit_rule_none_keeps_backtest_byte_identical(monkeypatch):
+    """G-3：`profit_rule=None`（既有直构造用例）⇒ 保护层全路径空转，payload / notes / 统计逐字回退。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        llm = _StubLLM(_alternating)
+        _patch_loaders(monkeypatch, candles, llm)
+        runner = AiBacktestRunner(_spec(sid, paper, candles))
+        job = _BacktestJob("aibt_off", runner)
+        await runner.run(job)
+
+        result = job.result
+        assert result["aiStats"]["profitGuardExits"] == 0
+        # RV-1：未装配必须**可分辨**——只看 exits==0 分不出「装了没触发」，UI 会照挂免责卡片。
+        assert result["aiStats"]["profitGuardEnabled"] is False
+        assert all("利润保护" not in note for note in result["notes"])
+        assert runner._guard_state is None and runner._cooldown is None
+        assert runner._atr_series is None                 # 未装配时连 ATR 都不算
+        assert "profitGuard" not in runner._run_config() or runner._run_config()["profitGuard"] is None
+    finally:
+        await dispose_engine()
+
+
+async def test_assembled_profit_rule_fires_and_notes_the_conservative_caveat(monkeypatch):
+    """装配后：跑出保护性平仓（`profitGuardExits > 0`）+ notes 带 §2.3.5 免责 + config 可复现参数。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        llm = _StubLLM(lambda call: (
+            {"action": "open_long", "sizeFraction": 0.5, "confidence": 0.8, "reason": "r"}
+            if call == 1 else {"action": "hold", "reason": "h"}))
+        _patch_loaders(monkeypatch, candles, llm)
+        runner = AiBacktestRunner(_spec(sid, paper, candles, profit_rule=_pg_rule()))
+        job = _BacktestJob("aibt_on", runner)
+        await runner.run(job)
+
+        result = job.result
+        assert result["aiStats"]["profitGuardExits"] > 0
+        assert result["aiStats"]["profitGuardEnabled"] is True
+        assert any("bar 内极值保守近似" in note for note in result["notes"])
+        assert any("不得据此推断实盘一定更好或更差" in note for note in result["notes"])
+        guard_cfg = runner._run_config()["profitGuard"]
+        assert guard_cfg is not None and guard_cfg["givebackPct"] == 0.2
+        # 保护平仓的成交理由是保护码本身（绝不借 stop_loss 的手平仓，归因不撒谎）。
+        assert any(t["reason"].startswith("profit_guard_")
+                   for t in result["trades"] if t["side"] == "close")
+    finally:
+        await dispose_engine()
+
+
+async def test_atr_series_uses_previous_bar_and_degrades_on_nan(monkeypatch):
+    """无未来函数：第 i 根取 `iloc[i-1]`；`i-1<0` 或 NaN（暖机不足）⇒ None ⇒ 上下界整体不生效。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        llm = _StubLLM(lambda _call: {"action": "hold", "reason": "h"})
+        _patch_loaders(monkeypatch, candles, llm)
+        runner = AiBacktestRunner(_spec(sid, paper, candles, profit_rule=_pg_rule()))
+        job = _BacktestJob("aibt_atr", runner)
+        await runner.run(job)
+
+        import pandas as pd
+        from app.engine.indicators import atr
+
+        expected = atr(candles_to_df(candles), 14)
+        assert runner._atr_series is not None
+        assert runner._atr_at(0) is None                       # i-1 < 0
+        assert runner._atr_at(5) is None                       # min_periods=14 前恒 NaN
+        assert pd.isna(expected.iloc[4])
+        assert runner._atr_at(100) == expected.iloc[99]        # 严格取上一根
+    finally:
+        await dispose_engine()
+
+
+async def test_backtest_cooldown_gate_composes_three_reasons(monkeypatch):
+    """§2.3.3a：冷却门禁与实盘**同一纯函数**、落在铁律与共识之间，`gate_reason` 三元合成。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        llm = _StubLLM(lambda _call: {"action": "open_long", "sizeFraction": 0.5,
+                                      "confidence": 0.8, "reason": "r"})
+        _patch_loaders(monkeypatch, candles, llm)
+        runner = AiBacktestRunner(_spec(sid, paper, candles, every=1,
+                                        profit_rule=_pg_rule(cooldown_s=36_000.0)))
+        job = _BacktestJob("aibt_cool", runner)
+        await runner.run(job)
+
+        degraded = [d for d in job.result["decisionsDigest"]
+                    if (d.get("degradeReason") or "").startswith("profit_cooldown(")]
+        assert degraded, "保护平仓后的同向开仓必须被冷却门禁降级为 hold"
+        assert all(d["action"] == "hold" for d in degraded)
+        assert job.result["aiStats"]["degradedRounds"] >= len(degraded)
     finally:
         await dispose_engine()

@@ -194,3 +194,39 @@ describe("AiTradePanel · 利润保护行", () => {
   });
 });
 
+// 冷却 chip 的门控是 `member.profitGuardCooldown`（与 position 平级），**不是** position 之下的
+// 快照：冷却期内按定义已无持仓，挂在 position 之下这枚 chip 永远不会出现（adaptive §4.2 / P1-4）。
+describe("AiTradePanel · 利润保护冷却 chip", () => {
+  const COOLDOWN = {
+    activeUntilTs: 1_700_000_180,
+    remainingSeconds: 120,
+    scope: "same_side" as const,
+    blockedSide: "long" as const,
+    reasonCode: "profit_guard_trailing",
+    label: "移动止盈",
+  };
+
+  it("平仓后（position 为 null）仍渲染冷却 chip，含剩余时间与豁免范围", () => {
+    const group = makeGroup([makeSession("BTC-USDT-SWAP", { positionSide: "flat" })]);
+    group.members["BTC-USDT-SWAP"].profitGuardCooldown = COOLDOWN;
+    useAppStore.setState({ aiTradeGroup: group });
+    render(
+      <AiTradePanel rows={ROWS} active="BTC-USDT-SWAP" livePrice={null} changePct={null} onSelect={noop} />,
+    );
+    const chip = screen.getByTestId("ai-profit-cooldown");
+    expect(chip).toHaveTextContent("120s");
+    expect(chip).toHaveTextContent("暂停做多开仓（反向不受影响）");
+    expect(chip).toHaveTextContent("平仓不受限");
+  });
+
+  it("冷却已到期 / 未激活 → chip 不渲染（后端到期会主动补推一次 status 把它摘掉）", () => {
+    const group = makeGroup([makeSession("BTC-USDT-SWAP", { positionSide: "flat" })]);
+    group.members["BTC-USDT-SWAP"].profitGuardCooldown = { ...COOLDOWN, remainingSeconds: 0 };
+    useAppStore.setState({ aiTradeGroup: group });
+    render(
+      <AiTradePanel rows={ROWS} active="BTC-USDT-SWAP" livePrice={null} changePct={null} onSelect={noop} />,
+    );
+    expect(screen.queryByTestId("ai-profit-cooldown")).not.toBeInTheDocument();
+  });
+});
+

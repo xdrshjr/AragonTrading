@@ -23,6 +23,7 @@ from ..okx.rest_client import get_rest_client
 from ..paper.strategy_factory import PaperStrategySpec
 from .backtest import AiBacktestRunner, AiBacktestSpec, _BacktestJob
 from .base_rules import MaBandRule
+from .profit_guard import ProfitGuardRule
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,9 @@ class AiBacktestStartRequest:
     # 【基础策略】MA 通道开单铁律（默认 None=不装配，直接构造该 dataclass 的既有测试零回归）；
     # 「缺省即开启」由 API 层 `_resolve_base_rules` 单点解析，与实盘同一函数、同一默认（P1-4/P1-5）。
     base_rule: MaBandRule | None = None
+    # 利润保护层（adaptive §3.1/P1-1）：同样默认 None=不装配。**不透传就是整条断路**——API 层解析出的
+    # 规则到不了 runner，F3 全部代码都在但永不生效（跑不出错、功能静默缺失）。
+    profit_rule: ProfitGuardRule | None = None
 
 
 class AiBacktestManager:
@@ -133,7 +137,8 @@ class AiBacktestManager:
             planned_rounds=planned, settings=settings, rest=get_rest_client(), provider=provider,
             position_step_pct=req.position_step_pct,
             reflection_enabled=settings.ai_trade_reflection_enabled,   # RV-1：生产回测显式开（默认 True）
-            base_rule=req.base_rule)                                   # 【基础策略】与实盘同源（P1-4）
+            base_rule=req.base_rule,                                   # 【基础策略】与实盘同源（P1-4）
+            profit_rule=req.profit_rule)                               # 利润保护层与实盘同源（F3）
 
     # ---------- 前置门禁辅助 ----------
     @staticmethod

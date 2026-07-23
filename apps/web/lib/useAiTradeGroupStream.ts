@@ -31,6 +31,8 @@ export function groupStateFromStatus(row: AiTradeGroupRow): AiTradeGroupState {
       session: m,
       trades: [],
       position: null,
+      // 冷却期与 position 平级：平仓后 position 恒 null，挂在它之下 chip 永远拿不到数据（§4.2）。
+      profitGuardCooldown: null,
       decisions: m.lastDecision ? [m.lastDecision] : [],
       traces: [],
       summary: m.contextSummary ?? null,

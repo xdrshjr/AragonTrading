@@ -1,7 +1,12 @@
 "use client";
 
 import { Badge } from "@/components/ui";
-import { describeProfitGuardFallback, describeProfitGuardStatus } from "@/lib/aiTrade";
+import {
+  describeProfitGuardCooldown,
+  describeProfitGuardFallback,
+  describeProfitGuardStatus,
+  describeProfitGuardTrail,
+} from "@/lib/aiTrade";
 import { colorForReturn, fmtMoney, fmtNum, fmtPct, fmtPrice } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 import type { AiTradeGroupMemberState, ProfitGuardSnapshot } from "@/lib/aiTradeTypes";
@@ -128,6 +133,7 @@ function MemberRow({
           </span>
         )}
         <ProfitGuardRow guard={guard} />
+        <ProfitGuardCooldownChip member={member} />
       </span>
       <span className="flex shrink-0 items-center gap-2">
         <Badge tone={positionTone(positionSide)}>{describePosition(positionSide)}</Badge>
@@ -165,6 +171,8 @@ function ProfitGuardRow({ guard }: { guard: ProfitGuardSnapshot | null }) {
   const peak = guard.peakUnrealizedPnlUsd;
   const giveback = guard.givebackRatio;
   const exitPx = guard.effectiveExitPx;
+  // 「这条线被谁定住」必须写出来：自适应之后用户已无法心算出这条线，看不懂就不会信它（R-11）。
+  const trail = describeProfitGuardTrail(guard);
   return (
     <span className="tabular truncate text-[10px] text-[var(--muted)]" data-testid="ai-profit-guard">
       峰值 {peak == null ? "—" : `${peak >= 0 ? "+" : ""}${fmtMoney(peak)}`}
@@ -172,6 +180,24 @@ function ProfitGuardRow({ guard }: { guard: ProfitGuardSnapshot | null }) {
       {giveback == null ? "—" : `${(giveback * 100).toFixed(1)}%`}
       {" ｜ 退出线 "}
       {exitPx == null ? "未武装" : `${fmtPrice(exitPx)}（${view.label.replace("利润保护 · ", "")}）`}
+      {trail && <span className="block truncate">{trail}</span>}
+    </span>
+  );
+}
+
+/**
+ * 保护性平仓冷却 chip（adaptive §4.2）。
+ *
+ * 门控**必须**是 `member.profitGuardCooldown != null`，**不得**挂在 `member.position` 之下：冷却期内
+ * 按定义已无持仓（position 恒 null），挂上去这枚 chip 永远不会出现。冷却结束由后端主动补推一次
+ * status（该键为 null）摘掉它——前端不据 remainingSeconds 自行倒计时判真伪（两个时钟必然漂移）。
+ */
+function ProfitGuardCooldownChip({ member }: { member: AiTradeGroupMemberState }) {
+  const text = describeProfitGuardCooldown(member.profitGuardCooldown);
+  if (!text) return null;
+  return (
+    <span className="truncate text-[10px] text-[var(--accent)]" data-testid="ai-profit-cooldown">
+      {text}
     </span>
   );
 }

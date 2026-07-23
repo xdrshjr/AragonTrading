@@ -5,6 +5,7 @@ import type { AccountMode } from "./types";
 import type {
   AiTradeAction,
   AiTradeDecision,
+  AiTradeGivebackTier,
   AiTradeProfitGuardRule,
   AiTradeRoundTrace,
   AiTradeStopReason,
@@ -15,6 +16,7 @@ import type {
   MarketContext,
   MultiTimeframeFrame,
   PriceAction,
+  ProfitGuardCooldown,
   ProfitGuardSnapshot,
   VolumeContext,
 } from "./aiTradeTypes";
@@ -87,6 +89,11 @@ export const AI_TRADE_PROFIT_GUARD_DEFAULTS: {
   breakevenOffsetReturnPct: number;
   minHoldSeconds: number;
   hardTakeProfitReturnPct: number;
+  givebackTiers: AiTradeGivebackTier[];
+  atrFloorMult: number;
+  atrCapMult: number;
+  cooldownSeconds: number;
+  cooldownScope: "same_side" | "both";
 } = {
   enabled: true,
   armReturnPct: 0.05,
@@ -95,7 +102,44 @@ export const AI_TRADE_PROFIT_GUARD_DEFAULTS: {
   breakevenOffsetReturnPct: 0.002,
   minHoldSeconds: 30,
   hardTakeProfitReturnPct: 0,
+  // 与后端 `ai_trade_profit_guard_*` 的默认逐值对齐（弹窗只是回填，真源仍在服务端 config）。
+  givebackTiers: [
+    { peakReturnPct: 0.1, givebackPct: 0.35 },
+    { peakReturnPct: 0.25, givebackPct: 0.28 },
+    { peakReturnPct: 0.5, givebackPct: 0.2 },
+  ],
+  atrFloorMult: 0.8,
+  atrCapMult: 3,
+  cooldownSeconds: 180,
+  cooldownScope: "same_side",
 };
+
+/** 回吐阶梯预设（弹窗下拉；`[]` = 关闭阶梯，退回固定回吐比例）。 */
+export const AI_TRADE_GIVEBACK_TIER_PRESETS: {
+  value: string;
+  label: string;
+  tiers: AiTradeGivebackTier[];
+}[] = [
+  { value: "standard", label: "标准（10%→35%／25%→28%／50%→20%）", tiers: AI_TRADE_PROFIT_GUARD_DEFAULTS.givebackTiers },
+  {
+    value: "tight",
+    label: "激进落袋（10%→28%／25%→20%／50%→12%）",
+    tiers: [
+      { peakReturnPct: 0.1, givebackPct: 0.28 },
+      { peakReturnPct: 0.25, givebackPct: 0.2 },
+      { peakReturnPct: 0.5, givebackPct: 0.12 },
+    ],
+  },
+  {
+    value: "loose",
+    label: "宽松持有（25%→35%／50%→30%）",
+    tiers: [
+      { peakReturnPct: 0.25, givebackPct: 0.35 },
+      { peakReturnPct: 0.5, givebackPct: 0.3 },
+    ],
+  },
+  { value: "off", label: "关闭阶梯（始终用固定回吐比例）", tiers: [] },
+];
 
 const AI_TRADE_STEP_EPS = 1e-9;
 
@@ -399,9 +443,13 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
   { prefix: "base_rule_band_unavailable", label: "基础策略否决：均线通道数据不足，无法验证开单位置" },
   { prefix: "base_rule_ma_band", label: "基础策略否决：开单价不在均线通道上/中/下轨附近" },
   // 利润保护三码：它们不是「降级」而是**系统主动平仓**的成交原因，但同样会出现在成交列表的原因位上。
-  { prefix: "profit_guard_trailing", label: "利润保护：浮盈自峰值回吐超阈，已锁定利润" },
+  // §六.1b：**不写「已锁定利润」**——码本身不含盈亏符号，保本线触发 / 滑点不利时这笔可能打平甚至
+  // 净亏；具体金额由成交行的 pnl 呈现，这里只说触发了什么规则。
+  { prefix: "profit_guard_trailing", label: "利润保护：浮盈自峰值回吐超阈，已按保护线离场" },
   { prefix: "profit_guard_breakeven", label: "利润保护：价格跌回保本线，已离场保住本金" },
   { prefix: "profit_guard_hard_take_profit", label: "利润保护：已达硬止盈目标位" },
+  // 冷却降级码带参数后缀（profit_cooldown(120s,long)），与基础策略同为**前缀**匹配。
+  { prefix: "profit_cooldown", label: "利润保护冷却：刚锁住利润，暂停同向开仓" },
 ];
 
 /**
@@ -436,6 +484,48 @@ export function validateProfitGuard(rule: AiTradeProfitGuardRule): string | null
   }
   if (!Number.isFinite(minHold) || minHold < 0 || minHold > 3600) {
     return "最短持有需为 0~3600 秒";
+  }
+  return validateProfitGuardAdaptive(rule);
+}
+
+/**
+ * 自适应参数校验（阶梯单调性 / ATR 上下界 / 冷却秒），与后端 `AiTradeProfitGuardIn` 的 422 条件一致。
+ *
+ * 阶梯的两条硬约束（阈值严格递增 + 回吐比例单调不增）不是风格偏好：「赚得越多却允许回吐得越多」
+ * 正是本轮要修的 bug 本身，让它通过校验等于把 bug 写进配置。
+ */
+function validateProfitGuardAdaptive(rule: AiTradeProfitGuardRule): string | null {
+  const tiers = rule.givebackTiers ?? [];
+  if (tiers.length > 6) return "回吐阶梯最多 6 档";
+  let prevThreshold = 0;
+  let prevGiveback: number | null = null;
+  for (const tier of tiers) {
+    if (!Number.isFinite(tier.peakReturnPct) || tier.peakReturnPct <= prevThreshold) {
+      return "回吐阶梯的峰值收益阈值需严格递增且首档大于 0";
+    }
+    if (!Number.isFinite(tier.givebackPct) || tier.givebackPct <= 0 || tier.givebackPct > 1) {
+      return "回吐阶梯的回吐比例需为 0~100%";
+    }
+    if (prevGiveback != null && tier.givebackPct > prevGiveback) {
+      return "回吐阶梯的回吐比例需单调不增（赚得越多不可允许回吐更多）";
+    }
+    prevThreshold = tier.peakReturnPct;
+    prevGiveback = tier.givebackPct;
+  }
+  const floorMult = rule.atrFloorMult ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.atrFloorMult;
+  const capMult = rule.atrCapMult ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.atrCapMult;
+  if (!Number.isFinite(floorMult) || floorMult < 0 || floorMult > 10) {
+    return "ATR 下界倍数需为 0~10（0 表示关闭下界）";
+  }
+  if (!Number.isFinite(capMult) || capMult < 0 || capMult > 50) {
+    return "ATR 上界倍数需为 0~50（0 表示关闭上界）";
+  }
+  if (floorMult > 0 && capMult > 0 && floorMult > capMult) {
+    return "ATR 下界倍数不可大于上界倍数";
+  }
+  const cooldown = rule.cooldownSeconds ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.cooldownSeconds;
+  if (!Number.isFinite(cooldown) || cooldown < 0 || cooldown > 86400) {
+    return "冷却秒数需为 0~86400 秒（0 表示关闭冷却）";
   }
   return null;
 }
@@ -496,6 +586,51 @@ export function describeProfitGuardUnavailable(
 ): string {
   const reason = snapshot?.unavailableReason ?? "";
   return PROFIT_GUARD_UNAVAILABLE_LABELS[reason] ?? "数据异常";
+}
+
+const TRAIL_BASIS_SUFFIX: Record<string, string> = {
+  giveback: "",
+  atr_floor: "（已按波动率放宽至下界）",
+  atr_cap: "（已按波动率收紧至上界）",
+  clamped_breakeven: "（已夹至保本线：本层不做劣于保本的出场）",
+};
+
+/**
+ * 移动止盈线的中文化（单点真源，`trailBasis` 由后端下发、前端**不重算**）。
+ *
+ * 五个分支必须各自说清「被谁定住」，否则用户看到一条自己算不出来的线只会更不信任它（R-11）。
+ * `suppressed_at_entry` 是本轮 P0 修复引入的诚实降级态：波动率下界把线推到入场价之下且未启用保本线
+ * ⇒ 整条线作废、本轮不会据它平仓——绝不假装那条线还在。快照缺失 / 未武装 → null（整行不渲染）。
+ */
+export function describeProfitGuardTrail(
+  snapshot: ProfitGuardSnapshot | null | undefined,
+): string | null {
+  if (!snapshot || snapshot.status === "unavailable" || snapshot.status === "flat") return null;
+  if (snapshot.trailBasis === "suppressed_at_entry") {
+    return "移动止盈线本轮作废（波动率下界把它推到了入场价之下，且未启用保本线）——本轮不会据它平仓";
+  }
+  if (snapshot.trailStopPx == null) return null;
+  const giveback = snapshot.givebackPctEffective;
+  const threshold = giveback == null ? "" : `｜回吐阈 ${+(giveback * 100).toFixed(1)}%`;
+  const suffix = TRAIL_BASIS_SUFFIX[snapshot.trailBasis ?? "giveback"] ?? "";
+  return `移动止盈线 ${snapshot.trailStopPx}${threshold}${suffix}`;
+}
+
+/**
+ * 冷却期中文化（与后端 `format_profit_cooldown` 同语义）；未激活 → null（chip 整块不渲染）。
+ *
+ * 必须同时给出剩余时间与豁免范围：只说「被拦截」会让用户（和模型）以为整个交易能力被剥夺。
+ */
+export function describeProfitGuardCooldown(
+  cooldown: ProfitGuardCooldown | null | undefined,
+): string | null {
+  if (!cooldown || cooldown.remainingSeconds <= 0) return null;
+  const blocked = cooldown.blockedSide === "long" ? "做多" : "做空";
+  const scope =
+    cooldown.scope === "both"
+      ? "暂停开仓（多空均拦）"
+      : `暂停${blocked}开仓（反向不受影响）`;
+  return `利润保护冷却 ${cooldown.remainingSeconds}s · ${scope}；平仓不受限`;
 }
 
 const PROFIT_GUARD_REASON_LABELS: Record<string, string> = {

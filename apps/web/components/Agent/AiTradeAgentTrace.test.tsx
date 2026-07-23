@@ -433,6 +433,31 @@ describe("AiTradeAgentTrace · 利润保护段", () => {
     );
     expect(screen.queryByText(/利润保护（移动止盈 \/ 保本）/)).not.toBeInTheDocument();
   });
+
+  // 冷却降级轮里持仓已平（快照多为 flat 空壳甚至整键缺席），而「本轮为什么被降级为观望」恰恰
+  // 要在轨迹上说清楚——按快照早退就会让用户只看到一个没有理由的 hold（adaptive §4.2 载体二）。
+  it("冷却轮即便没有保护快照也渲染冷却原因与剩余时间", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            profitGuardCooldown: {
+              activeUntilTs: 1_700_000_180,
+              remainingSeconds: 120,
+              scope: "same_side",
+              blockedSide: "long",
+              reasonCode: "profit_guard_trailing",
+              label: "移动止盈",
+            },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    const chip = screen.getByTestId("trace-profit-cooldown");
+    expect(chip).toHaveTextContent("120s");
+    expect(chip).toHaveTextContent("暂停做多开仓（反向不受影响）");
+  });
 });
 
 describe("AgentPanel segmented view", () => {

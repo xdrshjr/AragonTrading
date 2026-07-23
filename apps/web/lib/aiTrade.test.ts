@@ -15,9 +15,11 @@ import {
   describeFactors,
   describeOrderType,
   describePriceAction,
+  describeProfitGuardCooldown,
   describeProfitGuardReason,
   describeProfitGuardFallback,
   describeProfitGuardStatus,
+  describeProfitGuardTrail,
   describeProfitGuardUnavailable,
   describeReflection,
   describeRegime,
@@ -657,5 +659,143 @@ describe("describeDegradeReason · 利润保护码", () => {
     expect(describeDegradeReason("profit_guard_trailing")).toContain("浮盈自峰值回吐超阈");
     expect(describeDegradeReason("profit_guard_breakeven")).toContain("跌回保本线");
     expect(describeDegradeReason("profit_guard_hard_take_profit")).toContain("硬止盈");
+  });
+});
+
+
+// ============ 自适应保护线 + 冷却期（ai-trade-profit-protection-adaptive §六）============
+describe("describeProfitGuardTrail", () => {
+  const base = {
+    ruleId: "profit_trailing",
+    status: "armed" as const,
+    side: "long" as const,
+    trailStopPx: 0.0741075,
+    givebackPctEffective: 0.35,
+    trailDistancePx: 0.00089,
+  };
+
+  it("必须交代这条线被谁定住（回吐阈 + 约束来源）", () => {
+    expect(describeProfitGuardTrail({ ...base, trailBasis: "giveback" })).toBe(
+      "移动止盈线 0.0741075｜回吐阈 35%",
+    );
+    expect(describeProfitGuardTrail({ ...base, trailBasis: "atr_floor" })).toContain(
+      "已按波动率放宽至下界",
+    );
+    expect(describeProfitGuardTrail({ ...base, trailBasis: "atr_cap" })).toContain(
+      "已按波动率收紧至上界",
+    );
+    expect(describeProfitGuardTrail({ ...base, trailBasis: "clamped_breakeven" })).toContain(
+      "已夹至保本线",
+    );
+  });
+
+  it("抑制态如实说「本轮作废」，绝不假装那条线还在（P0-1）", () => {
+    const text = describeProfitGuardTrail({
+      ...base,
+      trailStopPx: null,
+      trailDistancePx: null,
+      trailBasis: "suppressed_at_entry",
+      trailClampedAtEntry: true,
+    });
+    expect(text).toContain("本轮作废");
+    expect(text).toContain("本轮不会据它平仓");
+  });
+
+  it("未武装 / 不可用 / 无快照 → null（整行不渲染，不显示算得出来却不作数的数字）", () => {
+    expect(describeProfitGuardTrail(null)).toBeNull();
+    expect(describeProfitGuardTrail({ ...base, status: "unavailable", trailStopPx: null })).toBeNull();
+    expect(describeProfitGuardTrail({ ...base, status: "idle", trailStopPx: null })).toBeNull();
+  });
+});
+
+describe("describeProfitGuardCooldown", () => {
+  const cooldown = {
+    activeUntilTs: 1_700_000_180,
+    remainingSeconds: 120,
+    scope: "same_side" as const,
+    blockedSide: "long" as const,
+    reasonCode: "profit_guard_trailing",
+    label: "移动止盈",
+  };
+
+  it("同时给出剩余时间与豁免范围（只说「被拦截」会让人以为交易能力被剥夺）", () => {
+    const text = describeProfitGuardCooldown(cooldown);
+    expect(text).toContain("120s");
+    expect(text).toContain("暂停做多开仓");
+    expect(text).toContain("反向不受影响");
+    expect(text).toContain("平仓不受限");
+  });
+
+  it("both 作用域写明多空均拦", () => {
+    expect(describeProfitGuardCooldown({ ...cooldown, scope: "both" })).toContain("多空均拦");
+  });
+
+  it("未激活 / 已到期 → null（chip 整块不渲染）", () => {
+    expect(describeProfitGuardCooldown(null)).toBeNull();
+    expect(describeProfitGuardCooldown({ ...cooldown, remainingSeconds: 0 })).toBeNull();
+  });
+});
+
+describe("validateProfitGuard · 自适应参数", () => {
+  const enabled = { enabled: true };
+
+  it("阶梯回吐比例必须单调不增（赚得越多不可允许回吐更多）", () => {
+    expect(
+      validateProfitGuard({
+        ...enabled,
+        givebackTiers: [
+          { peakReturnPct: 0.1, givebackPct: 0.3 },
+          { peakReturnPct: 0.25, givebackPct: 0.4 },
+        ],
+      }),
+    ).toContain("单调不增");
+  });
+
+  it("阶梯阈值必须严格递增且首档 > 0", () => {
+    expect(
+      validateProfitGuard({
+        ...enabled,
+        givebackTiers: [
+          { peakReturnPct: 0.25, givebackPct: 0.3 },
+          { peakReturnPct: 0.1, givebackPct: 0.2 },
+        ],
+      }),
+    ).toContain("严格递增");
+    expect(
+      validateProfitGuard({ ...enabled, givebackTiers: [{ peakReturnPct: 0, givebackPct: 0.3 }] }),
+    ).toContain("严格递增");
+  });
+
+  it("ATR 下界不可大于上界；冷却秒需在 [0, 86400]", () => {
+    expect(validateProfitGuard({ ...enabled, atrFloorMult: 5, atrCapMult: 1 })).toContain(
+      "不可大于上界",
+    );
+    expect(validateProfitGuard({ ...enabled, cooldownSeconds: -1 })).toContain("冷却秒数");
+    expect(validateProfitGuard({ ...enabled, cooldownSeconds: 0 })).toBeNull(); // 0 = 关闭，合法
+  });
+
+  it("空阶梯（显式关闭）与默认参数均合法", () => {
+    expect(validateProfitGuard({ ...enabled, givebackTiers: [] })).toBeNull();
+    expect(
+      validateProfitGuard({
+        ...enabled,
+        givebackTiers: AI_TRADE_PROFIT_GUARD_DEFAULTS.givebackTiers,
+        atrFloorMult: AI_TRADE_PROFIT_GUARD_DEFAULTS.atrFloorMult,
+        atrCapMult: AI_TRADE_PROFIT_GUARD_DEFAULTS.atrCapMult,
+        cooldownSeconds: AI_TRADE_PROFIT_GUARD_DEFAULTS.cooldownSeconds,
+      }),
+    ).toBeNull();
+  });
+
+  it("关闭保护时其余输入一律不校验（关闭态的残留值不该阻塞提交）", () => {
+    expect(validateProfitGuard({ enabled: false, atrFloorMult: 99, cooldownSeconds: -5 })).toBeNull();
+  });
+});
+
+describe("describeDegradeReason · 冷却降级码", () => {
+  it("带参数后缀的冷却码按前缀中文化，参数原样保留", () => {
+    expect(describeDegradeReason("profit_cooldown(120s,long)")).toBe(
+      "利润保护冷却：刚锁住利润，暂停同向开仓(120s,long)",
+    );
   });
 });

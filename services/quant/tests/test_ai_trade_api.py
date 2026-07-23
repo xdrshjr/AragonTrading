@@ -549,9 +549,72 @@ async def test_profit_guard_out_of_range_giveback_returns_422(monkeypatch):
         await dispose_engine()
 
 
-async def test_backtest_start_never_assembles_profit_guard(monkeypatch):
-    """[P2-4] 回测显式非目标：`AiBacktestStartIn` 无该字段，回测请求体带 `profitGuard` 一律被忽略。"""
-    from app.schemas import AiBacktestStartIn
+async def test_backtest_start_assembles_profit_guard_unless_switch_off(monkeypatch):
+    """[adaptive §7.2a I-1] 本轮**有意反转** v1 的 P2-4 决策：回测也接 `profitGuard`。
 
-    assert "profitGuard" not in AiBacktestStartIn.model_fields
+    第 1 轮把回测列为非目标，是因为当时只想得到「用收盘价近似」这一种做法（低估触发频次 ⇒ 假数据）；
+    第 2 轮 F3 改用 bar 内 OHLC 极值 + 保守成交序，故限制解除。本用例同时钉死一键回退：运维总闸
+    `ai_trade_profit_guard_backtest_enabled=false` ⇒ 解析结果恒 `None`（回测逐字回到第 1 轮行为）。
+    """
+    from app.api.ai_auto import _resolve_backtest_profit_guard
+    from app.schemas import AiBacktestStartIn, AiTradeProfitGuardIn
 
+    assert "profitGuard" in AiBacktestStartIn.model_fields
+
+    body = AiTradeProfitGuardIn(enabled=True, armReturnPct=0.08)
+    rule = _resolve_backtest_profit_guard(body, Settings())
+    assert rule is not None and rule.arm_return_pct == 0.08
+
+    off = Settings(ai_trade_profit_guard_backtest_enabled=False)
+    assert _resolve_backtest_profit_guard(body, off) is None
+
+
+async def test_profit_guard_non_monotonic_tiers_return_422(monkeypatch):
+    """R-2：阶梯回吐比例非单调不增（赚得越多允许回吐更多）在入口即 422——写反等于把 bug 写进配置。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, profitGuard={"enabled": True, "givebackTiers": [
+                    {"peakReturnPct": 0.10, "givebackPct": 0.30},
+                    {"peakReturnPct": 0.25, "givebackPct": 0.40}]}))
+            assert r.status_code == 422, r.text
+
+            r2 = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, profitGuard={"enabled": True, "atrFloorMult": 4.0,
+                                          "atrCapMult": 1.0}))
+            assert r2.status_code == 422, r2.text
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_profit_guard_adaptive_fields_are_mirrored_in_the_receipt(monkeypatch):
+    """回执 `rule_wire` 镜像本轮五个新字段（阶梯 / ATR 上下界 / 冷却秒与范围），供 UI 与 config 复现。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, profitGuard={"enabled": True, "atrFloorMult": 0.5,
+                                          "atrCapMult": 2.0, "cooldownSeconds": 240,
+                                          "cooldownScope": "both",
+                                          "givebackTiers": [
+                                              {"peakReturnPct": 0.10, "givebackPct": 0.35}]}))
+            assert r.status_code == 200, r.text
+            guard = r.json()["profitGuard"]
+            assert guard["atrFloorMult"] == 0.5 and guard["atrCapMult"] == 2.0
+            assert guard["cooldownSeconds"] == 240.0 and guard["cooldownScope"] == "both"
+            assert guard["givebackTiers"] == [{"peakReturnPct": 0.10, "givebackPct": 0.35}]
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()

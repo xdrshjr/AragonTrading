@@ -300,7 +300,9 @@ async def append_live_trade(session: AsyncSession, run_id: int, trade: dict) -> 
         stop_loss_pct=trade.get("stopLossPct"), take_profit_pct=trade.get("takeProfitPct"),
         max_hold_bars=trade.get("maxHoldBars"), stop_loss_price=trade.get("stopLossPrice"),
         take_profit_price=trade.get("takeProfitPrice"),
-        position_pct=trade.get("positionPct"), explain_json=explain_json))
+        position_pct=trade.get("positionPct"),
+        # F4：仅平仓成交带该键（`_dispatch` 读取即消费）；缺键 → None，绝不补 0。
+        peak_pnl=trade.get("peakPnlUsd"), explain_json=explain_json))
     await session.commit()
 
 

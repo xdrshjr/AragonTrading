@@ -483,6 +483,9 @@ describe("AiTradeLaunchModal", () => {
     fireEvent.change(screen.getByLabelText("时间级别"), { target: { value: "4H" } });
     fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[0], { target: { value: "500" } });
     fireEvent.change(screen.getByLabelText("允许回吐（%）"), { target: { value: "55" } });
+    fireEvent.change(screen.getByLabelText("ATR 下界倍数（0=关）"), { target: { value: "0.4" } });
+    fireEvent.change(screen.getByLabelText("平仓后冷却（秒，0=关）"), { target: { value: "90" } });
+    fireEvent.change(screen.getByLabelText("回吐阶梯"), { target: { value: "tight" } });
 
     // 模拟行情流节流 flush 引发的父树重渲染：open 恒为真，但每帧传入全新的默认数组引用。
     rerender({ defaultStrategyIds: [1], defaultMembers: [{ instId: "ETH-USDT-SWAP", allocationPct: 100 }] });
@@ -494,6 +497,9 @@ describe("AiTradeLaunchModal", () => {
     expect((screen.getByLabelText("时间级别") as HTMLSelectElement).value).toBe("4H");
     // 本轮新增的利润保护输入同守（复发性缺陷的教训：每加一个新字段就要在此加一条断言）。
     expect((screen.getByLabelText("允许回吐（%）") as HTMLInputElement).value).toBe("55");
+    expect((screen.getByLabelText("ATR 下界倍数（0=关）") as HTMLInputElement).value).toBe("0.4");
+    expect((screen.getByLabelText("平仓后冷却（秒，0=关）") as HTMLInputElement).value).toBe("90");
+    expect((screen.getByLabelText("回吐阶梯") as HTMLSelectElement).value).toBe("tight");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -515,12 +521,18 @@ describe("AiTradeLaunchModal", () => {
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
     const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    // 本轮 F1/F2 的四个自适应字段是**纯加法**，故这条整体 toEqual 须同步扩展（清单外的必要更新，
+    // 已回填 spec §十一）：断言仍是「提交体逐键等于默认参数」，语义一字未变。
     expect(opts.profitGuard).toEqual({
       enabled: true,
       armReturnPct: 0.05,
       givebackPct: 0.4,
       breakevenArmReturnPct: 0.03,
       minHoldSeconds: 30,
+      givebackTiers: AI_TRADE_PROFIT_GUARD_DEFAULTS.givebackTiers,
+      atrFloorMult: AI_TRADE_PROFIT_GUARD_DEFAULTS.atrFloorMult,
+      atrCapMult: AI_TRADE_PROFIT_GUARD_DEFAULTS.atrCapMult,
+      cooldownSeconds: AI_TRADE_PROFIT_GUARD_DEFAULTS.cooldownSeconds,
     });
   });
 
@@ -576,17 +588,61 @@ describe("AiTradeLaunchModal", () => {
     expect(screen.queryByText("保证金口径按下单杠杆换算，填写杠杆后显示")).not.toBeInTheDocument();
   });
 
-  it("回测段整块隐藏利润保护 UI 且提交体不带该键（§1.3 非目标，不得暗示回测已含保护）", async () => {
+  // [adaptive §7.2a I-2] 本轮**有意反转**上一轮的「回测段整块隐藏利润保护」用例：F3 用 bar 内 OHLC
+  // 极值 + 保守成交序取代了收盘价近似，故回测段照常露出并随体提交——但文案必须写明是**保守近似**，
+  // 不得让用户以为回测 = 实盘（R-4：曲线变好看 ⇒ 高估实盘，是本特性最大的风险）。
+  it("回测段渲染利润保护 UI 且随体提交，文案与实盘段不同（保守近似免责）", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    expect(screen.getByText(/判定只用/)).toBeInTheDocument();          // 实盘段文案
+
     fireEvent.click(screen.getByRole("button", { name: "回测" }));
-    expect(screen.queryByRole("checkbox", { name: "利润保护（推荐开启）" })).not.toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" })).toBeInTheDocument();
+    expect(screen.getByText(/bar 内极值保守近似/)).toBeInTheDocument();
+    expect(screen.getByText(/相对实盘偏保守/)).toBeInTheDocument();
+    expect(screen.queryByText(/判定只用/)).not.toBeInTheDocument();    // 回测不得照抄实盘文案
+
     const confirm = screen.getByRole("button", { name: /开始 AI 回测/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
     const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
     expect(opts.mode).toBe("backtest");
-    expect(opts.profitGuard).toBeUndefined();
+    expect(opts.profitGuard?.enabled).toBe(true);
+    expect(opts.profitGuard?.givebackTiers?.length).toBeGreaterThan(0);
+  });
+
+  // ---------- 自适应四项（adaptive §3.3）----------
+  it("四个新输入随体提交，且阶梯预设切换生效", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+
+    fireEvent.change(screen.getByLabelText("ATR 下界倍数（0=关）"), { target: { value: "0.5" } });
+    fireEvent.change(screen.getByLabelText("ATR 上界倍数（0=关）"), { target: { value: "2" } });
+    fireEvent.change(screen.getByLabelText("平仓后冷却（秒，0=关）"), { target: { value: "240" } });
+    fireEvent.change(screen.getByLabelText("回吐阶梯"), { target: { value: "off" } });
+
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.profitGuard?.atrFloorMult).toBe(0.5);
+    expect(opts.profitGuard?.atrCapMult).toBe(2);
+    expect(opts.profitGuard?.cooldownSeconds).toBe(240);
+    expect(opts.profitGuard?.givebackTiers).toEqual([]);      // 「关闭阶梯」预设
+  });
+
+  it("ATR 下界大于上界时两模式都拦住提交（P2-8：校验必须真的挡住按钮）", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.change(screen.getByLabelText("ATR 下界倍数（0=关）"), { target: { value: "5" } });
+    fireEvent.change(screen.getByLabelText("ATR 上界倍数（0=关）"), { target: { value: "1" } });
+
+    expect(screen.getByRole("alert").textContent).toContain("ATR 下界倍数不可大于上界倍数");
+    expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "回测" }));
+    expect(screen.getByRole("alert").textContent).toContain("ATR 下界倍数不可大于上界倍数");
+    expect(screen.getByRole("button", { name: /开始 AI 回测/ })).toBeDisabled();
   });
 });
 

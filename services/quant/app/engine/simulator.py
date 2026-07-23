@@ -241,6 +241,17 @@ class SimBroker:
         else:
             self.equity_points.append(point)
 
+    def close_at_price(self, px: float, ts: int, reason: str) -> None:
+        """按**指定触发价**立即平仓（`_close_at` 的公有薄封装；持仓为 flat 时空转）。
+
+        供 AI 回测的利润保护层按保护线成交（ai-trade-profit-protection-adaptive §2.3.3）。刻意不走
+        「把 `pos.stop_loss_price` 改写成移动止盈线、借 `apply_risk` 的手平仓」那种取巧：那会让成交
+        理由被记成 ``stop_loss``，归因当场撒谎——保护层的存在感恰恰来自「用户能看出利润是被谁锁住的」。
+
+        私有 ``_close_at`` 与 ``run_backtest`` 的既有调用序**零改动**：本方法只是转调。
+        """
+        self._close_at(px, ts, reason)
+
     # ================= 成交内部实现 =================
     def _open(self, side, strength, ref_price, ts, bar_index, reason) -> None:
         strength = max(0.0, min(float(strength), 1.0))

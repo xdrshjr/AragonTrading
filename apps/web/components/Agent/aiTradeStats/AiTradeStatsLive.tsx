@@ -13,6 +13,11 @@ import {
   resolveRangeBounds,
   summarizeRoundTrips,
 } from "@/lib/autoTradePnl";
+import {
+  formatProfitCapture,
+  PROFIT_CAPTURE_HINT,
+  summarizeProfitCaptureAcross,
+} from "@/lib/aiTradeCapture";
 import { computeReflectionCounts, latestHoldStreak } from "@/lib/aiTradeObservability";
 import type { AiTradeGroupMemberState } from "@/lib/aiTradeTypes";
 import { colorForReturn, fmtTime, signed } from "@/lib/format";
@@ -68,6 +73,16 @@ export default function AiTradeStatsLive() {
     };
   }, [group, range, custom, nowSec, capitalBaseUsd]);
 
+  // F4 利润捕获率：本轮迭代循环的验收指标——**峰值浮盈里最终落袋了几成**。与已实现收益的时间窗口
+  // 解耦（配对口径与后端 _summarize_pairs 逐字对应），故取全会话样本。
+  const capture = useMemo(
+    () =>
+      summarizeProfitCaptureAcross(
+        group ? Object.values(group.members).map((m) => ({ trades: m.trades })) : [],
+      ),
+    [group],
+  );
+
   if (group == null) {
     return (
       <EmptyHint text="尚未启动 AI 自动交易；启动后这里按时间维度汇总每次完整交易（开→平）的收益与总收益率，停止后可在『历史』标签回溯。" />
@@ -104,6 +119,7 @@ export default function AiTradeStatsLive() {
           elapsedSec={nowSec - group.startedTs}
           tradeCount={fullSummary.count}
         />
+        <ProfitCaptureCard capture={capture} />
         {unrealizedUsd !== null && (
           <div className="flex items-center justify-between rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs">
             <span className="text-[var(--muted)]">
@@ -193,4 +209,29 @@ function EmptyHint({ text }: { text: string }) {
 // 稳定行 key：优先成交 id，回退开 / 平时刻，永不跨标的混淆。
 function rowKey(rt: RoundTrip): string {
   return `${rt.instId}-${rt.entry.id ?? rt.openedTs}-${rt.exit.id ?? rt.closedTs}`;
+}
+
+/**
+ * 利润捕获率卡片（F4）：已实现盈亏 ÷ 峰值浮盈。
+ *
+ * 口径提示是**必需**的而非装饰：分母不含手续费、分子含，小额往返会系统性偏低；持仓期间加过仓的
+ * 往返，峰值是按最终均价重估值。不写出来就是误导（R-8）。样本 < 3 显示「样本不足」，绝不用 1~2 笔
+ * 冒充统计结论（沿用统计看板既有的最小样本门禁范式）。
+ */
+function ProfitCaptureCard({
+  capture,
+}: {
+  capture: ReturnType<typeof summarizeProfitCaptureAcross>;
+}) {
+  return (
+    <div className="flex flex-col gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2">
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span className="text-[var(--muted)]">利润捕获率</span>
+        <span className="tabular font-semibold text-[var(--text)]" data-testid="ai-profit-capture">
+          {formatProfitCapture(capture)}
+        </span>
+      </div>
+      <p className="text-[10px] leading-relaxed text-[var(--muted)]">{PROFIT_CAPTURE_HINT}</p>
+    </div>
+  );
 }

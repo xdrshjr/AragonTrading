@@ -37,7 +37,8 @@ from ..okx.trading import fetch_live_open_orders, fetch_live_positions, fetch_tr
 from ..paper.strategy_factory import PaperStrategySpec
 from .admission import get_admission_lock
 from .base_rules import MaBandRule, format_charter, rule_wire
-from .profit_guard import ProfitGuardRule, format_profit_guard_charter
+from .profit_guard import ProfitGuardRule
+from .profit_guard_text import format_profit_guard_charter
 from .profit_guard import rule_wire as profit_guard_wire
 from .decider import AiTradeDecider
 from .prompts import build_ai_trade_system_prompt
@@ -128,7 +129,8 @@ class AiTradeGroupStartRequest:
     # 「缺省即开启」的语义**只在 API 层解析**（`_resolve_base_rules`），绝不在此给开启默认值。
     base_rule: MaBandRule | None = None
     # 利润保护层：同款零回归垫片（默认 None=不装配；「缺省即开启」只在 API 层 `_resolve_profit_guard`
-    # 解析，且**只挂实盘启动**——回测显式非目标，ai-trade-profit-protection §1.3/P2-4）。
+    # 解析）。回测侧的同名规则走 `AiBacktestStartRequest.profit_rule`（同一解析点、另加回测总闸），
+    # 见 ai-trade-profit-protection-adaptive §2.3 / §7.2a I-3。
     profit_rule: ProfitGuardRule | None = None
 
 

@@ -92,6 +92,10 @@ class Trade(Base):
     take_profit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     # 自动订单按成员最终预算折算的仓位比例（fraction，旧行 / 回测行为 NULL）。
     position_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 本持仓周期的峰值浮盈 USD（ai-trade-profit-protection-adaptive §2.4）：随**平仓**成交落一列，
+    # 供「利润捕获率 = Σ已实现 / Σ峰值浮盈」聚合。保护层未装配 / 快照一路不可用 / 老行为 NULL——
+    # **绝不填 0**（0 会被聚合当成「峰值就是 0」，把捕获率算成 0 或 ∞）。
+    peak_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
     # 序列化的 TriggerExplain（auto-trade-explainability §5.1）：实盘自动交易逐笔触发解释，
     # 历史行 / 非自动交易行为 NULL。绝不含凭证。老库经 _ensure_trade_risk_columns 幂等补列。
     explain_json: Mapped[str | None] = mapped_column(Text, nullable=True)

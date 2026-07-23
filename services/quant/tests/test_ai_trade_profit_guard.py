@@ -29,12 +29,19 @@ from app.ai_auto.profit_guard import (
     build_idle_snapshot,
     build_snapshot,
     evaluate_profit_guard,
+    parse_giveback_tiers,
+    resolve_giveback_pct,
+    resolve_profit_guard_rule,
+    rule_wire,
+    safe_atr,
+    sanitize_atr,
+    unavailable_reason_for,
+)
+from app.ai_auto.profit_guard_text import (
+    describe_exit_outcome,
     format_profit_guard_charter,
     format_profit_guard_for_prompt,
     format_profit_hold_note,
-    resolve_profit_guard_rule,
-    rule_wire,
-    unavailable_reason_for,
 )
 from app.config import Settings
 
@@ -441,3 +448,192 @@ def test_snapshot_numbers_are_internally_consistent():
     assert snap["effectiveExitPx"] == pytest.approx(max(snap["trailStopPx"],
                                                         snap["breakevenPx"]))
     assert math.isfinite(snap["unrealizedPnlUsd"])
+
+
+# ==================== F1 自适应（ai-trade-profit-protection-adaptive §2.1）====================
+def _snapshot_at(peak_return_pct: float, mark_px: float, rule: ProfitGuardRule, *,
+                 atr_px: float | None = None, side: str = "long") -> dict:
+    """把状态推到指定峰值收益后，用给定判定价组装一份快照（全部构造式，禁止写死价格）。"""
+    peak_px = _peak_px_for(peak_return_pct, side=side)
+    state = advance_state(None, _facts(_ENTRY, now_wall=_WALL, side=side))
+    state = advance_state(state, _facts(peak_px, now_wall=_WALL + _STEP, side=side))
+    facts = _facts(mark_px, now_wall=_WALL + 2 * _STEP, side=side, atr_px=atr_px)
+    state = advance_state(state, facts)
+    return build_snapshot(rule, state, facts)
+
+
+def test_giveback_tiers_tighten_as_profit_grows():
+    """验收 #1：峰值收益跨过 10% / 25% / 50% 三档，有效回吐阈立即变为 0.35 / 0.28 / 0.20。"""
+    tiers = parse_giveback_tiers("0.10:0.35,0.25:0.28,0.50:0.20")
+    rule = _rule(giveback_tiers=tiers)
+
+    assert resolve_giveback_pct(rule, 0.05) == rule.giveback_pct    # 无匹配档 → 基准值
+    assert resolve_giveback_pct(rule, 0.10) == 0.35                 # 边界含等于
+    assert resolve_giveback_pct(rule, 0.30) == 0.28
+    assert resolve_giveback_pct(rule, 0.80) == 0.20
+
+    snap = _snapshot_at(0.30, _peak_px_for(0.20), rule)
+    assert snap["givebackPctEffective"] == 0.28
+    # 线由同一个有效阈反算：trail = entry + 峰值距离 ×（1 − 0.28）
+    span = abs(_peak_px_for(0.30) - _ENTRY)
+    assert snap["trailStopPx"] == pytest.approx(_ENTRY + span * (1 - 0.28))
+    assert snap["trailBasis"] == "giveback"
+
+
+def test_giveback_tiers_reject_non_monotonic_config():
+    """R-2：阈值必须严格递增、回吐比例必须单调不增——写反等于把本轮要修的 bug 写进配置。"""
+    with pytest.raises(ValueError):
+        parse_giveback_tiers("0.10:0.30,0.25:0.40")        # 赚得越多却允许回吐更多
+    with pytest.raises(ValueError):
+        parse_giveback_tiers("0.25:0.30,0.10:0.20")        # 阈值不递增
+    with pytest.raises(ValueError):
+        parse_giveback_tiers("0:0.30")                     # 首档阈值须 > 0
+    with pytest.raises(ValueError):
+        parse_giveback_tiers(",".join(f"0.{i}:0.3" for i in range(1, 9)))   # 超 6 档
+    assert parse_giveback_tiers("") == () and parse_giveback_tiers(None) == ()
+
+
+def test_atr_bounds_are_tri_state():
+    """验收 #2：ATR 下界抬宽 / 上界压紧 / 不绑定三态，`trailBasis` 如实记录是谁定住了这条线。"""
+    peak_return = 0.0518
+    span = abs(_peak_px_for(peak_return) - _ENTRY)
+    mark = _peak_px_for(0.05)
+    # 不绑定：ATR 极小 ⇒ 距离仍由回吐比例决定。
+    loose = _rule(atr_floor_mult=0.8, atr_cap_mult=3.0)
+    snap = _snapshot_at(peak_return, mark, loose, atr_px=span * 0.25)
+    assert snap["trailBasis"] == "giveback"      # 0.8×ATR < 0.4×span < 3×ATR ⇒ 两界都不绑定
+    assert snap["trailDistancePx"] == pytest.approx(span * loose.giveback_pct, abs=1e-8)
+    # 下界绑定：0.8×ATR 大于按比例算出的距离 ⇒ 线被放宽（远离峰值）。
+    floored = _snapshot_at(peak_return, mark, loose, atr_px=span)
+    assert floored["trailBasis"] == "atr_floor"
+    assert floored["trailDistancePx"] == pytest.approx(0.8 * span, abs=1e-8)
+    # 上界绑定：3×ATR 小于按比例算出的距离 ⇒ 线被收紧。
+    capped = _snapshot_at(peak_return, mark, loose, atr_px=span * 0.05)
+    assert capped["trailBasis"] == "atr_cap"
+    assert capped["trailDistancePx"] == pytest.approx(3.0 * span * 0.05, abs=1e-8)
+    # ATR 不可用 ⇒ 上下界整体不生效（fail-open 降级为纯阶梯回吐）。
+    degraded = _snapshot_at(peak_return, mark, loose, atr_px=None)
+    assert degraded["trailBasis"] == "giveback" and degraded["atrPx"] is None
+
+
+def test_trail_clamps_to_breakeven_when_atr_floor_pushes_below_entry():
+    """T-2（§2.1.4 断面 C）：ATR 下界把线推到保本线之下 ⇒ 夹到保本线，且区间内仍不触发。"""
+    peak_return = 0.0587
+    span = abs(_peak_px_for(peak_return) - _ENTRY)
+    rule = _rule(atr_floor_mult=0.8, atr_cap_mult=3.0)
+    # ATR 大到让 0.8×ATR > 峰值距离本身 ⇒ 原始 trail 落到入场价之下。
+    snap = _snapshot_at(peak_return, _peak_px_for(0.05), rule, atr_px=span * 2)
+
+    breakeven = _breakeven_px_for(rule)
+    assert snap["breakevenPx"] == pytest.approx(breakeven)
+    assert snap["trailStopPx"] == pytest.approx(breakeven)
+    assert snap["trailBasis"] == "clamped_breakeven"
+    assert snap["trailClampedAtEntry"] is True
+    assert snap["effectiveExitPx"] == pytest.approx(breakeven)
+    # 距离按**实际那条线**回算（RV-2）：三键自洽 ⇒ peak − trailDistancePx 恰是 trailStopPx，
+    # 否则 prompt 的「距峰值 X」会让人反算出一条不存在的线。
+    assert snap["trailDistancePx"] == pytest.approx(_peak_px_for(peak_return) - breakeven, abs=1e-8)
+    # 现价仍在 (保本线, 峰值) 之间 ⇒ 不触发（夹紧不制造额外的触发点）。
+    assert evaluate_profit_guard(snap, rule) is None
+
+
+def test_trail_suppressed_at_entry_never_forces_a_losing_exit():
+    """T-5（§2.1.4 断面 D / P0-1 守门）：保本线关闭 + ATR 下界绑定 ⇒ 整条线作废，压到入场价之下仍不触发。
+
+    若实现写成「夹到 entry 后照常触发」，本用例必红——而线上的表现会是一次 `pnl = −手续费` 的强平，
+    配上「锁定利润」的文案。
+    """
+    peak_return = 0.0587
+    span = abs(_peak_px_for(peak_return) - _ENTRY)
+    rule = _rule(breakeven_arm_return_pct=0.0, atr_floor_mult=0.8, atr_cap_mult=3.0)
+
+    snap = _snapshot_at(peak_return, _peak_px_for(0.05), rule, atr_px=span * 2)
+    assert snap["trailStopPx"] is None
+    assert snap["trailBasis"] == "suppressed_at_entry"
+    assert snap["trailClampedAtEntry"] is True
+    assert snap["trailDistancePx"] is None
+    assert snap["effectiveExitPx"] is None
+    # 有效阈与 ATR 仍如实下发（用户要能看出「是波动率把线推到了入场价之下」）。
+    assert snap["givebackPctEffective"] == rule.giveback_pct and snap["atrPx"] is not None
+
+    for mark in (_ENTRY, _ENTRY * 0.99):
+        pressed = _snapshot_at(peak_return, mark, rule, atr_px=span * 2)
+        assert evaluate_profit_guard(pressed, rule) is None
+
+    # 同一构造恢复保本线 ⇒ 退回 T-2 的 clamped_breakeven 分支（抑制只在没有兜底线时发生）。
+    restored = _snapshot_at(peak_return, _peak_px_for(0.05),
+                            _rule(breakeven_arm_return_pct=0.03, atr_floor_mult=0.8,
+                                  atr_cap_mult=3.0), atr_px=span * 2)
+    assert restored["trailBasis"] == "clamped_breakeven"
+
+
+def test_allow_filter_restricts_which_rules_may_fire():
+    """`allow=` 白名单（F3 保守成交序用）：不在名单内的规则即便命中也不裁决；默认 None = 全开。"""
+    rule = _rule(hard_tp_return_pct=0.20)
+    peak_return = 0.0518
+    trail_px = _trail_px_for(_peak_px_for(peak_return), rule)
+    snap = _snapshot_at(peak_return, trail_px, rule)
+
+    assert evaluate_profit_guard(snap, rule).reason_code == REASON_TRAILING
+    assert evaluate_profit_guard(snap, rule, allow=(REASON_TRAILING,)) is not None
+    assert evaluate_profit_guard(snap, rule, allow=(REASON_HARD_TAKE_PROFIT,)) is None
+
+
+def test_unavailable_snapshot_nulls_every_new_key():
+    """§2.1.3：`unavailable` 时新增五键与三条线同待遇——一律 None，绝不下发不作数的数字。"""
+    rule = _rule(atr_floor_mult=0.8)
+    facts = _facts(_peak_px_for(0.05), now_wall=_WALL + _STEP, atr_px=0.001)
+    state = advance_state(None, _facts(_ENTRY, now_wall=_WALL))
+    snap = build_snapshot(rule, state, facts, unavailable_reason="stale_feed")
+
+    assert snap["status"] == STATUS_UNAVAILABLE
+    for key in ("givebackPctEffective", "trailBasis", "trailDistancePx",
+                "trailClampedAtEntry", "atrPx"):
+        assert snap[key] is None
+
+
+def test_default_rule_is_byte_identical_to_v1_trail():
+    """G-1：`ProfitGuardRule()` 直构造（阶梯空 / atr_*=0）⇒ 移动止盈线与 v1 公式逐字节相等。"""
+    rule = _rule()
+    peak_px = _peak_px_for(0.0518)
+    snap = _snapshot_at(0.0518, _peak_px_for(0.04), rule, atr_px=0.01)   # ATR 有值也不生效
+
+    assert rule.giveback_tiers == () and rule.atr_floor_mult == 0.0 and rule.cooldown_s == 0.0
+    assert snap["trailStopPx"] == pytest.approx(_trail_px_for(peak_px, rule))
+    assert snap["trailBasis"] == "giveback" and snap["trailClampedAtEntry"] is False
+
+
+def test_exit_outcome_copy_is_derived_from_pnl_sign():
+    """§六.1b / P0-1：措辞由 pnl 符号派生——绝不在一笔非盈利出场上宣称「锁定利润」。"""
+    assert "锁定利润" in describe_exit_outcome(1.25)
+    assert "锁定利润" not in describe_exit_outcome(0.0)
+    assert "锁定利润" not in describe_exit_outcome(-0.42)
+    assert "锁定利润" not in describe_exit_outcome(None)
+
+
+def test_charter_discloses_adaptive_and_cooldown_only_when_active():
+    """宪章的两段新披露：未启用（v1 默认）⇒ 逐字回退；启用 ⇒ 必须说清「以每轮输入为准」与冷却豁免。"""
+    assert "保护线是自适应的" not in format_profit_guard_charter(_rule())
+    assert "冷却期" not in format_profit_guard_charter(_rule())
+
+    adaptive = format_profit_guard_charter(_rule(
+        giveback_tiers=parse_giveback_tiers("0.10:0.35"), atr_floor_mult=0.8,
+        cooldown_s=180.0))
+    assert "保护线是自适应的" in adaptive and "有效回吐阈" in adaptive
+    assert "180s" in adaptive and "不受任何限制" in adaptive
+
+
+def test_safe_atr_degrades_instead_of_guessing():
+    """ATR 取数：样本不足 / NaN / ≤0 一律 None（与回测侧同一条判据 sanitize_atr）。"""
+    import pandas as pd
+
+    assert sanitize_atr(float("nan")) is None
+    assert sanitize_atr(0.0) is None and sanitize_atr(-1.0) is None
+    assert sanitize_atr("x") is None and sanitize_atr(0.5) == 0.5
+
+    rows = [{"ts": i, "o": 100.0, "h": 101.0, "l": 99.0, "c": 100.0, "vol": 1.0}
+            for i in range(30)]
+    df = pd.DataFrame(rows)
+    assert safe_atr(df, 14) == pytest.approx(2.0, rel=1e-6)
+    assert safe_atr(df.iloc[:5], 14) is None            # 样本不足 ⇒ 降级
+    assert safe_atr(None, 14) is None

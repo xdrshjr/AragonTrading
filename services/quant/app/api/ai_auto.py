@@ -104,11 +104,22 @@ def _resolve_profit_guard(raw: AiTradeProfitGuardIn | None,
     字段缺省 ⇒ 按 settings 装配开启态（老客户端 / 桌面旧包不发该字段也受保护）；显式 `enabled=false`
     ⇒ `None`（该会话不装配）；运维总闸关 ⇒ 恒 `None`。
 
-    **[P2-4] 只接 `ai_trade_start`，绝不接 `ai_backtest_start`**——与两处共用的 `_resolve_base_rules`
-    刻意不同：回测按根推进，峰值浮盈的真值需要 bar 内 OHLC 级建模，用收盘价近似会低估触发频次并产出
-    一份「比实盘保守却看起来同构」的曲线（§1.3 非目标，属假数据）。
+    **实盘与回测两处启动都走本函数**（ai-trade-profit-protection-adaptive §7.2a I-3，与
+    `_resolve_base_rules` 重新对齐）：第 1 轮把回测列为非目标，是因为当时只想得到「用收盘价近似」这一
+    种做法（会低估触发频次，属假数据）；第 2 轮 F3 改用 **bar 内 OHLC 极值 + 保守成交序**（§2.3.1，与
+    `simulator.apply_risk` 处理止损止盈同一范式），故该限制解除。回测侧另有运维总闸
+    `ai_trade_profit_guard_backtest_enabled`（false ⇒ 恒不装配，一键回到第 1 轮的回测行为），
+    结果 notes 与 UI 必须同时显示 §2.3.5 的保守近似免责。
     """
     return resolve_profit_guard_rule(raw.model_dump() if raw is not None else None, settings)
+
+
+def _resolve_backtest_profit_guard(raw: AiTradeProfitGuardIn | None,
+                                   settings: Settings) -> ProfitGuardRule | None:
+    """回测侧解析：在实盘那条语义之上再叠一层运维总闸（§2.3.4 的一键回退）。"""
+    if not settings.ai_trade_profit_guard_backtest_enabled:
+        return None
+    return _resolve_profit_guard(raw, settings)
 
 
 async def _resolve_account(session: AsyncSession, account_id: int | None) -> repo.OkxAccount:
@@ -279,7 +290,8 @@ async def ai_backtest_start(body: AiBacktestStartIn, session: AsyncSession = Dep
         take_profit_usd=body.takeProfitUsd, stop_loss_usd=body.stopLossUsd,
         min_consensus=body.minConsensus,
         position_step_pct=_resolve_position_step(body.positionStepPct, settings),
-        base_rule=_resolve_base_rules(body.baseRules, settings))
+        base_rule=_resolve_base_rules(body.baseRules, settings),
+        profit_rule=_resolve_backtest_profit_guard(body.profitGuard, settings))
     try:
         job = await get_ai_backtest_manager().start(req)
     except AiBacktestError as exc:

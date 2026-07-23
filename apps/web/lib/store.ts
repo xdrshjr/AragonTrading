@@ -772,13 +772,18 @@ export const useAppStore = create<AppState>()(
             m.session ? { ...m, session: { ...m.session, ...patch } } : m,
           ),
         ),
+      // status 事件是冷却期的唯一落库点（§4.2 三载体之三）：冷却写在 **member 层**而非 session 层，
+      // 因为面板的 chip 门控须是 `member.profitGuardCooldown != null`——挂在 position 之下则平仓后
+      // 恒 null，chip 永远不出现；冷却结束后端会主动再推一次 status（该键为 null）以摘掉 chip。
       patchAiTradeMemberStatus: (instId, status) =>
         set((s) =>
-          patchAiTradeMember(s.aiTradeGroup, instId, (m) =>
-            m.session
-              ? { ...m, session: { ...m.session, ...(status as Partial<AiTradeSessionRow>) } }
-              : m,
-          ),
+          patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({
+            ...m,
+            profitGuardCooldown: status.profitGuardCooldown ?? null,
+            session: m.session
+              ? { ...m.session, ...(status as Partial<AiTradeSessionRow>) }
+              : m.session,
+          })),
         ),
       setAiTradeMemberTrades: (instId, trades) =>
         set((s) => patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({ ...m, trades }))),

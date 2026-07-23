@@ -137,9 +137,19 @@ def build_external_close_explain(*, pos_side: str, source: str, entry_price: flo
                  metrics=metrics)
 
 
+_TRAIL_BASIS_LABEL = {
+    "giveback": "回吐比例",
+    "atr_floor": "波动率下界",
+    "atr_cap": "波动率上界",
+    "clamped_breakeven": "夹至保本线",
+    "suppressed_at_entry": "本轮作废（低于入场价）",
+}
+
+
 def build_profit_guard_explain(*, pos_side: str, trigger_label: str, entry_price: float,
                                exit_price: float, peak_pnl: float | None,
-                               giveback_ratio: float | None, pnl: float | None) -> dict:
+                               giveback_ratio: float | None, pnl: float | None,
+                               trail: dict | None = None) -> dict:
     """利润保护层强制平仓（ai-trade-profit-protection §2.7）：移动止盈 / 保本 / 硬止盈触发。
 
     与 ``risk_exit``（时间止盈）刻意分列一个新 kind：前者是「持仓根数到了」，本条是「已到手的浮盈
@@ -147,6 +157,12 @@ def build_profit_guard_explain(*, pos_side: str, trigger_label: str, entry_price
 
     ``pnl`` 为触发瞬间的**本地派生浮盈**（不含手续费 / 资金费，比交易所 upl 略乐观），故标注为
     「触发时浮盈」而非「本笔盈亏」——真实已实现盈亏以 trade.pnl 为准，绝不在此冒充。
+
+    ``trail``（adaptive §3.1）：本轮**规则量**断面 ``{givebackPctEffective, trailBasis}``——构造时算得
+    出来，故可以进 metrics。**「峰值→落袋」捕获率刻意不在这里**（P1-5）：本函数在 ``executor.apply``
+    **之前**被调用，此刻 ``trade.pnl`` 尚不存在，捕获率是成交后量；它一律由前端 ``summarizeProfitCapture``
+    与后端 ``_summarize_pairs`` 在成交后派生。``trail`` 为聚合结构体而非再加两个形参——本函数已有 7 个
+    keyword 形参，继续堆参会更偏离 CLAUDE.md「形参 ≤ 5」。
     """
     giveback = "—" if giveback_ratio is None else f"{float(giveback_ratio) * 100:.1f}%"
     metrics = [
@@ -159,9 +175,26 @@ def build_profit_guard_explain(*, pos_side: str, trigger_label: str, entry_price
         _metric("触发时浮盈", _fmt_usd(pnl), tone=_pnl_tone(pnl),
                 hint="本地派生口径，不含手续费与资金费"),
     ]
+    trail_metric = _profit_guard_trail_metric(trail)
+    if trail_metric is not None:
+        metrics.insert(1, trail_metric)
     return _base("profit_guard", "close", f"利润保护平仓（{trigger_label}）",
-                 summary="持仓浮盈自峰值回吐触及系统保护线，由利润保护层直接市价平仓锁定利润",
+                 # §六.1b / P0-1：措辞由 pnl **符号**派生——保本线触发 / 滑点不利时这笔可能打平甚至
+                 # 净亏，无条件写「锁定利润」就是在一笔亏损出场上撒谎。
+                 summary=("持仓浮盈自峰值回吐触及系统保护线，由利润保护层直接市价平仓锁定利润"
+                          if pnl is not None and float(pnl) > 0
+                          else "价格触及系统保护线，由利润保护层直接市价平仓离场"),
                  metrics=metrics)
+
+
+def _profit_guard_trail_metric(trail: dict | None) -> dict | None:
+    """本轮有效回吐阈 + 约束来源的规则量 metric；断面缺失 / 无有效阈 ⇒ None（整条 metric 省略）。"""
+    giveback_eff = (trail or {}).get("givebackPctEffective")
+    if giveback_eff is None:
+        return None
+    basis = _TRAIL_BASIS_LABEL.get((trail or {}).get("trailBasis"), "—")
+    return _metric("本轮回吐阈", f"{float(giveback_eff) * 100:.1f}%",
+                   hint=f"约束来源：{basis}")
 
 
 def with_risk(explain: dict, risk: dict) -> dict:

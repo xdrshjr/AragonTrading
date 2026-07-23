@@ -113,6 +113,9 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         # 利润保护快照（ai-trade-profit-protection §2.7）：**刻意不新增 trace phase**——基础策略是逐轮
         # 门禁故每轮一条事件，保护层跑在 5s 盯市上、不是轮级判定，只随 round_start 带一份断面。
         "profitGuard": payload.get("profitGuard"),
+        # 冷却期（adaptive §4.2 三载体之二）：本函数是**显式取键**装配，不加这一行 `AiTradeRoundTrace`
+        # 永远拿不到冷却数据 ⇒ 轨迹上「本轮为什么被降级」永远空白（跑不出错、功能静默缺失）。
+        "profitGuardCooldown": payload.get("profitGuardCooldown"),
         "state": "deciding",
     }
 

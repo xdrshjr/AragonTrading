@@ -1,10 +1,15 @@
 // AI 自动交易 wire 类型（camelCase，与后端 schemas.py 的 AiTrade* 同构）。
 // 运行期句柄（sessionId 等）为瞬态（store 不入 partialize）；aiTradeConfig 为持久化偏好。
-import type { PaperPositionEvent, ProfitGuardSnapshot, Trade } from "./types";
+import type {
+  PaperPositionEvent,
+  ProfitGuardCooldown,
+  ProfitGuardSnapshot,
+  Trade,
+} from "./types";
 
 // 保护快照的形状真源在 types.ts（aiTradeTypes 已 import 它，反向 import 会成环）；此处只做转出口，
 // 使 AI 自动交易侧的消费点无需跨文件二次 import。
-export type { ProfitGuardSnapshot } from "./types";
+export type { ProfitGuardCooldown, ProfitGuardSnapshot } from "./types";
 
 // cancel_order（ai-trade-limit-orders M-11）：撤回本会话未成交的限价挂单，不开不平。
 export type AiTradeAction = "open_long" | "open_short" | "close" | "hold" | "cancel_order";
@@ -221,6 +226,20 @@ export interface AiTradeProfitGuardRule {
   breakevenOffsetReturnPct?: number | null;  // 保本线正向偏移（覆盖手续费）
   minHoldSeconds?: number | null;            // 最短持有期（秒）
   hardTakeProfitReturnPct?: number | null;   // 硬止盈收益率（null 与 0 等价，均表关闭）
+  // ---- 自适应（ai-trade-profit-protection-adaptive §4.1）：留空→服务端按 settings 回填 ----
+  // 利润阶梯：峰值收益越高、允许回吐越少。阈值须严格递增、回吐比例须单调不增（后端 422 硬约束）；
+  // `[]` = 显式关闭阶梯（退回固定 givebackPct），与「字段留空 = 用服务端默认阶梯」严格区分。
+  givebackTiers?: AiTradeGivebackTier[] | null;
+  atrFloorMult?: number | null;              // 回吐**距离**下界 = 该倍数 × ATR；0 = 关闭下界
+  atrCapMult?: number | null;                // 回吐**距离**上界 = 该倍数 × ATR；0 = 关闭上界
+  cooldownSeconds?: number | null;           // 保护性平仓后的冷却秒数；0 = 关闭冷却
+  cooldownScope?: "same_side" | "both" | null;
+}
+
+// 利润阶梯的一档：峰值保证金收益率越过 `peakReturnPct` 即改用该档的 `givebackPct`。
+export interface AiTradeGivebackTier {
+  peakReturnPct: number;
+  givebackPct: number;
 }
 
 // agent_trace 事件 data（各字段按 phase 可选；前端 reducer 按 phase 归约）。
@@ -250,6 +269,8 @@ export interface AiTradeTraceEvent {
   marketDigest?: MarketDigest | null; // round_start（R1：价格走势/成交量/因子证据摘要）
   multiTimeframeContext?: MultiTimeframeContext | null; // round_start（决策级中线背景）
   profitGuard?: ProfitGuardSnapshot | null; // round_start：利润保护断面（未装配→ null）
+  // round_start：保护性平仓冷却期（未激活→ null）。轨迹上「本轮为什么被降级」靠它自解释。
+  profitGuardCooldown?: ProfitGuardCooldown | null;
   attempt?: number; // retry：当前重试序号（1-based）
   maxAttempts?: number; // retry：本轮最大重试次数
   reason?: string; // retry：触发本次重试的上一次 degrade 原因 / reflection_verdict：反思理由
@@ -301,6 +322,8 @@ export interface AiTradeRoundTrace {
   // 利润保护快照（ai-trade-profit-protection §2.7）：规则未装配的会话恒为 null；**不新增 trace phase**
   // ——保护层跑在 5s 盯市上、不是轮级判定，只随 round_start 带一份断面。
   profitGuard?: ProfitGuardSnapshot | null;
+  // 冷却期断面（adaptive §4.2 三载体之二）：本轮若被冷却门禁降级，UI 据此说清原因与剩余时间。
+  profitGuardCooldown?: ProfitGuardCooldown | null;
   state: "deciding" | "done" | "skipped" | "error";
 }
 
@@ -351,6 +374,9 @@ export interface AiTradeStatusEvent {
   stopReason?: string | null;
   flattenFailed?: boolean;
   message?: string;
+  // 保护性平仓冷却期（adaptive §4.2 三载体之三）：未激活 / 已到期 → null（后端到期会主动补推一次
+  // status，否则 chip 会一直挂着）。
+  profitGuardCooldown?: ProfitGuardCooldown | null;
 }
 
 export interface AiTradeStartReq {
@@ -483,6 +509,11 @@ export interface AiTradeGroupMemberState {
   session: AiTradeSessionRow | null;   // 会话只读视图（info + WS status/decision/summary 增量合并）
   trades: Trade[];
   position: PaperPositionEvent | null;
+  // 保护性平仓冷却期（adaptive §4.2）：**与 position 平级的独立字段**，绝不挂在 position 之下——
+  // 冷却期内按定义已无持仓（position 恒 null），挂上去 chip 永远拿不到数据。由 status 事件写入。
+  // 声明为**可选**（与 baseRules/positionStepPct 等既有可选键同范式）：老快照 / 既有直接构造成员对象
+  // 的用例无此键，读点一律 `?? null` 兜底。
+  profitGuardCooldown?: ProfitGuardCooldown | null;
   decisions: AiTradeDecision[];
   traces: AiTradeRoundTrace[];
   summary: string | null;

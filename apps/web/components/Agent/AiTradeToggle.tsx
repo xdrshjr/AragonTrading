@@ -98,7 +98,7 @@ export default function AiTradeToggle() {
         positionStepPct: opts.positionStepPct,   // 仓位操作档位（透传，服务端默认回填/量化）
         wakeIntervalMinutes: opts.wakeIntervalMinutes,   // Agent 墙钟定时唤醒周期（透传，服务端默认回填/夹紧）
         baseRules: opts.baseRules,               // 【基础策略】铁律（透传；取消勾选即 enabled:false）
-        profitGuard: opts.profitGuard,           // 利润保护层（仅实盘透传；取消勾选即 enabled:false）
+        profitGuard: opts.profitGuard,           // 利润保护层（透传；取消勾选即 enabled:false）
         contextRefreshRounds: opts.contextRefreshRounds,
       }),
     onSuccess: (res, opts) => {
@@ -145,6 +145,9 @@ export default function AiTradeToggle() {
         minConsensus: opts.minConsensus ?? null,
         positionStepPct: opts.positionStepPct,   // 回测同享档位约束（决策脑单点收口，实盘/回测同生效）
         baseRules: opts.baseRules,               // 回测同享铁律（P1-4：默认必须与实盘一致，否则调参失真）
+        // F3：回测同享利润保护（bar 内极值 + 保守成交序）。同一条理由——两侧参数不同源，
+        // 用户拿回测调出来的参数在实盘直接失真。
+        profitGuard: opts.profitGuard,
       }),
     onSuccess: (res, opts) => {
       setAiBacktestJobId(res.jobId);

@@ -496,6 +496,17 @@ class AiTradeBaseRulesIn(BaseModel):
     maBandEntry: AiTradeMaBandRuleIn | None = None
 
 
+class AiTradeGivebackTierIn(BaseModel):
+    """利润阶梯的一档（ai-trade-profit-protection-adaptive §4.1）：峰值收益越过阈值即收紧回吐比例。
+
+    档间的**严格递增 / 单调不增**约束由 `AiTradeProfitGuardIn` 的 model_validator 统一校验
+    （单档看不出单调性），此处只兜单档值域。
+    """
+
+    peakReturnPct: float = Field(gt=0, le=50)     # 峰值保证金收益率阈值（首档必须 > 0）
+    givebackPct: float = Field(gt=0, le=1)        # 该档允许的自峰值回吐比例
+
+
 class AiTradeProfitGuardIn(BaseModel):
     """利润保护层入参（ai-trade-profit-protection §4.1）：移动止盈 + 保本 + 可选硬止盈。
 
@@ -512,6 +523,29 @@ class AiTradeProfitGuardIn(BaseModel):
     minHoldSeconds: float | None = Field(default=None, ge=0, le=3600)
     # null 与 0 等价，均表关闭硬止盈（归一点在 resolve_profit_guard_rule，此后不可再分辨）。
     hardTakeProfitReturnPct: float | None = Field(default=None, ge=0, le=20)
+    # ---- 自适应（ai-trade-profit-protection-adaptive §4.1）：留空 ⇒ settings 回填；`[]` ⇒ 显式关闭阶梯 ----
+    givebackTiers: list[AiTradeGivebackTierIn] | None = None
+    atrFloorMult: float | None = Field(default=None, ge=0, le=10)      # 0 = 关闭下界
+    atrCapMult: float | None = Field(default=None, ge=0, le=50)        # 0 = 关闭上界
+    cooldownSeconds: float | None = Field(default=None, ge=0, le=86400)  # 0 = 关闭冷却
+    cooldownScope: Literal["same_side", "both"] | None = None
+
+    @model_validator(mode="after")
+    def _check_adaptive(self) -> "AiTradeProfitGuardIn":
+        """边界一次性校验（进入内部后信任）：阶梯单调性 + ATR 上下界不可倒置，违反即 422。
+
+        阶梯校验**复用后端唯一解析点** `profit_guard.parse_giveback_tiers`——env 串与请求体两条入口
+        共用同一套约束（R-2：写反的阶梯等于把本轮要修的 bug 写进配置）。
+        """
+        from .ai_auto.profit_guard import parse_giveback_tiers
+
+        if self.givebackTiers is not None:
+            parse_giveback_tiers([t.model_dump() for t in self.givebackTiers])
+        floor_mult, cap_mult = self.atrFloorMult, self.atrCapMult
+        if (floor_mult is not None and cap_mult is not None
+                and floor_mult > 0 and cap_mult > 0 and floor_mult > cap_mult):
+            raise ValueError("ATR 下界倍数不可大于上界倍数")
+        return self
 
 
 class AiTradeGroupStartIn(BaseModel):
@@ -546,7 +580,8 @@ class AiTradeGroupStartIn(BaseModel):
     # `_resolve_base_rules` 单点解析）；`{"maBandEntry":{"enabled":false}}` ⇒ 该会话不装配。
     baseRules: AiTradeBaseRulesIn | None = None
     # 利润保护层（默认开启，同上「字段缺省 ⇒ 开启」语义，解析点 `_resolve_profit_guard`）；
-    # `{"enabled":false}` ⇒ 该会话不装配。**只挂实盘启动**，回测显式非目标（§1.3）。
+    # `{"enabled":false}` ⇒ 该会话不装配。**实盘与回测两处启动体都接该字段**（adaptive §7.2a I-4：
+    # 第 1 轮把回测列为非目标，第 2 轮 F3 用 bar 内 OHLC 极值 + 保守成交序取代了收盘价近似）。
     profitGuard: AiTradeProfitGuardIn | None = None
 
     @field_validator("members")
@@ -620,6 +655,10 @@ class AiBacktestStartIn(BaseModel):
     # 【基础策略】铁律：与实盘同字段同语义、同一 `_resolve_base_rules` 解析——**实盘与回测的默认必须
     # 一致**，否则用户用回测调出的参数在实盘直接失真（P1-4）。
     baseRules: AiTradeBaseRulesIn | None = None
+    # 利润保护层：与实盘同字段同语义、同一 `_resolve_profit_guard` 解析（adaptive §2.3 / §7.2a I-1）。
+    # 回测按 bar 内 OHLC 极值 + 保守成交序近似，运维总闸 `ai_trade_profit_guard_backtest_enabled=false`
+    # 可一键回到第 1 轮的「回测无保护层」行为。
+    profitGuard: AiTradeProfitGuardIn | None = None
 
 
 class AiBacktestStartOut(BaseModel):
@@ -820,6 +859,14 @@ class AiTradeHistorySummary(BaseModel):
     winRate: float
     bestUsd: float
     worstUsd: float
+    # 利润捕获率五键（adaptive §2.4.3）：分母 peakPnlUsd **不含**手续费、分子 capturedPnlUsd **含**，
+    # 故小额往返会系统性偏低；capturePairs / noPeakCount 是样本诚实性（peak ≤0 或缺失不进分母）。
+    # 老会话（老库缺列 / 保护层未装配）全为 0，前端据 capturePairs 显示「样本不足」。
+    peakPnlUsd: float = 0.0
+    capturedPnlUsd: float = 0.0
+    captureRatio: float = 0.0
+    capturePairs: int = 0
+    noPeakCount: int = 0
 
 
 class AiTradeHistoryMember(BaseModel):
@@ -876,6 +923,9 @@ def trade_out(t: Trade) -> dict:
         "takeProfitPct": t.take_profit_pct, "maxHoldBars": t.max_hold_bars,
         "stopLossPrice": t.stop_loss_price, "takeProfitPrice": t.take_profit_price,
         "positionPct": getattr(t, "position_pct", None),
+        # F4：本持仓周期的峰值浮盈（保护层未装配 / 快照一路不可用 / 老库缺列 → None，**绝不填 0**）。
+        # `getattr` 兜底：幂等补列前的进程 / 老快照读到 None 而不是 AttributeError（G-6）。
+        "peakPnlUsd": getattr(t, "peak_pnl", None),
         # explain 键恒在（缺列 / 坏 JSON → None），与既有恒含全键风格一致（§5.2 / P2-6）。
         "explain": _parse_explain(getattr(t, "explain_json", None)),
     }

@@ -25,9 +25,22 @@ import math
 from dataclasses import dataclass
 
 from ..config import Settings
+from ..engine.indicators import atr
 
 # 预置规则 id（本期只有这一条移动止盈 / 保本组合；注册表结构留位但不提前造框架）。
 PROFIT_GUARD_RULE_ID = "profit_trailing"
+
+# 回吐距离被哪条约束定住（§2.1.1 第 2/3 条）：前三个来自「阶梯 / ATR 上下界」，后两个来自入场价夹紧
+# （夹紧是最后一道处理，优先级高于前三个）。全链路如实透出，使「为什么这条线在这里」可被解释（R-11）。
+TRAIL_BASIS_GIVEBACK = "giveback"
+TRAIL_BASIS_ATR_FLOOR = "atr_floor"
+TRAIL_BASIS_ATR_CAP = "atr_cap"
+TRAIL_BASIS_CLAMPED_BREAKEVEN = "clamped_breakeven"
+TRAIL_BASIS_SUPPRESSED_AT_ENTRY = "suppressed_at_entry"
+
+# 利润阶梯硬约束（§2.1.1 第 1 条）：档数上限 + 比例值域。阈值严格递增、回吐单调不增在
+# `normalize_giveback_tiers` 里强制——赚得越多却允许回吐得越多，等于把本轮要修的 bug 写进配置（R-2）。
+GIVEBACK_TIERS_MAX = 6
 
 # 三个触发码（`Signal.reason` / `trade.reason` / `explain` / 前端 `inferKindFromReason` 共用同一组常量）。
 REASON_TRAILING = "profit_guard_trailing"
@@ -49,11 +62,6 @@ STATUS_UNAVAILABLE = "unavailable"
 # 计入 `profitGuardArmedRounds` 的两个状态（§2.7/P2-2，轮级口径）。
 ARMED_STATUSES = (STATUS_ARMED, STATUS_BREAKEVEN_ARMED)
 
-_UNAVAILABLE_LABEL = {
-    "stale_feed": "行情数据陈旧",
-    "no_price": "实时价不可用",
-    "bad_position": "持仓读数异常",
-}
 
 
 @dataclass(frozen=True)
@@ -69,6 +77,14 @@ class ProfitGuardRule:
         min_hold_s: 最短持有期（墙钟秒），抑制开仓瞬间的价差 / 一跳噪音。
         hard_tp_return_pct: 硬止盈的保证金收益率；`0` = 关闭（请求体的 `null` 在解析点归一至此）。
         max_px_age_s: 判定价最大允许年龄（秒）；超龄 ⇒ `unavailable` ⇒ 本轮零动作（fail-open）。
+        giveback_tiers: 利润阶梯 `((峰值收益阈值, 回吐比例), …)`，阈值升序；`()` = 关闭阶梯。
+        atr_floor_mult: 回吐**距离**下界 = 该倍数 × ATR；`0` = 关闭下界。
+        atr_cap_mult: 回吐**距离**上界 = 该倍数 × ATR；`0` = 关闭上界。
+        cooldown_s: 保护性平仓后的冷却秒数；`0` = 关闭冷却。
+        cooldown_scope: `same_side`（只拦同向开仓）| `both`。
+
+    本轮新增的五个字段**全部带 dataclass 默认值 = v1 行为**（阶梯空、上下界关、冷却关），故任何直接
+    `ProfitGuardRule(...)` 的既有构造点与用例判定结果逐字节等价（G-1）。
     """
 
     enabled: bool = True
@@ -79,6 +95,11 @@ class ProfitGuardRule:
     min_hold_s: float = 30.0
     hard_tp_return_pct: float = 0.0
     max_px_age_s: float = 90.0
+    giveback_tiers: tuple[tuple[float, float], ...] = ()
+    atr_floor_mult: float = 0.0
+    atr_cap_mult: float = 0.0
+    cooldown_s: float = 0.0
+    cooldown_scope: str = "same_side"
 
 
 @dataclass
@@ -118,6 +139,9 @@ class PositionFacts:
         exchange_tp_px / exchange_sl_px: 交易所侧兜底 OCO 触发价。
         exchange_oco_source: `trade`=取自开仓成交回执（首选真源）｜`derived`=只读转发现算（P1-4）。
         px_age_s: 判定价年龄（秒，`now_wall − 最近一次实时价推送墙钟`）；仅供如实展示与新鲜度豁免。
+        atr_px: 确认根 ATR(period)（价格单位）；`None` ⇒ 上下界整体不生效（退化为纯阶梯回吐）。
+            **只进入回吐距离计算，绝不参与任何触发判定的比较**（G-5）；允许滞后一根（波动尺度天然是
+            确认根统计量），与 `mark_px` 的实时性要求刻意不同源。
     """
 
     seq: int
@@ -132,6 +156,7 @@ class PositionFacts:
     exchange_sl_px: float | None = None
     exchange_oco_source: str | None = None
     px_age_s: float | None = None
+    atr_px: float | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +171,122 @@ class ProtectVerdict:
 def _fallback(value, default):
     """入参缺省（None）时回落 settings 默认；显式值（含 0/False）原样保留。"""
     return default if value is None else value
+
+
+# ---------- F1：利润阶梯（解析 / 校验 / 选档，env 串与请求体共用同一条通路）----------
+def normalize_giveback_tiers(pairs) -> tuple[tuple[float, float], ...]:
+    """校验并归一利润阶梯；违反任一硬约束即 `ValueError`（调用点转 422 / 启动失败）。
+
+    硬约束（§2.1.1 第 1 条）：阈值**严格递增**、回吐比例**单调不增**且 ∈ (0,1]、≤ 6 档、首档阈值 > 0。
+    单调不增是语义硬约束而非风格偏好——「赚得越多却允许回吐得越多」正是本轮要修的 bug 本身（R-2）。
+
+    Args:
+        pairs: 可迭代的 `(峰值收益阈值, 回吐比例)`；空 ⇒ `()`（关闭阶梯，退回固定 `giveback_pct`）。
+
+    Returns:
+        升序不可变元组；空输入 → `()`。
+
+    Raises:
+        ValueError: 档数越界 / 数值非有限 / 阈值非严格递增 / 回吐比例非单调不增或越界。
+    """
+    tiers = tuple((float(t), float(g)) for t, g in pairs or ())
+    if not tiers:
+        return ()
+    if len(tiers) > GIVEBACK_TIERS_MAX:
+        raise ValueError(f"利润阶梯最多 {GIVEBACK_TIERS_MAX} 档")
+    prev_threshold = 0.0
+    prev_giveback = None
+    for threshold, giveback in tiers:
+        if not (math.isfinite(threshold) and math.isfinite(giveback)):
+            raise ValueError("利润阶梯含非有限数值")
+        if threshold <= prev_threshold:
+            raise ValueError("利润阶梯的峰值收益阈值必须严格递增且首档 > 0")
+        if not (0 < giveback <= 1):
+            raise ValueError("利润阶梯的回吐比例须在 (0, 1] 之间")
+        if prev_giveback is not None and giveback > prev_giveback:
+            raise ValueError("利润阶梯的回吐比例必须单调不增（赚得越多不可允许回吐更多）")
+        prev_threshold, prev_giveback = threshold, giveback
+    return tiers
+
+
+def parse_giveback_tiers(raw) -> tuple[tuple[float, float], ...]:
+    """把 env 串 / 请求体列表解析为阶梯元组（**唯一解析点**，两条入口共用同一校验）。
+
+    支持三种形状：`None`/空串 ⇒ `()`；`"0.10:0.35,0.25:0.28"` 逗号分隔的 `阈值:回吐`；
+    `[{"peakReturnPct":0.1,"givebackPct":0.35}, …]` 或等价的二元序列（请求体）。
+
+    Raises:
+        ValueError: 串格式非法，或归一时违反 `normalize_giveback_tiers` 的任一硬约束。
+    """
+    if raw is None:
+        return ()
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return ()
+        pairs = []
+        for chunk in text.split(","):
+            part = chunk.strip()
+            if not part:
+                continue
+            threshold, _, giveback = part.partition(":")
+            if not giveback:
+                raise ValueError(f"利润阶梯格式非法（应为 阈值:回吐）：{part}")
+            pairs.append((float(threshold), float(giveback)))
+        return normalize_giveback_tiers(pairs)
+    pairs = []
+    for item in raw:
+        if isinstance(item, dict):
+            pairs.append((item.get("peakReturnPct"), item.get("givebackPct")))
+        else:
+            pairs.append((item[0], item[1]))
+    return normalize_giveback_tiers(pairs)
+
+
+def tiers_wire(tiers: tuple[tuple[float, float], ...]) -> list[dict]:
+    """阶梯 → camelCase 回执镜像（`rule_wire` / run `config_json` 用）。"""
+    return [{"peakReturnPct": threshold, "givebackPct": giveback}
+            for threshold, giveback in tiers]
+
+
+def resolve_giveback_pct(rule: ProfitGuardRule, peak_return_pct: float) -> float:
+    """选档：取满足 `peak_return ≥ 阈值` 的**最后一档**回吐比例；无匹配 ⇒ 基准 `giveback_pct`。
+
+    阶梯为空（v1 默认）时恒返回 `rule.giveback_pct`，故判定与 v1 逐字节等价（G-1）。
+    """
+    giveback = rule.giveback_pct
+    for threshold, tier_giveback in rule.giveback_tiers:
+        if peak_return_pct >= threshold:
+            giveback = tier_giveback
+    return giveback
+
+
+# ---------- F1：ATR 读数（实盘与回测共用同一条降级判据，P2-5）----------
+def sanitize_atr(value) -> float | None:
+    """ATR 读数归一：非有限 / ≤0 / 不可转 ⇒ `None`（⇒ 上下界整体不生效，退化为纯阶梯回吐）。
+
+    `indicators.atr` 用 `ewm(min_periods=period)`，前 `period-1` 行恒为 `NaN`；回测的暖机在「无 HTF +
+    关闭体制上下文 + 策略暖机很小」的组合下可以小于 14，故取值后**必须**过这条判据（P2-5）。
+    """
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) and out > 0 else None
+
+
+def safe_atr(df, period: int) -> float | None:
+    """确认根 ATR(period)：样本不足 / 非有限 / ≤0 一律 `None`（fail-open，绝不假数据）。
+
+    复用 `engine/indicators.atr`（`market_digest._atr_reading` 已是同一函数的既有消费者），
+    不另造第二份公式——两份 ATR 迟早漂移，而这条线要对真实资金动手。
+    """
+    if df is None or len(df) < period + 1:
+        return None
+    try:
+        return sanitize_atr(atr(df, period).iloc[-1])
+    except (KeyError, ValueError, IndexError):
+        return None                 # 帧缺列 / 空帧：如实降级，不把脏数带进保护线
 
 
 def resolve_profit_guard_rule(raw: dict | None, settings: Settings) -> ProfitGuardRule | None:
@@ -184,7 +325,19 @@ def resolve_profit_guard_rule(raw: dict | None, settings: Settings) -> ProfitGua
         hard_tp_return_pct=float(_fallback(raw.get("hardTakeProfitReturnPct"),
                                            settings.ai_trade_profit_guard_hard_tp_return_pct)),
         max_px_age_s=float(_fallback(raw.get("maxPriceAgeSeconds"),
-                                     settings.ai_trade_profit_guard_max_px_age_s)))
+                                     settings.ai_trade_profit_guard_max_px_age_s)),
+        # F1/F2 五个新字段同款「缺省即回落 settings」语义；`givebackTiers: []` 是显式关闭阶梯的退出口
+        # （与 `None`=用 settings 串严格区分，故此处仍走 `_fallback` 而非 `or`）。
+        giveback_tiers=parse_giveback_tiers(_fallback(
+            raw.get("givebackTiers"), settings.ai_trade_profit_guard_giveback_tiers)),
+        atr_floor_mult=float(_fallback(raw.get("atrFloorMult"),
+                                       settings.ai_trade_profit_guard_atr_floor_mult)),
+        atr_cap_mult=float(_fallback(raw.get("atrCapMult"),
+                                     settings.ai_trade_profit_guard_atr_cap_mult)),
+        cooldown_s=float(_fallback(raw.get("cooldownSeconds"),
+                                   settings.ai_trade_profit_guard_cooldown_s)),
+        cooldown_scope=str(_fallback(raw.get("cooldownScope"),
+                                     settings.ai_trade_profit_guard_cooldown_scope)))
 
 
 def rule_wire(rule: ProfitGuardRule | None) -> dict | None:
@@ -197,7 +350,10 @@ def rule_wire(rule: ProfitGuardRule | None) -> dict | None:
             "breakevenOffsetReturnPct": rule.breakeven_offset_return_pct,
             "minHoldSeconds": rule.min_hold_s,
             "hardTakeProfitReturnPct": rule.hard_tp_return_pct,
-            "maxPriceAgeSeconds": rule.max_px_age_s}
+            "maxPriceAgeSeconds": rule.max_px_age_s,
+            "givebackTiers": tiers_wire(rule.giveback_tiers),
+            "atrFloorMult": rule.atr_floor_mult, "atrCapMult": rule.atr_cap_mult,
+            "cooldownSeconds": rule.cooldown_s, "cooldownScope": rule.cooldown_scope}
 
 
 def advance_state(state: ProfitGuardState | None,
@@ -240,8 +396,85 @@ def _signed(side: str, value: float) -> float:
     return value if side == "long" else -value
 
 
+def _clamp_trail_distance(span: float, giveback_eff: float, rule: ProfitGuardRule,
+                          atr_px: float | None) -> tuple[float, str]:
+    """回吐**距离**的 ATR 归一（§2.1.1 第 2 条）：低于下界抬到下界、高于上界压到上界。
+
+    下界防「按比例算出的距离小于分钟级噪音 ⇒ 趋势还在时就被扫掉」（与原始 bug 相反、同样吃利润的
+    失败模式）；上界防「浮盈很大时放任 20 个点回吐」。`atr_px is None`（样本不足 / 非有限）或倍数为 0
+    ⇒ 该侧不生效。返回 `(距离, trailBasis)`。
+    """
+    distance = span * giveback_eff
+    if atr_px is None:
+        return distance, TRAIL_BASIS_GIVEBACK
+    if rule.atr_floor_mult > 0 and distance < rule.atr_floor_mult * atr_px:
+        return rule.atr_floor_mult * atr_px, TRAIL_BASIS_ATR_FLOOR
+    if rule.atr_cap_mult > 0 and distance > rule.atr_cap_mult * atr_px:
+        return rule.atr_cap_mult * atr_px, TRAIL_BASIS_ATR_CAP
+    return distance, TRAIL_BASIS_GIVEBACK
+
+
+def _clamp_trail_to_floor(trail_px: float, side: str, entry_px: float,
+                          breakeven_px: float | None) -> tuple[float | None, str | None, bool]:
+    """入场价夹紧（§2.1.1 第 3 条 / P0-1）：**本层绝不做一次注定净亏的强平**。
+
+    ATR 下界会把回吐距离撑大，从而可能把 `trail_px` 推到入场价之下（高波动 + 刚武装）。原始 v1 公式
+    恒有 `trail` 严格优于 `entry`，本轮必须显式补回这条保证：
+
+    - **保本线已武装**（默认路径）⇒ 夹到保本线，两线重合、归因如实记为保本线在兜底。
+    - **保本线被用户关闭**（`breakevenArmReturnPct=0`，schema 与 config 都允许）⇒ 整条线**作废**：
+      `_touched("long", px, entry)` 在 `px ≤ entry` 即为真，毛盈亏恰为 0、净盈亏 = −（开+平手续费）。
+      让一个名为「利润保护」的层去做一次必然净亏的强平，既与它存在的理由冲突，也与它的 fail-open
+      极性冲突（宁可不动，也绝不据一个不作数的线动一笔真实持仓）。
+
+    Returns:
+        `(trail_px, 覆盖后的 basis 或 None, 夹紧是否绑定)`。
+    """
+    if breakeven_px is not None:
+        worse = trail_px < breakeven_px if side == "long" else trail_px > breakeven_px
+        if worse:
+            return breakeven_px, TRAIL_BASIS_CLAMPED_BREAKEVEN, True
+        return trail_px, None, False
+    at_or_below_entry = trail_px <= entry_px if side == "long" else trail_px >= entry_px
+    if at_or_below_entry:
+        return None, TRAIL_BASIS_SUPPRESSED_AT_ENTRY, True
+    return trail_px, None, False
+
+
+def _derive_trail(rule: ProfitGuardRule, state: ProfitGuardState, facts: PositionFacts, *,
+                  armed: bool, peak_return_pct: float,
+                  breakeven_px: float | None) -> dict:
+    """移动止盈线的三段式派生：**阶梯选档 → ATR 归一 → 入场价夹紧**（§2.1.1，顺序不可换）。
+
+    零回归（G-1）：阶梯为空 ⇒ `giveback_eff == rule.giveback_pct`；`atr_*=0` 或 ATR 不可用 ⇒
+    basis 恒为 `giveback` ⇒ 走与 v1 **逐字相同**的那一行表达式；此时 `trail` 恒优于保本线与入场价
+    （武装需 peak_return ≥ 5%，保本偏移只有 0.2%/lev）⇒ 夹紧与抑制两条分支都不绑定。
+    """
+    giveback_eff = resolve_giveback_pct(rule, peak_return_pct)
+    if not armed:
+        return {"trailStopPx": None, "givebackPctEffective": giveback_eff,
+                "trailBasis": None, "trailDistancePx": None, "trailClampedAtEntry": False}
+    span = abs(state.peak_px - facts.entry_px)
+    distance, basis = _clamp_trail_distance(span, giveback_eff, rule, facts.atr_px)
+    # basis 未被 ATR 改写时沿用 v1 的**逐字表达式**（而非等价的 `peak − dist`），保证浮点位级等价。
+    trail_px = (facts.entry_px + _signed(facts.side, span * (1 - giveback_eff))
+                if basis == TRAIL_BASIS_GIVEBACK
+                else state.peak_px - _signed(facts.side, distance))
+    trail_px, clamp_basis, clamped = _clamp_trail_to_floor(
+        trail_px, facts.side, facts.entry_px, breakeven_px)
+    return {"trailStopPx": trail_px,
+            "givebackPctEffective": giveback_eff,
+            "trailBasis": clamp_basis or basis,
+            # 抑制态整条线作废 ⇒ 距离也一律 None（绝不显示一个算得出来却不作数的数字，§2.1.3）；
+            # 夹到保本线时距离必须按**实际那条线**回算，否则 prompt 的「距峰值 X」与 trailStopPx 对不上
+            # （用户与模型据 peak − X 会反算出一条不存在的线，三键自洽正是 R-11 要的可解释性）。
+            "trailDistancePx": (None if trail_px is None
+                                else abs(state.peak_px - trail_px) if clamped else distance),
+            "trailClampedAtEntry": clamped}
+
+
 def _derive(rule: ProfitGuardRule, state: ProfitGuardState, facts: PositionFacts) -> dict:
-    """由 `(entry, leverage, qty_coin, mark, peak)` 现算全部派生量（§2.3 公式表）。"""
+    """由 `(entry, leverage, qty_coin, mark, peak, atr)` 现算全部派生量（§2.3 公式表 + §2.1）。"""
     entry, lev = facts.entry_px, facts.leverage
     move_pct = _signed(facts.side, (facts.mark_px - entry) / entry)
     peak_move_pct = _signed(facts.side, (state.peak_px - entry) / entry)
@@ -252,10 +485,10 @@ def _derive(rule: ProfitGuardRule, state: ProfitGuardState, facts: PositionFacts
     armed = peak_return_pct >= rule.arm_return_pct
     breakeven_armed = (rule.breakeven_arm_return_pct > 0
                        and peak_return_pct >= rule.breakeven_arm_return_pct)
-    trail_px = (entry + _signed(facts.side, abs(state.peak_px - entry) * (1 - rule.giveback_pct))
-                if armed else None)
     breakeven_px = (entry * (1 + _signed(facts.side, rule.breakeven_offset_return_pct / lev))
                     if breakeven_armed else None)
+    trail = _derive_trail(rule, state, facts, armed=armed, peak_return_pct=peak_return_pct,
+                          breakeven_px=breakeven_px)
     hard_tp_px = (entry * (1 + _signed(facts.side, rule.hard_tp_return_pct / lev))
                   if rule.hard_tp_return_pct > 0 else None)
     return {"movePct": move_pct, "returnPct": return_pct, "peakMovePct": peak_move_pct,
@@ -263,7 +496,7 @@ def _derive(rule: ProfitGuardRule, state: ProfitGuardState, facts: PositionFacts
             "unrealizedPnlUsd": facts.qty_coin * _signed(facts.side, facts.mark_px - entry),
             "peakUnrealizedPnlUsd": facts.qty_coin * _signed(facts.side, state.peak_px - entry),
             "armed": armed, "breakevenArmed": breakeven_armed,
-            "trailStopPx": trail_px, "breakevenPx": breakeven_px, "hardTakeProfitPx": hard_tp_px}
+            "breakevenPx": breakeven_px, "hardTakeProfitPx": hard_tp_px, **trail}
 
 
 def _effective_exit_px(side: str, trail_px: float | None,
@@ -308,9 +541,13 @@ def build_snapshot(rule: ProfitGuardRule, state: ProfitGuardState, facts: Positi
     绝不显示一条算得出来却不作数的价位（§2.6 b）。交易所侧 OCO 价保留：那是此时唯一还生效的兜底。
     """
     if unavailable_reason is not None:
+        # 新增的 5 个键与三条线同待遇：`unavailable` 时**一律 None**（§2.1.3），绝不下发一个算得
+        # 出来却不作数的数字。
         d = {"movePct": None, "returnPct": None, "peakReturnPct": None, "givebackRatio": None,
              "unrealizedPnlUsd": None, "peakUnrealizedPnlUsd": None,
-             "trailStopPx": None, "breakevenPx": None, "hardTakeProfitPx": None}
+             "trailStopPx": None, "breakevenPx": None, "hardTakeProfitPx": None,
+             "givebackPctEffective": None, "trailBasis": None, "trailDistancePx": None,
+             "trailClampedAtEntry": None}
         status = STATUS_UNAVAILABLE
         exit_px = None
     else:
@@ -338,6 +575,13 @@ def build_snapshot(rule: ProfitGuardRule, state: ProfitGuardState, facts: Positi
         "armReturnPct": rule.arm_return_pct, "givebackPct": rule.giveback_pct,
         "minHoldSeconds": rule.min_hold_s,
         "pxAgeSeconds": (None if facts.px_age_s is None else round(float(facts.px_age_s), 1)),
+        # F1 新增五键（纯加法）：本轮的**有效**回吐阈、被哪条约束定住、回吐距离、是否被入场价夹紧、
+        # 本轮 ATR。UI / prompt / explain 三处据同一份数据渲染，不各自重算（R-11 / [R-5] 教训）。
+        "givebackPctEffective": _round_pct(d["givebackPctEffective"]),
+        "trailBasis": d["trailBasis"],
+        "trailDistancePx": _round_px(d["trailDistancePx"]),
+        "trailClampedAtEntry": d["trailClampedAtEntry"],
+        "atrPx": None if unavailable_reason is not None else _round_px(facts.atr_px),
         "lastExit": None,
     }
 
@@ -363,8 +607,8 @@ def _verdict(reason_code: str, snapshot: dict, exit_px: float | None) -> Protect
               "peakPnlUsd": snapshot.get("peakUnrealizedPnlUsd")})
 
 
-def evaluate_profit_guard(snapshot: dict | None,
-                          rule: ProfitGuardRule | None) -> ProtectVerdict | None:
+def evaluate_profit_guard(snapshot: dict | None, rule: ProfitGuardRule | None, *,
+                          allow: tuple[str, ...] | None = None) -> ProtectVerdict | None:
     """三条规则按固定优先级短路判定（§2.4）；**任一分支不成立一律 `None`（不动作）**。
 
     优先级：硬止盈 → 移动止盈 → 保本。硬止盈在最前是因为它是「已达目标位」而非「已在回吐」，
@@ -373,6 +617,8 @@ def evaluate_profit_guard(snapshot: dict | None,
     Args:
         snapshot: `build_snapshot` 产物；`None` / `status=="unavailable"` ⇒ 直接不动作（fail-open）。
         rule: 已装配规则；`None` / `enabled=False` ⇒ 恒不动作。
+        allow: keyword-only 的**规则码白名单**（F3 §2.3.1 的保守成交序用：先只判两条下方保护线、
+            推完峰值再只判硬止盈）。`None`（默认）= 全部规则参与 ⇒ 实盘调用点行为逐字节不变。
 
     Returns:
         命中的 `ProtectVerdict`；未命中或前置豁免 → `None`。
@@ -386,168 +632,14 @@ def evaluate_profit_guard(snapshot: dict | None,
         return None
     if float(snapshot.get("holdSeconds") or 0.0) < rule.min_hold_s:
         return None                              # 最短持有期：抑制开仓瞬间的价差 / 一跳噪音
+    allowed = (lambda code: True) if allow is None else (lambda code: code in allow)
     hard_tp_px = snapshot.get("hardTakeProfitPx")
     return_pct = snapshot.get("returnPct")
-    if (rule.hard_tp_return_pct > 0 and return_pct is not None
-            and return_pct >= rule.hard_tp_return_pct):
+    if (allowed(REASON_HARD_TAKE_PROFIT) and rule.hard_tp_return_pct > 0
+            and return_pct is not None and return_pct >= rule.hard_tp_return_pct):
         return _verdict(REASON_HARD_TAKE_PROFIT, snapshot, hard_tp_px)
-    if _touched(side, px, snapshot.get("trailStopPx")):
+    if allowed(REASON_TRAILING) and _touched(side, px, snapshot.get("trailStopPx")):
         return _verdict(REASON_TRAILING, snapshot, snapshot.get("trailStopPx"))
-    if _touched(side, px, snapshot.get("breakevenPx")):
+    if allowed(REASON_BREAKEVEN) and _touched(side, px, snapshot.get("breakevenPx")):
         return _verdict(REASON_BREAKEVEN, snapshot, snapshot.get("breakevenPx"))
     return None
-
-
-# ---------- 文案渲染（与判定共用同一份真源，杜绝「UI 说已保护、判定不触发」，[R-5]）----------
-def format_profit_guard_charter(rule: ProfitGuardRule | None) -> str:
-    """系统 prompt 的利润保护宪章章（§2.6 a）；未装配 → **空串垫片**（渲染逐字节不变、零回归）。
-
-    两层语义**不可删**（放行条件 5 / P1-5）：① 被保护层强平 = 一次决策失误；② 保护层可能不可用、
-    不可依赖。缺第一层会诱发「反正有兜底」的道德风险（R-2），缺第二层更糟——模型会据一条它以为
-    无条件成立的保证去延长持有，而本层极性是 fail-open。
-    """
-    if rule is None or not rule.enabled:
-        return ""
-    hard = ("；本会话另启用**硬止盈**：保证金收益达 "
-            f"{rule.hard_tp_return_pct * 100:g}% 即由系统直接止盈"
-            if rule.hard_tp_return_pct > 0 else "")
-    return (
-        "**利润保护层（移动止盈 + 保本 · 由系统强制执行）**：本会话启用了利润保护层。持仓浮盈达到"
-        f"保证金收益 {rule.arm_return_pct * 100:g}% 后系统会记录峰值，并在利润自峰值回吐超过 "
-        f"{rule.giveback_pct * 100:g}%、或价格跌回保本线时**由系统直接市价平仓**"
-        f"{hard}。它是**兜底底线，不是你的止盈策略**——被保护层强制平仓意味着你没有在更好的位置"
-        "主动离场，应视为一次决策失误。主动的 `close` 永远优先于等待保护层触发。\n"
-        "**另须知悉：保护层在行情或持仓读数异常时会主动不动作**（宁可不动，也绝不据脏数据平掉一笔"
-        "真实持仓），届时每轮输入会明确标注「保护层当前不可用」。因此它**不是一条你可以依赖的保证**，"
-        "你的退出计划必须在没有它的前提下也成立。"
-    )
-
-
-def _has_exchange_oco(snapshot: dict) -> bool:
-    """交易所侧是否真的挂着兜底 OCO（两个触发价至少有一个）。"""
-    return (snapshot.get("exchangeTakeProfitPx") is not None
-            or snapshot.get("exchangeStopLossPx") is not None)
-
-
-def _format_exchange_oco(snapshot: dict) -> str:
-    """交易所侧兜底 OCO 一行；来自现算而非成交回执时标「估算」（§六.5 诚实约束）。"""
-    tp, sl = snapshot.get("exchangeTakeProfitPx"), snapshot.get("exchangeStopLossPx")
-    if not _has_exchange_oco(snapshot):
-        return "交易所侧兜底：未挂止盈止损"
-    tag = "（估算）" if snapshot.get("exchangeOcoSource") == "derived" else ""
-    return (f"交易所侧兜底{tag}：止盈 {_fmt_px(tp)} / 止损 {_fmt_px(sl)}")
-
-
-def _format_unavailable_fallback(snapshot: dict) -> str:
-    """保护层不可用时，如实交代兜底责任归属（§六.5 诚实约束）。
-
-    `risk.stop_loss_pct` / `take_profit_pct` 双双为 None 时（运维把 `AI_TRADE_DEFAULT_SL_PCT` /
-    `_TP_PCT` 置 0 即可达，`manager._resolve_risk` 的 `sl or None`）交易所侧根本没挂单。此时若照写
-    「仅交易所侧止盈止损仍生效」，等于在保护层已经停手的那一刻，告诉模型还有一条**并不存在**的防线
-    ——这正是 P1-5 要防的道德风险的最坏形态（既没有保护层，又以为有兜底）。
-    """
-    if _has_exchange_oco(snapshot):
-        return f"仅{_format_exchange_oco(snapshot)} 仍生效。请据此自行管理退出。"
-    return "且交易所侧**未挂**止盈止损——此刻没有任何自动兜底，退出完全由你负责。"
-
-
-def _fmt_px(value: float | None) -> str:
-    return "—" if value is None else f"{float(value):.6f}"
-
-
-def _fmt_pct(value: float | None) -> str:
-    return "—" if value is None else f"{float(value) * 100:+.2f}%"
-
-
-def _fmt_usd(value: float | None) -> str:
-    return "—" if value is None else f"{float(value):+.3f} USDT"
-
-
-def _format_last_exit(last_exit: dict | None) -> str:
-    """上一次保护性平仓回执（§2.6 d）：让模型知道它的仓位为何消失。缺省 → 空串。"""
-    if not last_exit:
-        return ""
-    return (f"  ★ 上一笔持仓已由利润保护层强制平仓（{last_exit.get('label')}）："
-            f"平仓价 {_fmt_px(last_exit.get('exitPx'))}，"
-            f"本笔浮盈 {_fmt_usd(last_exit.get('pnlUsd'))}"
-            f"（峰值 {_fmt_usd(last_exit.get('peakPnlUsd'))}）。"
-            "这意味着你没有在更好的位置主动离场——本轮请据此调整你的退出计划。")
-
-
-def _format_lines(snapshot: dict) -> str:
-    """三条保护线 + 有效退出线（未武装时如实降级，绝不假数据）。"""
-    trail = snapshot.get("trailStopPx")
-    breakeven = snapshot.get("breakevenPx")
-    hard = snapshot.get("hardTakeProfitPx")
-    arm = snapshot.get("armReturnPct")
-    trail_text = (f"移动止盈线 {_fmt_px(trail)}（已武装）" if trail is not None
-                  else f"移动止盈线：尚未达到武装阈值（需保证金收益 ≥ {float(arm or 0) * 100:g}%）")
-    breakeven_text = (f"保本线 {_fmt_px(breakeven)}（已武装）" if breakeven is not None
-                      else "保本线：尚未武装")
-    hard_text = f"硬止盈 {_fmt_px(hard)}" if hard is not None else "硬止盈：未启用"
-    return f"  {trail_text}｜{breakeven_text}｜{hard_text}"
-
-
-def format_profit_guard_for_prompt(snapshot: dict | None) -> str:
-    """决策 prompt 的每轮只读上下文段（§2.6 b）。
-
-    `payload["profitGuard"]` **键缺失**（规则未装配 / 回测自建 payload 不带）⇒ 调用方整段省略 ⇒
-    既有冻结断言与回测 payload 逐字节不变。无持仓 / 未武装 / 不可用一律**如实降级**。
-    """
-    if not snapshot:
-        return ""
-    last_exit_line = _format_last_exit(snapshot.get("lastExit"))
-    status = snapshot.get("status")
-    if status == STATUS_FLAT:
-        return last_exit_line          # 无持仓：只可能有一条平仓回执，没有回执则整段省略
-    if status == STATUS_UNAVAILABLE:
-        age = snapshot.get("pxAgeSeconds")
-        head = ("【利润保护 · 当前不可用】"
-                f"{_UNAVAILABLE_LABEL.get(snapshot.get('unavailableReason'), '数据异常')}"
-                f"{'' if age is None else f'（判定价已 {age:.0f}s 未更新）'}，"
-                "保护层本轮不做任何判定、不会平仓；"
-                f"{_format_unavailable_fallback(snapshot)}")
-        return "\n".join(part for part in (head, last_exit_line) if part)
-    bars = snapshot.get("barsInPosition")
-    body = (
-        "【利润保护 · 移动止盈 / 保本（系统强制执行）】\n"
-        f"  持仓 {snapshot.get('holdSeconds'):.0f}s"
-        f"{'' if bars is None else f'（{bars} 根）'}"
-        f"｜实时价 {_fmt_px(snapshot.get('livePx'))}"
-        f"｜当前浮盈 {_fmt_usd(snapshot.get('unrealizedPnlUsd'))}"
-        f"（保证金收益 {_fmt_pct(snapshot.get('returnPct'))}）\n"
-        f"  峰值浮盈 {_fmt_usd(snapshot.get('peakUnrealizedPnlUsd'))}"
-        f"（保证金收益 {_fmt_pct(snapshot.get('peakReturnPct'))}，"
-        f"峰值价 {_fmt_px(snapshot.get('peakPx'))}）→ 已回吐 "
-        f"{float(snapshot.get('givebackRatio') or 0.0) * 100:.1f}%\n"
-        f"{_format_lines(snapshot)}\n"
-        f"{_format_effective_exit(snapshot)}\n"
-        f"  {_format_exchange_oco(snapshot)}")
-    return "\n".join(part for part in (body, last_exit_line) if part)
-
-
-def _format_effective_exit(snapshot: dict) -> str:
-    exit_px = snapshot.get("effectiveExitPx")
-    if exit_px is None:
-        return "  ★ 有效退出线：尚未武装，本轮保护层不会平仓——退出完全由你负责"
-    return (f"  ★ 有效退出线 {_fmt_px(exit_px)}：价格**向下触及**（做空为向上）即由系统市价平仓，"
-            "你无需等待")
-
-
-def format_profit_hold_note(snapshot: dict | None, rounds) -> str:
-    """盈利持仓自察段（§2.6 c / F3）：仅浮盈为正且连续观望达阈值时由调用方注入。
-
-    措辞必须**对称**（沿用 `_format_hold_streak` 踩过的坑）：既打断「盈利也无脑持有」，也不得暗示
-    「必须马上平仓」——否则注记本身会变成过度交易的推手。
-    """
-    if not snapshot or not isinstance(rounds, int) or rounds <= 0:
-        return ""
-    return_pct = snapshot.get("returnPct")
-    if return_pct is None or return_pct <= 0:
-        return ""
-    return (f"盈利持仓自察：你已连续 {rounds} 轮在浮盈状态下选择继续持有"
-            f"（当前保证金收益 {_fmt_pct(return_pct)}，"
-            f"自峰值已回吐 {float(snapshot.get('givebackRatio') or 0.0) * 100:.1f}%）。"
-            "若本轮仍选择持有，请在研判中明确给出：① **你的退出线**（具体价位或条件），"
-            "② 为什么此刻继续承担利润回吐风险优于兑现。这不是必须平仓的指令；"
-            "但「浮盈还在」本身不构成继续持有的理由。")

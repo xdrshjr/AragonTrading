@@ -72,7 +72,10 @@ function runningView(): AiBacktestJobView {
   };
 }
 
-function completeView(opts: { ext?: boolean; bench?: boolean } = { ext: true, bench: true }): AiBacktestJobView {
+function completeView(
+  opts: { ext?: boolean; bench?: boolean; guard?: { enabled: boolean; exits: number } }
+    = { ext: true, bench: true },
+): AiBacktestJobView {
   const base = runningView();
   return {
     ...base,
@@ -88,6 +91,8 @@ function completeView(opts: { ext?: boolean; bench?: boolean } = { ext: true, be
         decisionRounds: 6, actionCounts: { open_long: 3, open_short: 0, close: 3, hold: 0 },
         holdRate: 0, avgConfidence: 0.8, degradedRounds: 0, timeoutRounds: 0, summaryCount: 2,
         finalSummary: "偏多", decisionEveryBars: 1, plannedRounds: 6, reachedRoundCap: false,
+        profitGuardEnabled: opts.guard?.enabled,
+        profitGuardExits: opts.guard?.exits,
       },
       equity: [
         { ts: START, equity: 10000, drawdown: 0 },
@@ -169,6 +174,23 @@ describe("AiBacktestModal · complete dashboard", () => {
     fireEvent.click(screen.getByRole("button", { name: "AI 决策" }));
     expect(screen.getByText("决策轮数")).toBeInTheDocument();
     expect(screen.getByText("动作分布")).toBeInTheDocument();
+  });
+
+  // 保护层免责卡片的门控是「本次回测是否真的装配了保护层」，不是「触发了几次」：未装配的回测同样
+  // 下发 profitGuardExits: 0，照它渲染就等于在一次没有防线的回测上宣称有防线（RV-1）。
+  it("profit-guard caveat card only shows when the backtest actually assembled the guard", () => {
+    mockView = completeView({ ext: true, bench: true, guard: { enabled: true, exits: 2 } });
+    const { unmount } = render(<AiBacktestModal jobId="aibt_done" onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "AI 决策" }));
+    expect(screen.getByTestId("bt-profit-guard-exits").textContent).toContain("2");
+    expect(screen.getByText(/跳空穿越按开盘价成交/)).toBeInTheDocument();
+    unmount();
+
+    mockView = completeView({ ext: true, bench: true, guard: { enabled: false, exits: 0 } });
+    render(<AiBacktestModal jobId="aibt_done" onClose={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "AI 决策" }));
+    expect(screen.queryByTestId("bt-profit-guard-exits")).toBeNull();
+    expect(screen.queryByText(/保守近似/)).toBeNull();
   });
 
   it("gracefully degrades for old results lacking extendedMetrics / benchmark", () => {

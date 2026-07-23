@@ -14,7 +14,8 @@ import pytest
 from app.agent.llm.base import StreamEvent
 from app.ai_auto.base_rules import MaBandRule
 from app.ai_auto.decider import AiTradeDecider
-from app.ai_auto.profit_guard import ProfitGuardRule, format_profit_guard_for_prompt
+from app.ai_auto.profit_guard import ProfitGuardRule
+from app.ai_auto.profit_guard_text import format_profit_guard_for_prompt
 from app.ai_auto.prompts import REFLECTION_TOOL_NAME
 from app.ai_auto.session import AiTradeSession
 from app.config import Settings
@@ -920,7 +921,7 @@ def _arm_peak(session, peak_px: float, *, aged_s: float = 300.0) -> None:
     """把峰值推到 `peak_px` 并让最短持有期过去（`opened_wall` 回拨）。"""
     session._last_live_px = peak_px
     session._refresh_profit_state(time.time())
-    session._profit_state.opened_wall -= aged_s
+    session._guard.state.opened_wall -= aged_s
 
 
 async def test_profit_guard_absent_rule_is_byte_identical():
@@ -1018,7 +1019,7 @@ async def test_profit_guard_failed_close_does_not_count_or_claim_success():
         events = _drain(q)
         assert attempts["n"] == 2                         # 失败即保留状态、下轮重试
         assert session.profit_guard_exits == 0
-        assert session._pending_protect_note is None
+        assert session._guard.pending_protect_note is None
         assert session.executor.projected == "long"
         messages = [e["data"].get("message") or "" for e in events if e["type"] == "status"]
         assert not any("已市价平仓" in m for m in messages)
@@ -1161,11 +1162,133 @@ async def test_profit_hold_streak_only_counts_undegraded_profitable_holds():
 
     session._update_profit_hold_streak("hold", None, profitable)
     session._update_profit_hold_streak("hold", None, profitable)
-    assert session._profit_hold_streak == 2
+    assert session._guard.hold_streak == 2
     session._update_profit_hold_streak("hold", "llm_error", profitable)
-    assert session._profit_hold_streak == 2               # 降级轮不变
+    assert session._guard.hold_streak == 2               # 降级轮不变
     session._update_profit_hold_streak("hold", None, losing)
-    assert session._profit_hold_streak == 0
+    assert session._guard.hold_streak == 0
     session._update_profit_hold_streak("hold", None, profitable)
     session._update_profit_hold_streak("open_long", None, profitable)
-    assert session._profit_hold_streak == 0               # 已展示交易意愿 ⇒ 归零
+    assert session._guard.hold_streak == 0               # 已展示交易意愿 ⇒ 归零
+
+
+# ============ F2 冷却期 + F4 峰值浮盈回填（ai-trade-profit-protection-adaptive §2.2/§2.4）============
+async def test_protective_exit_starts_cooldown_and_wires_three_carriers():
+    """保护层**确实平掉一笔**后开启冷却，并同时出现在决策 payload / round_start 轨迹 / status 三载体。"""
+    await init_db()
+    rule = _pg_rule(cooldown_s=180.0)
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        _open_long(session)
+        peak = _pg_peak_px(0.10)
+        _arm_peak(session, peak)
+        session._last_live_px = _pg_trail_px(peak, rule)
+
+        await session._maybe_profit_exit(_START_TS)
+
+        assert session._guard.cooldown is not None
+        assert session._guard.cooldown.side == "long"
+        assert session._guard.cooldown.reason_code == "profit_guard_trailing"
+        payload = session._build_decision_payload(1, 0, _PG_ENTRY, [], "candle")
+        view = payload["profitGuardCooldown"]
+        assert view["blockedSide"] == "long" and view["scope"] == "same_side"
+        assert 0 < view["remainingSeconds"] <= 180
+        assert session._status_payload()["profitGuardCooldown"]["blockedSide"] == "long"
+        from app.ai_auto.trace import new_round_trace
+        assert new_round_trace(1, 0, _PG_ENTRY, payload, [])["profitGuardCooldown"] == view
+    finally:
+        await dispose_engine()
+
+
+async def test_cooldown_gate_sits_between_base_rule_and_consensus():
+    """门禁落点：冷却把同向开仓降级为 hold（铁律后、共识前）；`close` 与反向开仓不受影响。"""
+    await init_db()
+    rule = _pg_rule(cooldown_s=180.0)
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        from app.ai_auto.decider import TradeDecision
+        from app.ai_auto.profit_cooldown import CooldownState
+
+        session._guard.cooldown = CooldownState(
+            until_wall=time.time() + 120.0, side="long",
+            reason_code="profit_guard_trailing", label="移动止盈")
+
+        opened = TradeDecision(action="open_long", size_fraction=0.5, confidence=0.6, reason="x")
+        degraded, reason = session._apply_profit_cooldown_gate(opened, None)
+        assert degraded.action == "hold" and reason.startswith("profit_cooldown(")
+
+        closing = TradeDecision(action="close", size_fraction=None, confidence=None, reason="x")
+        passed, none_reason = session._apply_profit_cooldown_gate(closing, None)
+        assert passed is closing and none_reason is None
+
+        # 已有降级码时先执行者胜出（铁律的原因不被冷却覆盖）。
+        _, kept = session._apply_profit_cooldown_gate(opened, "base_rule_ma_band(pctB=0.42)")
+        assert kept == "base_rule_ma_band(pctB=0.42)"
+    finally:
+        await dispose_engine()
+
+
+async def test_expired_cooldown_pushes_one_more_status():
+    """冷却到期主动补推一次 status（`profitGuardCooldown: null`）——不推则前端 chip 会一直挂着。"""
+    await init_db()
+    session, _, _ = _make_session(action="hold", profit_rule=_pg_rule(cooldown_s=180.0))
+    try:
+        from app.ai_auto.profit_cooldown import CooldownState
+
+        session._guard.cooldown = CooldownState(
+            until_wall=time.time() - 1.0, side="long",
+            reason_code="profit_guard_trailing", label="移动止盈")
+        q = session.subscribe()
+
+        await session._expire_profit_cooldown()
+
+        events = [e for e in _drain(q) if e["type"] == "status"]
+        assert len(events) == 1
+        assert events[0]["data"]["profitGuardCooldown"] is None
+        assert session._guard.cooldown is None
+
+        await session._expire_profit_cooldown()          # 幂等：已清空则不再推
+        assert _drain(q) == []
+    finally:
+        await dispose_engine()
+
+
+async def test_close_trade_carries_peak_pnl_read_and_consumed():
+    """T-4（F4）：close 成交带 `peakPnlUsd` 且**读取即消费**——第二笔不得继承第一笔的峰值。"""
+    await init_db()
+    session, _, _ = _make_session(action="hold", profit_rule=_pg_rule())
+    try:
+        _open_long(session)
+        _arm_peak(session, _pg_peak_px(0.10))
+        assert session._guard.last_peak_pnl_usd is not None
+
+        first = {"ts": _START_TS, "side": "close", "price": _PG_ENTRY, "qty": 1.0,
+                 "fee": 0.0, "pnl": 0.1, "positionAfter": 0.0, "reason": "x"}
+        second = dict(first, ts=_START_TS + 1)
+        await session._dispatch([{"type": "trade", "data": first},
+                                 {"type": "trade", "data": second}])
+
+        assert first["peakPnlUsd"] is not None and first["peakPnlUsd"] > 0
+        assert second["peakPnlUsd"] is None              # 绝不继承，也绝不补 0
+    finally:
+        await dispose_engine()
+
+
+async def test_profit_guard_status_message_is_derived_from_pnl_sign():
+    """§六.1b / P0-1：保护性平仓的 status 文案由 pnl 符号派生，不无条件写「锁定利润」。"""
+    await init_db()
+    rule = _pg_rule()
+    session, _, _ = _make_session(action="hold", profit_rule=rule)
+    try:
+        _open_long(session)
+        q = session.subscribe()
+        peak = _pg_peak_px(0.10)
+        _arm_peak(session, peak)
+        session._last_live_px = _pg_trail_px(peak, rule)
+
+        await session._maybe_profit_exit(_START_TS)
+
+        messages = [e["data"].get("message") for e in _drain(q) if e["type"] == "status"]
+        assert any(m and "锁定利润" in m for m in messages)   # 本例确为正浮盈出场
+    finally:
+        await dispose_engine()
