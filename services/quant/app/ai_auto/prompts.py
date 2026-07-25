@@ -72,7 +72,8 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
                                  allow_limit: bool = False,
                                  limit_band_pct: float = 0.02,
                                  base_rules_text: str = "",
-                                 profit_guard_text: str = "") -> str:
+                                 profit_guard_text: str = "",
+                                 sizing_text: str = "") -> str:
     """决策者系统 prompt：信号仅供参考 + 分步思维链纪律 + 风险偏好 + 只用真数据 + 收尾必调决策工具。
 
     `position_step_pct`（默认 0.0 → 连续、原文逐字不变、零回归）：当 `>0` 时把决策纪律 #3 的
@@ -94,8 +95,13 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
     `profit_guard_text`（末位，默认 `""` → 渲染逐字节不变、零回归，ai-trade-profit-protection §2.6 a）：
     利润保护宪章章（`profit_guard_text.format_profit_guard_charter` 产物）。非空时紧随基础策略铁律章之后
     ——两者都是「系统强制执行」的层，但语义互补：一个约束在哪开仓，一个约束利润何时被强制锁定。
+
+    `sizing_text`（末位，默认 `""` → 渲染逐字节不变、零回归，vol-sizing-and-drawdown-brake §3.8）：
+    仓位与风险层宪章章（`sizing_text.format_sizing_charter` 产物）。紧随利润保护章之后——它约束的是
+    **下多大注**，与前两者「在哪开」「何时锁」构成完整的三段式硬约束声明。
     """
-    charter = "".join(f"{text}\n\n" for text in (base_rules_text, profit_guard_text) if text)
+    charter = "".join(f"{text}\n\n"
+                      for text in (base_rules_text, profit_guard_text, sizing_text) if text)
     return (
         "你是一名严谨、纪律性极强的加密合约自动交易决策者。你不是聊天助手，也不是信号复读机——你的"
         f"**唯一职责**是在每个决策轮，为标的 {inst_id}（周期 {bar}）做出一个受严格约束的交易决策。"
@@ -119,7 +125,8 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
         "反转时优先考虑 close；陈旧或缺失周期不得补猜。观望是需要当前证据支撑的主动决策，不是默认"
         "答案；不要因历史摘要中长期观望而路径依赖。\n"
         f"3. 风险优先：已持仓且多数证据转为反向时，优先 close 保护利润 / 止损；空仓且多数证据同向、"
-        f"研判充分时才开仓，{_size_discipline(position_step_pct)}，避免频繁反手与过度交易。\n"
+        f"研判充分时才开仓，{_size_discipline(position_step_pct, bool(sizing_text))}，"
+        "避免频繁反手与过度交易。\n"
         f"4. {_action_discipline(allow_limit, limit_band_pct)}"
         "真实下单由系统的守护执行器落地并继承全部资金护栏，你只需给出决策与理由。\n"
         "5. **收尾硬约束（务必遵守）：每轮在完成上述分步研判之后，必须且只能调用一次 "
@@ -143,15 +150,24 @@ def _action_discipline(allow_limit: bool, band_pct: float = 0.02) -> str:
             "空操作）。限价适合有明确点位、愿意等待的入场/离场；急需立即成交（如止损保护）请用市价。")
 
 
-def _size_discipline(position_step_pct: float) -> str:
-    """决策纪律 #3 的开仓规模子句：`step<=0` 保持原文（连续）；`step>0` 换为「只能取允许档位」（[R-8]）。"""
+def _size_discipline(position_step_pct: float, sizing_enabled: bool = False) -> str:
+    """决策纪律 #3 的开仓规模子句：`step<=0` 保持原文（连续）；`step>0` 换为「只能取允许档位」（[R-8]）。
+
+    `sizing_enabled`（末位，默认 False → 渲染逐字节不变、零回归）：仓位层装配时**追加**一句上限声明
+    （vol-sizing §3.8）——**不替换**原句：原句讲的是档位、新句讲的是上限，两者不冲突且都必须说清。
+    """
     step = max(0.0, float(position_step_pct))
     if step <= 0:
-        return "sizeFraction 保守（默认 ≤0.5）"
-    from .signals import position_ladder   # 延迟导入打破 signals→decider→prompts 模块级循环（§2.2）
-    ladder_text = " / ".join(f"{g:g}" for g in position_ladder(step))
-    return (f"开仓 sizeFraction **只能**从允许档位中选择：{ladder_text}"
-            "（系统会把你给出的值吸附到最近的合法档位，非档位值一律被量化）")
+        base = "sizeFraction 保守（默认 ≤0.5）"
+    else:
+        from .signals import position_ladder   # 延迟导入打破 signals→decider→prompts 模块级循环（§2.2）
+        ladder_text = " / ".join(f"{g:g}" for g in position_ladder(step))
+        base = (f"开仓 sizeFraction **只能**从允许档位中选择：{ladder_text}"
+                "（系统会把你给出的值吸附到最近的合法档位，非档位值一律被量化）")
+    if not sizing_enabled:
+        return base
+    return (base + "；且你的 sizeFraction 是**上限提议**：系统会按波动率、胜率先验、成本与组合敞口"
+            "独立解一个上限，并取两者较小值执行")
 
 
 def build_decision_tool_description(allow_limit: bool = False, *,
@@ -468,6 +484,19 @@ def _format_profit_cooldown(cooldown: dict | None) -> str:
     return format_profit_cooldown(cooldown)
 
 
+def _format_sizing(plan: dict | None) -> str:
+    """仓位约束段（vol-sizing-and-drawdown-brake §3.8）。
+
+    `payload["sizingPlan"]` **键缺失 / None**（三条规则全未装配 / 回测 payload 无此键）⇒ 返回空串 ⇒
+    整段省略 ⇒ 逐字节回退。渲染委托 `sizing_text` 纯文案模块（**与判定同源**：UI 与 prompt 说的上限
+    必须就是系统真正执行的那个数，否则模型会把一个被静默改写的仓位写进自己的摘要）。
+    """
+    if not plan:
+        return ""
+    from .sizing_text import format_sizing_for_prompt   # 延迟导入，与 _format_profit_cooldown 同范式
+    return format_sizing_for_prompt(plan)
+
+
 def _format_profit_hold_note(payload: dict) -> str:
     """盈利持仓自察段（§2.6 c / F3）：`profitHoldRounds` 键缺失即整段省略（会话侧按阈值决定注入）。"""
     rounds = payload.get("profitHoldRounds")
@@ -499,6 +528,9 @@ def build_decision_prompt(payload: dict) -> str:
     cooldown_line = _format_profit_cooldown(payload.get("profitGuardCooldown"))
     if cooldown_line:                        # 冷却未激活 ⇒ 整段省略（不写「当前无冷却」的噪音）
         parts.append(cooldown_line)
+    sizing_line = _format_sizing(payload.get("sizingPlan"))
+    if sizing_line:                          # 键缺失 ⇒ 整段省略（规则未装配 / 回测 payload 无此键）
+        parts.append(sizing_line)
     parts.append(
         f"会话累计盈亏≈{payload.get('sessionPnlUsd')} USDT / 预算 {payload.get('budgetUsd')} USDT；"
         f"会话止盈阈值={'不触发' if tp is None else tp}，止损阈值={'不触发' if sl is None else sl}")

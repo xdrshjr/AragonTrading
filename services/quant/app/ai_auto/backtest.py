@@ -17,7 +17,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pandas as pd
 from fastapi import HTTPException
@@ -78,6 +78,8 @@ from .signals import (
     evaluate_signal_board,
     make_shadow_broker,
 )
+from .sizing_runtime import SizingContext, build_sizing_runtime
+from .sizing_text import SIZING_BACKTEST_NOTE
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +257,8 @@ class AiBacktestRunner:
                               taker_fee_bps=self.settings.default_taker_fee_bps,
                               slippage_bps=self.settings.default_slippage_bps, leverage=self.leverage)
         self.main.set_risk(self._oco_risk)
+        # 仓位/刹车层（vol-sizing §3.10）：与实盘共用同一批纯核心，规则由 runner 从 settings 自解析（[P1-7]）。
+        self._sizing = build_sizing_runtime(spec.settings, self.inst_id, BAR_SECONDS[self.bar])
         self.shadows = [make_shadow_broker() for _ in self.specs]
 
         self.rounds_done = 0
@@ -330,8 +334,10 @@ class AiBacktestRunner:
         }
         first = self._first_decision_index(main_df)
         # 最小 edge 门禁同样按 `_atr_at(i)` 取粗估 edge（§3.6），故 k_min>0 时也必须建这条序列——
-        # 否则门禁在回测里恒 unavailable、fail-open 放行，「回测同位插入」就成了空话（spec §十二 I-5）。
-        if self.profit_rule is not None or self.settings.ai_trade_edge_gate_k_min > 0:
+        # 否则门禁恒 unavailable、fail-open 放行（I-5）。ATR 止损（vol-sizing §3.10 复发点一）同款：不把
+        # 总闸②或进来，`_atr_series` 恒 None ⇒ 止损在回测里恒不生效**且不报任何错**（T-19 守这条）。
+        if (self.profit_rule is not None or self.settings.ai_trade_edge_gate_k_min > 0
+                or self.settings.ai_trade_stop_atr_mult > 0):
             # F1/F3：ATR 一次性向量化（第 i 根取 iloc[i-1]，含本根 h/l 的 ATR 是未来函数）。
             self._atr_series = atr(main_df, self.settings.ai_trade_profit_guard_atr_period)
             self._bar_ts_index = main_df["ts"].astype(int).tolist()
@@ -388,6 +394,7 @@ class AiBacktestRunner:
             # 同根同时命中按更保守的先手记因）、mark **之前**（本根内的平仓必须反映进本根权益点）。
             self._apply_profit_guard_bar(i, row)
             self.main.mark(ts=int(row["ts"]), close=float(row["c"]))
+            self._sizing.note_equity(self.main.equity_at(float(row["c"])))   # 刹车权益推进
             if self.main.pos.side != "flat":         # [B1] 在场根计数（timeInMarketPct 分子）
                 self._bars_in_market += 1
             self._bars_processed = i - first + 1
@@ -526,6 +533,7 @@ class AiBacktestRunner:
         # ★ 利润保护冷却门禁（F2 §2.3.3a）：与实盘同序（铁律后、共识前）、**同一个纯函数**——严禁在
         # 回测侧复制一份判定（那正是 v1 P1-4 给【基础策略】铁律定下的规矩）。未装配 ⇒ 原样直通（G-3）。
         decision, cooldown_reason = apply_profit_cooldown(decision, self._cooldown, now_wall=ts)
+        decision, brake_reason = self._sizing.gate(decision, None, now_wall=float(ts))  # ★ 刹车（第 7 步）
         decision, consensus_reason = apply_consensus_gate(decision, consensus, self.min_consensus)
         # ★ 最小 edge 门禁（§3.7）：与实盘**同一纯核心、同位插入**（共识后、反思前）；k_min=0（默认）
         # ⇒ 恒返回 None ⇒ 既有回测结果逐字节相同。成本用 SimBroker 实收常数（两侧各自对自己的世界说真话）。
@@ -536,7 +544,7 @@ class AiBacktestRunner:
         edge_reason = edge_out.reason if edge_out is not None else None
         decision = edge_out.decision if edge_out is not None else decision
         # 四元合成，先执行者胜出：铁律优先级最高，冷却次之（本系统刚亲手做过的动作，解释力强于票数）。
-        gate_reason = base_reason or cooldown_reason or consensus_reason or edge_reason
+        gate_reason = base_reason or cooldown_reason or brake_reason or consensus_reason or edge_reason
         # 二次反思（决策脑不变式：回测复用同一 decider.reflect，emit=None 轨迹全程空转）。verdict 须在分支外
         # 预置 None（RV-3），否则 hold 轮走 else 分支时 _tally_reflection(verdict) 会 NameError。
         verdict = None
@@ -548,6 +556,18 @@ class AiBacktestRunner:
             verdict = await self.decider.reflect(payload, decision)             # emit 缺省 None
             decision, reflect_reason = apply_reflection(
                 decision, gate_reason, verdict, self.position_step_pct)         # 复用 session 同款纯函数
+        # ★ 仓位求解 + ATR 止损（第 11 步，反思后、_execute 前）。[P0-3] **必须双写**：`apply_risk` 第三形参
+        # 根本没被使用、止损价是 `_open` 时由 `self._risk` 冻结进 pos 的，只改 `_oco_risk` 一行都不会生效且
+        # 不报错；而它的 take_profit_pct 又被 edge 门禁当上界读（backtest.py:534），故两条必须同步更新。
+        decision, plan, _ = self._sizing.resolve(decision, SizingContext(
+            ref_px=ref_px, atr_px=self._atr_at(i), step=self.position_step_pct, now_wall=float(ts),
+            closes=list(main_df["c"].iloc[:i + 1]), fallback_stop_pct=self._oco_risk.stop_loss_pct,
+            notional_full=self.main.equity_at(ref_px) * self.leverage,
+            fallback_take_pct=self._oco_risk.take_profit_pct))
+        if plan is not None:
+            self._oco_risk = replace(self._oco_risk, stop_loss_pct=plan.stop_pct,
+                                     take_profit_pct=plan.take_pct)
+            self.main.set_risk(self._oco_risk)       # ← 缺这一行 = 彻底空转（simulator.py:123 已存在）
         executed = self._execute(decision)
         self.rounds_done = round_no
         self._tally(decision, decide_degrade, gate_reason)
@@ -698,6 +718,8 @@ class AiBacktestRunner:
         while self._trades_emitted < len(self.main.trades):
             trade = self.main.trades[self._trades_emitted]
             self._trades_emitted += 1
+            if trade.side == "close":       # 回测侧成交唯一收口 ⇒ 连亏计数（与实盘 _dispatch 同位）
+                self._sizing.note_close(trade.pnl, now_wall=float(trade.ts))
             job.publish({"type": "trade", "data": _trade_wire(trade)})
 
     def _emit_progress(self, job: "_BacktestJob", i: int, first: int, total: int,
@@ -790,6 +812,8 @@ class AiBacktestRunner:
             notes.append(_PROFIT_GUARD_BACKTEST_NOTE)
         if self.settings.ai_trade_edge_gate_k_min > 0:
             notes.append(_EDGE_GATE_BACKTEST_NOTE)
+        if self._sizing.armed:
+            notes.append(SIZING_BACKTEST_NOTE)
         return notes
 
     def _build_result(self, metrics: dict, ai_stats: dict, notes: list[str]) -> dict:

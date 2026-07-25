@@ -15,6 +15,7 @@ import time
 from ..live_auto.fee_ledger import explain_meta_fields
 from ..okx.rest_client import get_rest_client
 from .attribution import AttributionLedger
+from .cost_model import estimate_round_trip_cost, query_for_decision, resolve_cost_params
 from .edge_gate import EdgeGateOutcome, evaluate_edge_gate
 from .funding import FundingCache
 from .stats_ext import build_cost_stats, cost_snapshot_wire, merge_cost_stats
@@ -76,6 +77,28 @@ class CostRuntime:
             out.wire["priorP"] = readout.get("p")
             out.wire["priorContributors"] = readout.get("contributors")
         return out
+
+    def estimate_cost_only(self, decision, bar_seconds: int) -> float | None:
+        """只读往返成本估算（bps），**不受 `k_min` 门控**（vol-sizing §4.2 / Q-2）。
+
+        `evaluate` 在 `k_min <= 0`（默认值）时整体早退返回 `None`，故仓位层的凯利项若走那条路会**默认
+        恒不可算**——那等于「为了让一个仓位特性生效，运维必须先打开另一层会真实否决开仓的资金门禁」。
+        本入口复用**同一对**纯核心（`estimate_round_trip_cost` + `resolve_cost_params`，`evaluate_edge_gate`
+        用的也是这两行），因此**不是第二条估算路径、不存在口径漂移**：`k_min` 早退只发生在编排函数里，
+        两个估算纯核心都是模块级、无门控。
+
+        资金费率快照在 `k_min=0` 时不刷新（构造期的 `enabled` 条件），故此路径拿到的成本
+        `confidence="degraded"`——**如实透传**，不做任何补齐；`degraded` 只会让成本偏保守，不影响可算性。
+
+        Returns:
+            往返成本（bps）；非开仓动作照样可算（纯函数不看动作），调用方自行决定用不用。
+        """
+        cost = estimate_round_trip_cost(
+            query_for_decision(decision, bar_seconds=bar_seconds,
+                               funding=self.funding.snapshot(time.time()),
+                               funding_enabled=self.settings.ai_trade_funding_enabled),
+            resolve_cost_params(self.settings))
+        return cost.total_bps
 
     def note_gate(self, out: EdgeGateOutcome) -> int:
         """记一轮门禁判定 + 推进连续不可用计数；返回当前连续轮数（0 = 本轮可用 / 本轮不受约束）。

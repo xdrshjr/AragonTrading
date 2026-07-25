@@ -22,6 +22,7 @@ import {
   describeProfitGuardTrail,
   describeReflection,
   describeRegime,
+  describeSizing,
   describeStance,
   isEffectiveExitCommitted,
   describeTraceState,
@@ -268,6 +269,53 @@ function EdgeGateBlock({ trace }: { trace: AiTradeRoundTrace }) {
       {trace.edgeGateReason && (
         <p className="text-[11px] leading-relaxed text-[var(--text)]">
           {describeDegradeReason(trace.edgeGateReason)}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 仓位与风险段（vol-sizing-and-drawdown-brake §6.3 第 7a 点）：紧随成本门禁之后——管线顺序即卡片顺序
+ * （铁律 → 刹车 → 共识 → 成本门禁 → 反思 → **本层**）。三条规则全未装配 ⇒ `describeSizing` 返回 null
+ * ⇒ 整段不渲染（老会话与老快照零影响）。
+ *
+ * 刻意把 `fFinalRaw` 与 `finalFraction` **同时**摆出来：两者之差就是被档位地板吃掉的量。只显示后者会让
+ * 一次纯 no-op 的减速看起来和真减速一模一样，那正是本仓库最忌讳的假阳性观测。
+ */
+function SizingBlock({ trace }: { trace: AiTradeRoundTrace }) {
+  const view = describeSizing(trace);
+  if (!view) return null;
+  return (
+    <div className="flex flex-col gap-1.5 rounded-[10px] border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] px-2.5 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1 text-[11px] font-medium text-[var(--text)]">
+          <span className="leading-none">📐</span>仓位与风险（下多大注 / 止损多远）
+        </span>
+        <span
+          className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+          style={{ color: TONE_VAR[view.tone], backgroundColor: toneSoft(view.tone) }}
+        >
+          {view.label}
+        </span>
+      </div>
+      {view.note && <p className="text-[10px] leading-relaxed text-[var(--muted)]">{view.note}</p>}
+      <div className="flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-[var(--muted)]">
+        {trace.fVol != null && <span>波动率目标项 {fmtNum(trace.fVol, 2)}</span>}
+        {trace.fKelly != null && <span>凯利项 {fmtNum(trace.fKelly, 2)}</span>}
+        {trace.fFinalRaw != null && <span>吸附前 {fmtNum(trace.fFinalRaw, 3)}</span>}
+        {trace.finalFraction != null && <span>实际下单占比 {fmtNum(trace.finalFraction, 2)}</span>}
+        {trace.stopPct != null && trace.takePct != null && (
+          <span>
+            止损 ±{fmtNum(trace.stopPct * 100, 2)}% / 止盈 {fmtNum(trace.takePct * 100, 2)}%
+          </span>
+        )}
+        {trace.drawdownPct != null && <span>会话回撤 {fmtNum(trace.drawdownPct * 100, 1)}%（含未实现）</span>}
+        {trace.corrScale != null && trace.corrScale < 1 && <span>相关性缩减 ×{fmtNum(trace.corrScale, 2)}</span>}
+      </div>
+      {trace.brakeReason && (
+        <p className="text-[11px] leading-relaxed text-[var(--text)]">
+          {describeDegradeReason(trace.brakeReason)}
         </p>
       )}
     </div>
@@ -534,6 +582,7 @@ export default function AiTradeTraceRound({ trace }: { trace: AiTradeRoundTrace 
       <BaseRuleBlock trace={trace} />
       <EdgeGateBlock trace={trace} />
       <ProfitGuardBlock trace={trace} />
+      <SizingBlock trace={trace} />
       <ReflectionBlock trace={trace} />
       <ResultRow trace={trace} />
       <SignalContext trace={trace} />

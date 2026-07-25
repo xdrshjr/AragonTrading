@@ -505,6 +505,65 @@ describe("AiTradeAgentTrace · 利润保护段", () => {
   });
 });
 
+// ---------------- 仓位与风险段（vol-sizing-and-drawdown-brake §6.3 第 7a/7b 编辑点）----------------
+// 本组用例守的是**挂载**而不只是定义：本仓库有过「组件写好了但不在渲染树里——数据到了、代码全绿、
+// 界面上什么都没有」的同类事故，`tsc` 与逐函数单测都不会替你发现少挂了一个。
+describe("AiTradeAgentTrace · 仓位与风险段", () => {
+  it("三条规则全未装配（默认）⇒ 整段不渲染", () => {
+    render(
+      <AiTradeAgentTrace group={groupWith(SESSION, [round({})])} activeInstId="BTC-USDT-SWAP" />,
+    );
+    expect(screen.queryByText(/仓位与风险/)).not.toBeInTheDocument();
+  });
+
+  it("装配后渲染：吸附前/后两个数同时可见（差值即被档位地板吃掉的量）", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            brakeLevel: "slow",
+            stopSource: "atr",
+            modelFraction: 0.75,
+            finalFraction: 0.25,
+            fFinalRaw: 0.135,
+            fVol: 0.28,
+            fKelly: 0.21,
+            scaleErased: true,
+            scaleSource: "brake",
+            stopPct: 0.021,
+            takePct: 0.042,
+            drawdownPct: 0.092,
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText(/仓位与风险/)).toBeInTheDocument();
+    expect(screen.getByText("仓位层缩减 · 0.75→0.25")).toBeInTheDocument();
+    expect(screen.getByText(/吸附前 0\.135/)).toBeInTheDocument();
+    expect(screen.getByText(/实际下单占比 0\.25/)).toBeInTheDocument();
+    expect(screen.getByText(/止损 ±2\.10% \/ 止盈 4\.20%/)).toBeInTheDocument();
+  });
+
+  it("第二档「只平不开」把降级码中文化，并写清平仓不受影响", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            brakeLevel: "halt",
+            drawdownPct: 0.162,
+            brakeReason: "drawdown_brake_halt(dd=16.2%)",
+            stopSource: "fixed",
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText(/回撤刹车 · 只平不开/)).toBeInTheDocument();
+    expect(screen.getByText(/暂停开新仓（平仓不受影响）/)).toBeInTheDocument();
+  });
+});
+
 describe("AgentPanel segmented view", () => {
   beforeEach(() => {
     localStorage.clear();

@@ -63,16 +63,19 @@ from .signals import (
     evaluate_signal_board,
     make_shadow_broker,
 )
+from .sizing_runtime import SizingRuntime
 from .trace import (
     _TRACES_MAX,
     TraceEmit,
     apply_edge_gate_trace,
+    apply_sizing_trace,
     base_rule_event,
     edge_gate_event,
     edge_gate_unavailable_event,
     new_round_trace,
     reflection_start_event,
     reflection_verdict_event,
+    sizing_event,
     trace_event,
 )
 from .wake_guard import should_skip_interval_wake
@@ -110,7 +113,8 @@ class AiTradeSession:
                  context_refresh_rounds: int = 10, wake_interval_s: float = 0.0,
                  base_rule: MaBandRule | None = None,
                  profit_rule: ProfitGuardRule | None = None,
-                 prior_snapshot: dict | None = None):
+                 prior_snapshot: dict | None = None,
+                 sizing: SizingRuntime | None = None):
         self.session_id = session_id
         self.run_id = run_id
         self._specs = specs
@@ -147,6 +151,8 @@ class AiTradeSession:
         # 信号先验层（signal-prior-and-ev-gate §3.1）：同款下沉范式；总闸①关或快照缺席 ⇒ payload
         # 无 signalPriors 键、prompt 逐字节回退、EV 分子回退 ATR 粗估（既有单测零回归）。
         self._prior = PriorRuntime(prior_snapshot, executor.settings)
+        # 仓位 / 刹车层（vol-sizing §3.1）：同款下沉；未装配 ⇒ 零动作、无 sizingPlan 键、risk 从不被赋值。
+        self._sizing = sizing or SizingRuntime()
         # P0-1：会话级单调持仓序号——`_dispatch` 观察到任一 `side=="close"` 成交即 +1。epoch 身份的一半，
         # 没有它，「保护平仓 → 同一 tick 内同向重开」的新仓会继承旧峰值并被当场强平（真实资金）。
         self._position_seq = 0
@@ -257,6 +263,8 @@ class AiTradeSession:
                         # 键已存在时也会把峰值消费掉，让下一笔平仓静默拿到 None）
                         trade["peakPnlUsd"] = self._guard.take_peak_pnl()
                     self._cost.record_close(trade)      # §3.8：往返归因同挂这个唯一收口
+                    self._sizing.note_close(trade, now_wall=time.time())   # 连亏计数同挂唯一收口
+                self._sizing.note_executor(self.executor, self._current_px())   # [P1-8] 敞口簿
                 self._inject_explain_meta(trade)
                 await self._persist_trade(trade)
             await self._push(event)
@@ -539,6 +547,7 @@ class AiTradeSession:
         # 上下界整体不生效，退化为纯阶梯回吐（与本层 fail-open 极性一致）。
         self._atr_px = safe_atr(self._window.base_df(),
                                 self.executor.settings.ai_trade_profit_guard_atr_period)
+        self._sizing.note_candles([c["c"] for c in self._window.candles], int(candle.ts))
         decision_as_of_ts = int(candle.ts) + BAR_SECONDS[self.bar]
         await self._window.maybe_refresh_htf(decision_as_of_ts)
         frames = self._window.build_strategy_frames()
@@ -592,6 +601,7 @@ class AiTradeSession:
                 round_no, ts, payload, decision, degrade)
             # ★ 利润保护冷却门禁（adaptive §2.2.2）：铁律后、共识前（见 _apply_profit_cooldown_gate）。
             decision, degrade = self._apply_profit_cooldown_gate(decision, degrade)
+            decision, degrade = self._sizing.gate(decision, degrade)   # ★ 回撤刹车 / 连亏熔断（第 7 步）
             decision, degrade = self._apply_consensus_gate(decision, consensus, degrade)  # E2 门禁
             # ★ 最小 edge 门禁（§3.7）：共识后、反思前——被拦轮此时已是 hold，而反思对 hold 本就
             # 直通 ⇒ EV 不足的轮次自动省掉一次反思 LLM 调用，门禁本身就是省钱项。
@@ -601,6 +611,7 @@ class AiTradeSession:
             # F2（hold-inertia-fix）：第三元 reflection_note 保真「提议了什么、为何被否决」。
             decision, degrade, reflection_note = await self._reflect_before_execute(
                 round_no, ts, payload, decision, degrade)
+            decision = await self._apply_sizing(round_no, ts, ref_px, decision)   # ★ 第 11 步
             executed = await self._execute_decision(decision, ref_px, i, ts)
             self._cost.note_round(bool(executed.get("traded")))          # §6.3 决策转化率
             self.rounds_completed = round_no
@@ -848,6 +859,18 @@ class AiTradeSession:
         if snap is not None:
             await self._push({"type": "status",
                               "data": {**self._status_payload(), "costSnapshot": snap}})
+
+    async def _apply_sizing(self, round_no: int, ts: int, ref_px: float,
+                            decision: TradeDecision) -> TradeDecision:
+        """★ 第 11 步：仓位求解 + ATR 止损覆盖（只缩不放、绝不改 action）；未装配 ⇒ 原对象直通零事件。"""
+        decision, _, wire = self._sizing.resolve_live(
+            decision, self.executor, ref_px=ref_px, atr_px=self._atr_px,
+            step=self.decider.position_step, prior_view=self._prior.coverage_wire(),
+            cost_bps=self._cost.estimate_cost_only(decision, BAR_SECONDS[self.bar]))
+        if wire:
+            apply_sizing_trace(self._round_trace, wire)
+            await self._push(sizing_event(round_no, ts, wire))
+        return decision
 
     def _apply_consensus_gate(self, decision: TradeDecision, consensus: Consensus,
                               degrade: str | None) -> tuple[TradeDecision, str | None]:
@@ -1149,6 +1172,7 @@ class AiTradeSession:
             payload["baseRules"] = {
                 "maBand": build_ma_band(self._window.base_df(), self.base_rule)}
         self._inject_profit_guard(payload)      # §2.6 b/d：未装配 ⇒ 整键缺席 ⇒ prompt 逐字回退
+        self._sizing.inject(payload)            # 同款「整键缺席」范式（vol-sizing §3.8）
         priors = self._prior.build(board, payload.get("marketContext"),
                                    self._window.base_df())
         if priors is not None:                  # 同款「整键缺席」范式（§3.9 的 G-1 逐字节断言）
@@ -1258,6 +1282,7 @@ class AiTradeSession:
         equity = self.executor.budget_usd + self.executor.session_pnl_usd
         self._peak_equity = max(self._peak_equity, equity)
         dd = (equity / self._peak_equity - 1.0) if self._peak_equity > 0 else 0.0
+        self._sizing.note_executor(self.executor, ref_px)   # 刹车权益推进 + 敞口簿轮末兜底（S-14）
         record = {"ts": ts, "equity": equity, "drawdown": min(dd, 0.0)}
         self._equity.append(record)
         await self._push({"type": "equity", "data": record})
@@ -1356,6 +1381,7 @@ class AiTradeSession:
             metrics["aiStats"]["profitGuardArmedRounds"] = self.profit_guard_armed_rounds
             # 成本记账与门禁观测（§3.8，RV-1）：合并落在**调用点**，`_compute_ai_stats` 一字不动。
             metrics["aiStats"] = self._cost.merge_into(metrics["aiStats"])
+            metrics["aiStats"] = self._sizing.merge_into(metrics["aiStats"])   # 同款调用点合并
         except Exception as exc:  # noqa: BLE001 —— 富化对 finalize 是加法且可失败，绝不阻断落库收尾
             logger.warning("ai-trade finalize enrichment skipped for run %s: %s", self.run_id, exc)
             for key in ("equityDigest", "decisionsDigest", "aiStats"):

@@ -35,15 +35,21 @@ from ..live_auto.fee_ledger import build_fee_ledger
 from ..okx.accounts import AccountCredentials
 from ..okx.order_builder import snap_size
 from ..okx.trading import fetch_live_open_orders, fetch_live_positions, fetch_trading_config
+from ..okx.types import BAR_SECONDS
 from ..paper.strategy_factory import PaperStrategySpec
 from .admission import get_admission_lock
 from .base_rules import MaBandRule, format_charter, rule_wire
+from .exposure_book import GroupExposureBook
+from .market_window import MarketWindow
 from .profit_guard import ProfitGuardRule
 from .profit_guard_text import format_profit_guard_charter
 from .profit_guard import rule_wire as profit_guard_wire
 from .decider import AiTradeDecider
 from .prompts import build_ai_trade_system_prompt
 from .session import AiTradeSession
+from .sizing import SizingRule, StopRule, check_window_capacity, parse_sizing_rule, parse_stop_rule
+from .sizing_runtime import build_sizing_runtime, sizing_config_wire
+from .sizing_text import format_sizing_charter
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +173,9 @@ class AiTradeGroup:
     wake_interval_s: float = 0.0             # 墙钟定时唤醒周期（秒；0=关闭），group_status 回显换算为分钟
     base_rule: MaBandRule | None = None      # 【基础策略】铁律（None=未装配），group_status 回显 baseRules
     profit_rule: ProfitGuardRule | None = None   # 利润保护层（None=未装配），回显 profitGuard
+    sizing_rule: SizingRule | None = None    # 仓位求解规则（总闸①；None=未装配）
+    stop_rule: StopRule | None = None        # ATR 止损规则（总闸②；与①独立）
+    exposure_book: GroupExposureBook | None = None   # 分组共享敞口簿（总闸③关 ⇒ None）
 
 
 @dataclass
@@ -191,6 +200,7 @@ class _GroupBuildCtx:
     total_budget_usd: float
     group_id: str
     created_ts: int
+    book: GroupExposureBook | None = None     # 分组共享敞口簿（总闸③关 ⇒ None ⇒ corrScale ≡ 1.0）
 
 
 class AiTradeManager:
@@ -215,6 +225,7 @@ class AiTradeManager:
                 "AGENT_NOT_CONFIGURED", "未配置 AI 模型，无法决策（请在设置中心配置默认模型）", 400)
         self._validate_strategies(req)
         self._validate_context_rounds(req)
+        self._validate_sizing(req)      # 仓位层的两条启动期对账（越界 422，绝不留到运行期静默空转）
         async with get_admission_lock(), self._start_lock:
             self._require_capacity()
             members = self._validate_members(req.members_in, req.settings, req.allocation_mode)
@@ -359,10 +370,15 @@ class AiTradeManager:
                            lever: float) -> AiTradeGroup:
         """第二阶段·建会话（**不启动**）：逐成员建 Executor + Decider + Run + Session（止盈止损按比例分摊）。"""
         created_ts = int(time.time())
+        # 敞口簿是**分组级**共享状态（每成员一个 runtime，共用一本簿）；`unit` 取平均单标的满仓名义额。
+        rule = parse_sizing_rule(req.settings)
+        book = (GroupExposureBook(unit_notional=total * lever / max(1, len(plans)),
+                                  cap_mult=rule.exposure_cap_mult, bar_seconds=BAR_SECONDS[req.bar])
+                if rule is not None and rule.exposure_cap_mult > 0 else None)
         ctx = _GroupBuildCtx(
             req=req, creds=creds, provider=provider, lever=lever,
             sum_pct=sum(p.allocation_pct for p in plans), total_budget_usd=total,
-            group_id=f"aitradegrp_{uuid.uuid4().hex}", created_ts=created_ts)
+            group_id=f"aitradegrp_{uuid.uuid4().hex}", created_ts=created_ts, book=book)
         members = [await self._build_member(ctx, p) for p in plans]
         return AiTradeGroup(
             group_id=ctx.group_id, bar=req.bar,
@@ -372,7 +388,8 @@ class AiTradeManager:
             context_refresh_rounds=req.context_refresh_rounds,
             created_ts=created_ts, members=members,
             wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
-            profit_rule=req.profit_rule)
+            profit_rule=req.profit_rule, sizing_rule=rule, exposure_book=book,
+            stop_rule=parse_stop_rule(req.settings))
 
     async def _build_member(self, ctx: _GroupBuildCtx, plan: _MemberPlan) -> AiTradeGroupMember:
         """建单成员会话：Executor（按 budget_i）+ Decider + Run（含 groupId/allocationPct）+ Session。
@@ -389,6 +406,9 @@ class AiTradeManager:
         # ai-trade-limit-orders §5.3：限价总闸只在**生产实盘装配**处显式打开（决策器与回测均默认
         # False）——schema 露出 orderType/limitPrice、动作枚举加 cancel_order，皆由此单点决定。
         allow_limit = req.settings.ai_trade_limit_orders_enabled
+        # 仓位/刹车层：三条规则由本层从 `settings` 自解析（[P1-7]：**不给启动请求加字段**，否则永远没人填）。
+        sizing = build_sizing_runtime(req.settings, plan.inst_id, BAR_SECONDS[req.bar],
+                                      book=ctx.book, budget_usd=plan.budget_usd)
         decider = AiTradeDecider(
             make_llm_client_from_config(ctx.provider),
             build_ai_trade_system_prompt(plan.inst_id, req.bar, plan.budget_usd, ctx.lever,
@@ -401,7 +421,10 @@ class AiTradeManager:
                                          base_rules_text=format_charter(req.base_rule),
                                          # 利润保护宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变
                                          profit_guard_text=format_profit_guard_charter(
-                                             req.profit_rule)),
+                                             req.profit_rule),
+                                         # 仓位与风险层宪章章；三条规则全未装配 → "" ⇒ 渲染逐字节不变
+                                         sizing_text=format_sizing_charter(
+                                             sizing.rule, sizing.stop_rule, sizing.brake_rule)),
             context_refresh_rounds=req.context_refresh_rounds, settings=req.settings,
             position_step_pct=req.position_step_pct,
             reflection_enabled=req.settings.ai_trade_reflection_enabled,   # 生产实盘显式开（默认 True）
@@ -416,7 +439,7 @@ class AiTradeManager:
             context_refresh_rounds=req.context_refresh_rounds,
             wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
             profit_rule=req.profit_rule,
-            prior_snapshot=(req.prior_snapshots or {}).get(plan.inst_id))
+            prior_snapshot=(req.prior_snapshots or {}).get(plan.inst_id), sizing=sizing)
         return AiTradeGroupMember(inst_id=plan.inst_id, allocation_pct=plan.allocation_pct,
                                   budget_usd=plan.budget_usd, session=session, run_id=run_id)
 
@@ -554,6 +577,27 @@ class AiTradeManager:
                 "AI_TRADE_CONTEXT_ROUNDS_INVALID", f"上下文刷新轮数须在 [{lo}, {hi}] 之间", 400)
 
     @staticmethod
+    def _validate_sizing(req: AiTradeGroupStartRequest) -> None:
+        """仓位层的两条启动期对账（vol-sizing [P1-6]/G-8）：越界即 422，绝不留到运行期静默空转。
+
+        ① 敞口上限取值域 `{0} ∪ [1,10]`（下界保证单成员分组恒不受约束）；② 窗口装不下回看根数则波动率
+        恒不可用、相关性恒 `ρ=1`，两个旗舰机制永久静默失效。窗口上限用真的 `MarketWindow` 探针算，绝不
+        在此复制一份 `_window_max` 公式（复制即漂移）。
+        """
+        rule = parse_sizing_rule(req.settings)
+        if rule is None or not req.members_in:      # 空分组归 `_validate_members` 的 400，不抢它的码
+            return
+        if 0 < rule.exposure_cap_mult < 1.0:
+            raise AiTradePreflightError(
+                "AI_TRADE_EXPOSURE_CAP_INVALID",
+                "有效敞口上限倍数须为 0（关闭）或 ≥ 1.0（下界保证单成员分组恒不受约束）", 422)
+        probe = MarketWindow(req.members_in[0].inst_id, req.bar, req.specs, req.priming_bars,
+                             context_enabled=req.settings.ai_trade_multi_timeframe_context)
+        message = check_window_capacity(rule, probe.window_max)
+        if message is not None:
+            raise AiTradePreflightError("AI_TRADE_SIZING_WINDOW_TOO_SMALL", message, 422)
+
+    @staticmethod
     def _resolve_budget_group(capital_usd: float | None, avail: float,
                               cap_frac: float, default_frac: float) -> float:
         """留空→ avail×default_frac（1%）；非空→ 夹到 ≤ avail×cap_frac（maxBudgetPct 与运营天花板共同主导）。
@@ -631,7 +675,9 @@ class AiTradeManager:
                         # 【基础策略】铁律配置随 config_json 落库（零列迁移，A-12；未装配存 None）。
                         "baseRules": rule_wire(req.base_rule),
                         # 利润保护配置随 config_json 落库（零列迁移；未装配存 None）。
-                        "profitGuard": profit_guard_wire(req.profit_rule)},
+                        "profitGuard": profit_guard_wire(req.profit_rule),
+                        # 仓位/刹车层配置同款落库（零列迁移；三条规则全未装配存 None）。
+                        "sizing": sizing_config_wire(req.settings, BAR_SECONDS[req.bar])},
                 status="running",
                 # ai-trade-stats-dashboard §3.2：填既有 group_* 列（零迁移），使 ai-trade run 可按组聚合
                 # 出历史会话；各成员冗余同值。组级秒级起点为 ctx.created_ts（P1-3；ctx 无 started_ts）。

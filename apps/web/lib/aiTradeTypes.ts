@@ -199,7 +199,9 @@ export type AiTradeTracePhase =
   // 【基础策略】铁律门禁段（ai-trade-base-strategy-ma-band §2.9）：仅规则装配的会话每轮一条。
   | "base_rule"
   // 最小 edge 门禁段（ai-trade-cost-accounting-and-edge-gate §5.3）：仅 k_min>0 的会话每轮一条。
-  | "edge_gate";
+  | "edge_gate"
+  // 仓位求解 + ATR 止损 + 回撤刹车段（vol-sizing-and-drawdown-brake §3.9）：仅规则装配的会话每轮一条。
+  | "sizing";
 
 // 【基础策略】MA 通道开单约束（与后端 base_rules.MaBandRule 镜像；数值字段留空→服务端按 settings 回填）。
 export interface AiTradeMaBandRule {
@@ -314,6 +316,31 @@ export interface AiTradeTraceEvent {
   // §5.4 会话内观测通道：成本统计只读快照。前端本轮**不消费**（阶段一的读者是运维，读 WS 原始事件），
   // 声明它只为让类型如实描述 wire——未识别键在 reducer 的 default 分支被忽略。
   costSnapshot?: Record<string, unknown> | null;
+  // sizing：仓位求解 + ATR 止损 + 刹车断面（vol-sizing-and-drawdown-brake §3.9，与后端
+  // trace.SIZING_TRACE_KEYS 逐键镜像）。三条规则全未装配的会话根本收不到这个相位。
+  brakeLevel?: "none" | "slow" | "halt" | "cooldown" | null;
+  brakeReason?: string | null;
+  drawdownPct?: number | null; // **正号**口径（0.08 = 回撤 8%），与 equity 事件的负号 drawdown 不同
+  lossStreak?: number | null;
+  peakEquityBasis?: "markToMarket" | null; // 峰值含未实现盈亏，与利润保护层的「允许回吐」相互作用
+  unrealizedShare?: number | null;
+  modelFraction?: number | null;
+  fVol?: number | null;
+  fKelly?: number | null;
+  fCap?: number | null;
+  kellyStatus?: "ok" | "no_prior" | "no_cost" | "no_bracket" | "disabled" | null;
+  fFinalRaw?: number | null; // **吸附前**的解；与 finalFraction 之差 = 被档位地板吃掉的量
+  finalFraction?: number | null;
+  scaleSource?: "model" | "vol" | "kelly" | "brake" | "correlation" | null;
+  scaleErased?: boolean | null; // 缩减被档位地板整个吃掉了（计数在涨但什么也没发生）
+  volSource?: "realized" | "insufficient_samples" | "disabled" | null;
+  stopPct?: number | null;
+  takePct?: number | null;
+  stopSource?: "atr" | "fixed" | "skipped_resting" | "skipped_position_live" | "skipped_reversal" | null;
+  effectiveExposure?: number | null;
+  effectiveExposureCap?: number | null;
+  corrScale?: number | null;
+  exposureCapUnreachable?: boolean | null; // 其余成员自身已越界，缩到 0 也达不到上限（如实标注，不假装）
 }
 
 // store / snapshot 的已装配单轮轨迹（thinking/analysis 累积；env 环形 ≤20）。
@@ -366,6 +393,32 @@ export interface AiTradeRoundTrace {
   profitGuard?: ProfitGuardSnapshot | null;
   // 冷却期断面（adaptive §4.2 三载体之二）：本轮若被冷却门禁降级，UI 据此说清原因与剩余时间。
   profitGuardCooldown?: ProfitGuardCooldown | null;
+  // 仓位求解 + ATR 止损 + 回撤刹车（vol-sizing-and-drawdown-brake §3.9）：三条规则全未装配的会话恒为
+  // null ⇒ SizingBlock 整段不渲染。**必须与 emptyRoundTrace 的逐键手抄保持一致**——漏一个键，后端发
+  // 什么前端都收不到（跑不出错、功能静默缺失，这是阶段二第一步踩过的原坑）。
+  brakeLevel?: "none" | "slow" | "halt" | "cooldown" | null;
+  brakeReason?: string | null;
+  drawdownPct?: number | null;
+  lossStreak?: number | null;
+  peakEquityBasis?: "markToMarket" | null;
+  unrealizedShare?: number | null;
+  modelFraction?: number | null;
+  fVol?: number | null;
+  fKelly?: number | null;
+  fCap?: number | null;
+  kellyStatus?: "ok" | "no_prior" | "no_cost" | "no_bracket" | "disabled" | null;
+  fFinalRaw?: number | null;
+  finalFraction?: number | null;
+  scaleSource?: "model" | "vol" | "kelly" | "brake" | "correlation" | null;
+  scaleErased?: boolean | null;
+  volSource?: "realized" | "insufficient_samples" | "disabled" | null;
+  stopPct?: number | null;
+  takePct?: number | null;
+  stopSource?: "atr" | "fixed" | "skipped_resting" | "skipped_position_live" | "skipped_reversal" | null;
+  effectiveExposure?: number | null;
+  effectiveExposureCap?: number | null;
+  corrScale?: number | null;
+  exposureCapUnreachable?: boolean | null;
   state: "deciding" | "done" | "skipped" | "error";
 }
 

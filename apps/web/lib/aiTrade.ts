@@ -455,6 +455,10 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
   // 最小 edge 门禁（ai-trade-cost-accounting-and-edge-gate §3.7）：码带参数后缀
   // `edge_below_cost(edge=8.1bps,cost=13.0bps,k=2.0)`，同为前缀匹配、参数原样保留供排查。
   { prefix: "edge_below_cost", label: "期望收益不足以覆盖交易成本，本轮观望" },
+  // 回撤刹车两码（vol-sizing-and-drawdown-brake §3.6）：同为带参数后缀的前缀码。文案必须写清**只拦
+  // 开新仓**——用户看到「暂停」时最怕的是「我的仓位是不是也平不掉了」。
+  { prefix: "drawdown_brake_halt", label: "回撤刹车：会话回撤越线，暂停开新仓（平仓不受影响）" },
+  { prefix: "loss_streak_cooldown", label: "连亏熔断：连续亏损达阈，冷却期内暂停开新仓（平仓不受影响）" },
 ];
 
 /**
@@ -764,6 +768,111 @@ export function describeEdgeGate(
       : "";
   if (status === "veto") return { label: `成本门禁否决 · 观望${budget}`, tone: "short" };
   return { label: `成本门禁 · 放行${budget}`, tone: "muted" };
+}
+
+export interface AiSizingView {
+  label: string; // 仓位层 · 未缩减 / 仓位层缩减 · 0.75→0.25 / 回撤刹车 · 只平不开 …
+  tone: AiTraceTone;
+  note: string; // 一句话说清「这个数是怎么来的」（来源 + 是否被档位地板吃掉）
+}
+
+// 仓位缩减来源的中文（与后端 `sizing._scale_source` 五态逐条对应）。
+const SCALE_SOURCE_LABEL: Record<string, string> = {
+  model: "你的提议本身就更小",
+  vol: "波动率目标项绑定",
+  kelly: "凯利项绑定",
+  brake: "回撤刹车绑定",
+  correlation: "组合相关性预算绑定",
+};
+
+// 凯利项降级码的中文（**绝不**把「不可算」说成「仓位归零」——本层的降级一律是「该项不参与 min」）。
+const KELLY_STATUS_LABEL: Record<string, string> = {
+  ok: "",
+  no_prior: "本方向暂无胜率先验，凯利项不参与",
+  no_cost: "成本估算缺席，凯利项不参与",
+  no_bracket: "止盈/止损括号不可用（或成本吃掉整个止盈距离），凯利项不参与",
+  disabled: "凯利项已关闭",
+};
+
+// 止损来源五态的中文（三个 skip 态必须讲清「为什么没按 ATR 挂」——那是本设计付出的真实代价）。
+const STOP_SOURCE_LABEL: Record<string, string> = {
+  atr: "止损距离按本轮 ATR 定标后随单挂出",
+  fixed: "ATR 不可用或未开启，止损沿用固定百分比",
+  skipped_resting: "有限价挂单在飞，本轮不改写止损（改了会让落库回执写上一个交易所侧不存在的价）",
+  skipped_position_live: "已有持仓，本轮不改写止损（其 OCO 早已挂出，改了只会让展示口径撒谎）",
+  skipped_reversal: "本轮是反手，开新仓沿用当前固定止损（fail-safe：拿到的是与实际挂单一致的距离）",
+};
+
+/**
+ * 仓位 / 刹车层判定中文化（vol-sizing-and-drawdown-brake §6.3 第 6a 点）：标签 + tone + 说明。
+ * 规则未装配（`brakeLevel` 与 `stopSource` 皆空）→ null（组件整段不渲染，老会话与老快照零影响）。
+ *
+ * 三条呈现纪律：① 刹车的两个阻断档用红色（它们真的拦了开仓），第一档减速用 accent（只是缩小）；
+ * ② `scaleErased` 必须显式说出来——「减速了但被档位地板原样吃回去」与「减速生效」在数字上长得一样，
+ * 不说清楚运维会据 `brakeSlowRounds` 认定刹车已验证；③ `stopSource` 的三个 skip 态要讲清**为什么**
+ * 没按 ATR 挂（有挂单在飞 / 有持仓 / 反手），否则用户只会看到「止损还是老样子」。
+ */
+export function describeSizing(
+  trace: Pick<
+    AiTradeRoundTrace,
+    | "brakeLevel"
+    | "brakeReason"
+    | "drawdownPct"
+    | "modelFraction"
+    | "finalFraction"
+    | "fFinalRaw"
+    | "scaleSource"
+    | "scaleErased"
+    | "kellyStatus"
+    | "stopSource"
+    | "exposureCapUnreachable"
+  >,
+): AiSizingView | null {
+  const level = trace.brakeLevel ?? null;
+  if (!level && !trace.stopSource) return null;
+  if (level === "halt" || level === "cooldown") {
+    const label = level === "halt" ? "回撤刹车 · 只平不开" : "连亏熔断 · 冷却中";
+    const dd = trace.drawdownPct != null ? `（当前回撤 ${(trace.drawdownPct * 100).toFixed(1)}%）` : "";
+    return { label: `${label}${dd}`, tone: "short", note: "本档只拦开新仓：平仓与撤单任何时候都不受影响。" };
+  }
+  const shrank =
+    trace.modelFraction != null && trace.finalFraction != null && trace.finalFraction < trace.modelFraction;
+  const label = shrank
+    ? `仓位层缩减 · ${trace.modelFraction!.toFixed(2)}→${trace.finalFraction!.toFixed(2)}`
+    : level === "slow"
+      ? "回撤刹车 · 第一档减速"
+      : "仓位层 · 未缩减";
+  return {
+    label,
+    tone: level === "slow" ? "accent" : shrank ? "accent" : "muted",
+    note: sizingNote(trace),
+  };
+}
+
+/** `describeSizing` 的说明句：来源 → 是否被档位地板吃掉 → 凯利降级 → 敞口不可达 → 止损来源。 */
+function sizingNote(
+  trace: Pick<
+    AiTradeRoundTrace,
+    "scaleSource" | "scaleErased" | "fFinalRaw" | "finalFraction" | "kellyStatus" | "stopSource" | "exposureCapUnreachable"
+  >,
+): string {
+  const bits: string[] = [];
+  const source = trace.scaleSource ? SCALE_SOURCE_LABEL[trace.scaleSource] : "";
+  if (source) bits.push(source);
+  if (trace.scaleErased && trace.fFinalRaw != null && trace.finalFraction != null) {
+    bits.push(
+      `解出 ${trace.fFinalRaw.toFixed(3)} 但被档位地板吸附回 ${trace.finalFraction.toFixed(2)}——本轮缩减实际未生效，` +
+        "想要更细的响应请把档位步长调小",
+    );
+  }
+  const kelly = trace.kellyStatus ? KELLY_STATUS_LABEL[trace.kellyStatus] : "";
+  if (kelly) bits.push(kelly);
+  if (trace.exposureCapUnreachable) {
+    bits.push("组合有效敞口已超上限且缩减本笔也达不到，读数如实标注为不可达（本层不否决开仓）");
+  }
+  const stop = trace.stopSource ? STOP_SOURCE_LABEL[trace.stopSource] : "";
+  if (stop) bits.push(stop);
+  return bits.join("；");
 }
 
 export interface AiExecutedView {

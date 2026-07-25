@@ -300,6 +300,30 @@ class Settings(BaseSettings):
     ai_trade_prior_max_age_s: float = Field(default=604800.0, gt=0)  # 7 天陈旧度门禁
     ai_trade_prior_lookback_bars: int = Field(default=4000, ge=100)   # rebuild 缺省回看根数
     ai_trade_prior_max_bars: int = Field(default=8000, ge=100)        # rebuild 取数前硬上限（413）
+    # ---- 波动率目标化仓位 + ATR 止损 + 相关性预算 + 回撤刹车（ai-trade-vol-sizing-and-drawdown-brake §4.4）----
+    # 四个**相互独立、默认全关**的总闸：全关时系统逐字节回退到阶段二第一步（commit c6db95d）的行为。
+    # env 名同为 AI_TRADE_ 前缀，desktop config.js 的 prod 透传白名单已覆盖；此处须真的声明——
+    # Settings extra="ignore" 会静默丢弃未声明的 env。
+    ai_trade_sizing_enabled: bool = False               # 总闸①：波动率目标化仓位求解
+    ai_trade_vol_target_annual: float = Field(default=0.20, ge=0)   # 年化波动率目标（0=该项不参与 min）
+    ai_trade_realized_vol_window: int = Field(default=96, ge=2)     # 回看根数（15m ⇒ 一整天）
+    ai_trade_kelly_lambda: float = Field(default=0.25, ge=0, le=1)  # 凯利缩放（0=凯利项不参与 min）
+    # 总闸②：ATR 止损倍数。**与总闸①完全独立**（[P1-1]：runbook L1 是「只开 ATR 止损、不开仓位层」，
+    # 受①门控则那一级恒不可达）。0 ⇒ 单仓 OCO 逐字回退固定 pct（ai_trade_default_sl/tp_pct）。
+    ai_trade_stop_atr_mult: float = Field(default=0.0, ge=0, le=20)
+    ai_trade_stop_rr: float = Field(default=2.0, ge=0, le=20)       # 盈亏比（止盈 = rr × 止损）
+    # 总闸③：组合有效敞口上限（单标的满仓名义额的倍数）。取值域 {0} ∪ [1,10]，越界即启动失败（422）
+    # ——下界 1.0 是「单成员分组恒不受约束」的**结构性**零回归保证（S-8），而不是靠默认值碰巧成立。
+    ai_trade_effective_exposure_cap_mult: float = Field(default=0.0, ge=0, le=10)
+    ai_trade_correlation_min_samples: int = Field(default=96, ge=2)  # 重叠样本不足 ⇒ ρ=1（最保守）
+    # 总闸④：三级刹车，三档各自独立关闭。**阈值必须按杠杆定标**（[P1-4]）：session_pnl 落在已含杠杆的
+    # 名义额上而 dd 的分母是保证金口径的 budget，3× 下 8%/15% 等价于标的价反向 2.7%/5.0%。建议生产值
+    # 以 3× 为锚点按 `× 3/leverage` 折算（3× ⇒ 0.08/0.15；5× ⇒ 0.048/0.09）。
+    ai_trade_brake_slow_dd_pct: float = Field(default=0.0, ge=0, le=1)    # ④a 第一档减速
+    ai_trade_brake_slow_size_mult: float = Field(default=0.5, ge=0, le=1)  # 第一档仓位系数（1.0=关）
+    ai_trade_brake_halt_dd_pct: float = Field(default=0.0, ge=0, le=1)   # ④b 第二档「只平不开」
+    ai_trade_brake_loss_streak: int = Field(default=0, ge=0)             # ④c 连亏熔断笔数（0=关）
+    ai_trade_brake_loss_cooldown_bars: float = Field(default=4.0, ge=0)  # 冷却时长（× 一根 K 线周期）
     # ---- AI 自动交易 · 回测模式（ai-auto-trading-backtest §2.5，三重决策成本护栏）----
     # 回测每决策根调一次 LLM，成本/时长敏感；三重护栏：决策间隔（降频）+ 决策轮数硬上限（越界启动前
     # 拒绝，绝不静默截断）+ 并发闸（限同时消耗 LLM 的回测数）。字段名即环境变量名（AI_BACKTEST_*，

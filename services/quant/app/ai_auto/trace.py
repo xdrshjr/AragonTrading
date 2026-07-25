@@ -23,9 +23,22 @@ if TYPE_CHECKING:                       # 仅类型标注用，运行期不导�
 # reflection_*：下单前二次反思三阶段（ai-trade-pre-trade-reflection §2.6），仅交易意愿轮出现。
 # base_rule：【基础策略】铁律门禁段（ai-trade-base-strategy-ma-band §2.9），**仅在规则装配时**每轮一条。
 # edge_gate：最小 edge 门禁段（ai-trade-cost-accounting-and-edge-gate §5.3），**仅 k_min>0 时**每轮一条。
+# sizing：仓位求解 + ATR 止损 + 刹车段（vol-sizing-and-drawdown-brake §3.9），**仅规则装配时**每轮一条。
+# 之所以值得新增一个相位（代价 = 8 个前端镜像点）：求解发生在**轮次末尾**（管线第 11 步），`round_start`
+# 早已发出、搭不上；且本层新增了 5 个「看起来生效但可能没生效」的观测量（scaleErased / stopSource 的三个
+# skip 态 / exposureCapUnreachable / volSource），它们必须每轮可见——静默的保守是本仓库的前科。
 PHASES = ("round_start", "thinking", "analysis", "tool_call_start",
           "tool_call", "result", "summary", "error", "retry",
-          "reflection_start", "reflection", "reflection_verdict", "base_rule", "edge_gate")
+          "reflection_start", "reflection", "reflection_verdict", "base_rule", "edge_gate",
+          "sizing")
+
+# `sizing` 事件与在飞轮次共用的键集合（**单一真源**：事件装配、轮次初值、前端镜像三处照它对齐）。
+SIZING_TRACE_KEYS = (
+    "brakeLevel", "brakeReason", "drawdownPct", "lossStreak", "peakEquityBasis",
+    "unrealizedShare", "modelFraction", "fVol", "fKelly", "fCap", "kellyStatus",
+    "fFinalRaw", "finalFraction", "scaleSource", "scaleErased", "volSource",
+    "stopPct", "takePct", "stopSource", "effectiveExposure", "effectiveExposureCap",
+    "corrScale", "exposureCapUnreachable")
 
 # 合并冲刷阈值：累计 ≥48 字符 / 相变 / 工具起始 / 收尾 即冲刷一条 delta（轮间隔以分钟计，量级极低）。
 _TRACE_FLUSH_CHARS = 48
@@ -124,6 +137,10 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         # 冷却期（adaptive §4.2 三载体之二）：本函数是**显式取键**装配，不加这一行 `AiTradeRoundTrace`
         # 永远拿不到冷却数据 ⇒ 轨迹上「本轮为什么被降级」永远空白（跑不出错、功能静默缺失）。
         "profitGuardCooldown": payload.get("profitGuardCooldown"),
+        # 仓位 / 刹车层（vol-sizing-and-drawdown-brake §3.9）：本函数是**显式取键**装配，漏抄这批键
+        # `AiTradeRoundTrace` 永远拿不到本层数据 ⇒ 后端发什么前端都收不到（跑不出错、功能静默缺失）。
+        # 键集合走 `SIZING_TRACE_KEYS` 单一真源，杜绝「事件加了键、初值忘了加」的漂移。
+        **{key: None for key in SIZING_TRACE_KEYS},
         "state": "deciding",
     }
 
@@ -198,3 +215,23 @@ def apply_edge_gate_trace(trace: dict | None, wire: dict, reason: str | None) ->
     trace["edgeSource"] = wire.get("edgeSource")   # 前端据此改判「分子是怎么来的」文案
     trace["priorP"] = wire.get("priorP")
     trace["priorEvBps"] = wire.get("priorEvBps")
+
+
+# ---------- 仓位 / 刹车层轨迹装配（ai-trade-vol-sizing-and-drawdown-brake §3.9）----------
+def sizing_event(round_no: int, ts: int, wire: dict) -> dict:
+    """sizing：本轮仓位求解 + ATR 止损 + 刹车断面（规则装配时**每轮一条**）。
+
+    与 `base_rule_event` / `edge_gate_event` 的理由逐字相同：静默的保守会被用户当成故障。本层尤其
+    需要每轮可见——`fFinalRaw` 与 `finalFraction` 之差就是被档位地板吃掉的量，只看后者会让运维以为
+    减速生效了（[P1-2]）。
+    """
+    return trace_event("sizing", round_no, ts,
+                       **{key: wire.get(key) for key in SIZING_TRACE_KEYS})
+
+
+def apply_sizing_trace(trace: dict | None, wire: dict) -> None:
+    """把本轮仓位判定写入在飞轮次（`trace is None` ⇒ 空转，与既有 emit 段同款垫片）。"""
+    if trace is None:
+        return
+    for key in SIZING_TRACE_KEYS:
+        trace[key] = wire.get(key)

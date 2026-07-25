@@ -160,6 +160,31 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     priorP: null,
     priorEvBps: null,
     signalPriors: evt.signalPriors ?? null,
+    // 仓位 / 刹车层（vol-sizing-and-drawdown-brake §6.3 第 4 点）：本函数是**逐键手抄**装配，漏抄任一
+    // 键，`AiTradeRoundTrace` 永远拿不到该读数 ⇒ 后端发什么前端都收不到（跑不出错、功能静默缺失）。
+    brakeLevel: null,
+    brakeReason: null,
+    drawdownPct: null,
+    lossStreak: null,
+    peakEquityBasis: null,
+    unrealizedShare: null,
+    modelFraction: null,
+    fVol: null,
+    fKelly: null,
+    fCap: null,
+    kellyStatus: null,
+    fFinalRaw: null,
+    finalFraction: null,
+    scaleSource: null,
+    scaleErased: null,
+    volSource: null,
+    stopPct: null,
+    takePct: null,
+    stopSource: null,
+    effectiveExposure: null,
+    effectiveExposureCap: null,
+    corrScale: null,
+    exposureCapUnreachable: null,
     state: "deciding",
   };
 }
@@ -224,6 +249,36 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
         edgeSource: evt.edgeSource ?? null,
         priorP: evt.priorP ?? null,
         priorEvBps: evt.priorEvBps ?? null,
+      };
+    case "sizing":
+      // 仓位求解 + ATR 止损 + 刹车判定：每轮一条（三条规则全未装配的会话根本收不到此相位）。
+      // `fFinalRaw` 与 `finalFraction` 必须同时落——两者之差就是被档位地板吃掉的量，只抄后者会让
+      // 界面显示「减速生效了」而实际上是 no-op（[P1-2] 的假阳性观测）。
+      return {
+        ...t,
+        brakeLevel: evt.brakeLevel ?? null,
+        brakeReason: evt.brakeReason ?? null,
+        drawdownPct: evt.drawdownPct ?? null,
+        lossStreak: evt.lossStreak ?? null,
+        peakEquityBasis: evt.peakEquityBasis ?? null,
+        unrealizedShare: evt.unrealizedShare ?? null,
+        modelFraction: evt.modelFraction ?? null,
+        fVol: evt.fVol ?? null,
+        fKelly: evt.fKelly ?? null,
+        fCap: evt.fCap ?? null,
+        kellyStatus: evt.kellyStatus ?? null,
+        fFinalRaw: evt.fFinalRaw ?? null,
+        finalFraction: evt.finalFraction ?? null,
+        scaleSource: evt.scaleSource ?? null,
+        scaleErased: evt.scaleErased ?? null,
+        volSource: evt.volSource ?? null,
+        stopPct: evt.stopPct ?? null,
+        takePct: evt.takePct ?? null,
+        stopSource: evt.stopSource ?? null,
+        effectiveExposure: evt.effectiveExposure ?? null,
+        effectiveExposureCap: evt.effectiveExposureCap ?? null,
+        corrScale: evt.corrScale ?? null,
+        exposureCapUnreachable: evt.exposureCapUnreachable ?? null,
       };
     case "reflection_verdict":
       // 反思裁决：落 verdict/reason/实际收缩后仓位并清在飞指示。

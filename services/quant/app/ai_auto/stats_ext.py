@@ -51,6 +51,54 @@ def merge_cost_stats(base: dict, ext: dict) -> dict:
     return merged
 
 
+def build_sizing_stats(counters, brake_counters, brake_state) -> dict:
+    """仓位 / 刹车层的加法键（`aiStats.sizing`；vol-sizing-and-drawdown-brake §3.9）。
+
+    三组读数刻意分开：`scaledRounds` 说明本层**真的缩过**，`quantizeErasedRounds` 说明其中有多少次
+    缩减被档位地板原样吃了回去，`brakeSlowRounds` 只说明第一档在那些轮是激活的——三者不可互相换算，
+    只凭最后一个宣称「刹车已验证」正是 [P1-2] 要防的假阳性观测。
+
+    Args:
+        counters: `SizingRuntime._Counters`（轮级）。
+        brake_counters: `drawdown_brake.BrakeCounters`（档位触发级）。
+        brake_state: `drawdown_brake.BrakeState`（会话级最大回撤）。
+
+    Returns:
+        `{"sizing": {...}}` 形状的纯加法 dict。
+    """
+    gated = counters.gated_rounds
+    ratios = counters.scale_ratios
+    shares = brake_counters.halt_unrealized_shares
+    return {"sizing": {
+        "gatedRounds": gated, "scaledRounds": counters.scaled_rounds,
+        "scaleRate": round(counters.scaled_rounds / gated, 4) if gated else 0.0,
+        "avgScaleRatio": round(sum(ratios) / len(ratios), 4) if ratios else None,
+        "quantizeErasedRounds": counters.quantize_erased_rounds,
+        "brakeSlowRounds": brake_counters.slow_rounds,
+        "brakeHaltRounds": brake_counters.halt_rounds,
+        "lossStreakCooldowns": brake_counters.cooldown_hits,
+        "maxDrawdownPct": round(brake_state.max_dd, 6),
+        "haltUnrealizedShareAvg": round(sum(shares) / len(shares), 4) if shares else None,
+        "atrStopRounds": counters.atr_stop_rounds,
+        "reversalSkips": counters.reversal_skips, "restingSkips": counters.resting_skips,
+        "corrScaledRounds": counters.corr_scaled_rounds,
+        "exposureUnreachableRounds": counters.exposure_unreachable_rounds}}
+
+
+def merge_sizing_stats(base: dict, ext: dict) -> dict:
+    """把仓位统计并入既有 `aiStats`；**任一键冲突即抛**（镜像 `merge_cost_stats`，绝不静默覆盖）。
+
+    Raises:
+        ValueError: `ext` 的某个键已存在于 `base`（附冲突键名，便于定位）。
+    """
+    merged = dict(base or {})
+    clashes = sorted(set(merged) & set(ext or {}))
+    if clashes:
+        raise ValueError(f"sizing stats key clash with existing aiStats: {','.join(clashes)}")
+    merged.update(ext or {})
+    return merged
+
+
 def cost_snapshot_wire(round_no: int, attribution_stats: dict, fee_ledger, *,
                        every: int = _COST_SNAPSHOT_EVERY_ROUNDS) -> dict | None:
     """L0/L1 通道的节流装配（§5.4）：未到轮次 ⇒ `None`（调用方据此不推事件）。
