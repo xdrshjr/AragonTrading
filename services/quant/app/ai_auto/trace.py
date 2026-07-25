@@ -22,9 +22,10 @@ if TYPE_CHECKING:                       # 仅类型标注用，运行期不导�
 # retry：可重试失败降级前的重试面包屑（ai-trade-decision-llm-retry §4.4），前端据此重置本轮累积。
 # reflection_*：下单前二次反思三阶段（ai-trade-pre-trade-reflection §2.6），仅交易意愿轮出现。
 # base_rule：【基础策略】铁律门禁段（ai-trade-base-strategy-ma-band §2.9），**仅在规则装配时**每轮一条。
+# edge_gate：最小 edge 门禁段（ai-trade-cost-accounting-and-edge-gate §5.3），**仅 k_min>0 时**每轮一条。
 PHASES = ("round_start", "thinking", "analysis", "tool_call_start",
           "tool_call", "result", "summary", "error", "retry",
-          "reflection_start", "reflection", "reflection_verdict", "base_rule")
+          "reflection_start", "reflection", "reflection_verdict", "base_rule", "edge_gate")
 
 # 合并冲刷阈值：累计 ≥48 字符 / 相变 / 工具起始 / 收尾 即冲刷一条 delta（轮间隔以分钟计，量级极低）。
 _TRACE_FLUSH_CHARS = 48
@@ -110,6 +111,9 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         # 【基础策略】铁律门禁（ai-trade-base-strategy-ma-band §2.9）：规则未装配的会话恒为初值。
         "baseRuleStatus": None, "baseRuleZone": None,
         "baseRulePctB": None, "baseRuleReason": None,
+        # 最小 edge 门禁（ai-trade-cost-accounting-and-edge-gate §4.3）：k_min=0（默认）的会话恒为初值。
+        "edgeGateStatus": None, "edgeBps": None,
+        "edgeCostBps": None, "edgeGateReason": None,
         # 利润保护快照（ai-trade-profit-protection §2.7）：**刻意不新增 trace phase**——基础策略是逐轮
         # 门禁故每轮一条事件，保护层跑在 5s 盯市上、不是轮级判定，只随 round_start 带一份断面。
         "profitGuard": payload.get("profitGuard"),
@@ -154,3 +158,36 @@ def base_rule_event(round_no: int, ts: int, band: dict | None,
                        zone=band.get("zone"), pctB=band.get("pctB"),
                        upper=band.get("upper"), mid=band.get("mid"),
                        lower=band.get("lower"), reason=reason)
+
+
+# ---------- 最小 edge 门禁轨迹装配（ai-trade-cost-accounting-and-edge-gate §5.3）----------
+def edge_gate_event(round_no: int, ts: int, wire: dict,
+                    cost_snapshot: dict | None = None) -> dict:
+    """edge_gate：本轮门禁判定（pass/veto/unavailable）+ edge/成本断面 + 会话内成本快照。
+
+    与 `base_rule_event` 的理由逐字相同：**每轮都发一条**（`k_min > 0` 时）——静默的保守会被用户
+    当成故障。`costSnapshot` 是纯加法只读键（§5.4 的会话内观测通道），前端未识别即忽略。
+    """
+    return trace_event("edge_gate", round_no, ts, costSnapshot=cost_snapshot, **wire)
+
+
+def edge_gate_unavailable_event(ts: int, streak: int) -> dict:
+    """连续不可用告警（镜像 `AI_TRADE_BASE_RULE_UNAVAILABLE` 的既有写法）。
+
+    极性与铁律层相反：本层 fail-open，**期间开仓一律放行**——静默的降级与静默的保守一样，都会被
+    用户当成故障，故文案必须把「放行」这件事讲清楚，而不是让用户以为门禁在生效。
+    """
+    return {"type": "error", "data": {
+        "ts": int(ts), "code": "AI_TRADE_EDGE_GATE_UNAVAILABLE",
+        "message": (f"最小 edge 门禁已连续 {streak} 轮无法估算（ATR 数据不足），"
+                    "期间开仓一律**放行**（本层 fail-open）；平仓与撤单不受影响")}}
+
+
+def apply_edge_gate_trace(trace: dict | None, wire: dict, reason: str | None) -> None:
+    """把本轮 edge 门禁判定写入在飞轮次（`trace is None` ⇒ 空转，与既有 emit 段同款垫片）。"""
+    if trace is None:
+        return
+    trace["edgeGateStatus"] = wire.get("status")
+    trace["edgeBps"] = wire.get("edgeBps")
+    trace["edgeCostBps"] = wire.get("costBps")
+    trace["edgeGateReason"] = reason

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 
 from ..config import Settings
 from ..db.session import get_sessionmaker
@@ -30,10 +31,12 @@ from ..okx.rest_client import OKXError
 from ..okx.trading import (
     cancel_live_order,
     close_live_position,
+    fetch_live_fills,
     fetch_live_order,
     fetch_live_positions,
     place_live_order,
 )
+from .fee_ledger import FeeLedger, audit_fills, trade_fee_fields
 from .explain import (
     as_close,
     build_atomic_explain,
@@ -82,7 +85,8 @@ class LiveExecutor:
                  risk: RiskParams, ct_val: float, lot_sz: float, min_sz: float,
                  settings: Settings,
                  place_order_fn=None, close_position_fn=None, positions_fn=None,
-                 cancel_order_fn=None, get_order_fn=None):
+                 cancel_order_fn=None, get_order_fn=None, fills_fn=None,
+                 fee_ledger: FeeLedger | None = None):
         self.creds = creds
         self.account_id = account_id
         self.inst_id = inst_id
@@ -95,6 +99,8 @@ class LiveExecutor:
         self.lot_sz = lot_sz
         self.min_sz = min_sz
         self.settings = settings
+        self.fee_ledger = fee_ledger       # §3.2.0 第七缝：只有 ai_auto 传；None ⇒ live_auto 逐字回退
+        self.entry_fee_usd = 0.0           # 当前持仓已累计的**开仓腿**费率（三处复位点，§3.3b）
 
         self.projected = "flat"            # 自管持仓状态机（镜像 SimBroker._Position.side）
         self.entry_price = 0.0
@@ -118,6 +124,7 @@ class LiveExecutor:
         # P1-2：挂单生命周期依赖的两个新缝（镜像上方三缝的既有范式）——没有它们，限价整组单测无法脱网。
         self._cancel_order = cancel_order_fn or self._default_cancel_order
         self._get_order = get_order_fn or self._default_get_order
+        self._read_fills = fills_fn or self._default_read_fills
 
     # ---------- 默认 OKX 调用（短生命周期 session，R3）----------
     async def _default_place_order(self, order: OrderInput) -> dict:
@@ -141,6 +148,9 @@ class LiveExecutor:
 
     async def _default_get_order(self, cl_ord_id: str) -> dict:
         return await fetch_live_order(self.creds, self.inst_id, cl_ord_id=cl_ord_id)
+
+    async def _default_read_fills(self) -> list[dict]:
+        return await fetch_live_fills(self.creds, self.inst_id, limit=100)
 
     # ---------- 对外只读上下文（供 strategy.on_candle）----------
     @property
@@ -280,7 +290,8 @@ class LiveExecutor:
         cl_ord_id, ord_id = self._order_ids(result)
         trade = self._make_trade(ts, side, ref_px, sz, pnl=0.0, reason=reason, tp=tp, sl=sl,
                                  explain=explain, cl_ord_id=cl_ord_id, ord_id=ord_id,
-                                 position_pct=self.entry_position_pct)
+                                 position_pct=self.entry_position_pct, expected_px=ref_px)
+        self.entry_fee_usd += float(trade["fee"])
         self.trades.append(trade)
         return pre + [{"type": "trade", "data": trade}]
 
@@ -485,7 +496,9 @@ class LiveExecutor:
         trade = self._make_trade(ts, order.side, avg_px, delta_sz if delta_sz is not None
                                  else total_sz, pnl=0.0, reason=order.reason or "signal_open",
                                  tp=tp, sl=sl, explain=explain, cl_ord_id=order.cl_ord_id,
-                                 ord_id=order.ord_id, position_pct=self.entry_position_pct)
+                                 ord_id=order.ord_id, position_pct=self.entry_position_pct,
+                                 ord_type="limit", expected_px=order.px)
+        self.entry_fee_usd += float(trade["fee"])   # §3.3a：按本轮采纳增量计费（sz 已是 delta）
         self.trades.append(trade)
         return [{"type": "trade", "data": trade}]
 
@@ -499,7 +512,7 @@ class LiveExecutor:
         explain = self._close_explain("signal", order.reason, None, avg_px)
         result = {"clOrdId": order.cl_ord_id, "ordId": order.ord_id}
         return self._settle_close(avg_px, ts, order.reason or "signal_close", result,
-                                  explain=explain)
+                                  explain=explain, ord_type="limit", expected_px=order.px)
 
     def _external_close_suppressed(self) -> bool:
         """O-2 兜底：平仓挂单在飞时禁用 `external_close` 合成分支（§2.3）。
@@ -512,20 +525,23 @@ class LiveExecutor:
         return self.resting is not None and self.resting.intent == "close"
 
     def _settle_close(self, ref_px: float, ts: int, reason: str, result: dict, *,
-                      explain: dict | None = None) -> list[dict]:
-        pnl = self._close_pnl(ref_px)
-        pnl_pct = self._close_return_pct(ref_px)   # v2（P1-2）：须在复位 entry/projected 前算
+                      explain: dict | None = None, ord_type: str = "market",
+                      expected_px: float | None = None) -> list[dict]:
+        pnl = self._close_pnl(ref_px, ord_type=ord_type)
+        pnl_pct = self._close_return_pct(ref_px, ord_type=ord_type)   # 须在复位 entry 前算（P1-2）
         qty = self.entry_qty_sz
         position_pct = self.entry_position_pct
         self.realized_pnl_usd += pnl
         self.unrealized_usd = 0.0
         self.projected = "flat"
         self.entry_qty_sz = 0.0
+        self.entry_fee_usd = 0.0                   # §3.3b 复位点 1/3：主动平仓 / 限价平仓采纳
         self.entry_position_pct = None
         cl_ord_id, ord_id = self._order_ids(result)
         trade = self._make_trade(ts, "close", ref_px, qty, pnl=pnl, pnl_pct=pnl_pct,
                                  reason=reason, explain=explain, cl_ord_id=cl_ord_id,
-                                 ord_id=ord_id, position_pct=position_pct)
+                                 ord_id=ord_id, position_pct=position_pct,
+                                 ord_type=ord_type, expected_px=expected_px)
         self.trades.append(trade)
         return [{"type": "trade", "data": trade}]
 
@@ -540,6 +556,7 @@ class LiveExecutor:
         self.unrealized_usd = 0.0
         self.projected = "flat"
         self.entry_qty_sz = 0.0
+        self.entry_fee_usd = 0.0                   # §3.3b 复位点 2/3：交易所侧 OCO 已先平
         self.entry_position_pct = None
         return events + [self._status_event("标的已在交易所侧平仓（OCO 触发），自管持仓归 flat")]
 
@@ -568,6 +585,8 @@ class LiveExecutor:
         `resting is None`（含 `live_auto` 全部场景）时 `_poll_resting` 返回 `[]`，行为逐字不变。
         """
         events = await self._poll_resting(ts)          # O-1：必须最先；异常已在内部自隔离
+        await audit_fills(self.fee_ledger, fills_fn=self._read_fills,
+                          now_wall=time.time(), settings=self.settings)
         try:
             positions = await self._read_positions()
         except OKXError as exc:
@@ -598,6 +617,7 @@ class LiveExecutor:
             self.unrealized_usd = 0.0
             self.projected = "flat"
             self.entry_qty_sz = 0.0
+            self.entry_fee_usd = 0.0               # §3.3b 复位点 3/3：外部干预平仓（漏掉即静默重扣）
             self.entry_position_pct = None
             events.append(self._status_event("持仓已在交易所侧平仓 / 外部干预，已校正为 flat"))
         return events
@@ -729,7 +749,16 @@ class LiveExecutor:
             tp = fill * (1 + tpp) if side == "long" else fill * (1 - tpp)
         return tp, sl
 
-    def _close_pnl(self, exit_px: float) -> float:
+    def _close_pnl(self, exit_px: float, *, ord_type: str = "market") -> float:
+        """平仓盈亏；账本未装配恒走毛口径、位相同（§3.3/Z-2）。**纯读**：绝不在此消费 entry_fee_usd。"""
+        gross = self._gross_close_pnl(exit_px)
+        if self.fee_ledger is None:
+            return gross
+        return self.fee_ledger.net_close_pnl(
+            gross, entry_fee_usd=self.entry_fee_usd, exit_px=exit_px,
+            sz=self.entry_qty_sz, ord_type=ord_type)
+
+    def _gross_close_pnl(self, exit_px: float) -> float:
         qty_coin = self.entry_qty_sz * self.ct_val
         if self.projected == "long":
             return qty_coin * (exit_px - self.entry_price)
@@ -737,7 +766,7 @@ class LiveExecutor:
             return qty_coin * (self.entry_price - exit_px)
         return 0.0
 
-    def _close_return_pct(self, exit_px: float) -> float | None:
+    def _close_return_pct(self, exit_px: float, *, ord_type: str = "market") -> float | None:
         """平仓收益率：已实现盈亏 / 开仓占用保证金（等价于方向化价格变动% × 杠杆）。
 
         v2（P1-2）：先校验后相除——杠杆或名义价值非正（异常断面）直接返回 None，杜绝在
@@ -746,7 +775,7 @@ class LiveExecutor:
         notional = self.entry_qty_sz * self.ct_val * self.entry_price
         if self.leverage <= 0 or notional <= 0:
             return None
-        return self._close_pnl(exit_px) / (notional / self.leverage)
+        return self._close_pnl(exit_px, ord_type=ord_type) / (notional / self.leverage)
 
     def _unrealized_at(self, mark_px: float) -> float:
         if self.projected == "long":
@@ -773,7 +802,8 @@ class LiveExecutor:
                     reason: str, pnl_pct: float | None = None, tp: float | None = None,
                     sl: float | None = None, explain: dict | None = None,
                     cl_ord_id: str | None = None, ord_id: str | None = None,
-                    seeded: bool = False, position_pct: float | None = None) -> dict:
+                    seeded: bool = False, position_pct: float | None = None,
+                    ord_type: str = "market", expected_px: float | None = None) -> dict:
         position_after = sz if side == "long" else (-sz if side == "short" else 0.0)
         trade = {"ts": int(ts), "side": side, "price": float(price), "qty": float(sz),
                  "fee": 0.0, "pnl": float(pnl), "positionAfter": position_after,
@@ -793,6 +823,8 @@ class LiveExecutor:
             trade["clOrdId"] = cl_ord_id
         if ord_id:
             trade["ordId"] = ord_id
+        trade.update(trade_fee_fields(self.fee_ledger, cl_ord_id=cl_ord_id, side=side, sz=sz,
+                                      px=price, ord_type=ord_type, expected_px=expected_px))
         return trade
 
     # ---------- 解释合成（纯函数、异常隔离，绝不进入 place / close 调用栈，R1）----------
@@ -839,7 +871,7 @@ class LiveExecutor:
                 exit_price=ref_px, pnl=pnl)
             trade = self._make_trade(ts, "close", ref_px, self.entry_qty_sz, pnl=pnl,
                                      pnl_pct=pnl_pct, reason="external_close", explain=explain,
-                                     position_pct=self.entry_position_pct)
+                                     position_pct=self.entry_position_pct, expected_px=ref_px)
             self.trades.append(trade)
             return [{"type": "trade", "data": trade}]
         except Exception:  # noqa: BLE001 —— 合成失败回落原 status，绝不影响 reconcile / flatten 主流程

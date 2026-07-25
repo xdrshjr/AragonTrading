@@ -149,6 +149,11 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     baseRuleZone: null,
     baseRulePctB: null,
     baseRuleReason: null,
+    // 最小 edge 门禁（ai-trade-cost-accounting-and-edge-gate §4.3）：k_min=0 的会话恒为初值 null。
+    edgeGateStatus: null,
+    edgeBps: null,
+    edgeCostBps: null,
+    edgeGateReason: null,
     state: "deciding",
   };
 }
@@ -200,6 +205,15 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
         baseRuleZone: evt.zone ?? null,
         baseRulePctB: evt.pctB ?? null,
         baseRuleReason: evt.reason ?? null,
+      };
+    case "edge_gate":
+      // 最小 edge 门禁判定：落 status/edge/成本/降级码（每轮一条；k_min=0 的会话根本收不到此相位）。
+      return {
+        ...t,
+        edgeGateStatus: evt.status ?? null,
+        edgeBps: evt.edgeBps ?? null,
+        edgeCostBps: evt.costBps ?? null,
+        edgeGateReason: evt.reason ?? null,
       };
     case "reflection_verdict":
       // 反思裁决：落 verdict/reason/实际收缩后仓位并清在飞指示。

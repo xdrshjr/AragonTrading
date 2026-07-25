@@ -40,7 +40,9 @@ from ..strategies.base import Signal
 from ..agent.services import load_htf_frames, load_range_candles
 from .backtest_frames import build_backtest_frames
 from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, format_charter
+from .cost_model import backtest_params
 from .decider import AiTradeDecider, TradeDecision
+from .edge_gate import evaluate_edge_gate
 from .market_context import build_market_context
 from .market_digest import build_market_digest
 from .multi_timeframe_context import (
@@ -100,6 +102,11 @@ _PROFIT_GUARD_BACKTEST_NOTE = (
     # 模型会给出相同的线。
     "⑥ 承诺退出线同样为 bar 内极值保守近似，且回测中的 holdExitPx 来自回测 LLM 的决策、与实盘可能"
     "不同——回测验证的是「承诺线一旦给出系统如何兑现」的机制，不保证实盘模型会给出相同的线。")
+# 最小 edge 门禁的**粗估免责**（§8 R-3）：绝不让用户把拦截率当成胜率证据。
+_EDGE_GATE_BACKTEST_NOTE = (
+    "阶段一的 edge 为 ATR 粗估（min(ATR 预算, 单仓 OCO 止盈距离)），**不是**概率化胜率先验；"
+    "门禁拦截率仅作结构性参考，不得据此推断策略的真实期望。回测世界的往返成本按 SimBroker 实收的"
+    "双边费 + 双边滑点计（与实盘常数各自独立），故两侧的拦截率不可直接比较。")
 
 
 @dataclass
@@ -322,7 +329,9 @@ class AiBacktestRunner:
             if htf_frames.get(bar)
         }
         first = self._first_decision_index(main_df)
-        if self.profit_rule is not None:
+        # 最小 edge 门禁同样按 `_atr_at(i)` 取粗估 edge（§3.6），故 k_min>0 时也必须建这条序列——
+        # 否则门禁在回测里恒 unavailable、fail-open 放行，「回测同位插入」就成了空话（spec §十二 I-5）。
+        if self.profit_rule is not None or self.settings.ai_trade_edge_gate_k_min > 0:
             # F1/F3：ATR 一次性向量化（第 i 根取 iloc[i-1]，含本根 h/l 的 ATR 是未来函数）。
             self._atr_series = atr(main_df, self.settings.ai_trade_profit_guard_atr_period)
             self._bar_ts_index = main_df["ts"].astype(int).tolist()
@@ -518,8 +527,16 @@ class AiBacktestRunner:
         # 回测侧复制一份判定（那正是 v1 P1-4 给【基础策略】铁律定下的规矩）。未装配 ⇒ 原样直通（G-3）。
         decision, cooldown_reason = apply_profit_cooldown(decision, self._cooldown, now_wall=ts)
         decision, consensus_reason = apply_consensus_gate(decision, consensus, self.min_consensus)
-        # 三元合成，先执行者胜出：铁律优先级最高，冷却次之（本系统刚亲手做过的动作，解释力强于票数）。
-        gate_reason = base_reason or cooldown_reason or consensus_reason
+        # ★ 最小 edge 门禁（§3.7）：与实盘**同一纯核心、同位插入**（共识后、反思前）；k_min=0（默认）
+        # ⇒ 恒返回 None ⇒ 既有回测结果逐字节相同。成本用 SimBroker 实收常数（两侧各自对自己的世界说真话）。
+        edge_out = evaluate_edge_gate(
+            decision, settings=self.settings, last_px=ref_px, atr_px=self._atr_at(i),
+            take_profit_pct=self._oco_risk.take_profit_pct, bar_seconds=BAR_SECONDS[self.bar],
+            params=backtest_params(self.settings), funding_enabled=False)
+        edge_reason = edge_out.reason if edge_out is not None else None
+        decision = edge_out.decision if edge_out is not None else decision
+        # 四元合成，先执行者胜出：铁律优先级最高，冷却次之（本系统刚亲手做过的动作，解释力强于票数）。
+        gate_reason = base_reason or cooldown_reason or consensus_reason or edge_reason
         # 二次反思（决策脑不变式：回测复用同一 decider.reflect，emit=None 轨迹全程空转）。verdict 须在分支外
         # 预置 None（RV-3），否则 hold 轮走 else 分支时 _tally_reflection(verdict) 会 NameError。
         verdict = None
@@ -771,6 +788,8 @@ class AiBacktestRunner:
             notes.append("历史深度或暖机不足，首个决策晚于所选区间起点，起始若干根未参与决策。")
         if self.profit_rule is not None:
             notes.append(_PROFIT_GUARD_BACKTEST_NOTE)
+        if self.settings.ai_trade_edge_gate_k_min > 0:
+            notes.append(_EDGE_GATE_BACKTEST_NOTE)
         return notes
 
     def _build_result(self, metrics: dict, ai_stats: dict, notes: list[str]) -> dict:

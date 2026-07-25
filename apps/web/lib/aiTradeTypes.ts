@@ -197,7 +197,9 @@ export type AiTradeTracePhase =
   | "reflection"
   | "reflection_verdict"
   // 【基础策略】铁律门禁段（ai-trade-base-strategy-ma-band §2.9）：仅规则装配的会话每轮一条。
-  | "base_rule";
+  | "base_rule"
+  // 最小 edge 门禁段（ai-trade-cost-accounting-and-edge-gate §5.3）：仅 k_min>0 的会话每轮一条。
+  | "edge_gate";
 
 // 【基础策略】MA 通道开单约束（与后端 base_rules.MaBandRule 镜像；数值字段留空→服务端按 settings 回填）。
 export interface AiTradeMaBandRule {
@@ -215,6 +217,10 @@ export interface AiTradeBaseRules {
 
 // 铁律门禁判定态：放行 / 否决 / 通道数据不可用（fail-closed）。
 export type AiTradeBaseRuleStatus = "pass" | "veto" | "unavailable";
+
+// 最小 edge 门禁判定态：放行 / 否决 / 估算不可用。
+// 与铁律层**同名三态但极性相反**：本层 unavailable 时开仓一律**放行**（fail-open），文案不得反过来说。
+export type AiTradeEdgeGateStatus = "pass" | "veto" | "unavailable";
 
 // 利润保护层入参（与后端 profit_guard.ProfitGuardRule 镜像；数值字段留空→服务端按 settings 回填）。
 // 全部收益率为**保证金收益率口径**（5× 杠杆下标的 10% ≈ 保证金 +50%，用标的口径根本触发不到）。
@@ -281,12 +287,23 @@ export interface AiTradeTraceEvent {
   verdict?: AiReflectionVerdict; // reflection_verdict：反思裁决（confirm/abort）
   adjustedSizeFraction?: number | null; // reflection_verdict：实际收缩后的开仓仓位占比（无收缩为 null）
   // base_rule：【基础策略】铁律门禁判定 + 本轮通道断面（band 不可用时三条线为 null，不假数据）。
+  // edge_gate 复用同一个 `status` 位（三态取值相同；两个相位互不同时出现在一条事件上）。
   status?: AiTradeBaseRuleStatus;
   zone?: "lower" | "mid" | "upper" | null;
   pctB?: number | null;
   upper?: number | null;
   mid?: number | null;
   lower?: number | null;
+  // edge_gate：粗估毛 edge / 往返成本 / 阈值倍数与判据（缺失即该轮未估出，本层 fail-open）。
+  edgeBps?: number | null;
+  costBps?: number | null;
+  kMin?: number | null;
+  requiredBps?: number | null;
+  costConfidence?: "ok" | "degraded" | null;
+  edgeSource?: "atr" | "take_profit" | null;
+  // §5.4 会话内观测通道：成本统计只读快照。前端本轮**不消费**（阶段一的读者是运维，读 WS 原始事件），
+  // 声明它只为让类型如实描述 wire——未识别键在 reducer 的 default 分支被忽略。
+  costSnapshot?: Record<string, unknown> | null;
 }
 
 // store / snapshot 的已装配单轮轨迹（thinking/analysis 累积；env 环形 ≤20）。
@@ -322,6 +339,11 @@ export interface AiTradeRoundTrace {
   baseRuleZone?: "lower" | "mid" | "upper" | null;
   baseRulePctB?: number | null;
   baseRuleReason?: string | null;
+  // 最小 edge 门禁（ai-trade-cost-accounting-and-edge-gate §4.3）：k_min=0（默认）的会话恒为 null。
+  edgeGateStatus?: AiTradeEdgeGateStatus | null;
+  edgeBps?: number | null;
+  edgeCostBps?: number | null;
+  edgeGateReason?: string | null;
   // 利润保护快照（ai-trade-profit-protection §2.7）：规则未装配的会话恒为 null；**不新增 trace phase**
   // ——保护层跑在 5s 盯市上、不是轮级判定，只随 round_start 带一份断面。
   profitGuard?: ProfitGuardSnapshot | null;

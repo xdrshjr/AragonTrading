@@ -452,6 +452,9 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
   { prefix: "profit_guard_committed_exit", label: "利润保护：已触及你承诺的退出线，按承诺离场" },
   // 冷却降级码带参数后缀（profit_cooldown(120s,long)），与基础策略同为**前缀**匹配。
   { prefix: "profit_cooldown", label: "利润保护冷却：刚锁住利润，暂停同向开仓" },
+  // 最小 edge 门禁（ai-trade-cost-accounting-and-edge-gate §3.7）：码带参数后缀
+  // `edge_below_cost(edge=8.1bps,cost=13.0bps,k=2.0)`，同为前缀匹配、参数原样保留供排查。
+  { prefix: "edge_below_cost", label: "期望收益不足以覆盖交易成本，本轮观望" },
 ];
 
 /**
@@ -733,6 +736,31 @@ export function describeBaseRule(
   if (status === "veto") return { label: "基础策略否决 · 观望", tone: "short" };
   const zone = BASE_RULE_ZONE_LABEL[trace.baseRuleZone ?? ""];
   return { label: zone ? `基础策略 · ${zone}锚区 · 放行` : "基础策略 · 放行", tone: "muted" };
+}
+
+export interface AiEdgeGateView {
+  label: string; // 成本门禁 · 放行 / 成本门禁否决 · 观望 / 成本门禁 · 无法估算 · 放行
+  tone: AiTraceTone;
+}
+
+/**
+ * 最小 edge 门禁判定中文化（ai-trade-cost-accounting-and-edge-gate §4.3 单点）：三态标签 + tone。
+ * 放行 → muted（常态，不抢眼）；否决 → short（红，须显眼）；**无法估算 → accent 而非 short**——本层
+ * 极性是 fail-open，此时开仓一律放行，用红色会让用户以为被拦住了，与铁律层的同名态含义正相反。
+ * 未启用（`edgeGateStatus` 为空，k_min=0 即默认）→ null（组件整段不渲染，老会话与老快照零影响）。
+ */
+export function describeEdgeGate(
+  trace: Pick<AiTradeRoundTrace, "edgeGateStatus" | "edgeBps" | "edgeCostBps">,
+): AiEdgeGateView | null {
+  const status = trace.edgeGateStatus;
+  if (!status) return null;
+  if (status === "unavailable") return { label: "成本门禁 · 无法估算 · 放行", tone: "accent" };
+  const budget =
+    trace.edgeBps != null && trace.edgeCostBps != null
+      ? `（${trace.edgeBps.toFixed(1)} / ${trace.edgeCostBps.toFixed(1)}bps）`
+      : "";
+  if (status === "veto") return { label: `成本门禁否决 · 观望${budget}`, tone: "short" };
+  return { label: `成本门禁 · 放行${budget}`, tone: "muted" };
 }
 
 export interface AiExecutedView {

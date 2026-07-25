@@ -31,6 +31,7 @@ from ..okx.ws_client import OKXWSClient
 from ..paper.strategy_factory import PaperStrategySpec
 from ..strategies.base import Signal
 from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, gate_status
+from .cost_runtime import CostRuntime
 from .decider import AiTradeDecider, TradeDecision
 from .market_context import build_market_context
 from .market_digest import build_market_digest
@@ -64,7 +65,10 @@ from .signals import (
 from .trace import (
     _TRACES_MAX,
     TraceEmit,
+    apply_edge_gate_trace,
     base_rule_event,
+    edge_gate_event,
+    edge_gate_unavailable_event,
     new_round_trace,
     reflection_start_event,
     reflection_verdict_event,
@@ -83,6 +87,9 @@ _ANALYSIS_EXCERPT_CHARS = 400
 # 【基础策略】通道连续不可用告警阈值（ai-trade-base-strategy-ma-band §2.6/P0-4）：连续这么多轮算不出
 # 通道即追发一条 error 事件，使「为什么一直不开单」在 UI 上自解释——静默的保守 = 用户眼中的故障。
 _BAND_UNAVAILABLE_ALERT_ROUNDS = 3
+# 最小 edge 门禁连续不可用告警阈值（§3.7）：本层 fail-open，故阈值比铁律层宽——连续这么多轮算不出
+# 粗估 edge 才追一条 error，使「门禁其实一直没生效」在 UI 上自解释（静默的降级同样会被当成故障）。
+_EDGE_UNAVAILABLE_ALERT_ROUNDS = 20
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +139,9 @@ class AiTradeSession:
         # 会话只留三个 async 编排点（_maybe/_apply/_report_profit_exit）与时钟读数打包。
         self._guard = ProfitGuardRuntime(profit_rule)
         self._atr_px: float | None = None     # 确认根 ATR（F1）；None ⇒ 回吐距离上下界不生效
+        # 成本记账与最小 edge 门禁（§3.10）：状态 / 快照 / 计数全部下沉 `CostRuntime`（镜像 F0 把
+        # 利润保护下沉 `ProfitGuardRuntime` 的同款范式），会话只留薄封装调用。
+        self._cost = CostRuntime(inst_id, executor.settings, executor.fee_ledger)
         # P0-1：会话级单调持仓序号——`_dispatch` 观察到任一 `side=="close"` 成交即 +1。epoch 身份的一半，
         # 没有它，「保护平仓 → 同一 tick 内同向重开」的新仓会继承旧峰值并被当场强平（真实资金）。
         self._position_seq = 0
@@ -241,6 +251,7 @@ class AiTradeSession:
                     if "peakPnlUsd" not in trade:      # 绝不用 setdefault（P2-7：恒求值实参 ⇒
                         # 键已存在时也会把峰值消费掉，让下一笔平仓静默拿到 None）
                         trade["peakPnlUsd"] = self._guard.take_peak_pnl()
+                    self._cost.record_close(trade)      # §3.8：往返归因同挂这个唯一收口
                 self._inject_explain_meta(trade)
                 await self._persist_trade(trade)
             await self._push(event)
@@ -258,6 +269,7 @@ class AiTradeSession:
             meta.setdefault("clOrdId", trade["clOrdId"])
         if trade.get("ordId"):
             meta.setdefault("ordId", trade["ordId"])
+        self._cost.apply_explain_meta(meta, trade)   # A0-1：记账关闭即空转 ⇒ meta 逐字回退
         explain["meta"] = meta
 
     async def _persist_trade(self, trade: dict) -> None:
@@ -387,6 +399,7 @@ class AiTradeSession:
         await self._maybe_profit_exit(now_ts)
         await self._expire_profit_cooldown()
         await self._maybe_session_exit(mark, now_ts)
+        await self._cost.refresh_funding(time.time())    # §3.1：网络 IO 只跑在盯市 tick 上
         await self._maybe_interval_wake()
 
     async def _maybe_interval_wake(self) -> None:
@@ -573,11 +586,16 @@ class AiTradeSession:
             # ★ 利润保护冷却门禁（adaptive §2.2.2）：铁律后、共识前（见 _apply_profit_cooldown_gate）。
             decision, degrade = self._apply_profit_cooldown_gate(decision, degrade)
             decision, degrade = self._apply_consensus_gate(decision, consensus, degrade)  # E2 门禁
+            # ★ 最小 edge 门禁（§3.7）：共识后、反思前——被拦轮此时已是 hold，而反思对 hold 本就
+            # 直通 ⇒ EV 不足的轮次自动省掉一次反思 LLM 调用，门禁本身就是省钱项。
+            decision, degrade = await self._apply_edge_gate(round_no, ts, ref_px,
+                                                            decision, degrade)
             # 二次反思（ReAct 复核，仅交易意愿触发；只会更保守）——共识门禁后、真实执行前。
             # F2（hold-inertia-fix）：第三元 reflection_note 保真「提议了什么、为何被否决」。
             decision, degrade, reflection_note = await self._reflect_before_execute(
                 round_no, ts, payload, decision, degrade)
             executed = await self._execute_decision(decision, ref_px, i, ts)
+            self._cost.note_round(bool(executed.get("traded")))          # §6.3 决策转化率
             self.rounds_completed = round_no
             # RC-2/RC-3：研判全文只走 agent_trace/_traces；进 journal 与 decision 事件的取有界摘录（≤400）。
             # 降级轮 last_analysis 恒为空串（RC-1）→ excerpt=None（journal/事件不带残段）。
@@ -791,6 +809,34 @@ class AiTradeSession:
                 "message": (f"基础策略的 MA 通道已连续 {self._band_unavailable_streak} 轮无法计算"
                             f"（需至少 {self.base_rule.period + 1} 根 K 线），期间开仓一律降级观望；"
                             "平仓与撤单不受影响")}})
+
+    async def _apply_edge_gate(self, round_no: int, ts: int, ref_px: float,
+                               decision: TradeDecision, degrade: str | None
+                               ) -> tuple[TradeDecision, str | None]:
+        """薄封装 `CostRuntime.evaluate`（§3.7）：`k_min<=0` ⇒ 原样直通、零事件、零副作用。"""
+        out = self._cost.evaluate(decision, last_px=ref_px, atr_px=self._atr_px,
+                                  take_profit_pct=self.executor.risk.take_profit_pct,
+                                  bar_seconds=BAR_SECONDS[self.bar])
+        if out is None:                       # 门禁空转：只按节流搭一次会话内成本快照（§5.4）
+            await self._emit_cost_snapshot(round_no)
+            return decision, degrade
+        await self._emit_edge_gate_trace(round_no, ts, out)
+        return out.decision, (degrade or out.reason)
+
+    async def _emit_edge_gate_trace(self, round_no: int, ts: int, out) -> None:
+        """edge_gate 轨迹段 + 连续不可用告警升级（§3.7/§5.3；装配与计数均已下沉）。"""
+        streak = self._cost.note_gate(out)
+        apply_edge_gate_trace(self._round_trace, out.wire, out.reason)
+        await self._push(edge_gate_event(round_no, ts, out.wire, self._cost.snapshot()))
+        if streak == _EDGE_UNAVAILABLE_ALERT_ROUNDS:
+            await self._push(edge_gate_unavailable_event(ts, streak))
+
+    async def _emit_cost_snapshot(self, round_no: int) -> None:
+        """§5.4 L0/L1 通道：门禁空转时每 N 轮把只读成本快照搭在既有 status 事件上（纯加法键）。"""
+        snap = self._cost.snapshot_if_due(round_no)
+        if snap is not None:
+            await self._push({"type": "status",
+                              "data": {**self._status_payload(), "costSnapshot": snap}})
 
     def _apply_consensus_gate(self, decision: TradeDecision, consensus: Consensus,
                               degrade: str | None) -> tuple[TradeDecision, str | None]:
@@ -1292,6 +1338,8 @@ class AiTradeSession:
             # armedRounds 是**轮级**口径（快照曾处于 armed/breakeven_armed 的轮数）；二者不可互相换算。
             metrics["aiStats"]["profitGuardExits"] = self.profit_guard_exits
             metrics["aiStats"]["profitGuardArmedRounds"] = self.profit_guard_armed_rounds
+            # 成本记账与门禁观测（§3.8，RV-1）：合并落在**调用点**，`_compute_ai_stats` 一字不动。
+            metrics["aiStats"] = self._cost.merge_into(metrics["aiStats"])
         except Exception as exc:  # noqa: BLE001 —— 富化对 finalize 是加法且可失败，绝不阻断落库收尾
             logger.warning("ai-trade finalize enrichment skipped for run %s: %s", self.run_id, exc)
             for key in ("equityDigest", "decisionsDigest", "aiStats"):

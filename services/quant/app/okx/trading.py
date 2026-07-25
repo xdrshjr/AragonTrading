@@ -471,6 +471,10 @@ def _normalize_fill(r: dict) -> dict:
     额外回带 ``clOrdId``（成交 → 自动交易解释的关联主键，下单时我方写入、成交时 OKX 回显）
     与 ``tradeId``（OKX 每笔成交唯一 id，作前端行 key 与展开态稳定身份）。二者仅「停止丢弃」，
     缺失容错为空串，不改变任何外部调用（live-fills-explainability §2.2）。
+
+    ``feeCcy``（费率计价币）同样仅「停止丢弃」：``fee`` 是**有符号量**（负=收取 / 正=返佣）且币本位
+    合约以币计价，费率审计必须先按计价币筛掉非 USDT 样本再归一符号，否则是量纲错误
+    （ai-trade-cost-accounting-and-edge-gate §3.2.4）。
     """
     return {
         "ts": int(r.get("fillTime") or r.get("ts") or 0) // 1000,
@@ -479,6 +483,7 @@ def _normalize_fill(r: dict) -> dict:
         "fillPx": _optional_float(r.get("fillPx")) or 0.0,
         "fillSz": _optional_float(r.get("fillSz")) or 0.0,
         "fee": _optional_float(r.get("fee")) or 0.0,
+        "feeCcy": str(r.get("feeCcy") or ""),
         "ordId": str(r.get("ordId") or ""),
         "clOrdId": str(r.get("clOrdId") or ""),
         "tradeId": str(r.get("tradeId") or ""),

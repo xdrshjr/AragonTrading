@@ -7,6 +7,7 @@ import {
   describeBaseRule,
   describeConsensus,
   describeDegradeReason,
+  describeEdgeGate,
   describeExecuted,
   describeFactors,
   describeCandidateLevel,
@@ -219,6 +220,43 @@ function BaseRuleBlock({ trace }: { trace: AiTradeRoundTrace }) {
         // 否则用户在此看到的是裸 `base_rule_ma_band(pctB=0.42)`，与本段「人话理由」的职责相悖。
         <p className="text-[11px] leading-relaxed text-[var(--text)]">
           {describeDegradeReason(trace.baseRuleReason)}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 最小 edge 门禁段（ai-trade-cost-accounting-and-edge-gate §4.3）：与铁律段并列、紧随其后——管线顺序
+ * 即卡片顺序（铁律 → 冷却 → 共识 → **本层** → 反思）。徽标与铁律段同排同款，但**极性相反**：本层
+ * fail-open，「无法估算」意味着放行而非拦截，故用 accent 而非红色，文案也把这件事讲清楚。
+ * 门禁未启用（`k_min=0`，默认）⇒ `edgeGateStatus` 恒为空 ⇒ 整段不渲染（老会话与老快照零影响）。
+ */
+function EdgeGateBlock({ trace }: { trace: AiTradeRoundTrace }) {
+  const view = describeEdgeGate(trace);
+  if (!view) return null;
+  const unavailable = trace.edgeGateStatus === "unavailable";
+  return (
+    <div className="flex flex-col gap-1.5 rounded-[10px] border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] px-2.5 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1 text-[11px] font-medium text-[var(--text)]">
+          <span className="leading-none">⚖️</span>成本门禁（期望收益 vs 往返成本）
+        </span>
+        <span
+          className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+          style={{ color: TONE_VAR[view.tone], backgroundColor: toneSoft(view.tone) }}
+        >
+          {view.label}
+        </span>
+      </div>
+      <p className="text-[10px] leading-relaxed text-[var(--muted)]">
+        {unavailable
+          ? "本轮无法估算期望收益（ATR 数据不足），开仓一律放行；本层只会更保守，不会因估不出而拦单。"
+          : "粗估毛收益 = min(ATR 预算, 单仓止盈距离)；成本 = 双边手续费 + 穿越价差 + 冲击 + 资金费率。"}
+      </p>
+      {trace.edgeGateReason && (
+        <p className="text-[11px] leading-relaxed text-[var(--text)]">
+          {describeDegradeReason(trace.edgeGateReason)}
         </p>
       )}
     </div>
@@ -483,6 +521,7 @@ export default function AiTradeTraceRound({ trace }: { trace: AiTradeRoundTrace 
       <AnalysisBlock trace={trace} />
       <DecisionToolCard trace={trace} />
       <BaseRuleBlock trace={trace} />
+      <EdgeGateBlock trace={trace} />
       <ProfitGuardBlock trace={trace} />
       <ReflectionBlock trace={trace} />
       <ResultRow trace={trace} />

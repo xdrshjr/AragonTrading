@@ -16,6 +16,10 @@ from .types import Candle, Instrument, _optional_float, parse_okx_candle
 
 # 合约元数据缓存 TTL（秒）：ctVal/lotSz/tickSz 等极少变动，1 小时足够新鲜又免重复往返。
 _INST_META_TTL_SECONDS = 3600.0
+# 资金费率缓存 TTL（秒）：结算以小时计，30s 已足够新鲜，且天然给多标的分组的并发盯市去重。
+_FUNDING_TTL_SECONDS = 30.0
+# 结算周期缺失时的保守回落（OKX 主流永续为 8h）。
+_DEFAULT_FUNDING_INTERVAL_S = 28800.0
 
 
 class OKXError(Exception):
@@ -63,6 +67,8 @@ class OKXRestClient:
         self._last_latency_ms: int | None = None   # 最近一次 health 探活往返毫秒 (F2)
         # 合约元数据进程内缓存（instId -> (到期 monotonic, meta)）；元数据低频变动，短 TTL (C1-1)。
         self._inst_meta_cache: dict[str, tuple[float, dict]] = {}
+        # 资金费率进程内缓存（instId -> (到期 monotonic, 归一读数)）；镜像上一行的既有写法。
+        self._funding_cache: dict[str, tuple[float, dict]] = {}
 
     @property
     def last_ok_ts(self) -> int | None:
@@ -249,6 +255,36 @@ class OKXRestClient:
         }
         self._inst_meta_cache[inst_id] = (time.monotonic() + _INST_META_TTL_SECONDS, meta)
         return meta
+
+    async def get_funding_rate(self, inst_id: str) -> dict | None:
+        """永续资金费率（``GET /api/v5/public/funding-rate``，公共无签名）。
+
+        供成本模型的 ``fundingCarryBps`` 项（ai-trade-cost-accounting-and-edge-gate §3.5，D-2）。
+        进程内按 instId 短 TTL 缓存，完全镜像 ``_inst_meta_cache`` 的既有写法——5s 盯市 × 60s TTL
+        下每分钟至多一次公共请求，配额压力可忽略。
+
+        Returns:
+            ``{"fundingRate", "fundingTs", "nextFundingTs", "intervalS"}``；该标的无资金费率
+            （非永续）或返回为空时 ``None``。``intervalS`` 由两个结算时点相减得出，缺失回落 8h。
+        """
+        cached = self._funding_cache.get(inst_id)
+        if cached and cached[0] > time.monotonic():
+            return cached[1]
+        rows = await self._request("/api/v5/public/funding-rate", {"instId": inst_id})
+        row = next((r for r in rows if r.get("instId") == inst_id), rows[0] if rows else None)
+        if row is None:
+            return None
+        funding_ts = int(_optional_float(row.get("fundingTime")) or 0.0) // 1000
+        next_ts = int(_optional_float(row.get("nextFundingTime")) or 0.0) // 1000
+        span = next_ts - funding_ts
+        out = {
+            "fundingRate": _optional_float(row.get("fundingRate")) or 0.0,
+            "fundingTs": funding_ts,
+            "nextFundingTs": next_ts,
+            "intervalS": max(60.0, float(span)) if span > 0 else _DEFAULT_FUNDING_INTERVAL_S,
+        }
+        self._funding_cache[inst_id] = (time.monotonic() + _FUNDING_TTL_SECONDS, out)
+        return out
 
 
 # 进程级单例（FastAPI 启动时创建，关闭时 aclose）

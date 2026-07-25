@@ -11,7 +11,12 @@ import json
 
 from sqlalchemy import select
 
-from app.ai_auto.backtest import AiBacktestRunner, AiBacktestSpec, _BacktestJob
+from app.ai_auto.backtest import (
+    _EDGE_GATE_BACKTEST_NOTE,
+    AiBacktestRunner,
+    AiBacktestSpec,
+    _BacktestJob,
+)
 from app.agent.llm.base import StreamEvent
 from app.ai_auto.prompts import REFLECTION_TOOL_NAME
 from app.config import Settings
@@ -704,3 +709,67 @@ async def test_backtest_commitment_disabled_keeps_committed_none(monkeypatch):
         assert "holdExitPx" not in runner.decider._tool.input_schema["properties"]
     finally:
         await dispose_engine()
+
+
+# ============ 最小 edge 门禁的回测同构（ai-trade-cost-accounting-and-edge-gate §7.4）============
+async def test_backtest_edge_gate_off_by_default_is_byte_identical(monkeypatch):
+    """§7.4 用例 1：`k_min=0`（默认）⇒ 门禁恒空转 ⇒ 无任何 `edge_below_cost` 降级、结果不变。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        _patch_loaders(monkeypatch, candles, _StubLLM(_alternating))
+        runner = AiBacktestRunner(_spec(sid, paper, candles, every=1))
+        job = _BacktestJob("aibt_edge_off", runner)
+        await runner.run(job)
+
+        assert runner.settings.ai_trade_edge_gate_k_min == 0.0
+        assert not [d for d in job.result["decisionsDigest"]
+                    if (d.get("degradeReason") or "").startswith("edge_below_cost")]
+        assert job.result["trades"], "空转的门禁不该拦掉任何成交"
+        assert _EDGE_GATE_BACKTEST_NOTE not in job.result["notes"]
+    finally:
+        await dispose_engine()
+
+
+async def test_backtest_edge_gate_vetoes_and_skips_reflection(monkeypatch):
+    """§7.4 用例 2/3：`k_min` 极大 ⇒ 开仓全被降级为 hold、反思零调用、免责条目落 notes。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(300)
+        llm = _StubLLM(lambda _c: {"action": "open_long", "sizeFraction": 0.5,
+                                   "confidence": 0.8, "reason": "r"})
+        _patch_loaders(monkeypatch, candles, llm)
+        spec = _spec(sid, paper, candles, every=1, reflection_enabled=True)
+        spec.settings = Settings(ai_backtest_max_rounds=400, ai_trade_edge_gate_k_min=10.0,
+                                 ai_trade_edge_atr_target_mult=0.001)
+        runner = AiBacktestRunner(spec)
+        reflect_calls = {"n": 0}
+
+        async def counting_reflect(*_a, **_k):
+            reflect_calls["n"] += 1
+            raise AssertionError("被 edge 门禁拦下的轮次不应触发反思")
+
+        runner.decider.reflect = counting_reflect
+        job = _BacktestJob("aibt_edge_on", runner)
+        await runner.run(job)
+
+        vetoed = [d for d in job.result["decisionsDigest"]
+                  if (d.get("degradeReason") or "").startswith("edge_below_cost(")]
+        assert vetoed and all(d["action"] == "hold" for d in vetoed)
+        assert reflect_calls["n"] == 0                 # 门禁省钱项：被拦轮零反思 LLM
+        assert not job.result["trades"]                # 全部开仓被拦 ⇒ 无成交
+        assert _EDGE_GATE_BACKTEST_NOTE in job.result["notes"]
+    finally:
+        await dispose_engine()
+
+
+async def test_backtest_cost_uses_simbroker_constants_not_live_ones(monkeypatch):
+    """回测世界的成本 = `SimBroker` 实收（双边 taker + 双边滑点 = 14bps），与实盘常数各自独立。"""
+    from app.ai_auto.cost_model import CostQuery, backtest_params, estimate_round_trip_cost
+
+    settings = Settings()
+    cost = estimate_round_trip_cost(
+        CostQuery(ord_type="market", side="long", bar_seconds=3600, funding_rate=0.0),
+        backtest_params(settings))
+    assert cost.total_bps == 14.0
+    assert cost.confidence == "ok"          # 回测不收资金费率是**有意不建模**，不是数据缺失

@@ -31,6 +31,7 @@ from ..db import repositories as repo
 from ..db.session import get_sessionmaker
 from ..engine.simulator import RiskParams
 from ..live_auto.executor import LiveExecutor
+from ..live_auto.fee_ledger import build_fee_ledger
 from ..okx.accounts import AccountCredentials
 from ..okx.order_builder import snap_size
 from ..okx.trading import fetch_live_open_orders, fetch_live_positions, fetch_trading_config
@@ -593,7 +594,9 @@ class AiTradeManager:
             pos_mode=config.get("posMode") or "long_short_mode",
             leverage=lever, budget_usd=budget, risk=risk,
             ct_val=meta.get("ctVal") or 0.0, lot_sz=meta.get("lotSz") or 0.0,
-            min_sz=meta.get("minSz") or 0.0, settings=settings)
+            min_sz=meta.get("minSz") or 0.0, settings=settings,
+            # 成本记账的作用域缝（§3.2.0）：**只有** AI 链路注入账本；live_auto 不传 ⇒ 逐字节回退。
+            fee_ledger=build_fee_ledger(settings, ct_val=meta.get("ctVal") or 0.0))
 
     @staticmethod
     async def _create_group_run(ctx: _GroupBuildCtx, plan: _MemberPlan,

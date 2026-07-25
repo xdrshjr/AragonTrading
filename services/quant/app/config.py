@@ -250,6 +250,34 @@ class Settings(BaseSettings):
     # 承诺退出线总闸：把模型每轮被索要、却从不被系统采集/执行的退出线做成结构化、单调棘轮、确定性兑现
     # 的第三条保护线。False ⇒ 决策工具字段 / 宪章段 / 判定逐字节回退 v2（G-1/G-2）。
     ai_trade_profit_guard_commitment_enabled: bool = True
+    # ---- 成本记账与最小 edge 门禁（ai-trade-cost-accounting-and-edge-gate §3.9）----
+    # 本段全部字段的**作用域是 AI 会话**：`FeeLedger` 只由 `ai_auto/manager.py` 经 `LiveExecutor` 的
+    # `fee_ledger=` 构造缝注入，`live_auto`（非 AI）恒传 None ⇒ 这些开关取任何值都不影响非 AI 链路
+    # （§3.2.0，Z-7 钉死）。env 名 AI_TRADE_* 已在 desktop config.js prod 透传白名单内（AI_TRADE_ 前缀），
+    # 此处须真的声明——Settings extra="ignore" 会静默丢弃未声明的 env。
+    # A0-1 记录层：每笔成交按确定性费率模型入账（notional × feeBps）。False ⇒ trade["fee"] 逐字回退 0.0。
+    ai_trade_fee_accounting_enabled: bool = True
+    # A0-2 口径切换：_close_pnl 扣双边费用 ⇒ session_pnl_usd 变净额。**破坏性变更，默认关**。
+    ai_trade_net_pnl_enabled: bool = False
+    # 费率常量刻意**不复用** default_taker_fee_bps（本文件下方「撮合默认参数」段）：后者同时服务
+    # SimBroker / 纸面 / 影子 broker，改它等于静默重写每一次历史回测的成本假设。两个世界的费率必须能各自演进。
+    ai_trade_maker_fee_bps: float = Field(default=2.0, ge=0, le=100)
+    ai_trade_taker_fee_bps: float = Field(default=5.0, ge=0, le=100)
+    ai_trade_half_spread_fallback_bps: float = Field(default=1.0, ge=0, le=100)  # 无 books5 时的保守假设
+    ai_trade_impact_bps: float = Field(default=0.5, ge=0, le=100)
+    # 成本模型的预期持仓根数（资金费率结算周期数由它推）。
+    ai_trade_cost_expected_hold_bars: int = Field(default=8, ge=1, le=1000)
+    # 最小 edge 门禁：判据 毛edge(bps) ≥ k_min × C(bps)。**0 = 门禁空转（默认，逐字回退）**。
+    # 启用 runbook 见 spec §7.5：先满 50 笔费率入账 → 开 A0-2 → 观察 100 笔 → 再置 2.0。
+    ai_trade_edge_gate_k_min: float = Field(default=0.0, ge=0, le=10)
+    ai_trade_edge_gate_degraded_mult: float = Field(default=1.2, ge=1.0, le=3.0)  # 成本 degraded 时的收紧倍数
+    ai_trade_edge_atr_target_mult: float = Field(default=1.0, gt=0, le=10)        # 粗估毛 edge 的 ATR 倍数
+    # 资金费率：总闸关 ⇒ fundingCarryBps=0.0 且 confidence 保持 "ok"（有意选择 ≠ 数据缺失）。
+    ai_trade_funding_enabled: bool = True
+    ai_trade_funding_poll_ttl_s: float = Field(default=60.0, gt=0, le=3600)
+    # 实测成交明细旁路审计（校准 feeBps / 观测滑点）；绝不进决策轮，绝不回写盈亏。
+    ai_trade_fill_audit_enabled: bool = True
+    ai_trade_fill_audit_interval_s: float = Field(default=60.0, gt=0, le=3600)
     # ---- AI 自动交易 · 回测模式（ai-auto-trading-backtest §2.5，三重决策成本护栏）----
     # 回测每决策根调一次 LLM，成本/时长敏感；三重护栏：决策间隔（降频）+ 决策轮数硬上限（越界启动前
     # 拒绝，绝不静默截断）+ 并发闸（限同时消耗 LLM 的回测数）。字段名即环境变量名（AI_BACKTEST_*，
