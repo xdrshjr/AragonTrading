@@ -285,6 +285,50 @@ def _format_consensus(consensus: dict | None) -> str:
             f"一致度={consensus.get('agreement')}")
 
 
+def _format_signal_priors(priors: dict | None) -> str:
+    """把信号先验压成 2~3 行（§3.9）；`priors is None` 时返回空串（整段省略，同 E1/E2 降级范式）。
+
+    三条渲染硬约束：① 必须写明「历史统计，不是当下保证」——它是对过去的度量，而加密市场体制切换
+    极快；② 证据明细至多 `top_n` 条（已在 `resolve_direction_prior` 截好，此处不再截）；
+    ③ 键缺失 ⇒ 整段省略 ⇒ 对不含 `signalPriors` 的 payload 输出与合入前**逐字节**相同（G-1）。
+    """
+    if not priors:
+        return ""
+    age_days = (priors.get("ageS") or 0) / 86400.0
+    head = (f"信号先验（历史统计，非当下保证；毛口径，前瞻 {priors.get('horizonBars')} 根，"
+            f"快照 {age_days:.1f} 天前 · 体制桶={priors.get('regimeUsed') or '—'}）：")
+    lines = [head, _format_prior_directions(priors)]
+    evidence = _format_prior_contributors(priors)
+    if evidence:
+        lines.append(evidence)
+    return "\n".join(lines)
+
+
+def _format_prior_directions(priors: dict) -> str:
+    """多空两侧的聚合读数 + 覆盖率；某侧无贡献者即如实写「无证据」（**不写 p=0.5**）。"""
+    coverage = priors.get("coverage") or {}
+    cov = (f"；覆盖率 {coverage.get('boardWithPrior')}/{coverage.get('boardTotal')}"
+           if coverage.get("boardTotal") else "")
+    return (f"做多 {_format_prior_side(priors.get('long'))}，"
+            f"做空 {_format_prior_side(priors.get('short'))}{cov}。")
+
+
+def _format_prior_side(side: dict | None) -> str:
+    if not side:
+        return "无证据"
+    return f"p={side.get('p')}（{side.get('contributorN')} 条证据，IR 加权，EV {side.get('evBps')}bps）"
+
+
+def _format_prior_contributors(priors: dict) -> str:
+    """本轮触发证据明细（两侧合并，至多 `top_n` 条已在聚合层截好）。"""
+    items = []
+    for side in ("long", "short"):
+        for c in (priors.get(side) or {}).get("contributors") or []:
+            items.append(f"{c.get('label')}（{'多' if side == 'long' else '空'}，"
+                         f"p={c.get('p')}，样本 {c.get('sampleN')}，IR {c.get('ir')}）")
+    return ("本轮触发证据：" + "｜".join(items)) if items else ""
+
+
 def _format_price_action(pa: dict | None) -> str:
     """把价格走势证据压成一行（R1）；`pa is None` 时返回空串（整段省略，同 _format_market_context）。"""
     if not pa:
@@ -474,6 +518,9 @@ def build_decision_prompt(payload: dict) -> str:
     consensus_line = _format_consensus(payload.get("consensus"))
     if consensus_line:                       # E2：consensus 为 None 时省略；空板则如实呈现 0 票
         parts.append(consensus_line)
+    priors_line = _format_signal_priors(payload.get("signalPriors"))
+    if priors_line:                          # 证据相邻性：共识 → 共识的历史质量 → 行情证据
+        parts.append(priors_line)
     digest = payload.get("marketDigest") or {}   # R1：各段 None 时整段省略（同 E1/E2 降级范式）
     for line in (_format_price_action(digest.get("priceAction")),
                  _format_volume(digest.get("volume")),

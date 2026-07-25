@@ -24,6 +24,7 @@ from ..engine.simulator import RiskParams, SimBroker
 from ..paper.strategy_factory import PaperStrategySpec
 from ..strategies.base import Signal
 from .decider import TradeDecision
+from .signal_prior import TIE_EPS
 
 # 影子 broker 名义资金（仅用于读立场；stance 只取决于开/平信号，与具体权益无关）。
 _SHADOW_CAPITAL = 10_000.0
@@ -78,6 +79,103 @@ def compute_consensus(board: list["StrategySignalView"]) -> Consensus:
     agreement = max(long_votes, short_votes) / total if total else 0.0
     return Consensus(long_votes=long_votes, short_votes=short_votes, flat_votes=flat_votes,
                      total=total, net_stance=net_stance, agreement=round(agreement, 4))
+
+
+# ============================ 加权共识（signal-prior-and-ev-gate §3.8，与等权**并列**） ============================
+@dataclass
+class WeightedConsensus:
+    """IR 加权共识：把「几票」换成「这些票历史上值多少钱」（`compute_consensus` 一字不动）。"""
+
+    p_long: float | None       # 该方向无贡献者 ⇒ None（**不是 0.5**）
+    p_short: float | None
+    net_stance: str            # long | short | flat（差值不超过 TIE_EPS 即 flat）
+    weight_long: float
+    weight_short: float
+    contributors_long: int
+    contributors_short: int
+    coverage: float | None     # 有立场的板上策略里有先验的比例；全板空仓 ⇒ None（**不是 0.0**）
+
+
+def compute_weighted_consensus(board: list["StrategySignalView"],
+                               priors) -> WeightedConsensus | None:
+    """按方向先验聚合出加权共识；先验缺席 / 两侧皆无贡献者 ⇒ `None` ⇒ payload 整键缺席。
+
+    **本轮不接门禁**：`apply_consensus_gate` 的入参与行为逐字不变，加权结果只进 payload / prompt /
+    轨迹与 EV 分子。同时上两道硬共识门禁会让「哪一道在起作用」不可证伪（§2.2）。
+
+    Args:
+        board: 本轮信号板。
+        priors: `{"long": DirectionPrior|None, "short": DirectionPrior|None}`；`None` ⇒ 返回 None。
+
+    Returns:
+        `WeightedConsensus` 或 `None`。
+    """
+    if not priors:
+        return None
+    long_, short = priors.get("long"), priors.get("short")
+    if long_ is None and short is None:
+        return None
+    p_long = None if long_ is None else long_.p
+    p_short = None if short is None else short.p
+    return WeightedConsensus(
+        p_long=p_long, p_short=p_short,
+        net_stance=_weighted_net_stance(p_long, p_short),
+        weight_long=0.0 if long_ is None else long_.w_sum,
+        weight_short=0.0 if short is None else short.w_sum,
+        contributors_long=0 if long_ is None else long_.contributor_n,
+        contributors_short=0 if short is None else short.contributor_n,
+        coverage=_weighted_coverage(board, priors))
+
+
+def _weighted_net_stance(p_long: float | None, p_short: float | None) -> str:
+    """净立场判定：无证据的一侧按中性 0.5 **参与比较**，但 `p_long`/`p_short` 仍如实为 `None`。
+
+    把 0.5 写进 wire 会让「没有证据」和「证据说五五开」变成同一个数；只在比较这一处用中性值，
+    是为了让「只有一侧有先验」的轮次仍能给出方向，而不是一律 flat。
+    """
+    lo = 0.5 if p_long is None else p_long
+    sh = 0.5 if p_short is None else p_short
+    if lo - sh > TIE_EPS:
+        return "long"
+    if sh - lo > TIE_EPS:
+        return "short"
+    return "flat"
+
+
+def board_prior_coverage(board: list["StrategySignalView"],
+                         priors) -> tuple[int, int] | None:
+    """覆盖率的**唯一口径**（比值与计数两个读点共用）：`(有先验的, 本轮在说话的)`。
+
+    **分母只数本轮真的在说话的策略**（`stance ∈ {long, short}`）。把 `stance == flat` 的策略也算
+    进分母，会让「覆盖率 ≥ 80%」在一个健康系统上永远不达标——空仓策略本就不该有方向先验，运维
+    据此会去做错误的补救（拉长回看窗口）。全板空仓 ⇒ `None`（**不是 0/0**）：没有分母时报 0%
+    是在制造一个假的故障信号。
+    """
+    speaking = [v for v in board if v.stance in ("long", "short")]
+    if not speaking:
+        return None
+    covered = {d: set(getattr((priors or {}).get(d), "strategy_ids", ()) or ())
+               for d in ("long", "short")}
+    hit = sum(1 for v in speaking if v.strategy_id in covered[v.stance])
+    return hit, len(speaking)
+
+
+def _weighted_coverage(board: list["StrategySignalView"], priors) -> float | None:
+    """覆盖率比值（口径见 `board_prior_coverage`；全板空仓 ⇒ `None` 而非 `0.0`）。"""
+    counts = board_prior_coverage(board, priors)
+    return None if counts is None else round(counts[0] / counts[1], 4)
+
+
+def weighted_consensus_wire(weighted: WeightedConsensus | None) -> dict | None:
+    """`WeightedConsensus` → camelCase 只读 wire；`None` → `None`（键缺席即整段省略）。"""
+    if weighted is None:
+        return None
+    return {"pLong": weighted.p_long, "pShort": weighted.p_short,
+            "netStance": weighted.net_stance, "weightLong": round(weighted.weight_long, 4),
+            "weightShort": round(weighted.weight_short, 4),
+            "contributorsLong": weighted.contributors_long,
+            "contributorsShort": weighted.contributors_short,
+            "coverage": weighted.coverage}
 
 
 def make_shadow_broker(leverage: float = 1.0) -> SimBroker:

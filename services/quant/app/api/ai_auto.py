@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,10 +28,14 @@ from ..ai_auto.manager import (
     AiTradePreflightError,
     AiTradeSessionLimitError,
 )
+from ..ai_auto.prior_service import prior_snapshot_out, rebuild_prior_snapshot
 from ..ai_auto.profit_guard import ProfitGuardRule, resolve_profit_guard_rule
+from ..ai_auto.signal_prior import resolve_prior_params, strategy_fingerprint
 from ..config import Settings, get_settings
+from ..db import ai_prior_repositories as prior_repo
 from ..db import repositories as repo
 from ..db.session import get_session
+from ..okx.types import BAR_SECONDS
 from ..paper.strategy_factory import build_paper_strategy_spec
 from ..schemas import (
     AiBacktestStartIn,
@@ -38,6 +43,8 @@ from ..schemas import (
     AiTradeGroupStartIn,
     AiTradeHistoryDetailOut,
     AiTradeHistoryListOut,
+    AiTradePriorRebuildIn,
+    AiTradePriorSnapshotOut,
     AiTradeProfitGuardIn,
     trade_out,
 )
@@ -137,9 +144,14 @@ async def _resolve_account(session: AsyncSession, account_id: int | None) -> rep
     return row
 
 
-async def _build_specs(session: AsyncSession, strategy_ids: list[int]) -> list:
-    """逐个策略行取存在性 + `build_paper_strategy_spec` 可实例化；任一失败 → AI_TRADE_STRATEGIES_INVALID。"""
-    specs = []
+async def _build_specs(session: AsyncSession,
+                       strategy_ids: list[int]) -> tuple[list, dict[int, str]]:
+    """逐个策略行取存在性 + `build_paper_strategy_spec` 可实例化；任一失败 → AI_TRADE_STRATEGIES_INVALID。
+
+    **顺带算出策略指纹**（C-6，signal-prior-and-ev-gate §3.5）：本函数已逐个取过策略行，
+    `template_key` / `params_json` 就在手上，零额外查询。返回 `(specs, {strategyId: 指纹})`。
+    """
+    specs, fingerprints = [], {}
     for sid in strategy_ids:
         row = await repo.get_strategy_row(session, sid)
         if row is None:
@@ -152,7 +164,29 @@ async def _build_specs(session: AsyncSession, strategy_ids: list[int]) -> list:
             raise HTTPException(400, detail={
                 "code": "AI_TRADE_STRATEGIES_INVALID",
                 "message": detail.get("message", f"策略无法实例化：{sid}")}) from exc
-    return specs
+        fingerprints[sid] = strategy_fingerprint(row.template_key, row.params_json)
+    return specs, fingerprints
+
+
+async def _resolve_prior_snapshots(session: AsyncSession, settings: Settings, *,
+                                   inst_ids: list[str], bar: str,
+                                   fingerprints: dict[int, str]) -> dict[str, dict] | None:
+    """按 `instId` 逐个取先验快照并注入指纹表；总闸①关 ⇒ `None`（连查询都不发）。
+
+    **按标的键**而非分组共享一份（P1-5）：一个分组最多 5 个标的，共享快照等于让 BTC 的成员拿
+    ETH 的历史统计去开真实仓位。缺键 = 该成员无先验（不是错误，逐字回退 ATR 粗估）。
+
+    `fingerprints` 作为**内存态键**注入快照（不落库）：`PriorRuntime` 据此做 C-6 比对，改过参数
+    的策略条目会被丢弃并推一条 `AI_TRADE_PRIOR_CONTRACT_MISMATCH`。
+    """
+    if not settings.ai_trade_signal_prior_enabled:
+        return None
+    out: dict[str, dict] = {}
+    for inst_id in inst_ids:
+        snapshot = await prior_repo.load_prior_snapshot(session, inst_id, bar)
+        if snapshot is not None:
+            out[inst_id] = {**snapshot, "fingerprints": fingerprints}
+    return out or None
 
 
 @router.post("/ai-trade/start")
@@ -168,7 +202,10 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
     """
     _require_ai_enabled(settings)
     account_row = await _resolve_account(session, body.accountId)
-    specs = await _build_specs(session, body.strategyIds)
+    specs, fingerprints = await _build_specs(session, body.strategyIds)
+    priors = await _resolve_prior_snapshots(
+        session, settings, inst_ids=[m.instId for m in body.members], bar=body.bar,
+        fingerprints=fingerprints)
     at = await repo.get_auto_trade_settings(session)
     # 天花板委托给账户级 maxBudgetPct 与运营天花板（与 effectiveMaxBudgetPct 同源，min 只收紧不放大）；
     # ai_trade_max_capital_frac 默认 1.0=不额外约束，运维可下调为 AI 专属更紧的绝对上限。
@@ -189,7 +226,8 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
         position_step_pct=_resolve_position_step(body.positionStepPct, settings),
         wake_interval_s=_resolve_wake_interval_s(body.wakeIntervalMinutes, settings),
         base_rule=_resolve_base_rules(body.baseRules, settings),
-        profit_rule=_resolve_profit_guard(body.profitGuard, settings))
+        profit_rule=_resolve_profit_guard(body.profitGuard, settings),
+        prior_snapshots=priors)
     try:
         await get_ai_trade_manager().start_group(req)
     except AiTradeGroupPreflightError as exc:
@@ -250,6 +288,65 @@ async def ai_trade_history_detail(group_id: str,
     return detail
 
 
+# ============================ 信号先验快照（signal-prior-and-ev-gate §4.1）============================
+# 同一 `(instId, bar)` 的重建守门（进程内）：重建是秒级同步计算 + 分页取数，重入会白烧公共配额并让
+# 两次写互相覆盖。只读端点不守门。
+_PRIOR_REBUILD_INFLIGHT: set[tuple[str, str]] = set()
+
+
+@router.post("/ai-trade/priors/rebuild", response_model=AiTradePriorSnapshotOut)
+async def ai_trade_prior_rebuild(body: AiTradePriorRebuildIn,
+                                 session: AsyncSession = Depends(get_session),
+                                 settings: Settings = Depends(get_settings)) -> dict:
+    """离线重建某 `(instId, bar)` 的先验快照（同步执行，重计算在 `run_in_threadpool` 内）。
+
+    业务逻辑全在 `ai_auto/prior_builder`，本层只做守门与编排。**不守 AI 总闸**：重建只算统计、
+    不下任何单，运维需要在开闸之前先把快照建好（§九 L1 的第一个动作）。
+    """
+    if body.bar not in BAR_SECONDS:
+        raise HTTPException(400, detail={"code": "AI_PRIOR_BAR_INVALID",
+                                         "message": f"不支持的周期：{body.bar}"})
+    specs, fingerprints = await _build_specs(session, body.strategyIds)
+    lookback = int(body.lookbackBars or settings.ai_trade_prior_lookback_bars)
+    if lookback > settings.ai_trade_prior_max_bars:      # **取数前**快速失败，绝不无界拉 K 线
+        raise HTTPException(413, detail={
+            "code": "AI_PRIOR_TOO_LARGE",
+            "message": (f"回看根数 {lookback} 超过上限 {settings.ai_trade_prior_max_bars}，"
+                        "请缩小 lookbackBars")})
+    key = (body.instId, body.bar)
+    if key in _PRIOR_REBUILD_INFLIGHT:
+        raise HTTPException(409, detail={"code": "AI_PRIOR_REBUILD_BUSY",
+                                         "message": "该标的/周期的先验重建正在进行中"})
+    _PRIOR_REBUILD_INFLIGHT.add(key)
+    try:
+        snapshot = await rebuild_prior_snapshot(
+            inst_id=body.instId, bar=body.bar, specs=specs, fingerprints=fingerprints,
+            settings=settings, lookback=lookback, segments=body.segments)
+    finally:
+        _PRIOR_REBUILD_INFLIGHT.discard(key)
+    await prior_repo.save_prior_snapshot(session, snapshot)
+    return prior_snapshot_out(snapshot)
+
+
+@router.get("/ai-trade/priors")
+async def ai_trade_prior_get(instId: str, bar: str,
+                             session: AsyncSession = Depends(get_session),
+                             settings: Settings = Depends(get_settings)) -> dict:
+    """读当前快照。无记录 ⇒ `{"exists": false}`——「还没建」是正常状态，不是错误（故非 404）。
+
+    `contract` 直接把 C-2 新鲜度 / C-3 持有期的判定结果告诉运维，省得对着时间戳心算。
+    """
+    snapshot = await prior_repo.load_prior_snapshot(session, instId, bar)
+    if snapshot is None:
+        return {"exists": False}
+    params = resolve_prior_params(settings)
+    age_s = time.time() - float(snapshot.get("builtAtTs") or 0)
+    return {"exists": True, "snapshot": prior_snapshot_out(snapshot),
+            "contract": {"fresh": age_s <= params.max_age_s,
+                         "horizonMatch": (int(snapshot.get("horizonBars") or 0)
+                                          == params.horizon_bars)}}
+
+
 @router.websocket("/ws/ai-trade/{session_id}")
 async def ws_ai_trade(websocket: WebSocket, session_id: str) -> None:
     """事件协议与 /ws/live-auto/{id} 同信封；连接即原子 subscribe→status→snapshot（防丢事件）。"""
@@ -281,7 +378,7 @@ async def ws_ai_trade(websocket: WebSocket, session_id: str) -> None:
 async def ai_backtest_start(body: AiBacktestStartIn, session: AsyncSession = Depends(get_session),
                             settings: Settings = Depends(get_settings)) -> dict:
     """启动一个 AI 自动交易回测作业（§2.9 前置门禁；回执含 plannedRounds 与夹紧后生效资金/杠杆）。"""
-    specs = await _build_specs(session, body.strategyIds)
+    specs, _ = await _build_specs(session, body.strategyIds)   # 回测侧不接先验（D-2 前视偏差）
     req = AiBacktestStartRequest(
         specs=specs, inst_id=body.instId, bar=body.bar, start_ts=body.startTs, end_ts=body.endTs,
         settings=settings, context_refresh_rounds=body.contextRefreshRounds,

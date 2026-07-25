@@ -278,6 +278,28 @@ class Settings(BaseSettings):
     # 实测成交明细旁路审计（校准 feeBps / 观测滑点）；绝不进决策轮，绝不回写盈亏。
     ai_trade_fill_audit_enabled: bool = True
     ai_trade_fill_audit_interval_s: float = Field(default=60.0, gt=0, le=3600)
+    # ---- 信号先验体系与 EV 分子（ai-trade-signal-prior-and-ev-gate §七）----
+    # 三个**默认关闭**的独立总闸：全关时系统逐字节回退到阶段一行为（KV 里遗留的快照行不被读取，
+    # 也无任何副作用）。env 名同为 AI_TRADE_ 前缀，desktop config.js 的 prod 透传白名单已覆盖。
+    ai_trade_signal_prior_enabled: bool = False        # 总闸①：加载快照、payload/prompt 露出先验
+    ai_trade_weighted_consensus_enabled: bool = False  # 总闸②：加权共识（等权口径与门禁逐字不变）
+    # 总闸③：先验进 edge 分子。与①分开是为了把「展示」与「门禁」拆成两个可分别归因的观察窗口
+    # ——③关闭时 priorEvBps / priorWouldVeto 反事实读数**照发**（P1-2），L3 才有据可依地定 k_min。
+    ai_trade_edge_prior_enabled: bool = False
+    # 先验持有期**不新增字段**：恒取 ai_trade_cost_expected_hold_bars（§3.2 推论 1 单一真源）；
+    # 两者不等即整键缺席（C-3），改了它必须立刻重建快照。
+    ai_trade_prior_min_samples: int = Field(default=30, ge=1)      # 单条先验的事件数下限
+    # 独立事件段数下限，**仅作用于 strategy_replay 条目**：立场根高度重叠，一段 200 根的单边趋势
+    # 能单独满足 min_samples，不设它显著性判据形同虚设。0 = 关闭（不建议）。
+    ai_trade_prior_min_runs: int = Field(default=10, ge=0)
+    ai_trade_prior_min_segments: int = Field(default=6, ge=2)      # 与 MIN_IC_SEGMENTS 同源
+    ai_trade_prior_decay_half_life_days: float = Field(default=30.0, gt=0)  # 置极大 = 关衰减
+    ai_trade_prior_embargo_bars: int = Field(default=12, ge=0)     # 0 = 关跨段隔离
+    ai_trade_prior_ir_clip: float = Field(default=2.0, ge=0)       # 0 ⇒ 权重恒 0 ⇒ 先验恒缺席
+    ai_trade_prior_top_n: int = Field(default=5, ge=0)             # prompt 证据明细条数上限
+    ai_trade_prior_max_age_s: float = Field(default=604800.0, gt=0)  # 7 天陈旧度门禁
+    ai_trade_prior_lookback_bars: int = Field(default=4000, ge=100)   # rebuild 缺省回看根数
+    ai_trade_prior_max_bars: int = Field(default=8000, ge=100)        # rebuild 取数前硬上限（413）
     # ---- AI 自动交易 · 回测模式（ai-auto-trading-backtest §2.5，三重决策成本护栏）----
     # 回测每决策根调一次 LLM，成本/时长敏感；三重护栏：决策间隔（降频）+ 决策轮数硬上限（越界启动前
     # 拒绝，绝不静默截断）+ 并发闸（限同时消耗 LLM 的回测数）。字段名即环境变量名（AI_BACKTEST_*，

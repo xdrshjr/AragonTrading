@@ -154,6 +154,12 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     edgeBps: null,
     edgeCostBps: null,
     edgeGateReason: null,
+    // 信号先验（signal-prior-and-ev-gate §6.3）：本函数是**逐键手抄**装配，不加这几行
+    // `AiTradeRoundTrace` 永远拿不到先验数据 ⇒ 后端发什么前端都收不到（跑不出错、功能静默缺失）。
+    edgeSource: null,
+    priorP: null,
+    priorEvBps: null,
+    signalPriors: evt.signalPriors ?? null,
     state: "deciding",
   };
 }
@@ -214,6 +220,10 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
         edgeBps: evt.edgeBps ?? null,
         edgeCostBps: evt.costBps ?? null,
         edgeGateReason: evt.reason ?? null,
+        // 分子来源 + 先验读数（同上：不抄这三键，界面永远显示旧的「min(ATR 预算, 止盈距离)」文案）。
+        edgeSource: evt.edgeSource ?? null,
+        priorP: evt.priorP ?? null,
+        priorEvBps: evt.priorEvBps ?? null,
       };
     case "reflection_verdict":
       // 反思裁决：落 verdict/reason/实际收缩后仓位并清在飞指示。

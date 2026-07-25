@@ -750,14 +750,17 @@ export interface AiEdgeGateView {
  * 未启用（`edgeGateStatus` 为空，k_min=0 即默认）→ null（组件整段不渲染，老会话与老快照零影响）。
  */
 export function describeEdgeGate(
-  trace: Pick<AiTradeRoundTrace, "edgeGateStatus" | "edgeBps" | "edgeCostBps">,
+  trace: Pick<AiTradeRoundTrace, "edgeGateStatus" | "edgeBps" | "edgeCostBps" | "edgeSource" | "priorP">,
 ): AiEdgeGateView | null {
   const status = trace.edgeGateStatus;
   if (!status) return null;
   if (status === "unavailable") return { label: "成本门禁 · 无法估算 · 放行", tone: "accent" };
+  // 分子来自先验时带上 `p=` 读数：ATR 分子是「若走对能吃到多少」的幅度，先验分子是已按胜率折算的
+  // 期望，两者量级天然差一档——不标出来，用户会以为门禁突然变严了 10 倍（signal-prior §3.7 量纲提醒）。
+  const prior = trace.edgeSource === "prior" && trace.priorP != null ? `p=${trace.priorP.toFixed(2)}，` : "";
   const budget =
     trace.edgeBps != null && trace.edgeCostBps != null
-      ? `（${trace.edgeBps.toFixed(1)} / ${trace.edgeCostBps.toFixed(1)}bps）`
+      ? `（${prior}${trace.edgeBps.toFixed(1)} / ${trace.edgeCostBps.toFixed(1)}bps）`
       : "";
   if (status === "veto") return { label: `成本门禁否决 · 观望${budget}`, tone: "short" };
   return { label: `成本门禁 · 放行${budget}`, tone: "muted" };

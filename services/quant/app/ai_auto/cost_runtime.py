@@ -38,21 +38,44 @@ class CostRuntime:
             net_mode=bool(settings.ai_trade_net_pnl_enabled),
             ct_val=getattr(fee_ledger, "ct_val", 0.0))
         self.unavailable_streak = 0        # 连续「估算不可用」轮数（§3.7 告警升级）
+        # 信号先验的本轮只读视图（`PriorRuntime.coverage_wire()` 每轮回灌一次）。**两条快照通道
+        # 互斥且不同源**：`snapshot()` 只在门禁生效（k_min>0）时随 `edge_gate` 事件下发，
+        # `snapshot_if_due()` 只在门禁空转时搭 `status` 事件——只并入其中一条，运维按 runbook 去
+        # 另一条里找 `priorCoverage` 会永远找不到（P1-3）。
+        self._prior_view: dict | None = None
 
     # ---------- 盯市 tick（唯一的网络 IO 落点；决策轮内零 IO）----------
     async def refresh_funding(self, now_wall: float) -> bool:
         """5s 盯市上刷新资金费率快照；未到 TTL / 已禁用 / 取数失败一律静默 `False`。"""
         return await self.funding.refresh(get_rest_client().get_funding_rate, now_wall)
 
+    def set_prior_view(self, view: dict | None) -> None:
+        """回灌本轮先验读数（`None` ⇒ 全部先验键缺席）；先验读数进成本快照的**唯一入口**。"""
+        self._prior_view = view or None
+
     # ---------- 决策轮（纯同步）----------
     def evaluate(self, decision, *, last_px: float | None, atr_px: float | None,
-                 take_profit_pct: float | None, bar_seconds: int) -> EdgeGateOutcome | None:
-        """本轮门禁判定；`k_min <= 0` ⇒ `None`（门禁空转，调用方据此不发任何事件）。"""
-        return evaluate_edge_gate(
+                 take_profit_pct: float | None, bar_seconds: int,
+                 prior_ev_bps: float | None = None,
+                 prior_binding: bool = False) -> EdgeGateOutcome | None:
+        """本轮门禁判定；`k_min <= 0` ⇒ `None`（门禁空转，调用方据此不发任何事件）。
+
+        `prior_ev_bps` 无条件透传（读数 + 反事实进 wire），`prior_binding`（总闸③）才决定它是否
+        真的进 `min` 链。`priorP` / `priorContributors` 由本层从 `_prior_view` 补进 wire——纯核心
+        `edge_gate` 只认得 bps，不该为了展示字段而认识先验的数据结构。
+        """
+        out = evaluate_edge_gate(
             decision, settings=self.settings, last_px=last_px, atr_px=atr_px,
             take_profit_pct=take_profit_pct, bar_seconds=bar_seconds,
             funding=self.funding.snapshot(time.time()),
+            prior_ev_bps=prior_ev_bps, prior_binding=prior_binding,
         )
+        if out is not None:
+            side = {"open_long": "long", "open_short": "short"}.get(decision.action)
+            readout = ((self._prior_view or {}).get(side) or {}) if side else {}
+            out.wire["priorP"] = readout.get("p")
+            out.wire["priorContributors"] = readout.get("contributors")
+        return out
 
     def note_gate(self, out: EdgeGateOutcome) -> int:
         """记一轮门禁判定 + 推进连续不可用计数；返回当前连续轮数（0 = 本轮可用 / 本轮不受约束）。
@@ -82,11 +105,25 @@ class CostRuntime:
 
     # ---------- 统计（会话内快照与落库富化出自同一 build_cost_stats）----------
     def snapshot(self) -> dict:
-        return build_cost_stats(self.attribution.stats(), self.fee_ledger)
+        return self._with_prior(build_cost_stats(self.attribution.stats(), self.fee_ledger))
 
     def snapshot_if_due(self, round_no: int) -> dict | None:
         """L0/L1 通道的节流快照（§5.4）；未到轮次 ⇒ `None`。"""
-        return cost_snapshot_wire(round_no, self.attribution.stats(), self.fee_ledger)
+        snap = cost_snapshot_wire(round_no, self.attribution.stats(), self.fee_ledger)
+        return None if snap is None else self._with_prior(snap)
+
+    def _with_prior(self, stats: dict) -> dict:
+        """并入先验覆盖率读数（两条通道同源，P1-3）；未回灌视图 ⇒ 两键**缺席**而非 None。
+
+        `priorCoverage` 是**轮级瞬时量**：落 `metricsJson.aiStats` 的 `merge_into` 走的也是
+        `snapshot()`，故会话停止后记的是**最后一轮**的读数，绝不可被误读成全程平均。
+        """
+        view = self._prior_view
+        if view is None:
+            return stats
+        stats["priorCoverage"] = view.get("coverage")
+        stats["priorAgeS"] = view.get("ageS")
+        return stats
 
     def merge_into(self, ai_stats: dict) -> dict:
         """把三组加法键并入既有 `aiStats`（键冲突即抛，绝不静默覆盖，§3.8）。"""

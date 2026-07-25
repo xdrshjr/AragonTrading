@@ -216,6 +216,17 @@ def _forward_return(prices: tuple, i: int, h: int, entry_at: str, direction: str
     return raw if direction == "long" else -raw
 
 
+def forward_return_at(opens: tuple, closes: tuple, i: int, h: int, *,
+                      entry_at: str = "next_open", direction: str = "long") -> float:
+    """单根事件的方向调整前瞻收益（公开包装；调用方保证 ``i + h <= n-1``，因果由此约束）。
+
+    存在的唯一理由是让**离线先验**与本模块共用同一个前瞻收益估计量（ai-trade-signal-prior-and-ev-gate
+    §3.2 推论 2）：在 `prior_builder` 里另写一份 `exit/entry - 1` 看似三行，实则会在「入场取 open[i+1]
+    还是 close[i]」这个口径上悄悄分叉，而那正是先验与门禁分子说两段话的开始。
+    """
+    return _forward_return((opens, closes), i, h, entry_at, direction)
+
+
 def _horizon_returns(prices: tuple, triggers: np.ndarray, h: int, entry_at: str,
                      direction: str) -> tuple[list, list]:
     """逐 horizon 收益：(触发样本收益 sig, 全合格根收益 base)。

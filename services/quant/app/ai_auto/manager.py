@@ -133,6 +133,11 @@ class AiTradeGroupStartRequest:
     # 解析）。回测侧的同名规则走 `AiBacktestStartRequest.profit_rule`（同一解析点、另加回测总闸），
     # 见 ai-trade-profit-protection-adaptive §2.3 / §7.2a I-3。
     profit_rule: ProfitGuardRule | None = None
+    # 信号先验快照，**按 `instId` 键**（signal-prior-and-ev-gate §4.3 / P1-5）。刻意不镜像
+    # `base_rule` 的「分组共享单对象」姿态：铁律是同一条规则，先验快照却是 `(instId, bar)` 粒度的
+    # 历史统计——照字面共享会让 BTC 的成员拿 ETH 的统计去开真实仓位，且**不会报错**。
+    # 缺键 = 该成员无先验（不是错误，逐字回退 ATR 粗估）。
+    prior_snapshots: dict[str, dict] | None = None
 
 
 @dataclass
@@ -410,7 +415,8 @@ class AiTradeManager:
             priming=req.priming, priming_bars=req.priming_bars,
             context_refresh_rounds=req.context_refresh_rounds,
             wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
-            profit_rule=req.profit_rule)
+            profit_rule=req.profit_rule,
+            prior_snapshot=(req.prior_snapshots or {}).get(plan.inst_id))
         return AiTradeGroupMember(inst_id=plan.inst_id, allocation_pct=plan.allocation_pct,
                                   budget_usd=plan.budget_usd, session=session, run_id=run_id)
 

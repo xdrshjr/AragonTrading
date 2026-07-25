@@ -38,6 +38,7 @@ from .market_digest import build_market_digest
 from .market_window import MarketWindow
 from .multi_timeframe_context import build_multi_timeframe_context
 from .order_plan import decision_to_order_plan
+from .prior_runtime import PriorRuntime
 from .profit_cooldown import apply_profit_cooldown, build_cooldown_view
 from .profit_guard import (
     STATUS_UNAVAILABLE,
@@ -108,7 +109,8 @@ class AiTradeSession:
                  priming: bool = True, priming_bars: int = 300,
                  context_refresh_rounds: int = 10, wake_interval_s: float = 0.0,
                  base_rule: MaBandRule | None = None,
-                 profit_rule: ProfitGuardRule | None = None):
+                 profit_rule: ProfitGuardRule | None = None,
+                 prior_snapshot: dict | None = None):
         self.session_id = session_id
         self.run_id = run_id
         self._specs = specs
@@ -142,6 +144,9 @@ class AiTradeSession:
         # 成本记账与最小 edge 门禁（§3.10）：状态 / 快照 / 计数全部下沉 `CostRuntime`（镜像 F0 把
         # 利润保护下沉 `ProfitGuardRuntime` 的同款范式），会话只留薄封装调用。
         self._cost = CostRuntime(inst_id, executor.settings, executor.fee_ledger)
+        # 信号先验层（signal-prior-and-ev-gate §3.1）：同款下沉范式；总闸①关或快照缺席 ⇒ payload
+        # 无 signalPriors 键、prompt 逐字节回退、EV 分子回退 ATR 粗估（既有单测零回归）。
+        self._prior = PriorRuntime(prior_snapshot, executor.settings)
         # P0-1：会话级单调持仓序号——`_dispatch` 观察到任一 `side=="close"` 成交即 +1。epoch 身份的一半，
         # 没有它，「保护平仓 → 同一 tick 内同向重开」的新仓会继承旧峰值并被当场强平（真实资金）。
         self._position_seq = 0
@@ -292,6 +297,8 @@ class AiTradeSession:
         # 首次定时唤醒在启动后约 wake_interval_s 触发（而非 t=0 立刻，R-8）。
         self._last_decision_started_wall = now
         self._monitor_task = asyncio.create_task(self._monitor_loop())
+        for alert in self._prior.alerts:   # 先验静默降级会被当成故障（R-5）：启动即如实推一条
+            await self._push(alert)
         await self._push({"type": "status", "data": self._status_payload()})
 
     async def _prime(self) -> None:
@@ -644,7 +651,8 @@ class AiTradeSession:
             multiTimeframeContext=trace["multiTimeframeContext"],
             consensus=trace["consensus"], marketDigest=trace["marketDigest"],
             trigger=trace["trigger"], profitGuard=trace["profitGuard"],
-            profitGuardCooldown=trace["profitGuardCooldown"]))
+            profitGuardCooldown=trace["profitGuardCooldown"],
+            signalPriors=trace["signalPriors"]))
 
     # ---------- 下单前二次反思编排（ai-trade-pre-trade-reflection §2.3；精简，装配下沉 trace.py）----------
     async def _reflect_before_execute(self, round_no: int, ts: int, payload: dict,
@@ -814,9 +822,12 @@ class AiTradeSession:
                                decision: TradeDecision, degrade: str | None
                                ) -> tuple[TradeDecision, str | None]:
         """薄封装 `CostRuntime.evaluate`（§3.7）：`k_min<=0` ⇒ 原样直通、零事件、零副作用。"""
-        out = self._cost.evaluate(decision, last_px=ref_px, atr_px=self._atr_px,
-                                  take_profit_pct=self.executor.risk.take_profit_pct,
-                                  bar_seconds=BAR_SECONDS[self.bar])
+        out = self._cost.evaluate(
+            decision, last_px=ref_px, atr_px=self._atr_px,
+            take_profit_pct=self.executor.risk.take_profit_pct,
+            bar_seconds=BAR_SECONDS[self.bar],
+            prior_ev_bps=self._prior.last_edge_bps(decision.action),
+            prior_binding=bool(self.executor.settings.ai_trade_edge_prior_enabled))
         if out is None:                       # 门禁空转：只按节流搭一次会话内成本快照（§5.4）
             await self._emit_cost_snapshot(round_no)
             return decision, degrade
@@ -1138,6 +1149,11 @@ class AiTradeSession:
             payload["baseRules"] = {
                 "maBand": build_ma_band(self._window.base_df(), self.base_rule)}
         self._inject_profit_guard(payload)      # §2.6 b/d：未装配 ⇒ 整键缺席 ⇒ prompt 逐字回退
+        priors = self._prior.build(board, payload.get("marketContext"),
+                                   self._window.base_df())
+        if priors is not None:                  # 同款「整键缺席」范式（§3.9 的 G-1 逐字节断言）
+            payload["signalPriors"] = priors
+        self._cost.set_prior_view(self._prior.coverage_wire())   # P1-3：两条快照通道同源
         return payload
 
     def _build_multi_timeframe_context(self, ts: int, ref_px: float) -> dict | None:

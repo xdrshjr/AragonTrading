@@ -226,11 +226,23 @@ function BaseRuleBlock({ trace }: { trace: AiTradeRoundTrace }) {
   );
 }
 
+/** 说明文案按分子来源分档：接入先验后写死的「min(ATR 预算, 止盈距离)」会说谎（signal-prior §6.3）。 */
+const EDGE_SOURCE_NOTE: Record<string, string> = {
+  unavailable:
+    "本轮无法估算期望收益（ATR 数据不足），开仓一律放行；本层只会更保守，不会因估不出而拦单。",
+  atr: "粗估毛收益 = ATR 波动预算（一个「若走对能吃到多少」的幅度，不含胜率）；成本 = 双边手续费 + 穿越价差 + 冲击 + 资金费率。",
+  take_profit:
+    "粗估毛收益 = 单仓止盈距离（模型再有想法也拿不到超过 OCO 止盈的利润）；成本 = 双边手续费 + 穿越价差 + 冲击 + 资金费率。",
+  prior:
+    "毛收益 = 信号先验期望 p·W −(1−p)·L（历史统计，非当下保证；已按胜率折算，故数量级远小于 ATR 幅度）；成本 = 双边手续费 + 穿越价差 + 冲击 + 资金费率。",
+};
+
 /**
  * 最小 edge 门禁段（ai-trade-cost-accounting-and-edge-gate §4.3）：与铁律段并列、紧随其后——管线顺序
  * 即卡片顺序（铁律 → 冷却 → 共识 → **本层** → 反思）。徽标与铁律段同排同款，但**极性相反**：本层
  * fail-open，「无法估算」意味着放行而非拦截，故用 accent 而非红色，文案也把这件事讲清楚。
  * 门禁未启用（`k_min=0`，默认）⇒ `edgeGateStatus` 恒为空 ⇒ 整段不渲染（老会话与老快照零影响）。
+ * 说明文案按 `edgeSource` 取 `EDGE_SOURCE_NOTE`（signal-prior-and-ev-gate §6.3）。
  */
 function EdgeGateBlock({ trace }: { trace: AiTradeRoundTrace }) {
   const view = describeEdgeGate(trace);
@@ -250,9 +262,8 @@ function EdgeGateBlock({ trace }: { trace: AiTradeRoundTrace }) {
         </span>
       </div>
       <p className="text-[10px] leading-relaxed text-[var(--muted)]">
-        {unavailable
-          ? "本轮无法估算期望收益（ATR 数据不足），开仓一律放行；本层只会更保守，不会因估不出而拦单。"
-          : "粗估毛收益 = min(ATR 预算, 单仓止盈距离)；成本 = 双边手续费 + 穿越价差 + 冲击 + 资金费率。"}
+        {EDGE_SOURCE_NOTE[unavailable ? "unavailable" : (trace.edgeSource ?? "atr")] ??
+          EDGE_SOURCE_NOTE.atr}
       </p>
       {trace.edgeGateReason && (
         <p className="text-[11px] leading-relaxed text-[var(--text)]">

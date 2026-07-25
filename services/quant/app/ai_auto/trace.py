@@ -114,6 +114,10 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         # 最小 edge 门禁（ai-trade-cost-accounting-and-edge-gate §4.3）：k_min=0（默认）的会话恒为初值。
         "edgeGateStatus": None, "edgeBps": None,
         "edgeCostBps": None, "edgeGateReason": None,
+        # 信号先验（signal-prior-and-ev-gate §3.10）：**加法键**，不新增 trace phase（新增一个相位
+        # 的代价是前端 6 处镜像点）。三总闸全关的会话恒为初值 None ⇒ 前端整段回退旧文案。
+        "signalPriors": payload.get("signalPriors"),
+        "edgeSource": None, "priorP": None, "priorEvBps": None,
         # 利润保护快照（ai-trade-profit-protection §2.7）：**刻意不新增 trace phase**——基础策略是逐轮
         # 门禁故每轮一条事件，保护层跑在 5s 盯市上、不是轮级判定，只随 round_start 带一份断面。
         "profitGuard": payload.get("profitGuard"),
@@ -191,3 +195,6 @@ def apply_edge_gate_trace(trace: dict | None, wire: dict, reason: str | None) ->
     trace["edgeBps"] = wire.get("edgeBps")
     trace["edgeCostBps"] = wire.get("costBps")
     trace["edgeGateReason"] = reason
+    trace["edgeSource"] = wire.get("edgeSource")   # 前端据此改判「分子是怎么来的」文案
+    trace["priorP"] = wire.get("priorP")
+    trace["priorEvBps"] = wire.get("priorEvBps")

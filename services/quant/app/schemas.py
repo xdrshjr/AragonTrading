@@ -604,6 +604,66 @@ class AiTradeGroupStartIn(BaseModel):
         return self
 
 
+# ---- 信号先验快照（ai-trade-signal-prior-and-ev-gate §4.1）----
+class AiTradePriorRebuildIn(BaseModel):
+    """重建某 `(instId, bar)` 的先验快照。`strategyIds` 为空数组 = 只建 `signal_edge` 侧。
+
+    `lookbackBars` 的硬上限由 `ai_trade_prior_max_bars` 在**取数前**判定（413 快速失败，与
+    `factor_train_max_bars` 同款姿态）——绝不无界拉 K 线。
+    """
+
+    instId: str
+    bar: str
+    strategyIds: list[int] = Field(default_factory=list)
+    lookbackBars: int | None = Field(default=None, ge=100)
+    segments: int | None = Field(default=None, ge=2, le=20)
+
+
+class AiTradePriorEntryOut(BaseModel):
+    """快照单条目（§5.1）。`avgLossBps` 为**正数**（幅度）；`usable=false` 的条目不参与在线聚合。"""
+
+    source: str
+    event: str
+    signalKey: str | None = None
+    strategyId: int | None = None
+    strategyName: str = ""
+    strategyFingerprint: str | None = None
+    direction: str
+    regime: str
+    winRate: float
+    meanRetBps: float
+    avgWinBps: float
+    avgLossBps: float
+    sampleN: int
+    lossN: int
+    segments: int
+    runN: int
+    ir: float | None = None
+    tStat: float | None = None
+    usable: bool
+    unusableReason: str | None = None
+    costBasis: str
+
+
+class AiTradePriorSnapshotOut(BaseModel):
+    """快照摘要（rebuild 回执与 GET 共用；`entries` 即落库原文的逐条镜像）。"""
+
+    instId: str
+    bar: str
+    builtAtTs: int
+    asOfTs: int
+    horizonBars: int
+    costBasis: str
+    bars: int
+    segments: int
+    purgeBars: int
+    embargoBars: int
+    entryCount: int
+    usableCount: int
+    coverage: dict[str, int] = Field(default_factory=dict)
+    entries: list[AiTradePriorEntryOut] = Field(default_factory=list)
+
+
 class AiTradeGroupMemberRow(AiTradeSessionRow):   # 复用单会话行全字段 + 分配占比
     allocationPct: float
 

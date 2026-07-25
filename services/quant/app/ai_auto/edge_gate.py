@@ -43,12 +43,19 @@ _ROUND_BPS = 6
 
 @dataclass(frozen=True)
 class EdgeEstimate:
-    """本轮的粗估毛 edge（bps）及其来源，供 UI / 归因如实标注「这只是粗估」。"""
+    """本轮的毛 edge（bps）及其来源，供 UI / 归因如实标注「这个分子是怎么来的」。
+
+    阶段二（signal-prior-and-ev-gate §3.7）把「读数」与「绑定」拆开：`prior_ev_bps` 无条件记录，
+    `would_target_bps` 是「若绑定会取到多少」的反事实，二者**与总闸③无关**；只有 `source == "prior"`
+    才代表先验真的收紧了本轮门禁。
+    """
 
     target_bps: float
-    source: str                         # "atr" | "take_profit"
+    source: str                         # "atr" | "take_profit" | "prior"
     atr_bps: float | None
     take_profit_bps: float | None
+    prior_ev_bps: float | None = None       # 本轮先验期望（读数；缺席 ⇒ None）
+    would_target_bps: float | None = None   # 若绑定的分子（= min(既有链, 先验)）
 
 
 @dataclass(frozen=True)
@@ -68,8 +75,9 @@ class EdgeGateOutcome:
 
 
 def estimate_gross_edge_bps(*, action: str, ref_px: float | None, atr_px: float | None,
-                            take_profit_pct: float | None,
-                            atr_target_mult: float) -> EdgeEstimate | None:
+                            take_profit_pct: float | None, atr_target_mult: float,
+                            prior_ev_bps: float | None = None,
+                            prior_binding: bool = False) -> EdgeEstimate | None:
     """粗估本轮开仓的毛 edge（bps）；非受控动作 / 判定价或 ATR 不可用 ⇒ `None`（⇒ fail-open）。
 
     上界项是**单仓 OCO 止盈距离**（实盘取 `executor.risk.take_profit_pct`、回测取
@@ -86,6 +94,11 @@ def estimate_gross_edge_bps(*, action: str, ref_px: float | None, atr_px: float 
         atr_px: 确认根 ATR（价格单位）；`None`/非有限/≤0 ⇒ 估算不可用。
         take_profit_pct: 单仓 OCO 止盈比例（fraction）；`None` ⇒ 不设上界。
         atr_target_mult: ATR 预算倍数（`ai_trade_edge_atr_target_mult`）。
+        prior_ev_bps: 本轮信号先验的期望毛收益（bps，**可为负**）；`None` ⇒ 先验缺席。
+            它是**概率加权的期望**，而 ATR 项是「若走对能吃到多少」的幅度——同为 bps 毛口径、可比，
+            但数量级天然差一档（§3.7 量纲提醒），沿用对着 ATR 拍的 `k_min` 几乎必然把开仓全拦。
+        prior_binding: 先验是否真的进 `min` 链（总闸③ `ai_trade_edge_prior_enabled`）。
+            `False` ⇒ `target_bps` / `source` 与合入前**逐字段相等**，只留读数与反事实（G-10）。
 
     Returns:
         `EdgeEstimate`；无法估算时 `None`。
@@ -103,9 +116,17 @@ def estimate_gross_edge_bps(*, action: str, ref_px: float | None, atr_px: float 
     tp_bps = None if tp_bps is None else tp_bps * 1e4
     if tp_bps is not None and tp_bps < target:
         target, source = tp_bps, "take_profit"
+    prior = _finite(prior_ev_bps)
+    would = target if prior is None else min(target, prior)
+    # EV-1 单调保守：先验只经 `min` 进链 ⇒ 分子只会更小、绝不放大 ⇒ 被否的轮次仍被否
+    # （§3.7 硬约束 1：**严禁**为 prior 分支单设更小的 `k` / `required`，那会凭空造出新仓位）。
+    if prior_binding and prior is not None and prior < target:
+        target, source = prior, "prior"
     return EdgeEstimate(target_bps=round(target, _ROUND_BPS), source=source,
                         atr_bps=round(atr_bps, _ROUND_BPS),
-                        take_profit_bps=None if tp_bps is None else round(tp_bps, _ROUND_BPS))
+                        take_profit_bps=None if tp_bps is None else round(tp_bps, _ROUND_BPS),
+                        prior_ev_bps=None if prior is None else round(prior, _ROUND_BPS),
+                        would_target_bps=round(would, _ROUND_BPS))
 
 
 def apply_edge_gate(decision: TradeDecision, edge: EdgeEstimate | None,
@@ -164,7 +185,9 @@ def edge_wire(edge: EdgeEstimate | None) -> dict | None:
 def evaluate_edge_gate(decision: TradeDecision, *, settings, last_px: float | None,
                        atr_px: float | None, take_profit_pct: float | None,
                        bar_seconds: int, funding=None, params=None,
-                       funding_enabled: bool | None = None) -> EdgeGateOutcome | None:
+                       funding_enabled: bool | None = None,
+                       prior_ev_bps: float | None = None,
+                       prior_binding: bool = False) -> EdgeGateOutcome | None:
     """一轮门禁的**完整**编排（取成本 → 估 edge → 判定 → 装配 wire）；`k_min <= 0` ⇒ `None`。
 
     存在的唯一理由是把业务逻辑留在本模块、让 `session.py` 只剩薄封装调用（spec §3.10 的行数
@@ -181,6 +204,8 @@ def evaluate_edge_gate(decision: TradeDecision, *, settings, last_px: float | No
         params: 成本常数覆盖（回测传 `cost_model.backtest_params(settings)`）。
         funding_enabled: 资金费率总闸覆盖（回测传 `False`：SimBroker 不收资金费率，是**有意
             不建模**而非数据缺失，故 `confidence` 应保持 `"ok"`）。
+        prior_ev_bps: 本轮信号先验的期望毛收益（bps）；**无条件进 wire**（读数与反事实）。
+        prior_binding: 先验是否进 `min` 链（总闸③）；`False` ⇒ 判定逐字段回退（G-10）。
     """
     k_min = float(settings.ai_trade_edge_gate_k_min)
     if k_min <= 0:
@@ -194,19 +219,27 @@ def evaluate_edge_gate(decision: TradeDecision, *, settings, last_px: float | No
     edge = estimate_gross_edge_bps(
         action=decision.action, ref_px=entry_reference_px(decision, last_px), atr_px=atr_px,
         take_profit_pct=take_profit_pct,
-        atr_target_mult=float(settings.ai_trade_edge_atr_target_mult))
+        atr_target_mult=float(settings.ai_trade_edge_atr_target_mult),
+        prior_ev_bps=prior_ev_bps, prior_binding=prior_binding)
     action = decision.action                    # 门禁**前**的动作：豁免矩阵与状态判定都按它
     decided, reason = apply_edge_gate(
         decision, edge, cost, k_min=k_min,
         degraded_mult=float(settings.ai_trade_edge_gate_degraded_mult))
     status = gate_status(action, edge, cost, reason)
     mult = degraded_multiplier(cost, float(settings.ai_trade_edge_gate_degraded_mult))
+    required = round(k_min * cost.total_bps * mult, _ROUND_BPS)
     wire = {"status": status, "edgeBps": None if edge is None else edge.target_bps,
             "costBps": cost.total_bps, "kMin": k_min,
-            "requiredBps": round(k_min * cost.total_bps * mult, _ROUND_BPS),
+            "requiredBps": required,
             "costConfidence": cost.confidence,
             "edgeSource": None if edge is None else edge.source,
-            "cost": cost_wire(cost), "edge": edge_wire(edge), "reason": reason}
+            "cost": cost_wire(cost), "edge": edge_wire(edge), "reason": reason,
+            # P1-2 反事实读数：**总闸③关闭时照发**——「开③之前先看看它会拦掉多少」是 L1/L2
+            # 观察窗口唯一该做的事，读数不可得就只能闭眼开门禁。判据与真实的那条同一个 `required`。
+            "priorEvBps": _finite(prior_ev_bps),
+            "priorWouldTargetBps": None if edge is None else edge.would_target_bps,
+            "priorWouldVeto": (None if edge is None
+                               else bool(edge.would_target_bps < required))}
     return EdgeGateOutcome(decision=decided, reason=reason, status=status, wire=wire,
                            cost_bps=cost.total_bps,
                            edge_bps=None if edge is None else edge.target_bps,
@@ -220,8 +253,14 @@ def degraded_multiplier(cost: CostBreakdown | None, degraded_mult: float) -> flo
 
 def _positive(value) -> float | None:
     """正有限数归一：非有限 / ≤0 / 不可转 ⇒ None。"""
+    out = _finite(value)
+    return out if out is not None and out > 0 else None
+
+
+def _finite(value) -> float | None:
+    """有限数归一（**保留负号**）：先验 EV 为负是一个真实结论，绝不夹到 0（§3.7）。"""
     try:
         out = float(value)
     except (TypeError, ValueError):
         return None
-    return out if math.isfinite(out) and out > 0 else None
+    return out if math.isfinite(out) else None

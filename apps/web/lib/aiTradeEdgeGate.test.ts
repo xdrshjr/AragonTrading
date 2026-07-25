@@ -46,6 +46,32 @@ describe("describeEdgeGate", () => {
     const view = describeEdgeGate({ edgeGateStatus: "veto", edgeBps: null, edgeCostBps: 13 });
     expect(view!.label).toBe("成本门禁否决 · 观望");
   });
+
+  // ---- 信号先验（signal-prior-and-ev-gate §6.3 / T-18）----
+  it("分子来自先验 ⇒ 标签带 p= 读数（量级差一档，不标出来会被误读成门禁突然变严）", () => {
+    const view = describeEdgeGate({
+      edgeGateStatus: "veto",
+      edgeBps: 3.2,
+      edgeCostBps: 13,
+      edgeSource: "prior",
+      priorP: 0.54,
+    });
+    expect(view!.label).toContain("p=0.54");
+    expect(view!.label).toContain("3.2 / 13.0bps");
+  });
+
+  it("分子来自 ATR / 止盈上界 ⇒ 标签**不带** p=（老会话与总闸③关闭时逐字不变）", () => {
+    for (const edgeSource of ["atr", "take_profit"] as const) {
+      const view = describeEdgeGate({
+        edgeGateStatus: "pass",
+        edgeBps: 42.5,
+        edgeCostBps: 13,
+        edgeSource,
+        priorP: 0.54, // 总闸③关闭：读数照发，但分子不是它 ⇒ 标签里不得出现
+      });
+      expect(view!.label).toBe("成本门禁 · 放行（42.5 / 13.0bps）");
+    }
+  });
 });
 
 describe("describeDegradeReason（edge_below_cost 前缀）", () => {
@@ -82,6 +108,27 @@ describe("applyAiTradeTracePhase / edge_gate 相位", () => {
     expect(t[0].edgeBps).toBe(8.1);
     expect(t[0].edgeCostBps).toBe(13);
     expect(t[0].edgeGateReason).toBe("edge_below_cost(edge=8.1bps,cost=13.0bps,k=2.0)");
+  });
+
+  it("先验三键经 store 逐键手抄落轮次（漏抄即后端发什么前端都收不到，§6.3 P0-1）", () => {
+    let t = applyAiTradeTracePhase([], ev("round_start", 1, { signalPriors: { horizonBars: 8 } }));
+    expect(t[0].signalPriors).toEqual({ horizonBars: 8 });
+    expect(t[0].edgeSource).toBeNull();
+    expect(t[0].priorP).toBeNull();
+    expect(t[0].priorEvBps).toBeNull();
+
+    t = applyAiTradeTracePhase(
+      t,
+      ev("edge_gate", 1, { status: "veto", edgeBps: 3.2, costBps: 13, edgeSource: "prior", priorP: 0.54, priorEvBps: 3.2 }),
+    );
+    expect(t[0].edgeSource).toBe("prior");
+    expect(t[0].priorP).toBe(0.54);
+    expect(t[0].priorEvBps).toBe(3.2);
+  });
+
+  it("round_start 无 signalPriors 键（三总闸全关）⇒ 轮次上恒为 null，零回归", () => {
+    const t = applyAiTradeTracePhase([], ev("round_start", 1));
+    expect(t[0].signalPriors).toBeNull();
   });
 
   it("未识别的 costSnapshot 加法键被忽略，不污染轮次对象", () => {

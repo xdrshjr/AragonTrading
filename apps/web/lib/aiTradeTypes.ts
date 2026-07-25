@@ -300,7 +300,17 @@ export interface AiTradeTraceEvent {
   kMin?: number | null;
   requiredBps?: number | null;
   costConfidence?: "ok" | "degraded" | null;
-  edgeSource?: "atr" | "take_profit" | null;
+  edgeSource?: "atr" | "take_profit" | "prior" | null;
+  // 信号先验读数（signal-prior-and-ev-gate §4.2）：`priorP` / `priorEvBps` 是本轮该方向的先验；
+  // `priorWouldVeto` 是**反事实**——总闸③关闭（先验只展示、不进门禁）时也照发，供 L1/L2 观察
+  // 窗口先看清「开闸后会拦掉多少」，再据此定 k_min。
+  priorP?: number | null;
+  priorEvBps?: number | null;
+  priorWouldTargetBps?: number | null;
+  priorWouldVeto?: boolean | null;
+  priorContributors?: unknown[] | null;
+  // round_start：本轮先验输入快照（三总闸全关的会话恒无此键 ⇒ 组件整段回退旧文案）。
+  signalPriors?: Record<string, unknown> | null;
   // §5.4 会话内观测通道：成本统计只读快照。前端本轮**不消费**（阶段一的读者是运维，读 WS 原始事件），
   // 声明它只为让类型如实描述 wire——未识别键在 reducer 的 default 分支被忽略。
   costSnapshot?: Record<string, unknown> | null;
@@ -344,6 +354,13 @@ export interface AiTradeRoundTrace {
   edgeBps?: number | null;
   edgeCostBps?: number | null;
   edgeGateReason?: string | null;
+  // 信号先验（signal-prior-and-ev-gate §3.10）：**加法键**，后端刻意不新增 trace phase。
+  // `edgeSource` 决定 EdgeGateBlock 的说明文案——接入先验后「粗估毛收益 = min(ATR 预算, 单仓止盈
+  // 距离)」这句话会说谎，必须按来源三分。三总闸全关的会话恒为 null。
+  edgeSource?: "atr" | "take_profit" | "prior" | null;
+  priorP?: number | null;
+  priorEvBps?: number | null;
+  signalPriors?: Record<string, unknown> | null;
   // 利润保护快照（ai-trade-profit-protection §2.7）：规则未装配的会话恒为 null；**不新增 trace phase**
   // ——保护层跑在 5s 盯市上、不是轮级判定，只随 round_start 带一份断面。
   profitGuard?: ProfitGuardSnapshot | null;
