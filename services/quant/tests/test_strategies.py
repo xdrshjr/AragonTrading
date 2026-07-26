@@ -16,7 +16,7 @@ def test_registry_has_builtins():
     for key in ("long_shadow_reversal", "momentum_breakout", "ema_cross_scalper",
                 "bollinger_reversion", "vwap_rsi_momentum",
                 "trend_pullback_long", "trend_pullback_short",
-                "range_scalping_strategy"):
+                "range_scalping_strategy", "trend_band_swing"):
         assert key in STRATEGY_REGISTRY
     assert len(STRATEGY_REGISTRY) >= 8
 

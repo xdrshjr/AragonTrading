@@ -20,6 +20,7 @@ from . import vwap_rsi_momentum     # noqa: F401,E402
 from . import trend_pullback_long   # noqa: F401,E402
 from . import trend_pullback_short  # noqa: F401,E402
 from . import range_scalping_strategy  # noqa: F401,E402
+from . import trend_band_swing      # noqa: F401,E402
 from . import combination           # noqa: F401,E402  # 组合模板 regime_rotation（排在原子策略之后）
 from . import factor_score_strategy  # noqa: F401,E402  # 因子组合得分 kind="factor"（追加到末尾）
 
@@ -33,6 +34,7 @@ BUILTIN_ORDER = [
     "trend_pullback_long",
     "trend_pullback_short",
     "range_scalping_strategy",
+    "trend_band_swing",
     "regime_rotation",
     "factor_score",
 ]
