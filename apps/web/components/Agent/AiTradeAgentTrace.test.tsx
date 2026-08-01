@@ -306,6 +306,125 @@ describe("AiTradeAgentTrace", () => {
     expect(screen.getByText(/候选支撑/)).toBeInTheDocument();
   });
 
+  // ---------- 唤醒感知上下文（wake-aware-context §6.1 T-18）----------
+  const tacticalFrame = (bar: string, closedBars: number | null) => ({
+    bar,
+    sampleCount: 120,
+    closeTs: 1,
+    ageSeconds: 42,
+    stale: false,
+    closedBars,
+    regime: { primary: "range", volatility: "normal", event: "none", confidence: 0.6, labels: [] },
+    digest: {
+      priceAction: null,
+      volume: null,
+      factors: {
+        rsi14: { value: 49, label: "neutral" },
+        macdHist: { value: 0, label: "flat" },
+        bollPctB: { value: 0.5, label: "mid" },
+        atrPct: { value: 0.3, label: "low" },
+        rocPct: { value: 0, label: "flat" },
+      },
+    },
+  });
+
+  const TACTICAL = {
+    executionBar: "1H",
+    wakeIntervalS: 180,
+    asOfTs: 1,
+    executionPrimary: "trend_up",
+    alignment: "diverged" as const,
+    changeSinceLastRound: { pct: 0.42, atrMult: 0.91, atrBar: "1H" },
+    frames: [tacticalFrame("5m", 1), tacticalFrame("1m", 3)],
+    missingBars: [],
+    staleBars: [],
+  };
+
+  it("renders the tactical block coarse-to-fine with its shared change line", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [round({ state: "done", tacticalContext: TACTICAL })])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    const frames = screen.getAllByTestId("tactical-frame");
+    expect(frames).toHaveLength(2);
+    expect(frames[0]).toHaveTextContent("5m");
+    expect(frames[1]).toHaveTextContent("1m");
+    expect(frames[1]).toHaveTextContent("自上轮收 3 根");
+    expect(screen.getByText(/战术周期 · 与执行周期背离/)).toBeInTheDocument();
+    expect(screen.getByText(/自上一决策轮：价 \+0.42%（≈0.91×1H ATR）/)).toBeInTheDocument();
+  });
+
+  it("shows the wake reason in the round header (七态中文标签)", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            state: "done",
+            signalBoard: [],
+            trigger: "interval",
+            wake: { kind: "price_breakout", trigger: "interval" },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText("价格异动 · 越过唤醒阈值")).toBeInTheDocument();
+    expect(screen.queryByText("周期唤醒 · 常规复盘")).not.toBeInTheDocument();
+  });
+
+  it("spells out the wake criterion with its actual numbers (why it woke / why it did not)", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            state: "done",
+            wake: {
+              kind: "price_breakout",
+              trigger: "interval",
+              executionBar: "1H",
+              sinceLastRoundS: 182,
+              priceMovePct: 0.42,
+              priceMoveAtr: 0.91,
+              moveThresholdAtr: 0.5,
+              horizonScale: 0.316,
+              moveThresholdAtrEff: 0.158,
+            },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    const line = screen.getByTestId("wake-reason");
+    expect(line).toHaveTextContent("0.91×1H ATR");
+    // 门槛必须是**折算后**的实际判据，不是配置里的 0.5（说的和做的必须一致）
+    expect(line).toHaveTextContent("阈值 0.16×1H ATR");
+  });
+
+  it("keeps the whole 输入信号板 section alive on a tactical-only round (early-return gate)", () => {
+    // 板空 + 无 regime/consensus/digest/MTF、**仅有** tacticalContext：早退门控漏了 tactical 时，
+    // 整段会静默消失（跑不出错、永远空白）。这正是本仓库 RV-2 的原型复发形态。
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            state: "done",
+            signalBoard: [],
+            marketContext: null,
+            consensus: null,
+            marketDigest: null,
+            multiTimeframeContext: null,
+            tacticalContext: TACTICAL,
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText("输入信号板")).toBeInTheDocument();
+    expect(screen.getAllByTestId("tactical-frame")).toHaveLength(2);
+  });
+
   it("auto-resumes bottom-follow after 2 minutes idle and re-scrolls to latest (R2)", () => {
     vi.useFakeTimers();
     try {

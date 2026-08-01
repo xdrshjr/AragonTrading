@@ -113,6 +113,13 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         "consensus": payload.get("consensus"),
         "marketDigest": payload.get("marketDigest"),   # R1：round_start/trace 承载证据摘要（RC-9）
         "trigger": payload.get("trigger"),   # wake-interval：唤醒来源 candle/interval（round_start 轨迹带来源）
+        # 唤醒感知上下文（wake-aware-context §3.1）：本函数是**显式取键**装配，漏抄这四键
+        # `AiTradeRoundTrace` 永远拿不到唤醒原因与战术周期证据 ⇒ 后端发什么前端都收不到
+        # （跑不出错、功能静默缺失）。三总闸全关的会话恒为 None ⇒ 前端整段回退旧文案。
+        "wake": payload.get("wake"),
+        "tacticalContext": payload.get("tacticalContext"),
+        "tacticalTier": payload.get("tacticalTier"),
+        "contextDisclosure": payload.get("contextDisclosure"),
         "thinking": "", "analysis": "",
         "toolCallPending": False, "toolCall": None,
         "executed": None, "degradeReason": None,

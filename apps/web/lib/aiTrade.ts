@@ -18,7 +18,10 @@ import type {
   PriceAction,
   ProfitGuardCooldown,
   ProfitGuardSnapshot,
+  TacticalFrame,
   VolumeContext,
+  WakeInfo,
+  WakeKind,
 } from "./aiTradeTypes";
 
 export { clampBudgetToCap, deriveDefaultBudget };
@@ -403,6 +406,57 @@ export function describeMultiTimeframeFrame(frame: MultiTimeframeFrame): string 
   const rangeText = rangePos == null ? "" : ` · 区间位 ${Math.round(rangePos * 100)}%`;
   const stale = frame.stale ? " · 数据陈旧" : "";
   return `${frame.bar} · ${regime} · ${rsiText}${rangeText} · ${frame.sampleCount} 根${stale}`;
+}
+
+// ---- 唤醒感知上下文（ai-trade-wake-aware-context §3.3）----
+const TACTICAL_ALIGNMENT_LABELS: Record<string, string> = {
+  aligned: "与执行周期同向",
+  diverged: "与执行周期背离",
+  insufficient: "体制证据不足",
+};
+
+/** 战术周期与执行周期的体制关系中文化；未知枚举原样回显。 */
+export function describeTacticalAlignment(alignment: string): string {
+  return TACTICAL_ALIGNMENT_LABELS[alignment] ?? alignment;
+}
+
+/**
+ * 单个战术周期的只读证据摘要：`1m · 震荡 · RSI中性 · 自上轮收 3 根 · 120 根`。
+ * 与 describeMultiTimeframeFrame 视觉同构（同一套体制/因子标签表），只把「区间位」换成
+ * 「自上轮收 N 根」——后者才是战术层真正逐轮变化、也是本特性存在理由的那个量。
+ */
+export function describeTacticalFrame(frame: TacticalFrame): string {
+  const primary = frame.regime?.primary;
+  const regime = primary ? (REGIME_PRIMARY_LABELS[primary] ?? primary) : "体制不足";
+  const rsi = frame.digest?.factors?.rsi14;
+  const rsiText = rsi ? (FACTOR_LABELS[rsi.label] ?? rsi.label) : "RSI不足";
+  const closed = frame.closedBars == null ? "" : ` · 自上轮收 ${frame.closedBars} 根`;
+  const stale = frame.stale ? " · 数据陈旧" : "";
+  return `${frame.bar} · ${regime} · ${rsiText}${closed} · ${frame.sampleCount} 根${stale}`;
+}
+
+/**
+ * 唤醒原因的判据明细（轮头 chip 之外的展开位）：把判据的**实际数值**如实呈现。
+ *
+ * 阈值取折算后的 `moveThresholdAtrEff` 而非配置里的 `moveThresholdAtr`——写「0.5×ATR」而实际按
+ * 0.158 判，就是新造一次「说的和做的不一致」。无任何数值可讲时返回空串（轮头 chip 已经给了标签，
+ * 再渲染一行同样的文字只是噪音）。
+ */
+export function describeWakeReason(wake: WakeInfo | null | undefined): string {
+  if (!wake) return "";
+  const bar = wake.executionBar ?? "执行周期";
+  const details: string[] = [];
+  if (wake.sinceLastRoundS != null) details.push(`距上轮 ${Math.round(wake.sinceLastRoundS)}s`);
+  if (wake.priceMovePct != null) {
+    const atr = wake.priceMoveAtr == null ? "" : `（≈${wake.priceMoveAtr.toFixed(2)}×${bar} ATR）`;
+    details.push(`价 ${wake.priceMovePct > 0 ? "+" : ""}${wake.priceMovePct.toFixed(2)}%${atr}`);
+  }
+  if (wake.moveThresholdAtrEff != null) {
+    details.push(`阈值 ${wake.moveThresholdAtrEff.toFixed(2)}×${bar} ATR`);
+  }
+  if (wake.restingAgeS != null) details.push(`挂单已 ${Math.round(wake.restingAgeS)}s`);
+  if (!details.length) return "";
+  return [WAKE_LABELS[wake.kind]?.label ?? wake.kind, ...details].join(" · ");
 }
 
 export type AiExecTone = "long" | "short" | "muted";
@@ -924,6 +978,19 @@ export interface AiTradeTriggerView {
   tone: AiTraceTone; // long | short | muted | accent（复用轮头着色体系）
 }
 
+// 唤醒原因七态的轮头标签（wake-aware-context §3.3）：把原来单调的两个兜底文案细化成七态。
+// tone 只在「值得注意」的四态用 accent（补看新 K 线 / 价格异动 / 浮盈跨档 / 挂单盯守），
+// 常规心跳与持仓盯市保持 muted——满屏 accent 等于没有 accent。
+const WAKE_LABELS: Record<WakeKind, AiTradeTriggerView> = {
+  candle_close: { label: "K 线收盘 · 信号板已重算", tone: "muted" },
+  bar_advanced: { label: "补看新 K 线 · 首次研判", tone: "accent" },
+  resting_order: { label: "挂单盯守 · 未成交委托", tone: "accent" },
+  profit_tier: { label: "浮盈跨档 · 保护线已激活", tone: "accent" },
+  price_breakout: { label: "价格异动 · 越过唤醒阈值", tone: "accent" },
+  position_watch: { label: "持仓盯市 · 常规复盘", tone: "muted" },
+  heartbeat: { label: "心跳复盘 · 数据未见异动", tone: "muted" },
+};
+
 // 触发方向 → 轮头着色 tone（open_long 绿 / open_short 红 / close 及未知边沿 accent）。
 function toneForTriggerAction(action: string): AiTraceTone {
   if (action === "open_long") return "long";
@@ -939,10 +1006,15 @@ function toneForTriggerAction(action: string): AiTraceTone {
  * 着色取多/空/其它。动作中文化复用既有 describeAiAction（同文件），不再自建标签表。
  */
 export function describeTrigger(
-  trace: Pick<AiTradeRoundTrace, "signalBoard" | "trigger">,
+  trace: Pick<AiTradeRoundTrace, "signalBoard" | "trigger" | "wake">,
 ): AiTradeTriggerView {
   const fired = (trace.signalBoard ?? []).filter((s) => s.latestSignal !== "none");
   if (fired.length === 0) {
+    // 三级优先：信号板边沿 > wake.kind > trigger。wake 只把原来单调的两个兜底文案细化成七态，
+    // **绝不抢先**——有边沿信号时 `开多信号 · 均线突破` 的信息量高于 `价格异动`，让 wake 抢先
+    // 是功能退化而非升级。
+    const kind = trace.wake?.kind;
+    if (kind && WAKE_LABELS[kind]) return WAKE_LABELS[kind];
     if (trace.trigger === "interval") {
       return { label: "周期唤醒 · 常规复盘", tone: "accent" };
     }

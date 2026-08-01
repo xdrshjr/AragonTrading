@@ -40,7 +40,7 @@ from ..paper.strategy_factory import PaperStrategySpec
 from .admission import get_admission_lock
 from .base_rules import MaBandRule, format_charter, rule_wire
 from .exposure_book import GroupExposureBook
-from .market_window import MarketWindow
+from .market_window import MarketWindow, WindowOptions
 from .profit_guard import ProfitGuardRule
 from .profit_guard_text import format_profit_guard_charter
 from .profit_guard import rule_wire as profit_guard_wire
@@ -50,6 +50,7 @@ from .session import AiTradeSession
 from .sizing import SizingRule, StopRule, check_window_capacity, parse_sizing_rule, parse_stop_rule
 from .sizing_runtime import build_sizing_runtime, sizing_config_wire
 from .sizing_text import format_sizing_charter
+from .wake_runtime import format_tactical_bars_text, tactical_bars_for
 
 logger = logging.getLogger(__name__)
 
@@ -424,7 +425,12 @@ class AiTradeManager:
                                              req.profit_rule),
                                          # 仓位与风险层宪章章；三条规则全未装配 → "" ⇒ 渲染逐字节不变
                                          sizing_text=format_sizing_charter(
-                                             sizing.rule, sizing.stop_rule, sizing.brake_rule)),
+                                             sizing.rule, sizing.stop_rule, sizing.brake_rule),
+                                         # 战术周期串：与会话真正注入的周期集合**同源**（共用
+                                         # `tactical_bars_for`），说的和给的必须是同一批周期
+                                         tactical_bars_text=format_tactical_bars_text(
+                                             tactical_bars_for(req.settings, req.bar,
+                                                               req.wake_interval_s))),
             context_refresh_rounds=req.context_refresh_rounds, settings=req.settings,
             position_step_pct=req.position_step_pct,
             reflection_enabled=req.settings.ai_trade_reflection_enabled,   # 生产实盘显式开（默认 True）
@@ -592,7 +598,9 @@ class AiTradeManager:
                 "AI_TRADE_EXPOSURE_CAP_INVALID",
                 "有效敞口上限倍数须为 0（关闭）或 ≥ 1.0（下界保证单成员分组恒不受约束）", 422)
         probe = MarketWindow(req.members_in[0].inst_id, req.bar, req.specs, req.priming_bars,
-                             context_enabled=req.settings.ai_trade_multi_timeframe_context)
+                             options=WindowOptions(
+                                 context_enabled=req.settings
+                                 .ai_trade_multi_timeframe_context))
         message = check_window_capacity(rule, probe.window_max)
         if message is not None:
             raise AiTradePreflightError("AI_TRADE_SIZING_WINDOW_TOO_SMALL", message, 422)

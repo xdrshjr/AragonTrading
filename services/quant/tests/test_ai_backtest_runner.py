@@ -773,3 +773,43 @@ async def test_backtest_cost_uses_simbroker_constants_not_live_ones(monkeypatch)
         backtest_params(settings))
     assert cost.total_bps == 14.0
     assert cost.confidence == "ok"          # 回测不收资金费率是**有意不建模**，不是数据缺失
+
+
+async def test_g2_backtest_payload_never_carries_wake_or_tactical_keys(monkeypatch):
+    """G-2（ai-trade-wake-aware-context §6.2）：回测**天然**不受唤醒感知上下文影响。
+
+    回测引擎只有执行周期 OHLCV，注入战术周期需要它不具备的日内细粒度数据，强行注入等于制造未来
+    函数。`backtest.py` 自建 payload，故四个新键天然缺席、回测 prompt 逐字节不变——本用例把这条
+    「天然性」钉成断言，防止将来有人「顺手」把战术段接进回测。
+    """
+    import inspect
+
+    from app.ai_auto import backtest as backtest_module
+
+    source = inspect.getsource(backtest_module)
+    for key in ("tacticalContext", "tacticalTier", "contextDisclosure", "wake_runtime"):
+        assert key not in source, f"回测不得引入 {key}（战术周期在回测里就是未来函数）"
+
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(180)
+        llm = _StubLLM(lambda _call: {"action": "hold", "reason": "h"})
+        _patch_loaders(monkeypatch, candles, llm)
+        runner = AiBacktestRunner(_spec(sid, paper, candles))
+        original_decide = runner.decider.decide
+        seen_payloads = []
+
+        async def capture_decide(payload, *args, **kwargs):
+            seen_payloads.append(payload)
+            return await original_decide(payload, *args, **kwargs)
+
+        runner.decider.decide = capture_decide
+        await runner.run(_BacktestJob("aibt_wake", runner))
+
+        assert seen_payloads, "回测未产生任何决策轮，断言失去意义"
+        for payload in seen_payloads:
+            for key in ("wake", "tacticalContext", "tacticalTier", "contextDisclosure"):
+                assert key not in payload
+            assert payload.get("trigger") is None       # 回测 payload 本就无 trigger 键
+    finally:
+        await dispose_engine()

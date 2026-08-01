@@ -404,3 +404,51 @@ async def test_interval_wake_guard_disabled_at_zero_threshold():
         assert session.wake_skips == 0
     finally:
         await dispose_engine()
+
+
+# ---------- 唤醒感知上下文（ai-trade-wake-aware-context §3.2，纯加法：既有断言全保留）----------
+async def test_wake_object_is_passed_through_to_the_decision_event():
+    """定时轮的 `wake` 对象随 decision 事件下发，且 `data.trigger` 语义与取值逐字不变（G-4）。"""
+    await init_db()
+    session = _make_session(action="hold", wake_interval_s=120,
+                            settings=Settings(ai_trade_wake_skip_unchanged_pct=0.0))
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        _drain(q)
+        _elapse_timer(session)
+        await session._maybe_interval_wake()
+        await _settle(session)
+        decision = [e for e in _drain(q) if e["type"] == "decision"][-1]["data"]
+        assert decision["trigger"] == "interval"           # 既有断言语义一字不改
+        wake = decision["wake"]
+        assert wake["trigger"] == "interval"
+        assert wake["kind"] in {"candle_close", "bar_advanced", "resting_order", "profit_tier",
+                                "price_breakout", "position_watch", "heartbeat"}
+        # 阈值随 wire 下发：读者能自行反算门槛，杜绝「静默门禁」
+        assert wake["moveThresholdAtrEff"] == pytest.approx(
+            wake["moveThresholdAtr"] * wake["horizonScale"])
+    finally:
+        await dispose_engine()
+
+
+async def test_reason_switch_off_leaves_the_decision_event_wake_free():
+    """总闸关闭 ⇒ `data.wake` 为 None、`data.trigger` 照旧（A-6 回退的活证据）。"""
+    await init_db()
+    session = _make_session(action="hold", wake_interval_s=120,
+                            settings=Settings(ai_trade_wake_reason_enabled=False,
+                                              ai_trade_wake_skip_unchanged_pct=0.0))
+    try:
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        _drain(q)
+        _elapse_timer(session)
+        await session._maybe_interval_wake()
+        await _settle(session)
+        decision = [e for e in _drain(q) if e["type"] == "decision"][-1]["data"]
+        assert decision["wake"] is None
+        assert decision["trigger"] == "interval"
+    finally:
+        await dispose_engine()

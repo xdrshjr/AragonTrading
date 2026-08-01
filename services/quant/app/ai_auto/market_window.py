@@ -7,7 +7,10 @@
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from collections import deque
+from dataclasses import dataclass
 
 import pandas as pd
 
@@ -19,20 +22,43 @@ from ..paper.strategy_factory import PaperStrategySpec
 from .multi_timeframe_context import decision_timeframes
 
 _CONTEXT_WARMUP = 80
+# 单发 `/market/candles` 的 limit 硬上限：`get_rest_client().get_candles` 在 `limit<=300` 且无游标时
+# 走单发，超过即改走 history-candles **翻页**（一次预填可能打出 4~5 个请求，直接违背配额目标）。
+_SINGLE_PAGE_LIMIT_MAX = 300
+# 刷新时至少要覆盖的根数余量（比「上次刷新以来可能新收的根数」多留一点，防锚点抖动漏根）。
+_TACTICAL_REFRESH_SLACK = 10
+_TACTICAL_REFRESH_MIN = 20
+
+
+@dataclass(frozen=True)
+class WindowOptions:
+    """`MarketWindow` 的可选装配项（聚合结构体，守 CLAUDE.md「形参 ≤5」）。
+
+    `tactical_bars` 由 `WakeRuntime` 解析后**传入**——战术周期集合的唯一真源在运行时那侧，窗口只
+    消费不自算。两处各算一次，一旦某处的 `wake_interval_s` 口径漂移（例如一处用秒、一处用分钟），
+    就会出现「窗口在取 1m/5m，prompt 却宣称在看 5m/15m」这类无声失真。
+    """
+
+    context_enabled: bool = True
+    tactical_bars: tuple[str, ...] = ()
+    tactical_window_bars: int = 120
+    tactical_min_refresh_s: float = 20.0
+    tactical_fetch_timeout_s: float = 8.0
 
 
 class MarketWindow:
-    """共享 K 线滚动窗口 + 各高周期窗口 + 逐策略建帧（多策略并集上界）。"""
+    """共享 K 线滚动窗口 + 各高周期窗口 + 战术周期窗口 + 逐策略建帧（多策略并集上界）。"""
 
     def __init__(self, inst_id: str, bar: str, specs: list[PaperStrategySpec],
-                 priming_bars: int, *, context_enabled: bool = True):
+                 priming_bars: int, *, options: WindowOptions = WindowOptions()):
         self.inst_id = inst_id
         self.bar = bar
         self._specs = specs
+        self._opt = options
         base_seconds = BAR_SECONDS.get(bar, 60)
         warmup = max((s.strategy.warmup() for s in specs), default=20)
         htf_warmup = max((s.strategy.htf_warmup_bars() for s in specs), default=60)
-        self._context_bars = decision_timeframes(bar) if context_enabled else ()
+        self._context_bars = decision_timeframes(bar) if options.context_enabled else ()
         self._window_max = min(
             max(warmup + 5, priming_bars, htf_warmup + 5,
                 _CONTEXT_WARMUP if self._context_bars else 0),
@@ -53,11 +79,25 @@ class MarketWindow:
         self._htf_next_refresh_ts: dict[str, int] = {}
         self._last_confirmed_ts: int | None = None
         self._htf_warmup = htf_warmup
+        # 战术周期窗口（严格短于执行周期，与 `_htf_bars` 集合**不可能相交**——后者只收
+        # `BAR_SECONDS[tf] > base_seconds`，故不存在窗口争用）。刻意**不复用** `_window_max`
+        # （多策略并集上界，最大 1200 根）：战术窗口只服务指标计算，120 根已 ≥ market_digest 的
+        # _MIN_BARS=35 且 ≥ classify_regime 的 60。
+        self._tactical_bars = tuple(
+            sorted(options.tactical_bars, key=lambda b: BAR_SECONDS.get(b, 0)))
+        self._tactical_windows: dict[str, deque] = {
+            b: deque(maxlen=options.tactical_window_bars) for b in self._tactical_bars}
+        self._tactical_next_refresh_ts: dict[str, int] = {}
+        self._tactical_last_fetch_wall: dict[str, float] = {}
 
     # ---------- 只读 ----------
     @property
     def window_max(self) -> int:
         return self._window_max
+
+    @property
+    def tactical_bars(self) -> tuple[str, ...]:
+        return self._tactical_bars
 
     @property
     def candles(self) -> deque[dict]:
@@ -199,3 +239,88 @@ class MarketWindow:
             return await get_rest_client().get_candles(self.inst_id, bar, limit=limit)
         except Exception:  # noqa: BLE001 —— 取数失败：窗口不更新（安全降级，绝不假数据）
             return None
+
+    # ---------- 战术周期窗口（ai-trade-wake-aware-context §2.2）----------
+    def tactical_frames(self) -> dict[str, pd.DataFrame]:
+        """各战术周期的原始 OHLCV 拷贝（镜像 `context_frames`，供战术证据装配）。"""
+        return {
+            bar: candles_to_df(list(self._tactical_windows[bar])).copy()
+            for bar in self._tactical_bars
+            if self._tactical_windows.get(bar)
+        }
+
+    async def prefill_tactical(self) -> None:
+        """启动时一次性预填各战术周期窗口（取数失败留空，安全降级，绝不阻塞暖机）。
+
+        `limit` 必须 ≤300：超过即改走 history-candles 翻页（见 `_SINGLE_PAGE_LIMIT_MAX`）。
+        """
+        for bar in self._tactical_bars:
+            if bar not in BAR_SECONDS:
+                continue
+            limit = min(_SINGLE_PAGE_LIMIT_MAX, self._opt.tactical_window_bars + 5)
+            candles = await self._fetch_tactical(bar, limit, time.time())
+            if candles:
+                self._absorb_tactical(bar, candles)
+
+    async def maybe_refresh_tactical(self, now_ts: int, now_wall: float) -> None:
+        """按交易所报出的收线锚点刷新战术窗口；失败不推进锚点（下 tick 重试）。
+
+        三闸门（缺一不可，按序判定）：① 锚点闸——未到下一根收线即跳过（正常节奏 = 每收一根请求一次）；
+        ② 配额闸——距上次取数不足 `tactical_min_refresh_s` 即跳过（硬护栏：即便锚点算错也不会让 5 秒
+        盯市把 REST 打成每 5 秒一发，多标的分组会直接撞 429）；③ 单 tick 节流闸——一次调用**最多刷新
+        一个**周期（本方法跑在 5 秒盯市 tick 上，而同一个 tick 还守着利润保护棘轮与会话止损这些真实
+        资金路径，取数绝不能把它们挤停）。
+        """
+        bar = self._next_tactical_bar(now_ts, now_wall)
+        if bar is None:
+            return
+        secs = BAR_SECONDS[bar]
+        limit = min(_SINGLE_PAGE_LIMIT_MAX,
+                    max(_TACTICAL_REFRESH_MIN,
+                        int(self._opt.tactical_min_refresh_s // secs) + _TACTICAL_REFRESH_SLACK))
+        candles = await self._fetch_tactical(bar, limit, now_wall)
+        if candles:
+            self._absorb_tactical(bar, candles)
+
+    def _next_tactical_bar(self, now_ts: int, now_wall: float) -> str | None:
+        """过完锚点闸与配额闸的候选里取 `BAR_SECONDS` 最小的一个（其余留给下一 tick）。"""
+        for bar in self._tactical_bars:                  # 构造期已按 BAR_SECONDS 升序
+            if bar not in BAR_SECONDS:
+                continue
+            next_refresh = self._tactical_next_refresh_ts.get(bar)
+            if next_refresh is not None and now_ts < next_refresh:
+                continue
+            last_fetch = self._tactical_last_fetch_wall.get(bar)
+            if last_fetch is not None and now_wall - last_fetch < self._opt.tactical_min_refresh_s:
+                continue
+            return bar
+        return None
+
+    async def _fetch_tactical(self, bar: str, limit: int, now_wall: float) -> list | None:
+        """带硬超时的战术取数；超时/异常一律 None（不推进锚点 ⇒ 下 tick 重试）。
+
+        `asyncio.wait_for` 的超时会取消内层协程并在**本调用点**抛 `TimeoutError`（`_safe_get_candles`
+        的 `except Exception` 捕不到被取消时抛的 `CancelledError`），故超时必须在此显式收口。默认 8s
+        ⇒ 单 tick 最坏增量 8s，仍在 5 秒盯市可容忍的抖动量级内。
+        """
+        self._tactical_last_fetch_wall[bar] = now_wall   # 配额闸按「发起时刻」记，失败同样受节流
+        try:
+            return await asyncio.wait_for(self._safe_get_candles(bar, limit),
+                                          self._opt.tactical_fetch_timeout_s)
+        except (TimeoutError, asyncio.TimeoutError):
+            return None
+
+    def _absorb_tactical(self, bar: str, candles: list) -> None:
+        """入窗（只收确认根，按 ts 去重覆盖）并把锚点推到「最新一根 + 一根」。
+
+        只收 `confirm` 为真的根：OKX `/market/candles` 会把**未收线的当前根**作为最新一条返回，
+        收进来会让指标 repaint——正是本特性最需要避免的失真。
+        """
+        win = self._tactical_windows[bar]
+        existing = {row["ts"] for row in win}
+        for c in sorted(candles, key=lambda item: item.ts):
+            if getattr(c, "confirm", True) and c.ts not in existing:
+                win.append({"ts": c.ts, "o": c.o, "h": c.h, "l": c.l, "c": c.c, "vol": c.vol})
+                existing.add(c.ts)
+        latest_raw = max(candles, key=lambda item: item.ts)
+        self._tactical_next_refresh_ts[bar] = int(latest_raw.ts) + BAR_SECONDS[bar]

@@ -128,6 +128,13 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     marketDigest: evt.marketDigest ?? null,
     multiTimeframeContext: evt.multiTimeframeContext ?? null,
     trigger: evt.trigger,   // wake-interval：唤醒来源随 round_start 装配进轮次（供 describeTrigger 区分周期唤醒）
+    // 唤醒感知上下文（wake-aware-context §3.3）：本函数是**逐键手抄**装配，漏抄这四键
+    // `AiTradeRoundTrace` 永远拿不到唤醒原因与战术周期证据 ⇒ 后端发什么前端都收不到
+    // （跑不出错、功能静默缺失，这是先验层与仓位层都踩过的原坑）。
+    wake: evt.wake ?? null,
+    tacticalContext: evt.tacticalContext ?? null,
+    tacticalTier: evt.tacticalTier ?? null,
+    contextDisclosure: evt.contextDisclosure ?? null,
     thinking: "",
     analysis: "",
     toolCallPending: false,

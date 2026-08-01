@@ -128,6 +128,72 @@ export interface MultiTimeframeContext {
   staleBars: string[];
 }
 
+// ---- 唤醒感知上下文（ai-trade-wake-aware-context §5.3）----
+// 唤醒原因七态（与后端 wake_reason.WAKE_KINDS 镜像；判定顺序即优先级）。
+export type WakeKind =
+  | "candle_close"
+  | "bar_advanced"
+  | "resting_order"
+  | "profit_tier"
+  | "price_breakout"
+  | "position_watch"
+  | "heartbeat";
+
+// 本轮唤醒断面：kind 是标签，alsoTrue 保留全部同时成立的条件（判定只决定标签，绝不丢证据）。
+// 阈值随 wire 下发是刻意的——静默的门禁在本仓库有前科，用户必须能看到「判据是多少、实际是多少」。
+export interface WakeInfo {
+  kind: WakeKind;
+  trigger: "candle" | "interval";
+  executionBar?: string | null; // ATR 倍数的量纲周期名（文案必须写「0.91×30m ATR」而非裸「ATR」）
+  sinceLastRoundS?: number | null;
+  priceMovePct?: number | null;
+  priceMoveAtr?: number | null; // **未**折算的原始倍数（物理量）
+  moveThresholdAtr?: number | null; // 配置值（未折算）
+  moveThresholdPct?: number | null;
+  horizonScale?: number | null; // sqrt(min(1, wake_s / bar_s))：把执行周期 ATR 折算到唤醒窗口
+  moveThresholdAtrEff?: number | null; // 实际判据 = moveThresholdAtr × horizonScale
+  skipStreak?: number | null; // 连续跳过计数（触到上限即强制放行一轮）
+  barAdvanced?: boolean;
+  restingAgeS?: number | null;
+  guardStatus?: string | null; // 本 tick 利润保护快照 status（profit_tier 文案的取值来源）
+  lastGuardStatus?: string | null;
+  alsoTrue?: WakeKind[];
+  dropped?: boolean; // 被 in-flight 守卫丢弃的 K 线轮
+}
+
+// 自上一决策轮的价格变动：**与周期无关**，故挂在 TacticalContext 顶层而非逐周期重复。
+// atrBar 显式声明这个 ATR 的量纲周期是执行周期，不是战术周期自身的 ATR。
+export interface TacticalChange {
+  pct: number | null;
+  atrMult: number | null;
+  atrBar: string;
+}
+
+export interface TacticalFrame {
+  bar: string;
+  sampleCount: number;
+  closeTs: number;
+  ageSeconds: number;
+  stale: boolean;
+  regime?: MarketContext | null;
+  digest?: MarketDigest | null;
+  closedBars?: number | null; // 上一决策轮之后该级别**收线**的根数（按收线时刻计，不是开盘）
+}
+
+// 战术周期证据（严格短于执行周期、贴唤醒节奏的 1~2 个周期）；frames 由粗到细，与 prompt 同序。
+export interface TacticalContext {
+  executionBar: string;
+  wakeIntervalS?: number | null;
+  asOfTs: number;
+  executionPrimary?: string | null;
+  alignment: "aligned" | "diverged" | "insufficient";
+  changeSinceLastRound?: TacticalChange | null;
+  frames: TacticalFrame[];
+  missingBars: string[];
+  staleBars: string[];
+  maxChars?: number | null; // 服务端渲染字符上限（前端不消费，声明它只为让类型如实描述 wire）
+}
+
 // 当前挂着的限价委托（ai-trade-limit-orders §4.2；与后端 AiTradeRestingOrderOut / resting_payload 同构）。
 // 会话至多一笔（不变式 I-1）；ageS/expiresInS 为后端装配时刻的断面秒数，非前端实时倒计时。
 export interface AiTradeRestingOrder {
@@ -171,6 +237,11 @@ export interface AiTradeDecision {
   marketDigest?: MarketDigest | null;     // R1：价格走势/成交量/因子证据摘要（可为 null）
   multiTimeframeContext?: MultiTimeframeContext | null;
   trigger?: "candle" | "interval";        // wake-interval：唤醒来源（K 线唤醒 / 墙钟定时唤醒）
+  // 唤醒感知上下文（wake-aware-context §4.3）：总闸关闭 / 老事件 → null 或缺席。
+  wake?: WakeInfo | null;
+  tacticalContext?: TacticalContext | null;
+  tacticalTier?: "full" | "brief" | null;
+  contextDisclosure?: "full" | "repeat" | null;
   // 下单前二次反思裁决（ai-trade-pre-trade-reflection §2.6）：无反思轮（hold / 关闭）为 null。
   reflectionVerdict?: "confirm" | "abort" | null;
   reflectionReason?: string | null;
@@ -286,6 +357,11 @@ export interface AiTradeTraceEvent {
   maxAttempts?: number; // retry：本轮最大重试次数
   reason?: string; // retry：触发本次重试的上一次 degrade 原因 / reflection_verdict：反思理由
   trigger?: "candle" | "interval"; // round_start：唤醒来源（K 线唤醒 / 墙钟定时唤醒）
+  // round_start：唤醒原因 + 战术周期证据 + 两个披露档（wake-aware-context §4.3）。
+  wake?: WakeInfo | null;
+  tacticalContext?: TacticalContext | null;
+  tacticalTier?: "full" | "brief" | null;
+  contextDisclosure?: "full" | "repeat" | null;
   verdict?: AiReflectionVerdict; // reflection_verdict：反思裁决（confirm/abort）
   adjustedSizeFraction?: number | null; // reflection_verdict：实际收缩后的开仓仓位占比（无收缩为 null）
   // base_rule：【基础策略】铁律门禁判定 + 本轮通道断面（band 不可用时三条线为 null，不假数据）。
@@ -355,6 +431,12 @@ export interface AiTradeRoundTrace {
   marketDigest?: MarketDigest | null; // R1：价格走势/成交量/因子证据摘要（round_start 承载）
   multiTimeframeContext?: MultiTimeframeContext | null;
   trigger?: "candle" | "interval"; // wake-interval：唤醒来源（供 describeTrigger 区分周期唤醒）
+  // 唤醒感知上下文（wake-aware-context §3.3）：三总闸全关的会话恒为 null ⇒ 轮头与战术块整段回退。
+  // **必须与 emptyRoundTrace 的逐键手抄保持一致**——漏一个键，后端发什么前端都收不到。
+  wake?: WakeInfo | null;
+  tacticalContext?: TacticalContext | null;
+  tacticalTier?: "full" | "brief" | null;
+  contextDisclosure?: "full" | "repeat" | null;
   thinking: string; // 累积深度思考（未开启扩展思考时通常为空）
   analysis: string; // 累积自然语言研判分析（流式主可见内容）
   toolCallPending?: boolean;

@@ -73,7 +73,8 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
                                  limit_band_pct: float = 0.02,
                                  base_rules_text: str = "",
                                  profit_guard_text: str = "",
-                                 sizing_text: str = "") -> str:
+                                 sizing_text: str = "",
+                                 tactical_bars_text: str = "") -> str:
     """决策者系统 prompt：信号仅供参考 + 分步思维链纪律 + 风险偏好 + 只用真数据 + 收尾必调决策工具。
 
     `position_step_pct`（默认 0.0 → 连续、原文逐字不变、零回归）：当 `>0` 时把决策纪律 #3 的
@@ -99,6 +100,10 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
     `sizing_text`（末位，默认 `""` → 渲染逐字节不变、零回归，vol-sizing-and-drawdown-brake §3.8）：
     仓位与风险层宪章章（`sizing_text.format_sizing_charter` 产物）。紧随利润保护章之后——它约束的是
     **下多大注**，与前两者「在哪开」「何时锁」构成完整的三段式硬约束声明。
+
+    `tactical_bars_text`（末位，默认 `""` → 渲染逐字节不变、零回归，ai-trade-wake-aware-context §2.8）：
+    本会话实际注入的战术周期串（`"5m → 1m"`）。非空时在决策纪律 #1 的中线背景子句之后**插入**一句
+    择时核对指令——「说的」与「给的」必须是同一批周期，故取值只能来自 `WakeRuntime` 的同一个真源。
     """
     charter = "".join(f"{text}\n\n"
                       for text in (base_rules_text, profit_guard_text, sizing_text) if text)
@@ -113,7 +118,8 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
         f"{charter}"
         "决策纪律：\n"
         "1. **每轮必须先输出一段分步骤的研判（思维链）**。输入提供可用多周期证据时，先按 "
-        "1D → 12H → 4H → 1H 研判中线背景、趋势一致性、候选支撑阻力与超买/超卖，再依次思考："
+        "1D → 12H → 4H → 1H 研判中线背景、趋势一致性、候选支撑阻力与超买/超卖，"
+        f"{_tactical_discipline(tactical_bars_text)}再依次思考："
         "① 价格走势（方向、动量、均线结构、"
         "区间位置）；② 成交量（量能、量比、放缩、异常放量）；③ 市场体制（趋势/震荡/高低波动/事件）；"
         "④ 技术因子读数（RSI/MACD/布林/ATR/动量各说明什么）；⑤ 逐一批判各策略信号——每个策略此刻的"
@@ -132,6 +138,18 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
         "5. **收尾硬约束（务必遵守）：每轮在完成上述分步研判之后，必须且只能调用一次 "
         "`submit_trade_decision` 工具提交本轮决策——绝不允许只输出研判文字而不调用决策工具。**"
     )
+
+
+def _tactical_discipline(tactical_bars_text: str) -> str:
+    """决策纪律 #1 的战术周期核对子句；空串 ⇒ 空串（系统 prompt 渲染逐字节回退，G-1）。
+
+    措辞里的「不得单独反转中线判断」是硬约束不是客套：1m 级别信号横跳，模型被短周期带偏会直接抬高
+    交易频次、被成本吃掉——那正好反向恶化本特性要解决的「总是亏损」。
+    """
+    if not tactical_bars_text:
+        return ""
+    return (f"再用战术周期（{tactical_bars_text}）核对执行时机（本级别是否已形成有效突破/回踩、"
+            "量能是否配合、还是仅为噪音；战术周期只用于择时与确认，不得单独反转中线判断），")
 
 
 def _action_discipline(allow_limit: bool, band_pct: float = 0.02) -> str:
@@ -376,45 +394,10 @@ def _format_factors(factors: dict | None) -> str:
             f"布林%B={_reading('bollPctB')}，ATR%={_reading('atrPct')}，动量ROC={_reading('rocPct')}")
 
 
-def _format_candidate(label: str, candidate: dict | None) -> str:
-    if not candidate:
-        return f"{label}=无"
-    bars = "/".join(candidate.get("bars") or []) or "未知"
-    return (f"{label}={candidate.get('price')}（距离 {candidate.get('distancePct')}%，"
-            f"来源 {bars}）")
-
-
-def _format_multi_timeframe_frame(frame: dict) -> str:
-    regime = (frame.get("regime") or {}).get("primary")
-    digest = frame.get("digest") or {}
-    rsi = ((digest.get("factors") or {}).get("rsi14") or {})
-    range_pos = (digest.get("priceAction") or {}).get("rangePos")
-    stale = "，数据陈旧" if frame.get("stale") else ""
-    return (f"- {frame.get('bar')}：体制={regime}，RSI14={rsi.get('value')}"
-            f"({rsi.get('label')})，区间位置={range_pos}，样本={frame.get('sampleCount')}"
-            f"{stale}")
-
-
 def _format_multi_timeframe(context: dict | None) -> list[str]:
-    if context is None:
-        return []
-    frames = context.get("frames") or []
-    if not frames:
-        return ["中线背景暂不可用，已回退基础周期；缺失或陈旧周期不得补猜。"]
-    alignment = (context.get("trendAlignment") or {}).get("status")
-    header = "；".join((
-        f"中线背景：整体={alignment}",
-        _format_candidate("候选支撑", context.get("nearestSupport")),
-        _format_candidate("候选阻力", context.get("nearestResistance")),
-    ))
-    order = {bar: index for index, bar in enumerate(("1D", "12H", "4H", "1H"))}
-    lines = [header]
-    lines.extend(_format_multi_timeframe_frame(frame)
-                 for frame in sorted(frames, key=lambda item: order.get(item.get("bar"), 99)))
-    missing = context.get("missingBars") or []
-    if missing:
-        lines.append(f"缺失周期={'/'.join(missing)}；不得补猜。")
-    return lines
+    """中线背景段（渲染主体在 `market_text`，见该模块 docstring 的行数逃生口说明）。"""
+    from .market_text import _format_multi_timeframe as render   # 延迟导入，同 _format_base_rules
+    return render(context)
 
 
 def _trigger_suffix(trigger) -> str:
@@ -429,6 +412,67 @@ def _trigger_suffix(trigger) -> str:
         return ""
     return ("｜触发源=定时唤醒（墙钟到点，非新 K 线确认触发；**若**本轮行情数据与上一决策轮相同"
             "或仅实时价微动，重复数据下的观望不构成新的独立证据）")
+
+
+def _format_wake(wake: dict | None) -> str:
+    """唤醒原因后缀（wake-aware-context §2.8）：`payload["wake"]` **键缺失** ⇒ 空串。
+
+    调用方在空串时回退既有 `_trigger_suffix` ⇒ 回测与老 payload 的首行逐字节不变。渲染委托
+    `wake_text` 模块——判定、守卫、文案共用同一个 `wake` 对象，杜绝「prompt 说没变、守卫认为变了」。
+    """
+    if not wake:
+        return ""
+    from .wake_text import format_wake_for_prompt   # 延迟导入，与 _format_profit_guard 同范式
+    return format_wake_for_prompt(wake)
+
+
+def _format_tactical(payload: dict) -> list[str]:
+    """战术周期段；`payload["tacticalContext"]` **键缺失** ⇒ 空表（整段省略，逐字节回退）。
+
+    字符上限随 `tacticalContext.maxChars` 一同下发（装配期从 settings 取一次），故渲染层无需拿到
+    `Settings`——这与本模块其余渲染函数「只吃 payload」的既有形态一致。
+    """
+    context = payload.get("tacticalContext")
+    if not context:
+        return []
+    from .wake_text import format_tactical_for_prompt   # 延迟导入，同上
+    return format_tactical_for_prompt(context, payload.get("tacticalTier") or "brief",
+                                      max_chars=int(context.get("maxChars") or 0))
+
+
+def _multi_timeframe_lines(payload: dict) -> list[str]:
+    """中线背景段：重复轮压缩成表头 + 一句说明，其余情形逐字节沿用既有全量渲染。"""
+    context = payload.get("multiTimeframeContext")
+    if payload.get("contextDisclosure") == "repeat":
+        from .wake_text import format_multi_timeframe_repeat   # 延迟导入，同上
+        repeat = format_multi_timeframe_repeat(context)
+        if repeat is not None:
+            return repeat
+    return _format_multi_timeframe(context)
+
+
+def _digest_lines(payload: dict) -> list[str]:
+    """执行周期证据段：重复轮压成一行，其余情形逐字节沿用既有三行渲染。"""
+    digest = payload.get("marketDigest") or {}
+    if payload.get("contextDisclosure") == "repeat":
+        from .wake_text import format_digest_repeat   # 延迟导入，同上
+        # 「本轮最新变化见战术周期」这句指路只在战术段真的会被渲染时才给：三个总闸互相独立，
+        # 战术段可能因总闸关 / 无候选周期（1m 执行）/ 取数全失败而缺席。
+        line = format_digest_repeat(payload.get("marketDigest"), _payload_execution_bar(payload),
+                                    has_tactical=bool(payload.get("tacticalContext")))
+        return [line] if line else []
+    return [line for line in (_format_price_action(digest.get("priceAction")),
+                              _format_volume(digest.get("volume")),
+                              _format_factors(digest.get("factors"))) if line]
+
+
+def _payload_execution_bar(payload: dict) -> str | None:
+    """执行周期名（压缩文案的量纲标注用）：从战术段 / 唤醒段回读，两者都缺席时 None（不假数据）。"""
+    for key in ("tacticalContext", "wake"):
+        bar = (payload.get(key) or {}).get("executionBar")
+        if bar:
+            return bar
+    return None
 
 
 def _format_hold_streak(hold_streak) -> str:
@@ -519,7 +563,8 @@ def build_decision_prompt(payload: dict) -> str:
     sl = payload.get("stopLossUsd")
     parts = [
         f"决策轮 #{payload.get('round')}｜barTs={payload.get('barTs')}｜最新价={payload.get('lastPx')}"
-        + _trigger_suffix(payload.get("trigger")),
+        # 唤醒原因优先（七态结构化措辞）；`wake` 键缺席时逐字节回退既有二值触发源标注。
+        + (_format_wake(payload.get("wake")) or _trigger_suffix(payload.get("trigger"))),
         _format_position(payload.get("position")),
     ]
     guard_line = _format_profit_guard(payload.get("profitGuard"))
@@ -543,7 +588,7 @@ def build_decision_prompt(payload: dict) -> str:
     resting_line = _format_resting_order(payload.get("restingOrder"))
     if resting_line:                         # 无挂单时整段省略（不出现「当前挂单：无」的噪音）
         parts.append(resting_line)
-    parts.extend(_format_multi_timeframe(payload.get("multiTimeframeContext")))
+    parts.extend(_multi_timeframe_lines(payload))
     market_line = _format_market_context(payload.get("marketContext"))
     if market_line:                          # E1：mc 为 None 时整段省略（不出现半截空信息）
         parts.append(market_line)
@@ -553,12 +598,10 @@ def build_decision_prompt(payload: dict) -> str:
     priors_line = _format_signal_priors(payload.get("signalPriors"))
     if priors_line:                          # 证据相邻性：共识 → 共识的历史质量 → 行情证据
         parts.append(priors_line)
-    digest = payload.get("marketDigest") or {}   # R1：各段 None 时整段省略（同 E1/E2 降级范式）
-    for line in (_format_price_action(digest.get("priceAction")),
-                 _format_volume(digest.get("volume")),
-                 _format_factors(digest.get("factors"))):
-        if line:
-            parts.append(line)
+    parts.extend(_digest_lines(payload))     # R1：各段 None 时整段省略（同 E1/E2 降级范式）
+    # 战术周期段（时间尺度由远及近单调收缩）：中线背景 → 体制 → 共识 → 先验 → 执行周期证据 →
+    # **战术周期** → 基础策略铁律 → 信号板 → 摘要，与系统 prompt 的思维链步骤同序。
+    parts.extend(_format_tactical(payload))
     base_rules_line = _format_base_rules(payload.get("baseRules"))
     if base_rules_line:                      # 键缺失时整段省略（零回归；规则未装配 / 回测老 payload）
         parts.append(base_rules_line)

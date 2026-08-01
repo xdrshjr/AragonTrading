@@ -35,7 +35,7 @@ from .cost_runtime import CostRuntime
 from .decider import AiTradeDecider, TradeDecision
 from .market_context import build_market_context
 from .market_digest import build_market_digest
-from .market_window import MarketWindow
+from .market_window import MarketWindow, WindowOptions
 from .multi_timeframe_context import build_multi_timeframe_context
 from .order_plan import decision_to_order_plan
 from .prior_runtime import PriorRuntime
@@ -78,7 +78,8 @@ from .trace import (
     sizing_event,
     trace_event,
 )
-from .wake_guard import should_skip_interval_wake
+from .wake_reason import WakeReadings
+from .wake_runtime import InjectionContext, WakeRuntime
 
 _SNAPSHOT_EQUITY_MAX = 1000
 _DECISIONS_MAX = 50
@@ -94,6 +95,10 @@ _BAND_UNAVAILABLE_ALERT_ROUNDS = 3
 # 最小 edge 门禁连续不可用告警阈值（§3.7）：本层 fail-open，故阈值比铁律层宽——连续这么多轮算不出
 # 粗估 edge 才追一条 error，使「门禁其实一直没生效」在 UI 上自解释（静默的降级同样会被当成故障）。
 _EDGE_UNAVAILABLE_ALERT_ROUNDS = 20
+# 打 `explain.meta.wakeKind` 的成交类型白名单（ai-trade-wake-aware-context §2.9）：只有 AI 决策**直接**
+# 产生的成交才归因到唤醒来源。保护层平仓 / 会话止损 / 外部干预由确定性层触发、与唤醒无关，打上去会让
+# 「按唤醒来源切胜率」这张表整体失真——而那正是本条要解决的问题。
+_WAKE_ATTRIBUTED_KINDS = ("atomic", "reverse")
 
 logger = logging.getLogger(__name__)
 
@@ -166,12 +171,20 @@ class AiTradeSession:
         self.residual: dict | None = None
         self.degraded = False
 
+        # 唤醒感知上下文（wake-aware-context §2.6）：必须**先于** `MarketWindow` 构造——窗口的
+        # `WindowOptions.tactical_bars` 要吃 `self._wake.tactical_bars`，战术集合的唯一真源在此。
+        self._wake = WakeRuntime(bar, wake_interval_s, executor.settings)
         self._window = MarketWindow(
             inst_id,
             bar,
             specs,
             priming_bars,
-            context_enabled=executor.settings.ai_trade_multi_timeframe_context,
+            options=WindowOptions(
+                context_enabled=executor.settings.ai_trade_multi_timeframe_context,
+                tactical_bars=self._wake.tactical_bars,
+                tactical_window_bars=executor.settings.ai_trade_tactical_window_bars,
+                tactical_min_refresh_s=executor.settings.ai_trade_tactical_min_refresh_s,
+                tactical_fetch_timeout_s=executor.settings.ai_trade_tactical_fetch_timeout_s),
         )
         self._shadows = [make_shadow_broker() for _ in specs]
         self._exec_lock = asyncio.Lock()      # P1-1：串行化一切 executor 写
@@ -283,6 +296,10 @@ class AiTradeSession:
         if trade.get("ordId"):
             meta.setdefault("ordId", trade["ordId"])
         self._cost.apply_explain_meta(meta, trade)   # A0-1：记账关闭即空转 ⇒ meta 逐字回退
+        # §2.9 唤醒来源归因：让「我赚钱的那些交易是哪种唤醒触发的」这个问题事后可用数据回答。
+        # 总闸关闭 ⇒ `last_round_kind` 恒 None ⇒ 本键整体缺席（老数据同样缺席，查询侧按「未知」处理）。
+        if explain.get("kind") in _WAKE_ATTRIBUTED_KINDS and self._wake.last_round_kind:
+            meta.setdefault("wakeKind", self._wake.last_round_kind)
         explain["meta"] = meta
 
     async def _persist_trade(self, trade: dict) -> None:
@@ -312,6 +329,7 @@ class AiTradeSession:
     async def _prime(self) -> None:
         """预填窗口 + 逐根回放种入各策略影子（每策略独立，P0-1）；真实决策从首个实时确认根起。"""
         await self._window.prefill_htf(self.priming_bars if self.priming else 60)
+        await self._window.prefill_tactical()    # 战术窗口预填（取数失败留空，绝不阻塞暖机）
         rows = await self._window.fetch_priming_rows(self.priming_bars if self.priming else 60)
         for row in rows:
             self._window.prime_append(row)
@@ -415,6 +433,9 @@ class AiTradeSession:
         await self._expire_profit_cooldown()
         await self._maybe_session_exit(mark, now_ts)
         await self._cost.refresh_funding(time.time())    # §3.1：网络 IO 只跑在盯市 tick 上
+        # 战术窗口刷新**必须**排在定时唤醒之前——否则定时轮拿到的是上一分钟的战术数据，整个特性
+        # 在最该生效的路径上空转。三闸门（锚点/配额/单 tick 节流）+ 硬超时保证它不拖停盯市。
+        await self._window.maybe_refresh_tactical(now_ts, time.time())
         await self._maybe_interval_wake()
 
     async def _maybe_interval_wake(self) -> None:
@@ -425,6 +446,9 @@ class AiTradeSession:
         （纯同步，守卫与认领之间无 await、无竞态）——空仓+无挂单+无新确认根+价格微动时跳过本次唤醒，
         且**不刷新** `_last_decision_started_wall`：下个 monitor tick（默认 ~5s）重新评估，价格一越过
         阈值或新 K 线到来即恢复唤醒；持仓轮/挂单轮永不跳过（盯市职责不受影响）。
+
+        wake-aware-context §2.5：守卫判据收敛到 `WakeRuntime` —— 先分类（纯同步）再问要不要跳过，
+        「跳过」与「prompt 措辞」从此读同一个 `kind`，杜绝两处各算一次。
         """
         if (self.wake_interval_s <= 0 or self.state != "running" or self._deciding
                 or self._stale_degraded or self._last_board is None):
@@ -433,17 +457,14 @@ class AiTradeSession:
         if now - self._last_decision_started_wall < self.wake_interval_s:
             return
         ref_px = self._current_px()           # 纯同步取实时价（不 await）
-        if should_skip_interval_wake(
-                position_side=self.executor.projected,
-                has_resting=self.executor.resting is not None,
-                bar_index=self._last_bar_index,
-                last_round_bar_index=self._last_round_bar_index,
-                px=ref_px, last_round_px=self._last_round_px,
-                threshold=self.executor.settings.ai_trade_wake_skip_unchanged_pct):
+        wake = self._wake.classify(self._wake_readings("interval", ref_px), now_wall=now)
+        if self._wake.should_skip(wake):
             # O1（hold-inertia-observability）：守卫命中期间没有任何事件发出，live 面板的 wakeSkips
             # 只能停在连接时 snapshot 的旧值；计数成功即补推一次 status（频率被 R-02 节流天然封顶：
             # 每唤醒周期至多一条，不新增节流机制）。
-            if self._count_wake_skip(now):
+            counted = self._count_wake_skip(now)
+            self._wake.note_skip(counted)     # 连续跳过计数与 wake_skips 同口径（绝不按 tick 裸计）
+            if counted:
                 await self._push({"type": "status", "data": self._status_payload()})
             return
         self._deciding = True                 # 同步认领槽位：check→set 间无 await（与 feed_candle 同范式，P1-2）
@@ -452,7 +473,16 @@ class AiTradeSession:
         self._last_decision_started_wall = now
         self._decision_task = asyncio.create_task(
             self._run_decision_round(self._last_board, self._last_bar_index, ref_px,
-                                     int(now), trigger="interval"))
+                                     int(now), wake))
+
+    def _wake_readings(self, trigger: str, ref_px: float) -> WakeReadings:
+        """本次唤醒的会话侧断面（executor 与窗口的现成读数；保护快照与 ATR 由运行时回读）。"""
+        resting = self.executor.resting
+        payload = resting_payload(resting, int(time.time())) if resting is not None else None
+        return WakeReadings(
+            trigger=trigger, position_side=self.executor.projected,
+            has_resting=resting is not None, bar_index=self._last_bar_index, px=ref_px,
+            resting_age_s=(payload or {}).get("ageS"))
 
     def _count_wake_skip(self, now: float) -> bool:
         """守卫命中计数（R-02 节流）：每个唤醒周期至多计数+日志一次。
@@ -547,9 +577,12 @@ class AiTradeSession:
         # 上下界整体不生效，退化为纯阶梯回吐（与本层 fail-open 极性一致）。
         self._atr_px = safe_atr(self._window.base_df(),
                                 self.executor.settings.ai_trade_profit_guard_atr_period)
+        self._wake.note_atr(self._atr_px)     # ATR 判据与参照断面共用这一个数（唯一入口）
         self._sizing.note_candles([c["c"] for c in self._window.candles], int(candle.ts))
         decision_as_of_ts = int(candle.ts) + BAR_SECONDS[self.bar]
         await self._window.maybe_refresh_htf(decision_as_of_ts)
+        # 锚点闸使其在盯市已刷新时为零成本空转；确认根这条路径保证「新根落地即有最新战术数据」。
+        await self._window.maybe_refresh_tactical(decision_as_of_ts, time.time())
         frames = self._window.build_strategy_frames()
         i = self._window.cur_index()
         ref_px = float(row["c"])
@@ -565,20 +598,27 @@ class AiTradeSession:
         self._deciding = True
         self._last_round_bar_index = i           # F4c：记录本决策轮启动断面（根索引 + 参考价）
         self._last_round_px = ref_px
-        self._last_decision_started_wall = time.time()   # 任一轮决策开始即刷新计时器，与定时唤醒合流去重
+        now_wall = time.time()
+        self._last_decision_started_wall = now_wall   # 任一轮决策开始即刷新计时器，与定时唤醒合流去重
+        wake = self._wake.classify(self._wake_readings("candle", ref_px), now_wall=now_wall)
         self._decision_task = asyncio.create_task(
-            self._run_decision_round(board, i, ref_px, ts, trigger="candle"))
+            self._run_decision_round(board, i, ref_px, ts, wake))
 
     async def _run_decision_round(self, board: list[StrategySignalView], i: int,
-                                  ref_px: float, ts: int, trigger: str = "candle") -> None:
+                                  ref_px: float, ts: int, wake: dict) -> None:
         """一个决策轮：装配输入 → AI 决策 → 映射 Signal 守护执行 → 记录/摘要 → 推事件（含认知轨迹）。
 
-        `trigger`（默认 "candle"，K 线唤醒；"interval"=墙钟定时唤醒）透传到 payload / round_start 轨迹 /
-        decision 事件，供 prompt 与前端区分唤醒来源；决策安全性不依赖它。
+        `wake`（wake-aware-context §2.7）承载本轮唤醒断面，其中 `wake["trigger"]` 即原 `trigger` 形参
+        的取值（wire 逐字不变）。透传到 payload / round_start 轨迹 / decision 事件，供 prompt 与前端
+        区分唤醒来源；决策安全性不依赖它。
         """
         round_no = self.rounds_completed + 1     # RV-5：try 之前绑定，except 可安全引用
         try:
-            payload = self._build_decision_payload(round_no, ts, ref_px, board, trigger)
+            payload = self._build_decision_payload(round_no, ts, ref_px, board, wake)
+            # 断面冻结须在 payload 之后：`changeSinceLastRound` / `closedBars` 参照的是**上一**轮。
+            self._wake.note_round_start(wake, px=ref_px, bar_index=i,
+                                        as_of_ts=self._decision_as_of_ts(ts, wake),
+                                        now_wall=time.time())
             consensus = compute_consensus(board)                 # E2：每轮只算一次（供门禁 + wire）
             payload["consensus"] = self._consensus_wire(consensus)
             await self._begin_round_trace(round_no, ts, ref_px, payload, board)  # RV-7：consensus 之后
@@ -630,7 +670,11 @@ class AiTradeSession:
                                       degrade_reason=degrade, analysis=excerpt,
                                       market_digest=payload.get("marketDigest"),
                                       multi_timeframe_context=payload.get("multiTimeframeContext"),
-                                      trigger=trigger, reflection_verdict=reflection_verdict,
+                                      wake=wake,
+                                      tactical_context=payload.get("tacticalContext"),
+                                      tactical_tier=payload.get("tacticalTier"),
+                                      context_disclosure=payload.get("contextDisclosure"),
+                                      reflection_verdict=reflection_verdict,
                                       reflection_reason=reflection_reason)
             if degrade:
                 await self._emit_degraded(ts, degrade)
@@ -663,7 +707,9 @@ class AiTradeSession:
             consensus=trace["consensus"], marketDigest=trace["marketDigest"],
             trigger=trace["trigger"], profitGuard=trace["profitGuard"],
             profitGuardCooldown=trace["profitGuardCooldown"],
-            signalPriors=trace["signalPriors"]))
+            signalPriors=trace["signalPriors"], wake=trace["wake"],
+            tacticalContext=trace["tacticalContext"], tacticalTier=trace["tacticalTier"],
+            contextDisclosure=trace["contextDisclosure"]))
 
     # ---------- 下单前二次反思编排（ai-trade-pre-trade-reflection §2.3；精简，装配下沉 trace.py）----------
     async def _reflect_before_execute(self, round_no: int, ts: int, payload: dict,
@@ -1014,14 +1060,21 @@ class AiTradeSession:
 
         F0 之后本方法只剩「有没有仓 → 组装 facts → 委托运行时」三步；epoch 身份判定、峰值推进与
         fail-open 前置校验全部在纯核心里（`advance_state` / `unavailable_reason_for`）。
+
+        本方法是保护快照 status 的**唯一**产出点，故 `WakeRuntime.note_guard_status` 挂在这里：唤醒
+        分类要读的「本 tick 保护状态」与保护层真正据以平仓的是同一个数，调用方不得另取一次。
         """
         if self.profit_rule is None:
+            self._wake.note_guard_status(None)
             return None
         if self.executor.projected == "flat":
             self._guard.clear_state()
+            self._wake.note_guard_status(None)
             return None
         facts = build_position_facts(self.executor, self._session_readings(now_wall))
-        return self._guard.refresh(facts, stale_feed=self._stale_degraded)
+        snap = self._guard.refresh(facts, stale_feed=self._stale_degraded)
+        self._wake.note_guard_status((snap or {}).get("status"))
+        return snap
 
     async def _maybe_profit_exit(self, ts: int) -> None:
         """确定性利润保护：峰值回吐 / 保本 / 硬止盈触发即市价平仓（§2.5）。
@@ -1141,11 +1194,27 @@ class AiTradeSession:
             await self._push({"type": "status", "data": self._status_payload()})
 
     # ---------- decision / summary 事件 ----------
+    def _decision_as_of_ts(self, ts: int, wake: dict) -> int:
+        """本轮决策瞬刻（epoch 秒，**墙钟口径**）：K 线轮 = 该根收盘时刻；定时轮 = `ts` 本身。
+
+        会话在两条唤醒路径上给出的 `ts` 语义不同（K 线轮是根**开盘** ts、定时轮是墙钟 `int(now)`），
+        故「决策瞬刻」只能有一个真源、按 trigger 分支求一次，再同时喂战术段与 `changeSinceLastRound`。
+        若沿用既有 MTF 的 `ts + BAR_SECONDS[bar]`，定时轮的 `as_of_ts` 会变成「现在 + 一整根」这个
+        **未来时刻**：`ageSeconds` 凭空多出一整根，而战术周期的 stale 阈值只有两根（1m 仅 120 秒）
+        ⇒ 每个定时轮的每个战术周期恒被标成「数据陈旧」，而系统 prompt 决策纪律 #2 明写「陈旧或缺失
+        周期不得补猜」——等于把刚取回来的证据亲手命令模型忽略。反过来传裸 `ts`，K 线轮又会把整根
+        执行周期内的战术根全部裁掉。
+        """
+        if wake.get("trigger") == "candle":
+            return ts + BAR_SECONDS[self.bar]
+        return ts
+
     def _build_decision_payload(self, round_no: int, ts: int, ref_px: float,
                                 board: list[StrategySignalView],
-                                trigger: str = "candle") -> dict:
+                                wake: dict) -> dict:
         payload = {
-            "round": round_no, "barTs": ts, "lastPx": ref_px, "trigger": trigger,
+            "round": round_no, "barTs": ts, "lastPx": ref_px,
+            "trigger": wake.get("trigger", "candle"),
             "position": self.executor.position_payload(ref_px),
             # §4.2：当前挂单只读上下文（无挂单 → None，prompt 整段省略）。Agent 看不见自己的挂单
             # 就无法就它做任何决策——这是 `cancel_order` 可用的前提。
@@ -1178,6 +1247,13 @@ class AiTradeSession:
         if priors is not None:                  # 同款「整键缺席」范式（§3.9 的 G-1 逐字节断言）
             payload["signalPriors"] = priors
         self._cost.set_prior_view(self._prior.coverage_wire())   # P1-3：两条快照通道同源
+        # 唤醒原因 + 战术周期证据 + 两个披露档（wake-aware-context §2.6）：三总闸各管自己的键，
+        # 关闭即**整键缺席**（不是 None）⇒ prompt 渲染与既有 payload 冻结断言逐字节回退。
+        self._wake.inject(payload, InjectionContext(
+            wake=wake, frames=self._window.tactical_frames(),
+            as_of_ts=self._decision_as_of_ts(ts, wake), last_px=ref_px,
+            position_side=self.executor.projected,
+            execution_primary=(payload.get("marketContext") or {}).get("primary")))
         return payload
 
     def _build_multi_timeframe_context(self, ts: int, ref_px: float) -> dict | None:
@@ -1225,15 +1301,19 @@ class AiTradeSession:
                              analysis: str | None = None,
                              market_digest: dict | None = None,
                              multi_timeframe_context: dict | None = None,
-                             trigger: str = "candle",
+                             wake: dict | None = None,
+                             tactical_context: dict | None = None,
+                             tactical_tier: str | None = None,
+                             context_disclosure: str | None = None,
                              reflection_verdict: str | None = None,
                              reflection_reason: str | None = None) -> None:
         """推 decision 事件；E1/E2/E3 + R1 研判摘录/证据摘要搭顺风车下发（旧前端忽略未知字段，向前兼容）。
 
         `analysis` 为有界摘录（≤`_ANALYSIS_EXCERPT_CHARS`，供左栏决策卡首段；完整思维链见 agent_trace/
         snapshot.agentTraces，RC-3）；`market_digest` 为本轮价格走势/成交量/因子证据（小、~10 数值）；
-        `trigger` 为本轮唤醒来源（candle/interval，供前端区分周期唤醒）；`reflection_verdict/reason` 为
-        下单前二次反思裁决（无反思轮为 None）。
+        `wake` 为本轮唤醒断面（`wake["trigger"]` 即既有 `data.trigger` 的取值，wire 语义不变；唤醒原因
+        总闸关闭时 `data.wake` 下发 None，前端整段回退旧文案）；`reflection_verdict/reason` 为下单前
+        二次反思裁决（无反思轮为 None）。
         """
         data = {"ts": ts, "round": round_no, "action": decision.action,
                 "sizeFraction": decision.size_fraction, "confidence": decision.confidence,
@@ -1245,7 +1325,11 @@ class AiTradeSession:
                 "executed": executed, "marketContext": market_context,
                 "consensus": consensus, "degradeReason": degrade_reason,
                 "analysis": analysis, "marketDigest": market_digest,
-                "multiTimeframeContext": multi_timeframe_context, "trigger": trigger,
+                "multiTimeframeContext": multi_timeframe_context,
+                "trigger": (wake or {}).get("trigger", "candle"),
+                "wake": wake if self._wake.reason_enabled else None,
+                "tacticalContext": tactical_context, "tacticalTier": tactical_tier,
+                "contextDisclosure": context_disclosure,
                 "reflectionVerdict": reflection_verdict, "reflectionReason": reflection_reason,
                 # N5（hold-inertia-observability）：decide 后已更新，语义=「截至本轮」的连续真实观望；
                 # 每轮随 decision 事件下发，是前端 live 值的最新真源（跳过轮事件不带此键）。
@@ -1262,6 +1346,11 @@ class AiTradeSession:
                 "marketContext": None, "consensus": None, "degradeReason": None,
                 "analysis": None, "marketDigest": None,
                 "multiTimeframeContext": None, "trigger": "candle",
+                # §2.7：被 in-flight 守卫丢弃的 K 线轮从此**自解释**——用户能看到「这根 K 线的首次
+                # 研判被推迟了」，且下一次定时唤醒必被判为 bar_advanced（模型会被明确告知）。
+                "wake": ({"kind": "candle_close", "trigger": "candle", "dropped": True}
+                         if self._wake.reason_enabled else None),
+                "tacticalContext": None, "tacticalTier": None, "contextDisclosure": None,
                 "reflectionVerdict": None, "reflectionReason": None}
         self._last_decision = data
         self._decisions.append(data)

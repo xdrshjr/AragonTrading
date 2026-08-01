@@ -29,6 +29,11 @@ from app.okx.types import Candle
 from app.paper.strategy_factory import PaperStrategySpec
 from app.strategies.base import BaseStrategy, StrategyMeta
 
+# wake-aware-context §2.7：`_build_decision_payload` 的第 5 形参由 `trigger: str` 换成结构化
+# `wake: dict`（`wake["trigger"]` 承载原值，wire 逐字不变）。本常量只是把既有调用点的 "candle"
+# 平移过来，**断言一字未改**。
+_CANDLE_WAKE = {"trigger": "candle", "kind": "candle_close"}
+
 _START_TS = 1_700_000_000
 _STEP = 3600
 
@@ -686,14 +691,14 @@ def test_payload_hold_streak_threshold():
     达阈注入 holdStreak；未达无键；=0 关闭时 hold_streak=99 也无键（prompt 逐字节回退口）。"""
     session, _, _ = _make_session(settings=Settings(ai_trade_hold_streak_note_after=2))
     session.hold_streak = 2
-    payload = session._build_decision_payload(1, _START_TS, 30000.0, [], "candle")
+    payload = session._build_decision_payload(1, _START_TS, 30000.0, [], _CANDLE_WAKE)
     assert payload["holdStreak"] == 2
     session.hold_streak = 1
-    payload = session._build_decision_payload(2, _START_TS, 30000.0, [], "candle")
+    payload = session._build_decision_payload(2, _START_TS, 30000.0, [], _CANDLE_WAKE)
     assert "holdStreak" not in payload
     session_off, _, _ = _make_session(settings=Settings(ai_trade_hold_streak_note_after=0))
     session_off.hold_streak = 99
-    payload = session_off._build_decision_payload(3, _START_TS, 30000.0, [], "candle")
+    payload = session_off._build_decision_payload(3, _START_TS, 30000.0, [], _CANDLE_WAKE)
     assert "holdStreak" not in payload
 
 
@@ -857,7 +862,7 @@ async def test_emits_base_rule_trace_each_round():
         assert not [e for e in _drain(q)
                     if e["type"] == "agent_trace" and e["data"]["phase"] == "base_rule"]
         assert plain._round_trace["baseRuleStatus"] is None
-        assert "baseRules" not in plain._build_decision_payload(1, 0, 1.0, [], "candle")
+        assert "baseRules" not in plain._build_decision_payload(1, 0, 1.0, [], _CANDLE_WAKE)
     finally:
         await dispose_engine()
 
@@ -931,7 +936,7 @@ async def test_profit_guard_absent_rule_is_byte_identical():
     try:
         _open_long(session)
         q = session.subscribe()
-        payload = session._build_decision_payload(1, 0, _PG_ENTRY, [], "candle")
+        payload = session._build_decision_payload(1, 0, _PG_ENTRY, [], _CANDLE_WAKE)
         assert "profitGuard" not in payload and "profitHoldRounds" not in payload
         assert "profitGuard" not in (session._position_payload(_PG_ENTRY) or {})
         await session._maybe_profit_exit(_START_TS)
@@ -1067,8 +1072,8 @@ async def test_profit_guard_last_exit_is_consumed_after_one_round():
         await session._maybe_profit_exit(_START_TS)
         assert session.profit_guard_exits == 1
 
-        first = session._build_decision_payload(1, _START_TS, _PG_ENTRY, [], "candle")
-        second = session._build_decision_payload(2, _START_TS, _PG_ENTRY, [], "candle")
+        first = session._build_decision_payload(1, _START_TS, _PG_ENTRY, [], _CANDLE_WAKE)
+        second = session._build_decision_payload(2, _START_TS, _PG_ENTRY, [], _CANDLE_WAKE)
 
         assert first["profitGuard"]["lastExit"]["reasonCode"] == "profit_guard_trailing"
         assert first["profitGuard"]["status"] == "flat"   # 已平仓：空壳快照只承载回执
@@ -1139,7 +1144,7 @@ async def test_profit_guard_metrics_land_in_ai_stats():
         _open_long(session)
         peak = _pg_peak_px(0.10)
         _arm_peak(session, peak)
-        session._build_decision_payload(1, _START_TS, _PG_ENTRY, [], "candle")
+        session._build_decision_payload(1, _START_TS, _PG_ENTRY, [], _CANDLE_WAKE)
         session._last_live_px = _pg_trail_px(peak, rule)
         await session._maybe_profit_exit(_START_TS)
 
@@ -1189,7 +1194,7 @@ async def test_protective_exit_starts_cooldown_and_wires_three_carriers():
         assert session._guard.cooldown is not None
         assert session._guard.cooldown.side == "long"
         assert session._guard.cooldown.reason_code == "profit_guard_trailing"
-        payload = session._build_decision_payload(1, 0, _PG_ENTRY, [], "candle")
+        payload = session._build_decision_payload(1, 0, _PG_ENTRY, [], _CANDLE_WAKE)
         view = payload["profitGuardCooldown"]
         assert view["blockedSide"] == "long" and view["scope"] == "same_side"
         assert 0 < view["remainingSeconds"] <= 180

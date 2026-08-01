@@ -192,6 +192,31 @@ class Settings(BaseSettings):
     # 达到该轮数后，决策 prompt 注入一条对称措辞的自察注记；0 = 完全关闭（prompt 逐字节回退现行为）。
     # env 名 AI_TRADE_HOLD_STREAK_NOTE_AFTER 已被 desktop config.js 的 AI_TRADE_ 前缀透传白名单覆盖。
     ai_trade_hold_streak_note_after: int = Field(default=10, ge=0)
+    # ---- 唤醒感知上下文（ai-trade-wake-aware-context §4.2）----
+    # 两条正交的轴：① 战术周期证据——在「中线背景（高于执行周期）」与「执行周期」之外补上缺失的第三层
+    # （严格短于执行周期、贴唤醒节奏的 1~2 个周期），让定时唤醒轮拿到**真的不同于**上一轮的行情证据；
+    # ② 唤醒原因——把 trigger 的二值扩成七种结构化 kind，同时驱动跳过守卫与 prompt 措辞（判定与文案
+    # 同源，杜绝「prompt 说没变、守卫认为变了」）。三个总闸全关 ⇒ payload/prompt/事件逐字节回退。
+    # env 名 AI_TRADE_TACTICAL_* / AI_TRADE_WAKE_* / AI_TRADE_PROGRESSIVE_* 已被 desktop config.js 的
+    # AI_TRADE_ 前缀透传白名单覆盖；此处须真的声明——Settings extra="ignore" 会静默丢弃未声明的 env。
+    ai_trade_tactical_context: bool = True       # 战术周期总闸；False ⇒ 整键缺席 + prompt 逐字回退
+    ai_trade_tactical_max_bars: int = Field(default=2, ge=0, le=3)   # 注入周期数；0 等价关闭
+    # 每个战术周期窗口根数（≥ market_digest._MIN_BARS=35 且 ≥ classify_regime 的 60）。
+    ai_trade_tactical_window_bars: int = Field(default=120, ge=40, le=300)
+    ai_trade_tactical_min_refresh_s: float = Field(default=20.0, gt=0, le=600)  # REST 配额护栏，防 429
+    # 单次战术取数硬超时：本取数跑在 5 秒盯市 tick 上，而同一个 tick 还守着利润保护棘轮与会话止损
+    # 这些**真实资金**路径；交易所慢响应最坏可达 ~60s/周期，不封顶会把盯市整体拖停。
+    ai_trade_tactical_fetch_timeout_s: float = Field(default=8.0, gt=0, le=60)
+    ai_trade_tactical_max_chars: int = Field(default=700, ge=0, le=4000)  # 战术段字符上限；0=不截断
+    ai_trade_wake_reason_enabled: bool = True    # 唤醒原因总闸（payload / prompt / 事件 / 归因）
+    # 价格异动判据（×执行周期 ATR，**经 horizon_scale 的 √t 律折算**到唤醒窗口的时间尺度）；
+    # 0 ⇒ 逐字回退纯 pct 判据（ai_trade_wake_skip_unchanged_pct）。折算系数刻意**不做成配置项**：
+    # 它是量纲折算而非调参旋钮，开放出去等于允许用户重新制造「1D 执行周期下永久跳过」的失配。
+    ai_trade_wake_move_atr_mult: float = Field(default=0.5, ge=0, le=10)
+    # 连续跳过上限，到即强制放行一轮（饿死兜底）；0 = 不封顶（回退纯守卫行为）。ATR 判据把跳过率
+    # 推高后没有这条上界，静止行情下 AI 会变成事实上的停机，而用户看不到任何原因。
+    ai_trade_wake_max_skip_streak: int = Field(default=5, ge=0, le=100)
+    ai_trade_progressive_disclosure: bool = True  # 重复轮压缩总闸；False ⇒ 执行披露恒 full
     # ---- 【基础策略】铁律层（ai-trade-base-strategy-ma-band §5.3）----
     # 与常规/组合/因子策略并列的第四种「策略类型」，但**不是**策略库里的行：它是信号板之外的硬约束层
     # （宪章 prompt 软引导 + base_rules.py 确定性门禁硬保证），默认开启、可在启动弹窗关闭、优先级最高。

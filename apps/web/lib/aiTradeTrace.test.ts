@@ -202,6 +202,51 @@ describe("applyAiTradeTracePhase", () => {
     expect(t[0].analysis).toBe("研判");
   });
 
+  // ---------- 唤醒感知上下文（wake-aware-context §6.1 T-17）----------
+  it("round_start 带四个新键 ⇒ AiTradeRoundTrace 上可读（防 store.ts 逐键手抄漏抄）", () => {
+    const tactical = {
+      executionBar: "30m",
+      wakeIntervalS: 180,
+      asOfTs: 1_700_000_000,
+      executionPrimary: "trend_up",
+      alignment: "diverged" as const,
+      changeSinceLastRound: { pct: 0.42, atrMult: 0.91, atrBar: "30m" },
+      frames: [
+        { bar: "5m", sampleCount: 120, closeTs: 1, ageSeconds: 42, stale: false, closedBars: 1 },
+        { bar: "1m", sampleCount: 120, closeTs: 1, ageSeconds: 12, stale: false, closedBars: 3 },
+      ],
+      missingBars: [],
+      staleBars: [],
+    };
+    const wake = { kind: "price_breakout" as const, trigger: "interval" as const, priceMoveAtr: 0.91 };
+    let t = applyAiTradeTracePhase(
+      [],
+      ev("round_start", 1, {
+        wake,
+        tacticalContext: tactical,
+        tacticalTier: "full",
+        contextDisclosure: "repeat",
+      }),
+    );
+    expect(t[0].wake).toEqual(wake);
+    expect(t[0].tacticalContext).toEqual(tactical);
+    expect(t[0].tacticalTier).toBe("full");
+    expect(t[0].contextDisclosure).toBe("repeat");
+
+    // 后续 phase 归约不得把它们丢掉（thinking/analysis 累积期整轮都要留着）
+    t = applyAiTradeTracePhase(t, ev("analysis", 1, { delta: "研判" }));
+    expect(t[0].tacticalContext).toEqual(tactical);
+    expect(t[0].wake?.kind).toBe("price_breakout");
+  });
+
+  it("老后端不发这四键时恒为 null（前端整段回退旧文案，不炸）", () => {
+    const t = applyAiTradeTracePhase([], ev("round_start", 1));
+    expect(t[0].wake).toBeNull();
+    expect(t[0].tacticalContext).toBeNull();
+    expect(t[0].tacticalTier).toBeNull();
+    expect(t[0].contextDisclosure).toBeNull();
+  });
+
   it("环形容量：超过 20 轮裁最旧", () => {
     let t: AiTradeRoundTrace[] = [];
     for (let r = 1; r <= 25; r++) t = applyAiTradeTracePhase(t, ev("round_start", r));

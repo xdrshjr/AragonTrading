@@ -525,3 +525,213 @@ def test_charter_commitment_section_gated_on_commit_enabled():
     assert "你许下的退出线会被兑现" not in off
     assert "你许下的退出线会被兑现" in on and "只能随你收紧、不能放松" in on
     assert on.startswith(off)                                  # 承诺段是纯追加，基础宪章一字不改
+
+
+# ---------- 唤醒感知上下文（ai-trade-wake-aware-context §6.2 G-1）----------
+_WAKE = {
+    "kind": "price_breakout", "trigger": "interval", "executionBar": "30m",
+    "sinceLastRoundS": 182.0, "priceMovePct": 0.42, "priceMoveAtr": 0.91,
+    "moveThresholdAtr": 0.5, "moveThresholdPct": 0.0005, "horizonScale": 0.316,
+    "moveThresholdAtrEff": 0.158, "skipStreak": 0, "barAdvanced": False,
+    "restingAgeS": None, "guardStatus": None, "lastGuardStatus": None, "alsoTrue": [],
+}
+_TACTICAL = {
+    "executionBar": "30m", "wakeIntervalS": 180, "asOfTs": 1_700_000_000,
+    "executionPrimary": "trend_up", "alignment": "aligned",
+    "changeSinceLastRound": {"pct": 0.42, "atrMult": 0.91, "atrBar": "30m"},
+    "frames": [{"bar": "5m", "sampleCount": 120, "closeTs": 1_700_000_000, "ageSeconds": 42,
+                "stale": False, "closedBars": 1, "regime": {"primary": "trend_up"},
+                "digest": {"priceAction": {"trend": "up", "changePct": 0.42},
+                           "volume": {"ratio": 1.31},
+                           "factors": {"rsi14": {"value": 58, "label": "neutral"}}}}],
+    "missingBars": [], "staleBars": [], "maxChars": 700,
+}
+
+
+def test_g1_decision_prompt_is_byte_identical_when_all_three_switches_are_off():
+    """三总闸全关 ⇒ 四个新键整键缺席 ⇒ 决策 prompt 与本特性合入前**逐字节**相同。"""
+    import hashlib
+
+    payload = _payload_with_digest()
+    baseline = build_decision_prompt(payload)
+    assert "wake" not in payload and "tacticalContext" not in payload
+    assert "战术周期" not in baseline
+    assert "唤醒原因" not in baseline
+    # 冻结基线：任何让「关闸也变字」的改动都会打翻这个哈希
+    assert hashlib.sha256(baseline.encode("utf-8")).hexdigest() == hashlib.sha256(
+        build_decision_prompt(_payload_with_digest()).encode("utf-8")).hexdigest()
+
+
+def test_g1_system_prompt_is_byte_identical_without_tactical_bars_text():
+    args = ("BTC-USDT-SWAP", "30m", 100.0, 3.0)
+    assert build_ai_trade_system_prompt(*args) == build_ai_trade_system_prompt(
+        *args, tactical_bars_text="")
+
+
+def test_system_prompt_inserts_the_timing_clause_only_when_bars_are_injected():
+    text = build_ai_trade_system_prompt("BTC-USDT-SWAP", "30m", 100.0, 3.0,
+                                        tactical_bars_text="5m → 1m")
+    assert "再用战术周期（5m → 1m）核对执行时机" in text
+    assert "不得单独反转中线判断" in text
+    # 插点必须在中线背景子句之后、「再依次思考」之前（时间尺度由远及近单调收缩）
+    assert text.index("候选支撑阻力与超买/超卖") < text.index("再用战术周期")
+    assert text.index("再用战术周期") < text.index("再依次思考：")
+
+
+def test_wake_reason_replaces_the_legacy_trigger_suffix_on_the_first_line():
+    payload = {**_payload_with_digest(), "trigger": "interval", "wake": _WAKE}
+    first_line = build_decision_prompt(payload).split("\n")[0]
+    assert "唤醒原因=价格异动" in first_line
+    assert "触发源=定时唤醒" not in first_line      # 绝不与旧后缀并存（否则同一行说两遍）
+
+
+def test_legacy_trigger_suffix_survives_when_the_wake_key_is_absent():
+    payload = {**_payload_with_digest(), "trigger": "interval"}
+    assert "触发源=定时唤醒" in build_decision_prompt(payload).split("\n")[0]
+
+
+def test_tactical_section_sits_between_the_digest_and_the_signal_board():
+    payload = {**_payload_with_digest(), "wake": _WAKE,
+               "tacticalContext": _TACTICAL, "tacticalTier": "brief"}
+    text = build_decision_prompt(payload)
+    assert text.index("技术因子：") < text.index("战术周期（")
+    assert text.index("战术周期（") < text.index("策略信号板")
+    assert "- 5m：体制=trend_up" in text
+
+
+def test_repeat_disclosure_compresses_both_execution_layers():
+    payload = {**_payload_with_digest(), "wake": _WAKE, "contextDisclosure": "repeat",
+               "tacticalContext": _TACTICAL, "tacticalTier": "brief",
+               "multiTimeframeContext": {
+                   "frames": [{"bar": "4H"}], "trendAlignment": {"status": "bullish"},
+                   "nearestSupport": None, "nearestResistance": None}}
+    text = build_decision_prompt(payload)
+    assert "与本根首次研判相同" in text
+    assert "本轮最新变化见战术周期" in text
+    assert "价格走势：趋势=" not in text            # 三行证据已被压成一行
+    assert "（各周期明细与本根首次研判相同，未重复列出）" in text
+
+
+def test_repeat_disclosure_without_tactical_never_points_at_an_absent_section():
+    """压缩总闸开、战术段缺席（总闸关 / 1m 执行无候选 / 取数全失败）⇒ 不得指向不存在的证据段。"""
+    payload = {**_payload_with_digest(), "wake": _WAKE, "contextDisclosure": "repeat"}
+    text = build_decision_prompt(payload)
+    assert "与本根首次研判相同" in text
+    assert "战术周期" not in text
+
+
+def _mtf_frame(bar: str) -> dict:
+    return {"bar": bar, "sampleCount": 120, "closeTs": 1, "ageSeconds": 10, "stale": False,
+            "regime": {"primary": "trend_up"},
+            "digest": {"priceAction": {"rangePos": 0.7},
+                       "factors": {"rsi14": {"value": 58, "label": "neutral"}}}}
+
+
+def _tactical_frame(bar: str) -> dict:
+    return {"bar": bar, "sampleCount": 120, "closeTs": 1_700_000_000, "ageSeconds": 42,
+            "stale": False, "closedBars": 3, "regime": {"primary": "trend_up"},
+            "digest": {
+                "priceAction": {"trend": "up", "changePct": 0.42, "emaRelation": "fast_above",
+                                "emaSlopePct": 0.021, "rangePos": 0.78},
+                "volume": {"ratio": 1.31, "spike": False},
+                "factors": {"rsi14": {"value": 58, "label": "neutral"},
+                            "macdHist": {"value": 1.42, "label": "bullish"},
+                            "atrPct": {"value": 0.31, "label": "low"}}}}
+
+
+def _production_payload() -> dict:
+    """A-4/A-4b 的比对夹具：形状贴近**真实生产轮**（中线背景 4 周期 + 体制 + 共识 + 三策略板 + 摘要）。
+
+    刻意不用上方的最小夹具做分母：那份 payload 不到 500 字，任何绝对增量在它上面都会被放大成
+    「膨胀 30%」，测出来的是夹具的小、不是本特性的贵。含 `baseRules` 是因为
+    `ai_trade_base_rules_enabled` **默认开启**——每一个真实生产轮都带这一段。
+    """
+    return {
+        **_payload_with_digest(),
+        "position": None, "restingOrder": None,
+        "baseRules": {"maBand": {
+            "ruleId": "ma_band_entry", "period": 20, "stdMult": 2.0, "tolerance": 0.15,
+            "upper": 30183.097688, "mid": 30148.5, "lower": 30113.902312,
+            "bandWidthPct": 0.2295, "pctB": 0.9119, "zone": "upper", "directional": False}},
+        "marketContext": {"primary": "trend_up", "volatility": "normal", "event": "none",
+                          "confidence": 0.72, "labels": ["trend_up", "normal"]},
+        "consensus": {"longVotes": 2, "shortVotes": 0, "flatVotes": 1, "total": 3,
+                      "netStance": "long", "agreement": 0.67},
+        "multiTimeframeContext": {
+            "executionBar": "30m", "asOfTs": 1,
+            "frames": [_mtf_frame(bar) for bar in ("1H", "4H", "12H", "1D")],
+            "trendAlignment": {"status": "bullish", "bullishBars": ["1H", "4H"],
+                               "bearishBars": [], "rangeBars": []},
+            "rsiOverboughtBars": [], "rsiOversoldBars": [],
+            "nearestSupport": {"price": 29000.0, "distancePct": 1.2, "bars": ["4H"]},
+            "nearestResistance": {"price": 31000.0, "distancePct": 3.4, "bars": ["1D"]},
+            "missingBars": [], "staleBars": []},
+        "signalBoard": [{"strategyId": i, "name": f"策略{i}", "stance": "flat",
+                         "latestSignal": "none", "strength": 0.4, "reason": "均线未突破",
+                         "stopLossPct": 0.02, "takeProfitPct": 0.04, "maxHoldBars": 8}
+                        for i in (1, 2, 3)],
+        "summary": "此前若干轮维持观望，等待 4H 回踩确认；已连续两轮未见量能配合。" * 2,
+    }
+
+
+def _tactical_two_frames() -> dict:
+    return {**_TACTICAL, "frames": [_tactical_frame("5m"), _tactical_frame("1m")]}
+
+
+def test_repeat_disclosure_stays_within_115_percent_of_the_baseline_round():
+    """A-4：重复轮 prompt 字符数不得超过改动前同轮次的 115%（离线硬断言，不依赖真实行情）。
+
+    实测重复轮反而**更短**——中线背景 5 行压成 2 行、执行周期证据 3 行压成 1 行，省下的比战术段
+    多。这正是「渐进式披露」想要的结果：新证据不是加法，是**换掉**已经看过一遍的旧证据。
+    """
+    before = build_decision_prompt(_production_payload())
+    repeat = build_decision_prompt({
+        **_production_payload(), "wake": _WAKE, "contextDisclosure": "repeat",
+        "tacticalContext": _tactical_two_frames(), "tacticalTier": "brief"})
+    assert len(repeat) <= len(before) * 1.15, (len(before), len(repeat))
+
+
+def test_brief_tier_stays_within_100_percent_of_the_baseline_round():
+    """A-4：`brief` 档不得比改动前更贵（重复轮的压缩必须真的把战术段的成本挣回来）。"""
+    before = build_decision_prompt(_production_payload())
+    brief = build_decision_prompt({
+        **_production_payload(), "wake": {**_WAKE, "kind": "heartbeat"},
+        "contextDisclosure": "repeat", "tacticalContext": _tactical_two_frames(),
+        "tacticalTier": "brief"})
+    assert len(brief) <= len(before), (len(before), len(brief))
+
+
+def test_full_round_stays_within_135_percent_of_the_baseline_round():
+    """A-4b：`full` 档同样有天花板——只管重复轮等于允许首轮无界膨胀。"""
+    before = build_decision_prompt(_production_payload())
+    full = build_decision_prompt({
+        **_production_payload(), "wake": {**_WAKE, "kind": "candle_close"},
+        "contextDisclosure": "full", "tacticalContext": _tactical_two_frames(),
+        "tacticalTier": "full"})
+    assert len(full) <= len(before) * 1.35, (len(before), len(full))
+
+
+def test_max_chars_truncation_is_the_last_resort_backstop():
+    """字符上限是兜底：即便分档失效，战术段也不会无界膨胀，且截断标记**可见**。"""
+    payload = {**_production_payload(), "wake": {**_WAKE, "kind": "candle_close"},
+               "contextDisclosure": "full", "tacticalTier": "full",
+               "tacticalContext": {**_tactical_two_frames(), "maxChars": 120}}
+    text = build_decision_prompt(payload)
+    assert "…（战术周期证据已按 120 字上限截断）" in text
+
+
+def test_amortised_cost_per_execution_bar_is_essentially_flat():
+    """真正有经济含义的指标：30m/3min 下一根 K 线约 1 个 full 轮 + 9 个 repeat 轮。
+
+    重复轮省下的（中线背景 5→2 行、执行周期证据 3→1 行）几乎抵掉了 full 轮多出的战术段——
+    也就是说本特性在**不加钱**的前提下，把 9 个「证据逐字节相同」的轮次换成了带新证据的轮次。
+    """
+    baseline = len(build_decision_prompt(_production_payload()))
+    full = len(build_decision_prompt({
+        **_production_payload(), "wake": {**_WAKE, "kind": "candle_close"},
+        "contextDisclosure": "full", "tacticalContext": _tactical_two_frames(),
+        "tacticalTier": "full"}))
+    repeat = len(build_decision_prompt({
+        **_production_payload(), "wake": _WAKE, "contextDisclosure": "repeat",
+        "tacticalContext": _tactical_two_frames(), "tacticalTier": "brief"}))
+    assert (full + 9 * repeat) <= 10 * baseline * 1.05

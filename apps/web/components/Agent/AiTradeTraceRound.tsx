@@ -25,11 +25,18 @@ import {
   describeSizing,
   describeStance,
   isEffectiveExitCommitted,
+  describeTacticalAlignment,
+  describeTacticalFrame,
   describeTraceState,
   describeTrigger,
   describeVolume,
+  describeWakeReason,
 } from "@/lib/aiTrade";
-import type { AiTradeRoundTrace, MultiTimeframeContext } from "@/lib/aiTradeTypes";
+import type {
+  AiTradeRoundTrace,
+  MultiTimeframeContext,
+  TacticalContext,
+} from "@/lib/aiTradeTypes";
 import { fmtNum, fmtPrice, fmtTime } from "@/lib/format";
 import { renderMarkdown } from "@/lib/markdown";
 
@@ -507,7 +514,36 @@ function MultiTimeframeEvidence({ context }: { context: MultiTimeframeContext })
   );
 }
 
-/** 输入信号板 / 中线背景 / 体制 / 共识 / 市场证据摘要。 */
+/**
+ * 战术周期证据（wake-aware-context §3.3）：与中线背景块视觉同构（同字号、同行距、同色阶），
+ * 只是时间尺度相反——中线由大到小讲背景，战术由粗到细讲「现在是不是好的进场点」。
+ * 缺失 / 陈旧周期如实标注，绝不假数据。
+ */
+function TacticalEvidence({ context }: { context: TacticalContext }) {
+  const change = context.changeSinceLastRound;
+  return (
+    <div className="flex flex-col gap-0.5">
+      <div className="font-medium text-[var(--text)]">
+        战术周期 · {describeTacticalAlignment(context.alignment)}
+      </div>
+      {change?.pct != null && (
+        <div>
+          自上一决策轮：价 {change.pct > 0 ? "+" : ""}
+          {change.pct.toFixed(2)}%
+          {change.atrMult == null ? "" : `（≈${change.atrMult.toFixed(2)}×${change.atrBar} ATR）`}
+        </div>
+      )}
+      {context.frames.map((frame) => (
+        <div key={frame.bar} data-testid="tactical-frame">
+          {describeTacticalFrame(frame)}
+        </div>
+      ))}
+      {context.missingBars.length ? <div>缺失周期：{context.missingBars.join("、")}</div> : null}
+    </div>
+  );
+}
+
+/** 输入信号板 / 中线背景 / 战术周期 / 体制 / 共识 / 市场证据摘要。 */
 function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
   const regime = describeRegime(trace.marketContext);
   const consensus = describeConsensus(trace.consensus ?? null);
@@ -516,8 +552,22 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
   const volume = describeVolume(digest?.volume);
   const factors = describeFactors(digest?.factors);
   const multiTimeframe = trace.multiTimeframeContext ?? null;
+  const tactical = trace.tacticalContext ?? null;
+  const wakeReason = describeWakeReason(trace.wake);
   const board = trace.signalBoard ?? [];
-  if (!board.length && !regime && !consensus && !price && !volume && !factors && !multiTimeframe) {
+  // 早退门控**必须**含 tactical 与 wake：漏了它们，只有战术数据 / 只有唤醒断面的轮次会让整段
+  // 「输入信号板」消失（跑不出错、永远空白）——新增边缘态字段必须验证渲染门控没把该态排除掉。
+  if (
+    !board.length &&
+    !regime &&
+    !consensus &&
+    !price &&
+    !volume &&
+    !factors &&
+    !multiTimeframe &&
+    !tactical &&
+    !wakeReason
+  ) {
     return null;
   }
   return (
@@ -526,7 +576,11 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
         输入信号板{board.length ? `（${board.length}）` : ""}
       </summary>
       <div className="mt-1 flex flex-col gap-1">
+        {/* 唤醒原因的判据明细：阈值是多少、实际走了多少，一律如实展示。轮头 chip 只给标签，
+            具体数值放在展开区——静默的门禁在本仓库有前科，用户必须能回答「为什么叫 / 为什么没叫」。 */}
+        {wakeReason ? <div data-testid="wake-reason">{wakeReason}</div> : null}
         {multiTimeframe ? <MultiTimeframeEvidence context={multiTimeframe} /> : null}
+        {tactical ? <TacticalEvidence context={tactical} /> : null}
         {(regime || consensus) && (
           <div className="flex flex-wrap gap-x-2 gap-y-0.5">
             {regime && <span>{regime}</span>}

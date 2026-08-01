@@ -1,0 +1,134 @@
+"""唤醒原因判定单测（ai-trade-wake-aware-context §6.1 T-4/T-5/T-6/T-22）。
+
+覆盖：七种 kind 的优先级表、`alsoTrue` 不丢证据、ATR / pct 双判据、价不可信 fail-open、
+**`horizon_scale` 校准（T-22，P0-2）**。纯函数，无 IO。
+"""
+from __future__ import annotations
+
+import pytest
+
+from app.ai_auto.wake_reason import WAKE_KINDS, WakeFacts, classify_wake, horizon_scale, moved
+
+_THRESHOLDS = {"move_atr_mult": 0.5, "move_pct": 0.0005}
+
+
+def _classify(facts: WakeFacts, *, horizon: float = 1.0) -> dict:
+    return classify_wake(facts, horizon_scale=horizon, **_THRESHOLDS)
+
+
+def _steady(**overrides) -> WakeFacts:
+    """一个「什么都没发生」的定时唤醒基线：空仓、无挂单、同一根、价格纹丝不动。"""
+    base = {"trigger": "interval", "position_side": "flat", "has_resting": False,
+            "bar_index": 7, "last_round_bar_index": 7, "px": 30000.0,
+            "last_round_px": 30000.0, "atr_px": 100.0, "since_last_round_s": 182.0}
+    return WakeFacts(**{**base, **overrides})
+
+
+# ---------- T-4：七态优先级 ----------
+@pytest.mark.parametrize(("overrides", "expected"), [
+    ({"trigger": "candle"}, "candle_close"),
+    ({"bar_index": 9}, "bar_advanced"),
+    ({"has_resting": True, "resting_age_s": 240.0}, "resting_order"),
+    ({"position_side": "long", "guard_status": "armed", "last_round_guard_status": "idle"},
+     "profit_tier"),
+    ({"px": 30060.0}, "price_breakout"),                       # |Δ|=60 >= 0.5×100
+    ({"position_side": "long", "guard_status": "idle", "last_round_guard_status": "idle"},
+     "position_watch"),
+    ({}, "heartbeat"),
+])
+def test_classify_wake_priority_table(overrides, expected):
+    assert _classify(_steady(**overrides))["kind"] == expected
+
+
+def test_every_declared_kind_is_reachable():
+    assert set(WAKE_KINDS) == {
+        "candle_close", "bar_advanced", "resting_order", "profit_tier",
+        "price_breakout", "position_watch", "heartbeat"}
+
+
+def test_lower_priority_conditions_are_kept_in_also_true_never_dropped():
+    """判定只决定标签，绝不丢证据：挂单 + 越阈同时成立 ⇒ kind=resting_order 且 alsoTrue 保留越阈。"""
+    wake = _classify(_steady(has_resting=True, resting_age_s=240.0, px=30060.0))
+    assert wake["kind"] == "resting_order"
+    assert wake["alsoTrue"] == ["price_breakout"]
+    assert wake["restingAgeS"] == 240.0
+
+
+def test_heartbeat_is_never_listed_as_also_true():
+    wake = _classify(_steady())
+    assert wake["kind"] == "heartbeat"
+    assert wake["alsoTrue"] == []
+
+
+def test_first_round_without_a_previous_bar_index_is_honestly_bar_advanced():
+    """首轮确实是「这根 K 线的首次研判」，文案成立（R-8：有意为之，不是误判）。"""
+    wake = _classify(_steady(last_round_bar_index=None, last_round_px=None))
+    assert wake["kind"] == "bar_advanced"
+    assert wake["barAdvanced"] is True
+
+
+def test_profit_tier_needs_a_real_transition_into_an_armed_status():
+    """已 armed 且**未跨档**的持仓轮退回 position_watch——否则每轮都会被误报成「浮盈跨档」。"""
+    same = _steady(position_side="long", guard_status="armed", last_round_guard_status="armed")
+    assert _classify(same)["kind"] == "position_watch"
+    # 保护层未装配 ⇒ guard_status 恒 None ⇒ 该分支恒假，自然退化（R-7）
+    unarmed = _steady(position_side="long", guard_status=None, last_round_guard_status=None)
+    assert _classify(unarmed)["kind"] == "position_watch"
+
+
+# ---------- T-5 / T-6：判据 ----------
+def test_atr_criterion_beats_and_misses_around_the_threshold():
+    facts_over = _steady(px=30060.0)      # |Δ|=60 >= 0.5 × 100
+    facts_under = _steady(px=30040.0)     # |Δ|=40 <  0.5 × 100
+    assert moved(facts_over, horizon_scale=1.0, **_THRESHOLDS)[0] is True
+    assert moved(facts_under, horizon_scale=1.0, **_THRESHOLDS)[0] is False
+
+
+def test_missing_atr_falls_back_verbatim_to_the_existing_pct_criterion():
+    no_atr = _steady(atr_px=None, px=30040.0)
+    is_moved, pct, atr_mult = moved(no_atr, horizon_scale=1.0, **_THRESHOLDS)
+    assert atr_mult is None
+    assert pct == pytest.approx((30040.0 / 30000.0 - 1) * 100, abs=1e-6)
+    assert is_moved is (abs(30040.0 / 30000.0 - 1.0) >= 0.0005)     # 与既有守卫同式
+    assert is_moved is True
+
+
+@pytest.mark.parametrize("bad", [None, 0.0, -1.0])
+def test_untrustworthy_price_fails_open_and_always_wakes(bad):
+    """价拿不准时宁可唤醒（与 F4c 现行极性逐字一致）——绝不因为读不到价就静默跳过。"""
+    assert moved(_steady(px=bad), horizon_scale=1.0, **_THRESHOLDS) == (True, None, None)
+    assert moved(_steady(last_round_px=bad), horizon_scale=1.0, **_THRESHOLDS) == (True, None, None)
+
+
+def test_reported_atr_multiple_is_the_raw_physical_quantity_not_the_scaled_one():
+    """返回的第三元是给人和模型看的物理量；折算只发生在判据侧，两者都随 wire 下发。"""
+    wake = _classify(_steady(px=30060.0), horizon=0.316)
+    assert wake["priceMoveAtr"] == pytest.approx(0.6)                # 60/100，**未**折算
+    assert wake["horizonScale"] == pytest.approx(0.316)
+    assert wake["moveThresholdAtr"] == 0.5                           # 配置值
+    assert wake["moveThresholdAtrEff"] == pytest.approx(0.158)       # 实际门槛
+    assert wake["kind"] == "price_breakout"
+
+
+# ---------- T-22（P0-2）：horizon_scale 校准 ----------
+def test_horizon_scale_calibration_table():
+    assert horizon_scale(180, 1800) == pytest.approx(0.3162, abs=1e-4)     # 30m / 3min
+    assert horizon_scale(120, 86400) == pytest.approx(0.0373, abs=1e-4)    # 1D / 2min
+    assert horizon_scale(3600, 1800) == 1.0                                # 只缩不放
+    assert horizon_scale(1800, 1800) == 1.0
+    assert horizon_scale(0, 1800) == 1.0                                   # 退化为原始 ATR 判据
+    assert horizon_scale(180, 0) == 1.0
+
+
+def test_daily_execution_bar_no_longer_skips_every_interval_wake_forever():
+    """1D 执行 + 2 分钟唤醒下 0.06% 的位移必须被判为越阈。
+
+    不折算时门槛是 `0.5 × 3%ATR = 1.5%`——两分钟内**不可能**发生 ⇒ 空仓定时唤醒被永久跳过，
+    而定时轮恰恰是战术周期证据服务的对象，两轴互相取消。
+    """
+    px, atr_px = 100_000.0, 3_000.0                    # ATR ≈ 3%（1D 典型）
+    facts = WakeFacts(trigger="interval", position_side="flat", bar_index=1,
+                      last_round_bar_index=1, px=px * 1.0006, last_round_px=px, atr_px=atr_px)
+    scale = horizon_scale(120, 86400)
+    assert moved(facts, horizon_scale=scale, **_THRESHOLDS)[0] is True
+    assert moved(facts, horizon_scale=1.0, **_THRESHOLDS)[0] is False      # 原写法：永久跳过

@@ -26,6 +26,11 @@ from app.okx.accounts import AccountCredentials
 from app.paper.strategy_factory import PaperStrategySpec
 from app.strategies.base import BaseStrategy, StrategyMeta
 
+# wake-aware-context §2.7：`_build_decision_payload` 的第 5 形参由 `trigger: str` 换成结构化
+# `wake: dict`（`wake["trigger"]` 承载原值，wire 逐字不变）。本常量只是把既有调用点的 "candle"
+# 平移过来，**断言一字未改**。
+_CANDLE_WAKE = {"trigger": "candle", "kind": "candle_close"}
+
 _START_TS = 1_785_000_000
 _STEP = 3600
 _PX = 30_000.0
@@ -127,7 +132,7 @@ def _make_session(*, settings=None, prior_snapshot=None, bars: int = 3) -> AiTra
 
 
 def _payload(session: AiTradeSession) -> dict:
-    return session._build_decision_payload(1, _START_TS, _PX, _board(), "candle")
+    return session._build_decision_payload(1, _START_TS, _PX, _board(), _CANDLE_WAKE)
 
 
 # ============================ T-15：零回归（三总闸默认全关）============================

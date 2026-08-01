@@ -41,6 +41,11 @@ from app.okx.types import Candle
 from app.paper.strategy_factory import PaperStrategySpec
 from app.strategies.base import BaseStrategy, StrategyMeta
 
+# wake-aware-context §2.7：`_build_decision_payload` 的第 5 形参由 `trigger: str` 换成结构化
+# `wake: dict`（`wake["trigger"]` 承载原值，wire 逐字不变）。本常量只是把既有调用点的 "candle"
+# 平移过来，**断言一字未改**。
+_CANDLE_WAKE = {"trigger": "candle", "kind": "candle_close"}
+
 _START_TS = 1_700_000_000
 _STEP = 3600
 _PX = 30_000.0
@@ -169,7 +174,7 @@ async def test_all_switches_off_is_byte_identical(monkeypatch):
         events = _drain(q)
         assert _traces(events, "sizing") == []            # trace 零事件
         assert session.executor.risk is risk_before       # `executor.risk` **对象** is 相等
-        payload = session._build_decision_payload(1, _START_TS, _PX, [], "candle")
+        payload = session._build_decision_payload(1, _START_TS, _PX, [], _CANDLE_WAKE)
         assert "sizingPlan" not in payload                # payload 整键缺席 ⇒ prompt 逐字节回退
         assert session._sizing.armed is False
     finally:

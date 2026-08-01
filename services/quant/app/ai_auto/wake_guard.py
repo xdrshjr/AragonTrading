@@ -37,3 +37,33 @@ def should_skip_interval_wake(*, position_side: str, has_resting: bool,
     if px is None or last_round_px is None or px <= 0 or last_round_px <= 0:
         return False
     return abs(px / last_round_px - 1.0) < threshold
+
+
+def should_skip_wake(wake: dict, *, threshold_pct: float, threshold_atr_mult: float,
+                     max_skip_streak: int = 0) -> bool:
+    """结构化唤醒对象版守卫（ai-trade-wake-aware-context §2.5）；上方既有函数语义一字不改。
+
+    判据**不在本函数里重算**——`kind == "heartbeat"` 本身就是「空仓 + 无挂单 + 无新根 + 未越阈」的
+    合取，`wake_reason.classify_wake` 已经算过一次。两处各算一次正是「prompt 说数据没变、守卫却认为
+    变了」这类信任崩塌的经典成因。
+
+    Args:
+        wake: `classify_wake` 产物（读 `kind` 与 `skipStreak` 两个键）。
+        threshold_pct: pct 回退判据（fraction）；与下一项同时 <=0 即**关守卫**（恒不跳过）。
+        threshold_atr_mult: ATR 判据倍数（未折算的配置值）。
+        max_skip_streak: 连续跳过上限，到即强制放行一轮（饿死兜底）；0 = 不封顶。
+
+    Returns:
+        True 当且仅当：守卫开启、`kind == "heartbeat"`、且连续跳过数未触到上限。
+
+    注（饿死兜底）：ATR 判据把跳过率显著推高后，需要一条**上界**保证模型在长时间静止行情里不被完全
+    饿死——否则「AI 自动交易」会在盘整期变成事实上的停机，而用户看不到任何原因。放行轮的 `kind` 仍
+    如实是 `heartbeat`（条件化措辞正是为这种轮次写的），不需要新 kind。
+    """
+    if threshold_pct <= 0 and threshold_atr_mult <= 0:
+        return False
+    if wake.get("kind") != "heartbeat":
+        return False
+    if max_skip_streak > 0 and int(wake.get("skipStreak") or 0) >= max_skip_streak:
+        return False
+    return True

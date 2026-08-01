@@ -29,7 +29,10 @@ import {
   describeMultiTimeframeFrame,
   describeStance,
   describeStopReason,
+  describeTacticalAlignment,
+  describeTacticalFrame,
   describeTrigger,
+  describeWakeReason,
   describeVolume,
   marginReturnFromPricePct,
   positionLadder,
@@ -47,6 +50,7 @@ import type {
   MultiTimeframeFrame,
   PriceAction,
   StrategySignalView,
+  WakeKind,
   VolumeContext,
 } from "./aiTradeTypes";
 
@@ -856,5 +860,123 @@ describe("isEffectiveExitCommitted", () => {
 describe("describeProfitGuardReason: 承诺退出线码", () => {
   it("profit_guard_committed_exit → 承诺退出线", () => {
     expect(describeProfitGuardReason("profit_guard_committed_exit")).toBe("承诺退出线");
+  });
+});
+
+
+// ---------- 唤醒感知上下文（ai-trade-wake-aware-context §6.2 G-8 / §3.3）----------
+describe("describeTrigger 三级优先：信号板边沿 > wake.kind > trigger", () => {
+  it("无边沿时把单调的两个兜底文案细化成七态", () => {
+    const cases: Array<[WakeKind, string]> = [
+      ["candle_close", "K 线收盘 · 信号板已重算"],
+      ["bar_advanced", "补看新 K 线 · 首次研判"],
+      ["resting_order", "挂单盯守 · 未成交委托"],
+      ["profit_tier", "浮盈跨档 · 保护线已激活"],
+      ["price_breakout", "价格异动 · 越过唤醒阈值"],
+      ["position_watch", "持仓盯市 · 常规复盘"],
+      ["heartbeat", "心跳复盘 · 数据未见异动"],
+    ];
+    for (const [kind, label] of cases) {
+      expect(
+        describeTrigger({ signalBoard: [], trigger: "interval", wake: { kind, trigger: "interval" } }).label,
+      ).toBe(label);
+    }
+  });
+
+  it("wake 绝不抢先：有边沿信号时仍按信号板派生（信息量更高的那个赢）", () => {
+    const view = describeTrigger({
+      signalBoard: [signal({ name: "均线突破", latestSignal: "open_long" })],
+      trigger: "interval",
+      wake: { kind: "price_breakout", trigger: "interval" },
+    });
+    expect(view).toEqual({ label: "开多信号 · 均线突破", tone: "long" });
+  });
+
+  it("wake 缺席时逐字回退到既有二值兜底", () => {
+    expect(describeTrigger({ signalBoard: [], trigger: "interval" }).label).toBe("周期唤醒 · 常规复盘");
+    expect(describeTrigger({ signalBoard: [] }).label).toBe("K 线收盘 · 常规复盘");
+  });
+
+  it("只有真正值得注意的四态用 accent（满屏 accent 等于没有 accent）", () => {
+    const tone = (kind: WakeKind) =>
+      describeTrigger({ signalBoard: [], wake: { kind, trigger: "interval" } }).tone;
+    expect([tone("bar_advanced"), tone("price_breakout"), tone("profit_tier"), tone("resting_order")]).toEqual(
+      ["accent", "accent", "accent", "accent"],
+    );
+    expect([tone("candle_close"), tone("position_watch"), tone("heartbeat")]).toEqual([
+      "muted",
+      "muted",
+      "muted",
+    ]);
+  });
+});
+
+describe("describeTacticalFrame / describeTacticalAlignment / describeWakeReason", () => {
+  const frame = {
+    bar: "1m",
+    sampleCount: 120,
+    closeTs: 1,
+    ageSeconds: 42,
+    stale: false,
+    closedBars: 3,
+    regime: { primary: "range", volatility: "normal", event: "none", confidence: 0.6, labels: [] },
+    digest: {
+      priceAction: null,
+      volume: null,
+      factors: {
+        rsi14: { value: 49, label: "neutral" },
+        macdHist: { value: 0, label: "flat" },
+        bollPctB: { value: 0.5, label: "mid" },
+        atrPct: { value: 0.3, label: "low" },
+        rocPct: { value: 0, label: "flat" },
+      },
+    },
+  };
+
+  it("把「自上轮收 N 根」放在中线背景放区间位的位置（战术层真正逐轮变化的量）", () => {
+    const text = describeTacticalFrame(frame);
+    expect(text).toContain("1m");
+    expect(text).toContain("自上轮收 3 根");
+    expect(text).toContain("120 根");
+    expect(text).not.toContain("数据陈旧");
+    expect(describeTacticalFrame({ ...frame, stale: true })).toContain("数据陈旧");
+  });
+
+  it("首轮无参照时不渲染「自上轮收」（绝不显示 null 根）", () => {
+    expect(describeTacticalFrame({ ...frame, closedBars: null })).not.toContain("自上轮收");
+  });
+
+  it("体制关系中文化；未知枚举原样回显", () => {
+    expect(describeTacticalAlignment("aligned")).toBe("与执行周期同向");
+    expect(describeTacticalAlignment("diverged")).toBe("与执行周期背离");
+    expect(describeTacticalAlignment("insufficient")).toBe("体制证据不足");
+    expect(describeTacticalAlignment("unknown_enum")).toBe("unknown_enum");
+  });
+
+  it("唤醒原因说明取**折算后**的实际门槛，且 ATR 倍数必带周期名", () => {
+    const text = describeWakeReason({
+      kind: "price_breakout",
+      trigger: "interval",
+      executionBar: "30m",
+      sinceLastRoundS: 182,
+      priceMovePct: 0.42,
+      priceMoveAtr: 0.91,
+      moveThresholdAtr: 0.5,
+      horizonScale: 0.316,
+      moveThresholdAtrEff: 0.158,
+    });
+    expect(text).toContain("价格异动");
+    expect(text).toContain("距上轮 182s");
+    expect(text).toContain("+0.42%");
+    expect(text).toContain("0.91×30m ATR");
+    expect(text).toContain("阈值 0.16×30m ATR");
+    expect(describeWakeReason(null)).toBe("");
+  });
+
+  it("无数值可讲时返回空串（轮头 chip 已给标签，再渲染一行同样的文字只是噪音）", () => {
+    expect(describeWakeReason({ kind: "heartbeat", trigger: "interval" })).toBe("");
+    expect(describeWakeReason({ kind: "resting_order", trigger: "interval", restingAgeS: 240 })).toBe(
+      "挂单盯守 · 未成交委托 · 挂单已 240s",
+    );
   });
 });
