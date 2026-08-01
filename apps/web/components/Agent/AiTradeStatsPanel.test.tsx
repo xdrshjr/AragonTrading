@@ -218,6 +218,31 @@ describe("AiTradeStatsPanel", () => {
     expect(within(dialog).getByText(/唤醒抑制 — · 连续观望 —/)).toBeInTheDocument();
   });
 
+  // wake-scheduler-closed-loop §4.3：四个调度计数必须有一个消费点，否则后端算了、类型也补了，
+  // 用户却永远看不到——轴 A/B/C 「减少的每一次都可解释」这条目标就落不了地。
+  it("renders the wake-scheduler counters with the drops caliber in a tooltip", () => {
+    const group = makeGroup();
+    group.members["BTC-USDT-SWAP"].session = sessionRow({
+      wakeSkips: 5, wakeDrops: 4, wakeCatchups: 3, positionWatchSkips: 22, signalFlipWakes: 2,
+    });
+    useAppStore.setState({ aiTradeGroup: group });
+    renderPanel();
+    const strip = within(screen.getByRole("dialog")).getByTestId("wake-scheduler-counts");
+    expect(strip).toHaveTextContent("补跑 3/4 · 持仓省 22 · 翻转唤 2");
+    expect(strip.getAttribute("title")).toMatch(/不等于「系统漏掉了这么多次决策」/);
+  });
+
+  it("hides the wake-scheduler counters entirely when every counter is zero", () => {
+    // 轴未生效的会话不该看到一排 0——那会被读成「统计坏了」（与老记录缺键即整行隐藏同款纪律）。
+    const group = makeGroup();
+    group.members["BTC-USDT-SWAP"].session = sessionRow({
+      wakeSkips: 5, wakeDrops: 0, wakeCatchups: 0, positionWatchSkips: 0, signalFlipWakes: 0,
+    });
+    useAppStore.setState({ aiTradeGroup: group });
+    renderPanel();
+    expect(within(screen.getByRole("dialog")).queryByTestId("wake-scheduler-counts")).toBeNull();
+  });
+
   it("shows the aggregated reflection observability row for new-style aiStats", async () => {
     listMock.mockResolvedValue(HISTORY_LIST);
     detailMock.mockResolvedValue(makeDetail({
@@ -304,6 +329,49 @@ describe("AiTradeStatsPanel", () => {
     expect(within(dialog).getByText("可信度 低")).toBeInTheDocument();
   });
 
+  // ---------- 唤醒调度闭环 轴 D：按唤醒来源胜率卡 ----------
+  it("hides the wake-attribution card entirely when no fill carries a wakeKind", () => {
+    // 老会话（唤醒原因上线前）不该看到一张全是「未记录来源」的表——那不是信息，是噪音。
+    useAppStore.setState({ aiTradeGroup: makeGroup() });
+    renderPanel();
+    expect(screen.queryByTestId("wake-attribution-card")).not.toBeInTheDocument();
+  });
+
+  it("renders the wake-attribution card on the live tab once entries carry a wakeKind", () => {
+    const group = makeGroup();
+    const member = group.members["BTC-USDT-SWAP"];
+    member.trades = wakeAttributedTrades();
+    useAppStore.setState({ aiTradeGroup: group });
+    renderPanel();
+    const card = screen.getByTestId("wake-attribution-card");
+    expect(card).toHaveTextContent("按唤醒来源");
+    expect(card).toHaveTextContent("K 线收盘 · 信号板已重算");
+    // 5 笔样本恰好达标 ⇒ 给真实胜率；口径脚注必须写清是按**开仓**归集
+    expect(card).toHaveTextContent("5 笔 · 胜率 80%");
+    expect(card).toHaveTextContent("开仓");
+  });
+
+  it("degrades the wake-attribution card to 样本不足 instead of faking a win rate", () => {
+    const group = makeGroup();
+    const member = group.members["BTC-USDT-SWAP"];
+    member.trades = wakeAttributedTrades().slice(0, 4);   // 2 笔完整往返 < 最小样本 5
+    useAppStore.setState({ aiTradeGroup: group });
+    renderPanel();
+    expect(screen.getByTestId("wake-attribution-card")).toHaveTextContent("样本不足（n=2）");
+  });
+
+  it("renders the same card on the history detail tab from a group-level ledger", async () => {
+    listMock.mockResolvedValue(HISTORY_LIST);
+    const detail = makeDetail({});
+    detail.members[0].trades = wakeAttributedTrades();
+    detailMock.mockResolvedValue(detail);
+    renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: "历史" }));
+    fireEvent.click(await screen.findByRole("button", { name: /BTC-USDT-SWAP/ }));
+    const card = await screen.findByTestId("wake-attribution-card");
+    expect(card).toHaveTextContent("K 线收盘 · 信号板已重算");
+  });
+
   it("expands a trade record into an inline K-line panel when a bar is supplied", async () => {
     candlesMock.mockResolvedValue({
       source: "live",
@@ -364,6 +432,25 @@ describe("AutoTradeRoundTripRow bar-gated inline K-line (zero regression)", () =
     expect(await screen.findByTestId("trade-candle-chart")).toBeInTheDocument();
   });
 });
+
+// 轴 D 夹具：5 笔完整往返，开仓腿全部带 `wakeKind=candle_close`（4 盈 1 亏 ⇒ 胜率 80%）。
+// 平仓腿刻意也带一个**不同**的 wakeKind，用来钉死「归因按开仓腿、绝不按平仓腿」。
+function wakeAttributedTrades(): Trade[] {
+  const entryExplain = {
+    schema: 1, kind: "atomic", side: "long", headline: "h", metrics: [],
+    meta: { wakeKind: "candle_close" },
+  } as Trade["explain"];
+  const exitExplain = {
+    schema: 1, kind: "reverse", side: "close", headline: "h", metrics: [],
+    meta: { wakeKind: "signal_flip" },
+  } as Trade["explain"];
+  return [10, 10, 10, 10, -6].flatMap((pnl, idx) => [
+    { ...trade({ id: idx * 2 + 1, ts: NOW_SEC - 900 + idx * 100, side: "long", price: 100 }),
+      explain: entryExplain },
+    { ...trade({ id: idx * 2 + 2, ts: NOW_SEC - 860 + idx * 100, side: "close", price: 110, pnl }),
+      explain: exitExplain },
+  ]);
+}
 
 function makeDetail(metrics: AiTradeHistoryDetailOut["members"][number]["metrics"]): AiTradeHistoryDetailOut {
   return {

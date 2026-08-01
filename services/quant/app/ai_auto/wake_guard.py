@@ -6,8 +6,16 @@
 无新确认根、且实时价相对上一决策轮变动小于阈值时跳过本次唤醒（省一次 LLM 调用 + 少一条重复
 hold 流水）。持仓/挂单轮永不跳过（盯市职责不受影响）；`threshold=0` 完全关闭守卫（逐字回退
 现行为）。镜像 `reflection.py` 的「小纯函数模块」先例——session.py 已越 800 行上限，不再喂逻辑。
+
+ai-trade-wake-scheduler-closed-loop 轴 B：跳过对象从「空仓心跳」扩到「持仓盯市」，但**只在确定性
+退出层证明在岗时**（利润保护快照处于 armed/breakeven_armed）。旋钮聚合为 `SkipPolicy`（守
+CLAUDE.md「形参 ≤5」，镜像 `WindowOptions` / `WakeReadings` 的既有范式）。
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
+
+from .profit_guard import ARMED_STATUSES
 
 
 def should_skip_interval_wake(*, position_side: str, has_resting: bool,
@@ -39,31 +47,55 @@ def should_skip_interval_wake(*, position_side: str, has_resting: bool,
     return abs(px / last_round_px - 1.0) < threshold
 
 
-def should_skip_wake(wake: dict, *, threshold_pct: float, threshold_atr_mult: float,
-                     max_skip_streak: int = 0) -> bool:
-    """结构化唤醒对象版守卫（ai-trade-wake-aware-context §2.5）；上方既有函数语义一字不改。
+@dataclass(frozen=True)
+class SkipPolicy:
+    """跳过守卫的全部旋钮（聚合结构体；镜像 `WindowOptions` / `WakeReadings` 的既有范式）。"""
 
-    判据**不在本函数里重算**——`kind == "heartbeat"` 本身就是「空仓 + 无挂单 + 无新根 + 未越阈」的
-    合取，`wake_reason.classify_wake` 已经算过一次。两处各算一次正是「prompt 说数据没变、守卫却认为
-    变了」这类信任崩塌的经典成因。
+    threshold_pct: float = 0.0
+    threshold_atr_mult: float = 0.0
+    max_skip_streak: int = 0                 # 空仓 heartbeat 的饿死上限（既有语义，0=不封顶）
+    position_watch_enabled: bool = False     # 轴 B 总闸
+    # 持仓轮的饿死上限。**刻意不复用「0=不封顶」这个既有极性**：持仓期无限期不研判是一个能亏真钱
+    # 的状态，配置层已把它约束为 `ge=1`；「不跳过」由上面的总闸表达，不需要第二条路。
+    position_watch_max_skip_streak: int = 3
+
+
+def should_skip_wake(wake: dict, policy: SkipPolicy) -> bool:
+    """结构化唤醒对象版守卫（ai-trade-wake-aware-context §2.5 + 本轮轴 B）；上方既有函数一字不改。
+
+    判据**不在本函数里重算**——`kind` 已经是判定结果。`kind == "heartbeat"` 本身就是「空仓 + 无挂单
+    + 无新根 + 未越阈」的合取，`wake_reason.classify_wake` 已经算过一次；两处各算一次正是「prompt 说
+    数据没变、守卫却认为变了」这类信任崩塌的经典成因。
+
+    两条可跳过的态：
+    - `heartbeat`：既有语义，一字不改。
+    - `position_watch`（轴 B 新增）：持仓 + 上述四条同样成立，**且**利润保护快照处于
+      `armed`/`breakeven_armed`。保护层 `idle`/`unavailable` 时 AI 是唯一退出路径，绝不跳过——
+      本层是 fail-open 的，`unavailable` 只表示「本层算不出保护线」，**不代表交易所侧有兜底**。
 
     Args:
-        wake: `classify_wake` 产物（读 `kind` 与 `skipStreak` 两个键）。
-        threshold_pct: pct 回退判据（fraction）；与下一项同时 <=0 即**关守卫**（恒不跳过）。
-        threshold_atr_mult: ATR 判据倍数（未折算的配置值）。
-        max_skip_streak: 连续跳过上限，到即强制放行一轮（饿死兜底）；0 = 不封顶。
+        wake: `classify_wake` 产物（读 `kind` / `skipStreak` / `guardStatus` 三个键）。
+        policy: 本次判定的全部旋钮（见 `SkipPolicy`）。
 
     Returns:
-        True 当且仅当：守卫开启、`kind == "heartbeat"`、且连续跳过数未触到上限。
+        True = 跳过本次唤醒。
 
     注（饿死兜底）：ATR 判据把跳过率显著推高后，需要一条**上界**保证模型在长时间静止行情里不被完全
     饿死——否则「AI 自动交易」会在盘整期变成事实上的停机，而用户看不到任何原因。放行轮的 `kind` 仍
-    如实是 `heartbeat`（条件化措辞正是为这种轮次写的），不需要新 kind。
+    如实是 `heartbeat` / `position_watch`（条件化措辞正是为这种轮次写的），不需要新 kind。
     """
-    if threshold_pct <= 0 and threshold_atr_mult <= 0:
+    if policy.threshold_pct <= 0 and policy.threshold_atr_mult <= 0:
         return False
-    if wake.get("kind") != "heartbeat":
-        return False
-    if max_skip_streak > 0 and int(wake.get("skipStreak") or 0) >= max_skip_streak:
-        return False
-    return True
+    kind = wake.get("kind")
+    if kind == "heartbeat":
+        return not _streak_exhausted(wake, policy.max_skip_streak)
+    if kind == "position_watch" and policy.position_watch_enabled:
+        if wake.get("guardStatus") not in ARMED_STATUSES:
+            return False
+        return not _streak_exhausted(wake, policy.position_watch_max_skip_streak)
+    return False
+
+
+def _streak_exhausted(wake: dict, ceiling: int) -> bool:
+    """连续跳过是否已触到上限（True = 必须强制放行一轮，饿死兜底）。"""
+    return ceiling > 0 and int(wake.get("skipStreak") or 0) >= ceiling

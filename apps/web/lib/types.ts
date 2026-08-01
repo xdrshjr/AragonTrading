@@ -296,6 +296,10 @@ export interface TriggerExplain {
     barTs?: number;
     clOrdId?: string;
     ordId?: string;
+    // AI 自动交易的唤醒来源归因（ai-trade-wake-aware-context §2.9 写入，本轮读出）。
+    // 只打在 AI 决策**直接**产生的成交上（atomic / reverse）；保护层平仓 / 会话止损 / 外部干预
+    // 由确定性层触发、与唤醒无关，按设计缺席——那不是缺陷，打上去反而会让胜率归因整体失真。
+    wakeKind?: string;
   };
 }
 

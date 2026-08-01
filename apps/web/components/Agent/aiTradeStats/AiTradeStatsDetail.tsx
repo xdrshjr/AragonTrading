@@ -5,8 +5,9 @@ import { useMemo, useState } from "react";
 import { PeriodReturnBars, UnderwaterChart } from "@/components/Chart/aiBacktest/charts";
 import AutoTradeRoundTripRow from "@/components/Chart/AutoTradeRoundTripRow";
 import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
+import WakeAttributionCard from "./WakeAttributionCard";
 import { Badge, Button, Skeleton } from "@/components/ui";
-import { buildRoundTrips, type RoundTrip } from "@/lib/autoTradePnl";
+import { buildLedger, buildRoundTrips, type RoundTrip } from "@/lib/autoTradePnl";
 import { formatProfitCapture, PROFIT_CAPTURE_HINT } from "@/lib/aiTradeCapture";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
 import type { AiTradeHistoryDetailOut, AiTradeHistoryMember } from "@/lib/aiTradeHistoryTypes";
@@ -61,6 +62,16 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
   // O4（hold-inertia-observability）：观测行是**全成员合计**（与上方旧五键卡的「首成员」口径并存，
   // pre-existing 口径本轮不动）；老记录全缺新键 → null → 整行隐藏（不显示一排误导性的 0）。
   const observability = useMemo(() => aggregateAiObservability(detail.members), [detail.members]);
+  // 轴 D 需要**组级**扁平往返，而本页原本只在成员子组件里各自 buildRoundTrips（组级拿不到 trips）。
+  // `buildLedger` 已是「跨成员合并、逐成员配对、绝不跨 instId」的现成真源——不在子组件里各建一份
+  // 再拼（那就是又一次「同一个量两处各算一次」）。
+  const ledger = useMemo(
+    () =>
+      buildLedger(
+        detail.members.map((m) => ({ instId: m.instId, trades: m.trades, leverage: m.leverage })),
+      ),
+    [detail.members],
+  );
 
   // §3.6 双栏：左栏 = KPI + 权益/回撤 + AI 决策概况 + 预计年化；右栏 = 逐成员完整交易（可展开行内 K 线）。
   // 「当前」页与「历史·详情」页同构。窄屏（<md）上下堆叠；左右各自 `overflow-y-auto`（避免嵌套双滚动 P2-3）。
@@ -105,6 +116,8 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
           {aiStats && (
             <AiStatsCard aiStats={aiStats} observability={observability} finalSummary={finalSummary} />
           )}
+
+          <WakeAttributionCard trips={ledger} />
 
           {/* P2-5：年化口径 = 会话已实现收益 + 真实经历时长（endedTs-startedTs），与筛选无关。 */}
           <AnnualizedProjectionCard

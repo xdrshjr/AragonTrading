@@ -54,6 +54,7 @@ from .profit_guard_runtime import (
 )
 from .prompts import DECISION_TOOL_NAME
 from .reflection import applied_shrink, apply_reflection, build_reflection_note
+from .signal_preview import PreviewRequest, PreviewRunner
 from .signals import (
     Consensus,
     StrategySignalView,
@@ -203,6 +204,8 @@ class AiTradeSession:
         self._last_bar_index = 0
         self._last_live_px: float | None = None
         self._last_decision_started_wall = 0.0
+        self._live_row: dict | None = None      # 未确认根临时行（轴 C 预演的唯一输入行，不入窗）
+        self._preview = PreviewRunner(session_id, executor.settings)   # 轴 C 异步编排（总闸默认关）
         # 空仓重复唤醒守卫态（hold-inertia-fix F4c）：最近一次**决策轮启动时**的确认根索引 / 参考价
         # （None=尚无决策轮 → 守卫直通）+ 被抑制的唤醒计数 + 计数节流墙钟（R-02：每唤醒周期至多计一次）。
         self._last_round_bar_index: int | None = None
@@ -436,6 +439,7 @@ class AiTradeSession:
         # 战术窗口刷新**必须**排在定时唤醒之前——否则定时轮拿到的是上一分钟的战术数据，整个特性
         # 在最该生效的路径上空转。三闸门（锚点/配额/单 tick 节流）+ 硬超时保证它不拖停盯市。
         await self._window.maybe_refresh_tactical(now_ts, time.time())
+        await self._maybe_signal_flip_wake()     # 轴 C：须在定时唤醒之前（翻转优先于墙钟到点）
         await self._maybe_interval_wake()
 
     async def _maybe_interval_wake(self) -> None:
@@ -449,12 +453,18 @@ class AiTradeSession:
 
         wake-aware-context §2.5：守卫判据收敛到 `WakeRuntime` —— 先分类（纯同步）再问要不要跳过，
         「跳过」与「prompt 措辞」从此读同一个 `kind`，杜绝两处各算一次。
+
+        轴 A：`_deciding` 判定**下移到计时器之后**，只对「真的到点却撞上在飞轮」的丢弃记账。
         """
-        if (self.wake_interval_s <= 0 or self.state != "running" or self._deciding
+        if (self.wake_interval_s <= 0 or self.state != "running"
                 or self._stale_degraded or self._last_board is None):
             return
         now = time.time()
         if now - self._last_decision_started_wall < self.wake_interval_s:
+            return
+        if self._deciding:                    # 轴 A：到点却撞上在飞轮 ⇒ 记待办，不再静默丢弃
+            if self._wake.note_interval_drop(now):
+                await self._push({"type": "status", "data": self._status_payload()})
             return
         ref_px = self._current_px()           # 纯同步取实时价（不 await）
         wake = self._wake.classify(self._wake_readings("interval", ref_px), now_wall=now)
@@ -565,6 +575,8 @@ class AiTradeSession:
         if not candle.confirm:
             self._last_live_px = float(candle.c)   # 两根 K 线之间的当前价（供定时唤醒研判最新价位）
             self._last_px_wall = time.time()       # 判定价年龄基准（利润保护新鲜度豁免的唯一真源）
+            self._live_row = {"ts": candle.ts, "o": candle.o, "h": candle.h,   # 轴 C 预演输入行
+                              "l": candle.l, "c": candle.c, "vol": candle.vol}
             await self._push({"type": "candle", "data": {
                 "ts": candle.ts, "o": candle.o, "h": candle.h, "l": candle.l,
                 "c": candle.c, "vol": candle.vol, "confirm": False}})
@@ -573,6 +585,8 @@ class AiTradeSession:
             return
         row = self._window.append_confirmed(candle)
         self._last_candle_wall = self._last_px_wall = time.time()
+        self._wake.note_new_bar()         # 轴 C：新根 = 新证据，解锁同方向翻转的防抖锁存
+        self._live_row = None             # 该根已收线，旧的未确认行不再有意义
         # F1（§2.1.2）：ATR 是波动**尺度**，只在确认根刷新（允许滞后一根）；不可用 ⇒ None ⇒
         # 上下界整体不生效，退化为纯阶梯回吐（与本层 fail-open 极性一致）。
         self._atr_px = safe_atr(self._window.base_df(),
@@ -593,6 +607,7 @@ class AiTradeSession:
         self._last_live_px = ref_px
         await self._push({"type": "candle", "data": {**row, "confirm": True}})
         if self._deciding:                       # P1-2：上一轮未完成→跳过本轮，不并发
+            self._wake.note_bar_drop(time.time())    # 轴 A：先记待办（轮末补跑），再推自解释事件
             await self._emit_decision_skipped(ts, board)
             return
         self._deciding = True
@@ -691,6 +706,59 @@ class AiTradeSession:
                 "ts": ts, "code": "AI_TRADE_ROUND_FAILED", "message": "本轮决策异常，已跳过"}})
         finally:
             self._deciding = False
+            self._maybe_catchup_wake()       # 轴 A：纯同步，check→claim 之间无 await
+
+    def _maybe_catchup_wake(self) -> None:
+        """上一轮结束即补跑一轮（轴 A）。纯同步：与既有两处槽位认领同范式，无竞态。
+
+        `finally` 在 `stop()` 取消决策任务时同样会跑，故 `state != "running"` 必须显式挡掉——
+        否则停止流程会在 flatten 之后凭空再起一轮真实资金决策。
+        """
+        if self.state != "running" or self._deciding or self._last_board is None:
+            return
+        now = time.time()
+        ref_px = self._current_px()
+        wake = self._wake.plan_catchup(self._wake_readings("interval", ref_px), now_wall=now)
+        if wake is None:
+            return
+        self._deciding = True
+        self._last_round_bar_index = self._last_bar_index
+        self._last_round_px = ref_px
+        self._last_decision_started_wall = now
+        self._decision_task = asyncio.create_task(
+            self._run_decision_round(self._last_board, self._last_bar_index,
+                                     ref_px, int(now), wake))
+
+    async def _maybe_signal_flip_wake(self) -> None:
+        """轴 C：未确认根预演 → 防抖 → 投影净共识翻转即唤醒（重活在线程里，不占盯市 tick）。"""
+        for alert in self._preview.take_alerts():   # 自动关轴是降级，静默降级会被当成故障
+            await self._push(alert)
+        if not self._preview_ready():
+            return
+        result = await self._preview.run(PreviewRequest(
+            specs=self._specs, shadows=self._shadows, window=self._window,
+            live_row=self._live_row, now_wall=time.time(), last_px_wall=self._last_px_wall))
+        if result is None or self._deciding:  # 在飞轮不抢槽位，本次采样也不喂防抖器（见 plan_signal_flip）
+            return
+        ref_px = self._current_px()           # 以下同步认领，check→set 之间无 await
+        now = time.time()
+        wake = self._wake.plan_signal_flip(result, self._last_board,
+                                           self._wake_readings("interval", ref_px), now_wall=now)
+        if wake is None:
+            return
+        self._deciding = True
+        self._last_round_bar_index = self._last_bar_index
+        self._last_round_px = ref_px
+        self._last_decision_started_wall = now
+        self._decision_task = asyncio.create_task(
+            self._run_decision_round(self._last_board, self._last_bar_index,
+                                     ref_px, int(now), wake))
+
+    def _preview_ready(self) -> bool:
+        """预演前置条件（CLAUDE.md §六：单表达式超过三个布尔条件即抽函数）。"""
+        return (self.state == "running" and not self._stale_degraded
+                and self._last_board is not None and self._live_row is not None
+                and self._preview.due(time.time()))
 
     # ---------- 决策认知轨迹（ai-auto-trading-agent-trace §3.3）----------
     async def _begin_round_trace(self, round_no: int, ts: int, ref_px: float,
@@ -1348,7 +1416,8 @@ class AiTradeSession:
                 "multiTimeframeContext": None, "trigger": "candle",
                 # §2.7：被 in-flight 守卫丢弃的 K 线轮从此**自解释**——用户能看到「这根 K 线的首次
                 # 研判被推迟了」，且下一次定时唤醒必被判为 bar_advanced（模型会被明确告知）。
-                "wake": ({"kind": "candle_close", "trigger": "candle", "dropped": True}
+                "wake": ({"kind": "candle_close", "trigger": "candle", "dropped": True,
+                          "backlog": self._wake.backlog_wire()}
                          if self._wake.reason_enabled else None),
                 "tacticalContext": None, "tacticalTier": None, "contextDisclosure": None,
                 "reflectionVerdict": None, "reflectionReason": None}
@@ -1398,6 +1467,7 @@ class AiTradeSession:
                 "contextRefreshRounds": self.context_refresh_rounds,
                 "wakeIntervalMinutes": self._wake_interval_minutes(),
                 "wakeSkips": self.wake_skips,
+                **self._wake.status_counts(self._preview.stats()),   # 调度四计数（A-6 同源）
                 "holdStreak": self.hold_streak,
                 # F2 冷却三载体之一（§4.2）：**不挂 position**——冷却期内按定义已无持仓。
                 "profitGuardCooldown": build_cooldown_view(self._guard.cooldown,
@@ -1468,6 +1538,8 @@ class AiTradeSession:
             # armedRounds 是**轮级**口径（快照曾处于 armed/breakeven_armed 的轮数）；二者不可互相换算。
             metrics["aiStats"]["profitGuardExits"] = self.profit_guard_exits
             metrics["aiStats"]["profitGuardArmedRounds"] = self.profit_guard_armed_rounds
+            # 唤醒调度闭环观测（§4.4）：与 status 的四计数**同读**一份 WakeBacklog / PreviewRunner。
+            metrics["aiStats"]["wakeScheduler"] = self._wake.stats(self._preview.stats())
             # 成本记账与门禁观测（§3.8，RV-1）：合并落在**调用点**，`_compute_ai_stats` 一字不动。
             metrics["aiStats"] = self._cost.merge_into(metrics["aiStats"])
             metrics["aiStats"] = self._sizing.merge_into(metrics["aiStats"])   # 同款调用点合并

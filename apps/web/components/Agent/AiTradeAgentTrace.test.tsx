@@ -425,6 +425,80 @@ describe("AiTradeAgentTrace", () => {
     expect(screen.getAllByTestId("tactical-frame")).toHaveLength(2);
   });
 
+  it("keeps the section alive on a backlog-only round and renders the catch-up evidence", () => {
+    // 只有补跑信息、其余输入全空的轮次**仍要渲染**（镜像点 12：早退门控漏了 backlog 就整段空白）。
+    // 这里正是上一轮 RV-2 的原址——新增边缘态字段必须验证渲染门控没把该态排除掉。
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            state: "done",
+            signalBoard: [],
+            marketContext: null,
+            consensus: null,
+            marketDigest: null,
+            multiTimeframeContext: null,
+            tacticalContext: null,
+            wake: {
+              kind: "bar_advanced",
+              trigger: "interval",
+              backlog: { droppedBars: 1, droppedIntervals: 3, waitedS: 259, chain: 1 },
+            },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText("输入信号板")).toBeInTheDocument();
+    const backlog = screen.getByTestId("wake-backlog");
+    expect(backlog).toHaveTextContent("1 根 K 线收线未被研判");
+    expect(backlog).toHaveTextContent("3 次定时唤醒被丢弃");
+    expect(backlog).toHaveTextContent("最早的一次已等待 259s");
+    // 轮头徽标同步带上补跑标记
+    expect(screen.getByText("补看新 K 线 · 首次研判 · 补跑")).toBeInTheDocument();
+  });
+
+  it("keeps the section alive on a flip-only round and always states it is provisional", () => {
+    // 翻转是**未收线**的预演结论。UI 把它呈现成既成事实，就等于用界面撤销了后端那条安全隔离。
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            state: "done",
+            signalBoard: [],
+            marketContext: null,
+            consensus: null,
+            marketDigest: null,
+            multiTimeframeContext: null,
+            tacticalContext: null,
+            wake: {
+              kind: "signal_flip",
+              trigger: "interval",
+              flip: {
+                netStanceFrom: "flat",
+                netStanceTo: "long",
+                strategies: [{ strategyId: 7, name: "EMA 交叉短线", from: "flat", to: "long" }],
+                provisional: true,
+                heldS: 47.3,
+                samples: 4,
+                barTs: 1785600000,
+              },
+            },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText("输入信号板")).toBeInTheDocument();
+    const flip = screen.getByTestId("wake-flip");
+    expect(flip).toHaveTextContent("EMA 交叉短线");
+    expect(flip).toHaveTextContent("已保持 47s");
+    expect(flip).toHaveTextContent("4 次有效观测");
+    expect(flip).toHaveTextContent("repaint");
+    expect(flip).toHaveTextContent("仍以最近确认根为准");
+    expect(screen.getByText("策略立场翻转 · 未收线预演")).toBeInTheDocument();
+  });
+
   it("auto-resumes bottom-follow after 2 minutes idle and re-scrolls to latest (R2)", () => {
     vi.useFakeTimers();
     try {

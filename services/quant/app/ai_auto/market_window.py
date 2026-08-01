@@ -30,6 +30,35 @@ _TACTICAL_REFRESH_SLACK = 10
 _TACTICAL_REFRESH_MIN = 20
 
 
+def build_frames_for(specs: list[PaperStrategySpec], rows, htf_rows,
+                     bar: str) -> list[pd.DataFrame]:
+    """逐策略建帧的**唯一真源**：`MarketWindow.build_strategy_frames` 与轴 C 的预演共用。
+
+    抽出来是为了让预演走的是**同一条**建帧路径——复制粘贴一份就等于预演的不是同一个系统，而这类
+    分叉在本仓库有前科（同一个量两处各算一次）。行为与抽取前逐字不变（同参对拍）。
+
+    Args:
+        specs: 策略清单（预演时必须传**克隆体**：`prepare` 会写策略内部状态）。
+        rows: 基础周期 K 线行序列（`list` / `deque` 均可）。
+        htf_rows: 各高周期窗口 `{bar: rows}`（空窗自动略过）。
+        bar: 基础（执行）周期名。
+
+    Returns:
+        与 `specs` 一一对齐的帧列表。
+    """
+    base_rows = list(rows)
+    frames_by_bar = {b: candles_to_df(list(win)) for b, win in htf_rows.items() if win}
+    out: list[pd.DataFrame] = []
+    for spec in specs:
+        df = spec.strategy.prepare(candles_to_df(base_rows), bar)
+        strat_htf = {b for b in spec.strategy.timeframes() if b in frames_by_bar}
+        if strat_htf:
+            df = spec.strategy.attach_timeframes(
+                df, bar, {b: frames_by_bar[b] for b in strat_htf})
+        out.append(df)
+    return out
+
+
 @dataclass(frozen=True)
 class WindowOptions:
     """`MarketWindow` 的可选装配项（聚合结构体，守 CLAUDE.md「形参 ≤5」）。
@@ -167,17 +196,49 @@ class MarketWindow:
     # ---------- 逐策略建帧 ----------
     def build_strategy_frames(self) -> list[pd.DataFrame]:
         """为每个策略各自 `prepare`(+MTF `attach_timeframes`) 出一份帧（互不污染）。"""
-        rows = list(self._candles)
-        frames_by_bar = {b: candles_to_df(list(win)) for b, win in self._htf_windows.items() if win}
-        out: list[pd.DataFrame] = []
-        for spec in self._specs:
-            df = spec.strategy.prepare(candles_to_df(rows), self.bar)
-            strat_htf = {b for b in spec.strategy.timeframes() if b in frames_by_bar}
-            if strat_htf:
-                df = spec.strategy.attach_timeframes(
-                    df, self.bar, {b: frames_by_bar[b] for b in strat_htf})
-            out.append(df)
-        return out
+        return build_frames_for(self._specs, list(self._candles), self._htf_windows, self.bar)
+
+    # ---------- 预演快照（wake-scheduler-closed-loop 轴 C）----------
+    def preview_snapshot(self, live_row: dict | None, *, now_wall: float,
+                         last_px_wall: float, stale_after_s: float):
+        """未确认根预演所需的只读快照；任一前置闸不过 ⇒ None（不预演，绝不猜）。
+
+        必须在**事件循环线程**取：`_candles` / `_htf_windows` 是 `deque`，另一侧 `feed_candle`
+        随时可能 append，把 deque 直接交给工作线程会抛 `RuntimeError: deque mutated`。
+
+        闸 ①（重复根）：`live_row["ts"] <= _last_confirmed_ts` ⇒ None。确认根落地之后仍可能收到一条
+        **同 ts** 的未确认推送（`feed_candle` 的未确认分支不做 ts 校验），把它追加到 `rows` 末尾会让
+        帧里出现两根同 ts 的 K 线、指标在重复根上计算 ⇒ 产生一个纯属数据缺陷的「翻转」，并据此起一轮
+        真实资金决策。
+
+        闸 ②（判定价新鲜度）：`now_wall - last_px_wall > stale_after_s` ⇒ None。**必须读
+        `_last_px_wall`（每次写实时价即刷新）而不是 `_last_candle_wall`（只在确认根更新）**——后者在
+        12H/1D 执行周期下几十小时不跳，WS 静默时 `_stale_degraded` 还没触发、`_live_row` 已冻结不动，
+        而防抖器仍在按墙钟累积「已连续保持 45 秒」。这是利润保护层 D-1 踩过的同款坑。
+
+        Args:
+            live_row: 当前未确认根（`{ts,o,h,l,c,vol}`）；None ⇒ None。
+            now_wall: 当前墙钟。
+            last_px_wall: 最近一次收到任意价格推送的墙钟（`session._last_px_wall`）。
+            stale_after_s: 判定价新鲜度上限（秒）。
+
+        Returns:
+            `signal_preview.PreviewSnapshot` 或 None。
+        """
+        from .signal_preview import PreviewSnapshot     # 延迟导入：与 signal_preview 互为依赖
+        if not live_row or not self._candles:
+            return None
+        if self._last_confirmed_ts is not None and int(live_row["ts"]) <= self._last_confirmed_ts:
+            return None
+        if last_px_wall <= 0 or now_wall - last_px_wall > stale_after_s:
+            return None
+        row = dict(live_row)
+        return PreviewSnapshot(
+            rows=[*self._candles, row],
+            htf_rows={b: list(win) for b, win in self._htf_windows.items() if win},
+            bar=self.bar,
+            row_key=(row["ts"], row["c"], row["h"], row["l"]),
+            bar_ts=int(row["ts"]))
 
     # ---------- 高周期窗口（镜像 LiveAutoSession）----------
     async def prefill_htf(self, base_span_bars: int) -> None:

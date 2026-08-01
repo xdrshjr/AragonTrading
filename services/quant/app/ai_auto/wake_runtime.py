@@ -25,7 +25,9 @@ from .tactical_context import (
     execution_disclosure,
     tactical_timeframes,
 )
-from .wake_guard import should_skip_interval_wake, should_skip_wake
+from .flip_detector import CONFIRMED, FlipDetector
+from .wake_backlog import WakeBacklog
+from .wake_guard import SkipPolicy, should_skip_interval_wake, should_skip_wake
 from .wake_reason import WakeFacts, WakeReadings, classify_wake, horizon_scale
 
 
@@ -82,6 +84,18 @@ class WakeRuntime:
         self._last_facts: WakeFacts | None = None
         self._last_round_wall = 0.0       # 上一决策轮启动墙钟（只服务 sinceLastRoundS 文案）
         self._skip_streak = 0
+        # ---- 唤醒调度闭环（wake-scheduler-closed-loop §2.6）：本运行时只留**纯同步**判定，
+        # 异步 / 线程 / 退避一律在 `signal_preview.PreviewRunner`。----
+        self._backlog = WakeBacklog()
+        self._detector = FlipDetector(
+            hold_s=settings.ai_trade_signal_wake_hold_s,
+            min_samples=settings.ai_trade_signal_wake_min_samples)
+        self._signal_flip_wakes = 0
+        self._position_watch_skips = 0
+        self._last_flip_wake_wall = 0.0
+        # 最近一次判为「应跳过」的 kind。由 `should_skip` 就地记下、`note_skip` 按同一节流口径消费
+        # ——分列计数因此与 `wake_skips` **同源同口径**，不会出现第二个口径（本仓库付过学费的失效模式）。
+        self._last_skip_kind: str | None = None
 
     # ---------- 只读公开面 ----------
     @property
@@ -114,6 +128,29 @@ class WakeRuntime:
     def skip_streak(self) -> int:
         return self._skip_streak
 
+    @property
+    def backlog_enabled(self) -> bool:
+        """轴 A 总闸；关闭 ⇒ 只计数不补跑（观测保留，行为逐字回退）。"""
+        return self._settings.ai_trade_wake_backlog_enabled
+
+    @property
+    def signal_flip_enabled(self) -> bool:
+        """轴 C 的**配置**总闸。
+
+        运行期降级（克隆连续失败即整轴关闭）由 `PreviewRunner.enabled` 单独承担：它一旦关闭就
+        再也产不出 `PreviewResult`，本判定链自然空转，两处不需要也**不应**各判一次。
+        """
+        return self._settings.ai_trade_signal_wake_enabled
+
+    @property
+    def position_watch_skips(self) -> int:
+        """轴 B 省下来的轮数（与 `wake_skips` **同口径**，只是分列，便于复盘「省的是哪一类」）。"""
+        return self._position_watch_skips
+
+    @property
+    def signal_flip_wakes(self) -> int:
+        return self._signal_flip_wakes
+
     # ---------- 记账 ----------
     def note_guard_status(self, status: str | None) -> None:
         """利润保护快照 status 的**唯一**入口（盯市 tick 每次 `_refresh_profit_state` 之后即记）。
@@ -136,6 +173,10 @@ class WakeRuntime:
         """
         if counted:
             self._skip_streak += 1
+            # 轴 B 分列：`wake_skips` 的口径与数值**不变**，只额外记「省下来的是哪一类」。不分列
+            # 就无法区分「省了心跳轮」与「省了持仓轮」——两者的机会成本完全不同，复盘会得出错误结论。
+            if self._last_skip_kind == "position_watch":
+                self._position_watch_skips += 1
 
     def note_round_start(self, wake: dict, *, px: float, bar_index: int,
                          as_of_ts: int, now_wall: float) -> None:
@@ -152,10 +193,17 @@ class WakeRuntime:
         self._last_round_guard_status = self._guard_status
         self._last_round_wall = now_wall
         self._skip_streak = 0
+        self._backlog.note_round_start(now_wall)
+        if wake.get("backlog") is None:      # 非补跑轮 ⇒ 补跑链归零（链只统计背靠背的补跑）
+            self._backlog.reset_chain()
 
     # ---------- 分类 / 跳过 ----------
-    def classify(self, readings: WakeReadings, *, now_wall: float) -> dict:
-        """组装 `WakeFacts` 并判定唤醒原因；返回可直接进 payload / 事件 / 轨迹的 wire。"""
+    def classify(self, readings: WakeReadings, *, now_wall: float,
+                 flip: dict | None = None) -> dict:
+        """组装 `WakeFacts` 并判定唤醒原因；返回可直接进 payload / 事件 / 轨迹的 wire。
+
+        `flip` 缺省 None ⇒ `signal_flip` 条件不成立、wire 无 `flip` 键 ⇒ 非翻转轮逐字节回退。
+        """
         since = (max(0.0, now_wall - self._last_round_wall) if self._last_round_wall else 0.0)
         facts = WakeFacts(
             trigger=readings.trigger,
@@ -170,6 +218,7 @@ class WakeRuntime:
             last_round_guard_status=self._last_round_guard_status,
             since_last_round_s=since,
             resting_age_s=readings.resting_age_s,
+            flip=flip,
         )
         self._last_facts = facts
         wake = classify_wake(
@@ -182,7 +231,11 @@ class WakeRuntime:
         return wake
 
     def should_skip(self, wake: dict) -> bool:
-        """本次定时唤醒是否应跳过；总闸关闭 ⇒ **逐字回退**既有 `should_skip_interval_wake`。"""
+        """本次定时唤醒是否应跳过；总闸关闭 ⇒ **逐字回退**既有 `should_skip_interval_wake`。
+
+        跳过时就地记下 `kind`（`_last_skip_kind`），供 `note_skip` 按**同一节流口径**分列轴 B 的
+        `positionWatchSkips`——判定与计数因此共用一个数，不会长出第二个口径。
+        """
         if not self.reason_enabled:
             facts = self._last_facts
             if facts is None:
@@ -192,11 +245,114 @@ class WakeRuntime:
                 bar_index=facts.bar_index, last_round_bar_index=facts.last_round_bar_index,
                 px=facts.px, last_round_px=facts.last_round_px,
                 threshold=self._settings.ai_trade_wake_skip_unchanged_pct)
-        return should_skip_wake(
-            wake,
+        skip = should_skip_wake(wake, SkipPolicy(
             threshold_pct=self._settings.ai_trade_wake_skip_unchanged_pct,
             threshold_atr_mult=self._settings.ai_trade_wake_move_atr_mult,
-            max_skip_streak=self._settings.ai_trade_wake_max_skip_streak)
+            max_skip_streak=self._settings.ai_trade_wake_max_skip_streak,
+            position_watch_enabled=self._settings.ai_trade_wake_skip_position_watch,
+            position_watch_max_skip_streak=(
+                self._settings.ai_trade_wake_position_watch_max_skip_streak)))
+        self._last_skip_kind = wake.get("kind") if skip else None
+        return skip
+
+    # ---------- 轴 A：唤醒补跑 ----------
+    def note_interval_drop(self, now_wall: float) -> bool:
+        """记一次「定时唤醒到点却撞上在飞轮」；返回是否真的计了数（节流口径同 `wake_skips`）。"""
+        return self._backlog.note_interval(now_wall, min_gap_s=self._wake_interval_s)
+
+    def note_bar_drop(self, now_wall: float) -> None:
+        """记一根「确认根收线却撞上在飞轮」（不节流：每根都是独立事实）。"""
+        self._backlog.note_bar(now_wall)
+
+    def backlog_wire(self) -> dict:
+        """当前待办快照（供 `decision_skipped` 事件自解释；`waitedS` 以最近一次丢弃为参照）。"""
+        return self._backlog.wire(self._backlog.last_dropped_wall)
+
+    def plan_catchup(self, readings: WakeReadings, *, now_wall: float) -> dict | None:
+        """轮末补跑判定；不补跑 ⇒ None（且**不留悬空待办**）。
+
+        「输入确实变了」刻意**不新写判据**，而是翻译成既有分类器的结论：`should_skip` 为 False
+        意味着 kind 不是可跳过的（`heartbeat` / 轴 B 的 `position_watch`），也就是「新根 / 挂单 /
+        浮盈跨档 / 价格越阈 / 立场翻转」至少成立一条。两处各写一套判据是本仓库反复踩过的信任崩塌来源。
+        """
+        if not self.backlog_enabled or not self._backlog.pending:
+            return None
+        ceiling = self._settings.ai_trade_wake_backlog_max_chain
+        if ceiling > 0 and self._backlog.chain >= ceiling:
+            self._backlog.note_ceiling_hit()
+            self._backlog.consume()          # 触顶即弃单，绝不让待办无限期堆着
+            return None
+        wake = self.classify(readings, now_wall=now_wall)
+        if self.should_skip(wake):
+            self._backlog.consume()          # 输入没真变 ⇒ 不补跑，也不留悬空待办
+            return None
+        # `note_catchup()` 必须在 `wire()` **之前**：`chain` 要如实回答「本轮是补跑链的第几轮」，
+        # 先取 wire 会让第一次补跑下发 `chain: 0` —— 一个正在补跑的轮次说自己链长为 0 是无意义的
+        # （spec §2.1.4 的草图顺序与它自己 §2.8 的时间线期望值矛盾，此处按后者，见 §九 D-1）。
+        self._backlog.note_catchup()
+        wake["backlog"] = self._backlog.wire(now_wall)
+        self._backlog.consume()
+        return wake
+
+    # ---------- 轴 C：信号驱动唤醒 ----------
+    def note_new_bar(self) -> None:
+        """确认根落地：解锁防抖锁存（新根 = 新证据，同方向的翻转值得再看一次）。"""
+        self._detector.note_new_bar()
+
+    def plan_signal_flip(self, result, base_board: list | None, readings: WakeReadings, *,
+                         now_wall: float) -> dict | None:
+        """轴 C 唤醒判定：签名 → 防抖 → 最小间隔 → 锁存；任一环不成立 ⇒ None。
+
+        **关键不变式**：本方法返回的 wake 只影响 `payload["wake"]`。传给 `_run_decision_round` 的
+        `board` 仍是**确认根**的信号板，故共识门禁、铁律层、edge 门禁、仓位层全部仍以确认根为准，
+        预演结果**永远只是建议性证据**。这条是轴 C 全部安全性的支点。
+
+        `row_key` 由 `result` 带入而**不得**回头读 `session._live_row`：预演跑在线程里、期间
+        `feed_candle` 随时可能写新的 `_live_row`，回头读会把「这次采样看的是哪一行」记错。
+
+        **有副作用**：判 `confirmed` 即锁存并计数。故调用方在「起不了轮」的时刻（例如撞上在飞轮）
+        必须**根本不调用**本方法，而不是调用后丢弃返回值——否则那次确认会被白白消费掉，同一次翻转
+        再也不会唤醒第二次。跟踪态本身跨 tick 保留，下一 tick 续测即可。
+        """
+        if not self.signal_flip_enabled or result is None or not base_board:
+            return None
+        from .signal_preview import flip_signature    # 延迟导入：断开 preview ↔ runtime 的环
+        matched = flip_signature(base_board, result.board)
+        signature = None if matched is None else matched[0]
+        state = self._detector.observe(signature, now_wall, row_key=result.row_key)
+        if state != CONFIRMED or matched is None:
+            return None
+        min_gap = self._settings.ai_trade_signal_wake_min_gap_s
+        if self._last_flip_wake_wall > 0 and now_wall - self._last_flip_wake_wall < min_gap:
+            return None                      # 不唤醒**且不锁存**：翻转仍在跟踪，下次仍可唤醒
+        flip = {**matched[1], "heldS": round(self._detector.held_s, 3),
+                "samples": self._detector.samples, "barTs": result.bar_ts}
+        self._detector.note_fired()
+        self._last_flip_wake_wall = now_wall
+        self._signal_flip_wakes += 1
+        return self.classify(readings, now_wall=now_wall, flip=flip)
+
+    def stats(self, preview_stats: dict | None = None) -> dict:
+        """调度层观测键（进 `status` 与 `metrics_json.aiStats.wakeScheduler`）。
+
+        `drops` / `catchups` 都**只**读 `WakeBacklog.total_drops` / `total_catchups` 这一个源，
+        故 `status.wakeDrops == aiStats.wakeScheduler.drops` 是恒等式而不是巧合（A-6）。
+        """
+        return {**self._backlog.stats(),
+                "positionWatchSkips": self._position_watch_skips,
+                "signalFlipWakes": self._signal_flip_wakes,
+                **(preview_stats or {})}
+
+    def status_counts(self, preview_stats: dict | None = None) -> dict:
+        """WS `status` 事件的四个调度计数（与 `stats()` **同源**，只是键名按 status 的既有风格）。
+
+        `wakeDrops` 的口径是「**到点了却撞上在飞轮**的唤醒次数」——其中一部分若不在飞也会被守卫
+        跳过，故它并不等于「系统漏掉了这么多次决策」。这个口径差必须写进前端 tooltip。
+        """
+        stats = self.stats(preview_stats)
+        return {"wakeDrops": stats["drops"], "wakeCatchups": stats["catchups"],
+                "positionWatchSkips": stats["positionWatchSkips"],
+                "signalFlipWakes": stats["signalFlipWakes"]}
 
     # ---------- payload 注入 ----------
     def inject(self, payload: dict, ctx: InjectionContext) -> None:

@@ -1,7 +1,7 @@
-"""唤醒原因判定单测（ai-trade-wake-aware-context §6.1 T-4/T-5/T-6/T-22）。
+"""唤醒原因判定单测（ai-trade-wake-aware-context §6.1 T-4/T-5/T-6/T-22 + 本轮 T-19）。
 
-覆盖：七种 kind 的优先级表、`alsoTrue` 不丢证据、ATR / pct 双判据、价不可信 fail-open、
-**`horizon_scale` 校准（T-22，P0-2）**。纯函数，无 IO。
+覆盖：八种 kind 的优先级表、`alsoTrue` 不丢证据、ATR / pct 双判据、价不可信 fail-open、
+**`horizon_scale` 校准（T-22，P0-2）**、`signal_flip` 的优先级与 `flip` 键缺席回退。纯函数，无 IO。
 """
 from __future__ import annotations
 
@@ -24,10 +24,16 @@ def _steady(**overrides) -> WakeFacts:
     return WakeFacts(**{**base, **overrides})
 
 
-# ---------- T-4：七态优先级 ----------
+_FLIP = {"netStanceFrom": "flat", "netStanceTo": "long",
+         "strategies": [{"strategyId": 7, "name": "EMA 交叉短线", "from": "flat", "to": "long"}],
+         "provisional": True, "heldS": 47.3, "samples": 4, "barTs": 1_785_600_000}
+
+
+# ---------- T-4 / T-19：八态优先级 ----------
 @pytest.mark.parametrize(("overrides", "expected"), [
     ({"trigger": "candle"}, "candle_close"),
     ({"bar_index": 9}, "bar_advanced"),
+    ({"flip": _FLIP}, "signal_flip"),
     ({"has_resting": True, "resting_age_s": 240.0}, "resting_order"),
     ({"position_side": "long", "guard_status": "armed", "last_round_guard_status": "idle"},
      "profit_tier"),
@@ -42,8 +48,26 @@ def test_classify_wake_priority_table(overrides, expected):
 
 def test_every_declared_kind_is_reachable():
     assert set(WAKE_KINDS) == {
-        "candle_close", "bar_advanced", "resting_order", "profit_tier",
+        "candle_close", "bar_advanced", "signal_flip", "resting_order", "profit_tier",
         "price_breakout", "position_watch", "heartbeat"}
+
+
+# ---------- 本轮轴 C：signal_flip 的插位与 flip 键的加法性 ----------
+def test_a_real_new_bar_always_outranks_a_provisional_flip():
+    """真的收了新根永远优先：`signal_flip` 只排在 `bar_advanced` **之后**。
+
+    翻转是未确认根上的预演结论，新根是既成事实——把建议性证据排到既成事实前面，就是让 prompt
+    的首行说一件更弱的事。
+    """
+    wake = _classify(_steady(bar_index=9, flip=_FLIP))
+    assert wake["kind"] == "bar_advanced"
+    assert wake["alsoTrue"][0] == "signal_flip"        # 判定只决定标签，绝不丢证据
+
+
+def test_flip_key_is_absent_entirely_when_there_is_no_flip():
+    """非翻转轮 wire **无 `flip` 键**（不是 None）⇒ 逐字节回退 a7ed70c 的 payload。"""
+    assert "flip" not in _classify(_steady())
+    assert _classify(_steady(flip=_FLIP))["flip"] is _FLIP
 
 
 def test_lower_priority_conditions_are_kept_in_also_true_never_dropped():

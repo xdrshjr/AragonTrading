@@ -217,6 +217,36 @@ class Settings(BaseSettings):
     # 推高后没有这条上界，静止行情下 AI 会变成事实上的停机，而用户看不到任何原因。
     ai_trade_wake_max_skip_streak: int = Field(default=5, ge=0, le=100)
     ai_trade_progressive_disclosure: bool = True  # 重复轮压缩总闸；False ⇒ 执行披露恒 full
+    # ---- 唤醒调度闭环（ai-trade-wake-scheduler-closed-loop §4.2）----
+    # 四条正交的轴：A 补跑（被在飞轮吞掉的唤醒记待办、轮末立刻补跑一轮）、B 持仓轮跳过（确定性退出层
+    # 证明在岗时才跳）、C 信号驱动唤醒（未确认根上无副作用预演出「投影净共识翻转」再唤醒）、D 唤醒来源
+    # 胜率归因（纯前端投影，无配置）。全部总闸关闭 ⇒ payload / prompt / 事件 / DB 逐字节回退 a7ed70c。
+    # env 名 AI_TRADE_WAKE_* / AI_TRADE_SIGNAL_WAKE_* 已被 desktop config.js 的 AI_TRADE_ 前缀透传白名单
+    # 覆盖；此处须真的声明——Settings extra="ignore" 会静默丢弃未声明的 env。
+    ai_trade_wake_backlog_enabled: bool = True   # 轴 A 总闸；False ⇒ 只计数不补跑（观测保留，行为回退）
+    # 连续补跑上限。**刻意无「0=不封顶」**：无上限的补跑链 = 无上限的 LLM 花费，「不补跑」由上一行
+    # 的总闸表达，不需要第二条通往无限花费的路。
+    ai_trade_wake_backlog_max_chain: int = Field(default=3, ge=1, le=20)
+    ai_trade_wake_skip_position_watch: bool = True   # 轴 B 总闸；False ⇒ 持仓轮逐字回退「永不跳过」
+    # 持仓连续跳过上限（比空仓的 5 更紧：持仓时「什么都不做」的机会成本更高）。同样**无「0=不封顶」**
+    # ——持仓期无限期不研判能亏真钱，那不是一个该留给配置的形态。
+    ai_trade_wake_position_watch_max_skip_streak: int = Field(default=3, ge=1, le=100)
+    # 轴 C 总闸。**首发默认关**：本轴是唯一会占用守着真实资金的 5 秒盯市 tick 与线程池的一条，且镜像
+    # signal-prior 那轮「新轴默认全关、验收达标再翻」的既有做法。晋级需一次真实会话 ≥24h 的人工观察窗。
+    ai_trade_signal_wake_enabled: bool = False
+    ai_trade_signal_wake_hold_s: float = Field(default=45.0, ge=0, le=600)  # 翻转须连续保持的时长；0=只看样本数
+    # 翻转须被**有效**观测到的次数（行情确实变过才算一次）。下限取 2 而非 1：`hold_s=0 + min_samples=1`
+    # 是「零防抖」，正是本轴最怕的 repaint 放大器。
+    ai_trade_signal_wake_min_samples: int = Field(default=3, ge=2, le=20)
+    ai_trade_signal_wake_min_gap_s: float = Field(default=120.0, ge=30, le=3600)  # 两次信号唤醒最小间隔（花费上界）
+    # 预演节流（≈每 3 个盯市 tick 一次）；首次到期按 session_id 稳定哈希在 [0, interval) 内错峰，
+    # 避免分组 N 个成员步调一致地同时向线程池投 CPU 密集预演。
+    ai_trade_signal_wake_preview_interval_s: float = Field(default=15.0, ge=5, le=600)
+    # 单次预演硬超时；超时即退避（间隔翻倍，上限 300s），且**不解锁在飞守卫**（线程本身不可取消）。
+    ai_trade_signal_wake_timeout_s: float = Field(default=3.0, gt=0, le=30)
+    # 判定价新鲜度闸：`now - _last_px_wall` 超过即不预演。**必须读 `_last_px_wall` 而非 `_last_candle_wall`**
+    # ——后者只在确认根更新，12H/1D 执行周期下几十小时不跳，会让防抖器在冻结数据上凑出「已保持 45 秒」。
+    ai_trade_signal_wake_stale_s: float = Field(default=90.0, gt=0, le=3600)
     # ---- 【基础策略】铁律层（ai-trade-base-strategy-ma-band §5.3）----
     # 与常规/组合/因子策略并列的第四种「策略类型」，但**不是**策略库里的行：它是信号板之外的硬约束层
     # （宪章 prompt 软引导 + base_rules.py 确定性门禁硬保证），默认开启、可在启动弹窗关闭、优先级最高。

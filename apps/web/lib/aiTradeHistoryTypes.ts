@@ -76,6 +76,18 @@ export interface AiTradeRunMetrics {
     reflectionFailClosed?: number;
     wakeSkips?: number;
     maxHoldStreak?: number;
+    // 唤醒调度闭环观测（wake-scheduler-closed-loop §4.4）：加法写既有 JSON 列，老记录缺键 ⇒
+    // 整段隐藏（绝不显示一排误导性的 0）。`drops` 与 status.wakeDrops **同读**一个后端计数。
+    wakeScheduler?: {
+      drops?: number;
+      catchups?: number;
+      catchupCeilingHits?: number;
+      positionWatchSkips?: number;
+      signalFlipWakes?: number;
+      previewTimeouts?: number;
+      previewErrors?: number;
+      previewDisabled?: boolean;
+    };
   };
 }
 

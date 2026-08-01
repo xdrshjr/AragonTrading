@@ -866,10 +866,11 @@ describe("describeProfitGuardReason: 承诺退出线码", () => {
 
 // ---------- 唤醒感知上下文（ai-trade-wake-aware-context §6.2 G-8 / §3.3）----------
 describe("describeTrigger 三级优先：信号板边沿 > wake.kind > trigger", () => {
-  it("无边沿时把单调的两个兜底文案细化成七态", () => {
+  it("无边沿时把单调的两个兜底文案细化成八态", () => {
     const cases: Array<[WakeKind, string]> = [
       ["candle_close", "K 线收盘 · 信号板已重算"],
       ["bar_advanced", "补看新 K 线 · 首次研判"],
+      ["signal_flip", "策略立场翻转 · 未收线预演"],
       ["resting_order", "挂单盯守 · 未成交委托"],
       ["profit_tier", "浮盈跨档 · 保护线已激活"],
       ["price_breakout", "价格异动 · 越过唤醒阈值"],
@@ -897,17 +898,70 @@ describe("describeTrigger 三级优先：信号板边沿 > wake.kind > trigger",
     expect(describeTrigger({ signalBoard: [] }).label).toBe("K 线收盘 · 常规复盘");
   });
 
-  it("只有真正值得注意的四态用 accent（满屏 accent 等于没有 accent）", () => {
+  it("只有真正值得注意的五态用 accent（满屏 accent 等于没有 accent）", () => {
     const tone = (kind: WakeKind) =>
       describeTrigger({ signalBoard: [], wake: { kind, trigger: "interval" } }).tone;
-    expect([tone("bar_advanced"), tone("price_breakout"), tone("profit_tier"), tone("resting_order")]).toEqual(
-      ["accent", "accent", "accent", "accent"],
-    );
+    expect([
+      tone("bar_advanced"),
+      tone("signal_flip"),
+      tone("price_breakout"),
+      tone("profit_tier"),
+      tone("resting_order"),
+    ]).toEqual(["accent", "accent", "accent", "accent", "accent"]);
     expect([tone("candle_close"), tone("position_watch"), tone("heartbeat")]).toEqual([
       "muted",
       "muted",
       "muted",
     ]);
+  });
+});
+
+// ---------- 唤醒调度闭环（ai-trade-wake-scheduler-closed-loop 轴 A：补跑标记）----------
+describe("describeTrigger 的补跑标记（返回新对象，绝不污染共享标签表）", () => {
+  const backlog = { droppedBars: 1, droppedIntervals: 3, waitedS: 259, chain: 1 };
+
+  it("补跑轮在原标签之后追加「· 补跑」", () => {
+    expect(
+      describeTrigger({
+        signalBoard: [],
+        trigger: "interval",
+        wake: { kind: "bar_advanced", trigger: "interval", backlog },
+      }).label,
+    ).toBe("补看新 K 线 · 首次研判 · 补跑");
+  });
+
+  it("绝不就地改写共享常量：下一轮的同 kind 标签必须干净", () => {
+    // `WAKE_LABELS[kind]` 是模块级共享对象；就地追加会让此后每一轮都带上补跑字样——
+    // 一个只该出现在个别轮次的标记会变成永久的谎话。
+    describeTrigger({
+      signalBoard: [],
+      wake: { kind: "bar_advanced", trigger: "interval", backlog },
+    });
+    expect(
+      describeTrigger({ signalBoard: [], wake: { kind: "bar_advanced", trigger: "interval" } }).label,
+    ).toBe("补看新 K 线 · 首次研判");
+  });
+
+  it("空 backlog（缺席 / 计数全 0）逐字回退，不加任何标记", () => {
+    expect(
+      describeTrigger({ signalBoard: [], wake: { kind: "heartbeat", trigger: "interval" } }).label,
+    ).toBe("心跳复盘 · 数据未见异动");
+    expect(
+      describeTrigger({
+        signalBoard: [],
+        wake: {
+          kind: "heartbeat",
+          trigger: "interval",
+          backlog: { droppedBars: 0, droppedIntervals: 0 },
+        },
+      }).label,
+    ).toBe("心跳复盘 · 数据未见异动");
+  });
+
+  it("二值兜底分支同样带补跑标记（补跑轮的 wake.kind 未必在标签表里）", () => {
+    expect(
+      describeTrigger({ signalBoard: [], trigger: "interval", wake: undefined }).label,
+    ).toBe("周期唤醒 · 常规复盘");
   });
 });
 

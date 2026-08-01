@@ -543,6 +543,69 @@ function TacticalEvidence({ context }: { context: TacticalContext }) {
   );
 }
 
+/**
+ * 补跑证据（轴 A）：上一轮研判期间丢了什么、最早的一次等了多久。
+ *
+ * 「等待时长」的口径是**自首次丢弃至今**，不是上一轮的研判耗时——后端没有把轮耗时记进 backlog，
+ * 写成后者就是在界面上给出一个用户无从校验的错数。
+ */
+function WakeBacklogEvidence({
+  backlog,
+}: {
+  backlog: NonNullable<AiTradeRoundTrace["wake"]>["backlog"];
+}) {
+  const bars = backlog?.droppedBars ?? 0;
+  const intervals = backlog?.droppedIntervals ?? 0;
+  if (!bars && !intervals) return null;
+  const parts = [
+    bars ? `${bars} 根 K 线收线未被研判` : "",
+    intervals ? `${intervals} 次定时唤醒被丢弃` : "",
+  ].filter(Boolean);
+  const waited = backlog?.waitedS;
+  return (
+    <div data-testid="wake-backlog" className="text-[var(--accent)]">
+      补跑 · 上一轮研判期间{parts.join("、")}
+      {typeof waited === "number" ? `，最早的一次已等待 ${Math.round(waited)}s` : ""}
+      {backlog?.chain ? `（补跑链第 ${backlog.chain} 轮）` : ""}
+    </div>
+  );
+}
+
+/**
+ * 立场翻转证据（轴 C）：**未收线**的预演结论，必须如实标注 provisional / repaint。
+ *
+ * 信号板与全部门禁仍以最近确认根为准——UI 把它呈现成既成事实，就等于用界面撤销了那条安全隔离。
+ */
+function WakeFlipEvidence({ flip }: { flip: NonNullable<AiTradeRoundTrace["wake"]>["flip"] }) {
+  if (!flip) return null;
+  const names = (flip.strategies ?? [])
+    .slice(0, 3)
+    .map((s) => `${s.name ?? "?"}（${describeStance(s.from ?? "")}→${describeStance(s.to ?? "")}）`)
+    .join("、");
+  return (
+    <div data-testid="wake-flip" className="flex flex-col gap-0.5">
+      <div className="font-medium text-[var(--text)]">
+        立场翻转 · {describeStance(flip.netStanceFrom ?? "")} →{" "}
+        {describeStance(flip.netStanceTo ?? "")}
+        {describeFlipEvidenceStrength(flip)}
+      </div>
+      {names ? <div>{names}</div> : null}
+      <div>未收线预演结果，可能随收线反复（repaint）；信号板与全部门禁仍以最近确认根为准。</div>
+    </div>
+  );
+}
+
+// 防抖强度小句：「已保持 47s / 4 次有效观测」。两项各自可缺（老事件 / 部分下发），缺项即省略，
+// 绝不出现半个括号或一个凭空的 0——「有效观测次数」是这条证据成立与否的核心论据，不许含糊。
+function describeFlipEvidenceStrength(
+  flip: NonNullable<NonNullable<AiTradeRoundTrace["wake"]>["flip"]>,
+): string {
+  const parts: string[] = [];
+  if (typeof flip.heldS === "number") parts.push(`已保持 ${Math.round(flip.heldS)}s`);
+  if (typeof flip.samples === "number") parts.push(`${flip.samples} 次有效观测`);
+  return parts.length ? `（${parts.join(" / ")}）` : "";
+}
+
 /** 输入信号板 / 中线背景 / 战术周期 / 体制 / 共识 / 市场证据摘要。 */
 function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
   const regime = describeRegime(trace.marketContext);
@@ -554,9 +617,12 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
   const multiTimeframe = trace.multiTimeframeContext ?? null;
   const tactical = trace.tacticalContext ?? null;
   const wakeReason = describeWakeReason(trace.wake);
+  const backlog = trace.wake?.backlog ?? null;
+  const flip = trace.wake?.flip ?? null;
   const board = trace.signalBoard ?? [];
-  // 早退门控**必须**含 tactical 与 wake：漏了它们，只有战术数据 / 只有唤醒断面的轮次会让整段
-  // 「输入信号板」消失（跑不出错、永远空白）——新增边缘态字段必须验证渲染门控没把该态排除掉。
+  // 早退门控**必须**含 tactical / wake / backlog / flip：漏了它们，只有战术数据、只有唤醒断面、
+  // 只有补跑信息或只有翻转明细的轮次会让整段「输入信号板」消失（跑不出错、永远空白）——
+  // 新增边缘态字段必须验证渲染门控没把该态排除掉。
   if (
     !board.length &&
     !regime &&
@@ -566,7 +632,9 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
     !factors &&
     !multiTimeframe &&
     !tactical &&
-    !wakeReason
+    !wakeReason &&
+    !backlog &&
+    !flip
   ) {
     return null;
   }
@@ -579,6 +647,8 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
         {/* 唤醒原因的判据明细：阈值是多少、实际走了多少，一律如实展示。轮头 chip 只给标签，
             具体数值放在展开区——静默的门禁在本仓库有前科，用户必须能回答「为什么叫 / 为什么没叫」。 */}
         {wakeReason ? <div data-testid="wake-reason">{wakeReason}</div> : null}
+        {backlog ? <WakeBacklogEvidence backlog={backlog} /> : null}
+        {flip ? <WakeFlipEvidence flip={flip} /> : null}
         {multiTimeframe ? <MultiTimeframeEvidence context={multiTimeframe} /> : null}
         {tactical ? <TacticalEvidence context={tactical} /> : null}
         {(regime || consensus) && (

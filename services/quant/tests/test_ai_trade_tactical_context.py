@@ -192,6 +192,7 @@ def test_disclosure_tier_is_brief_only_when_the_round_really_has_nothing():
 
 @pytest.mark.parametrize(("kind", "side", "context"), [
     ("price_breakout", "flat", _QUIET),                                   # ① 唤醒原因在升档集合
+    ("signal_flip", "flat", _QUIET),                                      # ①b 立场翻转轮同样升档
     ("heartbeat", "long", _QUIET),                                        # ② 持仓中
     ("heartbeat", "flat", {**_QUIET, "alignment": "diverged"}),           # ③ 体制背离
     ("heartbeat", "flat", {"alignment": "aligned", "frames": [{"digest": {
@@ -206,5 +207,8 @@ def test_execution_disclosure_compresses_every_repeat_round_of_the_same_bar():
     assert execution_disclosure(wake_kind="bar_advanced", enabled=True) == "full"
     assert execution_disclosure(wake_kind="heartbeat", enabled=True) == "repeat"
     assert execution_disclosure(wake_kind="price_breakout", enabled=True) == "repeat"
+    # `signal_flip` 刻意**不进**执行周期全量披露集合：翻转是未确认根上的预演结论，执行周期的
+    # 证据自上一根确认根起没变，压缩档仍正确（本轮最新变化由战术周期承载）。
+    assert execution_disclosure(wake_kind="signal_flip", enabled=True) == "repeat"
     # 总闸关闭 ⇒ 恒 full（渲染逐字节回退）
     assert execution_disclosure(wake_kind="heartbeat", enabled=False) == "full"

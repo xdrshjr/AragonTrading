@@ -978,12 +978,15 @@ export interface AiTradeTriggerView {
   tone: AiTraceTone; // long | short | muted | accent（复用轮头着色体系）
 }
 
-// 唤醒原因七态的轮头标签（wake-aware-context §3.3）：把原来单调的两个兜底文案细化成七态。
-// tone 只在「值得注意」的四态用 accent（补看新 K 线 / 价格异动 / 浮盈跨档 / 挂单盯守），
-// 常规心跳与持仓盯市保持 muted——满屏 accent 等于没有 accent。
-const WAKE_LABELS: Record<WakeKind, AiTradeTriggerView> = {
+// 唤醒原因八态的轮头标签（wake-aware-context §3.3 + wake-scheduler-closed-loop 轴 C）：把原来
+// 单调的两个兜底文案细化成八态。tone 只在「值得注意」的五态用 accent（补看新 K 线 / 立场翻转 /
+// 价格异动 / 浮盈跨档 / 挂单盯守），常规心跳与持仓盯市保持 muted——满屏 accent 等于没有 accent。
+// 导出供轴 D 的归因表复用标签（同一个 kind 在轨迹面板与胜率表里必须是同一句中文）。
+// 声明为 `Record<WakeKind, …>` ⇒ 后端新增 kind 时 tsc 强制要求补齐，不会静默漏一个展示点。
+export const WAKE_LABELS: Record<WakeKind, AiTradeTriggerView> = {
   candle_close: { label: "K 线收盘 · 信号板已重算", tone: "muted" },
   bar_advanced: { label: "补看新 K 线 · 首次研判", tone: "accent" },
+  signal_flip: { label: "策略立场翻转 · 未收线预演", tone: "accent" },
   resting_order: { label: "挂单盯守 · 未成交委托", tone: "accent" },
   profit_tier: { label: "浮盈跨档 · 保护线已激活", tone: "accent" },
   price_breakout: { label: "价格异动 · 越过唤醒阈值", tone: "accent" },
@@ -1014,11 +1017,11 @@ export function describeTrigger(
     // **绝不抢先**——有边沿信号时 `开多信号 · 均线突破` 的信息量高于 `价格异动`，让 wake 抢先
     // 是功能退化而非升级。
     const kind = trace.wake?.kind;
-    if (kind && WAKE_LABELS[kind]) return WAKE_LABELS[kind];
+    if (kind && WAKE_LABELS[kind]) return withCatchupMark(WAKE_LABELS[kind], trace.wake);
     if (trace.trigger === "interval") {
-      return { label: "周期唤醒 · 常规复盘", tone: "accent" };
+      return withCatchupMark({ label: "周期唤醒 · 常规复盘", tone: "accent" }, trace.wake);
     }
-    return { label: "K 线收盘 · 常规复盘", tone: "muted" };
+    return withCatchupMark({ label: "K 线收盘 · 常规复盘", tone: "muted" }, trace.wake);
   }
   if (fired.length === 1) {
     const s = fired[0];
@@ -1038,4 +1041,21 @@ export function describeTrigger(
     .map((a) => `${counts.get(a)}${describeAiAction(a)}`)
     .join("/");
   return { label: `信号分歧 · ${tally}`, tone: "accent" };
+}
+
+/**
+ * 补跑轮追加「· 补跑」标记（轴 A）。
+ *
+ * **必须返回新对象**：`WAKE_LABELS[kind]` 是一个**共享常量对象**，就地改写会污染全局标签表，
+ * 让此后每一轮都带上补跑字样——一个只该出现在个别轮次的标记会变成永久的谎话。
+ */
+function withCatchupMark(
+  base: AiTradeTriggerView,
+  wake: WakeInfo | null | undefined,
+): AiTradeTriggerView {
+  const backlog = wake?.backlog;
+  if (!backlog) return base;
+  const dropped = (backlog.droppedBars ?? 0) + (backlog.droppedIntervals ?? 0);
+  if (dropped <= 0) return base;
+  return { ...base, label: `${base.label} · 补跑` };
 }

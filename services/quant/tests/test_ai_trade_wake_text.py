@@ -1,6 +1,7 @@
 """唤醒 / 战术 / 重复轮压缩文案单测（ai-trade-wake-aware-context §6.1 T-9/T-10/T-11）。
 
-覆盖：七条唤醒文案各含其判定短语、`brief`/`full` 行数、可见截断标记、重复轮压缩、`wake` 缺席 ⇒ 空串。
+覆盖：八条唤醒文案各含其判定短语、`brief`/`full` 行数、可见截断标记、重复轮压缩、`wake` 缺席 ⇒ 空串，
+以及本轮新增的 `signal_flip` 措辞（必含 repaint 警示）与 `_backlog_clause` 的缺席即逐字回退（T-20）。
 措辞纪律的三条硬约束也在此钉死：条件化措辞、ATR 倍数必带周期名、阈值取**折算后**的实际门槛。
 """
 from __future__ import annotations
@@ -64,10 +65,16 @@ _REPEAT_DIGEST = {
 }
 
 
-# ---------- T-11：七条唤醒文案 ----------
+_FLIP = {"netStanceFrom": "flat", "netStanceTo": "long",
+         "strategies": [{"strategyId": 7, "name": "EMA 交叉短线", "from": "flat", "to": "long"}],
+         "provisional": True, "heldS": 47.3, "samples": 4, "barTs": 1_785_600_000}
+
+
+# ---------- T-11 / T-20：八条唤醒文案 ----------
 @pytest.mark.parametrize(("kind", "must_contain"), [
     ("candle_close", ["新 K 线收盘", "30m 确认根落地", "信号板已按新根重算"]),
     ("bar_advanced", ["补看新 K 线", "首次", "不要把上一轮结论"]),
+    ("signal_flip", ["策略立场翻转", "flat→long", "EMA 交叉短线", "0 分 47 秒"]),
     ("resting_order", ["挂单盯守", "未成交限价委托", "cancel_order"]),
     ("profit_tier", ["浮盈跨档", "移动止盈线已激活"]),
     ("price_breakout", ["价格异动", "距上轮 3 分 2 秒", "+0.42%", "0.91×30m ATR"]),
@@ -76,7 +83,7 @@ _REPEAT_DIGEST = {
 ])
 def test_each_wake_kind_carries_its_own_decisive_phrase(kind, must_contain):
     text = format_wake_for_prompt(_wake(kind, restingAgeS=240.0, guardStatus="armed",
-                                        lastGuardStatus="idle"))
+                                        lastGuardStatus="idle", flip=_FLIP))
     assert text.startswith("｜唤醒原因=")
     for phrase in must_contain:
         assert phrase in text, f"{kind} 文案缺少关键短语：{phrase}"
@@ -104,6 +111,50 @@ def test_absent_wake_renders_nothing_so_the_legacy_suffix_takes_over():
 def test_also_true_conditions_are_surfaced_and_never_silently_dropped():
     text = format_wake_for_prompt(_wake("resting_order", alsoTrue=["price_breakout"]))
     assert "同时成立=价格异动" in text
+
+
+def test_signal_flip_text_must_carry_all_three_repaint_anchors():
+    """T-20：翻转文案必须同时说清「未确认根」「可能 repaint」「以最近确认根为准」。
+
+    少任何一条，模型就可能把一个**预演**结论当成既成事实——而这正是轴 C 唯一可能造成真实亏损的
+    误读路径（结构性隔离已保证它进不了门禁，但措辞不能反过来撤销这条保证）。
+    """
+    text = format_wake_for_prompt(_wake("signal_flip", flip=_FLIP))
+    for anchor in ("未确认根", "repaint", "以最近确认根为准", "择时线索而非既成事实"):
+        assert anchor in text, f"signal_flip 文案缺少语义锚点：{anchor}"
+
+
+def test_signal_flip_label_is_available_as_an_also_true_condition():
+    """新 kind 必须同时进 `_ALSO_TRUE_LABEL`，否则它作为次要条件时会被静默丢掉。"""
+    text = format_wake_for_prompt(_wake("bar_advanced", alsoTrue=["signal_flip"], flip=_FLIP))
+    assert "同时成立=立场翻转" in text
+
+
+# ---------- T-20：补跑子句 ----------
+def test_backlog_clause_is_absent_verbatim_when_nothing_was_dropped():
+    """`backlog` 缺席 ⇒ 输出与 a7ed70c **逐字节相同**（G-1 冻结门禁的语义前提）。"""
+    baseline = format_wake_for_prompt(_wake("heartbeat"))
+    assert "补跑" not in baseline
+    assert format_wake_for_prompt(_wake("heartbeat", backlog=None)) == baseline
+    empty = {"droppedIntervals": 0, "droppedBars": 0, "waitedS": 0.0, "chain": 0}
+    assert format_wake_for_prompt(_wake("heartbeat", backlog=empty)) == baseline
+
+
+def test_backlog_clause_reports_both_drop_kinds_and_the_wait_since_the_first_one():
+    """措辞与 `WakeBacklog.wire` 口径逐字对应：等待时间是「最早的一次」，不是上一轮研判耗时。"""
+    text = format_wake_for_prompt(_wake("bar_advanced", backlog={
+        "droppedIntervals": 3, "droppedBars": 1, "waitedS": 259.0, "chain": 1}))
+    assert "1 根 K 线收线未被研判" in text
+    assert "3 次定时唤醒被丢弃" in text
+    assert "最早的一次已等待 4 分 19 秒" in text
+    assert "上一轮研判耗时" not in text
+
+
+def test_backlog_clause_precedes_the_also_true_clause():
+    """子句顺序固定：唤醒原因 → 补跑 → 同时成立（三段各自独立，互不吞并）。"""
+    text = format_wake_for_prompt(_wake("bar_advanced", alsoTrue=["price_breakout"],
+                                        backlog={"droppedBars": 2, "waitedS": 61.0}))
+    assert text.index("补跑") < text.index("同时成立")
 
 
 # ---------- 战术段：brief / full / 截断 ----------

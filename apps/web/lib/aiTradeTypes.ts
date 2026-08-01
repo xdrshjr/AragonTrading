@@ -129,10 +129,13 @@ export interface MultiTimeframeContext {
 }
 
 // ---- 唤醒感知上下文（ai-trade-wake-aware-context §5.3）----
-// 唤醒原因七态（与后端 wake_reason.WAKE_KINDS 镜像；判定顺序即优先级）。
+// 唤醒原因八态（与后端 wake_reason.WAKE_KINDS 镜像；判定顺序即优先级）。
+// `signal_flip` 插在 `bar_advanced` 之后：真的收了新根永远优先，除此之外「某个策略的立场正在
+// 翻转」是信息量最高的一件事（ai-trade-wake-scheduler-closed-loop 轴 C）。
 export type WakeKind =
   | "candle_close"
   | "bar_advanced"
+  | "signal_flip"
   | "resting_order"
   | "profit_tier"
   | "price_breakout"
@@ -159,6 +162,29 @@ export interface WakeInfo {
   lastGuardStatus?: string | null;
   alsoTrue?: WakeKind[];
   dropped?: boolean; // 被 in-flight 守卫丢弃的 K 线轮
+  backlog?: WakeBacklogInfo | null; // 仅补跑轮出现（轴 A）
+  flip?: WakeFlipInfo | null; // 仅 signal_flip 轮出现（轴 C）
+}
+
+// 上一轮研判期间被在飞守卫吞掉的唤醒（轴 A）。`waitedS` 的口径是「自**首次**丢弃至今」，
+// 不是上一轮的研判耗时——后端并没有把轮耗时记进 backlog，两者不可混读。
+export interface WakeBacklogInfo {
+  droppedIntervals?: number;
+  droppedBars?: number;
+  waitedS?: number;
+  chain?: number; // 本轮是补跑链的第几轮（背靠背补跑的计数，非补跑轮启动即归零）
+}
+
+// 未确认根上的**投影净共识**立场翻转（轴 C）。`provisional` 恒为 true：它是预演结论，
+// 信号板与全部门禁仍以最近确认根为准，UI 必须如实标注，绝不呈现成既成事实。
+export interface WakeFlipInfo {
+  netStanceFrom?: string;
+  netStanceTo?: string;
+  strategies?: { strategyId?: number; name?: string; from?: string; to?: string }[];
+  provisional?: boolean;
+  heldS?: number; // 该翻转已连续保持多久（**只按有效采样推进**，行情没动过的采样不计）
+  samples?: number;
+  barTs?: number;
 }
 
 // 自上一决策轮的价格变动：**与周期无关**，故挂在 TacticalContext 顶层而非逐周期重复。
@@ -531,6 +557,15 @@ export interface AiTradeSessionRow {
   // 全量 spread 合并进 member.session；REST info() 不带 → WS 连上前短暂 undefined，呈现「—」）。
   wakeSkips?: number;
   holdStreak?: number;
+  // 唤醒调度闭环观测（wake-scheduler-closed-loop §4.3）：status 事件经 store.patchAiTradeMemberStatus
+  // **全量展开**合并进 member.session，故运行期数据本来就在——漏的只是类型声明，症状是 tsc 报错
+  // 而非静默丢数据，但极易被「后端已下发」骗过去。
+  // `wakeDrops` 的口径是「**到点了却撞上在飞轮**的唤醒次数」，其中一部分若不在飞也会被守卫跳过，
+  // 故它并不等于「系统漏掉了这么多次决策」——呈现处必须写清楚。
+  wakeDrops?: number;
+  wakeCatchups?: number;
+  positionWatchSkips?: number;
+  signalFlipWakes?: number;
 }
 
 // WS status 事件负载（_status_payload / 轻量 status，会话视图的可增量合并子集）。
@@ -547,6 +582,11 @@ export interface AiTradeStatusEvent {
   // hold-inertia-observability O2：第 1 轮后端已发 wakeSkips（本轮补齐类型）；holdStreak 为本轮新增。
   wakeSkips?: number;
   holdStreak?: number;
+  // 唤醒调度闭环四计数（口径见 AiTradeSessionRow 上的注释；全量 spread 合并进 member.session）。
+  wakeDrops?: number;
+  wakeCatchups?: number;
+  positionWatchSkips?: number;
+  signalFlipWakes?: number;
   degraded?: boolean;
   stopReason?: string | null;
   flattenFailed?: boolean;

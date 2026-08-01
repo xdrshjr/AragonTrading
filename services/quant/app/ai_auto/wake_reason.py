@@ -16,8 +16,10 @@ from dataclasses import dataclass
 
 from .profit_guard import ARMED_STATUSES
 
-# 七种唤醒原因，按判定优先级排列（首个命中即为 kind，其余成立项进 alsoTrue）。
-WAKE_KINDS = ("candle_close", "bar_advanced", "resting_order", "profit_tier",
+# 八种唤醒原因，按判定优先级排列（首个命中即为 kind，其余成立项进 alsoTrue）。
+# `signal_flip` 插在 `bar_advanced` 之后、`resting_order` 之前：真的收了新根永远优先；除此之外，
+# 「某个策略的立场正在翻转」是信息量最高的一件事（wake-scheduler-closed-loop §2.4）。
+WAKE_KINDS = ("candle_close", "bar_advanced", "signal_flip", "resting_order", "profit_tier",
               "price_breakout", "position_watch", "heartbeat")
 
 
@@ -54,6 +56,9 @@ class WakeFacts:
     last_round_guard_status: str | None = None
     since_last_round_s: float = 0.0
     resting_age_s: float | None = None
+    # 轴 C：未确认根预演出的投影净共识翻转（`signal_preview.flip_signature` 的 wire + 防抖读数）。
+    # None ⇒ `flip` 整键缺席 ⇒ 非翻转轮的 wire 逐字节回退 a7ed70c。
+    flip: dict | None = None
 
 
 def horizon_scale(wake_interval_s: float, bar_seconds: int) -> float:
@@ -130,6 +135,7 @@ def classify_wake(facts: WakeFacts, *, move_atr_mult: float, move_pct: float,
     conditions = (
         ("candle_close", facts.trigger == "candle"),
         ("bar_advanced", bar_advanced),
+        ("signal_flip", facts.flip is not None),
         ("resting_order", facts.has_resting),
         ("profit_tier", in_position
          and facts.guard_status != facts.last_round_guard_status
@@ -139,7 +145,7 @@ def classify_wake(facts: WakeFacts, *, move_atr_mult: float, move_pct: float,
     )
     fired = [name for name, ok in conditions if ok]
     kind = fired[0] if fired else "heartbeat"
-    return {
+    wire = {
         "kind": kind,
         "trigger": facts.trigger,
         "executionBar": None,           # 由 WakeRuntime 回填（文案的 ATR 量纲周期名，见 wake_text）
@@ -157,3 +163,6 @@ def classify_wake(facts: WakeFacts, *, move_atr_mult: float, move_pct: float,
         "lastGuardStatus": facts.last_round_guard_status,
         "alsoTrue": list(fired[1:]),
     }
+    if facts.flip is not None:      # 缺席即整键不出现（与 tacticalContext / baseRules 同款范式）
+        wire["flip"] = facts.flip
+    return wire

@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react";
 import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
+import WakeAttributionCard from "./WakeAttributionCard";
 import AutoTradePnlSummary from "@/components/Chart/AutoTradePnlSummary";
 import AutoTradeRoundTripRow from "@/components/Chart/AutoTradeRoundTripRow";
 import {
@@ -19,7 +20,7 @@ import {
   summarizeProfitCaptureAcross,
 } from "@/lib/aiTradeCapture";
 import { computeReflectionCounts, latestHoldStreak } from "@/lib/aiTradeObservability";
-import type { AiTradeGroupMemberState } from "@/lib/aiTradeTypes";
+import type { AiTradeGroupMemberState, AiTradeSessionRow } from "@/lib/aiTradeTypes";
 import { colorForReturn, fmtTime, signed } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 
@@ -46,15 +47,24 @@ export default function AiTradeStatsLive() {
       : null;
   }, [group]);
 
-  const { visible, summary, bounds, fullSummary } = useMemo<{
+  // 轴 D 取**未筛选**的 ledger 是刻意的——与 fullSummary / AnnualizedProjectionCard 同源：
+  // 胜率归因的样本量本来就少（MIN_SAMPLES=5），再叠一层时间筛选会让这张表在绝大多数窗口下整卡消失。
+  const { visible, summary, bounds, fullSummary, ledger } = useMemo<{
     visible: RoundTrip[];
     summary: PnlSummary;
     bounds: { startTs: number; endTs: number };
     fullSummary: PnlSummary;
+    ledger: RoundTrip[];
   }>(() => {
     if (!group) {
       const empty = summarizeRoundTrips([], 0);
-      return { visible: [], summary: empty, bounds: { startTs: 0, endTs: nowSec }, fullSummary: empty };
+      return {
+        visible: [],
+        summary: empty,
+        bounds: { startTs: 0, endTs: nowSec },
+        fullSummary: empty,
+        ledger: [],
+      };
     }
     const members = Object.values(group.members).map((m) => ({
       instId: m.instId,
@@ -70,6 +80,7 @@ export default function AiTradeStatsLive() {
       summary: summarizeRoundTrips(vis, capitalBaseUsd),
       bounds: b,
       fullSummary: summarizeRoundTrips(ledger, capitalBaseUsd),
+      ledger,
     };
   }, [group, range, custom, nowSec, capitalBaseUsd]);
 
@@ -120,6 +131,7 @@ export default function AiTradeStatsLive() {
           tradeCount={fullSummary.count}
         />
         <ProfitCaptureCard capture={capture} />
+        <WakeAttributionCard trips={ledger} />
         {unrealizedUsd !== null && (
           <div className="flex items-center justify-between rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs">
             <span className="text-[var(--muted)]">
@@ -165,15 +177,43 @@ function MemberObservabilityRow({ member }: { member: AiTradeGroupMemberState })
   const counts = computeReflectionCounts(member.decisions);
   const wakeSkips = member.session?.wakeSkips;
   const holdStreak = latestHoldStreak(member.decisions, member.session);
+  const scheduler = describeWakeScheduler(member.session);
   return (
     <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-0.5 text-[11px]">
       <span className="font-medium text-[var(--text)]">{member.instId}</span>
       <span className="tabular text-[var(--muted)]">
         反思 {counts.runs}（放行 {counts.confirms} · 否决 {counts.aborts} · 故障 {counts.failClosed}）
         · 唤醒抑制 {wakeSkips ?? "—"} · 连续观望 {holdStreak === null ? "—" : `${holdStreak} 轮`}
+        {scheduler ? (
+          <span data-testid="wake-scheduler-counts" title={WAKE_SCHEDULER_HINT}>
+            {" "}
+            · {scheduler}
+          </span>
+        ) : null}
       </span>
     </div>
   );
+}
+
+// wakeDrops 的口径是「**到点了却撞上在飞轮**」，其中一部分即便不在飞也会被守卫跳过——不写清楚，用户
+// 会把它读成「系统漏掉了这么多次决策」（wake-scheduler-closed-loop §4.3 点名要求的那条 tooltip）。
+const WAKE_SCHEDULER_HINT =
+  "补跑 A/B：B = 到点却撞上在飞轮的唤醒次数（其中一部分即便不在飞也会被守卫跳过，故它不等于" +
+  "「系统漏掉了这么多次决策」），A = 其中真的补跑了一轮的次数。" +
+  "持仓省 = 保护线在岗（armed）时跳过的持仓盯市轮；翻转唤 = 未收线预演出立场翻转而起的轮。";
+
+// 唤醒调度闭环四计数（§4.3）。四个数全为 0 ⇒ 返回 null ⇒ **整段不出现**：轴未生效的会话不该看到
+// 一排 0，那会被读成「统计坏了」——与本页「老记录缺键即整行隐藏」的既有纪律同款。
+function describeWakeScheduler(session: AiTradeSessionRow | null | undefined): string | null {
+  const drops = session?.wakeDrops ?? 0;
+  const catchups = session?.wakeCatchups ?? 0;
+  const positionWatchSkips = session?.positionWatchSkips ?? 0;
+  const signalFlipWakes = session?.signalFlipWakes ?? 0;
+  const parts: string[] = [];
+  if (drops || catchups) parts.push(`补跑 ${catchups}/${drops}`);
+  if (positionWatchSkips) parts.push(`持仓省 ${positionWatchSkips}`);
+  if (signalFlipWakes) parts.push(`翻转唤 ${signalFlipWakes}`);
+  return parts.length ? parts.join(" · ") : null;
 }
 
 // 窄化守卫：position 为 unknown | null，仅取真实 number 型 unrealizedPnl（WS position 载荷承载浮盈的字段，

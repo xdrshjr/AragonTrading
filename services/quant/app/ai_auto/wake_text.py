@@ -14,8 +14,9 @@
 from __future__ import annotations
 
 _ALSO_TRUE_LABEL = {
-    "candle_close": "新 K 线收盘", "bar_advanced": "补看新 K 线", "resting_order": "挂单盯守",
-    "profit_tier": "浮盈跨档", "price_breakout": "价格异动", "position_watch": "持仓盯市",
+    "candle_close": "新 K 线收盘", "bar_advanced": "补看新 K 线", "signal_flip": "立场翻转",
+    "resting_order": "挂单盯守", "profit_tier": "浮盈跨档", "price_breakout": "价格异动",
+    "position_watch": "持仓盯市",
 }
 _TRUNCATION_HINT = "…（战术周期证据已按 {max_chars} 字上限截断）"
 
@@ -31,7 +32,9 @@ def format_wake_for_prompt(wake: dict | None) -> str:
     suffix = f"｜唤醒原因={body(wake)}"
     also = [_ALSO_TRUE_LABEL[name] for name in (wake.get("alsoTrue") or [])
             if name in _ALSO_TRUE_LABEL]
-    return f"{suffix}｜同时成立={'/'.join(also)}" if also else suffix
+    also_clause = f"｜同时成立={'/'.join(also)}" if also else ""
+    # `backlog` 缺席时返回值**逐字节等于**本轮之前的现状（G-1 冻结门禁按这条对拍）。
+    return f"{suffix}{_backlog_clause(wake)}{also_clause}"
 
 
 def format_tactical_for_prompt(context: dict | None, tier: str, *, max_chars: int) -> list[str]:
@@ -94,7 +97,7 @@ def format_digest_repeat(digest: dict | None, bar: str | None, *, has_tactical: 
             f"ATR%={atr.get('value')}）{pointer}")
 
 
-# ---------- 唤醒原因七态文案 ----------
+# ---------- 唤醒原因八态文案 + 补跑子句 ----------
 def _wake_candle_close(wake: dict) -> str:
     return f"新 K 线收盘（{_bar(wake)} 确认根落地，信号板已按新根重算）"
 
@@ -102,6 +105,37 @@ def _wake_candle_close(wake: dict) -> str:
 def _wake_bar_advanced(wake: dict) -> str:
     return ("补看新 K 线（上一轮研判仍在进行时该根已收线，本轮是它的**首次**研判"
             "——不要把上一轮结论当作对这根 K 线的判断）")
+
+
+def _wake_signal_flip(wake: dict) -> str:
+    flip = wake.get("flip") or {}
+    names = "、".join(item.get("name", "?") for item in (flip.get("strategies") or [])[:3])
+    return (f"策略立场翻转（{flip.get('netStanceFrom')}→{flip.get('netStanceTo')}；"
+            f"{names} 在**当前未收线**的这根上改变了立场，已连续保持 "
+            f"{_duration(flip.get('heldS'))}）。这是**未确认根**上的预演结果，"
+            "可能随收线反复（repaint）；信号板与全部门禁仍以最近确认根为准，"
+            "请把它当作择时线索而非既成事实")
+
+
+def _backlog_clause(wake: dict) -> str:
+    """补跑子句（追加在任意 kind 的原因之后，**只在 `backlog` 存在时**出现）。
+
+    措辞与 `WakeBacklog.wire` 的口径逐字对应：`waitedS` 是「自**首次**丢弃至今」，不是上一轮的
+    研判耗时——会话并没有把轮耗时记进 backlog，把一个数说成它不是的东西正是本模块反复要杜绝的失真。
+    """
+    backlog = wake.get("backlog") or {}
+    bars = backlog.get("droppedBars") or 0
+    intervals = backlog.get("droppedIntervals") or 0
+    if not (bars or intervals):
+        return ""
+    parts = []
+    if bars:
+        parts.append(f"{bars} 根 K 线收线未被研判")
+    if intervals:
+        parts.append(f"{intervals} 次定时唤醒被丢弃")
+    return (f"｜补跑（上一轮研判期间{'、'.join(parts)}，最早的一次已等待 "
+            f"{_duration(backlog.get('waitedS'))}；本轮是它们的首次研判，"
+            "不要把上一轮结论当作对这段行情的判断）")
 
 
 def _wake_resting_order(wake: dict) -> str:
@@ -137,6 +171,7 @@ def _wake_heartbeat(wake: dict) -> str:
 _WAKE_BODY = {
     "candle_close": _wake_candle_close,
     "bar_advanced": _wake_bar_advanced,
+    "signal_flip": _wake_signal_flip,
     "resting_order": _wake_resting_order,
     "profit_tier": _wake_profit_tier,
     "price_breakout": _wake_price_breakout,
