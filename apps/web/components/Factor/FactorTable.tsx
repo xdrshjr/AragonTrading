@@ -246,8 +246,21 @@ function Row({
           <div className="flex items-center gap-1.5">
             <span className="font-medium text-[var(--text)]">{factor.name}</span>
             {intradayOnly && <Badge tone="neutral">仅日内</Badge>}
+            {/* 挖掘因子按 source 给独立徽标：它的 category 统一为 "discovered"，不进既有类别
+                chip（strategy-factor-discovery §2.12），故不能靠 category 识别。 */}
+            {factor.source === "mined" && <Badge tone="accent">挖掘</Badge>}
           </div>
-          <code className="text-[10px] text-[var(--muted)]">{factor.factorKey}</code>
+          {factor.factorKey === "expr" ? (
+            // 挖掘表达式因子：只读等宽表达式 pill（参数不可手改，真源是挖掘任务的候选记录）。
+            <code
+              className="max-w-[280px] truncate rounded-[6px] bg-[var(--surface-2)] px-1.5 py-0.5 text-[10px] text-[var(--text)]"
+              title={String((factor.params as Record<string, unknown>)?.expr ?? "")}
+            >
+              {String((factor.params as Record<string, unknown>)?.expr ?? factor.factorKey)}
+            </code>
+          ) : (
+            <code className="text-[10px] text-[var(--muted)]">{factor.factorKey}</code>
+          )}
         </div>
       </td>
       <td className="px-3 py-2 text-[var(--muted)]">{categoryLabel(factor.category)}</td>

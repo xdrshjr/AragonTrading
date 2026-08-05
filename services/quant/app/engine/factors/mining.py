@@ -50,6 +50,8 @@ def default_candidates(bar: str, categories: list[str] | None = None) -> list[di
     """
     out: list[dict] = []
     for key, spec in FACTOR_LIBRARY.items():
+        if spec.hidden:
+            continue   # D-1 桥接条目（expr）不进经典挖掘候选集（§2.2 四处改点之一）
         if categories and spec.category not in categories:
             continue
         for params in _MINE_GRID.get(key, [{}]):

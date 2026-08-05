@@ -21,6 +21,7 @@ from .library import (  # noqa: F401
     compute_factor,
     factor_meta,
     is_bar_compatible,
+    visible_factor_keys,
 )
 from .mining import (  # noqa: F401
     MINE_WORK_UNIT_LIMIT,

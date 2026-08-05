@@ -2,7 +2,13 @@
 from __future__ import annotations
 
 from app.engine.backtester import candles_to_df
-from app.engine.factors import FACTOR_LIBRARY, default_candidates, mine_factors, mining_workload
+from app.engine.factors import (
+    FACTOR_LIBRARY,
+    default_candidates,
+    mine_factors,
+    mining_workload,
+    visible_factor_keys,
+)
 from app.okx.types import Candle
 from tests.conftest import make_synthetic_candles
 
@@ -32,8 +38,11 @@ def test_mining_workload_is_candidate_times_bars():
 
 
 def test_default_candidates_cover_whole_library():
+    """经典挖掘候选集覆盖**目录可见**全库；``hidden`` 的 ``expr`` 桥绝不进候选（§3.6）。"""
     keys = {c["factorKey"] for c in default_candidates("1H")}
-    assert keys == set(FACTOR_LIBRARY)
+    assert keys == set(visible_factor_keys())
+    assert "expr" not in keys
+    assert "expr" in FACTOR_LIBRARY
 
 
 def test_mine_ranks_by_abs_ir_descending():

@@ -63,14 +63,18 @@ function backendEnv({ mode, dbPath, agentEnv } = {}) {
   if (mode === 'prod') {
     env.LIVE_AUTO_TRADING_ENABLED ??= 'true';
   }
-  // prod：把 AGENT_* / LIVE_* / AI_TRADE_* 注入后端子进程 env（密钥仅在后端，绝不下发前端，R3/R4；
-  // 实盘开关 C1-6）。AI_TRADE_* 为 ai-auto-trading 必改透传（P1-6）：否则 Settings extra="ignore" 会
-  // 静默丢弃未透传的 AI_TRADE_ENABLED，打包/prod 将永远无法启用 AI 自动交易。因 AI_TRADE_ENABLED 默认
-  // OFF（安全姿态），刻意**不**为其加 prod 默认注入行（对比上方 LIVE_AUTO_TRADING_ENABLED ??= 'true'）
-  // ——用户在 prod 须显式提供 env 方可开启。
+  // prod：把 AGENT_* / LIVE_* / AI_TRADE_* / DISCOVERY_* 注入后端子进程 env（密钥仅在后端，
+  // 绝不下发前端，R3/R4；实盘开关 C1-6）。
+  // AI_TRADE_* 为 ai-auto-trading 必改透传（P1-6）：否则 Settings extra="ignore" 会静默丢弃未
+  // 透传的 AI_TRADE_ENABLED，打包/prod 将永远无法启用 AI 自动交易。因 AI_TRADE_ENABLED 默认 OFF
+  // （安全姿态），刻意**不**为其加 prod 默认注入行（对比上方 LIVE_AUTO_TRADING_ENABLED ??=
+  // 'true'）——用户在 prod 须显式提供 env 方可开启。
+  // DISCOVERY_* 为 strategy-factor-discovery 必改透传（§六）：漏改即所有 DISCOVERY_ env 静默
+  // 失效，打包/prod 将无法用 agent.env 覆盖挖掘总闸与配额。
   if (mode === 'prod' && agentEnv && typeof agentEnv === 'object') {
     for (const [key, value] of Object.entries(agentEnv)) {
-      if ((key.startsWith('AGENT_') || key.startsWith('LIVE_') || key.startsWith('AI_TRADE_'))
+      if ((key.startsWith('AGENT_') || key.startsWith('LIVE_') || key.startsWith('AI_TRADE_')
+           || key.startsWith('DISCOVERY_'))
           && value != null) {
         env[key] = String(value);
       }

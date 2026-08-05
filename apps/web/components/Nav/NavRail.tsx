@@ -7,7 +7,7 @@ import { useAppStore, type WorkbenchView } from "@/lib/store";
 /**
  * 左侧竖向主功能导航栏（App Shell 外壳）。
  *
- * 纵向排布一级功能项（交易 / 因子实验室），常驻在 header 之下、内容区最左侧；点击即写入
+ * 纵向排布一级功能项（交易 / 因子实验室 / 策略与因子挖掘），常驻在 header 之下、内容区最左侧；点击即写入
  * store.activeView 切换视图，并关闭设置浮层。选中项以赭色强调（--accent）+ 左侧指示条高亮。
  * 内联 SVG，无三方图标依赖（镜像 FactorButton/SettingsGearButton 的着色与圆角 token）。
  * 普通 <button> + aria-current 即满足 Tab/Enter/Space 键盘可达（因子层 NavRail §2.3）。
@@ -46,9 +46,23 @@ function FactorIcon(): ReactNode {
   );
 }
 
+function RadarIcon(): ReactNode {
+  // 雷达：同心扫描弧 + 指向臂，呼应「持续扫描 / 自动发现」。规格与前两枚一致
+  // （20×20 / 1.6 stroke / currentColor / 内联 SVG，不引第三方图标库）。
+  return (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle cx="12" cy="12" r="8.5" stroke="currentColor" strokeWidth="1.6" />
+      <circle cx="12" cy="12" r="4.5" stroke="currentColor" strokeWidth="1.6" />
+      <circle cx="12" cy="12" r="1.1" fill="currentColor" />
+      <path d="M12 12 19.2 7.6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 const ITEMS: NavItem[] = [
   { key: "trade", label: "交易", icon: <TradeIcon /> },
   { key: "factor", label: "因子实验室", icon: <FactorIcon /> },
+  { key: "discovery", label: "策略与因子挖掘", icon: <RadarIcon /> },
 ];
 
 export default function NavRail() {
@@ -69,7 +83,7 @@ export default function NavRail() {
       className="flex w-12 shrink-0 flex-col gap-1 border-r border-[var(--border)] bg-[var(--surface)]/60 px-2 py-3"
     >
       {ITEMS.map((item) => {
-        // 设置浮层打开时两项均不显选中，避免误导（高亮以 !showSettings && activeView 计算）。
+        // 设置浮层打开时各项均不显选中，避免误导（高亮以 !showSettings && activeView 计算）。
         const active = !showSettings && activeView === item.key;
         return (
           <button

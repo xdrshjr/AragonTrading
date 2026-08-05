@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 from fastapi import HTTPException
 
@@ -19,6 +20,13 @@ MIN_FACTOR_SET_MEMBERS = 1    # 单因子也可成组合（直接用某个因子
 MAX_FACTOR_SET_MEMBERS = 12
 VALID_DIRECTIONS = ("long", "short")
 
+# 挖掘表达式因子（strategy-factor-discovery D-1）的成员列名格式（评审 P0-3 承重）。
+# 挖掘组合的**每个成员 factorKey 都是 `expr`**，若不透传 `name`，``member_names`` 会退化成
+# `expr` / `expr#2` / `expr#3` 这种**纯位置序**：成员一旦重排，``assert_weights_cover`` 的键集
+# 相等检查照样通过，训练权重却被静默错配到别的因子上。故此处强制 `expr:<hash8>` 并透传。
+EXPR_FACTOR_KEY = "expr"
+EXPR_MEMBER_NAME_RE = re.compile(r"^expr:[0-9a-f]{8}$")
+
 
 def _bad(code: str, message: str) -> HTTPException:
     return HTTPException(400, detail={"code": code, "message": message})
@@ -30,14 +38,44 @@ def validate_factor_key(key: str) -> None:
         raise _bad("FACTOR_UNKNOWN", f"未知因子：{key}")
 
 
+def _validate_expr_member(member: dict, params: dict) -> str:
+    """``expr`` 成员的两处加法校验（strategy-factor-discovery §2.2，评审 P0-3）。
+
+    ① 强制并透传 ``name``（格式 ``expr:<hash8>``），使 ``member_names`` 得到**与表达式绑定**
+    的稳定列名，列名不再依赖成员顺序；② ``params["expr"]`` 必须能被 ``parse_expression``
+    解析（边界一次性校验，进入内部后信任）。
+
+    Returns:
+        校验通过的成员列名。
+
+    Raises:
+        HTTPException: 400 ``FACTOR_MEMBER_NAME_REQUIRED`` / ``FACTOR_EXPR_INVALID``。
+    """
+    # 延迟导入：specs 属请求边界层，避免模块加载期把 discovery 拉进 factors 包依赖图。
+    from ..discovery.expression import ExpressionError, parse_expression
+
+    name = str(member.get("name") or "")
+    if not EXPR_MEMBER_NAME_RE.match(name):
+        raise _bad("FACTOR_MEMBER_NAME_REQUIRED",
+                   "挖掘表达式因子成员必须带 name（格式 expr:<8 位小写十六进制哈希>）")
+    try:
+        parse_expression(str(params.get("expr") or ""))
+    except ExpressionError as exc:
+        raise _bad("FACTOR_EXPR_INVALID", f"成员 {name} 的表达式非法：{exc}") from exc
+    return name
+
+
 def validate_members(members: list[dict]) -> list[dict]:
     """校验并归一化组合成员（factorKey 已知、direction 冻结、成员数在界内）。
 
     Returns:
-        ``[{factorKey, params, weight, direction}]``（自包含，不引用 factors.id）。
+        ``[{factorKey, params, weight, direction}]``（自包含，不引用 factors.id）；
+        ``factorKey == "expr"`` 的成员**额外**透传 ``name``（§2.2，评审 P0-3）——非 ``expr``
+        成员的返回 dict 与本改动前逐键一致（零回归）。
 
     Raises:
-        HTTPException: 400 —— 未知因子 / 非法方向（含 auto）/ 成员数越界。
+        HTTPException: 400 —— 未知因子 / 非法方向（含 auto）/ 成员数越界 /
+            ``expr`` 成员缺 name 或表达式非法。
     """
     if not isinstance(members, list):
         raise _bad("FACTOR_MEMBERS", "members 必须为数组")
@@ -48,8 +86,12 @@ def validate_members(members: list[dict]) -> list[dict]:
         direction = member.get("direction", "long")
         if direction not in VALID_DIRECTIONS:
             raise _bad("FACTOR_DIRECTION", f"成员 {key} 方向须冻结为 long/short（不接受 {direction}）")
-        out.append({"factorKey": key, "params": dict(member.get("params") or {}),
-                    "weight": _safe_float(member.get("weight"), 0.0), "direction": direction})
+        params = dict(member.get("params") or {})
+        row = {"factorKey": key, "params": params,
+               "weight": _safe_float(member.get("weight"), 0.0), "direction": direction}
+        if key == EXPR_FACTOR_KEY:
+            row["name"] = _validate_expr_member(member, params)
+        out.append(row)
     if not (MIN_FACTOR_SET_MEMBERS <= len(out) <= MAX_FACTOR_SET_MEMBERS):
         raise _bad("FACTOR_MEMBERS",
                    f"组合成员数须在 {MIN_FACTOR_SET_MEMBERS}..{MAX_FACTOR_SET_MEMBERS} 之间")

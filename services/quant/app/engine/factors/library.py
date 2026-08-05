@@ -28,6 +28,10 @@ class FactorSpec:
         params_schema: 与前端 ParamSchema 对齐的参数定义（缺省即生产值）。
         compute: 纯计算 ``(df, params) -> pd.Series``（严格因果，与 df 等长）。
         intraday_only: 仅日内 bar 有效（非日内返回全 NaN，挖掘中跳过）。
+        hidden: 仅供内部桥接、**不进目录**（strategy-factor-discovery §2.2 / D-1）。
+            末位带默认值 ⇒ 既有 12 条构造零改。``available_factors`` /
+            ``visible_factor_keys`` / seed / ``default_candidates`` /
+            Agent 工具枚举五处遍历现场**必须**一致过滤它（漏一处即出空壳因子，R-10）。
     """
 
     cn: str
@@ -36,6 +40,7 @@ class FactorSpec:
     params_schema: dict
     compute: Callable[[pd.DataFrame, dict], pd.Series]
     intraday_only: bool = False
+    hidden: bool = False
 
 
 def _param(params: dict | None, key: str, default: float) -> float:
@@ -137,6 +142,23 @@ def _px_vwap_dist(df: pd.DataFrame, params: dict) -> pd.Series:
     return (df["c"] - vwap) / vwap.replace(0.0, np.nan)
 
 
+def _expr_factor(df: pd.DataFrame, params: dict) -> pd.Series:
+    """通用表达式因子（D-1 桥）：``params["expr"]`` 为 discovery 规范式。
+
+    降级契约（strategy-factor-discovery §2.2 硬约束，评审 P1-1）：解析 / 求值任何失败路径
+    都必须返回**与 df 等长、index 0..n-1 的全 NaN Series**。既有
+    ``test_factor_library.py`` 的因果性 / 形状两条用例会以 ``params=None`` 遍历全库到本条目，
+    返回空 Series 或长度不符即打红。
+
+    延迟导入 + **直达子模块**（绝不 ``from ...discovery import ...``）：避免
+    ``discovery/__init__`` 的再导出把 ``engine.factors.evaluation`` 整条链拉起，形成
+    ``engine ↔ discovery`` 回边（评审 P2-7）。``expression`` 只依赖 numpy/pandas。
+    """
+    from ...discovery.expression import evaluate_expression_text
+
+    return evaluate_expression_text(df, str((params or {}).get("expr", "")))
+
+
 # ============================ 因子库（唯一真源 C6） ============================
 def _schema(label: str, **fields: dict) -> dict:
     """构造单因子 params_schema（与前端 ParamSchema 对齐；label 仅占位说明）。"""
@@ -193,6 +215,13 @@ FACTOR_LIBRARY: dict[str, FactorSpec] = {
     "px_vwap_dist": FactorSpec(
         "收盘相对 session VWAP 偏离", "mean_revert", "short",
         {}, _px_vwap_dist, intraday_only=True),
+    # D-1 桥（strategy-factor-discovery §2.2）：挖掘产物经本条目零改地复用整条既有管线
+    # （评估 / 权重训练 / 组合 / 回测 / AI 上下文）。``hidden=True`` ⇒ 不进因子目录、不进
+    # Agent 工具枚举、不 seed、不进经典挖掘候选集——它只作为挖掘产物的落库载体存在。
+    "expr": FactorSpec(
+        "自动挖掘表达式因子", "discovered", "long",
+        {"expr": {"type": "expr", "default": "", "label": "因子表达式", "readonly": True}},
+        _expr_factor, hidden=True),
 }
 
 
@@ -207,9 +236,22 @@ def factor_meta(key: str) -> dict | None:
             "intradayOnly": spec.intraday_only}
 
 
+def visible_factor_keys() -> tuple[str, ...]:
+    """目录可见的因子 key（过滤 ``hidden``）—— 五处遍历现场的**唯一口径**（§2.2）。
+
+    ``hidden`` 条目（当前仅 D-1 的 ``expr`` 桥）仍在 ``FACTOR_LIBRARY`` 里可被
+    ``compute_factor`` / ``validate_factor_key`` 正常解析，只是不出现在任何面向用户或
+    面向模型的目录里——否则会出现「一条永远算不出值的空表达式因子」。
+    """
+    return tuple(key for key, spec in FACTOR_LIBRARY.items() if not spec.hidden)
+
+
 def available_factors() -> list[dict]:
-    """因子目录 ``[{key,cn,category,directionHint,paramsSchema,intradayOnly}]``（UI / primer 共用真源 C6）。"""
-    return [factor_meta(key) for key in FACTOR_LIBRARY]  # type: ignore[misc]
+    """因子目录 ``[{key,cn,category,directionHint,paramsSchema,intradayOnly}]``（UI / primer 共用真源 C6）。
+
+    只回 ``visible_factor_keys()``：``hidden`` 桥接条目绝不进目录（§2.2 四处改点之一）。
+    """
+    return [factor_meta(key) for key in visible_factor_keys()]  # type: ignore[misc]
 
 
 def is_bar_compatible(key: str, bar: str) -> bool:

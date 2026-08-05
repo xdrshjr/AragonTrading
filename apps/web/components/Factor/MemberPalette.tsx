@@ -107,6 +107,7 @@ interface Candidate {
   member: FactorMember; // 点击时切换的成员
   label: string;
   factorKey: string;
+  exprText?: string;
   category: string;
   direction: FrozenDirection;
   rankIc?: number | null; // 仅「我的因子」展示主 horizon RankIC（undefined=不展示）
@@ -252,6 +253,7 @@ function CandidateBody({
             key={c.uid}
             label={c.label}
             factorKey={c.factorKey}
+            exprText={c.exprText}
             category={c.category}
             direction={c.direction}
             rankIc={c.rankIc}
@@ -270,6 +272,7 @@ function CandidateBody({
 function CandidateChip({
   label,
   factorKey,
+  exprText,
   category,
   direction,
   rankIc,
@@ -281,6 +284,8 @@ function CandidateChip({
 }: {
   label: string;
   factorKey: string;
+  /** 挖掘表达式因子的规范式（factorKey==="expr" 时才有）；缺省回落 factorKey。 */
+  exprText?: string;
   category: string;
   direction: FrozenDirection;
   rankIc?: number | null;
@@ -314,7 +319,12 @@ function CandidateChip({
         </span>
       )}
       <span className="truncate pr-5 text-xs font-medium text-[var(--text)]">{label}</span>
-      <code className="truncate text-[10px] text-[var(--muted)]">{factorKey}</code>
+      {/* 挖掘表达式因子（factorKey==="expr"）的 key 本身没有信息量，改显示表达式本体；
+          完整表达式挂 title（strategy-factor-discovery §3.4）。CategoryChips 无须改——
+          它派生自库目录，而 expr 已被 hidden 过滤掉。 */}
+      <code className="truncate text-[10px] text-[var(--muted)]" title={exprText || factorKey}>
+        {exprText || factorKey}
+      </code>
       <div className="flex flex-wrap items-center gap-1">
         <Badge tone="neutral">{categoryLabel(category)}</Badge>
         <Badge tone={direction === "long" ? "long" : "short"}>{directionLabel(direction)}</Badge>
@@ -490,6 +500,11 @@ function buildCandidates(
       member,
       label: f.name,
       factorKey: f.factorKey,
+      // 挖掘因子的 params.expr 即规范式；非 expr 因子为 undefined（chip 回落显示 factorKey）。
+      exprText:
+        f.factorKey === "expr"
+          ? String((f.params as Record<string, unknown>)?.expr ?? "")
+          : undefined,
       category: f.category,
       direction: member.direction,
       rankIc: f.eval ? primaryRankIc(f.eval.horizons) : null,

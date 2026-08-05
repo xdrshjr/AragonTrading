@@ -8,6 +8,7 @@ import AiBacktestModal from "@/components/Chart/AiBacktestModal";
 import ChartWorkspace from "@/components/Chart/ChartWorkspace";
 import WindowControls from "@/components/Desktop/WindowControls";
 import AccountModeSwitch from "@/components/Header/AccountModeSwitch";
+import DiscoveryLab from "@/components/Discovery/DiscoveryLab";
 import FactorLab from "@/components/Factor/FactorLab";
 import NavRail from "@/components/Nav/NavRail";
 import RightPanel from "@/components/RightPanel/RightPanel";
@@ -144,6 +145,8 @@ export default function Page() {
   const [jumpToTs, setJumpToTs] = useState<number | null>(null);
   // 因子实验室「首激活后常驻」惰性挂载：从未打开者不触发因子查询；一旦打开即保持挂载（hidden）以保态。
   const [hasOpenedFactor, setHasOpenedFactor] = useState(false);
+  // 策略与因子挖掘同款惰性挂载：从未打开者不触发任何挖掘查询（DoD #13：未启动时 0 额外请求）。
+  const [hasOpenedDiscovery, setHasOpenedDiscovery] = useState(false);
   const loadingMore = useRef(false);
   const lastMarketTsRef = useRef<number | null>(null);
   // 右侧面板调宽：以 <main> 右边缘为锚，宽度 = 右边缘 − 指针 X（store 负责夹取 [320,640]）。
@@ -510,6 +513,7 @@ export default function Page() {
   // 首激活后常驻：activeView 首次为 "factor" 时置位，置位后即便切回交易也保持 FactorLab 挂载（hidden）。
   useEffect(() => {
     if (activeView === "factor") setHasOpenedFactor(true);
+    if (activeView === "discovery") setHasOpenedDiscovery(true);
   }, [activeView]);
 
   useEffect(() => {
@@ -678,6 +682,12 @@ export default function Page() {
           {hasOpenedFactor && (
             <div className="min-h-0 flex-1" hidden={showSettings || activeView !== "factor"}>
               <FactorLab active={activeView === "factor" && !showSettings} />
+            </div>
+          )}
+
+          {hasOpenedDiscovery && (
+            <div className="min-h-0 flex-1" hidden={showSettings || activeView !== "discovery"}>
+              <DiscoveryLab active={activeView === "discovery" && !showSettings} />
             </div>
           )}
 

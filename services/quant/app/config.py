@@ -387,6 +387,39 @@ class Settings(BaseSettings):
     ai_backtest_default_decision_every_bars: int = Field(default=1, ge=1)  # AI 每 K 根决策一次的默认间隔
     ai_backtest_max_jobs: int = Field(default=2, ge=1, le=8)        # 同时进行的 AI 回测作业上限（超出 429）
 
+    # ---- 策略与因子挖掘（strategy-factor-discovery §六，env 前缀 DISCOVERY_）----
+    # 字段名即环境变量名（DISCOVERY_*，大小写不敏感）。⚠️ 三处联动缺一即静默失效：
+    # ① 此处必须**真的声明**字段（Settings extra="ignore" 会吞掉未声明的 env）；
+    # ② desktop/src/lib/config.js 的 prod 白名单必须放行 DISCOVERY_ 前缀；③ .env.example 补文档。
+    discovery_enabled: bool = True                  # 总闸；False ⇒ 写类端点 403（读类仍可看历史）
+    discovery_max_runs: int = Field(default=1, ge=1, le=3)   # 并发挖掘任务上限（硬上限 3）
+    discovery_default_interval_s: float = Field(default=300.0, gt=0)   # 迭代间隔默认（对齐报告的 5 分钟）
+    discovery_min_interval_s: float = Field(default=60.0, gt=0)        # 间隔夹紧下界
+    discovery_max_interval_s: float = Field(default=3600.0, gt=0)      # 间隔夹紧上界
+    discovery_max_candidates_per_iter: int = Field(default=200, ge=1)  # 单轮候选上限
+    discovery_max_window_bars: int = Field(default=8000, ge=200)       # 数据窗口根数上限（取数护栏）
+    # 单轮工作量上限（候选数 × 根数），超限 413（沿用 MINE_WORK_UNIT_LIMIT 语义）。
+    discovery_work_unit_limit: int = Field(default=3_000_000, ge=1000)
+    discovery_candidate_timeout_s: float = Field(default=20.0, gt=0)   # 单候选验证墙钟超时
+    # 单轮墙钟预算（评审 P2-4）：candidateTimeoutS × candidatesPerIteration 最坏 800s 远超默认
+    # 300s 间隔，必须有上限。到点停取新候选、正常 commit 已完成者、记 truncatedByTimeout + 丢弃数。
+    discovery_iteration_timeout_s: float = Field(default=600.0, gt=0)
+    # 验证层进 run_in_threadpool 的并发信号量（评审 P2-6）：与所有 API 请求**共用** anyio 默认
+    # 线程池，24/7 挖掘若无节制并发会与交易 / 回测请求争抢线程，表现为「整个 App 变卡」却查不到原因。
+    discovery_validate_concurrency: int = Field(default=2, ge=1, le=8)
+    discovery_llm_enabled: bool = True                                 # LLM 子代理总闸
+    discovery_llm_timeout_s: float = Field(default=60.0, gt=0)
+    discovery_llm_max_retries: int = Field(default=1, ge=0)
+    discovery_llm_max_calls_per_hour: int = Field(default=24, ge=0)    # 成本硬闸（0=禁用 LLM 调用）
+    discovery_max_candidate_rows: int = Field(default=20000, ge=100)   # 每 run 拒绝候选保留上限
+    discovery_max_iteration_rows: int = Field(default=5000, ge=50)     # 每 run 迭代记录保留上限
+    discovery_ws_ring: int = Field(default=400, ge=50)                 # WS 环形缓冲条数
+    # 进程重启后自动续跑 running 任务。⚠️ **受 discovery_enabled 一票否决**（评审 P1-8）：总闸为
+    # False 时一律 paused(disabled_by_config)，绝不拉起后台循环——写类端点 403 却在后台继续烧
+    # LLM 与 OKX 配额，是「关了但没关」的假安全姿态。续跑必先跑完 kept 池重建才进第一轮。
+    discovery_auto_resume: bool = True
+    discovery_resume_delay_s: float = Field(default=10.0, ge=0)        # 自动续跑前的静置延时
+
     # ---- 代理（透传给 httpx / websockets）----
     http_proxy: str = ""
     https_proxy: str = ""

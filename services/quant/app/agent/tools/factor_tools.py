@@ -11,7 +11,6 @@ import numpy as np
 
 from ...engine.backtester import candles_to_df
 from ...engine.factors import (
-    FACTOR_LIBRARY,
     available_factors,
     compose_score,
     compute_factor,
@@ -20,6 +19,7 @@ from ...engine.factors import (
     factor_meta,
     resolve_norm_contract,
     score_points,
+    visible_factor_keys,
 )
 from ...okx.rest_client import get_rest_client
 from .. import services
@@ -43,7 +43,9 @@ from .base import (
     require_str,
 )
 
-FACTOR_KEY_ENUM = tuple(FACTOR_LIBRARY)
+# 只放行目录可见因子（strategy-factor-discovery §2.2 四处改点之一）：``expr`` 桥若进枚举，
+# 模型会以空参数调用它并拿到一条全 NaN 因子，属纯噪声。
+FACTOR_KEY_ENUM = visible_factor_keys()
 _DEFAULT_LIMIT = 300
 _MAX_LIMIT = 300
 _DEFAULT_HORIZONS = (1, 3, 6, 12)

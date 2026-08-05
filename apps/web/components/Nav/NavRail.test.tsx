@@ -12,16 +12,29 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("NavRail — 左侧主功能导航", () => {
-  it("renders the two primary nav items with accessible names", () => {
+  it("renders the three primary nav items with accessible names", () => {
     render(<NavRail />);
     expect(screen.getByRole("button", { name: "交易" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "因子实验室" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "策略与因子挖掘" })).toBeTruthy();
   });
 
   it("marks the active view with aria-current=page (trade by default)", () => {
     render(<NavRail />);
     expect(screen.getByRole("button", { name: "交易" })).toHaveAttribute("aria-current", "page");
     expect(screen.getByRole("button", { name: "因子实验室" })).not.toHaveAttribute("aria-current");
+    expect(screen.getByRole("button", { name: "策略与因子挖掘" })).not.toHaveAttribute("aria-current");
+  });
+
+  it("clicking 策略与因子挖掘 switches activeView to discovery", () => {
+    render(<NavRail />);
+    fireEvent.click(screen.getByRole("button", { name: "策略与因子挖掘" }));
+    expect(useAppStore.getState().activeView).toBe("discovery");
+    // 选中态视觉与既有两项一致（左侧指示条 + accent 前景）。
+    expect(screen.getByRole("button", { name: "策略与因子挖掘" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
   });
 
   it("clicking 因子实验室 switches activeView to factor", () => {
@@ -33,7 +46,7 @@ describe("NavRail — 左侧主功能导航", () => {
   it("clicking a nav item closes the settings overlay and switches view", () => {
     useAppStore.setState({ showSettings: true });
     render(<NavRail />);
-    // 设置浮层打开时两项均不显选中，避免误导。
+    // 设置浮层打开时各项均不显选中，避免误导。
     expect(screen.getByRole("button", { name: "交易" })).not.toHaveAttribute("aria-current");
     fireEvent.click(screen.getByRole("button", { name: "因子实验室" }));
     expect(useAppStore.getState().showSettings).toBe(false);

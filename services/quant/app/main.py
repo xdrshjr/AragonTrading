@@ -21,6 +21,7 @@ from .api import (
     agent,
     ai_auto,
     app_settings,
+    discovery,
     factors,
     live_auto,
     market,
@@ -34,6 +35,7 @@ from .api import (
     ws_market,
 )
 from .db.session import dispose_engine, init_db
+from .discovery.manager import get_discovery_manager
 from .factors.weight_batch_manager import get_weight_batch_manager
 from .factors.weight_train_manager import get_weight_train_manager
 from .live_auto.manager import get_live_auto_manager
@@ -51,9 +53,12 @@ async def lifespan(app: FastAPI):
     await _backfill_companion_strategies()
     await _reconcile_weight_train_runs()
     sweeper = asyncio.create_task(_weight_train_sweeper())   # H-B6：周期回收过期终态作业（cancel-safe）
+    resumer = asyncio.create_task(_resume_discovery_runs())  # 挖掘任务自动续跑（静置延时后拉起）
     yield
+    resumer.cancel()
     sweeper.cancel()                                         # 关停先取消清扫协程（与 manager.shutdown 同段）
     await get_agent_manager().shutdown()
+    await get_discovery_manager().shutdown()   # 策略与因子挖掘（长跑循环，先停再收 DB / OKX）
     await get_paper_manager().shutdown()
     await get_ai_trade_manager().shutdown()   # AI 自动交易（紧随 live-auto 关停，含平仓）
     await get_ai_backtest_manager().shutdown()   # AI 回测作业（取消所有在跑 job，无真单）
@@ -100,6 +105,40 @@ async def _reconcile_weight_train_runs() -> None:
             logger.info("reconciled %d dangling weight-train runs to failed", reconciled)
     except Exception as exc:  # noqa: BLE001 —— 启动对账非关键，绝不因它拖垮服务启动
         logger.warning("weight-train run reconcile skipped: %s", exc)
+
+
+async def _resume_discovery_runs() -> None:
+    """自动续跑上次崩溃残留的挖掘任务（strategy-factor-discovery §2.1 纪律 4 / §6）。
+
+    ``init_db`` 里的对账已把 ``running`` 孤儿一律置 ``paused`` 并给出 ``action``；这里只负责在
+    ``discovery_resume_delay_s`` 静置延时（等 OKX / DB 就绪）后把 ``resumable`` 的那些拉起。
+    **总闸关闭时对账给出的全是 ``paused``，本协程自然一个也不拉起**——这正是评审 P1-8 要的
+    「关了就是真的关了」。整段 try/except，失败仅 warning 不阻断启动；cancel-safe。
+    """
+    try:
+        from .config import get_settings
+        from .db.session import get_sessionmaker
+        from .discovery import service as discovery_service
+        from .discovery.manager import reconcile_orphan_runs
+
+        settings = get_settings()
+        pending = [item for item in await reconcile_orphan_runs()
+                   if item.get("action") == "resumable"]
+        if not pending:
+            return
+        await asyncio.sleep(float(settings.discovery_resume_delay_s))
+        for item in pending:
+            try:
+                async with get_sessionmaker()() as session:
+                    await discovery_service.resume_run(session, get_rest_client(),
+                                                       int(item["runId"]))
+                logger.info("resumed discovery run %s from checkpoint", item["runId"])
+            except Exception as exc:  # noqa: BLE001 —— 单条拉起失败（如并发已满）不得吃掉其余
+                logger.warning("discovery run %s auto-resume skipped: %s", item["runId"], exc)
+    except asyncio.CancelledError:      # 关停取消时干净退出
+        return
+    except Exception as exc:  # noqa: BLE001 —— 自动续跑非关键，绝不因它拖垮服务启动
+        logger.warning("discovery auto-resume skipped: %s", exc)
 
 
 async def _weight_train_sweeper() -> None:
@@ -196,6 +235,7 @@ app.include_router(app_settings.router, prefix="/api")  # 第 11 个路由（设
 app.include_router(workspace.router, prefix="/api")  # 第 12 个路由（workspace 偏好持久化，watchlist-auto-trade-persistence §3）
 app.include_router(weight_models.router, prefix="/api")  # 权重模型工作区（weight-model-workspace §五；含 WS /ws/weight-train/{jobId}）
 app.include_router(weight_batches.router, prefix="/api")  # 多模型训练竞技场（weight-multi-model-training §四；含 WS /ws/weight-batch/{batchId}）
+app.include_router(discovery.router, prefix="/api")  # 第 16 个路由（策略与因子挖掘 §四；含 WS /ws/discovery/{runId}）
 
 
 @app.get("/")

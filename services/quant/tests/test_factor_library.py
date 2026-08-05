@@ -4,7 +4,13 @@ from __future__ import annotations
 import numpy as np
 
 from app.engine.backtester import candles_to_df
-from app.engine.factors import FACTOR_LIBRARY, available_factors, compute_factor, is_bar_compatible
+from app.engine.factors import (
+    FACTOR_LIBRARY,
+    available_factors,
+    compute_factor,
+    is_bar_compatible,
+    visible_factor_keys,
+)
 from app.engine.factors.library import factor_meta
 from tests.conftest import make_synthetic_candles
 
@@ -64,9 +70,14 @@ def test_px_vwap_dist_all_nan_on_non_intraday():
 
 
 def test_catalog_consistency():
-    """available_factors 与库 key 一致，每条含必需字段。"""
+    """available_factors 与**目录可见** key 一致，每条含必需字段。
+
+    ``hidden`` 条目（strategy-factor-discovery D-1 的 ``expr`` 桥）在库中但不进目录——
+    这条断言即「hidden 过滤真的生效了」的门禁（§3.6），是加强而非放宽。
+    """
     catalog = available_factors()
-    assert {f["key"] for f in catalog} == set(FACTOR_LIBRARY)
+    assert {f["key"] for f in catalog} == set(visible_factor_keys())
+    assert "expr" in FACTOR_LIBRARY and "expr" not in visible_factor_keys()
     for f in catalog:
         assert {"key", "cn", "category", "directionHint", "paramsSchema"} <= set(f)
         assert f["directionHint"] in ("long", "short")

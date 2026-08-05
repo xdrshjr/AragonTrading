@@ -3,6 +3,8 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { type ComboDraft, DEFAULT_COMBO_DRAFT } from "./combo";
+import { applyDiscoveryEvent } from "./discovery";
+import type { DiscoveryRunState, DiscoveryWsEvent } from "./discoveryTypes";
 import { DEFAULT_INDICATORS, type IndicatorKey } from "./indicators";
 import { FALLBACK_INSTRUMENTS } from "./instruments";
 import type {
@@ -49,7 +51,7 @@ export type InstSidebarTab = "watch" | "spot" | "swap";
 // 右侧面板页签：AI 助手 / 交易策略（Agent Trading Copilot §5.3，默认 "agent"）。
 export type RightTab = "agent" | "strategy";
 // 一级功能视图（左侧主导航 NavRail 驱动）：trade=交易工作台，factor=因子实验室；持久化跨刷新恢复。
-export type WorkbenchView = "trade" | "factor";
+export type WorkbenchView = "trade" | "factor" | "discovery";
 
 // 生成新会话 id（SSR 安全：crypto 不可用时回落空串，由组件挂载后补）。
 function makeConversationId(): string {
@@ -416,6 +418,11 @@ interface AppState {
   activeView: WorkbenchView;
   factorLabSection: string;
   factorOverlay: FactorOverlay | null;
+  // 策略与因子挖掘（strategy-factor-discovery §2.13）：discoverySection 持久化（记忆上次分区）；
+  // discoveryRun / discoveryRunId 为运行期瞬态（**不**入 partialize，刷新由 WS 首发 state 快照重建）。
+  discoverySection: string;
+  discoveryRunId: number | null;
+  discoveryRun: DiscoveryRunState | null;
   // 跨视图编辑交接载荷（瞬态，不入 partialize）：「因子组合策略」列表 / 交易面板「在因子实验室编辑」
   // 写入，FactorSetBuilder 挂载时消费一次性水合并立即清空。不持久化（避免刷新后水合到陈旧编辑指针）。
   factorEditTarget: FactorEditTarget | null;
@@ -533,6 +540,11 @@ interface AppState {
   setActiveView: (view: WorkbenchView) => void;
   setFactorLabSection: (section: string) => void;
   setFactorOverlay: (overlay: FactorOverlay | null) => void;
+  setDiscoverySection: (section: string) => void;
+  setDiscoveryRunId: (runId: number | null) => void;
+  setDiscoveryRun: (state: DiscoveryRunState | null) => void;
+  applyDiscoveryWsEvent: (event: DiscoveryWsEvent) => void;
+  setDiscoveryConnected: (open: boolean) => void;
   setFactorEditTarget: (target: FactorEditTarget | null) => void;
   setWeightTrainTarget: (target: WeightTrainTarget | null) => void;
   setWeightBatchTarget: (target: WeightBatchTarget | null) => void;
@@ -670,6 +682,10 @@ export const useAppStore = create<AppState>()(
       activeView: "trade",
       factorLabSection: "catalog",
       factorOverlay: null,
+      // 挖掘：默认分区「总览」；运行期态瞬态（全新安装只走初始化器、不触发 migrate，故默认值写在此处）。
+      discoverySection: "overview",
+      discoveryRunId: null,
+      discoveryRun: null,
       // 编辑交接载荷默认空（瞬态，不持久化）。
       factorEditTarget: null,
       // 权重模型工作区交接态默认空（瞬态，不持久化）。
@@ -1004,6 +1020,15 @@ export const useAppStore = create<AppState>()(
       setActiveView: (activeView) => set({ activeView }),
       setFactorLabSection: (factorLabSection) => set({ factorLabSection }),
       setFactorOverlay: (factorOverlay) => set({ factorOverlay }),
+      // 挖掘：分区持久化；运行期态瞬态。WS 事件一律经纯 reducer applyDiscoveryEvent 落态——
+      // 它对 state 事件走**整对象合并**，故后端新增字段自动穿透，绝不逐键手抄（R-11）。
+      setDiscoverySection: (discoverySection) => set({ discoverySection }),
+      setDiscoveryRunId: (discoveryRunId) => set({ discoveryRunId }),
+      setDiscoveryRun: (discoveryRun) => set({ discoveryRun }),
+      applyDiscoveryWsEvent: (event) =>
+        set((s) => ({ discoveryRun: applyDiscoveryEvent(s.discoveryRun, event) })),
+      setDiscoveryConnected: (open) =>
+        set((s) => (s.discoveryRun ? { discoveryRun: { ...s.discoveryRun, connected: open } } : {})),
       // 编辑交接载荷（瞬态）：写入后由 FactorSetBuilder 消费一次性水合并清空（不入 partialize）。
       setFactorEditTarget: (factorEditTarget) => set({ factorEditTarget }),
       // 权重模型交接态（瞬态）：builder ⇄ 实时训练视图一次性消费载荷 + 同会话模型复用记忆。
@@ -1074,7 +1099,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 29,
+      version: 30,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -1124,6 +1149,9 @@ export const useAppStore = create<AppState>()(
         // 持久化一级视图（NavRail）与因子实验室当前工作区；factorOverlay 为瞬态，**不**入 partialize。
         activeView: s.activeView,
         factorLabSection: s.factorLabSection,
+        // 挖掘当前分区（持久化）；discoveryRun / discoveryRunId 为运行期瞬态，**不**入 partialize
+        // （刷新由 WS 首发 state 快照重建，绝不落陈旧运行态）。
+        discoverySection: s.discoverySection,
       }),
       // 逐版补默认态（即便缺省 zustand 浅合并也回落初值，migrate 仅为显式稳妥，R7/R11）。
       migrate: (persisted, version) => {
@@ -1264,6 +1292,11 @@ export const useAppStore = create<AppState>()(
               },
             };
           }
+        }
+        if (version < 30) {
+          // 策略与因子挖掘：补分区默认（老用户从未持久化过 discoverySection）；
+          // discoveryRun / discoveryRunId 为瞬态（不入 partialize），浅合并回落即可。
+          next = { ...next, discoverySection: "overview" };
         }
         return next as never;
       },

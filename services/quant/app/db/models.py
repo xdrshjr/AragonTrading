@@ -258,7 +258,10 @@ class FactorSet(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(128))
-    members_json: Mapped[str] = mapped_column(Text, default="[]")     # [{factorKey,params,weight,direction}]
+    # [{factorKey,params,weight,direction,name?}]：``name`` 仅挖掘表达式因子（factorKey="expr"）
+    # 携带，格式 ``expr:<hash8>``，由 ``factors/specs.py::validate_members`` 强制并透传，使
+    # ``member_names`` 与表达式绑定而非退化为位置序（strategy-factor-discovery §2.2 / P0-3）。纯注释，零迁移。
+    members_json: Mapped[str] = mapped_column(Text, default="[]")
     method: Mapped[str] = mapped_column(String(24), default="linear")  # equal|ic_weight|linear|random_forest|xgboost|extra_trees|mlp|kernel_ridge|knn|mutual_info|elastic_net（最长 kernel_ridge=12≤24，无迁移）
     config_json: Mapped[str] = mapped_column(Text, default="{}")      # 训练配置 + thresholds
     model_json: Mapped[str] = mapped_column(Text, default="{}")       # weights/importances/normStats/trainerVersion
@@ -394,6 +397,101 @@ class AppSetting(Base):
     key: Mapped[str] = mapped_column(String(64), primary_key=True)   # e.g. "auto_trade.max_budget_pct"
     value: Mapped[str] = mapped_column(Text, default="")             # JSON 编码标量 / 对象
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class DiscoveryRun(Base):
+    """一次「策略与因子挖掘」任务（strategy-factor-discovery §5.1）。
+
+    可 24 小时长跑：``checkpoint_json`` 存**小而有界**的断点状态（迭代数 / 预算 / 动量 /
+    FSA 冻结 / 机制覆盖 / 数据窗口，目标 < 64 KB），已测哈希则落
+    ``discovery_candidates.genome_hash`` 的唯一索引（D-3：十万级候选下 JSON 大对象既写不动
+    也不原子）。``create_all`` 加法建表、**零数据迁移、不动任何既有表**（D-5）。
+    所有时间秒级 UTC（C2）。
+    """
+
+    __tablename__ = "discovery_runs"
+    __table_args__ = (Index("ix_discovery_runs_status", "status", "id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    label: Mapped[str] = mapped_column(String(128), default="")
+    inst_id: Mapped[str] = mapped_column(String(32))
+    bar: Mapped[str] = mapped_column(String(8))
+    symbols_json: Mapped[str] = mapped_column(Text, default="[]")   # 单标的为 [instId]（多标的留口）
+    status: Mapped[str] = mapped_column(String(16), default="running")  # running|paused|stopped|succeeded|failed
+    # user | process_restart | disabled_by_config | data_unavailable | limit_reached | rebuild_failed
+    pause_reason: Mapped[str] = mapped_column(String(64), default="")
+    config_json: Mapped[str] = mapped_column(Text, default="{}")    # 归一化后的完整配置快照（回溯真源）
+    checkpoint_json: Mapped[str] = mapped_column(Text, default="{}")  # §2.10 小状态（有界）
+    counters_json: Mapped[str] = mapped_column(Text, default="{}")  # 冗余计数（列表页免解析大 JSON）
+    iteration: Mapped[int] = mapped_column(Integer, default=0)
+    kept_count: Mapped[int] = mapped_column(Integer, default=0)     # 反范式冗余（列表排序用）
+    tested_count: Mapped[int] = mapped_column(Integer, default=0)
+    started_ts: Mapped[int] = mapped_column(Integer, default=0)
+    last_iter_ts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    finished_ts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_code: Mapped[str] = mapped_column(String(64), default="")
+    error_message: Mapped[str] = mapped_column(String(256), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class DiscoveryIteration(Base):
+    """单轮挖掘迭代记录（strategy-factor-discovery §5.2）——回溯「这一轮发生了什么」。
+
+    保留策略：每 run 保留最近 ``discovery_max_iteration_rows`` 条，超出剪最旧，剪枝量记入
+    run 的 ``counters_json.prunedIterations``（绝不静默截断）。
+    """
+
+    __tablename__ = "discovery_iterations"
+    __table_args__ = (Index("ix_discovery_iter_run", "run_id", "idx"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("discovery_runs.id"), index=True)
+    idx: Mapped[int] = mapped_column(Integer, default=0)            # 轮序号（自 1 起）
+    started_ts: Mapped[int] = mapped_column(Integer, default=0)
+    finished_ts: Mapped[int] = mapped_column(Integer, default=0)
+    budget_json: Mapped[str] = mapped_column(Text, default="{}")    # 本轮五维预算（自适应后实际值）
+    stats_json: Mapped[str] = mapped_column(Text, default="{}")     # 逐段计数 + 拒绝原因分布 + 来源分布
+    llm_json: Mapped[str] = mapped_column(Text, default="{}")       # {calls,latencyMs,degraded,...}
+    note: Mapped[str] = mapped_column(String(256), default="")      # 人类可读一句话
+
+
+class DiscoveryCandidate(Base):
+    """单个挖掘候选（strategy-factor-discovery §5.3）——已测集合与成果库的物理载体。
+
+    ``UniqueConstraint(run_id, genome_hash)`` 是**去重的物理保证**（D-3）：续跑时一次
+    ``SELECT genome_hash WHERE run_id=?`` 即可重建内存去重集。保留策略：全部 ``kept``
+    永不剪，``rejected`` 每 run 保留最近 ``discovery_max_candidate_rows`` 条。
+    """
+
+    __tablename__ = "discovery_candidates"
+    __table_args__ = (
+        UniqueConstraint("run_id", "genome_hash", name="uq_discovery_candidate"),
+        Index("ix_discovery_cand_run", "run_id", "verdict", "id"),
+        Index("ix_discovery_cand_hash", "genome_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("discovery_runs.id"), index=True)
+    iteration_idx: Mapped[int] = mapped_column(Integer, default=0)
+    kind: Mapped[str] = mapped_column(String(24), default="factor")  # factor|factor_combo|strategy_param|strategy_combo
+    genome_hash: Mapped[str] = mapped_column(String(32))
+    genome_json: Mapped[str] = mapped_column(Text, default="{}")
+    expr_text: Mapped[str] = mapped_column(Text, default="")        # 规范式（因子轴）；策略轴为空
+    describe_text: Mapped[str] = mapped_column(String(512), default="")   # 中文渲染（列表与 prompt 共用）
+    skeleton: Mapped[str] = mapped_column(String(256), default="")  # FSA 键（因子轴）
+    mechanism: Mapped[str] = mapped_column(String(48), default="")
+    source: Mapped[str] = mapped_column(String(16), default="seed")  # mutate|crossover|perturb|random|llm|seed
+    verdict: Mapped[str] = mapped_column(String(16), default="rejected")  # kept|rejected
+    reject_reason: Mapped[str] = mapped_column(String(64), default="")    # 首个未通过条目
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}")   # 全量指标（IS/OOS 双份）
+    series_json: Mapped[str] = mapped_column(Text, default="{}")    # 有界序列（分段 IC ≤24 / 分位 ≤10）
+    trials_at_accept: Mapped[int] = mapped_column(Integer, default=0)     # 入库时累计试验数（多重检验回溯）
+    demoted: Mapped[bool] = mapped_column(Boolean, default=False)   # 刷新后复评降级标记
+    # 入库后的实体（factor|factor_set|strategy + id）；普通整数不加外键，仿 LiveOrderAudit.account_id
+    promoted_kind: Mapped[str] = mapped_column(String(16), default="")
+    promoted_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class CandleCache(Base):

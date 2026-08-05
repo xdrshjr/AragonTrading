@@ -34,6 +34,9 @@ export const CATEGORY_LABELS: Record<string, string> = {
   volume: "成交量",
   liquidity: "流动性",
   mean_revert: "均值回复",
+  // 挖掘入库因子的类别统一为 "discovered"（strategy-factor-discovery §2.12）。漏了这条，
+  // 「我的因子」的类别列会直接显示英文枚举，且类别筛选下拉里挑不出挖掘因子。
+  discovered: "自动挖掘",
 };
 
 export function categoryLabel(category: string): string {

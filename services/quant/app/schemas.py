@@ -1953,6 +1953,51 @@ def weight_explore_start_out(batch: WeightTrainBatch, plan_json: dict,
     }
 
 
+# ---------------- 策略与因子挖掘（strategy-factor-discovery §四） ----------------
+class DiscoveryStartReq(BaseModel):
+    """启动挖掘任务入参。
+
+    只在解析期做**形状与硬边界**校验；语义夹取（间隔 / 候选数 / 窗口根数按 settings 上下界）
+    与轴合法性（D-6：未实现的轴一律 400 ``DISCOVERY_AXIS_UNSUPPORTED``）统一在
+    ``discovery/service.py::normalize_config`` 收口——单一真源，避免两处各夹一套。
+    """
+
+    instId: str = Field(min_length=1, max_length=32)
+    bar: str = Field(min_length=1, max_length=8)
+    label: str | None = Field(default=None, max_length=128)
+    windowBars: int = Field(default=4000, ge=200, le=200000)
+    axes: list[str] = Field(default_factory=lambda: ["factor"], min_length=1, max_length=4)
+    horizon: int = Field(default=6, ge=1, le=100)
+    candidatesPerIteration: int = Field(default=40, ge=1, le=1000)
+    iterationIntervalS: float = Field(default=300.0, gt=0)
+    dataRefreshS: float = Field(default=21600.0, ge=0)
+    windowMode: Literal["rolling", "fixed"] = "rolling"
+    isRatio: float = Field(default=0.7, ge=0.5, le=0.9)
+    maxIterations: int = Field(default=0, ge=0)
+    maxRuntimeHours: float = Field(default=0.0, ge=0)
+    maxKept: int = Field(default=200, ge=1, le=2000)
+    autoResume: bool = True
+    autoPromote: bool = False
+    revalidateOnRefresh: bool = True
+    seed: int | None = Field(default=None, ge=0)
+    llm: dict[str, Any] = Field(default_factory=dict)
+    thresholds: dict[str, Any] = Field(default_factory=dict)
+    evolution: dict[str, Any] = Field(default_factory=dict)
+
+
+class DiscoveryBacktestReq(BaseModel):
+    """候选一键回测入参（区间必填，与既有回测端点同口径）。"""
+
+    startTs: int = Field(ge=0)
+    endTs: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _check_range(self):
+        if self.endTs <= self.startTs:
+            raise ValueError("endTs 必须大于 startTs")
+        return self
+
+
 class ErrorBody(BaseModel):
     code: str
     message: str

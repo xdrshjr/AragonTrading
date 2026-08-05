@@ -78,6 +78,7 @@ async def init_db() -> None:
     await _seed_builtin_factors()
     await _seed_agent_providers()
     await _reconcile_orphan_ai_trade_runs()
+    await _reconcile_orphan_discovery_runs()
 
 
 async def _ensure_trade_risk_columns(conn) -> None:
@@ -187,6 +188,24 @@ async def _reconcile_orphan_ai_trade_runs() -> None:
         logger.warning("ai-trade orphan reconcile skipped: %s", exc)
 
 
+async def _reconcile_orphan_discovery_runs() -> None:
+    """启动对账（strategy-factor-discovery §2.1 纪律 4）：``running`` 孤儿一律先置 ``paused``。
+
+    进程启动时内存管理器为空，任何仍标 ``running`` 的挖掘任务必是上次崩溃 / 强杀遗留。判定
+    顺序固定为 ``discovery_enabled`` → ``run.autoResume`` → 续跑，``pauseReason`` 如实区分
+    （``disabled_by_config`` / ``process_restart``）。**整段 try/except 包裹、失败仅 warning
+    不阻断启动**（对账为非关键收敛，二次运行幂等）。真正拉起循环由 ``main.py`` 的 lifespan
+    在静置延时后完成（需要 rest client，不该由 db 层持有）。
+    """
+    try:
+        from ..discovery.manager import reconcile_orphan_runs
+        reconciled = await reconcile_orphan_runs()
+        if reconciled:
+            logger.info("reconciled %d orphan discovery runs", len(reconciled))
+    except Exception as exc:  # noqa: BLE001 —— 启动对账非关键，绝不因它拖垮服务启动
+        logger.warning("discovery orphan reconcile skipped: %s", exc)
+
+
 async def _seed_builtin_strategies() -> None:
     """为注册表中每个模板确保存在一行 builtin 策略实例（按注册顺序）。"""
     sm = get_sessionmaker()
@@ -224,6 +243,8 @@ async def _seed_builtin_factors() -> None:
         if existing is not None:
             return
         for key, spec in FACTOR_LIBRARY.items():
+            if spec.hidden:
+                continue   # D-1 桥接条目（expr）不 seed：否则「我的因子」首屏多一条不可删空壳
             session.add(Factor(
                 factor_key=key, name=spec.cn, params_json="{}", direction=spec.direction_hint,
                 category=spec.category, source="builtin", enabled=True))
