@@ -165,6 +165,25 @@ describe("DiscoveryMonitor", () => {
     expect(screen.queryByText("各轴候选池")).toBeNull();
   });
 
+  // ---- 成果资产台账的两个计数（AL-5 后半句：只计数不呈现等于没计数） ----
+  it("台账登记数有渲染落点", () => {
+    setRun({ iterations: [], counters: { tested: 100, kept: 5, rejected: {},
+                                         ledgerRegistered: 5 } });
+    render(<DiscoveryMonitor />);
+    expect(screen.getByTestId("ledger-registered").textContent).toBe("5");
+    expect(screen.queryByTestId("ledger-errors")).toBeNull();
+  });
+
+  it("登记失败时用告警色显示并给出解释性 tooltip", () => {
+    setRun({ iterations: [], counters: { tested: 100, kept: 5, rejected: {},
+                                         ledgerRegistered: 4, ledgerErrors: 2 } });
+    render(<DiscoveryMonitor />);
+    const errors = screen.getByTestId("ledger-errors");
+    expect(errors.textContent).toContain("2");
+    expect(errors.className).toContain("--short");
+    expect(errors.getAttribute("title")).toContain("未能登记进台账");
+  });
+
   it("把逐轴计数与让渡记录传给漏斗组件（BL-9 的落点在 DiscoveryFunnel）", () => {
     setRun({
       axes: ["factor", "strategy_combo"],

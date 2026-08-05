@@ -107,6 +107,34 @@ export default function DiscoveryMonitor() {
         ))}
       </div>
 
+      {/* 台账登记计数（discovery-asset-ledger §2.2.2）：登记是 fail-open 的，
+          「算了但看不见」等于没做，所以这两个数必须有渲染落点。
+          注意计数**落库晚一轮**（counters_json 在下一轮才写），刷新后短暂归零不是 bug。 */}
+      <Card className="flex flex-wrap items-center gap-4 p-2.5">
+        <span className="text-[11px] text-[var(--muted)]">
+          已登记进成果资产台账{" "}
+          <b className="tabular text-[var(--text)]" data-testid="ledger-registered">
+            {run?.counters.ledgerRegistered ?? 0}
+          </b>
+        </span>
+        {(run?.counters.ledgerErrors ?? 0) > 0 && (
+          <span
+            className="text-[11px] text-[var(--short)]"
+            data-testid="ledger-errors"
+            title="本轮有成果未能登记进台账（登记失败不影响挖掘本身，但这些成果暂时不会出现在「成果资产」分区）"
+          >
+            登记失败 <b className="tabular">{run?.counters.ledgerErrors}</b> 次
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={() => goSection("assets")}
+          className="text-[11px] text-[var(--accent)] underline"
+        >
+          去成果资产分区
+        </button>
+      </Card>
+
       {axes.length > 1 && (
         <Card className="p-3">
           <h4 className="mb-2 text-xs font-medium text-[var(--text)]">各轴候选池</h4>

@@ -419,10 +419,14 @@ interface AppState {
   factorLabSection: string;
   factorOverlay: FactorOverlay | null;
   // 策略与因子挖掘（strategy-factor-discovery §2.13）：discoverySection 持久化（记忆上次分区）；
-  // discoveryRun / discoveryRunId 为运行期瞬态（**不**入 partialize，刷新由 WS 首发 state 快照重建）。
+  // 取值域 overview | runs | monitor | candidates | library | assets（第 6 项为成果资产台账）。
+  // discoveryRun / discoveryRunId / discoveryAssetId 为运行期瞬态（**不**入 partialize，
+  // 刷新由 WS 首发 state 快照与 REST 重建）。
   discoverySection: string;
   discoveryRunId: number | null;
   discoveryRun: DiscoveryRunState | null;
+  /** 台账详情抽屉指针（瞬态）：与 discoveryRunId 同姿态，刷新即复位。 */
+  discoveryAssetId: number | null;
   // 跨视图编辑交接载荷（瞬态，不入 partialize）：「因子组合策略」列表 / 交易面板「在因子实验室编辑」
   // 写入，FactorSetBuilder 挂载时消费一次性水合并立即清空。不持久化（避免刷新后水合到陈旧编辑指针）。
   factorEditTarget: FactorEditTarget | null;
@@ -542,6 +546,7 @@ interface AppState {
   setFactorOverlay: (overlay: FactorOverlay | null) => void;
   setDiscoverySection: (section: string) => void;
   setDiscoveryRunId: (runId: number | null) => void;
+  setDiscoveryAssetId: (assetId: number | null) => void;
   setDiscoveryRun: (state: DiscoveryRunState | null) => void;
   applyDiscoveryWsEvent: (event: DiscoveryWsEvent) => void;
   setDiscoveryConnected: (open: boolean) => void;
@@ -686,6 +691,7 @@ export const useAppStore = create<AppState>()(
       discoverySection: "overview",
       discoveryRunId: null,
       discoveryRun: null,
+      discoveryAssetId: null,
       // 编辑交接载荷默认空（瞬态，不持久化）。
       factorEditTarget: null,
       // 权重模型工作区交接态默认空（瞬态，不持久化）。
@@ -1024,6 +1030,7 @@ export const useAppStore = create<AppState>()(
       // 它对 state 事件走**整对象合并**，故后端新增字段自动穿透，绝不逐键手抄（R-11）。
       setDiscoverySection: (discoverySection) => set({ discoverySection }),
       setDiscoveryRunId: (discoveryRunId) => set({ discoveryRunId }),
+      setDiscoveryAssetId: (discoveryAssetId) => set({ discoveryAssetId }),
       setDiscoveryRun: (discoveryRun) => set({ discoveryRun }),
       applyDiscoveryWsEvent: (event) =>
         set((s) => ({ discoveryRun: applyDiscoveryEvent(s.discoveryRun, event) })),

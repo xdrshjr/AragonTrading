@@ -6,6 +6,7 @@ import { discoveryApi } from "@/lib/discoveryApi";
 import type { DiscoveryDefaults, DiscoveryRunSummary } from "@/lib/discoveryTypes";
 import { useDiscoveryRunStream } from "@/lib/useDiscoveryRunStream";
 import { useAppStore } from "@/lib/store";
+import DiscoveryAssets from "./DiscoveryAssets";
 import DiscoveryCandidates from "./DiscoveryCandidateTable";
 import DiscoveryLibrary from "./DiscoveryLibrary";
 import DiscoveryMonitor from "./DiscoveryMonitor";
@@ -46,6 +47,9 @@ const SECTIONS = [
   { key: "monitor", label: "实时监控", desc: "漏斗 / 来源 / 迭代时间线" },
   { key: "candidates", label: "候选库", desc: "筛选 / 详情 / 入库" },
   { key: "library", label: "成果库", desc: "已入库因子与溯源" },
+  // 第 6 分区（discovery-asset-ledger §2.10）：「成果库」是**本轮**视图，台账是**全局**视图，
+  // 用户在长跑中最常问的两个问题分别对应这两个，故并列而不是改造既有分区。
+  { key: "assets", label: "成果资产", desc: "跨任务台账与持续体检" },
 ];
 
 export default function DiscoveryLab({ active }: { active: boolean }) {
@@ -177,6 +181,7 @@ export default function DiscoveryLab({ active }: { active: boolean }) {
           {section === "monitor" && <DiscoveryMonitor />}
           {section === "candidates" && <DiscoveryCandidates />}
           {section === "library" && <DiscoveryLibrary />}
+          {section === "assets" && <DiscoveryAssets />}
         </main>
       </div>
     </DiscoveryContext.Provider>

@@ -11,11 +11,75 @@ import {
   runtimeSeconds,
 } from "@/lib/discovery";
 import { discoveryApi } from "@/lib/discoveryApi";
+import { discoveryAssetApi } from "@/lib/discoveryAssetApi";
+import type { DiscoveryAssetSummary } from "@/lib/discoveryAssetTypes";
+import { HEALTH_STATUS_CN, HEALTH_STATUS_ORDER, isGuardStalled, relativeTime } from "@/lib/discoveryHealth";
 import { shouldShowCoverage } from "@/lib/discoveryStrategy";
 import type { DiscoveryVocabulary } from "@/lib/discoveryTypes";
 import { useAppStore } from "@/lib/store";
 import { useDiscovery } from "./DiscoveryLab";
 import DiscoveryLauncher from "./DiscoveryLauncher";
+
+/**
+ * 成果资产摘要卡（discovery-asset-ledger §2.10）。
+ *
+ * **关掉的功能必须在界面上看得出来**：守护被关闭 / 疑似停摆时，健康状态其实不会更新，
+ * 而一屏「健康」的徽标会让用户以为一切正常——这正是本轮反复要防的那种「不报错的空转」。
+ */
+function AssetLedgerCard({ summary, onOpen }: {
+  summary: DiscoveryAssetSummary | null;
+  onOpen: () => void;
+}) {
+  if (!summary) {
+    return (
+      <Card className="p-3">
+        <h4 className="mb-2 text-xs font-medium text-[var(--text)]">成果资产</h4>
+        <p className="text-[11px] text-[var(--muted)]">台账摘要加载中…</p>
+      </Card>
+    );
+  }
+  const guard = summary.guard;
+  const stalled = isGuardStalled(guard.lastTickTs, guard.tickS);
+  return (
+    <Card className="p-3">
+      <div className="mb-2 flex items-center gap-2">
+        <h4 className="text-xs font-medium text-[var(--text)]">成果资产</h4>
+        <Badge tone="neutral">{summary.total}</Badge>
+        <button type="button" onClick={onOpen} className="ml-auto text-[11px] text-[var(--accent)] underline">
+          查看台账
+        </button>
+      </div>
+      <ul className="grid grid-cols-3 gap-x-3 gap-y-1 text-[11px] tabular">
+        {HEALTH_STATUS_ORDER.map((status) => (
+          <li key={status} className="flex items-center justify-between">
+            <span className="text-[var(--muted)]">{HEALTH_STATUS_CN[status]}</span>
+            <span className="text-[var(--text)]">{summary.byStatus?.[status] ?? 0}</span>
+          </li>
+        ))}
+      </ul>
+      <p className="mt-2 text-[11px] text-[var(--muted)]">
+        近 24 小时体检 <b className="tabular text-[var(--text)]">{summary.checkedLast24h}</b> 次 ·
+        近 7 天新增衰减 <b className="tabular text-[var(--text)]">{summary.newlyDecayedLast7d}</b> 条
+      </p>
+      {!guard.enabled && (
+        <p className="mt-1 text-[11px] text-[var(--short)]">
+          体检守护已关闭，健康状态不会更新。
+        </p>
+      )}
+      {guard.enabled && stalled && (
+        <p className="mt-1 text-[11px] text-[var(--short)]">
+          守护似乎已停止：最近一次巡检在 {relativeTime(guard.lastTickTs)}。
+        </p>
+      )}
+      {summary.backfilled > 0 && (
+        <p className="mt-1 text-[11px] leading-relaxed text-[var(--muted)]">
+          其中 {summary.backfilled} 条为本功能上线前回填。它们的首次结论基于
+          <b>上线前挖到的成果</b>的第一次样本外体检，出现较多「已衰减」是正常的。
+        </p>
+      )}
+    </Card>
+  );
+}
 
 /** 机制族覆盖热力（自绘方格；0 覆盖用空心格提示「尚未探索」，绝不用颜色深浅骗人）。 */
 function CoverageGrid({
@@ -60,10 +124,12 @@ export default function DiscoveryOverview() {
   const { runs, defaults, activeRunId, selectRun, refresh, goSection } = useDiscovery();
   const run = useAppStore((s) => s.discoveryRun);
   const [vocabulary, setVocabulary] = useState<DiscoveryVocabulary | null>(null);
+  const [assetSummary, setAssetSummary] = useState<DiscoveryAssetSummary | null>(null);
   const [launcherOpen, setLauncherOpen] = useState(false);
 
   useEffect(() => {
     discoveryApi.vocabulary().then(setVocabulary).catch(() => setVocabulary(null));
+    discoveryAssetApi.summary().then(setAssetSummary).catch(() => setAssetSummary(null));
   }, []);
 
   const summary = runs.find((row) => row.runId === activeRunId) ?? runs[0] ?? null;
@@ -162,6 +228,8 @@ export default function DiscoveryOverview() {
           )}
         </Card>
       </div>
+
+      <AssetLedgerCard summary={assetSummary} onOpen={() => goSection("assets")} />
 
       <Card className="p-3">
         <h4 className="mb-1 text-xs font-medium text-[var(--text)]">关于本功能</h4>

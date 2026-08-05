@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -432,6 +432,30 @@ class Settings(BaseSettings):
     # 低于此规模的轴本轮跳过 FSA 扫描（BL-10 后半）：池里只有 3 条时每条都占 33% > 15%，
     # 会被**全部**冻结——回测型的三条策略轴入库速度比因子轴低一到两个数量级，早期必然踩中。
     discovery_fsa_min_pool: int = Field(default=20, ge=1)
+    # ---- 成果资产台账与持续样本外体检（discovery-asset-ledger §六，env 前缀 DISCOVERY_HEALTH_）----
+    # 15 个键。⚠️ desktop/src/lib/config.js 的 prod 白名单已放行整个 DISCOVERY_ 前缀，本组
+    # **无需**改 desktop（见 .env.example 的同名说明）。
+    discovery_health_enabled: bool = True             # 体检守护总闸，受 discovery_enabled 一票否决
+    discovery_health_tick_s: float = Field(default=900.0, gt=0)        # 守护轮询间隔
+    discovery_health_interval_s: float = Field(default=21600.0, gt=0)  # 单资产体检周期（默认 6h）
+    discovery_health_batch: int = Field(default=8, ge=1, le=64)        # 单 tick 处理的资产数
+    # ⚠️ 计数单位是**底层 run_backtest 调用次数**：run_split_backtest 无条件跑 IS + OOS 两段，
+    # 预估口径一律 2 × backtests_per_segment()（AL-9）。按 per_segment 计放行量正好翻倍，
+    # 且表现为「从没触发过闸」——看起来完全正常。
+    discovery_health_max_backtests_per_tick: int = Field(default=40, ge=1)
+    discovery_health_asset_timeout_s: float = Field(default=45.0, gt=0)   # 单资产墙钟超时
+    discovery_health_window_bars: int = Field(default=1500, ge=200, le=8000)  # 一组一次取这么多
+    # 每个资产的暖机段根数；freshStartTs 与 maxFreshBars 都由它派生（§2.3）。
+    # 校验：必须 ≥ discovery_health_min_warmup_bars 且 < discovery_health_window_bars，
+    # 否则 maxFreshBars ≤ 0、fresh 段恒空——启动即 fail-fast，不许运行期才发现。
+    discovery_health_warmup_bars: int = Field(default=400, ge=50, le=4000)
+    discovery_health_min_fresh_bars: int = Field(default=120, ge=10)   # 不足即 unknown（AL-2）
+    discovery_health_min_warmup_bars: int = Field(default=300, ge=50)  # 夹上界后实为取数缺口告警
+    discovery_health_min_fresh_trades: int = Field(default=5, ge=1)    # 策略资产 fresh 段成交下限
+    discovery_health_retain_frac: float = Field(default=0.5, ge=0, le=1)  # H5 / H6 的留存系数
+    discovery_health_fail_streak: int = Field(default=2, ge=1, le=10)  # 迟滞（AL-8）
+    discovery_health_max_check_rows: int = Field(default=200, ge=10)   # 每资产体检记录上限
+    discovery_health_max_assets: int = Field(default=5000, ge=100)     # 台账规模护栏（不报错、不删旧）
 
     # ---- 代理（透传给 httpx / websockets）----
     http_proxy: str = ""
@@ -518,6 +542,25 @@ class Settings(BaseSettings):
     agent_detach_grace_seconds: float = Field(default=30.0, ge=0)   # 断连存活宽限；0 即断连立即取消（回退迭代2）
     agent_heartbeat_seconds: float = Field(default=20.0, gt=0)      # run 期心跳间隔（须 < 中间层 idle 超时）
     agent_event_buffer_size: int = Field(default=512, ge=64)        # 会话事件缓冲上限（重放窗口）
+
+    @model_validator(mode="after")
+    def _check_health_window(self) -> "Settings":
+        """体检窗口三个根数的相容性（discovery-asset-ledger §六）—— 启动即 fail-fast。
+
+        ``maxFreshBars = window_bars − warmup_bars`` 必须为正，否则 fresh 段恒空、每个资产
+        永远判 ``unknown``；而 ``unknown`` 按 D-26 是中性文案「暂不评级」，界面上**看不出
+        任何异常**。这类「不报错的空转」只能在启动时挡下来。
+        """
+        if self.discovery_health_warmup_bars < self.discovery_health_min_warmup_bars:
+            raise ValueError(
+                f"DISCOVERY_HEALTH_WARMUP_BARS({self.discovery_health_warmup_bars}) 必须 ≥ "
+                f"DISCOVERY_HEALTH_MIN_WARMUP_BARS({self.discovery_health_min_warmup_bars})")
+        if self.discovery_health_warmup_bars >= self.discovery_health_window_bars:
+            raise ValueError(
+                f"DISCOVERY_HEALTH_WARMUP_BARS({self.discovery_health_warmup_bars}) 必须 < "
+                f"DISCOVERY_HEALTH_WINDOW_BARS({self.discovery_health_window_bars})，"
+                "否则体检的 fresh 段恒为空、全部资产永久「暂不评级」")
+        return self
 
     @property
     def proxy_url(self) -> str | None:

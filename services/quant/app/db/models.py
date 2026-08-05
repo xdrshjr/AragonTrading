@@ -494,6 +494,92 @@ class DiscoveryCandidate(Base):
     created_ts: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class DiscoveryAsset(Base):
+    """跨 run 归一的成果资产（discovery-asset-ledger §5.1）。
+
+    资产 = 「一条被挖出来并通过全部硬闸的成果」的**语义身份**（``asset_key``，与
+    ``promote.py`` 的幂等键同源，AL-4），而不是某个 run 的某一行候选。它**自持**
+    genome / 冻结方向 / 挖掘窗口口径 / 登记时的完整指标与阈值，因此 run 被删掉之后详情、
+    入库与持续体检全都照常可用（AL-11）。
+
+    ``create_all`` 加法建表，**不动任何既有表、不加任何既有列**（D-5 延续）。
+    所有 ``*_ts`` 秒级 UTC（C2）。
+    """
+
+    __tablename__ = "discovery_assets"
+    __table_args__ = (
+        Index("ix_discovery_assets_due", "archived", "next_check_ts"),
+        Index("ix_discovery_assets_kind", "kind", "health_status", "id"),
+        Index("ix_discovery_assets_market", "inst_id", "bar"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    asset_key: Mapped[str] = mapped_column(String(48), unique=True)   # §2.2.1 语义身份
+    kind: Mapped[str] = mapped_column(String(24), default="factor")
+    inst_id: Mapped[str] = mapped_column(String(32), default="")      # 资产自持（AL-12）
+    bar: Mapped[str] = mapped_column(String(8), default="")
+    horizon: Mapped[int] = mapped_column(Integer, default=0)          # 因子轴预测周期；策略轴 0
+    direction: Mapped[str] = mapped_column(String(8), default="")     # 因子轴冻结方向（AL-1 输入）
+    expr_text: Mapped[str] = mapped_column(Text, default="")
+    genome_json: Mapped[str] = mapped_column(Text, default="{}")
+    describe_text: Mapped[str] = mapped_column(String(512), default="")
+    mechanism: Mapped[str] = mapped_column(String(48), default="")
+    label: Mapped[str] = mapped_column(String(128), default="")
+    first_found_ts: Mapped[int] = mapped_column(Integer, default=0)
+    last_found_ts: Mapped[int] = mapped_column(Integer, default=0)
+    source_count: Mapped[int] = mapped_column(Integer, default=0)     # 真实总次数（可 > 溯源条数）
+    sources_json: Mapped[str] = mapped_column(Text, default="[]")     # ≤20 条（最早 1 + 最近 19）
+    variant_count: Mapped[int] = mapped_column(Integer, default=1)    # 被合并的不同 genomeHash 数
+    backfilled: Mapped[bool] = mapped_column(Boolean, default=False)  # 上线前一次性回填（§2.11）
+    mined_window_json: Mapped[str] = mapped_column(Text, default="{}")
+    accept_metrics_json: Mapped[str] = mapped_column(Text, default="{}")   # 判级分母（AL-3）
+    accept_thresholds_json: Mapped[str] = mapped_column(Text, default="{}")
+    trials_at_accept: Mapped[int] = mapped_column(Integer, default=0)
+    promoted_kind: Mapped[str] = mapped_column(String(16), default="")
+    promoted_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    companion_strategy_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # fresh|healthy|watch|decayed|unknown|error
+    health_status: Mapped[str] = mapped_column(String(16), default="fresh")
+    retention: Mapped[float | None] = mapped_column(Float, nullable=True)  # null 是合法值
+    consecutive_fail: Mapped[int] = mapped_column(Integer, default=0)      # 迟滞计数（AL-8）
+    last_reasons: Mapped[str] = mapped_column(String(64), default="")
+    last_check_ts: Mapped[int] = mapped_column(Integer, default=0)
+    next_check_ts: Mapped[int] = mapped_column(Integer, default=0)
+    checks_count: Mapped[int] = mapped_column(Integer, default=0)
+    checks_pruned: Mapped[int] = mapped_column(Integer, default=0)
+    archived: Mapped[bool] = mapped_column(Boolean, default=False)    # 用户动作，与健康状态正交
+    archived_ts: Mapped[int] = mapped_column(Integer, default=0)
+    note: Mapped[str] = mapped_column(String(256), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class DiscoveryAssetCheck(Base):
+    """一次持续样本外体检的快照（discovery-asset-ledger §5.2）。
+
+    只在**资产自身**可判定或出错时才写一行；取数失败（网络抖动 / OKX 不可达）整组跳过、
+    **不写**行——否则每次抖动都会在健康时间线上插一根尖刺，此后再也读不出真实趋势（AL-8）。
+    """
+
+    __tablename__ = "discovery_asset_checks"
+    __table_args__ = (Index("ix_discovery_asset_checks", "asset_id", "checked_ts"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("discovery_assets.id"), index=True)
+    checked_ts: Mapped[int] = mapped_column(Integer, default=0)
+    window_start_ts: Mapped[int] = mapped_column(Integer, default=0)   # 口径落库（AL-2 可回溯）
+    window_end_ts: Mapped[int] = mapped_column(Integer, default=0)
+    fresh_start_ts: Mapped[int] = mapped_column(Integer, default=0)
+    fresh_bars: Mapped[int] = mapped_column(Integer, default=0)
+    warmup_bars: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(16), default="unknown")
+    reasons: Mapped[str] = mapped_column(String(64), default="")       # 逗号分隔 H 码 / S0:*
+    retention: Mapped[float | None] = mapped_column(Float, nullable=True)
+    clip_mode: Mapped[str] = mapped_column(String(16), default="")     # ""|gated|rebased
+    metrics_json: Mapped[str] = mapped_column(Text, default="{}")      # {"fresh":…,"history":…}
+    error: Mapped[str] = mapped_column(String(256), default="")
+
+
 class CandleCache(Base):
     """OKX K 线本地缓存（降低调用、加速回测）。"""
 

@@ -90,6 +90,9 @@ class ValidationContext:
     slip_bps: float = 2.0
     thresholds: dict = field(default_factory=lambda: dict(DEFAULT_THRESHOLDS))
     memo: dict = field(default_factory=dict)
+    # ---- discovery-asset-ledger §2.4（两个**带默认值**的可选字段；默认值下行为逐位不变）----
+    split_at: int | None = None      # None ⇒ 走 split_index(is_ratio)
+    frozen_direction: str = ""       # "" / 非法值 ⇒ 走 resolve_direction(auto)
 
 
 @dataclass
@@ -243,14 +246,23 @@ def evaluate_split(node: Node, ctx: ValidationContext) -> SplitEvaluation:
     ③ 在【IS 段】一次性定号并冻结；
     ④ 两段都传**同一个冻结字面量**——严禁再传 ``"auto"``，否则 ``rankIc`` 被构造成两段都
     非负，F6 的「同号」判据恒真，最强的样本外防线整条空转（评审 P0-1）。
+
+    ``ctx.split_at`` / ``ctx.frozen_direction``（discovery-asset-ledger §2.4 · AL-1）只被持续
+    体检用到：体检要在「挖掘窗口右端之后新产生的那一段」上判级，且**必须**用登记时冻结的
+    方向——``auto`` 是在 IS 段（体检语境下即暖机段）定号的，行情一翻面它就跟着翻，衰减会被
+    判成健康，且与 ``retention`` 的分母不同源。两个字段取默认值时本函数逐位不变。
     """
     work = ctx.df_full.reset_index(drop=True)
     values = evaluate(node, _context_of(ctx), ctx.memo)
-    split = split_index(len(work), ctx.is_ratio)
+    split = (int(ctx.split_at) if ctx.split_at is not None
+             else split_index(len(work), ctx.is_ratio))
+    split = max(1, min(split, max(len(work) - 1, 1)))
     df_is, v_is = work.iloc[:split], values[:split]
     df_oos, v_oos = work.iloc[split:], values[split:]
     close_is = df_is["c"].to_numpy(dtype=float)
-    direction = resolve_direction(v_is, close_is, "auto", primary_horizon=ctx.horizon)
+    direction = (ctx.frozen_direction if ctx.frozen_direction in ("long", "short")
+                 else resolve_direction(v_is, close_is, "auto",
+                                        primary_horizon=ctx.horizon))
     dir_mult = -1.0 if direction == "short" else 1.0
     res_is = evaluate_factor(df_is, pd.Series(v_is), direction, factor_key="expr",
                              horizons=(ctx.horizon,), quantiles=QUANTILES,

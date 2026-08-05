@@ -265,7 +265,7 @@ export default function DiscoveryCandidates() {
                   <td className="px-2 py-1.5">
                     {row.verdict === "kept" ? (
                       <Badge tone={row.demoted ? "short" : "long"}>
-                        {row.demoted ? "已退化" : row.promotedId ? "已入库" : "待入库"}
+                        {row.demoted ? "本轮已淘汰" : row.promotedId ? "已入库" : "待入库"}
                       </Badge>
                     ) : (
                       <span className="text-[var(--muted)]" title={rejectReasonCn(row.rejectReason)}>

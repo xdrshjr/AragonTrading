@@ -150,7 +150,13 @@ export default function DiscoveryCandidateDetail({
               {detail.verdict === "kept" ? "已入库候选" : `已拒绝：${rejectReasonCn(detail.rejectReason)}`}
             </Badge>
           )}
-          {detail?.demoted && <Badge tone="short">已退化</Badge>}
+          {/* 命名纪律（discovery-asset-ledger §2.5.4）：run 内的淘汰与资产级的
+              「已衰减」必须分开叫，混用会让用户以为系统前后矛盾。 */}
+          {detail?.demoted && (
+            <span title="「本轮已淘汰」= 本任务窗口右移后的轻量复评淘汰；与「成果资产」分区里跨任务的「已衰减」是两个概念，互不等价。">
+              <Badge tone="short">本轮已淘汰</Badge>
+            </span>
+          )}
         </div>
 
         {loading && <p className="text-xs text-[var(--muted)]">加载中…</p>}

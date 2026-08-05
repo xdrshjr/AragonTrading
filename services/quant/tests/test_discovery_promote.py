@@ -115,6 +115,50 @@ async def test_same_expression_from_another_run_reuses_the_factor():
         await dispose_engine()
 
 
+# ============================ D-27：因子幂等键升级为规范式哈希（discovery-asset-ledger P0-3） ==========
+async def test_commutative_variants_reuse_the_same_factor_row():
+    """``add(a,b)`` 与 ``add(b,a)`` 复用同一 ``factors`` 行。
+
+    这是**有意的语义变更**（旧口径是 ``params_json["expr"]`` 逐字相等）。不这么改，
+    AL-4「资产身份与 promote 同源」在因子轴上根本不成立：同一个因子会在台账里占两行，
+    其中一行永远显示「未入库」。改回逐字比较 = 把 AL-4 改空。
+    """
+    sm = await _fresh()
+    try:
+        _r1, first_id = await _seed_candidate(sm, expr="add(ts_mean(ret,20),delta(volume,5))")
+        _r2, second_id = await _seed_candidate(sm, expr="add(delta(volume,5),ts_mean(ret,20))")
+        async with sm() as session:
+            a = await promote.promote_candidate(session, first_id)
+            b = await promote.promote_candidate(session, second_id)
+            rows = (await session.execute(
+                select(Factor).where(Factor.source == "mined"))).scalars().all()
+        assert a["promoted"]["entityId"] == b["promoted"]["entityId"]
+        assert len(rows) == 1
+    finally:
+        await dispose_engine()
+
+
+async def test_unparsable_legacy_factor_row_falls_back_to_literal_compare():
+    """``params_json.expr`` 解析不了的历史行**不得**炸掉整次入库（回落逐字比）。"""
+    sm = await _fresh()
+    try:
+        from app.db import factor_repositories as factor_repo
+
+        async with sm() as session:
+            await factor_repo.create_factor(session, values=factor_repo.FactorValues(
+                factor_key="expr", name="脏数据", params={"expr": "ts_mean(ret,21)"},
+                direction="long", category="discovered", source="mined", notes=""))
+        _run_id, candidate_id = await _seed_candidate(sm)
+        async with sm() as session:
+            payload = await promote.promote_candidate(session, candidate_id)
+            rows = (await session.execute(
+                select(Factor).where(Factor.source == "mined"))).scalars().all()
+        assert payload["promoted"]["entityId"] > 0
+        assert len(rows) == 2        # 脏数据行仍在，新因子照常建行
+    finally:
+        await dispose_engine()
+
+
 # ============================ 守门 ============================
 async def test_rejected_candidate_cannot_be_promoted():
     sm = await _fresh()

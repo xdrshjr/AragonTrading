@@ -24,6 +24,10 @@ export interface DiscoveryCounters {
   llmCalls?: number;
   prunedCandidates?: number;
   prunedIterations?: number;
+  /** 本 run 累计登记进成果资产台账的条数（新建 + 合并溯源，discovery-asset-ledger §2.2.2）。 */
+  ledgerRegistered?: number;
+  /** 登记失败次数。fail-open 不呈现等于没计数，故 `DiscoveryMonitor` 必须有渲染落点。 */
+  ledgerErrors?: number;
   rejected: Record<string, number>;
 }
 

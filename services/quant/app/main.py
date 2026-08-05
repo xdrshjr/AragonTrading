@@ -22,6 +22,7 @@ from .api import (
     ai_auto,
     app_settings,
     discovery,
+    discovery_assets,
     factors,
     live_auto,
     market,
@@ -35,6 +36,7 @@ from .api import (
     ws_market,
 )
 from .db.session import dispose_engine, init_db
+from .discovery.health_runtime import get_health_guard
 from .discovery.manager import get_discovery_manager
 from .factors.weight_batch_manager import get_weight_batch_manager
 from .factors.weight_train_manager import get_weight_train_manager
@@ -51,12 +53,15 @@ async def lifespan(app: FastAPI):
     await init_db()
     logger.info("DB initialized; builtin strategies seeded.")
     await _backfill_companion_strategies()
+    await _backfill_discovery_assets()         # 成果资产台账的一次性存量回填（D-29）
     await _reconcile_weight_train_runs()
     sweeper = asyncio.create_task(_weight_train_sweeper())   # H-B6：周期回收过期终态作业（cancel-safe）
     resumer = asyncio.create_task(_resume_discovery_runs())  # 挖掘任务自动续跑（静置延时后拉起）
+    get_health_guard().start()                 # 持续样本外体检守护（双闸每 tick 重读，D-24）
     yield
     resumer.cancel()
     sweeper.cancel()                                         # 关停先取消清扫协程（与 manager.shutdown 同段）
+    await get_health_guard().shutdown()         # 体检守护先停（它只读行情，无终态可等）
     await get_agent_manager().shutdown()
     await get_discovery_manager().shutdown()   # 策略与因子挖掘（长跑循环，先停再收 DB / OKX）
     await get_paper_manager().shutdown()
@@ -87,6 +92,27 @@ async def _backfill_companion_strategies() -> None:
             logger.info("backfilled %d companion factor_score strategies", created)
     except Exception as exc:  # noqa: BLE001 —— 启动补建非关键，绝不因它拖垮服务启动
         logger.warning("companion strategy backfill skipped: %s", exc)
+
+
+async def _backfill_discovery_assets() -> None:
+    """把本功能上线前已 kept 的候选一次性补进成果资产台账（discovery-asset-ledger §2.11）。
+
+    姿态完全镜像 ``_backfill_companion_strategies``：一次性 session + **整段 try/except，
+    失败仅 warning 不阻断启动**（台账是观测面）。幂等靠 ``asset_key`` 唯一索引与
+    ``register_kept`` 的同一条 upsert 路径，跑一百次结果相同；有界与错峰见 ``backfill_assets``。
+    """
+    try:
+        from .config import get_settings
+        from .db.session import get_sessionmaker
+        from .discovery import assets as asset_service
+
+        async with get_sessionmaker()() as session:
+            stats = await asset_service.backfill_assets(session, get_settings())
+        if stats.created or stats.merged:
+            logger.info("backfilled discovery assets: %d created, %d merged, %d skipped",
+                        stats.created, stats.merged, stats.skipped)
+    except Exception as exc:  # noqa: BLE001 —— 启动回填非关键，绝不因它拖垮服务启动
+        logger.warning("discovery asset backfill skipped: %s", exc)
 
 
 async def _reconcile_weight_train_runs() -> None:
@@ -236,6 +262,7 @@ app.include_router(workspace.router, prefix="/api")  # 第 12 个路由（worksp
 app.include_router(weight_models.router, prefix="/api")  # 权重模型工作区（weight-model-workspace §五；含 WS /ws/weight-train/{jobId}）
 app.include_router(weight_batches.router, prefix="/api")  # 多模型训练竞技场（weight-multi-model-training §四；含 WS /ws/weight-batch/{batchId}）
 app.include_router(discovery.router, prefix="/api")  # 第 16 个路由（策略与因子挖掘 §四；含 WS /ws/discovery/{runId}）
+app.include_router(discovery_assets.router, prefix="/api")  # 第 17 个路由（成果资产台账与持续体检 §四，无 WS）
 
 
 @app.get("/")

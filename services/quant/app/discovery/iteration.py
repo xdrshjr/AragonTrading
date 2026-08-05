@@ -19,6 +19,7 @@ import random
 import time
 
 from ..db.session import get_sessionmaker
+from . import assets
 from . import repositories as repo
 from .axis_budget import plan_axis_budget, yield_sentence
 from .checkpoint import bump_reject, dumps, iteration_seed
@@ -226,7 +227,34 @@ class IterationRunner:
         pruned = await self._persist(iteration_row, rows)
         for key in ("prunedCandidates", "prunedIterations"):
             run._counters[key] = int(run._counters.get(key, 0)) + int(pruned.get(key, 0))
+        await self._register_assets(index, rows)
         self._emit(iteration_row, rows)
+
+    async def _register_assets(self, index: int, rows: list) -> None:
+        """把本轮 kept 候选登记进成果资产台账（discovery-asset-ledger §2.2.2 · AL-5）。
+
+        位置必须精确：**在 ``_persist`` 之后**（候选行才有 id，``sources_json`` 要记
+        ``candidateId``）、**不在 ``_persist`` 内部**（那里有一次有界重试，登记抛错会把已提交
+        成功的 ``commit_iteration`` 再跑一遍）、**在 ``_emit`` 之前**（两个计数才搭得上同一轮的
+        ``state`` 事件）。
+
+        两个计数**落库晚一轮**——``counters_json`` 是在下一轮的 ``commit_iteration`` 里写的。
+        这是有意接受的代价（换取不动它的单事务语义）：看到「刚登记完刷新页面计数是 0」不是 bug。
+        """
+        run = self._run
+        kept_rows = [row for row in rows if row.verdict == "kept"]
+        if not kept_rows:
+            return
+        try:
+            stats = await assets.register_kept(run.spec, rows=kept_rows,
+                                               window=assets.MinedWindow.of(run),
+                                               iteration_idx=index)
+            run._counters["ledgerRegistered"] = (
+                int(run._counters.get("ledgerRegistered", 0)) + stats.created + stats.merged)
+        except Exception as exc:  # noqa: BLE001 —— 台账是观测面，绝不拖垮迭代（fail-open）
+            run._counters["ledgerErrors"] = int(run._counters.get("ledgerErrors", 0)) + 1
+            logger.warning("asset ledger register failed for run %d iter %d: %s",
+                           run.run_id, index, exc)
 
     def _sync_axis_checkpoint(self) -> None:
         """把逐轴计数写回检查点（BL-14：三者一律逐轴，且各自过 256 条上界）。"""

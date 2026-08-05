@@ -29,7 +29,7 @@ const ENTITY_TITLE: Record<string, string> = {
 };
 
 /**
- * 成果库：按**实体类型**分组（因子 / 因子组合 / 策略）+ 「已退化」徽标 + 溯源 + 一键跳转。
+ * 成果库：按**实体类型**分组（因子 / 因子组合 / 策略）+ 「本轮已淘汰」徽标 + 溯源 + 一键跳转。
  *
  * 「挖到 → 一眼看到 → 一键用起来」是这个分区的全部意义：只列出来而不给跳转，用户还得自己
  * 去别的页面找一遍。
@@ -171,6 +171,9 @@ export default function DiscoveryLibrary() {
         >
           去因子实验室查看
         </Button>
+        <Button variant="ghost" size="sm" onClick={() => goSection("assets")}>
+          跨任务查看 →
+        </Button>
       </div>
 
       {error && (
@@ -191,8 +194,12 @@ export default function DiscoveryLibrary() {
                     "还没有入库的成果。在候选库里选中通过全部过滤条件的候选并点「入库」即可。")}
       {renderGroup("待入库（已通过全部过滤条件）", pending,
                    "暂无待入库候选。")}
-      {renderGroup("已退化", demoted,
-                   "暂无退化记录。数据窗口右移后系统会对已入库因子做轻量复评，连续不达标者会被标记为已退化并退出父本池。")}
+      {/* 命名纪律（§2.5.4）：run 内的 demoted 与资产级的「已衰减」是**两个概念**，
+          中文必须分开——混用会让用户以为系统前后矛盾。 */}
+      <div title="「本轮已淘汰」= 本任务窗口右移后的轻量复评淘汰；「已衰减」= 成果资产分区里跨任务的持续样本外衰减。两者互不等价。">
+        {renderGroup("本轮已淘汰", demoted,
+                     "暂无淘汰记录。数据窗口右移后系统会对本任务已入库候选做轻量复评，连续不达标者会退出父本池。跨任务的长期衰减请看「成果资产」分区。")}
+      </div>
 
       <DiscoveryCandidateDetail
         candidateId={detailId}

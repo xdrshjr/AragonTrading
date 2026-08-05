@@ -130,10 +130,10 @@ describe("DiscoveryCandidates — 候选表", () => {
     expect(await screen.findByText("F10")).toBeTruthy();
   });
 
-  it("已退化候选带独立徽标", async () => {
+  it("本轮已淘汰的候选带独立徽标（与资产级「已衰减」分开叫）", async () => {
     listMock.mockResolvedValue({ items: [row({ demoted: true })], total: 1 });
     render(<DiscoveryCandidates />);
-    expect(await screen.findByText("已退化")).toBeTruthy();
+    expect(await screen.findByText("本轮已淘汰")).toBeTruthy();
   });
 
   it("点表达式打开详情抽屉", async () => {
