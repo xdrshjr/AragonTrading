@@ -56,6 +56,9 @@ export interface DiscoveryStateEvent {
   counters: DiscoveryCounters;
   budget: SourceBudget;
   poolSizes: Record<string, number>;
+  axisPlan?: Record<string, number>;
+  axes?: DiscoveryAxis[];
+  axisSnapshots?: Record<string, Record<string, number>>;
   mechanismCoverage: Record<string, number>;
   fsaBans: FsaBan[];
   nextIterationTs: number | null;
@@ -79,9 +82,15 @@ export interface DiscoveryIterationRow {
   rejectedByReason: Record<string, number>;
   bySource: Record<string, number>;
   truncatedByTimeout: number;
+  truncatedByBacktestCap?: number;
   overrun: boolean;
   skipped: string;
   durationMs: number;
+  /** 逐轴计数（漏斗按轴分列直接读它）。 */
+  perAxis?: Record<string, DiscoveryAxisTally>;
+  axisShares?: Record<string, number>;
+  /** BL-9：上游库存不足时的让渡记录（必须有 UI 落点，否则等于没做）。 */
+  yieldedByPool?: Record<string, AxisPlanEntry>;
   llm: {
     calls: number;
     latencyMs: number;
@@ -119,6 +128,103 @@ export interface DiscoveryMetrics {
   oos: DiscoveryMetricSide;
 }
 
+/** 策略轴的单段指标（``metrics_of`` 的并集出口；``calmar`` 只可能来自 metrics_ext）。 */
+export interface DiscoveryStrategySide {
+  bars?: number;
+  sharpe?: number;
+  totalReturn?: number;
+  maxDrawdown?: number;
+  calmar?: number;
+  profitFactor?: number;
+  winRate?: number;
+  tradeCount?: number;
+  tradeRate?: number;
+}
+
+export interface DiscoveryGateRow {
+  id: string;
+  label: string;
+  value: number | null;
+  gate: number | null;
+  passed: boolean;
+}
+
+export interface DiscoveryParamDiff {
+  key: string;
+  label: string;
+  default: unknown;
+  value: unknown;
+}
+
+/** 策略轴 `metrics_json`（discovery-strategy-axes §5.1）。 */
+export interface DiscoveryStrategyMetrics {
+  kind: DiscoveryAxis;
+  templateKey?: string;
+  /** 模板中文名（后端 `describe_strategy.template_name` 的唯一真源，缺失才回落 key）。 */
+  templateName?: string;
+  trials: number;
+  requiredSharpe: number;
+  costs: {
+    initialCapital: number;
+    takerFeeBps: number;
+    slippageBps: number;
+    leverage: number;
+  };
+  /** `gated`（单策略纯切片）| `rebased`（组合净值重基）—— 两种口径**不可比**，必须如实标注。 */
+  clipMode: "gated" | "rebased";
+  warmupPad: number;
+  is: DiscoveryStrategySide;
+  oos: DiscoveryStrategySide;
+  stress?: { costMult: number; totalReturn: number | null };
+  maxEquityCorr: number;
+  thresholds?: Record<string, number>;
+  paramDiff?: DiscoveryParamDiff[];
+  members?: Record<string, unknown>[];
+  policy?: Record<string, unknown>;
+}
+
+export interface DiscoveryEquityPoint {
+  ts: number;
+  equity: number;
+}
+
+export interface TemplateSpec {
+  key: string;
+  name: string;
+  family: string;
+  familyCn: string;
+  minable: boolean;
+  /** 不可挖时的中文原因——**必须展示**，绝不灰着不说为什么。 */
+  reason: string;
+  paramCount: number;
+  htfBars: string[];
+}
+
+export interface AxisInfo {
+  label: string;
+  desc: string;
+  backtestsPerCandidate: number;
+  dependsOn: DiscoveryAxis[];
+  cost: number;
+}
+
+export interface AxisPlanEntry {
+  count: number;
+  reason: string;
+  toAxis: string;
+}
+
+export interface DiscoveryAxisTally {
+  generated: number;
+  ruleRejected: number;
+  llmRejected: number;
+  validated: number;
+  kept: number;
+  truncated: number;
+  truncatedByBacktestCap: number;
+  rejectedByReason: Record<string, number>;
+}
+
 export interface DiscoveryCandidateRow {
   id?: number;
   runId?: number;
@@ -137,7 +243,7 @@ export interface DiscoveryCandidateRow {
   promotedKind?: string;
   promotedId?: number | null;
   createdTs: number;
-  metrics: Partial<DiscoveryMetrics>;
+  metrics: Partial<DiscoveryMetrics> & Partial<DiscoveryStrategyMetrics>;
 }
 
 export interface DiscoveryCandidateDetail extends DiscoveryCandidateRow {
@@ -145,6 +251,9 @@ export interface DiscoveryCandidateDetail extends DiscoveryCandidateRow {
     isIc?: number[];
     oosIc?: number[];
     quantiles?: { q: number; meanRet: number; count: number }[];
+    equityIs?: DiscoveryEquityPoint[];
+    equityOos?: DiscoveryEquityPoint[];
+    gates?: DiscoveryGateRow[];
   };
   genome: Record<string, unknown>;
 }
@@ -183,6 +292,9 @@ export interface DiscoveryRunState {
   counters: DiscoveryCounters;
   budget: SourceBudget;
   poolSizes: Record<string, number>;
+  axisPlan?: Record<string, number>;
+  axes?: DiscoveryAxis[];
+  axisSnapshots?: Record<string, Record<string, number>>;
   mechanismCoverage: Record<string, number>;
   fsaBans: FsaBan[];
   nextIterationTs: number | null;
@@ -207,6 +319,13 @@ export interface DiscoveryDefaults {
   horizon: { default: number; min: number; max: number };
   dataRefreshS: { default: number; min: number };
   maxKept: { default: number; min: number; max: number };
+  maxKeptPerAxis: { default: number; min: number; max: number };
+  axisInfo: Record<DiscoveryAxis, AxisInfo>;
+  axisLabels: Record<string, string>;
+  templates: TemplateSpec[];
+  strategyThresholds: Record<string, number>;
+  comboSize: { default: { min: number; max: number }; min: number; max: number };
+  rotationSize: { default: { min: number; max: number }; min: number; max: number };
   thresholds: Record<string, number>;
   evolution: {
     budget: SourceBudget;
@@ -257,6 +376,14 @@ export interface DiscoveryStartBody {
   llm: { enabled: boolean; reviewSample: number; maxCallsPerHour: number; timeoutS: number };
   thresholds: Record<string, number>;
   evolution: Record<string, unknown>;
+  // 三条策略轴（§4.1）：全部可选，缺省即沿用后端默认。
+  axisWeights?: Record<string, number>;
+  templates?: string[];
+  includeLibraryFactors?: boolean;
+  comboSize?: { min: number; max: number };
+  rotationSize?: { min: number; max: number };
+  strategyThresholds?: Record<string, number>;
+  maxKeptPerAxis?: number;
 }
 
 export type DiscoveryWsEvent =

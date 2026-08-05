@@ -1,11 +1,17 @@
-"""搜索器子包（strategy-factor-discovery §2.4）。
+"""搜索器子包（strategy-factor-discovery §2.4 / discovery-strategy-axes §2.3）。
 
-**范围（D-6）**：v1 只有 ``factor`` 轴。``factor_combo`` / ``strategy_param`` /
-``strategy_combo`` 三轴是 v1.1+ 的加法增量，落地前一律不进 ``IMPLEMENTED_AXES``、
-UI 不渲染、API 400——绝不留「能选但不产候选」的空转轴。
+四条轴各一个搜索器，全部遵守同一条协议：**产物合法或 ``None``**，绝不把非法基因丢给下游——
+审查层的规则是第二道防线，不是第一道。
 """
 from __future__ import annotations
 
+from .combo_searcher import ComboSearcher  # noqa: F401
 from .factor_searcher import FactorSearcher  # noqa: F401
+from .param_searcher import ParamSearcher  # noqa: F401
+from .rotation_searcher import RotationSearcher  # noqa: F401
 
-__all__ = ["FactorSearcher"]
+SEARCHERS = {"strategy_param": ParamSearcher, "factor_combo": ComboSearcher,
+             "strategy_combo": RotationSearcher}
+
+__all__ = ["FactorSearcher", "ParamSearcher", "ComboSearcher", "RotationSearcher",
+           "SEARCHERS"]

@@ -2,17 +2,39 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Badge, Button, Field, Input, Modal, Select } from "@/components/ui";
-import { windowDays, workloadOf } from "@/lib/discovery";
+import { windowDays } from "@/lib/discovery";
 import { discoveryApi } from "@/lib/discoveryApi";
+import { backtestsPerIteration } from "@/lib/discoveryStrategy";
 import type { DiscoveryAxis, DiscoveryDefaults, DiscoveryStartBody } from "@/lib/discoveryTypes";
 import { useAppStore } from "@/lib/store";
+import DiscoveryAxisPicker, { type AxisSelection } from "./DiscoveryAxisPicker";
 
-const AXIS_LABEL: Record<DiscoveryAxis, string> = {
-  factor: "因子表达式",
-  factor_combo: "因子组合",
-  strategy_param: "常规策略参数",
-  strategy_combo: "策略轮动组合",
-};
+/** 轴代价系数（与后端 ``service.AXIS_COST`` 同源；缺省回落 1，绝不臆造）。 */
+function axisCost(defaults: DiscoveryDefaults, axis: string): number {
+  return defaults.axisInfo?.[axis as DiscoveryAxis]?.cost ?? 1;
+}
+
+/**
+ * 工作量预估（§六新口径）：窗口根数 × Σ(轴名额 × 轴代价系数)。
+ *
+ * 沿用旧口径（候选数 × 根数）会让「40 个组合候选」与「40 个因子候选」被判成同样的工作量，
+ * 413 这道闸对策略轴形同虚设。对 factor 单轴恒等于旧口径（系数为 1）。
+ */
+export function workloadOfAxes(
+  defaults: DiscoveryDefaults,
+  axes: string[],
+  candidates: number,
+  windowBars: number,
+): number {
+  if (!axes.length) return 0;
+  const share = Math.floor(candidates / axes.length);
+  const remainder = candidates - share * axes.length;
+  const weighted = axes.reduce(
+    (sum, axis, index) => sum + (share + (index < remainder ? 1 : 0)) * axisCost(defaults, axis),
+    0,
+  );
+  return Math.max(0, Math.floor(windowBars)) * weighted;
+}
 
 interface FormState {
   instId: string;
@@ -29,6 +51,8 @@ interface FormState {
   llmReviewSample: number;
   llmMaxCallsPerHour: number;
   thresholds: Record<string, number>;
+  strategyThresholds: Record<string, number>;
+  selection: AxisSelection;
 }
 
 function initialForm(defaults: DiscoveryDefaults, instId: string, bar: string): FormState {
@@ -47,6 +71,15 @@ function initialForm(defaults: DiscoveryDefaults, instId: string, bar: string): 
     llmReviewSample: defaults.llm.reviewSample,
     llmMaxCallsPerHour: defaults.llm.maxCallsPerHour,
     thresholds: { ...defaults.thresholds },
+    strategyThresholds: { ...(defaults.strategyThresholds ?? {}) },
+    selection: {
+      // R-15：默认只勾 `factor`，与现状一致——单轴用户不该被多轴 UI 的复杂度伤害。
+      axes: ["factor"],
+      templates: [],
+      includeLibraryFactors: true,
+      comboSize: { ...(defaults.comboSize?.default ?? { min: 2, max: 5 }) },
+      rotationSize: { ...(defaults.rotationSize?.default ?? { min: 2, max: 4 }) },
+    },
   };
 }
 
@@ -55,11 +88,22 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+/** S1–S9 里用户最可能想动的几条（其余保持后端默认；「恢复默认」一键回落）。 */
+const STRATEGY_THRESHOLD_FIELDS: { key: string; label: string; step: string }[] = [
+  { key: "minTrades", label: "最少平仓笔数", step: "1" },
+  { key: "minSharpe", label: "最小样本内夏普", step: "0.1" },
+  { key: "maxDrawdown", label: "最大回撤上限", step: "0.05" },
+  { key: "minCalmar", label: "最小 Calmar", step: "0.1" },
+  { key: "oosRetain", label: "样本外留存比", step: "0.05" },
+  { key: "maxEquityCorr", label: "最大相关性", step: "0.05" },
+];
+
 /**
- * 两步式启动器（strategy-factor-discovery §2.13）：第一步标的·周期·窗口·轴，第二步阈值与 LLM 用量。
+ * 两步式启动器：第一步标的·周期·窗口·**多选轴**，第二步阈值与 LLM 用量。
  *
- * **D-6 强制推论**：轴选择器只渲染 `GET /discovery/config/defaults` 回的 `implementedAxes`，
- * 绝不渲染灰掉的「敬请期待」占位——「能选、能启动、静默不产候选」正是本仓库反复吃过亏的失败模式。
+ * **D-7 强制推论**：轴选择器渲染 `GET /discovery/config/defaults` 回的 `implementedAxes`
+ * （本轮四轴全部实现），绝不渲染灰掉的「敬请期待」占位——「能选、能启动、静默不产候选」
+ * 正是本仓库反复吃过亏的失败模式。
  */
 export default function DiscoveryLauncher({
   open,
@@ -89,10 +133,22 @@ export default function DiscoveryLauncher({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  const axes = defaults?.implementedAxes ?? [];
+  const allAxes = defaults?.implementedAxes ?? [];
   const workload = useMemo(
-    () => (form ? workloadOf(form.candidatesPerIteration, form.windowBars) : 0),
-    [form],
+    () =>
+      form && defaults
+        ? workloadOfAxes(defaults, form.selection.axes, form.candidatesPerIteration,
+                         form.windowBars)
+        : 0,
+    [form, defaults],
+  );
+  const backtests = useMemo(
+    () =>
+      form && defaults
+        ? backtestsPerIteration(form.selection.axes, form.candidatesPerIteration,
+                                defaults.axisInfo)
+        : 0,
+    [form, defaults],
   );
   const overLimit = Boolean(defaults && workload > defaults.workUnitLimit);
 
@@ -108,7 +164,7 @@ export default function DiscoveryLauncher({
         instId: form.instId.trim(),
         bar: form.bar,
         windowBars: form.windowBars,
-        axes: axes.length ? [axes[0]] : ["factor"],
+        axes: form.selection.axes.length ? form.selection.axes : ["factor"],
         horizon: form.horizon,
         candidatesPerIteration: form.candidatesPerIteration,
         iterationIntervalS: form.iterationIntervalS,
@@ -127,6 +183,11 @@ export default function DiscoveryLauncher({
         },
         thresholds: form.thresholds,
         evolution: defaults.evolution,
+        templates: form.selection.templates,
+        includeLibraryFactors: form.selection.includeLibraryFactors,
+        comboSize: form.selection.comboSize,
+        rotationSize: form.selection.rotationSize,
+        strategyThresholds: form.strategyThresholds,
       };
       const res = await discoveryApi.start(body);
       onStarted(res.runId);
@@ -198,20 +259,18 @@ export default function DiscoveryLauncher({
                 }
               />
             </Field>
-            <Field label="搜索轴" htmlFor="disc-axis" hint="当前版本仅实现因子表达式轴">
-              <Select id="disc-axis" value={axes[0] ?? "factor"} disabled={axes.length <= 1}>
-                {axes.map((axis) => (
-                  <option key={axis} value={axis}>
-                    {AXIS_LABEL[axis] ?? axis}
-                  </option>
-                ))}
-              </Select>
-            </Field>
             <Field
               label="每轮候选数"
               htmlFor="disc-count"
-              error={overLimit ? "工作量超出上限，请调小候选数或窗口" : undefined}
-              hint={overLimit ? undefined : `工作量预估 ${workload.toLocaleString()} / ${defaults.workUnitLimit.toLocaleString()}`}
+              error={
+                overLimit ? "工作量超出上限，请减少候选数、缩短窗口，或减少同时开启的轴" : undefined
+              }
+              hint={
+                overLimit
+                  ? undefined
+                  : `工作量预估 ${workload.toLocaleString()} / ${defaults.workUnitLimit.toLocaleString()}` +
+                    (backtests > 0 ? ` · 每轮约 ${backtests} 次回测` : "")
+              }
             >
               <Input
                 id="disc-count"
@@ -228,6 +287,16 @@ export default function DiscoveryLauncher({
                 }
               />
             </Field>
+            <div className="col-span-2">
+              <p className="mb-1.5 text-[11px] font-medium text-[var(--text)]">搜索轴（可多选）</p>
+              <DiscoveryAxisPicker
+                allAxes={allAxes}
+                axisInfo={defaults.axisInfo ?? {}}
+                templates={defaults.templates ?? []}
+                value={form.selection}
+                onChange={(selection) => patch({ selection })}
+              />
+            </div>
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-3">
@@ -307,6 +376,34 @@ export default function DiscoveryLauncher({
               />
               进程重启后自动续跑（受挖掘总闸一票否决）
             </label>
+
+            {form.selection.axes.some((axis) => axis !== "factor") && (
+              <details className="col-span-2 rounded-[10px] border border-[var(--border)] p-2.5">
+                <summary className="cursor-pointer text-[11px] font-medium text-[var(--text)]">
+                  策略轴阈值（高级）
+                </summary>
+                <div className="mt-2 grid grid-cols-3 gap-2">
+                  {STRATEGY_THRESHOLD_FIELDS.map(({ key, label, step }) => (
+                    <Field key={key} label={label} htmlFor={`disc-st-${key}`}>
+                      <Input
+                        id={`disc-st-${key}`}
+                        type="number"
+                        step={step}
+                        value={form.strategyThresholds[key] ?? 0}
+                        onChange={(e) =>
+                          patch({
+                            strategyThresholds: {
+                              ...form.strategyThresholds,
+                              [key]: Number(e.target.value),
+                            },
+                          })
+                        }
+                      />
+                    </Field>
+                  ))}
+                </div>
+              </details>
+            )}
           </div>
         )}
 

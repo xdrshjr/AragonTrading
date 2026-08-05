@@ -63,13 +63,28 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("DiscoveryCandidates — 候选表", () => {
-  it("默认只查 kept，并渲染关键指标列", async () => {
+  it("默认只查 kept 且不限轴，混排时逐行标注指标口径（IC 与夏普不可比）", async () => {
     render(<DiscoveryCandidates />);
     await waitFor(() => expect(listMock).toHaveBeenCalled());
-    expect(listMock.mock.calls[0][1]).toMatchObject({ verdict: "kept", limit: 25, offset: 0 });
+    expect(listMock.mock.calls[0][1]).toMatchObject({
+      verdict: "kept", kind: "", limit: 25, offset: 0,
+    });
     expect(await screen.findByText(/sub\(ts_mean\(overnight,20\)/)).toBeTruthy();
+    // 混排视图下必须写清「这个数字是什么」——因子的 IC 与策略的夏普不可比，
+    // 只给一个裸数字会让两套口径被当成同一列读（这正是逐轴列定义存在的理由）。
+    expect(screen.getByText("IC 0.0612")).toBeTruthy();
+    expect(screen.getByText("IC 0.0451")).toBeTruthy();
+  });
+
+  it("切到因子轴后列头换成因子口径（IS RankIC / IR / 换手）", async () => {
+    render(<DiscoveryCandidates />);
+    await waitFor(() => expect(listMock).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole("button", { name: "因子" }));
+    await waitFor(() =>
+      expect(listMock.mock.calls[listMock.mock.calls.length - 1][1].kind).toBe("factor"),
+    );
+    expect(await screen.findByText("IS RankIC")).toBeTruthy();
     expect(screen.getByText("0.0612")).toBeTruthy();
-    expect(screen.getByText("0.0451")).toBeTruthy();
     expect(screen.getByText("0.221")).toBeTruthy();
   });
 

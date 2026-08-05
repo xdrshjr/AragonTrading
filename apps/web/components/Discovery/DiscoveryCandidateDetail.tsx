@@ -4,7 +4,9 @@ import { useEffect, useState } from "react";
 import { Badge, Button, Modal } from "@/components/ui";
 import { rejectReasonCn } from "@/lib/discovery";
 import { discoveryApi } from "@/lib/discoveryApi";
+import { axisLabel, isStrategyAxis } from "@/lib/discoveryStrategy";
 import type { DiscoveryCandidateDetail as Detail } from "@/lib/discoveryTypes";
+import DiscoveryStrategyDetail from "./DiscoveryStrategyDetail";
 import ExpressionTree from "./ExpressionTree";
 
 function fmt(value: number | null | undefined, digits = 4): string {
@@ -73,7 +75,18 @@ function QuantileBars({ buckets }: { buckets: { q: number; meanRet: number; coun
   );
 }
 
-/** 候选详情抽屉：表达式树 + 中文解释 + IS/OOS 双份指标 + 分段 IC + 分位收益 + 入库 / 回测。 */
+/** 入库成功文案：三种实体的落点不同，说清「东西去了哪里」才谈得上闭环。 */
+function promotedMessage(kind: string, reused: boolean): string {
+  const where =
+    kind === "factor_set"
+      ? "「我的因子组合」，并已同步建好伴生的因子组合得分策略"
+      : kind === "strategy"
+        ? "策略列表，可直接在策略面板发起回测"
+        : "「我的因子」，可在因子实验室评估、训练与组合";
+  return reused ? `该候选此前已入库，已复用既有记录（${where}）。` : `已入库到${where}。`;
+}
+
+/** 候选详情抽屉：按轴分派到表达式详情或策略详情；入库 / 回测按钮共用。 */
 export default function DiscoveryCandidateDetail({
   candidateId,
   onClose,
@@ -107,11 +120,7 @@ export default function DiscoveryCandidateDetail({
     setBusy("promote");
     try {
       const res = await discoveryApi.promote(candidateId);
-      setMessage(
-        res.promoted.reused
-          ? "该因子此前已入库，已复用既有记录。"
-          : "已入库到「我的因子」，可在因子实验室评估、训练与组合。",
-      );
+      setMessage(promotedMessage(res.promoted.kind, res.promoted.reused));
       onPromoted();
     } catch (err) {
       setMessage(err instanceof Error ? err.message : "入库失败");
@@ -146,7 +155,35 @@ export default function DiscoveryCandidateDetail({
 
         {loading && <p className="text-xs text-[var(--muted)]">加载中…</p>}
 
-        {detail && (
+        {detail && isStrategyAxis(detail.kind) && (
+          <>
+            <div>
+              <p className="text-xs leading-relaxed text-[var(--text)]">{detail.describe}</p>
+              <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                {axisLabel(detail.kind)} · 来源 {detail.source} · 第 {detail.iterationIdx} 轮
+              </p>
+            </div>
+            <DiscoveryStrategyDetail detail={detail} />
+            {message && <p className="text-xs text-[var(--accent)]">{message}</p>}
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" size="sm" onClick={onClose}>
+                关闭
+              </Button>
+              {detail.verdict === "kept" && (
+                <Button
+                  variant="primary"
+                  size="sm"
+                  disabled={busy === "promote"}
+                  onClick={() => void promote()}
+                >
+                  {detail.promotedId ? "已入库（再次入库幂等）" : "入库到策略库"}
+                </Button>
+              )}
+            </div>
+          </>
+        )}
+
+        {detail && !isStrategyAxis(detail.kind) && (
           <>
             <div>
               <pre className="overflow-x-auto rounded-[10px] bg-[var(--surface-2)] px-3 py-2 font-mono text-[11px] text-[var(--text)]">

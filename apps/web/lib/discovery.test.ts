@@ -260,3 +260,69 @@ describe("中文映射", () => {
     expect(pauseReasonCn("")).toBe("");
   });
 });
+
+// ============================ 三条策略轴的增量（discovery-strategy-axes §7.2） ============================
+describe("策略轴的中文映射（评审 P1-5 的机器判据）", () => {
+  it("S1–S9 与 S0:* 一律不得回显裸英文码", () => {
+    // 后端的 FILTER_LABELS 与本文件的 REJECT_REASON_CN 是**两张各自硬编码的表**：
+    // 只改后端，用户会在「拒绝原因 Top 5」里看到裸的 S6 / S0:gate_leak。
+    // 这是本仓库第二次在同一个地方摔跤，这条用例就是不许有第三次的门禁。
+    for (const code of ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"]) {
+      expect(rejectReasonCn(code)).not.toBe(code);
+    }
+    expect(rejectReasonCn("S0:missing_htf:12H")).not.toBe("S0:missing_htf:12H");
+    expect(rejectReasonCn("S0:missing_htf:12H")).toContain("高周期数据缺失");
+    expect(rejectReasonCn("S0:gate_leak")).toContain("样本外隔离失效");
+    expect(rejectReasonCn("S0:score_unavailable")).toContain("组合打分不可用");
+    expect(rejectReasonCn("S0:assemble_rejected:COMBO_MEMBERS")).toContain("边界校验拒绝");
+  });
+
+  it("「不可判定即拒」的复合码也翻成中文", () => {
+    expect(rejectReasonCn("S5:calmar_undefined")).toContain("Calmar 不足");
+    expect(rejectReasonCn("S5:calmar_undefined")).toContain("Calmar 不可判定");
+    expect(rejectReasonCn("S5:calmar_undefined")).not.toBe("S5:calmar_undefined");
+  });
+
+  it("策略轴的确定性规则同样有中文", () => {
+    for (const code of ["degenerate_params", "degenerate_members", "duplicate_members",
+                        "risk_inconsistent", "window_inconsistent"]) {
+      expect(rejectReasonCn(code)).not.toBe(code);
+    }
+  });
+});
+
+describe("多轴运行态", () => {
+  it("emptyRunState 含逐轴字段（缺了它们，state 事件的新键会没处落）", () => {
+    const state = emptyRunState(9);
+    expect(state.poolSizes).toEqual({});
+    expect(state.axisPlan).toEqual({});
+    expect(state.axes).toEqual([]);
+    expect(state.axisSnapshots).toEqual({});
+  });
+
+  it("reducer 对**未知新键**整对象透传（后端算了、类型没补，也不能被吞掉）", () => {
+    const prev = emptyRunState(9);
+    const next = applyDiscoveryEvent(prev, {
+      type: "state",
+      data: { poolSizes: { factor: 3, strategy_param: 1 }, brandNewKey: 42 },
+    } as never);
+    expect(next?.poolSizes).toEqual({ factor: 3, strategy_param: 1 });
+    expect((next as unknown as Record<string, unknown>).brandNewKey).toBe(42);
+  });
+
+  it("iteration 事件里的逐轴计数与让渡记录原样进 store", () => {
+    const prev = emptyRunState(9);
+    const next = applyDiscoveryEvent(prev, {
+      type: "iteration",
+      data: {
+        index: 1,
+        perAxis: { factor: { generated: 4, kept: 1 } },
+        yieldedByPool: { strategy_combo: { count: 2, reason: "upstream_pool_too_small",
+                                           toAxis: "factor" } },
+      },
+    } as never);
+    const row = next?.iterations[0] as unknown as Record<string, unknown>;
+    expect(row.perAxis).toEqual({ factor: { generated: 4, kept: 1 } });
+    expect(row.yieldedByPool).toBeTruthy();
+  });
+});

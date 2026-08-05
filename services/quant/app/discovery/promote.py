@@ -23,9 +23,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..db import factor_repositories as factor_repo
-from ..db.models import Factor
+from ..db import strategy_repositories as strategy_repo
+from ..db.models import Factor, Strategy
+from . import describe_strategy
 from .expression import expr_hash, parse_expression
 from .expression_text import describe_text
+from .genomes import canonical_json
 from .mechanisms import mechanism_cn
 from . import repositories as repo
 
@@ -34,6 +37,7 @@ logger = logging.getLogger("aragon")
 DISCOVERED_CATEGORY = "discovered"    # 与 FACTOR_LIBRARY["expr"].category 同值（单一口径）
 FACTOR_NAME_MAX = 128
 DESCRIBE_IN_NAME_MAX = 100
+ROTATION_TEMPLATE_KEY = "regime_rotation"
 
 
 def _bad(code: str, message: str, status: int = 400) -> HTTPException:
@@ -60,13 +64,150 @@ async def promote_candidate(session: AsyncSession, candidate_id: int) -> dict:
         raise _bad("DISCOVERY_CANDIDATE_NOT_KEPT",
                    "只有通过全部过滤条件的候选才能入库", 409)
     if row.promoted_kind and row.promoted_id:
-        return _promoted_payload(row.promoted_kind, int(row.promoted_id), reused=True)
-    if row.kind != "factor":
+        return await _replay_payload(session, row)
+    promoter = _PROMOTERS.get(row.kind)
+    if promoter is None:
         raise _bad("DISCOVERY_AXIS_UNSUPPORTED",
                    f"搜索轴「{row.kind}」的入库尚未实现", 400)
+    entity_kind, entity_id, companion = await promoter(session, row)
+    await repo.mark_promoted(session, candidate_id, kind=entity_kind, entity_id=entity_id)
+    return _promoted_payload(entity_kind, entity_id, reused=False,
+                             companion_strategy_id=companion)
+
+
+async def _replay_payload(session: AsyncSession, row) -> dict:
+    """幂等回放（评审 P1-9）：``factor_set`` 分支必须**按 id 反查伴生策略**。
+
+    ``companionStrategyId`` 只有首次调 ``factors.service.create_set`` 才拿得到；不反查的话
+    第二次点「入库」返回的 payload 里没有它，成果库的「去策略面板」跳转就断了。
+    """
+    kind, entity_id = str(row.promoted_kind), int(row.promoted_id)
+    companion = None
+    if kind == "factor_set":
+        from ..factors import service as factors_service
+
+        companion = await factors_service.companion_strategy_id(session, entity_id)
+    return _promoted_payload(kind, entity_id, reused=True, companion_strategy_id=companion)
+
+
+async def _promote_factor_axis(session: AsyncSession, row) -> tuple[str, int, None]:
     entity = await _promote_factor(session, row)
-    await repo.mark_promoted(session, candidate_id, kind="factor", entity_id=int(entity.id))
-    return _promoted_payload("factor", int(entity.id), reused=False)
+    return "factor", int(entity.id), None
+
+
+async def _promote_strategy(session: AsyncSession, row) -> tuple[str, int, None]:
+    """``strategy_param`` → ``strategies`` 行（BL-7：``params_json`` 与被回测的那份逐键相等）。"""
+    genome = _loads(row.genome_json)
+    template_key = str(genome.get("templateKey") or "")
+    params = dict(genome.get("params") or {})
+    if not template_key or not params:
+        raise _bad("DISCOVERY_GENOME_INVALID", "候选基因缺少模板或参数，无法入库")
+    existing = await _find_existing_strategy(session, template_key, params)
+    if existing is not None:
+        return "strategy", int(existing.id), None
+    name = _strategy_name("挖掘策略", row, describe_strategy.template_name(template_key))
+    created = await strategy_repo.add_strategy(session, template_key, name, params)
+    await session.commit()
+    return "strategy", int(created.id), None
+
+
+async def _promote_rotation(session: AsyncSession, row) -> tuple[str, int, None]:
+    """``strategy_combo`` → ``regime_rotation`` 策略行（先过入库期同一把边界尺子）。"""
+    from ..strategies import combo_specs
+
+    genome = _loads(row.genome_json)
+    members = [{"templateKey": str(item.get("templateKey") or ""),
+                "params": dict(item.get("params") or {})}
+               for item in (genome.get("members") or [])]
+    params = {**dict(genome.get("policy") or {}), "members": members}
+    combo_specs.validate_combo_params(ROTATION_TEMPLATE_KEY, params)
+    existing = await _find_existing_strategy(session, ROTATION_TEMPLATE_KEY, params)
+    if existing is not None:
+        return "strategy", int(existing.id), None
+    name = _strategy_name("挖掘轮动", row, f"{len(members)} 策略")
+    created = await strategy_repo.add_strategy(session, ROTATION_TEMPLATE_KEY, name, params)
+    await session.commit()
+    return "strategy", int(created.id), None
+
+
+async def _promote_factor_set(session: AsyncSession, row) -> tuple[str, int, int | None]:
+    """``factor_combo`` → ``factor_sets`` + 伴生 ``factor_score`` 策略（**必须**走 create_set）。
+
+    ``factors.service.create_set`` 是单事务 + 伴生策略 + 三道校验的唯一真源；自建行会绕开
+    伴生策略与权重契约校验，挖出一批「入库了但策略面板里没有」的组合。
+    """
+    from ..factors import service as factors_service
+
+    genome = _loads(row.genome_json)
+    members = _combo_members(genome)
+    existing = await _find_existing_set(session, members)
+    if existing is not None:
+        companion = await factors_service.companion_strategy_id(session, int(existing.id))
+        return "factor_set", int(existing.id), companion
+    name = _strategy_name("挖掘组合", row, f"{len(members)} 因子")
+    payload = await factors_service.create_set(
+        session, name=name, members_raw=members, method="equal",
+        config={"thresholds": dict(genome.get("thresholds") or {})}, model=None,
+        metrics=None, enabled=True)
+    return "factor_set", int(payload["id"]), payload.get("strategyId")
+
+
+_PROMOTERS = {"factor": _promote_factor_axis, "strategy_param": _promote_strategy,
+              "factor_combo": _promote_factor_set, "strategy_combo": _promote_rotation}
+
+
+def _combo_members(genome: dict) -> list[dict]:
+    """基因 → 入库成员（**权重逐成员烘焙**，BL-12：缺 ``weight`` 会被填 0.0 且不报错）。"""
+    members = list(genome.get("members") or [])
+    weights = list(genome.get("weights") or [])
+    return [{"factorKey": str(member.get("factorKey") or ""),
+             "params": dict(member.get("params") or {}),
+             "direction": str(member.get("direction") or "long"),
+             "name": str(member.get("name") or ""),
+             "weight": float(weights[i]) if i < len(weights) else 0.0}
+            for i, member in enumerate(members)]
+
+
+def _strategy_name(prefix: str, row, tail: str) -> str:
+    """``挖掘策略 <hash8>：<模板中文名>``（``Strategy.name`` / ``FactorSet.name`` 均 128 上限）。"""
+    return f"{prefix} {str(row.genome_hash)[:8]}：{tail}"[:FACTOR_NAME_MAX]
+
+
+async def _find_existing_strategy(session: AsyncSession, template_key: str, params: dict):
+    """幂等键 = ``(template_key, canonical_json(params))``——同一份参数已入库即复用。"""
+    target = canonical_json(params)
+    rows = (await session.execute(select(Strategy).where(
+        Strategy.template_key == template_key))).scalars().all()
+    for row in rows:
+        if canonical_json(_loads(row.params_json)) == target:
+            return row
+    return None
+
+
+async def _find_existing_set(session: AsyncSession, members: list[dict]):
+    """幂等键 = 成员集合（``factorKey`` + 参数 + 方向）的规范式，与名字无关。"""
+    from ..db import factor_repositories as factor_set_repo
+
+    target = canonical_json(sorted(
+        [[m["factorKey"], m["params"], m["direction"]] for m in members],
+        key=lambda item: canonical_json(item)))
+    for row in await factor_set_repo.list_factor_sets(session):
+        existing = _loads_list(row.members_json)
+        current = canonical_json(sorted(
+            [[str(m.get("factorKey") or ""), dict(m.get("params") or {}),
+              str(m.get("direction") or "long")] for m in existing],
+            key=lambda item: canonical_json(item)))
+        if current == target:
+            return row
+    return None
+
+
+def _loads_list(raw: str | None) -> list:
+    try:
+        value = json.loads(raw or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return []
+    return value if isinstance(value, list) else []
 
 
 async def _promote_factor(session: AsyncSession, row) -> Factor:
@@ -103,9 +244,12 @@ async def _find_existing_factor(session: AsyncSession, expr_text: str) -> Factor
     return None
 
 
-def _promoted_payload(kind: str, entity_id: int, *, reused: bool) -> dict:
-    return {"promoted": {"kind": kind, "entityId": entity_id, "entityKind": kind,
-                         "reused": reused}}
+def _promoted_payload(kind: str, entity_id: int, *, reused: bool,
+                      companion_strategy_id: int | None = None) -> dict:
+    payload = {"kind": kind, "entityId": entity_id, "entityKind": kind, "reused": reused}
+    if companion_strategy_id is not None:
+        payload["companionStrategyId"] = int(companion_strategy_id)
+    return {"promoted": payload}
 
 
 def _loads(raw: str | None) -> dict:
@@ -130,11 +274,14 @@ async def backtest_candidate(session: AsyncSession, rest, candidate_id: int, *,
     row = await repo.get_candidate(session, candidate_id)
     if row is None:
         raise _bad("NOT_FOUND", "候选不存在", 404)
-    if not row.expr_text:
-        raise _bad("DISCOVERY_AXIS_UNSUPPORTED", "该候选没有可回测的表达式", 400)
     run = await repo.get_run(session, int(row.run_id))
     if run is None:
         raise _bad("NOT_FOUND", "候选所属任务不存在", 404)
+    if row.kind != "factor":
+        return await _backtest_strategy_candidate(rest, row, run, start_ts=start_ts,
+                                                  end_ts=end_ts)
+    if not row.expr_text:
+        raise _bad("DISCOVERY_AXIS_UNSUPPORTED", "该候选没有可回测的表达式", 400)
     metrics = _loads(row.metrics_json)
     params = _factor_score_params(row.expr_text, str(metrics.get("direction") or "long"))
     _candles, result, costs = await run_factor_score_backtest(
@@ -142,9 +289,96 @@ async def backtest_candidate(session: AsyncSession, rest, candidate_id: int, *,
         start_ts=int(start_ts), end_ts=int(end_ts))
     return {"candidateId": candidate_id, "instId": run.inst_id, "bar": run.bar,
             "startTs": int(start_ts), "endTs": int(end_ts), "metrics": result.metrics,
-            "trades": len(result.trades),
+            "trades": len(result.trades), "clipMode": "full",
             "costs": {"initialCapital": costs[0], "takerFeeBps": costs[1],
                       "slippageBps": costs[2], "leverage": costs[3]}}
+
+
+async def _backtest_strategy_candidate(rest, row, run, *, start_ts: int,
+                                       end_ts: int) -> dict:
+    """策略轴候选的一键回测：按**同一个 assembler**在给定区间跑一次真回测（不落库）。
+
+    与因子轴的一次性语义一致——「进运行历史并可回放 K 线」由用户先入库再从策略面板发起，
+    发现层绝不往 ``strategy_runs`` 写东西（安全不变式）。
+    """
+    from ..config import get_settings
+    from ..engine.backtester import candles_to_df, run_backtest
+    from ..engine.combo import run_combo_backtest
+    from .backtest_lane import costs_of, metrics_of
+    from .genomes import GENOME_LOADERS
+    from .lanes import LaneContext
+    from .lanes.strategy_lane import assembler_for
+
+    settings = get_settings()
+    genome_payload = _loads(row.genome_json)
+    if not genome_payload:
+        raise _bad("DISCOVERY_GENOME_INVALID", "候选基因为空，无法回测")
+    assembler = assembler_for(str(row.kind), GENOME_LOADERS[str(row.kind)](genome_payload),
+                              settings)
+    candles, frames = await _load_backtest_window(rest, assembler, run, start_ts, end_ts,
+                                                  settings)
+    ctx = LaneContext(df_full=candles_to_df(candles), candles=candles, htf_frames=frames,
+                      bar=run.bar, split=len(candles), split_ts=int(end_ts),
+                      config={}, settings=settings, memo={})
+    reason = assembler.preflight(ctx)
+    if reason:
+        raise _bad("DISCOVERY_BACKTEST_UNAVAILABLE", f"候选无法回测：{reason}")
+    initial, fee_bps, slip_bps, leverage = costs_of(settings)
+    kwargs = {"initial_capital": initial, "taker_fee_bps": fee_bps,
+              "slippage_bps": slip_bps, "leverage": leverage}
+    if assembler.is_combo:
+        members = assembler.members()
+        result = run_combo_backtest(
+            members, candles, run.bar, policy=assembler.policy(),
+            htf_frames_by_member=assembler.htf_frames_by_member(ctx, members), **kwargs)
+        extra = {"segments": len(result.segments)}
+    else:
+        result = run_backtest(assembler.build(), candles, run.bar,
+                              htf_frames=assembler.htf_frames(ctx) or None, **kwargs)
+        extra = {}
+    return {"candidateId": int(row.id), "instId": run.inst_id, "bar": run.bar,
+            "startTs": int(start_ts), "endTs": int(end_ts),
+            "metrics": metrics_of(result.equity_points, result.trades, run.bar, initial),
+            "trades": len(result.trades), "equity": _equity_points(result.equity_points),
+            "clipMode": "full", **extra,
+            "costs": {"initialCapital": initial, "takerFeeBps": fee_bps,
+                      "slippageBps": slip_bps, "leverage": leverage}}
+
+
+async def _load_backtest_window(rest, assembler, run, start_ts: int, end_ts: int,
+                                settings) -> tuple[list, dict]:
+    """取基础区间 K 线 + 该候选所需的高周期帧（缺帧由 ``preflight`` fail-closed 拦下）。"""
+    from ..agent.services import load_htf_frames, load_range_candles
+    from ..engine.mtf import bar_to_seconds
+
+    candles = await load_range_candles(rest, inst_id=run.inst_id, bar=run.bar,
+                                       start_ts=int(start_ts), end_ts=int(end_ts),
+                                       max_bars=int(settings.backtest_max_bars))
+    base = bar_to_seconds(run.bar)
+    needed = sorted({tf for tf in _required_timeframes(assembler)
+                     if tf != run.bar and bar_to_seconds(tf) > base})
+    if not needed:
+        return candles, {}
+    frames = await load_htf_frames(rest, inst_id=run.inst_id, start_ts=int(start_ts),
+                                   end_ts=int(end_ts), base_seconds=base,
+                                   timeframes=needed, htf_warmup_bars=64)
+    return candles, frames
+
+
+def _required_timeframes(assembler) -> list[str]:
+    if assembler.is_combo:
+        return [tf for member in assembler.members() for tf in member.timeframes]
+    return list(assembler.build().timeframes())
+
+
+def _equity_points(points: list, cap: int = 400) -> list[dict]:
+    """净值下采样到 ≤``cap`` 点（详情抽屉够用，响应体不因此膨胀）。"""
+    if not points:
+        return []
+    picked = points if len(points) <= cap else [
+        points[min(len(points) - 1, round(i * (len(points) - 1) / (cap - 1)))]
+        for i in range(cap)]
+    return [{"ts": int(p.ts), "equity": round(float(p.equity), 4)} for p in picked]
 
 
 def _factor_score_params(expr_text: str, direction: str) -> dict:

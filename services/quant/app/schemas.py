@@ -1976,6 +1976,7 @@ class DiscoveryStartReq(BaseModel):
     maxIterations: int = Field(default=0, ge=0)
     maxRuntimeHours: float = Field(default=0.0, ge=0)
     maxKept: int = Field(default=200, ge=1, le=2000)
+    maxKeptPerAxis: int | None = Field(default=None, ge=1, le=2000)
     autoResume: bool = True
     autoPromote: bool = False
     revalidateOnRefresh: bool = True
@@ -1983,6 +1984,13 @@ class DiscoveryStartReq(BaseModel):
     llm: dict[str, Any] = Field(default_factory=dict)
     thresholds: dict[str, Any] = Field(default_factory=dict)
     evolution: dict[str, Any] = Field(default_factory=dict)
+    # 三条策略轴（discovery-strategy-axes §4.1）：全部可选，缺省即沿用后端默认。
+    axisWeights: dict[str, Any] = Field(default_factory=dict)
+    templates: list[str] = Field(default_factory=list, max_length=32)
+    includeLibraryFactors: bool = True
+    comboSize: dict[str, Any] = Field(default_factory=dict)
+    rotationSize: dict[str, Any] = Field(default_factory=dict)
+    strategyThresholds: dict[str, Any] = Field(default_factory=dict)
 
 
 class DiscoveryBacktestReq(BaseModel):

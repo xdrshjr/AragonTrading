@@ -48,13 +48,23 @@ def _assert_legal(genome: ExprGenome) -> None:
     assert all(w in WINDOW_LADDER for w in windows_of(genome.node))
 
 
-# ============================ 范围守门（D-6） ============================
-def test_only_factor_axis_is_implemented_in_v1():
-    """未实现的轴绝不能进 ``IMPLEMENTED_AXES``——「能选但不产候选」算缺陷，不算完成。"""
-    assert IMPLEMENTED_AXES == ("factor",)
-    assert set(IMPLEMENTED_AXES) < set(ALL_AXES)
+# ============================ 范围守门（D-7） ============================
+def test_all_four_axes_are_implemented():
+    """D-7：四条轴全部落地 ⇒ ``IMPLEMENTED_AXES == ALL_AXES``。
+
+    这条守的仍是同一件事：**能选但不产候选**算缺陷，不算完成。轴一旦进
+    ``IMPLEMENTED_AXES``，就必须有搜索器、有验证、有入库路径。
+    """
+    from app.discovery.searchers import SEARCHERS
+
+    assert IMPLEMENTED_AXES == ALL_AXES
     assert isinstance(FactorSearcher(), Searcher)
     assert FactorSearcher.kind == "factor"
+    for axis in ALL_AXES:
+        if axis == "factor":
+            continue
+        searcher = SEARCHERS[axis]()
+        assert isinstance(searcher, Searcher) and searcher.kind == axis
 
 
 # ============================ seed ============================

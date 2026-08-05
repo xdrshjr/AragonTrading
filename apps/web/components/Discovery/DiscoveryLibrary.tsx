@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Badge, Button, Card } from "@/components/ui";
 import { discoveryApi } from "@/lib/discoveryApi";
+import { AXIS_SHORT_CN, fmtNumber, isStrategyAxis } from "@/lib/discoveryStrategy";
 import type { DiscoveryCandidateRow } from "@/lib/discoveryTypes";
 import { useAppStore } from "@/lib/store";
 import DiscoveryCandidateDetail from "./DiscoveryCandidateDetail";
@@ -14,7 +15,25 @@ function fmt(value: number | null | undefined, digits = 4): string {
     : value.toFixed(digits);
 }
 
-/** 成果库：本任务已入库的因子 + 「已退化」徽标 + 溯源（run # / iter #）+ 跳转因子实验室。 */
+/** 候选 → 它入库后会变成哪种实体（与后端 ``_PROMOTERS`` 的映射同源）。 */
+function entityOf(kind: string): "factor" | "factor_set" | "strategy" {
+  if (kind === "factor_combo") return "factor_set";
+  if (kind === "factor") return "factor";
+  return "strategy";
+}
+
+const ENTITY_TITLE: Record<string, string> = {
+  factor: "因子",
+  factor_set: "因子组合（含伴生得分策略）",
+  strategy: "策略",
+};
+
+/**
+ * 成果库：按**实体类型**分组（因子 / 因子组合 / 策略）+ 「已退化」徽标 + 溯源 + 一键跳转。
+ *
+ * 「挖到 → 一眼看到 → 一键用起来」是这个分区的全部意义：只列出来而不给跳转，用户还得自己
+ * 去别的页面找一遍。
+ */
 export default function DiscoveryLibrary() {
   const { activeRunId, runs, goSection } = useDiscovery();
   const setActiveView = useAppStore((s) => s.setActiveView);
@@ -41,6 +60,17 @@ export default function DiscoveryLibrary() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /** 跳转到该实体所在的既有页面（复用 setActiveView + 分区跳转，不新造路由）。 */
+  const jumpTo = (entity: "factor" | "factor_set" | "strategy") => {
+    if (entity === "strategy") {
+      setActiveView("trade");
+      return;
+    }
+    // 因子组合落在因子实验室的「组合构建」分区（与 StrategyDetail 的跳转口径一致）。
+    setFactorLabSection(entity === "factor_set" ? "builder" : "my-factors");
+    setActiveView("factor");
+  };
 
   const summary = runs.find((row) => row.runId === activeRunId) ?? null;
   const promoted = rows.filter((row) => row.promotedId);
@@ -74,18 +104,41 @@ export default function DiscoveryLibrary() {
         <ul className="flex flex-col gap-2">
           {list.map((row) => (
             <li key={row.id ?? row.genomeHash} className="border-b border-[var(--border)] pb-2 last:border-0 last:pb-0">
-              <button
-                type="button"
-                onClick={() => row.id !== undefined && setDetailId(row.id)}
-                className="block w-full truncate text-left font-mono text-[11px] text-[var(--text)] underline-offset-2 hover:underline"
-                title={row.exprText}
-              >
-                {row.exprText}
-              </button>
+              <div className="flex items-start gap-2">
+                <button
+                  type="button"
+                  onClick={() => row.id !== undefined && setDetailId(row.id)}
+                  className="block flex-1 truncate text-left font-mono text-[11px] text-[var(--text)] underline-offset-2 hover:underline"
+                  title={row.exprText || row.describe}
+                >
+                  {row.exprText || row.describe}
+                </button>
+                <span className="shrink-0 rounded-full bg-[var(--surface-2)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                  {AXIS_SHORT_CN[row.kind] ?? row.kind}
+                </span>
+                {row.promotedId && (
+                  <button
+                    type="button"
+                    onClick={() => jumpTo(entityOf(row.kind))}
+                    className="shrink-0 text-[10px] text-[var(--accent)] underline"
+                  >
+                    {entityOf(row.kind) === "strategy" ? "去策略面板" : "去因子实验室"}
+                  </button>
+                )}
+              </div>
               <p className="truncate text-[11px] text-[var(--muted)]">{row.describe}</p>
               <p className="mt-0.5 flex flex-wrap gap-x-3 text-[10px] tabular text-[var(--muted)]">
-                <span>IS RankIC {fmt(row.metrics.is?.rankIc)}</span>
-                <span>OOS RankIC {fmt(row.metrics.oos?.rankIc)}</span>
+                {isStrategyAxis(row.kind) ? (
+                  <>
+                    <span>IS 夏普 {fmtNumber(row.metrics.is?.sharpe)}</span>
+                    <span>OOS 夏普 {fmtNumber(row.metrics.oos?.sharpe)}</span>
+                  </>
+                ) : (
+                  <>
+                    <span>IS RankIC {fmt(row.metrics.is?.rankIc)}</span>
+                    <span>OOS RankIC {fmt(row.metrics.oos?.rankIc)}</span>
+                  </>
+                )}
                 <span>试验数 {row.trialsAtAccept ?? "—"}</span>
                 <span>
                   来源 #{summary?.runId ?? activeRunId} / 第 {row.iterationIdx} 轮
@@ -97,6 +150,9 @@ export default function DiscoveryLibrary() {
       )}
     </Card>
   );
+
+  const byEntity = (entity: string, list: DiscoveryCandidateRow[]) =>
+    list.filter((row) => entityOf(row.kind) === entity);
 
   return (
     <div className="flex flex-col gap-3">
@@ -123,8 +179,16 @@ export default function DiscoveryLibrary() {
         </p>
       )}
 
-      {renderGroup("已入库到「我的因子」", promoted,
-                   "还没有入库的因子。在候选库里选中通过全部过滤条件的候选并点「入库」即可。")}
+      {(["factor", "factor_set", "strategy"] as const).map((entity) =>
+        byEntity(entity, promoted).length > 0 ? (
+          <div key={entity}>
+            {renderGroup(`已入库 · ${ENTITY_TITLE[entity]}`, byEntity(entity, promoted), "")}
+          </div>
+        ) : null,
+      )}
+      {promoted.length === 0 &&
+        renderGroup("已入库", promoted,
+                    "还没有入库的成果。在候选库里选中通过全部过滤条件的候选并点「入库」即可。")}
       {renderGroup("待入库（已通过全部过滤条件）", pending,
                    "暂无待入库候选。")}
       {renderGroup("已退化", demoted,

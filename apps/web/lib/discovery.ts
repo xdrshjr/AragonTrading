@@ -57,6 +57,41 @@ export const REJECT_REASON_CN: Record<string, string> = {
   skeleton_blacklisted: "该骨架屡试不中",
   constant_or_empty: "近乎常数或有效值过少",
   validate_timeout: "单候选验证超时",
+  // 策略轴 S1–S9 + 装配失败（discovery-strategy-axes §2.6.2）。⚠️ 后端 `FILTER_LABELS` 是
+  // **另一张**表：只改后端，用户会在「拒绝原因 Top 5」里看到裸的 `S6` / `S0:gate_leak`。
+  // 这是本仓库第二次在同一个地方摔跤（上一次是 `category=discovered` 未登记中文映射）。
+  S1: "样本量不足",
+  S2: "样本内亏损",
+  S3: "夏普未达（含多重检验惩罚）",
+  S4: "回撤超限",
+  S5: "Calmar 不足",
+  S6: "样本外崩塌",
+  S7: "交易过密或盈亏比不足",
+  S8: "与已入库策略高度相关",
+  S9: "成本压力下不再盈利",
+  S0: "装配失败",
+  degenerate_params: "全部可挖参数都等于模板默认值",
+  degenerate_members: "成员不足或存在摆设成员",
+  duplicate_members: "存在两个完全相同的成员",
+  risk_inconsistent: "止损不小于止盈（必亏结构）",
+  window_inconsistent: "快窗不小于慢窗",
+};
+
+/** `S0:` 与 `S<n>:` 的子因中文（带冒号的形态必须逐个翻，否则回显裸英文码）。 */
+export const REJECT_SUB_REASON_CN: Record<string, string> = {
+  missing_htf: "高周期数据缺失",
+  gate_leak: "样本外隔离失效",
+  score_unavailable: "组合打分不可用",
+  assemble_rejected: "边界校验拒绝",
+  rebase_undefined: "样本外净值不可重基",
+  calmar_undefined: "Calmar 不可判定",
+  sharpe_undefined: "夏普不可判定",
+  tradeCount_undefined: "成交笔数不可判定",
+  totalReturn_undefined: "收益不可判定",
+  tradeRate_undefined: "交易密度不可判定",
+  profitFactor_undefined: "盈亏比不可判定",
+  equityCorr_undefined: "相关性不可判定",
+  maxDrawdown_undefined: "回撤不可判定",
 };
 
 export const PAUSE_REASON_CN: Record<string, string> = {
@@ -83,6 +118,17 @@ export function rejectReasonCn(code: string): string {
     return detail ? `LLM 精判否决：${detail}` : "LLM 精判否决";
   }
   if (code.startsWith("eval_error:")) return `求值异常（${code.slice("eval_error:".length)}）`;
+  if (code.startsWith("S0:")) {
+    const [sub, ...rest] = code.slice("S0:".length).split(":");
+    const detail = rest.length ? `：${rest.join(":")}` : "";
+    return `装配失败（${REJECT_SUB_REASON_CN[sub] ?? sub}${detail}）`;
+  }
+  // `S<n>:<field>_undefined`（不可判定即拒）也必须翻成中文，绝不回显裸码。
+  const undecided = /^(S[1-9]):(.+)$/.exec(code);
+  if (undecided) {
+    const gate = REJECT_REASON_CN[undecided[1]] ?? undecided[1];
+    return `${gate}（${REJECT_SUB_REASON_CN[undecided[2]] ?? undecided[2]}）`;
+  }
   return REJECT_REASON_CN[code] ?? code;
 }
 
@@ -99,6 +145,9 @@ export function emptyRunState(runId: number): DiscoveryRunState {
     counters: { tested: 0, kept: 0, rejected: {} },
     budget: { ...DEFAULT_BUDGET },
     poolSizes: {},
+    axisPlan: {},
+    axes: [],
+    axisSnapshots: {},
     mechanismCoverage: {},
     fsaBans: [],
     nextIterationTs: null,

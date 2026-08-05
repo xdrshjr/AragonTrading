@@ -21,6 +21,7 @@ class IterationTally:
     rejected_by_reason: dict = field(default_factory=dict)
     by_source: dict = field(default_factory=dict)
     truncated_by_timeout: int = 0
+    truncated_by_backtest_cap: int = 0
     overrun: bool = False
     skipped: str = ""
 
@@ -29,6 +30,22 @@ class IterationTally:
 
     def count_reject(self, reason: str) -> None:
         self.rejected_by_reason[reason] = self.rejected_by_reason.get(reason, 0) + 1
+
+    def merge(self, other: "IterationTally") -> None:
+        """把一条轴的计数并进汇总 tally（多轴同跑时 UI 顶部读的是汇总值）。"""
+        self.generated += other.generated
+        self.rule_rejected += other.rule_rejected
+        self.llm_rejected += other.llm_rejected
+        self.validated += other.validated
+        self.kept += other.kept
+        self.truncated_by_timeout += other.truncated_by_timeout
+        self.truncated_by_backtest_cap += other.truncated_by_backtest_cap
+        for reason, count in other.rejected_by_reason.items():
+            self.rejected_by_reason[reason] = self.rejected_by_reason.get(reason, 0) + count
+        for source, count in other.by_source.items():
+            self.by_source[source] = self.by_source.get(source, 0) + count
+        self.overrun = self.overrun or other.overrun
+        self.skipped = self.skipped or other.skipped
 
 
 def rate(numerator: int, denominator: int) -> float:
@@ -43,7 +60,26 @@ def tally_to_stats(tally: IterationTally) -> dict:
             "kept": tally.kept, "rejectedByReason": dict(tally.rejected_by_reason),
             "bySource": dict(tally.by_source),
             "truncatedByTimeout": tally.truncated_by_timeout,
+            "truncatedByBacktestCap": tally.truncated_by_backtest_cap,
             "overrun": tally.overrun, "skipped": tally.skipped}
+
+
+def per_axis_stats(tallies: dict) -> dict:
+    """逐轴计数投影（``iteration.data.perAxis``；漏斗按轴分列直接读它）。"""
+    return {axis: {"generated": t.generated, "ruleRejected": t.rule_rejected,
+                   "llmRejected": t.llm_rejected, "validated": t.validated,
+                   "kept": t.kept, "truncated": t.truncated_by_timeout,
+                   "truncatedByBacktestCap": t.truncated_by_backtest_cap,
+                   "rejectedByReason": dict(t.rejected_by_reason)}
+            for axis, t in tallies.items()}
+
+
+def merged_tally(tallies: dict) -> IterationTally:
+    """把逐轴 tally 合成一份汇总（顶部漏斗与既有 ``stats_json`` 形状保持不变）。"""
+    total = IterationTally()
+    for tally in tallies.values():
+        total.merge(tally)
+    return total
 
 
 def iteration_note(tally: IterationTally) -> str:
@@ -56,6 +92,8 @@ def iteration_note(tally: IterationTally) -> str:
     parts = [f"生成 {tally.generated}／审出 {tally.validated}／入库 {tally.kept}"]
     if tally.truncated_by_timeout:
         parts.append(f"本轮墙钟到点，丢弃 {tally.truncated_by_timeout} 条未验证候选")
+    if tally.truncated_by_backtest_cap:
+        parts.append(f"本轮回测次数触顶，丢弃 {tally.truncated_by_backtest_cap} 条未验证候选")
     if tally.overrun:
         parts.append("耗时超过迭代间隔（不排队补跑）")
     if tally.skipped:

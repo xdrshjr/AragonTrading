@@ -408,6 +408,16 @@ async def ensure_companion_strategy(session: AsyncSession, set_row: FactorSet) -
     return canonical
 
 
+async def companion_strategy_id(session: AsyncSession, set_id: int) -> int | None:
+    """组合的伴生 ``factor_score`` 策略 id（正典 = min id；无伴生 → ``None``）。
+
+    只读助手，零行为变更：供挖掘层的**幂等回放**路径补齐 ``companionStrategyId``——
+    第二次入库若不带它，成果库的「去策略面板」跳转就断了（discovery-strategy-axes P1-9）。
+    """
+    rows = await repo.list_factor_score_rows_for_set(session, int(set_id))
+    return int(rows[0].id) if rows else None
+
+
 async def create_set(session: AsyncSession, *, name: str, members_raw: list[dict], method: str,
                      config: dict | None, model: dict | None, metrics: dict | None,
                      enabled: bool) -> dict:

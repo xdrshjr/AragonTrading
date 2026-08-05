@@ -4,17 +4,15 @@ import { useCallback, useEffect, useState } from "react";
 import { Badge, Button, Card, Select } from "@/components/ui";
 import { rejectReasonCn } from "@/lib/discovery";
 import { discoveryApi } from "@/lib/discoveryApi";
+import { AXIS_SHORT_CN, columnsForKind } from "@/lib/discoveryStrategy";
 import type { DiscoveryCandidateRow } from "@/lib/discoveryTypes";
 import DiscoveryCandidateDetail from "./DiscoveryCandidateDetail";
 import { useDiscovery } from "./DiscoveryLab";
 
 const PAGE_SIZE = 25;
-
-function fmt(value: number | null | undefined, digits = 4): string {
-  return value === null || value === undefined || !Number.isFinite(value)
-    ? "—"
-    : value.toFixed(digits);
-}
+const KIND_CHIPS = ["", "factor", "factor_combo", "strategy_param", "strategy_combo"];
+const STRATEGY_REJECT_CODES = ["S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+                               "degenerate_params", "degenerate_members"];
 
 /** 候选库：筛选（状态 / 机制族 / 拒绝原因）+ 分页 + 详情抽屉 + 批量入库。 */
 export default function DiscoveryCandidates() {
@@ -25,6 +23,7 @@ export default function DiscoveryCandidates() {
   const [verdict, setVerdict] = useState("kept");
   const [mechanism, setMechanism] = useState("");
   const [reason, setReason] = useState("");
+  const [kind, setKind] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [detailId, setDetailId] = useState<number | null>(null);
@@ -40,6 +39,7 @@ export default function DiscoveryCandidates() {
         verdict,
         mechanism,
         reason,
+        kind,
         limit: PAGE_SIZE,
         offset,
       });
@@ -51,7 +51,7 @@ export default function DiscoveryCandidates() {
     } finally {
       setLoading(false);
     }
-  }, [activeRunId, verdict, mechanism, reason, offset]);
+  }, [activeRunId, verdict, mechanism, reason, kind, offset]);
 
   useEffect(() => {
     void load();
@@ -61,7 +61,7 @@ export default function DiscoveryCandidates() {
   useEffect(() => {
     setOffset(0);
     setSelected(new Set());
-  }, [verdict, mechanism, reason, activeRunId]);
+  }, [verdict, mechanism, reason, kind, activeRunId]);
 
   const toggle = (id: number) => {
     setSelected((prev) => {
@@ -109,9 +109,29 @@ export default function DiscoveryCandidates() {
   }
 
   const canPromote = verdict === "kept" && selected.size > 0;
+  const columns = columnsForKind(kind);
 
   return (
     <div className="flex flex-col gap-3">
+      <ul className="flex flex-wrap items-center gap-1.5" aria-label="按搜索轴筛选">
+        {KIND_CHIPS.map((item) => (
+          <li key={item || "all"}>
+            <button
+              type="button"
+              onClick={() => setKind(item)}
+              aria-pressed={kind === item}
+              className={`rounded-full px-2.5 py-0.5 text-[11px] transition-colors ${
+                kind === item
+                  ? "bg-[var(--accent)] text-white"
+                  : "bg-[var(--surface-2)] text-[var(--muted)] hover:text-[var(--text)]"
+              }`}
+            >
+              {item ? AXIS_SHORT_CN[item] ?? item : "全部轴"}
+            </button>
+          </li>
+        ))}
+      </ul>
+
       <div className="flex flex-wrap items-center gap-2">
         <h3 className="text-sm font-semibold text-[var(--text)]">候选库</h3>
         <Select
@@ -149,6 +169,7 @@ export default function DiscoveryCandidates() {
           >
             <option value="">全部原因</option>
             {["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11",
+              ...STRATEGY_REJECT_CODES,
               "duplicate", "fsa_banned", "constant_or_empty"].map((code) => (
               <option key={code} value={code}>
                 {code} · {rejectReasonCn(code)}
@@ -187,12 +208,17 @@ export default function DiscoveryCandidates() {
             <thead className="bg-[var(--surface-2)] text-[var(--muted)]">
               <tr>
                 <th scope="col" className="w-8 px-2 py-1.5" />
-                <th scope="col" className="px-2 py-1.5">表达式</th>
-                <th scope="col" className="px-2 py-1.5">机制族</th>
-                <th scope="col" className="px-2 py-1.5 text-right">IS RankIC</th>
-                <th scope="col" className="px-2 py-1.5 text-right">OOS RankIC</th>
-                <th scope="col" className="px-2 py-1.5 text-right">IR</th>
-                <th scope="col" className="px-2 py-1.5 text-right">换手</th>
+                <th scope="col" className="px-2 py-1.5">候选</th>
+                <th scope="col" className="px-2 py-1.5">轴 / 机制族</th>
+                {columns.map((column) => (
+                  <th
+                    key={column.key}
+                    scope="col"
+                    className={`px-2 py-1.5 ${column.align === "right" ? "text-right" : ""}`}
+                  >
+                    {column.label}
+                  </th>
+                ))}
                 <th scope="col" className="px-2 py-1.5">状态</th>
               </tr>
             </thead>
@@ -203,7 +229,7 @@ export default function DiscoveryCandidates() {
                     {row.verdict === "kept" && row.id !== undefined && (
                       <input
                         type="checkbox"
-                        aria-label={`选择 ${row.exprText}`}
+                        aria-label={`选择 ${row.exprText || row.describe}`}
                         checked={selected.has(row.id)}
                         onChange={() => toggle(row.id as number)}
                       />
@@ -214,21 +240,28 @@ export default function DiscoveryCandidates() {
                       type="button"
                       onClick={() => row.id !== undefined && setDetailId(row.id)}
                       className="block max-w-full truncate text-left font-mono text-[var(--text)] underline-offset-2 hover:underline"
-                      title={row.exprText}
+                      title={row.exprText || row.describe}
                     >
-                      {row.exprText}
+                      {row.exprText || row.describe}
                     </button>
                     <span className="block max-w-full truncate text-[var(--muted)]">
                       {row.describe}
                     </span>
                   </td>
-                  <td className="px-2 py-1.5 text-[var(--muted)]">{row.mechanism || "—"}</td>
-                  <td className="px-2 py-1.5 text-right tabular">{fmt(row.metrics.is?.rankIc)}</td>
-                  <td className="px-2 py-1.5 text-right tabular">{fmt(row.metrics.oos?.rankIc)}</td>
-                  <td className="px-2 py-1.5 text-right tabular">{fmt(row.metrics.is?.ir, 3)}</td>
-                  <td className="px-2 py-1.5 text-right tabular">
-                    {fmt(row.metrics.turnoverProxy, 3)}
+                  <td className="px-2 py-1.5 text-[var(--muted)]">
+                    <span className="mr-1 rounded-full bg-[var(--surface-2)] px-1.5 py-0.5 text-[10px]">
+                      {AXIS_SHORT_CN[row.kind] ?? row.kind}
+                    </span>
+                    {row.mechanism || "—"}
                   </td>
+                  {columns.map((column) => (
+                    <td
+                      key={column.key}
+                      className={`px-2 py-1.5 tabular ${column.align === "right" ? "text-right" : ""}`}
+                    >
+                      {column.value(row)}
+                    </td>
+                  ))}
                   <td className="px-2 py-1.5">
                     {row.verdict === "kept" ? (
                       <Badge tone={row.demoted ? "short" : "long"}>

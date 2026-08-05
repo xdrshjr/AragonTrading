@@ -79,13 +79,23 @@ def build_generate_system_prompt() -> str:
 
 
 def build_review_system_prompt() -> str:
-    """审查子代理的 system prompt（只有否决权，绝不替代硬编码验证）。"""
+    """审查子代理的 system prompt（只有否决权，绝不替代硬编码验证）。
+
+    ⚠️ 候选可能来自四条轴：``factor`` 是表达式，另三条是**策略**（参数组合 / 因子组合 /
+    策略轮动），它们没有表达式、只有中文渲染。不把这件事说清，模型会拿「表达式审查」的尺子去
+    量一条策略候选，然后以「看不懂结构」为由否决——而裁决语义是**只减不增**，那等于把整条轴
+    误杀在审查层（discovery-strategy-axes §2.7）。
+    """
     return (
-        "你是量化因子的**经济学含义**审查员。系统已经用确定性规则做过语法、量纲与复杂度检查，"
-        "接下来还会用硬编码的回测与 11 条统计闸做验证。\n\n"
+        "你是量化研究的**经济学含义**审查员。系统已经用确定性规则做过语法、量纲、复杂度与"
+        "退化检查，接下来还会用硬编码的统计闸（因子 11 条）或真回测（策略 9 条）做验证。\n\n"
+        "候选有两类，**判据不同**：\n"
+        "  · 类型 factor：一条价量**表达式**，判断它是否有可解释的经济学含义、边界是否合理。\n"
+        "  · 类型 strategy_param / factor_combo / strategy_combo：一条**策略**（模板参数组合 /"
+        "因子加权组合 / 策略轮动），它没有表达式，只给中文渲染。判断这套配置在逻辑上是否自相"
+        "矛盾（如风控参数互相打架、成员之间完全同质），**不要**因为「没有表达式」而否决。\n\n"
         "你的职责边界（务必严格遵守）：\n"
-        "  1. 你**只有否决权**。判断某条表达式是否有可解释的经济学含义、边界条件是否合理；"
-        "拿不准就放行（accept=true），把裁决权留给统计验证。\n"
+        "  1. 你**只有否决权**。拿不准就放行（accept=true），把裁决权留给统计验证与回测。\n"
         "  2. 你**不能**替代统计验证。绝不要因为「看起来会赚钱 / 不赚钱」而否决或放行——"
         "达标与否由硬编码的闸决定，不由你决定。\n"
         "  3. 否决的合理理由举例：把不可比的量强行组合、窗口组合自相矛盾、"
@@ -193,12 +203,21 @@ def _failure_block(rows: list) -> str:
     return f"【失败模式（这些结构反复不达标，请避开）】{items}"
 
 
+AXIS_CN: dict[str, str] = {
+    "factor": "因子表达式", "factor_combo": "因子组合策略",
+    "strategy_param": "常规策略参数", "strategy_combo": "策略轮动组合",
+}
+
+
 def build_review_prompt(payload: dict) -> str:
-    """装配审查 prompt：逐条候选的表达式 + 中文渲染 + 机制族 + 本 run 的覆盖摘要。"""
+    """装配审查 prompt：逐条候选的类型 + 表达式（仅因子轴有）+ 中文渲染 + 机制族 + 覆盖摘要。"""
     lines = ["【待审候选】"]
     for row in payload.get("candidates") or []:
+        kind = str(row.get("kind") or "factor")
+        expr = str(row.get("expr") or "")
         lines.append(f"  hash={row.get('hash', '')}\n"
-                     f"    表达式：{row.get('expr', '')}\n"
+                     f"    类型：{AXIS_CN.get(kind, kind)}\n"
+                     f"    表达式：{expr or '（该类型无表达式，见下方中文解释）'}\n"
                      f"    中文解释：{row.get('describe', '')}\n"
                      f"    系统判定机制族：{mechanism_cn(str(row.get('mechanism', '')))}")
     coverage = payload.get("mechanismCoverage") or {}

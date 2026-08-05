@@ -420,6 +420,19 @@ class Settings(BaseSettings):
     discovery_auto_resume: bool = True
     discovery_resume_delay_s: float = Field(default=10.0, ge=0)        # 自动续跑前的静置延时
 
+    # ---- 三条策略轴（discovery-strategy-axes §六）----
+    # ⚠️ 计数单位是**底层 run_backtest 调用次数**，不是候选数：engine/combo.py::_build_member_curves
+    # 对每个成员各跑一次，一个 strategy_combo 候选背后是 4–12 次。按候选级计数会低估 4–6 倍，
+    # 墙钟护栏形同虚设（评审 P1-3）。
+    discovery_max_backtests_per_iteration: int = Field(default=120, ge=1)
+    # 单个策略候选的墙钟超时（**IS / OOS / S9 压力，三段合计**）。
+    discovery_backtest_timeout_s: float = Field(default=30.0, gt=0)
+    discovery_max_htf_frames: int = Field(default=3, ge=0, le=8)       # 一个 run 的高周期帧数上限
+    discovery_member_catalog_max: int = Field(default=60, ge=2)        # 因子成员目录上限
+    # 低于此规模的轴本轮跳过 FSA 扫描（BL-10 后半）：池里只有 3 条时每条都占 33% > 15%，
+    # 会被**全部**冻结——回测型的三条策略轴入库速度比因子轴低一到两个数量级，早期必然踩中。
+    discovery_fsa_min_pool: int = Field(default=20, ge=1)
+
     # ---- 代理（透传给 httpx / websockets）----
     http_proxy: str = ""
     https_proxy: str = ""

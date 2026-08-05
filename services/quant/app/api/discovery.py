@@ -101,7 +101,7 @@ async def delete_discovery_run(run_id: int,
 # ============================ 候选 ============================
 @router.get("/discovery/runs/{run_id}/candidates")
 async def list_discovery_candidates(run_id: int, verdict: str = "kept", mechanism: str = "",
-                                    reason: str = "", sort: str = "",
+                                    reason: str = "", sort: str = "", kind: str = "",
                                     limit: int = Query(50, ge=1, le=200),
                                     offset: int = Query(0, ge=0),
                                     session: AsyncSession = Depends(get_session)) -> dict:
@@ -109,7 +109,7 @@ async def list_discovery_candidates(run_id: int, verdict: str = "kept", mechanis
         raise HTTPException(404, detail=_NOT_FOUND)
     rows, total = await repo.list_candidates(
         session, run_id, verdict=verdict or None, mechanism=mechanism, reason=reason,
-        sort=sort, limit=limit, offset=offset)
+        sort=sort, kind=kind, limit=limit, offset=offset)
     return {"items": [service.candidate_summary(row) for row in rows], "total": total}
 
 

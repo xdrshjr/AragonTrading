@@ -166,12 +166,15 @@ async def load_tested_hashes(session: AsyncSession, run_id: int) -> set[str]:
 
 
 async def list_kept_candidates(session: AsyncSession, run_id: int, *,
-                               include_demoted: bool = False) -> list[DiscoveryCandidate]:
+                               include_demoted: bool = False,
+                               kind: str = "") -> list[DiscoveryCandidate]:
     """本 run 的已入库候选（默认排除已降级者——它们已退出父本池与去重基准）。"""
     stmt = select(DiscoveryCandidate).where(
         DiscoveryCandidate.run_id == run_id, DiscoveryCandidate.verdict == "kept")
     if not include_demoted:
         stmt = stmt.where(DiscoveryCandidate.demoted == False)  # noqa: E712
+    if kind:
+        stmt = stmt.where(DiscoveryCandidate.kind == kind)
     return list((await session.execute(stmt.order_by(DiscoveryCandidate.id))).scalars().all())
 
 
@@ -181,14 +184,15 @@ async def get_candidate(session: AsyncSession, candidate_id: int) -> DiscoveryCa
 
 async def list_candidates(session: AsyncSession, run_id: int, *, verdict: str | None = "kept",
                           mechanism: str = "", reason: str = "", sort: str = "",
-                          limit: int = 50, offset: int = 0
+                          kind: str = "", limit: int = 50, offset: int = 0
                           ) -> tuple[list[DiscoveryCandidate], int]:
-    """候选分页（默认只回 ``kept``；``verdict=""`` 即不过滤）。"""
+    """候选分页（默认只回 ``kept``；``verdict=""`` 即不过滤；``kind=""`` 即全部轴）。"""
     stmt = select(DiscoveryCandidate).where(DiscoveryCandidate.run_id == run_id)
     count_stmt = select(func.count()).select_from(DiscoveryCandidate).where(
         DiscoveryCandidate.run_id == run_id)
     for column, value in ((DiscoveryCandidate.verdict, verdict),
                           (DiscoveryCandidate.mechanism, mechanism),
+                          (DiscoveryCandidate.kind, kind),
                           (DiscoveryCandidate.reject_reason, reason)):
         if value:
             stmt = stmt.where(column == value)

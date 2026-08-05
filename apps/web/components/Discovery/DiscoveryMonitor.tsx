@@ -8,6 +8,7 @@ import {
   keptRateSeries,
   pauseReasonCn,
 } from "@/lib/discovery";
+import { AXIS_SHORT_CN } from "@/lib/discoveryStrategy";
 import { useAppStore } from "@/lib/store";
 import DiscoveryFunnel from "./DiscoveryFunnel";
 import DiscoverySourceBars from "./DiscoverySourceBars";
@@ -59,6 +60,7 @@ export default function DiscoveryMonitor() {
   }
 
   const latest = run?.iterations.length ? run.iterations[run.iterations.length - 1] : null;
+  const axes = run?.axes ?? [];
   const rate = keptRate(run?.counters.tested ?? 0, run?.counters.kept ?? 0);
   const countdown = countdownSeconds(run?.nextIterationTs ?? null);
   const llm = run?.llmUsage;
@@ -104,6 +106,26 @@ export default function DiscoveryMonitor() {
           </Card>
         ))}
       </div>
+
+      {axes.length > 1 && (
+        <Card className="p-3">
+          <h4 className="mb-2 text-xs font-medium text-[var(--text)]">各轴候选池</h4>
+          <ul className="flex flex-wrap gap-2 text-[11px]">
+            {axes.map((axis) => (
+              <li
+                key={axis}
+                className="rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-[var(--muted)]"
+              >
+                {AXIS_SHORT_CN[axis] ?? axis}
+                <span className="ml-1 tabular text-[var(--text)]">
+                  {run?.poolSizes?.[axis] ?? 0}
+                </span>
+                <span className="ml-1">已测 {run?.axisSnapshots?.[axis]?.tested ?? 0}</span>
+              </li>
+            ))}
+          </ul>
+        </Card>
+      )}
 
       <div className="grid grid-cols-2 gap-3">
         <Card className="p-3">

@@ -11,6 +11,7 @@ import {
   runtimeSeconds,
 } from "@/lib/discovery";
 import { discoveryApi } from "@/lib/discoveryApi";
+import { shouldShowCoverage } from "@/lib/discoveryStrategy";
 import type { DiscoveryVocabulary } from "@/lib/discoveryTypes";
 import { useAppStore } from "@/lib/store";
 import { useDiscovery } from "./DiscoveryLab";
@@ -126,10 +127,22 @@ export default function DiscoveryOverview() {
       </Card>
 
       <div className="grid grid-cols-2 gap-3">
-        <Card className="p-3">
-          <h4 className="mb-2 text-xs font-medium text-[var(--text)]">机制族覆盖</h4>
-          <CoverageGrid coverage={run?.mechanismCoverage ?? {}} vocabulary={vocabulary} />
-        </Card>
+        {shouldShowCoverage(run?.axes) ? (
+          <Card className="p-3">
+            <h4 className="mb-2 text-xs font-medium text-[var(--text)]">机制族覆盖</h4>
+            <CoverageGrid coverage={run?.mechanismCoverage ?? {}} vocabulary={vocabulary} />
+          </Card>
+        ) : (
+          <Card className="p-3">
+            <h4 className="mb-2 text-xs font-medium text-[var(--text)]">机制族覆盖</h4>
+            {/* P2-11：两条组合轴的 mechanism 恒为单值，画出来就是一根 100% 的柱子——
+                那是在假装有信息量。整块隐藏并说明理由，比画一张漂亮的假图诚实。 */}
+            <p className="text-[11px] leading-relaxed text-[var(--muted)]">
+              本任务只启用了组合类搜索轴，其机制标签恒为单一取值（因子组合 / 策略轮动），
+              覆盖度图对它们没有信息量，故不展示。
+            </p>
+          </Card>
+        )}
 
         <Card className="p-3">
           <h4 className="mb-2 text-xs font-medium text-[var(--text)]">近期入库</h4>

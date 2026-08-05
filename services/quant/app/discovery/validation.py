@@ -64,6 +64,18 @@ FILTER_LABELS: dict[str, str] = {
     "F9": "换手代理过高（疑似高频噪声）",
     "F10": "与已入库因子高度相关",
     "F11": "多重检验惩罚后门槛未达",
+    # 策略轴 S1–S9 + 装配失败（discovery-strategy-axes §2.6.2）。前端 ``REJECT_REASON_CN``
+    # 是**另一张**表，必须同步增补——只改这里，用户会在监控页看到裸英文码（评审 P1-5）。
+    "S1": "样本量不足",
+    "S2": "样本内亏损",
+    "S3": "夏普未达（含多重检验惩罚）",
+    "S4": "回撤超限",
+    "S5": "Calmar 不足",
+    "S6": "样本外崩塌",
+    "S7": "交易过密或盈亏比不足",
+    "S8": "与已入库策略高度相关",
+    "S9": "成本压力下不再盈利",
+    "S0": "装配失败",
 }
 
 
@@ -110,6 +122,9 @@ class ValidationOutcome:
     values: np.ndarray | None = None
     ic_series: list[float] = field(default_factory=list)
     score: float = 0.0
+    # 策略轴的去重基准（IS 段逐根收益率）。与因子轴的 ``values`` 同性质、同生命周期，
+    # 但量纲完全不同，故单列一个字段而非复用——两条轴共用一个字段名迟早被读错。
+    bar_returns: list = field(default_factory=list)
 
 
 # ============================ F9：换手代理（本层自算） ============================
@@ -137,16 +152,25 @@ def turnover_proxy(values: np.ndarray, *, quantiles: int = QUANTILES) -> float |
 
 
 # ============================ F11：多重检验惩罚 ============================
-def required_ir(trials: int, thresholds: dict) -> float:
-    """门槛随累计试验数抬高：``minAbsIr × (1 + k·log10(max(trials,10)/10))``（§2.7 F11 / R-1）。
+def penalized_gate(base: float, trials: int, k: float) -> float:
+    """多重检验惩罚的**唯一**实现（BL-4）：``base × (1 + k·log10(max(trials,10)/10))``。
 
-    跑几万个候选时纯噪声也能凑出 IR>0.5，这条惩罚是最直接的解药。``trials`` 恒 ≥10 以避免
-    log 定义域问题；k=0 即退化为无惩罚（可配置，但默认 0.15）。
+    因子轴的 ``required_ir`` 与策略轴的 ``required_sharpe`` 都必须调它。两份公式迟早会漂移，
+    而漂移了没人看得出来（上游「估计量同源律」）。``trials`` 恒 ≥10 以避免 log 定义域问题；
+    ``k=0`` 即退化为无惩罚。
     """
-    base = float(thresholds.get("minAbsIr", DEFAULT_THRESHOLDS["minAbsIr"]))
-    k = float(thresholds.get("trialPenaltyK", DEFAULT_THRESHOLDS["trialPenaltyK"]))
-    effective = max(int(trials), 10)
-    return base * (1.0 + k * math.log10(effective / 10.0))
+    return float(base) * (1.0 + float(k) * math.log10(max(int(trials), 10) / 10.0))
+
+
+def required_ir(trials: int, thresholds: dict) -> float:
+    """门槛随累计试验数抬高（§2.7 F11 / R-1）；返回值与抽取前**逐位相同**。
+
+    跑几万个候选时纯噪声也能凑出 IR>0.5，这条惩罚是最直接的解药。默认值一律引
+    ``DEFAULT_THRESHOLDS``——硬写字面量会在默认值调整时与真源静默漂移（评审 P2-1）。
+    """
+    return penalized_gate(
+        float(thresholds.get("minAbsIr", DEFAULT_THRESHOLDS["minAbsIr"])), trials,
+        float(thresholds.get("trialPenaltyK", DEFAULT_THRESHOLDS["trialPenaltyK"])))
 
 
 # ============================ F8：往返成本（量纲承重） ============================

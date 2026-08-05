@@ -50,6 +50,8 @@ export interface CandidateQuery {
   mechanism?: string;
   reason?: string;
   sort?: string;
+  /** 按搜索轴过滤（空 = 全部轴）。 */
+  kind?: string;
   limit?: number;
   offset?: number;
 }
@@ -99,10 +101,16 @@ export const discoveryApi = {
     request<DiscoveryCandidateDetail>(`/discovery/candidates/${candidateId}`),
 
   promote: (candidateId: number) =>
-    request<{ promoted: { kind: string; entityId: number; entityKind: string; reused: boolean } }>(
-      `/discovery/candidates/${candidateId}/promote`,
-      { method: "POST" },
-    ),
+    request<{
+      promoted: {
+        kind: string;
+        entityId: number;
+        entityKind: string;
+        reused: boolean;
+        /** 仅 `factor_set` 有；**幂等回放的响应里也必须有**（否则「去策略面板」跳转会断）。 */
+        companionStrategyId?: number;
+      };
+    }>(`/discovery/candidates/${candidateId}/promote`, { method: "POST" }),
 
   backtest: (candidateId: number, startTs: number, endTs: number) =>
     request<{

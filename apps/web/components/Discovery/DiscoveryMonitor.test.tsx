@@ -144,4 +144,49 @@ describe("DiscoveryMonitor", () => {
     render(<DiscoveryMonitor />);
     expect(screen.getByText(/超过 15%/)).toBeTruthy();
   });
+
+  // ---- 三条策略轴的增量 ----
+  it("多轴时逐轴显示候选池规模与已测数（BL-14：计数一律逐轴）", () => {
+    setRun({
+      iterations: [],
+      axes: ["factor", "strategy_param"],
+      poolSizes: { factor: 12, strategy_param: 3 },
+      axisSnapshots: { factor: { tested: 800 }, strategy_param: { tested: 40 } },
+    });
+    render(<DiscoveryMonitor />);
+    expect(screen.getByText("各轴候选池")).toBeTruthy();
+    expect(screen.getByText("12")).toBeTruthy();
+    expect(screen.getByText("已测 40")).toBeTruthy();
+  });
+
+  it("单轴时不渲染多余的逐轴卡片（默认路径观感零变化，R-15）", () => {
+    setRun({ iterations: [], axes: ["factor"], poolSizes: { factor: 12 } });
+    render(<DiscoveryMonitor />);
+    expect(screen.queryByText("各轴候选池")).toBeNull();
+  });
+
+  it("把逐轴计数与让渡记录传给漏斗组件（BL-9 的落点在 DiscoveryFunnel）", () => {
+    setRun({
+      axes: ["factor", "strategy_combo"],
+      iterations: [
+        iteration({
+          perAxis: {
+            factor: { generated: 30, ruleRejected: 0, llmRejected: 0, validated: 30,
+                      kept: 2, truncated: 0, truncatedByBacktestCap: 0,
+                      rejectedByReason: {} },
+            strategy_combo: { generated: 0, ruleRejected: 0, llmRejected: 0, validated: 0,
+                              kept: 0, truncated: 0, truncatedByBacktestCap: 0,
+                              rejectedByReason: {} },
+          },
+          yieldedByPool: {
+            strategy_combo: { count: 10, reason: "upstream_pool_too_small",
+                              toAxis: "factor" },
+          },
+        }),
+      ],
+    });
+    render(<DiscoveryMonitor />);
+    expect(screen.getByText("本轮让渡")).toBeTruthy();
+    expect(screen.getByText(/策略轮动组合 10/)).toBeTruthy();
+  });
 });

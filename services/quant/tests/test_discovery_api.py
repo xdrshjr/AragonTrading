@@ -197,8 +197,42 @@ async def test_master_switch_returns_403(monkeypatch):
         await dispose_engine()
 
 
-async def test_unimplemented_axis_returns_400(monkeypatch):
-    """D-6 强制推论：未实现的轴在 API 上一律 400，绝不「能选但不产候选」。"""
+async def test_unknown_axis_returns_400_and_implemented_axes_start(monkeypatch):
+    """D-7：四条轴均可启动；**未知**轴仍一律 400（语义由「未实现」收窄为「不认识」）。"""
+    await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch_launch(monkeypatch)
+    try:
+        async with _client(app) as client:
+            bad = await client.post("/api/discovery/runs", json=_body(axes=["nonsense"]))
+            ok = await client.post("/api/discovery/runs", json=_body(
+                axes=["factor", "factor_combo", "strategy_param", "strategy_combo"]))
+        assert bad.status_code == 400
+        assert bad.json()["error"]["code"] == "DISCOVERY_AXIS_UNSUPPORTED"
+        assert ok.status_code == 201, ok.text
+        assert ok.json()["config"]["axes"] == [
+            "factor", "factor_combo", "strategy_param", "strategy_combo"]
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+def test_workload_is_bit_identical_for_a_factor_only_run():
+    """评审 P2-7：``AXIS_COST["factor"] == 1`` ⇒ factor 单轴的 413 行为**逐位不变**。"""
+    from app.discovery.service import AXIS_COST, workload_of
+
+    config = {"axes": ["factor"], "axisWeights": {"factor": 1.0},
+              "candidatesPerIteration": 40, "windowBars": 4000}
+    assert AXIS_COST["factor"] == 1
+    assert workload_of(config) == 40 * 4000
+    heavy = {**config, "axes": ["factor", "strategy_combo"],
+             "axisWeights": {"factor": 1.0, "strategy_combo": 1.0}}
+    assert workload_of(heavy) > workload_of(config)
+
+
+async def test_rotation_axis_requires_the_param_axis(monkeypatch):
+    """评审 P1-7：只勾轮动轴一律 400（无条件），绝不放行一条注定空转的轴（BL-9）。"""
     await _fresh()
     app = _load_app()
     _override(app)
@@ -206,9 +240,26 @@ async def test_unimplemented_axis_returns_400(monkeypatch):
     try:
         async with _client(app) as client:
             res = await client.post("/api/discovery/runs",
-                                    json=_body(axes=["strategy_param"]))
+                                    json=_body(axes=["strategy_combo"]))
         assert res.status_code == 400
-        assert res.json()["error"]["code"] == "DISCOVERY_AXIS_UNSUPPORTED"
+        assert res.json()["error"]["code"] == "DISCOVERY_AXIS_DEPENDENCY"
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_combo_size_out_of_range_returns_400(monkeypatch):
+    """评审 P2-3：``comboSize`` 边界统一取 2–5，越界一律 400（**不静默夹取**）。"""
+    await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch_launch(monkeypatch)
+    try:
+        async with _client(app) as client:
+            res = await client.post("/api/discovery/runs", json=_body(
+                axes=["factor_combo"], comboSize={"min": 1, "max": 5}))
+        assert res.status_code == 400
+        assert res.json()["error"]["code"] == "DISCOVERY_COMBO_SIZE"
     finally:
         app.dependency_overrides.clear()
         await dispose_engine()
@@ -443,15 +494,28 @@ async def test_candidate_endpoints(monkeypatch):
 
 
 # ============================ 配置与词表 ============================
-async def test_defaults_expose_only_implemented_axes():
+async def test_defaults_expose_all_four_axes_with_axis_info_and_templates():
+    """D-7：四轴全部实现；``axisInfo`` / ``templates`` 两个新字段的形状必须正确。
+
+    不可挖模板**必须带原因**——启动器直接展示它，缺了就退化成「灰着但不说为什么」。
+    """
     await _fresh()
     app = _load_app()
     _override(app)
     try:
         async with _client(app) as client:
             payload = (await client.get("/api/discovery/config/defaults")).json()
-        assert payload["implementedAxes"] == ["factor"]
-        assert set(payload["allAxes"]) > {"factor"}
+        assert payload["implementedAxes"] == payload["allAxes"]
+        assert len(payload["allAxes"]) == 4
+        assert set(payload["axisInfo"]) == set(payload["allAxes"])
+        assert payload["axisInfo"]["strategy_combo"]["dependsOn"] == ["strategy_param"]
+        templates = payload["templates"]
+        assert templates and all({"key", "name", "minable", "reason"} <= set(t)
+                                 for t in templates)
+        assert all(t["reason"] for t in templates if not t["minable"])
+        assert any(t["minable"] for t in templates)
+        assert payload["strategyThresholds"]["minSharpe"] == 0.8
+        assert payload["comboSize"] == {"default": {"min": 2, "max": 5}, "min": 2, "max": 5}
         assert payload["thresholds"]["minAbsIc"] == 0.03
         assert payload["evolution"]["budget"]["mutate"] == 0.25
         assert payload["workUnitLimit"] > 0

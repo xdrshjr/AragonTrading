@@ -1,9 +1,12 @@
-"""发现循环运行时（strategy-factor-discovery §2.9）—— 24/7 长跑的四步迭代。
+"""发现循环运行时（strategy-factor-discovery §2.9 / discovery-strategy-axes §2.9）。
+
+24/7 长跑的四步迭代，本轮起**按轴展开**：每条轴一个 ``Lane``（生成 + 审查 + 验证 + 池），
+runtime 只负责「调度谁、给多少名额、把结果落库和扇出」。
 
 四条纪律全部照抄仓库既有范式（``WeightTrainManager`` / ``ai_auto`` 会话），不得省略：
-1. **CPU 密集全走 ``run_in_threadpool``**（表达式求值 / 评估），绝不阻塞事件循环；且必须先拿到
+1. **CPU 密集全走 ``run_in_threadpool``**（表达式求值 / 回测），绝不阻塞事件循环；且必须先拿到
    ``discovery_validate_concurrency`` 信号量——线程池与所有 API 请求共用，无节制并发会让交互
-   请求变慢，用户只会感觉「整个 App 变卡」（R-16）。
+   请求变慢，用户只会感觉「整个 App 变卡」（R-16 / R-12）。
 2. **每个 run 必达终态**；落库失败也先置终态再重试一次，绝不让 WS 永久悬挂。
 3. **协作式取消**：四步之间与每个候选之间检查标志。
 4. **绝不合成数据**：OKX 不可达就退避、连续失败转 ``paused(data_unavailable)``，
@@ -14,64 +17,39 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import random
 import time
 from dataclasses import dataclass
 
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from ..agent.services import load_range_candles
+from ..agent.services import load_htf_frames, load_range_candles
 from ..config import Settings
 from ..db.session import get_sessionmaker
 from ..engine.backtester import candles_to_df
 from ..engine.mtf import bar_to_seconds
 from ..okx.rest_client import OKXError
 from . import repositories as repo
-from .checkpoint import Checkpoint, bans_from_checkpoint, bump_reject, dumps, iteration_seed
-from .evolution import (
-    BudgetCounters,
-    MomentumTracker,
-    adapt_budget,
-    cold_start_budget,
-    normalize_budget,
-)
-from .fsa import (
-    active_bans,
-    merge_bans,
-    prune_expired,
-    prune_skeleton_stats,
-    scan_skeletons,
-    update_skeleton_stats,
-)
-from .generation import CandidateFactory
-from .iteration_stats import (
-    IterationTally,
-    candidate_event,
-    iteration_note,
-    rate,
-    tally_to_stats,
-)
-from .llm_agents import DiscoveryLlmAgents, accepted_hashes
-from .mechanisms import uncovered_families
-from .review import ReviewContext, filter_rules, review_values
-from .searchers import FactorSearcher
+from .catalogs import SearchInputs, compose_members, library_members, minable_templates
+from .checkpoint import Checkpoint, bans_of
+from .evolution import MomentumTracker
+from .genomes import ALL_AXES, canonical_json
+from .iteration import IterationRunner
+from .lanes import LaneContext, build_lanes
+from .llm_agents import DiscoveryLlmAgents
 from .validation import (
-    KeptEntry,
     KeptRow,
     ValidationContext,
     normalize_thresholds,
     rebuild_kept_pool,
-    validate_candidate,
+    split_index,
 )
 
 logger = logging.getLogger("aragon")
 
 _TERMINAL_STATUSES = ("stopped", "succeeded", "failed")
-_PERSIST_RETRY_DELAY = 0.2      # 瞬态 SQLite 锁多在数百 ms 内自清，单次有界重试
 _DATA_RETRY_MAX_S = 900.0       # 取数失败的指数退避上限
 _DATA_FAILURE_LIMIT = 12        # 连续失败上限，超出转 paused(data_unavailable)
-_MAX_CANDIDATE_EVENTS = 20      # 每轮下发的候选事件条数上限（kept 优先）
 _PAUSE_POLL_S = 0.5
 
 
@@ -91,7 +69,7 @@ class RunSpec:
 
 
 class DiscoveryRun:
-    """单个挖掘任务的运行时：四步循环 + 调度 + 事件扇出 + 协作式取消 + 必达终态。"""
+    """单个挖掘任务的运行时：四步循环 + 多轴调度 + 事件扇出 + 协作式取消 + 必达终态。"""
 
     def __init__(self, spec: RunSpec, *, on_terminal=None):
         self.spec = spec
@@ -107,24 +85,26 @@ class DiscoveryRun:
         self._task: asyncio.Task | None = None
         self._checkpoint = Checkpoint()
         self._counters: dict = {"tested": 0, "kept": 0, "rejected": {}, "llmCalls": 0}
-        self._tested: set[str] = set()      # 已测哈希（续跑时由 DB 唯一索引一次性载入，D-3）
-        self._pool: list[KeptEntry] = []
         self._df = None
+        self._candles: list = []
+        self._htf_frames: dict = {}
         self._memo: dict = {}
         self._momentum = MomentumTracker()
-        self._bans: list = []
-        self._skeleton_stats: dict = {}
         self._rebuilding = False
         self._next_iteration_ts = 0
         self._started_mono = time.monotonic()
-        self._searcher = FactorSearcher()
+        self._lanes: dict = {}
+        self._pending: dict = {}
+        self._tested: set[str] = set()
+        self._template_catalog = None
+        self._member_catalog = None
+        self._library_members: tuple = ()
         self._llm = DiscoveryLlmAgents(
             spec.llm_client, timeout_s=spec.settings.discovery_llm_timeout_s,
             max_retries=spec.settings.discovery_llm_max_retries,
             budget=_hourly_budget(spec))
         self._validate_sem = asyncio.Semaphore(
             max(1, int(spec.settings.discovery_validate_concurrency)))
-        self._factory = CandidateFactory(self._searcher, self._llm, self._momentum)
         self._data_failures = 0
         self._data_backoff = 5.0
 
@@ -138,12 +118,7 @@ class DiscoveryRun:
         self._subscribers.discard(queue)
 
     def snapshot(self) -> list[dict]:
-        """订阅即发：**全量 state 快照 + 最近 ``ws_ring`` 条事件**（终态永远在最后）。
-
-        与 ``weight-batch`` 的「全量回放」有意偏离（§4.2）：挖掘 run 可能跑三天、事件数十万条，
-        全量回放不可行。终态事件单独持有一个槽位，绝不被环形缓冲挤掉——否则晚订阅的客户端会
-        看到一个永远「进行中」的死流。
-        """
+        """订阅即发：**全量 state 快照 + 最近 ``ws_ring`` 条事件**（终态永远在最后）。"""
         head = [{"type": "state", "data": self.state_snapshot()}]
         tail = [self._terminal_event] if self._terminal_event else []
         return head + list(self._ring) + tail
@@ -172,9 +147,12 @@ class DiscoveryRun:
             "runId": self.run_id, "status": self.status, "pauseReason": self.pause_reason,
             "iteration": int(self._checkpoint.iteration),
             "counters": dict(self._counters), "budget": dict(self._checkpoint.budget),
-            "poolSizes": dict(self._checkpoint.pool_sizes),
+            "poolSizes": {axis: lane.pool_size() for axis, lane in self._lanes.items()},
+            "axisPlan": dict(self._checkpoint.axis_shares),
+            "axes": list(self.axes()),
+            "axisSnapshots": {axis: lane.snapshot() for axis, lane in self._lanes.items()},
             "mechanismCoverage": dict(self._checkpoint.mechanism_coverage),
-            "fsaBans": [ban.to_dict() for ban in self._bans[:12]],
+            "fsaBans": [ban.to_dict() for ban in self._all_bans()[:12]],
             "nextIterationTs": int(self._next_iteration_ts) or None,
             "dataWindow": dict(self._checkpoint.data_window),
             "llmUsage": {**self._llm.usage(), "enabled": self._llm.enabled},
@@ -182,6 +160,13 @@ class DiscoveryRun:
             "keptCount": int(self._counters.get("kept", 0)),
             "testedCount": int(self._counters.get("tested", 0)),
         }
+
+    def axes(self) -> list[str]:
+        raw = self.spec.config.get("axes") or ["factor"]
+        return [axis for axis in ALL_AXES if axis in set(raw)]
+
+    def _all_bans(self) -> list:
+        return [ban for lane in self._lanes.values() for ban in lane.bans]
 
     # ============================ 生命周期 ============================
     def start(self) -> None:
@@ -268,16 +253,18 @@ class DiscoveryRun:
             await self._finalize("failed", error_code="DISCOVERY_FAILED", error=str(exc))
 
     async def _prepare(self) -> bool:
-        """开跑前置：载入检查点 / 已测集合 → 取数 → （续跑）重建 kept 池。
+        """开跑前置：载入检查点 → 取数（含高周期） → 装配 Lane → （续跑）重建各轴池。
 
-        ⚠️ 续跑**必须**先跑完 ``rebuild_kept_pool``（§2.10 承重）：否则 F10 的值级去重没有基准，
-        每次重启后都会开始收一批同质因子，而这恰是本特性的核心卖点。重建失败一律转 ``paused``，
-        **绝不**带残缺池开跑。
+        ⚠️ 续跑**必须**先跑完池重建（§2.10 / BL-5 承重）：否则 F10 / S8 的去重没有基准，
+        每次重启后都会开始收一批同质产物，而这恰是本特性的核心卖点。重建失败一律转
+        ``paused``，**绝不**带残缺池开跑。
         """
         await self._load_state()
         self._push({"type": "state", "data": self.state_snapshot()})
+        self._template_catalog = self._build_template_catalog()
         if not await self._refresh_data(initial=True):
             return False
+        await self._build_lanes()
         if self.spec.resume and self._checkpoint.iteration > 0:
             self._rebuilding = True
             self._push({"type": "state", "data": self.state_snapshot()})
@@ -300,13 +287,92 @@ class DiscoveryRun:
             self._tested = await repo.load_tested_hashes(session, self.run_id)
         self._counters.setdefault("rejected", {})
         self._momentum = MomentumTracker.from_list(self._checkpoint.momentum)
-        self._bans = bans_from_checkpoint(self._checkpoint)
-        self._skeleton_stats = dict(self._checkpoint.skeleton_stats)
         if not self._checkpoint.rng_seed:
             self._checkpoint.rng_seed = int(self.spec.config.get("seed") or int(time.time()))
 
+    def _build_template_catalog(self):
+        """只在真正需要策略模板的轴被选中时才建目录。
+
+        因子单轴的 run 不得因此多取一根高周期 K 线——「未打开过挖掘视图的用户零额外开销」
+        这条承诺同样适用于「没选策略轴的 run」（DoD #12 的同一精神）。
+        """
+        if not {"strategy_param", "strategy_combo"}.intersection(self.axes()):
+            return None
+        return minable_templates(
+            self.spec.bar, max_htf_frames=int(self.spec.settings.discovery_max_htf_frames))
+
+    async def _build_lanes(self) -> None:
+        """装配各轴 Lane 并从检查点恢复**逐轴**计数（BL-14）。"""
+        inputs = await self._build_search_inputs()
+        self._lanes = build_lanes(self.axes(), config=self.spec.config,
+                                  momentum=self._momentum, llm=self._llm,
+                                  coverage=self._checkpoint.mechanism_coverage,
+                                  catalog=inputs)
+        for axis, lane in self._lanes.items():
+            lane.tested = int(self._checkpoint.tested_by_axis.get(axis, 0) or 0)
+            lane.skeleton_stats = dict(self._checkpoint.skeleton_stats_by_axis.get(axis) or {})
+            lane.bans = bans_of(self._checkpoint.fsa_bans_by_axis.get(axis) or [])
+            lane.tested_hashes = self._tested
+
+    async def _build_search_inputs(self) -> SearchInputs:
+        """模板目录 + 因子成员目录 + 组合规模区间（数据刷新后必须重建，方向要重新冻结）。"""
+        config = self.spec.config
+        if "factor_combo" in self.axes():
+            self._library_members = library_members(
+                self.lane_context(), mined_exprs=await self._mined_exprs(),
+                include_library=bool(config.get("includeLibraryFactors", True)))
+        templates = self._template_catalog.templates if self._template_catalog else ()
+        self._checkpoint.template_signature = _template_signature(templates)
+        return SearchInputs(
+            templates=templates, members=self._compose_members(),
+            combo_size=tuple(_size_range(config.get("comboSize"), 2, 5)),
+            rotation_size=tuple(_size_range(config.get("rotationSize"), 2, 4)))
+
+    def _compose_members(self) -> tuple:
+        """把本 run 新入库的因子拼进成员目录（每轮一次，便宜；库那半边只在刷新后重算）。"""
+        if "factor_combo" not in self.axes():
+            return ()
+        catalog = compose_members(
+            self._factor_kept_exprs(), self._library_members,
+            int(self.spec.settings.discovery_member_catalog_max))
+        self._member_catalog = catalog
+        self._checkpoint.member_catalog_hash = catalog.content_hash
+        return catalog.members
+
+    async def _refresh_catalogs(self) -> None:
+        """数据刷新后重建目录并下发给各轴（成员方向必须在新窗口上重新冻结）。"""
+        inputs = await self._build_search_inputs()
+        for lane in self._lanes.values():
+            if hasattr(lane, "inputs"):
+                lane.inputs = inputs
+
+    def _factor_kept_exprs(self) -> list:
+        lane = self._lanes.get("factor")
+        return lane.parent_genomes() if lane is not None else []
+
+    async def _mined_exprs(self) -> list:
+        """既有挖掘因子（``factors`` 表 ``factor_key=="expr" and source=="mined"``）。"""
+        from sqlalchemy import select
+
+        from ..db.models import Factor
+
+        sm = get_sessionmaker()
+        out: list = []
+        async with sm() as session:
+            rows = (await session.execute(select(Factor).where(
+                Factor.factor_key == "expr", Factor.source == "mined"))).scalars().all()
+        for row in rows:
+            try:
+                params = json.loads(row.params_json or "{}")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            expr = str((params or {}).get("expr") or "")
+            if expr:
+                out.append((expr, str(row.direction or "long")))
+        return out
+
     async def _rebuild_pool(self, *, demote: bool = True) -> bool:
-        """在当前窗口上重建 kept 池的去重基准（与刷新复评**同一个实现**，§2.10）。
+        """在当前窗口上重建各轴 kept 池的去重基准（与刷新复评**同一个实现**，§2.10 / BL-5）。
 
         Args:
             demote: 是否按复评结果淘汰并落降级。``False``（``revalidateOnRefresh`` 关）时
@@ -315,24 +381,52 @@ class DiscoveryRun:
         sm = get_sessionmaker()
         async with sm() as session:
             rows = await repo.list_kept_candidates(session, self.run_id)
-        targets = [KeptRow(candidate_id=int(row.id), expr_text=row.expr_text,
-                           mechanism=row.mechanism, skeleton=row.skeleton)
-                   for row in rows if row.expr_text]
-        if not targets:
-            self._pool = []
-            return True
-        async with self._validate_sem:
-            result = await run_in_threadpool(rebuild_kept_pool, targets, self._validation_ctx())
-        if result.errors and not result.entries:
-            logger.error("discovery run %d kept 池重建全部失败：%s", self.run_id, result.errors[:3])
-            return False
-        if not demote:
-            self._pool = list(result.entries)
-            return True
-        self._pool = [e for e in result.entries
-                      if e.candidate_id not in {cid for cid, _r in result.failures}]
-        await self._apply_demotions(result.failures)
+        failures: list = []
+        for axis, lane in self._lanes.items():
+            ok, axis_failures = await self._rebuild_lane(lane, axis, rows)
+            if not ok:
+                return False
+            failures.extend(axis_failures)
+        if demote:
+            await self._apply_demotions(failures)
+            for lane in self._lanes.values():
+                dropped = {cid for cid, _r in failures}
+                lane.adopt([e for e in lane.pool if e.candidate_id not in dropped])
         return True
+
+    async def _rebuild_lane(self, lane, axis: str, rows: list) -> tuple[bool, list]:
+        ctx = self.lane_context()
+        if axis == "factor":
+            targets = [KeptRow(candidate_id=int(row.id), expr_text=row.expr_text,
+                               mechanism=row.mechanism, skeleton=row.skeleton)
+                       for row in rows if row.kind == "factor" and row.expr_text]
+            if not targets:
+                lane.adopt([])
+                return True, []
+            async with self._validate_sem:
+                result = await run_in_threadpool(rebuild_kept_pool, targets,
+                                                 self._factor_validation_ctx(ctx))
+        else:
+            if not any(row.kind == axis for row in rows):
+                lane.adopt([])
+                return True, []
+            async with self._validate_sem:
+                result = await run_in_threadpool(lane.rebuild, rows, ctx)
+        if result.errors and not result.entries:
+            logger.error("discovery run %d 轴 %s 池重建全部失败：%s",
+                         self.run_id, axis, result.errors[:3])
+            return False, []
+        lane.adopt(result.entries)
+        return True, list(result.failures)
+
+    def _factor_validation_ctx(self, ctx: LaneContext) -> ValidationContext:
+        return ValidationContext(
+            df_full=ctx.df_full, horizon=int(self.spec.config.get("horizon", 6)),
+            is_ratio=float(self.spec.config.get("isRatio", 0.7)),
+            fee_bps=float(self.spec.settings.default_taker_fee_bps),
+            slip_bps=float(self.spec.settings.default_slippage_bps),
+            thresholds=normalize_thresholds(self.spec.config.get("thresholds")),
+            memo=ctx.memo)
 
     async def _apply_demotions(self, failures: list) -> None:
         if not failures:
@@ -368,17 +462,31 @@ class DiscoveryRun:
                 self.spec.rest, inst_id=self.spec.inst_id, bar=self.spec.bar,
                 start_ts=start_ts, end_ts=end_ts,
                 max_bars=int(self.spec.settings.discovery_max_window_bars))
+            frames = await self._load_frames(start_ts, end_ts)
         except (OKXError, HTTPException, asyncio.TimeoutError, OSError) as exc:
             return await self._handle_data_failure(exc, initial=initial)
+        self._candles = list(candles)
         self._df = candles_to_df(candles)
+        self._htf_frames = frames
         self._memo = {}
-        self._factory = CandidateFactory(self._searcher, self._llm, self._momentum)
+        for lane in self._lanes.values():
+            lane.on_data_refresh()
         self._data_failures = 0
         self._data_backoff = 5.0
         self._checkpoint.data_window = {"startTs": int(self._df["ts"].iloc[0]),
                                         "endTs": int(self._df["ts"].iloc[-1]),
                                         "lastRefreshTs": int(time.time())}
         return True
+
+    async def _load_frames(self, start_ts: int, end_ts: int) -> dict:
+        """按模板目录的高周期并集一次性取帧（BL-6 的资源侧护栏在目录层已封顶）。"""
+        catalog = self._template_catalog
+        if catalog is None or not catalog.htf_bars:
+            return {}
+        return await load_htf_frames(
+            self.spec.rest, inst_id=self.spec.inst_id, start_ts=start_ts, end_ts=end_ts,
+            base_seconds=bar_to_seconds(self.spec.bar), timeframes=list(catalog.htf_bars),
+            htf_warmup_bars=int(catalog.htf_warmup_bars))
 
     async def _handle_data_failure(self, exc: Exception, *, initial: bool) -> bool:
         """指数退避重试；连续失败超限 ⇒ ``paused(data_unavailable)`` 而非 ``failed``。"""
@@ -396,7 +504,7 @@ class DiscoveryRun:
         return False
 
     async def _ensure_fresh_data(self) -> bool:
-        """到点即刷新窗口并对 kept 池做一次轻量复评（跨窗口指标可比性，§2.9 / R-13）。"""
+        """到点即刷新窗口并对各轴池做一次轻量复评（跨窗口指标可比性，§2.9 / R-13）。"""
         interval = float(self.spec.config.get("dataRefreshS", 21600) or 0)
         if interval <= 0 or self._df is None:
             return self._df is not None
@@ -405,9 +513,10 @@ class DiscoveryRun:
             return True
         if not await self._refresh_data():
             return False
-        # 重建**无条件**执行：窗口右移后 kept 池里的值序列与新窗口不再等长，F10 的值通道会逐候选
-        # 抛 ValueError 并被 `_validate_one` 吞成 `eval_error`——表现为「刷新之后突然一条都收不到」，
-        # 而不是报错。`revalidateOnRefresh` 只决定要不要按复评结果淘汰，不决定要不要重建基准（§2.10）。
+        await self._refresh_catalogs()      # 方向要在新窗口上重新冻结（§2.4.2）
+        # 重建**无条件**执行：窗口右移后池里的基准与新窗口不再等长，去重通道会逐候选抛错并被
+        # 吞成 `eval_error`——表现为「刷新之后突然一条都收不到」，而不是报错。
+        # `revalidateOnRefresh` 只决定要不要按复评结果淘汰，不决定要不要重建基准（§2.10）。
         if not await self._rebuild_pool(
                 demote=bool(self.spec.config.get("revalidateOnRefresh", True))):
             await self._pause_with("rebuild_failed")
@@ -415,290 +524,30 @@ class DiscoveryRun:
         return True
 
     # ============================ 单轮迭代 ============================
-    def _validation_ctx(self) -> ValidationContext:
-        return ValidationContext(
-            df_full=self._df, horizon=int(self.spec.config.get("horizon", 6)),
-            is_ratio=float(self.spec.config.get("isRatio", 0.7)),
-            fee_bps=float(self.spec.settings.default_taker_fee_bps),
-            slip_bps=float(self.spec.settings.default_slippage_bps),
-            thresholds=normalize_thresholds(self.spec.config.get("thresholds")),
-            memo=self._memo)
-
-    def _review_ctx(self) -> ReviewContext:
-        evolution = self.spec.config.get("evolution") or {}
-        iteration = int(self._checkpoint.iteration)
-        kept_counts: dict[str, int] = {}
-        for entry in self._pool:
-            kept_counts[entry.skeleton] = kept_counts.get(entry.skeleton, 0) + 1
-        return ReviewContext(
-            tested_hashes=self._tested,
-            banned_skeletons=active_bans(
-                self._bans, iteration=iteration,
-                ttl_iters=int(evolution.get("fsaBanTtlIters", 150))),
-            kept_skeleton_counts=kept_counts,
-            skeleton_stats=self._skeleton_stats,
-            variant_cap=int(evolution.get("variantCap", 6)),
-            min_coverage=float(normalize_thresholds(
-                self.spec.config.get("thresholds"))["minCoverage"]))
+    def lane_context(self) -> LaneContext:
+        split = split_index(len(self._df), float(self.spec.config.get("isRatio", 0.7)))
+        return LaneContext(
+            df_full=self._df, candles=self._candles, htf_frames=self._htf_frames,
+            bar=self.spec.bar, split=split, split_ts=int(self._df["ts"].iloc[split]),
+            config=self.spec.config, settings=self.spec.settings, memo=self._memo)
 
     async def _run_iteration(self) -> None:
-        started = int(time.time())
-        started_mono = time.monotonic()
-        index = int(self._checkpoint.iteration) + 1
-        rng = random.Random(iteration_seed(self._checkpoint.rng_seed, index))
-        budget = self._plan_budget(index)
-        tally = IterationTally()
-        candidates, llm_outcome = await self._generate(rng, budget, tally)
-        passed, rejected = filter_rules(candidates, self._review_ctx())
-        tally.rule_rejected = len(rejected)
-        passed, llm_rejected = await self._llm_review(passed, llm_outcome)
-        tally.llm_rejected = len(llm_rejected)
-        rows = self._rows_for(rejected + llm_rejected, started)
-        rows += await self._validate_batch(passed, tally, started, started_mono)
-        elapsed_ms = int((time.monotonic() - started_mono) * 1000)
-        tally.overrun = elapsed_ms / 1000.0 > float(
-            self.spec.config.get("iterationIntervalS", 300))
-        await self._commit(index, rows, tally, budget, llm_outcome, started, elapsed_ms)
+        """一轮的编排下沉到 ``iteration.IterationRunner``（本文件已逼近 800 行清洁度上限）。"""
+        await IterationRunner(self).run_once()
 
-    def _plan_budget(self, index: int) -> dict:
-        """冷启动 → 固定预算；此后每 ``adaptEvery`` 轮跑一次纯函数 ``adapt_budget``。"""
-        evolution = self.spec.config.get("evolution") or {}
-        if len(self._pool) < int(evolution.get("coldStartMin", 5)):
-            return cold_start_budget()
-        current = normalize_budget(self._checkpoint.budget)
-        every = max(1, int(evolution.get("adaptEvery", 10)))
-        if index % every != 0:
-            return current
-        return adapt_budget(current, self._budget_counters(index))
+    def sync_axis_inputs(self) -> None:
+        """每轮把上游产出同步进下游轴的取材池（就绪判据与让渡据此变化，BL-9）。
 
-    def _budget_counters(self, index: int) -> BudgetCounters:
-        rejected = self._counters.get("rejected") or {}
-        total_rejected = sum(int(v or 0) for v in rejected.values()) or 1
-        tested = max(1, int(self._counters.get("tested", 0)))
-        coverage = self._checkpoint.mechanism_coverage
-        return BudgetCounters(
-            near_kept_rate=float(self._counters.get("nearKeptRate", 0.0) or 0.0),
-            global_kept_rate=int(self._counters.get("kept", 0)) / tested,
-            dedupe_reject_rate=int(rejected.get("F10", 0)) / total_rejected,
-            uncovered_families=len(uncovered_families(coverage)),
-            covered_families=sum(1 for v in coverage.values() if int(v or 0) > 0),
-            iteration=index,
-            kept_rate_trend=tuple(self._checkpoint.kept_rate_trend))
-
-    # ---------- ① 生成（编排下沉到 generation.CandidateFactory） ----------
-    async def _generate(self, rng, budget: dict, tally: IterationTally):
-        return await self._factory.produce(
-            rng, budget=budget,
-            count=int(self.spec.config.get("candidatesPerIteration", 40)),
-            pool=self._pool, coverage=self._checkpoint.mechanism_coverage,
-            bans=self._bans, skeleton_stats=self._skeleton_stats, tally=tally)
-
-    # ---------- ② LLM 精判 ----------
-    async def _llm_review(self, passed: list, generate_outcome) -> tuple[list, list]:
-        """抽样交审查子代理；**fail-open**：降级即视为全部 accept（裁决只减不增）。"""
-        sample_size = int((self.spec.config.get("llm") or {}).get("reviewSample", 5))
-        if not passed or sample_size <= 0 or not self._llm.enabled:
-            return passed, []
-        sample = passed[:sample_size]
-        outcome = await self._llm.review({
-            "candidates": [{"hash": c.genome_hash, "expr": c.expr_text,
-                            "describe": c.describe, "mechanism": c.mechanism}
-                           for c in sample],
-            "mechanismCoverage": self._checkpoint.mechanism_coverage})
-        generate_outcome.calls += outcome.calls
-        if outcome.degraded and not generate_outcome.degraded:
-            generate_outcome.degraded = True
-            generate_outcome.degraded_reason = outcome.degraded_reason
-        vetoed, reasons = accepted_hashes(outcome, [c.genome_hash for c in sample])
-        if not vetoed:
-            return passed, []
-        kept = [c for c in passed if c.genome_hash not in vetoed]
-        rejected = [(c, f"llm_review:{reasons.get(c.genome_hash, '')}"[:64])
-                    for c in passed if c.genome_hash in vetoed]
-        return kept, rejected
-
-    # ---------- ③ 验证 ----------
-    async def _validate_batch(self, candidates: list, tally: IterationTally,
-                              started_ts: int, started_mono: float) -> list:
-        """逐候选验证（线程池 + 信号量 + 单候选超时 + 单轮墙钟预算）。
-
-        一旦 ``kept``，**立刻**把它加进内存 kept 池——使同轮后续候选就能与它做相关性去重，
-        避免同轮双胞胎双双入库。
+        ``strategy_combo`` 的成员**只**来自本 run ``strategy_param`` 轴的 kept 池（D-18）；
+        ``factor_combo`` 的成员目录每轮把因子轴新入库的表达式拼进来。
         """
-        budget_s = float(self.spec.settings.discovery_iteration_timeout_s)
-        timeout_s = float(self.spec.settings.discovery_candidate_timeout_s)
-        rows: list = []
-        for candidate in candidates:
-            if self._cancel:
-                break
-            if time.monotonic() - started_mono > budget_s:
-                tally.truncated_by_timeout = len(candidates) - len(rows)
-                break
-            outcome = await self._validate_one(candidate, timeout_s)
-            tally.validated += 1
-            self._counters["tested"] = int(self._counters.get("tested", 0)) + 1
-            self._tested.add(candidate.genome_hash)
-            update_skeleton_stats(self._skeleton_stats, candidate.skeleton,
-                                  kept=outcome.verdict == "kept")
-            rows.append(self._candidate_row(candidate, outcome, started_ts))
-            self._absorb(candidate, outcome, tally)
-        return rows
-
-    async def _validate_one(self, candidate, timeout_s: float):
-        """单候选验证：先跑末位的 ``constant_or_empty``（共用记忆化求值），再跑 11 条闸。"""
-        from .validation import ValidationOutcome
-
-        trials = int(self._counters.get("tested", 0)) + 1
-        try:
-            async with self._validate_sem:
-                return await asyncio.wait_for(
-                    run_in_threadpool(self._validate_sync, candidate, trials),
-                    timeout=timeout_s)
-        except asyncio.TimeoutError:
-            return ValidationOutcome(verdict="rejected", reject_reason="validate_timeout",
-                                     direction="long", metrics={}, series={})
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 —— 单候选异常绝不拖垮整轮（沿用 mine_factors 纪律）
-            return ValidationOutcome(verdict="rejected",
-                                     reject_reason=f"eval_error:{type(exc).__name__}"[:64],
-                                     direction="long", metrics={}, series={})
-
-    def _validate_sync(self, candidate, trials: int):
-        from .expression import evaluate
-        from .validation import ValidationOutcome
-
-        ctx = self._validation_ctx()
-        values = evaluate(candidate.genome.node, _fields_of(ctx), ctx.memo)
-        reason = review_values(values, self._review_ctx())
-        if reason:
-            return ValidationOutcome(verdict="rejected", reject_reason=reason,
-                                     direction="long", metrics={}, series={})
-        return validate_candidate(candidate.genome.node, ctx, pool=self._pool, trials=trials)
-
-    def _absorb(self, candidate, outcome, tally: IterationTally) -> None:
-        """把单候选结果并入 run 级状态（kept 立刻进池，供同轮后续候选去重）。"""
-        if outcome.verdict == "kept" and outcome.values is not None:
-            tally.kept += 1
-            self._counters["kept"] = int(self._counters.get("kept", 0)) + 1
-            coverage = self._checkpoint.mechanism_coverage
-            coverage[candidate.mechanism] = int(coverage.get(candidate.mechanism, 0)) + 1
-            self._pool.append(KeptEntry(
-                candidate_id=0, expr_text=candidate.expr_text, direction=outcome.direction,
-                values=outcome.values, ic_series=outcome.ic_series, score=outcome.score,
-                mechanism=candidate.mechanism, skeleton=candidate.skeleton))
-            self._trim_pool()
+        inputs = next((lane.inputs for lane in self._lanes.values()
+                       if hasattr(lane, "inputs")), None)
+        if inputs is None:
             return
-        reason = outcome.reject_reason or "unknown"
-        tally.count_reject(reason)
-        bump_reject(self._counters, reason)
-
-    def _trim_pool(self) -> None:
-        """有界精英池：到顶后只保留分数最高的 ``maxKept`` 条（§2.9 资源封顶）。"""
-        cap = max(1, int(self.spec.config.get("maxKept", 200)))
-        if len(self._pool) <= cap:
-            return
-        self._pool.sort(key=lambda entry: -float(entry.score or 0.0))
-        del self._pool[cap:]
-
-    # ---------- ④ 提交 ----------
-    def _rows_for(self, rejected: list, started_ts: int) -> list:
-        rows = []
-        for candidate, reason in rejected:
-            self._tested.add(candidate.genome_hash)
-            bump_reject(self._counters, reason.split(":")[0])
-            rows.append(repo.CandidateRow(
-                kind=candidate.kind, genome_hash=candidate.genome_hash,
-                genome={"expr": candidate.expr_text}, expr_text=candidate.expr_text,
-                describe_text=candidate.describe, skeleton=candidate.skeleton,
-                mechanism=candidate.mechanism, source=candidate.source,
-                verdict="rejected", reject_reason=reason, created_ts=started_ts))
-        return rows
-
-    def _candidate_row(self, candidate, outcome, started_ts: int) -> repo.CandidateRow:
-        return repo.CandidateRow(
-            kind=candidate.kind, genome_hash=candidate.genome_hash,
-            genome={"expr": candidate.expr_text}, expr_text=candidate.expr_text,
-            describe_text=candidate.describe, skeleton=candidate.skeleton,
-            mechanism=candidate.mechanism, source=candidate.source,
-            verdict=outcome.verdict, reject_reason=outcome.reject_reason,
-            metrics=outcome.metrics, series=outcome.series,
-            trials_at_accept=int(outcome.metrics.get("trials", 0) or 0),
-            created_ts=started_ts)
-
-    async def _commit(self, index: int, rows: list, tally: IterationTally, budget: dict,
-                      llm_outcome, started_ts: int, elapsed_ms: int) -> None:
-        """单事务写候选 + 迭代 + 检查点，再扇出事件（落库失败绝不吞，转 failed 终态）。"""
-        self._run_fsa(index, tally)
-        self._checkpoint.iteration = index
-        self._checkpoint.budget = normalize_budget(budget)
-        self._checkpoint.momentum = self._momentum.to_list()
-        self._checkpoint.fsa_bans = [ban.to_dict() for ban in self._bans]
-        self._checkpoint.skeleton_stats = prune_skeleton_stats(self._skeleton_stats)
-        self._checkpoint.pool_sizes = {**self._checkpoint.pool_sizes,
-                                       "factor": len(self._pool)}
-        self._checkpoint.kept_rate_trend = (
-            list(self._checkpoint.kept_rate_trend) + [rate(tally.kept, tally.validated)])[-3:]
-        self._counters["llmCalls"] = int(self._counters.get("llmCalls", 0)) + llm_outcome.calls
-        stats = tally_to_stats(tally)
-        iteration_row = repo.IterationRow(
-            idx=index, started_ts=started_ts, finished_ts=int(time.time()), budget=budget,
-            stats={**stats, "durationMs": elapsed_ms},
-            llm={"calls": llm_outcome.calls, "latencyMs": llm_outcome.latency_ms,
-                 "degraded": llm_outcome.degraded,
-                 "degradedReason": llm_outcome.degraded_reason,
-                 "promptChars": llm_outcome.prompt_chars},
-            note=iteration_note(tally))
-        pruned = await self._persist_iteration(iteration_row, rows)
-        self._counters["prunedCandidates"] = int(
-            self._counters.get("prunedCandidates", 0)) + int(pruned.get("prunedCandidates", 0))
-        self._counters["prunedIterations"] = int(
-            self._counters.get("prunedIterations", 0)) + int(pruned.get("prunedIterations", 0))
-        self._emit_iteration(iteration_row, rows)
-
-    def _run_fsa(self, index: int, tally: IterationTally) -> None:
-        evolution = self.spec.config.get("evolution") or {}
-        every = max(1, int(evolution.get("fsaEvery", 25)))
-        ttl = int(evolution.get("fsaBanTtlIters", 150))
-        if index % every != 0:
-            return
-        fresh = scan_skeletons([entry.skeleton for entry in self._pool], iteration=index,
-                               threshold=float(evolution.get("fsaThreshold", 0.15)))
-        if fresh:
-            self._bans = merge_bans(self._bans, fresh)
-            tally.skipped = tally.skipped or f"fsa_frozen:{len(fresh)}"
-        self._bans = prune_expired(self._bans, iteration=index, ttl_iters=ttl)
-
-    async def _persist_iteration(self, iteration_row, rows: list) -> dict:
-        """落库（有界重试一次）；两次都失败即抛，由 ``_run`` 收口为 ``failed`` 终态。"""
-        for attempt in range(2):
-            try:
-                sm = get_sessionmaker()
-                async with sm() as session:
-                    return await repo.commit_iteration(
-                        session, self.run_id, candidates=rows, iteration=iteration_row,
-                        checkpoint_json=dumps(self._checkpoint), counters=self._counters,
-                        candidate_row_cap=int(self.spec.settings.discovery_max_candidate_rows),
-                        iteration_row_cap=int(self.spec.settings.discovery_max_iteration_rows))
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("discovery run %d 第 %d 轮落库失败（尝试 %d）：%s",
-                               self.run_id, iteration_row.idx, attempt + 1, exc)
-                if attempt == 0:
-                    await asyncio.sleep(_PERSIST_RETRY_DELAY)
-                else:
-                    raise
-        return {}
-
-    def _emit_iteration(self, iteration_row, rows: list) -> None:
-        self._push({"type": "iteration", "data": {
-            "index": iteration_row.idx, "startedTs": iteration_row.started_ts,
-            "finishedTs": iteration_row.finished_ts, "budget": iteration_row.budget,
-            **iteration_row.stats, "llm": iteration_row.llm, "note": iteration_row.note}})
-        kept = [row for row in rows if row.verdict == "kept"]
-        others = [row for row in rows if row.verdict != "kept"]
-        for row in (kept + others)[:_MAX_CANDIDATE_EVENTS]:
-            self._push({"type": "candidate", "data": candidate_event(row)})
-        self._push({"type": "state", "data": self.state_snapshot()})
+        inputs.members = self._compose_members()
+        source = self._lanes.get("strategy_param")
+        inputs.rotation_pool = tuple(source.kept_genomes()) if source is not None else ()
 
     # ============================ 调度与终态 ============================
     async def _sleep_until_next(self) -> None:
@@ -724,8 +573,7 @@ class DiscoveryRun:
 
         **绝不推 ``done``**：``paused`` 不是终态（§4.2 里 ``done`` 专指终态），而
         ``api/discovery.py`` 见 ``done`` 即关流、``snapshot()`` 又会把它永久钉在缓冲尾部——
-        一条还能恢复的任务会因此变成「怎么连都立刻断」的死流。状态经 ``state`` 事件下发即可，
-        取数失败另有 ``error`` 事件说明原因。
+        一条还能恢复的任务会因此变成「怎么连都立刻断」的死流。
         """
         self._paused = True
         self.status = "paused"
@@ -773,10 +621,21 @@ class DiscoveryRun:
 
 
 # ============================ 模块级纯函数 ============================
-def _fields_of(ctx: ValidationContext) -> dict:
-    from .validation import _context_of
+def _size_range(raw: object, low: int, high: int) -> tuple[int, int]:
+    data = raw if isinstance(raw, dict) else {}
+    lo = max(low, min(high, int(data.get("min", low) or low)))
+    hi = max(lo, min(high, int(data.get("max", high) or high)))
+    return lo, hi
 
-    return _context_of(ctx)
+
+def _template_signature(templates: tuple) -> str:
+    """可挖模板目录签名（key + 参数梯子）。升级后模板改了 min/max，旧基因可能已越界；
+    **不检查就会静默把越界参数当成合法基因继续繁殖**。"""
+    import hashlib
+
+    payload = [[spec.key, [[p.key, list(p.ladder)] for p in spec.params]]
+               for spec in templates if spec.minable]
+    return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()[:16]
 
 
 def _hourly_budget(spec: RunSpec):

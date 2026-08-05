@@ -43,7 +43,25 @@ REVIEW_REASON_CN: dict[str, str] = {
     "variant_cap": "同骨架的已入库变体数已达上限",
     "skeleton_blacklisted": "该骨架屡试不中，已进失败模式库",
     "constant_or_empty": "在数据窗上近乎常数或有效值过少",
+    # 策略轴的确定性规则（discovery-strategy-axes §2.7）。
+    "degenerate_params": "全部可挖参数都等于模板默认值（等于没挖）",
+    "degenerate_members": "去重后成员不足 2 个，或存在权重过小的摆设成员",
+    "duplicate_members": "存在两个完全相同的成员",
+    "risk_inconsistent": "止损不小于止盈（必亏结构）",
+    "window_inconsistent": "快窗不小于慢窗（参数对语义颠倒）",
 }
+
+# 「快窗 / 慢窗」语义参数对声明表（``window_inconsistent`` 判据）。用声明表而非猜名字：
+# 猜错了会把合法候选误杀，而误杀在长跑里表现为「入库率偏低」，查不出来。
+FAST_SLOW_PAIRS: dict[str, tuple[tuple[str, str], ...]] = {
+    "ema_cross_scalper": (("fast", "slow"),),
+    "trend_pullback_long": (("htf_ema_fast", "htf_ema_slow"),),
+    "trend_pullback_short": (("htf_ema_fast", "htf_ema_slow"),),
+    "trend_band_swing": (("trend_ema_fast", "trend_ema_slow"),),
+    "bollinger_reversion": (("rsi_os", "rsi_ob"),),
+}
+MIN_MEMBER_WEIGHT = 0.05
+MIN_COMBO_MEMBERS = 2
 
 
 @dataclass
@@ -92,6 +110,20 @@ def _is_homogeneous(node: Node) -> bool:
     return False
 
 
+def _shared_reason(ctx: ReviewContext, genome_hash: str, skeleton_key: str) -> str:
+    """四条**全轴共用**的规则：去重 / FSA 冻结 / 同骨架变体上限 / 失败模式库。"""
+    if genome_hash in ctx.tested_hashes:
+        return "duplicate"
+    if skeleton_key in ctx.banned_skeletons:
+        return "fsa_banned"
+    if int(ctx.kept_skeleton_counts.get(skeleton_key, 0)) >= max(1, int(ctx.variant_cap)):
+        return "variant_cap"
+    stats = ctx.skeleton_stats.get(skeleton_key) or {}
+    if int(stats.get("tested", 0)) >= BLACKLIST_MIN_TESTED and int(stats.get("kept", 0)) == 0:
+        return "skeleton_blacklisted"
+    return ""
+
+
 def _structural_reason(node: Node, ctx: ReviewContext, genome_hash: str,
                        skeleton_key: str) -> str:
     """前八条纯结构规则（顺序即代价，命中即返回码）。"""
@@ -107,22 +139,78 @@ def _structural_reason(node: Node, ctx: ReviewContext, genome_hash: str,
         validate_node(node)
     except ExpressionError:
         return "complexity_out_of_range"
-    if genome_hash in ctx.tested_hashes:
-        return "duplicate"
-    if skeleton_key in ctx.banned_skeletons:
-        return "fsa_banned"
-    if int(ctx.kept_skeleton_counts.get(skeleton_key, 0)) >= max(1, int(ctx.variant_cap)):
-        return "variant_cap"
-    stats = ctx.skeleton_stats.get(skeleton_key) or {}
-    if int(stats.get("tested", 0)) >= BLACKLIST_MIN_TESTED and int(stats.get("kept", 0)) == 0:
-        return "skeleton_blacklisted"
-    return ""
+    return _shared_reason(ctx, genome_hash, skeleton_key)
 
 
 def review_structure(candidate: Candidate, ctx: ReviewContext) -> str:
     """跑前八条纯结构规则，返回拒绝码（``""`` 即通过本道）。"""
     return _structural_reason(candidate.genome.node, ctx, candidate.genome_hash,
                               candidate.skeleton)
+
+
+# ============================ 策略轴的确定性规则（§2.7） ============================
+def _param_rules(genome) -> str:
+    """``strategy_param``：退化参数 / 必亏风控 / 快慢窗颠倒。"""
+    from ..strategies.base import get_strategy_class
+
+    cls = get_strategy_class(genome.template_key)
+    if cls is None:
+        return "degenerate_params"
+    defaults = dict(cls.meta.default_params)
+    schema = dict(cls.meta.params_schema)
+    if all(_close(defaults.get(key), value) for key, value in (genome.params or {}).items()):
+        return "degenerate_params"
+    stop, take = genome.params.get("stop_loss_pct"), genome.params.get("take_profit_pct")
+    if "stop_loss_pct" in schema and "take_profit_pct" in schema:
+        if stop is not None and take is not None and float(stop) >= float(take):
+            return "risk_inconsistent"
+    for fast_key, slow_key in FAST_SLOW_PAIRS.get(genome.template_key, ()):
+        fast, slow = genome.params.get(fast_key), genome.params.get(slow_key)
+        if fast is not None and slow is not None and float(fast) >= float(slow):
+            return "window_inconsistent"
+    return ""
+
+
+def _close(left, right) -> bool:
+    try:
+        return abs(float(left) - float(right)) < 1e-9
+    except (TypeError, ValueError):
+        return left == right
+
+
+def _combo_rules(genome) -> str:
+    """``factor_combo``：成员去重后不足 2 个 / 权重过小的摆设成员 / 完全相同的两个成员。"""
+    from .genomes import canonical_json
+
+    keys = [f"{m.factor_key}|{canonical_json(m.params)}" for m in genome.members]
+    if len(set(keys)) < len(keys):
+        return "duplicate_members"
+    if len(set(keys)) < MIN_COMBO_MEMBERS:
+        return "degenerate_members"
+    if any(float(weight) < MIN_MEMBER_WEIGHT for weight in genome.weights):
+        return "degenerate_members"
+    return ""
+
+
+def _rotation_rules(genome) -> str:
+    """``strategy_combo``：成员去重后不足 2 个（引擎侧同样要求 ≥2，提前拦下省一次回测）。"""
+    from .genomes import canonical_json
+
+    keys = {f"{m.template_key}|{canonical_json(m.params)}" for m in genome.members}
+    return "degenerate_members" if len(keys) < MIN_COMBO_MEMBERS else ""
+
+
+_STRATEGY_RULES = {"strategy_param": _param_rules, "factor_combo": _combo_rules,
+                   "strategy_combo": _rotation_rules}
+
+
+def review_strategy(candidate: Candidate, ctx: ReviewContext) -> str:
+    """策略轴的确定性规则链（先跑共用四条，再跑本轴专属的，命中即返回码）。"""
+    reason = _shared_reason(ctx, candidate.genome_hash, candidate.skeleton)
+    if reason:
+        return reason
+    rule = _STRATEGY_RULES.get(candidate.kind)
+    return rule(candidate.genome) if rule else ""
 
 
 def review_values(values: np.ndarray, ctx: ReviewContext) -> str:
@@ -151,7 +239,8 @@ def filter_rules(candidates: list[Candidate],
     rejected: list[tuple[Candidate, str]] = []
     seen: set[str] = set()
     for candidate in candidates:
-        reason = review_structure(candidate, ctx)
+        reason = (review_structure(candidate, ctx) if candidate.kind == "factor"
+                  else review_strategy(candidate, ctx))
         if not reason and candidate.genome_hash in seen:
             reason = "duplicate"
         if reason:
