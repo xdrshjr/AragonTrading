@@ -34,11 +34,13 @@ from ..live_auto.executor import LiveExecutor
 from ..live_auto.fee_ledger import build_fee_ledger
 from ..okx.accounts import AccountCredentials
 from ..okx.order_builder import snap_size
-from ..okx.trading import fetch_live_open_orders, fetch_live_positions, fetch_trading_config
+from ..okx.trading import (fetch_live_open_orders, fetch_live_positions, fetch_trade_fee,
+                          fetch_trading_config)
 from ..okx.types import BAR_SECONDS
 from ..paper.strategy_factory import PaperStrategySpec
 from .admission import get_admission_lock
 from .base_rules import MaBandRule, format_charter, rule_wire
+from .cost_runtime import build_charter_text
 from .exposure_book import GroupExposureBook
 from .market_window import MarketWindow, WindowOptions
 from .profit_guard import ProfitGuardRule
@@ -187,6 +189,9 @@ class _MemberPlan:
     allocation_pct: float
     budget_usd: float
     config: dict
+    # 轴 A 启动期预取的官方费率快照（P1-7）：`_create_group_run` 是 @staticmethod，既拿不到
+    # config_map 也拿不到执行器，故这个值只能随成员计划下传。取数失败 ⇒ None ⇒ 回落配置常数。
+    fee_rates_wire: dict | None = None
 
 
 @dataclass
@@ -279,12 +284,28 @@ class AiTradeManager:
                 return await fetch_trading_config(
                     creds, req.account_row.id, inst_id, settings=req.settings)
 
+        async def _bounded_fee_rate(inst_id: str) -> dict | None:
+            """轴 A：官方费率档位（签名私有 GET，并入同一并发预算）。
+
+            **失败一律 None ⇒ 回落配置常数，绝不阻断启动**——可用性不得成为开仓能力的函数。
+            """
+            if not req.settings.ai_trade_fee_rate_source_enabled:
+                return None
+            async with sem:
+                try:
+                    return await fetch_trade_fee(creds, inst_id)
+                except Exception as exc:  # noqa: BLE001 —— 费率取数失败只降级，不拒绝启动
+                    logger.info("ai-trade trade-fee prefetch failed (%s): %s", inst_id, exc)
+                    return None
+
         configs = await asyncio.gather(*[_bounded_config(m.inst_id) for m in members])
+        fee_rates = await asyncio.gather(*[_bounded_fee_rate(m.inst_id) for m in members])
         async with sem:
             positions = await fetch_live_positions(creds)
         async with sem:                       # 复用同一并发预算（规避已知的启动 429）
             pending = await self._fetch_blocking_pending(creds)
-        config_map = {m.inst_id: cfg for m, cfg in zip(members, configs)}
+        config_map = {m.inst_id: {**cfg, "feeRates": fr}
+                      for m, cfg, fr in zip(members, configs, fee_rates)}
         avail = next((cfg.get("availUsdt") or 0.0 for cfg in configs), 0.0)
         return avail, positions, config_map, pending
 
@@ -316,7 +337,8 @@ class AiTradeManager:
             if fail is not None:
                 failures.append(fail)
             else:
-                plans.append(_MemberPlan(m.inst_id, m.allocation_pct, budget_i, cfg))
+                plans.append(_MemberPlan(m.inst_id, m.allocation_pct, budget_i, cfg,
+                                         fee_rates_wire=cfg.get("feeRates")))
         if failures:
             raise AiTradeGroupPreflightError(failures)
         return plans
@@ -423,6 +445,12 @@ class AiTradeManager:
                                          # 利润保护宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变
                                          profit_guard_text=format_profit_guard_charter(
                                              req.profit_rule),
+                                         # 成本宪章章（轴 D）；总闸关 → "" ⇒ 渲染逐字节不变
+                                         cost_text=build_charter_text(
+                                             req.settings, plan.inst_id,
+                                             fee_rates_wire=plan.fee_rates_wire,
+                                             bar_seconds=BAR_SECONDS[req.bar],
+                                             allow_limit=allow_limit),
                                          # 仓位与风险层宪章章；三条规则全未装配 → "" ⇒ 渲染逐字节不变
                                          sizing_text=format_sizing_charter(
                                              sizing.rule, sizing.stop_rule, sizing.brake_rule),
@@ -654,7 +682,8 @@ class AiTradeManager:
             ct_val=meta.get("ctVal") or 0.0, lot_sz=meta.get("lotSz") or 0.0,
             min_sz=meta.get("minSz") or 0.0, settings=settings,
             # 成本记账的作用域缝（§3.2.0）：**只有** AI 链路注入账本；live_auto 不传 ⇒ 逐字节回退。
-            fee_ledger=build_fee_ledger(settings, ct_val=meta.get("ctVal") or 0.0))
+            fee_ledger=build_fee_ledger(settings, ct_val=meta.get("ctVal") or 0.0,
+                                        fee_rates=config.get("feeRates")))
 
     @staticmethod
     async def _create_group_run(ctx: _GroupBuildCtx, plan: _MemberPlan,
@@ -685,7 +714,12 @@ class AiTradeManager:
                         # 利润保护配置随 config_json 落库（零列迁移；未装配存 None）。
                         "profitGuard": profit_guard_wire(req.profit_rule),
                         # 仓位/刹车层配置同款落库（零列迁移；三条规则全未装配存 None）。
-                        "sizing": sizing_config_wire(req.settings, BAR_SECONDS[req.bar])},
+                        "sizing": sizing_config_wire(req.settings, BAR_SECONDS[req.bar]),
+                        # 会话级静态口径标记（cost-truth §3.2 B-4，零迁移）：聚合层据此判断
+                        # trades.pnl 是净额还是毛额；缺键的老 run 走 legacy 推定 + costBasisAssumed。
+                        "costBasis": ("net" if req.settings.ai_trade_net_pnl_enabled
+                                      else "gross"),
+                        "feeRates": plan.fee_rates_wire},
                 status="running",
                 # ai-trade-stats-dashboard §3.2：填既有 group_* 列（零迁移），使 ai-trade run 可按组聚合
                 # 出历史会话；各成员冗余同值。组级秒级起点为 ctx.created_ts（P1-3；ctx 无 started_ts）。

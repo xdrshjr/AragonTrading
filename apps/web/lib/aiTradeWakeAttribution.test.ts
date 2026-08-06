@@ -58,6 +58,8 @@ function trip(o: {
     }),
     pnlUsd: o.pnlUsd,
     pnlPct: null,
+    feeUsd: 0,
+    grossPnlUsd: o.pnlUsd,
     openedTs: 1,
     closedTs: 2,
     isWin: o.pnlUsd > 0,

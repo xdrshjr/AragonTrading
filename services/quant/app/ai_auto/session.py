@@ -153,7 +153,8 @@ class AiTradeSession:
         self._atr_px: float | None = None     # 确认根 ATR（F1）；None ⇒ 回吐距离上下界不生效
         # 成本记账与最小 edge 门禁（§3.10）：状态 / 快照 / 计数全部下沉 `CostRuntime`（镜像 F0 把
         # 利润保护下沉 `ProfitGuardRuntime` 的同款范式），会话只留薄封装调用。
-        self._cost = CostRuntime(inst_id, executor.settings, executor.fee_ledger)
+        self._cost = CostRuntime(inst_id, executor.settings, executor.fee_ledger,
+                                 executor.creds, allow_limit=decider.allow_limit)
         # 信号先验层（signal-prior-and-ev-gate §3.1）：同款下沉范式；总闸①关或快照缺席 ⇒ payload
         # 无 signalPriors 键、prompt 逐字节回退、EV 分子回退 ATR 粗估（既有单测零回归）。
         self._prior = PriorRuntime(prior_snapshot, executor.settings)
@@ -370,6 +371,9 @@ class AiTradeSession:
         except Exception as exc:  # noqa: BLE001 —— 平仓失败如实记录，仍完成停止流程
             self.flatten_result = {"ok": False, "message": str(exc)}
         await self._handle_flatten_result(ts)
+        await self._cost.reconcile_tick(          # 轴 C：终态对账（硬超时，永不判 drift）
+            time.time(), window_start_ts=self.started_ts,
+            trades=self.executor.trades, push=self._push, final=True)
         await self._finalize_run(ts)
         await self._push({"type": "status", "data": self._status_payload()})
         return self.flatten_result
@@ -435,7 +439,10 @@ class AiTradeSession:
         await self._maybe_profit_exit(now_ts)
         await self._expire_profit_cooldown()
         await self._maybe_session_exit(mark, now_ts)
-        await self._cost.refresh_funding(time.time())    # §3.1：网络 IO 只跑在盯市 tick 上
+        # §3.1：网络 IO 只跑在盯市 tick 上；三条刷新（资金费率 / 官方费率 / 交易所对账）离开
+        # tick 的关键路径跑在后台单飞任务里——串行 await 会把 5s 盯市周期翻倍（I-1）。
+        self._cost.schedule_maintenance(time.time(), window_start_ts=self.started_ts,
+                                        trades=self.executor.trades, push=self._push)
         # 战术窗口刷新**必须**排在定时唤醒之前——否则定时轮拿到的是上一分钟的战术数据，整个特性
         # 在最该生效的路径上空转。三闸门（锚点/配额/单 tick 节流）+ 硬超时保证它不拖停盯市。
         await self._window.maybe_refresh_tactical(now_ts, time.time())
@@ -1110,10 +1117,10 @@ class AiTradeSession:
         接受该形参只是为了不改既有调用点签名。
         """
         pos = self.executor.position_payload(mark_px)
-        if pos is None or self.profit_rule is None:
-            return pos
-        snap = self._refresh_profit_state(time.time())
-        return pos if snap is None else {**pos, "profitGuard": snap}
+        if pos is not None and self.profit_rule is not None:
+            snap = self._refresh_profit_state(time.time())
+            pos = pos if snap is None else {**pos, "profitGuard": snap}
+        return self._cost.decorate_position(pos, bar_seconds=BAR_SECONDS[self.bar])
 
     def _session_readings(self, now_wall: float) -> SessionReadings:
         """把会话侧的六个时钟 / 断面读数打包（F1：ATR 只进上下界计算，绝不参与触发判定，G-5）。"""
@@ -1315,6 +1322,8 @@ class AiTradeSession:
         if priors is not None:                  # 同款「整键缺席」范式（§3.9 的 G-1 逐字节断言）
             payload["signalPriors"] = priors
         self._cost.set_prior_view(self._prior.coverage_wire())   # P1-3：两条快照通道同源
+        self._cost.inject(payload, last_px=ref_px, atr_px=self._atr_px,
+                          bar_seconds=BAR_SECONDS[self.bar])     # 轴 D：总闸关 ⇒ 整键缺席
         # 唤醒原因 + 战术周期证据 + 两个披露档（wake-aware-context §2.6）：三总闸各管自己的键，
         # 关闭即**整键缺席**（不是 None）⇒ prompt 渲染与既有 payload 冻结断言逐字节回退。
         self._wake.inject(payload, InjectionContext(

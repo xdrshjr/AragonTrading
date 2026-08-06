@@ -108,7 +108,8 @@ class LiveExecutor:
         self.entry_qty_sz = 0.0            # 自管持仓张数（contracts）
         self.entry_position_pct: float | None = None
         self.realized_pnl_usd = 0.0        # 累计已实现（平仓回执累加）
-        self.unrealized_usd = 0.0          # 最近一次 reconcile 的浮盈（OKX upl）
+        self.unrealized_usd = 0.0          # 最近一次 reconcile 的浮盈（净额口径，B-2）
+        self.gross_unrealized_usd = 0.0    # 同一次 reconcile 的**毛**浮盈（只读，供对账/排查）
         self.trades: list[dict] = []       # 已执行真单→Trade（驱动图表 markers）
         self._reconcile_fail_streak = 0    # H2：连续 reconcile 读取失败计数（成功即清零）
         self.degraded = False              # H2：盯市降级标志（连续失败达阈→True，恢复→False）
@@ -532,7 +533,7 @@ class LiveExecutor:
         qty = self.entry_qty_sz
         position_pct = self.entry_position_pct
         self.realized_pnl_usd += pnl
-        self.unrealized_usd = 0.0
+        self.unrealized_usd = self.gross_unrealized_usd = 0.0
         self.projected = "flat"
         self.entry_qty_sz = 0.0
         self.entry_fee_usd = 0.0                   # §3.3b 复位点 1/3：主动平仓 / 限价平仓采纳
@@ -553,7 +554,7 @@ class LiveExecutor:
         """
         events = self._synthesize_external_close(ref_px, ts, source="oco")
         self.realized_pnl_usd += self._close_pnl(ref_px)
-        self.unrealized_usd = 0.0
+        self.unrealized_usd = self.gross_unrealized_usd = 0.0
         self.projected = "flat"
         self.entry_qty_sz = 0.0
         self.entry_fee_usd = 0.0                   # §3.3b 复位点 2/3：交易所侧 OCO 已先平
@@ -608,13 +609,14 @@ class LiveExecutor:
         grace = self._fill_grace
         self._fill_grace = False
         abs_pos = self._net_abs_pos(positions)
-        self.unrealized_usd = self._net_upl(positions)
+        self.gross_unrealized_usd = self._net_upl(positions)     # OKX upl：纯价差、不含任何费用
+        self.unrealized_usd = self._net_unrealized(self.gross_unrealized_usd, mark_px)
         if (self.projected != "flat" and abs_pos <= 0 and not grace
                 and not self._external_close_suppressed()):
             # v2（P1-1）：侦测到交易所侧 / 外部已平仓，合成只读 external_close 成交后再校正为 flat。
             events += self._synthesize_external_close(mark_px, ts, source="external")
             self.realized_pnl_usd += self._close_pnl(mark_px)
-            self.unrealized_usd = 0.0
+            self.unrealized_usd = self.gross_unrealized_usd = 0.0
             self.projected = "flat"
             self.entry_qty_sz = 0.0
             self.entry_fee_usd = 0.0               # §3.3b 复位点 3/3：外部干预平仓（漏掉即静默重扣）
@@ -778,11 +780,21 @@ class LiveExecutor:
         return self._close_pnl(exit_px, ord_type=ord_type) / (notional / self.leverage)
 
     def _unrealized_at(self, mark_px: float) -> float:
+        """本地派生浮盈（**净额口径**，B-2）：账本未装配 / 空仓恒返回毛额，live_auto 逐字节回退。"""
         if self.projected == "long":
-            return self.entry_qty_sz * self.ct_val * (mark_px - self.entry_price)
-        if self.projected == "short":
-            return self.entry_qty_sz * self.ct_val * (self.entry_price - mark_px)
-        return 0.0
+            gross = self.entry_qty_sz * self.ct_val * (mark_px - self.entry_price)
+        elif self.projected == "short":
+            gross = self.entry_qty_sz * self.ct_val * (self.entry_price - mark_px)
+        else:
+            return 0.0
+        return self._net_unrealized(gross, mark_px)
+
+    def _net_unrealized(self, gross: float, mark_px: float) -> float:
+        """浮盈净额化的**唯一**入口；账本未装配（live_auto 全部路径）/ 空仓 ⇒ 恒返回 gross（位相同）。"""
+        if self.fee_ledger is None or self.projected == "flat":
+            return gross
+        return self.fee_ledger.net_unrealized(gross, entry_fee_usd=self.entry_fee_usd,
+                                              mark_px=mark_px, sz=self.entry_qty_sz)
 
     def _pos_side(self) -> str:
         return "net" if self.pos_mode == "net_mode" else self.projected

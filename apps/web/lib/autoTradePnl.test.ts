@@ -285,3 +285,90 @@ describe("summarizeRoundTrips", () => {
     expect(Number.isNaN(s.winRate)).toBe(false);
   });
 });
+
+// ============ 净额口径镜像（ai-trade-cost-truth-and-net-pnl §3.5 F-2，G-7）============
+describe("buildRoundTrips cost basis (G-7：与后端 _Trip 逐笔同构)", () => {
+  it("defaults to gross and stays byte-for-byte identical for non-AI callers (fee ≡ 0)", () => {
+    // live-auto（非 AI）成交的 fee 恒为 0.0（账本只由 ai_auto 注入），减零即恒等——**结构性**保证。
+    const trades = [
+      trade({ id: 1, ts: 10, side: "long", price: 100 }),
+      trade({ id: 2, ts: 20, side: "close", price: 110, pnl: 9 }),
+    ];
+    const [rt] = buildRoundTrips("BTC-USDT-SWAP", trades, 3);
+    expect(rt.pnlUsd).toBe(9);
+    expect(rt.feeUsd).toBe(0);
+    expect(rt.grossPnlUsd).toBe(9);
+  });
+
+  it("reconstructs the net pnl from a gross row by subtracting every leg fee", () => {
+    const trades = [
+      trade({ id: 1, ts: 10, side: "long", price: 100, fee: 1.5 }),
+      trade({ id: 2, ts: 20, side: "close", price: 110, pnl: 10, fee: 1.5 }),
+    ];
+    const [rt] = buildRoundTrips("BTC-USDT-SWAP", trades, 3, { costBasis: "gross" });
+    expect(rt.pnlUsd).toBe(7);
+    expect(rt.feeUsd).toBe(3);
+    expect(rt.grossPnlUsd).toBe(10);
+    expect(rt.isWin).toBe(true);
+  });
+
+  it("takes a net row verbatim and restores the gross side by adding the fees back", () => {
+    const trades = [
+      trade({ id: 1, ts: 10, side: "long", price: 100, fee: 1.5 }),
+      trade({ id: 2, ts: 20, side: "close", price: 110, pnl: 7, fee: 1.5 }),
+    ];
+    const [rt] = buildRoundTrips("BTC-USDT-SWAP", trades, 3, { costBasis: "net" });
+    expect(rt.pnlUsd).toBe(7);
+    expect(rt.grossPnlUsd).toBe(10);
+  });
+
+  it("sums the fees of EVERY leg since the previous close, including overwritten open legs", () => {
+    // 后端 `_pair_round_trips` 的同一组夹具：部分成交产生两条开仓腿，配对只留最后一条。
+    // 按「配对那条腿的 fee」计会得到 5.0（漏记 1.0）——这条断言正是 B-5 要防的漏记。
+    const trades = [
+      trade({ id: 1, ts: 10, side: "long", price: 100, fee: 1 }), // 3 张
+      trade({ id: 2, ts: 11, side: "long", price: 102, fee: 2 }), // 再 7 张
+      trade({ id: 3, ts: 20, side: "close", price: 110, pnl: 10, fee: 3 }),
+    ];
+    const [rt] = buildRoundTrips("BTC-USDT-SWAP", trades, 3, { costBasis: "gross" });
+    expect(rt.feeUsd).toBe(6);
+    expect(rt.pnlUsd).toBe(4);
+  });
+
+  it("does not let one round-trip's fees leak into the next", () => {
+    const trades = [
+      trade({ id: 1, ts: 10, side: "long", price: 100, fee: 1 }),
+      trade({ id: 2, ts: 20, side: "close", price: 110, pnl: 10, fee: 1 }),
+      trade({ id: 3, ts: 30, side: "short", price: 110, fee: 2 }),
+      trade({ id: 4, ts: 40, side: "close", price: 105, pnl: 5, fee: 2 }),
+    ];
+    const rts = buildRoundTrips("BTC-USDT-SWAP", trades, 3, { costBasis: "gross" });
+    expect(rts.map((r) => r.feeUsd)).toEqual([2, 4]);
+    expect(rts.map((r) => r.pnlUsd)).toEqual([8, 1]);
+  });
+
+  it("collects leg fees in causal (id) order, not array order", () => {
+    // AI 自动交易的 trades.ts 由两套时钟写入；腿费归集必须与配对钉死同一个排序键（P2-4）。
+    const trades = [
+      trade({ id: 2, ts: 20, side: "close", price: 110, pnl: 10, fee: 3 }),
+      trade({ id: 1, ts: 10, side: "long", price: 100, fee: 1 }),
+    ];
+    const [rt] = buildRoundTrips("BTC-USDT-SWAP", trades, 3, { costBasis: "gross" });
+    expect(rt.feeUsd).toBe(4);
+  });
+
+  it("propagates the cost basis through buildLedger", () => {
+    const members = [
+      {
+        instId: "BTC-USDT-SWAP",
+        leverage: 3,
+        trades: [
+          trade({ id: 1, ts: 10, side: "long", price: 100, fee: 1 }),
+          trade({ id: 2, ts: 20, side: "close", price: 110, pnl: 10, fee: 1 }),
+        ],
+      },
+    ];
+    expect(buildLedger(members, { costBasis: "gross" })[0].pnlUsd).toBe(8);
+    expect(buildLedger(members)[0].pnlUsd).toBe(8); // 默认 gross
+  });
+});

@@ -9,6 +9,14 @@ import WakeAttributionCard from "./WakeAttributionCard";
 import { Badge, Button, Skeleton } from "@/components/ui";
 import { buildLedger, buildRoundTrips, type RoundTrip } from "@/lib/autoTradePnl";
 import { formatProfitCapture, PROFIT_CAPTURE_HINT } from "@/lib/aiTradeCapture";
+import {
+  COST_BASIS_HINT,
+  costShareOfGross,
+  describeCostBasis,
+  describeFeeRates,
+  describeIdentityCheck,
+  describeReconcile,
+} from "@/lib/aiTradeCost";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
 import type { AiTradeHistoryDetailOut, AiTradeHistoryMember } from "@/lib/aiTradeHistoryTypes";
 import { type AiObservability, aggregateAiObservability } from "@/lib/aiTradeObservability";
@@ -94,7 +102,13 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
             <span>· {detail.status === "error" ? "异常结束" : "已停止"}</span>
           </div>
 
-          <KpiGrid summary={summary} />
+          <KpiGrid
+            summary={summary}
+            costBasis={resolveCostBasis(detail.members)}
+            costBasisAssumed={detail.costBasisAssumed === true}
+          />
+
+          <ReconcileCard members={detail.members} />
 
           <Section title="权益 / 回撤">
             {combinedEquity.length >= 2 ? (
@@ -140,7 +154,25 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
   );
 }
 
-function KpiGrid({ summary }: { summary: AiTradeHistoryDetailOut["summary"] }) {
+// 组级口径：成员一致即取该值；跨 run 出现两种 ⇒ undefined ⇒ 文案退回「口径未知」并由 costBasisMixed
+// 徽标说明成因。**绝不硬编码 "net"**——老会话整组都是毛额，硬编码会让它谎报自己已扣过手续费。
+function resolveCostBasis(members: AiTradeHistoryMember[]): "net" | "gross" | undefined {
+  const seen = new Set(members.map((m) => m.costBasis).filter(Boolean));
+  return seen.size === 1 ? ([...seen][0] as "net" | "gross") : undefined;
+}
+
+function KpiGrid({
+  summary,
+  costBasis,
+  costBasisAssumed,
+}: {
+  summary: AiTradeHistoryDetailOut["summary"];
+  costBasis: "net" | "gross" | undefined;
+  costBasisAssumed: boolean;
+}) {
+  // 成本三键：老后端不下发 ⇒ 三者皆 undefined ⇒ 整段隐藏（绝不显示一排误导性的 0）。
+  const hasCost = summary.feeUsd != null || summary.grossPnlUsd != null;
+  const share = costShareOfGross(summary.feeUsd, summary.grossPnlUsd);
   return (
     <div className="flex flex-col gap-2">
       <div className="grid grid-cols-2 gap-2">
@@ -154,6 +186,21 @@ function KpiGrid({ summary }: { summary: AiTradeHistoryDetailOut["summary"] }) {
         <Kpi label="最大单笔盈" value={signed(summary.bestUsd)} color={colorForReturn(summary.bestUsd)} />
         <Kpi label="最大单笔亏" value={signed(summary.worstUsd)} color={colorForReturn(summary.worstUsd)} />
       </div>
+      {hasCost && (
+        <div className="flex flex-col gap-1" data-testid="ai-cost-kpis">
+          <div className="grid grid-cols-2 gap-2">
+            <Kpi label="已付手续费（USDT）" value={fmtNum(summary.feeUsd ?? 0)} />
+            <Kpi label="毛额盈亏（未扣费）" value={signed(summary.grossPnlUsd ?? 0)} color={colorForReturn(summary.grossPnlUsd ?? 0)} />
+            <Kpi label="成本占毛利比" value={share == null ? "—" : fmtPct(share)} />
+            <Kpi label="盈亏口径" value={describeCostBasis(summary.costBasisMixed ? undefined : costBasis, costBasisAssumed)} />
+          </div>
+          <p className="text-[10px] leading-relaxed text-[var(--muted)]" title={COST_BASIS_HINT}>
+            {summary.costBasisMixed
+              ? "该会话跨 run 出现两种盈亏口径（净额 / 毛额），上方已实现总收益按各 run 各自口径还原为净额后相加。"
+              : COST_BASIS_HINT}
+          </p>
+        </div>
+      )}
       {/* F4 利润捕获率：**取后端 summary 的聚合值，不在前端重算历史**（两份实现必然漂移；实时页
           才用前端纯函数）。老会话 / 老库缺列时后端下发全 0 ⇒ 走同一条「样本不足」降级路径。 */}
       <div className="flex flex-col gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2">
@@ -172,6 +219,40 @@ function KpiGrid({ summary }: { summary: AiTradeHistoryDetailOut["summary"] }) {
         <p className="text-[10px] leading-relaxed text-[var(--muted)]">{PROFIT_CAPTURE_HINT}</p>
       </div>
     </div>
+  );
+}
+
+/**
+ * 交易所对账卡（cost-truth-and-net-pnl §3.5 F-3）。
+ *
+ * **老记录缺键 ⇒ 整段隐藏**：显示一张全 0 的对账卡等于宣称系统验证过一件它没验证过的事。
+ * 卡片只呈现后端算好的差额与自检结论，前端不重算任何一项（C-5：本层只观测、不回写盈亏）。
+ */
+function ReconcileCard({ members }: { members: AiTradeHistoryMember[] }) {
+  const rec = members.map((m) => m.metrics.aiStats?.reconcile).find((r) => r) ?? null;
+  const rates = members.map((m) => m.metrics.aiStats?.feeRates).find((r) => r) ?? null;
+  const view = describeReconcile(rec);
+  if (!view) return null;
+  const identity = describeIdentityCheck(rec);
+  const feeLine = describeFeeRates(rates);
+  return (
+    <Section title="交易所对账">
+      <div className="flex flex-col gap-1.5 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2" data-testid="ai-reconcile-card">
+        <div className="flex items-center justify-between gap-2 text-xs">
+          <span className="text-[var(--muted)]">本地净额 vs 交易所结算</span>
+          <Badge tone={view.tone === "ok" ? "long" : view.tone === "warn" ? "short" : "neutral"}>{view.label}</Badge>
+        </div>
+        <p className="text-[10px] leading-relaxed text-[var(--muted)]">{view.detail}</p>
+        <div className="grid grid-cols-2 gap-2">
+          <Kpi label="交易所手续费" value={fmtNum(rec?.exchangeFeeUsd ?? 0)} />
+          <Kpi label="交易所资金费" value={fmtNum(rec?.exchangeFundingFeeUsd ?? 0)} />
+          <Kpi label="交易所样本数" value={`${rec?.samples ?? 0} 笔`} />
+          <Kpi label="本地往返数" value={`${rec?.localTrips ?? 0} 笔`} />
+        </div>
+        {identity && <p className="text-[10px] text-[var(--muted)]">{identity}</p>}
+        {feeLine && <p className="text-[10px] text-[var(--muted)]">{feeLine}</p>}
+      </div>
+    </Section>
   );
 }
 
@@ -243,7 +324,11 @@ function AiStatsCard({
 function MemberTrades({ member, bar }: { member: AiTradeHistoryMember; bar: string }) {
   const [openRowKey, setOpenRowKey] = useState<string | null>(null);
   const roundTrips = useMemo(
-    () => buildRoundTrips(member.instId, member.trades, member.leverage).sort((a, b) => b.closedTs - a.closedTs),
+    // 该成员 run 的口径由后端下发（老 run 为推定值）；缺键 ⇒ "gross" ⇒ 与本特性合入前逐字相同。
+    () =>
+      buildRoundTrips(member.instId, member.trades, member.leverage, {
+        costBasis: member.costBasis ?? "gross",
+      }).sort((a, b) => b.closedTs - a.closedTs),
     [member],
   );
   return (

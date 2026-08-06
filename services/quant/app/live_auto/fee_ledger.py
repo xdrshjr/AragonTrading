@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +67,17 @@ class FillAudit:
     slip_bps: float | None
 
 
-def resolve_fee_params(settings) -> FeeParams:
-    """settings → `FeeParams`（`ai_auto/manager.py` 的构造缝用；§3.2.0 的唯一解析点）。"""
+def resolve_fee_params(settings, *, rates: tuple[float, float] | None = None) -> FeeParams:
+    """settings → `FeeParams`（`ai_auto/manager.py` 的构造缝用；§3.2.0 的唯一解析点）。
+
+    Args:
+        settings: 全局配置（费率常数即回落值）。
+        rates: 官方费率档位 `(maker_bps, taker_bps)`（轴 A）；`None` ⇒ 用配置常数。
+    """
+    maker, taker = rates if rates is not None else (
+        float(settings.ai_trade_maker_fee_bps), float(settings.ai_trade_taker_fee_bps))
     return FeeParams(
-        maker_fee_bps=float(settings.ai_trade_maker_fee_bps),
-        taker_fee_bps=float(settings.ai_trade_taker_fee_bps),
+        maker_fee_bps=float(maker), taker_fee_bps=float(taker),
         accounting_enabled=bool(settings.ai_trade_fee_accounting_enabled),
         net_pnl_enabled=bool(settings.ai_trade_net_pnl_enabled))
 
@@ -83,10 +89,13 @@ class FeeLedger:
     最近一次开仓腿的反向——`direction` 无需由调用方逐处传入，本账本自己记得。
     """
 
-    def __init__(self, *, ct_val: float, params: FeeParams,
+    def __init__(self, *, ct_val: float, params: FeeParams, rate_source: str = "config",
                  audit_capacity: int = _AUDIT_CAPACITY) -> None:
         self.ct_val = float(ct_val or 0.0)
         self.params = params
+        self.rate_source = str(rate_source)   # "exchange"（官方档位）| "config"（回落常数）
+        self.fee_rate_wire: dict | None = None  # 启动期官方费率快照（轴 A；供 CostRuntime 播种缓存）
+        self._session_fee_usd = 0.0           # 本会话已付手续费累计（进 costSnapshot.cost）
         self._pending: dict[str, FillAudit] = {}
         self._pending_capacity = max(1, audit_capacity * _PENDING_CAPACITY_FACTOR)
         self._audits: deque[FillAudit] = deque(maxlen=audit_capacity)
@@ -131,6 +140,7 @@ class FeeLedger:
         # 故滑点**只能**由 fills 审计产出，严禁试图从 trade 的 price/expectedPx 之差推导（那恒为 0）。
         expected = float(px if expected_px is None else expected_px)
         fee = self.leg_fee(sz=sz, px=px, ord_type=ord_type)
+        self._session_fee_usd += fee
         self.register(cl_ord_id=cl_ord_id or "", direction=self._direction_for(side),
                       ord_type=ord_type, expected_px=expected, sz=_finite(sz),
                       model_fee_usd=fee)
@@ -177,6 +187,34 @@ class FeeLedger:
         if not self.params.net_pnl_enabled:
             return gross
         return gross - float(entry_fee_usd) - self.leg_fee(sz=sz, px=exit_px, ord_type=ord_type)
+
+    def net_unrealized(self, gross: float, *, entry_fee_usd: float, mark_px: float,
+                       sz: float) -> float:
+        """浮盈的净额口径 = 毛浮盈 − 已付开仓费 − 按标记价预估的平仓腿 taker 费。
+
+        与 `net_close_pnl` **严格同构**（总闸关 ⇒ 恒返回 `gross` 本身，位相同）：交易所 `upl` 按标记价
+        算纯价差、不含任何费用，故持仓期间显示的浮盈比「此刻平掉能拿到手的钱」多出一个开仓费加一个
+        预估平仓费。平仓腿恒按 taker 估（保守取贵的一侧，与成本模型 `feeCloseBps` 同口径）。
+        """
+        if not self.params.net_pnl_enabled:
+            return gross
+        return gross - float(entry_fee_usd) - self.leg_fee(sz=sz, px=mark_px, ord_type="market")
+
+    # ---------- 轴 A：官方费率热更新 ----------
+    def retune(self, *, maker_bps: float, taker_bps: float, source: str) -> None:
+        """按官方档位换一套费率（**只影响此后新腿，绝不回改已记账的费用**，不变式 A-4a）。
+
+        `FeeParams` 是 frozen dataclass，`dataclasses.replace` 换一个新对象即天然满足该不变式——否则
+        一笔持仓的开仓费会在持仓期间被悄悄改写，平仓时的净额与开仓时的承诺对不上。
+        """
+        self.params = replace(self.params, maker_fee_bps=max(0.0, float(maker_bps)),
+                              taker_fee_bps=max(0.0, float(taker_bps)))
+        self.rate_source = str(source)
+
+    @property
+    def session_fee_usd(self) -> float:
+        """本会话累计已付手续费（Σ 每腿 `fee`；记账关闭 ⇒ 恒 `0.0`）。"""
+        return self._session_fee_usd
 
     # ---------- 实测审计（旁路，绝不回写盈亏）----------
     def has_pending(self) -> bool:
@@ -256,9 +294,21 @@ class FeeLedger:
 _SKIPPED = object()
 
 
-def build_fee_ledger(settings, *, ct_val: float) -> FeeLedger:
-    """AI 链路的费率账本构造点（§3.2.0 的作用域缝；`live_auto` 不调用本函数即逐字节回退）。"""
-    return FeeLedger(ct_val=ct_val, params=resolve_fee_params(settings))
+def build_fee_ledger(settings, *, ct_val: float, fee_rates: dict | None = None) -> FeeLedger:
+    """AI 链路的费率账本构造点（§3.2.0 的作用域缝；`live_auto` 不调用本函数即逐字节回退）。
+
+    Args:
+        settings: 全局配置。
+        ct_val: 合约乘数。
+        fee_rates: 轴 A 启动期预取的官方费率归一 wire（`okx.trading._normalize_trade_fee` 产物）；
+            `None` ⇒ 费率取配置常数 ⇒ 与本特性合入前逐字相同。
+    """
+    rates = ((float(fee_rates["makerBps"]), float(fee_rates["takerBps"]))
+             if fee_rates else None)
+    ledger = FeeLedger(ct_val=ct_val, params=resolve_fee_params(settings, rates=rates),
+                       rate_source=str((fee_rates or {}).get("source") or "config"))
+    ledger.fee_rate_wire = dict(fee_rates) if fee_rates else None
+    return ledger
 
 
 def trade_fee_fields(ledger: FeeLedger | None, **leg) -> dict:

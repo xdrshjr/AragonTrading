@@ -1,5 +1,6 @@
 // AI 自动交易 wire 类型（camelCase，与后端 schemas.py 的 AiTrade* 同构）。
 // 运行期句柄（sessionId 等）为瞬态（store 不入 partialize）；aiTradeConfig 为持久化偏好。
+import type { FeeRatesWire, ReconcileWire } from "./aiTradeCost";
 import type {
   PaperPositionEvent,
   ProfitGuardCooldown,
@@ -350,6 +351,20 @@ export interface AiTradeGivebackTier {
   givebackPct: number;
 }
 
+// 会话成本快照（ai-trade-cost-truth-and-net-pnl §5.4 / P1-1）：后端 `build_cost_stats` 的唯一产物，
+// 同时作为 WS `costSnapshot` 与落库 `metricsJson.aiStats`——**两条通道必然同形**，故此处一个接口
+// 描述两处。`feeRates` / `reconcile` 挂**顶层**，`sessionFeeUsd` 挂 `cost` 子对象（与实测键同族）。
+// 全部可选：老会话 / 总闸关的会话根本不下发这些键，读点一律走「缺键即整段隐藏」的降级范式。
+export interface AiTradeCostSnapshot {
+  cost?: Record<string, number | null> & { sessionFeeUsd?: number };
+  edgeGate?: Record<string, number | null>;
+  decisionConversionRate?: number | null;
+  feeRates?: FeeRatesWire | null;
+  reconcile?: ReconcileWire | null;
+  priorCoverage?: number | null;
+  priorAgeS?: number | null;
+}
+
 // agent_trace 事件 data（各字段按 phase 可选；前端 reducer 按 phase 归约）。
 export interface AiTradeTraceEvent {
   phase: AiTradeTracePhase;
@@ -415,9 +430,12 @@ export interface AiTradeTraceEvent {
   priorContributors?: unknown[] | null;
   // round_start：本轮先验输入快照（三总闸全关的会话恒无此键 ⇒ 组件整段回退旧文案）。
   signalPriors?: Record<string, unknown> | null;
-  // §5.4 会话内观测通道：成本统计只读快照。前端本轮**不消费**（阶段一的读者是运维，读 WS 原始事件），
-  // 声明它只为让类型如实描述 wire——未识别键在 reducer 的 default 分支被忽略。
-  costSnapshot?: Record<string, unknown> | null;
+  // §5.4 会话内观测通道：成本统计只读快照。收紧为具名接口（cost-truth §3.5 F-5），顶层含
+  // cost / edgeGate / reconcile / feeRates 四段——与后端 `build_cost_stats` 的挂载层级逐字一致。
+  // **该键仍不进 trace reducer**（`aiTradeEdgeGate` 逐键手抄，未识别键被忽略）：本轮真正被组件
+  // 消费的是**落库**通道 `metrics.aiStats.{reconcile,feeRates}`（历史详情的交易所对账卡），
+  // 两条通道同源同形（`build_cost_stats` 是唯一产物），故此处只需如实声明形状。
+  costSnapshot?: AiTradeCostSnapshot | null;
   // sizing：仓位求解 + ATR 止损 + 刹车断面（vol-sizing-and-drawdown-brake §3.9，与后端
   // trace.SIZING_TRACE_KEYS 逐键镜像）。三条规则全未装配的会话根本收不到这个相位。
   brakeLevel?: "none" | "slow" | "halt" | "cooldown" | null;

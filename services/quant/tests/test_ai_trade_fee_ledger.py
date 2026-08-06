@@ -76,7 +76,7 @@ def test_partial_fills_charge_the_delta_not_the_cumulative_size():
 
 # ---------- 用例 3 / 4：net_close_pnl 开关等价性与计价基准 ----------
 def test_net_close_pnl_returns_gross_verbatim_when_switch_off():
-    ledger = _ledger()                                   # net_pnl 默认关
+    ledger = _ledger(ai_trade_net_pnl_enabled=False)     # cost-truth B-1 起默认**开**，此处显式关
     gross = 123.456
     assert ledger.net_close_pnl(gross, entry_fee_usd=9.9, exit_px=_PX, sz=1.0) is gross
 
@@ -341,3 +341,44 @@ def test_repeated_registration_of_one_order_never_evicts_other_pendings():
                         sz=1.0, model_fee_usd=0.15)
     assert len(ledger._pending) == 4
     assert ledger.resolve([_fill("c1")]) == 1            # 最旧的那条仍在
+
+
+# ---------- 用例 9：净额浮盈 / 会话累计费用 / 官方费率热更新（cost-truth-and-net-pnl 轴 A/B）----------
+def test_net_unrealized_is_structurally_identical_to_net_close_pnl():
+    """浮盈净额与平仓净额**同构**：都扣「已付开仓费 + 按当前价估的平仓腿 taker 费」。
+
+    这条同构是「持仓期显示的钱 == 此刻平掉能拿到的钱」的全部依据；两者若各写一份公式，切换持仓
+    状态的那一刻数字就会跳一下，而那一跳没有任何真实事件与之对应。
+    """
+    ledger = _ledger(ai_trade_net_pnl_enabled=True)
+    px = 31_000.0
+    net_unreal = ledger.net_unrealized(100.0, entry_fee_usd=1.5, mark_px=px, sz=2.0)
+    net_close = ledger.net_close_pnl(100.0, entry_fee_usd=1.5, exit_px=px, sz=2.0)
+    assert net_unreal == pytest.approx(net_close)
+
+
+def test_net_unrealized_returns_gross_verbatim_when_the_switch_is_off():
+    ledger = _ledger(ai_trade_net_pnl_enabled=False)
+    gross = 123.456
+    assert ledger.net_unrealized(gross, entry_fee_usd=9.9, mark_px=_PX, sz=1.0) is gross
+
+
+def test_session_fee_accumulates_only_through_booked_legs():
+    """`sessionFeeUsd` 只由**真的记过账**的腿推进——它是「本会话已经付掉多少」的读数，不是估算。"""
+    ledger = _ledger()
+    assert ledger.session_fee_usd == 0.0
+    first = ledger.on_trade(cl_ord_id="c1", side="long", sz=1.0, px=_PX,
+                            ord_type="market", expected_px=None)
+    second = ledger.on_trade(cl_ord_id="c2", side="close", sz=1.0, px=_PX,
+                             ord_type="limit", expected_px=None)
+    assert ledger.session_fee_usd == pytest.approx(first["fee"] + second["fee"])
+
+
+def test_retune_switches_the_rate_source_for_subsequent_legs_only():
+    ledger = _ledger()
+    before = ledger.leg_fee(sz=1.0, px=_PX, ord_type="market")
+    ledger.retune(maker_bps=1.5, taker_bps=4.0, source="exchange")
+    after = ledger.leg_fee(sz=1.0, px=_PX, ord_type="market")
+    assert before == pytest.approx(300.0 * 5e-4)      # 配置常数 5 bps
+    assert after == pytest.approx(300.0 * 4e-4)       # 官方档位 4 bps
+    assert ledger.rate_source == "exchange"

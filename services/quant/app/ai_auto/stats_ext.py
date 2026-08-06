@@ -19,13 +19,21 @@ from __future__ import annotations
 _COST_SNAPSHOT_EVERY_ROUNDS = 10
 
 
-def build_cost_stats(attribution_stats: dict, fee_ledger) -> dict:
+def build_cost_stats(attribution_stats: dict, fee_ledger, *, fee_rates: dict | None = None,
+                     reconcile: dict | None = None) -> dict:
     """归因读数 + 费率账本实测读数 → `§6.3` 的三组加法键（`cost` / `edgeGate` /
-    `decisionConversionRate`）。
+    `decisionConversionRate`），外加轴 A / 轴 C 的两个**顶层**加法键。
+
+    挂载层级的唯一约定（cost-truth-and-net-pnl P1-1）：`feeRates` / `reconcile` 挂**顶层**
+    （落库即 `aiStats.feeRates` / `aiStats.reconcile`），`sessionFeeUsd` 挂 `cost` 子对象（与
+    `measuredFeeBps` / `feeDeviationBps` 同族）。本函数是 `costSnapshot` 与落库 `aiStats` 的
+    **同一个**产物，故两条通道必然同形——两种写法不可能同时成立。
 
     Args:
         attribution_stats: `AttributionLedger.stats()` 产物。
         fee_ledger: `FeeLedger` 实例或 `None`（未装配账本的会话 ⇒ 实测键一律缺席）。
+        fee_rates: `FeeRateCache.wire()` 产物（从未取到 ⇒ `None` ⇒ 该顶层键**缺席**）。
+        reconcile: 最近一次对账读数（未跑过 ⇒ `None` ⇒ 该顶层键**缺席**，前端整段隐藏）。
 
     Returns:
         可直接并入 `aiStats` 的纯加法 dict（同一份产物亦作会话内 `costSnapshot`）。
@@ -34,6 +42,11 @@ def build_cost_stats(attribution_stats: dict, fee_ledger) -> dict:
              for key, value in (attribution_stats or {}).items()}
     if fee_ledger is not None and isinstance(stats.get("cost"), dict):
         stats["cost"].update(fee_ledger.audit_stats())
+        stats["cost"]["sessionFeeUsd"] = round(fee_ledger.session_fee_usd, 6)
+    if fee_rates is not None:
+        stats["feeRates"] = fee_rates
+    if reconcile is not None:
+        stats["reconcile"] = reconcile
     return stats
 
 
@@ -100,7 +113,9 @@ def merge_sizing_stats(base: dict, ext: dict) -> dict:
 
 
 def cost_snapshot_wire(round_no: int, attribution_stats: dict, fee_ledger, *,
-                       every: int = _COST_SNAPSHOT_EVERY_ROUNDS) -> dict | None:
+                       every: int = _COST_SNAPSHOT_EVERY_ROUNDS,
+                       fee_rates: dict | None = None,
+                       reconcile: dict | None = None) -> dict | None:
     """L0/L1 通道的节流装配（§5.4）：未到轮次 ⇒ `None`（调用方据此不推事件）。
 
     运维读这份快照的唯一别处路径是会话停止后的 `GET /ai-trade/history/{group_id}`，而 §7.5 的
@@ -108,4 +123,5 @@ def cost_snapshot_wire(round_no: int, attribution_stats: dict, fee_ledger, *,
     """
     if every <= 0 or round_no <= 0 or round_no % every:
         return None
-    return build_cost_stats(attribution_stats, fee_ledger)
+    return build_cost_stats(attribution_stats, fee_ledger, fee_rates=fee_rates,
+                            reconcile=reconcile)

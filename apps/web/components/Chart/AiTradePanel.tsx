@@ -9,6 +9,7 @@ import {
   describeProfitGuardTrail,
   isEffectiveExitCommitted,
 } from "@/lib/aiTrade";
+import { COST_BASIS_HINT, describeCostBasis } from "@/lib/aiTradeCost";
 import { colorForReturn, fmtMoney, fmtNum, fmtPct, fmtPrice } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 import type { AiTradeGroupMemberState, ProfitGuardSnapshot } from "@/lib/aiTradeTypes";
@@ -39,6 +40,9 @@ export default function AiTradePanel({
 
   const members = Object.values(group.members);
   const aggregatePnl = members.reduce((sum, m) => sum + (m.session?.sessionPnlUsd ?? 0), 0);
+  // 净额徽标的门控**只认后端下发的口径标记**，绝不据配置或猜测推断：口径是会话级静态量，
+  // 前端说「已扣手续费」而后端其实是毛额，比不显示徽标危险得多。
+  const netBasis = members.some((m) => m.position?.costAwareness?.netBasis === true);
   const stopped = group.state === "stopped" || members.every((m) => m.session?.state === "stopped");
 
   return (
@@ -51,15 +55,26 @@ export default function AiTradePanel({
             <span className="text-[10px] text-[var(--muted)]">{members.length} 个标的</span>
           )}
         </div>
-        <span
-          className={
-            aggregatePnl >= 0
-              ? "tabular text-xs font-medium text-[var(--long)]"
-              : "tabular text-xs font-medium text-[var(--short)]"
-          }
-        >
-          {aggregatePnl >= 0 ? "+" : ""}
-          {fmtMoney(aggregatePnl)}
+        <span className="flex items-center gap-1.5">
+          {netBasis && (
+            <span
+              title={COST_BASIS_HINT}
+              data-testid="ai-trade-net-basis"
+              className="rounded border border-[var(--border)] px-1 py-px text-[9px] text-[var(--muted)]"
+            >
+              {describeCostBasis("net")}
+            </span>
+          )}
+          <span
+            className={
+              aggregatePnl >= 0
+                ? "tabular text-xs font-medium text-[var(--long)]"
+                : "tabular text-xs font-medium text-[var(--short)]"
+            }
+          >
+            {aggregatePnl >= 0 ? "+" : ""}
+            {fmtMoney(aggregatePnl)}
+          </span>
         </span>
       </div>
 
@@ -134,6 +149,7 @@ function MemberRow({
             当前挂单 {fmtPrice(resting.px)} · {fmtNum(resting.sz, 0)} 张 · 剩余 {resting.expiresInS}s
           </span>
         )}
+        <BreakEvenRow member={member} />
         <ProfitGuardRow guard={guard} />
         <ProfitGuardCooldownChip member={member} />
       </span>
@@ -151,6 +167,29 @@ function MemberRow({
         )}
       </span>
     </button>
+  );
+}
+
+/**
+ * 盈亏平衡价行（ai-trade-cost-truth-and-net-pnl §3.5 F-4）。
+ *
+ * 只在**确实还持仓**且后端下发了成本证据时显示。平衡价**与杠杆无关**（杠杆只放大保证金收益率，
+ * 不改变回本所需的价格距离）——这正是用户最容易算错的一处，故它必须由后端算好下发，前端不重算。
+ */
+function BreakEvenRow({ member }: { member: AiTradeGroupMemberState }) {
+  // 门控与 ProfitGuardRow 逐字同款：`member.position` 在平仓后不会被清空（后端无仓时不发事件、
+  // store 也无复位路径），只判快照存在会在空仓后继续显示一条已不存在持仓的平衡价。
+  const positionSide = member.session?.positionSide ?? "flat";
+  const cost = positionSide !== "flat" ? member.position?.costAwareness : null;
+  if (!cost || cost.breakEvenPx == null) return null;
+  const gap = cost.breakEvenGapPct;
+  return (
+    <span className="tabular truncate text-[10px] text-[var(--muted)]" data-testid="ai-break-even">
+      盈亏平衡价 {fmtPrice(cost.breakEvenPx)}
+      {gap == null ? "" : gap <= 0 ? "（已覆盖成本）" : `（还差 ${(gap * 100).toFixed(3)}%）`}
+      {" ｜ 往返成本 "}
+      {cost.roundTripBps} bps
+    </span>
   );
 }
 

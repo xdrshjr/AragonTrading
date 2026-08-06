@@ -402,6 +402,8 @@ describe("AutoTradeRoundTripRow bar-gated inline K-line (zero regression)", () =
       exit: trade({ id: 2, ts: NOW_SEC - 600, side: "close", price: 110, pnl: 12 }),
       pnlUsd: 12,
       pnlPct: 0.36,
+      feeUsd: 0,
+      grossPnlUsd: 12,
       openedTs: NOW_SEC - 700,
       closedTs: NOW_SEC - 600,
       isWin: true,
@@ -452,18 +454,109 @@ function wakeAttributedTrades(): Trade[] {
   ]);
 }
 
-function makeDetail(metrics: AiTradeHistoryDetailOut["members"][number]["metrics"]): AiTradeHistoryDetailOut {
+function makeDetail(
+  metrics: AiTradeHistoryDetailOut["members"][number]["metrics"],
+  over: Partial<AiTradeHistoryDetailOut> = {},
+): AiTradeHistoryDetailOut {
   return {
     groupId: "g1", strategyName: "动量", bar: "1H",
     startedTs: NOW_SEC - DAY, endedTs: NOW_SEC, status: "stopped", totalBudgetUsd: 100,
-    members: [{
+    ...over,
+    members: over.members ?? [{
       runId: 1, instId: "BTC-USDT-SWAP", leverage: 3, budgetUsd: 100, allocationPct: 100,
-      strategyNames: ["动量"], status: "stopped", metrics,
+      strategyNames: ["动量"], status: "stopped", costBasis: "net", metrics,
       trades: [
         trade({ id: 1, ts: NOW_SEC - 700, side: "long", price: 100 }),
         trade({ id: 2, ts: NOW_SEC - 600, side: "close", price: 110, pnl: 12 }),
       ],
     }],
-    summary: { realizedPnlUsd: 12, returnPct: 0.12, tradeCount: 1, winRate: 1, bestUsd: 12, worstUsd: 0 },
+    summary: over.summary
+      ?? { realizedPnlUsd: 12, returnPct: 0.12, tradeCount: 1, winRate: 1, bestUsd: 12, worstUsd: 0 },
   };
 }
+
+// ---------- 成本真值化与净额盈亏（ai-trade-cost-truth-and-net-pnl §3.5 F-3）----------
+// **渲染断言**（不是 grep 到类型声明）：本仓库的 store 存在「逐键手抄 WS payload」的写法，只确认
+// 类型里声明了新键会让验收门禁空转——两个新键必须真的到达组件并被画出来（放行条件 #4）。
+describe("AiTradeStatsDetail cost readings", () => {
+  function renderDetail(detail: AiTradeHistoryDetailOut) {
+    listMock.mockResolvedValue(HISTORY_LIST);
+    detailMock.mockResolvedValue(detail);
+    renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: "历史" }));
+    return screen.findByRole("button", { name: /BTC-USDT-SWAP/ }).then((card) => {
+      fireEvent.click(card);
+    });
+  }
+
+  it("renders the fee / gross / share KPIs when the backend sends them", async () => {
+    await renderDetail(makeDetail({}, {
+      summary: {
+        realizedPnlUsd: 8, returnPct: 0.08, tradeCount: 1, winRate: 1, bestUsd: 8, worstUsd: 0,
+        feeUsd: 4, grossPnlUsd: 12,
+      },
+    }));
+    const kpis = await screen.findByTestId("ai-cost-kpis");
+    expect(within(kpis).getByText("已付手续费（USDT）")).toBeInTheDocument();
+    expect(within(kpis).getByText("4.00")).toBeInTheDocument();
+    expect(within(kpis).getByText("+12.00")).toBeInTheDocument();      // 毛额盈亏
+    expect(within(kpis).getByText("33.33%")).toBeInTheDocument();      // 成本占毛利比 4/12
+    expect(within(kpis).getByText("净额（已扣手续费）")).toBeInTheDocument();
+  });
+
+  it("hides the cost KPIs entirely for legacy records without the keys", async () => {
+    await renderDetail(makeDetail({}));
+    expect(await screen.findByText(/已实现总收益/)).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-cost-kpis")).not.toBeInTheDocument();
+  });
+
+  it("marks an ASSUMED basis differently from a known one", async () => {
+    await renderDetail(makeDetail({}, {
+      costBasisAssumed: true,
+      summary: {
+        realizedPnlUsd: 8, returnPct: 0.08, tradeCount: 1, winRate: 1, bestUsd: 8, worstUsd: 0,
+        feeUsd: 4, grossPnlUsd: 12,
+      },
+    }));
+    const kpis = await screen.findByTestId("ai-cost-kpis");
+    expect(within(kpis).getByText("净额（推定）")).toBeInTheDocument();
+  });
+
+  it("renders the exchange reconciliation card from metrics.aiStats.reconcile", async () => {
+    await renderDetail(makeDetail({
+      aiStats: {
+        decisionRounds: 3, actionCounts: { hold: 3 }, holdRate: 1, avgConfidence: 0.5,
+        degradedRounds: 0,
+        reconcile: {
+          status: "ok", samples: 7, localTrips: 7, final: false, coverageMismatch: false,
+          localNetUsd: -8.42, diffUsd: -0.12, diffRatio: 0.0145,
+          exchangeRealizedUsd: -8.55, exchangeComparableUsd: -8.3,
+          exchangeFeeUsd: 21.4, exchangeFundingFeeUsd: 1.2, exchangeLiqPenaltyUsd: 0,
+          identityHolds: true, identityMaxGapUsd: 0.000004, windowStartTs: NOW_SEC - DAY,
+        },
+        feeRates: {
+          makerBps: 1.5, takerBps: 4, level: "Lv1", ruleType: "normal", source: "exchange",
+          rebate: false, ageS: 12, stale: false, makerBpsRaw: 1.5, takerBpsRaw: 4,
+        },
+      },
+    }));
+    const card = await screen.findByTestId("ai-reconcile-card");
+    expect(within(card).getByText("已对上")).toBeInTheDocument();
+    expect(within(card).getByText(/-0.12 USDT/)).toBeInTheDocument();
+    expect(within(card).getByText("21.40")).toBeInTheDocument();       // 交易所手续费
+    expect(within(card).getByText("1.20")).toBeInTheDocument();        // 交易所资金费
+    expect(within(card).getByText(/交易所口径自检通过/)).toBeInTheDocument();
+    expect(within(card).getByText(/交易所官方档位 Lv1/)).toBeInTheDocument();
+  });
+
+  it("hides the reconciliation card when the reading is absent", async () => {
+    await renderDetail(makeDetail({
+      aiStats: {
+        decisionRounds: 3, actionCounts: { hold: 3 }, holdRate: 1, avgConfidence: 0.5,
+        degradedRounds: 0,
+      },
+    }));
+    expect(await screen.findByText(/已实现总收益/)).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-reconcile-card")).not.toBeInTheDocument();
+  });
+});

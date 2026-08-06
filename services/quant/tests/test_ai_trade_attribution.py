@@ -117,6 +117,8 @@ def test_merge_raises_on_key_clash_instead_of_silently_overwriting():
 
 def test_build_cost_stats_folds_in_fee_ledger_audit_readings():
     class _Ledger:
+        session_fee_usd = 12.34        # cost-truth §5.4：会话累计已付手续费，与实测键同族挂 `cost`
+
         @staticmethod
         def audit_stats():
             return {"measuredFeeBps": 5.4, "feeDeviationBps": 0.4, "slipBps": 1.9,
@@ -125,6 +127,7 @@ def test_build_cost_stats_folds_in_fee_ledger_audit_readings():
     stats = build_cost_stats(AttributionLedger().stats(), _Ledger())
     assert stats["cost"]["measuredFeeBps"] == 5.4
     assert stats["cost"]["feeAuditSamples"] == 24
+    assert stats["cost"]["sessionFeeUsd"] == 12.34
     # 账本缺席（未装配的会话）⇒ 实测键一律不出现，其余读数照常。
     assert "measuredFeeBps" not in build_cost_stats(AttributionLedger().stats(), None)["cost"]
 

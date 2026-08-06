@@ -195,6 +195,10 @@ def edge_gate_event(round_no: int, ts: int, wire: dict,
 
     与 `base_rule_event` 的理由逐字相同：**每轮都发一条**（`k_min > 0` 时）——静默的保守会被用户
     当成故障。`costSnapshot` 是纯加法只读键（§5.4 的会话内观测通道），前端未识别即忽略。
+
+    cost-truth-and-net-pnl P1-1：`costSnapshot` 自 `CostRuntime.snapshot()` 直出，故轴 A 的
+    `feeRates` 与轴 C 的 `reconcile` 两个**顶层**加法键随该快照一并到达，本函数无需逐键搬运
+    ——`build_cost_stats` 是这两条通道（trace / 落库 aiStats）的同一个产物，形状必然一致。
     """
     return trace_event("edge_gate", round_no, ts, costSnapshot=cost_snapshot, **wire)
 

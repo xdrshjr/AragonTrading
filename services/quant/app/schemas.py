@@ -899,6 +899,12 @@ class AiTradeHistoryEntry(BaseModel):
     winRate: float
     bestUsd: float
     worstUsd: float
+    # 成本口径三键（cost-truth-and-net-pnl §5.6，纯加法可选）：realizedPnlUsd 已是**净额**，
+    # feeUsd 是同窗口的已付手续费，grossPnlUsd 是毛额还原——三者并列才能让「数字为什么下移」
+    # 被逐笔解释；costBasisMixed 说明该组跨 run 出现了两种口径。
+    feeUsd: float = 0.0
+    grossPnlUsd: float = 0.0
+    costBasisMixed: bool = False
 
 
 class AiTradeHistoryListOut(BaseModel):
@@ -922,11 +928,16 @@ class AiTradeHistorySummary(BaseModel):
     # 利润捕获率五键（adaptive §2.4.3）：分母 peakPnlUsd **不含**手续费、分子 capturedPnlUsd **含**，
     # 故小额往返会系统性偏低；capturePairs / noPeakCount 是样本诚实性（peak ≤0 或缺失不进分母）。
     # 老会话（老库缺列 / 保护层未装配）全为 0，前端据 capturePairs 显示「样本不足」。
+    # v2（cost-truth P1-3）：分子分母**同为毛额**（均不含手续费），比值维度自洽且不随净额总闸变化；
+    # 手续费口径请看同级 feeUsd / realizedPnlUsd（后者已是净额）。
     peakPnlUsd: float = 0.0
     capturedPnlUsd: float = 0.0
     captureRatio: float = 0.0
     capturePairs: int = 0
     noPeakCount: int = 0
+    feeUsd: float = 0.0
+    grossPnlUsd: float = 0.0
+    costBasisMixed: bool = False
 
 
 class AiTradeHistoryMember(BaseModel):
@@ -944,6 +955,7 @@ class AiTradeHistoryMember(BaseModel):
     allocationPct: float
     strategyNames: list[str] = Field(default_factory=list)
     status: str
+    costBasis: str = "gross"        # 该成员 run 的盈亏口径（"net" 已扣双边手续费）
     metrics: dict[str, Any] = Field(default_factory=dict)
     trades: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -958,6 +970,9 @@ class AiTradeHistoryDetailOut(BaseModel):
     endedTs: int
     status: str
     totalBudgetUsd: float
+    # 口径是否为**推定**（cost-truth P0-3）：老 run 的 config_json 缺 costBasis 时按
+    # ai_trade_history_legacy_cost_basis 推定，UI 必须把「推定」与「已知」分开显示。
+    costBasisAssumed: bool = False
     members: list[AiTradeHistoryMember]
     summary: AiTradeHistorySummary
 

@@ -117,6 +117,11 @@ def _make_session(*, action="hold", size=0.5, run_id=1, stop_loss_usd=None,
         return []
 
     session._window._safe_get_candles = no_htf_data
+    # 脱网守门（cost-truth-and-net-pnl I-1）：轴 A / 轴 C 的两条签名私有 GET 由 `CostRuntime` 在
+    # 盯市 tick 的后台任务里发起。直接构造会话的用例带的是**假凭证**，不桩掉就会真的打 OKX——
+    # 本文件承诺的是脱网单测，且真实往返会让每个 tick 多花数秒。
+    session._cost._fetch_fee_rate = _no_trade_fee
+    session._cost._fetch_position_history = _no_position_history
     return session, calls, pos_state
 
 
@@ -445,6 +450,11 @@ def _make_reflect_session(*, action="open_long", size=0.5, verdict="confirm",
         return []
 
     session._window._safe_get_candles = no_htf_data
+    # 脱网守门（cost-truth-and-net-pnl I-1）：轴 A / 轴 C 的两条签名私有 GET 由 `CostRuntime` 在
+    # 盯市 tick 的后台任务里发起。直接构造会话的用例带的是**假凭证**，不桩掉就会真的打 OKX——
+    # 本文件承诺的是脱网单测，且真实往返会让每个 tick 多花数秒。
+    session._cost._fetch_fee_rate = _no_trade_fee
+    session._cost._fetch_position_history = _no_position_history
     return session, calls, llm
 
 
@@ -1371,3 +1381,13 @@ async def test_session_commitment_resets_on_reopen_same_side():
         assert session._guard.committed_exit_px is None
     finally:
         await dispose_engine()
+
+
+async def _no_trade_fee(_inst_id):
+    """费率取数桩：恒不可用 ⇒ 回落配置常数（与本文件既有断言的费率口径一致）。"""
+    return None
+
+
+async def _no_position_history():
+    """持仓历史取数桩：恒空 ⇒ 对账 status="unavailable"，绝不触网。"""
+    return []

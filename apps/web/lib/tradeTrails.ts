@@ -26,6 +26,16 @@ export function buildTradeTrailSegments(trades: Trade[]): TradeTrailSegment[] {
   return buildPairedTrails(trades).map((item) => item.segment);
 }
 
+/**
+ * 因果序的只读导出（ai-trade-cost-truth-and-net-pnl §3.5 F-2）。
+ *
+ * 存在的唯一理由：往返的**腿费归集**必须与配对钉死**同一个**排序键，否则费用会串窗（P2-4）。
+ * 由本模块导出而不是让调用方各自重排，是为了不产生第二份「因果序」的定义。
+ */
+export function causalOrderedTrades(trades: Trade[]): Trade[] {
+  return causalOrderTrades(trades).map((item) => item.trade);
+}
+
 export function buildTradeMarkerEvents(trades: Trade[]): TradeMarkerEvent[] {
   const pairByIndex = new Map<number, PairedTrail>();
   for (const pair of buildPairedTrails(trades)) {

@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import json
 from collections import defaultdict
+from dataclasses import dataclass
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..config import get_settings
 from .models import StrategyRun, Trade
 
 _AI_TRADE_MODE = "ai-trade"
@@ -47,7 +49,29 @@ def _num(value: object) -> float:
     return out if out == out and out not in (float("inf"), float("-inf")) else 0.0
 
 
-def _pair_round_trips(trades: list[Trade]) -> list[tuple[Trade, Trade]]:
+@dataclass(frozen=True)
+class _Trip:
+    """一笔完整往返（含腿费与所属 run 的口径标记，cost-truth §3.2 B-5）。"""
+
+    entry: Trade
+    exit: Trade
+    leg_fee_usd: float      # Σ 上一笔平仓之后至本笔平仓（含）的**全部**腿 fee
+    cost_basis: str         # 所属 run 的 costBasis（"net" | "gross"）
+
+    @property
+    def net_pnl(self) -> float:
+        """净额（已扣双边手续费）：`"gross"` 的 run 按 `pnl − legFee` 还原。"""
+        pnl = self.exit.pnl or 0.0
+        return pnl if self.cost_basis == "net" else pnl - self.leg_fee_usd
+
+    @property
+    def gross_pnl(self) -> float:
+        """毛额还原（净额行加回腿费）——捕获率分子必须与毛额分母同口径（P1-3）。"""
+        pnl = self.exit.pnl or 0.0
+        return pnl + self.leg_fee_usd if self.cost_basis == "net" else pnl
+
+
+def _pair_round_trips(trades: list[Trade], cost_basis: str = "gross") -> list[_Trip]:
     """逐字移植前端 buildPairedTrails：按**因果序**（id 升序 = 落库序）单持仓 open→close 配对。
 
     side ∈ {long, short} 记为开仓；其余（close）在有未配对开仓时成对，孤儿平仓 / 悬挂开仓丢弃。
@@ -59,27 +83,43 @@ def _pair_round_trips(trades: list[Trade]) -> list[tuple[Trade, Trade]]:
     即真实发生顺序，实测生产库按 id 配对 161 笔平仓零孤儿。仅本函数改排序键：
     ``_load_trades_by_run`` 的 SQL 仍按 (ts, id) 升序，故 ``_aggregate_group`` 的 endedTs 与
     ``_group_started_ts`` 的「首元素 == 最早 ts」语义原样成立。
+
+    **腿费按区间累计**（B-5）：一笔往返的费用 = 自上一笔平仓（不含）起、到本笔平仓（含）止的
+    **全部**成交腿 fee 之和。按「配对的那条开仓腿的 fee」计是错的——部分成交会产生多条开仓腿而
+    本函数只保留最后一条，会漏记先前分批的费用。腿费累计与配对必须钉死**同一个**排序键（P2-4），
+    否则费用会串窗。
     """
-    pairs: list[tuple[Trade, Trade]] = []
+    trips: list[_Trip] = []
     open_trade: Trade | None = None
+    leg_fee = 0.0
     for t in sorted(trades, key=lambda x: x.id or 0):
+        leg_fee += float(getattr(t, "fee", 0.0) or 0.0)
         if t.side in ("long", "short"):
             open_trade = t
         elif open_trade is not None:
-            pairs.append((open_trade, t))
+            trips.append(_Trip(open_trade, t, leg_fee, cost_basis))
             open_trade = None
-    return pairs
+            leg_fee = 0.0
+    return trips
 
 
-def _summarize_pairs(pairs: list[tuple[Trade, Trade]], total_budget_usd: float) -> dict:
-    """汇总往返（口径同前端 summarizeRoundTrips）：realized=Σexit.pnl、winRate、best/worst（无样本 0）。
+def _summarize_pairs(trips: list[_Trip], total_budget_usd: float) -> dict:
+    """汇总往返（口径同前端 summarizeRoundTrips）：realized/winRate/best/worst 走**净额**。
 
     另出**利润捕获率**五键（ai-trade-profit-protection-adaptive §2.4.3，口径同前端
     ``summarizeProfitCapture`` 且公式逐字对应）：``captureRatio = Σrealized / Σpeak``，只统计
     ``peak > 0`` 的往返；``peak`` 缺失（保护层未装配 / 老库缺列）或 ≤0（全程未浮盈）的往返计入
     ``noPeakCount`` 单列，**不进分母**——把它们按 0 计入会让捕获率变成 0 或 ∞。
+
+    **捕获率五键必须整体留在毛额口径**（cost-truth P1-3）：分母 ``peakPnlUsd`` 来自
+    ``trades.peak_pnl``，而该列由利润保护层按**本地派生毛浮盈**落库（``profit_guard.py`` 自算一份，
+    不经 ``unrealized_usd``），本轮有意不动它。若分子换成净额而分母仍是毛额，比值会系统性下移一个
+    往返成本，且**老会话的历史 ``captureRatio`` 会被追溯改小**——那是用一个正确的修复打坏另一个
+    已发布的 KPI。故 ``capturedPnlUsd`` 恒取 ``trip.gross_pnl``，与分母同维（G-14 双向断言）。
     """
     realized = 0.0
+    gross_total = 0.0
+    fee_total = 0.0
     wins = 0
     best = 0.0
     worst = 0.0
@@ -87,23 +127,25 @@ def _summarize_pairs(pairs: list[tuple[Trade, Trade]], total_budget_usd: float) 
     captured_total = 0.0
     capture_pairs = 0
     no_peak = 0
-    for _entry, exit_trade in pairs:
-        pnl = exit_trade.pnl or 0.0
+    for trip in trips:
+        pnl = trip.net_pnl
         realized += pnl
+        gross_total += trip.gross_pnl
+        fee_total += trip.leg_fee_usd
         if pnl > 0:
             wins += 1
         if pnl > best:
             best = pnl
         if pnl < worst:
             worst = pnl
-        peak = getattr(exit_trade, "peak_pnl", None)   # 老库缺列读到 None 而非 AttributeError
+        peak = getattr(trip.exit, "peak_pnl", None)   # 老库缺列读到 None 而非 AttributeError
         if peak is not None and peak > 0:
             peak_total += float(peak)
-            captured_total += pnl
+            captured_total += trip.gross_pnl          # 分子分母同为毛额（P1-3）
             capture_pairs += 1
         else:
             no_peak += 1
-    count = len(pairs)
+    count = len(trips)
     return {
         "realizedPnlUsd": realized,
         "returnPct": realized / total_budget_usd if total_budget_usd > 0 else 0.0,
@@ -111,12 +153,31 @@ def _summarize_pairs(pairs: list[tuple[Trade, Trade]], total_budget_usd: float) 
         "winRate": wins / count if count > 0 else 0.0,
         "bestUsd": best,
         "worstUsd": worst,
+        "feeUsd": fee_total,
+        "grossPnlUsd": gross_total,
+        "costBasisMixed": len({t.cost_basis for t in trips}) > 1,
         "peakPnlUsd": peak_total,
         "capturedPnlUsd": captured_total,
         "captureRatio": captured_total / peak_total if peak_total > 0 else 0.0,
         "capturePairs": capture_pairs,
         "noPeakCount": no_peak,
     }
+
+
+def _run_cost_basis(cfg: dict) -> tuple[str, bool]:
+    """该 run 的盈亏口径与「是否为推定」（cost-truth P0-3）。
+
+    ``config_json`` 里有 ``costBasis`` 即为**已知**；缺键的老 run 走
+    ``ai_trade_history_legacy_cost_basis`` **推定**（默认 ``"gross"``，对出厂配置正确）。已按阶段一
+    §7.5 runbook 提前打开 ``ai_trade_net_pnl_enabled`` 的部署必须把它置 ``"net"``，否则那批**已是
+    净额**的历史行会被聚合层二次扣费——与本轮要修的缺陷同量级、方向相反。UI 必须把「推定」与
+    「已知」分开显示，故第二个返回值恒随回执下发。
+    """
+    basis = cfg.get("costBasis")
+    if basis in ("net", "gross"):
+        return basis, False
+    legacy = str(get_settings().ai_trade_history_legacy_cost_basis or "gross")
+    return ("net" if legacy == "net" else "gross"), True
 
 
 def _resolve_total_budget(runs: list[StrategyRun]) -> float:
@@ -174,11 +235,14 @@ def _group_started_ts(runs: list[StrategyRun], trades_by_run: dict[int, list[Tra
 def _aggregate_group(runs: list[StrategyRun], trades_by_run: dict[int, list[Trade]]) -> dict:
     """把一个 group 的成员 runs + 成交聚合为共享字段（列表 / 详情共用；逐成员配对不跨标的）。"""
     total_budget = _resolve_total_budget(runs)
-    all_pairs: list[tuple[Trade, Trade]] = []
+    all_pairs: list[_Trip] = []
     end_candidates: list[int] = []
+    assumed = False
     for run in runs:
         member_trades = trades_by_run.get(run.id, [])
-        all_pairs.extend(_pair_round_trips(member_trades))
+        basis, basis_assumed = _run_cost_basis(_load_config(run.config_json))
+        assumed = assumed or basis_assumed
+        all_pairs.extend(_pair_round_trips(member_trades, basis))
         if run.end_ts:
             end_candidates.append(int(run.end_ts))
         if member_trades:
@@ -192,6 +256,7 @@ def _aggregate_group(runs: list[StrategyRun], trades_by_run: dict[int, list[Trad
         "endedTs": max(end_candidates) if end_candidates else started_ts,
         "status": _group_status(runs),
         "totalBudgetUsd": total_budget,
+        "costBasisAssumed": assumed,
         "summary": _summarize_pairs(all_pairs, total_budget),
     }
 
@@ -267,6 +332,7 @@ async def get_ai_trade_group_detail(session: AsyncSession, group_id: str) -> dic
             "leverage": _num(cfg.get("leverage")), "budgetUsd": _num(cfg.get("budgetUsd")),
             "allocationPct": _num(cfg.get("allocationPct")),
             "strategyNames": _config_strategy_names(cfg), "status": run.status,
+            "costBasis": _run_cost_basis(cfg)[0],   # 该成员 run 的盈亏口径（推定与否见组级标记）
             "metrics": _load_config(run.metrics_json),
             "trades": trades_by_run.get(run.id, []),
         })
@@ -274,7 +340,8 @@ async def get_ai_trade_group_detail(session: AsyncSession, group_id: str) -> dic
     return {
         "groupId": group_id, "strategyName": agg["strategyName"], "bar": agg["bar"],
         "startedTs": agg["startedTs"], "endedTs": agg["endedTs"], "status": agg["status"],
-        "totalBudgetUsd": agg["totalBudgetUsd"], "members": members, "summary": agg["summary"],
+        "totalBudgetUsd": agg["totalBudgetUsd"], "costBasisAssumed": agg["costBasisAssumed"],
+        "members": members, "summary": agg["summary"],
     }
 
 

@@ -188,6 +188,47 @@ class OKXTradeClient(OKXPrivateClient):
             params["instId"] = inst_id
         return await self._get("/api/v5/trade/fills", params)
 
+    async def get_trade_fee(self, inst_type: str, inst_id: str | None = None) -> dict:
+        """``GET /api/v5/account/trade-fee``：本账户在该合约上的**真实**费率档位（签名 GET）。
+
+        关键回读字段：``level``（如 ``Lv1``）/ ``ruleType``/ ``maker``/``taker``（币本位与现货）/
+        ``makerU``/``takerU``（USDT 保证金合约）/ ``makerUSDC``/``takerUSDC``。费率为**有符号字符串**，
+        负数 = 平台收取、正数 = 返佣（归一与夹紧在服务层 ``_normalize_trade_fee``）。
+
+        Args:
+            inst_type: 产品类型（本项目恒 ``"SWAP"``）。
+            inst_id: 合约 ID（可选；不传即取该 instType 的账户通用档位）。
+
+        Returns:
+            ``data[0]``；OKX 回空数组时为 ``{}``。
+        """
+        params: dict[str, str] = {"instType": inst_type}
+        if inst_id:
+            params["instId"] = inst_id
+        rows = await self._get("/api/v5/account/trade-fee", params)
+        return rows[0] if rows else {}
+
+    async def get_position_history(self, inst_type: str, inst_id: str | None = None, *,
+                                   limit: int = 50, after_ms: int | None = None) -> list:
+        """``GET /api/v5/account/positions-history``：交易所侧**已结算持仓**的权威盈亏（签名 GET）。
+
+        关键回读字段：``posId``/``instId``/``direction``/``openAvgPx``/``closeAvgPx``/``cTime``/
+        ``uTime``/``pnl``/``fee``/``fundingFee``/``liqPenalty``/``realizedPnl``。后四项按 OKX 口径
+        「负数 = 支出」，符号归一在服务层。覆盖最近 3 个月。
+
+        Args:
+            inst_type: 产品类型（本项目恒 ``"SWAP"``）。
+            inst_id: 合约 ID（可选）。
+            limit: 单页条数（OKX 上限 100）。
+            after_ms: 只取 ``uTime`` 晚于该毫秒时间戳的记录（可选）。
+        """
+        params: dict[str, str] = {"instType": inst_type, "limit": str(min(int(limit), 100))}
+        if inst_id:
+            params["instId"] = inst_id
+        if after_ms:
+            params["after"] = str(int(after_ms))
+        return await self._get("/api/v5/account/positions-history", params)
+
     async def get_pending_orders(self, inst_id: str | None = None) -> list:
         """``GET /api/v5/trade/orders-pending``：当前未成交挂单（签名 GET）。"""
         params: dict[str, str] = {}

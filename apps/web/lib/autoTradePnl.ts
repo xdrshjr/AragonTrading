@@ -4,7 +4,7 @@
 // （复用 tradeTrails 的因果配对），按时间窗口筛选并汇总总收益 / 总收益率 / 胜率 / 最佳最差。
 // `nowSec` 由调用方注入，便于单测与时区一致性。
 
-import { buildTradeTrailSegments } from "./tradeTrails";
+import { buildTradeTrailSegments, causalOrderedTrades } from "./tradeTrails";
 import type { Trade } from "./types";
 
 export type AutoTradeRange = "today" | "7d" | "30d" | "all" | "custom";
@@ -14,12 +14,18 @@ export interface RoundTrip {
   direction: "long" | "short";
   entry: Trade;
   exit: Trade;
-  pnlUsd: number; // = exit.pnl（后端真实已实现）
+  pnlUsd: number; // **净额**（已扣双边手续费）；costBasis="gross" 时由 exit.pnl − feeUsd 还原
   pnlPct: number | null; // = exit.pnlPct ?? 回退派生（见 derivePct）
+  feeUsd: number; // 该往返的全部成交腿手续费之和（cost-truth §3.2 B-5）
+  grossPnlUsd: number; // 毛额（不含手续费）——与 pnlUsd 并列才能逐笔解释「数字为什么下移」
   openedTs: number; // entry.ts
   closedTs: number; // exit.ts（用于时间窗口筛选 + 排序）
   isWin: boolean; // pnlUsd > 0
 }
+
+// 一笔往返的口径：`"net"` = exit.pnl 已扣双边手续费（AI 会话 costBasis="net"）；
+// `"gross"` = 未扣，需减去腿费还原。
+export type RoundTripCostBasis = "net" | "gross";
 
 // 秒级 UTC 闭区间 [startTs, endTs]。
 export interface RangeBounds {
@@ -49,15 +55,24 @@ export interface LedgerMember {
 /**
  * 单个标的成交流 → 完整交易往返。复用 buildTradeTrailSegments 的因果配对（按落库/到达序、单持仓配对）；
  * seeded（历史预热）成交在配对前过滤——非真实成交不计入收益（当前 live-auto 无 seeded，前瞻保护）。
+ *
+ * `opts.costBasis`（末位可选，默认 `"gross"`，cost-truth §3.5 F-2）：**非 AI 调用点逐字节不变**——
+ * live-auto（非 AI）成交的 `fee` 恒为 `0.0`（账本只由 ai_auto 注入），减零即恒等。这是结构性保证，
+ * 不是靠默认值碰巧成立。
  */
 export function buildRoundTrips(
   instId: string,
   trades: Trade[],
   leverage: number,
+  opts?: { costBasis?: RoundTripCostBasis },
 ): RoundTrip[] {
   const real = trades.filter((t) => !t.seeded);
+  const basis = opts?.costBasis ?? "gross";
+  const fees = collectLegFees(real);
   return buildTradeTrailSegments(real).map((seg) => {
-    const pnlUsd = seg.exit.pnl;
+    const feeUsd = fees.get(seg.exit) ?? 0;
+    const raw = seg.exit.pnl;
+    const pnlUsd = basis === "net" ? raw : raw - feeUsd;
     const fallback = derivePct(seg.direction, seg.entry.price, seg.exit.price, leverage);
     return {
       instId,
@@ -66,6 +81,8 @@ export function buildRoundTrips(
       exit: seg.exit,
       pnlUsd,
       pnlPct: seg.exit.pnlPct ?? fallback,
+      feeUsd,
+      grossPnlUsd: basis === "net" ? raw + feeUsd : raw,
       openedTs: seg.entry.ts,
       closedTs: seg.exit.ts,
       isWin: pnlUsd > 0,
@@ -73,9 +90,38 @@ export function buildRoundTrips(
   });
 }
 
+/**
+ * 每笔平仓 → 该往返的腿费之和：自上一笔平仓（不含）起、到本笔平仓（含）止的**全部**成交腿。
+ *
+ * 按「配对的那条开仓腿的 fee」计是错的：部分成交会产生多条开仓腿，而 `buildTradeTrailSegments`
+ * 只保留最后一条并**丢弃**被覆盖的先前开仓腿——那正是这条规则要防的漏记。故归集必须在**过滤后的
+ * 原始数组**上按索引区间累计（与后端 `_pair_round_trips` 在 `sorted(trades, key=id)` 上做的是同一
+ * 件事），再按 exit 对象回填到对应段。
+ */
+function collectLegFees(real: Trade[]): Map<Trade, number> {
+  const out = new Map<Trade, number>();
+  let acc = 0;
+  let hasOpen = false;
+  for (const t of causalOrderedTrades(real)) {
+    acc += t.fee ?? 0;
+    if (t.side === "long" || t.side === "short") {
+      hasOpen = true;
+      continue;
+    }
+    if (!hasOpen) continue; // 孤儿平仓不成对：腿费继续累计（与后端 _pair_round_trips 逐字同构）
+    out.set(t, acc);
+    hasOpen = false;
+    acc = 0;
+  }
+  return out;
+}
+
 /** 跨成员合并为扁平 RoundTrip[]，逐成员配对、绝不跨 instId（R5）。 */
-export function buildLedger(members: LedgerMember[]): RoundTrip[] {
-  return members.flatMap((m) => buildRoundTrips(m.instId, m.trades, m.leverage));
+export function buildLedger(
+  members: LedgerMember[],
+  opts?: { costBasis?: RoundTripCostBasis },
+): RoundTrip[] {
+  return members.flatMap((m) => buildRoundTrips(m.instId, m.trades, m.leverage, opts));
 }
 
 /** 时间窗口 → 秒级闭区间边界。`nowSec` 由调用方注入（不读时钟，可测）。 */

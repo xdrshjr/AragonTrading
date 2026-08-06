@@ -71,11 +71,20 @@ class CostBreakdown:
     confidence: str                     # "ok" | "degraded"
 
 
-def resolve_cost_params(settings) -> CostParams:
-    """实盘世界的成本常数（`ai_trade_*` 前缀，与回测世界的 `default_*` 严格分家，§5.1）。"""
+def resolve_cost_params(settings, *, rates: tuple[float, float] | None = None) -> CostParams:
+    """实盘世界的成本常数（`ai_trade_*` 前缀，与回测世界的 `default_*` 严格分家，§5.1）。
+
+    Args:
+        settings: 全局配置。
+        rates: 官方费率档位 `(maker_bps, taker_bps)`（轴 A）；`None` ⇒ 用配置常数。**记账链
+            （`FeeLedger.params`）与本决策链必须读同一对数字**，否则会出现「prompt 说 8 bps、
+            门禁按 12 bps 判」的信任崩塌（A-6 单一真源约束，G-3 断言）。
+    """
+    maker, taker = rates if rates is not None else (
+        float(settings.ai_trade_maker_fee_bps), float(settings.ai_trade_taker_fee_bps))
     return CostParams(
-        maker_fee_bps=float(settings.ai_trade_maker_fee_bps),
-        taker_fee_bps=float(settings.ai_trade_taker_fee_bps),
+        maker_fee_bps=float(maker),
+        taker_fee_bps=float(taker),
         half_spread_fallback_bps=float(settings.ai_trade_half_spread_fallback_bps),
         impact_bps=float(settings.ai_trade_impact_bps),
         expected_hold_bars=int(settings.ai_trade_cost_expected_hold_bars))
@@ -163,25 +172,52 @@ def cost_wire(cost: CostBreakdown | None) -> dict | None:
             "totalBps": cost.total_bps, "confidence": cost.confidence}
 
 
-def query_for_decision(decision, *, bar_seconds: int, funding, funding_enabled: bool,
-                       half_spread_bps: float | None = None) -> CostQuery:
-    """由本轮决策 + 会话级资金费率快照装配 `CostQuery`（决策轮内零网络 IO 的落点）。
+def query_for_preview(*, ord_type: str, side: str, bar_seconds: int, funding,
+                      funding_enabled: bool, half_spread_bps: float | None = None) -> CostQuery:
+    """由**显式的腿意图与方向**装配 `CostQuery`（决策轮内零网络 IO 的落点）。
+
+    抽出本函数的理由（P0-1）：决策 payload 与系统 prompt 都在**决策尚不存在时**装配，而
+    `query_for_decision` 的第一个必填入参就是 `decision`。把「装配 CostQuery」与「从 decision 取值」
+    拆开，使轴 D 的预览成本与门禁判定共用**同一对**纯核心，不产生第二条估算路径。
 
     Args:
-        decision: 本轮 `TradeDecision`（取 `action` 定方向、`ord_type` 定开仓腿类型）。
+        ord_type: 开仓腿意图（`"market"` / `"limit"`）。
+        side: 资金费率的收 / 付方向（`"long"` / `"short"`）。
         bar_seconds: 执行周期秒数（资金费率结算期数由它与 `expected_hold_bars` 推）。
         funding: `FundingCache.snapshot()` 产物或 None（陈旧 / 未取到 ⇒ None ⇒ degraded）。
         funding_enabled: 资金费率建模总闸。**关闭时传 `0.0` 而非 `None`**——「有意不建模」不是
             「数据缺失」，二者不得混为一谈（§3.5）。
         half_spread_bps: 盘口半价差（本轮无 books5 订阅 ⇒ None ⇒ 回落常数，D-3）。
     """
-    side = "long" if decision.action == "open_long" else "short"
     if not funding_enabled:
-        return CostQuery(ord_type=decision.ord_type, side=side, bar_seconds=bar_seconds,
+        return CostQuery(ord_type=ord_type, side=side, bar_seconds=bar_seconds,
                          half_spread_bps=half_spread_bps, funding_rate=0.0)
     if funding is None:
-        return CostQuery(ord_type=decision.ord_type, side=side, bar_seconds=bar_seconds,
+        return CostQuery(ord_type=ord_type, side=side, bar_seconds=bar_seconds,
                          half_spread_bps=half_spread_bps, funding_rate=None)
-    return CostQuery(ord_type=decision.ord_type, side=side, bar_seconds=bar_seconds,
+    return CostQuery(ord_type=ord_type, side=side, bar_seconds=bar_seconds,
                      half_spread_bps=half_spread_bps, funding_rate=funding.rate,
                      funding_interval_s=funding.interval_s)
+
+
+def query_for_decision(decision, *, bar_seconds: int, funding, funding_enabled: bool,
+                       half_spread_bps: float | None = None) -> CostQuery:
+    """`query_for_preview` 的薄包装：方向与腿类型由本轮 `decision` 取（行为逐字节不变）。"""
+    return query_for_preview(
+        ord_type=decision.ord_type,
+        side="long" if decision.action == "open_long" else "short",
+        bar_seconds=bar_seconds, funding=funding, funding_enabled=funding_enabled,
+        half_spread_bps=half_spread_bps)
+
+
+def break_even_px(entry_px: float, *, side: str, cost_bps: float) -> float | None:
+    """盈亏平衡价 = 开仓价 ×(1 ± cost/1e4)；入参非法 ⇒ `None`。
+
+    **与杠杆无关**：杠杆只放大保证金收益率，不改变回本所需的价格距离。这一点必须写进 prompt 文案，
+    否则模型会用杠杆去「稀释」成本（轴 D · D-2）。
+    """
+    px = _finite(entry_px)
+    cost = _finite(cost_bps)
+    if px is None or px <= 0 or cost is None or side not in ("long", "short"):
+        return None
+    return px * (1.0 + cost / 1e4) if side == "long" else px * (1.0 - cost / 1e4)

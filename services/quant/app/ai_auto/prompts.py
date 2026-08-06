@@ -74,7 +74,8 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
                                  base_rules_text: str = "",
                                  profit_guard_text: str = "",
                                  sizing_text: str = "",
-                                 tactical_bars_text: str = "") -> str:
+                                 tactical_bars_text: str = "",
+                                 cost_text: str = "") -> str:
     """决策者系统 prompt：信号仅供参考 + 分步思维链纪律 + 风险偏好 + 只用真数据 + 收尾必调决策工具。
 
     `position_step_pct`（默认 0.0 → 连续、原文逐字不变、零回归）：当 `>0` 时把决策纪律 #3 的
@@ -101,12 +102,16 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
     仓位与风险层宪章章（`sizing_text.format_sizing_charter` 产物）。紧随利润保护章之后——它约束的是
     **下多大注**，与前两者「在哪开」「何时锁」构成完整的三段式硬约束声明。
 
+    `cost_text`（末位，默认 `""` → 逐字节回退，cost-truth-and-net-pnl D-4）：交易成本宪章章，**置于
+    `sizing_text` 之后**——四段顺序即「在哪开 → 何时锁 → 下多大注 → 每笔要付多少」。
+
     `tactical_bars_text`（末位，默认 `""` → 渲染逐字节不变、零回归，ai-trade-wake-aware-context §2.8）：
     本会话实际注入的战术周期串（`"5m → 1m"`）。非空时在决策纪律 #1 的中线背景子句之后**插入**一句
     择时核对指令——「说的」与「给的」必须是同一批周期，故取值只能来自 `WakeRuntime` 的同一个真源。
     """
-    charter = "".join(f"{text}\n\n"
-                      for text in (base_rules_text, profit_guard_text, sizing_text) if text)
+    charter = "".join(
+        f"{text}\n\n" for text in
+        (base_rules_text, profit_guard_text, sizing_text, cost_text) if text)
     return (
         "你是一名严谨、纪律性极强的加密合约自动交易决策者。你不是聊天助手，也不是信号复读机——你的"
         f"**唯一职责**是在每个决策轮，为标的 {inst_id}（周期 {bar}）做出一个受严格约束的交易决策。"
@@ -516,6 +521,17 @@ def _format_profit_guard(snapshot: dict | None) -> str:
     return format_profit_guard_for_prompt(snapshot)
 
 
+def _format_cost(view: dict | None) -> str:
+    """每轮交易成本段；`payload["costAwareness"]` **键缺失** ⇒ 空串 ⇒ 整段省略（逐字节回退）。
+
+    渲染委托 `cost_text` 纯核心——写给模型看的 bps 与门禁真正据以判定的 bps 必须是同一个数（A-6）。
+    """
+    if not view:
+        return ""
+    from .cost_text import format_cost_for_prompt   # 延迟导入，同 _format_base_rules
+    return format_cost_for_prompt(view)
+
+
 def _format_profit_cooldown(cooldown: dict | None) -> str:
     """保护性平仓冷却段（ai-trade-profit-protection-adaptive §2.2.3）。
 
@@ -576,6 +592,9 @@ def build_decision_prompt(payload: dict) -> str:
     sizing_line = _format_sizing(payload.get("sizingPlan"))
     if sizing_line:                          # 键缺失 ⇒ 整段省略（规则未装配 / 回测 payload 无此键）
         parts.append(sizing_line)
+    cost_line = _format_cost(payload.get("costAwareness"))
+    if cost_line:                            # 成本**先于**盈亏：模型要先知道成本才能正确解读那个数字
+        parts.append(cost_line)
     parts.append(
         f"会话累计盈亏≈{payload.get('sessionPnlUsd')} USDT / 预算 {payload.get('budgetUsd')} USDT；"
         f"会话止盈阈值={'不触发' if tp is None else tp}，止损阈值={'不触发' if sl is None else sl}")

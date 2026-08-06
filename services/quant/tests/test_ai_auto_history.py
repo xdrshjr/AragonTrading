@@ -14,6 +14,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, or_, select
 
 from app.ai_auto.session import _compute_ai_stats, _digest_decisions, _downsample_equity
+from app.config import Settings
 from app.db import repositories as repo
 from app.db.ai_auto_repositories import (
     get_ai_trade_group_detail,
@@ -329,17 +330,18 @@ async def test_history_endpoints() -> None:
 # ============ F4 利润捕获率聚合（ai-trade-profit-protection-adaptive §2.4.3）============
 def test_capture_ratio_only_counts_pairs_with_a_positive_peak():
     """口径：`captureRatio = Σrealized / Σpeak`，仅 `peak > 0` 的往返入分母；缺失 / ≤0 单列计数。"""
-    from app.db.ai_auto_repositories import _summarize_pairs
+    from app.db.ai_auto_repositories import _summarize_pairs, _Trip
 
     class _T:
         def __init__(self, side, pnl=0.0, peak_pnl=None, tid=0):
             self.side, self.pnl, self.peak_pnl, self.id = side, pnl, peak_pnl, tid
 
+    # 零腿费 + basis="gross" ⇒ net_pnl / gross_pnl 皆等于 exit.pnl，故本组既有断言逐字不变。
     pairs = [
-        (_T("long", tid=1), _T("close", pnl=0.6, peak_pnl=1.0, tid=2)),    # 捕获 60%
-        (_T("long", tid=3), _T("close", pnl=0.9, peak_pnl=1.0, tid=4)),    # 捕获 90%
-        (_T("long", tid=5), _T("close", pnl=-0.2, peak_pnl=None, tid=6)),  # 无峰值：不入分母
-        (_T("long", tid=7), _T("close", pnl=-0.3, peak_pnl=0.0, tid=8)),   # 峰值 ≤0：不入分母
+        _Trip(_T("long", tid=1), _T("close", pnl=0.6, peak_pnl=1.0, tid=2), 0.0, "gross"),
+        _Trip(_T("long", tid=3), _T("close", pnl=0.9, peak_pnl=1.0, tid=4), 0.0, "gross"),
+        _Trip(_T("long", tid=5), _T("close", pnl=-0.2, peak_pnl=None, tid=6), 0.0, "gross"),
+        _Trip(_T("long", tid=7), _T("close", pnl=-0.3, peak_pnl=0.0, tid=8), 0.0, "gross"),
     ]
 
     summary = _summarize_pairs(pairs, 1000.0)
@@ -354,13 +356,14 @@ def test_capture_ratio_only_counts_pairs_with_a_positive_peak():
 
 def test_capture_ratio_tolerates_legacy_rows_without_the_column():
     """G-6：老库缺 `peak_pnl` 列 ⇒ `getattr` 兜底为 None ⇒ 全部计入 noPeakCount，比率为 0（不炸）。"""
-    from app.db.ai_auto_repositories import _summarize_pairs
+    from app.db.ai_auto_repositories import _summarize_pairs, _Trip
 
     class _Legacy:
         def __init__(self, side, pnl=0.0, tid=0):
             self.side, self.pnl, self.id = side, pnl, tid
 
-    summary = _summarize_pairs([(_Legacy("long", tid=1), _Legacy("close", pnl=0.5, tid=2))], 100.0)
+    summary = _summarize_pairs(
+        [_Trip(_Legacy("long", tid=1), _Legacy("close", pnl=0.5, tid=2), 0.0, "gross")], 100.0)
 
     assert summary["captureRatio"] == 0.0 and summary["capturePairs"] == 0
     assert summary["noPeakCount"] == 1
@@ -372,7 +375,7 @@ def test_capture_ratio_denominator_is_revalued_at_final_average_price():
     本用例把这一点钉成**已知且被接受**的行为（而不是某次实现走样）：同一笔往返里 peak 由保护层用
     当前 qty × (peak_px − 漂移后均价) 得到，聚合层原样采信、不做任何 rebase。
     """
-    from app.db.ai_auto_repositories import _summarize_pairs
+    from app.db.ai_auto_repositories import _summarize_pairs, _Trip
 
     class _T:
         def __init__(self, side, pnl=0.0, peak_pnl=None, tid=0):
@@ -380,8 +383,98 @@ def test_capture_ratio_denominator_is_revalued_at_final_average_price():
 
     # 加仓后均价上移、手数变大 ⇒ 重估峰值 2.4 大于任何单一时刻真实浮盈；聚合仍原样使用。
     summary = _summarize_pairs(
-        [(_T("long", tid=1), _T("close", pnl=1.2, peak_pnl=2.4, tid=2))], 1000.0)
+        [_Trip(_T("long", tid=1), _T("close", pnl=1.2, peak_pnl=2.4, tid=2), 0.0, "gross")], 1000.0)
 
     assert summary["peakPnlUsd"] == 2.4
     assert summary["captureRatio"] == pytest.approx(0.5)
     assert summary["capturePairs"] == 1
+
+
+# ============ 成本口径聚合（ai-trade-cost-truth-and-net-pnl §3.2 B-4 / B-5，G-6 / G-14）============
+class _CostTrade:
+    """成交行替身：只带聚合层真正读的四个属性（side / pnl / fee / id）。"""
+
+    def __init__(self, side, *, pnl=0.0, fee=0.0, peak_pnl=None, tid=0):
+        self.side, self.pnl, self.fee, self.peak_pnl, self.id = side, pnl, fee, peak_pnl, tid
+
+
+def _round_trip_rows(*, fee: float, pnl: float, peak: float | None = None) -> list:
+    """一笔往返：开仓腿 + 平仓腿，各收一半腿费。"""
+    return [_CostTrade("long", fee=fee / 2, tid=1),
+            _CostTrade("close", pnl=pnl, fee=fee / 2, peak_pnl=peak, tid=2)]
+
+
+def test_leg_fees_are_summed_across_partially_filled_open_legs():
+    """B-5：部分成交产生多条开仓腿，配对只留最后一条 ⇒ 按「配对那条腿的 fee」计会漏记先前分批。"""
+    from app.db.ai_auto_repositories import _pair_round_trips
+
+    trades = [_CostTrade("long", fee=1.0, tid=1),      # 3 张
+              _CostTrade("long", fee=2.0, tid=2),      # 再 7 张（覆盖上一条开仓腿）
+              _CostTrade("close", pnl=10.0, fee=3.0, tid=3)]
+    trips = _pair_round_trips(trades, "gross")
+
+    assert len(trips) == 1
+    assert trips[0].leg_fee_usd == pytest.approx(6.0)          # 三腿之和
+    assert trips[0].leg_fee_usd != pytest.approx(5.0)          # ≠「仅最后一条开仓腿 + 平仓腿」
+    assert trips[0].net_pnl == pytest.approx(4.0)
+
+
+def test_four_generations_of_rows_aggregate_without_double_charging():
+    """G-6：同一张 trades 表里的**四**代行各自还原正确，缺 costBasis 的第 ④ 代绝不被二次扣费。"""
+    from app.db.ai_auto_repositories import _pair_round_trips, _summarize_pairs
+
+    # ① 阶段一之前：fee 恒 0、pnl 毛额、缺 costBasis ⇒ 推定 gross ⇒ 与今天数值相同（诚实降级）。
+    gen1 = _summarize_pairs(_pair_round_trips(_round_trip_rows(fee=0.0, pnl=10.0), "gross"), 100.0)
+    assert gen1["realizedPnlUsd"] == pytest.approx(10.0) and gen1["feeUsd"] == 0.0
+    # ② 阶段一之后、本轮之前：fee 已记、pnl 仍毛额 ⇒ 可还原为 Σ(pnl − legFee)。
+    gen2 = _summarize_pairs(_pair_round_trips(_round_trip_rows(fee=2.0, pnl=10.0), "gross"), 100.0)
+    assert gen2["realizedPnlUsd"] == pytest.approx(8.0) and gen2["grossPnlUsd"] == pytest.approx(10.0)
+    # ③ 本轮之后：pnl 已是净额且 costBasis == "net" ⇒ 原样相加。
+    gen3 = _summarize_pairs(_pair_round_trips(_round_trip_rows(fee=2.0, pnl=8.0), "net"), 100.0)
+    assert gen3["realizedPnlUsd"] == pytest.approx(8.0) and gen3["grossPnlUsd"] == pytest.approx(10.0)
+    # ④ 运维按 runbook 提前开过总闸：pnl 已是净额但**缺** costBasis ⇒ 推定为 "net" 才不二次扣费。
+    gen4 = _summarize_pairs(_pair_round_trips(_round_trip_rows(fee=2.0, pnl=8.0), "net"), 100.0)
+    assert gen4["realizedPnlUsd"] == pytest.approx(8.0)
+    assert gen4["realizedPnlUsd"] != pytest.approx(6.0)         # 二次扣费的错数长这样
+
+
+def test_legacy_cost_basis_is_a_declared_assumption_not_a_silent_guess(monkeypatch):
+    """P0-3：缺键即**推定**，且推定这件事本身必须随回执下发（UI 要把「推定」与「已知」分开）。"""
+    import app.db.ai_auto_repositories as mod
+
+    assert mod._run_cost_basis({"costBasis": "net"}) == ("net", False)
+    assert mod._run_cost_basis({"costBasis": "gross"}) == ("gross", False)
+
+    monkeypatch.setattr(mod, "get_settings",
+                        lambda: Settings(ai_trade_history_legacy_cost_basis="gross"))
+    assert mod._run_cost_basis({}) == ("gross", True)
+    monkeypatch.setattr(mod, "get_settings",
+                        lambda: Settings(ai_trade_history_legacy_cost_basis="net"))
+    assert mod._run_cost_basis({}) == ("net", True)
+
+
+def test_mixed_basis_group_is_flagged():
+    from app.db.ai_auto_repositories import _pair_round_trips, _summarize_pairs
+
+    trips = (_pair_round_trips(_round_trip_rows(fee=2.0, pnl=10.0), "gross")
+             + _pair_round_trips(_round_trip_rows(fee=2.0, pnl=8.0), "net"))
+    summary = _summarize_pairs(trips, 100.0)
+    assert summary["costBasisMixed"] is True
+    assert summary["realizedPnlUsd"] == pytest.approx(16.0)     # 各按自己的口径还原后相加
+    assert summary["feeUsd"] == pytest.approx(4.0)
+
+
+def test_capture_ratio_is_identical_on_both_sides_of_the_net_switch():
+    """G-14：捕获率分子分母**同为毛额** ⇒ 净额总闸翻转不改变它；只有 realizedPnlUsd 差一个 feeUsd。"""
+    from app.db.ai_auto_repositories import _pair_round_trips, _summarize_pairs
+
+    gross = _summarize_pairs(
+        _pair_round_trips(_round_trip_rows(fee=2.0, pnl=10.0, peak=20.0), "gross"), 100.0)
+    net = _summarize_pairs(
+        _pair_round_trips(_round_trip_rows(fee=2.0, pnl=8.0, peak=20.0), "net"), 100.0)
+
+    for key in ("peakPnlUsd", "capturedPnlUsd", "captureRatio", "capturePairs", "noPeakCount"):
+        assert gross[key] == net[key], key                      # 逐位相同（老会话的历史 KPI 不被追溯改写）
+    assert gross["capturedPnlUsd"] == pytest.approx(10.0)        # 分子是**毛额**，与毛额分母同维
+    assert gross["realizedPnlUsd"] == net["realizedPnlUsd"] == pytest.approx(8.0)
+    assert net["realizedPnlUsd"] == pytest.approx(net["grossPnlUsd"] - net["feeUsd"])

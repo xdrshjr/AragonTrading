@@ -1,5 +1,6 @@
 // AI 自动交易统计历史 wire 类型（ai-trade-stats-dashboard §3.8）：与后端 schemas.AiTradeHistory* 逐字对齐。
 // 皆为组件 / lib 局部类型，不入 store（历史走 TanStack Query，不持久化）。时间戳全为秒（§6.2 / P2-8）。
+import type { FeeRatesWire, ReconcileWire } from "./aiTradeCost";
 import type { Trade } from "./types";
 
 // 历史会话列表单行 KPI（后端逐成员配对聚合；口径同 autoTradePnl.summarizeRoundTrips）。
@@ -18,6 +19,11 @@ export interface AiTradeHistoryEntry {
   winRate: number;
   bestUsd: number;
   worstUsd: number;
+  // 成本三键（cost-truth §5.6）：realizedPnlUsd 已是**净额**，与 feeUsd / grossPnlUsd 并列才能
+  // 逐笔解释「数字为什么下移」。老后端不下发 ⇒ 读点 `?? 0` 兜底，故全部可选。
+  feeUsd?: number;
+  grossPnlUsd?: number;
+  costBasisMixed?: boolean;
 }
 
 export interface AiTradeHistoryListOut {
@@ -42,6 +48,10 @@ export interface AiTradeHistorySummary {
   captureRatio?: number;
   capturePairs?: number;
   noPeakCount?: number;
+  // cost-truth：捕获率五键**分子分母同为毛额**（不随净额总闸变化）；手续费口径看这三键。
+  feeUsd?: number;
+  grossPnlUsd?: number;
+  costBasisMixed?: boolean;
 }
 
 // metrics_json 解析（全可选，缺失即优雅降级——崩溃 / 对账会话没有富化字段）。
@@ -88,6 +98,9 @@ export interface AiTradeRunMetrics {
       previewErrors?: number;
       previewDisabled?: boolean;
     };
+    // 成本真值化（cost-truth §5.4，**顶层**加法键）：老记录缺键 ⇒ 整段隐藏（绝不显示误导性的 0）。
+    feeRates?: FeeRatesWire;
+    reconcile?: ReconcileWire;
   };
 }
 
@@ -99,6 +112,7 @@ export interface AiTradeHistoryMember {
   allocationPct: number;
   strategyNames: string[];
   status: string;
+  costBasis?: "net" | "gross";   // 该成员 run 的盈亏口径（老后端不下发 ⇒ undefined）
   metrics: AiTradeRunMetrics;
   trades: Trade[];
 }
@@ -111,6 +125,9 @@ export interface AiTradeHistoryDetailOut {
   endedTs: number;
   status: string;
   totalBudgetUsd: number;
+  // 口径是否为**推定**（cost-truth P0-3）：老 run 缺 costBasis 时按运维配置推定，UI 必须把
+  // 「推定」与「已知」分开显示——两件事不可合并成一个徽标。
+  costBasisAssumed?: boolean;
   members: AiTradeHistoryMember[];
   summary: AiTradeHistorySummary;
 }

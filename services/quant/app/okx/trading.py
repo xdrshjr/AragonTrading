@@ -490,6 +490,106 @@ def _normalize_fill(r: dict) -> dict:
     }
 
 
+async def fetch_trade_fee(creds: AccountCredentials, inst_id: str, *,
+                          inst_type: str = "SWAP") -> dict | None:
+    """本账户在该合约上的**官方**费率档位（ai-trade-cost-truth-and-net-pnl 轴 A）。
+
+    错误映射与 ``fetch_live_fills`` 逐字同构。归一后任一侧不可用 ⇒ ``None``（调用方回落配置常数）。
+    """
+    client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
+    try:
+        raw = await client.get_trade_fee(inst_type, inst_id)
+    except OKXError as exc:
+        raise OKXPrivateError(_map_trade_code(exc.code),
+                              _redact(exc.message, creds.secret_key, creds.passphrase)) from exc
+    finally:
+        await client.aclose()
+    return _normalize_trade_fee(raw, inst_id)
+
+
+def _fee_tier_fields(inst_id: str) -> tuple[str, str]:
+    """按 ``instId`` 后缀选分档字段（顺序不可换，轴 A A-2 第 1 步）。"""
+    upper = inst_id.upper()
+    if upper.endswith("-USDC-SWAP"):
+        return "makerUSDC", "takerUSDC"
+    if upper.endswith("-USDT-SWAP"):
+        return "makerU", "takerU"
+    return "maker", "taker"
+
+
+def _fee_bps(raw: dict, tier_key: str, base_key: str) -> float | None:
+    """费率字段 → bps（**收取为正**）；分档字段为空即回落通用字段，仍为空 ⇒ ``None``。
+
+    **绝不返回 0.0 作为「缺失」**：0 bps 是一个会静默放松门禁与净额扣减的危险默认。
+    """
+    for key in (tier_key, base_key):
+        rate = _optional_float(str(raw.get(key) or "").strip() or None)
+        if rate is not None:
+            return -rate * 1e4          # OKX：负数 = 平台收取 ⇒ bps 为正 = 支出
+    return None
+
+
+def _normalize_trade_fee(raw: dict, inst_id: str) -> dict | None:
+    """OKX ``account/trade-fee`` 单行 → 归一费率快照；任一侧不可用 ⇒ ``None``。
+
+    **负 bps（返佣）一律夹紧到 0.0 后才交给下游**（P1-4）：记账链与决策链一视同仁。真实返佣与一次
+    符号解析错误在数值上不可区分，而不夹紧的代价是「盈亏可能被凭空抬高」——那正是本 spec 要修的方向
+    的反面。原始有符号值只以 ``makerBpsRaw`` / ``takerBpsRaw`` 进 wire 供事后审计，并置 ``rebate``。
+    """
+    tier_maker, tier_taker = _fee_tier_fields(inst_id)
+    maker_raw = _fee_bps(raw or {}, tier_maker, "maker")
+    taker_raw = _fee_bps(raw or {}, tier_taker, "taker")
+    if maker_raw is None or taker_raw is None:
+        return None
+    return {"instId": inst_id,
+            "makerBps": max(0.0, round(maker_raw, 6)), "takerBps": max(0.0, round(taker_raw, 6)),
+            "makerBpsRaw": round(maker_raw, 6), "takerBpsRaw": round(taker_raw, 6),
+            "level": str((raw or {}).get("level") or ""),
+            "ruleType": str((raw or {}).get("ruleType") or ""),
+            "rebate": bool(maker_raw < 0 or taker_raw < 0),
+            "ts": int(_optional_float((raw or {}).get("ts")) or 0), "source": "exchange"}
+
+
+async def fetch_position_history(creds: AccountCredentials, inst_id: str, *, limit: int = 50,
+                                 after_ms: int | None = None) -> list[dict]:
+    """交易所侧已结算持仓（轴 C 对账锚点）；错误映射同 ``fetch_live_fills``。"""
+    client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
+    try:
+        rows = await client.get_position_history("SWAP", inst_id, limit=limit, after_ms=after_ms)
+    except OKXError as exc:
+        raise OKXPrivateError(_map_trade_code(exc.code),
+                              _redact(exc.message, creds.secret_key, creds.passphrase)) from exc
+    finally:
+        await client.aclose()
+    return [_normalize_position_history(r) for r in rows]
+
+
+def _normalize_position_history(r: dict) -> dict:
+    """OKX ``positions-history`` 单行 → 归一（秒级时间、**支出为正**、附恒等式自检残差）。
+
+    ``fee`` / ``fundingFee`` / ``liqPenalty`` 三项按 OKX 口径为负数=支出，此处**取反**统一为
+    「正数 = 支出」；``pnl`` 与 ``realizedPnl`` 保持「正数 = 盈利」原义。``identityGapUsd`` 是官方
+    关系式 ``realizedPnl = pnl + fee + fundingFee + liqPenalty`` 的运行期残差（三项已取反故此处为减）
+    ——本 spec 不把该式当前提，只在运行期数值自检（C-3）。
+    """
+    fee = -(_optional_float(r.get("fee")) or 0.0)
+    funding = -(_optional_float(r.get("fundingFee")) or 0.0)
+    liq = -(_optional_float(r.get("liqPenalty")) or 0.0)
+    pnl = _optional_float(r.get("pnl")) or 0.0
+    realized = _optional_float(r.get("realizedPnl")) or 0.0
+    return {
+        "posId": str(r.get("posId") or ""), "instId": str(r.get("instId") or ""),
+        "direction": str(r.get("direction") or ""),
+        "openAvgPx": _optional_float(r.get("openAvgPx")) or 0.0,
+        "closeAvgPx": _optional_float(r.get("closeAvgPx")) or 0.0,
+        "cTime": int(_optional_float(r.get("cTime")) or 0) // 1000,
+        "uTime": int(_optional_float(r.get("uTime")) or 0) // 1000,
+        "pnl": pnl, "fee": fee, "fundingFee": funding, "liqPenalty": liq,
+        "realizedPnl": realized,
+        "identityGapUsd": realized - (pnl - fee - funding - liq),
+    }
+
+
 async def fetch_live_open_orders(creds: AccountCredentials,
                                  inst_id: str | None = None) -> list[dict]:
     """未结委托（普通挂单 + 策略委托）：聚合归一为统一形态。

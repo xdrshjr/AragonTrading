@@ -312,8 +312,10 @@ class Settings(BaseSettings):
     # 此处须真的声明——Settings extra="ignore" 会静默丢弃未声明的 env。
     # A0-1 记录层：每笔成交按确定性费率模型入账（notional × feeBps）。False ⇒ trade["fee"] 逐字回退 0.0。
     ai_trade_fee_accounting_enabled: bool = True
-    # A0-2 口径切换：_close_pnl 扣双边费用 ⇒ session_pnl_usd 变净额。**破坏性变更，默认关**。
-    ai_trade_net_pnl_enabled: bool = False
+    # A0-2 口径切换：_close_pnl 扣双边费用 ⇒ session_pnl_usd 变净额。**破坏性口径变更**。
+    # ai-trade-cost-truth-and-net-pnl §3.2 B-1 起默认 **True**：本项就是用户报告的缺陷本身（看板盈亏
+    # 高于真实到手金额一个往返成本），默认关等于交付一个默认不生效的修复。置 false 即逐字回退。
+    ai_trade_net_pnl_enabled: bool = True
     # 费率常量刻意**不复用** default_taker_fee_bps（本文件下方「撮合默认参数」段）：后者同时服务
     # SimBroker / 纸面 / 影子 broker，改它等于静默重写每一次历史回测的成本假设。两个世界的费率必须能各自演进。
     ai_trade_maker_fee_bps: float = Field(default=2.0, ge=0, le=100)
@@ -333,6 +335,26 @@ class Settings(BaseSettings):
     # 实测成交明细旁路审计（校准 feeBps / 观测滑点）；绝不进决策轮，绝不回写盈亏。
     ai_trade_fill_audit_enabled: bool = True
     ai_trade_fill_audit_interval_s: float = Field(default=60.0, gt=0, le=3600)
+    # ---- 成本真值化与净额盈亏（ai-trade-cost-truth-and-net-pnl §5.5）----
+    # 轴 A：官方费率真源（`GET /account/trade-fee`，签名私有）。关 ⇒ 一个请求都不发，费率恒取上面
+    # 的配置常数且 wire 上 source=="config"。取数失败一律回落常数，**绝不阻断会话启动**。
+    ai_trade_fee_rate_source_enabled: bool = True
+    ai_trade_fee_rate_ttl_s: float = Field(default=3600.0, gt=0, le=86400)
+    # 轴 D：Agent 成本意识（宪章章 + 每轮成本段）。关 ⇒ costAwareness 整键缺席 + 宪章章为 ""
+    # ⇒ prompt 渲染逐字节回退。
+    ai_trade_cost_awareness_enabled: bool = True
+    # 轴 C：交易所对账（`GET /account/positions-history`，签名私有）。本层**只观测、不回写盈亏**。
+    ai_trade_reconcile_enabled: bool = True
+    ai_trade_reconcile_interval_s: float = Field(default=300.0, gt=0, le=86400)
+    ai_trade_reconcile_abs_tol_usd: float = Field(default=0.5, ge=0)
+    ai_trade_reconcile_rel_tol: float = Field(default=0.05, ge=0, le=1)
+    ai_trade_reconcile_alert_streak: int = Field(default=3, ge=1, le=100)
+    # stop 收尾强制对账的硬超时（P1-5）：观测层绝不延长真实资金平仓后的落库收尾。
+    ai_trade_reconcile_stop_timeout_s: float = Field(default=3.0, gt=0, le=30)
+    # 老 run（config_json 缺 costBasis）的口径**推定**（P0-3）。默认 "gross" 对出厂配置正确；
+    # 已按阶段一 §7.5 runbook 提前打开 ai_trade_net_pnl_enabled 的部署须置 "net"，否则那批
+    # 已是净额的历史行会被聚合层二次扣费。回执恒带 costBasisAssumed=true，UI 分开显示「推定 / 已知」。
+    ai_trade_history_legacy_cost_basis: str = "gross"        # gross | net
     # ---- 信号先验体系与 EV 分子（ai-trade-signal-prior-and-ev-gate §七）----
     # 三个**默认关闭**的独立总闸：全关时系统逐字节回退到阶段一行为（KV 里遗留的快照行不被读取，
     # 也无任何副作用）。env 名同为 AI_TRADE_ 前缀，desktop config.js 的 prod 透传白名单已覆盖。

@@ -77,7 +77,7 @@ def _gate_settings(**over) -> Settings:
 def _make_session(*, settings=None, action="open_long", run_id=1, base_rule=None,
                   risk=None, with_ledger=True):
     settings = settings or Settings()
-    io_calls = {"funding": 0, "fills": 0, "reflect": 0}
+    io_calls = {"funding": 0, "fills": 0, "reflect": 0, "feeRate": 0, "posHistory": 0}
 
     async def place_order_fn(order):
         return {"ok": True, "ordId": "x", "clOrdId": "aragonx"}
@@ -126,6 +126,20 @@ def _make_session(*, settings=None, action="open_long", run_id=1, base_rule=None
     session._window._safe_get_candles = no_htf
     # 资金费率取数桩：绝不触网；调用计数用于「决策轮内零 IO」的可证伪断言。
     session._cost.refresh_funding = lambda now: session._cost.funding.refresh(funding_fn, now)
+
+    async def trade_fee_fn(_inst_id):
+        io_calls["feeRate"] += 1
+        return {"instId": "BTC-USDT-SWAP", "makerBps": 1.5, "takerBps": 4.0, "level": "Lv1",
+                "ruleType": "normal", "rebate": False, "makerBpsRaw": 1.5, "takerBpsRaw": 4.0,
+                "ts": 0, "source": "exchange"}
+
+    async def position_history_fn():
+        io_calls["posHistory"] += 1
+        return []
+
+    # 轴 A / 轴 C 的两条**签名私有** GET 同样走注入缝（脱网 + 可证伪的调用计数）。
+    session._cost._fetch_fee_rate = trade_fee_fn
+    session._cost._fetch_position_history = position_history_fn
     return session, io_calls
 
 
@@ -323,6 +337,9 @@ async def test_multi_symbol_group_request_count_is_bounded_by_throttle(monkeypat
         for session, _ in sessions:
             for _ in range(12):                  # 60s / 5s 盯市周期 = 12 个 tick
                 await session._monitor_tick()
+            # I-1：刷新已离开 tick 的关键路径跑进后台单飞任务，故计数须等那一批落地再断言——
+            # 不 drain 则计数恒为 0，上界断言会**空转通过**，且在途任务会留到事件循环关闭。
+            await session._cost.drain_maintenance()
         assert sum(io["funding"] for _, io in sessions) <= 5
         assert sum(io["fills"] for _, io in sessions) <= 5
     finally:
@@ -336,8 +353,13 @@ async def test_monitor_tick_is_the_only_place_that_touches_the_network():
         settings=_gate_settings(ai_trade_funding_enabled=True))
     try:
         await session._monitor_tick()
+        # I-1：网络刷新排进后台单飞任务后，「只在盯市 tick 上触网」与「调用次数上界」两条性质都
+        # 原样成立，只是要等那一批真的落地——不 drain 就成了对调度时序的赌博（且会把在途任务留到
+        # 事件循环关闭，GC 时报 coroutine never awaited）。
+        await session._cost.drain_maintenance()
         assert io_calls["funding"] == 1        # 资金费率只在盯市 tick 上刷新
         await session._monitor_tick()
+        await session._cost.drain_maintenance()
         assert io_calls["funding"] == 1        # TTL 去重
     finally:
         await dispose_engine()
@@ -404,7 +426,13 @@ async def test_cost_snapshot_rides_status_event_every_ten_rounds_when_gate_is_of
         snapshots = [e["data"]["costSnapshot"] for e in _drain(q)
                      if e["type"] == "status" and "costSnapshot" in e["data"]]
         assert len(snapshots) == 1                     # 第 10 轮恰一条
-        assert snapshots[0]["cost"] == session._cost.snapshot()["cost"]   # 同一 build 产物
+        # 同一 build 产物：除 `sessionFeeUsd` 外逐键相同。后者是**会话级累计**活计数器
+        # （cost-truth §5.4），事件在本轮下单之前推出，故它必然 ≤ 事后再取的快照——比较两个
+        # 时刻的活计数器只会测出时间流逝，不测口径同源。
+        live = session._cost.snapshot()["cost"]
+        drop_live = lambda d: {k: v for k, v in d.items() if k != "sessionFeeUsd"}  # noqa: E731
+        assert drop_live(snapshots[0]["cost"]) == drop_live(live)
+        assert 0 < snapshots[0]["cost"]["sessionFeeUsd"] <= live["sessionFeeUsd"]
     finally:
         await dispose_engine()
 
@@ -438,3 +466,105 @@ class _CloseSig:
     side = "close"
     strength = 1.0
     reason = "test_close"
+
+
+# ============ 成本真值化与净额盈亏（ai-trade-cost-truth-and-net-pnl §3.2 / §3.3 / §3.4）============
+async def test_cost_awareness_lands_in_the_payload_and_the_decision_prompt():
+    """轴 D：`costAwareness` 进 payload 与 prompt，且预览假设如实下发（P0-1）。"""
+    from app.ai_auto.prompts import build_decision_prompt
+
+    await init_db()
+    session, _ = _make_session()
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        payload = session._build_decision_payload(1, _START_TS, _PX, [], {"trigger": "candle"})
+        view = payload["costAwareness"]
+        assert view["previewOrdType"] in ("market", "limit") and view["previewSide"] in ("long", "short")
+        assert view["netBasis"] is True                    # B-1 起默认净额口径
+        assert "【交易成本】" in build_decision_prompt(payload)
+    finally:
+        await dispose_engine()
+
+
+async def test_cost_awareness_switch_off_restores_the_payload_byte_for_byte():
+    """G-8：总闸关 ⇒ `costAwareness` **整键缺席**（不是 None）⇒ prompt 渲染逐字节回退。"""
+    await init_db()
+    on, _ = _make_session()
+    off, _ = _make_session(settings=Settings(ai_trade_cost_awareness_enabled=False,
+                                             ai_trade_net_pnl_enabled=False,
+                                             ai_trade_fee_rate_source_enabled=False,
+                                             ai_trade_reconcile_enabled=False))
+    try:
+        wake = {"trigger": "candle"}
+        keys_on = set(on._build_decision_payload(1, _START_TS, _PX, [], wake))
+        keys_off = set(off._build_decision_payload(1, _START_TS, _PX, [], wake))
+        assert keys_on - keys_off == {"costAwareness"}
+        assert off._cost.charter_text(3600) == ""
+    finally:
+        await dispose_engine()
+
+
+async def test_reconcile_is_throttled_and_lands_on_the_cost_snapshot():
+    """轴 C：对账挂在盯市 tick 上并按 `ai_trade_reconcile_interval_s` 节流；读数进 costSnapshot 顶层。"""
+    await init_db()
+    session, io = _make_session(settings=Settings(ai_trade_reconcile_interval_s=300.0))
+    try:
+        await session._monitor_tick()
+        await session._cost.drain_maintenance()
+        await session._monitor_tick()                       # 同一节流窗口内的第二次 tick
+        await session._cost.drain_maintenance()
+        assert io["posHistory"] == 1                        # 节流生效
+        assert io["feeRate"] == 1                           # 官方费率同样按 TTL 去重
+        snap = session._cost.snapshot()
+        assert snap["reconcile"]["status"] == "unavailable"  # 桩回空数组 ⇒ 没样本不等于对上了
+        assert snap["feeRates"]["source"] == "exchange"      # P1-1：两个键都挂**顶层**
+        assert "sessionFeeUsd" in snap["cost"]               # sessionFeeUsd 挂 cost 子对象
+    finally:
+        await dispose_engine()
+
+
+async def test_reconcile_disabled_sends_zero_requests():
+    """G-9：总闸关 ⇒ `positions-history` 一个请求都不发（调用计数上界断言）。"""
+    await init_db()
+    session, io = _make_session(settings=Settings(ai_trade_reconcile_enabled=False,
+                                                  ai_trade_fee_rate_source_enabled=False))
+    try:
+        await session._monitor_tick()
+        await session._cost.drain_maintenance()
+        assert io["posHistory"] == 0 and io["feeRate"] == 0
+        assert "reconcile" not in session._cost.snapshot()   # 未跑过 ⇒ 该顶层键**缺席**
+    finally:
+        await dispose_engine()
+
+
+async def test_stop_forces_a_final_reconciliation_into_the_persisted_metrics():
+    """P1-5：stop 收尾忽略节流强跑一次，落库 `aiStats.reconcile` 且 `final=True`、永不判 drift。"""
+    await init_db()
+    session, io = _make_session()
+    sm = get_sessionmaker()
+    try:
+        await session.stop()
+        assert io["posHistory"] == 1                        # 忽略节流：从未 tick 过也要跑一次
+        async with sm() as s:
+            run = await repo.get_run(s, 1)
+        assert run.status == "stopped"                      # 观测层绝不阻断真实资金平仓后的收尾
+        metrics = json.loads(run.metrics_json or "{}")
+        rec = metrics["aiStats"]["reconcile"]
+        assert rec["final"] is True and rec["status"] != "drift"
+    finally:
+        await dispose_engine()
+
+
+async def test_new_top_level_keys_do_not_clash_with_the_existing_ai_stats():
+    """P1-1 的前置硬约束：`merge_cost_stats` 键冲突即抛，会被 finalize 兜底吞成「统计静默消失」。"""
+    await init_db()
+    session, _ = _make_session()
+    try:
+        base = _compute_ai_stats([], 0)
+        base.update({"wakeSkips": 0, "maxHoldStreak": 0, "profitGuardExits": 0,
+                     "profitGuardArmedRounds": 0, "wakeScheduler": {}})
+        merged = session._cost.merge_into(base)              # 撞名会在此 raise ValueError
+        assert set(merged) - set(base) >= {"cost", "edgeGate"}
+    finally:
+        await dispose_engine()

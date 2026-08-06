@@ -478,6 +478,23 @@ export interface PaperPositionEvent {
   positionPct?: number | null;
   /** 利润保护快照（AI 自动交易且规则已装配时才有；旧前端忽略未知键，向前兼容）。 */
   profitGuard?: ProfitGuardSnapshot | null;
+  /**
+   * 本轮成本证据（ai-trade-cost-truth-and-net-pnl 轴 D；成本意识总闸关 ⇒ 整键缺席）。
+   *
+   * `unrealizedPnl` 在净额口径下已是「此刻平掉能拿到手的钱」，`breakEvenPx` 则回答「还要走多远
+   * 才回本」——两者是同一件事的两个面，缺一个用户就只能靠心算，而平衡价与杠杆无关这件事恰恰是
+   * 最容易算错的地方。
+   */
+  costAwareness?: {
+    roundTripBps: number;
+    roundTripPct: number;
+    breakEvenPx: number | null;
+    breakEvenGapPct: number | null;
+    sessionFeeUsd: number | null;
+    netBasis: boolean;
+    source?: string;
+    level?: string;
+  } | null;
 }
 
 export interface PaperStatus {
