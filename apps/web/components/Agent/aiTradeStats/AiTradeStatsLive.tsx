@@ -1,10 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
 import ExitSourceCard from "./ExitSourceCard";
 import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
-import TurnoverBackstopCard from "./TurnoverBackstopCard";
+import TurnoverBackstopCard, { type RepairPendingState } from "./TurnoverBackstopCard";
 import WakeAttributionCard from "./WakeAttributionCard";
 import AutoTradePnlSummary from "@/components/Chart/AutoTradePnlSummary";
 import AutoTradeRoundTripRow from "@/components/Chart/AutoTradeRoundTripRow";
@@ -29,6 +29,8 @@ import type {
   AiTradeGroupState,
   AiTradeSessionRow,
 } from "@/lib/aiTradeTypes";
+import { aiTradeApi } from "@/lib/aiTradeApi";
+import { ApiRequestError } from "@/lib/api";
 import { colorForReturn, fmtTime, signed } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 
@@ -38,6 +40,26 @@ import { useAppStore } from "@/lib/store";
 export default function AiTradeStatsLive() {
   const group = useAppStore((s) => s.aiTradeGroup);
   const [range, setRange] = useState<AutoTradeRange>("all");
+  // 「立即补挂」的请求态按 `instId` 键（[P2-5]：卡片保持无状态）。状态流转本身由后端在
+  // `state`/`blockedReason` 变化时补推 status 带上来（[P1-3]），此处只负责按钮的三态。
+  const [repairState, setRepairState] = useState<Record<string, RepairPendingState>>({});
+  const groupId = group?.groupId ?? null;
+  const repair = useCallback(
+    (instId: string) => {
+      if (!groupId) return;
+      const settle = (result: { ok: boolean; message: string }) => {
+        setRepairState((prev) => ({ ...prev, [instId]: { result } }));
+        // 结果只停留 2.5 秒：状态流转本身由后端补推的 status 带上来，按钮不该永久停在「已提交」。
+        setTimeout(() => setRepairState(({ [instId]: _done, ...rest }) => rest), 2500);
+      };
+      setRepairState((prev) => ({ ...prev, [instId]: { pending: true } }));
+      aiTradeApi
+        .repairBackstop(groupId, instId)
+        .then(() => settle({ ok: true, message: "补挂请求已发出，正在向交易所核实" }))
+        .catch((err: unknown) => settle({ ok: false, message: repairErrorText(err) }));
+    },
+    [groupId],
+  );
   const [custom, setCustom] = useState<{ startTs?: number; endTs?: number }>({});
   const [openRowKey, setOpenRowKey] = useState<string | null>(null);
   // 短生命周期视图：挂载期取一次 nowSec（时间窗口为日粒度，无需定时 tick；对齐 AutoTradePnlPanel）。
@@ -152,6 +174,8 @@ export default function AiTradeStatsLive() {
             turnover: m.session?.horizon?.turnover,
             backstop: m.session?.horizon?.backstop,
           }))}
+          onRepair={repair}
+          repairPending={repairState}
         />
         <ExitSourceCard exits={group.exits} />
         <ProfitCaptureCard capture={capture} />
@@ -341,4 +365,17 @@ function ProfitCaptureCard({
       <p className="text-[10px] leading-relaxed text-[var(--muted)]">{PROFIT_CAPTURE_HINT}</p>
     </div>
   );
+}
+
+/**
+ * 补挂失败的人话（**绝不把裸码或原始异常抛给用户**）。
+ *
+ * 被三道锁拦下时后端回 409 + `blockedReason`，那份 message 本身已是中文；交易所拒单回 502 +
+ * 原始 sCode，此时把码带上——它是用户去交易所后台核对时唯一有用的线索。
+ */
+function repairErrorText(err: unknown): string {
+  if (err instanceof ApiRequestError) {
+    return err.code ? `${err.message}（${err.code}）` : err.message;
+  }
+  return "补挂请求失败，请稍后重试";
 }

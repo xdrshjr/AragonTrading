@@ -35,6 +35,20 @@ _BACKSTOP_REASON_LABEL = {
     "stale": "最近一次核实已过期",
 }
 
+# 自愈层暂缓原因的 prompt 侧标签（backstop-repair §2.2.7）。值域与 `backstop_repair` 的常量、
+# 前端标签表、端点错误体**四处镜像**——任一处新增取值而另三处未跟进，用例即红（放行条件 7）。
+_REPAIR_BLOCK_LABEL = {
+    "coverage_unknown": "交易所未回报可核对的委托张数",
+    "no_local_px": "本地没有可用的止损价",
+    "no_mark_px": "当前判定价不可用",
+    "px_too_close": "止损价距离现价过近",
+    "size_below_min": "未覆盖差额不足最小下单量",
+    "order_in_flight": "有一笔限价委托在途",
+    "cooling": "两次补挂之间的冷却尚未结束",
+    "attempts_exhausted": "补挂次数已达上限",
+    "verify_failed": "已补挂但核实仍未覆盖",
+}
+
 _RELEASE_LABEL = {
     RELEASE_LOSS: "浮亏已达解除阈",
     RELEASE_STALE_PX: "判定价不可信",
@@ -316,13 +330,21 @@ def _release_line(wire: dict) -> str:
 
 
 def _exchange_snapshot_line(wire: dict) -> str:
-    """交易所侧兜底一行（§2.8 第 3 条 + turnover-budget §2.3.3 的五分支）。
+    """交易所侧兜底一行（§2.8 第 3 条 + turnover-budget §2.3.3 的五分支 + 本轮的自愈子句）。
 
     `backstop` 键缺席（总闸关 / 回测 / 未装配）⇒ **逐字返回本轮之前的那两句**（冻结用例守，
     保证「不开轴 B 的会话 prompt 一个字节都不变」）。键在场时按 `basis` 分五支，核心纪律：
     **核实到才敢说「进程退出后仍生效」**；`coverageRatio is None` 是「还不知道」，绝不渲染成
     「确认裸露」那句确定的坏消息（[P0-2] / D-14）。
+
+    `backstop.repair` 子键在场时**至多追加一句**（backstop-repair §2.2.7）——兜底行已经是 prompt
+    里最长的一段；子键缺席（自愈层未装配 / `idle`）⇒ 五支逐字节回退。
     """
+    return _backstop_basis_line(wire) + _repair_clause(wire.get("backstop"))
+
+
+def _backstop_basis_line(wire: dict) -> str:
+    """五分支的兜底基线句（本轮**一个字节都没改**，冻结用例读的就是它）。"""
     sl, tp = wire.get("exchangeStopLossPx"), wire.get("exchangeTakeProfitPx")
     backstop = wire.get("backstop")
     if not isinstance(backstop, dict):
@@ -350,6 +372,51 @@ def _exchange_snapshot_line(wire: dict) -> str:
                 f"（{ago}前核实）——未覆盖部分在本进程退出后**没有**兜底。")
     return (f"  交易所侧兜底：止损 {stop_px}（已于 {ago}前向交易所核实，覆盖 "
             f"{float(ratio) * 100:.0f}%）——**进程退出后仍生效**。")
+
+
+def _repair_clause(backstop) -> str:
+    """自愈层的加法子句（backstop-repair §2.2.7）；键缺席 / `idle` ⇒ `""` ⇒ 逐字节回退。
+
+    每一句都以「当前**有没有**兜底」结尾，不以「系统做了什么」结尾——模型需要的是事实，
+    不是工单状态。`placed` 一律说「已发出，正在核实」而**不说「已补挂」**：OKX 回了一个 algoId
+    不等于那张单真的挂在那里（§九 D-6）。
+    """
+    repair = (backstop or {}).get("repair") if isinstance(backstop, dict) else None
+    if not isinstance(repair, dict):
+        return ""
+    state = str(repair.get("state") or "")
+    px, sz = _fmt_px(repair.get("plannedStopPx")), repair.get("plannedSz")
+    if state == "planned":
+        return (f" 系统已算出补挂方案（止损 {px} / {sz} 张），但本会话为「仅提醒」模式"
+                "——在人工挂出前，请按「没有兜底」规划退出。")
+    if state in ("placing", "placed"):
+        return (f" 系统已发出一张补挂止损（{px} / {sz} 张），正在向交易所核实；"
+                "核实通过前不要按「已有兜底」放松退出计划。")
+    if state == "verified":
+        done = (repair.get("lastResult") or {}).get("sz")
+        return f" 其中 {done} 张由系统自动补挂并已核实通过。"
+    if state == "failed":
+        last = repair.get("lastResult") or {}
+        # 读**预渲染**的中文原因（`backstop_repair._note_failure`），不读裸码：归一码的值域由
+        # `okx.trading` 拥有，在本文件抄一张表，下一次新增码就会让 prompt 里出现一个原始英文串。
+        return (f" ⚠ 系统尝试补挂止损失败（{last.get('codeLabel') or last.get('code')}），"
+                "当前仍无持久化兜底。")
+    if state == "blocked":
+        return _repair_blocked_clause(repair)
+    return ""
+
+
+def _repair_blocked_clause(repair: dict) -> str:
+    """`blocked` 的三支措辞：越过 / 过期 / 其余（前两支各有各的行动含义，不得合并）。"""
+    reason = str(repair.get("blockedReason") or "")
+    if reason == "px_through":
+        return (f" ⚠ 现价已越过本地止损价 {_fmt_px(repair.get('plannedStopPx'))}，"
+                "系统拒绝补挂一张会立刻触发的止损（那等于立刻市价平仓）——退出决策完全在你手上。")
+    if reason == "px_stale":
+        return (" 系统本可补挂止损，但当前判定价已过期，无法确认现价是否仍在止损的有利侧，"
+                "故暂缓——当前仍无持久化兜底。")
+    return (f" 系统本可补挂止损但被暂缓（{_REPAIR_BLOCK_LABEL.get(reason, reason or '未知原因')}），"
+            "当前仍无持久化兜底。")
 
 
 def _unverified_backstop_line(backstop: dict, sl, tp) -> str:

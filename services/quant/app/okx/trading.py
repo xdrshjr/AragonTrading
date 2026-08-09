@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import time
+from dataclasses import replace
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -21,14 +22,17 @@ from ..config import Settings
 from ..db import repositories as repo
 from .accounts import AccountCredentials, _map_okx_code, _normalize_position, _redact
 from .order_builder import (
+    AlgoStopInput,
     CancelOrderInput,
     ClosePositionInput,
     InstrumentMeta,
     OrderInput,
+    build_algo_stop_payload,
     build_close_order_payload,
     build_order_payload,
     ensure_instrument_supported,
     is_instrument_supported,
+    validate_algo_stop,
     validate_close,
     validate_order,
 )
@@ -46,6 +50,10 @@ _LOCAL_REJECT_CODES = {
 # 对未知码一律拍平为 OKX_ERROR——既违反「原样回传前端」契约，又使本地拒被误判为 error 而非 rejected。
 _CLOSE_LOCAL_REJECT_CODES = {
     "LIVE_CLOSE_REJECTED_LOCAL", "LIVE_CLOSE_SIZE_EXCEEDS", "LIVE_NO_POSITION"}
+# 补挂止损的本地拦截类语义码（backstop-repair §2.2.3 H2）：同样须显式纳入透传集合，否则会被
+# `_map_okx_code` 对未知码一律拍平为 OKX_ERROR，端点就再也分不清「本地拒」与「交易所拒」。
+_BACKSTOP_LOCAL_REJECT_CODES = {
+    "LIVE_BACKSTOP_REJECTED_LOCAL", "LIVE_BACKSTOP_SIZE_EXCEEDS", "LIVE_NO_POSITION"}
 # clOrdId 进程内单调序号（与毫秒时间戳拼接，确保同毫秒并发也唯一，C1-2）。
 _clord_counter = itertools.count()
 
@@ -57,6 +65,10 @@ def _map_trade_code(code: str) -> str:
     「已撤销」意味着无持仓、「已成交」意味着有真实持仓，两者的持仓后果完全相反。把它们压成同一个
     「订单不在了」的归一码，正是本仓选用 ``GET /trade/order`` 而非 ``orders-pending`` 时所要规避的
     同一个二义陷阱。
+
+    ⚠ **新增归一码时必须同步在 ``okx/error_text.py`` 补一句中文**，否则它会以原始英文出现在用户的
+    卡片与模型的 prompt 里——下面这些码的中文此前只活在行尾注释里，等于没有。该同步由
+    ``test_ai_trade_backstop_repair_io.py`` 的 AST 门禁强制：漏一个即红。
     """
     mapping = {
         "51008": "INSUFFICIENT_BALANCE",   # 可用余额 / 保证金不足
@@ -73,7 +85,7 @@ def _map_trade_code(code: str) -> str:
     if code in mapping:
         return mapping[code]
     if (code in _LOCAL_REJECT_CODES or code in _CLOSE_LOCAL_REJECT_CODES
-            or code == "LIVE_TRADING_DISABLED"):
+            or code in _BACKSTOP_LOCAL_REJECT_CODES or code == "LIVE_TRADING_DISABLED"):
         return code
     return _map_okx_code(code)
 
@@ -263,6 +275,73 @@ async def close_live_position(session: AsyncSession, creds: AccountCredentials, 
     return {"ok": True, "mode": close.ord_type, "ordId": ord_id or None,
             "clOrdId": str(row.get("clOrdId") or cl_ord_id), "closedSz": closed_sz,
             "code": None, "message": None}
+
+
+def _backstop_audit_values(account_id: int, stop: AlgoStopInput, direction: str, sz: float, *,
+                           status: str, ord_id: str,
+                           error_code: str) -> repo.LiveOrderAuditValues:
+    """补挂止损留痕（复用 ``live_order_audit``，**零迁移**：只是 ``ord_type`` 的一个新取值）。
+
+    ``ord_id`` 落 OKX 的 ``algoId``、``cl_ord_id`` 落我方 ``algoClOrdId``（两列都是自由 String）。
+    ``px``/``lever``/``tp_trigger_px`` 恒空——补挂只有一条止损腿、不设杠杆、不带委托价（触发后市价）。
+    """
+    return repo.LiveOrderAuditValues(
+        account_id=account_id, inst_id=stop.inst_id, direction=direction,
+        ord_type="conditional", td_mode=stop.td_mode, px=None, sz=sz, lever=None,
+        tp_trigger_px=None, sl_trigger_px=stop.stop_px, status=status,
+        cl_ord_id=stop.algo_cl_ord_id, ord_id=ord_id, error_code=error_code,
+        created_ts=int(time.time()))
+
+
+async def place_backstop_stop(session: AsyncSession, creds: AccountCredentials, account_id: int,
+                              stop: AlgoStopInput) -> dict:
+    """补挂交易所侧止损（ai-trade-backstop-repair-and-net-backtest §2.2.2）。
+
+    时序：``_load_meta → ensure_instrument_supported → posMode → 实时 |pos| → H2 → order-algo →
+    留痕``。与 ``place_live_order``（:144）的三点差异**都是刻意的**：
+
+    * **不设杠杆**——补挂不改变仓位参数；
+    * **不查** ``_would_reduce_net_position``——本单本就是减仓单，那条守卫的语义正相反；
+    * **不应用名义上限**——沿用本文件 :224-225 已确立的减仓腿豁免（「平仓**不**应用名义上限与反向
+      减仓护栏（平仓即减仓，是动作目的）；仅以实时 ``|pos|`` 二次校验 ``sz≤|pos|``」）。
+
+    张数在此**按实时 ``abs_pos`` 重算一次**（[P0-4]）：调用方给的 ``stop.sz`` 只是纯核心算出的
+    预览值（它手里只有本会话自管仓）。真正的上界是 ``min(abs_pos, 自管仓) − 已覆盖``。
+
+    Returns:
+        ``{ok, algoId, algoClOrdId, sz, stopPx, code, message}``（``code``/``message`` 恒 None）。
+
+    Raises:
+        OKXPrivateError: 本地拦截 / OKX 拒单 / 连通失败——归一 + 脱敏 + 落审计后上抛，绝不假成功。
+    """
+    direction = _closed_direction(stop.pos_side, stop.pos)
+    client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
+    sz = float(stop.sz)
+    try:
+        meta = await _load_meta(stop.inst_id)
+        ensure_instrument_supported(meta)
+        pos_mode = str((await client.get_account_config()).get("posMode") or "long_short_mode")
+        abs_pos = _abs_open_pos(await client.get_positions(), stop.inst_id, stop.pos_side)
+        if abs_pos <= 0:
+            raise OKXPrivateError("LIVE_NO_POSITION", "该方向当前无持仓，无需补挂止损")
+        sz = validate_algo_stop(stop, meta, abs_pos=abs_pos)["sz"]
+        row = await client.place_algo_order(
+            build_algo_stop_payload(replace(stop, sz=sz), meta, pos_mode))
+    except OKXError as exc:
+        mapped = _map_trade_code(exc.code)
+        status = "rejected" if mapped in _BACKSTOP_LOCAL_REJECT_CODES else "error"
+        await repo.create_live_order_audit(session, values=_backstop_audit_values(
+            account_id, stop, direction, sz, status=status, ord_id="", error_code=mapped))
+        raise OKXPrivateError(mapped,
+                              _redact(exc.message, creds.secret_key, creds.passphrase)) from exc
+    finally:
+        await client.aclose()
+    algo_id = str(row.get("algoId") or "")
+    await repo.create_live_order_audit(session, values=_backstop_audit_values(
+        account_id, stop, direction, sz, status="accepted", ord_id=algo_id, error_code=""))
+    return {"ok": True, "algoId": algo_id or None,
+            "algoClOrdId": str(row.get("algoClOrdId") or stop.algo_cl_ord_id),
+            "sz": sz, "stopPx": stop.stop_px, "code": None, "message": None}
 
 
 # 撤单三态归因（ai-trade-limit-orders §2.5/§4.4，P0-2）：撤单**不是**成功/失败两态——第三态是

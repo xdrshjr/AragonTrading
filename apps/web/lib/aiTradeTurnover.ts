@@ -181,13 +181,23 @@ function unverifiedRow(wire: AiTradeBackstopWire): TurnoverRow {
 
 /**
  * 卡片排序键（§2.4.2「最紧要优先」）：数字越小越靠前。
- * `mismatch` > 覆盖不足 > 冷却中 > 预算耗尽 > 正常。
+ * `mismatch` / 自愈失败 / 现价已越过 > 覆盖不足 > **补挂待授权** > 冷却中 > 预算耗尽 > 正常。
+ *
+ * **[P1-7] 本函数与 `describeTurnoverChip` 必须同一处改。** 后者用 `severity === n` 的硬编码
+ * 分支读它——中间插一格而不同步改 chip，冷却态就会被渲染成预算态、预算态返回 `null`，面板上
+ * 最显眼的那一格开始说错话，且没有任何类型错误。
+ *
+ * 自愈的两格并入最高优先级是刻意的：`failed` 与 `px_through` 都意味着**此刻没有兜底而系统也
+ * 补不上**，它比「覆盖只有 60%」更紧要。`planned` 只是「等你点一下」，故排在覆盖不足之后。
  */
 export function turnoverSeverity(
   turnover?: AiTradeTurnoverWire | null,
   backstop?: AiTradeBackstopWire | null,
 ): number {
+  const repair = backstop?.repair;
   if (backstop?.basis === "exchange" && backstop.mismatch) return 0;
+  if (repair?.state === "failed") return 0;
+  if (repair?.state === "blocked" && repair.blockedReason === "px_through") return 0;
   if (
     backstop?.basis === "exchange" &&
     backstop.coverageRatio != null &&
@@ -195,9 +205,10 @@ export function turnoverSeverity(
   ) {
     return 1;
   }
-  if (turnover?.cooldownActive) return 2;
-  if (turnover?.budgetEnabled && (turnover.tokens ?? 0) < 1) return 3;
-  return 4;
+  if (repair?.state === "planned") return 2;
+  if (turnover?.cooldownActive) return 3;
+  if (turnover?.budgetEnabled && (turnover.tokens ?? 0) < 1) return 4;
+  return 5;
 }
 
 /** 面板 chip：只显示**最紧要的一格**；正常态返回 null ⇒ 不占位（R-7 信息过载）。 */
@@ -206,21 +217,22 @@ export function describeTurnoverChip(
   backstop?: AiTradeBackstopWire | null,
 ): { label: string; tone: TurnoverTone } | null {
   const severity = turnoverSeverity(turnover, backstop);
-  if (severity === 0) return { label: "交易所兜底：核实为未挂", tone: "short" };
+  if (severity === 0) return { label: topSeverityLabel(backstop), tone: "short" };
   if (severity === 1) {
     return {
       label: `交易所兜底覆盖 ${Math.round((backstop?.coverageRatio ?? 0) * 100)}%`,
       tone: "short",
     };
   }
-  if (severity === 2) {
+  if (severity === 2) return { label: "交易所兜底待补挂", tone: "accent" };
+  if (severity === 3) {
     const side = SIDE_LABEL[turnover?.cooldownSide ?? ""] ?? "同向";
     return {
       label: `再入场冷却 ${formatHoldDuration(turnover?.cooldownRemainingSeconds)}（${side}）`,
       tone: "accent",
     };
   }
-  if (severity === 3) {
+  if (severity === 4) {
     const eta =
       turnover?.nextTokenSeconds == null
         ? ""
@@ -228,6 +240,13 @@ export function describeTurnoverChip(
     return { label: `换手预算已用尽${eta}`, tone: "short" };
   }
   return null;
+}
+
+/** 最高优先级那一格的三种成因；`mismatch` 优先（它是「本地以为有、其实没有」这条最危险的读数）。 */
+function topSeverityLabel(backstop?: AiTradeBackstopWire | null): string {
+  if (backstop?.basis === "exchange" && backstop.mismatch) return "交易所兜底：核实为未挂";
+  if (backstop?.repair?.state === "failed") return "交易所兜底补挂失败";
+  return "现价已越过止损价，系统拒绝补挂";
 }
 
 /** 「多久之前」——秒级也要说得出口（与后端 `_fmt_ago` 同口径）。 */

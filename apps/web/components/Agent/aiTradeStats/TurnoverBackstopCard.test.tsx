@@ -1,8 +1,12 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
 import TurnoverBackstopCard from "./TurnoverBackstopCard";
 import type { TurnoverBackstopMember } from "./TurnoverBackstopCard";
-import type { AiTradeBackstopWire, AiTradeTurnoverWire } from "@/lib/aiTradeTypes";
+import type {
+  AiTradeBackstopRepairWire,
+  AiTradeBackstopWire,
+  AiTradeTurnoverWire,
+} from "@/lib/aiTradeTypes";
 
 function turnover(over: Partial<AiTradeTurnoverWire> = {}): AiTradeTurnoverWire {
   return {
@@ -41,6 +45,25 @@ function backstop(over: Partial<AiTradeBackstopWire> = {}): AiTradeBackstopWire 
     localStopLossPx: 62140,
     localTakeProfitPx: 68000,
     mismatch: false,
+    ...over,
+  };
+}
+
+function repair(over: Partial<AiTradeBackstopRepairWire> = {}): AiTradeBackstopRepairWire {
+  return {
+    mode: "plan",
+    state: "planned",
+    blockedReason: null,
+    plannedStopPx: 62140,
+    plannedSz: 3,
+    coveredSz: 0,
+    positionSz: 3,
+    attemptsEpoch: 0,
+    maxPerEpoch: 2,
+    attemptsSession: 0,
+    maxPerSession: 8,
+    coolingSeconds: null,
+    lastResult: null,
     ...over,
   };
 }
@@ -141,5 +164,90 @@ describe("TurnoverBackstopCard", () => {
     expect(card.textContent).toContain("只约束建立新敞口的那一腿");
     expect(card.textContent).toContain("平仓腿一定会执行");
     expect(card.textContent).toContain("本会话");
+  });
+});
+
+describe("TurnoverBackstopCard · 兜底自愈第五行（backstop-repair §2.4.2）", () => {
+  it("U-17 `repair` 键缺席 ⇒ 第五行不渲染（整层未装配的会话上不挂一个空壳）", () => {
+    render(<TurnoverBackstopCard members={[member()]} />);
+    expect(screen.queryByTestId("ai-turnover-row-repair")).toBeNull();
+  });
+
+  it("U-18 `idle` 同样不渲染——「一切正常」不需要占一行", () => {
+    render(
+      <TurnoverBackstopCard
+        members={[member({ backstop: backstop({ repair: repair({ state: "idle" }) }) })]}
+      />,
+    );
+    expect(screen.queryByTestId("ai-turnover-row-repair")).toBeNull();
+  });
+
+  it("`planned` ⇒ 第五行在场，且带一颗「立即补挂」按钮", () => {
+    const onRepair = vi.fn();
+    render(
+      <TurnoverBackstopCard
+        members={[member({ backstop: backstop({ hasStop: false, coverageRatio: 0, repair: repair() }) })]}
+        onRepair={onRepair}
+      />,
+    );
+    expect(screen.getByTestId("ai-turnover-row-repair").textContent).toContain("方案就绪");
+    fireEvent.click(screen.getByTestId("ai-turnover-repair-BTC-USDT-SWAP"));
+    expect(onRepair).toHaveBeenCalledWith("BTC-USDT-SWAP");
+  });
+
+  it("不传 `onRepair` ⇒ 不渲染按钮（历史页这类只读场景不该出现一个点了没反应的按钮）", () => {
+    render(
+      <TurnoverBackstopCard
+        members={[member({ backstop: backstop({ hasStop: false, coverageRatio: 0, repair: repair() }) })]}
+      />,
+    );
+    expect(screen.queryByTestId("ai-turnover-repair-BTC-USDT-SWAP")).toBeNull();
+  });
+
+  it("U-19 请求态：点击后禁用且文案变「补挂中…」（态由父组件传入，卡片保持无状态）", () => {
+    render(
+      <TurnoverBackstopCard
+        members={[member({ backstop: backstop({ hasStop: false, coverageRatio: 0, repair: repair() }) })]}
+        onRepair={vi.fn()}
+        repairPending={{ "BTC-USDT-SWAP": { pending: true } }}
+      />,
+    );
+    const button = screen.getByTestId("ai-turnover-repair-BTC-USDT-SWAP") as HTMLButtonElement;
+    expect(button.textContent).toBe("补挂中…");
+    expect(button.disabled).toBe(true);
+  });
+
+  it("刚完成 ⇒ 按钮禁用并把结果写进本行 detail（失败时显示中文标签，不显示裸码）", () => {
+    render(
+      <TurnoverBackstopCard
+        members={[member({ backstop: backstop({ hasStop: false, coverageRatio: 0, repair: repair() }) })]}
+        onRepair={vi.fn()}
+        repairPending={{
+          "BTC-USDT-SWAP": { result: { ok: false, message: "现价已越过本地止损价（51008）" } },
+        }}
+      />,
+    );
+    const button = screen.getByTestId("ai-turnover-repair-BTC-USDT-SWAP") as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(screen.getByTestId("ai-turnover-row-repair").textContent).toContain("现价已越过本地止损价");
+  });
+
+  it("`px_through` 不给按钮——重试只会更快地做错事（补一张立刻触发的止损=立刻市价平仓）", () => {
+    render(
+      <TurnoverBackstopCard
+        members={[
+          member({
+            backstop: backstop({
+              hasStop: false,
+              coverageRatio: 0,
+              repair: repair({ state: "blocked", blockedReason: "px_through" }),
+            }),
+          }),
+        ]}
+        onRepair={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId("ai-turnover-row-repair").textContent).toContain("已暂缓");
+    expect(screen.queryByTestId("ai-turnover-repair-BTC-USDT-SWAP")).toBeNull();
   });
 });

@@ -55,6 +55,7 @@ import {
   parseOptionalUsd,
 } from "@/lib/liveAuto";
 import type {
+  AiTradeBackstopRepairMode,
   AiTradeBaseRules,
   AiTradeGivebackTier,
   AiTradeHorizonProfile,
@@ -241,6 +242,11 @@ export default function AiTradeLaunchModal({
     defaultTradingHorizon?.profile ?? null,
   );
   const [horizonCustom, setHorizonCustom] = useState(() => seedHorizonCustom(defaultTradingHorizon));
+  // 交易所侧兜底自愈模式（backstop-repair §2.4.1）。`null` = 本次尚未主动选过 ⇒ 采用接口下发的
+  // `defaultMode`（同 `horizonProfileRaw` 的既有姿态：绝不在前端硬编一个默认值与服务端各存一份）。
+  // **[P2-6] 刻意不进偏好回填链**（`defaultTradingHorizon`）：`arm` 是「允许系统在你不在场时下单」
+  // 的授权，每次重新授权比记住上次更安全——这是一次有意的选择，不是遗漏。
+  const [repairMode, setRepairMode] = useState<AiTradeBackstopRepairMode | null>(null);
   const [startInput, setStartInput] = useState("");
   const [endInput, setEndInput] = useState("");
   const [everyRaw, setEveryRaw] = useState("");
@@ -320,6 +326,7 @@ export default function AiTradeLaunchModal({
     setHorizonEnabled(defaultTradingHorizon?.enabled ?? true);
     setHorizonProfileRaw(defaultTradingHorizon?.profile ?? null);
     setHorizonCustom(seedHorizonCustom(defaultTradingHorizon));
+    setRepairMode(null);   // 同上：新增受控输入**必须**塞进这个既有 [open] effect（U-21 守它）
     setCapitalRaw("");
     setLeverageRaw("");
     setTakeProfitRaw("");
@@ -441,10 +448,13 @@ export default function AiTradeLaunchModal({
   // 一个本应按默认模式生效的会话静默降级成空转契约——那是本层最不该出现的失效方式。
   const horizonProfile = horizonProfileRaw ?? horizonQ.data?.defaultProfile ?? null;
   const horizonProfileId = (horizonProfile ?? "custom") as AiTradeHorizonProfileId;
+  // 自愈模式：用户没主动选过 ⇒ **不带该键**，交由服务端按运维缺省回填（与 `profile` 同款姿态：
+  // 前端拿一个本地默认顶上，会让「弹窗显示的」与「实际落地的」在运维改配置后静默分叉）。
   const tradingHorizonPayload: AiTradeHorizonRule = horizonEnabled
     ? {
         enabled: true,
         ...(horizonProfile ? { profile: horizonProfile } : {}),
+        ...(repairMode ? { backstopRepair: repairMode } : {}),
         ...horizonOverrides(horizonProfileId, horizonCustom),
       }
     : { enabled: false };
@@ -649,6 +659,8 @@ export default function AiTradeLaunchModal({
           leverage={leverage.value}
           stopLossPct={stopLossPct.value}
           defaultStopLossPct={AI_TRADE_DEFAULT_OCO_SL_PCT}
+          backstopRepairMode={repairMode}
+          onBackstopRepairModeChange={setRepairMode}
           wakeMinutes={wakeMinutes}
           onAlign={() => alignToProfile(activeHorizonProfile ?? undefined)}
           disabled={submitting}

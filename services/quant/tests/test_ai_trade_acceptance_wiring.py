@@ -444,10 +444,17 @@ def test_shared_execution_files_have_zero_diff():
     assert frozen & changed == set()
 
 
-def test_backtest_cost_model_funding_args_are_unchanged():
-    """G-5 [P1-5]：`backtest.py` 里喂给成本模型的 `funding=None, funding_enabled=False`
-    实参**零改动**——那两处是 G3 迟滞与 edge 门禁的往返成本估算，不是资金费记账现场；
-    照字面「修」它们会当场改变门禁判定。按 AST 断言，不靠肉眼。"""
+def test_backtest_cost_model_funding_args_come_from_one_source():
+    """G-5 **冻结方向反转**（ai-trade-backstop-repair-and-net-backtest 轴 B）。
+
+    本轮之前这条用例冻结的是「两处成本估算现场**保持** `funding=None, funding_enabled=False`」，
+    理由是：那时修它们会当场改变 G3 迟滞与 edge 门禁在回测里的判定，与该轮「不动任何既有门禁
+    判定式」的边界正面冲突（登记为欠账 D-9）。轴 B 的边界不同——它**就是**来还这笔账的，方向是
+    让回测向实盘收敛（回测按「资金费为 0」判定、实盘按真实资金费判定，模式越长回测越乐观）。
+
+    故本用例改为冻结新契约，守的东西一个没少：两处判定现场的资金费入参必须来自**同一个**
+    `_cost_funding`（不得出现第二条估算路径），且不得再退回任何字面量。仍按 AST 断言，不靠肉眼。
+    """
     source = (_REPO_ROOT / "services/quant/app/ai_auto/backtest.py").read_text("utf-8")
     tree = ast.parse(source)
     by_callee: dict[str, list[dict]] = {}
@@ -456,17 +463,22 @@ def test_backtest_cost_model_funding_args_are_unchanged():
                 "query_for_preview", "evaluate_edge_gate"):
             by_callee.setdefault(node.func.id, []).append(
                 {kw.arg: kw.value for kw in node.keywords})
-    # 现场一：G3 换手迟滞的往返成本估算（`_horizon_facts`）。
-    preview = by_callee.get("query_for_preview") or []
-    assert len(preview) == 1
-    assert isinstance(preview[0]["funding"], ast.Constant)
-    assert preview[0]["funding"].value is None
-    assert preview[0]["funding_enabled"].value is False
+    # 现场一：G3 换手迟滞的往返成本估算（`_horizon_facts`）——两个入参都是 `_cost_funding`
+    # 解包出来的名字（另一处 `query_for_preview` 是 notes 的口径披露，不是判定现场）。
+    judged = [kw for kw in (by_callee.get("query_for_preview") or [])
+              if isinstance(kw.get("funding"), ast.Name)]
+    assert len(judged) == 1
+    assert isinstance(judged[0]["funding_enabled"], ast.Name)
     # 现场二：最小 edge 门禁（`_run_decision`）。
     gate = by_callee.get("evaluate_edge_gate") or []
     assert len(gate) == 1
-    assert gate[0]["funding_enabled"].value is False
-    assert "funding" not in gate[0]      # 保持默认（None），本轮不喂真实快照
+    assert isinstance(gate[0]["funding"], ast.Name)
+    assert isinstance(gate[0]["funding_enabled"], ast.Name)
+    # 唯一真源：判定现场恰好各调一次 `_cost_funding`，多出来的就是第二条估算路径。
+    sources = [n for n in ast.walk(tree)
+               if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+               and n.func.attr == "_cost_funding"]
+    assert len(sources) == 2
 
 
 def test_no_new_self_settings_in_session():

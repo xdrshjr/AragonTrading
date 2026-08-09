@@ -356,6 +356,30 @@ class Settings(BaseSettings):
     ai_trade_backstop_max_age_s: float = Field(default=300.0, ge=60, le=86400)
     ai_trade_backstop_min_coverage: float = Field(default=0.999, gt=0, le=1)
     ai_trade_backstop_gate_scale_in: bool = True      # G6；关 ⇒ 只报不拦
+    # ---- 交易所侧兜底自愈（ai-trade-backstop-repair-and-net-backtest §2.2）----
+    # 上一轮把「交易所侧到底挂着什么」做成了可核实的事实，但检测到「没有兜底」之后系统什么都不做：
+    # 一个 trend_hold 会话会带着一个裸露的仓位继续跑 1–3 天。本段补上执行体。
+    # 总闸关 ⇒ 整层不装配、`horizon.backstop.repair` 整键缺席、prompt 逐字回退到上一轮的五句、
+    # 人工端点 404、一个写请求都不发。
+    ai_trade_backstop_repair_enabled: bool = True
+    # 缺省模式（启动请求未显式指定时回填）。**默认 plan**：本轮是本仓库第一条 AI 侧自动写路径，
+    # 默认给方案 + 一键执行，而不是默认自动花钱（§九 D-1）。
+    ai_trade_backstop_repair_default_mode: Literal["plan", "arm"] = "plan"
+    # 触发价与现价之间要求的最小距离（bps）。补一张会立刻触发的止损 = 立刻市价平仓，
+    # 那是把安全层变成亏钱机器的最短路径（H1-e）。
+    ai_trade_backstop_repair_min_gap_bps: float = Field(default=15.0, ge=0, le=1000)
+    # 单持仓周期内最多补几次；**0 ⇒ 本层整体关闭（自动与人工都不补）**，不是「无限次」。
+    ai_trade_backstop_repair_max_per_epoch: int = Field(default=2, ge=0, le=10)
+    ai_trade_backstop_repair_cooldown_s: float = Field(default=60.0, ge=0, le=3600)
+    ai_trade_backstop_repair_max_per_session: int = Field(default=8, ge=0, le=100)
+    # 覆盖率阈值**不新开旋钮**：恒复用 `ai_trade_backstop_min_coverage`（G6 的同一个数）。
+    # 判定价年龄阈同理复用 `ai_trade_profit_guard_max_px_age_s`（默认 90s，本层是它的第三个复用方）
+    # ——用一个过期的价去论证「现价还没越过止损」，正是「补一张会立刻触发的止损」最现实的发生路径。
+    # ---- 回测净额真值（§2.3）----
+    # 回测的**记账**自上一轮起已含真实资金费，但**成本估算**两个入口仍硬传 funding_enabled=False，
+    # 于是 G3 与 edge 门禁在回测里按「资金费为 0」判定，模式越长越乐观。
+    # 关 ⇒ 两处入参逐字节回退到本轮之前的 `(None, False)`，回测结果逐字节相同。
+    ai_trade_funding_cost_backtest_enabled: bool = True
     # ---- AI 自动交易 · 持仓周期验收闭环（ai-trade-horizon-acceptance-loop §5.1）----
     # 轴 A：资金费真值化。总闸关 ⇒ 账本恒空转、`aiStats.funding` 整键缺席、验收卡第 5 行判
     # insufficient。本开关**必须**并进 `CostRuntime` 里 `FundingCache` 的 enabled 析取式

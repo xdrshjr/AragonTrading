@@ -3,6 +3,7 @@
 import { ApiRequestError } from "./api";
 import { ReconnectingWS, type WsEvent } from "./ws";
 import type {
+  AiTradeBackstopRepairResult,
   AiTradeGroupMemberStopResult,
   AiTradeGroupStartReq,
   AiTradeGroupStartResult,
@@ -51,6 +52,13 @@ export const aiTradeApi = {
   stopMember: (groupId: string, instId: string) =>
     request<AiTradeGroupMemberStopResult>(
       `/ai-trade/${groupId}/member/${encodeURIComponent(instId)}/stop`,
+      { method: "POST" },
+    ),
+  // 人工授权的**单次**交易所侧兜底补挂（backstop-repair §4.1）。与自动路径共用同一个判定与同一条
+  // 写路径，只绕过 `mode`、绝不绕过三道锁；被拦下即 409（`blockedReason` 与卡片、prompt 同值域）。
+  repairBackstop: (groupId: string, instId: string) =>
+    request<AiTradeBackstopRepairResult>(
+      `/ai-trade/${groupId}/member/${encodeURIComponent(instId)}/backstop/repair`,
       { method: "POST" },
     ),
   // 当前活跃分组 + 是否启用（只读，重载后据此重连各成员 WS）。

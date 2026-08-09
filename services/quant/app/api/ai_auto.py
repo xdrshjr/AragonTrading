@@ -20,6 +20,8 @@ from ..ai_auto.backtest_manager import (
     AiBacktestStartRequest,
     get_ai_backtest_manager,
 )
+from ..ai_auto.backstop_repair import AiTradeRepairBlocked
+from ..ai_auto.backstop_repair import fail_message as repair_fail_message
 from ..ai_auto.base_rules import MaBandRule, resolve_ma_band_rule
 from ..ai_auto.cost_runtime import CostRuntime
 from ..ai_auto.hold_horizon import HorizonRule, profiles_wire, resolve_horizon_rule
@@ -37,6 +39,7 @@ from ..config import Settings, get_settings
 from ..db import ai_prior_repositories as prior_repo
 from ..db import repositories as repo
 from ..db.session import get_session
+from ..okx.private_client import OKXPrivateError
 from ..okx.types import BAR_SECONDS
 from ..paper.strategy_factory import build_paper_strategy_spec
 from ..schemas import (
@@ -283,6 +286,38 @@ async def ai_trade_stop(group_id: str) -> dict:
 async def ai_trade_member_stop(group_id: str, inst_id: str) -> dict:
     """仅停某成员（其余续跑；不守门）；停后无运行成员则分组清空。"""
     result = await get_ai_trade_manager().stop_member(group_id, inst_id)
+    if result is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "分组或成员不存在"})
+    return result
+
+
+@router.post("/ai-trade/{group_id}/member/{inst_id}/backstop/repair")
+async def ai_trade_member_backstop_repair(group_id: str, inst_id: str) -> dict:
+    """人工授权的**单次**交易所侧兜底补挂（ai-trade-backstop-repair-and-net-backtest §4.1）。
+
+    与自动路径共用同一个 `plan_repair` 与同一条写路径，**只绕过 `mode`，绝不绕过 H1/H2/H3**。
+
+    **刻意不守 AI 总闸**（与 `/ai-trade/{gid}/stop` 同理，D-11）：补挂是收敛风险的动作，任何时候
+    都该能执行。它守的是运维总闸——总闸关 ⇒ 整层未装配 ⇒ 会话侧抛 `not_applicable` ⇒ 本处 409。
+
+    错误映射（端点层是唯一的翻译点）：`AiTradeRepairBlocked` → 409 + `blockedReason`；
+    `OKXPrivateError` → 502 + 原始 sCode + **中文原因在前**（§4.1；交易所原文常是英文，而 `plan`
+    是默认模式 ⇒ 人工那一发的失败提示往往是用户对本层唯一的一次阅读，绝不能只给一串归一码）；
+    分组 / 成员缺失 → 404（镜像 `stop_member`）。message 已在服务层经 `_redact` 脱敏。
+    """
+    try:
+        result = await get_ai_trade_manager().repair_member(group_id, inst_id)
+    except AiTradeRepairBlocked as exc:
+        raise HTTPException(409, detail={"code": "AI_TRADE_BACKSTOP_NOT_REPAIRABLE",
+                                         "message": exc.message,
+                                         "blockedReason": exc.reason}) from exc
+    except OKXPrivateError as exc:
+        text = str(exc.message or "")
+        why = repair_fail_message(exc.code)
+        raise HTTPException(502, detail={
+            "code": exc.code,
+            "message": f"{why}：{text}" if text and why not in text else (text or why),
+        }) from exc
     if result is None:
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "分组或成员不存在"})
     return result

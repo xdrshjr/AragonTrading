@@ -30,6 +30,8 @@ from ..okx.types import BAR_SECONDS, Candle
 from ..okx.ws_client import OKXWSClient
 from ..paper.strategy_factory import PaperStrategySpec
 from ..strategies.base import Signal
+from .backstop_repair import (RepairRuntime, repair_now_from_executor,
+                              rule_from_settings as repair_rule_from_settings, schedule_repair)
 from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, gate_status
 from .cost_runtime import CostRuntime
 from .decider import AiTradeDecider, TradeDecision
@@ -171,10 +173,18 @@ class AiTradeSession:
         self.horizon_rule = horizon_rule
         # `net_mode`：退出来源账本的净额还原口径，与 `AttributionLedger` **同一条规则**（轴 B）。
         self._backstop = BackstopRuntime(executor.settings, executor.creds, inst_id)
+        self.started_ts = int(time.time())
+        self._repair = RepairRuntime(
+            executor.settings,
+            repair_rule_from_settings(executor.settings,
+                                      getattr(horizon_rule, "backstop_repair_mode", None),
+                                      horizon_armed=horizon_rule is not None),
+            executor, inst_id, session_key=f"{inst_id}|{self.started_ts}",
+            verify_hook=self._backstop.force_next)
         self._horizon = HorizonRuntime(
             horizon_rule, net_mode=bool(executor.settings.ai_trade_net_pnl_enabled),
             turnover_rule=turnover_rule_from_horizon(horizon_rule, executor.settings),
-            backstop=self._backstop)
+            backstop=self._backstop, repair=self._repair)
         self._round_horizon: dict | None = None      # 本轮 gate 快照（decision 事件与判定同源）
         hold_bars = None if horizon_rule is None else horizon_rule.expected_hold_bars
         self._cost = CostRuntime(inst_id, executor.settings, executor.fee_ledger,
@@ -191,7 +201,6 @@ class AiTradeSession:
 
         self.state = "running"
         self.stop_reason: str | None = None
-        self.started_ts = int(time.time())
         self.rounds_completed = 0
         self.flatten_result: dict | None = None
         self.flatten_failed = False
@@ -309,6 +318,7 @@ class AiTradeSession:
                     self._horizon.note_close(trade, time.time())   # 真实持仓时长样本同挂唯一收口
                 else:   # 开仓成交：锁定 epoch 的 opened_wall（部分成交同一 epoch ⇒ 内部幂等不重置）
                     self._horizon.note_open(trade, time.time(), seq=self._position_seq)
+                    self._repair.note_epoch(self._position_seq)   # 新持仓周期 ⇒ 补挂配额清零
                     self._backstop.force_next()   # 随单 OCO 是否真的挂上，是开仓后最该立刻知道的事
                     self._cost.note_open(trade, seq=self._position_seq, now_wall=time.time())
                 self._sizing.note_executor(self.executor, self._current_px())   # [P1-8] 敞口簿
@@ -398,6 +408,7 @@ class AiTradeSession:
         self._cancel_task("_monitor_task")
         self._cancel_task("_decision_task")
         self._backstop.close()   # 在途核实回来后不再写状态、不再推事件（§2.3.1 约束 5）
+        self._repair.close()     # 同上：在途补挂回来后不再写状态、不再推事件
         if self._ws is not None:
             await self._ws.stop()
         ref_px = self._ref_px()
@@ -485,6 +496,12 @@ class AiTradeSession:
                                         mark_px=self._current_px())
         schedule_from_executor(self._backstop, self.executor, now_wall=time.time(),
                                push=self._push)   # 只读、单飞、仅持仓时发（turnover-budget §2.3.1）
+        # ★ 交易所侧兜底自愈（backstop-repair §2.2）：状态变化即补推一次 status（[P1-3]）——全量
+        # 快照不挂 5s 盯市 tick，而本层的目标用户恰是唤醒周期 0、决策轮以小时计的 trend_hold。
+        schedule_repair(self._repair, self._backstop, self.executor,
+                        self._session_readings(time.time()), push=self._push,
+                        on_change=lambda: self._push({"type": "status",
+                                                      "data": self._status_payload()}))
         # 战术窗口刷新**必须**排在定时唤醒之前——否则定时轮拿到的是上一分钟的战术数据，整个特性
         # 在最该生效的路径上空转。三闸门（锚点/配额/单 tick 节流）+ 硬超时保证它不拖停盯市。
         await self._window.maybe_refresh_tactical(now_ts, time.time())
@@ -1003,6 +1020,13 @@ class AiTradeSession:
                 "message": (f"基础策略的 MA 通道已连续 {self._band_unavailable_streak} 轮无法计算"
                             f"（需至少 {self.base_rule.period + 1} 根 K 线），期间开仓一律降级观望；"
                             "平仓与撤单不受影响")}})
+
+    async def repair_backstop(self) -> dict:
+        """人工授权的单次补挂（backstop-repair §4.1）：与自动路径共用同一个 `plan_repair` 与同一条
+        写路径，**只绕过 `mode`，绝不绕过 H1/H2/H3**；完成后补推一条 status（[P1-3]）。"""
+        return await repair_now_from_executor(
+            self._repair, self._backstop, self.executor, self._session_readings(time.time()),
+            on_change=lambda: self._push({"type": "status", "data": self._status_payload()}))
 
     def _horizon_facts(self, now_wall: float) -> HorizonFacts:
         """本轮持仓周期断面（成本按**持仓方向**估，[P1-2]：按动作推方向会让平多仓恒记 0 资金费）。"""

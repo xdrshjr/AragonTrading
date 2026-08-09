@@ -585,6 +585,11 @@ class AiTradeHorizonIn(BaseModel):
     # 承诺的那个数与运行期真正执行的数可以分叉（D-1）。
     reentryCooldownSeconds: float | None = Field(default=None, ge=0, le=604800)
     turnoverBudgetPerDay: float | None = Field(default=None, ge=0, le=1000)
+    # 交易所侧兜底自愈模式（ai-trade-backstop-repair-and-net-backtest §4.3）。
+    # `null` / 缺省 ⇒ 服务端按 `ai_trade_backstop_repair_default_mode` 回填（只回填、不复夹）；
+    # 值域在本层 422——`arm` 是本仓库唯一一处「允许系统在你不在场时向交易所发出委托」的授权点，
+    # 它必须是一次显式选择，不能靠一个拼错的字符串滑进去。
+    backstopRepair: Literal["plan", "arm"] | None = None
 
     @model_validator(mode="after")
     def _check_target_range(self) -> "AiTradeHorizonIn":
@@ -736,6 +741,29 @@ class AiTradeHorizonProfileOut(BaseModel):
     acceptance: AiTradeAcceptanceThresholdsOut | None = None
 
 
+class AiTradeBackstopRepairModeOut(BaseModel):
+    """自愈控件的一个选项（`plan` / `arm`）——标签与说明**全部由后端下发**，前端一个字都不硬编。"""
+
+    id: str
+    label: str
+    detail: str
+
+
+class AiTradeBackstopRepairOut(BaseModel):
+    """`GET /ai-trade/horizon-profiles` 的自愈块（backstop-repair §4.2，加法字段）。
+
+    [P0-3] **本块必须在这里显式开字段**：该端点声明了 `response_model`，`profiles_wire` 多下发的
+    键会被 FastAPI **静默剔除**；而前端规则是「整块缺席 ⇒ 不渲染控件」，两条一叠就是「控件永远
+    不出现，且没有任何前端用例会红」（手造 wire 的用例守不住这一格，只有真端点用例能）。
+    """
+
+    defaultMode: str
+    modes: list[AiTradeBackstopRepairModeOut] = Field(default_factory=list)
+    note: str
+    maxPerEpoch: int
+    maxPerSession: int
+
+
 class AiTradeHorizonProfilesOut(BaseModel):
     """模式预设表回执（只读、不守 AI 总闸——读预设表不下任何单）。
 
@@ -754,6 +782,8 @@ class AiTradeHorizonProfilesOut(BaseModel):
     turnoverGateEnabled: bool = True
     backstopCheckEnabled: bool = True
     backstopPollSeconds: float = 120.0
+    # 交易所侧兜底自愈块（backstop-repair §4.2）；运维总闸关 ⇒ **整块缺席** ⇒ 前端不渲染控件。
+    backstopRepair: AiTradeBackstopRepairOut | None = None
     profiles: list[AiTradeHorizonProfileOut] = Field(default_factory=list)
 
 

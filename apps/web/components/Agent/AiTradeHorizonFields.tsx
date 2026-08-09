@@ -9,6 +9,8 @@ import {
 } from "@/lib/aiTradeHorizon";
 import type {
   AiTradeAcceptanceThresholds,
+  AiTradeBackstopRepairConfig,
+  AiTradeBackstopRepairMode,
   AiTradeHorizonProfile,
   AiTradeHorizonProfileId,
   AiTradeHorizonProfilesResponse,
@@ -54,6 +56,9 @@ export interface AiTradeHorizonFieldsProps {
   wakeMinutes: number | null;
   /** 「按模式对齐」：把 bar / 唤醒周期重新拉回本模式的建议值（非阻断提示的配套动作）。 */
   onAlign: () => void;
+  /** 交易所侧兜底自愈模式（backstop-repair §2.4.1）；`null` ⇒ 用接口下发的 `defaultMode`。 */
+  backstopRepairMode: AiTradeBackstopRepairMode | null;
+  onBackstopRepairModeChange: (mode: AiTradeBackstopRepairMode) => void;
   disabled: boolean;
 }
 
@@ -132,6 +137,14 @@ export default function AiTradeHorizonFields(props: AiTradeHorizonFieldsProps) {
               && (active?.turnoverBudgetPerDay ?? 0) > 0}
           />
           <BackstopNotice profile={active} response={data} />
+          {/* [P1-10] 自愈控件**不受跨日条件门控**：随单 OCO 丢失与持仓周期长短无关，
+              `hourly_swing` 的仓一样会裸露。四个预设 + custom 一律渲染。 */}
+          <BackstopRepairField
+            config={data.backstopRepair ?? null}
+            mode={props.backstopRepairMode}
+            onChange={props.onBackstopRepairModeChange}
+            disabled={disabled}
+          />
           {active?.bar == null && (
             <CustomFields custom={props.custom} onChange={props.onCustomChange} disabled={disabled} />
           )}
@@ -399,6 +412,81 @@ function BackstopNotice({
       <strong className="text-[var(--text)]">如实告知 AI</strong>
       ，并停止在未覆盖的持仓上继续加仓（平仓与新开仓不受影响）。
     </p>
+  );
+}
+
+/**
+ * 交易所侧兜底自愈的两段式控件（backstop-repair §2.4.1）。
+ *
+ * 它回答的是一个此前系统「知道却什么都不做」的问题：向交易所核实到「止损单不存在 / 覆盖不足」
+ * 之后要不要**自动把那张单补回来**。默认 `plan`（只给方案、一键人工执行）——这是本仓库第一条
+ * AI 侧自动下单路径，默认自动执行与默认死码之间的第三条路是「默认给方案 + 一键执行」。
+ *
+ * 三条 UI 纪律：
+ * 1. **整块由后端下发**（`backstopRepair`）：标签、说明、缺省模式、两个上限，前端一个字都不硬编；
+ *    整块缺席（运维总闸关）⇒ 控件不渲染。
+ * 2. **默认选中项来自 `defaultMode`**，不写死 `"plan"`。
+ * 3. 选中「自动补挂」时追加一行 `--accent` 授权确认语——这是本轮唯一一处「系统会自己花钱」的
+ *    授权点，必须让用户在点「启动」之前读到。
+ */
+function BackstopRepairField({
+  config,
+  mode,
+  onChange,
+  disabled,
+}: {
+  config: AiTradeBackstopRepairConfig | null;
+  mode: AiTradeBackstopRepairMode | null;
+  onChange: (mode: AiTradeBackstopRepairMode) => void;
+  disabled: boolean;
+}) {
+  if (!config) return null;
+  const active = mode ?? config.defaultMode;
+  const armed = active === "arm";
+  return (
+    <div className="flex flex-col gap-1" data-testid="ai-trade-backstop-repair">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] text-[var(--muted)]">交易所侧兜底自愈</span>
+        <div
+          role="radiogroup"
+          aria-label="交易所侧兜底自愈"
+          className="flex overflow-hidden rounded-[4px] border border-[var(--border)]"
+        >
+          {config.modes.map((option) => (
+            <button
+              key={option.id}
+              type="button"
+              role="radio"
+              aria-checked={active === option.id}
+              disabled={disabled}
+              title={option.detail}
+              onClick={() => onChange(option.id)}
+              data-testid={`ai-trade-backstop-repair-${option.id}`}
+              className={`px-2 py-0.5 text-[11px] ${
+                active === option.id
+                  ? "bg-[var(--accent)] text-[var(--on-accent,#fff)]"
+                  : "text-[var(--muted)]"
+              }`}
+            >
+              {option.label}
+            </button>
+          ))}
+        </div>
+      </div>
+      <p className="text-[10px] leading-relaxed text-[var(--muted)]">
+        {config.modes.find((m) => m.id === active)?.detail}；{config.note}
+        单个持仓周期最多 <strong className="text-[var(--text)]">{config.maxPerEpoch}</strong> 次、
+        单会话最多 <strong className="text-[var(--text)]">{config.maxPerSession}</strong> 次。
+      </p>
+      {armed ? (
+        <p
+          className="text-[10px] leading-relaxed text-[var(--accent)]"
+          data-testid="ai-trade-backstop-repair-consent"
+        >
+          本会话将允许系统在你不在场时向交易所发出止损委托。
+        </p>
+      ) : null}
+    </div>
   );
 }
 

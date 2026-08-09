@@ -40,11 +40,17 @@ from ..strategies.base import Signal
 from ..agent.services import load_htf_frames, load_range_candles
 from .backtest_frames import build_backtest_frames
 from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, format_charter
-from .cost_model import backtest_params, estimate_round_trip_cost, query_for_preview
+from .cost_model import (
+    backtest_params,
+    estimate_round_trip_cost,
+    funding_periods,
+    query_for_preview,
+)
 from .decider import AiTradeDecider, TradeDecision
 from .edge_gate import evaluate_edge_gate
 from .exit_attribution import (ExitLedger, classify_backtest, exit_counters,
                                is_deterministic_reason)
+from .funding import FundingSnapshot
 from .funding_ledger import BacktestFundingCurve, FundingLedger
 from .hold_horizon import HorizonFacts, HorizonRule
 from .hold_horizon import rule_wire as horizon_rule_wire
@@ -266,6 +272,9 @@ class AiBacktestRunner:
             enabled=bool(spec.settings.ai_trade_funding_ledger_enabled)
             and bool(spec.settings.ai_trade_funding_backtest_enabled), ct_val=1.0)
         self._curve = BacktestFundingCurve([])
+        # 轴 B [P2-1]：曲线起点之前的若干根 `snapshot_at` 恒 `None`，故「本次回测含不含资金费」
+        # 不是一个全局布尔——如实计「含资金费的决策轮 / 总决策轮」并写进 notes。
+        self._funding_cost_rounds = self._funding_cost_covered = 0
         # 单槽打标：凡是运行时**自己**提交的平仓在 submit 之前写槽，成交被观察到时消费。
         # `SimBroker` 自己的盘中止损止盈 / max_hold / 区间收尾不经运行时 ⇒ 槽为空、由 reason 兜住。
         self._pending_exit_source: str | None = None
@@ -685,6 +694,19 @@ class AiBacktestRunner:
         return bundle_from_input(inp, rule=self.horizon_rule, settings=self.settings,
                                  exits=self._exits.stats(), funding=funding)
 
+    def _cost_funding(self, ts: int) -> tuple[FundingSnapshot | None, bool]:
+        """回测成本模型的资金费入参 `(snapshot | None, funding_enabled)`（轴 B §2.3.2 **唯一真源**）。
+
+        **曲线不可用 ⇒ 逐字回退 `(None, False)`**（§九 D-8）：`funding_enabled=True` +
+        `funding=None` 在 `cost_model` 里的语义是「数据缺失 ⇒ degraded ⇒ 门禁阈值收紧」
+        （`cost_model.py` `query_for_preview` 两条分支），那会让「拉不到历史费率」这件观测层的
+        小事静默改变回测的门禁判定。回退到 `(None, False)`（有意不建模）才与本轮之前逐字节相同。
+        """
+        if not self.settings.ai_trade_funding_cost_backtest_enabled:
+            return None, False
+        snap = self._curve.snapshot_at(int(ts))
+        return (snap, True) if snap is not None else (None, False)
+
     def _horizon_facts(self, i: int, ts: int, ref_px: float) -> HorizonFacts:
         """回测断面（§2.10 对照表）：`now_wall`=当前根 ts、`mark_px`=当根收盘价、`side`=`pos.side`。
 
@@ -695,10 +717,11 @@ class AiBacktestRunner:
         pos = self.main.pos
         cost = None
         if pos.side in ("long", "short"):
+            funding, funding_on = self._cost_funding(ts)      # 轴 B：与实盘同口径的资金费入参
             cost = estimate_round_trip_cost(
                 query_for_preview(ord_type="market", side=pos.side,
-                                  bar_seconds=BAR_SECONDS[self.bar], funding=None,
-                                  funding_enabled=False),
+                                  bar_seconds=BAR_SECONDS[self.bar], funding=funding,
+                                  funding_enabled=funding_on),
                 backtest_params(self.settings,
                                 expected_hold_bars=self._horizon_hold_bars)).total_bps
         return HorizonFacts(
@@ -775,12 +798,17 @@ class AiBacktestRunner:
         decision, consensus_reason = apply_consensus_gate(decision, consensus, self.min_consensus)
         # ★ 最小 edge 门禁（§3.7）：与实盘**同一纯核心、同位插入**（共识后、反思前）；k_min=0（默认）
         # ⇒ 恒返回 None ⇒ 既有回测结果逐字节相同。成本用 SimBroker 实收常数（两侧各自对自己的世界说真话）。
+        # 轴 B：本轮决策的资金费入参在此**取一次并计数**（`_cost_funding` 在 `_horizon_facts` 里
+        # 也会被调一次，但那条只在持仓时走；覆盖率的分母口径是「决策轮」，故计数只挂这一处）。
+        edge_funding, edge_funding_on = self._cost_funding(ts)
+        self._funding_cost_rounds += 1
+        self._funding_cost_covered += 1 if edge_funding_on else 0
         edge_out = evaluate_edge_gate(
             decision, settings=self.settings, last_px=ref_px, atr_px=self._atr_at(i),
             take_profit_pct=self._oco_risk.take_profit_pct, bar_seconds=BAR_SECONDS[self.bar],
             params=backtest_params(self.settings,
                                    expected_hold_bars=self._horizon_hold_bars),
-            funding_enabled=False)
+            funding=edge_funding, funding_enabled=edge_funding_on)
         edge_reason = edge_out.reason if edge_out is not None else None
         decision = edge_out.decision if edge_out is not None else decision
         # 八元合成，先执行者胜出：铁律优先级最高，持仓周期次之，再冷却（本系统刚亲手做过的动作，
@@ -1082,21 +1110,57 @@ class AiBacktestRunner:
         return notes
 
     def _funding_notes(self) -> list[str]:
-        """资金费口径免责（horizon-acceptance §2.2.4 第 4、5 点 + §九 D-8 的欠账披露）。"""
+        """资金费口径免责（horizon-acceptance §2.2.4 第 4、5 点 + 本轮轴 B §2.4.4）。
+
+        [P1-6] **成本估算口径句恒在最前、且不受 `_funding.enabled` 早退连坐**：本函数是资金费口径
+        的唯一披露出口，而成本估算的口径变化与「记账是否开启」「有没有装配周期契约」都无关——
+        `_horizon_facts` 与 `evaluate_edge_gate` 在两种臂上都会跑，对照臂恰恰是验收时最该对拍的
+        那条曲线（挂在 `format_backtest_notes` 上会因 `rule is None ⇒ []` 而整句消失）。
+        """
+        notes: list[str] = [self._cost_basis_note()]
         if not self._funding.enabled:
-            return []
+            return notes
         if not self._curve.available:
-            return ["本次回测未能取到历史资金费曲线，净额**未含**资金费，"
-                    "验收卡「资金费后净收益」一行按「口径不可得」呈现（绝不按 0 计）。"]
-        notes = ["资金费按交易所历史费率曲线逐结算点计提，但**未计入权益曲线与 metrics**，"
-                 "仅在周期验收卡以「资金费后净收益」单列——"
-                 "`SimBroker` 被全仓库所有回测共用，在其中扣资金费会改变每一个既有策略回测的结果。",
-                 "已知欠账：回测里给换手迟滞与 edge 门禁用的**成本估算**仍不含资金费（实盘含），"
-                 "两者的不对称留待下一轮连同门禁阈值一起重估（spec §九 D-8）。"]
+            notes.append("本次回测未能取到历史资金费曲线，净额**未含**资金费，"
+                         "验收卡「资金费后净收益」一行按「口径不可得」呈现（绝不按 0 计）。")
+            return notes
+        notes.append("资金费按交易所历史费率曲线逐结算点计提，但**未计入权益曲线与 metrics**，"
+                     "仅在周期验收卡以「资金费后净收益」单列——"
+                     "`SimBroker` 被全仓库所有回测共用，在其中扣资金费会改变每一个既有策略回测的结果。")
         if self._stamp_conflicts:
             notes.append(f"退出来源归因中有 {self._stamp_conflicts} 笔的运行时打标与成交理由冲突，"
                          "已一律以成交理由为准。")
         return notes
+
+    def _cost_basis_note(self) -> str:
+        """本次回测的**往返成本估算**到底含不含资金费（轴 B §2.4.4，取代旧的欠账披露句）。
+
+        旧那句「已知欠账：成本估算仍不含资金费」在轴 B 落地后是一句假话，必须由本函数取代——
+        **一条在事实变化后没被撤下的免责，比没有免责更坏**（[P1-6] / R-14）。
+        括号里的「与最小 edge 门禁」是条件文本：`k_min` 默认 0 时 `evaluate_edge_gate` 第一句即
+        `return None`，无条件写上就又是一句没核实过的承诺（[P1-9]，沿用 `_build_notes` 的同款先例）。
+        """
+        gate = "与最小 edge 门禁" if self.settings.ai_trade_edge_gate_k_min > 0 else ""
+        if self._funding_cost_covered <= 0:
+            # 三种「不含」必须分开说：总闸关是运维选择、曲线不可得是观测层失败、而「曲线在手但本次
+            # 区间的决策轮全落在它起点之前」是第三件事——把它说成「曲线不可得」正是 [P2-1] 要根除的
+            # 那种「一个全局布尔说不清」的口径。
+            why = ("运维总闸 `ai_trade_funding_cost_backtest_enabled` 已关闭"
+                   if not self.settings.ai_trade_funding_cost_backtest_enabled
+                   else "历史资金费曲线不可得" if not self._curve.available
+                   else "本次区间没有任何决策轮读到可见的历史结算点")
+            return (f"本次回测的往返成本估算**不含**资金费（{why}），G3 换手迟滞{gate}的判定因此比"
+                    "实盘宽松；持仓越长偏差越大，不得据此为长周期模式背书。")
+        interval_h = float(self._curve.interval_hint or 0.0) / 3600.0
+        periods = funding_periods(
+            query_for_preview(ord_type="market", side="long",
+                              bar_seconds=BAR_SECONDS[self.bar],
+                              funding=self._curve.snapshot_at(self._last_ts or self.end_ts),
+                              funding_enabled=True),
+            backtest_params(self.settings, expected_hold_bars=self._horizon_hold_bars))
+        return (f"本次回测的往返成本估算已含资金费（真实历史曲线，结算周期约 {interval_h:g}h，"
+                f"按目标持仓跨 {periods} 期，覆盖 {self._funding_cost_covered}/"
+                f"{self._funding_cost_rounds} 个决策轮）；G3 换手迟滞{gate}据此判定。")
 
     def _build_result(self, metrics: dict, ai_stats: dict, notes: list[str]) -> dict:
         equity = [{"ts": e.ts, "equity": round(e.equity, 4), "drawdown": round(e.drawdown, 6)}

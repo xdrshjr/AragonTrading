@@ -244,6 +244,106 @@ def build_close_order_payload(close: ClosePositionInput, meta: InstrumentMeta, p
     return payload
 
 
+@dataclass(frozen=True)
+class AlgoStopInput:
+    """归一化「补挂止损」意图（ai-trade-backstop-repair-and-net-backtest §4.5）。
+
+    聚合为值对象而非堆形参，守 CLAUDE.md 的「形参 ≤5」（镜像 ``ClosePositionInput`` 的既有范式）。
+    后两个字段是**收敛上界的两个真源**，与下单意图一起旅行（[P0-4]）：缺任何一个，服务层就只能
+    在下单现场再去猜一次「该补多少张」，而那正是本仓库反复出事的「同一口径两处各存一份」形态。
+    """
+
+    inst_id: str
+    pos_side: str            # long | short | net（net 模式靠 pos 符号判向）
+    pos: float               # 带符号张数（net 判向用）
+    td_mode: str             # cross | isolated
+    sz: float                # 待补差额张数（未取整；服务层按实时 |pos| 重算后才下单）
+    stop_px: float           # 触发价（本地回执口径，**绝不新建第二条求价路径**）
+    algo_cl_ord_id: str      # 确定性幂等键（三段式：会话身份 + 持仓周期 + 尝试序号）
+    self_position_sz: float  # 本层自管仓张数——守「**绝不处置本层不拥有的仓**」
+    covered_sz: float        # 已被交易所侧止损覆盖的张数（检测层原样转发，不重算）
+
+
+def ensure_close_only(payload: dict) -> None:
+    """补挂腿必须锁死为平仓腿：``reduceOnly`` 与 ``posSide`` **二者必居其一**（H2 第 4 条）。
+
+    这是「本层永不建立敞口」这条不变式的代码化断言。两种持仓模式的锁侧写法不同
+    （``build_close_order_payload``:238-241），漏了任何一侧，那张单在触发时就可能开出反向敞口。
+
+    Raises:
+        OKXPrivateError: 两个锁侧字段都缺（``LIVE_BACKSTOP_REJECTED_LOCAL``，绝不发往 OKX）。
+    """
+    if not payload.get("reduceOnly") and not payload.get("posSide"):
+        raise OKXPrivateError("LIVE_BACKSTOP_REJECTED_LOCAL",
+                              "补挂止损缺少锁侧字段（reduceOnly / posSide 必居其一），已本地拦截")
+
+
+def build_algo_stop_payload(stop: AlgoStopInput, meta: InstrumentMeta, pos_mode: str) -> dict:
+    """补挂止损的 ``/api/v5/trade/order-algo`` 请求体（backstop-repair §2.2.2）。
+
+    ``ordType="conditional"`` + ``slTriggerPx`` + ``slOrdPx="-1"`` + ``slTriggerPxType="last"``
+    —— 与随单 OCO 的 ``build_attach_algo_orders``（:115-127）**逐字一致**，不发明第二套写法。
+    锁侧：``net_mode ⇒ reduceOnly=True 且不带 posSide``；对冲 ⇒ 带 ``posSide`` 且不带
+    ``reduceOnly``（与 ``build_close_order_payload``:238-241 同款），组装完即以
+    ``ensure_close_only`` 断言不变式。
+    """
+    payload: dict = {
+        "instId": stop.inst_id,
+        "tdMode": stop.td_mode,
+        "side": _close_side(stop.pos_side, stop.pos),
+        "ordType": "conditional",
+        "sz": fmt_step(snap_size(stop.sz, meta.lot_sz), meta.lot_sz),
+        "slTriggerPx": fmt_step(snap_price(stop.stop_px, meta.tick_sz), meta.tick_sz),
+        "slOrdPx": "-1",
+        "slTriggerPxType": "last",
+        "algoClOrdId": stop.algo_cl_ord_id,
+    }
+    if pos_mode == "net_mode":
+        payload["reduceOnly"] = True
+    else:
+        payload["posSide"] = stop.pos_side
+    ensure_close_only(payload)
+    return payload
+
+
+def validate_algo_stop(stop: AlgoStopInput, meta: InstrumentMeta, *, abs_pos: float) -> dict:
+    """H2 越界锁；命中即抛，**绝不发往 OKX**。返回 ``{"sz": 收敛并取整后的张数}``。
+
+    [P0-4] 先按 §2.2.2 **向下收敛**到 ``min(abs_pos, self_position_sz) − covered_sz`` 再取整：
+    ``abs_pos`` 守「绝不信本地读数」（本地偏大时不能按本地下），``self_position_sz`` 守「绝不处置
+    本层不拥有的仓」（账户上另有 live_auto / 手工持仓时 ``abs_pos`` 是全账户口径，按它补出来的
+    ``reduceOnly`` 止损一旦触发就替用户平掉了他自己建的仓）。**能收敛的越界不抛**——本地读数暂时
+    偏大是正常的时序差，不是故障，抛它只会把一次读数偏差渲染成一次吓人的失败并烧掉一次频率配额。
+
+    [P1-1] **不收 ``max_notional_usd``**：名义上限守的是「单笔**新增**敞口」，而补挂腿是减仓腿。
+    仓库既有纪律已写明「平仓**不**应用名义上限与反向减仓护栏（平仓即减仓，是动作目的）；仅以实时
+    ``|pos|`` 二次校验 ``sz≤|pos|``」（``okx/trading.py``:224-225）。默认上限仅 1000 USDT，而持仓由
+    多次加仓合法累积而成——照单笔开仓的口径拒单，会让仓位越大、越裸露、越需要兜底时补挂越是被拒死。
+
+    Raises:
+        OKXPrivateError: ``LIVE_BACKSTOP_REJECTED_LOCAL``（触发价非法 / 收敛取整后 < ``minSz``）；
+            ``LIVE_BACKSTOP_SIZE_EXCEEDS`` 是**内部不变式断言**——收敛后仍 ``> abs_pos`` 在数学上
+            不可能，命中即说明上游算错了，必须炸。
+    """
+    px = stop.stop_px
+    if px is None or not math.isfinite(float(px)) or float(px) <= 0:
+        raise OKXPrivateError("LIVE_BACKSTOP_REJECTED_LOCAL",
+                              "补挂止损必须有大于 0 的有效触发价")
+    room = max(0.0, min(float(abs_pos), float(stop.self_position_sz)) - float(stop.covered_sz))
+    sz = snap_size(min(float(stop.sz), room), meta.lot_sz)
+    if sz <= 0 or sz < meta.min_sz:
+        raise OKXPrivateError(
+            "LIVE_BACKSTOP_REJECTED_LOCAL",
+            f"补挂张数需 ≥ 最小下单量 {fmt_step(meta.min_sz, meta.lot_sz)} 张"
+            f"（未覆盖差额仅 {fmt_step(max(0.0, room), meta.lot_sz)} 张）")
+    if sz > float(abs_pos):
+        raise OKXPrivateError(
+            "LIVE_BACKSTOP_SIZE_EXCEEDS",
+            f"补挂张数 {fmt_step(sz, meta.lot_sz)} 超过实时持仓 "
+            f"{fmt_step(float(abs_pos), meta.lot_sz)} 张（内部不变式违反）")
+    return {"sz": sz}
+
+
 def validate_close(close: ClosePositionInput, meta: InstrumentMeta, abs_pos: float) -> dict:
     """限价平仓本地越界拦截（§2.4，P1-2）：限价须有正价、取整后 ``sz>0``、``sz≥minSz``、``sz≤|pos|``。
 

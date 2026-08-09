@@ -177,6 +177,10 @@ class HorizonRule:
     # 判定价最大允许年龄（秒）：**复用** `ai_trade_profit_guard_max_px_age_s`——「判定价多老算老」
     # 在一个会话里只能有一个答案（§5.1）。
     max_px_age_s: float = 90.0
+    # 交易所侧兜底自愈模式（backstop-repair [P0-3]）：`plan`（只给方案）/ `arm`（自动补挂）。
+    # 契约在这里落地是**唯一解析点**——`api/ai_auto.py:_resolve_horizon` 只是两行透传，把回填写在
+    # 那里会让值到不了运行时。`None` ⇒ 由 `rule_from_settings` 按运维缺省回填。
+    backstop_repair_mode: str | None = None
 
 
 @dataclass(frozen=True)
@@ -341,7 +345,19 @@ def resolve_horizon_rule(raw: dict | None, settings, *, bar: str) -> HorizonRule
         loss_release_return_pct_fallback=float(
             settings.ai_trade_horizon_loss_release_return_pct),
         note_after_rounds=int(settings.ai_trade_horizon_note_after_rounds),
-        max_px_age_s=float(settings.ai_trade_profit_guard_max_px_age_s))
+        max_px_age_s=float(settings.ai_trade_profit_guard_max_px_age_s),
+        backstop_repair_mode=_resolve_repair_mode(raw.get("backstopRepair"), settings))
+
+
+def _resolve_repair_mode(raw_mode, settings) -> str | None:
+    """交易所侧兜底自愈模式的**唯一回填点**（backstop-repair [P0-3]）。
+
+    运维总闸关 ⇒ 恒 `None`（字段被忽略，回执里整键缺席，与「本会话没有这一层」一致）；
+    缺省 ⇒ 回填运维缺省模式（默认 `plan`）；显式值原样保留（值域已在 schema 层 422）。
+    """
+    if not getattr(settings, "ai_trade_backstop_repair_enabled", False):
+        return None
+    return str(raw_mode or settings.ai_trade_backstop_repair_default_mode)
 
 
 def _resolve_turnover(raw: dict, settings, *, min_hold_s: float,
@@ -401,7 +417,10 @@ def rule_wire(rule: HorizonRule | None) -> dict | None:
             "reentryCooldownSeconds": rule.reentry_cooldown_s,
             "reentryScope": rule.reentry_scope,
             "turnoverBudgetPerDay": rule.turnover_per_day,
-            "turnoverBudgetCapacity": rule.turnover_capacity}
+            "turnoverBudgetCapacity": rule.turnover_capacity,
+            # 自愈模式的回执镜像（backstop-repair [P0-3]）：不镜像它，用户就无法核对「我选的和
+            # 落地的是不是同一个」——那正是第 1 轮 [P1-9] 立下的规矩。未装配 ⇒ `null`。
+            "backstopRepair": rule.backstop_repair_mode}
 
 
 def rule_from_wire(wire: dict | None) -> HorizonRule | None:
@@ -467,9 +486,34 @@ def profiles_wire(settings, *, estimated_cost_bps: float | None = None) -> dict:
             "turnoverGateEnabled": bool(settings.ai_trade_horizon_turnover_enabled),
             "backstopCheckEnabled": bool(settings.ai_trade_backstop_check_enabled),
             "backstopPollSeconds": float(settings.ai_trade_backstop_poll_ttl_s),
+            "backstopRepair": _backstop_repair_wire(settings),
             "profiles": [profile_wire(PROFILES[key], acceptance=_acceptance_preview(
                 settings, PROFILES[key]), turnover=_turnover_preview(
                 settings, PROFILES[key])) for key in PROFILES]}
+
+
+def _backstop_repair_wire(settings) -> dict | None:
+    """自愈控件的下发块（backstop-repair §4.2）；运维总闸关 ⇒ `None` ⇒ 前端整块不渲染。
+
+    标签、说明、缺省模式与两个上限**全部由后端下发**，前端一个字、一个数都不硬编（R-3 / G-10
+    的成文教训：一张前后端各存一份的表必然漂移）。「自动补挂」那句 detail 里必须写清授权含义
+    ——那是本轮唯一一处「系统会自己花钱」的授权点。
+    """
+    if not getattr(settings, "ai_trade_backstop_repair_enabled", False):
+        return None
+    return {
+        "defaultMode": str(settings.ai_trade_backstop_repair_default_mode),
+        "modes": [
+            {"id": "plan", "label": "仅提醒",
+             "detail": "系统只给出补挂方案，由你一键执行"},
+            {"id": "arm", "label": "自动补挂",
+             "detail": "核实到止损缺失时由系统自动补挂，本会话将允许系统在你不在场时发出止损委托"},
+        ],
+        "note": ("补挂只补止损腿、只补差额张数、永不平仓、永不加仓；"
+                 "现价已越过止损价时拒绝补挂。"),
+        "maxPerEpoch": int(settings.ai_trade_backstop_repair_max_per_epoch),
+        "maxPerSession": int(settings.ai_trade_backstop_repair_max_per_session),
+    }
 
 
 def _turnover_preview(settings, profile: HorizonProfile) -> dict:

@@ -77,6 +77,16 @@ const HORIZON_PROFILES = {
   estimatedCostBps: 13,
   lossReleaseFrac: 0.5,
   lossReleaseReturnPctFallback: 0.1,
+  backstopRepair: {
+    defaultMode: "plan" as const,
+    modes: [
+      { id: "plan" as const, label: "仅提醒", detail: "系统只给出补挂方案，由你一键执行" },
+      { id: "arm" as const, label: "自动补挂", detail: "核实到止损缺失时由系统自动补挂" },
+    ],
+    note: "补挂只补止损腿、只补差额张数、永不平仓、永不加仓。",
+    maxPerEpoch: 2,
+    maxPerSession: 8,
+  },
   profiles: [
     {
       id: "intraday_swing" as const, title: "日内波段", description: "小时级别一段趋势。",
@@ -843,6 +853,54 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("U-21 [P1-8] 复发守门：切到「自动补挂」后等一个渲染周期与 2 秒假时钟，值**不得回退**", async () => {
+    // 该缺陷的形态是「新字段写在了另一个非稳定依赖的 effect 里，约 1 秒后被冲回默认」——
+    // 每加一个新受控输入就复发一次。新 state 必须塞进那个依赖收敛为 [open] 的既有 effect。
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { rerender } = renderModal({ defaultStrategyIds: [1] });
+      await screen.findByTestId("ai-trade-backstop-repair");
+      fireEvent.click(screen.getByTestId("ai-trade-backstop-repair-arm"));
+      expect(screen.getByTestId("ai-trade-backstop-repair-arm")).toHaveAttribute(
+        "aria-checked", "true");
+      rerender();                                 // 模拟父树重渲染（新引用的默认值）
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(screen.getByTestId("ai-trade-backstop-repair-arm")).toHaveAttribute(
+        "aria-checked", "true");
+      expect(screen.getByTestId("ai-trade-backstop-repair-consent")).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("自愈模式进 `tradingHorizon` payload；没主动选过 ⇒ **不带该键**（交服务端按运维缺省回填）", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByTestId("ai-trade-backstop-repair");
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    expect(
+      (onConfirm.mock.calls[0][0] as AiTradeLaunchOpts).tradingHorizon,
+    ).not.toHaveProperty("backstopRepair");
+    fireEvent.click(screen.getByTestId("ai-trade-backstop-repair-arm"));
+    fireEvent.click(confirm);
+    expect((onConfirm.mock.calls[1][0] as AiTradeLaunchOpts).tradingHorizon).toMatchObject({
+      backstopRepair: "arm",
+    });
+  });
+
+  it("[P2-6] 重开弹窗回到「仅提醒」——`arm` 是一次性授权，刻意**不进偏好回填链**", async () => {
+    const { rerender } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByTestId("ai-trade-backstop-repair");
+    fireEvent.click(screen.getByTestId("ai-trade-backstop-repair-arm"));
+    rerender({ defaultStrategyIds: [1], open: false });
+    rerender({ defaultStrategyIds: [1], open: true });
+    await waitFor(() =>
+      expect(screen.getByTestId("ai-trade-backstop-repair-plan")).toHaveAttribute(
+        "aria-checked", "true"),
+    );
   });
 
   it("契约摘要按当前表单值现算：改杠杆 ⇒ 解除阈随之变化（[P1-10]，无静态算例）", async () => {

@@ -336,6 +336,9 @@ export interface AiTradeHorizonRule {
   // 以下两键**仅出现在回执镜像里**（服务端派生后的实际值）：只回显入参等于把派生关系藏起来。
   reentryScope?: "same_side" | "both" | null;
   turnoverBudgetCapacity?: number | null;
+  // 交易所侧兜底自愈模式（backstop-repair §4.3）：入参 `null`/缺省 ⇒ 服务端按运维缺省回填；
+  // 回执镜像同一个键，用户据此核对「我选的和落地的是不是同一个」。
+  backstopRepair?: AiTradeBackstopRepairMode | null;
 }
 
 // `GET /ai-trade/horizon-profiles` 的单个预设条目。**除三个字符串外全部可空**（[P1-8]）：`custom`
@@ -375,7 +378,27 @@ export interface AiTradeHorizonProfilesResponse {
   turnoverGateEnabled?: boolean;
   backstopCheckEnabled?: boolean;
   backstopPollSeconds?: number;
+  // 交易所侧兜底自愈块（backstop-repair §4.2）；运维总闸关 ⇒ **整块缺席** ⇒ 前端不渲染控件。
+  // 标签、说明、缺省模式与两个上限**全部由后端下发**，前端一个字、一个数都不硬编。
+  backstopRepair?: AiTradeBackstopRepairConfig | null;
   profiles: AiTradeHorizonProfile[];
+}
+
+export type AiTradeBackstopRepairMode = "plan" | "arm";
+
+/** 自愈控件的一个选项；`detail` 是授权含义的说明（`arm` 那句必须写清「系统会替你下单」）。 */
+export interface AiTradeBackstopRepairModeOption {
+  id: AiTradeBackstopRepairMode;
+  label: string;
+  detail: string;
+}
+
+export interface AiTradeBackstopRepairConfig {
+  defaultMode: AiTradeBackstopRepairMode;
+  modes: AiTradeBackstopRepairModeOption[];
+  note: string;
+  maxPerEpoch: number;
+  maxPerSession: number;
 }
 
 // ---- 开仓侧换手纪律与交易所侧兜底的运行期 wire（turnover-budget §5.4）----
@@ -420,6 +443,44 @@ export interface AiTradeBackstopWire {
   localStopLossPx?: number | null;            // 本地成交回执口径（**不是**交易所读数）
   localTakeProfitPx?: number | null;
   mismatch: boolean;                          // 本地声称有止损、交易所侧确认一条都没有
+  // 自愈层的**嵌套加法子键**（backstop-repair §4.4 / D-10）：嵌在这个整对象透传的 wire 里，
+  // 故 `store.ts` 的逐键手抄 reducer 一行都不必动。未装配 ⇒ **整键缺席**（不是 null）。
+  repair?: AiTradeBackstopRepairWire;
+}
+
+// 自愈状态机（后端 `backstop_repair` 的常量逐条镜像）。`placed` 与 `verified` 是**两个**状态：
+// OKX 回了一个 algoId 不等于那张单真的挂在那里，核实通过前一律说「已发出，正在核实」。
+export type AiTradeRepairState =
+  | "idle" | "planned" | "blocked" | "placing" | "placed" | "verified" | "failed";
+
+export interface AiTradeRepairResult {
+  ok: boolean;
+  ts: number;
+  algoId?: string | null;
+  algoClOrdId?: string | null;
+  stopPx?: number | null;
+  sz?: number | null;
+  code?: string | null;
+  // 失败原因的中文标签，由后端**预渲染**（归一码的值域归 `okx.trading` 所有，前端抄一份必漂移
+  // 成一个原始英文串）。呈现只读这一个键，`code` 只作核对线索。
+  codeLabel?: string | null;
+  message?: string | null;
+}
+
+export interface AiTradeBackstopRepairWire {
+  mode: AiTradeBackstopRepairMode;
+  state: AiTradeRepairState;
+  blockedReason?: string | null;              // state==="blocked" 时必填（值域四处镜像）
+  plannedStopPx?: number | null;              // 算不出 ⇒ null
+  plannedSz?: number | null;                  // **null=算不出、0=不需要补**，两个结论
+  coveredSz?: number | null;                  // 检测层原样转发（本层不重算）
+  positionSz?: number | null;
+  attemptsEpoch: number;
+  maxPerEpoch: number;
+  attemptsSession: number;
+  maxPerSession: number;
+  coolingSeconds?: number | null;             // 未冷却 ⇒ null（**绝不用 0 冒充**）
+  lastResult?: AiTradeRepairResult | null;    // 从未尝试 ⇒ null
 }
 
 // 判定态：空仓 / 持仓中 / 限制已解除。
@@ -1057,6 +1118,18 @@ export interface AiTradeGroupMemberStopResult {
   groupId: string;
   instId: string;
   flattened?: unknown;
+}
+
+/** 人工补挂的 200 回执（backstop-repair §4.1）；`state` 恒为 `placed`——核实前不说「已补挂」。 */
+export interface AiTradeBackstopRepairResult {
+  instId: string;
+  state: AiTradeRepairState;
+  algoId?: string | null;
+  algoClOrdId?: string | null;
+  stopLossPx?: number | null;
+  sz?: number | null;
+  coveredBefore?: number | null;
+  positionSz?: number | null;
 }
 
 // 运行期成员槽（瞬态；镜像 LiveAutoGroupMemberState + AI 专属轨迹 / 决策 / 摘要）。

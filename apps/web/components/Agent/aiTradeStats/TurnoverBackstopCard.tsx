@@ -1,5 +1,6 @@
 "use client";
 
+import { describeRepair, type RepairRow } from "@/lib/aiTradeBackstopRepair";
 import {
   budgetProgress,
   describeBackstop,
@@ -15,6 +16,12 @@ export interface TurnoverBackstopMember {
   symbol: string;
   turnover?: AiTradeTurnoverWire | null;
   backstop?: AiTradeBackstopWire | null;
+}
+
+/** 「立即补挂」按钮的请求态（[P2-5]：**卡片本身无状态**，态由父组件按 `instId` 键传入）。 */
+export interface RepairPendingState {
+  pending?: boolean;
+  result?: { ok: boolean; message: string } | null;
 }
 
 /**
@@ -36,8 +43,14 @@ export interface TurnoverBackstopMember {
  */
 export default function TurnoverBackstopCard({
   members,
+  onRepair,
+  repairPending,
 }: {
   members: TurnoverBackstopMember[];
+  /** 人工授权一次补挂（父组件接 `aiTradeApi.repairBackstop`）；缺省 ⇒ 不渲染按钮。 */
+  onRepair?: (symbol: string) => void;
+  /** 按 `instId` 键的请求态（[P2-5]）。 */
+  repairPending?: Record<string, RepairPendingState | undefined>;
 }) {
   // 先把每个成员真正**有内容的行**算出来，再决定整卡渲不渲染：一个成员可能带着 `turnover` 键
   // 却两道闸都结构性关闭（custom 全默认）——此时若只按「键在不在」判，卡片会渲染成一个空壳，
@@ -70,6 +83,8 @@ export default function TurnoverBackstopCard({
           member={block.member}
           rows={block.rows}
           multi={blocks.length > 1}
+          onRepair={onRepair}
+          pending={repairPending?.[block.member.symbol]}
         />
       ))}
 
@@ -84,13 +99,19 @@ export default function TurnoverBackstopCard({
   );
 }
 
-/** 一个成员真正有内容的行（全空 ⇒ 该成员整块不渲染，见上）。 */
+/**
+ * 一个成员真正有内容的行（全空 ⇒ 该成员整块不渲染，见上）。
+ *
+ * 第五行是自愈状态（backstop-repair §2.4.2）：`repair` 键缺席（整层未装配）或 `idle`（无需补挂）
+ * ⇒ `describeRepair` 返回 null ⇒ 整行不渲染，与前四行同一条纪律。
+ */
 function buildRows(member: TurnoverBackstopMember): TurnoverRow[] {
   return [
     describeCooldown(member.turnover),
     describeBudget(member.turnover),
     describeVetoes(member.turnover),
     describeBackstop(member.backstop),
+    describeRepair(member.backstop?.repair),
   ].filter((row): row is TurnoverRow => row !== null);
 }
 
@@ -98,10 +119,14 @@ function MemberBlock({
   member,
   rows,
   multi,
+  onRepair,
+  pending,
 }: {
   member: TurnoverBackstopMember;
   rows: TurnoverRow[];
   multi: boolean;
+  onRepair?: (symbol: string) => void;
+  pending?: RepairPendingState;
 }) {
   const progress = budgetProgress(member.turnover);
   return (
@@ -119,7 +144,7 @@ function MemberBlock({
         >
           <span className="shrink-0 text-[var(--muted)]">{row.label}</span>
           <span className="min-w-0 flex-1 truncate text-right text-[10px] text-[var(--muted)]">
-            {row.detail}
+            {pending?.result && row.key === "repair" ? pending.result.message : row.detail}
           </span>
           <span
             className="tabular w-[104px] shrink-0 text-right font-medium"
@@ -127,6 +152,7 @@ function MemberBlock({
           >
             {row.value}
           </span>
+          <RepairButton row={row} symbol={member.symbol} onRepair={onRepair} pending={pending} />
         </div>
       ))}
       {progress == null ? null : (
@@ -141,6 +167,40 @@ function MemberBlock({
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * 行内「立即补挂 / 重试」按钮——**本轮唯一一处用户主动触发下单的入口**。
+ *
+ * 三态（[P2-5]，态由父组件传入，卡片保持无状态）：可点 / 请求中（禁用 + 「补挂中…」）/ 刚完成
+ * （禁用并把结果显示在 `detail` 里）。失败时显示的是**交易所原始 sCode 的中文标签**，不显示裸码。
+ */
+function RepairButton({
+  row,
+  symbol,
+  onRepair,
+  pending,
+}: {
+  row: TurnoverRow;
+  symbol: string;
+  onRepair?: (symbol: string) => void;
+  pending?: RepairPendingState;
+}) {
+  const action = (row as RepairRow).action;
+  if (row.key !== "repair" || !action || !onRepair) return null;
+  const busy = Boolean(pending?.pending);
+  const done = Boolean(pending?.result);
+  return (
+    <button
+      type="button"
+      disabled={busy || done}
+      onClick={() => onRepair(symbol)}
+      data-testid={`ai-turnover-repair-${symbol}`}
+      className="shrink-0 rounded-[3px] border border-[var(--accent-soft)] px-1.5 py-px text-[10px] text-[var(--accent)] disabled:opacity-50"
+    >
+      {busy ? "补挂中…" : done ? "已提交" : action.label}
+    </button>
   );
 }
 

@@ -550,6 +550,18 @@ class AiTradeManager:
             self._group = None
         return {"groupId": group_id, "instId": inst_id, "flattened": flat}
 
+    async def repair_member(self, group_id: str, inst_id: str) -> dict | None:
+        """人工授权的单次兜底补挂（backstop-repair §4.1）；分组 / 成员不存在 ⇒ `None` → 404。
+
+        镜像 `stop_member` 的既有姿态：只按 `(group_id, inst_id)` 定位成员并转发，判定、频率锁与
+        下单一律在会话侧（`AiTradeSession.repair_backstop`）——manager 不做任何业务判断。
+        """
+        group = self._group
+        if group is None or group.group_id != group_id:
+            return None
+        member = next((m for m in group.members if m.inst_id == inst_id), None)
+        return None if member is None else await member.session.repair_backstop()
+
     async def _stop_session(self, session: AiTradeSession, reason: str) -> dict:
         flat = await session.stop(reason)
         if not flat.get("ok"):   # 平仓失败不静默——日志留痕（API 仍回 flattened 供 UI 强提示）

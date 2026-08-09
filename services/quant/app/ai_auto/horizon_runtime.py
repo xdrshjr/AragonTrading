@@ -91,8 +91,8 @@ class HorizonRuntime:
     """
 
     def __init__(self, rule: HorizonRule | None, *, net_mode: bool = True,
-                 record_exits: bool = True,
-                 turnover_rule: TurnoverRule | None = None, backstop=None) -> None:
+                 record_exits: bool = True, turnover_rule: TurnoverRule | None = None,
+                 backstop=None, repair=None) -> None:
         """
         Args:
             rule: 已装配周期契约；`None` = 本会话不装配。
@@ -103,6 +103,8 @@ class HorizonRuntime:
             backstop: 交易所侧兜底核实运行时（鸭子类型：只要求 `.wire(now_wall) -> dict | None`）。
                 回测**不装配**（回测没有交易所，声称「已向交易所核实」是假话，D-5）。
                 本类不持有 settings、不发任何请求——IO 全在 `exchange_backstop` 那一侧。
+            repair: 交易所侧兜底自愈运行时（鸭子类型：只要求 `.wire() -> dict | None`）。
+                回测同样**不装配**（让回测显示一个「已补挂」的绿勾，是本特性链要根除的那类谎言）。
         """
         self.rule = rule
         # 退出来源账本（horizon-acceptance 轴 B）：**恒构造，与 `rule` 是否装配无关**——关掉周期
@@ -136,6 +138,7 @@ class HorizonRuntime:
         self.last_turnover_reason: str | None = None
         self._cooldown_was_active = False
         self.backstop = backstop
+        self.repair = repair
         self.last_backstop_reason: str | None = None
         self.backstop_vetoes = 0
 
@@ -176,7 +179,20 @@ class HorizonRuntime:
             self.rule, self.state, facts,
             turnover=build_turnover_wire(self.turnover_state, self.turnover_rule,
                                          now_wall=now_wall),
-            backstop=None if self.backstop is None else self.backstop.wire(now_wall))
+            backstop=self._backstop_wire(now_wall))
+
+    def _backstop_wire(self, now_wall: float) -> dict | None:
+        """检测层 wire + 自愈层的**嵌套加法子键**（backstop-repair §4.4 / 上一轮 D-10）。
+
+        `repair` 嵌在既有整对象透传的 `backstop` 里，故 `store.ts` 的逐键手抄 reducer 一行都不必动
+        （上一轮 [P0-1] 正是踩在那个坑上）。两层各自未装配时**整键缺席**（不是 `null`），
+        prompt 与运行卡因此逐字节回退。
+        """
+        if self.backstop is None:
+            return None
+        wire = self.backstop.wire(now_wall)
+        repair = None if self.repair is None else self.repair.wire()
+        return wire if wire is None or repair is None else {**wire, "repair": repair}
 
     def note_intent(self, stage1_action: str, stage1_degrade: str | None, *,
                     position_side: str, now_wall: float) -> None:

@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import AiTradeHorizonFields, {
   type AiTradeHorizonFieldsProps,
@@ -16,6 +16,16 @@ const DATA: AiTradeHorizonProfilesResponse = {
   estimatedCostBps: 13,
   lossReleaseFrac: 0.5,
   lossReleaseReturnPctFallback: 0.1,
+  backstopRepair: {
+    defaultMode: "plan",
+    modes: [
+      { id: "plan", label: "仅提醒", detail: "系统只给出补挂方案，由你一键执行" },
+      { id: "arm", label: "自动补挂", detail: "核实到止损缺失时由系统自动补挂" },
+    ],
+    note: "补挂只补止损腿、只补差额张数、永不平仓、永不加仓。",
+    maxPerEpoch: 2,
+    maxPerSession: 8,
+  },
   profiles: [
     {
       id: "intraday_swing", title: "日内波段", description: "小时级别一段趋势。",
@@ -49,6 +59,7 @@ function renderFields(over: Partial<AiTradeHorizonFieldsProps> = {}) {
   const onProfileChange = vi.fn();
   const onCustomChange = vi.fn();
   const onAlign = vi.fn();
+  const onRepairModeChange = vi.fn();
   render(
     <AiTradeHorizonFields
       data={DATA}
@@ -65,11 +76,13 @@ function renderFields(over: Partial<AiTradeHorizonFieldsProps> = {}) {
       defaultStopLossPct={0.05}
       wakeMinutes={30}
       onAlign={onAlign}
+      backstopRepairMode={null}
+      onBackstopRepairModeChange={onRepairModeChange}
       disabled={false}
       {...over}
     />,
   );
-  return { onProfileChange, onCustomChange, onAlign };
+  return { onProfileChange, onCustomChange, onAlign, onRepairModeChange };
 }
 
 afterEach(() => cleanup());
@@ -77,9 +90,10 @@ afterEach(() => cleanup());
 describe("AiTradeHorizonFields", () => {
   it("是一个真正的单选组：radiogroup + 每卡 role=radio + aria-checked 正确反映状态", () => {
     renderFields();
-    expect(screen.getByRole("radiogroup", { name: "交易周期模式" })).toBeInTheDocument();
-    const radios = screen.getAllByRole("radio");
-    expect(radios).toHaveLength(DATA.profiles.length);
+    const group = screen.getByRole("radiogroup", { name: "交易周期模式" });
+    expect(group).toBeInTheDocument();
+    // 按组取（同屏另有「交易所侧兜底自愈」那个两段式 radiogroup，全局 getAllByRole 会把它算进来）。
+    expect(within(group).getAllByRole("radio")).toHaveLength(DATA.profiles.length);
     expect(screen.getByRole("radio", { name: /日内波段/ })).toBeChecked();
     expect(screen.getByRole("radio", { name: /趋势持仓/ })).not.toBeChecked();
   });
@@ -149,5 +163,61 @@ describe("AiTradeHorizonFields", () => {
     renderFields({ enabled: false });
     expect(screen.queryByRole("radiogroup")).toBeNull();
     expect(screen.queryByTestId("ai-trade-horizon-contract")).toBeNull();
+  });
+});
+
+// ---------------- 交易所侧兜底自愈控件（backstop-repair §2.4.1 · U-20 / U-20b） ----------------
+describe("AiTradeHorizonFields · 兜底自愈控件", () => {
+  it("U-20 默认选中项来自接口的 `defaultMode`，**不是硬编码的 plan**", () => {
+    renderFields();
+    expect(screen.getByTestId("ai-trade-backstop-repair-plan")).toHaveAttribute(
+      "aria-checked", "true");
+    cleanup();
+    renderFields({
+      data: { ...DATA, backstopRepair: { ...DATA.backstopRepair!, defaultMode: "arm" } },
+    });
+    expect(screen.getByTestId("ai-trade-backstop-repair-arm")).toHaveAttribute(
+      "aria-checked", "true");
+  });
+
+  it("整块缺席（运维总闸关）⇒ 控件不渲染（绝不给一个点了不生效的开关）", () => {
+    renderFields({ data: { ...DATA, backstopRepair: null } });
+    expect(screen.queryByTestId("ai-trade-backstop-repair")).toBeNull();
+  });
+
+  it("U-20b [P1-10] 不受跨日门控：非跨日模式下控件**仍然渲染**", () => {
+    // `intraday_swing` 的 targetHoldMaxSeconds = 43200 < 86400 ⇒ 同屏的 BackstopNotice 不渲染，
+    // 而自愈控件必须在场——随单 OCO 丢失与持仓周期长短无关，日内的仓一样会裸露。
+    renderFields({ profileId: "intraday_swing" });
+    expect(screen.queryByTestId("ai-trade-backstop-notice")).toBeNull();
+    expect(screen.getByTestId("ai-trade-backstop-repair")).toBeInTheDocument();
+  });
+
+  it("选中「自动补挂」才出现授权确认语——这是唯一一处「系统会自己花钱」的授权点", () => {
+    renderFields();
+    expect(screen.queryByTestId("ai-trade-backstop-repair-consent")).toBeNull();
+    cleanup();
+    renderFields({ backstopRepairMode: "arm" });
+    expect(screen.getByTestId("ai-trade-backstop-repair-consent").textContent).toContain(
+      "你不在场时向交易所发出止损委托");
+  });
+
+  it("点击即回调（本组件是纯受控件，自己不持状态——那是 modal-revert 复发的根因）", () => {
+    const { onRepairModeChange } = renderFields();
+    fireEvent.click(screen.getByTestId("ai-trade-backstop-repair-arm"));
+    expect(onRepairModeChange).toHaveBeenCalledWith("arm");
+  });
+
+  it("说明文字与两个上限全部来自接口，前端不硬编任何一个数", () => {
+    renderFields({
+      data: {
+        ...DATA,
+        backstopRepair: { ...DATA.backstopRepair!, maxPerEpoch: 5, maxPerSession: 30 },
+      },
+    });
+    const text = screen.getByTestId("ai-trade-backstop-repair").textContent ?? "";
+    expect(text).toContain("只补差额张数");
+    expect(text).toContain("5");
+    expect(text).toContain("30");
   });
 });

@@ -74,6 +74,37 @@ class OKXTradeClient(OKXPrivateClient):
             raise OKXPrivateError(code, str(msg))
         return row
 
+    async def place_algo_order(self, payload: dict) -> dict:
+        """``POST /api/v5/trade/order-algo``：下一张算法委托（本类**唯一**的算法委托写路径）。
+
+        业务码判定与 ``place_order``（:60-75）**逐字同构**：先看顶层 ``code`` 再看 ``data[0].sCode``，
+        任一非 ``"0"`` 即以更具体的那个码抛 ``OKXPrivateError``，由服务层 ``_map_trade_code`` 归一。
+
+        **本方法只被交易所侧兜底自愈路径调用**（``okx.trading.place_backstop_stop``），不对外开放
+        通用算法委托能力：本仓库全部 AI 侧安全层此前的共同纪律是「绝不新增下单路径」，本轮是第一次
+        破例，故这条写能力必须收敛在一个有唯一调用方的方法上。
+
+        Args:
+            payload: ``order_builder.build_algo_stop_payload`` 组装的请求体
+                （含确定性 ``algoClOrdId``——``_post`` 会在 ``TransportError`` 上重试同一 body）。
+
+        Returns:
+            ``data[0]``（含 ``algoId`` / ``algoClOrdId``）。
+
+        Raises:
+            OKXPrivateError: 连通失败、或业务码非 ``"0"``（带**原始** sCode）。
+        """
+        body = await self._post("/api/v5/trade/order-algo", payload)
+        rows = body.get("data") or []
+        row = rows[0] if rows else {}
+        top_code = str(body.get("code"))
+        s_code = str(row.get("sCode") or "")
+        if top_code != "0" or (s_code and s_code != "0"):
+            code = s_code if s_code and s_code != "0" else top_code
+            msg = row.get("sMsg") or body.get("msg") or "OKX 算法委托被拒"
+            raise OKXPrivateError(code, str(msg))
+        return row
+
     async def cancel_order(self, inst_id: str, *, ord_id: str | None = None,
                            cl_ord_id: str | None = None) -> dict:
         """``POST /api/v5/trade/cancel-order``：撤一笔未成交挂单；``ordId`` 与 ``clOrdId`` 二选一。

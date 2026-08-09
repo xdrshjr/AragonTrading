@@ -9,7 +9,11 @@ import {
   turnoverSeverity,
 } from "./aiTradeTurnover";
 import { describeDegradeReason } from "./aiTrade";
-import type { AiTradeBackstopWire, AiTradeTurnoverWire } from "./aiTradeTypes";
+import type {
+  AiTradeBackstopRepairWire,
+  AiTradeBackstopWire,
+  AiTradeTurnoverWire,
+} from "./aiTradeTypes";
 
 function turnover(over: Partial<AiTradeTurnoverWire> = {}): AiTradeTurnoverWire {
   return {
@@ -154,17 +158,50 @@ describe("describeBackstop", () => {
   });
 });
 
+/** 自愈 wire 的最小骨架（backstop-repair §5.4）；只填 severity / chip 真正读到的那几个键。 */
+function repair(over: Partial<AiTradeBackstopRepairWire> = {}): AiTradeBackstopRepairWire {
+  return {
+    mode: "plan",
+    state: "planned",
+    blockedReason: null,
+    plannedStopPx: 61000,
+    plannedSz: 0.3,
+    coveredSz: 0,
+    positionSz: 0.3,
+    attemptsEpoch: 0,
+    maxPerEpoch: 2,
+    attemptsSession: 0,
+    maxPerSession: 8,
+    coolingSeconds: null,
+    lastResult: null,
+    ...over,
+  };
+}
+
 describe("severity 与 chip", () => {
-  it("最紧要优先：mismatch > 覆盖不足 > 冷却中 > 预算耗尽 > 正常", () => {
+  it("最紧要优先：mismatch / 自愈失败 / 已越过 > 覆盖不足 > 待补挂 > 冷却中 > 预算耗尽 > 正常", () => {
     const order = [
       turnoverSeverity(turnover(), backstop({ mismatch: true, hasStop: false })),
       turnoverSeverity(turnover(), backstop({ coverageRatio: 0.5 })),
+      turnoverSeverity(turnover(), backstop({ repair: repair() })),
       turnoverSeverity(turnover({ cooldownActive: true }), backstop()),
       turnoverSeverity(turnover({ tokens: 0 }), backstop()),
       turnoverSeverity(turnover(), backstop()),
     ];
     expect(order).toEqual([...order].sort((a, b) => a - b));
-    expect(new Set(order).size).toBe(5);
+    expect(new Set(order).size).toBe(6);
+  });
+
+  it("U-15 自愈的两格与 mismatch 同级：补挂失败 / 现价已越过都是「此刻没有兜底且补不上」", () => {
+    const failed = turnoverSeverity(turnover(), backstop({ repair: repair({ state: "failed" }) }));
+    const through = turnoverSeverity(
+      turnover(),
+      backstop({ repair: repair({ state: "blocked", blockedReason: "px_through" }) }),
+    );
+    expect(failed).toBe(0);
+    expect(through).toBe(0);
+    // 「等你点一下」不该抢占最紧要的那一格，但要排在冷却之前。
+    expect(turnoverSeverity(turnover(), backstop({ repair: repair() }))).toBe(2);
   });
 
   it("正常态 chip ⇒ null ⇒ 不占位；异常态只显示最紧要的一格", () => {
@@ -178,8 +215,49 @@ describe("severity 与 chip", () => {
     expect(budget?.tone).toBe("short");
   });
 
+  it("U-15b [P1-7] 插格后既有四格的 chip 文案**逐字不变**——severity 重排最容易打断的就是它们", () => {
+    expect(
+      describeTurnoverChip(turnover(), backstop({ mismatch: true, hasStop: false }))?.label,
+    ).toBe("交易所兜底：核实为未挂");
+    expect(describeTurnoverChip(turnover(), backstop({ coverageRatio: 0.62 }))?.label).toBe(
+      "交易所兜底覆盖 62%",
+    );
+    const cooling = describeTurnoverChip(
+      turnover({ cooldownActive: true, cooldownRemainingSeconds: 1800, cooldownSide: "long" }),
+      backstop(),
+    );
+    expect(cooling?.label).toContain("再入场冷却");
+    expect(cooling?.tone).toBe("accent");
+    expect(
+      describeTurnoverChip(turnover({ tokens: 0, nextTokenSeconds: 2520 }), backstop())?.label,
+    ).toContain("换手预算已用尽");
+  });
+
+  it("U-15b 自愈两格的 chip 文案与色调", () => {
+    expect(
+      describeTurnoverChip(turnover(), backstop({ repair: repair({ state: "failed" }) })),
+    ).toEqual({ label: "交易所兜底补挂失败", tone: "short" });
+    expect(describeTurnoverChip(turnover(), backstop({ repair: repair() }))).toEqual({
+      label: "交易所兜底待补挂",
+      tone: "accent",
+    });
+    expect(
+      describeTurnoverChip(
+        turnover(),
+        backstop({ repair: repair({ state: "blocked", blockedReason: "px_through" }) }),
+      )?.label,
+    ).toContain("拒绝补挂");
+  });
+
   it("覆盖未知不进 chip——它不是坏消息，不该抢占最紧要的那一格", () => {
     expect(describeTurnoverChip(turnover(), backstop({ coverageRatio: null }))).toBeNull();
+  });
+
+  it("自愈的中间态不抢 chip：`placed`（已发出、核实中）与 `verified` 都不是坏消息", () => {
+    expect(describeTurnoverChip(turnover(), backstop({ repair: repair({ state: "placed" }) }))).toBeNull();
+    expect(
+      describeTurnoverChip(turnover(), backstop({ repair: repair({ state: "verified" }) })),
+    ).toBeNull();
   });
 });
 

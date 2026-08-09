@@ -26,6 +26,7 @@ import math
 from dataclasses import dataclass, field, replace
 
 from .acceptance_text import funding_note
+from .funding import FundingSnapshot
 
 # 单次计提可平铺的结算点上限：坏读数（interval 极小）下防止一次 tick 造出上万次计提。
 # 触顶即记一次 `capHits`——不记的话，「只取了最近 64 个」与「本来就只跨了这么多」在 wire 上无法
@@ -424,6 +425,35 @@ class BacktestFundingCurve:
         if len(self._points) < 2:
             return None
         return float(self._points[-1][0] - self._points[-2][0])
+
+    def snapshot_at(self, ts: int, *, now_wall: float = 0.0) -> FundingSnapshot | None:
+        """`ts` 时点可见的最近一次真实结算费率；曲线不可用 ⇒ `None`
+        （ai-trade-backstop-repair-and-net-backtest §2.3.1）。
+
+        产物与实盘**同一个** `FundingSnapshot` 类型——回测的成本模型入参与实盘走同一条形状，
+        才谈得上「回测向实盘收敛」。三条纪律：
+
+        1. **严格无未来函数**：只取 `point.ts <= ts` 的最后一点；一个都没有 ⇒ `None`
+           （曲线起点之前的那几根决策轮就是没有可见费率，绝不拿未来那一点补上）。
+        2. **`available` 是前置条件**（≥2 点）：单点算不出周期，算不出周期就表达不了「几期」。
+        3. `interval_s` 取 `interval_hint`（最近两点之差）且 `interval_known=True`——历史曲线自带
+           每一次真实结算时刻，这是本仓库唯一一个「结算周期真的可知」的场景（调查约束 #7）。
+        """
+        if not self.available:
+            return None
+        target = int(ts)
+        point = None
+        for candidate in self._points:
+            if candidate[0] > target:
+                break
+            point = candidate
+        if point is None:
+            return None
+        interval = float(self.interval_hint or 0.0)
+        return FundingSnapshot(
+            rate=float(point[1]), funding_ts=int(point[0]),
+            next_funding_ts=int(point[0] + interval), interval_s=interval,
+            fetched_wall=float(now_wall), interval_known=True)
 
 
 def _finite(value) -> bool:
