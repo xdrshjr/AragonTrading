@@ -809,3 +809,76 @@ describe("AgentPanel segmented view", () => {
     expect(screen.getByText("AI 交易助手")).toBeInTheDocument();
   });
 });
+
+// ---------------- 交易周期段（ai-trade-holding-horizon-modes §2.11 展示落点之二）----------------
+// 与上一组同款理由：守的是**挂载**而不只是定义——组件写好了却没挂进渲染树，tsc 与逐函数单测都不会
+// 替你发现（本仓库有过同类事故）。
+function horizonWire(over: Record<string, unknown> = {}) {
+  return {
+    profileId: "intraday_swing", title: "日内波段", targetLabel: "4 – 12 小时",
+    status: "holding", holdSeconds: 5400, barsInPosition: 2, targetHoldMinSeconds: 14400,
+    targetHoldMaxSeconds: 43200, minHoldSeconds: 7200, minHoldRemainingSeconds: 1800,
+    exitConfirmRounds: 2, exitConfirmStreak: 1, confirmWindowSeconds: 3600,
+    confirmWindowRemainingSeconds: 1200, confirmWindowElapsed: false,
+    turnoverHysteresisK: 1.5, moveBps: 8.2, costBps: 13, requiredMoveBps: 19.5,
+    returnPct: 0.02, lossReleaseReturnPct: 0.075, released: false, releaseReason: null,
+    releasedGates: [], blockedStreak: 0, expectedHoldBars: 12, openedWallEstimated: false,
+    gateReverse: true, asOfWall: 1_700_000_000, ...over,
+  } as NonNullable<AiTradeRoundTrace["horizonWire"]>;
+}
+
+describe("AiTradeAgentTrace · 交易周期段", () => {
+  it("契约未装配（默认）⇒ 整段不渲染", () => {
+    render(
+      <AiTradeAgentTrace group={groupWith(SESSION, [round({})])} activeInstId="BTC-USDT-SWAP" />,
+    );
+    expect(screen.queryByText(/交易周期（持仓时长铁律）/)).not.toBeInTheDocument();
+  });
+
+  it("被否轮：三道闸读数与中文理由同时可见（只说「被拦了」用户无从判断该等还是该关）", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [round({
+          horizonStatus: "veto",
+          horizonReason: "horizon_min_hold(held=90m,min=120m)",
+          horizonWire: horizonWire(),
+        })])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText(/交易周期（持仓时长铁律）/)).toBeInTheDocument();
+    const rows = screen.getByTestId("ai-horizon-rows").textContent ?? "";
+    expect(rows).toContain("还差 30 分钟");
+    expect(rows).toContain("离场确认 1/2");
+    expect(rows).toContain("需 ≥19.5bps");
+    expect(screen.getByText(/未满最短持仓窗口/)).toBeInTheDocument();
+  });
+
+  it("解除态：徽标点名原因，且文案讲清此刻是**放行**（本层 fail-open，用红色会让人以为被拦住）", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [round({
+          horizonStatus: "released",
+          horizonWire: horizonWire({ released: true, releaseReason: "stale_px",
+                                     releasedGates: ["G1", "G2", "G3"] }),
+        })])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText(/限制已解除（判定价不可信）/)).toBeInTheDocument();
+  });
+
+  it("空仓轮：如实说「本层不约束开仓」（新增边缘态必须验渲染门控没把它整段吞掉）", () => {
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [round({
+          horizonStatus: "idle",
+          horizonWire: horizonWire({ status: "flat", holdSeconds: 0 }),
+        })])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    // 徽标与正文两处都要说清楚（用户先看徽标、再看正文，缺一处都会让空仓态读起来像被拦住）。
+    expect(screen.getAllByText(/不约束开仓/).length).toBeGreaterThanOrEqual(2);
+  });
+});

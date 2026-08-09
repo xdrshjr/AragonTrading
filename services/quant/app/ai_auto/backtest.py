@@ -40,9 +40,14 @@ from ..strategies.base import Signal
 from ..agent.services import load_htf_frames, load_range_candles
 from .backtest_frames import build_backtest_frames
 from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, format_charter
-from .cost_model import backtest_params
+from .cost_model import backtest_params, estimate_round_trip_cost, query_for_preview
 from .decider import AiTradeDecider, TradeDecision
 from .edge_gate import evaluate_edge_gate
+from .hold_horizon import HorizonFacts, HorizonRule
+from .hold_horizon import rule_wire as horizon_rule_wire
+from .hold_horizon_text import format_backtest_notes
+from .hold_horizon_text import format_charter as format_horizon_charter
+from .horizon_runtime import HorizonRuntime
 from .market_context import build_market_context
 from .market_digest import build_market_digest
 from .multi_timeframe_context import (
@@ -144,6 +149,10 @@ class AiBacktestSpec:
     # + `profit_cooldown`），差异只在「谁提供行情断面」。默认 None=不装配 ⇒ `_run_loop` 的 SimBroker
     # 调用序与 payload/prompt 逐字节回退（G-3，既有直接构造该 dataclass 的回测测试零回归）。
     profit_rule: ProfitGuardRule | None = None
+    # 交易周期模式（holding-horizon §2.10）：与实盘**共用同一纯核心**（`hold_horizon` +
+    # `horizon_runtime`），差别只在时钟与断面来源（墙钟 → bar ts，实时价 → 当根收盘价）。默认
+    # None=不装配 ⇒ payload / prompt / 门禁 / notes 逐字节回退（既有回测测试零回归）。
+    horizon_rule: HorizonRule | None = None
 
 
 # ============================ 线格式序列化助手（纯函数） ============================
@@ -228,6 +237,11 @@ class AiBacktestRunner:
         self.profit_guard_exits = 0
         self._atr_series = None            # `_setup` 里一次性向量化；第 i 根用 iloc[i-1]（无未来函数）
         self._bar_ts_index: list[int] | None = None   # 根索引 → ts（把开仓根 ts 当 opened_wall，§2.3.2）
+        # 交易周期层（holding-horizon §2.10）：与实盘同一个运行时类，只是喂进去的时钟是 bar ts。
+        self.horizon_rule = spec.horizon_rule
+        self._horizon = HorizonRuntime(spec.horizon_rule)
+        self._horizon_hold_bars = (None if spec.horizon_rule is None
+                                   else spec.horizon_rule.expected_hold_bars)
 
         self.warmup = _compute_warmup(self.specs, spec.settings.ai_trade_regime_context)
         # allow_limit 恒 False（ai-trade-limit-orders §2.10，Non-goal）：`SimBroker._pending` 是「次根
@@ -243,7 +257,15 @@ class AiBacktestRunner:
                                          base_rules_text=format_charter(self.base_rule),
                                          # 利润保护宪章同源注入（F3）；未装配 → "" ⇒ 同上零回归
                                          profit_guard_text=format_profit_guard_charter(
-                                             self.profit_rule)),
+                                             self.profit_rule,
+                                             horizon_armed=self.horizon_rule is not None),
+                                         # 交易周期宪章同源注入；未装配 → "" ⇒ 同上零回归。解除阈按
+                                         # 本次回测真实的 OCO 止损与杠杆现算，绝不写死算例。
+                                         horizon_text=format_horizon_charter(
+                                             self.horizon_rule,
+                                             stop_loss_pct=spec.stop_loss_pct,
+                                             take_profit_pct=spec.take_profit_pct,
+                                             leverage=self.leverage)),
             context_refresh_rounds=self.context_refresh_rounds, settings=self.settings,
             position_step_pct=self.position_step_pct, reflection_enabled=self.reflection_enabled,
             allow_limit=False,
@@ -337,8 +359,11 @@ class AiBacktestRunner:
         # 否则门禁恒 unavailable、fail-open 放行（I-5）。ATR 止损（vol-sizing §3.10 复发点一）同款：不把
         # 总闸②或进来，`_atr_series` 恒 None ⇒ 止损在回测里恒不生效**且不报任何错**（T-19 守这条）。
         if (self.profit_rule is not None or self.settings.ai_trade_edge_gate_k_min > 0
-                or self.settings.ai_trade_stop_atr_mult > 0):
+                or self.settings.ai_trade_stop_atr_mult > 0
+                or self.horizon_rule is not None):
             # F1/F3：ATR 一次性向量化（第 i 根取 iloc[i-1]，含本根 h/l 的 ATR 是未来函数）。
+            # 交易周期层同样要 `_bar_ts_index`——`opened_wall` 取开仓根 ts，缺这条索引会让持仓时长
+            # 恒为 0、G1 在回测里恒不生效（`_atr_series` 是顺带的，本层不读它）。
             self._atr_series = atr(main_df, self.settings.ai_trade_profit_guard_atr_period)
             self._bar_ts_index = main_df["ts"].astype(int).tolist()
         job.publish({"type": "phase", "data": {"phase": "priming"}})
@@ -393,6 +418,7 @@ class AiBacktestRunner:
             # ★ 利润保护（F3 §2.3.3）：排在 apply_risk **之后**（交易所侧 OCO 物理上先于本进程存在，
             # 同根同时命中按更保守的先手记因）、mark **之前**（本根内的平仓必须反映进本根权益点）。
             self._apply_profit_guard_bar(i, row)
+            self._track_horizon_epoch(int(row["ts"]))
             self.main.mark(ts=int(row["ts"]), close=float(row["c"]))
             self._sizing.note_equity(self.main.equity_at(float(row["c"])))   # 刹车权益推进
             if self.main.pos.side != "flat":         # [B1] 在场根计数（timeInMarketPct 分子）
@@ -481,6 +507,55 @@ class AiBacktestRunner:
             return default
         return int(self._bar_ts_index[bar_index])
 
+    # ---------- 交易周期层（holding-horizon §2.10：与实盘共用纯核心，本文件只提供 bar 时钟）----------
+    def _track_horizon_epoch(self, bar_ts: int) -> None:
+        """逐根维护 epoch：开仓即锁 `opened_wall = 开仓根 ts`，转 flat 即收一条持仓时长样本。
+
+        **绝不依赖 `refresh()` 的兜底建 epoch**：那条路径会把 `opened_wall_estimated` 置真，从而让
+        `epoch_estimated` 豁免每一轮都命中 ⇒ G1 在回测里恒不生效且不报任何错（与实盘结论相反）。
+        实盘的对应真源是 `_dispatch` 的开仓成交事件，回测这里是**开仓根 ts**（§2.10 对照表）。
+        """
+        if self.horizon_rule is None:
+            return
+        pos = self.main.pos
+        if pos.side == "flat":
+            if self._horizon.state.epoch is not None:
+                self._horizon.note_close({}, float(bar_ts))
+            return
+        epoch = (pos.side, int(pos.entry_bar))
+        current = self._horizon.state.epoch
+        # 反手（long → short）在**同一根**里换了身份、中间不经过 flat：不先收一笔 `note_close`，上一段
+        # 持仓的时长样本与 `roundTrips` 会静默消失，而反手恰是本层专门计数的一类换手（reverseVetoes）。
+        # 实盘侧无此问题——`_dispatch` 的 close 与 open 是两条成交事件，天然成对。
+        if current is not None and current != epoch:
+            self._horizon.note_close({}, float(bar_ts))
+        self._horizon.note_open({"side": pos.side},
+                                float(self._bar_ts(pos.entry_bar, default=bar_ts)),
+                                seq=int(pos.entry_bar))
+
+    def _horizon_facts(self, i: int, ts: int, ref_px: float) -> HorizonFacts:
+        """回测断面（§2.10 对照表）：`now_wall`=当前根 ts、`mark_px`=当根收盘价、`side`=`pos.side`。
+
+        `cost_bps` 走**回测世界**的常数（`backtest_params`）且方向按**持仓**取（[P1-2]/[P1-3]）——
+        两侧各自对自己的世界说真话，但前瞻窗口同为 `rule.expected_hold_bars`，否则回测按 8 根算资金费、
+        实盘按 12–72 根算，G-3「两侧 reason 逐字相等」不可能通过。
+        """
+        pos = self.main.pos
+        cost = None
+        if pos.side in ("long", "short"):
+            cost = estimate_round_trip_cost(
+                query_for_preview(ord_type="market", side=pos.side,
+                                  bar_seconds=BAR_SECONDS[self.bar], funding=None,
+                                  funding_enabled=False),
+                backtest_params(self.settings,
+                                expected_hold_bars=self._horizon_hold_bars)).total_bps
+        return HorizonFacts(
+            seq=int(pos.entry_bar), side=pos.side, entry_px=float(pos.entry_price or 0.0),
+            mark_px=float(ref_px), leverage=float(self.leverage), now_wall=float(ts),
+            bars_in_position=(i - pos.entry_bar) if pos.side != "flat" else None,
+            max_hold_bars=self._oco_risk.max_hold_bars,
+            stop_loss_pct=self._oco_risk.stop_loss_pct, cost_bps=cost)
+
     def _profit_guard_wire(self, i: int, ref_px: float) -> dict | None:
         """决策 payload 用的只读保护快照（不推进状态）；未装配 / 空仓 / 无 state ⇒ None ⇒ 整键缺席。
 
@@ -532,6 +607,12 @@ class AiBacktestRunner:
             last_px=ref_px)
         # ★ 利润保护冷却门禁（F2 §2.3.3a）：与实盘同序（铁律后、共识前）、**同一个纯函数**——严禁在
         # 回测侧复制一份判定（那正是 v1 P1-4 给【基础策略】铁律定下的规矩）。未装配 ⇒ 原样直通（G-3）。
+        # ★ 交易周期铁律门禁（holding-horizon §2.10）：与实盘**同一纯核心、同位插入**（基础策略后、
+        # 冷却前）。`note_intent` 同样排在一切门禁**之前**（第一阶段意愿口径）。未装配 ⇒ 原样直通。
+        self._horizon.note_intent(decision.action, decide_degrade,
+                                  position_side=self.main.pos.side, now_wall=float(ts))
+        decision, _, _ = self._horizon.gate(decision, None, self._horizon_facts(i, ts, ref_px))
+        horizon_reason = self._horizon.last_reason
         decision, cooldown_reason = apply_profit_cooldown(decision, self._cooldown, now_wall=ts)
         decision, brake_reason = self._sizing.gate(decision, None, now_wall=float(ts))  # ★ 刹车（第 7 步）
         decision, consensus_reason = apply_consensus_gate(decision, consensus, self.min_consensus)
@@ -540,11 +621,15 @@ class AiBacktestRunner:
         edge_out = evaluate_edge_gate(
             decision, settings=self.settings, last_px=ref_px, atr_px=self._atr_at(i),
             take_profit_pct=self._oco_risk.take_profit_pct, bar_seconds=BAR_SECONDS[self.bar],
-            params=backtest_params(self.settings), funding_enabled=False)
+            params=backtest_params(self.settings,
+                                   expected_hold_bars=self._horizon_hold_bars),
+            funding_enabled=False)
         edge_reason = edge_out.reason if edge_out is not None else None
         decision = edge_out.decision if edge_out is not None else decision
-        # 四元合成，先执行者胜出：铁律优先级最高，冷却次之（本系统刚亲手做过的动作，解释力强于票数）。
-        gate_reason = base_reason or cooldown_reason or brake_reason or consensus_reason or edge_reason
+        # 五元合成，先执行者胜出：铁律优先级最高，持仓周期次之，再冷却（本系统刚亲手做过的动作，
+        # 解释力强于票数），最后共识与成本门禁——与实盘 `degrade or reason` 的链序逐字同构。
+        gate_reason = (base_reason or horizon_reason or cooldown_reason or brake_reason
+                       or consensus_reason or edge_reason)
         # 二次反思（决策脑不变式：回测复用同一 decider.reflect，emit=None 轨迹全程空转）。verdict 须在分支外
         # 预置 None（RV-3），否则 hold 轮走 else 分支时 _tally_reflection(verdict) 会 NameError。
         verdict = None
@@ -637,6 +722,9 @@ class AiBacktestRunner:
         cooldown = build_cooldown_view(self._cooldown, now_wall=ts)
         if cooldown is not None:
             payload["profitGuardCooldown"] = cooldown
+        # 交易周期段（§2.10）：同款「整键缺席」范式；须在 profitGuard 之后——它顺带给保护快照打
+        # `horizonArmed` 标记（§2.9 a/b 的两处抢跑文案据它切换，两侧同源）。
+        self._horizon.inject(payload, self._horizon.refresh(self._horizon_facts(i, ts, ref_px)))
         return payload
 
     def _build_multi_timeframe_context(
@@ -797,7 +885,10 @@ class AiBacktestRunner:
             # 本次回测**是否真的装配了保护层**（RV-1）：`profitGuardExits` 恒下发且未装配时也是 0，
             # 只凭它无法把「装了但没触发」与「压根没装」分开——UI 据此才不会在一次没有保护层的回测上
             # 挂出「利润保护（保守近似）」的卡片，宣称一条并不存在的防线（v1 终审 RV-1 的同一条教训）。
-            "profitGuardEnabled": self.profit_rule is not None}
+            "profitGuardEnabled": self.profit_rule is not None,
+            # 交易周期层观测（§2.12）：与实盘 `aiStats.horizon` **同名同形**（同一个 `stats()`），
+            # 未装配 ⇒ `None` ⇒ UI 整段不渲染（绝不在一次没有周期契约的回测上挂出该卡片）。
+            "horizon": self._horizon.stats()}
 
     def _build_notes(self, main_df: pd.DataFrame, first: int) -> list[str]:
         notes: list[str] = []
@@ -814,6 +905,9 @@ class AiBacktestRunner:
             notes.append(_EDGE_GATE_BACKTEST_NOTE)
         if self._sizing.armed:
             notes.append(SIZING_BACKTEST_NOTE)
+        # 分辨率免责（§2.10 / [P2-7]）：**点名具体模式**——`hourly_swing`（5m 执行 + 180s 窗口）在
+        # 回测里 G1 恒不生效，不写清楚用户仍会拿这份回测去为实盘的最短持仓窗口背书。
+        notes.extend(format_backtest_notes(self.horizon_rule, BAR_SECONDS[self.bar]))
         return notes
 
     def _build_result(self, metrics: dict, ai_stats: dict, notes: list[str]) -> dict:
@@ -861,7 +955,9 @@ class AiBacktestRunner:
                 "positionStepPct": self.position_step_pct,
                 # P2-6：回填本次保护参数，否则 run 的 config_json 无法复现这次回测（与 §4.1 的
                 # 「回执与 config_json 由 rule_wire 镜像全部字段」承诺矛盾）。未装配 → None。
-                "profitGuard": rule_wire(self.profit_rule)}
+                "profitGuard": rule_wire(self.profit_rule),
+                # 同上：不回填本次周期契约，run 的 config_json 就复现不了这次回测（含两个派生量）。
+                "tradingHorizon": horizon_rule_wire(self.horizon_rule)}
 
 
 def _compute_warmup(specs: list[PaperStrategySpec], regime_enabled: bool) -> int:

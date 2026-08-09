@@ -548,6 +548,88 @@ class AiTradeProfitGuardIn(BaseModel):
         return self
 
 
+AiTradeHorizonProfileId = Literal[
+    "hourly_swing", "intraday_swing", "short_swing", "trend_hold", "custom"]
+
+
+class AiTradeHorizonIn(BaseModel):
+    """交易周期模式入参（ai-trade-holding-horizon-modes §4.2）：一次选择、全局生效的结构化契约。
+
+    它一次性决定执行周期建议、唤醒节奏建议、成本与先验的前瞻窗口，以及三条由系统确定性执行的换手
+    约束（最短主动平仓窗口 / 离场连续确认 / 换手迟滞）。**字段整体缺省 ⇒ 服务端按 settings 装配默认
+    模式**（D-2，与 baseRules / profitGuard 的「缺省即开启」惯例一致）；`enabled=false` 是用户显式
+    关闭本层的唯一途径。
+
+    校验只在本层做（422），服务端 `_resolve_horizon` **只做缺省回填、不复夹**（沿用
+    `_resolve_position_step` 的 `[R-2]` 惯例）——值域的唯一真源就是下面这些 `Field` 约束。
+    """
+
+    enabled: bool = True
+    profile: AiTradeHorizonProfileId | None = None   # 缺省 → settings.ai_trade_horizon_default_profile
+    minHoldSeconds: float | None = Field(default=None, ge=0, le=604800)   # 7 天硬顶
+    exitConfirmRounds: int | None = Field(default=None, ge=1, le=10)
+    turnoverHysteresisK: float | None = Field(default=None, ge=0, le=10)
+    # [P1-9] 这两项**不是纯展示字段**：`targetHoldMaxSeconds` 是 `expectedHoldBars` 的唯一派生源，
+    # 覆盖它会连带改写成本模型的资金费期数与信号先验的前瞻窗口；`targetHoldMinSeconds` 同时是
+    # `confirmWindowSeconds`（G2 墙钟上界）与 `minHoldSeconds` 默认值的派生源。回执会同时镜像这两个
+    # 派生量，使「我到底改了什么」可被逐字段核对。
+    targetHoldMinSeconds: float | None = Field(default=None, gt=0, le=2592000)   # 30 天
+    targetHoldMaxSeconds: float | None = Field(default=None, gt=0, le=2592000)
+    # true ⇒ 把 executor 的 `max_hold_bars` 设为 `expectedHoldBars`（默认关，D-6）。它与 §2.3.3 的
+    # `max_hold_bars` 豁免构成闭环：上限已到时本层整体解除，绝不出现「系统要强平、本层却拦着 Agent
+    # 先走一步」的对冲态。
+    enforceMaxHold: bool = False
+
+    @model_validator(mode="after")
+    def _check_target_range(self) -> "AiTradeHorizonIn":
+        """边界一次性校验（进入内部后信任）：目标区间不可倒置，违反即 422。"""
+        lo, hi = self.targetHoldMinSeconds, self.targetHoldMaxSeconds
+        if lo is not None and hi is not None and lo > hi:
+            raise ValueError("目标持仓下界不可大于上界")
+        return self
+
+
+class AiTradeHorizonProfileOut(BaseModel):
+    """`GET /ai-trade/horizon-profiles` 的单个预设条目（§4.1）。
+
+    [P1-8] 除 `id` / `title` / `description` 外**全部可空**：`custom` 条目这些格子恒为 `null`
+    （§2.2 表里它们是「不联动 / 用户填」）。若声明为非空，前端渲染 custom 卡片时会拿到一组无意义
+    数字并据此联动 bar 与唤醒周期。
+    """
+
+    id: str
+    title: str
+    description: str
+    targetLabel: str | None = None
+    bar: str | None = None
+    wakeIntervalMinutes: float | None = None
+    minHoldSeconds: float | None = None
+    exitConfirmRounds: int | None = None
+    turnoverHysteresisK: float | None = None
+    targetHoldMinSeconds: float | None = None
+    targetHoldMaxSeconds: float | None = None
+    # 两个**派生量的预览值**（按本条目自带 bar 算）；实际生效值按用户所选 bar 现算。
+    expectedHoldBars: int | None = None
+    confirmWindowSeconds: float | None = None
+    leverageMaxHint: float | None = None
+
+
+class AiTradeHorizonProfilesOut(BaseModel):
+    """模式预设表回执（只读、不守 AI 总闸——读预设表不下任何单）。
+
+    `estimatedCostBps` 为按当前配置常数估的往返成本（**非实时盘口**，UI 须标「约」）；
+    `lossReleaseFrac` / `lossReleaseReturnPctFallback` 下发给前端，使契约摘要第 4 行能按当前表单值
+    **现算**解除阈而不是写死一个算例（[P1-10]）。
+    """
+
+    enabled: bool
+    defaultProfile: str
+    estimatedCostBps: float | None = None
+    lossReleaseFrac: float
+    lossReleaseReturnPctFallback: float
+    profiles: list[AiTradeHorizonProfileOut] = Field(default_factory=list)
+
+
 class AiTradeGroupStartIn(BaseModel):
     """启动 AI 自动交易分组请求（金额/杠杆字段可留空→服务端保守默认，§4.1）。
 
@@ -583,6 +665,10 @@ class AiTradeGroupStartIn(BaseModel):
     # `{"enabled":false}` ⇒ 该会话不装配。**实盘与回测两处启动体都接该字段**（adaptive §7.2a I-4：
     # 第 1 轮把回测列为非目标，第 2 轮 F3 用 bar 内 OHLC 极值 + 保守成交序取代了收盘价近似）。
     profitGuard: AiTradeProfitGuardIn | None = None
+    # 交易周期模式（默认开启，同上「字段缺省 ⇒ 开启」语义，解析点 `_resolve_horizon`）；
+    # `{"enabled":false}` ⇒ 该会话不装配。**实盘与回测两处启动体都接该字段**（同一解析点，
+    # 否则用户拿回测调出来的参数在实盘失真——`base_rules` P1-4 / `profit_guard` I-3 的成文教训）。
+    tradingHorizon: AiTradeHorizonIn | None = None
 
     @field_validator("members")
     @classmethod
@@ -617,6 +703,11 @@ class AiTradePriorRebuildIn(BaseModel):
     strategyIds: list[int] = Field(default_factory=list)
     lookbackBars: int | None = Field(default=None, ge=100)
     segments: int | None = Field(default=None, ge=2, le=20)
+    # 前瞻根数覆盖（ai-trade-holding-horizon-modes §2.6 / §4.5）：缺省仍取
+    # `settings.ai_trade_cost_expected_hold_bars`。装配了持仓周期模式的会话其 `horizonBars` 会变成
+    # 12/18/24，而库里按全局 8 建的快照会被 C-3 判 `horizon_mismatch` 并整份丢弃——那是**正确行为**
+    # （拿 8 根前瞻的胜率去给 12 根持仓做 EV 分子是错的），但运维必须有一条按目标模式重建的出路。
+    horizonBars: int | None = Field(default=None, ge=1, le=1000)
 
 
 class AiTradePriorEntryOut(BaseModel):
@@ -681,6 +772,9 @@ class AiTradeGroupRow(BaseModel):
     wakeIntervalMinutes: float | None = None   # Agent 墙钟定时唤醒周期（分钟；null=关闭），契约镜像
     baseRules: dict | None = None              # 【基础策略】铁律回执镜像（null=未装配）
     profitGuard: dict | None = None            # 利润保护层回执镜像（null=未装配）
+    # 交易周期模式回执镜像（null=未装配）：为**服务端解析后的生效值**，且必须同时带上两个派生量
+    # `expectedHoldBars` / `confirmWindowSeconds`（[P1-9]/[P0-3]）——只回显入参等于把派生关系藏起来。
+    tradingHorizon: dict | None = None
 
 
 class AiTradeGroupStartOut(AiTradeGroupRow):
@@ -719,6 +813,10 @@ class AiBacktestStartIn(BaseModel):
     # 回测按 bar 内 OHLC 极值 + 保守成交序近似，运维总闸 `ai_trade_profit_guard_backtest_enabled=false`
     # 可一键回到第 1 轮的「回测无保护层」行为。
     profitGuard: AiTradeProfitGuardIn | None = None
+    # 交易周期模式：与实盘同字段同语义、同一 `_resolve_horizon` 解析（回测侧另叠一层运维总闸
+    # `ai_trade_horizon_backtest_enabled`）。回测按根推进，故最短持仓窗口的分辨率是一根 K 线——
+    # 该免责由 `hold_horizon_text.format_backtest_notes` 写进结果 notes 并在 UI 上显示。
+    tradingHorizon: AiTradeHorizonIn | None = None
 
 
 class AiBacktestStartOut(BaseModel):

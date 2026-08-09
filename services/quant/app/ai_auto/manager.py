@@ -42,6 +42,9 @@ from .admission import get_admission_lock
 from .base_rules import MaBandRule, format_charter, rule_wire
 from .cost_runtime import build_charter_text
 from .exposure_book import GroupExposureBook
+from .hold_horizon import HorizonRule
+from .hold_horizon import rule_wire as horizon_wire
+from .hold_horizon_text import format_charter as format_horizon_charter
 from .market_window import MarketWindow, WindowOptions
 from .profit_guard import ProfitGuardRule
 from .profit_guard_text import format_profit_guard_charter
@@ -147,6 +150,10 @@ class AiTradeGroupStartRequest:
     # 历史统计——照字面共享会让 BTC 的成员拿 ETH 的统计去开真实仓位，且**不会报错**。
     # 缺键 = 该成员无先验（不是错误，逐字回退 ATR 粗估）。
     prior_snapshots: dict[str, dict] | None = None
+    # 交易周期模式契约（ai-trade-holding-horizon-modes §2.4）：同款零回归垫片（默认 None=不装配；
+    # 「缺省即开启」只在 API 层 `_resolve_horizon` 解析）。**分组共享同一份契约**——模式是会话级契约
+    # 而非标的属性（R-12），与 base_rule / profit_rule 的分组共享姿态一致。
+    horizon_rule: HorizonRule | None = None
 
 
 @dataclass
@@ -179,6 +186,7 @@ class AiTradeGroup:
     sizing_rule: SizingRule | None = None    # 仓位求解规则（总闸①；None=未装配）
     stop_rule: StopRule | None = None        # ATR 止损规则（总闸②；与①独立）
     exposure_book: GroupExposureBook | None = None   # 分组共享敞口簿（总闸③关 ⇒ None）
+    horizon_rule: HorizonRule | None = None  # 交易周期模式（None=未装配），回显 tradingHorizon
 
 
 @dataclass
@@ -412,7 +420,7 @@ class AiTradeManager:
             created_ts=created_ts, members=members,
             wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
             profit_rule=req.profit_rule, sizing_rule=rule, exposure_book=book,
-            stop_rule=parse_stop_rule(req.settings))
+            stop_rule=parse_stop_rule(req.settings), horizon_rule=req.horizon_rule)
 
     async def _build_member(self, ctx: _GroupBuildCtx, plan: _MemberPlan) -> AiTradeGroupMember:
         """建单成员会话：Executor（按 budget_i）+ Decider + Run（含 groupId/allocationPct）+ Session。
@@ -432,6 +440,10 @@ class AiTradeManager:
         # 仓位/刹车层：三条规则由本层从 `settings` 自解析（[P1-7]：**不给启动请求加字段**，否则永远没人填）。
         sizing = build_sizing_runtime(req.settings, plan.inst_id, BAR_SECONDS[req.bar],
                                       book=ctx.book, budget_usd=plan.budget_usd)
+        # 交易周期模式（holding-horizon §2.6）：前瞻窗口与交易所侧 OCO 读数由**同一份契约**派生，
+        # 使宪章说的、成本判定用的、先验校验的是同一个数（未装配 ⇒ None ⇒ 三处逐字回退）。
+        risk = self._resolve_trade_risk(req, req.settings)
+        hold_bars = None if req.horizon_rule is None else req.horizon_rule.expected_hold_bars
         decider = AiTradeDecider(
             make_llm_client_from_config(ctx.provider),
             build_ai_trade_system_prompt(plan.inst_id, req.bar, plan.budget_usd, ctx.lever,
@@ -450,7 +462,15 @@ class AiTradeManager:
                                              req.settings, plan.inst_id,
                                              fee_rates_wire=plan.fee_rates_wire,
                                              bar_seconds=BAR_SECONDS[req.bar],
-                                             allow_limit=allow_limit),
+                                             allow_limit=allow_limit,
+                                             expected_hold_bars=hold_bars),
+                                         # 交易周期宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变。
+                                         # 解除阈按**本会话真实的** OCO 止损与杠杆现算，绝不写死算例。
+                                         horizon_text=format_horizon_charter(
+                                             req.horizon_rule,
+                                             stop_loss_pct=risk.stop_loss_pct,
+                                             take_profit_pct=risk.take_profit_pct,
+                                             leverage=ctx.lever),
                                          # 仓位与风险层宪章章；三条规则全未装配 → "" ⇒ 渲染逐字节不变
                                          sizing_text=format_sizing_charter(
                                              sizing.rule, sizing.stop_rule, sizing.brake_rule),
@@ -473,7 +493,8 @@ class AiTradeManager:
             context_refresh_rounds=req.context_refresh_rounds,
             wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
             profit_rule=req.profit_rule,
-            prior_snapshot=(req.prior_snapshots or {}).get(plan.inst_id), sizing=sizing)
+            prior_snapshot=(req.prior_snapshots or {}).get(plan.inst_id), sizing=sizing,
+            horizon_rule=req.horizon_rule)
         return AiTradeGroupMember(inst_id=plan.inst_id, allocation_pct=plan.allocation_pct,
                                   budget_usd=plan.budget_usd, session=session, run_id=run_id)
 
@@ -552,6 +573,9 @@ class AiTradeManager:
                                         if group.wake_interval_s > 0 else None),
                 "baseRules": rule_wire(group.base_rule),   # 【基础策略】回执镜像（未装配→ null）
                 "profitGuard": profit_guard_wire(group.profit_rule),   # 利润保护回执镜像（同上）
+                # 交易周期模式回执镜像（同上）：**生效值** + 两个派生量，使「弹窗预览 == 落地」可逐
+                # 字段核对（[P1-9]：只回显入参等于把 expectedHoldBars 的派生关系藏起来）。
+                "tradingHorizon": horizon_wire(group.horizon_rule),
                 "createdTs": group.created_ts,
                 "members": [self._member_row(m) for m in group.members]}
 
@@ -658,14 +682,25 @@ class AiTradeManager:
         """E4：入参 sl/tp% 夹紧到 `ai_trade_max_sl_pct/tp_pct`，留空回落 config 默认；构造期 OCO。
 
         不改 `LiveExecutor` 任何代码（其构造本就收 `risk`），只把原写死的 config 默认变为
-        「用户可在夹紧区间内设定」；`max_hold_bars` 仍取 config 默认。各成员单仓 OCO pct 同值。
+        「用户可在夹紧区间内设定」。各成员单仓 OCO pct 同值。
+
+        `max_hold_bars`（holding-horizon [P1-5]）：默认仍取 config 常数（默认 0 = 禁用）；仅当交易
+        周期契约显式 `enforceMaxHold=true` 且派生出了 `expected_hold_bars` 时改用后者。这一处是
+        `enforceMaxHold` 的**唯一实现落点**——不接它，那个字段就是一个没有落点的死字段。开启后它与
+        §2.3.3 的 `max_hold_bars` 豁免构成闭环：executor 在 `bars_in_position >= max_hold_bars` 时
+        强平，本层在**同一判据**上整体解除，绝不出现「系统要强平、本层却拦着 Agent 先走一步」。
+        本改动**只作用于 AI 链路**（`live_auto` 有自己的 `_resolve_*`，不经本函数）。
         """
         sl = (_clamp(req.stop_loss_pct, 0.0, settings.ai_trade_max_sl_pct)
               if req.stop_loss_pct is not None else settings.ai_trade_default_sl_pct)
         tp = (_clamp(req.take_profit_pct, 0.0, settings.ai_trade_max_tp_pct)
               if req.take_profit_pct is not None else settings.ai_trade_default_tp_pct)
+        rule = req.horizon_rule
+        max_hold = settings.ai_trade_default_max_hold_bars or None
+        if rule is not None and rule.enforce_max_hold and rule.expected_hold_bars:
+            max_hold = int(rule.expected_hold_bars)
         return RiskParams(stop_loss_pct=sl or None, take_profit_pct=tp or None,
-                          max_hold_bars=settings.ai_trade_default_max_hold_bars or None)
+                          max_hold_bars=max_hold)
 
     @staticmethod
     def _build_executor(creds: AccountCredentials, req: AiTradeGroupStartRequest, inst_id: str,
@@ -713,6 +748,9 @@ class AiTradeManager:
                         "baseRules": rule_wire(req.base_rule),
                         # 利润保护配置随 config_json 落库（零列迁移；未装配存 None）。
                         "profitGuard": profit_guard_wire(req.profit_rule),
+                        # 交易周期模式同款落库（零列迁移；未装配存 None）——历史详情接口直读 json 列，
+                        # 故「这次会话到底选了哪种周期」事后可核对。
+                        "tradingHorizon": horizon_wire(req.horizon_rule),
                         # 仓位/刹车层配置同款落库（零列迁移；三条规则全未装配存 None）。
                         "sizing": sizing_config_wire(req.settings, BAR_SECONDS[req.bar]),
                         # 会话级静态口径标记（cost-truth §3.2 B-4，零迁移）：聚合层据此判断

@@ -35,6 +35,7 @@ from ..agent.llm.base import (
 from ..agent.llm.retry import backoff_delay_ms
 from ..config import Settings
 from ..live_auto.resting import validate_limit_intent
+from .hold_horizon_text import format_reflection_note
 from .prompts import (
     DECISION_TOOL_NAME,
     REFLECTION_TOOL_DESCRIPTION,
@@ -448,7 +449,10 @@ class AiTradeDecider:
         复核推理经 `phase="reflection"` 合并后 `emit`（`emit is None` 时空转，回测/单测零副作用）；反思
         工具起始**不**发 tool_call_start（裁决经 reflection_verdict 呈现，非工具卡）。无有效工具调用 → None。
         """
-        system = build_reflection_system_prompt()
+        # holding-horizon §2.9 c：持仓周期补充段随本轮 payload 现取（payload 就在手上，零额外管线）；
+        # 契约未装配 ⇒ 键缺席 ⇒ `""` ⇒ 反思系统 prompt 逐字节回退（G-1 的 sha256 冻结门禁据此成立）。
+        system = build_reflection_system_prompt(
+            format_reflection_note(payload.get("tradingHorizon")))
         user_msg = LlmMessage("user", [TextBlock(build_reflection_prompt(payload, decision))])
         accs: dict[str, dict] = {}
         order: list[str] = []

@@ -3,6 +3,8 @@
 import type {
   AiTradeBaseRules,
   AiTradeDecision,
+  AiTradeHorizonRule,
+  AiTradeHorizonStats,
   AiTradeProfitGuardRule,
 } from "./aiTradeTypes";
 import type { EquityPoint, Metrics, Trade } from "./types";
@@ -33,6 +35,9 @@ export interface AiBacktestStartReq {
   // 利润保护层：本轮 F3 起回测也接该字段（bar 内 OHLC 极值 + 保守成交序，不再是收盘价近似）。
   // 与实盘同一服务端解析点；运维总闸关闭时服务端恒不装配，结果 notes 会写明保守近似免责。
   profitGuard?: AiTradeProfitGuardRule | null;
+  // 交易周期模式：同一 `_resolve_horizon` 解析（回测侧另叠一层运维总闸）。回测按根推进，最短持仓
+  // 窗口的分辨率是一根 K 线——该免责由后端写进结果 notes 并在 UI 上显示。
+  tradingHorizon?: AiTradeHorizonRule | null;
 }
 
 export interface AiBacktestStartResult {
@@ -67,6 +72,9 @@ export interface AiBacktestAiStats {
   // 本次回测是否真的装配了保护层：`profitGuardExits` 未装配时也是 0，只凭它分不出「装了没触发」与
   // 「压根没装」。保护层的免责卡片一律以这一键门控，绝不在没有保护层的回测上宣称有防线。
   profitGuardEnabled?: boolean;
+  // 交易周期层观测（holding-horizon §2.10）：与实盘 `aiStats.horizon` 同名同形；未装配 ⇒ null ⇒
+  // UI 整段不渲染（绝不在一次没有周期契约的回测上挂出该卡片，与 profitGuardEnabled 同款理由）。
+  horizon?: AiTradeHorizonStats | null;
 }
 
 // 进度事件（驱动进度头 / 滚动权益迷你图）。

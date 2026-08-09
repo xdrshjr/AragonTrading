@@ -99,6 +99,7 @@ export default function AiTradeToggle() {
         wakeIntervalMinutes: opts.wakeIntervalMinutes,   // Agent 墙钟定时唤醒周期（透传，服务端默认回填/夹紧）
         baseRules: opts.baseRules,               // 【基础策略】铁律（透传；取消勾选即 enabled:false）
         profitGuard: opts.profitGuard,           // 利润保护层（透传；取消勾选即 enabled:false）
+        tradingHorizon: opts.tradingHorizon,     // 交易周期模式（同上；缺省=服务端默认开启）
         contextRefreshRounds: opts.contextRefreshRounds,
       }),
     onSuccess: (res, opts) => {
@@ -116,6 +117,9 @@ export default function AiTradeToggle() {
         // 同上取 opts：诊断根因 ③ 的根治点——单仓 OCO 与利润保护偏好从此被记住并回填，
         // 不再每次重开都清空、让用户在不知情下一直吃 10%/5% 的宽默认。
         profitGuard: opts.profitGuard,
+        // [R-4] 同理取 opts：回执镜像的是**服务端解析后的生效值**（含两个派生量），拿它回填会把
+        // 用户「留空=按预设」的意图固化成一组具体数字，下次改周期时不再联动。
+        tradingHorizon: opts.tradingHorizon,
         stopLossPct: opts.stopLossPct ?? undefined,
         takeProfitPct: opts.takeProfitPct ?? undefined,
       });
@@ -145,6 +149,9 @@ export default function AiTradeToggle() {
         minConsensus: opts.minConsensus ?? null,
         positionStepPct: opts.positionStepPct,   // 回测同享档位约束（决策脑单点收口，实盘/回测同生效）
         baseRules: opts.baseRules,               // 回测同享铁律（P1-4：默认必须与实盘一致，否则调参失真）
+        // 回测同享交易周期模式（同一 `_resolve_horizon` 解析 + 一层回测运维总闸）。同一条理由——
+        // 两侧参数不同源，用户拿回测调出来的周期在实盘直接失真。
+        tradingHorizon: opts.tradingHorizon,
         // F3：回测同享利润保护（bar 内极值 + 保守成交序）。同一条理由——两侧参数不同源，
         // 用户拿回测调出来的参数在实盘直接失真。
         profitGuard: opts.profitGuard,
@@ -231,6 +238,9 @@ export default function AiTradeToggle() {
         defaultStopLossPct={aiTradeConfig?.stopLossPct ?? undefined}
         defaultTakeProfitPct={aiTradeConfig?.takeProfitPct ?? undefined}
         defaultBaseRule={aiTradeConfig?.baseRules ?? AI_TRADE_BASE_RULE_DEFAULTS}
+        // 无本地预设兜底：模式表由 `GET /ai-trade/horizon-profiles` 下发，未选过时留 undefined 即可
+        // （弹窗采用接口返回的 defaultProfile）——前端复制一份默认模式必然与服务端漂移（R-3）。
+        defaultTradingHorizon={aiTradeConfig?.tradingHorizon}
         error={error}
         liveGateReason={liveGateReason}
         defaultStartTs={backtestStartTs}

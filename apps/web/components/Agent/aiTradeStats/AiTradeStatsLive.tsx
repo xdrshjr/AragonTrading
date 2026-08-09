@@ -19,8 +19,13 @@ import {
   PROFIT_CAPTURE_HINT,
   summarizeProfitCaptureAcross,
 } from "@/lib/aiTradeCapture";
+import { formatHoldDuration, horizonLiveKpis } from "@/lib/aiTradeHorizon";
 import { computeReflectionCounts, latestHoldStreak } from "@/lib/aiTradeObservability";
-import type { AiTradeGroupMemberState, AiTradeSessionRow } from "@/lib/aiTradeTypes";
+import type {
+  AiTradeGroupMemberState,
+  AiTradeGroupState,
+  AiTradeSessionRow,
+} from "@/lib/aiTradeTypes";
 import { colorForReturn, fmtTime, signed } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 
@@ -130,6 +135,7 @@ export default function AiTradeStatsLive() {
           elapsedSec={nowSec - group.startedTs}
           tradeCount={fullSummary.count}
         />
+        <HorizonLiveCard group={group} ledger={ledger} />
         <ProfitCaptureCard capture={capture} />
         <WakeAttributionCard trips={ledger} />
         {unrealizedUsd !== null && (
@@ -249,6 +255,49 @@ function EmptyHint({ text }: { text: string }) {
 // 稳定行 key：优先成交 id，回退开 / 平时刻，永不跨标的混淆。
 function rowKey(rt: RoundTrip): string {
   return `${rt.instId}-${rt.entry.id ?? rt.openedTs}-${rt.exit.id ?? rt.closedTs}`;
+}
+
+/**
+ * 交易周期卡片（ai-trade-holding-horizon-modes §2.11 展示落点之三 · 运行期侧）。
+ *
+ * 未装配本层的会话 ⇒ `tradingHorizon` 为空 ⇒ **整卡不渲染**（绝不在一个没有周期契约的会话上挂出
+ * 一排 0，那会被读成「统计坏了」——与本页既有纪律同款）。
+ *
+ * 口径提示是**必需**的而非装饰：这里的三个数由成交时间戳配对现算，与落库口径（`note_close` 墙钟
+ * 差）量级一致但不保证逐笔相等；且未平仓的持仓不计入。不写出来就是误导。
+ */
+function HorizonLiveCard({ group, ledger }: { group: AiTradeGroupState; ledger: RoundTrip[] }) {
+  const rule = group.tradingHorizon ?? null;
+  if (!rule || !rule.enabled) return null;
+  const holds = ledger.map((rt) => rt.closedTs - rt.openedTs);
+  const target =
+    rule.targetHoldMaxSeconds && rule.targetHoldMaxSeconds > 0
+      ? `${formatHoldDuration(rule.targetHoldMinSeconds)} – ${formatHoldDuration(rule.targetHoldMaxSeconds)}`
+      : "未设定";
+  return (
+    <div
+      className="flex flex-col gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2"
+      data-testid="ai-horizon-live"
+    >
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span className="text-[var(--muted)]">交易周期 · {rule.title ?? rule.profile}</span>
+        <span className="tabular text-[10px] text-[var(--muted)]">目标持仓 {target}</span>
+      </div>
+      <div className="grid grid-cols-3 gap-2">
+        {horizonLiveKpis(holds, rule).map((kpi) => (
+          <div key={kpi.label} className="flex flex-col">
+            <span className="text-[10px] text-[var(--muted)]">{kpi.label}</span>
+            <span className="tabular text-xs font-semibold text-[var(--text)]">{kpi.value}</span>
+          </div>
+        ))}
+      </div>
+      <p className="text-[10px] leading-relaxed text-[var(--muted)]">
+        运行期估算：按成交时间戳配对的
+        <strong className="text-[var(--text)]">已完成往返</strong>
+        现算，未平仓的持仓不计入；会话停止后以「历史」标签的落库值（含本层拦截计数与豁免明细）为准。
+      </p>
+    </div>
+  );
 }
 
 /**

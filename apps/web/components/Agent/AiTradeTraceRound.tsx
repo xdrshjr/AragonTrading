@@ -32,6 +32,7 @@ import {
   describeVolume,
   describeWakeReason,
 } from "@/lib/aiTrade";
+import { describeHorizonGate, formatHoldDuration } from "@/lib/aiTradeHorizon";
 import type {
   AiTradeRoundTrace,
   MultiTimeframeContext,
@@ -231,6 +232,81 @@ function BaseRuleBlock({ trace }: { trace: AiTradeRoundTrace }) {
         </p>
       )}
     </div>
+  );
+}
+
+/**
+ * 交易周期铁律段（ai-trade-holding-horizon-modes §2.11）：置于基础策略之后——管线顺序即卡片顺序
+ * （铁律 → **本层** → 冷却 → 刹车 → 共识 → 成本门禁 → 反思）。
+ *
+ * 徽标与铁律段同排同款，但**极性相反**：本层 fail-open，「限制已解除」意味着放行而非拦截，故用
+ * accent 而非红色。契约未装配 ⇒ `horizonStatus` 恒为空 ⇒ 整段不渲染（老会话与老快照零影响）。
+ *
+ * 三行读数分别对应三道闸——**必须同时摆出来**：只显示「被拦了」而不说是哪道闸、还差多久，用户
+ * 无从判断该等还是该关掉本层（本仓库最忌讳的不可解释保守）。
+ */
+function HorizonBlock({ trace }: { trace: AiTradeRoundTrace }) {
+  const view = describeHorizonGate(trace.horizonStatus, trace.horizonWire);
+  if (!view) return null;
+  const wire = trace.horizonWire;
+  return (
+    <div className="flex flex-col gap-1.5 rounded-[10px] border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_6%,transparent)] px-2.5 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-1 text-[11px] font-medium text-[var(--text)]">
+          <span className="leading-none">⏳</span>交易周期（持仓时长铁律）
+        </span>
+        <span
+          className="inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium"
+          style={{ color: TONE_VAR[view.tone], backgroundColor: toneSoft(view.tone) }}
+        >
+          {view.label}
+        </span>
+      </div>
+      {wire && wire.status !== "flat" ? (
+        <HorizonGateRows wire={wire} />
+      ) : (
+        <p className="text-[10px] leading-relaxed text-[var(--muted)]">
+          当前空仓：本层<strong className="text-[var(--text)]">不约束开仓</strong>；开仓后才按目标
+          周期约束 AI 主动平仓与反手。
+        </p>
+      )}
+      {trace.horizonReason && (
+        <p className="text-[11px] leading-relaxed text-[var(--text)]">
+          {describeDegradeReason(trace.horizonReason)}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** 三道闸的逐行读数（空转的闸整段省略——写「本闸未启用」只是噪音，与 base_rule 段同款降级范式）。 */
+function HorizonGateRows({ wire }: { wire: NonNullable<AiTradeRoundTrace["horizonWire"]> }) {
+  const rows: string[] = [];
+  const held = formatHoldDuration(wire.holdSeconds);
+  rows.push(
+    wire.minHoldSeconds > 0
+      ? `已持仓 ${held} / 最短 ${formatHoldDuration(wire.minHoldSeconds)}` +
+          (wire.minHoldRemainingSeconds > 0
+            ? `（还差 ${formatHoldDuration(wire.minHoldRemainingSeconds)}）`
+            : "（已满足）")
+      : `已持仓 ${held}（本会话未设最短持仓窗口）`,
+  );
+  if (wire.exitConfirmRounds > 1) {
+    const window = wire.confirmWindowElapsed
+      ? "确认窗口已到，按意愿放行"
+      : wire.confirmWindowRemainingSeconds != null
+        ? `窗口剩余 ${formatHoldDuration(wire.confirmWindowRemainingSeconds)}`
+        : "尚未提出离场";
+    rows.push(`离场确认 ${wire.exitConfirmStreak}/${wire.exitConfirmRounds}（${window}）`);
+  }
+  if (wire.requiredMoveBps != null) {
+    const move = wire.moveBps == null ? "—" : `${wire.moveBps.toFixed(1)}bps`;
+    rows.push(`换手迟滞：需 ≥${wire.requiredMoveBps.toFixed(1)}bps，当前 ${move}`);
+  }
+  return (
+    <p className="text-[10px] leading-relaxed text-[var(--muted)]" data-testid="ai-horizon-rows">
+      {rows.join(" ｜ ")}
+    </p>
   );
 }
 
@@ -704,6 +780,7 @@ export default function AiTradeTraceRound({ trace }: { trace: AiTradeRoundTrace 
       <AnalysisBlock trace={trace} />
       <DecisionToolCard trace={trace} />
       <BaseRuleBlock trace={trace} />
+      <HorizonBlock trace={trace} />
       <EdgeGateBlock trace={trace} />
       <ProfitGuardBlock trace={trace} />
       <SizingBlock trace={trace} />

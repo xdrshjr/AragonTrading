@@ -27,10 +27,12 @@ if TYPE_CHECKING:                       # 仅类型标注用，运行期不导�
 # 之所以值得新增一个相位（代价 = 8 个前端镜像点）：求解发生在**轮次末尾**（管线第 11 步），`round_start`
 # 早已发出、搭不上；且本层新增了 5 个「看起来生效但可能没生效」的观测量（scaleErased / stopSource 的三个
 # skip 态 / exposureCapUnreachable / volSource），它们必须每轮可见——静默的保守是本仓库的前科。
+# horizon：持仓周期铁律段（ai-trade-holding-horizon-modes §4.4），**仅在契约装配时**每轮一条
+# （**含放行轮**——静默的保守会被用户当成故障，这是 base_rule / edge_gate 已确立的理由）。
 PHASES = ("round_start", "thinking", "analysis", "tool_call_start",
           "tool_call", "result", "summary", "error", "retry",
           "reflection_start", "reflection", "reflection_verdict", "base_rule", "edge_gate",
-          "sizing")
+          "sizing", "horizon")
 
 # `sizing` 事件与在飞轮次共用的键集合（**单一真源**：事件装配、轮次初值、前端镜像三处照它对齐）。
 SIZING_TRACE_KEYS = (
@@ -148,6 +150,10 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         # `AiTradeRoundTrace` 永远拿不到本层数据 ⇒ 后端发什么前端都收不到（跑不出错、功能静默缺失）。
         # 键集合走 `SIZING_TRACE_KEYS` 单一真源，杜绝「事件加了键、初值忘了加」的漂移。
         **{key: None for key in SIZING_TRACE_KEYS},
+        # 持仓周期铁律层（ai-trade-holding-horizon-modes §3.4）：本函数是**显式取键**装配，漏抄这
+        # 三键 `AiTradeRoundTrace` 永远拿不到本层数据 ⇒ 后端发什么前端都收不到（跑不出错、功能静默
+        # 缺失）。契约未装配的会话恒为初值 None ⇒ 前端整段不渲染。
+        "horizonStatus": None, "horizonReason": None, "horizonWire": None,
         "state": "deciding",
     }
 
@@ -246,3 +252,37 @@ def apply_sizing_trace(trace: dict | None, wire: dict) -> None:
         return
     for key in SIZING_TRACE_KEYS:
         trace[key] = wire.get(key)
+
+
+# ---------- 持仓周期铁律层轨迹装配（ai-trade-holding-horizon-modes §4.4）----------
+def horizon_event(round_no: int, ts: int, wire: dict | None,
+                  status: str, reason: str | None = None) -> dict:
+    """horizon：本轮持仓周期判定（pass/veto/released/idle）+ 完整快照 + 降级原因。
+
+    与 `base_rule_event` / `edge_gate_event` 的理由逐字相同：**每轮都发一条**（契约装配时）——静默
+    的保守会被用户当成故障。整份 `wire` 随事件下发（而非逐键搬运）：本层的读数有 20 余个，逐键抄
+    一遍必然在下一次加字段时漏掉，而前端 chip / 轨迹 / 统计三处都要读它。
+    """
+    return trace_event("horizon", round_no, ts, status=status, reason=reason, horizon=wire)
+
+
+def apply_horizon_trace(trace: dict | None, wire: dict | None, status: str,
+                        reason: str | None) -> None:
+    """把本轮持仓周期判定写入在飞轮次（`trace is None` ⇒ 空转，与既有 emit 段同款垫片）。"""
+    if trace is None:
+        return
+    trace["horizonStatus"] = status
+    trace["horizonReason"] = reason
+    trace["horizonWire"] = wire
+
+
+def horizon_released_event(ts: int, streak: int, reason: str | None) -> dict:
+    """连续解除告警（§4.4）：本层 fail-open，故阈值比铁律层宽（镜像 `_EDGE_UNAVAILABLE_ALERT_ROUNDS`）。
+
+    文案必须把「放行」这件事讲清楚，而不是让用户以为门禁在生效——静默的降级与静默的保守一样，都
+    会被当成故障。
+    """
+    return {"type": "error", "data": {
+        "ts": int(ts), "code": "AI_TRADE_HORIZON_RELEASED",
+        "message": (f"持仓周期约束已连续 {streak} 轮解除（原因：{reason or '未知'}），"
+                    "期间主动平仓一律**放行**（本层 fail-open）；开仓与撤单本就不受限制")}}

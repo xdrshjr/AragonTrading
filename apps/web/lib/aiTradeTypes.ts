@@ -299,7 +299,132 @@ export type AiTradeTracePhase =
   // 最小 edge 门禁段（ai-trade-cost-accounting-and-edge-gate §5.3）：仅 k_min>0 的会话每轮一条。
   | "edge_gate"
   // 仓位求解 + ATR 止损 + 回撤刹车段（vol-sizing-and-drawdown-brake §3.9）：仅规则装配的会话每轮一条。
-  | "sizing";
+  | "sizing"
+  // 持仓周期铁律段（ai-trade-holding-horizon-modes §4.4）：仅契约装配的会话每轮一条（含放行轮）。
+  | "horizon";
+
+// ---- 交易周期模式（ai-trade-holding-horizon-modes §4.1/§5.4，与后端 hold_horizon 逐键镜像）----
+export type AiTradeHorizonProfileId =
+  | "hourly_swing"
+  | "intraday_swing"
+  | "short_swing"
+  | "trend_hold"
+  | "custom";
+
+// 启动请求里的周期契约入参；整个字段省略 ⇒ 服务端按 settings 装配默认模式（D-2「缺省即开启」）。
+export interface AiTradeHorizonRule {
+  enabled: boolean;
+  profile?: AiTradeHorizonProfileId | null;
+  minHoldSeconds?: number | null;        // 最短主动平仓窗口（秒；0=不约束）
+  exitConfirmRounds?: number | null;     // 离场连续确认轮数（1=不约束）
+  turnoverHysteresisK?: number | null;   // 换手迟滞倍数（0=不约束）
+  // **不是纯展示字段**：targetHoldMaxSeconds 是 expectedHoldBars 的唯一派生源（成本资金费期数 +
+  // 先验前瞻窗口），targetHoldMinSeconds 同时派生 confirmWindowSeconds 与 minHoldSeconds 默认值。
+  targetHoldMinSeconds?: number | null;
+  targetHoldMaxSeconds?: number | null;
+  enforceMaxHold?: boolean | null;       // true ⇒ 把 executor 的 max_hold_bars 设为 expectedHoldBars
+  // 以下三键**仅出现在回执镜像里**（服务端解析后的生效值 + 两个派生量，[P1-9]/[P0-3]）。
+  title?: string | null;
+  targetLabel?: string | null;
+  confirmWindowSeconds?: number | null;
+  expectedHoldBars?: number | null;
+  gateReverse?: boolean | null;
+}
+
+// `GET /ai-trade/horizon-profiles` 的单个预设条目。**除三个字符串外全部可空**（[P1-8]）：`custom`
+// 条目这些格子恒为 null，前端对 `bar === null` 不执行任何联动。
+export interface AiTradeHorizonProfile {
+  id: AiTradeHorizonProfileId;
+  title: string;
+  description: string;
+  targetLabel?: string | null;
+  bar?: string | null;
+  wakeIntervalMinutes?: number | null;
+  minHoldSeconds?: number | null;
+  exitConfirmRounds?: number | null;
+  turnoverHysteresisK?: number | null;
+  targetHoldMinSeconds?: number | null;
+  targetHoldMaxSeconds?: number | null;
+  expectedHoldBars?: number | null;      // 按该条目自带 bar 的**预览值**；实际按用户所选 bar 现算
+  confirmWindowSeconds?: number | null;  // 同上
+  leverageMaxHint?: number | null;
+}
+
+export interface AiTradeHorizonProfilesResponse {
+  enabled: boolean;
+  defaultProfile: AiTradeHorizonProfileId;
+  estimatedCostBps?: number | null;      // 按配置常数估的往返成本（非实时盘口，UI 须标「约」）
+  lossReleaseFrac: number;               // 解除阈 = stopLossPct × leverage × frac（[P1-10] 现算）
+  lossReleaseReturnPctFallback: number;  // 无交易所止损时的兜底解除阈
+  profiles: AiTradeHorizonProfile[];
+}
+
+// 判定态：空仓 / 持仓中 / 限制已解除。
+export type AiTradeHorizonStatus = "flat" | "holding" | "released";
+// 门禁段状态：放行 / 否决 / 豁免 / 空仓（与后端 `hold_horizon.gate_status` 镜像）。
+export type AiTradeHorizonGateStatus = "pass" | "veto" | "released" | "idle";
+
+// 每轮快照（payload / decision / status / trace 共用的唯一 wire，后端 §5.4）。
+export interface AiTradeHorizonSnapshot {
+  profileId: AiTradeHorizonProfileId;
+  title: string;
+  targetLabel?: string | null;
+  status: AiTradeHorizonStatus;
+  side?: string;
+  holdSeconds: number;
+  barsInPosition?: number | null;
+  targetHoldMinSeconds: number;
+  targetHoldMaxSeconds: number;
+  minHoldSeconds: number;
+  minHoldRemainingSeconds: number;
+  exitConfirmRounds: number;
+  exitConfirmStreak: number;
+  confirmWindowSeconds: number;
+  confirmWindowRemainingSeconds?: number | null;
+  confirmWindowElapsed: boolean;
+  turnoverHysteresisK: number;
+  moveBps?: number | null;
+  costBps?: number | null;
+  requiredMoveBps?: number | null;
+  returnPct?: number | null;
+  lossReleaseReturnPct: number;
+  released: boolean;
+  releaseReason?: string | null;
+  releasedGates: string[];               // 逐闸解除矩阵（[P0-2]：只写 released 会留下歧义）
+  blockedStreak: number;
+  blockedStreakNote?: boolean;           // 未武装 ⇒ **整键缺席**（不是 false）
+  expectedHoldBars?: number | null;
+  openedWallEstimated: boolean;
+  gateReverse: boolean;
+  asOfWall: number;                      // 本快照采集时刻（[P1-7] 双快照契约的可验证凭据）
+  exchangeStopLossPx?: number | null;
+  exchangeTakeProfitPx?: number | null;
+}
+
+// 落库 `metricsJson.aiStats.horizon`（§2.12）；零样本时六个派生量为 **null 而非 0**（[P2-3]）。
+export interface AiTradeHorizonStats {
+  profileId: string;
+  title: string;
+  minHoldSeconds: number;
+  exitConfirmRounds: number;
+  turnoverHysteresisK: number;
+  expectedHoldBars?: number | null;
+  minHoldVetoes: number;
+  unconfirmedVetoes: number;
+  hysteresisVetoes: number;
+  reverseVetoes: number;
+  releasedRounds: number;
+  releaseReasons: Record<string, number>;
+  confirmWindowReleases: number;
+  roundTrips: number;
+  estimatedEpochs: number;
+  avgHoldSeconds?: number | null;
+  medianHoldSeconds?: number | null;
+  minHoldObservedSeconds?: number | null;
+  maxHoldObservedSeconds?: number | null;
+  withinTargetRate?: number | null;
+  turnoverPerDay?: number | null;
+}
 
 // 【基础策略】MA 通道开单约束（与后端 base_rules.MaBandRule 镜像；数值字段留空→服务端按 settings 回填）。
 export interface AiTradeMaBandRule {
@@ -407,7 +532,9 @@ export interface AiTradeTraceEvent {
   adjustedSizeFraction?: number | null; // reflection_verdict：实际收缩后的开仓仓位占比（无收缩为 null）
   // base_rule：【基础策略】铁律门禁判定 + 本轮通道断面（band 不可用时三条线为 null，不假数据）。
   // edge_gate 复用同一个 `status` 位（三态取值相同；两个相位互不同时出现在一条事件上）。
-  status?: AiTradeBaseRuleStatus;
+  // horizon 相位复用同一个 `status` 位，但取值域更宽（多 `released` / `idle` 两态）——三个相位互不
+  // 同时出现在一条事件上，故联合类型不会产生歧义。
+  status?: AiTradeBaseRuleStatus | AiTradeHorizonGateStatus;
   zone?: "lower" | "mid" | "upper" | null;
   pctB?: number | null;
   upper?: number | null;
@@ -461,6 +588,9 @@ export interface AiTradeTraceEvent {
   effectiveExposureCap?: number | null;
   corrScale?: number | null;
   exposureCapUnreachable?: boolean | null; // 其余成员自身已越界，缩到 0 也达不到上限（如实标注，不假装）
+  // horizon：持仓周期铁律判定（ai-trade-holding-horizon-modes §4.4）。整份快照随事件下发（本层读数
+  // 有 20 余个，逐键搬运必然在下一次加字段时漏掉）。`status` 位与 base_rule/edge_gate 互不同时出现。
+  horizon?: AiTradeHorizonSnapshot | null;
 }
 
 // store / snapshot 的已装配单轮轨迹（thinking/analysis 累积；env 环形 ≤20）。
@@ -545,6 +675,12 @@ export interface AiTradeRoundTrace {
   effectiveExposureCap?: number | null;
   corrScale?: number | null;
   exposureCapUnreachable?: boolean | null;
+  // 持仓周期铁律层（ai-trade-holding-horizon-modes §3.4 / [P1-4]）：**必须与 emptyRoundTrace 的逐键
+  // 手抄保持一致**——`applyAiTradeTracePhase` 对未知相位是静默忽略，漏写不会有任何报错，只会安静地
+  // 什么都不显示。契约未装配的会话恒为 null ⇒ HorizonBlock 整段不渲染。
+  horizonStatus?: AiTradeHorizonGateStatus | null;
+  horizonReason?: string | null;
+  horizonWire?: AiTradeHorizonSnapshot | null;
   state: "deciding" | "done" | "skipped" | "error";
 }
 
@@ -584,6 +720,10 @@ export interface AiTradeSessionRow {
   wakeCatchups?: number;
   positionWatchSkips?: number;
   signalFlipWakes?: number;
+  // 持仓周期快照（holding-horizon [P1-4] 第 2 处）：`patchAiTradeMemberStatus` 把 status 整体浅合并
+  // 进 `m.session`，**类型里没有这个键则面板取不到**（tsc 报错而非静默丢数据，但极易被「后端已下发」
+  // 骗过去）。未装配 / 老后端 ⇒ undefined 或 null ⇒ chip 整段不渲染。
+  horizon?: AiTradeHorizonSnapshot | null;
 }
 
 // WS status 事件负载（_status_payload / 轻量 status，会话视图的可增量合并子集）。
@@ -612,6 +752,9 @@ export interface AiTradeStatusEvent {
   // 保护性平仓冷却期（adaptive §4.2 三载体之三）：未激活 / 已到期 → null（后端到期会主动补推一次
   // status，否则 chip 会一直挂着）。
   profitGuardCooldown?: ProfitGuardCooldown | null;
+  // 持仓周期快照（holding-horizon §4.4）：每次 status 事件随附，供面板 chip 在无决策事件时也能更新
+  // 倒计时；未装配 ⇒ null。
+  horizon?: AiTradeHorizonSnapshot | null;
 }
 
 export interface AiTradeStartReq {
@@ -694,6 +837,7 @@ export interface AiTradeGroupStartReq {
   wakeIntervalMinutes?: number | null;  // Agent 墙钟定时唤醒周期（分钟；留空→服务端默认 2；0→关闭）
   baseRules?: AiTradeBaseRules | null;  // 【基础策略】铁律（字段省略→服务端默认开启）
   profitGuard?: AiTradeProfitGuardRule | null;  // 利润保护层（字段省略→服务端默认开启）
+  tradingHorizon?: AiTradeHorizonRule | null;   // 交易周期模式（字段省略→服务端默认开启）
 }
 
 // 分组成员行（start 回执 / status 视图共用）：完整会话行 + 分配占比。
@@ -715,6 +859,9 @@ export interface AiTradeGroupRow {
   wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭）
   baseRules?: AiTradeBaseRules | null; // 【基础策略】铁律回执镜像（null=未装配）
   profitGuard?: AiTradeProfitGuardRule | null; // 利润保护层回执镜像（null=未装配）
+  // 交易周期模式回执镜像（null=未装配）：**服务端解析后的生效值** + 两个派生量
+  // （expectedHoldBars / confirmWindowSeconds），使「弹窗预览 == 落地」可逐字段核对。
+  tradingHorizon?: AiTradeHorizonRule | null;
 }
 
 export type AiTradeGroupStartResult = AiTradeGroupRow;
@@ -764,6 +911,7 @@ export interface AiTradeGroupState {
   leverage: number;
   contextRefreshRounds: number;
   wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭，面板显示）
+  tradingHorizon?: AiTradeHorizonRule | null;   // 分组共享的周期契约（R-12：模式是会话级契约）
   state: "running" | "stopped";
   startedTs: number;
   members: Record<string, AiTradeGroupMemberState>;
@@ -786,6 +934,9 @@ export interface AiTradeConfig {
   profitGuard?: AiTradeProfitGuardRule;
   stopLossPct?: number;
   takeProfitPct?: number;
+  // 交易周期模式偏好（holding-horizon §3.4 第 3 处）；同为**可选**，读点一律兜底
+  // （**不**为此改 persist version，沿用 baseRules 先例，避免动 migration 链）。
+  tradingHorizon?: AiTradeHorizonRule;
 }
 
 // 别名（spec §3 类型清单）：会话运行期视图 / 轻量状态负载，供 store 与流式路由语义化引用。

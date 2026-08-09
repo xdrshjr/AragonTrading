@@ -33,6 +33,8 @@ import {
   validateStrategySelection,
   validateWakeInterval,
 } from "@/lib/aiTrade";
+import { validateHorizon } from "@/lib/aiTradeHorizon";
+import { aiTradeHorizonApi } from "@/lib/aiTradeHorizonApi";
 import {
   clampGroupBudgetToCap,
   DEFAULT_AUTO_TRADE_MAX_BUDGET_PCT,
@@ -55,12 +57,16 @@ import {
 import type {
   AiTradeBaseRules,
   AiTradeGivebackTier,
+  AiTradeHorizonProfile,
+  AiTradeHorizonProfileId,
+  AiTradeHorizonRule,
   AiTradeMaBandRule,
   AiTradeProfitGuardRule,
 } from "@/lib/aiTradeTypes";
 import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
 import { tradingApi } from "@/lib/tradingApi";
 import type { Bar } from "@/lib/types";
+import AiTradeHorizonFields, { type HorizonCustomKey } from "./AiTradeHorizonFields";
 import ProfitGuardFields from "./ProfitGuardFields";
 
 export type AiTradeLaunchMode = "live" | "backtest";
@@ -88,6 +94,9 @@ export interface AiTradeLaunchOpts {
   // 利润保护层（**实盘与回测同源**，adaptive §7.2a）：回测改用 bar 内 OHLC 极值 + 保守成交序后，
   // 该字段两模式都提交。勾选 ⇒ 带完整参数；取消勾选 ⇒ `{enabled:false}`（显式关闭，与「字段缺省=默认开启」区分）。
   profitGuard?: AiTradeProfitGuardRule;
+  // 交易周期模式（**实盘与回测同源**，holding-horizon §4.3）：选中模式 ⇒ 带 `{enabled,profile,…}`；
+  // 取消勾选 ⇒ `{enabled:false}`（**显式关闭**，与「字段缺省=默认开启」语义严格区分）。
+  tradingHorizon?: AiTradeHorizonRule;
   contextRefreshRounds: number;
   // Agent 墙钟定时唤醒周期（分钟）：[RN-1] 声明为**可选**（对齐 backtest-only 可选字段），仅 live 分支透传、
   // base 不含、回测省略——若定为非可选，回测 onConfirm 不带该键将 tsc 编译失败。0/关闭 = 仅按 K 线与策略触发。
@@ -130,6 +139,7 @@ export default function AiTradeLaunchModal({
   defaultWakeIntervalMinutes,
   defaultBaseRule,
   defaultProfitGuard,
+  defaultTradingHorizon,
   defaultStopLossPct,
   defaultTakeProfitPct,
   error,
@@ -154,6 +164,9 @@ export default function AiTradeLaunchModal({
   defaultWakeIntervalMinutes: number; // 上次所选 Agent 唤醒周期（aiTradeConfig?.wakeIntervalMinutes ?? 默认，回填弹窗）
   defaultBaseRule: AiTradeMaBandRule; // 上次所选【基础策略】参数（aiTradeConfig?.baseRules ?? 默认，回填弹窗）
   defaultProfitGuard: AiTradeProfitGuardRule; // 上次所选利润保护参数（aiTradeConfig?.profitGuard ?? 默认）
+  // 上次所选交易周期模式（aiTradeConfig?.tradingHorizon）；**无本地预设兜底**——模式表由服务端下发，
+  // 未选过时留 undefined 并采用接口返回的 defaultProfile（前端不复制任何一个预设数值，R-3）。
+  defaultTradingHorizon?: AiTradeHorizonRule;
   // 上次填过的单仓 OCO（诊断根因 ③：每次都被清空 ⇒ 用户不知不觉一直用 10%/5% 的宽默认）。
   defaultStopLossPct?: number;
   defaultTakeProfitPct?: number;
@@ -221,6 +234,13 @@ export default function AiTradeLaunchModal({
     defaultProfitGuard.atrCapMult ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.atrCapMult));
   const [cooldownRaw, setCooldownRaw] = useState(String(
     defaultProfitGuard.cooldownSeconds ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.cooldownSeconds));
+  // 交易周期模式（holding-horizon §2.11）：`profileRaw = null` 表示「本次尚未主动选过」⇒ 采用接口
+  // 下发的 defaultProfile（绝不在前端硬编码一个默认模式 id 去和服务端各存一份）。
+  const [horizonEnabled, setHorizonEnabled] = useState(defaultTradingHorizon?.enabled ?? true);
+  const [horizonProfileRaw, setHorizonProfileRaw] = useState<AiTradeHorizonProfileId | null>(
+    defaultTradingHorizon?.profile ?? null,
+  );
+  const [horizonCustom, setHorizonCustom] = useState(() => seedHorizonCustom(defaultTradingHorizon));
   const [startInput, setStartInput] = useState("");
   const [endInput, setEndInput] = useState("");
   const [everyRaw, setEveryRaw] = useState("");
@@ -250,6 +270,13 @@ export default function AiTradeLaunchModal({
     enabled: open && !!budgetInst && mode === "live",
   });
   const availUsdt = configQ.data?.availUsdt ?? null;
+  // 模式预设表（只读、不守 AI 总闸）：**按 bar 取**——`estimatedCostBps` 的资金费期数随执行周期变，
+  // 契约摘要第三行的「需 ≥N bps」必须与门禁真正判定的数同源（实盘 / 回测两段都要，故不收敛 mode）。
+  const horizonQ = useQuery({
+    queryKey: ["aiTrade", "horizonProfiles", bar],
+    queryFn: () => aiTradeHorizonApi.profiles(bar),
+    enabled: open,
+  });
 
   // 弹窗每次打开：回落默认段 / 成员 / 分配模式 / 周期 / 策略 / 轮数 / 区间并清空金额输入。
   useEffect(() => {
@@ -288,6 +315,11 @@ export default function AiTradeLaunchModal({
       ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.atrCapMult));
     setCooldownRaw(String(defaultProfitGuard.cooldownSeconds
       ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.cooldownSeconds));
+    // 交易周期模式的三个新状态同样**必须塞进这个既有 [open] effect**（见上一段注释：另写 effect =
+    // ai-trade-modal-revert-recurrence 复发）。
+    setHorizonEnabled(defaultTradingHorizon?.enabled ?? true);
+    setHorizonProfileRaw(defaultTradingHorizon?.profile ?? null);
+    setHorizonCustom(seedHorizonCustom(defaultTradingHorizon));
     setCapitalRaw("");
     setLeverageRaw("");
     setTakeProfitRaw("");
@@ -402,6 +434,40 @@ export default function AiTradeLaunchModal({
   const tpMarginPct = marginReturnFromPricePct(
     takeProfitPct.value ?? AI_TRADE_DEFAULT_OCO_TP_PCT, leverage.value);
 
+  // 交易周期模式（两模式共用；关闭勾选时提交体只含 enabled:false）。`profileId` 未选过即取接口
+  // 下发的 defaultProfile——前端不复制服务端的默认选择。
+  // 预设表未就绪（加载中 / 读取失败）且用户没主动选过 ⇒ 提交体**不带 profile 键**，交由服务端按
+  // `ai_trade_horizon_default_profile` 装配（§4.2「字段缺省即默认模式」）。前端拿 `custom` 顶上会把
+  // 一个本应按默认模式生效的会话静默降级成空转契约——那是本层最不该出现的失效方式。
+  const horizonProfile = horizonProfileRaw ?? horizonQ.data?.defaultProfile ?? null;
+  const horizonProfileId = (horizonProfile ?? "custom") as AiTradeHorizonProfileId;
+  const tradingHorizonPayload: AiTradeHorizonRule = horizonEnabled
+    ? {
+        enabled: true,
+        ...(horizonProfile ? { profile: horizonProfile } : {}),
+        ...horizonOverrides(horizonProfileId, horizonCustom),
+      }
+    : { enabled: false };
+  const activeHorizonProfile =
+    horizonQ.data?.profiles.find((p) => p.id === horizonProfileId) ?? null;
+  // §2.8 防线 1（「跨日持仓必须有交易所侧止损」）**无需在此另写一条阻断**：`parseOptionalPct` 对
+  // 「显式填 0」本就返回 error 并并入 `inputError`（`0` 解析不出 value），故该输入根本到不了这里；
+  // 留空则走服务端默认 5%，契约摘要会按它现算解除阈并写明来源。再加一条判据只会是永不触发的死码。
+  const horizonError = validateHorizon(tradingHorizonPayload);
+  // [P0-1] 切换模式**只联动 bar / 唤醒周期**，严禁触碰 profitGuard.minHoldSeconds：那个字段控制的是
+  // **利润保护层**在开仓瞬间的噪音抑制（默认 30 秒），而保护层在该窗口内整层停摆。把它抬到 3600 秒
+  // 等于造出「G1 禁止 AI 平仓 **且** 保护层不工作」的双关窗口，而同屏契约摘要还在承诺「保护层不受
+  // 本层限制」。两层的最短持有期解决的是两个不同问题（本层：换手成本；保护层：开仓瞬间的一跳噪音）。
+  const alignToProfile = (profile: AiTradeHorizonProfile | undefined) => {
+    if (!profile || profile.bar == null) return;
+    setBar(profile.bar as Bar);
+    if (profile.wakeIntervalMinutes != null) setWakeIntervalRaw(String(profile.wakeIntervalMinutes));
+  };
+  const handleProfileSelect = (profile: AiTradeHorizonProfile) => {
+    setHorizonProfileRaw(profile.id);
+    alignToProfile(profile);   // 切到 custom 时 `bar === null` ⇒ 不联动任何字段（[P1-8]）
+  };
+
   // 成员校验（实盘）：非空、皆可自动交易、各 pct ∈ (0,100]，even 模式 Σ ≤ 100（避免提交即 422）。
   const sumPct = totalAllocation(members);
   const hasUnsupportedMember = members.some((m) => !isAutoTradable(m.instId));
@@ -463,7 +529,8 @@ export default function AiTradeLaunchModal({
   const usingDefault = capital.value == null;
   // 利润保护校验并入 baseValid：两模式共用（P2-8），避免回测下「校验会跑但拦不住提交」。
   const baseValid =
-    !inputError && !strategyError && !roundsError && !baseRuleError && !profitGuardError;
+    !inputError && !strategyError && !roundsError && !baseRuleError && !profitGuardError
+    && !horizonError;
   const ready =
     mode === "live"
       ? baseValid && !membersError && !wakeError && acknowledged
@@ -481,6 +548,7 @@ export default function AiTradeLaunchModal({
       takeProfitPct: takeProfitPct.value,
       positionStepPct: positionStep,                // 仓位操作档位（实盘/回测两 tab 同得）
       baseRules: baseRulesPayload,                  // 【基础策略】铁律（实盘/回测同源，P1-4）
+      tradingHorizon: tradingHorizonPayload,        // 交易周期模式（同一服务端解析点，两侧同源）
       contextRefreshRounds: roundsValue,
       bar,                                          // 可编辑周期真正生效（不再被 store.bar 覆盖）
     };
@@ -513,6 +581,7 @@ export default function AiTradeLaunchModal({
     inputError ||
     baseRuleError ||
     profitGuardError ||
+    horizonError ||
     (mode === "live"
       ? membersError || wakeError
       : instSupported
@@ -562,6 +631,28 @@ export default function AiTradeLaunchModal({
             </>
           )}
         </p>
+
+        {/* 交易周期模式（holding-horizon §2.11）：**挂在最顶部**——在「时间级别」之上、在【基础策略】
+            之上。位置即优先级声明：它决定了下面几乎所有字段的合理取值（执行周期、唤醒节奏、杠杆）。 */}
+        <AiTradeHorizonFields
+          data={horizonQ.data ?? null}
+          loading={horizonQ.isPending}
+          enabled={horizonEnabled}
+          onEnabledChange={setHorizonEnabled}
+          profileId={horizonProfileId}
+          onProfileChange={handleProfileSelect}
+          custom={horizonCustom}
+          onCustomChange={(key: HorizonCustomKey, value: string) =>
+            setHorizonCustom((prev) => ({ ...prev, [key]: value }))
+          }
+          bar={bar}
+          leverage={leverage.value}
+          stopLossPct={stopLossPct.value}
+          defaultStopLossPct={AI_TRADE_DEFAULT_OCO_SL_PCT}
+          wakeMinutes={wakeMinutes}
+          onAlign={() => alignToProfile(activeHorizonProfile ?? undefined)}
+          disabled={submitting}
+        />
 
         {/* 时间级别（默认 K 线所选周期，可修改，两模式共用）。 */}
         <label className="flex flex-col gap-1 text-[11px] text-[var(--muted)]">
@@ -1128,6 +1219,48 @@ function guardPreview(armRaw: string, givebackRaw: string, armPriceMovePct: numb
       ? `浮盈达 ${+arm.toFixed(2)}%（保证金口径）`
       : `浮盈达 ${+arm.toFixed(2)}%（≈标的 ${+(armPriceMovePct * 100).toFixed(2)}%）`;
   return `${scope}即武装 → 自峰值回吐 ${+giveback.toFixed(2)}% 或跌回保本线即由系统平仓。`;
+}
+
+/**
+ * 交易周期「自定义」输入的回填种子（holding-horizon §2.11）。
+ *
+ * **全部留空**是本特性的安全退出口：空串 ⇒ 提交体不带该键 ⇒ 服务端按 `custom` 预设装配
+ * （0 / 1 / 0 + expectedHoldBars=None）⇒ 逐字等价于本层未装配。绝不在此填一组「看起来合理」的
+ * 默认数字——那会让一个本应零副作用的选择静默改写成本模型的资金费期数（[P1-1]）。
+ */
+function seedHorizonCustom(rule: AiTradeHorizonRule | undefined) {
+  return {
+    minHoldRaw: numToRaw(rule?.minHoldSeconds),
+    confirmRoundsRaw: numToRaw(rule?.exitConfirmRounds),
+    hysteresisRaw: numToRaw(rule?.turnoverHysteresisK),
+    targetMinHoursRaw: secondsToHoursRaw(rule?.targetHoldMinSeconds),
+    targetMaxHoursRaw: secondsToHoursRaw(rule?.targetHoldMaxSeconds),
+  };
+}
+
+function numToRaw(value: number | null | undefined): string {
+  return value == null ? "" : String(value);
+}
+
+function secondsToHoursRaw(value: number | null | undefined): string {
+  return value == null ? "" : String(+(value / 3600).toFixed(4));
+}
+
+/**
+ * 「自定义」模式的逐项覆盖（非 custom 模式**一个覆盖都不发**）。
+ *
+ * 非 custom 模式的数字全部以服务端预设为准：前端多发一份等于把那张 11 列的表抄了一遍，而本仓库
+ * 已经为「前后端各存一份口径」付过学费（R-3）。空串 ⇒ 该键缺席 ⇒ 服务端按预设回填。
+ */
+function horizonOverrides(profileId: AiTradeHorizonProfileId, custom: ReturnType<typeof seedHorizonCustom>) {
+  if (profileId !== "custom") return {};
+  const out: Partial<AiTradeHorizonRule> = {};
+  if (custom.minHoldRaw.trim()) out.minHoldSeconds = Number(custom.minHoldRaw);
+  if (custom.confirmRoundsRaw.trim()) out.exitConfirmRounds = Number(custom.confirmRoundsRaw);
+  if (custom.hysteresisRaw.trim()) out.turnoverHysteresisK = Number(custom.hysteresisRaw);
+  if (custom.targetMinHoursRaw.trim()) out.targetHoldMinSeconds = Number(custom.targetMinHoursRaw) * 3600;
+  if (custom.targetMaxHoursRaw.trim()) out.targetHoldMaxSeconds = Number(custom.targetMaxHoursRaw) * 3600;
+  return out;
 }
 
 /** 阶梯预设 → 阶梯数组（未知 key 回落标准预设，绝不静默提交一个空阶梯）。 */

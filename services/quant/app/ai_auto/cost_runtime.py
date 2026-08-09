@@ -41,10 +41,14 @@ class CostRuntime:
     """一个会话的成本层运行时：资金费率与官方费率缓存 + 归因账本 + 门禁编排 + 对账 + 统计装配。"""
 
     def __init__(self, inst_id: str, settings, fee_ledger, creds=None, *,
-                 allow_limit: bool = False) -> None:
+                 allow_limit: bool = False, expected_hold_bars: int | None = None) -> None:
         self.settings = settings
         self.fee_ledger = fee_ledger
         self.inst_id = inst_id
+        # 前瞻窗口覆盖（ai-trade-holding-horizon-modes §2.6）：由会话从 `HorizonRule.expected_hold_bars`
+        # 传入；`None` ⇒ 逐字回退全局常数 `ai_trade_cost_expected_hold_bars`（既有调用点零回归）。
+        # **必须与 `PriorRuntime` 传同一个数**，否则会造出第三个前瞻口径。
+        self.expected_hold_bars = expected_hold_bars
         # 私有签名 GET 的凭证缝（轴 A 与轴 C 共用）。既有 `refresh_funding` 只要 `get_rest_client()`
         # 是因为资金费率是**公共**端点；`trade-fee` 与 `positions-history` 都是签名私有 GET。
         # **`creds is None` ⇒ 两条私有取数一个请求都不发**（直接构造会话的既有单测路径，G-18）。
@@ -199,6 +203,35 @@ class CostRuntime:
             self._cost_params())
         return cost.total_bps
 
+    def estimate_cost_for_position(self, position_side: str,
+                                   bar_seconds: int) -> float | None:
+        """按**当前持仓方向**估的往返成本（bps）——持仓周期层 G3 换手迟滞的唯一入口（[P1-2]）。
+
+        为什么不能复用 `estimate_cost_only(decision, …)`：该入口内部走 `query_for_decision`，其方向
+        是 `side = "long" if action == "open_long" else "short"`（`cost_model.py`）——对 `close`
+        决策**恒判为 short**。而资金费只取不利侧（`max(0.0, signed)`），于是平多仓时资金费恒记 0、
+        平空仓时恒记满额。持仓周期模式把 `expected_hold_bars` 从 8 拉到 12–72，资金费在 `cost_bps`
+        里的占比被同步放大 ⇒ G3 阈值会按多空系统性偏斜（多头永远拦不住、空头永远拦过头）。
+
+        本入口复用**同一对**纯核心（`query_for_preview` + `estimate_round_trip_cost`），不是第二条
+        估算路径；`estimate_cost_only` 的签名与既有调用点一字不改。
+
+        Args:
+            position_side: 当前持仓方向（`"long"` / `"short"`）；其它值 ⇒ `None`（空仓无迟滞可言）。
+            bar_seconds: 执行周期秒数。
+
+        Returns:
+            往返成本（bps）；空仓或估算失败 ⇒ `None` ⇒ G3 fail-open 放行。
+        """
+        if position_side not in ("long", "short"):
+            return None
+        # 平仓腿恒为 taker（`estimate_round_trip_cost` 内部约定），故此处的 ord_type 只影响开仓腿
+        # 假设——与会话装配时的 `allow_limit` 同源，绝不在本层重读 settings。
+        cost = self.estimate_preview_cost(
+            ord_type="limit" if self.allow_limit else "market",
+            side=position_side, bar_seconds=bar_seconds)
+        return None if cost is None else cost.total_bps
+
     # ---------- 轴 A：官方费率真源（记账链与决策链的同一份数）----------
     def _cost_params(self):
         """决策链的成本常数：官方档位可用即覆盖 maker/taker，否则与账本读同一对配置常数。
@@ -208,15 +241,18 @@ class CostRuntime:
         数字）必须同为交易所返回值或同为配置常数——否则会出现「prompt 说 8 bps、门禁按 12 bps 判」
         的信任崩塌（G-3 / G-4 断言）。
         """
+        hold = self.expected_hold_bars      # 三分支统一透传（漏一支即造出第二个前瞻口径）
         snap = self.fee_rates.snapshot()
         if snap is not None:
-            return resolve_cost_params(self.settings, rates=(snap.maker_bps, snap.taker_bps))
+            return resolve_cost_params(self.settings, rates=(snap.maker_bps, snap.taker_bps),
+                                       expected_hold_bars=hold)
         if self.fee_ledger is not None:
             return resolve_cost_params(
                 self.settings,
                 rates=(self.fee_ledger.params.maker_fee_bps,
-                       self.fee_ledger.params.taker_fee_bps))
-        return resolve_cost_params(self.settings)
+                       self.fee_ledger.params.taker_fee_bps),
+                expected_hold_bars=hold)
+        return resolve_cost_params(self.settings, expected_hold_bars=hold)
 
     async def refresh_fee_rates(self, now_wall: float) -> bool:
         """盯市 tick 上按 TTL 刷新官方费率档位；成功即热更新账本（**不回改已记账**，A-4a）。
@@ -443,13 +479,15 @@ class CostRuntime:
 
 
 def build_charter_text(settings, inst_id: str, *, fee_rates_wire: dict | None,
-                       bar_seconds: int, allow_limit: bool) -> str:
+                       bar_seconds: int, allow_limit: bool,
+                       expected_hold_bars: int | None = None) -> str:
     """会话启动期的成本宪章章（`manager._build_member` 用；此刻既无决策也无持仓）。
 
     与每轮成本段共用 `CostRuntime.cost_view` 的**同一条**装配路径——`fee_ledger` 与 `creds` 皆传
     `None` 即得到一个纯只读的临时运行时：它不发任何请求、不持有任何状态，只把「同一个数」渲染成
     宪章文案。绝不在此另写一份估算（那会立刻产生第二个成本口径，正是 A-6 要禁止的）。
     """
-    runtime = CostRuntime(inst_id, settings, None, None, allow_limit=allow_limit)
+    runtime = CostRuntime(inst_id, settings, None, None, allow_limit=allow_limit,
+                          expected_hold_bars=expected_hold_bars)
     runtime.fee_rates.seed(snapshot_from_wire(fee_rates_wire, time.time()), time.time())
     return runtime.charter_text(bar_seconds)

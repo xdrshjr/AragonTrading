@@ -55,6 +55,10 @@ class CostQuery:
     half_spread_bps: float | None = None    # None ⇒ 回落 params.half_spread_fallback_bps
     funding_rate: float | None = None       # None ⇒ 缺席降级；0.0 ⇒ 有意不建模
     funding_interval_s: float = DEFAULT_FUNDING_INTERVAL_S
+    # 结算周期是否**真的取自交易所**（OKX 由 `nextFundingTs − fundingTs` 得出真实值，会动态变为
+    # 1/2/4/8 小时）。False ⇒ 上面那个数只是保守回落值，文案必须写「结算周期未知，按 8h 保守估算」
+    # 而不能报出一个确定的周期（holding-horizon §2.7 的诚实约束）。
+    funding_interval_known: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,9 +73,15 @@ class CostBreakdown:
     funding_carry_bps: float | None
     total_bps: float
     confidence: str                     # "ok" | "degraded"
+    # 资金费的**期数与结算周期**（holding-horizon §2.7）：1–2 天持仓必须让模型看见「跨几个结算点」，
+    # 而 OKX 的结算周期会动态变为 1/2/4/8 小时，故绝不能在文案里写死 8h。取不到 `intervalS` 时
+    # `funding_interval_s is None` ⇒ 文案如实写「结算周期未知，按 8h 保守估算」。
+    funding_periods: int | None = None
+    funding_interval_s: float | None = None
 
 
-def resolve_cost_params(settings, *, rates: tuple[float, float] | None = None) -> CostParams:
+def resolve_cost_params(settings, *, rates: tuple[float, float] | None = None,
+                        expected_hold_bars: int | None = None) -> CostParams:
     """实盘世界的成本常数（`ai_trade_*` 前缀，与回测世界的 `default_*` 严格分家，§5.1）。
 
     Args:
@@ -79,6 +89,10 @@ def resolve_cost_params(settings, *, rates: tuple[float, float] | None = None) -
         rates: 官方费率档位 `(maker_bps, taker_bps)`（轴 A）；`None` ⇒ 用配置常数。**记账链
             （`FeeLedger.params`）与本决策链必须读同一对数字**，否则会出现「prompt 说 8 bps、
             门禁按 12 bps 判」的信任崩塌（A-6 单一真源约束，G-3 断言）。
+        expected_hold_bars: 前瞻窗口覆盖（ai-trade-holding-horizon-modes §2.6）；`None` ⇒ **逐字
+            回退**全局常数 `ai_trade_cost_expected_hold_bars`。交易周期模式装配后由会话按
+            `HorizonRule.expected_hold_bars` 传入，使资金费期数真正随目标持仓时长变化——固定 8 根
+            的常数在「趋势持仓 3 天」下会把 9 期资金费算成 1 期。
     """
     maker, taker = rates if rates is not None else (
         float(settings.ai_trade_maker_fee_bps), float(settings.ai_trade_taker_fee_bps))
@@ -87,22 +101,28 @@ def resolve_cost_params(settings, *, rates: tuple[float, float] | None = None) -
         taker_fee_bps=float(taker),
         half_spread_fallback_bps=float(settings.ai_trade_half_spread_fallback_bps),
         impact_bps=float(settings.ai_trade_impact_bps),
-        expected_hold_bars=int(settings.ai_trade_cost_expected_hold_bars))
+        expected_hold_bars=int(expected_hold_bars if expected_hold_bars is not None
+                               else settings.ai_trade_cost_expected_hold_bars))
 
 
-def backtest_params(settings) -> CostParams:
+def backtest_params(settings, *, expected_hold_bars: int | None = None) -> CostParams:
     """回测世界的成本常数（§3.7）：`SimBroker` 实收的就是这两个数。
 
     闸 0 链路同构性的正确含义不是「两侧数字相同」而是「两侧都对自己的世界说真话」：`SimBroker`
     收 `default_taker_fee_bps` + `default_slippage_bps` 双边、`allow_limit=False`（回测里 Agent
     只能市价）、且不收资金费率。故 maker 与 taker 同值、冲击成本为 0、半价差取滑点常数。
+
+    `expected_hold_bars` 与 `resolve_cost_params` **同款开口**（holding-horizon [P1-3]）：本函数同样
+    硬取过全局常数，不同步开口会让回测按 8 根算资金费、实盘按 12–72 根算，「两侧在同一断面下 reason
+    逐字相等」（G-3）不可能通过。`None` ⇒ 逐字回退（既有调用点行为不变）。
     """
     return CostParams(
         maker_fee_bps=float(settings.default_taker_fee_bps),
         taker_fee_bps=float(settings.default_taker_fee_bps),
         half_spread_fallback_bps=float(settings.default_slippage_bps),
         impact_bps=0.0,
-        expected_hold_bars=int(settings.ai_trade_cost_expected_hold_bars))
+        expected_hold_bars=int(expected_hold_bars if expected_hold_bars is not None
+                               else settings.ai_trade_cost_expected_hold_bars))
 
 
 def _finite(value) -> float | None:
@@ -114,6 +134,17 @@ def _finite(value) -> float | None:
     return out if math.isfinite(out) else None
 
 
+def funding_periods(query: CostQuery, params: CostParams) -> int:
+    """预期持仓期内跨过的资金费结算点数（至少 1 期：跨结算点的持仓要付整期）。
+
+    抽成公开纯函数是为了让 §2.7 的披露文案与成本判定读**同一个数**——在成本模型里算一遍、又在文案
+    里按 8h 现算一遍，正是 [R-5] 那类「UI 说一套、判定做另一套」的起点。
+    """
+    interval = _finite(query.funding_interval_s) or DEFAULT_FUNDING_INTERVAL_S
+    hold_s = max(0.0, float(params.expected_hold_bars) * float(query.bar_seconds))
+    return max(1, math.ceil(hold_s / interval)) if interval > 0 else 1
+
+
 def _funding_carry_bps(query: CostQuery, params: CostParams) -> float | None:
     """预期持仓期内的资金费率成本（bps，**只取不利侧**）；`funding_rate is None` ⇒ None。
 
@@ -123,10 +154,8 @@ def _funding_carry_bps(query: CostQuery, params: CostParams) -> float | None:
     rate = _finite(query.funding_rate)
     if rate is None:
         return None
-    interval = _finite(query.funding_interval_s) or DEFAULT_FUNDING_INTERVAL_S
-    hold_s = max(0.0, float(params.expected_hold_bars) * float(query.bar_seconds))
-    periods = max(1, math.ceil(hold_s / interval)) if interval > 0 else 1
-    signed = rate * 1e4 * periods * (1.0 if query.side == "long" else -1.0)
+    signed = (rate * 1e4 * funding_periods(query, params)
+              * (1.0 if query.side == "long" else -1.0))
     return max(0.0, signed)
 
 
@@ -159,7 +188,12 @@ def estimate_round_trip_cost(query: CostQuery, params: CostParams) -> CostBreakd
         crossing_legs=legs,
         funding_carry_bps=None if carry is None else round(carry, _ROUND_BPS),
         total_bps=round(total, _ROUND_BPS),
-        confidence="degraded" if carry is None else "ok")
+        confidence="degraded" if carry is None else "ok",
+        # 期数恒可算（只依赖 `expected_hold_bars × bar_seconds` 与结算周期），故即使 rate 缺席也如实
+        # 下发——「跨几个结算点」与「这几期要付多少」是两件事，前者不该被后者的缺失连坐。
+        funding_periods=funding_periods(query, params),
+        funding_interval_s=(_finite(query.funding_interval_s)
+                            if query.funding_interval_known else None))
 
 
 def cost_wire(cost: CostBreakdown | None) -> dict | None:
@@ -197,7 +231,7 @@ def query_for_preview(*, ord_type: str, side: str, bar_seconds: int, funding,
                          half_spread_bps=half_spread_bps, funding_rate=None)
     return CostQuery(ord_type=ord_type, side=side, bar_seconds=bar_seconds,
                      half_spread_bps=half_spread_bps, funding_rate=funding.rate,
-                     funding_interval_s=funding.interval_s)
+                     funding_interval_s=funding.interval_s, funding_interval_known=True)
 
 
 def query_for_decision(decision, *, bar_seconds: int, funding, funding_enabled: bool,

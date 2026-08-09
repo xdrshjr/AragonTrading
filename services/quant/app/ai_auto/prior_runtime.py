@@ -35,9 +35,14 @@ _STALE_PREFIX = "stale"
 class PriorRuntime:
     """一个会话的先验层：加载契约 → 逐轮聚合 → 缓存本轮 EV → 回灌覆盖率读数。"""
 
-    def __init__(self, raw_snapshot: dict | None, settings) -> None:
+    def __init__(self, raw_snapshot: dict | None, settings, *,
+                 horizon_bars: int | None = None) -> None:
         self.settings = settings
-        self._params = resolve_prior_params(settings)
+        # 前瞻根数覆盖（holding-horizon §2.6）：与 `CostRuntime.expected_hold_bars` **同源同值**。
+        # 覆盖后库里按全局常数建的快照会被 C-3 判 `horizon_mismatch` 并整份丢弃——那是正确行为
+        # （拿 8 根前瞻的胜率给 12 根持仓做 EV 分子是错的），既有 `AI_TRADE_PRIOR_CONTRACT_MISMATCH`
+        # 告警照常推送，运维按 `POST /ai-trade/priors/rebuild?horizonBars=` 重建即可。
+        self._params = resolve_prior_params(settings, horizon_bars=horizon_bars)
         self._entries: list = []
         self._alerts: list[dict] = []
         self._meta: dict = {}

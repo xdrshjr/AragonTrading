@@ -194,6 +194,12 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     effectiveExposureCap: null,
     corrScale: null,
     exposureCapUnreachable: null,
+    // 持仓周期铁律层（ai-trade-holding-horizon-modes §3.4 / [P1-4]）：本函数是**逐键手抄**装配，
+    // 漏抄这三键 `AiTradeRoundTrace` 永远拿不到本层数据 ⇒ 后端发什么前端都收不到（跑不出错、
+    // 功能静默缺失——这是先验层与仓位层都踩过的原坑）。
+    horizonStatus: null,
+    horizonReason: null,
+    horizonWire: null,
     state: "deciding",
   };
 }
@@ -241,7 +247,9 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
       // 【基础策略】铁律门禁判定：落 status/zone/%B/降级码（每轮一条；未装配会话根本收不到此相位）。
       return {
         ...t,
-        baseRuleStatus: evt.status ?? null,
+        // `evt.status` 是三个相位共用的位（horizon 相位多两态），此处按 base_rule 的三态窄化：
+        // 相位互斥，故不会收到 released/idle。
+        baseRuleStatus: (evt.status as AiTradeRoundTrace["baseRuleStatus"]) ?? null,
         baseRuleZone: evt.zone ?? null,
         baseRulePctB: evt.pctB ?? null,
         baseRuleReason: evt.reason ?? null,
@@ -250,7 +258,7 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
       // 最小 edge 门禁判定：落 status/edge/成本/降级码（每轮一条；k_min=0 的会话根本收不到此相位）。
       return {
         ...t,
-        edgeGateStatus: evt.status ?? null,
+        edgeGateStatus: (evt.status as AiTradeRoundTrace["edgeGateStatus"]) ?? null,
         edgeBps: evt.edgeBps ?? null,
         edgeCostBps: evt.costBps ?? null,
         edgeGateReason: evt.reason ?? null,
@@ -288,6 +296,16 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
         effectiveExposureCap: evt.effectiveExposureCap ?? null,
         corrScale: evt.corrScale ?? null,
         exposureCapUnreachable: evt.exposureCapUnreachable ?? null,
+      };
+    case "horizon":
+      // 持仓周期铁律判定：落 status/降级码/整份快照（每轮一条；未装配的会话根本收不到此相位）。
+      // `horizonWire` **必须整份落**——本层读数有 20 余个（倒计时 / 确认进度 / 迟滞阈 / 解除原因 /
+      // 交易所兜底价），逐键抄一遍必然在下一次加字段时漏掉，而 chip、轨迹、统计三处都要读它。
+      return {
+        ...t,
+        horizonStatus: (evt.status as AiTradeRoundTrace["horizonStatus"]) ?? null,
+        horizonReason: evt.reason ?? null,
+        horizonWire: evt.horizon ?? null,
       };
     case "reflection_verdict":
       // 反思裁决：落 verdict/reason/实际收缩后仓位并清在飞指示。

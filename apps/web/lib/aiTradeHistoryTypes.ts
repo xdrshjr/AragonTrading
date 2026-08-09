@@ -1,6 +1,7 @@
 // AI 自动交易统计历史 wire 类型（ai-trade-stats-dashboard §3.8）：与后端 schemas.AiTradeHistory* 逐字对齐。
 // 皆为组件 / lib 局部类型，不入 store（历史走 TanStack Query，不持久化）。时间戳全为秒（§6.2 / P2-8）。
 import type { FeeRatesWire, ReconcileWire } from "./aiTradeCost";
+import type { AiTradeHorizonStats } from "./aiTradeTypes";
 import type { Trade } from "./types";
 
 // 历史会话列表单行 KPI（后端逐成员配对聚合；口径同 autoTradePnl.summarizeRoundTrips）。
@@ -101,6 +102,10 @@ export interface AiTradeRunMetrics {
     // 成本真值化（cost-truth §5.4，**顶层**加法键）：老记录缺键 ⇒ 整段隐藏（绝不显示误导性的 0）。
     feeRates?: FeeRatesWire;
     reconcile?: ReconcileWire;
+    // 交易周期层观测（holding-horizon §2.12）：加法写既有 JSON 列，老记录缺键 ⇒ 整段隐藏。
+    // 零样本时六个派生量为 **null 而非 0**（[P2-3]：「目标区间内占比 0%」与「还没有样本」是两个
+    // 截然不同的结论）。
+    horizon?: AiTradeHorizonStats;
   };
 }
 

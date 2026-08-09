@@ -47,6 +47,9 @@ export function groupStateFromStatus(row: AiTradeGroupRow): AiTradeGroupState {
     leverage: row.leverage,
     contextRefreshRounds: row.contextRefreshRounds,
     wakeIntervalMinutes: row.wakeIntervalMinutes,   // wake-interval：供面板显示「唤醒周期 N 分钟」
+    // 交易周期契约（holding-horizon §3.4）：分组共享一份（R-12：模式是会话级契约而非标的属性）。
+    // 逐轮快照走 status/decision 事件**整对象透传**进 member.session.horizon，与此处的静态契约分工。
+    tradingHorizon: row.tradingHorizon ?? null,
     state: "running",
     startedTs: row.createdTs,
     members,

@@ -3,11 +3,14 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AI_TRADE_BASE_RULE_DEFAULTS, AI_TRADE_PROFIT_GUARD_DEFAULTS } from "@/lib/aiTrade";
+import { aiTradeHorizonApi } from "@/lib/aiTradeHorizonApi";
 import { autoTradeSettingsApi } from "@/lib/autoTradeSettingsApi";
 import { tradingApi } from "@/lib/tradingApi";
 import AiTradeLaunchModal, { type AiTradeLaunchOpts } from "./AiTradeLaunchModal";
 
 vi.mock("@/lib/tradingApi", () => ({ tradingApi: { config: vi.fn() } }));
+// 交易周期模式预设表：与上面两个同级的模块级 mock——弹窗每次打开都会拉它，不 mock 会触发真实 fetch。
+vi.mock("@/lib/aiTradeHorizonApi", () => ({ aiTradeHorizonApi: { profiles: vi.fn() } }));
 // 模块级 mock（P2-1）：写在文件顶层与 tradingApi mock 同级，否则其余用例的 settings 查询会触发真实 fetch。
 vi.mock("@/lib/autoTradeSettingsApi", () => ({ autoTradeSettingsApi: { get: vi.fn() } }));
 vi.mock("@/lib/api", async (orig) => {
@@ -64,7 +67,39 @@ beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(tradingApi.config).mockResolvedValue({ availUsdt: 1000 } as never);
   vi.mocked(autoTradeSettingsApi.get).mockResolvedValue({ maxBudgetPct: 100, effectiveMaxBudgetPct: 100 });
+  vi.mocked(aiTradeHorizonApi.profiles).mockResolvedValue(HORIZON_PROFILES);
 });
+
+// 后端 `GET /ai-trade/horizon-profiles` 的最小夹具（数值与中文标签一律来自服务端，前端不复制，R-3）。
+const HORIZON_PROFILES = {
+  enabled: true,
+  defaultProfile: "intraday_swing" as const,
+  estimatedCostBps: 13,
+  lossReleaseFrac: 0.5,
+  lossReleaseReturnPctFallback: 0.1,
+  profiles: [
+    {
+      id: "intraday_swing" as const, title: "日内波段", description: "小时级别一段趋势。",
+      targetLabel: "4 – 12 小时", bar: "1H", wakeIntervalMinutes: 30, minHoldSeconds: 7200,
+      exitConfirmRounds: 2, turnoverHysteresisK: 1.5, targetHoldMinSeconds: 14400,
+      targetHoldMaxSeconds: 43200, expectedHoldBars: 12, confirmWindowSeconds: 3600,
+      leverageMaxHint: 3,
+    },
+    {
+      id: "trend_hold" as const, title: "趋势持仓", description: "跟随一段中线趋势。",
+      targetLabel: "1 – 3 天", bar: "4H", wakeIntervalMinutes: 0, minHoldSeconds: 43200,
+      exitConfirmRounds: 3, turnoverHysteresisK: 2, targetHoldMinSeconds: 86400,
+      targetHoldMaxSeconds: 259200, expectedHoldBars: 18, confirmWindowSeconds: 21600,
+      leverageMaxHint: 2,
+    },
+    {
+      id: "custom" as const, title: "自定义", description: "自行设定。", targetLabel: null,
+      bar: null, wakeIntervalMinutes: null, minHoldSeconds: null, exitConfirmRounds: null,
+      turnoverHysteresisK: null, targetHoldMinSeconds: null, targetHoldMaxSeconds: null,
+      expectedHoldBars: null, confirmWindowSeconds: null, leverageMaxHint: null,
+    },
+  ],
+};
 
 afterEach(() => cleanup());
 
@@ -711,5 +746,114 @@ describe("AiTradeLaunchModal · backtest mode", () => {
     await screen.findByText("均线策略");
     // 默认落实盘段，未勾选 acknowledged → CTA 禁用
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
+  });
+});
+
+// ---------- 交易周期模式（ai-trade-holding-horizon-modes §6.2）----------
+describe("AiTradeLaunchModal · 交易周期模式", () => {
+  it("默认勾选并采用接口下发的 defaultProfile，提交体带 tradingHorizon", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByRole("radio", { name: /日内波段/ });
+    expect(screen.getByRole("checkbox", { name: "交易周期模式（推荐开启）" })).toBeChecked();
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.tradingHorizon).toEqual({ enabled: true, profile: "intraday_swing" });
+  });
+
+  it("预设表读取失败 ⇒ 提交体**省略 profile 键**，由服务端按默认模式装配（不拿 custom 顶上）", async () => {
+    vi.mocked(aiTradeHorizonApi.profiles).mockRejectedValue(new Error("boom"));
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByTestId("ai-trade-horizon-loading");
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    // `custom` 全默认逐字等价于本层未装配——静默顶上等于把一个本应生效的周期契约悄悄关掉。
+    expect(opts.tradingHorizon).toEqual({ enabled: true });
+  });
+
+  it("取消勾选 ⇒ 提交体为显式关闭（与「字段缺省=默认开启」严格区分）", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByRole("radio", { name: /日内波段/ });
+    fireEvent.click(screen.getByRole("checkbox", { name: "交易周期模式（推荐开启）" }));
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.tradingHorizon).toEqual({ enabled: false });
+  });
+
+  it("切换 profile 联动时间级别与唤醒周期（这正是「模式」的意义）", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    fireEvent.click(await screen.findByRole("radio", { name: /趋势持仓/ }));
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.bar).toBe("4H");
+    expect(opts.wakeIntervalMinutes).toBe(0);
+    expect(opts.tradingHorizon).toEqual({ enabled: true, profile: "trend_hold" });
+  });
+
+  it("[P0-1] 切换 profile **不得**触碰利润保护层的最短持有——那会造出「G1 拦 AI + 保护层停摆」双关窗口", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByRole("radio", { name: /日内波段/ });
+    const minHold = screen.getByLabelText("最短持有（秒）") as HTMLInputElement;
+    const before = minHold.value;
+    fireEvent.click(screen.getByRole("radio", { name: /趋势持仓/ }));
+    expect((screen.getByLabelText("最短持有（秒）") as HTMLInputElement).value).toBe(before);
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.profitGuard?.minHoldSeconds).toBe(Number(before));
+  });
+
+  it("切到 custom 露出高级参数且**不联动**任何字段（[P1-8] bar === null）", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    fireEvent.click(await screen.findByRole("radio", { name: /自定义/ }));
+    fireEvent.change(screen.getByLabelText("最短主动平仓窗口（秒，0=不约束）"), {
+      target: { value: "300" },
+    });
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.bar).toBe("1H");                 // 未被联动改写
+    expect(opts.tradingHorizon).toEqual({
+      enabled: true, profile: "custom", minHoldSeconds: 300,
+    });
+  });
+
+  it("[G-7] 复发回归：改过的周期输入在 2 秒假时钟后**不被冲回默认**", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { rerender } = renderModal({ defaultStrategyIds: [1] });
+      await screen.findByRole("radio", { name: /日内波段/ });
+      fireEvent.click(screen.getByRole("radio", { name: /自定义/ }));
+      const input = screen.getByLabelText("最短主动平仓窗口（秒，0=不约束）") as HTMLInputElement;
+      fireEvent.change(input, { target: { value: "1234" } });
+      rerender();                                 // 模拟父树重渲染（新引用的默认值）
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(
+        (screen.getByLabelText("最短主动平仓窗口（秒，0=不约束）") as HTMLInputElement).value,
+      ).toBe("1234");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("契约摘要按当前表单值现算：改杠杆 ⇒ 解除阈随之变化（[P1-10]，无静态算例）", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByRole("radio", { name: /日内波段/ });
+    const summary = () => screen.getByTestId("ai-trade-horizon-contract").textContent ?? "";
+    // 杠杆留空 ⇒ 解除阈**诚实降级**为兜底口径（绝不猜一个杠杆去算出一个看起来很确定的数）。
+    expect(summary()).toContain("兜底口径");
+    fireEvent.change(screen.getByLabelText("杠杆（×）"), { target: { value: "3" } });
+    await waitFor(() => expect(summary()).toContain("−7.50%"));   // 默认止损 5% × 3× × 0.5
+    fireEvent.change(screen.getByLabelText("杠杆（×）"), { target: { value: "5" } });
+    await waitFor(() => expect(summary()).toContain("−12.50%"));
   });
 });

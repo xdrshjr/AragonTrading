@@ -33,6 +33,8 @@ from ..strategies.base import Signal
 from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, gate_status
 from .cost_runtime import CostRuntime
 from .decider import AiTradeDecider, TradeDecision
+from .hold_horizon import HorizonFacts, HorizonRule, gate_status as horizon_gate_status
+from .horizon_runtime import HorizonRuntime, build_horizon_facts
 from .market_context import build_market_context
 from .market_digest import build_market_digest
 from .market_window import MarketWindow, WindowOptions
@@ -69,10 +71,13 @@ from .trace import (
     _TRACES_MAX,
     TraceEmit,
     apply_edge_gate_trace,
+    apply_horizon_trace,
     apply_sizing_trace,
     base_rule_event,
     edge_gate_event,
     edge_gate_unavailable_event,
+    horizon_event,
+    horizon_released_event,
     new_round_trace,
     reflection_start_event,
     reflection_verdict_event,
@@ -96,6 +101,9 @@ _BAND_UNAVAILABLE_ALERT_ROUNDS = 3
 # 最小 edge 门禁连续不可用告警阈值（§3.7）：本层 fail-open，故阈值比铁律层宽——连续这么多轮算不出
 # 粗估 edge 才追一条 error，使「门禁其实一直没生效」在 UI 上自解释（静默的降级同样会被当成故障）。
 _EDGE_UNAVAILABLE_ALERT_ROUNDS = 20
+# 持仓周期层连续解除告警阈值（holding-horizon §4.4）：本层同为 fail-open，阈值同宽——连续这么多轮
+# 「限制已解除」才追一条 error，使「锁其实一直开着」在 UI 上自解释。
+_HORIZON_RELEASED_ALERT_ROUNDS = 20
 # 打 `explain.meta.wakeKind` 的成交类型白名单（ai-trade-wake-aware-context §2.9）：只有 AI 决策**直接**
 # 产生的成交才归因到唤醒来源。保护层平仓 / 会话止损 / 外部干预由确定性层触发、与唤醒无关，打上去会让
 # 「按唤醒来源切胜率」这张表整体失真——而那正是本条要解决的问题。
@@ -120,7 +128,8 @@ class AiTradeSession:
                  base_rule: MaBandRule | None = None,
                  profit_rule: ProfitGuardRule | None = None,
                  prior_snapshot: dict | None = None,
-                 sizing: SizingRuntime | None = None):
+                 sizing: SizingRuntime | None = None,
+                 horizon_rule: HorizonRule | None = None):
         self.session_id = session_id
         self.run_id = run_id
         self._specs = specs
@@ -153,11 +162,18 @@ class AiTradeSession:
         self._atr_px: float | None = None     # 确认根 ATR（F1）；None ⇒ 回吐距离上下界不生效
         # 成本记账与最小 edge 门禁（§3.10）：状态 / 快照 / 计数全部下沉 `CostRuntime`（镜像 F0 把
         # 利润保护下沉 `ProfitGuardRuntime` 的同款范式），会话只留薄封装调用。
+        # 交易周期模式（holding-horizon §2.4）：同款下沉范式；未装配 ⇒ 无 tradingHorizon 键、prompt
+        # 逐字回退、门禁直通、零轨迹。前瞻窗口由契约派生并**同时**喂成本层与先验层（§2.6 要求同源）。
+        self.horizon_rule = horizon_rule
+        self._horizon = HorizonRuntime(horizon_rule)
+        self._round_horizon: dict | None = None      # 本轮 gate 快照（decision 事件与判定同源）
+        hold_bars = None if horizon_rule is None else horizon_rule.expected_hold_bars
         self._cost = CostRuntime(inst_id, executor.settings, executor.fee_ledger,
-                                 executor.creds, allow_limit=decider.allow_limit)
+                                 executor.creds, allow_limit=decider.allow_limit,
+                                 expected_hold_bars=hold_bars)
         # 信号先验层（signal-prior-and-ev-gate §3.1）：同款下沉范式；总闸①关或快照缺席 ⇒ payload
         # 无 signalPriors 键、prompt 逐字节回退、EV 分子回退 ATR 粗估（既有单测零回归）。
-        self._prior = PriorRuntime(prior_snapshot, executor.settings)
+        self._prior = PriorRuntime(prior_snapshot, executor.settings, horizon_bars=hold_bars)
         # 仓位 / 刹车层（vol-sizing §3.1）：同款下沉；未装配 ⇒ 零动作、无 sizingPlan 键、risk 从不被赋值。
         self._sizing = sizing or SizingRuntime()
         # P0-1：会话级单调持仓序号——`_dispatch` 观察到任一 `side=="close"` 成交即 +1。epoch 身份的一半，
@@ -281,6 +297,9 @@ class AiTradeSession:
                         trade["peakPnlUsd"] = self._guard.take_peak_pnl()
                     self._cost.record_close(trade)      # §3.8：往返归因同挂这个唯一收口
                     self._sizing.note_close(trade, now_wall=time.time())   # 连亏计数同挂唯一收口
+                    self._horizon.note_close(trade, time.time())   # 真实持仓时长样本同挂唯一收口
+                else:   # 开仓成交：锁定 epoch 的 opened_wall（部分成交同一 epoch ⇒ 内部幂等不重置）
+                    self._horizon.note_open(trade, time.time(), seq=self._position_seq)
                 self._sizing.note_executor(self.executor, self._current_px())   # [P1-8] 敞口簿
                 self._inject_explain_meta(trade)
                 await self._persist_trade(trade)
@@ -437,6 +456,8 @@ class AiTradeSession:
         # 利润保护先于会话止盈（§2.5）：一次保护性平仓可能正好把会话累计盈亏推过 TP，随后
         # `_maybe_session_exit` 自然停会话；反序则会先停会话、保护层再无机会锁住这笔利润。
         await self._maybe_profit_exit(now_ts)
+        # 持仓周期快照随盯市推进（面板 chip 的倒计时在无决策轮时也要动；纯同步、不判定、不平仓）。
+        self._horizon.refresh(self._horizon_facts(time.time()))
         await self._expire_profit_cooldown()
         await self._maybe_session_exit(mark, now_ts)
         # §3.1：网络 IO 只跑在盯市 tick 上；三条刷新（资金费率 / 官方费率 / 交易所对账）离开
@@ -659,8 +680,14 @@ class AiTradeSession:
             # ★【基础策略】铁律门禁（ai-trade-base-strategy-ma-band §2.5）：必须落在 decide **之后**
             # （重试循环只认 _map_decision 的 degrade，落进去会每轮白烧 LLM，P1-1）、共识门禁与反思
             # **之前**（被否轮此时已是 hold，反思对 hold 本就直通 ⇒ 自动零 LLM 成本，P1-2）。
+            # 连续确认计数须在**任何门禁之前**记（§2.5 硬约束 4）：记门禁后的动作，一次 MA 通道否决
+            # 就会把 close 意图的连续性洗掉、G2 永远数不到 2。
+            self._horizon.note_intent(decision.action, degrade, now_wall=time.time(),
+                                      position_side=self.executor.projected)
             decision, degrade = await self._apply_base_rule_gate(
                 round_no, ts, payload, decision, degrade)
+            # ★ 持仓周期铁律门禁（holding-horizon §2.5）：基础策略**之后**、冷却**之前**。
+            decision, degrade = await self._apply_horizon_gate(round_no, ts, decision, degrade)
             # ★ 利润保护冷却门禁（adaptive §2.2.2）：铁律后、共识前（见 _apply_profit_cooldown_gate）。
             decision, degrade = self._apply_profit_cooldown_gate(decision, degrade)
             decision, degrade = self._sizing.gate(decision, degrade)   # ★ 回撤刹车 / 连亏熔断（第 7 步）
@@ -949,6 +976,34 @@ class AiTradeSession:
                 "message": (f"基础策略的 MA 通道已连续 {self._band_unavailable_streak} 轮无法计算"
                             f"（需至少 {self.base_rule.period + 1} 根 K 线），期间开仓一律降级观望；"
                             "平仓与撤单不受影响")}})
+
+    def _horizon_facts(self, now_wall: float) -> HorizonFacts:
+        """本轮持仓周期断面（成本按**持仓方向**估，[P1-2]：按动作推方向会让平多仓恒记 0 资金费）。"""
+        return build_horizon_facts(
+            self.executor, self._session_readings(now_wall), stale_feed=self._stale_degraded,
+            cost_bps=self._cost.estimate_cost_for_position(self.executor.projected,
+                                                           BAR_SECONDS[self.bar]))
+
+    async def _apply_horizon_gate(self, round_no: int, ts: int, decision: TradeDecision,
+                                  degrade: str | None) -> tuple[TradeDecision, str | None]:
+        """薄封装 `HorizonRuntime.gate`（§2.5）；未装配 ⇒ 原样直通、零轨迹。
+
+        [P1-7] 断面在此**重新采集**（payload 那一份隔着一次完整 LLM 调用），方向安全：两次之间只有
+        时间向前流逝。轨迹取 `last_reason` 而非合成 `degrade`——后者先手胜出会把本层的码吞掉。
+        """
+        if self.horizon_rule is None:
+            return decision, degrade
+        decision, degrade, snap = self._horizon.gate(decision, degrade,
+                                                     self._horizon_facts(time.time()))
+        self._round_horizon = snap
+        reason = self._horizon.last_reason
+        status = horizon_gate_status(snap, reason)
+        apply_horizon_trace(self._round_trace, snap, status, reason)
+        await self._push(horizon_event(round_no, ts, snap, status, reason))
+        if self._horizon.released_streak == _HORIZON_RELEASED_ALERT_ROUNDS:
+            await self._push(horizon_released_event(ts, self._horizon.released_streak,
+                                                    (snap or {}).get("releaseReason")))
+        return decision, degrade
 
     async def _apply_edge_gate(self, round_no: int, ts: int, ref_px: float,
                                decision: TradeDecision, degrade: str | None
@@ -1316,6 +1371,9 @@ class AiTradeSession:
             payload["baseRules"] = {
                 "maBand": build_ma_band(self._window.base_df(), self.base_rule)}
         self._inject_profit_guard(payload)      # §2.6 b/d：未装配 ⇒ 整键缺席 ⇒ prompt 逐字回退
+        # 持仓周期段（§2.4 双快照契约）：这是 **round-start** 那一份（带 asOfWall），只喂 prompt；判定
+        # 另在 gate 里重采。须在 `_inject_profit_guard` 之后——它顺带给保护快照打 `horizonArmed` 标记。
+        self._horizon.inject(payload, self._horizon.refresh(self._horizon_facts(time.time())))
         self._sizing.inject(payload)            # 同款「整键缺席」范式（vol-sizing §3.8）
         priors = self._prior.build(board, payload.get("marketContext"),
                                    self._window.base_df())
@@ -1410,7 +1468,9 @@ class AiTradeSession:
                 "reflectionVerdict": reflection_verdict, "reflectionReason": reflection_reason,
                 # N5（hold-inertia-observability）：decide 后已更新，语义=「截至本轮」的连续真实观望；
                 # 每轮随 decision 事件下发，是前端 live 值的最新真源（跳过轮事件不带此键）。
-                "holdStreak": self.hold_streak}
+                "holdStreak": self.hold_streak,
+                # 本轮**判定用**的持仓周期快照（G-4：trace / decision 与门禁同源同值）；未装配 ⇒ None。
+                "horizon": self._round_horizon}
         self._last_decision = data
         self._decisions.append(data)
         await self._push({"type": "decision", "data": data})
@@ -1481,6 +1541,8 @@ class AiTradeSession:
                 # F2 冷却三载体之一（§4.2）：**不挂 position**——冷却期内按定义已无持仓。
                 "profitGuardCooldown": build_cooldown_view(self._guard.cooldown,
                                                            now_wall=time.time()),
+                # 持仓周期快照（§4.4）：供面板 chip 在无决策事件时也能更新倒计时；未装配 ⇒ None。
+                "horizon": self._horizon.last_snapshot,
                 "stopReason": self.stop_reason,
                 "degraded": self.executor.degraded or self._stale_degraded or self.degraded,
                 "flattenFailed": self.flatten_failed, "residual": self.residual}
@@ -1552,6 +1614,7 @@ class AiTradeSession:
             # 成本记账与门禁观测（§3.8，RV-1）：合并落在**调用点**，`_compute_ai_stats` 一字不动。
             metrics["aiStats"] = self._cost.merge_into(metrics["aiStats"])
             metrics["aiStats"] = self._sizing.merge_into(metrics["aiStats"])   # 同款调用点合并
+            metrics["aiStats"] = self._horizon.merge_into(metrics["aiStats"])  # §2.12 验收指标
         except Exception as exc:  # noqa: BLE001 —— 富化对 finalize 是加法且可失败，绝不阻断落库收尾
             logger.warning("ai-trade finalize enrichment skipped for run %s: %s", self.run_id, exc)
             for key in ("equityDigest", "decisionsDigest", "aiStats"):

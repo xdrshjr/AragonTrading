@@ -9,6 +9,7 @@ import {
   describeProfitGuardTrail,
   isEffectiveExitCommitted,
 } from "@/lib/aiTrade";
+import { describeHorizonStatus } from "@/lib/aiTradeHorizon";
 import { COST_BASIS_HINT, describeCostBasis } from "@/lib/aiTradeCost";
 import { colorForReturn, fmtMoney, fmtNum, fmtPct, fmtPrice } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
@@ -149,6 +150,7 @@ function MemberRow({
             当前挂单 {fmtPrice(resting.px)} · {fmtNum(resting.sz, 0)} 张 · 剩余 {resting.expiresInS}s
           </span>
         )}
+        <HorizonChip member={member} />
         <BreakEvenRow member={member} />
         <ProfitGuardRow guard={guard} />
         <ProfitGuardCooldownChip member={member} />
@@ -167,6 +169,34 @@ function MemberRow({
         )}
       </span>
     </button>
+  );
+}
+
+/**
+ * 交易周期 chip（ai-trade-holding-horizon-modes §2.11 展示落点之一）。
+ *
+ * 门控**只判快照存在**，刻意**不**叠加 `positionSide !== "flat"`：本层的空仓态是一条有信息量的
+ * 消息（「本层不约束开仓」），把它一并吞掉正是 `ai-trade-profit-protection` 终审 RV-2 的教训——
+ * 新增边缘态必须验渲染门控没排除掉该态。快照由 status / decision 事件**整对象透传**（AI-trade 的
+ * position/status 是整对象合并，不存在 `edgeSource` 那种逐键手抄吞新键的问题）。
+ *
+ * `released` 用 `--short` 色：此刻锁是开的、AI 可以随时平仓，用常规灰会让用户以为限制还在。
+ */
+function HorizonChip({ member }: { member: AiTradeGroupMemberState }) {
+  const wire = member.session?.horizon ?? null;
+  const text = describeHorizonStatus(wire);
+  if (!text) return null;
+  return (
+    <span
+      className={
+        wire?.released
+          ? "truncate text-[10px] text-[var(--short)]"
+          : "truncate text-[10px] text-[var(--muted)]"
+      }
+      data-testid="ai-trade-horizon-chip"
+    >
+      {text}
+    </span>
   );
 }
 

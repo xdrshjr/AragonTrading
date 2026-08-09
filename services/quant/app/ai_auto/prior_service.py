@@ -31,7 +31,8 @@ _DEFAULT_SEGMENTS = 6
 
 async def rebuild_prior_snapshot(*, inst_id: str, bar: str, specs: list,
                                  fingerprints: dict[int, str], settings: Settings,
-                                 lookback: int, segments: int | None = None) -> dict:
+                                 lookback: int, segments: int | None = None,
+                                 horizon_bars: int | None = None) -> dict:
     """取真实 K 线 → 建策略帧 → 事件研究 → 返回可直接落库的快照（两次重计算均卸载到线程池）。
 
     Args:
@@ -41,6 +42,9 @@ async def rebuild_prior_snapshot(*, inst_id: str, bar: str, specs: list,
         settings: 运行配置（提供持有期、分段隔离、衰减与三条 `usable` 门槛）。
         lookback: 回看根数（上限已由调用方在**取数前**判定，413 快速失败）。
         segments: 分段数；缺省 6（`DEFAULT_IC_SEGMENTS`）。
+        horizon_bars: 前瞻根数覆盖（holding-horizon §4.5）；缺省仍取全局常数。装配了持仓周期模式的
+            会话其前瞻窗口是 12–72 根，按全局 8 根建的快照会被 C-3 整份丢弃——这是运维按目标模式
+            重建的唯一出路。
 
     Returns:
         §5.2 的快照 dict。
@@ -63,7 +67,8 @@ async def rebuild_prior_snapshot(*, inst_id: str, bar: str, specs: list,
     frames = await run_in_threadpool(build_backtest_frames, specs, rows, htf, bar)
     return await run_in_threadpool(
         build_prior_snapshot, candles_to_df(rows), specs, frames, inst_id=inst_id, bar=bar,
-        horizon_bars=settings.ai_trade_cost_expected_hold_bars, segments=seg,
+        horizon_bars=int(horizon_bars if horizon_bars is not None
+                         else settings.ai_trade_cost_expected_hold_bars), segments=seg,
         embargo_bars=settings.ai_trade_prior_embargo_bars,
         half_life_days=settings.ai_trade_prior_decay_half_life_days,
         min_samples=settings.ai_trade_prior_min_samples,

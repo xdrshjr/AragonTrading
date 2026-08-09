@@ -256,3 +256,61 @@ describe("AiTradePanel · 利润保护冷却 chip", () => {
   });
 });
 
+
+// ---------- 交易周期 chip（ai-trade-holding-horizon-modes §2.11 展示落点之一）----------
+function horizonSnapshot(over: Record<string, unknown> = {}) {
+  return {
+    profileId: "intraday_swing", title: "日内波段", targetLabel: "4 – 12 小时",
+    status: "holding", holdSeconds: 5400, barsInPosition: 2, targetHoldMinSeconds: 14400,
+    targetHoldMaxSeconds: 43200, minHoldSeconds: 7200, minHoldRemainingSeconds: 1800,
+    exitConfirmRounds: 2, exitConfirmStreak: 0, confirmWindowSeconds: 3600,
+    confirmWindowRemainingSeconds: null, confirmWindowElapsed: false,
+    turnoverHysteresisK: 1.5, moveBps: 8.2, costBps: 13, requiredMoveBps: 19.5,
+    returnPct: 0.02, lossReleaseReturnPct: 0.075, released: false, releaseReason: null,
+    releasedGates: [], blockedStreak: 0, expectedHoldBars: 12, openedWallEstimated: false,
+    gateReverse: true, asOfWall: 1_700_000_000, ...over,
+  } as NonNullable<AiTradeSessionRow["horizon"]>;
+}
+
+describe("AiTradePanel · 交易周期 chip", () => {
+  afterEach(() => useAppStore.setState({ aiTradeGroup: null }));
+
+  it("持仓中显示倒计时（已持仓 / 最短 / 还差）", () => {
+    useAppStore.setState({
+      aiTradeGroup: makeGroup([makeSession("BTC-USDT-SWAP", { horizon: horizonSnapshot() })]),
+    });
+    render(<AiTradePanel rows={ROWS} active="BTC-USDT-SWAP" onSelect={noop} />);
+    const chip = screen.getByTestId("ai-trade-horizon-chip");
+    expect(chip.textContent).toContain("日内波段");
+    expect(chip.textContent).toContain("还差 30 分钟");
+  });
+
+  it("released ⇒ 点名原因并用 --short 色（此刻锁是开的，用常规灰会让用户以为限制还在）", () => {
+    useAppStore.setState({
+      aiTradeGroup: makeGroup([makeSession("BTC-USDT-SWAP", {
+        horizon: horizonSnapshot({ status: "released", released: true,
+                                   releaseReason: "loss_release" }),
+      })]),
+    });
+    render(<AiTradePanel rows={ROWS} active="BTC-USDT-SWAP" onSelect={noop} />);
+    const chip = screen.getByTestId("ai-trade-horizon-chip");
+    expect(chip.textContent).toContain("限制已解除");
+    expect(chip.className).toContain("--short");
+  });
+
+  it("空仓态**不被吞掉**：如实告知「本层不约束开仓」（RV-2 教训：新增边缘态须验渲染门控）", () => {
+    useAppStore.setState({
+      aiTradeGroup: makeGroup([makeSession("BTC-USDT-SWAP", {
+        positionSide: "flat", horizon: horizonSnapshot({ status: "flat", holdSeconds: 0 }),
+      })]),
+    });
+    render(<AiTradePanel rows={ROWS} active="BTC-USDT-SWAP" onSelect={noop} />);
+    expect(screen.getByTestId("ai-trade-horizon-chip").textContent).toContain("待入场");
+  });
+
+  it("未装配 ⇒ 整行不渲染（老会话与老快照零影响）", () => {
+    useAppStore.setState({ aiTradeGroup: makeGroup([makeSession("BTC-USDT-SWAP")]) });
+    render(<AiTradePanel rows={ROWS} active="BTC-USDT-SWAP" onSelect={noop} />);
+    expect(screen.queryByTestId("ai-trade-horizon-chip")).toBeNull();
+  });
+});

@@ -34,24 +34,36 @@ _UNAVAILABLE_LABEL = {
 }
 
 
-def format_profit_guard_charter(rule: ProfitGuardRule | None) -> str:
+def format_profit_guard_charter(rule: ProfitGuardRule | None, *,
+                                horizon_armed: bool = False) -> str:
     """系统 prompt 的利润保护宪章章（§2.6 a）；未装配 → **空串垫片**（渲染逐字节不变、零回归）。
 
-    两层语义**不可删**（放行条件 5 / P1-5）：① 被保护层强平 = 一次决策失误；② 保护层可能不可用、
-    不可依赖。缺第一层会诱发「反正有兜底」的道德风险（R-2），缺第二层更糟——模型会据一条它以为
+    第二层语义**不可删**（放行条件 5 / P1-5）：保护层可能不可用、不可依赖。缺它模型会据一条它以为
     无条件成立的保证去延长持有，而本层极性是 fail-open。
+
+    `horizon_armed`（holding-horizon §2.9 a / D-1）：装配了交易周期模式时，第一层语义由「被保护层
+    强平 = 决策失误 + 主动 close 永远更优」改写为**对称**表述。这不是措辞偏好而是据线上证据的推翻：
+    16 次往返中 15 次由 Agent 主动退出、净 −2.4741 USDT，唯一一次保护层退出净 +1.8655 USDT——原文案
+    在制度上鼓励抢跑退出。道德风险的防线改由确定性门禁（G1/G2/G3）与保留的第二层语义共同承担。
+    **`horizon_armed=False` 分支逐字不变**（G-1 的 sha256 冻结门禁据此成立）。
     """
     if rule is None or not rule.enabled:
         return ""
     hard = ("；本会话另启用**硬止盈**：保证金收益达 "
             f"{rule.hard_tp_return_pct * 100:g}% 即由系统直接止盈"
             if rule.hard_tp_return_pct > 0 else "")
+    stance = (
+        "它是**兜底底线，也是你的退出执行器**——当你的持仓理由仍然成立时，让保护线去执行退出，"
+        "与你主动离场同样正确；**提前离场同样是一种错误**，它用两笔确定的手续费换一个尚未成熟的"
+        "判断。只有当你能指出「持仓理由已经失效」时才主动 `close`。"
+        if horizon_armed else
+        "它是**兜底底线，不是你的止盈策略**——被保护层强制平仓意味着你没有在更好的位置"
+        "主动离场，应视为一次决策失误。主动的 `close` 永远优先于等待保护层触发。")
     return (
         "**利润保护层（移动止盈 + 保本 · 由系统强制执行）**：本会话启用了利润保护层。持仓浮盈达到"
         f"保证金收益 {rule.arm_return_pct * 100:g}% 后系统会记录峰值，并在利润自峰值回吐超过 "
         f"{rule.giveback_pct * 100:g}%、或价格跌回保本线时**由系统直接市价平仓**"
-        f"{hard}。它是**兜底底线，不是你的止盈策略**——被保护层强制平仓意味着你没有在更好的位置"
-        "主动离场，应视为一次决策失误。主动的 `close` 永远优先于等待保护层触发。\n"
+        f"{hard}。{stance}\n"
         "**另须知悉：保护层在行情或持仓读数异常时会主动不动作**（宁可不动，也绝不据脏数据平掉一笔"
         "真实持仓），届时每轮输入会明确标注「保护层当前不可用」。因此它**不是一条你可以依赖的保证**，"
         "你的退出计划必须在没有它的前提下也成立。"
@@ -163,15 +175,22 @@ def describe_exit_outcome(pnl_usd: float | None) -> str:
     return f"按保护线离场，本笔 {_fmt_usd(pnl_usd)}"
 
 
-def _format_last_exit(last_exit: dict | None) -> str:
-    """上一次保护性平仓回执（§2.6 d）：让模型知道它的仓位为何消失。缺省 → 空串。"""
+def _format_last_exit(last_exit: dict | None, horizon_armed: bool = False) -> str:
+    """上一次保护性平仓回执（§2.6 d）：让模型知道它的仓位为何消失。缺省 → 空串。
+
+    `horizon_armed`（holding-horizon §2.9 b）：装配了交易周期模式时结尾改述为对称口径——原文案
+    「你没有在更好的位置主动离场」会把每一次正常的保护线退出都记成一次失分，从而在下一轮把模型推向
+    更早的抢跑。`False` 分支逐字不变。
+    """
     if not last_exit:
         return ""
+    tail = ("保护线已按你设定的持仓周期完成了这次退出。请据此校准你的退出计划，但不必因此提前离场。"
+            if horizon_armed else
+            "这意味着你没有在更好的位置主动离场——本轮请据此调整你的退出计划。")
     return (f"  ★ 上一笔持仓已由利润保护层强制平仓（{last_exit.get('label')}）："
             f"平仓价 {_fmt_px(last_exit.get('exitPx'))}，"
             f"{describe_exit_outcome(last_exit.get('pnlUsd'))}"
-            f"（峰值 {_fmt_usd(last_exit.get('peakPnlUsd'))}）。"
-            "这意味着你没有在更好的位置主动离场——本轮请据此调整你的退出计划。")
+            f"（峰值 {_fmt_usd(last_exit.get('peakPnlUsd'))}）。{tail}")
 
 
 _TRAIL_BASIS_SUFFIX = {
@@ -235,7 +254,10 @@ def format_profit_guard_for_prompt(snapshot: dict | None) -> str:
     """
     if not snapshot:
         return ""
-    last_exit_line = _format_last_exit(snapshot.get("lastExit"))
+    # holding-horizon §2.9 b：`horizonArmed` 由 `HorizonRuntime.inject` 打在同一份保护快照上——
+    # 契约未装配的会话该键缺席 ⇒ `False` ⇒ 本段逐字节回退。
+    last_exit_line = _format_last_exit(snapshot.get("lastExit"),
+                                       bool(snapshot.get("horizonArmed")))
     status = snapshot.get("status")
     if status == STATUS_FLAT:
         return last_exit_line          # 无持仓：只可能有一条平仓回执，没有回执则整段省略

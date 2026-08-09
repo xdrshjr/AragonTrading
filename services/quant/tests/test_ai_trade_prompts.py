@@ -735,3 +735,60 @@ def test_amortised_cost_per_execution_bar_is_essentially_flat():
         **_production_payload(), "wake": _WAKE, "contextDisclosure": "repeat",
         "tacticalContext": _tactical_two_frames(), "tacticalTier": "brief"}))
     assert (full + 9 * repeat) <= 10 * baseline * 1.05
+
+
+# ---------- 交易周期模式的 prompt 冻结门禁（ai-trade-holding-horizon-modes G-1）----------
+def _sha(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_unarmed_horizon_keeps_three_prompts_byte_identical():
+    """G-1：未装配 ⇒ 系统 / 决策 / 反思三份 prompt 与本特性合入前**逐字节相等**。
+
+    以「显式传空垫片 vs 完全不传」的 sha256 相等来固化：新形参一旦被写成必填、或垫片默认值被改成
+    非空，本用例立刻判红——这正是「一键运维回退」能不能兑现的可证伪判据。
+    """
+    system_before = build_ai_trade_system_prompt("BTC-USDT-SWAP", "1H", 100.0, 3.0)
+    system_after = build_ai_trade_system_prompt("BTC-USDT-SWAP", "1H", 100.0, 3.0,
+                                                horizon_text="")
+    assert _sha(system_before) == _sha(system_after)
+    assert _sha(build_reflection_system_prompt()) == _sha(build_reflection_system_prompt(""))
+    payload = _payload_with_digest()
+    assert "tradingHorizon" not in payload
+    assert "【交易周期" not in build_decision_prompt(payload)
+
+
+def test_armed_horizon_charter_is_the_fifth_section_in_order():
+    """装配 ⇒ 五段宪章顺序为「基础策略 → 利润保护 → 仓位 → 成本 → 持仓周期」（位置即优先级声明）。"""
+    text = build_ai_trade_system_prompt(
+        "BTC-USDT-SWAP", "1H", 100.0, 3.0, base_rules_text="BASE_RULES_MARK",
+        profit_guard_text="PROFIT_MARK", sizing_text="SIZING_MARK", cost_text="COST_MARK",
+        horizon_text="HORIZON_MARK")
+    positions = [text.index(mark) for mark in
+                 ("BASE_RULES_MARK", "PROFIT_MARK", "SIZING_MARK", "COST_MARK",
+                  "HORIZON_MARK")]
+    assert positions == sorted(positions)
+
+
+def test_armed_horizon_renders_the_round_section():
+    """装配 ⇒ 决策 prompt 出现持仓周期段，且**数全部取自快照**（渲染层不重算）。"""
+    payload = {**_payload_with_digest(), "tradingHorizon": {
+        "profileId": "intraday_swing", "title": "日内波段", "targetLabel": "4 – 12 小时",
+        "status": "holding", "holdSeconds": 5400.0, "barsInPosition": 2,
+        "minHoldSeconds": 7200.0, "minHoldRemainingSeconds": 1800.0,
+        "exitConfirmRounds": 2, "exitConfirmStreak": 1, "confirmWindowSeconds": 3600.0,
+        "confirmWindowRemainingSeconds": 1200.0, "confirmWindowElapsed": False,
+        "turnoverHysteresisK": 1.5, "moveBps": 8.2, "costBps": 13.0,
+        "requiredMoveBps": 19.5, "returnPct": 0.02, "lossReleaseReturnPct": 0.075,
+        "released": False, "releaseReason": None, "releasedGates": [], "blockedStreak": 0,
+        "expectedHoldBars": 12, "openedWallEstimated": False, "gateReverse": True,
+        "asOfWall": 1_700_000_000.0, "exchangeStopLossPx": None,
+        "exchangeTakeProfitPx": None}}
+    text = build_decision_prompt(payload)
+    assert "【交易周期 · 日内波段（4 – 12 小时）】" in text
+    assert "距最短持仓窗口还差 30 分钟" in text
+    assert "离场连续确认：1/2" in text
+    assert "需浮盈 ≥ 19.5bps" in text
+    assert "交易所侧未挂止盈止损" in text          # 两者皆空时如实说没有（诚实约束）

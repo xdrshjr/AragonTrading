@@ -71,7 +71,22 @@ def _funding_clause(view: dict) -> str:
     carry = view.get("fundingCarryBps")
     if carry is None:
         return "（资金费率暂未取到，未计入——真实成本只会更高）"
-    return f"，另含预估资金费 {carry} bps" if carry else ""
+    return f"，另含预估资金费 {carry} bps{_funding_periods_clause(view)}" if carry else ""
+
+
+def _funding_periods_clause(view: dict) -> str:
+    """资金费**期数**披露（holding-horizon §2.7）；期数缺失 ⇒ 空串（不写噪音）。
+
+    OKX 的结算周期由 `nextFundingTs − fundingTs` 得出、会动态变为 1/2/4/8 小时，故取不到时**绝不**
+    写成一个确定的数——如实写「结算周期未知，按 8h 保守估算」。
+    """
+    periods = view.get("fundingPeriods")
+    if not periods:
+        return ""
+    interval = view.get("fundingIntervalS")
+    detail = ("结算周期未知，按 8h 保守估算" if interval is None
+              else f"当前结算周期 {float(interval) / 3600:g}h，实际以交易所为准")
+    return f"（按目标持仓预计跨 {int(periods)} 个资金费结算点；{detail}）"
 
 
 def _basis_line(net_basis: bool) -> str:

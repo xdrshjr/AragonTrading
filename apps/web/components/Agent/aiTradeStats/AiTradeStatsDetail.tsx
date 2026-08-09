@@ -17,8 +17,15 @@ import {
   describeIdentityCheck,
   describeReconcile,
 } from "@/lib/aiTradeCost";
+import {
+  horizonEstimatedNote,
+  horizonKpis,
+  horizonReleaseHint,
+  horizonVetoLine,
+} from "@/lib/aiTradeHorizon";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
 import type { AiTradeHistoryDetailOut, AiTradeHistoryMember } from "@/lib/aiTradeHistoryTypes";
+import type { AiTradeHorizonStats } from "@/lib/aiTradeTypes";
 import { type AiObservability, aggregateAiObservability } from "@/lib/aiTradeObservability";
 import { colorForReturn, fmtNum, fmtPct, fmtTime, signed } from "@/lib/format";
 import type { EquityPoint } from "@/lib/types";
@@ -256,6 +263,33 @@ function ReconcileCard({ members }: { members: AiTradeHistoryMember[] }) {
   );
 }
 
+/**
+ * 「持仓周期」三格 KPI + 拦截计数行（ai-trade-holding-horizon-modes §2.11 展示落点之三）。
+ *
+ * 未装配本层的历史记录 ⇒ `horizon` 键缺席 ⇒ 整段不渲染（绝不显示一排误导性的 0，与本页
+ * 「老记录缺键即整段隐藏」的既有纪律同款）。零样本时三格呈现「—」（[P2-3]）。
+ */
+function HorizonKpiGroup({ stats }: { stats: AiTradeHorizonStats | null }) {
+  if (!stats) return null;
+  const note = horizonEstimatedNote(stats);
+  return (
+    <div className="mt-2" data-testid="ai-horizon-kpis">
+      <div className="grid grid-cols-3 gap-2">
+        {horizonKpis(stats).map((kpi) => (
+          <Kpi key={kpi.label} label={kpi.label} value={kpi.value} />
+        ))}
+      </div>
+      <p
+        className="mt-1 text-[10px] leading-relaxed text-[var(--muted)]"
+        title={horizonReleaseHint(stats)}
+      >
+        {stats.title}（{stats.profileId}）· {horizonVetoLine(stats)}
+        {note ? ` · ${note}` : ""}
+      </p>
+    </div>
+  );
+}
+
 function AiStatsCard({
   aiStats,
   observability,
@@ -275,6 +309,7 @@ function AiStatsCard({
         <Kpi label="平均置信度" value={fmtPct(aiStats.avgConfidence)} />
         <Kpi label="共识降级" value={`${aiStats.degradedRounds} 轮`} />
       </div>
+      <HorizonKpiGroup stats={aiStats.horizon ?? null} />
       {observability && (
         <>
           <div className="mt-2 grid grid-cols-3 gap-2 sm:grid-cols-6">

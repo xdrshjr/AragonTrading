@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -305,6 +306,29 @@ class Settings(BaseSettings):
     # 承诺退出线总闸：把模型每轮被索要、却从不被系统采集/执行的退出线做成结构化、单调棘轮、确定性兑现
     # 的第三条保护线。False ⇒ 决策工具字段 / 宪章段 / 判定逐字节回退 v2（G-1/G-2）。
     ai_trade_profit_guard_commitment_enabled: bool = True
+    # ---- 交易周期模式 · 持仓周期铁律层（ai-trade-holding-horizon-modes §5.1）----
+    # 与【基础策略】铁律层、利润保护层并列的第三条铁律，极性同利润保护（fail-open）：它只约束
+    # **Agent 主动发起的**平仓与反手，止损 / 交易所 OCO / 利润保护层 / 会话止盈损 / 强制时间平仓
+    # 一律不受影响。总闸 False ⇒ 恒不装配、prompt 不注入、门禁直通 ⇒ **逐字回退**到本特性合入前。
+    # env 名 AI_TRADE_HORIZON_* 已在 desktop config.js prod 透传白名单内（AI_TRADE_ 前缀），此处
+    # 须真的声明——Settings extra="ignore" 会静默丢弃未声明的 env。
+    ai_trade_horizon_enabled: bool = True
+    # 字段缺省时装配的模式（**Literal 而非 str**：写错一个字母就该在进程启动时炸，而不是在第一次
+    # start 时 KeyError）。
+    ai_trade_horizon_default_profile: Literal[
+        "hourly_swing", "intraday_swing", "short_swing", "trend_hold", "custom",
+    ] = "intraday_swing"
+    ai_trade_horizon_backtest_enabled: bool = True    # 回测侧运维总闸（一键回到不装配的回测行为）
+    ai_trade_horizon_gate_reverse: bool = True        # 是否把「反手」也纳入约束（退出口）
+    # 解除阈的派生系数：有单仓 OCO 止损时 `阈 = stopLossPct × leverage × frac`（保证金收益率口径）。
+    ai_trade_horizon_loss_release_frac: float = Field(default=0.5, ge=0, le=1)
+    # 无 OCO 止损时的兜底解除阈（保证金收益率）。
+    ai_trade_horizon_loss_release_return_pct: float = Field(default=0.10, gt=0, le=5)
+    # 连续被本层拦截 N 轮后注入一段自察注记（0=关闭 ⇒ 整键缺席 ⇒ prompt 逐字节回退）。消费方见
+    # §2.9(e) 的 `blockedStreakNote`——本仓库不留没有展示落点的常量。
+    ai_trade_horizon_note_after_rounds: int = Field(default=3, ge=0)
+    # 判定价年龄阈**刻意不新增字段**，复用 `ai_trade_profit_guard_max_px_age_s`（90s）——
+    # 「判定价多老算老」在一个会话里只能有一个答案。
     # ---- 成本记账与最小 edge 门禁（ai-trade-cost-accounting-and-edge-gate §3.9）----
     # 本段全部字段的**作用域是 AI 会话**：`FeeLedger` 只由 `ai_auto/manager.py` 经 `LiveExecutor` 的
     # `fee_ledger=` 构造缝注入，`live_auto`（非 AI）恒传 None ⇒ 这些开关取任何值都不影响非 AI 链路

@@ -513,6 +513,20 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
   // 开新仓**——用户看到「暂停」时最怕的是「我的仓位是不是也平不掉了」。
   { prefix: "drawdown_brake_halt", label: "回撤刹车：会话回撤越线，暂停开新仓（平仓不受影响）" },
   { prefix: "loss_streak_cooldown", label: "连亏熔断：连续亏损达阈，冷却期内暂停开新仓（平仓不受影响）" },
+  // 持仓周期铁律三码（ai-trade-holding-horizon-modes §2.3.2）：同为带参数后缀的前缀码。文案必须写清
+  // **只拦 AI 主动换手**——用户看到「不接受平仓」时最怕的是「我的止损是不是也失效了」。
+  {
+    prefix: "horizon_min_hold",
+    label: "交易周期：未满最短持仓窗口，本轮不接受 AI 主动平仓（止损/止盈/利润保护层不受影响）",
+  },
+  {
+    prefix: "horizon_exit_unconfirmed",
+    label: "交易周期：离场理由需连续确认若干轮，本轮尚未满足（确认窗口到期即放行）",
+  },
+  {
+    prefix: "horizon_turnover_hysteresis",
+    label: "交易周期：浮盈尚未覆盖往返成本，获利了结推迟（浮亏离场不受此限）",
+  },
 ];
 
 /**

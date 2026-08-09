@@ -102,10 +102,18 @@ class PriorParams:
     tie_eps: float
 
 
-def resolve_prior_params(settings) -> PriorParams:
-    """`Settings` → `PriorParams`（唯一解析点；`horizon_bars` 与成本模型同源，§3.2 推论 1）。"""
+def resolve_prior_params(settings, *, horizon_bars: int | None = None) -> PriorParams:
+    """`Settings` → `PriorParams`（唯一解析点；`horizon_bars` 与成本模型同源，§3.2 推论 1）。
+
+    Args:
+        settings: 全局配置。
+        horizon_bars: 前瞻根数覆盖（ai-trade-holding-horizon-modes §2.6）；`None` ⇒ 逐字回退全局
+            常数。**必须与 `CostRuntime.expected_hold_bars` 传同一个数**——两者不同源即造出第三个
+            前瞻口径，而 C-3 契约校验恰好是按这个数去判快照该不该被整份丢弃的。
+    """
     return PriorParams(
-        horizon_bars=int(settings.ai_trade_cost_expected_hold_bars),
+        horizon_bars=int(horizon_bars if horizon_bars is not None
+                         else settings.ai_trade_cost_expected_hold_bars),
         min_samples=int(settings.ai_trade_prior_min_samples),
         ir_clip=float(settings.ai_trade_prior_ir_clip),
         top_n=int(settings.ai_trade_prior_top_n),

@@ -21,6 +21,8 @@ from ..ai_auto.backtest_manager import (
     get_ai_backtest_manager,
 )
 from ..ai_auto.base_rules import MaBandRule, resolve_ma_band_rule
+from ..ai_auto.cost_runtime import CostRuntime
+from ..ai_auto.hold_horizon import HorizonRule, profiles_wire, resolve_horizon_rule
 from ..ai_auto.manager import (
     AiTradeGroupMemberInput,
     AiTradeGroupPreflightError,
@@ -43,6 +45,8 @@ from ..schemas import (
     AiTradeGroupStartIn,
     AiTradeHistoryDetailOut,
     AiTradeHistoryListOut,
+    AiTradeHorizonIn,
+    AiTradeHorizonProfilesOut,
     AiTradePriorRebuildIn,
     AiTradePriorSnapshotOut,
     AiTradeProfitGuardIn,
@@ -127,6 +131,32 @@ def _resolve_backtest_profit_guard(raw: AiTradeProfitGuardIn | None,
     if not settings.ai_trade_profit_guard_backtest_enabled:
         return None
     return _resolve_profit_guard(raw, settings)
+
+
+def _resolve_horizon(raw: AiTradeHorizonIn | None, settings: Settings, *,
+                     bar: str) -> HorizonRule | None:
+    """交易周期模式「默认开启」语义的**唯一解析点**（ai-trade-holding-horizon-modes §4.2 / D-2）。
+
+    四层语义：运维总闸关 ⇒ 恒 `None`；字段缺省 ⇒ 按 settings 装配默认模式（老客户端 / 桌面旧包不发
+    该字段也默认开启）；显式 `enabled=false` ⇒ `None`（该会话不装配）；逐项覆盖 ⇒ 覆盖预设。
+
+    `bar` 是**用户实际选择的执行周期**：`expectedHoldBars` 与 `confirmWindowSeconds` 两个派生量按它
+    现算，绝不按预设自带的建议周期算——否则用户把 `intraday_swing` 的周期从 1H 改成 5m 之后，资金费
+    期数与 G2 的墙钟上界仍按 1H 的口径走，是一个不会报错的静默错配。
+
+    **实盘与回测共用本函数**（`base_rules` P1-4 / `profit_guard` I-3 的成文教训）：两侧默认不一致，
+    用户拿回测调出来的参数在实盘直接失真。
+    """
+    return resolve_horizon_rule(raw.model_dump() if raw is not None else None,
+                                settings, bar=bar)
+
+
+def _resolve_backtest_horizon(raw: AiTradeHorizonIn | None, settings: Settings, *,
+                              bar: str) -> HorizonRule | None:
+    """回测侧解析：在实盘那条语义之上再叠一层运维总闸（一键回到不装配的回测行为）。"""
+    if not settings.ai_trade_horizon_backtest_enabled:
+        return None
+    return _resolve_horizon(raw, settings, bar=bar)
 
 
 async def _resolve_account(session: AsyncSession, account_id: int | None) -> repo.OkxAccount:
@@ -227,6 +257,7 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
         wake_interval_s=_resolve_wake_interval_s(body.wakeIntervalMinutes, settings),
         base_rule=_resolve_base_rules(body.baseRules, settings),
         profit_rule=_resolve_profit_guard(body.profitGuard, settings),
+        horizon_rule=_resolve_horizon(body.tradingHorizon, settings, bar=body.bar),
         prior_snapshots=priors)
     try:
         await get_ai_trade_manager().start_group(req)
@@ -262,6 +293,28 @@ async def ai_trade_status(settings: Settings = Depends(get_settings)) -> dict:
     """当前活跃 AI 分组（无则 group:null）；前端重载后据此重连各成员 WS（只读，不守门）。"""
     return {"group": get_ai_trade_manager().group_status(),
             "aiTradeEnabled": settings.ai_trade_enabled}
+
+
+@router.get("/ai-trade/horizon-profiles", response_model=AiTradeHorizonProfilesOut)
+async def ai_trade_horizon_profiles(bar: str = Query("1H"),
+                                    settings: Settings = Depends(get_settings)) -> dict:
+    """交易周期模式预设表（ai-trade-holding-horizon-modes §4.1）。
+
+    **不守 AI 总闸**：读预设表不下任何单，弹窗在总闸关闭时也要能把「有哪些模式」画出来（沿用
+    `priors/rebuild` 不守总闸的先例理由）。数值与中文标签**全部**由本端点下发，前端不复制任何一个
+    ——本仓库已经有过前后端各存一份口径导致静默漂移的事故（`edgeSource` 逐键手抄吞新键），一张
+    11 列 × 5 行的表手抄一遍必然漂移（R-3 / G-10）。
+
+    `estimatedCostBps` 按当前配置常数估（**非实时盘口**，UI 须标「约」）：契约摘要第三行的
+    「需 ≥N bps」要有一个可信来源，前端自己乘一遍就会与门禁真正判定的数分叉。
+    """
+    bar_seconds = BAR_SECONDS.get(bar) or BAR_SECONDS["1H"]
+    # 复用**同一对**成本纯核心（不发任何请求的只读运行时，镜像 `build_charter_text` 的姿态）；
+    # 取不到（总闸关 / 估算失败）⇒ None ⇒ 前端该行改述为「费率未知」，绝不编一个数。
+    preview = CostRuntime(bar, settings, None, None).estimate_preview_cost(
+        ord_type="market", side="long", bar_seconds=bar_seconds)
+    return profiles_wire(settings,
+                         estimated_cost_bps=None if preview is None else preview.total_bps)
 
 
 @router.get("/ai-trade/history", response_model=AiTradeHistoryListOut)
@@ -321,7 +374,10 @@ async def ai_trade_prior_rebuild(body: AiTradePriorRebuildIn,
     try:
         snapshot = await rebuild_prior_snapshot(
             inst_id=body.instId, bar=body.bar, specs=specs, fingerprints=fingerprints,
-            settings=settings, lookback=lookback, segments=body.segments)
+            settings=settings, lookback=lookback, segments=body.segments,
+            # holding-horizon §4.5：按目标持仓模式的前瞻窗口重建（缺省仍取全局常数）。装配了周期
+            # 模式的会话其 horizonBars 是 12–72，按全局 8 建的快照会被 C-3 整份丢弃——这是出路。
+            horizon_bars=body.horizonBars)
     finally:
         _PRIOR_REBUILD_INFLIGHT.discard(key)
     await prior_repo.save_prior_snapshot(session, snapshot)
@@ -330,16 +386,19 @@ async def ai_trade_prior_rebuild(body: AiTradePriorRebuildIn,
 
 @router.get("/ai-trade/priors")
 async def ai_trade_prior_get(instId: str, bar: str,
+                             horizonBars: int | None = Query(None, ge=1, le=1000),
                              session: AsyncSession = Depends(get_session),
                              settings: Settings = Depends(get_settings)) -> dict:
     """读当前快照。无记录 ⇒ `{"exists": false}`——「还没建」是正常状态，不是错误（故非 404）。
 
     `contract` 直接把 C-2 新鲜度 / C-3 持有期的判定结果告诉运维，省得对着时间戳心算。
+    可选 `horizonBars`（holding-horizon §4.5）用于**按目标周期模式核对**契约；缺省仍比全局常数
+    （行为逐字不变）。
     """
     snapshot = await prior_repo.load_prior_snapshot(session, instId, bar)
     if snapshot is None:
         return {"exists": False}
-    params = resolve_prior_params(settings)
+    params = resolve_prior_params(settings, horizon_bars=horizonBars)
     age_s = time.time() - float(snapshot.get("builtAtTs") or 0)
     return {"exists": True, "snapshot": prior_snapshot_out(snapshot),
             "contract": {"fresh": age_s <= params.max_age_s,
@@ -388,7 +447,8 @@ async def ai_backtest_start(body: AiBacktestStartIn, session: AsyncSession = Dep
         min_consensus=body.minConsensus,
         position_step_pct=_resolve_position_step(body.positionStepPct, settings),
         base_rule=_resolve_base_rules(body.baseRules, settings),
-        profit_rule=_resolve_backtest_profit_guard(body.profitGuard, settings))
+        profit_rule=_resolve_backtest_profit_guard(body.profitGuard, settings),
+        horizon_rule=_resolve_backtest_horizon(body.tradingHorizon, settings, bar=body.bar))
     try:
         job = await get_ai_backtest_manager().start(req)
     except AiBacktestError as exc:

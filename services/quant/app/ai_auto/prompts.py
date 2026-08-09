@@ -75,7 +75,8 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
                                  profit_guard_text: str = "",
                                  sizing_text: str = "",
                                  tactical_bars_text: str = "",
-                                 cost_text: str = "") -> str:
+                                 cost_text: str = "",
+                                 horizon_text: str = "") -> str:
     """决策者系统 prompt：信号仅供参考 + 分步思维链纪律 + 风险偏好 + 只用真数据 + 收尾必调决策工具。
 
     `position_step_pct`（默认 0.0 → 连续、原文逐字不变、零回归）：当 `>0` 时把决策纪律 #3 的
@@ -105,13 +106,18 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
     `cost_text`（末位，默认 `""` → 逐字节回退，cost-truth-and-net-pnl D-4）：交易成本宪章章，**置于
     `sizing_text` 之后**——四段顺序即「在哪开 → 何时锁 → 下多大注 → 每笔要付多少」。
 
+    `horizon_text`（末位，默认 `""` → 逐字节回退，ai-trade-holding-horizon-modes §2.9）：交易周期
+    模式宪章章，**置于 `cost_text` 之后**——五段顺序即「在哪开 → 何时锁 → 下多大注 → 每笔要付多少
+    → 应该持有多久」。它必须排在成本之后：只有先知道一次往返要付多少，「不要为了一个还没覆盖手续费
+    的浮盈去付两笔手续费」这句话才成立。
+
     `tactical_bars_text`（末位，默认 `""` → 渲染逐字节不变、零回归，ai-trade-wake-aware-context §2.8）：
     本会话实际注入的战术周期串（`"5m → 1m"`）。非空时在决策纪律 #1 的中线背景子句之后**插入**一句
     择时核对指令——「说的」与「给的」必须是同一批周期，故取值只能来自 `WakeRuntime` 的同一个真源。
     """
     charter = "".join(
         f"{text}\n\n" for text in
-        (base_rules_text, profit_guard_text, sizing_text, cost_text) if text)
+        (base_rules_text, profit_guard_text, sizing_text, cost_text, horizon_text) if text)
     return (
         "你是一名严谨、纪律性极强的加密合约自动交易决策者。你不是聊天助手，也不是信号复读机——你的"
         f"**唯一职责**是在每个决策轮，为标的 {inst_id}（周期 {bar}）做出一个受严格约束的交易决策。"
@@ -557,6 +563,20 @@ def _format_sizing(plan: dict | None) -> str:
     return format_sizing_for_prompt(plan)
 
 
+def _format_horizon(wire: dict | None) -> str:
+    """交易周期模式的每轮只读上下文段（ai-trade-holding-horizon-modes §2.9）。
+
+    `payload["tradingHorizon"]` **键缺失**（契约未装配 / 老回测 payload 不带）⇒ 返回空串 ⇒ 整段省略
+    ⇒ 既有决策 prompt 冻结断言逐字节不变。渲染委托 `hold_horizon_text` 纯核心——门禁、轨迹、prompt
+    三者共用同一份快照，绝不在此重算任何一个数。
+    """
+    if not wire:
+        return ""
+    from .hold_horizon_text import format_horizon_for_prompt   # 延迟导入，同 _format_base_rules
+
+    return format_horizon_for_prompt(wire)
+
+
 def _format_profit_hold_note(payload: dict) -> str:
     """盈利持仓自察段（§2.6 c / F3）：`profitHoldRounds` 键缺失即整段省略（会话侧按阈值决定注入）。"""
     rounds = payload.get("profitHoldRounds")
@@ -595,6 +615,11 @@ def build_decision_prompt(payload: dict) -> str:
     cost_line = _format_cost(payload.get("costAwareness"))
     if cost_line:                            # 成本**先于**盈亏：模型要先知道成本才能正确解读那个数字
         parts.append(cost_line)
+    horizon_line = _format_horizon(payload.get("tradingHorizon"))
+    if horizon_line:                         # 键缺失 ⇒ 整段省略（契约未装配 / 老回测 payload）
+        # 紧随成本之后、与系统 prompt 的五段宪章同序：换手迟滞是一个「浮盈够不够盖住成本」的判据，
+        # 把它放在成本读数旁边，模型才不必跨段回忆那个 bps。
+        parts.append(horizon_line)
     parts.append(
         f"会话累计盈亏≈{payload.get('sessionPnlUsd')} USDT / 预算 {payload.get('budgetUsd')} USDT；"
         f"会话止盈阈值={'不触发' if tp is None else tp}，止损阈值={'不触发' if sl is None else sl}")
@@ -662,13 +687,17 @@ REFLECTION_TOOL_DESCRIPTION = (
 )
 
 
-def build_reflection_system_prompt() -> str:
+def build_reflection_system_prompt(horizon_text: str = "") -> str:
     """反思复核官系统 prompt：分级复核标准（有名有姓才否决，收缩优先），只可收紧，收尾必调反思工具。
 
     hold-inertia-fix F1：删除「任何不放心即 abort（宁可错过不可做错）」的不对称保守标准——它把 abort
     设成默认答案（历史样本 7/7 全否决），是「永不开单」因果链的根因 ①。替换为分级复核标准（默认
     confirm / 收缩优先 / abort 须指名实质性缺陷 / 机会成本对称）；确定性安全层（apply_reflection、
     只能收紧、fail-closed）逐字不变。
+
+    `horizon_text`（默认 `""` → 逐字节回退，holding-horizon §2.9 c）：持仓周期模式的补充段，**追加
+    而非替换**既有的「`close` 是风险收敛动作」一句——那句仍然成立，本段补的是它缺失的对称性：
+    「过早的 `close`」与「该平不平」是两种同样真实的错误。
     """
     return (
         "你是一名独立的下单前风控复核官。刚才另一名交易员基于同样的证据给出了一个**交易决策**（会真实"
@@ -688,6 +717,7 @@ def build_reflection_system_prompt() -> str:
         "须有极强理由。\n"
         "你**只能**收紧（否决或调小仓位），**无权**放大仓位或改变方向。"
         "收尾必须且只能调用一次 `submit_trade_reflection` 提交裁决——绝不允许只输出复核文字而不调用工具。"
+        f"{horizon_text}"
     )
 
 
