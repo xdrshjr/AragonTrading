@@ -264,8 +264,15 @@ class OKXRestClient:
         下每分钟至多一次公共请求，配额压力可忽略。
 
         Returns:
-            ``{"fundingRate", "fundingTs", "nextFundingTs", "intervalS"}``；该标的无资金费率
-            （非永续）或返回为空时 ``None``。``intervalS`` 由两个结算时点相减得出，缺失回落 8h。
+            ``{"fundingRate", "fundingTs", "nextFundingTs", "intervalS", "intervalKnown"}``；该标的
+            无资金费率（非永续）或返回为空时 ``None``。``intervalS`` 由两个结算时点相减得出，缺失
+            回落 8h；``intervalKnown`` 则如实说出**这个数到底是不是交易所给的**
+            （ai-trade-horizon-acceptance-loop [P0-1]）。
+
+        为什么必须多一个布尔键：``intervalS`` 有兜底值，因此它**永远表达不出「不知道」**——
+        ``interval_s <= 0`` 那种判据在生产里恒不成立，据它写的「取不到就不计提」分支是死码。
+        资金费账本（``ai_auto/funding_ledger.py``）只认 ``intervalKnown``；成本模型继续按既有的
+        8h 保守估算走，两层对同一个未知给出不同处置是有意的（spec §九 D-9）。
         """
         cached = self._funding_cache.get(inst_id)
         if cached and cached[0] > time.monotonic():
@@ -282,8 +289,52 @@ class OKXRestClient:
             "fundingTs": funding_ts,
             "nextFundingTs": next_ts,
             "intervalS": max(60.0, float(span)) if span > 0 else _DEFAULT_FUNDING_INTERVAL_S,
+            # 加法键：既有 `intervalS` 的兜底值**一字不改**（改它会连带改写 cost_model 的资金费期数
+            # 与 prompt 文案，越过「只加观测」的边界并打破 prompt 逐字节冻结）。
+            "intervalKnown": span > 0,
         }
         self._funding_cache[inst_id] = (time.monotonic() + _FUNDING_TTL_SECONDS, out)
+        return out
+
+    async def get_funding_rate_history(self, inst_id: str, *, before_ms: int | None = None,
+                                       after_ms: int | None = None,
+                                       limit: int = 100) -> list[dict]:
+        """永续**历史**资金费率（``GET /api/v5/public/funding-rate-history``，公共无签名）。
+
+        供 AI 回测按真实费率曲线计提资金费（ai-trade-horizon-acceptance-loop §2.2.4）：回测侧
+        ``SimBroker`` 全文没有任何资金费扣减路径，``trend_hold``（1–3 天，跨 3～9 个结算点）下这会
+        让回测系统性优于实盘，而那正是 L1 放行门槛所依赖的那份回测。
+
+        与 ``get_funding_rate`` 同姿态（同一个 ``_request``、同样的公共端点、同样不缓存整段曲线——
+        曲线由调用方一次性取完后自己持有）。**不做任何平铺假设**：历史数据自带每一次真实结算时刻，
+        相邻两点之差即该期的真实周期（OKX 会动态改成 1/2/4/8h）。
+
+        Args:
+            inst_id: 永续合约 instId。
+            before_ms: 只取该毫秒时间戳**之后**的记录（OKX ``before`` 语义）。
+            after_ms: 只取该毫秒时间戳**之前**的记录（OKX ``after`` 语义，用于向更早翻页）。
+            limit: 单页条数（OKX 上限 100）。
+
+        Returns:
+            ``[{"fundingTs": 秒, "fundingRate": float, "realizedRate": float | None}, …]``，
+            **按 ts 升序**（OKX 原样返回是倒序）。取不到即空列表。
+        """
+        params: dict = {"instId": inst_id, "limit": str(int(limit))}
+        if before_ms is not None:
+            params["before"] = str(int(before_ms))
+        if after_ms is not None:
+            params["after"] = str(int(after_ms))
+        rows = await self._request("/api/v5/public/funding-rate-history", params)
+        out: list[dict] = []
+        for row in rows or []:
+            ts = int(_optional_float(row.get("fundingTime")) or 0.0) // 1000
+            if ts <= 0:
+                continue
+            realized = _optional_float(row.get("realizedRate"))
+            out.append({"fundingTs": ts,
+                        "fundingRate": _optional_float(row.get("fundingRate")) or 0.0,
+                        "realizedRate": realized})
+        out.sort(key=lambda r: r["fundingTs"])
         return out
 
 

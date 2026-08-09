@@ -1,7 +1,14 @@
 // AI 回测结果面板组件（ai-auto-trading-backtest-analytics §2.5）：KPI 概览 / 扩展指标网格 / 基准对比。
 // 抽到 sibling 文件避免 AiBacktestModal.tsx 破 800 行阈值（P1-5）；各组件 ≤50 行、复用设计 token。
+import ExitSourceCard from "@/components/Agent/aiTradeStats/ExitSourceCard";
+import HorizonAcceptanceCard from "@/components/Agent/aiTradeStats/HorizonAcceptanceCard";
+import { turnoverVetoLine } from "@/lib/aiTradeHorizon";
 import { fmtDuration } from "@/lib/backtestStats";
-import type { AiBacktestBenchmark, AiBacktestExtendedMetrics } from "@/lib/aiBacktestTypes";
+import type {
+  AiBacktestAiStats,
+  AiBacktestBenchmark,
+  AiBacktestExtendedMetrics,
+} from "@/lib/aiBacktestTypes";
 import { colorForReturn, fmtMoney, fmtNum, fmtPct } from "@/lib/format";
 import type { Metrics } from "@/lib/types";
 
@@ -160,6 +167,77 @@ export function ProfitGuardBacktestCard({ enabled, exits }: { enabled?: boolean;
         故回测的保护触发次数与落袋结果<strong className="text-[var(--text)]">相对实盘偏保守</strong>，
         不得据此推断实盘一定更好或更差。
       </p>
+    </div>
+  );
+}
+
+// 回测的资金费口径免责（horizon-acceptance §2.2.4 第 4/5 点）：与后端 `_funding_notes` 同向。
+// **必须显示**——回测资金费不进权益曲线，用户会同时看到两个「收益」数字；不写清楚就是误导（R-5）。
+const FUNDING_BACKTEST_CAVEATS = [
+  "资金费按交易所历史费率曲线逐结算点计提，但未计入权益曲线与上方 metrics",
+  "「资金费后净收益」是本卡自带的一次显式减法：= 净额 − 资金费",
+  "取不到历史费率曲线时该行按「口径不可得」呈现，绝不按 0 计",
+  "回测里给换手迟滞与 edge 门禁用的成本估算仍不含资金费（实盘含），此不对称留待下一轮重估",
+];
+
+/**
+ * 回测结果面板的周期验收区（horizon-acceptance §2.5 落点之三）。
+ *
+ * 与运行期看板 / 历史详情**共用同一对组件、同一份 props 类型**——形状本来就同源，任何一处分叉
+ * 都会立刻在 tsc 上报错。两卡是两个独立入参：未装配周期契约的对照回测上 `horizonAcceptance`
+ * 为 null，而退出来源卡照常渲染（[P0-4]）。两卡都缺 ⇒ 整段不出现。
+ */
+export function AcceptanceBacktestSection({ aiStats }: { aiStats: AiBacktestAiStats }) {
+  const card = aiStats.horizonAcceptance;
+  const exits = aiStats.exits;
+  if (!card && !exits) return null;
+  return (
+    <section className="flex flex-col gap-2" data-testid="bt-acceptance-section">
+      <HorizonAcceptanceCard acceptance={card} />
+      <ExitSourceCard exits={exits} />
+      <TurnoverBacktestCard horizon={aiStats.horizon} />
+      {card ? (
+        <ul className="flex flex-col gap-0.5 rounded-[12px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-[10px] leading-relaxed text-[var(--muted)]">
+          {FUNDING_BACKTEST_CAVEATS.map((line) => (
+            <li key={line}>· {line}</li>
+          ))}
+        </ul>
+      ) : null}
+    </section>
+  );
+}
+
+// 换手纪律的回测口径免责（turnover-budget §2.4.4）：与后端 `_turnover_backtest_notes` 同向。
+// 第二句尤其重要——回测**没有交易所**，用户不能拿这份结论去为「兜底真的挂着」背书。
+const TURNOVER_BACKTEST_CAVEATS = [
+  "回测按根推进，再入场冷却的实际生效粒度是 ceil(冷却秒数 / 一根)；冷却短于一根 K 线时回测中恒不生效",
+  "回测不装配交易所侧兜底核实（回测没有交易所），覆盖闸恒放行——本次结论不覆盖这一轴",
+  "被换手闸拦下的反手会降级为平仓（退出腿保留、再入场腿否掉），故这类退出在退出来源分布里记为「Agent 主动平仓」而非「Agent 反手」",
+];
+
+/**
+ * 换手纪律的两个拦截计数（turnover-budget §2.4.4）。
+ *
+ * `budgetVetoes` 是本轮最有信息量的新读数：**「模型想换手而被制度拦住」的次数**。它极高（例如
+ * 超过每日往返数的 3 倍）说明模型持续想换手而被压着——那时正确的动作是**换一个更短的周期模式**，
+ * 而不是调大预算；调大预算等于把用户自己选的周期契约悄悄改掉。
+ *
+ * 未装配（老回测 / 回测侧总闸关）⇒ 三个计数缺席 ⇒ **整块不渲染**（绝不挂一排 0）。
+ */
+function TurnoverBacktestCard({ horizon }: { horizon?: AiBacktestAiStats["horizon"] }) {
+  const line = turnoverVetoLine(horizon ?? null);
+  if (!line) return null;
+  return (
+    <div
+      className="flex flex-col gap-1 rounded-[12px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2"
+      data-testid="bt-turnover-card"
+    >
+      <span className="text-[11px] text-[var(--text)]">{line}</span>
+      <ul className="flex flex-col gap-0.5 text-[10px] leading-relaxed text-[var(--muted)]">
+        {TURNOVER_BACKTEST_CAVEATS.map((item) => (
+          <li key={item}>· {item}</li>
+        ))}
+      </ul>
     </div>
   );
 }

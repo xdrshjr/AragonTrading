@@ -329,6 +329,13 @@ export interface AiTradeHorizonRule {
   confirmWindowSeconds?: number | null;
   expectedHoldBars?: number | null;
   gateReverse?: boolean | null;
+  // ---- 开仓侧换手纪律（turnover-budget §4.2）----
+  // 入参：`null` ⇒ 按契约派生；`0` ⇒ **显式关闭**该闸（不是「无限长 / 无限多」）。
+  reentryCooldownSeconds?: number | null;
+  turnoverBudgetPerDay?: number | null;
+  // 以下两键**仅出现在回执镜像里**（服务端派生后的实际值）：只回显入参等于把派生关系藏起来。
+  reentryScope?: "same_side" | "both" | null;
+  turnoverBudgetCapacity?: number | null;
 }
 
 // `GET /ai-trade/horizon-profiles` 的单个预设条目。**除三个字符串外全部可空**（[P1-8]）：`custom`
@@ -348,6 +355,12 @@ export interface AiTradeHorizonProfile {
   expectedHoldBars?: number | null;      // 按该条目自带 bar 的**预览值**；实际按用户所选 bar 现算
   confirmWindowSeconds?: number | null;  // 同上
   leverageMaxHint?: number | null;
+  // 验收门槛预览（horizon-acceptance §4.1）：全部由后端现算下发，前端不复制任何一个数。
+  acceptance?: AiTradeAcceptanceThresholds | null;
+  // 开仓侧换手纪律的三个**预览**值（turnover-budget §4.1）；`custom` 恒为 null。
+  reentryCooldownSeconds?: number | null;
+  turnoverBudgetPerDay?: number | null;
+  turnoverBudgetCapacity?: number | null;
 }
 
 export interface AiTradeHorizonProfilesResponse {
@@ -356,7 +369,57 @@ export interface AiTradeHorizonProfilesResponse {
   estimatedCostBps?: number | null;      // 按配置常数估的往返成本（非实时盘口，UI 须标「约」）
   lossReleaseFrac: number;               // 解除阈 = stopLossPct × leverage × frac（[P1-10] 现算）
   lossReleaseReturnPctFallback: number;  // 无交易所止损时的兜底解除阈
+  // 三个只读运维标志（turnover-budget §4.1 / [P2-4]）：弹窗那句「每 N 分钟核实一次」必须读
+  // `backstopPollSeconds`，**前端不得硬抄一个 2 分钟**——运维改了配置而文案不动，就又造出
+  // 一句没核实的话。
+  turnoverGateEnabled?: boolean;
+  backstopCheckEnabled?: boolean;
+  backstopPollSeconds?: number;
   profiles: AiTradeHorizonProfile[];
+}
+
+// ---- 开仓侧换手纪律与交易所侧兜底的运行期 wire（turnover-budget §5.4）----
+// 两者都挂在**运行期快照** `horizon` 下（不是契约 `tradingHorizon`）；未装配 ⇒ **整键缺席**。
+export interface AiTradeTurnoverWire {
+  cooldownActive: boolean;
+  cooldownRemainingSeconds?: number | null;   // 未激活 ⇒ null（**绝不用 0 冒充**）
+  cooldownSide?: "long" | "short" | null;
+  cooldownScope: "same_side" | "both";
+  cooldownSeconds?: number | null;
+  budgetEnabled: boolean;
+  // 恒 "session"：令牌桶是会话内存态、启动即满桶 ⇒ 停会话重开即回满（[P1-5] / D-13）。
+  // 三处文案（弹窗 / 卡片 / 验收自认）必须照此措辞，绝不写一句做不到的「每日」。
+  budgetScope: "session";
+  tokens?: number | null;
+  capacity?: number | null;
+  perDay?: number | null;
+  nextTokenSeconds?: number | null;           // null ⇒ 已有可用令牌
+  blocked: boolean;
+  reverseWouldDowngrade: boolean;             // 提议反手时再入场腿会被否、只执行平仓腿
+  gateSkipped?: string | null;                // 立场落在值域外时的如实记号（fail-open）
+  reentryVetoes: number;
+  budgetVetoes: number;
+  opensCounted: number;
+}
+
+export type AiTradeBackstopBasis = "exchange" | "local" | "unavailable";
+
+export interface AiTradeBackstopWire {
+  basis: AiTradeBackstopBasis;
+  unavailableReason?: string | null;
+  checkedAgoSeconds?: number | null;          // null ⇒ 从未核实
+  stopLossPx?: number | null;                 // **交易所读数**；未核实态恒 null
+  takeProfitPx?: number | null;
+  hasStop?: boolean | null;
+  coveredSz?: number | null;
+  positionSz?: number | null;
+  // **`null` 是合法值**＝「还不知道」，与 `0`＝「确认裸露」是两个结论（[P0-2] / D-14）：
+  // 前者一律灰色、G6 放行；只有后者与「有数且低于阈」才是确定的坏消息。
+  coverageRatio?: number | null;
+  orders?: number | null;
+  localStopLossPx?: number | null;            // 本地成交回执口径（**不是**交易所读数）
+  localTakeProfitPx?: number | null;
+  mismatch: boolean;                          // 本地声称有止损、交易所侧确认一条都没有
 }
 
 // 判定态：空仓 / 持仓中 / 限制已解除。
@@ -399,6 +462,12 @@ export interface AiTradeHorizonSnapshot {
   asOfWall: number;                      // 本快照采集时刻（[P1-7] 双快照契约的可验证凭据）
   exchangeStopLossPx?: number | null;
   exchangeTakeProfitPx?: number | null;
+  // 两个嵌套加法键（turnover-budget [P1-1] / D-10）：挂在**这里**而不是 `tradingHorizon`——
+  // 前者是运行期快照、后者是契约。嵌套即可自动搭上 payload / decision / status / trace 四条
+  // 既有载体（均为整对象透传），无需逐键补抄 reducer（`edgeSource` 那次的教训）。
+  // 未装配 / 总闸关 / 回测 ⇒ **整键缺席**（不是 null）。
+  turnover?: AiTradeTurnoverWire;
+  backstop?: AiTradeBackstopWire;
 }
 
 // 落库 `metricsJson.aiStats.horizon`（§2.12）；零样本时六个派生量为 **null 而非 0**（[P2-3]）。
@@ -418,12 +487,105 @@ export interface AiTradeHorizonStats {
   confirmWindowReleases: number;
   roundTrips: number;
   estimatedEpochs: number;
+  // 开仓侧换手纪律的三个只增计数（turnover-budget §4.3）。`budgetVetoes` 是「模型想换手而被制度
+  // 拦住」的次数——它比换手率本身更能说明周期模式是否与该标的、该行情匹配。
+  reentryVetoes?: number;
+  budgetVetoes?: number;
+  opensCounted?: number;
   avgHoldSeconds?: number | null;
   medianHoldSeconds?: number | null;
   minHoldObservedSeconds?: number | null;
   maxHoldObservedSeconds?: number | null;
   withinTargetRate?: number | null;
   turnoverPerDay?: number | null;
+}
+
+// ---- 持仓周期验收闭环（ai-trade-horizon-acceptance-loop）：四个 wire 类型与后端 schemas 逐字对齐 ----
+// 三条口径纪律（读点必须遵守，否则卡片会撒谎）：
+// 1. `value == null` 与 `value === 0` 是两个结论：前者「没算成」、后者是真实读数，绝不 `?? 0`；
+// 2. `verdict === "insufficient"` 永远不显示为绿色——它是「什么都还不知道」，不是「快通过了」；
+// 3. `exits` / `funding` 是**顶层键**，`acceptance` 为 null 时它们仍可非空（关掉周期模式跑对照臂
+//    是上线观察窗口的必要一臂，数据记了却看不到等于没记）。
+export type AiTradeAcceptanceVerdict = "pass" | "fail" | "insufficient";
+
+export interface AiTradeAcceptanceRow {
+  key: string;
+  label: string;
+  verdict: AiTradeAcceptanceVerdict;
+  value?: number | null;
+  unit: string;                 // seconds | ratio | count | usd
+  display: string;              // 后端渲染好的展示串（前端不复制任何格式化规则）
+  target: string;
+  note?: string | null;
+  inPositionValue?: number | null;  // 第 3 行的在场口径对照值
+  basis?: string | null;            // 第 5 行的资金费口径
+}
+
+export interface AiTradeExitSourceRow {
+  source: string;
+  count: number;
+  share?: number | null;
+  netUsd: number;
+  avgHoldSeconds?: number | null;
+  winRate?: number | null;      // 样本 < 5 ⇒ null ⇒ 显示「样本不足」，绝不用 2 笔冒充结论
+}
+
+export interface AiTradeExitMix {
+  totalExits: number;
+  bySource: AiTradeExitSourceRow[];
+}
+
+export interface AiTradeFundingStats {
+  enabled: boolean;
+  basis: string;                // settled+accrued | accrued | unavailable
+  accruedClosedUsd: number;
+  accruedOpenUsd?: number | null;
+  settledUsd?: number | null;
+  fundingCostUsd?: number | null;   // null=口径不可得，0=真的没跨过结算点（两个结论）
+  crossings: number;
+  intervalKnown: boolean;
+  intervalS?: number | null;    // intervalKnown=false ⇒ null（后端绝不下发兜底的 8h）
+  lastRateBps?: number | null;
+  staleTicks: number;
+  unknownIntervalTicks: number;
+  capHits: number;
+  settledTrusted: boolean;
+  note: string;
+}
+
+export interface AiTradeAcceptance {
+  profileId: string;
+  title: string;
+  verdict: AiTradeAcceptanceVerdict;
+  sampleFloor: number;
+  roundTrips: number;
+  truncatedSamples: number;
+  sampleNote: string;
+  rows: AiTradeAcceptanceRow[];
+  // 顶层同名键的镜像（同一对象）；前端一律读顶层，此处只供就近取数。
+  exitMix?: AiTradeExitMix | null;
+  funding?: AiTradeFundingStats | null;
+  diagnostics: string[];
+  // 多标的分组的成员级摘要（R-10）：合并只用于总判定，但「一个赚一个亏被平均成还行」是这张卡
+  // 最危险的读法。单标的分组 ⇒ 整键缺席。
+  bySymbol?: AiTradeAcceptanceSymbol[] | null;
+}
+
+export interface AiTradeAcceptanceSymbol {
+  instId: string;
+  roundTrips: number;
+  netPnlUsd: number;
+  verdict?: AiTradeAcceptanceVerdict | null;
+}
+
+// 弹窗的「验收门槛预览」（选模式那一刻就看见将被按什么标准判定）。
+export interface AiTradeAcceptanceThresholds {
+  sampleFloor: number;
+  minAvgHoldSeconds?: number | null;
+  minWithinTargetRate?: number | null;
+  maxTurnoverPerDay?: number | null;
+  maxFeeToGross: number;
+  requiresPositiveNetAfterFunding: boolean;
 }
 
 // 【基础策略】MA 通道开单约束（与后端 base_rules.MaBandRule 镜像；数值字段留空→服务端按 settings 回填）。
@@ -724,6 +886,12 @@ export interface AiTradeSessionRow {
   // 进 `m.session`，**类型里没有这个键则面板取不到**（tsc 报错而非静默丢数据，但极易被「后端已下发」
   // 骗过去）。未装配 / 老后端 ⇒ undefined 或 null ⇒ chip 整段不渲染。
   horizon?: AiTradeHorizonSnapshot | null;
+  // 验收闭环三键（horizon-acceptance [P0-3] 成员级实时通路）：status 事件经
+  // `patchAiTradeMemberStatus` **整体 spread** 合并进 `m.session`，故运行期数据本来就在——
+  // 漏的只是类型声明。未装配 / 零样本 ⇒ null ⇒ 卡片整段不渲染。
+  acceptance?: AiTradeAcceptance | null;
+  exits?: AiTradeExitMix | null;
+  funding?: AiTradeFundingStats | null;
 }
 
 // WS status 事件负载（_status_payload / 轻量 status，会话视图的可增量合并子集）。
@@ -755,6 +923,10 @@ export interface AiTradeStatusEvent {
   // 持仓周期快照（holding-horizon §4.4）：每次 status 事件随附，供面板 chip 在无决策事件时也能更新
   // 倒计时；未装配 ⇒ null。
   horizon?: AiTradeHorizonSnapshot | null;
+  // 验收闭环三键（成员级口径）：随每次 status 事件下发，是运行期卡片的**主通路**。
+  acceptance?: AiTradeAcceptance | null;
+  exits?: AiTradeExitMix | null;
+  funding?: AiTradeFundingStats | null;
 }
 
 export interface AiTradeStartReq {
@@ -862,6 +1034,10 @@ export interface AiTradeGroupRow {
   // 交易周期模式回执镜像（null=未装配）：**服务端解析后的生效值** + 两个派生量
   // （expectedHoldBars / confirmWindowSeconds），使「弹窗预览 == 落地」可逐字段核对。
   tradingHorizon?: AiTradeHorizonRule | null;
+  // 验收闭环三键的**分组合并口径**（后端 `merge_inputs` 后判定一次）：由 15s 轮询消费。
+  acceptance?: AiTradeAcceptance | null;
+  exits?: AiTradeExitMix | null;
+  funding?: AiTradeFundingStats | null;
 }
 
 export type AiTradeGroupStartResult = AiTradeGroupRow;
@@ -912,6 +1088,12 @@ export interface AiTradeGroupState {
   contextRefreshRounds: number;
   wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭，面板显示）
   tradingHorizon?: AiTradeHorizonRule | null;   // 分组共享的周期契约（R-12：模式是会话级契约）
+  // 验收闭环三键（分组合并口径）：由 `patchAiTradeGroupAcceptance` 窄 action 补丁写入——
+  // **绝不**走 `setAiTradeGroup(groupStateFromStatus(...))`，那条映射写死 `trades: []`，
+  // 每轮询一次就会把成交流清空一次（[P0-3] 要防的正是这个坑）。
+  acceptance?: AiTradeAcceptance | null;
+  exits?: AiTradeExitMix | null;
+  funding?: AiTradeFundingStats | null;
   state: "running" | "stopped";
   startedTs: number;
   members: Record<string, AiTradeGroupMemberState>;

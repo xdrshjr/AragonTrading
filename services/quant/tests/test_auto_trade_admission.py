@@ -54,6 +54,11 @@ class _FakeAiSession:
     def info(self):
         return {"sessionId": self.session_id, "state": self.state}
 
+    def acceptance_bundle(self):
+        """验收闭环四键的会话桩（horizon-acceptance）：无成交样本 ⇒ 四键恒 None。"""
+        return {"acceptance": None, "exits": None, "funding": None,
+                "acceptanceInput": None}
+
 
 class _FakeLiveSession:
     def __init__(self, session_id, run_id, strategy, inst_id, bar, executor, **kw):

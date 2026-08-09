@@ -21,10 +21,11 @@ from .attribution import AttributionLedger
 from .cost_model import (CostBreakdown, estimate_round_trip_cost, query_for_decision,
                         query_for_preview, resolve_cost_params)
 from .cost_text import format_cost_charter
-from .cost_view import build_cost_view
+from .cost_view import build_cost_view, funding_accrued_view
 from .edge_gate import EdgeGateOutcome, evaluate_edge_gate
 from .fee_rates import FeeRateCache, snapshot_from_wire
 from .funding import FundingCache
+from .funding_ledger import FundingLedger
 from .reconcile import (build_reconciliation, drift_message, local_net_view,
                         resolve_reconcile_params)
 from .stats_ext import build_cost_stats, cost_snapshot_wire, merge_cost_stats
@@ -58,11 +59,23 @@ class CostRuntime:
         self.allow_limit = bool(allow_limit)
         # 轴 D 让 prompt 消费成本读数后，`k_min = 0`（默认）下资金费率**已有消费方**，故构造条件
         # 由「门禁生效」放宽为「门禁生效 或 成本意识开启」（B-6：不是推翻 I-2，而是消费方真的出现了）。
+        # [P1-7] 资金费账本（轴 A）是资金费率快照的**第三个**消费方，故它的总闸必须并进这条析取
+        # 式——否则运维把 `ai_trade_cost_awareness_enabled` 关掉，就会把资金费的数据源一起静默
+        # 关死，而验收卡只会显示「口径不可得」、说不出是被谁关的。
         self.funding = FundingCache(
             inst_id, ttl_s=settings.ai_trade_funding_poll_ttl_s,
             enabled=bool(settings.ai_trade_funding_enabled)
             and (float(settings.ai_trade_edge_gate_k_min) > 0
-                 or bool(settings.ai_trade_cost_awareness_enabled)))
+                 or bool(settings.ai_trade_cost_awareness_enabled)
+                 or bool(settings.ai_trade_funding_ledger_enabled)))
+        # 轴 A：会话级资金费账本。住在本层而不是会话里——`FundingCache` / `AttributionLedger` /
+        # `last_reconcile` 这三个输入本来就都在这一层汇合，且 `session.py` 已 1727 行。
+        self.funding_ledger = FundingLedger(
+            enabled=bool(settings.ai_trade_funding_enabled)
+            and bool(settings.ai_trade_funding_ledger_enabled),
+            ct_val=getattr(fee_ledger, "ct_val", 0.0),
+            min_interval_s=float(settings.ai_trade_funding_min_interval_s),
+            max_interval_s=float(settings.ai_trade_funding_max_interval_s))
         # 轴 A：官方费率档位缓存。启动期预取（`manager._gather_context`）的那份直接播种，避免会话
         # 起来 5s 后立刻再发一次同样的请求。
         self.fee_rates = FeeRateCache(
@@ -90,7 +103,8 @@ class CostRuntime:
 
     # ---------- 盯市 tick（唯一的网络 IO 落点；决策轮内零 IO）----------
     def schedule_maintenance(self, now_wall: float, *, window_start_ts: int,
-                             trades: list[dict], push=None) -> None:
+                             trades: list[dict], push=None,
+                             mark_px: float | None = None) -> None:
         """把成本层的三条网络刷新排进**后台任务**；本函数是同步的，绝不阻塞 5s 盯市 tick。
 
         阶段一只有资金费率一条 IO 且默认关（`k_min=0`），故它当年直接 await 在 tick 上是安全的。
@@ -100,7 +114,15 @@ class CostRuntime:
         **网络刷新一律离开 tick 的关键路径**。
 
         单飞保护：上一批还在途就直接跳过本轮，绝不堆积任务（慢链路下否则会无界增长）。
+
+        `mark_px`（轴 A）：资金费计提在**排后台任务之前同步**跑一次——它是纯算、零 IO，放进后台
+        批次就会被那个 30s 总上界连坐（整批超时即被丢弃），而计提丢一次就是永久少记一个结算点。
+        调用方**恒传 `self._current_px()`**：会话内「判定价」只能有一个答案，`_latest_mark_px()`
+        的兜底分支会回落 `entry_price`，拿它算名义额等于悄悄按开仓价计（P2-4）。
+        未传 ⇒ 本轮不计提且不抛（既有调用点零回归，W-8）。
         """
+        self.funding_ledger.accrue(self.funding.snapshot(now_wall),
+                                   now_wall=now_wall, mark_px=mark_px)
         if self._maintenance is not None and not self._maintenance.done():
             return
         self._maintenance = asyncio.create_task(
@@ -324,12 +346,17 @@ class CostRuntime:
         cost = self.estimate_preview_cost(ord_type=ord_type, side=side, bar_seconds=bar_seconds)
         if cost is None:
             return None
-        return build_cost_view(
+        view = build_cost_view(
             cost, fee_snapshot=self.fee_rates.snapshot(), ord_type=ord_type, side=side,
             position=position, last_px=last_px, atr_px=atr_px,
             session_fee_usd=(self.fee_ledger.session_fee_usd
                              if self.fee_ledger is not None else None),
             net_basis=bool(self.settings.ai_trade_net_pnl_enabled))
+        # 轴 A 披露（§2.2.5）：未装配 / 空仓 / 账本关 ⇒ **整键缺席** ⇒ prompt 整段省略、逐字节回退。
+        accrued = funding_accrued_view(self.funding_stats(), position)
+        if accrued is not None:
+            view["fundingAccrued"] = accrued
+        return view
 
     def inject(self, payload: dict, *, last_px: float | None, atr_px: float | None,
                bar_seconds: int) -> None:
@@ -438,9 +465,46 @@ class CostRuntime:
         """记一个决策轮及其是否落到成交（决策转化率，§6.3）。"""
         self.attribution.note_round(executed)
 
+    def note_open(self, trade: dict, *, seq: int, now_wall: float) -> None:
+        """记一笔开仓成交（轴 A：建 / 续资金费 epoch，身份 `(side, seq)` 与 horizon 同源）。"""
+        self.funding_ledger.note_open(trade, seq=seq, now_wall=now_wall)
+
     def record_close(self, trade: dict) -> None:
         """记一笔平仓成交（`session._dispatch` 是全部 executor 事件的唯一收口）。"""
         self.attribution.record_close(trade)
+        self.funding_ledger.note_close(trade, time.time())
+
+    # ---------- 轴 A：资金费账本的只读出口 ----------
+    def funding_stats(self) -> dict | None:
+        """`aiStats.funding` / `status.funding` 共用的只读 wire；账本未启用 ⇒ `None`。"""
+        settled, reason = self._settled_funding_usd()
+        return self.funding_ledger.stats(settled_usd=settled, unavailable_reason=reason)
+
+    def _settled_funding_usd(self) -> tuple[float | None, str | None]:
+        """交易所结算口径的资金费合计 + **不可得时是哪一道门没过**（[P1-7] / P2-6）。
+
+        三道门任一不满足 ⇒ `(None, 原因)` ⇒ 账本退回 `accrued` 并在 note 里说清楚。绝不让运维
+        在一个恒 `accrued` 的会话上去比对 L2 的「实盘 vs 回测 netAfterFunding 差异」。
+        """
+        if not self.settings.ai_trade_reconcile_enabled:
+            return None, "disabled"
+        if self.creds is None:
+            return None, "no_creds"
+        rec = self.last_reconcile
+        if not rec:
+            return None, "not_run"
+        if rec.get("status") not in ("ok", "drift", "partial") or rec.get("coverageMismatch"):
+            return None, "untrusted"
+        # `_fetch_position_history` 取 limit=100 且**无分页**：样本触顶即视为可能被截断，绝不拿
+        # 一份被截断的合计当权威值（P2-6）。
+        if int(rec.get("samples") or 0) >= 100:
+            return None, "truncated"
+        funding = rec.get("exchangeFundingFeeUsd")
+        return (None, "untrusted") if funding is None else (float(funding), None)
+
+    def lifetime_cost(self) -> dict:
+        """全程累计的成本四项（周期验收卡的唯一成本入口，[P1-1]）。"""
+        return self.attribution.lifetime_cost()
 
     def apply_explain_meta(self, meta: dict, trade: dict) -> None:
         """把成交的费率 / 滑点键搬进 `explain.meta`；A0-1 关闭 ⇒ 空转 ⇒ meta 逐字回退。"""

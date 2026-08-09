@@ -691,12 +691,18 @@ def _normalize_algo_order(r: dict) -> list[dict]:
 
     一条策略委托可同时含 ``tpTriggerPx`` 与 ``slTriggerPx``（OCO），分别展开为 ``tp`` / ``sl`` 两条
     归一记录并共享 ``algoId``；只含其一则产出一条（不依赖 ordType 名，对 oco/conditional 命名稳健）。
+
+    ``closeFraction`` 是**纯加法**的一个新键（ai-trade-turnover-budget-and-backstop [P0-2]）：随单
+    TP/SL 转成的算法委托常见形态是 ``sz`` 为 0 / 缺省、靠 ``closeFraction="1"`` 表示「全仓」，只看
+    ``sz`` 会把覆盖率恒判成 0 ⇒ 对模型误报「此刻没有任何持久化兜底」。既有键一个不动、既有调用方
+    （委托页签 / 图表虚线 / 持仓子行）读的都是具名键，故加键零影响（R-11）。
     """
     base = {
         "instId": str(r.get("instId") or ""),
         "posSide": str(r.get("posSide") or "net"),
         "side": str(r.get("side") or ""),
         "sz": _optional_float(r.get("sz")),
+        "closeFraction": str(r.get("closeFraction") or "") or None,
         "state": str(r.get("state") or ""),
         "reduceOnly": _as_bool(r.get("reduceOnly")),
         "ordId": None,

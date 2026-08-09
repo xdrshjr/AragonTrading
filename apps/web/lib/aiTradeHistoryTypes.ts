@@ -1,7 +1,12 @@
 // AI 自动交易统计历史 wire 类型（ai-trade-stats-dashboard §3.8）：与后端 schemas.AiTradeHistory* 逐字对齐。
 // 皆为组件 / lib 局部类型，不入 store（历史走 TanStack Query，不持久化）。时间戳全为秒（§6.2 / P2-8）。
 import type { FeeRatesWire, ReconcileWire } from "./aiTradeCost";
-import type { AiTradeHorizonStats } from "./aiTradeTypes";
+import type {
+  AiTradeAcceptance,
+  AiTradeExitMix,
+  AiTradeFundingStats,
+  AiTradeHorizonStats,
+} from "./aiTradeTypes";
 import type { Trade } from "./types";
 
 // 历史会话列表单行 KPI（后端逐成员配对聚合；口径同 autoTradePnl.summarizeRoundTrips）。
@@ -53,6 +58,12 @@ export interface AiTradeHistorySummary {
   feeUsd?: number;
   grossPnlUsd?: number;
   costBasisMixed?: boolean;
+  // 周期验收闭环（horizon-acceptance [P1-9]）：**后端合并各成员 run 的原始计数器后判定一次**，
+  // 故这里恒是**一张**组级卡而不是 N 张（比例类指标不可在前端平均）。任一成员缺
+  // `acceptanceInput`（本特性上线前的老记录）⇒ 两键缺席 ⇒ 整卡不渲染。
+  horizonAcceptance?: AiTradeAcceptance | null;
+  exits?: AiTradeExitMix | null;
+  funding?: AiTradeFundingStats | null;
 }
 
 // metrics_json 解析（全可选，缺失即优雅降级——崩溃 / 对账会话没有富化字段）。
@@ -106,6 +117,13 @@ export interface AiTradeRunMetrics {
     // 零样本时六个派生量为 **null 而非 0**（[P2-3]：「目标区间内占比 0%」与「还没有样本」是两个
     // 截然不同的结论）。
     horizon?: AiTradeHorizonStats;
+    // 持仓周期验收闭环（horizon-acceptance §5.3）：单 run 口径的卡片 + 退出分布 + 资金费，
+    // 外加 `acceptanceInput`（**原始计数器**）——后者是分组历史在后端合并成一张卡的唯一输入，
+    // 老记录缺它 ⇒ 组级卡整键缺席（绝不用半组数据冒充整组结论，[P1-9]）。
+    horizonAcceptance?: AiTradeAcceptance | null;
+    exits?: AiTradeExitMix | null;
+    funding?: AiTradeFundingStats | null;
+    acceptanceInput?: Record<string, unknown> | null;
   };
 }
 

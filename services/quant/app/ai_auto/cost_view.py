@@ -40,6 +40,34 @@ def break_even_wire(position: dict | None, total_bps: float,
     return {"breakEvenPx": round(px, 8), "breakEvenGapPct": gap}
 
 
+def funding_accrued_view(funding_stats: dict | None,
+                         position: dict | None) -> dict | None:
+    """本仓**已实际计提**的资金费只读键（horizon-acceptance §2.2.5）。
+
+    与 `fundingCarryBps`（成本模型对未来的**预估**）刻意分开：那是「按目标持仓预计要付多少」，
+    这是「这一仓到现在真的已经付了多少」。两者混成一个数会让模型分不清预估与实付。
+
+    未装配账本 / 账本关 / 无持仓 / 本仓尚无计提读数 ⇒ **返回 `None` ⇒ 调用方让整键缺席** ⇒
+    渲染管线整段省略 ⇒ prompt 逐字节回退（G-1 冻结断言可证）。
+
+    **刻意不作为 `build_cost_view` 的第 10 个形参**：那个函数已远超 CLAUDE.md 的「形参 ≤5」，
+    继续堆参只会更偏离；本层是纯装配，由 `CostRuntime` 在同一处把两块拼起来。
+    """
+    if not funding_stats or not funding_stats.get("enabled"):
+        return None
+    if (position or {}).get("side") not in ("long", "short"):
+        return None
+    open_usd = funding_stats.get("accruedOpenUsd")
+    if open_usd is None:
+        return None
+    return {"accruedOpenUsd": open_usd,
+            "crossings": funding_stats.get("crossings"),
+            "intervalS": funding_stats.get("intervalS"),
+            "intervalKnown": funding_stats.get("intervalKnown"),
+            "lastRateBps": funding_stats.get("lastRateBps"),
+            "basis": funding_stats.get("basis")}
+
+
 def build_cost_view(cost: CostBreakdown, *, fee_snapshot, ord_type: str, side: str,
                     position: dict | None, last_px: float | None, atr_px: float | None,
                     session_fee_usd: float | None, net_basis: bool) -> dict:

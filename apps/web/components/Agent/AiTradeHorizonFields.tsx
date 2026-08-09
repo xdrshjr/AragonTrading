@@ -1,12 +1,14 @@
 "use client";
 
 import { useMemo } from "react";
+import { formatSeconds as formatHoldDuration } from "@/lib/aiTradeAcceptance";
 import {
   horizonCoherenceHints,
   horizonContractLines,
   type HorizonContractLine,
 } from "@/lib/aiTradeHorizon";
 import type {
+  AiTradeAcceptanceThresholds,
   AiTradeHorizonProfile,
   AiTradeHorizonProfileId,
   AiTradeHorizonProfilesResponse,
@@ -73,6 +75,7 @@ export default function AiTradeHorizonFields(props: AiTradeHorizonFieldsProps) {
             estimatedCostBps: data.estimatedCostBps ?? null,
             lossReleaseFrac: data.lossReleaseFrac,
             lossReleaseFallbackPct: data.lossReleaseReturnPctFallback,
+            turnoverGateEnabled: data.turnoverGateEnabled,
           }),
     [data, active, props.bar, props.leverage, props.stopLossPct, props.defaultStopLossPct],
   );
@@ -123,6 +126,12 @@ export default function AiTradeHorizonFields(props: AiTradeHorizonFieldsProps) {
             onSelect={props.onProfileChange}
           />
           <ContractSummary lines={lines} />
+          <AcceptancePreview
+            acceptance={active?.acceptance ?? null}
+            turnoverGateArmed={data.turnoverGateEnabled !== false
+              && (active?.turnoverBudgetPerDay ?? 0) > 0}
+          />
+          <BackstopNotice profile={active} response={data} />
           {active?.bar == null && (
             <CustomFields custom={props.custom} onChange={props.onCustomChange} disabled={disabled} />
           )}
@@ -277,6 +286,119 @@ function ContractSummary({ lines }: { lines: HorizonContractLine[] }) {
         不受本层影响；上述所有限制也不影响交易所侧止损止盈与会话级止盈止损。
       </p>
     </div>
+  );
+}
+
+/**
+ * 验收门槛预览（ai-trade-horizon-acceptance-loop §4.1）。
+ *
+ * 让用户在**选模式那一刻**就看见「这套配置将按什么标准被判定」，而不是跑完一周才发现门槛是什么。
+ * 数值全部由 `GET /ai-trade/horizon-profiles` 现算下发（与会话跑起来后真正据以判定的是同一处
+ * `resolve_thresholds`），本组件**不做任何计算**——前端自己乘一遍就会与后端判定分叉。
+ *
+ * `custom` 未填目标区间 ⇒ 派生阈为 null ⇒ 如实说「按你填的目标区间派生」，绝不编一个数。
+ */
+function AcceptancePreview({
+  acceptance,
+  turnoverGateArmed,
+}: {
+  acceptance: AiTradeAcceptanceThresholds | null;
+  turnoverGateArmed: boolean;
+}) {
+  if (!acceptance) return null;
+  const minAvgHold = acceptance.minAvgHoldSeconds;
+  return (
+    <div
+      className="rounded-md border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5"
+      data-testid="ai-trade-acceptance-preview"
+    >
+      <p className="text-[10px] font-medium text-[var(--text)]">
+        跑起来后将按以下门槛判定（统计看板的「周期验收」卡）：
+      </p>
+      <ul className="mt-0.5 flex flex-col gap-0.5 text-[10px] leading-relaxed text-[var(--muted)]">
+        <li>
+          · 平均持仓时间 ≥{" "}
+          {minAvgHold != null ? formatHoldDuration(minAvgHold) : "按你填的目标区间派生"}
+          ；落在目标区间的比例 ≥{" "}
+          {acceptance.minWithinTargetRate != null
+            ? `${(acceptance.minWithinTargetRate * 100).toFixed(0)}%`
+            : "按你填的目标区间派生"}
+        </li>
+        <li>
+          · 每日换手次数（墙钟口径）≤{" "}
+          {acceptance.maxTurnoverPerDay != null
+            ? `${acceptance.maxTurnoverPerDay.toFixed(1)} 次`
+            : "按你填的目标区间派生"}
+          {/* 自指披露（turnover-budget §2.2.6）：这一行已从「事后判据」变成「运行期约束」，
+              因而接近恒真。用户必须知道这件事，否则会把一个恒绿的格子当成通过。 */}
+          {turnoverGateArmed ? (
+            <span
+              className="ml-1 rounded-[3px] border border-[var(--border)] px-1 py-px text-[9px] text-[var(--muted)]"
+              data-testid="ai-turnover-gate-badge"
+              title={
+                "本会话开启了换手预算闸：超出该上限即暂停开新仓（平仓不受影响），" +
+                "预算按本会话计、会话重启后重新计算。因此本行接近恒真，请以「平均持仓时间」" +
+                "「手续费占毛利润」「资金费后净收益」三行为准。"
+              }
+            >
+              运行期强制
+            </span>
+          ) : null}
+          ；手续费占毛利润 ≤ {(acceptance.maxFeeToGross * 100).toFixed(0)}%
+        </li>
+        <li>· 扣掉手续费与<strong className="text-[var(--text)]">资金费</strong>后的净收益 &gt; 0</li>
+        <li>
+          · 满 {acceptance.sampleFloor} 笔完整往返才出结论；不足即显示
+          <strong className="text-[var(--text)]">「样本不足」</strong>
+          （灰色，不是「快通过了」），此时不宜放大实盘资金。
+        </li>
+      </ul>
+    </div>
+  );
+}
+
+/**
+ * 跨日模式的兜底核实提示（turnover-budget §2.4.1）——**非阻断**。
+ *
+ * 跨日持有「不必每轮盯盘」这句授权的唯一前提，是交易所侧那两张单真的还挂着。此前系统从未核实过
+ * 它，只是把下单时的**本地回执**当成事实。这行提示告诉用户：现在会真的去问，而且问不到时会如实
+ * 告诉 AI。
+ *
+ * [P2-4] 核实周期的分钟数由服务端下发（`backstopPollSeconds`），**前端不得硬抄一个 2 分钟**——
+ * 运维改了配置而文案不动，就又造出一句没核实的话，那正是本轮要根除的东西。
+ */
+function BackstopNotice({
+  profile,
+  response,
+}: {
+  profile: AiTradeHorizonProfile | null;
+  response: AiTradeHorizonProfilesResponse;
+}) {
+  const crossesDay = (profile?.targetHoldMaxSeconds ?? 0) >= 86400;
+  if (!crossesDay) return null;
+  if (response.backstopCheckEnabled === false) {
+    return (
+      <p
+        className="text-[10px] leading-relaxed text-[var(--muted)]"
+        data-testid="ai-trade-backstop-notice"
+      >
+        本会话<strong className="text-[var(--text)]">没有向交易所核实止损的通道</strong>
+        （运维已关闭核实）：随单挂出的止盈止损只有本地下单回执可证，
+        请不要把「进程退出后仍生效」当作前提。
+      </p>
+    );
+  }
+  const minutes = Math.max(1, Math.round((response.backstopPollSeconds ?? 120) / 60));
+  return (
+    <p
+      className="text-[10px] leading-relaxed text-[var(--muted)]"
+      data-testid="ai-trade-backstop-notice"
+    >
+      本会话将每 <strong className="text-[var(--text)]">{minutes}</strong> 分钟向交易所核实一次
+      止损是否仍然挂着；核实不到时系统会
+      <strong className="text-[var(--text)]">如实告知 AI</strong>
+      ，并停止在未覆盖的持仓上继续加仓（平仓与新开仓不受影响）。
+    </p>
   );
 }
 

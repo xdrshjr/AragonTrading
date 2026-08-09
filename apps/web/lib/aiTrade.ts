@@ -527,6 +527,22 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
     prefix: "horizon_turnover_hysteresis",
     label: "交易周期：浮盈尚未覆盖往返成本，获利了结推迟（浮亏离场不受此限）",
   },
+  // 开仓侧换手纪律与兜底覆盖三码（ai-trade-turnover-budget-and-backstop §2.4.3）：同为带参数
+  // 后缀的前缀码。**漏加不会报错、只会静默显示原始码**（第 1 轮 P1-4 的同款坑），故有专属用例守。
+  // 与上面三条的关键差别必须写进文案：那三条约束「平」，这三条只约束「开」——用户看到「拦截」
+  // 时最怕的是「我的仓位是不是也平不掉了」。
+  {
+    prefix: "horizon_reentry_cooldown",
+    label: "交易周期：再入场冷却中，暂停同向开仓（平仓与反向开仓不受影响）",
+  },
+  {
+    prefix: "horizon_turnover_budget",
+    label: "交易周期：本会话换手预算已用尽，暂停开新仓（平仓不受影响；反手只保留平仓腿）",
+  },
+  {
+    prefix: "horizon_backstop_uncovered",
+    label: "交易所兜底未覆盖当前持仓，暂停继续加仓（平仓与新开仓不受影响）",
+  },
 ];
 
 /**

@@ -1,8 +1,11 @@
 // AI 自动交易 · 回测模式 wire 类型（camelCase，与后端 schemas.py 的 AiBacktest* 同构）。
 // 决策/摘要复用 aiTradeTypes 的 AiTradeDecision；aiBacktestJobId 为瞬态（store 不入 partialize，GET 重发现）。
 import type {
+  AiTradeAcceptance,
   AiTradeBaseRules,
   AiTradeDecision,
+  AiTradeExitMix,
+  AiTradeFundingStats,
   AiTradeHorizonRule,
   AiTradeHorizonStats,
   AiTradeProfitGuardRule,
@@ -75,6 +78,12 @@ export interface AiBacktestAiStats {
   // 交易周期层观测（holding-horizon §2.10）：与实盘 `aiStats.horizon` 同名同形；未装配 ⇒ null ⇒
   // UI 整段不渲染（绝不在一次没有周期契约的回测上挂出该卡片，与 profitGuardEnabled 同款理由）。
   horizon?: AiTradeHorizonStats | null;
+  // 持仓周期验收闭环（horizon-acceptance）：与实盘 `aiStats` **逐键同形**（同一个 builder、
+  // 同一份 wire），这是「回测 vs 实盘可对拍」的前提。未装配周期契约 ⇒ `horizonAcceptance` 为
+  // null，但 `exits` / `funding` 仍可非空（关掉周期模式跑对照回测是上线观察窗口的必要一臂）。
+  horizonAcceptance?: AiTradeAcceptance | null;
+  exits?: AiTradeExitMix | null;
+  funding?: AiTradeFundingStats | null;
 }
 
 // 进度事件（驱动进度头 / 滚动权益迷你图）。

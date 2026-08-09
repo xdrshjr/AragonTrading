@@ -13,6 +13,7 @@ import {
   horizonLossRelease,
   horizonReleaseHint,
   horizonVetoLine,
+  turnoverVetoLine,
   validateHorizon,
 } from "./aiTradeHorizon";
 import type {
@@ -317,14 +318,136 @@ describe("预设表单一真源（R-3 / G-10）", () => {
     const raw = readFileSync(join(process.cwd(), "lib", "aiTradeHorizon.ts"), "utf8");
     // `HORIZON_BAR_SECONDS` 是**周期换算表**（与后端 `okx.types.BAR_SECONDS` 镜像），不是模式预设
     // ——一致性提示要按周期折算，别处无此表。扫描前先把它剔掉，否则 12H 的 43200 会误伤。
+    // `\r?\n`：本仓库 `core.autocrlf=true`，**任何一次干净检出的工作树都是 CRLF**（作者机上是 LF
+    // 只因文件是就地写出来的）。写死 `\n};\n` 会让剔除**静默失效**，于是换算表里的 14400 / 43200
+    // 被当成硬编码预设——这道门禁因此在每一台正常检出的机器上都红，且红的理由与它要守的东西无关。
     const source = raw.replace(
-      /export const HORIZON_BAR_SECONDS[\s\S]*?\n};\n/,
+      /export const HORIZON_BAR_SECONDS[\s\S]*?\r?\n};\r?\n/,
       "",
     );
-    expect(source).not.toContain("HORIZON_BAR_SECONDS =");
+    // 断言剔除**真的发生了**（原判据 `"HORIZON_BAR_SECONDS ="` 恒不命中：声明写的是
+    // `HORIZON_BAR_SECONDS: Record<string, number> =`，故它过去从不能证明任何事）。
+    expect(source).not.toContain("HORIZON_BAR_SECONDS: Record");
     for (const preset of ["7200", "14400", "43200", "172800", "259200", "hourly_swing"]) {
       expect(source).not.toContain(preset);
     }
+  });
+});
+
+// ---------- 开仓侧换手纪律（ai-trade-turnover-budget-and-backstop §2.4.1 / §2.4.4）----------
+describe("换手纪律契约摘要", () => {
+  const withTurnover: AiTradeHorizonProfile = {
+    ...INTRADAY,
+    reentryCooldownSeconds: 3600,
+    turnoverBudgetPerDay: 6,
+    turnoverBudgetCapacity: 3,
+  };
+
+  it("两行数值全部来自服务端下发值——改一个数即变（前端零计算）", () => {
+    const lines = contract({ profile: withTurnover });
+    const reentry = lines.find((l) => l.key === "reentry");
+    const budget = lines.find((l) => l.key === "budget");
+    expect(reentry?.text).toContain("1 小时");
+    expect(budget?.text).toContain("6 次完整往返");
+    expect(budget?.text).toContain("突发额度 3 次");
+    const changed = contract({
+      profile: { ...withTurnover, reentryCooldownSeconds: 7200, turnoverBudgetPerDay: 12 },
+    });
+    expect(changed.find((l) => l.key === "reentry")?.text).toContain("2 小时");
+    expect(changed.find((l) => l.key === "budget")?.text).toContain("12 次完整往返");
+  });
+
+  it("必须写明「本会话」口径与「平仓腿永不受限」——两者都是本轮承诺的一部分", () => {
+    const budget = contract({ profile: withTurnover }).find((l) => l.key === "budget");
+    expect(budget?.text).toContain("本会话");
+    expect(budget?.text).toContain("会话重启后预算重新计算");
+    expect(budget?.text).toContain("平仓与反手的平仓腿永不受限");
+  });
+
+  it("长周期模式在选模式那一刻就披露代价（事后再解释就是投诉）", () => {
+    const trend = contract({
+      profile: { ...withTurnover, turnoverBudgetPerDay: 1, turnoverBudgetCapacity: 2 },
+    });
+    const cost = trend.find((l) => l.key === "budgetCost");
+    // `trend_hold`：速率 1 次/日 ⇒ 补回**一枚**令牌要 24h。绝不是补满整桶的 48h——再次开仓只
+    // 需要一枚，把「补满」写成「能开仓」会让弹窗把约束夸大一倍。
+    expect(cost?.text).toContain("24 小时");
+    expect(cost?.text).toContain("这是长周期契约的代价，不是故障");
+    // `short_swing`（速率 2 次/日、容量同为 2）⇒ 12h。容量相同而等待减半，正是「等待时间只由
+    // 速率决定、与容量无关」这条判据；照容量算会在这里同样得出 24h。
+    const short = contract({
+      profile: { ...withTurnover, turnoverBudgetPerDay: 2, turnoverBudgetCapacity: 2 },
+    });
+    expect(short.find((l) => l.key === "budgetCost")?.text).toContain("12 小时");
+    // 日内模式（每日 6 次）不出这句：它不成立，写出来只是噪音。
+    expect(contract({ profile: withTurnover }).find((l) => l.key === "budgetCost")).toBeUndefined();
+  });
+
+  it("custom 全默认 ⇒ 不产出那两行（安全退出口）；运维总闸关 ⇒ 同样不产出", () => {
+    const custom = contract({ profile: CUSTOM });
+    expect(custom.find((l) => l.key === "reentry")).toBeUndefined();
+    expect(custom.find((l) => l.key === "budget")).toBeUndefined();
+    const off = contract({ profile: withTurnover, turnoverGateEnabled: false });
+    expect(off.find((l) => l.key === "reentry")).toBeUndefined();
+    expect(off.find((l) => l.key === "budget")).toBeUndefined();
+  });
+});
+
+describe("换手纪律拦截计数行", () => {
+  const base: AiTradeHorizonStats = {
+    profileId: "intraday_swing",
+    title: "日内波段",
+    minHoldSeconds: 7200,
+    exitConfirmRounds: 2,
+    turnoverHysteresisK: 1.5,
+    expectedHoldBars: 12,
+    minHoldVetoes: 0,
+    unconfirmedVetoes: 0,
+    hysteresisVetoes: 0,
+    reverseVetoes: 0,
+    releasedRounds: 0,
+    releaseReasons: {},
+    confirmWindowReleases: 0,
+    roundTrips: 0,
+    estimatedEpochs: 0,
+  };
+
+  it("三个计数缺席（老记录 / 未装配）⇒ null ⇒ 整行不渲染", () => {
+    expect(turnoverVetoLine(null)).toBeNull();
+    expect(turnoverVetoLine({ ...base })).toBeNull();
+  });
+
+  it("有计数即呈现——`budgetVetoes` 是「模型想换手而被制度拦住」的次数，必须有落点", () => {
+    const line = turnoverVetoLine({
+      ...base,
+      reentryVetoes: 3,
+      budgetVetoes: 7,
+      opensCounted: 11,
+    });
+    expect(line).toContain("再入场冷却拦下 3");
+    expect(line).toContain("预算拦下 7");
+    expect(line).toContain("消耗令牌 11");
+  });
+});
+
+// ---------- 放行条件 13：前端不得硬编码本轮三个契约值 ----------
+describe("换手纪律的数值单一真源", () => {
+  it("三个契约值的来源只能是服务端下发字段，实现文件里没有它们的字面量赋值", () => {
+    const source = readFileSync(join(process.cwd(), "lib", "aiTradeHorizon.ts"), "utf8");
+    for (const key of [
+      "reentryCooldownSeconds",
+      "turnoverBudgetPerDay",
+      "turnoverBudgetCapacity",
+    ]) {
+      // 只允许「从 profile 上读」，不允许任何 `key = 数字` / `key: 数字` 形式的字面量赋值。
+      expect(source).not.toMatch(new RegExp(`${key}\\s*[:=]\\s*\\d`));
+    }
+    // 核实周期的分钟数同样不得硬抄（[P2-4]）：它是 `backstopPollSeconds` 的函数。
+    const fields = readFileSync(
+      join(process.cwd(), "components", "Agent", "AiTradeHorizonFields.tsx"),
+      "utf8",
+    );
+    expect(fields).toContain("backstopPollSeconds");
   });
 });
 

@@ -6,6 +6,7 @@ import { Badge, Button, Modal, Tabs } from "@/components/ui";
 import MetricsCards from "@/components/Strategy/MetricsCards";
 import TradesTable from "@/components/Strategy/TradesTable";
 import {
+  AcceptanceBacktestSection,
   BenchmarkCompareCard,
   ExtendedMetricsGrid,
   KPIHero,
@@ -425,6 +426,7 @@ function AiDecisionTab({ result, timeline }: { result: NonNullable<BacktestResul
         enabled={result.aiStats.profitGuardEnabled}
         exits={result.aiStats.profitGuardExits}
       />
+      <AcceptanceBacktestSection aiStats={result.aiStats} />
       <section className="flex flex-col gap-1">
         <span className="text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">动作分布</span>
         <ActionBars counts={result.aiStats.actionCounts} />

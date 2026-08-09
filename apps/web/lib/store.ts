@@ -45,6 +45,14 @@ import type { WorkspacePrefs } from "./workspaceTypes";
 import { clampAllocationOnEdit, defaultAllocationOnAdd, evenSplit } from "./autoTrade";
 import { AI_TRADE_DEFAULT_POSITION_STEP, AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN } from "./aiTrade";
 
+// 分组级验收三键的补丁面（横切 `AiTradeGroupState` 的一个**窄**子集，故在此单独取名——
+// 用 `Partial<AiTradeGroupState>` 会让这个 action 有能力覆盖 `members` / `trades`，
+// 而它存在的全部理由恰恰是「不许碰那两个」）。
+export type AiTradeGroupAcceptancePatch = Pick<
+  AiTradeGroupState,
+  "acceptance" | "exits" | "funding"
+>;
+
 type Theme = "light" | "dark";
 // 标的侧边栏页签：自选 / 现货 / 合约（"swap" 承载 SWAP+FUTURES 合约页签，RV-10）。
 export type InstSidebarTab = "watch" | "spot" | "swap";
@@ -514,6 +522,7 @@ interface AppState {
   setAiTradeMemberSession: (instId: string, session: AiTradeSessionRow | null) => void;
   patchAiTradeMemberSession: (instId: string, patch: Partial<AiTradeSessionRow>) => void;
   patchAiTradeMemberStatus: (instId: string, status: AiTradeStatusEvent) => void;
+  patchAiTradeGroupAcceptance: (patch: AiTradeGroupAcceptancePatch) => void;
   setAiTradeMemberTrades: (instId: string, trades: Trade[]) => void;
   appendAiTradeMemberTrade: (instId: string, trade: Trade) => void;
   setAiTradeMemberPosition: (instId: string, pos: PaperPositionEvent | null) => void;
@@ -910,6 +919,14 @@ export const useAppStore = create<AppState>()(
               ? { ...m.session, ...(status as Partial<AiTradeSessionRow>) }
               : m.session,
           })),
+        ),
+      // 分组级验收三键的**窄** action（horizon-acceptance [P0-3]）：只覆盖这三个加法键，
+      // **绝不碰 `members`**。用 `setAiTradeGroup(groupStateFromStatus(...))` 去做这件事会把每个
+      // 成员的 `trades` 清空（那条映射写死 `trades: []`），而它跑在一个 15 秒轮询里——
+      // 成交流会每 15 秒消失一次。分组不存在时静默空转（轮询与分组生命周期天然有竞态）。
+      patchAiTradeGroupAcceptance: (patch) =>
+        set((s) =>
+          s.aiTradeGroup ? { aiTradeGroup: { ...s.aiTradeGroup, ...patch } } : {},
         ),
       setAiTradeMemberTrades: (instId, trades) =>
         set((s) => patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({ ...m, trades }))),

@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import replace
 
+from .exit_attribution import ExitLedger
 from .hold_horizon import (
     REASON_EXIT_UNCONFIRMED,
     REASON_HYSTERESIS,
@@ -30,7 +31,20 @@ from .hold_horizon import (
     evaluate_horizon_gate,
     gated_kind,
 )
+from .exchange_backstop import apply_backstop_gate
 from .profit_guard_runtime import exchange_oco_px
+from .turnover_discipline import (
+    TurnoverRule,
+    apply_turnover_gate,
+    build_wire as build_turnover_wire,
+    bump_wire_vetoes,
+    gate_skip_reason,
+    init_state as init_turnover_state,
+    note_veto as note_turnover_veto,
+    on_close_fill,
+    on_open_fill,
+    refill,
+)
 
 # 被本层拦下时按前缀归类到四个计数器之一（前缀是稳定契约，与 `DEGRADE_REASON_LABELS` 同源）。
 _VETO_COUNTER_KEY = {
@@ -76,8 +90,29 @@ class HorizonRuntime:
         released_streak: 连续「本层已解除」的持仓轮数（达阈追发一条 error 事件，§4.4）。
     """
 
-    def __init__(self, rule: HorizonRule | None) -> None:
+    def __init__(self, rule: HorizonRule | None, *, net_mode: bool = True,
+                 record_exits: bool = True,
+                 turnover_rule: TurnoverRule | None = None, backstop=None) -> None:
+        """
+        Args:
+            rule: 已装配周期契约；`None` = 本会话不装配。
+            net_mode: 退出来源账本的净额还原口径。
+            record_exits: 回测侧传 `False`（那边账本由 runner 自持，见下）。
+            turnover_rule: 开仓侧换手纪律契约（turnover-budget §2.2.2）；**默认 `None` ⇒ 整层
+                空转** ⇒ 既有直接构造 `HorizonRuntime(rule)` 的单测逐字零回归。
+            backstop: 交易所侧兜底核实运行时（鸭子类型：只要求 `.wire(now_wall) -> dict | None`）。
+                回测**不装配**（回测没有交易所，声称「已向交易所核实」是假话，D-5）。
+                本类不持有 settings、不发任何请求——IO 全在 `exchange_backstop` 那一侧。
+        """
         self.rule = rule
+        # 退出来源账本（horizon-acceptance 轴 B）：**恒构造，与 `rule` 是否装配无关**——关掉周期
+        # 模式跑一段对照组正是 L1 观察窗口最需要做的事，若它随 `rule is None` 一起消失，对照臂
+        # 就会「记下了数据却一个字都看不到」（[P0-4]）。
+        # `record_exits=False` 只给**回测**用：那边的平仓成交由 `SimBroker` 产出、来源要靠成交
+        # `reason` 与打标槽合判，故由 runner 自己持有一份账本并在**不受周期模式门控**的钩子里记
+        # （挂在这里会被 `_track_horizon_epoch` 的 `rule is None` 早退连坐）。
+        self.record_exits = bool(record_exits)
+        self.exits = ExitLedger(net_mode=bool(net_mode))
         self.state = HorizonState()
         self.last_snapshot: dict | None = None
         # 最近一次 `gate()` 的**本层**降级码（`None` = 本轮本层放行）。刻意与合成后的 `degrade` 分开：
@@ -91,6 +126,18 @@ class HorizonRuntime:
         self.round_trips = 0
         self.estimated_epochs = 0
         self.hold_samples: list[float] = []
+        # ---- 开仓侧换手纪律（turnover-budget §2.2）----
+        # `turnover_state` 是**会话级**、跨 epoch 存活的（R-5：挂进 `HorizonState` 会在每笔平仓
+        # 被清空，G5 就变成一个永远满桶的摆设）。`last_refill_wall` 刻意从 0 起：首次读取时
+        # elapsed 极大、但令牌本就已是满桶，夹到容量后逐字等价于「在那一刻装配」——本类因此
+        # 不需要持有任何时钟（实盘墙钟与回测 bar ts 都能直接喂进来）。
+        self.turnover_rule = turnover_rule
+        self.turnover_state = init_turnover_state(turnover_rule, now_wall=0.0)
+        self.last_turnover_reason: str | None = None
+        self._cooldown_was_active = False
+        self.backstop = backstop
+        self.last_backstop_reason: str | None = None
+        self.backstop_vetoes = 0
 
     # ---------- 状态推进 / 快照 ----------
     def refresh(self, facts: HorizonFacts) -> dict | None:
@@ -105,15 +152,31 @@ class HorizonRuntime:
             return None
         if facts.side not in ("long", "short"):
             self.state = HorizonState()
-            self.last_snapshot = build_snapshot(self.rule, self.state, facts)
+            self.last_snapshot = self._snapshot(facts)
             return self.last_snapshot
         epoch = (facts.side, int(facts.seq))
         if self.state.epoch != epoch:
             # 未观察到开仓成交事件（重连 / 外部干预 / 单测直接构造）⇒ 兜底建 epoch 并如实标估算。
             self.state = HorizonState(epoch=epoch, opened_wall=float(facts.now_wall),
                                       opened_wall_estimated=True)
-        self.last_snapshot = build_snapshot(self.rule, self.state, facts)
+        self.last_snapshot = self._snapshot(facts)
         return self.last_snapshot
+
+    def _snapshot(self, facts: HorizonFacts) -> dict:
+        """装配快照并挂上两个新嵌套键（turnover-budget §5.4）。
+
+        **空仓分支同样带 `turnover`**（[P0-3]）：`flat` 恰是 G4/G5 唯一真正会拦人的状态，若只在
+        持仓分支挂，文案层就只能沿用那句「当前空仓：本层不约束开仓」——系统会每轮主动说反话。
+        两键在未装配时**整键缺席**（不是 `null`），prompt 因此逐字节回退。
+        """
+        now_wall = float(facts.now_wall)
+        self.turnover_state = refill(self.turnover_state, self.turnover_rule,
+                                     now_wall=now_wall)
+        return build_snapshot(
+            self.rule, self.state, facts,
+            turnover=build_turnover_wire(self.turnover_state, self.turnover_rule,
+                                         now_wall=now_wall),
+            backstop=None if self.backstop is None else self.backstop.wire(now_wall))
 
     def note_intent(self, stage1_action: str, stage1_degrade: str | None, *,
                     position_side: str, now_wall: float) -> None:
@@ -198,6 +261,78 @@ class HorizonRuntime:
             self.vetoes["reverse"] += 1
         self.state = replace(self.state, blocked_streak=self.state.blocked_streak + 1)
 
+    # ---------- 开仓侧换手纪律（turnover-budget §2.2.5 / §2.3.4）----------
+    def turnover_gate(self, decision, degrade: str | None, *, position_side: str,
+                      now_wall: float) -> tuple[object, str | None]:
+        """★ G4/G5 门禁（冷却之后、仓位/刹车之前）；未装配 ⇒ 原样直通、同一对象返回。
+
+        判定读的是**本轮 `gate()` 刚刚 refresh 出来的那一份快照**——与判定同源，且由于 trace 存
+        的是同一个 dict 引用，[P2-2] 的「原地 mutate 计数」在此生效：被拦轮的轨迹里
+        `budgetVetoes` 已经 +1，不会落后一轮（S-17）。
+
+        Args:
+            decision: 本轮决策（已过铁律 / 周期 / 利润保护冷却三层）。
+            degrade: 既有合成降级码（「先执行者胜出」，本层只在其为空时写入）。
+            position_side: 当前**投影立场**（实盘 `executor.projected`，回测 `pos.side`）——
+                [P0-1] 的三分支判定式依赖它，用真实持仓做判据会看不见同根新边沿。
+            now_wall: 判定时刻（实盘墙钟秒，回测当前根 ts）。
+        """
+        self.last_turnover_reason = None
+        if self.turnover_rule is None:
+            return decision, degrade
+        wire = (self.last_snapshot or {}).get("turnover")
+        skip = gate_skip_reason(position_side)
+        if skip is not None:                       # fail-open，但如实记号（绝不静默）
+            if isinstance(wire, dict):
+                wire["gateSkipped"] = skip
+            return decision, degrade
+        gated, reason = apply_turnover_gate(decision, wire, self.turnover_rule,
+                                            position_side=position_side)
+        if reason is None:
+            return decision, degrade
+        self.turnover_state = note_turnover_veto(self.turnover_state, reason)
+        bump_wire_vetoes(wire, self.turnover_state)
+        self.last_turnover_reason = reason
+        return gated, (degrade or reason)
+
+    def backstop_gate(self, decision, degrade: str | None, *,
+                      position_side: str) -> tuple[object, str | None]:
+        """★ G6 兜底覆盖闸（只拦同向加仓）；未核实 / 覆盖未知 ⇒ 恒放行（fail-open）。
+
+        两个判定参数取自 `self.backstop.settings`——`BackstopRuntime` 本来就持有 settings，
+        再让会话层把它们传一遍，等于在决策链上多铺一条可以与取数侧分叉的口径。本类自身
+        仍然不持有 settings（回测侧 `backstop is None` ⇒ 整层空转）。
+        """
+        self.last_backstop_reason = None
+        if self.backstop is None:
+            return decision, degrade
+        settings = self.backstop.settings
+        gated, reason = apply_backstop_gate(
+            decision, (self.last_snapshot or {}).get("backstop"),
+            position_side=position_side,
+            enabled=bool(getattr(settings, "ai_trade_backstop_gate_scale_in", True)),
+            min_coverage=float(getattr(settings, "ai_trade_backstop_min_coverage", 0.999)))
+        if reason is None:
+            return decision, degrade
+        self.backstop_vetoes += 1
+        self.last_backstop_reason = reason
+        return gated, (degrade or reason)
+
+    def expire_turnover_cooldown(self, now_wall: float) -> bool:
+        """G4 冷却由「激活」翻为「未激活」的那一 tick 返回 `True`（[P1-3] 补推 status 用）。
+
+        仓库已为完全同款的问题写过专门补丁（`ProfitGuardRuntime.expire_cooldown`）：不推则前端
+        chip 会一直挂着——后端已不再拦，UI 却说在拦。**预算不需要补推**：它是连续量，每次
+        status 下发的 `tokens` / `nextTokenSeconds` 都是瞬时快照，前端只显示不自行推进。
+        """
+        rule = self.turnover_rule
+        active = bool(rule is not None and rule.reentry_cooldown_s > 0
+                      and self.turnover_state.cooldown_side in ("long", "short")
+                      and float(now_wall) < float(self.turnover_state.cooldown_until_wall))
+        expired = self._cooldown_was_active and not active
+        self._cooldown_was_active = active
+        return expired
+
     # ---------- payload 注入 ----------
     def inject(self, payload: dict, snapshot: dict | None) -> None:
         """把本轮快照挂进决策 payload（未装配 ⇒ **整键缺席** ⇒ prompt 渲染逐字节回退）。
@@ -232,22 +367,51 @@ class HorizonRuntime:
             return
         self.state = HorizonState(epoch=epoch, opened_wall=float(now_wall),
                                   opened_wall_estimated=False)
+        # 换手预算的消耗点（turnover-budget §2.2.4）：**只对新 epoch 计一次**——上面那条早退已经
+        # 保证了「同 (side, seq) 不重复建 epoch」，故加仓（同 epoch 的后续成交）走不到这里。
+        # 预算的单位是「往返」，与验收卡第 3 行的分子 `roundTrips` 严格同单位（D-4）。
+        self.turnover_state = on_open_fill(self.turnover_state, self.turnover_rule,
+                                           now_wall=float(now_wall))
 
     def note_close(self, trade: dict, now_wall: float) -> None:
-        """平仓成交：记一笔真实持仓时长样本并清空 epoch（估算起点的样本**不入统计**）。
+        """平仓成交：记一笔真实持仓时长样本 + 一笔退出来源样本，并清空 epoch。
 
         平仓侧不存在部分结算（`_adopt_partial` 对 close 意图刻意不做增量采纳），故一个 epoch 恰对应
-        一次 `note_close`。`trade` 形参保留以对齐 `_cost.record_close` / `_sizing.note_close` 的同款
-        收口签名（本层只需时钟，不读成交字段）。
+        一次 `note_close`。本方法是**唯一**同时握有「本次持仓时长」与「本次平仓成交」的地方，故
+        退出来源归因也挂在这里；**记录必须发生在 `rule is None` 早退之前**（[P0-4]）。
+
+        ⚠ **本轮唯一一处纯核心之外的调用顺序依赖（turnover-budget [P0-4]）**：G4 冷却的
+        `closed_side` 必须在 `_consume_epoch_hold()` **之前**从 `self.state.epoch[0]` 取——该方法
+        会把 `state` 整体重置。**绝不可**改从 `trade["side"]` 取：实盘 close 成交的它恒为字符串
+        `"close"`、回测干脆传空字典 `{}`，那样 `cooldown_side` 会变成 `"close"`，而判定式比对的是
+        `long` / `short` ⇒ **永远不拦、永远不报错**。`epoch is None`（从未建立 / 未装配）⇒
+        不开启冷却（宁可不拦，也不拿一个猜的方向去拦）。
+        """
+        closed_side = self.state.epoch[0] if self.state.epoch else ""
+        hold_s = self._consume_epoch_hold(now_wall)
+        self.turnover_state = on_close_fill(self.turnover_state, self.turnover_rule,
+                                            closed_side=closed_side,
+                                            now_wall=float(now_wall))
+        if self.record_exits:
+            self.exits.record(trade, hold_seconds=hold_s)
+
+    def _consume_epoch_hold(self, now_wall: float) -> float | None:
+        """结算本 epoch 并返回真实持仓时长；未装配 / 无 epoch / 估算起点 ⇒ `None`。
+
+        估算起点的样本**不入时长统计**（`opened_wall` 是兜底猜的，拿它算平均持仓时间等于用一个
+        编出来的数去证明本层有效），但它照样计入 `round_trips` 与退出来源笔数。
         """
         if self.rule is None or self.state.epoch is None:
-            return
+            return None
         self.round_trips += 1
+        hold_s: float | None = None
         if self.state.opened_wall_estimated:
             self.estimated_epochs += 1
         else:
-            self.hold_samples.append(max(0.0, float(now_wall) - float(self.state.opened_wall)))
+            hold_s = max(0.0, float(now_wall) - float(self.state.opened_wall))
+            self.hold_samples.append(hold_s)
         self.state = HorizonState()
+        return hold_s
 
     # ---------- 统计（§2.12）----------
     def merge_into(self, ai_stats: dict) -> dict:
@@ -284,7 +448,46 @@ class HorizonRuntime:
                 "confirmWindowReleases": self.confirm_window_releases,
                 "roundTrips": self.round_trips,
                 "estimatedEpochs": self.estimated_epochs,
+                # 开仓侧换手纪律的三个只增计数（turnover-budget §4.3）。[P2-7] 刻意**不并进**
+                # 上面四个第 1 轮的冻结计数：那会让 G-2 的 AST 冻结门禁虽过、语义却已漂移。
+                "reentryVetoes": self.turnover_state.reentry_vetoes,
+                "budgetVetoes": self.turnover_state.budget_vetoes,
+                "opensCounted": self.turnover_state.opens_counted,
                 **self._sample_stats()}
+
+    # ---------- 周期验收卡的原始计数器（horizon-acceptance [P1-2]）----------
+    def acceptance_input_parts(self) -> dict | None:
+        """验收卡所需的**未 round 原始计数器**；未装配 ⇒ `None`。
+
+        与 `stats()` 分工明确：后者是**展示口径**（`avgHoldSeconds` round 3 位、
+        `withinTargetRate` round 4 位），**反推不出** `hold_seconds_sum` 与
+        `within_target_samples`；按 `avg × n` 反乘会引入舍入误差，多成员合并后误差累积——那就与
+        「原始计数器可精确合并」这句话自相矛盾了（[P1-2]）。`stats()` 一字不改。
+        """
+        if self.rule is None:
+            return None
+        samples = self.hold_samples
+        return {"roundTrips": int(self.round_trips),
+                "holdSecondsSum": float(sum(samples)),
+                "holdSamples": len(samples),
+                "withinTargetSamples": self._within_target_samples(samples),
+                # 验收卡第 3 行的自指披露（turnover-budget §2.2.6）：本会话是否武装了 G5、
+                # 它实际拦下多少次。未武装 ⇒ 该行 note 逐字节不变（冻结用例守）。
+                "turnoverGateArmed": bool(self.turnover_rule is not None
+                                          and self.turnover_rule.per_day is not None),
+                "turnoverBudgetVetoes": int(self.turnover_state.budget_vetoes)}
+
+    def _within_target_samples(self, samples: list[float]) -> int:
+        """落在 `[targetMin, targetMax]` 内的**条数**（未设上界 ⇒ 0，由验收卡判 insufficient）。"""
+        rule = self.rule
+        if rule is None or rule.target_hold_max_s <= 0:
+            return 0
+        return sum(1 for s in samples
+                   if rule.target_hold_min_s <= s <= rule.target_hold_max_s)
+
+    def exit_stats(self) -> dict | None:
+        """退出来源分布 wire；零样本 ⇒ `None`（**与 `rule` 是否装配无关**，[P0-4]）。"""
+        return self.exits.stats()
 
     def _sample_stats(self) -> dict:
         """持仓时长样本的派生量；无样本 ⇒ 六键全 `None`（[P2-3]，绝不用 0 冒充「还没有样本」）。"""

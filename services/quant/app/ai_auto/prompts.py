@@ -531,11 +531,19 @@ def _format_cost(view: dict | None) -> str:
     """每轮交易成本段；`payload["costAwareness"]` **键缺失** ⇒ 空串 ⇒ 整段省略（逐字节回退）。
 
     渲染委托 `cost_text` 纯核心——写给模型看的 bps 与门禁真正据以判定的 bps 必须是同一个数（A-6）。
+
+    资金费**已计提**一句（horizon-acceptance §2.2.5）刻意渲染在 `acceptance_text` 而**不是**
+    `cost_text`：本轮的 G-6 冻结门禁要求 `cost_model` / `cost_text` 逐字节零 diff（那是「结算周期
+    未知不得渗进成本估算层」这条不变式的机械判据）。`fundingAccrued` 键缺席 ⇒ 该句为空串 ⇒ 整段
+    与本轮之前逐字节相同（见 spec 《实施过程发现的方案缺陷》I-1）。
     """
     if not view:
         return ""
+    from .acceptance_text import format_funding_accrued_for_prompt
     from .cost_text import format_cost_for_prompt   # 延迟导入，同 _format_base_rules
-    return format_cost_for_prompt(view)
+    accrued = format_funding_accrued_for_prompt(view.get("fundingAccrued"))
+    base = format_cost_for_prompt(view)
+    return f"{base}\n{accrued}" if accrued else base
 
 
 def _format_profit_cooldown(cooldown: dict | None) -> str:

@@ -579,6 +579,12 @@ class AiTradeHorizonIn(BaseModel):
     # `max_hold_bars` 豁免构成闭环：上限已到时本层整体解除，绝不出现「系统要强平、本层却拦着 Agent
     # 先走一步」的对冲态。
     enforceMaxHold: bool = False
+    # ---- 开仓侧换手纪律的两个可选覆盖（ai-trade-turnover-budget-and-backstop §4.2）----
+    # `null` ⇒ 按契约派生；`0` ⇒ **显式关闭**该闸（不是「无限长 / 无限多」）。
+    # 速率没有第三个旋钮：容量恒由速率派生（`max(2, ceil(perDay × burstFrac))`），否则弹窗
+    # 承诺的那个数与运行期真正执行的数可以分叉（D-1）。
+    reentryCooldownSeconds: float | None = Field(default=None, ge=0, le=604800)
+    turnoverBudgetPerDay: float | None = Field(default=None, ge=0, le=1000)
 
     @model_validator(mode="after")
     def _check_target_range(self) -> "AiTradeHorizonIn":
@@ -587,6 +593,115 @@ class AiTradeHorizonIn(BaseModel):
         if lo is not None and hi is not None and lo > hi:
             raise ValueError("目标持仓下界不可大于上界")
         return self
+
+
+class AiTradeAcceptanceRowOut(BaseModel):
+    """周期验收卡的一行判据（horizon-acceptance §2.4.4）。
+
+    `value` 可为 `None`（该行「算不出」）——与 `0` 是两个结论，故**绝不**给默认值 0.0：
+    前者是「没算成」，后者是一个真实读数，UI 的文案与颜色都不同。
+    """
+
+    key: str
+    label: str
+    verdict: str                       # pass | fail | insufficient
+    value: float | None = None
+    unit: str                          # seconds | ratio | count | usd
+    display: str
+    target: str
+    note: str | None = None
+    inPositionValue: float | None = None   # 第 3 行的在场口径对照值
+    basis: str | None = None               # 第 5 行的资金费口径
+
+
+class AiTradeExitSourceRowOut(BaseModel):
+    """退出来源分布的一行；`winRate` 在样本 < 5 时为 `None`（绝不用 2 笔冒充统计结论）。"""
+
+    source: str
+    count: int
+    share: float | None = None
+    netUsd: float
+    avgHoldSeconds: float | None = None
+    winRate: float | None = None
+
+
+class AiTradeExitMixOut(BaseModel):
+    """退出来源分布（**顶层键**，[P0-4]：`acceptance` 为 null 时它仍可非空——关掉周期模式跑
+    对照臂是 L1 的必要臂，数据记了却看不到等于没记）。"""
+
+    totalExits: int
+    bySource: list[AiTradeExitSourceRowOut] = Field(default_factory=list)
+
+
+class AiTradeFundingOut(BaseModel):
+    """资金费账本读数（horizon-acceptance §2.2.2）。
+
+    `fundingCostUsd` 为 `None` 与为 `0` 是两个结论：前者是「没算成」（口径不可得），后者是「真的
+    没跨过结算点」。`intervalS` 在 `intervalKnown=false` 时恒 `None`——绝不把上游的 8h 兜底值当
+    读数展示（[P0-1]）。
+    """
+
+    enabled: bool
+    basis: str                          # settled+accrued | accrued | unavailable
+    accruedClosedUsd: float = 0.0
+    accruedOpenUsd: float | None = None
+    settledUsd: float | None = None
+    fundingCostUsd: float | None = None
+    crossings: int = 0
+    intervalKnown: bool = False
+    intervalS: float | None = None
+    lastRateBps: float | None = None
+    staleTicks: int = 0
+    unknownIntervalTicks: int = 0
+    capHits: int = 0
+    settledTrusted: bool = False
+    note: str = ""
+
+
+class AiTradeAcceptanceSymbolOut(BaseModel):
+    """多标的分组里单个成员的验收摘要（R-10）；`verdict` 为该成员**自己**的结论。"""
+
+    instId: str
+    roundTrips: int
+    netPnlUsd: float
+    verdict: str | None = None
+
+
+class AiTradeAcceptanceOut(BaseModel):
+    """周期验收卡（五行判据 + 退出来源镜像 + 派生诊断）。
+
+    `exitMix` / `funding` 与顶层同名键是**同一个对象**（[P0-4] / D-11）：顶层保证对照臂可见，
+    镜像保证 tooltip 与诊断能就近取数；两处各算一份即视为实现缺陷。
+    """
+
+    profileId: str
+    title: str
+    verdict: str                        # pass | fail | insufficient
+    sampleFloor: int
+    roundTrips: int
+    truncatedSamples: int = 0
+    sampleNote: str = ""
+    rows: list[AiTradeAcceptanceRowOut] = Field(default_factory=list)
+    exitMix: AiTradeExitMixOut | None = None
+    funding: AiTradeFundingOut | None = None
+    diagnostics: list[str] = Field(default_factory=list)
+    # R-10：多标的分组的成员级摘要——合并只用于**总判定**，但「一个赚一个亏被平均成还行」是这张
+    # 卡最危险的读法。单标的分组 ⇒ 整键缺席（那时它与总判定逐字相同，多挂一行只是噪音）。
+    bySymbol: list[AiTradeAcceptanceSymbolOut] | None = None
+
+
+class AiTradeAcceptanceThresholdsOut(BaseModel):
+    """弹窗的「验收门槛预览」（`GET /ai-trade/horizon-profiles` 的加法块）。
+
+    `custom` 条目的派生阈在 `targetHold*` 未填时为 `null` ⇒ 前端显示「按你填的目标区间派生」。
+    """
+
+    sampleFloor: int
+    minAvgHoldSeconds: float | None = None
+    minWithinTargetRate: float | None = None
+    maxTurnoverPerDay: float | None = None
+    maxFeeToGross: float
+    requiresPositiveNetAfterFunding: bool = True
 
 
 class AiTradeHorizonProfileOut(BaseModel):
@@ -612,6 +727,13 @@ class AiTradeHorizonProfileOut(BaseModel):
     expectedHoldBars: int | None = None
     confirmWindowSeconds: float | None = None
     leverageMaxHint: float | None = None
+    # 开仓侧换手纪律的三个**预览**值（turnover-budget §4.1）；`custom` 恒为 `null`。
+    reentryCooldownSeconds: float | None = None
+    turnoverBudgetPerDay: float | None = None
+    turnoverBudgetCapacity: float | None = None
+    # 验收门槛预览（horizon-acceptance §4.1）：让用户在**选模式那一刻**就看见「这套配置将按什么
+    # 标准被判定」，而不是等跑完一周才发现门槛是什么。全部由后端下发，前端不复制任何一个数。
+    acceptance: AiTradeAcceptanceThresholdsOut | None = None
 
 
 class AiTradeHorizonProfilesOut(BaseModel):
@@ -627,6 +749,11 @@ class AiTradeHorizonProfilesOut(BaseModel):
     estimatedCostBps: float | None = None
     lossReleaseFrac: float
     lossReleaseReturnPctFallback: float
+    # 三个只读运维标志（turnover-budget §4.1 / [P2-4]）：UI 据此如实说明两道新闸是否真的开着、
+    # 以及多久向交易所核实一次兜底——`backstopPollSeconds` 尤其不能让前端硬抄一个 2 分钟。
+    turnoverGateEnabled: bool = True
+    backstopCheckEnabled: bool = True
+    backstopPollSeconds: float = 120.0
     profiles: list[AiTradeHorizonProfileOut] = Field(default_factory=list)
 
 
@@ -1036,6 +1163,12 @@ class AiTradeHistorySummary(BaseModel):
     feeUsd: float = 0.0
     grossPnlUsd: float = 0.0
     costBasisMixed: bool = False
+    # 周期验收闭环（horizon-acceptance [P1-9]）：**在后端合并各成员 run 的原始计数器后判定一次**，
+    # 故这里是一张组级卡而不是 N 张。任一成员缺 `acceptanceInput`（老记录）⇒ 两键缺席 ⇒ 前端整卡
+    # 不渲染（绝不用半组数据冒充整组结论）。
+    horizonAcceptance: AiTradeAcceptanceOut | None = None
+    exits: AiTradeExitMixOut | None = None
+    funding: AiTradeFundingOut | None = None
 
 
 class AiTradeHistoryMember(BaseModel):

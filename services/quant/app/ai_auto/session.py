@@ -33,7 +33,10 @@ from ..strategies.base import Signal
 from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, gate_status
 from .cost_runtime import CostRuntime
 from .decider import AiTradeDecider, TradeDecision
+from .exchange_backstop import BackstopRuntime, schedule_from_executor
+from .exit_attribution import classify_live
 from .hold_horizon import HorizonFacts, HorizonRule, gate_status as horizon_gate_status
+from .horizon_acceptance import ai_stats_keys, build_bundle
 from .horizon_runtime import HorizonRuntime, build_horizon_facts
 from .market_context import build_market_context
 from .market_digest import build_market_digest
@@ -84,6 +87,7 @@ from .trace import (
     sizing_event,
     trace_event,
 )
+from .turnover_discipline import rule_from_horizon as turnover_rule_from_horizon
 from .wake_reason import WakeReadings
 from .wake_runtime import InjectionContext, WakeRuntime
 
@@ -165,7 +169,12 @@ class AiTradeSession:
         # 交易周期模式（holding-horizon §2.4）：同款下沉范式；未装配 ⇒ 无 tradingHorizon 键、prompt
         # 逐字回退、门禁直通、零轨迹。前瞻窗口由契约派生并**同时**喂成本层与先验层（§2.6 要求同源）。
         self.horizon_rule = horizon_rule
-        self._horizon = HorizonRuntime(horizon_rule)
+        # `net_mode`：退出来源账本的净额还原口径，与 `AttributionLedger` **同一条规则**（轴 B）。
+        self._backstop = BackstopRuntime(executor.settings, executor.creds, inst_id)
+        self._horizon = HorizonRuntime(
+            horizon_rule, net_mode=bool(executor.settings.ai_trade_net_pnl_enabled),
+            turnover_rule=turnover_rule_from_horizon(horizon_rule, executor.settings),
+            backstop=self._backstop)
         self._round_horizon: dict | None = None      # 本轮 gate 快照（decision 事件与判定同源）
         hold_bars = None if horizon_rule is None else horizon_rule.expected_hold_bars
         self._cost = CostRuntime(inst_id, executor.settings, executor.fee_ledger,
@@ -300,6 +309,8 @@ class AiTradeSession:
                     self._horizon.note_close(trade, time.time())   # 真实持仓时长样本同挂唯一收口
                 else:   # 开仓成交：锁定 epoch 的 opened_wall（部分成交同一 epoch ⇒ 内部幂等不重置）
                     self._horizon.note_open(trade, time.time(), seq=self._position_seq)
+                    self._backstop.force_next()   # 随单 OCO 是否真的挂上，是开仓后最该立刻知道的事
+                    self._cost.note_open(trade, seq=self._position_seq, now_wall=time.time())
                 self._sizing.note_executor(self.executor, self._current_px())   # [P1-8] 敞口簿
                 self._inject_explain_meta(trade)
                 await self._persist_trade(trade)
@@ -323,6 +334,12 @@ class AiTradeSession:
         # 总闸关闭 ⇒ `last_round_kind` 恒 None ⇒ 本键整体缺席（老数据同样缺席，查询侧按「未知」处理）。
         if explain.get("kind") in _WAKE_ATTRIBUTED_KINDS and self._wake.last_round_kind:
             meta.setdefault("wakeKind", self._wake.last_round_kind)
+        # 退出来源归因（horizon-acceptance 轴 B）：只给平仓成交打，开仓腿无「退出来源」可言。
+        # 打完标后落库 / WS 扇出 / 历史查询 / CSV 导出全部自动带上，无需任何额外通路。
+        # 总闸关 ⇒ 整键缺席（老数据同样缺席，查询侧一律按 "unknown" 处理）。
+        if (trade.get("side") == "close"
+                and self.executor.settings.ai_trade_exit_attribution_enabled):
+            meta.setdefault("exitSource", classify_live(explain))
         explain["meta"] = meta
 
     async def _persist_trade(self, trade: dict) -> None:
@@ -380,6 +397,7 @@ class AiTradeSession:
         self.stop_reason = reason
         self._cancel_task("_monitor_task")
         self._cancel_task("_decision_task")
+        self._backstop.close()   # 在途核实回来后不再写状态、不再推事件（§2.3.1 约束 5）
         if self._ws is not None:
             await self._ws.stop()
         ref_px = self._ref_px()
@@ -463,7 +481,10 @@ class AiTradeSession:
         # §3.1：网络 IO 只跑在盯市 tick 上；三条刷新（资金费率 / 官方费率 / 交易所对账）离开
         # tick 的关键路径跑在后台单飞任务里——串行 await 会把 5s 盯市周期翻倍（I-1）。
         self._cost.schedule_maintenance(time.time(), window_start_ts=self.started_ts,
-                                        trades=self.executor.trades, push=self._push)
+                                        trades=self.executor.trades, push=self._push,
+                                        mark_px=self._current_px())
+        schedule_from_executor(self._backstop, self.executor, now_wall=time.time(),
+                               push=self._push)   # 只读、单飞、仅持仓时发（turnover-budget §2.3.1）
         # 战术窗口刷新**必须**排在定时唤醒之前——否则定时轮拿到的是上一分钟的战术数据，整个特性
         # 在最该生效的路径上空转。三闸门（锚点/配额/单 tick 节流）+ 硬超时保证它不拖停盯市。
         await self._window.maybe_refresh_tactical(now_ts, time.time())
@@ -690,6 +711,12 @@ class AiTradeSession:
             decision, degrade = await self._apply_horizon_gate(round_no, ts, decision, degrade)
             # ★ 利润保护冷却门禁（adaptive §2.2.2）：铁律后、共识前（见 _apply_profit_cooldown_gate）。
             decision, degrade = self._apply_profit_cooldown_gate(decision, degrade)
+            # ★ 换手纪律 G4/G5 与兜底覆盖 G6（turnover-budget §2.2.5）：冷却后、仓位/刹车前。
+            decision, degrade = self._horizon.turnover_gate(
+                decision, degrade, position_side=self.executor.projected,
+                now_wall=time.time())
+            decision, degrade = self._horizon.backstop_gate(
+                decision, degrade, position_side=self.executor.projected)
             decision, degrade = self._sizing.gate(decision, degrade)   # ★ 回撤刹车 / 连亏熔断（第 7 步）
             decision, degrade = self._apply_consensus_gate(decision, consensus, degrade)  # E2 门禁
             # ★ 最小 edge 门禁（§3.7）：共识后、反思前——被拦轮此时已是 hold，而反思对 hold 本就
@@ -1319,8 +1346,10 @@ class AiTradeSession:
         return decision, degrade or reason
 
     async def _expire_profit_cooldown(self) -> None:
-        """冷却到期主动补推一次 `status`（§4.2）——不推则前端 chip 会一直挂着（后端已不再拦，UI 却说在拦）。"""
-        if self._guard.expire_cooldown(time.time()):
+        """两条冷却到期时各补推一次 `status`（§4.2 / turnover-budget [P1-3]）——不推则前端 chip 会
+        一直挂着（后端已不再拦，UI 却说在拦）。**两者都必须求值**：`or` 短路会吞掉另一层的翻转。"""
+        guard_expired = self._guard.expire_cooldown(time.time())
+        if self._horizon.expire_turnover_cooldown(time.time()) or guard_expired:
             await self._push({"type": "status", "data": self._status_payload()})
 
     # ---------- decision / summary 事件 ----------
@@ -1543,9 +1572,18 @@ class AiTradeSession:
                                                            now_wall=time.time()),
                 # 持仓周期快照（§4.4）：供面板 chip 在无决策事件时也能更新倒计时；未装配 ⇒ None。
                 "horizon": self._horizon.last_snapshot,
+                # 验收闭环四键（horizon-acceptance [P0-3] 主通路）：成员级实时刷新走这条既有 WS
+                # status；分组合并口径另走 15s REST 轮询。未装配 / 零样本 ⇒ 各键为 None 而非缺席。
+                **self.acceptance_bundle(),
                 "stopReason": self.stop_reason,
                 "degraded": self.executor.degraded or self._stale_degraded or self.degraded,
                 "flattenFailed": self.flatten_failed, "residual": self.residual}
+
+    def acceptance_bundle(self) -> dict:
+        """验收闭环四键（status / 落库 / 分组合并共用**同一次**装配，绝不两处各算一份）。"""
+        return build_bundle(self._horizon, self._cost,
+                            settings=self.executor.settings,
+                            wall_seconds=time.time() - self.started_ts)
 
     def _wake_interval_minutes(self) -> float | None:
         """墙钟定时唤醒周期回执换算（秒→分，关闭态存 None，与分组/config 口径统一，RN-7）。"""
@@ -1615,6 +1653,7 @@ class AiTradeSession:
             metrics["aiStats"] = self._cost.merge_into(metrics["aiStats"])
             metrics["aiStats"] = self._sizing.merge_into(metrics["aiStats"])   # 同款调用点合并
             metrics["aiStats"] = self._horizon.merge_into(metrics["aiStats"])  # §2.12 验收指标
+            metrics["aiStats"].update(ai_stats_keys(self.acceptance_bundle()))  # 验收闭环四键
         except Exception as exc:  # noqa: BLE001 —— 富化对 finalize 是加法且可失败，绝不阻断落库收尾
             logger.warning("ai-trade finalize enrichment skipped for run %s: %s", self.run_id, exc)
             for key in ("equityDigest", "decisionsDigest", "aiStats"):

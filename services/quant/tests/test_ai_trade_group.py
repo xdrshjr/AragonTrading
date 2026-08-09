@@ -53,6 +53,11 @@ class _FakeSession:
     async def start(self):
         return None
 
+    def acceptance_bundle(self):
+        """验收闭环四键的会话桩（horizon-acceptance）：无成交样本 ⇒ 四键恒 None。"""
+        return {"acceptance": None, "exits": None, "funding": None,
+                "acceptanceInput": None}
+
     async def stop(self, reason="user_stop"):
         self.state = "stopped"
         self.stop_reason = reason

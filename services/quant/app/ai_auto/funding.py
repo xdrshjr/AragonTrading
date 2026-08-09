@@ -31,6 +31,11 @@ class FundingSnapshot:
     next_funding_ts: int
     interval_s: float
     fetched_wall: float
+    # 结算周期是否**真的**来自交易所（ai-trade-horizon-acceptance-loop [P0-1]）。
+    # `interval_s` 有兜底值（`rest_client` 在 span<=0 时回落 8h），因此它永远表达不出「不知道」；
+    # 资金费账本只认这一个布尔量。默认 `False` 是刻意的方向安全选择：单测里直接构造的快照、以及
+    # 升级期尚未刷新过的快照，一律按「未知 ⇒ 不计提」处理，绝不把兜底值当真值记账。
+    interval_known: bool = False
 
 
 class FundingCache:
@@ -72,6 +77,7 @@ class FundingCache:
             funding_ts=int(row.get("fundingTs") or 0),
             next_funding_ts=int(row.get("nextFundingTs") or 0),
             interval_s=float(row.get("intervalS") or 0.0),
+            interval_known=bool(row.get("intervalKnown")),
             fetched_wall=float(now_wall))
         return True
 
@@ -90,4 +96,6 @@ class FundingCache:
         if snap is None:
             return None
         return {"fundingRate": snap.rate, "fundingTs": snap.funding_ts,
-                "nextFundingTs": snap.next_funding_ts, "intervalS": snap.interval_s}
+                "nextFundingTs": snap.next_funding_ts, "intervalS": snap.interval_s,
+                # 排查资金费账本为何不计提时，第一件要看的就是这个键（[P0-1]）。
+                "intervalKnown": snap.interval_known}

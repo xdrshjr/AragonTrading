@@ -44,6 +44,7 @@ from .cost_runtime import build_charter_text
 from .exposure_book import GroupExposureBook
 from .hold_horizon import HorizonRule
 from .hold_horizon import rule_wire as horizon_wire
+from .horizon_acceptance import input_from_wire, merge_bundle
 from .hold_horizon_text import format_charter as format_horizon_charter
 from .market_window import MarketWindow, WindowOptions
 from .profit_guard import ProfitGuardRule
@@ -470,7 +471,14 @@ class AiTradeManager:
                                              req.horizon_rule,
                                              stop_loss_pct=risk.stop_loss_pct,
                                              take_profit_pct=risk.take_profit_pct,
-                                             leverage=ctx.lever),
+                                             leverage=ctx.lever,
+                                             # 「不必每轮盯盘」这句授权只有在**真的有核实通道**
+                                             # 时才成立（turnover-budget §2.3.3）：总闸关或无凭证
+                                             # ⇒ 改口为「尚无核实通道」，绝不据一句未经核实的
+                                             # 承诺让模型放松盯盘。
+                                             backstop_armed=bool(
+                                                 req.settings.ai_trade_backstop_check_enabled
+                                                 and ctx.creds is not None)),
                                          # 仓位与风险层宪章章；三条规则全未装配 → "" ⇒ 渲染逐字节不变
                                          sizing_text=format_sizing_charter(
                                              sizing.rule, sizing.stop_rule, sizing.brake_rule),
@@ -577,7 +585,40 @@ class AiTradeManager:
                 # 字段核对（[P1-9]：只回显入参等于把 expectedHoldBars 的派生关系藏起来）。
                 "tradingHorizon": horizon_wire(group.horizon_rule),
                 "createdTs": group.created_ts,
+                # 验收闭环三键的**分组合并口径**（horizon-acceptance [P0-3] / [P1-9]）：合并的是
+                # 各成员的原始计数器而不是已判定的卡——比例类指标不可平均。本端点由前端 15s 轮询
+                # 消费，是分组口径唯一的实时来源（成员级实时数据仍走既有成员 WS status）。
+                **self._acceptance_bundle(group),
                 "members": [self._member_row(m) for m in group.members]}
+
+    @staticmethod
+    def _acceptance_bundle(group: AiTradeGroup) -> dict:
+        """分组级验收卡 / 退出分布 / 资金费（合并各成员的原始计数器后**判定一次**）。
+
+        settings 取自成员会话的 executor（进程内同一个 Settings 实例），不另建一次解析——
+        「阈值从哪来」在一个分组里只能有一个答案。无成员 ⇒ 三键 `None`。
+        """
+        if not group.members:
+            return {"acceptance": None, "exits": None, "funding": None}
+        bundles = [m.session.acceptance_bundle() for m in group.members]
+        inputs = [inp for inp in (input_from_wire(b.get("acceptanceInput"))
+                                  for b in bundles) if inp is not None]
+        merged = merge_bundle(
+            inputs, rule=group.horizon_rule,
+            settings=group.members[0].session.executor.settings,
+            fundings=[b.get("funding") for b in bundles])
+        out = {key: merged[key] for key in ("acceptance", "exits", "funding")}
+        if out["acceptance"] is not None and len(group.members) > 1:
+            # R-10：合并只用于**总判定**，但一个赚一个亏被平均成「还行」是这张卡最危险的读法，
+            # 故同时下发成员级摘要（笔数 / 净额 / 各自的结论）。单标的分组 ⇒ 整键缺席（那时它
+            # 与总判定逐字相同，多挂一行只是噪音）。
+            out["acceptance"]["bySymbol"] = [
+                {"instId": m.session.inst_id,
+                 "roundTrips": int((b.get("acceptanceInput") or {}).get("roundTrips") or 0),
+                 "netPnlUsd": float((b.get("acceptanceInput") or {}).get("netPnlUsd") or 0.0),
+                 "verdict": (b.get("acceptance") or {}).get("verdict")}
+                for m, b in zip(group.members, bundles)]
+        return out
 
     @staticmethod
     def _member_row(member: AiTradeGroupMember) -> dict:

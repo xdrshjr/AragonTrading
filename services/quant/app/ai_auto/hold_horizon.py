@@ -27,6 +27,13 @@ import math
 from dataclasses import dataclass
 
 from ..okx.types import BAR_SECONDS
+# [P1-9] 依赖方向**单向**：本模块 import `turnover_discipline`（要它的派生式），后者绝不反向
+# import 本模块——反向即成环（`_acceptance_preview` 已在用函数内延迟 import 绕同一类环）。
+from .turnover_discipline import (
+    derive_max_turnover_per_day,
+    derive_reentry_cooldown_s,
+    derive_turnover_capacity,
+)
 
 # 三道闸的稳定标识（进快照 `releasedGates`，前后端镜像；顺序即 §2.3.2 的判定顺序）。
 GATE_MIN_HOLD = "G1"
@@ -157,6 +164,14 @@ class HorizonRule:
     enforce_max_hold: bool = False
     loss_release_frac: float = 0.5
     loss_release_return_pct_fallback: float = 0.10
+    # ---- 开仓侧换手纪律的四个投影字段（turnover-budget §2.2.1）----
+    # 全部由 `resolve_horizon_rule` 按 `turnover_discipline` 的派生式回填（唯一回填点），
+    # 再由 `turnover_discipline.rule_from_horizon` 原样投影成 `TurnoverRule`。
+    # 全默认（冷却 0 + 速率 None）⇒ 投影为 `None` ⇒ 两道新闸整层空转、wire 整键缺席。
+    reentry_cooldown_s: float = 0.0                  # G4；0 = 本闸关闭（不是「无限长」）
+    reentry_scope: str = "same_side"                 # same_side | both
+    turnover_per_day: float | None = None            # G5 速率；None = 本闸关闭
+    turnover_capacity: float = 0.0                   # G5 令牌桶容量（突发额度）
     # 连续被本层拦截 N 轮后注入自察注记（§2.9(e)）；0 = 关闭 ⇒ `blockedStreakNote` 整键缺席。
     note_after_rounds: int = 0
     # 判定价最大允许年龄（秒）：**复用** `ai_trade_profit_guard_max_px_age_s`——「判定价多老算老」
@@ -306,11 +321,15 @@ def resolve_horizon_rule(raw: dict | None, settings, *, bar: str) -> HorizonRule
     target_max = float(_fallback(raw.get("targetHoldMaxSeconds"),
                                  profile.target_hold_max_s or 0.0))
     rounds = int(_fallback(raw.get("exitConfirmRounds"), profile.exit_confirm_rounds or 1))
+    min_hold = float(_fallback(raw.get("minHoldSeconds"), derive_min_hold_s(target_min)))
+    turnover = _resolve_turnover(raw, settings, min_hold_s=min_hold,
+                                 target_hold_min_s=target_min)
     return HorizonRule(
         enabled=True, profile_id=profile.id, title=profile.title,
         target_label=profile.target_label,
-        min_hold_s=float(_fallback(raw.get("minHoldSeconds"), derive_min_hold_s(target_min))),
+        min_hold_s=min_hold,
         exit_confirm_rounds=rounds,
+        **turnover,
         confirm_window_s=_resolve_confirm_window_s(target_min, rounds, bar),
         hysteresis_k=float(_fallback(raw.get("turnoverHysteresisK"),
                                      profile.hysteresis_k or 0.0)),
@@ -323,6 +342,33 @@ def resolve_horizon_rule(raw: dict | None, settings, *, bar: str) -> HorizonRule
             settings.ai_trade_horizon_loss_release_return_pct),
         note_after_rounds=int(settings.ai_trade_horizon_note_after_rounds),
         max_px_age_s=float(settings.ai_trade_profit_guard_max_px_age_s))
+
+
+def _resolve_turnover(raw: dict, settings, *, min_hold_s: float,
+                      target_hold_min_s: float) -> dict:
+    """开仓侧换手纪律四字段的**唯一回填点**（turnover-budget §2.2.1 / §4.2）。
+
+    速率**没有独立配置项**：它恒等于验收卡第 3 行的阈值（D-1）——多一个旋钮就多一次「弹窗承诺
+    6 次、运行期执行 12 次」的机会。用户仍可按会话显式覆盖（`turnoverBudgetPerDay`），此时
+    容量按覆盖后的速率重算，两者不会分叉。两个覆盖入参的语义：`null` ⇒ 派生；`0` ⇒ 显式关闭。
+
+    运维总闸关 ⇒ **四个字段全部回到关闭值**（而不是「填好了但不装配」）：宪章章与 `rule_wire`
+    都直接读这四个字段，若只在投影处拦一道，prompt 就会向模型宣布两条并不存在的约束。
+    """
+    if not settings.ai_trade_horizon_turnover_enabled:
+        return {"reentry_cooldown_s": 0.0, "reentry_scope": "same_side",
+                "turnover_per_day": None, "turnover_capacity": 0.0}
+    cooldown = float(_fallback(raw.get("reentryCooldownSeconds"), derive_reentry_cooldown_s(
+        min_hold_s, frac=float(settings.ai_trade_horizon_reentry_frac))))
+    per_day = _fallback(raw.get("turnoverBudgetPerDay"),
+                        derive_max_turnover_per_day(target_hold_min_s))
+    per_day = None if per_day is None or float(per_day) <= 0 else float(per_day)
+    return {"reentry_cooldown_s": max(0.0, cooldown),
+            "reentry_scope": str(settings.ai_trade_horizon_reentry_scope),
+            "turnover_per_day": per_day,
+            "turnover_capacity": derive_turnover_capacity(
+                per_day, burst_frac=float(settings.ai_trade_horizon_turnover_burst_frac),
+                min_capacity=float(settings.ai_trade_horizon_turnover_min_capacity))}
 
 
 def _resolve_profile(profile_id, settings) -> HorizonProfile:
@@ -349,14 +395,40 @@ def rule_wire(rule: HorizonRule | None) -> dict | None:
             "targetHoldMaxSeconds": rule.target_hold_max_s,
             "expectedHoldBars": rule.expected_hold_bars,
             "gateReverse": rule.gate_reverse,
-            "enforceMaxHold": rule.enforce_max_hold}
+            "enforceMaxHold": rule.enforce_max_hold,
+            # 开仓侧换手纪律的**派生后实际值**（turnover-budget §4.2）：只回显入参等于把派生
+            # 关系藏起来（第 1 轮 P1-9 的纪律），故容量也一并镜像。
+            "reentryCooldownSeconds": rule.reentry_cooldown_s,
+            "reentryScope": rule.reentry_scope,
+            "turnoverBudgetPerDay": rule.turnover_per_day,
+            "turnoverBudgetCapacity": rule.turnover_capacity}
 
 
-def profile_wire(profile: HorizonProfile) -> dict:
+def rule_from_wire(wire: dict | None) -> HorizonRule | None:
+    """`rule_wire` 的逆变换（读 `config_json.tradingHorizon` 复原契约）；未装配 ⇒ `None`。
+
+    只复原**验收判定需要的那几个字段**（目标区间 / 标识 / 标题）——三道闸的运行期参数在一次已
+    结束的会话上没有消费方，凭空复原它们只会给人「这条历史记录还能重跑」的错觉。
+    本函数不参与任何门禁判定，`evaluate_horizon_gate` 的输入输出在本轮零改动（G-2）。
+    """
+    if not isinstance(wire, dict) or not wire.get("enabled"):
+        return None
+    return HorizonRule(
+        profile_id=str(wire.get("profile") or ""), title=str(wire.get("title") or ""),
+        target_label=wire.get("targetLabel"),
+        target_hold_min_s=float(wire.get("targetHoldMinSeconds") or 0.0),
+        target_hold_max_s=float(wire.get("targetHoldMaxSeconds") or 0.0))
+
+
+def profile_wire(profile: HorizonProfile, *, acceptance: dict | None = None,
+                 turnover: dict | None = None) -> dict:
     """预设条目 → `AiTradeHorizonProfileOut` 形状（`custom` 除三个字符串外全为 `null`，[P1-8]）。
 
     `expectedHoldBars` / `confirmWindowSeconds` 是**按该条目自带 bar 的预览值**——实际生效值按用户
     所选 bar 现算（弹窗切换周期后会变），故前端必须把它们当预览而非承诺。
+
+    `acceptance`（horizon-acceptance §4.1）：本模式将被按什么标准判定的**门槛预览**，由调用方从
+    `horizon_acceptance.resolve_thresholds` 现算后传入——阈值的解析点只能有一个，本模块不复算。
     """
     bar = profile.bar
     return {"id": profile.id, "title": profile.title, "description": profile.description,
@@ -372,7 +444,13 @@ def profile_wire(profile: HorizonProfile) -> dict:
                                  else derive_expected_hold_bars(profile.target_hold_max_s, bar)),
             "confirmWindowSeconds": (None if bar is None
                                      else derive_confirm_window_s(profile.target_hold_min_s, bar)),
-            "leverageMaxHint": profile.leverage_max_hint}
+            "leverageMaxHint": profile.leverage_max_hint,
+            "acceptance": acceptance,
+            # 开仓侧换手纪律的三个**预览**值（turnover-budget §4.1）；`custom` 恒 `null`
+            # （沿用 [P1-8]：那些格子是「用户填」，给出数字会让弹窗据一组无意义的值联动）。
+            **(turnover or {"reentryCooldownSeconds": None,
+                            "turnoverBudgetPerDay": None,
+                            "turnoverBudgetCapacity": None})}
 
 
 def profiles_wire(settings, *, estimated_cost_bps: float | None = None) -> dict:
@@ -383,7 +461,53 @@ def profiles_wire(settings, *, estimated_cost_bps: float | None = None) -> dict:
             "lossReleaseFrac": float(settings.ai_trade_horizon_loss_release_frac),
             "lossReleaseReturnPctFallback": float(
                 settings.ai_trade_horizon_loss_release_return_pct),
-            "profiles": [profile_wire(PROFILES[key]) for key in PROFILES]}
+            # 三个只读运维标志（turnover-budget §4.1 / [P2-4]）：UI 据此如实说明「这两道闸是否
+            # 真的开着 / 多久向交易所核实一次」。第三个尤其重要——弹窗那句「每 N 分钟核实一次」
+            # 若硬抄配置值，运维改了配置而文案不动，就又造出一句没核实的话。
+            "turnoverGateEnabled": bool(settings.ai_trade_horizon_turnover_enabled),
+            "backstopCheckEnabled": bool(settings.ai_trade_backstop_check_enabled),
+            "backstopPollSeconds": float(settings.ai_trade_backstop_poll_ttl_s),
+            "profiles": [profile_wire(PROFILES[key], acceptance=_acceptance_preview(
+                settings, PROFILES[key]), turnover=_turnover_preview(
+                settings, PROFILES[key])) for key in PROFILES]}
+
+
+def _turnover_preview(settings, profile: HorizonProfile) -> dict:
+    """本模式的开仓侧换手纪律预览（turnover-budget §4.1）。
+
+    与 `_acceptance_preview` 同款姿态：数字全部由后端按**唯一那份派生式**现算，前端一个都不算
+    （R-3 / G-10）。`custom` 未填目标区间 ⇒ 三个值恒 `null` ⇒ 弹窗不渲染那两行契约摘要。
+    """
+    target_min = profile.target_hold_min_s
+    if target_min is None or float(target_min) <= 0:
+        return {"reentryCooldownSeconds": None, "turnoverBudgetPerDay": None,
+                "turnoverBudgetCapacity": None}
+    per_day = derive_max_turnover_per_day(target_min)
+    return {"reentryCooldownSeconds": derive_reentry_cooldown_s(
+                derive_min_hold_s(target_min),
+                frac=float(settings.ai_trade_horizon_reentry_frac)),
+            "turnoverBudgetPerDay": per_day,
+            "turnoverBudgetCapacity": derive_turnover_capacity(
+                per_day, burst_frac=float(settings.ai_trade_horizon_turnover_burst_frac),
+                min_capacity=float(settings.ai_trade_horizon_turnover_min_capacity))}
+
+
+def _acceptance_preview(settings, profile: HorizonProfile) -> dict:
+    """本模式的验收门槛预览（horizon-acceptance §4.1）。
+
+    阈值一律由 `horizon_acceptance.resolve_thresholds` 现算——弹窗里写的门槛与会话跑起来之后真正
+    据以判定的门槛必须是同一个数，前端与本模块都不许自己再乘一遍（本仓库已为「前后端各存一份口径
+    静默漂移」出过事故）。`custom` 未填目标区间 ⇒ 派生阈为 `null` ⇒ 前端显示「按你填的区间派生」。
+    """
+    from .horizon_acceptance import resolve_thresholds
+    th = resolve_thresholds(settings, HorizonRule(
+        target_hold_min_s=float(profile.target_hold_min_s or 0.0),
+        target_hold_max_s=float(profile.target_hold_max_s or 0.0)))
+    return {"sampleFloor": th.sample_floor, "minAvgHoldSeconds": th.min_avg_hold_s,
+            "minWithinTargetRate": th.min_within_target_rate,
+            "maxTurnoverPerDay": th.max_turnover_per_day,
+            "maxFeeToGross": th.max_fee_to_gross,
+            "requiresPositiveNetAfterFunding": True}
 
 
 # ============================ §2.3.1 豁免矩阵（冻结） ============================
@@ -478,11 +602,19 @@ def _fmt_minutes(seconds: float) -> str:
     return f"{seconds / 60.0:.0f}m"
 
 
-def build_snapshot(rule: HorizonRule, state: HorizonState, facts: HorizonFacts) -> dict:
+def build_snapshot(rule: HorizonRule, state: HorizonState, facts: HorizonFacts, *,
+                   turnover: dict | None = None,
+                   backstop: dict | None = None) -> dict:
     """§5.4 形状的 wire 快照（payload / decision / status / trace 共用的**唯一真源**）。
 
     纯函数：状态推进由 `HorizonRuntime` 负责，本函数只读。文案模块 `hold_horizon_text` 只读本产物、
     **绝不重算任何一个数**（`profit_guard_text` 的 `[R-5]` 教训）。
+
+    Args:
+        turnover: 开仓侧换手纪律 wire（turnover-budget §5.4）；`None` ⇒ **整键缺席**
+            （不是 `null`）——键缺席是本仓库「prompt 逐字节回退」的既定判据。
+            **空仓分支同样要带它**：`flat` 恰是 G4/G5 唯一真正会拦人的状态（[P0-3]）。
+        backstop: 交易所侧兜底核实 wire；`None` ⇒ 整键缺席（回测恒缺席，D-5）。
     """
     hold_s = max(0.0, float(facts.now_wall) - float(state.opened_wall)) if state.epoch else 0.0
     return_pct = _return_pct(facts)
@@ -524,6 +656,10 @@ def build_snapshot(rule: HorizonRule, state: HorizonState, facts: HorizonFacts) 
         "exchangeTakeProfitPx": facts.exchange_tp_px,
     }
     snapshot.update(_confirm_window_wire(rule, state, facts))
+    if turnover is not None:
+        snapshot["turnover"] = turnover
+    if backstop is not None:
+        snapshot["backstop"] = backstop
     if rule.note_after_rounds > 0 and state.blocked_streak >= rule.note_after_rounds:
         # §2.9(e)：**只在武装时才有这个键**（未武装 ⇒ 整键缺席 ⇒ prompt 逐字节回退）。文案里的数
         # 全部取自本快照的 `blockedStreak` / `minHoldRemainingSeconds`，渲染层不重算。

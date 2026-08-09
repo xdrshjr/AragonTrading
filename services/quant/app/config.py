@@ -329,6 +329,53 @@ class Settings(BaseSettings):
     ai_trade_horizon_note_after_rounds: int = Field(default=3, ge=0)
     # 判定价年龄阈**刻意不新增字段**，复用 `ai_trade_profit_guard_max_px_age_s`（90s）——
     # 「判定价多老算老」在一个会话里只能有一个答案。
+    # ---- 交易周期模式 · 开仓侧换手纪律（ai-trade-turnover-budget-and-backstop §5.1）----
+    # 第 1 轮的三道闸只约束「平」，留下一条完整的合法绕行路径：开仓 → 持够最短窗口 → 平仓 →
+    # 下一轮立刻同向重开。本段补上「不许过快重开」的另一半（G4 再入场冷却 + G5 换手预算）。
+    # 总闸关 ⇒ 两道闸整层不装配、`horizon.turnover` 整键缺席、prompt 逐字节回退。
+    ai_trade_horizon_turnover_enabled: bool = True
+    ai_trade_horizon_turnover_backtest_enabled: bool = True   # 回测侧独立总闸（沿用既有先例）
+    # G4：再入场冷却 = frac × min_hold_s。0 ⇒ 关闭本闸（不是「无限长」）。
+    ai_trade_horizon_reentry_frac: float = Field(default=0.5, ge=0, le=4)
+    ai_trade_horizon_reentry_scope: Literal["same_side", "both"] = "same_side"
+    # G5：令牌桶。速率**不在此处配置**——它恒等于验收卡第 3 行的阈值（§2.2.1 / D-1），另开一个
+    # 旋钮就等于允许「弹窗承诺 6 次、运行期执行 12 次」这种自相矛盾。
+    ai_trade_horizon_turnover_burst_frac: float = Field(default=0.5, gt=0, le=1)
+    # 容量下限 2 是刻意的安全阀（D-2）：`trend_hold` 速率是 1 次/日，容量若也取 1，则一次早期止损
+    # 之后会话要整整 22 小时开不出下一单——那正是 `hold-inertia` 那一轮的「永不开单」形态。
+    ai_trade_horizon_turnover_min_capacity: float = Field(default=2.0, ge=1, le=100)
+    # ---- 交易所侧兜底真值化（§2.3）----
+    # 「交易所侧还有兜底」是一句从未被核实过的话（真源是本地成交回执，从不查交易所），而它恰是
+    # 跨日模式「不必每轮盯盘」的唯一授权来源。总闸关 ⇒ 一个请求都不发、兜底文案逐字回退到本地
+    # 回执口径（并如实说明「本会话尚无核实通道」）。**本轮明确不做自动补挂 / 重挂**（§2.3.5）：
+    # 那需要一条全新的下单写路径，与本仓库全部 AI 侧安全层「绝不新增下单路径」的纪律冲突。
+    ai_trade_backstop_check_enabled: bool = True
+    ai_trade_backstop_poll_ttl_s: float = Field(default=120.0, ge=30, le=3600)
+    ai_trade_backstop_timeout_s: float = Field(default=6.0, gt=0, le=30)
+    # 核实结果的最大可信年龄；超过即从 `exchange` 降级为 `unavailable(stale)`（绝不拿旧读数背书）。
+    ai_trade_backstop_max_age_s: float = Field(default=300.0, ge=60, le=86400)
+    ai_trade_backstop_min_coverage: float = Field(default=0.999, gt=0, le=1)
+    ai_trade_backstop_gate_scale_in: bool = True      # G6；关 ⇒ 只报不拦
+    # ---- AI 自动交易 · 持仓周期验收闭环（ai-trade-horizon-acceptance-loop §5.1）----
+    # 轴 A：资金费真值化。总闸关 ⇒ 账本恒空转、`aiStats.funding` 整键缺席、验收卡第 5 行判
+    # insufficient。本开关**必须**并进 `CostRuntime` 里 `FundingCache` 的 enabled 析取式
+    # （cost_runtime.py，[P1-7]），否则本层开着、资金费率快照却被 `ai_trade_cost_awareness_enabled`
+    # 连坐关死，卡片只会说「口径不可得」而说不出是被谁关的。
+    ai_trade_funding_ledger_enabled: bool = True
+    # 结算周期合理性区间：交易所读数落在区间外即视为坏读数 ⇒ 本次**不计提**（不猜 8h，调查约束 #7）。
+    # 与 `cost_model` 的处置**有意不对称**（§九 D-9）：成本估算宁可按 8h 保守高估，记账宁可不记——
+    # 两层的失败方向不同，绝不把一个猜出来的数当真值上报。
+    ai_trade_funding_min_interval_s: float = Field(default=1800.0, gt=0, le=86400)
+    ai_trade_funding_max_interval_s: float = Field(default=28800.0, gt=0, le=86400)
+    ai_trade_funding_backtest_enabled: bool = True    # 回测侧历史费率曲线运维总闸
+    ai_trade_funding_history_max_pages: int = Field(default=8, ge=1, le=50)
+    # 轴 B：退出来源归因。关 ⇒ `explain.meta.exitSource` 整键缺席（老数据同样缺席，查询侧按 unknown）。
+    ai_trade_exit_attribution_enabled: bool = True
+    # 轴 C：周期验收卡（五行判据 + 退出来源分布）。关 ⇒ acceptance 整键为 null。
+    ai_trade_acceptance_enabled: bool = True
+    ai_trade_acceptance_min_round_trips: int = Field(default=20, ge=1, le=1000)
+    ai_trade_acceptance_min_within_target_rate: float = Field(default=0.6, ge=0, le=1)
+    ai_trade_acceptance_max_fee_to_gross: float = Field(default=0.35, gt=0, le=10)
     # ---- 成本记账与最小 edge 门禁（ai-trade-cost-accounting-and-edge-gate §3.9）----
     # 本段全部字段的**作用域是 AI 会话**：`FeeLedger` 只由 `ai_auto/manager.py` 经 `LiveExecutor` 的
     # `fee_ledger=` 构造缝注入，`live_auto`（非 AI）恒传 None ⇒ 这些开关取任何值都不影响非 AI 链路

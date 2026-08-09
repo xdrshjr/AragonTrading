@@ -9,6 +9,8 @@
 """
 from __future__ import annotations
 
+import math
+
 from .hold_horizon import (
     RELEASE_EPOCH_ESTIMATED,
     RELEASE_LOSS,
@@ -21,6 +23,17 @@ from .hold_horizon import (
 
 # 跨日门槛（秒）：目标持仓上界达到一整天即视为「跨日持仓」，宪章须点名交易所侧兜底（§2.8）。
 _CROSS_DAY_SECONDS = 86400.0
+
+_SIDE_LABEL = {"long": "多头", "short": "空头"}
+
+# 兜底核实不可得的原因标签（turnover-budget §2.3.3）；缺省 ⇒「尚未核实」。
+_BACKSTOP_REASON_LABEL = {
+    "disabled": "核实通道未开启",
+    "no_creds": "未接入交易所凭证",
+    "not_run": "本会话尚未跑过一次核实",
+    "error": "最近一次核实失败",
+    "stale": "最近一次核实已过期",
+}
 
 _RELEASE_LABEL = {
     RELEASE_LOSS: "浮亏已达解除阈",
@@ -45,6 +58,16 @@ def _fmt_duration(seconds) -> str:
     return f"{value / 86400:g} 天"
 
 
+def _fmt_ago(seconds) -> str:
+    """「多久之前」的人话；秒级也要说得出口（`_fmt_duration` 在 60s 以下会把 42s 说成「1 分钟」，
+    而兜底核实的新鲜度恰恰是这一段最有信息量——「42s 前核实过」与「1 分钟前」读感差很远）。"""
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return "刚刚"
+    return f"{value:.0f}s" if value < 60 else _fmt_duration(value)
+
+
 def _fmt_pct(value) -> str:
     try:
         return f"{float(value) * 100:.2f}%"
@@ -57,7 +80,8 @@ def _fmt_px(value) -> str:
 
 
 def format_charter(rule: HorizonRule | None, *, stop_loss_pct: float | None = None,
-                   take_profit_pct: float | None = None, leverage: float = 1.0) -> str:
+                   take_profit_pct: float | None = None, leverage: float = 1.0,
+                   backstop_armed: bool = False) -> str:
     """系统 prompt 的持仓周期宪章章（§2.9）；未装配 → **空串垫片**（渲染逐字节不变、零回归）。
 
     软引导层：让 Agent 知道并主动遵守目标周期（否则它会反复撞墙、白烧轮次）；硬保证仍是
@@ -68,6 +92,9 @@ def format_charter(rule: HorizonRule | None, *, stop_loss_pct: float | None = No
         stop_loss_pct: 单仓交易所侧 OCO 止损%（`loss_release` 阈的派生源；`None` = 走服务端默认）。
         take_profit_pct: 单仓 OCO 止盈%（跨日模式的兜底披露用）。
         leverage: 本会话杠杆（保证金收益率口径的换算因子）。
+        backstop_armed: 本会话是否具备**向交易所核实**兜底的通道（turnover-budget §2.3.3）。
+            跨日那句「即使本进程退出它们依然生效，故你不必每轮盯盘」是模型放松盯盘的直接授权
+            来源，它必须与证据强度一致：没有核实通道就不能说这句话。
     """
     if rule is None or not rule.enabled:
         return ""
@@ -82,7 +109,7 @@ def format_charter(rule: HorizonRule | None, *, stop_loss_pct: float | None = No
         "**这三条只约束你自己发起的换手**：交易所侧止损止盈、利润保护层、会话级止盈止损、强制时间"
         "平仓一律不受本层限制，它们随时可以把仓位平掉。**利润保护层有它自己的最短持有期，与本层无关、"
         "不受本层影响**。\n"
-        f"{_exchange_line(rule, stop_loss_pct, take_profit_pct)}"
+        f"{_exchange_line(rule, stop_loss_pct, take_profit_pct, backstop_armed)}"
         "**单根分钟级回撤不构成平仓理由**：执行周期与更高周期的持仓逻辑未失效之前，战术周期的反向"
         "信号只应影响你的离场**价位**，不应影响你的离场**决定**。需要离场时，请先说明「持仓理由已经"
         "失效」的新证据，再给出 `close`。"
@@ -108,16 +135,44 @@ def _gate_lines(rule: HorizonRule) -> str:
     if rule.hysteresis_k > 0:
         lines.append(f"  · 获利了结需浮盈覆盖 {rule.hysteresis_k:g}× 往返成本"
                      "（浮亏离场不受此限）。\n")
+    lines.extend(_turnover_gate_lines(rule))
     if not lines:
         lines.append("  · 本会话未开启任何硬性换手约束（自定义模式全默认）。\n")
     return "".join(lines)
 
 
-def _exchange_line(rule: HorizonRule, stop_loss_pct, take_profit_pct) -> str:
+def _turnover_gate_lines(rule: HorizonRule) -> list[str]:
+    """开仓侧换手纪律的两条宪章行（turnover-budget §2.2.7）；空转的闸**整行省略**。
+
+    与上面三条的关键差别必须写进去：那三条约束「平」，这两条约束「开」。不点破这一点，模型会把
+    它读成「连平仓也更严了」，然后在最该止损的时候犹豫——那是本层最不该造成的副作用。
+    """
+    lines: list[str] = []
+    if rule.reentry_cooldown_s > 0:
+        lines.append(f"  · 平掉一笔持仓后 {_fmt_duration(rule.reentry_cooldown_s)} 内"
+                     "不接受你**同向重新开仓**（反向不受限）。\n")
+    if rule.turnover_per_day is not None:
+        lines.append(f"  · **本会话**每日最多 {rule.turnover_per_day:g} 次完整往返，"
+                     f"突发额度 {rule.turnover_capacity:g} 次（会话重启后预算重新计算）；"
+                     "超出即暂停开新仓。\n")
+    if lines:
+        lines.append("  · 以上两条**只约束建立新敞口的那一腿**：平仓 `close`、观望 `hold`、"
+                     "撤单 `cancel_order` 与同向加仓永不受限；你若提议反手，"
+                     "**平仓那一腿一定会执行**，只有反向的新开仓那一腿会被推迟。\n")
+    return lines
+
+
+def _exchange_line(rule: HorizonRule, stop_loss_pct, take_profit_pct,
+                   backstop_armed: bool = False) -> str:
     """跨日模式的交易所侧兜底披露（§2.8）；非跨日 ⇒ 空串（不写与本轮无关的噪音）。
 
     诚实约束（沿用 `_format_unavailable_fallback` 的 v1 终审 RV-1）：两个 pct 皆为空 ⇒ 交易所侧
     **真的没挂单**，此时绝不能宣称还有一条并不存在的兜底。
+
+    turnover-budget §2.3.3 把同一条纪律推进一层：**pct 非 0 也不等于单还在**。这两个数的真源是
+    本地成交回执，而「即使本进程退出它们依然生效，故你不必每轮盯盘」正是模型放松盯盘的直接授权
+    来源。没有核实通道（`backstop_armed=False`）时必须改口——让模型据一句未经核实的承诺去放松
+    盯盘，是本特性最大的一处安全债。
     """
     if rule.target_hold_max_s < _CROSS_DAY_SECONDS:
         return ""
@@ -129,24 +184,82 @@ def _exchange_line(rule: HorizonRule, stop_loss_pct, take_profit_pct) -> str:
     if not parts:
         return ("**本会话跨日持有，但交易所侧未挂止盈止损**——进程退出后没有任何持久化兜底，"
                 "退出完全由你与本进程负责。\n")
+    if not backstop_armed:
+        return (f"本会话跨日持有，开仓时已随单挂出交易所侧{' / '.join(parts)}——但这两个数来自"
+                "**本地下单回执**，本会话**尚无向交易所核实的通道**，故请不要把「不必盯盘」"
+                "当作前提。\n")
     return (f"本会话跨日持有，开仓时已随单挂出交易所侧{' / '.join(parts)}——"
-            "即使本进程退出它们依然生效，故你**不必每轮盯盘**，可以按目标周期规划退出。\n")
+            "即使本进程退出它们依然生效，故你**不必每轮盯盘**，可以按目标周期规划退出。"
+            "本会话会定期向交易所核实它们是否仍然挂着，核实结果每轮如实告诉你；"
+            "**一旦核实不到，请立即收紧退出计划**。\n")
 
 
 def format_horizon_for_prompt(wire: dict | None) -> str:
     """决策 prompt 的每轮只读上下文段（§2.9）；键缺失 ⇒ `""` ⇒ 调用方整段省略（逐字节回退）。
 
-    无持仓时只出一行「本轮空仓、本层不约束开仓」——那正是模型最需要知道的一件事：**开仓不受本层
-    限制**，不写会让它以为周期模式也在拦开单。
+    [P0-3] 空仓分支**不再早退**：`flat` 恰是 G4/G5 唯一真正会拦人的状态。原句「本层不约束开仓」
+    今天已经是假的——落地后的形态会是「每轮告诉模型开仓不受限 → 模型开仓 → 被降级为 hold →
+    模型把被拦当成新证据自我怀疑」，即 `hold-inertia` 那条教训，而且是系统主动说反话。
+    两道新闸都未激活时 `_turnover_line` 返回空串，拼接后与本轮之前**逐字节相同**（S-13 守它）。
     """
     if not wire:
         return ""
     head = f"【交易周期 · {wire.get('title')}（{wire.get('targetLabel') or '自定义'}）】"
     if wire.get("status") == STATUS_FLAT:
-        return f"{head}\n  当前空仓：本层**不约束开仓**；开仓后将按上述目标周期约束你的主动平仓。"
+        return "\n".join(part for part in [f"{head}\n  {_flat_line(wire)}",
+                                           _turnover_line(wire)] if part)
     lines = [head, _hold_line(wire), _confirm_line(wire), _hysteresis_line(wire),
-             _release_line(wire), _exchange_snapshot_line(wire), _blocked_note_line(wire)]
+             _release_line(wire), _turnover_line(wire), _exchange_snapshot_line(wire),
+             _blocked_note_line(wire)]
     return "\n".join(part for part in lines if part)
+
+
+def _flat_line(wire: dict) -> str:
+    """空仓那一句（[P0-3]）：措辞取决于**换手纪律层是否装配**，而不是两道闸此刻是否激活。
+
+    这是本轮对 spec §2.2.7 内部矛盾的取舍（见 §十一 实施发现）：spec 既要求「原句里『不约束开仓』
+    四个字必须改掉」，又要求「两闸未激活时拼接后与今天逐字节相同」——两者不可兼得。按**装配**分支
+    才同时守住两端：
+      · 未装配（总闸关 / custom 全默认 ⇒ `turnover` 整键缺席）⇒ 逐字返回今天这句，G-1 冻结门禁成立；
+      · 已装配 ⇒ 绝不再说「不约束开仓」。此时哪怕两道闸此刻恰好都没激活，它们**下一轮就可能拦**，
+        按「此刻是否激活」分支等于把一句随时会变成假话的承诺继续说出口。
+    """
+    if not isinstance(wire.get("turnover"), dict):
+        return "当前空仓：本层**不约束开仓**；开仓后将按上述目标周期约束你的主动平仓。"
+    return "当前空仓：本层**不约束你的平仓能力**；开仓后将按上述目标周期约束主动平仓。"
+
+
+def _turnover_line(wire: dict) -> str:
+    """换手纪律一行（turnover-budget §2.2.7）；两个闸都未激活 ⇒ **空串** ⇒ 整行省略。
+
+    沿用 `format_profit_cooldown` 的既有教训：只说「被拦」而不说「还剩多久 / 什么不受限」，
+    会让模型每轮重复提议、每轮被拦、每轮把被拦当成新证据——既烧 LLM 又污染上下文。故这一行
+    必须同时给出**剩余时间**、**豁免范围**与**反手的处置**。
+    """
+    turnover = wire.get("turnover")
+    if not isinstance(turnover, dict):
+        return ""
+    parts: list[str] = []
+    if turnover.get("cooldownActive"):
+        side = _SIDE_LABEL.get(str(turnover.get("cooldownSide") or ""), "同向")
+        scope = ("**开仓（做多与做空）都会被拦截**" if turnover.get("cooldownScope") == "both"
+                 else f"**{side}开仓会被拦截并降级为观望**（反向不受影响）")
+        parts.append(f"刚平掉一笔{side}持仓，接下来 "
+                     f"{_fmt_duration(turnover.get('cooldownRemainingSeconds'))}内{scope}")
+    if turnover.get("budgetEnabled") and float(turnover.get("tokens") or 0.0) < 1.0:
+        nxt = turnover.get("nextTokenSeconds")
+        eta = "" if nxt is None else f"，下一枚约 {_fmt_duration(nxt)}后到账"
+        parts.append(f"**本会话**换手预算余 {float(turnover.get('tokens') or 0.0):.1f}"
+                     f" / {float(turnover.get('capacity') or 0.0):g} 枚"
+                     f"（上限 {turnover.get('perDay')} 次/日，会话重启后重新计算）{eta}")
+    if not parts:
+        return ""
+    return ("  【交易周期 · 换手纪律】" + "；".join(parts) + "。\n"
+            "  **平仓 `close`、观望 `hold`、撤单 `cancel_order` 不受任何影响；"
+            "若你此刻持仓并提议反手，平仓那一腿一定会执行，只有反向的新开仓那一腿会被推迟。**\n"
+            "  这两条限制的目的与你的目标持仓周期一致：一次往返的手续费是确定的，而一次立刻的"
+            "重开需要一个比上一次更强的理由。若你认为现在确实存在这样的理由，请把它写进 "
+            "`reason`——它会被记录下来，用于事后核对预算闸是否设得过紧。")
 
 
 def _hold_line(wire: dict) -> str:
@@ -203,11 +316,60 @@ def _release_line(wire: dict) -> str:
 
 
 def _exchange_snapshot_line(wire: dict) -> str:
-    """交易所侧兜底一行（只读转发 `profit_guard` 快照，§2.8 第 3 条；两者皆空 ⇒ 如实说没有）。"""
+    """交易所侧兜底一行（§2.8 第 3 条 + turnover-budget §2.3.3 的五分支）。
+
+    `backstop` 键缺席（总闸关 / 回测 / 未装配）⇒ **逐字返回本轮之前的那两句**（冻结用例守，
+    保证「不开轴 B 的会话 prompt 一个字节都不变」）。键在场时按 `basis` 分五支，核心纪律：
+    **核实到才敢说「进程退出后仍生效」**；`coverageRatio is None` 是「还不知道」，绝不渲染成
+    「确认裸露」那句确定的坏消息（[P0-2] / D-14）。
+    """
     sl, tp = wire.get("exchangeStopLossPx"), wire.get("exchangeTakeProfitPx")
-    if sl is None and tp is None:
+    backstop = wire.get("backstop")
+    if not isinstance(backstop, dict):
+        if sl is None and tp is None:
+            return "  交易所侧未挂止盈止损——此刻没有任何持久化兜底。"
+        return f"  交易所侧兜底：止盈 {_fmt_px(tp)} / 止损 {_fmt_px(sl)}（进程退出后仍生效）。"
+    if backstop.get("basis") != "exchange":
+        return _unverified_backstop_line(backstop, sl, tp)
+    ago = _fmt_ago(backstop.get("checkedAgoSeconds"))
+    if backstop.get("mismatch"):
+        return ("  ⚠ **本地记录声称挂过止损，但向交易所核实的结果是未覆盖（0%）**——"
+                "此刻没有任何持久化兜底，本进程是唯一的退出执行者。"
+                "请据此收紧你的退出计划，不要按「有兜底」规划持有。")
+    if not backstop.get("hasStop"):
+        return (f"  交易所侧现在**没有**任何止损委托（{ago}前核实）——"
+                "退出完全由你与本进程负责。")
+    stop_px = _fmt_px(backstop.get("stopLossPx"))
+    ratio = backstop.get("coverageRatio")
+    if ratio is None:
+        return (f"  交易所侧确认存在一张止损委托 {stop_px}（{ago}前核实）——"
+                "**但交易所未回报可核对的委托张数，本会话无法确认它是否覆盖了全部持仓**。"
+                "请按「至少有一张、但未必覆盖全部」规划退出。")
+    if float(ratio) < 0.999:
+        return (f"  ⚠ 交易所侧止损只覆盖了当前持仓的 {float(ratio) * 100:.0f}%"
+                f"（{ago}前核实）——未覆盖部分在本进程退出后**没有**兜底。")
+    return (f"  交易所侧兜底：止损 {stop_px}（已于 {ago}前向交易所核实，覆盖 "
+            f"{float(ratio) * 100:.0f}%）——**进程退出后仍生效**。")
+
+
+def _unverified_backstop_line(backstop: dict, sl, tp) -> str:
+    """`local` / `unavailable` 两态的同一句话：本地口径 + **本会话尚未向交易所核实**。
+
+    两态刻意共用一句：对模型而言「还没查」与「查失败」的**行动含义完全相同**——都不能据此
+    假定兜底在进程退出后仍然生效。差别只在括号里的原因，那是给人看的。
+    """
+    reason = _BACKSTOP_REASON_LABEL.get(str(backstop.get("unavailableReason") or ""),
+                                        "尚未核实")
+    parts = []
+    if sl is not None:
+        parts.append(f"止损 {_fmt_px(sl)}")
+    if tp is not None:
+        parts.append(f"止盈 {_fmt_px(tp)}")
+    if not parts:
         return "  交易所侧未挂止盈止损——此刻没有任何持久化兜底。"
-    return f"  交易所侧兜底：止盈 {_fmt_px(tp)} / 止损 {_fmt_px(sl)}（进程退出后仍生效）。"
+    return (f"  交易所侧兜底（**本地回执口径**）：{' / '.join(parts)}——"
+            f"**本会话尚未向交易所核实**（{reason}），"
+            "故不能据此假定它在进程退出后仍然生效。")
 
 
 def _blocked_note_line(wire: dict) -> str:
@@ -243,11 +405,18 @@ def format_reflection_note(wire: dict | None) -> str:
     )
 
 
-def format_backtest_notes(rule: HorizonRule | None, bar_seconds: int) -> list[str]:
+def format_backtest_notes(rule: HorizonRule | None, bar_seconds: int, *,
+                          turnover=None) -> list[str]:
     """回测结果的分辨率免责（§2.10 / [P2-7]）；未装配 ⇒ `[]`。
 
     **必须点名具体模式**：`hourly_swing`（5m 执行 + 180s 窗口）在回测里 G1 恒不生效，不写清楚用户
     仍会拿这份回测去为实盘的 G1 背书。
+
+    Args:
+        rule: 已装配周期契约。
+        bar_seconds: 本次回测的执行周期秒数。
+        turnover: 回测侧实际装配的 `TurnoverRule`（`None` = 两道新闸在本次回测里整层空转 ⇒
+            三句新免责整体省略，既有回测 notes 逐字节不变）。
     """
     if rule is None or not rule.enabled:
         return []
@@ -262,4 +431,26 @@ def format_backtest_notes(rule: HorizonRule | None, bar_seconds: int) -> list[st
     if 0 < rule.confirm_window_s < bar_seconds:
         notes.append(f"⚠ 本模式的离场确认窗口 {rule.confirm_window_s:g}s 小于一根 K 线，回测中该窗口"
                      "恒于次根即已到期，连续确认闸相对实盘偏松。")
+    notes.extend(_turnover_backtest_notes(turnover, rule, bar_seconds))
+    return notes
+
+
+def _turnover_backtest_notes(turnover, rule: HorizonRule,
+                             bar_seconds: int) -> list[str]:
+    """开仓侧换手纪律与轴 B 的三句回测免责（turnover-budget §2.4.4）；未装配 ⇒ `[]`。"""
+    if turnover is None:
+        return []
+    notes = [
+        "回测**不装配**交易所侧兜底核实（回测没有交易所），G6 覆盖闸恒放行；本次回测结论"
+        "不覆盖「交易所侧兜底是否真的挂着」这一轴。",
+        # [P2-5]：反手被换手闸拦下时降级为平仓（退出腿保留、再入场腿否掉），退出来源分布随之偏移。
+        "被换手闸拦下的**反手**会降级为平仓（退出腿保留、再入场腿否掉），故这类退出在退出来源"
+        "分布里记为「Agent 主动平仓」而非「Agent 反手」；两轮之间对比该分布时须知道这一点。"]
+    cooldown = float(getattr(turnover, "reentry_cooldown_s", 0.0) or 0.0)
+    if cooldown <= 0:
+        return notes
+    grain = ("**回测中恒不生效**" if cooldown < bar_seconds
+             else f"{math.ceil(cooldown / bar_seconds):g} 根")
+    notes.insert(0, f"回测按根推进，再入场冷却的实际生效粒度是 ceil({cooldown:g}s / 一根)："
+                    f"本模式（{rule.profile_id}）冷却 {cooldown:g}s、一根 {bar_seconds}s ⇒ {grain}。")
     return notes

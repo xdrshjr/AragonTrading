@@ -337,12 +337,49 @@ async def get_ai_trade_group_detail(session: AsyncSession, group_id: str) -> dic
             "trades": trades_by_run.get(run.id, []),
         })
     agg = _aggregate_group(runs, trades_by_run)
+    summary = {**agg["summary"], **_merge_acceptance(members, runs)}
     return {
         "groupId": group_id, "strategyName": agg["strategyName"], "bar": agg["bar"],
         "startedTs": agg["startedTs"], "endedTs": agg["endedTs"], "status": agg["status"],
         "totalBudgetUsd": agg["totalBudgetUsd"], "costBasisAssumed": agg["costBasisAssumed"],
-        "members": members, "summary": agg["summary"],
+        "members": members, "summary": summary,
     }
+
+
+def _merge_acceptance(members: list[dict], runs: list[StrategyRun]) -> dict:
+    """把各成员 run 的 `acceptanceInput` 合并成**一张**组级验收卡（[P1-9]）。
+
+    历史是**按成员 run 落库**的，而 `build_acceptance` 的产物是一张**已判定的卡**——前端无法把
+    3 张卡合并成 1 张（比例类指标不可平均），`merge_inputs` 只存在于后端，故合并必须在这里做。
+
+    **任一成员缺 `acceptanceInput`（本特性上线前的老记录）⇒ 整键缺席**：绝不用部分成员的数据
+    冒充整组结论。周期契约取自成员 run 的 `config.tradingHorizon`（分组共享同一份）。
+    """
+    from ..ai_auto.horizon_acceptance import input_from_wire, merge_bundle
+    wires = [(m.get("metrics") or {}).get("aiStats", {}).get("acceptanceInput")
+             for m in members]
+    if not wires or any(w is None for w in wires):
+        return {}
+    inputs = [inp for inp in (input_from_wire(w) for w in wires) if inp is not None]
+    rule = _group_horizon_rule(runs)
+    if rule is None or not inputs:
+        return {}
+    fundings = [(m.get("metrics") or {}).get("aiStats", {}).get("funding")
+                for m in members]
+    merged = merge_bundle(inputs, rule=rule, settings=get_settings(), fundings=fundings)
+    return {"horizonAcceptance": merged["acceptance"], "exits": merged["exits"],
+            "funding": merged["funding"]}
+
+
+def _group_horizon_rule(runs: list[StrategyRun]):
+    """组级周期契约（各成员共享一份，取第一条可解析的）；未装配 ⇒ `None`。"""
+    from ..ai_auto.hold_horizon import rule_from_wire
+    for run in runs:
+        wire = _load_config(run.config_json).get("tradingHorizon")
+        rule = rule_from_wire(wire)
+        if rule is not None:
+            return rule
+    return None
 
 
 async def reconcile_orphan_ai_trade_runs(session: AsyncSession) -> int:

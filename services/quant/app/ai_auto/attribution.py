@@ -45,6 +45,13 @@ class AttributionLedger:
         # （BTC-USDT-SWAP 的 ctVal=0.01 ⇒ 高估 100 倍）。未知合约（未装配账本）⇒ 0 ⇒ 不报名义额。
         self.ct_val = float(ct_val or 0.0)
         self._trips: deque[RoundTrip] = deque(maxlen=capacity)
+        # [P1-1] **全程累计**口径的四个只增累加器，与上面那个 200 容量环形缓冲**并存**。
+        # 理由：环形缓冲让 `stats()["cost"]` 的四项天然是滚动窗口口径，而周期验收卡的持仓样本与
+        # 资金费账本都是全程累计——超过 200 笔往返的会话（恰恰就是验收卡要抓的高换手失败态，
+        # 按 3 分钟唤醒推算一周就能跑过 200 笔）第 4、5 行会悄悄换成另一个时间窗，而卡片上没有
+        # 任何东西提示这件事。两套数用途分开且**都标注口径**（R-13）。
+        self._lifetime = {"trips": 0, "gross": 0.0, "fee": 0.0, "net": 0.0,
+                          "absGross": 0.0}
         self._close_samples = 0           # 平仓成交样本数（closeFeeCoverage 的分母）
         self._close_with_fee = 0          # 其中 fee != 0 的条数
         self._gate = {"pass": 0, "veto": 0, "unavailable": 0}
@@ -69,6 +76,11 @@ class AttributionLedger:
         self._close_samples += 1
         if fee != 0.0:
             self._close_with_fee += 1
+        self._lifetime["trips"] += 1
+        self._lifetime["gross"] += gross
+        self._lifetime["fee"] += fee
+        self._lifetime["net"] += net
+        self._lifetime["absGross"] += abs(gross)
         self._trips.append(RoundTrip(
             ts=int(trade.get("ts") or 0), side=str(trade.get("side") or ""),
             ord_type=str(trade.get("ordType") or "market"),
@@ -113,6 +125,9 @@ class AttributionLedger:
                 "costRatio": round(fee / abs_gross, _ROUND_RATIO) if abs_gross > 0 else None,
                 "tStat": _t_stat([t.net_pnl_usd for t in trips]),
                 "modelCostBps": self._last_cost_bps,
+                # [P1-1] 全程累计口径子块（加法键；≤200 笔时与上面四项逐位相等，A-6 对拍）。
+                # 周期验收卡的第 4、5 行**一律取这里**，绝不取上面那个滚动窗口口径。
+                "lifetime": self.lifetime_cost(),
             },
             "edgeGate": {**self._gate,
                          "vetoRate": (round(self._gate["veto"] / gates, _ROUND_RATIO)
@@ -120,6 +135,22 @@ class AttributionLedger:
             "decisionConversionRate": (round(self._traded_rounds / self._rounds, _ROUND_RATIO)
                                        if self._rounds else None),
         }
+
+    def lifetime_cost(self) -> dict:
+        """全程累计的成本四项 + 比例（[P1-1]；周期验收卡的唯一成本入口）。
+
+        与 `stats()["cost"]` 的同名键**口径不同**：后者是最近 200 笔往返的滚动窗口。两者在
+        ≤200 笔时逐位相等，超过后必然分叉——故两处文案都必须带口径词（R-13 / W-14）。
+        """
+        life = self._lifetime
+        abs_gross = life["absGross"]
+        return {"roundTrips": int(life["trips"]),
+                "grossPnlUsd": round(life["gross"], _ROUND_USD),
+                "feeUsd": round(life["fee"], _ROUND_USD),
+                "netPnlUsd": round(life["net"], _ROUND_USD),
+                "absGrossPnlUsd": round(abs_gross, _ROUND_USD),
+                "costRatio": (round(life["fee"] / abs_gross, _ROUND_RATIO)
+                              if abs_gross > 0 else None)}
 
 
 def _t_stat(values: list[float]) -> float | None:

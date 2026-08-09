@@ -120,7 +120,14 @@ def build_session_stop_explain(*, pos_side: str, entry_price: float, exit_price:
 
 def build_external_close_explain(*, pos_side: str, source: str, entry_price: float,
                                  exit_price: float, pnl: float) -> dict:
-    """交易所侧 / 外部平仓的只读合成解释（仅记录已发生的平仓，本系统不下任何单，P1-1 / R11）。"""
+    """交易所侧 / 外部平仓的只读合成解释（仅记录已发生的平仓，本系统不下任何单，P1-1 / R11）。
+
+    返回 dict 带一个**顶层加法键** ``source``（ai-trade-horizon-acceptance-loop 轴 B）：oco 与
+    external 的区别在此之前**只写在中文 metric 文案里**，机器读不到，退出来源归因就只能去解析
+    展示层——把展示层当契约是本仓库反复出事的模式。该键不参与任何 ``live_auto`` 分支判断，
+    ``live_auto`` 的渲染按 ``metrics`` 数组走、对未知顶层键无感（冻结用例 W-7 守「除 source 外
+    与改动前逐键相等」）。
+    """
     source_label = {
         "oco": "交易所侧止盈止损（OCO）触发",
         "external": "外部 / 手动平仓",
@@ -132,9 +139,11 @@ def build_external_close_explain(*, pos_side: str, source: str, entry_price: flo
         _metric("平仓价", _fmt_px(exit_price)),
         _metric("本笔盈亏", _fmt_usd(pnl), tone=_pnl_tone(pnl)),
     ]
-    return _base("external_close", "close", "交易所侧 / 外部平仓",
-                 summary="本系统据 reconcile / flatten 侦测到交易所侧已平仓并据此校正；非策略主动下单",
-                 metrics=metrics)
+    explain = _base("external_close", "close", "交易所侧 / 外部平仓",
+                    summary="本系统据 reconcile / flatten 侦测到交易所侧已平仓并据此校正；非策略主动下单",
+                    metrics=metrics)
+    explain["source"] = source
+    return explain
 
 
 _TRAIL_BASIS_LABEL = {

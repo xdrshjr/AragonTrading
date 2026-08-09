@@ -5,6 +5,8 @@ import { useMemo, useState } from "react";
 import { PeriodReturnBars, UnderwaterChart } from "@/components/Chart/aiBacktest/charts";
 import AutoTradeRoundTripRow from "@/components/Chart/AutoTradeRoundTripRow";
 import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
+import ExitSourceCard from "./ExitSourceCard";
+import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
 import WakeAttributionCard from "./WakeAttributionCard";
 import { Badge, Button, Skeleton } from "@/components/ui";
 import { buildLedger, buildRoundTrips, type RoundTrip } from "@/lib/autoTradePnl";
@@ -22,6 +24,7 @@ import {
   horizonKpis,
   horizonReleaseHint,
   horizonVetoLine,
+  turnoverVetoLine,
 } from "@/lib/aiTradeHorizon";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
 import type { AiTradeHistoryDetailOut, AiTradeHistoryMember } from "@/lib/aiTradeHistoryTypes";
@@ -137,6 +140,12 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
           {aiStats && (
             <AiStatsCard aiStats={aiStats} observability={observability} finalSummary={finalSummary} />
           )}
+
+          {/* 周期验收闭环（horizon-acceptance [P1-9]）：组级卡由**后端**合并各成员 run 的原始
+              计数器后判定一次（比例类指标不可在前端平均）；任一成员缺 acceptanceInput ⇒ 整键
+              缺席 ⇒ 不渲染。两卡同样是两个独立入参（[P0-4]）。 */}
+          <HorizonAcceptanceCard acceptance={summary.horizonAcceptance} />
+          <ExitSourceCard exits={summary.exits} />
 
           <WakeAttributionCard trips={ledger} />
 
@@ -272,6 +281,7 @@ function ReconcileCard({ members }: { members: AiTradeHistoryMember[] }) {
 function HorizonKpiGroup({ stats }: { stats: AiTradeHorizonStats | null }) {
   if (!stats) return null;
   const note = horizonEstimatedNote(stats);
+  const turnoverLine = turnoverVetoLine(stats);
   return (
     <div className="mt-2" data-testid="ai-horizon-kpis">
       <div className="grid grid-cols-3 gap-2">
@@ -286,6 +296,14 @@ function HorizonKpiGroup({ stats }: { stats: AiTradeHorizonStats | null }) {
         {stats.title}（{stats.profileId}）· {horizonVetoLine(stats)}
         {note ? ` · ${note}` : ""}
       </p>
+      {/* 开仓侧换手纪律的三个计数（turnover-budget §2.4.4）；老记录缺键 ⇒ 整行不渲染。
+          历史页**刻意不渲染兜底态**：`backstop` 是实时态、不落库（D-6），一个 3 天前的
+          「已核实」在这里只会是个骗人的绿勾。 */}
+      {turnoverLine ? (
+        <p className="mt-0.5 text-[10px] leading-relaxed text-[var(--muted)]">
+          {turnoverLine}
+        </p>
+      ) : null}
     </div>
   );
 }

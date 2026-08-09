@@ -10,6 +10,7 @@ import {
   isEffectiveExitCommitted,
 } from "@/lib/aiTrade";
 import { describeHorizonStatus } from "@/lib/aiTradeHorizon";
+import { describeTurnoverChip } from "@/lib/aiTradeTurnover";
 import { COST_BASIS_HINT, describeCostBasis } from "@/lib/aiTradeCost";
 import { colorForReturn, fmtMoney, fmtNum, fmtPct, fmtPrice } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
@@ -151,6 +152,7 @@ function MemberRow({
           </span>
         )}
         <HorizonChip member={member} />
+        <TurnoverChip member={member} />
         <BreakEvenRow member={member} />
         <ProfitGuardRow guard={guard} />
         <ProfitGuardCooldownChip member={member} />
@@ -196,6 +198,29 @@ function HorizonChip({ member }: { member: AiTradeGroupMemberState }) {
       data-testid="ai-trade-horizon-chip"
     >
       {text}
+    </span>
+  );
+}
+
+/**
+ * 换手纪律与兜底 chip（turnover-budget §2.4.3）：**只显示最紧要的一格**。
+ *
+ * 优先级 `mismatch` > 覆盖不足 > 冷却中 > 预算耗尽；**正常态返回 null ⇒ 整行不占位**（R-7：
+ * 本行的价值只在异常时，常态多一行只会稀释上面那条周期 chip）。门控与上面同款——只判快照存在，
+ * 绝不叠加 `positionSide !== "flat"`：空仓恰是换手闸唯一真正会拦人的状态。
+ */
+function TurnoverChip({ member }: { member: AiTradeGroupMemberState }) {
+  const wire = member.session?.horizon ?? null;
+  const chip = describeTurnoverChip(wire?.turnover, wire?.backstop);
+  if (!chip) return null;
+  const color = chip.tone === "short" ? "var(--short)" : "var(--accent)";
+  return (
+    <span
+      className="truncate text-[10px]"
+      style={{ color }}
+      data-testid="ai-trade-turnover-chip"
+    >
+      {chip.label}
     </span>
   );
 }

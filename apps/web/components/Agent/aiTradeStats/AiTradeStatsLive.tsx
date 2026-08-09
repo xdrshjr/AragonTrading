@@ -2,6 +2,9 @@
 
 import { useMemo, useState } from "react";
 import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
+import ExitSourceCard from "./ExitSourceCard";
+import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
+import TurnoverBackstopCard from "./TurnoverBackstopCard";
 import WakeAttributionCard from "./WakeAttributionCard";
 import AutoTradePnlSummary from "@/components/Chart/AutoTradePnlSummary";
 import AutoTradeRoundTripRow from "@/components/Chart/AutoTradeRoundTripRow";
@@ -136,6 +139,21 @@ export default function AiTradeStatsLive() {
           tradeCount={fullSummary.count}
         />
         <HorizonLiveCard group={group} ledger={ledger} />
+        {/* 周期验收闭环（horizon-acceptance）：两卡是**两个独立入参**——`acceptance` 为 null
+            （未装配周期模式的对照臂）时退出来源卡照常渲染（[P0-4]）。分组合并口径由
+            `useAiTradeGroupStream` 的 15s 轮询经窄 action 补丁进来，故它会随会话推进而更新。 */}
+        <HorizonAcceptanceCard acceptance={group.acceptance} />
+        {/* 换手纪律与兜底（turnover-budget §2.4.2）：数据源是**成员级实时快照**
+            `member.session.horizon`——`group.tradingHorizon` 是分组共享的**契约**、不是快照
+            （[P1-2]）。每成员一份令牌桶与一份覆盖率，绝不跨成员求和。 */}
+        <TurnoverBackstopCard
+          members={Object.values(group.members).map((m) => ({
+            symbol: m.instId,
+            turnover: m.session?.horizon?.turnover,
+            backstop: m.session?.horizon?.backstop,
+          }))}
+        />
+        <ExitSourceCard exits={group.exits} />
         <ProfitCaptureCard capture={capture} />
         <WakeAttributionCard trips={ledger} />
         {unrealizedUsd !== null && (

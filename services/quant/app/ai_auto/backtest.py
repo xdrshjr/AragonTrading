@@ -43,10 +43,14 @@ from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, format_ch
 from .cost_model import backtest_params, estimate_round_trip_cost, query_for_preview
 from .decider import AiTradeDecider, TradeDecision
 from .edge_gate import evaluate_edge_gate
+from .exit_attribution import (ExitLedger, classify_backtest, exit_counters,
+                               is_deterministic_reason)
+from .funding_ledger import BacktestFundingCurve, FundingLedger
 from .hold_horizon import HorizonFacts, HorizonRule
 from .hold_horizon import rule_wire as horizon_rule_wire
 from .hold_horizon_text import format_backtest_notes
 from .hold_horizon_text import format_charter as format_horizon_charter
+from .horizon_acceptance import ai_stats_keys, build_input, bundle_from_input
 from .horizon_runtime import HorizonRuntime
 from .market_context import build_market_context
 from .market_digest import build_market_digest
@@ -85,6 +89,7 @@ from .signals import (
 )
 from .sizing_runtime import SizingContext, build_sizing_runtime
 from .sizing_text import SIZING_BACKTEST_NOTE
+from .turnover_discipline import rule_from_horizon as turnover_rule_from_horizon
 
 logger = logging.getLogger(__name__)
 
@@ -239,9 +244,38 @@ class AiBacktestRunner:
         self._bar_ts_index: list[int] | None = None   # 根索引 → ts（把开仓根 ts 当 opened_wall，§2.3.2）
         # 交易周期层（holding-horizon §2.10）：与实盘同一个运行时类，只是喂进去的时钟是 bar ts。
         self.horizon_rule = spec.horizon_rule
-        self._horizon = HorizonRuntime(spec.horizon_rule)
+        # `record_exits=False`：回测的退出来源必须**独立于周期模式的开关**——`_track_horizon_epoch`
+        # 首行就是 `if self.horizon_rule is None: return`，挂在它里面会让「关掉周期模式跑对照臂」
+        # 这件 L1 必做的事拿不到任何退出分布（[P0-4] / [P1-4] 同款连坐）。
+        # 开仓侧换手纪律（turnover-budget §4.5）：回测侧**独立总闸**，关 ⇒ 传 None ⇒ 两道新闸
+        # 整层空转、`gate_reason` 逐字回退（G-3）。轴 B（兜底核实）**不在回测装配**（D-5）。
+        self._horizon = HorizonRuntime(
+            spec.horizon_rule, record_exits=False,
+            turnover_rule=(turnover_rule_from_horizon(spec.horizon_rule, spec.settings)
+                           if spec.settings.ai_trade_horizon_turnover_backtest_enabled
+                           else None))
         self._horizon_hold_bars = (None if spec.horizon_rule is None
                                    else spec.horizon_rule.expected_hold_bars)
+        # 验收闭环三本账（horizon-acceptance）：与实盘共用同一批纯核心，只是喂进去的时钟是 bar ts。
+        # `net_mode=True`：`SimBroker` 的平仓 `TradeRecord.pnl` **已扣双边费**（`_close_at` 里
+        # `net_pnl = gross - (entry_fee + exit_fee)`），而 `fee` 只是平仓腿——搞反会让净额多减一次费。
+        self._exits = ExitLedger(net_mode=True)
+        # `ct_val=1.0`：`SimBroker` 的 `qty` 本来就是币本位（`qty = notional / fill`），
+        # 不像实盘账本那样按张数计（实盘要乘 ctVal）。
+        self._funding = FundingLedger(
+            enabled=bool(spec.settings.ai_trade_funding_ledger_enabled)
+            and bool(spec.settings.ai_trade_funding_backtest_enabled), ct_val=1.0)
+        self._curve = BacktestFundingCurve([])
+        # 单槽打标：凡是运行时**自己**提交的平仓在 submit 之前写槽，成交被观察到时消费。
+        # `SimBroker` 自己的盘中止损止盈 / max_hold / 区间收尾不经运行时 ⇒ 槽为空、由 reason 兜住。
+        self._pending_exit_source: str | None = None
+        self._stamp_conflicts = 0        # 槽非空但 reason 命中确定性字面量的次数（R-6，进 notes）
+        self._trade_scan_idx = 0         # 已归因到的 `main.trades` 游标
+        self._entry_ts: int | None = None    # 当前持仓的开仓根 ts（退出样本的持仓时长起点）
+        self._leg_fee = 0.0              # 自上一笔平仓（不含）起累计的腿费（一笔往返的总费用）
+        self._lifetime = {"trips": 0, "gross": 0.0, "fee": 0.0, "net": 0.0,
+                          "absGross": 0.0}
+        self._wall_seconds = 1.0         # [P1-3] 回测口径：**首决策根 → 末根**的模拟跨度
 
         self.warmup = _compute_warmup(self.specs, spec.settings.ai_trade_regime_context)
         # allow_limit 恒 False（ai-trade-limit-orders §2.10，Non-goal）：`SimBroker._pending` 是「次根
@@ -355,6 +389,14 @@ class AiBacktestRunner:
             if htf_frames.get(bar)
         }
         first = self._first_decision_index(main_df)
+        # [P1-3] 墙钟口径的分母 = **首决策根 → 末根**的模拟跨度：暖机段既不决策也不持仓，算进去
+        # 会把每日换手次数稀释成一个恒过的门槛。
+        self._wall_seconds = max(
+            1.0, float(int(main_df.iloc[-1]["ts"]) - int(main_df.iloc[first]["ts"])))
+        # 根索引 → ts：退出样本的持仓时长与资金费 epoch 都按真实 ts 计，**与周期模式是否装配无关**，
+        # 故从下面那个条件里提出来无条件建（它只是一个 int 列表，代价可忽略）。
+        self._bar_ts_index = main_df["ts"].astype(int).tolist()
+        await self._load_funding_curve()
         # 最小 edge 门禁同样按 `_atr_at(i)` 取粗估 edge（§3.6），故 k_min>0 时也必须建这条序列——
         # 否则门禁恒 unavailable、fail-open 放行（I-5）。ATR 止损（vol-sizing §3.10 复发点一）同款：不把
         # 总闸②或进来，`_atr_series` 恒 None ⇒ 止损在回测里恒不生效**且不报任何错**（T-19 守这条）。
@@ -365,12 +407,38 @@ class AiBacktestRunner:
             # 交易周期层同样要 `_bar_ts_index`——`opened_wall` 取开仓根 ts，缺这条索引会让持仓时长
             # 恒为 0、G1 在回测里恒不生效（`_atr_series` 是顺带的，本层不读它）。
             self._atr_series = atr(main_df, self.settings.ai_trade_profit_guard_atr_period)
-            self._bar_ts_index = main_df["ts"].astype(int).tolist()
         job.publish({"type": "phase", "data": {"phase": "priming"}})
         await run_in_threadpool(self._prime_shadows, dfs, first)
         if job.cancelled:
             return None
         return main_df, dfs, context_frames, first
+
+    async def _load_funding_curve(self) -> None:
+        """拉一次覆盖 `[start_ts, end_ts]` 的真实历史资金费曲线（horizon-acceptance §2.2.4）。
+
+        取不到 ⇒ 曲线 `available=False` ⇒ 资金费按「口径不可得」呈现、验收卡第 5 行判样本不足，
+        **绝不按 0 呈现**（回测里资金费恒 0 正是本轮要修的那件事）。异常一律吞掉：回测的主结果
+        不该因为一个观测层的公共端点抖动而失败。
+        """
+        if not self._funding.enabled:
+            return
+        rows: list[dict] = []
+        after_ms: int | None = (self.end_ts + 1) * 1000
+        try:
+            for _ in range(int(self.settings.ai_trade_funding_history_max_pages)):
+                page = await self.rest.get_funding_rate_history(
+                    self.inst_id, after_ms=after_ms, limit=100)
+                if not page:
+                    break
+                rows.extend(page)
+                oldest = page[0]["fundingTs"]
+                if oldest <= self.start_ts:
+                    break
+                after_ms = oldest * 1000
+        except Exception as exc:  # noqa: BLE001 —— 观测层取数失败绝不打断回测主流程
+            logger.warning("ai-backtest funding curve unavailable (%s): %s",
+                           self.inst_id, exc)
+        self._curve = BacktestFundingCurve(rows)
 
     async def _load_htf(self, left: int, base_sec: int) -> dict:
         strategy_tfs = {
@@ -419,6 +487,9 @@ class AiBacktestRunner:
             # 同根同时命中按更保守的先手记因）、mark **之前**（本根内的平仓必须反映进本根权益点）。
             self._apply_profit_guard_bar(i, row)
             self._track_horizon_epoch(int(row["ts"]))
+            # 验收闭环三本账（horizon-acceptance）：**独立于 `_track_horizon_epoch`**，故未装配
+            # 周期模式的对照臂照样拿得到资金费与退出分布（[P1-4] / [P0-4]）。
+            self._track_ledgers(int(row["ts"]), float(row["c"]))
             self.main.mark(ts=int(row["ts"]), close=float(row["c"]))
             self._sizing.note_equity(self.main.equity_at(float(row["c"])))   # 刹车权益推进
             if self.main.pos.side != "flat":         # [B1] 在场根计数（timeInMarketPct 分子）
@@ -473,6 +544,7 @@ class AiBacktestRunner:
         self._guard_state = result.state
         if result.verdict is None:
             return
+        self._pending_exit_source = "profitGuard"    # 轴 B 打标槽（submit 之前写）
         self.main.close_at_price(float(result.fill_px), bar_ts, result.verdict.reason_code)
         self.profit_guard_exits += 1
         self._reset_guard_epoch()
@@ -532,6 +604,86 @@ class AiBacktestRunner:
         self._horizon.note_open({"side": pos.side},
                                 float(self._bar_ts(pos.entry_bar, default=bar_ts)),
                                 seq=int(pos.entry_bar))
+
+    # ---------- 验收闭环三本账（horizon-acceptance；与实盘共用纯核心，本文件只提供 bar 时钟）----------
+    def _track_ledgers(self, bar_ts: int, close_px: float) -> None:
+        """逐根推进资金费 / 退出来源 / 全程成本三本账。
+
+        **门控只有各自的总闸**，与 `horizon_rule` 无关——「装 vs 不装周期模式的对照回测」正是
+        L1 要做的事，把它们挂在周期模式的开关下就等于把对照臂的数据抹掉。
+        """
+        for trade in self._drain_new_trades():
+            if trade.side in ("long", "short"):
+                self._note_backtest_open(trade)
+            elif trade.side == "close":
+                self._note_backtest_close(trade)
+        # 收尾：给仍在场的 epoch 累计到本根（已平仓的那段在 `_note_backtest_close` 里已结算）。
+        self._funding.accrue_bars(self._curve, from_ts=0, to_ts=bar_ts, mark_px=close_px)
+
+    def _drain_new_trades(self) -> list:
+        """自上次归因以来新产生的成交（`main.trades` 只增不改，故一个游标即可）。"""
+        idx = self._trade_scan_idx
+        self._trade_scan_idx = len(self.main.trades)
+        return list(self.main.trades[idx:])
+
+    def _note_backtest_open(self, trade) -> None:
+        self._entry_ts = int(trade.ts)
+        self._leg_fee += float(trade.fee or 0.0)
+        self._funding.note_open({"side": trade.side, "qty": float(trade.qty or 0.0)},
+                                seq=int(trade.ts), now_wall=float(trade.ts))
+
+    def _note_backtest_close(self, trade) -> None:
+        """一笔平仓成交的三本账收口（退出来源 / 全程成本 / 资金费结转）。"""
+        # 先把本段持仓**截至平仓时刻**的资金费计提完再结转：上一根只累计到上一根的 ts，
+        # 而 1D 执行周期下这一根内完全可能还跨着一个结算点，不补就永久少记一笔。
+        self._funding.accrue_bars(self._curve, from_ts=0, to_ts=int(trade.ts),
+                                  mark_px=float(trade.price or 0.0))
+        self._leg_fee += float(trade.fee or 0.0)
+        source = classify_backtest(str(trade.reason or ""),
+                                   stamped=self._pending_exit_source)
+        if (self._pending_exit_source is not None
+                and is_deterministic_reason(str(trade.reason or ""))):
+            self._stamp_conflicts += 1      # R-6：以 reason 为准，但把冲突记下来可观测
+        self._pending_exit_source = None
+        hold = (None if self._entry_ts is None
+                else max(0.0, float(trade.ts) - float(self._entry_ts)))
+        # `fee` 传**整笔往返的腿费**（开仓腿 + 平仓腿）：`TradeRecord.fee` 只有平仓腿，而
+        # `pnl` 已扣双边——只喂平仓腿会让 `gross = pnl + fee` 少算一条开仓腿。
+        record = {"pnl": float(trade.pnl or 0.0), "fee": self._leg_fee}
+        self._exits.record(record, hold_seconds=hold, source=source)
+        self._accumulate_lifetime(record)
+        self._funding.note_close(record, float(trade.ts))
+        self._leg_fee = 0.0
+        self._entry_ts = None
+
+    def _accumulate_lifetime(self, record: dict) -> None:
+        """全程累计成本（[P1-1]；回测无 `AttributionLedger`，故在此按同一条口径累加）。"""
+        net = float(record["pnl"])          # `net_mode=True`：SimBroker 的 pnl 已扣双边费
+        gross = net + float(record["fee"])
+        self._lifetime["trips"] += 1
+        self._lifetime["gross"] += gross
+        self._lifetime["fee"] += float(record["fee"])
+        self._lifetime["net"] += net
+        self._lifetime["absGross"] += abs(gross)
+
+    def _lifetime_cost(self) -> dict:
+        """与 `AttributionLedger.lifetime_cost()` **逐键同形**（验收卡两世界共用一个 builder）。"""
+        life = self._lifetime
+        abs_gross = life["absGross"]
+        return {"roundTrips": int(life["trips"]), "grossPnlUsd": round(life["gross"], 6),
+                "feeUsd": round(life["fee"], 6), "netPnlUsd": round(life["net"], 6),
+                "absGrossPnlUsd": round(abs_gross, 6),
+                "costRatio": (round(life["fee"] / abs_gross, 4) if abs_gross > 0 else None)}
+
+    def _acceptance_bundle(self) -> dict:
+        """回测侧的验收闭环四键（与实盘 `session.acceptance_bundle()` **逐键同形**）。"""
+        funding = self._funding.stats(settled_usd=None, unavailable_reason="no_creds")
+        inp = build_input(horizon_parts=self._horizon.acceptance_input_parts(),
+                          lifetime_cost=self._lifetime_cost(),
+                          exit_stats=exit_counters(self._exits), funding_stats=funding,
+                          wall_seconds=self._wall_seconds)
+        return bundle_from_input(inp, rule=self.horizon_rule, settings=self.settings,
+                                 exits=self._exits.stats(), funding=funding)
 
     def _horizon_facts(self, i: int, ts: int, ref_px: float) -> HorizonFacts:
         """回测断面（§2.10 对照表）：`now_wall`=当前根 ts、`mark_px`=当根收盘价、`side`=`pos.side`。
@@ -614,6 +766,11 @@ class AiBacktestRunner:
         decision, _, _ = self._horizon.gate(decision, None, self._horizon_facts(i, ts, ref_px))
         horizon_reason = self._horizon.last_reason
         decision, cooldown_reason = apply_profit_cooldown(decision, self._cooldown, now_wall=ts)
+        # ★ 开仓侧换手纪律（turnover-budget §2.2.5）：与实盘**同一纯核心、同位插入**（冷却后、
+        # 刹车前）。`position_side` 取 `self.main.pos.side`，与 `note_intent` 同源。
+        decision, turnover_reason = self._horizon.turnover_gate(
+            decision, None, position_side=self.main.pos.side, now_wall=float(ts))
+        backstop_reason = None   # 轴 B 不在回测装配：回测没有交易所，恒 None（形状仍与实盘同构）
         decision, brake_reason = self._sizing.gate(decision, None, now_wall=float(ts))  # ★ 刹车（第 7 步）
         decision, consensus_reason = apply_consensus_gate(decision, consensus, self.min_consensus)
         # ★ 最小 edge 门禁（§3.7）：与实盘**同一纯核心、同位插入**（共识后、反思前）；k_min=0（默认）
@@ -626,10 +783,13 @@ class AiBacktestRunner:
             funding_enabled=False)
         edge_reason = edge_out.reason if edge_out is not None else None
         decision = edge_out.decision if edge_out is not None else decision
-        # 五元合成，先执行者胜出：铁律优先级最高，持仓周期次之，再冷却（本系统刚亲手做过的动作，
-        # 解释力强于票数），最后共识与成本门禁——与实盘 `degrade or reason` 的链序逐字同构。
-        gate_reason = (base_reason or horizon_reason or cooldown_reason or brake_reason
-                       or consensus_reason or edge_reason)
+        # 八元合成，先执行者胜出：铁律优先级最高，持仓周期次之，再冷却（本系统刚亲手做过的动作，
+        # 解释力强于票数），然后换手纪律与兜底覆盖，最后刹车、共识与成本门禁——与实盘
+        # `degrade or reason` 的链序逐字同构（[P1-10]：原注释自称「五元」而实为六元，本轮顺手改正
+        # 注释，判定式一个字符不动）。
+        gate_reason = (base_reason or horizon_reason or cooldown_reason
+                       or turnover_reason or backstop_reason
+                       or brake_reason or consensus_reason or edge_reason)
         # 二次反思（决策脑不变式：回测复用同一 decider.reflect，emit=None 轨迹全程空转）。verdict 须在分支外
         # 预置 None（RV-3），否则 hold 轮走 else 分支时 _tally_reflection(verdict) 会 NameError。
         verdict = None
@@ -672,6 +832,12 @@ class AiBacktestRunner:
         side_before = self.main.pos.side
         signals = decision_to_signals(decision)
         if signals:
+            # 打标槽（轴 B）：运行时**自己**提交的平仓在 submit 之前写槽。反手的平仓腿与主动平仓
+            # 是两类退出（前者是换方向、后者是离场），归成一类会让偏置矫正的效果读不出来。
+            if decision.action == "close" and side_before in ("long", "short"):
+                self._pending_exit_source = "agent"
+            elif side_before in ("long", "short") and decision.action.startswith("open_"):
+                self._pending_exit_source = "agentReverse"
             self.main.submit(signals)
         return {"ok": True, "action": decision.action, "submitted": bool(signals),
                 "positionBefore": side_before,
@@ -888,7 +1054,10 @@ class AiBacktestRunner:
             "profitGuardEnabled": self.profit_rule is not None,
             # 交易周期层观测（§2.12）：与实盘 `aiStats.horizon` **同名同形**（同一个 `stats()`），
             # 未装配 ⇒ `None` ⇒ UI 整段不渲染（绝不在一次没有周期契约的回测上挂出该卡片）。
-            "horizon": self._horizon.stats()}
+            "horizon": self._horizon.stats(),
+            # 验收闭环四键（horizon-acceptance）：与实盘 `_finalize_run` 的四键**逐键同形**
+            # （同一个 builder、同一份 wire），这是回测 vs 实盘可对拍的前提。
+            **ai_stats_keys(self._acceptance_bundle())}
 
     def _build_notes(self, main_df: pd.DataFrame, first: int) -> list[str]:
         notes: list[str] = []
@@ -907,7 +1076,26 @@ class AiBacktestRunner:
             notes.append(SIZING_BACKTEST_NOTE)
         # 分辨率免责（§2.10 / [P2-7]）：**点名具体模式**——`hourly_swing`（5m 执行 + 180s 窗口）在
         # 回测里 G1 恒不生效，不写清楚用户仍会拿这份回测去为实盘的最短持仓窗口背书。
-        notes.extend(format_backtest_notes(self.horizon_rule, BAR_SECONDS[self.bar]))
+        notes.extend(format_backtest_notes(self.horizon_rule, BAR_SECONDS[self.bar],
+                                           turnover=self._horizon.turnover_rule))
+        notes.extend(self._funding_notes())
+        return notes
+
+    def _funding_notes(self) -> list[str]:
+        """资金费口径免责（horizon-acceptance §2.2.4 第 4、5 点 + §九 D-8 的欠账披露）。"""
+        if not self._funding.enabled:
+            return []
+        if not self._curve.available:
+            return ["本次回测未能取到历史资金费曲线，净额**未含**资金费，"
+                    "验收卡「资金费后净收益」一行按「口径不可得」呈现（绝不按 0 计）。"]
+        notes = ["资金费按交易所历史费率曲线逐结算点计提，但**未计入权益曲线与 metrics**，"
+                 "仅在周期验收卡以「资金费后净收益」单列——"
+                 "`SimBroker` 被全仓库所有回测共用，在其中扣资金费会改变每一个既有策略回测的结果。",
+                 "已知欠账：回测里给换手迟滞与 edge 门禁用的**成本估算**仍不含资金费（实盘含），"
+                 "两者的不对称留待下一轮连同门禁阈值一起重估（spec §九 D-8）。"]
+        if self._stamp_conflicts:
+            notes.append(f"退出来源归因中有 {self._stamp_conflicts} 笔的运行时打标与成交理由冲突，"
+                         "已一律以成交理由为准。")
         return notes
 
     def _build_result(self, metrics: dict, ai_stats: dict, notes: list[str]) -> dict:

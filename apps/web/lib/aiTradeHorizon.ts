@@ -122,6 +122,8 @@ export interface HorizonContractInput {
   estimatedCostBps: number | null;
   lossReleaseFrac: number;
   lossReleaseFallbackPct: number;
+  // 运维总闸（turnover-budget §4.1）：关 ⇒ 换手纪律两行整体省略（缺省视为开，与后端默认一致）。
+  turnoverGateEnabled?: boolean;
 }
 
 /**
@@ -153,7 +155,58 @@ export function horizonContractLines(input: HorizonContractInput): HorizonContra
   }
   const k = profile.turnoverHysteresisK ?? 0;
   if (k > 0) lines.push({ key: "hysteresis", text: hysteresisText(k, input.estimatedCostBps) });
+  lines.push(...turnoverContractLines(profile, input.turnoverGateEnabled !== false));
   lines.push({ key: "release", text: releaseText(input) });
+  return lines;
+}
+
+/**
+ * 开仓侧换手纪律的两行契约摘要（turnover-budget §2.4.1）。
+ *
+ * 三条必须写在这一行里的事（缺一就会变成投诉）：
+ * 1. **「本会话」口径**（[P1-5]）——令牌桶是会话内存态、重启即回满，写一句做不到的「每日」就是
+ *    本轮自己最反对的那种「没核实过的话」；
+ * 2. **平仓与反手的平仓腿永不受限**（[P0-1]）——用户看到「暂停开仓」时最怕的是仓位平不掉；
+ * 3. **长周期模式的代价必须在选模式那一刻就说**（[P2-1]）——事后再解释就是投诉。
+ *
+ * 数值全部来自服务端下发的预览值，前端一个都不算（R-3 / G-10）；运维总闸关 ⇒ 两行整体省略。
+ */
+function turnoverContractLines(
+  profile: AiTradeHorizonProfile,
+  gateEnabled: boolean,
+): HorizonContractLine[] {
+  if (!gateEnabled) return [];
+  const lines: HorizonContractLine[] = [];
+  const cooldown = profile.reentryCooldownSeconds ?? 0;
+  if (cooldown > 0) {
+    lines.push({
+      key: "reentry",
+      text: `平仓后 ${formatHoldDuration(cooldown)}内不再开同向仓（反向不受限）`,
+    });
+  }
+  const perDay = profile.turnoverBudgetPerDay ?? 0;
+  const capacity = profile.turnoverBudgetCapacity ?? 0;
+  if (perDay > 0) {
+    lines.push({
+      key: "budget",
+      text:
+        `本会话每日最多 ${trimNum(perDay)} 次完整往返，突发额度 ${trimNum(capacity)} 次` +
+        "（会话重启后预算重新计算；超出即暂停开新仓，平仓与反手的平仓腿永不受限）",
+    });
+    if (perDay <= 2 && capacity > 0) {
+      // 再次开仓只需**一枚**令牌，故等待上限是补一枚的时间 `24 / perDay` 小时，而不是把整桶补满的
+      // `capacity / perDay × 24`（`trend_hold` 下后者是 48h，足足夸大一倍）。本轮的全部论点都建立在
+      // 「不许说没核实过的话」上，弹窗里这个数尤其不能自己先说错。
+      const worstHours = Math.round(24 / perDay);
+      lines.push({
+        key: "budgetCost",
+        text:
+          `本模式每日只补 ${trimNum(perDay)} 枚令牌：若连续用光突发额度，最长需等约 ` +
+          `${worstHours} 小时补回一枚令牌才能再次开仓（平仓不受影响）。` +
+          "这是长周期契约的代价，不是故障。",
+      });
+    }
+  }
   return lines;
 }
 
@@ -335,6 +388,22 @@ export function horizonVetoLine(stats?: AiTradeHorizonStats | null): string | nu
     `本层拦截：最短窗口 ${stats.minHoldVetoes} / 未确认 ${stats.unconfirmedVetoes} / ` +
     `迟滞 ${stats.hysteresisVetoes} / 反手 ${stats.reverseVetoes}`
   );
+}
+
+/**
+ * 开仓侧换手纪律的拦截计数一行（turnover-budget §2.4.4）；两个计数皆为 0 且未记开仓 ⇒ null。
+ *
+ * `budgetVetoes` 是本轮最有信息量的新读数：它是**「模型想换手而被制度拦住」的次数**，比换手率
+ * 本身更能说明周期模式是否与该标的、该行情匹配。**不并入上面四个第 1 轮的冻结计数**（[P2-7]）：
+ * 那会让冻结门禁虽过、语义却已漂移。
+ */
+export function turnoverVetoLine(stats?: AiTradeHorizonStats | null): string | null {
+  if (!stats) return null;
+  const reentry = stats.reentryVetoes ?? 0;
+  const budget = stats.budgetVetoes ?? 0;
+  const opens = stats.opensCounted ?? 0;
+  if (reentry + budget + opens <= 0) return null;
+  return `换手纪律：再入场冷却拦下 ${reentry} / 预算拦下 ${budget}（消耗令牌 ${opens} 次）`;
 }
 
 /** 拦截计数行的 title 悬浮：豁免明细 + 窗口放行次数（[P2-4] 要求这两项必须有展示归宿）。 */
