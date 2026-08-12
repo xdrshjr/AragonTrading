@@ -5,7 +5,28 @@ import {
   formatFiredCount,
   summarizeDisciplines,
 } from "@/lib/aiTradeDiscipline";
-import type { AiTradeDisciplineRow, AiTradeDisciplineWire } from "@/lib/aiTradeTypes";
+import type {
+  AiTradeDisciplineRow,
+  AiTradeDisciplineWire,
+  AiTradeSummaryHealth,
+} from "@/lib/aiTradeTypes";
+
+/**
+ * 「长期记忆已停摆」的文案（轴 D · D-6）。
+ *
+ * **必须说明后果**：只报「失败」不报后果，用户无法判断要不要停会话。滚动摘要失败不影响本轮决策
+ * ——模型仍在按当前行情决策，丢的是更早的执行历程。
+ */
+export const SUMMARY_STALLED_TEXT = (failures: number): string =>
+  `长期记忆已停摆（连续 ${failures} 次摘要失败）：模型仍在按当前行情决策，` +
+  "但会逐渐忘记更早的执行历程（自己挂过什么价、为什么平过仓）。可继续运行，也可停止后重启会话。";
+
+/** 把后端下发的一段提示切成「结论 + 建议」两截；无分隔符即整段一行。 */
+function splitHint(hint: string): string[] {
+  const parts = hint.split("。").filter((s) => s.trim().length > 0);
+  if (parts.length <= 1) return [hint];
+  return [`${parts[0]}。`, `${parts.slice(1).join("。")}。`];
+}
 
 /**
  * 生效纪律自检卡（ai-trade-discipline-preset-and-integrity 轴 B 的明细落点）。
@@ -22,9 +43,12 @@ import type { AiTradeDisciplineRow, AiTradeDisciplineWire } from "@/lib/aiTradeT
 export default function DisciplineCard({
   wire,
   memberCount = 1,
+  summaryHealth,
 }: {
   wire?: AiTradeDisciplineWire | null;
   memberCount?: number;
+  /** 轴 D 的第二个渲染落点（`AiTradePanel` 是第一个）：停摆事实必须两处都看得到。 */
+  summaryHealth?: AiTradeSummaryHealth | null;
 }) {
   const rows = wire?.rows ?? [];
   // 老后端 / 还没成员 ⇒ 整卡不渲染（绝不在一个没有数据的会话上挂出一排「—」，那会被读成统计坏了）。
@@ -45,12 +69,27 @@ export default function DisciplineCard({
         <span className="tabular text-[10px] text-[var(--muted)]">{summary.label}</span>
       </div>
 
+      {/* 自检提示（tradability-and-open-funnel 轴 C）：升级为**结构化**渲染——第一句是结论、
+          其余是对症建议。合入前它固定建议「改选更宽松的预设」，而本轮实测证明那在短周期断面上是
+          错的补救方向（最宽松的档在 BTC 1m 上仍有 93% 否决率）。`data-testid` 保持不变。 */}
       {wire.hint && (
-        <p
-          className="rounded border border-[var(--short)] bg-[var(--surface-2)] px-2 py-1 text-[10px] leading-relaxed text-[var(--short)]"
+        <div
+          className="flex flex-col gap-0.5 rounded border border-[var(--short)] bg-[var(--surface-2)] px-2 py-1 text-[10px] leading-relaxed text-[var(--short)]"
           data-testid="ai-discipline-hint"
         >
-          {wire.hint}
+          {splitHint(wire.hint).map((line, i) => (
+            <p key={line} className={i === 0 ? "font-medium" : "text-[var(--muted)]"}>
+              {line}
+            </p>
+          ))}
+        </div>
+      )}
+      {summaryHealth?.stalled && (
+        <p
+          className="rounded border border-[var(--accent)] px-2 py-1 text-[10px] leading-relaxed text-[var(--accent)]"
+          data-testid="ai-summary-stalled"
+        >
+          {SUMMARY_STALLED_TEXT(summaryHealth.failures)}
         </p>
       )}
 

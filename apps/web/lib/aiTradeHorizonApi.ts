@@ -5,6 +5,7 @@
 import type {
   AiTradeDisciplinePresetsResponse,
   AiTradeHorizonProfilesResponse,
+  AiTradeTradabilityResponse,
 } from "./aiTradeTypes";
 
 const BASE = "/api/py";
@@ -32,5 +33,23 @@ export const aiTradeDisciplineApi = {
     const res = await fetch(`${BASE}/ai-trade/discipline-presets`, { cache: "no-store" });
     if (!res.ok) throw new Error(`discipline presets ${res.status}`);
     return (await res.json()) as AiTradeDisciplinePresetsResponse;
+  },
+};
+
+// 可交易性预检（tradability-and-open-funnel 轴 A）。同一条纪律：**只读、不守总闸、判据与文案
+// 全部由后端下发**。后端保证「取数失败也回 200 + `level:"unknown"`」，故这里的非 2xx 是真故障。
+export const aiTradeTradabilityApi = {
+  probe: async (
+    instId: string,
+    bar: string,
+    preset?: string | null,
+  ): Promise<AiTradeTradabilityResponse> => {
+    const params = new URLSearchParams({ instId, bar });
+    if (preset) params.set("preset", preset);
+    const res = await fetch(`${BASE}/ai-trade/tradability?${params.toString()}`, {
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error(`tradability ${res.status}`);
+    return (await res.json()) as AiTradeTradabilityResponse;
   },
 };

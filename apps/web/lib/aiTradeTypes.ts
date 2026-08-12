@@ -877,7 +877,10 @@ export interface AiTradeTraceEvent {
   volSource?: "realized" | "insufficient_samples" | "disabled" | null;
   stopPct?: number | null;
   takePct?: number | null;
-  stopSource?: "atr" | "fixed" | "skipped_resting" | "skipped_position_live" | "skipped_reversal" | null;
+  // 七态（tradability-and-open-funnel 轴 B）：`atr_floored` = 止损被成本下界抬起来了；
+  // `floor_above_cap` = 下界高于用户可见红线 ⇒ 整条 ATR 覆盖回退固定 pct。
+  // ⚠️ 三处必须同步：本联合类型（两处）+ `lib/aiTrade.ts` 的 `STOP_SOURCE_LABEL`——漏一处即静默空串。
+  stopSource?: AiTradeStopSource | null;
   effectiveExposure?: number | null;
   effectiveExposureCap?: number | null;
   corrScale?: number | null;
@@ -964,7 +967,10 @@ export interface AiTradeRoundTrace {
   volSource?: "realized" | "insufficient_samples" | "disabled" | null;
   stopPct?: number | null;
   takePct?: number | null;
-  stopSource?: "atr" | "fixed" | "skipped_resting" | "skipped_position_live" | "skipped_reversal" | null;
+  // 七态（tradability-and-open-funnel 轴 B）：`atr_floored` = 止损被成本下界抬起来了；
+  // `floor_above_cap` = 下界高于用户可见红线 ⇒ 整条 ATR 覆盖回退固定 pct。
+  // ⚠️ 三处必须同步：本联合类型（两处）+ `lib/aiTrade.ts` 的 `STOP_SOURCE_LABEL`——漏一处即静默空串。
+  stopSource?: AiTradeStopSource | null;
   effectiveExposure?: number | null;
   effectiveExposureCap?: number | null;
   corrScale?: number | null;
@@ -1028,6 +1034,13 @@ export interface AiTradeSessionRow {
   // 合并进 `m.session`，故运行期数据本来就在——漏的只是类型声明（tsc 报错而非静默丢数据，但极易被
   // 「后端已下发」骗过去）。老后端 ⇒ undefined ⇒ 纪律条整段不渲染。
   disciplines?: AiTradeDisciplineDigest | null;
+  // tradability-and-open-funnel 三新键：可交易性启动断面 / 开仓漏斗 / 摘要健康度。
+  // status 事件经 `patchAiTradeMemberStatus` **整体 spread** 合并进 `m.session`，故运行期数据本来
+  // 就在——漏的只是类型声明（tsc 报错而非静默丢数据，但极易被「后端已下发」骗过去）。
+  // 未装配 / 零样本 / 老后端 ⇒ null 或 undefined ⇒ 各自的卡片整段不渲染。
+  tradability?: AiTradeTradabilitySnapshot | null;
+  openFunnel?: AiTradeOpenFunnel | null;
+  summaryHealth?: AiTradeSummaryHealth | null;
 }
 
 // WS status 事件负载（_status_payload / 轻量 status，会话视图的可增量合并子集）。
@@ -1066,6 +1079,13 @@ export interface AiTradeStatusEvent {
   // 生效纪律自检（轴 B 主通路）：每次 status 事件随附；裸仓事实翻转时后端会**补推一次** status
   // （轴 C [P0-2]：刻意不发 `error` 事件——`routeMemberEvent` 没有 error 分支，推了也是丢）。
   disciplines?: AiTradeDisciplineDigest | null;
+  // tradability-and-open-funnel 三新键：可交易性启动断面 / 开仓漏斗 / 摘要健康度。
+  // status 事件经 `patchAiTradeMemberStatus` **整体 spread** 合并进 `m.session`，故运行期数据本来
+  // 就在——漏的只是类型声明（tsc 报错而非静默丢数据，但极易被「后端已下发」骗过去）。
+  // 未装配 / 零样本 / 老后端 ⇒ null 或 undefined ⇒ 各自的卡片整段不渲染。
+  tradability?: AiTradeTradabilitySnapshot | null;
+  openFunnel?: AiTradeOpenFunnel | null;
+  summaryHealth?: AiTradeSummaryHealth | null;
 }
 
 export interface AiTradeStartReq {
@@ -1277,6 +1297,107 @@ export interface AiTradeConfig {
   // 交易周期模式偏好（holding-horizon §3.4 第 3 处）；同为**可选**，读点一律兜底
   // （**不**为此改 persist version，沿用 baseRules 先例，避免动 migration 链）。
   tradingHorizon?: AiTradeHorizonRule;
+}
+
+// ---- 止损来源七态（tradability-and-open-funnel 轴 B · R-5）----
+// 五态 → 七态。**三处漏一处即静默显示空串**：本类型、`lib/aiTrade.ts` 的 `STOP_SOURCE_LABEL`、
+// 以及 `lib/aiTradeSizing.test.ts:128-132` 那条按数组遍历 source 的冻结用例。
+export type AiTradeStopSource =
+  | "atr"
+  | "atr_floored"
+  | "fixed"
+  | "floor_above_cap"
+  | "skipped_resting"
+  | "skipped_position_live"
+  | "skipped_reversal";
+
+// ---- 可交易性预检（tradability-and-open-funnel 轴 A · §5.1）----
+// **判据与文案全部由后端下发，前端一个字都不重写**：一张用户按下启动键之前看的表，如果与真正
+// 生效的那组数分叉，比不给这张表更坏（`edgeSource` 逐键手抄吞新键的成文教训）。
+export type AiTradeTradabilityLevel = "ok" | "marginal" | "infeasible" | "unknown";
+
+export interface AiTradeTradabilityAlternative {
+  bar: string;
+  vetoRateMarket: number | null;
+  // 每项用它**自己的** `bar_seconds` 重算（资金费期数随周期变，`1D × 8 根 = 24 期`）。
+  costBpsMarket: number | null;
+  level: AiTradeTradabilityLevel;
+}
+
+export interface AiTradeTradabilityResponse {
+  instId: string;
+  bar: string;
+  preset: string;
+  level: AiTradeTradabilityLevel;
+  samples: number;
+  source: "live" | "cache" | null;
+  asOfTs: number | null;
+  atrBps: { p10: number | null; p50: number | null; p90: number | null } | null;
+  costBps: { market: number | null; limit: number | null } | null;
+  costConfidence: { market: string; limit: string } | null;
+  degradedMultApplied: number | null;
+  requiredBps: { market: number | null; limit: number | null } | null;
+  vetoRate: { market: number | null; limit: number | null } | null;
+  stopBps: { p50: number | null } | null;
+  stopInsideCostRate: { market: number | null; limit: number | null } | null;
+  alternatives: AiTradeTradabilityAlternative[];
+  headline: string;
+  advice: string | null;
+  disclaimer: string;
+}
+
+// 会话 status 上的**瘦身**投影（启动断面，启动后不变）。
+export interface AiTradeTradabilitySnapshot {
+  level: AiTradeTradabilityLevel;
+  bar?: string | null;
+  vetoRateMarket?: number | null;
+  headline?: string | null;
+  advice?: string | null;
+  samples?: number | null;
+  source?: string | null;
+  asOfTs?: number | null;
+}
+
+// ---- 开仓漏斗（轴 C · §5.3）----
+export interface AiTradeOpenFunnel {
+  intents: number;
+  blocked: Record<string, number>;
+  topBlocker: { key: string; label: string; count: number } | null;
+  llmDegraded: number;   // **仅** LLM 故障；`low_confidence` 的唯一落点是 blocked.confidence
+  sizingZeroed: number;  // 不是一道闸，是求解结果 ⇒ 画在「委托」前的最后一格
+  submitted: number;
+  filled: number;
+  conversion: number | null;   // `intents == 0` ⇒ null（**绝不**把 0/0 画成 0%）
+  layers: string[];            // 决策链顺序（后端下发，前端只做布局）
+  scope: string;               // 口径词（全程累计 vs 滚动窗口）
+}
+
+// ---- 滚动摘要健康度（轴 D · §5.3）----
+export interface AiTradeSummaryHealth {
+  roundsSinceSummary: number;
+  refreshRounds: number;
+  failures: number;        // **连续**失败（成功即清零）
+  totalFailures: number;   // 全程累计（只增不减，与上一行不是一个口径）
+  lastError: string | null;
+  backoffRounds: number;
+  stalled: boolean;
+}
+
+// ---- 历史预设对照卡（轴 E · §5.2）----
+export interface AiTradePresetComparisonGroup {
+  preset: string;
+  samples: number;
+  conclusive: boolean;    // false ⇒ UI 必须显式写「样本不足，不下结论」
+  netPnlUsd: number;
+  roundTrips: number;
+  winRate: number | null;
+  edgeVetoRate: number | null;
+  openConversion: number | null;
+}
+
+export interface AiTradePresetComparisonResponse {
+  groups: AiTradePresetComparisonGroup[];
+  minSamples: number;
 }
 
 // 别名（spec §3 类型清单）：会话运行期视图 / 轻量状态负载，供 store 与流式路由语义化引用。

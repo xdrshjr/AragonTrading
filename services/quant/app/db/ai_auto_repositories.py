@@ -382,6 +382,94 @@ def _group_horizon_rule(runs: list[StrategyRun]):
     return None
 
 
+# 一组的指标要「下结论」所需的最小历史会话数（tradability-and-open-funnel 轴 E）。低于它照常给出
+# 全部数字但 `conclusive=false`，前端显式写「样本不足，不下结论」——用 1~2 局历史宣称「哪档更赚」
+# 正是本仓库明令禁止的假阳性观测（沿用统计看板既有的最小样本门禁范式）。
+_PRESET_COMPARISON_MIN_SAMPLES = 3
+
+
+async def list_ai_trade_preset_comparison(session: AsyncSession) -> dict:
+    """按纪律预设分组聚合**历史真实资金会话**的表现（轴 E · §5.2；只读 `metrics_json`，零迁移）。
+
+    它偿还的是第 1 轮的 G-17 欠账的一半：「这组阈值到底是让系统赚钱还是让系统停摆」。另一半由轴 A
+    的确定性探针秒级回答。**刻意不做两臂 LLM 回测对照**——实测 50 分钟跑不完两臂，且回测与实盘的
+    仓位求解仍不同构（`p_win` 在回测侧恒 `None` ⇒ 凯利项恒不参与 `min`），结论不可迁移。
+
+    分组键取 `metricsJson.aiStats.disciplinePreset`（第 1 轮起落库）；缺键的老 run 归 `unknown`
+    并如实标注——**不能**把它们默默算进 `balanced`，那会用一批不知道开着什么纪律的历史去污染结论。
+
+    Returns:
+        `{"groups": [{preset, samples, conclusive, netPnlUsd, roundTrips, winRate,
+        edgeVetoRate, openConversion}], "minSamples": N}`。
+    """
+    runs = (await session.execute(
+        select(StrategyRun).where(StrategyRun.mode == _AI_TRADE_MODE,
+                                  StrategyRun.group_id.is_not(None))
+        .order_by(StrategyRun.id.asc()))).scalars().all()
+    if not runs:
+        return {"groups": [], "minSamples": _PRESET_COMPARISON_MIN_SAMPLES}
+    trades_by_run = await _load_trades_by_run(session, [r.id for r in runs])
+    by_group: dict[str, list[StrategyRun]] = defaultdict(list)
+    for run in runs:
+        by_group[run.group_id].append(run)
+    buckets: dict[str, list[dict]] = defaultdict(list)
+    for members in by_group.values():
+        buckets[_group_preset(members)].append(_group_comparison_row(members, trades_by_run))
+    return {"groups": [_summarize_preset(preset, rows)
+                       for preset, rows in sorted(buckets.items())],
+            "minSamples": _PRESET_COMPARISON_MIN_SAMPLES}
+
+
+def _group_preset(runs: list[StrategyRun]) -> str:
+    """该组启动时生效的纪律预设；缺键的老 run ⇒ `"unknown"`（**不归进任何具名档**）。"""
+    for run in runs:
+        preset = (_load_config(run.metrics_json).get("aiStats") or {}).get("disciplinePreset")
+        if preset:
+            return str(preset)
+    return "unknown"
+
+
+def _group_comparison_row(runs: list[StrategyRun], trades_by_run: dict[int, list]) -> dict:
+    """一个历史 group 的对照读数（净额盈亏 / 往返数 / 胜率 / 门禁否决率 / 漏斗转化率）。
+
+    净额与往返配对**逐字复用** `_aggregate_group`——历史列表卡片与本卡必须是同一个数，
+    另算一份就是第二个口径。`edgeVetoRate` / `openConversion` 取各成员 `aiStats` 的**加权/合并**
+    读数：算不出的一律 `None`（**不填 0 冒充**，0 与「没有这个读数」是两个结论）。
+    """
+    agg = _aggregate_group(runs, trades_by_run)
+    summary = agg["summary"]
+    stats = [(_load_config(r.metrics_json).get("aiStats") or {}) for r in runs]
+    gated = sum(_num((s.get("edgeGate") or {}).get("gated")) for s in stats)
+    veto = sum(_num((s.get("edgeGate") or {}).get("veto")) for s in stats)
+    intents = sum(_num((s.get("openFunnel") or {}).get("intents")) for s in stats)
+    filled = sum(_num((s.get("openFunnel") or {}).get("filled")) for s in stats)
+    return {"netPnlUsd": summary["realizedPnlUsd"], "roundTrips": summary["tradeCount"],
+            "winRate": summary["winRate"] if summary["tradeCount"] else None,
+            "edgeVetoRate": (veto / gated) if gated > 0 else None,
+            "openConversion": (filled / intents) if intents > 0 else None}
+
+
+def _summarize_preset(preset: str, rows: list[dict]) -> dict:
+    """一档预设的汇总：盈亏与往返数取**和**，三个比例类指标取**可得样本的均值**。
+
+    比例类指标绝不与「样本数」混为一谈：`samples` 是这一档有多少局历史，而比例的分母是那些
+    **真的算得出该比例**的局数——两者不等时取前者会把 `None` 当 0 平均进去。
+    """
+    return {"preset": preset, "samples": len(rows),
+            "conclusive": len(rows) >= _PRESET_COMPARISON_MIN_SAMPLES,
+            "netPnlUsd": sum(_num(r["netPnlUsd"]) for r in rows),
+            "roundTrips": int(sum(_num(r["roundTrips"]) for r in rows)),
+            "winRate": _mean([r["winRate"] for r in rows]),
+            "edgeVetoRate": _mean([r["edgeVetoRate"] for r in rows]),
+            "openConversion": _mean([r["openConversion"] for r in rows])}
+
+
+def _mean(values: list) -> float | None:
+    """可得样本的均值；一个都算不出 ⇒ `None`（**绝不**把 `None` 当 0 平均进去）。"""
+    rows = [float(v) for v in values if v is not None]
+    return sum(rows) / len(rows) if rows else None
+
+
 async def reconcile_orphan_ai_trade_runs(session: AsyncSession) -> int:
     """启动期孤儿对账（§3.5 / R-3）：running 的 ai-trade run 回填 end_ts + 置 stopped + reconciled=true。
 

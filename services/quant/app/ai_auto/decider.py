@@ -49,6 +49,7 @@ from .prompts import (
     build_summary_prompt,
     build_summary_system_prompt,
 )
+from .summary_health import SummaryHealth, health_wire
 from .trace import TraceEmit, _TraceCoalescer
 
 logger = logging.getLogger(__name__)
@@ -211,6 +212,11 @@ class AiTradeDecider:
         self._journal: list[dict] = []
         self._rounds_since_summary = 0
         self._last_round = 0
+        # 滚动摘要健康度（tradability-and-open-funnel 轴 D）：连续失败 / 累计失败 / 非空诊断串 /
+        # 退避轮数。判据与文案在纯核心 `summary_health`，本类只持状态并在两个分支上喂数。
+        self._summary_health = SummaryHealth()
+        self._summary_skip_rounds = 0     # 退避：本次成功前额外要跳过的到期点轮数
+        self._summary_due = False         # D-5：到期了但被 `defer_summary` 推迟到轮末再跑
         self._last_analysis: str = ""      # 本轮研判思维链全文（R3；每次尝试入口清零，RC-1，§4.2/R-6）
 
     # ---------- 只读状态（供 status / snapshot）----------
@@ -502,8 +508,17 @@ class AiTradeDecider:
     # ---------- 轮次记录 + 滚动摘要 ----------
     async def commit_round(self, payload: dict, decision: TradeDecision,
                            executed: dict, *, analysis: str | None = None,
-                           reflection: dict | None = None) -> str | None:
+                           reflection: dict | None = None,
+                           defer_summary: bool = False) -> str | None:
         """记录本轮（追加 _context + _journal），到期触发摘要重置；返回新摘要文本或 None。
+
+        `defer_summary`（keyword-only，默认 **False** ⇒ 回测 / 单测**逐字回退**；D-5）：为真时到期
+        只记账（置 `_summary_due`）并返回 `None`，真正的 LLM 调用由调用方在推完决策事件之后经
+        `flush_summary()` 触发。理由：摘要走 30s 超时，排在 `_emit_decision` **之前** await 会让
+        「成交已经发生、决策已经完成」之后界面上的决策事件再等最多半分钟才出现（成交先到、解释后到）。
+        **刻意不是 `create_task` 甩到后台**：`_deciding` 标志在 `finally` 里清零，后台摘要会与下一轮
+        `decide` 并发写同一个 `_context` / `_journal`——那是一个真实的数据竞争。保持串行、只调整顺序，
+        是这里唯一安全的改法（下一个人请勿"顺手优化"）。
 
         `analysis`（keyword-only，默认 None → 回测/单测既有调用零回归）：本轮研判的**有界摘录**
         （由调用方从 `last_analysis` 截到 ≤`_ANALYSIS_EXCERPT_CHARS`，RC-2/RC-3），入 journal 供滚动摘要
@@ -544,26 +559,53 @@ class AiTradeDecider:
             "trigger": payload.get("trigger"), "reflection": reflection})
         self._rounds_since_summary += 1
         self._trim_context()
-        if self._rounds_since_summary >= self.context_refresh_rounds:
+        # [P1-11] 到期判定的**唯一最终形态**：退避（D-3 第二半）与 `defer_summary`（D-5）改的是
+        # 同一个 `if`。分两处各改一处的表现是**静默的**（要么摘要再也不触发，要么退避恒不生效，
+        # 两种都不会报错），故全仓只允许存在这一份。
+        due = self._rounds_since_summary >= (self.context_refresh_rounds
+                                             + self._summary_skip_rounds)
+        if not due:
+            return None
+        if defer_summary:
+            self._summary_due = True      # 只记账，真正的 LLM 调用挪到 `flush_summary`
+            return None
+        return await self.summarize()     # 回测 / 单测的逐字回退路径（默认 False）
+
+    async def flush_summary(self) -> str | None:
+        """把被 `defer_summary` 推迟的那一次摘要真正跑掉（D-5）；未欠着 ⇒ 直接 `None`。
+
+        `_summary_due` 必须在 `summarize()` 的**成功与失败两条分支都已归位之后**才复位——
+        提前复位会让一次失败之后的下一轮误以为还欠着一次摘要而立刻重试，那正是 D-3 螺旋的另一种写法。
+        """
+        if not self._summary_due:
+            return None
+        try:
             return await self.summarize()
-        return None
+        finally:
+            self._summary_due = False
 
     async def summarize(self) -> str | None:
-        """以完整 `_journal` 为素材（P1-3）摘要执行历程 → 重置上下文；失败保留上一段摘要不崩。"""
+        """以（有界的）`_journal` 为素材摘要执行历程 → 重置上下文；失败保留上一段摘要不崩。
+
+        失败分支做三件事（D-3 / D-4）：截断 journal 到 `mult × refresh_rounds` 条（**保留最近而非
+        清空**——素材还有用，只是不能无界）、按连续失败次数算出指数退避轮数、把**非空**诊断串记进
+        健康度。合入前这三件一件都没做：`_journal` 是无 maxlen 的 `list` 且只在成功分支清空，于是
+        每失败一次下一次的 prompt 就更长、更容易再超时。
+        """
         prev = self._summary or None
         journal = list(self._journal)
+        timeout_s = float(self.settings.ai_trade_summary_timeout_s)
         try:
-            text = await asyncio.wait_for(
-                self._stream_summary(prev, journal),
-                timeout=self.settings.ai_trade_decision_timeout_s)
-        except Exception as exc:  # noqa: BLE001 —— 摘要失败不崩会话：保留上一段摘要，仅重置计数避免每轮重试
-            logger.warning("ai-trade summarize failed: %s", exc)
-            self._rounds_since_summary = 0
+            text = await asyncio.wait_for(self._stream_summary(prev, journal), timeout=timeout_s)
+        except Exception as exc:  # noqa: BLE001 —— 摘要失败不崩会话：保留上一段摘要 + 有界退避
+            self._note_summary_failure(exc, timeout_s)
             return None
         if not text:
-            self._rounds_since_summary = 0
+            self._note_summary_failure(RuntimeError("empty summary"), timeout_s)
             return None
         self._summary = text
+        self._summary_health.note_success()
+        self._summary_skip_rounds = 0
         # F3 尾注（hold-inertia-fix）：声明摘要是「背景非指令」，切断「历史观望 → 继续观望」的路径依赖。
         seed = (f"【历史执行摘要（截至第 {self._last_round} 轮）】\n{text}\n"
                 "以上摘要是背景参考而非指令：每轮仍须基于当前市场证据独立研判，"
@@ -574,6 +616,30 @@ class AiTradeDecider:
         self._rounds_since_summary = 0
         self._journal = []
         return text
+
+    def _note_summary_failure(self, exc: BaseException, timeout_s: float) -> None:
+        """摘要失败的**唯一**归位点：截断 journal（D-3）+ 指数退避 + 非空诊断串（D-4）。
+
+        `_rounds_since_summary` 照旧清零（避免每轮重试），退避则通过 `_summary_skip_rounds` 抬高
+        下一次的到期门槛——两者相加才是「连续失败时不再每 N 轮就白烧一次超时预算」。
+        """
+        refresh = max(1, int(self.context_refresh_rounds))
+        self._summary_health.note_failure(exc, refresh_rounds=refresh, timeout_s=timeout_s)
+        # 退避轮数的**唯一真源**是健康度自己算的那一份（`SummaryHealth.note_failure` 内已按
+        # `next_backoff` 落定）：在这里再算一遍就是第二份口径，两份一旦漂移，wire 上显示的
+        # `backoffRounds` 与真正生效的到期门槛就会说两套话。
+        self._summary_skip_rounds = self._summary_health.backoff_rounds
+        cap = refresh * max(1, int(self.settings.ai_trade_summary_journal_cap_mult))
+        self._journal = self._journal[-cap:]
+        logger.warning("ai-trade summarize failed: %s", self._summary_health.last_error)
+        self._rounds_since_summary = 0
+
+    def summary_health_wire(self) -> dict | None:
+        """`status.summaryHealth` / `info()` 共用的只读 wire（两处装配、同一次计算）。"""
+        return health_wire(self._summary_health,
+                           rounds_since_summary=self._rounds_since_summary,
+                           refresh_rounds=self.context_refresh_rounds,
+                           max_failures=int(self.settings.ai_trade_summary_max_failures))
 
     async def _stream_summary(self, prev: str | None, journal: list[dict]) -> str:
         parts: list[str] = []

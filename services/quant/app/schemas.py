@@ -1234,6 +1234,59 @@ class AiTradeHistoryListOut(BaseModel):
     offset: int
 
 
+class AiTradeTradabilityOut(BaseModel):
+    """GET /ai-trade/tradability 响应（tradability-and-open-funnel §5.1）。
+
+    **判据与文案全部由后端下发，前端一个字都不重写**——本仓库已有过前后端各存一份口径导致静默
+    漂移的事故。缺席语义：任一子块算不出即该键为 `null`（**绝不填 0 冒充**）；`level=="unknown"`
+    时除 `headline` / `samples` / `source` 外允许全 `null`。
+
+    ⚠️ 本模型用 `dict | None` 承载 `atrBps` / `costBps` 等子块而不是嵌套模型，是**有意的**：
+    `response_model` 会静默吞掉未声明的 wire 键（本仓库成文教训），子块用宽类型可保证后端新增
+    读数时不会被 FastAPI 悄悄裁掉。
+    """
+
+    instId: str
+    bar: str
+    preset: str = ""
+    level: str
+    samples: int
+    source: str | None = None
+    asOfTs: int | None = None
+    atrBps: dict | None = None
+    costBps: dict | None = None
+    costConfidence: dict | None = None
+    degradedMultApplied: float | None = None
+    requiredBps: dict | None = None
+    vetoRate: dict | None = None
+    stopBps: dict | None = None
+    stopInsideCostRate: dict | None = None
+    alternatives: list[dict] = Field(default_factory=list)
+    headline: str = ""
+    advice: str | None = None
+    disclaimer: str = ""
+
+
+class AiTradePresetComparisonGroup(BaseModel):
+    """一档纪律预设的历史表现（轴 E）。`conclusive=false` ⇒ 前端必须显式写「样本不足，不下结论」。"""
+
+    preset: str
+    samples: int
+    conclusive: bool
+    netPnlUsd: float
+    roundTrips: int
+    winRate: float | None = None
+    edgeVetoRate: float | None = None
+    openConversion: float | None = None
+
+
+class AiTradePresetComparisonOut(BaseModel):
+    """GET /ai-trade/history/preset-comparison 响应：按预设分组的历史对照卡。"""
+
+    groups: list[AiTradePresetComparisonGroup] = Field(default_factory=list)
+    minSamples: int
+
+
 class AiTradeHistorySummary(BaseModel):
     """单会话聚合 KPI（与列表行汇总同口径；前端亦可据 members[].trades 复算校验）。"""
 

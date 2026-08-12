@@ -44,6 +44,7 @@ from ..ai_auto.prior_service import prior_snapshot_out, rebuild_prior_snapshot
 from ..ai_auto.profit_guard import ProfitGuardRule, resolve_profit_guard_rule
 from ..ai_auto.signal_prior import resolve_prior_params, strategy_fingerprint
 from ..ai_auto.sizing import parse_sizing_rule, window_need
+from ..ai_auto.tradability_probe import probe
 from ..config import Settings, get_settings
 from ..db import ai_prior_repositories as prior_repo
 from ..db import repositories as repo
@@ -60,9 +61,11 @@ from ..schemas import (
     AiTradeHistoryListOut,
     AiTradeHorizonIn,
     AiTradeHorizonProfilesOut,
+    AiTradePresetComparisonOut,
     AiTradePriorRebuildIn,
     AiTradePriorSnapshotOut,
     AiTradeProfitGuardIn,
+    AiTradeTradabilityOut,
     trade_out,
 )
 
@@ -451,6 +454,51 @@ async def ai_trade_horizon_profiles(bar: str = Query("1H"),
         ord_type="market", side="long", bar_seconds=bar_seconds)
     return profiles_wire(settings,
                          estimated_cost_bps=None if preview is None else preview.total_bps)
+
+
+@router.get("/ai-trade/tradability", response_model=AiTradeTradabilityOut)
+async def ai_trade_tradability(instId: str, bar: str,
+                               preset: str | None = Query(None),
+                               session: AsyncSession = Depends(get_session),
+                               settings: Settings = Depends(get_settings)) -> dict:
+    """可交易性预检（tradability-and-open-funnel §5.1）：**只提示、不阻断**。
+
+    **不守 AI 总闸**（沿用 `/ai-trade/horizon-profiles`、`/ai-trade/discipline-presets` 的成文
+    先例：读一张表不下任何单）。取数与判据全在 `ai_auto.tradability_probe` / `ai_auto.tradability`
+    ——本函数只解析 query → 调它 → 原样返回（`api/ai_auto.py` 的净增预算是硬验收判据，G-19b）。
+
+    `preset` 缺省取 `ai_trade_discipline_default_preset`；**未知值按 `off` 处理**（不 422：一个
+    看不懂的预设名不该把用户的预检挡掉）。**取数失败一律 200 + `level:"unknown"`，绝不 5xx。**
+    """
+    if bar not in BAR_SECONDS:
+        raise HTTPException(422, detail={"code": "BAD_BAR",
+                                         "message": f"不支持的周期：{bar}"})
+    derived = _preset_settings(preset, settings)
+    return await probe(session, derived, inst_id=instId, bar=bar)
+
+
+def _preset_settings(preset: str | None, settings: Settings) -> Settings:
+    """按弹窗当前选中的预设派生一份**会话私有** Settings 副本（与启动路径同一个解析点）。
+
+    探针算的必须是「按下启动键之后真正会生效的那组阈值」，而不是进程默认值——两者分叉会让预检
+    说的和门禁做的不是一回事，那正是 R-2 要防的漂移。未知 preset / `off` ⇒ 原对象直通（`is` 相等）。
+    """
+    preset_id = preset or settings.ai_trade_discipline_default_preset
+    if not settings.ai_trade_discipline_enabled or preset_id not in PRESET_IDS:
+        return settings
+    resolved = resolve_updates(preset_id, {}, 0)
+    return settings.model_copy(update=resolved.updates) if resolved.armed else settings
+
+
+@router.get("/ai-trade/history/preset-comparison",
+            response_model=AiTradePresetComparisonOut)
+async def ai_trade_preset_comparison(session: AsyncSession = Depends(get_session)) -> dict:
+    """历史纪律预设对照卡（轴 E）：按 `aiStats.disciplinePreset` 分组聚合历史 run（只读，不守门）。
+
+    ⚠️ 路由顺序：本条**必须**排在 `/ai-trade/history/{group_id}` **之前**，否则
+    `preset-comparison` 会被那条路径参数吞掉并当成一个 group_id 去查（返回 404）。
+    """
+    return await repo.list_ai_trade_preset_comparison(session)
 
 
 @router.get("/ai-trade/history", response_model=AiTradeHistoryListOut)

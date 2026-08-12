@@ -112,6 +112,47 @@ def merge_sizing_stats(base: dict, ext: dict) -> dict:
     return merged
 
 
+def build_funnel_stats(funnel_wire_out: dict | None, tradability_stats: dict | None,
+                       counters) -> dict:
+    """轴 A / C / B 的三个落库加法键（tradability-and-open-funnel §6.2；**零 DB 迁移**）。
+
+    三键一起装配是刻意的：它们回答的是同一个问题的三段——「这一局开在什么条件下」（`tradability`
+    的**启动断面**）、「模型想开几次、被谁拦下」（`openFunnel`）、「止损被成本下界抬了多少次」
+    （`stopFloored`）。分三次装配必然出现「加了一个忘了另一个」。
+
+    缺席语义：算不出的键**整体缺席**（不是 `None`）——老 run 缺键时前端的渲染门控据此整段隐藏。
+
+    Args:
+        funnel_wire_out: `open_funnel.funnel_wire()` 产物或 `None`。
+        tradability_stats: `tradability.stats_wire()` 产物或 `None`（启动断面）。
+        counters: `SizingRuntime._Counters`（取轴 B 的两个新计数）。
+    """
+    out: dict = {}
+    if funnel_wire_out is not None:
+        out["openFunnel"] = funnel_wire_out
+    if tradability_stats is not None:
+        out["tradability"] = tradability_stats
+    if counters is not None:
+        out["stopFloored"] = {
+            "flooredRounds": int(getattr(counters, "stop_floored_rounds", 0)),
+            "floorAboveCapRounds": int(getattr(counters, "floor_above_cap_rounds", 0))}
+    return out
+
+
+def merge_funnel_stats(base: dict, ext: dict) -> dict:
+    """把三个加法键并入既有 `aiStats`；**任一键冲突即抛**（镜像 `merge_cost_stats`）。
+
+    Raises:
+        ValueError: `ext` 的某个键已存在于 `base`（附冲突键名，便于定位）。
+    """
+    merged = dict(base or {})
+    clashes = sorted(set(merged) & set(ext or {}))
+    if clashes:
+        raise ValueError(f"funnel stats key clash with existing aiStats: {','.join(clashes)}")
+    merged.update(ext or {})
+    return merged
+
+
 def cost_snapshot_wire(round_no: int, attribution_stats: dict, fee_ledger, *,
                        every: int = _COST_SNAPSHOT_EVERY_ROUNDS,
                        fee_rates: dict | None = None,

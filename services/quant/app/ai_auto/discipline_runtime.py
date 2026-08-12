@@ -13,10 +13,15 @@ import time
 
 from .discipline_view import (
     DisciplineFacts,
+    StrictnessFacts,
     build_discipline_digest,
     naked_backstop,
     strictness_hint,
 )
+from .open_funnel import OpenFunnelCounters, funnel_wire
+from .stats_ext import build_funnel_stats, merge_funnel_stats
+from .tradability import stats_wire as tradability_stats_wire
+from .tradability import status_wire as tradability_status_wire
 
 # 决策降级理由 → digest 行 key。降级理由是既有 wire（`low_consensus(k/n)` / `low_confidence` /
 # `base_rule_*`），此处**只读不改**：它们各自的产生点已有用例守着，在这里重新定义一遍就是第二份口径。
@@ -40,14 +45,33 @@ class DisciplineRuntime:
         self.preset_id = preset_id                # 只为落库回答「这次会话开的是哪个预设」
         self._degrades: dict[str, int] = {}
         self._last_naked: bool | None = None      # None = 还没判过（首次判定不算「翻转」）
+        # 轴 C：开仓漏斗的会话级累计计数。**住在本门面而不是 session**——它与 13 行自检是同一件事
+        # 的两面（「哪些闸开着」与「它们各拦下了多少次真实开仓意愿」），且 `session.py` 已 1819 行、
+        # 本轮的净增预算是 ≤ 22 行（G-19b）。
+        self.funnel = OpenFunnelCounters()
+        # 轴 A：会话启动断面的可交易性只读快照（`manager.start` 算一次，**启动后不变**）。
+        self.tradability: dict | None = None
 
     # ---------- 喂数 ----------
+    def note_intent(self, action: str, degrade: str | None) -> None:
+        """第一阶段决策的收口：记开仓漏斗的**分母**（门禁后的动作已被洗成 hold，那里数永远是 0）。"""
+        self.funnel.note_intent(action, degrade)
+
+    def note_tradability(self, wire: dict | None) -> None:
+        """装入启动断面（与启动回执**是同一份对象**，同一 `asOfTs`，[P1-10]）。"""
+        self.tradability = wire
+
     def note_round(self, degrade: str | None) -> None:
         """记一轮决策的降级理由（共识 / 置信度 / 基础策略三条闸的 `firedCount` 唯一来源）。
 
         这三条闸的纯核心只返回降级理由字符串、不自带计数器；在**决策轮的唯一收口**上按前缀归类，
         比在三个纯核心里各加一个计数器更不容易漂移（且回测侧共用那些纯核心，加计数器会污染它们）。
+
+        轴 C 的漏斗归类**同挂这个唯一收口**：此处的 `degrade` 已是 `degrade or gate_reason` 的归并
+        结果，即「第一个拦下它的层」。`note_block` 自己会判「本轮记没记过 intent」——平仓侧被
+        `horizon` / `exchangeBackstop` 拦下的轮次一律不进分子（[P0-3]，否则漏斗算术上不闭合）。
         """
+        self.funnel.note_block(degrade)
         if not degrade:
             return
         for prefix, key in _DEGRADE_PREFIXES:
@@ -61,11 +85,30 @@ class DisciplineRuntime:
         return build_discipline_digest(self.facts())
 
     def hint(self, rows: list[dict]) -> str | None:
-        """[P1-9] 恒真自检提示：一堆闸武装着却一单都没开过。开仓成交数按 `side != "close"` 数。"""
+        """[P1-9 / 轴 C] 对症自检提示：一堆闸武装着却一单都没开过 ⇒ 点名**谁在拦、动哪个旋钮**。
+
+        开仓成交数按 `side in ("long","short")` 数——与 `OpenFunnelCounters.note_filled` 的判据
+        **共用同一条**，绝不另写（两处口径一旦分叉，漏斗与提示会给出互相矛盾的结论）。
+        取数面仍只在本函数里：判据全在 `discipline_view.strictness_hint`（纯核心）。
+        """
         executor = self._session.executor
         opens = sum(1 for t in executor.trades if t.get("side") in ("long", "short"))
-        return strictness_hint(rows, rounds_completed=self._session.rounds_completed,
-                               opens=opens)
+        return strictness_hint(rows, StrictnessFacts(
+            rounds_completed=self._session.rounds_completed, opens=opens,
+            funnel=self.funnel_wire(), tradability_level=self._tradability_level()))
+
+    def funnel_wire(self) -> dict | None:
+        """开仓漏斗 wire（`status.openFunnel` 与落库 `aiStats.openFunnel` 的**同一次**装配）。"""
+        return funnel_wire(self.funnel)
+
+    def tradability_status(self) -> dict | None:
+        """`status.tradability`：启动断面的瘦身投影（未探测 ⇒ `None` ⇒ 前端整段不渲染）。"""
+        return tradability_status_wire(self.tradability)
+
+    def _tradability_level(self) -> str | None:
+        """会话启动断面的可交易性 level；未探测 / 老会话 ⇒ `None`（不造数）。"""
+        wire = self.tradability
+        return wire.get("level") if isinstance(wire, dict) else None
 
     def naked_changed(self) -> bool:
         """裸仓事实自上次询问以来是否翻转（轴 C [P0-2]：翻转即补推一次 status）。
@@ -97,7 +140,11 @@ class DisciplineRuntime:
         ai_stats["disciplinePreset"] = self.preset_id
         ai_stats["disciplineArmedKeys"] = armed
         ai_stats["disciplineArmedCount"] = len(armed)
-        return ai_stats
+        # 轴 A / B / C 的三个落库加法键（tradability-and-open-funnel §6.2）：使历史会话可回答
+        # 「上次为什么没开单」与「我当时是在什么条件下开的这一局」。键冲突即抛，绝不静默覆盖。
+        return merge_funnel_stats(ai_stats, build_funnel_stats(
+            self.funnel_wire(), tradability_stats_wire(self.tradability),
+            getattr(self._session._sizing, "counters", None)))
 
     def facts(self) -> DisciplineFacts:
         """会话运行时 → 纯核心入参。**取数面就是这一个函数**，改读点只改这里。"""

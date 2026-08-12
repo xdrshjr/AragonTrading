@@ -142,6 +142,58 @@ async def test_backtest_atr_stop_actually_moves_fill(monkeypatch):
         await dispose_engine()
 
 
+# ---------- 轴 B（tradability-and-open-funnel）：回测侧必须同步，否则两侧止损位系统性分叉 ----------
+async def test_backtest_feeds_cost_bps_into_the_sizing_context(monkeypatch):
+    """D-8 的**本轮那一半**：`SizingContext.cost_bps` 补齐（回测世界常数）。
+
+    **两个反直觉后果**（实现节点必须知道）：
+    1. 补 `cost_bps` 对回测的**仓位**是**零行为变化**——`kelly_fraction` 先判 `p_win is None`
+       ⇒ `no_prior` 短路，`cost_bps` 的检查在其之后；而回测侧没有 `PriorRuntime`，`p_win` 恒
+       `None`。**若你期待仓位数字变化、结果没变，那不是没接上，那是对的。**
+    2. 但它是**轴 B 在回测侧生效的必要条件**：不补则 `ctx.cost_bps` 恒 `None` ⇒ 止损下界分支恒
+       不进 ⇒ 回测与实盘的止损位系统性分叉（「双通道共用纯核心时只有一侧被实现」的成文缺陷模式）。
+    """
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(200)
+        _patch_loaders(monkeypatch, candles, _StubLLM(_alternating))
+        runner = AiBacktestRunner(_spec(sid, paper, candles, _sizing_settings()))
+        seen: list = []
+        original = runner._sizing.resolve
+
+        def _spy(decision, ctx, executor=None):
+            seen.append(ctx.cost_bps)
+            return original(decision, ctx, executor)
+
+        runner._sizing.resolve = _spy
+        await runner.run(_BacktestJob("aibt_cost_bps", runner))
+        assert seen, "回测一轮都没跑到仓位求解"
+        opens = [value for value in seen if value is not None]
+        assert opens, "开仓轮的 cost_bps 恒为 None ⇒ 止损下界在回测侧恒不生效"
+        assert all(value > 0 for value in opens)
+        # 非开仓轮（hold / close）不该凭空造一个成本——方向未知时它不是一个有意义的数。
+        assert any(value is None for value in seen)
+    finally:
+        await dispose_engine()
+
+
+async def test_backtest_stop_floor_binds_when_atr_is_narrower_than_cost(monkeypatch):
+    """轴 B 在回测侧真的绑定：把下界倍数拉到值域上限（20）+ 把 ATR 倍数压到极小 ⇒ 下界必然咬合。"""
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(200)
+        _patch_loaders(monkeypatch, candles, _StubLLM(_alternating))
+        settings = _sizing_settings(ai_trade_stop_cost_floor_mult=20.0,
+                                    ai_trade_stop_atr_mult=0.01)
+        runner = AiBacktestRunner(_spec(sid, paper, candles, settings))
+        await runner.run(_BacktestJob("aibt_stop_floor", runner))
+        assert runner._sizing.counters.stop_floored_rounds > 0
+        assert runner._sizing.counters.atr_stop_rounds >= (
+            runner._sizing.counters.stop_floored_rounds)
+    finally:
+        await dispose_engine()
+
+
 def test_only_writing_oco_risk_is_provably_inert():
     """对照实验：证明 T-19b 的判据真的能把「只改 `_oco_risk`」判红（G-13 的先红后绿）。"""
     broker = SimBroker(10_000.0, taker_fee_bps=5.0, slippage_bps=2.0, leverage=1.0)

@@ -85,12 +85,17 @@ class StopRule:
         stop_rr: 盈亏比（止盈 = `stop_rr × 止损`）。
         max_sl_pct: 止损比例的既有用户可见红线（`ai_trade_max_sl_pct`），本层只能在其内活动。
         max_tp_pct: 止盈比例的既有用户可见红线（`ai_trade_max_tp_pct`）。
+        cost_floor_mult: **成本感知的止损下界**倍数（tradability-and-open-funnel 轴 B）：
+            止损距离不得落进 `cost_floor_mult × 往返成本` 以内。`0` ⇒ 逐字回退合入前行为。
+            实测依据：BTC 1m 上 `2×ATR` 的止损距离中位 11.2 bps，而一笔市价往返成本 13.0 bps
+            ——**62.3% 的止损被打掉时亏的价格幅度还不如手续费多**，那是一台结构性手续费机器。
     """
 
     stop_atr_mult: float
     stop_rr: float
     max_sl_pct: float
     max_tp_pct: float
+    cost_floor_mult: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -101,7 +106,9 @@ class StopPlan:
     take_pct: float
     stop_bps: float
     take_bps: float
-    source: str                     # 恒为 "atr"（不可用时调用方拿到的是 None，而非一个假 plan）
+    # "atr" | "atr_floored"（后者 = 本轮止损被成本下界抬起来了，轴 B）。
+    # 不可用时调用方拿到的是 `(None, skip_reason)`，而非一个假 plan。
+    source: str
 
 
 @dataclass(frozen=True)
@@ -186,7 +193,9 @@ def parse_stop_rule(settings) -> StopRule | None:
         return None
     return StopRule(stop_atr_mult=mult, stop_rr=max(0.0, float(settings.ai_trade_stop_rr)),
                     max_sl_pct=float(settings.ai_trade_max_sl_pct),
-                    max_tp_pct=float(settings.ai_trade_max_tp_pct))
+                    max_tp_pct=float(settings.ai_trade_max_tp_pct),
+                    cost_floor_mult=max(0.0, float(
+                        getattr(settings, "ai_trade_stop_cost_floor_mult", 0.0) or 0.0)))
 
 
 def window_need(rule: SizingRule | None) -> int:
@@ -293,32 +302,66 @@ def kelly_fraction(*, p_win: float | None, take_bps: float | None, cost_bps: flo
 # ============================ ATR 自适应止损止盈（§3.4）============================
 def resolve_stop_distance(*, atr_px, ref_px, rule: StopRule | None,
                           max_sl_pct: float | None = None,
-                          max_tp_pct: float | None = None) -> StopPlan | None:
-    """本轮的 ATR 止损/止盈距离；不可用 ⇒ `None` ⇒ 调用方**一行都不改** ⇒ 逐字回退固定 pct。
+                          max_tp_pct: float | None = None,
+                          cost_bps: float | None = None
+                          ) -> tuple[StopPlan | None, str | None]:
+    """本轮的 ATR 止损/止盈距离 + **没覆盖的原因**；`(None, None)` ⇒ 调用方一行都不改。
 
     `sanitize_atr` 直接复用利润保护层的那一条（与实盘 `safe_atr`、回测 `_atr_at` 同一条降级判据），
     **禁止另写**。夹紧上界取既有的用户可见红线（`ai_trade_max_sl_pct` / `ai_trade_max_tp_pct`）；
     形参留空即取 `rule` 自带的那一份（两者恒同源于 settings）。
+
+    **返回二元组而不是裸 `None`（[P0-2]）**：裸 `None` 把「为什么没覆盖」这个信息擦掉了——
+    `sizing_runtime._apply_stop` 对 `plan is None` 的两条路径都只能得到 `"fixed"`，调用方无从
+    区分「ATR 不可用」与「下界高于用户红线」。那会让 `floor_above_cap` 这个状态在当前代码上
+    **产生不出来**（有读点、没写点）。故：
+
+    - 不可用（rule 缺席 / ATR 无效 / px 无效）⇒ `(None, None)` —— 与合入前语义**逐字相同**；
+    - 成本下界高于用户可见红线 `sl_cap` ⇒ `(None, "floor_above_cap")`。
+
+    三段顺序**不可交换**：下界 → 上界 → 冲突判定。冲突时**不落 `StopPlan` 而是整条覆盖回退**：
+    `sl_cap`（`ai_trade_max_sl_pct`，默认 0.20）是用户可见红线，若成本下界比红线还大，说明这个
+    标的/周期的成本结构已经彻底不可行，此时挂一个「刚好等于红线」的止损是**假装可行**。
+
+    Args:
+        atr_px: 确认根 ATR（价格单位）。
+        ref_px: 判定价。
+        rule: 止损规则；`None` / `stop_atr_mult<=0` ⇒ 本层未装配。
+        max_sl_pct: 止损红线覆盖（留空取 `rule.max_sl_pct`）。
+        max_tp_pct: 止盈红线覆盖（留空取 `rule.max_tp_pct`）。
+        cost_bps: 本轮往返成本（bps）；`None` / `<=0` ⇒ 下界分支**整体不进**（轴 B 不生效）。
+
+    Returns:
+        `(plan, skip_reason)`。
     """
     if rule is None or rule.stop_atr_mult <= 0:
-        return None
+        return None, None
     atr = sanitize_atr(atr_px)
     px = _positive(ref_px)
     if atr is None or px is None:
-        return None
+        return None, None
     sl_cap = _positive(rule.max_sl_pct if max_sl_pct is None else max_sl_pct)
     tp_cap = _positive(rule.max_tp_pct if max_tp_pct is None else max_tp_pct)
     stop_pct = rule.stop_atr_mult * atr / px
+    floor_pct = None
+    floored = False
+    cost = _positive(cost_bps)
+    if rule.cost_floor_mult > 0 and cost is not None:
+        floor_pct = rule.cost_floor_mult * cost / 1e4
+        if floor_pct > stop_pct:
+            stop_pct, floored = floor_pct, True
     if sl_cap is not None:
+        if floor_pct is not None and floor_pct > sl_cap:
+            return None, "floor_above_cap"
         stop_pct = min(stop_pct, sl_cap)
     take_pct = rule.stop_rr * stop_pct
     if tp_cap is not None:
         take_pct = min(take_pct, tp_cap)
     if stop_pct <= 0 or take_pct <= 0:
-        return None
+        return None, None
     return StopPlan(stop_pct=round(stop_pct, _ROUND), take_pct=round(take_pct, _ROUND),
                     stop_bps=round(stop_pct * 1e4, _ROUND), take_bps=round(take_pct * 1e4, _ROUND),
-                    source="atr")
+                    source="atr_floored" if floored else "atr"), None
 
 
 # ============================ 求解（§3.3 的七步）============================

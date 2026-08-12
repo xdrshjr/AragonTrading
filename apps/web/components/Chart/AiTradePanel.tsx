@@ -17,6 +17,7 @@ import {
   summarizeDisciplines,
 } from "@/lib/aiTradeDiscipline";
 import { describeHorizonStatus } from "@/lib/aiTradeHorizon";
+import { describeTradability } from "@/lib/aiTradeTradability";
 import { describeTurnoverChip } from "@/lib/aiTradeTurnover";
 import { COST_BASIS_HINT, describeCostBasis } from "@/lib/aiTradeCost";
 import { colorForReturn, fmtMoney, fmtNum, fmtPct, fmtPrice } from "@/lib/format";
@@ -93,6 +94,12 @@ export default function AiTradePanel({
         </span>
       </div>
 
+      {/* 可交易性红条 + 长期记忆停摆徽标（tradability-and-open-funnel 轴 A / 轴 D）。
+          放在纪律条**之上**：当探针判定「这个周期几乎开不出单」时，那是用户最该先看到的一句话
+          ——否则「开着、在跑、每轮都有分析、就是从不开单」只会被读成「AI 坏了」。 */}
+      <TradabilityStrip members={members} />
+      <SummaryStalledStrip members={members} />
+
       <DisciplineStrip group={group} />
 
       <div className="flex flex-col gap-1">
@@ -112,6 +119,61 @@ export default function AiTradePanel({
         ))}
       </div>
     </div>
+  );
+}
+
+/**
+ * 可交易性红条（tradability-and-open-funnel 轴 A · §3.1.3 落点三）。
+ *
+ * **只在 `infeasible` 且本会话一单未成交时**出现——那正是「开着、在跑、就是从不开单」的现场。
+ * 已经成交过的会话不该被一条红条打扰（探针是启动断面，行情会变）。逐成员各判一次：多标的分组里
+ * 只看第一个成员会漏报后面的标的。
+ */
+function TradabilityStrip({ members }: { members: AiTradeGroupMemberState[] }) {
+  const rows = members
+    .map((m) => ({
+      instId: m.instId,
+      view: describeTradability(m.session?.tradability),
+      filled: m.session?.openFunnel?.filled ?? 0,
+    }))
+    .filter((row) => row.view?.level === "infeasible" && row.filled === 0);
+  if (rows.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-1" data-testid="ai-tradability-strip">
+      {rows.map((row) => (
+        <p
+          key={row.instId}
+          className="rounded border border-[var(--short)] px-2 py-1 text-[10px] leading-relaxed text-[var(--short)]"
+        >
+          <strong>{members.length > 1 ? `${row.instId} · ` : ""}当前周期几乎开不出单</strong>
+          ：{row.view?.headline}
+          {row.view?.advice ? ` ${row.view.advice}` : ""}
+        </p>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * 「长期记忆已停摆」徽标（轴 D · D-6）。
+ *
+ * 合入前摘要失败在全仓**没有任何呈现落点**（`_status_payload` 只有 `roundsSinceSummary`），
+ * 而实测出现过 4 条连续失败且诊断串全为空。文案必须说明**后果**——只报「失败」不报后果，
+ * 用户无法判断要不要停会话。
+ */
+function SummaryStalledStrip({ members }: { members: AiTradeGroupMemberState[] }) {
+  const stalled = members.find((m) => m.session?.summaryHealth?.stalled);
+  const health = stalled?.session?.summaryHealth;
+  if (!health) return null;
+  return (
+    <p
+      className="rounded border border-[var(--accent)] px-2 py-1 text-[10px] leading-relaxed text-[var(--accent)]"
+      data-testid="ai-summary-stalled-badge"
+      title={health.lastError ?? undefined}
+    >
+      <strong>长期记忆已停摆</strong>（连续 {health.failures} 次摘要失败）：
+      模型仍在按当前行情决策，但会逐渐忘记更早的执行历程。
+    </p>
   );
 }
 

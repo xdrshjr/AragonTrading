@@ -707,6 +707,24 @@ class AiBacktestRunner:
         snap = self._curve.snapshot_at(int(ts))
         return (snap, True) if snap is not None else (None, False)
 
+    def _sizing_cost_bps(self, ts: int, action: str) -> float | None:
+        """仓位层 / 止损下界用的往返成本（bps，**回测世界常数**）；非开仓动作 ⇒ `None`。
+
+        方向按本轮**开仓意图**取（`open_short` ⇒ `"short"`，其余 ⇒ `"long"`）——资金费只取不利侧，
+        方向搞反会让成本看起来更便宜。回测里 Agent 恒市价（`allow_limit=False`，§2.10），故
+        `ord_type` 固定 `"market"`，与 `_horizon_facts` 的既有姿态逐字同源。
+        """
+        if action not in ("open_long", "open_short"):
+            return None
+        funding, funding_on = self._cost_funding(ts)
+        return estimate_round_trip_cost(
+            query_for_preview(ord_type="market",
+                              side="short" if action == "open_short" else "long",
+                              bar_seconds=BAR_SECONDS[self.bar], funding=funding,
+                              funding_enabled=funding_on),
+            backtest_params(self.settings,
+                            expected_hold_bars=self._horizon_hold_bars)).total_bps
+
     def _horizon_facts(self, i: int, ts: int, ref_px: float) -> HorizonFacts:
         """回测断面（§2.10 对照表）：`now_wall`=当前根 ts、`mark_px`=当根收盘价、`side`=`pos.side`。
 
@@ -832,10 +850,20 @@ class AiBacktestRunner:
         # ★ 仓位求解 + ATR 止损（第 11 步，反思后、_execute 前）。[P0-3] **必须双写**：`apply_risk` 第三形参
         # 根本没被使用、止损价是 `_open` 时由 `self._risk` 冻结进 pos 的，只改 `_oco_risk` 一行都不会生效且
         # 不报错；而它的 take_profit_pct 又被 edge 门禁当上界读（backtest.py:534），故两条必须同步更新。
+        # [D-8 / P1-1] `cost_bps` 走**回测世界**的常数（`backtest_params`）——两个世界的成本常数
+        # 必须各自演进，严禁在回测里用实盘的 `resolve_cost_params`。两个反直觉后果（都要记住）：
+        # ① 补 `cost_bps` 对回测的**仓位**是**零行为变化**：`kelly_fraction` 先判 `p_win is None`
+        #    ⇒ `no_prior` 短路（`sizing.py:278-280`），`cost_bps` 的检查在其**之后**。回测侧没有
+        #    `PriorRuntime`（先验快照只在实盘启动流程里装配），`p_win` 恒 `None`，故凯利项**依然
+        #    恒不参与 min**。**若你期待仓位数字变化、结果没变，那不是没接上，那是对的。**
+        # ② 但它是轴 B 在回测侧生效的**必要条件**：不补，`ctx.cost_bps` 恒 `None` ⇒ 止损下界分支
+        #    恒不进 ⇒ 回测与实盘的止损位系统性分叉。本仓库有过「双通道共用纯核心时只有一侧被实现」
+        #    的阻断级事故，故这一条**不是可选项**。
         decision, plan, _ = self._sizing.resolve(decision, SizingContext(
             ref_px=ref_px, atr_px=self._atr_at(i), step=self.position_step_pct, now_wall=float(ts),
             closes=list(main_df["c"].iloc[:i + 1]), fallback_stop_pct=self._oco_risk.stop_loss_pct,
             notional_full=self.main.equity_at(ref_px) * self.leverage,
+            cost_bps=self._sizing_cost_bps(ts, decision.action),
             fallback_take_pct=self._oco_risk.take_profit_pct))
         if plan is not None:
             self._oco_risk = replace(self._oco_risk, stop_loss_pct=plan.stop_pct,

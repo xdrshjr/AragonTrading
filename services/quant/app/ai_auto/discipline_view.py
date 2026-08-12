@@ -81,22 +81,116 @@ def build_discipline_digest(facts: DisciplineFacts) -> list[dict]:
     return [dict(_BUILDERS[key](facts), label=_LABELS[key]) for key in ROW_KEYS]
 
 
-def strictness_hint(rows: list[dict], *, rounds_completed: int, opens: int) -> str | None:
-    """[P1-9] 恒真自检：一堆闸都武装着、却一单都没开过 ⇒ 给出显著提示；否则 `None`。
+@dataclass(frozen=True)
+class StrictnessFacts:
+    """`strictness_hint` 的全部输入（聚合结构体，[P1-8]）。
 
-    本仓库已有四次「恒真判据 ⇒ 永不开单」前科，它们在只报 armed 的面板上与「一切正常」完全同形。
-    样本不足（轮数 < `_STRICTNESS_MIN_ROUNDS`）时不提示——刚启动没开过仓是正常的。
+    **刻意不是五个 keyword-only 形参**：那恰好踩到 CLAUDE.md 的「函数形参 ≤ 5」红线，而**同一个
+    文件**的 `DisciplineFacts` docstring 里已经白纸黑字写了这条规则和它的解法。在同一文件里另立
+    一套散装形参，就是本仓库反复记录的「制造新孤岛」。
+
+    Attributes:
+        rounds_completed: 本会话已完成决策轮数（样本量门禁）。
+        opens: 本会话开仓成交笔数（>0 ⇒ 不提示）。
+        funnel: `open_funnel.funnel_wire()` 产物或 `None`（轴 C 未装配 / 老会话）。
+        tradability_level: 轴 A 的启动断面 level（`ok|marginal|infeasible|unknown`）或 `None`。
     """
-    if opens > 0 or rounds_completed < _STRICTNESS_MIN_ROUNDS:
+
+    rounds_completed: int = 0
+    opens: int = 0
+    funnel: dict | None = None
+    tradability_level: str | None = None
+
+
+def strictness_hint(rows: list[dict], facts: StrictnessFacts) -> str | None:
+    """[P1-9 / 轴 C] 恒真自检**升级为对症建议**：不只说「可能过严」，而是说**谁在拦、该动哪个旋钮**。
+
+    合入前这句提示的建议固定为「改选更宽松的预设」。本轮实测证明那在短周期断面上是**错的**：
+    同一批 BTC 1m K 线上，最宽松的 `aggressive`（k=1.0）仍有 93.0% 的否决率——门禁的分母是往返
+    成本，短周期的单笔波动幅度本身就覆盖不了它，放宽 k 只能把曲线整体平移一点。真正的补救是
+    **换时间级别**。
+
+    有序规则链（第一条命中即返回）：
+
+    1. 已开过仓 / 样本不足 ⇒ `None`（既有行为逐字不变）。
+    2. `tradability_level == "infeasible"` ⇒ **首要建议是换周期**，且必须写明「换预设解决不了」。
+       这一条**必须排在第 4 条之前**——D-1 的实测表就是它的依据。
+    3. `funnel.intents == 0` ⇒ 模型一次都没提出过开仓：这是**模型侧**问题而非纪律侧，
+       放宽一个从未触发的闸没有任何作用。
+    4. 有首拦截层 ⇒ 点名那一层 + 它专属的对症建议。
+    5. 兜底 ⇒ 保留合入前那句（作为最后一档，不删）。
+    """
+    if facts.opens > 0 or facts.rounds_completed < _STRICTNESS_MIN_ROUNDS:
         return None
     armed = [row for row in rows if row["armed"]]
     if not armed:
         return None
+    if facts.tradability_level == "infeasible":
+        return _infeasible_hint(facts)
+    funnel = facts.funnel if isinstance(facts.funnel, dict) else None
+    if funnel is not None and int(funnel.get("intents") or 0) == 0:
+        return _no_intent_hint(facts, funnel)
+    top = (funnel or {}).get("topBlocker") if funnel else None
+    if isinstance(top, dict) and top.get("count"):
+        return _top_blocker_hint(facts, funnel or {}, top)
+    return _legacy_hint(armed, facts.rounds_completed)
+
+
+def _infeasible_hint(facts: StrictnessFacts) -> str:
+    """轴 A 判定不可行时的首要建议：换时间级别（并明说换预设解决不了）。"""
+    return ("本周期的可交易性预检判定为「不可行」：这个标的在当前「时间级别」上的单笔波动幅度"
+            f"覆盖不了一笔往返成本，已完成 {facts.rounds_completed} 轮决策而一单未开。"
+            "首要动作是改用更长的时间级别——换预设解决不了（最宽松的档位仍会被同一条"
+            "成本判据拦住绝大多数开仓）。详情见「可交易性预检」卡。")
+
+
+def _no_intent_hint(facts: StrictnessFacts, funnel: dict) -> str:
+    """分母为 0：模型压根没提出过开仓 ⇒ 这是模型侧问题，放宽纪律毫无作用。"""
+    degraded = int(funnel.get("llmDegraded") or 0)
+    tail = f"（其中 {degraded} 轮因模型调用失败而降级）" if degraded else ""
+    return (f"模型在 {facts.rounds_completed} 轮里一次都没有提出开仓{tail}——"
+            "这是模型侧（策略信号板 / 提示词 / 行情本身）的问题，不是纪律过严："
+            "放宽一个从未被触发过的闸没有任何作用。建议先检查信号板是否长期无同向信号。")
+
+
+def _top_blocker_hint(facts: StrictnessFacts, funnel: dict, top: dict) -> str:
+    """点名首拦截层 + 该层专属的对症建议（口径词必须带：只归给**第一个**拦下它的闸）。"""
+    intents = int(funnel.get("intents") or 0)
+    label = top.get("label") or top.get("key")
+    advice = _BLOCKER_ADVICE.get(str(top.get("key")), _BLOCKER_ADVICE_DEFAULT)
+    return (f"{intents} 次开仓意图里有 {int(top['count'])} 次被「{label}」拦下"
+            f"（按决策链顺序只归给第一个拦下它的闸）。{advice}")
+
+
+def _legacy_hint(armed: list[dict], rounds_completed: int) -> str:
+    """兜底档：漏斗不可用（老会话 / 轴 C 未装配）时保留合入前那句。"""
     fired = [row for row in armed if (row.get("firedCount") or 0) > 0]
     culprits = "、".join(row["label"] for row in fired) if fired else None
     tail = f"其中 {culprits} 确实拦下过开仓意图。" if culprits else ""
     return (f"{len(armed)} 条纪律可能过严：已完成 {rounds_completed} 轮决策，本会话尚未开过任何仓。"
             f"{tail}可在弹窗改选更宽松的预设（或「关闭」）后重启会话。")
+
+
+# 逐层的对症建议：每条都要能自证「为什么是这个旋钮」，绝不给一句「改选更宽松的预设」了事。
+# ⚠️ 本表与上面三个 `_*_hint` 的产出串**全部是纯文本**：它们经 `status.disciplines.hint` 下发，
+# 由 `DisciplineCard` 直接放进 JSX 文本节点渲染，**不经任何 markdown 渲染器**——写 `**粗体**`
+# 会原样显示成两个星号（本仓库已为这条栽过一次）。强调一律用「」与句式。
+_BLOCKER_ADVICE_DEFAULT = "可在启动弹窗改选更宽松的纪律预设后重启会话。"
+_BLOCKER_ADVICE = {
+    "edgeGate": ("这一条比较的是「一笔的预期毛幅度 vs 一笔往返成本」：短周期上分子天然打不过"
+                 "分母，首选换更长的时间级别；其次才是改用「激进」预设降低 k。"),
+    "baseRuleMaBand": ("开仓被限制在 MA 通道的上/中/下轨附近。可在弹窗「基础策略」分区放宽容差，"
+                       "或取消勾选该铁律（它是凌驾于所选策略之上的开单纪律）。"),
+    "consensus": "同向策略数没达到门槛。可减少策略数量、或改用门槛更低的预设。",
+    "confidence": "模型自报置信度低于门槛。这通常说明行情本身不明朗，放宽门槛会同时放进低质量开仓。",
+    "horizon": "被持仓周期纪律拦下的是「平仓与反手」：若你要的是更高频的进出，请改选更短的周期模式。",
+    "turnover": "换手预算已用尽（按会话计）。可改选换手预算更高的周期模式，或等预算恢复。",
+    "profitCooldown": "处在保护性平仓后的冷却期内。可在弹窗「利润保护」分区调小冷却秒数。",
+    "drawdownBrake": "回撤刹车 / 连亏熔断正在阻止开新仓——这通常是应该被拦住的断面，先复盘亏损原因。",
+    "exchangeBackstop": "交易所侧兜底止损未覆盖当前持仓，系统据此暂停加仓。请先补挂止损。",
+    "reflection": "下单前二次反思否决了这些开仓。可在设置中关闭反思，但那会去掉一层安全网。",
+    "other": _BLOCKER_ADVICE_DEFAULT,
+}
 
 
 # ============================ 逐行装配 ============================

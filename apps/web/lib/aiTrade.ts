@@ -878,9 +878,16 @@ const KELLY_STATUS_LABEL: Record<string, string> = {
   disabled: "凯利项已关闭",
 };
 
-// 止损来源五态的中文（三个 skip 态必须讲清「为什么没按 ATR 挂」——那是本设计付出的真实代价）。
+// 止损来源**七态**的中文（三个 skip 态必须讲清「为什么没按 ATR 挂」——那是本设计付出的真实代价）。
+// ⚠️ 与 `lib/aiTradeTypes.ts` 的 `AiTradeStopSource` 逐态对应：**漏一态即静默显示空串**。
 const STOP_SOURCE_LABEL: Record<string, string> = {
   atr: "止损距离按本轮 ATR 定标后随单挂出",
+  atr_floored:
+    "止损距离被成本下界抬起：按 ATR 算出的距离窄于往返成本带，已抬到成本下界后随单挂出" +
+    "（否则这一单只要被止损打掉，亏的价格幅度还不如手续费多）",
+  floor_above_cap:
+    "成本下界已高于你设定的最大止损比例，本轮整条 ATR 覆盖回退固定百分比" +
+    "——挂一个刚好等于红线的止损是假装可行，该标的/周期的成本结构值得重新评估",
   fixed: "ATR 不可用或未开启，止损沿用固定百分比",
   skipped_resting: "有限价挂单在飞，本轮不改写止损（改了会让落库回执写上一个交易所侧不存在的价）",
   skipped_position_live: "已有持仓，本轮不改写止损（其 OCO 早已挂出，改了只会让展示口径撒谎）",

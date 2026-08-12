@@ -121,16 +121,21 @@ describe("describeSizing", () => {
     }
   });
 
-  it("止损来源五态各有中文，三个 skip 态必须讲清「为什么没按 ATR 挂」", () => {
+  // [tradability-and-open-funnel R-5] 五态 → **七态**：轴 B 的成本下界新增 `atr_floored`
+  // （止损被抬到成本带以外）与 `floor_above_cap`（下界高于用户红线 ⇒ 整条覆盖回退）。
+  // **三处漏一处即静默显示空串**：`AiTradeStopSource` 联合类型、`STOP_SOURCE_LABEL`、以及本用例。
+  it("止损来源七态各有中文，skip 与 floor 两类都必须讲清「为什么没按 ATR 挂」", () => {
     for (const [source, needle] of [
       ["atr", "按本轮 ATR 定标"],
+      ["atr_floored", "成本下界抬起"],
+      ["floor_above_cap", "高于你设定的最大止损比例"],
       ["fixed", "固定百分比"],
       ["skipped_resting", "限价挂单在飞"],
       ["skipped_position_live", "已有持仓"],
       ["skipped_reversal", "反手"],
     ] as const) {
       const view = describeSizing({ brakeLevel: "none", stopSource: source } as AiTradeRoundTrace);
-      expect(view!.note).toContain(needle);
+      expect(view!.note, source).toContain(needle);
     }
   });
 

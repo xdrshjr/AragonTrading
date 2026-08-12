@@ -4,6 +4,7 @@
 // 复用 ./api 的 ApiRequestError；不引用任何不存在的 helper。历史为一次性只读拉取，无 WS。
 import { ApiRequestError } from "./api";
 import type { AiTradeHistoryDetailOut, AiTradeHistoryListOut } from "./aiTradeHistoryTypes";
+import type { AiTradePresetComparisonResponse } from "./aiTradeTypes";
 
 const BASE = "/api/py";
 
@@ -33,4 +34,8 @@ export const aiTradeHistoryApi = {
   // 单会话详情（会话头 + 逐成员成交 / metrics + 后端聚合 summary）。
   detail: (groupId: string) =>
     get<AiTradeHistoryDetailOut>(`/ai-trade/history/${encodeURIComponent(groupId)}`),
+  // 历史纪律预设对照（tradability-and-open-funnel 轴 E）：用**真实资金的历史**回答「哪一档更赚」。
+  // 后端按 `aiStats.disciplinePreset` 分组聚合；`conclusive=false` 的组必须显式写「样本不足」。
+  presetComparison: () =>
+    get<AiTradePresetComparisonResponse>("/ai-trade/history/preset-comparison"),
 };

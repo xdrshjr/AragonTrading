@@ -85,6 +85,7 @@ from .trace import (
     edge_gate_unavailable_event,
     horizon_event,
     horizon_released_event,
+    maybe_emit_summary_failed,
     new_round_trace,
     reflection_start_event,
     reflection_verdict_event,
@@ -322,6 +323,7 @@ class AiTradeSession:
                     self._sizing.note_close(trade, now_wall=time.time())   # 连亏计数同挂唯一收口
                     self._horizon.note_close(trade, time.time())   # 真实持仓时长样本同挂唯一收口
                 else:   # 开仓成交：锁定 epoch 的 opened_wall（部分成交同一 epoch ⇒ 内部幂等不重置）
+                    self._discipline.funnel.note_filled()   # 轴 C：漏斗末格（事件级口径）
                     self._horizon.note_open(trade, time.time(), seq=self._position_seq)
                     self._repair.note_epoch(self._position_seq)   # 新持仓周期 ⇒ 补挂配额清零
                     self._backstop.force_next()   # 随单 OCO 是否真的挂上，是开仓后最该立刻知道的事
@@ -724,6 +726,7 @@ class AiTradeSession:
             # N2（hold-inertia-observability）：以第一阶段原始输出立即更新连续观望计数——须在共识门禁
             # 与反思之前（此时的 decision/degrade 正是第一阶段输出，惯性以模型真实意愿为准）。
             self._update_hold_streak(decision.action, degrade)
+            self._discipline.note_intent(decision.action, degrade)   # 轴 C：开仓漏斗的**分母**
             # 同上落点（§2.6 c）：盈利持有链条同样以第一阶段真实意愿为准，据本轮保护快照的浮盈正负推进。
             self._update_profit_hold_streak(decision.action, degrade,
                                             payload.get("profitGuard"))
@@ -762,14 +765,18 @@ class AiTradeSession:
                 round_no, ts, payload, decision, degrade)
             decision = await self._apply_sizing(round_no, ts, ref_px, decision)   # ★ 第 11 步
             executed = await self._execute_decision(decision, ref_px, i, ts)
+            self._discipline.funnel.note_executed(decision.action, bool(executed.get("skipped")))
             self._cost.note_round(bool(executed.get("traded")))          # §6.3 决策转化率
             self.rounds_completed = round_no
             # RC-2/RC-3：研判全文只走 agent_trace/_traces；进 journal 与 decision 事件的取有界摘录（≤400）。
             # 降级轮 last_analysis 恒为空串（RC-1）→ excerpt=None（journal/事件不带残段）。
             excerpt = self.decider.last_analysis[:_ANALYSIS_EXCERPT_CHARS] or None
             # R-P1-3：commit_round 收门禁后的最终 decision，journal/摘要据此记真实动作（保持上下文纯净）。
+            # D-5：`defer_summary=True` ⇒ 到期只记账，真正的 LLM 调用挪到 `_emit_decision` 之后
+            # （否则「成交已发生、决策已完成」之后界面上的决策事件还要再等最多一个摘要超时才出现）。
             summary = await self.decider.commit_round(payload, decision, executed,
-                                                      analysis=excerpt, reflection=reflection_note)
+                                                      analysis=excerpt, reflection=reflection_note,
+                                                      defer_summary=True)
             await self._emit_tool_call_trace(round_no, ts, decision)
             await self._emit_result_trace(round_no, ts, executed, degrade)
             reflection_verdict, reflection_reason = self._round_reflection_summary()
@@ -785,12 +792,15 @@ class AiTradeSession:
                                       context_disclosure=payload.get("contextDisclosure"),
                                       reflection_verdict=reflection_verdict,
                                       reflection_reason=reflection_reason)
-            self._discipline.note_round(degrade)   # 轴 B：三条闸的 firedCount 唯一计数点
+            self._discipline.note_round(degrade)   # 轴 B/C：闸计数 + 开仓漏斗的首拦截层归类
             if degrade:
                 await self._emit_degraded(ts, degrade)
+            summary = await self.decider.flush_summary() or summary   # D-5：摘要在决策事件之后
             if summary is not None:
                 await self._emit_summary_trace(round_no, ts, summary)
                 await self._emit_summary(round_no, ts, summary)
+            await maybe_emit_summary_failed(self._push, self._round_trace,        # D-6
+                                            self.decider.summary_health_wire(), round_no, ts)
             await self._post_round(ref_px, ts)
         except asyncio.CancelledError:
             raise
@@ -801,6 +811,7 @@ class AiTradeSession:
                 "ts": ts, "code": "AI_TRADE_ROUND_FAILED", "message": "本轮决策异常，已跳过"}})
         finally:
             self._deciding = False
+            self._discipline.funnel.end_round()   # R-12：轮级标志兜底清零（异常路径也走这里）
             self._maybe_catchup_wake()       # 轴 A：纯同步，check→claim 之间无 await
 
     def _maybe_catchup_wake(self) -> None:
@@ -998,6 +1009,10 @@ class AiTradeSession:
             self._round_trace["summary"] = summary
         await self._push(trace_event("summary", round_no, ts, summary=summary))
 
+    def note_tradability(self, wire: dict | None) -> None:
+        """装入启动断面的可交易性预检（`manager.start` 算一次；与启动回执是**同一份对象**）。"""
+        self._discipline.note_tradability(wire)
+
     async def _emit_error_trace(self, round_no: int, ts: int, message: str) -> None:
         """error：本轮决策异常兜底（不崩会话），state="error"。"""
         if self._round_trace is not None:
@@ -1116,6 +1131,7 @@ class AiTradeSession:
             decision, self.executor, ref_px=ref_px, atr_px=self._atr_px,
             step=self.decider.position_step, prior_view=self._prior.coverage_wire(),
             cost_bps=self._cost.estimate_cost_only(decision, BAR_SECONDS[self.bar]))
+        self._discipline.funnel.note_sizing(decision.action, decision.size_fraction)  # 轴 C
         if wire:
             apply_sizing_trace(self._round_trace, wire)
             await self._push(sizing_event(round_no, ts, wire))
@@ -1612,6 +1628,12 @@ class AiTradeSession:
                 "wakeIntervalMinutes": self._wake_interval_minutes(),
                 "wakeSkips": self.wake_skips,
                 "disciplines": self.discipline_wire(),   # 轴 B：13 行自检 + 恒真自检提示
+                # tradability-and-open-funnel 三新键（未装配 / 零样本 ⇒ None 而非缺席）：
+                # 可交易性启动断面 / 开仓漏斗 / 摘要健康度。三者各自的渲染落点都在本轮内做完
+                # （§十.5：后端算了、类型补了、没有渲染落点 = 死数据）。
+                "tradability": self._discipline.tradability_status(),
+                "openFunnel": self._discipline.funnel_wire(),
+                "summaryHealth": self.decider.summary_health_wire(),
                 **self._wake.status_counts(self._preview.stats()),   # 调度四计数（A-6 同源）
                 "holdStreak": self.hold_streak,
                 # F2 冷却三载体之一（§4.2）：**不挂 position**——冷却期内按定义已无持仓。
@@ -1664,6 +1686,10 @@ class AiTradeSession:
                 "wakeIntervalMinutes": self._wake_interval_minutes(),
                 "roundsCompleted": self.rounds_completed,
                 "roundsSinceSummary": self.decider.rounds_since_summary,
+                # [P1-9] `summaryHealth` **两处装配**（此处与 `_status_payload`），两者的**渲染义务
+                # 不同**——义务对照表在 `summary_health.health_wire` 的 docstring 里，改这一行前先读它。
+                # **不要**因为「这个键没人渲染」就把它当死码删掉：那个坑会第二次复发。
+                "summaryHealth": self.decider.summary_health_wire(),
                 "positionSide": self.executor.projected,
                 "sessionPnlUsd": self.executor.session_pnl_usd, "startedTs": self.started_ts,
                 "lastDecision": self._last_decision, "contextSummary": self.decider.summary,

@@ -5,6 +5,8 @@ import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
 import DisciplineCard from "./DisciplineCard";
 import ExitSourceCard from "./ExitSourceCard";
 import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
+import OpenFunnelCard from "./OpenFunnelCard";
+import TradabilityCard from "./TradabilityCard";
 import TurnoverBackstopCard, { type RepairPendingState } from "./TurnoverBackstopCard";
 import WakeAttributionCard from "./WakeAttributionCard";
 import AutoTradePnlSummary from "@/components/Chart/AutoTradePnlSummary";
@@ -178,7 +180,17 @@ export default function AiTradeStatsLive() {
               : null
           }
           memberCount={Object.keys(group.members).length}
+          summaryHealth={Object.values(group.members)[0]?.session?.summaryHealth}
         />
+        {/* 可交易性预检 + 开仓漏斗（tradability-and-open-funnel 轴 A / 轴 C）：紧跟纪律卡——
+            「AI 为什么不开单」的完整答案是这三张卡连起来读的（哪些闸开着 → 这个周期上它们会拦掉
+            多少 → 模型真的提出过几次开仓、被谁拦下）。数据源是**成员级实时快照**，逐成员一份。 */}
+        {Object.values(group.members).map((m) => (
+          <TradabilityCard key={`trad-${m.instId}`} tradability={m.session?.tradability} />
+        ))}
+        {Object.values(group.members).map((m) => (
+          <OpenFunnelCard key={`funnel-${m.instId}`} funnel={m.session?.openFunnel} />
+        ))}
         <HorizonLiveCard group={group} ledger={ledger} />
         {/* 周期验收闭环（horizon-acceptance）：两卡是**两个独立入参**——`acceptance` 为 null
             （未装配周期模式的对照臂）时退出来源卡照常渲染（[P0-4]）。分组合并口径由

@@ -83,6 +83,10 @@ def apply_risk_override(executor, plan: StopPlan | None,
                         action: str | None = None) -> str:
     """把本轮 ATR 止损距离写进 `executor.risk`；返回实际生效的 `stopSource`（五态）。
 
+    **[P0-2] 本函数一行都不动**：「plan 为 None 就不碰 `executor.risk`」这条不变式必须原样保留
+    （它守的是「会话展示口径与交易所侧现存 OCO 一致」，见下方论证）。轴 B 新增的
+    `floor_above_cap` 态由 `_apply_stop` 在**拿到 `skip_reason` 之后**改写，不经过本函数。
+
     `plan is None` 或前置条件不满足 ⇒ **一行都不动**，逐字回退到当前 risk（构造期固定 pct，或上一次
     开仓时写入的那一份——两者都与交易所侧现存 OCO 一致）。`max_hold_bars` **必须原样保留**：
     `_maybe_time_exit` 读它，改动会静默改变时间止盈行为。
@@ -151,6 +155,11 @@ class _Counters:
     resting_skips: int = 0
     corr_scaled_rounds: int = 0
     exposure_unreachable_rounds: int = 0
+    # 轴 B（tradability-and-open-funnel）：止损被成本下界抬起来的轮数 / 下界高于用户红线而
+    # **整条覆盖回退**的轮数。两者不可互相换算：前者是「保护生效了」，后者是「这个组合的成本
+    # 结构已经彻底不可行」——只报前者会让后者永远看不见（[P0-2]）。
+    stop_floored_rounds: int = 0
+    floor_above_cap_rounds: int = 0
 
 
 class SizingRuntime:
@@ -236,8 +245,11 @@ class SizingRuntime:
             return decision, None, {}
         if ctx.closes is not None:      # 回测侧：无确认根喂数点，波动率随本轮断面一并刷新
             self._refresh_vol(ctx.closes)
-        plan = resolve_stop_distance(atr_px=ctx.atr_px, ref_px=ctx.ref_px, rule=self.stop_rule)
-        stop_source = self._apply_stop(executor, plan, decision.action)
+        # 轴 B：`ctx.cost_bps` 已在同一作用域里（实盘由 `session._cost.estimate_cost_only` 传入、
+        # 回测由 `backtest_params` 的回测世界常数传入），故这里只多传一个形参。
+        plan, skip = resolve_stop_distance(atr_px=ctx.atr_px, ref_px=ctx.ref_px,
+                                           rule=self.stop_rule, cost_bps=ctx.cost_bps)
+        stop_source = self._apply_stop(executor, plan, decision.action, skip_reason=skip)
         view = (evaluate_brake(self.state, self.brake_rule, now_wall=ctx.now_wall or time.time())
                 if self.brake_rule is not None else None)
         outcome, exposure, corr = self._solve(decision, ctx, plan, view, executor)
@@ -247,14 +259,32 @@ class SizingRuntime:
         self._last_wire = wire
         return apply_size_fraction(decision, outcome), plan, wire
 
-    def _apply_stop(self, executor, plan: StopPlan | None, action: str) -> str:
-        """落地 ATR 止损覆盖并记三个 skip 计数（L1.5 用它度量「ATR 止损覆盖不到多少开仓」）。"""
+    def _apply_stop(self, executor, plan: StopPlan | None, action: str, *,
+                    skip_reason: str | None = None) -> str:
+        """落地 ATR 止损覆盖并记计数；返回 `stopSource`（**七态**）。
+
+        七态 = `atr | atr_floored | fixed | floor_above_cap | skipped_resting |
+        skipped_position_live | skipped_reversal`。
+
+        [P0-2] `skip_reason` 只在 `source` 落成 `"fixed"` 时才顶上去：`skipped_*` 三态说的是
+        「有挂单在飞 / 有持仓 / 反手」，它们与「下界高于红线」是两件事，被后者盖掉会让真正的
+        跳过原因消失。`atr_stop_rounds` 对 `atr` 与 `atr_floored` **都要 +1**——它度量的是
+        「ATR 覆盖到了多少开仓」（`discipline_runtime.py:132` 是它唯一的读点）。
+        """
         if executor is None:
-            source = "atr" if plan is not None else "fixed"
+            source = (plan.source if plan is not None else "fixed")
         else:
             source = apply_risk_override(executor, plan, action)
-        if source == "atr":
+            if source == "atr" and plan is not None:
+                source = plan.source        # 实盘侧把 `atr_floored` 如实带出（覆盖已真的写进 risk）
+        if source == "fixed" and skip_reason:
+            source = skip_reason
+        if source in ("atr", "atr_floored"):
             self.counters.atr_stop_rounds += 1
+            if source == "atr_floored":
+                self.counters.stop_floored_rounds += 1
+        elif source == "floor_above_cap":
+            self.counters.floor_above_cap_rounds += 1
         elif source == "skipped_resting":
             self.counters.resting_skips += 1
         elif source == "skipped_reversal":
@@ -468,7 +498,10 @@ def sizing_config_wire(settings, bar_seconds: int) -> dict | None:
                           "exposureCapMult": rule.exposure_cap_mult,
                           "corrMinSamples": rule.corr_min_samples}
     if stop is not None:
-        wire["stop"] = {"stopAtrMult": stop.stop_atr_mult, "stopRr": stop.stop_rr}
+        wire["stop"] = {"stopAtrMult": stop.stop_atr_mult, "stopRr": stop.stop_rr,
+                        # 轴 B：0 ⇒ 逐字回退合入前行为，落进 config_json 才能事后回答
+                        # 「当时的止损下界开着没有」。
+                        "costFloorMult": stop.cost_floor_mult}
     if brake is not None:
         wire["brake"] = {"slowDdPct": brake.slow_dd_pct, "slowSizeMult": brake.slow_size_mult,
                          "haltDdPct": brake.halt_dd_pct, "lossStreak": brake.loss_streak,

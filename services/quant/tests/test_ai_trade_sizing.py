@@ -91,8 +91,8 @@ def test_non_gated_actions_pass_through_the_same_object():
 # ---------- T-5：止损是标的价口径，绝不与保证金收益率互换 ----------
 def test_stop_pct_is_underlying_not_margin():
     rule = StopRule(stop_atr_mult=1.5, stop_rr=2.0, max_sl_pct=0.20, max_tp_pct=0.50)
-    plan = resolve_stop_distance(atr_px=300.0, ref_px=30_000.0, rule=rule)
-    assert plan is not None
+    plan, skip = resolve_stop_distance(atr_px=300.0, ref_px=30_000.0, rule=rule)
+    assert plan is not None and skip is None
     # 标的口径：1.5 × 300 / 30000 = 1.5%。5× 杠杆下同一波动的**保证金收益率**是它的 5 倍（7.5%），
     # 两者相差恰一个 leverage——利润保护层的阈值全部是后者口径，混用即整层失准。
     assert math.isclose(plan.stop_pct, 0.015, rel_tol=1e-9)
@@ -180,18 +180,20 @@ def test_kelly_odds_track_the_placed_bracket():
 # ---------- T-16 / T-17：夹紧到既有红线 / ATR 不可用即逐字回退 ----------
 def test_atr_stop_clamped_to_existing_caps():
     rule = StopRule(stop_atr_mult=1.5, stop_rr=2.0, max_sl_pct=0.20, max_tp_pct=0.50)
-    plan = resolve_stop_distance(atr_px=30_000.0, ref_px=30_000.0, rule=rule)   # 1.5×ATR = 150%
-    assert plan is not None
+    plan, skip = resolve_stop_distance(atr_px=30_000.0, ref_px=30_000.0, rule=rule)   # 1.5×ATR = 150%
+    assert plan is not None and skip is None
     assert math.isclose(plan.stop_pct, 0.20)
     assert math.isclose(plan.take_pct, 0.40)     # 2 × 0.20 = 0.40 ≤ 0.50，未再被 tp 上限截断
 
 
 def test_atr_unavailable_falls_back_verbatim():
     rule = StopRule(stop_atr_mult=1.5, stop_rr=2.0, max_sl_pct=0.20, max_tp_pct=0.50)
-    assert resolve_stop_distance(atr_px=float("nan"), ref_px=30_000.0, rule=rule) is None
-    assert resolve_stop_distance(atr_px=0.0, ref_px=30_000.0, rule=rule) is None
-    assert resolve_stop_distance(atr_px=300.0, ref_px=0.0, rule=rule) is None
-    assert resolve_stop_distance(atr_px=300.0, ref_px=30_000.0, rule=None) is None
+    # [P0-2] 返回值已是 `(plan, skip_reason)` 二元组：不可用一律 `(None, None)`——
+    # `skip_reason` 非空**只**表示「下界高于用户红线」，与「ATR 不可用」是两个结论。
+    assert resolve_stop_distance(atr_px=float("nan"), ref_px=30_000.0, rule=rule) == (None, None)
+    assert resolve_stop_distance(atr_px=0.0, ref_px=30_000.0, rule=rule) == (None, None)
+    assert resolve_stop_distance(atr_px=300.0, ref_px=0.0, rule=rule) == (None, None)
+    assert resolve_stop_distance(atr_px=300.0, ref_px=30_000.0, rule=None) == (None, None)
 
 
 # ---------- T-18 / T-23：档位地板的分辨率与「反噬」观测量 ----------
@@ -225,7 +227,7 @@ def test_stop_rule_independent_of_sizing_switch():
     assert parse_sizing_rule(settings) is None
     stop = parse_stop_rule(settings)
     assert stop is not None and stop.stop_atr_mult == 1.5
-    plan = resolve_stop_distance(atr_px=300.0, ref_px=30_000.0, rule=stop)
+    plan, _ = resolve_stop_distance(atr_px=300.0, ref_px=30_000.0, rule=stop)
     assert plan is not None and plan.stop_pct > 0
 
 

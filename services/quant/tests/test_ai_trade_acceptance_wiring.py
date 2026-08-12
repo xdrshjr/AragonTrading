@@ -470,22 +470,29 @@ def test_backtest_cost_model_funding_args_come_from_one_source():
                 "query_for_preview", "evaluate_edge_gate"):
             by_callee.setdefault(node.func.id, []).append(
                 {kw.arg: kw.value for kw in node.keywords})
-    # 现场一：G3 换手迟滞的往返成本估算（`_horizon_facts`）——两个入参都是 `_cost_funding`
-    # 解包出来的名字（另一处 `query_for_preview` 是 notes 的口径披露，不是判定现场）。
+    # 判定现场：G3 换手迟滞（`_horizon_facts`）与轴 B 止损下界（`_sizing_cost_bps`）的往返成本
+    # 估算——**每一处**的两个入参都必须是 `_cost_funding` 解包出来的名字（另有一处
+    # `query_for_preview` 是 notes 的口径披露，不是判定现场，它的 `funding` 是字面量）。
+    #
+    # ⚠️ [tradability-and-open-funnel] 本条断言由「恰好 1 处」改为「每一处都合规」：
+    # 轴 B 的止损下界要求回测侧也传 `cost_bps`（否则下界分支恒不进 ⇒ 回测与实盘的止损位系统性
+    # 分叉，正是「双通道共用纯核心时只有一侧被实现」的成文缺陷模式），于是判定现场从 1 处变为
+    # 2 处。**它守的东西一个没少**——「不得出现第二条估算路径」这条不变式由下面的「现场数 ==
+    # `_cost_funding` 调用数」精确表达，而一个写死的 1 只是那条不变式在当时的一个快照。
     judged = [kw for kw in (by_callee.get("query_for_preview") or [])
               if isinstance(kw.get("funding"), ast.Name)]
-    assert len(judged) == 1
-    assert isinstance(judged[0]["funding_enabled"], ast.Name)
+    assert len(judged) == 2
+    assert all(isinstance(kw["funding_enabled"], ast.Name) for kw in judged)
     # 现场二：最小 edge 门禁（`_run_decision`）。
     gate = by_callee.get("evaluate_edge_gate") or []
     assert len(gate) == 1
     assert isinstance(gate[0]["funding"], ast.Name)
     assert isinstance(gate[0]["funding_enabled"], ast.Name)
-    # 唯一真源：判定现场恰好各调一次 `_cost_funding`，多出来的就是第二条估算路径。
+    # 唯一真源：判定现场每一处恰好各调一次 `_cost_funding`，多出来的就是第二条估算路径。
     sources = [n for n in ast.walk(tree)
                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                and n.func.attr == "_cost_funding"]
-    assert len(sources) == 2
+    assert len(sources) == len(judged) + len(gate)
 
 
 def test_no_new_self_settings_in_session():

@@ -29,10 +29,14 @@ if TYPE_CHECKING:                       # 仅类型标注用，运行期不导�
 # skip 态 / exposureCapUnreachable / volSource），它们必须每轮可见——静默的保守是本仓库的前科。
 # horizon：持仓周期铁律段（ai-trade-holding-horizon-modes §4.4），**仅在契约装配时**每轮一条
 # （**含放行轮**——静默的保守会被用户当成故障，这是 base_rule / edge_gate 已确立的理由）。
+# summary_failed：滚动摘要失败段（tradability-and-open-funnel 轴 D / D-6），**仅在本轮真的失败过时**
+# 一条。它与 `retry` 面包屑同款：一条灰色注记，说明「长期记忆这一次没刷新成、连续第几次了」。
+# 值得新增一个相位的理由：摘要失败在合入前**没有任何呈现落点**（`_status_payload` 只有
+# `roundsSinceSummary`），而实测出现过 4 条连续失败且诊断串全为空——那正是「后端算了但用户看不见」。
 PHASES = ("round_start", "thinking", "analysis", "tool_call_start",
           "tool_call", "result", "summary", "error", "retry",
           "reflection_start", "reflection", "reflection_verdict", "base_rule", "edge_gate",
-          "sizing", "horizon")
+          "sizing", "horizon", "summary_failed")
 
 # `sizing` 事件与在飞轮次共用的键集合（**单一真源**：事件装配、轮次初值、前端镜像三处照它对齐）。
 SIZING_TRACE_KEYS = (
@@ -154,6 +158,8 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         # 三键 `AiTradeRoundTrace` 永远拿不到本层数据 ⇒ 后端发什么前端都收不到（跑不出错、功能静默
         # 缺失）。契约未装配的会话恒为初值 None ⇒ 前端整段不渲染。
         "horizonStatus": None, "horizonReason": None, "horizonWire": None,
+        # 滚动摘要健康度（轴 D）：**显式取键**装配，漏抄这一行前端永远拿不到停摆事实。
+        "summaryHealth": None,
         "state": "deciding",
     }
 
@@ -274,6 +280,33 @@ def apply_horizon_trace(trace: dict | None, wire: dict | None, status: str,
     trace["horizonStatus"] = status
     trace["horizonReason"] = reason
     trace["horizonWire"] = wire
+
+
+# ---------- 滚动摘要健康度轨迹装配（tradability-and-open-funnel 轴 D · D-6）----------
+async def maybe_emit_summary_failed(push, trace: dict | None, health: dict | None,
+                                    round_no: int, ts: int) -> None:
+    """本轮摘要失败过 ⇒ 发一条 `summary_failed` 面包屑并写入在飞轮次；否则**零动作**。
+
+    判据是 `roundsSinceSummary == 0 且 failures > 0`——摘要无论成败都会把它清零，故「刚归零且
+    连续失败数非零」恰好等价于「本轮跑过摘要且失败了」。放在纯装配层是为了让 `session.py` 只留
+    一行薄封装（它已 1819 行，本轮净增预算 ≤ 22 行）。
+
+    Args:
+        push: 会话的事件扇出闭包。
+        trace: 在飞轮次（`None` ⇒ 只发事件、不写轮次，与既有 `apply_*_trace` 同款垫片）。
+        health: `decider.summary_health_wire()` 产物；`None` ⇒ 零动作。
+        round_no: 轮次号。
+        ts: 事件时间戳。
+    """
+    if not health or int(health.get("roundsSinceSummary") or 0) != 0:
+        return
+    if int(health.get("failures") or 0) <= 0:
+        return
+    if trace is not None:
+        trace["summaryHealth"] = health
+    await push(trace_event("summary_failed", round_no, ts, reason=health.get("lastError"),
+                           failures=health.get("failures"), stalled=health.get("stalled"),
+                           backoffRounds=health.get("backoffRounds")))
 
 
 def horizon_released_event(ts: int, streak: int, reason: str | None) -> dict:

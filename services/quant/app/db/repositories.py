@@ -1021,5 +1021,6 @@ from .weight_batch_repositories import (  # noqa: E402,F401
 from .ai_auto_repositories import (  # noqa: E402,F401
     get_ai_trade_group_detail,
     list_ai_trade_groups,
+    list_ai_trade_preset_comparison,
     reconcile_orphan_ai_trade_runs,
 )

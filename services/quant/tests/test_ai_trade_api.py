@@ -667,6 +667,31 @@ async def test_discipline_receipt_is_verifiable_end_to_end(monkeypatch):
         await dispose_engine()
 
 
+async def test_start_receipt_carries_the_tradability_snapshot(monkeypatch):
+    """轴 A（tradability-and-open-funnel §5.4）：启动回执在 `discipline` 同级带 `tradability`。
+
+    桌面旧包 / 直接调 API 的用户拿不到弹窗那块预检，**回执是他们唯一的告知面**。
+    两条纪律一并守：
+    - **逐成员一份的列表**（R-10：分组级刻意不做任何合并——一个「平均否决率」既没有操作含义，
+      AI-trade 也没有分组级实时通道可以可信地下发它）；
+    - **探针失败绝不阻断启动**：本用例的 REST 桩不返回 K 线，`tradability` 应为空列表而不是 500。
+    """
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(strategy_id))
+            assert r.status_code == 200, r.text
+            assert isinstance(r.json()["tradability"], list)
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
 async def test_discipline_off_falls_back_to_the_pre_feature_behaviour(monkeypatch):
     """§7.1 零回归：显式 `off` ⇒ 三层全不装配、回执如实说「关闭」。"""
     strategy_id = await _fresh()

@@ -57,6 +57,7 @@ from .session import AiTradeSession
 from .sizing import SizingRule, StopRule, check_window_capacity, parse_sizing_rule, parse_stop_rule
 from .sizing_runtime import build_sizing_runtime, sizing_config_wire
 from .sizing_text import format_sizing_charter
+from .tradability_probe import probe_members
 from .wake_runtime import format_tactical_bars_text, tactical_bars_for
 
 logger = logging.getLogger(__name__)
@@ -199,6 +200,10 @@ class AiTradeGroup:
     discipline_preset: str = "off"           # 交易纪律预设 id（"off"=整轴未装配），回显 discipline
     discipline_adjustments: list[dict] = field(default_factory=list)
     discipline_thresholds: dict = field(default_factory=dict)
+    # 轴 A 启动断面（tradability-and-open-funnel §3.1.3）：**逐成员一份**，与各成员会话 status 里
+    # 的那一份是**同一个对象**（同一 `asOfTs`）。R-10：分组级刻意不做任何合并——一个「平均否决率」
+    # 既没有操作含义，AI-trade 也没有分组级实时通道可以可信地下发它。
+    tradability: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -263,8 +268,33 @@ class AiTradeManager:
             plans = self._preflight_group(members, configs, positions, total, lever, pending)
             self._note_dust_risk(req, plans, lever)   # [P0-4]：如实回执，绝不 422
             group = await self._build_group(req, creds, provider, plans, total, lever)
+            await self._probe_tradability(group, req)   # 轴 A：启动断面（只提示、绝不阻断启动）
             self._group = group
             return await self._launch_group_or_rollback(group)
+
+    @staticmethod
+    async def _probe_tradability(group: AiTradeGroup, req: AiTradeGroupStartRequest) -> None:
+        """按 `instId` 逐成员各算一份可交易性预检，装进各自会话（R-10：**分组级不做任何合并**）。
+
+        启动回执与会话 `status` 用的是**同一份对象**（同一 `asOfTs`，[P1-10]）——弹窗那份是独立的
+        事前预览、允许不同。**全程 fail-open**：任何异常只 warning，绝不让一个旁路统计量挡住真实
+        资金会话的启动（探针把用户挡在门外比给错建议更坏）。
+        """
+        try:
+            sm = get_sessionmaker()
+            async with sm() as db:
+                rows = await probe_members(
+                    db, req.settings, inst_ids=[m.inst_id for m in group.members], bar=req.bar)
+            by_inst = {row.get("instId"): row for row in rows}
+            group.tradability = [by_inst[m.inst_id] for m in group.members
+                                 if m.inst_id in by_inst]
+            for member in group.members:
+                member.session.note_tradability(by_inst.get(member.inst_id))
+        except Exception as exc:  # noqa: BLE001 —— 预检是旁路统计，失败只降级
+            # 装配也在 try 内是刻意的：极性纪律是**整轴 fail-open**，一个只提示、不阻断的旁路
+            # 统计量绝不该成为「真实资金会话能不能起来」的函数。失败即 `tradability` 缺席 ⇒
+            # 前端整段不渲染 ⇒ 逐字回退到本轮之前的行为。
+            logger.info("ai-trade tradability probe skipped: %s", exc)
 
     def _validate_members(self, members_in: list[AiTradeGroupMemberInput],
                           settings: Settings,
@@ -658,6 +688,10 @@ class AiTradeManager:
                 # **分组共享**的（同一份派生 settings），逐成员各发一份只是噪音；成员之间真正会
                 # 分叉的只有 `exchangeBackstop` 那一行，它已随各成员的 `status.disciplines` 下发。
                 "discipline": self._discipline_wire(group),
+                # 轴 A 启动断面（§5.4）：**逐成员一份的列表**，各带 `instId` 与 `asOfTs`。
+                # 桌面旧包 / 直接调 API 的用户拿不到弹窗那块预检，本回执是他们唯一的告知面。
+                # 该端点 `-> dict` 且无 `response_model`，故新键不会被 FastAPI 静默吞掉（已核实）。
+                "tradability": list(getattr(group, "tradability", None) or []),
                 "createdTs": group.created_ts,
                 # 验收闭环三键的**分组合并口径**（horizon-acceptance [P0-3] / [P1-9]）：合并的是
                 # 各成员的原始计数器而不是已判定的卡——比例类指标不可平均。本端点由前端 15s 轮询

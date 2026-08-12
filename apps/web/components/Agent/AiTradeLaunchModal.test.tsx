@@ -3,7 +3,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AI_TRADE_BASE_RULE_DEFAULTS, AI_TRADE_PROFIT_GUARD_DEFAULTS } from "@/lib/aiTrade";
-import { aiTradeDisciplineApi, aiTradeHorizonApi } from "@/lib/aiTradeHorizonApi";
+import {
+  aiTradeDisciplineApi,
+  aiTradeHorizonApi,
+  aiTradeTradabilityApi,
+} from "@/lib/aiTradeHorizonApi";
 import { autoTradeSettingsApi } from "@/lib/autoTradeSettingsApi";
 import { tradingApi } from "@/lib/tradingApi";
 import AiTradeLaunchModal, { type AiTradeLaunchOpts } from "./AiTradeLaunchModal";
@@ -15,6 +19,8 @@ vi.mock("@/lib/aiTradeHorizonApi", () => ({
   // 纪律预设的只读阈值表与周期预设表同住一个模块，整模块 mock 时必须一并给出——漏掉它，
   // `queryFn` 会是 undefined，症状是一堆无关用例莫名其妙地红。
   aiTradeDisciplineApi: { presets: vi.fn() },
+  // 可交易性预检同住一个模块（tradability-and-open-funnel 轴 A），同理必须一并 mock。
+  aiTradeTradabilityApi: { probe: vi.fn() },
 }));
 // 模块级 mock（P2-1）：写在文件顶层与 tradingApi mock 同级，否则其余用例的 settings 查询会触发真实 fetch。
 vi.mock("@/lib/autoTradeSettingsApi", () => ({ autoTradeSettingsApi: { get: vi.fn() } }));
@@ -74,7 +80,32 @@ beforeEach(() => {
   vi.mocked(autoTradeSettingsApi.get).mockResolvedValue({ maxBudgetPct: 100, effectiveMaxBudgetPct: 100 });
   vi.mocked(aiTradeHorizonApi.profiles).mockResolvedValue(HORIZON_PROFILES);
   vi.mocked(aiTradeDisciplineApi.presets).mockResolvedValue(DISCIPLINE_PRESETS_FIXTURE);
+  vi.mocked(aiTradeTradabilityApi.probe).mockResolvedValue(TRADABILITY_FIXTURE);
 });
+
+// 后端 `GET /ai-trade/tradability` 的最小夹具（判据与文案全部由服务端下发；本弹窗**只挂载子组件
+// 并透传受控 state**，具体渲染断言在 `AiTradeTradabilityFields.test.tsx`）。
+const TRADABILITY_FIXTURE = {
+  instId: "BTC-USDT-SWAP",
+  bar: "1H",
+  preset: "balanced",
+  level: "infeasible" as const,
+  samples: 200,
+  source: "live" as const,
+  asOfTs: 1786600000,
+  atrBps: { p10: 2.9, p50: 5.6, p90: 11.3 },
+  costBps: { market: 13, limit: 8.5 },
+  costConfidence: { market: "degraded", limit: "degraded" },
+  degradedMultApplied: 1.2,
+  requiredBps: { market: 23.4, limit: 15.3 },
+  vetoRate: { market: 0.986, limit: 0.926 },
+  stopBps: { p50: 11.2 },
+  stopInsideCostRate: { market: 0.623, limit: 0.287 },
+  alternatives: [{ bar: "15m", vetoRateMarket: 0.203, costBpsMarket: 13, level: "marginal" as const }],
+  headline: "在 1H 周期上……约 98.6% 的开仓意图会被否决。",
+  advice: "建议改用 15m 或更长的时间级别。",
+  disclaimer: "以上是确定性统计，不是收益预测。",
+};
 
 // 后端 `GET /ai-trade/discipline-presets` 的最小夹具（中文标签与已格式化的值全由服务端下发，
 // 前端不复制任何一个——这条纪律与周期预设表同源，见 R-3 / G-10）。
@@ -1014,6 +1045,51 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
     await waitFor(() =>
       expect(screen.getByTestId("ai-trade-backstop-repair-plan")).toHaveAttribute(
         "aria-checked", "true"),
+    );
+  });
+
+  // ---- 可交易性预检（tradability-and-open-funnel 轴 A）：本弹窗**只断言子组件被挂载且受控
+  // state 正确透传**，具体的四档渲染 / 二次确认 / 确认态重置断言全在 AiTradeTradabilityFields.test.tsx。
+  it("挂载可交易性预检子组件，并按当前 instId / bar / preset 透传", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByTestId("ai-trade-tradability");
+    await waitFor(() =>
+      expect(aiTradeTradabilityApi.probe).toHaveBeenCalledWith("BTC-USDT-SWAP", "1H", "balanced"),
+    );
+  });
+
+  it("`infeasible` 也**不禁用**启动按钮，但文案改为「仍要启动」——预检只提示、不阻断", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByTestId("ai-tradability-confirm");
+    const confirm = await screen.findByRole("button", { name: /仍要启动 AI 自动交易/ });
+    expect(confirm).not.toBeDisabled();
+  });
+
+  // 二次确认必须**真的拦得住**：若勾选态只被写进 state 而没有任何读点，那一行就纯粹是装饰，
+  // 一次点击照样能在一个几乎开不出单的周期上起一个真实资金会话（有写点、没读点）。
+  it("`infeasible` 未勾选确认时点击启动**不提交**，并同屏说明该做什么", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByTestId("ai-tradability-confirm");
+    fireEvent.click(await screen.findByRole("button", { name: /仍要启动 AI 自动交易/ }));
+    expect(onConfirm).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert").textContent ?? "").toContain("仍要启动");
+  });
+
+  it("勾选二次确认后即可启动（确认是一次显式动作，不是永久豁免）", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    const box = await screen.findByLabelText("仍要在该周期上启动");
+    fireEvent.click(box);
+    await waitFor(() => expect(box).toBeChecked());
+    fireEvent.click(screen.getByRole("button", { name: /仍要启动 AI 自动交易/ }));
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+  });
+
+  it("「一键换周期」改的是本弹窗的时间级别下拉（不自动改预设，不发额外请求）", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByTestId("ai-tradability-pick-bar");
+    fireEvent.click(screen.getByTestId("ai-tradability-pick-bar"));
+    await waitFor(() =>
+      expect((screen.getByLabelText("时间级别") as HTMLSelectElement).value).toBe("15m"),
     );
   });
 

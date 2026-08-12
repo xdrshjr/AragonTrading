@@ -6,6 +6,7 @@ import { Badge, Button, Skeleton } from "@/components/ui";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
 import type { AiTradeHistoryEntry } from "@/lib/aiTradeHistoryTypes";
 import { colorForReturn, fmtPct, fmtTime, signed } from "@/lib/format";
+import PresetComparisonCard from "./PresetComparisonCard";
 
 const PAGE_SIZE = 20;
 
@@ -52,6 +53,9 @@ export default function AiTradeStatsHistoryList({ onSelect }: { onSelect: (group
   const hasNext = offset + items.length < total;
   return (
     <div className="flex flex-col gap-2">
+      {/* 历史纪律预设对照（tradability-and-open-funnel 轴 E）：挂在列表**顶部**——「哪一档更赚」
+          是用户翻历史时的第一个问题，答案不该藏在几十张卡片下面。无历史 ⇒ 整卡不渲染。 */}
+      <PresetComparisonCard />
       {items.map((item) => (
         <HistoryCard key={item.groupId} entry={item} onSelect={() => onSelect(item.groupId)} />
       ))}

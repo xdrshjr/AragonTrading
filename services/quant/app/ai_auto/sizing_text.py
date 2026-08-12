@@ -47,13 +47,32 @@ def format_sizing_charter(rule: SizingRule | None, stop: StopRule | None,
     if stop is not None:
         lines.append(
             f"· 止损距离按确认根 ATR 定标为 {stop.stop_atr_mult:g}×ATR、止盈为其 {stop.stop_rr:g} 倍，"
-            "在开仓那一刻随单挂到交易所侧；不再是固定百分比。")
+            f"在开仓那一刻随单挂到交易所侧；不再是固定百分比。{_stop_floor_clause(stop)}")
     if brake is not None:
         lines.append(
             "· 会话权益自峰值回撤触及第一档即下调开新仓的仓位系数，触及第二档转为**只平不开**，"
             "连续亏损达阈进入冷却。三档**全部只拦开新仓**：平仓与撤单任何时候都不会被拦。"
             "回撤按 mark-to-market 口径（含未实现盈亏）计算。")
     return "\n".join(lines)
+
+
+def _stop_floor_clause(stop: StopRule) -> str:
+    """止损的**成本下界**子句（tradability-and-open-funnel 轴 B）；未装配（`0`）⇒ `""` ⇒ 逐字回退。
+
+    这是轴 B 面向模型的唯一披露落点，且刻意与上一句同段：止损位是模型自己在提案里给的，而系统会把
+    落进往返成本带以内的止损**抬出去**——不说，模型就会以为它那个比手续费还窄的止损真的生效了。
+    实测依据：BTC 1m 上 `2×ATR` 的止损距离中位 11.2 bps，而一笔市价往返成本 13.0 bps，
+    **62.3% 的止损被打掉时亏的价格幅度还不如手续费多**。
+
+    只写倍数、不写绝对 bps：宪章章在会话启动时装配一次，而往返成本逐轮现算（费率档位 / 价差 /
+    资金费都会变）。在这里写死一个 bps 数就会与门禁那一侧说两套话——本模块的第一条纪律是
+    「渲染与判定同源」。
+    """
+    if stop.cost_floor_mult <= 0:
+        return ""
+    return (f"另有一条**成本下界**：止损距离不得窄于 {stop.cost_floor_mult:g}× 当轮往返成本，"
+            "更窄的提案会被系统抬到该距离（否则这一单只要被止损打掉，亏掉的价格幅度还不如"
+            "手续费多）；若该下界已高于本会话的最大止损比例，则整条 ATR 覆盖回退为固定百分比。")
 
 
 def format_sizing_for_prompt(plan: dict | None) -> str:

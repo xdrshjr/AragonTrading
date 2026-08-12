@@ -356,6 +356,10 @@ class CostRuntime:
         accrued = funding_accrued_view(self.funding_stats(), position)
         if accrued is not None:
             view["fundingAccrued"] = accrued
+        # 轴 B（止损成本下界）的披露**不在本视图上**：它的落点是仓位/风险宪章章
+        # （`sizing_text.format_sizing_charter`，与 `StopRule` 同源）。放这里需要改 `cost_text.py`，
+        # 而那是一个跨轮冻结文件（`test_shared_execution_files_have_zero_diff`）——为了让新键有个
+        # 消费者去解冻一个别的轮次立下的门禁，是把判据改松到能通过为止。见 spec §实施发现 I-9。
         return view
 
     def inject(self, payload: dict, *, last_px: float | None, atr_px: float | None,

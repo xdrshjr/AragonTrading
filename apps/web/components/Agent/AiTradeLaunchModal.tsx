@@ -75,6 +75,9 @@ import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTyp
 import { tradingApi } from "@/lib/tradingApi";
 import type { Bar } from "@/lib/types";
 import AiTradeHorizonFields, { type HorizonCustomKey } from "./AiTradeHorizonFields";
+import AiTradeTradabilityFields, {
+  TRADABILITY_CONFIRM_REQUIRED_TEXT,
+} from "./AiTradeTradabilityFields";
 import ProfitGuardFields from "./ProfitGuardFields";
 
 export type AiTradeLaunchMode = "live" | "backtest";
@@ -227,6 +230,12 @@ export default function AiTradeLaunchModal({
   // 交易纪律预设（discipline-preset 轴 A）：**只存一个 id**，阈值一概不在前端保存或重算——
   // 生效值恒以启动回执 `discipline` 为准（前后端各存一份口径必漂移，`edgeSource` 的成文教训）。
   const [disciplinePreset, setDisciplinePreset] = useState(DEFAULT_DISCIPLINE_PRESET);
+  // 可交易性预检的二次确认态（轴 A）：受控 state 留在父组件，子组件内不写任何 reset effect。
+  const [tradabilityConfirmed, setTradabilityConfirmed] = useState(false);
+  // 是否**要求**那次确认（= 预检判定 infeasible）。由子组件按 level 上报，**刻意不进下面那个
+  // `[open]` 重置 effect**：它不是用户输入而是探针的派生事实，重置它反而会在「关掉又打开、参数
+  // 没变故 level 没变」时让子组件不再上报 ⇒ 拦截静默失效。用户输入 `tradabilityConfirmed` 才重置。
+  const [tradabilityNeedsConfirm, setTradabilityNeedsConfirm] = useState(false);
   // 利润保护层（默认开启）：四个数值输入一律走**百分数**（用户口径），提交时统一 /100 转 fraction。
   const [profitGuardEnabled, setProfitGuardEnabled] = useState(
     defaultProfitGuard.enabled ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.enabled,
@@ -348,6 +357,7 @@ export default function AiTradeLaunchModal({
     setHorizonCustom(seedHorizonCustom(defaultTradingHorizon));
     setRepairMode(null);   // 同上：新增受控输入**必须**塞进这个既有 [open] effect（U-21 守它）
     setDisciplinePreset(DEFAULT_DISCIPLINE_PRESET);   // 同上（discipline-preset 轴 A 的受控输入）
+    setTradabilityConfirmed(false);   // 同上（tradability 轴 A：**必须**塞进这个既有 [open] effect）
     setCapitalRaw("");
     setLeverageRaw("");
     setTakeProfitRaw("");
@@ -566,9 +576,14 @@ export default function AiTradeLaunchModal({
     mode === "live"
       ? baseValid && !membersError && !wakeError && acknowledged
       : baseValid && instSupported && !!instId && !rangeError && !everyError && !minConsensusError && !roundsCapError;
+  // 可交易性预检的放行判定（轴 A §3.1.3）。**刻意不并进 `ready`**：`ready` 直接驱动
+  // `disabled={!ready}`，而本轴的极性纪律是「启动按钮永不禁用」（R-1：把用户挡在门外的探针比给错
+  // 建议的探针更坏）。故按钮照旧可点，拦在提交路径上并同屏给出该做什么——若只把勾选态存进 state
+  // 而没有任何读点，那一行二次确认就纯粹是装饰，一次点击照样能在几乎开不出单的周期上起会话。
+  const tradabilityBlocked = tradabilityNeedsConfirm && !tradabilityConfirmed;
 
   const handleConfirm = () => {
-    if (!ready || submitting) return;
+    if (!ready || submitting || tradabilityBlocked) return;
     const base = {
       strategyIds: selectedIds,
       capitalUsd: capital.value,
@@ -622,6 +637,8 @@ export default function AiTradeLaunchModal({
         ? null
         : "标的不支持自动交易（仅 USDT 本位永续 / 交割合约）") ||
     (mode === "backtest" ? rangeError || everyError || minConsensusError || roundsCapError : null) ||
+    // 排在既有校验之后：它不是输入非法，而是一次需要用户拍板的风险确认，不该盖住真正的填写错误。
+    (tradabilityBlocked ? TRADABILITY_CONFIRM_REQUIRED_TEXT : null) ||
     error;
 
   const title = mode === "backtest" ? "AI 自动交易 · 回测" : "启动 AI 自动交易";
@@ -1095,6 +1112,20 @@ export default function AiTradeLaunchModal({
           table={disciplineQ.data ?? null}
         />
 
+        {/* 可交易性预检（tradability-and-open-funnel 轴 A）：挂在「交易纪律」正下方——它算的正是
+            「这组纪律阈值在这个周期上会拦掉多少」，两块必须相邻才读得懂。只提示、不阻断。 */}
+        <AiTradeTradabilityFields
+          open={open}
+          instId={budgetInst}
+          bar={bar}
+          preset={disciplinePreset}
+          onPickBar={(next) => setBar(next as Bar)}
+          confirmed={tradabilityConfirmed}
+          onConfirmedChange={setTradabilityConfirmed}
+          onNeedsConfirmChange={setTradabilityNeedsConfirm}
+          disabled={submitting}
+        />
+
         {/* 利润保护层（**实盘与回测两段都渲染**，adaptive §7.2a I-2）：第 1 轮把回测列为非目标，是因为
             当时只想得到「用收盘价近似」这一种做法；本轮 F3 改用 bar 内 OHLC 极值 + 保守成交序，故回测
             段照常露出，但文案必须写明是**保守近似**，不得让用户以为回测 = 实盘。 */}
@@ -1180,6 +1211,8 @@ export default function AiTradeLaunchModal({
         <Button variant="ghost" size="sm" onClick={onClose} disabled={submitting}>
           取消
         </Button>
+        {/* 按钮**永不因预检而禁用**（轴 A 的 fail-open 极性）：`infeasible` 只把文案改成「仍要
+            启动」并在提交路径上要一次显式确认，拦截理由同屏写在上面的错误横幅里。 */}
         <Button variant="primary" size="sm" onClick={handleConfirm} disabled={!ready || submitting}>
           {mode === "backtest"
             ? submitting
@@ -1187,7 +1220,9 @@ export default function AiTradeLaunchModal({
               : "开始 AI 回测"
             : submitting
               ? "启动中…"
-              : "确认并开始 AI 自动交易"}
+              : tradabilityNeedsConfirm
+                ? "仍要启动 AI 自动交易"
+                : "确认并开始 AI 自动交易"}
         </Button>
       </div>
     </Modal>

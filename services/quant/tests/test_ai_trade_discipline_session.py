@@ -245,7 +245,15 @@ async def test_dust_risk_warns_on_the_vol_sizing_row_before_the_first_skip_happe
 
 
 async def test_strictness_hint_fires_only_after_enough_rounds_with_zero_opens():
-    """G-16：闸都武装着 + 跑了足够多轮 + 一单没开 ⇒ 显著提示；反向断面不提示。"""
+    """G-16：闸都武装着 + 跑了足够多轮 + 一单没开 ⇒ 显著提示；反向断面不提示。
+
+    ⚠️ [tradability-and-open-funnel 轴 C] **文案口径本轮有意变更**：合入前这句提示恒为
+    「N 条纪律可能过严……可在弹窗改选更宽松的预设」，而本轮实测证明那在短周期断面上是**错的**
+    补救方向。升级后的规则链第 3 条先看开仓漏斗的分母：本用例的会话一轮都没跑过决策，
+    `funnel.intents == 0` ⇒ 提示改为「模型一次都没有提出开仓」——那才是这个断面的真实原因，
+    而「放宽一个从未被触发过的闸」确实毫无作用。故断言随之改为新口径，守的东西一个没少：
+    样本不足不提示 / 足够轮数且零开仓才提示 / 开过仓即不提示。
+    """
     await init_db()
     try:
         session = _session(_derived("balanced"))
@@ -253,7 +261,7 @@ async def test_strictness_hint_fires_only_after_enough_rounds_with_zero_opens():
         assert session.discipline_wire()["hint"] is None        # 样本不足，不吓唬人
         session.rounds_completed = 20
         hint = session.discipline_wire()["hint"]
-        assert hint is not None and "尚未开过任何仓" in hint
+        assert hint is not None and "一次都没有提出开仓" in hint
         session.executor.trades.append({"side": "long", "ts": 1, "price": 1.0})
         assert session.discipline_wire()["hint"] is None        # 开过仓 ⇒ 不提示
     finally:

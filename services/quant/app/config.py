@@ -537,6 +537,19 @@ class Settings(BaseSettings):
     ai_trade_discipline_enabled: bool = True
     ai_trade_discipline_default_preset: Literal["steady", "balanced", "aggressive", "off"] = (
         "balanced")
+    # ---- 可交易性预检 / 成本感知止损下界 / 摘要健康度（ai-trade-tradability-and-open-funnel §6.1）----
+    # ATR 止损的**成本下界**：止损距离不得落进往返成本带以内（实测 BTC 1m 上 62.3% 的 2×ATR 止损
+    # 比一笔市价往返成本还窄 ⇒ 一台结构性手续费机器）。`0` ⇒ 逐字回退合入前行为。
+    ai_trade_stop_cost_floor_mult: float = Field(default=2.0, ge=0, le=20)
+    # 轴 A 总闸：关 ⇒ 端点仍在但恒回 `level:"unknown"`，前端整段不渲染（探针只提示、绝不阻断）。
+    ai_trade_tradability_enabled: bool = True
+    ai_trade_tradability_window_bars: int = Field(default=200, ge=60, le=500)
+    ai_trade_tradability_infeasible_veto_rate: float = Field(default=0.80, gt=0, le=1)
+    ai_trade_tradability_marginal_veto_rate: float = Field(default=0.40, gt=0, le=1)
+    # 滚动摘要的**独立**超时：摘要是背景任务，不该占用决策的 60s 预算（D-5）。
+    ai_trade_summary_timeout_s: float = Field(default=30.0, gt=0, le=300)
+    ai_trade_summary_max_failures: int = Field(default=3, ge=1, le=20)   # 连续失败达该数即 stalled
+    ai_trade_summary_journal_cap_mult: int = Field(default=2, ge=1, le=10)  # 失败后保留 mult × 刷新轮数
     # ---- AI 自动交易 · 回测模式（ai-auto-trading-backtest §2.5，三重决策成本护栏）----
     # 回测每决策根调一次 LLM，成本/时长敏感；三重护栏：决策间隔（降频）+ 决策轮数硬上限（越界启动前
     # 拒绝，绝不静默截断）+ 并发闸（限同时消耗 LLM 的回测数）。字段名即环境变量名（AI_BACKTEST_*，
@@ -718,6 +731,23 @@ class Settings(BaseSettings):
                 f"DISCOVERY_HEALTH_WARMUP_BARS({self.discovery_health_warmup_bars}) 必须 < "
                 f"DISCOVERY_HEALTH_WINDOW_BARS({self.discovery_health_window_bars})，"
                 "否则体检的 fresh 段恒为空、全部资产永久「暂不评级」")
+        return self
+
+    @model_validator(mode="after")
+    def _check_tradability_thresholds(self) -> "Settings":
+        """`marginal < infeasible`（§6.1）—— 启动即 fail-fast。
+
+        反过来配（marginal ≥ infeasible）会让 `marginal` 这一档**恒不可达**：判定链先判
+        `infeasible` 再判 `marginal`，任何达到 marginal 阈的断面都已先被判成 infeasible。
+        那是一个不报错的空转，只能在构造期挡下来。
+        """
+        if self.ai_trade_tradability_marginal_veto_rate >= (
+                self.ai_trade_tradability_infeasible_veto_rate):
+            raise ValueError(
+                f"AI_TRADE_TRADABILITY_MARGINAL_VETO_RATE"
+                f"({self.ai_trade_tradability_marginal_veto_rate}) 必须 < "
+                f"AI_TRADE_TRADABILITY_INFEASIBLE_VETO_RATE"
+                f"({self.ai_trade_tradability_infeasible_veto_rate})，否则 marginal 档恒不可达")
         return self
 
     @property
