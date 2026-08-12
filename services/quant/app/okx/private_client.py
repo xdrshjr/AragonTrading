@@ -17,12 +17,20 @@ import asyncio
 import base64
 import hashlib
 import hmac
-from datetime import datetime, timezone
 
 import httpx
 
 from ..config import Settings, get_settings
+from .client_pool import POOL_LIMITS, fingerprint, get_client_pool
+from .clock import get_server_clock
+from .link_state import get_link_registry
+from .rate_limit import get_limiters
 from .rest_client import OKXError
+from .retry import classify_okx_code
+
+# 私有链路在健康登记簿里的通道键与中文标签（私有面单列，**不参与** overall，见 link_state）。
+PRIVATE_LINK_KEY = "rest:private"
+PRIVATE_LINK_LABEL = "账户接口"
 
 
 class OKXPrivateError(OKXError):
@@ -34,9 +42,13 @@ class OKXPrivateError(OKXError):
 
 
 def _iso_timestamp() -> str:
-    """ISO8601 毫秒 UTC，带尾 `Z`，形如 ``2026-06-22T08:15:42.123Z``（OKX 签名头要求）。"""
-    now = datetime.now(timezone.utc)
-    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+    """ISO8601 毫秒 UTC，带尾 `Z`，形如 ``2026-06-22T08:15:42.123Z``（OKX 签名头要求）。
+
+    **签名与输出格式一字不变**，只是时间源改走 ``ServerClock``：本机时钟漂移（尤其 Windows
+    笔记本休眠唤醒后）会让全部私有请求同时撞 ``50102``，而此前 ``OKX_TIME_SKEW`` 之后没有任何
+    自愈动作。偏移未同步时 offset=0，输出与旧实现逐字节相同。
+    """
+    return get_server_clock().now_iso()
 
 
 def _sign(secret: str, ts: str, method: str, request_path: str, body: str = "") -> str:
@@ -64,22 +76,103 @@ class OKXPrivateClient:
         self._passphrase = passphrase
         self._settings = settings or get_settings()
         self._client: httpx.AsyncClient | None = None
+        self._pool_holds = 0     # 本实例从池里取过几份引用，`aclose()` 须**逐一**归还
+
+    def _fingerprint(self) -> str:
+        """本实例在连接池里的身份：账户 + 端点 + 模拟盘标志 + 超时档。不同账户绝不复用连接。"""
+        return fingerprint(self._api_key, self._settings.okx_rest_base,
+                           self._settings.okx_account_demo,
+                           self._settings.okx_account_timeout_seconds)
+
+    def _new_client(self) -> httpx.AsyncClient:
+        timeout = self._settings.okx_account_timeout_seconds
+        return httpx.AsyncClient(
+            base_url=self._settings.okx_rest_base,
+            timeout=httpx.Timeout(timeout, connect=min(8.0, timeout)),
+            proxy=self._settings.proxy_url,
+            limits=POOL_LIMITS,
+            headers={"User-Agent": "aragon-trading/0.1"},
+        )
 
     async def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None:
-            timeout = self._settings.okx_account_timeout_seconds
-            self._client = httpx.AsyncClient(
-                base_url=self._settings.okx_rest_base,
-                timeout=httpx.Timeout(timeout, connect=min(8.0, timeout)),
-                proxy=self._settings.proxy_url,
-                headers={"User-Agent": "aragon-trading/0.1"},
-            )
-        return self._client
+        """从连接池取共享客户端。**绝不把它记进 `self._client`**（P1-1，阻断级）。
+
+        实例级缓存与连接池根本冲突：``invalidate(fp)`` 关掉底层 ``AsyncClient`` 之后，任何仍持有
+        旧引用的实例下一次请求会撞 ``RuntimeError: Cannot send a request, as the client has been
+        closed.``——而 ``invalidate`` 的触发条件正是「传输层异常」，也就是故障期间必然发生，于是
+        「换代自愈」会变成「换代自爆」。同 fp 的复用由池内保证，那是池唯一该管的事。
+
+        ``self._client`` 仍被**读**：既有签名测试直接给实例塞一个 MockTransport 客户端
+        （``tests/test_okx_signing.py:66``），那条注入口保留。
+        """
+        if self._client is not None:
+            return self._client
+        client = await get_client_pool().acquire(
+            self._fingerprint(), self._new_client,
+            idle_ttl_s=self._settings.okx_link_pool_idle_ttl_s)
+        self._pool_holds += 1        # 每一跳都取一次 ⇒ 归还也必须是同样的次数（见 `aclose`）
+        return client
 
     async def aclose(self) -> None:
-        if self._client is not None:
+        """用完即还（语义对外不变，只是不再销毁 TCP 连接）。TTL=0 时池内退化为「用完即关」。
+
+        **还多少取决于取过多少**，两处都不能想当然：重试循环里每一跳都会 `acquire` 一次，只还一次
+        会让引用计数只增不减（于是 `sweep` 永远清扫不到、`okx_link_pool_idle_ttl_s=0` 那条「用完
+        即关」的退路也永远不生效）；反过来，一次都没取过就无脑 `release`（`probe_account` 一类
+        「构造了但没发请求」的分支）会去减掉**别的实例**正持有的那份引用——TTL=0 下那等于当场
+        关掉别人在用的连接。
+        """
+        if self._client is not None:      # 外部注入的替身：谁建谁关
             await self._client.aclose()
             self._client = None
+            return
+        holds, self._pool_holds = self._pool_holds, 0
+        pool, fp = get_client_pool(), self._fingerprint()
+        for _ in range(holds):
+            await pool.release(fp)
+
+    async def _invalidate_pooled(self) -> None:
+        """传输层异常即整池换代（笔记本休眠唤醒后所有池化 socket 都是半死的，解药就是这一行）。"""
+        if self._client is None:
+            # 手里那几份引用随被摘掉的那一代一起作废，不能拿它们去减新一代的计数。
+            self._pool_holds = 0
+            await get_client_pool().invalidate(self._fingerprint())
+
+    async def _acquire_slot(self) -> None:
+        """按账户独立的私有令牌桶（多标的分组启动瞬间不至于把私有限频一次打爆）。"""
+        cfg = self._settings
+        bucket = get_limiters().bucket(f"private:{self._fingerprint()}",
+                                       cfg.okx_link_private_rate_per_s, cfg.okx_link_private_burst)
+        await bucket.acquire()
+
+    async def _sync_clock_once(self) -> None:
+        """``50102/50104`` 自愈：拉一次交易所时间对齐偏移；失败静默（时钟修不好不该变成另一种错）。"""
+        from .rest_client import get_rest_client
+
+        try:
+            await get_server_clock().sync(get_rest_client().get_server_time_ms)
+        except Exception:  # noqa: BLE001 —— 自愈是尽力而为，失败仍按原错误上抛
+            return
+
+    async def _maybe_heal_clock(self, okx_code: str) -> None:
+        """``50102/50104``（签名时间戳过期）即拉一次交易所时间对齐偏移。
+
+        本机时钟漂移（Windows 笔记本休眠唤醒后尤甚）会让**全部**私有请求在同一瞬间一起失败，
+        而此前 ``OKX_TIME_SKEW`` 之后没有任何自愈动作——用户只能自己去改系统时间。对齐之后
+        **下一次**调用即恢复；本次仍按原错误上抛（不在这里偷偷重试，写路径的重试语义归
+        ``write_safety`` 管，读路径的调用方本就会再来一次）。
+        """
+        if classify_okx_code(okx_code) == "clock_skew":
+            await self._sync_clock_once()
+
+    def _note_link_ok(self) -> None:
+        get_link_registry().note_ok(PRIVATE_LINK_KEY, kind="restPrivate",
+                                    label=PRIVATE_LINK_LABEL)
+
+    def _note_link_fail(self, code: str, message: str) -> None:
+        """私有面失败只进 ``accountState``，**不**参与 ``overall``（没配实盘的用户不该看到顶栏变红）。"""
+        get_link_registry().note_failure(PRIVATE_LINK_KEY, kind="restPrivate",
+                                         label=PRIVATE_LINK_LABEL, code=code, message=message)
 
     async def __aenter__(self) -> "OKXPrivateClient":
         return self
@@ -107,12 +200,13 @@ class OKXPrivateClient:
         HTTP ``429``（限流）做指数退避重试（镜像 ``rest_client._request``）——签名私有路径同样需自愈，
         否则多标的自动交易启动瞬间撞限频会把 ``OKX HTTP 429`` 原样抛到 UI。非 429 的 4xx/5xx 仍立即上抛。
         """
-        client = await self._get_client()
         query = httpx.QueryParams(params or {})
         request_path = path + (f"?{query}" if query else "")
         last_exc: Exception | None = None
         rate_limited = False
         for attempt in range(3):
+            await self._acquire_slot()
+            client = await self._get_client()   # 每跳都问池要（换代后立刻拿到新连接，P1-1）
             ts = _iso_timestamp()
             headers = self._headers(ts, "GET", request_path)
             try:
@@ -124,17 +218,25 @@ class OKXPrivateClient:
                 resp.raise_for_status()
                 body = resp.json()
                 if str(body.get("code")) != "0":
+                    await self._maybe_heal_clock(str(body.get("code")))
                     raise OKXPrivateError(str(body.get("code")),
                                           str(body.get("msg") or "OKX error"))
+                self._note_link_ok()
                 return body.get("data", [])
             except httpx.TransportError as exc:  # 仅传输层异常重试，鉴权/业务错误立即上抛
                 last_exc = exc
                 rate_limited = False
+                await self._invalidate_pooled()   # 抖动即整池换代，而非让后续请求各自超时一遍
             except httpx.HTTPStatusError as exc:  # 非 429 的 4xx/5xx：语义不变，立即上抛
+                self._note_link_fail("OKX_HTTP_ERROR", f"{path}: HTTP {exc.response.status_code}")
                 raise OKXPrivateError("OKX_HTTP_ERROR",
                                       f"OKX HTTP {exc.response.status_code}") from exc
         if rate_limited:   # 退避耗尽仍 429：显式回 OKX_HTTP_ERROR，避免 last_exc=None 的误导串
+            # 【有意的不对齐，spec §2.3.5 / §十一 D-1】公共侧改抛 OKX_RATE_LIMITED，私有侧**一字不动**：
+            # 它被 tests/test_okx_signing.py:95 逐字冻结，而那条用例本轮必须未经改动仍绿。
+            self._note_link_fail("OKX_HTTP_ERROR", f"{path}: HTTP 429")
             raise OKXPrivateError("OKX_HTTP_ERROR", "OKX HTTP 429")
+        self._note_link_fail("OKX_UNREACHABLE", f"{path}: {last_exc}")
         raise OKXPrivateError("OKX_UNREACHABLE", f"无法连接 OKX ({path}): {last_exc}")
 
     async def get_account_config(self) -> dict:

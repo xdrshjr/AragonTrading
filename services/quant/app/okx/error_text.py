@@ -41,6 +41,11 @@ _TRADE_CODE_MESSAGE = {
     "OKX_ERROR": "交易所业务错误",
     "CONNECTION_FAILED": "连接交易所失败",
     "OKX_HTTP_ERROR": "交易所返回 HTTP 错误",
+    # 链路韧性三码（okx-link-resilience §2.4.3）。SEND_UNCERTAIN 的中文刻意**不**说「请重试」：
+    # 它是终态，任何上层都不许据它自动重发平仓，人工也只该先去核对而不是再点一次。
+    "OKX_RATE_LIMITED": "请求过于频繁，已自动退避重试仍被交易所限频",
+    "OKX_CIRCUIT_OPEN": "交易所连接暂时熔断，稍后自动恢复",
+    "OKX_SEND_UNCERTAIN": "请求已发出但结果未确认，请核对交易所侧状态",
 }
 
 

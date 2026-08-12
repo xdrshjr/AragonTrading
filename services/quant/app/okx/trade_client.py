@@ -19,24 +19,35 @@ import json
 import httpx
 
 from .private_client import OKXPrivateClient, OKXPrivateError, _iso_timestamp
+from .write_safety import may_retry_write
 
 
 class OKXTradeClient(OKXPrivateClient):
     """实盘交易客户端：签名 POST 下单 / 设杠杆 + 签名 GET 查成交 / 挂单。"""
 
-    async def _post(self, path: str, payload: dict) -> dict:
+    async def _post(self, path: str, payload: dict, *, allow_retry: bool | None = None) -> dict:
         """签名 POST：返回 OKX 完整响应体（dict）；连通 / HTTP 失败抛 ``OKXPrivateError``。
 
-        业务码判定交由调用方（下单须同看顶层 ``code`` 与 ``data[0].sCode``，§2.2f）。对
-        ``httpx.TransportError`` 重试，并对 HTTP ``429`` 做指数退避重试，与基类 ``_get`` 口径一致。
-        重试用同一 body / 同一 ``clOrdId``，OKX 按 ``clOrdId`` 去重，故即便首发已落地重试也不会重复下单
-        （幂等安全）。非 429 的 4xx/5xx 仍立即上抛。
+        业务码判定交由调用方（下单须同看顶层 ``code`` 与 ``data[0].sCode``，§2.2f）。HTTP ``429``
+        照旧指数退避重试（与基类 ``_get`` 口径一致）；**传输层异常的重试改为按幂等分级放行**
+        （okx-link-resilience §2.4.3）：带去重键或天然幂等的写才重试，其余首次异常即上抛。
+
+        为什么必须分级：``place_order`` / ``order-algo`` 重发同一 body 是安全的（OKX 按
+        ``clOrdId`` / ``algoClOrdId`` 去重），但 ``close-position`` **没有这个承诺**——一次「请求已
+        送达、响应在回程丢了」的超时，盲重试就可能变成第二次平仓动作（R-1，本轮最严重的风险）。
+
+        Args:
+            path: OKX 请求路径。
+            payload: 请求体（``may_retry_write`` 会检查它是否**确实带上了**去重键）。
+            allow_retry: 覆盖幂等判定；``None`` 即交给 ``write_safety.may_retry_write``。
         """
-        client = await self._get_client()
+        retryable = may_retry_write(path, payload) if allow_retry is None else bool(allow_retry)
         body = json.dumps(payload, separators=(",", ":"))
         last_exc: Exception | None = None
         rate_limited = False
         for attempt in range(3):
+            await self._acquire_slot()
+            client = await self._get_client()   # 每跳都问池要（换代后立刻拿到新连接，P1-1）
             ts = _iso_timestamp()
             headers = self._headers(ts, "POST", path, body)
             try:
@@ -46,15 +57,22 @@ class OKXTradeClient(OKXPrivateClient):
                     await asyncio.sleep(0.5 * (2 ** attempt))
                     continue
                 resp.raise_for_status()
+                self._note_link_ok()
                 return resp.json()
-            except httpx.TransportError as exc:  # 仅传输层异常重试，业务错误立即上抛
+            except httpx.TransportError as exc:  # 传输层异常：只有幂等写才允许再发一次
                 last_exc = exc
                 rate_limited = False
+                await self._invalidate_pooled()
+                if not retryable:
+                    break
             except httpx.HTTPStatusError as exc:  # 非 429 的 4xx/5xx：语义不变，立即上抛
+                self._note_link_fail("OKX_HTTP_ERROR", f"{path}: HTTP {exc.response.status_code}")
                 raise OKXPrivateError("OKX_HTTP_ERROR",
                                       f"OKX HTTP {exc.response.status_code}") from exc
         if rate_limited:   # 退避耗尽仍 429：显式回 OKX_HTTP_ERROR，避免 last_exc=None 的误导串
+            self._note_link_fail("OKX_HTTP_ERROR", f"{path}: HTTP 429")
             raise OKXPrivateError("OKX_HTTP_ERROR", "OKX HTTP 429")
+        self._note_link_fail("OKX_UNREACHABLE", f"{path}: {last_exc}")
         raise OKXPrivateError("OKX_UNREACHABLE", f"无法连接 OKX ({path}): {last_exc}")
 
     async def place_order(self, payload: dict) -> dict:
@@ -185,7 +203,12 @@ class OKXTradeClient(OKXPrivateClient):
                          "autoCxl": auto_cxl}
         if cl_ord_id:
             payload["clOrdId"] = cl_ord_id
-        body = await self._post("/api/v5/trade/close-position", payload)
+        try:
+            body = await self._post("/api/v5/trade/close-position", payload)
+        except OKXPrivateError as exc:
+            if exc.code != "OKX_UNREACHABLE":     # 业务拒单是确定的失败，不需要核验
+                raise
+            return await self._verify_closed(inst_id, pos_side)
         rows = body.get("data") or []
         row = rows[0] if rows else {}
         top_code = str(body.get("code"))
@@ -195,6 +218,34 @@ class OKXTradeClient(OKXPrivateClient):
             msg = row.get("sMsg") or body.get("msg") or "OKX 平仓失败"
             raise OKXPrivateError(code, str(msg))
         return row
+
+    async def _verify_closed(self, inst_id: str, pos_side: str) -> dict:
+        """平仓请求送出后连通失败：**读回交易所状态**判定，而不是再发一次平仓（R-1 / R-17）。
+
+        为什么必须**有界重读**而不是只读一次：平仓送达后交易所侧持仓归零有毫秒级到秒级的延迟，
+        立刻读 ``positions`` 很可能仍看到仓位——只读一次会把「其实成功了」稳定地误报成「不确定」，
+        而「不确定」在自愈层里是最贵的一种回答。至多 ``okx_link_verify_attempts`` 次、间隔
+        ``okx_link_verify_backoff_s``（线性不退避），总耗时 <2s。
+
+        **调用方契约（安全不变式）**：``OKX_SEND_UNCERTAIN`` 是**终态**。任何上层——``live_auto``
+        执行器、``okx.trading``、自愈层、界面上的人工平仓按钮——**一律禁止**据它自动重发平仓，
+        只能如实展示并请人工核对。上一轮 ``ai-trade-backstop-repair`` 最重的缺陷正是「待核实态被
+        覆盖，于是人工连点两次发出了两张全仓止损」；一个新的「不确定」码若没有配套写死「谁都不许
+        据它重试」，就是在同一个坑上重新铺一块木板。
+        """
+        cfg = self._settings
+        attempts = max(1, int(cfg.okx_link_verify_attempts))
+        for i in range(attempts):
+            if i:
+                await asyncio.sleep(float(cfg.okx_link_verify_backoff_s))
+            try:
+                positions = await self.get_positions()
+            except OKXPrivateError:
+                continue          # 核验自身失败：继续重读，读不到就落 UNCERTAIN（绝不假成功）
+            if not _has_open_position(positions, inst_id, pos_side):
+                return {"instId": inst_id, "posSide": pos_side, "verified": True}
+        raise OKXPrivateError("OKX_SEND_UNCERTAIN",
+                              "平仓请求结果未确认，交易所侧仍有持仓，请人工核对后再操作")
 
     async def set_leverage(self, inst_id: str, lever: float, mgn_mode: str,
                            pos_side: str | None = None) -> dict:
@@ -276,3 +327,24 @@ class OKXTradeClient(OKXPrivateClient):
         if inst_id:
             params["instId"] = inst_id
         return await self._get("/api/v5/trade/orders-algo-pending", params)
+
+
+def _has_open_position(positions: list, inst_id: str, pos_side: str) -> bool:
+    """该合约该方向是否仍有非零持仓（纯函数，供 ``_verify_closed`` 判定）。
+
+    ``posSide`` 在净持仓模式下是 ``"net"``；OKX 回执里 ``pos`` 为字符串且可能是 ``""`` / ``"0"``。
+    判据刻意宽松地**只认「明确读到非零」**：读不出来就不算「已平掉」，宁可落 UNCERTAIN
+    也绝不假成功——一个被误判成功的平仓会让上层以为已经空仓，而实际持仓还在裸奔。
+    """
+    for row in positions or []:
+        if str(row.get("instId") or "") != inst_id:
+            continue
+        side = str(row.get("posSide") or "net")
+        if pos_side not in ("net", side) and side != "net":
+            continue
+        try:
+            if abs(float(row.get("pos") or 0.0)) > 0:
+                return True
+        except (TypeError, ValueError):
+            return True      # 读不懂的持仓字段一律按「还有仓」处理（诚实的保守）
+    return False

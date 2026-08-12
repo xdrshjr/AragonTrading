@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -26,6 +27,7 @@ from .api import (
     factors,
     live_auto,
     market,
+    okx_link,
     paper,
     runs,
     strategies,
@@ -41,6 +43,8 @@ from .discovery.manager import get_discovery_manager
 from .factors.weight_batch_manager import get_weight_batch_manager
 from .factors.weight_train_manager import get_weight_train_manager
 from .live_auto.manager import get_live_auto_manager
+from .okx.client_pool import get_client_pool
+from .okx.clock import get_server_clock
 from .okx.rest_client import OKXError, get_rest_client
 from .paper.manager import get_paper_manager
 
@@ -58,7 +62,9 @@ async def lifespan(app: FastAPI):
     sweeper = asyncio.create_task(_weight_train_sweeper())   # H-B6：周期回收过期终态作业（cancel-safe）
     resumer = asyncio.create_task(_resume_discovery_runs())  # 挖掘任务自动续跑（静置延时后拉起）
     get_health_guard().start()                 # 持续样本外体检守护（双闸每 tick 重读，D-24）
+    link_sweeper = asyncio.create_task(_okx_link_sweeper())   # 私有连接池清扫 + 服务器时钟对齐
     yield
+    link_sweeper.cancel()
     resumer.cancel()
     sweeper.cancel()                                         # 关停先取消清扫协程（与 manager.shutdown 同段）
     await get_health_guard().shutdown()         # 体检守护先停（它只读行情，无终态可等）
@@ -72,6 +78,7 @@ async def lifespan(app: FastAPI):
     await get_weight_batch_manager().shutdown()
     await get_weight_train_manager().shutdown()
     await get_rest_client().aclose()
+    await get_client_pool().aclose_all()   # 池化的私有 AsyncClient 统一收口（okx-link-resilience §2.4.1）
     await dispose_engine()
 
 
@@ -187,6 +194,33 @@ async def _weight_train_sweeper() -> None:
         return
 
 
+async def _okx_link_sweeper() -> None:
+    """OKX 链路后台维护（okx-link-resilience §2.4.1 / §2.4.2）：连接池清扫 + 服务器时钟对齐。
+
+    姿态完全镜像既有 ``_weight_train_sweeper``：60s 一跳、cancel-safe、单次失败只 warning 不让
+    协程死亡。启动即先同步一次时钟——本机时钟漂移（Windows 笔记本休眠唤醒后尤甚）会让**全部**
+    私有请求在同一瞬间撞 ``50102``，而此前它之后没有任何自愈动作。
+    """
+    from .config import get_settings
+
+    clock = get_server_clock()
+    pool = get_client_pool()
+    try:
+        while True:
+            try:
+                settings = get_settings()
+                if clock.is_stale(settings.okx_link_clock_sync_interval_s):
+                    await clock.sync(get_rest_client().get_server_time_ms)
+                closed = await pool.sweep(time.monotonic())
+                if closed:
+                    logger.info("okx client pool swept %d idle clients", closed)
+            except Exception as exc:  # noqa: BLE001 —— 单次维护失败不得拖垮常驻协程
+                logger.warning("okx link sweeper tick skipped: %s", exc)
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:    # 关停取消时干净退出
+        return
+
+
 app = FastAPI(title="Aragon Trading Quant API", version="0.1.0", lifespan=lifespan)
 
 # 单机本地工具：开发期放开 CORS（前端走 Next 代理，浏览器直连 WS 也需放开）
@@ -262,6 +296,7 @@ app.include_router(workspace.router, prefix="/api")  # 第 12 个路由（worksp
 app.include_router(weight_models.router, prefix="/api")  # 权重模型工作区（weight-model-workspace §五；含 WS /ws/weight-train/{jobId}）
 app.include_router(weight_batches.router, prefix="/api")  # 多模型训练竞技场（weight-multi-model-training §四；含 WS /ws/weight-batch/{batchId}）
 app.include_router(discovery.router, prefix="/api")  # 第 16 个路由（策略与因子挖掘 §四；含 WS /ws/discovery/{runId}）
+app.include_router(okx_link.router, prefix="/api")   # OKX 链路健康只读端点（okx-link-resilience §四）
 app.include_router(discovery_assets.router, prefix="/api")  # 第 17 个路由（成果资产台账与持续体检 §四，无 WS）
 
 

@@ -21,6 +21,7 @@ import type {
   Trade,
   WalkForwardResult,
 } from "./types";
+import type { OkxConnectivity } from "./okxLinkTypes";
 
 const BASE = "/api/py";
 
@@ -98,6 +99,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<Health>("/health"),
+
+  // OKX 链路健康（okx-link-resilience §4.1 / §4.2）。probe 是**只读**语义：强制一次公共探活 +
+  // 一次时钟同步，不触碰任何私有写路径，因此不需要实盘总闸。
+  okxConnectivity: () => request<OkxConnectivity>("/okx/connectivity"),
+  okxProbe: () => request<OkxConnectivity>("/okx/connectivity/probe", { method: "POST" }),
 
   instruments: (instType = "SWAP") =>
     request<Instrument[]>(`/instruments?instType=${encodeURIComponent(instType)}`),

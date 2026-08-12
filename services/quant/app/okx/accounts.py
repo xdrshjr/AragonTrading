@@ -38,6 +38,12 @@ class AccountCredentials:
     passphrase: str
 
 
+# 链路韧性新增的三个归一码（okx-link-resilience §2.4.3）。它们**本身就是**稳定语义码，
+# 必须显式登记为原码透传：不登记就会掉进末行的 `OKX_ERROR`，「被限频 / 已熔断 / 结果未确认」
+# 这三种截然不同的处置在这一跳被拍成同一句「交易所业务错误」。中文在 `okx/error_text.py`。
+_LINK_CODES = frozenset({"OKX_RATE_LIMITED", "OKX_CIRCUIT_OPEN", "OKX_SEND_UNCERTAIN"})
+
+
 def _map_okx_code(okx_code: str) -> str:
     """OKX 原始错误码 → 稳定对外语义码（前端据此给友好中文提示）。"""
     mapping = {
@@ -51,6 +57,8 @@ def _map_okx_code(okx_code: str) -> str:
     }
     if okx_code in mapping:
         return mapping[okx_code]
+    if okx_code in _LINK_CODES:          # 链路韧性三码：原码透传，否则语义在这一跳被拍平成 OKX_ERROR
+        return okx_code
     if okx_code in ("OKX_UNREACHABLE", "OKX_HTTP_ERROR"):
         return "CONNECTION_FAILED"
     return "OKX_ERROR"                   # 其它非 0：透传原码于 message

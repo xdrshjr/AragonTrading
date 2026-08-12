@@ -71,10 +71,12 @@ function backendEnv({ mode, dbPath, agentEnv } = {}) {
   // 'true'）——用户在 prod 须显式提供 env 方可开启。
   // DISCOVERY_* 为 strategy-factor-discovery 必改透传（§六）：漏改即所有 DISCOVERY_ env 静默
   // 失效，打包/prod 将无法用 agent.env 覆盖挖掘总闸与配额。
+  // OKX_ 为 okx-link-resilience 必改透传（§3.5）：不加则打包版**所有** OKX_LINK_* 旋钮
+  // （心跳 / 退避 / 熔断 / 连接池 / 补根上限）静默失效——这类漏改从不报错，已栽过两次。
   if (mode === 'prod' && agentEnv && typeof agentEnv === 'object') {
     for (const [key, value] of Object.entries(agentEnv)) {
       if ((key.startsWith('AGENT_') || key.startsWith('LIVE_') || key.startsWith('AI_TRADE_')
-           || key.startsWith('DISCOVERY_'))
+           || key.startsWith('DISCOVERY_') || key.startsWith('OKX_'))
           && value != null) {
         env[key] = String(value);
       }

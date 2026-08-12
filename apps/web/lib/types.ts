@@ -653,6 +653,8 @@ export interface Health {
   wsConfigured: boolean;
   cachedFallbackEnabled?: boolean;
   maxPaperSessions?: number;
+  /** OKX 链路摘要（okx-link-resilience §4.3）。**可选**：老后端没有这个键。 */
+  link?: { overall: string; summary: string };
 }
 
 export interface ApiError {

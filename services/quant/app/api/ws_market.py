@@ -15,6 +15,7 @@ from ..okx.types import (
     OrderBookSnapshot,
 )
 from ..okx.ws_client import MarketWSHandlers, OKXMarketWSClient
+from ..okx.ws_supervisor import StreamEvent
 
 router = APIRouter(tags=["ws"])
 
@@ -59,6 +60,13 @@ async def ws_market(websocket: WebSocket) -> None:
         # client's own reconnect loop, not here.
         await _send_if_open(closed, websocket, "error", {"code": code, "message": message})
 
+    async def on_stream(event: StreamEvent) -> None:
+        # 链路状态是**加法**事件类型：前端遇到未知 type 本就忽略，故老前端零影响。
+        # 浏览器据它可以在图表上如实说「正在重连」，而不必等 15s 的 /api/health 轮询。
+        await _send_if_open(closed, websocket, "link", {
+            "key": event.key, "state": event.state, "attempt": event.attempt,
+            "downtimeS": round(event.downtime_s, 1), "detail": event.detail})
+
     client = OKXMarketWSClient(
         inst_id,
         bar,
@@ -68,6 +76,7 @@ async def ws_market(websocket: WebSocket) -> None:
             on_ticker=on_ticker,
             on_book=on_book,
             on_error=on_error,
+            on_stream=on_stream,
         ),
         # market_channels defaults to True: the candle channel streams from the
         # business endpoint and trades/tickers/books5 from the public endpoint,

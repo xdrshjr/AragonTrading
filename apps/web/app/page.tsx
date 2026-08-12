@@ -1,9 +1,9 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 import type { Dispatch, MouseEventHandler, SetStateAction } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AiBacktestModal from "@/components/Chart/AiBacktestModal";
 import ChartWorkspace from "@/components/Chart/ChartWorkspace";
 import WindowControls from "@/components/Desktop/WindowControls";
@@ -157,10 +157,26 @@ export default function Page() {
     setRightPanelWidth(widthFromRightEdge(rect.right, clientX));
   };
 
+  const queryClient = useQueryClient();
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
   const okxUp = health.data ? health.data.okx === "up" : null;
   const latencyMs = health.data?.okxLatencyMs ?? null;
   const lastOkTs = health.data?.lastOkTs ?? null;
+  // OKX 链路详情（okx-link-resilience §3.4）。`refetchInterval` **取函数式**：面板展开时 5s、
+  // 收起时 30s——顶栏已经有一条 15s 的 /api/health 轮询，再无条件叠一条定频轮询是白烧的往返。
+  // 端点缺失（老后端）时 `data` 为 undefined，ConnectionStatus 自会回落到 okxUp 二元展示。
+  const [linkPanelOpen, setLinkPanelOpen] = useState(false);
+  const connectivity = useQuery({
+    queryKey: ["okxLink"],
+    queryFn: api.okxConnectivity,
+    refetchInterval: () => (linkPanelOpen ? 5_000 : 30_000),
+    retry: false,
+  });
+  const probeConnectivity = useCallback(async () => {
+    const snapshot = await api.okxProbe();
+    queryClient.setQueryData(["okxLink"], snapshot);
+    return snapshot;
+  }, [queryClient]);
 
   const runQ = useQuery({
     queryKey: ["run", runId],
@@ -658,6 +674,9 @@ export default function Page() {
                   okxUp,
                   latencyMs,
                   lastOkTs,
+                  connectivity: connectivity.data ?? null,
+                  onConnectivityOpenChange: setLinkPanelOpen,
+                  onConnectivityProbe: probeConnectivity,
                   liveWsOpen: streamMarket ? liveWsOpen : undefined,
                   lastPrice: streamMarket ? lastPrice : undefined,
                   chartView,

@@ -21,6 +21,7 @@ from ..engine.backtester import candles_to_df
 from ..engine.metrics import _empty_metrics
 from ..okx.rest_client import get_rest_client
 from ..okx.types import BAR_SECONDS, Candle
+from ..okx.session_link import make_session_link
 from ..okx.ws_client import OKXWSClient
 from ..strategies.base import BaseStrategy
 from ..paper.session import PAPER_WINDOW_MAX
@@ -154,7 +155,10 @@ class LiveAutoSession:
         """暖机窗口（仅热指标，不下单）后订阅实时 WS。"""
         await self._prefill_htf(self.priming_bars if self.priming else 60)
         await self._prime_window()
-        self._ws = OKXWSClient(self.inst_id, self.bar, self.feed_candle)
+        # 链路事件与断线补根的实体全在 okx/session_link.py（本文件只留绑定，见 spec §3.2 注）。
+        self._link = make_session_link(self, "live_auto")
+        self._ws = OKXWSClient(self.inst_id, self.bar, self.feed_candle,
+                               on_stream=self._link.on_stream, owner=f"live:{self.session_id}")
         self._ws.start()
         # R-5：订阅 WS 即以墙钟初始化看门狗基准，避免首根实时确认根到来前误判停滞。
         self._last_candle_wall = time.time()

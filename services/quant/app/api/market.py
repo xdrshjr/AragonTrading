@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
+from ..okx.link_state import get_link_registry
 from ..okx.rest_client import OKXError, get_rest_client
 
 router = APIRouter(tags=["market"])
@@ -45,7 +46,16 @@ async def health() -> dict:
         # F2：缓存回退开关是否启用——前端据此预知"回退可能发生"（仅信息性，不放宽硬约束）
         "cachedFallbackEnabled": settings.allow_cached_fallback,
         "maxPaperSessions": settings.max_paper_sessions,
+        # 加法键（okx-link-resilience §4.3）：本端点**未声明** `response_model`，故新键不会被静默
+        # 剔除。只带摘要两项，详情走 `/api/okx/connectivity`——顶栏 15s 轮询不该顺带拖一份全量快照。
+        "link": _link_summary(),
     }
+
+
+def _link_summary() -> dict:
+    """链路摘要（`overall` 只由**行情面**决定；账户面的问题在 summary 里说，不冒充行情断线）。"""
+    snap = get_link_registry().snapshot()
+    return {"overall": snap["overall"], "summary": snap["summary"]}
 
 
 @router.get("/instruments")

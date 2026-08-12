@@ -1,9 +1,10 @@
 "use client";
 
-import { fmtPrice, fmtTime } from "@/lib/format";
+import { fmtPrice } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 import type { Bar, ChartView, Mode } from "@/lib/types";
-import { Badge } from "@/components/ui";
+import type { OkxConnectivity } from "@/lib/okxLinkTypes";
+import ConnectionStatus from "./ConnectionStatus";
 import IndicatorMenu from "./IndicatorMenu";
 
 const BARS: Bar[] = ["1m", "5m", "15m", "30m", "1H", "4H", "1D"];
@@ -15,9 +16,13 @@ const MODES: { key: Mode; label: string }[] = [
 
 // 标的选择已迁至 InstrumentList（chart-workspace-layout #10）；工具栏专注周期 / 指标 / 日期 / 区间 / 模式 / 状态。
 export interface ChartToolbarProps {
+  // 既有三个 props 一律保留：端点缺失（老后端）时 ConnectionStatus 据它们回落到二元展示。
   okxUp: boolean | null;
   latencyMs?: number | null;
   lastOkTs?: number | null;
+  connectivity?: OkxConnectivity | null;
+  onConnectivityOpenChange?: (open: boolean) => void;
+  onConnectivityProbe?: () => Promise<unknown> | void;
   liveWsOpen?: boolean; // F1：市场实时流连接态（仅非 paper 模式传入）
   lastPrice?: number | null;
   chartView: ChartView;
@@ -30,6 +35,9 @@ export default function ChartToolbar({
   okxUp,
   latencyMs,
   lastOkTs,
+  connectivity,
+  onConnectivityOpenChange,
+  onConnectivityProbe,
   liveWsOpen,
   lastPrice,
   chartView,
@@ -141,7 +149,14 @@ export default function ChartToolbar({
         </div>
 
         <LivePrice liveWsOpen={liveWsOpen} lastPrice={lastPrice} />
-        <ConnDot okxUp={okxUp} latencyMs={latencyMs} lastOkTs={lastOkTs} />
+        <ConnectionStatus
+          connectivity={connectivity}
+          okxUp={okxUp}
+          latencyMs={latencyMs}
+          lastOkTs={lastOkTs}
+          onOpenChange={onConnectivityOpenChange}
+          onProbe={onConnectivityProbe}
+        />
       </div>
     </div>
   );
@@ -170,37 +185,6 @@ function LivePrice({
         }}
       />
       <span className="tabular font-medium text-[var(--text)]">{fmtPrice(lastPrice)}</span>
-    </span>
-  );
-}
-
-function ConnDot({
-  okxUp,
-  latencyMs,
-  lastOkTs,
-}: {
-  okxUp: boolean | null;
-  latencyMs?: number | null;
-  lastOkTs?: number | null;
-}) {
-  const tone = okxUp === null ? "neutral" : okxUp ? "long" : "short";
-  const label = okxUp === null ? "探测中" : okxUp ? "OKX 已连接" : "OKX 不可达";
-  const title = okxUp
-    ? `OKX 已连接${latencyMs != null ? ` · 时延 ${latencyMs}ms` : ""}${
-        lastOkTs ? ` · 最近取数 ${fmtTime(lastOkTs)}` : ""
-      }`
-    : okxUp === null
-      ? "正在探测 OKX 可达性…"
-      : "OKX 不可达：请检查代理 / 网络（不会以假数据冒充真实行情）";
-  return (
-    <span title={title}>
-      <Badge tone={tone}>
-        <span
-          className="mr-1 inline-block h-1.5 w-1.5 rounded-full"
-          style={{ background: "currentColor" }}
-        />
-        {label}
-      </Badge>
     </span>
   );
 }

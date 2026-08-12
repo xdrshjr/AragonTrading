@@ -16,6 +16,7 @@ from ..engine.backtester import candles_to_df
 from ..engine.simulator import SimBroker
 from ..okx.rest_client import get_rest_client
 from ..okx.types import BAR_SECONDS, Candle
+from ..okx.session_link import make_session_link
 from ..okx.ws_client import OKXWSClient
 from ..strategies.base import BaseStrategy
 
@@ -124,7 +125,10 @@ class PaperSession:
             await self._prime_history()
         else:
             await self._load_warmup_window()
-        self._ws = OKXWSClient(self.inst_id, self.bar, self.feed_candle)
+        # 链路事件与断线补根的实体全在 okx/session_link.py（本文件只留绑定，见 spec §3.2 注）。
+        self._link = make_session_link(self, "paper")
+        self._ws = OKXWSClient(self.inst_id, self.bar, self.feed_candle,
+                               on_stream=self._link.on_stream, owner=f"paper:{self.session_id}")
         self._ws.start()
         await self._push({"type": "status", "data": self._status_payload()})
 

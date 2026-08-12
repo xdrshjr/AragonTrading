@@ -40,6 +40,38 @@ class Settings(BaseSettings):
     okx_account_demo: bool = False             # True 时私有请求附 x-simulated-trading:1（模拟盘）
     okx_account_timeout_seconds: float = 15.0  # 私有请求超时上限
 
+    # ---- OKX 链路韧性加固（okx-link-resilience §六）----
+    # 字段名即环境变量名（OKX_LINK_*，大小写不敏感）。桌面打包须在 desktop/src/lib/config.js
+    # 白名单补 key.startsWith('OKX_') 方能透传——Settings 为 extra="ignore"，漏改从不报错，
+    # 只会让打包版的所有旋钮静默失效（本仓库已为这类漏改栽过两次）。
+    # 纪律：每个机制都有一个**关得掉的取值**（阈值 0 / 速率 0 / TTL 0），不新增分叉代码路径。
+    okx_link_ws_ping_interval_s: float = 15.0      # 入站静默多久后发 "ping"
+    okx_link_ws_pong_timeout_s: float = 8.0        # 发 ping 后多久无任何入站帧即判失活（0=不判）
+    okx_link_ws_silence_timeout_s: float = 45.0    # 入站静默多久即判失活（兜底；0=不判）
+    okx_link_ws_subscribe_timeout_s: float = 10.0  # 订阅确认超时（0=不判）
+    okx_link_ws_healthy_after_s: float = 20.0      # 连接存活多久才允许复位退避（0=连上即复位）
+    okx_link_ws_backoff_base_s: float = 1.0        # WS 重连退避基数
+    okx_link_ws_backoff_max_s: float = 30.0        # WS 重连退避上限
+    # 全局建连速率闸，**只作用于重连**（attempt ≥ 1）：首次建连不取令牌。需要被压制的是故障期间的
+    # 重连风暴，而首建并发度本就由 live_auto_start_concurrency 与「一个浏览器一次订阅」约束住。
+    okx_link_ws_connect_rate_per_s: float = 2.0    # 0 = 不限
+    okx_link_rest_max_attempts: int = 4            # 公共 REST 最大尝试次数（含首次；1=不重试）
+    okx_link_rest_budget_s: float = 25.0           # 单次公共调用总墙钟预算（含等待）
+    okx_link_public_rate_per_s: float = 8.0        # 公共 REST 令牌桶速率（0=不限；≈既有 0.12s 间隔）
+    okx_link_public_burst: float = 4.0             # 公共桶容量
+    okx_link_private_rate_per_s: float = 5.0       # **每账户**私有令牌桶速率（0=不限）
+    okx_link_private_burst: float = 5.0            # 私有桶容量
+    # 熔断只作用于**公共读**；私有读写永不熔断（一个裸奔的持仓要平仓时，最不该出现的就是一个本地
+    # 开关拒绝把请求发出去）。探针类调用（health / 服务器时间 / 补根取数 / 手动探测）一律豁免。
+    okx_link_breaker_failures: int = 5             # 公共读连续失败多少次熔断（0=不熔断）
+    okx_link_breaker_cooldown_s: float = 20.0      # 熔断冷却（失败翻倍，上限 120s；任一成功即复位）
+    okx_link_pool_idle_ttl_s: float = 120.0        # 私有连接池空闲存活（0=用完即关，旧行为）
+    okx_link_clock_sync_interval_s: float = 900.0  # 服务器时钟同步周期（0=只在 50102 时同步）
+    okx_link_gap_repair_max_bars: int = 300        # 断线补根上限（0=不补根）
+    okx_link_down_alert_s: float = 20.0            # 链路断开多久推降级提示（极大值=不提示）
+    okx_link_verify_attempts: int = 3              # 平仓「读回核验」最多读几次持仓（1=只读一次）
+    okx_link_verify_backoff_s: float = 0.6         # 两次核验读之间的间隔（线性，不退避）
+
     # ---- 实盘交易（Phase 2「guarded order placement」，实盘交易模式 spec §3）----
     # 字段名即环境变量名（LIVE_*，大小写不敏感）；本轮需求把实盘下单默认翻为开启。
     # 桌面端经 desktop/src/lib/config.js 白名单透传（C1-6），dev 经 services/quant/.env 读取。

@@ -27,6 +27,7 @@ from ..live_auto.explain import build_atomic_explain, build_profit_guard_explain
 from ..live_auto.resting import resting_payload
 from ..okx.rest_client import get_rest_client
 from ..okx.types import BAR_SECONDS, Candle
+from ..okx.session_link import make_session_link
 from ..okx.ws_client import OKXWSClient
 from ..paper.strategy_factory import PaperStrategySpec
 from ..strategies.base import Signal
@@ -364,7 +365,10 @@ class AiTradeSession:
     async def start(self) -> None:
         """暖机（仅热指标 + 种入影子立场，不下任何真单）后订阅实时 WS 与 monitor 循环。"""
         await self._prime()
-        self._ws = OKXWSClient(self.inst_id, self.bar, self.feed_candle)
+        # 链路事件与断线补根的实体全在 okx/session_link.py（本文件只留绑定，见 spec §3.2 注）。
+        self._link = make_session_link(self, "ai_auto")
+        self._ws = OKXWSClient(self.inst_id, self.bar, self.feed_candle,
+                               on_stream=self._link.on_stream, owner=f"ai:{self.session_id}")
         self._ws.start()
         now = time.time()
         self._last_candle_wall = now

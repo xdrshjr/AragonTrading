@@ -1,7 +1,14 @@
-"""OKX public WebSocket clients."""
+"""OKX public WebSocket clients.
+
+连接的**活性判据、退避与重连**已下沉到 ``okx/ws_supervisor.py``（okx-link-resilience §2.2）；
+本模块保留对外 API（``OKXMarketWSClient`` / ``OKXWSClient`` 的构造与 ``start/stop`` 语义、
+一个 endpoint 一个 ``asyncio.Task``）与消息解析分发，并**仍在本模块内**发起
+``websockets.connect``——既有测试 monkeypatch 的正是 ``app.okx.ws_client.websockets.connect``。
+"""
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -21,6 +28,7 @@ from .types import (
     parse_okx_ticker,
     parse_okx_trade,
 )
+from .ws_supervisor import StreamEvent, WSStreamConfig, WSSupervisor
 
 logger = logging.getLogger("aragon.okx.ws")
 
@@ -29,10 +37,43 @@ TradeHandler = Callable[[MarketTrade], Awaitable[None]]
 TickerHandler = Callable[[MarketTicker], Awaitable[None]]
 BookHandler = Callable[[OrderBookSnapshot], Awaitable[None]]
 ErrorHandler = Callable[[str, str], Awaitable[None]]
+StreamHandler = Callable[[StreamEvent], Awaitable[None]]
 
 
 async def _noop_error(_code: str, _message: str) -> None:
     return None
+
+
+async def _noop_stream(_event: StreamEvent) -> None:
+    return None
+
+
+def _connect(url: str, **kwargs):
+    """模块级建连接缝：**必须**留在本模块内，否则既有测试的 monkeypatch 目标失效（F-6）。
+
+    返回值一律交给 ``async with``，**绝不 await**——真实 ``websockets.connect(...)`` 两者皆可，
+    但既有替身 ``_FakeConnection`` 不可 await。
+    """
+    return websockets.connect(url, **kwargs)
+
+
+def _connect_kwargs(settings: Settings) -> dict:
+    """建连参数。代理是本轮最危险的一处，规则只有一条：**为空一律不传 `proxy` 键**。
+
+    ``websockets`` 15 的 ``proxy`` **默认值是 ``True``**（走 ``urllib.request.getproxies()``，
+    Windows 上**含注册表里的系统代理**）；传 ``None`` 是「**显式禁用**代理」而不是「不指定」。
+    而 ``settings.proxy_url`` 只读 ``HTTPS_PROXY / HTTP_PROXY / ALL_PROXY`` 三个 env——本仓库的
+    用户大量只配了系统代理（Clash Verge 等）而没有这三个 env，此时它恒为 ``None``。无条件传
+    ``proxy=settings.proxy_url`` 会把这批用户的 WS **全部立刻断掉且永不恢复**，比现状严重得多。
+
+    ``ping_interval=None`` 保留不动：应用层三重活性判据已覆盖存活，而改它会同时改变既有替身
+    面对的参数面。库不支持 ``proxy`` 形参时（pin 的 14.1）也一律不传。
+    """
+    kwargs: dict = {"ping_interval": None, "open_timeout": 15}
+    proxy = settings.proxy_url
+    if proxy and "proxy" in inspect.signature(websockets.connect).parameters:
+        kwargs["proxy"] = proxy
+    return kwargs
 
 
 @dataclass
@@ -42,6 +83,8 @@ class MarketWSHandlers:
     on_ticker: TickerHandler
     on_book: BookHandler
     on_error: ErrorHandler = _noop_error
+    # 链路状态事件（加法字段，带默认值 ⇒ 既有构造点零改动）。
+    on_stream: StreamHandler = _noop_stream
 
 
 class OKXMarketWSClient:
@@ -62,12 +105,14 @@ class OKXMarketWSClient:
         handlers: MarketWSHandlers,
         settings: Settings | None = None,
         market_channels: bool = True,
+        owner: str = "chart",
     ):
         self._settings = settings or get_settings()
         self.inst_id = inst_id
         self.bar = bar
         self._handlers = handlers
         self._market_channels = market_channels
+        self._owner = owner
         self._channel = BAR_TO_WS_CHANNEL.get(bar, "candle1H")
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
@@ -76,11 +121,11 @@ class OKXMarketWSClient:
         if self._tasks:
             return
         self._tasks.append(asyncio.create_task(
-            self._run_endpoint(self._settings.okx_ws_business, self._candle_args())
+            self._run_endpoint(self._stream_config("business"))
         ))
         if self._market_channels:
             self._tasks.append(asyncio.create_task(
-                self._run_endpoint(self._settings.okx_ws_public, self._market_args())
+                self._run_endpoint(self._stream_config("public"))
             ))
 
     async def stop(self) -> None:
@@ -94,28 +139,39 @@ class OKXMarketWSClient:
                 pass
         self._tasks = []
 
-    async def _run_endpoint(self, url: str, args: list[dict[str, str]]) -> None:
-        backoff = 1.0
-        connect_kwargs: dict = {"ping_interval": None, "open_timeout": 15}
-        while not self._stop.is_set():
-            try:
-                async with websockets.connect(url, **connect_kwargs) as ws:
-                    await ws.send(json.dumps({"op": "subscribe", "args": args}))
-                    backoff = 1.0
-                    heartbeat = asyncio.create_task(self._heartbeat(ws))
-                    try:
-                        async for raw in ws:
-                            await self._handle_message(raw)
-                    finally:
-                        heartbeat.cancel()
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:  # noqa: BLE001
-                if self._stop.is_set():
-                    break
-                logger.warning("OKX WS disconnected; reconnecting in %.1fs: %s", backoff, exc)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 30.0)
+    def _stream_config(self, endpoint: str) -> WSStreamConfig:
+        """一条 endpoint 的登记簿身份。
+
+        通道键含 ``owner`` 段（``ws:{endpoint}:{instId}:{bar}:{owner}``）：不加这一段，一个
+        live_auto 会话与一个浏览器图表订阅同一 ``BTC-USDT-SWAP:1H`` 时会**共写同一条记录**，
+        一方断线另一方健康 → 面板状态来回翻，而两条连接的真实健康度谁也没被如实表达。
+        """
+        is_business = endpoint == "business"
+        url = self._settings.okx_ws_business if is_business else self._settings.okx_ws_public
+        label = (f"实时流(K 线 · {self.inst_id} {self.bar})" if is_business
+                 else f"实时流(盘口 · {self.inst_id})")
+        return WSStreamConfig(
+            url=url,
+            args=self._candle_args() if is_business else self._market_args(),
+            kind="wsBusiness" if is_business else "wsPublic",
+            label=label,
+            key=f"ws:{endpoint}:{self.inst_id}:{self.bar}:{self._owner}",
+        )
+
+    async def _run_endpoint(self, cfg: WSStreamConfig) -> None:
+        """一个 endpoint 一个 task（``_tasks`` 语义不变）；生命周期全权交给 supervisor。"""
+        connect_kwargs = _connect_kwargs(self._settings)
+        supervisor = WSSupervisor(
+            cfg,
+            settings=self._settings,
+            connect_factory=lambda url: _connect(url, **connect_kwargs),
+            on_raw=self._handle_message,
+            on_stream=self._handlers.on_stream,
+        )
+        try:
+            await supervisor.run(self._stop)
+        except asyncio.CancelledError:
+            return
 
     def _candle_args(self) -> list[dict[str, str]]:
         return [{"channel": self._channel, "instId": self.inst_id}]
@@ -126,14 +182,6 @@ class OKXMarketWSClient:
             {"channel": "tickers", "instId": self.inst_id},
             {"channel": "books5", "instId": self.inst_id},
         ]
-
-    async def _heartbeat(self, ws) -> None:
-        try:
-            while True:
-                await asyncio.sleep(20)
-                await ws.send("ping")
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            return
 
     async def _handle_message(self, raw: str) -> None:
         if raw == "pong":
@@ -190,6 +238,8 @@ class OKXWSClient:
         bar: str,
         on_candle: CandleHandler,
         settings: Settings | None = None,
+        on_stream: StreamHandler | None = None,
+        owner: str = "chart",
     ):
         self._client = OKXMarketWSClient(
             inst_id,
@@ -199,9 +249,11 @@ class OKXWSClient:
                 on_trade=_ignore_trade,
                 on_ticker=_ignore_ticker,
                 on_book=_ignore_book,
+                on_stream=on_stream or _noop_stream,
             ),
             settings=settings,
             market_channels=False,
+            owner=owner,
         )
 
     def start(self) -> None:
