@@ -1119,6 +1119,7 @@ export default function AiTradeLaunchModal({
           instId={budgetInst}
           bar={bar}
           preset={disciplinePreset}
+          stopLossPct={stopLossPct.value}
           onPickBar={(next) => setBar(next as Bar)}
           confirmed={tradabilityConfirmed}
           onConfirmedChange={setTradabilityConfirmed}

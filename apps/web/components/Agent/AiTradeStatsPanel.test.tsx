@@ -276,7 +276,10 @@ describe("AiTradeStatsPanel", () => {
     renderPanel();
     fireEvent.click(screen.getByRole("button", { name: "历史" }));
     fireEvent.click(await screen.findByRole("button", { name: /BTC-USDT-SWAP/ }));
-    expect(await screen.findByText("决策轮数")).toBeInTheDocument(); // 旧五键卡照常渲染
+    // 旧五键卡照常渲染。label 自 realized-edge-calibration E-3 起带口径词——`decisionRounds` 是
+    // **全程**真实轮数而 `holdRate` 的分母是近 50 轮保留样本，两个分母并排而不标口径就是误导（D-8）。
+    expect(await screen.findByText("决策轮数（全程）")).toBeInTheDocument();
+    expect(screen.getByText("观望占比（近 50 轮）")).toBeInTheDocument();
     expect(screen.queryByText("反思轮数")).toBeNull(); // 老记录不显示一排误导性的 0
     expect(screen.queryByText("唤醒抑制")).toBeNull();
   });
@@ -558,5 +561,49 @@ describe("AiTradeStatsDetail cost readings", () => {
     }));
     expect(await screen.findByText(/已实现总收益/)).toBeInTheDocument();
     expect(screen.queryByTestId("ai-reconcile-card")).not.toBeInTheDocument();
+  });
+
+  // ---------- 会话级「已实现」读数（realized-edge-calibration [P1-2] / G-9b）----------
+  // **渲染断言**：`aiStats.realized` 与 `session.realized` 是同一份 `realized_stats()` 的两条通道，
+  // 只确认后端算了、类型补了会让验收门禁空转——本仓库最高频的缺陷形状就是「没有渲染落点 = 死数据」。
+  const REALIZED = {
+    trips: 12, medianMoveBps: 13.9, medianRealizedNetBps: -1.2, medianRMultiple: -0.01,
+    rSamples: 11, reachedOneRShare: 0, medianStopAtrMult: 17.8, edgeErrorMedianBps: null,
+    costErrorMedianBps: 0.4, estimateCoverage: 0.83, feeCoverage: 1,
+  };
+
+  it("paints the realized readings on the history detail with both coverage denominators", async () => {
+    await renderDetail(makeDetail({
+      aiStats: {
+        decisionRounds: 40, actionCounts: { hold: 30 }, holdRate: 0.75, avgConfidence: 0.6,
+        degradedRounds: 2, realized: REALIZED,
+      },
+    }));
+    const block = await screen.findByTestId("ai-realized-history");
+    expect(within(block).getByText("位移中位（12 笔）")).toBeInTheDocument();
+    expect(within(block).getByText("R 倍数中位（11 笔可算）")).toBeInTheDocument();  // R 自带分母
+    expect(within(block).getByText(/带门禁估计 83.0% · 带费率记录 100.0%/)).toBeInTheDocument();
+  });
+
+  it("hides the realized block for sessions with too few settled trips", async () => {
+    await renderDetail(makeDetail({
+      aiStats: {
+        decisionRounds: 40, actionCounts: { hold: 30 }, holdRate: 0.75, avgConfidence: 0.6,
+        degradedRounds: 2, realized: { ...REALIZED, trips: 1, rSamples: 1 },
+      },
+    }));
+    expect(await screen.findByText(/已实现总收益/)).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-realized-history")).not.toBeInTheDocument();
+  });
+
+  it("paints the same readings live from session.realized (the second channel)", () => {
+    const group = makeGroup();
+    group.members["BTC-USDT-SWAP"].session = sessionRow({ realized: REALIZED });
+    useAppStore.setState({ aiTradeGroup: group });
+    renderPanel();
+    const card = within(screen.getByRole("dialog")).getByTestId("ai-realized-live");
+    expect(card).toHaveTextContent("BTC-USDT-SWAP");
+    expect(card).toHaveTextContent("位移中位（12 笔） 13.9 bps");
+    expect(card).toHaveTextContent("带门禁估计 83.0%");
   });
 });

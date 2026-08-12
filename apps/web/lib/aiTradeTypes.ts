@@ -1,6 +1,7 @@
 // AI 自动交易 wire 类型（camelCase，与后端 schemas.py 的 AiTrade* 同构）。
 // 运行期句柄（sessionId 等）为瞬态（store 不入 partialize）；aiTradeConfig 为持久化偏好。
 import type { FeeRatesWire, ReconcileWire } from "./aiTradeCost";
+import type { AiTradeRealizedStats } from "./aiTradeProfitability";
 import type {
   PaperPositionEvent,
   ProfitGuardCooldown,
@@ -1041,6 +1042,10 @@ export interface AiTradeSessionRow {
   tradability?: AiTradeTradabilitySnapshot | null;
   openFunnel?: AiTradeOpenFunnel | null;
   summaryHealth?: AiTradeSummaryHealth | null;
+  // 会话级已实现读数（realized-edge-calibration 轴 A）：挂 `_status_payload` **顶层**而不是
+  // `costSnapshot` 之下——后者只在 `k_min<=0`（门禁空转）时才发，装了纪律预设的会话一次都收不到。
+  // 零往返 / 老后端 ⇒ null 或 undefined ⇒ 整段不渲染（G-9b 的实时侧读点）。
+  realized?: AiTradeRealizedStats | null;
 }
 
 // WS status 事件负载（_status_payload / 轻量 status，会话视图的可增量合并子集）。
@@ -1086,6 +1091,10 @@ export interface AiTradeStatusEvent {
   tradability?: AiTradeTradabilitySnapshot | null;
   openFunnel?: AiTradeOpenFunnel | null;
   summaryHealth?: AiTradeSummaryHealth | null;
+  // 会话级已实现读数（realized-edge-calibration 轴 A）：挂 `_status_payload` **顶层**而不是
+  // `costSnapshot` 之下——后者只在 `k_min<=0`（门禁空转）时才发，装了纪律预设的会话一次都收不到。
+  // 零往返 / 老后端 ⇒ null 或 undefined ⇒ 整段不渲染（G-9b 的实时侧读点）。
+  realized?: AiTradeRealizedStats | null;
 }
 
 export interface AiTradeStartReq {
@@ -1340,10 +1349,26 @@ export interface AiTradeTradabilityResponse {
   vetoRate: { market: number | null; limit: number | null } | null;
   stopBps: { p50: number | null } | null;
   stopInsideCostRate: { market: number | null; limit: number | null } | null;
+  // 风险单位体检（realized-edge-calibration 轴 E-0）：只提示、不阻断、算不出即整键缺席。
+  bracket?: AiTradeBracketVerdict | null;
   alternatives: AiTradeTradabilityAlternative[];
   headline: string;
   advice: string | null;
   disclaimer: string;
+}
+
+// ---- 风险单位体检（realized-edge-calibration 轴 E-0 · §5.2）----
+// `level` 四态：`atr_scaled`（已按 ATR 定标）/ `cost_floored`（成本下界抬起，同样是对齐后的结果）/
+// `aligned`（固定百分比但量级相当）/ `oversized`（止损远大于该周期一根 K 线的波动 ⇒ 报警）。
+// 文案一律由后端下发，前端一个字都不重写；`suggestedStopPct` **绝不自动填进输入框**。
+export interface AiTradeBracketVerdict {
+  level: "atr_scaled" | "cost_floored" | "aligned" | "oversized";
+  stopSource: string;
+  stopBps: number | null;
+  atrP50Bps: number | null;
+  stopAtrMult: number | null;
+  suggestedStopPct: number | null;
+  text: string;
 }
 
 // 会话 status 上的**瘦身**投影（启动断面，启动后不变）。

@@ -44,6 +44,7 @@ from ..ai_auto.prior_service import prior_snapshot_out, rebuild_prior_snapshot
 from ..ai_auto.profit_guard import ProfitGuardRule, resolve_profit_guard_rule
 from ..ai_auto.signal_prior import resolve_prior_params, strategy_fingerprint
 from ..ai_auto.sizing import parse_sizing_rule, window_need
+from ..ai_auto.track_record_service import build_profitability, resolve_track_record
 from ..ai_auto.tradability_probe import probe
 from ..config import Settings, get_settings
 from ..db import ai_prior_repositories as prior_repo
@@ -64,6 +65,7 @@ from ..schemas import (
     AiTradePresetComparisonOut,
     AiTradePriorRebuildIn,
     AiTradePriorSnapshotOut,
+    AiTradeProfitabilityOut,
     AiTradeProfitGuardIn,
     AiTradeTradabilityOut,
     trade_out,
@@ -337,6 +339,8 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
         profit_rule=_resolve_profit_guard(body.profitGuard, settings),
         horizon_rule=_resolve_horizon(body.tradingHorizon, settings, bar=body.bar),
         prior_snapshots=priors,
+        track_records=await resolve_track_record(   # 轴 D：启动期一次性快照（会话内不刷新，R-5）
+            session, settings, inst_ids=[m.instId for m in body.members], bar=body.bar),
         # 纪律预设的回执载体（`group_status().discipline` 现装配）。`adjustments` 是**可变列表**：
         # `_validate_sizing` 的 [P0-4] 最小下单量复核会在启动期继续往里追加。
         discipline_preset=discipline.preset_id, discipline_f_floor=discipline.f_floor,
@@ -459,6 +463,7 @@ async def ai_trade_horizon_profiles(bar: str = Query("1H"),
 @router.get("/ai-trade/tradability", response_model=AiTradeTradabilityOut)
 async def ai_trade_tradability(instId: str, bar: str,
                                preset: str | None = Query(None),
+                               slPct: float | None = Query(None, gt=0),
                                session: AsyncSession = Depends(get_session),
                                settings: Settings = Depends(get_settings)) -> dict:
     """可交易性预检（tradability-and-open-funnel §5.1）：**只提示、不阻断**。
@@ -468,26 +473,40 @@ async def ai_trade_tradability(instId: str, bar: str,
     ——本函数只解析 query → 调它 → 原样返回（`api/ai_auto.py` 的净增预算是硬验收判据，G-19b）。
 
     `preset` 缺省取 `ai_trade_discipline_default_preset`；**未知值按 `off` 处理**（不 422：一个
-    看不懂的预设名不该把用户的预检挡掉）。**取数失败一律 200 + `level:"unknown"`，绝不 5xx。**
+    看不懂的预设名不该把用户的预检挡掉）。`slPct` 是弹窗里单仓止损那一格的现值（留空 = 用服务端
+    默认）。**取数失败一律 200 + `level:"unknown"`，绝不 5xx。**
     """
     if bar not in BAR_SECONDS:
         raise HTTPException(422, detail={"code": "BAD_BAR",
                                          "message": f"不支持的周期：{bar}"})
-    derived = _preset_settings(preset, settings)
+    derived = _preset_settings(preset, settings, sl_pct=slPct)
     return await probe(session, derived, inst_id=instId, bar=bar)
 
 
-def _preset_settings(preset: str | None, settings: Settings) -> Settings:
-    """按弹窗当前选中的预设派生一份**会话私有** Settings 副本（与启动路径同一个解析点）。
+def _preset_settings(preset: str | None, settings: Settings,
+                     *, sl_pct: float | None = None) -> Settings:
+    """按弹窗当前选中的预设**与用户填的止损**派生一份会话私有 Settings 副本（与启动路径同一解析点）。
 
     探针算的必须是「按下启动键之后真正会生效的那组阈值」，而不是进程默认值——两者分叉会让预检
-    说的和门禁做的不是一回事，那正是 R-2 要防的漂移。未知 preset / `off` ⇒ 原对象直通（`is` 相等）。
+    说的和门禁做的不是一回事，那正是 R-2 要防的漂移。两者皆缺省 ⇒ 原对象直通（`is` 相等）。
+
+    `sl_pct` 同理（realized-edge-calibration 轴 E-0）：启动路径取的是
+    `req.stop_loss_pct or ai_trade_default_sl_pct`（`manager.py:868`），故预检若只读进程默认值，
+    一个已经把止损改到 1% 的用户仍会被按出厂的 5% 告知「止损离现价约 500 bps、建议改到 0.56%」
+    ——**判据取自不携带该信息的入参**，正是 [P1-8] 点名的那个形状。
+    入参**照启动路径同样夹紧**到用户可见红线（`manager._resolve_risk:867` 的 `ai_trade_max_sl_pct`）：
+    预检要说的是真正会挂出去的那个止损，而不是用户填在框里的那个数。
     """
     preset_id = preset or settings.ai_trade_discipline_default_preset
-    if not settings.ai_trade_discipline_enabled or preset_id not in PRESET_IDS:
-        return settings
-    resolved = resolve_updates(preset_id, {}, 0)
-    return settings.model_copy(update=resolved.updates) if resolved.armed else settings
+    updates: dict = {}
+    if settings.ai_trade_discipline_enabled and preset_id in PRESET_IDS:
+        resolved = resolve_updates(preset_id, {}, 0)
+        if resolved.armed:
+            updates.update(resolved.updates)
+    if sl_pct is not None:
+        cap = float(updates.get("ai_trade_max_sl_pct", settings.ai_trade_max_sl_pct))
+        updates["ai_trade_default_sl_pct"] = min(max(0.0, float(sl_pct)), cap)
+    return settings.model_copy(update=updates) if updates else settings
 
 
 @router.get("/ai-trade/history/preset-comparison",
@@ -499,6 +518,27 @@ async def ai_trade_preset_comparison(session: AsyncSession = Depends(get_session
     `preset-comparison` 会被那条路径参数吞掉并当成一个 group_id 去查（返回 404）。
     """
     return await repo.list_ai_trade_preset_comparison(session)
+
+
+@router.get("/ai-trade/history/profitability", response_model=AiTradeProfitabilityOut)
+async def ai_trade_profitability(instId: str | None = Query(None), bar: str | None = Query(None),
+                                 sinceTs: int | None = Query(None),
+                                 preset: str | None = Query(None),
+                                 horizonProfile: str | None = Query(None),
+                                 session: AsyncSession = Depends(get_session),
+                                 settings: Settings = Depends(get_settings)) -> dict:
+    """跨会话盈利体检（realized-edge-calibration 轴 B/C · §5.1）：**池化**口径的历史统计。
+
+    **不守 AI 总闸**（沿用 `/ai-trade/horizon-profiles`、`/ai-trade/history/preset-comparison`
+    的先例：读一张历史表不下任何单）。装配全在 `ai_auto.track_record_service`，本函数只解析
+    query → 调它 → 原样返回（`api/ai_auto.py` 的净增预算是硬验收判据）。
+
+    ⚠️ 路由顺序：本条**必须**排在 `/ai-trade/history/{group_id}` **之前**，否则会被那条路径参数
+    吞掉、当成一个 `group_id` 去查并返回 404。`preset-comparison` 已经踩过这一次（G-21 钉住）。
+    """
+    return await build_profitability(session, settings, repo.TripQuery(
+        inst_id=instId, bar=bar, since_ts=sinceTs, preset=preset,
+        horizon_profile=horizonProfile))
 
 
 @router.get("/ai-trade/history", response_model=AiTradeHistoryListOut)

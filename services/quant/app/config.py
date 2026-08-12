@@ -557,6 +557,18 @@ class Settings(BaseSettings):
     ai_backtest_max_rounds: int = Field(default=400, ge=1)          # 单次回测的决策轮数硬上限（越界 400 拒绝）
     ai_backtest_default_decision_every_bars: int = Field(default=1, ge=1)  # AI 每 K 根决策一次的默认间隔
     ai_backtest_max_jobs: int = Field(default=2, ge=1, le=8)        # 同时进行的 AI 回测作业上限（超出 429）
+    # ---- 已实现 edge 校准与盈利体检（ai-trade-realized-edge-calibration §6.1）----
+    ai_trade_trip_ledger_enabled: bool = True          # 轴 A 总闸；False ⇒ explain.meta 逐字回退
+    ai_trade_profitability_min_trips: int = Field(default=30, ge=5, le=1000)     # 轴 B 下结论下限
+    ai_trade_profitability_t_threshold: float = Field(default=2.0, ge=0, le=10)  # 显著性判据
+    ai_trade_profitability_bucket_min_trips: int = Field(default=10, ge=2, le=200)  # 轴 C 桶内下限
+    ai_trade_track_record_enabled: bool = True         # 轴 D 总闸；False ⇒ payload 整键缺席
+    ai_trade_track_record_min_trips: int = Field(default=20, ge=5, le=1000)      # 轴 D 装配下限
+    # [P0-4] 成本句的独立门禁：带费率记录的往返占比低于此值 ⇒ prompt **整行省略**成本句。
+    # 绝不向模型下发一个由「没记费率」算出来的 0.0 bps 往返成本（D-9）。
+    ai_trade_track_record_min_fee_coverage: float = Field(default=0.5, ge=0, le=1)
+    ai_trade_bracket_check_enabled: bool = True        # 轴 E-0 总闸；False ⇒ bracket 整键缺席
+    ai_trade_bracket_max_atr_mult: float = Field(default=8.0, gt=0, le=100)      # 固定 pct 止损的告警上限
 
     # ---- 策略与因子挖掘（strategy-factor-discovery §六，env 前缀 DISCOVERY_）----
     # 字段名即环境变量名（DISCOVERY_*，大小写不敏感）。⚠️ 三处联动缺一即静默失效：

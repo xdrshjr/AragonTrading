@@ -363,6 +363,111 @@ def stats_wire(wire: dict | None) -> dict | None:
             "samples": wire.get("samples")}
 
 
+# ============ 风险单位体检（realized-edge-calibration 轴 E-0）============
+# 止损来源归并到三态：ATR 真的胜出 / 成本下界抬起 / 整条 ATR 覆盖没生效。
+_STOP_SOURCE_ATR = ("atr", "atr_capped")
+_STOP_SOURCE_FLOORED = ("atr_floored",)
+
+
+@dataclass(frozen=True)
+class BracketInputs:
+    """[P1-11] 形参聚合（CLAUDE.md ≤5）：全部取自探针**已经算出**的那一份断面，零新增取数。
+
+    Attributes:
+        atr_p50_bps: 探针窗口的 ATR 中位（bps）。
+        stop_source: 止损**实际**来源（`atr` / `atr_capped` / `atr_floored` / `fixed` /
+            `floor_above_cap` / `unknown`）——**不得从配置反推**，见下方判定表的成文理由。
+        stop_bps_p50: ATR 覆盖真的生效时的止损距离中位（bps）；不生效 ⇒ None。
+        stop_pct: 用户填的固定百分比止损（`ai_trade_default_sl_pct` 或弹窗入参）。
+        stop_atr_mult: 配置的 ATR 倍数（只用于文案，**不参与判定**）。
+        max_atr_mult: 告警上限（`ai_trade_bracket_max_atr_mult`，默认 8）。
+    """
+
+    atr_p50_bps: float | None
+    stop_source: str
+    stop_bps_p50: float | None
+    stop_pct: float | None
+    stop_atr_mult: float | None
+    max_atr_mult: float
+
+
+def bracket_verdict(inputs: BracketInputs) -> dict | None:
+    """启动期风险单位体检：**只提示，不改**。算不出 ⇒ `None` ⇒ 整块缺席（fail-open，与探针同极性）。
+
+    **必须先判「止损从哪来」，再判倍数**，否则会在一个已经正确定标的会话上报警。[P1-8]：
+    `stop_source` 不能从配置反推——真实止损距离要过 `sizing.resolve_stop_distance` 的三段
+    （成本下界 → 用户红线上界 → 冲突判定）：`floor_above_cap` 时**整条 ATR 覆盖回退成用户的固定
+    `slPct`**，成本下界胜出时距离也不是 `k×ATR`。实测 BTC 1m 有 62.3% 的断面 `2×ATR` 比单次成本
+    还小，故「按配置反推」会在**恰恰最该报警**的断面上说「已按 ATR 定标，不报警」。
+
+    三条硬约束：① **绝不自动改用户填的 `slPct`**（自动改参数是本仓库明令禁止的静默夹紧形状）；
+    ② 建议值 `suggestedStopPct` 由后端算好下发，前端不做任何换算；③ 它**不是**启动阻断——
+    按钮永不禁用。
+    """
+    atr = _finite(inputs.atr_p50_bps)
+    source = str(inputs.stop_source or "unknown")
+    if atr is None or atr <= 0:
+        return None
+    if source in _STOP_SOURCE_ATR or source in _STOP_SOURCE_FLOORED:
+        return _aligned_bracket(inputs, atr, source)
+    if source not in ("fixed", "floor_above_cap"):
+        return None                       # `unknown`：算不出止损从哪来 ⇒ 整块缺席，绝不猜
+    stop_pct = _finite(inputs.stop_pct)
+    if stop_pct is None or stop_pct <= 0:
+        return None
+    stop_bps = stop_pct * 1e4
+    ratio = stop_bps / atr
+    level = "oversized" if ratio > float(inputs.max_atr_mult) else "aligned"
+    return {"level": level, "stopSource": source, "stopBps": _round(stop_bps),
+            "atrP50Bps": _round(atr), "stopAtrMult": _round(ratio),
+            "suggestedStopPct": _suggested_stop_pct(inputs, atr),
+            "text": (_oversized_text(stop_bps, atr, ratio, inputs)
+                     if level == "oversized" else _aligned_fixed_text(stop_bps, atr, ratio))}
+
+
+def _aligned_bracket(inputs: BracketInputs, atr: float, source: str) -> dict:
+    """ATR 真的胜出（含被成本下界抬起）的两态：**恒不报警**——它已经是对齐后的结果。"""
+    stop_bps = _finite(inputs.stop_bps_p50)
+    ratio = (stop_bps / atr) if stop_bps else _finite(inputs.stop_atr_mult)
+    floored = source in _STOP_SOURCE_FLOORED
+    level = "cost_floored" if floored else "atr_scaled"
+    if floored:
+        text = (f"止损被成本下界抬到 {_bps(stop_bps)} —— 这个周期一根 K 线的波动"
+                f"（ATR 中位 {_bps(atr)}）比一次往返成本还小。这已经是对齐后的结果，无需调整。")
+    else:
+        text = (f"已按 ATR 定标：止损距离约 {_bps(stop_bps)}，相当于 "
+                f"{'未知' if ratio is None else f'{ratio:.1f}'} 根 K 线的波动"
+                f"（ATR 中位 {_bps(atr)}）。风险框架与交易尺度在同一量级。")
+    return {"level": level, "stopSource": source, "stopBps": _round(stop_bps),
+            "atrP50Bps": _round(atr), "stopAtrMult": _round(ratio),
+            "suggestedStopPct": None, "text": text}
+
+
+def _oversized_text(stop_bps: float, atr: float, ratio: float, inputs: BracketInputs) -> str:
+    """`oversized` 的文案（纯文本、**无 `**`**：后端文案里的粗体在四个渲染点会显示成字面星号）。"""
+    suggested = _suggested_stop_pct(inputs, atr)
+    tail = ("" if suggested is None else
+            f"若希望风险框架与交易尺度对齐，可考虑把单仓止损设到约 {suggested * 100:.2f}%"
+            f"（= {inputs.stop_atr_mult:g}×ATR），或改用「均衡 / 稳健」纪律预设"
+            "（它们会按 ATR 自动定标）。")
+    return (f"止损离现价约 {_bps(stop_bps)}，而这个周期一根 K 线的波动（ATR 中位）只有 "
+            f"{_bps(atr)} —— 相当于 {ratio:.1f} 根 K 线的波动幅度。按历史行为，这样的止损几乎不会"
+            f"被触发，交易所侧止损、止盈与利润保护的武装线都不会有生效机会。{tail}")
+
+
+def _aligned_fixed_text(stop_bps: float, atr: float, ratio: float) -> str:
+    return (f"止损离现价约 {_bps(stop_bps)}，相当于 {ratio:.1f} 根 K 线的波动"
+            f"（ATR 中位 {_bps(atr)}）。风险框架与交易尺度在同一量级。")
+
+
+def _suggested_stop_pct(inputs: BracketInputs, atr: float) -> float | None:
+    """建议止损百分比（`k×ATR`）；`stop_atr_mult<=0` ⇒ None（**绝不自动填进输入框**）。"""
+    mult = _finite(inputs.stop_atr_mult)
+    if mult is None or mult <= 0:
+        return None
+    return round(mult * atr / 1e4, 6)
+
+
 def _pct(values, q: float) -> float | None:
     """分位数（线性插值，与 numpy 默认一致）；空序列 ⇒ `None`。"""
     rows = sorted(value for value in (_finite(v) for v in values) if value is not None)

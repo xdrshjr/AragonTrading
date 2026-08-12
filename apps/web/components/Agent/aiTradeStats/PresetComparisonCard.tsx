@@ -32,7 +32,7 @@ export default function PresetComparisonCard() {
       data-testid="ai-preset-comparison-card"
     >
       <div className="flex items-baseline justify-between gap-2">
-        <span className="text-xs text-[var(--muted)]">历史纪律预设对照</span>
+        <span className="text-xs text-[var(--muted)]">历史纪律预设对照 · 池化口径</span>
         <span className="tabular text-[10px] text-[var(--muted)]">
           满 {query.data?.minSamples ?? 3} 局才下结论
         </span>
@@ -47,7 +47,10 @@ export default function PresetComparisonCard() {
         <strong className="text-[var(--text)]">真实资金历史</strong>
         。「样本不足」的组同样给出全部数字，但
         <strong className="text-[var(--text)]">不构成任何结论</strong>
-        ；缺少预设记录的老会话独立成「未记录」一组，绝不并进任一具名档。
+        ；缺少预设记录的老会话独立成「未记录」一组，绝不并进任一具名档。三个比例一律
+        <strong className="text-[var(--text)]">池化</strong>
+        （Σ分子 / Σ分母），不对各局的比值求平均——各局的往返数从 1 笔到 39 笔不等，等权会让一笔样本
+        的局与四十笔的局有完全相同的权重。
       </p>
     </div>
   );

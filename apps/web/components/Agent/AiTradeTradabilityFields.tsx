@@ -50,6 +50,14 @@ export interface AiTradeTradabilityFieldsProps {
   instId: string;
   bar: string;
   preset: string;
+  /**
+   * 弹窗里单仓止损那一格的现值（fraction，留空 = 用服务端默认）。
+   *
+   * 风险单位体检（轴 E-0）判的是**按下启动键之后真正会挂出去的那个止损**，而启动路径取的正是
+   * 这一格（`req.stopLossPct or ai_trade_default_sl_pct`）。不传下去，一个已经把止损改到 1% 的
+   * 用户仍会被按出厂的 5% 告知「止损离现价约 500 bps」——判据取自不携带该信息的入参。
+   */
+  stopLossPct?: number | null;
   /** 「一键换周期」：直接改本弹窗的时间级别下拉，**不发任何请求**、不改预设。 */
   onPickBar: (bar: string) => void;
   /** 已确认「仍要启动」——受控 state 由父组件持有（本组件不写重置 effect）。 */
@@ -70,6 +78,7 @@ export default function AiTradeTradabilityFields({
   instId,
   bar,
   preset,
+  stopLossPct = null,
   onPickBar,
   confirmed,
   onConfirmedChange,
@@ -88,7 +97,7 @@ export default function AiTradeTradabilityFields({
     setLoading(true);
     const timer = setTimeout(() => {
       aiTradeTradabilityApi
-        .probe(instId, bar, preset)
+        .probe(instId, bar, preset, stopLossPct)
         .then((res) => {
           if (!alive) return;
           setData(res);
@@ -108,7 +117,9 @@ export default function AiTradeTradabilityFields({
       alive = false;
       clearTimeout(timer);
     };
-  }, [open, instId, bar, preset]);
+    // `stopLossPct` 进依赖：它改变的是**判据本身**（风险单位体检按它定标），不重取就等于把上一个
+    // 止损的结论贴在新止损上。既有的 350 ms debounce 已经吸收掉逐字输入的抖动。
+  }, [open, instId, bar, preset, stopLossPct]);
 
   const view = useMemo(() => describeTradability(data), [data]);
 
@@ -176,6 +187,7 @@ export default function AiTradeTradabilityFields({
             </p>
           )}
           <Numbers data={data} />
+          <BracketRow data={data} />
           <PickBarButton data={data} disabled={disabled} onPickBar={onPickBar} />
           {view.needsConfirm && (
             <ConfirmRow
@@ -206,6 +218,35 @@ function Numbers({ data }: { data: AiTradeTradabilityResponse | null }) {
   return (
     <p className="tabular text-[10px] text-[var(--muted)]" data-testid="ai-tradability-numbers">
       {parts.join(" · ")}
+    </p>
+  );
+}
+
+/**
+ * 风险单位体检行（realized-edge-calibration 轴 E-0）：**与既有可交易性结论共用同一个折叠区**。
+ *
+ * 它回答的是启动前最该说而至今没说的一句话：你设的止损离现价 500 bps，而这个周期一根 K 线的 ATR
+ * 只有 28 bps —— 风险框架和交易尺度不在一个量级上。实测 193 笔历史往返里 100% 的 |R| < 0.2、
+ * 无一笔触及过 ±1R，整套止损 / 止盈 / 利润保护武装线从未被触碰过一次。
+ *
+ * 三条纪律：① **只提示、不阻断**（启动按钮永不禁用，这一块也不参与二次确认）；② 文案与建议值
+ * 全部由后端下发，前端一个字都不重写、一次换算都不做；③ 建议值**绝不自动填进输入框**。
+ */
+function BracketRow({ data }: { data: AiTradeTradabilityResponse | null }) {
+  const bracket = data?.bracket;
+  if (!bracket) return null;          // 算不出 / 总闸关 ⇒ 整块缺席（fail-open，与探针同极性）
+  const alarming = bracket.level === "oversized";
+  return (
+    <p
+      className="rounded border px-2 py-1 text-[10px] leading-relaxed"
+      style={{
+        color: alarming ? "var(--warn, var(--short))" : "var(--muted)",
+        borderColor: alarming ? "var(--warn, var(--short))" : "var(--border)",
+      }}
+      data-testid="ai-bracket-verdict"
+      data-level={bracket.level}
+    >
+      {bracket.text}
     </p>
   );
 }

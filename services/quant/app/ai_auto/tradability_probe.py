@@ -29,7 +29,15 @@ from ..engine.indicators import atr as atr_series
 from ..okx.rest_client import get_rest_client
 from ..okx.types import BAR_SECONDS
 from .cost_runtime import CostRuntime
-from .tradability import TradabilityInputs, TradabilityVerdict, evaluate, verdict_wire
+from .sizing import parse_stop_rule, resolve_stop_distance
+from .tradability import (
+    BracketInputs,
+    TradabilityInputs,
+    TradabilityVerdict,
+    bracket_verdict,
+    evaluate,
+    verdict_wire,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +77,13 @@ async def probe(session, settings, *, inst_id: str, bar: str,
         alternatives = await _probe_alternatives(session, settings, inst_id=inst_id, bar=bar,
                                                  window=window)
     verdict = _evaluate_rows(rows, settings, inst_id=inst_id, bar=bar, alternatives=alternatives)
-    return verdict_wire(verdict, inst_id=inst_id, bar=bar, preset=preset, source=source,
+    wire = verdict_wire(verdict, inst_id=inst_id, bar=bar, preset=preset, source=source,
                         as_of_ts=(int(rows[-1]["ts"]) if rows else None),
                         alternatives=alternatives)
+    bracket = _bracket(verdict, settings)   # 轴 E-0：风险单位体检（只提示、不阻断、算不出即缺席）
+    if wire is not None and bracket is not None:
+        wire["bracket"] = bracket
+    return wire
 
 
 def _window_bars(settings) -> int:
@@ -164,6 +176,34 @@ def _preview_costs(settings, *, inst_id: str, bar: str) -> tuple[object | None, 
         return max(rows, key=lambda c: c.total_bps) if rows else None
 
     return _worst("market"), _worst("limit")
+
+
+def _bracket(verdict: TradabilityVerdict, settings) -> dict | None:
+    """轴 E-0 的装配：解出**真实**止损来源 → 喂纯核心判据。总闸关 / 算不出 ⇒ `None`（整键缺席）。
+
+    ⚠️ **止损来源必须现解，不能从配置反推**（[P1-8]）。spec §3.5.1 说它「取探针已经算出的七态」，
+    但探针**根本没有算过**这个量——`tradability._stop_series` 只算 `stop_atr_mult × ATR`，七态住在
+    `sizing_runtime._apply_stop`（决策轮里，启动期不存在）。见 spec §实施过程发现的方案缺陷 I-2。
+    故这里直接调**实盘用的同一个纯函数** `sizing.resolve_stop_distance`：它把成本下界 → 用户红线
+    → 冲突判定三段跑一遍，`plan.source` 与 `skip_reason` 合起来就是真实来源。
+
+    量纲技巧：`resolve_stop_distance` 只用到 `atr_px / ref_px` 这个比值，故传
+    `ref_px=1e4, atr_px=ATR(bps)` 即得到正确的百分比口径（尺度无关），零新增取数。
+    """
+    if not getattr(settings, "ai_trade_bracket_check_enabled", True):
+        return None
+    if verdict.level == "unknown" or verdict.atr_p50 is None:
+        return None
+    rule = parse_stop_rule(settings)
+    plan, skip = resolve_stop_distance(atr_px=verdict.atr_p50, ref_px=1e4, rule=rule,
+                                       cost_bps=verdict.cost_bps_market)
+    source = plan.source if plan is not None else (skip or "fixed")
+    return bracket_verdict(BracketInputs(
+        atr_p50_bps=verdict.atr_p50, stop_source=source,
+        stop_bps_p50=(plan.stop_bps if plan is not None else None),
+        stop_pct=float(getattr(settings, "ai_trade_default_sl_pct", 0.0) or 0.0),
+        stop_atr_mult=float(getattr(settings, "ai_trade_stop_atr_mult", 0.0) or 0.0),
+        max_atr_mult=float(getattr(settings, "ai_trade_bracket_max_atr_mult", 8.0) or 8.0)))
 
 
 async def _probe_alternatives(session, settings, *, inst_id: str, bar: str,

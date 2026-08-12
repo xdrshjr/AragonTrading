@@ -33,6 +33,11 @@ import type {
   AiTradeGroupState,
   AiTradeSessionRow,
 } from "@/lib/aiTradeTypes";
+import {
+  type AiTradeRealizedStats,
+  realizedCoverageText,
+  realizedRows,
+} from "@/lib/aiTradeProfitability";
 import { aiTradeApi } from "@/lib/aiTradeApi";
 import { ApiRequestError } from "@/lib/api";
 import { colorForReturn, fmtTime, signed } from "@/lib/format";
@@ -210,6 +215,7 @@ export default function AiTradeStatsLive() {
         />
         <ExitSourceCard exits={group.exits} />
         <ProfitCaptureCard capture={capture} />
+        <RealizedLiveCard group={group} />
         <WakeAttributionCard trips={ledger} />
         {unrealizedUsd !== null && (
           <div className="flex items-center justify-between rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs">
@@ -239,6 +245,7 @@ export default function AiTradeStatsLive() {
                   open={openRowKey === key}
                   onToggle={() => setOpenRowKey((prev) => (prev === key ? null : key))}
                   bar={group.bar}
+                  showR
                 />
               );
             })}
@@ -368,6 +375,43 @@ function HorizonLiveCard({ group, ledger }: { group: AiTradeGroupState; ledger: 
         运行期估算：按成交时间戳配对的
         <strong className="text-[var(--text)]">已完成往返</strong>
         现算，未平仓的持仓不计入；会话停止后以「历史」标签的落库值（含本层拦截计数与豁免明细）为准。
+      </p>
+    </div>
+  );
+}
+
+/**
+ * 会话级「已实现」卡（realized-edge-calibration [P1-2] 的渲染落点之二）。
+ *
+ * 与历史详情页**共用 `lib/aiTradeProfitability` 的同一套格式化器**——同一个读数在两处各写一份
+ * 口径，正是本仓库反复出事的形状。多成员时逐成员一行（比例类读数不可跨成员平均）。
+ * 样本 < 3 笔的成员整行不渲染；一个成员都渲染不出 ⇒ 整卡不出现。
+ */
+function RealizedLiveCard({ group }: { group: AiTradeGroupState }) {
+  const rows = Object.values(group.members)
+    .map((m) => ({ instId: m.instId, stats: m.session?.realized ?? null }))
+    .filter((row): row is { instId: string; stats: AiTradeRealizedStats } =>
+      realizedRows(row.stats) !== null,
+    );
+  if (rows.length === 0) return null;
+  return (
+    <div
+      className="flex flex-col gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2"
+      data-testid="ai-realized-live"
+    >
+      {/* 标题不写「估计 ↔ 实现」：本卡渲染的三项全是**已实现**侧的读数，估计与实现的对拍在轴 C
+          的校准卡（跨会话、带 coverage），一个会话的样本量撑不起那个结论。 */}
+      <span className="text-xs text-[var(--muted)]">本会话已实现（逐笔往返结算）</span>
+      {rows.map(({ instId, stats }) => (
+        <div key={instId} className="flex flex-col gap-0.5">
+          <span className="tabular text-[11px] text-[var(--text)]">
+            {instId} · {(realizedRows(stats) ?? []).map((r) => `${r.label} ${r.value}`).join(" · ")}
+          </span>
+          <span className="tabular text-[10px] text-[var(--muted)]">{realizedCoverageText(stats)}</span>
+        </div>
+      ))}
+      <p className="text-[10px] leading-relaxed text-[var(--muted)]">
+        R 倍数 = 已实现净额 ÷ 计划风险单位（开仓价到止损价的距离）；无止损或合约乘数未知的往返不进分母。
       </p>
     </div>
   );

@@ -14,6 +14,18 @@ import math
 from collections import deque
 from dataclasses import dataclass
 
+from .trip_ledger import (
+    PENDING_ESTIMATE_MAX,
+    OpenSnapshot,
+    RoundEstimate,
+    SettleContext,
+    SettledTrip,
+    merge_open_leg,
+    open_snapshot,
+    settle,
+    trip_meta_wire,
+)
+
 _CAPACITY = 200
 _ROUND_USD = 6
 _ROUND_RATIO = 4
@@ -60,6 +72,98 @@ class AttributionLedger:
         # 最近一次门禁读数（成本模型 / 粗估 edge）；门禁空转的会话恒为 None。
         self._last_cost_bps: float | None = None
         self._last_edge_bps: float | None = None
+        # ---- 轴 A（realized-edge-calibration）：估计 → 开仓断面 → 已结算往返 ----
+        # 三者与上面那个 `_trips` **并存不合并**：`_trips` 是已发布 `stats()["cost"]` 的口径来源，
+        # 动它就是追溯改写已发布 KPI。
+        self._round_estimate: RoundEstimate | None = None            # 轮级，轮末清零
+        self._pending_estimates: dict[str, RoundEstimate] = {}       # [P0-2] 按 clOrdId 的待成交槽
+        self._open: OpenSnapshot | None = None                       # 持仓周期级
+        self._settled: deque[SettledTrip] = deque(maxlen=capacity)
+
+    # ---------- 轴 A：估计的三个槽位（D-3 的错绑修复） ----------
+    def note_estimate(self, est: RoundEstimate | None) -> None:
+        """冻结本轮受门禁约束的开仓估计（**轮级**；观望 / 平仓轮拿不到 `out` ⇒ 恒 None）。"""
+        self._round_estimate = est
+
+    def claim_estimate(self, cl_ord_id: str | None) -> None:
+        """[P0-2] 下单那一刻把轮级估计移进**待成交槽**（按 `clOrdId`）。
+
+        `ai_trade_limit_orders_enabled` **默认 True**，限价开仓单会 resting 若干轮，其采纳成交由
+        盯市 tick 发出——那时轮级槽早已被 `_run_decision_round` 的 `finally` 清零。只有轮级槽的话，
+        **默认订单类型的每一笔开仓都拿不到估计**，轴 C 的问一与问三永远是空表。
+        容量上限 `PENDING_ESTIMATE_MAX`，超量按 FIFO 丢弃（挂单额度只有一个，正常只会有 1 项）。
+        """
+        if not cl_ord_id or self._round_estimate is None:
+            return
+        while len(self._pending_estimates) >= PENDING_ESTIMATE_MAX:
+            self._pending_estimates.pop(next(iter(self._pending_estimates)))
+        self._pending_estimates[str(cl_ord_id)] = self._round_estimate
+
+    def end_round(self) -> None:
+        """清零轮级槽（D-3）：一次被否的开仓意图绝不可改绑到下一笔真实往返上。"""
+        self._round_estimate = None
+
+    def _take_estimate(self, trade: dict) -> RoundEstimate | None:
+        """开仓成交认领估计：**先按 `clOrdId`**（限价跨轮），认领不到再回退轮级槽（市价恒走回退）。"""
+        cl_ord_id = trade.get("clOrdId")
+        if cl_ord_id and str(cl_ord_id) in self._pending_estimates:
+            return self._pending_estimates.pop(str(cl_ord_id))
+        return self._round_estimate
+
+    def note_open(self, trade: dict, *, seq: int, atr_px: float | None = None,
+                  now_wall: float = 0.0) -> None:
+        """建 / 续开仓断面（同一 `seq` 的第二次调用 = 部分成交 ⇒ **幂等累加**，绝不重置估计）。"""
+        if self._open is not None and self._open.seq == int(seq):
+            self._open = merge_open_leg(self._open, trade, self.ct_val)
+            return
+        self._open = open_snapshot(trade, seq=seq, now_wall=now_wall, atr_px=atr_px,
+                                   ct_val=self.ct_val, estimate=self._take_estimate(trade))
+
+    def settle_close(self, trade: dict, *, exit_source: str = "unknown") -> dict:
+        """结算本笔往返并返回 `explain.meta` 的加法键；无开仓断面 / 结算失败 ⇒ `{}`（绝不抛）。
+
+        与 `record_close` 分开的理由是**顺序**：`exitSource` 要到 `_inject_explain_meta` 的最后一步
+        才写（[P1-1]），而 `record_close` 发生在 `_dispatch` 更早的位置。故结算延后到打标之后。
+        """
+        snap, self._open = self._open, None
+        if snap is None:
+            return {}
+        trip = settle(snap, trade, SettleContext(net_mode=self.net_mode, ct_val=self.ct_val,
+                                                 exit_source=exit_source))
+        if trip is None:
+            return {}
+        self._settled.append(trip)
+        return trip_meta_wire(trip)
+
+    def settled_trips(self) -> list[SettledTrip]:
+        """会话级只读快照（轴 D 的会话段）。"""
+        return list(self._settled)
+
+    def realized_stats(self) -> dict | None:
+        """`aiStats.realized` 加法块；一笔已结算往返都没有 ⇒ `None`（整键缺席，不造空表）。"""
+        trips = list(self._settled)
+        if not trips:
+            return None
+        total = len(trips)
+        r_values = [t.r_multiple for t in trips if t.r_multiple is not None]
+        return {
+            "trips": total,
+            "medianMoveBps": _median([t.move_bps for t in trips]),
+            "medianRealizedNetBps": _median([t.realized_net_bps for t in trips]),
+            "medianRMultiple": _median(r_values),
+            # R 的分母**不是** `trips`：无止损 / 合约乘数未知的往返算不出 R。两个 R 读数与它同行
+            # 下发，否则卡片上那个中位数就是一个没有分母的比例（§一 的产品级不变式）。
+            "rSamples": len(r_values),
+            "reachedOneRShare": (round(sum(1 for v in r_values if abs(v) >= 1.0) / len(r_values),
+                                       _ROUND_RATIO) if r_values else None),
+            "medianStopAtrMult": _median([t.stop_atr_mult for t in trips]),
+            "edgeErrorMedianBps": _median([t.edge_error_bps for t in trips]),
+            "costErrorMedianBps": _median([t.cost_error_bps for t in trips]),
+            # 两个分母就是「所有新读数都必须带 coverage」这条产品级不变式的落地。
+            "estimateCoverage": round(sum(1 for t in trips if t.est_edge_bps is not None)
+                                      / total, _ROUND_RATIO),
+            "feeCoverage": round(sum(1 for t in trips if t.fee_known) / total, _ROUND_RATIO),
+        }
 
     def record_close(self, trade: dict, *, net_mode: bool | None = None) -> None:
         """记一笔平仓成交（`session._dispatch` 是全部 executor 事件的唯一收口，故在那里挂点）。
@@ -151,6 +255,16 @@ class AttributionLedger:
                 "absGrossPnlUsd": round(abs_gross, _ROUND_USD),
                 "costRatio": (round(life["fee"] / abs_gross, _ROUND_RATIO)
                               if abs_gross > 0 else None)}
+
+
+def _median(values: list) -> float | None:
+    """可得样本的中位数；一个都算不出 ⇒ `None`（`statistics.median` 对空列表会抛，端点上就是 500）。"""
+    rows = sorted(float(v) for v in values if v is not None)
+    if not rows:
+        return None
+    mid = len(rows) // 2
+    out = rows[mid] if len(rows) % 2 else (rows[mid - 1] + rows[mid]) / 2
+    return round(out, _ROUND_RATIO)
 
 
 def _t_stat(values: list[float]) -> float | None:

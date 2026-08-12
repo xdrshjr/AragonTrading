@@ -100,6 +100,12 @@ def _pair_round_trips(trades: list[Trade], cost_basis: str = "gross") -> list[_T
             trips.append(_Trip(open_trade, t, leg_fee, cost_basis))
             open_trade = None
             leg_fee = 0.0
+        else:
+            # E-1（realized-edge-calibration D-7）：**孤儿平仓**按上面 docstring 的承诺「丢弃」。
+            # 合入前它的 `fee` 已经进了 `leg_fee` 却不会被清零，于是被记到**下一笔**往返头上。
+            # 当前生产库零孤儿故未暴露；但 flatten 失败后的残留、外部干预平仓、会话重启后的补记
+            # 正是会造出孤儿平仓的路径，而本轮全部 bps 化成本读数都以 `leg_fee` 为分子。
+            leg_fee = 0.0
     return trips
 
 
@@ -151,6 +157,9 @@ def _summarize_pairs(trips: list[_Trip], total_budget_usd: float) -> dict:
         "returnPct": realized / total_budget_usd if total_budget_usd > 0 else 0.0,
         "tradeCount": count,
         "winRate": wins / count if count > 0 else 0.0,
+        # [P1-7] `wins` 是 E-2 池化所需的**分子**，纯加法键（既有键的值逐位不变，G-19 双向断言）。
+        # 靠 `round(winRate × tradeCount)` 反推分子是把浮点误差引进判据，明令禁止。
+        "wins": wins,
         "bestUsd": best,
         "worstUsd": worst,
         "feeUsd": fee_total,
@@ -443,31 +452,200 @@ def _group_comparison_row(runs: list[StrategyRun], trades_by_run: dict[int, list
     veto = sum(_num((s.get("edgeGate") or {}).get("veto")) for s in stats)
     intents = sum(_num((s.get("openFunnel") or {}).get("intents")) for s in stats)
     filled = sum(_num((s.get("openFunnel") or {}).get("filled")) for s in stats)
+    # E-2（realized-edge-calibration D-2）：返回**分子分母**而不是比值——`_summarize_preset` 求和
+    # 后再除即得池化口径。合入前这三个比例走的是「各组比值的算术平均」，而各组的分母从 1 笔到
+    # 39 笔不等（实测池化胜率 40.74% vs 等权 36.11%，差 4.63 pp）。
     return {"netPnlUsd": summary["realizedPnlUsd"], "roundTrips": summary["tradeCount"],
-            "winRate": summary["winRate"] if summary["tradeCount"] else None,
-            "edgeVetoRate": (veto / gated) if gated > 0 else None,
-            "openConversion": (filled / intents) if intents > 0 else None}
+            "wins": int(summary.get("wins") or 0),
+            "edgeGated": gated, "edgeVeto": veto,
+            "openIntents": intents, "openFilled": filled}
 
 
 def _summarize_preset(preset: str, rows: list[dict]) -> dict:
-    """一档预设的汇总：盈亏与往返数取**和**，三个比例类指标取**可得样本的均值**。
+    """一档预设的汇总：盈亏与往返数取**和**，三个比例类指标一律**池化**（Σ分子 / Σ分母）。
 
-    比例类指标绝不与「样本数」混为一谈：`samples` 是这一档有多少局历史，而比例的分母是那些
-    **真的算得出该比例**的局数——两者不等时取前者会把 `None` 当 0 平均进去。
+    `samples`（局数）与比例的分母是两个东西：前者是这一档有多少局历史，后者是这一档**全部**局
+    加起来有多少笔往返 / 多少个受约束轮。合入前取的是各局比值的算术平均，等于让一个 1 笔往返的
+    局与一个 39 笔的局对结论有**完全相同**的权重——这是一次**有意的口径变更**，卡片须标注
+    「池化口径」，老截图上的数字会变（§十一.2 已如实记账）。
     """
     return {"preset": preset, "samples": len(rows),
             "conclusive": len(rows) >= _PRESET_COMPARISON_MIN_SAMPLES,
             "netPnlUsd": sum(_num(r["netPnlUsd"]) for r in rows),
             "roundTrips": int(sum(_num(r["roundTrips"]) for r in rows)),
-            "winRate": _mean([r["winRate"] for r in rows]),
-            "edgeVetoRate": _mean([r["edgeVetoRate"] for r in rows]),
-            "openConversion": _mean([r["openConversion"] for r in rows])}
+            "winRate": _pooled_rate(rows, "wins", "roundTrips"),
+            "edgeVetoRate": _pooled_rate(rows, "edgeVeto", "edgeGated"),
+            "openConversion": _pooled_rate(rows, "openFilled", "openIntents")}
 
 
-def _mean(values: list) -> float | None:
-    """可得样本的均值；一个都算不出 ⇒ `None`（**绝不**把 `None` 当 0 平均进去）。"""
-    rows = [float(v) for v in values if v is not None]
-    return sum(rows) / len(rows) if rows else None
+def _pooled_rate(rows: list[dict], numerator: str, denominator: str) -> float | None:
+    """池化比例 `Σ分子 / Σ分母`；分母为 0 ⇒ `None`（**绝不填 0 冒充**，0 是另一个结论）。"""
+    total = sum(_num(r.get(denominator)) for r in rows)
+    if total <= 0:
+        return None
+    return sum(_num(r.get(numerator)) for r in rows) / total
+
+
+# ============ 跨会话盈利体检的取数层（realized-edge-calibration 轴 B · §3.2.2）============
+@dataclass(frozen=True)
+class TripQuery:
+    """轴 B 端点的过滤条件（[P1-11] 形参聚合，满足 CLAUDE.md 的「≤5」）。全部缺省 = 全部历史。"""
+
+    inst_id: str | None = None
+    bar: str | None = None
+    since_ts: int | None = None
+    preset: str | None = None
+    horizon_profile: str | None = None
+
+
+async def load_profitability_trips(session: AsyncSession, query: TripQuery) -> list[dict]:
+    """全部 ai-trade run 的往返样本（逐 run 分桶 → `_pair_round_trips` → 并入 explain.meta 结算键）。
+
+    **货币类键的唯一权威是追溯复算**（[P0-3]）：`netPnlUsd` / `grossPnlUsd` / `roundTripFeeUsd` /
+    `notionalUsd` / `rMultiple` / `moveBps` 六键一律由本层按 `_Trip` + `_run_cost_basis` 现算；
+    `meta` 里的同名键**只用于成交行展示**。理由：这六个键在两条路径上都算得出来，而「两条路径各算
+    一份」正是本仓库反复出事的形状——必须**先定权威、再谈对拍**。
+    `estEdgeBps` / `estCostBps` / `edgeSource` / `costConfidence` / `decisionConfidence` /
+    `wakeKind` / `stopAtrMult` 七键则**只有 `meta` 一个来源**（追溯不可得）。
+
+    **单一配对真源**：必须复用 `_pair_round_trips`（它的排序键是 `trades.id` 而非 `ts`，那条坑
+    已经踩过一次），不得另写配对。
+
+    `unitUsd` 的代数抵消是关键实现技巧：`ctVal` 不在 `trades` 表里，但
+    `grossPnl = ±(exitPx − entryPx) × qty × ctVal` ⇒ `qty × ctVal = |grossPnl| / |Δpx|`。
+    它必须与实盘结算路径产出**同一个** `notionalUsd`（G-6 双向对拍，相对误差 < 1e-6）。
+    """
+    runs = (await session.execute(
+        select(StrategyRun).where(StrategyRun.mode == _AI_TRADE_MODE)
+        .order_by(StrategyRun.id.asc()))).scalars().all()
+    runs = [r for r in runs if _run_matches(r, query)]
+    if not runs:
+        return []
+    trades_by_run = await _load_trades_by_run(session, [r.id for r in runs])
+    out: list[dict] = []
+    for run in runs:
+        cfg = _load_config(run.config_json)
+        basis, assumed = _run_cost_basis(cfg)
+        dims = _run_dimensions(run, cfg, assumed)
+        for trip in _pair_round_trips(trades_by_run.get(run.id, []), basis):
+            row = _trip_row(trip, dims)
+            if row is not None and _row_matches(row, query):
+                out.append(row)
+    return out
+
+
+def _run_matches(run: StrategyRun, query: TripQuery) -> bool:
+    """run 级过滤（标的 / 周期 / 起始时间）；`bar` 从 `config.bar` 取（`StrategyRun` 无该列）。"""
+    if query.inst_id and run.inst_id != query.inst_id:
+        return False
+    if query.since_ts and int(run.group_started_ts or run.start_ts or 0) < int(query.since_ts):
+        return False
+    return not (query.bar and _run_bar(run) != query.bar)
+
+
+def _row_matches(row: dict, query: TripQuery) -> bool:
+    """trip 级过滤（预设 / 周期模式）：缺该维度的往返在**指定了该过滤条件**时不计入。"""
+    if query.preset and row.get("preset") != query.preset:
+        return False
+    return not (query.horizon_profile and row.get("horizonProfile") != query.horizon_profile)
+
+
+def _run_bar(run: StrategyRun) -> str | None:
+    return _load_config(run.config_json).get("bar") or None
+
+
+def _run_dimensions(run: StrategyRun, cfg: dict, assumed: bool) -> dict:
+    """run 级维度（切片用）：标的 / 周期 / 预设 / 周期模式 / 口径是否为推定。"""
+    stats = (_load_config(run.metrics_json).get("aiStats") or {})
+    horizon = cfg.get("tradingHorizon") or {}
+    return {"instId": run.inst_id, "bar": cfg.get("bar") or None,
+            "preset": stats.get("disciplinePreset") or "unknown",
+            "horizonProfile": (horizon.get("profile") if isinstance(horizon, dict) else None),
+            "costBasisAssumed": bool(assumed)}
+
+
+def _trip_row(trip: _Trip, dims: dict) -> dict | None:
+    """一笔往返的归一 dict（轴 B/C 纯核心的输入）；价不可用 ⇒ None（不产出一个算不出分母的样本）。"""
+    entry_px = float(trip.entry.price or 0.0)
+    exit_px = float(trip.exit.price or 0.0)
+    if entry_px <= 0 or exit_px <= 0:
+        return None
+    net, gross = trip.net_pnl, trip.gross_pnl
+    move = abs(exit_px - entry_px)
+    # `unitUsd = qty × ctVal`：位移为 0 或毛额为 0 的往返算不出来（实测 193 笔里仅 2 笔）。
+    unit = (abs(gross) / move) if (move > 0 and gross != 0) else None
+    notional = entry_px * unit if unit else None
+    fee = float(trip.leg_fee_usd or 0.0)
+    fee_known = _fee_known(trip)
+    stop_px = trip.entry.stop_loss_price
+    stop_distance = abs(entry_px - float(stop_px)) if stop_px else 0.0
+    risk = (stop_distance * unit) if (unit and stop_distance > 0) else None
+    meta = _trip_meta(trip)
+    gross_bps = (gross / notional * 1e4) if notional else None
+    cost_bps = (fee / notional * 1e4) if (notional and fee_known) else None
+    return {
+        **dims,
+        "netPnlUsd": net, "grossPnlUsd": gross,
+        "roundTripFeeUsd": fee if fee_known else None, "feeKnown": fee_known,
+        "notionalUsd": notional,
+        "moveBps": move / entry_px * 1e4,
+        "stopBps": (stop_distance / entry_px * 1e4) if stop_distance > 0 else None,
+        "realizedGrossBps": gross_bps,
+        "realizedNetBps": (net / notional * 1e4) if notional else None,
+        "realizedCostBps": cost_bps,
+        "riskUsd": risk, "rMultiple": (net / risk) if risk else None,
+        "plannedRr": _planned_rr(trip, entry_px, stop_distance),
+        "holdSeconds": max(0, int(trip.exit.ts or 0) - int(trip.entry.ts or 0)),
+        # [P1-1] `exitSource` **只读** `explain.meta` 那唯一一处打的标；查询侧同样不得另判。
+        "exitSource": str(meta.get("exitSource") or "unknown"),
+        "stopAtrMult": meta.get("stopAtrMult"),
+        "estEdgeBps": meta.get("estEdgeBps"), "estCostBps": meta.get("estCostBps"),
+        # 两条误差是**派生量**：分子取本层现算的已实现 bps（货币类键的权威在本层），分母侧的估计
+        # 只有 `meta` 一个来源。缺估计 ⇒ None ⇒ 该笔不进轴 C 的分母（而不是按 0 计入）。
+        "edgeErrorBps": _error_bps(gross_bps, meta.get("estEdgeBps")),
+        "costErrorBps": _error_bps(cost_bps, meta.get("estCostBps")),
+        "edgeSource": meta.get("edgeSource"), "costConfidence": meta.get("costConfidence"),
+        "decisionConfidence": meta.get("decisionConfidence"), "wakeKind": meta.get("wakeKind"),
+    }
+
+
+def _fee_known(trip: _Trip) -> bool:
+    """这笔往返到底有没有费率记录（[P0-4]）。
+
+    ⚠️ 追溯路径**分辨不出**「记了一个 0」与「根本没记」：`trades.fee` 是**非空**列，费率记账
+    2026-07-26 才上线，之前的行一律落 `0.0`。故这里的判据是「双腿都非空 **且** 区间腿费 > 0」，
+    与 §附录 A.5 的复算脚本（`if lf > 0`）逐字同构。实盘结算路径（`trip_ledger._leg_fee`）能靠
+    「`fee` 这个键在不在成交 dict 里」分辨，故那边保留了「真实零费率也算已知」的语义——
+    两条路径的判据不同**是有意的**，因为它们手上的信息本来就不一样。
+    """
+    if trip.entry.fee is None or trip.exit.fee is None:
+        return False
+    return float(trip.leg_fee_usd or 0.0) > 0
+
+
+def _error_bps(realized: float | None, estimate) -> float | None:
+    """`已实现 − 估计`；任一缺席 / 非有限 ⇒ `None`。"""
+    if realized is None or estimate is None:
+        return None
+    try:
+        value = float(estimate)
+    except (TypeError, ValueError):
+        return None
+    return realized - value if value == value else None
+
+
+def _planned_rr(trip: _Trip, entry_px: float, stop_distance: float) -> float | None:
+    take_px = trip.entry.take_profit_price
+    if not take_px or stop_distance <= 0:
+        return None
+    return abs(float(take_px) - entry_px) / stop_distance
+
+
+def _trip_meta(trip: _Trip) -> dict:
+    """平仓腿 `explain_json` 的 `meta`（坏 JSON / 缺列 ⇒ `{}`，与既有 `run_out` 容错一致）。"""
+    envelope = _load_config(getattr(trip.exit, "explain_json", None))
+    meta = envelope.get("meta")
+    return meta if isinstance(meta, dict) else {}
 
 
 async def reconcile_orphan_ai_trade_runs(session: AsyncSession) -> int:

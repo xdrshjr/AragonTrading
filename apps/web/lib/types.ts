@@ -300,6 +300,13 @@ export interface TriggerExplain {
     // 只打在 AI 决策**直接**产生的成交上（atomic / reverse）；保护层平仓 / 会话止损 / 外部干预
     // 由确定性层触发、与唤醒无关，按设计缺席——那不是缺陷，打上去反而会让胜率归因整体失真。
     wakeKind?: string;
+    /**
+     * 本笔往返的 R 倍数（realized-edge-calibration 轴 A）。**实时通道只有这里读得到**：
+     * executor 成交 dict 的顶层键集是冻结的（`test_ai_trade_fee_ledger._BASE_OPEN_KEYS`），
+     * 新键只能搭 explain 信封；历史通道另由 `trade_out` 提到 `Trade.rMultiple` 顶层。
+     * 两处都走 `readRMultiple()` 这一个读点，绝不在渲染点各写一份兜底链。
+     */
+    rMultiple?: number | null;
   };
 }
 
@@ -331,6 +338,12 @@ export interface Trade {
    * 「峰值就是 0」，把捕获率算成 0 或 ∞）。开仓成交无此字段。
    */
   peakPnlUsd?: number | null;
+  /**
+   * 本笔往返的 R 倍数 = 已实现净额 / 计划风险单位（|开仓价 − 止损价| × 张数 × 合约乘数）。
+   * 与 `wallTs` / `peakPnlUsd` 同款范式：搭 `explain` 信封落库、`trade_out` 提回顶层。
+   * 无止损 / 合约乘数未知 / 老数据 ⇒ `null`——**绝不是 0**（一个被 0 兜底的 R 比没有 R 更糟）。
+   */
+  rMultiple?: number | null;
   stopLossPct?: number | null;
   takeProfitPct?: number | null;
   maxHoldBars?: number | null;

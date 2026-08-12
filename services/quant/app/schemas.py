@@ -1261,6 +1261,10 @@ class AiTradeTradabilityOut(BaseModel):
     vetoRate: dict | None = None
     stopBps: dict | None = None
     stopInsideCostRate: dict | None = None
+    # [P0-6] 风险单位体检（realized-edge-calibration 轴 E-0）。**必须在此显式声明**——本模型是一张
+    # 显式字段清单，未声明的 wire 键会被 `response_model` 静默裁掉，那一轴上线即死键（见上方 ⚠️）。
+    # 用 `dict | None` 而不是嵌套模型，理由同上一段。算不出 ⇒ `None`。
+    bracket: dict | None = None
     alternatives: list[dict] = Field(default_factory=list)
     headline: str = ""
     advice: str | None = None
@@ -1285,6 +1289,30 @@ class AiTradePresetComparisonOut(BaseModel):
 
     groups: list[AiTradePresetComparisonGroup] = Field(default_factory=list)
     minSamples: int
+
+
+class AiTradeProfitabilityOut(BaseModel):
+    """GET /ai-trade/history/profitability 响应（realized-edge-calibration §5.1）。
+
+    五条契约纪律：① 算不出的量一律 `null`，**绝不填 0**；② 每个比例类读数所在的对象必带它自己的
+    分母（`trips` / `n` / `coverage` / `rSamples` / `feeTrips`）；③ `verdict.detail` 由后端生成
+    （前端不拼数字）；④ 口径推定用 `costBasisAssumedTrips`（**计数**，不是布尔——布尔表达不了
+    「89% 的样本靠推定」这件事）；⑤ `medianCostBps` / `travelToCostRatio` 与 `feeCoverage`
+    **必须在同一个对象里**下发。
+
+    ⚠️ 子块一律用 `dict` / `list[dict]` 宽类型（同 `AiTradeTradabilityOut` 的成文理由）：
+    `response_model` 会静默吞掉未声明的 wire 键，宽类型可保证后端新增读数时不会被悄悄裁掉。
+    """
+
+    sampleTrips: int
+    minTrips: int
+    conclusive: bool
+    costBasisAssumedTrips: int = 0
+    pooled: dict = Field(default_factory=dict)
+    risk: dict = Field(default_factory=dict)
+    slices: dict = Field(default_factory=dict)
+    calibration: dict = Field(default_factory=dict)
+    verdict: dict = Field(default_factory=dict)
 
 
 class AiTradeHistorySummary(BaseModel):
@@ -1398,6 +1426,10 @@ def trade_out(t: Trade) -> dict:
         # `session._inject_explain_meta` 搭 explain 信封落库，在此提回顶层；老数据缺键 ⇒ None ⇒
         # 前端一律 `wallTs ?? ts` 兜底。
         "wallTs": ((envelope or {}).get("meta") or {}).get("wallTs"),
+        # realized-edge-calibration 轴 A：往返行要显示的那一列。与上面 `wallTs` 逐字同款——搭
+        # explain 信封落库、读侧在此提回顶层；其余结算键由查询层直接读 `explain.meta`。
+        # 老数据 / 总闸关 / 算不出（无止损、ct_val 未知）⇒ None ⇒ 前端整列不渲染，**绝不填 0**。
+        "rMultiple": ((envelope or {}).get("meta") or {}).get("rMultiple"),
         # explain 键恒在（缺列 / 坏 JSON → None），与既有恒含全键风格一致（§5.2 / P2-6）。
         "explain": _public_explain(envelope),
     }

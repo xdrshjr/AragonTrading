@@ -1019,8 +1019,10 @@ from .weight_batch_repositories import (  # noqa: E402,F401
 # ai_auto_repositories：AI 自动交易「历史会话」按 group_id 聚合读端点 + 启动期孤儿对账
 # （ai-trade-stats-dashboard §3.4/§3.5；自包含镜像 live_auto 版，不 import 在制模块，调用点仍用 repo.X）。
 from .ai_auto_repositories import (  # noqa: E402,F401
+    TripQuery,
     get_ai_trade_group_detail,
     list_ai_trade_groups,
     list_ai_trade_preset_comparison,
+    load_profitability_trips,
     reconcile_orphan_ai_trade_runs,
 )

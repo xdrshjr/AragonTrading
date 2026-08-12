@@ -74,6 +74,7 @@ from .signals import (
     make_shadow_broker,
 )
 from .sizing_runtime import SizingRuntime
+from .track_record import TrackRecordRuntime
 from .trace import (
     _TRACES_MAX,
     TraceEmit,
@@ -139,7 +140,8 @@ class AiTradeSession:
                  prior_snapshot: dict | None = None,
                  sizing: SizingRuntime | None = None,
                  horizon_rule: HorizonRule | None = None,
-                 discipline_preset: str = "off"):
+                 discipline_preset: str = "off",
+                 track_record: dict | None = None):
         self.session_id = session_id
         self.run_id = run_id
         self._specs = specs
@@ -199,6 +201,10 @@ class AiTradeSession:
         self._prior = PriorRuntime(prior_snapshot, executor.settings, horizon_bars=hold_bars)
         # 仓位 / 刹车层（vol-sizing §3.1）：同款下沉；未装配 ⇒ 零动作、无 sizingPlan 键、risk 从不被赋值。
         self._sizing = sizing or SizingRuntime()
+        # 实测战绩回喂（realized-edge-calibration 轴 D）：同款「运行时对象 + inject(payload)」范式；
+        # 四条门禁任一不满足 ⇒ payload 无 trackRecord 键 ⇒ prompt 逐字节回退。会话段每轮现算（零 IO）。
+        self._track = TrackRecordRuntime(track_record, executor.settings,
+                                         self._cost.attribution.settled_trips)
         # 生效纪律自检（discipline-preset §3.2）：同款下沉门面，须排在上面各运行时之后（它持它们的引用）。
         self._discipline = DisciplineRuntime(self, preset_id=discipline_preset)
         # P0-1：会话级单调持仓序号——`_dispatch` 观察到任一 `side=="close"` 成交即 +1。epoch 身份的一半，
@@ -327,7 +333,8 @@ class AiTradeSession:
                     self._horizon.note_open(trade, time.time(), seq=self._position_seq)
                     self._repair.note_epoch(self._position_seq)   # 新持仓周期 ⇒ 补挂配额清零
                     self._backstop.force_next()   # 随单 OCO 是否真的挂上，是开仓后最该立刻知道的事
-                    self._cost.note_open(trade, seq=self._position_seq, now_wall=time.time())
+                    self._cost.note_open(trade, seq=self._position_seq, now_wall=time.time(),
+                                         atr_px=self._atr_px)   # 轴 A：冻结开仓断面（含 stopAtrMult）
                 self._sizing.note_executor(self.executor, self._current_px())   # [P1-8] 敞口簿
                 self._inject_explain_meta(trade)
                 await self._persist_trade(trade)
@@ -361,6 +368,9 @@ class AiTradeSession:
         if (trade.get("side") == "close"
                 and self.executor.settings.ai_trade_exit_attribution_enabled):
             meta.setdefault("exitSource", classify_live(explain))
+        # 轴 A 往返结算（realized-edge-calibration §3.1.1）：**必须在 exitSource 打标之后**——本层
+        # 只读那个键、绝不自己再判一次（[P1-1]）。总闸关 / 非平仓 / 无开仓断面 ⇒ 空转 ⇒ meta 逐字回退。
+        self._cost.apply_trip_meta(meta, trade)
         explain["meta"] = meta
 
     async def _persist_trade(self, trade: dict) -> None:
@@ -812,6 +822,7 @@ class AiTradeSession:
         finally:
             self._deciding = False
             self._discipline.funnel.end_round()   # R-12：轮级标志兜底清零（异常路径也走这里）
+            self._cost.end_round()   # 轴 A：轮级估计同址清零（D-3：被否的意图绝不改绑到下一笔往返）
             self._maybe_catchup_wake()       # 轴 A：纯同步，check→claim 之间无 await
 
     def _maybe_catchup_wake(self) -> None:
@@ -1107,6 +1118,8 @@ class AiTradeSession:
             await self._emit_cost_snapshot(round_no)
             return decision, degrade
         await self._emit_edge_gate_trace(round_no, ts, out)
+        # 轴 A 轮级估计：写点必须在**本函数内部**——`out` 是函数局部量，调用点只拿得到二元组（[P0-1]）。
+        self._cost.note_estimate(out, decision, self._wake.last_round_kind)
         return out.decision, (degrade or out.reason)
 
     async def _emit_edge_gate_trace(self, round_no: int, ts: int, out) -> None:
@@ -1174,6 +1187,7 @@ class AiTradeSession:
                                                order_plan=order_plan)
             events += await self.executor.reconcile(ref_px, ts)
         await self._dispatch(events)
+        self._cost.claim_estimate(self.executor.resting)   # [P0-2] 限价开仓单：估计随 clOrdId 冻结
         await self._push_status_if_side_changed()
         traded = any(e.get("type") == "trade" for e in events)
         return {"ok": True, "action": decision.action, "skipped": False, "traded": traded,
@@ -1473,6 +1487,7 @@ class AiTradeSession:
         self._cost.set_prior_view(self._prior.coverage_wire())   # P1-3：两条快照通道同源
         self._cost.inject(payload, last_px=ref_px, atr_px=self._atr_px,
                           bar_seconds=BAR_SECONDS[self.bar])     # 轴 D：总闸关 ⇒ 整键缺席
+        self._track.inject(payload)             # 实测战绩：同款「整键缺席」范式（realized-edge 轴 D）
         # 唤醒原因 + 战术周期证据 + 两个披露档（wake-aware-context §2.6）：三总闸各管自己的键，
         # 关闭即**整键缺席**（不是 None）⇒ prompt 渲染与既有 payload 冻结断言逐字节回退。
         self._wake.inject(payload, InjectionContext(
@@ -1634,6 +1649,10 @@ class AiTradeSession:
                 "tradability": self._discipline.tradability_status(),
                 "openFunnel": self._discipline.funnel_wire(),
                 "summaryHealth": self.decider.summary_health_wire(),
+                # 轴 A 已实现读数（realized-edge-calibration [P1-2]）：**必须挂在这里**，不能只走
+                # `costSnapshot`——那条通道只在 `k_min<=0`（门禁空转）时才发，装了纪律预设的会话
+                # 一次都收不到（见 spec §实施过程发现的方案缺陷 I-3）。零往返 ⇒ None ⇒ 整段不渲染。
+                "realized": self._cost.realized_stats(),
                 **self._wake.status_counts(self._preview.stats()),   # 调度四计数（A-6 同源）
                 "holdStreak": self.hold_streak,
                 # F2 冷却三载体之一（§4.2）：**不挂 position**——冷却期内按定义已无持仓。
@@ -1733,6 +1752,9 @@ class AiTradeSession:
             metrics["aiStats"] = self._horizon.merge_into(metrics["aiStats"])  # §2.12 验收指标
             metrics["aiStats"].update(ai_stats_keys(self.acceptance_bundle()))  # 验收闭环四键
             metrics["aiStats"] = self._discipline.merge_into(metrics["aiStats"])  # 纪律预设观测
+            # [P1-9] 本会话到底有没有把历史战绩喂给模型——任何一次事后对账都要能按「有没有喂」分臂
+            # （负期望战绩每轮回喂的最坏结果是模型再也不开单，本仓库已复发 4 次）。
+            metrics["aiStats"]["trackRecordShown"] = self._track.shown
         except Exception as exc:  # noqa: BLE001 —— 富化对 finalize 是加法且可失败，绝不阻断落库收尾
             logger.warning("ai-trade finalize enrichment skipped for run %s: %s", self.run_id, exc)
             for key in ("equityDigest", "decisionsDigest", "aiStats"):

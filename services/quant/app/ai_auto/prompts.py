@@ -594,6 +594,14 @@ def _format_profit_hold_note(payload: dict) -> str:
     return format_profit_hold_note(payload.get("profitGuard"), rounds)
 
 
+def _format_track_record(wire: dict | None) -> str:
+    """实测战绩段；键缺失 ⇒ 空串 ⇒ 整段省略。全文在 `track_record`，本函数不做任何算术。"""
+    if not wire:
+        return ""
+    from .track_record import format_track_record_text   # 延迟导入，同 _format_base_rules
+    return format_track_record_text(wire)
+
+
 def build_decision_prompt(payload: dict) -> str:
     """把本轮决策输入（体制/共识 + 信号板 + 真实持仓 + 会话盈亏 + 摘要）压成紧凑文本喂决策器。
 
@@ -650,6 +658,9 @@ def build_decision_prompt(payload: dict) -> str:
     priors_line = _format_signal_priors(payload.get("signalPriors"))
     if priors_line:                          # 证据相邻性：共识 → 共识的历史质量 → 行情证据
         parts.append(priors_line)
+    track_line = _format_track_record(payload.get("trackRecord"))
+    if track_line:                           # 键缺失 ⇒ 整段省略（四条装配门禁任一不过 / 回测 payload）
+        parts.append(track_line)
     parts.extend(_digest_lines(payload))     # R1：各段 None 时整段省略（同 E1/E2 降级范式）
     # 战术周期段（时间尺度由远及近单调收缩）：中线背景 → 体制 → 共识 → 先验 → 执行周期证据 →
     # **战术周期** → 基础策略铁律 → 信号板 → 摘要，与系统 prompt 的思维链步骤同序。

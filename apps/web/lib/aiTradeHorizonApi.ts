@@ -39,13 +39,18 @@ export const aiTradeDisciplineApi = {
 // 可交易性预检（tradability-and-open-funnel 轴 A）。同一条纪律：**只读、不守总闸、判据与文案
 // 全部由后端下发**。后端保证「取数失败也回 200 + `level:"unknown"`」，故这里的非 2xx 是真故障。
 export const aiTradeTradabilityApi = {
+  // `slPct` 是弹窗里单仓止损那一格的现值（fraction，留空即用服务端默认）：风险单位体检要判的是
+  // 「按下启动键之后真正会挂出去的那个止损」，而启动路径取的正是这一格——不传等于让体检照着出厂
+  // 默认说话，用户改过止损之后看到的就是一个与自己无关的数。
   probe: async (
     instId: string,
     bar: string,
     preset?: string | null,
+    slPct?: number | null,
   ): Promise<AiTradeTradabilityResponse> => {
     const params = new URLSearchParams({ instId, bar });
     if (preset) params.set("preset", preset);
+    if (slPct != null && Number.isFinite(slPct) && slPct > 0) params.set("slPct", String(slPct));
     const res = await fetch(`${BASE}/ai-trade/tradability?${params.toString()}`, {
       cache: "no-store",
     });

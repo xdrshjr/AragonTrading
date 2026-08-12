@@ -6,7 +6,9 @@ import { Badge, Button, Skeleton } from "@/components/ui";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
 import type { AiTradeHistoryEntry } from "@/lib/aiTradeHistoryTypes";
 import { colorForReturn, fmtPct, fmtTime, signed } from "@/lib/format";
+import CalibrationCard from "./CalibrationCard";
 import PresetComparisonCard from "./PresetComparisonCard";
+import ProfitabilityCard from "./ProfitabilityCard";
 
 const PAGE_SIZE = 20;
 
@@ -40,43 +42,49 @@ export default function AiTradeStatsHistoryList({ onSelect }: { onSelect: (group
   const data = query.data;
   const items = data?.items ?? [];
   const total = data?.total ?? 0;
-
-  if (items.length === 0) {
-    return (
-      <p className="px-3 py-10 text-center text-xs leading-relaxed text-[var(--muted)]">
-        暂无历史 AI 自动交易记录。启动并停止一次 AI 自动交易后，本组的完整收益概况会持久保存在这里，可随时回溯。
-      </p>
-    );
-  }
-
   const hasPrev = offset > 0;
   const hasNext = offset + items.length < total;
   return (
     <div className="flex flex-col gap-2">
+      {/* realized-edge-calibration [P1-4]：三张跨会话卡必须挂在 `items.length === 0` 的空态早返回
+          **之前**——`/ai-trade/history` 会排除**正在运行**的那一组，只跑过一组的用户在会话运行期间
+          整页恒空，卡一张都看不到。空态文案因此下移为**列表区**的空态，而不是整页的空态。 */}
+      <ProfitabilityCard />
+      <CalibrationCard />
       {/* 历史纪律预设对照（tradability-and-open-funnel 轴 E）：挂在列表**顶部**——「哪一档更赚」
           是用户翻历史时的第一个问题，答案不该藏在几十张卡片下面。无历史 ⇒ 整卡不渲染。 */}
       <PresetComparisonCard />
-      {items.map((item) => (
-        <HistoryCard key={item.groupId} entry={item} onSelect={() => onSelect(item.groupId)} />
-      ))}
-      <div className="flex items-center justify-between pt-1 text-[11px] text-[var(--muted)]">
-        <span className="tabular">
-          共 {total} 次 · 第 {Math.floor(offset / PAGE_SIZE) + 1} 页
-        </span>
-        <div className="flex items-center gap-2">
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={!hasPrev}
-            onClick={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}
-          >
-            上一页
-          </Button>
-          <Button variant="ghost" size="sm" disabled={!hasNext} onClick={() => setOffset((o) => o + PAGE_SIZE)}>
-            下一页
-          </Button>
+      {items.length === 0 ? (
+        <p className="px-3 py-10 text-center text-xs leading-relaxed text-[var(--muted)]">
+          暂无历史 AI 自动交易记录。启动并停止一次 AI 自动交易后，本组的完整收益概况会持久保存在这里，可随时回溯。
+        </p>
+      ) : (
+        items.map((item) => (
+          <HistoryCard key={item.groupId} entry={item} onSelect={() => onSelect(item.groupId)} />
+        ))
+      )}
+      {/* 零历史时不挂翻页条：空态文案下面跟一句「共 0 次 · 第 1 页」与两个禁用按钮，是把
+          「这里什么都还没有」说成了「这一页什么都没有」。 */}
+      {total > 0 && (
+        <div className="flex items-center justify-between pt-1 text-[11px] text-[var(--muted)]">
+          <span className="tabular">
+            共 {total} 次 · 第 {Math.floor(offset / PAGE_SIZE) + 1} 页
+          </span>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={!hasPrev}
+              onClick={() => setOffset((o) => Math.max(0, o - PAGE_SIZE))}
+            >
+              上一页
+            </Button>
+            <Button variant="ghost" size="sm" disabled={!hasNext} onClick={() => setOffset((o) => o + PAGE_SIZE)}>
+              下一页
+            </Button>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

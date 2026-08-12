@@ -89,7 +89,7 @@ describe("AiTradeTradabilityFields", () => {
     rerender(<AiTradeTradabilityFields {...{ ...props, bar: "15m" }} />);
     await advance(400);
     expect(probe).toHaveBeenCalledTimes(1);
-    expect(probe).toHaveBeenCalledWith("BTC-USDT-SWAP", "15m", "balanced");
+    expect(probe).toHaveBeenCalledWith("BTC-USDT-SWAP", "15m", "balanced", null);
   });
 
   it("切换 bar 之后重新取一次（G-4）", async () => {
@@ -100,7 +100,17 @@ describe("AiTradeTradabilityFields", () => {
     rerender(<AiTradeTradabilityFields {...{ ...props, bar: "1H" }} />);
     await advance(400);
     expect(probe).toHaveBeenCalledTimes(2);
-    expect(probe).toHaveBeenLastCalledWith("BTC-USDT-SWAP", "1H", "balanced");
+    expect(probe).toHaveBeenLastCalledWith("BTC-USDT-SWAP", "1H", "balanced", null);
+  });
+
+  it("改止损之后重新取一次，并把那一格的现值带下去（风险单位体检必须按真正会挂的止损定标）", async () => {
+    const { rerender, props } = renderFields();
+    await advance(400);
+    expect(probe).toHaveBeenLastCalledWith("BTC-USDT-SWAP", "1m", "balanced", null);
+    rerender(<AiTradeTradabilityFields {...{ ...props, stopLossPct: 0.01 }} />);
+    await advance(400);
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(probe).toHaveBeenLastCalledWith("BTC-USDT-SWAP", "1m", "balanced", 0.01);
   });
 
   it("infeasible ⇒ 红色结论 + 后端原文建议 + 二次确认；启动按钮不由本组件禁用", async () => {

@@ -29,6 +29,7 @@ from .funding_ledger import FundingLedger
 from .reconcile import (build_reconciliation, drift_message, local_net_view,
                         resolve_reconcile_params)
 from .stats_ext import build_cost_stats, cost_snapshot_wire, merge_cost_stats
+from .trip_ledger import build_round_estimate
 
 logger = logging.getLogger(__name__)
 
@@ -469,14 +470,70 @@ class CostRuntime:
         """记一个决策轮及其是否落到成交（决策转化率，§6.3）。"""
         self.attribution.note_round(executed)
 
-    def note_open(self, trade: dict, *, seq: int, now_wall: float) -> None:
-        """记一笔开仓成交（轴 A：建 / 续资金费 epoch，身份 `(side, seq)` 与 horizon 同源）。"""
+    def note_open(self, trade: dict, *, seq: int, now_wall: float,
+                  atr_px: float | None = None) -> None:
+        """记一笔开仓成交（轴 A：建 / 续资金费 epoch，身份 `(side, seq)` 与 horizon 同源）。
+
+        `atr_px` 为 realized-edge-calibration 轴 A 新增（开仓那一刻的确认根 ATR，用于 `stopAtrMult`）；
+        留空即不产出该读数，既有调用点零改动。
+        """
         self.funding_ledger.note_open(trade, seq=seq, now_wall=now_wall)
+        self.attribution.note_open(trade, seq=seq, atr_px=atr_px, now_wall=now_wall)
 
     def record_close(self, trade: dict) -> None:
         """记一笔平仓成交（`session._dispatch` 是全部 executor 事件的唯一收口）。"""
         self.attribution.record_close(trade)
         self.funding_ledger.note_close(trade, time.time())
+
+    # ---------- 轴 A（realized-edge-calibration）：四个薄转发 ----------
+    def note_estimate(self, out, decision, wake_kind: str | None) -> None:
+        """冻结本轮门禁估计（轮级）；总闸关 ⇒ 空转 ⇒ `explain.meta` 逐字回退。
+
+        估计的**装配**在 `trip_ledger.build_round_estimate`（模块级纯函数），故 `session.py` 里
+        既不拼 dict 也不必 import 那个函数——它的净增预算是硬验收判据。
+        """
+        if self.settings.ai_trade_trip_ledger_enabled:
+            self.attribution.note_estimate(build_round_estimate(out, decision, wake_kind))
+
+    def claim_estimate(self, resting) -> None:
+        """[P0-2] 下单那一刻按 `clOrdId` 冻结估计；非**开仓**挂单 / 无挂单 ⇒ 空转。
+
+        入参是 `executor.resting`（`RestingOrder | None`）而不是一个 `clOrdId` 字符串：
+        `_execute_decision` 的回执 dict 里**没有** `clOrdId` 这个键（见 spec §实施过程发现的方案缺陷
+        I-1），挂单的委托号只在 `executor.resting` 上。属性按鸭子类型读，本层不 import 那个类型。
+        """
+        if getattr(resting, "intent", None) == "open":
+            self.attribution.claim_estimate(str(getattr(resting, "cl_ord_id", "") or ""))
+
+    def end_round(self) -> None:
+        """清零轮级估计槽（D-3 的错绑修复；异常路径同样走这里）。"""
+        self.attribution.end_round()
+
+    def apply_trip_meta(self, meta: dict, trade: dict) -> None:
+        """把本笔往返的结算读数搬进 `explain.meta`（**在 `exitSource` 打标之后**，[P1-1]）。
+
+        非平仓成交 / 总闸关 / 无开仓断面 ⇒ 空转 ⇒ meta 逐字回退。`exit_source` **只读不判**——
+        本层绝不调 `classify_live`（那会造出第二个分类现场并绕过 `exit_attribution` 的总闸）。
+
+        **这一处的 `try/except` 不是噪音**（R-1）：调用点在 `session._inject_explain_meta`，而它跑在
+        `_dispatch → _persist_trade` 之间——真实资金的成交落库路径上。结算是**富化**，落库是**账实
+        相符**；一次富化异常绝不允许换来一笔没有记录的真实成交。范式沿用 `_finalize_run` 的富化
+        best-effort（`session.py`）：最坏只丢这几个键，成交照常落库。
+        """
+        if trade.get("side") != "close" or not self.settings.ai_trade_trip_ledger_enabled:
+            return
+        try:
+            wire = self.attribution.settle_close(
+                trade, exit_source=str(meta.get("exitSource") or "unknown"))
+        except Exception as exc:  # noqa: BLE001 —— 见上：富化绝不阻断真实成交落库
+            logger.warning("ai-trade trip settlement skipped: %s", exc)
+            return
+        for key, value in wire.items():
+            meta.setdefault(key, value)
+
+    def realized_stats(self) -> dict | None:
+        """`aiStats.realized` / `costSnapshot.realized` 的唯一产出点（两条通道同源）。"""
+        return self.attribution.realized_stats()
 
     # ---------- 轴 A：资金费账本的只读出口 ----------
     def funding_stats(self) -> dict | None:
@@ -517,16 +574,27 @@ class CostRuntime:
 
     # ---------- 统计（会话内快照与落库富化出自同一 build_cost_stats）----------
     def snapshot(self) -> dict:
-        return self._with_prior(build_cost_stats(
+        return self._with_realized(self._with_prior(build_cost_stats(
             self.attribution.stats(), self.fee_ledger,
-            fee_rates=self.fee_rates.wire(time.time()), reconcile=self.last_reconcile))
+            fee_rates=self.fee_rates.wire(time.time()), reconcile=self.last_reconcile)))
 
     def snapshot_if_due(self, round_no: int) -> dict | None:
         """L0/L1 通道的节流快照（§5.4）；未到轮次 ⇒ `None`。"""
         snap = cost_snapshot_wire(round_no, self.attribution.stats(), self.fee_ledger,
                                   fee_rates=self.fee_rates.wire(time.time()),
                                   reconcile=self.last_reconcile)
-        return None if snap is None else self._with_prior(snap)
+        return None if snap is None else self._with_realized(self._with_prior(snap))
+
+    def _with_realized(self, stats: dict) -> dict:
+        """并入轴 A 的已实现读数（两条快照通道同源）；一笔已结算往返都没有 ⇒ **整键缺席**。
+
+        走既有 `costSnapshot` 通道而不是新增一个 WS `status` 键，是为了少一个「后端算了但没有
+        渲染落点」的机会（本仓库最高频的缺陷形状）。落库侧经 `merge_into` 自动带进 `aiStats`。
+        """
+        realized = self.realized_stats()
+        if realized is not None:
+            stats["realized"] = realized
+        return stats
 
     def _with_prior(self, stats: dict) -> dict:
         """并入先验覆盖率读数（两条通道同源，P1-3）；未回灌视图 ⇒ 两键**缺席**而非 None。

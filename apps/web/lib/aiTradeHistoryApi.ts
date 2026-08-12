@@ -4,6 +4,7 @@
 // 复用 ./api 的 ApiRequestError；不引用任何不存在的 helper。历史为一次性只读拉取，无 WS。
 import { ApiRequestError } from "./api";
 import type { AiTradeHistoryDetailOut, AiTradeHistoryListOut } from "./aiTradeHistoryTypes";
+import type { AiTradeProfitabilityResponse } from "./aiTradeProfitability";
 import type { AiTradePresetComparisonResponse } from "./aiTradeTypes";
 
 const BASE = "/api/py";
@@ -38,4 +39,12 @@ export const aiTradeHistoryApi = {
   // 后端按 `aiStats.disciplinePreset` 分组聚合；`conclusive=false` 的组必须显式写「样本不足」。
   presetComparison: () =>
     get<AiTradePresetComparisonResponse>("/ai-trade/history/preset-comparison"),
+  // 跨会话盈利体检（realized-edge-calibration 轴 B/C）：**池化**口径的历史统计 + 校准三问。
+  // 全部过滤参数可选，缺省 = 全部历史；后端保证空历史也返回结构完整的回执（不 404、不 500）。
+  profitability: (params: { instId?: string; bar?: string; sinceTs?: number } = {}) => {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v != null).map(([k, v]) => [k, String(v)]),
+    ).toString();
+    return get<AiTradeProfitabilityResponse>(`/ai-trade/history/profitability${qs ? `?${qs}` : ""}`);
+  },
 };

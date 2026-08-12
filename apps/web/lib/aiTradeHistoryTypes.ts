@@ -7,6 +7,7 @@ import type {
   AiTradeFundingStats,
   AiTradeHorizonStats,
 } from "./aiTradeTypes";
+import type { AiTradeRealizedStats } from "./aiTradeProfitability";
 import type { Trade } from "./types";
 
 // 历史会话列表单行 KPI（后端逐成员配对聚合；口径同 autoTradePnl.summarizeRoundTrips）。
@@ -124,6 +125,11 @@ export interface AiTradeRunMetrics {
     exits?: AiTradeExitMix | null;
     funding?: AiTradeFundingStats | null;
     acceptanceInput?: Record<string, unknown> | null;
+    // 会话级已实现读数（realized-edge-calibration 轴 A）：经既有 `costSnapshot` 通道并入
+    // `aiStats`，故与实时侧**同形同源**。老记录缺键 ⇒ 整段隐藏。
+    realized?: AiTradeRealizedStats | null;
+    // [P1-9] 本会话到底有没有把历史战绩喂给模型（事后按臂对账用）。
+    trackRecordShown?: boolean;
   };
 }
 

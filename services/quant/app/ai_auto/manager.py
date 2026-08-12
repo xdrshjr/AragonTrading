@@ -153,6 +153,10 @@ class AiTradeGroupStartRequest:
     # 历史统计——照字面共享会让 BTC 的成员拿 ETH 的统计去开真实仓位，且**不会报错**。
     # 缺键 = 该成员无先验（不是错误，逐字回退 ATR 粗估）。
     prior_snapshots: dict[str, dict] | None = None
+    # 实测战绩快照，**按 `instId` 键**（realized-edge-calibration 轴 D）。与 `prior_snapshots` 同款
+    # 姿态：BTC 15m 的胜率与 PEPE 1m 的胜率不是同一个东西，分组共享一份等于用别的标的的历史去开
+    # 真实仓位且**不会报错**。缺键 = 该成员无战绩（不是错误，payload 整键缺席、prompt 逐字回退）。
+    track_records: dict[str, dict] | None = None
     # 交易周期模式契约（ai-trade-holding-horizon-modes §2.4）：同款零回归垫片（默认 None=不装配；
     # 「缺省即开启」只在 API 层 `_resolve_horizon` 解析）。**分组共享同一份契约**——模式是会话级契约
     # 而非标的属性（R-12），与 base_rule / profit_rule 的分组共享姿态一致。
@@ -590,7 +594,8 @@ class AiTradeManager:
             prior_snapshot=(req.prior_snapshots or {}).get(plan.inst_id), sizing=sizing,
             horizon_rule=req.horizon_rule,
             # 只为落库回答「这次会话开的是哪个预设」；阈值本身已在 executor.settings 那份派生副本里。
-            discipline_preset=req.discipline_preset)
+            discipline_preset=req.discipline_preset,
+            track_record=(req.track_records or {}).get(plan.inst_id))
         return AiTradeGroupMember(inst_id=plan.inst_id, allocation_pct=plan.allocation_pct,
                                   budget_usd=plan.budget_usd, session=session, run_id=run_id)
 

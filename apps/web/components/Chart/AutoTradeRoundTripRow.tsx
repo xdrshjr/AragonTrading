@@ -4,6 +4,7 @@ import clsx from "clsx";
 import { Badge } from "@/components/ui";
 import { colorForReturn, fmtPct, fmtPrice, fmtTime, signed } from "@/lib/format";
 import type { RoundTrip } from "@/lib/autoTradePnl";
+import { readRMultiple } from "@/lib/aiTradeProfitability";
 import TradeExplainDetail from "../Strategy/TradeExplainDetail";
 import TradeCandleChartPanel from "./TradeCandleChartPanel";
 
@@ -13,19 +14,26 @@ import TradeCandleChartPanel from "./TradeCandleChartPanel";
 // ai-trade-stats-two-column-and-kline §3.5 / P1-3：新增**可选** `bar?`。仅 AI 统计看板向 row 传 `bar` →
 // 放宽可展开并在展开态额外渲染该往返窗口的行内 K 线；其它调用点（live-auto / paper 面板）不传 `bar`，
 // `expandable` 仍 = `Boolean(rt.exit.explain)`、展开仍只有 `TradeExplainDetail` → 逐字节不变（零回归）。
+//
+// ai-trade-realized-edge-calibration [P1-3]：再新增**可选** `showR?`。仅 AI 统计看板传 true →
+// 在时间行尾部多渲染一列 R 倍数（`exit.rMultiple`，算不出即整列省略）；其它调用点不传 → 逐字节不变。
 export default function AutoTradeRoundTripRow({
   rt,
   open,
   onToggle,
   bar,
+  showR,
 }: {
   rt: RoundTrip;
   open: boolean;
   onToggle: () => void;
   bar?: string;
+  showR?: boolean;
 }) {
   const tone = colorForReturn(rt.pnlUsd);
   const expandable = Boolean(bar) || Boolean(rt.exit.explain);
+  // 历史通道读顶层、实时通道读 explain.meta —— 两条通道的落点不同，故收口在 `readRMultiple`。
+  const rMultiple = showR ? readRMultiple(rt.exit) : null;
   return (
     <div className="border-t border-[var(--border)] first:border-t-0">
       <button
@@ -50,6 +58,9 @@ export default function AutoTradeRoundTripRow({
           <span className="tabular text-[10px] text-[var(--muted)]">
             {fmtPrice(rt.entry.price)} → {fmtPrice(rt.exit.price)} · {fmtTime(rt.closedTs)} ·
             持仓 {formatHoldDuration(rt.closedTs - rt.openedTs)}
+            {showR && rMultiple != null && (
+              <span data-testid="ai-round-trip-r"> · R {rMultiple.toFixed(2)}</span>
+            )}
           </span>
         </div>
         <div className="flex shrink-0 flex-col items-end gap-0.5 tabular">

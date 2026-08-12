@@ -1054,7 +1054,9 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByTestId("ai-trade-tradability");
     await waitFor(() =>
-      expect(aiTradeTradabilityApi.probe).toHaveBeenCalledWith("BTC-USDT-SWAP", "1H", "balanced"),
+      // 第 4 个入参是单仓止损那一格的现值（realized-edge 轴 E-0）：留空 ⇒ null ⇒ 后端用默认值。
+      expect(aiTradeTradabilityApi.probe).toHaveBeenCalledWith(
+        "BTC-USDT-SWAP", "1H", "balanced", null),
     );
   });
 

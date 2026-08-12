@@ -26,6 +26,11 @@ import {
   horizonVetoLine,
   turnoverVetoLine,
 } from "@/lib/aiTradeHorizon";
+import {
+  type AiTradeRealizedStats,
+  realizedCoverageText,
+  realizedRows,
+} from "@/lib/aiTradeProfitability";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
 import type { AiTradeHistoryDetailOut, AiTradeHistoryMember } from "@/lib/aiTradeHistoryTypes";
 import type { AiTradeHorizonStats } from "@/lib/aiTradeTypes";
@@ -321,12 +326,21 @@ function AiStatsCard({
   const counts = aiStats.actionCounts ?? {};
   return (
     <Section title="AI 决策概况">
+      {/* E-3（realized-edge-calibration D-8）：`decisionRounds` 是**全程**真实轮数，而 `holdRate`
+          的分母是最近 50 轮的保留样本——两个分母并排渲染而不标口径，用户读到的就是错的。
+          口径直接写进 label 而不是 `title` 提示：悬停才可见的提示等于没显示（触屏与用例都读不到）。 */}
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <Kpi label="决策轮数" value={`${aiStats.decisionRounds}`} />
-        <Kpi label="观望占比" value={fmtPct(aiStats.holdRate)} />
-        <Kpi label="平均置信度" value={fmtPct(aiStats.avgConfidence)} />
-        <Kpi label="共识降级" value={`${aiStats.degradedRounds} 轮`} />
+        <Kpi label="决策轮数（全程）" value={`${aiStats.decisionRounds}`} />
+        <Kpi label="观望占比（近 50 轮）" value={fmtPct(aiStats.holdRate)} />
+        <Kpi label="平均置信度（近 50 轮）" value={fmtPct(aiStats.avgConfidence)} />
+        {/* `degradedRounds` 与 `holdRate` / `avgConfidence` 同源——都在 `_compute_ai_stats` 的
+            ≤50 条决策样本上求（`session.py` 的 `_DECISIONS_MAX`），**不是**全程计数。 */}
+        <Kpi label="共识降级（近 50 轮）" value={`${aiStats.degradedRounds} 轮`} />
       </div>
+      <p className="mt-1 text-[10px] leading-relaxed text-[var(--muted)]">
+        「全程」为会话完整轮数；「近 50 轮」取自决策保留样本（环形缓冲），两者在长会话上必然不等。
+      </p>
+      <RealizedKpiGroup stats={aiStats.realized ?? null} />
       <HorizonKpiGroup stats={aiStats.horizon ?? null} />
       {observability && (
         <>
@@ -405,6 +419,7 @@ function MemberTrades({ member, bar }: { member: AiTradeHistoryMember; bar: stri
                 open={openRowKey === key}
                 onToggle={() => setOpenRowKey((prev) => (prev === key ? null : key))}
                 bar={bar}
+                showR
               />
             );
           })}
@@ -438,6 +453,29 @@ function PrimaryKpi({ label, value, color }: { label: string; value: string; col
       <span className="tabular text-xl font-semibold" style={{ color }}>
         {value}
       </span>
+    </div>
+  );
+}
+
+/**
+ * 会话级「已实现」三项（realized-edge-calibration [P1-2] 的渲染落点之一）。
+ *
+ * 它与实时侧的同名读数**共用 `lib/aiTradeProfitability` 的同一套格式化器**——绝不在两处各写一份
+ * 口径。样本 < 3 笔 ⇒ 整段不渲染（不显示一个 1 笔样本的中位数）。
+ */
+function RealizedKpiGroup({ stats }: { stats: AiTradeRealizedStats | null }) {
+  const rows = realizedRows(stats);
+  if (!rows || !stats) return null;
+  return (
+    <div className="mt-2 flex flex-col gap-1" data-testid="ai-realized-history">
+      <div className="grid grid-cols-3 gap-2">
+        {rows.map((row) => (
+          <Kpi key={row.label} label={row.label} value={row.value} />
+        ))}
+      </div>
+      <p className="text-[10px] leading-relaxed text-[var(--muted)]">
+        本会话已实现 · {realizedCoverageText(stats)}
+      </p>
     </div>
   );
 }
