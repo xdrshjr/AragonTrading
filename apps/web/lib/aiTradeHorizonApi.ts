@@ -2,7 +2,10 @@
 //
 // **只读、不守 AI 总闸**：读预设表不下任何单，弹窗在总闸关闭时也要能把「有哪些模式」画出来。
 // 数值与中文标签一律由后端下发——前端复制一份必然漂移（R-3 / G-10）。
-import type { AiTradeHorizonProfilesResponse } from "./aiTradeTypes";
+import type {
+  AiTradeDisciplinePresetsResponse,
+  AiTradeHorizonProfilesResponse,
+} from "./aiTradeTypes";
 
 const BASE = "/api/py";
 
@@ -19,5 +22,15 @@ export const aiTradeHorizonApi = {
     });
     if (!res.ok) throw new Error(`horizon profiles ${res.status}`);
     return (await res.json()) as AiTradeHorizonProfilesResponse;
+  },
+};
+
+// 交易纪律预设的只读阈值表（discipline-preset 轴 A）。与上面同一条纪律：**数值与中文标签全部由后端
+// 下发，前端一个都不复制**——一张用户按下启动键之前看的表，如果与真正生效的那组数分叉，比不给更坏。
+export const aiTradeDisciplineApi = {
+  presets: async (): Promise<AiTradeDisciplinePresetsResponse> => {
+    const res = await fetch(`${BASE}/ai-trade/discipline-presets`, { cache: "no-store" });
+    if (!res.ok) throw new Error(`discipline presets ${res.status}`);
+    return (await res.json()) as AiTradeDisciplinePresetsResponse;
   },
 };

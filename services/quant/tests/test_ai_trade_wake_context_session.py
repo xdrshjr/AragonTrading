@@ -482,6 +482,42 @@ async def test_a_dropped_bar_is_re_examined_by_a_catchup_round_in_the_same_tick(
         await dispose_engine()
 
 
+async def test_stale_feed_blocks_the_catchup_round_and_keeps_the_backlog(monkeypatch):
+    """G-6（discipline-preset-and-integrity D-4）：行情陈旧期补跑不起轮，**且待办必须保留**。
+
+    三条唤醒源里此前只有补跑漏了 `_stale_degraded` 守卫（`_maybe_interval_wake`/`_preview_ready`
+    都有），于是「会话对外宣告已降级停摆、第三条却在照常花真钱」。两条断言缺一不可：
+    ① 陈旧期不起轮（安全）；② `WakeBacklog` 的待办数不减（可恢复）——守卫若写进 `plan_catchup`
+    内部，三条分支都会先 `consume()` 掉待办，行情恢复后那根 K 线就永远补不回来了。
+    """
+    await init_db()
+    session = _make_session(wake_interval_s=0.0)
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+
+        session._deciding = True                          # 上一轮在飞
+        await session.feed_candle(_candle(1))             # 这根收线被丢弃 ⇒ 记一笔待办
+        session._deciding = False
+        pending_before = session._wake.stats()["drops"]
+        assert pending_before == 1
+
+        session._stale_degraded = True                    # 行情断流：另外两条唤醒源此刻都已停
+        session._maybe_catchup_wake()
+        await _settle(session)
+        assert session._deciding is False                 # ① 没有起轮
+        assert session._decision_task is None or session._decision_task.done()
+        assert session._wake.stats()["catchups"] == 0     # ② 待办没被消耗
+        assert session._wake.stats()["drops"] == pending_before
+
+        session._stale_degraded = False                   # 行情恢复 ⇒ 那根 K 线仍补得回来
+        session._maybe_catchup_wake()
+        await _settle(session)
+        assert session._wake.stats()["catchups"] == 1
+    finally:
+        await dispose_engine()
+
+
 async def test_catchup_prompt_carries_the_backlog_clause():
     """A-1：补跑轮的 prompt 首行必须如实说明「丢了什么、等了多久」。"""
     from app.ai_auto.wake_text import format_wake_for_prompt

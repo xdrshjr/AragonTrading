@@ -787,6 +787,56 @@ class AiTradeHorizonProfilesOut(BaseModel):
     profiles: list[AiTradeHorizonProfileOut] = Field(default_factory=list)
 
 
+class AiTradeDisciplineIn(BaseModel):
+    """交易纪律预设入参（ai-trade-discipline-preset-and-integrity §5.1）。
+
+    **字段整键缺省 ⇒ 服务端按 `ai_trade_discipline_default_preset`（默认 `balanced`）装配**——沿用
+    `baseRules` / `profitGuard` / `tradingHorizon` 的成文惯例，老客户端 / 桌面旧包同样受纪律保护。
+    `{"enabled": false}` 或 `{"preset": "off"}` 是用户显式关闭的唯一途径。
+
+    覆盖字段的值域**一次性在本层校验**（越界 422）；服务端 `_resolve_discipline` 只做缺省回填、
+    不复夹（沿用 `_resolve_position_step` 的 [R-2] 惯例）。`0` 一律表示「显式关闭该闸」，
+    `null` 表示「按预设」。
+
+    [P1-5] `enabled=false` / `preset="off"` 与任一覆盖字段**同时出现即 422**（`AI_TRADE_DISCIPLINE_
+    CONFLICT`，在 `api/ai_auto._resolve_discipline` 抛）：静默丢弃用户显式填的数是本仓库明令禁止的
+    形状。校验放在 API 层而不是这里，是为了让错误体能点名「哪个字段与哪个开关矛盾」。
+    """
+
+    enabled: bool = True
+    preset: Literal["steady", "balanced", "aggressive", "off"] | None = None
+    edgeGateK: float | None = Field(default=None, ge=0, le=10)
+    minConsensus: int | None = Field(default=None, ge=0, le=8)
+    minConfidence: float | None = Field(default=None, ge=0, le=1)
+    volTargetAnnual: float | None = Field(default=None, ge=0, le=3)
+    stopAtrMult: float | None = Field(default=None, ge=0, le=20)      # 0=显式关闭 ATR 止损覆盖
+    brakeSlowDdPct: float | None = Field(default=None, ge=0, le=1)
+    brakeHaltDdPct: float | None = Field(default=None, ge=0, le=1)
+    brakeLossStreak: int | None = Field(default=None, ge=0, le=50)    # 0=显式关闭
+
+    def overrides(self) -> dict:
+        """非空覆盖字段（camelCase）。键集与 `discipline.OVERRIDE_TO_SETTING` 一一对应。"""
+        return {key: value for key, value in self.model_dump().items()
+                if key not in ("enabled", "preset") and value is not None}
+
+
+class AiTradeDisciplineRowOut(BaseModel):
+    """生效纪律自检的一行（轴 B；`status.disciplines` 与 `group.discipline.rows` 同构）。
+
+    `threshold` / `firedCount` **算不出一律 `None`**，绝不填 0 冒充读数——只报「装配了」而不报
+    「拦了多少」的面板，在「闸门把每一单都拦了」这个最危险的断面上与「一切正常」长得一模一样。
+    """
+
+    key: str
+    label: str
+    armed: bool
+    threshold: str | None = None
+    source: str                       # preset | config | rule | runtime
+    note: str | None = None           # `armed=false` 时**必填**（为什么没生效、怎么开）
+    firedCount: int | None = None     # 本会话累计触发次数；算不出 ⇒ None
+    tone: str | None = None           # ok | warn | danger（呈现层用；缺省 ⇒ 按 armed 取色）
+
+
 class AiTradeGroupStartIn(BaseModel):
     """启动 AI 自动交易分组请求（金额/杠杆字段可留空→服务端保守默认，§4.1）。
 
@@ -826,6 +876,10 @@ class AiTradeGroupStartIn(BaseModel):
     # `{"enabled":false}` ⇒ 该会话不装配。**实盘与回测两处启动体都接该字段**（同一解析点，
     # 否则用户拿回测调出来的参数在实盘失真——`base_rules` P1-4 / `profit_guard` I-3 的成文教训）。
     tradingHorizon: AiTradeHorizonIn | None = None
+    # 交易纪律预设（默认开启，同上「字段缺省 ⇒ 按服务端默认预设装配」语义，解析点
+    # `_resolve_discipline`，且它**必须排在所有其它 `_resolve_*` 之前**——预设表里含
+    # `ai_trade_profit_guard_hard_tp_return_pct`，派生副本晚一步产生那一行预设就是死字母（[P1-2]）。
+    discipline: AiTradeDisciplineIn | None = None
 
     @field_validator("members")
     @classmethod
@@ -932,6 +986,11 @@ class AiTradeGroupRow(BaseModel):
     # 交易周期模式回执镜像（null=未装配）：为**服务端解析后的生效值**，且必须同时带上两个派生量
     # `expectedHoldBars` / `confirmWindowSeconds`（[P1-9]/[P0-3]）——只回显入参等于把派生关系藏起来。
     tradingHorizon: dict | None = None
+    # 交易纪律预设回执（[P1-7]：承载体是本模型，**不是** `AiTradeStatusOut`——`/ai-trade/start` 与
+    # `/ai-trade/status` 都没有 `response_model`，wire 的真源是 `manager.group_status()`）。
+    # 形状：`{preset, presetLabel, adjustments: [{field,from,to,reason}], rows: [...]}`；
+    # 整轴未装配 ⇒ `{"preset": "off", ...}`（而不是 null——「关着」也是一个要如实回答的事实）。
+    discipline: dict | None = None
 
 
 class AiTradeGroupStartOut(AiTradeGroupRow):
@@ -974,6 +1033,10 @@ class AiBacktestStartIn(BaseModel):
     # `ai_trade_horizon_backtest_enabled`）。回测按根推进，故最短持仓窗口的分辨率是一根 K 线——
     # 该免责由 `hold_horizon_text.format_backtest_notes` 写进结果 notes 并在 UI 上显示。
     tradingHorizon: AiTradeHorizonIn | None = None
+    # 交易纪律预设：与实盘**同一个** `_resolve_discipline`（R-3）。两处各解析一次的后果已有成文
+    # 前科（`base_rules` P1-4 / `profit_guard` I-3）：用户拿回测调出来的参数在实盘失真。
+    # 优先级写死为「显式请求字段（`minConsensus`）> 预设 > config 默认」，见 `backtest_manager`。
+    discipline: AiTradeDisciplineIn | None = None
 
 
 class AiBacktestStartOut(BaseModel):
@@ -1239,8 +1302,13 @@ class AiTradeHistoryDetailOut(BaseModel):
 
 
 # ---------------- Response serializers ----------------
-def _parse_explain(raw: str | None) -> dict | None:
-    """explain_json → dict（缺列 / 空 / 坏 JSON 安全回 None，与既有 run_out 容错风格一致）。"""
+def _explain_envelope(raw: str | None) -> dict | None:
+    """explain_json → dict **原样**（含「仅 meta」的内部信封）；缺列 / 空 / 坏 JSON 安全回 None。
+
+    与 `_public_explain` 的区别只有一条：本函数**不**按 `kind` 过滤。`meta` 里搭车的随行键
+    （`wallTs` / `clOrdId` / `exitSource` …）在没有 `kind` 的内部信封里同样有效，按 explain 的
+    对外口径过滤会把它们一起丢掉。
+    """
     if not raw:
         return None
     import json
@@ -1248,10 +1316,20 @@ def _parse_explain(raw: str | None) -> dict | None:
         parsed = json.loads(raw)
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
-    return parsed if isinstance(parsed, dict) and parsed.get("kind") else None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _public_explain(envelope: dict | None) -> dict | None:
+    """对外的 explain：**仅 meta** 的内部信封（无 `kind`）一律隐藏为 None，与既有 wire 一致。
+
+    收已解析的信封而不是原始字符串，是为了让 `trade_out` 只解析一次——同一段 JSON 解两遍，
+    迟早会有一处忘了跟上另一处的口径。
+    """
+    return envelope if envelope is not None and envelope.get("kind") else None
 
 
 def trade_out(t: Trade) -> dict:
+    envelope = _explain_envelope(getattr(t, "explain_json", None))
     return {
         "id": t.id, "runId": t.run_id, "ts": t.ts, "side": t.side, "price": t.price,
         "qty": t.qty, "fee": t.fee, "pnl": t.pnl, "positionAfter": t.position_after,
@@ -1262,8 +1340,13 @@ def trade_out(t: Trade) -> dict:
         # F4：本持仓周期的峰值浮盈（保护层未装配 / 快照一路不可用 / 老库缺列 → None，**绝不填 0**）。
         # `getattr` 兜底：幂等补列前的进程 / 老快照读到 None 而不是 AttributeError（G-6）。
         "peakPnlUsd": getattr(t, "peak_pnl", None),
+        # 轴 D（discipline-preset-and-integrity D-3）：`ts` 已是 **bar 对齐**秒（图表标记读它），
+        # `wallTs` 才是真实墙钟秒（列表排序 / 悬停 / 导出读它）。`live_trades` 表没有这一列，值由
+        # `session._inject_explain_meta` 搭 explain 信封落库，在此提回顶层；老数据缺键 ⇒ None ⇒
+        # 前端一律 `wallTs ?? ts` 兜底。
+        "wallTs": ((envelope or {}).get("meta") or {}).get("wallTs"),
         # explain 键恒在（缺列 / 坏 JSON → None），与既有恒含全键风格一致（§5.2 / P2-6）。
-        "explain": _parse_explain(getattr(t, "explain_json", None)),
+        "explain": _public_explain(envelope),
     }
 
 

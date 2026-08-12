@@ -2,6 +2,7 @@
 
 import { useCallback, useMemo, useState } from "react";
 import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
+import DisciplineCard from "./DisciplineCard";
 import ExitSourceCard from "./ExitSourceCard";
 import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
 import TurnoverBackstopCard, { type RepairPendingState } from "./TurnoverBackstopCard";
@@ -22,6 +23,7 @@ import {
   PROFIT_CAPTURE_HINT,
   summarizeProfitCaptureAcross,
 } from "@/lib/aiTradeCapture";
+import { memberDisciplines } from "@/lib/aiTradeDiscipline";
 import { formatHoldDuration, horizonLiveKpis } from "@/lib/aiTradeHorizon";
 import { computeReflectionCounts, latestHoldStreak } from "@/lib/aiTradeObservability";
 import type {
@@ -159,6 +161,23 @@ export default function AiTradeStatsLive() {
           returnPct={fullSummary.totalReturnPct}
           elapsedSec={nowSec - group.startedTs}
           tradeCount={fullSummary.count}
+        />
+        {/* 生效纪律自检（discipline-preset 轴 B）：紧跟在 KPI 之后——「AI 为什么开单变少」是用户
+            看完收益数字后的第一个问题，答案必须就在下一屏，而不是藏在更下面。数据源优先取**成员级**
+            status（`exchangeBackstop` 是唯一逐成员分叉的一行），分组回执只做兜底。 */}
+        <DisciplineCard
+          wire={
+            group.discipline
+              ? {
+                  ...group.discipline,
+                  ...(memberDisciplines(
+                    Object.values(group.members)[0]?.session?.disciplines,
+                    group.discipline,
+                  ) ?? { rows: [], hint: null }),
+                }
+              : null
+          }
+          memberCount={Object.keys(group.members).length}
         />
         <HorizonLiveCard group={group} ledger={ledger} />
         {/* 周期验收闭环（horizon-acceptance）：两卡是**两个独立入参**——`acceptance` 为 null

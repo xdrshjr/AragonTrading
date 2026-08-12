@@ -92,7 +92,8 @@ function TradeRow({ trade: t }: { trade: Trade }) {
             }
           : {})}
       >
-        <td className="py-1.5 pr-2 tabular text-[var(--muted)]">{fmtTime(t.ts)}</td>
+        {/* 轴 D：成交表读真实墙钟 `wallTs`（`ts` 已是 bar 对齐秒）；缺键回退 `ts`。 */}
+        <td className="py-1.5 pr-2 tabular text-[var(--muted)]">{fmtTime(t.wallTs ?? t.ts)}</td>
         <td className="py-1.5 pr-2">
           <span className="inline-flex items-center gap-1">
             <Badge tone={SIDE_TONE[t.side]}>{SIDE_LABEL[t.side]}</Badge>

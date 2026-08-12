@@ -1,5 +1,6 @@
 "use client";
 
+import { useCallback, useState } from "react";
 import { Badge } from "@/components/ui";
 import {
   describeCommittedExit,
@@ -9,12 +10,24 @@ import {
   describeProfitGuardTrail,
   isEffectiveExitCommitted,
 } from "@/lib/aiTrade";
+import { aiTradeApi } from "@/lib/aiTradeApi";
+import {
+  disciplineRow,
+  memberDisciplines,
+  summarizeDisciplines,
+} from "@/lib/aiTradeDiscipline";
 import { describeHorizonStatus } from "@/lib/aiTradeHorizon";
 import { describeTurnoverChip } from "@/lib/aiTradeTurnover";
 import { COST_BASIS_HINT, describeCostBasis } from "@/lib/aiTradeCost";
 import { colorForReturn, fmtMoney, fmtNum, fmtPct, fmtPrice } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
-import type { AiTradeGroupMemberState, ProfitGuardSnapshot } from "@/lib/aiTradeTypes";
+import { ApiRequestError } from "@/lib/api";
+import type {
+  AiTradeDisciplineRow,
+  AiTradeGroupMemberState,
+  AiTradeGroupState,
+  ProfitGuardSnapshot,
+} from "@/lib/aiTradeTypes";
 import type { Instrument } from "@/lib/types";
 
 // AI 自动交易「标的面板」（ai-trade-multi-symbol-and-timeframe §4.2）：泛化为「多标的」分组视图。
@@ -80,6 +93,8 @@ export default function AiTradePanel({
         </span>
       </div>
 
+      <DisciplineStrip group={group} />
+
       <div className="flex flex-col gap-1">
         <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
           自动交易标的
@@ -98,6 +113,165 @@ export default function AiTradePanel({
       </div>
     </div>
   );
+}
+
+/**
+ * 纪律条（discipline-preset 轴 B 的紧凑落点 + 轴 C 的裸仓警示）。
+ *
+ * 为什么放在主面板顶部而不是只放统计弹窗：本轮把纪律层默认装配起来后，用户看到的第一个变化是
+ * 「AI 开单变少」。若「哪些纪律正在生效」只存在于一个要主动点开的弹窗里，这个变化只会被读成
+ * 「AI 坏了」——**后端算了但用户看不见 = 死数据**，这正是本仓库反复出现的缺陷形状。
+ *
+ * 红色态**由 `disciplines.exchangeBackstop` 行驱动**（[P0-2]），不是由任何 `error` 事件驱动：
+ * `useAiTradeGroupStream.routeMemberEvent` 根本没有 `error` 分支，那条通道是个 /dev/null。
+ */
+function DisciplineStrip({ group }: { group: AiTradeGroupState }) {
+  const [open, setOpen] = useState(false);
+  const members = Object.values(group.members);
+  // 成员级 status 优先：`exchangeBackstop` 是唯一逐成员分叉的一行，分组回执只做兜底。
+  const digest = memberDisciplines(members[0]?.session?.disciplines, group.discipline);
+  const rows = digest?.rows ?? [];
+  const summary = summarizeDisciplines(rows);
+  // 裸仓可能发生在**任意**成员上，故逐成员各判一次（只看第一个成员会漏报后面的标的）。
+  const naked = members
+    .map((m) => ({
+      instId: m.instId,
+      row: disciplineRow(m.session?.disciplines?.rows ?? rows, "exchangeBackstop"),
+    }))
+    .filter((entry) => entry.row?.tone === "danger");
+  if (!summary.label) return null;   // 老后端 / 还没数据 ⇒ 整条不占位
+
+  return (
+    <div className="flex flex-col gap-1" data-testid="ai-discipline-strip">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center justify-between gap-2 rounded border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-left transition-colors hover:bg-[var(--surface-2)]"
+      >
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="text-[10px] text-[var(--muted)]">交易纪律</span>
+          {group.discipline?.presetLabel && (
+            <Badge tone="neutral">{group.discipline.presetLabel}</Badge>
+          )}
+          <span className="tabular text-[10px] text-[var(--muted)]">{summary.label}</span>
+          {summary.warnings > 0 && (
+            <span className="text-[10px] text-[var(--accent)]">{summary.warnings} 项需注意</span>
+          )}
+        </span>
+        <span className="shrink-0 text-[10px] text-[var(--muted)]">{open ? "收起" : "展开"}</span>
+      </button>
+
+      {naked.map((entry) => (
+        <NakedBackstopAlert
+          key={entry.instId}
+          groupId={group.groupId}
+          instId={entry.instId}
+          showInstId={members.length > 1}
+          note={entry.row?.note ?? null}
+        />
+      ))}
+
+      {digest?.hint && (
+        <p
+          className="rounded border border-[var(--short)] px-2 py-1 text-[10px] leading-relaxed text-[var(--short)]"
+          data-testid="ai-discipline-strip-hint"
+        >
+          {digest.hint}
+        </p>
+      )}
+
+      {open && (
+        <div className="flex flex-col gap-0.5 rounded border border-[var(--border)] bg-[var(--bg)] px-2 py-1">
+          {rows.map((row) => (
+            <CompactDisciplineRow key={row.key} row={row} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CompactDisciplineRow({ row }: { row: AiTradeDisciplineRow }) {
+  const color =
+    row.tone === "danger"
+      ? "var(--short)"
+      : row.tone === "warn"
+        ? "var(--accent)"
+        : row.armed
+          ? "var(--long)"
+          : "var(--muted)";
+  return (
+    <span className="flex items-center justify-between gap-2 text-[10px]">
+      <span className="truncate" style={{ color }} title={row.note ?? undefined}>
+        {row.label}
+      </span>
+      <span className="tabular shrink-0 text-[var(--muted)]">
+        {row.armed ? (row.threshold ?? "已启用") : "未生效"}
+      </span>
+    </span>
+  );
+}
+
+/**
+ * 裸仓警示条（轴 C）：高显著度、常驻、带「立即补挂」直连既有 `repairBackstop` 端点。
+ *
+ * 三态按钮沿用 `AiTradeStatsLive` 已有范式（含 502 的中文原因在前）。文案只复述后端那一行的
+ * `note`——两处各写一遍就是两份口径，而这一条是安全告警，措辞失准的代价最大。
+ */
+function NakedBackstopAlert({
+  groupId,
+  instId,
+  showInstId,
+  note,
+}: {
+  groupId: string;
+  instId: string;
+  showInstId: boolean;
+  note: string | null;
+}) {
+  const [pending, setPending] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+  const repair = useCallback(() => {
+    setPending(true);
+    setResult(null);
+    aiTradeApi
+      .repairBackstop(groupId, instId)
+      .then(() => setResult("补挂请求已发出，正在向交易所核实"))
+      .catch((err: unknown) => setResult(repairErrorText(err)))
+      .finally(() => setPending(false));
+  }, [groupId, instId]);
+
+  return (
+    <div
+      className="flex flex-col gap-1 rounded border border-[var(--short)] bg-[var(--surface-2)] px-2 py-1"
+      data-testid="ai-discipline-naked-alert"
+    >
+      <span className="text-[10px] font-medium leading-relaxed text-[var(--short)]">
+        {showInstId ? `${instId} · ` : ""}
+        {note ?? "当前持仓在交易所侧没有兜底止损"}
+      </span>
+      <span className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={repair}
+          disabled={pending}
+          className="rounded border border-[var(--short)] px-1.5 py-px text-[10px] text-[var(--short)] transition-colors hover:bg-[var(--short)] hover:text-[var(--bg)] disabled:opacity-50"
+        >
+          {pending ? "补挂中…" : "立即补挂"}
+        </button>
+        {result && <span className="truncate text-[10px] text-[var(--muted)]">{result}</span>}
+      </span>
+    </div>
+  );
+}
+
+/** 补挂失败的人话（绝不把裸码或原始异常抛给用户；交易所拒单时带上 sCode 供后台核对）。 */
+function repairErrorText(err: unknown): string {
+  if (err instanceof ApiRequestError) {
+    return err.code ? `${err.message}（${err.code}）` : err.message;
+  }
+  return "补挂请求失败，请稍后重试";
 }
 
 function MemberRow({

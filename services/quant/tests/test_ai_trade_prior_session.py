@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from app.agent.llm.base import StreamEvent
 from app.ai_auto.decider import AiTradeDecider, TradeDecision
@@ -31,8 +32,13 @@ from app.strategies.base import BaseStrategy, StrategyMeta
 # 平移过来，**断言一字未改**。
 _CANDLE_WAKE = {"trigger": "candle", "kind": "candle_close"}
 
-_START_TS = 1_785_000_000
+# E-2（discipline-preset-and-integrity D-6）：**绝不写绝对墙钟常量**。夹具 `_snapshot()` 的
+# `builtAtTs = _START_TS - 3600` 要通过 `load_snapshot` 的 C-2 新鲜度门（`ai_trade_prior_max_age_s`
+# 默认 7 天），而一个写死的时间点会在写死那天起第 8 天开始必红——本文件正是这样红了 17 天，
+# 期间先验层的会话级回归护栏完全失效。改成相对当前墙钟（对齐到整根，保持 `_row` 的 ts 相位稳定）。
+# `test_prior_fixture_age_within_contract` 是防复发的元用例，改动本常量前先看它。
 _STEP = 3600
+_START_TS = int(time.time()) // _STEP * _STEP - 3 * _STEP
 _PX = 30_000.0
 
 
@@ -348,3 +354,23 @@ def test_event_loop_is_not_required_for_pure_runtime():
     assert asyncio.get_event_loop_policy() is not None
     wire = runtime.build(_board(), {"primary": "range"}, None)
     assert wire["long"]["p"] == 0.6 and wire["regimeUsed"] == "all"
+
+
+def test_prior_fixture_age_within_contract():
+    """防复发元用例（discipline-preset-and-integrity E-2 / G-8）：夹具快照永远不许陈旧。
+
+    本文件此前用绝对墙钟常量 `_START_TS = 1_785_000_000` 建夹具，`builtAtTs` 一旦超过
+    `ai_trade_prior_max_age_s`（默认 7 天）就会被 `load_snapshot` 判 `stale` ⇒ `PriorRuntime`
+    整份丢弃 ⇒ 本文件 7 条断言集体转红——这是一枚**墙钟定时炸弹**，它已经让先验层的会话级回归
+    护栏静默失效了 17 天。本用例把「夹具必须新鲜」这件事变成显式判据：任何人再把 `_START_TS`
+    改回绝对常量，红的是这一条，且它的失败信息直说原因。
+    """
+    settings = _prior_settings()
+    snapshot = _snapshot()
+    age_s = time.time() - float(snapshot["builtAtTs"])
+    assert 0 <= age_s < settings.ai_trade_prior_max_age_s, (
+        f"夹具快照年龄 {age_s:.0f}s 已超出 ai_trade_prior_max_age_s="
+        f"{settings.ai_trade_prior_max_age_s}s —— `_START_TS` 必须相对当前墙钟推导，"
+        "绝不可写成绝对时间常量（E-2）")
+    # 光看年龄还不够：真正要守的是「装配得起来」。跑一遍运行时，条目不许被丢空。
+    assert PriorRuntime(snapshot, settings)._entries, "新鲜快照必须能被 load_snapshot 接受"

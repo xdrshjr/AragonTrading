@@ -4,6 +4,7 @@ import type {
   AiTradeAcceptance,
   AiTradeBaseRules,
   AiTradeDecision,
+  AiTradeDisciplineIn,
   AiTradeExitMix,
   AiTradeFundingStats,
   AiTradeHorizonRule,
@@ -41,6 +42,9 @@ export interface AiBacktestStartReq {
   // 交易周期模式：同一 `_resolve_horizon` 解析（回测侧另叠一层运维总闸）。回测按根推进，最短持仓
   // 窗口的分辨率是一根 K 线——该免责由后端写进结果 notes 并在 UI 上显示。
   tradingHorizon?: AiTradeHorizonRule | null;
+  // 交易纪律预设：与实盘**同一个** `_resolve_discipline`（discipline-preset R-3）。回测正是唯一能
+  // 对这组阈值做「开 vs 不开」净额对照的地方，两侧不同源就等于把校准路径也一起废掉。
+  discipline?: AiTradeDisciplineIn | null;
 }
 
 export interface AiBacktestStartResult {

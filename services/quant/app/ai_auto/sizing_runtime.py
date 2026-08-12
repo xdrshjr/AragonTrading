@@ -40,6 +40,7 @@ from .sizing import (
     resolve_size_fraction,
     resolve_stop_distance,
     sizing_wire,
+    window_need,
 )
 from .stats_ext import build_sizing_stats, merge_sizing_stats
 
@@ -184,10 +185,8 @@ class SizingRuntime:
 
     @property
     def window_need(self) -> int:
-        """本层需要的收盘价根数（`max(vol_window, corr_min_samples) + 1`）；未装配 ⇒ 0。"""
-        if self.rule is None:
-            return 0
-        return max(int(self.rule.vol_window), int(self.rule.corr_min_samples)) + 1
+        """本层需要的收盘价根数；未装配 ⇒ 0。式子的唯一真源在 `sizing.window_need`（复制即漂移）。"""
+        return window_need(self.rule)
 
     # ---------- 门控（第 7 步：回撤刹车 / 连亏熔断）----------
     def gate(self, decision, degrade: str | None, *, now_wall: float | None = None) -> tuple:

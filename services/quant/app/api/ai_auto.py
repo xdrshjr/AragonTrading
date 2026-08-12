@@ -24,6 +24,14 @@ from ..ai_auto.backstop_repair import AiTradeRepairBlocked
 from ..ai_auto.backstop_repair import fail_message as repair_fail_message
 from ..ai_auto.base_rules import MaBandRule, resolve_ma_band_rule
 from ..ai_auto.cost_runtime import CostRuntime
+from ..ai_auto.discipline import (
+    PRESET_IDS,
+    PRESET_LABELS,
+    DisciplinePreset,
+    preset_rows,
+    preset_table,
+    resolve_updates,
+)
 from ..ai_auto.hold_horizon import HorizonRule, profiles_wire, resolve_horizon_rule
 from ..ai_auto.manager import (
     AiTradeGroupMemberInput,
@@ -35,6 +43,7 @@ from ..ai_auto.manager import (
 from ..ai_auto.prior_service import prior_snapshot_out, rebuild_prior_snapshot
 from ..ai_auto.profit_guard import ProfitGuardRule, resolve_profit_guard_rule
 from ..ai_auto.signal_prior import resolve_prior_params, strategy_fingerprint
+from ..ai_auto.sizing import parse_sizing_rule, window_need
 from ..config import Settings, get_settings
 from ..db import ai_prior_repositories as prior_repo
 from ..db import repositories as repo
@@ -45,6 +54,7 @@ from ..paper.strategy_factory import build_paper_strategy_spec
 from ..schemas import (
     AiBacktestStartIn,
     AiTradeBaseRulesIn,
+    AiTradeDisciplineIn,
     AiTradeGroupStartIn,
     AiTradeHistoryDetailOut,
     AiTradeHistoryListOut,
@@ -68,6 +78,63 @@ def _require_ai_enabled(settings: Settings) -> None:
         raise HTTPException(status_code=403, detail={
             "code": "AI_TRADE_DISABLED",
             "message": "AI 自动交易未启用（需 AI_TRADE_ENABLED 与 LIVE_TRADING_ENABLED 均开启）"})
+
+
+def _resolve_discipline(raw: AiTradeDisciplineIn | None, settings: Settings, *,
+                        spec_count: int, priming_bars: int) -> tuple[Settings, DisciplinePreset,
+                                                                     int]:
+    """交易纪律预设的**唯一解析点**（discipline-preset-and-integrity §3.1；实盘与回测共用）。
+
+    产出「会话私有的 Settings 副本」而不是改全局——`get_settings()` 是进程级缓存单例，且
+    `LiveExecutor` 被 `ai_auto` 与 `live_auto` 共用同一个 settings 对象，`setattr` 会让 AI 侧的
+    纪律阈值静默溢出到非 AI 链路（历史坑）。
+
+    ⚠️ **调用点必须排在所有其它 `_resolve_*` 之前**（[P1-2]）：`_resolve_base_rules` /
+    `_resolve_profit_guard` / `_resolve_horizon` / `_resolve_position_step` / `_resolve_wake_interval_s`
+    全都在实参位置读 `settings`，而预设表里含 `ai_trade_profit_guard_hard_tp_return_pct`。派生副本
+    晚一步产生，那一行预设就是死字母**且不报任何错**。G-13 钉死这一条。
+
+    三层优先级（§3.1.4）：运维总闸 > 用户显式 > 服务端默认预设。
+
+    Returns:
+        `(settings, preset, priming_bars)`。未装配（总闸关 / `off` / `enabled=false`）时返回的是
+        **同一个 settings 对象**（`is` 相等，G-18 / §7.1 的零回归支点）。
+
+    Raises:
+        HTTPException: 422 `AI_TRADE_DISCIPLINE_CONFLICT`——「关闭」与逐项覆盖同时出现（[P1-5]）。
+            静默丢弃用户显式填的数是本仓库明令禁止的形状，故宁可拒绝也不猜。
+    """
+    off = DisciplinePreset(preset_id="off", updates={})
+    if not settings.ai_trade_discipline_enabled:      # ① 运维总闸：一键回滚，优先级高于请求体
+        return settings, off, priming_bars
+    overrides = raw.overrides() if raw is not None else {}
+    closed = raw is not None and (not raw.enabled or raw.preset == "off")
+    if closed and overrides:
+        names = "、".join(sorted(overrides))
+        switch = "enabled=false" if (raw is not None and not raw.enabled) else 'preset="off"'
+        raise HTTPException(422, detail={
+            "code": "AI_TRADE_DISCIPLINE_CONFLICT",
+            "message": f"交易纪律已被 {switch} 关闭，不能同时指定覆盖字段（{names}）："
+                       "请去掉这些字段，或改选一个具体预设"})
+    if closed:
+        return settings, off, priming_bars
+    preset_id = (raw.preset if raw is not None and raw.preset else
+                 settings.ai_trade_discipline_default_preset)          # ②用户显式 / ③服务端默认
+    preset = resolve_updates(preset_id, overrides, spec_count)
+    if not preset.armed:                              # `off` ⇒ 原对象本身，逐字节回退
+        return settings, preset, priming_bars
+    derived = settings.model_copy(update=preset.updates)
+    # R-2：装配仓位层后 `check_window_capacity` 会要求窗口装得下回看根数。**须从派生后的 settings
+    # 现算**（`ai_trade_correlation_min_samples` 不在预设表里，运维调到 200 而这里写死 97，启动就会
+    # 被自己的 422 打回），且**默认装配绝不允许把用户的启动打回 422**，故改为抬 primingBars 并如实
+    # 披露。默认 primingBars=300 时这条抬升不触发。
+    need = window_need(parse_sizing_rule(derived))
+    if 0 < priming_bars < need:      # `priming_bars<=0` = 回测调用方（无暖机根数概念）⇒ 恒不触发
+        preset.adjustments.append({
+            "field": "primingBars", "from": priming_bars, "to": need,
+            "reason": f"仓位层需要 {need} 根收盘价（波动率窗口与相关性样本的较大者），已自动抬高暖机根数"})
+        priming_bars = need
+    return derived, preset, priming_bars
 
 
 def _resolve_position_step(raw: float | None, settings: Settings) -> float:
@@ -236,6 +303,11 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
     _require_ai_enabled(settings)
     account_row = await _resolve_account(session, body.accountId)
     specs, fingerprints = await _build_specs(session, body.strategyIds)
+    # ★ [P1-2] 纪律预设**必须**在这里就把 `settings` 换成派生副本——下面所有 `_resolve_*` 都在
+    # 实参位置读它，晚一步产生就会让预设里的 `profit_guard_hard_tp_return_pct` 变成死字母。
+    # 此后本函数体内**再无**任何一处读得到旧对象（G-13 钉死顺序）。
+    settings, discipline, priming_bars = _resolve_discipline(
+        body.discipline, settings, spec_count=len(specs), priming_bars=body.primingBars)
     priors = await _resolve_prior_snapshots(
         session, settings, inst_ids=[m.instId for m in body.members], bar=body.bar,
         fingerprints=fingerprints)
@@ -254,14 +326,19 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
         total_capital_usd=body.capitalUsd, leverage=body.leverage,
         take_profit_usd=body.takeProfitUsd, stop_loss_usd=body.stopLossUsd,
         stop_loss_pct=body.stopLossPct, take_profit_pct=body.takeProfitPct,  # E4：单仓 OCO 入参
-        priming=body.priming, priming_bars=body.primingBars,
+        priming=body.priming, priming_bars=priming_bars,   # R-2 抬升后的值（如实列在 adjustments）
         budget_cap_frac=cap_frac, default_budget_frac=settings.ai_trade_default_capital_frac,
         position_step_pct=_resolve_position_step(body.positionStepPct, settings),
         wake_interval_s=_resolve_wake_interval_s(body.wakeIntervalMinutes, settings),
         base_rule=_resolve_base_rules(body.baseRules, settings),
         profit_rule=_resolve_profit_guard(body.profitGuard, settings),
         horizon_rule=_resolve_horizon(body.tradingHorizon, settings, bar=body.bar),
-        prior_snapshots=priors)
+        prior_snapshots=priors,
+        # 纪律预设的回执载体（`group_status().discipline` 现装配）。`adjustments` 是**可变列表**：
+        # `_validate_sizing` 的 [P0-4] 最小下单量复核会在启动期继续往里追加。
+        discipline_preset=discipline.preset_id, discipline_f_floor=discipline.f_floor,
+        discipline_adjustments=discipline.adjustments,
+        discipline_thresholds=preset_table(discipline.preset_id))
     try:
         await get_ai_trade_manager().start_group(req)
     except AiTradeGroupPreflightError as exc:
@@ -328,6 +405,30 @@ async def ai_trade_status(settings: Settings = Depends(get_settings)) -> dict:
     """当前活跃 AI 分组（无则 group:null）；前端重载后据此重连各成员 WS（只读，不守门）。"""
     return {"group": get_ai_trade_manager().group_status(),
             "aiTradeEnabled": settings.ai_trade_enabled}
+
+
+@router.get("/ai-trade/discipline-presets")
+async def ai_trade_discipline_presets(settings: Settings = Depends(get_settings)) -> dict:
+    """交易纪律预设的只读阈值表（discipline-preset 轴 A 的弹窗数据源）。
+
+    **不守 AI 总闸**（沿用 `/ai-trade/horizon-profiles` 与 `priors/rebuild` 的先例）：读一张表不下
+    任何单，总闸关闭时弹窗也要能把「有哪些预设、各是什么阈值」画出来。
+
+    数值与中文标签**全部由本端点下发，前端一个都不复制**——本仓库已经有过前后端各存一份口径导致
+    静默漂移的事故（`edgeSource` 逐键手抄吞新键）。一张用户按下启动键**之前**看的表，如果与真正
+    生效的那组数分叉，比不给这张表更坏。
+
+    `enabled=false`（运维总闸关）时照常下发表格，但 UI 须据此说明「本机已整轴关闭」——藏起来会让
+    用户以为是自己选错了。
+    """
+    return {
+        "enabled": settings.ai_trade_discipline_enabled,
+        "defaultPreset": settings.ai_trade_discipline_default_preset,
+        "presets": [{"id": preset_id,
+                     "label": PRESET_LABELS[preset_id],
+                     "rows": preset_rows(preset_id)}
+                    for preset_id in PRESET_IDS],
+    }
 
 
 @router.get("/ai-trade/horizon-profiles", response_model=AiTradeHorizonProfilesOut)
@@ -473,6 +574,11 @@ async def ai_backtest_start(body: AiBacktestStartIn, session: AsyncSession = Dep
                             settings: Settings = Depends(get_settings)) -> dict:
     """启动一个 AI 自动交易回测作业（§2.9 前置门禁；回执含 plannedRounds 与夹紧后生效资金/杠杆）。"""
     specs, _ = await _build_specs(session, body.strategyIds)   # 回测侧不接先验（D-2 前视偏差）
+    # R-3：回测吃**同一个** `_resolve_discipline`（`base_rules` P1-4 / `profit_guard` I-3 的成文
+    # 教训：两处各解析一次 ⇒ 用户拿回测调出来的参数在实盘失真）。回测无暖机根数概念，故 R-2 的
+    # `primingBars` 抬升在此不适用（传 0 ⇒ 恒不触发；回测窗口由 `start_ts/end_ts` 决定）。
+    settings, discipline, _ = _resolve_discipline(
+        body.discipline, settings, spec_count=len(specs), priming_bars=0)
     req = AiBacktestStartRequest(
         specs=specs, inst_id=body.instId, bar=body.bar, start_ts=body.startTs, end_ts=body.endTs,
         settings=settings, context_refresh_rounds=body.contextRefreshRounds,
@@ -492,7 +598,12 @@ async def ai_backtest_start(body: AiBacktestStartIn, session: AsyncSession = Dep
     return {"jobId": job.job_id, "instId": runner.inst_id, "bar": runner.bar,
             "strategyIds": runner.strategy_ids, "startTs": runner.start_ts, "endTs": runner.end_ts,
             "decisionEveryBars": runner.decision_every_bars, "plannedRounds": runner.planned_rounds,
-            "initialCapital": runner.initial_capital, "leverage": runner.leverage}
+            "initialCapital": runner.initial_capital, "leverage": runner.leverage,
+            # 纪律预设回执（R-3）：回测与实盘吃同一份解析，回执也必须能逐字段核对——否则
+            # 「我在回测里调好的那组阈值到底跑没跑」这个问题在回测侧无从回答。
+            "discipline": {"preset": discipline.preset_id,
+                           "minConsensus": runner.min_consensus,
+                           "adjustments": discipline.adjustments}}
 
 
 @router.post("/ai-trade/backtest/{job_id}/cancel")

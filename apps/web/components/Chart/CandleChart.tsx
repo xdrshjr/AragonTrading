@@ -609,7 +609,9 @@ export default function CandleChart({
   );
 }
 
-function markerForEvent(event: TradeMarkerEvent): SeriesMarker<Time> {
+// 导出仅为让 D-7 的颜色判据可被直接断言（G-9）：这段运算符优先级坑无法从渲染出的 DOM 上观察到
+// （标记画在 canvas 里），只能对纯函数取值。
+export function markerForEvent(event: TradeMarkerEvent): SeriesMarker<Time> {
   const trade = event.trade;
   const strategyTrade = trade as Trade & { color?: string; strategyName?: string };
   const color = strategyTrade.color;
@@ -635,13 +637,17 @@ function markerForEvent(event: TradeMarkerEvent): SeriesMarker<Time> {
   }
 
   const tone = tradeToneForEvent(event);
+  // E-3（discipline-preset-and-integrity D-7）：括号是**必需**的，不是格式化偏好。`??` 的优先级
+  // 高于三元条件运算符，原写法解析为 `(color ?? (tone === "long")) ? A : B`——多策略着色路径下
+  // `color` 是真值字符串 ⇒ 条件恒真 ⇒ **所有平仓标记恒被涂成多头色**，`color ??` 那层覆盖意图
+  // 完全是死码。补括号后语义与同文件 `trailColor` 一致：有 color 用 color，否则按方向取色。
   const closeColor =
     color ??
-    tone === "long"
+    (tone === "long"
       ? cssVar("--long")
       : tone === "short"
         ? cssVar("--short")
-        : cssVar("--muted");
+        : cssVar("--muted"));
 
   return {
     time: trade.ts as UTCTimestamp,

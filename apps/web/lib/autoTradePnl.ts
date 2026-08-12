@@ -83,8 +83,12 @@ export function buildRoundTrips(
       pnlPct: seg.exit.pnlPct ?? fallback,
       feeUsd,
       grossPnlUsd: basis === "net" ? raw + feeUsd : raw,
-      openedTs: seg.entry.ts,
-      closedTs: seg.exit.ts,
+      // 轴 D（discipline-preset-and-integrity D-3）：这两个时刻是**时长与窗口筛选**的口径，必须读
+      // 真实墙钟 `wallTs`。若沿用已被吸附到 K 线开盘秒的 `ts`，1H 周期下一笔 20 分钟的往返会被算成
+      // 「持仓 0」——`HorizonLiveCard` 的三个 KPI 会集体塌成 0（见 spec I-2）。缺键 ⇒ 回退 `ts`，
+      // 非 AI 链路逐字不变。
+      openedTs: seg.entry.wallTs ?? seg.entry.ts,
+      closedTs: seg.exit.wallTs ?? seg.exit.ts,
       isWin: pnlUsd > 0,
     };
   });

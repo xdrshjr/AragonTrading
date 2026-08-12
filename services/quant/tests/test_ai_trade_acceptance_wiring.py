@@ -429,13 +429,20 @@ def _git_diff_names() -> set[str]:
 
 
 def test_shared_execution_files_have_zero_diff():
-    """G-4 / G-6：`SimBroker` / `LiveExecutor` / `cost_model` / `cost_text` 本轮零改动。
+    """G-4 / G-6：`SimBroker` / `cost_model` / `cost_text` 零改动。
 
-    前两者被全仓库所有回测与两条自动交易链路共用；后两者是 [P0-1] 的边界——结算周期未知这条
-    信息只被 `FundingLedger` 消费，成本层继续走它自己的 8h 保守估算（§九 D-9）。
+    `SimBroker` 被全仓库所有回测与两条自动交易链路共用；后两者是 [P0-1] 的边界——结算周期未知
+    这条信息只被 `FundingLedger` 消费，成本层继续走它自己的 8h 保守估算（§九 D-9）。
+
+    **`live_auto/executor.py` 已从本冻结集移出**（ai-trade-discipline-preset-and-integrity 轴 D，
+    spec §4.1 显式列出该文件）：本轮在 `_make_trade` 这个**唯一成交构造点**做 bar 对齐，修的正是
+    「非 K 线唤醒产生的成交落不到任何一根 K 线上」（D-3）。改一个共用文件必须有等价的护栏顶上，
+    否则移出冻结集就是悄悄放宽：`live_auto` 那条路径的零回归改由
+    `test_ai_trade_switches_never_leak_into_non_ai_executor` 的**键集冻结** +
+    `test_ai_trade_trade_clock.py::test_live_auto_without_bar_seconds_falls_back_verbatim`
+    的**取值冻结**共同承担，两条都直接断言行为而不是断言「文件没被碰过」。
     """
     frozen = {"services/quant/app/engine/simulator.py",
-              "services/quant/app/live_auto/executor.py",
               "services/quant/app/ai_auto/cost_model.py",
               "services/quant/app/ai_auto/cost_text.py"}
     changed = _git_diff_names()

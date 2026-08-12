@@ -3,14 +3,19 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AI_TRADE_BASE_RULE_DEFAULTS, AI_TRADE_PROFIT_GUARD_DEFAULTS } from "@/lib/aiTrade";
-import { aiTradeHorizonApi } from "@/lib/aiTradeHorizonApi";
+import { aiTradeDisciplineApi, aiTradeHorizonApi } from "@/lib/aiTradeHorizonApi";
 import { autoTradeSettingsApi } from "@/lib/autoTradeSettingsApi";
 import { tradingApi } from "@/lib/tradingApi";
 import AiTradeLaunchModal, { type AiTradeLaunchOpts } from "./AiTradeLaunchModal";
 
 vi.mock("@/lib/tradingApi", () => ({ tradingApi: { config: vi.fn() } }));
 // 交易周期模式预设表：与上面两个同级的模块级 mock——弹窗每次打开都会拉它，不 mock 会触发真实 fetch。
-vi.mock("@/lib/aiTradeHorizonApi", () => ({ aiTradeHorizonApi: { profiles: vi.fn() } }));
+vi.mock("@/lib/aiTradeHorizonApi", () => ({
+  aiTradeHorizonApi: { profiles: vi.fn() },
+  // 纪律预设的只读阈值表与周期预设表同住一个模块，整模块 mock 时必须一并给出——漏掉它，
+  // `queryFn` 会是 undefined，症状是一堆无关用例莫名其妙地红。
+  aiTradeDisciplineApi: { presets: vi.fn() },
+}));
 // 模块级 mock（P2-1）：写在文件顶层与 tradingApi mock 同级，否则其余用例的 settings 查询会触发真实 fetch。
 vi.mock("@/lib/autoTradeSettingsApi", () => ({ autoTradeSettingsApi: { get: vi.fn() } }));
 vi.mock("@/lib/api", async (orig) => {
@@ -68,7 +73,27 @@ beforeEach(() => {
   vi.mocked(tradingApi.config).mockResolvedValue({ availUsdt: 1000 } as never);
   vi.mocked(autoTradeSettingsApi.get).mockResolvedValue({ maxBudgetPct: 100, effectiveMaxBudgetPct: 100 });
   vi.mocked(aiTradeHorizonApi.profiles).mockResolvedValue(HORIZON_PROFILES);
+  vi.mocked(aiTradeDisciplineApi.presets).mockResolvedValue(DISCIPLINE_PRESETS_FIXTURE);
 });
+
+// 后端 `GET /ai-trade/discipline-presets` 的最小夹具（中文标签与已格式化的值全由服务端下发，
+// 前端不复制任何一个——这条纪律与周期预设表同源，见 R-3 / G-10）。
+const DISCIPLINE_PRESETS_FIXTURE = {
+  enabled: true,
+  defaultPreset: "balanced" as const,
+  presets: [
+    { id: "steady" as const, label: "稳健",
+      rows: [{ key: "ai_trade_edge_gate_k_min", label: "最小 edge 门禁", value: "2 ×成本",
+               off: false }] },
+    { id: "balanced" as const, label: "均衡",
+      rows: [{ key: "ai_trade_edge_gate_k_min", label: "最小 edge 门禁", value: "1.5 ×成本",
+               off: false }] },
+    { id: "aggressive" as const, label: "激进",
+      rows: [{ key: "ai_trade_profit_guard_hard_tp_return_pct", label: "利润保护·硬止盈",
+               value: "0%", off: true }] },
+    { id: "off" as const, label: "关闭", rows: [] },
+  ],
+};
 
 // 后端 `GET /ai-trade/horizon-profiles` 的最小夹具（数值与中文标签一律来自服务端，前端不复制，R-3）。
 const HORIZON_PROFILES = {
@@ -140,6 +165,95 @@ describe("AiTradeLaunchModal", () => {
     expect(opts.instId).toBe("BTC-USDT-SWAP");
     expect(opts.bar).toBe("1H");
     expect(opts.contextRefreshRounds).toBe(10);
+  });
+
+  // ---------- 交易纪律预设（ai-trade-discipline-preset-and-integrity 轴 A）----------
+  it("默认下发服务端默认预设，并在卡片上明示这是默认值", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    // 本轮唯一改变默认行为的地方，必须**明示**而不是静默生效。
+    expect(screen.getByRole("button", { name: /均衡/ })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("服务端默认")).toBeInTheDocument();
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.discipline).toEqual({ preset: "balanced" });
+  });
+
+  it("选中另一个预设后提交体带该 id，且**不带任何阈值**（阈值真源在服务端冻结表）", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.click(screen.getByRole("button", { name: /稳健/ }));
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.discipline).toEqual({ preset: "steady" });
+    expect(Object.keys(opts.discipline ?? {})).toEqual(["preset"]);
+  });
+
+  it("「关闭」是显式退出口，且其后果说明必须写清楚失去了什么", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.click(screen.getByRole("button", { name: /关闭/ }));
+    expect(screen.getByText(/没有波动率定标、没有回撤刹车/)).toBeInTheDocument();
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    expect((onConfirm.mock.calls[0][0] as AiTradeLaunchOpts).discipline)
+      .toEqual({ preset: "off" });
+  });
+
+  it("展开后的只读阈值表**只渲染后端下发的值**（前端不复制任何一个数）", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    expect(screen.queryByTestId("ai-discipline-threshold-table")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "查看这一档的阈值" }));
+    const table = screen.getByTestId("ai-discipline-threshold-table");
+    expect(table).toHaveTextContent("最小 edge 门禁");
+    expect(table).toHaveTextContent("1.5 ×成本");        // balanced 那一档，来自服务端夹具
+    // 切到另一档 ⇒ 表随之换（若前端自存一份，这里会纹丝不动）。
+    fireEvent.click(screen.getByRole("button", { name: /稳健/ }));
+    expect(screen.getByTestId("ai-discipline-threshold-table")).toHaveTextContent("2 ×成本");
+  });
+
+  it("取值为 0 的阈值显示「关闭」而不是「0」（显式关闭 ≠ 一个很小的数）", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.click(screen.getByRole("button", { name: /激进/ }));
+    fireEvent.click(screen.getByRole("button", { name: "查看这一档的阈值" }));
+    const table = screen.getByTestId("ai-discipline-threshold-table");
+    expect(table).toHaveTextContent("利润保护·硬止盈");
+    expect(table).toHaveTextContent("关闭");
+  });
+
+  it("运维总闸关闭时如实说明，而不是把整个分区藏起来", async () => {
+    vi.mocked(aiTradeDisciplineApi.presets).mockResolvedValue({
+      ...DISCIPLINE_PRESETS_FIXTURE, enabled: false,
+    });
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    expect(await screen.findByText(/本机已由运维总闸整轴关闭/)).toBeInTheDocument();
+  });
+
+  it("阈值表取不到时优雅降级：四张卡与提交路径照常可用", async () => {
+    vi.mocked(aiTradeDisciplineApi.presets).mockRejectedValue(new Error("boom"));
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    expect(screen.queryByRole("button", { name: "查看这一档的阈值" })).toBeNull();
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    expect((onConfirm.mock.calls[0][0] as AiTradeLaunchOpts).discipline)
+      .toEqual({ preset: "balanced" });
+  });
+
+  it("不得宣称阈值「已校准」（[P1-10]：不得宣称不存在的东西）", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    expect(screen.getByText(/尚未经回测校准/)).toBeInTheDocument();
+    expect(screen.queryByText(/已校准|经回测验证/)).toBeNull();
   });
 
   // ---------- 【基础策略】铁律区块（ai-trade-base-strategy-ma-band §6.2 用例 29）----------

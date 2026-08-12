@@ -12,6 +12,11 @@ import {
   validateBacktestRange,
 } from "@/lib/aiBacktest";
 import {
+  DEFAULT_DISCIPLINE_PRESET,
+  DISCIPLINE_COPY,
+  DISCIPLINE_PRESETS,
+} from "@/lib/aiTradeDiscipline";
+import {
   AI_TRADE_BAND_TOLERANCE_OPTIONS,
   AI_TRADE_BASE_RULE_DEFAULTS,
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
@@ -34,7 +39,7 @@ import {
   validateWakeInterval,
 } from "@/lib/aiTrade";
 import { validateHorizon } from "@/lib/aiTradeHorizon";
-import { aiTradeHorizonApi } from "@/lib/aiTradeHorizonApi";
+import { aiTradeDisciplineApi, aiTradeHorizonApi } from "@/lib/aiTradeHorizonApi";
 import {
   clampGroupBudgetToCap,
   DEFAULT_AUTO_TRADE_MAX_BUDGET_PCT,
@@ -57,6 +62,8 @@ import {
 import type {
   AiTradeBackstopRepairMode,
   AiTradeBaseRules,
+  AiTradeDisciplineIn,
+  AiTradeDisciplinePresetsResponse,
   AiTradeGivebackTier,
   AiTradeHorizonProfile,
   AiTradeHorizonProfileId,
@@ -98,6 +105,9 @@ export interface AiTradeLaunchOpts {
   // 交易周期模式（**实盘与回测同源**，holding-horizon §4.3）：选中模式 ⇒ 带 `{enabled,profile,…}`；
   // 取消勾选 ⇒ `{enabled:false}`（**显式关闭**，与「字段缺省=默认开启」语义严格区分）。
   tradingHorizon?: AiTradeHorizonRule;
+  // 交易纪律预设（**实盘与回测同源**，discipline-preset R-3）：只带 `{preset}`，阈值一律由服务端
+  // 的冻结表决定。整键不发 ⇒ 服务端按 `ai_trade_discipline_default_preset` 装配（老客户端同样受保护）。
+  discipline?: AiTradeDisciplineIn;
   contextRefreshRounds: number;
   // Agent 墙钟定时唤醒周期（分钟）：[RN-1] 声明为**可选**（对齐 backtest-only 可选字段），仅 live 分支透传、
   // base 不含、回测省略——若定为非可选，回测 onConfirm 不带该键将 tsc 编译失败。0/关闭 = 仅按 K 线与策略触发。
@@ -214,6 +224,9 @@ export default function AiTradeLaunchModal({
   const [baseRuleDirectional, setBaseRuleDirectional] = useState(
     defaultBaseRule.directional ?? AI_TRADE_BASE_RULE_DEFAULTS.directional,
   );
+  // 交易纪律预设（discipline-preset 轴 A）：**只存一个 id**，阈值一概不在前端保存或重算——
+  // 生效值恒以启动回执 `discipline` 为准（前后端各存一份口径必漂移，`edgeSource` 的成文教训）。
+  const [disciplinePreset, setDisciplinePreset] = useState(DEFAULT_DISCIPLINE_PRESET);
   // 利润保护层（默认开启）：四个数值输入一律走**百分数**（用户口径），提交时统一 /100 转 fraction。
   const [profitGuardEnabled, setProfitGuardEnabled] = useState(
     defaultProfitGuard.enabled ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.enabled,
@@ -283,6 +296,13 @@ export default function AiTradeLaunchModal({
     queryFn: () => aiTradeHorizonApi.profiles(bar),
     enabled: open,
   });
+  // 纪律预设的只读阈值表（与周期预设表同款姿态：**只读、不守总闸、数值与标签全由后端下发**）。
+  // 与 `bar` 无关，故 queryKey 不带它。取不到 ⇒ 表格整段不渲染，四张卡与提交路径照常可用。
+  const disciplineQ = useQuery({
+    queryKey: ["aiTrade", "disciplinePresets"],
+    queryFn: aiTradeDisciplineApi.presets,
+    enabled: open,
+  });
 
   // 弹窗每次打开：回落默认段 / 成员 / 分配模式 / 周期 / 策略 / 轮数 / 区间并清空金额输入。
   useEffect(() => {
@@ -327,6 +347,7 @@ export default function AiTradeLaunchModal({
     setHorizonProfileRaw(defaultTradingHorizon?.profile ?? null);
     setHorizonCustom(seedHorizonCustom(defaultTradingHorizon));
     setRepairMode(null);   // 同上：新增受控输入**必须**塞进这个既有 [open] effect（U-21 守它）
+    setDisciplinePreset(DEFAULT_DISCIPLINE_PRESET);   // 同上（discipline-preset 轴 A 的受控输入）
     setCapitalRaw("");
     setLeverageRaw("");
     setTakeProfitRaw("");
@@ -559,6 +580,9 @@ export default function AiTradeLaunchModal({
       positionStepPct: positionStep,                // 仓位操作档位（实盘/回测两 tab 同得）
       baseRules: baseRulesPayload,                  // 【基础策略】铁律（实盘/回测同源，P1-4）
       tradingHorizon: tradingHorizonPayload,        // 交易周期模式（同一服务端解析点，两侧同源）
+      // 交易纪律预设（同一服务端解析点 `_resolve_discipline`，实盘与回测两侧同源，R-3）。
+      // **只下发 preset，不下发任何阈值**：阈值的唯一真源是后端那张冻结表。
+      discipline: { preset: disciplinePreset },
       contextRefreshRounds: roundsValue,
       bar,                                          // 可编辑周期真正生效（不再被 store.bar 覆盖）
     };
@@ -1061,6 +1085,16 @@ export default function AiTradeLaunchModal({
           </label>
         )}
 
+        {/* 交易纪律预设（discipline-preset 轴 A）：**实盘与回测两段都渲染**——两侧走同一个服务端
+            解析点，只在一边露出就会让用户拿回测调出来的配置在实盘失真（base_rules P1-4 的成文教训）。
+            这是本轮唯一改变默认行为的地方，故必须在此**明示**而不是静默生效。 */}
+        <DisciplinePresetFields
+          value={disciplinePreset}
+          onChange={setDisciplinePreset}
+          disabled={submitting}
+          table={disciplineQ.data ?? null}
+        />
+
         {/* 利润保护层（**实盘与回测两段都渲染**，adaptive §7.2a I-2）：第 1 轮把回测列为非目标，是因为
             当时只想得到「用收盘价近似」这一种做法；本轮 F3 改用 bar 内 OHLC 极值 + 保守成交序，故回测
             段照常露出，但文案必须写明是**保守近似**，不得让用户以为回测 = 实盘。 */}
@@ -1288,6 +1322,97 @@ function matchTierPreset(tiers: AiTradeGivebackTier[] | null | undefined): strin
     list.map((t) => `${t.peakReturnPct}:${t.givebackPct}`).join(",");
   const hit = AI_TRADE_GIVEBACK_TIER_PRESETS.find((preset) => key(preset.tiers) === key(tiers));
   return (hit ?? AI_TRADE_GIVEBACK_TIER_PRESETS[0]).value;
+}
+
+/**
+ * 交易纪律预设分区：4 选 1 卡片 + 每张卡的**一句话后果说明**。
+ *
+ * 为什么必须明示：本轮之前，从这个弹窗启动的会话拿到的是「持有全额预算、没有波动率定标、没有回撤
+ * 刹车、且明知手续费吃得掉预期收益也照开」的 LLM；本轮起默认套上「均衡」预设。这是唯一一处行为
+ * 默认值的改变，静默生效会让用户在下一次「AI 怎么开单变少了」时无从对账。
+ *
+ * 刻意**不在这里显示任何阈值数字**：阈值的唯一真源是后端那张冻结表，前端抄一份必漂移；用户要核对
+ * 具体数值时，启动回执的 `discipline.thresholds` 与统计页的纪律卡都会如实给出**生效值**。
+ */
+function DisciplinePresetFields({
+  value,
+  onChange,
+  disabled,
+  table,
+}: {
+  value: (typeof DISCIPLINE_PRESETS)[number];
+  onChange: (next: (typeof DISCIPLINE_PRESETS)[number]) => void;
+  disabled: boolean;
+  table: AiTradeDisciplinePresetsResponse | null;
+}) {
+  const [open, setOpen] = useState(false);
+  const rows = table?.presets.find((p) => p.id === value)?.rows ?? [];
+  return (
+    <div className="flex flex-col gap-1.5" data-testid="ai-discipline-preset">
+      <span className="text-[11px] text-[var(--muted)]">交易纪律</span>
+      <div className="grid grid-cols-4 gap-1.5">
+        {DISCIPLINE_PRESETS.map((preset) => (
+          <button
+            key={preset}
+            type="button"
+            disabled={disabled}
+            aria-pressed={value === preset}
+            onClick={() => onChange(preset)}
+            className="rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-[11px] text-[var(--text)] transition-colors hover:bg-[var(--surface-2)] aria-[pressed=true]:border-[var(--accent)] aria-[pressed=true]:text-[var(--accent)] disabled:opacity-50"
+          >
+            {DISCIPLINE_COPY[preset].label}
+            {preset === DEFAULT_DISCIPLINE_PRESET && (
+              <span className="block text-[9px] text-[var(--muted)]">服务端默认</span>
+            )}
+          </button>
+        ))}
+      </div>
+      <span className="text-[10px] leading-relaxed text-[var(--muted)]">
+        {DISCIPLINE_COPY[value].detail}
+      </span>
+      {table && !table.enabled && (
+        <span className="text-[10px] leading-relaxed text-[var(--short)]">
+          本机已由运维总闸整轴关闭（AI_TRADE_DISCIPLINE_ENABLED=false）：无论这里选哪一档，本次启动
+          都不会装配纪律层。
+        </span>
+      )}
+      {rows.length > 0 && (
+        <>
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+            className="self-start text-[10px] text-[var(--accent)] underline-offset-2 hover:underline"
+          >
+            {open ? "收起阈值" : "查看这一档的阈值"}
+          </button>
+          {open && (
+            <div
+              className="grid grid-cols-2 gap-x-3 gap-y-0.5 rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5"
+              data-testid="ai-discipline-threshold-table"
+            >
+              {rows.map((r) => (
+                <span key={r.key} className="flex items-center justify-between gap-2 text-[10px]">
+                  <span className="truncate text-[var(--muted)]">{r.label}</span>
+                  <span
+                    className="tabular shrink-0"
+                    style={{ color: r.off ? "var(--muted)" : "var(--text)" }}
+                  >
+                    {r.off ? "关闭" : r.value}
+                  </span>
+                </span>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+      <span className="text-[10px] leading-relaxed text-[var(--muted)]">
+        这组阈值控制仓位大小、开仓门槛、回撤刹车与连亏熔断，
+        <strong className="text-[var(--text)]">尚未经回测校准</strong>
+        ；启动后可在「统计 → 当前」的纪律卡里逐条核对生效值与本会话的拦截次数。
+      </span>
+    </div>
+  );
 }
 
 function ModeTab({

@@ -86,7 +86,8 @@ class LiveExecutor:
                  settings: Settings,
                  place_order_fn=None, close_position_fn=None, positions_fn=None,
                  cancel_order_fn=None, get_order_fn=None, fills_fn=None,
-                 fee_ledger: FeeLedger | None = None):
+                 fee_ledger: FeeLedger | None = None,
+                 bar_seconds: int = 0, bar_anchor_ts: int = 0):
         self.creds = creds
         self.account_id = account_id
         self.inst_id = inst_id
@@ -100,6 +101,15 @@ class LiveExecutor:
         self.min_sz = min_sz
         self.settings = settings
         self.fee_ledger = fee_ledger       # §3.2.0 第七缝：只有 ai_auto 传；None ⇒ live_auto 逐字回退
+        # 成交时钟对齐的两个缝（discipline-preset-and-integrity 轴 D）：**任一为 0 ⇒ 不对齐**，
+        # 故 `live_auto` 的调用点一字不改即逐字节回退。`bar_anchor_ts` 由 `ai_auto` 的会话在每根
+        # 已确认 K 线落地时同步一次（相位由交易所给的真实根决定，不猜时区，见 `_align_bar_ts`）。
+        self.bar_seconds = int(bar_seconds or 0)
+        self.bar_anchor_ts = int(bar_anchor_ts or 0)
+        self.dust_skips = 0                # [P0-4]：因解算量 < minSz 而跳过开仓的次数（纪律条读它）
+        # [P0-4]：启动期按预设保守仓位下界复核出的「解算量可能不足最小下单量」结论。**只有 ai_auto
+        # 的 `_build_executor` 会置真**；本类自己不算它（它需要预设的 f_floor，那是 AI 侧的概念）。
+        self.dust_risk = False
         self.entry_fee_usd = 0.0           # 当前持仓已累计的**开仓腿**费率（三处复位点，§3.3b）
 
         self.projected = "flat"            # 自管持仓状态机（镜像 SimBroker._Position.side）
@@ -256,6 +266,10 @@ class LiveExecutor:
                        order_plan=None) -> list[dict]:
         sz = self._compute_sz(strength, ref_px)
         if sz <= 0 or sz < self.min_sz:
+            # [P0-4]：这条 status 文案在 AI-trade 前端**没有渲染落点**，装配仓位层后它又会从
+            # 「预检盲区」变成常态（真实下单量是 f×budget，f 常落在 0.2~0.4）。计数使纪律条能说出
+            # 「本会话已有 N 次因不足最小下单量跳过开仓」——否则现象与「AI 一直不开单」完全一致。
+            self.dust_skips += 1
             return [self._status_event(
                 f"预算 / 杠杆过小，单笔不足最小下单量（{side}），已跳过该信号")]
         limit_px = _plan_limit_px(order_plan)
@@ -810,6 +824,21 @@ class LiveExecutor:
         return sum(p.get("upl") or 0.0 for p in positions
                    if str(p.get("instId")) == self.inst_id)
 
+    def _align_bar_ts(self, wall: int) -> int:
+        """把墙钟秒吸附到**所属那根真实 K 线**的开盘秒；相位由交易所给的锚点决定，不猜时区。
+
+        **绝不能写成 `(wall // bar_seconds) * bar_seconds`**：那隐含「交易所 K 线以 UTC 整点相位
+        开盘」，而 OKX 的 `12H` / `1D` 是港时（UTC+8）开盘（`_band_structure.py:154` 已成文），
+        UTC 整除既修不好 1D，还会把 K 线驱动轮自己的 ts 从 16:00 系列改写成 00:00。
+
+        两条有意的降级（不静默）：`bar_seconds<=0` 即 `live_auto` 未装配本轴；`bar_anchor_ts<=0`
+        即会话暖机期尚无确认根——此时也确实还没有任何一根 K 线可供落点，逐字回退墙钟。
+        """
+        secs, anchor = self.bar_seconds, self.bar_anchor_ts
+        if secs <= 0 or anchor <= 0:
+            return wall
+        return anchor + ((wall - anchor) // secs) * secs   # 负差走 floor，落到锚点前一根的真实相位
+
     def _make_trade(self, ts: int, side: str, price: float, sz: float, *, pnl: float,
                     reason: str, pnl_pct: float | None = None, tp: float | None = None,
                     sl: float | None = None, explain: dict | None = None,
@@ -817,13 +846,22 @@ class LiveExecutor:
                     seeded: bool = False, position_pct: float | None = None,
                     ord_type: str = "market", expected_px: float | None = None) -> dict:
         position_after = sz if side == "long" else (-sz if side == "short" else 0.0)
-        trade = {"ts": int(ts), "side": side, "price": float(price), "qty": float(sz),
+        # 轴 D 的**唯一写点**：`ts` 吸附到所属那根 K 线的开盘秒（图表标记 / 悬停索引读它）。
+        wall = int(ts)
+        trade = {"ts": self._align_bar_ts(wall),
+                 "side": side, "price": float(price), "qty": float(sz),
                  "fee": 0.0, "pnl": float(pnl), "positionAfter": position_after,
                  "reason": reason, "stopLossPct": self.risk.stop_loss_pct,
                  "takeProfitPct": self.risk.take_profit_pct,
                  "maxHoldBars": self.risk.max_hold_bars,
                  "stopLossPrice": sl, "takeProfitPrice": tp, "seeded": seeded,
                  "explain": explain}
+        # `wallTs`（真实墙钟秒，排序 / 悬停展示 / 导出读它，单调不减）沿用本方法既有的「缺失即省略
+        # 键」风格：**只有装配了对齐的链路（= ai_auto）才带这个键**。这不是可选的洁癖——`live_auto`
+        # 的成交 dict 形状被 `test_ai_trade_switches_never_leak_into_non_ai_executor` 的键集冻结门禁
+        # 守着，无条件多一个键就是一次非 AI 链路的 wire 变更。读侧一律 `wallTs ?? ts`，故省略无损。
+        if self.bar_seconds > 0:
+            trade["wallTs"] = wall
         # pnlPct 为平仓派生收益率（开仓 / 退化断面省略键，与 clOrdId/ordId 同样的「缺失即省略」风格）。
         if pnl_pct is not None:
             trade["pnlPct"] = float(pnl_pct)

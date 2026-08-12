@@ -35,6 +35,7 @@ from .backstop_repair import (RepairRuntime, repair_now_from_executor,
                               rule_from_settings as repair_rule_from_settings, schedule_repair)
 from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, gate_status
 from .cost_runtime import CostRuntime
+from .discipline_runtime import DisciplineRuntime
 from .decider import AiTradeDecider, TradeDecision
 from .exchange_backstop import BackstopRuntime, schedule_from_executor
 from .exit_attribution import classify_live
@@ -136,7 +137,8 @@ class AiTradeSession:
                  profit_rule: ProfitGuardRule | None = None,
                  prior_snapshot: dict | None = None,
                  sizing: SizingRuntime | None = None,
-                 horizon_rule: HorizonRule | None = None):
+                 horizon_rule: HorizonRule | None = None,
+                 discipline_preset: str = "off"):
         self.session_id = session_id
         self.run_id = run_id
         self._specs = specs
@@ -196,6 +198,8 @@ class AiTradeSession:
         self._prior = PriorRuntime(prior_snapshot, executor.settings, horizon_bars=hold_bars)
         # 仓位 / 刹车层（vol-sizing §3.1）：同款下沉；未装配 ⇒ 零动作、无 sizingPlan 键、risk 从不被赋值。
         self._sizing = sizing or SizingRuntime()
+        # 生效纪律自检（discipline-preset §3.2）：同款下沉门面，须排在上面各运行时之后（它持它们的引用）。
+        self._discipline = DisciplineRuntime(self, preset_id=discipline_preset)
         # P0-1：会话级单调持仓序号——`_dispatch` 观察到任一 `side=="close"` 成交即 +1。epoch 身份的一半，
         # 没有它，「保护平仓 → 同一 tick 内同向重开」的新仓会继承旧峰值并被当场强平（真实资金）。
         self._position_seq = 0
@@ -336,6 +340,10 @@ class AiTradeSession:
         meta.setdefault("instId", self.inst_id)
         meta.setdefault("bar", self.bar)
         meta.setdefault("barTs", trade.get("ts"))
+        # 轴 D：`append_live_trade` 是**逐列手抄**（spec §六.3 的「新键自动随行落库」不成立，见 I-1），
+        # 故墙钟秒搭既有 explain 信封的车落库；读侧 `trade_out` 提回顶层，历史与实时同口径。
+        if trade.get("wallTs"):
+            meta.setdefault("wallTs", trade["wallTs"])
         if trade.get("clOrdId"):
             meta.setdefault("clOrdId", trade["clOrdId"])
         if trade.get("ordId"):
@@ -388,6 +396,7 @@ class AiTradeSession:
         for row in rows:
             self._window.prime_append(row)
         self._warmed_bars = len(self._window.candles)
+        self.executor.bar_anchor_ts = self._ref_ts() if self._window.candles else 0  # 轴 D 相位
         if not self.priming or not rows:
             return
         frames = self._window.build_strategy_frames()   # 各策略在整段暖机窗口上的因果帧
@@ -481,6 +490,8 @@ class AiTradeSession:
             events = await self.executor.reconcile(mark, now_ts)
         await self._dispatch(events)
         await self._push_status_if_side_changed()
+        if self._discipline.naked_changed():   # 轴 C [P0-2]：裸仓事实翻转 ⇒ 补推一次 status
+            await self._push({"type": "status", "data": self._status_payload()})
         await self._emit_equity(mark, now_ts)
         await self._emit_position(mark)
         await self._check_staleness(now_ts)
@@ -654,6 +665,7 @@ class AiTradeSession:
         if self._window.is_duplicate(candle):
             return
         row = self._window.append_confirmed(candle)
+        self.executor.bar_anchor_ts = int(row["ts"])   # 轴 D：相位真源 = 交易所给的最近一根确认根
         self._last_candle_wall = self._last_px_wall = time.time()
         self._wake.note_new_bar()         # 轴 C：新根 = 新证据，解锁同方向翻转的防抖锁存
         self._live_row = None             # 该根已收线，旧的未确认行不再有意义
@@ -773,6 +785,7 @@ class AiTradeSession:
                                       context_disclosure=payload.get("contextDisclosure"),
                                       reflection_verdict=reflection_verdict,
                                       reflection_reason=reflection_reason)
+            self._discipline.note_round(degrade)   # 轴 B：三条闸的 firedCount 唯一计数点
             if degrade:
                 await self._emit_degraded(ts, degrade)
             if summary is not None:
@@ -795,8 +808,13 @@ class AiTradeSession:
 
         `finally` 在 `stop()` 取消决策任务时同样会跑，故 `state != "running"` 必须显式挡掉——
         否则停止流程会在 flatten 之后凭空再起一轮真实资金决策。
+
+        E-1（D-4）：三条唤醒源里此前只有本条漏了 `_stale_degraded` 守卫，断流期间会话对外已宣告降级
+        停摆、本条却仍拿陈旧价起真实资金决策。守卫**必须前置在 `plan_catchup` 之前**：它的三条分支
+        都会 `self._backlog.consume()`，写进函数内部一律扣待办，行情恢复后那根 K 线就补不回来了。
         """
-        if self.state != "running" or self._deciding or self._last_board is None:
+        if (self.state != "running" or self._deciding or self._stale_degraded
+                or self._last_board is None):
             return
         now = time.time()
         ref_px = self._current_px()
@@ -1593,6 +1611,7 @@ class AiTradeSession:
                 "contextRefreshRounds": self.context_refresh_rounds,
                 "wakeIntervalMinutes": self._wake_interval_minutes(),
                 "wakeSkips": self.wake_skips,
+                "disciplines": self.discipline_wire(),   # 轴 B：13 行自检 + 恒真自检提示
                 **self._wake.status_counts(self._preview.stats()),   # 调度四计数（A-6 同源）
                 "holdStreak": self.hold_streak,
                 # F2 冷却三载体之一（§4.2）：**不挂 position**——冷却期内按定义已无持仓。
@@ -1606,6 +1625,11 @@ class AiTradeSession:
                 "stopReason": self.stop_reason,
                 "degraded": self.executor.degraded or self._stale_degraded or self.degraded,
                 "flattenFailed": self.flatten_failed, "residual": self.residual}
+
+    def discipline_wire(self) -> dict:
+        """生效纪律自检（轴 B）：13 行固定顺序 + [P1-9] 恒真自检提示；装配全在 `discipline_runtime`。"""
+        rows = self._discipline.rows()
+        return {"rows": rows, "hint": self._discipline.hint(rows)}
 
     def acceptance_bundle(self) -> dict:
         """验收闭环四键（status / 落库 / 分组合并共用**同一次**装配，绝不两处各算一份）。"""
@@ -1682,6 +1706,7 @@ class AiTradeSession:
             metrics["aiStats"] = self._sizing.merge_into(metrics["aiStats"])   # 同款调用点合并
             metrics["aiStats"] = self._horizon.merge_into(metrics["aiStats"])  # §2.12 验收指标
             metrics["aiStats"].update(ai_stats_keys(self.acceptance_bundle()))  # 验收闭环四键
+            metrics["aiStats"] = self._discipline.merge_into(metrics["aiStats"])  # 纪律预设观测
         except Exception as exc:  # noqa: BLE001 —— 富化对 finalize 是加法且可失败，绝不阻断落库收尾
             logger.warning("ai-trade finalize enrichment skipped for run %s: %s", self.run_id, exc)
             for key in ("equityDigest", "decisionsDigest", "aiStats"):

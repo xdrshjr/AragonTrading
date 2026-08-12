@@ -39,9 +39,19 @@ class _FakeSession:
         self.context_refresh_rounds = kw.get("context_refresh_rounds", 10)
         self.take_profit_usd = kw.get("take_profit_usd")
         self.stop_loss_usd = kw.get("stop_loss_usd")
+        # discipline-preset R-2：暖机根数会被服务端抬升，桩须留住它才验得到「抬升真的落到了会话」。
+        self.priming_bars = kw.get("priming_bars")
 
     async def start(self):
         return None
+
+    def discipline_wire(self):
+        """生效纪律自检的会话桩（discipline-preset 轴 B）：桩不装配任何层 ⇒ 空行 + 无提示。
+
+        `group_status()` 会调它——真实 `AiTradeSession` 新增的**被 manager 读到的**方法，
+        测试替身必须同步跟上，否则守的是一个与生产不同构的接口。
+        """
+        return {"rows": [], "hint": None}
 
     def acceptance_bundle(self):
         """验收闭环四键的会话桩（horizon-acceptance）：无成交样本 ⇒ 四键恒 None。"""
@@ -463,7 +473,11 @@ async def test_profit_guard_default_on_when_field_absent(monkeypatch):
             assert r.status_code == 200, r.text
             guard = r.json()["profitGuard"]
             assert guard["enabled"] is True and guard["armReturnPct"] == 0.05
-            assert guard["givebackPct"] == 0.40 and guard["hardTakeProfitReturnPct"] == 0.0
+            assert guard["givebackPct"] == 0.40
+            # discipline-preset-and-integrity [P1-2] / G-13：默认预设 `balanced` 会把硬止盈从
+            # config 默认的 0.0 抬到 0.50。这**不是**回归——它恰恰证明 `_resolve_discipline` 排在
+            # `_resolve_profit_guard` **之前**：顺序一旦写反，这里会静默变回 0.0 且不报任何错。
+            assert guard["hardTakeProfitReturnPct"] == 0.50
             rule = get_ai_trade_manager()._group.profit_rule
             assert rule is not None and rule.enabled and rule.min_hold_s == 30.0
     finally:
@@ -621,5 +635,157 @@ async def test_profit_guard_adaptive_fields_are_mirrored_in_the_receipt(monkeypa
             assert guard["givebackTiers"] == [{"peakReturnPct": 0.10, "givebackPct": 0.35}]
     finally:
         get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+# ---------- 交易纪律预设（ai-trade-discipline-preset-and-integrity 轴 A/B；G-1 / G-14 / [P1-5]）----------
+async def test_discipline_receipt_is_verifiable_end_to_end(monkeypatch):
+    """请求不带 `discipline` ⇒ 服务端按默认预设装配，且回执**可逐字段核对**（绝不静默生效）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(strategy_id))
+            assert r.status_code == 200, r.text
+            wire = r.json()["discipline"]
+            assert wire["preset"] == "balanced" and wire["presetLabel"] == "均衡"
+            assert wire["thresholds"]["ai_trade_sizing_enabled"] is True
+            assert isinstance(wire["rows"], list) and "hint" in wire
+            # 会话真的拿到了派生副本（不是只把数字写进回执）。
+            group = get_ai_trade_manager()._group
+            assert group.members[0].session.executor.settings.ai_trade_sizing_enabled is True
+            assert group.sizing_rule is not None and group.stop_rule is not None
+            # 单策略会话 ⇒ `balanced` 的共识门槛 1 恰好等于策略数，不夹紧、不产生调整项。
+            assert wire["adjustments"] == []
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_discipline_off_falls_back_to_the_pre_feature_behaviour(monkeypatch):
+    """§7.1 零回归：显式 `off` ⇒ 三层全不装配、回执如实说「关闭」。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, discipline={"preset": "off"}))
+            assert r.status_code == 200, r.text
+            assert r.json()["discipline"]["preset"] == "off"
+            assert r.json()["profitGuard"]["hardTakeProfitReturnPct"] == 0.0
+            group = get_ai_trade_manager()._group
+            assert group.members[0].session.executor.settings.ai_trade_sizing_enabled is False
+            assert group.sizing_rule is None and group.stop_rule is None
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_conflicting_discipline_body_is_rejected_with_a_named_field(monkeypatch):
+    """[P1-5]：「关闭」+ 覆盖字段 ⇒ 422 且点名字段——静默丢弃用户显式输入是明令禁止的形状。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, discipline={"enabled": False, "edgeGateK": 2.0}))
+            assert r.status_code == 422, r.text
+            error = r.json()["error"]
+            assert error["code"] == "AI_TRADE_DISCIPLINE_CONFLICT"
+            assert "edgeGateK" in error["message"]
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_small_priming_bars_are_raised_instead_of_rejecting_the_start(monkeypatch):
+    """G-4：默认装配**绝不允许**把用户的启动打回 422；抬升在回执里如实披露。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, primingBars=60))
+            assert r.status_code == 200, r.text
+            raised = [a for a in r.json()["discipline"]["adjustments"]
+                      if a["field"] == "primingBars"]
+            assert len(raised) == 1 and raised[0]["from"] == 60 and raised[0]["to"] == 97
+            assert get_ai_trade_manager()._group.members[0].session.priming_bars == 97
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_dust_risk_is_disclosed_in_the_receipt_but_never_blocks_the_start(monkeypatch):
+    """[P0-4] 第一件（G-14）：预算按预设保守下界解算可能低于 minSz ⇒ **不 422**，如实写进回执。
+
+    把「今天本来能启动」的用户挡在门外是更坏的回归；而不说，用户只会看到「AI 一直不开单」。
+    """
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    # minSz 抬到让 f=1.0 的既有预检刚好放行、而 f=0.20 的复核必然命中的量级。
+    # 预算 200 × 杠杆 3 ÷ (ctVal 0.01 × 价 30000) ⇒ f=1.0 时 2.0 张（既有预检放行），
+    # f=0.20（balanced 的保守下界）时只有 0.4 张 ⇒ 复核必然命中。minSz 取两者之间。
+    config = {**_CONFIG, "instMeta": {**_CONFIG["instMeta"], "minSz": 1.0}}
+    _patch(monkeypatch, config=config)
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_start_body(
+                strategy_id, capitalUsd=200.0, leverage=3.0))
+            assert r.status_code == 200, r.text
+            notes = [a for a in r.json()["discipline"]["adjustments"]
+                     if a["field"] == "volSizing"]
+            assert len(notes) == 1 and "最小下单量" in notes[0]["reason"]
+            # G-14 要的是**两个**落点：回执说了、纪律条也得说。只写回执，主面板上那一行仍是
+            # 一片正常的绿，而现象与「AI 一直不开单」完全一致。本用例守这条线的前半段（复核结论
+            # 真的随执行器走），后半段（它上到 `volSizing` 行）由 `test_ai_trade_discipline_session
+            # .py::test_dust_risk_warns_on_the_vol_sizing_row_before_the_first_skip_happens` 守
+            # ——本文件的会话是桩（`_FakeSession.discipline_wire` 恒空），digest 在这里验不到。
+            assert get_ai_trade_manager()._group.members[0].session.executor.dust_risk is True
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_discipline_presets_endpoint_serves_labels_and_thresholds(monkeypatch):
+    """弹窗的只读阈值表数据源：**不守 AI 总闸**（读一张表不下任何单），四档齐、标签为中文。"""
+    await _fresh()
+    app = _load_app()
+    _override(app, ai=False, live=False)          # 总闸全关也必须能读
+    try:
+        async with await _client(app) as client:
+            r = await client.get("/api/ai-trade/discipline-presets")
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["defaultPreset"] == "balanced"
+            assert [p["id"] for p in body["presets"]] == [
+                "steady", "balanced", "aggressive", "off"]
+            balanced = next(p for p in body["presets"] if p["id"] == "balanced")
+            assert balanced["label"] == "均衡"
+            keys = {row["key"] for row in balanced["rows"]}
+            assert "ai_trade_edge_gate_k_min" in keys and "ai_trade_stop_atr_mult" in keys
+            assert all(row["label"] and row["value"] for row in balanced["rows"])
+            assert next(p for p in body["presets"] if p["id"] == "off")["rows"] == []
+    finally:
         app.dependency_overrides.clear()
         await dispose_engine()

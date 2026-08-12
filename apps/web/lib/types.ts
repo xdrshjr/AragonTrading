@@ -306,7 +306,16 @@ export interface TriggerExplain {
 export interface Trade {
   id?: number;
   runId?: number;
+  /**
+   * **K 线开盘秒**（AI 自动交易自 ai-trade-discipline-preset-and-integrity 轴 D 起对齐；
+   * 其余链路仍是墙钟秒）。图表标记与悬停索引读它——它必须落在某一根真实 K 线上。
+   */
   ts: number;
+  /**
+   * 真实**墙钟**秒（轴 D 新增）。同一根 K 线内的多笔成交会共享 `ts`，只有它单调不减，
+   * 故成交表排序 / 悬停展示 / 导出一律读 `wallTs ?? ts`。老数据 / 非 AI 链路缺席 ⇒ 回退 `ts`。
+   */
+  wallTs?: number | null;
   side: "long" | "short" | "close";
   price: number;
   qty: number;

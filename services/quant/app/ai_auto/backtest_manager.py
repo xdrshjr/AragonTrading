@@ -136,6 +136,12 @@ class AiBacktestManager:
             stop_loss_pct=sl or None, take_profit_pct=tp or None,
             take_profit_usd=req.take_profit_usd, stop_loss_usd=req.stop_loss_usd,
             context_refresh_rounds=req.context_refresh_rounds,
+            # 纪律预设的 R-3 优先级**就写在这一行**（discipline-preset-and-integrity §3.1.3）：
+            # 「显式请求字段 > 预设 > config 默认」。`settings` 自本轮起是 API 层 `_resolve_discipline`
+            # 产出的**会话私有派生副本**，故「预设」与「config 默认」经同一个字段抵达，先后由那一层
+            # 决定；本行只负责让显式入参赢。预设值已在 `resolve_updates` 里按策略数做过 R-1 夹紧
+            # （[P1-4]：不夹紧，单策略回测会退化成一条「全 hold」的假曲线）；显式入参**刻意不夹**
+            # ——那是用户对着一个具体数字做的选择，静默改掉它比拒绝更坏。
             min_consensus=(req.min_consensus if req.min_consensus is not None
                            else settings.ai_trade_min_consensus),
             planned_rounds=planned, settings=settings, rest=get_rest_client(), provider=provider,

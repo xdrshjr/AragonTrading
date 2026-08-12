@@ -31,7 +31,11 @@ export default function TradeTooltip({ events, x, y }: TradeTooltipProps) {
     >
       <div className="mb-1.5 flex items-center justify-between">
         <span className="font-semibold">回测成交</span>
-        <span className="tabular text-[var(--muted)]">{fmtTime(events[0].trade.ts)}</span>
+        {/* 轴 D：`ts` 已被吸附到所属 K 线开盘秒（标记落点用），展示时刻必须读真实墙钟 `wallTs`，
+            否则悬停会告诉用户一个整点时间。老数据 / 非 AI 链路缺该键 ⇒ 回退 `ts`，逐字不变。 */}
+        <span className="tabular text-[var(--muted)]">
+          {fmtTime(events[0].trade.wallTs ?? events[0].trade.ts)}
+        </span>
       </div>
       <div className="space-y-1.5">
         {events.map((event) => (

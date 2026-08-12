@@ -189,6 +189,20 @@ def parse_stop_rule(settings) -> StopRule | None:
                     max_tp_pct=float(settings.ai_trade_max_tp_pct))
 
 
+def window_need(rule: SizingRule | None) -> int:
+    """本层需要的收盘价根数 `max(vol_window, corr_min_samples) + 1`；未装配 ⇒ `0`。
+
+    **这个式子在全仓只允许有这一份**（`manager.py:696`「绝不在此复制一份 `_window_max` 公式——
+    复制即漂移」的同款纪律）。`check_window_capacity` 的 422 判据、`SizingRuntime.window_need` 的
+    只读属性、以及纪律预设的 `primingBars` 抬升（discipline-preset-and-integrity R-2）三处都读它：
+    运维把 `AI_TRADE_CORRELATION_MIN_SAMPLES` 从 96 调到 200 时，三处必须一起变——任何一处写死
+    常数，都会让启动被自己的 422 打回，且现场看不出是谁算错了。
+    """
+    if rule is None:
+        return 0
+    return max(int(rule.vol_window), int(rule.corr_min_samples)) + 1
+
+
 def check_window_capacity(rule: SizingRule | None, window_max: int) -> str | None:
     """启动期对账（[P1-6]）：窗口装不下回看根数 ⇒ 返回中文错误文案，调用方据此启动失败（422）。
 
@@ -198,7 +212,7 @@ def check_window_capacity(rule: SizingRule | None, window_max: int) -> str | Non
     """
     if rule is None:
         return None
-    need = max(int(rule.vol_window), int(rule.corr_min_samples)) + 1
+    need = window_need(rule)
     if need <= int(window_max):
         return None
     return (f"行情窗口容量不足：仓位层需要 {need} 根收盘价，当前窗口上限只有 {window_max} 根。"

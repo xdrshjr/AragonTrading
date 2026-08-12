@@ -122,7 +122,10 @@ function TradeRow({
             )}
           </span>
         </span>
-        <span className="text-right tabular text-[var(--muted)]">{fmtTime(trade.ts, false)}</span>
+        {/* 轴 D：成交表读真实墙钟 `wallTs`（`ts` 已是 bar 对齐秒，同根多笔会共享同一个时刻）。 */}
+        <span className="text-right tabular text-[var(--muted)]">
+          {fmtTime(trade.wallTs ?? trade.ts, false)}
+        </span>
         <span className="text-right tabular">{fmtPrice(trade.price)}</span>
         <span
           className="text-right tabular font-medium"

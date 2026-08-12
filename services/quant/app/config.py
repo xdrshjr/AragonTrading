@@ -528,6 +528,15 @@ class Settings(BaseSettings):
     ai_trade_brake_halt_dd_pct: float = Field(default=0.0, ge=0, le=1)   # ④b 第二档「只平不开」
     ai_trade_brake_loss_streak: int = Field(default=0, ge=0)             # ④c 连亏熔断笔数（0=关）
     ai_trade_brake_loss_cooldown_bars: float = Field(default=4.0, ge=0)  # 冷却时长（× 一根 K 线周期）
+    # ---- 交易纪律预设（ai-trade-discipline-preset-and-integrity §3.1.4）----
+    # 上面那一整排 `ai_trade_*` 阈值的**既有默认值本轮一个都没动**（它们仍是「全关」）；改变的只有
+    # 一件事：从 API 层启动的会话会默认套上一份预设副本。故行为默认值的改变**集中且只发生在**
+    # `ai_trade_discipline_default_preset` 这一处（[P1-11]），env 仍是最终的运维退出口。
+    # `ai_trade_discipline_enabled=False` 是本特性**唯一的一键回滚路径**，且**优先级高于请求体**
+    # （沿用 `ai_trade_horizon_backtest_enabled` 等既有总闸惯例）：关 ⇒ 整轴不装配 ⇒ 等价 `off`。
+    ai_trade_discipline_enabled: bool = True
+    ai_trade_discipline_default_preset: Literal["steady", "balanced", "aggressive", "off"] = (
+        "balanced")
     # ---- AI 自动交易 · 回测模式（ai-auto-trading-backtest §2.5，三重决策成本护栏）----
     # 回测每决策根调一次 LLM，成本/时长敏感；三重护栏：决策间隔（降频）+ 决策轮数硬上限（越界启动前
     # 拒绝，绝不静默截断）+ 并发闸（限同时消耗 LLM 的回测数）。字段名即环境变量名（AI_BACKTEST_*，

@@ -57,6 +57,10 @@ export function groupStateFromStatus(row: AiTradeGroupRow): AiTradeGroupState {
     acceptance: row.acceptance ?? null,
     exits: row.exits ?? null,
     funding: row.funding ?? null,
+    // 交易纪律预设（discipline-preset 轴 A/B）：同上——本函数是逐键手抄的映射，不补这一行，
+    // 纪律条在「刷新页面后重发现」这条路径上就恒为空（而 WS status 那条通路是好的，故这个坑
+    // 只在重载后复现，最难被发现）。`aiTradeDiscipline.test.ts` 有一条用例专门守它。
+    discipline: row.discipline ?? null,
     state: "running",
     startedTs: row.createdTs,
     members,

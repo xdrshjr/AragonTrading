@@ -283,13 +283,17 @@ async def append_live_trade(session: AsyncSession, run_id: int, trade: dict) -> 
     刷新后历史触发丢失（R12）。调用方（session._persist_trade）已 try/except 兜底，落库失败不阻塞交易。
     """
     explain = trade.get("explain")
-    if explain is None and (trade.get("clOrdId") or trade.get("ordId")):
+    if explain is None and (trade.get("clOrdId") or trade.get("ordId")
+                            or trade.get("wallTs")):
         # 仓位比例不依赖触发解释；仍复用既有 JSON 列保留 fill 关联键。
-        # schemas.trade_out 会把这种仅含 meta 的内部信封隐藏为 explain=null。
-        explain = {"meta": {
-            "clOrdId": trade.get("clOrdId"),
-            "ordId": trade.get("ordId"),
-        }}
+        # schemas.trade_out 会把这种仅含 meta 的内部信封隐藏为 explain=null（但 meta 里搭车的
+        # 随行键仍会被 `_explain_envelope` 提回顶层）。
+        meta = {"clOrdId": trade.get("clOrdId"), "ordId": trade.get("ordId")}
+        # 轴 D：`live_trades` 无 wallTs 列，墙钟秒只能搭这班车（零迁移，见 spec I-1）。
+        # **有值才写**——`live_auto` 的成交不带该键，塞一个 `null` 进去就是改了非 AI 链路的落库形状。
+        if trade.get("wallTs"):
+            meta["wallTs"] = trade["wallTs"]
+        explain = {"meta": meta}
     explain_json = json.dumps(explain, ensure_ascii=False) if explain is not None else None
     session.add(Trade(
         run_id=run_id, ts=int(trade.get("ts", 0)), side=str(trade.get("side", "")),

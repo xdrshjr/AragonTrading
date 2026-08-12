@@ -22,7 +22,7 @@ import asyncio
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..agent.llm.factory import make_llm_client_from_config
 from ..agent.providers import resolve_active_provider
@@ -41,6 +41,7 @@ from ..paper.strategy_factory import PaperStrategySpec
 from .admission import get_admission_lock
 from .base_rules import MaBandRule, format_charter, rule_wire
 from .cost_runtime import build_charter_text
+from .discipline import PRESET_LABELS
 from .exposure_book import GroupExposureBook
 from .hold_horizon import HorizonRule
 from .hold_horizon import rule_wire as horizon_wire
@@ -155,6 +156,13 @@ class AiTradeGroupStartRequest:
     # 「缺省即开启」只在 API 层 `_resolve_horizon` 解析）。**分组共享同一份契约**——模式是会话级契约
     # 而非标的属性（R-12），与 base_rule / profit_rule 的分组共享姿态一致。
     horizon_rule: HorizonRule | None = None
+    # 交易纪律预设的**回执载体**（discipline-preset-and-integrity 轴 A）。阈值本身不在这里——它们
+    # 已经在 `settings` 那份**会话私有派生副本**里了，这四个字段只为「让用户能核对服务端到底装了
+    # 什么」。默认值 = 未装配（直接构造该 dataclass 的既有测试逐字节零回归）。
+    discipline_preset: str = "off"
+    discipline_f_floor: float = 1.0          # [P0-4] 最小下单量复核用的保守仓位下界（1.0=不复核）
+    discipline_adjustments: list[dict] = field(default_factory=list)
+    discipline_thresholds: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -188,6 +196,9 @@ class AiTradeGroup:
     stop_rule: StopRule | None = None        # ATR 止损规则（总闸②；与①独立）
     exposure_book: GroupExposureBook | None = None   # 分组共享敞口簿（总闸③关 ⇒ None）
     horizon_rule: HorizonRule | None = None  # 交易周期模式（None=未装配），回显 tradingHorizon
+    discipline_preset: str = "off"           # 交易纪律预设 id（"off"=整轴未装配），回显 discipline
+    discipline_adjustments: list[dict] = field(default_factory=list)
+    discipline_thresholds: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -250,6 +261,7 @@ class AiTradeManager:
                 req.total_capital_usd, avail, req.budget_cap_frac, req.default_budget_frac)
             lever = req.leverage or req.settings.live_default_leverage
             plans = self._preflight_group(members, configs, positions, total, lever, pending)
+            self._note_dust_risk(req, plans, lever)   # [P0-4]：如实回执，绝不 422
             group = await self._build_group(req, creds, provider, plans, total, lever)
             self._group = group
             return await self._launch_group_or_rollback(group)
@@ -371,6 +383,47 @@ class AiTradeManager:
         return None
 
     @staticmethod
+    def _dust_risky(req: AiTradeGroupStartRequest, config: dict, budget: float,
+                    lever: float) -> bool:
+        """[P0-4] 单成员的下单量可行性判据（启动回执与纪律条**共用这一份**）。
+
+        既有 dust 预检 `_budget_too_small` 按 **f = 1.0** 算，本判据按该预设的保守仓位下界
+        `f_floor` 再算一次。两个消费者（`_note_dust_risk` 的回执、`executor.dust_risk` 驱动的
+        `volSizing` 纪律条）必须读同一个式子——两处各写一遍，回执与面板迟早会给出相反的结论。
+        """
+        floor = float(req.discipline_f_floor)
+        if floor >= 1.0 or not req.discipline_preset or req.discipline_preset == "off":
+            return False    # 未装配预设 ⇒ 运行期 f 仍由模型自报 ⇒ 既有 f=1.0 预检已是同一口径
+        return AiTradeManager._budget_too_small(config, budget * floor, lever)
+
+    @staticmethod
+    def _note_dust_risk(req: AiTradeGroupStartRequest, plans: list[_MemberPlan],
+                        lever: float) -> None:
+        """[P0-4] 装配仓位层后的**下单量可行性复核**——本轮最可能把用户直接劝退的断面。
+
+        启动期既有的 dust 预检 `_budget_too_small` 按 **f = 1.0**（全额预算 × 杠杆）算可下张数；
+        而装配 `sizing` 之后运行期真实下单量是 `f × budget`，波动率目标化 + 凯利缩放下 f 常落在
+        0.2~0.4，`sizing.py` / `sizing_runtime.py` 里又**没有任何 dust 下限保护**。真的算小了，
+        `executor._do_open` 只会发一条 status 文案就跳过——而那条 message 在 AI-trade 前端没有渲染
+        落点。合起来就是「预检放行 → 每一轮开仓静默不下单 → 用户只看到 AI 一直不开单」，并极可能
+        被误判成「纪律预设把 AI 弄坏了」。
+
+        **刻意不 422**：把「今天本来能启动」的用户挡在门外是更坏的回归。改为在启动回执的
+        `discipline.adjustments` 里如实追加一条；digest 的 `volSizing` 行由 `executor.dust_risk`
+        承载同一句风险提示（G-14 要求**两个**落点都有——只写进回执，主面板上那一行仍然一片正常）。
+        """
+        floor = float(req.discipline_f_floor)
+        risky = [p.inst_id for p in plans
+                 if AiTradeManager._dust_risky(req, p.config, p.budget_usd, lever)]
+        if risky:
+            req.discipline_adjustments.append({
+                "field": "volSizing", "from": None, "to": None,
+                "instIds": risky,
+                "reason": f"预算偏小：仓位层按该预设的保守下界（f={floor:.2f}）解算出的单笔委托量"
+                          f"可能低于交易所最小下单量（{'、'.join(risky)}），届时该轮会跳过开仓。"
+                          "提高总预算或该标的百分比可消除"})
+
+    @staticmethod
     def _has_position(positions: list[dict], inst_id: str) -> bool:
         return any(str(p.get("instId")) == inst_id and abs(p.get("pos") or 0.0) > 0
                    for p in positions)
@@ -421,7 +474,10 @@ class AiTradeManager:
             created_ts=created_ts, members=members,
             wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
             profit_rule=req.profit_rule, sizing_rule=rule, exposure_book=book,
-            stop_rule=parse_stop_rule(req.settings), horizon_rule=req.horizon_rule)
+            stop_rule=parse_stop_rule(req.settings), horizon_rule=req.horizon_rule,
+            discipline_preset=req.discipline_preset,
+            discipline_adjustments=req.discipline_adjustments,
+            discipline_thresholds=req.discipline_thresholds)
 
     async def _build_member(self, ctx: _GroupBuildCtx, plan: _MemberPlan) -> AiTradeGroupMember:
         """建单成员会话：Executor（按 budget_i）+ Decider + Run（含 groupId/allocationPct）+ Session。
@@ -502,7 +558,9 @@ class AiTradeManager:
             wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
             profit_rule=req.profit_rule,
             prior_snapshot=(req.prior_snapshots or {}).get(plan.inst_id), sizing=sizing,
-            horizon_rule=req.horizon_rule)
+            horizon_rule=req.horizon_rule,
+            # 只为落库回答「这次会话开的是哪个预设」；阈值本身已在 executor.settings 那份派生副本里。
+            discipline_preset=req.discipline_preset)
         return AiTradeGroupMember(inst_id=plan.inst_id, allocation_pct=plan.allocation_pct,
                                   budget_usd=plan.budget_usd, session=session, run_id=run_id)
 
@@ -596,6 +654,10 @@ class AiTradeManager:
                 # 交易周期模式回执镜像（同上）：**生效值** + 两个派生量，使「弹窗预览 == 落地」可逐
                 # 字段核对（[P1-9]：只回显入参等于把 expectedHoldBars 的派生关系藏起来）。
                 "tradingHorizon": horizon_wire(group.horizon_rule),
+                # 交易纪律预设回执（轴 A / 轴 B）：`rows` 取任一成员的 13 行自检——预设与阈值是
+                # **分组共享**的（同一份派生 settings），逐成员各发一份只是噪音；成员之间真正会
+                # 分叉的只有 `exchangeBackstop` 那一行，它已随各成员的 `status.disciplines` 下发。
+                "discipline": self._discipline_wire(group),
                 "createdTs": group.created_ts,
                 # 验收闭环三键的**分组合并口径**（horizon-acceptance [P0-3] / [P1-9]）：合并的是
                 # 各成员的原始计数器而不是已判定的卡——比例类指标不可平均。本端点由前端 15s 轮询
@@ -604,11 +666,30 @@ class AiTradeManager:
                 "members": [self._member_row(m) for m in group.members]}
 
     @staticmethod
+    def _discipline_wire(group: AiTradeGroup) -> dict:
+        """分组级纪律回执 = 静态预设（preset/阈值表/调整项）+ 任一成员现算的 13 行自检。
+
+        `rows` 取第一个成员：预设与阈值是分组共享的同一份派生 settings，逐成员各发一份只是噪音。
+        无成员 ⇒ `rows` 为空数组（**不是缺席**）——前端据此区分「还没成员」与「后端没上线这个键」。
+        """
+        digest = (group.members[0].session.discipline_wire() if group.members
+                  else {"rows": [], "hint": None})
+        return {"preset": group.discipline_preset,
+                "presetLabel": PRESET_LABELS.get(group.discipline_preset,
+                                                 group.discipline_preset),
+                "thresholds": group.discipline_thresholds,
+                "adjustments": group.discipline_adjustments,
+                **digest}
+
+    @staticmethod
     def _acceptance_bundle(group: AiTradeGroup) -> dict:
         """分组级验收卡 / 退出分布 / 资金费（合并各成员的原始计数器后**判定一次**）。
 
-        settings 取自成员会话的 executor（进程内同一个 Settings 实例），不另建一次解析——
-        「阈值从哪来」在一个分组里只能有一个答案。无成员 ⇒ 三键 `None`。
+        settings 取自成员会话的 executor。**注意口径**：自 discipline-preset-and-integrity 轴 A 起，
+        每个会话持的是 API 层派生的**会话私有 Settings 副本**（不再是进程级单例），故这里读到的是
+        「本分组这次启动实际生效的那一份」——分组内各成员共享同一份副本，「阈值从哪来」在一个分组
+        里仍然只有一个答案（[P2-7]：原注释「进程内同一个 Settings 实例」已随本轮变成假话，故订正）。
+        无成员 ⇒ 三键 `None`。
         """
         if not group.members:
             return {"acceptance": None, "exits": None, "funding": None}
@@ -762,7 +843,7 @@ class AiTradeManager:
         meta = config.get("instMeta") or {}
         settings = req.settings
         risk = AiTradeManager._resolve_trade_risk(req, settings)
-        return LiveExecutor(
+        executor = LiveExecutor(
             creds=creds, account_id=req.account_row.id, inst_id=inst_id,
             td_mode=settings.live_default_td_mode,
             pos_mode=config.get("posMode") or "long_short_mode",
@@ -771,7 +852,15 @@ class AiTradeManager:
             min_sz=meta.get("minSz") or 0.0, settings=settings,
             # 成本记账的作用域缝（§3.2.0）：**只有** AI 链路注入账本；live_auto 不传 ⇒ 逐字节回退。
             fee_ledger=build_fee_ledger(settings, ct_val=meta.get("ctVal") or 0.0,
-                                        fee_rates=config.get("feeRates")))
+                                        fee_rates=config.get("feeRates")),
+            # 成交时钟对齐（discipline-preset-and-integrity 轴 D / D-3）：同款「只有 AI 链路传」的
+            # 作用域缝。锚点（相位）由会话在每根确认根落地时写入 `executor.bar_anchor_ts`——这里
+            # 只给周期长度，绝不预设 UTC 相位（OKX 的 12H/1D 是港时开盘，[P0-1]）。
+            bar_seconds=BAR_SECONDS[req.bar])
+        # [P0-4] 启动期复核结论随执行器走：纪律条的 `volSizing` 行据此**在第一次跳过发生之前**就
+        # 示警。只在回执里说一句是不够的——回执用户看一眼就走了，而那一行会一直挂在面板上。
+        executor.dust_risk = AiTradeManager._dust_risky(req, config, budget, lever)
+        return executor
 
     @staticmethod
     async def _create_group_run(ctx: _GroupBuildCtx, plan: _MemberPlan,
@@ -806,6 +895,11 @@ class AiTradeManager:
                         "tradingHorizon": horizon_wire(req.horizon_rule),
                         # 仓位/刹车层配置同款落库（零列迁移；三条规则全未装配存 None）。
                         "sizing": sizing_config_wire(req.settings, BAR_SECONDS[req.bar]),
+                        # 交易纪律预设同款落库（零列迁移）：历史会话据此回答「当时开着哪些纪律、
+                        # 服务端替我改了什么」——这正是后续用验收卡校准这组阈值的前提。
+                        "discipline": {"preset": req.discipline_preset,
+                                       "thresholds": req.discipline_thresholds,
+                                       "adjustments": req.discipline_adjustments},
                         # 会话级静态口径标记（cost-truth §3.2 B-4，零迁移）：聚合层据此判断
                         # trades.pnl 是净额还是毛额；缺键的老 run 走 legacy 推定 + costBasisAssumed。
                         "costBasis": ("net" if req.settings.ai_trade_net_pnl_enabled

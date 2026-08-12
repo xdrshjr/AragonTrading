@@ -79,7 +79,11 @@ export default function TradeCandleChartPanel({
   const candles = query.data;
   // E3-b：极长窗口被行情条数上限（Math.min(1000, …)）截断时，首根 K 线晚于开仓 → 诚实提示只显示临近平仓的一段。
   const truncated = candles.length > 0 && candles[0].ts > entry.ts;
-  const holdSec = Math.max(0, exit.ts - entry.ts);
+  // 轴 D：K 线窗口边界仍用已对齐的 `ts`（那正是根边界），但**时长与展示时刻**必须读真实墙钟——
+  // 用对齐后的 ts 算，1H 周期下一笔 20 分钟往返会显示成「持仓 0 秒」。缺键回退 `ts`。
+  const entryWallTs = entry.wallTs ?? entry.ts;
+  const exitWallTs = exit.wallTs ?? exit.ts;
+  const holdSec = Math.max(0, exitWallTs - entryWallTs);
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -95,10 +99,10 @@ export default function TradeCandleChartPanel({
           {direction === "long" ? "开多" : "开空"}
         </span>
         <span className="tabular">
-          开仓 {fmtPrice(entry.price)} @ {fmtTime(entry.ts)}
+          开仓 {fmtPrice(entry.price)} @ {fmtTime(entryWallTs)}
         </span>
         <span className="tabular">
-          平仓 {fmtPrice(exit.price)} @ {fmtTime(exit.ts)}
+          平仓 {fmtPrice(exit.price)} @ {fmtTime(exitWallTs)}
         </span>
         <span className="tabular">持仓 {fmtHoldSpan(holdSec)}</span>
         <span className="tabular font-medium" style={{ color: colorForReturn(exit.pnl) }}>

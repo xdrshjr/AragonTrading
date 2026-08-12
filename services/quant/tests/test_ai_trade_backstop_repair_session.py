@@ -489,7 +489,9 @@ def test_group_status_carries_the_mode_through_the_same_wire():
     manager._group = SimpleNamespace(
         group_id="g1", bar="1H", strategy_ids=[1], strategy_names=["S"],
         total_budget_usd=100.0, leverage=3.0, context_refresh_rounds=50, wake_interval_s=0,
-        base_rule=None, profit_rule=None, horizon_rule=rule, created_ts=0, members=[])
+        base_rule=None, profit_rule=None, horizon_rule=rule, created_ts=0, members=[],
+        # 纪律预设三键（discipline-preset 轴 A）：`group_status()` 现在也回显它们。
+        discipline_preset="off", discipline_adjustments=[], discipline_thresholds={})
     assert manager.group_status()["tradingHorizon"]["backstopRepair"] == "arm"
 
 

@@ -54,6 +54,14 @@ class _FakeAiSession:
     def info(self):
         return {"sessionId": self.session_id, "state": self.state}
 
+    def discipline_wire(self):
+        """生效纪律自检的会话桩（discipline-preset 轴 B）：桩不装配任何层 ⇒ 空行 + 无提示。
+
+        `group_status()` 会调它——真实 `AiTradeSession` 新增的**被 manager 读到的**方法，
+        测试替身必须同步跟上，否则守的是一个与生产不同构的接口。
+        """
+        return {"rows": [], "hint": None}
+
     def acceptance_bundle(self):
         """验收闭环四键的会话桩（horizon-acceptance）：无成交样本 ⇒ 四键恒 None。"""
         return {"acceptance": None, "exits": None, "funding": None,

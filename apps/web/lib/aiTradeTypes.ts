@@ -425,6 +425,77 @@ export interface AiTradeTurnoverWire {
   opensCounted: number;
 }
 
+// ---- 交易纪律预设与生效自检（ai-trade-discipline-preset-and-integrity 轴 A / 轴 B）----
+export type AiTradeDisciplinePreset = "steady" | "balanced" | "aggressive" | "off";
+
+/** 启动请求里的纪律入参；**整键缺省 ⇒ 服务端按默认预设装配**（老客户端同样受保护）。 */
+export interface AiTradeDisciplineIn {
+  enabled?: boolean;
+  preset?: AiTradeDisciplinePreset;
+  // 逐项覆盖（留空=按预设）。`0` 一律表示「显式关闭该闸」。
+  // **与 `enabled=false` / `preset="off"` 同时出现 ⇒ 服务端 422**（静默丢弃显式输入是禁止的形状）。
+  edgeGateK?: number | null;
+  minConsensus?: number | null;
+  minConfidence?: number | null;
+  volTargetAnnual?: number | null;
+  stopAtrMult?: number | null;
+  brakeSlowDdPct?: number | null;
+  brakeHaltDdPct?: number | null;
+  brakeLossStreak?: number | null;
+}
+
+/**
+ * 生效纪律自检的一行（13 行固定顺序，后端 `discipline_view` 装配）。
+ *
+ * `threshold` / `firedCount` 为 `null` 表示**算不出**，绝不是 0——只报「装配了」而不报「拦了多少」
+ * 的面板，在「闸门把每一单都拦了」这个最危险的断面上与「一切正常」长得一模一样。
+ */
+export interface AiTradeDisciplineRow {
+  key: string;
+  label: string;
+  armed: boolean;
+  threshold?: string | null;
+  source: string;                 // preset | rule | runtime
+  note?: string | null;           // armed=false 时后端**恒**给（为什么没生效、怎么开）
+  firedCount?: number | null;     // 本会话累计触发次数；算不出 ⇒ null
+  tone?: "ok" | "warn" | "danger" | null;
+}
+
+/** 会话级 `status.disciplines`：13 行 + [P1-9] 恒真自检提示（一堆闸武装着却一单没开过）。 */
+export interface AiTradeDisciplineDigest {
+  rows: AiTradeDisciplineRow[];
+  hint?: string | null;
+}
+
+/** 分组级 `group.discipline`：静态预设回执 + 上面那份 digest（`rows` / `hint` 平铺在同层）。 */
+export interface AiTradeDisciplineWire extends AiTradeDisciplineDigest {
+  preset: AiTradeDisciplinePreset;
+  presetLabel: string;
+  thresholds?: Record<string, number | boolean> | null;
+  // 服务端替用户改过的每一处（共识夹紧 / 暖机根数抬升 / 最小下单量风险），**如实列出**。
+  adjustments?: { field: string; from?: number | null; to?: number | null; reason: string }[];
+}
+
+/** 只读阈值表的一行（`GET /ai-trade/discipline-presets`）。中文标签与已格式化的值全由后端下发。 */
+export interface AiTradeDisciplineThresholdRow {
+  key: string;
+  label: string;
+  value: string;
+  off: boolean;      // 该阈值取 0 = 这条闸在本预设下**显式关闭**（灰显，不是「没数据」）
+}
+
+export interface AiTradeDisciplinePresetOption {
+  id: AiTradeDisciplinePreset;
+  label: string;
+  rows: AiTradeDisciplineThresholdRow[];
+}
+
+export interface AiTradeDisciplinePresetsResponse {
+  enabled: boolean;            // 运维总闸；false ⇒ 本机整轴关闭，UI 须如实说明而不是把表藏起来
+  defaultPreset: AiTradeDisciplinePreset;
+  presets: AiTradeDisciplinePresetOption[];
+}
+
 export type AiTradeBackstopBasis = "exchange" | "local" | "unavailable";
 
 export interface AiTradeBackstopWire {
@@ -953,6 +1024,10 @@ export interface AiTradeSessionRow {
   acceptance?: AiTradeAcceptance | null;
   exits?: AiTradeExitMix | null;
   funding?: AiTradeFundingStats | null;
+  // 生效纪律自检（discipline-preset 轴 B）：status 事件经 `patchAiTradeMemberStatus` **整体 spread**
+  // 合并进 `m.session`，故运行期数据本来就在——漏的只是类型声明（tsc 报错而非静默丢数据，但极易被
+  // 「后端已下发」骗过去）。老后端 ⇒ undefined ⇒ 纪律条整段不渲染。
+  disciplines?: AiTradeDisciplineDigest | null;
 }
 
 // WS status 事件负载（_status_payload / 轻量 status，会话视图的可增量合并子集）。
@@ -988,6 +1063,9 @@ export interface AiTradeStatusEvent {
   acceptance?: AiTradeAcceptance | null;
   exits?: AiTradeExitMix | null;
   funding?: AiTradeFundingStats | null;
+  // 生效纪律自检（轴 B 主通路）：每次 status 事件随附；裸仓事实翻转时后端会**补推一次** status
+  // （轴 C [P0-2]：刻意不发 `error` 事件——`routeMemberEvent` 没有 error 分支，推了也是丢）。
+  disciplines?: AiTradeDisciplineDigest | null;
 }
 
 export interface AiTradeStartReq {
@@ -1071,6 +1149,7 @@ export interface AiTradeGroupStartReq {
   baseRules?: AiTradeBaseRules | null;  // 【基础策略】铁律（字段省略→服务端默认开启）
   profitGuard?: AiTradeProfitGuardRule | null;  // 利润保护层（字段省略→服务端默认开启）
   tradingHorizon?: AiTradeHorizonRule | null;   // 交易周期模式（字段省略→服务端默认开启）
+  discipline?: AiTradeDisciplineIn | null;      // 交易纪律预设（字段省略→服务端默认 balanced）
 }
 
 // 分组成员行（start 回执 / status 视图共用）：完整会话行 + 分配占比。
@@ -1099,6 +1178,9 @@ export interface AiTradeGroupRow {
   acceptance?: AiTradeAcceptance | null;
   exits?: AiTradeExitMix | null;
   funding?: AiTradeFundingStats | null;
+  // 交易纪律预设回执（轴 A）：`preset` / `adjustments` 使「弹窗选了什么、服务端替我改了什么」
+  // 可逐字段核对；`rows` 是分组共享的 13 行自检（成员间只有 exchangeBackstop 会分叉，走成员 status）。
+  discipline?: AiTradeDisciplineWire | null;
 }
 
 export type AiTradeGroupStartResult = AiTradeGroupRow;
@@ -1167,6 +1249,9 @@ export interface AiTradeGroupState {
   acceptance?: AiTradeAcceptance | null;
   exits?: AiTradeExitMix | null;
   funding?: AiTradeFundingStats | null;
+  // 分组共享的纪律预设回执。由 `groupStateFromStatus` **逐键手抄**写入——那正是本仓库「静默吞新键」
+  // 缺陷的那个函数，不补就永远拿不到（`aiTradeDiscipline.test.ts` 有一条用例专门守它）。
+  discipline?: AiTradeDisciplineWire | null;
   state: "running" | "stopped";
   startedTs: number;
   members: Record<string, AiTradeGroupMemberState>;
