@@ -49,11 +49,25 @@ export interface MarketTicker {
   volCcy24h: number | null;
 }
 
+/**
+ * OKX 链路状态帧（后端 `ws_market.py` 的 `on_stream`，okx-link-resilience 引入）。
+ * 图表**不消费**它，仅作诊断用途；顶栏链路芯片走 REST `/api/okx/connectivity`。
+ * 之所以要在此建模：它与 candle 共用同一条市场 WS，漏掉这一支会让消费端把它错当 K 线。
+ */
+export interface MarketLinkEvent {
+  key: string;
+  state: "connecting" | "subscribing" | "live" | "degraded" | "down";
+  attempt: number;
+  downtimeS: number;
+  detail: string;
+}
+
 export type MarketWsEvent =
   | { type: "candle"; data: Candle }
   | { type: "trade"; data: MarketTrade }
   | { type: "ticker"; data: MarketTicker }
   | { type: "book"; data: OrderBookSnapshot }
+  | { type: "link"; data: MarketLinkEvent }
   | { type: "error"; data: { code: string; message: string } };
 
 export interface LiveMarketState {

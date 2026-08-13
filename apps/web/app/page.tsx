@@ -23,6 +23,7 @@ import {
   subscribeWindowControlsOverlay,
 } from "@/lib/desktop";
 import {
+  isCandleFrame,
   LATEST_CANDLE_LIMIT,
   liveCandleRefreshIntervalMs,
   resolveChartRange,
@@ -453,6 +454,10 @@ export default function Page() {
           throttle.pushBook(event.data);
           return;
         }
+        // 收敛到 K 线帧：**只有** type==="candle" 才是 K 线。原先此处以 else 兜底，把后端后加的
+        // 链路状态帧（type==="link"）当成 K 线写进图表数据，其 ts 为 undefined，令图表库抛错、
+        // 整棵 React 树卸载 → 桌面端开屏白屏（见 isCandleFrame 注释）。
+        if (!isCandleFrame(event)) return;
         // candle：confirm/forming 维持即时（右侧 K 线需即时落定）；其价格经门控并入节流缓冲，
         // 使 flush 成为 lastPrice 的唯一写入口，避免与节流流互相打架（面板顶部最新价同步降到 1~2Hz）。
         const candle = event.data;

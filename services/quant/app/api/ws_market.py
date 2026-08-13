@@ -61,7 +61,11 @@ async def ws_market(websocket: WebSocket) -> None:
         await _send_if_open(closed, websocket, "error", {"code": code, "message": message})
 
     async def on_stream(event: StreamEvent) -> None:
-        # 链路状态是**加法**事件类型：前端遇到未知 type 本就忽略，故老前端零影响。
+        # 链路状态是**加法**事件类型：前端只消费显式认得的 type，其余忽略（见 web 侧
+        # chartLive.isCandleFrame）。该前提在引入本帧时并不成立——彼时消费端用 else 兜底
+        # 把未匹配的帧一律当 K 线，本帧遂以 ts=undefined 进图表数据打崩渲染层致桌面端白屏
+        # （docs/diagnoses/desktop-white-screen-market-ws-link-frame）。再加新事件类型前，
+        # 请确认消费端仍是白名单判据。
         # 浏览器据它可以在图表上如实说「正在重连」，而不必等 15s 的 /api/health 轮询。
         await _send_if_open(closed, websocket, "link", {
             "key": event.key, "state": event.state, "attempt": event.attempt,
