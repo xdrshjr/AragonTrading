@@ -62,17 +62,15 @@ function backendEnv({ mode, dbPath, agentEnv } = {}) {
   // prod 默认开启自动交易总闸（缺失的唯一源）。置于 agentEnv 透传之前，使用户 userData/agent.env 的显式值可覆盖。
   if (mode === 'prod') {
     env.LIVE_AUTO_TRADING_ENABLED ??= 'true';
+    env.AI_TRADE_ENABLED ??= 'true';
   }
-  // prod：把 AGENT_* / LIVE_* / AI_TRADE_* / DISCOVERY_* 注入后端子进程 env（密钥仅在后端，
-  // 绝不下发前端，R3/R4；实盘开关 C1-6）。
-  // AI_TRADE_* 为 ai-auto-trading 必改透传（P1-6）：否则 Settings extra="ignore" 会静默丢弃未
-  // 透传的 AI_TRADE_ENABLED，打包/prod 将永远无法启用 AI 自动交易。因 AI_TRADE_ENABLED 默认 OFF
-  // （安全姿态），刻意**不**为其加 prod 默认注入行（对比上方 LIVE_AUTO_TRADING_ENABLED ??=
-  // 'true'）——用户在 prod 须显式提供 env 方可开启。
-  // DISCOVERY_* 为 strategy-factor-discovery 必改透传（§六）：漏改即所有 DISCOVERY_ env 静默
-  // 失效，打包/prod 将无法用 agent.env 覆盖挖掘总闸与配额。
-  // OKX_ 为 okx-link-resilience 必改透传（§3.5）：不加则打包版**所有** OKX_LINK_* 旋钮
-  // （心跳 / 退避 / 熔断 / 连接池 / 补根上限）静默失效——这类漏改从不报错，已栽过两次。
+  // prod：把 AGENT_* / LIVE_* / AI_TRADE_* / DISCOVERY_* 注入后端子进程 env（密钥仅在后端，绝不下发
+  // 前端，R3/R4；实盘开关 C1-6）。AI_TRADE_* 为 ai-auto-trading 必改透传（P1-6）；DISCOVERY_* 为
+  // strategy-factor-discovery 必改透传（§六）：否则 Settings extra="ignore" 会静默丢弃未透传的
+  // DISCOVERY_ENABLED 等键，打包/prod 将无法用 agent.env 覆盖挖掘总闸与配额（漏改即所有
+  // DISCOVERY_ env 静默失效）。OKX_ 为 okx-link-resilience 必改透传（§3.5）：不加则打包版
+  // **所有** OKX_LINK_* 旋钮（心跳 / 退避 / 熔断 / 连接池 / 补根上限）静默失效——这类漏改
+  // 从不报错，本仓库已为它栽过两次。
   if (mode === 'prod' && agentEnv && typeof agentEnv === 'object') {
     for (const [key, value] of Object.entries(agentEnv)) {
       if ((key.startsWith('AGENT_') || key.startsWith('LIVE_') || key.startsWith('AI_TRADE_')

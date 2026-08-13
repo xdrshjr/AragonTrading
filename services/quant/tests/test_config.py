@@ -6,6 +6,22 @@ from pydantic import ValidationError
 from app.config import Settings
 
 
+def test_ai_trade_is_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("AI_TRADE_ENABLED", raising=False)
+
+    settings = Settings(_env_file=None)
+
+    assert settings.ai_trade_enabled is True
+
+
+def test_ai_trade_can_be_explicitly_disabled(monkeypatch):
+    monkeypatch.setenv("AI_TRADE_ENABLED", "false")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.ai_trade_enabled is False
+
+
 # ---------- 唤醒调度闭环（ai-trade-wake-scheduler-closed-loop §4.2 / C-7）----------
 def test_wake_scheduler_defaults_ship_axis_c_switched_off():
     """轴 A / B 默认开、轴 C 默认**关**。

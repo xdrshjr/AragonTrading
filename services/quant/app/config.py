@@ -125,9 +125,10 @@ class Settings(BaseSettings):
     # 字段名即环境变量名（AI_TRADE_*，大小写不敏感）。**必须真的声明这些字段**：Settings 为
     # extra="ignore"，未声明的 AI_TRADE_* env 会被静默丢弃（P1-6）。桌面打包须在
     # desktop/src/lib/config.js prod 白名单补 key.startsWith('AI_TRADE_') 方能透传（P1-6）。
-    # 安全：自动化专用总闸 ai_trade_enabled 默认关闭（AI 下单默认关闭闸）；启动须 API 层显式同时
+    # AI 自动交易总闸默认开启；仍可经 AI_TRADE_ENABLED=false 显式关闭。
+    # 启动须 API 层显式同时
     # 校验 ai_trade_enabled 与 live_trading_enabled 皆为 True 方可放行（双闸）。
-    ai_trade_enabled: bool = False               # 自动化专用总闸：False 时 /ai-trade 写类一律 403
+    ai_trade_enabled: bool = True                # 自动化专用总闸：False 时 /ai-trade 写类一律 403
     ai_trade_default_capital_frac: float = 0.01  # 留空默认预算 = availUsdt × 该值（保守 1%）
     # AI 分组预算的**可选**绝对天花板分数（默认 1.0=不约束，实际天花板委托给账户级 maxBudgetPct 与分组运营
     # 天花板 live_auto_group_max_capital_frac，与非 AI 多标的分组口径统一）；运维如需 AI 专属更紧的绝对上限
