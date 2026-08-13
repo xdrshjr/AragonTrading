@@ -23,13 +23,13 @@ import {
   subscribeWindowControlsOverlay,
 } from "@/lib/desktop";
 import {
-  isCandleFrame,
   LATEST_CANDLE_LIMIT,
   liveCandleRefreshIntervalMs,
   resolveChartRange,
   shouldApplyPublicCandle,
   shouldStreamMarket,
 } from "@/lib/chartLive";
+import { isUsableCandle, routeMarketFrame } from "@/lib/marketFrames";
 import { colorForIndex } from "@/lib/compare";
 import { foldTradeTape } from "@/lib/marketDepth";
 import { createMarketThrottle } from "@/lib/marketThrottle";
@@ -412,6 +412,9 @@ export default function Page() {
   // 节流约束：ref 推进必须随入帧同步发生（ref 无渲染成本，candle 分支门控要读最新值），
   // 只有 setLastMarketTs 这个 state 写入才纳入节流（由 throttle 的 flush 统一落库）。
   const advanceMarketTs = (ts: number) => {
+    // 非有限值一律不推进：Math.max 一旦吃进 NaN 就永久锁死这个时钟（`??` 拦不住 NaN），
+    // 之后 K 线分支的 `lastMarketTs <= candle.ts` 恒假，顶部最新价会静默冻结到下次重挂。
+    if (!Number.isFinite(ts)) return;
     lastMarketTsRef.current = Math.max(lastMarketTsRef.current ?? 0, ts);
   };
 
@@ -433,43 +436,21 @@ export default function Page() {
     const ws = marketWS(
       instId,
       bar,
-      (event) => {
-        if (event.type === "error") {
-          setMarketError(event.data.message); // 故障提示保持即时，不进节流
-          return;
-        }
-        setMarketError(null);
-        if (event.type === "trade") {
-          advanceMarketTs(event.data.ts);
-          throttle.pushTrade(event.data);
-          return;
-        }
-        if (event.type === "ticker") {
-          advanceMarketTs(event.data.ts);
-          throttle.pushTicker(event.data);
-          return;
-        }
-        if (event.type === "book") {
-          advanceMarketTs(event.data.ts);
-          throttle.pushBook(event.data);
-          return;
-        }
-        // 收敛到 K 线帧：**只有** type==="candle" 才是 K 线。原先此处以 else 兜底，把后端后加的
-        // 链路状态帧（type==="link"）当成 K 线写进图表数据，其 ts 为 undefined，令图表库抛错、
-        // 整棵 React 树卸载 → 桌面端开屏白屏（见 isCandleFrame 注释）。
-        if (!isCandleFrame(event)) return;
-        // candle：confirm/forming 维持即时（右侧 K 线需即时落定）；其价格经门控并入节流缓冲，
-        // 使 flush 成为 lastPrice 的唯一写入口，避免与节流流互相打架（面板顶部最新价同步降到 1~2Hz）。
-        const candle = event.data;
-        if ((lastMarketTsRef.current ?? 0) <= candle.ts) throttle.pushPrice(candle.c, candle.ts);
-        if (!applyPublicCandle) return;
-        if (candle.confirm === true) {
-          setLive((prev) => mergeUnique(prev, [candle]));
-          setForming(null);
-        } else {
-          setForming(candle);
-        }
-      },
+      // 路由判据集中在 lib/marketFrames：白名单 + K 线形状校验。这条流上不止跑 K 线
+      // （还有链路状态帧），把判据写成兜底式 else 曾令整个应用白屏，见该模块注释。
+      (event) =>
+        routeMarketFrame(event, {
+          setError: setMarketError,
+          advanceMarketTs,
+          pushTrade: throttle.pushTrade,
+          pushTicker: throttle.pushTicker,
+          pushBook: throttle.pushBook,
+          pushPrice: throttle.pushPrice,
+          lastMarketTs: () => lastMarketTsRef.current,
+          applyPublicCandle,
+          onConfirmedCandle: (candle) => setLive((prev) => mergeUnique(prev, [candle])),
+          onFormingCandle: setForming,
+        }),
       (open) => {
         setLiveWsOpen(open);
         if (open) setMarketError(null);
@@ -796,7 +777,9 @@ function handlePaperEvent(
     return;
   }
   if (event.type === "candle") {
-    const candle = event.data as Candle;
+    // 与市场流共用同一道形状闸：ts/c 不是有限数就不许进图表数据（见 lib/marketFrames）。
+    if (!isUsableCandle(event.data)) return;
+    const candle = event.data;
     if (candle.confirm) {
       setters.setLive((prev) => mergeUnique(prev, [candle]));
       setters.setForming(null);
@@ -858,7 +841,9 @@ function handleLiveAutoEvent(event: WsEvent, setters: LiveAutoEventSetters) {
     return;
   }
   if (event.type === "candle") {
-    const candle = event.data as Candle;
+    // 与市场流共用同一道形状闸：ts/c 不是有限数就不许进图表数据（见 lib/marketFrames）。
+    if (!isUsableCandle(event.data)) return;
+    const candle = event.data;
     if (candle.confirm) {
       setters.setLive((prev) => mergeUnique(prev, [candle]));
       setters.setForming(null);

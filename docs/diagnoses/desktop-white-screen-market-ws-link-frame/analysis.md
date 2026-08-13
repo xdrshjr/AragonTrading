@@ -100,21 +100,38 @@ if (candle.confirm === true) { setLive(...); } else { setForming(candle); }
 
 ## 修复
 
-把兜底方向反过来——**只有显式认得的 type 才被消费**：
+把兜底方向反过来——**只有显式认得的 type 才被消费**，并且**进图表的 K 线必须先过形状闸**。
 
-- [apps/web/lib/chartLive.ts](../../../apps/web/lib/chartLive.ts)：新增类型守卫 `isCandleFrame`。
-- [apps/web/app/page.tsx](../../../apps/web/app/page.tsx)：K 线分支前置 `if (!isCandleFrame(event)) return;`，
-  取代原来的 else 兜底。未知 / 后端将来再加的事件类型一律忽略，后端注释里的「加法」前提这才真正成立。
-- [apps/web/lib/types.ts](../../../apps/web/lib/types.ts)：`MarketWsEvent` 补上 `link` 一支
-  （`MarketLinkEvent`），让 wire 的真实形状在类型层可见——下一次后端加事件类型时，
-  漏改会在 `tsc` 阶段而不是在用户的白屏里暴露。
+新模块 [apps/web/lib/marketFrames.ts](../../../apps/web/lib/marketFrames.ts) 是这条流的唯一路由判据：
 
-回归用例：[apps/web/lib/chartLive.test.ts](../../../apps/web/lib/chartLive.test.ts) 的
-`market frame routing`，直接喂一帧真实的 `link`（`state=connecting`）断言它不被当作 K 线，
-并断言它确实没有 `ts`——即「一旦被当 K 线就会打崩图表库」的那个属性。
+- `routeMarketFrame(event, sinks)`：`switch` 白名单路由，`default` 分支里的
+  `const unrouted: never = event` 让「给 `MarketWsEvent` 加一支却忘了在此路由」变成**编译错误**，
+  运行期则静默忽略未建模的 type。落点全部由调用方注入，故不依赖 React 即可单测。
+- `isUsableCandle(data)`：`ts` / `c` 必须是有限数才准进图表。判据取自图表库真正的要求，
+  而不是「后端应该会给对」的信任——链路帧靠它也会被拦下，与它被标成什么 type 无关。
+  三个 K 线入口（市场流 / 模拟盘流 / 自动交易流）共用这道闸。
 
-注：`handlePaperEvent` / `handleLiveAutoEvent` 两个同构的 WS 消费端本来就是
-`if (event.type === "candle")` 的正向判据，不受影响；`marketWS` 全仓也只有这一个消费端。
+改动点：
+
+- [apps/web/app/page.tsx](../../../apps/web/app/page.tsx)：`marketWS` 回调改为调 `routeMarketFrame`；
+  `handlePaperEvent` / `handleLiveAutoEvent` 的 K 线分支接上 `isUsableCandle`。
+- [apps/web/lib/okxLinkTypes.ts](../../../apps/web/lib/okxLinkTypes.ts)：新增 `MarketLinkEvent` 与
+  `OkxWsStreamState`，与顶栏芯片的 `OkxLinkState` 同处一个 wire 模块并写明**两套词表不互转**
+  （`connecting/subscribing/live` 是一条 socket 的状态机，`up/idle/degraded/down` 是通道健康度聚合）。
+  [types.ts](../../../apps/web/lib/types.ts) 的 `MarketWsEvent` 引用它补上 `link` 一支。
+- [apps/web/app/error.tsx](../../../apps/web/app/error.tsx)：段级错误边界。本次事故能把整个应用
+  打没，正因为 `app/` 下没有任何边界，Next 的根兜底只留一行英文黑字（暗色窗口里即"白屏"）。
+  现在会给出中文说明、错误编号与「重试」。
+- `page.tsx` 的 `advanceMarketTs` 加 `Number.isFinite` 闸：`Math.max` 一旦吃进 `NaN` 就永久锁死
+  行情时钟（`??` 拦不住 `NaN`），此后 K 线分支的 `lastMarketTs <= candle.ts` 恒假，顶部最新价
+  会**静默**冻结到下次重挂——与本次同一类「无异常的坏值传播」。
+
+回归用例 [apps/web/lib/marketFrames.test.ts](../../../apps/web/lib/marketFrames.test.ts) 直接驱动
+路由函数，喂后端真实的 link 载荷断言它到不了任何 K 线落点、也不许清掉故障横幅（重连时的
+connecting/subscribing/live 三帧都试）。**已验证它确实能挡住回归**：把 `case "link"` 改回按 K 线
+处理，该用例立刻变红。
+
+注：`marketWS` 全仓只有这一个消费端。
 
 ## 验证
 
@@ -132,6 +149,9 @@ if (candle.confirm === true) { setLive(...); } else { setForming(candle); }
   **注意**：当前工作树的 `desktop/src/lib/config.js` 有未提交改动（prod 默认注入
   `AI_TRADE_ENABLED=true`），重打包会把它一并烤进 asar——那是另一件事的在制品，
   不应作为本次修复的副作用带出去。
-- 本次白屏能把整个应用打没，是因为渲染层没有任何 error boundary。加一个
-  `app/error.tsx`（或 `global-error.tsx`）可把这一类图表库异常降级为局部可恢复错误，
-  而不是整页消失。本次未做，属独立改动。
+- **`link` 帧目前没有任何前端消费者**。它每次状态迁移都在 wire 上跑一趟却无人读；要么把它
+  接进连接面板 / 故障横幅（那才兑现后端注释里「不必等 15s 轮询就能显示正在重连」的承诺），
+  要么连同前端的 `link` 分支一起删掉。本次两者都没做，只把现状写进了后端注释。
+- `applyPublicCandle` 在市场 WS 的 effect 依赖数组里，但它只在 K 线分支被读。切图表视图 /
+  起停模拟盘都会因此拆掉重建整条 socket（丢弃节流挂起帧、重置基线，并让后端重订 OKX 两条流）。
+  改成走 ref 即可保住连接。属既有行为、非本次引入，未动——它牵动实时链路，需要单独验证。

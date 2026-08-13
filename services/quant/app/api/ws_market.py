@@ -61,12 +61,13 @@ async def ws_market(websocket: WebSocket) -> None:
         await _send_if_open(closed, websocket, "error", {"code": code, "message": message})
 
     async def on_stream(event: StreamEvent) -> None:
-        # 链路状态是**加法**事件类型：前端只消费显式认得的 type，其余忽略（见 web 侧
-        # chartLive.isCandleFrame）。该前提在引入本帧时并不成立——彼时消费端用 else 兜底
-        # 把未匹配的帧一律当 K 线，本帧遂以 ts=undefined 进图表数据打崩渲染层致桌面端白屏
-        # （docs/diagnoses/desktop-white-screen-market-ws-link-frame）。再加新事件类型前，
-        # 请确认消费端仍是白名单判据。
-        # 浏览器据它可以在图表上如实说「正在重连」，而不必等 15s 的 /api/health 轮询。
+        # 链路状态是**加法**事件类型。该前提在引入本帧时并不成立——彼时前端用 else 兜底把未
+        # 匹配的帧一律当 K 线，本帧遂以 ts=undefined 进图表数据打崩渲染层致桌面端白屏
+        # （docs/diagnoses/desktop-white-screen-market-ws-link-frame）。现前端改为白名单路由
+        # （web/lib/marketFrames.routeMarketFrame），再加新事件类型前请确认它仍是白名单。
+        # 现状：本帧**尚无前端消费者**（顶栏链路芯片走 REST /api/okx/connectivity 轮询）。
+        # 保留它是为了让「浏览器无需等 15s 轮询即可如实显示正在重连」这条路径可用；若决定不做，
+        # 应连同前端的 link 分支一起删掉，而不是留着一条没人读的流。
         await _send_if_open(closed, websocket, "link", {
             "key": event.key, "state": event.state, "attempt": event.attempt,
             "downtimeS": round(event.downtime_s, 1), "detail": event.detail})

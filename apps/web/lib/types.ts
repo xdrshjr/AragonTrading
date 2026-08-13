@@ -1,3 +1,5 @@
+import type { MarketLinkEvent } from "./okxLinkTypes";
+
 export type Bar = "1m" | "5m" | "15m" | "30m" | "1H" | "4H" | "1D";
 // 回测区间预设（strategy-backtest-config-modal §4.2）：预设换算在打开弹窗时按 now 派生，custom 走用户起止。
 export type RangePreset = "7d" | "30d" | "90d" | "180d" | "1y" | "custom";
@@ -49,19 +51,7 @@ export interface MarketTicker {
   volCcy24h: number | null;
 }
 
-/**
- * OKX 链路状态帧（后端 `ws_market.py` 的 `on_stream`，okx-link-resilience 引入）。
- * 图表**不消费**它，仅作诊断用途；顶栏链路芯片走 REST `/api/okx/connectivity`。
- * 之所以要在此建模：它与 candle 共用同一条市场 WS，漏掉这一支会让消费端把它错当 K 线。
- */
-export interface MarketLinkEvent {
-  key: string;
-  state: "connecting" | "subscribing" | "live" | "degraded" | "down";
-  attempt: number;
-  downtimeS: number;
-  detail: string;
-}
-
+// 链路状态帧的形状属于 OKX 链路这一 wire 面，与顶栏芯片的类型同源，故建在 okxLinkTypes.ts。
 export type MarketWsEvent =
   | { type: "candle"; data: Candle }
   | { type: "trade"; data: MarketTrade }
