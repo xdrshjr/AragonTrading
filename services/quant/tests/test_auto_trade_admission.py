@@ -43,13 +43,30 @@ class _FakeAiSession:
         self.executor = executor
         self.state = "running"
         self.strategy_ids = [s.strategy_id for s in specs]
+        self.inst_id = inst_id
+        self.group_id = ""          # pause-resume：W2/W3 的落点（桩不落盘）
+        self.on_stopped = None      # pause-resume W5：manager 装的收敛回调
 
     async def start(self):
         return None
 
-    async def stop(self, reason="user_stop"):
+    async def stop(self, reason="user_stop", *, flatten=True):
         self.state = "stopped"
         return {"ok": True, "closedSz": 0}
+
+    @property
+    def is_active(self):
+        """`running ∪ paused`（pause-resume §3.1.1；manager 的清组判据读它）。"""
+        return self.state in ("running", "paused")
+
+    def state_member_row(self):
+        """`ai_trade_group_states.members_json` 的单成员行（pause-resume §6.2）。
+
+        与 `discipline_wire` 同一条既有纪律：manager 读什么，测试替身就必须跟上什么。
+        """
+        return {"instId": self.inst_id, "runId": self.run_id, "sessionId": self.session_id,
+                "position": None, "positionUnknown": False,
+                "restingClOrdId": None, "knownClOrdIds": []}
 
     def info(self):
         return {"sessionId": self.session_id, "state": self.state}

@@ -1,13 +1,15 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Badge } from "@/components/ui";
 import {
+  AI_TRADE_PAUSE_REASON_TEXT,
   describeCommittedExit,
   describeProfitGuardCooldown,
   describeProfitGuardFallback,
   describeProfitGuardStatus,
   describeProfitGuardTrail,
+  formatPausedFor,
   isEffectiveExitCommitted,
 } from "@/lib/aiTrade";
 import { aiTradeApi } from "@/lib/aiTradeApi";
@@ -24,9 +26,11 @@ import { colorForReturn, fmtMoney, fmtNum, fmtPct, fmtPrice } from "@/lib/format
 import { useAppStore } from "@/lib/store";
 import { ApiRequestError } from "@/lib/api";
 import type {
+  AiTradeBackstopAtPause,
   AiTradeDisciplineRow,
   AiTradeGroupMemberState,
   AiTradeGroupState,
+  AiTradeResumableGroup,
   ProfitGuardSnapshot,
 } from "@/lib/aiTradeTypes";
 import type { Instrument } from "@/lib/types";
@@ -51,8 +55,11 @@ export default function AiTradePanel({
   onSelect,
 }: AiTradePanelProps) {
   const group = useAppStore((s) => s.aiTradeGroup);
+  const resumable = useAppStore((s) => s.aiTradeResumable);
 
-  if (!group) return null;
+  // 冷续跑卡（ai-trade-pause-resume §1.3 / §3.9.2）：进程重启后内存里没有会话，但磁盘上仍有一份
+  // 可续跑契约。**与热态互斥**（后端 G-9 冻结），故这条早退恰好把两者切开。
+  if (!group) return resumable ? <ResumableCard card={resumable} /> : null;
 
   const members = Object.values(group.members);
   const aggregatePnl = members.reduce((sum, m) => sum + (m.session?.sessionPnlUsd ?? 0), 0);
@@ -60,13 +67,19 @@ export default function AiTradePanel({
   // 前端说「已扣手续费」而后端其实是毛额，比不显示徽标危险得多。
   const netBasis = members.some((m) => m.position?.costAwareness?.netBasis === true);
   const stopped = group.state === "stopped" || members.every((m) => m.session?.state === "stopped");
+  // 暂停（ai-trade-pause-resume §3.9.2）：分组级 `state` 优先，成员级 `state` 兜底（老后端不下发
+  // 分组键时，WS status 那条通路仍会把成员置 paused）。
+  const paused =
+    !stopped && (group.state === "paused" || members.some((m) => m.session?.state === "paused"));
 
   return (
     <div className="flex flex-col gap-2 border-b border-[var(--border)] px-3 py-2.5">
       <div className="flex items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="text-xs font-semibold text-[var(--text)]">AI 自动交易</span>
-          <Badge tone={stopped ? "neutral" : "long"}>{stopped ? "已停止" : "运行中"}</Badge>
+          <Badge tone={stopped ? "neutral" : paused ? "accent" : "long"}>
+            {stopped ? "已停止" : paused ? "已暂停" : "运行中"}
+          </Badge>
           {members.length > 1 && (
             <span className="text-[10px] text-[var(--muted)]">{members.length} 个标的</span>
           )}
@@ -94,6 +107,10 @@ export default function AiTradePanel({
         </span>
       </div>
 
+      {/* 暂停横幅排在最前：暂停期「每轮都没有分析、也从不开单」是**预期行为**，先说清这一条，
+          下面那条可交易性红条才不会被读成「AI 坏了」的第二个证据。 */}
+      {paused && <PausedBanner group={group} members={members} />}
+
       {/* 可交易性红条 + 长期记忆停摆徽标（tradability-and-open-funnel 轴 A / 轴 D）。
           放在纪律条**之上**：当探针判定「这个周期几乎开不出单」时，那是用户最该先看到的一句话
           ——否则「开着、在跑、每轮都有分析、就是从不开单」只会被读成「AI 坏了」。 */}
@@ -118,6 +135,114 @@ export default function AiTradePanel({
           />
         ))}
       </div>
+    </div>
+  );
+}
+
+/**
+ * 冷续跑卡（ai-trade-pause-resume §1.3 / §3.9.2 的冷态文案）。
+ *
+ * **措辞的可信度必须与「此刻真的知道多少」对齐**（[P2-9]）：进程刚起、还没向交易所发过任何请求，
+ * 故这里**绝不能**说「交易所侧止损仍生效」。关机前那次核实只能以**过去时**呈现；那次核实缺失或
+ * 不可得时，整句改成「关机前未能确认是否有交易所侧兜底」——宁可说不知道，也不编一句安心话。
+ *
+ * 动作（继续 / 结束）在 AI 面板头部的控件里，与本卡的分工同既有「面板呈现、控件动作」惯例。
+ */
+function ResumableCard({ card }: { card: AiTradeResumableGroup }) {
+  const holding = card.members.filter((m) => !!m.position || m.positionUnknown);
+  return (
+    <div
+      className="flex flex-col gap-1.5 border-b border-[var(--border)] px-3 py-2.5"
+      data-testid="ai-trade-resumable-card"
+    >
+      <div className="flex flex-wrap items-center gap-1.5">
+        <span className="text-xs font-semibold text-[var(--text)]">已暂停的 AI 自动交易</span>
+        <Badge tone="accent">可继续</Badge>
+      </div>
+      <span className="text-[10px] leading-relaxed text-[var(--muted)]">
+        {card.members.map((m) => m.instId).join("、")} · {card.bar} · 预算{" "}
+        {fmtMoney(card.totalBudgetUsd)} · 已暂停 {card.offlineText}
+        {card.pauseReasonText ? ` · ${card.pauseReasonText}` : ""}
+        {card.resumedCount > 0 ? ` · 已续跑 ${card.resumedCount} 次` : ""}
+      </span>
+      {holding.length > 0 ? (
+        holding.map((m) => (
+          <span key={m.instId} className="text-[10px] leading-relaxed text-[var(--muted)]">
+            {m.instId}：
+            {m.positionUnknown
+              ? "关机前未能读到持仓，继续前会重新向交易所核实。"
+              : `仍持有${m.position?.side === "long" ? "多头" : "空头"} ${fmtNum(
+                  Number(m.position?.size ?? 0),
+                )} 张。`}
+            {describeBackstopAtPause(m.backstopAtPause, card.offlineText)}
+          </span>
+        ))
+      ) : (
+        <span className="text-[10px] text-[var(--muted)]">暂停时无持仓。</span>
+      )}
+      <span className="text-[10px] text-[var(--muted)]">
+        点右侧「AI 自动交易」旁的「▶ 继续」核对持仓后接着跑；也可以直接结束并归档。
+      </span>
+    </div>
+  );
+}
+
+/** 关机前那次兜底核实的**过去时**描述；缺失 / 不可得 ⇒ 明说不知道，绝不编一句安心话。 */
+function describeBackstopAtPause(
+  backstop: AiTradeBackstopAtPause | null | undefined,
+  offlineText: string,
+): string {
+  if (!backstop) return "关机前未能确认是否有交易所侧兜底。";
+  if (!backstop.covered) return "关机前核实的结果是：没有任何持久化兜底。";
+  const px = backstop.stopPx;
+  return `关机前最后一次核实（${offlineText}前）交易所侧止损为 ${px == null ? "—" : fmtPrice(px)}；当前状态需点「继续」后向交易所核实。`;
+}
+
+/**
+ * 暂停期常驻横幅（ai-trade-pause-resume §3.9.2）。
+ *
+ * **常驻，不是 toast**：暂停可能持续一整夜，一条会消失的提示等于没有提示；而「暂停」很容易被
+ * 误读成「AI 坏了」，横幅要把「哪些东西还在跑」明确写出来。
+ *
+ * 措辞的可信度必须与「此刻真的知道多少」对齐（诚实不变式 I-4 / [P2-9]）：这里是**热暂停**
+ * （会话在内存里、盯市与兜底核实照常跑），故可以说「仍挂着」；冷续跑卡在另一处，它只能说
+ * 「关机前最后一次核实是…」——那是过去时，绝不能声称当下仍生效。
+ */
+function PausedBanner({
+  group,
+  members,
+}: {
+  group: AiTradeGroupState;
+  members: AiTradeGroupMemberState[];
+}) {
+  const pausedTs = group.pausedTs ?? null;
+  const [nowTs, setNowTs] = useState(() => Math.floor(Date.now() / 1000));
+  useEffect(() => {
+    const timer = setInterval(() => setNowTs(Math.floor(Date.now() / 1000)), 30_000);
+    return () => clearInterval(timer);
+  }, []);
+  const holding = members.filter((m) => !!m.position);
+  const reason = group.pauseReason ? AI_TRADE_PAUSE_REASON_TEXT[group.pauseReason] : null;
+
+  return (
+    <div
+      className="flex flex-col gap-1 rounded border border-[var(--accent)] bg-[var(--accent-soft)] px-2 py-1.5"
+      data-testid="ai-trade-paused-banner"
+    >
+      <span className="text-[10px] font-medium leading-relaxed text-[var(--accent)]">
+        已暂停：不再开新仓；盯市、保护性平仓、会话止盈止损与交易所侧兜底核实照常运行。
+        {pausedTs ? ` 已暂停 ${formatPausedFor(pausedTs, nowTs)}。` : ""}
+        {reason ? ` （${reason}）` : ""}
+      </span>
+      {holding.length > 0 && (
+        <span className="text-[10px] leading-relaxed text-[var(--muted)]">
+          仍持有：
+          {holding
+            .map((m) => `${m.instId} ${m.position?.side === "long" ? "多头" : "空头"}`)
+            .join("、")}
+          。关闭软件后由交易所侧止损兜底；重新打开并联网后点「继续」即可接着跑。
+        </span>
+      )}
     </div>
   );
 }

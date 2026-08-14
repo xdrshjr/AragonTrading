@@ -570,6 +570,17 @@ class Settings(BaseSettings):
     ai_trade_track_record_min_fee_coverage: float = Field(default=0.5, ge=0, le=1)
     ai_trade_bracket_check_enabled: bool = True        # 轴 E-0 总闸；False ⇒ bracket 整键缺席
     ai_trade_bracket_max_atr_mult: float = Field(default=8.0, gt=0, le=100)      # 固定 pct 止损的告警上限
+    # ---- 暂停 / 继续（ai-trade-pause-resume §6.4）----
+    ai_trade_pause_enabled: bool = True             # 整轴总闸；False ⇒ 写端点 403 + 启动对账逐字回退老行为
+    ai_trade_pause_hold_position_default: bool = True    # 用户暂停时「保留持仓」的默认选项
+    # 优雅退出 / quit-pause 对**运行中**分组的处置：hold（带仓暂停，默认）| flatten（平仓归档）。
+    # 默认 hold：D-4 证明今天那条平仓路径几乎从不执行，而 quit-pause 是能跑通的 HTTP 钩子——
+    # 默认 flatten 等于**新增**「每次关软件都平真仓」，用户重开后无卡可续，本轮需求原地失效。
+    ai_trade_shutdown_action: str = "hold"
+    ai_trade_resume_max_age_s: float = Field(default=604800.0, gt=0)   # 超龄的暂停契约只许归档（7 天）
+    ai_trade_resume_size_tolerance: float = Field(default=0.02, ge=0, le=1)   # 持仓张数对账相对容差
+    ai_trade_resume_backstop_required: bool = False   # 带仓续跑是否强制要求兜底已覆盖（默认只警示）
+    ai_trade_pause_persist_interval_s: float = Field(default=60.0, gt=0)      # 心跳写点节流（W3）
 
     # ---- 策略与因子挖掘（strategy-factor-discovery §六，env 前缀 DISCOVERY_）----
     # 字段名即环境变量名（DISCOVERY_*，大小写不敏感）。⚠️ 三处联动缺一即静默失效：

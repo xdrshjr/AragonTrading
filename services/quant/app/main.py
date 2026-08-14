@@ -21,6 +21,7 @@ from .api import (
     accounts,
     agent,
     ai_auto,
+    ai_trade_lifecycle,
     app_settings,
     discovery,
     discovery_assets,
@@ -61,10 +62,12 @@ async def lifespan(app: FastAPI):
     await _reconcile_weight_train_runs()
     sweeper = asyncio.create_task(_weight_train_sweeper())   # H-B6：周期回收过期终态作业（cancel-safe）
     resumer = asyncio.create_task(_resume_discovery_runs())  # 挖掘任务自动续跑（静置延时后拉起）
+    hydrator = asyncio.create_task(_hydrate_paused_ai_trade())  # AI 自动交易冷占位（不启动任何交易）
     get_health_guard().start()                 # 持续样本外体检守护（双闸每 tick 重读，D-24）
     link_sweeper = asyncio.create_task(_okx_link_sweeper())   # 私有连接池清扫 + 服务器时钟对齐
     yield
     link_sweeper.cancel()
+    hydrator.cancel()
     resumer.cancel()
     sweeper.cancel()                                         # 关停先取消清扫协程（与 manager.shutdown 同段）
     await get_health_guard().shutdown()         # 体检守护先停（它只读行情，无终态可等）
@@ -172,6 +175,54 @@ async def _resume_discovery_runs() -> None:
         return
     except Exception as exc:  # noqa: BLE001 —— 自动续跑非关键，绝不因它拖垮服务启动
         logger.warning("discovery auto-resume skipped: %s", exc)
+
+
+async def _hydrate_paused_ai_trade() -> None:
+    """冷启装上「可续跑的 AI 自动交易分组」轻量占位（ai-trade-pause-resume §3.7）。**不启动任何交易。**
+
+    姿态镜像 `_backfill_companion_strategies`（一次性 session + 整段 try/except，不阻断启动），
+    但多两条 —— 本协程装载的不是观测面，而是**互斥与容量闸的真值**（[P0-3]）：
+    1. **有界重试**：3 次、退避 1s（DB 在启动瞬间被 `init_db` 占着是最常见的失败原因）；
+    2. **失败即置盲区标志**：`manager.note_hydration_failed()` 让 `status()` 回一个非空占位
+       （`live_auto` 零改动地保持互斥），并让 AI 侧容量闸的那次 DB 读在成功时顺手把它清掉。
+
+    换句话说：**仍然不阻断启动（惯例不破），但「我不知道」被显式表示出来，而不是被表示成
+    「没有」**。另含 §八风险 11 的自愈：run 已 `stopped` 而状态表仍 `paused` ⇒ 置 `ended`。
+    """
+    from .ai_auto.manager import paused_ref_from_state_row
+    from .config import get_settings
+    from .db import ai_trade_state_repositories as state_repo
+    from .db import repositories as repo
+    from .db.session import get_sessionmaker
+
+    if not get_settings().ai_trade_pause_enabled:
+        return
+    for attempt in range(3):
+        try:
+            async with get_sessionmaker()() as session:
+                row = await state_repo.load_paused_group_brief(session)
+                if row is None:
+                    return
+                alive = await repo.list_paused_ai_trade_group_ids(session)
+                if row["groupId"] not in alive:
+                    # 状态表落后于 run（W5 那次写失败过）：以**状态表为准**是本特性的原则，但当
+                    # run 已终态时它显然过期了 —— 置 ended 并 warning，绝不留一张指向已平仓会话
+                    # 的续跑卡（§八风险 11）。
+                    await state_repo.patch_group_state(session, row["groupId"],
+                                                       {"status": "ended"})
+                    logger.warning("ai-trade paused contract %s dropped: runs already finalized",
+                                   row["groupId"])
+                    return
+            get_ai_trade_manager().adopt_paused_ref(paused_ref_from_state_row(row))
+            logger.info("ai-trade resumable group hydrated: %s", row["groupId"])
+            return
+        except asyncio.CancelledError:      # 关停取消时干净退出
+            return
+        except Exception as exc:  # noqa: BLE001 —— 有界重试；三次都失败才置盲区标志
+            logger.warning("ai-trade paused-group hydration attempt %d failed: %s",
+                           attempt + 1, exc)
+            await asyncio.sleep(1.0)
+    get_ai_trade_manager().note_hydration_failed()
 
 
 async def _weight_train_sweeper() -> None:
@@ -291,6 +342,7 @@ app.include_router(trading.router, prefix="/api")
 app.include_router(factors.router, prefix="/api")   # 第 9 个路由（因子层 §3.1）
 app.include_router(live_auto.router, prefix="/api")  # 第 10 个路由（实时自动交易，live-auto-trading §4）
 app.include_router(ai_auto.router, prefix="/api")   # AI 自动交易（ai-auto-trading §4；含 WS /ws/ai-trade/{sid}）
+app.include_router(ai_trade_lifecycle.router, prefix="/api")  # AI 自动交易生命周期（暂停/继续/结束，ai-trade-pause-resume §五）
 app.include_router(app_settings.router, prefix="/api")  # 第 11 个路由（设置中心 · 自动交易设置 §4.1）
 app.include_router(workspace.router, prefix="/api")  # 第 12 个路由（workspace 偏好持久化，watchlist-auto-trade-persistence §3）
 app.include_router(weight_models.router, prefix="/api")  # 权重模型工作区（weight-model-workspace §五；含 WS /ws/weight-train/{jobId}）

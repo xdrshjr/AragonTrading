@@ -5,6 +5,7 @@ import type { AccountMode } from "./types";
 import type {
   AiTradeAction,
   AiTradeDecision,
+  AiTradeGroupState,
   AiTradeGivebackTier,
   AiTradeProfitGuardRule,
   AiTradeRoundTrace,
@@ -16,6 +17,7 @@ import type {
   MarketContext,
   MultiTimeframeFrame,
   PriceAction,
+  AiTradeResumableGroup,
   ProfitGuardCooldown,
   ProfitGuardSnapshot,
   TacticalFrame,
@@ -1096,3 +1098,49 @@ function withCatchupMark(
   if (dropped <= 0) return base;
   return { ...base, label: `${base.label} · 补跑` };
 }
+
+
+// ============ 暂停 / 继续（ai-trade-pause-resume §3.9.1）============
+
+/** AI 自动交易在用户眼里的三态。 */
+export type AiTradeLifecycle = "idle" | "running" | "paused";
+
+/**
+ * 生命周期的**唯一**推导点：`group.state` 优先，其次冷占位 `resumable`。
+ *
+ * 任何组件都不得自己拼这个判断——本仓库已经有过「前后端各存一份口径导致静默漂移」的事故，
+ * 而这一个判断决定的是「暂停按钮还是继续按钮」，拼错了用户会对着一个错的按钮做真实资金决策。
+ * 热暂停走 `group.state === "paused"`，冷暂停走 `resumable`；两者**互斥**（后端 G-9 冻结）。
+ */
+export function resolveAiTradeLifecycle(
+  group: AiTradeGroupState | null | undefined,
+  resumable: AiTradeResumableGroup | null | undefined,
+): AiTradeLifecycle {
+  if (group) return group.state === "paused" ? "paused" : "running";
+  return resumable ? "paused" : "idle";
+}
+
+/**
+ * 已暂停时长中文化（`3 小时 12 分`）。
+ *
+ * 与后端 `pause.describe_offline_span` **同口径**：热暂停用本函数按本地时钟现算（每分钟都在变），
+ * 冷续跑卡直接渲染后端下发的 `offlineText`（那是后端按自己的时钟算的，不重算一遍以免两个数打架）。
+ */
+export function formatPausedFor(pausedTs: number | null | undefined, nowTs: number): string {
+  const total = Math.max(0, Math.floor(nowTs - (pausedTs ?? 0)));
+  if (!pausedTs || total < 60) return "不到 1 分钟";
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  return [days ? `${days} 天` : "", hours ? `${hours} 小时` : "", minutes ? `${minutes} 分` : ""]
+    .filter(Boolean)
+    .join(" ") || "不到 1 分钟";
+}
+
+/** 暂停原因 → 中文（后端下发同一枚举；这里只做**装饰性**映射，判定性文案一律走后端）。 */
+export const AI_TRADE_PAUSE_REASON_TEXT: Record<string, string> = {
+  user: "你暂停了它",
+  app_quit: "软件退出时自动暂停",
+  process_restart: "上次未正常退出，已自动暂停",
+  disabled_by_config: "本机已关闭 AI 自动交易，此会话只能结束归档",
+};

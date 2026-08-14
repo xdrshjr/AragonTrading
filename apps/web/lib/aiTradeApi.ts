@@ -4,11 +4,15 @@ import { ApiRequestError } from "./api";
 import { ReconnectingWS, type WsEvent } from "./ws";
 import type {
   AiTradeBackstopRepairResult,
+  AiTradeEndResult,
   AiTradeGroupMemberStopResult,
+  AiTradeGroupRow,
   AiTradeGroupStartReq,
   AiTradeGroupStartResult,
   AiTradeGroupStatusResponse,
   AiTradeGroupStopResult,
+  AiTradePauseResult,
+  AiTradeResumePreview,
 } from "./aiTradeTypes";
 
 const BASE = "/api/py";
@@ -63,6 +67,29 @@ export const aiTradeApi = {
     ),
   // 当前活跃分组 + 是否启用（只读，重载后据此重连各成员 WS）。
   status: () => request<AiTradeGroupStatusResponse>("/ai-trade/status"),
+  // ---- 暂停 / 继续 / 结束（ai-trade-pause-resume §五）----
+  // 暂停：停一切新决策与开仓，**保留持仓**（`holdPosition: false` = 平仓后暂停）。
+  pauseGroup: (groupId: string, body: { holdPosition?: boolean } = {}) =>
+    request<AiTradePauseResult>(`/ai-trade/${groupId}/pause`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  // 续跑复核（只读，会向交易所核实持仓 / 挂单）：离线期间发生了什么、契约有没有漂移。
+  resumePreview: (groupId: string) =>
+    request<AiTradeResumePreview>(`/ai-trade/${groupId}/resume-preview`),
+  // 继续：`verdict === "needs_confirm"` 时必须携 `acknowledge: true`（后端 400 兜底）。
+  resumeGroup: (groupId: string, body: { acknowledge: boolean }) =>
+    request<AiTradeGroupRow>(`/ai-trade/${groupId}/resume`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  // 结束并归档：**带仓时 `flatten` 必填**，选「保留持仓」还要 `acknowledgeOrphanPosition`。
+  endGroup: (groupId: string,
+             body: { flatten?: boolean | null; acknowledgeOrphanPosition?: boolean } = {}) =>
+    request<AiTradeEndResult>(`/ai-trade/${groupId}/end`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
 };
 
 /** 打开一条 AI 自动交易会话 WS（事件协议 {type,data}，含 decision/summary/agent_trace；每成员一条）。 */

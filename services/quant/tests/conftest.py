@@ -65,3 +65,38 @@ def _reset_okx_link_singletons():
     yield
     for s in singletons:
         s.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_ai_trade_pause_state():
+    """每个用例前后清掉 AI 自动交易「可续跑契约」的跨用例残留（ai-trade-pause-resume）。
+
+    与 ``_reset_okx_link_singletons`` 同一条理由：``services/quant`` 的用例**共用一个临时 DB**
+    与一批进程级单例，不复位就会跨用例污染。本轮之后这条尤其要紧：``init_db()`` 的启动对账会把
+    上一个用例残留的 ``running`` run 置成 ``paused`` 并把契约行一并置 ``paused``，于是下一个
+    用例的 ``start`` 会被 ``AI_TRADE_PAUSED_GROUP_EXISTS`` **正确地**挡下来——那是生产上正确的
+    行为，只是把既有用例之间早已存在的状态泄漏暴露了出来。
+
+    用同步 ``sqlite3`` 而不是 async 引擎：夹具是同步的，而 async 引擎的连接池与创建它的事件
+    循环绑定，在夹具里另起一个循环去用它并不安全。表尚未建出（纯单元用例）时静默跳过。
+    """
+    def _wipe() -> None:
+        import sqlite3
+        try:
+            conn = sqlite3.connect(_TMP_DB, timeout=5)
+            try:
+                conn.execute("DELETE FROM ai_trade_group_states")
+                conn.commit()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass          # 表还没建 / 库被占：本夹具只做清扫，绝不因它让用例红
+
+    _wipe()
+    yield
+    _wipe()
+    from app.ai_auto import get_ai_trade_manager
+
+    manager = get_ai_trade_manager()
+    manager._paused_ref = None
+    manager._hydration_failed = False

@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 
+import { groupStateFromStatus } from "./useAiTradeGroupStream";
+import type {
+  AiTradeGroupRow,
+  AiTradeGroupState,
+  AiTradeResumableGroup,
+} from "./aiTradeTypes";
 import {
+  formatPausedFor,
+  resolveAiTradeLifecycle,
   AI_TRADE_DEFAULT_POSITION_STEP,
   AI_TRADE_PROFIT_GUARD_DEFAULTS,
   AI_TRADE_POSITION_STEP_OPTIONS,
@@ -1032,5 +1040,57 @@ describe("describeTacticalFrame / describeTacticalAlignment / describeWakeReason
     expect(describeWakeReason({ kind: "resting_order", trigger: "interval", restingAgeS: 240 })).toBe(
       "挂单盯守 · 未成交委托 · 挂单已 240s",
     );
+  });
+});
+
+
+// ============ 暂停 / 继续（ai-trade-pause-resume §3.9.1 / G-23）============
+describe("resolveAiTradeLifecycle", () => {
+  const group = (state: "running" | "paused" | "stopped") =>
+    ({ groupId: "g", state } as unknown as AiTradeGroupState);
+  const cold = { groupId: "g", pausedTs: 1 } as unknown as AiTradeResumableGroup;
+
+  it("无分组也无冷占位 ⇒ idle", () => {
+    expect(resolveAiTradeLifecycle(null, null)).toBe("idle");
+  });
+
+  it("热态优先：有分组就按 group.state 判，冷占位一概不参与", () => {
+    expect(resolveAiTradeLifecycle(group("running"), cold)).toBe("running");
+    expect(resolveAiTradeLifecycle(group("paused"), cold)).toBe("paused");
+  });
+
+  it("只有冷占位 ⇒ paused（进程重启后磁盘上仍有一份可续跑契约）", () => {
+    expect(resolveAiTradeLifecycle(null, cold)).toBe("paused");
+  });
+});
+
+describe("formatPausedFor", () => {
+  it("与后端 describe_offline_span 同口径（含不到一分钟的诚实措辞）", () => {
+    expect(formatPausedFor(1000, 1030)).toBe("不到 1 分钟");
+    expect(formatPausedFor(0, 99999)).toBe("不到 1 分钟");   // 无暂停时刻 ⇒ 不编一个时长
+    expect(formatPausedFor(1000, 1000 + 3 * 3600 + 12 * 60)).toBe("3 小时 12 分");
+    expect(formatPausedFor(1000, 1000 + 86400 + 3600)).toBe("1 天 1 小时");
+  });
+});
+
+describe("groupStateFromStatus 的 state 不再被写死（D-7 的直接守卫）", () => {
+  const row = (over: Record<string, unknown> = {}) =>
+    ({
+      groupId: "g", bar: "1H", strategyIds: [1], strategyNames: ["S"],
+      totalBudgetUsd: 100, leverage: 3, contextRefreshRounds: 10, createdTs: 0,
+      members: [], ...over,
+    }) as unknown as AiTradeGroupRow;
+
+  it("后端下发 paused ⇒ 前端就是 paused（此前这里写死 running，暂停态在重发现路径上恒不可见）", () => {
+    expect(groupStateFromStatus(row({ state: "paused", pauseReason: "user" })).state).toBe(
+      "paused",
+    );
+    expect(groupStateFromStatus(row({ state: "paused", pauseReason: "user" })).pauseReason).toBe(
+      "user",
+    );
+  });
+
+  it("老后端不下发该键 ⇒ 逐字回退 running", () => {
+    expect(groupStateFromStatus(row()).state).toBe("running");
   });
 });

@@ -49,6 +49,10 @@ class _FakeSession:
         self.context_refresh_rounds = kw.get("context_refresh_rounds", 10)
         self.take_profit_usd = kw.get("take_profit_usd")
         self.stop_loss_usd = kw.get("stop_loss_usd")
+        self.group_id = ""          # pause-resume：W2/W3 的落点（桩不落盘）
+        self.on_stopped = None      # pause-resume W5：manager 装的收敛回调
+        self.pause_reason = None
+        self.paused_ts = 0
 
     async def start(self):
         return None
@@ -66,7 +70,7 @@ class _FakeSession:
         return {"acceptance": None, "exits": None, "funding": None,
                 "acceptanceInput": None}
 
-    async def stop(self, reason="user_stop"):
+    async def stop(self, reason="user_stop", *, flatten=True):
         self.state = "stopped"
         self.stop_reason = reason
         sm = get_sessionmaker()
@@ -74,6 +78,34 @@ class _FakeSession:
             await repo.finalize_run(s, self.run_id, status="stopped",
                                     metrics={"totalReturn": 0.0}, end_ts=_START_TS)
         return {"ok": True, "closedSz": 1}
+
+    # ---- ai-trade-pause-resume：真实 `AiTradeSession` 新增的、**被 manager 读到的**接口 ----
+    # 与上面 `discipline_wire` 同一条既有纪律：manager 读什么，测试替身就必须跟上什么，
+    # 否则守的是一个与生产不同构的接口。
+    @property
+    def is_active(self):
+        """`running ∪ paused`（清组判据与盯市作用域的唯一真源，spec §3.1.1）。"""
+        return self.state in ("running", "paused")
+
+    def state_member_row(self):
+        """`ai_trade_group_states.members_json` 的单成员行（spec §6.2）。"""
+        return {"instId": self.inst_id, "runId": self.run_id, "sessionId": self.session_id,
+                "position": None, "positionUnknown": False,
+                "restingClOrdId": None, "knownClOrdIds": []}
+
+    async def pause(self, reason="user", *, flatten=False):
+        self.state = "paused"
+        self.pause_reason = reason
+        self.paused_ts = _START_TS
+        return {"instId": self.inst_id, "sessionId": self.session_id, "runId": self.run_id,
+                "state": self.state, "pauseReason": reason, "pausedTs": _START_TS,
+                "position": None, "positionUnknown": False, "restingCancelled": None,
+                "backstop": None, "flattened": None}
+
+    async def resume(self):
+        self.state = "running"
+        self.pause_reason = None
+        return {"ok": True, "state": self.state}
 
     def info(self):
         return {"sessionId": self.session_id, "runId": self.run_id, "state": self.state,

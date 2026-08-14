@@ -598,3 +598,37 @@ class CandleCache(Base):
     l: Mapped[float] = mapped_column(Float)
     c: Mapped[float] = mapped_column(Float)
     vol: Mapped[float] = mapped_column(Float)
+
+
+class AiTradeGroupState(Base):
+    """一次 AI 自动交易分组的**可续跑契约**（ai-trade-pause-resume §3.4 / §6.1）。
+
+    为什么是新表而不是给 ``strategy_runs`` 加列：``create_all`` 不给既有表补列（见
+    ``db/session.py`` 的四个 ``_ensure_*_columns`` 补丁与其成文教训），加列必须写 ALTER 补丁；
+    而 ``create_all`` **会**建缺失的表 ⇒ 新表 = 零迁移代码、老库自动获得、不可能 no such column。
+
+    为什么不复用 ``strategy_runs.config_json``：那份缺 ``accountId`` / ``stopLossPct`` /
+    ``takeProfitPct`` / ``primingBars``（spec D-2），照它续跑会静默把用户设的 1% 止损换成服务端
+    默认——一个不会报错的风控失真。故续跑的唯一真源是 ``start_wire_json``（启动请求原文）。
+
+    只落**不可推导**的事实（§3.4.3）：派生量（已实现盈亏 / 持仓序号 / 开仓腿费）一律在续跑时
+    从 ``trades`` 重算，两份必漂移，而这里漂移的是真实资金的盈亏显示。
+    """
+
+    __tablename__ = "ai_trade_group_states"
+    __table_args__ = (Index("ix_ai_trade_group_states_status", "status"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[str] = mapped_column(String(48), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="running")   # running|paused|ended
+    account_id: Mapped[int] = mapped_column(Integer, default=0)
+    bar: Mapped[str] = mapped_column(String(8), default="")
+    start_wire_json: Mapped[str] = mapped_column(Text, default="{}")     # 启动请求原文（续跑唯一真源）
+    resolved_echo_json: Mapped[str] = mapped_column(Text, default="{}")  # 落地回执快照（漂移对照）
+    members_json: Mapped[str] = mapped_column(Text, default="[]")        # 形状见 spec §6.2
+    pause_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    paused_ts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    resumed_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_seen_ts: Mapped[int] = mapped_column(Integer, default=0)        # 心跳（离线时长分母）
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)
+    updated_ts: Mapped[int] = mapped_column(Integer, default=0)

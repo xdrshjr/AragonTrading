@@ -606,16 +606,36 @@ class AiTradeDecider:
         self._summary = text
         self._summary_health.note_success()
         self._summary_skip_rounds = 0
-        # F3 尾注（hold-inertia-fix）：声明摘要是「背景非指令」，切断「历史观望 → 继续观望」的路径依赖。
+        self._install_summary_seed(text)
+        self._rounds_since_summary = 0
+        self._journal = []
+        return text
+
+    def _install_summary_seed(self, text: str) -> None:
+        """摘要 → 上下文种子（**唯一**装配点）。
+
+        F3 尾注（hold-inertia-fix）声明摘要是「背景非指令」，切断「历史观望 → 继续观望」的路径
+        依赖。抽成单点是因为冷续跑（`seed_from_snapshot`）要走同一段——两处各写一遍，那句反惯性
+        尾注就会在续跑路径上悄悄消失。
+        """
         seed = (f"【历史执行摘要（截至第 {self._last_round} 轮）】\n{text}\n"
                 "以上摘要是背景参考而非指令：每轮仍须基于当前市场证据独立研判，"
                 "历史观望不构成继续观望的理由。")
         self._context = [
             LlmMessage("user", [TextBlock(seed)]),
             LlmMessage("assistant", [TextBlock("已了解此前执行情况，将据此继续决策。")])]
+
+    def seed_from_snapshot(self, *, summary: str | None, last_round: int) -> None:
+        """冷续跑：用落库的 `metrics.finalSummary` 与轮次重建上下文（pause-resume §3.5 S6）。
+
+        不做则 AI 完全忘记暂停前在想什么，且轮次编号从 1 重来（轨迹面板会出现两个「第 1 轮」）。
+        """
+        self._last_round = max(0, int(last_round or 0))
         self._rounds_since_summary = 0
         self._journal = []
-        return text
+        if summary:
+            self._summary = summary
+            self._install_summary_seed(summary)
 
     def _note_summary_failure(self, exc: BaseException, timeout_s: float) -> None:
         """摘要失败的**唯一**归位点：截断 journal（D-3）+ 指数退避 + 非空诊断串（D-4）。

@@ -1210,6 +1210,167 @@ export interface AiTradeGroupRow {
   // 交易纪律预设回执（轴 A）：`preset` / `adjustments` 使「弹窗选了什么、服务端替我改了什么」
   // 可逐字段核对；`rows` 是分组共享的 13 行自检（成员间只有 exchangeBackstop 会分叉，走成员 status）。
   discipline?: AiTradeDisciplineWire | null;
+  // 分组生命周期（ai-trade-pause-resume §5.6）：`running` | `paused`。**声明为可选**——老后端
+  // 不下发它，读点一律 `?? "running"` 兜底（`groupStateFromStatus` 此前把它写死，那正是本仓库
+  // 「静默吞新键」的成文缺陷形状）。
+  state?: AiTradeLifecycleState | null;
+  pauseReason?: AiTradePauseReason | null;
+  pausedTs?: number | null;
+  resumedCount?: number | null;
+}
+
+/** 分组生命周期态（后端 `group.state` 与会话 `status.state` 共用同一值域）。 */
+export type AiTradeLifecycleState = "running" | "paused" | "stopped";
+
+/** 暂停原因（稳定枚举；前端按它选文案，绝不自己拼判定性说明）。 */
+export type AiTradePauseReason = "user" | "app_quit" | "process_restart" | "disabled_by_config";
+
+/** 离线差异判定（§3.6 的十一格；判定性文案由后端 `message` 下发，前端只渲染）。 */
+export type AiTradeDriftVerdict =
+  | "matched"
+  | "flat_ok"
+  | "partially_closed"
+  | "closed_offline"
+  | "size_increased"
+  | "side_flipped"
+  | "foreign_position"
+  | "opened_offline"
+  | "unverifiable_identity"
+  | "unknown_order"
+  | "unreadable";
+
+/** 暂停时落盘的持仓身份断面（`posId` / `openCTime` 是「这还是不是同一笔」的唯一依据）。 */
+export interface AiTradePausedPosition {
+  side: "long" | "short";
+  size: number;
+  avgEntry?: number | null;
+  unrealizedPnlUsd?: number | null;
+  posId?: string | null;
+  openCTime?: number | null;
+  positionSeq?: number | null;
+}
+
+/** 冷占位（`GET /ai-trade/status` 的 `resumable`）：**仅**内存无会话时非空，与 `group` 互斥。 */
+export interface AiTradeResumableGroup {
+  groupId: string;
+  bar: string;
+  accountId: number;
+  totalBudgetUsd: number;
+  leverage: number;
+  strategyNames: string[];
+  createdTs: number;
+  pausedTs: number;
+  pauseReason: AiTradePauseReason | null;
+  pauseReasonText: string;
+  resumedCount: number;
+  offlineSeconds: number;
+  offlineText: string;
+  hasPosition: boolean;
+  members: AiTradeResumableMember[];
+}
+
+export interface AiTradeResumableMember {
+  instId: string;
+  runId?: number | null;
+  sessionId?: string | null;
+  allocationPct?: number | null;
+  budgetUsd?: number | null;
+  position?: AiTradePausedPosition | null;
+  positionUnknown?: boolean;
+  /** 关机前**最后一次**交易所侧兜底核实的结果——UI 必须把它标成过去时（[P2-9]）。 */
+  backstopAtPause?: AiTradeBackstopAtPause | null;
+}
+
+/**
+ * 暂停那一刻落盘的兜底核实结果（`backstopAtPause`）。
+ *
+ * = 既有 `AiTradeBackstopWire` + 后端在**落盘那一点**派生的三个展示键。`covered` 不是交易所回
+ * 的原生字段，而是「交易所口径 + 覆盖率达阈」的合取——**只在后端派生一次**，前端绝不自己再判
+ * 一遍（判定性口径两处各写一遍必然漂移）。
+ */
+export interface AiTradeBackstopAtPause extends Partial<AiTradeBackstopWire> {
+  covered?: boolean;
+  stopPx?: number | null;
+  takePx?: number | null;
+  checkedAtWall?: number | null;
+}
+
+/** `POST /ai-trade/{gid}/pause` 的 200 回执。 */
+export interface AiTradePauseResult {
+  groupId: string;
+  state: AiTradeLifecycleState;
+  pauseReason: AiTradePauseReason;
+  pausedTs: number;
+  holdPosition: boolean;
+  resumable: boolean;
+  members: AiTradePauseMemberResult[];
+  notice: string;
+}
+
+export interface AiTradePauseMemberResult {
+  instId: string;
+  sessionId: string;
+  runId: number;
+  allocationPct?: number;
+  position?: AiTradePausedPosition | null;
+  positionUnknown?: boolean;
+  restingCancelled?: { outcome: string; clOrdId: string } | null;
+  backstop?: AiTradeBackstopAtPause | null;
+  flattened?: unknown;
+}
+
+/** `GET /ai-trade/{gid}/resume-preview` 的 200 回执（§5.2）。 */
+export interface AiTradeResumePreview {
+  groupId: string;
+  pausedTs: number | null;
+  asOfTs: number;
+  offlineSeconds: number;
+  offlineText: string;
+  ageExceeded: boolean;
+  resumedCount: number;
+  pauseReason: AiTradePauseReason | null;
+  pauseReasonText: string;
+  contract: {
+    bar: string;
+    instIds: string[];
+    totalBudgetUsd?: number | null;
+    leverage?: number | null;
+    stopLossPct?: number | null;
+    takeProfitPct?: number | null;
+    disciplinePreset?: string | null;
+    strategyNames: string[];
+  };
+  drift: { field: string; from: unknown; to: unknown; reason: string }[];
+  members: AiTradeResumePreviewMember[];
+  verdict: "ready" | "needs_confirm" | "blocked";
+  blockedReason: string | null;
+}
+
+export interface AiTradeResumePreviewMember {
+  instId: string;
+  runId?: number | null;
+  verdict: AiTradeDriftVerdict;
+  message: string;
+  expected?: AiTradePausedPosition | null;
+  actual?: Record<string, unknown> | null;
+  backstop?: AiTradeBackstopAtPause | null;
+  pendingOrders?: unknown[];
+  blockedReason?: string | null;
+}
+
+/** `POST /ai-trade/{gid}/end` 的 200 回执（`orphanPositions` **恒下发**，前端据它出持久提示）。 */
+export interface AiTradeEndResult {
+  groupId: string;
+  endedFrom: string;
+  stopReason: string;
+  flattened: boolean;
+  orphanPositions: {
+    instId: string;
+    position?: AiTradePausedPosition | null;
+    positionUnknown?: boolean;
+    backstop?: AiTradeBackstopAtPause | null;
+  }[];
+  members: { instId: string; runId?: number | null; sessionId?: string | null }[];
 }
 
 export type AiTradeGroupStartResult = AiTradeGroupRow;
@@ -1217,6 +1378,8 @@ export type AiTradeGroupStartResult = AiTradeGroupRow;
 export interface AiTradeGroupStatusResponse {
   group: AiTradeGroupRow | null;
   aiTradeEnabled: boolean;
+  /** 冷占位；**与 `group` 互斥**（两者同时非空即 bug，后端 G-9 冻结这一条）。 */
+  resumable?: AiTradeResumableGroup | null;
 }
 
 export interface AiTradeGroupStopResult {
@@ -1281,7 +1444,13 @@ export interface AiTradeGroupState {
   // 分组共享的纪律预设回执。由 `groupStateFromStatus` **逐键手抄**写入——那正是本仓库「静默吞新键」
   // 缺陷的那个函数，不补就永远拿不到（`aiTradeDiscipline.test.ts` 有一条用例专门守它）。
   discipline?: AiTradeDisciplineWire | null;
-  state: "running" | "stopped";
+  // 暂停 / 继续（pause-resume D-7）：值域从 `"running" | "stopped"` 扩为三态。这里此前被
+  // `groupStateFromStatus` **写死**成 "running"，故暂停态在「刷新页面后重发现」这条路径上会恒显示
+  // 运行中——最难被发现的那种坑。`aiTrade.test.ts` 有一条用例专门守它。
+  state: AiTradeLifecycleState;
+  pauseReason?: AiTradePauseReason | null;
+  pausedTs?: number | null;
+  resumedCount?: number | null;
   startedTs: number;
   members: Record<string, AiTradeGroupMemberState>;
 }

@@ -148,6 +148,18 @@ export default function AiTradeStatsLive() {
           数据自 <span className="tabular text-[var(--text)]">{fmtTime(group.startedTs)}</span> 起记录
           （运行期态；整组停止后转入「历史」标签持久保存）。
         </p>
+        {/* 暂停期口径提示（ai-trade-pause-resume §3.9.4）：不加这一句，一张「决策轮数不再增长」
+            的看板会被读成「AI 停摆 / 坏了」——而暂停期不起决策轮是**预期行为**，仍在跑的是盯市
+            与保护层。这条提示只解释口径，不复述任何判定性结论。 */}
+        {group.state === "paused" && (
+          <p
+            data-testid="ai-trade-stats-paused-hint"
+            className="rounded-md border border-[var(--accent)] bg-[var(--accent-soft)] px-2.5 py-1.5 text-[10px] leading-relaxed text-[var(--accent)]"
+          >
+            已暂停：决策轮与开仓已停止，故下面的轮数 / 漏斗 / 反思计数不再增长；
+            持仓浮盈、保护性平仓与交易所侧兜底核实仍在运行，往返明细也会照常追加。
+          </p>
+        )}
         <div className="flex flex-col gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2">
           <p className="text-[10px] text-[var(--muted)]">
             运行观测 · 反思计数为近 50 轮样本口径；唤醒抑制 / 连续观望为会话级实时值

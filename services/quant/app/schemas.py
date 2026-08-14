@@ -901,6 +901,41 @@ class AiTradeGroupStartIn(BaseModel):
         return self
 
 
+# ---- 暂停 / 继续 / 结束（ai-trade-pause-resume §五）----
+# ⚠️ **本组只定义请求体，不定义 response_model**：AI-trade 的三个生命周期端点一律 `-> dict`。
+# 理由是本仓库的成文教训——`response_model` 会把回执里的新键**静默吞掉**（`OkxAccountPosition`
+# 吞掉 `posId` 就是同一形状），而这三个回执（逐成员 verdict / 兜底覆盖 / orphanPositions）正是
+# 用户拿着真钱做决定的唯一依据，少一个键就是少一条事实。
+class AiTradePauseIn(BaseModel):
+    """暂停请求。两键皆可省：`holdPosition` 缺省取 `ai_trade_pause_hold_position_default`。"""
+
+    holdPosition: bool | None = None      # True=保留持仓暂停（默认）；False=平仓后暂停
+    reason: str = "user"                  # 稳定枚举，见 spec §3.0（前端只发 "user"）
+
+
+class AiTradeResumeIn(BaseModel):
+    """继续请求。
+
+    `onDrift` 已在 v2 删除（原值域 abort | flatten）：`size_increased` / `side_flipped` /
+    `foreign_position` / `opened_offline` 四格的共同事实是**交易所上那部分名义额里有我们没开过
+    的**，替用户平掉它等于未经授权动用他的资金。漂移只有「拒绝」一条路。
+    """
+
+    acknowledge: bool = False             # 复核框勾选态；verdict=needs_confirm 时必须为 True
+
+
+class AiTradeEndIn(BaseModel):
+    """结束（归档）请求。
+
+    [P1-12]：`flatten` **没有默认值**。带仓时必填，且选「不平仓」还要
+    `acknowledgeOrphanPosition=true`——否则「结束」会造出一个「本地已归档、交易所上仍在」的
+    孤儿仓，而本轮的立论正是「今天已经存在孤儿持仓，只是没人告诉用户」。
+    """
+
+    flatten: bool | None = None
+    acknowledgeOrphanPosition: bool = False
+
+
 # ---- 信号先验快照（ai-trade-signal-prior-and-ev-gate §4.1）----
 class AiTradePriorRebuildIn(BaseModel):
     """重建某 `(instId, bar)` 的先验快照。`strategyIds` 为空数组 = 只建 `signal_edge` 侧。

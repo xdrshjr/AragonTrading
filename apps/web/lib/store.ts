@@ -32,6 +32,7 @@ import type {
   AiTradeConfig,
   AiTradeDecision,
   AiTradeGroupState,
+  AiTradeResumableGroup,
   AiTradeRoundTrace,
   AiTradeSessionRow,
   AiTradeStatusEvent,
@@ -405,6 +406,14 @@ interface AppState {
   // 刷新由 GET /ai-trade/status 重发现）。成员按 instId 映射，各承载会话视图 / 成交 / 持仓 / 决策 / 轨迹 /
   // 摘要（镜像 liveAutoGroup）。aiTradeConfig 为持久化偏好（记忆上次策略集合与刷新轮数，进 partialize）。
   aiTradeGroup: AiTradeGroupState | null;
+  // 冷占位（ai-trade-pause-resume §3.9.4）：进程重启后磁盘上仍有一份可续跑契约时非空。
+  // **与 `aiTradeGroup` 互斥**——热暂停走 `aiTradeGroup.state === "paused"`，冷暂停才走这里。
+  aiTradeResumable: AiTradeResumableGroup | null;
+  // 生命周期回执的**持久**提示（暂停回执 notice / 结束后的孤儿持仓，§3.10 / §5.4）：这两条都是
+  // 后端单点生成的判定性事实，必须有读点且**不能是 toast**——「结束后这些仓没人管了」这句话若
+  // 三秒就消失，等于没说。刻意**不进** `clearAiTradeRuntime`：结束那一刻分组正好被清掉，跟着清
+  // 就等于让这条提示永远显示不出来。
+  aiTradeLifecycleNotice: string | null;
   aiTradeAcknowledged: boolean;                   // 首启风险勾选会话记忆，刷新复位
   aiTradeConfig: AiTradeConfig | null;            // 持久化偏好（进 partialize）
   // AI 回测（ai-auto-trading-backtest §5.4）：aiBacktestJobId 瞬态（GET /ai-trade/backtest/{id} 重发现）；
@@ -519,6 +528,8 @@ interface AppState {
   // AI 自动交易「分组」运行期态（瞬态）：分组视图 + 逐成员 setter（会话视图 / 成交 / 持仓 / 决策 / 轨迹 /
   // 摘要，按 instId 路由，镜像 liveAutoGroup member setter）+ 风险勾选 + 清理；aiTradeConfig 为持久化偏好。
   setAiTradeGroup: (group: AiTradeGroupState | null) => void;
+  setAiTradeResumable: (resumable: AiTradeResumableGroup | null) => void;
+  setAiTradeLifecycleNotice: (notice: string | null) => void;
   setAiTradeMemberSession: (instId: string, session: AiTradeSessionRow | null) => void;
   patchAiTradeMemberSession: (instId: string, patch: Partial<AiTradeSessionRow>) => void;
   patchAiTradeMemberStatus: (instId: string, status: AiTradeStatusEvent) => void;
@@ -682,6 +693,8 @@ export const useAppStore = create<AppState>()(
       // AI 自动交易：分组运行期态瞬态（刷新由 GET /ai-trade/status 重发现）；aiTradeConfig 偏好默认 null
       // （全新安装只走初始化器、不触发 migrate，故默认值须写在此处）。
       aiTradeGroup: null,
+      aiTradeResumable: null,
+      aiTradeLifecycleNotice: null,
       aiTradeAcknowledged: false,
       aiTradeConfig: null,
       aiBacktestJobId: null,
@@ -899,6 +912,8 @@ export const useAppStore = create<AppState>()(
       // AI 自动交易「分组」运行期态（瞬态）：分组视图 + 逐成员 setter（会话视图含增量合并 / 成交流 /
       // 持仓 / 决策日志（环形）/ 轨迹（环形）/ 摘要，按 instId 路由）+ 风险勾选 + 清理；aiTradeConfig 持久化。
       setAiTradeGroup: (aiTradeGroup) => set({ aiTradeGroup }),
+      setAiTradeResumable: (aiTradeResumable) => set({ aiTradeResumable }),
+      setAiTradeLifecycleNotice: (aiTradeLifecycleNotice) => set({ aiTradeLifecycleNotice }),
       setAiTradeMemberSession: (instId, session) =>
         set((s) => patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({ ...m, session }))),
       patchAiTradeMemberSession: (instId, patch) =>
@@ -973,7 +988,9 @@ export const useAppStore = create<AppState>()(
       setAiTradeMemberSummary: (instId, summary) =>
         set((s) => patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({ ...m, summary }))),
       setAiTradeAcknowledged: (aiTradeAcknowledged) => set({ aiTradeAcknowledged }),
-      clearAiTradeRuntime: () => set({ aiTradeGroup: null }),
+      // 停止 / 结束后**同时**清冷占位：只清 aiTradeGroup 会在页面上留一张指向已归档会话的
+      // 续跑卡，而那张卡点下去是一次真实资金的开仓授权。
+      clearAiTradeRuntime: () => set({ aiTradeGroup: null, aiTradeResumable: null }),
       setAiTradeConfig: (aiTradeConfig) => set({ aiTradeConfig }),
       setAiBacktestJobId: (aiBacktestJobId) => set({ aiBacktestJobId }),
       setAiBacktestConfig: (aiBacktestConfig) => set({ aiBacktestConfig }),

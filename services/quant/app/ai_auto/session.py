@@ -37,7 +37,8 @@ from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, gate_stat
 from .cost_runtime import CostRuntime
 from .discipline_runtime import DisciplineRuntime
 from .decider import AiTradeDecider, TradeDecision
-from .exchange_backstop import BackstopRuntime, schedule_from_executor
+from .exchange_backstop import (BackstopRuntime, check_now_from_executor,
+                                schedule_from_executor)
 from .exit_attribution import classify_live
 from .hold_horizon import HorizonFacts, HorizonRule, gate_status as horizon_gate_status
 from .horizon_acceptance import ai_stats_keys, build_bundle
@@ -47,6 +48,7 @@ from .market_digest import build_market_digest
 from .market_window import MarketWindow, WindowOptions
 from .multi_timeframe_context import build_multi_timeframe_context
 from .order_plan import decision_to_order_plan
+from . import pause as pause_core
 from .prior_runtime import PriorRuntime
 from .profit_cooldown import apply_profit_cooldown, build_cooldown_view
 from .profit_guard import (
@@ -123,6 +125,10 @@ logger = logging.getLogger(__name__)
 
 _ACTION_LABEL = {"open_long": "开多", "open_short": "开空", "close": "平仓", "hold": "观望",
                  "cancel_order": "撤单"}
+# 「盯市与风控」作用域（ai-trade-pause-resume §3.1.1）：`running ∪ paused`。与
+# `state == "running"`（「决策与开仓」作用域）刻意分开——不变式 I-1 的全部实现落点就是这两个
+# 谓词在判据表上的分配（spec §3.1.2）。**禁止**再写 `state != 'stopped'` 这类第三种判据。
+_ACTIVE_STATES = ("running", "paused")
 # 决策动作 → `Signal.side`（M-6：原为 `_ai_explain` 内的裸下标，新动作当轮即 KeyError）。
 _ACTION_SIDE = {"open_long": "long", "open_short": "short", "close": "close"}
 
@@ -212,6 +218,16 @@ class AiTradeSession:
         self._position_seq = 0
 
         self.state = "running"
+        # 暂停 / 继续（ai-trade-pause-resume §6.5）：默认值使既有直接构造会话的单测逐字节零回归。
+        # `group_id` 由 manager 在建组后回填——会话据它做 W2/W3 的增量写；空串 ⇒ 整条持久化通路空转。
+        self.pause_reason: str | None = None
+        self.paused_ts = 0
+        self.resumed_ts = 0
+        self.group_id = ""
+        self.on_stopped = None        # W5：会话自终止后的状态表收敛回调（manager 装）
+        self._pause_result: dict | None = None     # pause 幂等回执
+        self._last_state_beat_wall = 0.0           # W3 心跳节流墙钟
+        self._known_cl_ord_ids: list[str] = []     # 当前持仓周期内本会话下过的 clOrdId（有界）
         self.stop_reason: str | None = None
         self.rounds_completed = 0
         self.flatten_result: dict | None = None
@@ -282,6 +298,16 @@ class AiTradeSession:
     def poll_interval_s(self) -> int:
         return self.executor.settings.live_auto_poll_interval_s
 
+    @property
+    def is_active(self) -> bool:
+        """会话是否仍在**盯市与风控**作用域内（running ∪ paused，ai-trade-pause-resume §3.1.1）。
+
+        与 `state == "running"`（**决策与开仓**作用域）刻意分开：不变式 I-1 的全部实现落点就是
+        这两个谓词在判据表上的分配（spec §3.1.2 的重定向表）。任何新增判据都必须显式回答自己
+        属于哪一侧，**禁止**新写 `state != 'stopped'` / `state in (...)` 这类第三种写法。
+        """
+        return self.state in _ACTIVE_STATES
+
     # F0：计数迁入 `ProfitGuardRuntime` 后，既有读点（finalize 的 aiStats / 用例）零改动地继续走这里。
     @property
     def profit_guard_exits(self) -> int:
@@ -320,8 +346,11 @@ class AiTradeSession:
         for event in events:
             if event.get("type") == "trade" and isinstance(event.get("data"), dict):
                 trade = event["data"]
+                if trade.get("clOrdId"):        # pause-resume §6.2：本会话下过的单（unknown_order 判据）
+                    self._note_cl_ord_id(str(trade["clOrdId"]))
                 if trade.get("side") == "close":
                     self._position_seq += 1     # 任一平仓成交 = 一个持仓周期终结
+                    self._known_cl_ord_ids.clear()   # 有界：只保留**当前持仓周期**内的
                     if "peakPnlUsd" not in trade:      # 绝不用 setdefault（P2-7：恒求值实参 ⇒
                         # 键已存在时也会把峰值消费掉，让下一笔平仓静默拿到 None）
                         trade["peakPnlUsd"] = self._guard.take_peak_pnl()
@@ -338,6 +367,10 @@ class AiTradeSession:
                 self._sizing.note_executor(self.executor, self._current_px())   # [P1-8] 敞口簿
                 self._inject_explain_meta(trade)
                 await self._persist_trade(trade)
+                # W2（pause-resume §3.4.2）：持仓事实**只在成交时变**，故契约的持仓断面事件驱动
+                # 地写——精确且零轮询开销。挂在 `_persist_trade` 之后（[P2-3]：`_push` 对每一个
+                # 事件都执行，挂那里会被 status/candle 一并触发）。
+                await self._persist_state_position()
             await self._push(event)
 
     def _inject_explain_meta(self, trade: dict) -> None:
@@ -380,6 +413,82 @@ class AiTradeSession:
                 await repo.append_live_trade(s, self.run_id, trade)
         except Exception as exc:  # noqa: BLE001 —— best-effort 审计落库，失败不阻塞热路径
             logger.warning("append_live_trade failed (run_id=%s): %s", self.run_id, exc)
+
+    # ---------- 可续跑契约的增量写点（ai-trade-pause-resume §3.4.2 W2 / W3）----------
+    def _note_cl_ord_id(self, cl_ord_id: str) -> None:
+        """记一个本会话下出的 `clOrdId`（去重、有界：随平仓成交清空）。"""
+        if cl_ord_id and cl_ord_id not in self._known_cl_ord_ids:
+            self._known_cl_ord_ids.append(cl_ord_id)
+
+    def state_member_row(self) -> dict:
+        """本成员在 `ai_trade_group_states.members_json` 里的那一行（§6.2 的形状）。
+
+        只落**不可推导**的事实（§3.4.3）：持仓身份断面 + 挂单身份，派生量（已实现盈亏 / 持仓
+        序号 / 开仓腿费）一律在续跑时从 `trades` 重算——落两份必漂移，而这里漂移的是真实资金的
+        盈亏显示。持仓取 `executor` 的自管投影（W2 的事件驱动口径）；暂停那一刻则由 `pause()`
+        用**交易所真值**覆盖 `posId` / `openCTime`（那是身份判据的唯一采集点，[P0-1]）。
+        """
+        resting = self.executor.resting
+        known = list(self._known_cl_ord_ids)
+        if resting is not None and resting.cl_ord_id not in known:
+            known.append(resting.cl_ord_id)
+        return {"instId": self.inst_id, "runId": self.run_id, "sessionId": self.session_id,
+                "position": self._state_position_snapshot(),
+                "positionUnknown": False,
+                "restingClOrdId": None if resting is None else resting.cl_ord_id,
+                "knownClOrdIds": known}
+
+    def _state_position_snapshot(self) -> dict | None:
+        """自管持仓断面（无仓 ⇒ None）。`openWallTs` 取当前持仓周期开仓腿的墙钟秒（`entry_bar` 反推的回落源）。"""
+        if self.executor.projected == "flat":
+            return None
+        return {"side": self.executor.projected, "size": self.executor.entry_qty_sz,
+                "avgEntry": self.executor.entry_price, "posId": "", "openCTime": 0,
+                "openWallTs": self._open_wall_ts(), "positionSeq": self._position_seq}
+
+    def _open_wall_ts(self) -> int:
+        """当前持仓周期**开仓腿**的墙钟秒（`_dispatch` 落在 `explain.meta.wallTs` 的那个）；取不到 ⇒ 0。"""
+        for trade in reversed(self.executor.trades or []):
+            if trade.get("side") == "close":
+                break
+            wall = trade.get("wallTs") or ((trade.get("explain") or {}).get("meta") or {}).get("wallTs")
+            if wall:
+                return int(wall)
+        return 0
+
+    async def _persist_state_position(self) -> None:
+        """W2：成交后把该成员的持仓 / 挂单身份写回状态表。**best-effort**，失败绝不阻塞热路径。"""
+        if not self.group_id:
+            return
+        try:
+            from ..db import ai_trade_state_repositories as state_repo
+            sm = get_sessionmaker()
+            async with sm() as s:
+                await state_repo.patch_member_state(s, self.group_id, self.inst_id,
+                                                    self.state_member_row())
+        except Exception as exc:  # noqa: BLE001 —— 契约增量写是 best-effort（镜像 _persist_trade）
+            logger.warning("ai-trade state position write skipped (%s): %s", self.inst_id, exc)
+
+    async def _beat_state_row(self, now_wall: float) -> None:
+        """W3：盯市 tick 上按 `ai_trade_pause_persist_interval_s` 节流地刷新 `last_seen_ts`。
+
+        它是「离线多久」这句文案与超龄判定的分母。同为 best-effort。
+        """
+        if not self.group_id:
+            return
+        interval = float(getattr(self.executor.settings,
+                                 "ai_trade_pause_persist_interval_s", 60.0))
+        if now_wall - self._last_state_beat_wall < interval:
+            return
+        self._last_state_beat_wall = now_wall
+        try:
+            from ..db import ai_trade_state_repositories as state_repo
+            sm = get_sessionmaker()
+            async with sm() as s:
+                await state_repo.patch_group_state(s, self.group_id,
+                                                   {"lastSeenTs": int(now_wall)})
+        except Exception as exc:  # noqa: BLE001 —— 心跳是观测面，失败只降级
+            logger.debug("ai-trade state heartbeat skipped (%s): %s", self.inst_id, exc)
 
     # ---------- lifecycle ----------
     async def start(self) -> None:
@@ -424,9 +533,16 @@ class AiTradeSession:
         self._last_bar_index = n - 1
         self._last_live_px = self._ref_px()
 
-    async def stop(self, reason: str = "user_stop") -> dict:
-        """平掉自管持仓 + 停 WS/monitor/决策 + 落 Run 终态（幂等：非 running 直接返回上次结果）。"""
-        if self.state != "running":
+    async def stop(self, reason: str = "user_stop", *, flatten: bool = True) -> dict:
+        """平掉自管持仓 + 停 WS/monitor/决策 + 落 Run 终态（幂等：非 active 直接返回上次结果）。
+
+        判据是 `is_active` 而非 `state == "running"`（§3.1.2 row 19）：必须能从 `paused` 直接
+        停止**并平仓**——否则一个暂停中的会话就再也停不掉了。
+
+        pause 与 stop 的区别（写在这里防后人「顺手统一」）：stop ① 停 WS ② 平仓
+        ③ `_backstop.close()` / `_repair.close()` ④ 落 run 终态；pause **四件都不做**。
+        """
+        if not self.is_active:
             return self.flatten_result or {"ok": True, "closedSz": 0}
         self.state = "stopped"
         self.stop_reason = reason
@@ -438,18 +554,44 @@ class AiTradeSession:
             await self._ws.stop()
         ref_px = self._ref_px()
         ts = self._ref_ts()
-        try:
-            async with self._exec_lock:
-                self.flatten_result = await self.executor.flatten(ref_px, ts)
-        except Exception as exc:  # noqa: BLE001 —— 平仓失败如实记录，仍完成停止流程
-            self.flatten_result = {"ok": False, "message": str(exc)}
-        await self._handle_flatten_result(ts)
+        if flatten:
+            try:
+                async with self._exec_lock:
+                    self.flatten_result = await self.executor.flatten(ref_px, ts)
+            except Exception as exc:  # noqa: BLE001 —— 平仓失败如实记录，仍完成停止流程
+                self.flatten_result = {"ok": False, "message": str(exc)}
+            await self._handle_flatten_result(ts)
+        else:
+            # `flatten=False` 只有一个调用方：`end_group` 的「保留持仓、仅结束本地会话」分支
+            # （pause-resume §5.4，用户已显式勾选确认）。默认恒 True ⇒ 既有全部调用点逐字节不变。
+            self.flatten_result = {"ok": True, "closedSz": 0, "skipped": "hold_position"}
         await self._cost.reconcile_tick(          # 轴 C：终态对账（硬超时，永不判 drift）
             time.time(), window_start_ts=self.started_ts,
             trades=self.executor.trades, push=self._push, final=True)
         await self._finalize_run(ts)
+        await self._notify_stopped()
         await self._push({"type": "status", "data": self._status_payload()})
         return self.flatten_result
+
+    async def _notify_stopped(self) -> None:
+        """W5（§3.4.2）：会话**自终止**之后把可续跑契约收敛（置 `ended` 或摘掉本成员）。
+
+        没有它，`strategy_runs` 已是 `stopped` 而状态表仍 `paused` ⇒ 进程内留一张指向已平仓会话
+        的续跑卡，用户点「继续」会走到一个 `closed_offline` + run 已终态的怪状态。
+
+        **例外极性**：`stop()` 承诺「平仓失败也要完成停止流程」，故本步失败**不得**吞掉
+        `stop()` 的结果——只 `logger.error` 并在回执里带 `stateRowStale`，由下次启动的水合按
+        §八风险 11 自愈。这是全文唯一允许状态表短暂落后于 run 的地方。
+        """
+        if self.on_stopped is None:
+            return
+        try:
+            await self.on_stopped(self)
+        except Exception as exc:  # noqa: BLE001 —— 见 docstring 的例外极性
+            logger.error("ai-trade state row not converged after stop (%s): %s",
+                         self.session_id, exc)
+            if isinstance(self.flatten_result, dict):
+                self.flatten_result["stateRowStale"] = True
 
     def _cancel_task(self, attr: str) -> None:
         """取消命名后台任务，但绝不取消自身（会话止损在 monitor/决策任务内触发 stop，R-2）。"""
@@ -475,6 +617,159 @@ class AiTradeSession:
             "message": "AI 自动交易停止时平仓失败，请立即到下方实盘面板手动平仓",
             "residual": self.residual}})
 
+    # ---------- 暂停 / 继续（ai-trade-pause-resume §3.1.3 / §3.1.4）----------
+    async def pause(self, reason: str = "user", *, flatten: bool = False) -> dict:
+        """挂起本会话：只停「增风险」侧，保留盯市与全部保护层（不变式 I-1）。
+
+        **动作顺序本身是安全性的一部分，不得重排**：
+          ① 先置 `paused` —— `_execute_decision` 的复检在 `_exec_lock` **内**，故此后任何还没
+             拿到锁的在飞轮都不可能再下单；
+          ② 再 `async with self._exec_lock: pass` 排空 —— 若某一轮**已经**拿着锁在下单，就等它
+             把回执记完（这比在 `place_order` 的 await 上把它 cancel 掉安全得多：那会造成
+             「交易所有单、本地无记录」）；
+          ③ 才 cancel 决策任务（此刻它已无害；`_run_decision_round` 的 `finally` 会复位
+             `_deciding`，故续跑后能正常起轮）；
+          ④ 撤掉未成交限价挂单（暂停期没有任何东西在盯它的 TTL 与部分成交）；`flatten=True`
+             时改走 `executor.flatten`（它自己先撤单再平仓）；
+          ⑤ **向交易所读一次持仓断面** —— 必须在 ④ 之后（[P2-8]：三态撤单可能返回 `filled` 并
+             当场改写 `projected`，先读会给出一份「已空仓」的假回执，而用户正要据它决定关不关
+             电脑），且它是 `posId` / `cTimeS` 的**唯一采集点**（[P0-1]）；
+          ⑥ 带仓则**同步等一次**交易所侧兜底核实（软件即将关闭，这是用户唯一一次知道「关机后
+             还有没有止损」的机会）；
+          ⑦ 落 run metrics（`status='paused'`，不写 `end_ts`）。
+        状态表整行（W4）由 manager 在本方法返回后写——⑧ 必须在 ⑦ 之后。
+
+        幂等：非 `running` 直接回上次结果。
+        """
+        if self.state != "running":
+            return self._pause_result or {"instId": self.inst_id, "sessionId": self.session_id,
+                                          "runId": self.run_id, "state": self.state}
+        self.state = "paused"                                    # ①
+        self.pause_reason = reason
+        self.paused_ts = int(time.time())
+        async with self._exec_lock:                              # ②
+            pass
+        self._cancel_task("_decision_task")                      # ③
+        ts = self._ref_ts()
+        flattened, resting_cancelled = await self._pause_unwind(flatten, ts)     # ④
+        position, unknown = await self._read_exchange_position()                 # ⑤
+        backstop = await self._pause_backstop(position)                          # ⑥
+        await self.snapshot_run_metrics(status="paused")                         # ⑦
+        self._pause_result = {
+            "instId": self.inst_id, "sessionId": self.session_id, "runId": self.run_id,
+            "state": self.state, "pauseReason": reason, "pausedTs": self.paused_ts,
+            "position": position, "positionUnknown": unknown,
+            "restingCancelled": resting_cancelled, "backstop": backstop,
+            "flattened": flattened}
+        await self._push({"type": "status", "data": self._status_payload()})
+        await self._push({"type": "lifecycle", "data": {
+            "action": "paused", "reason": reason, "ts": self.paused_ts}})
+        return self._pause_result
+
+    async def _pause_unwind(self, flatten: bool, ts: int) -> tuple[dict | None, dict | None]:
+        """④：`flatten=True` 走平仓路径；否则只撤未成交挂单并如实回执三态结果。
+
+        平仓分支**复用 `stop()` 的同一条收尾** `_handle_flatten_result`：除了扇出撤单 / 成交事件，
+        它还负责「平仓失败」这条路径上的三件事——置 `flatten_failed` / `residual`、推一条
+        `AI_TRADE_FLATTEN_FAILED` 强提示。各写一遍的话，「平仓后暂停」会成为全仓**唯一**一条
+        平仓失败却静默的路径：用户以为自己空仓关机了，交易所上其实还留着一笔无人看管的仓位。
+        """
+        if flatten:
+            try:
+                async with self._exec_lock:
+                    self.flatten_result = await self.executor.flatten(self._ref_px(), ts)
+            except Exception as exc:  # noqa: BLE001 —— 平仓失败如实记录，仍完成暂停流程
+                self.flatten_result = {"ok": False, "message": str(exc)}
+            await self._handle_flatten_result(ts)
+            return self.flatten_result, None
+        before = self.executor.resting
+        events = await self.executor.cancel_resting("pause", ts)
+        await self._dispatch(events)
+        if before is None:
+            return None, None
+        traded = any(e.get("type") == "trade" for e in events)
+        outcome = ("filled" if traded
+                   else "cancelled" if self.executor.resting is None else "unknown")
+        return None, {"outcome": outcome, "clOrdId": before.cl_ord_id}
+
+    async def _read_exchange_position(self) -> tuple[dict | None, bool]:
+        """⑤：向交易所读该标的持仓真值 → `(position, unknown)`。
+
+        走 `executor._read_positions()`（executor 已持有凭证的那条既有取数缝，**零 executor
+        改动**），而不是本地 `projected` 投影：暂停是一次用户主动的、每会话一次的动作，多打一次
+        私有 REST 完全值得，而「我关机时到底还有多少仓」这个数不该来自本地投影。
+
+        读失败 ⇒ **不阻断暂停**（暂停是减风险动作，恒可执行），但回执 `positionUnknown=True`，
+        续跑时该成员直接判 `unverifiable_identity`（诚实不变式 I-4：读不到 ≠ 没有）。
+        """
+        try:
+            rows = await self.executor._read_positions()
+        except Exception as exc:  # noqa: BLE001 —— 取数失败不阻断暂停，但必须如实标注
+            logger.warning("ai-trade pause position read failed (%s): %s", self.inst_id, exc)
+            return None, True
+        for row in rows or []:
+            if str(row.get("instId") or "") != self.inst_id:
+                continue
+            pos = float(row.get("pos") or 0.0)
+            if abs(pos) <= 0:
+                continue
+            side = str(row.get("posSide") or "").lower()
+            if side not in ("long", "short"):
+                side = "long" if pos > 0 else "short"
+            return {"side": side, "size": abs(pos),
+                    "avgEntry": float(row.get("avgPx") or 0.0),
+                    "unrealizedPnlUsd": float(row.get("upl") or 0.0),
+                    "posId": str(row.get("posId") or ""),
+                    "openCTime": int(row.get("cTimeS") or 0),
+                    "openWallTs": self._open_wall_ts(),
+                    "positionSeq": self._position_seq}, False
+        return None, False
+
+    async def _pause_backstop(self, position: dict | None) -> dict | None:
+        """⑥：带仓时同步等一次交易所侧兜底核实；无仓时只回最近一次分类结果（不多打请求）。
+
+        回执里额外派生两个键：`covered`（`classify_backstop` 的 wire 只给 `basis` /
+        `coverageRatio`，「覆盖」是这两者的合取）与 `stopPx`（展示用的交易所侧止损价）。
+        **在这里单点派生**，续跑卡与暂停文案才不会各判一次（判定性文案单一真源，§3.10）。
+        """
+        wire = (self._backstop.wire(time.time()) if position is None
+                else await check_now_from_executor(self._backstop, self.executor,
+                                                   now_wall=time.time()))
+        if wire is None:
+            return None
+        min_coverage = float(getattr(self.executor.settings,
+                                     "ai_trade_backstop_min_coverage", 0.999))
+        return {**wire, "covered": pause_core.is_backstop_covered(wire, min_coverage),
+                "stopPx": wire.get("stopLossPx"), "takePx": wire.get("takeProfitPx"),
+                "checkedAtWall": int(time.time())}
+
+    async def resume(self) -> dict:
+        """从 `paused` 回到 `running`（会话对象仍在内存里的**热续跑**路径）。
+
+        ① 重置三个时钟，避免「续跑瞬间连打 N 轮」：`_last_decision_started_wall`（定时唤醒下一次
+           在 ~wake_interval_s 后，与 `start()` 同一条理由）、`_last_candle_wall` / `_last_px_wall`
+           （否则暂停期累积的时长会被 `_check_staleness` 立刻判成陈旧并触发降级）；
+        ② `_deciding = False`（防御性：pause 的 cancel 已由 `finally` 复位，此处兜底）；
+        ③ `state = "running"`；④ 推 status + `lifecycle` 事件供轨迹面板留痕。
+        **不重新暖机、不重建 WS**：热续跑期间 `self._ws` 一直连着（pause 从不停 WS）。
+        """
+        if self.state != "paused":
+            return {"ok": False, "state": self.state}
+        now = time.time()
+        self._last_decision_started_wall = now
+        self._last_candle_wall = self._last_px_wall = now
+        self._deciding = False
+        self.state = "running"
+        self.pause_reason = None
+        self.resumed_ts = int(now)
+        self._pause_result = None
+        if self._monitor_task is None or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(self._monitor_loop())
+        await self._push({"type": "status", "data": self._status_payload()})
+        await self._push({"type": "lifecycle", "data": {
+            "action": "resumed", "reason": None, "ts": self.resumed_ts}})
+        return {"ok": True, "state": self.state}
+
     def _ref_px(self) -> float:
         c = self._window.candles
         return float(c[-1]["c"]) if c else self.executor.entry_price
@@ -485,10 +780,12 @@ class AiTradeSession:
 
     # ---------- monitor 循环 ----------
     async def _monitor_loop(self) -> None:
+        """盯市循环。判据是 `is_active`（§3.1.2 row 1）——暂停期**必须继续跑**：reconcile、
+        利润保护、会话止盈止损、交易所侧兜底核实与自愈补挂全挂在这条循环上（D-5 的根因就在这两行）。"""
         try:
-            while self.state == "running":
+            while self.is_active:
                 await asyncio.sleep(self.poll_interval_s)
-                if self.state != "running":
+                if not self.is_active:
                     break
                 await self._monitor_tick()
         except asyncio.CancelledError:
@@ -529,9 +826,12 @@ class AiTradeSession:
                         self._session_readings(time.time()), push=self._push,
                         on_change=lambda: self._push({"type": "status",
                                                       "data": self._status_payload()}))
+        await self._beat_state_row(time.time())   # W3：可续跑契约的心跳（节流、best-effort）
         # 战术窗口刷新**必须**排在定时唤醒之前——否则定时轮拿到的是上一分钟的战术数据，整个特性
         # 在最该生效的路径上空转。三闸门（锚点/配额/单 tick 节流）+ 硬超时保证它不拖停盯市。
-        await self._window.maybe_refresh_tactical(now_ts, time.time())
+        # §3.1.2 row 12：战术窗口只服务决策轮，暂停期刷它是白烧 REST 配额 ⇒ paused 时跳过。
+        if self.state == "running":
+            await self._window.maybe_refresh_tactical(now_ts, time.time())
         await self._maybe_signal_flip_wake()     # 轴 C：须在定时唤醒之前（翻转优先于墙钟到点）
         await self._maybe_interval_wake()
 
@@ -636,7 +936,13 @@ class AiTradeSession:
         return float(px) if px is not None else self.executor.entry_price
 
     async def _check_staleness(self, now_ts: int) -> None:
-        if self.state != "running" or self._last_candle_wall <= 0:
+        """行情停滞看门狗。判据是 `is_active`（§3.1.2 row 4，减风险侧）。
+
+        ⚠️ [P2-7]：`live_auto_flatten_on_stale`（`config.py`，**默认 False**）为真时，行情长时间
+        断流会把一个「保留持仓的暂停」直接平掉并终结会话。刻意不为暂停单独豁免它——那会开一个
+        「暂停期风控半开」的口子，比现状更坏；改为在暂停回执与常驻横幅里如实说明这一条件。
+        """
+        if not self.is_active or self._last_candle_wall <= 0:
             return
         settings = self.executor.settings
         stale_after = BAR_SECONDS.get(self.bar, 60) * settings.live_auto_staleness_factor
@@ -662,8 +968,13 @@ class AiTradeSession:
 
     # ---------- 核心：每根已确认 K 线 = 一个决策轮 ----------
     async def feed_candle(self, candle: Candle) -> None:
-        """OKX WS 回调（也可被测试直接注入）。确认根：步进影子信号板 → 触发一轮 AI 决策。"""
-        if self.state != "running":
+        """OKX WS 回调（也可被测试直接注入）。确认根：步进影子信号板 → 触发一轮 AI 决策。
+
+        §3.1.2 row 16：顶部判据是 `is_active` —— 暂停期**仍要入窗**，因为 `_last_live_px` /
+        `_last_px_wall`（保护层判定价年龄的唯一真源）、`_atr_px`、`bar_anchor_ts` 全靠这条路径
+        刷新。真正被暂停挡住的是下面 row 17 那道「起不起决策轮」的门。
+        """
+        if not self.is_active:
             return
         if not candle.confirm:
             self._last_live_px = float(candle.c)   # 两根 K 线之间的当前价（供定时唤醒研判最新价位）
@@ -688,9 +999,12 @@ class AiTradeSession:
         self._wake.note_atr(self._atr_px)     # ATR 判据与参照断面共用这一个数（唯一入口）
         self._sizing.note_candles([c["c"] for c in self._window.candles], int(candle.ts))
         decision_as_of_ts = int(candle.ts) + BAR_SECONDS[self.bar]
-        await self._window.maybe_refresh_htf(decision_as_of_ts)
-        # 锚点闸使其在盯市已刷新时为零成本空转；确认根这条路径保证「新根落地即有最新战术数据」。
-        await self._window.maybe_refresh_tactical(decision_as_of_ts, time.time())
+        # §3.1.2 row 12b：这两处 REST 取数只服务决策轮，与 row 12 同一条理由 ⇒ paused 时跳过。
+        # 不跳过的话，暂停期每根 K 线仍会照打两次 REST，row 12 省下的配额被这里原样烧掉。
+        if self.state == "running":
+            await self._window.maybe_refresh_htf(decision_as_of_ts)
+            # 锚点闸使其在盯市已刷新时为零成本空转；确认根这条路径保证「新根落地即有最新战术数据」。
+            await self._window.maybe_refresh_tactical(decision_as_of_ts, time.time())
         frames = self._window.build_strategy_frames()
         i = self._window.cur_index()
         ref_px = float(row["c"])
@@ -700,6 +1014,13 @@ class AiTradeSession:
         self._last_bar_index = i
         self._last_live_px = ref_px
         await self._push({"type": "candle", "data": {**row, "confirm": True}})
+        # §3.1.2 row 17（增风险侧的门）：暂停期绝不起决策轮。**插点不得上移**——上面的
+        # `evaluate_signal_board`（影子逐根步进）与 `_last_board` / `_last_bar_index` /
+        # `_last_live_px` 赋值必须在暂停期继续执行：它们是纯本地计算、不下任何单，却是「续跑后
+        # 第一轮拿到的是最新信号板而不是暂停那一刻的化石」的唯一保证（把门提到入窗之前会静默
+        # 冻结影子立场，且**不会报任何错**）。
+        if self.state != "running":
+            return
         if self._deciding:                       # P1-2：上一轮未完成→跳过本轮，不并发
             self._wake.note_bar_drop(time.time())    # 轴 A：先记待办（轮末补跑），再推自解释事件
             await self._emit_decision_skipped(ts, board)
@@ -1316,7 +1637,10 @@ class AiTradeSession:
         互不干涉（后三者一律不拦 `close`，故不存在「保护要平、门禁不让」的死锁）。判定只用实时价，
         不等 K 线确认（诊断根因 ④）。
         """
-        if self.profit_rule is None or self.state != "running":
+        # §3.1.2 row 5（I-1 的招牌条款）：判据是 `is_active` —— 暂停期利润保护**照旧平仓**。
+        # 反例说明为什么：用户暂停后去睡觉，一个已浮盈 8% 的仓位会失去唯一的本地退出执行者，
+        # 而他以为自己做的是一个**降低**风险的动作。
+        if self.profit_rule is None or not self.is_active:
             return
         snap = self._refresh_profit_state(time.time())
         if snap is None or snap.get("status") == STATUS_UNAVAILABLE:
@@ -1349,7 +1673,8 @@ class AiTradeSession:
             trail={"givebackPctEffective": snap.get("givebackPctEffective"),
                    "trailBasis": snap.get("trailBasis")})
         async with self._exec_lock:
-            if self.state != "running" or self.executor.projected == "flat":
+            # §3.1.2 row 6：内层复检必须与外层同口径（`is_active`），否则外层放行、内层拦下。
+            if not self.is_active or self.executor.projected == "flat":
                 return None       # LLM 决策轮可能在等锁期间已平仓——目的已达成，复检非防御性噪音
             events = await self.executor.apply([signal], ref_px=px,
                                                bar_index=self._last_bar_index, ts=ts)
@@ -1633,7 +1958,10 @@ class AiTradeSession:
         await self._push({"type": "status", "data": self._status_payload()})
 
     def _status_payload(self) -> dict:
-        return {"state": self.state, "warmedBars": self._warmed_bars,
+        return {"state": self.state,
+                # 暂停 / 继续（§5.7）：`state` 现可为 `"paused"`；`pauseReason` 供前端选文案。
+                "pauseReason": self.pause_reason, "pausedTs": self.paused_ts,
+                "warmedBars": self._warmed_bars,
                 "sessionPnlUsd": self.executor.session_pnl_usd,
                 "positionSide": self.executor.projected,
                 "budgetUsd": self.executor.budget_usd, "leverage": self.executor.leverage,
@@ -1697,6 +2025,7 @@ class AiTradeSession:
 
     def info(self) -> dict:
         return {"sessionId": self.session_id, "runId": self.run_id, "state": self.state,
+                "pauseReason": self.pause_reason, "pausedTs": self.paused_ts,
                 "instId": self.inst_id, "bar": self.bar,
                 "strategyIds": self.strategy_ids, "strategyNames": self.strategy_names,
                 "budgetUsd": self.executor.budget_usd, "leverage": self.executor.leverage,
@@ -1717,6 +2046,26 @@ class AiTradeSession:
 
     # ---------- 持久化 ----------
     async def _finalize_run(self, end_ts: int) -> None:
+        sm = get_sessionmaker()
+        async with sm() as s:
+            await repo.finalize_run(s, self.run_id, status="stopped",
+                                    metrics=self._build_run_metrics(), end_ts=end_ts)
+
+    async def snapshot_run_metrics(self, *, status: str) -> None:
+        """把当前 metrics 落库并置 run 状态，**不写 `end_ts`**（暂停 / 续跑共用，§3.1.3 ⑦）。
+
+        与 `_finalize_run` **共用** `_build_run_metrics`——那段富化有 20 行 `aiStats` 合并与一个
+        best-effort try，抄一遍必漂移。`repositories.finalize_run` 的签名本就是
+        `end_ts: int | None = None` 且 `if end_ts is not None` 才写，故它在这里只是一次 UPDATE
+        （函数名叫 finalize，但它不写终态时间，[P2-5]）。
+        """
+        sm = get_sessionmaker()
+        async with sm() as s:
+            await repo.finalize_run(s, self.run_id, status=status,
+                                    metrics=self._build_run_metrics())
+
+    def _build_run_metrics(self) -> dict:
+        """构造 run metrics（基础指标 + 三段 digest 富化）。纯同步、绝不抛。"""
         budget = self.executor.budget_usd
         realized = self.executor.realized_pnl_usd
         metrics = {**_empty_metrics(),
@@ -1759,10 +2108,7 @@ class AiTradeSession:
             logger.warning("ai-trade finalize enrichment skipped for run %s: %s", self.run_id, exc)
             for key in ("equityDigest", "decisionsDigest", "aiStats"):
                 metrics.pop(key, None)
-        sm = get_sessionmaker()
-        async with sm() as s:
-            await repo.finalize_run(s, self.run_id, status="stopped", metrics=metrics,
-                                    end_ts=end_ts)
+        return metrics
 
 
 # ---------- ai-trade-stats-dashboard §3.3：finalize metrics 富化纯函数（模块级、可单测、绝不抛）----------

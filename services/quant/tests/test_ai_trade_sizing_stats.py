@@ -73,7 +73,10 @@ def test_merge_lands_at_the_call_site_not_inside_compute_ai_stats():
     source = inspect.getsource(_compute_ai_stats)
     assert "sizing" not in source                    # 纯函数一字不动（拿不到 self，物理上也做不到）
     assert _compute_ai_stats([], 0).get("sizing") is None
-    finalize = inspect.getsource(AiTradeSession._finalize_run)
+    # ai-trade-pause-resume §3.1.3 ⑦：metrics 构造已从 `_finalize_run` 抽成 `_build_run_metrics`
+    # （暂停快照与停止落库共用同一段富化，绝不复制）。**本条断言的口径一字未改**——合并仍必须发生
+    # 在调用点，只是那个调用点现在叫 `_build_run_metrics`。
+    finalize = inspect.getsource(AiTradeSession._build_run_metrics)
     assert 'self._sizing.merge_into(metrics["aiStats"])' in finalize
 
 

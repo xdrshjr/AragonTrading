@@ -365,6 +365,30 @@ class BackstopRuntime:
         """下一个盯市 tick 立即核实一次（`note_open` 之后调用）。"""
         self._force = True
 
+    async def check_now(self, now_wall: float, *, side: str, position_sz: float | None,
+                        local_sl_px: float | None, local_tp_px: float | None,
+                        timeout_s: float = 8.0) -> dict | None:
+        """同步等一次核实并回 `wire()`（暂停回执 / 续跑复核专用，pause-resume §3.1.3 ⑥）。
+
+        **复用 `schedule_check` 的同一条私有路径**（单飞、TTL、异常全吞），只是把在途任务
+        `await` 出来 —— 绝不在此另写一份取数逻辑（两份取数迟早给出两种「覆盖率」）。
+        超时 / 异常一律回 `self.wire(now_wall)`（那已是一个诚实的 `unavailable`），**绝不抛**。
+
+        [P2-4]：**必须先 `force_next()`**。`schedule_check` 在 `ai_trade_backstop_poll_ttl_s`
+        （默认 120s）内会直接 return 不建任务，于是这里会 await 到一个早已 `done()` 的旧任务并
+        原样回一份**上一次**的读数——用户看到的「已核实覆盖 100%」其实是两分钟前的事实。
+        """
+        self.force_next()
+        self.schedule_check(now_wall, side=side, position_sz=position_sz,
+                            local_sl_px=local_sl_px, local_tp_px=local_tp_px)
+        task = self._task
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=max(0.1, timeout_s))
+            except Exception as exc:  # noqa: BLE001 —— 超时 / 异常一律回诚实的 unavailable
+                logger.debug("ai-trade backstop check_now degraded (%s): %s", self.inst_id, exc)
+        return self.wire(now_wall)
+
     def close(self) -> None:
         """会话停止：置 `_closed`，在途任务回来后不再写任何状态、不再推任何事件。"""
         self._closed = True
@@ -434,3 +458,19 @@ def schedule_from_executor(runtime: BackstopRuntime | None, executor, *,
     runtime.schedule_check(now_wall, side=executor.projected,
                            position_sz=float(getattr(executor, "entry_qty_sz", 0.0) or 0.0),
                            local_sl_px=sl_px, local_tp_px=tp_px, push=push)
+
+
+async def check_now_from_executor(runtime: BackstopRuntime | None, executor, *,
+                                  now_wall: float, timeout_s: float = 8.0) -> dict | None:
+    """从 executor 读断面并**同步等**一次核实（pause-resume §3.1.3 ⑥）。
+
+    断面口径与 `schedule_from_executor` **同一处**：立场取 `executor.projected`，两个价只读
+    转发 `exchange_oco_px` 的既有产物。刻意不让调用方自己算——那就是第二份口径。
+    """
+    if runtime is None:
+        return None
+    tp_px, sl_px, _ = exchange_oco_px(executor, executor.projected)
+    return await runtime.check_now(
+        now_wall, side=executor.projected,
+        position_sz=float(getattr(executor, "entry_qty_sz", 0.0) or 0.0),
+        local_sl_px=sl_px, local_tp_px=tp_px, timeout_s=timeout_s)

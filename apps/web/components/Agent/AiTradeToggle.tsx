@@ -1,8 +1,8 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useState } from "react";
-import { Switch } from "@/components/ui";
+import { useCallback, useState } from "react";
+import { Badge, Button, Switch } from "@/components/ui";
 import { accountApi } from "@/lib/accountApi";
 import { agentApi } from "@/lib/agentApi";
 import { aiBacktestApi } from "@/lib/aiBacktestApi";
@@ -14,11 +14,21 @@ import {
   AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN,
   AI_TRADE_PROFIT_GUARD_DEFAULTS,
   resolveAiTradeGate,
+  resolveAiTradeLifecycle,
 } from "@/lib/aiTrade";
 import { ApiRequestError } from "@/lib/api";
 import { groupStateFromStatus } from "@/lib/useAiTradeGroupStream";
+import type {
+  AiTradeEndResult,
+  AiTradeResumableMember,
+  AiTradeResumePreview,
+} from "@/lib/aiTradeTypes";
+import { fmtNum } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 import AiTradeLaunchModal, { type AiTradeLaunchOpts } from "./AiTradeLaunchModal";
+import AiTradeEndDialog from "./AiTradeEndDialog";
+import AiTradePauseDialog from "./AiTradePauseDialog";
+import AiTradeResumeDialog from "./AiTradeResumeDialog";
 
 /**
  * AI 自动交易开关（ai-trade-multi-symbol-and-timeframe §4.2）：挂 AgentPanel 头部「新对话」右侧。
@@ -34,6 +44,7 @@ export default function AiTradeToggle() {
   const backtestStartTs = useAppStore((s) => s.backtestStartTs);
   const backtestEndTs = useAppStore((s) => s.backtestEndTs);
   const aiTradeGroup = useAppStore((s) => s.aiTradeGroup);
+  const aiTradeResumable = useAppStore((s) => s.aiTradeResumable);
   const liveAutoGroup = useAppStore((s) => s.liveAutoGroup);
   const autoTradeMembers = useAppStore((s) => s.autoTradeMembers);
   const autoTradeAllocationMode = useAppStore((s) => s.autoTradeAllocationMode);
@@ -41,6 +52,8 @@ export default function AiTradeToggle() {
   const aiTradeConfig = useAppStore((s) => s.aiTradeConfig);
   const aiBacktestConfig = useAppStore((s) => s.aiBacktestConfig);
   const setAiTradeGroup = useAppStore((s) => s.setAiTradeGroup);
+  const setAiTradeResumable = useAppStore((s) => s.setAiTradeResumable);
+  const setAiTradeLifecycleNotice = useAppStore((s) => s.setAiTradeLifecycleNotice);
   const setAiTradeAcknowledged = useAppStore((s) => s.setAiTradeAcknowledged);
   const setAiTradeConfig = useAppStore((s) => s.setAiTradeConfig);
   const setAiBacktestJobId = useAppStore((s) => s.setAiBacktestJobId);
@@ -50,6 +63,11 @@ export default function AiTradeToggle() {
   const qc = useQueryClient();
   const [modalOpen, setModalOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [pauseOpen, setPauseOpen] = useState(false);
+  const [resumeOpen, setResumeOpen] = useState(false);
+  const [endOpen, setEndOpen] = useState(false);
+  const [preview, setPreview] = useState<AiTradeResumePreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
 
   const accountsQ = useQuery({ queryKey: ["okx", "accounts"], queryFn: accountApi.accounts.list });
   const defaultAccount =
@@ -68,8 +86,11 @@ export default function AiTradeToggle() {
   });
   const aiTradeEnabled = statusQ.data?.aiTradeEnabled ?? false;
 
-  const running = !!aiTradeGroup;
-  const groupId = aiTradeGroup?.groupId ?? null;
+  // 生命周期的唯一推导点（pause-resume §3.9.1）：任何组件都不得自己拼这个判断。
+  const lifecycle = resolveAiTradeLifecycle(aiTradeGroup, aiTradeResumable);
+  const running = lifecycle === "running";
+  const paused = lifecycle === "paused";
+  const groupId = aiTradeGroup?.groupId ?? aiTradeResumable?.groupId ?? null;
   // 实盘段门禁（传入弹窗，实盘 tab 据此禁用 + 悬浮说明）；回测段仅需 agentConfigured。
   const liveGateReason = resolveAiTradeGate({
     accountMode,
@@ -77,7 +98,9 @@ export default function AiTradeToggle() {
     aiTradeEnabled,
     agentConfigured,
     liveAutoActive: !!liveAutoGroup,
-    hasActiveSession: running,
+    // 暂停中的分组同样占着那唯一一个活跃位（后端容量闸会 409 `AI_TRADE_PAUSED_GROUP_EXISTS`）。
+    // 不把 `paused` 算进来，弹窗会看起来可用，用户填完一整屏参数才在提交时吃一个 409。
+    hasActiveSession: running || paused,
   });
   // 打开弹窗的最小门禁（独立于 resolveAiTradeGate）：Agent 已配置即可（回测在模拟账户模式也可用，R6）。
   const openBlockedReason = running ? null : !agentConfigured ? "请先在设置中心配置 AI 模型" : null;
@@ -126,6 +149,8 @@ export default function AiTradeToggle() {
       });
       setModalOpen(false);
       setError(null);
+      // 新会话起来了，上一次的生命周期提示就过期了（那笔孤儿仓的告知使命到此为止）。
+      setAiTradeLifecycleNotice(null);
       qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
     },
     onError: (e) => setError(e instanceof ApiRequestError ? describeStartError(e) : "启动失败，请稍后重试"),
@@ -181,6 +206,70 @@ export default function AiTradeToggle() {
     },
   });
 
+  // ---- 暂停 / 继续 / 结束（pause-resume §3.9.2）----
+  const pauseM = useMutation({
+    mutationFn: (opts: { holdPosition: boolean }) =>
+      aiTradeApi.pauseGroup(groupId ?? "", { holdPosition: opts.holdPosition }),
+    onSuccess: (res) => {
+      // 回执的 `notice` 是后端单点生成的判定性文案（§3.10）：它是唯一一处会说出「平仓其实没成功」
+      // 与「此刻没有任何持久化兜底」的地方。只写不读 = 用户永远看不到那句话。
+      setAiTradeLifecycleNotice(res.notice || null);
+      setPauseOpen(false);
+      setError(null);
+      qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
+    },
+    onError: (e) => setError(e instanceof ApiRequestError ? e.message : "暂停失败，请稍后重试"),
+  });
+
+  const resumeM = useMutation({
+    mutationFn: (opts: { acknowledge: boolean }) =>
+      aiTradeApi.resumeGroup(groupId ?? "", { acknowledge: opts.acknowledge }),
+    onSuccess: (res) => {
+      // 续跑成功后热态回来了：装上分组视图并清掉冷占位（两者互斥，绝不同时非空）。
+      setAiTradeGroup(groupStateFromStatus(res));
+      setAiTradeResumable(null);
+      setResumeOpen(false);
+      setPreview(null);
+      setError(null);
+      qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
+    },
+    onError: (e) =>
+      setError(e instanceof ApiRequestError ? describeStartError(e) : "继续失败，请稍后重试"),
+  });
+
+  const endM = useMutation({
+    mutationFn: (opts: { flatten: boolean | null; acknowledgeOrphanPosition: boolean }) =>
+      aiTradeApi.endGroup(groupId ?? "", opts),
+    onSuccess: (res) => {
+      clearAiTradeRuntime();
+      // `orphanPositions` = 此次结束后仍留在交易所上的持仓（§5.4 要求前端据它出一条**持久**提示）。
+      // 归档后 AI 面板整块消失，若这条提示也跟着消失，「这些仓从此没人管了」就再也没人告诉用户。
+      setAiTradeLifecycleNotice(describeOrphanPositions(res.orphanPositions));
+      setEndOpen(false);
+      setResumeOpen(false);
+      setError(null);
+      qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
+    },
+    onError: (e) => setError(e instanceof ApiRequestError ? e.message : "结束失败，请稍后重试"),
+  });
+
+  // 「继续」按钮三态（`继续` / `正在核对持仓…` / 错误原因内联展示）：先拉复核数据再开框，
+  // 用户看到的第一屏就是「离线期间发生了什么」，而不是一个空壳弹窗。
+  const openResume = useCallback(() => {
+    if (!groupId) return;
+    setError(null);
+    setPreview(null);
+    setResumeOpen(true);
+    setPreviewLoading(true);
+    aiTradeApi
+      .resumePreview(groupId)
+      .then(setPreview)
+      .catch((e: unknown) =>
+        setError(e instanceof ApiRequestError ? e.message : "无法核对持仓，请稍后重试"),
+      )
+      .finally(() => setPreviewLoading(false));
+  }, [groupId]);
+
   const onToggle = (next: boolean) => {
     setError(null);
     if (next) {
@@ -202,23 +291,112 @@ export default function AiTradeToggle() {
     <div
       className="flex items-center gap-1.5"
       title={
-        openBlockedReason ?? (running ? "点击停止 AI 自动交易并平掉自管持仓" : "开启 AI 自动交易 / 回测")
+        paused
+          ? "已暂停：不再开新仓，但盯市与保护层照常运行。点「继续」核对持仓后接着跑，或「结束」归档"
+          : (openBlockedReason
+            ?? (running ? "点击停止 AI 自动交易并平掉自管持仓" : "开启 AI 自动交易 / 回测"))
       }
     >
       <span
         className={
-          running
+          running || paused
             ? "text-[11px] font-medium text-[var(--accent)]"
             : "text-[11px] text-[var(--muted)]"
         }
       >
         AI 自动交易
       </span>
+      {/* 三态控件（§3.9.2）。`paused` 时开关保持 off 且**禁用**——避免「关开关」与「结束」两个
+          入口语义重叠：暂停可逆、结束不可逆，二者绝不能长得像同一个动作。 */}
       <Switch
         checked={running}
-        onChange={onToggle}
+        onChange={paused ? noop : onToggle}
         label="AI 自动交易开关"
-        className={openBlockedReason && !running ? "opacity-40" : undefined}
+        className={(openBlockedReason && !running) || paused ? "opacity-40" : undefined}
+      />
+      {running && (
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-label="暂停 AI 自动交易"
+          onClick={() => {
+            setError(null);
+            setPauseOpen(true);
+          }}
+        >
+          ⏸ 暂停
+        </Button>
+      )}
+      {paused && (
+        <>
+          <Badge tone="accent">已暂停</Badge>
+          <Button
+            variant="primary"
+            size="sm"
+            aria-label="继续 AI 自动交易"
+            disabled={resumeM.isPending}
+            onClick={openResume}
+          >
+            {resumeM.isPending ? "正在核对持仓…" : "▶ 继续"}
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label="结束 AI 自动交易"
+            onClick={() => {
+              setError(null);
+              setEndOpen(true);
+            }}
+          >
+            结束
+          </Button>
+        </>
+      )}
+      {paused && error && !resumeOpen && !endOpen && (
+        <span className="max-w-[220px] truncate text-[10px] text-[var(--short)]" role="alert">
+          {error}
+        </span>
+      )}
+      <AiTradePauseDialog
+        open={pauseOpen}
+        group={aiTradeGroup}
+        submitting={pauseM.isPending}
+        error={pauseOpen ? error : null}
+        onClose={() => {
+          setPauseOpen(false);
+          setError(null);
+        }}
+        onConfirm={(opts) => pauseM.mutate(opts)}
+      />
+      <AiTradeResumeDialog
+        open={resumeOpen}
+        preview={preview}
+        loading={previewLoading}
+        submitting={resumeM.isPending}
+        error={resumeOpen ? error : null}
+        onClose={() => {
+          setResumeOpen(false);
+          setError(null);
+        }}
+        onConfirm={(opts) => resumeM.mutate(opts)}
+        onEnd={() => {
+          setResumeOpen(false);
+          setEndOpen(true);
+        }}
+      />
+      <AiTradeEndDialog
+        open={endOpen}
+        members={endDialogMembers(aiTradeResumable?.members, aiTradeGroup)}
+        // 冷续跑卡上没有会话对象，后端也就没有任何东西能代用户下平仓单（服务端同样 fail-closed，
+        // 回 `AI_TRADE_END_FLATTEN_UNAVAILABLE`）。这里**不给**那个选项，而不是给了再报错。
+        canFlatten={!!aiTradeGroup}
+        submitting={endM.isPending}
+        error={endOpen ? error : null}
+        onClose={() => {
+          setEndOpen(false);
+          setError(null);
+        }}
+        onConfirm={(opts) => endM.mutate(opts)}
       />
       <AiTradeLaunchModal
         open={modalOpen}
@@ -253,6 +431,61 @@ export default function AiTradeToggle() {
       />
     </div>
   );
+}
+
+/**
+ * 暂停态下开关的空动作。
+ *
+ * 刻意**不给 `Switch` 加 `disabled` 形参**：`components/ui/index.tsx` 不在本轮的文件变更计划里，
+ * 而它是全仓共用的 UI kit（改它要配一条 kit 用例，见 spec [P2-2] 对 `Badge tone="warn"` 的同款
+ * 判断）。视觉上用 `opacity-40` 表达不可用，行为上在此处吃掉点击 —— 暂停期「关开关」与「结束」
+ * 两个入口的语义绝不能重叠：暂停可逆，结束不可逆。
+ */
+const noop = () => {};
+
+/**
+ * 结束确认框的成员行：冷占位有落盘快照就用它，热暂停则由内存持仓派生。
+ *
+ * 两条路径都要走 —— 冷启后内存里没有会话（只有契约），而热暂停时冷占位是空的；少一条，
+ * 「带仓时强制二选一」这道闸就会在另一条路径上**静默失效**（用户会看到一个无仓的普通确认框）。
+ */
+function endDialogMembers(
+  cold: AiTradeResumableMember[] | undefined,
+  group: ReturnType<typeof useAppStore.getState>["aiTradeGroup"],
+): AiTradeResumableMember[] {
+  if (cold && cold.length > 0) return cold;
+  if (!group) return [];
+  return Object.values(group.members).map((m) => ({
+    instId: m.instId,
+    runId: m.session?.runId ?? null,
+    sessionId: m.sessionId,
+    position: m.position
+      ? {
+          side: (m.position.side === "short" ? "short" : "long") as "long" | "short",
+          size: Number(m.position.size ?? 0),
+        }
+      : null,
+    positionUnknown: false,
+  }));
+}
+
+/**
+ * 结束回执里的孤儿持仓 → 一条持久提示（§5.4）；没有孤儿仓 ⇒ `null`（不打扰）。
+ *
+ * 只做**结构化事实**的中文装配（哪一个标的、多少张、关机前有没有兜底），不下任何新判断 ——
+ * 判定性口径仍由后端那份 `orphanPositions` 决定（§3.10）。
+ */
+function describeOrphanPositions(rows: AiTradeEndResult["orphanPositions"]): string | null {
+  if (!rows || rows.length === 0) return null;
+  const parts = rows.map((row) => {
+    // 措辞对冷（关机前那次核实）/ 热（刚刚平仓失败，还没核实过）两条路径都要成立，故只说
+    // 「最后一次核实」而不说「关机前」——后者在热路径上是一句不成立的话。
+    const cover = row.backstop?.covered ? "最后一次核实：交易所侧止损已覆盖" : "未确认有交易所侧兜底";
+    if (row.positionUnknown || !row.position) return `${row.instId}（持仓未能读取，${cover}）`;
+    const side = row.position.side === "long" ? "多头" : "空头";
+    return `${row.instId} ${side} ${fmtNum(Number(row.position.size ?? 0))} 张（${cover}）`;
+  });
+  return `已结束并归档。以下持仓仍留在交易所上，从此不再由任何自动化管理，请到实盘面板自行处理：${parts.join("；")}。`;
 }
 
 /** 整组前置失败（AI_TRADE_GROUP_PREFLIGHT）逐标的明细中文化；否则回落 message。 */

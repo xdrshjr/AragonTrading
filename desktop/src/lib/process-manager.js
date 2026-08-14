@@ -102,6 +102,50 @@ function httpGetText(url, perTryTimeoutMs = 4000) {
   });
 }
 
+/**
+ * 单次 HTTP POST（JSON），**任何失败一律返回 null 且绝不抛**（ai-trade-pause-resume §3.8）。
+ *
+ * 唯一调用方是退出前的 `quit-pause` 钩子：它是**纯优化**，正确性由后端的启动对账兜底
+ * （强杀 / 崩溃 / 断电时它根本不会被执行）。故这里的每一条错误路径都必须静默降级——一个
+ * best-effort 的钩子绝不能让用户点了「关闭」之后卡住或看到报错。
+ */
+function postJsonSafe(url, body, timeoutMs = 2000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => {
+      if (!settled) {
+        settled = true;
+        resolve(v);
+      }
+    };
+    const payload = Buffer.from(JSON.stringify(body ?? {}), 'utf-8');
+    let req;
+    try {
+      req = http.request(
+        url,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': payload.length },
+        },
+        (res) => {
+          const chunks = [];
+          res.on('data', (d) => chunks.push(d));
+          res.on('end', () => done(Buffer.concat(chunks).toString('utf-8')));
+          res.on('error', () => done(null));
+        },
+      );
+    } catch {
+      return done(null); // 非法 URL 等同步抛错：同样静默降级
+    }
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      done(null);
+    });
+    req.on('error', () => done(null));
+    req.end(payload);
+  });
+}
+
 // ===================== 端口自愈：定位占用者 → 身份护栏 → 强杀 → 轮询释放 =====================
 // round-3：自动化弹窗里原本要求用户手敲的 Get-NetTCPConnection | Stop-Process（见 main.js 端口预检）。
 // 仅用内置模块 + 系统自带命令（PowerShell / netstat / tasklist / lsof），维持运行期零 npm 依赖。
@@ -446,6 +490,7 @@ module.exports = {
   waitForHttp,
   delay,
   httpGetText,
+  postJsonSafe,
   reclaimPort,
   reapRecordedPids,
   writeRecordedPids,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -177,13 +178,31 @@ async def _reconcile_orphan_ai_trade_runs() -> None:
     进程启动时内存管理器为空，任何仍标 ``running`` 的 ai-trade run 必是上次崩溃 / 强杀遗留，
     否则历史列表会出现「幽灵进行中」。仿 ``_reconcile_orphan_live_auto_runs`` 用一次性 session，
     **整段 try/except 包裹、失败仅 warning 不阻断启动**（对账为非关键收敛，二次运行幂等）。
+
+    ai-trade-pause-resume §3.7：``resume_enabled`` **只由整轴总闸 ``ai_trade_pause_enabled``
+    决定**（关 ⇒ 逐字回退老行为）。是否允许 ``resume`` 才由 ``ai_trade_enabled`` 决定——
+    「运维关掉 AI 总闸」绝不该等于「把一个仍持真实仓位的会话静默归档」（[P1-11]）。
+    ``pause_reason`` 据此两分（照抄 ``discovery/manager`` 的既有写法）。
     """
     try:
+        from . import ai_trade_state_repositories as state_repo
         from . import repositories as repo
+
+        settings = get_settings()
+        resume_enabled = bool(settings.ai_trade_pause_enabled)
+        reason = ("process_restart" if settings.ai_trade_enabled else "disabled_by_config")
         async with get_sessionmaker()() as session:
-            reconciled = await repo.reconcile_orphan_ai_trade_runs(session)
+            reconciled = await repo.reconcile_orphan_ai_trade_runs(
+                session, resume_enabled=resume_enabled)
+            if resume_enabled:
+                for group_id in await repo.list_paused_ai_trade_group_ids(session):
+                    await state_repo.patch_group_state(
+                        session, group_id,
+                        {"status": "paused", "pauseReason": reason,
+                         "pausedTs": int(time.time())})
         if reconciled:
-            logger.info("reconciled %d orphan ai-trade runs to stopped", reconciled)
+            logger.info("reconciled %d orphan ai-trade runs (resume_enabled=%s)",
+                        reconciled, resume_enabled)
     except Exception as exc:  # noqa: BLE001 —— 启动对账非关键，绝不因它拖垮服务启动
         logger.warning("ai-trade orphan reconcile skipped: %s", exc)
 

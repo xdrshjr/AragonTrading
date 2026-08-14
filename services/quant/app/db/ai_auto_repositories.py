@@ -284,15 +284,23 @@ async def _load_trades_by_run(session: AsyncSession, run_ids: list[int]) -> dict
 
 
 async def list_ai_trade_groups(session: AsyncSession, *, limit: int = 20, offset: int = 0,
-                               exclude_group_id: str | None = None) -> dict:
+                               exclude_group_id: str | None = None,
+                               exclude_statuses: tuple[str, ...] = ()) -> dict:
     """历史会话列表：group_id 非空、按 group_started_ts DESC、可排除当前运行中 group（§3.4 / §5.1）。
 
     3 查询/页（去重分组分页 + 成员 runs + 成交），逐成员配对聚合每组 KPI；返回
     ``{items, total, limit, offset}``。空历史 → ``items=[]``、``total=0``。
+
+    ``exclude_statuses``（ai-trade-pause-resume D-8）：按 run **状态**排除（默认空元组 ⇒ 既有
+    行为逐字不变）。它与 ``exclude_group_id`` 分工互补：后者是**内存派生**的，冷启后内存里什么
+    都没有，一个仍持真实仓位的 ``paused`` 分组会同时出现在「历史会话」里——用户会看到同一次交易
+    既「已结束」又「可继续」。
     """
     where = [StrategyRun.mode == _AI_TRADE_MODE, StrategyRun.group_id.is_not(None)]
     if exclude_group_id is not None:
         where.append(StrategyRun.group_id != exclude_group_id)
+    if exclude_statuses:
+        where.append(StrategyRun.status.notin_(tuple(exclude_statuses)))
 
     total = (await session.execute(
         select(func.count(func.distinct(StrategyRun.group_id))).where(*where))).scalar() or 0
@@ -648,12 +656,24 @@ def _trip_meta(trip: _Trip) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
-async def reconcile_orphan_ai_trade_runs(session: AsyncSession) -> int:
+async def reconcile_orphan_ai_trade_runs(session: AsyncSession, *,
+                                         resume_enabled: bool = False) -> int:
     """启动期孤儿对账（§3.5 / R-3）：running 的 ai-trade run 回填 end_ts + 置 stopped + reconciled=true。
 
     幂等：二次运行无 running 行即 0 改。end_ts 取「最后成交 ts / group_started_ts / start_ts」之最大
     （AI-trade 无持久化 equity 表，去掉 live-auto 版的「最后权益」项，P2-3），避免历史列表「幽灵进行中」。
-    返回被对账条数。
+
+    ``resume_enabled``（ai-trade-pause-resume §3.7）：
+    - ``False``（默认）⇒ **逐字保持既有行为**（running → stopped，一键回滚到本轮之前）；
+    - ``True`` ⇒ running 的 ai-trade run 置 ``paused``（**不回填 end_ts、不写 metrics.reconciled**）
+      —— 那行「一律置 stopped」的代码正是用户抱怨的那句「再次启动后就得重新启动交易」的实现。
+      它只动数据库、不看交易所，所以强杀时若持仓还在，本地已经「结案」而交易所上那个真实仓位
+      没人再看它一眼。
+
+    Returns:
+        被对账的**条数**（两种模式同口径）。**返回类型必须保持 `int`**（[P1-3]）：改成 dict 会直接
+        打破既有用例 `test_ai_auto_history.py::test_reconcile_orphan_ai_trade_runs` 与
+        `db/session.py` 的 `%d` 日志。分组信息走独立的只读 `list_paused_ai_trade_group_ids`。
     """
     orphans = (await session.execute(
         select(StrategyRun).where(
@@ -661,6 +681,9 @@ async def reconcile_orphan_ai_trade_runs(session: AsyncSession) -> int:
     if not orphans:
         return 0
     for run in orphans:
+        if resume_enabled:
+            run.status = "paused"
+            continue
         run.status = "stopped"
         run.end_ts = await _resolve_orphan_end_ts(session, run)
         metrics = _load_config(run.metrics_json)
@@ -668,6 +691,19 @@ async def reconcile_orphan_ai_trade_runs(session: AsyncSession) -> int:
         run.metrics_json = json.dumps(metrics, ensure_ascii=False)
     await session.commit()
     return len(orphans)
+
+
+async def list_paused_ai_trade_group_ids(session: AsyncSession) -> list[str]:
+    """当前处于 ``paused`` 的 ai-trade ``group_id`` 列表（只读、幂等、与上面那个函数解耦）。
+
+    刻意**不塞进** ``reconcile_orphan_ai_trade_runs`` 的返回值（[P1-3]）：那会把一个有既有用例
+    钉着的稳定签名改掉，而这里要的只是一次成本近乎为零的只读查询。
+    """
+    rows = (await session.execute(
+        select(StrategyRun.group_id).where(
+            StrategyRun.mode == _AI_TRADE_MODE, StrategyRun.status == "paused",
+            StrategyRun.group_id.is_not(None)).distinct())).all()
+    return [str(row[0]) for row in rows if row[0]]
 
 
 async def _resolve_orphan_end_ts(session: AsyncSession, run: StrategyRun) -> int:

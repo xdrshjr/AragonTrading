@@ -61,7 +61,12 @@ export function groupStateFromStatus(row: AiTradeGroupRow): AiTradeGroupState {
     // 纪律条在「刷新页面后重发现」这条路径上就恒为空（而 WS status 那条通路是好的，故这个坑
     // 只在重载后复现，最难被发现）。`aiTradeDiscipline.test.ts` 有一条用例专门守它。
     discipline: row.discipline ?? null,
-    state: "running",
+    // pause-resume D-7：这里此前**写死**成 "running"，于是暂停态在「刷新页面后重发现」这条路径上
+    // 恒显示为运行中——最难被发现的那种坑。`?? "running"` 让老后端逐字回退。
+    state: row.state ?? "running",
+    pauseReason: row.pauseReason ?? null,
+    pausedTs: row.pausedTs ?? null,
+    resumedCount: row.resumedCount ?? null,
     startedTs: row.createdTs,
     members,
   };
@@ -79,6 +84,7 @@ export function useAiTradeGroupStream() {
   const accountMode = useAppStore((s) => s.accountMode);
   const aiTradeGroup = useAppStore((s) => s.aiTradeGroup);
   const setAiTradeGroup = useAppStore((s) => s.setAiTradeGroup);
+  const setAiTradeResumable = useAppStore((s) => s.setAiTradeResumable);
   const patchAiTradeMemberSession = useAppStore((s) => s.patchAiTradeMemberSession);
   const patchAiTradeMemberStatus = useAppStore((s) => s.patchAiTradeMemberStatus);
   const patchAiTradeGroupAcceptance = useAppStore((s) => s.patchAiTradeGroupAcceptance);
@@ -92,13 +98,18 @@ export function useAiTradeGroupStream() {
   const setAiTradeMemberSummary = useAppStore((s) => s.setAiTradeMemberSummary);
 
   // 重发现：实盘模式下拉活跃分组，重建瞬态运行期态（已有同组本地态则不覆盖成交流，仅在缺失时重建）。
+  // pause-resume §3.9.4：**必须先消费 `resumable` 再走 `!res.group` 那条早退**——否则冷占位这条
+  // 路径上 `setAiTradeResumable` 永远不会被调用（那正是 D-7 那类「静默失效」的同款形状）。
+  // 第一行 `accountMode !== "live"` 保持不动：续跑卡**只在实盘账户模式渲染**（[P2-10]）。
   useEffect(() => {
     if (accountMode !== "live") return;
     let cancelled = false;
     aiTradeApi
       .status()
       .then((res) => {
-        if (cancelled || !res.group) return;
+        if (cancelled) return;
+        setAiTradeResumable(res.resumable ?? null);   // 冷占位**绝不** setAiTradeGroup
+        if (!res.group) return;
         const current = useAppStore.getState().aiTradeGroup;
         if (current?.groupId === res.group.groupId) return;
         setAiTradeGroup(groupStateFromStatus(res.group));
@@ -107,7 +118,7 @@ export function useAiTradeGroupStream() {
     return () => {
       cancelled = true;
     };
-  }, [accountMode, setAiTradeGroup]);
+  }, [accountMode, setAiTradeGroup, setAiTradeResumable]);
 
   // 分组级验收三键的 15s 轮询（[P0-3]）：只在实盘模式且存在运行中分组时启动，页面隐藏即暂停
   // （R-14：长期挂着的看板不该持续打请求）。**只走窄 action**——`setAiTradeGroup` 会把成交流清空。
@@ -138,8 +149,11 @@ export function useAiTradeGroupStream() {
   }, [accountMode, groupId, patchAiTradeGroupAcceptance]);
 
   // 成员集合稳定键：成员增删 / 重启即重建全部 WS（值变才触发，避免每次渲染重连）。
+  // 只由**有 sessionId** 的成员构成（pause-resume §3.9.4）：冷占位没有 sessionId，
+  // 不过滤就会去连 `/ws/ai-trade/undefined`。
   const memberKey = aiTradeGroup
     ? Object.values(aiTradeGroup.members)
+        .filter((m) => !!m.sessionId)
         .map((m) => `${m.instId}${SEP}${m.sessionId}`)
         .sort()
         .join(",")

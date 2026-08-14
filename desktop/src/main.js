@@ -21,6 +21,7 @@ const {
   writeRecordedPids,
   removeRecordedPids,
   httpGetText,
+  postJsonSafe,
 } = require('./lib/process-manager');
 
 let win = null;
@@ -488,6 +489,15 @@ async function gracefulQuit() {
   quitting = true;
   if (pm) {
     logMain('收到退出信号，正在停止前后端 …');
+    // AI 自动交易：退出前给后端一次「落暂停」的机会（best-effort，2s 硬超时）。
+    // **正确性不依赖它** —— 强杀 / 崩溃 / 断电由后端的启动对账兜底（spec §3.7）；而 Windows 上
+    // `_gracefulStop()` 用的 `taskkill /PID /T`（无 `/F`）对一个 windowsHide 的无窗口 Python
+    // 子进程通常直接失败，8s 宽限后被 `/F /T` 强杀，故 FastAPI 的 lifespan 关停钩子大概率跑不到。
+    // 这条 HTTP 钩子是那条路的**可靠**替代：它默认走 `hold`（带仓暂停），重开后有一张续跑卡。
+    // 注意路径是后端自己的 `/api/*`（`/api/py/*` 是 Next 的代理前缀，直连后端时不存在）。
+    const paused = await postJsonSafe(
+      `http://${cfg.BACKEND_HOST}:${cfg.BACKEND_PORT}/api/ai-trade/quit-pause`, {}, 2000);
+    if (paused) logMain(`AI 自动交易退出前处置：${paused}`);
     await pm.stop();
     // 兜底端口清扫（R4）：pm.stop() 仅按 PID 树杀受管子进程；若仍有端口被占（逃逸的孙子进程），
     // 按身份护栏回收，确保「关闭后端口被释放」（round-3 之一，覆盖正常退出场景）。

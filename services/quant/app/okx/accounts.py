@@ -152,7 +152,18 @@ def _normalize_balance(balance: dict) -> dict:
 
 
 def _normalize_position(p: dict) -> dict:
-    """OKX account/positions 单行 → 归一持仓（camelCase，数值容错）。"""
+    """OKX account/positions 单行 → 归一持仓（camelCase，数值容错）。
+
+    ``posId`` / ``cTimeS`` / ``uTimeS`` 三键仅「停止丢弃」（ai-trade-pause-resume §3.5 S3'，
+    先例 = ``_normalize_fill`` 对 ``clOrdId``/``tradeId``/``feeCcy`` 的同款处理）：**既有键与语义
+    逐字不变**。没有它们，「暂停 → 关机 → 续跑」时就只能比 `(side, size)`，而那会把用户在离线
+    期间自己开的同向同量仓判成「与暂停时一致」并静默接管（spec [P0-1]）。时间戳按仓库惯例归一
+    为**秒级** UTC（OKX 原文是毫秒串），缺失容错为 ``""`` / ``0``。
+
+    ⚠️ ``api/trading.py:104`` 那条端点有 ``response_model=OkxAccountPosition``
+    （``schemas.py``），FastAPI 会把这三个新键**静默吞掉** —— 这不影响续跑（它走
+    ``fetch_live_positions`` 直调、不经该端点），但别把「账户面板拿不到 posId」误判成 bug。
+    """
     return {
         "instId": str(p.get("instId") or ""),
         "instType": str(p.get("instType") or ""),
@@ -164,4 +175,7 @@ def _normalize_position(p: dict) -> dict:
         "uplRatio": _optional_float(p.get("uplRatio")),
         "lever": _optional_float(p.get("lever")),
         "marginMode": str(p.get("mgnMode") or ""),
+        "posId": str(p.get("posId") or ""),
+        "cTimeS": int(_optional_float(p.get("cTime")) or 0) // 1000,
+        "uTimeS": int(_optional_float(p.get("uTime")) or 0) // 1000,
     }

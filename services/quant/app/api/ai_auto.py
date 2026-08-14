@@ -306,6 +306,26 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
     成员总预算按 allocationPct 切分（非倍增）。
     """
     _require_ai_enabled(settings)
+    req = await build_start_request(session, settings, body)
+    try:
+        await get_ai_trade_manager().start_group(req)
+    except AiTradeGroupPreflightError as exc:
+        # 整组前置失败须透传逐标的 members 明细（全局处理器据此包成 {error:{code,message,members}}）。
+        raise HTTPException(exc.status, detail={
+            "code": exc.code, "message": exc.message, "members": exc.members})
+    except (AiTradeSessionLimitError, AiTradePreflightError) as exc:
+        raise HTTPException(exc.status, detail={"code": exc.code, "message": exc.message})
+    return get_ai_trade_manager().group_status()
+
+
+async def build_start_request(session: AsyncSession, settings: Settings,
+                              body: AiTradeGroupStartIn) -> AiTradeGroupStartRequest:
+    """`/ai-trade/start` 的**唯一**解析链（`ai_auto/resume.py` 的 S2 复用同一条，绝不另写一份）。
+
+    抽出来的理由：冷续跑的真源是 `start_wire`（启动请求原文），它必须**重跑一遍**这条链才能拿到
+    与首次启动逐字段相同的落地参数（spec §3.5 S2）。两处各写一遍必然漂移，而这里漂移的是止损
+    百分比与账户凭证——不会报错，只会让用户以为止损 1% 实际 5%（D-2）。
+    """
     account_row = await _resolve_account(session, body.accountId)
     specs, fingerprints = await _build_specs(session, body.strategyIds)
     # ★ [P1-2] 纪律预设**必须**在这里就把 `settings` 换成派生副本——下面所有 `_resolve_*` 都在
@@ -345,16 +365,10 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
         # `_validate_sizing` 的 [P0-4] 最小下单量复核会在启动期继续往里追加。
         discipline_preset=discipline.preset_id, discipline_f_floor=discipline.f_floor,
         discipline_adjustments=discipline.adjustments,
-        discipline_thresholds=preset_table(discipline.preset_id))
-    try:
-        await get_ai_trade_manager().start_group(req)
-    except AiTradeGroupPreflightError as exc:
-        # 整组前置失败须透传逐标的 members 明细（全局处理器据此包成 {error:{code,message,members}}）。
-        raise HTTPException(exc.status, detail={
-            "code": exc.code, "message": exc.message, "members": exc.members})
-    except (AiTradeSessionLimitError, AiTradePreflightError) as exc:
-        raise HTTPException(exc.status, detail={"code": exc.code, "message": exc.message})
-    return get_ai_trade_manager().group_status()
+        discipline_thresholds=preset_table(discipline.preset_id),
+        # 续跑的唯一真源（pause-resume D-2 / [P2-11]）：只落请求体，绝不含 apiKey/secret/passphrase。
+        start_wire=body.model_dump(mode="json"))
+    return req
 
 
 @router.post("/ai-trade/{group_id}/stop")
@@ -409,9 +423,15 @@ async def ai_trade_member_backstop_repair(group_id: str, inst_id: str) -> dict:
 
 @router.get("/ai-trade/status")
 async def ai_trade_status(settings: Settings = Depends(get_settings)) -> dict:
-    """当前活跃 AI 分组（无则 group:null）；前端重载后据此重连各成员 WS（只读，不守门）。"""
-    return {"group": get_ai_trade_manager().group_status(),
-            "aiTradeEnabled": settings.ai_trade_enabled}
+    """当前活跃 AI 分组（无则 group:null）；前端重载后据此重连各成员 WS（只读，不守门）。
+
+    `resumable`（pause-resume §5.6）：**仅**冷占位（内存无会话、磁盘有暂停契约）时非空。
+    它与 `group` **互斥**——热暂停走 `group.state="paused"`，两者同时非空即 bug（G-9 冻结）。
+    该端点 `-> dict` 且无 `response_model`，故新键不会被 FastAPI 静默吞掉。
+    """
+    manager = get_ai_trade_manager()
+    return {"group": manager.group_status(), "aiTradeEnabled": settings.ai_trade_enabled,
+            "resumable": manager.resumable()}
 
 
 @router.get("/ai-trade/discipline-presets")
@@ -549,8 +569,12 @@ async def ai_trade_history(limit: int = Query(20, ge=1, le=100),
     分页；排除当前运行中分组（其在「当前」视图展示）。只读，不守门（历史查看不涉及下单）。"""
     active = get_ai_trade_manager().group_status()
     exclude = active["groupId"] if active else None
+    # D-8 / [P0-3]：已暂停的分组按 **DB `status`** 排除（不依赖内存派生的 id——冷启后内存是空的，
+    # 一个仍持真仓的 paused 分组会同时出现在「历史会话」里）。**只加 "paused"，不加 "running"**：
+    # 加它会打破既有用例 `test_history_endpoints`（`_add_run` 默认 status="running"）。
     return await repo.list_ai_trade_groups(
-        session, limit=limit, offset=offset, exclude_group_id=exclude)
+        session, limit=limit, offset=offset, exclude_group_id=exclude,
+        exclude_statuses=("paused",))
 
 
 @router.get("/ai-trade/history/{group_id}", response_model=AiTradeHistoryDetailOut)

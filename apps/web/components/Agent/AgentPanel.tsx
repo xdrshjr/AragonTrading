@@ -332,6 +332,8 @@ export default function AgentPanel() {
         </div>
       </header>
 
+      <AiTradeLifecycleNotice />
+
       {aiTradeGroup && (
         <div
           role="tablist"
@@ -390,6 +392,37 @@ export default function AgentPanel() {
           disabled={!connected}
         />
       )}
+    </div>
+  );
+}
+
+/**
+ * AI 自动交易生命周期回执的**持久**提示（ai-trade-pause-resume §3.10 / §5.4）。
+ *
+ * 两个来源都是后端单点生成的判定性事实：暂停回执的 `notice`（含「平仓其实没成功」「此刻没有任何
+ * 持久化兜底」）与结束回执的 `orphanPositions`（「这些仓从此没人管了」）。**刻意不做成 toast**：
+ * 这两句话的有效期是「直到用户真的去处理了那笔仓」，而不是三秒。挂在 AgentPanel 头部之下是因为
+ * 结束之后 AI 面板整块会消失，只有这里在两种态下都还在。
+ */
+function AiTradeLifecycleNotice() {
+  const notice = useAppStore((s) => s.aiTradeLifecycleNotice);
+  const setNotice = useAppStore((s) => s.setAiTradeLifecycleNotice);
+  if (!notice) return null;
+  return (
+    <div
+      role="status"
+      data-testid="ai-trade-lifecycle-notice"
+      className="flex items-start gap-2 border-b border-[var(--accent)] bg-[var(--accent-soft)] px-3 py-1.5"
+    >
+      <span className="flex-1 text-[10px] leading-relaxed text-[var(--accent)]">{notice}</span>
+      <button
+        type="button"
+        aria-label="关闭提示"
+        onClick={() => setNotice(null)}
+        className="shrink-0 text-[10px] text-[var(--muted)] transition-colors hover:text-[var(--text)]"
+      >
+        知道了
+      </button>
     </div>
   );
 }
