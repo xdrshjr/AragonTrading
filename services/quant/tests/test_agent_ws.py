@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
+import pytest
 from starlette.websockets import WebSocketDisconnect
 
 from app.agent.llm.base import StreamEvent
@@ -46,6 +48,24 @@ class _PausingLLM:
         yield StreamEvent(kind="message_done", stop_reason="end_turn")
 
 
+_RUN_END_TIMEOUT_S = 10.0
+
+
+async def _await_event(sent: list[dict], kinds: tuple[str, ...],
+                       timeout: float = _RUN_END_TIMEOUT_S) -> None:
+    """等到 `sent` 里出现任一 `kinds` 事件；**按墙钟死线**有界等待。
+
+    绝不能用「循环 N 次 sleep(0)」计预算：run 要经 aiosqlite 线程池落库，那是真实耗时，
+    而 sleep(0) 不推进时间——整套顺序跑时预算会在 done 到达前耗尽（见 spec D2）。
+    超时即返回（不抛），由调用方的断言把真失败暴露成断言错误而不是超时噪声。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(e.get("type") in kinds for e in sent):
+            return
+        await asyncio.sleep(0.005)
+
+
 class _FakeWS:
     def __init__(self, inbound):
         self.inbound = list(inbound)
@@ -69,10 +89,7 @@ class _FakeWS:
             self._idx += 1
             return json.dumps(msg)
         # 脚本耗尽：等到 run 结束（done/error）再断连，给后台任务时间推进事件。
-        for _ in range(20000):
-            if any(e.get("type") in ("done", "error") for e in self.sent):
-                break
-            await asyncio.sleep(0)
+        await _await_event(self.sent, ("done", "error"))
         raise WebSocketDisconnect()
 
 
@@ -127,17 +144,38 @@ class _FakeWSResume:
             return json.dumps({"type": "resume", "data": {"lastSeq": self.last_seq}})
         if self._release is not None:
             self._release.set()  # 放行尾段，使 run 续流至 done
-        for _ in range(20000):
-            if any(e.get("type") == self._wait_for for e in self.sent):
-                break
-            await asyncio.sleep(0)
+        await _await_event(self.sent, (self._wait_for,))
         raise WebSocketDisconnect()
+
+
+_MANAGERS: list[AgentManager] = []
 
 
 def _manager(api_key, llm, **settings_kw):
     settings = Settings(agent_api_key=api_key, agent_provider="anthropic", **settings_kw)
-    return AgentManager(settings, llm=llm, registry=ToolRegistry(),
-                        session_factory=get_sessionmaker())
+    manager = AgentManager(settings, llm=llm, registry=ToolRegistry(),
+                           session_factory=get_sessionmaker())
+    _MANAGERS.append(manager)
+    return manager
+
+
+@pytest.fixture(autouse=True)
+async def _shutdown_managers():
+    """用例结束即取消并**收敛**宽限计时器：否则 `_grace_countdown` 任务跨用例泄漏（spec D2 根因 2）。
+
+    `shutdown()` 只**投递**取消（其体内无 await，见 manager.py:268-275），故必须自己把句柄
+    抓出来再 await 一次——这正是 D4 写下的同一条纪律。`shutdown()` 会 `clear()` 掉
+    `_grace_timers`，所以句柄只能在调用**之前**取。
+    """
+    yield
+    # 用 while/pop 而不是 for：一条用例可能造多个 manager，且即便中途抛错也要保证列表被清空
+    # ——否则泄漏会跨用例累积，把本条修的问题换个更隐蔽的样子留下来。
+    while _MANAGERS:
+        manager = _MANAGERS.pop()
+        timers = [t for t in manager._grace_timers.values() if not t.done()]
+        await manager.shutdown()                                   # 投递取消
+        if timers:
+            await asyncio.gather(*timers, return_exceptions=True)  # 真正收敛
 
 
 def _types(ws):

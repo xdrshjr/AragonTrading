@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from app.agent.llm.base import StreamEvent
 from app.agent.manager import AgentManager
@@ -36,6 +37,38 @@ async def _drop_sink(_ev):
     pass
 
 
+_RUN_STATE_TIMEOUT_S = 10.0
+
+
+async def _await_run_started(sess, timeout: float = _RUN_STATE_TIMEOUT_S) -> None:
+    """等到 run 真的起跑（`sess.running` 为真）；**按墙钟死线**有界等待（与 spec D2 同一条纪律）。
+
+    绝不能拿一个固定 `sleep(...)` 当等待预算：run 要经 aiosqlite 线程池落库，那是真实耗时，
+    整套顺序跑或机器有负载时那个常数常常不够，断言就会在 run 还没就位时先执行。
+    超时即返回（不抛），由调用方的断言把真失败暴露成断言错误而不是超时噪声。
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if sess.running:
+            return
+        await asyncio.sleep(0.005)
+
+
+async def _settle_run_task(sess) -> None:
+    """把 run 任务**真正**收敛掉。
+
+    `AgentManager.drain` 超时后只 `cancel()`、**不 await**（manager.py 的 drain）：被留下的任务
+    仍握着 aiosqlite 的 greenlet，事件循环关闭后它会在**别的模块**里以 `GeneratorExit` 现形
+    （实测：整批跑时红在 `test_agent_provider_api.py`，而那里与 agent run 毫无关系）。
+    这与 spec D2 夹具、D4 `_cancel_background` 是同一条纪律：投递取消之后必须自己再等一次。
+    """
+    task = sess.run_task
+    if task is None or task.done():
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 def _mgr(llm, **kw) -> AgentManager:
     return AgentManager(Settings(agent_api_key="x", **kw), llm=llm,
                         registry=ToolRegistry(), session_factory=get_sessionmaker())
@@ -44,13 +77,16 @@ def _mgr(llm, **kw) -> AgentManager:
 async def _start_slow_run(mgr: AgentManager, conv: str):
     await mgr.attach(conv, _drop_sink)
     await mgr.handle(conv, "hi", None)
-    await asyncio.sleep(0.08)  # 让 run 起跑并产出若干事件
-    return mgr._sessions[conv]
+    sess = mgr._sessions[conv]
+    await _await_run_started(sess)  # 先确认 run 真的起跑（墙钟死线，而不是赌一个固定 sleep）
+    await asyncio.sleep(0.08)       # 再给它时间产出若干事件（_SlowLLM 每 20ms 一条）
+    return sess
 
 
 async def _teardown(mgr, sess):
     await mgr.shutdown()  # 取消宽限计时器 + 全部会话
     await AgentManager.drain(sess.run_task, 2.0)
+    await _settle_run_task(sess)    # drain 超时只投递取消，收敛必须自己做（见该助手的说明）
     await dispose_engine()
 
 
@@ -137,8 +173,10 @@ async def test_resume_after_completion_acks_false_completed_without_replay():
     try:
         await mgr.attach("c6", _drop_sink)
         await mgr.handle("c6", "hi", None)
-        await asyncio.sleep(0.1)  # 等 run 自然完成
         sess = mgr._sessions["c6"]
+        # 等 run **任务真正结束**（有界）：`AgentSession.run` 的 finally 先置 `_running=False`、
+        # 再 await 心跳收尾，故只等那个标志会在任务仍挂起时就返回，而本用例随后就 dispose_engine。
+        await AgentManager.drain(sess.run_task, _RUN_STATE_TIMEOUT_S)
         assert sess.running is False
         cap: list[dict] = []
 
@@ -151,4 +189,5 @@ async def test_resume_after_completion_acks_false_completed_without_replay():
         assert resumed and resumed[0]["data"] == {"ok": False, "reason": "completed"}
         assert not any(e["type"] == "text_delta" for e in cap)  # DB history 权威，不重放
     finally:
+        await mgr.shutdown()   # 本用例原本不关停 manager：宽限计时器会跨用例泄漏（同 spec D2 根因 2）
         await dispose_engine()

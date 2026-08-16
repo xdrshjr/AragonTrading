@@ -88,6 +88,21 @@ body {
   outline-offset: 2px;
 }
 
+/* 尊重系统「减少动态效果」偏好（WCAG 2.3.3）：装饰性动画一律压到最短，但**不移除任何信息**
+   —— 状态仍由颜色 / 文案表达，这里关掉的只是"动"。一个满屏常驻脉冲点、骨架微光、连接状态
+   呼吸灯的行情类界面，对前庭功能敏感人群是真实困扰。全仓无 transitionend/animationend 监听
+   （已核实），故压缩时长不会吊死任何回调。 */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
 .card {
   background: var(--surface);
   border: 1px solid var(--border);

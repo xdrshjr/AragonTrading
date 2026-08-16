@@ -13,6 +13,11 @@ const cfg = require('./lib/config');
 const paths = require('./lib/paths');
 const agentEnvLib = require('./lib/agent-env');
 const {
+  describeRendererGone,
+  createReloadBudget,
+  describeLoadFailure,
+} = require('./lib/renderer-health');
+const {
   ProcessManager,
   portFree,
   waitForHttp,
@@ -270,10 +275,78 @@ function createWindow() {
   win.on('leave-full-screen', pushMax);
   // 补偿被移除原生菜单的视图加速键（重载 / DevTools / 缩放 / 全屏，跨平台）。
   wireWindowShortcuts(win);
+  // 渲染进程崩溃 / 无响应 / 加载失败的兜底（spec D5）。
+  wireRendererHealth(win);
   // 就绪前先显示内置过渡页，避免白屏 / ERR_CONNECTION_REFUSED 闪现（spec §4.2 step8）。
   win.loadFile(path.join(__dirname, 'loading.html'));
   win.on('closed', () => {
     win = null;
+  });
+}
+
+// 不再自动重载时的最后一道出口：说清发生了什么，并给三条出路（重载 / 看日志 / 退出）。
+// 抽成独立函数是为了让 wireRendererHealth 留在 50 行阈值内（CLAUDE.md §二）。
+function promptRendererGone(targetWin, info, isLive) {
+  dialog
+    .showMessageBox(targetWin, {
+      type: 'error',
+      title: '界面进程已退出',
+      message: info.message,
+      detail: '已停止自动重载以免反复崩溃。后端与已落库数据不受影响。',
+      buttons: ['重新载入', '打开日志', '退出'],
+      defaultId: 0,
+      cancelId: 2,
+    })
+    .then(({ response }) => {
+      if (!isLive()) return; // 用户可能在对话框开着时就退出了应用
+      if (response === 0) targetWin.reload();
+      else if (response === 1) shell.openPath(paths.ensureLogsDir());
+      else targetWin.close();
+    })
+    // 这一笔 catch 不是防御性噪音：主进程的未处理 Promise 拒绝会经 Node 的默认策略落到
+    // `process.on('uncaughtException')`（本文件末尾），而那个钩子会 `app.exit(1)` ——
+    // 即崩溃兜底本身会把它正要救的这个会话杀掉。宁可只留一行日志。
+    .catch((err) => logMain(`renderer gone 对话框失败：${(err && err.message) || err}`));
+}
+
+// 渲染进程健康接线（spec D5）。三个事件共用一份重载配额：它们都是「窗口自愈」这一件事。
+// 抽成函数而不是塞进 createWindow：后者已 60 行，再塞 ~25 行就越过 CLAUDE.md 的 50 行阈值；
+// wireWindowShortcuts 本来就是本文件「窗口接线抽成同名函数」的既有范式。
+function wireRendererHealth(targetWin) {
+  const budget = createReloadBudget({});
+  // 退出期渲染进程本来就会消失：此时自愈 = 把正在关的窗口拉回来，且对已销毁的 win 弹窗会抛。
+  const isLive = () => !quitting && targetWin && !targetWin.isDestroyed();
+
+  targetWin.webContents.on('render-process-gone', (_e, details) => {
+    const info = describeRendererGone(details);
+    logMain(`renderer gone: ${info.reason} — ${info.message}`); // 任何分支都不吞掉这一笔
+    if (!isLive() || info.expected) return;   // clean-exit 不是故障：记完日志就收手，不自愈也不弹窗
+    if (info.recoverable && budget.allow(Date.now())) {
+      targetWin.reload();
+      return;
+    }
+    promptRendererGone(targetWin, info, isLive); // 配额用尽 / 不值得自愈 → 把选择权交回用户
+  });
+
+  // 只记日志、不弹窗：长任务渲染期间 unresponsive 会反复触发，弹模态即弹窗风暴；
+  // 配对记 responsive 才能在日志里读出「卡了多久」——这正是「外壳日志全绿 ≠ 没崩」要补的那一笔。
+  targetWin.on('unresponsive', () => logMain('renderer unresponsive（界面暂时无响应，未做任何处置）'));
+  targetWin.on('responsive', () => logMain('renderer responsive（界面已恢复响应）'));
+
+  targetWin.webContents.on('did-fail-load', (_e, code, desc, url, isMainFrame) => {
+    if (!isMainFrame) return;
+    const line = describeLoadFailure(code, desc, url);
+    if (!line) return; // -3 ERR_ABORTED：正常导航打断，忽略
+    logMain(`load failed: ${line}`);
+    if (!isLive()) return;
+    targetWin.loadFile(path.join(__dirname, 'loading.html')); // 回自带过渡页，而不是 Chromium 英文错误页
+    if (budget.allow(Date.now())) {
+      // 最常见的成因是前端进程刚死 / 正在重起，一次有界重试就能自己回来；配额用尽即停在过渡页，
+      // 用户仍可 Ctrl+R（wireWindowShortcuts 已接）——绝不无限重试。
+      setTimeout(() => {
+        if (isLive()) targetWin.loadURL(cfg.WEB_URL);
+      }, 1500);
+    }
   });
 }
 

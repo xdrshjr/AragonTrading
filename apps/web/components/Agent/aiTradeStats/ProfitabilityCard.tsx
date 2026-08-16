@@ -10,6 +10,7 @@ import {
   fmtOrDash,
   fmtRate,
   fmtUsd,
+  holdDurationText,
   payoffText,
   riskDistributionText,
   travelToCostText,
@@ -78,6 +79,10 @@ export default function ProfitabilityCard() {
       {/* [P0-4] 这一行是本轮最该上屏的那个数，且**必须**与 feeCoverage 同行（G-9）。 */}
       <p className="text-[10px] leading-relaxed text-[var(--text)]" data-testid="ai-profitability-travel">
         {travelToCostText(pooled)}
+      </p>
+      {/* 中位持仓时长：后端一直算着却从没上过屏；它是「交易周期模式」那套纪律的事后验证读数。 */}
+      <p className="text-[10px] leading-relaxed text-[var(--muted)]" data-testid="ai-profitability-hold">
+        {holdDurationText(pooled)}
       </p>
       {/* R 分布：整套止损 / 止盈 / 保护武装线到底有没有被触碰过，答案全在这一行（D-1）。 */}
       <p className="text-[10px] leading-relaxed text-[var(--muted)]" data-testid="ai-profitability-risk">

@@ -54,13 +54,28 @@ async def _add_run(session, *, strategy_id: int, group_id: str, inst_id: str = "
 
 async def _add_trip(session, run_id: int, *, entry: float, exit_px: float, pnl: float,
                     fee: float = 0.0, stop: float | None = None, take: float | None = None,
-                    meta: dict | None = None, ts: int = 100) -> None:
+                    meta: dict | None = None, ts: int = 100, exit_ts: int | None = None,
+                    entry_wall_ts: int | None = None, exit_wall_ts: int | None = None) -> None:
+    """造一笔往返。
+
+    `entry_wall_ts` / `exit_wall_ts` / `exit_ts` 均为关键字且默认 `None`（既有调用点零改）：
+    它们用来复刻 spec D3 的双时钟形状——`ts` 被吸附到 K 线开盘秒，真值另存
+    `explain_json.meta.wallTs`；开仓腿默认**不带** `explain_json`（老数据形状）。
+    """
+    entry_explain = ({"kind": "atomic", "meta": {"wallTs": entry_wall_ts}}
+                     if entry_wall_ts is not None else None)
     session.add(Trade(run_id=run_id, ts=ts, side="long", price=entry, qty=10.0, fee=fee,
                       pnl=0.0, position_after=1.0, reason="", stop_loss_price=stop,
-                      take_profit_price=take))
+                      take_profit_price=take,
+                      explain_json=(json.dumps(entry_explain, ensure_ascii=False)
+                                    if entry_explain else None)))
     await session.commit()
-    explain = {"kind": "atomic", "meta": {"exitSource": "agent", **(meta or {})}}
-    session.add(Trade(run_id=run_id, ts=ts + 100, side="close", price=exit_px, qty=10.0,
+    exit_meta = {"exitSource": "agent", **(meta or {})}
+    if exit_wall_ts is not None:
+        exit_meta["wallTs"] = exit_wall_ts
+    explain = {"kind": "atomic", "meta": exit_meta}
+    session.add(Trade(run_id=run_id, ts=(ts + 100 if exit_ts is None else exit_ts),
+                      side="close", price=exit_px, qty=10.0,
                       fee=fee, pnl=pnl, position_after=0.0, reason="",
                       explain_json=json.dumps(explain, ensure_ascii=False)))
     await session.commit()
@@ -85,6 +100,50 @@ async def test_query_layer_recomputes_the_legacy_readings():
     assert row["feeKnown"] is False and row["realizedCostBps"] is None
     assert row["rMultiple"] is not None and row["exitSource"] == "agent"
     assert row["bar"] == "15m" and row["preset"] == "balanced"
+
+
+async def test_hold_seconds_uses_per_leg_wall_clock():
+    """spec D3：两腿落在同一根 bar（`ts` 相同）时，持仓时长必须来自 `wallTs` 而不是被吸附的 `ts`。
+
+    旧实现在这条形状上恒报 0——一笔 20 分钟的往返被 1H 的 bar 对齐整个量化掉。
+    """
+    sid = await _reset()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        run = await _add_run(s, strategy_id=sid, group_id="aiprof_hold", bar="1H")
+        await _add_trip(s, run, entry=100.0, exit_px=101.0, pnl=0.1,
+                        ts=3600, exit_ts=3600,                   # 同一根 1H bar 的开盘秒
+                        entry_wall_ts=4020, exit_wall_ts=5220)   # 09:07 → 09:27
+        trips = await repo.load_profitability_trips(s, repo.TripQuery())
+    assert trips[0]["holdSeconds"] == 1200
+
+
+async def test_hold_seconds_falls_back_to_bar_ts_for_legacy_trips():
+    """老数据（两腿都无 `wallTs`）逐值保持修改前的行为：`exit.ts − entry.ts`。"""
+    sid = await _reset()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        run = await _add_run(s, strategy_id=sid, group_id="aiprof_hold_legacy", bar="1H")
+        await _add_trip(s, run, entry=100.0, exit_px=101.0, pnl=0.1, ts=3600, exit_ts=7200)
+        trips = await repo.load_profitability_trips(s, repo.TripQuery())
+    assert trips[0]["holdSeconds"] == 3600
+
+
+async def test_hold_seconds_is_per_leg_when_exit_has_no_wall_ts():
+    """`offline_exit` 形状：平仓腿自带 explain 却**永远没有** `wallTs`，其 `ts` 却是真实墙钟秒。
+
+    故取值必须**逐腿** `wallTs ?? ts`（= `exit.ts − entry.wallTs`）。若按「双腿全有才用墙钟」，
+    这笔往返会退回「墙钟 − bar 对齐」——正是本条要消灭的混合口径（spec 评审 P1-3）。
+    """
+    sid = await _reset()
+    sm = get_sessionmaker()
+    async with sm() as s:
+        run = await _add_run(s, strategy_id=sid, group_id="aiprof_hold_offline", bar="1H")
+        await _add_trip(s, run, entry=100.0, exit_px=101.0, pnl=0.1,
+                        ts=3600, entry_wall_ts=4020,   # 开仓腿：ts 为 bar 开盘秒，真值在 wallTs
+                        exit_ts=5220)                  # 平仓腿：无 wallTs，ts 即交易所 uTime（墙钟）
+        trips = await repo.load_profitability_trips(s, repo.TripQuery())
+    assert trips[0]["holdSeconds"] == 1200             # 5220 − 4020，绝不是 5220 − 3600
 
 
 async def test_g6_live_settlement_and_retrospective_recompute_agree():

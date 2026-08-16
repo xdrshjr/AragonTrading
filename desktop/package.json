@@ -20,6 +20,7 @@
     "verify:dist": "node scripts/verify-dist.mjs",
     "release:check": "run-s smoke verify:dist",
     "icons": "python scripts/make-icons.py",
+    "test": "node --test \"scripts/*.test.mjs\"",
     "check": "run-s check:*",
     "check:main": "node --check src/main.js",
     "check:devlaunch": "node --check scripts/dev-launch.js",
@@ -30,6 +31,7 @@
     "check:buildweb": "node --check scripts/build-web.mjs",
     "check:verifydist": "node --check scripts/verify-dist.mjs",
     "check:agentenv": "node --check src/lib/agent-env.js",
+    "check:rendererhealth": "node --check src/lib/renderer-health.js",
     "check:buildagentenv": "node --check scripts/build-agent-env.mjs"
   },
   "dependencies": {},

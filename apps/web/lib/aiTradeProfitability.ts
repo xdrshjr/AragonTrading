@@ -7,6 +7,8 @@
 //   **此处刻意不逐字复述那几个词**——本文件自己就在扫描集里，写出来会把冻结门禁自己打红）。
 //   这是一张历史统计，不是对未来的承诺。
 
+import { formatHoldDuration } from "./aiTradeHorizon";
+
 export interface AiTradePooled {
   roundTrips: number;
   netPnlUsd: number | null;
@@ -168,6 +170,16 @@ export function travelToCostText(pooled: AiTradePooled): string {
     `位移中位 ${fmtBps(pooled.medianMoveBps)} / 往返成本 ${fmtBps(pooled.medianCostBps)}` +
     ` = ${fmtOrDash(pooled.travelToCostRatio, 2)}×（取自 ${pooled.feeTrips} 笔带费率记录的往返，覆盖 ${fmtRate(pooled.feeCoverage)}）`
   );
+}
+
+/**
+ * 中位持仓时长一行（读数与分母同屏）；无样本 ⇒ `formatHoldDuration` 自己给 `—`，绝不编一个 0。
+ *
+ * 后端算了、wire 传了、类型也接了，此前却没有任何读点——本仓最高频的缺陷形状。分母取
+ * `roundTrips` 是对的：后端的中位数吃的正是全部往返的 `holdSeconds`，不是子样本。
+ */
+export function holdDurationText(pooled: AiTradePooled): string {
+  return `中位持仓时长 ${formatHoldDuration(pooled.medianHoldSeconds)}（${pooled.roundTrips} 笔）`;
 }
 
 /**

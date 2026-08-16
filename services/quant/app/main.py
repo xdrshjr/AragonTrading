@@ -65,11 +65,9 @@ async def lifespan(app: FastAPI):
     hydrator = asyncio.create_task(_hydrate_paused_ai_trade())  # AI 自动交易冷占位（不启动任何交易）
     get_health_guard().start()                 # 持续样本外体检守护（双闸每 tick 重读，D-24）
     link_sweeper = asyncio.create_task(_okx_link_sweeper())   # 私有连接池清扫 + 服务器时钟对齐
+    background = (sweeper, resumer, hydrator, link_sweeper)
     yield
-    link_sweeper.cancel()
-    hydrator.cancel()
-    resumer.cancel()
-    sweeper.cancel()                                         # 关停先取消清扫协程（与 manager.shutdown 同段）
+    await _cancel_background(background)   # 关停先取消清扫协程（与 manager.shutdown 同段）并有界收敛
     await get_health_guard().shutdown()         # 体检守护先停（它只读行情，无终态可等）
     await get_agent_manager().shutdown()
     await get_discovery_manager().shutdown()   # 策略与因子挖掘（长跑循环，先停再收 DB / OKX）
@@ -83,6 +81,35 @@ async def lifespan(app: FastAPI):
     await get_rest_client().aclose()
     await get_client_pool().aclose_all()   # 池化的私有 AsyncClient 统一收口（okx-link-resilience §2.4.1）
     await dispose_engine()
+
+
+_BACKGROUND_SETTLE_TIMEOUT_S = 5.0
+
+
+async def _cancel_background(tasks: tuple[asyncio.Task, ...],
+                             *, timeout: float = _BACKGROUND_SETTLE_TIMEOUT_S) -> None:
+    """取消并**有界收敛**常驻后台协程（spec D4）。
+
+    ``cancel()`` 只是**投递**一次取消：协程要等到下一次被调度才会走完 ``except CancelledError: return``。
+    不 await 就往下 ``dispose_engine()`` / ``aclose_all()``，协程可能在半路被连根拔掉。
+
+    死线是硬性的：关停路径上一个吞掉取消的协程**绝不能**反过来把整条关停链堵死（桌面端每次退出都
+    走这条路）。超时不抛，如实 warning——「没停干净」是要被看见的事实，不是要被制造的异常。
+    ``asyncio.wait`` 不会替你取回异常，故对已完成的任务显式取一次，既避免 "exception was never
+    retrieved" 噪声，也让真异常留下日志。
+
+    Args:
+        tasks: 待取消的后台任务句柄（按创建顺序传入；本函数逆序 cancel）。
+        timeout: 收敛死线（秒）；超时即记 warning 返回，绝不抛。
+    """
+    for task in reversed(tasks):   # 取消顺序逐字保持既有：link_sweeper → hydrator → resumer → sweeper
+        task.cancel()
+    done, pending = await asyncio.wait(tasks, timeout=timeout)
+    for task in done:
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning("background task ended with %r", task.exception())
+    if pending:
+        logger.warning("%d background task(s) did not settle in %.1fs", len(pending), timeout)
 
 
 async def _backfill_companion_strategies() -> None:

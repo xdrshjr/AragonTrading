@@ -243,4 +243,28 @@ describe("WeightExploreModal", () => {
     expect(screen.getByText("第 2 轮")).toBeTruthy(); // 面包屑记录轮次
     expect(screen.queryByText(/探索因子池/)).toBeNull(); // P2-2：过渡期不闪回配置态
   });
+
+  // ── 可达性：本弹窗曾自绘遮罩，绕开了 Modal 原语（spec D8）。它是个会跑数十分钟的长驻弹窗，
+  //    键盘用户一旦 Tab 出去就再也回不来。以下三条钉住迁移后的三项能力。
+  it("D8：role=dialog 落在面板上，可访问名取标题文本（不再是另写一份 aria-label）", async () => {
+    wrap(<WeightExploreModal onClose={vi.fn()} ctx={ctx([M("a"), M("b")])} />);
+    const dialog = await screen.findByRole("dialog", { name: "探索训练 · 因子组合探索" });
+    // 面板才是 dialog，遮罩不是：遮罩上挂 role 会让屏幕阅读器把整页背景读成对话框内容。
+    expect(dialog.className).toContain("max-w-4xl");
+    expect(dialog.className).not.toContain("fixed");
+  });
+
+  it("D8：按 Esc 触发 onClose 恰一次（自建监听已删除，不会双重关闭）", async () => {
+    const onClose = vi.fn();
+    wrap(<WeightExploreModal onClose={onClose} ctx={ctx([M("a"), M("b")])} />);
+    await screen.findByRole("dialog");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("D8：打开后初始焦点落在对话框内（焦点陷阱的前提）", async () => {
+    wrap(<WeightExploreModal onClose={vi.fn()} ctx={ctx([M("a"), M("b")])} />);
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
+  });
 });

@@ -106,6 +106,21 @@ describe("ProfitabilityCard", () => {
     expect(row).not.toHaveTextContent("×ATR");     // 该覆盖率为 0 ⇒ 整项省略，绝不显示一个 0 倍
   });
 
+  it("D3b：中位持仓时长带着它的分母上屏（后端一直算着，此前没有读点）", async () => {
+    renderCard(<ProfitabilityCard />);
+    const row = await screen.findByTestId("ai-profitability-hold");
+    expect(row).toHaveTextContent("中位持仓时长 21 分钟（193 笔）");
+  });
+
+  it("D3b：medianHoldSeconds 为 null ⇒ 破折号，绝不编一个 0 秒", async () => {
+    fetchMock.mockResolvedValue({
+      ...RESPONSE,
+      pooled: { ...RESPONSE.pooled, medianHoldSeconds: null },
+    });
+    renderCard(<ProfitabilityCard />);
+    expect(await screen.findByTestId("ai-profitability-hold")).toHaveTextContent("—");
+  });
+
   it("口径推定的计数如实上屏（[P1-12]）", async () => {
     renderCard(<ProfitabilityCard />);
     expect(await screen.findByTestId("ai-profitability-basis")).toHaveTextContent("172 / 193");

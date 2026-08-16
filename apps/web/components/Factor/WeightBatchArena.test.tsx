@@ -4,7 +4,7 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_THRESHOLDS } from "@/lib/factorTypes";
-import type { TrainMetrics } from "@/lib/factorTypes";
+import type { TrainMethod, TrainMetrics } from "@/lib/factorTypes";
 import { buildBatchTarget } from "@/lib/weightBatch";
 import { weightBatchApi } from "@/lib/weightBatchApi";
 import { weightBatchWS } from "@/lib/weightBatchWs";
@@ -59,7 +59,7 @@ function driveTwoSucceeded() {
       ],
     },
   });
-  const result = (method: string, icOut: number) => ({
+  const result = (method: TrainMethod, icOut: number) => ({
     method, weights: { mom_roc: 1 }, normStats: { normWindow: 200, clip: 4 }, metrics: metrics(icOut),
     trainerVersion: null, note: "", provenance: { instId: "BTC-USDT-SWAP", bar: "1H", startTs: 1, endTs: 2, horizon: 6 },
   });

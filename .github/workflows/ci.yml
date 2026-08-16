@@ -60,7 +60,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          # `node --test` 的 glob 匹配是 Node 21+ 的能力，而 package.json 里的 glob 是**带引号**的
+          # （sh 不展开），Node 20 下会把它当成一个不存在的文件路径而 MODULE_NOT_FOUND。
+          # 不去掉引号是因为 Windows 上 cmd / PowerShell 都不展开 glob，本地 `npm test` 会失效——
+          # 抬版本是一处改动、两边都真。frontend / backend 两个 job 的版本与本条无关，不动。
+          node-version: "22"
       # desktop/ 无 lockfile（故不用 npm ci）；--ignore-scripts 跳过 electron postinstall 的 ≈111 MB
       # 二进制下载（与 spec D6/R9「CI 只做静态校验、绝不下载 120 MB Electron」一致，job 秒级且不抖）。
       # npm-run-all 等纯 JS 包仍正常装，node --check 不需 electron 二进制。
@@ -70,3 +74,8 @@ jobs:
       # make-icons.py 为 Python，node --check 不覆盖，靠运行时 `npm run icons` 保障（如实声明）。
       - name: Static syntax check
         run: npm run check
+      # 这些用例只依赖 node 内置与 src/lib 下的纯模块，不需要 Electron 二进制（与 --ignore-scripts 兼容）。
+      # 它们此前从未被任何门禁跑过，却守着「打包默认注入两个自动交易总闸」这类一旦回归就会静默
+      # 改变生产行为的断言（spec D5b）。
+      - name: Unit tests
+        run: npm test

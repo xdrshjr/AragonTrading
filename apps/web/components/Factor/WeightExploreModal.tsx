@@ -1,8 +1,8 @@
 "use client";
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { Badge, Button } from "@/components/ui";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { Badge, Button, Modal } from "@/components/ui";
 import { ApiRequestError } from "@/lib/api";
 import { formatIc } from "@/lib/factor";
 import type { FactorLibraryItem, FactorMember, FactorThresholds } from "@/lib/factorTypes";
@@ -61,6 +61,7 @@ interface ExploreCtx {
 export default function WeightExploreModal({ onClose, ctx }: { onClose: () => void; ctx: ExploreCtx }) {
   const qc = useQueryClient();
   const setWeightTrainResult = useAppStore((s) => s.setWeightTrainResult);
+  const titleId = useId(); // 对话框可访问名取标题文本本身（`Modal` 的 labelledBy），不再另写一份 aria-label
 
   const [batchId, setBatchId] = useState<number | null>(null);
   const [localCombos, setLocalCombos] = useState<LocalCombo[]>([]);
@@ -129,14 +130,8 @@ export default function WeightExploreModal({ onClose, ctx }: { onClose: () => vo
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [batchId]);
 
-  // Esc 关闭（overlay 遮罩点击亦关闭，见下）。
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  // Esc 关闭 / 遮罩点击 / 焦点陷阱 / 滚动锁 / portal 全部由 `Modal` 原语负责（spec D8）。
+  // 此处**刻意不再自建** Escape 监听：原语已在捕获期处理，留着会双重关闭。
 
   const launch = useMutation({
     mutationFn: async (config: ExploreConfig) => {
@@ -230,20 +225,12 @@ export default function WeightExploreModal({ onClose, ctx }: { onClose: () => vo
     : null;
 
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-label="因子组合探索训练"
-      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/50 p-4 sm:p-8"
-      onClick={onClose}
-    >
-      <div
-        className="card my-auto flex w-full max-w-4xl flex-col gap-4 p-4"
-        onClick={(e) => e.stopPropagation()}
-      >
+    // 原语外框已是 `max-h-[85vh] flex-col overflow-hidden`，故长内容的滚动下沉到内层容器。
+    <Modal open onClose={onClose} labelledBy={titleId} className="max-w-4xl">
+      <div className="flex flex-col gap-4 overflow-y-auto p-4">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold text-[var(--text)]">探索训练 · 因子组合探索</span>
+            <span id={titleId} className="text-sm font-semibold text-[var(--text)]">探索训练 · 因子组合探索</span>
             <PhaseBadge phase={phase} />
           </div>
           <Button variant="ghost" size="sm" onClick={onClose}>关闭</Button>
@@ -302,7 +289,7 @@ export default function WeightExploreModal({ onClose, ctx }: { onClose: () => vo
           />
         )}
       </div>
-    </div>
+    </Modal>
   );
 }
 

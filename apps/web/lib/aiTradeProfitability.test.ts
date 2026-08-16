@@ -9,6 +9,7 @@ import {
   fmtBps,
   fmtOrDash,
   fmtRate,
+  holdDurationText,
   payoffText,
   readRMultiple,
   realizedCoverageText,
@@ -95,6 +96,18 @@ describe("赔率成对、位移/成本带分母（G-9）", () => {
     const text = travelToCostText({ ...POOLED, travelToCostRatio: null, feeTrips: 2 });
     expect(text).toContain("成本样本不足");
     expect(text).not.toContain("0.0 bps");
+  });
+});
+
+describe("中位持仓时长带分母上屏（D3b）", () => {
+  it("有样本时给出人话时长与它的分母", () => {
+    const text = holdDurationText(POOLED);
+    expect(text).toContain("21 分钟");
+    expect(text).toContain("（193 笔）");
+  });
+
+  it("medianHoldSeconds 为 null ⇒ 破折号，绝不编一个 0 秒", () => {
+    expect(holdDurationText({ ...POOLED, medianHoldSeconds: null })).toContain("—");
   });
 });
 

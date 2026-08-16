@@ -9,8 +9,13 @@
 //
 // 这里不试图"修好"错误，只负责三件事：说人话、给出重试、把 digest 亮出来供对日志。
 // 重试走 Next 的 reset()（重挂本段），失败原因若是瞬时坏帧，一次重试即恢复。
+//
+// 展示部分收在 `components/ui/CrashFallback`，与根级边界 `app/global-error.tsx` 共用同一张页面：
+// 崩溃页也是产品的一部分，两级边界长得不一样只会让用户更慌。可见文案逐字未变（回归护栏见
+// `app/error.test.tsx`）。
 
 import { useEffect } from "react";
+import CrashFallback from "@/components/ui/CrashFallback";
 
 interface WorkspaceErrorProps {
   error: Error & { digest?: string };
@@ -24,23 +29,11 @@ export default function WorkspaceError({ error, reset }: WorkspaceErrorProps) {
   }, [error]);
 
   return (
-    <div className="flex h-screen w-full flex-col items-center justify-center gap-4 bg-[var(--bg)] px-6 text-center">
-      <h2 className="text-base font-semibold text-[var(--text)]">工作台渲染失败</h2>
-      <p className="max-w-[42rem] text-sm leading-6 text-[var(--muted)]">
-        界面遇到一个未处理的异常，已停止渲染以免显示错误的行情。这不会影响后端已落库的数据与
-        运行中的策略。可先重试；若反复出现，请把下面的错误编号连同日志一并反馈。
-      </p>
-      <pre className="max-w-[42rem] overflow-x-auto rounded-[6px] border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-left text-[11px] leading-5 text-[var(--muted)]">
-        {error.message || "未知错误"}
-        {error.digest ? `\n错误编号：${error.digest}` : ""}
-      </pre>
-      <button
-        type="button"
-        onClick={reset}
-        className="rounded-[6px] border border-[var(--border)] bg-[var(--surface)] px-4 py-1.5 text-sm font-medium text-[var(--text)] hover:bg-[var(--surface-2)]"
-      >
-        重试
-      </button>
-    </div>
+    <CrashFallback
+      title="工作台渲染失败"
+      description="界面遇到一个未处理的异常，已停止渲染以免显示错误的行情。这不会影响后端已落库的数据与运行中的策略。可先重试；若反复出现，请把下面的错误编号连同日志一并反馈。"
+      error={error}
+      onRetry={reset}
+    />
   );
 }

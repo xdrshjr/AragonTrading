@@ -603,7 +603,7 @@ def _trip_row(trip: _Trip, dims: dict) -> dict | None:
         "realizedCostBps": cost_bps,
         "riskUsd": risk, "rMultiple": (net / risk) if risk else None,
         "plannedRr": _planned_rr(trip, entry_px, stop_distance),
-        "holdSeconds": max(0, int(trip.exit.ts or 0) - int(trip.entry.ts or 0)),
+        "holdSeconds": _trip_hold_seconds(trip),
         # [P1-1] `exitSource` **只读** `explain.meta` 那唯一一处打的标；查询侧同样不得另判。
         "exitSource": str(meta.get("exitSource") or "unknown"),
         "stopAtrMult": meta.get("stopAtrMult"),
@@ -654,6 +654,40 @@ def _trip_meta(trip: _Trip) -> dict:
     envelope = _load_config(getattr(trip.exit, "explain_json", None))
     meta = envelope.get("meta")
     return meta if isinstance(meta, dict) else {}
+
+
+def _leg_wall_ts(trade: Trade) -> int | None:
+    """某一腿的真实墙钟秒（`explain_json.meta.wallTs`）；缺键 / 坏 JSON / 非正数 ⇒ None。"""
+    meta = _load_config(getattr(trade, "explain_json", None)).get("meta")
+    if not isinstance(meta, dict):
+        return None
+    try:
+        wall = int(meta.get("wallTs") or 0)
+    except (TypeError, ValueError):
+        return None
+    return wall if wall > 0 else None
+
+
+def _trip_hold_seconds(trip: _Trip) -> int:
+    """往返持仓秒数：**逐腿**取 `wallTs ?? ts`，与前端 `autoTradePnl` 同一条规则。
+
+    `trades.ts` 被 `_align_bar_ts` 吸附到 K 线开盘秒，1H 周期下一笔 20 分钟的往返会被算成 0
+    或整根 bar（spec D3）。逐腿回退是安全的、而不是听天由命：`executor._make_trade` 里「吸附
+    `ts`」与「写 `wallTs`」由**同一个** `bar_seconds > 0` 判据控制，故缺 `wallTs` 的 executor
+    腿其 `ts` 本就是墙钟；唯一的非 executor 写点 `resume._offline_exit_trade` 也只写墙钟秒
+    （交易所 `uTime`，已归一到秒）。**绝不能写成「双腿全有才用墙钟」**——`offline_exit` 平仓腿
+    永远没有 `wallTs`，那条规则会让这类往返退回「墙钟 − bar 对齐」，恰好是它想避免的混用，
+    而且与前端读出两个不同的数。
+
+    两腿都缺 `wallTs` 时是 best-effort 回退（口径可能混合，见 `_pair_round_trips` 的既有说明），
+    但它在所有既有写路径上都不劣于修改前的值：老数据两腿同为吸附秒，逐值与修改前相同。
+
+    负差压 0 沿用既有 `max(0, ...)`：真实的往返不会先平后开，出现负差即数据异常，报 0 比报一个
+    负持仓时长诚实。
+    """
+    entry = _leg_wall_ts(trip.entry) or int(trip.entry.ts or 0)
+    exit_ = _leg_wall_ts(trip.exit) or int(trip.exit.ts or 0)
+    return max(0, exit_ - entry)
 
 
 async def reconcile_orphan_ai_trade_runs(session: AsyncSession, *,
