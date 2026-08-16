@@ -47,7 +47,7 @@ function LegendToken({ item }: { item: LegendItem }) {
     >
       <span
         className="h-1.5 w-1.5 shrink-0 rounded-full"
-        style={{ backgroundColor: item.color ?? "var(--accent)" }}
+        style={{ backgroundColor: item.swatchColor ?? "var(--accent)" }}
       />
       <span className="truncate max-sm:hidden">{item.label}</span>
       <span className="hidden truncate max-sm:inline">

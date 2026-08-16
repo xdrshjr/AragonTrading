@@ -35,10 +35,25 @@ describe("前后端 wire 封顶常量必须相等（D4）", () => {
     expect(readIntConstant(backend, "_SNAPSHOT_EQUITY_MAX")).toBe(EQUITY_MAX);
   });
 
-  it("后端 wire_caps 明确写着「不裁剪会计真值」这条红线", () => {
-    // 这条红线一旦从 docstring 里消失，下一个读到 `tail_trades` 的人就会顺手把它用在
-    // `executor.trades` 本体上——那是静默改变交易行为（换手闸放松 / metrics 低报）。
+  it("后端 wire_caps 明确写着「计数器先行」这条红线", () => {
+    // 上一轮这里钉的是「绝不裁剪服务端的会计真值」。本轮（trust-boundary-and-signal-integrity D5）
+    // **解除**了那条禁令，但只解除了一半：`LiveExecutor` 先有了两个显式计数器、四个 append 点
+    // 收敛到 `_record_trade`、两个按长度判定的读点改读计数器之后，裁剪才不再改变任何判定。
+    //
+    // 所以这条门禁的语义从「不许裁」变成「顺序不可颠倒」——它守的仍是同一个失败模式：
+    // 下一个读到 `tail_trades` 的人顺手把它用在某个**还在数列表长度**的判据上，
+    // 换手闸就悄悄放松了、metrics 就悄悄低报了，而两边各自的用例都是绿的。
     const backend = readPython("services/quant/app/wire_caps.py");
-    expect(backend).toContain("绝不裁剪服务端的会计真值");
+    expect(backend).toContain("先有计数器，再谈封顶");
+    expect(backend).toContain("封不动任何一个判定");
+    // `SimBroker.trades`（回测撮合产物）**至今**不在解除范围内：它会被整体落库并参与指标计算。
+    expect(backend).toContain("至今不封顶");
+  });
+
+  it("TRADE_LEDGER_MAX 远高于展示封顶（它是内存护栏，不是展示策略）", () => {
+    // 两个数字混用会造成最难查的一类失真：展示口径被当成会计口径写进 run metrics。
+    const backend = readPython("services/quant/app/wire_caps.py");
+    const ledger = readIntConstant(backend, "TRADE_LEDGER_MAX");
+    expect(ledger).toBeGreaterThan(TRADES_MAX * 5);
   });
 });

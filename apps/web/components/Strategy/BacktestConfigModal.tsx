@@ -388,9 +388,9 @@ function StepPill({
       className={clsx(
         "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors duration-150",
         "outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]",
-        isCurrent && "bg-[var(--accent-soft)] text-[var(--accent)]",
+        isCurrent && "bg-[var(--accent-soft)] text-[var(--accent-ink)]",
         state === "done" && "cursor-pointer text-[var(--text)] hover:bg-[var(--surface-2)]",
-        state === "ready" && "cursor-pointer text-[var(--accent)] hover:bg-[var(--accent-soft)]",
+        state === "ready" && "cursor-pointer text-[var(--accent-ink)] hover:bg-[var(--accent-soft)]",
         isLocked && "cursor-not-allowed text-[var(--muted)] opacity-60",
       )}
     >
@@ -398,7 +398,7 @@ function StepPill({
         className={clsx(
           "flex h-4 w-4 items-center justify-center rounded-full text-[10px] leading-none",
           isCurrent
-            ? "bg-[var(--accent)] text-white"
+            ? "bg-[var(--accent)] text-[var(--on-accent)]"
             : state === "done"
               ? "bg-[var(--long)] text-white"
               : "bg-[var(--surface-2)] text-[var(--muted)]",
@@ -430,7 +430,7 @@ function Chip({
         "rounded-[8px] px-2.5 py-1 text-[11px] font-medium transition-all duration-150 " +
         "outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] " +
         (active
-          ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+          ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
           : "bg-[var(--surface)] text-[var(--muted)] hover:text-[var(--text)]")
       }
     >
@@ -592,7 +592,7 @@ function ConfigStep({
 
       {/* 即时反馈：校验错误 / 暖机告警 / 样本内外提示 */}
       {errors.length > 0 && (
-        <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+        <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short-ink)]">
           {errors.join("；")}
         </div>
       )}
@@ -608,7 +608,7 @@ function ConfigStep({
         <div className="rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--muted)]">
           权重训练区间：{provenanceHint.instId ?? instId} · {provenanceHint.bar ?? "—"} ·{" "}
           {fmtTime(provenanceHint.startTs)} → {fmtTime(provenanceHint.endTs)}
-          <span className={inSample ? "text-[var(--warn)]" : "text-[var(--long)]"}>
+          <span className={inSample ? "text-[var(--warn)]" : "text-[var(--long-ink)]"}>
             {inSample
               ? " · 当前区间与训练区间重叠（样本内），结果可能偏乐观"
               : " · 当前区间为样本外"}
@@ -649,7 +649,7 @@ function ResultStep({
             ))}
           </div>
         ) : errorMessage ? (
-          <div className="rounded-[10px] border border-[var(--short)] bg-[var(--surface)] px-3 py-3 text-xs text-[var(--short)]">
+          <div className="rounded-[10px] border border-[var(--short)] bg-[var(--surface)] px-3 py-3 text-xs text-[var(--short-ink)]">
             回测失败：{errorMessage}
           </div>
         ) : result ? (

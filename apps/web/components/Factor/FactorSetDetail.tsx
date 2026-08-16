@@ -53,7 +53,7 @@ export default function FactorSetDetail({ set }: { set: FactorSet }) {
           <Badge tone="neutral">样本外 IC {formatIc(set.metrics?.icOut ?? null)}</Badge>
           <span className="text-[11px] text-[var(--muted)]">{set.members.length} 个成员</span>
         </div>
-        {overfit && <p className="text-[11px] font-medium text-[var(--short)]">{overfit}</p>}
+        {overfit && <p className="text-[11px] font-medium text-[var(--short-ink)]">{overfit}</p>}
         <div className="flex flex-wrap gap-1">
           {set.members.map((m, i) => (
             <Badge key={`${m.factorKey}-${i}`} tone={m.direction === "short" ? "short" : "long"}>
@@ -91,7 +91,7 @@ export default function FactorSetDetail({ set }: { set: FactorSet }) {
         ) : score.isPending ? (
           <p className="py-6 text-center text-[11px] text-[var(--muted)]">计算中...</p>
         ) : score.isError ? (
-          <p className="text-[11px] text-[var(--short)]">复合得分计算失败：{(score.error as Error)?.message}</p>
+          <p className="text-[11px] text-[var(--short-ink)]">复合得分计算失败：{(score.error as Error)?.message}</p>
         ) : (
           <FactorScoreChart points={points} title={`${set.name} 复合得分`} emptyNote={note} />
         )}

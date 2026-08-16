@@ -83,7 +83,7 @@ export default function AgentToolsSection() {
   }
   if (isError || !data) {
     return (
-      <div className="card flex items-center justify-between gap-3 p-4 text-sm text-[var(--short)]">
+      <div className="card flex items-center justify-between gap-3 p-4 text-sm text-[var(--short-ink)]">
         <span>加载工具列表失败：{(error as Error)?.message || "请稍后重试"}</span>
         <Button variant="ghost" size="sm" onClick={() => void refetch()}>
           重试
@@ -104,12 +104,12 @@ export default function AgentToolsSection() {
         onDisableAll={() => bulk.mutate(false)}
       />
       {notice && (
-        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--short)]">
+        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--short-ink)]">
           {notice}
         </p>
       )}
       {data.enabledCount === 0 && (
-        <div className="card border-[var(--short)] p-4 text-sm text-[var(--short)]">
+        <div className="card border-[var(--short)] p-4 text-sm text-[var(--short-ink)]">
           已禁用全部工具：AI 助手将只能进行文字对话，无法读取真实行情或运行回测。
         </div>
       )}

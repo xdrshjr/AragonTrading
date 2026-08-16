@@ -80,6 +80,7 @@ class _FakeWS:
 
     def __init__(self, stop_after: int | None = None):
         self.sent: list[dict] = []
+        self.headers: dict = {}   # 无 Origin ⇒ 非浏览器客户端，来源守卫放行（app/api/ws_guard.py）
         self.closed = False
         self._stop_after = stop_after
 

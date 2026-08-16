@@ -68,6 +68,7 @@ class _FakeWebSocket:
         self.accepted = False
         self.closed = False
         self.sent = []
+        self.headers: dict = {}   # 无 Origin ⇒ 非浏览器客户端，来源守卫放行（app/api/ws_guard.py）
 
     async def accept(self):
         self.accepted = True

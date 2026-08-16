@@ -17,6 +17,7 @@ from ..paper.manager import (
 )
 from ..paper.strategy_factory import build_paper_strategy_spec
 from ..schemas import PaperBatchStartReq, PaperStartReq
+from .ws_guard import guard_ws_origin
 
 router = APIRouter(tags=["paper"])
 
@@ -165,6 +166,8 @@ async def paper_sessions() -> list[dict]:
 
 @router.websocket("/ws/paper/{session_id}")
 async def ws_paper(websocket: WebSocket, session_id: str) -> None:
+    if not await guard_ws_origin(websocket):   # 必须在 accept() 之前：不合规连接一帧都不许收到
+        return
     await websocket.accept()
     session = get_paper_manager().get(session_id)
     if session is None:

@@ -55,8 +55,8 @@ function EventRow({ event }: { event: LiveAutoEvent }) {
 }
 
 function textTone(level: LiveAutoEvent["level"]): string {
-  if (level === "error") return "text-[var(--short)]";
-  if (level === "warn") return "text-[var(--accent)]";
+  if (level === "error") return "text-[var(--short-ink)]";
+  if (level === "warn") return "text-[var(--accent-ink)]";
   return "text-[var(--muted)]";
 }
 

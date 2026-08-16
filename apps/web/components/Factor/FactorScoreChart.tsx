@@ -31,7 +31,7 @@ export default function FactorScoreChart({
         className={
           "flex items-center justify-center rounded-[10px] border border-dashed px-3 text-center text-[11px] " +
           (warn
-            ? "border-[var(--accent-soft)] bg-[var(--accent-soft)]/40 font-medium text-[var(--accent)]"
+            ? "border-[var(--accent-soft)] bg-[var(--accent-soft)]/40 font-medium text-[var(--accent-ink)]"
             : "border-[var(--border)] text-[var(--muted)]")
         }
         style={{ height }}
@@ -52,7 +52,7 @@ export default function FactorScoreChart({
         <div className="flex items-center justify-between">
           <span className="text-[11px] font-medium text-[var(--muted)]">{title}</span>
           <span className="text-[11px] tabular text-[var(--text)]">
-            最新 <span className={latest >= 0 ? "text-[var(--long)]" : "text-[var(--short)]"}>{latest.toFixed(4)}</span>
+            最新 <span className={latest >= 0 ? "text-[var(--long-ink)]" : "text-[var(--short-ink)]"}>{latest.toFixed(4)}</span>
           </span>
         </div>
       )}

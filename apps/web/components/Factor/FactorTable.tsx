@@ -133,7 +133,7 @@ export default function FactorTable() {
         <Skeleton className="h-64" />
       ) : isError ? (
         <div className="card flex flex-col items-center gap-2 p-6 text-center">
-          <p className="text-xs text-[var(--short)]">加载因子失败，请重试</p>
+          <p className="text-xs text-[var(--short-ink)]">加载因子失败，请重试</p>
           <Button variant="default" size="sm" onClick={() => void refetch()}>
             重试
           </Button>
@@ -284,7 +284,7 @@ function Row({
       >
         <span
           className={
-            tone === "long" ? "text-[var(--long)]" : tone === "short" ? "text-[var(--short)]" : "text-[var(--muted)]"
+            tone === "long" ? "text-[var(--long-ink)]" : tone === "short" ? "text-[var(--short-ink)]" : "text-[var(--muted)]"
           }
         >
           {formatIc(rankIc)}

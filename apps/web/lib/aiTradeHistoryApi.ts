@@ -2,7 +2,8 @@
 // P1-2：仓库无 apiGet/apiFetch 导出（lib/api.ts 的 request/rawRequest 为模块私有，仅导出 api 与
 // ApiRequestError）。故镜像 aiTradeApi.ts 的自持范式：本地私有 get<T>（BASE="/api/py"、cache:"no-store"），
 // 复用 ./api 的 ApiRequestError；不引用任何不存在的 helper。历史为一次性只读拉取，无 WS。
-import { ApiRequestError } from "./api";
+import { ApiRequestError, toApiError } from "./api";
+import { timeoutFor, withTimeout } from "./httpTimeout";
 import type { AiTradeHistoryDetailOut, AiTradeHistoryListOut } from "./aiTradeHistoryTypes";
 import type { AiTradeProfitabilityResponse } from "./aiTradeProfitability";
 import type { AiTradePresetComparisonResponse } from "./aiTradeTypes";
@@ -10,7 +11,14 @@ import type { AiTradePresetComparisonResponse } from "./aiTradeTypes";
 const BASE = "/api/py";
 
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { cache: "no-store" });
+  // D3：超时决策集中在 lib/httpTimeout.ts，接线留在原地。
+  const timeoutMs = timeoutFor(path);
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, withTimeout({ cache: "no-store" }, timeoutMs));
+  } catch (err) {
+    throw toApiError(err, timeoutMs, path);   // 非超时错误原样上抛，绝不吞
+  }
   if (!res.ok) {
     let code = String(res.status);
     let message = res.statusText;

@@ -308,14 +308,14 @@ function GroupEditor({
                   "relative truncate rounded-[8px] border px-2 py-1.5 text-left text-[11px] font-medium transition-all",
                   "disabled:cursor-not-allowed disabled:opacity-40",
                   selected
-                    ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                    ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                     : "border-[var(--border)] bg-[var(--surface)] text-[var(--text)] hover:border-[var(--accent)]",
                 )}
               >
                 {selected && (
                   <span
                     aria-hidden
-                    className="absolute right-1 top-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-[var(--accent)] text-[9px] font-bold leading-none text-white"
+                    className="absolute right-1 top-1 flex h-3.5 w-3.5 items-center justify-center rounded-full bg-[var(--accent)] text-[9px] font-bold leading-none text-[var(--on-accent)]"
                   >
                     ✓
                   </span>
@@ -369,7 +369,7 @@ function GroupEditor({
         )}
       </div>
 
-      {error && <p className="text-[11px] text-[var(--short)]">{error}</p>}
+      {error && <p className="text-[11px] text-[var(--short-ink)]">{error}</p>}
 
       <div className="flex items-center justify-end gap-2 pt-1">
         <Button variant="ghost" size="sm" onClick={onCancel}>取消</Button>

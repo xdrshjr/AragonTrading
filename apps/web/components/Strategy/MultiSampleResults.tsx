@@ -120,7 +120,7 @@ function TabBar({
           >
             <span>{it.instId}</span>
             {it.status === "error" ? (
-              <span className="text-[var(--short)]" aria-hidden>
+              <span className="text-[var(--short-ink)]" aria-hidden>
                 !
               </span>
             ) : (
@@ -188,7 +188,7 @@ function OkPanel({ item }: { item: MultiSampleItem }) {
 function ErrorCard({ item }: { item: MultiSampleItem }) {
   return (
     <div className="rounded-[10px] border border-[var(--short)] bg-[var(--surface)] px-3 py-3 text-[11px]">
-      <div className="font-medium text-[var(--short)]">该标的回测失败</div>
+      <div className="font-medium text-[var(--short-ink)]">该标的回测失败</div>
       {item.error && <div className="mt-1 break-words text-[var(--muted)]">{item.error}</div>}
       <div className="mt-1 text-[var(--muted)]">可缩小区间或确认标的有效后重试。</div>
     </div>

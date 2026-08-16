@@ -45,7 +45,7 @@ export default function OkxAccountsSection() {
   }
   if (isError || !data) {
     return (
-      <div className="card flex items-center justify-between gap-3 p-4 text-sm text-[var(--short)]">
+      <div className="card flex items-center justify-between gap-3 p-4 text-sm text-[var(--short-ink)]">
         <span>加载账户失败：{(error as Error)?.message || "请稍后重试"}</span>
         <Button variant="ghost" size="sm" onClick={() => void refetch()}>
           重试
@@ -60,7 +60,7 @@ export default function OkxAccountsSection() {
     <div className="flex flex-col gap-5 pb-6">
       <DefaultBanner account={defaultAccount} />
       {feedback && (
-        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--long)]">
+        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--long-ink)]">
           {feedback}
         </p>
       )}
@@ -102,7 +102,7 @@ function DefaultBanner({ account }: { account: OkxAccount | null }) {
             {account.label} · API {account.apiKeyPreview || "未配置"}
           </span>
         ) : (
-          <span className="text-sm font-semibold text-[var(--short)]">未设置默认账户</span>
+          <span className="text-sm font-semibold text-[var(--short-ink)]">未设置默认账户</span>
         )}
       </div>
       <Badge tone={ready ? "long" : "neutral"}>{ready ? "就绪" : "待配置"}</Badge>
@@ -190,7 +190,7 @@ function AddAccount({ onAdded }: { onAdded: () => void }) {
           </Button>
         </div>
       </div>
-      {error && <p className="text-[11px] text-[var(--short)]">{error}</p>}
+      {error && <p className="text-[11px] text-[var(--short-ink)]">{error}</p>}
     </div>
   );
 }

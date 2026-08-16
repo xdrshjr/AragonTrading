@@ -125,7 +125,7 @@ export default function DiscoveryStrategyDetail({ detail }: { detail: Detail }) 
                   <td className="py-1 text-right tabular text-[var(--muted)]">
                     {formatParamValue(row.default)}
                   </td>
-                  <td className="py-1 text-right tabular font-medium text-[var(--accent)]">
+                  <td className="py-1 text-right tabular font-medium text-[var(--accent-ink)]">
                     {formatParamValue(row.value)}
                   </td>
                 </tr>

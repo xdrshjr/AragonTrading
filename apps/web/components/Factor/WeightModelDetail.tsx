@@ -118,7 +118,7 @@ export default function WeightModelDetail({
       )}
 
       {deleteNotice && (
-        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short)]">
+        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short-ink)]">
           删除失败：{deleteNotice}
         </p>
       )}
@@ -183,7 +183,7 @@ function RunHistoryTable({
   if (error) {
     return (
       <div className="card flex flex-col items-center gap-2 p-6 text-center">
-        <span className="text-[11px] text-[var(--short)]">加载训练记录失败：{errorMessage ?? "未知错误"}</span>
+        <span className="text-[11px] text-[var(--short-ink)]">加载训练记录失败：{errorMessage ?? "未知错误"}</span>
         {onRetry && <Button variant="default" size="sm" onClick={onRetry}>重试</Button>}
       </div>
     );
@@ -234,7 +234,7 @@ function RunHistoryTable({
                   <button
                     type="button"
                     onClick={(e) => { e.stopPropagation(); onRequestDelete(run.id); }}
-                    className="text-[var(--muted)] underline hover:text-[var(--short)]"
+                    className="text-[var(--muted)] underline hover:text-[var(--short-ink)]"
                   >
                     删除
                   </button>
@@ -268,13 +268,13 @@ function RunReplay({
   });
   if (run.isPending) return <p className="py-4 text-center text-[11px] text-[var(--muted)]">加载曲线...</p>;
   if (run.isError) {
-    return <p className="text-[11px] text-[var(--short)]">加载训练记录失败：{(run.error as Error)?.message}</p>;
+    return <p className="text-[11px] text-[var(--short-ink)]">加载训练记录失败：{(run.error as Error)?.message}</p>;
   }
   const data = run.data;
   if (data.status === "failed") {
     return (
       // G-F6：错误码经 codeLabel 友好呈现，原始码作 title 保留排障线索。
-      <p role="alert" title={data.errorCode ?? undefined} className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] text-[var(--short)]">
+      <p role="alert" title={data.errorCode ?? undefined} className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] text-[var(--short-ink)]">
         该次训练失败（{codeLabel(data.errorCode)}）：{data.errorMessage ?? "无详情"}
       </p>
     );
@@ -316,7 +316,7 @@ function RunReplay({
 function ErrorState({ message, onBack }: { message?: string; onBack: () => void }) {
   return (
     <div className="flex flex-col items-center gap-2 py-8">
-      <p className="text-[11px] text-[var(--short)]">加载模型失败：{message}</p>
+      <p className="text-[11px] text-[var(--short-ink)]">加载模型失败：{message}</p>
       <Button variant="default" size="sm" onClick={onBack}>返回列表</Button>
     </div>
   );

@@ -69,7 +69,7 @@ export default function DiscoveryFunnel({ row }: { row: DiscoveryIterationRow | 
                   <td className="py-0.5 text-[var(--text)]">{AXIS_SHORT_CN[axis] ?? axis}</td>
                   <td className="py-0.5 text-right tabular">{tally.generated}</td>
                   <td className="py-0.5 text-right tabular">{tally.validated}</td>
-                  <td className="py-0.5 text-right tabular text-[var(--long)]">{tally.kept}</td>
+                  <td className="py-0.5 text-right tabular text-[var(--long-ink)]">{tally.kept}</td>
                   <td className="py-0.5 text-right tabular text-[var(--muted)]">
                     {tally.truncated + (tally.truncatedByBacktestCap ?? 0)}
                   </td>

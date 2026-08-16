@@ -89,13 +89,13 @@ export default function OrderConfirmModal({
             className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--accent)]"
           />
           <span>
-            我已知晓这是<strong className="text-[var(--short)]">真实资金下单</strong>
+            我已知晓这是<strong className="text-[var(--short-ink)]">真实资金下单</strong>
             ，将立即提交至 OKX 实盘账户，盈亏由本人承担。
           </span>
         </label>
 
         {error && (
-          <p role="alert" className="text-[11px] font-medium text-[var(--short)]">
+          <p role="alert" className="text-[11px] font-medium text-[var(--short-ink)]">
             {error}
           </p>
         )}

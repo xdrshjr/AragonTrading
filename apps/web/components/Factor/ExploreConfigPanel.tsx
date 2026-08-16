@@ -110,7 +110,7 @@ export default function ExploreConfigPanel({
               className={clsx(
                 "rounded-[8px] border px-3 py-1.5 text-xs font-medium transition-colors",
                 strategy === s.value
-                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                   : "border-[var(--border)] text-[var(--muted)] hover:text-[var(--text)]",
               )}
             >
@@ -168,7 +168,7 @@ export default function ExploreConfigPanel({
       />
 
       {error && (
-        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short)]">
+        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short-ink)]">
           {error}
         </p>
       )}
@@ -213,7 +213,7 @@ function SizePicker({ poolSize, selected, onToggle }: { poolSize: number; select
           className={clsx(
             "rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors",
             selected.includes(k)
-              ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+              ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
               : "bg-[var(--surface-2)] text-[var(--muted)] hover:text-[var(--text)]",
           )}
         >
@@ -246,12 +246,12 @@ function CandidatePreview({
       <p className="text-xs text-[var(--text)]">
         预览：<span className="font-semibold tabular">{comboCount}</span> 组合 ×{" "}
         <span className="font-semibold tabular">{methodCount}</span> 方法 ={" "}
-        <span className={clsx("font-semibold tabular", tooMany ? "text-[var(--short)]" : "text-[var(--accent)]")}>{candidateCount}</span> 候选
+        <span className={clsx("font-semibold tabular", tooMany ? "text-[var(--short-ink)]" : "text-[var(--accent-ink)]")}>{candidateCount}</span> 候选
       </p>
-      {poolTooSmall && <p className="text-[11px] text-[var(--short)]">因子池至少需 2 个因子才能探索子集组合。</p>}
-      {noMethod && !poolTooSmall && <p className="text-[11px] text-[var(--short)]">请至少选择 1 个可用训练方法。</p>}
+      {poolTooSmall && <p className="text-[11px] text-[var(--short-ink)]">因子池至少需 2 个因子才能探索子集组合。</p>}
+      {noMethod && !poolTooSmall && <p className="text-[11px] text-[var(--short-ink)]">请至少选择 1 个可用训练方法。</p>}
       {tooMany && (
-        <p className="text-[11px] font-medium text-[var(--short)]">
+        <p className="text-[11px] font-medium text-[var(--short-ink)]">
           候选数超过上限 {MAX_EXPLORE_CANDIDATES}，请收窄组合大小或减少训练方法后再启动。
         </p>
       )}
@@ -297,7 +297,7 @@ function PoolEditor({ library, pool, onChange }: { library: FactorLibraryItem[];
         {pool.map((m, i) => (
           <span key={`${m.factorKey}-${i}`} className="flex items-center gap-1 rounded-full bg-[var(--surface-2)] px-2 py-0.5 text-[11px] text-[var(--text)]">
             {cn(m.factorKey)}
-            <button type="button" aria-label={`移除 ${cn(m.factorKey)}`} className="text-[var(--muted)] hover:text-[var(--short)]" onClick={() => removeAt(i)}>
+            <button type="button" aria-label={`移除 ${cn(m.factorKey)}`} className="text-[var(--muted)] hover:text-[var(--short-ink)]" onClick={() => removeAt(i)}>
               ×
             </button>
           </span>
@@ -317,7 +317,7 @@ function PoolEditor({ library, pool, onChange }: { library: FactorLibraryItem[];
               onClick={() => setSource(val)}
               className={clsx(
                 "rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-all",
-                source === val ? "bg-[var(--accent-soft)] text-[var(--accent)]" : "text-[var(--muted)] hover:text-[var(--text)]",
+                source === val ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]" : "text-[var(--muted)] hover:text-[var(--text)]",
               )}
             >
               {label}

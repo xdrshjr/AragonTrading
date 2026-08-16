@@ -180,7 +180,7 @@ function renderLink(token: string, key: string): React.ReactNode {
       href: url.trim(),
       target: "_blank",
       rel: "noopener noreferrer",
-      className: "text-[var(--accent)] underline underline-offset-2 hover:brightness-110",
+      className: "text-[var(--accent-ink)] underline underline-offset-2 hover:brightness-110",
     },
     label,
   );

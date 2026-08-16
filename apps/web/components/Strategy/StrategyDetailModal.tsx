@@ -118,7 +118,7 @@ function AtomicDetail({ strategy }: { strategy: Strategy }) {
     <section className="flex flex-col gap-2">
       <SectionTitle>策略参数</SectionTitle>
       {htfBar && (
-        <span className="inline-flex w-fit items-center gap-1 rounded-[6px] bg-[var(--accent-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--accent)]">
+        <span className="inline-flex w-fit items-center gap-1 rounded-[6px] bg-[var(--accent-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--accent-ink)]">
           参考周期：{htfBar}
         </span>
       )}
@@ -163,7 +163,7 @@ function FactorDetail({ strategy }: { strategy: Strategy }) {
       <p className="text-[11px] text-[var(--muted)]">
         消费独立因子层的复合得分做决策（内联快照 {members.length} 个因子成员）。
       </p>
-      <p className="text-[11px] text-[var(--accent)]">
+      <p className="text-[11px] text-[var(--accent-ink)]">
         至少需约 {minBars} 根数据才会产出信号（区间过短将安静空仓）。
       </p>
       {members.length > 0 && (

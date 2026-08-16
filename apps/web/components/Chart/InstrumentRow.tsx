@@ -83,8 +83,8 @@ export default function InstrumentRow({
         className={clsx(
           "shrink-0 rounded p-1 transition-colors",
           starred
-            ? "text-[var(--accent)]"
-            : "text-[var(--muted)] opacity-60 hover:opacity-100 hover:text-[var(--accent)]",
+            ? "text-[var(--accent-ink)]"
+            : "text-[var(--muted)] opacity-60 hover:opacity-100 hover:text-[var(--accent-ink)]",
         )}
       >
         <StarIcon filled={starred} />
@@ -125,7 +125,7 @@ export default function InstrumentRow({
           className={clsx(
             "shrink-0 rounded p-1 transition-colors",
             canAddAuto
-              ? "text-[var(--muted)] opacity-60 hover:text-[var(--accent)] hover:opacity-100"
+              ? "text-[var(--muted)] opacity-60 hover:text-[var(--accent-ink)] hover:opacity-100"
               : "cursor-not-allowed text-[var(--muted)] opacity-25",
           )}
         >

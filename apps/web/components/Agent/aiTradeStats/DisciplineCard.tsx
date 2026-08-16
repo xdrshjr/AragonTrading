@@ -74,7 +74,7 @@ export default function DisciplineCard({
           错的补救方向（最宽松的档在 BTC 1m 上仍有 93% 否决率）。`data-testid` 保持不变。 */}
       {wire.hint && (
         <div
-          className="flex flex-col gap-0.5 rounded border border-[var(--short)] bg-[var(--surface-2)] px-2 py-1 text-[10px] leading-relaxed text-[var(--short)]"
+          className="flex flex-col gap-0.5 rounded border border-[var(--short)] bg-[var(--surface-2)] px-2 py-1 text-[10px] leading-relaxed text-[var(--short-ink)]"
           data-testid="ai-discipline-hint"
         >
           {splitHint(wire.hint).map((line, i) => (
@@ -86,7 +86,7 @@ export default function DisciplineCard({
       )}
       {summaryHealth?.stalled && (
         <p
-          className="rounded border border-[var(--accent)] px-2 py-1 text-[10px] leading-relaxed text-[var(--accent)]"
+          className="rounded border border-[var(--accent)] px-2 py-1 text-[10px] leading-relaxed text-[var(--accent-ink)]"
           data-testid="ai-summary-stalled"
         >
           {SUMMARY_STALLED_TEXT(summaryHealth.failures)}
@@ -95,7 +95,7 @@ export default function DisciplineCard({
 
       {naked?.tone === "danger" && (
         <p
-          className="rounded border border-[var(--short)] bg-[var(--surface-2)] px-2 py-1 text-[10px] leading-relaxed text-[var(--short)]"
+          className="rounded border border-[var(--short)] bg-[var(--surface-2)] px-2 py-1 text-[10px] leading-relaxed text-[var(--short-ink)]"
           data-testid="ai-discipline-naked"
         >
           {naked.note}

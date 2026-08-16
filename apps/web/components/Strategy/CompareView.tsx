@@ -153,7 +153,7 @@ export default function CompareView() {
       </div>
 
       {compare.isError && (
-        <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+        <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short-ink)]">
           对比失败：{(compare.error as Error)?.message}
         </div>
       )}
@@ -204,14 +204,14 @@ export default function CompareView() {
                   </td>
                   <td className="py-1.5 pr-2 text-right tabular">{fmtNum(it.metrics.sharpe)}</td>
                   <td className="py-1.5 pr-2 text-right tabular">{fmtPct(it.metrics.winRate)}</td>
-                  <td className="py-1.5 pr-2 text-right tabular text-[var(--short)]">
+                  <td className="py-1.5 pr-2 text-right tabular text-[var(--short-ink)]">
                     {fmtPct(it.metrics.maxDrawdown)}
                   </td>
                   <td className="py-1.5 pr-2 text-right tabular">{it.metrics.tradeCount}</td>
                   <td className="py-1.5 text-right">
                     <button
                       onClick={() => openDetail(it.strategyId, it.runId)}
-                      className="rounded-[6px] px-2 py-0.5 text-[11px] text-[var(--accent)] hover:bg-[var(--accent-soft)]"
+                      className="rounded-[6px] px-2 py-0.5 text-[11px] text-[var(--accent-ink)] hover:bg-[var(--accent-soft)]"
                     >
                       打开
                     </button>

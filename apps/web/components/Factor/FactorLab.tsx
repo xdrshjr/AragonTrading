@@ -280,7 +280,7 @@ export default function FactorLab({ active }: { active: boolean }) {
             <span className="pb-1 text-[11px] text-[var(--muted)]">请先在交易工作台添加自选标的</span>
           )}
           {!rangeValid && (
-            <span className="pb-1 text-[11px] text-[var(--short)]">起始须早于结束</span>
+            <span className="pb-1 text-[11px] text-[var(--short-ink)]">起始须早于结束</span>
           )}
           {/* 横栏最右侧：管理标的组（自选为空时禁用并提示，spec §六1）。 */}
           <div className="ml-auto pb-0.5">
@@ -311,7 +311,7 @@ export default function FactorLab({ active }: { active: boolean }) {
                 className={clsx(
                   "flex flex-col gap-0.5 rounded-[10px] px-3 py-2 text-left transition-colors duration-150 ease-smooth",
                   section === s.key
-                    ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                    ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                     : "text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]",
                 )}
               >

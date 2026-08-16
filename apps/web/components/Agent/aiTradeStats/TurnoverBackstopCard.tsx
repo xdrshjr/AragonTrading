@@ -197,7 +197,7 @@ function RepairButton({
       disabled={busy || done}
       onClick={() => onRepair(symbol)}
       data-testid={`ai-turnover-repair-${symbol}`}
-      className="shrink-0 rounded-[3px] border border-[var(--accent-soft)] px-1.5 py-px text-[10px] text-[var(--accent)] disabled:opacity-50"
+      className="shrink-0 rounded-[3px] border border-[var(--accent-soft)] px-1.5 py-px text-[10px] text-[var(--accent-ink)] disabled:opacity-50"
     >
       {busy ? "补挂中…" : done ? "已提交" : action.label}
     </button>

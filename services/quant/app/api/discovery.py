@@ -24,6 +24,7 @@ from ..discovery import service
 from ..discovery.manager import get_discovery_manager
 from ..okx.rest_client import get_rest_client
 from ..schemas import DiscoveryBacktestReq, DiscoveryStartReq
+from .ws_guard import guard_ws_origin
 
 router = APIRouter(tags=["discovery"])
 
@@ -150,6 +151,8 @@ async def discovery_vocabulary() -> dict:
 # ============================ 实时流 ============================
 @router.websocket("/ws/discovery/{run_id}")
 async def ws_discovery(websocket: WebSocket, run_id: int) -> None:
+    if not await guard_ws_origin(websocket):   # 必须在 accept() 之前：不合规连接一帧都不许收到
+        return
     await websocket.accept()
     run = get_discovery_manager().get(run_id)
     if run is None:

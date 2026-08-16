@@ -51,7 +51,7 @@ export default function DiscoveryMonitor() {
         <button
           type="button"
           onClick={() => goSection("runs")}
-          className="mt-2 text-xs text-[var(--accent)] underline"
+          className="mt-2 text-xs text-[var(--accent-ink)] underline"
         >
           去挖掘任务列表选择或新建
         </button>
@@ -85,7 +85,7 @@ export default function DiscoveryMonitor() {
       </div>
 
       {run?.lastError && (
-        <p role="status" className="text-[11px] text-[var(--short)]">
+        <p role="status" className="text-[11px] text-[var(--short-ink)]">
           {run.lastError.code}：{run.lastError.message}
         </p>
       )}
@@ -119,7 +119,7 @@ export default function DiscoveryMonitor() {
         </span>
         {(run?.counters.ledgerErrors ?? 0) > 0 && (
           <span
-            className="text-[11px] text-[var(--short)]"
+            className="text-[11px] text-[var(--short-ink)]"
             data-testid="ledger-errors"
             title="本轮有成果未能登记进台账（登记失败不影响挖掘本身，但这些成果暂时不会出现在「成果资产」分区）"
           >
@@ -129,7 +129,7 @@ export default function DiscoveryMonitor() {
         <button
           type="button"
           onClick={() => goSection("assets")}
-          className="text-[11px] text-[var(--accent)] underline"
+          className="text-[11px] text-[var(--accent-ink)] underline"
         >
           去成果资产分区
         </button>
@@ -219,7 +219,7 @@ export default function DiscoveryMonitor() {
               </p>
               {llm.sinceProcessStart && <p>用量自**进程启动**起算，不跨重启累计。</p>}
               {latest?.llm.degraded && (
-                <p className="text-[var(--short)]">
+                <p className="text-[var(--short-ink)]">
                   最近一轮已降级：{latest.llm.degradedReason || "未知原因"}
                 </p>
               )}

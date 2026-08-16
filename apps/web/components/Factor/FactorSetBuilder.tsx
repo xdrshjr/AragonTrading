@@ -469,7 +469,7 @@ export default function FactorSetBuilder() {
               训练样本 {trained.metrics.nTrain} · 验证样本 {trained.metrics.nValid}
             </span>
           </div>
-          {overfit && <p className="text-[11px] font-medium text-[var(--short)]">{overfit}</p>}
+          {overfit && <p className="text-[11px] font-medium text-[var(--short-ink)]">{overfit}</p>}
           {trained.provenance && (
             <p className="text-[11px] text-[var(--muted)]">
               训练于 {trained.provenance.instId} · {trained.provenance.bar} · 前瞻 {trained.provenance.horizon} 根
@@ -505,9 +505,9 @@ export default function FactorSetBuilder() {
       {blockReason && !memberError && (
         <p className="text-[11px] text-[var(--muted)]">{blockReason}</p>
       )}
-      {notice && <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--accent)]">{notice}</p>}
+      {notice && <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--accent-ink)]">{notice}</p>}
       {(save.isError || update.isError || updateStrategy.isError) && (
-        <p className="text-[11px] text-[var(--short)]">
+        <p className="text-[11px] text-[var(--short-ink)]">
           操作失败：
           {((save.error || update.error || updateStrategy.error) as Error)?.message}
         </p>
@@ -554,7 +554,7 @@ function EditBanner({
       : `已从交易策略「${name}」载入内联快照 — 可「另存为组合」或「更新该策略」`;
   return (
     <div className="flex flex-wrap items-center justify-between gap-2 rounded-[10px] border border-[var(--accent)] bg-[var(--accent-soft)]/50 px-3 py-2">
-      <span className="text-[11px] font-medium text-[var(--accent)]">{label}</span>
+      <span className="text-[11px] font-medium text-[var(--accent-ink)]">{label}</span>
       <Button variant="ghost" size="sm" onClick={onReset}>新建组合</Button>
     </div>
   );

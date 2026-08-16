@@ -113,7 +113,7 @@ export default function AutoTradeToggle() {
       <span
         className={clsx(
           "text-[11px] font-medium",
-          active ? "text-[var(--short)]" : "text-[var(--muted)]",
+          active ? "text-[var(--short-ink)]" : "text-[var(--muted)]",
         )}
       >
         自动交易

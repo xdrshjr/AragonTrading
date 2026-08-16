@@ -2073,8 +2073,10 @@ class AiTradeSession:
         realized = self.executor.realized_pnl_usd
         metrics = {**_empty_metrics(),
                    "totalReturn": (realized / budget) if budget > 0 else 0.0,
-                   "tradeCount": len(self.executor.trades),
-                   "avgPnl": realized / max(1, len(self.executor.trades)),
+                   # D5：读显式计数器而不是列表长度——`executor.trades` 现在有内存护栏封顶，
+                   # 数长度会在超长会话上静默低报，而这两个数是要落库进 run metrics 的。
+                   "tradeCount": self.executor.trade_count,
+                   "avgPnl": realized / max(1, self.executor.trade_count),
                    "roundsCompleted": self.rounds_completed,
                    "finalSummary": self.decider.summary,
                    "flattenFailed": self.flatten_failed,

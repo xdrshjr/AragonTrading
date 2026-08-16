@@ -46,7 +46,7 @@ export default function AiModelsSection() {
   }
   if (isError || !data) {
     return (
-      <div className="card flex items-center justify-between gap-3 p-4 text-sm text-[var(--short)]">
+      <div className="card flex items-center justify-between gap-3 p-4 text-sm text-[var(--short-ink)]">
         <span>加载服务商失败：{(error as Error)?.message || "请稍后重试"}</span>
         <Button variant="ghost" size="sm" onClick={() => void refetch()}>
           重试
@@ -61,7 +61,7 @@ export default function AiModelsSection() {
     <div className="flex flex-col gap-5 pb-6">
       <ActiveBanner active={data.active} />
       {feedback && (
-        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--long)]">
+        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--long-ink)]">
           {feedback}
         </p>
       )}
@@ -102,7 +102,7 @@ function ActiveBanner({ active }: { active: ProviderActive }) {
             {active.label || active.provider} · {active.model}
           </span>
         ) : (
-          <span className="text-sm font-semibold text-[var(--short)]">未配置可用服务</span>
+          <span className="text-sm font-semibold text-[var(--short-ink)]">未配置可用服务</span>
         )}
       </div>
       <Badge tone={active.configured ? "long" : "neutral"}>
@@ -212,7 +212,7 @@ function AddCustom({ onAdded }: { onAdded: () => void }) {
           </Button>
         </div>
       </div>
-      {error && <p className="text-[11px] text-[var(--short)]">{error}</p>}
+      {error && <p className="text-[11px] text-[var(--short-ink)]">{error}</p>}
     </div>
   );
 }

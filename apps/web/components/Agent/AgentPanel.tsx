@@ -367,7 +367,7 @@ export default function AgentPanel() {
       </div>
 
       {error && !showTrace && (
-        <div className="flex items-center justify-between gap-2 border-t border-[var(--border)] bg-[color-mix(in_srgb,var(--short)_10%,transparent)] px-3 py-1.5 text-[11px] text-[var(--short)]">
+        <div className="flex items-center justify-between gap-2 border-t border-[var(--border)] bg-[color-mix(in_srgb,var(--short)_10%,transparent)] px-3 py-1.5 text-[11px] text-[var(--short-ink)]">
           <span className="min-w-0 flex-1 truncate">{error}</span>
           {lastUserTextRef.current && !running && (
             <button
@@ -414,7 +414,7 @@ function AiTradeLifecycleNotice() {
       data-testid="ai-trade-lifecycle-notice"
       className="flex items-start gap-2 border-b border-[var(--accent)] bg-[var(--accent-soft)] px-3 py-1.5"
     >
-      <span className="flex-1 text-[10px] leading-relaxed text-[var(--accent)]">{notice}</span>
+      <span className="flex-1 text-[10px] leading-relaxed text-[var(--accent-ink)]">{notice}</span>
       <button
         type="button"
         aria-label="关闭提示"

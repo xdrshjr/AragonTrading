@@ -94,7 +94,7 @@ export default function FactorEvalPanel() {
       </div>
 
       {evaluate.isError && (
-        <p className="text-[11px] text-[var(--short)]">评估失败：{(evaluate.error as Error)?.message}</p>
+        <p className="text-[11px] text-[var(--short-ink)]">评估失败：{(evaluate.error as Error)?.message}</p>
       )}
 
       {compute.data?.note === "bar_incompatible" ? (
@@ -121,7 +121,7 @@ function EvalResult({ result, onAddToCombo }: { result: FactorEvalResult; onAddT
   if (result.note === "bar_incompatible") {
     return (
       <div className="card flex flex-col gap-2 p-4 text-center">
-        <span className="text-[11px] font-medium text-[var(--accent)]">该因子仅适用于日内周期</span>
+        <span className="text-[11px] font-medium text-[var(--accent-ink)]">该因子仅适用于日内周期</span>
         <span className="text-[11px] text-[var(--muted)]">{BAR_INCOMPATIBLE_NOTE}。</span>
       </div>
     );
@@ -293,5 +293,5 @@ function HorizonTable({ horizons }: { horizons: FactorHorizonStat[] }) {
 
 function cellTone(value: number | null): string {
   const tone = icTone(value);
-  return `px-3 py-1.5 ${tone === "long" ? "text-[var(--long)]" : tone === "short" ? "text-[var(--short)]" : "text-[var(--muted)]"}`;
+  return `px-3 py-1.5 ${tone === "long" ? "text-[var(--long-ink)]" : tone === "short" ? "text-[var(--short-ink)]" : "text-[var(--muted)]"}`;
 }

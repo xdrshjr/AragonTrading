@@ -254,7 +254,7 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
             <ChartToolbar {...toolbar} />
           </div>
           {dataSource === "cache" && (
-            <div className="shrink-0 border-b border-[var(--accent)] bg-[var(--accent-soft)] px-4 py-1.5 text-[11px] font-medium text-[var(--accent)]">
+            <div className="shrink-0 border-b border-[var(--accent)] bg-[var(--accent-soft)] px-4 py-1.5 text-[11px] font-medium text-[var(--accent-ink)]">
               缓存样例 · OKX 暂不可达，当前显示本地缓存历史。
             </div>
           )}

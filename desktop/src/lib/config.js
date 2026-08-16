@@ -1,7 +1,9 @@
 'use strict';
 // 端口常量 + 子进程环境变量组装 (spec §4.5)。
 // 固定端口策略 (D3)：与 scripts/dev.py / apps/web / docker-compose 保持一致——
-// 后端 18760 / 前端 18761。改动须同步 README「端口同步点」一节（P2-3，第 5 处）。
+// 后端 18760 / 前端 18761。改动须同步 README「端口同步点」一节（P2-3，第 5 处；
+// 第 6 处是 services/quant/app/security/origins.py 的 DEFAULT_ORIGINS——那里写的是前端
+// 入口的 Origin 白名单，改了端口而不同步它，应用会被自己的信任边界挡在门外）。
 
 const BACKEND_HOST = '127.0.0.1';
 const WEB_HOST = '127.0.0.1';
@@ -70,11 +72,14 @@ function backendEnv({ mode, dbPath, agentEnv } = {}) {
   // DISCOVERY_ENABLED 等键，打包/prod 将无法用 agent.env 覆盖挖掘总闸与配额（漏改即所有
   // DISCOVERY_ env 静默失效）。OKX_ 为 okx-link-resilience 必改透传（§3.5）：不加则打包版
   // **所有** OKX_LINK_* 旋钮（心跳 / 退避 / 熔断 / 连接池 / 补根上限）静默失效——这类漏改
-  // 从不报错，本仓库已为它栽过两次。
+  // 从不报错，本仓库已为它栽过两次。SECURITY_ 为 trust-boundary-and-signal-integrity 必改透传
+  // （D1/P0-3，第三次同形）：后端本轮起按 Origin 白名单拒绝跨源请求，白名单一旦与实际入口不符，
+  // 症状是「点什么都 403」——不透传 SECURITY_ALLOWED_ORIGINS 的话，用户**没有任何一条路**能改回来。
   if (mode === 'prod' && agentEnv && typeof agentEnv === 'object') {
     for (const [key, value] of Object.entries(agentEnv)) {
       if ((key.startsWith('AGENT_') || key.startsWith('LIVE_') || key.startsWith('AI_TRADE_')
-           || key.startsWith('DISCOVERY_') || key.startsWith('OKX_'))
+           || key.startsWith('DISCOVERY_') || key.startsWith('OKX_')
+           || key.startsWith('SECURITY_'))
           && value != null) {
         env[key] = String(value);
       }

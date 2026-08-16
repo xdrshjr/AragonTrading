@@ -28,7 +28,7 @@ export default function SettingsNav() {
             "flex flex-col gap-0.5 rounded-[10px] px-3 py-2 text-left",
             "transition-colors duration-150 ease-smooth",
             section === s.key
-              ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+              ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
               : "text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]",
           )}
         >

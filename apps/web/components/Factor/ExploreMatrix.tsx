@@ -95,8 +95,8 @@ function MatrixCell({
       className={clsx(
         "flex h-14 w-full flex-col items-center justify-center gap-0.5 rounded-[8px] border px-1 text-center transition-all",
         state.status === "queued" && "border-[var(--border)] bg-[var(--surface-2)] text-[var(--muted)]",
-        state.status === "running" && "animate-pulse border-[var(--accent)]/50 bg-[var(--accent-soft)]/40 text-[var(--accent)]",
-        state.status === "failed" && "border-[var(--short)]/40 bg-[var(--short)]/10 text-[var(--short)]",
+        state.status === "running" && "animate-pulse border-[var(--accent)]/50 bg-[var(--accent-soft)]/40 text-[var(--accent-ink)]",
+        state.status === "failed" && "border-[var(--short)]/40 bg-[var(--short)]/10 text-[var(--short-ink)]",
         state.status === "cancelled" && "border-[var(--border)] bg-[var(--surface-2)] text-[var(--muted)]",
         succeeded && "border-transparent text-[var(--text)]",
         isBest && "ring-2 ring-[var(--long)]/50",

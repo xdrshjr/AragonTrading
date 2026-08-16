@@ -96,7 +96,7 @@ export default function AiTradeEndDialog({
                     onChange={() => setFlatten(true)}
                     className="mt-0.5"
                   />
-                  <span className="text-[12px] text-[var(--short)]">平掉这些持仓并结束</span>
+                  <span className="text-[12px] text-[var(--short-ink)]">平掉这些持仓并结束</span>
                 </label>
                 <label className="flex cursor-pointer items-start gap-2 rounded border border-[var(--border)] px-2.5 py-2">
                   <input
@@ -111,7 +111,7 @@ export default function AiTradeEndDialog({
               </fieldset>
             ) : (
               <p
-                className="rounded border border-[var(--short)] px-2.5 py-2 text-[11px] leading-relaxed text-[var(--short)]"
+                className="rounded border border-[var(--short)] px-2.5 py-2 text-[11px] leading-relaxed text-[var(--short-ink)]"
                 data-testid="ai-trade-end-cold-hint"
               >
                 软件重启后这次会话已不在进程内，这里无法代你平仓：结束只会归档本地记录，持仓会
@@ -136,7 +136,7 @@ export default function AiTradeEndDialog({
         )}
 
         {error && (
-          <p className="text-[11px] leading-relaxed text-[var(--short)]" role="alert">
+          <p className="text-[11px] leading-relaxed text-[var(--short-ink)]" role="alert">
             {error}
           </p>
         )}

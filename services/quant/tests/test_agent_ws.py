@@ -70,6 +70,7 @@ class _FakeWS:
     def __init__(self, inbound):
         self.inbound = list(inbound)
         self.sent = []
+        self.headers: dict = {}   # 无 Origin ⇒ 非浏览器客户端，来源守卫放行（app/api/ws_guard.py）
         self.accepted = False
         self.closed = False
         self._idx = 0
@@ -99,6 +100,7 @@ class _FakeWSDisconnectAfter:
     def __init__(self, gate: asyncio.Event):
         self.gate = gate
         self.sent = []
+        self.headers: dict = {}   # 无 Origin ⇒ 非浏览器客户端，来源守卫放行（app/api/ws_guard.py）
         self._sent_user = False
 
     async def accept(self):
@@ -127,6 +129,7 @@ class _FakeWSResume:
         self._release = release
         self._wait_for = wait_for
         self.sent = []
+        self.headers: dict = {}   # 无 Origin ⇒ 非浏览器客户端，来源守卫放行（app/api/ws_guard.py）
         self._sent_resume = False
 
     async def accept(self):

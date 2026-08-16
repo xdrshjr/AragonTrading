@@ -108,7 +108,7 @@ export default function OkxAccountCard({
           </div>
           <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[11px] text-[var(--muted)]">
             <span className="tabular">API {account.apiKeyPreview || "未配置"}</span>
-            <span className={account.hasSecret ? "text-[var(--long)]" : "text-[var(--short)]"}>
+            <span className={account.hasSecret ? "text-[var(--long-ink)]" : "text-[var(--short-ink)]"}>
               {account.hasSecret ? "密钥已存" : "密钥未存"}
             </span>
             {account.ipWhitelist && (
@@ -194,9 +194,9 @@ export default function OkxAccountCard({
         </div>
       </div>
 
-      {error && <p className="text-[11px] text-[var(--short)]">{error}</p>}
+      {error && <p className="text-[11px] text-[var(--short-ink)]">{error}</p>}
       {feedback && (
-        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--long)]">
+        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--long-ink)]">
           {feedback}
         </p>
       )}

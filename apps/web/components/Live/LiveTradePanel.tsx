@@ -141,7 +141,7 @@ export default function LiveTradePanel({
   }
   if (configQ.isError || !config || !meta) {
     return (
-      <div className="flex flex-col items-start gap-2 p-4 text-xs text-[var(--short)]">
+      <div className="flex flex-col items-start gap-2 p-4 text-xs text-[var(--short-ink)]">
         <span>加载下单上下文失败：{(configQ.error as Error)?.message || "请稍后重试"}</span>
         <Button variant="ghost" size="sm" onClick={() => void configQ.refetch()}>
           重试
@@ -252,7 +252,7 @@ export default function LiveTradePanel({
             className="text-right tabular"
           />
           {validation.errors.px && (
-            <span className="text-[11px] text-[var(--short)]">{validation.errors.px}</span>
+            <span className="text-[11px] text-[var(--short-ink)]">{validation.errors.px}</span>
           )}
         </label>
       ) : (
@@ -326,7 +326,7 @@ export default function LiveTradePanel({
       </Button>
 
       {submitOk && (
-        <p role="status" className="text-[11px] font-medium text-[var(--long)]">
+        <p role="status" className="text-[11px] font-medium text-[var(--long-ink)]">
           {submitOk}
         </p>
       )}

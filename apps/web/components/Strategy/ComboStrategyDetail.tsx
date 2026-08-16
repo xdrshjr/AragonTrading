@@ -89,7 +89,7 @@ export default function ComboStrategyDetail({
                   className={
                     "rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-all " +
                     (source === item
-                      ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                      ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                       : "text-[var(--muted)] hover:text-[var(--text)]")
                   }
                 >
@@ -110,7 +110,7 @@ export default function ComboStrategyDetail({
                     className={
                       "rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-all " +
                       (speed === item
-                        ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                        ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                         : "text-[var(--muted)] hover:text-[var(--text)]")
                     }
                   >

@@ -125,6 +125,21 @@ test("prod backendEnv forwards OKX_LINK_* knobs from agent.env", () => {
   });
 });
 
+test("prod backendEnv forwards SECURITY_ALLOWED_ORIGINS from agent.env", () => {
+  // trust-boundary-and-signal-integrity D1/P0-3：后端本轮起按 Origin 白名单拒绝跨源请求。
+  // prod 的 PyInstaller 后端**不读 .env、只读进程 env**，所以白名单的唯一入口就是这份透传。
+  // 漏放行 SECURITY_ 前缀 ⇒ 用户改了前端端口后「点什么都 403」且**没有任何一条路**能改回来。
+  // 这是同一类漏改的第三次（前两次是 DISCOVERY_ 与 OKX_），故照同一范式钉住。
+  withCleanGateEnv(() => {
+    const env = cfg.backendEnv({
+      mode: "prod",
+      dbPath: "C:/tmp/aragon.db",
+      agentEnv: { SECURITY_ALLOWED_ORIGINS: "http://127.0.0.1:19999" },
+    });
+    assert.equal(env.SECURITY_ALLOWED_ORIGINS, "http://127.0.0.1:19999");
+  });
+});
+
 // 触发 unused-import lint 前的自证：确认 config.js 解析入口与本测试同源，避免误引其他副本。
 test("config module resolves to src/lib/config.js", () => {
   const here = path.dirname(fileURLToPath(import.meta.url));

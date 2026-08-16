@@ -59,7 +59,7 @@ function renderState(loading: boolean, result: TestResultLike | null) {
   if (result.ok) {
     const latency = typeof result.latencyMs === "number" ? ` · ${Math.round(result.latencyMs)}ms` : "";
     return (
-      <span className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--long)]">
+      <span className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--long-ink)]">
         ✓ 连通{latency}
       </span>
     );
@@ -67,7 +67,7 @@ function renderState(loading: boolean, result: TestResultLike | null) {
   const hint = (result.code && CODE_HINT[result.code]) || result.message || "测试失败";
   return (
     <span
-      className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--short)]"
+      className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--short-ink)]"
       title={result.message || hint}
     >
       ✗ {hint}

@@ -88,7 +88,7 @@ export default function CandidateCard({
         <p
           role="alert"
           title={state.error.code}
-          className="rounded-[8px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-2 py-1 text-[11px] font-medium text-[var(--short)]"
+          className="rounded-[8px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-2 py-1 text-[11px] font-medium text-[var(--short-ink)]"
         >
           {codeLabel(state.error.code)}：{state.error.message}
         </p>

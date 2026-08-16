@@ -10,6 +10,8 @@ from typing import Literal
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .security.origins import DEFAULT_ORIGINS
+
 
 class Settings(BaseSettings):
     """全局设置。字段名即环境变量名（大小写不敏感）。"""
@@ -743,6 +745,25 @@ class Settings(BaseSettings):
     agent_heartbeat_seconds: float = Field(default=20.0, gt=0)      # run 期心跳间隔（须 < 中间层 idle 超时）
     agent_event_buffer_size: int = Field(default=512, ge=64)        # 会话事件缓冲上限（重放窗口）
 
+    # ---- 信任边界（trust-boundary-and-signal-integrity D1 / §6.1）----
+    # 逗号分隔的 Origin 白名单；空 = 用 `app/security/origins.py` 的 DEFAULT_ORIGINS。
+    # 显式配置即**完全替换**默认（不做合并，避免「以为收紧了其实没有」）。
+    # ⚠️ 前缀必须是 `SECURITY_`：`desktop/src/lib/config.js` 的 `backendEnv` 用**前缀白名单**决定
+    # 哪些 env 进得了打包后端子进程，而 prod 的 PyInstaller 后端**不读 `.env`、只读进程 env**。
+    # 裸名 `ALLOWED_ORIGINS` 一个前缀都不沾 ⇒ 打包形态下这个开关恒失效，白名单一旦不匹配就是
+    # 「点什么都 403 且用户无从补救」。改名/加字段时必须同步那份白名单（该文件已为此栽过两次）。
+    security_allowed_origins: str = ""
+
+    @model_validator(mode="after")
+    def _check_allowed_origins(self) -> "Settings":
+        """白名单里不许出现 ``*`` 或 ``null`` —— 启动即 fail-fast。
+
+        一个「安全开关」允许被一键关掉，等于没有这个开关；`null` 是 sandboxed iframe 的不透明源，
+        放行它等于给整条边界留一个任意网页三行 HTML 就能走通的正门（spec §三 D1 [v2·P0-1]）。
+        """
+        self.allowed_origin_list()
+        return self
+
     @model_validator(mode="after")
     def _check_health_window(self) -> "Settings":
         """体检窗口三个根数的相容性（discovery-asset-ledger §六）—— 启动即 fail-fast。
@@ -778,6 +799,26 @@ class Settings(BaseSettings):
                 f"AI_TRADE_TRADABILITY_INFEASIBLE_VETO_RATE"
                 f"({self.ai_trade_tradability_infeasible_veto_rate})，否则 marginal 档恒不可达")
         return self
+
+    def allowed_origin_list(self) -> list[str]:
+        """解析 ``SECURITY_ALLOWED_ORIGINS`` 为白名单；空串 → ``DEFAULT_ORIGINS``。
+
+        Returns:
+            至少含一项的 Origin 列表（逐项 ``strip()`` 后丢弃空项）。
+
+        Raises:
+            ValueError: 白名单里出现 ``*`` 或 ``null``（两者都等价于「把边界关掉」）。
+        """
+        raw = self.security_allowed_origins.strip()
+        if not raw:
+            return list(DEFAULT_ORIGINS)
+        items = [part.strip() for part in raw.split(",") if part.strip()]
+        for item in items:
+            if item == "*" or item.lower() == "null":
+                raise ValueError(
+                    f"SECURITY_ALLOWED_ORIGINS 不接受 {item!r}：通配符与不透明源 null 都等价于"
+                    "关闭信任边界（null 是 sandboxed iframe 的来源，正是本设计要挡的那一类）")
+        return items or list(DEFAULT_ORIGINS)
 
     @property
     def proxy_url(self) -> str | None:

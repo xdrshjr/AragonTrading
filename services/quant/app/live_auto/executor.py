@@ -36,6 +36,7 @@ from ..okx.trading import (
     fetch_live_positions,
     place_live_order,
 )
+from ..wire_caps import TRADE_LEDGER_MAX
 from .fee_ledger import FeeLedger, audit_fills, trade_fee_fields
 from .explain import (
     as_close,
@@ -61,6 +62,9 @@ _CLEAR_CONFIRM_MAX_TRIES = 6
 _CLEAR_CONFIRM_INTERVAL_S = 0.5
 # H4：停止会话平仓失败的有界重试间隔（次数由 settings.live_auto_flatten_max_retries 控制）。
 _FLATTEN_RETRY_INTERVAL_S = 0.5
+# 台账封顶的迟滞量（D5）：超过 `TRADE_LEDGER_MAX + slack` 才一次性裁到上限，把 `del` 的 O(n)
+# 成本摊到 slack 笔成交上；逐笔裁会让每一笔成交都付一次整列搬移。
+_LEDGER_TRIM_SLACK = 500
 
 
 def _plan_limit_px(order_plan) -> float | None:
@@ -120,7 +124,19 @@ class LiveExecutor:
         self.realized_pnl_usd = 0.0        # 累计已实现（平仓回执累加）
         self.unrealized_usd = 0.0          # 最近一次 reconcile 的浮盈（净额口径，B-2）
         self.gross_unrealized_usd = 0.0    # 同一次 reconcile 的**毛**浮盈（只读，供对账/排查）
-        self.trades: list[dict] = []       # 已执行真单→Trade（驱动图表 markers）
+        # 已执行真单→Trade（驱动图表 markers）。**容器类型必须是 `list`，不得换成 `deque`**：
+        # `wire_caps.tail_trades` 的实现是 `trades[-cap:]`，而 deque 不支持切片
+        # （`TypeError: sequence index must be integer, not 'slice'`），两条会话的快照下发主路径
+        # （`live_auto/session.py` 与 `ai_auto/session.py`）会每次都炸。封顶改在 `_record_trade` 里按块裁。
+        self.trades: list[dict] = []
+        # 显式计数器（trust-boundary-and-signal-integrity D5）。**它们是封顶的前置条件**：
+        # 这份台账同时承担三个角色——明细、计数器、换手闸判据。先把后两个从「数列表长度」里
+        # 解耦出来，裁剪才不会静默改变交易行为（裁 `trades` 等于静默放松换手纪律阈值）。
+        # 刻意**只有两个**：已实现盈亏的真值是上面的 `realized_pnl_usd`（平仓回执累加，续跑时由
+        # continuity 一并回灌），再按成交腿累加一份「总额」就是同一个数落两份——而这里漂移的是
+        # 真实资金的盈亏显示（`ai_auto/resume.rebuild_continuity` 的不变式原文）。
+        self.trade_count = 0               # 会话累计成交笔数（单调递增，不受封顶影响）
+        self.open_count = 0                # 其中开仓笔数（side in long/short）——换手闸判据
         self._reconcile_fail_streak = 0    # H2：连续 reconcile 读取失败计数（成功即清零）
         self.degraded = False              # H2：盯市降级标志（连续失败达阈→True，恢复→False）
         # 当前挂着的那一笔限价委托（不变式 I-1：单会话至多一笔）。恒为 None ⇒ 市价路径 ⇒ live_auto
@@ -307,7 +323,7 @@ class LiveExecutor:
                                  explain=explain, cl_ord_id=cl_ord_id, ord_id=ord_id,
                                  position_pct=self.entry_position_pct, expected_px=ref_px)
         self.entry_fee_usd += float(trade["fee"])
-        self.trades.append(trade)
+        self._record_trade(trade)
         return pre + [{"type": "trade", "data": trade}]
 
     async def _do_close(self, ref_px: float, ts: int, reason: str, *, signal=None,
@@ -514,7 +530,7 @@ class LiveExecutor:
                                  ord_id=order.ord_id, position_pct=self.entry_position_pct,
                                  ord_type="limit", expected_px=order.px)
         self.entry_fee_usd += float(trade["fee"])   # §3.3a：按本轮采纳增量计费（sz 已是 delta）
-        self.trades.append(trade)
+        self._record_trade(trade)
         return [{"type": "trade", "data": trade}]
 
     def _adopt_close_fill(self, order: RestingOrder, avg_px: float, ts: int) -> list[dict]:
@@ -557,7 +573,7 @@ class LiveExecutor:
                                  reason=reason, explain=explain, cl_ord_id=cl_ord_id,
                                  ord_id=ord_id, position_pct=position_pct,
                                  ord_type=ord_type, expected_px=expected_px)
-        self.trades.append(trade)
+        self._record_trade(trade)
         return [{"type": "trade", "data": trade}]
 
     def _settle_benign_close(self, ref_px: float, ts: int) -> list[dict]:
@@ -922,10 +938,48 @@ class LiveExecutor:
             trade = self._make_trade(ts, "close", ref_px, self.entry_qty_sz, pnl=pnl,
                                      pnl_pct=pnl_pct, reason="external_close", explain=explain,
                                      position_pct=self.entry_position_pct, expected_px=ref_px)
-            self.trades.append(trade)
+            self._record_trade(trade)
             return [{"type": "trade", "data": trade}]
         except Exception:  # noqa: BLE001 —— 合成失败回落原 status，绝不影响 reconcile / flatten 主流程
             return []
+
+    def _record_trade(self, trade: dict) -> None:
+        """成交入账的**唯一入口**（trust-boundary-and-signal-integrity D5）。
+
+        四个 append 点全部收敛到这里，是为了让「新增一个 append 点却忘了计数」在结构上不可能发生
+        ——那类漏改不会报错，只会让换手闸悄悄放松、让统计悄悄低报。
+
+        封顶按块裁（一次删到 `TRADE_LEDGER_MAX`，而不是每笔删一笔），把 `del` 的 O(n) 成本摊薄。
+        它是**内存护栏**不是展示策略：`TRADE_LEDGER_MAX` 远超任何现实会话，正常情况下永不触发；
+        真触发时三个计数器仍是全量真值，所以下游没有任何一处会因此低报。
+
+        Args:
+            trade: `_make_trade` 产出的成交字典（本方法只读它的 ``side``）。
+        """
+        self.trades.append(trade)
+        self.trade_count += 1
+        if trade.get("side") in ("long", "short"):
+            self.open_count += 1
+        if len(self.trades) > TRADE_LEDGER_MAX + _LEDGER_TRIM_SLACK:
+            del self.trades[:len(self.trades) - TRADE_LEDGER_MAX]
+
+    def restore_trades(self, rows: list[dict]) -> None:
+        """续跑时回灌整段台账并**就地派生**两个计数器（D5 / P1-6）。
+
+        计数器**不落库**：`ai_auto/resume.rebuild_continuity` 的不变式原文是「派生量绝不落库：
+        落两份必然漂移，而这里漂移的是真实资金的盈亏显示」，而它本就从 DB 的**全量 `Trade` 行**
+        重建 `rows`（无裁剪）。因此恢复后的计数器与暂停前**逐位相同**，既不需要新增持久化键，
+        也不存在需要在 UI 上解释的降级口径。同一条理由也解释了这里为什么**不**接收已实现盈亏：
+        它的真值是 `realized_pnl_usd`，由调用方从同一份 continuity 一并回灌。
+
+        Args:
+            rows: 从 DB 重建的全量成交行。
+        """
+        self.trades[:] = rows                     # 原地替换，绝不换掉容器对象本身
+        self.trade_count = len(rows)
+        self.open_count = sum(1 for row in rows if row.get("side") in ("long", "short"))
+        if len(self.trades) > TRADE_LEDGER_MAX + _LEDGER_TRIM_SLACK:
+            del self.trades[:len(self.trades) - TRADE_LEDGER_MAX]
 
     @staticmethod
     def _order_ids(result) -> tuple[str | None, str | None]:

@@ -59,7 +59,7 @@ export default function CompareSelectionBar({
               className={clsx(
                 "rounded-[6px] px-2.5 py-0.5 text-[11px] font-medium transition-all duration-150",
                 filter === f.key
-                  ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                  ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                   : "text-[var(--muted)] hover:text-[var(--text)]",
               )}
             >

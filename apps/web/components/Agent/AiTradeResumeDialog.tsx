@@ -90,7 +90,7 @@ export default function AiTradeResumeDialog({
                     {member.message}
                   </span>
                   {member.blockedReason && (
-                    <span className="text-[10px] text-[var(--short)]">
+                    <span className="text-[10px] text-[var(--short-ink)]">
                       {BLOCKED_REASON_LABEL[member.blockedReason] ?? member.blockedReason}
                     </span>
                   )}
@@ -114,7 +114,7 @@ export default function AiTradeResumeDialog({
             )}
 
             {blocked && (
-              <p className="text-[11px] leading-relaxed text-[var(--short)]" role="alert">
+              <p className="text-[11px] leading-relaxed text-[var(--short-ink)]" role="alert">
                 当前状态无法安全续跑。你可以稍后重试，或结束并归档这次会话（如仍有持仓，请到实盘
                 面板自行处理 —— AI 绝不会替你平掉它没有开过的仓位）。
               </p>
@@ -123,7 +123,7 @@ export default function AiTradeResumeDialog({
         )}
 
         {error && (
-          <p className="text-[11px] leading-relaxed text-[var(--short)]" role="alert">
+          <p className="text-[11px] leading-relaxed text-[var(--short-ink)]" role="alert">
             {error}
           </p>
         )}

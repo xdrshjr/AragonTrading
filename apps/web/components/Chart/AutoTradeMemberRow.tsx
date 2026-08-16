@@ -107,7 +107,7 @@ export default function AutoTradeMemberRow({
         <button
           type="button"
           onClick={() => onStopMember(inst.instId)}
-          className="shrink-0 rounded-md border border-[var(--short)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--short)] hover:bg-[var(--short)]/10"
+          className="shrink-0 rounded-md border border-[var(--short)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--short-ink)] hover:bg-[var(--short)]/10"
           title="停止该标的自动交易并平仓"
         >
           停止
@@ -125,7 +125,7 @@ export default function AutoTradeMemberRow({
             aria-label={`从自动交易移出 ${inst.instId}`}
             disabled={locked}
             onClick={() => onRemove(inst.instId)}
-            className="rounded p-0.5 text-[var(--muted)] hover:text-[var(--short)] disabled:opacity-30"
+            className="rounded p-0.5 text-[var(--muted)] hover:text-[var(--short-ink)] disabled:opacity-30"
             title="移出自动交易（仍保留在自选）"
           >
             <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round">

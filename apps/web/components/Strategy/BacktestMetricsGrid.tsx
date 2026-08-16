@@ -46,7 +46,7 @@ function riskItems(metrics: Metrics, ext?: ExtendedMetrics): Cell[] {
     {
       label: "最大回撤",
       value: fmtPct(metrics.maxDrawdown),
-      color: metrics.maxDrawdown < 0 ? "var(--short)" : N,
+      color: metrics.maxDrawdown < 0 ? "var(--short-ink)" : N,
     },
     {
       label: "最长水下",
@@ -84,17 +84,17 @@ function qualityItems(metrics: Metrics, ext?: ExtendedMetrics): Cell[] {
     {
       label: "平均盈利",
       value: ext ? fmtMoney(ext.avgWin) : DASH,
-      color: ext ? "var(--long)" : N,
+      color: ext ? "var(--long-ink)" : N,
       hint: "平仓盈利笔的平均已实现盈亏",
     },
     {
       label: "平均亏损",
       value: ext ? fmtMoney(ext.avgLoss) : DASH,
-      color: ext ? "var(--short)" : N,
+      color: ext ? "var(--short-ink)" : N,
       hint: "平仓亏损笔的平均已实现亏损（绝对值）",
     },
-    { label: "单笔最大盈利", value: ext ? fmtMoney(ext.largestWin) : DASH, color: ext ? "var(--long)" : N },
-    { label: "单笔最大亏损", value: ext ? fmtMoney(ext.largestLoss) : DASH, color: ext ? "var(--short)" : N },
+    { label: "单笔最大盈利", value: ext ? fmtMoney(ext.largestWin) : DASH, color: ext ? "var(--long-ink)" : N },
+    { label: "单笔最大亏损", value: ext ? fmtMoney(ext.largestLoss) : DASH, color: ext ? "var(--short-ink)" : N },
     { label: "最大连胜", value: ext ? `${ext.maxConsecutiveWins} 笔` : DASH, color: N },
     { label: "最大连亏", value: ext ? `${ext.maxConsecutiveLosses} 笔` : DASH, color: N },
     {

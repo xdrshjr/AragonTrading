@@ -14,23 +14,40 @@ import path from "node:path";
 //
 // core.autocrlf=true：跨行正则一律写 \r?\n，否则干净检出上恒红。
 
-const COMPONENTS_DIR = path.resolve(__dirname, "..");
+// 扫描根与 `contrastTokens.source.test.ts` 的通用扫描取齐：`components/` + `app/` + `lib/`。
+// 原来只扫 `components/`，而本轮在 `lib/` 里就抓到了两处同类问题（面色当文字、指向未定义 token 的
+// 内联回退）——一个只覆盖一半代码树的门禁，挡不住漂到另一半去的同一个缺陷。
+const WEB_ROOT = path.resolve(__dirname, "..", "..");
+const SCAN_ROOTS = ["components", "app", "lib"].map((name) => path.join(WEB_ROOT, name));
 
 function collectSources(dir: string): { file: string; text: string }[] {
   const out: { file: string; text: string }[] = [];
+  if (!fs.existsSync(dir)) return out;
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
       out.push(...collectSources(full));
     } else if (/\.tsx?$/.test(entry.name)) {
-      out.push({ file: path.relative(COMPONENTS_DIR, full), text: fs.readFileSync(full, "utf8") });
+      out.push({
+        file: path.relative(WEB_ROOT, full).replace(/\\/g, "/"),
+        text: fs.readFileSync(full, "utf8"),
+      });
     }
   }
   return out;
 }
 
 describe("警告语义色的单一写法（D5）", () => {
-  const sources = collectSources(COMPONENTS_DIR).filter((s) => !s.file.endsWith(".source.test.ts"));
+  const sources = SCAN_ROOTS.flatMap(collectSources).filter(
+    (s) => !/\.(source\.)?test\.tsx?$/.test(s.file),
+  );
+
+  it("扫描根覆盖到了 components / app / lib 三处", () => {
+    expect(sources.some((s) => s.file.startsWith("components/"))).toBe(true);
+    expect(sources.some((s) => s.file.startsWith("app/"))).toBe(true);
+    expect(sources.some((s) => s.file.startsWith("lib/"))).toBe(true);
+  });
 
   it("components/ 下不再出现拼错的 --warning", () => {
     const offenders = sources.filter((s) => /--warning\b/.test(s.text)).map((s) => s.file);

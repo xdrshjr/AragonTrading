@@ -28,12 +28,16 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(function 
         // H-F8：键盘聚焦可见环（仅 focus-visible，鼠标点击不显，不改既有视觉）。
         "outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg)]",
         size === "sm" ? "px-2.5 py-1 text-xs" : "px-3.5 py-2 text-sm",
+        // 白字 on --accent 实测浅 3.28 / 暗 2.69（暗色连大字号 3:1 都不到），而这是全应用的主行动按钮。
         variant === "primary" &&
-          "bg-[var(--accent)] text-white hover:brightness-105 active:brightness-95 shadow-soft",
+          "bg-[var(--accent)] text-[var(--on-accent)] hover:brightness-105 active:brightness-95 shadow-soft",
         variant === "default" &&
           "bg-[var(--surface-2)] text-[var(--text)] hover:bg-[var(--border)]",
         variant === "ghost" && "bg-transparent text-[var(--muted)] hover:text-[var(--text)] hover:bg-[var(--surface-2)]",
-        variant === "danger" && "bg-transparent text-[var(--short)] hover:bg-[var(--accent-soft)]",
+        // hover 底从 --accent-soft 改为 --surface-2：暗色 --short-ink on --accent-soft 只有 4.41，
+        // 而「删除 / 平掉全部 / 停止会话」正是最需要看清的那颗按钮；顺带修掉「破坏性按钮的 hover 底
+        // 是品牌赭色」这处语义错配（写法与上面 variant="ghost" 一致，不是新发明）。
+        variant === "danger" && "bg-transparent text-[var(--short-ink)] hover:bg-[var(--surface-2)]",
         className,
       )}
       {...props}
@@ -116,7 +120,7 @@ export function Field({
       )}
       {children}
       {error ? (
-        <span id={errorId} className="text-[11px] text-[var(--short)]">{error}</span>
+        <span id={errorId} className="text-[11px] text-[var(--short-ink)]">{error}</span>
       ) : hint ? (
         <span className="text-[11px] leading-relaxed text-[var(--muted)]">{hint}</span>
       ) : null}
@@ -138,9 +142,9 @@ export function Badge({
       className={clsx(
         "inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium tabular",
         tone === "neutral" && "bg-[var(--surface-2)] text-[var(--muted)]",
-        tone === "long" && "bg-[color-mix(in_srgb,var(--long)_16%,transparent)] text-[var(--long)]",
-        tone === "short" && "bg-[color-mix(in_srgb,var(--short)_16%,transparent)] text-[var(--short)]",
-        tone === "accent" && "bg-[var(--accent-soft)] text-[var(--accent)]",
+        tone === "long" && "bg-[color-mix(in_srgb,var(--long)_16%,transparent)] text-[var(--long-ink)]",
+        tone === "short" && "bg-[color-mix(in_srgb,var(--short)_16%,transparent)] text-[var(--short-ink)]",
+        tone === "accent" && "bg-[var(--accent-soft)] text-[var(--accent-ink)]",
         className,
       )}
     >
@@ -246,6 +250,32 @@ const FOCUSABLE =
   'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 /**
+ * 同时打开的对话框登记表（spec D4）；「栈顶」= 唯一有权响应 Esc / Tab 陷阱的那一个。
+ *
+ * **为什么不能只按挂载顺序判栈顶**：React 的 effect 是**自底向上**执行的（子先于父）。
+ * 外层 `Modal` 与内层 `ConfirmDialog` 同时挂载时（`SymbolGroupModal.tsx:177` 就是这个形状，
+ * 打开时若确认框已是 open 状态），内层的 effect 先跑、先入栈，外层反而后入——按纯挂载顺序判定
+ * 会得出「外层在顶」，缺陷原样保留。所以真正的判据是**React 树上的嵌套深度**（context 穿透
+ * portal，按渲染位置传递），挂载顺序只在同深度（两个互不嵌套的兄弟弹窗）时用作后入者优先的次序。
+ *
+ * 元素里的 `id` 是 `Symbol`，只用于身份比较，不持有组件引用，因此不会造成泄漏。
+ */
+type DialogEntry = { id: symbol; depth: number };
+const dialogStack: DialogEntry[] = [];
+
+/** 嵌套深度：最外层 `Modal` 的 children 拿到 1，它内部再开一层拿到 2，依此类推。 */
+const ModalDepthContext = React.createContext(0);
+
+/** 该对话框是否是当前的栈顶（深度最大者优先；同深度取后入者）。 */
+function isTopDialog(id: symbol): boolean {
+  let top: DialogEntry | undefined;
+  for (const entry of dialogStack) {
+    if (top === undefined || entry.depth >= top.depth) top = entry;
+  }
+  return top?.id === id;
+}
+
+/**
  * 可复用对话框原语（P1-Modal）：详情面板与未来任何浮层均复用，避免一次性孤岛。
  *
  * a11y / 行为契约（与 Modal.test.tsx 一致）：
@@ -273,6 +303,31 @@ export function Modal({
 }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
+  // 嵌套深度在挂载时一次定型：一个 `Modal` 在 React 树上的位置不会在生命周期内变化，
+  // 用 `useRef` 的惰性初始化捕获它，就能让下面的入栈 effect 依赖数组保持为**纯 `[open]`**。
+  const depth = React.useContext(ModalDepthContext) + 1;
+  const entryRef = useRef<DialogEntry>();
+  if (entryRef.current === undefined) entryRef.current = { id: Symbol("modal"), depth };
+
+  // 对话框栈（spec D4）：`window` 上的捕获期 keydown 是**每个 Modal 各挂一份**，而
+  // `e.stopPropagation()` 按 DOM 规范只阻止事件传到**其它节点**，不阻止**同一节点上的其它监听器**。
+  // 于是两个 Modal 同开时，先挂载的外层先执行，Esc 会先把外层关掉——用户想「退出这个删除确认」，
+  // 结果整个标的组管理器一起消失、工作上下文丢失（§2.1(c) 已实测复现）。
+  //
+  // ⚠️ 这个 effect 的依赖数组**只能是 `[open]`**，绝不可并进下面那个 `[open, onClose]` 的 keydown
+  // effect。调用方普遍传内联箭头（如 `FactorLab.tsx:301` 的 `onClose={() => setGroupModalOpen(false)}`
+  // 经 `SymbolGroupModal.tsx:124` 原样交给 `<Modal onClose={onClose}>`），父组件每次重渲染 `onClose`
+  // 都换新身份 ⇒ 挂在那个 effect 上就会「splice 掉自己 → 重新 push 到**栈顶**」，缺陷原样复活，
+  // 而静态渲染的用例照样是绿的。`open` 是布尔，身份天然稳定。
+  useEffect(() => {
+    if (!open) return;
+    const entry = entryRef.current!;
+    dialogStack.push(entry);
+    return () => {
+      const at = dialogStack.indexOf(entry);   // 按值移除，不用 pop：卸载顺序未必是入栈顺序
+      if (at >= 0) dialogStack.splice(at, 1);
+    };
+  }, [open]);
 
   // 挂载：记住触发元素 → 初始焦点入对话框 → body 滚动锁定；卸载：解锁并把焦点交还触发元素。
   useEffect(() => {
@@ -296,8 +351,15 @@ export function Modal({
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (e: KeyboardEvent) => {
+      // 只有**栈顶**对话框响应 Esc 与 Tab 陷阱。Tab 一并守住是因为：外层的焦点陷阱在内层打开时
+      // 仍在跑，目前只是恰好每个分支都不命中——任何一次 FOCUSABLE 选择器调整都会让它开始抢焦点。
+      if (!isTopDialog(entryRef.current!.id)) return;
       if (e.key === "Escape") {
         e.stopPropagation();
+        // stopPropagation 挡不住**同一个 EventTarget 上的其它监听器**（那需要 stopImmediatePropagation）。
+        // 栈顶守卫已经解决了 Modal 之间的相互干扰，这一行是纵深防御：挡住同样挂在 window 捕获期的
+        // 非 Modal 监听器（面板级 Esc 流）在同一次按键里再关一层。
+        e.stopImmediatePropagation();
         onClose();
         return;
       }
@@ -346,7 +408,9 @@ export function Modal({
           className,
         )}
       >
-        {children}
+        {/* 在这里下发深度：children 是在本组件的子树里渲染的，因此**内部**再开的 Modal
+            （典型是 ConfirmDialog）读到的是 depth+1，与 DOM 上二者互为兄弟无关。 */}
+        <ModalDepthContext.Provider value={depth}>{children}</ModalDepthContext.Provider>
       </div>
     </div>,
     document.body,

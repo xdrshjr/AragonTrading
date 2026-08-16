@@ -22,6 +22,7 @@ from ..schemas import (
     WeightModelUpdateReq,
     WeightTrainStartReq,
 )
+from .ws_guard import guard_ws_origin
 
 router = APIRouter(tags=["weight-models"])
 
@@ -138,6 +139,8 @@ async def backtest_weight_run(model_id: int, run_id: int, body: WeightBacktestRe
 # ============================ 训练实时流（§5.4，抄 ws_paper） ============================
 @router.websocket("/ws/weight-train/{job_id}")
 async def ws_weight_train(websocket: WebSocket, job_id: str) -> None:
+    if not await guard_ws_origin(websocket):   # 必须在 accept() 之前：不合规连接一帧都不许收到
+        return
     await websocket.accept()
     job = get_weight_train_manager().get(job_id)
     if job is None:

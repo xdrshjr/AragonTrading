@@ -266,7 +266,7 @@ export default function DiscoveryAssetDetail({
               />
             </section>
 
-            {message && <p className="text-xs text-[var(--accent)]">{message}</p>}
+            {message && <p className="text-xs text-[var(--accent-ink)]">{message}</p>}
 
             {/* ⑥ 动作区 */}
             <div className="flex flex-wrap justify-end gap-2">

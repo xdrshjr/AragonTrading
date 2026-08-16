@@ -66,7 +66,7 @@ export default function AutoTradeSettingsSection() {
   }
   if (isError || !data) {
     return (
-      <div className="card flex items-center justify-between gap-3 p-4 text-sm text-[var(--short)]">
+      <div className="card flex items-center justify-between gap-3 p-4 text-sm text-[var(--short-ink)]">
         <span>加载自动交易设置失败：{(error as Error)?.message || "请稍后重试"}</span>
         <Button variant="ghost" size="sm" onClick={() => void refetch()}>
           重试
@@ -92,7 +92,7 @@ export default function AutoTradeSettingsSection() {
         ceilingActive={ceilingActive}
       />
       {notice && (
-        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--accent)]">
+        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--accent-ink)]">
           {notice}
         </p>
       )}
@@ -148,7 +148,7 @@ function MaxBudgetCard({
         </div>
       </label>
       {error ? (
-        <p role="alert" className="text-[11px] font-medium text-[var(--short)]">
+        <p role="alert" className="text-[11px] font-medium text-[var(--short-ink)]">
           {error}
         </p>
       ) : ceilingActive ? (

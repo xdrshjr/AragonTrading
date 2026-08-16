@@ -262,7 +262,9 @@ async def test_strictness_hint_fires_only_after_enough_rounds_with_zero_opens():
         session.rounds_completed = 20
         hint = session.discipline_wire()["hint"]
         assert hint is not None and "一次都没有提出开仓" in hint
-        session.executor.trades.append({"side": "long", "ts": 1, "price": 1.0})
+        # 必须走 `_record_trade`（成交入账的唯一入口）：`opens` 判据本轮已从「数 trades 列表」
+        # 改为读 `executor.open_count`，直接 append 会绕过计数器（trust-boundary-and-signal-integrity D5）。
+        session.executor._record_trade({"side": "long", "ts": 1, "price": 1.0})
         assert session.discipline_wire()["hint"] is None        # 开过仓 ⇒ 不提示
     finally:
         await dispose_engine()

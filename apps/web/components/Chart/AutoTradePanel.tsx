@@ -91,7 +91,7 @@ export default function AutoTradePanel({
           <span className="flex items-center gap-1.5 text-[11px] font-semibold text-[var(--text)]">
             自动交易
             {running ? (
-              <span className="inline-flex items-center gap-1 text-[var(--long)]">
+              <span className="inline-flex items-center gap-1 text-[var(--long-ink)]">
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--long)]" />
                 运行中
               </span>
@@ -107,7 +107,7 @@ export default function AutoTradePanel({
               type="button"
               onClick={onOpenRecords}
               title="按时间维度查看每次完整交易的收益与总收益率"
-              className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)] transition-colors hover:bg-[var(--accent-soft)]"
+              className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent-ink)] transition-colors hover:bg-[var(--accent-soft)]"
             >
               <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden>
                 <path
@@ -139,7 +139,7 @@ export default function AutoTradePanel({
               type="button"
               onClick={onEvenSplit}
               disabled={running || members.length === 0}
-              className="rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:opacity-40"
+              className="rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent-ink)] hover:bg-[var(--accent-soft)] disabled:opacity-40"
             >
               均分
             </button>
@@ -150,7 +150,7 @@ export default function AutoTradePanel({
           {allocationMode === "even" ? (
             <span className="tabular text-[var(--muted)]">
               已分配{" "}
-              <span className={clsx("font-semibold", overLimit ? "text-[var(--short)]" : "text-[var(--text)]")}>
+              <span className={clsx("font-semibold", overLimit ? "text-[var(--short-ink)]" : "text-[var(--text)]")}>
                 {Math.round(totalPct * 100) / 100}%
               </span>
               /100% · {members.length}/{LIVE_AUTO_MAX_GROUP_SYMBOLS}
@@ -166,7 +166,7 @@ export default function AutoTradePanel({
 
         {/* 禁用 / 拖入错误就地可见原因（HCI：避免守门被误判为「按钮坏了」）。 */}
         {(blocked && gateReason) || dropError ? (
-          <p className="truncate text-[10px] text-[var(--short)]" title={dropError ?? gateReason ?? ""}>
+          <p className="truncate text-[10px] text-[var(--short-ink)]" title={dropError ?? gateReason ?? ""}>
             {dropError ?? gateReason}
           </p>
         ) : null}

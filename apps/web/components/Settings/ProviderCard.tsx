@@ -109,7 +109,7 @@ export default function ProviderCard({
         <span
           className={clsx(
             "shrink-0 text-[11px] tabular",
-            provider.hasKey ? "text-[var(--long)]" : "text-[var(--muted)]",
+            provider.hasKey ? "text-[var(--long-ink)]" : "text-[var(--muted)]",
           )}
         >
           {provider.hasKey ? `密钥 ${provider.keyPreview}` : "未配置密钥"}
@@ -117,7 +117,7 @@ export default function ProviderCard({
       </div>
 
       {provider.isDefault && !provider.hasKey && !editing && (
-        <p className="text-[11px] font-medium text-[var(--short)]">
+        <p className="text-[11px] font-medium text-[var(--short-ink)]">
           该默认服务未填写密钥，填写后生效
         </p>
       )}
@@ -190,9 +190,9 @@ export default function ProviderCard({
           )}
         </div>
       </div>
-      {error && <p className="text-[11px] text-[var(--short)]">{error}</p>}
+      {error && <p className="text-[11px] text-[var(--short-ink)]">{error}</p>}
       {feedback && (
-        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--long)]">
+        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--long-ink)]">
           {feedback}
         </p>
       )}

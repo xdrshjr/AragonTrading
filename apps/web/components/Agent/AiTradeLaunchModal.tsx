@@ -750,7 +750,7 @@ export default function AiTradeLaunchModal({
           </label>
           {baseRuleEnabled && (
             <details className="text-[11px] text-[var(--muted)]">
-              <summary className="cursor-pointer select-none text-[var(--accent)]">高级参数</summary>
+              <summary className="cursor-pointer select-none text-[var(--accent-ink)]">高级参数</summary>
               <div className="mt-1.5 flex flex-col gap-1.5">
                 <div className="flex items-center gap-2">
                   <label className="flex flex-1 items-center gap-1.5">
@@ -887,7 +887,7 @@ export default function AiTradeLaunchModal({
                   <span className="flex items-center gap-1.5 truncate text-[var(--text)]">
                     {m.instId}
                     {!isAutoTradable(m.instId) && (
-                      <span className="text-[10px] text-[var(--short)]">不支持</span>
+                      <span className="text-[10px] text-[var(--short-ink)]">不支持</span>
                     )}
                   </span>
                   <span className="flex items-center gap-2">
@@ -910,7 +910,7 @@ export default function AiTradeLaunchModal({
                       disabled={submitting}
                       onClick={() => removeMember(m.instId)}
                       aria-label={`移除 ${m.instId}`}
-                      className="rounded px-1 text-[var(--muted)] hover:text-[var(--short)] disabled:opacity-40"
+                      className="rounded px-1 text-[var(--muted)] hover:text-[var(--short-ink)] disabled:opacity-40"
                     >
                       ✕
                     </button>
@@ -944,7 +944,7 @@ export default function AiTradeLaunchModal({
                 </button>
               </div>
             </div>
-            {addError && <span className="text-[10px] text-[var(--short)]">{addError}</span>}
+            {addError && <span className="text-[10px] text-[var(--short-ink)]">{addError}</span>}
             {oversubscribed && (
               <p className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1 text-[10px] leading-relaxed text-[var(--muted)]">
                 各标的上限合计 {Math.round(sumPct * 100) / 100}%（&gt; 100%）：多标的同时触发时组合敞口可能超过总预算，
@@ -1011,7 +1011,7 @@ export default function AiTradeLaunchModal({
             <Row
               label="计划决策轮数"
               value={
-                <span className={roundsCapError ? "text-[var(--short)]" : undefined}>
+                <span className={roundsCapError ? "text-[var(--short-ink)]" : undefined}>
                   {plannedRounds} 轮 · 间隔 {everyValue} 根/次（上限 {AI_BACKTEST_MAX_ROUNDS}）
                 </span>
               }
@@ -1195,14 +1195,14 @@ export default function AiTradeLaunchModal({
               className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--accent)]"
             />
             <span>
-              我已知晓这是<strong className="text-[var(--short)]">真实资金 AI 自动交易</strong>
+              我已知晓这是<strong className="text-[var(--short-ink)]">真实资金 AI 自动交易</strong>
               ，AI 将对上述全部标的据所选策略信号自主决定开仓 / 平仓，盈亏由本人承担。
             </span>
           </label>
         )}
 
         {firstError && (
-          <p role="alert" className="text-[11px] font-medium text-[var(--short)]">
+          <p role="alert" className="text-[11px] font-medium text-[var(--short-ink)]">
             {firstError}
           </p>
         )}
@@ -1394,7 +1394,7 @@ function DisciplinePresetFields({
             disabled={disabled}
             aria-pressed={value === preset}
             onClick={() => onChange(preset)}
-            className="rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-[11px] text-[var(--text)] transition-colors hover:bg-[var(--surface-2)] aria-[pressed=true]:border-[var(--accent)] aria-[pressed=true]:text-[var(--accent)] disabled:opacity-50"
+            className="rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-[11px] text-[var(--text)] transition-colors hover:bg-[var(--surface-2)] aria-[pressed=true]:border-[var(--accent)] aria-[pressed=true]:text-[var(--accent-ink)] disabled:opacity-50"
           >
             {DISCIPLINE_COPY[preset].label}
             {preset === DEFAULT_DISCIPLINE_PRESET && (
@@ -1407,7 +1407,7 @@ function DisciplinePresetFields({
         {DISCIPLINE_COPY[value].detail}
       </span>
       {table && !table.enabled && (
-        <span className="text-[10px] leading-relaxed text-[var(--short)]">
+        <span className="text-[10px] leading-relaxed text-[var(--short-ink)]">
           本机已由运维总闸整轴关闭（AI_TRADE_DISCIPLINE_ENABLED=false）：无论这里选哪一档，本次启动
           都不会装配纪律层。
         </span>
@@ -1418,7 +1418,7 @@ function DisciplinePresetFields({
             type="button"
             onClick={() => setOpen((v) => !v)}
             aria-expanded={open}
-            className="self-start text-[10px] text-[var(--accent)] underline-offset-2 hover:underline"
+            className="self-start text-[10px] text-[var(--accent-ink)] underline-offset-2 hover:underline"
           >
             {open ? "收起阈值" : "查看这一档的阈值"}
           </button>

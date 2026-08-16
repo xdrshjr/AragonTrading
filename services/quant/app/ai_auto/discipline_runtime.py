@@ -92,7 +92,9 @@ class DisciplineRuntime:
         取数面仍只在本函数里：判据全在 `discipline_view.strictness_hint`（纯核心）。
         """
         executor = self._session.executor
-        opens = sum(1 for t in executor.trades if t.get("side") in ("long", "short"))
+        # D5：读 `open_count` 而不是遍历列表——判据与 `_record_trade` 里的累加**是同一条**
+        # （`side in ("long","short")`），但不再依赖列表长度，故台账封顶不会静默放松换手闸。
+        opens = executor.open_count
         return strictness_hint(rows, StrictnessFacts(
             rounds_completed=self._session.rounds_completed, opens=opens,
             funnel=self.funnel_wire(), tradability_level=self._tradability_level()))

@@ -35,8 +35,8 @@ function TraceOverview({ session }: { session: AiTradeSessionRow }) {
         <span
           className={
             pnl >= 0
-              ? "tabular text-xs font-medium text-[var(--long)]"
-              : "tabular text-xs font-medium text-[var(--short)]"
+              ? "tabular text-xs font-medium text-[var(--long-ink)]"
+              : "tabular text-xs font-medium text-[var(--short-ink)]"
           }
         >
           {pnl >= 0 ? "+" : ""}
@@ -52,7 +52,7 @@ function TraceOverview({ session }: { session: AiTradeSessionRow }) {
         {consensus && <span>{consensus}</span>}
       </div>
       {session.degraded && (
-        <p className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1 text-[10px] text-[var(--short)]">
+        <p className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1 text-[10px] text-[var(--short-ink)]">
           决策降级观望（多次重试仍失败 / 置信度不足 / 未产出有效决策 → 本轮回落观望，资金安全优先）
         </p>
       )}

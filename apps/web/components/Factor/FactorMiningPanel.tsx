@@ -60,7 +60,7 @@ export default function FactorMiningPanel() {
               className={
                 "rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors " +
                 (categories.includes(cat)
-                  ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                  ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                   : "bg-[var(--surface-2)] text-[var(--muted)] hover:text-[var(--text)]")
               }
             >
@@ -94,9 +94,9 @@ export default function FactorMiningPanel() {
         </div>
       </div>
 
-      {notice && <p className="text-[11px] font-medium text-[var(--accent)]">{notice}</p>}
+      {notice && <p className="text-[11px] font-medium text-[var(--accent-ink)]">{notice}</p>}
       {mine.isError && (
-        <p className="text-[11px] text-[var(--short)]">挖掘失败：{(mine.error as Error)?.message}</p>
+        <p className="text-[11px] text-[var(--short-ink)]">挖掘失败：{(mine.error as Error)?.message}</p>
       )}
       {mine.data && (
         <p className="text-[11px] text-[var(--muted)]">
@@ -189,5 +189,5 @@ function factorName(lib: FactorLibraryItem[], item: { factorKey: string }): stri
 
 function cellTone(value: number | null): string {
   const tone = icTone(value);
-  return `px-3 py-1.5 ${tone === "long" ? "text-[var(--long)]" : tone === "short" ? "text-[var(--short)]" : "text-[var(--muted)]"}`;
+  return `px-3 py-1.5 ${tone === "long" ? "text-[var(--long-ink)]" : tone === "short" ? "text-[var(--short-ink)]" : "text-[var(--muted)]"}`;
 }

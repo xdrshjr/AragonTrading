@@ -99,7 +99,7 @@ export default function MarketCloseAllConfirm({
                   <td className="py-1.5 pr-2 text-right tabular">{fmtPrice(p.last)}</td>
                   <td className="py-1.5 text-right tabular">
                     {r ? (
-                      <span className={r.ok ? "text-[var(--long)]" : "text-[var(--short)]"}>
+                      <span className={r.ok ? "text-[var(--long-ink)]" : "text-[var(--short-ink)]"}>
                         {r.ok ? "已提交" : `失败：${r.code ?? "未知"}`}
                       </span>
                     ) : (
@@ -125,14 +125,14 @@ export default function MarketCloseAllConfirm({
               className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--short)]"
             />
             <span>
-              我已知晓将以<strong className="text-[var(--short)]">市价一键平掉以上全部持仓</strong>
+              我已知晓将以<strong className="text-[var(--short-ink)]">市价一键平掉以上全部持仓</strong>
               ，结果不可撤销。
             </span>
           </label>
         )}
 
         {error && (
-          <p role="alert" className="text-[11px] font-medium text-[var(--short)]">
+          <p role="alert" className="text-[11px] font-medium text-[var(--short-ink)]">
             {error}
           </p>
         )}

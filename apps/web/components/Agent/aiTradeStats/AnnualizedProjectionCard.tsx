@@ -21,9 +21,9 @@ const REASON_HINTS: Record<AnnualizedReason, string> = {
 
 // E4 样本可信度徽标（低 / 中 / 高）：仅在年化出数字时并排展示，一眼提示这次外推有多可信。
 const CONFIDENCE_BADGE: Record<AnnualizedConfidence, { label: string; cls: string }> = {
-  low: { label: "可信度 低", cls: "text-[var(--short)] border-[var(--short)]" },
+  low: { label: "可信度 低", cls: "text-[var(--short-ink)] border-[var(--short)]" },
   medium: { label: "可信度 中", cls: "text-[var(--muted)] border-[var(--border)]" },
-  high: { label: "可信度 高", cls: "text-[var(--long)] border-[var(--long)]" },
+  high: { label: "可信度 高", cls: "text-[var(--long-ink)] border-[var(--long)]" },
 };
 
 /**

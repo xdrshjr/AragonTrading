@@ -102,7 +102,7 @@ export default function AiTradePauseDialog({
         )}
 
         {error && (
-          <p className="text-[11px] leading-relaxed text-[var(--short)]" role="alert">
+          <p className="text-[11px] leading-relaxed text-[var(--short-ink)]" role="alert">
             {error}
           </p>
         )}
@@ -174,7 +174,7 @@ function MemberBackstopRow({
           type="button"
           onClick={repair}
           disabled={pending}
-          className="rounded border border-[var(--short)] px-1.5 py-px text-[10px] text-[var(--short)] transition-colors hover:bg-[var(--short)] hover:text-[var(--bg)] disabled:opacity-50"
+          className="rounded border border-[var(--short)] px-1.5 py-px text-[10px] text-[var(--short-ink)] transition-colors hover:bg-[var(--short)] hover:text-[var(--bg)] disabled:opacity-50"
         >
           {pending ? "补挂中…" : "立即补挂"}
         </button>

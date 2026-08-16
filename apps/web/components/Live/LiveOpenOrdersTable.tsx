@@ -41,7 +41,7 @@ export default function LiveOpenOrdersTable({
   }
   if (isError) {
     return (
-      <div className="py-8 text-center text-xs text-[var(--short)]">
+      <div className="py-8 text-center text-xs text-[var(--short-ink)]">
         加载委托失败：{(error as Error)?.message || "请稍后重试"}
       </div>
     );

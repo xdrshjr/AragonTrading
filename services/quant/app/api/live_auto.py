@@ -27,6 +27,7 @@ from ..live_auto.manager import (
 )
 from ..paper.strategy_factory import build_paper_strategy_spec
 from ..schemas import LiveAutoGroupStartIn, LiveAutoStartIn, run_out
+from .ws_guard import guard_ws_origin
 
 router = APIRouter(tags=["live-auto"])
 
@@ -171,6 +172,8 @@ async def live_auto_group_status(settings: Settings = Depends(get_settings)) -> 
 @router.websocket("/ws/live-auto/{session_id}")
 async def ws_live_auto(websocket: WebSocket, session_id: str) -> None:
     """事件协议与 /ws/paper/{id} 同构：连接即原子 subscribe→status→snapshot（防丢事件）。"""
+    if not await guard_ws_origin(websocket):   # 必须在 accept() 之前：不合规连接一帧都不许收到
+        return
     await websocket.accept()
     session = get_live_auto_manager().get(session_id)
     if session is None:

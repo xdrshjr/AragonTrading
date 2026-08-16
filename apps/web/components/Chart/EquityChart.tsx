@@ -193,7 +193,7 @@ export default function EquityChart({
 
       {error && (
         <div className="absolute inset-0 flex items-center justify-center bg-[var(--bg)]/80 backdrop-blur-sm">
-          <div className="rounded-[12px] border border-[var(--short)] bg-[var(--surface)] px-5 py-4 text-center text-xs text-[var(--short)] shadow-soft">
+          <div className="rounded-[12px] border border-[var(--short)] bg-[var(--surface)] px-5 py-4 text-center text-xs text-[var(--short-ink)] shadow-soft">
             {error}
           </div>
         </div>

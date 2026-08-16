@@ -102,7 +102,7 @@ export default function WeightBatchCompare({
                           e.stopPropagation();
                           onView(row.runId);
                         }}
-                        className="text-[var(--muted)] underline hover:text-[var(--accent)]"
+                        className="text-[var(--muted)] underline hover:text-[var(--accent-ink)]"
                       >
                         查看/回测
                       </button>
@@ -116,7 +116,7 @@ export default function WeightBatchCompare({
                         className={clsx(
                           "underline",
                           scored
-                            ? "text-[var(--muted)] hover:text-[var(--accent)]"
+                            ? "text-[var(--muted)] hover:text-[var(--accent-ink)]"
                             : "cursor-not-allowed text-[var(--border)]",
                         )}
                       >
@@ -133,7 +133,7 @@ export default function WeightBatchCompare({
                           className={clsx(
                             "underline",
                             scored
-                              ? "text-[var(--muted)] hover:text-[var(--long)]"
+                              ? "text-[var(--muted)] hover:text-[var(--long-ink)]"
                               : "cursor-not-allowed text-[var(--border)]",
                           )}
                         >

@@ -408,7 +408,7 @@ export default function DiscoveryLauncher({
         )}
 
         {error && (
-          <p role="alert" className="text-xs text-[var(--short)]">
+          <p role="alert" className="text-xs text-[var(--short-ink)]">
             {error}
           </p>
         )}

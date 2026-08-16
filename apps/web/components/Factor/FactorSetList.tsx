@@ -59,7 +59,7 @@ export default function FactorSetList() {
   if (sets.isError) {
     return (
       <div className="flex flex-col items-center gap-2 py-8">
-        <p className="text-[11px] text-[var(--short)]">加载因子组合失败：{(sets.error as Error)?.message}</p>
+        <p className="text-[11px] text-[var(--short-ink)]">加载因子组合失败：{(sets.error as Error)?.message}</p>
         <Button variant="default" size="sm" onClick={() => sets.refetch()}>重试</Button>
       </div>
     );
@@ -103,7 +103,7 @@ export default function FactorSetList() {
           </div>
         )}
         {remove.isError && (
-          <p className="mt-2 text-[11px] text-[var(--short)]">
+          <p className="mt-2 text-[11px] text-[var(--short-ink)]">
             操作失败：{(remove.error as Error)?.message}
           </p>
         )}

@@ -31,7 +31,7 @@ export default function MarketDepthPanel({ market, activeCandle }: MarketDepthPa
         <div className="truncate text-[var(--muted)]">
           {market.connected ? updated : "disconnected"}
         </div>
-        {market.error && <div className="mt-1 text-[var(--short)]">{market.error}</div>}
+        {market.error && <div className="mt-1 text-[var(--short-ink)]">{market.error}</div>}
       </div>
 
       <div className="grid grid-cols-2 gap-1 border-b border-[var(--border)] pb-2 tabular">
@@ -55,7 +55,7 @@ export default function MarketDepthPanel({ market, activeCandle }: MarketDepthPa
                 key={trade.tradeId ?? `${trade.ts}-${trade.price}`}
                 className="grid grid-cols-[32px_1fr] gap-1"
               >
-                <span className={trade.side === "buy" ? "text-[var(--long)]" : "text-[var(--short)]"}>
+                <span className={trade.side === "buy" ? "text-[var(--long-ink)]" : "text-[var(--short-ink)]"}>
                   {trade.side === "buy" ? "B" : "S"}
                 </span>
                 <span className="truncate text-right text-[var(--text)]">

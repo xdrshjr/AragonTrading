@@ -97,7 +97,7 @@ export default function NavRail() {
               "group relative flex h-11 items-center justify-center rounded-[12px]",
               "transition-all duration-150 ease-smooth",
               active
-                ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                 : "text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]",
             )}
           >

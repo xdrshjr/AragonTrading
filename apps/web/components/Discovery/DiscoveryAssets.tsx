@@ -89,7 +89,7 @@ export default function DiscoveryAssets() {
           <button
             type="button"
             onClick={() => setQuery(DEFAULT_QUERY)}
-            className="mt-2 text-xs text-[var(--accent)] underline"
+            className="mt-2 text-xs text-[var(--accent-ink)] underline"
           >
             清空筛选
           </button>
@@ -115,7 +115,7 @@ export default function DiscoveryAssets() {
         <button
           type="button"
           onClick={() => goSection("runs")}
-          className="mt-2 text-xs text-[var(--accent)] underline"
+          className="mt-2 text-xs text-[var(--accent-ink)] underline"
         >
           去新建一个挖掘任务
         </button>
@@ -135,7 +135,7 @@ export default function DiscoveryAssets() {
           href={discoveryAssetApi.exportUrl(
             checked.length ? { ids: checked.join(",") } : query,
           )}
-          className="text-xs text-[var(--accent)] underline"
+          className="text-xs text-[var(--accent-ink)] underline"
         >
           导出{checked.length ? `选中 ${checked.length} 条` : "当前筛选"}
         </a>
@@ -159,7 +159,7 @@ export default function DiscoveryAssets() {
       />
 
       {error && (
-        <p role="alert" className="text-xs text-[var(--short)]">
+        <p role="alert" className="text-xs text-[var(--short-ink)]">
           {error}
         </p>
       )}

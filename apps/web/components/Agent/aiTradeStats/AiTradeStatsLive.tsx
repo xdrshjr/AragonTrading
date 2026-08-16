@@ -171,7 +171,7 @@ export default function AiTradeStatsLive() {
         {group.state === "paused" && (
           <p
             data-testid="ai-trade-stats-paused-hint"
-            className="rounded-md border border-[var(--accent)] bg-[var(--accent-soft)] px-2.5 py-1.5 text-[10px] leading-relaxed text-[var(--accent)]"
+            className="rounded-md border border-[var(--accent)] bg-[var(--accent-soft)] px-2.5 py-1.5 text-[10px] leading-relaxed text-[var(--accent-ink)]"
           >
             已暂停：决策轮与开仓已停止，故下面的轮数 / 漏斗 / 反思计数不再增长；
             持仓浮盈、保护性平仓与交易所侧兜底核实仍在运行，往返明细也会照常追加。

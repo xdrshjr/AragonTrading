@@ -16,6 +16,7 @@ from ..okx.types import (
 )
 from ..okx.ws_client import MarketWSHandlers, OKXMarketWSClient
 from ..okx.ws_supervisor import StreamEvent
+from .ws_guard import guard_ws_origin
 
 router = APIRouter(tags=["ws"])
 
@@ -24,6 +25,10 @@ INST_ID_RE = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+(?:-[A-Z0-9]+)?$")
 
 @router.websocket("/ws/market")
 async def ws_market(websocket: WebSocket) -> None:
+    # 来源守卫**不产生任何帧**，因此不与「本路由 idle 时必须绝对静默」那条约束冲突
+    # （resilience-and-hci-hardening 硬约束 2：加保活会把客户端 45s 停摆看门狗致盲）。
+    if not await guard_ws_origin(websocket):   # 必须在 accept() 之前：不合规连接一帧都不许收到
+        return
     await websocket.accept()
     inst_id = websocket.query_params.get("instId", "BTC-USDT-SWAP")
     bar = websocket.query_params.get("bar", "1H")

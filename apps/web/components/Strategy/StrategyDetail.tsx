@@ -31,7 +31,7 @@ function FactorStrategyBanner({ strategy }: { strategy: Strategy }) {
   return (
     <div className="flex flex-col gap-2 rounded-[10px] border border-[var(--accent-soft)] bg-[var(--accent-soft)]/40 px-3 py-2.5">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-[11px] font-semibold text-[var(--accent)]">因子组合得分策略</span>
+        <span className="text-[11px] font-semibold text-[var(--accent-ink)]">因子组合得分策略</span>
         <Button
           variant="ghost"
           size="sm"
@@ -52,7 +52,7 @@ function FactorStrategyBanner({ strategy }: { strategy: Strategy }) {
       <p className="text-[11px] text-[var(--muted)]">
         参数由因子实验室的因子组合管理，请在因子实验室编辑；此处临时改参仅用于即时回测，下次组合更新会以快照覆盖。
       </p>
-      <p className="text-[11px] text-[var(--accent)]">
+      <p className="text-[11px] text-[var(--accent-ink)]">
         至少需约 {minBars} 根数据才会产出信号（区间过短将安静空仓，请确保回测/对比区间足够长）。
       </p>
       {hasRange && provenance && (
@@ -173,7 +173,7 @@ export default function StrategyDetail({
       <p className="text-xs leading-relaxed text-[var(--muted)]">{strategy.description}</p>
 
       {htfBar && (
-        <span className="inline-flex w-fit items-center gap-1 rounded-[6px] bg-[var(--accent-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--accent)]">
+        <span className="inline-flex w-fit items-center gap-1 rounded-[6px] bg-[var(--accent-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--accent-ink)]">
           参考周期：{htfBar}
         </span>
       )}
@@ -249,7 +249,7 @@ export default function StrategyDetail({
                   className={
                     "rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-all " +
                     (source === item
-                      ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                      ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                       : "text-[var(--muted)] hover:text-[var(--text)]")
                   }
                 >
@@ -270,7 +270,7 @@ export default function StrategyDetail({
                     className={
                       "rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-all " +
                       (speed === item
-                        ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                        ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                         : "text-[var(--muted)] hover:text-[var(--text)]")
                     }
                   >

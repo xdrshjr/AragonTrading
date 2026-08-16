@@ -43,7 +43,7 @@ export default function DiscoveryGateLadder({
             <span
               aria-hidden
               className={`w-4 shrink-0 text-center ${
-                gate.passed ? "text-[var(--long)]" : "text-[var(--short)]"
+                gate.passed ? "text-[var(--long-ink)]" : "text-[var(--short-ink)]"
               }`}
             >
               {gate.passed ? "✓" : "✕"}
@@ -58,7 +58,7 @@ export default function DiscoveryGateLadder({
               <span title="门槛">{fmtNumber(gate.gate, 4)}</span>
             </span>
             {blocked && (
-              <span className="shrink-0 text-[var(--short)]">卡在这条</span>
+              <span className="shrink-0 text-[var(--short-ink)]">卡在这条</span>
             )}
           </li>
         );

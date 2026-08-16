@@ -54,7 +54,7 @@ export default function WeightBatchList({ onOpen }: { onOpen: (batchId: number) 
   if (batches.isError) {
     return (
       <div className="flex flex-col items-center gap-2 py-8">
-        <p className="text-[11px] text-[var(--short)]">加载训练批次失败：{(batches.error as Error)?.message}</p>
+        <p className="text-[11px] text-[var(--short-ink)]">加载训练批次失败：{(batches.error as Error)?.message}</p>
         <Button variant="default" size="sm" onClick={() => batches.refetch()}>重试</Button>
       </div>
     );
@@ -75,7 +75,7 @@ export default function WeightBatchList({ onOpen }: { onOpen: (batchId: number) 
   return (
     <div className="flex flex-col gap-3">
       {deleteNotice && (
-        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short)]">
+        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short-ink)]">
           删除失败：{deleteNotice}
         </p>
       )}

@@ -35,7 +35,7 @@ export default function DeleteStrategyConfirm({
         </h2>
         <p className="text-xs leading-relaxed text-[var(--muted)]">{body}</p>
         {error && (
-          <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+          <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short-ink)]">
             删除失败：{error}
           </div>
         )}

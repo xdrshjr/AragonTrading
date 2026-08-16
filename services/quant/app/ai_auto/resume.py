@@ -276,7 +276,11 @@ async def _adopt_group(group: AiTradeGroup, assessment: _Assessment) -> None:
         session._known_cl_ord_ids = [str(c) for c in (contract.get("knownClOrdIds") or [])]
         continuity = await rebuild_continuity(member.run_id, net_mode=net_mode)
         executor = session.executor
-        executor.trades = continuity["trades"]
+        # D5：走 `restore_trades` 而不是直接赋值——它同时**就地派生**两个计数器并施加同一份封顶。
+        # 计数器刻意**不落库**：本模块 `rebuild_continuity` 的不变式原文是「派生量绝不落库：落两份
+        # 必然漂移，而这里漂移的是真实资金的盈亏显示」，而 `trades` 本就是从 DB 全量 `Trade` 行重建的
+        # （无裁剪），所以恢复后的计数器与暂停前**逐位相同**，零新增持久化键、零老库兼容分支。
+        executor.restore_trades(continuity["trades"])
         executor.realized_pnl_usd = continuity["realizedPnlUsd"]
         executor.entry_fee_usd = continuity["entryFeeUsd"]
         session._position_seq = continuity["positionSeq"]

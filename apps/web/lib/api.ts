@@ -22,6 +22,7 @@ import type {
   WalkForwardResult,
 } from "./types";
 import type { OkxConnectivity } from "./okxLinkTypes";
+import { isTimeoutError, timeoutFor, timeoutMessage, withTimeout } from "./httpTimeout";
 
 const BASE = "/api/py";
 
@@ -41,6 +42,22 @@ export class ApiRequestError extends Error {
     this.status = status;
     this.members = members;
   }
+}
+
+/**
+ * 把 `fetch` 抛出的超时错误翻译成统一错误体（spec D3）。非超时错误**原样返回**，绝不吞。
+ *
+ * 住在 `api.ts` 而不是 `httpTimeout.ts`：`ApiRequestError` 由本文件定义，反过来引用会造成
+ * `api.ts ⇄ httpTimeout.ts` 的模块环，而 `httpTimeout.ts` 的定位正是「纯函数、无依赖」。
+ *
+ * @param err `fetch` 抛出的原始错误。
+ * @param ms 本次请求施加的超时毫秒数（用于文案）。
+ * @param path `/api/py` 之后的路径（决定「失败」还是「结果未知」的口径）。
+ * @returns 超时 → `ApiRequestError("TIMEOUT", …, 0)`；否则原样返回入参。
+ */
+export function toApiError(err: unknown, ms: number, path: string): unknown {
+  if (!isTimeoutError(err)) return err;
+  return new ApiRequestError("TIMEOUT", timeoutMessage(path, ms), 0);
 }
 
 function formatValidationDetail(detail: unknown): string | null {
@@ -64,11 +81,19 @@ async function rawRequest<T>(
   path: string,
   init?: RequestInit,
 ): Promise<{ data: T; res: Response }> {
-  const res = await fetch(`${BASE}${path}`, {
-    ...init,
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
-    cache: "no-store",
-  });
+  // D3：超时决策集中在 lib/httpTimeout.ts，接线留在原地——浏览器 fetch 无默认超时，
+  // 「后端活着但不回」时按钮会静默冻结最长 5 分钟（standalone）或永远（dev）。
+  const timeoutMs = timeoutFor(path);
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, withTimeout({
+      ...init,
+      headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
+      cache: "no-store",
+    }, timeoutMs));
+  } catch (err) {
+    throw toApiError(err, timeoutMs, path);   // 非超时错误原样上抛，绝不吞
+  }
   if (!res.ok) {
     let code = String(res.status);
     let message = res.statusText;

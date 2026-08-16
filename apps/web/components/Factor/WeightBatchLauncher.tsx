@@ -157,7 +157,7 @@ export default function WeightBatchLauncher({
       </div>
 
       {launch.isError && (
-        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short)]">
+        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short-ink)]">
           启动失败（{codeLabel((launch.error as ApiRequestError)?.code)}）：{(launch.error as Error)?.message}
         </p>
       )}

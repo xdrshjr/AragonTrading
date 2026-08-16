@@ -102,7 +102,7 @@ export default function AiBacktestModal({ jobId, onClose }: { jobId: string; onC
         />
 
         {error && (
-          <p role="alert" className="rounded-md border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short)]">
+          <p role="alert" className="rounded-md border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short-ink)]">
             回测失败（{error.code}）：{error.message}
           </p>
         )}
@@ -149,7 +149,7 @@ function ProgressHead({
         <span className="flex items-center gap-2">
           <span className="font-medium text-[var(--text)]">{phase}</span>
           <span>{barLabel}</span>
-          {running && !connected && <span className="text-[var(--accent)]">· 重连中…</span>}
+          {running && !connected && <span className="text-[var(--accent-ink)]">· 重连中…</span>}
         </span>
         <span className="tabular">{pct}%</span>
       </div>
@@ -167,7 +167,7 @@ function ProgressHead({
               权益 <span className="tabular font-medium text-[var(--text)]">{fmtMoney(progress.equity)}</span>
             </span>
             <span
-              className={progress.sessionPnlUsd >= 0 ? "text-[var(--long)]" : "text-[var(--short)]"}
+              className={progress.sessionPnlUsd >= 0 ? "text-[var(--long-ink)]" : "text-[var(--short-ink)]"}
             >
               {progress.sessionPnlUsd >= 0 ? "+" : ""}
               {fmtMoney(progress.sessionPnlUsd)}

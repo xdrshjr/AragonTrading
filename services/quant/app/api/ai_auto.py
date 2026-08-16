@@ -70,6 +70,7 @@ from ..schemas import (
     AiTradeTradabilityOut,
     trade_out,
 )
+from .ws_guard import guard_ws_origin
 
 router = APIRouter(tags=["ai-trade"])
 
@@ -657,6 +658,8 @@ async def ai_trade_prior_get(instId: str, bar: str,
 @router.websocket("/ws/ai-trade/{session_id}")
 async def ws_ai_trade(websocket: WebSocket, session_id: str) -> None:
     """事件协议与 /ws/live-auto/{id} 同信封；连接即原子 subscribe→status→snapshot（防丢事件）。"""
+    if not await guard_ws_origin(websocket):   # 必须在 accept() 之前：不合规连接一帧都不许收到
+        return
     await websocket.accept()
     session = get_ai_trade_manager().get(session_id)
     if session is None:
@@ -747,6 +750,8 @@ async def ai_backtest_get(job_id: str) -> dict:
 @router.websocket("/ws/ai-backtest/{job_id}")
 async def ws_ai_backtest(websocket: WebSocket, job_id: str) -> None:
     """回测事件流（同信封 {type,data}，镜像 weight-train）：连接即原子 subscribe→snapshot 回放→续订新事件。"""
+    if not await guard_ws_origin(websocket):   # 必须在 accept() 之前：不合规连接一帧都不许收到
+        return
     await websocket.accept()
     job = get_ai_backtest_manager().get(job_id)
     if job is None:

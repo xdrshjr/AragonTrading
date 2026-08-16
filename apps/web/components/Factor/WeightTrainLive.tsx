@@ -218,7 +218,7 @@ export default function WeightTrainLive({
       <ProgressBar status={status} phase={phase?.phase ?? null} pct={pct} />
 
       {streamingLike && !connected && (
-        <p aria-live="polite" className="rounded-[10px] border border-[var(--accent)]/40 bg-[var(--accent-soft)]/40 px-3 py-2 text-[11px] font-medium text-[var(--accent)]">
+        <p aria-live="polite" className="rounded-[10px] border border-[var(--accent)]/40 bg-[var(--accent-soft)]/40 px-3 py-2 text-[11px] font-medium text-[var(--accent-ink)]">
           连接中断，正在重连…（训练在后端继续，恢复后自动续显）
         </p>
       )}
@@ -230,7 +230,7 @@ export default function WeightTrainLive({
 
       {error && (
         // G-F5：role=alert 让读屏在失败 / 断连时即时播报；G-F6：错误码经 codeLabel 友好呈现，原始码作 title。
-        <p role="alert" title={error.code} className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short)]">
+        <p role="alert" title={error.code} className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short-ink)]">
           训练{status === "failed" ? "失败" : "异常"}（{codeLabel(error.code)}）：{error.message}
         </p>
       )}

@@ -210,7 +210,7 @@ export default function WeightBatchArena({
       </div>
 
       {!connected && derivedStatus === "running" && (
-        <p aria-live="polite" className="rounded-[10px] border border-[var(--accent)]/40 bg-[var(--accent-soft)]/40 px-3 py-2 text-[11px] font-medium text-[var(--accent)]">
+        <p aria-live="polite" className="rounded-[10px] border border-[var(--accent)]/40 bg-[var(--accent-soft)]/40 px-3 py-2 text-[11px] font-medium text-[var(--accent-ink)]">
           连接中断，正在重连…（训练在后端继续，恢复后自动续显）
         </p>
       )}
@@ -242,11 +242,11 @@ export default function WeightBatchArena({
         </div>
       )}
       {settled && succeededCount === 0 && (
-        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short)]">
+        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short-ink)]">
           没有任何候选成功训练，无法择优；请检查成员 / 区间后重新发起。
         </p>
       )}
-      {notice && <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--accent)]">{notice}</p>}
+      {notice && <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--accent-ink)]">{notice}</p>}
 
       {/* 排行榜（按样本外 IC）+ 叠加曲线。 */}
       {states.length > 0 && (

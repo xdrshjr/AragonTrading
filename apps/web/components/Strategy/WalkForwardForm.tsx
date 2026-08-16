@@ -99,7 +99,7 @@ function PresetRow({
             className={
               "flex-1 rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-all " +
               (value === preset
-                ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                 : "text-[var(--muted)] hover:text-[var(--text)]")
             }
           >

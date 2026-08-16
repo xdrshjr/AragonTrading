@@ -128,7 +128,7 @@ function PerformanceSection({ combo }: { combo: Strategy }) {
         <p className="text-[11px] text-[var(--muted)]">回测区间未就绪：请先在左侧图表选择起止时间。</p>
       )}
       {backtest.isError && (
-        <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+        <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short-ink)]">
           回测失败：{(backtest.error as Error)?.message}
         </div>
       )}
@@ -136,7 +136,7 @@ function PerformanceSection({ combo }: { combo: Strategy }) {
         <div className="flex flex-col gap-3">
           {comboResult && (
             <div className="rounded-[10px] border border-[var(--accent)] bg-[var(--accent-soft)] px-3 py-2">
-              <div className="text-[11px] text-[var(--accent)]">期望年化收益</div>
+              <div className="text-[11px] text-[var(--accent-ink)]">期望年化收益</div>
               <div
                 className="tabular text-xl font-bold"
                 style={{ color: colorForReturn(comboResult.annualizedReturn) }}

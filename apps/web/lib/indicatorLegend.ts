@@ -10,7 +10,14 @@ export interface LegendItem {
   compactLabel: string;
   tone: "overlay" | "pane";
   priority: number;
-  color?: string;
+  /**
+   * 图例前面那颗**色点的填充色**（不是文字色），所以取的是面色而非墨色。
+   *
+   * 字段名不叫 `color`：`components/ui/contrastTokens.source.test.ts` 有一条门禁——任何内联
+   * `color:` 都不得取面色（面色是为 K 线蜡烛设计的，作正文字号在浅色主题下不达 WCAG AA）。
+   * 叫 `color` 就得给那条门禁开一个例外，而「被约定的例外」正是这类缺陷复发的入口。
+   */
+  swatchColor?: string;
 }
 
 export interface BuildIndicatorLegendItemsInput {
@@ -60,7 +67,7 @@ function buildLegendItem(
     compactLabel: def.key.toUpperCase(),
     tone,
     priority: priorityFor(def, tone),
-    color: tone === "overlay" ? "var(--accent)" : "var(--muted)",
+    swatchColor: tone === "overlay" ? "var(--accent)" : "var(--muted)",
   };
 }
 

@@ -85,7 +85,7 @@ export default function QuantitySlider({
       </div>
 
       {error && (
-        <span className="text-[11px] text-[var(--short)]">{error}</span>
+        <span className="text-[11px] text-[var(--short-ink)]">{error}</span>
       )}
 
       <div className="grid grid-cols-4 gap-1">

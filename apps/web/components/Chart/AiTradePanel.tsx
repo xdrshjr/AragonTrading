@@ -97,8 +97,8 @@ export default function AiTradePanel({
           <span
             className={
               aggregatePnl >= 0
-                ? "tabular text-xs font-medium text-[var(--long)]"
-                : "tabular text-xs font-medium text-[var(--short)]"
+                ? "tabular text-xs font-medium text-[var(--long-ink)]"
+                : "tabular text-xs font-medium text-[var(--short-ink)]"
             }
           >
             {aggregatePnl >= 0 ? "+" : ""}
@@ -229,7 +229,7 @@ function PausedBanner({
       className="flex flex-col gap-1 rounded border border-[var(--accent)] bg-[var(--accent-soft)] px-2 py-1.5"
       data-testid="ai-trade-paused-banner"
     >
-      <span className="text-[10px] font-medium leading-relaxed text-[var(--accent)]">
+      <span className="text-[10px] font-medium leading-relaxed text-[var(--accent-ink)]">
         已暂停：不再开新仓；盯市、保护性平仓、会话止盈止损与交易所侧兜底核实照常运行。
         {pausedTs ? ` 已暂停 ${formatPausedFor(pausedTs, nowTs)}。` : ""}
         {reason ? ` （${reason}）` : ""}
@@ -268,7 +268,7 @@ function TradabilityStrip({ members }: { members: AiTradeGroupMemberState[] }) {
       {rows.map((row) => (
         <p
           key={row.instId}
-          className="rounded border border-[var(--short)] px-2 py-1 text-[10px] leading-relaxed text-[var(--short)]"
+          className="rounded border border-[var(--short)] px-2 py-1 text-[10px] leading-relaxed text-[var(--short-ink)]"
         >
           <strong>{members.length > 1 ? `${row.instId} · ` : ""}当前周期几乎开不出单</strong>
           ：{row.view?.headline}
@@ -292,7 +292,7 @@ function SummaryStalledStrip({ members }: { members: AiTradeGroupMemberState[] }
   if (!health) return null;
   return (
     <p
-      className="rounded border border-[var(--accent)] px-2 py-1 text-[10px] leading-relaxed text-[var(--accent)]"
+      className="rounded border border-[var(--accent)] px-2 py-1 text-[10px] leading-relaxed text-[var(--accent-ink)]"
       data-testid="ai-summary-stalled-badge"
       title={health.lastError ?? undefined}
     >
@@ -343,7 +343,7 @@ function DisciplineStrip({ group }: { group: AiTradeGroupState }) {
           )}
           <span className="tabular text-[10px] text-[var(--muted)]">{summary.label}</span>
           {summary.warnings > 0 && (
-            <span className="text-[10px] text-[var(--accent)]">{summary.warnings} 项需注意</span>
+            <span className="text-[10px] text-[var(--accent-ink)]">{summary.warnings} 项需注意</span>
           )}
         </span>
         <span className="shrink-0 text-[10px] text-[var(--muted)]">{open ? "收起" : "展开"}</span>
@@ -361,7 +361,7 @@ function DisciplineStrip({ group }: { group: AiTradeGroupState }) {
 
       {digest?.hint && (
         <p
-          className="rounded border border-[var(--short)] px-2 py-1 text-[10px] leading-relaxed text-[var(--short)]"
+          className="rounded border border-[var(--short)] px-2 py-1 text-[10px] leading-relaxed text-[var(--short-ink)]"
           data-testid="ai-discipline-strip-hint"
         >
           {digest.hint}
@@ -434,7 +434,7 @@ function NakedBackstopAlert({
       className="flex flex-col gap-1 rounded border border-[var(--short)] bg-[var(--surface-2)] px-2 py-1"
       data-testid="ai-discipline-naked-alert"
     >
-      <span className="text-[10px] font-medium leading-relaxed text-[var(--short)]">
+      <span className="text-[10px] font-medium leading-relaxed text-[var(--short-ink)]">
         {showInstId ? `${instId} · ` : ""}
         {note ?? "当前持仓在交易所侧没有兜底止损"}
       </span>
@@ -443,7 +443,7 @@ function NakedBackstopAlert({
           type="button"
           onClick={repair}
           disabled={pending}
-          className="rounded border border-[var(--short)] px-1.5 py-px text-[10px] text-[var(--short)] transition-colors hover:bg-[var(--short)] hover:text-[var(--bg)] disabled:opacity-50"
+          className="rounded border border-[var(--short)] px-1.5 py-px text-[10px] text-[var(--short-ink)] transition-colors hover:bg-[var(--short)] hover:text-[var(--bg)] disabled:opacity-50"
         >
           {pending ? "补挂中…" : "立即补挂"}
         </button>
@@ -508,7 +508,7 @@ function MemberRow({
           预算 {fmtNum(session?.budgetUsd ?? 0)} USDT · {session?.leverage ?? 0}× · {member.allocationPct}%
         </span>
         {resting && (
-          <span className="tabular truncate text-[10px] text-[var(--accent)]">
+          <span className="tabular truncate text-[10px] text-[var(--accent-ink)]">
             当前挂单 {fmtPrice(resting.px)} · {fmtNum(resting.sz, 0)} 张 · 剩余 {resting.expiresInS}s
           </span>
         )}
@@ -553,7 +553,7 @@ function HorizonChip({ member }: { member: AiTradeGroupMemberState }) {
     <span
       className={
         wire?.released
-          ? "truncate text-[10px] text-[var(--short)]"
+          ? "truncate text-[10px] text-[var(--short-ink)]"
           : "truncate text-[10px] text-[var(--muted)]"
       }
       data-testid="ai-trade-horizon-chip"
@@ -620,7 +620,7 @@ function ProfitGuardRow({ guard }: { guard: ProfitGuardSnapshot | null }) {
   if (!guard || !view) return null;
   if (guard.status === "unavailable") {
     return (
-      <span className="truncate text-[10px] text-[var(--short)]" data-testid="ai-profit-guard">
+      <span className="truncate text-[10px] text-[var(--short-ink)]" data-testid="ai-profit-guard">
         {view.label}（{describeProfitGuardFallback(guard)}）
       </span>
     );
@@ -661,7 +661,7 @@ function ProfitGuardCooldownChip({ member }: { member: AiTradeGroupMemberState }
   const text = describeProfitGuardCooldown(member.profitGuardCooldown);
   if (!text) return null;
   return (
-    <span className="truncate text-[10px] text-[var(--accent)]" data-testid="ai-profit-cooldown">
+    <span className="truncate text-[10px] text-[var(--accent-ink)]" data-testid="ai-profit-cooldown">
       {text}
     </span>
   );

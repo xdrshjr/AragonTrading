@@ -38,7 +38,7 @@ export default function FactorCatalog() {
     <div className="flex flex-col gap-5 pb-6">
       <Header total={lib.data?.length ?? 0} />
       {notice && (
-        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--accent)]">
+        <p role="status" aria-live="polite" className="text-[11px] font-medium text-[var(--accent-ink)]">
           {notice}
         </p>
       )}

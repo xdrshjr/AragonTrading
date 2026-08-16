@@ -21,8 +21,12 @@ export const ACCEPTANCE_VERDICT_META: Record<
   AiTradeAcceptanceVerdict,
   { label: string; icon: string; color: string }
 > = {
-  pass: { label: "已通过", icon: "✓", color: "var(--success, var(--long))" },
-  fail: { label: "未通过", icon: "⛔", color: "var(--danger, var(--short))" },
+  // 这两行是**正文字号的文字色**（`HorizonAcceptanceCard` 的 `style={{ color: meta.color }}`），
+  // 故用墨色而不是面色。原写法是「先取 --success / --danger、取不到再回退到面色」的两级 var，
+  // 而这两个 token 在 globals.css 里**从未定义**——那层间接跳转从第一天起就是死的，真正渲染出来的
+  // 一直是兜底的面色（浅色 3.74 / 4.13，不达 AA）。去掉死跳转，同时迁到墨色。
+  pass: { label: "已通过", icon: "✓", color: "var(--long-ink)" },
+  fail: { label: "未通过", icon: "⛔", color: "var(--short-ink)" },
   insufficient: { label: "样本不足", icon: "…", color: "var(--muted)" },
 };
 
@@ -40,16 +44,22 @@ export const EXIT_SOURCE_LABELS: Record<string, string> = {
   unknown: "未记录来源",
 };
 
-// 堆叠比例条的配色：全部取自既有 `--chart-*` 设计 token，不新增任何一个。
+// 堆叠比例条的配色（**背景填充**，不是文字，故用面色而非墨色）。
+//
+// 原写法是 `var(--chart-N, var(--accent))` 这样的两级 var，注释还写着「全部取自既有 `--chart-*`
+// 设计 token」——但 `--chart-1..8` 在 globals.css 里**一个都没有定义**，所以那层间接跳转从第一天
+// 起就是死的，实际渲染出来的一直是兜底值。这与本轮 D2 消灭的 `var(--on-accent,#fff)` 是同一个
+// 形状：引用一个不存在的 token，靠兜底把话说圆。去掉死跳转后**渲染逐像素不变**，
+// 只是这份配色表现在说的是实话。（真要引入 `--chart-*` 调色板是独立一轮的事。）
 const EXIT_SOURCE_COLORS: Record<string, string> = {
-  agent: "var(--chart-1, var(--accent))",
-  agentReverse: "var(--chart-2, var(--accent))",
-  profitGuard: "var(--chart-3, var(--long))",
-  exchangeOco: "var(--chart-4, var(--short))",
-  timeExit: "var(--chart-5, var(--muted))",
-  sessionStop: "var(--chart-6, var(--muted))",
-  windowEnd: "var(--chart-7, var(--muted))",
-  external: "var(--chart-8, var(--muted))",
+  agent: "var(--accent)",
+  agentReverse: "var(--accent)",
+  profitGuard: "var(--long)",
+  exchangeOco: "var(--short)",
+  timeExit: "var(--muted)",
+  sessionStop: "var(--muted)",
+  windowEnd: "var(--muted)",
+  external: "var(--muted)",
   unknown: "var(--border)",
 };
 

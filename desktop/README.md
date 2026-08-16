@@ -151,10 +151,16 @@ npm run icons -- --candidate logo-07-signal-gate
 
 ## 五、端口同步点（务必同步！）
 
-固定端口 **18760（后端）/ 18761（前端）**。改动须同步以下**五处**（前四处见 `scripts/dev.py` 注释，本目录为第 5 处）：
+固定端口 **18760（后端）/ 18761（前端）**。改动须同步以下**六处**（前四处见 `scripts/dev.py` 注释，本目录为第 5 处）：
 
 1. `apps/web/package.json` 的 `dev` 脚本（`next dev -p 18761`）
 2. `apps/web/next.config.mjs` 的 `PY_BACKEND_URL` 默认值
 3. `apps/web/lib/ws.ts` 的 `NEXT_PUBLIC_PY_WS_URL` 默认值
 4. `docker-compose.yml` 与两个 Dockerfile
 5. **`desktop/src/lib/config.js`** 的 `BACKEND_PORT` / `WEB_PORT`（本桌面外壳）
+6. **`services/quant/app/security/origins.py`** 的 `DEFAULT_ORIGINS`（信任边界的 Origin 白名单）
+
+> 第 6 处的失败形态与前五处不同，值得单独记一句：漏改它不会「连不上后端」，而是**每一个请求
+> 都回 403 `ORIGIN_NOT_ALLOWED`**——前端起得来、页面渲染得出来，但点什么都没反应。
+> 运行期的补救入口是 `userData/agent.env` 里的 `SECURITY_ALLOWED_ORIGINS`
+> （经 `src/lib/config.js` 的 `SECURITY_` 前缀白名单透传给打包后端）。

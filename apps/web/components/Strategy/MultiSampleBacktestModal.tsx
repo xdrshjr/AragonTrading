@@ -162,7 +162,7 @@ export default function MultiSampleBacktestModal({
             <span className="text-[11px] text-[var(--muted)]">
               已选 {count} 个标的
               {overLimit && (
-                <span className="ml-1 text-[var(--short)]">最多 {MULTI_SAMPLE_MAX_SYMBOLS} 个</span>
+                <span className="ml-1 text-[var(--short-ink)]">最多 {MULTI_SAMPLE_MAX_SYMBOLS} 个</span>
               )}
             </span>
             <div className="flex gap-2">

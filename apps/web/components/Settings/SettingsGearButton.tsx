@@ -23,7 +23,7 @@ export default function SettingsGearButton() {
         "no-drag inline-flex h-8 w-8 items-center justify-center rounded-[10px]",
         "transition-all duration-150 ease-smooth",
         showSettings
-          ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+          ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
           : "text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]",
       )}
     >

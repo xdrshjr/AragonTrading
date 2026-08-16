@@ -95,7 +95,7 @@ export default function WeightBacktestPanel({
         <p
           role="alert"
           title={(query.error as ApiRequestError)?.code ?? undefined}
-          className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short)]"
+          className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short-ink)]"
         >
           回测失败：{codeLabel((query.error as ApiRequestError)?.code)}
         </p>

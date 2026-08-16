@@ -41,6 +41,7 @@ from ..schemas import (
     provider_out,
     tool_out,
 )
+from .ws_guard import guard_ws_origin
 
 router = APIRouter(tags=["agent"])
 
@@ -208,6 +209,8 @@ async def bulk_tools(body: AgentToolBulkUpdate,
 
 @router.websocket("/ws/agent/{conversation_id}")
 async def ws_agent(websocket: WebSocket, conversation_id: str) -> None:
+    if not await guard_ws_origin(websocket):   # 必须在 accept() 之前：不合规连接一帧都不许收到
+        return
     await websocket.accept()
     manager = get_agent_manager()
     await _send(websocket, "ready",

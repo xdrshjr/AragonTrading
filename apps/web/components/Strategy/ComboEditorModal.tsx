@@ -201,7 +201,7 @@ export default function ComboEditorModal({
         <PolicyEditor schema={policySchema} policy={policy} onChange={setPolicyValue} />
 
         {preview.isError && (
-          <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+          <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short-ink)]">
             回测失败：{(preview.error as Error)?.message}
           </div>
         )}
@@ -213,7 +213,7 @@ export default function ComboEditorModal({
         <div className="flex min-h-[1.25rem] items-center gap-2 text-[11px]">
           {memberError && <span className="text-[var(--muted)]">{memberError}</span>}
           {!memberError && nameError && <span className="text-[var(--muted)]">请填写组合名称</span>}
-          {saveError && <span className="text-[var(--short)]">保存失败：{saveError}</span>}
+          {saveError && <span className="text-[var(--short-ink)]">保存失败：{saveError}</span>}
         </div>
         <div className="flex items-center gap-2">
           <Button

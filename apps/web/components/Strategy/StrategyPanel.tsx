@@ -579,12 +579,12 @@ export default function StrategyPanel() {
                     )}
                     {runningSessions.length > 0 && <PaperRunningList sessions={runningSessions} />}
                     {backtest.isError && (
-                      <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+                      <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short-ink)]">
                         回测失败：{(backtest.error as Error)?.message}
                       </div>
                     )}
                     {(paperStart.isError || stopError) && (
-                      <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+                      <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short-ink)]">
                         <div>
                           操作失败：
                           {stopError || (paperStart.error as Error)?.message}
@@ -643,7 +643,7 @@ export default function StrategyPanel() {
                     )}
                     {runningSessions.length > 0 && <PaperRunningList sessions={runningSessions} />}
                     {(backtest.isError || paperStart.isError || stopError) && (
-                      <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+                      <div className="mt-2 rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short-ink)]">
                         <div>
                           操作失败：
                           {stopError ||

@@ -94,7 +94,7 @@ export default function TradeCandleChartPanel({
       <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 px-0.5 text-[10px] text-[var(--muted)]">
         <span
           className="tabular font-medium"
-          style={{ color: direction === "long" ? "var(--long)" : "var(--short)" }}
+          style={{ color: direction === "long" ? "var(--long-ink)" : "var(--short-ink)" }}
         >
           {direction === "long" ? "开多" : "开空"}
         </span>

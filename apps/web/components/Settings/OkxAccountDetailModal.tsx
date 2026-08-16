@@ -69,7 +69,7 @@ function DetailSkeleton() {
 
 function ErrorState({ message, onRetry }: { message?: string; onRetry: () => void }) {
   return (
-    <div className="flex items-center justify-between gap-3 rounded-[10px] border border-[var(--border)] p-4 text-sm text-[var(--short)]">
+    <div className="flex items-center justify-between gap-3 rounded-[10px] border border-[var(--border)] p-4 text-sm text-[var(--short-ink)]">
       <span>加载详情失败：{message || "OKX 不可达或鉴权失败"}</span>
       <Button variant="ghost" size="sm" onClick={onRetry}>
         重试

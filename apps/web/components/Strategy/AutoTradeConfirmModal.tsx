@@ -155,13 +155,13 @@ export default function AutoTradeConfirmModal({
             className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--accent)]"
           />
           <span>
-            我已知晓这是<strong className="text-[var(--short)]">真实资金自动交易</strong>
+            我已知晓这是<strong className="text-[var(--short-ink)]">真实资金自动交易</strong>
             ，将按所选策略自动下单 / 平仓，盈亏由本人承担。
           </span>
         </label>
 
         {(inputError || error) && (
-          <p role="alert" className="text-[11px] font-medium text-[var(--short)]">
+          <p role="alert" className="text-[11px] font-medium text-[var(--short-ink)]">
             {inputError || error}
           </p>
         )}

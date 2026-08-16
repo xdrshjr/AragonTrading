@@ -255,7 +255,7 @@ function ProfileCard({
           {checked ? "● " : "○ "}
           {profile.title}
         </span>
-        {recommended && <span className="text-[9px] text-[var(--accent)]">推荐</span>}
+        {recommended && <span className="text-[9px] text-[var(--accent-ink)]">推荐</span>}
       </span>
       <span className="text-[10px] text-[var(--muted)]">
         {profile.targetLabel ? `目标持仓 ${profile.targetLabel}` : profile.description}
@@ -464,7 +464,7 @@ function BackstopRepairField({
               data-testid={`ai-trade-backstop-repair-${option.id}`}
               className={`px-2 py-0.5 text-[11px] ${
                 active === option.id
-                  ? "bg-[var(--accent)] text-[var(--on-accent,#fff)]"
+                  ? "bg-[var(--accent)] text-[var(--on-accent)]"
                   : "text-[var(--muted)]"
               }`}
             >
@@ -480,7 +480,7 @@ function BackstopRepairField({
       </p>
       {armed ? (
         <p
-          className="text-[10px] leading-relaxed text-[var(--accent)]"
+          className="text-[10px] leading-relaxed text-[var(--accent-ink)]"
           data-testid="ai-trade-backstop-repair-consent"
         >
           本会话将允许系统在你不在场时向交易所发出止损委托。
@@ -591,7 +591,7 @@ function CoherenceHints({
         type="button"
         disabled={disabled}
         onClick={onAlign}
-        className="self-start text-[10px] font-medium text-[var(--accent)] hover:underline disabled:opacity-50"
+        className="self-start text-[10px] font-medium text-[var(--accent-ink)] hover:underline disabled:opacity-50"
       >
         按模式对齐（重置时间级别与唤醒周期）
       </button>

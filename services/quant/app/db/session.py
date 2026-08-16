@@ -44,6 +44,27 @@ def get_engine():
 
 
 def _configure_sqlite(dbapi_connection, _connection_record) -> None:
+    """每条新连接的 PRAGMA。SQLite 的 PRAGMA 是**连接级**的，故必须挂在 connect 事件上。
+
+    ⚠️ **这里刻意没有 `PRAGMA foreign_keys=ON`**，而它本轮曾经加上又被整批回退
+    （trust-boundary-and-signal-integrity D7 / R9 出口阀）。理由必须留在这里，否则下一个人会
+    「顺手补上」并在生产上踩同一个坑：
+
+    `strategy_runs.strategy_id` 是指向 `strategies.id` 的非空外键，而删策略的两条真实路径
+    （`repositories.delete_strategy` 与 `factors/service.delete_set` 连带删伴生 `factor_score`）
+    **都不清理子表**，靠的正是「外键没开」这件事——`delete_set` 的 docstring 甚至明写着
+    「本机 SQLite 未开外键……不因 `strategy_runs` 外键失败；已发起的 run 自包含、不受影响
+    （历史经 `strategy_id` 仍可查阅）」。这是一个**有意的产品决定**：删策略保留其交易历史
+    （`list_runs` 不 join `strategies`，孤儿 run 照常展示）。
+
+    于是打开外键只有两条出路，两条都超出本轮范围：
+      · 连带删 run ⇒ **销毁真实资金的交易历史**，是一次产品语义变更，不能顺手做；
+      · 把 `strategy_id` 改成可空 + `ondelete="SET NULL"` ⇒ 需要 DB 迁移，而本轮明确「零 DB 迁移」。
+
+    实测证据：打开后全量 pytest 出现 8 条红（`test_discovery_promote_strategy`，根因是
+    `DELETE FROM strategies WHERE builtin = 0` 撞上仍在引用它们的 `strategy_runs`）。
+    完整记录见 spec 的「实施过程发现的方案缺陷 · I-14」与 §十第 13 条。
+    """
     cursor = dbapi_connection.cursor()
     try:
         cursor.execute("PRAGMA busy_timeout=5000")

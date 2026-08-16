@@ -51,7 +51,7 @@ export default function ExploreRunningPanel({
   return (
     <div className="flex flex-col gap-3">
       {!connected && (
-        <p aria-live="polite" className="rounded-[10px] border border-[var(--accent)]/40 bg-[var(--accent-soft)]/40 px-3 py-2 text-[11px] font-medium text-[var(--accent)]">
+        <p aria-live="polite" className="rounded-[10px] border border-[var(--accent)]/40 bg-[var(--accent-soft)]/40 px-3 py-2 text-[11px] font-medium text-[var(--accent-ink)]">
           连接中断，正在重连…（训练在后端继续，恢复后自动续显）
         </p>
       )}

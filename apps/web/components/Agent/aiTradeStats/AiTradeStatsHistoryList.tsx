@@ -33,7 +33,7 @@ export default function AiTradeStatsHistoryList({ onSelect }: { onSelect: (group
 
   if (query.isError) {
     return (
-      <p role="alert" className="rounded-md border border-[var(--short)] bg-[var(--surface-2)] px-3 py-6 text-center text-xs text-[var(--short)]">
+      <p role="alert" className="rounded-md border border-[var(--short)] bg-[var(--surface-2)] px-3 py-6 text-center text-xs text-[var(--short-ink)]">
         加载历史失败，请稍后重试。
       </p>
     );

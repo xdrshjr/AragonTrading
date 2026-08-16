@@ -214,14 +214,14 @@ export default function ClosePositionModal({
             className="text-right tabular"
           />
           {ordType === "limit" && !szValidation.valid && szValidation.error && (
-            <span className="text-[11px] text-[var(--short)]">{szValidation.error}</span>
+            <span className="text-[11px] text-[var(--short-ink)]">{szValidation.error}</span>
           )}
           {ordType === "limit" && (
             <button
               type="button"
               disabled={controlsDisabled}
               onClick={() => meta && setSzInput(String(defaultCloseSize(absPos, meta.lotSz)))}
-              className="self-end text-[11px] text-[var(--accent)] disabled:opacity-40"
+              className="self-end text-[11px] text-[var(--accent-ink)] disabled:opacity-40"
             >
               全仓 {fmtNum(absPos, 0)} 张
             </button>
@@ -257,18 +257,18 @@ export default function ClosePositionModal({
             className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--accent)]"
           />
           <span>
-            我已知晓这是<strong className="text-[var(--short)]">真实资金平仓</strong>
+            我已知晓这是<strong className="text-[var(--short-ink)]">真实资金平仓</strong>
             ，将立即提交至 OKX 实盘账户，盈亏由本人承担。
           </span>
         </label>
 
         {error && (
-          <p role="alert" className="text-[11px] font-medium text-[var(--short)]">
+          <p role="alert" className="text-[11px] font-medium text-[var(--short-ink)]">
             {error}
           </p>
         )}
         {okMsg && (
-          <p role="status" className="text-[11px] font-medium text-[var(--long)]">
+          <p role="status" className="text-[11px] font-medium text-[var(--long-ink)]">
             {okMsg}
           </p>
         )}

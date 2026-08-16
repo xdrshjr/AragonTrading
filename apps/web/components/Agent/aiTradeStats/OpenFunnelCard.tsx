@@ -99,7 +99,7 @@ export default function OpenFunnelCard({
 
           {!isFunnelClosed(funnel) && (
             <p
-              className="text-[10px] leading-relaxed text-[var(--short)]"
+              className="text-[10px] leading-relaxed text-[var(--short-ink)]"
               data-testid="ai-open-funnel-broken"
             >
               ⚠ 漏斗数据不闭合（各层拦截数之和超过了开仓意愿数），请把这条现象反馈给开发者

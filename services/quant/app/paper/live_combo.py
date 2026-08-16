@@ -1,6 +1,8 @@
 """Runtime adapter for saved combo strategies in paper sessions."""
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 
 from ..config import get_settings
@@ -8,6 +10,23 @@ from ..engine.backtester import run_backtest
 from ..engine.combo import ComboMember, ComboPolicy
 from ..engine.simulator import BrokerContext, RiskParams
 from ..strategies.base import BaseStrategy, Signal, StrategyMeta
+
+logger = logging.getLogger("aragon.paper.combo")
+
+# 打分失败里**可以吞掉**的那一类：数据不足 / 列缺失 / 越界 / 除零，以及 pandas 自己抛的那几个
+# 计算类异常。其余（AttributeError、TypeError、ImportError……）说明这个策略类根本跑不起来，
+# 原样上抛——为「理论上不会发生」的分支写防御性 try 只是噪音（CLAUDE.md §五）。
+#
+# ⚠️ 这里**不能**写 `pd.errors.PandasError`：pandas 2.2 早已没有这个名字（实测
+# `AttributeError: module 'pandas.errors' has no attribute 'PandasError'`，且它会在 import 期就炸掉
+# 整条 `paper.strategy_factory → ai_auto.manager` 链）。pandas 现存的异常类没有统一基类，
+# 但计算路径上真正会抛的那几个（`IndexingError` / `InvalidIndexError` / `DataError` /
+# `SpecificationError`）已在下面显式列出，其余绝大多数本就是 ValueError / KeyError 的子类。
+_SCORING_FAILURES = (
+    ValueError, KeyError, IndexError, ZeroDivisionError,
+    pd.errors.IndexingError, pd.errors.InvalidIndexError,
+    pd.errors.DataError, pd.errors.SpecificationError,
+)
 
 
 class LiveComboStrategy(BaseStrategy):
@@ -36,6 +55,9 @@ class LiveComboStrategy(BaseStrategy):
         self.policy_spec = policy_spec
         self.members_spec = members_spec
         self.active_key: str | None = None
+        # memberKey -> 本会话打分失败次数（D6）。有名有姓地记下来，「静默」才变成「可诊断」：
+        # 光有 backend.log 还不够，`_choose_member` 需要一个**可判定**的「本根全员都失败了」信号。
+        self.scoring_failures: dict[str, int] = {}
         self.last_rebalance_i = -1
         self.bars_held = 0
         self._frames: dict[str, pd.DataFrame] = {}
@@ -116,13 +138,26 @@ class LiveComboStrategy(BaseStrategy):
             if self.bars_held < self.policy.min_dwell_bars:
                 return self.active_key
 
+        failures_before = self._scoring_failures_total()
         scores = {member.key: self._score_member(member, df, i) for member in eligible}
+        all_failed = self._scoring_failures_total() - failures_before >= len(eligible)
         challenger = max(eligible, key=lambda member: scores.get(member.key, 0.0))
         if self.active_key is None or self.active_key not in scores:
+            # 本根**全员**打分失败时，`scores` 全是 0.0，`max` 按 Python 稳定语义返回 `eligible[0]`
+            # ——于是「谁都算不出来」被当成「大家表现持平」，资金被平静地钉在成员列表的第一条上，
+            # 而 UI 上不留一点痕迹。有在任者就保住在任者：这条路径覆盖 `active_key not in scores`
+            # （在任者被 regime gating 判为不合格）那一支，它此前会真的切走。
+            # `active_key is None`（首次选择）没有在任者可保，只能落到第一个。
+            if all_failed and self.active_key is not None:
+                return self.active_key
             return challenger.key
         incumbent = scores.get(self.active_key, 0.0)
         threshold = incumbent + abs(incumbent) * self.policy.switch_margin
         return challenger.key if scores.get(challenger.key, 0.0) > threshold else self.active_key
+
+    def _scoring_failures_total(self) -> int:
+        """本会话累计打分失败次数（`_choose_member` 用前后差判「本根全员失败」）。"""
+        return sum(self.scoring_failures.values())
 
     def _eligible_members(self, df: pd.DataFrame, i: int) -> list[ComboMember]:
         if not self.policy.regime_gating:
@@ -154,7 +189,14 @@ class LiveComboStrategy(BaseStrategy):
                 leverage=settings.default_leverage,
                 htf_frames=self._member_htf_records(member, int(window.iloc[-1]["ts"])),
             )
-        except Exception:  # noqa: BLE001 - scoring failures make the member neutral.
+        except _SCORING_FAILURES as exc:
+            # 收窄捕获 + 出声（trust-boundary-and-signal-integrity D6）。原来是裸 `except Exception:
+            # return 0.0`，无日志、无计数：它把「这个成员这根 K 线算不出来」和「这个策略类根本跑不
+            # 起来」合并成同一个结果，而 `0.0` 又恰好是一个**合法分数**——于是「全员失败」与「全员
+            # 表现持平」在下游不可区分。对一个宣称「按近端表现自动轮动」的功能来说，这是最坏的一种
+            # 失败：它看起来在工作。其余异常一律原样上抛（CLAUDE.md §五）。
+            self.scoring_failures[member.key] = self.scoring_failures.get(member.key, 0) + 1
+            logger.warning("combo member %s scoring failed at bar %d: %s", member.key, i, exc)
             return 0.0
         metrics = result.metrics
         if self.policy.selection_metric == "return":

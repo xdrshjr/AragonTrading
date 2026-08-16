@@ -150,7 +150,7 @@ export default function DiscoveryLab({ active }: { active: boolean }) {
                 className={clsx(
                   "rounded-[10px] px-2.5 py-2 text-left transition-colors duration-150 ease-smooth",
                   isActive
-                    ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                    ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                     : "text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]",
                 )}
               >
@@ -168,7 +168,7 @@ export default function DiscoveryLab({ active }: { active: boolean }) {
           {error && (
             <div
               role="alert"
-              className="mb-3 rounded-[10px] border border-[var(--short)] bg-[color-mix(in_srgb,var(--short)_10%,transparent)] px-3 py-2 text-xs text-[var(--short)]"
+              className="mb-3 rounded-[10px] border border-[var(--short)] bg-[color-mix(in_srgb,var(--short)_10%,transparent)] px-3 py-2 text-xs text-[var(--short-ink)]"
             >
               {error}
               <button type="button" onClick={() => void refresh()} className="ml-2 underline">

@@ -206,7 +206,7 @@ export default function AutoTradeGroupConfirmModal({
               <span className="flex items-center gap-1.5 truncate text-[var(--text)]">
                 {m.instId}
                 {!isAutoTradable(m.instId) && (
-                  <span className="text-[10px] text-[var(--short)]">不支持</span>
+                  <span className="text-[10px] text-[var(--short-ink)]">不支持</span>
                 )}
               </span>
               <span className="tabular text-[var(--muted)]">
@@ -278,13 +278,13 @@ export default function AutoTradeGroupConfirmModal({
             className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--accent)]"
           />
           <span>
-            我已知晓这是<strong className="text-[var(--short)]">真实资金多标的自动交易</strong>
+            我已知晓这是<strong className="text-[var(--short-ink)]">真实资金多标的自动交易</strong>
             ，将对上述全部标的按所选策略同时自动下单 / 平仓，盈亏由本人承担。
           </span>
         </label>
 
         {(inputError || error || hasUnsupported) && (
-          <p role="alert" className="text-[11px] font-medium text-[var(--short)]">
+          <p role="alert" className="text-[11px] font-medium text-[var(--short-ink)]">
             {inputError || error || "含不支持自动交易的标的，请先移出（仅 USDT 本位永续 / 交割合约）"}
           </p>
         )}
@@ -338,7 +338,7 @@ function Field({
         onChange={(e) => onChange(e.target.value)}
         className="rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] disabled:opacity-50"
       />
-      {hint && <span className="leading-relaxed text-[var(--short)]">{hint}</span>}
+      {hint && <span className="leading-relaxed text-[var(--short-ink)]">{hint}</span>}
     </label>
   );
 }

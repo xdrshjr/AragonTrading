@@ -115,7 +115,7 @@ function FilterChips<T extends string>({
           className={clsx(
             "rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors",
             value === o.key
-              ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+              ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
               : "bg-[var(--surface-2)] text-[var(--muted)] hover:text-[var(--text)]",
           )}
         >
@@ -212,7 +212,7 @@ export default function InstrumentSidebar({
 
         {isError && (
           <div className="flex flex-col items-start gap-2 p-3">
-            <p className="text-[11px] font-medium text-[var(--short)]">
+            <p className="text-[11px] font-medium text-[var(--short-ink)]">
               无法连接 OKX，请检查网络 / 代理。
             </p>
             {errorMsg instanceof Error && (

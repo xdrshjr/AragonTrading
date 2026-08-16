@@ -119,7 +119,7 @@ export default function WeightModelEditor({
             invalid={!!nameError}
             className="py-1.5 text-xs"
           />
-          {nameError && <span className="text-[11px] text-[var(--short)]">{nameError}</span>}
+          {nameError && <span className="text-[11px] text-[var(--short-ink)]">{nameError}</span>}
         </label>
         <label className="flex flex-col gap-1">
           <span className="text-[11px] text-[var(--muted)]">训练方法</span>
@@ -149,12 +149,12 @@ export default function WeightModelEditor({
         <Button variant="primary" disabled={!!memberError || !!nameError || save.isPending} onClick={() => save.mutate()}>
           {save.isPending ? "保存中..." : editingId == null ? "创建模型" : "保存修改"}
         </Button>
-        {memberError && <span className="text-[11px] text-[var(--short)]">{memberError}</span>}
+        {memberError && <span className="text-[11px] text-[var(--short-ink)]">{memberError}</span>}
       </div>
       <p className="text-[11px] text-[var(--muted)]">
         模型保存后会出现在列表中；点列表上的「训练」即可在实时视图里训练并查看 loss/IC 曲线。
       </p>
-      {notice && <p className="text-[11px] font-medium text-[var(--accent)]">{notice}</p>}
+      {notice && <p className="text-[11px] font-medium text-[var(--accent-ink)]">{notice}</p>}
     </div>
   );
 }

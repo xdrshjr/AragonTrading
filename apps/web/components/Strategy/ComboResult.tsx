@@ -22,7 +22,7 @@ export default function ComboResult({
   return (
     <div className="flex flex-col gap-3">
       <div className="rounded-[10px] border border-[var(--accent)] bg-[var(--accent-soft)] px-3 py-2">
-        <div className="text-[11px] text-[var(--accent)]">期望年化收益</div>
+        <div className="text-[11px] text-[var(--accent-ink)]">期望年化收益</div>
         <div
           className="tabular text-xl font-bold"
           style={{ color: colorForReturn(combo.annualizedReturn) }}
@@ -52,7 +52,7 @@ export default function ComboResult({
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={onGoCompare}
-            className="rounded-[6px] px-2 py-0.5 text-[11px] text-[var(--accent)] hover:bg-[var(--accent-soft)]"
+            className="rounded-[6px] px-2 py-0.5 text-[11px] text-[var(--accent-ink)] hover:bg-[var(--accent-soft)]"
           >
             在对比中查看已保存组合 →
           </button>

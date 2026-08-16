@@ -84,7 +84,7 @@ export default function WeightModelList({
         <p className="py-8 text-center text-[11px] text-[var(--muted)]">加载权重模型...</p>
       ) : models.isError ? (
         <div className="flex flex-col items-center gap-2 py-8">
-          <p className="text-[11px] text-[var(--short)]">加载权重模型失败：{(models.error as Error)?.message}</p>
+          <p className="text-[11px] text-[var(--short-ink)]">加载权重模型失败：{(models.error as Error)?.message}</p>
           <Button variant="default" size="sm" onClick={() => models.refetch()}>重试</Button>
         </div>
       ) : items.length === 0 ? (
@@ -112,7 +112,7 @@ export default function WeightModelList({
         </div>
       )}
       {tab === "models" && remove.isError && (
-        <p className="text-[11px] text-[var(--short)]">删除失败：{(remove.error as Error)?.message}</p>
+        <p className="text-[11px] text-[var(--short-ink)]">删除失败：{(remove.error as Error)?.message}</p>
       )}
 
       <ConfirmDialog

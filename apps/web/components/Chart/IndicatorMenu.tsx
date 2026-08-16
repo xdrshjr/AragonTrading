@@ -68,7 +68,7 @@ export default function IndicatorMenu() {
         <span aria-hidden>📊</span>
         <span>指标</span>
         {enabledCount > 0 && (
-          <span className="ml-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--accent)] px-1 text-[10px] font-semibold text-white tabular">
+          <span className="ml-0.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-[var(--accent)] px-1 text-[10px] font-semibold text-[var(--on-accent)] tabular">
             {enabledCount}
           </span>
         )}
@@ -142,7 +142,7 @@ export default function IndicatorMenu() {
           <div className="flex items-center justify-between gap-2 border-t border-[var(--border)] px-2 py-1.5">
             <button
               onClick={resetIndicators}
-              className="rounded-[7px] px-2 py-1 text-[11px] font-medium text-[var(--accent)] hover:bg-[var(--accent-soft)]"
+              className="rounded-[7px] px-2 py-1 text-[11px] font-medium text-[var(--accent-ink)] hover:bg-[var(--accent-soft)]"
             >
               恢复默认
             </button>

@@ -84,7 +84,7 @@ export default function DiscoveryLibrary() {
         <button
           type="button"
           onClick={() => goSection("runs")}
-          className="mt-2 text-xs text-[var(--accent)] underline"
+          className="mt-2 text-xs text-[var(--accent-ink)] underline"
         >
           去挖掘任务列表选择
         </button>
@@ -120,7 +120,7 @@ export default function DiscoveryLibrary() {
                   <button
                     type="button"
                     onClick={() => jumpTo(entityOf(row.kind))}
-                    className="shrink-0 text-[10px] text-[var(--accent)] underline"
+                    className="shrink-0 text-[10px] text-[var(--accent-ink)] underline"
                   >
                     {entityOf(row.kind) === "strategy" ? "去策略面板" : "去因子实验室"}
                   </button>
@@ -177,7 +177,7 @@ export default function DiscoveryLibrary() {
       </div>
 
       {error && (
-        <p role="alert" className="text-xs text-[var(--short)]">
+        <p role="alert" className="text-xs text-[var(--short-ink)]">
           {error}
         </p>
       )}

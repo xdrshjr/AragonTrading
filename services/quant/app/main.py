@@ -50,6 +50,7 @@ from .okx.client_pool import get_client_pool
 from .okx.clock import get_server_clock
 from .okx.rest_client import OKXError, get_rest_client
 from .paper.manager import get_paper_manager
+from .security.origin_middleware import OriginGuardMiddleware
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("aragon")
@@ -363,10 +364,15 @@ async def _okx_link_sweeper() -> None:
 
 app = FastAPI(title="Aragon Trading Quant API", version="0.1.0", lifespan=lifespan)
 
-# 单机本地工具：开发期放开 CORS（前端走 Next 代理，浏览器直连 WS 也需放开）
+# 信任边界（trust-boundary-and-signal-integrity D1）：这套 CORS 配置写于「单机本地工具、前端走 Next
+# 同源代理」的年代，此后产品长出了「真实下单 + 明文私钥 + 24/7 无人值守」，配置却没跟着收。
+# `allow_origins=["*"]` + `allow-headers: content-type` 意味着**任意网页**的跨源 JSON POST
+# 到 `/api/trading/close-all` 是被配置明确批准的动作。
+_ALLOWED_ORIGINS = get_settings().allowed_origin_list()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -374,6 +380,11 @@ app.add_middleware(
     # 经 /api/py/* 同源代理的默认路径不依赖它（Next rewrite 默认透传上游响应头）。无害零成本，保留。
     expose_headers=["X-Aragon-Data-Source", "X-Aragon-Stale"],
 )
+# 必须装在 CORS **外层**：CORS 只在浏览器拿不到 ACAO 时**隐藏响应**，请求本身早已到达服务端并被
+# 执行——真正拦住「执行」的是这一层。ASGI 中间件后进先出（`applications.py:132` 的
+# `user_middleware.insert(0, ...)`），故这一行必须排在上面的 `add_middleware(CORSMiddleware, ...)`
+# **之后**，才会包在它外面。
+app.add_middleware(OriginGuardMiddleware, allowed=_ALLOWED_ORIGINS)
 
 
 @app.exception_handler(OKXError)

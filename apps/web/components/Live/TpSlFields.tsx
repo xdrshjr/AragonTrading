@@ -54,7 +54,7 @@ export default function TpSlFields({
 
           <div className="grid grid-cols-2 gap-2">
             <label className="flex flex-col gap-1">
-              <span className="text-[10px] text-[var(--long)]">止盈{unit}</span>
+              <span className="text-[10px] text-[var(--long-ink)]">止盈{unit}</span>
               <Input
                 type="number"
                 inputMode="decimal"
@@ -67,7 +67,7 @@ export default function TpSlFields({
               />
             </label>
             <label className="flex flex-col gap-1">
-              <span className="text-[10px] text-[var(--short)]">止损{unit}</span>
+              <span className="text-[10px] text-[var(--short-ink)]">止损{unit}</span>
               <Input
                 type="number"
                 inputMode="decimal"

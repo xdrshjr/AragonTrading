@@ -28,7 +28,7 @@ export default function WalkForwardResults({
   }
   if (error) {
     return (
-      <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short)]">
+      <div className="rounded-[8px] border border-[var(--short)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--short-ink)]">
         高级回测失败：{error}
       </div>
     );
@@ -145,7 +145,7 @@ export default function WalkForwardResults({
                 >
                   {fmtPct(w.metrics.totalReturn)}
                 </td>
-                <td className="py-1.5 pr-2 text-right tabular text-[var(--short)]">
+                <td className="py-1.5 pr-2 text-right tabular text-[var(--short-ink)]">
                   {fmtPct(w.metrics.maxDrawdown)}
                 </td>
                 <td className="py-1.5 text-right tabular text-[var(--muted)]">{w.tradeCount}</td>

@@ -66,7 +66,7 @@ export default function AiTradeStatsDetail({ groupId, onBack }: { groupId: strin
     return (
       <div className="flex flex-col gap-3">
         <BackButton onBack={onBack} />
-        <p role="alert" className="rounded-md border border-[var(--short)] bg-[var(--surface-2)] px-3 py-6 text-center text-xs text-[var(--short)]">
+        <p role="alert" className="rounded-md border border-[var(--short)] bg-[var(--surface-2)] px-3 py-6 text-center text-xs text-[var(--short-ink)]">
           加载会话详情失败，请稍后重试。
         </p>
       </div>
@@ -372,7 +372,7 @@ function AiStatsCard({
             type="button"
             aria-expanded={open}
             onClick={() => setOpen((v) => !v)}
-            className="text-[11px] font-medium text-[var(--accent)] hover:underline"
+            className="text-[11px] font-medium text-[var(--accent-ink)] hover:underline"
           >
             {open ? "▾ 收起会话总结" : "▸ 查看会话总结"}
           </button>

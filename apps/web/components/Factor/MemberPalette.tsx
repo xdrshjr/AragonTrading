@@ -226,7 +226,7 @@ function CandidateBody({
   if (source === "mine" && error) {
     return (
       <div className="flex flex-col items-center gap-2 rounded-[10px] border border-[var(--border)] py-6 text-center">
-        <p className="text-[11px] text-[var(--short)]">加载因子失败，请重试</p>
+        <p className="text-[11px] text-[var(--short-ink)]">加载因子失败，请重试</p>
         <Button variant="default" size="sm" onClick={onRetry}>
           重试
         </Button>
@@ -313,7 +313,7 @@ function CandidateChip({
       {selected && (
         <span
           aria-hidden
-          className="absolute right-1.5 top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-[var(--accent)] text-[10px] font-bold leading-none text-white"
+          className="absolute right-1.5 top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-[var(--accent)] text-[10px] font-bold leading-none text-[var(--on-accent)]"
         >
           ✓
         </span>
@@ -418,7 +418,7 @@ function SourceTabs({
           className={clsx(
             "rounded-[6px] px-2 py-0.5 text-[11px] font-medium transition-all",
             source === val
-              ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+              ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
               : "text-[var(--muted)] hover:text-[var(--text)]",
           )}
         >
@@ -450,7 +450,7 @@ function CategoryChips({
           className={clsx(
             "rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors",
             active === cat
-              ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+              ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
               : "bg-[var(--surface-2)] text-[var(--muted)] hover:text-[var(--text)]",
           )}
         >

@@ -599,7 +599,7 @@ export default function CandleChart({
       {error && (
         <div className="absolute inset-0 z-40 flex flex-col items-center justify-center gap-2 bg-[var(--bg)]/80 backdrop-blur-sm">
           <div className="rounded-[12px] border border-[var(--short)] bg-[var(--surface)] px-5 py-4 text-center shadow-soft">
-            <div className="text-sm font-semibold text-[var(--short)]">无法连接 OKX</div>
+            <div className="text-sm font-semibold text-[var(--short-ink)]">无法连接 OKX</div>
             <div className="mt-1 max-w-xs text-xs text-[var(--muted)]">{error}</div>
             <div className="mt-1 text-[11px] text-[var(--muted)]">请检查代理 / 网络后重试（不会以假数据冒充真实行情）。</div>
           </div>

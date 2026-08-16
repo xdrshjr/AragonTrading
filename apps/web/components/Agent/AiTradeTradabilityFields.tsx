@@ -273,7 +273,7 @@ function PickBarButton({
       disabled={disabled}
       onClick={() => onPickBar(better.bar)}
       data-testid="ai-tradability-pick-bar"
-      className="self-start text-[10px] font-medium text-[var(--accent)] hover:underline disabled:opacity-50"
+      className="self-start text-[10px] font-medium text-[var(--accent-ink)] hover:underline disabled:opacity-50"
     >
       改用 {better.bar}
       {rate ? `（预计否决约 ${rate}）` : ""}
@@ -296,7 +296,7 @@ function ConfirmRow({
 }) {
   return (
     <label
-      className="flex cursor-pointer items-start gap-2 text-[10px] leading-relaxed text-[var(--short)]"
+      className="flex cursor-pointer items-start gap-2 text-[10px] leading-relaxed text-[var(--short-ink)]"
       data-testid="ai-tradability-confirm"
     >
       <input

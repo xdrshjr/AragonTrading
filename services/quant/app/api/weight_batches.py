@@ -18,6 +18,7 @@ from ..factors import weight_explore_service as explore_service
 from ..factors.weight_batch_manager import get_weight_batch_manager
 from ..okx.rest_client import get_rest_client
 from ..schemas import WeightBatchSelectReq, WeightBatchStartReq, WeightExploreStartReq
+from .ws_guard import guard_ws_origin
 
 router = APIRouter(tags=["weight-batches"])
 
@@ -108,6 +109,8 @@ async def delete_weight_batch(batch_id: int,
 # ============================ 批次实时流（抄 ws_weight_train，R-06） ============================
 @router.websocket("/ws/weight-batch/{batch_id}")
 async def ws_weight_batch(websocket: WebSocket, batch_id: int) -> None:
+    if not await guard_ws_origin(websocket):   # 必须在 accept() 之前：不合规连接一帧都不许收到
+        return
     await websocket.accept()
     runtime = get_weight_batch_manager().get(batch_id)
     if runtime is None:

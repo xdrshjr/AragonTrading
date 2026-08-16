@@ -94,7 +94,7 @@ function RetryBreadcrumb({ trace }: { trace: AiTradeRoundTrace }) {
   return (
     <p
       className="flex items-center gap-1 text-[10px]"
-      style={{ color: active ? "var(--accent)" : "var(--muted)" }}
+      style={{ color: active ? "var(--accent-ink)" : "var(--muted)" }}
     >
       <span>{active ? "⚠" : "↻"}</span>
       <span>
@@ -472,7 +472,7 @@ function ProfitGuardBlock({ trace }: { trace: AiTradeRoundTrace }) {
         </p>
       )}
       {cooldown && (
-        <p className="text-[10px] leading-relaxed text-[var(--accent)]" data-testid="trace-profit-cooldown">
+        <p className="text-[10px] leading-relaxed text-[var(--accent-ink)]" data-testid="trace-profit-cooldown">
           {cooldown}
         </p>
       )}
@@ -541,7 +541,7 @@ function ReflectionBlock({ trace }: { trace: AiTradeRoundTrace }) {
 function ResultRow({ trace }: { trace: AiTradeRoundTrace }) {
   if (trace.errorMessage) {
     return (
-      <p className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1 text-[11px] text-[var(--short)]">
+      <p className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1 text-[11px] text-[var(--short-ink)]">
         ⚠️ {trace.errorMessage}
       </p>
     );
@@ -639,7 +639,7 @@ function WakeBacklogEvidence({
   ].filter(Boolean);
   const waited = backlog?.waitedS;
   return (
-    <div data-testid="wake-backlog" className="text-[var(--accent)]">
+    <div data-testid="wake-backlog" className="text-[var(--accent-ink)]">
       补跑 · 上一轮研判期间{parts.join("、")}
       {typeof waited === "number" ? `，最早的一次已等待 ${Math.round(waited)}s` : ""}
       {backlog?.chain ? `（补跑链第 ${backlog.chain} 轮）` : ""}
@@ -746,7 +746,7 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
             <span className="shrink-0">
               立场 {describeStance(s.stance)}
               {s.latestSignal !== "none" && (
-                <span className="text-[var(--accent)]"> · {describeAiAction(s.latestSignal)}</span>
+                <span className="text-[var(--accent-ink)]"> · {describeAiAction(s.latestSignal)}</span>
               )}
             </span>
           </div>
@@ -760,7 +760,7 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
 function SummaryNode({ summary }: { summary: string }) {
   return (
     <details className="rounded-[8px] border border-[var(--accent-soft)] bg-[var(--accent-soft)] px-2.5 py-1.5 text-[11px]">
-      <summary className="cursor-pointer select-none font-medium text-[var(--accent)]">
+      <summary className="cursor-pointer select-none font-medium text-[var(--accent-ink)]">
         🔄 上下文已刷新
       </summary>
       <p className="mt-1 whitespace-pre-wrap leading-relaxed text-[var(--text)]">{summary}</p>

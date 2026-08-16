@@ -100,7 +100,7 @@ export default function DiscoveryCandidates() {
         <button
           type="button"
           onClick={() => goSection("runs")}
-          className="mt-2 text-xs text-[var(--accent)] underline"
+          className="mt-2 text-xs text-[var(--accent-ink)] underline"
         >
           去挖掘任务列表选择
         </button>
@@ -122,7 +122,7 @@ export default function DiscoveryCandidates() {
               aria-pressed={kind === item}
               className={`rounded-full px-2.5 py-0.5 text-[11px] transition-colors ${
                 kind === item
-                  ? "bg-[var(--accent)] text-white"
+                  ? "bg-[var(--accent)] text-[var(--on-accent)]"
                   : "bg-[var(--surface-2)] text-[var(--muted)] hover:text-[var(--text)]"
               }`}
             >
@@ -179,7 +179,7 @@ export default function DiscoveryCandidates() {
         )}
         <span className="text-[11px] tabular text-[var(--muted)]">共 {total} 条</span>
         <div className="ml-auto flex items-center gap-2">
-          {bulkMessage && <span className="text-[11px] text-[var(--accent)]">{bulkMessage}</span>}
+          {bulkMessage && <span className="text-[11px] text-[var(--accent-ink)]">{bulkMessage}</span>}
           <Button
             variant="primary"
             size="sm"
@@ -193,7 +193,7 @@ export default function DiscoveryCandidates() {
       </div>
 
       {error && (
-        <p role="alert" className="text-xs text-[var(--short)]">
+        <p role="alert" className="text-xs text-[var(--short-ink)]">
           {error}
         </p>
       )}

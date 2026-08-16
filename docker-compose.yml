@@ -19,6 +19,11 @@ services:
       # 缓存回退默认关闭（不可达即显式报错）；如需演示缓存横幅可置 true
       - ALLOW_CACHED_FALLBACK=${ALLOW_CACHED_FALLBACK:-false}
       - DB_PATH=/data/aragon.db
+      # 信任边界（trust-boundary-and-signal-integrity D1）：后端按 Origin 白名单拒绝跨源请求。
+      # 默认白名单是 http://localhost:18761 / http://127.0.0.1:18761，只对**同机浏览器**成立；
+      # 远程部署时浏览器地址栏里的 host 不是 localhost，必须在这里显式给出，否则页面打得开但
+      # 每个请求都回 403（与上方 NEXT_PUBLIC_PY_WS_URL 那条注释是同一个「宿主可达地址」问题）。
+      - SECURITY_ALLOWED_ORIGINS=${SECURITY_ALLOWED_ORIGINS:-}
     volumes:
       - aragon-db:/data
     restart: unless-stopped

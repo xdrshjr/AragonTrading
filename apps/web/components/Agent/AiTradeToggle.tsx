@@ -300,7 +300,7 @@ export default function AiTradeToggle() {
       <span
         className={
           running || paused
-            ? "text-[11px] font-medium text-[var(--accent)]"
+            ? "text-[11px] font-medium text-[var(--accent-ink)]"
             : "text-[11px] text-[var(--muted)]"
         }
       >
@@ -353,7 +353,7 @@ export default function AiTradeToggle() {
         </>
       )}
       {paused && error && !resumeOpen && !endOpen && (
-        <span className="max-w-[220px] truncate text-[10px] text-[var(--short)]" role="alert">
+        <span className="max-w-[220px] truncate text-[10px] text-[var(--short-ink)]" role="alert">
           {error}
         </span>
       )}

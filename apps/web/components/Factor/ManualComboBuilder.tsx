@@ -127,7 +127,7 @@ function ComboRow({
         <span className="text-[11px] font-medium text-[var(--text)]">
           组合 {rowIndex + 1} · {row.length} 因子
         </span>
-        <button type="button" className="text-[11px] text-[var(--muted)] hover:text-[var(--short)]" onClick={onRemove}>
+        <button type="button" className="text-[11px] text-[var(--muted)] hover:text-[var(--short-ink)]" onClick={onRemove}>
           删除本行
         </button>
       </div>
@@ -144,7 +144,7 @@ function ComboRow({
               className={clsx(
                 "rounded-full px-2.5 py-0.5 text-[11px] font-medium transition-colors",
                 selected
-                  ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                  ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                   : "bg-[var(--surface-2)] text-[var(--muted)] hover:text-[var(--text)]",
               )}
             >

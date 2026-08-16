@@ -486,8 +486,10 @@ class LiveAutoSession:
         realized = self.executor.realized_pnl_usd
         metrics = {**_empty_metrics(),
                    "totalReturn": (realized / budget) if budget > 0 else 0.0,
-                   "tradeCount": len(self.executor.trades),
-                   "avgPnl": realized / max(1, len(self.executor.trades)),
+                   # D5：读显式计数器而不是列表长度——`executor.trades` 现在有内存护栏封顶，
+                   # 数长度会在超长会话上静默低报，而这两个数是要落库进 run metrics 的。
+                   "tradeCount": self.executor.trade_count,
+                   "avgPnl": realized / max(1, self.executor.trade_count),
                    "flattenFailed": self.flatten_failed,   # H4：平仓失败留痕
                    "degradedSeen": self._degraded_seen}     # H2/H3：会话期是否曾降级
         sm = get_sessionmaker()

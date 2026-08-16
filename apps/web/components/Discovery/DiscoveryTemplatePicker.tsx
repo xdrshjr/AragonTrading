@@ -36,7 +36,7 @@ export default function DiscoveryTemplatePicker({
         </span>
         <button
           type="button"
-          className="text-[var(--accent)] underline"
+          className="text-[var(--accent-ink)] underline"
           onClick={() => onChange([])}
         >
           全选

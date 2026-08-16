@@ -60,7 +60,7 @@ export default function DiscoveryRunList() {
       </div>
 
       {error && (
-        <p role="alert" className="text-xs text-[var(--short)]">
+        <p role="alert" className="text-xs text-[var(--short-ink)]">
           {error}
         </p>
       )}
@@ -131,7 +131,7 @@ export default function DiscoveryRunList() {
                   </div>
 
                   {row.errorMessage && (
-                    <p className="text-[11px] text-[var(--short)]">
+                    <p className="text-[11px] text-[var(--short-ink)]">
                       {row.errorCode}：{row.errorMessage}
                     </p>
                   )}

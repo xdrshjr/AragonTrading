@@ -34,7 +34,7 @@ export default function LiveFillsTable({
   }
   if (isError) {
     return (
-      <div className="py-8 text-center text-xs text-[var(--short)]">
+      <div className="py-8 text-center text-xs text-[var(--short-ink)]">
         加载成交失败：{(error as Error)?.message || "请稍后重试"}
       </div>
     );
@@ -169,7 +169,7 @@ function KindTag({ explain, automatic }: {
     <span
       className={clsx(
         "rounded px-1 py-px text-[9px]",
-        tone === "warn" && "bg-[var(--accent-soft)] text-[var(--accent)]",
+        tone === "warn" && "bg-[var(--accent-soft)] text-[var(--accent-ink)]",
         tone !== "warn" && "bg-[var(--surface-2)] text-[var(--muted)]",
       )}
     >

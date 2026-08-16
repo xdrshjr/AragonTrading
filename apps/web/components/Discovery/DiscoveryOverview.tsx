@@ -45,7 +45,7 @@ function AssetLedgerCard({ summary, onOpen }: {
       <div className="mb-2 flex items-center gap-2">
         <h4 className="text-xs font-medium text-[var(--text)]">成果资产</h4>
         <Badge tone="neutral">{summary.total}</Badge>
-        <button type="button" onClick={onOpen} className="ml-auto text-[11px] text-[var(--accent)] underline">
+        <button type="button" onClick={onOpen} className="ml-auto text-[11px] text-[var(--accent-ink)] underline">
           查看台账
         </button>
       </div>
@@ -62,12 +62,12 @@ function AssetLedgerCard({ summary, onOpen }: {
         近 7 天新增衰减 <b className="tabular text-[var(--text)]">{summary.newlyDecayedLast7d}</b> 条
       </p>
       {!guard.enabled && (
-        <p className="mt-1 text-[11px] text-[var(--short)]">
+        <p className="mt-1 text-[11px] text-[var(--short-ink)]">
           体检守护已关闭，健康状态不会更新。
         </p>
       )}
       {guard.enabled && stalled && (
-        <p className="mt-1 text-[11px] text-[var(--short)]">
+        <p className="mt-1 text-[11px] text-[var(--short-ink)]">
           守护似乎已停止：最近一次巡检在 {relativeTime(guard.lastTickTs)}。
         </p>
       )}

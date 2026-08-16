@@ -69,12 +69,12 @@ export default function AutoTradeStatusBar() {
   return (
     <div className="flex items-center justify-between gap-2 border-b border-[var(--border)] bg-[var(--short)]/8 px-4 py-2 text-[11px]">
       <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-0.5">
-        <span className="inline-flex items-center gap-1 font-semibold text-[var(--short)]">
+        <span className="inline-flex items-center gap-1 font-semibold text-[var(--short-ink)]">
           <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--short)]" />
           自动交易运行中
         </span>
         {degraded && (
-          <span className="rounded bg-[var(--accent)]/15 px-1.5 py-0.5 font-medium text-[var(--accent)]">
+          <span className="rounded bg-[var(--accent)]/15 px-1.5 py-0.5 font-medium text-[var(--accent-ink)]">
             连接异常
           </span>
         )}
@@ -86,7 +86,7 @@ export default function AutoTradeStatusBar() {
         <span
           className={clsx(
             "tabular font-medium",
-            pnl > 0 ? "text-[var(--long)]" : pnl < 0 ? "text-[var(--short)]" : "text-[var(--text)]",
+            pnl > 0 ? "text-[var(--long-ink)]" : pnl < 0 ? "text-[var(--short-ink)]" : "text-[var(--text)]",
           )}
         >
           盈亏 {pnl >= 0 ? "+" : ""}
@@ -135,7 +135,7 @@ function TerminalBanner({
           <span
             className={clsx(
               "tabular font-medium",
-              pnl > 0 ? "text-[var(--long)]" : pnl < 0 ? "text-[var(--short)]" : "text-[var(--text)]",
+              pnl > 0 ? "text-[var(--long-ink)]" : pnl < 0 ? "text-[var(--short-ink)]" : "text-[var(--text)]",
             )}
           >
             会话盈亏 {pnl >= 0 ? "+" : ""}
@@ -147,7 +147,7 @@ function TerminalBanner({
         </Button>
       </div>
       {flattenFailed && (
-        <span role="alert" className="font-medium text-[var(--short)]">
+        <span role="alert" className="font-medium text-[var(--short-ink)]">
           ⚠ 自动平仓失败，请到下方实盘面板手动平仓
         </span>
       )}

@@ -44,7 +44,7 @@ export default function ToolToggleCard({
             type="button"
             onClick={() => setOpen((v) => !v)}
             aria-expanded={open}
-            className="mt-0.5 inline-flex w-fit items-center gap-1 text-[11px] font-medium text-[var(--accent)] hover:underline"
+            className="mt-0.5 inline-flex w-fit items-center gap-1 text-[11px] font-medium text-[var(--accent-ink)] hover:underline"
           >
             <span>{open ? "▾" : "▸"}</span>
             查看参数

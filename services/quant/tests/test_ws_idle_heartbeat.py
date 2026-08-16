@@ -26,6 +26,7 @@ class _FakeWS:
 
     def __init__(self):
         self.sent: list = []
+        self.headers: dict = {}   # 无 Origin ⇒ 非浏览器客户端，来源守卫放行（app/api/ws_guard.py）
         self.closed = False
         self.query_params: dict = {}
 

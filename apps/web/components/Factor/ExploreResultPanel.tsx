@@ -64,7 +64,7 @@ export default function ExploreResultPanel({
           <span className="text-[11px] text-[var(--muted)]">样本外 IC <span className="tabular font-semibold text-[var(--text)]">{formatIc(candidateIcOut(best))}</span></span>
         </div>
       ) : (
-        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short)]">
+        <p role="alert" className="rounded-[10px] border border-[var(--short)]/40 bg-[var(--short)]/10 px-3 py-2 text-[11px] font-medium text-[var(--short-ink)]">
           没有任何候选成功训练，无法择优；请调整因子池 / 组合策略 / 区间后重新探索。
         </p>
       )}

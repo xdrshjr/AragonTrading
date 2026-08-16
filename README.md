@@ -159,9 +159,46 @@ pnpm dev
 复制根目录 `.env.example` 后按需填写：
 
 - 前端 `apps/web/.env.local`：`PY_BACKEND_URL`（默认 `http://localhost:18760`）、`NEXT_PUBLIC_PY_WS_URL`（默认 `ws://localhost:18760`）。
-- 后端 `services/quant/.env`：`HTTP_PROXY/HTTPS_PROXY`、`DB_PATH`、`DEFAULT_INST/BAR`、`INITIAL_CAPITAL`、`MAX_PAPER_SESSIONS`、`ALLOW_CACHED_FALLBACK` 等。
+- 后端 `services/quant/.env`：`HTTP_PROXY/HTTPS_PROXY`、`DB_PATH`、`DEFAULT_INST/BAR`、`INITIAL_CAPITAL`、`MAX_PAPER_SESSIONS`、`ALLOW_CACHED_FALLBACK`、`SECURITY_ALLOWED_ORIGINS` 等。
 
-> **安全**：本期仅用 OKX 公共行情，**不需要** API 密钥。切勿把任何真实密钥写入仓库；若密钥曾明文出现，请视为已泄露并轮换。`.env` 已被 `.gitignore` 排除。
+> **安全**：切勿把任何真实密钥写入仓库；若密钥曾明文出现，请视为已泄露并轮换。`.env` 已被 `.gitignore` 排除。
+> 另需知悉：实盘凭据（`api_key` / `secret_key` / `passphrase`）目前**以明文存在库内**，
+> 因此 `%APPDATA%/aragon-desktop/aragon.db` 这个文件本身等同于凭证，请按凭证的规格保管它。
+
+## 安全 · 本机 API 的信任边界
+
+后端只绑 `127.0.0.1`，所以局域网够不着它。但**回环绑定挡不住用户自己浏览器里的任意网页**：
+一个广告位或被投毒的第三方站点，可以直接对 `http://127.0.0.1:18760/api/trading/close-all`
+发跨源 POST。这里必须点破一个常见误解——**CORS 保护的是「读」，不是「执行」**：
+浏览器只在拿不到 `Access-Control-Allow-Origin` 时**隐藏响应**，请求本身早就到达服务端并执行完了。
+而 `/api/trading/*` 的 8 条路由用库内明文密钥向 OKX 下**真实委托**。
+
+因此后端有两层（都不是鉴权，是边界）：
+
+| 层 | 作用 | 不合规时 |
+|---|---|---|
+| `OriginGuardMiddleware`（纯 ASGI，装在 CORS 外层） | 拦住**执行**：跨源请求不进路由、不碰 DB、不碰 OKX | HTTP `403 ORIGIN_NOT_ALLOWED` |
+| 9 条 WS 路由的 `guard_ws_origin` | WebSocket **完全不过 CORS**，且响应可读——不守就等于把实盘会话交给任意网页 | `accept()` 之前即 `close(1008)`，一帧不发；因为握手还没完成，浏览器/客户端看到的是一次 **HTTP 403 握手拒绝**（连接从未建立） |
+
+判据只有两态，很干净：
+
+- **`Origin` 缺失 → 放行。** 浏览器的非 GET/HEAD `fetch`/XHR 与 WS 握手**必带** `Origin`，
+  所以「没有 `Origin`」可靠地等价于「不是浏览器」（`scripts/smoke_e2e.py`、
+  `desktop/scripts/verify-dist.mjs` 的 node http 走的就是这条）。
+- **`Origin: null` → 拒绝。** 它不是「本地文件」的同义词，而是**不透明源**：带 `sandbox`
+  且不含 `allow-same-origin` 的 iframe 发的就是它，而这样的 iframe 任意网页三行 HTML 就能造出来。
+  代价是**用 `file://` 打开的本地调试页调不通本机 API**——这是有意的取舍，本地调试请用 http 页面。
+
+**排障**：如果界面打得开但点什么都没反应、DevTools 里全是 403 `ORIGIN_NOT_ALLOWED`，
+说明你的前端入口不在白名单里（最常见的原因是改过前端端口）。白名单默认值是
+`http://localhost:18761` 与 `http://127.0.0.1:18761`，改法是设 `SECURITY_ALLOWED_ORIGINS`
+（逗号分隔，**完全替换**默认，不接受 `*` 与 `null`）：
+
+- dev：写进 `services/quant/.env`；
+- 打包桌面端：写进 `%APPDATA%/aragon-desktop/agent.env`（经 `SECURITY_` 前缀白名单透传给后端进程 —— 打包后端**不读任何 `.env`**）；
+- 容器：`docker-compose.yml` 的 `quant` 服务已透传同名变量（远程部署时那是唯一入口，因为浏览器地址栏里的 host 不再是 `localhost`）。
+
+改前端端口时，`desktop/README.md` §五「端口同步点」的第 6 处指的就是这份白名单。
 
 ## 测试
 

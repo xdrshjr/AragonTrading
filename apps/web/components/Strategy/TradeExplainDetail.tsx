@@ -49,9 +49,9 @@ function Header({ explain }: { explain: TriggerExplain }) {
       <span
         className={clsx(
           "rounded-full px-2 py-0.5 text-[10px] font-medium",
-          tone === "warn" && "bg-[var(--accent-soft)] text-[var(--accent)]",
-          tone === "long" && "bg-[color-mix(in_srgb,var(--long)_16%,transparent)] text-[var(--long)]",
-          tone === "short" && "bg-[color-mix(in_srgb,var(--short)_16%,transparent)] text-[var(--short)]",
+          tone === "warn" && "bg-[var(--accent-soft)] text-[var(--accent-ink)]",
+          tone === "long" && "bg-[color-mix(in_srgb,var(--long)_16%,transparent)] text-[var(--long-ink)]",
+          tone === "short" && "bg-[color-mix(in_srgb,var(--short)_16%,transparent)] text-[var(--short-ink)]",
           tone === "neutral" && "bg-[var(--surface-2)] text-[var(--muted)]",
         )}
       >
@@ -129,12 +129,12 @@ function RiskSnapshot({ explain }: { explain: TriggerExplain }) {
     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-[var(--border)] pt-2 text-[11px]">
       <span className="text-[10px] uppercase tracking-wide text-[var(--muted)]">风控快照</span>
       {sl != null && (
-        <span className="tabular" style={{ color: "var(--short)" }}>
+        <span className="tabular" style={{ color: "var(--short-ink)" }}>
           止损 @ {fmtPrice(sl)}
         </span>
       )}
       {tp != null && (
-        <span className="tabular" style={{ color: "var(--long)" }}>
+        <span className="tabular" style={{ color: "var(--long-ink)" }}>
           止盈 @ {fmtPrice(tp)}
         </span>
       )}

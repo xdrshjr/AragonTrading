@@ -126,7 +126,7 @@ export default function AccountModeSwitch() {
           className={clsx(
             "flex items-center gap-1 rounded-full px-3 py-1 text-xs font-medium transition-all duration-150 ease-smooth",
             accountMode === "live"
-              ? "bg-[var(--surface)] text-[var(--short)] shadow-soft"
+              ? "bg-[var(--surface)] text-[var(--short-ink)] shadow-soft"
               : "text-[var(--muted)] hover:text-[var(--text)]",
           )}
         >
@@ -139,7 +139,7 @@ export default function AccountModeSwitch() {
           role="status"
           className={clsx(
             "max-w-[16rem] truncate text-[11px]",
-            notice.tone === "error" ? "text-[var(--short)]" : "text-[var(--muted)]",
+            notice.tone === "error" ? "text-[var(--short-ink)]" : "text-[var(--muted)]",
           )}
         >
           {notice.text}

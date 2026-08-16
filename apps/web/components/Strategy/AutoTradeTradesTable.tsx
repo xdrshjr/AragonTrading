@@ -116,7 +116,7 @@ function TradeRow({
             <span
               className={clsx(
                 "rounded px-1 py-px text-[9px]",
-                kindTone === "warn" && "bg-[var(--accent-soft)] text-[var(--accent)]",
+                kindTone === "warn" && "bg-[var(--accent-soft)] text-[var(--accent-ink)]",
                 kindTone !== "warn" && "bg-[var(--surface-2)] text-[var(--muted)]",
               )}
             >
@@ -140,7 +140,7 @@ function TradeRow({
         <span
           className="text-right tabular font-medium"
           style={{
-            color: trade.pnl > 0 ? "var(--long)" : trade.pnl < 0 ? "var(--short)" : "var(--muted)",
+            color: trade.pnl > 0 ? "var(--long-ink)" : trade.pnl < 0 ? "var(--short-ink)" : "var(--muted)",
           }}
         >
           {trade.side === "close" ? signed(trade.pnl) : fmtQty(trade.qty)}

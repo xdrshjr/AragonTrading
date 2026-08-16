@@ -41,7 +41,7 @@ export default function LeverageControl({
                 "rounded-[7px] border px-1 py-1 text-[11px] font-medium transition-colors duration-150",
                 "disabled:cursor-not-allowed disabled:opacity-40",
                 value === preset
-                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent-ink)]"
                   : "border-[var(--border)] text-[var(--muted)] hover:text-[var(--text)]",
               )}
             >

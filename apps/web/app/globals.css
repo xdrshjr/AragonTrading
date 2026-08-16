@@ -17,6 +17,30 @@
   --accent-soft: #f0ddd4;
   --long: #3b8c6e; /* green */
   --short: #c0573e; /* rust */
+
+  /* ── 墨色（ink）分层，trust-boundary-and-signal-integrity D2 ─────────────────
+     面色（--accent / --long / --short）是**为 K 线蜡烛与色块设计**的：在图表上它们是大色块，
+     对比度不成问题。但它们被复用成了正文字号的涨跌数字与全应用的错误文案（20 余处
+     role="alert" 用的就是 --short 面色当文字），而浅色主题下它们作为文字全线不达 WCAG AA：
+       --accent 3.01 / 3.25 / 2.86    --long 3.74 / 4.03 / 3.54    --short 4.13 / 4.45 / 3.91
+     （对 --bg / --surface / --surface-2；暗色主题本来就全部达标）。
+
+     修法刻意**不动面色取值** —— 图表 series、状态点、进度条填充、边框、accent-* 类因此逐字节
+     不变 —— 只新增三个 text-grade 墨色 + 一个反色，把文字用法迁过去。三层契约：
+
+       面色  --accent / --long / --short          → 图表、色块、边框、圆点。绝不用于 text-
+       墨色  --accent-ink / --long-ink / --short-ink → 仅用于 text-
+       反色  --on-accent                          → 仅用于 --accent 面上的文字
+
+     暗色三个 ink 的取值**等于原面色**，所以暗色文字逐像素不变——这正是覆盖 301 处机械替换的
+     那张验证网（任何一处误改都会立刻在暗色下变色）。取值与配对矩阵由
+     app/globals.source.test.ts 在测试里**重算** WCAG，不硬编码期望值。
+     ────────────────────────────────────────────────────────────────────────── */
+  --accent-ink: #9e4a2b; /* on --bg 5.56 / --surface 6.00 / --surface-2 5.28 / --accent-soft 4.61 */
+  --long-ink: #2b6b53;   /* 5.79 / 6.25 / 5.49 / 4.80 */
+  --short-ink: #9e3f27;  /* 6.04 / 6.52 / 5.73 / 5.01 */
+  --on-accent: #1f1e1b;  /* on --accent(#cc785c) 5.09 —— 此前被引用却从未定义，靠内联 #fff 兜底 */
+
   /* 警告语义（spec D5）。此前这个 token 根本不存在，六处调用各自内联回退 #d97706 或 var(--short)，
      于是同一个「警告」渲染成琥珀 / 铁锈红两种颜色，且 #d97706 在浅色三种底上只有 2.78–3.16:1。
      取值经 WCAG 2.1 相对亮度复算：对 --bg 5.71、--surface 6.16、--surface-2 5.42、--warn-soft 5.07。
@@ -39,6 +63,19 @@
   --accent-soft: #3a2c25;
   --long: #5fb38c;
   --short: #d97a62;
+
+  /* 暗色 ink **等于原面色**：暗色文字因此逐像素不变（301 处机械替换的验证网，见 :root 的说明）。
+     配对实测：--accent-ink 6.54/6.00/5.35/4.98、--long-ink 6.96/6.38/5.70/5.31、
+     --short-ink 5.79/5.31/4.74/(--accent-soft 4.41)。最后那一格是**不达标**的，它此前唯一的落点
+     是 Button variant="danger" 的 hover 底；本轮已把该 hover 底改成 --surface-2（4.74，达标），
+     此后 --short-ink 与 --accent-soft 在产品里不再相遇，故该格不在门禁矩阵内 —— 这一条由
+     components/ui/contrastTokens.source.test.ts 的「短色墨不得落在 accent-soft 上」扫描看守，
+     不是靠约定。 */
+  --accent-ink: #d98a6e;
+  --long-ink: #5fb38c;
+  --short-ink: #d97a62;
+  --on-accent: #1a1915;  /* on --accent(#d98a6e) 6.54 */
+
   /* 暗色配对：--warn 对 --bg 8.26、--surface 7.57、--surface-2 6.76、--warn-soft 6.14。 */
   --warn: #e0a75f;
   --warn-soft: #3a2f1e;

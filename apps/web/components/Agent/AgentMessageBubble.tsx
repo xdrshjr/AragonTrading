@@ -59,7 +59,7 @@ export default function AgentMessageBubble({ message }: { message: ChatMessage }
           className={clsx(
             "group relative max-w-[92%] break-words rounded-[12px] px-3 py-2 text-[13px] leading-relaxed",
             isUser
-              ? "self-end bg-[var(--accent)] text-white"
+              ? "self-end bg-[var(--accent)] text-[var(--on-accent)]"
               : "self-start bg-[var(--surface-2)] text-[var(--text)]",
           )}
         >

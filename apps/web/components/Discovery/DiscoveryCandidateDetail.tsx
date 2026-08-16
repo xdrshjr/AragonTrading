@@ -170,7 +170,7 @@ export default function DiscoveryCandidateDetail({
               </p>
             </div>
             <DiscoveryStrategyDetail detail={detail} />
-            {message && <p className="text-xs text-[var(--accent)]">{message}</p>}
+            {message && <p className="text-xs text-[var(--accent-ink)]">{message}</p>}
             <div className="flex justify-end gap-2">
               <Button variant="ghost" size="sm" onClick={onClose}>
                 关闭
@@ -255,7 +255,7 @@ export default function DiscoveryCandidateDetail({
               不构成收益预期。
             </p>
 
-            {message && <p className="text-xs text-[var(--accent)]">{message}</p>}
+            {message && <p className="text-xs text-[var(--accent-ink)]">{message}</p>}
 
             <div className="flex justify-end gap-2">
               <Button variant="ghost" size="sm" onClick={onClose}>

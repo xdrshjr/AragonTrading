@@ -1,13 +1,24 @@
 """实时快照的 wire 级封顶（单一真源，resilience-and-hci-hardening D4）。
 
-**只封顶下发与前端留存，绝不裁剪服务端的会计真值**——`LiveExecutor.trades`（AI 自动交易与实时
-自动交易两条会话共用）与 `SimBroker.trades`（模拟盘）是下列判定的真值来源，裁它等于**静默改变
-交易行为**：
+**下发与前端留存一律封顶；服务端的会计真值只有在「判定不再依赖列表长度」之后才允许封顶。**
+`LiveExecutor.trades`（AI 自动交易与实时自动交易两条会话共用）与 `SimBroker.trades`（模拟盘）
+曾经同时承担三个角色——明细台账、计数器、闸门判据——那时裁它等于**静默改变交易行为**：
 
 * `ai_auto/discipline_runtime.py` 的会话累计开仓次数 → 换手纪律闸（裁剪即静默放松阈值）；
 * `ai_auto/session.py` 的 `tradeCount` / `avgPnl` 分母 → run metrics 落库（裁剪即历史统计低报）；
 * `ai_auto/session.py` 的 `_cost.reconcile_tick(trades=...)` 成本对账窗口（裁剪即净额盈亏失真）；
 * `ai_auto/resume.py` 续跑时对整列的回灌（类型与长度契约）。
+
+**红线因此从「绝不裁剪」改写为「先有计数器，再谈封顶」**（trust-boundary-and-signal-integrity D5）。
+前提现已满足：`LiveExecutor` 新增了两个显式计数器（`trade_count` / `open_count`），四个 append 点
+全部收敛到 `_record_trade`，上面前两条**数列表长度**的读点已改读计数器；第三条（成本对账窗口）
+读的是近端切片、第四条是整列回灌，二者都不依赖长度。**刻意不设第三个「已实现盈亏总额」计数器**：
+那个数的真值是 `realized_pnl_usd`（平仓回执累加），再按成交腿累加一份就是同一个数落两份，
+而这里漂移的是真实资金的盈亏显示。因此 `TRADE_LEDGER_MAX` 只是**内存护栏**——它封的是明细的长度，
+封不动任何一个判定。顺序不可颠倒：先封顶后加计数器，就是上一轮明令禁止的那种越界。
+
+`SimBroker.trades`（`engine/simulator.py`）**至今不封顶**：它是回测/模拟撮合的完整产物，会被
+整体落库并参与指标计算，封顶会改变回测结果本身。
 
 取值是**安全网**而不是展示策略：前端有两处统计（`AiTradeStatsLive` 的全会话总盘与盈利捕获率、
 `AutoTradePnlPanel` 的时间窗汇总）按「全会话」口径直接由这份成交序列求和，封得太紧会静默低报。
@@ -20,6 +31,11 @@
 from __future__ import annotations
 
 SNAPSHOT_TRADES_MAX = 2000
+
+# 服务端成交台账（`LiveExecutor.trades`）的内存护栏（D5 第 2 步）。取值按 AI 会话最密的档位估算，
+# **远超任何现实会话**：正常情况下永不触发，触发时三个计数器仍是全量真值，故没有任何读点会低报。
+# 它不是展示策略——展示侧的封顶是上面的 `SNAPSHOT_TRADES_MAX`。
+TRADE_LEDGER_MAX = 20000
 
 
 def tail_trades(trades: list[dict], cap: int = SNAPSHOT_TRADES_MAX) -> list[dict]:

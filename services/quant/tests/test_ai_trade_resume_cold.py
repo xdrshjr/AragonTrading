@@ -467,6 +467,83 @@ async def test_continuity_rebuild_matches_hand_computed_numbers():
         await dispose_engine()
 
 
+async def test_resume_restores_the_ledger_counters_bit_for_bit():
+    """续跑后三个计数器必须与暂停前**逐位相同**（D5 / P1-6）——不是「不归零」，是精确相等。
+
+    它们由 DB 的**全量 `Trade` 行**派生（`rebuild_continuity` 无裁剪），所以本来就该精确相等；
+    正因为如此，它们**一个都不许落进会话状态 JSON**：`rebuild_continuity` 自己写着「派生量绝不
+    落库：落两份必然漂移，而这里漂移的是真实资金的盈亏显示」。这条用例同时钉住这两件事。
+    """
+    await init_db()
+    try:
+        sm = get_sessionmaker()
+        async with sm() as s:
+            run = await repo.create_run(s, strategy_id=1, inst_id="BTC-USDT-SWAP", bar="1H",
+                                        mode="ai-trade", config={}, status="running")
+            run_id = run.id
+        legs = []
+        for i in range(4):
+            legs.append({"ts": _START_TS + i * 10, "side": "long", "price": 100.0, "qty": 1.0,
+                         "fee": 0.1, "pnl": 0.0})
+            legs.append({"ts": _START_TS + i * 10 + 1, "side": "close", "price": 105.0,
+                         "qty": 1.0, "fee": 0.2, "pnl": 5.0})
+        await _seed_trades(run_id, legs)
+
+        # 暂停前：同一批成交逐笔经 `_record_trade` 入账。
+        before = _ledger_executor()
+        for leg in legs:
+            before._record_trade(dict(leg))
+
+        # 续跑：从 DB 全量重建 + 一次 restore。
+        continuity = await rebuild_continuity(run_id, net_mode=True)
+        after = _ledger_executor()
+        after.restore_trades(continuity["trades"])
+
+        assert after.trade_count == before.trade_count == 8
+        assert after.open_count == before.open_count == 4
+        # 已实现盈亏不由 `restore_trades` 管（它没有第二个累加器）：真值随 continuity 一并回灌，
+        # 这里顺带钉住「回灌值 == 台账逐腿之和」，即不需要第二份累加器的那条理由。
+        assert continuity["realizedPnlUsd"] == pytest.approx(
+            sum(float(row.get("pnl") or 0.0) for row in after.trades))
+    finally:
+        await dispose_engine()
+
+
+def _ledger_executor():
+    """一个只用来做台账记账的执行器（五个 OKX 缝全注入桩，绝不碰网络）。"""
+    from app.engine.simulator import RiskParams
+    from app.live_auto.executor import LiveExecutor
+    from app.okx.accounts import AccountCredentials
+
+    async def _noop(*_args, **_kwargs):
+        return {}
+
+    async def _empty(*_args, **_kwargs):
+        return []
+
+    return LiveExecutor(
+        creds=AccountCredentials("ak", "sk-000000", "pp-000000"), account_id=1,
+        inst_id="BTC-USDT-SWAP", td_mode="cross", pos_mode="long_short_mode",
+        leverage=3.0, budget_usd=1000.0, risk=RiskParams(stop_loss_pct=0.05),
+        ct_val=0.01, lot_sz=0.01, min_sz=0.01, settings=Settings(),
+        place_order_fn=_noop, close_position_fn=_noop, positions_fn=_empty, fills_fn=_empty)
+
+
+def test_continuity_payload_carries_no_derived_counter_keys():
+    """反向护栏：continuity 载荷里**不许**出现 `tradeCount` / `openCount` / `realizedTotal`。
+
+    加这三个键就是「同一个事实存两份」，而 `rebuild_continuity` 的 docstring 明写这条不变式。
+    这条用例让「顺手加个键缓存一下」在第一次跑测时就红。
+    """
+    import inspect
+
+    from app.ai_auto import resume as resume_module
+
+    source = inspect.getsource(resume_module)
+    for forbidden in ("tradeCount", "openCount", "realizedTotal"):
+        assert forbidden not in source
+
+
 def test_entry_bar_is_derived_from_the_exchange_open_time():
     """G-15：`entry_bar = cur_index - floor((now - openTs)/barSeconds)`，下界 0；缺失回落 cur_index。"""
     import time

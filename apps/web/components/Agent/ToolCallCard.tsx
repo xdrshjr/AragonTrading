@@ -23,8 +23,8 @@ export default function ToolCallCard({ call }: { call: ToolCall }) {
           className={clsx(
             "ml-auto inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium",
             status === "running" && "bg-[var(--surface-2)] text-[var(--muted)]",
-            status === "ok" && "bg-[color-mix(in_srgb,var(--long)_16%,transparent)] text-[var(--long)]",
-            status === "error" && "bg-[color-mix(in_srgb,var(--short)_16%,transparent)] text-[var(--short)]",
+            status === "ok" && "bg-[color-mix(in_srgb,var(--long)_16%,transparent)] text-[var(--long-ink)]",
+            status === "error" && "bg-[color-mix(in_srgb,var(--short)_16%,transparent)] text-[var(--short-ink)]",
           )}
         >
           {status === "running" ? "执行中…" : status === "ok" ? "完成" : "失败"}
