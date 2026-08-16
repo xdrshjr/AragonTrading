@@ -9,6 +9,7 @@ import type {
   StrategyEquityPoint,
   StrategyTrade,
 } from "./types";
+import { EQUITY_MAX, TRADES_MAX } from "./wireCaps";
 
 export const FALLBACK_MAX_PAPER_SESSIONS = 3;
 
@@ -65,14 +66,18 @@ export function sessionsFromReconcile(
   return { sessions, groupId };
 }
 
+// 成交追加封顶末 TRADES_MAX 条（D4）：此前无界，一条长跑模拟会话的成交数组只增不减。
 export function mergePaperTrade(
   prev: Record<number, StrategyTrade[]>,
   trade: StrategyTrade,
 ): Record<number, StrategyTrade[]> {
   const current = prev[trade.strategyId] ?? [];
-  return { ...prev, [trade.strategyId]: [...current, trade] };
+  return { ...prev, [trade.strategyId]: [...current, trade].slice(-TRADES_MAX) };
 }
 
+// 净值追加封顶末 EQUITY_MAX 条（D4）。这一侧**无信息损失**：后端 snapshot 早就只回末 1000 条
+// （`paper/session.py` 的 `_SNAPSHOT_EQUITY_MAX`），这里只是把增量路径也钉在同一个数字上——
+// 顺带把「每来一个点就重建 Map 并对全表排序」的 O(n log n)/点封在有界的 n 上。
 export function mergePaperEquity(
   prev: Record<number, StrategyEquityPoint[]>,
   point: StrategyEquityPoint,
@@ -80,7 +85,7 @@ export function mergePaperEquity(
   const byTs = new Map<number, StrategyEquityPoint>();
   for (const item of prev[point.strategyId] ?? []) byTs.set(item.ts, item);
   byTs.set(point.ts, point);
-  const next = Array.from(byTs.values()).sort((a, b) => a.ts - b.ts);
+  const next = Array.from(byTs.values()).sort((a, b) => a.ts - b.ts).slice(-EQUITY_MAX);
   return { ...prev, [point.strategyId]: next };
 }
 

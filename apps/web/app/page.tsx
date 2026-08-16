@@ -63,6 +63,7 @@ import type {
   StrategyTrade,
   Trade,
 } from "@/lib/types";
+import { TRADES_MAX } from "@/lib/wireCaps";
 import { marketWS, paperWS, type WsEvent } from "@/lib/ws";
 
 const BACKTEST_TRADE_LIMIT = 5000;
@@ -507,6 +508,29 @@ export default function Page() {
     chartView === "run-range" &&
     singleRunMode &&
     (tradesQ.data?.length ?? 0) >= BACKTEST_TRADE_LIMIT;
+  // 实时成交缓冲触到 wire 封顶（D4）。判据**只能在这里算**：唯有这一层知道当前跑的是哪条车道，
+  // 表格内部按长度自判会让一次 ≥2000 笔的回测误报。回测车道恒 false —— 那条车道有它自己的
+  // `tradeCapReached`（5000 笔）横幅。
+  //
+  // 而且必须**逐条序列**判定，不能拿 `bottomTrades` 的合并长度去比：封顶是按序列施加的，
+  // 模拟盘叠加视图却把多条策略的成交并成一列——三条各 999 笔合起来就 ≥2000，而一条都没被截断。
+  // 那会报一条假的截断提示，恰恰违背本条「如实告知」的初衷（谎报截断与瞒报截断一样伤信任）。
+  const overlayTradesCapped = aiTradeMember
+    ? aiTradeMember.trades.length >= TRADES_MAX
+    : liveAutoGroup
+      ? (liveAutoGroup.members[instId]?.trades.length ?? 0) >= TRADES_MAX
+      : liveAutoSessionId
+        ? liveAutoTrades.length >= TRADES_MAX
+        : false;
+  // 模拟盘有两个落点：图表 overlay 取可见策略、下方表格取当前选中策略，故两者的并集都要看。
+  const paperTradeSeriesIds =
+    effectiveActivePaperStrategyId == null
+      ? effectiveVisibleIds
+      : [...effectiveVisibleIds, effectiveActivePaperStrategyId];
+  const liveTradeCapReached =
+    overlayTradesCapped ||
+    (mode === "paper" &&
+      paperTradeSeriesIds.some((id) => (paperTradesByStrategyId[id]?.length ?? 0) >= TRADES_MAX));
 
   useEffect(() => {
     useAppStore.persist.rehydrate();
@@ -639,6 +663,7 @@ export default function Page() {
                 overlayTrades={overlayTrades}
                 bottomTrades={bottomTrades}
                 tradeCapReached={tradeCapReached}
+                liveTradeCapReached={liveTradeCapReached}
                 indicators={indicators}
                 theme={theme}
                 lastPrice={streamMarket ? lastPrice : null}

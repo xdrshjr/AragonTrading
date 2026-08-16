@@ -187,12 +187,11 @@ def test_direction_adjustment():
 
 def test_baseline_and_edge():
     # 恒定百分比上行 + 周期放量：每根（触发与否）的 close-to-close 前瞻收益相同 → edge≈0（隔离漂移）。
-    rows, prev = [], 100.0
+    rows = []
     for i in range(90):
         c = 100.0 * (1.001 ** i)
         vol = 3000.0 if i % 3 == 0 else 1000.0
         rows.append(_bar(i, c, c + 0.05, c - 0.05, c, vol))
-        prev = c
     result = forward_returns(_df(rows), "volume_breakout", horizons=(3,), entry_at="signal_close")
     assert result.occurrences >= 1
     assert result.horizons[0].edgeVsBaseline == pytest.approx(0.0, abs=1e-5)

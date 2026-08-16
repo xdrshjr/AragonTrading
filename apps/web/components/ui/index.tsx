@@ -6,17 +6,23 @@ import { createPortal } from "react-dom";
 
 /** 复用基础组件 (spec §8.2)：Button / Select / Card / Tabs / Skeleton / Badge / Modal。 */
 
-export function Button({
-  variant = "default",
-  size = "md",
-  className,
-  ...props
-}: React.ButtonHTMLAttributes<HTMLButtonElement> & {
+export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: "default" | "primary" | "ghost" | "danger";
   size?: "sm" | "md";
-}) {
+}
+
+/**
+ * 基础按钮。**转 `forwardRef` 是纯加法**（spec D6）：既有几十个调用方一行不改，
+ * 不传 `ref` 时行为逐字相同；而 `ConfirmDialog` 需要把初始焦点显式钉在「取消」上，
+ * 普通函数组件在 React 18.3 下拿不到 DOM 节点（`ref` 不是它的合法 prop，`tsc` 直接红）。
+ */
+export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(function Button(
+  { variant = "default", size = "md", className, ...props },
+  ref,
+) {
   return (
     <button
+      ref={ref}
       className={clsx(
         "inline-flex items-center justify-center gap-1.5 rounded-[10px] font-medium transition-all duration-150 ease-smooth disabled:opacity-40 disabled:cursor-not-allowed",
         // H-F8：键盘聚焦可见环（仅 focus-visible，鼠标点击不显，不改既有视觉）。
@@ -33,7 +39,7 @@ export function Button({
       {...props}
     />
   );
-}
+});
 
 export function Select({
   className,
@@ -247,18 +253,22 @@ const FOCUSABLE =
  * - React portal 到 `document.body`；半透明遮罩 + 居中卡片，配色用既有 CSS 变量、明/暗主题零适配。
  * - `Esc` 与**点击遮罩**触发 `onClose`；挂载时初始焦点入对话框；`Tab`/`Shift+Tab` 焦点陷阱于框内；
  *   卸载时焦点恢复到触发元素；打开期 `body` 滚动锁定。
+ * - `initialFocusRef`（可选，spec D6）：显式指定初始焦点落点。**不传即旧语义**（DOM 中第一个
+ *   可聚焦元素），11 个既有调用方零改动。破坏性确认框须用它把焦点钉在安全选项上。
  */
 export function Modal({
   open,
   onClose,
   labelledBy,
   className,
+  initialFocusRef,
   children,
 }: {
   open: boolean;
   onClose: () => void;
   labelledBy?: string;
   className?: string;
+  initialFocusRef?: React.RefObject<HTMLElement | null>;
   children: React.ReactNode;
 }) {
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -270,13 +280,16 @@ export function Modal({
     restoreFocusRef.current = (document.activeElement as HTMLElement) ?? null;
     const dialog = dialogRef.current;
     const first = dialog?.querySelector<HTMLElement>(FOCUSABLE);
-    (first ?? dialog)?.focus();
+    (initialFocusRef?.current ?? first ?? dialog)?.focus();
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     return () => {
       document.body.style.overflow = prevOverflow;
       restoreFocusRef.current?.focus?.();
     };
+    // 依赖仍只列 `open`：`initialFocusRef` 是 ref 对象，身份稳定，但把它写进依赖数组会让每个
+    // 传内联 `useRef` 以外形态的调用方引发 effect 反复重跑——本仓已为「依赖不稳」复发过一次缺陷。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
   // Esc 关闭 + Tab/Shift+Tab 焦点陷阱（捕获期绑定，优先于面板级 Esc 流，避免双重关闭）。
@@ -340,27 +353,67 @@ export function Modal({
   );
 }
 
+/**
+ * 共享页签原语（spec D8）。**11 个调用方零改动、视觉零变化**，补的全是语义与键盘行为：
+ * 外层 `role="tablist"`、每项 `role="tab"` + `aria-selected` + roving tabindex，
+ * ←/→ 环形移动、Home/End 跳首尾（手感照抄 `Strategy/MultiSampleResults.tsx` 的手写实现）。
+ *
+ * 此前它渲染的是一排裸 `<button>`：读屏用户听不到「第 2 项，共 4 项，已选中」，键盘用户要按 Tab
+ * 逐个穿过。而它覆盖的是 RightPanel 主页签、ChartHeaderBar 视图段控等**几乎整个应用的主导航**——
+ * 同仓库里三处手写页签反倒都做对了，共享原语是这套代码里 a11y 最差的那一个。
+ *
+ * **刻意不引入 `aria-controls`**：多数调用方不渲染独立 tabpanel，一个指向不存在 id 的
+ * `aria-controls` 比没有更糟。
+ */
 export function Tabs({
   tabs,
   active,
   onChange,
   variant = "segmented",
+  label,
 }: {
   tabs: { key: string; label: string }[];
   active: string;
   onChange: (key: string) => void;
   variant?: "segmented" | "underline";
+  /** 供多组页签共存时区分（→ `aria-label`）；不传即无此属性，行为不变。 */
+  label?: string;
 }) {
+  const listRef = useRef<HTMLDivElement>(null);
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const nextIdx = rovingTabIndex(e.key, tabs.findIndex((t) => t.key === active), tabs.length);
+    if (nextIdx == null) return;
+    e.preventDefault();
+    onChange(tabs[nextIdx].key);
+    listRef.current?.querySelectorAll<HTMLButtonElement>('[role="tab"]')[nextIdx]?.focus();
+  };
+
+  // `key` 刻意不放进这里：React 18.3 起把 key 混在 spread 里会 warning（且它本就不是 DOM prop）。
+  const tabProps = (t: { key: string; label: string }) => ({
+    type: "button" as const,
+    role: "tab",
+    "aria-selected": active === t.key,
+    tabIndex: active === t.key ? 0 : -1,
+    onClick: () => onChange(t.key),
+  });
+
   // underline 变体：靠左、内容宽度、下划线高亮（副图页签 + 下区数据页签共用）。
   // 评审 R-2：不加 overflow-x-auto（会令 overflow-y 计算为 auto 而裁掉 -mb-px 下划线）；
   // 两处调用方页签数少，单行不溢出。如未来需横向滚动，把溢出下沉到不承载底边线的内层 wrapper。
   if (variant === "underline") {
     return (
-      <div className="flex items-center gap-1 border-b border-[var(--border)]">
+      <div
+        ref={listRef}
+        role="tablist"
+        aria-label={label}
+        onKeyDown={onKeyDown}
+        className="flex items-center gap-1 border-b border-[var(--border)]"
+      >
         {tabs.map((t) => (
           <button
             key={t.key}
-            onClick={() => onChange(t.key)}
+            {...tabProps(t)}
             className={clsx(
               "-mb-px shrink-0 border-b-2 px-3 py-1.5 text-xs font-medium transition-colors duration-150",
               active === t.key
@@ -374,13 +427,19 @@ export function Tabs({
       </div>
     );
   }
-  // —— 既有 segmented 实现，原样保留（默认变体，不传 variant 的调用方零变化）——
+  // —— 既有 segmented 实现，视觉原样保留（默认变体，不传 variant 的调用方零变化）——
   return (
-    <div className="flex gap-1 rounded-[10px] bg-[var(--surface-2)] p-1">
+    <div
+      ref={listRef}
+      role="tablist"
+      aria-label={label}
+      onKeyDown={onKeyDown}
+      className="flex gap-1 rounded-[10px] bg-[var(--surface-2)] p-1"
+    >
       {tabs.map((t) => (
         <button
           key={t.key}
-          onClick={() => onChange(t.key)}
+          {...tabProps(t)}
           className={clsx(
             "flex-1 rounded-[7px] px-3 py-1.5 text-xs font-medium transition-all duration-150",
             active === t.key
@@ -393,4 +452,31 @@ export function Tabs({
       ))}
     </div>
   );
+}
+
+/**
+ * 方向键 → 目标页签下标（纯函数，便于用例直接冻结环绕语义）。
+ *
+ * @param key `KeyboardEvent.key`。
+ * @param current 当前激活项下标（-1 表示 active 不在列表里）。
+ * @param count 页签总数。
+ * @returns 目标下标；不是导航键或列表为空则返回 `null`（调用方即不 preventDefault）。
+ *   导航键即便落回当前项（在首项按 Home）也返回该下标：那一下仍然是「页签自己消费掉的按键」，
+ *   放行给页面滚动才是意外行为。
+ */
+function rovingTabIndex(key: string, current: number, count: number): number | null {
+  if (count === 0) return null;
+  const base = current < 0 ? 0 : current;
+  switch (key) {
+    case "ArrowRight":
+      return (base + 1) % count;
+    case "ArrowLeft":
+      return (base - 1 + count) % count;
+    case "Home":
+      return 0;
+    case "End":
+      return count - 1;
+    default:
+      return null;
+  }
 }

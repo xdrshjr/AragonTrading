@@ -148,7 +148,7 @@ describe("AiBacktestModal · complete dashboard", () => {
   it("advanced tab shows extended metrics with a non-colliding payoff label", () => {
     mockView = completeView();
     render(<AiBacktestModal jobId="aibt_done" onClose={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "进阶指标" }));
+    fireEvent.click(screen.getByRole("tab", { name: "进阶指标" }));
     expect(screen.getByText("索提诺")).toBeInTheDocument();
     // profitFactor 卡（MetricsCards「盈亏比」）与 payoffRatio 卡（「盈亏比·赔率」）标签不重名（P1-1）
     const payoff = screen.getByText("盈亏比·赔率");
@@ -161,7 +161,7 @@ describe("AiBacktestModal · complete dashboard", () => {
   it("trades tab export buttons call downloadCsv / downloadJson", () => {
     mockView = completeView();
     render(<AiBacktestModal jobId="aibt_done" onClose={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "成交" }));
+    fireEvent.click(screen.getByRole("tab", { name: "成交" }));
     fireEvent.click(screen.getByRole("button", { name: "导出成交 CSV" }));
     expect(downloadCsvMock).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole("button", { name: "导出完整 JSON" }));
@@ -171,7 +171,7 @@ describe("AiBacktestModal · complete dashboard", () => {
   it("ai-decision tab shows decision stats and action distribution", () => {
     mockView = completeView();
     render(<AiBacktestModal jobId="aibt_done" onClose={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "AI 决策" }));
+    fireEvent.click(screen.getByRole("tab", { name: "AI 决策" }));
     expect(screen.getByText("决策轮数")).toBeInTheDocument();
     expect(screen.getByText("动作分布")).toBeInTheDocument();
   });
@@ -181,14 +181,14 @@ describe("AiBacktestModal · complete dashboard", () => {
   it("profit-guard caveat card only shows when the backtest actually assembled the guard", () => {
     mockView = completeView({ ext: true, bench: true, guard: { enabled: true, exits: 2 } });
     const { unmount } = render(<AiBacktestModal jobId="aibt_done" onClose={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "AI 决策" }));
+    fireEvent.click(screen.getByRole("tab", { name: "AI 决策" }));
     expect(screen.getByTestId("bt-profit-guard-exits").textContent).toContain("2");
     expect(screen.getByText(/跳空穿越按开盘价成交/)).toBeInTheDocument();
     unmount();
 
     mockView = completeView({ ext: true, bench: true, guard: { enabled: false, exits: 0 } });
     render(<AiBacktestModal jobId="aibt_done" onClose={vi.fn()} />);
-    fireEvent.click(screen.getByRole("button", { name: "AI 决策" }));
+    fireEvent.click(screen.getByRole("tab", { name: "AI 决策" }));
     expect(screen.queryByTestId("bt-profit-guard-exits")).toBeNull();
     expect(screen.queryByText(/保守近似/)).toBeNull();
   });
@@ -198,7 +198,7 @@ describe("AiBacktestModal · complete dashboard", () => {
     render(<AiBacktestModal jobId="aibt_done" onClose={vi.fn()} />);
     expect(screen.getByText("总收益")).toBeInTheDocument(); // 概览仍渲染
     expect(screen.queryByText("超额 α")).toBeNull(); // 无基准 → 隐藏 alpha
-    fireEvent.click(screen.getByRole("button", { name: "进阶指标" }));
+    fireEvent.click(screen.getByRole("tab", { name: "进阶指标" }));
     expect(screen.getByText("核心指标")).toBeInTheDocument(); // 七项仍在
     expect(screen.queryByText("盈亏比·赔率")).toBeNull(); // 扩展网格优雅隐藏
     expect(screen.queryByText("策略 vs 买入持有")).toBeNull(); // 基准对比隐藏

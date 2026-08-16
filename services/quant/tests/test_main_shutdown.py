@@ -1,6 +1,7 @@
-"""关停期后台协程收敛（spec D4）：`_cancel_background` 的两条路径。
+"""关停期收敛：`_cancel_background`（stability-hardening-audit D4）与
+`_run_shutdown`（resilience-and-hci-hardening D1）两个助手。
 
-**只测该助手，绝不驱动真实 `lifespan(app)`**（spec D4 / 评审 P1-4）：lifespan 起步就会
+**只测这两个助手，绝不驱动真实 `lifespan(app)`**（评审 P1-4）：lifespan 起步就会
 `init_db()` 跑启动对账（跨用例污染，见 `tests/conftest.py`）、`_okx_link_sweeper` 起步即发真实
 HTTP 对时、退出段还要逐个 `shutdown()` 八个进程级单例——一条「验证关停确定性」的用例不该把这些
 全部拖进来，那反而会引入一条新的顺序依赖。
@@ -8,9 +9,10 @@ HTTP 对时、退出段还要逐个 `shutdown()` 八个进程级单例——一�
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 
-from app.main import _cancel_background
+from app.main import _cancel_background, _run_shutdown, _shutdown_steps
 
 
 async def test_cancel_background_settles_cancel_safe_tasks():
@@ -41,3 +43,113 @@ async def test_cancel_background_returns_even_when_a_task_swallows_cancellation(
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert task.done()
+
+
+# ---- `_run_shutdown` 逐步隔离与硬死线（resilience-and-hci-hardening D1）----
+
+
+def _fake_steps(calls: list[str], *, hang_grace: asyncio.Event):
+    """构造一张假步骤表：第 3 步抛、第 5 步永挂、第 7 步的**工厂本身**抛，其余正常。
+
+    Args:
+        calls: 被调用步骤名的记录簿（断言「每一步都被尝试过」用）。
+        hang_grace: 永挂步骤在被 cancel 后用来收尾的事件；用例负责 set，避免泄漏。
+
+    Returns:
+        与 `_shutdown_steps()` 同形的 ``(名称, 零参工厂)`` 元组。
+    """
+    async def _ok(name: str) -> None:
+        calls.append(name)
+
+    async def _boom(name: str) -> None:
+        calls.append(name)
+        raise RuntimeError(f"{name} exploded")
+
+    async def _hang(name: str) -> None:
+        calls.append(name)
+        try:
+            await asyncio.sleep(99)
+        except asyncio.CancelledError:
+            hang_grace.set()      # 证明「收尾窗口」确实给到了：finally 语义仍然跑得到
+            raise
+
+    def _factory_boom():
+        calls.append("step7")
+        raise RuntimeError("factory exploded")   # getter 自己抛：整张表都不该被连根拔掉
+
+    steps = []
+    for idx in range(1, 13):
+        name = f"step{idx}"
+        if idx == 3:
+            steps.append((name, (lambda n=name: _boom(n))))
+        elif idx == 5:
+            steps.append((name, (lambda n=name: _hang(n))))
+        elif idx == 7:
+            steps.append((name, _factory_boom))
+        else:
+            steps.append((name, (lambda n=name: _ok(n))))
+    return tuple(steps)
+
+
+async def test_run_shutdown_isolates_each_step_and_always_reaches_the_last(caplog):
+    """一步抛/挂/工厂自爆，都不得吃掉后续步骤——最后一步（真实链路里是 `dispose_engine`）必须被执行。"""
+    calls: list[str] = []
+    grace = asyncio.Event()
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="aragon"):
+        await _run_shutdown(_fake_steps(calls, hang_grace=grace), timeout=0.05)
+    elapsed = time.monotonic() - started
+
+    assert [f"step{i}" for i in range(1, 13)] == calls      # 12 步全部被尝试，一步不落
+    assert grace.is_set()                                  # 超时步被 cancel，且收尾窗口确实给到
+    # 硬死线：整段耗时 ≈ 单步 timeout + grace，绝不是 99s 的那个 sleep
+    assert elapsed < 0.05 + 1.0 + 1.0
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "step3" in messages and "failed" in messages          # 抛异常的那步
+    assert "step5" in messages and "did not settle" in messages  # 超时的那步
+    assert "step7" in messages and "could not start" in messages  # 工厂自爆的那步
+
+
+async def test_run_shutdown_reports_a_step_that_turns_cancellation_into_an_error(caplog):
+    """吞掉取消、又改抛别的异常的步骤，必须被**记到步骤名上**，而不是变成一条无主的 GC 警告。
+
+    未被取出的 task 异常会在垃圾回收时以 `Task exception was never retrieved` 印出来——
+    没有步骤名、没有时间点、还常常落在另一个模块的日志段里。关停期最不需要的就是这种噪声。
+    """
+    async def _hostile() -> None:
+        try:
+            await asyncio.sleep(99)
+        except asyncio.CancelledError:
+            raise RuntimeError("swallowed the cancel")   # 取消被改写成另一个异常
+
+    with caplog.at_level(logging.WARNING, logger="aragon"):
+        await _run_shutdown((("hostile", _hostile),), timeout=0.05)
+
+    messages = "\n".join(record.getMessage() for record in caplog.records)
+    assert "hostile" in messages and "did not settle" in messages
+    assert "raised while being cancelled" in messages
+
+
+async def test_run_shutdown_never_raises_even_when_every_step_fails():
+    """关停路径**不对外抛**：它是 lifespan 的最后一段，抛出去只会把「没停干净」变成「没停」。"""
+    async def _boom() -> None:
+        raise RuntimeError("boom")
+
+    def _factory_boom():
+        raise RuntimeError("factory boom")
+
+    await _run_shutdown((("a", _boom), ("b", _factory_boom)), timeout=0.05)
+
+
+def test_shutdown_steps_are_zero_arg_factories_in_the_legacy_order():
+    """步骤表的顺序即既有 lifespan 的 12 步顺序；**且求值必须推迟到 `_run_shutdown` 内**。
+
+    只断言形状与顺序——真的调用它们会拉起 12 个进程级单例，那正是本文件开头拒绝做的事。
+    """
+    steps = _shutdown_steps()
+    assert [name for name, _ in steps] == [
+        "health_guard", "agent", "discovery", "paper", "ai_trade", "ai_backtest",
+        "live_auto", "weight_batch", "weight_train", "okx_rest", "okx_pool", "db_engine",
+    ]
+    assert all(callable(factory) for _, factory in steps)

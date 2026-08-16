@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -38,6 +39,7 @@ from .api import (
     workspace,
     ws_market,
 )
+from .config import get_settings
 from .db.session import dispose_engine, init_db
 from .discovery.health_runtime import get_health_guard
 from .discovery.manager import get_discovery_manager
@@ -68,22 +70,76 @@ async def lifespan(app: FastAPI):
     background = (sweeper, resumer, hydrator, link_sweeper)
     yield
     await _cancel_background(background)   # 关停先取消清扫协程（与 manager.shutdown 同段）并有界收敛
-    await get_health_guard().shutdown()         # 体检守护先停（它只读行情，无终态可等）
-    await get_agent_manager().shutdown()
-    await get_discovery_manager().shutdown()   # 策略与因子挖掘（长跑循环，先停再收 DB / OKX）
-    await get_paper_manager().shutdown()
-    await get_ai_trade_manager().shutdown()   # AI 自动交易（紧随 live-auto 关停，含平仓）
-    await get_ai_backtest_manager().shutdown()   # AI 回测作业（取消所有在跑 job，无真单）
-    await get_live_auto_manager().shutdown()
-    # 关停顺序（weight-multi-model-training §2.6）：先停批次泵、再停底层作业，避免泵在作业消失后空转。
-    await get_weight_batch_manager().shutdown()
-    await get_weight_train_manager().shutdown()
-    await get_rest_client().aclose()
-    await get_client_pool().aclose_all()   # 池化的私有 AsyncClient 统一收口（okx-link-resilience §2.4.1）
-    await dispose_engine()
+    await _run_shutdown(_shutdown_steps(), timeout=get_settings().shutdown_step_timeout_s)
 
 
 _BACKGROUND_SETTLE_TIMEOUT_S = 5.0
+_SHUTDOWN_CANCEL_GRACE_S = 1.0   # 超时步被 cancel 后的收尾窗口；收不干净就抛下它继续
+
+ShutdownStep = tuple[str, Callable[[], Awaitable[object]]]
+
+
+def _shutdown_steps() -> tuple[ShutdownStep, ...]:
+    """关停步骤表（顺序逐字保持既有 lifespan 的 12 步，spec D1）。
+
+    **每一项都是零参 lambda**：单例 getter 与它返回的协程一起在 `_run_shutdown` 的 `try` 内求值，
+    这样「getter 自己抛」也只损失那一步，不会把整张表连根拔掉。
+
+    Returns:
+        ``(步骤名, 零参工厂)`` 的元组；步骤名只用于日志定位，必须与既有 await 顺序一一对应。
+    """
+    return (
+        ("health_guard", lambda: get_health_guard().shutdown()),   # 体检守护先停（只读行情，无终态可等）
+        ("agent", lambda: get_agent_manager().shutdown()),
+        ("discovery", lambda: get_discovery_manager().shutdown()),  # 长跑循环，先停再收 DB / OKX
+        ("paper", lambda: get_paper_manager().shutdown()),
+        ("ai_trade", lambda: get_ai_trade_manager().shutdown()),    # 含平仓（仅 shutdown_action=flatten 时下真单）
+        ("ai_backtest", lambda: get_ai_backtest_manager().shutdown()),
+        ("live_auto", lambda: get_live_auto_manager().shutdown()),
+        # 关停顺序（weight-multi-model-training §2.6）：先停批次泵、再停底层作业，避免泵在作业消失后空转。
+        ("weight_batch", lambda: get_weight_batch_manager().shutdown()),
+        ("weight_train", lambda: get_weight_train_manager().shutdown()),
+        ("okx_rest", lambda: get_rest_client().aclose()),
+        ("okx_pool", lambda: get_client_pool().aclose_all()),   # okx-link-resilience §2.4.1
+        ("db_engine", lambda: dispose_engine()),
+    )
+
+
+async def _run_shutdown(steps: tuple[ShutdownStep, ...], *, timeout: float) -> None:
+    """逐步执行关停，**任何一步的失败或超时都不得影响后续步骤**（spec D1）。
+
+    此前 12 步是首尾相连的裸 await：任何一步抛异常，后面全部不执行——最坏情形下
+    `dispose_engine()` 永不执行（SQLite 句柄悬挂）、进程永不退出（桌面端 8s 后 `/F` 强杀）。
+
+    死线是硬性的：**不用 `asyncio.wait_for`**——它超时后会 `cancel` 并**继续 await** 那个步骤，
+    于是一个吞掉 `CancelledError` 的步骤照样能把关停链永久堵死，正是本条要消灭的失败模式。
+    姿态与同文件 `_cancel_background` 逐字一致：`asyncio.wait` 拿到硬边界，超时就 cancel +
+    再给一个短暂的收尾窗口，收不干净就**抛下它继续往下走**——「没停干净」是要被看见的事实，
+    不是要被制造的异常。
+
+    Args:
+        steps: `_shutdown_steps()` 给出的 ``(名称, 零参工厂)`` 序列，按序执行。
+        timeout: 单步收敛死线（秒）；超时即 cancel 该步并继续，绝不抛。
+    """
+    for name, factory in steps:
+        try:
+            task = asyncio.ensure_future(factory())
+        except Exception as exc:  # noqa: BLE001 —— 连 getter/工厂本身抛都不得吃掉后续步骤
+            logger.warning("shutdown step %s could not start: %s; continuing", name, exc)
+            continue
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if not done:
+            task.cancel()
+            await asyncio.wait({task}, timeout=_SHUTDOWN_CANCEL_GRACE_S)   # 给一次收尾机会，不等第二遍
+            logger.warning("shutdown step %s did not settle in %.1fs; continuing", name, timeout)
+            if task.done() and not task.cancelled() and task.exception() is not None:
+                # 该步把取消吞成了另一个异常。**必须在这里取出来**：否则它会在 GC 时变成一条无主的
+                # "Task exception was never retrieved"，而关停期最不需要的就是没有出处的噪声。
+                logger.warning("shutdown step %s raised while being cancelled: %r",
+                               name, task.exception())
+            continue
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning("shutdown step %s failed: %r; continuing", name, task.exception())
 
 
 async def _cancel_background(tasks: tuple[asyncio.Task, ...],

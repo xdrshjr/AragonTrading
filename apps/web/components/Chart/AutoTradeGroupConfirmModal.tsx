@@ -244,7 +244,7 @@ export default function AutoTradeGroupConfirmModal({
           )}
         </p>
         {oversubscribed && (
-          <p className="rounded-md border border-[var(--warning,#d97706)] bg-[var(--surface-2)] px-2.5 py-2 text-[11px] leading-relaxed text-[var(--warning,#d97706)]">
+          <p className="rounded-md border border-[var(--warn)] bg-[var(--surface-2)] px-2.5 py-2 text-[11px] leading-relaxed text-[var(--warn)]">
             各标的上限合计 {Math.round(sumPct * 100) / 100}%（&gt; 100%）：多标的同时触发时组合敞口可能超过总预算，
             真实敞口仍受单笔名义上限与保证金兜底约束。
           </p>

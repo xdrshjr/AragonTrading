@@ -11,7 +11,7 @@ import json
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete
 
-from app.config import Settings, get_settings
+from app.config import Settings
 from app.db.models import (
     DiscoveryAsset,
     DiscoveryAssetCheck,

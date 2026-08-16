@@ -44,6 +44,10 @@ from ..schemas import (
 
 router = APIRouter(tags=["agent"])
 
+# 接收循环静默此秒数后下发一帧 `heartbeat`（spec D3）。与 `agent/loop.py` 的 run 期心跳
+# （`agent_heartbeat_seconds`，默认同为 20.0）重复是**良性**的：前端该 case 是 no-op，多一帧只多喂一次狗。
+_WS_IDLE_SECONDS = 20.0
+
 
 @router.get("/agent/config", response_model=AgentConfigOut)
 async def agent_config() -> dict:
@@ -218,7 +222,16 @@ async def ws_agent(websocket: WebSocket, conversation_id: str) -> None:
     sess = await manager.attach(conversation_id, emit)
     try:
         while True:
-            raw = await websocket.receive_text()
+            # 空闲保活（spec D3）：本路由的心跳此前是 **run 作用域**的（`agent/loop.py` 只在 run
+            # 期间发），于是「面板开着、用户在读上一条回答」这个最常见的状态下一帧都没有，客户端
+            # 45s 看门狗每 46 秒断一次 → attach/detach + 整段 history 重读 + 消息列表整表重建。
+            # 帧类型选 `heartbeat` 而非 `ping`：`AgentPanel.tsx` 已有 `case "heartbeat": break`
+            # （不入消息流、不推进 lastSeq），复用它前端一行不改，也不污染对账锚点。
+            try:
+                raw = await asyncio.wait_for(websocket.receive_text(), timeout=_WS_IDLE_SECONDS)
+            except asyncio.TimeoutError:
+                await _send(websocket, "heartbeat", {})   # 纯活性帧，无 seq（RS-7/RN-2 契约）
+                continue
             await _dispatch(raw, conversation_id, manager, sess, emit, websocket)
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass

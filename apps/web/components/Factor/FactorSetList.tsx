@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 import { useState } from "react";
 import { Badge, Button } from "@/components/ui";
+import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import { formatIc } from "@/lib/factor";
 import { factorApi } from "@/lib/factorApi";
 import type { FactorSet } from "@/lib/factorTypes";
@@ -46,12 +47,11 @@ export default function FactorSetList() {
     setEditTarget({ source: "set", setId: set.id });
     setSection("builder");
   };
-  const onDelete = (set: FactorSet) => {
-    const ok = window.confirm(
-      `确定删除组合「${set.name}」？将同时移除其在交易策略面板中对应的因子组合得分策略（数据保持一致）。`,
-    );
-    if (ok) remove.mutate(set.id);
-  };
+  // 删除确认走应用内 `ConfirmDialog`（spec D7）。这里此前是全仓**最后一处** `window.confirm`——
+  // 而 `ConfirmDialog` 的 docstring 与另外两处组件注释早已把「绝不用 window.confirm」写成约定。
+  // 在 Electron 打包形态下原生 confirm 会**同步阻塞渲染进程**（期间行情 WS 帧堆积、图表停画），
+  // 并弹出一个与自绘标题栏（WCO）风格割裂的系统对话框。
+  const [pendingDelete, setPendingDelete] = useState<FactorSet | null>(null);
 
   if (sets.isPending) {
     return <p className="py-8 text-center text-[11px] text-[var(--muted)]">加载因子组合...</p>;
@@ -90,7 +90,7 @@ export default function FactorSetList() {
             selected={set.id === selectedId}
             onSelect={() => setSelectedId(set.id)}
             onEdit={() => onEdit(set)}
-            onDelete={() => onDelete(set)}
+            onDelete={() => setPendingDelete(set)}
           />
         ))}
       </div>
@@ -108,6 +108,20 @@ export default function FactorSetList() {
           </p>
         )}
       </div>
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        title="删除因子组合"
+        message={
+          pendingDelete
+            ? `确定删除组合「${pendingDelete.name}」？将同时移除其在交易策略面板中对应的因子组合得分策略（数据保持一致）。`
+            : ""
+        }
+        onConfirm={() => {
+          if (pendingDelete) remove.mutate(pendingDelete.id);
+          setPendingDelete(null);
+        }}
+        onCancel={() => setPendingDelete(null)}
+      />
     </div>
   );
 }

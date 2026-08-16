@@ -351,6 +351,14 @@ function getButton(text: string) {
   return button;
 }
 
+// 共享 `Tabs` 原语自 spec D8 起渲染 `role="tab"`（读屏能听到「第 2 项，共 3 项，已选中」，
+// 键盘可用 ←/→ 漫游）。页签一律经此定位——**绝不**为了让用例绿而把 role 退回 button。
+function getTab(text: string) {
+  const tab = screen.getAllByRole("tab").find((item) => item.textContent?.includes(text));
+  if (!tab) throw new Error(`Tab not found: ${text}`);
+  return tab;
+}
+
 function selectStrategy(name: string) {
   // 锚定到行首：卡片选择 button 的可访问名以策略名开头，而编辑/删除动作按钮以「编辑/删除」开头，
   // 锚定可避免误命中同卡片右侧的动作按钮（动作簇为选择 button 的兄弟节点）。
@@ -358,7 +366,7 @@ function selectStrategy(name: string) {
 }
 
 async function selectComboTab() {
-  fireEvent.click(getButton(COMBO_TAB));
+  fireEvent.click(getTab(COMBO_TAB));
   await waitFor(() => expect(screen.getAllByText("Combo One").length).toBeGreaterThan(0));
 }
 
@@ -409,8 +417,8 @@ describe("StrategyPanel manual backtest trigger", () => {
   it("renders strategy category tabs and filters the strategy list", async () => {
     await renderLoadedPanel();
 
-    expect(getButton(REGULAR_TAB)).toBeTruthy();
-    expect(getButton(COMBO_TAB)).toBeTruthy();
+    expect(getTab(REGULAR_TAB)).toBeTruthy();
+    expect(getTab(COMBO_TAB)).toBeTruthy();
     expect(screen.getByText("Alpha Trend")).toBeTruthy();
     expect(screen.queryByText("Combo One")).toBeNull();
 
@@ -424,8 +432,8 @@ describe("StrategyPanel manual backtest trigger", () => {
   it("renders strategy category tabs in paper mode and filters the realtime list", async () => {
     await renderLoadedPanel({ mode: "paper" });
 
-    expect(getButton(REGULAR_TAB)).toBeTruthy();
-    expect(getButton(COMBO_TAB)).toBeTruthy();
+    expect(getTab(REGULAR_TAB)).toBeTruthy();
+    expect(getTab(COMBO_TAB)).toBeTruthy();
     expect(screen.getByText("Alpha Trend")).toBeTruthy();
     expect(screen.queryByText("Combo One")).toBeNull();
 
@@ -573,7 +581,7 @@ describe("StrategyPanel manual backtest trigger", () => {
     await runAtomicBacktest();
     vi.clearAllMocks();
 
-    fireEvent.click(getButton(COMBO_TAB));
+    fireEvent.click(getTab(COMBO_TAB));
     await screen.findByText("暂无组合策略");
     await waitFor(() => expect(useAppStore.getState().strategyId).toBeNull());
 
@@ -825,9 +833,9 @@ describe("StrategyPanel manual backtest trigger", () => {
   it("renders three strategy category tabs including the factor tab", async () => {
     await renderLoadedPanel();
 
-    expect(getButton(REGULAR_TAB)).toBeTruthy();
-    expect(getButton(COMBO_TAB)).toBeTruthy();
-    expect(getButton(FACTOR_TAB)).toBeTruthy();
+    expect(getTab(REGULAR_TAB)).toBeTruthy();
+    expect(getTab(COMBO_TAB)).toBeTruthy();
+    expect(getTab(FACTOR_TAB)).toBeTruthy();
   });
 
   it("shows factor strategies only on the factor tab, never on the regular tab", async () => {
@@ -837,7 +845,7 @@ describe("StrategyPanel manual backtest trigger", () => {
     expect(screen.queryByText("因子组合甲")).toBeNull();
     expect(screen.getByText("Alpha Trend")).toBeTruthy();
 
-    fireEvent.click(getButton(FACTOR_TAB));
+    fireEvent.click(getTab(FACTOR_TAB));
     await waitFor(() => expect(useAppStore.getState().strategyId).toBe(50));
     expect(screen.getAllByText("因子组合甲").length).toBeGreaterThan(0);
     expect(screen.queryByText("Alpha Trend")).toBeNull();
@@ -846,7 +854,7 @@ describe("StrategyPanel manual backtest trigger", () => {
   it("shows the factor empty state and a lab CTA when no factor strategies exist", async () => {
     await renderLoadedPanel();
 
-    fireEvent.click(getButton(FACTOR_TAB));
+    fireEvent.click(getTab(FACTOR_TAB));
     await screen.findByText(/暂无因子策略/);
     await waitFor(() => expect(useAppStore.getState().strategyId).toBeNull());
 
@@ -859,7 +867,7 @@ describe("StrategyPanel manual backtest trigger", () => {
     mockApi([...STRATEGIES, FACTOR_STRATEGY]);
     await renderLoadedPanel();
 
-    fireEvent.click(getButton(FACTOR_TAB));
+    fireEvent.click(getTab(FACTOR_TAB));
     const deleteBtn = await screen.findByRole("button", { name: "删除 因子组合甲" });
     fireEvent.click(deleteBtn);
 

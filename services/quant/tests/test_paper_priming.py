@@ -7,8 +7,6 @@ from __future__ import annotations
 
 import json
 
-import pytest
-
 from app.okx.types import Candle
 from app.strategies import STRATEGY_REGISTRY
 from tests.conftest import make_synthetic_candles

@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Trade, TriggerExplain } from "@/lib/types";
 import { useAppStore } from "@/lib/store";
+import { TRADES_MAX } from "@/lib/wireCaps";
 import AutoTradeTradesTable from "./AutoTradeTradesTable";
 
 function setTrades(trades: Trade[]) {
@@ -84,5 +85,25 @@ describe("AutoTradeTradesTable", () => {
     fireEvent.click(toggle);
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     expect(screen.queryByText(/因子组合复合得分触发/)).toBeNull();
+  });
+});
+
+// 成交缓冲触到 wire 封顶时的诚实提示（resilience-and-hci-hardening D4）。
+// 「看不到全部」必须是被说出来的事实，否则用户会以为自己的成交丢了。
+describe("实时成交上限提示（D4）", () => {
+  function plainTrade(ts: number): Trade {
+    return { ts, side: "long", price: 100 + ts, qty: 1, fee: 0, pnl: 0, positionAfter: 1, reason: "entry" };
+  }
+
+  it("触到上限时表尾出现「仅保留最近 N 笔」提示", () => {
+    setTrades(Array.from({ length: TRADES_MAX }, (_, i) => plainTrade(i)));
+    render(<AutoTradeTradesTable />);
+    expect(screen.getByText(new RegExp(`仅保留最近 ${TRADES_MAX} 笔`))).toBeTruthy();
+  });
+
+  it("未触到上限时不出提示（差一笔也不出）", () => {
+    setTrades(Array.from({ length: TRADES_MAX - 1 }, (_, i) => plainTrade(i)));
+    render(<AutoTradeTradesTable />);
+    expect(screen.queryByText(new RegExp(`仅保留最近 ${TRADES_MAX} 笔`))).toBeNull();
   });
 });

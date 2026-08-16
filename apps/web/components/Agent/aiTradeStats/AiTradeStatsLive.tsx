@@ -42,6 +42,7 @@ import { aiTradeApi } from "@/lib/aiTradeApi";
 import { ApiRequestError } from "@/lib/api";
 import { colorForReturn, fmtTime, signed } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
+import { TRADES_MAX } from "@/lib/wireCaps";
 
 // AI 自动交易统计「当前」视图（ai-trade-stats-dashboard §3.10.1）：读瞬态 store.aiTradeGroup，复用
 // autoTradePnl 纯函数把各成员成交配对为完整交易往返，按时间维度汇总总收益 / 收益率 / 胜率 + 当前持仓浮盈
@@ -133,6 +134,13 @@ export default function AiTradeStatsLive() {
     [group],
   );
 
+  // D4：`fullSummary` 与 `capture` 都由 `member.trades` 直接求和，而那份缓冲有 wire 封顶。
+  // **统计的分母变了就必须说**——否则一个交易产品会在报一个它自己都不相信的收益率。
+  const tradesCapped = useMemo(
+    () => Object.values(group?.members ?? {}).some((m) => m.trades.length >= TRADES_MAX),
+    [group],
+  );
+
   if (group == null) {
     return (
       <EmptyHint text="尚未启动 AI 自动交易；启动后这里按时间维度汇总每次完整交易（开→平）的收益与总收益率，停止后可在『历史』标签回溯。" />
@@ -148,6 +156,15 @@ export default function AiTradeStatsLive() {
           数据自 <span className="tabular text-[var(--text)]">{fmtTime(group.startedTs)}</span> 起记录
           （运行期态；整组停止后转入「历史」标签持久保存）。
         </p>
+        {tradesCapped && (
+          <p
+            data-testid="ai-trade-stats-cap-notice"
+            className="rounded-md border border-[var(--warn)] bg-[var(--warn-soft)] px-2.5 py-1.5 text-[10px] leading-relaxed text-[var(--warn)]"
+          >
+            口径：最近 {TRADES_MAX} 笔成交。实时缓冲已达上限，下方「全会话」总收益、成交笔数、
+            预计年化与利润捕获率均按此口径计算；权威全量口径见「历史」标签。
+          </p>
+        )}
         {/* 暂停期口径提示（ai-trade-pause-resume §3.9.4）：不加这一句，一张「决策轮数不再增长」
             的看板会被读成「AI 停摆 / 坏了」——而暂停期不起决策轮是**预期行为**，仍在跑的是盯市
             与保护层。这条提示只解释口径，不复述任何判定性结论。 */}

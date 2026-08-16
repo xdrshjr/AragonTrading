@@ -10,3 +10,10 @@ filterwarnings = ["ignore::DeprecationWarning"]
 [tool.ruff]
 line-length = 110
 target-version = "py311"
+
+[tool.ruff.lint]
+# 显式钉规则集，不吃 ruff 默认集的版本漂移（resilience-and-hci-hardening D9）。
+# 只选「一定是缺陷」的两类：pyflakes（未用导入 / 未用变量 / 未定义名 / 重复定义）与语法、运行时错误。
+# **刻意不选 B008**——FastAPI 的 `Depends()` 写在默认参数里是框架惯例，选它会产出 141 条假阳，
+# 而一道会报假阳的门禁只会被训练成「一律忽略」，那等于没有门禁。
+select = ["F", "E9"]

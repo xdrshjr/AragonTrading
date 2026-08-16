@@ -17,3 +17,5 @@ aiosqlite==0.20.0
 # 测试
 pytest==8.3.4
 pytest-asyncio==0.25.2
+# lint（钉版本：lint 结果随版本漂移是门禁不可信的头号原因）
+ruff==0.16.3

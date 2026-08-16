@@ -31,6 +31,7 @@ from ..okx.session_link import make_session_link
 from ..okx.ws_client import OKXWSClient
 from ..paper.strategy_factory import PaperStrategySpec
 from ..strategies.base import Signal
+from ..wire_caps import tail_trades
 from .backstop_repair import (RepairRuntime, repair_now_from_executor,
                               rule_from_settings as repair_rule_from_settings, schedule_repair)
 from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, gate_status
@@ -2015,7 +2016,9 @@ class AiTradeSession:
         # RV-1：在飞轮 _round_trace 是被原地 mutate 的引用；对每轮做浅拷贝（顶层键即冻结，
         # thinking/analysis 为不可变 str 且 mutate 走键重绑定，不回灌拷贝出的 dict），避免快照握手
         # await 期间决策任务续写导致重连客户端对同段文字二次追加（每段增量恰好下发一次）。
-        return {"trades": list(self.executor.trades),
+        # D4：**下发**封顶末 2000 条（断线重放载荷与前端内存的安全网）；`executor.trades` 本体
+        # 是换手闸 / run metrics / 成本对账的会计真值，**绝不裁剪**（见 app/wire_caps.py）。
+        return {"trades": tail_trades(self.executor.trades),
                 "equity": list(self._equity),
                 "position": self._position_payload(mark),
                 "status": self._status_payload(),

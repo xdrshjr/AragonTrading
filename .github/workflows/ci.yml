@@ -20,6 +20,10 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: pip install -r requirements.txt
+      # 规则集钉在 pyproject 的 [tool.ruff.lint]（只选 F + E9，见该处注释）。排在 pytest 之前：
+      # 未用导入 / 未定义名这类缺陷 3 秒能查出来，不该让人等完整跑测才看到（D9）。
+      - name: Lint (ruff)
+        run: python -m ruff check .
       # pyproject 的 addopts="-m 'not network'" 默认排除真实网络用例，离线可绿（C4）
       - name: Run pytest
         run: python -m pytest -q

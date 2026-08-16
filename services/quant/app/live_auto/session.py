@@ -25,6 +25,7 @@ from ..okx.session_link import make_session_link
 from ..okx.ws_client import OKXWSClient
 from ..strategies.base import BaseStrategy
 from ..paper.session import PAPER_WINDOW_MAX
+from ..wire_caps import tail_trades
 from .executor import LiveExecutor
 
 _SNAPSHOT_EQUITY_MAX = 1000   # snapshot 回放净值上限（订阅即重放末 N 条）
@@ -462,7 +463,8 @@ class LiveAutoSession:
 
     def snapshot(self) -> dict:
         mark = float(self._candles[-1]["c"]) if self._candles else self.executor.entry_price
-        return {"trades": list(self.executor.trades),
+        # D4：**下发**封顶末 2000 条；`executor.trades` 本体是会计真值，绝不裁剪（见 app/wire_caps.py）。
+        return {"trades": tail_trades(self.executor.trades),
                 "equity": list(self._equity),   # R-3：deque 不支持切片，maxlen 已自动裁顶
                 "position": self.executor.position_payload(mark),
                 "status": self._status_payload()}

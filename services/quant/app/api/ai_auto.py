@@ -670,7 +670,12 @@ async def ws_ai_trade(websocket: WebSocket, session_id: str) -> None:
         await websocket.send_text(json.dumps({"type": "status", "data": snap["status"]}))
         await websocket.send_text(json.dumps({"type": "snapshot", "data": snap}))
         while True:
-            event = await queue.get()
+            # 空闲保活（spec D3）：终态由 `status` 事件承载，服务端不主动关连接（同 ws_paper）。
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=_WS_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                await websocket.send_text(json.dumps({"type": "ping"}))
+                continue
             await websocket.send_text(json.dumps(event))
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass

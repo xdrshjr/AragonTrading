@@ -10,6 +10,7 @@ import { api } from "@/lib/api";
 import type { RoundTrip } from "@/lib/autoTradePnl";
 import { useAppStore } from "@/lib/store";
 import type { PaperPositionEvent, Trade } from "@/lib/types";
+import { TRADES_MAX } from "@/lib/wireCaps";
 import AiTradeStatsPanel from "./AiTradeStatsPanel";
 
 vi.mock("@/lib/aiTradeHistoryApi", () => ({
@@ -121,7 +122,7 @@ describe("AiTradeStatsPanel", () => {
   it("shows empty states on both tabs when nothing is running and no history exists", async () => {
     renderPanel();
     expect(screen.getByText(/尚未启动 AI 自动交易/)).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "历史" }));
+    fireEvent.click(screen.getByRole("tab", { name: "历史" }));
     expect(await screen.findByText(/暂无历史 AI 自动交易记录/)).toBeInTheDocument();
   });
 
@@ -158,7 +159,7 @@ describe("AiTradeStatsPanel", () => {
     listMock.mockResolvedValue(entry);
     detailMock.mockResolvedValue(makeDetail({}));
     renderPanel();
-    fireEvent.click(screen.getByRole("button", { name: "历史" }));
+    fireEvent.click(screen.getByRole("tab", { name: "历史" }));
     const card = await screen.findByRole("button", { name: /BTC-USDT-SWAP/ });
     fireEvent.click(card);
     expect(await screen.findByText(/已实现总收益/)).toBeInTheDocument();
@@ -177,7 +178,7 @@ describe("AiTradeStatsPanel", () => {
     });
     detailMock.mockResolvedValue(makeDetail({})); // members 无 equityDigest
     renderPanel();
-    fireEvent.click(screen.getByRole("button", { name: "历史" }));
+    fireEvent.click(screen.getByRole("tab", { name: "历史" }));
     fireEvent.click(await screen.findByRole("button", { name: /BTC-USDT-SWAP/ }));
     expect(await screen.findByText(/本次会话未落权益快照/)).toBeInTheDocument();
   });
@@ -185,7 +186,7 @@ describe("AiTradeStatsPanel", () => {
   it("shows a loading skeleton and then an error alert on history failure", async () => {
     listMock.mockRejectedValue(new Error("boom"));
     renderPanel();
-    fireEvent.click(screen.getByRole("button", { name: "历史" }));
+    fireEvent.click(screen.getByRole("tab", { name: "历史" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(/加载历史失败/);
   });
 
@@ -253,7 +254,7 @@ describe("AiTradeStatsPanel", () => {
       },
     }));
     renderPanel();
-    fireEvent.click(screen.getByRole("button", { name: "历史" }));
+    fireEvent.click(screen.getByRole("tab", { name: "历史" }));
     fireEvent.click(await screen.findByRole("button", { name: /BTC-USDT-SWAP/ }));
     expect(await screen.findByText("反思轮数")).toBeInTheDocument();
     expect(screen.getByText("反思放行")).toBeInTheDocument();
@@ -274,7 +275,7 @@ describe("AiTradeStatsPanel", () => {
       },
     }));
     renderPanel();
-    fireEvent.click(screen.getByRole("button", { name: "历史" }));
+    fireEvent.click(screen.getByRole("tab", { name: "历史" }));
     fireEvent.click(await screen.findByRole("button", { name: /BTC-USDT-SWAP/ }));
     // 旧五键卡照常渲染。label 自 realized-edge-calibration E-3 起带口径词——`decisionRounds` 是
     // **全程**真实轮数而 `holdRate` 的分母是近 50 轮保留样本，两个分母并排而不标口径就是误导（D-8）。
@@ -369,7 +370,7 @@ describe("AiTradeStatsPanel", () => {
     detail.members[0].trades = wakeAttributedTrades();
     detailMock.mockResolvedValue(detail);
     renderPanel();
-    fireEvent.click(screen.getByRole("button", { name: "历史" }));
+    fireEvent.click(screen.getByRole("tab", { name: "历史" }));
     fireEvent.click(await screen.findByRole("button", { name: /BTC-USDT-SWAP/ }));
     const card = await screen.findByTestId("wake-attribution-card");
     expect(card).toHaveTextContent("K 线收盘 · 信号板已重算");
@@ -486,7 +487,7 @@ describe("AiTradeStatsDetail cost readings", () => {
     listMock.mockResolvedValue(HISTORY_LIST);
     detailMock.mockResolvedValue(detail);
     renderPanel();
-    fireEvent.click(screen.getByRole("button", { name: "历史" }));
+    fireEvent.click(screen.getByRole("tab", { name: "历史" }));
     return screen.findByRole("button", { name: /BTC-USDT-SWAP/ }).then((card) => {
       fireEvent.click(card);
     });
@@ -605,5 +606,29 @@ describe("AiTradeStatsDetail cost readings", () => {
     expect(card).toHaveTextContent("BTC-USDT-SWAP");
     expect(card).toHaveTextContent("位移中位（12 笔） 13.9 bps");
     expect(card).toHaveTextContent("带门禁估计 83.0%");
+  });
+});
+
+// 统计口径随封顶如实改写（resilience-and-hci-hardening D4 / [R-1]）。
+//
+// `fullSummary`（全会话总收益 / 成交笔数 / 预计年化）与 `capture`（利润捕获率）都**直接由
+// `member.trades` 求和**，而那份缓冲有 wire 封顶。分母变了就必须说——否则一个交易产品在报一个
+// 它自己都不相信的收益率。
+describe("AiTradeStatsLive — 成交缓冲触顶时的口径标注（D4）", () => {
+  it("触到上限时给出「口径：最近 N 笔成交」标注", () => {
+    const group = makeGroup();
+    group.members["BTC-USDT-SWAP"].trades = Array.from({ length: TRADES_MAX }, (_, i) =>
+      trade({ id: i, ts: NOW_SEC - TRADES_MAX + i, side: i % 2 === 0 ? "long" : "close" }),
+    );
+    useAppStore.setState({ aiTradeGroup: group });
+    renderPanel();
+    const notice = screen.getByTestId("ai-trade-stats-cap-notice");
+    expect(notice).toHaveTextContent(`口径：最近 ${TRADES_MAX} 笔成交`);
+  });
+
+  it("未触到上限时不出该标注（默认口径仍是「全会话」）", () => {
+    useAppStore.setState({ aiTradeGroup: makeGroup() });
+    renderPanel();
+    expect(screen.queryByTestId("ai-trade-stats-cap-notice")).not.toBeInTheDocument();
   });
 });

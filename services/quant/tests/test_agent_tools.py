@@ -1,8 +1,6 @@
 """Agent 工具单测：summary/payload + ok=False（OKX 不可达不假数据，C1）。"""
 from __future__ import annotations
 
-import pytest
-
 from app.agent.tools.base import ToolContext, ToolResult, UiContext
 from app.agent.tools.market_tools import GetCandlesTool, GetMarketSummaryTool, ListInstrumentsTool
 from app.agent.tools.registry import ToolRegistry
@@ -10,7 +8,7 @@ from app.agent.tools.run_tools import GetRunMetricsTool
 from app.agent.tools.strategy_tools import CompareStrategiesTool, ListStrategiesTool, RunBacktestTool
 from app.agent.tools.ui_tools import ShowChartTool
 from app.okx.rest_client import OKXError
-from app.okx.types import Candle, Instrument
+from app.okx.types import Instrument
 
 
 class _FakeRest:

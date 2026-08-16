@@ -599,7 +599,7 @@ function ConfigStep({
       {warnings.map((w) => (
         <div
           key={w}
-          className="rounded-[8px] border border-[color-mix(in_srgb,var(--warn,#d97706)_40%,transparent)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--warn,#d97706)]"
+          className="rounded-[8px] border border-[color-mix(in_srgb,var(--warn)_40%,transparent)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--warn)]"
         >
           ⚠ {w}
         </div>
@@ -608,7 +608,7 @@ function ConfigStep({
         <div className="rounded-[8px] border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--muted)]">
           权重训练区间：{provenanceHint.instId ?? instId} · {provenanceHint.bar ?? "—"} ·{" "}
           {fmtTime(provenanceHint.startTs)} → {fmtTime(provenanceHint.endTs)}
-          <span className={inSample ? "text-[var(--warn,#d97706)]" : "text-[var(--long)]"}>
+          <span className={inSample ? "text-[var(--warn)]" : "text-[var(--long)]"}>
             {inSample
               ? " · 当前区间与训练区间重叠（样本内），结果可能偏乐观"
               : " · 当前区间为样本外"}
@@ -655,7 +655,7 @@ function ResultStep({
         ) : result ? (
           <>
             {result.truncated && (
-              <div className="rounded-[8px] border border-[color-mix(in_srgb,var(--warn,#d97706)_40%,transparent)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--warn,#d97706)]">
+              <div className="rounded-[8px] border border-[color-mix(in_srgb,var(--warn)_40%,transparent)] bg-[var(--surface)] px-3 py-2 text-[11px] text-[var(--warn)]">
                 ⚠ 区间过长 / 历史不足，仅覆盖最近 {result.effectiveCandleCount} / {result.requestedBars} 根，收益率为部分区间结果。
               </div>
             )}

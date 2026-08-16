@@ -27,7 +27,7 @@ from app.ai_auto.prompts import (
 )
 from app.ai_auto.signals import position_ladder, quantize_size_fraction
 from app.api.ai_auto import _resolve_position_step
-from app.config import Settings, get_settings
+from app.config import Settings
 from app.db.models import Strategy
 from app.db.session import dispose_engine, get_sessionmaker, init_db
 

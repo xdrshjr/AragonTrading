@@ -196,6 +196,8 @@ def test_state_survives_repeated_prepare():
     strat._peak = 123.0
     strat._trail_armed = True
     df = strat.prepare(pd.DataFrame(_uptrend_pullbacks()), "1H")
+    # prepare 确实做了事（否则「不写持仓运行态」这条断言会因为它什么都没做而空转变绿）。
+    assert not df.empty
     assert strat._peak == 123.0
     assert strat._trail_armed is True
     # 模拟 paper 路径：持多仓后逐根重复 prepare + on_candle，峰值应持续累积。

@@ -17,6 +17,12 @@
   --accent-soft: #f0ddd4;
   --long: #3b8c6e; /* green */
   --short: #c0573e; /* rust */
+  /* 警告语义（spec D5）。此前这个 token 根本不存在，六处调用各自内联回退 #d97706 或 var(--short)，
+     于是同一个「警告」渲染成琥珀 / 铁锈红两种颜色，且 #d97706 在浅色三种底上只有 2.78–3.16:1。
+     取值经 WCAG 2.1 相对亮度复算：对 --bg 5.71、--surface 6.16、--surface-2 5.42、--warn-soft 5.07。
+     警告面一律用 --warn-soft 打底 + 图标，绝不靠颜色单通道传达（色觉障碍友好）。 */
+  --warn: #8f5209; /* amber-ink */
+  --warn-soft: #f6e6cf;
 
   --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Menlo", monospace;
@@ -33,6 +39,9 @@
   --accent-soft: #3a2c25;
   --long: #5fb38c;
   --short: #d97a62;
+  /* 暗色配对：--warn 对 --bg 8.26、--surface 7.57、--surface-2 6.76、--warn-soft 6.14。 */
+  --warn: #e0a75f;
+  --warn-soft: #3a2f1e;
 }
 
 * {

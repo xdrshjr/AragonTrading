@@ -43,6 +43,7 @@ import type { FactorEditTarget, FactorTargetRef, SymbolGroup } from "./factorTyp
 import type { WeightTrainResult, WeightTrainTarget } from "./weightModelTypes";
 import type { WeightBatchTarget } from "./weightBatchTypes";
 import type { WorkspacePrefs } from "./workspaceTypes";
+import { TRADES_MAX } from "./wireCaps";
 import { clampAllocationOnEdit, defaultAllocationOnAdd, evenSplit } from "./autoTrade";
 import { AI_TRADE_DEFAULT_POSITION_STEP, AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN } from "./aiTrade";
 
@@ -810,14 +811,16 @@ export const useAppStore = create<AppState>()(
       // 实时自动交易运行期态（瞬态）：句柄 / 状态 / 成交流 / 持仓 / 风险勾选记忆 + 清理。
       setLiveAutoSessionId: (liveAutoSessionId) => set({ liveAutoSessionId }),
       setLiveAutoStatus: (liveAutoStatus) => set({ liveAutoStatus }),
-      setLiveAutoTrades: (liveAutoTrades) => set({ liveAutoTrades }),
+      // 成交流封顶（D4）：整列与增量两条路径都裁到末 TRADES_MAX 条。去重的 `some()` 扫描范围
+      // 随之有界，会话全程的 O(n²) 上界被钉死；语义不变（保留的永远是最新的那些）。
+      setLiveAutoTrades: (liveAutoTrades) => set({ liveAutoTrades: liveAutoTrades.slice(-TRADES_MAX) }),
       appendLiveAutoTrade: (trade) =>
         set((s) =>
           s.liveAutoTrades.some(
             (t) => t.ts === trade.ts && t.side === trade.side && t.price === trade.price,
           )
             ? s
-            : { liveAutoTrades: [...s.liveAutoTrades, trade] },
+            : { liveAutoTrades: [...s.liveAutoTrades, trade].slice(-TRADES_MAX) },
         ),
       setLiveAutoPosition: (liveAutoPosition) => set({ liveAutoPosition }),
       // 事件流环形追加：超上限裁最旧（H6，关键 error 由组件置顶高亮呈现）。
@@ -897,7 +900,12 @@ export const useAppStore = create<AppState>()(
       setLiveAutoMemberPosition: (instId, position) =>
         set((s) => patchLiveAutoMember(s.liveAutoGroup, instId, (m) => ({ ...m, position }))),
       setLiveAutoMemberTrades: (instId, trades) =>
-        set((s) => patchLiveAutoMember(s.liveAutoGroup, instId, (m) => ({ ...m, trades }))),
+        set((s) =>
+          patchLiveAutoMember(s.liveAutoGroup, instId, (m) => ({
+            ...m,
+            trades: trades.slice(-TRADES_MAX),   // 成交流封顶（D4）
+          })),
+        ),
       appendLiveAutoMemberTrade: (instId, trade) =>
         set((s) =>
           patchLiveAutoMember(s.liveAutoGroup, instId, (m) =>
@@ -905,7 +913,7 @@ export const useAppStore = create<AppState>()(
               (t) => t.ts === trade.ts && t.side === trade.side && t.price === trade.price,
             )
               ? m
-              : { ...m, trades: [...m.trades, trade] },
+              : { ...m, trades: [...m.trades, trade].slice(-TRADES_MAX) },
           ),
         ),
       clearLiveAutoGroup: () => set({ liveAutoGroup: null }),
@@ -944,7 +952,12 @@ export const useAppStore = create<AppState>()(
           s.aiTradeGroup ? { aiTradeGroup: { ...s.aiTradeGroup, ...patch } } : {},
         ),
       setAiTradeMemberTrades: (instId, trades) =>
-        set((s) => patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({ ...m, trades }))),
+        set((s) =>
+          patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({
+            ...m,
+            trades: trades.slice(-TRADES_MAX),   // 成交流封顶（D4）
+          })),
+        ),
       appendAiTradeMemberTrade: (instId, trade) =>
         set((s) =>
           patchAiTradeMember(s.aiTradeGroup, instId, (m) =>
@@ -952,7 +965,7 @@ export const useAppStore = create<AppState>()(
               (t) => t.ts === trade.ts && t.side === trade.side && t.price === trade.price,
             )
               ? m
-              : { ...m, trades: [...m.trades, trade] },
+              : { ...m, trades: [...m.trades, trade].slice(-TRADES_MAX) },
           ),
         ),
       setAiTradeMemberPosition: (instId, position) =>

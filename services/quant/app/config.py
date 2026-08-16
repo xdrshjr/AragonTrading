@@ -121,6 +121,11 @@ class Settings(BaseSettings):
     # 停止会话平仓失败的有界重试次数（默认 2；仍失败则诚实返回 residual 并强提示人工平仓，H4）。
     live_auto_flatten_max_retries: int = 2
 
+    # ---- 进程关停（resilience-and-hci-hardening D1）----
+    # 关停链单步收敛死线（秒）。超时即取消该步并继续——绝不让一步挂死拖住引擎与连接池的释放。
+    # 20s 对默认的 ai_trade_shutdown_action="hold"（只写 DB 不下单）绰绰有余；慢盘/慢盘符环境可调大。
+    shutdown_step_timeout_s: float = 20.0
+
     # ---- AI 自动交易（ai-auto-trading spec §三/config：AI Agent 作为多策略信号的决策者）----
     # 字段名即环境变量名（AI_TRADE_*，大小写不敏感）。**必须真的声明这些字段**：Settings 为
     # extra="ignore"，未声明的 AI_TRADE_* env 会被静默丢弃（P1-6）。桌面打包须在

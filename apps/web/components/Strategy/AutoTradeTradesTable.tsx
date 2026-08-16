@@ -7,6 +7,7 @@ import { useAppStore } from "@/lib/store";
 import { fmtPrice, fmtQty, fmtTime, signed } from "@/lib/format";
 import { Badge } from "@/components/ui";
 import { explainKindLabel, explainKindTone } from "@/lib/tradeExplain";
+import { TRADES_MAX } from "@/lib/wireCaps";
 import TradeExplainDetail from "./TradeExplainDetail";
 
 /**
@@ -39,6 +40,9 @@ export default function AutoTradeTradesTable() {
     );
   }
 
+  // 本表自持数据源（`liveAutoTrades`），故截断在这里**本地可判定**——store 的封顶与这个判据
+  // 共用同一个 `TRADES_MAX`，不需要 wire 上多一个没有第二个读点的 `tradesTotal` 字段。
+  const capReached = trades.length >= TRADES_MAX;
   const ordered = trades.slice().sort((a, b) => b.ts - a.ts);
   const toggle = (key: string) =>
     setExpanded((prev) => {
@@ -69,6 +73,12 @@ export default function AutoTradeTradesTable() {
           })}
         </ul>
       </div>
+      {capReached && (
+        // 「看不到全部」必须是被说出来的事实（D4）：否则用户会以为自己的成交丢了。
+        <p className="px-4 pb-3 pt-1 text-[10px] text-[var(--muted)]">
+          实时成交仅保留最近 {TRADES_MAX} 笔，更早的记录见运行历史。
+        </p>
+      )}
     </section>
   );
 }

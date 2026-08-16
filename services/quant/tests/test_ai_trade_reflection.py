@@ -17,7 +17,7 @@ import pytest
 
 from app.agent.llm.base import StreamEvent
 from app.ai_auto.decider import AiTradeDecider, ReflectionVerdict, TradeDecision, _fail_closed
-from app.ai_auto.prompts import REFLECTION_TOOL_NAME, build_reflection_prompt
+from app.ai_auto.prompts import REFLECTION_TOOL_NAME
 from app.ai_auto.reflection import applied_shrink, apply_reflection, build_reflection_note
 from app.config import Settings
 

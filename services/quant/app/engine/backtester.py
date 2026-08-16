@@ -11,7 +11,7 @@ import pandas as pd
 
 from ..strategies.base import BaseStrategy
 from .metrics import compute_metrics
-from .simulator import EquityRecord, RiskParams, SimBroker, TradeRecord
+from .simulator import EquityRecord, SimBroker, TradeRecord
 
 
 @dataclass

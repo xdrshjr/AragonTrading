@@ -9,6 +9,9 @@ import {
   DEFAULT_WF_PARAMS,
   useAppStore,
 } from "./store";
+import type { AiTradeGroupMemberState, AiTradeGroupState } from "./aiTradeTypes";
+import type { Trade } from "./types";
+import { TRADES_MAX } from "./wireCaps";
 
 describe("app store — account mode & sim balance", () => {
   beforeEach(() => {
@@ -774,5 +777,91 @@ describe("app store — hydrateWorkspace (watchlist-auto-trade-persistence)", ()
     });
     expect(useAppStore.getState().watchlist).toEqual([]);
     expect(useAppStore.getState().autoTradeMembers).toEqual([]);
+  });
+});
+
+// 成交缓冲的 wire 级封顶（resilience-and-hci-hardening D4）。
+//
+// 这四条追加路径此前**全部无界**，且每条都带一次 `some()` 去重 —— 会话全程是 O(n²)。
+// 封顶把扫描范围钉死在 TRADES_MAX 上；语义不变（保留的永远是最新的那些）。
+describe("app store — 实时成交缓冲封顶（D4）", () => {
+  function trade(ts: number): Trade {
+    return { ts, side: "long", price: 100 + ts, qty: 1, fee: 0, pnl: 0, positionAfter: 1, reason: "entry" };
+  }
+
+  function member(instId: string, trades: Trade[]): AiTradeGroupMemberState {
+    return {
+      instId,
+      sessionId: `sess-${instId}`,
+      allocationPct: 100,
+      session: null,
+      trades,
+      position: null,
+      decisions: [],
+      traces: [],
+      summary: null,
+    };
+  }
+
+  function aiGroup(trades: Trade[]): AiTradeGroupState {
+    return {
+      groupId: "g1",
+      bar: "1H",
+      strategyIds: [1],
+      strategyNames: ["s"],
+      totalBudgetUsd: 1000,
+      leverage: 3,
+      contextRefreshRounds: 4,
+      state: "running",
+      startedTs: 0,
+      members: { "BTC-USDT-SWAP": member("BTC-USDT-SWAP", trades) },
+    };
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({ liveAutoTrades: [], aiTradeGroup: null, liveAutoGroup: null });
+  });
+
+  it("appendLiveAutoTrade 追加第 TRADES_MAX+1 笔后长度恒为上限且保留最新", () => {
+    const store = useAppStore.getState();
+    store.setLiveAutoTrades(Array.from({ length: TRADES_MAX }, (_, i) => trade(i)));
+    store.appendLiveAutoTrade(trade(TRADES_MAX));
+    const kept = useAppStore.getState().liveAutoTrades;
+    expect(kept).toHaveLength(TRADES_MAX);
+    expect(kept[kept.length - 1].ts).toBe(TRADES_MAX);
+    expect(kept[0].ts).toBe(1); // 最旧的那笔被裁掉
+  });
+
+  it("setLiveAutoTrades 整列灌入（snapshot 重放）同样被封顶", () => {
+    useAppStore
+      .getState()
+      .setLiveAutoTrades(Array.from({ length: TRADES_MAX + 50 }, (_, i) => trade(i)));
+    const kept = useAppStore.getState().liveAutoTrades;
+    expect(kept).toHaveLength(TRADES_MAX);
+    expect(kept[kept.length - 1].ts).toBe(TRADES_MAX + 49);
+  });
+
+  it("appendAiTradeMemberTrade 与整列 setter 都封顶", () => {
+    useAppStore.setState({ aiTradeGroup: aiGroup([]) });
+    const store = useAppStore.getState();
+    store.setAiTradeMemberTrades(
+      "BTC-USDT-SWAP",
+      Array.from({ length: TRADES_MAX + 10 }, (_, i) => trade(i)),
+    );
+    expect(useAppStore.getState().aiTradeGroup?.members["BTC-USDT-SWAP"].trades).toHaveLength(
+      TRADES_MAX,
+    );
+    useAppStore.getState().appendAiTradeMemberTrade("BTC-USDT-SWAP", trade(99999));
+    const kept = useAppStore.getState().aiTradeGroup?.members["BTC-USDT-SWAP"].trades ?? [];
+    expect(kept).toHaveLength(TRADES_MAX);
+    expect(kept[kept.length - 1].ts).toBe(99999);
+  });
+
+  it("去重语义不变：同 ts/side/price 的重复成交仍被丢弃", () => {
+    const store = useAppStore.getState();
+    store.appendLiveAutoTrade(trade(1));
+    store.appendLiveAutoTrade(trade(1));
+    expect(useAppStore.getState().liveAutoTrades).toHaveLength(1);
   });
 });

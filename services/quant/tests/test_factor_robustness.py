@@ -16,7 +16,6 @@ import pytest
 
 from app.engine.backtester import candles_to_df
 from app.engine.factors import (
-    FACTOR_LIBRARY,
     build_factor_matrix,
     causal_zscore,
     compose_score,

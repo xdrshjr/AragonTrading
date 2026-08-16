@@ -9,8 +9,6 @@ paper/live 每根已确认 K 线都重调一次 `prepare()`，于是跟踪止损
 """
 from __future__ import annotations
 
-import pandas as pd
-
 from app.engine.backtester import candles_to_df, run_backtest
 from app.engine.simulator import BrokerContext, SimBroker
 from app.strategies.momentum_breakout import MomentumBreakout

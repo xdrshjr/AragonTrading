@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { factorApi } from "@/lib/factorApi";
 import type { FactorSet } from "@/lib/factorTypes";
@@ -88,10 +88,11 @@ describe("FactorSetList", () => {
     expect(screen.queryByRole("button", { name: "新建策略" })).toBeNull();
   });
 
-  it("deletes after confirm, double-invalidates sets + strategies, clears the selected detail", async () => {
+  // spec D7：删除确认从原生 `window.confirm` 改为应用内 `ConfirmDialog`，两条用例改为驱动
+  // 弹窗按钮；断言逐条保留（双失效 + 选中详情清空 + 取消时不发请求 + 文案）。
+  it("deletes after confirming in the in-app dialog, double-invalidates sets + strategies, clears the selected detail", async () => {
     setsApi.list.mockResolvedValue([makeSet({ id: 7, name: "组合A" })]);
     setsApi.remove.mockResolvedValue(undefined);
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     const client = renderList();
     const invalidateSpy = vi.spyOn(client, "invalidateQueries");
     await waitFor(() => expect(screen.getByText("组合A")).toBeTruthy());
@@ -101,9 +102,11 @@ describe("FactorSetList", () => {
     expect(screen.getByTestId("detail")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "删除" }));
-    expect(confirmSpy).toHaveBeenCalled();
+    const dialog = screen.getByRole("dialog");
     // 删除确认文案明确「将同时移除对应交易策略」（有意反转旧不变量，R3）。
-    expect(String(confirmSpy.mock.calls[0]?.[0])).toContain("将同时移除");
+    expect(dialog).toHaveTextContent("将同时移除");
+    fireEvent.click(within(dialog).getByRole("button", { name: "确定" }));
+
     await waitFor(() => expect(setsApi.remove).toHaveBeenCalledWith(7));
     // 双失效：组合列表 + 交易策略列表（R1/§2.3）。
     await waitFor(() =>
@@ -115,11 +118,22 @@ describe("FactorSetList", () => {
 
   it("does not delete when the confirm dialog is dismissed", async () => {
     setsApi.list.mockResolvedValue([makeSet({ id: 7, name: "组合A" })]);
-    vi.spyOn(window, "confirm").mockReturnValue(false);
     renderList();
     await waitFor(() => expect(screen.getByText("组合A")).toBeTruthy());
 
     fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "取消" }));
     expect(setsApi.remove).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  });
+
+  it("never falls back to the blocking native confirm (D7：全仓最后一处已收编)", async () => {
+    setsApi.list.mockResolvedValue([makeSet({ id: 7, name: "组合A" })]);
+    const confirmSpy = vi.spyOn(window, "confirm");
+    renderList();
+    await waitFor(() => expect(screen.getByText("组合A")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "删除" }));
+    expect(confirmSpy).not.toHaveBeenCalled();
   });
 });

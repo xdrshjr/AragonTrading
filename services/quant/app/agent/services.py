@@ -31,7 +31,10 @@ from ..strategies.combo_specs import (
     combo_spec_from_row as _combo_spec_from_row,
     is_combo as _is_combo,
     policy_from_spec as _policy_from_spec,
-    validate_combo_params,
+    # **本模块内不调用，但它是对外的再导出**：`app/api/strategies.py:50/64` 走的是
+    # `services.validate_combo_params(...)`。F401 只看本文件内有没有引用，故必须显式豁免——
+    # 被 `ruff --fix` 删掉一次即让 `POST/PATCH /strategies` 在运行期 AttributeError。
+    validate_combo_params,  # noqa: F401
 )
 
 

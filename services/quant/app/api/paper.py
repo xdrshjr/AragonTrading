@@ -20,6 +20,10 @@ from ..schemas import PaperBatchStartReq, PaperStartReq
 
 router = APIRouter(tags=["paper"])
 
+# 静默此秒数后下发 ping（半开探测，镜像 ws_weight_train / ws_ai_backtest）。会话流的静默是**正常态**，
+# 而客户端 `lib/ws.ts` 的 45s 看门狗会把它误判成断连并每 46 秒重连一次——保活帧消除那条假断连回路。
+_WS_HEARTBEAT_SECONDS = 20.0
+
 
 @router.post("/paper/start")
 async def paper_start(body: PaperStartReq,
@@ -177,7 +181,14 @@ async def ws_paper(websocket: WebSocket, session_id: str) -> None:
         await websocket.send_text(json.dumps({"type": "status", "data": snap["status"]}))
         await websocket.send_text(json.dumps({"type": "snapshot", "data": snap}))
         while True:
-            event = await queue.get()
+            # 空闲保活（spec D3）：**不**照搬 job 流的「终态即补发并关闭」——会话流的终态语义由
+            # `status` 事件承载，由前端决定何时收连接；服务端擅自关连接会打断「会话已停止但用户
+            # 还在看成交明细」这个正常场景。
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=_WS_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                await websocket.send_text(json.dumps({"type": "ping"}))
+                continue
             await websocket.send_text(json.dumps(event))
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass

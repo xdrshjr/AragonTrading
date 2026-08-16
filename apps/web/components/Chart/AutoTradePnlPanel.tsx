@@ -12,6 +12,7 @@ import {
   summarizeRoundTrips,
 } from "@/lib/autoTradePnl";
 import { useAppStore } from "@/lib/store";
+import { TRADES_MAX } from "@/lib/wireCaps";
 import AutoTradePnlSummary from "./AutoTradePnlSummary";
 import AutoTradeRoundTripRow from "./AutoTradeRoundTripRow";
 
@@ -60,6 +61,13 @@ export default function AutoTradePnlPanel({
     return { visible: vis, summary: summarizeRoundTrips(vis, capitalBaseUsd), bounds: b };
   }, [liveAutoGroup, range, custom, nowSec, capitalBaseUsd]);
 
+  // D4：`buildLedger` 的入参是 `member.trades`，而那份缓冲有 wire 封顶。触到上限即改口径标注——
+  // 早于窗口起点的回合会整段消失，不说出来就是在报一个分母悄悄变过的收益率。
+  const tradesCapped = useMemo(
+    () => Object.values(liveAutoGroup?.members ?? {}).some((m) => m.trades.length >= TRADES_MAX),
+    [liveAutoGroup],
+  );
+
   return (
     <Modal open={open} onClose={onClose} labelledBy={TITLE_ID} className="max-w-2xl">
       <div className="flex items-center justify-between border-b border-[var(--border)] px-5 py-3.5">
@@ -85,6 +93,14 @@ export default function AutoTradePnlPanel({
               数据自 <span className="tabular text-[var(--text)]">{fmtTime(liveAutoGroup.startedTs)}</span>{" "}
               起记录（运行期态，整组停止后清空）；时间筛选覆盖本组启动以来，跨会话历史收益将在后续版本提供。
             </p>
+            {tradesCapped && (
+              <p
+                data-testid="auto-trade-pnl-cap-notice"
+                className="rounded-md border border-[var(--warn)] bg-[var(--warn-soft)] px-2.5 py-1.5 text-[10px] leading-relaxed text-[var(--warn)]"
+              >
+                口径：最近 {TRADES_MAX} 笔成交。实时缓冲已达上限，早于该窗口的往返不计入下方汇总。
+              </p>
+            )}
             <AutoTradePnlSummary
               range={range}
               onRangeChange={setRange}

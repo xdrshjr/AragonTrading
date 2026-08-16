@@ -19,6 +19,7 @@ from ..okx.types import BAR_SECONDS, Candle
 from ..okx.session_link import make_session_link
 from ..okx.ws_client import OKXWSClient
 from ..strategies.base import BaseStrategy
+from ..wire_caps import tail_trades
 
 PAPER_WINDOW_MAX = 1200
 _WINDOW_MAX = PAPER_WINDOW_MAX
@@ -387,13 +388,17 @@ class PaperSession:
                 "markPrice": mark, "unrealizedPnl": unrealized}
 
     def snapshot(self) -> dict:
-        """全部成交 + 末 N 条净值 + 当前持仓 + 状态，供 ws 订阅/重连即重放（R7）。
+        """末 N 条成交 + 末 N 条净值 + 当前持仓 + 状态，供 ws 订阅/重连即重放（R7）。
 
         seeded 标记：索引 `< _seeded_trade_count` 的成交为预热回填（§6.2 / P2-5）。
+
+        成交封顶（D4）：**先在全表上 enumerate 出 seeded、再切末 2000 条**。反过来（先切再
+        enumerate）会把切片内的相对下标当成绝对下标，于是每次重连都把最新的一批成交误标成预热成交。
+        `self.broker.trades` 本体不裁——它是会计真值（见 app/wire_caps.py）。
         """
         n = self._seeded_trade_count
-        trades = [_trade_record_out(t, seeded=(idx < n))
-                  for idx, t in enumerate(self.broker.trades)]
+        trades = tail_trades([_trade_record_out(t, seeded=(idx < n))
+                              for idx, t in enumerate(self.broker.trades)])
         equity = [equity_out_record(e) for e in self.broker.equity_points[-_SNAPSHOT_EQUITY_MAX:]]
         return {"trades": trades, "equity": equity,
                 "position": self._position_payload(), "status": self._status_payload()}

@@ -17,6 +17,7 @@ const {
   createReloadBudget,
   describeLoadFailure,
 } = require('./lib/renderer-health');
+const { describeStartupFailure } = require('./lib/startup-failure');
 const {
   ProcessManager,
   portFree,
@@ -624,7 +625,23 @@ if (!gotLock) {
   });
   ipcMain.on('aragon:show-about', () => showAbout());
 
-  app.whenReady().then(bootstrap);
+  // bootstrap 的兜底（spec D2）：没有它，启动期任何预料之外的异常都只是一个未处理的 Promise
+  // 拒绝 → uncaughtException → app.exit(1)，用户看到的是「双击后什么都没发生」。
+  app.whenReady().then(bootstrap).catch((err) => {
+    try {
+      logMain(`bootstrap failed: ${err && err.stack ? err.stack : err}`);
+      // logsDir() 是纯路径拼接；**绝不在这里调 ensureLogsDir()**——它会建目录、会失败，
+      // 而「建日志目录失败」恰恰是本条要兜的头号失败模式，兜底自己抛等于什么都没做。
+      const { title, body } = describeStartupFailure(err, paths.logsDir());
+      dialog.showErrorBox(title, body);
+    } catch (inner) {
+      // 极早期（GUI 未就绪 / 磁盘只读）连日志和对话框都不可用：那就只剩退出这一件事可做。
+      try {
+        process.stderr.write(`[main] startup failure handler failed: ${inner}\n`);
+      } catch { /* 无处可写 */ }
+    }
+    gracefulQuit().finally(() => app.exit(1));
+  });
 
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin') app.quit();

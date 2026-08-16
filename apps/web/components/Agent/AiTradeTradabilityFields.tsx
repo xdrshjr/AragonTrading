@@ -240,8 +240,8 @@ function BracketRow({ data }: { data: AiTradeTradabilityResponse | null }) {
     <p
       className="rounded border px-2 py-1 text-[10px] leading-relaxed"
       style={{
-        color: alarming ? "var(--warn, var(--short))" : "var(--muted)",
-        borderColor: alarming ? "var(--warn, var(--short))" : "var(--border)",
+        color: alarming ? "var(--warn)" : "var(--muted)",
+        borderColor: alarming ? "var(--warn)" : "var(--border)",
       }}
       data-testid="ai-bracket-verdict"
       data-level={bracket.level}

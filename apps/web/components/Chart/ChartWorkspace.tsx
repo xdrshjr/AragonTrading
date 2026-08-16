@@ -15,6 +15,7 @@ import { buildOrderPriceLines, openOrdersKey } from "@/lib/openOrders";
 import { ratioFromRightEdge, ratioFromTopEdge, widthFromLeftEdge } from "@/lib/panelResize";
 import { buildPaperPositionRows } from "@/lib/paperMulti";
 import { tradingApi } from "@/lib/tradingApi";
+import { TRADES_MAX } from "@/lib/wireCaps";
 import {
   DEFAULT_CHART_INDICATOR_RATIO,
   DEFAULT_CHART_SPLIT_RATIO,
@@ -55,6 +56,8 @@ interface ChartWorkspaceProps {
   overlayTrades?: Trade[];
   bottomTrades?: Trade[];
   tradeCapReached?: boolean;
+  /** 实时/模拟车道的成交缓冲已触到 wire 封顶（D4）；判据由 `app/page.tsx` 按车道计算后透传。 */
+  liveTradeCapReached?: boolean;
   indicators: Record<IndicatorKey, boolean>;
   theme: "light" | "dark";
   lastPrice: number | null;
@@ -83,6 +86,7 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
     overlayTrades,
     bottomTrades,
     tradeCapReached,
+    liveTradeCapReached,
     indicators,
     theme,
     lastPrice,
@@ -257,6 +261,11 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
           {tradeCapReached && (
             <div className="shrink-0 border-b border-[var(--border)] bg-[var(--surface-2)] px-4 py-1.5 text-[11px] font-medium text-[var(--muted)]">
               Backtest trade cap reached: showing the latest 5000 returned trades.
+            </div>
+          )}
+          {liveTradeCapReached && (
+            <div className="shrink-0 border-b border-[var(--border)] bg-[var(--surface-2)] px-4 py-1.5 text-[11px] font-medium text-[var(--muted)]">
+              实时成交仅保留最近 {TRADES_MAX} 笔，更早的记录见运行历史。
             </div>
           )}
           <ChartHeaderBar

@@ -10,7 +10,8 @@ import math
 
 import pytest
 
-import app.strategies  # noqa: F401  P1-3：填充 STRATEGY_REGISTRY
+# P1-3：仅为填充 STRATEGY_REGISTRY 的副作用导入（故 F401 在此是预期的）。
+import app.strategies  # noqa: F401
 from app.engine.backtester import candles_to_df
 from app.engine.regime import (
     RegimeParams,

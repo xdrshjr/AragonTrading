@@ -30,6 +30,10 @@ from ..schemas import LiveAutoGroupStartIn, LiveAutoStartIn, run_out
 
 router = APIRouter(tags=["live-auto"])
 
+# 静默此秒数后下发 ping（半开探测，镜像 ws_weight_train / ws_ai_backtest）。盯市 tick 今天恰好每 5s
+# 推一次 equity 掩盖了这个问题，但一旦会话进终态或行情断流，它立刻退化成每 46 秒一次的假断连。
+_WS_HEARTBEAT_SECONDS = 20.0
+
 
 def _require_auto_enabled(settings: Settings) -> None:
     """写类守门（R1）：自动化总闸与底层写链路总闸须同时为 True，否则 403（先于凭证读取）。"""
@@ -180,7 +184,12 @@ async def ws_live_auto(websocket: WebSocket, session_id: str) -> None:
         await websocket.send_text(json.dumps({"type": "status", "data": snap["status"]}))
         await websocket.send_text(json.dumps({"type": "snapshot", "data": snap}))
         while True:
-            event = await queue.get()
+            # 空闲保活（spec D3）：终态由 `status` 事件承载，服务端不主动关连接（同 ws_paper）。
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=_WS_HEARTBEAT_SECONDS)
+            except asyncio.TimeoutError:
+                await websocket.send_text(json.dumps({"type": "ping"}))
+                continue
             await websocket.send_text(json.dumps(event))
     except (WebSocketDisconnect, asyncio.CancelledError):
         pass

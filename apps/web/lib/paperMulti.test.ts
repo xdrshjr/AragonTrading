@@ -15,6 +15,7 @@ import type {
   StrategyEquityPoint,
   StrategyTrade,
 } from "./types";
+import { EQUITY_MAX, TRADES_MAX } from "./wireCaps";
 
 function paperSessionRow(over: Partial<PaperSessionRow>): PaperSessionRow {
   return {
@@ -310,5 +311,57 @@ describe("buildPaperPositionRows", () => {
     const rows = buildPaperPositionRows([sessions[1], sessions[2]], {}, {}, {}, null);
     expect(rows.map((r) => r.strategyId)).toEqual([1, 2]);
     expect(rows.every((r) => r.position === null && r.equity === null)).toBe(true);
+  });
+});
+
+// 模拟盘多策略缓冲的封顶（resilience-and-hci-hardening D4）。
+// 成交这一侧是**真的**在收窄（前端此前无界）；净值那一侧无信息损失——后端 snapshot 早就只回末
+// 1000 条，这里只是把增量路径钉在同一个数字上，顺带把「每点一次全表排序」封在有界的 n 上。
+describe("实时缓冲封顶（D4）", () => {
+  function strategyTrade(ts: number): StrategyTrade {
+    return {
+      ts,
+      side: "long",
+      price: 100 + ts,
+      qty: 1,
+      fee: 0,
+      pnl: 0,
+      positionAfter: 1,
+      reason: "entry",
+      strategyId: 1,
+      strategyName: "s1",
+      color: "#000",
+    };
+  }
+
+  it("mergePaperTrade 超过 TRADES_MAX 后长度恒为上限且保留最新", () => {
+    let acc: Record<number, StrategyTrade[]> = {
+      1: Array.from({ length: TRADES_MAX }, (_, i) => strategyTrade(i)),
+    };
+    acc = mergePaperTrade(acc, strategyTrade(TRADES_MAX));
+    expect(acc[1]).toHaveLength(TRADES_MAX);
+    expect(acc[1][acc[1].length - 1].ts).toBe(TRADES_MAX);
+    expect(acc[1][0].ts).toBe(1);
+  });
+
+  it("mergePaperEquity 超过 EQUITY_MAX 后长度恒为上限且保留最新", () => {
+    let acc: Record<number, StrategyEquityPoint[]> = {
+      1: Array.from({ length: EQUITY_MAX }, (_, i) => ({
+        strategyId: 1,
+        ts: i,
+        equity: 10000 + i,
+        drawdown: 0,
+      })),
+    };
+    acc = mergePaperEquity(acc, { strategyId: 1, ts: EQUITY_MAX, equity: 20000, drawdown: 0 });
+    expect(acc[1]).toHaveLength(EQUITY_MAX);
+    expect(acc[1][acc[1].length - 1].ts).toBe(EQUITY_MAX);
+  });
+
+  it("mergePaperEquity 的同 ts 覆盖语义不变（封顶不改去重）", () => {
+    let acc: Record<number, StrategyEquityPoint[]> = {};
+    acc = mergePaperEquity(acc, { strategyId: 1, ts: 5, equity: 100, drawdown: 0 });
+    acc = mergePaperEquity(acc, { strategyId: 1, ts: 5, equity: 200, drawdown: 0 });
+    expect(acc[1]).toEqual([{ strategyId: 1, ts: 5, equity: 200, drawdown: 0 }]);
   });
 });
