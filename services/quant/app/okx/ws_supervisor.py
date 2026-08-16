@@ -134,7 +134,10 @@ class WSSupervisor:
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 —— 建连 / 收发的任何异常都只意味着「该重连了」
-            return False, f"connect_error: {exc}"
+            # 带上类名：握手/传输类异常的 `str()` 常为空串，只打 `{exc}` 的话登记簿与日志里就是
+            # 一句 `connect_error: `，下一次复发还得靠猜（同 `rest_client._exc_label`）。
+            # `_reason_code` / `_reason_text` 只取第一个冒号之前的头部，故错误码值域一字不变。
+            return False, f"connect_error: {type(exc).__name__}: {exc}"
 
     async def _open(self, ws, attempt: int) -> _PumpState:
         """发订阅并初始化判据状态；建连即喂一次静默看门狗。"""

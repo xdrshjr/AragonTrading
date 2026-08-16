@@ -258,15 +258,21 @@ async def _okx_link_sweeper() -> None:
     pool = get_client_pool()
     try:
         while True:
+            # 两件维护**互不连坐**：时钟同步走的是公共读，公共链路一断它必抛，而 `pool.sweep()`
+            # 排在它后面就跟着一起被跳过——生产上公共读死了三天，私有连接池的清扫也整整三天
+            # 一次都没跑过（okx-public-rest-circuit-open-never-recovers §3.4）。
             try:
                 settings = get_settings()
                 if clock.is_stale(settings.okx_link_clock_sync_interval_s):
                     await clock.sync(get_rest_client().get_server_time_ms)
+            except Exception as exc:  # noqa: BLE001 —— 单次维护失败不得拖垮常驻协程
+                logger.warning("okx link sweeper tick skipped: %s", exc)
+            try:
                 closed = await pool.sweep(time.monotonic())
                 if closed:
                     logger.info("okx client pool swept %d idle clients", closed)
-            except Exception as exc:  # noqa: BLE001 —— 单次维护失败不得拖垮常驻协程
-                logger.warning("okx link sweeper tick skipped: %s", exc)
+            except Exception as exc:  # noqa: BLE001 —— 同上，且不得反过来连坐时钟同步
+                logger.warning("okx client pool sweep skipped: %s", exc)
             await asyncio.sleep(60)
     except asyncio.CancelledError:    # 关停取消时干净退出
         return

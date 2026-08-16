@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import time
 from collections.abc import Callable
@@ -24,6 +25,8 @@ from .retry import (
     parse_retry_after,
 )
 from .types import Candle, Instrument, _optional_float, parse_okx_candle
+
+logger = logging.getLogger("aragon.okx.rest")
 
 
 # 合约元数据缓存 TTL（秒）：ctVal/lotSz/tickSz 等极少变动，1 小时足够新鲜又免重复往返。
@@ -47,6 +50,19 @@ class OKXError(Exception):
         self.code = code
         self.message = message
         super().__init__(f"[{code}] {message}")
+
+
+def _exc_label(exc: BaseException | None) -> str:
+    """异常的可定位描述：``{类名}: {str}``。
+
+    httpx 的**全部**超时类（``ReadTimeout`` / ``PoolTimeout`` / ``ConnectTimeout``）``str()`` 都是
+    空串，只格式化 ``{exc}`` 的话日志里冒号后什么都没有——生产上那 1748 行公共读失败因此一条有效
+    信息都没留下，只能靠「失败间隔直方图」反推异常类型
+    （``docs/diagnoses/okx-public-rest-circuit-open-never-recovers`` §3.3）。
+    """
+    if exc is None:
+        return "unknown"
+    return f"{type(exc).__name__}: {exc}"
 
 
 def infer_inst_type(inst_id: str) -> str:
@@ -86,38 +102,54 @@ class _Breaker:
     def __init__(self, settings: Settings):
         self._threshold = int(settings.okx_link_breaker_failures)
         self._base_cooldown = float(settings.okx_link_breaker_cooldown_s)
+        # 半开名额的租期 = 一次公共读的墙钟预算：试探调用最多也就花这么久。
+        self._half_open_lease_s = max(1.0, float(settings.okx_link_rest_budget_s))
         self._cooldown = self._base_cooldown
         self.failures = 0
         self.opened_until = 0.0
-        self._half_open = False
+        # >0 即「半开名额已发出」（在途或刚失效）；它同时充当 `note_failure` 的「这次失败来自
+        # 试探调用」判据。仅在 `_open()` / `note_ok()` 里归零，故它 >0 恒蕴含熔断是打开的。
+        self._half_open_until = 0.0
 
     @property
     def enabled(self) -> bool:
         return self._threshold > 0
 
     def ensure_closed_or_raise(self, path: str) -> None:
-        """熔断打开期间**立即**抛错、不发请求；冷却结束放行一个半开探针。"""
+        """熔断打开期间**立即**抛错、不发请求；冷却结束只放行**一个**半开试探。
+
+        「只放行一个」而不是原来那个所有并发调用共享的布尔：故障期同一瞬间有多路公共读在等，
+        共享布尔会把它们**全部**当成「那一个探针」一起放出去。名额带租期，因为持有者可能被
+        ``asyncio.wait_for`` 取消而永远走不到 ``note_ok`` / ``note_failure``——没有租期，一个用来
+        自愈的机制自己会变成第二个「永远合不上」的死结。
+        """
         if not self.enabled or self.opened_until <= 0.0:
             return
-        remaining = self.opened_until - time.monotonic()
+        now = time.monotonic()
+        remaining = max(self.opened_until - now, self._half_open_until - now)
         if remaining > 0:
             raise OKXError("OKX_CIRCUIT_OPEN",
                            f"交易所连接暂时熔断，{int(remaining) + 1} 秒后自动重试 ({path})")
-        self._half_open = True
+        self._half_open_until = now + self._half_open_lease_s
 
     def note_ok(self) -> None:
         """任一次成功即完全复位（含冷却时长），避免「网络已恢复而冷却还在翻倍」。"""
         self.failures = 0
         self.opened_until = 0.0
         self._cooldown = self._base_cooldown
-        self._half_open = False
+        self._half_open_until = 0.0
         get_link_registry().note_circuit(PUBLIC_LINK_KEY, "closed", None)
 
     def note_failure(self) -> None:
-        """半开探针失败即重新打开并翻倍冷却；否则累计到阈值再打开。"""
+        """半开试探失败即重新打开并翻倍冷却；否则累计到阈值再打开。
+
+        **只有非探针调用会走到这里**（收口在 ``_note_fail(probe=…)``）：探针被豁免熔断，正是为了
+        让它把熔断治好；让它的失败反过来给熔断上膛，等于让解药变成毒药——那是本次故障能撑 17
+        小时不自愈的放大器。
+        """
         if not self.enabled:
             return
-        if self._half_open:
+        if self._half_open_until > 0.0:
             self._cooldown = min(_BREAKER_COOLDOWN_MAX_S, self._cooldown * 2)
             self._open()
             return
@@ -126,7 +158,10 @@ class _Breaker:
             self._open()
 
     def _open(self) -> None:
-        self._half_open = False
+        self._half_open_until = 0.0
+        # 计数必须清零：不清的话此后**每一次**失败都满足 `failures >= threshold`，于是每一次失败
+        # 都把窗口重新推满，冷却再也不会真正走完。
+        self.failures = 0
         self.opened_until = time.monotonic() + self._cooldown
         get_link_registry().note_circuit(PUBLIC_LINK_KEY, "open", time.time() + self._cooldown)
 
@@ -157,15 +192,42 @@ class OKXRestClient:
     def last_latency_ms(self) -> int | None:
         return self._last_latency_ms
 
+    def _new_client(self) -> httpx.AsyncClient:
+        """建一条全新的公共客户端（建构与取用分开：测试注入与「失效换代」都挂在这条缝上）。
+
+        **不传 ``limits=``**：私有池那组 ``POOL_LIMITS``（16 连接 / keepalive 90s）对公共侧是加重
+        不是减轻——它把 httpx 默认的 100 连接砍到 16、把 keepalive 从 5s 拉到 90s，两个方向都让
+        「连接池槽位被占满」这类 wedge 更早更久（诊断报告 §五 评审注）。
+        """
+        return httpx.AsyncClient(
+            base_url=self._settings.okx_rest_base,
+            timeout=httpx.Timeout(20.0, connect=10.0),
+            proxy=self._settings.proxy_url,
+            headers={"User-Agent": "aragon-trading/0.1"},
+        )
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(
-                base_url=self._settings.okx_rest_base,
-                timeout=httpx.Timeout(20.0, connect=10.0),
-                proxy=self._settings.proxy_url,
-                headers={"User-Agent": "aragon-trading/0.1"},
-            )
+            self._client = self._new_client()
         return self._client
+
+    async def _invalidate_client(self, stale: httpx.AsyncClient) -> None:
+        """传输层失败即换代：下一次 ``_get_client()`` 建一条全新的连接池。
+
+        镜像私有侧 ``client_pool.invalidate()`` 那剂解药（同一轮加固只发给了私有链路）。故障期是
+        多路并发同时失败，所以两件事都不能省：
+
+        - **身份比对**：只有第一个失败者负责换代，否则后到的那个会把别人刚建好的新客户端关掉，
+          演成「A 换代 → B 拆掉 A 的新 client → C 再换一次」的连环拆台；
+        - **先摘引用、后关闭**：让并发调用**下一跳就拿到新客户端**，而不是继续撞一个半死的池。
+        """
+        if self._client is not stale:
+            return
+        self._client = None
+        try:
+            await stale.aclose()
+        except Exception as exc:  # noqa: BLE001 —— 关一个已经坏掉的池失败是常态，不该炸调用方
+            logger.debug("okx public client aclose skipped: %s", _exc_label(exc))
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -204,20 +266,20 @@ class OKXRestClient:
             rate_limited = rate_limited or outcome == "rate_limited"
             last_exc = exc or last_exc
             if outcome == "terminal":
-                self._note_fail(path, exc)
+                self._note_fail(path, exc, probe=probe)
                 raise exc if isinstance(exc, OKXError) else OKXError(
-                    "OKX_UNREACHABLE", f"无法连接 OKX ({path}): {exc}")
+                    "OKX_UNREACHABLE", f"无法连接 OKX ({path}): {_exc_label(exc)}")
             if attempt == policy.max_attempts - 1:
                 break     # 最后一次尝试之后不再退避：那是在等一次不会发生的重试，白拖最长 8 秒
             delay = max(next_delay(delay, policy, self._rand), retry_after or 0.0)
             if time.monotonic() + delay >= deadline:
                 break
             await asyncio.sleep(delay)
-        self._note_fail(path, last_exc)
+        self._note_fail(path, last_exc, probe=probe)
         if rate_limited:
             raise OKXError("OKX_RATE_LIMITED",
                            f"请求过于频繁：{path} 已退避重试 {policy.max_attempts} 次仍被交易所限频")
-        raise OKXError("OKX_UNREACHABLE", f"无法连接 OKX ({path}): {last_exc}")
+        raise OKXError("OKX_UNREACHABLE", f"无法连接 OKX ({path}): {_exc_label(last_exc)}")
 
     async def _attempt(self, path: str, params: dict) -> tuple[str, list | None,
                                                                Exception | None, float | None]:
@@ -227,6 +289,13 @@ class OKXRestClient:
         try:
             resp = await client.get(path, params=params)
         except Exception as exc:  # noqa: BLE001 —— 分级交给 classify_exception，此处只搬运
+            # 失效即换代。谓词是「进了这个 except 分支」而不是 `httpx.TransportError`：这个
+            # except 的唯一来源就是上面那句 `client.get`，所以它在语义上**就等于**传输层失败；
+            # 而生产日志证明真实发生过的失败类里有 `anyio.ClosedResourceError`（代理 CONNECT
+            # 隧道在 TLS 握手中途被拆），它根本不是 httpx 异常——用类型当谓词会恰好在**已知会
+            # 发生**的那一类上静默失效。`CancelledError` 是 `BaseException`，天然不进这里，
+            # 于是 `market_window` 每 5 秒一次的硬超时放弃不会被误当成换代信号。
+            await self._invalidate_client(client)
             return classify_exception(exc), None, exc, None
         outcome = classify_status(resp.status_code)
         if outcome != "ok":
@@ -250,12 +319,15 @@ class OKXRestClient:
         get_link_registry().note_ok(PUBLIC_LINK_KEY, kind="restPublic", label=PUBLIC_LINK_LABEL,
                                     latency_ms=self._last_request_ms)
 
-    def _note_fail(self, path: str, exc: Exception | None) -> None:
-        self._breaker.note_failure()
+    def _note_fail(self, path: str, exc: Exception | None, *, probe: bool = False) -> None:
+        """失败收口。``probe=True``（health / 服务器时间 / 补根取数）**不喂熔断器**——它们本来就
+        被豁免熔断，让它们的失败给熔断上膛等于让探针把自己的通路堵死（见 ``note_failure``）。"""
+        if not probe:
+            self._breaker.note_failure()
         code = exc.code if isinstance(exc, OKXError) else "OKX_UNREACHABLE"
         get_link_registry().note_failure(PUBLIC_LINK_KEY, kind="restPublic",
                                          label=PUBLIC_LINK_LABEL, code=code,
-                                         message=f"{path}: {exc}")
+                                         message=f"{path}: {_exc_label(exc)}")
 
     async def health(self) -> bool:
         """轻量探活：能取到一根 K 线即视为 up，并记录一次往返时延 (F2)。
