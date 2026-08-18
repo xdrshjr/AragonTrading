@@ -865,3 +865,103 @@ describe("app store — 实时成交缓冲封顶（D4）", () => {
     expect(useAppStore.getState().liveAutoTrades).toHaveLength(1);
   });
 });
+
+// ============ 生命周期真值化（ai-trade-lifecycle-truth F-9 · 风险 R-7 / [评审 R1-3]）============
+describe("app store — 生命周期对账的三个瞬态字段与窄 action", () => {
+  function lifecycleMember(trades: Trade[]) {
+    return {
+      instId: "BTC-USDT-SWAP",
+      sessionId: "s1",
+      allocationPct: 100,
+      session: {
+        sessionId: "s1", runId: 1, state: "running", instId: "BTC-USDT-SWAP", bar: "1H",
+        strategyIds: [1], strategyNames: ["s"], budgetUsd: 100, leverage: 3,
+        contextRefreshRounds: 4, roundsCompleted: 0, roundsSinceSummary: 0,
+        positionSide: "flat", sessionPnlUsd: 0, startedTs: 0,
+      },
+      trades,
+      position: { side: "long", size: 1 },
+      decisions: [{ ts: 1 }],
+      traces: [{ round: 1 }],
+      summary: "记忆",
+    } as never;
+  }
+
+  function seedGroup(trades: Trade[]) {
+    useAppStore.setState({
+      aiTradeGroup: {
+        groupId: "g1", bar: "1H", strategyIds: [1], strategyNames: ["s"],
+        totalBudgetUsd: 1000, leverage: 3, contextRefreshRounds: 4, state: "running",
+        startedTs: 0, members: { "BTC-USDT-SWAP": lifecycleMember(trades) },
+      } as never,
+    });
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({
+      aiTradeGroup: null, aiTradeSyncState: "ok", aiTradeReconcileUntil: null,
+      aiTradeEnabled: false,
+    });
+  });
+
+  it("风险 R-7：三个新字段**不得**出现在 persist 快照里（瞬态就该只活在内存里）", () => {
+    useAppStore.setState({
+      aiTradeSyncState: "unknown", aiTradeReconcileUntil: 123, aiTradeEnabled: true,
+    });
+    useAppStore.getState().setTheme("dark");        // 触发一次持久化写入
+    const persisted = JSON.parse(localStorage.getItem("aragon-ui") as string);
+    expect(persisted.state).not.toHaveProperty("aiTradeSyncState");
+    expect(persisted.state).not.toHaveProperty("aiTradeReconcileUntil");
+    expect(persisted.state).not.toHaveProperty("aiTradeEnabled");
+    expect(persisted.state).not.toHaveProperty("aiTradeGroup");
+  });
+
+  it("[评审 R1-3] 窄 action 写分组级 + 逐成员生命周期键，**绝不碰** trades/position/decisions", () => {
+    const trades = [{ ts: 1, side: "buy", price: 1, size: 1 }] as unknown as Trade[];
+    seedGroup(trades);
+
+    useAppStore.getState().patchAiTradeGroupLifecycle({
+      group: { state: "stopped", declaredState: "running", pauseReason: null,
+               pausedTs: 0, resumedCount: 2, lifecycle: null },
+      members: [{ instId: "BTC-USDT-SWAP",
+                  session: { state: "stopped", stopReason: "session_stop_loss" } }],
+    } as never);
+
+    const group = useAppStore.getState().aiTradeGroup!;
+    expect(group.state).toBe("stopped");
+    expect(group.declaredState).toBe("running");
+    expect(group.resumedCount).toBe(2);
+    const member = group.members["BTC-USDT-SWAP"];
+    expect(member.session?.state).toBe("stopped");
+    expect(member.session?.stopReason).toBe("session_stop_loss");
+    // 这四样是 WS 流的产物：覆盖即闪烁 / 丢历史，而本 action 跑在一个 3~15 秒的轮询里。
+    expect(member.trades).toHaveLength(1);
+    expect(member.position).not.toBeNull();
+    expect(member.decisions).toHaveLength(1);
+    expect(member.summary).toBe("记忆");
+  });
+
+  it("回执里缺席的成员**保留本地行不动，不删**（它的去向由终态留痕卡负责）", () => {
+    seedGroup([]);
+    useAppStore.getState().patchAiTradeGroupLifecycle({
+      group: { state: "running" }, members: [{ instId: "ETH-USDT-SWAP", session: {} }],
+    } as never);
+    expect(Object.keys(useAppStore.getState().aiTradeGroup!.members)).toEqual(["BTC-USDT-SWAP"]);
+  });
+
+  it("无分组时静默空转（轮询与分组生命周期天然有竞态）", () => {
+    useAppStore.getState().patchAiTradeGroupLifecycle({
+      group: { state: "stopped" }, members: [],
+    } as never);
+    expect(useAppStore.getState().aiTradeGroup).toBeNull();
+  });
+
+  it("requestAiTradeReconcile 打开 30 秒的快对账窗口", () => {
+    const before = Date.now();
+    useAppStore.getState().requestAiTradeReconcile();
+    const until = useAppStore.getState().aiTradeReconcileUntil!;
+    expect(until).toBeGreaterThanOrEqual(before + 29_000);
+    expect(until).toBeLessThanOrEqual(before + 31_000);
+  });
+});

@@ -21,6 +21,11 @@ PAUSE_REASON_USER = "user"
 PAUSE_REASON_APP_QUIT = "app_quit"
 PAUSE_REASON_PROCESS_RESTART = "process_restart"
 PAUSE_REASON_DISABLED_BY_CONFIG = "disabled_by_config"
+# 续跑武装复检未通过后的整组回滚（ai-trade-lifecycle-truth B-2 ③ / [评审 R1-4]）。
+# **扩展稳定枚举要一次改齐所有落点**（CLAUDE.md §五）：本常量 + 下面的文案表 +
+# `apps/web/lib/aiTradeTypes.ts` 的 `AiTradePauseReason` 联合类型 + `lib/aiTrade.ts` 的
+# `AI_TRADE_PAUSE_REASON_TEXT`。少改一处，回滚后的暂停原因在界面上就是**空的**。
+PAUSE_REASON_RESUME_ROLLBACK = "resume_rollback"
 
 # 稳定枚举 → 中文说明（§3.0 那张表的唯一实现落点；每一格都有真实产生点，绝不留死值）。
 PAUSE_REASON_TEXT = {
@@ -28,6 +33,7 @@ PAUSE_REASON_TEXT = {
     PAUSE_REASON_APP_QUIT: "软件退出时自动暂停",
     PAUSE_REASON_PROCESS_RESTART: "上次未正常退出，已自动暂停",
     PAUSE_REASON_DISABLED_BY_CONFIG: "本机已关闭 AI 自动交易，此会话只能结束归档",
+    PAUSE_REASON_RESUME_ROLLBACK: "继续失败，已退回暂停",
 }
 
 # ---------- 十一个 verdict（§3.6）----------

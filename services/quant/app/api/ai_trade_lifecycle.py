@@ -96,6 +96,15 @@ async def ai_trade_resume(group_id: str, body: AiTradeResumeIn | None = None,
 
     守双闸 + 整轴总闸。热续跑（软件没关）直接重新武装；冷续跑走 `ai_auto/resume.py` 的七步
     流水线，接管前必须通过离线差异复核（R-1：绝不静默接管）。
+
+    回执语义在 ai-trade-lifecycle-truth 里变了（§5.3）：从「我把它置成 running 了」变成
+    「**我核实过它现在是 running，而且这是它武装到什么程度的证据**」——`group_status()` 里的
+    `state` 是派生真值，`lifecycle` 是让人能反驳它的那份证据。
+
+    三个**新增**的 409（均由 `AiTradePreflightError` 派生并带 `.members`，`_http_error` 已透传）：
+    `AI_TRADE_GROUP_ENDED` / `AI_TRADE_RESUME_PARTIALLY_DEAD` / `AI_TRADE_RESUME_NOT_ARMED`。
+    前端 `describeStartError` 的 code 白名单必须**同时**认得这三个，否则 `.members` 里的逐标的
+    明细一个字都不会渲染（[评审 R1-1]：本仓库「wire 里有事实、用户那里没有」的第 N 次复发）。
     """
     _require_ai_enabled(settings)
     _require_pause_enabled(settings)

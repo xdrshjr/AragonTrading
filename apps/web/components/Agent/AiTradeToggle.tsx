@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Badge, Button, Switch } from "@/components/ui";
 import { accountApi } from "@/lib/accountApi";
 import { agentApi } from "@/lib/agentApi";
@@ -13,6 +13,10 @@ import {
   AI_TRADE_DEFAULT_POSITION_STEP,
   AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN,
   AI_TRADE_PROFIT_GUARD_DEFAULTS,
+  describeAiTradeLifecycleBadge,
+  describeStartError,
+  formatNextWake,
+  resolveAiTradeArmed,
   resolveAiTradeGate,
   resolveAiTradeLifecycle,
 } from "@/lib/aiTrade";
@@ -62,6 +66,8 @@ export default function AiTradeToggle() {
   const clearAiTradeRuntime = useAppStore((s) => s.clearAiTradeRuntime);
 
   const qc = useQueryClient();
+  // 倒计时每秒 tick 一次（只在有分组时挂表：idle 态挂一个每秒重渲染的定时器纯属浪费）。
+  const [nowTs, setNowTs] = useState(() => Math.floor(Date.now() / 1000));
   const [modalOpen, setModalOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pauseOpen, setPauseOpen] = useState(false);
@@ -69,6 +75,8 @@ export default function AiTradeToggle() {
   const [endOpen, setEndOpen] = useState(false);
   const [preview, setPreview] = useState<AiTradeResumePreview | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
+  // 进入「正在武装」清单的时刻（秒级墙钟，本地瞬态）。null = 还没提交过。
+  const [armingSince, setArmingSince] = useState<number | null>(null);
 
   const accountsQ = useQuery({ queryKey: ["okx", "accounts"], queryFn: accountApi.accounts.list });
   const defaultAccount =
@@ -79,18 +87,29 @@ export default function AiTradeToggle() {
   const agentConfigQ = useQuery({ queryKey: ["agent", "config"], queryFn: agentApi.config });
   const agentConfigured = agentConfigQ.data?.configured ?? false;
 
+  // [评审 R0-7] **`refetchInterval` 撤掉了**：对账的唯一 owner 是页面级的
+  // `useAiTradeGroupStream`（它不随面板折叠 / 归档而卸载）。两处各按自己的时序覆盖同一份生命
+  // 周期，正是 D-5「两处口径」的换皮复发；同时实盘模式下的总请求数从 2 次/15 秒降到 1 次/15 秒。
+  // 这里只保留挂载时的那一次，供首屏门禁在 store 还没被对账器写过时有个数。
   const statusQ = useQuery({
     queryKey: ["aiTrade", "status"],
     queryFn: aiTradeApi.status,
     enabled: accountMode === "live",
-    refetchInterval: 15_000,
   });
-  const aiTradeEnabled = statusQ.data?.aiTradeEnabled ?? false;
+  // 首屏 store 未水合时它是 `false`（风险 R-11）——门禁文案必须据 `aiTradeSyncState` 区分
+  // 「正在与后端同步」和「本机未开启」，后者在首屏是一句**假话**。
+  const aiTradeEnabled = useAppStore((s) => s.aiTradeEnabled) || (statusQ.data?.aiTradeEnabled ?? false);
+  const aiTradeSyncState = useAppStore((s) => s.aiTradeSyncState);
+  const requestAiTradeReconcile = useAppStore((s) => s.requestAiTradeReconcile);
 
-  // 生命周期的唯一推导点（pause-resume §3.9.1）：任何组件都不得自己拼这个判断。
+  // 生命周期的唯一推导点（L-4）：任何组件都不得自己拼这个判断。
   const lifecycle = resolveAiTradeLifecycle(aiTradeGroup, aiTradeResumable);
+  const armed = resolveAiTradeArmed(aiTradeGroup);
+  const syncing = aiTradeSyncState === "unknown";
   const running = lifecycle === "running";
   const paused = lifecycle === "paused";
+  const stopped = lifecycle === "stopped";
+  const badge = describeAiTradeLifecycleBadge(lifecycle, armed, syncing);
   const groupId = aiTradeGroup?.groupId ?? aiTradeResumable?.groupId ?? null;
   // 实盘段门禁（传入弹窗，实盘 tab 据此禁用 + 悬浮说明）；回测段仅需 agentConfigured。
   const liveGateReason = resolveAiTradeGate({
@@ -101,6 +120,10 @@ export default function AiTradeToggle() {
     liveAutoActive: !!liveAutoGroup,
     // 暂停中的分组同样占着那唯一一个活跃位（后端容量闸会 409 `AI_TRADE_PAUSED_GROUP_EXISTS`）。
     // 不把 `paused` 算进来，弹窗会看起来可用，用户填完一整屏参数才在提交时吃一个 409。
+    //
+    // **[评审 R1-5] `stopped` 刻意不算进来**：B-1 之后后端此刻已经清了组，容量闸不会 409，
+    // 用户应当能直接开一个新分组。别「顺手把 stopped 也算进 hasActiveSession」——那会把
+    // 「会话已结束却再也开不了新的」这个死结重新系上。
     hasActiveSession: running || paused,
   });
   // 打开弹窗的最小门禁（独立于 resolveAiTradeGate）：Agent 已配置即可（回测在模拟账户模式也可用，R6）。
@@ -208,6 +231,33 @@ export default function AiTradeToggle() {
   });
 
   // ---- 暂停 / 继续 / 结束（pause-resume §3.9.2）----
+  /**
+   * 写端点的失败分流（L-7 / [评审 R0-6]）。
+   *
+   * **超时的写请求不得渲染成「失败」** —— 一个超时的 `/resume` 很可能**已经成功了**
+   * （后端还在跑冷续跑的暖机），把它显示成「继续失败」会让用户再点一次，而那是一次真实资金的
+   * 开仓授权。
+   *
+   * 判据必须是 `code === "TIMEOUT"`：`aiTradeApi.request` 的 `catch` 已经把超时经 `toApiError`
+   * 换成了 `ApiRequestError("TIMEOUT", …)`，到 `onError` 这一层原始异常的 `name` 早已不在，
+   * `isTimeoutError` 在这里**恒为假**（照 v1 写，L-7 承诺的「结果未知」一次都不会出现）。
+   *
+   * 命中即：**不写 error**，改为把后端 `timeoutMessage` 单点生成的那句「本次操作结果未知……」
+   * 挂成持久提示 + 请一次快对账，由 3 秒节奏的对账给出最终结论。
+   */
+  const handleActionError = useCallback(
+    (e: unknown, fallback: string) => {
+      if (e instanceof ApiRequestError && e.code === "TIMEOUT") {
+        setError(null);
+        setAiTradeLifecycleNotice(e.message);   // 文案由 `timeoutMessage` 单点生成，前端不再拼第二句
+        requestAiTradeReconcile();
+        return;
+      }
+      setError(e instanceof ApiRequestError ? describeStartError(e) : fallback);
+    },
+    [requestAiTradeReconcile, setAiTradeLifecycleNotice],
+  );
+
   const pauseM = useMutation({
     mutationFn: (opts: { holdPosition: boolean }) =>
       aiTradeApi.pauseGroup(groupId ?? "", { holdPosition: opts.holdPosition }),
@@ -217,9 +267,10 @@ export default function AiTradeToggle() {
       setAiTradeLifecycleNotice(res.notice || null);
       setPauseOpen(false);
       setError(null);
+      requestAiTradeReconcile();               // 3 秒快对账：让权威回执尽快确认这次迁移
       qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
     },
-    onError: (e) => setError(e instanceof ApiRequestError ? e.message : "暂停失败，请稍后重试"),
+    onError: (e) => handleActionError(e, "暂停失败，请稍后重试"),
   });
 
   const resumeM = useMutation({
@@ -229,13 +280,20 @@ export default function AiTradeToggle() {
       // 续跑成功后热态回来了：装上分组视图并清掉冷占位（两者互斥，绝不同时非空）。
       setAiTradeGroup(groupStateFromStatus(res));
       setAiTradeResumable(null);
-      setResumeOpen(false);
-      setPreview(null);
       setError(null);
+      // **对话框不立刻关闭**（F-8）：进入「正在武装」清单，由 `lifecycle.armed` 决定它什么时候
+      // 该消失。点完「继续」就把框关掉，等于把「它到底起来了没有」这个问题重新交还给用户去猜。
+      requestAiTradeReconcile();
       qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
     },
-    onError: (e) =>
-      setError(e instanceof ApiRequestError ? describeStartError(e) : "继续失败，请稍后重试"),
+    onError: (e) => {
+      // **明确失败（非超时）⇒ 退出武装清单**，回到复核屏把后端的逐标的明细摊开给用户看，
+      // 主按钮也立刻可用。让一次已经被 409 拒绝的续跑继续对着一张「武装中」的清单等 45 秒，
+      // 就是本轮要消灭的那句「貌似在进行中」。
+      // 超时**不**退出：那一格的语义是「结果未知」，清单继续等，由快对账给最终结论（L-7）。
+      if (!(e instanceof ApiRequestError && e.code === "TIMEOUT")) setArmingSince(null);
+      handleActionError(e, "继续失败，请稍后重试");
+    },
   });
 
   const endM = useMutation({
@@ -249,9 +307,10 @@ export default function AiTradeToggle() {
       setEndOpen(false);
       setResumeOpen(false);
       setError(null);
+      requestAiTradeReconcile();
       qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
     },
-    onError: (e) => setError(e instanceof ApiRequestError ? e.message : "结束失败，请稍后重试"),
+    onError: (e) => handleActionError(e, "结束失败，请稍后重试"),
   });
 
   // 「继续」按钮三态（`继续` / `正在核对持仓…` / 错误原因内联展示）：先拉复核数据再开框，
@@ -260,16 +319,37 @@ export default function AiTradeToggle() {
     if (!groupId) return;
     setError(null);
     setPreview(null);
+    setArmingSince(null);          // 重新打开即回到第一屏（复核），而不是接着上次的武装清单
     setResumeOpen(true);
     setPreviewLoading(true);
     aiTradeApi
       .resumePreview(groupId)
       .then(setPreview)
       .catch((e: unknown) =>
-        setError(e instanceof ApiRequestError ? e.message : "无法核对持仓，请稍后重试"),
+        setError(e instanceof ApiRequestError ? describeStartError(e) : "无法核对持仓，请稍后重试"),
       )
       .finally(() => setPreviewLoading(false));
   }, [groupId]);
+
+  const hasLifecycleWire = !!aiTradeGroup?.lifecycle;
+  const armingOpen = armingSince != null;
+  useEffect(() => {
+    if (!hasLifecycleWire && !armingOpen) return;
+    const timer = setInterval(() => setNowTs(Math.floor(Date.now() / 1000)), 1_000);
+    return () => clearInterval(timer);
+  }, [hasLifecycleWire, armingOpen]);
+
+  // 武装清单全绿 ⇒ 1 秒后自动关闭（给用户看一眼「全部就绪」再收起来，而不是一闪而过）。
+  const fullyArmed = armingOpen && lifecycle === "running" && armed.armed && !armed.unavailable;
+  useEffect(() => {
+    if (!fullyArmed) return;
+    const timer = setTimeout(() => {
+      setResumeOpen(false);
+      setArmingSince(null);
+      setPreview(null);
+    }, 1_000);
+    return () => clearTimeout(timer);
+  }, [fullyArmed]);
 
   const onToggle = (next: boolean) => {
     setError(null);
@@ -288,6 +368,14 @@ export default function AiTradeToggle() {
         ? [strategyId]
         : [];
 
+  // `resuming`（F-6 的关键一态）：**本地瞬态，不来自后端**。从点下「继续」到
+  // `lifecycle.armed === true` 之间可能有几十秒（冷续跑要暖机），而在本轮之前这段时间界面上
+  // 什么都没有——用户只能靠猜。
+  const resuming = resumeM.isPending;
+  // `unknown` 下动作按钮全部禁用（L-7 的极性：读不到就不让点）。
+  const actionsDisabled = syncing || resuming;
+  const countdown = formatNextWake(aiTradeGroup?.lifecycle, lifecycle, nowTs);
+
   return (
     <div className="flex w-full min-w-0 flex-col gap-1">
       {/* 行容器承接**唯一一份** title：挂在「行」而不是左簇，是为了保住改前的悬停覆盖面——暂停态
@@ -299,10 +387,17 @@ export default function AiTradeToggle() {
         data-testid="ai-trade-toggle-row"
         className="flex min-h-[24px] w-full min-w-0 items-center justify-between gap-2"
         title={
-          paused
-            ? "已暂停：不再开新仓，但盯市与保护层照常运行。点「继续」核对持仓后接着跑，或「结束」归档"
-            : (openBlockedReason
-              ?? (running ? "点击停止 AI 自动交易并平掉自管持仓" : "开启 AI 自动交易 / 回测"))
+          syncing
+            ? "正在与后端核对 AI 自动交易的状态；核对完成前不接受新的动作"
+            : resuming
+              ? "正在恢复：核对持仓 → 重建会话 → 接上行情。全部就绪后才会回到「运行中」"
+              : stopped
+                ? (openBlockedReason
+                  ?? "这次 AI 自动交易已结束。点「知道了」清理面板，或直接开启一个新的分组")
+                : paused
+                  ? "已暂停：不再开新仓，但盯市与保护层照常运行。点「继续」核对持仓后接着跑，或「结束」归档"
+                  : (openBlockedReason
+                    ?? (running ? "点击停止 AI 自动交易并平掉自管持仓" : "开启 AI 自动交易 / 回测"))
         }
       >
         {/* 左簇：标签 + 开关。全行**唯一**的压力吸收点（min-w-0 + truncate）——宽度不足时只有它退让。 */}
@@ -316,24 +411,51 @@ export default function AiTradeToggle() {
           >
             AI 自动交易
           </span>
-          {/* 三态控件（§3.9.2）。`paused` 时开关保持 off 且**禁用**——避免「关开关」与「结束」两个
-              入口语义重叠：暂停可逆、结束不可逆，二者绝不能长得像同一个动作。 */}
+          {/* 四态 + `resuming` 控件（F-6）。`paused` / `resuming` / `unknown` 时开关保持 off 且
+              **禁用**——避免「关开关」与「结束」两个入口语义重叠：暂停可逆、结束不可逆，二者绝不
+              能长得像同一个动作；而读不到后端状态时不让点，是 L-7 的同一条极性。 */}
           <Switch
             checked={running}
-            onChange={paused ? noop : onToggle}
+            onChange={paused || resuming || syncing ? noop : onToggle}
             label="AI 自动交易开关"
-            className={(openBlockedReason && !running) || paused ? "opacity-40" : undefined}
+            className={
+              (openBlockedReason && !running) || paused || resuming || syncing
+                ? "opacity-40"
+                : undefined
+            }
           />
+          {/* 「下一次决策 03:12」——`running` 且**真的武装**时才走秒（[评审 R1-6]）。
+              这条倒计时是「已经恢复到 Agent 执行交易状态」的主要证据：用户看到「运行中」的同时
+              看到下一次思考还有多久，才叫真的恢复了。 */}
+          {countdown && (
+            <span
+              data-testid="ai-trade-next-wake"
+              className="shrink-0 rounded border border-[var(--border)] px-1 py-px text-[9px] tabular text-[var(--muted)]"
+              title="下一次 Agent 决策的预计时刻（以服务端时钟为锚点）"
+            >
+              {countdown}
+            </span>
+          )}
         </div>
 
         {/* 右簇：生命周期动作。shrink-0 ⇒ 宽度压力一律流向左簇标签的省略号，按钮永不被压折。
             idle 态它是个空 div——刻意**无条件渲染**，让排版契约在三态下都有同一个落点。 */}
         <div data-testid="ai-trade-toggle-actions" className="flex shrink-0 items-center gap-1.5">
-          {running && (
+          {/* 徽标是四态 + `armed` 分档的**唯一**呈现点（`describeAiTradeLifecycleBadge`）：
+              idle 态不渲染（那时这一行本就该是空的）。 */}
+          {lifecycle !== "idle" && (
+            <Badge tone={badge.tone}>
+              <span data-testid="ai-trade-lifecycle-badge">
+                {resuming ? "正在恢复…" : badge.label}
+              </span>
+            </Badge>
+          )}
+          {running && !resuming && (
             <Button
               variant="ghost"
               size="sm"
               aria-label="暂停 AI 自动交易"
+              disabled={actionsDisabled}
               onClick={() => {
                 setError(null);
                 setPauseOpen(true);
@@ -342,22 +464,22 @@ export default function AiTradeToggle() {
               ⏸ 暂停
             </Button>
           )}
-          {paused && (
+          {(paused || resuming) && (
             <>
-              <Badge tone="accent">已暂停</Badge>
               <Button
                 variant="primary"
                 size="sm"
                 aria-label="继续 AI 自动交易"
-                disabled={resumeM.isPending}
+                disabled={actionsDisabled}
                 onClick={openResume}
               >
-                {resumeM.isPending ? "正在核对持仓…" : "▶ 继续"}
+                {resuming ? "正在恢复…" : "▶ 继续"}
               </Button>
               <Button
                 variant="ghost"
                 size="sm"
                 aria-label="结束 AI 自动交易"
+                disabled={actionsDisabled}
                 onClick={() => {
                   setError(null);
                   setEndOpen(true);
@@ -367,6 +489,22 @@ export default function AiTradeToggle() {
               </Button>
             </>
           )}
+          {/* 终态留痕（F-5）：会话自行终止（会话止损 / 强平）是用户**必须**知道的事，面板整块
+              消失等于没说。点「知道了」才清运行期态。 */}
+          {stopped && (
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label="清理已停止的 AI 自动交易面板"
+              disabled={syncing}
+              onClick={() => {
+                setError(null);
+                clearAiTradeRuntime();
+              }}
+            >
+              知道了
+            </Button>
+          )}
         </div>
       </div>
 
@@ -375,7 +513,7 @@ export default function AiTradeToggle() {
           data-testid 是必需的：四个弹窗里的错误段落同样是 role="alert"，只靠 role 定位有歧义。
           触发面很窄——四个弹窗的 onClose 一律 setError(null)，唯一到达路径是「续跑复核在途时
           先关掉弹窗、随后复核失败」这个竞态。 */}
-      {paused && error && !resumeOpen && !endOpen && (
+      {(paused || stopped) && error && !resumeOpen && !endOpen && (
         <span
           data-testid="ai-trade-toggle-error"
           className="whitespace-normal break-words text-[10px] leading-relaxed text-[var(--short-ink)]"
@@ -396,19 +534,33 @@ export default function AiTradeToggle() {
         }}
         onConfirm={(opts) => pauseM.mutate(opts)}
       />
+      {/* F-8：提交后**不立刻关闭**，改为进入「正在武装」清单 —— 从点下「继续」到真的 armed
+          之间可能有几十秒（冷续跑要暖机），关掉框等于把「它到底起来了没有」还给用户去猜。
+          `armingSince` 是进入第三屏的时刻（本地瞬态），45 秒还没 armed ⇒ 清单原地变成如实的
+          失败说明 + 两个出路。 */}
       <AiTradeResumeDialog
         open={resumeOpen}
         preview={preview}
         loading={previewLoading}
         submitting={resumeM.isPending}
         error={resumeOpen ? error : null}
+        arming={armingSince != null}
+        armingSince={armingSince}
+        lifecycle={aiTradeGroup?.lifecycle ?? null}
+        members={aiTradeGroup ? Object.values(aiTradeGroup.members) : []}
+        nowTs={nowTs}
         onClose={() => {
           setResumeOpen(false);
+          setArmingSince(null);
           setError(null);
         }}
-        onConfirm={(opts) => resumeM.mutate(opts)}
+        onConfirm={(opts) => {
+          setArmingSince(Math.floor(Date.now() / 1000));
+          resumeM.mutate(opts);
+        }}
         onEnd={() => {
           setResumeOpen(false);
+          setArmingSince(null);
           setEndOpen(true);
         }}
       />
@@ -516,10 +668,6 @@ function describeOrphanPositions(rows: AiTradeEndResult["orphanPositions"]): str
   return `已结束并归档。以下持仓仍留在交易所上，从此不再由任何自动化管理，请到实盘面板自行处理：${parts.join("；")}。`;
 }
 
-/** 整组前置失败（AI_TRADE_GROUP_PREFLIGHT）逐标的明细中文化；否则回落 message。 */
-function describeStartError(err: ApiRequestError): string {
-  if (err.code === "AI_TRADE_GROUP_PREFLIGHT" && err.members?.length) {
-    return err.members.map((m) => `${m.instId}：${m.message}`).join("；");
-  }
-  return err.message;
-}
+// `describeStartError` 已迁到 `lib/aiTrade.ts`（F-10 / [评审 R1-1]）：续跑对话框的失败屏要渲染
+// **同一份**逐标的明细，留在组件里就会被抄第二遍 —— 那是 D-5 的形状。同时它的判据从「一个 code」
+// 变成了一张 code 白名单，否则本轮两个新 409 的 `members` 明细一个字都不会出现。

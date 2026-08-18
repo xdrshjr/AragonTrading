@@ -588,6 +588,12 @@ class Settings(BaseSettings):
     ai_trade_resume_size_tolerance: float = Field(default=0.02, ge=0, le=1)   # 持仓张数对账相对容差
     ai_trade_resume_backstop_required: bool = False   # 带仓续跑是否强制要求兜底已覆盖（默认只警示）
     ai_trade_pause_persist_interval_s: float = Field(default=60.0, gt=0)      # 心跳写点节流（W3）
+    # ---- 生命周期真值化（ai-trade-lifecycle-truth §七）----
+    # 整轴总闸。False ⇒ 一键**逐字**回滚到本轮之前：`group_status()` 回落 `getattr(group,"state",…)`、
+    # 不下发 `lifecycle` / `declaredState` / `lifecycleUnknown` / `serverTs` 四个加法键、
+    # `SessionLink.on_stream` 判据回落 `state == "running"`、续跑复检不参与、前端因 `lifecycle`
+    # 缺席而自动回落到 `group.state`。四处回落缺一，这个开关就只是一句声明（用例 12 是唯一护栏）。
+    ai_trade_lifecycle_truth_enabled: bool = True
 
     # ---- 策略与因子挖掘（strategy-factor-discovery §六，env 前缀 DISCOVERY_）----
     # 字段名即环境变量名（DISCOVERY_*，大小写不敏感）。⚠️ 三处联动缺一即静默失效：

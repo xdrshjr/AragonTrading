@@ -3,6 +3,7 @@ import {
   FAST_MS,
   LONG_MS,
   PROXY_TIMEOUT_MS,
+  RESUME_MS,
   isTimeoutError,
   isWritePath,
   timeoutFor,
@@ -151,5 +152,44 @@ describe("toApiError 的翻译与不吞（D3）", () => {
     const err = new TypeError("Failed to fetch");
     expect(isTimeoutError(err)).toBe(false);
     expect(toApiError(err, FAST_MS, "/candles")).toBe(err);
+  });
+});
+
+// ============ 续跑档（ai-trade-lifecycle-truth F-7，修 D-8 · 用例 16）============
+
+describe("RESUME_MS：续跑不该被 20 秒掐断（D-8）", () => {
+  it("用例 16：`/ai-trade/{id}/resume` 落续跑档，`/ai-trade/{id}/stop` 仍落 20 秒", () => {
+    expect(timeoutFor("/ai-trade/g1/resume")).toBe(RESUME_MS);
+    expect(timeoutFor("/ai-trade/g1/stop")).toBe(FAST_MS);
+  });
+
+  it("`resume-preview` 同档（它同样要读交易所的持仓与挂单）", () => {
+    expect(timeoutFor("/ai-trade/g1/resume-preview")).toBe(RESUME_MS);
+  });
+
+  it("档位关系：FAST < RESUME < PROXY —— 代理不会先放弃，客户端也不至于干等 5 分钟", () => {
+    expect(FAST_MS).toBeLessThan(RESUME_MS);
+    expect(RESUME_MS).toBeLessThan(PROXY_TIMEOUT_MS);
+  });
+
+  it("既有六行**一字不改**：没有 `ms` 的行仍取 LONG_MS", () => {
+    expect(timeoutFor("/strategies/7/backtest")).toBe(LONG_MS);
+    expect(timeoutFor("/weight-models/3/runs/9/backtest")).toBe(LONG_MS);
+    expect(timeoutFor("/factor-sets/1/score")).toBe(LONG_MS);
+  });
+
+  it("`/resume` 已在写类动作表里 ⇒ 超时文案本来就说「结果未知」（L-7）", () => {
+    expect(isWritePath("/ai-trade/g1/resume")).toBe(true);
+    expect(timeoutMessage("/ai-trade/g1/resume", RESUME_MS)).toContain("结果未知");
+    expect(timeoutMessage("/ai-trade/g1/resume", RESUME_MS)).toContain("180 秒");
+  });
+
+  it("[评审 R0-6] 超时经 toApiError 之后判据只剩 `code === \"TIMEOUT\"`", () => {
+    // `isTimeoutError` 判的是**原始异常**的 name；到 mutation 的 onError 那一层拿到的早已是
+    // `ApiRequestError`，在那里它恒为假 —— 照 v1 的写法，L-7 承诺的「结果未知」一次都不会出现。
+    const raw = Object.assign(new Error("aborted"), { name: "TimeoutError" });
+    const translated = toApiError(raw, RESUME_MS, "/ai-trade/g1/resume");
+    expect(isTimeoutError(translated)).toBe(false);
+    expect((translated as ApiRequestError).code).toBe("TIMEOUT");
   });
 });

@@ -306,6 +306,101 @@ async def test_ai_auto_backfill_with_nothing_new_does_nothing():
     assert session._wake.atr_calls == []
 
 
+# ---------------- B-3（ai-trade-lifecycle-truth，修 D-6）：暂停期不是观测盲区 ----------------
+
+
+class _PausableAiSession(_AiSession):
+    """带 `is_active` 的 ai_auto 会话（`is_active ⟺ state in {running, paused}`）。"""
+
+    @property
+    def is_active(self) -> bool:
+        return self.state in ("running", "paused")
+
+
+async def test_link_events_are_handled_while_paused():
+    """用例 7（D-6）：`paused` 时链路告警与**补根**必须照常发生。
+
+    今天 `on_stream` 的顶部判据是 `state != "running"` 即 return ⇒ 暂停期断线重连的缺根
+    **永远补不回来**（`_pending_repair` 都没被置位），恢复后 Agent 拿着一段有洞的窗口做真实
+    资金决策。L-6：补根与告警属于**观测侧**，判据必须是 `is_active`。
+    """
+    session = _PausableAiSession()
+    session.state = "paused"
+    link = sl.SessionLink(session, sl.FLAVORS["ai_auto"])
+    fetched: list[int] = []
+
+    async def _fake_fetch(_inst, _bar, *, since_ts, max_bars):
+        fetched.append(since_ts or 0)
+        return [_candle(1_700_003_600 + i * 3600) for i in range(2)]
+
+    original = sl.fetch_missing
+    sl.fetch_missing = _fake_fetch
+    try:
+        await link.on_stream(_event("degraded"))
+        assert any("已断开" in m for m in session.messages()), "暂停期链路告警不该被吞"
+        await link.on_stream(_event("live", downtime=7200.0))
+        await asyncio.sleep(0.05)
+    finally:
+        sl.fetch_missing = original
+
+    assert fetched, "暂停期必须仍然去补缺失的根"
+    assert len(session._window.candles) == 3, "补进来的根必须真的进窗口（1 根原有 + 2 根补齐）"
+
+
+async def test_a_stopped_ai_session_is_still_ignored():
+    """`is_active ⟺ state in {running, paused}` ⇒ 本行 ⟺ `state == "stopped"`：已终止仍被挡。"""
+    session = _PausableAiSession()
+    session.state = "stopped"
+    link = sl.SessionLink(session, sl.FLAVORS["ai_auto"])
+
+    await link.on_stream(_event("degraded"))
+
+    assert session.pushed == []
+
+
+async def test_stopped_live_auto_session_is_still_ignored_by_link():
+    """用例 21（[评审 R0-2]）：`live_auto` / `paper` 的 `stopped` 会话**必须仍被挡住**。
+
+    v1 的写法（`not getattr(session, "is_active", True)`）在这两类会话上兜底成 True ⇒ 永远挡
+    不住 ⇒ 一个已经停止的自动交易会话会继续补根、继续写窗口、继续推链路告警。故判据必须是
+    显式两分支，且这一分支与本轮之前**逐字一致**。
+    """
+    for flavor in ("live_auto", "paper"):
+        session = _FakeSession()               # 没有 `is_active` 属性（与生产一致）
+        session.state = "stopped"
+        link = sl.SessionLink(session, sl.FLAVORS[flavor])
+
+        await link.on_stream(_event("degraded"))
+        await link.on_stream(_event("live", downtime=7200.0))
+        await asyncio.sleep(0.05)
+
+        assert session.pushed == [], f"{flavor} 的已停止会话不该再收到任何链路事件"
+        assert link._pending_repair is False, f"{flavor} 的已停止会话不该被排上补根"
+
+
+async def test_the_master_switch_restores_the_old_running_only_predicate():
+    """用例 12 的链路侧一半：总闸关 ⇒ 判据逐字回落到 `state == "running"`（暂停期重新静默）。"""
+    session = _PausableAiSession()
+    session.state = "paused"
+    session.executor.settings.ai_trade_lifecycle_truth_enabled = False
+    link = sl.SessionLink(session, sl.FLAVORS["ai_auto"])
+
+    await link.on_stream(_event("degraded"))
+
+    assert session.pushed == []
+
+
+async def test_channel_state_reads_the_registry_without_probing():
+    """链路态是一次**纯内存读**（零新增探测），且键格式与 `ws_client._stream_config` 同源。"""
+    session = _PausableAiSession()
+    link = sl.SessionLink(session, sl.FLAVORS["ai_auto"])
+
+    assert link.channel_state("ai:s1") == "unknown"       # 还没探到 ≠ 不可达
+    get_link_registry().note_ws("ws:business:BTC-USDT-SWAP:1H:ai:s1", kind="wsBusiness",
+                                label="t", event="connected")
+    assert link.channel_state("ai:s1") == "up"
+
+
 # ---------------- paper 补根：走既有回放 ----------------
 
 

@@ -30,6 +30,19 @@ export const PROXY_TIMEOUT_MS = 300_000;
 export const LONG_MS = PROXY_TIMEOUT_MS + 15_000;
 
 /**
+ * 续跑档（ai-trade-lifecycle-truth F-7，修 D-8）。
+ *
+ * `/ai-trade/{groupId}/resume` 今天落 `FAST_MS`（20 秒），而**冷续跑要跑**
+ * `resolve_active_provider` + 逐成员 `_prime()`（`prefill_htf` / `prefill_tactical` /
+ * `fetch_priming_rows` / 逐根影子回放）+ 交易所私有取数。多标的 / 慢网下客户端先放弃：
+ * **后端续跑成功、界面停在「已暂停 + 继续失败」**——正是用户报告现象的镜像版。
+ *
+ * 为什么不是 `LONG_MS`：`FAST_MS < RESUME_MS < PROXY_TIMEOUT_MS`。取 `LONG_MS`（5 分 15 秒）
+ * 会让用户对着一个转圈的按钮干等五分钟；取 3 分钟则代理不会先放弃，客户端也不至于等太久。
+ */
+export const RESUME_MS = 180_000;
+
+/**
  * 长跑路径前缀表（逐条来自实读的后端路由，不猜）。
  *
  * 匹配的是 `/api/py` **之后**的那段路径，即各 `*Api.ts` 传给 `request(path)` 的原样入参。
@@ -47,7 +60,12 @@ const LONG_EXACT_PREFIXES = [
   "/ai-trade/prior/rebuild",
 ] as const;
 
-/** `/strategies/{id}/backtest` 这类「前缀 + 中间是 id + 尾段」的长跑路径。 */
+/**
+ * `/strategies/{id}/backtest` 这类「前缀 + 中间是 id + 尾段」的长跑路径。
+ *
+ * `ms` 是**可选**档位：缺省仍取 `LONG_MS`，故既有六行一字不改。加它是为了让「比 20 秒长、
+ * 但远不到 5 分钟」的路径（续跑）有个自己的档，而不是被迫二选一。
+ */
 const LONG_SEGMENT_SUFFIXES = [
   { prefix: "/strategies/", suffix: "/backtest" },
   { prefix: "/strategies/", suffix: "/multi-backtest" },
@@ -55,7 +73,11 @@ const LONG_SEGMENT_SUFFIXES = [
   { prefix: "/factor-sets/", suffix: "/score" },
   { prefix: "/weight-models/", suffix: "/backtest" },      // 一键回测：/weight-models/{id}/runs/{id}/backtest
   { prefix: "/discovery/candidates/", suffix: "/backtest" }, // 候选提升前的一次性回测，同步返回
-] as const;
+  // 冷续跑：provider 解析 + 逐成员 `_prime()` + 交易所私有取数（D-8）。
+  { prefix: "/ai-trade/", suffix: "/resume", ms: RESUME_MS },
+  // 续跑预检同样要读交易所（持仓 / 挂单 / 账户配置）。
+  { prefix: "/ai-trade/", suffix: "/resume-preview", ms: RESUME_MS },
+] as const satisfies readonly { prefix: string; suffix: string; ms?: number }[];
 
 /**
  * 写类路径表 —— **不靠 HTTP 方法猜**。
@@ -101,16 +123,15 @@ function pathOnly(path: string): string {
  * 该路径应当用哪一档超时。
  *
  * @param path 各 `*Api.ts` 传给自己 `request()` 的路径（`/api/py` 之后那段）。
- * @returns `LONG_MS`（重计算）或 `FAST_MS`（其余一律）。
+ * @returns 该行自带的 `ms` 档 → `LONG_MS`（重计算）→ `FAST_MS`（其余一律）。
  */
 export function timeoutFor(path: string): number {
   const clean = pathOnly(path);
   if (LONG_EXACT_PREFIXES.some((prefix) => clean.startsWith(prefix))) return LONG_MS;
-  if (
-    LONG_SEGMENT_SUFFIXES.some(({ prefix, suffix }) => clean.startsWith(prefix) && clean.endsWith(suffix))
-  ) {
-    return LONG_MS;
-  }
+  const segment = LONG_SEGMENT_SUFFIXES.find(
+    ({ prefix, suffix }) => clean.startsWith(prefix) && clean.endsWith(suffix),
+  );
+  if (segment) return "ms" in segment ? segment.ms : LONG_MS;
   return FAST_MS;
 }
 

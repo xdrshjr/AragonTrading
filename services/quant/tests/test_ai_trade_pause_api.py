@@ -463,3 +463,122 @@ async def test_paused_group_blocks_a_new_start(monkeypatch):
     finally:
         app.dependency_overrides.clear()
         await dispose_engine()
+
+
+# ---------------- 生命周期真值化的 REST 契约（ai-trade-lifecycle-truth §5.1 / §5.3）----------------
+async def test_status_exposes_the_lifecycle_evidence_and_the_two_additive_keys(monkeypatch):
+    """用例 11（D-12）+ §5.1：`lifecycleUnknown` / `serverTs` 两个加法键 + 分组级 `lifecycle`。
+
+    「后端不知道有没有暂停分组」今天在界面上表现为「没有暂停分组」——与真实资金上
+    「读不到 ≠ 没有」的既定极性矛盾。
+    """
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _start_group(client, strategy_id)
+
+            body = (await client.get("/api/ai-trade/status")).json()
+            assert body["lifecycleUnknown"] is False
+            assert body["serverTs"] > 1_700_000_000
+            wire = body["group"]["lifecycle"]
+            assert wire["state"] == "running" and wire["declaredState"] == "running"
+            assert wire["membersTotal"] == 1 and wire["membersArmed"] == 1
+            assert body["group"]["state"] == "running"
+
+            get_ai_trade_manager().note_hydration_failed()
+            blind = (await client.get("/api/ai-trade/status")).json()
+            assert blind["lifecycleUnknown"] is True
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_status_drops_every_new_key_when_the_master_switch_is_off(monkeypatch):
+    """用例 12：总闸关 ⇒ 回执与本轮之前**逐字节相同**（四个加法键一个都不出现）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app, ai_trade_lifecycle_truth_enabled=False)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            await _start_group(client, strategy_id)
+            body = (await client.get("/api/ai-trade/status")).json()
+
+        assert set(body) == {"group", "aiTradeEnabled", "resumable"}
+        assert "lifecycle" not in body["group"]
+        assert "declaredState" not in body["group"]
+        assert body["group"]["state"] == "running"
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_resuming_a_dead_group_returns_a_readable_409(monkeypatch):
+    """§3.6 第一格 + §5.3：全成员已终止时点「继续」⇒ 409 `AI_TRADE_GROUP_ENDED` 且**文案可读**。
+
+    绝不出现「恢复成功但不交易」——那正是本轮的用户报告。
+    """
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            group_id = await _start_group(client, strategy_id)
+            await client.post(f"/api/ai-trade/{group_id}/pause", json={})
+            # 暂停期会话止损自终止（不走 on_stopped，直接摆布状态以复刻竞态窗口）。
+            for member in get_ai_trade_manager()._group.members:
+                member.session.state = "stopped"
+                member.session.stop_reason = "session_stop_loss"
+
+            blocked = await client.post(f"/api/ai-trade/{group_id}/resume",
+                                        json={"acknowledge": True})
+        assert blocked.status_code == 409, blocked.text
+        error = blocked.json()["error"]
+        assert error["code"] == "AI_TRADE_GROUP_ENDED"
+        assert "会话止损" in error["message"]
+        assert error["members"][0]["instId"] == "BTC-USDT-SWAP"
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_partially_dead_group_returns_the_member_detail(monkeypatch):
+    """§3.6 第二格：部分成员已终止 ⇒ 409 `AI_TRADE_RESUME_PARTIALLY_DEAD` + 逐标的明细透传。
+
+    `_http_error` 透传 `.members` 是既有通路；前端 `describeStartError` 的 code 白名单必须一起
+    认得这个码，否则「wire 里有事实、用户那里没有」第 N+1 次复发（[评审 R1-1]）。
+    """
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    body = {"members": [{"instId": "BTC-USDT-SWAP", "allocationPct": 50},
+                        {"instId": "ETH-USDT-SWAP", "allocationPct": 50}],
+            "bar": "1H", "strategyIds": [strategy_id], "contextRefreshRounds": 10}
+    try:
+        async with await _client(app) as client:
+            await _seed_account(client)
+            started = await client.post("/api/ai-trade/start", json=body)
+            assert started.status_code == 200, started.text
+            group_id = started.json()["groupId"]
+            await client.post(f"/api/ai-trade/{group_id}/pause", json={})
+            dead = get_ai_trade_manager()._group.members[1].session
+            dead.state = "stopped"
+            dead.stop_reason = "stale_feed"
+
+            blocked = await client.post(f"/api/ai-trade/{group_id}/resume",
+                                        json={"acknowledge": True})
+        assert blocked.status_code == 409, blocked.text
+        error = blocked.json()["error"]
+        assert error["code"] == "AI_TRADE_RESUME_PARTIALLY_DEAD"
+        rows = {row["instId"]: row for row in error["members"]}
+        assert "行情中断保护" in rows["ETH-USDT-SWAP"]["message"]
+        assert rows["BTC-USDT-SWAP"]["code"] == "paused"
+        assert get_ai_trade_manager()._group.state == "paused"    # 绝不置 running
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()

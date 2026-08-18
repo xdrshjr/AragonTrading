@@ -131,10 +131,33 @@ class SessionLink:
         self._repair_task: asyncio.Task | None = None
 
     async def on_stream(self, event: StreamEvent) -> None:
-        """WS 链路状态回调。**绝不外抛**：一个观测回调不该打死刚刚才恢复的连接。"""
+        """WS 链路状态回调。**绝不外抛**：一个观测回调不该打死刚刚才恢复的连接。
+
+        顶部判据是上一轮 §3.1.2「重定向表」在 `okx/` 下的**第 20 行**（ai-trade-lifecycle-truth
+        B-3 / L-6）：补根与链路告警属于**观测侧**，故 `ai_auto` 的判据必须是 `is_active`
+        （`running ∪ paused`）而不是 `state == "running"`。今天写成后者的后果就是 D-6：
+        暂停期断线重连的缺根**永远补不回来**（`_pending_repair` 都没被置位），续跑后 Agent
+        拿着一段有洞的窗口做真实资金决策。
+
+        **[评审 R0-2] 不能写成 `not getattr(session, "is_active", True)`。** `live_auto` /
+        `paper` 两类会话没有 `is_active` 属性但**都有 `self.state`**：兜底 True 会让一个已经
+        `stopped` 的会话**永远挡不住**，继续补根、继续写窗口、继续推链路告警。故必须显式两分支。
+        """
         try:
-            if getattr(self._session, "state", "running") != "running":
+            session = self._session
+            active = getattr(session, "is_active", None)
+            if active is None:
+                # live_auto / paper：没有 paused 态，**逐字保持今天的判据**（零回归）。
+                if getattr(session, "state", "running") != "running":
+                    return
+            elif not active:
+                # ai_auto：`is_active ⟺ state in {running, paused}`，故本行 ⟺ `state == "stopped"`。
+                # 只有**已终止**才退出；paused 是观测作用域（L-6）。
                 return
+            elif not self._lifecycle_truth_enabled():
+                # 总闸关 ⇒ 判据逐字回落到本轮之前（`state == "running"`），暂停期重新静默。
+                if getattr(session, "state", "running") != "running":
+                    return
             if event.state == "live":
                 await self._on_recovered(event)
                 return
@@ -217,6 +240,22 @@ class SessionLink:
         """会话级 settings；paper 会话没有 executor，回落进程级设置。"""
         executor = getattr(self._session, "executor", None)
         return executor.settings if executor is not None else get_settings()
+
+    def _lifecycle_truth_enabled(self) -> bool:
+        """整轴总闸（B-3 的回落开关）。缺字段 ⇒ 按开启处理（新代码的默认语义）。"""
+        return bool(getattr(self._settings(), "ai_trade_lifecycle_truth_enabled", True))
+
+    def channel_state(self, owner: str) -> str:
+        """本会话那条 K 线通道此刻的链路态（`up` | `idle` | `degraded` | `down` | `unknown`）。
+
+        住在这里而不是 session 里，与本模块存在的理由同一条（[评审 P1-8] 的冻结用例）：
+        **链路的实体一律下沉到 `okx/session_link.py`，三处 session 各自只留绑定**。
+
+        键格式由 `okx/ws_client.py:_stream_config` 定义（``ws:{endpoint}:{instId}:{bar}:{owner}``），
+        K 线走 business 端点。这是一次**纯内存读**，零新增探测。
+        """
+        key = f"ws:business:{self._session.inst_id}:{self._session.bar}:{owner}"
+        return get_link_registry().channel_state(key)
 
     async def _push_message(self, message: str) -> None:
         await self._session._push({"type": "status", "data": {

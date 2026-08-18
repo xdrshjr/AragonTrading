@@ -70,7 +70,7 @@ const noop = () => {};
 
 afterEach(() => {
   cleanup();
-  useAppStore.setState({ aiTradeGroup: null });
+  useAppStore.setState({ aiTradeGroup: null, aiTradeSyncState: "ok" });
 });
 
 describe("AiTradePanel", () => {
@@ -312,5 +312,156 @@ describe("AiTradePanel · 交易周期 chip", () => {
     useAppStore.setState({ aiTradeGroup: makeGroup([makeSession("BTC-USDT-SWAP")]) });
     render(<AiTradePanel rows={ROWS} active="BTC-USDT-SWAP" onSelect={noop} />);
     expect(screen.queryByTestId("ai-trade-horizon-chip")).toBeNull();
+  });
+});
+
+// ============ 生命周期真值化（ai-trade-lifecycle-truth F-1 / F-5 / F-6 · 用例 15 / 29）============
+
+const PANEL_MEMBER_WIRE = {
+  state: "running" as const, armed: true, reason: "armed" as const, reasonText: "",
+  warmedBars: 300, feedAgeS: 3, staleAfterS: 10800, linkState: "up",
+  nextWakeInS: 120, nextBarInS: 480, roundsCompleted: 4,
+  pauseReason: null, pausedTs: 0, resumedTs: 0, stopReason: null,
+};
+
+function panelGroupWire(over: Record<string, unknown> = {}) {
+  return {
+    state: "running", declaredState: "running", armed: true, membersArmed: 1, membersTotal: 1,
+    asOfTs: Math.floor(Date.now() / 1000), notArmed: [], nextWakeInS: 192, nextBarInS: 480,
+    pauseReason: null, pausedTs: 0, resumedCount: 0, ...over,
+  } as never;
+}
+
+function renderPanel() {
+  return render(
+    <AiTradePanel rows={ROWS} active="BTC-USDT-SWAP" livePrice={null} changePct={null}
+                  onSelect={noop} />,
+  );
+}
+
+describe("AiTradePanel · 生命周期真值", () => {
+  it("用例 15（L-4）：徽标只走唯一推导点 —— 派生的 `lifecycle.state` 优先于被赋值的 `group.state`", () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP", { state: "stopped",
+                                                    stopReason: "session_stop_loss" })]),
+        state: "running",                                   // 意图态还写着 running
+        lifecycle: panelGroupWire({ state: "stopped", armed: false, membersArmed: 0 }),
+      } as never,
+    });
+    renderPanel();
+    expect(screen.getByTestId("ai-trade-panel-badge")).toHaveTextContent("已停止");
+  });
+
+  it("F-5：终态留痕卡说清「为什么它自己停了」+ 会话净额 + 持仓归属提醒", () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP", { state: "stopped",
+                                                    stopReason: "session_stop_loss",
+                                                    sessionPnlUsd: -42.5 })]),
+        state: "stopped",
+        lifecycle: panelGroupWire({ state: "stopped", armed: false, membersArmed: 0 }),
+      } as never,
+    });
+    renderPanel();
+    const card = screen.getByTestId("ai-trade-stopped-card");
+    expect(card).toHaveTextContent("触发会话止损");
+    expect(card).toHaveTextContent("-42.5");
+    expect(card).toHaveTextContent("不再由任何自动化管理");
+  });
+
+  it("用例 29：多标的下横幅**逐标的**说明，绝不把还在正常交易的那个也说成停了", () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP"), makeSession("ETH-USDT-SWAP")]),
+        lifecycle: panelGroupWire({
+          armed: false, membersArmed: 1, membersTotal: 2,
+          notArmed: [{ instId: "ETH-USDT-SWAP", state: "running", reason: "feed_stale",
+                       reasonText: "行情已 12 分钟没有新 K 线，Agent 暂不响应" }],
+        }),
+      } as never,
+    });
+    renderPanel();
+    expect(screen.getByTestId("ai-trade-panel-badge")).toHaveTextContent("1/2 未武装");
+    const banner = screen.getByTestId("ai-trade-not-armed-banner");
+    expect(banner).toHaveTextContent("ETH-USDT-SWAP：");
+    expect(banner).toHaveTextContent("行情已 12 分钟没有新 K 线");
+    expect(banner).toHaveTextContent("其余照常交易");
+    expect(banner).toHaveAttribute("role", "alert");
+  });
+
+  it("全部武装 ⇒ 不挂横幅，且「下一次决策」倒计时在走", () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP")]),
+        lifecycle: panelGroupWire(),
+      } as never,
+    });
+    renderPanel();
+    expect(screen.queryByTestId("ai-trade-not-armed-banner")).not.toBeInTheDocument();
+    expect(screen.getByTestId("ai-trade-panel-next-wake")).toHaveTextContent("下一次决策");
+  });
+
+  it("老后端不下发 lifecycle ⇒ 徽标回落到 group.state，且**绝不**因此挂一条假红条", () => {
+    useAppStore.setState({
+      aiTradeGroup: { ...makeGroup([makeSession("BTC-USDT-SWAP")]), lifecycle: null } as never,
+    });
+    renderPanel();
+    expect(screen.getByTestId("ai-trade-panel-badge")).toHaveTextContent("运行中");
+    expect(screen.queryByTestId("ai-trade-not-armed-banner")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("ai-trade-panel-next-wake")).not.toBeInTheDocument();
+  });
+
+  it("`unknown`（后端读不到）⇒ 徽标改说「与后端同步中…」，绝不冒充一个确定的态", () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP")]),
+        lifecycle: panelGroupWire(),
+      } as never,
+      aiTradeSyncState: "unknown",
+    });
+    renderPanel();
+    expect(screen.getByTestId("ai-trade-panel-badge")).toHaveTextContent("与后端同步中…");
+    useAppStore.setState({ aiTradeSyncState: "ok" });
+  });
+
+  it("paused ⇒ 暂停横幅照旧 + 倒计时不渲染（[评审 R1-6]）", () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP", { state: "paused" })]),
+        state: "paused",
+        lifecycle: panelGroupWire({ state: "paused", armed: false, membersArmed: 0 }),
+      } as never,
+    });
+    renderPanel();
+    expect(screen.getByTestId("ai-trade-panel-badge")).toHaveTextContent("已暂停");
+    expect(screen.getByTestId("ai-trade-paused-banner")).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-trade-panel-next-wake")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("ai-trade-not-armed-banner")).not.toBeInTheDocument();
+  });
+
+  it("成员级 lifecycle 能穿过 store 到达成员槽（风险 R-13 的白名单守卫）", () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP", { lifecycle: PANEL_MEMBER_WIRE })]),
+        lifecycle: panelGroupWire(),
+      } as never,
+    });
+    renderPanel();
+    expect(
+      useAppStore.getState().aiTradeGroup?.members["BTC-USDT-SWAP"].session?.lifecycle?.armed,
+    ).toBe(true);
+  });
+  it("F-4 的读点：会话状态行（行情断连 / 补根结果 / WS 错误帧）必须真的渲染出来", () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP", {
+          message: "行情连接异常，AI 自动交易暂停响应 K 线（交易所侧止盈止损仍生效）" })]),
+        lifecycle: panelGroupWire(),
+      } as never,
+    });
+    renderPanel();
+    expect(screen.getByTestId("ai-trade-member-message"))
+      .toHaveTextContent("行情连接异常");
   });
 });

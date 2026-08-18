@@ -429,10 +429,20 @@ async def ai_trade_status(settings: Settings = Depends(get_settings)) -> dict:
     `resumable`（pause-resume §5.6）：**仅**冷占位（内存无会话、磁盘有暂停契约）时非空。
     它与 `group` **互斥**——热暂停走 `group.state="paused"`，两者同时非空即 bug（G-9 冻结）。
     该端点 `-> dict` 且无 `response_model`，故新键不会被 FastAPI 静默吞掉。
+
+    `lifecycleUnknown` / `serverTs`（lifecycle-truth B-8）：两个**加法**键。
+    前者修 D-12 ——「后端不知道有没有暂停分组」今天在界面上表现为「没有暂停分组」，与真实资金上
+    「读不到 ≠ 没有」的既定极性矛盾；后者是前端倒计时的**服务端时钟锚点**（本仓库已有
+    `live-db-location-and-ai-trade-ts-dual-clock` 的双时钟教训，本机时钟偏移一小时不该让
+    「下一次决策」读出一个荒谬的数）。总闸关 ⇒ 两键整键缺席（逐字回退，用例 12）。
     """
     manager = get_ai_trade_manager()
-    return {"group": manager.group_status(), "aiTradeEnabled": settings.ai_trade_enabled,
+    body = {"group": manager.group_status(), "aiTradeEnabled": settings.ai_trade_enabled,
             "resumable": manager.resumable()}
+    if settings.ai_trade_lifecycle_truth_enabled:
+        body["lifecycleUnknown"] = manager.is_hydration_blind()
+        body["serverTs"] = int(time.time())
+    return body
 
 
 @router.get("/ai-trade/discipline-presets")

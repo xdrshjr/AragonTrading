@@ -1046,6 +1046,21 @@ export interface AiTradeSessionRow {
   // `costSnapshot` 之下——后者只在 `k_min<=0`（门禁空转）时才发，装了纪律预设的会话一次都收不到。
   // 零往返 / 老后端 ⇒ null 或 undefined ⇒ 整段不渲染（G-9b 的实时侧读点）。
   realized?: AiTradeRealizedStats | null;
+  // 成员级生命周期真值（lifecycle-truth B-5 / §5.2）：三条通路同时下发它——WS `status` 经
+  // `patchAiTradeMemberStatus` **整体 spread** 合并进 `m.session`、REST 成员行经
+  // `groupStateFromStatus` 逐键手抄、WS `lifecycle` 事件经窄 patch 合并。老后端 / 总闸关
+  // ⇒ 整键缺席 ⇒ 成员卡的武装说明整段不渲染（自动回落到本轮之前）。
+  lifecycle?: AiTradeMemberLifecycle | null;
+  // 会话终止原因（`info()` 不带、WS `status` 带）：终态留痕卡要说清「为什么它自己停了」。
+  stopReason?: string | null;
+  // 成员级暂停断面：`info()` 与 WS `status` **两条通路都在下发**（`ai_auto/session.py`），
+  // 漏的只是类型声明。窄 patch 的白名单要能引用它们（[评审 R1-3]）。
+  pauseReason?: AiTradePauseReason | null;
+  pausedTs?: number | null;
+  // 会话状态行的一句话（行情断连 / 已恢复 / 补根结果 / WS 错误帧）。后端**早就在下发它**
+  // （`_check_staleness`、`SessionLink._push_message` 都推 `{...status, message}`），但全仓一直
+  // **没有读点** —— 「wire 里有事实、用户那里没有」的又一处，本轮补上（F-4）。
+  message?: string | null;
 }
 
 // WS status 事件负载（_status_payload / 轻量 status，会话视图的可增量合并子集）。
@@ -1095,6 +1110,11 @@ export interface AiTradeStatusEvent {
   // `costSnapshot` 之下——后者只在 `k_min<=0`（门禁空转）时才发，装了纪律预设的会话一次都收不到。
   // 零往返 / 老后端 ⇒ null 或 undefined ⇒ 整段不渲染（G-9b 的实时侧读点）。
   realized?: AiTradeRealizedStats | null;
+  // 成员级生命周期真值（lifecycle-truth B-5 / §5.2）：三条通路同时下发它——WS `status` 经
+  // `patchAiTradeMemberStatus` **整体 spread** 合并进 `m.session`、REST 成员行经
+  // `groupStateFromStatus` 逐键手抄、WS `lifecycle` 事件经窄 patch 合并。老后端 / 总闸关
+  // ⇒ 整键缺席 ⇒ 成员卡的武装说明整段不渲染（自动回落到本轮之前）。
+  lifecycle?: AiTradeMemberLifecycle | null;
 }
 
 export interface AiTradeStartReq {
@@ -1217,13 +1237,118 @@ export interface AiTradeGroupRow {
   pauseReason?: AiTradePauseReason | null;
   pausedTs?: number | null;
   resumedCount?: number | null;
+  // 生命周期真值（lifecycle-truth B-6）：`state` 自本轮起是**派生真值**（由各成员会话态现算），
+  // `declaredState` 是上一次动作赋的那个「意图」。两者不等即 bug 的信号，只用于诊断。
+  // 老后端 / 总闸关 ⇒ 两键缺席 ⇒ 前端自动回落到 `state`（一键逐字回滚的第四处落点）。
+  declaredState?: AiTradeLifecycleState | null;
+  lifecycle?: AiTradeLifecycleWire | null;
 }
 
 /** 分组生命周期态（后端 `group.state` 与会话 `status.state` 共用同一值域）。 */
 export type AiTradeLifecycleState = "running" | "paused" | "stopped";
 
-/** 暂停原因（稳定枚举；前端按它选文案，绝不自己拼判定性说明）。 */
-export type AiTradePauseReason = "user" | "app_quit" | "process_restart" | "disabled_by_config";
+/**
+ * 暂停原因（稳定枚举；前端按它选文案，绝不自己拼判定性说明）。
+ *
+ * `resume_rollback` 是 ai-trade-lifecycle-truth 新增的一格（B-2 ③ 复检未过后的整组回滚）。
+ * **扩展稳定枚举要一次改齐所有落点**：后端 `pause.py` 的常量与 `PAUSE_REASON_TEXT`、本联合
+ * 类型、`lib/aiTrade.ts` 的 `AI_TRADE_PAUSE_REASON_TEXT`。少改一处，回滚后的暂停原因在界面
+ * 上就是**空的**。
+ */
+export type AiTradePauseReason =
+  | "user"
+  | "app_quit"
+  | "process_restart"
+  | "disabled_by_config"
+  | "resume_rollback";
+
+// ============ 生命周期真值（ai-trade-lifecycle-truth §5.1 / §5.2）============
+
+/**
+ * 「没武装」的稳定语义码（后端 `ai_auto/lifecycle.py` 的唯一真源）。
+ *
+ * 前端**只按它选颜色与图标**，判定性中文一律取同一份 wire 里的 `reasonText` ——
+ * 本仓库「稳定语义码直出 UI」与「前后端各存一份口径」的事故各发生过一次。
+ */
+export type AiTradeNotArmedReason =
+  | "armed"
+  | "session_stopped"
+  | "session_paused"
+  | "feed_stale"
+  | "feed_down"
+  | "not_warmed";
+
+/** 未武装成员的逐标的一行（`lifecycle.notArmed[]`）。 */
+export interface AiTradeNotArmedRow {
+  instId: string;
+  state: AiTradeLifecycleState;
+  reason: AiTradeNotArmedReason;
+  reasonText: string;
+}
+
+/**
+ * 分组级 `lifecycle`（§5.1）：`state` 的**证据**。
+ *
+ * L-2：凡是下发 `state === "running"`，同一份 wire 必须同时下发 `armed` 与（`armed === false`
+ * 时）逐成员的 `reason` + `reasonText` —— 否则「运行中」重新变成一句无法核对的话。
+ * `membersArmed` / `membersTotal` 分子分母同时下发，**前端绝不自己数**（[评审 R1-7]）。
+ */
+export interface AiTradeLifecycleWire {
+  state: AiTradeLifecycleState;
+  /** 意图态（`AiTradeGroup.state`）。与 `state` 不等即 bug 的信号，只用于诊断。 */
+  declaredState: AiTradeLifecycleState;
+  armed: boolean;
+  membersArmed: number;
+  membersTotal: number;
+  /** 服务端算这份 wire 的墙钟秒（倒计时锚点，避免本机时钟偏移）。 */
+  asOfTs: number;
+  notArmed: AiTradeNotArmedRow[];
+  /** 距下一次墙钟定时唤醒（秒）；`null` = 未装墙钟唤醒（**最常见配置**，前端回落 `nextBarInS`）。 */
+  nextWakeInS: number | null;
+  /** 距下一根 K 线收盘（秒）；`null` = 相位未知。 */
+  nextBarInS: number | null;
+  pauseReason: AiTradePauseReason | null;
+  pausedTs: number;
+  resumedCount: number;
+}
+
+/** 成员级 `lifecycle`（§5.2）：同时出现在 `/status` 的成员行、WS `status`、WS `lifecycle` 事件。 */
+export interface AiTradeMemberLifecycle {
+  state: AiTradeLifecycleState;
+  armed: boolean;
+  reason: AiTradeNotArmedReason;
+  reasonText: string;
+  warmedBars: number;
+  feedAgeS: number;
+  staleAfterS: number;
+  /** 链路登记簿口径（`up` | `idle` | `degraded` | `down` | `unknown`）。 */
+  linkState: string;
+  nextWakeInS: number | null;
+  nextBarInS: number | null;
+  roundsCompleted: number;
+  pauseReason: AiTradePauseReason | null;
+  pausedTs: number;
+  resumedTs: number;
+  stopReason: string | null;
+}
+
+/**
+ * WS `lifecycle` 事件（§5.4）。
+ *
+ * 唯一一条**实时**的暂停 / 继续信号：上一轮后端推了、前端没有 case（D-10），本轮才第一次消费它。
+ */
+export interface AiTradeLifecycleEvent {
+  action: "paused" | "resumed";
+  reason: AiTradePauseReason | null;
+  ts: number;
+  lifecycle?: AiTradeMemberLifecycle | null;
+}
+
+/** WS `error` 事件（§5.4）：协议不变，本轮才第一次消费它（D-9）。 */
+export interface AiTradeErrorEvent {
+  code: string;
+  message: string;
+}
 
 /** 离线差异判定（§3.6 的十一格；判定性文案由后端 `message` 下发，前端只渲染）。 */
 export type AiTradeDriftVerdict =
@@ -1380,6 +1505,15 @@ export interface AiTradeGroupStatusResponse {
   aiTradeEnabled: boolean;
   /** 冷占位；**与 `group` 互斥**（两者同时非空即 bug，后端 G-9 冻结这一条）。 */
   resumable?: AiTradeResumableGroup | null;
+  /**
+   * 后端水合盲区（lifecycle-truth B-8，修 D-12）。
+   *
+   * `true` = 后端**不知道**有没有可续跑的暂停分组（DB 读失败）。这与「没有」在真实资金上
+   * 不是同一件事：命中这一格时对账器**什么都不清**，只把界面切到「与后端同步中…」。
+   */
+  lifecycleUnknown?: boolean;
+  /** 服务端墙钟秒：倒计时的锚点（双时钟纪律，本机时钟偏移不该让「下一次决策」读出荒谬的数）。 */
+  serverTs?: number;
 }
 
 export interface AiTradeGroupStopResult {
@@ -1451,8 +1585,54 @@ export interface AiTradeGroupState {
   pauseReason?: AiTradePauseReason | null;
   pausedTs?: number | null;
   resumedCount?: number | null;
+  // 生命周期真值（lifecycle-truth F-2）：由 `patchAiTradeGroupLifecycle` 窄 action 与
+  // `groupStateFromStatus` 逐键手抄两条路径写入。**`state` 自本轮起消费的是后端的派生真值**，
+  // 而 `lifecycle` 是让人能反驳它的那份证据；两者缺一，「运行中」就重新变成一句无法核对的话。
+  declaredState?: AiTradeLifecycleState | null;
+  lifecycle?: AiTradeLifecycleWire | null;
   startedTs: number;
   members: Record<string, AiTradeGroupMemberState>;
+}
+
+/**
+ * 生命周期对账的**窄** patch（lifecycle-truth F-2 / F-9）。
+ *
+ * 「窄」的准确边界（[评审 R1-3]）：它**要**写分组级那几键 + 逐成员的六个生命周期键，
+ * **绝不**写 `members[].trades / position / decisions / traces / summary`（那些是 WS 流的产物，
+ * 覆盖即闪烁 / 丢历史），**也不**增删成员槽。
+ *
+ * 为什么不能用 `setAiTradeGroup(groupStateFromStatus(...))` 做这件事：那条映射写死
+ * `trades: []`，而它跑在一个 3~15 秒的轮询里 —— 成交流会周期性消失。这条与
+ * `patchAiTradeGroupAcceptance` 的注释是同一条教训。
+ *
+ * 白名单与 §5.2 的 wire 形状**写在同一处**（风险 R-13）：后端加了成员级生命周期字段而这里
+ * 没跟上时，那个字段会悄悄拿不到。
+ */
+export interface AiTradeGroupLifecyclePatch {
+  group: Partial<
+    Pick<
+      AiTradeGroupState,
+      | "state"
+      | "declaredState"
+      | "lifecycle"
+      | "pauseReason"
+      | "pausedTs"
+      | "resumedCount"
+      | "acceptance"
+      | "exits"
+      | "funding"
+    >
+  >;
+  /** 逐成员的六个生命周期键（按 `instId` 合并；缺席于回执的成员**保留本地行不动，不删**）。 */
+  members: {
+    instId: string;
+    session: Partial<
+      Pick<
+        AiTradeSessionRow,
+        "state" | "pauseReason" | "pausedTs" | "stopReason" | "degraded" | "lifecycle"
+      >
+    >;
+  }[];
 }
 
 // 持久化偏好（进 partialize）：记忆上次选的策略集合与刷新轮数与仓位操作档位。

@@ -117,6 +117,34 @@ class OKXMarketWSClient:
         self._stop = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
 
+    @property
+    def is_alive(self) -> bool:
+        """至少一条 endpoint 任务仍在跑。
+
+        ``_run_endpoint`` 只吞 ``CancelledError``，supervisor 抛别的异常时任务会**静默死掉**
+        ——这个属性就是那条静默的出口（ai-trade-lifecycle-truth B-4 / D-7）。
+
+        读到「已 done 且带异常」的 task 时顺手取一次 ``task.exception()``：否则 asyncio 会在
+        回收时打一条 "Task exception was never retrieved"，而那条噪音恰恰就是本属性想说出口
+        的那件事，不该被丢在事件循环的日志里（[评审 R2-3]）。
+
+        注意它**不是**「连接是否已建立」：连接的活性判据在 ``ws_supervisor`` 内部，重连期间
+        task 仍在跑、本属性仍为真。它回答的只有一件事——「还有没有人在为这条流努力」。
+        """
+        if not self._tasks:
+            return False
+        alive = False
+        for task in self._tasks:
+            if not task.done():
+                alive = True
+                continue
+            if not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    logger.warning("OKX WS endpoint task died: %s: %s",
+                                   type(exc).__name__, exc)
+        return alive
+
     def start(self) -> None:
         if self._tasks:
             return
@@ -255,6 +283,11 @@ class OKXWSClient:
             market_channels=False,
             owner=owner,
         )
+
+    @property
+    def is_alive(self) -> bool:
+        """转发 ``OKXMarketWSClient.is_alive``（本类是它的薄包装）。"""
+        return self._client.is_alive
 
     def start(self) -> None:
         self._client.start()

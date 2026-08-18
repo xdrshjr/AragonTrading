@@ -31,6 +31,7 @@ import type {
 import type {
   AiTradeConfig,
   AiTradeDecision,
+  AiTradeGroupLifecyclePatch,
   AiTradeGroupState,
   AiTradeResumableGroup,
   AiTradeRoundTrace,
@@ -45,7 +46,11 @@ import type { WeightBatchTarget } from "./weightBatchTypes";
 import type { WorkspacePrefs } from "./workspaceTypes";
 import { TRADES_MAX } from "./wireCaps";
 import { clampAllocationOnEdit, defaultAllocationOnAdd, evenSplit } from "./autoTrade";
-import { AI_TRADE_DEFAULT_POSITION_STEP, AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN } from "./aiTrade";
+import {
+  AI_TRADE_DEFAULT_POSITION_STEP,
+  AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN,
+  AI_TRADE_RECONCILE_WINDOW_MS,
+} from "./aiTrade";
 
 // 分组级验收三键的补丁面（横切 `AiTradeGroupState` 的一个**窄**子集，故在此单独取名——
 // 用 `Partial<AiTradeGroupState>` 会让这个 action 有能力覆盖 `members` / `trades`，
@@ -417,6 +422,15 @@ interface AppState {
   aiTradeLifecycleNotice: string | null;
   aiTradeAcknowledged: boolean;                   // 首启风险勾选会话记忆，刷新复位
   aiTradeConfig: AiTradeConfig | null;            // 持久化偏好（进 partialize）
+  // ---- 生命周期真值化（ai-trade-lifecycle-truth F-9）：三个字段全部**瞬态、不进 partialize** ----
+  // 一个瞬时的 `unknown` 被固化到下次开机，会让用户一开机就看到「与后端同步中」（风险 R-7）。
+  // `partialize` 是显式白名单，不主动写进去就不会被持久化——`store.persist.test.ts` 有一条用例守它。
+  /** 后端水合盲区 / 对账失败：`unknown` 时动作按钮全禁用（L-7 极性：读不到就不让点）。 */
+  aiTradeSyncState: "ok" | "unknown";
+  /** 快对账窗口截止时间戳（ms）：动作之后的 30 秒内用 3s 节奏收敛，其余 15s。 */
+  aiTradeReconcileUntil: number | null;
+  /** 后端总闸。**唯一写点 = 对账器**（Toggle 不再自己轮询，[评审 R0-7] 的单 owner 收敛）。 */
+  aiTradeEnabled: boolean;
   // AI 回测（ai-auto-trading-backtest §5.4）：aiBacktestJobId 瞬态（GET /ai-trade/backtest/{id} 重发现）；
   // aiBacktestConfig 为持久化偏好（记忆决策间隔 / 刷新轮数，进 partialize，v25 承载无需升版）。
   aiBacktestJobId: string | null;
@@ -535,6 +549,13 @@ interface AppState {
   patchAiTradeMemberSession: (instId: string, patch: Partial<AiTradeSessionRow>) => void;
   patchAiTradeMemberStatus: (instId: string, status: AiTradeStatusEvent) => void;
   patchAiTradeGroupAcceptance: (patch: AiTradeGroupAcceptancePatch) => void;
+  // 生命周期对账的三个写点（F-9）。`patchAiTradeGroupLifecycle` 是**窄** action：
+  // 只写分组级那几键 + 逐成员的六个生命周期键，绝不碰 `trades` / `position` / `decisions` /
+  // `traces` / `summary`（那些是 WS 流的产物，覆盖即闪烁 / 丢历史），也不增删成员槽。
+  patchAiTradeGroupLifecycle: (patch: AiTradeGroupLifecyclePatch) => void;
+  requestAiTradeReconcile: () => void;
+  setAiTradeSyncState: (state: "ok" | "unknown") => void;
+  setAiTradeEnabled: (enabled: boolean) => void;
   setAiTradeMemberTrades: (instId: string, trades: Trade[]) => void;
   appendAiTradeMemberTrade: (instId: string, trade: Trade) => void;
   setAiTradeMemberPosition: (instId: string, pos: PaperPositionEvent | null) => void;
@@ -698,6 +719,12 @@ export const useAppStore = create<AppState>()(
       aiTradeLifecycleNotice: null,
       aiTradeAcknowledged: false,
       aiTradeConfig: null,
+      // 生命周期真值化（F-9）：三个瞬态字段。首屏 store 未水合时 `aiTradeEnabled` 是 `false`，
+      // 而 `aiTradeSyncState` 恰好也是 `"ok"` —— 门禁文案因此必须区分这两件事（风险 R-11）：
+      // 「正在与后端同步…」和「本机未开启 AI 自动交易」不是同一句话，后者在首屏是**假的**。
+      aiTradeSyncState: "ok",
+      aiTradeReconcileUntil: null,
+      aiTradeEnabled: false,
       aiBacktestJobId: null,
       aiBacktestConfig: null,
       theme: "light",
@@ -951,6 +978,30 @@ export const useAppStore = create<AppState>()(
         set((s) =>
           s.aiTradeGroup ? { aiTradeGroup: { ...s.aiTradeGroup, ...patch } } : {},
         ),
+      // 生命周期对账的**窄** action（lifecycle-truth F-2 / [评审 R1-3]）：分组级那几键 +
+      // 逐成员的六个生命周期键。为什么必须窄：`setAiTradeGroup(groupStateFromStatus(...))`
+      // 会把每个成员的 `trades` 清空（那条映射写死 `trades: []`），而本 action 跑在一个 3~15 秒
+      // 的轮询里 —— 成交流会周期性消失。这条与 `patchAiTradeGroupAcceptance` 是同一条教训。
+      //
+      // 成员行必须一起合并，否则一个已死成员的卡片会**永远**显示「运行中」：它的 WS 恰好在
+      // `NOT_FOUND` 之后被停连了，再也没有任何事实会到达那张卡片。回执里缺席的成员**保留本地
+      // 行不动，不删**（它的去向由终态留痕卡负责）。
+      patchAiTradeGroupLifecycle: (patch) =>
+        set((s) => {
+          const group = s.aiTradeGroup;
+          if (!group) return {};
+          const members = { ...group.members };
+          for (const row of patch.members) {
+            const local = members[row.instId];
+            if (!local?.session) continue;
+            members[row.instId] = { ...local, session: { ...local.session, ...row.session } };
+          }
+          return { aiTradeGroup: { ...group, ...patch.group, members } };
+        }),
+      requestAiTradeReconcile: () =>
+        set({ aiTradeReconcileUntil: Date.now() + AI_TRADE_RECONCILE_WINDOW_MS }),
+      setAiTradeSyncState: (aiTradeSyncState) => set({ aiTradeSyncState }),
+      setAiTradeEnabled: (aiTradeEnabled) => set({ aiTradeEnabled }),
       setAiTradeMemberTrades: (instId, trades) =>
         set((s) =>
           patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({

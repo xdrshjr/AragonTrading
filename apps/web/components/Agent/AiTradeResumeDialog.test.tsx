@@ -153,3 +153,99 @@ describe("AiTradeResumeDialog", () => {
     expect(screen.getByRole("button", { name: "继续" })).toBeDisabled();
   });
 });
+
+// ============ 第三屏「正在武装」（ai-trade-lifecycle-truth F-8）============
+
+const DLG_MEMBER_WIRE = {
+  state: "running" as const, armed: true, reason: "armed" as const, reasonText: "",
+  warmedBars: 300, feedAgeS: 3, staleAfterS: 10800, linkState: "up",
+  nextWakeInS: 192, nextBarInS: 480, roundsCompleted: 4,
+  pauseReason: null, pausedTs: 0, resumedTs: 0, stopReason: null,
+};
+
+function member(over: Record<string, unknown> = {}) {
+  return {
+    instId: "BTC-USDT-SWAP", sessionId: "s1", allocationPct: 100,
+    session: { sessionId: "s1", runId: 1, state: "running", instId: "BTC-USDT-SWAP", bar: "1H",
+               strategyIds: [1], strategyNames: ["S"], budgetUsd: 100, leverage: 3,
+               contextRefreshRounds: 10, roundsCompleted: 0, roundsSinceSummary: 0,
+               positionSide: "flat", sessionPnlUsd: 0, startedTs: 0,
+               lifecycle: DLG_MEMBER_WIRE, ...over },
+    trades: [], position: null, decisions: [], traces: [], summary: null,
+  } as never;
+}
+
+function groupWire(over: Record<string, unknown> = {}) {
+  return {
+    state: "running", declaredState: "running", armed: true, membersArmed: 1, membersTotal: 1,
+    asOfTs: 1_755_500_000, notArmed: [], nextWakeInS: 192, nextBarInS: 480,
+    pauseReason: null, pausedTs: 0, resumedCount: 0, ...over,
+  } as never;
+}
+
+describe("AiTradeResumeDialog · 武装清单三屏流转（F-8）", () => {
+  it("未提交时是复核屏，`arming` 清单不出现", () => {
+    renderDialog(preview());
+    expect(screen.queryByTestId("ai-trade-arming-checklist")).not.toBeInTheDocument();
+    expect(screen.getByText("继续 AI 自动交易")).toBeInTheDocument();
+  });
+
+  it("提交后进入第二屏：清单出现、复核内容让位、标题改为「正在恢复」", () => {
+    renderDialog(preview(), {
+      arming: true, armingSince: 1_000, nowTs: 1_005, submitting: true,
+      lifecycle: groupWire({ armed: false, membersArmed: 0 }),
+      members: [member({ lifecycle: { ...DLG_MEMBER_WIRE, armed: false,
+                                      reason: "not_warmed",
+                                      reasonText: "行情窗口尚未暖机完成，Agent 暂不响应。" } })],
+    });
+    const list = screen.getByTestId("ai-trade-arming-checklist");
+    expect(screen.getByText("正在恢复 AI 自动交易")).toBeInTheDocument();
+    expect(list).toHaveTextContent("正在核对持仓、重建会话、接上行情");
+    expect(list).toHaveTextContent("武装中");
+    // 判定性说明**一律取后端 `reasonText`**，前端不按 code 自己拼中文。
+    expect(list).toHaveTextContent("行情窗口尚未暖机完成");
+    // 还没超时 ⇒ 不给「重试继续」（那会诱导用户在武装途中再打一次真实资金的开仓授权）。
+    expect(screen.queryByRole("button", { name: "重试继续" })).not.toBeInTheDocument();
+  });
+
+  it("全部就绪 ⇒ 第三屏说「全部就绪」，四行逐项打勾", () => {
+    renderDialog(preview(), {
+      arming: true, armingSince: 1_000, nowTs: 1_003,
+      lifecycle: groupWire(),
+      members: [member()],
+    });
+    const list = screen.getByTestId("ai-trade-arming-checklist");
+    expect(list).toHaveTextContent("全部就绪：Agent 已恢复自动交易。");
+    expect(list).toHaveTextContent("已武装");
+    for (const line of ["会话已建", "行情已连", "已接管持仓", "下一次决策"]) {
+      expect(list).toHaveTextContent(line);
+    }
+    expect(list).toHaveTextContent("03:12");     // 下一次决策的真实读数，不是占位
+  });
+
+  it("超过 45 秒仍未 armed ⇒ 原地变成如实的失败说明 + 两条**真实可走的路**（风险 R-12）", () => {
+    renderDialog(preview(), {
+      arming: true, armingSince: 1_000, nowTs: 1_050,      // 已过 50 秒
+      lifecycle: groupWire({ armed: false, membersArmed: 0 }),
+      members: [member({ lifecycle: { ...DLG_MEMBER_WIRE, armed: false, state: "paused",
+                                      reason: "feed_down",
+                                      reasonText: "实时链路不可达，Agent 暂不响应；交易所侧止盈止损仍生效。" } })],
+    });
+    const list = screen.getByTestId("ai-trade-arming-checklist");
+    expect(list).toHaveTextContent("仍有标的没有武装成功");
+    expect(list).toHaveTextContent("实时链路不可达");
+    expect(list).toHaveTextContent("未武装");
+    expect(screen.getByRole("button", { name: "重试继续" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "结束并归档" })).toBeInTheDocument();
+    // 「失败」这两个字不该出现：后端可能还在暖机，说它失败是一句没被证实的话。
+    expect(list.textContent).not.toContain("失败");
+  });
+
+  it("后端还没下发成员行 ⇒ 如实说「正在等待」，绝不画一张空的全绿清单", () => {
+    renderDialog(preview(), {
+      arming: true, armingSince: 1_000, nowTs: 1_002, lifecycle: null, members: [],
+    });
+    expect(screen.getByTestId("ai-trade-arming-checklist"))
+      .toHaveTextContent("正在等待后端下发成员状态…");
+  });
+});

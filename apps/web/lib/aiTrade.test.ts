@@ -4,10 +4,18 @@ import { groupStateFromStatus } from "./useAiTradeGroupStream";
 import type {
   AiTradeGroupRow,
   AiTradeGroupState,
+  AiTradeLifecycleWire,
+  AiTradeMemberLifecycle,
   AiTradeResumableGroup,
 } from "./aiTradeTypes";
+import { ApiRequestError } from "./api";
 import {
+  describeAiTradeLifecycleBadge,
+  describeStartError,
+  formatNextWake,
   formatPausedFor,
+  reconcileAiTradeLifecycle,
+  resolveAiTradeArmed,
   resolveAiTradeLifecycle,
   AI_TRADE_DEFAULT_POSITION_STEP,
   AI_TRADE_PROFIT_GUARD_DEFAULTS,
@@ -1092,5 +1100,287 @@ describe("groupStateFromStatus 的 state 不再被写死（D-7 的直接守卫�
 
   it("老后端不下发该键 ⇒ 逐字回退 running", () => {
     expect(groupStateFromStatus(row()).state).toBe("running");
+  });
+});
+
+// ============ 生命周期真值化（ai-trade-lifecycle-truth §8.2 用例 13 / 15 / 19 / 29）============
+
+const memberRow = (over: Record<string, unknown> = {}) =>
+  ({
+    instId: "BTC-USDT-SWAP", sessionId: "s1", runId: 1, state: "running",
+    bar: "1H", strategyIds: [1], strategyNames: ["S"], budgetUsd: 100, leverage: 3,
+    contextRefreshRounds: 10, roundsCompleted: 0, roundsSinceSummary: 0,
+    positionSide: "flat", sessionPnlUsd: 0, startedTs: 0, allocationPct: 100, ...over,
+  }) as unknown as AiTradeGroupRow["members"][number];
+
+const memberLifecycle = (over: Record<string, unknown> = {}) =>
+  ({
+    state: "running", armed: true, reason: "armed", reasonText: "", warmedBars: 300,
+    feedAgeS: 3, staleAfterS: 10800, linkState: "up", nextWakeInS: 120, nextBarInS: 480,
+    roundsCompleted: 4, pauseReason: null, pausedTs: 0, resumedTs: 0, stopReason: null,
+    ...over,
+  }) as unknown as AiTradeMemberLifecycle;
+
+const groupWire = (over: Record<string, unknown> = {}) =>
+  ({
+    state: "running", declaredState: "running", armed: true, membersArmed: 1, membersTotal: 1,
+    asOfTs: 1_755_500_000, notArmed: [], nextWakeInS: 120, nextBarInS: 480,
+    pauseReason: null, pausedTs: 0, resumedCount: 0, ...over,
+  }) as unknown as AiTradeLifecycleWire;
+
+const statusRow = (over: Record<string, unknown> = {}) =>
+  ({
+    groupId: "g1", bar: "1H", strategyIds: [1], strategyNames: ["S"], totalBudgetUsd: 100,
+    leverage: 3, contextRefreshRounds: 10, createdTs: 0, members: [memberRow()],
+    state: "running", lifecycle: groupWire(), ...over,
+  }) as unknown as AiTradeGroupRow;
+
+const localGroup = (over: Record<string, unknown> = {}) =>
+  ({
+    ...groupStateFromStatus(statusRow()),
+    members: {
+      "BTC-USDT-SWAP": {
+        instId: "BTC-USDT-SWAP", sessionId: "s1", allocationPct: 100,
+        session: memberRow(),
+        trades: [{ ts: 1, side: "buy", price: 1, size: 1 }],
+        position: { side: "long" }, decisions: [], traces: [], summary: null,
+      },
+    },
+    ...over,
+  }) as unknown as AiTradeGroupState;
+
+describe("resolveAiTradeLifecycle（L-4 的唯一推导点，四态）", () => {
+  it("优先吃后端**派生**的 lifecycle.state，而不是被赋值的 group.state", () => {
+    const group = localGroup({ state: "running", lifecycle: groupWire({ state: "stopped" }) });
+    expect(resolveAiTradeLifecycle(group, null)).toBe("stopped");
+  });
+
+  it("后端没下发 lifecycle（老后端 / 总闸关）⇒ 逐字回落到 group.state", () => {
+    expect(resolveAiTradeLifecycle(localGroup({ state: "paused", lifecycle: null }), null))
+      .toBe("paused");
+    expect(resolveAiTradeLifecycle(localGroup({ state: "running", lifecycle: null }), null))
+      .toBe("running");
+  });
+
+  it("stopped 是本轮新增的第四态（此前它会被误判成 running）", () => {
+    expect(resolveAiTradeLifecycle(localGroup({ lifecycle: groupWire({ state: "stopped" }) }), null))
+      .toBe("stopped");
+  });
+});
+
+describe("resolveAiTradeArmed（分子分母一律取后端，前端绝不自己数）", () => {
+  it("整组与门 + 逐标的原因", () => {
+    const rows = [{ instId: "ETH-USDT-SWAP", state: "running", reason: "feed_stale",
+                    reasonText: "行情已 12 分钟没有新 K 线" }];
+    const view = resolveAiTradeArmed(localGroup({
+      lifecycle: groupWire({ armed: false, membersArmed: 1, membersTotal: 2, notArmed: rows }),
+    }));
+    expect(view.armed).toBe(false);
+    expect(view.membersArmed).toBe(1);
+    expect(view.membersTotal).toBe(2);
+    expect(view.rows).toEqual(rows);
+    expect(view.unavailable).toBe(false);
+  });
+
+  it("后端没下发 lifecycle ⇒ unavailable，呈现层整段回退（绝不因此挂一条假红条）", () => {
+    const view = resolveAiTradeArmed(localGroup({ lifecycle: null }));
+    expect(view.unavailable).toBe(true);
+    expect(view.armed).toBe(true);
+  });
+});
+
+describe("describeAiTradeLifecycleBadge（用例 29：徽标必须带分数）", () => {
+  const full = { armed: true, membersArmed: 2, membersTotal: 2, rows: [], unavailable: false };
+  const partial = {
+    armed: false, membersArmed: 1, membersTotal: 2, unavailable: false,
+    rows: [{ instId: "ETH-USDT-SWAP", state: "running" as const,
+             reason: "feed_stale" as const, reasonText: "x" }],
+  };
+
+  it("全部武装 ⇒「运行中」", () => {
+    expect(describeAiTradeLifecycleBadge("running", full)).toEqual({ label: "运行中", tone: "long" });
+  });
+
+  it("2 个标的死 1 个 ⇒ 带分数，绝不让用户以为两个都停了", () => {
+    const badge = describeAiTradeLifecycleBadge("running", partial);
+    expect(badge.label).toContain("1/2");
+    expect(badge.tone).toBe("accent");
+  });
+
+  it("单标的未武装 ⇒ 不显示分数（1/1 是纯噪音）", () => {
+    const badge = describeAiTradeLifecycleBadge("running", {
+      ...partial, membersArmed: 0, membersTotal: 1 });
+    expect(badge.label).toBe("运行中 · 未武装");
+  });
+
+  it("四态各有自己的一句话；unknown 优先于一切（读不到就先说读不到）", () => {
+    expect(describeAiTradeLifecycleBadge("paused", full).label).toBe("已暂停");
+    expect(describeAiTradeLifecycleBadge("stopped", full).label).toBe("已停止");
+    expect(describeAiTradeLifecycleBadge("idle", full).label).toBe("未开启");
+    expect(describeAiTradeLifecycleBadge("running", full, true).label).toBe("与后端同步中…");
+  });
+});
+
+describe("formatNextWake（用例 19 / 29：服务端锚点 + 回落 + 绝不空转读秒）", () => {
+  it("有墙钟唤醒 ⇒「下一次决策 mm:ss」", () => {
+    expect(formatNextWake(groupWire({ nextWakeInS: 192, asOfTs: 1000 }), "running", 1000))
+      .toBe("下一次决策 03:12");
+  });
+
+  it("用例 19：以 serverTs（asOfTs）为锚点，本机时钟偏移不影响读数", () => {
+    const wire = groupWire({ nextWakeInS: 192, asOfTs: 1000 });
+    // 本机 `nowTs` 比服务端锚点晚 10 秒 ⇒ 读数只减 10 秒。
+    expect(formatNextWake(wire, "running", 1010)).toBe("下一次决策 03:02");
+  });
+
+  it("[评审 R1-6] 未装墙钟唤醒（最常见配置）⇒ 回落到「下一根 K 线」", () => {
+    expect(formatNextWake(groupWire({ nextWakeInS: null, nextBarInS: 480, asOfTs: 0 }),
+                          "running", 0)).toBe("下一根 K 线 08:00");
+  });
+
+  it("两者都没有 ⇒ null（不渲染，绝不显示 --:-- 占位）", () => {
+    expect(formatNextWake(groupWire({ nextWakeInS: null, nextBarInS: null }), "running", 0))
+      .toBeNull();
+  });
+
+  it("paused / 未武装 ⇒ 一律不渲染（对着一个不会到来的时刻读秒是新的谎话）", () => {
+    expect(formatNextWake(groupWire(), "paused", 0)).toBeNull();
+    expect(formatNextWake(groupWire({ armed: false }), "running", 0)).toBeNull();
+  });
+
+  it("后端没下发 lifecycle ⇒ null", () => {
+    expect(formatNextWake(null, "running", 0)).toBeNull();
+  });
+});
+
+describe("describeStartError（F-10 / [评审 R1-1]：两个新 409 的明细必须有读点）", () => {
+  const err = (code: string, members?: { instId: string; code: string; message: string }[]) =>
+    new ApiRequestError(code, "整组失败", 409, members);
+
+  it("三个携带明细的码都在白名单里，逐标的渲染后端下发的 message", () => {
+    for (const code of ["AI_TRADE_GROUP_PREFLIGHT", "AI_TRADE_RESUME_PARTIALLY_DEAD",
+                        "AI_TRADE_RESUME_NOT_ARMED"]) {
+      expect(describeStartError(err(code, [
+        { instId: "BTC-USDT-SWAP", code: "paused", message: "会话仍在暂停态" },
+        { instId: "ETH-USDT-SWAP", code: "stopped", message: "会话已结束（触发会话止损）" },
+      ]))).toBe("BTC-USDT-SWAP：会话仍在暂停态；ETH-USDT-SWAP：会话已结束（触发会话止损）");
+    }
+  });
+
+  it("不在白名单 / 无明细 ⇒ 回落后端 message（宁可少说，绝不吞掉）", () => {
+    expect(describeStartError(err("AI_TRADE_RESUME_NOT_ARMED"))).toBe("整组失败");
+    expect(describeStartError(err("SOMETHING_ELSE", [
+      { instId: "A", code: "x", message: "y" }]))).toBe("整组失败");
+  });
+});
+
+describe("reconcileAiTradeLifecycle（用例 13：七行判定表**逐格**）", () => {
+  const makeSetters = (local: AiTradeGroupState | null) => {
+    const calls: Record<string, unknown[]> = {
+      setAiTradeGroup: [], setAiTradeResumable: [], patchAiTradeGroupLifecycle: [],
+      clearAiTradeRuntime: [], setAiTradeSyncState: [], setAiTradeEnabled: [],
+      setAiTradeLifecycleNotice: [],
+    };
+    const setters = {
+      getGroup: () => local,
+      groupStateFromStatus,
+      setAiTradeGroup: (g: unknown) => calls.setAiTradeGroup.push(g),
+      setAiTradeResumable: (r: unknown) => calls.setAiTradeResumable.push(r),
+      patchAiTradeGroupLifecycle: (p: unknown) => calls.patchAiTradeGroupLifecycle.push(p),
+      clearAiTradeRuntime: () => calls.clearAiTradeRuntime.push(true),
+      setAiTradeSyncState: (s: unknown) => calls.setAiTradeSyncState.push(s),
+      setAiTradeEnabled: (v: unknown) => calls.setAiTradeEnabled.push(v),
+      setAiTradeLifecycleNotice: (n: unknown) => calls.setAiTradeLifecycleNotice.push(n),
+    } as unknown as Parameters<typeof reconcileAiTradeLifecycle>[1];
+    return { setters, calls };
+  };
+
+  const res = (over: Record<string, unknown> = {}) =>
+    ({ group: null, aiTradeEnabled: true, resumable: null, ...over }) as never;
+
+  it("① 同 groupId ⇒ 窄 patch（绝不 setAiTradeGroup，那会把成交流清空）", () => {
+    const { setters, calls } = makeSetters(localGroup());
+    reconcileAiTradeLifecycle(res({ group: statusRow() }), setters);
+    expect(calls.setAiTradeGroup).toHaveLength(0);
+    expect(calls.patchAiTradeGroupLifecycle).toHaveLength(1);
+    const patch = calls.patchAiTradeGroupLifecycle[0] as { group: Record<string, unknown>;
+      members: { instId: string }[] };
+    expect(patch.group.state).toBe("running");
+    expect(patch.group.lifecycle).toBeTruthy();
+    expect(patch.members.map((m) => m.instId)).toEqual(["BTC-USDT-SWAP"]);
+  });
+
+  it("② 异 groupId ⇒ 换组（重建成交流是对的）", () => {
+    const { setters, calls } = makeSetters(localGroup());
+    reconcileAiTradeLifecycle(res({ group: statusRow({ groupId: "g2" }) }), setters);
+    expect(calls.patchAiTradeGroupLifecycle).toHaveLength(0);
+    expect((calls.setAiTradeGroup[0] as AiTradeGroupState).groupId).toBe("g2");
+  });
+
+  it("③ [评审 R0-7] 本地无组 ⇒ 重发现（这一行在旧门禁下永远不可达）", () => {
+    const { setters, calls } = makeSetters(null);
+    reconcileAiTradeLifecycle(res({ group: statusRow() }), setters);
+    expect((calls.setAiTradeGroup[0] as AiTradeGroupState).groupId).toBe("g1");
+  });
+
+  it("④ 只有 resumable ⇒ 冷暂停接管（同样是旧门禁下不可达的一行）", () => {
+    const { setters, calls } = makeSetters(null);
+    reconcileAiTradeLifecycle(res({ resumable: { groupId: "gc" } }), setters);
+    expect(calls.setAiTradeGroup[0]).toBeNull();
+    expect((calls.setAiTradeResumable[0] as { groupId: string }).groupId).toBe("gc");
+  });
+
+  it("⑤ lifecycleUnknown ⇒ **什么都不清**，只置 unknown（L-7：读不到 ≠ 没有）", () => {
+    const { setters, calls } = makeSetters(localGroup());
+    reconcileAiTradeLifecycle(res({ lifecycleUnknown: true }), setters);
+    expect(calls.clearAiTradeRuntime).toHaveLength(0);
+    expect(calls.setAiTradeGroup).toHaveLength(0);
+    expect(calls.patchAiTradeGroupLifecycle).toHaveLength(0);
+    expect(calls.setAiTradeSyncState).toEqual(["unknown"]);
+  });
+
+  it("⑥ 都空且本地成员全 stopped ⇒ 终态留痕（保留面板，不清）", () => {
+    const stopped = localGroup();
+    (stopped.members["BTC-USDT-SWAP"].session as { state: string }).state = "stopped";
+    const { setters, calls } = makeSetters(stopped);
+    reconcileAiTradeLifecycle(res(), setters);
+    expect(calls.clearAiTradeRuntime).toHaveLength(0);
+    expect((calls.patchAiTradeGroupLifecycle[0] as { group: { state: string } }).group.state)
+      .toBe("stopped");
+  });
+
+  it("⑦ 都空且成员未全 stopped ⇒ 清运行期态 + 一条**持久**提示", () => {
+    const { setters, calls } = makeSetters(localGroup());
+    reconcileAiTradeLifecycle(res(), setters);
+    expect(calls.clearAiTradeRuntime).toHaveLength(1);
+    expect(String(calls.setAiTradeLifecycleNotice[0])).toContain("请到实盘面板核对持仓");
+  });
+
+  it("aiTradeEnabled 由对账器一并落 store（单 owner 收敛；无分组时也必须落）", () => {
+    const { setters, calls } = makeSetters(null);
+    reconcileAiTradeLifecycle(res({ aiTradeEnabled: true }), setters);
+    expect(calls.setAiTradeEnabled).toEqual([true]);
+  });
+});
+
+describe("groupStateFromStatus 的逐键手抄映射（风险 R-8 的第四条同款守卫）", () => {
+  it("lifecycle / declaredState 必须被抄下来，否则重发现路径上生命周期证据恒缺席", () => {
+    const state = groupStateFromStatus(statusRow({ declaredState: "paused" }));
+    expect(state.lifecycle).toBeTruthy();
+    expect(state.declaredState).toBe("paused");
+  });
+
+  it("state 优先吃 lifecycle.state（派生真值），其次 group.state", () => {
+    expect(groupStateFromStatus(statusRow({
+      state: "running", lifecycle: groupWire({ state: "stopped" }) })).state).toBe("stopped");
+    expect(groupStateFromStatus(statusRow({ state: "paused", lifecycle: null })).state)
+      .toBe("paused");
+  });
+
+  it("§5.2 的每个键都能穿过成员映射到达卡片（风险 R-13 的白名单守卫）", () => {
+    const wire = memberLifecycle();
+    const state = groupStateFromStatus(statusRow({
+      members: [memberRow({ lifecycle: wire })] }));
+    expect(state.members["BTC-USDT-SWAP"].session?.lifecycle).toEqual(wire);
   });
 });

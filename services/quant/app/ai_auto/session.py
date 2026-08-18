@@ -44,6 +44,7 @@ from .exit_attribution import classify_live
 from .hold_horizon import HorizonFacts, HorizonRule, gate_status as horizon_gate_status
 from .horizon_acceptance import ai_stats_keys, build_bundle
 from .horizon_runtime import HorizonRuntime, build_horizon_facts
+from . import lifecycle as lifecycle_core
 from .market_context import build_market_context
 from .market_digest import build_market_digest
 from .market_window import MarketWindow, WindowOptions
@@ -663,8 +664,11 @@ class AiTradeSession:
             "restingCancelled": resting_cancelled, "backstop": backstop,
             "flattened": flattened}
         await self._push({"type": "status", "data": self._status_payload()})
+        # `lifecycle` 载荷（ai-trade-lifecycle-truth D-10）：唯一一条**实时**的暂停 / 继续信号，
+        # 上一轮后端推了、前端没有 case，本轮两侧一起补齐。
         await self._push({"type": "lifecycle", "data": {
-            "action": "paused", "reason": reason, "ts": self.paused_ts}})
+            "action": "paused", "reason": reason, "ts": self.paused_ts,
+            **self._lifecycle_key()}})
         return self._pause_result
 
     async def _pause_unwind(self, flatten: bool, ts: int) -> tuple[dict | None, dict | None]:
@@ -747,18 +751,35 @@ class AiTradeSession:
     async def resume(self) -> dict:
         """从 `paused` 回到 `running`（会话对象仍在内存里的**热续跑**路径）。
 
-        ① 重置三个时钟，避免「续跑瞬间连打 N 轮」：`_last_decision_started_wall`（定时唤醒下一次
-           在 ~wake_interval_s 后，与 `start()` 同一条理由）、`_last_candle_wall` / `_last_px_wall`
-           （否则暂停期累积的时长会被 `_check_staleness` 立刻判成陈旧并触发降级）；
-        ② `_deciding = False`（防御性：pause 的 cancel 已由 `finally` 复位，此处兜底）；
-        ③ `state = "running"`；④ 推 status + `lifecycle` 事件供轨迹面板留痕。
-        **不重新暖机、不重建 WS**：热续跑期间 `self._ws` 一直连着（pause 从不停 WS）。
+        ① **诚实的陈旧时钟**（ai-trade-lifecycle-truth B-4，修 D-7）：只扣掉「暂停这一段」，
+           且**绝不越过 now**。续跑前行情就已经断了 30 分钟的话，续跑后立刻判陈旧并如实告知，
+           而不是把看门狗重新上弦、再骗用户一个完整的 `bar × 3` 窗口；
+        ② **行情通道体检 + 重新武装**（`_rearm_feed`）：断联 / 休眠 / 换网络之后 `self._ws`
+           可能已经死了，而上一轮那句注释（「pause 从不停 WS，所以 WS 一直连着」）只在
+           网络一直好着时成立；
+        ③ `_deciding = False`（防御性：pause 的 cancel 已由 `finally` 复位，此处兜底）；
+        ④ `state = "running"`；⑤ 推 status + `lifecycle` 事件（**带上 `lifecycle` 载荷**，
+           使前端能即时拿到「它到底武装到什么程度」而不是只知道「有人点了继续」）。
+        **不重新暖机**：窗口在暂停期照常入根（`feed_candle` 的顶部判据是 `is_active`）。
+
+        回执语义从「我把它置成 running 了」变成「我把它置成 running，**这是它此刻的证据**」：
+        `lifecycle` 键是 manager 复检（B-2 ③）与前端武装清单（F-8）的同一份真值。
         """
         if self.state != "paused":
-            return {"ok": False, "state": self.state}
+            # 早退回执必须说**为什么**：D-1 的整条根因就是这份回执被丢弃且它连 reason 都没有。
+            reason, text = lifecycle_core.classify_member(self.lifecycle_readings())
+            return {"ok": False, "state": self.state, "reason": reason, "reasonText": text}
         now = time.time()
+        paused_span = max(0.0, now - float(self.paused_ts or now))
+        # 夹取不可省（[评审 R0-3]）：暂停期 WS 不停、`feed_candle` 的顶部判据是 `is_active`，
+        # 这两个时钟在暂停期**照常被刷新到当前**（见 feed_candle 的两处赋值）。无夹取地
+        # `+= paused_span` 会把它们推到**未来**，于是接下来整整 paused_span 里行情真的死了也
+        # 判不出陈旧 —— 在一条风控读数上开 fail-open，与 D-7 的立论正好反向。
+        self._last_candle_wall = min(now, self._last_candle_wall + paused_span)
+        self._last_px_wall = min(now, self._last_px_wall + paused_span)
+        # 首轮定时唤醒仍在 ~wake_interval_s 后（既有语义不变，与 `start()` 同一条理由）。
         self._last_decision_started_wall = now
-        self._last_candle_wall = self._last_px_wall = now
+        await self._rearm_feed()
         self._deciding = False
         self.state = "running"
         self.pause_reason = None
@@ -766,10 +787,104 @@ class AiTradeSession:
         self._pause_result = None
         if self._monitor_task is None or self._monitor_task.done():
             self._monitor_task = asyncio.create_task(self._monitor_loop())
+        wire = self.lifecycle_wire()
         await self._push({"type": "status", "data": self._status_payload()})
         await self._push({"type": "lifecycle", "data": {
-            "action": "resumed", "reason": None, "ts": self.resumed_ts}})
-        return {"ok": True, "state": self.state}
+            "action": "resumed", "reason": None, "ts": self.resumed_ts,
+            **self._lifecycle_key()}})
+        # `lifecycle` **嵌套**而不是 `**wire` 展开（[评审 R2-4]）：展开会让 `state` 出现两次，
+        # 两个真源写在同一个字面量里是下一次漂移的种子。
+        # 回执里的 `lifecycle` **不受总闸门控**：它是 manager 复检（B-2 ③）的入参，
+        # 不是给界面看的 wire——总闸只回滚「对外说什么」，不回滚「服务端内部怎么核实」。
+        return {"ok": True, "state": self.state, "lifecycle": wire}
+
+    async def _rearm_feed(self) -> None:
+        """WS 死了就**换一个新的**（幂等：`is_alive` 为真则零动作）。
+
+        [评审 R0-4] **绝不能对同一个客户端 `stop()` 之后再 `start()`**：`OKXMarketWSClient._stop`
+        是 latched `asyncio.Event` —— `stop()` 置位后从不清、`start()` 也不清，而 supervisor 的
+        主循环是 `while not stop.is_set()` ⇒ 重启出来的 task 立刻退出并在 `finally` 里
+        `close_channel`。照那样写的结果是「续跑之后行情永久不来」且 `is_alive` 恒假：
+        比 D-7 更静默的一种死亡。
+
+        竞态（风险 R-4）：`is_alive` 为假才动手；换代前必须 `await old.stop()`（它会 cancel 并
+        await 全部 endpoint task），故旧 supervisor 绝不会与新的同时在线；`_window.is_duplicate`
+        是既有的去重护栏。
+        """
+        if self._ws is not None and self._ws.is_alive:
+            return                                  # 正常热续跑路径：零动作
+        link = getattr(self, "_link", None)
+        if link is None:
+            # 本会话从未 `start()` 过（进程内根本没有过这条流）。重建会造出一条**没人处理其链路
+            # 事件**的野连接（补根与告警都挂在 `_link` 上），故如实记一条并交给 B-2 ③ 的复检去
+            # 说「没武装成功」—— 那比一条静默的半残连接诚实得多。
+            logger.warning("ai-trade feed re-arm skipped, session never started: %s",
+                           self.session_id)
+            return
+        old, self._ws = self._ws, None
+        if old is not None:
+            try:
+                await old.stop()
+            except Exception as exc:  # noqa: BLE001 —— 收尸失败不该挡住续跑
+                logger.warning("ai-trade ws teardown failed (%s): %s", self.inst_id, exc)
+        # 与 `start()` 的装配**逐字同源**（见 start()），不另起一套。
+        self._ws = OKXWSClient(self.inst_id, self.bar, self.feed_candle,
+                               on_stream=link.on_stream, owner=f"ai:{self.session_id}")
+        self._ws.start()
+        logger.info("ai-trade feed re-armed on resume: session=%s inst=%s",
+                    self.session_id, self.inst_id)
+
+    # ---------- 生命周期真值（ai-trade-lifecycle-truth B-5 / L-2）----------
+    def lifecycle_readings(self) -> lifecycle_core.MemberReadings:
+        """本会话的生命周期读数（**唯一**构造点；纯内存，零 IO、零 REST）。
+
+        `link_state` 走 `SessionLink.channel_state(owner)`（链路的实体一律住在
+        `okx/session_link.py`，本文件只留绑定 —— 那是 okx-link-resilience [评审 P1-8] 冻结的
+        一条纪律）：**零新增探测**，它只是一次纯内存读。
+
+        `warmed_bars` 取**窗口当前根数**而不是 `self._warmed_bars`：后者是暖机那一刻的快照，
+        而这里要回答的是「此刻有没有可供思考的窗口」。
+        """
+        now = time.time()
+        settings = self.executor.settings
+        bar_seconds = BAR_SECONDS.get(self.bar, 60)
+        anchor = int(getattr(self.executor, "bar_anchor_ts", 0) or 0)
+        return lifecycle_core.MemberReadings(
+            inst_id=self.inst_id,
+            state=self.state,
+            stop_reason=self.stop_reason,
+            pause_reason=self.pause_reason,
+            warmed_bars=len(self._window.candles),
+            feed_age_s=(max(0.0, now - self._last_candle_wall)
+                        if self._last_candle_wall > 0 else 0.0),
+            stale_after_s=bar_seconds * float(settings.live_auto_staleness_factor),
+            link_state=self._link_state(),
+            next_wake_in_s=(max(0.0, self.wake_interval_s
+                                - (now - self._last_decision_started_wall))
+                            if self.wake_interval_s > 0 else None),
+            next_bar_in_s=(max(0.0, anchor + bar_seconds - now) if anchor > 0 else None),
+            rounds_completed=self.rounds_completed)
+
+    def _link_state(self) -> str:
+        """本会话 K 线通道的链路态；`start()` 之前（还没绑定）⇒ `unknown`（「还没探到」）。"""
+        link = getattr(self, "_link", None)
+        return "unknown" if link is None else link.channel_state(f"ai:{self.session_id}")
+
+    def lifecycle_wire(self) -> dict:
+        """成员级 `lifecycle`（§5.2）：`_status_payload` / `info()` / manager 成员行共用同一次装配。"""
+        return lifecycle_core.member_lifecycle_wire(
+            self.lifecycle_readings(), paused_ts=self.paused_ts,
+            resumed_ts=int(getattr(self, "resumed_ts", 0) or 0))
+
+    @property
+    def lifecycle_truth_enabled(self) -> bool:
+        """整轴总闸（§七）。关 ⇒ 全部加法键整键缺席，wire 逐字节回退到本轮之前。"""
+        return bool(getattr(self.executor.settings,
+                            "ai_trade_lifecycle_truth_enabled", True))
+
+    def _lifecycle_key(self) -> dict:
+        """`{"lifecycle": …}` 或**空字典**（总闸关时整键缺席，而不是下发一个 null）。"""
+        return {"lifecycle": self.lifecycle_wire()} if self.lifecycle_truth_enabled else {}
 
     def _ref_px(self) -> float:
         c = self._window.candles
@@ -1962,6 +2077,9 @@ class AiTradeSession:
         return {"state": self.state,
                 # 暂停 / 继续（§5.7）：`state` 现可为 `"paused"`；`pauseReason` 供前端选文案。
                 "pauseReason": self.pause_reason, "pausedTs": self.paused_ts,
+                # 生命周期真值（lifecycle-truth B-5 / L-2）：凡是说 `running`，同一份 wire 必须
+                # 同时带上让人能**反驳**它的证据。加法键，总闸关 ⇒ 整键缺席（逐字回退）。
+                **self._lifecycle_key(),
                 "warmedBars": self._warmed_bars,
                 "sessionPnlUsd": self.executor.session_pnl_usd,
                 "positionSide": self.executor.projected,

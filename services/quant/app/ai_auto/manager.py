@@ -49,6 +49,7 @@ from .hold_horizon import HorizonRule
 from .hold_horizon import rule_wire as horizon_wire
 from .horizon_acceptance import input_from_wire, merge_bundle
 from .hold_horizon_text import format_charter as format_horizon_charter
+from . import lifecycle as lifecycle_core
 from .market_window import MarketWindow, WindowOptions
 from . import pause as pause_core
 from .profit_guard import ProfitGuardRule
@@ -95,6 +96,45 @@ class AiTradeGroupPreflightError(AiTradePreflightError):
                  message: str = "部分标的无法启动 AI 自动交易", status: int = 409):
         self.members = members
         super().__init__("AI_TRADE_GROUP_PREFLIGHT", message, status)
+
+
+class AiTradeGroupEnded(AiTradePreflightError):
+    """续跑时发现整组会话都已终止（lifecycle-truth §3.6 第一格）。
+
+    L-5 的极性：**拒绝比谎言好**。今天这条路会安静地把分组置 `running` 并回 200，用户得到的是
+    「恢复成功但 Agent 不交易」——正是本轮要消灭的那句话。
+    """
+
+    def __init__(self, message: str, members: list[dict] | None = None):
+        self.members = members or []
+        super().__init__("AI_TRADE_GROUP_ENDED", message, 409)
+
+
+class AiTradeResumePartiallyDead(AiTradePreflightError):
+    """部分成员在暂停期自终止（`.members` 逐标的说明谁还活着 / 谁已结束）。
+
+    **不做半组续跑**：预算切分、`GroupExposureBook.unit_notional` 与验收卡口径都是分组级的，
+    半组续跑会让这三样同时失真（与 `resume.py` 模块 docstring 里 `[P2-13]` 同一条理由）。
+    """
+
+    def __init__(self, members: list[dict],
+                 message: str = ("该分组有成员的会话已经结束，无法整组继续。"
+                                 "可以「结束并归档」这个分组，或结束后重新启动一个新分组"
+                                 "（如交易所上仍有持仓，请先到实盘面板核对）")):
+        self.members = members
+        super().__init__("AI_TRADE_RESUME_PARTIALLY_DEAD", message, 409)
+
+
+class AiTradeResumeNotArmed(AiTradePreflightError):
+    """续跑后的武装复检未通过，已整组回滚到 `paused`（L-5 / [评审 R0-5]）。
+
+    这一格同时是「点继续 → 几秒后被强平」那条路的**唯一**拦截点：复检判到 `feed_stale` 就
+    当场不武装、回滚回暂停态，绝不让一次「继续」变成 `_check_staleness` 的强平触发器。
+    """
+
+    def __init__(self, members: list[dict], message: str):
+        self.members = members
+        super().__init__("AI_TRADE_RESUME_NOT_ARMED", message, 409)
 
 
 def _creds(account_row: repo.OkxAccount) -> AccountCredentials:
@@ -294,6 +334,8 @@ class AiTradeManager:
         # `status()` 仍回一个非空占位（live_auto 零改动地保持互斥）；任何一次 `_require_capacity`
         # 的 DB 读成功即把它清掉，故盲区不会长期存在。
         self._hydration_failed = False
+        # 「意图态 != 派生态」的告警去重（风险 R-9）：只在迁移瞬间记一次。
+        self._last_logged_mismatch: tuple[str, str, str] | None = None
 
     # ---------- 分组启动（两段式：全量门禁 → 建会话 → 起会话 / 回滚）----------
     async def start_group(self, req: AiTradeGroupStartRequest) -> AiTradeGroup:
@@ -776,6 +818,14 @@ class AiTradeManager:
 
         与 `start_group` 共用**同一对**锁（`get_admission_lock()` + `_start_lock`），否则
         「resume 与 start 并发」会造出双分组（§八风险 10）。
+
+        热路径五步（ai-trade-lifecycle-truth B-2，修 D-1 与 L-5）：
+          ① 体检（锁内、无 IO）：全 stopped ⇒ 自愈清组 + 409；部分 stopped ⇒ 409 逐标的明细；
+          ② 逐成员 `resume()` 并**收集回执**（D-1 的整条根因就是这一个被丢弃的赋值）；
+          ③ 复检 `_verify_armed`（**热 / 冷共用同一段判定**）；不通过 ⇒ 回滚 + 409；
+          ④ 只有到这里才置 `running` 并落契约；⑤ 冷路径在 `resume_cold_group` 返回后走同一个 ③。
+
+        **不存在「置了 running 但有成员没起来」的中间态**——那正是用户报告的那句「貌似恢复了」。
         """
         async with get_admission_lock(), self._start_lock:
             group = self._group
@@ -783,9 +833,10 @@ class AiTradeManager:
                 if group.state != pause_core.STATUS_PAUSED:
                     raise AiTradePreflightError(
                         "AI_TRADE_NOT_PAUSED", "该分组不处于已暂停状态", 409)
-                for member in group.members:
-                    await member.session.resume()
-                group.state = pause_core.STATUS_RUNNING
+                await self._preflight_resume(group)                                 # ①
+                receipts = [await member.session.resume() for member in group.members]  # ②
+                await self._verify_armed(group, receipts)                           # ③
+                group.state = pause_core.STATUS_RUNNING                             # ④
                 group.pause_reason = None
                 group.paused_ts = 0
                 group.resumed_count += 1
@@ -793,11 +844,166 @@ class AiTradeManager:
                 self._forget_paused_ref(group_id)
                 return group
             from .resume import resume_cold_group     # 延迟导入：resume.py 反向依赖本模块
+            started = time.time()
             resumed = await resume_cold_group(self, group_id, acknowledged=acknowledged)
+            # B-9：慢续跑必须可诊断（前端超时档已抬到 3 分钟，但「到底慢在哪」只能由后端说）。
+            logger.info("ai-trade resume cold pipeline took %.1fs (group=%s members=%d)",
+                        time.time() - started, group_id, len(resumed.members))
+            # [评审 R1-2] 冷路径**共用同一段复检**：用户报告里「关软件 → 重开 → 继续」正是这条路。
+            # 复检的价值不在拦截率（刚 `_prime()` 完通常必然 armed），而在「说 running 之前先核实
+            # 一遍」这条纪律**没有第二种写法**。
+            await self._verify_armed(resumed, None, cold=True)                      # ⑤
             self._group = resumed
             self._paused_ref = None
             await self._persist_group_state(resumed, status=pause_core.STATUS_RUNNING)
             return resumed
+
+    async def _preflight_resume(self, group: AiTradeGroup) -> None:
+        """① 体检（锁内）。总闸关 ⇒ 整段不参与（逐字回退到本轮之前）。
+
+        「全 stopped」那一格要做的是**自愈**而不只是拒绝：`_note_session_stopped` 之前不清组，
+        故进程里可能留着一个僵尸分组，磁盘上还留着一张指向它的 `paused` 契约。只清内存不收敛
+        契约的话，用户照着 409 里那句「请重新启动一个新的分组」去点，会被容量闸拿
+        `AI_TRADE_PAUSED_GROUP_EXISTS` 挡回来 —— 一句给不出出路的错误提示，比不给提示更坏。
+        """
+        if not self._lifecycle_truth_enabled(group):
+            return
+        states = [m.session.state for m in group.members]
+        if not states or all(s == "stopped" for s in states):
+            self._clear_group_if_current(group)
+            await self._mark_state_ended(group.group_id)     # 契约一并收敛，别把出路堵死
+            self._forget_paused_ref(group.group_id)
+            raise AiTradeGroupEnded(
+                "这个分组的所有会话都已结束（" + self._ended_because(group)
+                + "）。请重新启动一个新的 AI 自动交易分组。",
+                members=self._resume_member_rows(group))
+        if any(s == "stopped" for s in states):
+            raise AiTradeResumePartiallyDead(self._resume_member_rows(group))
+        if any(s == "running" for s in states):
+            raise AiTradePreflightError(
+                "AI_TRADE_NOT_PAUSED", "该分组已有成员在运行中，无需继续", 409)
+
+    @staticmethod
+    def _ended_because(group: AiTradeGroup) -> str:
+        """整组已终止时的原因短语（取第一个能说清楚的 `stop_reason`）。"""
+        for member in group.members:
+            why = lifecycle_core.STOP_REASON_TEXT.get(
+                str(getattr(member.session, "stop_reason", None) or ""), "")
+            if why:
+                return f"原因：{why}"
+        return "原因未知"
+
+    @staticmethod
+    def _resume_member_rows(group: AiTradeGroup) -> list[dict]:
+        """逐标的明细（`.members`，与 `AI_TRADE_GROUP_PREFLIGHT` 同形，前端直接复用渲染）。
+
+        **`message` 一律由后端生成**：本仓库「稳定语义码直出 UI」的事故已经发生过一次，
+        前端不得按 code 自己拼中文（§5.3）。
+        """
+        rows = []
+        for member in group.members:
+            session = member.session
+            state = getattr(session, "state", "running")
+            if state == "stopped":
+                why = lifecycle_core.STOP_REASON_TEXT.get(
+                    str(getattr(session, "stop_reason", None) or ""), "")
+                message = f"会话已结束（{why}）。" if why else "会话已结束。"
+            elif state == "paused":
+                message = "会话仍在暂停态，可以继续。"
+            else:
+                message = "会话正在运行。"
+            rows.append({"instId": member.inst_id, "code": state, "message": message})
+        return rows
+
+    async def _verify_armed(self, group: AiTradeGroup, receipts: list[dict] | None,
+                            *, cold: bool = False) -> None:
+        """③ 「说 running 之前先核实一遍」的**单点**实现（热 / 冷两条路径共用）。
+
+        既是 L-5 的守卫，也是 [评审 R0-5] 的安全前置：`_check_staleness` 在
+        `elapsed > stale_after * 4` 且 `live_auto_flatten_on_stale=True`（[P2-7]）时会
+        **直接 `stop("stale_feed")` 平掉真实持仓**。B-4 让陈旧时钟变得如实之后，一个「断了
+        很久才点继续」的分组如果被置成 running 再由 monitor 去发现陈旧，用户点下的「继续」
+        会在几秒内变成一次强平。
+
+        故：复检判到 `feed_stale` / `feed_down` ⇒ 当场不武装 ⇒ 回滚回 `paused`；用户看到的是
+        一句「继续失败，已退回暂停态（原因：行情不可达）」而不是一次没人解释的强平。
+        暂停态下该强平判据与今天**逐字一致**（`_check_staleness` 本就是 `is_active` 判据），
+        本轮不豁免、也不加严 —— 只是不让「继续」这个动作成为它的触发器。
+
+        **必须在任何 monitor tick 之前跑完**：本方法是纯内存判定（唯一的 await 在回滚分支上），
+        而 monitor 循环的第一件事是 `await asyncio.sleep(poll_interval_s)`，故这条时序成立。
+
+        Args:
+            group: 刚刚 resume 过的分组。
+            receipts: 逐成员 `session.resume()` 的回执（冷路径为 None）。
+            cold: 冷路径（回滚方式不同：那些会话是本次新建的，直接 `stop()` 掉）。
+
+        Raises:
+            AiTradeResumeNotArmed: 有成员没有武装成功（已完成回滚）。
+        """
+        if not self._lifecycle_truth_enabled(group):
+            return
+        readings = [self._member_readings(m) for m in group.members]
+        # 回执按**位置**对齐，不按 `instId` 建索引：`session.resume()` 的回执形状是
+        # `{"ok", "state", "reason"?, "reasonText"?, "lifecycle"?}`，**里面没有 instId** ——
+        # 按 instId 查表会得到一张永远查不中的表，于是 ② 收集来的回执又一次被丢掉，
+        # 而 D-1 的整条根因就是「回执被丢掉」。位置对齐是安全的：② 那行推导式逐成员顺序生成。
+        receipt_rows = list(receipts or [])
+        failed = []
+        for index, (member, reading) in enumerate(zip(group.members, readings)):
+            receipt = receipt_rows[index] if index < len(receipt_rows) else None
+            declined = isinstance(receipt, dict) and receipt.get("ok") is False
+            code, text = lifecycle_core.classify_member(reading)
+            if declined or code != lifecycle_core.ARMED_OK:
+                failed.append({"instId": member.inst_id,
+                               "code": code if code != lifecycle_core.ARMED_OK
+                               else lifecycle_core.NOT_ARMED_PAUSED,
+                               "message": text or "会话没有武装成功。"})
+        if not failed:
+            return
+        # 读数说得清就用读数的措辞（单标的省前缀、多标的点名）；只有「回执自己说 ok=False 而读数
+        # 看起来正常」那一格会走回落，此时逐条摊开 `failed` —— 一句没有原因的「继续失败」正是
+        # 本轮要消灭的那种话。
+        detail = lifecycle_core.describe_not_armed(readings) or "；".join(
+            f"{row['instId']}：{row['message']}" for row in failed)
+        await self._rollback_resume(group, cold=cold)
+        raise AiTradeResumeNotArmed(failed, "继续失败，已退回暂停态。" + detail)
+
+    async def _rollback_resume(self, group: AiTradeGroup, *, cold: bool) -> None:
+        """复检未过的整组回滚。**best-effort**：失败只 warning，绝不掩盖原始异常（风险 R-5）。
+
+        热路径把已经起来的成员重新 `pause(resume_rollback, flatten=False)` —— `pause()` 是既有
+        的**减风险**动作，恒可执行。冷路径沿用 `resume_failed` 那段收尾（先摘 W5 回调再 `stop()`）：
+        摘回调是因为那条回调是给「一个已经在跑的会话自终止」用的、会把契约置 `ended`，而这里契约
+        必须**留在 `paused`** 供再试。
+
+        ⚠️ **冷路径的 `stop()` 必须显式 `flatten=False`**（spec 说「一字不改地复用」既有那段，
+        但那段用的是默认 `flatten=True`）。既有那段跑在 `session.start()` 抛错时 —— 会话根本没起来；
+        而本方法跑在**复检未过**时，此刻 `_adopt_group` 已经把交易所上那笔**真实持仓**灌进了
+        executor，`flatten=True` 会当场把它平掉。那正是 [评审 R0-5] 花了整整一节要堵死的
+        「点继续 → 几秒后被强平」，只是从另一扇门进来。详见 spec §实施过程发现的方案缺陷 I-11。
+        """
+        for member in group.members:
+            session = member.session
+            try:
+                if cold:
+                    session.on_stopped = None
+                    await session.stop("resume_failed", flatten=False)
+                elif session.state == pause_core.STATUS_RUNNING:
+                    await session.pause(pause_core.PAUSE_REASON_RESUME_ROLLBACK, flatten=False)
+            except Exception as exc:  # noqa: BLE001 —— 回滚失败不掩盖原始拒绝
+                logger.warning("ai-trade resume rollback failed (%s): %s", member.inst_id, exc)
+        if cold:
+            # 冷路径此刻 `self._group` 还没被赋值（复检刻意排在赋值**之前**），故无组可清；
+            # `_paused_ref` 也必须留着——契约仍是 `paused`，那张续跑卡应当还在。
+            return
+        group.state = pause_core.STATUS_PAUSED
+        group.pause_reason = pause_core.PAUSE_REASON_RESUME_ROLLBACK
+        group.paused_ts = int(time.time())
+        try:
+            await self._persist_group_state(group, status=pause_core.STATUS_PAUSED)
+        except Exception as exc:  # noqa: BLE001 —— 契约本就是 paused，写失败只是没刷新原因
+            logger.warning("ai-trade rollback persist failed (%s): %s", group.group_id, exc)
 
     async def end_group(self, group_id: str, *, flatten: bool | None,
                         acknowledged: bool) -> dict | None:
@@ -937,6 +1143,68 @@ class AiTradeManager:
         """[P0-3]：水合有界重试仍失败 ⇒ 显式表示「我不知道」（而不是表示成「没有」）。"""
         self._hydration_failed = True
 
+    def is_hydration_blind(self) -> bool:
+        """水合盲区是否仍在（B-8，修 D-12）。
+
+        今天这个事实只影响 `_paused_wire_for_mutex` 的互斥占位，**对用户完全不可见**：
+        `group_status()` 与 `resumable()` 在盲区下都回 `None`，于是「后端不知道有没有暂停分组」
+        在界面上表现为「没有暂停分组」—— 与真实资金上「读不到 ≠ 没有」的既定极性矛盾。
+        """
+        return self._hydration_failed
+
+    # ---------- 生命周期真值（ai-trade-lifecycle-truth B-6 / L-1）----------
+    @staticmethod
+    def _lifecycle_truth_enabled(group: AiTradeGroup | None) -> bool:
+        """整轴总闸（§七）。分组无成员时回落进程级设置。"""
+        if group is not None and group.members:
+            settings = group.members[0].session.executor.settings
+        else:
+            from ..config import get_settings
+            settings = get_settings()
+        return bool(getattr(settings, "ai_trade_lifecycle_truth_enabled", True))
+
+    @staticmethod
+    def _member_readings(member: AiTradeGroupMember) -> lifecycle_core.MemberReadings:
+        """成员读数的**唯一**构造点。
+
+        真实会话走 `AiTradeSession.lifecycle_readings()`（那里才有窗口、时钟与链路键）；
+        测试替身 / 老会话对象没有这个方法 ⇒ 用 `getattr` 兜一份最小读数，把三处 `_FakeSession`
+        的改动面压到最小（成文教训：`test_ai_trade_group.py` / `test_ai_trade_api.py` /
+        `test_auto_trade_admission.py` 各有一个替身，一个只读视图不该把它们整片打红）。
+
+        兜底值刻意选**不会造假红条**的那一组：`warmed_bars=1` / `stale_after_s=0` /
+        `link_state="unknown"` ⇒ 一个 `running` 的替身会话恒判 armed。
+        """
+        session = member.session
+        readings_fn = getattr(session, "lifecycle_readings", None)
+        if callable(readings_fn):
+            return readings_fn()
+        return lifecycle_core.MemberReadings(
+            inst_id=getattr(session, "inst_id", member.inst_id),
+            state=getattr(session, "state", lifecycle_core.STATE_RUNNING),
+            stop_reason=getattr(session, "stop_reason", None),
+            pause_reason=getattr(session, "pause_reason", None),
+            warmed_bars=1, feed_age_s=0.0, stale_after_s=0.0, link_state="unknown",
+            next_wake_in_s=None, next_bar_in_s=None,
+            rounds_completed=int(getattr(session, "rounds_completed", 0) or 0))
+
+    def _note_state_mismatch(self, group: AiTradeGroup, derived: str) -> None:
+        """`declaredState != state` 即 bug 的信号（风险 R-9）。
+
+        **只在迁移瞬间记一次**（`_last_logged_mismatch` 去重），且是 `warning` 不是 `error`：
+        一条会刷屏的告警很快就会被所有人忽略，那等于没有告警。
+        """
+        declared = getattr(group, "state", pause_core.STATUS_RUNNING)
+        if declared == derived:
+            self._last_logged_mismatch = None
+            return
+        signature = (group.group_id, declared, derived)
+        if signature == self._last_logged_mismatch:
+            return
+        self._last_logged_mismatch = signature
+        logger.warning("ai-trade lifecycle mismatch: group=%s declared=%s derived=%s",
+                       group.group_id, declared, derived)
+
     # ---------- 可续跑契约的整行写点（W1 / W4 / W5）----------
     async def _persist_group_state(self, group: AiTradeGroup, *, status: str,
                                    member_rows: list[dict] | None = None) -> None:
@@ -963,7 +1231,11 @@ class AiTradeManager:
             row["allocationPct"] = member.allocation_pct
             row["budgetUsd"] = member.budget_usd
             receipt = by_inst.get(member.inst_id)
-            if receipt is not None:
+            # B-7（修 D-11）：判据必须是「回执里**真的有**持仓这个事实」，而不是「有回执」。
+            # 成员非 `running` 时 `pause()` 早退回的那份回执**没有 `position` 键**，照
+            # `receipt is not None` 覆盖会把契约里「这个标的还有仓」这个事实抹成 None ——
+            # 续跑复核与「结束」的孤儿仓提示同时失真。
+            if receipt is not None and "position" in receipt:
                 row["position"] = receipt.get("position")
                 row["positionUnknown"] = bool(receipt.get("positionUnknown"))
                 row["backstopAtPause"] = receipt.get("backstop")
@@ -990,6 +1262,26 @@ class AiTradeManager:
             return
         await self._mark_state_ended(group.group_id)
         self._forget_paused_ref(group.group_id)
+        # B-1（修 D-2）：**清组**。三处清组点 `stop_group` / `stop_member` / `_note_session_stopped`
+        # 判据统一为 `not any(m.session.is_active …)`；此前只有前两处清，于是一个在暂停期自终止的
+        # 分组会永久留在 `self._group` 里 —— `/ai-trade/status` 回一个 `state:"running"` 而成员全
+        # `stopped` 的僵尸分组，`live_auto` 的互斥闸被它永久占住，用户再点「暂停」还会给这个僵尸
+        # 写出一张新的 `paused` 契约（说谎循环）。
+        self._clear_group_if_current(group)
+
+    def _clear_group_if_current(self, group: AiTradeGroup) -> None:
+        """带**身份守卫**的清组（[评审 R0-1]，B-1 与冷路径回滚共用）。
+
+        `_note_session_stopped` 是经 `partial(self._note_session_stopped, group)` 绑定的
+        **旧分组**回调。上一个分组的最后一个会话延迟自终止时，`self._group` 可能已经是**新分组**：
+        无条件 `self._group = None` 会把新分组连同它占着的 live_auto 互斥位一起抹掉，界面整块
+        消失而 Agent 其实还在跑 —— 这正是本轮要消灭的那句谎话的镜像版（说「没在跑」而它在跑）。
+
+        判据用 `group_id` 而不是 `is`：冷续跑会重建分组对象，同一个 `group_id` 的新对象在语义上
+        就是它自己。
+        """
+        if self._group is not None and self._group.group_id == group.group_id:
+            self._group = None
 
     @staticmethod
     async def _mark_state_ended(group_id: str) -> None:
@@ -1055,7 +1347,13 @@ class AiTradeManager:
         return None
 
     def group_status(self) -> dict | None:
-        """活跃分组只读视图（前端重载后据此重连各成员 WS）；无活跃分组→ None。"""
+        """活跃分组只读视图（前端重载后据此重连各成员 WS）；无活跃分组→ None。
+
+        **`state` 的语义在本轮变了（L-1）**：它不再是「上一次动作赋的值」，而是
+        `derive_group_state(各成员会话态)` 的**派生真值**；旧语义经加法键 `declaredState`
+        保留，只用于诊断与「两者不等即 bug」的告警。R-1 已全仓核实读点：已知消费者只有前端与
+        `live_auto._require_capacity`（后者只判 `is not None`，不读 `state`）。
+        """
         group = self._group
         if group is None:
             return None
@@ -1084,7 +1382,7 @@ class AiTradeManager:
                 # 的成文缺陷形状——不下发这个键，暂停态在「刷新页面后重发现」这条路径上恒显示运行中。
                 # `getattr` 兜底与上面 `tradability` 那一行同款：既有测试替身用 `SimpleNamespace`
                 # 直接构造分组，新增字段对它们必须是**加法**，不能让一个只读视图把它们打红。
-                "state": getattr(group, "state", pause_core.STATUS_RUNNING),
+                **self._lifecycle_group_keys(group),
                 "pauseReason": getattr(group, "pause_reason", None),
                 "pausedTs": getattr(group, "paused_ts", 0),
                 "resumedCount": getattr(group, "resumed_count", 0),
@@ -1142,10 +1440,40 @@ class AiTradeManager:
                 for m, b in zip(group.members, bundles)]
         return out
 
-    @staticmethod
-    def _member_row(member: AiTradeGroupMember) -> dict:
-        """成员行 = 会话 `info()` 全字段 + 分配占比（复用不变的 AiTradeSession.info()）。"""
-        return {**member.session.info(), "allocationPct": member.allocation_pct}
+    def _lifecycle_group_keys(self, group: AiTradeGroup) -> dict:
+        """分组级 `state` / `declaredState` / `lifecycle` 三键（B-6）。
+
+        总闸关 ⇒ **逐字回退**：只回 `state = getattr(group, "state", …)`（本轮之前的那一行），
+        `declaredState` / `lifecycle` 整键缺席（用例 12 的护栏就是这一条）。
+        """
+        declared = getattr(group, "state", pause_core.STATUS_RUNNING)
+        if not self._lifecycle_truth_enabled(group):
+            return {"state": declared}
+        readings = [self._member_readings(m) for m in group.members]
+        derived = lifecycle_core.derive_group_state([r.state for r in readings])
+        self._note_state_mismatch(group, derived)
+        return {
+            "state": derived,                   # ← 派生真值（前端唯一消费的那个）
+            "declaredState": declared,          # ← 意图（诊断 / 告警用；两者不等即 bug 的信号）
+            "lifecycle": lifecycle_core.group_lifecycle_wire(
+                readings, declared=declared,
+                paused_ts=int(getattr(group, "paused_ts", 0) or 0),
+                pause_reason=getattr(group, "pause_reason", None),
+                resumed_count=int(getattr(group, "resumed_count", 0) or 0),
+                now_ts=int(time.time())),
+        }
+
+    def _member_row(self, member: AiTradeGroupMember) -> dict:
+        """成员行 = 会话 `info()` 全字段 + 分配占比 + 成员级 `lifecycle`（B-6）。
+
+        成员卡片要能**逐标的**说明「这一个到底起来了没有」——整组与门会把还在正常交易的那个
+        也说成停了（[评审 R1-7]）。老会话对象 / 测试替身没有 `lifecycle_wire` ⇒ 整键缺席。
+        """
+        row = {**member.session.info(), "allocationPct": member.allocation_pct}
+        wire_fn = getattr(member.session, "lifecycle_wire", None)
+        if callable(wire_fn) and self._lifecycle_truth_enabled(self._group):
+            row["lifecycle"] = wire_fn()
+        return row
 
     def get(self, session_id: str) -> AiTradeSession | None:
         """跨所有成员按 session_id 查会话（WS 路由用）。"""

@@ -6,6 +6,9 @@ import { accountApi } from "@/lib/accountApi";
 import { agentApi } from "@/lib/agentApi";
 import { api } from "@/lib/api";
 import { aiTradeApi } from "@/lib/aiTradeApi";
+import { resolveAiTradeLifecycle } from "@/lib/aiTrade";
+import { ApiRequestError, toApiError } from "@/lib/api";
+import { RESUME_MS } from "@/lib/httpTimeout";
 import type { AiTradeGroupRow, AiTradeGroupState } from "@/lib/aiTradeTypes";
 import { useAppStore } from "@/lib/store";
 import { tradingApi } from "@/lib/tradingApi";
@@ -89,6 +92,10 @@ beforeEach(() => {
     liveAutoGroup: null,
     aiTradeAcknowledged: false,
     aiTradeConfig: null,
+    aiTradeSyncState: "ok",
+    aiTradeReconcileUntil: null,
+    aiTradeEnabled: false,
+    aiTradeLifecycleNotice: null,
   });
   vi.mocked(accountApi.accounts.list).mockResolvedValue(READY_ACCOUNTS as never);
   vi.mocked(agentApi.config).mockResolvedValue({ configured: true, provider: "x", model: "y" } as never);
@@ -470,5 +477,208 @@ describe("AiTradeToggle 的通栏排版契约", () => {
     renderToggle();
     await screen.findByTitle("开启 AI 自动交易 / 回测");
     expect(screen.getAllByTitle("开启 AI 自动交易 / 回测")).toHaveLength(1);
+  });
+});
+
+// ============ 生命周期真值化（ai-trade-lifecycle-truth §8.2 用例 15 / 17 / 18 / 25 / 29）============
+
+const MEMBER_WIRE = {
+  state: "running" as const, armed: true, reason: "armed" as const, reasonText: "",
+  warmedBars: 300, feedAgeS: 3, staleAfterS: 10800, linkState: "up",
+  nextWakeInS: 120, nextBarInS: 480, roundsCompleted: 4,
+  pauseReason: null, pausedTs: 0, resumedTs: 0, stopReason: null,
+};
+
+function groupWire(over: Record<string, unknown> = {}) {
+  return {
+    state: "running", declaredState: "running", armed: true, membersArmed: 1, membersTotal: 1,
+    asOfTs: Math.floor(Date.now() / 1000), notArmed: [], nextWakeInS: 192, nextBarInS: 480,
+    pauseReason: null, pausedTs: 0, resumedCount: 0, ...over,
+  } as never;
+}
+
+/** 带生命周期证据的本地热态。 */
+function armedGroup(over: Record<string, unknown> = {}): AiTradeGroupState {
+  const base = makeGroup();
+  return {
+    ...base,
+    lifecycle: groupWire(),
+    members: {
+      "BTC-USDT-SWAP": {
+        ...base.members["BTC-USDT-SWAP"],
+        session: { ...base.members["BTC-USDT-SWAP"].session!, lifecycle: MEMBER_WIRE } as never,
+      },
+    },
+    ...over,
+  } as AiTradeGroupState;
+}
+
+describe("AiTradeToggle · 四态 + armed（F-6）", () => {
+  it("用例 29：2 个标的死 1 个 ⇒ 徽标带分数，绝不让用户以为两个都停了", async () => {
+    useAppStore.setState({
+      aiTradeGroup: armedGroup({
+        lifecycle: groupWire({
+          armed: false, membersArmed: 1, membersTotal: 2,
+          notArmed: [{ instId: "ETH-USDT-SWAP", state: "running", reason: "feed_stale",
+                       reasonText: "行情已 12 分钟没有新 K 线" }],
+        }),
+      }),
+    });
+    renderToggle();
+    expect(await screen.findByTestId("ai-trade-lifecycle-badge")).toHaveTextContent("1/2 未武装");
+  });
+
+  it("全部武装 ⇒「运行中」+「下一次决策」倒计时真的在走秒", async () => {
+    useAppStore.setState({ aiTradeGroup: armedGroup() });
+    renderToggle();
+    expect(await screen.findByTestId("ai-trade-lifecycle-badge")).toHaveTextContent("运行中");
+    expect(await screen.findByTestId("ai-trade-next-wake")).toHaveTextContent("下一次决策 03:1");
+  });
+
+  it("[评审 R1-6] paused ⇒ 倒计时**不渲染**（对着一个不会到来的时刻读秒是新的谎话）", async () => {
+    useAppStore.setState({
+      aiTradeGroup: armedGroup({ state: "paused", lifecycle: groupWire({ state: "paused" }) }),
+    });
+    renderToggle();
+    await screen.findByRole("button", { name: "继续 AI 自动交易" });
+    expect(screen.queryByTestId("ai-trade-next-wake")).not.toBeInTheDocument();
+  });
+
+  it("stopped（第四态）⇒ 徽标「已停止」+ 一颗「知道了」，点它才清运行期态", async () => {
+    useAppStore.setState({
+      aiTradeGroup: armedGroup({ state: "stopped", lifecycle: groupWire({ state: "stopped" }) }),
+    });
+    renderToggle();
+    expect(await screen.findByTestId("ai-trade-lifecycle-badge")).toHaveTextContent("已停止");
+    fireEvent.click(screen.getByRole("button", { name: "清理已停止的 AI 自动交易面板" }));
+    await waitFor(() => expect(useAppStore.getState().aiTradeGroup).toBeNull());
+  });
+
+  it("[评审 R1-5] stopped **不算**活跃会话：本地留痕不该把「再开一个新分组」锁死", async () => {
+    useAppStore.setState({
+      aiTradeGroup: armedGroup({ state: "stopped", lifecycle: groupWire({ state: "stopped" }) }),
+    });
+    renderToggle();
+    // 后端此刻已经清了组（B-1），容量闸不会 409 ⇒ 实盘段必须是**可用**的：点开开关就能看到
+    // 「启动 AI 自动交易」那一屏，而不是被门禁挡回回测段。
+    // 等门禁三条查询都水合（水合前 title 是「请先在设置中心配置 AI 模型」）。
+    await screen.findByTitle("这次 AI 自动交易已结束。点「知道了」清理面板，或直接开启一个新的分组");
+    fireEvent.click(screen.getByRole("switch"));
+    expect(await screen.findByText("启动 AI 自动交易")).toBeInTheDocument();
+  });
+
+  it("用例 18：`unknown` 态下三个动作按钮 `disabled` 均为真（读不到就不让点）", async () => {
+    useAppStore.setState({
+      aiTradeGroup: armedGroup({ state: "paused", lifecycle: groupWire({ state: "paused" }) }),
+      aiTradeSyncState: "unknown",
+    });
+    renderToggle();
+    expect(await screen.findByTestId("ai-trade-lifecycle-badge")).toHaveTextContent("与后端同步中…");
+    expect(screen.getByRole("button", { name: "继续 AI 自动交易" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "结束 AI 自动交易" })).toBeDisabled();
+    expect(screen.getByRole("switch")).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("用例 15（L-4 的守卫）：面板与开关在同一份 store 快照下必须给出**同一个**态", () => {
+    const group = armedGroup({ state: "running", lifecycle: groupWire({ state: "stopped" }) });
+    // 两个组件都只走 `resolveAiTradeLifecycle`；此前面板自己拼判据，于是徽标说「已停止」而
+    // 开关还是开的 —— 用户对着两个互相矛盾的控件做真实资金决策（D-5）。
+    expect(resolveAiTradeLifecycle(group, null)).toBe("stopped");
+    expect(resolveAiTradeLifecycle(group, null)).toBe(
+      resolveAiTradeLifecycle({ ...group }, null),
+    );
+  });
+});
+
+describe("AiTradeToggle · 写端点超时（用例 17 / 25 · L-7 · [评审 R0-6]）", () => {
+  it("用例 25：续跑超时 ⇒ 界面**不出现「失败」二字**，出现「结果未知」并触发快对账", async () => {
+    // **必须走真实的 `toApiError` 路径**：直接对 DOMException 断言的用例会绿着放过这个 bug
+    // （`isTimeoutError` 在 mutation 的 onError 那一层恒为假）。
+    const raw = Object.assign(new Error("aborted"), { name: "TimeoutError" });
+    const translated = toApiError(raw, RESUME_MS, "/ai-trade/grp-1/resume");
+    vi.mocked(aiTradeApi.resumePreview).mockResolvedValue({
+      groupId: "grp-1", offlineText: "1 分", pauseReasonText: "", resumedCount: 0,
+      contract: { bar: "1H", instIds: ["BTC-USDT-SWAP"], strategyNames: [] },
+      drift: [], members: [], verdict: "ready",
+    } as never);
+    vi.mocked(aiTradeApi.resumeGroup).mockRejectedValue(translated);
+    useAppStore.setState({
+      aiTradeGroup: armedGroup({ state: "paused", lifecycle: groupWire({ state: "paused" }) }),
+    });
+    renderToggle();
+
+    fireEvent.click(await screen.findByRole("button", { name: "继续 AI 自动交易" }));
+    await screen.findByTestId("ai-trade-resume-dialog");
+    fireEvent.click(await screen.findByRole("button", { name: "继续" }));
+
+    await waitFor(() =>
+      expect(useAppStore.getState().aiTradeLifecycleNotice).toContain("结果未知"),
+    );
+    expect(useAppStore.getState().aiTradeReconcileUntil).toBeTruthy();
+    expect(document.body.textContent).not.toContain("失败");
+  });
+
+  it("非超时的 409 仍照常渲染逐标的明细（F-10 的白名单）", async () => {
+    vi.mocked(aiTradeApi.resumePreview).mockResolvedValue({
+      groupId: "grp-1", offlineText: "1 分", pauseReasonText: "", resumedCount: 0,
+      contract: { bar: "1H", instIds: ["BTC-USDT-SWAP"], strategyNames: [] },
+      drift: [], members: [], verdict: "ready",
+    } as never);
+    vi.mocked(aiTradeApi.resumeGroup).mockRejectedValue(
+      new ApiRequestError("AI_TRADE_RESUME_PARTIALLY_DEAD", "整组失败", 409, [
+        { instId: "ETH-USDT-SWAP", code: "stopped", message: "会话已结束（触发会话止损）" },
+      ]),
+    );
+    useAppStore.setState({
+      aiTradeGroup: armedGroup({ state: "paused", lifecycle: groupWire({ state: "paused" }) }),
+    });
+    renderToggle();
+
+    fireEvent.click(await screen.findByRole("button", { name: "继续 AI 自动交易" }));
+    await screen.findByTestId("ai-trade-resume-dialog");
+    fireEvent.click(await screen.findByRole("button", { name: "继续" }));
+
+    expect(await screen.findByText(/ETH-USDT-SWAP：会话已结束（触发会话止损）/)).toBeInTheDocument();
+  });
+
+  it("暂停超时同款处理（L-7 说的是三个写端点，不是只有 /resume）", async () => {
+    const raw = Object.assign(new Error("aborted"), { name: "TimeoutError" });
+    vi.mocked(aiTradeApi.pauseGroup).mockRejectedValue(
+      toApiError(raw, 20_000, "/ai-trade/grp-1/pause"),
+    );
+    useAppStore.setState({ aiTradeGroup: armedGroup() });
+    renderToggle();
+
+    fireEvent.click(await screen.findByRole("button", { name: "暂停 AI 自动交易" }));
+    fireEvent.click(await screen.findByRole("button", { name: "保留持仓并暂停" }));
+
+    await waitFor(() =>
+      expect(useAppStore.getState().aiTradeLifecycleNotice).toContain("结果未知"),
+    );
+  });
+  it("明确的 409 ⇒ **退出**武装清单回到复核屏（不让一次已被拒绝的续跑对着清单空等 45 秒）", async () => {
+    vi.mocked(aiTradeApi.resumePreview).mockResolvedValue({
+      groupId: "grp-1", offlineText: "1 分", pauseReasonText: "", resumedCount: 0,
+      contract: { bar: "1H", instIds: ["BTC-USDT-SWAP"], strategyNames: [] },
+      drift: [], members: [], verdict: "ready",
+    } as never);
+    vi.mocked(aiTradeApi.resumeGroup).mockRejectedValue(
+      new ApiRequestError("AI_TRADE_RESUME_NOT_ARMED", "继续失败，已退回暂停态。", 409, [
+        { instId: "BTC-USDT-SWAP", code: "feed_down", message: "实时链路不可达" },
+      ]),
+    );
+    useAppStore.setState({
+      aiTradeGroup: armedGroup({ state: "paused", lifecycle: groupWire({ state: "paused" }) }),
+    });
+    renderToggle();
+
+    fireEvent.click(await screen.findByRole("button", { name: "继续 AI 自动交易" }));
+    await screen.findByTestId("ai-trade-resume-dialog");
+    fireEvent.click(await screen.findByRole("button", { name: "继续" }));
+
+    await screen.findByText(/BTC-USDT-SWAP：实时链路不可达/);
+    // 回到复核屏：武装清单不再挂着，主按钮立刻可再试。
+    expect(screen.queryByTestId("ai-trade-arming-checklist")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "继续" })).toBeInTheDocument();
   });
 });

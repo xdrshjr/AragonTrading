@@ -4,13 +4,18 @@ import { useCallback, useEffect, useState } from "react";
 import { Badge } from "@/components/ui";
 import {
   AI_TRADE_PAUSE_REASON_TEXT,
+  describeAiTradeLifecycleBadge,
   describeCommittedExit,
   describeProfitGuardCooldown,
   describeProfitGuardFallback,
   describeProfitGuardStatus,
   describeProfitGuardTrail,
+  describeStopReason,
+  formatNextWake,
   formatPausedFor,
   isEffectiveExitCommitted,
+  resolveAiTradeArmed,
+  resolveAiTradeLifecycle,
 } from "@/lib/aiTrade";
 import { aiTradeApi } from "@/lib/aiTradeApi";
 import {
@@ -30,6 +35,7 @@ import type {
   AiTradeDisciplineRow,
   AiTradeGroupMemberState,
   AiTradeGroupState,
+  AiTradeNotArmedRow,
   AiTradeResumableGroup,
   ProfitGuardSnapshot,
 } from "@/lib/aiTradeTypes";
@@ -56,6 +62,15 @@ export default function AiTradePanel({
 }: AiTradePanelProps) {
   const group = useAppStore((s) => s.aiTradeGroup);
   const resumable = useAppStore((s) => s.aiTradeResumable);
+  const syncing = useAppStore((s) => s.aiTradeSyncState) === "unknown";
+  // 倒计时每秒 tick（hooks 必须在早退**之前**声明：条件调用 hook 会直接违反 hooks 规则）。
+  const [nowTs, setNowTs] = useState(() => Math.floor(Date.now() / 1000));
+  const hasLifecycle = !!group?.lifecycle;
+  useEffect(() => {
+    if (!hasLifecycle) return;
+    const timer = setInterval(() => setNowTs(Math.floor(Date.now() / 1000)), 1_000);
+    return () => clearInterval(timer);
+  }, [hasLifecycle]);
 
   // 冷续跑卡（ai-trade-pause-resume §1.3 / §3.9.2）：进程重启后内存里没有会话，但磁盘上仍有一份
   // 可续跑契约。**与热态互斥**（后端 G-9 冻结），故这条早退恰好把两者切开。
@@ -66,20 +81,36 @@ export default function AiTradePanel({
   // 净额徽标的门控**只认后端下发的口径标记**，绝不据配置或猜测推断：口径是会话级静态量，
   // 前端说「已扣手续费」而后端其实是毛额，比不显示徽标危险得多。
   const netBasis = members.some((m) => m.position?.costAwareness?.netBasis === true);
-  const stopped = group.state === "stopped" || members.every((m) => m.session?.state === "stopped");
-  // 暂停（ai-trade-pause-resume §3.9.2）：分组级 `state` 优先，成员级 `state` 兜底（老后端不下发
-  // 分组键时，WS status 那条通路仍会把成员置 paused）。
-  const paused =
-    !stopped && (group.state === "paused" || members.some((m) => m.session?.state === "paused"));
+  // L-4：**生命周期只有一个推导点**。此前这里有两行自拼的判据（`group.state === "stopped" ||
+  // members.every(...)`），与 `AiTradeToggle` 走的 `resolveAiTradeLifecycle` 口径不同 —— 于是
+  // 面板徽标说「已暂停 / 已停止」，头部开关同时还是开的，用户对着两个互相矛盾的控件做真实资金
+  // 决策（D-5）。两行判据本轮**删除**，改调唯一入口。
+  const lifecycle = resolveAiTradeLifecycle(group, null);
+  const armed = resolveAiTradeArmed(group);
+  const badge = describeAiTradeLifecycleBadge(lifecycle, armed, syncing);
+  const stopped = lifecycle === "stopped";
+  const paused = lifecycle === "paused";
+  const countdown = formatNextWake(group.lifecycle, lifecycle, nowTs);
 
   return (
     <div className="flex flex-col gap-2 border-b border-[var(--border)] px-3 py-2.5">
       <div className="flex items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="text-xs font-semibold text-[var(--text)]">AI 自动交易</span>
-          <Badge tone={stopped ? "neutral" : paused ? "accent" : "long"}>
-            {stopped ? "已停止" : paused ? "已暂停" : "运行中"}
+          <Badge tone={badge.tone}>
+            <span data-testid="ai-trade-panel-badge">{badge.label}</span>
           </Badge>
+          {/* 「下一次决策 03:12」：用户看到「运行中」的同时看到 Agent 下一次思考还有多久，
+              这才叫恢复到了「Agent 执行交易的状态」（§1.3 目标 2）。 */}
+          {countdown && (
+            <span
+              data-testid="ai-trade-panel-next-wake"
+              className="rounded border border-[var(--border)] px-1 py-px text-[9px] tabular text-[var(--muted)]"
+              title="下一次 Agent 决策的预计时刻（以服务端时钟为锚点）"
+            >
+              {countdown}
+            </span>
+          )}
           {members.length > 1 && (
             <span className="text-[10px] text-[var(--muted)]">{members.length} 个标的</span>
           )}
@@ -110,6 +141,16 @@ export default function AiTradePanel({
       {/* 暂停横幅排在最前：暂停期「每轮都没有分析、也从不开单」是**预期行为**，先说清这一条，
           下面那条可交易性红条才不会被读成「AI 坏了」的第二个证据。 */}
       {paused && <PausedBanner group={group} members={members} />}
+
+      {/* 终态留痕（F-5）：分组在后端已经消失，但成员如实 `stopped` ⇒ 保留一张「已停止」卡。
+          会话自行终止（会话止损 / 行情中断强平）是用户**必须**知道的事，面板整块消失等于没说。 */}
+      {stopped && <StoppedCard members={members} />}
+
+      {/* 「运行中但没真的在跑」（L-2）：徽标已经降级，横幅**逐标的**说明为什么。
+          绝不用整组与门把还在正常交易的那个也说成停了（[评审 R1-7]）。 */}
+      {lifecycle === "running" && !armed.unavailable && !armed.armed && (
+        <NotArmedBanner rows={armed.rows} total={armed.membersTotal} />
+      )}
 
       {/* 可交易性红条 + 长期记忆停摆徽标（tradability-and-open-funnel 轴 A / 轴 D）。
           放在纪律条**之上**：当探针判定「这个周期几乎开不出单」时，那是用户最该先看到的一句话
@@ -243,6 +284,70 @@ function PausedBanner({
           。关闭软件后由交易所侧止损兜底；重新打开并联网后点「继续」即可接着跑。
         </span>
       )}
+    </div>
+  );
+}
+
+/**
+ * 「未武装」横幅（ai-trade-lifecycle-truth F-6 / L-2）。
+ *
+ * `running` 却没真的在跑时，**逐标的**说明原因。文案一律取后端下发的 `reasonText`（判定性说明
+ * 单一真源，§3.10）；前端只负责把标的名拼在前面，且**只在多标的时**拼 —— 单标的分组里那个前缀
+ * 是纯噪音。
+ *
+ * 用 `--warn` / `--warn-soft` 而不是 `Badge tone`：这里是一个普通 div，可以直接用设计系统那对
+ * 警告色；而 `components/ui/index.tsx` 是全仓共用的 kit，本轮不动它（§1.4）。
+ * 图标 + 文字双通道，绝不靠颜色单通道传达（色觉障碍友好，与 globals.css 的既有纪律同源）。
+ */
+function NotArmedBanner({ rows, total }: { rows: AiTradeNotArmedRow[]; total: number }) {
+  if (rows.length === 0) return null;
+  return (
+    <div
+      className="flex flex-col gap-1 rounded border border-[var(--warn)] bg-[var(--warn-soft)] px-2 py-1.5"
+      data-testid="ai-trade-not-armed-banner"
+      role="alert"
+    >
+      <span className="text-[10px] font-medium leading-relaxed text-[var(--warn)]">
+        ⚠ Agent 暂时不会做出新的决策
+        {total > 1 ? `（${rows.length}/${total} 个标的未武装，其余照常交易）` : ""}
+      </span>
+      {rows.map((row) => (
+        <span key={row.instId} className="text-[10px] leading-relaxed text-[var(--warn)]">
+          {total > 1 ? `${row.instId}：` : ""}
+          {row.reasonText}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * 已停止卡（ai-trade-lifecycle-truth F-5：终态留痕）。
+ *
+ * 后端此刻已经清了组（B-1），若面板跟着整块消失，「你的会话在夜里自己止损平仓并结束了」这件事
+ * 就再也没人告诉用户。理由与 `end` 的孤儿仓提示同源。清理动作在头部控制条的「知道了」上
+ * （面板呈现、控件动作，与既有分工一致）。
+ */
+function StoppedCard({ members }: { members: AiTradeGroupMemberState[] }) {
+  return (
+    <div
+      className="flex flex-col gap-1 rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1.5"
+      data-testid="ai-trade-stopped-card"
+    >
+      <span className="text-[10px] font-medium leading-relaxed text-[var(--text)]">
+        这次 AI 自动交易已经结束，Agent 不会再做任何决策。
+      </span>
+      {members.map((m) => (
+        <span key={m.instId} className="text-[10px] leading-relaxed text-[var(--muted)]">
+          {m.instId}：{describeStopReason(m.session?.stopReason)}
+          {typeof m.session?.sessionPnlUsd === "number"
+            ? ` · 本次会话 ${m.session.sessionPnlUsd >= 0 ? "+" : ""}${fmtMoney(m.session.sessionPnlUsd)}`
+            : ""}
+        </span>
+      ))}
+      <span className="text-[10px] leading-relaxed text-[var(--muted)]">
+        若交易所上仍有持仓，它从此不再由任何自动化管理，请到下方实盘面板核对。
+      </span>
     </div>
   );
 }
@@ -510,6 +615,19 @@ function MemberRow({
         {resting && (
           <span className="tabular truncate text-[10px] text-[var(--accent-ink)]">
             当前挂单 {fmtPrice(resting.px)} · {fmtNum(resting.sz, 0)} 张 · 剩余 {resting.expiresInS}s
+          </span>
+        )}
+        {/* 会话状态行（lifecycle-truth F-4）：行情断连 / 已恢复 / 补根结果 / WS 错误帧。
+            后端**早就在下发它**（`_check_staleness` 与 `SessionLink._push_message` 都推
+            `{...status, message}`），但全仓一直没有读点 —— 「wire 里有事实、用户那里没有」
+            的又一处，本轮补上。 */}
+        {session?.message && (
+          <span
+            data-testid="ai-trade-member-message"
+            className="truncate text-[10px] text-[var(--warn)]"
+            title={session.message}
+          >
+            {session.message}
           </span>
         )}
         <HorizonChip member={member} />

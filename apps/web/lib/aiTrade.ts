@@ -1,12 +1,18 @@
 // AI 自动交易纯件（无副作用、易单测）：开关守门文案矩阵、策略/轮数/预算校验、动作与停止原因中文化。
 // 预算派生/夹紧复用 live-auto 同款（0.01 默认 / 0.05 上限，与后端 ai_trade_default/max_capital_frac 对齐）。
+import type { ApiRequestError } from "./api";
 import { clampBudgetToCap, deriveDefaultBudget } from "./liveAuto";
 import type { AccountMode } from "./types";
 import type {
   AiTradeAction,
   AiTradeDecision,
+  AiTradeGroupLifecyclePatch,
+  AiTradeGroupRow,
   AiTradeGroupState,
+  AiTradeGroupStatusResponse,
   AiTradeGivebackTier,
+  AiTradeLifecycleWire,
+  AiTradeNotArmedRow,
   AiTradeProfitGuardRule,
   AiTradeRoundTrace,
   AiTradeStopReason,
@@ -1100,24 +1106,284 @@ function withCatchupMark(
 }
 
 
-// ============ 暂停 / 继续（ai-trade-pause-resume §3.9.1）============
-
-/** AI 自动交易在用户眼里的三态。 */
-export type AiTradeLifecycle = "idle" | "running" | "paused";
+// ============ 暂停 / 继续（ai-trade-pause-resume §3.9.1 + lifecycle-truth §3.4）============
 
 /**
- * 生命周期的**唯一**推导点：`group.state` 优先，其次冷占位 `resumable`。
+ * AI 自动交易在用户眼里的四态。
+ *
+ * **[评审 R1-5] 从三态加宽到四态是一次契约变更。** 唯一的门禁调用点把结果喂给
+ * `resolveAiTradeGate({ hasActiveSession: running || paused })`；加上 `stopped` 之后该表达式
+ * 会把「本地留痕的已停止分组」判成**可启动** —— 这**恰好是对的**（B-1 之后后端此刻已经清了组，
+ * 容量闸不会 409），但必须写在这里并配一条守卫用例，否则下一轮一定有人「顺手把 stopped 也算
+ * 进 hasActiveSession」，把「会话已结束却再也开不了新的」这个死结重新系上。
+ */
+export type AiTradeLifecycle = "idle" | "running" | "paused" | "stopped";
+
+/** `Badge` 组件的既有 `tone` 值域（本轮不动 `components/ui/index.tsx`，只组合既有取值）。 */
+export type AiTradeBadgeTone = "neutral" | "long" | "short" | "accent";
+
+/** 对账快窗口：动作之后的 30 秒内按 3 秒节奏收敛（其余时间 15 秒）。 */
+export const AI_TRADE_RECONCILE_FAST_MS = 3_000;
+export const AI_TRADE_RECONCILE_WINDOW_MS = 30_000;
+/** 「正在武装」清单等到这么久还没 armed ⇒ 原地变成如实的失败说明 + 两个出路。 */
+export const AI_TRADE_ARMING_TIMEOUT_MS = 45_000;
+
+/**
+ * 生命周期的**唯一**推导点（L-4）。
+ *
+ * 优先级：后端派生的 `group.lifecycle.state` → `group.state` → 冷占位 `resumable`。
+ * 第一顺位是本轮的立论所在 —— `lifecycle.state` 是**由会话事实派生**的真值，而 `group.state`
+ * 在老后端 / 总闸关时才是唯一可得的那个（那时它逐字回退到本轮之前的语义）。
  *
  * 任何组件都不得自己拼这个判断——本仓库已经有过「前后端各存一份口径导致静默漂移」的事故，
  * 而这一个判断决定的是「暂停按钮还是继续按钮」，拼错了用户会对着一个错的按钮做真实资金决策。
- * 热暂停走 `group.state === "paused"`，冷暂停走 `resumable`；两者**互斥**（后端 G-9 冻结）。
+ * 热暂停走 `group`，冷暂停走 `resumable`；两者**互斥**（后端 G-9 冻结）。
  */
 export function resolveAiTradeLifecycle(
   group: AiTradeGroupState | null | undefined,
   resumable: AiTradeResumableGroup | null | undefined,
 ): AiTradeLifecycle {
-  if (group) return group.state === "paused" ? "paused" : "running";
+  if (group) {
+    const state = group.lifecycle?.state ?? group.state;
+    if (state === "paused") return "paused";
+    if (state === "stopped") return "stopped";
+    return "running";
+  }
   return resumable ? "paused" : "idle";
+}
+
+/** `resolveAiTradeArmed` 的产物：整组结论 + 分子分母 + 逐标的原因。 */
+export interface AiTradeArmedView {
+  armed: boolean;
+  membersArmed: number;
+  membersTotal: number;
+  rows: AiTradeNotArmedRow[];
+  /** 后端没下发 `lifecycle`（老后端 / 总闸关）⇒ true ⇒ 呈现层整段回退到本轮之前。 */
+  unavailable: boolean;
+}
+
+/**
+ * 「运行中但没真的在跑」：`running ∧ !armed`（L-2 的界面落点）。
+ *
+ * 分子分母**一律取后端**（`membersArmed` / `membersTotal`）：整组与门在多标的下会把跑得好好的
+ * 成员也说成「未武装」（[评审 R1-7]），而前端自己数一遍就是第二处口径。
+ */
+export function resolveAiTradeArmed(
+  group: AiTradeGroupState | null | undefined,
+): AiTradeArmedView {
+  const wire: AiTradeLifecycleWire | null | undefined = group?.lifecycle;
+  if (!wire) {
+    return { armed: true, membersArmed: 0, membersTotal: 0, rows: [], unavailable: true };
+  }
+  return {
+    armed: !!wire.armed,
+    membersArmed: wire.membersArmed ?? 0,
+    membersTotal: wire.membersTotal ?? 0,
+    rows: wire.notArmed ?? [],
+    unavailable: false,
+  };
+}
+
+/**
+ * 徽标四态 + 色调的**单点**（F-1）。
+ *
+ * `running` 再按 `armed` 分两档，且**带分数**：全部武装 ⇒「运行中」；部分 ⇒「运行中 · 1/2 未武装」；
+ * 零 ⇒「运行中 · 未武装」。`unknown`（与后端同步中）优先于一切 —— 读不到的时候先说读不到。
+ *
+ * @param lifecycle 四态（`resolveAiTradeLifecycle` 的产物）。
+ * @param armed 武装视图（`resolveAiTradeArmed` 的产物）。
+ * @param syncing 后端水合盲区 / 对账失败（`aiTradeSyncState === "unknown"`）。
+ */
+export function describeAiTradeLifecycleBadge(
+  lifecycle: AiTradeLifecycle,
+  armed: AiTradeArmedView,
+  syncing = false,
+): { label: string; tone: AiTradeBadgeTone } {
+  if (syncing) return { label: "与后端同步中…", tone: "neutral" };
+  if (lifecycle === "stopped") return { label: "已停止", tone: "neutral" };
+  if (lifecycle === "paused") return { label: "已暂停", tone: "accent" };
+  if (lifecycle === "idle") return { label: "未开启", tone: "neutral" };
+  if (armed.unavailable || armed.armed) return { label: "运行中", tone: "long" };
+  const notArmed = Math.max(0, armed.membersTotal - armed.membersArmed);
+  return {
+    label: armed.membersTotal > 1
+      ? `运行中 · ${notArmed}/${armed.membersTotal} 未武装`
+      : "运行中 · 未武装",
+    tone: "accent",
+  };
+}
+
+/**
+ * 「下一次动作」倒计时文案（[评审 R1-6] 的判定顺序，单点）。
+ *
+ * ```
+ * nextWakeInS 非空 ⇒ 「下一次决策 mm:ss」
+ * 否则 nextBarInS 非空 ⇒ 「下一根 K 线 mm:ss」（K 线收盘同样会起决策轮，如实的第二证据）
+ * 否则 ⇒ null（不渲染，绝不显示「--:--」占位）
+ * lifecycle !== "running" 或 armed === false ⇒ 一律 null
+ * ```
+ *
+ * 最后一条是纪律：**对着一个不会到来的时刻读秒是新的谎话**。
+ *
+ * @param wire 分组级 lifecycle（缺席 ⇒ null）。
+ * @param lifecycle 四态。
+ * @param nowTs 当前墙钟秒（调用方每秒 tick 一次）。倒计时以 `wire.asOfTs` 为**服务端锚点**，
+ *   故本机时钟与服务端差一小时也不影响读数（双时钟纪律）。
+ */
+export function formatNextWake(
+  wire: AiTradeLifecycleWire | null | undefined,
+  lifecycle: AiTradeLifecycle,
+  nowTs: number,
+): string | null {
+  if (!wire || lifecycle !== "running" || !wire.armed) return null;
+  const elapsed = Math.max(0, nowTs - (wire.asOfTs || nowTs));
+  if (wire.nextWakeInS != null) {
+    return `下一次决策 ${formatCountdown(wire.nextWakeInS - elapsed)}`;
+  }
+  if (wire.nextBarInS != null) {
+    return `下一根 K 线 ${formatCountdown(wire.nextBarInS - elapsed)}`;
+  }
+  return null;
+}
+
+/** `mm:ss`（负数按 0；超过一小时用 `h:mm:ss`）。 */
+export function formatCountdown(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = String(m).padStart(2, "0");
+  const ss = String(s).padStart(2, "0");
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+/**
+ * 携带**逐标的明细**的错误码白名单（[评审 R1-1]，F-10）。
+ *
+ * 从 `AiTradeToggle` 提到本模块：续跑对话框的失败屏要渲染同一份明细，留在组件里就会被抄第二遍
+ * —— 那是 D-5 的形状。**成员级 `message` 一律由后端下发**，前端不得按 code 自己拼中文。
+ */
+export const AI_TRADE_MEMBER_DETAIL_CODES = new Set([
+  "AI_TRADE_GROUP_PREFLIGHT",
+  "AI_TRADE_RESUME_BLOCKED",
+  "AI_TRADE_RESUME_PARTIALLY_DEAD",   // 谁还活着 / 谁已结束
+  "AI_TRADE_RESUME_NOT_ARMED",        // 谁没武装成功、卡在哪一步
+  "AI_TRADE_GROUP_ENDED",
+]);
+
+/** 整组失败的逐标的明细中文化；不在白名单 / 无明细 ⇒ 回落后端 `message`。 */
+export function describeStartError(err: ApiRequestError): string {
+  if (AI_TRADE_MEMBER_DETAIL_CODES.has(err.code) && err.members?.length) {
+    return err.members.map((m) => `${m.instId}：${m.message}`).join("；");
+  }
+  return err.message;
+}
+
+/** `reconcileAiTradeLifecycle` 的写点集合（注入而非 import，避免 `aiTrade ⇄ hook` 的模块环）。 */
+export interface AiTradeReconcileSetters {
+  getGroup: () => AiTradeGroupState | null;
+  groupStateFromStatus: (row: AiTradeGroupRow) => AiTradeGroupState;
+  setAiTradeGroup: (group: AiTradeGroupState | null) => void;
+  setAiTradeResumable: (resumable: AiTradeResumableGroup | null) => void;
+  patchAiTradeGroupLifecycle: (patch: AiTradeGroupLifecyclePatch) => void;
+  clearAiTradeRuntime: () => void;
+  setAiTradeSyncState: (state: "ok" | "unknown") => void;
+  setAiTradeEnabled: (enabled: boolean) => void;
+  setAiTradeLifecycleNotice: (notice: string | null) => void;
+}
+
+/**
+ * 生命周期对账器（F-2 的判定表，**本轮前端的核心**）。
+ *
+ * 把 `GET /ai-trade/status` 的**权威回执**覆盖到本地投影上。七行判定：
+ *
+ * | 后端回执 | 本地状态 | 动作 |
+ * |---|---|---|
+ * | `group` 非空，同 `groupId` | 有同组 | 窄 patch（分组级 + 逐成员生命周期键，绝不碰 trades） |
+ * | `group` 非空，异 `groupId` | 有旧组 | 换组（重建成交流是对的） |
+ * | `group` 非空 | 无组 | 同上（重发现） |
+ * | `group` 空、`resumable` 非空 | 任意 | 清热态 + 装冷占位（冷暂停接管） |
+ * | `group` 空、`resumable` 空、`lifecycleUnknown` | 任意 | **什么都不清**，只置 `unknown` |
+ * | 都空、本地有组且成员全 `stopped` | — | 置本地 `stopped` 并**保留面板**（终态留痕） |
+ * | 都空、本地有组且成员未全 stopped | — | 清运行期态 + 一条持久提示 |
+ *
+ * 第五行是 L-7 的极性：**读不到 ≠ 没有**。第六行的理由与 `end` 的孤儿仓提示同源 —— 会话自行
+ * 终止（会话止损 / 强平）是用户**必须**知道的事，面板整块消失等于没说。
+ */
+export function reconcileAiTradeLifecycle(
+  res: AiTradeGroupStatusResponse,
+  setters: AiTradeReconcileSetters,
+): void {
+  setters.setAiTradeEnabled(!!res.aiTradeEnabled);
+  const local = setters.getGroup();
+  if (res.group) {
+    setters.setAiTradeSyncState("ok");
+    setters.setAiTradeResumable(res.resumable ?? null);
+    if (local && local.groupId === res.group.groupId) {
+      setters.patchAiTradeGroupLifecycle(buildLifecyclePatch(res.group));
+      return;
+    }
+    setters.setAiTradeGroup(setters.groupStateFromStatus(res.group));
+    return;
+  }
+  if (res.resumable) {
+    setters.setAiTradeSyncState("ok");
+    setters.setAiTradeGroup(null);
+    setters.setAiTradeResumable(res.resumable);
+    return;
+  }
+  if (res.lifecycleUnknown) {
+    // 后端水合盲区：它**不知道**有没有暂停分组。清掉本地态等于把「不知道」渲染成「没有」。
+    setters.setAiTradeSyncState("unknown");
+    return;
+  }
+  setters.setAiTradeSyncState("ok");
+  setters.setAiTradeResumable(null);
+  if (!local) return;
+  const members = Object.values(local.members);
+  if (members.length > 0 && members.every((m) => m.session?.state === "stopped")) {
+    // 终态留痕（F-5）：分组在后端消失，但成员已如实 `stopped` ⇒ 保留一张「已停止」卡，
+    // 由用户点「知道了」再清。
+    setters.patchAiTradeGroupLifecycle({ group: { state: "stopped" }, members: [] });
+    return;
+  }
+  setters.clearAiTradeRuntime();
+  setters.setAiTradeLifecycleNotice(
+    "AI 自动交易会话已在后端结束（可能是软件重启或会话自行终止），请到实盘面板核对持仓。",
+  );
+}
+
+/**
+ * 同组窄 patch 的装配（白名单逐字写死，与 §5.2 的 wire 形状同处一注释）。
+ *
+ * **成员行必须一起合并**（[评审 R1-3]）：只 patch 分组级的话，一个已死成员的卡片会**永远**
+ * 显示「运行中」—— 它的 WS 恰好被 `NOT_FOUND` 之后的停连关掉了，再也没有任何事实会到达那张卡片。
+ */
+function buildLifecyclePatch(row: AiTradeGroupRow): AiTradeGroupLifecyclePatch {
+  return {
+    group: {
+      state: row.lifecycle?.state ?? row.state ?? "running",
+      declaredState: row.declaredState ?? null,
+      lifecycle: row.lifecycle ?? null,
+      pauseReason: row.pauseReason ?? null,
+      pausedTs: row.pausedTs ?? null,
+      resumedCount: row.resumedCount ?? null,
+      acceptance: row.acceptance ?? null,
+      exits: row.exits ?? null,
+      funding: row.funding ?? null,
+    },
+    members: (row.members ?? []).map((m) => ({
+      instId: m.instId,
+      session: {
+        state: m.state,
+        pauseReason: m.pauseReason ?? null,
+        pausedTs: m.pausedTs ?? null,
+        stopReason: m.stopReason ?? null,
+        degraded: m.degraded ?? null,
+        lifecycle: m.lifecycle ?? null,
+      },
+    })),
+  };
 }
 
 /**
