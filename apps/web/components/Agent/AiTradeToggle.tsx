@@ -31,7 +31,8 @@ import AiTradePauseDialog from "./AiTradePauseDialog";
 import AiTradeResumeDialog from "./AiTradeResumeDialog";
 
 /**
- * AI 自动交易开关（ai-trade-multi-symbol-and-timeframe §4.2）：挂 AgentPanel 头部「新对话」右侧。
+ * AI 自动交易开关（ai-trade-multi-symbol-and-timeframe §4.2）：挂 AgentPanel 底部「AI 自动交易
+ * 控制条」——一条紧贴输入框上沿的常驻通栏（agent-panel-toolbar-two-rows §4.3）。
  * 只要 Agent 已配置模型即可点开弹窗（回测门禁独立于 resolveAiTradeGate）；弹窗内「实盘 / 回测」段控——
  * 实盘段走完整 resolveAiTradeGate 门禁并**自动填入左侧「自动交易」面板的 autoTradeMembers 多标的**（分组
  * 启动），回测段仅需 Agent 已配置。运行中开关用于停止整组；回测确认→启动 job（开关不 latch）。
@@ -288,75 +289,102 @@ export default function AiTradeToggle() {
         : [];
 
   return (
-    <div
-      className="flex items-center gap-1.5"
-      title={
-        paused
-          ? "已暂停：不再开新仓，但盯市与保护层照常运行。点「继续」核对持仓后接着跑，或「结束」归档"
-          : (openBlockedReason
-            ?? (running ? "点击停止 AI 自动交易并平掉自管持仓" : "开启 AI 自动交易 / 回测"))
-      }
-    >
-      <span
-        className={
-          running || paused
-            ? "text-[11px] font-medium text-[var(--accent-ink)]"
-            : "text-[11px] text-[var(--muted)]"
+    <div className="flex w-full min-w-0 flex-col gap-1">
+      {/* 行容器承接**唯一一份** title：挂在「行」而不是左簇，是为了保住改前的悬停覆盖面——暂停态
+          那段 title 恰恰是在解释「继续 / 结束」这两颗按钮，挂到左簇会让它们悬停无提示。代价是行内
+          空白处也会弹气泡：可接受，这一整行本就是一个被 aria-label 命名过的语义分组。
+          min-h-[24px] 把三态行高锁成同一个值：idle 行内最高的是 20px 的 Switch，running / paused
+          多出 24px 的 sm Button，不钉死就会在开启 / 停止时抖 4px 并连带推动输入框。 */}
+      <div
+        data-testid="ai-trade-toggle-row"
+        className="flex min-h-[24px] w-full min-w-0 items-center justify-between gap-2"
+        title={
+          paused
+            ? "已暂停：不再开新仓，但盯市与保护层照常运行。点「继续」核对持仓后接着跑，或「结束」归档"
+            : (openBlockedReason
+              ?? (running ? "点击停止 AI 自动交易并平掉自管持仓" : "开启 AI 自动交易 / 回测"))
         }
       >
-        AI 自动交易
-      </span>
-      {/* 三态控件（§3.9.2）。`paused` 时开关保持 off 且**禁用**——避免「关开关」与「结束」两个
-          入口语义重叠：暂停可逆、结束不可逆，二者绝不能长得像同一个动作。 */}
-      <Switch
-        checked={running}
-        onChange={paused ? noop : onToggle}
-        label="AI 自动交易开关"
-        className={(openBlockedReason && !running) || paused ? "opacity-40" : undefined}
-      />
-      {running && (
-        <Button
-          variant="ghost"
-          size="sm"
-          aria-label="暂停 AI 自动交易"
-          onClick={() => {
-            setError(null);
-            setPauseOpen(true);
-          }}
-        >
-          ⏸ 暂停
-        </Button>
-      )}
-      {paused && (
-        <>
-          <Badge tone="accent">已暂停</Badge>
-          <Button
-            variant="primary"
-            size="sm"
-            aria-label="继续 AI 自动交易"
-            disabled={resumeM.isPending}
-            onClick={openResume}
+        {/* 左簇：标签 + 开关。全行**唯一**的压力吸收点（min-w-0 + truncate）——宽度不足时只有它退让。 */}
+        <div data-testid="ai-trade-toggle-main" className="flex min-w-0 items-center gap-1.5">
+          <span
+            className={
+              running || paused
+                ? "min-w-0 truncate text-[11px] font-medium text-[var(--accent-ink)]"
+                : "min-w-0 truncate text-[11px] text-[var(--muted)]"
+            }
           >
-            {resumeM.isPending ? "正在核对持仓…" : "▶ 继续"}
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            aria-label="结束 AI 自动交易"
-            onClick={() => {
-              setError(null);
-              setEndOpen(true);
-            }}
-          >
-            结束
-          </Button>
-        </>
-      )}
+            AI 自动交易
+          </span>
+          {/* 三态控件（§3.9.2）。`paused` 时开关保持 off 且**禁用**——避免「关开关」与「结束」两个
+              入口语义重叠：暂停可逆、结束不可逆，二者绝不能长得像同一个动作。 */}
+          <Switch
+            checked={running}
+            onChange={paused ? noop : onToggle}
+            label="AI 自动交易开关"
+            className={(openBlockedReason && !running) || paused ? "opacity-40" : undefined}
+          />
+        </div>
+
+        {/* 右簇：生命周期动作。shrink-0 ⇒ 宽度压力一律流向左簇标签的省略号，按钮永不被压折。
+            idle 态它是个空 div——刻意**无条件渲染**，让排版契约在三态下都有同一个落点。 */}
+        <div data-testid="ai-trade-toggle-actions" className="flex shrink-0 items-center gap-1.5">
+          {running && (
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label="暂停 AI 自动交易"
+              onClick={() => {
+                setError(null);
+                setPauseOpen(true);
+              }}
+            >
+              ⏸ 暂停
+            </Button>
+          )}
+          {paused && (
+            <>
+              <Badge tone="accent">已暂停</Badge>
+              <Button
+                variant="primary"
+                size="sm"
+                aria-label="继续 AI 自动交易"
+                disabled={resumeM.isPending}
+                onClick={openResume}
+              >
+                {resumeM.isPending ? "正在核对持仓…" : "▶ 继续"}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label="结束 AI 自动交易"
+                onClick={() => {
+                  setError(null);
+                  setEndOpen(true);
+                }}
+              >
+                结束
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* 错误文案独占第二行：在通栏里再挤一段截断文本，等于把「继续 / 结束」按钮挤没。
+          whitespace-normal 显式覆盖控制条继承下来的 nowrap（这是本方案里唯一需要换行的文本）。
+          data-testid 是必需的：四个弹窗里的错误段落同样是 role="alert"，只靠 role 定位有歧义。
+          触发面很窄——四个弹窗的 onClose 一律 setError(null)，唯一到达路径是「续跑复核在途时
+          先关掉弹窗、随后复核失败」这个竞态。 */}
       {paused && error && !resumeOpen && !endOpen && (
-        <span className="max-w-[220px] truncate text-[10px] text-[var(--short-ink)]" role="alert">
+        <span
+          data-testid="ai-trade-toggle-error"
+          className="whitespace-normal break-words text-[10px] leading-relaxed text-[var(--short-ink)]"
+          role="alert"
+        >
           {error}
         </span>
       )}
+
       <AiTradePauseDialog
         open={pauseOpen}
         group={aiTradeGroup}

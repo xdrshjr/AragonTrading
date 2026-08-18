@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { accountApi } from "@/lib/accountApi";
 import { agentApi } from "@/lib/agentApi";
@@ -399,5 +399,76 @@ describe("AiTradeToggle 的三态", () => {
     expect(screen.queryByRole("button", { name: "暂停 AI 自动交易" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "继续 AI 自动交易" })).not.toBeInTheDocument();
     expect(screen.queryByText("已暂停")).not.toBeInTheDocument();
+  });
+});
+
+// ============ 通栏排版契约（agent-panel-toolbar-two-rows §9.1 B）============
+// 守的是**契约**而不是像素：jsdom 无布局引擎，「不折行 / 不抖动」只能靠冻结类名与结构来固定，
+// 真实排版由人工验收（R1–R9，三档面板宽 × 明暗双主题）负责。
+describe("AiTradeToggle 的通栏排版契约", () => {
+  it("三态共用同一条定高单行：左簇可截断、右簇不收缩", async () => {
+    const cases: { name: string; setup: () => void }[] = [
+      { name: "idle", setup: () => useAppStore.setState({ aiTradeGroup: null, aiTradeResumable: null }) },
+      { name: "running", setup: () => useAppStore.setState({ aiTradeGroup: makeGroup() }) },
+      {
+        name: "paused",
+        setup: () => useAppStore.setState({ aiTradeGroup: { ...makeGroup(), state: "paused" } }),
+      },
+    ];
+    for (const { name, setup } of cases) {
+      setup();
+      const view = renderToggle();
+      // min-h-[24px]：idle 行内最高的是 20px 的 Switch，running / paused 多出 24px 的 sm Button，
+      // 不钉死行高，开关一开一关整条控制条就抖一格并连带推动输入框。
+      expect(screen.getByTestId("ai-trade-toggle-row"), name).toHaveClass(
+        "min-h-[24px]",
+        "justify-between",
+      );
+      const main = screen.getByTestId("ai-trade-toggle-main");
+      expect(main, name).toHaveClass("min-w-0");
+      const label = main.firstElementChild!;
+      expect(label, name).toHaveTextContent("AI 自动交易");
+      expect(label, name).toHaveClass("min-w-0", "truncate");
+      // idle 态右簇是个空 div，但**必须存在**：三态同一落点，shrink-0 这条契约才在三态下都成立。
+      expect(screen.getByTestId("ai-trade-toggle-actions"), name).toHaveClass("shrink-0");
+      view.unmount();
+    }
+  });
+
+  // 这一行唯一的到达路径是个竞态：四个弹窗的 onClose 一律 setError(null)，而 openResume() 是**先**
+  // 开框再发请求 —— 复核失败时错误只会落在续跑弹窗里（那段同样是 role="alert"）。只有「在途时先
+  // 关框、随后才失败」才能让错误落到一个没有弹窗承接的状态上。
+  it("暂停态错误独占第二行且自然换行（按竞态路径构造）", async () => {
+    let rejectPreview!: (e: unknown) => void;
+    vi.mocked(aiTradeApi.resumePreview).mockImplementation(
+      () => new Promise((_resolve, reject) => { rejectPreview = reject; }),
+    );
+    useAppStore.setState({ aiTradeGroup: { ...makeGroup(), state: "paused" } });
+    renderToggle();
+
+    fireEvent.click(await screen.findByRole("button", { name: "继续 AI 自动交易" }));
+    await screen.findByTestId("ai-trade-resume-dialog");
+    expect(screen.queryByTestId("ai-trade-toggle-error")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    await waitFor(() =>
+      expect(screen.queryByTestId("ai-trade-resume-dialog")).not.toBeInTheDocument(),
+    );
+    await act(async () => {
+      rejectPreview(new Error("boom"));
+    });
+
+    const line = await screen.findByTestId("ai-trade-toggle-error");
+    expect(line).toHaveAttribute("role", "alert");
+    expect(line).toHaveClass("whitespace-normal");
+    expect(line).not.toHaveClass("truncate");
+    expect(line).not.toHaveClass("max-w-[220px]");
+  });
+
+  // K1：title 只能存在一份。留在根节点又抄一份到行容器，6 处 findByTitle 会因多命中直接抛错。
+  it("承载门禁文案的 title 全组件只有一份", async () => {
+    renderToggle();
+    await screen.findByTitle("开启 AI 自动交易 / 回测");
+    expect(screen.getAllByTitle("开启 AI 自动交易 / 回测")).toHaveLength(1);
   });
 });

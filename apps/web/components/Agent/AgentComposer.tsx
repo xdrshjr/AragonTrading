@@ -38,7 +38,10 @@ export default function AgentComposer({
   };
 
   return (
-    <div className="border-t border-[var(--border)] bg-[var(--surface)] p-2.5">
+    <div
+      data-testid="agent-composer"
+      className="border-t border-[var(--border)] bg-[var(--surface)] p-2.5"
+    >
       <div className="flex items-end gap-2 rounded-[12px] border border-[var(--border)] bg-[var(--surface-2)] px-2.5 py-1.5 focus-within:border-[var(--accent)]">
         <textarea
           ref={ref}

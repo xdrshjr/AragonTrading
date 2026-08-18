@@ -5,7 +5,7 @@ import { Button } from "@/components/ui";
 import AiTradeStatsPanel from "./AiTradeStatsPanel";
 
 // AI 自动交易统计入口按钮（ai-trade-stats-dashboard §3.9）：自封装（自持 open state + 自挂看板 Modal，
-// 仿 AiTradeToggle，避免污染 AgentPanel 状态）。挂在 AgentPanel 头部 AiTradeToggle 左侧。
+// 仿 AiTradeToggle，避免污染 AgentPanel 状态）。挂在 AgentPanel 顶栏「新对话」右侧。
 export default function AiTradeStatsButton() {
   const [open, setOpen] = useState(false);
   return (

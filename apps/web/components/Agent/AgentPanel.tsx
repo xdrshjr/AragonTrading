@@ -312,23 +312,26 @@ export default function AgentPanel() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <header className="flex items-center justify-between border-b border-[var(--border)] px-3 py-2">
-        <div className="flex items-center gap-2">
+      {/* 横栏 A：身份 + 会话动作。行级 whitespace-nowrap 沿 DOM 树继承到每一个按钮文案，
+          中文因此不再逐字断行；宽度压力由**唯一**一处 min-w-0 + truncate（模型名）吸收。 */}
+      <header className="flex items-center justify-between gap-2 whitespace-nowrap border-b border-[var(--border)] px-3 py-2">
+        <div className="flex min-w-0 items-center gap-2">
           <span
-            className={`h-1.5 w-1.5 rounded-full ${connected ? "bg-[var(--long)]" : "bg-[var(--muted)]"}`}
+            className={`h-1.5 w-1.5 shrink-0 rounded-full ${connected ? "bg-[var(--long)]" : "bg-[var(--muted)]"}`}
             title={connected ? "已连接" : "连接中…"}
           />
-          <span className="text-xs font-semibold text-[var(--text)]">AI 助手</span>
+          <span className="shrink-0 text-xs font-semibold text-[var(--text)]">AI 助手</span>
           {config?.model && (
-            <span className="text-[10px] text-[var(--muted)]">{config.model}</span>
+            <span className="truncate text-[10px] text-[var(--muted)]" title={config.model}>
+              {config.model}
+            </span>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-1.5">
           <Button variant="ghost" size="sm" onClick={newConversation} aria-label="新对话">
             新对话
           </Button>
           <AiTradeStatsButton />
-          <AiTradeToggle />
         </div>
       </header>
 
@@ -381,6 +384,19 @@ export default function AgentPanel() {
         </div>
       )}
 
+      {/* 横栏 B：AI 自动交易控制条。常驻贴在输入框正上方；「执行轨迹」视图下输入框不渲染时它
+          自然落到面板底缘——两个视图里位置一致，用户不必重新寻找同一个开关。刻意不做条件渲染：
+          随运行态出现 / 消失会在开启瞬间把整条消息流顶动一整格。排在错误条**之后**，是因为错误
+          条是瞬态通知，只有常驻外壳才有资格占住「紧贴输入框」这个位置。 */}
+      <div
+        role="group"
+        aria-label="AI 自动交易控制"
+        data-testid="ai-trade-control-bar"
+        className="shrink-0 whitespace-nowrap border-t border-[var(--border)] bg-[var(--surface)] px-3 py-1.5"
+      >
+        <AiTradeToggle />
+      </div>
+
       {!unconfigured && !showTrace && (
         <AgentComposer
           value={input}
@@ -427,7 +443,7 @@ function AiTradeLifecycleNotice() {
   );
 }
 
-/** 视图分段按钮（对话 / 执行轨迹）：置于标题行下方子行，与既有 AiTradeToggle 启停开关区分（RV-3）。 */
+/** 视图分段按钮（对话 / 执行轨迹）：置于标题行下方子行，与底部控制条的启停开关分居两端（RV-3）。 */
 function ViewTab({
   active,
   onClick,
