@@ -283,6 +283,9 @@ class AiTradeSession:
         self.max_hold_streak = 0
         self._stale_degraded = False
         self._degraded_seen = False
+        # F1：盯市 tick 的连续失败计数与「已推过降级」标志（守护循环的可见性，见 `_monitor_loop`）。
+        self._tick_fail_streak = 0
+        self._tick_degraded = False
         self._last_status_side = executor.projected
         self._warmed_bars = 0
 
@@ -897,15 +900,83 @@ class AiTradeSession:
     # ---------- monitor 循环 ----------
     async def _monitor_loop(self) -> None:
         """盯市循环。判据是 `is_active`（§3.1.2 row 1）——暂停期**必须继续跑**：reconcile、
-        利润保护、会话止盈止损、交易所侧兜底核实与自愈补挂全挂在这条循环上（D-5 的根因就在这两行）。"""
+        利润保护、会话止盈止损、交易所侧兜底核实与自愈补挂全挂在这条循环上（D-5 的根因就在这两行）。
+
+        F1（ai-trade-interval-wake-dead-monitor-loop）：**tick 级守卫**。此前循环体只吞
+        `CancelledError`，于是 `_monitor_tick` 里任意一步抛出的任意异常都会**永久终结**这条守着
+        真实资金的循环；而墙钟定时唤醒 `_maybe_interval_wake` 是 tick 的最后一行、且这条循环是它
+        的唯一执行者，于是「信号（K 线，另挂 WS 回调链）还能触发 Agent，定时触发再也不来了」。
+
+        谓词刻意是「进了这个 except 分支」而不是某个异常类型：生产日志证明真实发生过的失败类里
+        有 `anyio.ClosedResourceError`（代理 CONNECT 隧道在 TLS 握手中途被拆），它既不是 httpx
+        异常也不是 `OKXError`——用类型当谓词恰好会在**已知会发生**的那一类上静默失效（同款理由
+        见 `okx/rest_client.py` 的 `_attempt`）。`CancelledError` 是 `BaseException`，天然不进
+        `except Exception`，此处仍显式 `raise` 以对齐决策轮（`_run_decision_round`）的既有范式，
+        停止流程的取消语义逐字不变。
+        """
         try:
             while self.is_active:
                 await asyncio.sleep(self.poll_interval_s)
                 if not self.is_active:
                     break
-                await self._monitor_tick()
+                try:
+                    await self._monitor_tick()
+                    # 「恢复出声」刻意留在 `try` **之内**（而不是 `else` 分支）：它要读整份
+                    # `_status_payload()`，而 `else` 里抛出的异常**不被本 try 接住** —— 那等于在
+                    # 守护循环上重新开一个能被打死的缺口。失败侧的 `_note_tick_failure` 反过来
+                    # 只用原始类型（计数 / 日志 / 字面量事件），故它在守卫之外也不可能抛。
+                    await self._note_tick_recovered()
+                except asyncio.CancelledError:
+                    raise                 # 取消照旧上抛，由外层 except 收口（语义逐字不变）
+                except Exception as exc:  # noqa: BLE001 —— 守护循环：任何一跳失败都不得终结它
+                    await self._note_tick_failure(exc)
         except asyncio.CancelledError:
             pass
+
+    async def _note_tick_failure(self, exc: Exception) -> None:
+        """一跳盯市失败：记日志 + 连续失败计数 + 达阈推**一条**降级 error（不每 5 秒刷屏）。
+
+        计数与「达阈可见」是 F1 正确性的组成部分，不是装饰：tick 级守卫意味着「一步失败即跳过本
+        tick 余下全部步骤」，而 `reconcile` 在第一步、`_maybe_interval_wake` 在最后一步。失败若
+        持续存在，循环虽然活着，定时唤醒依然永不执行——症状与修复前**完全一样**，只是这次连一条
+        traceback 都不会有。故失败必须能被用户看见。
+
+        阈值复用 `live_auto_reconcile_max_failures`（默认 6，即 6 × 5s ≈ 30 秒），与 executor 的
+        reconcile 降级同一口径，不新增配置项。
+
+        出声走 `error` 帧：AI 自动交易的成员流把它落到 `member.session.message`
+        （`useAiTradeGroupStream.routeMemberEvent` 的 `case "error"`），即用户可见的状态行；恢复时
+        的 `status.message` 覆盖同一个键，故不会留下一句过期的降级文案。**本方法整体在守卫之外
+        执行**（见 `_monitor_loop`），故它只碰计数、日志与字面量事件，绝不去读任何可能抛的断面。
+        """
+        self._tick_fail_streak += 1
+        logger.warning("ai-trade monitor tick failed (session=%s streak=%d): %r",
+                       self.session_id, self._tick_fail_streak, exc)
+        threshold = max(1, int(self.executor.settings.live_auto_reconcile_max_failures))
+        if self._tick_fail_streak < threshold or self._tick_degraded:
+            return
+        self._tick_degraded = True
+        self._degraded_seen = True
+        await self._push({"type": "error", "data": {
+            "ts": int(time.time()), "code": "AI_TRADE_MONITOR_DEGRADED",
+            "message": f"盯市连续 {self._tick_fail_streak} 次异常（{type(exc).__name__}），"
+                       f"定时唤醒 / 利润保护 / 持仓校正暂时停摆，请检查网络 / 代理 / 账户凭证"}})
+
+    async def _note_tick_recovered(self) -> None:
+        """一跳盯市成功：清零计数；此前推过降级则补推一条恢复 status（对称于 executor 的口径）。
+
+        载荷是 `{**_status_payload(), "message": ...}` 而**不是**只有 `state` + `message` 的窄字典：
+        前端把 status 事件**整体浅合并**进成员断面（`store.patchAiTradeMemberStatus`），一份缺键的
+        status 会把 `profitGuardCooldown` 一类只在全量断面里出现的键顺手清成 null。本文件其余每一处
+        带文案的 status 推送（行情停滞 / 已恢复 / 利润保护）用的都是这个形状。
+        """
+        self._tick_fail_streak = 0
+        if not self._tick_degraded:
+            return
+        self._tick_degraded = False
+        await self._push({"type": "status", "data": {
+            **self._status_payload(),
+            "message": "盯市已恢复，定时唤醒与利润保护重新生效"}})
 
     async def _monitor_tick(self) -> None:
         """单轮盯市：reconcile（经 _exec_lock）+ 盯市 + staleness + 会话止盈止损（经 _exec_lock）。"""
@@ -2111,7 +2182,8 @@ class AiTradeSession:
                 # status；分组合并口径另走 15s REST 轮询。未装配 / 零样本 ⇒ 各键为 None 而非缺席。
                 **self.acceptance_bundle(),
                 "stopReason": self.stop_reason,
-                "degraded": self.executor.degraded or self._stale_degraded or self.degraded,
+                "degraded": (self.executor.degraded or self._stale_degraded
+                             or self.degraded or self._tick_degraded),
                 "flattenFailed": self.flatten_failed, "residual": self.residual}
 
     def discipline_wire(self) -> dict:
@@ -2162,7 +2234,8 @@ class AiTradeSession:
                 "positionSide": self.executor.projected,
                 "sessionPnlUsd": self.executor.session_pnl_usd, "startedTs": self.started_ts,
                 "lastDecision": self._last_decision, "contextSummary": self.decider.summary,
-                "degraded": self.executor.degraded or self._stale_degraded or self.degraded,
+                "degraded": (self.executor.degraded or self._stale_degraded
+                             or self.degraded or self._tick_degraded),
                 "flattenFailed": self.flatten_failed}
 
     # ---------- 持久化 ----------

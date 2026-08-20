@@ -10,6 +10,7 @@ R-17 是它的影子：新的「不确定」码若没有配套写死「谁都不
 """
 from __future__ import annotations
 
+import anyio
 import httpx
 import pytest
 
@@ -220,3 +221,71 @@ def test_net_mode_matches_any_side():
     rows = [{"instId": "BTC-USDT-SWAP", "posSide": "net", "pos": "-2"}]
     assert _has_open_position(rows, "BTC-USDT-SWAP", "net") is True
     assert _has_open_position(rows, "BTC-USDT-SWAP", "long") is True
+
+
+# ---------------- F2：写路径上放宽谓词的两条硬性边界 ----------------
+# （ai-trade-interval-wake-dead-monitor-loop §8.2）
+
+
+class _AnyioFlakyPoster:
+    """POST 恒抛一个**非 httpx** 的传输层异常（生产上真实发生的那一类）。"""
+
+    def __init__(self):
+        self.posts = 0
+
+    async def post(self, path, content=None, headers=None):
+        self.posts += 1
+        raise anyio.ClosedResourceError()
+
+
+async def test_a_non_httpx_transport_failure_still_obeys_the_idempotency_gate():
+    """放宽谓词之后，非 httpx 的传输失败也必须走 `may_retry_write` 分级，而不是原样穿透。
+
+    穿透的后果是 `_post` 承诺的「连通失败一律抛 OKXPrivateError」失效，调用方的
+    `except OKXError` 全部落空；而分级一旦被绕开，`close-position` 就可能被重发。
+    """
+    client = _client()
+    poster = _AnyioFlakyPoster()
+    client._client = poster
+
+    with pytest.raises(OKXPrivateError) as exc:
+        await client._post("/api/v5/trade/close-position", {"instId": "BTC-USDT-SWAP"})
+
+    assert exc.value.code == "OKX_UNREACHABLE"
+    assert poster.posts == 1, "非幂等写只发一次——重试可能变成第二次平仓动作"
+
+
+async def test_a_non_httpx_transport_failure_still_retries_an_idempotent_write():
+    client = _client()
+    poster = _AnyioFlakyPoster()
+    client._client = poster
+
+    with pytest.raises(OKXPrivateError):
+        await client._post("/api/v5/trade/order", {"clOrdId": "aragonx1"})
+
+    assert poster.posts == 3, "带去重键的写照旧重试三跳（语义不变）"
+
+
+async def test_a_malformed_response_body_is_never_treated_as_a_transport_failure():
+    """R-1 回归（§8.2）：`resp.json()` 必须留在 `try` **之外**。
+
+    否则一个畸形响应会被当成传输失败，而 `place_order` 的 `retryable` 为真 ⇒ **重复下单**——
+    正是 `_post` docstring 里标为「本轮最严重的风险」的那件事。
+    """
+    class _GarbagePoster:
+        def __init__(self):
+            self.posts = 0
+
+        async def post(self, path, content=None, headers=None):
+            self.posts += 1
+            return httpx.Response(200, content=b"<html>not json</html>")
+
+    client = _client()
+    poster = _GarbagePoster()
+    client._client = poster
+
+    with pytest.raises(Exception) as exc:
+        await client._post("/api/v5/trade/order", {"clOrdId": "aragonx1"})
+
+    assert not isinstance(exc.value, OKXPrivateError), "解析错误不是连通失败，语义不许串"
+    assert poster.posts == 1, "畸形响应绝不许触发第二次下单"

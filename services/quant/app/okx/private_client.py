@@ -76,7 +76,9 @@ class OKXPrivateClient:
         self._passphrase = passphrase
         self._settings = settings or get_settings()
         self._client: httpx.AsyncClient | None = None
-        self._pool_holds = 0     # 本实例从池里取过几份引用，`aclose()` 须**逐一**归还
+        # 本实例从池里取过几份引用，`aclose()` 须**逐一**归还。F3：按**世代**分桶——换代之后手里
+        # 那几份旧世代引用必须还到退役条目上，还到新一代身上就是在减别人的计数（见 `pool.release`）。
+        self._pool_holds: dict[int, int] = {}
 
     def _fingerprint(self) -> str:
         """本实例在连接池里的身份：账户 + 端点 + 模拟盘标志 + 超时档。不同账户绝不复用连接。"""
@@ -107,10 +109,11 @@ class OKXPrivateClient:
         """
         if self._client is not None:
             return self._client
-        client = await get_client_pool().acquire(
+        client, generation = await get_client_pool().acquire_hold(
             self._fingerprint(), self._new_client,
             idle_ttl_s=self._settings.okx_link_pool_idle_ttl_s)
-        self._pool_holds += 1        # 每一跳都取一次 ⇒ 归还也必须是同样的次数（见 `aclose`）
+        # 每一跳都取一次 ⇒ 归还也必须是同样的次数、且必须还给同一个世代（见 `aclose`）。
+        self._pool_holds[generation] = self._pool_holds.get(generation, 0) + 1
         return client
 
     async def aclose(self) -> None:
@@ -126,16 +129,21 @@ class OKXPrivateClient:
             await self._client.aclose()
             self._client = None
             return
-        holds, self._pool_holds = self._pool_holds, 0
+        holds, self._pool_holds = self._pool_holds, {}
         pool, fp = get_client_pool(), self._fingerprint()
-        for _ in range(holds):
-            await pool.release(fp)
+        for generation, count in holds.items():
+            for _ in range(count):
+                await pool.release(fp, generation=generation)
 
     async def _invalidate_pooled(self) -> None:
-        """传输层异常即整池换代（笔记本休眠唤醒后所有池化 socket 都是半死的，解药就是这一行）。"""
+        """传输层异常即整池换代（笔记本休眠唤醒后所有池化 socket 都是半死的，解药就是这一行）。
+
+        F3：**不再丢弃** `_pool_holds`。换代后池把旧条目移入退役表、等它的引用归零才真正关闭，
+        所以这几份旧世代引用必须照常归还（带上世代，池据此减到退役条目上）——丢弃它们会让那条
+        连接一直挂到宽限期才被兜底关掉。「不能拿它们去减新一代的计数」这条纪律由 `release` 的
+        世代校验直接保证，不再需要在调用方这边靠清零来近似。
+        """
         if self._client is None:
-            # 手里那几份引用随被摘掉的那一代一起作废，不能拿它们去减新一代的计数。
-            self._pool_holds = 0
             await get_client_pool().invalidate(self._fingerprint())
 
     async def _acquire_slot(self) -> None:
@@ -196,9 +204,22 @@ class OKXPrivateClient:
     async def _get(self, path: str, params: dict | None = None) -> list:
         """签名 GET：返回 OKX ``data`` 数组；``code != "0"`` 或连通失败抛 ``OKXPrivateError``。
 
-        ``requestPath`` 须含 query string 并与签名串一致。对 ``httpx.TransportError`` 重试，并对
-        HTTP ``429``（限流）做指数退避重试（镜像 ``rest_client._request``）——签名私有路径同样需自愈，
-        否则多标的自动交易启动瞬间撞限频会把 ``OKX HTTP 429`` 原样抛到 UI。非 429 的 4xx/5xx 仍立即上抛。
+        ``requestPath`` 须含 query string 并与签名串一致。对**传输层失败**重试，并对 HTTP ``429``
+        （限流）做指数退避重试（镜像 ``rest_client._request``）——签名私有路径同样需自愈，否则多标的
+        自动交易启动瞬间撞限频会把 ``OKX HTTP 429`` 原样抛到 UI。非 429 的 4xx/5xx 仍立即上抛。
+
+        F2（ai-trade-interval-wake-dead-monitor-loop §8.2）：**传输失败的谓词是「结构」而不是
+        「类型」**。此前 ``try`` 罩着整个成功路径、``except`` 写 ``httpx.TransportError``；而生产
+        日志证明真实发生过的失败类里有 ``anyio.ClosedResourceError``（代理 CONNECT 隧道在 TLS 握手
+        中途被拆，httpcore 的 ``start_tls`` 恰好漏了这一条映射），它根本不是 httpx 异常 ⇒ 它会
+        **原样穿透**本方法，把 docstring 承诺的「一律抛 ``OKXPrivateError``」变成一句空话，下游
+        ``executor.reconcile`` 的 ``except OKXError`` 降级链路整条空转。
+
+        故 ``try`` 收窄到**只包住那一次网络调用**，再把谓词放宽到「进了这个 except 分支」：这样
+        ``except`` 的唯一来源就是 ``client.get``，它在语义上**就等于**传输层失败。**严禁**只把关键字
+        换成 ``except Exception`` 而不收窄 ``try``——那会把 ``code != "0"`` 的鉴权 / 业务错误
+        （``OKXPrivateError`` 也是 ``Exception``）当成传输失败重试三次并坍缩成 ``OKX_UNREACHABLE``，
+        直接推翻本 docstring 的承诺，也让 ``_maybe_heal_clock`` 的时钟自愈与服务层的语义码全部失效。
         """
         query = httpx.QueryParams(params or {})
         request_path = path + (f"?{query}" if query else "")
@@ -211,26 +232,28 @@ class OKXPrivateClient:
             headers = self._headers(ts, "GET", request_path)
             try:
                 resp = await client.get(path, params=params, headers=headers)
-                if resp.status_code == 429:   # 限流：退避后重试，不直接抛
-                    rate_limited = True
-                    await asyncio.sleep(0.5 * (2 ** attempt))
-                    continue
-                resp.raise_for_status()
-                body = resp.json()
-                if str(body.get("code")) != "0":
-                    await self._maybe_heal_clock(str(body.get("code")))
-                    raise OKXPrivateError(str(body.get("code")),
-                                          str(body.get("msg") or "OKX error"))
-                self._note_link_ok()
-                return body.get("data", [])
-            except httpx.TransportError as exc:  # 仅传输层异常重试，鉴权/业务错误立即上抛
+            except Exception as exc:  # noqa: BLE001 —— 谓词见 docstring：进了这里即传输层失败
                 last_exc = exc
                 rate_limited = False
                 await self._invalidate_pooled()   # 抖动即整池换代，而非让后续请求各自超时一遍
+                continue
+            if resp.status_code == 429:   # 限流：退避后重试，不直接抛
+                rate_limited = True
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            try:
+                resp.raise_for_status()
             except httpx.HTTPStatusError as exc:  # 非 429 的 4xx/5xx：语义不变，立即上抛
                 self._note_link_fail("OKX_HTTP_ERROR", f"{path}: HTTP {exc.response.status_code}")
                 raise OKXPrivateError("OKX_HTTP_ERROR",
                                       f"OKX HTTP {exc.response.status_code}") from exc
+            body = resp.json()
+            if str(body.get("code")) != "0":
+                await self._maybe_heal_clock(str(body.get("code")))
+                raise OKXPrivateError(str(body.get("code")),
+                                      str(body.get("msg") or "OKX error"))
+            self._note_link_ok()
+            return body.get("data", [])
         if rate_limited:   # 退避耗尽仍 429：显式回 OKX_HTTP_ERROR，避免 last_exc=None 的误导串
             # 【有意的不对齐，spec §2.3.5 / §十一 D-1】公共侧改抛 OKX_RATE_LIMITED，私有侧**一字不动**：
             # 它被 tests/test_okx_signing.py:95 逐字冻结，而那条用例本轮必须未经改动仍绿。

@@ -94,13 +94,82 @@ async def test_releasing_a_fingerprint_never_acquired_is_a_no_op():
     await pool.aclose_all()
 
 
-async def test_invalidate_closes_and_bumps_the_generation():
+async def test_invalidate_closes_an_unused_client_and_bumps_the_generation():
+    """没人在用时行为逐字不变：当场关掉并置代。"""
     pool = OKXClientPool()
     old = await pool.acquire("fp1", _factory())
+    await pool.release("fp1")
     await pool.invalidate("fp1")
     assert old.is_closed
     new = await pool.acquire("fp1", _factory())
     assert new is not old and not new.is_closed
+    await pool.aclose_all()
+
+
+async def test_invalidate_never_closes_a_client_that_is_still_in_use():
+    """F3（ai-trade-interval-wake-dead-monitor-loop §3.7 / §8.3）：换代不得误伤在飞请求。
+
+    ``httpx.AsyncClient.aclose()`` 会关掉连接池里**正在服务某个请求**的连接，而
+    ``anyio.ClosedResourceError`` 在语义上恰恰等价于「本进程在别人的读还在飞的时候把那条 socket
+    关掉了」——立即 ``aclose()`` 不是故障的放大器，而是这一类异常的**触发器**：一个成员撞到一次
+    真实抖动，就会把同分组其它成员在飞的私有请求一起打成非 httpx 的裸异常。
+    """
+    pool = OKXClientPool()
+    old = await pool.acquire("fp1", _factory())      # refcount = 1：模拟一个在飞请求
+    await pool.invalidate("fp1")
+
+    assert not old.is_closed, "还有人在用，绝不许当场关掉"
+    new = await pool.acquire("fp1", _factory())
+    assert new is not old and not new.is_closed, "但下一跳必须立刻拿到新一代"
+    await pool.aclose_all()
+
+
+async def test_a_retired_client_closes_once_its_last_in_flight_hold_comes_back():
+    """推迟关闭不等于永不关闭：最后一份旧世代引用还回来时，退役条目立刻被关掉。"""
+    pool = OKXClientPool()
+    old, generation = await pool.acquire_hold("fp1", _factory())
+    await pool.acquire("fp1", _factory())            # 同一代的第二份引用
+    await pool.invalidate("fp1")
+
+    await pool.release("fp1", generation=generation)
+    assert not old.is_closed, "还剩一份引用没还"
+
+    await pool.release("fp1", generation=generation)
+    assert old.is_closed
+    await pool.aclose_all()
+
+
+async def test_a_retired_hold_is_never_subtracted_from_the_new_generation():
+    """F3 / §8.3：``release`` 必须校验世代，否则旧世代的归还会去减新一代的计数。
+
+    ``idle_ttl_s == 0``（代码明确支持的「用完即关」退路）下，那一还会把新条目的 refcount 打到 0，
+    **当场关掉一个别人正在用的客户端**——即本轮所修异常的第二条独立触发路径，与 ``invalidate``
+    的立即关闭无关。
+    """
+    pool = OKXClientPool()
+    stale, stale_gen = await pool.acquire_hold("fp1", _factory(), idle_ttl_s=0.0)
+    await pool.invalidate("fp1")
+    fresh = await pool.acquire("fp1", _factory(), idle_ttl_s=0.0)   # 新一代，别人正在用
+
+    await pool.release("fp1", generation=stale_gen)                 # 旧世代的归还
+
+    assert stale.is_closed, "旧世代引用归零 ⇒ 退役条目被关"
+    assert not fresh.is_closed, "新一代还有人在用，计数绝不许被旧世代减掉"
+    assert pool.stats()["fp1"] == 1
+    await pool.aclose_all()
+
+
+async def test_a_retired_entry_is_force_closed_after_the_grace_period():
+    """宽限期兜底：引用因任何原因没能归零时，``sweep`` 必须把退役条目关掉，绝不泄漏连接。"""
+    pool = OKXClientPool(retire_grace_s=30.0)
+    leaked = await pool.acquire("fp1", _factory(), idle_ttl_s=120.0, now=100.0)
+    await pool.invalidate("fp1", now=100.0)          # refcount 仍为 1，永远不会还回来
+
+    assert await pool.sweep(now=120.0) == 0, "宽限期内不许动它"
+    assert not leaked.is_closed
+
+    assert await pool.sweep(now=200.0) == 1
+    assert leaked.is_closed
     await pool.aclose_all()
 
 
@@ -147,12 +216,15 @@ async def test_the_same_private_client_instance_keeps_working_after_invalidate()
 
     first = await client._get_client()
     await client._invalidate_pooled()
-    assert first.is_closed
 
     second = await client._get_client()
 
     assert second is not first
     assert not second.is_closed
+    # F3：旧连接不在换代那一刻被关（本实例的引用还没还回去），引用归还之后才真正关闭。
+    assert not first.is_closed
+    await client.aclose()
+    assert first.is_closed
     await get_client_pool().aclose_all()
 
 

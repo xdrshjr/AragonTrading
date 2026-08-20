@@ -36,6 +36,14 @@ class OKXTradeClient(OKXPrivateClient):
         ``clOrdId`` / ``algoClOrdId`` 去重），但 ``close-position`` **没有这个承诺**——一次「请求已
         送达、响应在回程丢了」的超时，盲重试就可能变成第二次平仓动作（R-1，本轮最严重的风险）。
 
+        F2（ai-trade-interval-wake-dead-monitor-loop §8.2）：与 ``_get`` 同款结构化修法——``try``
+        收窄到**只包住那一次网络调用**，谓词随之放宽为「进了这个 except 分支」，使
+        ``anyio.ClosedResourceError`` 一类**非 httpx** 的传输失败也走幂等分级而不是原样穿透。
+        **收窄 ``try`` 在写路径上是硬性前提**：``resp.json()`` 原本也在 ``try`` 里，只放宽关键字会
+        把一个畸形响应当成传输失败，而 ``place_order`` 的 ``retryable`` 为真 ⇒ **重复下单**，正是
+        上面 R-1 标注的那件事。收窄之后，``json()`` 的解析错误照旧原样上抛，重试判定只受真正的
+        网络失败驱动。
+
         Args:
             path: OKX 请求路径。
             payload: 请求体（``may_retry_write`` 会检查它是否**确实带上了**去重键）。
@@ -52,23 +60,25 @@ class OKXTradeClient(OKXPrivateClient):
             headers = self._headers(ts, "POST", path, body)
             try:
                 resp = await client.post(path, content=body, headers=headers)
-                if resp.status_code == 429:   # 限流：退避后重试，不直接抛
-                    rate_limited = True
-                    await asyncio.sleep(0.5 * (2 ** attempt))
-                    continue
-                resp.raise_for_status()
-                self._note_link_ok()
-                return resp.json()
-            except httpx.TransportError as exc:  # 传输层异常：只有幂等写才允许再发一次
-                last_exc = exc
+            except Exception as exc:  # noqa: BLE001 —— 谓词见 docstring：进了这里即传输层失败
+                last_exc = exc                   # 传输层异常：只有幂等写才允许再发一次
                 rate_limited = False
                 await self._invalidate_pooled()
                 if not retryable:
                     break
+                continue
+            if resp.status_code == 429:   # 限流：退避后重试，不直接抛
+                rate_limited = True
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            try:
+                resp.raise_for_status()
             except httpx.HTTPStatusError as exc:  # 非 429 的 4xx/5xx：语义不变，立即上抛
                 self._note_link_fail("OKX_HTTP_ERROR", f"{path}: HTTP {exc.response.status_code}")
                 raise OKXPrivateError("OKX_HTTP_ERROR",
                                       f"OKX HTTP {exc.response.status_code}") from exc
+            self._note_link_ok()
+            return resp.json()
         if rate_limited:   # 退避耗尽仍 429：显式回 OKX_HTTP_ERROR，避免 last_exc=None 的误导串
             self._note_link_fail("OKX_HTTP_ERROR", f"{path}: HTTP 429")
             raise OKXPrivateError("OKX_HTTP_ERROR", "OKX HTTP 429")

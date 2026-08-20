@@ -6,10 +6,12 @@ import hashlib
 import hmac
 import re
 
+import anyio
 import httpx
 import pytest
 
 from app.config import Settings
+from app.okx.client_pool import get_client_pool
 from app.okx.private_client import OKXPrivateClient, OKXPrivateError, _iso_timestamp, _sign
 
 
@@ -133,3 +135,81 @@ async def test_get_non_429_status_raises_immediately(monkeypatch):
 async def _no_sleep(_seconds) -> None:
     """退避桩：跳过真实 sleep，避免单测被指数退避拖慢。"""
     return None
+
+
+# ---------------- F2：传输失败的谓词是「结构」而不是「类型」 ----------------
+# （ai-trade-interval-wake-dead-monitor-loop §3.3 / §8.2）
+
+
+def _pooled(handler, **over) -> OKXPrivateClient:
+    """走**连接池**路径的客户端（不注入 `self._client`，否则 `_invalidate_pooled` 会空转）。"""
+    base = dict(okx_account_demo=False, okx_link_private_rate_per_s=0.0,
+                okx_link_pool_idle_ttl_s=120.0)
+    base.update(over)
+    client = OKXPrivateClient("ak", "sk-123456", "pass-123456", Settings(**base))
+    client._new_client = lambda: httpx.AsyncClient(  # noqa: E731 —— 测试替身工厂
+        transport=httpx.MockTransport(handler), base_url="https://www.okx.com")
+    return client
+
+
+async def test_a_non_httpx_transport_failure_is_normalised_and_swaps_the_client(monkeypatch):
+    """镜像公共侧 `test_okx_rest_resilience.py` 的同名护栏——**私有侧此前正栽在这上面**。
+
+    `anyio.ClosedResourceError`（代理 CONNECT 隧道在 TLS 握手中途被拆）不是 httpx 异常：用
+    `except httpx.TransportError` 当谓词的写法，恰好会在这个**已知会发生**的类上静默失效，让裸
+    异常穿透 `_get` 承诺的「一律抛 OKXPrivateError」，于是下游 `executor.reconcile` 的
+    `except OKXError` 降级链路整条空转，盯市循环被直接打死（本轮缺陷的第一层漏斗）。
+    """
+    calls = {"n": 0}
+    made: list = []
+
+    def handler(_request):
+        calls["n"] += 1
+        raise anyio.ClosedResourceError()
+
+    monkeypatch.setattr("app.okx.private_client.asyncio.sleep", _no_sleep)
+    client = _pooled(handler)
+    factory = client._new_client
+
+    def counting_factory():
+        made.append(factory())
+        return made[-1]
+
+    client._new_client = counting_factory
+    try:
+        with pytest.raises(OKXPrivateError) as excinfo:
+            await client.get_positions()
+    finally:
+        await client.aclose()
+        await get_client_pool().aclose_all()
+
+    assert excinfo.value.code == "OKX_UNREACHABLE"
+    assert calls["n"] == 3, "传输失败照旧重试三跳（语义不变）"
+    assert len(made) == 3, "每一次传输失败都必须换代，下一跳才拿得到新连接"
+
+
+async def test_a_business_error_code_is_raised_at_once_and_never_retried(monkeypatch):
+    """守住 §8.2 判定为**阻断级**的那条回归面。
+
+    F2 若只把关键字换成 `except Exception` 而**不收窄 try**，`code != "0"` 的鉴权 / 业务错误
+    （`OKXPrivateError` 也是 `Exception`）会被当成传输失败重试三次并坍缩成 `OKX_UNREACHABLE`，
+    直接推翻 `_get` docstring 的承诺，也让 `_maybe_heal_clock` 的时钟自愈与服务层的语义码全失效。
+    """
+    calls = {"n": 0}
+
+    def handler(_request):
+        calls["n"] += 1
+        return httpx.Response(200, json={"code": "50113", "msg": "Invalid Sign"})
+
+    monkeypatch.setattr("app.okx.private_client.asyncio.sleep", _no_sleep)
+    client = _pooled(handler)
+    try:
+        with pytest.raises(OKXPrivateError) as excinfo:
+            await client.get_positions()
+    finally:
+        await client.aclose()
+        await get_client_pool().aclose_all()
+
+    assert excinfo.value.code == "50113", "业务码必须原样上抛，不得坍缩成 OKX_UNREACHABLE"
+    assert excinfo.value.message == "Invalid Sign"
+    assert calls["n"] == 1, "鉴权 / 业务错误立即上抛，绝不重试"

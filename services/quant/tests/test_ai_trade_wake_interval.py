@@ -10,9 +10,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 
+import anyio
 import pytest
 
 from app.agent.llm.base import StreamEvent
@@ -451,4 +453,139 @@ async def test_reason_switch_off_leaves_the_decision_event_wake_free():
         assert decision["wake"] is None
         assert decision["trigger"] == "interval"
     finally:
+        await dispose_engine()
+
+
+# ---------------- F1：盯市循环是墙钟唤醒的唯一执行者，它不许被一次异常打死 ----------------
+# （docs/diagnoses/ai-trade-interval-wake-dead-monitor-loop）
+
+
+async def _run_monitor_until(session, predicate, *, timeout_s: float = 8.0) -> bool:
+    """跑真实 `_monitor_loop`，轮询到 `predicate()` 为真或超时；返回**收尾前**循环是否还活着。
+
+    存活判定必须由本函数交出来：收尾会 cancel 掉这条任务，之后再问 `task.done()` 恒为 True，
+    调用方那句断言就成了一句空话。而收尾**只 cancel 不 await 也不行**——盯市 tick 里有 DB 写
+    （心跳），一条还没真正停下的循环会在用例结束、事件循环关闭之后继续动它，症状是别的模块里
+    冒出 `Event loop is closed`。
+    """
+    task = asyncio.create_task(session._monitor_loop())
+    session._monitor_task = task
+    deadline = time.monotonic() + timeout_s
+    try:
+        while time.monotonic() < deadline and not predicate():
+            await asyncio.sleep(0.1)
+            await _settle(session)
+    finally:
+        alive = not task.done()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    return alive
+
+
+async def test_a_failing_monitor_tick_never_kills_the_loop_nor_the_interval_wake():
+    """回归护栏：盯市 tick 抛出一个既不是 httpx 异常、也不是 `OKXError` 的异常时，循环必须**活着**
+    跑下一跳，且下一跳的墙钟定时唤醒**仍能起轮**。
+
+    只断言「没抛出」是不够的：修复前的症状恰恰是「循环死了、K 线唤醒还在、面板一切正常」，
+    `_maybe_interval_wake` 又是 `_monitor_tick` 的最后一行——所以必须断言唤醒本身还活着。
+    """
+    await init_db()
+    session = _make_session(action="hold", wake_interval_s=120,
+                            settings=Settings(ai_trade_wake_skip_unchanged_pct=0.0,
+                                              live_auto_poll_interval_s=1))
+    ticks = {"n": 0}
+    original_tick = session._monitor_tick
+
+    async def flaky_tick():
+        ticks["n"] += 1
+        if ticks["n"] == 1:
+            # 生产原样：代理 CONNECT 隧道在 TLS 握手中途被拆 ⇒ anyio 层异常，**不是** httpx 异常，
+            # 也不是 OKXError，四层 except 的谓词全不匹配。
+            raise anyio.ClosedResourceError()
+        await original_tick()
+
+    session._monitor_tick = flaky_tick
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        assert session.rounds_completed == 1
+        _elapse_timer(session)
+
+        alive = await _run_monitor_until(session, lambda: session.rounds_completed >= 2)
+
+        assert alive, "一次 tick 异常绝不许终结盯市循环"
+        assert ticks["n"] >= 2, "第一跳失败后循环必须继续跑下一跳"
+        assert session.rounds_completed == 2, "墙钟定时唤醒必须仍能起轮"
+    finally:
+        session.state = "stopped"
+        session._monitor_task = None
+        await dispose_engine()
+
+
+async def test_a_persistently_failing_tick_is_reported_instead_of_failing_silently():
+    """F1 的组成部分（§8.1 (a)），不是装饰。
+
+    tick 级守卫意味着「一步失败即跳过本 tick 余下全部步骤」，而 reconcile 在第一步、
+    `_maybe_interval_wake` 在最后一步：失败若持续存在，循环虽然活着，定时唤醒依然永不执行——
+    症状与修复前**完全一样**，只是这次连一条 traceback 都不会有。故达阈必须出声，且只出一次。
+    """
+    await init_db()
+    session = _make_session(action="hold", wake_interval_s=120,
+                            settings=Settings(live_auto_reconcile_max_failures=2))
+    try:
+        q = session.subscribe()
+        await session._note_tick_failure(anyio.ClosedResourceError())
+        assert not [e for e in _drain(q) if e["type"] == "error"], "未达阈不许刷屏"
+
+        await session._note_tick_failure(anyio.ClosedResourceError())
+        errors = [e for e in _drain(q) if e["type"] == "error"]
+        assert len(errors) == 1
+        assert errors[0]["data"]["code"] == "AI_TRADE_MONITOR_DEGRADED"
+        assert session._degraded_seen is True
+
+        await session._note_tick_failure(anyio.ClosedResourceError())
+        assert not [e for e in _drain(q) if e["type"] == "error"], "已降级不再重复推送"
+
+        await session._note_tick_recovered()
+        assert session._tick_fail_streak == 0
+        recovered = [e for e in _drain(q) if e["type"] == "status"]
+        assert len(recovered) == 1, "恢复也必须出声"
+        # 载荷必须是**全量**断面：status 事件经 `store.patchAiTradeMemberStatus` 整体浅合并进成员
+        # 断面，一份缺键的 status 会把 `profitGuardCooldown` 一类只在全量断面里出现的键清成 null。
+        assert recovered[0]["data"]["positionSide"] == session.executor.projected
+        assert "sessionPnlUsd" in recovered[0]["data"]
+    finally:
+        await dispose_engine()
+
+
+async def test_a_throwing_recovery_notice_never_kills_the_loop_either():
+    """出声路径本身也必须在守卫**之内**。
+
+    「成功即清零并出声」若写在 `try` 的 `else` 分支里，它抛出的异常**不被那个 try 接住**——守护
+    循环照样被打死，缺陷以完全相同的症状复发一次。恢复文案要读整份 `_status_payload()`，那不是
+    一句不会抛的字面量，所以这条缝必须堵上。
+    """
+    await init_db()
+    session = _make_session(action="hold", wake_interval_s=120,
+                            settings=Settings(live_auto_poll_interval_s=1))
+    notices = {"n": 0}
+
+    async def flaky_notice():
+        notices["n"] += 1
+        if notices["n"] == 1:
+            raise RuntimeError("status payload blew up")
+
+    session._note_tick_recovered = flaky_notice
+    try:
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+
+        alive = await _run_monitor_until(session, lambda: notices["n"] >= 2)
+
+        assert alive, "出声失败同样不许终结盯市循环"
+        assert notices["n"] >= 2, "第一跳出声失败后循环必须继续跑下一跳"
+    finally:
+        session.state = "stopped"
+        session._monitor_task = None
         await dispose_engine()

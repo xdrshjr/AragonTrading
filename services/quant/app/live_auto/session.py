@@ -65,6 +65,9 @@ class LiveAutoSession:
         self._last_candle_wall = 0.0          # H3/R-5：最近确认根墙钟（start 订阅 WS 时初始化）
         self._stale_degraded = False          # H3：行情停滞降级态（限频推送，避免刷屏）
         self._degraded_seen = False           # H4：会话期是否曾降级（落 Run metrics）
+        # F1：盯市 tick 的连续失败计数与「已推过降级」标志（守护循环的可见性，见 `_monitor_loop`）。
+        self._tick_fail_streak = 0
+        self._tick_degraded = False
         # A1：上次已随 status 事件推送的持仓方向。开/平/反手/外部平仓改变 executor.projected 后，
         # 据此补推一条带 positionSide 的全量 status，使前端持仓真源刷新，修复持仓恒显「空仓」。
         self._last_status_side = executor.projected
@@ -233,6 +236,13 @@ class LiveAutoSession:
 
         循环内触发的 `stop`（会话金额止损 / 停滞自动平仓）靠 `while self.state=="running"` 自然
         退出（R-2，绝不自取消）；`CancelledError`（外部停止取消本任务）安静吞掉。
+
+        F1（ai-trade-interval-wake-dead-monitor-loop）：**tick 级守卫**。此前 tick 里任意一步抛出
+        的任意异常都会**永久终结**这条守着真实资金的循环，而本会话的 `_monitor_task` 全仓**只在
+        `start()` 里创建过一次**、没有任何重建分支 ⇒ 一旦死亡，除非整个会话重启否则永不复活
+        （reconcile / 净值 / 停滞看门狗 / 会话止盈止损随之一起静默停摆）。谓词是「进了这个 except
+        分支」而不是某个异常类型：生产上真实发生过的 `anyio.ClosedResourceError` 既不是 httpx 异常
+        也不是 `OKXError`，用类型当谓词恰好会在已知会发生的那一类上静默失效。
         """
         try:
             while self.state == "running":
@@ -240,9 +250,65 @@ class LiveAutoSession:
                 async with self._lock:
                     if self.state != "running":
                         break
-                    await self._monitor_tick()
+                    try:
+                        await self._monitor_tick()
+                        # 「恢复出声」刻意留在 `try` **之内**而不是 `else` 分支：`else` 里抛出的
+                        # 异常**不被本 try 接住**，那等于在守护循环上重新开一个能被打死的缺口。
+                        await self._note_tick_recovered()
+                    except asyncio.CancelledError:
+                        raise                 # 取消照旧上抛，由外层 except 收口（语义逐字不变）
+                    except Exception as exc:  # noqa: BLE001 —— 守护循环：一跳失败不得终结它
+                        await self._note_tick_failure(exc)
         except asyncio.CancelledError:
             pass
+
+    async def _note_tick_failure(self, exc: Exception) -> None:
+        """一跳盯市失败：记日志 + 连续失败计数 + 达阈推**一条**降级（不每 5 秒刷屏）。
+
+        「达阈可见」是守卫正确性的一部分而非装饰：tick 级守卫意味着一步失败即跳过本 tick 余下
+        全部步骤，若失败持续存在，循环虽活着，会话止盈止损与净值推送依然不执行——症状与修复前
+        一样，只是连 traceback 都没有了。阈值复用 `live_auto_reconcile_max_failures`（默认 6，
+        约 30 秒），与 executor 的 reconcile 降级同一口径，不新增配置项。
+
+        **error 帧与 status 文案必须成对推**，缺一即等于没出声：自动交易分组的成员流
+        （`useLiveAutoGroupStream.routeMemberEvent`）**只消费 status**，`error` 帧被显式丢弃
+        （「error 由 status.message 渠道呈现」）——这正是 `executor._on_reconcile_failure` 也两条
+        一起推的原因。只推 error 的话，用户那边与「静默失败」逐字等价。
+
+        **本方法整体在守卫之外执行**（见 `_monitor_loop`），故只碰计数、日志与 `_status_payload()`
+        —— 后者是一串纯属性读取，不会抛。
+        """
+        self._tick_fail_streak += 1
+        logger.warning("live-auto monitor tick failed (session=%s streak=%d): %r",
+                       self.session_id, self._tick_fail_streak, exc)
+        threshold = max(1, int(self.executor.settings.live_auto_reconcile_max_failures))
+        if self._tick_fail_streak < threshold or self._tick_degraded:
+            return
+        self._tick_degraded = True          # 先置位：下面两条载荷的 `degraded` 据它派生
+        self._degraded_seen = True
+        message = (f"盯市连续 {self._tick_fail_streak} 次异常（{type(exc).__name__}），"
+                   f"持仓校正与会话止盈止损暂时停摆，请检查网络 / 代理 / 账户凭证")
+        await self._push({"type": "error", "data": {
+            "ts": int(time.time()), "code": "LIVE_AUTO_MONITOR_DEGRADED",
+            "message": message}})
+        await self._push({"type": "status", "data": {**self._status_payload(),
+                                                     "message": message}})
+
+    async def _note_tick_recovered(self) -> None:
+        """一跳盯市成功：清零计数；此前推过降级则补推一条恢复 status（对称于 executor 的口径）。
+
+        载荷是 `{**_status_payload(), "message": ...}` 而**不是**只有 `state` + `message` 的窄字典：
+        前端的成员 status 是**整体替换**（`store.setLiveAutoMemberStatus`），一份缺键的 status 会
+        把该成员的 `sessionPnlUsd` / `positionSide` / `budgetUsd` 一起抹掉，分组合计盈亏当场少算
+        这一笔，直到下一次全量 status 才恢复。本文件其余带文案的 status 推送都是这个形状。
+        """
+        self._tick_fail_streak = 0
+        if not self._tick_degraded:
+            return
+        self._tick_degraded = False         # 先复位：下面那条载荷的 `degraded` 据它派生
+        await self._push({"type": "status", "data": {
+            **self._status_payload(),
+            "message": "盯市已恢复，持仓校正与会话止盈止损重新生效"}})
 
     async def _monitor_tick(self) -> None:
         """单轮盯市（持 `self._lock`，与 `_on_confirmed` 互斥，杜绝并发改 projected）。"""
@@ -458,7 +524,8 @@ class LiveAutoSession:
                 "positionSide": self.executor.projected,
                 "budgetUsd": self.executor.budget_usd, "leverage": self.executor.leverage,
                 "stopReason": self.stop_reason,
-                "degraded": self.executor.degraded or self._stale_degraded,
+                "degraded": (self.executor.degraded or self._stale_degraded
+                             or self._tick_degraded),
                 "flattenFailed": self.flatten_failed, "residual": self.residual}
 
     def snapshot(self) -> dict:
@@ -477,7 +544,8 @@ class LiveAutoSession:
                 "takeProfitUsd": self.take_profit_usd, "stopLossUsd": self.stop_loss_usd,
                 "positionSide": self.executor.projected,
                 "sessionPnlUsd": self.executor.session_pnl_usd, "startedTs": self.started_ts,
-                "degraded": self.executor.degraded or self._stale_degraded,
+                "degraded": (self.executor.degraded or self._stale_degraded
+                             or self._tick_degraded),
                 "flattenFailed": self.flatten_failed}
 
     # ---------- 持久化 ----------

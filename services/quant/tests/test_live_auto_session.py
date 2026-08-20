@@ -6,7 +6,9 @@ reconcile 校正 projected、会话级止损触发自动平仓 + 停。
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
+import anyio
 import pytest
 
 from app.config import Settings
@@ -294,3 +296,96 @@ async def test_stop_flatten_failure_sets_flatten_failed_and_keeps_residual(monke
 
 async def _no_sleep(*_args, **_kwargs):
     return None
+
+
+# ---------------- F1：同形的守护循环（docs/diagnoses/ai-trade-interval-wake-dead-monitor-loop）----
+
+
+async def test_a_failing_monitor_tick_never_kills_the_loop_nor_the_session_stop_loss():
+    """回归护栏：一次非 httpx、非 `OKXError` 的异常不许终结盯市循环。
+
+    本会话的 `_monitor_task` 全仓**只在 `start()` 里创建过一次**、没有任何重建分支——它一旦死亡，
+    除非整个会话重启否则永不复活，reconcile / 净值 / 停滞看门狗 / 会话止盈止损随之一起静默停摆。
+    故断言不止「循环还活着」，还要断言下一跳的会话止损**真的把仓平掉了**。
+    """
+    await init_db()
+    session, calls, pos_state = _make_session({1: [Signal(side="long")]}, stop_loss_usd=50.0)
+    session.executor.settings = Settings(live_auto_poll_interval_s=1)
+    ticks = {"n": 0}
+    original_tick = session._monitor_tick
+
+    async def flaky_tick():
+        ticks["n"] += 1
+        if ticks["n"] == 1:
+            raise anyio.ClosedResourceError()   # 非 httpx、非 OKXError：既有 except 谓词全不匹配
+        await original_tick()
+
+    session._monitor_tick = flaky_tick
+    task = None
+    try:
+        await session.feed_candle(_candle(0))
+        await session.feed_candle(_candle(1))          # 开多；此刻浮亏为 0，收线不触发
+        assert session.executor.projected == "long" and session.state == "running"
+        pos_state["upl"] = -100.0                      # 两根之间浮亏 100 > 止损 50
+
+        task = asyncio.create_task(session._monitor_loop())
+        session._monitor_task = task
+        deadline = 80
+        while deadline > 0 and session.state == "running":
+            await asyncio.sleep(0.1)
+            deadline -= 1
+
+        assert ticks["n"] >= 2, "第一跳失败后循环必须继续跑下一跳"
+        assert session.state == "stopped" and session.stop_reason == "session_stop_loss"
+        assert len(calls["closes"]) >= 1, "会话止损必须真的平了仓"
+    finally:
+        if task is not None:
+            # 只 cancel 不 await 会让循环在事件循环关闭之后还动 DB（心跳写），症状是别的模块里
+            # 冒出 `Event loop is closed`。
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        session._monitor_task = None
+        await dispose_engine()
+
+
+async def test_a_persistently_failing_tick_is_reported_instead_of_failing_silently():
+    """连续失败达阈必须推一条降级（error + status **成对**），且不每 5 秒刷屏；恢复后清零并出声。
+
+    只推 `error` 等于没推：分组成员流（`useLiveAutoGroupStream.routeMemberEvent`）**显式丢弃**
+    `error` 帧、只消费 `status`（这也是 `executor._on_reconcile_failure` 两条一起推的原因）。
+    两条 status 载荷都必须是**全量** `_status_payload()`：前端成员 status 是整体替换，缺键会把
+    该成员的 `sessionPnlUsd` / `positionSide` 一并抹掉，分组合计盈亏当场少算这一笔。
+    """
+    await init_db()
+    session, _calls, _pos = _make_session()
+    session.executor.settings = Settings(live_auto_reconcile_max_failures=2)
+    try:
+        q = session.subscribe()
+        await session._note_tick_failure(anyio.ClosedResourceError())
+        assert not _drain(q), "未达阈不许出声"
+
+        await session._note_tick_failure(anyio.ClosedResourceError())
+        events = _drain(q)
+        errors = [e for e in events if e["type"] == "error"]
+        assert len(errors) == 1
+        assert errors[0]["data"]["code"] == "LIVE_AUTO_MONITOR_DEGRADED"
+        assert session._degraded_seen is True
+        degraded = [e for e in events if e["type"] == "status"]
+        assert len(degraded) == 1, "缺了 status 文案，用户那边与「静默失败」逐字等价"
+        assert degraded[0]["data"]["message"] == errors[0]["data"]["message"]
+        assert degraded[0]["data"]["degraded"] is True
+        assert degraded[0]["data"]["positionSide"] == session.executor.projected
+        assert "sessionPnlUsd" in degraded[0]["data"], "窄载荷会把成员盈亏抹成缺席"
+
+        await session._note_tick_failure(anyio.ClosedResourceError())
+        assert not _drain(q), "已降级不再重复推送"
+
+        await session._note_tick_recovered()
+        assert session._tick_fail_streak == 0
+        recovered = [e for e in _drain(q) if e["type"] == "status"]
+        assert len(recovered) == 1, "恢复也必须出声"
+        assert recovered[0]["data"]["degraded"] is False
+        assert "sessionPnlUsd" in recovered[0]["data"], "同上：恢复帧也不许是窄载荷"
+    finally:
+        await dispose_engine()
