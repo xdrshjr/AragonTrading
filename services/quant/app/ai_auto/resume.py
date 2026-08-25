@@ -28,6 +28,7 @@ from ..db.session import get_sessionmaker
 from ..okx.trading import fetch_position_history
 from ..okx.types import BAR_SECONDS
 from . import pause as pause_core
+from .experience.adopted import AdoptedOpen, synth_from_contract
 from .manager import (AiTradeGroup, AiTradeManager, AiTradePreflightError,
                       _creds)
 from .reconcile import local_net_view
@@ -292,11 +293,51 @@ async def _adopt_group(group: AiTradeGroup, assessment: _Assessment) -> None:
                                         cost_basis=_cost_basis(session),
                                         paused_ts=int(assessment.row.get("pausedTs") or 0))
         adopt_position(executor, assessed.get("actual"))
+        # W-A · H-3：**仍持仓**的接管。这一类往返在 v1 采不到——`CostRuntime.note_open` 只挂在
+        # 开仓成交上，跨进程接管后 `last_settled_trip()` 恒 None ⇒ 该往返只贡献一个 `harvestGap`。
+        # 而会被跨进程接管的，恰恰是**那些没能在会话内平掉的**仓位（超时、被套、等反弹），
+        # 在净额分布上系统性偏左：整类剔除等于给经验表做了一次幸存者偏差筛选。
+        experience = _experience(member)
+        if experience is not None:
+            experience.adopt_open(_adopted_open(member, assessed.get("actual"),
+                                                continuity["entryFeeUsd"]))
         session._last_status_side = executor.projected
         snapshot = await _run_snapshot(member.run_id)
         session.rounds_completed = int(snapshot.get("roundsCompleted") or 0)
         session.decider.seed_from_snapshot(summary=snapshot.get("finalSummary"),
                                            last_round=session.rounds_completed)
+
+
+def _experience(member):
+    """成员会话的经验层门面；未装配 ⇒ `None`。
+
+    **极性说明（本文件的 fail-closed 只管取数，不管旁路观测）**：续跑本身是一次开仓授权，
+    所以 S3 的取数一律 fail-closed。但经验采集是**旁路观测**——它缺席的最坏后果是「这一笔往返
+    没进经验库」，而把它变成一个能挡下合法续跑的异常，等于让一个统计增强读数决定真实资金能不能
+    继续交易。沿用 `experience.runtime.persist_pending` 的 best-effort 姿态。
+    """
+    return getattr(getattr(member, "session", None), "experience", None)
+
+
+def _adopted_open(member, actual: dict | None, entry_fee_usd: float) -> AdoptedOpen | None:
+    """把接管到的交易所真值装配成经验层的合成开仓断面（W-A · H-3）；已平 / 无仓 ⇒ `None`。
+
+    `entry_fee_usd == 0.0` 一律当作**不可知**而不是「零手续费」：`rebuild_continuity` 是
+    `sum(r.fee or 0.0)`，它在结构上分不出这两种情况，而 `trip_ledger` 的约束 2b 要求两者可区分。
+    当作不可知的后果是该事件因 `v1:I-7` 被排除在 bps 统计外但**仍然入表**并计进桶的 `excluded`
+    ——被看见的缺失，而不是一个编出来的零。
+    """
+    executor = member.session.executor
+    if executor.projected == "flat" or executor.entry_price <= 0 or executor.entry_qty_sz <= 0:
+        return None
+    return AdoptedOpen(
+        seq=int(member.session._position_seq), side=str(executor.projected),
+        entry={"px": float(executor.entry_price), "qty": float(executor.entry_qty_sz),
+               # 与平仓 trade 的 `ts` 同一时钟（墙钟秒）：交易所 `cTimeS` 是权威开仓时刻。
+               "ts": int((actual or {}).get("cTimeS") or 0)},
+        open_fee_usd=(float(entry_fee_usd) if float(entry_fee_usd or 0.0) > 0 else None),
+        ct_val=float(getattr(executor, "ct_val", 0.0) or 0.0),
+        horizon_profile_id=getattr(member.session.horizon_rule, "profile_id", None))
 
 
 async def settle_closed_offline(member, contract: dict, *, creds, cost_basis: str,
@@ -315,6 +356,17 @@ async def settle_closed_offline(member, contract: dict, *, creds, cost_basis: st
     而本地 `trades.pnl` 的口径由该 run 的 `costBasis` 决定，资金费另有 `funding_ledger` 台账。
     直接照抄会同时踩两个坑：`gross` 时被 `local_net_view` 再减一次腿费、资金费与台账双记。
     """
+    # W-A · H-1：合成断面必须建在 `fetch_position_history` **之前**——下面两条出口都要用它，
+    # 而本函数跑在 `adopt_position` **之前**（`_adopt_group` 的调用顺序，★ E-5），此刻
+    # `executor` 里还没有这笔仓的任何真值。数据源因此只能是 `contract["position"]`，与
+    # `_offline_exit_trade` 读的 `openCTime` / `size` **同源**。
+    experience = _experience(member)
+    entry_fee = float(getattr(member.session.executor, "entry_fee_usd", 0.0) or 0.0)
+    if experience is not None:
+        experience.adopt_open(synth_from_contract(
+            contract, seq=int(member.session._position_seq),
+            ct_val=float(getattr(member.session.executor, "ct_val", 0.0) or 0.0),
+            open_fee_usd=(entry_fee if entry_fee > 0 else None)))
     expected = contract.get("position") or {}
     pos_id = str(expected.get("posId") or "")
     row = None
@@ -328,11 +380,20 @@ async def settle_closed_offline(member, contract: dict, *, creds, cost_basis: st
                                 local_trades=member.session.executor.trades)
     if trade is None:
         await _mark_offline_gap(member.run_id, member.inst_id, has_row=row is not None)
+        # W-A · H-2（★ F-6 的正解）：**这条早退分支才是「暂停期离线平仓未能采集」的唯一真实
+        # 落点**。`ExperienceCard` 上那句文案在 v1 的后一半恒为 0——产品指名道姓承诺会计的一个
+        # 数，从来没有被计过。`has_row` 把「采不到」分成两种真实存在的原因（回读不到 / 增量不自洽）。
+        if experience is not None:
+            await experience.note_offline_close(None, has_row=row is not None)
         return
     async with get_sessionmaker()() as db:
         from ..db import repositories as repo
 
         await repo.append_live_trade(db, member.run_id, trade)
+    # W-A · H-2：有回执 ⇒ 用合成断面跑一次**既有的** `trip_ledger.settle` ⇒ 事件入表并落盘
+    # （`origin="adopted"`）。绝不另写一份 bps 换算（A-12 逐位断言）。
+    if experience is not None:
+        await experience.note_offline_close(trade, has_row=True)
 
 
 def _offline_exit_trade(row: dict | None, expected: dict, *, cost_basis: str,

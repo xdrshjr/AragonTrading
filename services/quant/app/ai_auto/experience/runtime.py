@@ -12,13 +12,17 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ...db import repositories as repo
 from ...db.session import get_sessionmaker
+from ..trip_ledger import SettleContext, settle
 from . import taxonomy as tax
+from .adopted import AdoptedOpen, degraded_context, synth_open_snapshot
 from .disclosure import build_wire, experience_tier, format_counter, format_disputed
-from .events import ContextFacts, EventIdentity, ExperienceEvent, build_event, freeze_open_context
+from .events import (ContextFacts, EventIdentity, ExperienceEvent, OpenContext, build_event,
+                     freeze_open_context)
 from .retrieval import ContextSeed, RetrievalConfig, most_conflicting, retrieve
 from .rules import ExperienceRule
 
@@ -41,6 +45,37 @@ _OPEN_SLOT_CAP = 64
 
 # 会话收尾把本次的采集缺口累加进去的 `app_settings` 键（★ E-8）。
 HARVEST_GAP_KEY = "experience.harvest_gap_total"
+
+# ★ W-A · 采集完整性的另外两个累计量（补采条数 + 逐原因明细）的 `app_settings` 键。
+HARVEST_TOTALS_KEY = "experience.harvest_totals"
+
+# `harvest.reasons` 的**闭合**键集。每一个键都必须有一处真实的自增点——多一个空键就是一个
+# 永远显示 0 的假分类（`v1:I-8` 的反面形态）；少一个键则「为什么采不到」在 UI 上变成一句
+# 「其他」。零值的键照常下发：列出来才知道「这条路今天没走过」与「这条路不存在」的区别。
+HARVEST_REASONS: tuple[str, ...] = (
+    "noOpenContext",         # 有往返、没有开仓语境槽（跨进程 / 槽被淘汰之外的情形）
+    "noTrip",                # 有平仓成交、结算不出往返（`SettledTrip` 为空）
+    "slotEvicted",           # 开仓语境槽被 FIFO 淘汰（★ E-13 的有界纪律）
+    "persistFailed",         # 事件组装成功但落盘失败（这张表因此偏乐观 k 笔）
+    "offlineNoReadback",     # 暂停期离线平仓：交易所 `positions-history` 回读不到该 posId
+    "offlineInconsistent",   # 暂停期离线平仓：回读到了但增量不自洽（`_offline_exit_trade` 判否）
+)
+
+
+def _injection_rows(opened, event) -> list[dict]:
+    """一次已结算往返 → 它的注入台账行（自然键与事件行**逐字一致**，故幂等语义同源）。
+
+    ★ **J-5 · 这是共现，不是因果。** 记录的是「注入了这几条之后，那一单的净额是多少」，
+    我们并不知道模型是否真的采纳了其中任何一条。全部 wire 键与文案因此一律用「注入后表现」。
+    """
+    return [{
+        "group_id": event.identity.group_id, "inst_id": event.identity.inst_id,
+        "seq": int(event.seq), "exit_ts": int(event.exit_ts), "lesson_key": key,
+        "layer": layer, "claim_sign": int(claim_sign),
+        "injected_wall_ts": int(opened.wall_ts or 0), "net_bps": event.net_bps,
+        "fee_known": bool(event.fee_known), "cost_basis": event.cost_basis,
+        "created_ts": int(event.created_ts or 0),
+    } for key, layer, claim_sign in (getattr(opened, "injected", ()) or ())]
 
 
 class ExperienceRuntime:
@@ -65,6 +100,10 @@ class ExperienceRuntime:
         self.identity = identity or EventIdentity(group_id="", run_id=0, inst_id="", bar="")
         self._open_slots: dict[tuple[str, int], object] = {}
         self._pending: list[ExperienceEvent] = []
+        # ★ W-C · 与 `_pending` **同生共死**：台账只在平仓那一刻写，且与事件行同一次 commit。
+        # 绝不在开仓时写——开了仓不一定平（进程崩溃 / 被接管），那会在表里留下一批 `net_bps`
+        # 永远为 NULL 的悬空行，而那些行会静默拉偏效用统计（A-27 断言零悬空行）。
+        self._pending_injections: list[dict] = []
         self._session_events: list[ExperienceEvent] = []
         self._prev_ids: tuple[str, ...] | None = None
         self._last_wire: dict | None = None
@@ -76,6 +115,21 @@ class ExperienceRuntime:
         # 与设置中心概览条各有一处渲染落点，后端算了却看不见的观测量等于死码。
         self.harvest_gap = 0
         self._persisted_gap = 0        # 已累加进 `app_settings` 的部分（收尾可重入，不双计）
+        # ★ W-A · v1 的处置是「不补采、只计数」，那把幸存者偏差留了下来：会被跨进程接管、或在
+        # 暂停期被交易所平掉的仓位，恰恰是**那些没能在会话内平掉的**（超时、被套、等反弹），
+        # 在净额分布上系统性偏左。本轮改为**降级补采**：合成开仓断面 + 只写确定为真的轴。
+        self.adopted_harvested = 0
+        self.harvest_reasons: dict[str, int] = {key: 0 for key in HARVEST_REASONS}
+        self._persisted_adopted = 0
+        self._persisted_reasons: dict[str, int] = {key: 0 for key in HARVEST_REASONS}
+        # 接管仓的合成开仓断面（`(side, seq)` → `(OpenSnapshot, ct_val)`）。与 `_open_slots`
+        # **同一把 key**，故 `_take_slot` 的既有退化匹配纪律原样适用。
+        self._adopted_snaps: dict[tuple[str, int], tuple[object, float]] = {}
+        self._adopted_keys: set[tuple[str, int]] = set()
+        # 事件的溯源身份分两份：`origin="adopted"` 是这张表**唯一**能回答「这条经验的证据是本
+        # 进程亲眼看到的，还是从交易所回读拼出来的」的列。抹掉它，§7.3 那句「接管补采 N 笔」
+        # 就无从算起（读侧口径由 `db.STAT_ORIGINS` 单点承载，★ E-2 / J-7）。
+        self._adopted_identity = replace(self.identity, origin="adopted")
         self.injections = 0
         self._dirty = False            # 自上次 `take_dirty()` 以来是否有新事件落盘（D-3 的输入）
 
@@ -91,6 +145,18 @@ class ExperienceRuntime:
         """本会话是否往经验资产回写（只读模式：用经验但不沉淀）。"""
         return self.rule is not None and self.rule.enabled and self.rule.write
 
+    @property
+    def adopt_harvesting(self) -> bool:
+        """是否补采接管 / 离线平仓的往返（★ W-A 的独立总闸；关掉即逐字回退 `v1` 的只计数行为）。"""
+        return self.writing and bool(
+            getattr(self.settings, "ai_trade_experience_adopt_harvest_enabled", True))
+
+    def _note_gap(self, reason: str, count: int = 1) -> None:
+        """记一次采集缺口 + 它的原因（**两者必须同一处自增**，否则明细与总数对不上）。"""
+        self.harvest_gap += int(count)
+        if reason in self.harvest_reasons:
+            self.harvest_reasons[reason] += int(count)
+
     # ---------- 采集（挂在**已有** IO 点上，不新增 IO 面） ----------
     def note_open(self, trade: dict, *, seq: int, facts: ContextFacts) -> None:
         """开仓成交 ⇒ 冻结九轴语境（出场时体制可能已变，用出场语境标注入场决策的教训是错的）。"""
@@ -99,10 +165,27 @@ class ExperienceRuntime:
         slot = (str(trade.get("side") or ""), int(seq))
         if slot in self._open_slots:      # 部分成交：同一 epoch 不重新冻结
             return
-        self._open_slots[slot] = freeze_open_context(facts, seq=seq, now_wall=time.time())
-        while len(self._open_slots) > _OPEN_SLOT_CAP:      # ★ E-13：FIFO 淘汰，且**被看见**
-            self._open_slots.pop(next(iter(self._open_slots)))
-            self.harvest_gap += 1
+        self._open_slots[slot] = freeze_open_context(
+            facts, seq=seq, now_wall=time.time(), injected=self._injected_claims())
+        self._evict_slots()
+
+    def _injected_claims(self) -> tuple[tuple[str, str, int], ...]:
+        """本轮 wire 里 L0/L1 的 `(key, layer, claim_sign)`（★ W-C：注入台账的**唯一**取数点）。
+
+        `claim_sign` 取该经验此刻 `meanNetBps` 的符号——那正是它「断言」的方向。L2 反例**不计**：
+        它进的是反思轮，是复核证据，不是这一单的决策依据。
+        """
+        if not bool(getattr(self.settings, "ai_trade_experience_utility_enabled", True)):
+            return ()
+        wire = self._last_wire or {}
+        claims: list[tuple[str, str, int]] = []
+        for layer in ("l0", "l1"):
+            for item in wire.get(layer) or []:
+                node = (self.graph.nodes.get(item.get("key")) if self.graph else None)
+                mean = float((getattr(node, "stats", None) or {}).get("meanNetBps") or 0.0)
+                claims.append((str(item.get("key") or ""), layer,
+                               0 if mean == 0 else (1 if mean > 0 else -1)))
+        return tuple(claim for claim in claims if claim[0])
 
     def facts(self, trade: dict, *, market_context: dict | None, wake_kind: str | None,
               horizon_profile_id: str | None) -> ContextFacts:
@@ -134,21 +217,33 @@ class ExperienceRuntime:
         """
         if not self.writing:
             return
+        if trip is None:
+            # ★ W-A（H-3）· 接管仓在会话内被平掉时，`CostRuntime` 没有它的开仓断面
+            # （`note_open` 只挂在开仓成交上）⇒ `last_settled_trip()` 恒 None ⇒ 这一整类往返
+            # 只贡献一个 `harvestGap`。用本层自己的合成断面把**既有的**结算链补全。
+            trip = self._settle_adopted(trade, meta)
         opened = self._take_slot(trip)
         if trip is None or opened is None:
-            self.harvest_gap += 1
+            self._note_gap("noTrip" if trip is None else "noOpenContext")
             return
+        slot = (str(getattr(trip, "side", "") or ""), int(getattr(trip, "seq", 0) or 0))
+        adopted = slot in self._adopted_keys
+        self._adopted_keys.discard(slot)
         enriched = dict(meta or {})
         enriched["_costBasis"] = ("net" if getattr(self.settings, "ai_trade_net_pnl_enabled", False)
                                   else "gross")
-        event = build_event(opened, trip, enriched, self.identity)
+        event = build_event(opened, trip, enriched,
+                            self._adopted_identity if adopted else self.identity)
         if event is None:
-            self.harvest_gap += 1
+            self._note_gap("noTrip")
             return
         self._pending.append(event)
+        self._pending_injections.extend(_injection_rows(opened, event))
         self._session_events.append(event)
         del self._session_events[:-_SESSION_EVENT_CAP]
         self.events_harvested += 1
+        if adopted:
+            self.adopted_harvested += 1
 
     def _take_slot(self, trip):
         """取出并清掉该 `(side, seq)` 的开仓语境槽；找不到 ⇒ None（调用方计 `harvestGap`）。"""
@@ -167,6 +262,91 @@ class ExperienceRuntime:
             return None
         return self._open_slots.pop(matches[0])
 
+    def _evict_slots(self) -> None:
+        """★ E-13 · 开仓语境槽的 FIFO 淘汰，且**被看见**（每淘汰一个即计一次缺口）。"""
+        while len(self._open_slots) > _OPEN_SLOT_CAP:
+            key = next(iter(self._open_slots))
+            self._open_slots.pop(key)
+            self._adopted_snaps.pop(key, None)
+            self._adopted_keys.discard(key)
+            self._note_gap("slotEvicted")
+
+    # ---------- W-A · 接管 / 离线平仓的补采（两处 hook 都落在 `resume.py`） ----------
+    def adopt_open(self, adopted: AdoptedOpen | None) -> bool:
+        """接管持仓 ⇒ 合成开仓断面 + **降级**语境，存进与 `note_open` 同一张槽表。
+
+        沿用 `note_open` 的两条既有纪律：经验模式关掉时一个字都不写；同一 `(side, seq)` 已有槽
+        ⇒ 不重新冻结（部分成交 / 重入安全）。
+
+        Args:
+            adopted: `adopted.synth_from_contract` 或调用方直接装配的接管断面；`None` ⇒ 空转。
+
+        Returns:
+            是否真的建了槽（`False` = 未装配 / 已有槽 / 价量不可用）。
+        """
+        if not self.adopt_harvesting or adopted is None:
+            return False
+        slot = (str(adopted.side or ""), int(adopted.seq))
+        if slot in self._open_slots:
+            return False
+        snapshot = synth_open_snapshot(seq=adopted.seq, side=adopted.side, entry=adopted.entry,
+                                       open_fee_usd=adopted.open_fee_usd)
+        if snapshot is None:
+            self._note_gap("noOpenContext")
+            return False
+        signature = degraded_context(
+            inst_id=self.identity.inst_id, bar=self.identity.bar, side=adopted.side,
+            horizon_profile_id=adopted.horizon_profile_id)
+        self._open_slots[slot] = OpenContext(seq=int(adopted.seq), side=slot[0],
+                                             signature=signature, wall_ts=int(snapshot.ts))
+        self._adopted_snaps[slot] = (snapshot, float(adopted.ct_val or 0.0))
+        self._adopted_keys.add(slot)
+        self._evict_slots()
+        return True
+
+    async def note_offline_close(self, trade: dict | None, *, has_row: bool) -> None:
+        """暂停期**离线平仓**的补采（★ F-6 的正解：两条出口都覆盖）。
+
+        `resume.settle_closed_offline` 从交易所 `positions-history` 回读一笔平仓并**直接**
+        `append_live_trade`，完全不经 `session._dispatch`——而 `note_close` 与 `harvest_gap` 的
+        三个自增点全部在 `_dispatch` 驱动的链上。于是 `ExperienceCard` 上那句逐字写着
+        「另有 N 笔往返因续跑接管 / 暂停期离线平仓未能采集」在**后一半上恒为 0**：产品指名道姓
+        承诺会计的一个数，在其中一条路径上从来没有被计过。
+
+        Args:
+            trade: `_offline_exit_trade` 产出的那条平仓 trade；`None` ⇒ 这一笔采不到。
+            has_row: 交易所侧是否回读到了该 `posId` 的行——它把「采不到」分成两种**真实存在**的
+                原因：`offlineNoReadback`（根本没回读到）与 `offlineInconsistent`（回读到了但
+                增量不自洽，`_offline_exit_trade` 判否）。
+        """
+        if not self.adopt_harvesting:
+            return
+        if trade is None:
+            self._note_gap("offlineInconsistent" if has_row else "offlineNoReadback")
+            return
+        self.note_close(trade, (trade.get("explain") or {}).get("meta") or {}, None)
+        await self.persist_pending()
+
+    def _settle_adopted(self, trade: dict, meta: dict):
+        """用合成断面跑一次**既有的** `trip_ledger.settle`；没有断面 / 结算不出 ⇒ `None`。
+
+        **绝不新写一份 bps 换算**：口径（`net_mode` / `ct_val` / 双腿费 / `fee_known` 传染）
+        全部由 `settle()` 承担，本函数只负责把合成断面交给它（A-12 逐位断言）。
+
+        「**恰好只有一个**合成断面才取」沿用 `_take_slot` 的退化匹配纪律：一个会话至多接管一笔
+        持仓，多于一个就说明状态已经不可信，宁可缺一条并说明。
+        """
+        if len(self._adopted_snaps) != 1:
+            return None
+        slot, (snapshot, ct_val) = next(iter(self._adopted_snaps.items()))
+        trip = settle(snapshot, trade, SettleContext(
+            net_mode=bool(getattr(self.settings, "ai_trade_net_pnl_enabled", False)),
+            ct_val=float(ct_val or 0.0),
+            exit_source=str((meta or {}).get("exitSource") or "unknown")))
+        if trip is not None:
+            self._adopted_snaps.pop(slot, None)
+        return trip
+
     async def persist_pending(self) -> None:
         """把待落盘事件写进真源表（`INSERT OR IGNORE`）。**只做这一件事**（★ D-1 / 评审 F-1）。
 
@@ -183,17 +363,24 @@ class ExperienceRuntime:
         if not self._pending:
             return
         rows = [event.row() for event in self._pending]
+        injections = list(self._pending_injections)
         self._pending = []
+        self._pending_injections = []
         try:
             async with get_sessionmaker()() as session:
-                await repo.append_experience_events(session, rows)
+                # ★ W-C §4.6.1 · **同一次 commit**：两张表自然键逐字同源，中途失败必须两边都
+                # 没有新行。分两次提交会在崩溃窗口里留下「有事件、没台账」或反过来的半成品，
+                # 而那种偏差在效用统计上是完全静默的。
+                await repo.append_experience_events(session, rows, commit=False)
+                await repo.append_experience_injections(session, injections, commit=False)
+                await session.commit()
         except Exception as exc:  # noqa: BLE001 —— 见 docstring
             # **落盘失败必须被看见**（§十二 P7 的第一个问题：这处 `except` 失败时用户从哪里知道）。
             # 这些事件已经从 `_pending` 里取走、且 `events_harvested` 早在 `note_close` 就加过了
             # ——不补这一笔，会话卡会说「已沉淀 N 条」而库里只有 N-k 条，差额无人可见。
             # 记进 `harvest_gap` 的语义恰好对：**这张表因此偏乐观了 k 笔**，与续跑 / 离线平仓
             # 那两条采集缺口是同一个口径，也共用 §7.1 与 §7.3 的同一处渲染落点。
-            self.harvest_gap += len(rows)
+            self._note_gap("persistFailed", len(rows))
             logger.warning("ai-trade experience events not persisted (%d lost): %s",
                            len(rows), exc)
             return
@@ -243,16 +430,29 @@ class ExperienceRuntime:
         best-effort：失败只 warning，绝不阻断真实资金的停止收尾。
         """
         delta = self.harvest_gap - self._persisted_gap
-        if delta <= 0:
+        adopted_delta = self.adopted_harvested - self._persisted_adopted
+        reason_delta = {key: self.harvest_reasons[key] - self._persisted_reasons[key]
+                        for key in HARVEST_REASONS}
+        if delta <= 0 and adopted_delta <= 0 and not any(reason_delta.values()):
             return
         try:
             async with get_sessionmaker()() as session:
                 prior = int((await repo.get_app_setting(session, HARVEST_GAP_KEY, 0)) or 0)
-                await repo.set_app_setting(session, HARVEST_GAP_KEY, prior + delta)
+                await repo.set_app_setting(session, HARVEST_GAP_KEY, prior + max(0, delta))
+                totals = await repo.get_app_setting(session, HARVEST_TOTALS_KEY, {})
+                totals = dict(totals) if isinstance(totals, dict) else {}
+                reasons = totals.get("reasons")
+                reasons = dict(reasons) if isinstance(reasons, dict) else {}
+                totals["adopted"] = int(totals.get("adopted") or 0) + max(0, adopted_delta)
+                totals["reasons"] = {key: int(reasons.get(key) or 0) + max(0, reason_delta[key])
+                                     for key in HARVEST_REASONS}
+                await repo.set_app_setting(session, HARVEST_TOTALS_KEY, totals)
         except Exception as exc:  # noqa: BLE001 —— 见 docstring
             logger.warning("ai-trade experience harvest gap not persisted: %s", exc)
             return
         self._persisted_gap = self.harvest_gap
+        self._persisted_adopted = self.adopted_harvested
+        self._persisted_reasons = dict(self.harvest_reasons)
 
     # ---------- 注入（决策轮零 IO，不变式 I-3） ----------
     def inject(self, payload: dict, *, seed: ContextSeed) -> None:
@@ -391,7 +591,11 @@ class ExperienceRuntime:
                 "tier": wire.get("tier"), "l0": len(wire.get("l0") or []),
                 "l1": len(wire.get("l1") or []), "injections": self.injections,
                 "chars": self._chars(), "eventsHarvested": self.events_harvested,
+                # 标量 `harvestGap` **保留一个版本**：`lib/store.ts` 的运行中卡片是逐键手抄装配，
+                # 桌面端旧包与新后端并存时删旧键会让那张卡直接空掉（`v1:I-7` 的成文教训）。
                 "harvestGap": self.harvest_gap,
+                "harvest": {"gap": self.harvest_gap, "adopted": self.adopted_harvested,
+                            "reasons": dict(self.harvest_reasons)},
                 "graphAsOfTs": self.graph_as_of_ts}
 
     @property

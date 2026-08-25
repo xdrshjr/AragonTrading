@@ -28,6 +28,15 @@ from ..wake_reason import WAKE_KINDS
 
 UNKNOWN = "unknown"
 
+# 词表 / 轴集 / 折叠规则 / 模板集的版本号。**改动其中任何一项都必须 +1**：桶身份与语境标签都由
+# 它们决定，而 W-B 的增量物化是在**旧桶上继续累加**的——版本变了却按老桶累加，图与代码的语义会
+# 永久错位且完全静默（B-1 判据的唯一输入，见 `experience/incremental.py`）。
+#
+# 1 = `8e05dd9` 交付的初版；
+# 2 = ai-trade-experience-compounding：`describe` 拼轴名（J-3）、`(轴,取值)` 词表（J-3b）、
+#     `_combos_for` 跳过 `unknown` / 缺席轴（J-4）——三者都改变了桶身份或标签。
+TAXONOMY_VERSION = 2
+
 # 轴 id 一律小写蛇形（`canonical_key` 直接拼），wire 侧的 camelCase 映射见 `AXIS_WIRE`。
 AXIS_SYMBOL = "symbol"
 AXIS_BAR = "bar"
@@ -112,6 +121,18 @@ VALUE_LABEL_ZH: dict[str, str] = {
 # 「持仓盯market」是一处笔误的物理防线：常量表在这里被逐条读过一遍。
 VALUE_LABEL_ZH["position_watch"] = "持仓盯市"
 
+# ★ J-3b（评审 R-8）· 按 `(轴, 取值)` 取词的覆盖表；`VALUE_LABEL_ZH` 是按**取值**查的单表，
+# 而 `none` / `unknown` / `low` / `mid` / `high` 这几个取值在**多条轴**上都合法。
+# 实测 `label_of(AXIS_HORIZON, "none")` 返回「无事件」——一个关于持仓周期的桶被描述成一个关于
+# 行情事件的事实。它不会报错，只会把一句不实的话逐字写进喂给模型的 prompt（`v1:I-9`）。
+#
+# 只登记「单表那个词会读错」的组合；其余组合按取值查表即可（轴名前缀已经把它们区分开）。
+AXIS_VALUE_LABEL_ZH: dict[tuple[str, str], str] = {
+    (AXIS_HORIZON, "none"): "不限",          # 未选周期档 ≠ 没有行情事件
+    (AXIS_HORIZON, UNKNOWN): "周期未知",
+    (AXIS_EXIT, UNKNOWN): "来源未知",         # `exit` 的 unknown 是「没打上退出来源标」
+}
+
 
 def canonical_key(axis: str, value: str) -> str:
     """语境节点的稳定 key：`axis:value`（轴名小写、取值原样）。
@@ -170,19 +191,44 @@ def confidence_band(value) -> str:
 
 
 def label_of(axis: str, value: str) -> str:
-    """语境的中文展示名（`高波动`）；未登记的取值原样回显（标的名走这条路）。"""
-    return VALUE_LABEL_ZH.get(str(value), str(value))
+    """语境的中文展示名；**先按 `(轴, 取值)` 取词**，再回落到按取值的单表（★ J-3b / E-8）。
+
+    只按取值取词会让 `horizon="none"` 渲染成「无事件」——一句关于持仓周期的事实被写成一句
+    关于行情事件的事实。它不会报错，只会逐字进 prompt。
+
+    Args:
+        axis: `AXES` 中的轴 id。
+        value: 该轴的取值。
+
+    Returns:
+        中文展示名；未登记的取值原样回显（标的名走这条路）。
+    """
+    hit = AXIS_VALUE_LABEL_ZH.get((str(axis), str(value)))
+    return hit if hit is not None else VALUE_LABEL_ZH.get(str(value), str(value))
 
 
 def describe(signature: dict) -> str:
-    """把一个语境签名压成一句人读的短语（`高波动+突破 做多`），供模板与 UI 共用。
+    """签名 → 人读短语（`体制·震荡+方向·做多`）；对签名的**非 symbol/bar 部分**单射（★ J-3 ①）。
 
-    刻意**不含标的与周期**：它们由模板的前缀单独渲染（`{标的} {周期} · {语境}`），
-    在这里重复一次会让 120 字上限被两遍标的名吃掉。
+    ★ **J-3 / F-2 · 此前只拼取值、且静默丢掉 `unknown` 轴**，于是两件事同时发生：
+      ① `{...,event:"none"}` 与 `{...,horizon:"none"}` 渲染成**逐字相同**的一句话——同一份
+         prompt 里因此可以出现两行一模一样的「铁律」，而 MMR 去冗比的是签名不是渲染结果，
+         对这种形态天生看不见；
+      ② 丢掉 `unknown` 轴让标签**声称的范围大于它实际的支撑**（「BTC 15m · 做多」其实只覆盖
+         体制未知的那一部分）。J-4 从桶枚举那一侧根治了 ②，本函数负责 ①。
+
+    **刻意仍不含标的与周期**：它们由 `aggregate._prefix` 渲染，在这里重复一次会白吃 22 字预算；
+    整条签名的单射性由 `_prefix` 承担（★ J-3 ②）。
+
+    Args:
+        signature: 语境签名（`{轴: 取值}`）。
+
+    Returns:
+        `轴名·取值` 以 `+` 连接的短语；非 symbol/bar 轴一条都没有 ⇒ `"全局"`。
     """
-    parts = [label_of(axis, signature[axis]) for axis in AXES
-             if axis in signature and axis not in (AXIS_SYMBOL, AXIS_BAR)
-             and signature[axis] != UNKNOWN]
+    parts = [f"{AXIS_LABEL_ZH.get(axis, axis)}·{label_of(axis, signature[axis])}"
+             for axis in AXES
+             if axis in signature and axis not in (AXIS_SYMBOL, AXIS_BAR)]
     return "+".join(parts) if parts else "全局"
 
 

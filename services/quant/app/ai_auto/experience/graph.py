@@ -29,7 +29,8 @@ from .aggregate import (
     lesson_key,
     render_label,
 )
-from .promote import PromoteRule, evidence_weight, resolve_scope, resolve_tier, roll_sign
+from .accumulate import BucketAccumulator, HistSpec, to_stats
+from .promote import PromoteRule, SignRoll, evidence_weight, resolve_scope, resolve_tier, roll_sign
 
 REL_APPLIES_IN = "applies_in"
 REL_CO_OCCURS = "co_occurs"
@@ -75,6 +76,23 @@ class GraphEdge:
     rel: str
     weight: float = 0.0
     support: int = 0
+
+
+@dataclass(frozen=True)
+class ContextCounts:
+    """语境计数器：`context` 节点的 `support` 与 `co_occurs` 的 NPMI **唯一**共用的输入。
+
+    把它从「事件列表」里抽出来，是 W-B 增量化的第二块承重墙（第一块是 `applies_in_edges` 不再
+    回看事件）：有了 `(single, pairs, total)` 三个可合并的计数，`co_occurs` 就再也不需要重扫
+    历史事件了。**全量与增量共用同一个下游函数**，两条路径因此不可能算出不同的边。
+
+    `total` 是**参与统计的事件总条数**——`_npmi` 的分母。增量侧它来自 epoch 状态的 `eventCount`；
+    少了它，增量算出的 NPMI 与全量不可能相等（★ E-10）。
+    """
+
+    single: dict[str, int] = field(default_factory=dict)
+    pairs: dict[tuple[str, str], int] = field(default_factory=dict)
+    total: int = 0
 
 
 @dataclass
@@ -165,41 +183,100 @@ class MaterializeOptions:
 
 
 def materialize(events: list[EventView], options: MaterializeOptions,
-                existing: dict[str, GraphNode] | None = None) -> MaterializedGraph:
+                existing: dict[str, GraphNode] | None = None, *,
+                cuts: dict | None = None) -> MaterializedGraph:
     """事件全集 → 物化计划（**纯函数**：同一批事件恒得同一份计划，A-15 的幂等由此而来）。
 
     Args:
-        events: 参与统计的事件（调用方已按 `origin='live'` 过滤）。
+        events: 参与统计的事件（调用方已按 `STAT_ORIGINS` 过滤，★ E-2）。
         options: 阈值与上限。
         existing: 库里既有的经验节点（按 key），用于前滚 `prev_sign` / `sign_streak` 与
             保留 `first_ts`。缺席即视作首次物化。
+        cuts: **冻结的**成本分位；缺席即按本批事件现算。W-B 的等价预言机（G-10）必须能用
+            「与增量同一份分位」跑一次全量——`costRegime` 决定桶身份，分位不同则两条路径比的
+            根本不是同一批桶，那种「红」说明不了任何问题。
 
     Returns:
         `MaterializedGraph`：待 upsert 的节点（语境 + 经验）、全量重算的边、分位点缓存。
     """
     prior = existing or {}
-    cuts = cost_regime_cuts(events, min_samples=options.cost_regime_min_samples)
+    if cuts is None:
+        cuts = cost_regime_cuts(events, min_samples=options.cost_regime_min_samples)
     buckets = enumerate_buckets(events, cuts)
     plan = MaterializedGraph(cost_regime_cuts=cuts)
-    lessons: list[tuple[GraphNode, Bucket]] = []
+    lessons: list[tuple[GraphNode, Bucket, int]] = []
     for key in sorted(buckets):                        # 决定性：按 bucket key 全序
         bucket = buckets[key]
         stats = compute_stats(bucket, events, cuts)
         if stats.n <= 0:
             continue
         node = _lesson_node(bucket, stats, options.rule, prior)
-        lessons.append((node, bucket))
+        lessons.append((node, bucket, len(bucket.event_ids)))
+    _assemble(plan, lessons, context_counts(events, cuts), options, prior)
+    return plan
+
+
+@dataclass(frozen=True)
+class AccumulatorPlan:
+    """一次增量物化的**全部输入**（聚合形参，满足 CLAUDE.md「形参 ≤5」）。
+
+    `roll_keys` 是**本批真被新事件碰过**的桶 key 集合；`None` ⇒ 全部前滚（全量语义）。
+    ★ J-2b：未被碰过的桶 `sign_streak` **冻结**——把「连续两次重算同号」换成「连续两个批次
+    同号」等于凭空造出一条**自动升档**路径，而 J-1 明令禁止这个方向。
+    """
+
+    entries: list[tuple[Bucket, BucketAccumulator]]
+    counts: ContextCounts
+    spec: HistSpec = field(default_factory=HistSpec)
+    roll_keys: set[str] | None = None
+
+
+def materialize_from_accumulators(plan: AccumulatorPlan, options: MaterializeOptions,
+                                  existing: dict[str, GraphNode] | None = None
+                                  ) -> MaterializedGraph:
+    """**桶累加器**全集 → 物化计划（W-B 的入口，与 `materialize` 共用同一段装配）。
+
+    这条路径**一条事件都不读**：`applies_in` 由签名产（★ E-1）、`co_occurs` 与 `context.support`
+    由语境计数器产（★ E-10）、`contradicts` 由节点表两两比。这正是「一次物化的成本与库大小
+    近似无关」这句话的全部依据（G-15 实测：50000 条事件的库上，全量 31817ms / 增量 287ms）。
+
+    Args:
+        plan: 本次增量的全部输入（桶累加器 / 语境计数器 / 直方图旋钮 / 前滚集合）。
+        options: 阈值与上限。
+        existing: 库里既有的经验节点（按 key）。
+
+    Returns:
+        与全量路径**逐值等价**的 `MaterializedGraph`（G-10 机械钉死；`cost_regime_cuts` 由调用方填）。
+    """
+    prior = existing or {}
+    roll_keys = plan.roll_keys
+    lessons: list[tuple[GraphNode, Bucket, int]] = []
+    for bucket, accumulator in sorted(plan.entries, key=lambda item: item[0].key):
+        stats = to_stats(accumulator, bucket, spec=plan.spec)
+        if stats.n <= 0:
+            continue
+        node = _lesson_node(bucket, stats, options.rule, prior,
+                            roll=(roll_keys is None or bucket.key in roll_keys))
+        lessons.append((node, bucket, accumulator.total))
+    out = MaterializedGraph()
+    _assemble(out, lessons, plan.counts, options, prior)
+    return out
+
+
+def _assemble(plan: MaterializedGraph, lessons: list[tuple[GraphNode, Bucket, int]],
+              counts: ContextCounts, options: MaterializeOptions,
+              prior: dict[str, GraphNode]) -> None:
+    """截断 → 节点 → 四类边 → 接回非 stat 经验（**全量与增量共用**，故两者不可能装配出不同的图）。"""
     lessons.sort(key=lambda item: (-item[0].weight, item[0].key))
     lessons = lessons[:max(1, options.node_cap)]
-    plan.nodes.extend(node for node, _ in lessons)
-    plan.seen_lesson_keys = {node.key for node, _ in lessons}
-    context_support = _context_support(events, cuts)
-    plan.nodes.extend(_context_nodes(context_support))
-    plan.edges.extend(_applies_in_edges(lessons, events, cuts))
-    plan.edges.extend(_co_occurs_edges(events, cuts, options))
-    plan.edges.extend(_contradicts_edges([node for node, _ in lessons], options.rule))
+    plan.nodes.extend(node for node, _bucket, _total in lessons)
+    plan.seen_lesson_keys = {node.key for node, _bucket, _total in lessons}
+    plan.nodes.extend(_context_nodes(counts.single))
+    plan.edges.extend(applies_in_edges(
+        [(node, bucket.signature, total) for node, bucket, total in lessons]))
+    plan.edges.extend(co_occurs_edges(counts, options))
+    plan.edges.extend(_contradicts_edges([node for node, _b, _t in lessons], options.rule))
     _attach_seeded_lessons(plan, prior, options)          # ★ E-2（评审 P0-2）
-    return plan
 
 
 _SEEDED_SOURCES = ("narrative", "manual", "imported")
@@ -248,12 +325,24 @@ def _attach_seeded_lessons(plan: MaterializedGraph, prior: dict[str, GraphNode],
 
 
 def _lesson_node(bucket: Bucket, stats: BucketStats, rule: PromoteRule,
-                 prior: dict[str, GraphNode]) -> GraphNode:
-    """一个桶 → 一个经验节点（含符号历史前滚与用户意志保留）。"""
+                 prior: dict[str, GraphNode], *, roll: bool = True) -> GraphNode:
+    """一个桶 → 一个经验节点（含符号历史前滚与用户意志保留）。
+
+    Args:
+        bucket: 桶身份。
+        stats: 该桶的统计量。
+        rule: 晋升判据。
+        prior: 库里既有的经验节点（按 key）。
+        roll: 是否前滚符号连续性。★ J-2b：增量步只对**本批真被碰过**的桶前滚，未被碰过的桶
+            `sign_streak` 冻结——否则「一次重算」被切成「七个批次」就等于把 `iron` 的第三道
+            门槛悄悄放宽七倍，那是 J-1 明令禁止的自动升档方向。
+    """
     key = lesson_key(bucket, stats.template)
     old = prior.get(key)
-    roll = roll_sign(old.prev_sign if old else 0, old.sign_streak if old else 0,
-                     stats.meanNetBps)
+    roll = (roll_sign(old.prev_sign if old else 0, old.sign_streak if old else 0,
+                      stats.meanNetBps) if roll
+            else SignRoll(sign=(old.prev_sign if old else 0),
+                          streak=(old.sign_streak if old else 0), flipped=False))
     stats.prevSign = roll.sign
     stats.signStreak = roll.streak
     wire = stats.wire()
@@ -268,7 +357,11 @@ def _lesson_node(bucket: Bucket, stats: BucketStats, rule: PromoteRule,
         mute_reason=(old.mute_reason if old else None),
         support=stats.n, weight=evidence_weight(wire, rule),
         stats=wire, signature=dict(bucket.signature),
-        first_ts=(old.first_ts if old and old.first_ts else stats.firstTs),
+        # ★ E-12（评审 R-12）· `first_ts` 必须是一个**与批次顺序无关**的单调量。
+        # 此前是 `old.first_ts if old and old.first_ts else stats.firstTs`：全量取全批最小值，
+        # 而增量取第一批的最小值 ⇒ 两者在批次乱序时必然不等（G-10 恒红）。取 `min` 既保住
+        # 「首次出现时刻不被重算抹掉」这条原意，又让它顺序无关。这是一次纯改进，全量同样受益。
+        first_ts=min(old.first_ts, stats.firstTs) if (old and old.first_ts) else stats.firstTs,
         last_seen_ts=stats.lastTs, prev_sign=roll.sign, sign_streak=roll.streak,
         id=(old.id if old else 0))
     if roll.flipped:
@@ -279,15 +372,23 @@ def _lesson_node(bucket: Bucket, stats: BucketStats, rule: PromoteRule,
     return node
 
 
-def _context_support(events: list[EventView], cuts: dict) -> dict[str, tuple[str, str, int]]:
-    """每个 `axis:value` 语境的支撑事件数（语境节点的 `support`）。"""
-    out: dict[str, tuple[str, str, int]] = {}
+def context_counts(events: list[EventView], cuts: dict) -> ContextCounts:
+    """事件全集 → 语境计数器（单点计数 + 共现计数 + 事件总数）。
+
+    **全量侧的产出点**；增量侧由 `ai_experience_context_counts` 表把同一组数累加起来。两条路径
+    喂给 `_context_nodes` / `co_occurs_edges` 的是同一个结构，故不可能算出不同的支撑或边权。
+    """
+    single: dict[str, int] = {}
+    pairs: dict[tuple[str, str], int] = {}
     for event in events:
-        for axis, value in _event_axes(event, cuts).items():
-            key = tax.canonical_key(axis, value)
-            axis_v, value_v, count = out.get(key, (axis, value, 0))
-            out[key] = (axis_v, value_v, count + 1)
-    return out
+        keys = sorted(tax.canonical_key(axis, value)
+                      for axis, value in _event_axes(event, cuts).items())
+        for key in keys:
+            single[key] = single.get(key, 0) + 1
+        for index, left in enumerate(keys):
+            for right in keys[index + 1:]:
+                pairs[(left, right)] = pairs.get((left, right), 0) + 1
+    return ContextCounts(single=single, pairs=pairs, total=len(events))
 
 
 def _event_axes(event: EventView, cuts: dict) -> dict[str, str]:
@@ -301,56 +402,58 @@ def _event_axes(event: EventView, cuts: dict) -> dict[str, str]:
     return {axis: value for axis, value in axes.items() if axis in tax.AXES}
 
 
-def _context_nodes(support: dict[str, tuple[str, str, int]]) -> list[GraphNode]:
-    return [GraphNode(key=key, kind="context", axis=axis, value=value, source="context",
-                      label=f"{tax.AXIS_LABEL_ZH.get(axis, axis)}·{tax.label_of(axis, value)}",
-                      support=count, weight=1.0, tier="normal")
-            for key, (axis, value, count) in sorted(support.items())]
+def _context_nodes(single: dict[str, int]) -> list[GraphNode]:
+    """单点计数 → 语境节点（`axis:value` 里轴名不含冒号，故按第一个冒号切一定是对的）。"""
+    nodes = []
+    for key, count in sorted(single.items()):
+        axis, _sep, value = str(key).partition(":")
+        nodes.append(GraphNode(
+            key=key, kind="context", axis=axis, value=value, source="context",
+            label=f"{tax.AXIS_LABEL_ZH.get(axis, axis)}·{tax.label_of(axis, value)}",
+            support=int(count), weight=1.0, tier="normal"))
+    return nodes
 
 
-def _applies_in_edges(lessons: list[tuple[GraphNode, Bucket]], events: list[EventView],
-                      cuts: dict) -> list[GraphEdge]:
-    """`applies_in(lesson → context)`：`w = 桶内该语境的事件数 / 桶的事件数`。
+def applies_in_edges(lessons: list[tuple[GraphNode, dict, int]]) -> list[GraphEdge]:
+    """`applies_in(lesson → context)`：**权重恒为 1.0**，由签名直接产出，**不看事件**。
 
-    一阶桶恒为 1；高阶桶给出该语境在这条经验里的份额——于是决策轮拿不到 `side` 时（评审 P1-2），
-    不匹配的轴自然减权，无需任何额外补丁。
+    ★ **E-1（F-5 上半）· 此前的实现是在为一个常量做 `Σ|events|×11` 次扫描。** 它的 docstring
+    声称 `w = 桶内该语境的事件数 / 桶的事件数`「给出该语境在这条经验里的份额」，但
+    `enumerate_buckets` 是按「事件签名的**子集**」建桶的——桶内每一条事件在桶的每一条签名轴上
+    取值都等于桶的取值，分子恒等于分母（实测 `APPLIES_IN distinct weights: [1.0]`）。
+
+    ⚠️ **这条修法是 W-B 的承重墙**：删掉它之后，四类边全部可以由「节点表 + 语境计数器」推出，
+    增量物化因此**完全不需要回看历史事件**。
+
+    ★ **E-15（评审 R-15）· `support` 的口径必须保住。** 既有实现写的是「桶内该语境的事件数
+    （含被 `v1:I-7` 排除的）」，而这一列随 `GET /api/experience/graph` 下发给图谱画布。按上面
+    那条恒等式，它逐值等于**桶的事件总数**——故本函数收 `total` 而不是 `node.support`
+    （后者是 `stats.n`，**只数合格者**，换了语义而没人说）。累加器侧用 `n + excluded` 还原它。
+
+    Args:
+        lessons: `(经验节点, 桶签名, 桶的事件总数)` 三元组。
+
+    Returns:
+        每条经验 × 它签名上每一条轴的 `applies_in` 边。
     """
-    edges: list[GraphEdge] = []
-    for node, bucket in lessons:
-        total = len(bucket.event_ids)
-        if total <= 0:
-            continue
-        counts: dict[str, int] = {}
-        for index in bucket.event_ids:
-            for axis, value in _event_axes(events[index], cuts).items():
-                counts[tax.canonical_key(axis, value)] = counts.get(
-                    tax.canonical_key(axis, value), 0) + 1
-        for context_key in sorted(bucket.signature):
-            key = tax.canonical_key(context_key, bucket.signature[context_key])
-            edges.append(GraphEdge(src_key=node.key, dst_key=key, rel=REL_APPLIES_IN,
-                                   weight=round(counts.get(key, 0) / total, 6),
-                                   support=counts.get(key, 0)))
-    return edges
+    return [GraphEdge(src_key=node.key, dst_key=tax.canonical_key(axis, signature[axis]),
+                      rel=REL_APPLIES_IN, weight=1.0, support=int(total))
+            for node, signature, total in lessons
+            for axis in sorted(signature)]
 
 
-def _co_occurs_edges(events: list[EventView], cuts: dict,
-                     options: MaterializeOptions) -> list[GraphEdge]:
+def co_occurs_edges(counts: ContextCounts, options: MaterializeOptions) -> list[GraphEdge]:
     """`co_occurs(context ↔ context)`：归一化点互信息（npmi > 0 且支撑数 ≥ `co_min_support`）。
 
     只做**一跳**扩散的理由写在 `retrieval` 里；这里只负责把边算对。无向边存两条有向边。
+
+    ★ E-10：分母 `counts.total` 必须是**已折进累加器的事件总条数**。增量侧它来自 epoch 状态的
+    `eventCount`——没有这个数，增量算出的 NPMI 与全量不可能相等（G-10 的边断言必红）。
     """
-    total = len(events)
+    total = int(counts.total)
     if total <= 0:
         return []
-    single: dict[str, int] = {}
-    pairs: dict[tuple[str, str], int] = {}
-    for event in events:
-        keys = sorted(tax.canonical_key(a, v) for a, v in _event_axes(event, cuts).items())
-        for key in keys:
-            single[key] = single.get(key, 0) + 1
-        for i, left in enumerate(keys):
-            for right in keys[i + 1:]:
-                pairs[(left, right)] = pairs.get((left, right), 0) + 1
+    single, pairs = counts.single, counts.pairs
     edges: list[GraphEdge] = []
     for (left, right), support in sorted(pairs.items()):
         if support < options.co_min_support:

@@ -16,6 +16,8 @@ import {
 const HEALTH = {
   lastTs: 1_700_000_000, lastMs: 1234, events: 2043,
   slow: false, torn: false, overflow: false,
+  // ★ W-B 的三个可见性键（compounding §5.2）：`mode` / `fullReason` / `pendingEvents`。
+  mode: "full" as const, fullReason: null, pendingEvents: 0,
 };
 
 describe("经验模式默认值", () => {
@@ -65,6 +67,35 @@ describe("诚实性注记（I-8 的渲染载体）", () => {
   it("库是空的（从未重建过）⇒ 一条注记都不渲染", () => {
     expect(honestyNotes({ health: null, excludedByCostBasis: 0, harvestGapTotal: 0 }))
       .toEqual([]);
+  });
+
+  it("走增量时那一行必须说「增量」并如实报出待处理条数（W-B 的可见性键）", () => {
+    const notes = honestyNotes({
+      health: { ...HEALTH, mode: "incremental", fullReason: null, pendingEvents: 42 },
+      excludedByCostBasis: 0, harvestGapTotal: 0,
+    });
+    expect(notes[0].text).toContain("增量");
+    expect(notes[0].text).toContain("待处理 42 条");
+  });
+
+  it("回全量时必须说出**是哪一条判据**把它打回去的（否则用户无从判断）", () => {
+    const notes = honestyNotes({
+      health: { ...HEALTH, mode: "full", fullReason: "cuts_drift" },
+      excludedByCostBasis: 0, harvestGapTotal: 0,
+    });
+    expect(notes[0].text).toContain("成本分位漂移");
+  });
+
+  it("补采与自动静音各有一句人话，且措辞不得暗示因果（J-5）", () => {
+    const notes = honestyNotes({
+      health: HEALTH, excludedByCostBasis: 0, harvestGapTotal: 5,
+      adoptedTotal: 2, utilityMuted: 3,
+    }).map((n) => n.text);
+    expect(notes.some((t) => t.includes("2 笔已由「接管补采」"))).toBe(true);
+    const muted = notes.find((t) => t.includes("3 条经验"));
+    expect(muted).toBeTruthy();
+    expect(muted).toContain("共现关系，不是因果");
+    expect(muted).not.toMatch(/贡献|带来|因此赚|导致盈利/);
   });
 });
 

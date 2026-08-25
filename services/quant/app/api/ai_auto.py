@@ -341,7 +341,7 @@ async def build_start_request(session: AsyncSession, settings: Settings,
         body.discipline, settings, spec_count=len(specs), priming_bars=body.primingBars)
     # 经验层 W-1（★ E-3 / 评审 P0-3）：**必须排在 `_resolve_discipline` 之后**——纪律预设把
     # `settings` 换成了派生副本，早一步读到的是旧对象。本步在其结果上**再派生一次**，把设置中心
-    # 那 12 项可写阈值（`app_settings["experience.*"]`）并回 `Settings`；没有这一座桥，那个面板就是
+    # 那 15 项可写阈值（`app_settings["experience.*"]`）并回 `Settings`；没有这一座桥，那个面板就是
     # 一个用户改得动、系统永远不读、而且不报错的假面板（不变式 I-10，用例 A-41）。
     settings = await resolve_experience_settings(session, settings)
     experience_rule = resolve_experience(

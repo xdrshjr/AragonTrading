@@ -10,15 +10,18 @@ import { timeoutFor, withTimeout } from "./httpTimeout";
 import type {
   ExperienceFilters,
   ExperienceGraphView,
+  ExperienceHealth,
   ExperienceImportResult,
   ExperienceLessonPage,
   ExperienceNode,
   ExperienceNodeDetail,
   ExperienceOverview,
   ExperiencePreview,
+  ExperiencePruneResult,
   ExperienceRebuildResult,
   ExperienceSettings,
   ExperienceSettingsPatch,
+  ExperienceUtilityPage,
 } from "./experienceTypes";
 
 const BASE = "/api/py";
@@ -93,10 +96,31 @@ export const experienceApi = {
   remove: (nodeId: number) =>
     request<void>(`/experience/nodes/${nodeId}`, { method: "DELETE" }),
 
-  /** 手动重建（长跑档；CPU 段在后端走线程池）。 */
-  rebuild: () =>
+  /**
+   * 手动重建（长跑档；CPU 段在后端走线程池）。
+   *
+   * `scope="stat"`（默认）= 智能：由增量物化的五条判据自选增量还是全量。
+   * `scope="full"` = **强制**全量并 `epoch+1`——它是增量算错时的兜底出口。
+   */
+  rebuild: (scope: "stat" | "full" = "stat") =>
     request<ExperienceRebuildResult>("/experience/rebuild", {
-      method: "POST", body: JSON.stringify({ scope: "stat" }),
+      method: "POST", body: JSON.stringify({ scope }),
+    }),
+
+  /** 物化健康 + epoch 现状 + 已自动静音条数（**轮询专用**；`overview` 会扫整张节点表）。 */
+  health: () => request<ExperienceHealth>("/experience/health"),
+
+  /** 效用面板：「这条经验被喂进去之后，那些单后来怎么样」（共现，不是因果）。 */
+  utility: (filters: { instId?: string; bar?: string; minInjected?: number; limit?: number }) =>
+    request<ExperienceUtilityPage>(`/experience/utility${query(filters)}`),
+
+  /**
+   * 清理沉降经验。**必须先 `dryRun` 再确认**——这是一个删除操作，默认值站在「先看一眼」那侧。
+   * 它落写路径超时档：超时要说「结果未知，请刷新核对」而不是「失败」。
+   */
+  prune: (dryRun: boolean) =>
+    request<ExperiencePruneResult>("/experience/prune", {
+      method: "POST", body: JSON.stringify({ scope: "stale", dryRun }),
     }),
 
   /** 检索预演——「Agent 下一轮会看到什么」的逐字答案。 */

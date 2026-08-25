@@ -8,8 +8,11 @@ import {
   formatTStat,
   relativeTime,
   tierLabel,
+  utilityCellText,
 } from "@/lib/experience";
-import type { ExperienceNode } from "@/lib/experienceTypes";
+import type { ExperienceNode, ExperienceUtility } from "@/lib/experienceTypes";
+
+type LessonRow = ExperienceNode & { utility?: ExperienceUtility };
 
 /**
  * 列表视图 —— 图谱的**无障碍等价形态**。
@@ -26,7 +29,7 @@ export default function ExperienceList({
   onMute,
   onDelete,
 }: {
-  items: ExperienceNode[];
+  items: LessonRow[];
   total: number;
   loading: boolean;
   onOpen: (node: ExperienceNode) => void;
@@ -61,6 +64,12 @@ export default function ExperienceList({
               <th scope="col" className="px-2 py-2 text-right font-medium">净额均值</th>
               <th scope="col" className="px-2 py-2 text-right font-medium">t</th>
               <th scope="col" className="px-2 py-2 font-medium">最近证据</th>
+              {/* ★ W-C · 「注入之后那些单表现如何」。**共现，不是因果**（J-5）。 */}
+              <th scope="col" className="px-2 py-2 font-medium">
+                <abbr title="这条经验被喂进决策轮之后，那些开了仓的往返表现如何。这是共现关系，不是因果——我们无法确认模型是否真的采纳了它。">
+                  注入后表现
+                </abbr>
+              </th>
               <th scope="col" className="px-2 py-2 font-medium">操作</th>
             </tr>
           </thead>
@@ -100,6 +109,18 @@ export default function ExperienceList({
                   {formatTStat((node.stats as Record<string, unknown>).tStat)}
                 </td>
                 <td className="px-2 py-2 text-[var(--muted)]">{relativeTime(node.lastSeenTs)}</td>
+                <td
+                  className="whitespace-nowrap px-2 py-2 text-[var(--muted)]"
+                  data-testid="experience-list-utility"
+                  // 形状编码：已自动静音的行在这一格左侧带一条竖线，颜色绝不单独承载语义。
+                  style={node.muteReason === "ineffective"
+                    ? { borderLeft: "2px solid var(--warn)" }
+                    : undefined}
+                  title={node.utility ? undefined : "尚未在任何一次开仓时被注入"}
+                >
+                  {node.muteReason === "ineffective" ? "⚠ 已自动静音 · " : ""}
+                  {utilityCellText(node.utility)}
+                </td>
                 <td className="whitespace-nowrap px-2 py-2">
                   <Button variant="ghost" size="sm" onClick={() => onPin(node)}>
                     {node.pinned ? "取消置顶" : "置顶"}

@@ -24,7 +24,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from ...db import repositories as repo
+from . import incremental
 from . import taxonomy as tax
+# 「物化健康读数」整块住在 `incremental.py`（它就是 mode / fullReason / pendingEvents 的产地），
+# 这里**再导出**而不是让六个调用点改 import——`importing.py` 是同一条纪律的成文先例。
+from .incremental import (  # noqa: F401
+    _debounce_ok, _note_materialized, _note_torn, _read_health, _write_health, health_view)
 from .aggregate import EventView
 from .disclosure import budget_floor, build_wire, experience_tier, format_l0, format_l1
 from .graph import (
@@ -42,7 +47,7 @@ from .rules import ExperienceRule
 logger = logging.getLogger(__name__)
 
 COST_CUTS_KEY = "experience.cost_regime_cuts"
-HEALTH_KEY = "experience.materialize_health"      # ★ F-2 的规模墙露出点（六个键，I-8）
+HEALTH_KEY = incremental.HEALTH_KEY   # 规模墙 / 增量模式的露出点（九个键，I-8）；产地在 incremental
 DIRTY_KEY = "experience.dirty"                    # ★ E-5：脏标志必须能跨进程活下来
 HARVEST_GAP_KEY = "experience.harvest_gap_total"  # ★ E-8：`harvestGapTotal` 的唯一取数来源
 REJECTED_KEY = "experience.rejected_narrative"
@@ -60,6 +65,12 @@ _MATERIALIZE_BUSY = False
 
 # 等锁的轮询间隔（秒）。只在**已经有人在物化**时才会走到，故 50ms 的粒度既不空转也不迟钝。
 _LOCK_POLL_S = 0.05
+
+# ★ E-13 · 当前持有物化锁的那个 task。锁的作用域从 `rebuild()` 内部**上提**到 `_run_materialize`
+# （使 `utility.refresh` 与 `mark_stale_lessons` 写同一批列时不会并发丢更新），而 `rebuild()`
+# 自己那一行 `async with _materialize_lock(...)` **一行不删**——它对同一个 task 变成空操作。
+# 记 task 而不是记布尔：布尔会让「另一个协程也在物化」被误判成重入，那是一次真正的数据竞争。
+_LOCK_HOLDER = None
 
 
 @dataclass(frozen=True)
@@ -136,7 +147,7 @@ def _totals_wire(stock: dict) -> dict:
 
 
 # ---------------- ★ E-3（评审 P0-3）：可写配置的唯一派生点 ----------------
-# 设置中心可写的 12 项阈值：**一张表同时承载 wire 键、`app_settings` 稀疏键、`Settings` 字段**。
+# 设置中心可写的 15 项阈值：**一张表同时承载 wire 键、`app_settings` 稀疏键、`Settings` 字段**。
 #
 # 三者必须写在同一行（不变式 I-10）。分成三份表的后果已有成文前科：某一项在 `PUT` 里被接住、
 # 在 `app_settings` 里被写下、却没有任何一行把它并回运行时真正读的那个对象——用户改得动、
@@ -155,6 +166,13 @@ _SETTING_BRIDGE: tuple[tuple[str, str, str, type], ...] = (
     ("l1MaxChars", "experience.l1_max_chars", "ai_trade_experience_l1_max_chars", int),
     ("distillEnabled", "experience.distill_enabled",
      "ai_trade_experience_distill_enabled", bool),
+    # ★ W-C · 效用闭环的三项可写阈值。漏一项就是一个「改得动、永远不生效」的假控件（G-9 逐项覆盖）。
+    ("utilityEnabled", "experience.utility_enabled",
+     "ai_trade_experience_utility_enabled", bool),
+    ("utilityMinSamples", "experience.utility_min_samples",
+     "ai_trade_experience_utility_min_samples", int),
+    ("utilityTThreshold", "experience.utility_t_threshold",
+     "ai_trade_experience_utility_t_threshold", float),
 )
 
 
@@ -162,7 +180,7 @@ def setting_bridge() -> tuple[tuple[str, str, str, type], ...]:
     """可写阈值的桥表（`api/app_settings.py`、本模块的派生点与门禁 G-9 共用；**绝不各抄一份**）。
 
     Returns:
-        `(wire 键, app_settings 键, Settings 字段, 类型)` 的元组，12 项。
+        `(wire 键, app_settings 键, Settings 字段, 类型)` 的元组，15 项。
     """
     return _SETTING_BRIDGE
 
@@ -220,6 +238,9 @@ def _cast_setting(field: str, raw, caster: type):
         logger.warning("ai-trade experience setting %s ignored (unparsable: %r)", field, raw)
         return None
     if field.endswith("_max_chars"):
+        # ⚠️ **本分支只认 l0 / l1**（按字段名猜层）。`reflection_max_chars`（L2）**不在**桥表里，
+        # 故它今天够用；但下一轮把 L2 放进设置面板之前**必须先改这里**，否则它会静默拿 L1 的
+        # 下限（164）去夹一个下限为 208 的值——一个改得动、却把整层关掉的假控件。
         floor = budget_floor("l0" if "l0" in field else "l1")   # ★ E-7：与校验器同一判据
         if value < floor:
             logger.warning("ai-trade experience %s clamped %s → %s", field, value, floor)
@@ -250,6 +271,12 @@ async def _materialize_lock(timeout: float | None):
     偏软（退出循环后仍可能被别人抢先，于是多等那一个持有者一轮），换来的是**它不可能泄漏锁**。
     在「软一点的死线」与「偶发的永久挂起」之间，这条选择是显然的。
     """
+    global _LOCK_HOLDER
+
+    current = asyncio.current_task()
+    if _LOCK_HOLDER is not None and current is _LOCK_HOLDER:
+        yield                       # ★ E-13：同一 task 已持锁 ⇒ 可重入的空操作
+        return
     lock = repo.experience_materialize_lock()
     if timeout is not None:
         deadline = time.monotonic() + max(0.0, float(timeout))
@@ -259,9 +286,11 @@ async def _materialize_lock(timeout: float | None):
                     f"等物化锁超过 {timeout}s，放弃本次（脏标志留着，下次再来）")
             await asyncio.sleep(_LOCK_POLL_S)
     await lock.acquire()
+    _LOCK_HOLDER = current
     try:
         yield
     finally:
+        _LOCK_HOLDER = None
         lock.release()
 
 
@@ -303,6 +332,12 @@ async def rebuild(session: AsyncSession, settings, *, lock_timeout: float | None
             {**{key: node.id for key, node in existing.items() if node.id},
              **upserted["keys"]})
         await repo.set_app_setting(session, COST_CUTS_KEY, plan.cost_regime_cuts)
+        # ★ W-B · 把本次算出的累加器与语境计数器写成**下一次增量的底座**并开一个新 epoch。
+        # 少了这一步，判据 B-4 会把之后每一次物化都打回全量——增量永远起不来，而且全绿。
+        await incremental.seed_from_full(session, settings, events, outcome={
+            "cuts": plan.cost_regime_cuts,
+            "lastId": max((int(row.get("id") or 0) for row in rows), default=0),
+            "nodeCount": len(plan.seen_lesson_keys)})
     return {"nodes": len(payload), "edges": edges, "stale": stale, "unmuted": unmuted,
             "inserted": upserted["inserted"], "updated": upserted["updated"],
             "events": len(events),
@@ -349,16 +384,26 @@ async def materialize_bounded(settings, *, force: bool = False) -> dict:
             if not force and not await _debounce_ok(session, derived):
                 await _mark_dirty(True, session=session)
                 return {"ran": False, "reason": "debounced"}
+            # ★ E-3（评审 R-3）· 规模闸此前在 `_run_materialize` **之前**短路，而增量住在它
+            # **里面** ⇒ 库越过 20 万条之后增量根本没有机会跑，`overflow` 照旧置真、UI 照旧打
+            # 「规模墙」。判据因此从「事件总数」改成「**本次真的要跑全量**」：增量的成本与库
+            # 大小近似无关（只读 `id > watermark` 且被 `incremental_batch` 封顶），不受本闸约束。
+            planned = await incremental.plan(session, derived)
+            if planned["reason"] == incremental.REASON_UP_TO_DATE:
+                await _mark_dirty(False, session=session)
+                return {"ran": False, "reason": "up_to_date"}
             events = await repo.count_experience_events(session)
             cap = int(derived.ai_trade_experience_materialize_max_events)
-            if events > cap:
+            if planned["mode"] == "full" and events > cap:
                 await _write_health(session, {"lastTs": int(time.time()), "lastMs": 0,
                                               "events": events, "slow": False, "torn": False,
-                                              "overflow": True})
-                logger.warning("ai-trade experience materialize skipped: %d events > cap %d",
+                                              "overflow": True, "mode": "full",
+                                              "fullReason": planned["reason"],
+                                              "pendingEvents": 0})
+                logger.warning("ai-trade experience full rebuild skipped: %d events > cap %d",
                                events, cap)
                 return {"ran": False, "reason": "overflow", "events": events}
-            return await _run_materialize(session, derived)
+            return await _run_materialize(session, derived, planned=planned)
     except Exception as exc:  # noqa: BLE001 —— 后台任务绝不把异常带出去
         logger.warning("ai-trade experience materialize failed: %s", exc)
         return {"ran": False, "reason": "error", "error": str(exc)}
@@ -366,13 +411,19 @@ async def materialize_bounded(settings, *, force: bool = False) -> dict:
         _MATERIALIZE_BUSY = False
 
 
-async def _run_materialize(session: AsyncSession, settings) -> dict:
-    """跑一次 `rebuild` 并落健康读数；撕裂（四次提交中途失败）⇒ `torn: true`，**不抛**。"""
+async def _run_materialize(session: AsyncSession, settings, *,
+                           planned: dict | None = None) -> dict:
+    """跑一次物化（增量或全量）并落健康读数；撕裂 ⇒ `torn: true`，**不抛**。
+
+    ★ E-13 · 锁在**这一层**持有，`utility.refresh` 因此与 `mark_stale_lessons` /
+    `unmute_reappeared` 处在同一个临界区——它们写的是同一批 `muted` / `mute_reason` 列，
+    跑在锁外会丢更新，且是那种「数字不对但不报错」的丢法。**不新增第二把锁、不新增后台任务。**
+    """
     started = time.time()
     try:
-        result = await rebuild(
-            session, settings,
-            lock_timeout=float(settings.ai_trade_experience_materialize_timeout_s))
+        async with _materialize_lock(
+                float(settings.ai_trade_experience_materialize_timeout_s)):
+            result = await incremental.run_locked(session, settings, planned=planned)
     except MaterializeBusyError as exc:
         logger.info("ai-trade experience materialize gave up waiting for the lock: %s", exc)
         return {"ran": False, "reason": "lock_timeout"}
@@ -384,7 +435,8 @@ async def _run_materialize(session: AsyncSession, settings) -> dict:
     return {"ran": True, "reason": "ok", **result}
 
 
-async def rebuild_manual(session: AsyncSession, settings, *, lock_timeout: float) -> dict:
+async def rebuild_manual(session: AsyncSession, settings, *, lock_timeout: float,
+                         scope: str = "stat") -> dict:
     """用户明确要求的重建（`POST /api/experience/rebuild`）——**无去抖、无规模闸**。
 
     与后台物化**共用同一处健康写回**（`_note_materialized` / `_note_torn`）。不共用的后果不是
@@ -410,7 +462,10 @@ async def rebuild_manual(session: AsyncSession, settings, *, lock_timeout: float
     """
     started = time.time()
     try:
-        result = await rebuild(session, settings, lock_timeout=lock_timeout)
+        async with _materialize_lock(lock_timeout):
+            # `scope="full"` = 用户明确要求**强制全量**（并 epoch+1）；`"stat"` = 由五条判据自选。
+            planned = None if scope == "full" else await incremental.plan(session, settings)
+            result = await incremental.run_locked(session, settings, planned=planned)
     except MaterializeBusyError:
         raise
     except Exception:
@@ -418,47 +473,6 @@ async def rebuild_manual(session: AsyncSession, settings, *, lock_timeout: float
         raise
     await _note_materialized(session, settings, result)
     return {**result, "torn": False}
-
-
-async def _note_materialized(session: AsyncSession, settings, result: dict) -> None:
-    """一次**成功**物化的收尾：落健康读数 + 清脏标志（后台与手动重建共用）。"""
-    elapsed = float(result.get("elapsedMs") or 0.0)
-    await _write_health(session, {
-        "lastTs": int(time.time()), "lastMs": elapsed, "events": int(result.get("events") or 0),
-        "slow": elapsed >= float(settings.ai_trade_experience_materialize_slow_ms),
-        "torn": False, "overflow": False})
-    await _mark_dirty(False, session=session)
-
-
-async def _note_torn(session: AsyncSession, started: float) -> None:
-    """★ E-14 · 撕裂如实落库。
-
-    先 `rollback`：`rebuild` 的四次提交里任何一次失败都会让这个 `AsyncSession` 停在失败事务上，
-    此后第一条语句必抛 `PendingRollbackError` —— 那会把「让撕裂可见」变成「连撕裂都记不下来」。
-    """
-    try:
-        await session.rollback()
-        await _write_health(session, {
-            "lastTs": int(time.time()), "lastMs": round((time.time() - started) * 1000, 1),
-            "events": 0, "slow": False, "torn": True, "overflow": False})
-    except Exception as exc:  # noqa: BLE001 —— 记录失败不能盖住真正的那个异常
-        logger.warning("ai-trade experience torn flag not persisted: %s", exc)
-
-
-async def _debounce_ok(session: AsyncSession, settings) -> bool:
-    """距上次成功物化是否已超过去抖窗口（`materialize_min_interval_s`，默认 60 秒）。"""
-    health = await _read_health(session)
-    interval = float(settings.ai_trade_experience_materialize_min_interval_s)
-    return (time.time() - float(health.get("lastTs") or 0)) >= interval
-
-
-async def _read_health(session: AsyncSession) -> dict:
-    raw = await repo.get_app_setting(session, HEALTH_KEY, {})
-    return raw if isinstance(raw, dict) else {}
-
-
-async def _write_health(session: AsyncSession, health: dict) -> None:
-    await repo.set_app_setting(session, HEALTH_KEY, health)
 
 
 async def _mark_dirty(dirty: bool, *, session: AsyncSession | None = None) -> None:
@@ -512,7 +526,23 @@ def _node_payload(node: GraphNode) -> dict:
 
 
 # ---------------- 只读视图 ----------------
-async def overview(session: AsyncSession) -> dict:
+async def _harvest_wire(session: AsyncSession, gap_total: int) -> dict:
+    """采集完整性块：`{gapTotal, adoptedTotal, reasons}`（★ W-A / W-F）。
+
+    `reasons` 的键集**恒为闭合的六个**（零值的键照常下发）：列出来才知道「这条路今天没走过」
+    与「这条路不存在」的区别；少一个键则「为什么采不到」在 UI 上变成一句「其他」。
+    """
+    from .runtime import HARVEST_REASONS, HARVEST_TOTALS_KEY
+
+    totals = await repo.get_app_setting(session, HARVEST_TOTALS_KEY, {})
+    totals = totals if isinstance(totals, dict) else {}
+    reasons = totals.get("reasons")
+    reasons = reasons if isinstance(reasons, dict) else {}
+    return {"gapTotal": int(gap_total), "adoptedTotal": int(totals.get("adopted") or 0),
+            "reasons": {key: int(reasons.get(key) or 0) for key in HARVEST_REASONS}}
+
+
+async def overview(session: AsyncSession, settings) -> dict:
     """概览条（`GET /api/experience/overview`）。
 
     ★ E-8（评审 P1-2）· `materializeHealth` 与 `harvestGapTotal` 此前**都没有取数来源**：前者是
@@ -520,17 +550,22 @@ async def overview(session: AsyncSession) -> dict:
     只活在会话内存里）。于是概览条上那两个数字**恒为 0**——而它们恰恰是用来说「这张表偏乐观」
     与「自动重建已经跟不上了」的。这是 I-8「观测量必须有渲染落点」的**镜像形态**：有渲染落点、
     没有取数来源。两者一并补齐（用例 A-48）。
+
+    ★ 本轮新增三块：`harvest`（采集完整性）、`utility`（效用闭环）、`materializeHealth` 的
+    `mode` / `fullReason` / `pendingEvents`。每一块在 §7.1 各有明确渲染落点（I-8）。
     """
+    from . import utility
+
     wire = await repo.experience_overview(session)
     wire["rejectedNarrative"] = int(
         (await repo.get_app_setting(session, REJECTED_KEY, 0)) or 0)
     wire["harvestGapTotal"] = int(
         (await repo.get_app_setting(session, HARVEST_GAP_KEY, 0)) or 0)
-    health = await _read_health(session)
-    wire["materializeHealth"] = {
-        "lastTs": int(health.get("lastTs") or 0), "lastMs": float(health.get("lastMs") or 0.0),
-        "events": int(health.get("events") or 0), "slow": bool(health.get("slow")),
-        "torn": bool(health.get("torn")), "overflow": bool(health.get("overflow"))}
+    wire["harvest"] = await _harvest_wire(session, wire["harvestGapTotal"])
+    utility_wire = await utility.overview_wire(session, settings)
+    if utility_wire is not None:      # 总闸关 ⇒ **整键缺席**，绝不下发一个恒为 0 的假读数
+        wire["utility"] = utility_wire
+    wire["materializeHealth"] = incremental.health_wire(await _read_health(session))
     wire["costRegimeCuts"] = await repo.get_app_setting(session, COST_CUTS_KEY, {}) or {}
     return wire
 
@@ -605,22 +640,35 @@ def _node_wire(row: dict) -> dict:
             "createdTs": row.get("created_ts"), "updatedTs": row.get("updated_ts")}
 
 
-async def lessons_view(session: AsyncSession, filters: dict) -> dict:
+async def lessons_view(session: AsyncSession, settings, filters: dict) -> dict:
     """列表视图（`GET /api/experience/lessons`）——**与图谱同数据源、同筛选判据**（A-22 的支点）。
 
     刻意**不**走一条独立的 SQL 分页：两条路径必然漂移，而这里漂移的是「同一筛选下图谱说 12 条、
     列表说 9 条」——用户完全无从判断哪个是真的。节点总量受 `graph_node_cap`（默认 4000）约束，
     在内存里筛一遍的代价可忽略，换来的是**两个视图的条数在结构上不可能不一致**。
     """
+    from . import utility
+
     rows = await repo.load_experience_nodes(session)
     lessons = [row for row in rows if row["kind"] == "lesson" and _match(row, filters)]
     offset = max(0, int(filters.get("offset") or 0))
     limit = max(1, min(int(filters.get("limit") or 50), 500))
-    return {"items": [_node_wire(row) for row in lessons[offset:offset + limit]],
-            "total": len(lessons)}
+    page = lessons[offset:offset + limit]
+    # ★ W-F · 「效用」列的取数与详情抽屉**同一个换算点**；没有注入样本的经验整键缺席，
+    # 列表据此渲染 `—` 而不是一个「注入 0 次、之后 0bps」的假读数。
+    scores = await utility.by_keys(session, settings, [row["key"] for row in page])
+    items = []
+    for row in page:
+        item = _node_wire(row)
+        hit = scores.get(row["key"])
+        if hit is not None:
+            item["utility"] = hit
+        items.append(item)
+    return {"items": items, "total": len(lessons)}
 
 
-async def node_detail(session: AsyncSession, node_id: int, *, evidence_limit: int = 20) -> dict | None:
+async def node_detail(session: AsyncSession, settings, node_id: int, *,
+                      evidence_limit: int = 20) -> dict | None:
     """详情抽屉（统计 / 语境 / 版本链 / 冲突 / 溯源证据）。"""
     row = await repo.get_experience_node(session, node_id)
     if row is None:
@@ -641,9 +689,15 @@ async def node_detail(session: AsyncSession, node_id: int, *, evidence_limit: in
             related[edge["rel"]].append(_node_wire(target))
     evidence = await repo.load_experience_evidence(
         session, row.get("signature") or {}, limit=evidence_limit)
-    return {"node": _node_wire(row), "stats": row.get("stats") or {},
-            "contexts": related["contexts"], "versions": related["refines"],
-            "contradicts": related["contradicts"], "evidence": evidence}
+    from . import utility
+
+    detail = {"node": _node_wire(row), "stats": row.get("stats") or {},
+              "contexts": related["contexts"], "versions": related["refines"],
+              "contradicts": related["contradicts"], "evidence": evidence}
+    hit = await utility.detail(session, settings, row["key"])
+    if hit is not None:               # ★ W-F：「注入后表现」区；无样本 ⇒ 整键缺席
+        detail["utility"] = hit
+    return detail
 
 
 # ---------------- 检索预演 ----------------
@@ -711,11 +765,11 @@ async def export_stream(session: AsyncSession, query, *, page: int = 500):
 # 再导出而不是让调用方改 import：`distill.py` 与 `api/experience.py` 都按 `service.sanitize_lesson`
 # 写着，而「为了拆文件去改三处调用点」正是这类重构最容易漏掉一处的地方。
 from .importing import (  # noqa: E402
-    ImportTooLargeError,
-    import_graph,
-    manual_key,
-    sanitize_lesson,
-)
+    ImportTooLargeError, import_graph, manual_key, sanitize_lesson)
+# 同款再导出：效用面板与「清理沉降经验」的编排住在 `utility.py`（service.py 的 800 行阈值是
+# 硬判据，`importing.py` 是同一条纪律的成文先例），路由层仍按 `service.X` 写。
+from .utility import list_view as utility_view  # noqa: E402
+from .utility import prune_stale  # noqa: E402
 
 __all__ = [
     "ImportTooLargeError",
@@ -724,6 +778,7 @@ __all__ = [
     "consume_dirty_flag",
     "export_stream",
     "graph_view",
+    "health_view",
     "import_graph",
     "lessons_view",
     "load_session_graph",
@@ -732,9 +787,11 @@ __all__ = [
     "node_detail",
     "overview",
     "preview",
+    "prune_stale",
     "rebuild",
     "rebuild_manual",
     "resolve_experience_settings",
     "sanitize_lesson",
     "setting_bridge",
+    "utility_view",
 ]

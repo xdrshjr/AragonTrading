@@ -2,7 +2,11 @@
 
 import { useEffect, useState } from "react";
 import { experienceApi } from "@/lib/experienceApi";
-import type { AiTradeExperienceRule, ExperienceOverview } from "@/lib/experienceTypes";
+import type {
+  AiTradeExperienceRule,
+  ExperienceHealth,
+  ExperienceOverview,
+} from "@/lib/experienceTypes";
 import { useAppStore } from "@/lib/store";
 
 /**
@@ -32,6 +36,9 @@ export default function AiTradeExperienceFields({
 }) {
   const [overview, setOverview] = useState<ExperienceOverview | null>(null);
   const [opsEnabled, setOpsEnabled] = useState<boolean | null>(null);
+  // ★ W-C / R-19 · 「已自动静音 N 条」取自 `/experience/health`——那个接口本就是为轮询拆出来的
+  // （`overview` 会扫整张节点表）。**零新增 IO 面**：它与上面两条同一次 `Promise.all`。
+  const [health, setHealth] = useState<ExperienceHealth | null>(null);
   const setShowSettings = useAppStore((s) => s.setShowSettings);
   const setSettingsSection = useAppStore((s) => s.setSettingsSection);
 
@@ -39,16 +46,18 @@ export default function AiTradeExperienceFields({
     let alive = true;
     void (async () => {
       try {
-        const [head, settings] = await Promise.all([
+        const [head, settings, pulse] = await Promise.all([
           experienceApi.overview(),
           experienceApi.settings(),
+          experienceApi.health(),
         ]);
         if (!alive) return;
         setOverview(head);
         setOpsEnabled(settings.enabled);
+        setHealth(pulse);
       } catch {
         // 接口失败（路由未注册 / 后端未起）⇒ 只隐藏数字，勾选与启动一律不受影响。
-        if (alive) setOpsEnabled(null);
+        if (alive) { setOpsEnabled(null); setHealth(null); }
       }
     })();
     return () => { alive = false; };
@@ -104,6 +113,17 @@ export default function AiTradeExperienceFields({
             <p className="text-[10px] text-[var(--muted)]">
               让 Agent 参考过往 {overview.sessions} 组有成交记录的自动交易沉淀的 {lessons} 条经验
               （其中铁律 {overview.lessons.iron} 条）。
+            </p>
+          )}
+
+          {/* 读数还没到就**整行不渲染**——绝不先显示一个占位的 0，那是一句会被当真的假话。 */}
+          {(health?.utilityMuted ?? 0) > 0 && (
+            <p
+              className="text-[10px] text-[var(--muted)]"
+              data-testid="ai-trade-experience-muted"
+            >
+              经验库中有 {health?.utilityMuted} 条已被自动静音（注入之后的表现与它们自己的结论
+              系统性相反），本次不会喂给 Agent。
             </p>
           )}
 

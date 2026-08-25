@@ -1032,7 +1032,23 @@ from .ai_auto_repositories import (  # noqa: E402,F401
 # SQL，两份必漂移，而这里漂移的是用户亲手按下的「静音」与 iron 档赖以晋升的符号历史）。
 # 泛用名（overview / get_node / …）一律加 `experience_` 限定前缀再导出，避免遮蔽既有 repo 符号
 # ——本文件已经因为 weight_* 的同名运行记录函数踩过一次这个坑。
+# ai_experience_accum_repositories：增量物化的底座（桶累加器 / 语境计数器 / 注入台账）
+# （ai-trade-experience-compounding §6.1；自包含，与 `ai_experience_repositories` 同一拆分范式）。
+# ⚠️ **新数据层函数必须在这里再导出**：漏一个的后果不是 ImportError 而是运行期
+# `AttributionError` 被上游的裸 `except` 吞成一行 warning ⇒ 整条特性静默空转（v1:P0-1 的形态）。
+from .ai_experience_accum_repositories import (  # noqa: E402,F401
+    append_experience_injections,
+    count_experience_buckets,
+    delete_orphan_experience_injections,
+    load_experience_buckets,
+    load_experience_context_counts,
+    load_experience_injections,
+    purge_experience_epochs,
+    upsert_experience_buckets,
+    upsert_experience_context_counts,
+)
 from .ai_experience_repositories import (  # noqa: E402,F401
+    STAT_ORIGINS as EXPERIENCE_STAT_ORIGINS,
     EventQuery as ExperienceEventQuery,
     append_experience_events,
     count_events as count_experience_events,
@@ -1048,6 +1064,7 @@ from .ai_experience_repositories import (  # noqa: E402,F401
     overview as experience_overview,
     patch_node as patch_experience_node,
     replace_edges as replace_experience_edges,
+    set_lesson_mute as set_experience_lesson_mute,
     stream_export_rows as stream_experience_export_rows,
     unmute_reappeared as unmute_reappeared_experience_lessons,
     upsert_lesson_nodes,

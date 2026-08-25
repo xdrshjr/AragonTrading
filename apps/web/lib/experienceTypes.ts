@@ -18,8 +18,92 @@ export type ExperienceSource = "stat" | "narrative" | "manual" | "imported" | "c
 /** 档位。`archived` 只出现在版本链里。 */
 export type ExperienceTier = "candidate" | "normal" | "iron" | "archived";
 
-/** 静音原因：`user` 是人类意志（物化永不覆盖），另两个是自动的（新证据即解除，E-9）。 */
-export type ExperienceMuteReason = "user" | "stale" | "flipped" | null;
+/**
+ * 静音原因。
+ *
+ * - `user`：人类意志，物化与自动化**永不**覆盖；
+ * - `stale` / `flipped`：物化产出的自动静音（新证据即解除，E-9）；
+ * - `ineffective`：★ W-C 新增——「注入之后的表现与它自己的结论系统性相反」。
+ *   注意这是**共现**不是因果：我们并不知道模型是否真的采纳了它（J-5）。
+ */
+export type ExperienceMuteReason = "user" | "stale" | "flipped" | "ineffective" | null;
+
+/**
+ * 一条经验的「注入后表现」（★ W-C）。
+ *
+ * **绝不是「贡献」**：`node.weight` 说的是「这个语境桶历史上赚不赚」，本结构说的是「把这句话
+ * 喂进去之后，那些单后来怎么样」。两者是完全不同的量，而后者只是共现关系。
+ */
+export interface ExperienceUtility {
+  /** 被注入过几次（只计**开了仓**的轮次）。 */
+  injected: number;
+  /** 其中口径合格（净额 + 已知费率）、真的进了 bps 聚合的条数。 */
+  scored: number;
+  /** 注入之后那些往返的净额均值。 */
+  meanNetAfter: number | null;
+  tAfter: number | null;
+  /** 事实与它的断言同向的比例（**「与事实一致率」，不是「准确率」**）。 */
+  agreement: number | null;
+  /** 该经验注入当时断言的净额符号（冻结值，绝不回填）。 */
+  claimSign: number;
+  /** 是否已被那条唯一的失效判据判定（三重门槛，且只导向静音）。 */
+  ineffective: boolean;
+}
+
+/** 效用面板的一行（`GET /api/experience/utility`）。 */
+export interface ExperienceUtilityRow extends ExperienceUtility {
+  key: string;
+  id: number;
+  label: string;
+  muted: boolean;
+  muteReason: ExperienceMuteReason;
+  pinned: boolean;
+}
+
+/** 效用面板回执。 */
+export interface ExperienceUtilityPage {
+  items: ExperienceUtilityRow[];
+  total: number;
+  asOfTs: number;
+  /** 失效判据的三重门槛之二，如实下发使 UI 能把「为什么被静音」说清楚（I-8）。 */
+  minSamples: number;
+  tThreshold: number;
+}
+
+/** 一条注入记录（详情抽屉的最近 N 条）。 */
+export interface ExperienceInjectionRow {
+  id: number;
+  groupId: string;
+  instId: string;
+  seq: number;
+  exitTs: number;
+  lessonKey: string;
+  layer: "l0" | "l1";
+  claimSign: number;
+  injectedWallTs: number;
+  netBps: number | null;
+  feeKnown: boolean;
+  costBasis: string;
+}
+
+/**
+ * 采集完整性（★ W-A）。
+ *
+ * `reasons` 的键集是**闭合的六个**，零值的键照常下发：列出来才知道「这条路今天没走过」与
+ * 「这条路不存在」的区别。
+ */
+export interface ExperienceHarvest {
+  gapTotal: number;
+  adoptedTotal: number;
+  reasons: {
+    noOpenContext: number;
+    noTrip: number;
+    slotEvicted: number;
+    persistFailed: number;
+    offlineNoReadback: number;
+    offlineInconsistent: number;
+  };
+}
 
 /** 启动请求里的经验模式规则（「字段缺省 ⇒ 开启」的语义在**后端**单点解析）。 */
 export interface AiTradeExperienceRule {
@@ -83,8 +167,37 @@ export interface ExperienceMaterializeHealth {
   slow: boolean;
   /** 上次重建没走完全部四次提交 ⇒ 图可能「新节点 + 旧边」（E-14）。 */
   torn: boolean;
-  /** 事件数超过自动重建规模闸 ⇒ 自动重建已停止（E-6）。 */
+  /**
+   * 事件数超过**全量重建**的规模闸 ⇒ 自动的**全量**重建已停止（E-6）。
+   *
+   * ★ 本轮之后它只约束全量：增量物化的成本与库大小近似无关，故大库上 `mode==="incremental"`
+   * 时这一位恒为 false——那正是「规模墙被推开了」这句承诺的可见形态。
+   */
   overflow: boolean;
+  /** 上次物化走的是哪条路（★ W-B）。 */
+  mode: "full" | "incremental" | "";
+  /** 走全量的原因（五条判据之一）；增量 ⇒ null。 */
+  fullReason: string | null;
+  /** 水位线之后还剩多少条没吃（满批时 > 0）。一个悄悄吃不完的队列必须能被看见。 */
+  pendingEvents: number;
+}
+
+/** `GET /api/experience/health` —— 概览条与启动弹窗共用的**轮询**读数。 */
+export interface ExperienceHealth extends ExperienceMaterializeHealth {
+  epoch: number;
+  watermarkEventId: number;
+  eventCount: number;
+  lastMode: string;
+  /** 因「注入后表现与其结论系统性相反」被自动静音的条数（启动弹窗那一行取它，零新增请求）。 */
+  utilityMuted: number;
+}
+
+/** `POST /api/experience/prune` 回执。 */
+export interface ExperiencePruneResult {
+  matched: number;
+  deleted: number;
+  skippedPinned: number;
+  skippedUserMuted: number;
 }
 
 /** 概览条读数（`GET /api/experience/overview`）。 */
@@ -101,6 +214,10 @@ export interface ExperienceOverview {
   rejectedNarrative: number;
   /** 续跑接管 / 暂停期离线平仓导致采不到的往返累计数（R-15 的幸存者偏差露出点）。 */
   harvestGapTotal: number;
+  /** ★ W-A · 采集完整性明细（补采条数 + 逐原因）。 */
+  harvest: ExperienceHarvest;
+  /** ★ W-C · 效用闭环；总闸关 ⇒ **整键缺席**（不是一个恒为 0 的假读数）。 */
+  utility?: { scored: number; ineffective: number };
   materializeHealth: ExperienceMaterializeHealth;
   costRegimeCuts: Record<string, unknown>;
 }
@@ -115,7 +232,7 @@ export interface ExperienceGraphView {
 
 /** 列表视图回执（与图谱**同数据源同筛选**，A-22）。 */
 export interface ExperienceLessonPage {
-  items: ExperienceNode[];
+  items: (ExperienceNode & { utility?: ExperienceUtility })[];
   total: number;
 }
 
@@ -140,6 +257,8 @@ export interface ExperienceNodeDetail {
   versions: ExperienceNode[];
   contradicts: ExperienceNode[];
   evidence: ExperienceEvidenceRow[];
+  /** ★ W-C · 「注入后表现」区；无注入样本 / 总闸关 ⇒ 整键缺席。 */
+  utility?: ExperienceUtility & { injections: ExperienceInjectionRow[] };
 }
 
 /** 检索预演里被逐字渲染的一条经验（与 prompt 里那一份同源）。 */
@@ -192,8 +311,16 @@ export interface AiTradeExperienceStatus {
   injections: number;
   chars: number;
   eventsHarvested: number;
-  /** **本会话**漏采的往返数（与概览条那个库存累计口径不同，两者都要有）。 */
+  /**
+   * **本会话**漏采的往返数（与概览条那个库存累计口径不同，两者都要有）。
+   *
+   * ★ 保留一个版本：`lib/store.ts` 的运行中卡片是逐键手抄装配，桌面端旧包与新后端并存时
+   * 删掉它会让那张卡直接空掉。新代码请读 `harvest.gap`。
+   */
   harvestGap: number;
+  /** ★ W-A · 本会话的采集完整性（`gap` / 补采条数 / 逐原因）。 */
+  harvest?: { gap: number; adopted: number;
+              reasons: Record<string, number> };
   graphAsOfTs: number;
 }
 
@@ -225,6 +352,10 @@ export interface ExperienceSettings {
   l1Max: number;
   l1MaxChars: number;
   distillEnabled: boolean;
+  /** ★ W-C · 效用闭环的三项可写阈值（桥表 12 → 15 项）。 */
+  utilityEnabled: boolean;
+  utilityMinSamples: number;
+  utilityTThreshold: number;
   /** 服务端下发的下限，使 UI 能在提交前就说清楚为什么不合法（E-7）。 */
   l0MinChars: number;
   l1MinChars: number;
@@ -256,6 +387,10 @@ export interface ExperienceRebuildResult {
   events: number;
   elapsedMs: number;
   torn: boolean;
+  /** ★ W-B · 这一次走的是哪条路；`fullReason` 说明为什么。 */
+  mode?: "full" | "incremental";
+  fullReason?: string | null;
+  pendingEvents?: number;
 }
 
 /** 导入回执（边与事件恒被拒——它们是派生物 / 带着别人的成本口径）。 */

@@ -31,6 +31,21 @@ _MATERIALIZE_LOCK = asyncio.Lock()
 _LESSON_KIND = "lesson"
 _CONTEXT_KIND = "context"
 
+# ★ E-2（评审 R-2 / 不变式 J-7）· **参与统计的事件来源集合，只此一个常量。**
+#
+# `origin` 是这张表唯一能回答「这条经验的证据是本进程亲眼看到的，还是从交易所回读拼出来的」
+# 的列，它是一个**口径闸**。四个读点——桶枚举（`load_experience_events`）/ 证据表
+# （`load_evidence`）/ 概览计数（`overview`）/ 规模闸（`count_events`）——必须共用它。
+#
+# 只加写侧不改读侧的后果不是抽象的：`adopted` 事件会**写得进、读不出**，一条也进不了桶、
+# 一条也进不了证据抽屉，而 `count_events` / `overview` 又不过滤 origin ⇒ L0 页眉那句
+# 「来自 X 组…的 Y 笔已结算往返」把这些从未贡献过任何一条经验的往返算进去（`v1:I-9` 当场破），
+# UI 上却同时显示「已补采 N 笔」——**比不做更坏**。
+#
+# `imported` 之类将来可能出现的来源默认**不进**统计：口径闸是本表的产品属性，不是过滤器的
+# 默认值。新增一种 origin 时，写侧与读侧必须同一个 PR（G-16 是它的机械判据）。
+STAT_ORIGINS: tuple[str, ...] = ("live", "adopted")
+
 # upsert 时**绝不覆盖**的字段（§4.5 的落地清单，评审 P0-2）。
 _PRESERVED = ("pinned", "muted", "mute_reason", "first_ts", "created_ts")
 
@@ -56,15 +71,20 @@ def _dumps(value) -> str:
 
 
 # ---------------- 事件（append-only 唯一真源） ----------------
-async def append_experience_events(session: AsyncSession, rows: list[dict]) -> int:
+async def append_experience_events(session: AsyncSession, rows: list[dict], *,
+                                   commit: bool = True) -> int:
     """批量落事件（`INSERT OR IGNORE`，幂等键保护）；返回**实际新增**条数。
 
     续跑重放 / 并发重复写全部安全。返回值是「真的新增了几条」而不是「提交了几条」——两者不同时，
     差额就是被幂等键挡下的重复，那是一个应当可见的事实而不是静默成功。
+
+    `commit=False` 是给「事件行与注入台账**同一次 commit**」那条路径用的（★ W-C §4.6.1）：
+    两张表同源同刻写入，中途失败必须两边都没有新行（A-26 逐条断言）。此时返回的是**提交前的
+    行数**（`count` 差额此刻还看不见），语义随之变成「本次尝试写入的条数」。
     """
     if not rows:
         return 0
-    before = await count_events(session)
+    before = await count_events(session) if commit else 0
     payload = [{
         "group_id": row["group_id"], "run_id": int(row["run_id"] or 0),
         "inst_id": row["inst_id"], "bar": row["bar"], "seq": int(row["seq"] or 0),
@@ -84,24 +104,52 @@ async def append_experience_events(session: AsyncSession, rows: list[dict]) -> i
     stmt = sqlite_insert(AiExperienceEvent).values(payload).on_conflict_do_nothing(
         index_elements=["group_id", "inst_id", "seq", "exit_ts"])
     await session.execute(stmt)
+    if not commit:
+        return len(payload)
     await session.commit()
     return max(0, await count_events(session) - before)
 
 
-async def count_events(session: AsyncSession) -> int:
-    """事件表总行数（物化的规模闸与导出信封的 `counts` 共用；空表 ⇒ 0）。"""
-    return int((await session.execute(select(func.count(AiExperienceEvent.id)))).scalar() or 0)
+async def count_events(session: AsyncSession, *,
+                       origins: tuple[str, ...] = STAT_ORIGINS,
+                       up_to_id: int | None = None) -> int:
+    """**参与统计的**事件行数（物化的规模闸、导出信封的 `counts`、B-5 对账共用；空表 ⇒ 0）。
+
+    ★ E-2：口径与桶枚举必须一致，否则规模闸会用一个比真实样本池更大的数去判「越界」。
+    ★ E-11：`after_id` 是 B-5 水位线对账（`COUNT(id <= watermark)`）的取数入口。
+
+    Args:
+        session: DB 会话。
+        origins: 参与统计的来源集合（默认 `STAT_ORIGINS`）。
+        up_to_id: 非 None ⇒ 只数 `id <= up_to_id` 的行（B-5 水位线对账用）。**刻意不叫
+            `after_id`**：`EventQuery.after_id` 的语义是 `id > after_id`，两处同名反向会
+            造出一条只在并发下现形的错误。
+
+    Returns:
+        行数。
+    """
+    stmt = select(func.count(AiExperienceEvent.id))
+    if origins:
+        stmt = stmt.where(AiExperienceEvent.origin.in_(list(origins)))
+    if up_to_id is not None:
+        stmt = stmt.where(AiExperienceEvent.id <= int(up_to_id))
+    return int((await session.execute(stmt)).scalar() or 0)
 
 
 @dataclass(frozen=True)
 class EventQuery:
-    """事件读取的过滤条件（聚合形参，满足「形参 ≤5」）。"""
+    """事件读取的过滤条件（聚合形参，满足「形参 ≤5」）。
+
+    ★ E-2：`origin`（单值）换成 `origins`（集合），默认即 `STAT_ORIGINS`——口径闸而非死码。
+    ★ E-11：`after_id` 是 W-B 增量物化的**事件水位线**，既有过滤字段里根本没有它。
+    """
 
     inst_id: str | None = None
     bar: str | None = None
     since_ts: int | None = None
     until_ts: int | None = None
-    origin: str | None = "live"       # 恒 "live"：口径闸而非死码（评审 P2-3）
+    origins: tuple[str, ...] = STAT_ORIGINS
+    after_id: int | None = None
     limit: int | None = None
     offset: int = 0
 
@@ -109,8 +157,10 @@ class EventQuery:
 async def load_experience_events(session: AsyncSession, query: EventQuery) -> list[dict]:
     """按条件读事件行（聚合与重建的取数点）。返回的是**行字典**，聚合层不认识 ORM 对象。"""
     stmt = select(AiExperienceEvent)
-    if query.origin:
-        stmt = stmt.where(AiExperienceEvent.origin == query.origin)
+    if query.origins:
+        stmt = stmt.where(AiExperienceEvent.origin.in_(list(query.origins)))
+    if query.after_id is not None:
+        stmt = stmt.where(AiExperienceEvent.id > int(query.after_id))
     if query.inst_id:
         stmt = stmt.where(AiExperienceEvent.inst_id == query.inst_id)
     if query.bar:
@@ -147,7 +197,8 @@ async def load_evidence(session: AsyncSession, signature: dict, *, limit: int = 
     （`side=long` 会匹配到 `side=long_xxx` 这类不存在但迟早出现的取值）。三列之外的轴由调用方在
     内存里再过滤一次——证据表只取最近 20 条，代价可忽略。
     """
-    stmt = select(AiExperienceEvent).where(AiExperienceEvent.origin == "live")
+    stmt = select(AiExperienceEvent).where(
+        AiExperienceEvent.origin.in_(list(STAT_ORIGINS)))      # ★ E-2：与桶枚举同一口径
     if signature.get("symbol"):
         stmt = stmt.where(AiExperienceEvent.inst_id == signature["symbol"])
     if signature.get("bar"):
@@ -335,6 +386,38 @@ async def mark_stale_lessons(session: AsyncSession, seen_keys: set[str], *,
     return touched
 
 
+async def set_lesson_mute(session: AsyncSession, node_id: int, *, muted: bool,
+                          reason: str | None) -> bool:
+    """**自动化**的静音写点（`mute_reason` 由调用方显式给定）。
+
+    刻意与 `patch_node` 分开：后者把 `mute_reason` 写死成 `"user"`——那是「人类按下了静音」
+    这一个事实的标记，也是 `mark_stale_lessons` / `unmute_reappeared` 判断「不许自动改写」的
+    唯一依据。让效用闭环走 `patch_node` 会把每一次自动静音都伪装成用户意志，此后再也解除不掉
+    （`unmute_reappeared` 跳过 `user`），而且**不报任何错**。
+
+    用户意志同样受保护：`mute_reason == "user"` 的行本函数一律不动。
+
+    Args:
+        session: DB 会话。
+        node_id: 经验节点主键。
+        muted: 目标静音状态。
+        reason: 静音原因（`ineffective` / `stale` / `flipped`）；解除时传 `None`。
+
+    Returns:
+        是否真的改动了这一行。
+    """
+    row = await session.get(AiExperienceNode, int(node_id))
+    if row is None or row.mute_reason == "user":
+        return False
+    if bool(row.muted) == bool(muted) and row.mute_reason == reason:
+        return False
+    row.muted = bool(muted)
+    row.mute_reason = reason if muted else None
+    row.updated_ts = int(time.time())
+    await session.commit()
+    return True
+
+
 async def replace_edges(session: AsyncSession, edges: list[dict], key_to_id: dict) -> int:
     """整体替换物化边（一个事务内）。悬空边（端点不在节点表）一律丢弃。
 
@@ -450,12 +533,17 @@ async def overview(session: AsyncSession) -> dict:
             tiers["muted"] += 1
         elif row.tier in tiers:
             tiers[row.tier] += 1
+    # ★ E-2：这三个计数与 `symbols` 都必须走 `STAT_ORIGINS`——`events` / `sessions` 是 L0 页眉
+    # 那句「来自 X 组有成交记录的自动交易的 Y 笔已结算往返」的**唯一**取数来源，口径不一致
+    # 就是在喂给下真单的模型的 prompt 里写一个假数字（`v1:I-9`，A-42 逐值断言）。
+    stat_only = AiExperienceEvent.origin.in_(list(STAT_ORIGINS))
     symbols = [s for (s,) in (await session.execute(
-        select(AiExperienceEvent.inst_id).distinct()
+        select(AiExperienceEvent.inst_id).distinct().where(stat_only)
         .order_by(AiExperienceEvent.inst_id.asc()))).all() if s]
     sessions = int((await session.execute(select(func.count(func.distinct(
-        AiExperienceEvent.group_id))))).scalar() or 0)
+        AiExperienceEvent.group_id))).where(stat_only))).scalar() or 0)
     excluded = int((await session.execute(select(func.count(AiExperienceEvent.id)).where(
+        stat_only,
         (AiExperienceEvent.cost_basis != "net") | (AiExperienceEvent.fee_known.is_(False))
     ))).scalar() or 0)
     return {"lessons": tiers, "events": await count_events(session), "sessions": sessions,
@@ -478,7 +566,7 @@ async def stream_export_rows(session: AsyncSession, query: EventQuery, *, page: 
         batch = await load_experience_events(
             session, EventQuery(inst_id=query.inst_id, bar=query.bar,
                                 since_ts=query.since_ts, until_ts=query.until_ts,
-                                origin=query.origin, limit=page, offset=offset))
+                                origins=query.origins, limit=page, offset=offset))
         if not batch:
             return
         for row in batch:

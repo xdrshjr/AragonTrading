@@ -187,6 +187,32 @@ export function tierLabel(node: Pick<ExperienceNode, "tier" | "muted" | "pinned"
   return TIER_LABEL_ZH[node.tier] ?? node.tier;
 }
 
+/** 采集缺口的六种原因（键集与后端 `HARVEST_REASONS` **逐字**闭合，多一个就是假分类）。 */
+export const HARVEST_REASON_ZH: Record<string, string> = {
+  noOpenContext: "无开仓语境",
+  noTrip: "结算不出往返",
+  slotEvicted: "语境槽被淘汰",
+  persistFailed: "落盘失败",
+  offlineNoReadback: "离线平仓回读不到",
+  offlineInconsistent: "离线平仓增量不自洽",
+};
+
+/**
+ * 列表页「效用」列的一格。
+ *
+ * 三态**刻意不同形**：无样本是一个破折号（而不是「注入 0 次」——那是一个假读数），
+ * 有样本是三个数，已失效额外带一个警示符号。颜色绝不单独承载语义。
+ */
+export function utilityCellText(
+  utility: { injected: number; meanNetAfter: number | null; agreement: number | null;
+             ineffective: boolean } | undefined,
+): string {
+  if (!utility || utility.injected <= 0) return "—";
+  const after = utility.meanNetAfter === null ? "样本不足" : formatNetBps(utility.meanNetAfter);
+  const agree = utility.agreement === null ? "" : ` · 一致 ${formatPercent(utility.agreement)}`;
+  return `注入 ${utility.injected} · 之后 ${after}${agree}`;
+}
+
 /** 概览条底部注记的一条（诚实性键的渲染载体，I-8）。 */
 export interface HonestyNote {
   text: string;
@@ -205,13 +231,25 @@ export function honestyNotes(input: {
   health: ExperienceMaterializeHealth | null | undefined;
   excludedByCostBasis: number;
   harvestGapTotal: number;
+  /** ★ W-A · 本轮补采到的往返数（正面数字，与 `harvestGapTotal` 是两件事）。 */
+  adoptedTotal?: number;
+  /** ★ W-C · 因「注入后表现与其结论系统性相反」被自动静音的条数。 */
+  utilityMuted?: number;
 }): HonestyNote[] {
   const notes: HonestyNote[] = [];
   const health = input.health;
   if (health && health.lastTs) {
+    // ★ W-B · `mode` / `pendingEvents` 必须出现在这句里：一个悄悄吃不完的队列在 UI 上与
+    // 「已经跟上了」长得一模一样，而 `fullReason` 是「为什么这次又走了全量」的唯一答案。
+    const mode = health.mode === "incremental"
+      ? "增量"
+      : health.mode === "full"
+        ? `全量${health.fullReason ? `（${FULL_REASON_ZH[health.fullReason] ?? health.fullReason}）` : ""}`
+        : "";
     notes.push({
-      text: `上次重建：${shortTime(health.lastTs)} · 耗时 ${(health.lastMs / 1000).toFixed(1)}s`
-        + ` · ${health.events} 条事件样本`,
+      text: `上次重建：${shortTime(health.lastTs)}${mode ? ` · ${mode}` : ""}`
+        + ` · 耗时 ${(health.lastMs / 1000).toFixed(1)}s · ${health.events} 条事件样本`
+        + (health.pendingEvents > 0 ? ` · 待处理 ${health.pendingEvents} 条` : ""),
       warn: false,
     });
   }
@@ -246,8 +284,37 @@ export function honestyNotes(input: {
       warn: false,
     });
   }
+  if ((input.adoptedTotal ?? 0) > 0) {
+    notes.push({
+      text: `其中 ${input.adoptedTotal} 笔已由「接管补采」以降级语境（只保留确定为真的轴）收进来`
+        + "——它们只会落进更粗的桶，标签声称的范围因此恒等于它实际的支撑。",
+      warn: false,
+    });
+  }
+  if ((input.utilityMuted ?? 0) > 0) {
+    notes.push({
+      text: `${input.utilityMuted} 条经验因「注入之后的表现与它自己的结论系统性相反」被自动静音。`
+        + "这是共现关系，不是因果——我们无法确认模型是否真的采纳了它。",
+      warn: false,
+    });
+  }
   return notes;
 }
+
+/**
+ * 「为什么这次走了全量」的取值表（与后端 `incremental.REASON_*` 逐字对齐）。
+ *
+ * 五条判据各一个，外加一个「增量被总闸关掉」。键集少一个，那一次回全量在 UI 上就变成一句
+ * 没有解释的英文原文。
+ */
+export const FULL_REASON_ZH: Record<string, string> = {
+  taxonomy: "词表版本变更",
+  cuts_drift: "成本分位漂移",
+  node_cap: "节点数越界",
+  no_epoch: "无增量底座",
+  count_mismatch: "水位线对账不符",
+  disabled: "增量已关闭",
+};
 
 /**
  * 检索预演顶部那条状态行（§7.1）。

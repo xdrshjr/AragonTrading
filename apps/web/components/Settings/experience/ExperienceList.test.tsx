@@ -77,6 +77,26 @@ describe("ExperienceList", () => {
     expect(screen.getByText(/共 940 条，已显示前 1 条/)).toBeVisible();
   });
 
+  it("「注入后表现」列三态不同形：无样本 ⇒ 破折号，已自动静音 ⇒ 形状 + 文字双编码（W-C / I-8）", () => {
+    renderList([node()]);
+    expect(screen.getByTestId("experience-list-utility")).toHaveTextContent("—");
+    cleanup();
+
+    renderList([node({
+      utility: { injected: 21, scored: 18, meanNetAfter: -8.4, tAfter: -2.9,
+                 agreement: 0.71, claimSign: 1, ineffective: true },
+      muted: true, muteReason: "ineffective",
+    } as Partial<ExperienceNode>)]);
+    const cell = screen.getByTestId("experience-list-utility");
+    expect(cell).toHaveTextContent("已自动静音");
+    expect(cell).toHaveTextContent("注入 21");
+    expect(cell).toHaveTextContent("-8.4bps");
+    // 颜色绝不单独承载语义：失效的行在这一格左侧带一条竖线。
+    expect(cell).toHaveStyle({ borderLeft: "2px solid var(--warn)" });
+    // J-5 / G-13：共现不是因果。
+    expect(cell.textContent ?? "").not.toMatch(/贡献|带来|因此|导致/);
+  });
+
   it("点击陈述打开详情抽屉", () => {
     const props = renderList([node()]);
     fireEvent.click(screen.getByRole("button", { name: /高波动/ }));

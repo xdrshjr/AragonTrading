@@ -33,6 +33,11 @@ class OpenContext:
     side: str
     signature: dict[str, str]          # 九轴（`taxonomy.OPEN_AXES`）
     wall_ts: int                       # 入场墙钟（`SettledTrip` 不带墙钟，故必须在此冻结）
+    # ★ W-C · 本轮**实际注入**的 L0/L1 经验及其当时断言的净额符号 `(key, layer, claim_sign)`。
+    # 冻结时机是开仓那一刻，理由与冻结九轴语境**完全一致**：决策是在开仓时做的。
+    # `claim_sign` 是冻结值、绝不回填——经验会随新证据翻转，用今天的符号去评判昨天那次注入
+    # 是一句事后诸葛的假话。
+    injected: tuple[tuple[str, str, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -99,13 +104,15 @@ class ContextFacts:
     extra: dict = field(default_factory=dict)
 
 
-def freeze_open_context(facts: ContextFacts, *, seq: int, now_wall: float) -> OpenContext:
+def freeze_open_context(facts: ContextFacts, *, seq: int, now_wall: float,
+                       injected: tuple[tuple[str, str, int], ...] = ()) -> OpenContext:
     """开仓成交 → 九轴语境签名（越界取值一律折成 `unknown`，**绝不丢事件**）。
 
     Args:
         facts: 开仓瞬刻可读的事实。
         seq: 会话级持仓序号（epoch 身份的一半）。
         now_wall: 墙钟秒（入场墙钟的唯一采集点）。
+        injected: 本轮实际注入的 `(经验 key, 层, 断言符号)`（★ W-C）。
 
     Returns:
         冻结的 `OpenContext`；此后该持仓周期内不再变化。
@@ -123,7 +130,7 @@ def freeze_open_context(facts: ContextFacts, *, seq: int, now_wall: float) -> Op
         tax.AXIS_CONFIDENCE: tax.confidence_band(facts.confidence),
     }
     return OpenContext(seq=int(seq), side=signature[tax.AXIS_SIDE], signature=signature,
-                       wall_ts=int(now_wall or time.time()))
+                       wall_ts=int(now_wall or time.time()), injected=tuple(injected))
 
 
 def build_event(opened: OpenContext, trip: SettledTrip, meta: dict,

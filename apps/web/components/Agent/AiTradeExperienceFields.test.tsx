@@ -17,14 +17,26 @@ const OVERVIEW = {
   events: 2043, sessions: 37, symbols: ["BTC-USDT-SWAP"], lastUpdatedTs: 1_700_000_000,
   excludedByCostBasis: 0, rejectedNarrative: 0, harvestGapTotal: 0,
   materializeHealth: { lastTs: 1_700_000_000, lastMs: 100, events: 2043,
-                       slow: false, torn: false, overflow: false },
+                       slow: false, torn: false, overflow: false,
+                       mode: "full", fullReason: null, pendingEvents: 0 },
+  harvest: { gapTotal: 0, adoptedTotal: 0,
+             reasons: { noOpenContext: 0, noTrip: 0, slotEvicted: 0, persistFailed: 0,
+                        offlineNoReadback: 0, offlineInconsistent: 0 } },
   costRegimeCuts: {},
+};
+
+// ★ W-C / R-19 · 「已自动静音 N 条」取自 `/experience/health`（那个接口本就是为轮询拆出来的）。
+const HEALTH = {
+  lastTs: 1_700_000_000, lastMs: 100, events: 2043, slow: false, torn: false, overflow: false,
+  mode: "full", fullReason: null, pendingEvents: 0,
+  epoch: 1, watermarkEventId: 2043, eventCount: 2043, lastMode: "full", utilityMuted: 0,
 };
 
 const SETTINGS = {
   enabled: true, defaultOn: true, writeEnabled: true, minSamples: 8, ironSamples: 20,
   tThreshold: 2, halfLifeDays: 30, staleDays: 90, l0Max: 3, l0MaxChars: 480,
   l1Max: 3, l1MaxChars: 660, distillEnabled: true, l0MinChars: 220, l1MinChars: 164,
+  utilityEnabled: true, utilityMinSamples: 12, utilityTThreshold: 2,
 };
 
 afterEach(() => {
@@ -35,6 +47,7 @@ afterEach(() => {
 beforeEach(() => {
   vi.spyOn(experienceApi, "overview").mockResolvedValue(OVERVIEW as never);
   vi.spyOn(experienceApi, "settings").mockResolvedValue(SETTINGS as never);
+  vi.spyOn(experienceApi, "health").mockResolvedValue(HEALTH as never);
 });
 
 function renderCard(over: Partial<React.ComponentProps<typeof AiTradeExperienceFields>> = {}) {
@@ -84,6 +97,7 @@ describe("AiTradeExperienceFields", () => {
   it("接口失败 ⇒ 只隐藏那两行数字，勾选与启动一律不受影响", async () => {
     vi.spyOn(experienceApi, "overview").mockRejectedValue(new Error("后端没起来"));
     vi.spyOn(experienceApi, "settings").mockRejectedValue(new Error("后端没起来"));
+    vi.spyOn(experienceApi, "health").mockRejectedValue(new Error("后端没起来"));
     const onChange = renderCard();
     await waitFor(() => expect(screen.getByLabelText("启用经验模式")).toBeEnabled());
     expect(screen.queryByTestId("ai-trade-experience-ops-off")).toBeNull();

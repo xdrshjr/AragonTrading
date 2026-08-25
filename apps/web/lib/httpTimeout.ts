@@ -113,6 +113,12 @@ const WRITE_PREFIXES = [
   // 一次超时的 `replace` 导入（它会先删除既有手工与导入节点）必须说「结果未知」而不是「失败」。
   "/experience/rebuild",
   "/experience/import",
+  // ★ W-F（ai-trade-experience-compounding §5.3）· 「清理沉降经验」是**删除**操作：超时必须说
+  // 「结果未知，请刷新核对」而不是「失败」——它确实可能已经删掉了。
+  // **刻意登记在这张前缀表**：往 `WRITE_ACTION_SUFFIXES` 里加 `/prune` 会波及其它家族里将来
+  // 出现的同名末段，而 `/experience/*` 没有路径参数，前缀表本就是为这种形状准备的。
+  // `/experience/utility` 与 `/experience/health` 是**读**路径，走默认档，刻意不进任何一张表。
+  "/experience/prune",
 ] as const;
 
 /**

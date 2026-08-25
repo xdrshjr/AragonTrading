@@ -21,8 +21,15 @@ const SOURCES: { key: string; label: string }[] = [
   { key: "imported", label: SOURCE_LABEL_ZH.imported },
 ];
 
+/** ★ W-F · 「效用」筛选的三态。**纯前端筛选**：读数随列表行一起下发，不必再打一次接口。 */
+const UTILITIES: { key: string; label: string }[] = [
+  { key: "", label: "全部" },
+  { key: "scored", label: "有注入样本" },
+  { key: "ineffective", label: "已判失效" },
+];
+
 /**
- * 经验库工具栏：标的 / 周期 / 坐标轴 / 档位 / 来源 / 搜索。
+ * 经验库工具栏：标的 / 周期 / 坐标轴 / 档位 / 来源 / 效用 / 搜索 + 清理沉降经验。
  *
  * 搜索框 300ms 防抖：每敲一个字就打一次全量取数会让一个 4000 节点的库在输入时明显卡顿，
  * 而这个筛选本来就是「边想边缩小范围」的交互。
@@ -31,12 +38,20 @@ export default function ExperienceToolbar({
   filters,
   symbols,
   bars,
+  utility,
   onChange,
+  onUtilityChange,
+  onPrune,
 }: {
   filters: ExperienceFilters;
   symbols: string[];
   bars: string[];
+  /** 效用筛选的当前值（`""` / `"scored"` / `"ineffective"`）。 */
+  utility: string;
   onChange: (next: ExperienceFilters) => void;
+  onUtilityChange: (next: string) => void;
+  /** 打开「清理沉降经验」的 dryRun 预览；`undefined` ⇒ 不渲染那个按钮。 */
+  onPrune?: () => void;
 }) {
   const [draft, setDraft] = useState(filters.q ?? "");
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -113,6 +128,16 @@ export default function ExperienceToolbar({
         </Select>
       </Field>
 
+      <Field label="注入后表现" htmlFor="exp-utility" className="w-[130px]">
+        <Select
+          id="exp-utility"
+          value={utility}
+          onChange={(e) => onUtilityChange(e.target.value)}
+        >
+          {UTILITIES.map((row) => <option key={row.key} value={row.key}>{row.label}</option>)}
+        </Select>
+      </Field>
+
       <Field label="搜索" htmlFor="exp-q" className="min-w-[200px] flex-1">
         <Input
           id="exp-q"
@@ -125,11 +150,22 @@ export default function ExperienceToolbar({
       <Button
         variant="ghost"
         size="sm"
-        onClick={() => onChange({})}
+        onClick={() => { onChange({}); onUtilityChange(""); }}
         aria-label="清空全部筛选"
       >
         清空筛选
       </Button>
+
+      {onPrune && (
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onPrune}
+          title="删除已沉降的统计经验（跳过置顶与你手动静音的）。会先显示条数再让你确认。"
+        >
+          清理沉降经验
+        </Button>
+      )}
     </div>
   );
 }

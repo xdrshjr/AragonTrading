@@ -595,7 +595,7 @@ class Settings(BaseSettings):
     # 缺席而自动回落到 `group.state`。四处回落缺一，这个开关就只是一句声明（用例 12 是唯一护栏）。
     ai_trade_lifecycle_truth_enabled: bool = True
 
-    # ---- 交易经验上下文图（ai-trade-experience-context-graph §6.5，36 项）----
+    # ---- 交易经验上下文图（context-graph §6.5 的 36 项 + compounding §6.2 的 11 项 = 47 项）----
     # 总闸关 ⇒ 全链路空转：payload 无 `experience` 键 ⇒ `build_decision_prompt` 输出**逐字节**
     # 等于本特性合入前（不变式 I-2，用例 G-2 钉死）。
     ai_trade_experience_enabled: bool = True
@@ -651,14 +651,46 @@ class Settings(BaseSettings):
     # 倒挂时外层先 cancel，drain 自己那半段「cancel 剩余任务」永远不执行，后台任务活着穿过
     # `dispose_engine`。姿态与 `main._cancel_background` 的 5.0 秒逐字一致：先 cancel、再有界收敛。
     ai_trade_experience_drain_timeout_s: float = Field(default=5.0, gt=0, le=60)
-    # ---- ★ E-6（评审 P0-6）：自动物化的规模闸 ----
-    # 超过即**不自动物化**，只在 `materialize_health.overflow` 置真并由 UI 明示。宁可停下来说
+    # ---- ★ E-6（评审 P0-6）：**全量重建**的规模闸 ----
+    # 超过即**不自动跑全量**，只在 `materialize_health.overflow` 置真并由 UI 明示。宁可停下来说
     # 清楚，也不要一个永远跑不完、每 60 秒还叠一个的后台任务（那个线程池全进程共用）。
+    #
+    # ⚠️ **它只约束全量路径**（ai-trade-experience-compounding ★ E-3）。增量物化的成本与库大小
+    # 近似无关——它只读 `id > watermark` 的那一批且被 `incremental_batch` 封顶，触碰的桶数由本批
+    # 事件决定——故增量**不受本闸约束**。下一个读到这个名字的人请勿把它当成总闸再抬回去。
     ai_trade_experience_materialize_max_events: int = Field(default=200000, ge=1000, le=5000000)
     # ---- ★ E-10（评审 P1-4）：导入是不可信输入，体量也是 ----
     ai_trade_experience_import_max_nodes: int = Field(default=2000, ge=1, le=100000)
     # ---- ★ E-15（评审 P1-9）：`enabled:false` = 既不读也不写。默认露出那句明文；关掉只是不显示 ----
     ai_trade_experience_disclose_off_semantics: bool = True
+
+    # ---- W-B 增量物化（ai-trade-experience-compounding §6.2，6 项）----
+    # 三个总闸（incremental / utility / adopt_harvest）**各自独立**，理由是回滚粒度：W-B 出问题
+    # 只需要关增量，不该把 W-C 一并关掉。关任一都退回上一轮（`8e05dd9`）的对应行为。
+    ai_trade_experience_incremental_enabled: bool = True
+    # 一次增量最多吃多少条新事件；满批 ⇒ 脏标志保留、`pendingEvents` 如实回报、下次继续。
+    ai_trade_experience_incremental_batch: int = Field(default=20000, ge=100, le=200000)
+    # `costRegime` 三分位的漂移容忍（判据 B-2）。分位漂了却继续用旧标签 ⇒「今天的 low 和半年前
+    # 的 low 不是一回事」，缓慢失真且不可察觉——超阈即回全量并 `epoch+1`。
+    ai_trade_experience_cuts_drift_bps: float = Field(default=1.0, ge=0, le=100)
+    # `medianNetBps` 的稀疏定宽直方图分箱与夹紧（J-2 允许的唯一误差，UI 必须标「≈」）。
+    ai_trade_experience_hist_bin_bps: float = Field(default=1.0, gt=0, le=50)
+    ai_trade_experience_hist_clamp_bps: float = Field(default=5000.0, gt=0)
+    # 桶级去重标的集合的容量上限；溢出即按 `>= cap` 处理（任何 `global_min_symbols` 阈值都会通过）。
+    ai_trade_experience_symbols_cap: int = Field(default=64, ge=1, le=1000)
+
+    # ---- W-C 效用闭环（4 项）----
+    # False ⇒ 不写台账、不算、不静音（`overview` 也不下发 `utility` 键）。
+    ai_trade_experience_utility_enabled: bool = True
+    # 失效判据的三重门槛：注入次数 ≥ min_samples，且注入后净额均值与其断言符号系统性相反，
+    # 且 |t| ≥ t_threshold。**只导向静音，绝不反向加权**（J-1）。
+    ai_trade_experience_utility_min_samples: int = Field(default=12, ge=1, le=10000)
+    ai_trade_experience_utility_t_threshold: float = Field(default=2.0, gt=0, le=100)
+    ai_trade_experience_utility_detail_rows: int = Field(default=20, ge=1, le=200)
+
+    # ---- W-A 采全（1 项）----
+    # False ⇒ 退回上一轮行为：接管 / 离线平仓的往返**只计缺口、不补采**。
+    ai_trade_experience_adopt_harvest_enabled: bool = True
 
     # ---- 策略与因子挖掘（strategy-factor-discovery §六，env 前缀 DISCOVERY_）----
     # 字段名即环境变量名（DISCOVERY_*，大小写不敏感）。⚠️ 三处联动缺一即静默失效：
@@ -879,7 +911,12 @@ class Settings(BaseSettings):
         schema 硬限，故满足该式即保证「第一条一定装得下」。不满足时的行为是**整层一个字都不渲染**
         （零条目 ⇒ 整段省略），那是一个不报错的空转：用户配了经验模式、日志全绿、模型一条都收不到。
         """
-        from .ai_auto.experience.disclosure import FRAME_OVERHEAD, MIN_ITEM_BUDGET, budget_floor
+        from .ai_auto.experience.disclosure import (
+            FRAME_OVERHEAD,
+            MIN_ITEM_BUDGET,
+            MIN_ITEM_BUDGET_L2,
+            budget_floor,
+        )
 
         for name, value, layer in (
                 ("AI_TRADE_EXPERIENCE_L0_MAX_CHARS", self.ai_trade_experience_l0_max_chars, "l0"),
@@ -889,6 +926,18 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"{name}({value}) 必须 ≥ {floor}（框架句 {FRAME_OVERHEAD[layer]} 字 + 单条上限 "
                     f"{MIN_ITEM_BUDGET} 字），否则该层第一条经验就装不下 ⇒ 整层一个字都不渲染")
+        # ★ D-3 配套（ai-trade-experience-compounding §4.2）· L2 是这条判据漏掉的第三层。
+        # `reflection_max_chars` 是 `Field(ge=0, le=2000)` 的合法配置项且**不在**设置桥表里，
+        # 故它此前完全不受 `budget_floor` 保护：落在 (0, 208) 区间会通过启动期校验，却让 L2
+        # 永远渲染不出一个字——一个不报错的空转（与 `v1:E-7` 逐字同形）。
+        # `0` 是合法的「整段关闭」，中间值一律拒绝启动，姿态与上面两层一致：不静默降级。
+        reflection = self.ai_trade_experience_reflection_max_chars
+        l2_floor = budget_floor("l2")
+        if 0 < reflection < l2_floor:
+            raise ValueError(
+                f"AI_TRADE_EXPERIENCE_REFLECTION_MAX_CHARS({reflection}) 必须为 0（整段关闭）"
+                f"或 ≥ {l2_floor}（框架句 {FRAME_OVERHEAD['l2']} 字 + 单条上限 "
+                f"{MIN_ITEM_BUDGET_L2} 字，L2 无序号前缀），否则反例段一个字都渲染不出来")
         return self
 
     @model_validator(mode="after")

@@ -200,19 +200,45 @@ def enumerate_buckets(events: list[EventView], cuts: dict) -> dict[str, Bucket]:
 
 
 def _combos_for(signature: dict[str, str]) -> list[dict[str, str]]:
-    """一条事件所属的全部桶签名（受限枚举，见模块 docstring 第 1 条）。"""
-    others = [axis for axis in tax.AXES if axis not in (tax.AXIS_SYMBOL, tax.AXIS_BAR)]
+    """一条事件所属的全部桶签名（受限枚举 + ★ J-4：`unknown` / 缺席轴一律不进桶身份）。
+
+    `unknown` 不是一个可行动的语境。留着它会造出一批**标签声称的范围大于实际支撑**的经验
+    （F-2 实测：同一份 prompt 里出现两行逐字相同的铁律），而它们对交易没有任何指导价值。
+
+    **缺席**与 `unknown` 同等处置（★ E-9）：W-A 的接管事件只写四条确定为真的轴，其余轴根本
+    不在字典里；此前的 `signature[axis]` 会当场 `KeyError`，而它会被
+    `service.materialize_bounded` 的裸 `except Exception` 吞成一行 warning ⇒ **每一次物化都失败、
+    图永久停更、日志与用例全绿**。
+
+    事件本身**绝不丢**——它照常落进由已知轴构成的更粗的桶（`{symbol, bar}` 恒在）。
+    `symbol` / `bar` 为空是数据缺陷而不是「未知语境」，由 `harvestGap` 覆盖，故整条返回空。
+
+    Args:
+        signature: 一条事件的完整语境签名（含 `cost_regime`）。
+
+    Returns:
+        该事件所属的桶签名列表（可能为空）。
+    """
+    known = {axis: value for axis, value in signature.items()
+             if value and (value != tax.UNKNOWN
+                           or axis in (tax.AXIS_SYMBOL, tax.AXIS_BAR))}
+    if tax.AXIS_SYMBOL not in known or tax.AXIS_BAR not in known:
+        return []                          # 标的 / 周期缺失是数据缺陷，由 harvestGap 覆盖
+    others = [axis for axis in tax.AXES
+              if axis in known and axis not in (tax.AXIS_SYMBOL, tax.AXIS_BAR)]
     combos: list[dict[str, str]] = []
     for axis in others + [tax.AXIS_BAR]:                       # 一阶：{symbol} × 每一条其他轴
-        combos.append({tax.AXIS_SYMBOL: signature[tax.AXIS_SYMBOL], axis: signature[axis]})
-        combos.append({axis: signature[axis]})                 # 跨标的同形桶
+        combos.append({tax.AXIS_SYMBOL: known[tax.AXIS_SYMBOL], axis: known[axis]})
+        combos.append({axis: known[axis]})                     # 跨标的同形桶
     for axis in others:                                        # 二阶：{symbol,bar} × 每一条其他轴
-        pair = {tax.AXIS_BAR: signature[tax.AXIS_BAR], axis: signature[axis]}
-        combos.append({tax.AXIS_SYMBOL: signature[tax.AXIS_SYMBOL], **pair})
+        pair = {tax.AXIS_BAR: known[tax.AXIS_BAR], axis: known[axis]}
+        combos.append({tax.AXIS_SYMBOL: known[tax.AXIS_SYMBOL], **pair})
         combos.append(dict(pair))
-    for axes in THIRD_ORDER:                                   # 三阶：4 组
-        combos.append({axis: signature[axis] for axis in axes})
-        combos.append({axis: signature[axis] for axis in axes if axis != tax.AXIS_SYMBOL})
+    for axes in THIRD_ORDER:                                   # 三阶：任一轴缺席 ⇒ 整条跳过
+        if any(axis not in known for axis in axes):
+            continue
+        combos.append({axis: known[axis] for axis in axes})
+        combos.append({axis: known[axis] for axis in axes if axis != tax.AXIS_SYMBOL})
     return combos
 
 
@@ -276,12 +302,30 @@ def lesson_key(bucket: Bucket, template: str) -> str:
     return "lesson:" + hashlib.sha1(raw).hexdigest()[:12]      # noqa: S324 —— 身份哈希，非安全用途
 
 
+# 子句边界（`_trim_to_clause` 用）：越界时**丢掉最后一个完整子句**，绝不砍在字中间。
+_CLAUSE_MARKS = "。；，、）%"
+
+
 def render_label(bucket: Bucket, stats: BucketStats) -> str:
-    """把桶统计压成一句 ≤120 字的中文陈述（六模板择一，纯字符串拼接）。"""
+    """把桶统计压成一句 ≤120 字的中文陈述（六模板择一，纯字符串拼接）。
+
+    ★ **J-6 / R-18 · 这条纪律覆盖 `render_label`。** label 是**逐字进 prompt 的正文**，此前的
+    `text[:119] + "…"` 会把一个统计结论切成残句（与 `disclosure.format_counter` 的 F-3 同一类
+    产品缺陷）。本轮的处置是「让它不可能触发」+「真的越界时丢掉最后一个完整子句」：
+    实算最坏长度是 **111**（A-9 把这个数逐值钉死；J-3 给每条轴补了轴名前缀之后比 spec 估的
+    110 多 1 个字），余量只剩 9 字。
+    """
     prefix = _prefix(bucket.signature)
     body = _TEMPLATES[stats.template](bucket, stats)
     text = f"{prefix}{body}"
-    return text if len(text) <= _LABEL_MAX else text[:_LABEL_MAX - 1] + "…"
+    return text if len(text) <= _LABEL_MAX else _trim_to_clause(text, _LABEL_MAX)
+
+
+def _trim_to_clause(text: str, limit: int) -> str:
+    """把 `text` 收进 `limit` 字，且**只在子句边界收尾**；找不到边界 ⇒ 空串（宁可不说）。"""
+    head = text[:limit]
+    cut = max((head.rfind(mark) for mark in _CLAUSE_MARKS), default=-1)
+    return head[:cut + 1] if cut >= 0 else ""
 
 
 def _prefix(signature: dict[str, str]) -> str:

@@ -1,6 +1,6 @@
-"""路由：交易经验库（ai-trade-experience-context-graph §五）。
+"""路由：交易经验库（experience-context-graph §五 + experience-compounding §5.1）。
 
-十一个端点，全部走 `/api` 前缀并经既有 `OriginGuardMiddleware`（ASGI 中间件，新路由自动受保护）。
+十四个端点，全部走 `/api` 前缀并经既有 `OriginGuardMiddleware`（ASGI 中间件，新路由自动受保护）。
 错误体统一 `{error:{code,message}}`（`main.py` 全局处理器包装）。
 
 三条贯穿本模块的纪律：
@@ -31,6 +31,7 @@ from ..schemas import (
     ExperienceNodeIn,
     ExperienceNodePatchIn,
     ExperiencePreviewIn,
+    ExperiencePruneIn,
     ExperienceRebuildIn,
 )
 
@@ -49,13 +50,19 @@ def _filters(inst_id: str | None, bar: str | None, axis: str | None, tier: str |
 
 
 @router.get("/experience/overview")
-async def experience_overview(session: AsyncSession = Depends(get_session)) -> dict:
-    """概览条：档位分布 + 事件样本 + 覆盖标的 + 三个诚实性计数 + 物化健康（六个键）。
+async def experience_overview(session: AsyncSession = Depends(get_session),
+                              settings: Settings = Depends(get_settings)) -> dict:
+    """概览条：档位分布 + 事件样本 + 覆盖标的 + 三个诚实性计数 + 物化健康（九个键）。
 
     `materializeHealth` 是 F-2 那堵规模墙的露出点，`harvestGapTotal` 是 R-15 那段幸存者偏差的
     露出点。两者在 §7.1 各有明确渲染落点——后端算了却没有呈现位置的观测量等于死码（I-8）。
+
+    ★ 本轮新增 `harvest`（采集完整性明细）与 `utility`（效用闭环），阈值经
+    `resolve_experience_settings` 取——`utility` 的总闸是可写配置，直接读 `get_settings()`
+    会让面板上关掉的东西在这里照常下发（★ E-3 / I-10）。
     """
-    return await experience_service.overview(session)
+    derived = await experience_service.resolve_experience_settings(session, settings)
+    return await experience_service.overview(session, derived)
 
 
 @router.get("/experience/graph")
@@ -79,21 +86,26 @@ async def experience_lessons(instId: str | None = None, bar: str | None = None,
                              source: str | None = None, q: str | None = None,
                              offset: int = Query(default=0, ge=0),
                              limit: int = Query(default=50, ge=1, le=500),
-                             session: AsyncSession = Depends(get_session)) -> dict:
+                             session: AsyncSession = Depends(get_session),
+                             settings: Settings = Depends(get_settings)) -> dict:
     """列表视图——图谱的**无障碍等价形态**（只有图的界面对读屏用户不可用）。
 
     与图谱**同数据源同筛选判据**，故同一筛选下的条数在结构上不可能不一致（A-22）。
     """
     filters = {**_filters(instId, bar, axis, tier, source, q), "offset": offset, "limit": limit}
-    return await experience_service.lessons_view(session, filters)
+    derived = await experience_service.resolve_experience_settings(session, settings)
+    return await experience_service.lessons_view(session, derived, filters)
 
 
 @router.get("/experience/nodes/{node_id}")
 async def experience_node_detail(node_id: int,
                                  evidenceLimit: int = Query(default=20, ge=1, le=200),
-                                 session: AsyncSession = Depends(get_session)) -> dict:
-    """详情抽屉：统计 / 语境签名 / 版本链 / 冲突 / 最近 N 笔溯源证据。"""
-    detail = await experience_service.node_detail(session, node_id, evidence_limit=evidenceLimit)
+                                 session: AsyncSession = Depends(get_session),
+                                 settings: Settings = Depends(get_settings)) -> dict:
+    """详情抽屉：统计 / 语境签名 / 版本链 / 冲突 / 最近 N 笔溯源证据 + **注入后表现**。"""
+    derived = await experience_service.resolve_experience_settings(session, settings)
+    detail = await experience_service.node_detail(session, derived, node_id,
+                                                  evidence_limit=evidenceLimit)
     if detail is None:
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "经验节点不存在"})
     return detail
@@ -169,6 +181,10 @@ async def experience_rebuild(body: ExperienceRebuildIn,
     阈值经 `resolve_experience_settings` 取（★ E-3）：不这样做，用户刚在上面那个面板里把
     「铁律样本门槛」从 20 改成 5、保存、再点「重建图谱」，得到的还是旧阈值的结果。
 
+    ★ 本轮 `scope` 真的开始有取值了：`"full"` = **强制**全量并 `epoch+1`（下拉菜单里那一项），
+    `"stat"`（默认）= 由 W-B 的五条判据自选增量还是全量。两者都是用户明确要求的动作，
+    都不受去抖与规模闸约束。
+
     走 `rebuild_manual` 而不是裸 `rebuild`：它与后台物化共用同一处健康写回。少了那一步，
     §7.1 概览条的「上次重建」永远停在上一次**自动**物化的时刻，而 `torn` / `overflow` 两条
     警告里写着的「建议手动重建」在用户照做之后仍不消失。
@@ -177,14 +193,13 @@ async def experience_rebuild(body: ExperienceRebuildIn,
     `/experience/rebuild`——F-2 自己就论证了全库重建在大库上超 20 秒是常态，落 `FAST_MS`
     会让这个按钮**必然**假超时。
     """
-    del body                     # `scope` v1 只有 "stat" 一种取值；保留形参以便下一轮开放
     derived = await experience_service.resolve_experience_settings(session, settings)
     try:
         # **等锁必须有界**，即便这是一个用户明确要求的动作：裸 `async with` 在持锁者异常消失后
         # 会把这个请求永久挂住，而挂起的 HTTP 请求既不返回也不报错。给它比后台任务宽裕得多的
         # 死线（×3），等不到就如实回 409 让用户稍后再试——「正在重建」是一个可执行的答案。
         return await experience_service.rebuild_manual(
-            session, derived,
+            session, derived, scope=body.scope,
             lock_timeout=float(derived.ai_trade_experience_materialize_timeout_s) * 3)
     except experience_service.MaterializeBusyError as exc:
         raise HTTPException(409, detail={
@@ -216,6 +231,52 @@ async def experience_preview(body: ExperiencePreviewIn,
     return await experience_service.preview(
         session, derived, axes,
         live_sessions=get_ai_trade_manager().experience_live_sessions())
+
+
+@router.get("/experience/utility")
+async def experience_utility(instId: str | None = None, bar: str | None = None,
+                             minInjected: int = Query(default=0, ge=0),
+                             limit: int = Query(default=200, ge=1, le=500),
+                             session: AsyncSession = Depends(get_session),
+                             settings: Settings = Depends(get_settings)) -> dict:
+    """效用面板：「这条经验被喂进去之后，那些单后来怎么样」。
+
+    ★ **J-5 · 这是共现，不是因果。** 我们并不知道模型是否真的采纳了其中任何一条，故全部 wire 键
+    与文案一律用「注入后表现」「与事实一致率」，绝不使用「贡献」「带来」（G-13 源码扫描钉死）。
+
+    筛选判据复用 `service._match`——与列表 / 图谱**同一个**，故同一筛选下三处的条数不可能不一致。
+    """
+    derived = await experience_service.resolve_experience_settings(session, settings)
+    return await experience_service.utility_view(session, derived, {
+        "instId": instId, "bar": bar, "minInjected": minInjected, "limit": limit})
+
+
+@router.get("/experience/health")
+async def experience_health(session: AsyncSession = Depends(get_session),
+                            settings: Settings = Depends(get_settings)) -> dict:
+    """物化健康 + epoch 现状 + 已自动静音条数（**轮询专用**，故从 `overview` 里拆出来）。
+
+    `overview` 会扫整张节点表。把一个每几秒轮询一次的接口挂在一次全表扫上，是那种「先能跑、
+    后来变慢、再也查不出为什么」的典型来源。启动弹窗那行「已自动静音 N 条」也取自这里——
+    **零新增请求**。
+    """
+    derived = await experience_service.resolve_experience_settings(session, settings)
+    return await experience_service.health_view(session, derived)
+
+
+@router.post("/experience/prune")
+async def experience_prune(body: ExperiencePruneIn,
+                           session: AsyncSession = Depends(get_session)) -> dict:
+    """清理**沉降**经验（`source="stat"` 且已静音且非用户静音且未置顶）。
+
+    **绝不静默批删**：`dryRun=true` 必须先跑一次并把条数显示给用户，二次确认之后才真删
+    （A-34 断言两次的条数一致）。置顶与用户静音一律跳过并如实回报条数——用户按下过的每一个
+    动作都必须在这条路径上活着。
+
+    客户端**必须落写路径超时档**（`lib/httpTimeout.ts` 的 `WRITE_PREFIXES`）：它是删除操作，
+    超时要说「结果未知，请刷新核对」而不是「失败」。
+    """
+    return await experience_service.prune_stale(session, dry_run=bool(body.dryRun))
 
 
 @router.get("/experience/export")

@@ -225,7 +225,7 @@ async def test_a44_torn_rebuild_is_visible_and_does_not_raise():
 
         sm = get_sessionmaker()
         async with sm() as session:
-            wire = await experience_service.overview(session)
+            wire = await experience_service.overview(session, get_settings())
         assert wire["materializeHealth"]["torn"] is True, (
             "撕裂没有被下发 ⇒ 用户看到的是「经验不再更新了，但哪里都没有报错」")
     finally:
@@ -261,15 +261,19 @@ async def test_a52_materialize_is_a_process_wide_single_slot_with_a_scale_gate()
         assert sum(1 for r in results if r["ran"]) == 1
         assert all(r["reason"] == "busy" for r in results if not r["ran"])
 
-        # 规模闸：事件数超上限 ⇒ **不跑**，只在 health 里落 overflow 并由 UI 明示。
+        # 规模闸：事件数超上限 ⇒ **全量不跑**，只在 health 里落 overflow 并由 UI 明示。
+        # ★ E-3（compounding）· 本轮把这道闸从「事件总数」判据下沉成「**本次真的要跑全量**」
+        # 判据，故这里必须同时把增量关掉，否则大库上走的是增量、`overflow` 恒为 false
+        # （那正是 G-17 断言的另一半：规模墙只约束全量）。
         # `model_copy` 绕过 `Field(ge=1000)` 的域，才能在 24 条事件上构造出越界断面。
         tiny = get_settings().model_copy(
-            update={"ai_trade_experience_materialize_max_events": 5})
+            update={"ai_trade_experience_materialize_max_events": 5,
+                    "ai_trade_experience_incremental_enabled": False})
         overflow = await experience_service.materialize_bounded(tiny, force=True)
         assert overflow["ran"] is False and overflow["reason"] == "overflow"
         sm = get_sessionmaker()
         async with sm() as session:
-            wire = await experience_service.overview(session)
+            wire = await experience_service.overview(session, get_settings())
         assert wire["materializeHealth"]["overflow"] is True, (
             "越界后没有在 UI 上说话 ⇒ 用户看到的是「经验不再更新了，但哪里都没有报错」")
     finally:
@@ -291,10 +295,11 @@ async def test_a45_dirty_flag_survives_the_process():
 
         result = await experience_service.consume_dirty_flag(get_settings())
         assert result["ran"] is True, "冷启动没有消费脏标志 ⇒ 关软件那一笔永远不进图"
+        assert result.get("mode") == "full", "首次物化必须是全量（判据 B-4：还没有 epoch 底座）"
 
         async with sm() as session:
             still_dirty = await repo.get_app_setting(session, experience_service.DIRTY_KEY, False)
-            wire = await experience_service.overview(session)
+            wire = await experience_service.overview(session, get_settings())
         assert bool(still_dirty) is False, "补物化跑完没有清脏标志 ⇒ 每次启动都会重建一次"
         assert wire["materializeHealth"]["lastTs"] > 0
 
@@ -320,6 +325,17 @@ async def test_debounce_only_skips_when_not_forced():
         assert bool(dirty) is True, "被去抖掉的那一次必须留下脏标志，否则那批事件永远不进图"
 
         # 终局物化（stop / pause / 冷启动补跑）豁免去抖——那是最后一次机会。
+        # ★ W-B 之后它会先问一句「水位线之后还有新事件吗」：没有 ⇒ `up_to_date`（**不是**再跑
+        # 一次全库重建），并顺手把脏标志清掉。这正是「一次物化的成本与库大小近似无关」的另一面。
+        third = await experience_service.materialize_bounded(get_settings(), force=True)
+        assert third["ran"] is False and third["reason"] == "up_to_date"
+        async with sm() as session:
+            assert bool(await repo.get_app_setting(
+                session, experience_service.DIRTY_KEY, False)) is False, (
+                "确认没有待处理事件之后仍留着脏标志 ⇒ 每 60 秒白问一次")
+
+        # 真的又有新事件时，终局物化照常跑（豁免去抖这条语义没有变）。
+        await _seed(_event_rows(6, net=-18.0, first_seq=900))
         assert (await experience_service.materialize_bounded(get_settings(), force=True))["ran"]
     finally:
         await dispose_engine()

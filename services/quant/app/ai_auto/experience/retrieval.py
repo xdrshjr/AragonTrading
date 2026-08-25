@@ -20,10 +20,15 @@ from dataclasses import dataclass, field
 from . import taxonomy as tax
 from .graph import Graph, GraphNode
 
-_EPS = 1e-9
-# 势均力敌的相对差异阈：`rel = |m1−m2| / max(m1,m2,ε)`。用**相对**判据的理由见 §4.6 步骤 4——
-# `match = Σ A(c)·w_applies` 无量纲上界，会随激活语境数增长，绝对阈值在种子多的轮次形同虚设。
-_DISPUTE_REL = 0.25
+# 势均力敌的**绝对**覆盖率差阈：`gap = |m1 − m2|`（★ E-14）。
+#
+# 这个阈值此前是**相对**的，理由逐字写着「`match = Σ A(c)·w_applies` 无量纲上界，会随激活语境
+# 数增长」。W-E 的覆盖率归一之后那个前提就没了：`match ∈ [0,1]` 且满匹配恒等于 1.0，继续用
+# 相对判据会让一大批满匹配的矛盾对同时取 1.0 ⇒ `rel = 0` ⇒ 双双被踢出 L0/L1。
+# 留着那句注释就是在源码里留一句假话（`v1:I-2` 的成文教训），故一并改成绝对量纲：
+# 「两条结论的覆盖率相差不到 0.25 ⇒ 谁也压不倒谁 ⇒ 都不进纲要，打包成一条争议送 L2」。
+# 方向仍是单侧安全的（说得更少，与 J-1 一致）。
+_DISPUTE_GAP = 0.25
 
 
 @dataclass(frozen=True)
@@ -121,10 +126,22 @@ def activate(graph: Graph, seed: ContextSeed, cfg: RetrievalConfig) -> dict[str,
 
 def _score(node: GraphNode, activation: dict[str, float], graph: Graph,
            seed: ContextSeed, cfg: RetrievalConfig) -> ScoredLesson:
-    """步骤 3 · 打分 `match · evidence · recency · scope · (pinned ? 1.5 : 1)`。"""
-    match = 0.0
-    for context_key, weight in graph.applies_in.get(node.key, ()):
-        match += activation.get(context_key, 0.0) * float(weight)
+    """步骤 3 · 打分 `match · evidence · recency · scope · (pinned ? 1.5 : 1)`。
+
+    ★ **E-2（F-5 下半）· `match` 的语义订正为「这条经验自身的条件被当前语境满足的比例」**，
+    值域 `[0,1]`。此前 `match = Σ A(c)·w`（而 `w` 恒为 1）= **命中的轴数**，于是：
+      · 签名越宽分越高（实测三条四轴经验 `match` 全部 = 4.0）；
+      · **一半条件不成立的经验与完全匹配的经验同分**——四轴命中两轴 = 两轴命中两轴。
+    覆盖率归一之后，前者 0.5、后者 1.0。这是需求里「精准」二字在打分函数里的落点。
+
+    **分母用「边权之和」而不是 `len(node.signature)`**：签名与边可能因物化撕裂而不同步
+    （`v1:E-14` 刻意保留了撕裂可见这一形态），用边算才是用「图上真的有什么」算；且
+    `_attach_seeded_lessons` 给 manual / imported / narrative 补的边权同样是 1.0，两者一致。
+    """
+    edges = graph.applies_in.get(node.key, ())
+    denominator = sum(float(weight) for _context, weight in edges) or 1.0
+    match = sum(activation.get(context_key, 0.0) * float(weight)
+                for context_key, weight in edges) / denominator
     recency = _recency(node.last_seen_ts, seed.now_wall, cfg.half_life_days)
     scope = _scope_factor(node, seed)
     evidence = _evidence(node, cfg)
@@ -218,8 +235,10 @@ def _suppress(scored: list[ScoredLesson],
               graph: Graph) -> tuple[list[ScoredLesson], list[tuple[str, str]], list[str]]:
     """步骤 4 · 反例压制。
 
-    - `rel > 0.25` ⇒ 保留高分者，低分者进 `suppressed`（UI 可见，prompt 不出现）；
-    - `rel ≤ 0.25`（势均力敌）⇒ **两条都不进 L0/L1**，打包成一条「争议」送 L2。
+    - 覆盖率差 `> 0.25` ⇒ 保留高分者，低分者进 `suppressed`（UI 可见，prompt 不出现）；
+    - 覆盖率差 `≤ 0.25`（势均力敌）⇒ **两条都不进 L0/L1**，打包成一条「争议」送 L2。
+
+    ★ **E-14**：判据在 W-E 之后是**绝对**的（`match ∈ [0,1]` 是覆盖率），见 `_DISPUTE_GAP`。
     """
     by_key = {item.node.key: item for item in scored}
     dropped: set[str] = set()
@@ -232,9 +251,8 @@ def _suppress(scored: list[ScoredLesson],
             rival = by_key.get(rival_key)
             if rival is None or rival_key in dropped:
                 continue
-            high = max(item.match, rival.match, _EPS)
-            rel = abs(item.match - rival.match) / high
-            if rel > _DISPUTE_REL:
+            gap = abs(item.match - rival.match)
+            if gap > _DISPUTE_GAP:
                 loser = rival if item.score >= rival.score else item
                 dropped.add(loser.node.key)
                 suppressed.append(loser.node.key)
@@ -279,8 +297,14 @@ def _signature_jaccard(left: GraphNode, right: GraphNode) -> float:
 def most_conflicting(graph: Graph, result: RetrievalResult, action: str) -> ScoredLesson | None:
     """反思轮的反例：与提议动作**最相冲突**的 1 条（§4.1 / §4.8 的 L2）。
 
-    判据：提议开多 ⇒ 找 `side=long` 且净额均值为负、`|t|` 最大的一条；开空同理；平仓 ⇒ 取
-    L0/L1 里净额均值绝对值最大的一条（复核官需要知道「这一类平仓历史上的净额长什么样」）。
+    判据：提议开多 ⇒ 找 `side=long` 且净额均值为负、`|t|` 最大的一条；开空同理；**平仓 ⇒ 取
+    净额均值为负、`|t|` 最大的一条**（★ D-1）。
+
+    ★ **D-1（F-1）· `close` 分支此前不看符号**，取的是 `|meanNetBps|` 最大的那条——实测会挑中
+    一条 **+88bps 的盈利经验**放在「与本次提议最相冲突的一条」这个标题下交给复核官。而复核官的
+    裁决空间只有 `confirm` / `abort` / 缩仓，把一条**支持**平仓的证据标注成「最相冲突」，唯一
+    可能的行为后果是**否掉一次本该确认的平仓**。这不是排序不佳，是陈述不实（`v1:I-9`）。
+    这一轮确实没有反例时，正确的产品行为是**什么都不说**，而不是找一条最响的话来填满这个位置。
 
     Args:
         graph: 会话内存图。
@@ -295,8 +319,12 @@ def most_conflicting(graph: Graph, result: RetrievalResult, action: str) -> Scor
     if not pool:
         return None
     if want_side is None:
-        return max(pool, key=lambda item: (abs(float(item.node.stats.get("meanNetBps") or 0.0)),
-                                           item.node.key))
+        negatives = [item for item in pool
+                     if float(item.node.stats.get("meanNetBps") or 0.0) < 0]
+        if not negatives:
+            return None
+        return max(negatives, key=lambda item: (abs(float(item.node.stats.get("tStat") or 0.0)),
+                                                item.node.key))
     conflicting = [item for item in pool
                    if item.node.signature.get(tax.AXIS_SIDE) == want_side
                    and float(item.node.stats.get("meanNetBps") or 0.0) < 0]

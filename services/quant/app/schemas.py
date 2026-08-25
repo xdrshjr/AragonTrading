@@ -2558,9 +2558,25 @@ class ExperiencePreviewIn(BaseModel):
 
 
 class ExperienceRebuildIn(BaseModel):
-    """手动重建（`scope` 目前只有 `stat` 一种；保留字段以便下一轮开放增量范围）。"""
+    """手动重建的范围（ai-trade-experience-compounding §5.2：本轮 `scope` 真的开始有取值了）。
 
-    scope: Literal["stat"] = "stat"
+    - `stat`（默认）：由 W-B 的五条判据自选增量还是全量——「智能」那一档。
+    - `full`：**强制**全量重建并 `epoch+1`（重写累加器底座）。它是增量算错时的兜底出口，
+      也是「正确性预言机」：两条路径的产物必须逐值相等（门禁 G-10）。
+    """
+
+    scope: Literal["stat", "full"] = "stat"
+
+
+class ExperiencePruneIn(BaseModel):
+    """清理沉降经验（`POST /api/experience/prune`）。
+
+    `dryRun` 默认 **True**：这是一个删除操作，默认值必须站在「先看一眼」那一侧。UI 也必须先跑
+    一次 dryRun 把条数显示给用户再二次确认——**绝不静默批删**（A-34）。
+    """
+
+    scope: Literal["stale"] = "stale"
+    dryRun: bool = True
 
 
 class ExperienceImportIn(BaseModel):
@@ -2603,6 +2619,12 @@ class ExperienceSettingsIn(BaseModel):
     l1Max: int | None = Field(default=None, ge=0, le=10)
     l1MaxChars: int | None = Field(default=None, ge=0, le=4000)
     distillEnabled: bool | None = None
+    # ★ W-C（ai-trade-experience-compounding §6.3）· 效用闭环的三项可写阈值。
+    # 域必须与 `config.py` 的 `Field(...)` 逐字一致：两处不同的那一半会变成「面板收得下、
+    # 运行时夹紧到别的值」——用户看到的与系统用的不是一个数，而且不报错。
+    utilityEnabled: bool | None = None
+    utilityMinSamples: int | None = Field(default=None, ge=1, le=10000)
+    utilityTThreshold: float | None = Field(default=None, gt=0, le=100)
 
 
 class ExperienceSettingsOut(BaseModel):
@@ -2621,6 +2643,9 @@ class ExperienceSettingsOut(BaseModel):
     l1Max: int
     l1MaxChars: int
     distillEnabled: bool
+    utilityEnabled: bool
+    utilityMinSamples: int
+    utilityTThreshold: float
     l0MinChars: int          # 下限判据如实下发，使 UI 能在提交前就说清楚为什么不合法（I-8）
     l1MinChars: int
 

@@ -750,3 +750,118 @@ class AiExperienceEdge(Base):
     weight: Mapped[float] = mapped_column(Float, default=0.0)
     support: Mapped[int] = mapped_column(Integer, default=0)
     updated_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiExperienceBucket(Base):
+    """桶级**充分统计量**，按 ``epoch`` 分版（ai-trade-experience-compounding §6.1）。
+
+    这张表是「真正的增量物化」的底座：有了它，一次物化不再需要读全表事件，只需要读
+    ``id > watermark`` 的那一批、把它们折进对应桶的累加器、再从累加器还原统计量。
+    产物必须与「同一批事件跑一次全量重建」**逐值相等**（门禁 G-10 机械钉死）。
+
+    **为什么按 ``epoch`` 分版而不是就地改**：``costRegime`` 的三分位是按当前事件全集算的，而它
+    决定每条事件的桶身份——**分位一变，历史桶全错**。把分位冻结成一个 epoch，让每一次全量重建
+    开一个新版本，是解开这处全局耦合的唯一诚实做法（漂移超阈即回全量并 ``epoch+1``）。
+
+    ``first_ts_kept`` / ``last_ts_kept`` / ``first_ts_all`` / ``last_ts_all`` **必须存四个**：
+    ``compute_stats`` 在「合格事件非空 / 为空」两种情况下取自**不同的集合**，只存两个就无法与
+    全量逐值等价。
+    """
+
+    __tablename__ = "ai_experience_buckets"
+    __table_args__ = (
+        UniqueConstraint("epoch", "key", name="uq_ai_exp_bucket"),
+        Index("ix_ai_exp_bucket_epoch", "epoch"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    epoch: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    key: Mapped[str] = mapped_column(String(255), default="")
+    signature_json: Mapped[str] = mapped_column(Text, default="{}")
+    scope: Mapped[str] = mapped_column(String(8), default="symbol")
+    n: Mapped[int] = mapped_column(Integer, default=0)          # 只数 I-7 合格者
+    excluded: Mapped[int] = mapped_column(Integer, default=0)
+    wins: Mapped[int] = mapped_column(Integer, default=0)
+    sum_net: Mapped[float] = mapped_column(Float, default=0.0)
+    sum_net_sq: Mapped[float] = mapped_column(Float, default=0.0)
+    sum_hold: Mapped[float] = mapped_column(Float, default=0.0)
+    # 每个均值的**分母各自独立**：`meanCostBps` 的分母是「有 cost 的条数」，不是 `n`。
+    sum_cost: Mapped[float] = mapped_column(Float, default=0.0)
+    cost_n: Mapped[int] = mapped_column(Integer, default=0)
+    sum_abs_gross: Mapped[float] = mapped_column(Float, default=0.0)
+    gross_n: Mapped[int] = mapped_column(Integer, default=0)
+    sum_edge_err: Mapped[float] = mapped_column(Float, default=0.0)
+    edge_n: Mapped[int] = mapped_column(Integer, default=0)
+    hist_json: Mapped[str] = mapped_column(Text, default="{}")      # 稀疏定宽直方图 {箱号: 计数}
+    symbols_json: Mapped[str] = mapped_column(Text, default="[]")   # 有界去重集合
+    symbols_overflow: Mapped[bool] = mapped_column(Boolean, default=False)
+    first_ts_kept: Mapped[int] = mapped_column(Integer, default=0)
+    last_ts_kept: Mapped[int] = mapped_column(Integer, default=0)
+    first_ts_all: Mapped[int] = mapped_column(Integer, default=0)
+    last_ts_all: Mapped[int] = mapped_column(Integer, default=0)
+    cost_fallback: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiExperienceContextCount(Base):
+    """语境计数器：``co_occurs`` 的 NPMI 与 ``context`` 节点 ``support`` 的**唯一**来源。
+
+    ``b_key == ""`` 表示单点计数（``count(a)``），否则是共现计数（``count(a, b)``，``a < b``）。
+
+    规模估算：闭合词表下语境节点约 10 轴 × 平均 4 取值 + 标的数 ≈ 50–80 个，两两配对 ≈ 3200 行
+    上限。**这是本设计敢把 ``co_occurs`` 做成计数器而不是每次重扫事件的全部理由。**
+    """
+
+    __tablename__ = "ai_experience_context_counts"
+    __table_args__ = (
+        UniqueConstraint("epoch", "a_key", "b_key", name="uq_ai_exp_ctx_count"),
+        Index("ix_ai_exp_ctx_epoch", "epoch"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    epoch: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    a_key: Mapped[str] = mapped_column(String(96), default="")
+    b_key: Mapped[str] = mapped_column(String(96), default="")
+    count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiExperienceInjection(Base):
+    """注入台账（append-only）：「本轮把哪几条经验喂进去了，那一单后来怎么样」。
+
+    ``node.weight`` 表达的是「这个语境桶历史上赚不赚」，**不是**「把这句话讲给模型之后有没有
+    变好」——两者是完全不同的量，而后者此前系统从来没有记录过答案。没有它，用户在管理界面上
+    回答不了「这条经验值不值得留着」（那正是「经验管理」这件事的核心问题），
+    ``v1:R-1``（叙事 → 被读到 → 被照做 → 又被写成经验的自我强化回路）也没有任何检测手段。
+
+    **自然键与 ``ai_experience_events`` 逐字一致**（``group_id, inst_id, seq, exit_ts``），
+    故 ``INSERT OR IGNORE`` 的幂等语义两张表同源。
+
+    ``claim_sign`` 是该经验**注入当时**断言的净额符号，**冻结值、绝不回填**：经验会随新证据翻转，
+    用今天的符号去评判昨天那次注入是一句事后诸葛的假话。
+
+    ``net_bps`` / ``fee_known`` / ``cost_basis`` 反规范化自事件行：效用聚合是热路径，join 不划算，
+    且两者**同刻写入**（同一次 commit）故不存在漂移窗口。
+    """
+
+    __tablename__ = "ai_experience_injections"
+    __table_args__ = (
+        UniqueConstraint("group_id", "inst_id", "seq", "exit_ts", "lesson_key",
+                         name="uq_ai_exp_injection"),
+        Index("ix_ai_exp_injection_lesson", "lesson_key"),
+        Index("ix_ai_exp_injection_exit", "exit_ts"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[str] = mapped_column(String(48), default="")
+    inst_id: Mapped[str] = mapped_column(String(32), default="")
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    exit_ts: Mapped[int] = mapped_column(Integer, default=0)
+    lesson_key: Mapped[str] = mapped_column(String(96), default="", index=True)
+    layer: Mapped[str] = mapped_column(String(4), default="l0")     # l0|l1（L2 是反思轮，不计）
+    claim_sign: Mapped[int] = mapped_column(Integer, default=0)     # -1|0|+1，冻结值
+    injected_wall_ts: Mapped[int] = mapped_column(Integer, default=0)
+    net_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fee_known: Mapped[bool] = mapped_column(Boolean, default=False)
+    cost_basis: Mapped[str] = mapped_column(String(8), default="gross")
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)

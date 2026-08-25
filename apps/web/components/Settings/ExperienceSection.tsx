@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import ConfirmDialog from "@/components/ui/ConfirmDialog";
 import { Button, Card, Field, Input, Tabs } from "@/components/ui";
-import { honestyNotes, relativeTime } from "@/lib/experience";
+import { HARVEST_REASON_ZH, honestyNotes, relativeTime } from "@/lib/experience";
 import { experienceApi } from "@/lib/experienceApi";
 import type {
   ExperienceFilters,
@@ -12,19 +12,24 @@ import type {
   ExperienceNode,
   ExperienceNodeDetail,
   ExperienceOverview,
+  ExperiencePruneResult,
   ExperienceSettings,
+  ExperienceUtilityPage,
 } from "@/lib/experienceTypes";
 import ExperienceDetailDrawer from "./experience/ExperienceDetailDrawer";
 import ExperienceEditor from "./experience/ExperienceEditor";
 import ExperienceGraphCanvas from "./experience/ExperienceGraphCanvas";
 import ExperienceList from "./experience/ExperienceList";
+import ExperiencePrunePrompt from "./experience/ExperiencePrunePrompt";
 import ExperienceRetrievalPreview from "./experience/ExperienceRetrievalPreview";
 import ExperienceToolbar from "./experience/ExperienceToolbar";
+import ExperienceUtilityPanel from "./experience/ExperienceUtilityPanel";
 
 const BARS = ["1m", "5m", "15m", "30m", "1H", "4H", "12H", "1D"];
 const TABS = [
   { key: "list", label: "列表" },
   { key: "graph", label: "图谱" },
+  { key: "utility", label: "注入后表现" },
   { key: "preview", label: "检索预演" },
 ];
 
@@ -41,7 +46,11 @@ export default function ExperienceSection() {
   const [settings, setSettings] = useState<ExperienceSettings | null>(null);
   const [graph, setGraph] = useState<ExperienceGraphView | null>(null);
   const [lessons, setLessons] = useState<ExperienceLessonPage | null>(null);
+  const [utility, setUtility] = useState<ExperienceUtilityPage | null>(null);
   const [filters, setFilters] = useState<ExperienceFilters>({});
+  // 「效用」筛选是**纯前端**的：读数已经随列表行下发，再打一次接口只会让两处条数有机会漂移。
+  const [utilityFilter, setUtilityFilter] = useState("");
+  const [prunePreview, setPrunePreview] = useState<ExperiencePruneResult | null>(null);
   const [tab, setTab] = useState("list");
   const [limit, setLimit] = useState(120);
   const [loading, setLoading] = useState(true);
@@ -65,16 +74,18 @@ export default function ExperienceSection() {
     try {
       // 图谱与列表**分别向各自的端点取数**，而两个端点在后端共用同一个 `_match` 判据——
       // 「同数据源同筛选」因此是服务端保证的，不是前端从一份数据里切两次切出来的（A-22）。
-      const [head, view, page, panel] = await Promise.all([
+      const [head, view, page, panel, scores] = await Promise.all([
         experienceApi.overview(),
         experienceApi.graph(filters, limit),
         experienceApi.lessons(filters, 0, 200),
         experienceApi.settings(),
+        experienceApi.utility({ instId: filters.instId, bar: filters.bar, limit: 300 }),
       ]);
       setOverview(head);
       setGraph(view);
       setLessons(page);
       setSettings(panel);
+      setUtility(scores);
     } catch (err) {
       setError((err as Error).message || "读取经验库失败");
     } finally {
@@ -100,9 +111,11 @@ export default function ExperienceSection() {
     }
   };
 
-  const openDetail = async (node: ExperienceNode) => {
+  // 收 id 而不是整个节点：列表 / 图谱 / 效用面板三处的行形状各不相同，但它们通向的是**同一个**
+  // 抽屉。收整个节点会逼着效用面板去伪造一个 `ExperienceNode`，那是一份迟早会漂移的假数据。
+  const openDetail = async (nodeId: number) => {
     try {
-      setDetail(await experienceApi.detail(node.id));
+      setDetail(await experienceApi.detail(nodeId));
     } catch (err) {
       setError((err as Error).message || "读取详情失败");
     }
@@ -188,7 +201,23 @@ export default function ExperienceSection() {
   const notes = honestyNotes({
     health: overview?.materializeHealth,
     excludedByCostBasis: overview?.excludedByCostBasis ?? 0,
-    harvestGapTotal: overview?.harvestGapTotal ?? 0,
+    harvestGapTotal: overview?.harvest?.gapTotal ?? overview?.harvestGapTotal ?? 0,
+    adoptedTotal: overview?.harvest?.adoptedTotal ?? 0,
+    utilityMuted: overview?.utility?.ineffective ?? 0,
+  });
+  // 采集缺口的逐原因明细：**零值的键也列**——列出来才知道「这条路今天没走过」与「这条路
+  // 不存在」的区别（后端的键集是闭合的六个，多一个就是一个永远显示 0 的假分类）。
+  const harvestReasons = Object.entries(overview?.harvest?.reasons ?? {});
+  // 「效用」筛选（前端）：全部 / 有注入样本 / 已判失效。
+  const visibleLessons = (lessons?.items ?? []).filter((row) => {
+    if (utilityFilter === "scored") return (row.utility?.injected ?? 0) > 0;
+    if (utilityFilter === "ineffective") return row.utility?.ineffective === true;
+    return true;
+  });
+
+  const onPrune = () => act("清理沉降经验", async () => {
+    // **绝不静默批删**：先跑一次 dryRun 把条数拿回来，二次确认之后才真删（A-34）。
+    setPrunePreview(await experienceApi.prune(true));
   });
 
   return (
@@ -216,10 +245,20 @@ export default function ExperienceSection() {
             <Button
               variant="ghost"
               size="sm"
-              onClick={() => act("重建", () => experienceApi.rebuild())}
+              onClick={() => act("重建", () => experienceApi.rebuild("stat"))}
               disabled={busy !== null}
+              title="智能：能走增量就走增量（成本与库大小近似无关），判据不满足时自动回全量"
             >
               {busy === "重建" ? "重建中…" : "重建图谱"}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => act("强制全量重建", () => experienceApi.rebuild("full"))}
+              disabled={busy !== null}
+              title="从事件表整表重算并重写增量底座。它是增量算错时的兜底出口，大库上会明显更慢。"
+            >
+              {busy === "强制全量重建" ? "重建中…" : "强制全量"}
             </Button>
             <Button variant="ghost" size="sm" onClick={onExport} disabled={busy !== null}>
               导出
@@ -292,6 +331,17 @@ export default function ExperienceSection() {
             {note.text}
           </p>
         ))}
+        {harvestReasons.length > 0 && (overview?.harvest?.gapTotal ?? 0) > 0 && (
+          <p
+            className="text-[10px] leading-relaxed text-[var(--muted)]"
+            data-testid="experience-harvest-reasons"
+          >
+            采集缺口明细：
+            {harvestReasons
+              .map(([key, count]) => `${HARVEST_REASON_ZH[key] ?? key} ${count}`)
+              .join(" · ")}
+          </p>
+        )}
         {(overview?.rejectedNarrative ?? 0) > 0 && (
           <p className="text-[10px] leading-relaxed text-[var(--muted)]">
             另有 {overview?.rejectedNarrative} 条 AI 蒸馏输出因语境越界被整条丢弃（闭合词表之外的
@@ -319,16 +369,24 @@ export default function ExperienceSection() {
         </p>
       )}
 
-      <ExperienceToolbar filters={filters} symbols={symbols} bars={BARS} onChange={setFilters} />
+      <ExperienceToolbar
+        filters={filters}
+        symbols={symbols}
+        bars={BARS}
+        utility={utilityFilter}
+        onChange={setFilters}
+        onUtilityChange={setUtilityFilter}
+        onPrune={onPrune}
+      />
 
       <Tabs tabs={TABS} active={tab} onChange={setTab} variant="underline" label="经验库视图" />
 
       {tab === "list" && (
         <ExperienceList
-          items={lessons?.items ?? []}
-          total={lessons?.total ?? 0}
+          items={visibleLessons}
+          total={utilityFilter ? visibleLessons.length : (lessons?.total ?? 0)}
           loading={loading}
-          onOpen={(node) => void openDetail(node)}
+          onOpen={(node) => void openDetail(node.id)}
           onPin={onPin}
           onMute={onMute}
           onDelete={setPendingDelete}
@@ -342,9 +400,21 @@ export default function ExperienceSection() {
           truncated={graph?.truncated ?? false}
           limit={limit}
           onRaiseLimit={() => setLimit((prev) => Math.min(2000, prev * 2))}
-          onOpen={(node) => void openDetail(node)}
+          onOpen={(node) => void openDetail(node.id)}
           onFilterContext={(node) =>
             setFilters((prev) => ({ ...prev, axis: node.axis ?? undefined }))}
+        />
+      )}
+      {tab === "utility" && (
+        <ExperienceUtilityPanel
+          page={utility}
+          loading={loading}
+          onOpen={(row) => void openDetail(row.id)}
+          onRestore={(row) => act("恢复启用", async () => {
+            // 走 `PATCH {muted:false}`：那条路径把 `mute_reason` 清成 null，此后自动化可以
+            // 再次接管它。用户显式静音（`user`）与自动静音（`ineffective`）严格分离。
+            await experienceApi.patch(row.id, { muted: false });
+          })}
         />
       )}
       {tab === "preview" && <ExperienceRetrievalPreview symbols={symbols} bars={BARS} />}
@@ -390,6 +460,19 @@ export default function ExperienceSection() {
           void act("删除", async () => {
             await experienceApi.remove(node.id);
             setDetail(null);
+          });
+        }}
+      />
+
+      <ExperiencePrunePrompt
+        preview={prunePreview}
+        onCancel={() => setPrunePreview(null)}
+        onConfirm={() => {
+          setPrunePreview(null);
+          void act("清理沉降经验", async () => {
+            const result = await experienceApi.prune(false);
+            setNotice(`已删除 ${result.deleted} 条沉降经验`
+              + `（跳过置顶 ${result.skippedPinned} 条 / 你手动静音的 ${result.skippedUserMuted} 条）。`);
           });
         }}
       />
@@ -465,6 +548,9 @@ function ThresholdPanel({
     { key: "l0MaxChars", label: "L0 字符上限", hint: `下限 ${settings.l0MinChars}（含框架句）` },
     { key: "l1Max", label: "L1 条数上限" },
     { key: "l1MaxChars", label: "L1 字符上限", hint: `下限 ${settings.l1MinChars}（含框架句）` },
+    // ★ W-C · 失效判据的两道可调门槛。第三道（符号系统性相反）不可调——它是判据本身。
+    { key: "utilityMinSamples", label: "失效判定的最少注入次数" },
+    { key: "utilityTThreshold", label: "失效判定的 |t| 门槛" },
   ];
   return (
     <div className="flex flex-col gap-3 rounded-md border border-[var(--border)] p-3">
@@ -503,6 +589,8 @@ function ThresholdPanel({
                 tThreshold: draft.tThreshold, halfLifeDays: draft.halfLifeDays,
                 staleDays: draft.staleDays, l0Max: draft.l0Max, l0MaxChars: draft.l0MaxChars,
                 l1Max: draft.l1Max, l1MaxChars: draft.l1MaxChars,
+                utilityMinSamples: draft.utilityMinSamples,
+                utilityTThreshold: draft.utilityTThreshold,
               }));
             } catch (err) {
               onError((err as Error).message || "保存阈值失败");

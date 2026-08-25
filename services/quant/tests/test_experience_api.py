@@ -257,6 +257,9 @@ async def test_a41_g9_every_writable_threshold_has_a_read_path():
             "halfLifeDays": 12.5, "staleDays": 45.0,
             "l0Max": 2, "l0MaxChars": 520, "l1Max": 1, "l1MaxChars": 700,
             "distillEnabled": not base.ai_trade_experience_distill_enabled,
+            # ★ W-C · 桥表 12 → 15 项。漏一项就是一个「改得动、永远不生效」的假控件。
+            "utilityEnabled": not base.ai_trade_experience_utility_enabled,
+            "utilityMinSamples": 7, "utilityTThreshold": 1.75,
         }
         async with _client() as client:
             res = await client.put("/api/settings/experience", json=patch)

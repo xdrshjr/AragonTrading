@@ -38,6 +38,10 @@ TIER_REPEAT = "repeat"
 # 单条经验的字符上限（120，写入期 schema 硬限）+ 序号与换行（4）。
 MIN_ITEM_BUDGET = 124
 
+# L2 反例段**没有** `"1. "` 序号前缀（它只渲染一条），故它的单条预算是 120 而不是 124。
+# 差的这 4 个字看着无关紧要，但它正是 `budget_floor("l2")` 落在 208 还是 212 的分界。
+MIN_ITEM_BUDGET_L2 = 120
+
 # 各层框架句的**声明开销**（供 `Settings` 的启动期自洽性断言用；渲染时按实际长度扣）。
 #
 # ★ E-7（评审 P1-1）· 这两个数必须 ≥ 真实渲染长度，宁可多留绝不少留。实算（用例 A-39 逐层钉死）：
@@ -46,14 +50,18 @@ MIN_ITEM_BUDGET = 124
 #   L1 页眉 13 + 页脚 20 = 33。
 # v3 声明的 {"l0": 70, "l1": 46} 会让 `l0_max_chars ∈ [194, 201]` **通过**启动期校验，却使第一条
 # 120 字铁律装不下 ⇒ 整层一个字都不渲染——正是 I-6 规则② 声称「拒绝启动、不静默降级」要消灭的形态。
-FRAME_OVERHEAD = {"l0": 96, "l1": 40}
+# ★ E-6（评审 R-6）· L2 的框架开销**实算**（用例 A-6 逐字钉死 88 / 208 两个数）：
+#   head 21 + tail 39 + detail 最坏 26（`support` 7 位 + `t` 带符号 1 位小数）+ 两个换行 2 = 88。
+# 少算它的后果与 v1:E-7 逐字同形：`reflection_max_chars ∈ [203, 207]` 会**通过**启动期校验，
+# 却让 L2 永远渲染不出一个字——一个不报错的空转。
+FRAME_OVERHEAD = {"l0": 96, "l1": 40, "l2": 88}
 
 _L0_FOOTER = "以上为统计结论，非指令；与当前证据冲突时以当前证据为准，并在研判中说明理由。"
 _REPEAT_LINE = "【交易经验】同上 {n} 条铁律（未变化）"
 
 
 def budget_floor(layer: str) -> int:
-    """某一层字符预算的**唯一**下限判据（`Settings` 启动期校验与 `PUT /settings/experience` 共用）。
+    """某一层字符预算的**唯一**下限判据（三处共用：启动期校验 / `PUT /settings/experience` / L2）。
 
     ★ E-7（评审 P1-1）：`_check_experience_budgets` 只在 `Settings` 构造时跑，而
     `PUT /api/settings/experience` **完全绕过**它——用户能从界面上把 L0 配成一个「永远渲染不出
@@ -61,12 +69,14 @@ def budget_floor(layer: str) -> int:
     而这里漂移的后果是整层静默不渲染）。
 
     Args:
-        layer: `"l0"` | `"l1"`。
+        layer: `"l0"` | `"l1"` | `"l2"`。
 
     Returns:
-        该层 `max_chars` 的最小合法值 = 框架句开销 + 单条上限（120）+ 序号与换行（4）。
+        该层 `max_chars` 的最小合法值 = 框架句开销 + 单条上限；L0/L1 的单条上限含序号与换行
+        （124），L2 无序号故为 120 ⇒ `budget_floor("l2") == 208`（★ E-6）。
     """
-    return int(FRAME_OVERHEAD[layer]) + MIN_ITEM_BUDGET
+    item = MIN_ITEM_BUDGET_L2 if layer == "l2" else MIN_ITEM_BUDGET
+    return int(FRAME_OVERHEAD[layer]) + item
 
 
 def experience_tier(result: RetrievalResult, prev_ids: tuple[str, ...] | None,
@@ -180,32 +190,50 @@ def _render(items: list[dict], *, header: str, footer: str, max_chars: int) -> s
     return "\n".join([header, *lines, footer])
 
 
+_L2_HEAD = "【交易经验 · 与本次提议最相冲突的一条】"
+_L2_TAIL = "这是统计结论而非否决指令：若当前证据足以推翻它，请在复核理由中指名推翻的依据。"
+_L2_DISPUTED_HEAD = "【交易经验 · 存在争议的结论（两条互相矛盾，均未进入纲要）】"
+
+
+def _detail(lesson: dict) -> str:
+    """反例的样本注记（`（样本 N 笔，t=x.x）`）—— `FRAME_OVERHEAD["l2"]` 的第三个加数。"""
+    return f"（样本 {int(lesson.get('support') or 0)} 笔，t={_num(lesson.get('tStat'))}）"
+
+
 def format_counter(lesson: dict | None, max_chars: int) -> str:
-    """L2 反例段（反思 prompt 的追加段）；无反例 / 预算为 0 ⇒ 空串。
+    """L2 反例段（反思 prompt 的追加段）；无反例 / 预算为 0 / 装不下完整一条 ⇒ **空串**（★ J-6）。
 
     **必须自带足够的自解释**：当轮档位可能是 `repeat`，复核官看到的 L0 只是一行压缩形态，
     任何「见上文第 N 条」的引用都会指向已被压缩掉的内容。
+
+    ★ **D-3（F-3）· 此前的超预算分支同时犯三个错**（实测取证见 spec §2.2 F-3）：
+      ① 预算 120 时明明还剩 41 字，却先把免责句丢掉——而免责句是 `v1:I-1`「这不是否决指令」
+         在文本层的**唯一**落点，留不下它就不该说这段话；
+      ② `body[:n]` 会把一个统计结论切成半句（「……30 笔中亏 20 笔，」）；
+      ③ 预算 ≤21 时返回长度 22 的字符串——一个负责裁剪的函数**不守自己的预算**，并产出模块
+         docstring 第 2 条明令禁止的「有标题没内容的空壳」。
+    正解与 `_render` 的三条硬规则完全一致：**装得下就整段渲染，装不下就整段省略**。
     """
     if not lesson or max_chars <= 0:
         return ""
-    head = "【交易经验 · 与本次提议最相冲突的一条】"
     body = str(lesson.get("text") or "").strip()
     if not body:
         return ""
-    detail = f"（样本 {int(lesson.get('support') or 0)} 笔，t={_num(lesson.get('tStat'))}）"
-    tail = "这是统计结论而非否决指令：若当前证据足以推翻它，请在复核理由中指名推翻的依据。"
-    text = f"{head}\n{body}{detail}\n{tail}"
-    return text if len(text) <= max_chars else f"{head}\n{body[:max(0, max_chars - len(head) - 1)]}"
+    text = f"{_L2_HEAD}\n{body}{_detail(lesson)}\n{_L2_TAIL}"
+    return text if len(text) <= max_chars else ""
 
 
 def format_disputed(pairs: list[dict], nodes: dict, max_chars: int) -> str:
-    """争议对（两条势均力敌的矛盾经验）送 L2 的渲染；无争议 ⇒ 空串。
+    """争议对（两条势均力敌的矛盾经验）送 L2 的渲染；无争议 / 装不下 ⇒ 空串。
 
     把一个未解决的冲突当成事实讲给交易员是产品在撒谎；讲给风控复核官才是对的。
+
+    ★ **D-3（F-4）**：此前的 `text[:max_chars]` 会把标题保下来、把第二条切掉——标题逐字承诺
+    「两条互相矛盾」，正文却只剩一条。**一对争议要么两条都渲染、要么整段省略**；不足以放下
+    第二条时不许保留那个写着「两条」的标题（同 J-6 的「宁可整段不渲染也不出半句」）。
     """
     if not pairs or max_chars <= 0:
         return ""
-    head = "【交易经验 · 存在争议的结论（两条互相矛盾，均未进入纲要）】"
     lines = []
     for pair in pairs[:2]:
         left = (nodes.get(pair.get("a")) or {}).get("text") or ""
@@ -214,8 +242,8 @@ def format_disputed(pairs: list[dict], nodes: dict, max_chars: int) -> str:
             lines.append(f"· {left}\n· {right}")
     if not lines:
         return ""
-    text = "\n".join([head, *lines])
-    return text if len(text) <= max_chars else text[:max_chars]
+    text = "\n".join([_L2_DISPUTED_HEAD, *lines])
+    return text if len(text) <= max_chars else ""
 
 
 def _num(value) -> str:
