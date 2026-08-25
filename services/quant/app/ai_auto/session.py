@@ -18,6 +18,7 @@ import asyncio
 import logging
 import time
 from collections import deque
+from collections.abc import Callable
 
 from ..db import repositories as repo
 from ..db.session import get_sessionmaker
@@ -41,6 +42,7 @@ from .decider import AiTradeDecider, TradeDecision
 from .exchange_backstop import (BackstopRuntime, check_now_from_executor,
                                 schedule_from_executor)
 from .exit_attribution import classify_live
+from .experience import ExperienceRuntime
 from .hold_horizon import HorizonFacts, HorizonRule, gate_status as horizon_gate_status
 from .horizon_acceptance import ai_stats_keys, build_bundle
 from .horizon_runtime import HorizonRuntime, build_horizon_facts
@@ -149,7 +151,9 @@ class AiTradeSession:
                  sizing: SizingRuntime | None = None,
                  horizon_rule: HorizonRule | None = None,
                  discipline_preset: str = "off",
-                 track_record: dict | None = None):
+                 track_record: dict | None = None,
+                 experience: ExperienceRuntime | None = None,
+                 on_experience_dirty: Callable[[], None] | None = None):
         self.session_id = session_id
         self.run_id = run_id
         self._specs = specs
@@ -215,6 +219,15 @@ class AiTradeSession:
                                          self._cost.attribution.settled_trips)
         # 生效纪律自检（discipline-preset §3.2）：同款下沉门面，须排在上面各运行时之后（它持它们的引用）。
         self._discipline = DisciplineRuntime(self, preset_id=discipline_preset)
+        # 交易经验上下文图（ai-trade-experience-context-graph §4.10 · W-6）：同款「运行时对象 +
+        # inject(payload)」下沉范式。**两个形参都带默认值** ⇒ 既有构造点逐字节零回归：未装配
+        # （空对象模式）⇒ payload 无 `experience` 键 ⇒ `build_decision_prompt` 输出与本特性合入前
+        # 逐字节相同（不变式 I-2，门禁 G-2 钉死）。
+        self._experience = experience or ExperienceRuntime(None, None, executor.settings)
+        # ★ E-12（评审 P1-6）：脏回调必须**被装配**而不是被引用。manager 据它决定要不要起一个
+        # 后台物化任务（去抖 + 进程级单槽，§4.5）——**同步调用、绝不 await**，因为它跑在
+        # `_dispatch` 这个全部 executor 事件的唯一收口上。
+        self._on_experience_dirty = on_experience_dirty or (lambda: None)
         # P0-1：会话级单调持仓序号——`_dispatch` 观察到任一 `side=="close"` 成交即 +1。epoch 身份的一半，
         # 没有它，「保护平仓 → 同一 tick 内同向重开」的新仓会继承旧峰值并被当场强平（真实资金）。
         self._position_seq = 0
@@ -369,14 +382,50 @@ class AiTradeSession:
                     self._backstop.force_next()   # 随单 OCO 是否真的挂上，是开仓后最该立刻知道的事
                     self._cost.note_open(trade, seq=self._position_seq, now_wall=time.time(),
                                          atr_px=self._atr_px)   # 轴 A：冻结开仓断面（含 stopAtrMult）
+                    # 经验层 W-7①：**语境冻结在开仓那一刻**——出场时体制可能已经变了，用出场语境
+                    # 标注一笔入场决策的教训是错的，而且不会报错（§4.3）。未装配 ⇒ 空转。
+                    self._experience.note_open(trade, seq=self._position_seq,
+                                               facts=self._experience.facts(
+                                                   trade,
+                                                   market_context=self._market_context(),
+                                                   wake_kind=self._wake.last_round_kind,
+                                                   horizon_profile_id=self._horizon_profile()))
                 self._sizing.note_executor(self.executor, self._current_px())   # [P1-8] 敞口簿
                 self._inject_explain_meta(trade)
                 await self._persist_trade(trade)
+                # 经验层 W-7②（★ E-12）：**必须是一个新的判据块**，且必须排在
+                # `_inject_explain_meta` 之后——`exitSource` 与往返结算都在那一步才写进 meta，
+                # 挂早了 meta 是空的（§4.1）。`persist_pending` 只做 `INSERT OR IGNORE`（★ D-1），
+                # 物化由 manager 侧的后台任务承担，绝不挂在这条热路径上。
+                if trade.get("side") == "close":
+                    self._experience.note_close(
+                        trade, (trade.get("explain") or {}).get("meta") or {},
+                        self._cost.last_settled_trip())
+                    await self._experience.persist_pending()
+                    if self._experience.take_dirty():
+                        self._on_experience_dirty()      # 同步回调，**不 await**（G-5 时延门禁）
                 # W2（pause-resume §3.4.2）：持仓事实**只在成交时变**，故契约的持仓断面事件驱动
                 # 地写——精确且零轮询开销。挂在 `_persist_trade` 之后（[P2-3]：`_push` 对每一个
                 # 事件都执行，挂那里会被 status/candle 一并触发）。
                 await self._persist_state_position()
             await self._push(event)
+
+    @property
+    def experience(self) -> ExperienceRuntime:
+        """经验层门面的**只读**出口（manager 侧的后台任务据它取蒸馏素材与换快照）。
+
+        `self._experience` 是私有的，而终局物化与叙事蒸馏都必须跑在 manager 侧的后台任务里
+        （绝不在 `stop()` 的 await 链上，评审 F-1），那里只拿得到会话对象。纯读，无副作用。
+        """
+        return self._experience
+
+    def _horizon_profile(self) -> str | None:
+        """当前交易周期模式 id（未装配 ⇒ None）；经验层的 `horizon` 轴取它，**不是** wire 键。"""
+        return None if self.horizon_rule is None else self.horizon_rule.profile_id
+
+    def _market_context(self) -> dict | None:
+        """成交路径上现算一次体制读数（与 `_build_decision_payload` 那一份同源同窗口）。"""
+        return build_market_context(self._window.base_df(), self.bar, self.executor.settings)
 
     def _inject_explain_meta(self, trade: dict) -> None:
         explain = trade.get("explain")
@@ -573,6 +622,8 @@ class AiTradeSession:
         await self._cost.reconcile_tick(          # 轴 C：终态对账（硬超时，永不判 drift）
             time.time(), window_start_ts=self.started_ts,
             trades=self.executor.trades, push=self._push, final=True)
+        await self._experience.flush()             # W-10：毫秒级本地 INSERT（物化与蒸馏都不在这条链上）
+        await self._experience.persist_harvest_gap()   # ★ E-8：不落库那个数字在概览条上恒为 0
         await self._finalize_run(ts)
         await self._notify_stopped()
         await self._push({"type": "status", "data": self._status_payload()})
@@ -659,6 +710,8 @@ class AiTradeSession:
         flattened, resting_cancelled = await self._pause_unwind(flatten, ts)     # ④
         position, unknown = await self._read_exchange_position()                 # ⑤
         backstop = await self._pause_backstop(position)                          # ⑥
+        await self._experience.flush()                 # W-10：暂停同样要保住收据（毫秒级本地 IO）
+        await self._experience.persist_harvest_gap()   # ★ E-8：同上
         await self.snapshot_run_metrics(status="paused")                         # ⑦
         self._pause_result = {
             "instId": self.inst_id, "sessionId": self.session_id, "runId": self.run_id,
@@ -1426,6 +1479,10 @@ class AiTradeSession:
                 or decision.action in ("hold", "cancel_order")):
             return decision, degrade, None           # 关闭 或 不下单动作 → 无 LLM、无轨迹、无注记
         await self._begin_reflection_trace(round_no, ts, decision)
+        # 经验层 W-9（L2 反例）：与提议动作**最相冲突**的 1 条；无反例 ⇒ 整键缺席 ⇒ 反思 prompt
+        # 逐字回退。影响方向**单侧**（I-1）：反思官只能 confirm / abort / 缩仓，最坏后果恒为
+        # 「少做一笔」，永远不会是「多做、做反、做大」。
+        self._experience.inject_reflection(payload, decision)
         verdict = await self.decider.reflect(
             payload, decision, emit=self._make_trace_emit(round_no, ts))
         final, new_degrade = apply_reflection(decision, degrade, verdict, self.decider.position_step)
@@ -2007,6 +2064,14 @@ class AiTradeSession:
             as_of_ts=self._decision_as_of_ts(ts, wake), last_px=ref_px,
             position_side=self.executor.projected,
             execution_primary=(payload.get("marketContext") or {}).get("primary")))
+        # 经验层 W-8：**必须是本方法的最后一步**，排在 `self._wake.inject(...)` 之后——档位判定读
+        # `payload["contextDisclosure"]`，而那个键由 wake 层在上面这一段才写入。排在它之前，
+        # 该键恒缺席 ⇒ 档位恒 `full` ⇒ §4.8 的整套压缩静默失效，而那正是本需求点名要解决的
+        # 「上下文爆炸」（用例 A-31 钉死）。未装配 / 零条目 ⇒ **整键缺席**（不是 None）。
+        self._experience.inject_round(
+            payload, wake_kind=self._wake.last_round_kind,
+            horizon_profile_id=self._horizon_profile(),
+            position_side=self.executor.projected)
         return payload
 
     def _build_multi_timeframe_context(self, ts: int, ref_px: float) -> dict | None:
@@ -2181,6 +2246,9 @@ class AiTradeSession:
                 # 验收闭环四键（horizon-acceptance [P0-3] 主通路）：成员级实时刷新走这条既有 WS
                 # status；分组合并口径另走 15s REST 轮询。未装配 / 零样本 ⇒ 各键为 None 而非缺席。
                 **self.acceptance_bundle(),
+                # 经验层观测（W-11）：未装配 ⇒ None ⇒ §7.3 的 `ExperienceCard` 整卡不渲染。
+                # `harvestGap` 与 `graphAsOfTs` 是两个**诚实性键**（I-8），各有明确渲染落点。
+                "experience": self._experience.stats(),
                 "stopReason": self.stop_reason,
                 "degraded": (self.executor.degraded or self._stale_degraded
                              or self.degraded or self._tick_degraded),
@@ -2300,6 +2368,8 @@ class AiTradeSession:
             # [P1-9] 本会话到底有没有把历史战绩喂给模型——任何一次事后对账都要能按「有没有喂」分臂
             # （负期望战绩每轮回喂的最坏结果是模型再也不开单，本仓库已复发 4 次）。
             metrics["aiStats"]["trackRecordShown"] = self._track.shown
+            # 经验层观测（W-11）：供事后按「有没有喂经验」分臂对账（R-16）；未装配 ⇒ None。
+            metrics["aiStats"]["experience"] = self._experience.stats()
         except Exception as exc:  # noqa: BLE001 —— 富化对 finalize 是加法且可失败，绝不阻断落库收尾
             logger.warning("ai-trade finalize enrichment skipped for run %s: %s", self.run_id, exc)
             for key in ("equityDigest", "decisionsDigest", "aiStats"):

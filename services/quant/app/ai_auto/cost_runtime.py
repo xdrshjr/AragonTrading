@@ -531,6 +531,14 @@ class CostRuntime:
         for key, value in wire.items():
             meta.setdefault(key, value)
 
+    def last_settled_trip(self):
+        """最近一笔已结算往返（转发 `AttributionLedger.last_settled()`）。
+
+        经验层在 `_dispatch` 的平仓分支读它组装事件——**必须在 `apply_trip_meta` 之后调用**，
+        否则本笔往返还没结算，拿到的是上一笔（评审 P0-3）。纯读、无副作用。
+        """
+        return self.attribution.last_settled()
+
     def realized_stats(self) -> dict | None:
         """`aiStats.realized` / `costSnapshot.realized` 的唯一产出点（两条通道同源）。"""
         return self.attribution.realized_stats()

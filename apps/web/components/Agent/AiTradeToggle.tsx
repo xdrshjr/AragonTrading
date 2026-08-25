@@ -148,6 +148,7 @@ export default function AiTradeToggle() {
         profitGuard: opts.profitGuard,           // 利润保护层（透传；取消勾选即 enabled:false）
         tradingHorizon: opts.tradingHorizon,     // 交易周期模式（同上；缺省=服务端默认开启）
         discipline: opts.discipline,             // 交易纪律预设（同上；缺省=服务端默认 balanced）
+        experience: opts.experience,             // 经验模式（同上；取消勾选即 enabled:false）
         contextRefreshRounds: opts.contextRefreshRounds,
       }),
     onSuccess: (res, opts) => {
@@ -170,6 +171,8 @@ export default function AiTradeToggle() {
         tradingHorizon: opts.tradingHorizon,
         stopLossPct: opts.stopLossPct ?? undefined,
         takeProfitPct: opts.takeProfitPct ?? undefined,
+        // [R-4] 同理取 opts：回执不回显经验模式规则，取 res 会让这个勾选每次重开都回落默认。
+        experience: opts.experience,
       });
       setModalOpen(false);
       setError(null);
@@ -603,6 +606,7 @@ export default function AiTradeToggle() {
         // 无本地预设兜底：模式表由 `GET /ai-trade/horizon-profiles` 下发，未选过时留 undefined 即可
         // （弹窗采用接口返回的 defaultProfile）——前端复制一份默认模式必然与服务端漂移（R-3）。
         defaultTradingHorizon={aiTradeConfig?.tradingHorizon}
+        defaultExperience={aiTradeConfig?.experience}
         error={error}
         liveGateReason={liveGateReason}
         defaultStartTs={backtestStartTs}

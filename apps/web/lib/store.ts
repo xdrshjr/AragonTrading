@@ -152,6 +152,9 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     tacticalContext: evt.tacticalContext ?? null,
     tacticalTier: evt.tacticalTier ?? null,
     contextDisclosure: evt.contextDisclosure ?? null,
+    // 交易经验（experience-context-graph W-13 的前端镜像）：同款逐键手抄纪律——漏抄这一键，
+    // 「经验 ×N」徽标永远拿不到数据，而 tsc / vitest 都不会红。
+    experience: evt.experience ?? null,
     thinking: "",
     analysis: "",
     toolCallPending: false,

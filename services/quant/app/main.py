@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from .agent.manager import get_agent_manager
 from .ai_auto import get_ai_trade_manager
 from .ai_auto.backtest_manager import get_ai_backtest_manager
+from .ai_auto.experience import scheduler as experience_scheduler
 from .api import (
     accounts,
     agent,
@@ -26,6 +27,7 @@ from .api import (
     app_settings,
     discovery,
     discovery_assets,
+    experience,
     factors,
     live_auto,
     market,
@@ -68,7 +70,9 @@ async def lifespan(app: FastAPI):
     hydrator = asyncio.create_task(_hydrate_paused_ai_trade())  # AI 自动交易冷占位（不启动任何交易）
     get_health_guard().start()                 # 持续样本外体检守护（双闸每 tick 重读，D-24）
     link_sweeper = asyncio.create_task(_okx_link_sweeper())   # 私有连接池清扫 + 服务器时钟对齐
-    background = (sweeper, resumer, hydrator, link_sweeper)
+    # ★ E-5：消费上一次进程留下的脏标志（关软件走 pause，去抖窗口内那一笔否则永远不进图）。
+    catchup = asyncio.create_task(experience_scheduler.catch_up(get_settings()))
+    background = (sweeper, resumer, hydrator, link_sweeper, catchup)
     yield
     await _cancel_background(background)   # 关停先取消清扫协程（与 manager.shutdown 同段）并有界收敛
     await _run_shutdown(_shutdown_steps(), timeout=get_settings().shutdown_step_timeout_s)
@@ -95,6 +99,12 @@ def _shutdown_steps() -> tuple[ShutdownStep, ...]:
         ("discovery", lambda: get_discovery_manager().shutdown()),  # 长跑循环，先停再收 DB / OKX
         ("paper", lambda: get_paper_manager().shutdown()),
         ("ai_trade", lambda: get_ai_trade_manager().shutdown()),    # 含平仓（仅 shutdown_action=flatten 时下真单）
+        # 经验层的后台任务（W-14）：**必须排在 `ai_trade` 之后**——先停会话（它在返回前 spawn
+        # 终局物化与蒸馏），再收后台任务。drain 自己**先 cancel 再有界收敛**，死线
+        # `ai_trade_experience_drain_timeout_s`（默认 5.0）由启动期校验器钉死 <
+        # `shutdown_step_timeout_s`（默认 20.0）；倒挂时外层先 cancel、内层清理永不执行，
+        # 后台任务会活着穿过下面的 `db_engine` 那一步（★ E-4 / 评审 P0-4）。
+        ("ai_trade_experience", lambda: get_ai_trade_manager().drain_experience_tasks()),
         ("ai_backtest", lambda: get_ai_backtest_manager().shutdown()),
         ("live_auto", lambda: get_live_auto_manager().shutdown()),
         # 关停顺序（weight-multi-model-training §2.6）：先停批次泵、再停底层作业，避免泵在作业消失后空转。
@@ -444,6 +454,7 @@ app.include_router(live_auto.router, prefix="/api")  # 第 10 个路由（实时
 app.include_router(ai_auto.router, prefix="/api")   # AI 自动交易（ai-auto-trading §4；含 WS /ws/ai-trade/{sid}）
 app.include_router(ai_trade_lifecycle.router, prefix="/api")  # AI 自动交易生命周期（暂停/继续/结束，ai-trade-pause-resume §五）
 app.include_router(app_settings.router, prefix="/api")  # 第 11 个路由（设置中心 · 自动交易设置 §4.1）
+app.include_router(experience.router, prefix="/api")  # 交易经验库（ai-trade-experience-context-graph §五）
 app.include_router(workspace.router, prefix="/api")  # 第 12 个路由（workspace 偏好持久化，watchlist-auto-trade-persistence §3）
 app.include_router(weight_models.router, prefix="/api")  # 权重模型工作区（weight-model-workspace §五；含 WS /ws/weight-train/{jobId}）
 app.include_router(weight_batches.router, prefix="/api")  # 多模型训练竞技场（weight-multi-model-training §四；含 WS /ws/weight-batch/{batchId}）

@@ -24,6 +24,22 @@ vi.mock("@/lib/aiTradeHorizonApi", () => ({
 }));
 // 模块级 mock（P2-1）：写在文件顶层与 tradingApi mock 同级，否则其余用例的 settings 查询会触发真实 fetch。
 vi.mock("@/lib/autoTradeSettingsApi", () => ({ autoTradeSettingsApi: { get: vi.fn() } }));
+// 经验模式卡片挂载即拉一次库存与阈值（experience-context-graph §7.2）。同一条理由：不 mock 就是
+// 每一条弹窗用例都发两次真实 fetch——它们会被卡片自己的 catch 吞掉（那是**产品上正确**的降级），
+// 于是症状不是报错而是**整个文件时快时慢、偶尔超时**，排查成本远大于这四行。
+vi.mock("@/lib/experienceApi", () => ({
+  experienceApi: {
+    overview: vi.fn().mockResolvedValue({
+      lessons: { iron: 0, normal: 0, candidate: 0, muted: 0, archived: 0 },
+      events: 0, sessions: 0, symbols: [], lastUpdatedTs: 0,
+      excludedByCostBasis: 0, rejectedNarrative: 0, harvestGapTotal: 0,
+      materializeHealth: { lastTs: 0, lastMs: 0, events: 0,
+                           slow: false, torn: false, overflow: false },
+      costRegimeCuts: {},
+    }),
+    settings: vi.fn().mockResolvedValue({ enabled: true }),
+  },
+}));
 vi.mock("@/lib/api", async (orig) => {
   const actual = (await orig()) as Record<string, unknown>;
   return {
@@ -80,7 +96,13 @@ beforeEach(() => {
   vi.mocked(autoTradeSettingsApi.get).mockResolvedValue({ maxBudgetPct: 100, effectiveMaxBudgetPct: 100 });
   vi.mocked(aiTradeHorizonApi.profiles).mockResolvedValue(HORIZON_PROFILES);
   vi.mocked(aiTradeDisciplineApi.presets).mockResolvedValue(DISCIPLINE_PRESETS_FIXTURE);
-  vi.mocked(aiTradeTradabilityApi.probe).mockResolvedValue(TRADABILITY_FIXTURE);
+  // **默认给 `ok` 而不是 `infeasible`**：预检有 350ms debounce，而 `infeasible` 会把
+  // `tradabilityBlocked` 置真、并把启动按钮的名字换成「仍要启动」。于是「等按钮可点 → 点它」
+  // 这个贯穿全文件的提交范式变成一场与 debounce 的赛跑——预检先落地就静默不提交，症状是
+  // `onConfirm.mock.calls[0]` 为 undefined，**且每次红的是不同的用例**。
+  // 需要 `infeasible` 的那几条自己装夹具（就在下面那个 describe 里），其余用例不该被一个与
+  // 它们无关的门禁按住。
+  vi.mocked(aiTradeTradabilityApi.probe).mockResolvedValue(TRADABILITY_OK_FIXTURE);
 });
 
 // 后端 `GET /ai-trade/tradability` 的最小夹具（判据与文案全部由服务端下发；本弹窗**只挂载子组件
@@ -105,6 +127,16 @@ const TRADABILITY_FIXTURE = {
   headline: "在 1H 周期上……约 98.6% 的开仓意图会被否决。",
   advice: "建议改用 15m 或更长的时间级别。",
   disclaimer: "以上是确定性统计，不是收益预测。",
+};
+
+// 同一份夹具的 `ok` 档：不触发二次确认，故与提交路径正交（见 `beforeEach` 的理由）。
+const TRADABILITY_OK_FIXTURE = {
+  ...TRADABILITY_FIXTURE,
+  level: "ok" as const,
+  vetoRate: { market: 0.12, limit: 0.05 },
+  stopInsideCostRate: { market: 0.04, limit: 0.01 },
+  headline: "在 1H 周期上……约 12.0% 的开仓意图会被否决。",
+  advice: "",
 };
 
 // 后端 `GET /ai-trade/discipline-presets` 的最小夹具（中文标签与已格式化的值全由服务端下发，
@@ -703,6 +735,32 @@ describe("AiTradeLaunchModal", () => {
   });
 
   // ---------- 利润保护区块（ai-trade-profit-protection §3.3 / §六）----------
+  it("A-23 · 经验模式默认勾选，提交体带完整规则", async () => {
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    expect(screen.getByRole("checkbox", { name: "启用经验模式" })).toBeChecked();
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.experience).toEqual({ enabled: true, scope: "symbol", write: true });
+  });
+
+  it("A-23 · 取消勾选 ⇒ 提交 `{enabled:false}` 而不是省略整键", async () => {
+    // 「字段整键缺省」= 老客户端没发这个字段 ⇒ 服务端按默认装配；
+    // 「显式 false」= 用户亲手取消了勾选 ⇒ 该会话不装配。
+    // 把两者合成一个判据，用户就再也关不掉这个功能，而界面上那个复选框看起来是生效的
+    // ——本仓库已在 baseRules / profitGuard / tradingHorizon 上踩过三次。
+    const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.click(screen.getByRole("checkbox", { name: "启用经验模式" }));
+    const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.experience).toEqual({ enabled: false, scope: "symbol", write: true });
+  });
+
   it("默认勾选利润保护，提交体带完整参数（UI 百分数 → wire fraction）", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
@@ -1061,6 +1119,7 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
   });
 
   it("`infeasible` 也**不禁用**启动按钮，但文案改为「仍要启动」——预检只提示、不阻断", async () => {
+    vi.mocked(aiTradeTradabilityApi.probe).mockResolvedValue(TRADABILITY_FIXTURE);
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByTestId("ai-tradability-confirm");
     const confirm = await screen.findByRole("button", { name: /仍要启动 AI 自动交易/ });
@@ -1070,6 +1129,7 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
   // 二次确认必须**真的拦得住**：若勾选态只被写进 state 而没有任何读点，那一行就纯粹是装饰，
   // 一次点击照样能在一个几乎开不出单的周期上起一个真实资金会话（有写点、没读点）。
   it("`infeasible` 未勾选确认时点击启动**不提交**，并同屏说明该做什么", async () => {
+    vi.mocked(aiTradeTradabilityApi.probe).mockResolvedValue(TRADABILITY_FIXTURE);
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByTestId("ai-tradability-confirm");
     fireEvent.click(await screen.findByRole("button", { name: /仍要启动 AI 自动交易/ }));
@@ -1078,6 +1138,7 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
   });
 
   it("勾选二次确认后即可启动（确认是一次显式动作，不是永久豁免）", async () => {
+    vi.mocked(aiTradeTradabilityApi.probe).mockResolvedValue(TRADABILITY_FIXTURE);
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     const box = await screen.findByLabelText("仍要在该周期上启动");
     fireEvent.click(box);
@@ -1087,6 +1148,7 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
   });
 
   it("「一键换周期」改的是本弹窗的时间级别下拉（不自动改预设，不发额外请求）", async () => {
+    vi.mocked(aiTradeTradabilityApi.probe).mockResolvedValue(TRADABILITY_FIXTURE);
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByTestId("ai-tradability-pick-bar");
     fireEvent.click(screen.getByTestId("ai-tradability-pick-bar"));

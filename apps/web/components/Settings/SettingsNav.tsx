@@ -9,6 +9,7 @@ const SECTIONS = [
   { key: "agent-tools", label: "Agent 工具管理", desc: "查看与开关可用工具" },
   { key: "okx-accounts", label: "实盘账户", desc: "欧易 API 凭证与连通性" },
   { key: "auto-trade", label: "自动交易设置", desc: "总预算上限与分配默认" },
+  { key: "experience", label: "交易经验库", desc: "AI 沉淀的经验与教训" },
   { key: "about", label: "关于 / 诊断", desc: "版本信息与日志目录" },
 ];
 

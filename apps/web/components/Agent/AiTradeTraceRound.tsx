@@ -756,6 +756,53 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
   );
 }
 
+/**
+ * 本轮实际喂入的交易经验（experience-context-graph §7.3）。
+ *
+ * **加法键，不新增 trace phase**——新增相位的代价是前端多处镜像点，`trace.py` 已有成文决策。
+ * 未装配 / 零条目 ⇒ 整枚徽标不渲染。
+ *
+ * 展开后**逐条显示本轮真的喂进去的文本**：用户必须能看到 Agent 到底被喂了什么，
+ * 否则「经验影响了这次决策」就是一句无法核对的话。
+ */
+function ExperienceBadge({ trace }: { trace: AiTradeRoundTrace }) {
+  const wire = trace.experience ?? null;
+  const items = [...(wire?.l0 ?? []), ...(wire?.l1 ?? [])];
+  if (!wire || items.length === 0) return null;
+  const tierText = wire.tier === "repeat"
+    ? "语境未变，本轮压缩为一行"
+    : wire.tier === "brief" ? "仅铁律" : "完整（语境已变化）";
+  return (
+    <details className="text-[11px] text-[var(--muted)]" data-testid="ai-trace-experience">
+      <summary className="cursor-pointer select-none text-[var(--text)]">
+        经验 ×{items.length}
+        <span className="ml-1 text-[var(--muted)]">（{tierText}）</span>
+      </summary>
+      <div className="mt-1 flex flex-col gap-1">
+        {items.map((item) => (
+          <div key={item.key} className="leading-relaxed">
+            <span className="text-[var(--text)]">{item.text}</span>
+            <span className="ml-1 tabular text-[10px]">
+              （样本 {item.support}
+              {typeof item.tStat === "number" ? ` · t=${item.tStat.toFixed(1)}` : ""}
+              {item.pinned ? " · 已置顶" : ""}）
+            </span>
+          </div>
+        ))}
+        {wire.disputed.length > 0 && (
+          <p className="text-[10px] text-[var(--warn)]">
+            另有 {wire.disputed.length} 组互相矛盾的结论被挡在纲要之外（只会进入下单前的反思环节）。
+          </p>
+        )}
+        <p className="text-[10px]">
+          这些是统计结论而非指令；与当前证据冲突时以当前证据为准。经验只进 prompt，
+          不参与任何风控、仓位或下单门禁。
+        </p>
+      </div>
+    </details>
+  );
+}
+
 /** 上下文刷新节点（G2）：醒目分隔 + 可展开摘要全文，直观体现「上下文纯净」机制。 */
 function SummaryNode({ summary }: { summary: string }) {
   return (
@@ -787,6 +834,7 @@ export default function AiTradeTraceRound({ trace }: { trace: AiTradeRoundTrace 
       <ReflectionBlock trace={trace} />
       <ResultRow trace={trace} />
       <SignalContext trace={trace} />
+      <ExperienceBadge trace={trace} />
       {trace.summary && <SummaryNode summary={trace.summary} />}
     </div>
   );

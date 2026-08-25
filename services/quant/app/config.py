@@ -595,6 +595,71 @@ class Settings(BaseSettings):
     # 缺席而自动回落到 `group.state`。四处回落缺一，这个开关就只是一句声明（用例 12 是唯一护栏）。
     ai_trade_lifecycle_truth_enabled: bool = True
 
+    # ---- 交易经验上下文图（ai-trade-experience-context-graph §6.5，36 项）----
+    # 总闸关 ⇒ 全链路空转：payload 无 `experience` 键 ⇒ `build_decision_prompt` 输出**逐字节**
+    # 等于本特性合入前（不变式 I-2，用例 G-2 钉死）。
+    ai_trade_experience_enabled: bool = True
+    ai_trade_experience_default_on: bool = True          # 启动请求缺省语义（需求：默认开启）
+    ai_trade_experience_write_enabled: bool = True       # 采集写闸（只读模式：用经验但不沉淀）
+    ai_trade_experience_min_samples: int = Field(default=8, ge=1)
+    ai_trade_experience_iron_samples: int = Field(default=20, ge=1)
+    ai_trade_experience_t_threshold: float = Field(default=2.0, gt=0)
+    ai_trade_experience_iron_t_threshold: float = Field(default=2.5, gt=0)
+    ai_trade_experience_half_life_days: float = Field(default=30.0, gt=0, le=3650)
+    ai_trade_experience_stale_days: float = Field(default=90.0, gt=0, le=3650)
+    ai_trade_experience_l0_max: int = Field(default=3, ge=0, le=10)
+    # 字符预算**含框架句**（I-6）：L0 页眉 ≈33 字 + 页脚 ≈37 字 + 3×(120+4) = 442 ⇒ 420 装不下
+    # 三条满长铁律。默认 480 留 38 字裕量；下界 160 与 `_check_experience_budgets` 的断言共同守。
+    ai_trade_experience_l0_max_chars: int = Field(default=480, ge=160, le=4000)
+    ai_trade_experience_l1_max: int = Field(default=3, ge=0, le=10)
+    ai_trade_experience_l1_max_chars: int = Field(default=660, ge=160, le=4000)
+    ai_trade_experience_reflection_max_chars: int = Field(default=240, ge=0, le=2000)
+    ai_trade_experience_seed_expand_alpha: float = Field(default=0.5, ge=0, le=1)
+    ai_trade_experience_co_edge_min_weight: float = Field(default=0.15, ge=0, le=1)
+    ai_trade_experience_co_edge_min_support: int = Field(default=5, ge=1)
+    ai_trade_experience_max_expanded_contexts: int = Field(default=24, ge=0, le=200)
+    ai_trade_experience_candidate_cap: int = Field(default=200, ge=1, le=5000)
+    ai_trade_experience_mmr_lambda: float = Field(default=0.5, ge=0, le=1)
+    ai_trade_experience_graph_node_cap: int = Field(default=4000, ge=100, le=100000)
+    ai_trade_experience_global_min_symbols: int = Field(default=3, ge=1, le=50)
+    ai_trade_experience_distill_enabled: bool = True
+    # **只被 manager 侧的后台任务读**，绝不出现在任何同步等待 `stop()` 的路径上（评审 P0-1）：
+    # `stop_group` 串行遍历成员，而客户端 `/stop` 超时是 20s（FAST_MS）——一次 45s 的同步蒸馏
+    # 会在真实资金的停止按钮上弹出「本次操作结果未知」。用例 G-5 / G-6 把这条钉死。
+    ai_trade_experience_distill_timeout_s: float = Field(default=45.0, gt=0, le=300)
+    ai_trade_experience_distill_max_lessons: int = Field(default=5, ge=1, le=20)
+    # 按 `(instId, bar)` 分组算 `costRegime` 三分位的最小样本；不足即回落全库分位并在 UI 标注。
+    ai_trade_experience_cost_regime_min_samples: int = Field(default=30, ge=1, le=5000)
+    ai_trade_experience_export_page_size: int = Field(default=500, ge=50, le=5000)
+    # ---- 后台物化调度（D-1 / D-3 的修法；三项都只被 manager 侧后台任务读）----
+    # 去抖：距上次成功物化不足该秒数 ⇒ 只置脏标志不起任务（防每笔平仓触发一次全库重建）。
+    ai_trade_experience_materialize_min_interval_s: float = Field(default=60.0, ge=0, le=3600)
+    # ★ E-6（评审 P0-6）修订语义：这**不是**「CPU 段的硬超时」——`asyncio.timeout` 停不掉
+    # `run_in_threadpool` 里已经开跑的线程，那个工作线程会把整轮全库重建跑完。它只约束
+    # 「排队等 `materialize_lock` 最多等多久」，等不到就放弃本次（脏标志留着，下次再来）。
+    ai_trade_experience_materialize_timeout_s: float = Field(default=20.0, gt=0, le=300)
+    # 慢物化告警线：单次耗时超过它即在 `materialize_health.slow` 置真，UI 明示规模墙（I-8）。
+    ai_trade_experience_materialize_slow_ms: int = Field(default=3000, ge=100, le=600000)
+    # ---- ★ E-2（评审 P0-2）：让非 stat 经验真的能被检索到 ----
+    # manual / imported / narrative 出生即 support=0、weight=0.0，乘进 score 恒为 0 并被
+    # `score > 0` 剔除 ⇒ 蒸馏 / 手工新增 / 导入三条写入路径全是只写不读。
+    ai_trade_experience_manual_seed_weight: float = Field(default=0.35, ge=0, le=1)
+    # 用户显式置顶 = 用户提供的证据。不设这个下限，I-4 承诺的「升 iron 只有一条路径——用户显式
+    # 置顶」在代码里根本不存在（§7.1 那句「置顶的经验不受证据门槛约束」也就是假的）。
+    ai_trade_experience_pinned_evidence_floor: float = Field(default=0.60, ge=0, le=1)
+    # ---- ★ E-4（评审 P0-4）：关停 drain 的死线，**必须** < shutdown_step_timeout_s（默认 20.0）----
+    # 倒挂时外层先 cancel，drain 自己那半段「cancel 剩余任务」永远不执行，后台任务活着穿过
+    # `dispose_engine`。姿态与 `main._cancel_background` 的 5.0 秒逐字一致：先 cancel、再有界收敛。
+    ai_trade_experience_drain_timeout_s: float = Field(default=5.0, gt=0, le=60)
+    # ---- ★ E-6（评审 P0-6）：自动物化的规模闸 ----
+    # 超过即**不自动物化**，只在 `materialize_health.overflow` 置真并由 UI 明示。宁可停下来说
+    # 清楚，也不要一个永远跑不完、每 60 秒还叠一个的后台任务（那个线程池全进程共用）。
+    ai_trade_experience_materialize_max_events: int = Field(default=200000, ge=1000, le=5000000)
+    # ---- ★ E-10（评审 P1-4）：导入是不可信输入，体量也是 ----
+    ai_trade_experience_import_max_nodes: int = Field(default=2000, ge=1, le=100000)
+    # ---- ★ E-15（评审 P1-9）：`enabled:false` = 既不读也不写。默认露出那句明文；关掉只是不显示 ----
+    ai_trade_experience_disclose_off_semantics: bool = True
+
     # ---- 策略与因子挖掘（strategy-factor-discovery §六，env 前缀 DISCOVERY_）----
     # 字段名即环境变量名（DISCOVERY_*，大小写不敏感）。⚠️ 三处联动缺一即静默失效：
     # ① 此处必须**真的声明**字段（Settings extra="ignore" 会吞掉未声明的 env）；
@@ -804,6 +869,45 @@ class Settings(BaseSettings):
                 f"({self.ai_trade_tradability_marginal_veto_rate}) 必须 < "
                 f"AI_TRADE_TRADABILITY_INFEASIBLE_VETO_RATE"
                 f"({self.ai_trade_tradability_infeasible_veto_rate})，否则 marginal 档恒不可达")
+        return self
+
+    @model_validator(mode="after")
+    def _check_experience_budgets(self) -> "Settings":
+        """经验披露的字符预算自洽性（不变式 I-6）—— 违反即拒绝启动，**不静默降级**。
+
+        判据：`max_chars ≥ 框架开销 + 单条上限(120) + 序号与换行(4)`。`label ≤ 120 字` 是写入期
+        schema 硬限，故满足该式即保证「第一条一定装得下」。不满足时的行为是**整层一个字都不渲染**
+        （零条目 ⇒ 整段省略），那是一个不报错的空转：用户配了经验模式、日志全绿、模型一条都收不到。
+        """
+        from .ai_auto.experience.disclosure import FRAME_OVERHEAD, MIN_ITEM_BUDGET, budget_floor
+
+        for name, value, layer in (
+                ("AI_TRADE_EXPERIENCE_L0_MAX_CHARS", self.ai_trade_experience_l0_max_chars, "l0"),
+                ("AI_TRADE_EXPERIENCE_L1_MAX_CHARS", self.ai_trade_experience_l1_max_chars, "l1")):
+            floor = budget_floor(layer)     # ★ E-7：与 `PUT /settings/experience` 共用同一判据
+            if value < floor:
+                raise ValueError(
+                    f"{name}({value}) 必须 ≥ {floor}（框架句 {FRAME_OVERHEAD[layer]} 字 + 单条上限 "
+                    f"{MIN_ITEM_BUDGET} 字），否则该层第一条经验就装不下 ⇒ 整层一个字都不渲染")
+        return self
+
+    @model_validator(mode="after")
+    def _check_experience_drain_deadline(self) -> "Settings":
+        """★ E-4（评审 P0-4）· 关停 drain 的死线**必须**严格小于单步关停死线——倒挂即拒绝启动。
+
+        `main._run_shutdown` 的单步死线取 `shutdown_step_timeout_s`，超时即 `cancel` 该步并只再给
+        `_SHUTDOWN_CANCEL_GRACE_S = 1.0` 秒。若 drain 内部等得比它久，外层的 cancel 会把 drain
+        打断在 `asyncio.wait` 上，**drain 自己那半段「cancel 剩余任务」永远不会执行**——恰恰在它
+        被设计来应对的那一种情况下。那些后台任务于是活着穿过 `("db_engine", dispose_engine)` 那一步。
+
+        这条不等式一旦倒挂，失败是**完全静默**的：日志里只多一行「shutdown step … did not settle」。
+        故只能在构造期挡下来（用例 A-47 正反两向各一条）。
+        """
+        if self.ai_trade_experience_drain_timeout_s >= self.shutdown_step_timeout_s:
+            raise ValueError(
+                f"AI_TRADE_EXPERIENCE_DRAIN_TIMEOUT_S({self.ai_trade_experience_drain_timeout_s})"
+                f" 必须 < SHUTDOWN_STEP_TIMEOUT_S({self.shutdown_step_timeout_s})，否则外层先 "
+                "cancel、drain 内层的清理永不执行，后台任务会活着穿过 dispose_engine")
         return self
 
     def allowed_origin_list(self) -> list[str]:

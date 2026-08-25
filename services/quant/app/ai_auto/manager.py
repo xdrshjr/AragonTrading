@@ -56,6 +56,9 @@ from .profit_guard import ProfitGuardRule
 from .profit_guard_text import format_profit_guard_charter
 from .profit_guard import rule_wire as profit_guard_wire
 from .decider import AiTradeDecider
+from .experience import ExperienceRule, ExperienceRuntime, SessionGraph
+from .experience import scheduler
+from .experience.events import EventIdentity
 from .prompts import build_ai_trade_system_prompt
 from .session import AiTradeSession
 from .sizing import SizingRule, StopRule, check_window_capacity, parse_sizing_rule, parse_stop_rule
@@ -218,6 +221,11 @@ class AiTradeGroupStartRequest:
     # 冷续跑时携带的既有身份：`{"groupId":…, "createdTs":…, "runIds":{instId: runId}}`。
     # 非空 ⇒ 复用同一 group_id 与同一批 run（不变式 I-3：续跑绝不新建 run）。
     resume_of: dict | None = None
+    # 交易经验上下文图（experience-context-graph W-2）：规则与启动期快照都在 API 层解析 / 取数
+    # （`build_start_request`）。**两者都带默认 None** ⇒ 直接构造该 dataclass 的既有测试逐字节
+    # 零回归；未装配 ⇒ 会话侧空对象 ⇒ payload 无 `experience` 键（不变式 I-2）。
+    experience_rule: ExperienceRule | None = None
+    experience_snapshot: SessionGraph | None = None
 
 
 @dataclass
@@ -710,7 +718,14 @@ class AiTradeManager:
             horizon_rule=req.horizon_rule,
             # 只为落库回答「这次会话开的是哪个预设」；阈值本身已在 executor.settings 那份派生副本里。
             discipline_preset=req.discipline_preset,
-            track_record=(req.track_records or {}).get(plan.inst_id))
+            track_record=(req.track_records or {}).get(plan.inst_id),
+            # 经验层 W-3：`run_id` 在本方法尾部才确定 ⇒ runtime 必须在它之后构造（`EventIdentity`
+            # 的 `run_id` 是事件的溯源身份之一）。未装配 ⇒ 快照与规则皆 None ⇒ 全链路空转。
+            experience=ExperienceRuntime(
+                req.experience_snapshot, req.experience_rule, req.settings,
+                EventIdentity(group_id=ctx.group_id, run_id=run_id,
+                              inst_id=plan.inst_id, bar=req.bar)),
+            on_experience_dirty=partial(self._on_experience_dirty, ctx.group_id))
         return AiTradeGroupMember(inst_id=plan.inst_id, allocation_pct=plan.allocation_pct,
                                   budget_usd=plan.budget_usd, session=session, run_id=run_id)
 
@@ -802,6 +817,13 @@ class AiTradeManager:
         rows = self._state_member_rows(group, receipts)
         await self._persist_group_state(group, status=pause_core.STATUS_PAUSED,
                                         member_rows=rows)     # W4（失败必须上抛）
+        # 经验层 W-5b（★ E-5 / 评审 P0-5）：**关软件走的是这条路**（`ai_trade_shutdown_action`
+        # 默认 `"hold"` ⇒ `shutdown()` 调 `pause_group("app_quit")`，不经 `_stop_session`）。
+        # 只挂 stop 等于「桌面端正常退出时终局物化根本不发生」，去抖攒下的脏标志随进程消亡，
+        # 「经验是累积的」在最常见的使用节奏下不兑现。**只物化不蒸馏**：暂停不是终结。
+        for member in group.members:
+            self._schedule_experience(
+                self._experience_finalize(member.session, distill=False))
         settings = self._group_settings(group)
         return {
             "groupId": group_id, "state": group.state, "pauseReason": reason,
@@ -1312,7 +1334,65 @@ class AiTradeManager:
         if not flat.get("ok"):   # 平仓失败不静默——日志留痕（API 仍回 flattened 供 UI 强提示）
             logger.warning("ai-trade group stop flatten failed: session=%s code=%s residual=%s",
                            session.session_id, flat.get("code"), flat.get("residual"))
+        # 经验层 W-5：终局物化 + 叙事蒸馏在**返回前 spawn**，**绝不 await**（评审 F-1 / G-5）。
+        # `stop_group` 串行遍历成员，而客户端 `/ai-trade/{groupId}/stop` 的超时档是
+        # `FAST_MS = 20_000` 且被判为写路径——一次 45 秒的 LLM 调用（或一次 5 秒的物化 ×3 成员）
+        # 会在真实资金的停止/平仓按钮上弹出「本次操作结果未知」。
+        self._schedule_experience(self._experience_finalize(session))
         return flat
+
+    # ---------- 经验层的后台调度（W-4；**逻辑本体在 `experience/scheduler.py`**）----------
+    # 本文件已超 CLAUDE.md 的 800 行阈值，故这里只留薄转发：调度 / 变脏 / 终局 / 排空 / 死线。
+    def _schedule_experience(self, coro) -> None:
+        scheduler.schedule(coro)
+
+    def _on_experience_dirty(self, group_id: str) -> None:
+        """会话侧「有新事件落盘」的**同步**回调（`_dispatch` 的 close 侧 hook 直接调它）。"""
+        scheduler.note_dirty(group_id, lambda: self._experience_ctx(group_id))
+
+    def _experience_ctx(self, group_id: str) -> scheduler.GroupContext | None:
+        """把后台物化需要的分组事实**同步**打包（绝不查 DB）；分组已不在 ⇒ None。"""
+        group = self._group
+        if group is None or group.group_id != group_id or not group.members:
+            return None
+        alive = [m.session for m in group.members if m.session.is_active]
+        rule = next((m.session.experience.rule for m in group.members
+                     if m.session.experience.rule is not None), None)
+        return scheduler.GroupContext(settings=self._group_settings(group),
+                                      sessions=alive, rule=rule)
+
+    async def _experience_finalize(self, session: AiTradeSession, *,
+                                   distill: bool = True) -> None:
+        await scheduler.finalize(session, distill=distill)
+
+    async def drain_experience_tasks(self) -> None:
+        """关停链的一步：**先 cancel、再有界收敛**（★ E-4，死线由启动期校验器钉死 < 单步死线）。"""
+        await scheduler.drain(self._experience_drain_timeout())
+
+    def _experience_drain_timeout(self) -> float:
+        """drain 死线：优先取活跃分组的派生副本，无分组时回落进程级默认。"""
+        group = self._group
+        settings = self._group_settings(group) if group is not None and group.members else None
+        if settings is None:
+            from ..config import get_settings
+
+            settings = get_settings()
+        return float(getattr(settings, "ai_trade_experience_drain_timeout_s", 5.0))
+
+    def experience_live_sessions(self) -> list[dict]:
+        """运行中会话的经验快照时刻（**同步、只查内存，绝不查 DB**）。
+
+        §7.1 的「检索预演」必须说实话：预演读的是**当前 DB 里的图**，而运行中的会话用的是
+        **启动那一刻**载入内存的快照（不变式 I-3 使然），两者会因后台物化与其它成员会话的写入
+        而分叉。少了这条对照，那一屏在最需要它的时刻（会话正在跑）说的是假话——
+        **一屏假话比没有这一屏更坏。**
+        """
+        group = self._group
+        if group is None:
+            return []
+        return [{"instId": member.inst_id,
+                 "graphAsOfTs": member.session.experience.graph_as_of_ts}
+                for member in group.members if member.session.is_active]
 
     # ---------- 只读视图 / WS 路由 ----------
     def status(self) -> dict | None:

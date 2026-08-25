@@ -143,13 +143,19 @@ async def test_run_shutdown_never_raises_even_when_every_step_fails():
 
 
 def test_shutdown_steps_are_zero_arg_factories_in_the_legacy_order():
-    """步骤表的顺序即既有 lifespan 的 12 步顺序；**且求值必须推迟到 `_run_shutdown` 内**。
+    """步骤表的顺序即既有 lifespan 的顺序；**且求值必须推迟到 `_run_shutdown` 内**。
 
-    只断言形状与顺序——真的调用它们会拉起 12 个进程级单例，那正是本文件开头拒绝做的事。
+    只断言形状与顺序——真的调用它们会拉起十余个进程级单例，那正是本文件开头拒绝做的事。
+
+    `ai_trade_experience`（ai-trade-experience-context-graph W-14）**必须紧跟在 `ai_trade`
+    之后、`db_engine` 之前**：先停会话（它在返回前 spawn 终局物化与蒸馏），再收那些后台任务；
+    收不干净的任务会活着穿过 `dispose_engine`，而 SQLite 引擎在还有活任务持着会话时被 dispose
+    的后果只在日志里留一行「did not settle」。
     """
     steps = _shutdown_steps()
     assert [name for name, _ in steps] == [
-        "health_guard", "agent", "discovery", "paper", "ai_trade", "ai_backtest",
-        "live_auto", "weight_batch", "weight_train", "okx_rest", "okx_pool", "db_engine",
+        "health_guard", "agent", "discovery", "paper", "ai_trade", "ai_trade_experience",
+        "ai_backtest", "live_auto", "weight_batch", "weight_train", "okx_rest", "okx_pool",
+        "db_engine",
     ]
     assert all(callable(factory) for _, factory in steps)

@@ -32,6 +32,11 @@ from ..ai_auto.discipline import (
     preset_table,
     resolve_updates,
 )
+from ..ai_auto.experience import (
+    load_session_graph,
+    resolve_experience,
+    resolve_experience_settings,
+)
 from ..ai_auto.hold_horizon import HorizonRule, profiles_wire, resolve_horizon_rule
 from ..ai_auto.manager import (
     AiTradeGroupMemberInput,
@@ -334,6 +339,15 @@ async def build_start_request(session: AsyncSession, settings: Settings,
     # 此后本函数体内**再无**任何一处读得到旧对象（G-13 钉死顺序）。
     settings, discipline, priming_bars = _resolve_discipline(
         body.discipline, settings, spec_count=len(specs), priming_bars=body.primingBars)
+    # 经验层 W-1（★ E-3 / 评审 P0-3）：**必须排在 `_resolve_discipline` 之后**——纪律预设把
+    # `settings` 换成了派生副本，早一步读到的是旧对象。本步在其结果上**再派生一次**，把设置中心
+    # 那 12 项可写阈值（`app_settings["experience.*"]`）并回 `Settings`；没有这一座桥，那个面板就是
+    # 一个用户改得动、系统永远不读、而且不报错的假面板（不变式 I-10，用例 A-41）。
+    settings = await resolve_experience_settings(session, settings)
+    experience_rule = resolve_experience(
+        body.experience.model_dump() if body.experience is not None else None, settings)
+    experience_snapshot = await load_session_graph(
+        session, settings=settings, rule=experience_rule)
     priors = await _resolve_prior_snapshots(
         session, settings, inst_ids=[m.instId for m in body.members], bar=body.bar,
         fingerprints=fingerprints)
@@ -367,7 +381,11 @@ async def build_start_request(session: AsyncSession, settings: Settings,
         discipline_preset=discipline.preset_id, discipline_f_floor=discipline.f_floor,
         discipline_adjustments=discipline.adjustments,
         discipline_thresholds=preset_table(discipline.preset_id),
+        # 经验层 W-1：规则与启动期快照（`SessionGraph{graph, totals, as_of_ts}` —— 图与库存总量
+        # **同一次取数**，因为那两个整数要被逐字渲染进 L0 页眉喂给下真单的模型，不变式 I-9）。
+        experience_rule=experience_rule, experience_snapshot=experience_snapshot,
         # 续跑的唯一真源（pause-resume D-2 / [P2-11]）：只落请求体，绝不含 apiKey/secret/passphrase。
+        # `experience` 键在原文里 ⇒ 冷续跑重跑本函数即自动同配置，**这一半无需额外代码**（§4.11）。
         start_wire=body.model_dump(mode="json"))
     return req
 

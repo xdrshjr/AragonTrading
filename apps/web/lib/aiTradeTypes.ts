@@ -823,6 +823,8 @@ export interface AiTradeTraceEvent {
   tacticalContext?: TacticalContext | null;
   tacticalTier?: "full" | "brief" | null;
   contextDisclosure?: "full" | "repeat" | null;
+  // round_start：本轮实际喂入的交易经验（未装配 ⇒ null ⇒ 徽标整枚不渲染）。
+  experience?: import("./experienceTypes").AiTradeExperienceInjection | null;
   verdict?: AiReflectionVerdict; // reflection_verdict：反思裁决（confirm/abort）
   adjustedSizeFraction?: number | null; // reflection_verdict：实际收缩后的开仓仓位占比（无收缩为 null）
   // base_rule：【基础策略】铁律门禁判定 + 本轮通道断面（band 不可用时三条线为 null，不假数据）。
@@ -909,6 +911,9 @@ export interface AiTradeRoundTrace {
   tacticalContext?: TacticalContext | null;
   tacticalTier?: "full" | "brief" | null;
   contextDisclosure?: "full" | "repeat" | null;
+  // 本轮实际喂入的交易经验（experience-context-graph §7.3）：**必须与 emptyRoundTrace 的逐键
+  // 手抄保持一致**——漏抄这一键，后端发什么前端都收不到，且跑不出错。
+  experience?: import("./experienceTypes").AiTradeExperienceInjection | null;
   thinking: string; // 累积深度思考（未开启扩展思考时通常为空）
   analysis: string; // 累积自然语言研判分析（流式主可见内容）
   toolCallPending?: boolean;
@@ -999,6 +1004,7 @@ export interface AiTradeSessionRow {
   takeProfitUsd?: number | null;
   stopLossUsd?: number | null;
   contextRefreshRounds: number;
+  experience?: import("./experienceTypes").AiTradeExperienceStatus | null;   // 经验层观测（加法键）
   roundsCompleted: number;
   roundsSinceSummary: number;
   positionSide: string;
@@ -1199,6 +1205,8 @@ export interface AiTradeGroupStartReq {
   profitGuard?: AiTradeProfitGuardRule | null;  // 利润保护层（字段省略→服务端默认开启）
   tradingHorizon?: AiTradeHorizonRule | null;   // 交易周期模式（字段省略→服务端默认开启）
   discipline?: AiTradeDisciplineIn | null;      // 交易纪律预设（字段省略→服务端默认 balanced）
+  // 经验模式（字段省略→服务端按 `ai_trade_experience_default_on` 装配，默认开启）。
+  experience?: import("./experienceTypes").AiTradeExperienceRule | null;
 }
 
 // 分组成员行（start 回执 / status 视图共用）：完整会话行 + 分配占比。
@@ -1655,6 +1663,7 @@ export interface AiTradeConfig {
   // 交易周期模式偏好（holding-horizon §3.4 第 3 处）；同为**可选**，读点一律兜底
   // （**不**为此改 persist version，沿用 baseRules 先例，避免动 migration 链）。
   tradingHorizon?: AiTradeHorizonRule;
+  experience?: import("./experienceTypes").AiTradeExperienceRule;   // 经验模式偏好（可选，同款兜底）
 }
 
 // ---- 止损来源七态（tradability-and-open-funnel 轴 B · R-5）----

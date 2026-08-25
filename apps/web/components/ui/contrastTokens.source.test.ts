@@ -133,15 +133,20 @@ describe("③ 内联回退不得指向 globals.css 里没有的 token（D2）", 
 describe("④ lib/** 下每一个 fetch 都经 withTimeout（D3）", () => {
   const LIB = collect(path.join(WEB_ROOT, "lib"));
 
-  // 口径对账：施工前是 **20 个调用点 / 18 个文件**（`aiTradeHorizonApi.ts` 一个文件独占 3 个，
-  // 彼此独立、无共享包装、抛的还是裸 `Error`）。本轮把那 3 个收敛进该文件私有的 `getJson`，
+  // 口径对账：D3 施工前是 **20 个调用点 / 18 个文件**（`aiTradeHorizonApi.ts` 一个文件独占 3 个，
+  // 彼此独立、无共享包装、抛的还是裸 `Error`）。那一轮把它们收敛进该文件私有的 `getJson`，
   // 于是 20 → 18；文件数不变。收敛不是「合并 18 个 *Api.ts 的包装」（那条明确在范围外），
   // 而是让「同一个文件里第 4 次复制粘贴 fetch 却忘了接超时」在结构上不可能发生。
-  it("扫到了全部 fetch 调用点（18 个调用点 / 18 个文件）", () => {
+  //
+  // ai-trade-experience-context-graph 新增 `experienceApi.ts`：**2 个调用点 / 1 个文件**
+  // （通用 `request` 一处 + NDJSON 导出一处——后者要拿 `res.text()` 而不是 `res.json()`，
+  // 走不了通用包装）。于是 18 → 20 个调用点、18 → 19 个文件。**这个数字每次都要人来对一遍**，
+  // 那正是它存在的理由：一个新 `*Api.ts` 忘了接超时时，按钮会静默冻结最长 5 分钟。
+  it("扫到了全部 fetch 调用点（20 个调用点 / 19 个文件）", () => {
     const sites = LIB.reduce((n, s) => n + (s.text.match(/\bfetch\(/g)?.length ?? 0), 0);
     const files = LIB.filter((s) => /\bfetch\(/.test(s.text));
-    expect(sites).toBe(18);
-    expect(files.length).toBe(18);
+    expect(sites).toBe(20);
+    expect(files.length).toBe(19);
   });
 
   // 判据是**调用点**不是文件：`aiTradeHorizonApi.ts` 一个文件里就有 3 个彼此独立的 fetch 且没有共享

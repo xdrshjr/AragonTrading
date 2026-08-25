@@ -787,6 +787,24 @@ class AiTradeHorizonProfilesOut(BaseModel):
     profiles: list[AiTradeHorizonProfileOut] = Field(default_factory=list)
 
 
+class AiTradeExperienceIn(BaseModel):
+    """经验模式入参（ai-trade-experience-context-graph §五）。
+
+    **字段整键缺省 ⇒ 按 `ai_trade_experience_default_on`（默认 True）装配**——沿用
+    `baseRules` / `profitGuard` / `tradingHorizon` / `discipline` 的成文惯例：「老客户端没发这个
+    字段」与「用户亲手取消了勾选」是两件不同的事，把它们合成一个判据用户就再也关不掉这个功能，
+    而界面上那个复选框看起来是生效的。解析点**单一**：`experience/rules.resolve_experience`。
+
+    **★ E-15（评审 P1-9）· `enabled:false` = 既不读也不写**（关就是全关）：`ExperienceRuntime.writing`
+    依赖 `rule.enabled`，关掉读的同时也关掉了采集。这是一个被明确决定并写在 UI 上的语义——
+    只想「用但不沉淀」的用户走 `write:false`（只读模式）。**没有**「不读但写」的第三态（§十一.10）。
+    """
+
+    enabled: bool = True
+    scope: Literal["symbol", "global"] = "symbol"
+    write: bool | None = None       # None = 按服务端写闸（`ai_trade_experience_write_enabled`）
+
+
 class AiTradeDisciplineIn(BaseModel):
     """交易纪律预设入参（ai-trade-discipline-preset-and-integrity §5.1）。
 
@@ -880,6 +898,10 @@ class AiTradeGroupStartIn(BaseModel):
     # `_resolve_discipline`，且它**必须排在所有其它 `_resolve_*` 之前**——预设表里含
     # `ai_trade_profit_guard_hard_tp_return_pct`，派生副本晚一步产生那一行预设就是死字母（[P1-2]）。
     discipline: AiTradeDisciplineIn | None = None
+    # 经验模式（默认开启，同上「字段缺省 ⇒ 开启」语义，解析点 `experience/rules.resolve_experience`）；
+    # `{"enabled":false}` ⇒ 该会话**既不读取也不沉淀**经验（★ E-15）。`start_wire` 原文含本键，
+    # 故冷续跑（`resume.py` 的 S2 重跑 `build_start_request`）自动同配置，无需额外代码。
+    experience: AiTradeExperienceIn | None = None
 
     @field_validator("members")
     @classmethod
@@ -1072,6 +1094,10 @@ class AiBacktestStartIn(BaseModel):
     # 前科（`base_rules` P1-4 / `profit_guard` I-3）：用户拿回测调出来的参数在实盘失真。
     # 优先级写死为「显式请求字段（`minConsensus`）> 预设 > config 默认」，见 `backtest_manager`。
     discipline: AiTradeDisciplineIn | None = None
+    # 经验模式：字段接住但 **v1 恒不装配**（§十一.2）——回测的成本口径与实盘不同，把实盘经验喂进
+    # 回测会让回测结论无法与历史回测对比；且回测跑得快，几分钟就能生成上万条事件淹没资产。
+    # 接住它是为了「前端两个 tab 共用同一张卡片」以及下一轮开放时不必改 wire。
+    experience: AiTradeExperienceIn | None = None
 
 
 class AiBacktestStartOut(BaseModel):
@@ -2483,6 +2509,120 @@ class DiscoveryBacktestReq(BaseModel):
         if self.endTs <= self.startTs:
             raise ValueError("endTs 必须大于 startTs")
         return self
+
+
+# ============================ 交易经验库（ai-trade-experience-context-graph §五）============================
+class ExperienceNodeIn(BaseModel):
+    """手工新增一条经验（`source="manual"`，`tier` 恒 `candidate`）。
+
+    `context` 的轴与取值走闭合词表（`taxonomy.is_valid`）；越界轴一律被丢弃，全部越界 ⇒ 422。
+    这是不可信输入的第一道闸——一个模型或用户编出来的 `axis="心情"` 在图上永远匹配不到任何东西，
+    却会静默占掉一条经验的全部权重（不变式 I-5）。
+    """
+
+    statement: str = Field(min_length=1, max_length=120)
+    detail: str = Field(default="", max_length=600)
+    context: dict[str, str] = Field(min_length=1)
+    polarity: Literal["positive", "negative"] = "negative"
+
+
+class ExperienceNodePatchIn(BaseModel):
+    """编辑一条经验的可写子集。
+
+    `tier` 只允许在 `candidate`/`normal`/`iron` 之间调整，且**升 `iron` 只有一条路径——置顶**
+    （不变式 I-4）。`muted=true` 落 `mute_reason="user"`，那是 `mark_stale_lessons` 与
+    `unmute_reappeared` 判断「这是人类意志、不许自动改写」的唯一依据（★ E-9）。
+    """
+
+    statement: str | None = Field(default=None, min_length=1, max_length=120)
+    detail: str | None = Field(default=None, max_length=600)
+    pinned: bool | None = None
+    muted: bool | None = None
+    tier: Literal["candidate", "normal", "iron"] | None = None
+
+
+class ExperiencePreviewIn(BaseModel):
+    """检索预演入参（全 11 轴均可手选；空值即该轴不参与种子）。"""
+
+    instId: str = Field(min_length=1, max_length=32)
+    bar: str = Field(min_length=1, max_length=8)
+    regime: str | None = None
+    volatility: str | None = None
+    event: str | None = None
+    side: str | None = None
+    wake: str | None = None
+    exit: str | None = None
+    horizon: str | None = None
+    confidence: str | None = None
+    costRegime: str | None = None
+
+
+class ExperienceRebuildIn(BaseModel):
+    """手动重建（`scope` 目前只有 `stat` 一种；保留字段以便下一轮开放增量范围）。"""
+
+    scope: Literal["stat"] = "stat"
+
+
+class ExperienceImportIn(BaseModel):
+    """导入 JSON（**不可信输入**，R-8 / ★ E-10）。
+
+    只导入经验节点：边是物化派生物，事件带着别人的成本口径（I-7 一旦混用整张表偏移一个往返
+    成本）。`nodes` 的条数上限由 `ai_trade_experience_import_max_nodes` 在服务端判定——越界回
+    422 并给出实际条数与上限，**绝不静默截断**。
+    """
+
+    version: int = 1
+    nodes: list[dict] = Field(default_factory=list)
+    edges: list[dict] = Field(default_factory=list)
+    events: list[dict] = Field(default_factory=list)
+    mode: Literal["merge", "replace"] = "merge"
+
+
+class ExperienceSettingsIn(BaseModel):
+    """设置中心可写的阈值子集（**不含 `enabled`**）。
+
+    评审 P2-4：`enabled` 是**运维总闸**，在本端点上只读。它可写就会与启动弹窗那个复选框互相
+    矛盾——总闸关掉后弹窗仍显示勾选且可勾。总闸只经环境变量 / `.env` 调整，与本仓库其它
+    「一键回滚」总闸一致。
+
+    ★ E-7（评审 P1-1）：`l0MaxChars` / `l1MaxChars` 的**下限**由端点复用
+    `disclosure.budget_floor(layer)` 判定，**不在这里抄一份数字**——`_check_experience_budgets`
+    只在 `Settings` 构造时跑，`PUT` 会完全绕过它，于是用户能从界面上把 L0 配成一个「永远渲染
+    不出任何东西」的值而毫无提示。
+    """
+
+    defaultOn: bool | None = None
+    writeEnabled: bool | None = None
+    minSamples: int | None = Field(default=None, ge=1, le=10000)
+    ironSamples: int | None = Field(default=None, ge=1, le=10000)
+    tThreshold: float | None = Field(default=None, gt=0, le=100)
+    halfLifeDays: float | None = Field(default=None, gt=0, le=3650)
+    staleDays: float | None = Field(default=None, gt=0, le=3650)
+    l0Max: int | None = Field(default=None, ge=0, le=10)
+    l0MaxChars: int | None = Field(default=None, ge=0, le=4000)
+    l1Max: int | None = Field(default=None, ge=0, le=10)
+    l1MaxChars: int | None = Field(default=None, ge=0, le=4000)
+    distillEnabled: bool | None = None
+
+
+class ExperienceSettingsOut(BaseModel):
+    """设置面板回执（`enabled` 只读，见 `ExperienceSettingsIn` 的 P2-4）。"""
+
+    enabled: bool
+    defaultOn: bool
+    writeEnabled: bool
+    minSamples: int
+    ironSamples: int
+    tThreshold: float
+    halfLifeDays: float
+    staleDays: float
+    l0Max: int
+    l0MaxChars: int
+    l1Max: int
+    l1MaxChars: int
+    distillEnabled: bool
+    l0MinChars: int          # 下限判据如实下发，使 UI 能在提交前就说清楚为什么不合法（I-8）
+    l1MinChars: int
 
 
 class ErrorBody(BaseModel):

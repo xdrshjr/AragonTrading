@@ -602,6 +602,28 @@ def _format_track_record(wire: dict | None) -> str:
     return format_track_record_text(wire)
 
 
+def _format_experience(wire: dict | None) -> str:
+    """交易经验段（L0 + L1，按档位）；键缺失 / 零条目 ⇒ 空串 ⇒ 整段省略。
+
+    全文渲染在 `experience/disclosure.py`（沿用「长文本渲染下沉、`prompts.py` 只留 3 行」的既有
+    纪律）。**档位判定的结果住在 wire 里，绝不在这里现场重算**：`commit_round` 会把 prompt
+    再渲染一次塞进 `_context`，两次渲染之间任何状态漂移都会让上下文里的那一份与模型真正看到的
+    那一份不一致。
+    """
+    if not wire:
+        return ""
+    from .experience.disclosure import format_experience   # 延迟导入，同 _format_base_rules
+
+    return format_experience(wire)
+
+
+def _format_experience_counter(wire: dict | None) -> str:
+    """反思轮的 L2 反例段（与提议动作最相冲突的一条）；键缺失 ⇒ 空串 ⇒ 整段省略。"""
+    if not wire:
+        return ""
+    return str(wire.get("rendered") or "")
+
+
 def build_decision_prompt(payload: dict) -> str:
     """把本轮决策输入（体制/共识 + 信号板 + 真实持仓 + 会话盈亏 + 摘要）压成紧凑文本喂决策器。
 
@@ -661,6 +683,11 @@ def build_decision_prompt(payload: dict) -> str:
     track_line = _format_track_record(payload.get("trackRecord"))
     if track_line:                           # 键缺失 ⇒ 整段省略（四条装配门禁任一不过 / 回测 payload）
         parts.append(track_line)
+    experience_line = _format_experience(payload.get("experience"))
+    if experience_line:                      # 键缺失 / 零条目 ⇒ 整段省略（不变式 I-2 的零回归路径）
+        # 位置：紧随实测战绩之后、证据摘要之前——「本账户的历史成绩」与「从历史里提炼的教训」
+        # 是同一类证据的两个粒度，放在一起模型才不必跨段回忆。
+        parts.append(experience_line)
     parts.extend(_digest_lines(payload))     # R1：各段 None 时整段省略（同 E1/E2 降级范式）
     # 战术周期段（时间尺度由远及近单调收缩）：中线背景 → 体制 → 共识 → 先验 → 执行周期证据 →
     # **战术周期** → 基础策略铁律 → 信号板 → 摘要，与系统 prompt 的思维链步骤同序。
@@ -759,12 +786,16 @@ def build_reflection_prompt(payload: dict, decision) -> str:
     决策一次性传入，让复核官在同一证据面上独立批判研判（ai-trade-pre-trade-reflection §八 RV-5 落地）。
     """
     evidence = build_decision_prompt(payload)
+    # L2 反例段（经验层 W-12）：**必须自带足够的自解释**——当轮档位可能是 `repeat`，复核官看到的
+    # L0 只是一行压缩形态，任何「见上文第 N 条」的引用都会指向已被压缩掉的内容（§4.8）。
+    counter = _format_experience_counter(payload.get("experienceCounter"))
+    counter_block = f"{counter}\n\n" if counter else ""
     return (
         "【以下是原交易员看到的本轮全部证据（含其收尾调用 submit_trade_decision 的任务指令）——仅供你复核"
         "时参考其判断依据；那条决策指令**是给原交易员的、与你无关**，你**不要**调用 submit_trade_decision】\n"
         f"{evidence}\n\n"
         "————\n"
-        f"{_format_reflection_decision(decision)}\n\n"
+        f"{counter_block}{_format_reflection_decision(decision)}\n\n"
         "请以资深风控/交易员的批判视角复核上述交易决策是否稳健（方向、与高周期背景是否冲突、当前持仓与"
         "会话盈亏下风险敞口是否可接受、仓位是否偏重、有无证据不足强行交易）。提议决策与证据大体一致即 "
         "`confirm`；对仓位偏重有疑虑时**优先**以 `confirm` + `adjustedSizeFraction` 收缩；仅当能指名一条"

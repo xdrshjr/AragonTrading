@@ -126,6 +126,10 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         "tacticalContext": payload.get("tacticalContext"),
         "tacticalTier": payload.get("tacticalTier"),
         "contextDisclosure": payload.get("contextDisclosure"),
+        # 交易经验（experience-context-graph W-13）：本函数是**显式取键**装配，漏抄这一键
+        # `AiTradeRoundTrace` 永远拿不到本轮实际喂入的经验 ⇒ 后端发什么前端都收不到，
+        # **跑不出错、功能静默缺失**。未装配的会话恒为 None ⇒ 前端整枚徽标不渲染。
+        "experience": payload.get("experience"),
         "thinking": "", "analysis": "",
         "toolCallPending": False, "toolCall": None,
         "executed": None, "degradeReason": None,

@@ -221,6 +221,16 @@ class AiTradeDecider:
 
     # ---------- 只读状态（供 status / snapshot）----------
     @property
+    def llm(self):
+        """LLM 客户端的**只读**出口（experience-context-graph §4.9 的会话末蒸馏用）。
+
+        `self._llm` 是私有的，「从外部持一个引用」拿不到——而蒸馏必须跑在 manager 侧的后台任务里
+        （绝不在 `stop()` 的 await 链上，评审 P0-1），那里只拿得到会话与决策器对象。纯读，
+        不改变决策器的任何状态。
+        """
+        return self._llm
+
+    @property
     def summary(self) -> str | None:
         return self._summary or None
 

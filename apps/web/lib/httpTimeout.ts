@@ -58,6 +58,12 @@ const LONG_EXACT_PREFIXES = [
   "/factor-sets/score-preview", // 组合打分的内联版本，与 /factor-sets/{id}/score 同形
   "/weight-models/train",
   "/ai-trade/prior/rebuild",
+  // 交易经验库（ai-trade-experience-context-graph E-11）：全库重建在大库上超 20 秒是常态
+  // （F-2 自己论证过），导出是几万条事件的 NDJSON 流，替换式导入要先删再写。三条都落
+  // `FAST_MS` 的话，「重建图谱」按钮**必然**假超时——而后端其实跑得好好的。
+  "/experience/rebuild",
+  "/experience/export",
+  "/experience/import",
 ] as const;
 
 /**
@@ -100,6 +106,13 @@ const WRITE_PREFIXES = [
   "/paper/start",
   "/paper/batch/start",
   "/paper/stop-all",
+  // 经验库的两个写类路径（E-11）。**必须登记在这张前缀表、而不是下面那张「家族 + 末段」表**：
+  // 往 `WRITE_ACTION_SUFFIXES` 里加 `/rebuild` 会让**既有的** `/ai-trade/prior/rebuild` 一并被
+  // 重判为写路径——那是在一个与本特性无关的按钮上悄悄改掉超时文案。`/experience/*` 没有路径
+  // 参数，前缀表本就是为这种形状准备的。
+  // 一次超时的 `replace` 导入（它会先删除既有手工与导入节点）必须说「结果未知」而不是「失败」。
+  "/experience/rebuild",
+  "/experience/import",
 ] as const;
 
 /**

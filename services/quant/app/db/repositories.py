@@ -1027,3 +1027,28 @@ from .ai_auto_repositories import (  # noqa: E402,F401
     load_profitability_trips,
     reconcile_orphan_ai_trade_runs,
 )
+# ai_experience_repositories：交易经验上下文图的事件 / 节点 / 边数据层
+# （ai-trade-experience-context-graph §六；自包含，含**唯一**的物化 upsert 函数——编排层禁止写第二份
+# SQL，两份必漂移，而这里漂移的是用户亲手按下的「静音」与 iron 档赖以晋升的符号历史）。
+# 泛用名（overview / get_node / …）一律加 `experience_` 限定前缀再导出，避免遮蔽既有 repo 符号
+# ——本文件已经因为 weight_* 的同名运行记录函数踩过一次这个坑。
+from .ai_experience_repositories import (  # noqa: E402,F401
+    EventQuery as ExperienceEventQuery,
+    append_experience_events,
+    count_events as count_experience_events,
+    create_node as create_experience_node,
+    delete_node as delete_experience_node,
+    get_node as get_experience_node,
+    load_edges as load_experience_edges,
+    load_evidence as load_experience_evidence,
+    load_experience_events,
+    load_nodes as load_experience_nodes,
+    mark_stale_lessons as mark_stale_experience_lessons,
+    materialize_lock as experience_materialize_lock,
+    overview as experience_overview,
+    patch_node as patch_experience_node,
+    replace_edges as replace_experience_edges,
+    stream_export_rows as stream_experience_export_rows,
+    unmute_reappeared as unmute_reappeared_experience_lessons,
+    upsert_lesson_nodes,
+)

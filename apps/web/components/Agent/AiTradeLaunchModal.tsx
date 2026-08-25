@@ -74,6 +74,9 @@ import type {
 import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
 import { tradingApi } from "@/lib/tradingApi";
 import type { Bar } from "@/lib/types";
+import { AI_TRADE_EXPERIENCE_DEFAULTS } from "@/lib/experience";
+import type { AiTradeExperienceRule } from "@/lib/experienceTypes";
+import AiTradeExperienceFields from "./AiTradeExperienceFields";
 import AiTradeHorizonFields, { type HorizonCustomKey } from "./AiTradeHorizonFields";
 import AiTradeTradabilityFields, {
   TRADABILITY_CONFIRM_REQUIRED_TEXT,
@@ -108,6 +111,10 @@ export interface AiTradeLaunchOpts {
   // 交易周期模式（**实盘与回测同源**，holding-horizon §4.3）：选中模式 ⇒ 带 `{enabled,profile,…}`；
   // 取消勾选 ⇒ `{enabled:false}`（**显式关闭**，与「字段缺省=默认开启」语义严格区分）。
   tradingHorizon?: AiTradeHorizonRule;
+  // 经验模式（experience-context-graph §7.2）：勾选 ⇒ 带 `{enabled,scope,write}`；取消勾选 ⇒
+  // `{enabled:false}`（**显式关闭**，与「字段缺省=默认开启」语义严格区分——后者是老客户端
+  // 没发这个字段，前者是用户亲手取消了勾选，合成一个判据用户就再也关不掉这个功能）。
+  experience?: AiTradeExperienceRule;
   // 交易纪律预设（**实盘与回测同源**，discipline-preset R-3）：只带 `{preset}`，阈值一律由服务端
   // 的冻结表决定。整键不发 ⇒ 服务端按 `ai_trade_discipline_default_preset` 装配（老客户端同样受保护）。
   discipline?: AiTradeDisciplineIn;
@@ -154,6 +161,7 @@ export default function AiTradeLaunchModal({
   defaultBaseRule,
   defaultProfitGuard,
   defaultTradingHorizon,
+  defaultExperience,
   defaultStopLossPct,
   defaultTakeProfitPct,
   error,
@@ -181,6 +189,7 @@ export default function AiTradeLaunchModal({
   // 上次所选交易周期模式（aiTradeConfig?.tradingHorizon）；**无本地预设兜底**——模式表由服务端下发，
   // 未选过时留 undefined 并采用接口返回的 defaultProfile（前端不复制任何一个预设数值，R-3）。
   defaultTradingHorizon?: AiTradeHorizonRule;
+  defaultExperience?: AiTradeExperienceRule;   // 上次所选经验模式（缺省 ⇒ 本地默认全开）
   // 上次填过的单仓 OCO（诊断根因 ③：每次都被清空 ⇒ 用户不知不觉一直用 10%/5% 的宽默认）。
   defaultStopLossPct?: number;
   defaultTakeProfitPct?: number;
@@ -198,6 +207,8 @@ export default function AiTradeLaunchModal({
   const [instId, setInstId] = useState(defaultInstId);   // 回测单标的
   const [addSymbolRaw, setAddSymbolRaw] = useState("");
   const [addError, setAddError] = useState<string | null>(null);
+  const [experience, setExperience] = useState<AiTradeExperienceRule>(
+    defaultExperience ?? AI_TRADE_EXPERIENCE_DEFAULTS);
   const [selectedIds, setSelectedIds] = useState<number[]>(defaultStrategyIds);
   const [capitalRaw, setCapitalRaw] = useState("");
   const [leverageRaw, setLeverageRaw] = useState("");
@@ -595,6 +606,9 @@ export default function AiTradeLaunchModal({
       positionStepPct: positionStep,                // 仓位操作档位（实盘/回测两 tab 同得）
       baseRules: baseRulesPayload,                  // 【基础策略】铁律（实盘/回测同源，P1-4）
       tradingHorizon: tradingHorizonPayload,        // 交易周期模式（同一服务端解析点，两侧同源）
+      // 经验模式：整键**恒下发**——`{enabled:false}` 是「用户亲手取消了勾选」，与「整键缺省 ⇒
+      // 服务端默认开启」严格区分。回测侧由服务端恒不装配（§十一.2），前端不重复那条判据。
+      experience,
       // 交易纪律预设（同一服务端解析点 `_resolve_discipline`，实盘与回测两侧同源，R-3）。
       // **只下发 preset，不下发任何阈值**：阈值的唯一真源是后端那张冻结表。
       discipline: { preset: disciplinePreset },
@@ -705,6 +719,14 @@ export default function AiTradeLaunchModal({
           wakeMinutes={wakeMinutes}
           onAlign={() => alignToProfile(activeHorizonProfile ?? undefined)}
           disabled={submitting}
+        />
+
+        {/* 经验模式（experience-context-graph §7.2）：挂在【交易周期模式】之后、时间级别之前。 */}
+        <AiTradeExperienceFields
+          value={experience}
+          onChange={setExperience}
+          disabled={submitting}
+          backtest={mode === "backtest"}
         />
 
         {/* 时间级别（默认 K 线所选周期，可修改，两模式共用）。 */}

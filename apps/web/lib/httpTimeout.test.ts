@@ -31,6 +31,11 @@ describe("超时档位（D3）", () => {
     "/weight-models/train",
     "/weight-models/4/runs/9/backtest",
     "/discovery/candidates/11/backtest",
+    // 交易经验库（A-50 / ★ E-11）：全库重建在大库上超 20 秒是常态，导出是几万条事件的 NDJSON
+    // 流，替换式导入要先删再写。三条落 FAST_MS 的话，「重建图谱」按钮**必然**假超时。
+    "/experience/rebuild",
+    "/experience/export",
+    "/experience/import",
     "/ai-trade/prior/rebuild",
   ])("重计算路径 %s 走 LONG_MS", (path) => {
     expect(timeoutFor(path)).toBe(LONG_MS);
@@ -101,7 +106,10 @@ describe("写类路径的超时文案必须说「未确认」而不是「失败�
            "/live-auto/group/start", "/live-auto/group/g1/stop",
            "/live-auto/group/g1/member/BTC-USDT-SWAP/stop",
            "/paper/start", "/paper/batch/start", "/paper/s1/stop",
-           "/paper/batch/g1/stop", "/paper/stop-all"])(
+           "/paper/batch/g1/stop", "/paper/stop-all",
+           // A-50（★ E-11）：一次超时的替换式导入**可能已经删掉**既有的手工与导入节点，
+           // 一次超时的重建可能已经重写了整张图。两者都必须说「结果未知」而不是「失败」。
+           "/experience/rebuild", "/experience/import"])(
     "%s 判为写类",
     (path) => {
       expect(isWritePath(path)).toBe(true);
@@ -111,7 +119,10 @@ describe("写类路径的超时文案必须说「未确认」而不是「失败�
 
   // 反向：同家族里的只读路径不许被「末段动作」误伤，否则等于在一次纯查询上制造恐慌。
   it.each(["/ai-trade/status", "/ai-trade/g1/resume-preview", "/ai-trade/history",
-           "/live-auto/status", "/paper/sessions", "/ai-trade/backtest/j1/cancel"])(
+           "/live-auto/status", "/paper/sessions", "/ai-trade/backtest/j1/cancel",
+           // A-50 反向：经验库的只读端点不得被误判为写类（一次纯查询上的「结果未知」是恐慌）。
+           "/experience/overview", "/experience/graph", "/experience/lessons",
+           "/experience/preview", "/experience/export"])(
     "%s 仍判为读类",
     (path) => {
       expect(isWritePath(path)).toBe(false);

@@ -4,6 +4,7 @@ import { useCallback, useMemo, useState } from "react";
 import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
 import DisciplineCard from "./DisciplineCard";
 import ExitSourceCard from "./ExitSourceCard";
+import ExperienceCard from "./ExperienceCard";
 import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
 import OpenFunnelCard from "./OpenFunnelCard";
 import TradabilityCard from "./TradabilityCard";
@@ -224,6 +225,11 @@ export default function AiTradeStatsLive() {
         ))}
         {Object.values(group.members).map((m) => (
           <OpenFunnelCard key={`funnel-${m.instId}`} funnel={m.session?.openFunnel} />
+        ))}
+        {/* 经验模式（experience-context-graph §7.3）：数据源同为**成员级实时快照**。
+            未装配 ⇒ 整卡不渲染（`ExperienceCard` 自己门控），绝不挂一排「—」。 */}
+        {Object.values(group.members).map((m) => (
+          <ExperienceCard key={`exp-${m.instId}`} experience={m.session?.experience} />
         ))}
         <HorizonLiveCard group={group} ledger={ledger} />
         {/* 周期验收闭环（horizon-acceptance）：两卡是**两个独立入参**——`acceptance` 为 null

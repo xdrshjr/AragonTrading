@@ -632,3 +632,121 @@ class AiTradeGroupState(Base):
     last_seen_ts: Mapped[int] = mapped_column(Integer, default=0)        # 心跳（离线时长分母）
     created_ts: Mapped[int] = mapped_column(Integer, default=0)
     updated_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiExperienceEvent(Base):
+    """一笔已结算往返沉淀下来的**经验事件**（ai-trade-experience-context-graph §6.1）。
+
+    这张表是整个特性的**唯一真源**：append-only、绝不改写。图（节点与边）全部由它物化派生，
+    随时可以整表重算——图算错了不是数据丢了，重建即可。这一性质是本设计的可修复性来源。
+
+    为什么是新表而不是给 ``trades`` 加列：``create_all`` **会**建缺失的表、**不会**给既有表补列
+    （见 ``db/session.py`` 的四个 ``_ensure_*_columns`` 补丁）。新表 = 零迁移代码、老库首次启动
+    自动获得、不可能 ``no such column``。
+
+    ``origin`` 在 v1 恒为 ``"live"``（回测侧不写入，见 spec §十一.2）。保留它的理由不是「它已经
+    有第二个取值」，而是**事后加列必须写 ALTER 补丁，而现在加它代价为零**：v2 开回测写入或续跑
+    补采时免掉一次迁移。聚合层照写 ``WHERE origin='live'``，语义是口径闸。
+
+    五个 bps 类读数从 ``outcome_json`` **提列**：聚合是热路径，逐行解 JSON 会让重建在几万条事件
+    上肉眼可见地慢，而这五个量是全部统计模板的输入。
+    """
+
+    __tablename__ = "ai_experience_events"
+    __table_args__ = (
+        UniqueConstraint("group_id", "inst_id", "seq", "exit_ts", name="uq_ai_exp_event"),
+        Index("ix_ai_exp_event_scope", "inst_id", "bar", "exit_ts"),
+        Index("ix_ai_exp_event_group", "group_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[str] = mapped_column(String(48), index=True, default="")
+    run_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    inst_id: Mapped[str] = mapped_column(String(32), default="")
+    bar: Mapped[str] = mapped_column(String(8), default="")
+    seq: Mapped[int] = mapped_column(Integer, default=0)
+    origin: Mapped[str] = mapped_column(String(8), default="live")   # live|backtest|adopted
+    entry_ts: Mapped[int] = mapped_column(Integer, default=0)        # 秒级 UTC（bar 时钟，C2）
+    exit_ts: Mapped[int] = mapped_column(Integer, default=0)
+    entry_wall_ts: Mapped[int] = mapped_column(Integer, default=0)   # 墙钟（时间衰减用，双时钟不混用）
+    exit_wall_ts: Mapped[int] = mapped_column(Integer, default=0)
+    side: Mapped[str] = mapped_column(String(8), default="")
+    context_json: Mapped[str] = mapped_column(Text, default="{}")    # 开仓瞬刻冻结的九轴签名
+    outcome_json: Mapped[str] = mapped_column(Text, default="{}")    # SettledTrip 的 wire
+    cost_basis: Mapped[str] = mapped_column(String(8), default="gross")   # net|gross（I-7 过滤依据）
+    fee_known: Mapped[bool] = mapped_column(Boolean, default=False)
+    net_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gross_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cost_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    edge_error_bps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hold_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    exit_source: Mapped[str] = mapped_column(String(16), default="unknown")
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiExperienceNode(Base):
+    """物化图节点：语境节点（``axis:value``）或经验节点（``lesson:<12hex>``）。
+
+    **物化是「按 key upsert」而不是「全量替换」**（spec §4.5 评审 P0-2）。六个字段一旦存在即绝不
+    覆盖：``pinned`` / ``muted`` / ``mute_reason``（``user`` 来源的）/ ``first_ts`` / ``created_ts``，
+    以及随 ``prev_sign`` / ``sign_streak`` 前滚的符号历史。前三个是**用户亲手按下的意志**——而
+    ``DELETE`` 对 ``stat`` 节点回 409 时给出的可执行提示恰恰是「改用静音」；删表重建等于产品告诉
+    用户的做法产品自己不兑现。后两个是 ``iron`` 档第三条门槛（最近两次物化符号一致）的唯一落点，
+    没有它 ``iron`` 在结构上永不可达 ⇒ L0 恒空 ⇒ 整个特性「装配成功、日志全绿、一个字都不喂」。
+
+    ``last_seen_ts`` 是该经验**最近一条支撑事件**的墙钟（与 ``stats_json.lastTs`` 同值同源），
+    **不是**最近一次物化的时刻——后者由 ``updated_ts`` 承载。两者若被合成一个字段，检索的时间
+    衰减因子会在每次重建后被拨回 now ⇒ 恒为 1 ⇒ 三年前的教训与昨天同权，且不会报错。
+    """
+
+    __tablename__ = "ai_experience_nodes"
+    __table_args__ = (
+        Index("ix_ai_exp_node_pick", "kind", "tier", "muted"),
+        Index("ix_ai_exp_node_axis", "axis", "value"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(8), default="lesson")        # context|lesson
+    key: Mapped[str] = mapped_column(String(96), unique=True, index=True)
+    axis: Mapped[str | None] = mapped_column(String(24), nullable=True)   # 仅 context 节点
+    value: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    label: Mapped[str] = mapped_column(String(200), default="")
+    detail: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(12), default="stat")   # stat|narrative|manual|imported|context
+    scope: Mapped[str] = mapped_column(String(8), default="symbol")   # symbol|global
+    tier: Mapped[str] = mapped_column(String(12), default="candidate")
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    muted: Mapped[bool] = mapped_column(Boolean, default=False)
+    mute_reason: Mapped[str | None] = mapped_column(String(24), nullable=True)  # user|stale|flipped
+    support: Mapped[int] = mapped_column(Integer, default=0)
+    weight: Mapped[float] = mapped_column(Float, default=0.0)
+    stats_json: Mapped[str] = mapped_column(Text, default="{}")
+    signature_json: Mapped[str] = mapped_column(Text, default="{}")
+    first_ts: Mapped[int] = mapped_column(Integer, default=0)
+    last_seen_ts: Mapped[int] = mapped_column(Integer, default=0)
+    prev_sign: Mapped[int] = mapped_column(Integer, default=0)      # -1|0|+1
+    sign_streak: Mapped[int] = mapped_column(Integer, default=0)
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)
+    updated_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiExperienceEdge(Base):
+    """物化图边：``applies_in`` / ``co_occurs`` / ``contradicts`` / ``refines``（§6.3）。
+
+    ``co_occurs`` 无向但**存两条有向边**：读侧只做单向索引查找，省掉一次 UNION，代价是一行的
+    存储与一次一致的写入（两条边由同一次物化写出，不存在半边状态）。
+    """
+
+    __tablename__ = "ai_experience_edges"
+    __table_args__ = (
+        UniqueConstraint("src_id", "dst_id", "rel", name="uq_ai_exp_edge"),
+        Index("ix_ai_exp_edge_src", "src_id", "rel"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    src_id: Mapped[int] = mapped_column(ForeignKey("ai_experience_nodes.id"), index=True)
+    dst_id: Mapped[int] = mapped_column(ForeignKey("ai_experience_nodes.id"), index=True)
+    rel: Mapped[str] = mapped_column(String(16), default="applies_in")
+    weight: Mapped[float] = mapped_column(Float, default=0.0)
+    support: Mapped[int] = mapped_column(Integer, default=0)
+    updated_ts: Mapped[int] = mapped_column(Integer, default=0)

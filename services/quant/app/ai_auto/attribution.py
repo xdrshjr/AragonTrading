@@ -139,6 +139,15 @@ class AttributionLedger:
         """会话级只读快照（轴 D 的会话段）。"""
         return list(self._settled)
 
+    def last_settled(self) -> SettledTrip | None:
+        """最近一笔已结算往返的**只读**访问器（experience-context-graph §4.3，评审 P0-3）。
+
+        经验层需要 `SettledTrip` **本体**而不是 `trip_meta_wire`：后者只发 17 个键，不含
+        `fee_known` / `side` / `entry_ts` / `edge_error_bps`，而那四个正是口径闸、事件表的列与
+        「估计偏差型」模板的输入。纯读、无副作用、绝不改 `_settled`。
+        """
+        return self._settled[-1] if self._settled else None
+
     def realized_stats(self) -> dict | None:
         """`aiStats.realized` 加法块；一笔已结算往返都没有 ⇒ `None`（整键缺席，不造空表）。"""
         trips = list(self._settled)
