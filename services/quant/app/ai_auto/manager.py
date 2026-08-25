@@ -701,7 +701,11 @@ class AiTradeManager:
             reflection_enabled=req.settings.ai_trade_reflection_enabled,   # 生产实盘显式开（默认 True）
             allow_limit=allow_limit,
             # C1 §2.4：承诺退出线总闸经既有 profit_rule 通路派生（装配保护层且承诺开启时露出 holdExitPx）。
-            allow_hold_exit=(req.profit_rule is not None and req.profit_rule.commit_enabled))
+            allow_hold_exit=(req.profit_rule is not None and req.profit_rule.commit_enabled),
+            # exit-priority §6.1：离场优先通道总闸经既有 horizon 契约通路派生（装配了周期层且
+            # 本层已装配时才露出 `exitConviction` / `exitEvidence`）。未装配 ⇒ schema / 描述 /
+            # 三份 prompt 全部逐字节回退（X-7）。
+            allow_exit_priority=getattr(req.horizon_rule, "exit_priority", None) is not None)
         # 不变式 I-3（续跑不新建 run）：冷续跑逐成员**复用同一 `run_id`**，成交 / 指标 / 历史聚合
         # 天然连续，一次交易在历史列表里永远只有一条。这是本方法与 `start` 路径的**唯一**差异。
         run_id = ((ctx.req.resume_of or {}).get("runIds") or {}).get(plan.inst_id)
@@ -1315,6 +1319,19 @@ class AiTradeManager:
     async def _load_state_row(group_id: str) -> dict | None:
         async with get_sessionmaker()() as s:
             return await state_repo.load_group_state(s, group_id)
+
+    async def exit_member(self, group_id: str, inst_id: str) -> dict | None:
+        """人工授权的**单次**市价离场（exit-priority §6.2）；分组 / 成员不存在 ⇒ `None` → 404。
+
+        镜像 `stop_member` / `repair_member` 的既有姿态：只按 `(group_id, inst_id)` 定位成员并
+        转发，判定、锁与下单一律在会话侧（`AiTradeSession.exit_now`）——manager 不做任何业务判断，
+        **也不改分组生命周期**（`/exit` 是会话继续运行的中途动作，不是 `stop`）。
+        """
+        group = self._group
+        if group is None or group.group_id != group_id:
+            return None
+        member = next((m for m in group.members if m.inst_id == inst_id), None)
+        return None if member is None else await member.session.exit_now()
 
     async def repair_member(self, group_id: str, inst_id: str) -> dict | None:
         """人工授权的单次兜底补挂（backstop-repair §4.1）；分组 / 成员不存在 ⇒ `None` → 404。

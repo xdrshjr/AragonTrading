@@ -281,6 +281,8 @@ const HORIZON_RELEASE_LABEL: Record<string, string> = {
   stale_px: "判定价不可信",
   epoch_estimated: "持仓起点为估算值",
   max_hold_bars: "已达强制平仓上限",
+  // exit-priority 轴 A 的第二把钥匙；漏加这一条，豁免轮 UI 只会显示「限制已解除」而说不出为什么。
+  exit_pending: "离场意图已挂起超过上界",
 };
 
 /**
@@ -404,6 +406,38 @@ export function turnoverVetoLine(stats?: AiTradeHorizonStats | null): string | n
   const opens = stats.opensCounted ?? 0;
   if (reentry + budget + opens <= 0) return null;
   return `换手纪律：再入场冷却拦下 ${reentry} / 预算拦下 ${budget}（消耗令牌 ${opens} 次）`;
+}
+
+/**
+ * 离场优先级的放行计数一行（exit-priority §5.4 / X-9）；七个计数全为 0 / 全缺席 ⇒ `null`。
+ *
+ * X-9 的原话是「**Agent 用掉了几次最高优先级、其中几次事后证明是对的**必须是一个能查的数——
+ * 否则这条通道无法被证伪，也就无法被信任」。「事后是对是错」由周期验收卡的净额那一句回答，
+ * **「用掉了几次」由本行回答**：两半缺一，这条通道就只剩一句自述。
+ *
+ * 三个刻意的呈现取舍：
+ * 1. **不并入 `horizonVetoLine` 的四个冻结计数**（沿用 `turnoverVetoLine` 的 [P2-7]）：那四个数的
+ *    语义是「被本层拦下」，而这一组是「被本层放行」，求和会得到一个没有意义的数。
+ * 2. `final` 声明与其中被降档的笔数**并排**：只报放行数会让「模型每轮都喊 final」这件事看不见。
+ * 3. `未经复核放行` 单独一项：它是基础设施故障下的 fail-open，不是模型的功劳，也不是降级
+ *    （故它既不在 `degrade` 里、也不能混进上面两项）。
+ */
+export function exitPriorityStatsLine(stats?: AiTradeHorizonStats | null): string | null {
+  if (!stats) return null;
+  const expedite = stats.exitExpediteRounds ?? 0;
+  const override = stats.exitOverrideRounds ?? 0;
+  const adjudicated = stats.exitAdjudicatedRounds ?? 0;
+  const declared = stats.exitFinalDeclared ?? 0;
+  const downgraded = stats.exitFinalDowngraded ?? 0;
+  const pending = stats.exitPendingReleases ?? 0;
+  const failOpen = stats.exitFailOpenRounds ?? 0;
+  if (expedite + override + adjudicated + declared + pending + failOpen <= 0) return null;
+  const parts = [`加速 ${expedite} 轮`, `最高优先级 ${override} 次`];
+  if (adjudicated > 0) parts.push(`复核官背书 ${adjudicated} 次`);
+  if (declared > 0) parts.push(`声明 final ${declared} 次（降档 ${downgraded} 次）`);
+  if (pending > 0) parts.push(`挂起到期放行 ${pending} 次`);
+  if (failOpen > 0) parts.push(`未经复核放行 ${failOpen} 次`);
+  return `离场优先通道：${parts.join(" / ")}`;
 }
 
 /** 拦截计数行的 title 悬浮：豁免明细 + 窗口放行次数（[P2-4] 要求这两项必须有展示归宿）。 */

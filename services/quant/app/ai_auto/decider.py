@@ -67,6 +67,8 @@ ORDERING_ACTIONS = ("open_long", "open_short", "close")
 # 本轮研判思维链全文的硬上限（ai-trade-reasoning-chain §2.5）：`_last_analysis` 只经 agent_trace 流与
 # _traces(≤20) 承载给 UI，超出即截断；进 journal / decision 事件的是调用方派生的有界摘录（≤400，RC-2/3）。
 _ANALYSIS_MAX_CHARS = 4000
+# 离场证据的落痕上限（与工具 schema 的 `maxLength: 300` 同数；schema 是软引导、本常量是硬约束）。
+_EXIT_EVIDENCE_MAX_CHARS = 300
 
 # 「可重试」degrade 原因白名单（瞬时 LLM 失败 / 未产出有效决策）；其余（low_confidence 等）为终态决策，
 # 绝不重试（ai-trade-decision-llm-retry §4.1）。
@@ -123,6 +125,11 @@ class TradeDecision:
     # 承诺退出线（ai-trade-profit-protection-commitment C1）：仅 `action=hold` 携带的合法值有意义
     # （非法值 / 非 hold 恒 None，绝不因此降级 hold）。末位带默认值 ⇒ 既有位置/六元构造零改动。
     hold_exit_px: float | None = None
+    # 离场确信度与证据（exit-priority §6.1）：仅 `action=close` 携带的合法值有意义。同款末位带
+    # 默认值 ⇒ 既有全部位置构造零改动；值域外 / 类型错**一律忽略、绝不据它降级**（沿用 orderType
+    # 的 F-2 先例：一个读不懂的确信度不该把最安全的动作降级）。
+    exit_conviction: str | None = None
+    exit_evidence: str | None = None
 
 
 def _hold(reason: str) -> TradeDecision:
@@ -174,7 +181,8 @@ class AiTradeDecider:
     def __init__(self, llm: LLMClient, system_prompt: str, *,
                  context_refresh_rounds: int, settings: Settings,
                  position_step_pct: float = 0.0, reflection_enabled: bool = False,
-                 allow_limit: bool = False, allow_hold_exit: bool = False):
+                 allow_limit: bool = False, allow_hold_exit: bool = False,
+                 allow_exit_priority: bool = False):
         self._llm = llm
         self.system_prompt = system_prompt
         self.context_refresh_rounds = max(1, int(context_refresh_rounds))
@@ -189,6 +197,9 @@ class AiTradeDecider:
         # `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA` 恒等断言原样通过（§2.1.2）。生产
         # 装配点从 `profit_rule.commit_enabled` 派生（manager/backtest 各自决定）。
         self.allow_hold_exit = bool(allow_hold_exit)
+        # 离场优先通道总闸（默认 **False**，镜像 allow_limit / allow_hold_exit）：默认 False 是硬
+        # 约束——它让 `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA` 恒等断言原样通过。
+        self.allow_exit_priority = bool(allow_exit_priority)
         # 下单前二次反思总闸（默认关；直接构造该决策器的既有测试/回测 → reflect 无副作用直通、逐字零回归。
         # 生产装配 manager/backtest_manager 从 req.settings.ai_trade_reflection_enabled 显式打开，§2.3）。
         self.reflection_enabled = bool(reflection_enabled)
@@ -198,11 +209,13 @@ class AiTradeDecider:
             name=DECISION_TOOL_NAME,
             description=build_decision_tool_description(self.allow_limit,
                                                         limit_band_pct=band_pct,
-                                                        allow_hold_exit=self.allow_hold_exit),
+                                                        allow_hold_exit=self.allow_hold_exit,
+                                                        allow_exit_priority=self.allow_exit_priority),
             input_schema=build_decision_tool_schema(self._position_step,
                                                     allow_limit=self.allow_limit,
                                                     limit_band_pct=band_pct,
-                                                    allow_hold_exit=self.allow_hold_exit))
+                                                    allow_hold_exit=self.allow_hold_exit,
+                                                    allow_exit_priority=self.allow_exit_priority))
         # 反思唯一放行工具（镜像决策工具的「唯一放行」范式，安全由回落兜底，§2.2）。
         self._reflection_tool = ToolSchema(name=REFLECTION_TOOL_NAME,
                                            description=REFLECTION_TOOL_DESCRIPTION,
@@ -412,8 +425,29 @@ class AiTradeDecider:
             from .signals import quantize_size_fraction
             size = quantize_size_fraction(size, self._position_step)
             return TradeDecision(action, size, confidence, reason, ord_type, limit_px), None
+        # exit-priority §6.1【R:P1-9b】：**只改这一条返回**。`open_long`/`open_short` 走的是上面
+        # 那条 6 位置参的提前 return（连 hold_exit_px 都不带），按 X-1b 反手一律不进本层（先降级
+        # 为 close 再判）——去动它会把一个开仓决策变成潜在的解闸入口，直接违反 X-1。
+        # 显式以 `action == "close"` 为条件解析（与 C1 给 holdExitPx 立的 [P2-3] 纪律逐字同构：
+        # 本函数没有字面 `action == "close"` 分支，不显式判条件残留值会泄漏到 hold/cancel_order）。
+        conviction, evidence = self._resolve_exit_intent(raw, action)
         return (TradeDecision(action, None, confidence, reason, ord_type, limit_px,
-                              hold_exit_px), None)
+                              hold_exit_px, conviction, evidence), None)
+
+    def _resolve_exit_intent(self, raw: dict,
+                             action: str) -> tuple[str | None, str | None]:
+        """解析 `exitConviction` / `exitEvidence`（总闸关 / 非 close ⇒ 恒 `(None, None)`）。
+
+        值域外 / 类型错**一律忽略、绝不降级**（沿用 `orderType` 的 F-2 先例）。
+        """
+        if not self.allow_exit_priority or action != "close":
+            return None, None
+        from .exit_priority import CONVICTIONS       # 延迟导入打破 decider→prompts→hold_horizon 环
+
+        raw_conviction = str(raw.get("exitConviction") or "").strip()
+        conviction = raw_conviction if raw_conviction in CONVICTIONS else None
+        evidence = str(raw.get("exitEvidence") or "").strip()[:_EXIT_EVIDENCE_MAX_CHARS]
+        return conviction, (evidence or None)
 
     # ---------- 下单前二次反思（ai-trade-pre-trade-reflection §2.2/§2.4）----------
     async def reflect(self, payload: dict, decision: TradeDecision, *,
@@ -519,6 +553,7 @@ class AiTradeDecider:
     async def commit_round(self, payload: dict, decision: TradeDecision,
                            executed: dict, *, analysis: str | None = None,
                            reflection: dict | None = None,
+                           gate_veto: dict | None = None,
                            defer_summary: bool = False) -> str | None:
         """记录本轮（追加 _context + _journal），到期触发摘要重置；返回新摘要文本或 None。
 
@@ -538,6 +573,12 @@ class AiTradeDecider:
         （`build_reflection_note` 产物）。恒入 journal（未触发轮为 None，形状稳定，R-06）；
         **仅否决轮**（`vetoed=True`）把注记合并进 `_context` 的 tool_result——短窗口内模型自己也能
         看到「这轮 hold 是被否决的开仓」；非否决轮 tool_result 内容逐字不变（R-05 冻结契约）。
+
+        `gate_veto`（keyword-only，默认 None → 既有调用零回归；exit-priority F-2）：本轮**门禁**
+        否决注记（`horizon_runtime.build_gate_veto_note` 产物）。与 `reflection` 逐字同款处理：
+        恒入 journal（未命中轮为 None，形状稳定），**仅命中轮**合并进 `_context` 的 tool_result。
+        没有它，被 G2 拦下的那一轮模型下一轮读到的自己的历史是「上轮我决定观望」——F-2 断的正是
+        模型侧的论证连续性，与 F-1 断的系统侧计数互为因果，共同构成那条没有出口的活锁。
         """
         self._last_round = int(payload.get("round") or self._last_round + 1)
         tool_id = uuid.uuid4().hex
@@ -547,13 +588,21 @@ class AiTradeDecider:
                           "orderType": decision.ord_type, "limitPrice": decision.limit_px,
                           # C1：承诺退出线随 journal 落痕，否则滚动摘要重置后问责回路断裂（模型记不得
                           # 自己许过什么退出线）——与 orderType/limitPrice 当初落 journal 同理（M-9）。
-                          "holdExitPx": decision.hold_exit_px}
+                          "holdExitPx": decision.hold_exit_px,
+                          # exit-priority §6.1：两者随 journal 落痕，否则滚动摘要重置后问责回路
+                          # 断裂（模型记不得自己声明过什么确信度）——与 orderType/holdExitPx 同理。
+                          "exitConviction": decision.exit_conviction,
+                          "exitEvidence": decision.exit_evidence}
+        # 浅拷贝合并，绝不就地改 `executed` 入参对象；两者都未命中时走空字典分支、tool_result
+        # 内容逐字不变（R-05）。两条注记**不假设互斥**（形状稳定优先于省字符）：门禁否决轮的
+        # decision 此刻已是 hold ⇒ 反思对 hold 直通、`reflection` 恒 None，故实际不会同时出现。
+        extra: dict = {}
         if reflection and reflection.get("vetoed"):
-            # 浅拷贝合并，绝不就地改 `executed` 入参对象；非否决轮走 else 分支逐字不变（R-05）。
-            tool_result_text = json.dumps({**executed, "reflection": reflection},
-                                          ensure_ascii=False)
-        else:
-            tool_result_text = json.dumps(executed, ensure_ascii=False)
+            extra["reflection"] = reflection
+        if gate_veto:
+            extra["gateVeto"] = gate_veto
+        tool_result_text = json.dumps({**executed, **extra} if extra else executed,
+                                      ensure_ascii=False)
         self._context.append(LlmMessage("user", [TextBlock(build_decision_prompt(payload))]))
         self._context.append(LlmMessage(
             "assistant", [ToolUseBlock(id=tool_id, name=DECISION_TOOL_NAME, input=decision_input)]))
@@ -566,7 +615,8 @@ class AiTradeDecider:
             "decision": decision_input, "executed": executed,
             "positionAfter": executed.get("positionAfter"),
             "sessionPnl": payload.get("sessionPnlUsd"), "analysis": analysis,
-            "trigger": payload.get("trigger"), "reflection": reflection})
+            "trigger": payload.get("trigger"), "reflection": reflection,
+            "gateVeto": gate_veto})
         self._rounds_since_summary += 1
         self._trim_context()
         # [P1-11] 到期判定的**唯一最终形态**：退避（D-3 第二半）与 `defer_summary`（D-5）改的是

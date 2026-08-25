@@ -138,7 +138,7 @@ async def test_backtest_and_live_produce_identical_reason(monkeypatch):
     state = HorizonState(epoch=("long", 7), opened_wall=1_700_000_000.0,
                          exit_confirm_streak=2)
     snapshot = build_snapshot(_RULE, state, facts)
-    _, reason = evaluate_horizon_gate(TradeDecision("close", None, 0.7, "x"), snapshot,
+    _, reason, _ = evaluate_horizon_gate(TradeDecision("close", None, 0.7, "x"), snapshot,
                                       _RULE, position_side="long")
     assert reason == "horizon_min_hold(held=10m,min=120m)"
 

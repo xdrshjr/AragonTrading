@@ -11,6 +11,7 @@ import type {
   AiTradeAcceptanceThresholds,
   AiTradeBackstopRepairConfig,
   AiTradeBackstopRepairMode,
+  AiTradeExitPriorityConfig,
   AiTradeHorizonProfile,
   AiTradeHorizonProfileId,
   AiTradeHorizonProfilesResponse,
@@ -137,6 +138,7 @@ export default function AiTradeHorizonFields(props: AiTradeHorizonFieldsProps) {
               && (active?.turnoverBudgetPerDay ?? 0) > 0}
           />
           <BackstopNotice profile={active} response={data} />
+          <ExitPriorityNotice config={data.exitPriority ?? null} />
           {/* [P1-10] 自愈控件**不受跨日条件门控**：随单 OCO 丢失与持仓周期长短无关，
               `hourly_swing` 的仓一样会裸露。四个预设 + custom 一律渲染。 */}
           <BackstopRepairField
@@ -595,6 +597,40 @@ function CoherenceHints({
       >
         按模式对齐（重置时间级别与唤醒周期）
       </button>
+    </div>
+  );
+}
+
+
+/**
+ * 离场优先通道的只读说明块（exit-priority §6.2）。
+ *
+ * 三条纪律与 `BackstopRepairField` 逐字同款：
+ * 1. **整块由后端下发**（`exitPriority`）：档位标签、配额、地板、那句安全承诺，前端一个字、一个数
+ *    都不硬编——一张前后端各存一份的表必然漂移（X-8 / R-8）。
+ * 2. 总闸关 ⇒ `config` 为 `null` ⇒ **整块不渲染**（而不是显示一个「未开启」的空壳）。
+ * 3. `note` 那句「只放行平仓、永不放行开仓」必须在场：它是不变式 X-1 在 UI 上的唯一落点，用户
+ *    需要在把这条通道打开之前就知道它**不可能**让 AI 更容易开仓。
+ */
+function ExitPriorityNotice({ config }: { config: AiTradeExitPriorityConfig | null }) {
+  if (!config || !config.enabled) return null;
+  return (
+    <div
+      className="flex flex-col gap-1 rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1.5"
+      data-testid="ai-horizon-exit-priority"
+    >
+      <span className="text-[10px] font-medium text-[var(--text)]">离场优先通道</span>
+      {config.levels.map((level) => (
+        <span key={level.id} className="text-[10px] leading-relaxed text-[var(--muted)]">
+          <span className="text-[var(--text)]">{level.label}</span>
+          （{level.id}）：{level.detail}
+        </span>
+      ))}
+      <span className="text-[10px] leading-relaxed text-[var(--muted)]">
+        本会话最高优先级配额 {config.maxOverridesPerSession} 次；需连续 {config.overrideRounds}{" "}
+        轮离场意图，且开仓后至少 {config.overrideMinHoldSeconds} 秒。
+      </span>
+      <span className="text-[10px] leading-relaxed text-[var(--accent-ink)]">{config.note}</span>
     </div>
   );
 }

@@ -384,6 +384,37 @@ class Settings(BaseSettings):
     # 容量下限 2 是刻意的安全阀（D-2）：`trend_hold` 速率是 1 次/日，容量若也取 1，则一次早期止损
     # 之后会话要整整 22 小时开不出下一单——那正是 `hold-inertia` 那一轮的「永不开单」形态。
     ai_trade_horizon_turnover_min_capacity: float = Field(default=2.0, ge=1, le=100)
+    # ---- 离场优先级与离场意图兑现（ai-trade-exit-priority-and-commitment §5.1）----
+    # 与持仓周期三闸并列的第四条纪律，极性与它相同（fail-open）但方向相反：三闸约束「什么时候
+    # 不许平」，本层约束「什么时候必须让它平」。总闸 False ⇒ 恒不装配、决策工具 schema 恒等于
+    # DECISION_TOOL_SCHEMA、prompt 三份逐字节回退、note_intent 回退到「一轮即清零」。
+    # env 名 AI_TRADE_EXIT_* 已在 desktop config.js prod 透传白名单内（AI_TRADE_ 前缀）。
+    ai_trade_exit_priority_enabled: bool = True                                    # C-1
+    ai_trade_exit_priority_backtest_enabled: bool = True                           # C-1b
+    # 0 ⇒ 逐字回退今天的「一轮非离场即清零」（F-1 的回滚开关）。**默认值分层是刻意的**：settings
+    # 默认 2、`HorizonRule.exit_intent_decay_rounds` 默认 **0**（既有用例直接构造 HorizonRule 且
+    # 断言今天的行为，靠的正是后者）——**不要顺手把 HorizonRule 的默认也改成 2**。
+    ai_trade_exit_intent_decay_rounds: int = Field(default=2, ge=0, le=10)         # C-2
+    # exit_pending 豁免 = mult × confirm_window_s；0 ⇒ 关闭本豁免。
+    ai_trade_exit_pending_release_mult: float = Field(default=2.0, ge=0, le=10)    # C-3
+    ai_trade_exit_override_rounds: int = Field(default=2, ge=1, le=10)             # C-4
+    # G1 的不可解除内核：override 也不解这一段（挡「开仓当轮立刻 final 平仓」的病态形态）。
+    ai_trade_exit_override_min_hold_s: float = Field(default=60.0, ge=0, le=3600)  # C-5
+    # 会话级配额；0 ⇒ 关闭 override 档（final 一律按 high 处理，如实写进 prompt）。
+    # `override` 与 `adjudicated` **共用**这一份配额——裁决不是配额外的第二条通道，否则
+    # 「配额用尽 ⇒ 走裁决 ⇒ 配额继续涨」会让本项变成一个只在文档里存在的数字（X-4b）。
+    ai_trade_exit_override_max_per_session: int = Field(default=6, ge=0, le=100)   # C-6
+    ai_trade_exit_evidence_min_chars: int = Field(default=10, ge=0, le=200)        # C-7
+    # X-6：close 的反思 fail-closed 反转为 fail-open。False ⇒ 逐字回退今天（F-3 的回滚开关）。
+    ai_trade_exit_reflection_fail_open: bool = True                                # C-8
+    ai_trade_exit_commitment_enabled: bool = True                                  # C-9
+    ai_trade_exit_commitment_retry_interval_s: float = Field(default=10.0, ge=1, le=300)   # C-10
+    ai_trade_exit_commitment_max_attempts: int = Field(default=6, ge=1, le=50)     # C-11
+    ai_trade_exit_commitment_max_age_s: float = Field(default=300.0, ge=10, le=3600)       # C-12
+    # 【立即离场】运维总闸（人工授权的单次市价离场端点）；关 ⇒ 端点 409（`AI_TRADE_MANUAL_EXIT_
+    # DISABLED`），面板按钮**照常渲染**、点下去如实回显那句中文——本值不进任何 wire，前端无从
+    # 预知它。这是刻意的取舍：为一个运维态开关多开一条下发通道，比让用户点一次看见原因更贵。
+    ai_trade_manual_exit_enabled: bool = True                                      # C-13
     # ---- 交易所侧兜底真值化（§2.3）----
     # 「交易所侧还有兜底」是一句从未被核实过的话（真源是本地成交回执，从不查交易所），而它恰是
     # 跨日模式「不必每轮盯盘」的唯一授权来源。总闸关 ⇒ 一个请求都不发、兜底文案逐字回退到本地

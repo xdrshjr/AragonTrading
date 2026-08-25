@@ -36,7 +36,7 @@ def test_unarmed_runtime_is_a_no_op():
     runtime = HorizonRuntime(None)
     assert runtime.refresh(_facts()) is None
     decision = _close()
-    out, degrade, snap = runtime.gate(decision, None, _facts())
+    out, degrade, snap, _ = runtime.gate(decision, None, _facts())
     assert out is decision and degrade is None and snap is None
     payload: dict = {}
     runtime.inject(payload, None)
@@ -139,7 +139,7 @@ def test_confirm_window_release_is_counted():
     runtime.note_intent("close", None, position_side="long", now_wall=_NOW + 8000.0)
     facts = _facts(now_wall=_NOW + 20000.0, mark_px=100.5)
     decision = _close()
-    out, _, snap = runtime.gate(decision, None, facts)
+    out, _, snap, _ = runtime.gate(decision, None, facts)
     assert out is decision and snap["confirmWindowElapsed"] is True
     assert runtime.stats()["confirmWindowReleases"] == 1
 

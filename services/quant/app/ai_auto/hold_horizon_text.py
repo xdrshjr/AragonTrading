@@ -11,6 +11,20 @@ from __future__ import annotations
 
 import math
 
+from .exit_intent import RELEASE_EXIT_PENDING
+from .exit_priority import (
+    CONVICTION_FINAL,
+    CONVICTION_HIGH,
+    DOWNGRADE_EVIDENCE,
+    DOWNGRADE_LEDGER,
+    DOWNGRADE_MIN_HOLD,
+    DOWNGRADE_QUOTA,
+    LEVEL_ADJUDICATED,
+    LEVEL_EXPEDITE,
+    LEVEL_NONE,
+    LEVEL_NORMAL,
+    LEVEL_OVERRIDE,
+)
 from .hold_horizon import (
     RELEASE_EPOCH_ESTIMATED,
     RELEASE_LOSS,
@@ -54,6 +68,23 @@ _RELEASE_LABEL = {
     RELEASE_STALE_PX: "判定价不可信",
     RELEASE_EPOCH_ESTIMATED: "持仓起点为估算值",
     RELEASE_MAX_HOLD_BARS: "已达强制时间平仓上限",
+    # exit-priority 轴 A 的第二把钥匙；漏加这一条，豁免轮 UI 只会说「限制已解除」而说不出为什么。
+    RELEASE_EXIT_PENDING: "离场意图已挂起超过上界",
+}
+
+# 五档离场优先级的中文标签（前端一个字都不硬编，X-8）。
+_LEVEL_LABEL = {
+    LEVEL_NONE: "不适用", LEVEL_NORMAL: "P1 · 常规",
+    LEVEL_EXPEDITE: "P2 · 加速", LEVEL_ADJUDICATED: "P3 · 复核官背书",
+    LEVEL_OVERRIDE: "P3 · 最高优先级",
+}
+
+# 四种降档原因的中文（**必须如实进 prompt**：静默降档会让模型在下一轮重复完全相同的错误）。
+_DOWNGRADE_LABEL = {
+    DOWNGRADE_EVIDENCE: "未给出可核对的新证据",
+    DOWNGRADE_LEDGER: "跨轮离场账本还不够厚",
+    DOWNGRADE_QUOTA: "本会话最高优先级配额已用尽",
+    DOWNGRADE_MIN_HOLD: "距开仓不足绝对地板时长",
 }
 
 
@@ -127,6 +158,35 @@ def format_charter(rule: HorizonRule | None, *, stop_loss_pct: float | None = No
         "**单根分钟级回撤不构成平仓理由**：执行周期与更高周期的持仓逻辑未失效之前，战术周期的反向"
         "信号只应影响你的离场**价位**，不应影响你的离场**决定**。需要离场时，请先说明「持仓理由已经"
         "失效」的新证据，再给出 `close`。"
+        f"{_exit_priority_charter(rule)}"
+    )
+
+
+def _exit_priority_charter(rule: HorizonRule) -> str:
+    """宪章的「离场优先通道」段（§4.6.4）；本层未装配 ⇒ **空串垫片** ⇒ 三份 prompt 逐字节回退。
+
+    这一段是本轮对用户诉求的直接回答：**当你在多轮研判中确认应当退场时，系统有一条最高优先级的
+    通道支持你走掉**，而不是被硬条件卡死。但优先级越高、举证责任越重——每一次放行都会留下能回头
+    算账的凭据（X-9），否则这条通道会在三天内退化成「每一轮都喊 final」。
+    """
+    priority = rule.exit_priority
+    if priority is None or not getattr(priority, "enabled", False):
+        return ""
+    return (
+        "\n**离场优先通道**：如果你判断持仓理由已经失效、需要立即离场，可在 "
+        "`submit_trade_decision` 里带上 `exitConviction`：\n"
+        f"  · `{CONVICTION_HIGH}` —— 离场理由已成熟：系统将跳过「离场连续确认」这一条约束"
+        "（**不含换手迟滞**：那一条是「浮盈还不够付一次往返成本」，跳过它就是确定性地做一笔净亏"
+        "的往返，不能由一句自述解开）。\n"
+        f"  · `{CONVICTION_FINAL}` —— 你已在多轮研判中确认持仓理由失效：系统将跳过全部三条约束"
+        f"立即执行。使用 `{CONVICTION_FINAL}` 必须同时在 `exitEvidence` 里指名「持仓理由失效」的"
+        f"**新证据**（不是重复上一轮的判断），且需要连续 {priority.override_rounds} 轮的离场意图"
+        f"与开仓后至少 {_fmt_duration(priority.override_min_hold_s)}。\n"
+        f"  · 本会话 `{CONVICTION_FINAL}` 配额 {priority.max_overrides_per_session} 次；"
+        "配额用尽后按 `high` 处理，**且不再进入复核裁决**（配额是硬的，不是一句「请复核官通融」"
+        "能绕过的）。\n"
+        "  · 你的每一次 `final` 都会被记录，并在会话结束时与真实结果对照。**它是给真正的转折点"
+        "准备的，不是给每一轮的犹豫准备的。**\n"
     )
 
 
@@ -223,7 +283,8 @@ def format_horizon_for_prompt(wire: dict | None) -> str:
         return "\n".join(part for part in [f"{head}\n  {_flat_line(wire)}",
                                            _turnover_line(wire)] if part)
     lines = [head, _hold_line(wire), _confirm_line(wire), _hysteresis_line(wire),
-             _release_line(wire), _turnover_line(wire), _exchange_snapshot_line(wire),
+             _release_line(wire), _exit_priority_line(wire), _exit_commitment_line(wire),
+             _turnover_line(wire), _exchange_snapshot_line(wire),
              _blocked_note_line(wire)]
     return "\n".join(part for part in lines if part)
 
@@ -295,12 +356,59 @@ def _confirm_line(wire: dict) -> str:
     if rounds <= 1:
         return ""
     streak = int(wire.get("exitConfirmStreak") or 0)
+    # 轴 A：一次犹豫不再抹掉整条论证链，故必须让模型看得见「你上一轮没提，本轮按衰减计入」——
+    # 否则它会以为账本已经清零而重新从头论证一遍。`lapses == 0` ⇒ 逐字节回退今天那句。
+    lapses = int(wire.get("exitIntentLapses") or 0)
+    decay = "" if lapses <= 0 else f"（其间 {lapses} 轮未提离场，已按衰减计入）"
     if wire.get("confirmWindowElapsed"):
-        return f"  离场连续确认：{streak}/{rounds}，**确认窗口已到，本轮按你的意愿放行**。"
+        return (f"  离场连续确认：{streak}/{rounds}{decay}，"
+                "**确认窗口已到，本轮按你的意愿放行**。")
     remaining = wire.get("confirmWindowRemainingSeconds")
     window = ("" if remaining is None
               else f"；确认窗口剩余 {_fmt_duration(remaining)}（到时即放行）")
-    return f"  离场连续确认：{streak}/{rounds}{window}。"
+    return f"  离场连续确认：{streak}/{rounds}{decay}{window}。"
+
+
+def _exit_priority_line(wire: dict) -> str:
+    """离场优先级一行（§4.6.4）；`exitPriority` 键缺席 / 本轮非平仓 ⇒ 整行省略（逐字节回退）。
+
+    降档轮**必须写清原因**：「你声明了 final，但因为 X 本轮按 high 处理」是模型下一轮修正行为的
+    唯一依据；静默降档会让它在下一轮重复完全相同的错误。
+    """
+    priority = wire.get("exitPriority")
+    if not isinstance(priority, dict) or priority.get("level") in (None, LEVEL_NONE):
+        return ""
+    level = str(priority.get("level"))
+    gates = "、".join(priority.get("releasedGates") or ()) or "—"
+    head = f"  离场优先级：{_LEVEL_LABEL.get(level, level)}"
+    body = "（本轮未解除任何约束）" if gates == "—" else f"（已解除 {gates}）"
+    downgrade = priority.get("downgradeReason")
+    tail = ("" if not downgrade else
+            f"；你声明了 {priority.get('declared')}，但{_DOWNGRADE_LABEL.get(downgrade, downgrade)}"
+            f"，本轮按 {CONVICTION_HIGH} 处理")
+    used, cap = priority.get("overridesUsed"), priority.get("maxOverridesPerSession")
+    quota = "" if used is None or cap is None else f"｜最高优先级配额已用 {used}/{cap} 次"
+    pending = "；**本轮已挂起，交由复核官裁决**" if priority.get("pending") else ""
+    return f"{head}{body}{tail}{quota}{pending}。"
+
+
+def _exit_commitment_line(wire: dict) -> str:
+    """离场兑现一行（§4.6.4）；未武装 ⇒ 整键缺席 ⇒ 整行省略。
+
+    **受阻那一支至关重要**：它是模型唯一能知道「我已经下过平仓指令但它没成交」的途径，缺了它
+    模型会在下一轮重新研判一遍已经作过的决定。
+    """
+    commit = wire.get("exitCommitment")
+    if not isinstance(commit, dict) or not commit.get("armed"):
+        return ""
+    attempts, cap = commit.get("attempts"), commit.get("maxAttempts")
+    age = _fmt_duration(commit.get("ageSeconds") or 0.0)
+    if commit.get("stuck"):
+        return (f"  ⚠ **你此前已确认离场，但连续 {attempts} 次平仓都未成交**（已持续 {age}），"
+                "系统已停止自动重试；交易所侧止盈止损仍生效，用户可在面板上一键离场。"
+                "请据此重新研判，不要把它当成一次尚未做出的决定。")
+    return (f"  离场意图正在兑现：第 {attempts}/{cap} 次尝试（已持续 {age}），"
+            "系统会在下一次盯市继续重试——**你无需重复下达同一条平仓指令**。")
 
 
 def _hysteresis_line(wire: dict) -> str:
@@ -469,7 +577,28 @@ def format_reflection_note(wire: dict | None) -> str:
         "`close`」与「该平不平」是**对称**的两种错误：前者用两笔确定的手续费换一个未成熟的判断。"
         "复核一笔主动平仓时，请同样检查它的依据是否只是分钟级噪音、是否与该模式的时间尺度相称。"
         "系统另有确定性的最短持仓窗口与连续确认约束，你无需替它执行，但你的裁决不应与它相悖。"
+        f"{_pending_exit_note(wire)}"
     )
+
+
+def _pending_exit_note(wire: dict) -> str:
+    """挂起裁决那一句（§6.4）；非挂起轮 ⇒ 空串 ⇒ 反思 prompt 逐字节回退。
+
+    括号里的内容不是装饰：挂起现在**只可能**由「账本还不够厚」触发（配额、证据、时间地板三种
+    降档根本不会走到反思），复核官必须知道自己被请来替代的到底是哪一项，而不是被含糊地要求
+    「你看着办」。
+    """
+    priority = wire.get("exitPriority")
+    if not isinstance(priority, dict) or not priority.get("pending"):
+        return ""
+    streak = priority.get("intentStreak")
+    rounds = priority.get("overrideRounds")
+    gap = ("" if streak is None or rounds is None
+           else f"（跨轮离场账本 {streak}/{rounds}，还差 {max(0, int(rounds) - int(streak))} 轮）")
+    return ("\n**本轮是被持仓周期层挂起的离场提议**"
+            f"{gap}：模型已声明这是终局判断并给出了证据，只是账本还不够厚。"
+            "你的裁决将**直接决定它是否执行**——`confirm` 即立即平仓，`abort` 即继续持有。"
+            "请只就「持仓理由是否确已失效」作答，不要替系统执行它自己的轮数约束。")
 
 
 def format_backtest_notes(rule: HorizonRule | None, bar_seconds: int, *,
@@ -499,6 +628,21 @@ def format_backtest_notes(rule: HorizonRule | None, bar_seconds: int, *,
         notes.append(f"⚠ 本模式的离场确认窗口 {rule.confirm_window_s:g}s 小于一根 K 线，回测中该窗口"
                      "恒于次根即已到期，连续确认闸相对实盘偏松。")
     notes.extend(_turnover_backtest_notes(turnover, rule, bar_seconds))
+    notes.extend(_exit_priority_backtest_notes(rule))
+    return notes
+
+
+def _exit_priority_backtest_notes(rule: HorizonRule) -> list[str]:
+    """离场优先级在回测世界的两条免责（exit-priority R-10 / D-4）；未装配 ⇒ `[]`。"""
+    if rule.exit_priority is None:
+        return []
+    notes = ["回测**不装配**离场意图兑现重试（轴 C）：`SimBroker` 每单必成，「离场已下发但未成交」"
+             "在回测世界里不存在，故本次回测结论不覆盖这一轴。"]
+    if rule.exit_pending_max_s > 0:
+        notes.append(
+            f"离场意图账本在回测里按**根时间戳**推进（不是墙钟）：挂起上界 "
+            f"{_fmt_duration(rule.exit_pending_max_s)} 与最高优先级的绝对地板，"
+            "在回测中衡量的是「根时间跨度」而非真实等待时长，与实盘存在系统性差异。")
     return notes
 
 

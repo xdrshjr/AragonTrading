@@ -142,6 +142,9 @@ class LiveExecutor:
         # 当前挂着的那一笔限价委托（不变式 I-1：单会话至多一笔）。恒为 None ⇒ 市价路径 ⇒ live_auto
         # 的每一处判定都短路，行为与本特性合入前逐字相同。
         self.resting: RestingOrder | None = None
+        # 最近一次 `apply` 中「平仓未下发」的原因码（exit-priority §5.5）；`None` = 未发生。
+        # 会话侧据它把 F-4 那条**此前完全静默**的路径写进本轮 `degrade`。
+        self.last_close_block: str | None = None
         # 刚采纳完开仓成交的一轮宽限（O-3，见 `_on_reconcile_ok`）。恒为 False ⇒ live_auto 零影响。
         self._fill_grace = False
 
@@ -225,6 +228,8 @@ class LiveExecutor:
         「一笔挂着的平仓单 + 没开成的新仓」的半反手态，还占掉了 I-1 的唯一挂单额度。
         """
         self._bar_cursor = bar_index
+        # exit-priority §5.5：本次 apply 的「平仓未下发」原因码（每次调用先清，绝不跨轮残留）。
+        self.last_close_block = None
         events: list[dict] = []
         events += await self._maybe_time_exit(ref_px, ts)
         actions = self._project_signals(signals)
@@ -289,7 +294,9 @@ class LiveExecutor:
             return [self._status_event(
                 f"预算 / 杠杆过小，单笔不足最小下单量（{side}），已跳过该信号")]
         limit_px = _plan_limit_px(order_plan)
-        pre, slot_free = await self._prepare_resting_slot(ts, "open", side, limit_px)
+        # F-4 的作用域边界：**开仓路径逐字不变**（双开风险真实存在，`close_position` 的 autoCxl
+        # 论证只对平仓成立）。此处只解包第三元、一行逻辑不改（G-6 冻结）。
+        pre, slot_free, _ = await self._prepare_resting_slot(ts, "open", side, limit_px)
         if not slot_free:
             return pre
         if require_clear and not await self._confirm_net_cleared():
@@ -331,9 +338,21 @@ class LiveExecutor:
         if self.projected == "flat":
             return []
         limit_px = _plan_limit_px(order_plan)
-        pre, slot_free = await self._prepare_resting_slot(ts, "close", self.projected, limit_px)
+        pre, slot_free, outcome = await self._prepare_resting_slot(
+            ts, "close", self.projected, limit_px)
         if not slot_free:
-            return pre
+            # F-4（P0）：**市价平仓**在「撤单未获确认」（unknown）时继续下发。安全前提已在仓库里：
+            # `close_position` 带 `autoCxl=True`，由**交易所侧**撤掉该合约全部未成交挂单
+            # （okx/trade_client.py），且重复平仓走下方 `LIVE_NO_POSITION` 良性分支。
+            # `filled` 仍必须止步：那是真的已经平掉了。限价平仓与**全部开仓路径**逐字不变。
+            if limit_px is not None or outcome != "unknown":
+                # F-4 的另一半：这条路径此前**连降级码都没有**——轨迹上会显示「决策工具 · 平仓」
+                # 而没有任何成交、没有任何降级码。把它变成一个可读的码，会话侧据它写 `degrade`。
+                self.last_close_block = f"exit_order_slot_busy({outcome})"
+                return pre
+            pre = pre + [self._status_event(
+                "原挂单撤销未获确认，但本轮是市价离场：仍按市价平仓"
+                "（交易所侧会同时撤掉该合约未成交挂单）")]
         close = ClosePositionInput(
             inst_id=self.inst_id, pos_side=self._pos_side(), pos=self._signed_pos(),
             mgn_mode=self.td_mode, ord_type="market" if limit_px is None else "limit",
@@ -344,6 +363,17 @@ class LiveExecutor:
             result = await self._close_position(close)
         except OKXError as exc:
             if exc.code == "LIVE_NO_POSITION":
+                # F-4 放行分支的第二个后果（【R:P1-1】）：挂单还在飞 ⇒ 交易所侧已无仓这件事**多半
+                # 就是我方那张限价平仓单成交造成的**，此刻本地无从分辨它与「交易所 OCO 先平了」。
+                # 故本轮**不就地结算**（既不合成 `external_close` 错归因，也不按 `ref_px` 捏一个
+                # 盈亏），把收敛交给下一轮 `_poll_resting`：读到 `filled` 走 `_adopt_close_fill`
+                # （真实 `avgPx` / 真实张数 / 归 `agent`），读到 `canceled` 则由 `_on_reconcile_ok`
+                # 合成 `external_close(source="external")`。两条支路都比就地猜一个来源诚实，代价
+                # 只是延后一轮——`_external_close_suppressed()` 在 `reconcile` 侧立的正是这条规矩。
+                if self._external_close_suppressed():
+                    return pre + [self._status_event(
+                        "交易所侧已无该持仓，而本会话的限价平仓单状态尚未核对："
+                        "本轮不就地结算，下一轮核对挂单后按真实成交价收敛")]
                 return pre + self._settle_benign_close(ref_px, ts)
             return pre + [self._error_event(ts, exc)]
         if limit_px is not None:      # I-2b：平仓挂单期间 projected **保持原方向**（真仓确实还在）
@@ -352,6 +382,9 @@ class LiveExecutor:
             return pre + self._enter_resting(result, ts, intent="close", side=self.projected,
                                              px=limit_px, sz=resting_sz, strength=0.0,
                                              reason=reason)
+        # 【R:P1-1】市价平仓成功后显式清挂单：交易所侧的 `autoCxl=True` 已经撤掉了它，本地留着只会
+        # 让下一轮 `_poll_resting` 去查一张不存在的单，并在读到 `filled` 时二次结算出一条幽灵成交。
+        self.resting = None
         return pre + self._settle_close(ref_px, ts, reason, result, explain=explain)
 
     # ---------- 挂单生命周期（ai-trade-limit-orders §2.3/§2.5；resting is None 时全部短路）----------
@@ -375,26 +408,32 @@ class LiveExecutor:
                                 px=order.px, sz=order.sz)
 
     async def _prepare_resting_slot(self, ts: int, intent: str, side: str,
-                                    limit_px: float | None) -> tuple[list[dict], bool]:
-        """下新单前腾出 I-1 的唯一挂单额度：撤旧挂新（§2.5）。返回 `(events, 可否下新单)`。
+                                    limit_px: float | None
+                                    ) -> tuple[list[dict], bool, str]:
+        """下新单前腾出 I-1 的唯一挂单额度：撤旧挂新（§2.5）。
 
         三态撤单的第一个红利：收到 `"filled"` 时**绝不**继续下新单——否则会在一笔已经成交的真实
         仓位之上再开一笔，敞口翻倍、预算失控，而自管 `projected` 还以为自己是 flat（R-2b）。
+
+        Returns:
+            `(events, 可否下新单, outcome)`——第三元为撤单结果 `"canceled"|"filled"|"unknown"`，
+            另有 `"skipped"`（无挂单 / 同向同价幂等，两条提前返回）。**调用方只允许据
+            `outcome == "unknown"` 放行市价平仓**（F-4，见 `_do_close`）；`"skipped"` 天然止步。
         """
         order = self.resting
         if order is None:
-            return [], True
+            return [], True, "skipped"
         if limit_px is not None and is_same_intent(order, intent=intent, side=side, px=limit_px):
             return [self._status_event(          # P2-3 幂等：同向同价不重挂，保住 maker 排队优先级
-                f"同向同价挂单仍在排队（{limit_px}），本轮保留原单不撤不重挂")], False
+                f"同向同价挂单仍在排队（{limit_px}），本轮保留原单不撤不重挂")], False, "skipped"
         outcome, events = await self._cancel_resting("replace", ts)
         if outcome == "canceled":
-            return events, True
+            return events, True, outcome
         if outcome == "filled":
             return events + [self._status_event(
-                "撤单时原挂单已成交，已采纳该成交；本轮不再下新单（避免在已成交仓位上重复开仓）")], False
+                "撤单时原挂单已成交，已采纳该成交；本轮不再下新单（避免在已成交仓位上重复开仓）")], False, outcome
         return events + [self._status_event(
-            "原挂单撤销未确认，本轮不下新单（绝不双挂），待下轮核对挂单状态")], False
+            "原挂单撤销未确认，本轮不下新单（绝不双挂），待下轮核对挂单状态")], False, outcome
 
     async def cancel_resting(self, reason: str, ts: int) -> list[dict]:
         """撤回本会话当前挂着的未成交委托（Agent `cancel_order` 动作的落点）。
@@ -581,6 +620,10 @@ class LiveExecutor:
 
         v2（P1-1）：在归 flat 前合成一条 kind="external_close" 成交，记录已发生的交易所侧平仓；
         **不调用任何下单 / 平仓接口**，best-effort + 异常隔离。
+
+        调用前提（exit-priority【R:P1-1】）：**平仓挂单不在飞**。挂单在飞时这笔多半是我方限价平仓
+        成交的，此处的 `source="oco"` 与按 `ref_px` 算出的盈亏都会是假的——那条时序由 `_do_close`
+        自己拦下并延后一轮收敛，绝不走到这里。
         """
         events = self._synthesize_external_close(ref_px, ts, source="oco")
         self.realized_pnl_usd += self._close_pnl(ref_px)

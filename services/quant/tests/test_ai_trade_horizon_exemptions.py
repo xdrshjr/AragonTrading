@@ -138,7 +138,7 @@ async def test_agent_close_is_actually_blocked_by_the_lock():
 
         session._horizon.note_intent("close", None, position_side="long",
                                      now_wall=session.started_ts + 1.0)
-        decision, degrade = await session._apply_horizon_gate(
+        decision, degrade, _ = await session._apply_horizon_gate(
             1, _START_TS, TradeDecision("close", None, 0.7, "exit"), None)
         assert decision.action == "hold"
         assert degrade.startswith("horizon_min_hold(")
@@ -237,7 +237,7 @@ async def test_non_gated_actions_pass_through_even_when_locked(action):
         from app.ai_auto.decider import TradeDecision
 
         decision = TradeDecision(action, 0.5, 0.8, "r")
-        out, degrade = await session._apply_horizon_gate(1, _START_TS, decision, None)
+        out, degrade, _ = await session._apply_horizon_gate(1, _START_TS, decision, None)
         assert out is decision and degrade is None
     finally:
         await dispose_engine()

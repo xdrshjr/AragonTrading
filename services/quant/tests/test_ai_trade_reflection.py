@@ -198,20 +198,20 @@ async def test_reflection_disabled_is_passthrough_no_llm_call():
 def test_apply_reflection_passthrough_when_not_ran():
     decision = _open_long(0.5)
     v = ReflectionVerdict("confirm", None, None, "", None, ran=False)
-    out, degrade = apply_reflection(decision, None, v)
+    out, degrade, _ = apply_reflection(decision, None, v)
     assert out is decision and degrade is None
 
 
 def test_apply_reflection_none_verdict_passthrough():
     decision = _open_long(0.5)
-    out, degrade = apply_reflection(decision, "prev", None)
+    out, degrade, _ = apply_reflection(decision, "prev", None)
     assert out is decision and degrade == "prev"
 
 
 def test_apply_reflection_abort_downgrades_to_hold_with_reason():
     decision = _open_long(0.5)
     v = ReflectionVerdict("abort", None, None, "顶背离追多风险高", None, ran=True)
-    out, degrade = apply_reflection(decision, None, v)
+    out, degrade, _ = apply_reflection(decision, None, v)
     assert out.action == "hold"
     assert out.reason == "顶背离追多风险高"       # §5.3：决策理由改写为反思理由
     assert degrade == "reflection_abort"
@@ -220,7 +220,7 @@ def test_apply_reflection_abort_downgrades_to_hold_with_reason():
 def test_apply_reflection_fail_closed_downgrades_and_keeps_code():
     decision = _open_long(0.5)
     v = _fail_closed("reflection_timeout")
-    out, degrade = apply_reflection(decision, None, v)
+    out, degrade, _ = apply_reflection(decision, None, v)
     assert out.action == "hold"
     assert degrade == "reflection_timeout"
 
@@ -228,14 +228,14 @@ def test_apply_reflection_fail_closed_downgrades_and_keeps_code():
 def test_apply_reflection_preserves_prior_degrade():
     decision = _open_long(0.5)
     v = ReflectionVerdict("abort", None, None, "no", None, ran=True)
-    out, degrade = apply_reflection(decision, "decision_timeout", v)
+    out, degrade, _ = apply_reflection(decision, "decision_timeout", v)
     assert degrade == "decision_timeout"          # 保留决策器先前回落原因
 
 
 def test_apply_reflection_confirm_shrinks_size():
     decision = _open_long(0.5)
     v = ReflectionVerdict("confirm", 0.2, None, "减仓", None, ran=True)
-    out, _ = apply_reflection(decision, None, v)   # step=0 连续
+    out, _, _ = apply_reflection(decision, None, v)   # step=0 连续
     assert out.action == "open_long"
     assert abs(out.size_fraction - 0.2) < 1e-9
 
@@ -244,14 +244,14 @@ def test_apply_reflection_confirm_never_enlarges():
     """收缩值 > 原仓位 → 忽略（只减不增，绝不放大）。"""
     decision = _open_long(0.3)
     v = ReflectionVerdict("confirm", 0.9, None, "想加仓", None, ran=True)
-    out, _ = apply_reflection(decision, None, v)
+    out, _, _ = apply_reflection(decision, None, v)
     assert abs(out.size_fraction - 0.3) < 1e-9      # 原样，未放大
 
 
 def test_apply_reflection_confirm_equal_size_ignored():
     decision = _open_long(0.5)
     v = ReflectionVerdict("confirm", 0.5, None, "同值", None, ran=True)
-    out, _ = apply_reflection(decision, None, v)
+    out, _, _ = apply_reflection(decision, None, v)
     assert abs(out.size_fraction - 0.5) < 1e-9      # 等值不算收缩，原样
 
 
@@ -259,7 +259,7 @@ def test_apply_reflection_shrink_quantized_then_min_only_decreases():
     """RV-4：step=0.25、原 0.5、调整 0.4 → quantize(0.4)=0.5(就近取整抬回)，再 min(0.5,0.5)=0.5，只减不增。"""
     decision = _open_long(0.5)
     v = ReflectionVerdict("confirm", 0.4, None, "略减", None, ran=True)
-    out, _ = apply_reflection(decision, None, v, position_step=0.25)
+    out, _, _ = apply_reflection(decision, None, v, position_step=0.25)
     assert abs(out.size_fraction - 0.5) < 1e-9      # 量化就近抬回后被 min 收口回原档位（绝不 >原值）
 
 
@@ -267,14 +267,14 @@ def test_apply_reflection_shrink_quantized_real_decrease():
     """step=0.25、原 0.75、调整 0.3 → quantize(0.3)=0.25，min(0.75,0.25)=0.25，真实收缩到合法档位。"""
     decision = _open_long(0.75)
     v = ReflectionVerdict("confirm", 0.3, None, "减到低档", None, ran=True)
-    out, _ = apply_reflection(decision, None, v, position_step=0.25)
+    out, _, _ = apply_reflection(decision, None, v, position_step=0.25)
     assert abs(out.size_fraction - 0.25) < 1e-9
 
 
 def test_apply_reflection_confirm_no_adjust_is_noop():
     decision = _open_long(0.5)
     v = ReflectionVerdict("confirm", None, None, "确认原样", None, ran=True)
-    out, degrade = apply_reflection(decision, None, v)
+    out, degrade, _ = apply_reflection(decision, None, v)
     assert out is decision and degrade is None
 
 
@@ -290,7 +290,7 @@ def test_reflection_shrink_preserves_limit_intent():
     """收缩仓位时 `ord_type`/`limit_px` 必须原样保留——位置重建丢字段是「限价静默变市价」的 P0 根因。"""
     decision = TradeDecision("open_long", 0.5, 0.9, "r", "limit", 100.0)
     v = ReflectionVerdict("confirm", 0.25, None, "减仓更稳", None, ran=True)
-    out, degrade = apply_reflection(decision, None, v)
+    out, degrade, _ = apply_reflection(decision, None, v)
     assert out.ord_type == "limit"
     assert out.limit_px == 100.0
     assert abs(out.size_fraction - 0.25) < 1e-9
@@ -301,7 +301,7 @@ def test_reflection_shrink_market_decision_behavior_unchanged():
     """零回归钉：市价决策的收缩行为逐字不变（默认 ord_type=market / limit_px=None 原样带过）。"""
     decision = _open_long(0.5)
     v = ReflectionVerdict("confirm", 0.2, None, "减仓", None, ran=True)
-    out, degrade = apply_reflection(decision, None, v)
+    out, degrade, _ = apply_reflection(decision, None, v)
     assert out.action == "open_long"
     assert abs(out.size_fraction - 0.2) < 1e-9
     assert out.ord_type == "market" and out.limit_px is None
@@ -323,7 +323,7 @@ def test_note_records_vetoed_open_intent():
     不再从记忆里蒸发（根因 ② 复现钉）。"""
     original = _open_long(0.5)
     verdict = ReflectionVerdict("abort", None, None, "顶背离追多风险高", None, ran=True)
-    final, _ = apply_reflection(original, None, verdict)
+    final, _, _ = apply_reflection(original, None, verdict)
     note = build_reflection_note(original, verdict, final)
     assert note is not None
     assert note["vetoed"] is True
@@ -341,7 +341,7 @@ def test_note_confirm_with_shrink_not_vetoed():
     """收缩确认轮：动作未变 → vetoed=False，final 仓位记收缩后档位（proposed 保留原值）。"""
     original = _open_long(0.5)
     verdict = ReflectionVerdict("confirm", 0.2, None, "减仓更稳", None, ran=True)
-    final, _ = apply_reflection(original, None, verdict)
+    final, _, _ = apply_reflection(original, None, verdict)
     note = build_reflection_note(original, verdict, final)
     assert note["vetoed"] is False
     assert note["verdict"] == "confirm"
@@ -354,7 +354,7 @@ def test_note_fail_closed_flagged_distinct_from_model_abort():
     区分开（F3 head 指令依赖此位）。"""
     original = _open_long(0.5)
     verdict = _fail_closed("reflection_timeout")
-    final, _ = apply_reflection(original, None, verdict)
+    final, _, _ = apply_reflection(original, None, verdict)
     note = build_reflection_note(original, verdict, final)
     assert note["vetoed"] is True
     assert note["failClosed"] is True

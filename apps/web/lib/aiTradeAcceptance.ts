@@ -34,6 +34,7 @@ export const ACCEPTANCE_VERDICT_META: Record<
 // 值，故此处保留一份呈现层映射——它不是判定口径，不会造成读数分叉）。
 export const EXIT_SOURCE_LABELS: Record<string, string> = {
   agent: "Agent 主动平仓",
+  agentOverride: "Agent 最高优先级离场",
   agentReverse: "Agent 反手",
   profitGuard: "利润保护层",
   exchangeOco: "交易所止盈止损",
@@ -53,6 +54,8 @@ export const EXIT_SOURCE_LABELS: Record<string, string> = {
 // 只是这份配色表现在说的是实话。（真要引入 `--chart-*` 调色板是独立一轮的事。）
 const EXIT_SOURCE_COLORS: Record<string, string> = {
   agent: "var(--accent)",
+  // 与 `agent` 同色系但更实：它是同一个执行者，只是走了优先通道（**不用红色**——放行不是拦截）。
+  agentOverride: "var(--accent)",
   agentReverse: "var(--accent)",
   profitGuard: "var(--long)",
   exchangeOco: "var(--short)",

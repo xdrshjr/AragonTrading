@@ -48,8 +48,16 @@ from .cost_model import (
 )
 from .decider import AiTradeDecider, TradeDecision
 from .edge_gate import evaluate_edge_gate
-from .exit_attribution import (ExitLedger, classify_backtest, exit_counters,
+from .exit_attribution import (EXIT_SOURCE_AGENT_OVERRIDE, ExitLedger,
+                               classify_backtest, exit_counters,
                                is_deterministic_reason)
+from .exit_priority import (
+    LEVEL_ADJUDICATED,
+    LEVEL_OVERRIDE,
+    ExitPriorityInput,
+    adjudicate as adjudicate_exit_priority,
+    resolve_exit_priority,
+)
 from .funding import FundingSnapshot
 from .funding_ledger import BacktestFundingCurve, FundingLedger
 from .hold_horizon import HorizonFacts, HorizonRule
@@ -125,6 +133,18 @@ _EDGE_GATE_BACKTEST_NOTE = (
     "阶段一的 edge 为 ATR 粗估（min(ATR 预算, 单仓 OCO 止盈距离)），**不是**概率化胜率先验；"
     "门禁拦截率仅作结构性参考，不得据此推断策略的真实期望。回测世界的往返成本按 SimBroker 实收的"
     "双边费 + 双边滑点计（与实盘常数各自独立），故两侧的拦截率不可直接比较。")
+
+
+def _exit_backtest_rule(rule, settings):
+    """回测侧独立总闸（C-1b）：关 ⇒ 把离场优先级的三个投影字段全部按回关闭值（轴 A/B 整层空转）。
+
+    刻意**不改 `spec.horizon_rule` 本体**（它是会话契约、还要回显进 `tradingHorizon`），只在
+    runner 内部持一份投影副本——沿用 `turnover_rule_from_horizon` 在回测侧的既有姿态。
+    """
+    if rule is None or settings.ai_trade_exit_priority_backtest_enabled:
+        return rule
+    return replace(rule, exit_intent_decay_rounds=0, exit_pending_max_s=0.0,
+                   exit_priority=None)
 
 
 @dataclass
@@ -255,8 +275,16 @@ class AiBacktestRunner:
         # 这件 L1 必做的事拿不到任何退出分布（[P0-4] / [P1-4] 同款连坐）。
         # 开仓侧换手纪律（turnover-budget §4.5）：回测侧**独立总闸**，关 ⇒ 传 None ⇒ 两道新闸
         # 整层空转、`gate_reason` 逐字回退（G-3）。轴 B（兜底核实）**不在回测装配**（D-5）。
+        # 离场优先级（exit-priority §7.1 #12）：回测侧**独立总闸**（C-1b），关 ⇒ 三个投影字段全部
+        # 回到关闭值 ⇒ 轴 A/B 整层空转、判定与降级码逐字回退（沿用 turnover 的既有先例）。
+        # 轴 C（离场兑现重试）**不在回测装配**：`SimBroker` 每单必成，「离场未成交」在回测世界里
+        # 根本不存在，装它等于凭空造一个永不触发的分支（D-5 同款理由）。
+        self.horizon_rule = _exit_backtest_rule(self.horizon_rule, spec.settings)
+        self._exit_rule = getattr(self.horizon_rule, "exit_priority", None)
+        self._exit_priority = None
+        self._exit_input = None
         self._horizon = HorizonRuntime(
-            spec.horizon_rule, record_exits=False,
+            self.horizon_rule, record_exits=False,
             turnover_rule=(turnover_rule_from_horizon(spec.horizon_rule, spec.settings)
                            if spec.settings.ai_trade_horizon_turnover_backtest_enabled
                            else None))
@@ -314,7 +342,10 @@ class AiBacktestRunner:
             allow_limit=False,
             # C5 §2.5：回测决策器同样露出 holdExitPx（allow_limit 恒 False 不变）——承诺退出线是决策
             # 语义、与限价的「回测每单必成」高估问题无关，故只随 commit_enabled 派生。
-            allow_hold_exit=(self.profit_rule is not None and self.profit_rule.commit_enabled))
+            allow_hold_exit=(self.profit_rule is not None and self.profit_rule.commit_enabled),
+            # exit-priority §7.1 #12：回测侧同样露出 `exitConviction` / `exitEvidence`（轴 B 是
+            # 决策语义、与「回测每单必成」的高估问题无关），由回测侧独立总闸派生。
+            allow_exit_priority=self._exit_rule is not None)
         self._oco_risk = RiskParams(
             stop_loss_pct=spec.stop_loss_pct or None, take_profit_pct=spec.take_profit_pct or None,
             max_hold_bars=self.settings.ai_trade_default_max_hold_bars or None)
@@ -802,9 +833,13 @@ class AiBacktestRunner:
         # 回测侧复制一份判定（那正是 v1 P1-4 给【基础策略】铁律定下的规矩）。未装配 ⇒ 原样直通（G-3）。
         # ★ 交易周期铁律门禁（holding-horizon §2.10）：与实盘**同一纯核心、同位插入**（基础策略后、
         # 冷却前）。`note_intent` 同样排在一切门禁**之前**（第一阶段意愿口径）。未装配 ⇒ 原样直通。
+        # ⚠ D-4（双时钟）：回测的 `now_wall` 取的是**根时间戳**而非墙钟，故 `exit_pending` 上界在
+        # 回测里的语义是「根时间跨度」而不是真实挂起时长；`format_backtest_notes` 如实披露。
         self._horizon.note_intent(decision.action, decide_degrade,
                                   position_side=self.main.pos.side, now_wall=float(ts))
-        decision, _, _ = self._horizon.gate(decision, None, self._horizon_facts(i, ts, ref_px))
+        self._resolve_exit_priority(decision, ts)
+        decision, _, _, pending = self._horizon.gate(
+            decision, None, self._horizon_facts(i, ts, ref_px), priority=self._exit_priority)
         horizon_reason = self._horizon.last_reason
         decision, cooldown_reason = apply_profit_cooldown(decision, self._cooldown, now_wall=ts)
         # ★ 开仓侧换手纪律（turnover-budget §2.2.5）：与实盘**同一纯核心、同位插入**（冷却后、
@@ -843,10 +878,23 @@ class AiBacktestRunner:
         # F2（hold-inertia-fix）：apply_reflection 前留存 original 引用（decision 随后可能被改写为 hold）。
         original = decision
         size_before = decision.size_fraction if decision.action in ("open_long", "open_short") else None
-        if self.decider.reflection_enabled and decision.action != "hold":
+        # X-5：`override` 级离场跳过反思（与实盘同一条纪律：复核官是无状态单轮调用，让它推翻一个
+        # 它看不见的跨轮账本，是用更弱的证据推翻更强的证据）。
+        skip_reflection = (self._exit_priority is not None
+                           and self._exit_priority.level == LEVEL_OVERRIDE
+                           and decision.action == "close")
+        if self.decider.reflection_enabled and decision.action != "hold" and not skip_reflection:
             verdict = await self.decider.reflect(payload, decision)             # emit 缺省 None
-            decision, reflect_reason = apply_reflection(
-                decision, gate_reason, verdict, self.position_step_pct)         # 复用 session 同款纯函数
+            # 【R:P2-5】① `fail_open_actions` **两侧必须同传**：两边默认不一致是本仓库
+            # `base_rules` P1-4 / `profit_guard` I-3 的成文教训。
+            decision, reflect_reason, fail_open = apply_reflection(
+                decision, gate_reason, verdict, self.position_step_pct,
+                fail_open_actions=self._exit_fail_open_actions())               # 复用 session 同款纯函数
+            if fail_open is not None:
+                self._horizon.note_exit_fail_open()
+            decision, reflect_reason = self._settle_pending_exit(
+                decision, reflect_reason, verdict, pending=pending)
+        self._horizon.note_exit_priority(self._exit_priority)   # X-9：档位定型后计一次
         # ★ 仓位求解 + ATR 止损（第 11 步，反思后、_execute 前）。[P0-3] **必须双写**：`apply_risk` 第三形参
         # 根本没被使用、止损价是 `_open` 时由 `self._risk` 冻结进 pos 的，只改 `_oco_risk` 一行都不会生效且
         # 不报错；而它的 take_profit_pct 又被 edge 门禁当上界读（backtest.py:534），故两条必须同步更新。
@@ -883,6 +931,45 @@ class AiBacktestRunner:
         if summary is not None:
             self._emit_summary(job, round_no, ts, summary)
 
+    # ---------- 离场优先级（exit-priority 轴 B；与实盘共用同一批纯核心）----------
+    def _resolve_exit_priority(self, decision: TradeDecision, ts: int) -> None:
+        """算本轮离场优先级；未装配 ⇒ 恒 `normal` 且 wire 整键缺席（与实盘同一个纯函数）。
+
+        `hold_seconds` 取**根时间跨度**（回测世界没有墙钟）——这与 `note_intent` 的 `now_wall`
+        同源，故 60 秒绝对地板在回测里的实际生效粒度是一根 K 线（D-4 已披露）。
+        """
+        state = self._horizon.state
+        hold_s = (max(0.0, float(ts) - float(state.opened_wall)) if state.epoch else 0.0)
+        self._exit_input = ExitPriorityInput(
+            action=decision.action, position_side=self.main.pos.side,
+            gate_reverse=bool(getattr(self.horizon_rule, "gate_reverse", True)),
+            conviction=decision.exit_conviction, evidence=decision.exit_evidence,
+            intent_streak=int(state.exit_confirm_streak),
+            intent_lapses=int(state.exit_intent_lapses),
+            hold_seconds=hold_s, overrides_used=int(self._horizon.exit_overrides_used))
+        priority = resolve_exit_priority(self._exit_input, self._exit_rule)
+        if priority.may_pend and not self.decider.reflection_enabled:
+            priority = replace(priority, may_pend=False)   # 无复核官则无裁决（同实盘，§十一 D-3）
+            priority.wire["mayPend"] = False
+        self._exit_priority = priority
+
+    def _exit_fail_open_actions(self) -> tuple[str, ...]:
+        """X-6：`close` 的反思 fail-closed 反转为 fail-open；总闸关 ⇒ `()` ⇒ 逐字回退（C-8）。"""
+        return (("close",)
+                if self.settings.ai_trade_exit_reflection_fail_open else ())
+
+    def _settle_pending_exit(self, decision: TradeDecision, degrade: str | None, verdict, *,
+                             pending: bool) -> tuple[TradeDecision, str | None]:
+        """`pendingExit` 轮的裁决映射（与实盘 `session._settle_pending_exit` 逐字同构）。"""
+        if not pending:
+            return decision, degrade
+        if decision.action == "close":
+            if verdict is not None and verdict.degrade_reason is None:
+                self._exit_priority = adjudicate_exit_priority(self._exit_input,
+                                                               self._exit_rule)
+            return decision, degrade
+        return decision, (self._horizon.last_pending_reason or degrade)
+
     def _execute(self, decision: TradeDecision) -> dict:
         """决策 → Signal（纯核心）→ main.submit（次根开盘成交）；返回本轮执行意图快照。"""
         side_before = self.main.pos.side
@@ -891,7 +978,13 @@ class AiBacktestRunner:
             # 打标槽（轴 B）：运行时**自己**提交的平仓在 submit 之前写槽。反手的平仓腿与主动平仓
             # 是两类退出（前者是换方向、后者是离场），归成一类会让偏置矫正的效果读不出来。
             if decision.action == "close" and side_before in ("long", "short"):
-                self._pending_exit_source = "agent"
+                # 【R:P0-5】② 最高优先级离场单独归类，否则回测对照臂永远统计不到 `agentOverride`，
+                # 而那正是 X-9 要回答的那个问题（「用最高优先级走掉的那几笔事后净额是正是负」）。
+                self._pending_exit_source = (
+                    EXIT_SOURCE_AGENT_OVERRIDE
+                    if (self._exit_priority is not None
+                        and self._exit_priority.level in (LEVEL_OVERRIDE, LEVEL_ADJUDICATED))
+                    else "agent")
             elif side_before in ("long", "short") and decision.action.startswith("open_"):
                 self._pending_exit_source = "agentReverse"
             self.main.submit(signals)

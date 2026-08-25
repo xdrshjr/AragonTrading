@@ -382,7 +382,28 @@ export interface AiTradeHorizonProfilesResponse {
   // 交易所侧兜底自愈块（backstop-repair §4.2）；运维总闸关 ⇒ **整块缺席** ⇒ 前端不渲染控件。
   // 标签、说明、缺省模式与两个上限**全部由后端下发**，前端一个字、一个数都不硬编。
   backstopRepair?: AiTradeBackstopRepairConfig | null;
+  // 离场优先通道的只读说明块（exit-priority §6.2）；总闸关 ⇒ 整块缺席 ⇒ 前端不渲染。
+  // 同上一条纪律：档位标签、配额、地板与那句安全承诺**全部由后端下发**，前端一个字都不硬编。
+  exitPriority?: AiTradeExitPriorityConfig | null;
   profiles: AiTradeHorizonProfile[];
+}
+
+/** 离场优先通道的一个档位（`id` 是模型要填进 `exitConviction` 的字面量）。 */
+export interface AiTradeExitLevelOption {
+  id: AiTradeExitConviction;
+  label: string;
+  detail: string;
+}
+
+export interface AiTradeExitPriorityConfig {
+  enabled: boolean;
+  overrideRounds: number;
+  overrideMinHoldSeconds: number;
+  maxOverridesPerSession: number;
+  evidenceMinChars: number;
+  levels: AiTradeExitLevelOption[];
+  /** 「只放行平仓、永不放行开仓」那句安全承诺——它是 X-1 在 UI 上的唯一落点。 */
+  note: string;
 }
 
 export type AiTradeBackstopRepairMode = "plan" | "arm";
@@ -601,6 +622,86 @@ export interface AiTradeHorizonSnapshot {
   // 未装配 / 总闸关 / 回测 ⇒ **整键缺席**（不是 null）。
   turnover?: AiTradeTurnoverWire;
   backstop?: AiTradeBackstopWire;
+  // 离场优先级与离场意图兑现（exit-priority §5.3）：同样挂在**快照**下而不是契约下——嵌套即自动
+  // 搭上 payload / decision / status / trace 四条既有载体（均为整对象透传），`store.ts` 的逐键手抄
+  // reducer 一行都不必动。未装配 / 本轮非平仓 / 未武装 ⇒ **整键缺席**（不是 null）。
+  exitPriority?: AiTradeExitPriorityWire;
+  exitCommitment?: AiTradeExitCommitmentWire;
+}
+
+/**
+ * `POST /ai-trade/{gid}/member/{inst}/exit` 的回执（exit-priority §6.2）。
+ *
+ * 后端**刻意返回裸 dict、不绑 `response_model`**（同类两个端点同款）：`response_model` 会静默吞掉
+ * 新 wire 键，那是本仓库出过事的形态。故此处声明的是「至少有这些键」，多余键原样保留。
+ */
+export interface AiTradeMemberExitResult {
+  ok: boolean;
+  instId: string;
+  groupId?: string;
+  flattened?: Record<string, unknown> | null;
+  positionAfter?: string;
+  restingCancelled?: boolean;
+  message?: string;
+}
+
+/** 五档离场优先级（exit-priority §4.3.1 冻结判定表）；与后端 `exit_priority.LEVELS` 镜像。 */
+export type AiTradeExitLevel = "none" | "normal" | "expedite" | "adjudicated" | "override";
+
+/** 模型显式声明的离场确信度（决策工具 `exitConviction` 的值域）。 */
+export type AiTradeExitConviction = "normal" | "high" | "final";
+
+/** `final` 声明未能兑现为 `override` 的四种原因（自上而下取第一条）。 */
+export type AiTradeExitDowngrade =
+  | "evidence_missing"
+  | "ledger_short"
+  | "quota_exhausted"
+  | "min_hold_floor";
+
+/**
+ * 每轮离场优先级快照（exit-priority §5.3）。
+ *
+ * `releasedGates` 与豁免矩阵的同名键**并列而不合并**：两者在轨迹上并排展示，用户据此分清
+ * 「是行情替你解的锁」还是「是你的确信度替你解的锁」。
+ */
+export interface AiTradeExitPriorityWire {
+  level: AiTradeExitLevel;
+  declared: AiTradeExitConviction;
+  downgradeReason?: AiTradeExitDowngrade | null;
+  releasedGates: string[];
+  intentStreak: number;
+  intentLapses: number;
+  holdSeconds: number;
+  overrideRounds: number;
+  overrideMinHoldSeconds: number;
+  overridesUsed: number;
+  overridesRemaining: number;
+  maxOverridesPerSession: number;
+  adjudicated: boolean;
+  /** 本轮是否**允许**挂起（≡ 降档原因是 `ledger_short` 且配额未尽）。 */
+  mayPend: boolean;
+  /** 本轮是否已挂起待裁决。 */
+  pending: boolean;
+  /** 挂起时「还差什么」的原门禁码（放行码与门禁码语义不同，故单独一键，不混进 `reason`）。 */
+  pendingReason?: string | null;
+  /** 非 null ⇒ 本笔离场**未经复核官复核**（基础设施失败下的 fail-open 放行）。 */
+  failOpenReason?: string | null;
+  reason?: string | null;
+}
+
+/** 离场意图兑现状态（exit-priority §5.3）；未装配 / 未武装 ⇒ 整键缺席。 */
+export interface AiTradeExitCommitmentWire {
+  armed: boolean;
+  attempts: number;
+  maxAttempts: number;
+  ageSeconds: number;
+  maxAgeSeconds: number;
+  retryIntervalSeconds: number;
+  priorityLevel: string;
+  reasonCode: string;
+  lastError?: string | null;
+  /** 已到顶（次数或时长），不再自动重试 ⇒ 面板红条 + 【立即离场】按钮。 */
+  stuck: boolean;
 }
 
 // 落库 `metricsJson.aiStats.horizon`（§2.12）；零样本时六个派生量为 **null 而非 0**（[P2-3]）。
@@ -625,6 +726,16 @@ export interface AiTradeHorizonStats {
   reentryVetoes?: number;
   budgetVetoes?: number;
   opensCounted?: number;
+  // 离场优先级的七个只增计数（exit-priority §5.4 / X-9）。**这一组必须有展示落点**：
+  // 「Agent 用掉了几次最高优先级、其中几次被降档、几次是没经复核就放行的」是这条通道唯一能被
+  // 事后证伪的读数——记了却没人读，等于没记。老记录缺键 ⇒ 整行不渲染（不显示一排误导性的 0）。
+  exitExpediteRounds?: number;
+  exitOverrideRounds?: number;
+  exitAdjudicatedRounds?: number;
+  exitFinalDeclared?: number;
+  exitFinalDowngraded?: number;
+  exitPendingReleases?: number;
+  exitFailOpenRounds?: number;
   avgHoldSeconds?: number | null;
   medianHoldSeconds?: number | null;
   minHoldObservedSeconds?: number | null;
@@ -891,6 +1002,16 @@ export interface AiTradeTraceEvent {
   // horizon：持仓周期铁律判定（ai-trade-holding-horizon-modes §4.4）。整份快照随事件下发（本层读数
   // 有 20 余个，逐键搬运必然在下一次加字段时漏掉）。`status` 位与 base_rule/edge_gate 互不同时出现。
   horizon?: AiTradeHorizonSnapshot | null;
+  // tool_call：模型**提议**了什么、被谁拦下（exit-priority F-6）。三键作为事件的**兄弟键**下发，
+  // 刻意不塞进 `input`——`input` 的语义是「模型提交的工具入参」，掺进非入参的键会让卡片本身撒谎。
+  // 未被拦 / 老快照 ⇒ 三键为 null ⇒ 卡片逐字节回退到今天的样子。
+  proposedAction?: AiTradeAction | null;
+  proposedReason?: string | null;
+  vetoedBy?: string | null;
+  // reflection_verdict：反思**之后**才定型的最终离场档位（含 `adjudicated` / `failOpenReason`）。
+  // **刻意不新开 `exit_priority` 相位**：那要付出四处逐键手抄的代价，而漏抄不会报错、只会静默
+  // 功能缺失（R-9）。非反思轮读 `horizonWire.exitPriority`（整对象透传的那一份）即可。
+  exitPriority?: AiTradeExitPriorityWire | null;
 }
 
 // store / snapshot 的已装配单轮轨迹（thinking/analysis 累积；env 环形 ≤20）。
@@ -987,6 +1108,12 @@ export interface AiTradeRoundTrace {
   horizonStatus?: AiTradeHorizonGateStatus | null;
   horizonReason?: string | null;
   horizonWire?: AiTradeHorizonSnapshot | null;
+  // 离场优先级（exit-priority §6.3）：**必须与 emptyRoundTrace 的逐键手抄保持一致**——
+  // `applyAiTradeTracePhase` 对未知相位是静默忽略，漏写不会有任何报错，只会安静地什么都不显示。
+  proposedAction?: AiTradeAction | null;
+  proposedReason?: string | null;
+  vetoedBy?: string | null;
+  exitPriority?: AiTradeExitPriorityWire | null;
   state: "deciding" | "done" | "skipped" | "error";
 }
 

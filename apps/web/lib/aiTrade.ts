@@ -504,6 +504,10 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
   { prefix: "base_rule_ma_band_direction", label: "基础策略否决：方向与所处均线锚区不符" },
   { prefix: "base_rule_band_unavailable", label: "基础策略否决：均线通道数据不足，无法验证开单位置" },
   { prefix: "base_rule_ma_band", label: "基础策略否决：开单价不在均线通道上/中/下轨附近" },
+  // exit-priority §5.5：本轮**唯一**新增的降级码（它是真的没平成，故进 degrade 天经地义）。
+  // ⚠️ `exit_priority_*` / `exit_adjudicated` / fail-open 三类是**放行码**，一律不进 degrade，
+  // 故此处**不加**它们的条目——把放行塞进降级表会让闸计数把一次成功离场记成一次被拦。
+  { prefix: "exit_order_slot_busy", label: "本轮未平成：原挂单撤销未获确认，已保留挂单待下轮核对" },
   // 利润保护三码：它们不是「降级」而是**系统主动平仓**的成交原因，但同样会出现在成交列表的原因位上。
   // §六.1b：**不写「已锁定利润」**——码本身不含盈亏符号，保本线触发 / 滑点不利时这笔可能打平甚至
   // 净亏；具体金额由成交行的 pnl 呈现，这里只说触发了什么规则。

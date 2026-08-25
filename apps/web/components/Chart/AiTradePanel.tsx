@@ -24,6 +24,7 @@ import {
   summarizeDisciplines,
 } from "@/lib/aiTradeDiscipline";
 import { describeHorizonStatus } from "@/lib/aiTradeHorizon";
+import { AiTradeExitCard } from "./AiTradeExitCard";
 import { describeTradability } from "@/lib/aiTradeTradability";
 import { describeTurnoverChip } from "@/lib/aiTradeTurnover";
 import { COST_BASIS_HINT, describeCostBasis } from "@/lib/aiTradeCost";
@@ -164,16 +165,14 @@ export default function AiTradePanel({
         <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
           自动交易标的
         </span>
+        {/* 离场卡**必须在 MemberRow 之外**（exit-priority §4.6.3）：MemberRow 本体是一个
+            `<button>`，而【立即离场】也是按钮——按钮不能嵌套按钮。未武装 ⇒ 整块不渲染。 */}
         {members.map((m) => (
-          <MemberRow
-            key={m.instId}
-            member={m}
-            rows={rows}
-            active={active}
-            livePrice={livePrice}
-            changePct={changePct}
-            onSelect={onSelect}
-          />
+          <div key={m.instId} className="flex flex-col gap-1">
+            <MemberRow member={m} rows={rows} active={active} livePrice={livePrice}
+                       changePct={changePct} onSelect={onSelect} />
+            <AiTradeExitCard groupId={group.groupId} member={m} />
+          </div>
         ))}
       </div>
     </div>

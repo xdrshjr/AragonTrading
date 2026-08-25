@@ -164,6 +164,12 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         "horizonStatus": None, "horizonReason": None, "horizonWire": None,
         # 滚动摘要健康度（轴 D）：**显式取键**装配，漏抄这一行前端永远拿不到停摆事实。
         "summaryHealth": None,
+        # 离场优先级的**最终**档位（exit-priority §6.3）：由 `reflection_verdict` 相位回填；
+        # 非反思轮为 None，此时读 `horizonWire.exitPriority`（整对象透传的那一份）即可。
+        "exitPriority": None,
+        # `tool_call` 相位的三个加法键（§4.6.1）：**逐键手抄区**，漏抄即静默功能缺失——界面上
+        # 会继续显示「决策工具 · 观望」，而模型提交的其实是 `close`。
+        "proposedAction": None, "proposedReason": None, "vetoedBy": None,
         "state": "deciding",
     }
 
@@ -183,10 +189,18 @@ def reflection_start_event(round_no: int, ts: int, decision: "TradeDecision") ->
 
 
 def reflection_verdict_event(round_no: int, ts: int, verdict: "ReflectionVerdict",
-                             adjusted_size_fraction: float | None = None) -> dict:
-    """reflection_verdict：反思裁决（confirm/abort）+ 实际收缩后仓位（若有）+ 理由。"""
+                             adjusted_size_fraction: float | None = None,
+                             exit_priority: dict | None = None) -> dict:
+    """reflection_verdict：反思裁决（confirm/abort）+ 实际收缩后仓位（若有）+ 理由。
+
+    `exit_priority`（exit-priority §6.3）：反思**之后**才定型的最终档位（含 `adjudicated` 与
+    `failOpenReason`）。**刻意不新开 `exit_priority` 相位**：那要付出 `PHASES` + 事件类型 +
+    轮次初值 + `reduceRoundPhase` 四处逐键手抄的代价，而漏抄不会报错、只会静默功能缺失（R-9）。
+    非反思轮的 `exitPriority` 随 `horizon` 相位的整对象透传自然到达，`None` ⇒ 键值为 null。
+    """
     return trace_event("reflection_verdict", round_no, ts, verdict=verdict.verdict,
-                       adjustedSizeFraction=adjusted_size_fraction, reason=verdict.reason)
+                       adjustedSizeFraction=adjusted_size_fraction, reason=verdict.reason,
+                       exitPriority=exit_priority)
 
 
 # ---------- 【基础策略】铁律门禁轨迹装配（ai-trade-base-strategy-ma-band §2.9）----------

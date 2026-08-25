@@ -218,6 +218,12 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     horizonStatus: null,
     horizonReason: null,
     horizonWire: null,
+    // 离场优先级（exit-priority §6.3 / R-9）：本函数是**逐键手抄**装配，漏抄这四键
+    // `AiTradeRoundTrace` 永远拿不到本层数据 ⇒ 后端发什么前端都收不到（跑不出错、功能静默缺失）。
+    proposedAction: null,
+    proposedReason: null,
+    vetoedBy: null,
+    exitPriority: null,
     state: "deciding",
   };
 }
@@ -232,7 +238,16 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
     case "tool_call_start":
       return { ...t, toolCallPending: true };
     case "tool_call":
-      return { ...t, toolCall: evt.input ?? null, toolCallPending: false };
+      // 三个加法键保真「模型提议了什么、被谁拦下」（F-6）：没有它们，界面上只剩
+      // 「决策工具 · 观望」，而模型提交的其实是 `close`——那正是用户最直观的困惑来源。
+      return {
+        ...t,
+        toolCall: evt.input ?? null,
+        toolCallPending: false,
+        proposedAction: evt.proposedAction ?? null,
+        proposedReason: evt.proposedReason ?? null,
+        vetoedBy: evt.vetoedBy ?? null,
+      };
     case "result":
       return {
         ...t,
@@ -333,6 +348,8 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
         reflectionVerdict: evt.verdict ?? null,
         reflectionReason: evt.reason ?? null,
         reflectionAdjustedSize: evt.adjustedSizeFraction ?? null,
+        // 反思之后才定型的最终离场档位（exit-priority §6.3）：本 case 早已是手抄区，只多这一行。
+        exitPriority: evt.exitPriority ?? null,
       };
     default:
       return t;

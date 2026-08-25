@@ -784,7 +784,28 @@ class AiTradeHorizonProfilesOut(BaseModel):
     backstopPollSeconds: float = 120.0
     # 交易所侧兜底自愈块（backstop-repair §4.2）；运维总闸关 ⇒ **整块缺席** ⇒ 前端不渲染控件。
     backstopRepair: AiTradeBackstopRepairOut | None = None
+    # 离场优先通道的只读说明块（exit-priority §6.2）；总闸关 ⇒ `None` ⇒ 前端整块不渲染。
+    # **形状刻意用 `dict`**：档位标签与那句安全承诺全部由后端下发，用一个逐字段声明的模型反而会在
+    # 下一次加字段时静默吞掉新键（同类端点 `/stop`、`/backstop/repair` 返回裸 dict 正是为此）。
+    exitPriority: dict | None = None
     profiles: list[AiTradeHorizonProfileOut] = Field(default_factory=list)
+
+
+class AiTradeExitOut(BaseModel):
+    """`POST /ai-trade/{gid}/member/{inst}/exit` 的回执形状（exit-priority §6.2）。
+
+    ⚠️ **只作文档 schema，端点返回裸 `dict`、不绑 `response_model`**（【R:P2-3】）：同类端点
+    `/ai-trade/{gid}/member/{inst}/stop` 与 `.../backstop/repair` 的返回标注都是裸 `dict`，正是
+    为绕开「`response_model` 静默吞掉新 wire 键」这个本仓库出过事的形态。
+    """
+
+    ok: bool
+    instId: str
+    groupId: str = ""
+    flattened: dict | None = None
+    positionAfter: str = "flat"
+    restingCancelled: bool = False
+    message: str = ""
 
 
 class AiTradeExperienceIn(BaseModel):

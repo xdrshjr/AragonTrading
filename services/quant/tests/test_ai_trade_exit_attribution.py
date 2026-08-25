@@ -1,6 +1,8 @@
 """退出来源归因纯核心（ai-trade-horizon-acceptance-loop 轴 B · §6.1 E-1~E-19）。
 
-九值枚举的每一个可达来源各一条用例。守的三条：
+枚举的每一个可达来源各一条用例（ai-trade-exit-priority-and-commitment 新增第十值
+`agentOverride`——它由**会话侧的一次性打标槽**产出而非分类器，故用例在
+`test_ai_trade_exit_session.py` 与 `test_ai_trade_exit_freeze.py`）。守的三条：
 - **实盘的 oco / external 之别必须来自机器可读键**，绝不解析中文文案（展示层随时会改）；
 - **`session_end` 归 `windowEnd` 而不是 `unknown`**：`trend_hold` 下每次回测必有一笔，落进
   「未记录来源」会让回测的退出分布凭空多一类（[P1-8]）；

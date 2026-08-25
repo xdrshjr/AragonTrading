@@ -19,6 +19,13 @@ from collections import Counter
 from dataclasses import replace
 
 from .exit_attribution import ExitLedger
+from .exit_intent import RELEASE_EXIT_PENDING, advance_intent, contradicts_exit
+from .exit_priority import (
+    CONVICTION_FINAL,
+    LEVEL_ADJUDICATED,
+    LEVEL_EXPEDITE,
+    LEVEL_OVERRIDE,
+)
 from .hold_horizon import (
     REASON_EXIT_UNCONFIRMED,
     REASON_HYSTERESIS,
@@ -52,6 +59,42 @@ _VETO_COUNTER_KEY = {
     REASON_EXIT_UNCONFIRMED: "unconfirmed",
     REASON_HYSTERESIS: "hysteresis",
 }
+
+
+# 门禁否决注记里提议理由的截断长度（与 `_ANALYSIS_EXCERPT_CHARS` 同款「有界摘录」纪律）。
+_PROPOSED_REASON_CHARS = 200
+
+
+def build_gate_veto_note(proposed, reason: str | None, priority=None) -> dict | None:
+    """把本轮**门禁**否决压成记忆注记（exit-priority F-2）；未被否决 ⇒ `None`。
+
+    被 G2 拦下的那一轮，`decision.action` 已经是 `"hold"`、`decision.reason` 已被
+    `hold_horizon._veto` 改写成降级码，于是模型下一轮读到的自己的历史是「上轮我决定观望」。
+    反思否决轮早有对等注记（`build_reflection_note`），**门禁否决轮没有**——F-1 断的是系统侧的
+    计数，F-2 断的是模型侧的论证连续性，两者互为因果，共同构成那条没有出口的活锁。
+
+    Args:
+        proposed: 进入 `_apply_horizon_gate` **那一刻**的 decision 引用（【R:P2-7】：不取更早的
+            `stage1_decision`——今天基础策略层不拦 close 故两者相同，但那是隐式依赖，将来任一层
+            开始改写 close 的 `reason`，注记就会静默失真）。
+        reason: 本层降级码（`None` ⇒ 本轮没被本层拦下 ⇒ 返回 `None`）。
+        priority: 本轮 `ExitPriority`（可为 `None`）——声明的确信度与账本进度一并写进注记，
+            让模型看得见「我声明了 final 但因为 X 被按 high 处理」。
+
+    Returns:
+        注记 dict 或 `None`。
+    """
+    if reason is None or proposed is None:
+        return None
+    note = {"vetoedBy": "horizon", "reason": reason,
+            "proposedAction": proposed.action,
+            "proposedReason": str(proposed.reason or "")[:_PROPOSED_REASON_CHARS]}
+    if priority is not None:
+        note.update({"exitConviction": priority.declared, "exitLevel": priority.level,
+                     "downgradeReason": priority.downgrade_reason,
+                     "intentStreak": int(priority.wire.get("intentStreak") or 0),
+                     "intentLapses": int(priority.wire.get("intentLapses") or 0)})
+    return note
 
 
 def build_horizon_facts(executor, readings, *, stale_feed: bool,
@@ -120,6 +163,15 @@ class HorizonRuntime:
         # 最近一次 `gate()` 的**本层**降级码（`None` = 本轮本层放行）。刻意与合成后的 `degrade` 分开：
         # 后者遵循「先执行者胜出」，基础策略先拦一轮就会把本层的 reason 吞掉，轨迹据它渲染必说谎。
         self.last_reason: str | None = None
+        # 最近一次 `gate()` 的**挂起**门禁码（`None` = 本轮未挂起）。刻意与 `last_reason` 分开：
+        # 挂起不是降级，混进去会让闸计数把一次成功离场记成一次被拦（§5.5）。
+        self.last_pending_reason: str | None = None
+        # 离场优先级计数（exit-priority §5.4）：`override` 与 `adjudicated` 共用同一份配额。
+        self.exit_levels: Counter = Counter()
+        self.exit_overrides_used = 0
+        self.exit_final_declared = 0
+        self.exit_final_downgraded = 0
+        self.exit_fail_open_rounds = 0
         self.released_streak = 0
         self.vetoes: Counter = Counter()          # min_hold / unconfirmed / hysteresis / reverse
         self.released_rounds = 0
@@ -196,54 +248,95 @@ class HorizonRuntime:
 
     def note_intent(self, stage1_action: str, stage1_degrade: str | None, *,
                     position_side: str, now_wall: float) -> None:
-        """第一阶段意图记账（连续确认计数）；**须在任何门禁之前**调用（§2.5 硬约束 4）。
+        """第一阶段意图记账（**带衰减的跨轮账本**，exit-priority 轴 A）；须在任何门禁之前调用。
 
         以模型的**真实意愿**为准（`decider.decide` 的直接返回值），与 `_update_hold_streak` 同源：
         若记门禁后的动作，一次 MA 通道否决就会把 close 意图的连续性洗掉，G2 永远数不到 2。
-        降级轮（llm_error / timeout / low_confidence）既非真实意愿也非真实观望 ⇒ 计数**不变**。
+
+        判定表全部下沉纯核心 `exit_intent.advance_intent`（本类只做状态推进，不判断）。
+        `HorizonRule.exit_intent_decay_rounds` 默认 **0** ⇒ 逐字回退今天的「一轮非离场即清零」。
         """
         if self.rule is None:
             return
-        if gated_kind(stage1_action, position_side, gate_reverse=self.rule.gate_reverse):
-            first = self.state.first_exit_intent_wall
-            self.state = replace(
-                self.state, exit_confirm_streak=self.state.exit_confirm_streak + 1,
-                first_exit_intent_wall=float(now_wall) if first is None else first)
-            return
-        if stage1_degrade is not None:
-            return
-        self._reset_intent()
-
-    def _reset_intent(self) -> None:
-        """离场意图链条终结：streak 与窗口起点一并清空（缺后者 ⇒ 窗口在下一次意图时已经「到期」）。"""
-        self.state = replace(self.state, exit_confirm_streak=0, first_exit_intent_wall=None)
+        gated = gated_kind(stage1_action, position_side,
+                           gate_reverse=self.rule.gate_reverse) is not None
+        self.state = advance_intent(
+            self.state, gated=gated,
+            contradicts=contradicts_exit(stage1_action, position_side),
+            degraded=stage1_degrade is not None, now_wall=float(now_wall),
+            decay_rounds=int(self.rule.exit_intent_decay_rounds))
 
     # ---------- 决策链薄封装 ----------
-    def gate(self, decision, degrade: str | None,
-             facts: HorizonFacts) -> tuple[object, str | None, dict | None]:
+    def gate(self, decision, degrade: str | None, facts: HorizonFacts, *,
+             priority=None) -> tuple[object, str | None, dict | None, bool]:
         """采断面 → 推状态 → 判定（[P1-7]：判定与下发恒取**本次** refresh 的快照）。
 
         未装配 / 非受控动作 ⇒ 返回**同一个** decision 对象（`is` 相等）、`degrade` 原样透传。
 
+        Args:
+            decision: 本轮决策（已过基础策略层）。
+            degrade: 既有合成降级码（「先执行者胜出」，本层只在其为空时写入）。
+            facts: 本轮持仓周期断面。
+            priority: 本轮 `ExitPriority`（exit-priority §4.3.3）；`None` ⇒ 不解闸、不挂起
+                ⇒ **逐字回退**到本特性合入前。
+
         Returns:
-            `(decision, degrade, snapshot)`——`snapshot` 为本次判定所用的 wire（未装配 ⇒ `None`）。
+            `(decision, degrade, snapshot, pending)`——`pending` 为真表示本轮**挂起待裁决**：
+            decision 原样继续下行，且本层**不 veto、不写 `degrade`、不计 `_note_veto`、不置
+            `last_reason`**（【R:P1-3】：否则 `_discipline.note_round(degrade)` 会把一次成功
+            离场记成一次被拦，`_emit_degraded` 还会推一条降级事件）。「差什么」只写进
+            `last_pending_reason` → `exitPriority.reason` 与 trace。
         """
         self.last_reason = None
+        self.last_pending_reason = None
         if self.rule is None:
-            return decision, degrade, None
+            return decision, degrade, None, False
         snapshot = self.refresh(facts)
         kind = gated_kind(decision.action, facts.side, gate_reverse=self.rule.gate_reverse)
         self._note_release(snapshot, gated=kind is not None)
         if kind is None:
-            return decision, degrade, snapshot
-        gated, reason = evaluate_horizon_gate(decision, snapshot, self.rule,
-                                              position_side=facts.side)
+            return decision, degrade, snapshot, False
+        gated, reason, pending = evaluate_horizon_gate(
+            decision, snapshot, self.rule, position_side=facts.side,
+            priority_gates=(() if priority is None else priority.released_gates),
+            may_pend=bool(priority is not None and priority.may_pend))
         if reason is None:
             self._note_pass(snapshot)
-            return decision, degrade, snapshot
+            return decision, degrade, snapshot, False
+        if pending:
+            self.last_pending_reason = reason
+            return decision, degrade, snapshot, True
         self._note_veto(reason, kind)
         self.last_reason = reason
-        return gated, (degrade or reason), snapshot
+        return gated, (degrade or reason), snapshot, False
+
+    # ---------- 离场优先级计数（exit-priority §5.4）----------
+    def note_exit_priority(self, priority) -> None:
+        """记一轮**最终**档位（须在反思之后调用，档位在那里才定型）；`None` / `none` ⇒ 空转。
+
+        `override` 与 `adjudicated` **共用**同一份配额（X-4b）：两者都在此自增
+        `exit_overrides_used`，下一轮的 `resolve_exit_priority` 读它做合取判定。
+        """
+        if priority is None or priority.level not in (LEVEL_EXPEDITE, LEVEL_OVERRIDE,
+                                                      LEVEL_ADJUDICATED):
+            self._note_final_declared(priority)
+            return
+        self.exit_levels[priority.level] += 1
+        if priority.level in (LEVEL_OVERRIDE, LEVEL_ADJUDICATED):
+            self.exit_overrides_used += 1
+        self._note_final_declared(priority)
+
+    def _note_final_declared(self, priority) -> None:
+        """`final` 声明与其中被降档的笔数（X-9：这条通道必须能被事后证伪，否则无法被信任）。"""
+        if priority is None or priority.declared != CONVICTION_FINAL:
+            return
+        self.exit_final_declared += 1
+        if priority.level not in (LEVEL_OVERRIDE, LEVEL_ADJUDICATED):
+            self.exit_final_downgraded += 1
+
+    def note_exit_fail_open(self) -> None:
+        """记一笔**未经复核官复核**的离场放行（【R:P1-3】：它不进 `degrade`，故必须有自己的计数）。"""
+        self.exit_fail_open_rounds += 1
 
     def _note_release(self, snapshot: dict | None, *, gated: bool) -> None:
         """豁免计数 + 连续解除计数（前者只记**受约束轮**以免稀释分母；后者按持仓轮计，供 §4.4 告警）。"""
@@ -469,6 +562,15 @@ class HorizonRuntime:
                 "reentryVetoes": self.turnover_state.reentry_vetoes,
                 "budgetVetoes": self.turnover_state.budget_vetoes,
                 "opensCounted": self.turnover_state.opens_counted,
+                # 离场优先级的七个只增计数（exit-priority §5.4）。同样**刻意不并进**上面的冻结
+                # 计数：X-9 要的是「用掉了几次最高优先级、其中几次事后证明是对的」这个能查的数。
+                "exitExpediteRounds": self.exit_levels[LEVEL_EXPEDITE],
+                "exitOverrideRounds": self.exit_levels[LEVEL_OVERRIDE],
+                "exitAdjudicatedRounds": self.exit_levels[LEVEL_ADJUDICATED],
+                "exitFinalDeclared": self.exit_final_declared,
+                "exitFinalDowngraded": self.exit_final_downgraded,
+                "exitPendingReleases": self.release_reasons[RELEASE_EXIT_PENDING],
+                "exitFailOpenRounds": self.exit_fail_open_rounds,
                 **self._sample_stats()}
 
     # ---------- 周期验收卡的原始计数器（horizon-acceptance [P1-2]）----------

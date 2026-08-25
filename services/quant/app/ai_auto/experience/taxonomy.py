@@ -107,8 +107,9 @@ VALUE_LABEL_ZH: dict[str, str] = {
     "candle_close": "新K线收线", "bar_advanced": "补跑上根", "signal_flip": "信号翻转",
     "resting_order": "挂单待成", "profit_tier": "利润档位", "price_breakout": "价格异动",
     "position_watch": "持仓盯market", "heartbeat": "心跳",
-    # exit（九值，逐字对齐 EXIT_SOURCES）
-    "agent": "Agent主动平", "agentReverse": "Agent反手", "profitGuard": "利润保护",
+    # exit（十值，逐字对齐 EXIT_SOURCES；`AXIS_VALUES[exit]` 自动跟随，**标签是手抄的**）
+    "agent": "Agent主动平", "agentOverride": "Agent优先离场",
+    "agentReverse": "Agent反手", "profitGuard": "利润保护",
     "exchangeOco": "交易所OCO", "timeExit": "到期离场", "sessionStop": "会话止盈损",
     "windowEnd": "区间结束", "external": "外部干预",
     # horizon

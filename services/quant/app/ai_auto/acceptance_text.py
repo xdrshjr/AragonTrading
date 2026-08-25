@@ -19,9 +19,10 @@ ROW_LABELS: dict[str, str] = {
     "netAfterFunding": "资金费后净收益",
 }
 
-# 九值退出来源的中文标签。
+# 十值退出来源的中文标签（镜像 `exit_attribution.EXIT_SOURCES`，G-9 双向覆盖断言守）。
 EXIT_SOURCE_LABELS: dict[str, str] = {
     "agent": "Agent 主动平仓",
+    "agentOverride": "Agent 最高优先级离场",
     "agentReverse": "Agent 反手",
     "profitGuard": "利润保护层",
     "exchangeOco": "交易所侧止盈止损",
@@ -252,4 +253,23 @@ def build_diagnostics(*, agent_share: float | None, fee_to_gross: float | None,
             and float(avg_hold) >= 4 * 3600):
         out.append("平均持仓已跨过资金费结算点，但资金费口径不可得 —— "
                    "此处的净额偏乐观，不可据此放大实盘资金。")
+    out.extend(exit_override_diagnostics(checks.get("exitOverride")))
     return out
+
+
+def exit_override_diagnostics(row: dict | None) -> list[str]:
+    """最高优先级离场的**事后净额**那一句（exit-priority X-9 的兑现点）；零笔 ⇒ `[]`。
+
+    「Agent 用掉了几次最高优先级、其中几次事后证明是对的」必须是一个能查的数——否则这条通道
+    无法被证伪，也就无法被信任。这一句是它在验收卡上的唯一落点，故**措辞一律由净额符号派生**
+    （沿用 `describe_exit_outcome` 的既有纪律：硬编码「效果良好」在净额为负时就是一句假话）。
+    """
+    if not isinstance(row, dict) or int(row.get("count") or 0) <= 0:
+        return []
+    count = int(row["count"])
+    net = float(row.get("netUsd") or 0.0)
+    win_rate = row.get("winRate")
+    verdict = "净额为正" if net > 0 else ("净额为负" if net < 0 else "净额持平")
+    win_text = "" if win_rate is None else f"、胜率 {float(win_rate) * 100:.0f}%"
+    return [f"最高优先级离场共 {count} 笔，合计 {verdict}（{net:+.2f} USDT{win_text}）"
+            f"—— 这是「Agent 的终局判断是否值得信任」的唯一可核对读数。"]

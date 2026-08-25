@@ -22,11 +22,10 @@ from app.ai_auto.hold_horizon import (
     evaluate_horizon_gate,
     gate_status,
     gated_kind,
-    profile_wire,
-    profiles_wire,
     resolve_horizon_rule,
     rule_wire,
 )
+from app.ai_auto.hold_horizon_profiles import profile_wire, profiles_wire
 from app.config import Settings
 
 _NOW = 1_700_000_000.0
@@ -67,7 +66,7 @@ def _snap(rule: HorizonRule, state: HorizonState, facts: HorizonFacts) -> dict:
 def test_h1_unarmed_returns_same_object():
     """H-1：`rule is None` 时任意动作原样直通（**同一对象**，零副作用）。"""
     decision = _close()
-    out, reason = evaluate_horizon_gate(decision, {}, None, position_side="long")
+    out, reason, _ = evaluate_horizon_gate(decision, {}, None, position_side="long")
     assert out is decision and reason is None
 
 
@@ -77,7 +76,7 @@ def test_h2_custom_all_defaults_equals_unarmed():
     facts = _facts()
     snapshot = _snap(rule, _state(), facts)
     decision = _close()
-    out, reason = evaluate_horizon_gate(decision, snapshot, rule, position_side="long")
+    out, reason, _ = evaluate_horizon_gate(decision, snapshot, rule, position_side="long")
     assert out is decision and reason is None
 
 
@@ -86,7 +85,7 @@ def test_h3_min_hold_veto():
     """H-3：持仓不足最短窗口的 `close` 降级为 hold，reason 带前缀与两个可读数。"""
     rule, facts = _rule(), _facts()
     snapshot = _snap(rule, _state(opened_wall=_NOW - 600.0, exit_confirm_streak=2), facts)
-    out, reason = evaluate_horizon_gate(_close(), snapshot, rule, position_side="long")
+    out, reason, _ = evaluate_horizon_gate(_close(), snapshot, rule, position_side="long")
     assert out.action == "hold"
     assert reason.startswith("horizon_min_hold(") and "min=120m" in reason
 
@@ -97,7 +96,7 @@ def test_h4_all_gates_satisfied_passes_through():
     facts = _facts(mark_px=100.5)          # +50bps > 1.5 × 13
     state = _state(opened_wall=_NOW - 20000.0, exit_confirm_streak=2)
     decision = _close()
-    out, reason = evaluate_horizon_gate(decision, _snap(rule, state, facts), rule,
+    out, reason, _ = evaluate_horizon_gate(decision, _snap(rule, state, facts), rule,
                                         position_side="long")
     assert out is decision and reason is None
 
@@ -108,13 +107,13 @@ def test_h5_exit_confirm_streak_then_pass():
     facts = _facts(mark_px=100.5)
     first = _state(opened_wall=_NOW - 20000.0, exit_confirm_streak=1,
                    first_exit_intent_wall=_NOW)
-    out, reason = evaluate_horizon_gate(_close(), _snap(rule, first, facts), rule,
+    out, reason, _ = evaluate_horizon_gate(_close(), _snap(rule, first, facts), rule,
                                         position_side="long")
     assert out.action == "hold" and reason == "horizon_exit_unconfirmed(1/2)"
     second = _state(opened_wall=_NOW - 20000.0, exit_confirm_streak=2,
                     first_exit_intent_wall=_NOW)
     decision = _close()
-    out2, reason2 = evaluate_horizon_gate(decision, _snap(rule, second, facts), rule,
+    out2, reason2, _ = evaluate_horizon_gate(decision, _snap(rule, second, facts), rule,
                                           position_side="long")
     assert out2 is decision and reason2 is None
 
@@ -124,7 +123,7 @@ def test_h8_hysteresis_veto_on_small_profit():
     rule = _rule()
     facts = _facts(mark_px=100.082)
     state = _state(opened_wall=_NOW - 20000.0, exit_confirm_streak=2)
-    out, reason = evaluate_horizon_gate(_close(), _snap(rule, state, facts), rule,
+    out, reason, _ = evaluate_horizon_gate(_close(), _snap(rule, state, facts), rule,
                                         position_side="long")
     assert out.action == "hold" and reason.startswith("horizon_turnover_hysteresis(")
 
@@ -135,7 +134,7 @@ def test_h9_loss_exit_never_blocked_by_hysteresis():
     facts = _facts(mark_px=99.7)           # −30bps
     state = _state(opened_wall=_NOW - 20000.0, exit_confirm_streak=2)
     decision = _close()
-    out, reason = evaluate_horizon_gate(decision, _snap(rule, state, facts), rule,
+    out, reason, _ = evaluate_horizon_gate(decision, _snap(rule, state, facts), rule,
                                         position_side="long")
     assert out is decision and reason is None
 
@@ -146,7 +145,7 @@ def test_h10_cost_unavailable_is_fail_open():
     facts = _facts(mark_px=100.02, cost_bps=None)
     state = _state(opened_wall=_NOW - 20000.0, exit_confirm_streak=2)
     decision = _close()
-    out, reason = evaluate_horizon_gate(decision, _snap(rule, state, facts), rule,
+    out, reason, _ = evaluate_horizon_gate(decision, _snap(rule, state, facts), rule,
                                         position_side="long")
     assert out is decision and reason is None
 
@@ -161,7 +160,7 @@ def test_h11_loss_release_frees_all_three_gates():
     assert snapshot["released"] and snapshot["releaseReason"] == "loss_release"
     assert snapshot["releasedGates"] == ["G1", "G2", "G3"]
     decision = _close()
-    out, reason = evaluate_horizon_gate(decision, snapshot, rule, position_side="long")
+    out, reason, _ = evaluate_horizon_gate(decision, snapshot, rule, position_side="long")
     assert out is decision and reason is None
 
 
@@ -184,7 +183,7 @@ def test_h13_epoch_estimated_releases_only_g1():
     snapshot = _snap(rule, state, facts)
     assert snapshot["releaseReason"] == "epoch_estimated"
     assert snapshot["releasedGates"] == ["G1"]
-    out, reason = evaluate_horizon_gate(_close(), snapshot, rule, position_side="long")
+    out, reason, _ = evaluate_horizon_gate(_close(), snapshot, rule, position_side="long")
     assert out.action == "hold" and reason == "horizon_exit_unconfirmed(1/2)"
 
 
@@ -203,7 +202,7 @@ def test_h15_never_gated_actions(action, side):
     """H-15：空仓开仓 / hold / cancel_order **永不**被拦（豁免矩阵冻结）。"""
     assert gated_kind(action, side, gate_reverse=True) is None
     decision = TradeDecision(action, 0.5, 0.8, "r")
-    out, reason = evaluate_horizon_gate(decision, _snap(_rule(), _state(), _facts()),
+    out, reason, _ = evaluate_horizon_gate(decision, _snap(_rule(), _state(), _facts()),
                                         _rule(), position_side=side)
     assert out is decision and reason is None
 
@@ -213,7 +212,7 @@ def test_h16_reverse_is_gated_and_degrades_to_hold():
     rule = _rule()
     snapshot = _snap(rule, _state(opened_wall=_NOW - 60.0), _facts())
     decision = TradeDecision("open_short", 0.5, 0.8, "flip")
-    out, reason = evaluate_horizon_gate(decision, snapshot, rule, position_side="long")
+    out, reason, _ = evaluate_horizon_gate(decision, snapshot, rule, position_side="long")
     assert out.action == "hold" and reason.startswith("horizon_min_hold(")
 
 
@@ -221,7 +220,7 @@ def test_h17_gate_reverse_off_lets_reverse_through():
     """H-17：`gate_reverse=False` ⇒ 反手恒直通（退出口）。"""
     rule = _rule(gate_reverse=False)
     decision = TradeDecision("open_short", 0.5, 0.8, "flip")
-    out, reason = evaluate_horizon_gate(decision, _snap(rule, _state(), _facts()), rule,
+    out, reason, _ = evaluate_horizon_gate(decision, _snap(rule, _state(), _facts()), rule,
                                         position_side="long")
     assert out is decision and reason is None
 
@@ -279,7 +278,7 @@ def test_h22_confirm_window_elapsed_releases_g2():
     snapshot = _snap(rule, state, facts)
     assert snapshot["confirmWindowElapsed"] is True
     decision = _close()
-    out, reason = evaluate_horizon_gate(decision, snapshot, rule, position_side="long")
+    out, reason, _ = evaluate_horizon_gate(decision, snapshot, rule, position_side="long")
     assert out is decision and reason is None
     # streak 归零时窗口起点一并清空 ⇒ 下一次意图重新起算（否则窗口在下一次意图时已经「到期」）。
     cleared = _snap(rule, _state(exit_confirm_streak=0, first_exit_intent_wall=None), facts)

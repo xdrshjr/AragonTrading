@@ -45,6 +45,8 @@ class _D:
     ord_type = "market"
     limit_px = None
     hold_exit_px = None
+    exit_conviction = None
+    exit_evidence = None
 
 
 # ---------- G-16：决策事件先于摘要事件推出 ----------

@@ -19,9 +19,19 @@ from __future__ import annotations
 
 import math
 
-# 九值枚举（wire 值，前后端镜像；顺序即 `bySource` 同数时的稳定次序）。
+# Agent **最高优先级**离场（exit-priority X-9 的兑现点）：凡本次 close 的最终档位是
+# `override` / `adjudicated` 即归此类。它必须与普通 `agent` 分开——「用最高优先级走掉的那几笔
+# 事后净额是正是负」是这条通道唯一的可证伪凭据，混进 `agent` 就再也算不出来了。
+EXIT_SOURCE_AGENT_OVERRIDE = "agentOverride"
+
+# 十值枚举（wire 值，前后端镜像；顺序即 `bySource` 同数时的稳定次序）。
+# ⚠️ 新增取值必须同步**六处手抄镜像**（G-9 的双向覆盖断言守）：后端
+# `acceptance_text.EXIT_SOURCE_LABELS` / `experience/taxonomy.VALUE_LABEL_ZH`；前端
+# `lib/aiTradeAcceptance.ts` 的 `EXIT_SOURCE_LABELS` 与 `EXIT_SOURCE_COLORS`、
+# `lib/experience.ts` 的 `VALUE_LABEL_ZH` 与 `AXIS_VALUES.exit`。漏一处**不会报错**，
+# 只会静默显示一个裸英文码，或让该类在经验图预演选择器里根本选不到。
 EXIT_SOURCES: tuple[str, ...] = (
-    "agent", "agentReverse", "profitGuard", "exchangeOco",
+    "agent", EXIT_SOURCE_AGENT_OVERRIDE, "agentReverse", "profitGuard", "exchangeOco",
     "timeExit", "sessionStop", "windowEnd", "external", "unknown",
 )
 

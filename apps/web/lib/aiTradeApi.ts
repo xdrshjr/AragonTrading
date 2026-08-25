@@ -12,6 +12,7 @@ import type {
   AiTradeGroupStartResult,
   AiTradeGroupStatusResponse,
   AiTradeGroupStopResult,
+  AiTradeMemberExitResult,
   AiTradePauseResult,
   AiTradeResumePreview,
 } from "./aiTradeTypes";
@@ -72,6 +73,14 @@ export const aiTradeApi = {
   repairBackstop: (groupId: string, instId: string) =>
     request<AiTradeBackstopRepairResult>(
       `/ai-trade/${groupId}/member/${encodeURIComponent(instId)}/backstop/repair`,
+      { method: "POST" },
+    ),
+  // 人工授权的**单次**市价离场（exit-priority §6.2）：只平本会话自管持仓，**不停止会话**。
+  // 这是本轮人机交互的兜底——无论模型怎么想、无论哪一层怎么判，用户永远有一个不经模型的离场
+  // 按钮。运维总闸关 ⇒ 409 `AI_TRADE_MANUAL_EXIT_DISABLED`。
+  exitMember: (groupId: string, instId: string) =>
+    request<AiTradeMemberExitResult>(
+      `/ai-trade/${groupId}/member/${encodeURIComponent(instId)}/exit`,
       { method: "POST" },
     ),
   // 当前活跃分组 + 是否启用（只读，重载后据此重连各成员 WS）。

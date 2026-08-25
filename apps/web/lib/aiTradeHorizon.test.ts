@@ -5,6 +5,7 @@ import { describeDegradeReason } from "./aiTrade";
 import {
   describeHorizonGate,
   describeHorizonStatus,
+  exitPriorityStatsLine,
   horizonCoherenceHints,
   horizonContractLines,
   horizonConfirmWindow,
@@ -427,6 +428,37 @@ describe("换手纪律拦截计数行", () => {
     expect(line).toContain("再入场冷却拦下 3");
     expect(line).toContain("预算拦下 7");
     expect(line).toContain("消耗令牌 11");
+  });
+
+  // ---------- 离场优先通道的放行计数（exit-priority X-9）----------
+  it("七个计数缺席（老记录 / 未装配）⇒ null ⇒ 整行不渲染，绝不显示一排 0", () => {
+    expect(exitPriorityStatsLine(null)).toBeNull();
+    expect(exitPriorityStatsLine({ ...base })).toBeNull();
+  });
+
+  it("「用掉了几次最高优先级、其中几次被降档」必须有落点——否则这条通道无法被证伪", () => {
+    const line = exitPriorityStatsLine({
+      ...base,
+      exitExpediteRounds: 4,
+      exitOverrideRounds: 2,
+      exitAdjudicatedRounds: 1,
+      exitFinalDeclared: 5,
+      exitFinalDowngraded: 2,
+      exitPendingReleases: 1,
+      exitFailOpenRounds: 3,
+    });
+    expect(line).toContain("加速 4 轮");
+    expect(line).toContain("最高优先级 2 次");
+    expect(line).toContain("复核官背书 1 次");
+    expect(line).toContain("声明 final 5 次（降档 2 次）");
+    expect(line).toContain("挂起到期放行 1 次");
+    expect(line).toContain("未经复核放行 3 次");
+  });
+
+  it("fail-open 放行**单独成项**：它不是模型的功劳，也不是一次降级", () => {
+    const line = exitPriorityStatsLine({ ...base, exitFailOpenRounds: 1 });
+    expect(line).toContain("未经复核放行 1 次");
+    expect(line).not.toContain("降档");
   });
 });
 

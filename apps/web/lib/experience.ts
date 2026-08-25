@@ -64,6 +64,7 @@ export const VALUE_LABEL_ZH: Record<string, string> = {
   position_watch: "持仓盯市",
   heartbeat: "心跳",
   agent: "Agent主动平",
+  agentOverride: "Agent优先离场",
   agentReverse: "Agent反手",
   profitGuard: "利润保护",
   exchangeOco: "交易所OCO",
@@ -90,8 +91,10 @@ export const AXIS_VALUES: Record<string, string[]> = {
   side: ["long", "short", "unknown"],
   wake: ["candle_close", "bar_advanced", "signal_flip", "resting_order", "profit_tier",
          "price_breakout", "position_watch", "heartbeat", "unknown"],
-  exit: ["agent", "agentReverse", "profitGuard", "exchangeOco", "timeExit", "sessionStop",
-         "windowEnd", "external", "unknown"],
+  // ⚠️ 硬编码数组，必须与后端 `EXIT_SOURCES` 逐值对齐——漏一个值，经验图预演选择器里**根本
+  // 选不到**那一类（X-9 在经验图那一侧就无法被查询），而 tsc / vitest 都不会红。
+  exit: ["agent", "agentOverride", "agentReverse", "profitGuard", "exchangeOco", "timeExit",
+         "sessionStop", "windowEnd", "external", "unknown"],
   horizon: ["hourly_swing", "intraday_swing", "short_swing", "trend_hold", "custom",
             "none", "unknown"],
   cost_regime: ["low", "mid", "high", "unknown"],

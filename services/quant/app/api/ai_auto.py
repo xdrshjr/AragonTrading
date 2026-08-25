@@ -37,7 +37,8 @@ from ..ai_auto.experience import (
     resolve_experience,
     resolve_experience_settings,
 )
-from ..ai_auto.hold_horizon import HorizonRule, profiles_wire, resolve_horizon_rule
+from ..ai_auto.hold_horizon import HorizonRule, resolve_horizon_rule
+from ..ai_auto.hold_horizon_profiles import profiles_wire
 from ..ai_auto.manager import (
     AiTradeGroupMemberInput,
     AiTradeGroupPreflightError,
@@ -47,6 +48,7 @@ from ..ai_auto.manager import (
 )
 from ..ai_auto.prior_service import prior_snapshot_out, rebuild_prior_snapshot
 from ..ai_auto.profit_guard import ProfitGuardRule, resolve_profit_guard_rule
+from ..ai_auto.session import AiTradeManualExitDisabled
 from ..ai_auto.signal_prior import resolve_prior_params, strategy_fingerprint
 from ..ai_auto.sizing import parse_sizing_rule, window_need
 from ..ai_auto.track_record_service import build_profitability, resolve_track_record
@@ -403,6 +405,37 @@ async def ai_trade_stop(group_id: str) -> dict:
 async def ai_trade_member_stop(group_id: str, inst_id: str) -> dict:
     """仅停某成员（其余续跑；不守门）；停后无运行成员则分组清空。"""
     result = await get_ai_trade_manager().stop_member(group_id, inst_id)
+    if result is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "分组或成员不存在"})
+    return result
+
+
+@router.post("/ai-trade/{group_id}/member/{inst_id}/exit")
+async def ai_trade_member_exit(group_id: str, inst_id: str) -> dict:
+    """人工授权的**单次**市价离场（ai-trade-exit-priority-and-commitment §6.2）。
+
+    语义：只平**本会话自管仓位**，**不停止会话**（与 `/member/{inst}/stop` 的关键差别）。它是
+    本轮人机交互的兜底——无论模型怎么想、无论哪一层怎么判，用户永远有一个不经模型的离场按钮。
+
+    **刻意不守 AI 总闸**（与 `/ai-trade/{gid}/stop`、`.../backstop/repair` 同理）：离场是收敛
+    风险的动作，任何时候都该能执行。它守的是运维总闸 `ai_trade_manual_exit_enabled`（关 ⇒ 409）。
+
+    错误映射（端点层是唯一的翻译点）：运维总闸关 → 409 `AI_TRADE_MANUAL_EXIT_DISABLED`；
+    分组 / 成员缺失 → 404（镜像 `stop_member`）。
+
+    **交易所业务失败刻意不映射成 502**（与 `/backstop/repair` 的差别，见 §十一 D-10）：
+    `executor.flatten` **不抛** `OKXError`——它内部重试后返回结构化失败 `{"ok": False, "code",
+    "message", "residual"}`，故这里写一个 `except OKXPrivateError` 只会得到一段**不可达的死代码**。
+    失败沿 200 + `{"ok": false, "message"}` 返回（message 已由会话层译成中文原因在前 + sCode），
+    并另有一条 `AI_TRADE_MANUAL_EXIT_FAILED` 的 WS error 推给面板。
+
+    **返回裸 `dict`、不绑 `response_model`**（`AiTradeExitOut` 只作文档 schema）：同类两个端点
+    正是为绕开「`response_model` 静默吞掉新 wire 键」这个本仓库出过事的形态。
+    """
+    try:
+        result = await get_ai_trade_manager().exit_member(group_id, inst_id)
+    except AiTradeManualExitDisabled as exc:
+        raise HTTPException(409, detail={"code": exc.code, "message": exc.message}) from exc
     if result is None:
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "分组或成员不存在"})
     return result

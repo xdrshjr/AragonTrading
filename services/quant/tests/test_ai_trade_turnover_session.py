@@ -259,6 +259,11 @@ def test_round_one_gate_matrix_is_frozen():
         "stale_px": ("G1", "G2", "G3"),
         "epoch_estimated": ("G1",),
         "max_hold_bars": ("G1", "G2", "G3"),
+        # exit-priority §4.2.3 新增的第五条豁免（轴 A 的第二把钥匙）。**只解 G2/G3**：
+        # 按默认派生式，四个预设的 `pending_max = 2 × confirm_window` 与 `min_hold` 完全相等，
+        # 故解 G1 在预设上恒为死码；而 `custom` 允许两者脱钩，一旦脱钩解 G1 就是一个真实的洞。
+        # 上面四条的**逐格取值在本轮一个字符都没动**——这才是本断言真正冻结的东西。
+        "exit_pending": ("G2", "G3"),
     }
     for action, side, expected in [
             ("close", "long", "close"), ("close", "short", "close"),
@@ -538,7 +543,7 @@ def test_backtest_notes_disclose_all_three_caveats():
 
 def test_profiles_wire_carries_previews_and_ops_flags():
     """§4.1：三个预览字段 + 三个运维标志；`custom` 恒 `null`（前端不硬抄任何一个数）。"""
-    from app.ai_auto.hold_horizon import profiles_wire
+    from app.ai_auto.hold_horizon_profiles import profiles_wire
 
     wire = profiles_wire(Settings())
     assert wire["turnoverGateEnabled"] is True and wire["backstopCheckEnabled"] is True

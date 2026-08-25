@@ -23,6 +23,7 @@ import {
   horizonEstimatedNote,
   horizonKpis,
   horizonReleaseHint,
+  exitPriorityStatsLine,
   horizonVetoLine,
   turnoverVetoLine,
 } from "@/lib/aiTradeHorizon";
@@ -287,6 +288,7 @@ function HorizonKpiGroup({ stats }: { stats: AiTradeHorizonStats | null }) {
   if (!stats) return null;
   const note = horizonEstimatedNote(stats);
   const turnoverLine = turnoverVetoLine(stats);
+  const exitLine = exitPriorityStatsLine(stats);
   return (
     <div className="mt-2" data-testid="ai-horizon-kpis">
       <div className="grid grid-cols-3 gap-2">
@@ -307,6 +309,14 @@ function HorizonKpiGroup({ stats }: { stats: AiTradeHorizonStats | null }) {
       {turnoverLine ? (
         <p className="mt-0.5 text-[10px] leading-relaxed text-[var(--muted)]">
           {turnoverLine}
+        </p>
+      ) : null}
+      {/* 离场优先通道的放行计数（exit-priority X-9）：这条通道**必须能被事后证伪**，而
+          「用掉了几次」只有这一个展示落点——记了却没人读等于没记。全为 0 / 老记录缺键 ⇒
+          整行不渲染（与上面两行同款纪律，绝不显示一排误导性的 0）。 */}
+      {exitLine ? (
+        <p className="mt-0.5 text-[10px] leading-relaxed text-[var(--muted)]">
+          {exitLine}
         </p>
       ) : null}
     </div>

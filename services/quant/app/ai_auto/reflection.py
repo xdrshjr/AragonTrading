@@ -15,8 +15,10 @@ _OPEN_ACTIONS = ("open_long", "open_short")
 
 def apply_reflection(decision: TradeDecision, degrade: str | None,
                      verdict: ReflectionVerdict | None,
-                     position_step: float = 0.0) -> tuple[TradeDecision, str | None]:
-    """把反思裁决落到最终决策（只会更保守）；返回 `(decision, degrade_reason)`。
+                     position_step: float = 0.0, *,
+                     fail_open_actions: tuple[str, ...] = ()
+                     ) -> tuple[TradeDecision, str | None, str | None]:
+    """把反思裁决落到最终决策（只会更保守）；返回 `(decision, degrade_reason, fail_open_code)`。
 
     - `verdict` 为 None 或 `ran=False`（反思关闭/未触发）→ 原样透传（逐字零回归）。
     - fail-closed（`degrade_reason` 非空）或 `abort` → 降级为 `hold`：决策理由改写为反思理由（§5.3），
@@ -31,15 +33,26 @@ def apply_reflection(decision: TradeDecision, degrade: str | None,
         degrade: 决策器/共识门禁先前的降级原因（None 表示无）。
         verdict: 反思裁决（`AiTradeDecider.reflect` 产物）。
         position_step: 开仓档位步长（fraction；用于收缩值量化，0=连续）。
+        fail_open_actions: 对哪些动作把 **fail-closed 反转为 fail-open**（exit-priority X-6）；
+            默认 `()` ⇒ **逐字回退**到本特性合入前（C-8 的一键回退据此成立）。会话侧传
+            `("close",)`：`close` 是风险收敛动作，一次 LLM 超时不该锁死一笔真实持仓——而
+            `hold_horizon.py` 模块头早已把同一条纪律写成不变式，只是在本模块被写反了。
 
     Returns:
-        `(final_decision, degrade_reason)`——`final_decision` 同方向或更保守。
+        `(final_decision, degrade_reason, fail_open_code)`——`final_decision` 同方向或更保守；
+        第三元非 `None` ⇒ 本轮是**因基础设施失败而放行**的那一笔（它**绝不进 `degrade`**：
+        `degrade` 的语义是「本轮被降级」，把放行塞进去会让闸计数把一次成功离场记成一次被拦）。
+        `fail_open_actions=()` 时第三元恒为 `None`。
     """
     if verdict is None or not verdict.ran:
-        return decision, degrade
+        return decision, degrade, None
     code = verdict.degrade_reason or ("reflection_abort" if verdict.verdict == "abort" else None)
     if code is not None:                                 # fail-closed 或 abort → 降级为 hold
-        return _hold(verdict.reason or code), (degrade or code)
+        # X-6：**只有基础设施失败**（`degrade_reason` 非空）才反转；模型的真实终态裁决
+        # （`abort` ⇒ `degrade_reason is None` ⇒ code 恒为 `reflection_abort`）逐字不变。
+        if verdict.degrade_reason is not None and decision.action in fail_open_actions:
+            return decision, degrade, code
+        return _hold(verdict.reason or code), (degrade or code), None
     # confirm：仅当模型给了严格更小的收缩值时收窄仓位（绝不放大/改向）。
     adjusted = verdict.adjusted_size_fraction
     if (adjusted is not None and decision.action in _OPEN_ACTIONS
@@ -51,12 +64,13 @@ def apply_reflection(decision: TradeDecision, degrade: str | None,
             # ai-trade-limit-orders-fix F-1（P0）：位置重建是「加字段就丢一遍」的复发根——曾把
             # ord_type/limit_px 静默落回 market/None（限价单被反思收缩后变市价成交）。`replace`
             # 只改仓位、其余字段（含未来新增）原样保留，根治该复发模式，勿回改为位置构造。
-            return replace(decision, size_fraction=new_size), degrade
-    return decision, degrade
+            return replace(decision, size_fraction=new_size), degrade, None
+    return decision, degrade, None
 
 
 def build_reflection_note(original: TradeDecision, verdict: ReflectionVerdict | None,
-                          final: TradeDecision) -> dict | None:
+                          final: TradeDecision, *,
+                          pending_exit: dict | None = None) -> dict | None:
     """把本轮反思结果压成记忆注记（hold-inertia-fix F2，session/backtest 共用纯函数）。
 
     否决把开仓候选改写成普通 hold 后，journal/摘要素材里「曾经想开仓但被否决」完全蒸发，摘要器
@@ -67,6 +81,11 @@ def build_reflection_note(original: TradeDecision, verdict: ReflectionVerdict | 
         original: 反思前的提议决策（须在 `apply_reflection` 之前留存引用）。
         verdict: 反思裁决；`None` 或 `ran=False`（关闭/未触发）→ 返回 `None`（journal 该键为 None）。
         final: `apply_reflection` 后的最终决策。
+        pending_exit: keyword-only，默认 `None` → 既有调用零回归（exit-priority §4.4.2）。本轮是
+            被持仓周期层**挂起待裁决**的离场提议时的断面
+            `{"gateReason", "intentStreak", "overrideRounds"}`。落进注记而不只落进 prompt 是有理由
+            的：`_context` 会被滚动摘要重置，而「那一次是复核官替我放行 / 否决的」是事后问责回路
+            里最该留下来的一条——缺了它，摘要器只能看到一次普通的 close。
 
     Returns:
         注记 dict 或 `None`。`failClosed=True` 表示基础设施故障（timeout/llm_error/no_tool/invalid）
@@ -75,6 +94,7 @@ def build_reflection_note(original: TradeDecision, verdict: ReflectionVerdict | 
     if verdict is None or not verdict.ran:
         return None
     return {"verdict": verdict.verdict,
+            "pendingExit": pending_exit,
             "vetoed": final.action != original.action,   # 被否决（open_*/close → hold）
             "failClosed": verdict.degrade_reason is not None,
             "reason": verdict.reason,

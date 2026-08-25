@@ -32,7 +32,7 @@ from .acceptance_text import (
     turnover_note,
     within_target_note,
 )
-from .exit_attribution import ExitLedger, exit_counters
+from .exit_attribution import EXIT_SOURCE_AGENT_OVERRIDE, ExitLedger, exit_counters
 from .funding_ledger import merge_funding_wires
 from .turnover_discipline import derive_turnover_per_day
 
@@ -286,7 +286,7 @@ def build_acceptance(inp: AcceptanceInput | None, rule, thresholds, *,
         # 顶层同名键的**同一个对象引用**；前端一律读顶层，此处仅供 diagnostics / tooltip 就近取用。
         "exitMix": exits,
         "funding": funding,
-        "diagnostics": _diagnostics(inp, rows, thresholds),
+        "diagnostics": _diagnostics(inp, rows, thresholds, exits=exits),
     }
 
 
@@ -437,8 +437,8 @@ def _compare_max(value: float | None, threshold: float | None) -> str:
     return VERDICT_PASS if value <= threshold else VERDICT_FAIL
 
 
-def _diagnostics(inp: AcceptanceInput, rows: list[dict],
-                 th: AcceptanceThresholds) -> list[str]:
+def _diagnostics(inp: AcceptanceInput, rows: list[dict], th: AcceptanceThresholds, *,
+                 exits: dict | None = None) -> list[str]:
     by_key = {row["key"]: row for row in rows}
     total = sum(inp.exit_counts.values())
     share = (inp.exit_counts.get("agent", 0) / total) if total else None
@@ -449,7 +449,18 @@ def _diagnostics(inp: AcceptanceInput, rows: list[dict],
         checks={"withinTargetPass": within["verdict"] == VERDICT_PASS,
                 "netAfterFunding": by_key["netAfterFunding"]["value"],
                 "fundingBasis": inp.funding_basis,
-                "avgHoldSeconds": by_key["avgHold"]["value"]})
+                "avgHoldSeconds": by_key["avgHold"]["value"],
+                # exit-priority X-9：最高优先级离场的事后净额（零笔 ⇒ 整句不出现）。**读的是
+                # `exits` 那一份现成的 wire**，绝不在此二次装配——两处各算一份就是分叉。
+                "exitOverride": _exit_override_row(exits)})
+
+
+def _exit_override_row(exits: dict | None) -> dict | None:
+    """从退出分布 wire 里取 `agentOverride` 那一行；无该来源 ⇒ `None`。"""
+    if not isinstance(exits, dict):
+        return None
+    return next((row for row in (exits.get("bySource") or [])
+                 if row.get("source") == EXIT_SOURCE_AGENT_OVERRIDE), None)
 
 
 def _merge_int(rows: list[AcceptanceInput], attr: str) -> dict[str, int]:

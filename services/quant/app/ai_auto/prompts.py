@@ -201,25 +201,45 @@ def _size_discipline(position_step_pct: float, sizing_enabled: bool = False) -> 
 
 def build_decision_tool_description(allow_limit: bool = False, *,
                                     limit_band_pct: float = 0.02,
-                                    allow_hold_exit: bool = False) -> str:
+                                    allow_hold_exit: bool = False,
+                                    allow_exit_priority: bool = False) -> str:
     """决策工具散文描述；`allow_limit` / `allow_hold_exit` 皆假（默认）**恒等**返回模块常量（零回归，M-4）。
 
     `limit_band_pct`（keyword-only，F-3）：价带比例文案；默认 0.02 渲染与参数化前逐字节相同。
     `allow_hold_exit`（keyword-only，C1）：为真时在尾部追加承诺退出线说明；关闭时逐字节回退（G-2）。
+    `allow_exit_priority`（keyword-only，exit-priority §6.1）：同款——为真时追加离场优先通道说明。
     """
-    if not allow_limit and not allow_hold_exit:
+    if not allow_limit and not allow_hold_exit and not allow_exit_priority:
         return DECISION_TOOL_DESCRIPTION
     text = DECISION_TOOL_DESCRIPTION
     if allow_limit:
         text += _limit_tool_description_suffix(limit_band_pct)
     if allow_hold_exit:
         text += _hold_exit_tool_description_suffix()
+    if allow_exit_priority:
+        text += _exit_priority_tool_description_suffix()
     return text
+
+
+def _exit_priority_tool_description_suffix() -> str:
+    """离场优先通道开启时（allow_exit_priority=True）追加进决策工具描述的散文说明（§6.1）。
+
+    基础文案（`DECISION_TOOL_DESCRIPTION`）**一字不改**——总闸关闭时描述与本特性合入前逐字相同。
+    """
+    return (
+        "另可在 action=close 时给 exitConviction 声明本次离场的确信度：normal=常规离场；"
+        "high=离场理由已成熟，请求跳过「离场连续确认」这一条约束（换手迟滞仍生效）；"
+        "final=你已在多轮研判中确认持仓理由失效，请求跳过全部三条约束立即执行。"
+        "使用 final 必须同时在 exitEvidence 里指名「持仓理由已失效」的**新证据**"
+        "（不是重复上一轮的判断）；本会话 final 配额有限，用尽后按 high 处理，且每一次都会被记录"
+        "并在会话结束时与真实结果对照。"
+    )
 
 
 def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = False,
                                limit_band_pct: float = 0.02,
-                               allow_hold_exit: bool = False) -> dict:
+                               allow_hold_exit: bool = False,
+                               allow_exit_priority: bool = False) -> dict:
     """按档位步长 + 限价总闸 + 承诺退出线总闸构造决策工具 `input_schema`（[R-5] `enum` 取真源）。
 
     `step<=0` **且** `allow_limit=False` **且** `allow_hold_exit=False`（含全部默认调用）原样返回模块
@@ -242,7 +262,9 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
         `validate_limit_intent`），本 schema 只是软引导。
     """
     step = max(0.0, float(position_step_pct))
-    if step <= 0 and not allow_limit and not allow_hold_exit:
+    # 【R:P1-9a】早退判据必须同时含 `allow_exit_priority`——漏了它，总闸开着时 schema 会原样返回
+    # 模块常量，两个新字段永远露不出来，而**不报任何错**（G-2 的直接依赖）。
+    if step <= 0 and not allow_limit and not allow_hold_exit and not allow_exit_priority:
         return DECISION_TOOL_SCHEMA
     schema = dict(DECISION_TOOL_SCHEMA)
     props = dict(DECISION_TOOL_SCHEMA["properties"])   # 独立浅拷贝，杜绝改动泄漏回模块常量
@@ -259,8 +281,28 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
             "description": "（可选）继续持有时你承诺的退出价位：价格向此价靠拢并触及即由系统市价平仓。"
                            "多头填低于现价的止盈保护价、空头填高于现价的价；系统只会据它把保护线收得更紧、"
                            "绝不放松，且不会劣于保本线。给了它等于让系统替你守住这条线，你无需每轮盯盘。"}
+    if allow_exit_priority:
+        _apply_exit_priority_properties(props)
     schema["properties"] = props
     return schema
+
+
+def _apply_exit_priority_properties(props: dict) -> None:
+    """就地给**调用方自己的 props 浅拷贝**补两个可选离场字段（§6.1）；`required` 不变。
+
+    两者永远可选：一个读不懂 / 没给出的确信度不该把 `close`（最安全的动作）降级——纯核心
+    `exit_priority.normalize_conviction` 对值域外一律归一为 `normal`，绝不据它降级。
+    """
+    props["exitConviction"] = {
+        "type": "string", "enum": ["normal", "high", "final"],
+        "description": "（可选，**仅 action=close 时有意义**）本次离场的确信度。"
+                       "normal=常规离场；high=离场理由已成熟，请求跳过离场连续确认；"
+                       "final=你已在多轮研判中确认持仓理由失效，请求最高优先级立即离场"
+                       "（必须同时给出 exitEvidence，本会话配额有限且会被记录核对）。"}
+    props["exitEvidence"] = {
+        "type": "string", "maxLength": 300,
+        "description": "（可选）exitConviction=final 时必填：指名「持仓理由已失效」的新证据"
+                       "——不是重复上一轮的判断。"}
 
 
 def _apply_limit_properties(props: dict, band_pct: float = 0.02) -> None:

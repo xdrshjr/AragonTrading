@@ -33,6 +33,7 @@ import {
   describeWakeReason,
 } from "@/lib/aiTrade";
 import { describeHorizonGate, formatHoldDuration } from "@/lib/aiTradeHorizon";
+import { ExitPriorityRow, ProposedVetoRow } from "./AiTradeExitPriorityRows";
 import type {
   AiTradeRoundTrace,
   MultiTimeframeContext,
@@ -178,6 +179,7 @@ function DecisionToolCard({ trace }: { trace: AiTradeRoundTrace }) {
         </span>
         <span className="text-[var(--muted)]">{open ? "▾" : "▸"}</span>
       </button>
+      <ProposedVetoRow trace={trace} />
       {call.reason && (
         <p className="border-t border-[var(--border)] px-2.5 py-1.5 text-[11px] leading-relaxed text-[var(--muted)]">
           {call.reason}
@@ -262,6 +264,7 @@ function HorizonBlock({ trace }: { trace: AiTradeRoundTrace }) {
           {view.label}
         </span>
       </div>
+      <ExitPriorityRow trace={trace} />
       {wire && wire.status !== "flat" ? (
         <HorizonGateRows wire={wire} />
       ) : (

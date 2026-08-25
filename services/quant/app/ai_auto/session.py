@@ -19,6 +19,7 @@ import logging
 import time
 from collections import deque
 from collections.abc import Callable
+from dataclasses import replace
 
 from ..db import repositories as repo
 from ..db.session import get_sessionmaker
@@ -41,11 +42,28 @@ from .discipline_runtime import DisciplineRuntime
 from .decider import AiTradeDecider, TradeDecision
 from .exchange_backstop import (BackstopRuntime, check_now_from_executor,
                                 schedule_from_executor)
-from .exit_attribution import classify_live
+from .exit_attribution import EXIT_SOURCE_AGENT_OVERRIDE, classify_live
+from .exit_commitment import (
+    EXIT_STUCK_CODE,
+    ExitCommitment,
+    arm as exit_arm,
+    build_wire as exit_commitment_wire,
+    note_attempt as exit_note_attempt,
+    on_epoch_change as exit_on_epoch_change,
+    rule_from_settings as exit_commitment_rule,
+    should_retry as exit_should_retry,
+)
+from .exit_priority import (
+    LEVEL_ADJUDICATED,
+    LEVEL_OVERRIDE,
+    ExitPriorityInput,
+    adjudicate as adjudicate_exit_priority,
+    resolve_exit_priority,
+)
 from .experience import ExperienceRuntime
 from .hold_horizon import HorizonFacts, HorizonRule, gate_status as horizon_gate_status
 from .horizon_acceptance import ai_stats_keys, build_bundle
-from .horizon_runtime import HorizonRuntime, build_horizon_facts
+from .horizon_runtime import HorizonRuntime, build_gate_veto_note, build_horizon_facts
 from . import lifecycle as lifecycle_core
 from .market_context import build_market_context
 from .market_digest import build_market_digest
@@ -124,6 +142,41 @@ _HORIZON_RELEASED_ALERT_ROUNDS = 20
 # 产生的成交才归因到唤醒来源。保护层平仓 / 会话止损 / 外部干预由确定性层触发、与唤醒无关，打上去会让
 # 「按唤醒来源切胜率」这张表整体失真——而那正是本条要解决的问题。
 _WAKE_ATTRIBUTED_KINDS = ("atomic", "reverse")
+
+
+class AiTradeManualExitDisabled(Exception):
+    """运维总闸 `ai_trade_manual_exit_enabled` 关闭时【立即离场】被调用（端点层译成 409）。
+
+    与 `AiTradeRepairBlocked` 同款姿态：会话层只抛稳定异常，中文与 HTTP 码的翻译点**只有一个**
+    （`api/ai_auto.py`），绝不在服务层拼 HTTP 语义。
+    """
+
+    code = "AI_TRADE_MANUAL_EXIT_DISABLED"
+    message = "【立即离场】未开启（运维总闸关闭）"
+
+
+def _manual_exit_failure_text(result: dict) -> str:
+    """【立即离场】失败回执的一句人话：**中文原因在前**，交易所原始 sCode 括在后面。
+
+    沿用 `/backstop/repair` 的既有翻译纪律——交易所原文常是英文，而这一发的失败提示往往是用户
+    对本层唯一的一次阅读，绝不能只给一串归一码。`executor.flatten` **不抛** `OKXError`（它内部
+    重试后返回结构化失败），故 sCode 只能从回执里取，见 §十一 D-10。
+    """
+    detail = str(result.get("message") or "").strip()
+    code = str(result.get("code") or "").strip()
+    text = f"立即离场未成功：{detail}" if detail else "立即离场未成功"
+    return f"{text}（{code}）" if code else text
+
+
+def _has_close_fill(events: list[dict]) -> bool:
+    """事件流里是否存在一笔 `close` 成交（轴 C 与利润保护层共用的**唯一**成交判据）。
+
+    绝不据「已调用 apply」宣称已平仓：`_do_close` 有多条**不平仓**的返回路径（撤单撞成交 /
+    `close_position` 抛 `OKXError` / `projected` 已 flat）。假报一次不存在的平仓，会让用户以为
+    风险已经收敛而实际仓位还在裸奔。
+    """
+    return any(e.get("type") == "trade" and (e.get("data") or {}).get("side") == "close"
+               for e in events)
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +257,17 @@ class AiTradeSession:
             turnover_rule=turnover_rule_from_horizon(horizon_rule, executor.settings),
             backstop=self._backstop, repair=self._repair)
         self._round_horizon: dict | None = None      # 本轮 gate 快照（decision 事件与判定同源）
+        # ---- 离场优先级与离场意图兑现（exit-priority §4.1）----
+        # 三者未装配时全部退化为零动作：`exitPriority` / `exitCommitment` 两键整键缺席、
+        # prompt 逐字节回退、门禁解闸集合为空 ⇒ 与本特性合入前逐字等价（X-7）。
+        self._exit_priority = None            # 本轮 `ExitPriority`（W-2 算、W-4b 可能重算）
+        self._exit_input: ExitPriorityInput | None = None
+        self._exit_commit = ExitCommitment()
+        self._exit_commit_rule = exit_commitment_rule(executor.settings)
+        # 【R:P0-6】退出归因的**一次性槽**：只在本次 close 的成交事件上消费即清空。挂成会话字段
+        # 会让一次 override 之后的下一笔**任意**平仓都被记成 `agentOverride`（且错误方向是系统性
+        # 高估——override 之后的仓位往往由保护层平掉）。
+        self._pending_exit_priority: str | None = None
         hold_bars = None if horizon_rule is None else horizon_rule.expected_hold_bars
         self._cost = CostRuntime(inst_id, executor.settings, executor.fee_ledger,
                                  executor.creds, allow_limit=decider.allow_limit,
@@ -454,7 +518,7 @@ class AiTradeSession:
         # 总闸关 ⇒ 整键缺席（老数据同样缺席，查询侧一律按 "unknown" 处理）。
         if (trade.get("side") == "close"
                 and self.executor.settings.ai_trade_exit_attribution_enabled):
-            meta.setdefault("exitSource", classify_live(explain))
+            meta.setdefault("exitSource", self._consume_exit_source(explain))
         # 轴 A 往返结算（realized-edge-calibration §3.1.1）：**必须在 exitSource 打标之后**——本层
         # 只读那个键、绝不自己再判一次（[P1-1]）。总闸关 / 非平仓 / 无开仓断面 ⇒ 空转 ⇒ meta 逐字回退。
         self._cost.apply_trip_meta(meta, trade)
@@ -656,8 +720,17 @@ class AiTradeSession:
             task.cancel()
         setattr(self, attr, None)
 
-    async def _handle_flatten_result(self, ts: int) -> None:
-        result = self.flatten_result or {}
+    async def _handle_flatten_result(self, ts: int, *, result: dict | None = None,
+                                     terminal: bool = True) -> None:
+        """flatten 的**唯一**收尾：扇出撤单 / 成交事件，失败时推强提示（各写一遍必然分叉）。
+
+        `terminal`（keyword-only，默认 True ⇒ 既有两个停止路径的调用点逐字节不变；【R:P1-6】）：
+        `False` 用于**会话继续运行**的中途离场（`/exit`）。`flatten_failed` / `residual` 被
+        `_status_payload` 读成面板上的**终态**红条，且全仓**没有任何复位点**（只在 `__init__` 置
+        `False`）——一次中途失败会让此后每一次 status 都宣称「AI 自动交易停止时平仓失败」，即便
+        下一轮 Agent 自己已经把仓平掉了。故中途路径只推一条独立的 `AI_TRADE_MANUAL_EXIT_FAILED`。
+        """
+        result = (self.flatten_result or {}) if result is None else result
         # §2.8：flatten 先撤挂单——撤单 / 「最后一刻成交」的采纳事件须如实扇出（缺键即无挂单，
         # 与本特性合入前逐字相同）。
         if result.get("events"):
@@ -666,12 +739,159 @@ class AiTradeSession:
             await self._dispatch([{"type": "trade", "data": result["trade"]}])
         if result.get("ok"):
             return
+        if not terminal:
+            await self._push({"type": "error", "data": {
+                "ts": ts, "code": "AI_TRADE_MANUAL_EXIT_FAILED",
+                "message": "立即离场未成功，请到下方实盘面板手动平仓（会话仍在运行）",
+                "residual": result.get("residual")}})
+            return
         self.flatten_failed = True
         self.residual = result.get("residual")
         await self._push({"type": "error", "data": {
             "ts": ts, "code": "AI_TRADE_FLATTEN_FAILED",
             "message": "AI 自动交易停止时平仓失败，请立即到下方实盘面板手动平仓",
             "residual": self.residual}})
+
+    async def exit_now(self) -> dict:
+        """人工授权的**单次**市价离场（§6.2）：只平本会话自管仓位，**不停止会话**。
+
+        复用 `executor.flatten` + `_handle_flatten_result` 的**同一条收尾**（各写一遍会造出全仓
+        唯一一条「平仓失败却静默」的路径），只是 `terminal=False`（【R:P1-6】，见上）。
+        运维总闸关 ⇒ 抛 `AiTradeManualExitDisabled`（端点层 409）；**不守 AI 总闸**——离场是收敛
+        风险的动作，任何时候都该能执行（与 `/stop`、`/backstop/repair` 同理）。
+        """
+        if not self.executor.settings.ai_trade_manual_exit_enabled:
+            raise AiTradeManualExitDisabled()
+        ts = self._ref_ts()
+        px = self._ref_px()
+        async with self._exec_lock:
+            try:
+                result = await self.executor.flatten(px, ts)
+            except Exception as exc:  # noqa: BLE001 —— 平仓失败如实回执，绝不让会话崩掉
+                result = {"ok": False, "message": str(exc)}
+        # 用户已亲手接手这笔离场：自动兑现意图与退出归因打标槽一并作废（绝不把一次手动离场
+        # 记成 `agentOverride`）。
+        self._exit_commit = ExitCommitment()
+        self._pending_exit_priority = None
+        await self._handle_flatten_result(ts, result=result, terminal=False)
+        ok = bool(result.get("ok"))
+        return {"ok": ok, "instId": self.inst_id, "groupId": self.group_id,
+                "flattened": result, "positionAfter": self.executor.projected,
+                "restingCancelled": bool(result.get("events")),
+                "message": ("已按市价平掉本会话自管持仓，会话继续运行"
+                            if ok else _manual_exit_failure_text(result))}
+
+    # ---------- 轴 C · 离场意图兑现（exit-priority §4.5.2）----------
+    def _arm_exit_commitment(self, decision: TradeDecision, executed: dict) -> None:
+        """★ W-5：本轮 close **未成交**即武装离场兑现意图（三条合取判据，缺一不可）。
+
+        ②「只对市价平仓武装」不可省（【R:P0-3】）：限价平仓走 `_enter_resting`，当轮**必然**没有
+        成交事件，照「未见成交即武装」写会让本层在 `retry_interval_s` 之后撤掉模型自己挂的限价单
+        并按市价平掉——整个 limit-orders 特性在离场侧被静默废掉，而界面上还显示着那张限价单。
+        """
+        if self._exit_commit_rule is None or decision.action != "close":
+            return
+        if decision.ord_type != "market" or decision.limit_px is not None:
+            return
+        if executed.get("skipped") or executed.get("closedFilled") is not False:
+            return
+        priority = self._exit_priority
+        self._exit_commit = exit_arm(
+            self._exit_commit, epoch=self._exit_epoch(), now_wall=time.time(),
+            reason_code=((priority.reason if priority else None) or decision.reason or ""),
+            priority_level=(priority.level if priority else "normal"))
+
+    async def _settle_exit_commitment(self) -> None:
+        """★ W-6：到点重试 / 完成清空 / 到顶告警；未装配 / 未武装 / 未到点 ⇒ 空转。
+
+        插在 `executor.reconcile` **之后**（挂单状态在那里收敛）、`_maybe_profit_exit` **之前**
+        ——Agent 已经确认离场的仓位不该再等一次保护层判定；两者都只产生 `close`，先后不产生对冲
+        态（若本次兑现成功，`_maybe_profit_exit` 会因 `projected == "flat"` 自然空转）。
+
+        **暂停期照旧兑现**（判据 `is_active`，与利润保护层同款）：用户暂停后去睡觉，一笔已经被
+        Agent 判定该走的仓位不该失去唯一的本地退出执行者。
+        """
+        if self._exit_commit_rule is None or not self.is_active:
+            return
+        epoch = self._exit_epoch()
+        before = self._exit_commit
+        self._exit_commit = exit_on_epoch_change(before, epoch)
+        # 【R:P0-6】打标槽只在「**已武装的**离场意图因持仓身份变化而作废」时一并作废。判据绝不能
+        # 写成「本轮未武装」——那在每一个盯市 tick 上都成立，而 `_note_exit_priority_round()` 与
+        # `_execute_decision` 之间隔着一次真实下单的 await：tick 一旦落在那个窗口里就会把槽抹掉，
+        # 一次 override 平仓被随机地记成普通 `agent`，X-9 的账本从「系统性高估」变成「随机漏记」。
+        if before.armed and not self._exit_commit.armed:
+            self._pending_exit_priority = None
+        if not self._exit_commit.armed:
+            return
+        now_wall = time.time()
+        if not exit_should_retry(self._exit_commit, self._exit_commit_rule,
+                                 position_side=self.executor.projected, epoch=epoch,
+                                 now_wall=now_wall, resting_close=self._resting_close()):
+            return
+        ts = int(now_wall)
+        px = self._current_px()
+        events = await self._apply_exit_commitment(px, ts)
+        if events is None:
+            return                               # 取锁期间局面已变（复检失败），静默返回
+        await self._dispatch(events)             # ← 落库 / 打 exitSource / 喂经验层 / 推 WS
+        await self._push_status_if_side_changed()
+        await self._report_exit_commitment(events, ts, now_wall)
+
+    async def _apply_exit_commitment(self, px: float, ts: int) -> list[dict] | None:
+        """经 `_exec_lock` 走 executor 的**唯一**平仓路径重下市价单；取锁后局面已变 ⇒ `None`。
+
+        绝不新增下单写路径（X-3）：与 `_apply_profit_exit` 逐字同款，`order_plan` 恒 `None`
+        ⇒ 市价 ⇒ `_do_close` 的既有 F-4 放行分支接手。
+        """
+        signal = Signal(side="close", reason=self._exit_commit.reason_code or "exit_commitment")
+        signal.explain = self._ai_explain(
+            "close", "离场意图兑现：按本会话已确认的离场决定重新下发市价平仓",
+            None, self._board_digest())
+        async with self._exec_lock:
+            if not self.is_active or self.executor.projected == "flat":
+                return None
+            events = await self.executor.apply([signal], ref_px=px,
+                                               bar_index=self._last_bar_index, ts=ts)
+            events += await self.executor.reconcile(px, ts)
+        return events
+
+    async def _report_exit_commitment(self, events: list[dict], ts: int,
+                                      now_wall: float) -> None:
+        """以 `close` 成交事件为**唯一**完成判据（与 `_report_profit_exit` 同构）。"""
+        filled = _has_close_fill(events)
+        error = next((str((e.get("data") or {}).get("message") or "")
+                      for e in events if e.get("type") == "error"), None)
+        before = self._exit_commit
+        self._exit_commit = exit_note_attempt(before, self._exit_commit_rule,
+                                              now_wall=now_wall, filled=filled, error=error)
+        if filled:
+            return
+        state = self._exit_commit
+        if state.stuck and not before.stuck:
+            await self._push({"type": "error", "data": {
+                "ts": int(ts), "code": EXIT_STUCK_CODE,
+                "message": (f"离场已尝试 {state.attempts} 次仍未成交，已停止自动重试；"
+                            "交易所侧止盈止损仍生效，可在面板上使用「立即离场」")}})
+            return
+        await self._push({"type": "status", "data": {
+            **self._status_payload(),
+            "message": (f"Agent 已确认离场但本次平仓未成交（第 {state.attempts} 次），"
+                        "将在下一次盯市重试（交易所侧止盈止损仍生效）")}})
+
+    def _consume_exit_source(self, explain: dict) -> str:
+        """退出来源：**一次性槽**优先（【R:P0-6】），其余一律走既有 `classify_live`。
+
+        槽只对 `kind == "atomic"` 的 close 生效（保护层的 `profit_guard`、OCO 的 `external_close`、
+        会话停止的 `session_stop` 一律不认它），且**消费即清空**——`_inject_explain_meta` 跑在
+        `_dispatch` 的**每一条**成交事件上（含限价平仓在后续盯市 tick 上被异步采纳的那一笔），
+        槽若不随本次 close 清空，一次 override 之后的下一笔**任意**平仓都会被记成 `agentOverride`。
+        """
+        level = self._pending_exit_priority
+        self._pending_exit_priority = None
+        if level and explain.get("kind") == "atomic":
+            return EXIT_SOURCE_AGENT_OVERRIDE
+        return classify_live(explain)
 
     # ---------- 暂停 / 继续（ai-trade-pause-resume §3.1.3 / §3.1.4）----------
     async def pause(self, reason: str = "user", *, flatten: bool = False) -> dict:
@@ -703,6 +923,10 @@ class AiTradeSession:
         self.state = "paused"                                    # ①
         self.pause_reason = reason
         self.paused_ts = int(time.time())
+        # 【R:P0-6】退出归因的一次性槽在暂停时**无条件作废**：暂停是一次用户动作，此后任何一笔
+        # 平仓都不该继承暂停之前那一轮的档位。方向安全——最坏是把一笔本该记 `agentOverride` 的
+        # 兑现少记一次（X-9 怕的是系统性**高估**，不是少记）。
+        self._pending_exit_priority = None
         async with self._exec_lock:                              # ②
             pass
         self._cancel_task("_decision_task")                      # ③
@@ -1046,11 +1270,14 @@ class AiTradeSession:
         await self._check_staleness(now_ts)
         self._degraded_seen = (self._degraded_seen or self.executor.degraded
                                or self._stale_degraded)
+        # ★ W-6 离场意图兑现（exit-priority §4.5.2）：排在 `executor.reconcile` 之后（挂单状态在
+        # 那里收敛）、利润保护**之前**——Agent 已经确认离场的仓位不该再等一次保护层判定。
+        await self._settle_exit_commitment()
         # 利润保护先于会话止盈（§2.5）：一次保护性平仓可能正好把会话累计盈亏推过 TP，随后
         # `_maybe_session_exit` 自然停会话；反序则会先停会话、保护层再无机会锁住这笔利润。
         await self._maybe_profit_exit(now_ts)
         # 持仓周期快照随盯市推进（面板 chip 的倒计时在无决策轮时也要动；纯同步、不判定、不平仓）。
-        self._horizon.refresh(self._horizon_facts(time.time()))
+        self._attach_exit_wires(self._horizon.refresh(self._horizon_facts(time.time())))
         await self._expire_profit_cooldown()
         await self._maybe_session_exit(mark, now_ts)
         # §3.1：网络 IO 只跑在盯市 tick 上；三条刷新（资金费率 / 官方费率 / 交易所对账）离开
@@ -1312,10 +1539,17 @@ class AiTradeSession:
             # 就会把 close 意图的连续性洗掉、G2 永远数不到 2。
             self._horizon.note_intent(decision.action, degrade, now_wall=time.time(),
                                       position_side=self.executor.projected)
+            # ★ W-2 离场优先级（exit-priority §4.1）：纯同步，落在账本推进**之后**、门禁**之前**
+            # ——三闸的解闸集合正来自它。反思之后可能按复核官裁决重算一次最终档位（W-4b）。
+            self._resolve_exit_priority(decision)
             decision, degrade = await self._apply_base_rule_gate(
                 round_no, ts, payload, decision, degrade)
+            # F-2 留存点（【R:P2-7】）：取**进入 `_apply_horizon_gate` 那一刻**的引用——该函数返回
+            # 时 decision 已被 `_veto` 换成一个新建的 hold 对象，调用点再也拿不回原来的 close。
+            gate_entry = decision
             # ★ 持仓周期铁律门禁（holding-horizon §2.5）：基础策略**之后**、冷却**之前**。
-            decision, degrade = await self._apply_horizon_gate(round_no, ts, decision, degrade)
+            decision, degrade, pending = await self._apply_horizon_gate(
+                round_no, ts, decision, degrade)
             # ★ 利润保护冷却门禁（adaptive §2.2.2）：铁律后、共识前（见 _apply_profit_cooldown_gate）。
             decision, degrade = self._apply_profit_cooldown_gate(decision, degrade)
             # ★ 换手纪律 G4/G5 与兜底覆盖 G6（turnover-budget §2.2.5）：冷却后、仓位/刹车前。
@@ -1333,9 +1567,16 @@ class AiTradeSession:
             # 二次反思（ReAct 复核，仅交易意愿触发；只会更保守）——共识门禁后、真实执行前。
             # F2（hold-inertia-fix）：第三元 reflection_note 保真「提议了什么、为何被否决」。
             decision, degrade, reflection_note = await self._reflect_before_execute(
-                round_no, ts, payload, decision, degrade)
+                round_no, ts, payload, decision, degrade, pending=pending)
             decision = await self._apply_sizing(round_no, ts, ref_px, decision)   # ★ 第 11 步
+            # ★ 档位定型（X-9）：计数 + 退出归因打标槽，**必须在真实执行之前**——打标由
+            # `_inject_explain_meta` 在 `_dispatch` 的成交事件上消费。
+            self._note_exit_priority_round()
             executed = await self._execute_decision(decision, ref_px, i, ts)
+            # F-4 的另一半：「提议了平仓、也放行了，但挂单槽位没腾出来所以本轮什么都没平」此前
+            # 是一条完全静默的路径（无成交、无降级码）。合成仍遵循「先执行者胜出」。
+            degrade = degrade or executed.get("closeBlocked")
+            self._arm_exit_commitment(decision, executed)          # ★ W-5
             self._discipline.funnel.note_executed(decision.action, bool(executed.get("skipped")))
             self._cost.note_round(bool(executed.get("traded")))          # §6.3 决策转化率
             self.rounds_completed = round_no
@@ -1345,10 +1586,13 @@ class AiTradeSession:
             # R-P1-3：commit_round 收门禁后的最终 decision，journal/摘要据此记真实动作（保持上下文纯净）。
             # D-5：`defer_summary=True` ⇒ 到期只记账，真正的 LLM 调用挪到 `_emit_decision` 之后
             # （否则「成交已发生、决策已完成」之后界面上的决策事件还要再等最多一个摘要超时才出现）。
-            summary = await self.decider.commit_round(payload, decision, executed,
-                                                      analysis=excerpt, reflection=reflection_note,
-                                                      defer_summary=True)
-            await self._emit_tool_call_trace(round_no, ts, decision)
+            summary = await self.decider.commit_round(
+                payload, decision, executed, analysis=excerpt, reflection=reflection_note,
+                # F-2：门禁否决轮也要留注记，否则模型下一轮读到的自己的历史是「上轮我决定观望」。
+                gate_veto=build_gate_veto_note(gate_entry, self._horizon.last_reason,
+                                               self._exit_priority),
+                defer_summary=True)
+            await self._emit_tool_call_trace(round_no, ts, decision, gate_entry)
             await self._emit_result_trace(round_no, ts, executed, degrade)
             reflection_verdict, reflection_reason = self._round_reflection_summary()
             await self._emit_decision(round_no, ts, decision, board, executed,
@@ -1464,14 +1708,26 @@ class AiTradeSession:
 
     # ---------- 下单前二次反思编排（ai-trade-pre-trade-reflection §2.3；精简，装配下沉 trace.py）----------
     async def _reflect_before_execute(self, round_no: int, ts: int, payload: dict,
-                                      decision: TradeDecision, degrade: str | None
+                                      decision: TradeDecision, degrade: str | None, *,
+                                      pending: bool = False
                                       ) -> tuple[TradeDecision, str | None, dict | None]:
         """交易意愿决策在真实下单前经一次独立反思复核（只会更保守）；hold/撤单/关闭反思时原样直通。
 
         返回三元组 `(final, degrade, reflection_note)`（hold-inertia-fix F2）：第三元为
         `build_reflection_note` 注记（直通分支为 None），由 `_run_decision_round` 透传给
         `commit_round`，使 journal/摘要素材保真「曾提议开仓但被否决」。
+
+        `pending`（exit-priority §4.4.2）：本轮是被持仓周期层**挂起待裁决**的离场提议——复核官的
+        裁决直接决定它是否执行（`confirm` ⇒ 档位升为 `adjudicated`；真实 `abort` ⇒ 降级 hold 且
+        `degrade` 取**原门禁码**而非 `reflection_abort`，因为用户此刻最需要知道的是「差几轮确认」）。
         """
+        # X-5：`override` 级离场**跳过反思**——它的前置条件已经包含跨多轮的持续意图与显式证据，
+        # 而复核官是**无状态单轮**调用（`decider.reflect` 明确不拼 `_context`），让它去推翻一个
+        # 它看不见的跨轮账本，是用更弱的证据推翻更强的证据。副作用是省一次 LLM 调用。
+        if (self._exit_priority is not None
+                and self._exit_priority.level == LEVEL_OVERRIDE
+                and decision.action == "close"):
+            return decision, degrade, None
         # F-7（ai-trade-limit-orders-fix §2.8）：cancel_order 与 hold 同列直通——反思宪章是「下单前
         # 二次复核」，撤单不产生任何委托（order_plan 恒 None）、本身即风险收敛动作；拦截它反而反保守
         # （abort/fail-closed 会把撤单降级 hold，挂单敞口多活到 TTL）。勿回改为单值门控。
@@ -1485,9 +1741,60 @@ class AiTradeSession:
         self._experience.inject_reflection(payload, decision)
         verdict = await self.decider.reflect(
             payload, decision, emit=self._make_trace_emit(round_no, ts))
-        final, new_degrade = apply_reflection(decision, degrade, verdict, self.decider.position_step)
+        final, new_degrade, fail_open = apply_reflection(
+            decision, degrade, verdict, self.decider.position_step,
+            fail_open_actions=self._exit_fail_open_actions())
+        if fail_open is not None:
+            self._note_exit_fail_open(fail_open)
+        final, new_degrade = self._settle_pending_exit(final, new_degrade, verdict,
+                                                       pending=pending)
         await self._emit_reflection_verdict_trace(round_no, ts, verdict, decision, final)
-        return final, new_degrade, build_reflection_note(decision, verdict, final)
+        return final, new_degrade, build_reflection_note(
+            decision, verdict, final, pending_exit=self._pending_exit_note(pending))
+
+    def _pending_exit_note(self, pending: bool) -> dict | None:
+        """挂起轮的记忆注记断面（§4.4.2）；非挂起轮 ⇒ `None` ⇒ journal 形状与今天逐字相同。
+
+        挂起现在**只可能**由「账本还不够厚」触发，故断面里带的正是那一项的读数——复核官被请来
+        替代的到底是哪一个合取项，事后必须能查（`_context` 会被滚动摘要重置，注记不会）。
+        """
+        priority = self._exit_priority
+        if not pending or priority is None or not priority.wire:
+            return None
+        return {"gateReason": self._horizon.last_pending_reason,
+                "intentStreak": priority.wire.get("intentStreak"),
+                "overrideRounds": priority.wire.get("overrideRounds")}
+
+    def _exit_fail_open_actions(self) -> tuple[str, ...]:
+        """X-6：`close` 的反思 fail-closed 反转为 fail-open；总闸关 ⇒ `()` ⇒ 逐字回退（C-8）。
+
+        一次 LLM 超时（最坏 3 × 45s）不该锁死一笔真实持仓——`hold_horizon.py` 的模块头早已把这条
+        纪律写成不变式（「任何『算不出 ⇒ 不许平仓』的设计都会在断网 / 暖机 / 脏数据的瞬间把一笔
+        真实持仓锁死」），只是在 `reflection.py` 那一侧被写反了。
+        """
+        return (("close",)
+                if self.executor.settings.ai_trade_exit_reflection_fail_open else ())
+
+    def _settle_pending_exit(self, decision: TradeDecision, degrade: str | None, verdict, *,
+                             pending: bool) -> tuple[TradeDecision, str | None]:
+        """`pendingExit` 轮的裁决映射（§4.4.2）；非挂起轮原样透传。
+
+        **只有 `confirm` 才重算为 `adjudicated`**（`verdict.degrade_reason is None` 即模型真的作了
+        一次裁决）：基础设施失败那一支同样放行（X-6），但它**不是背书**，故档位不升、配额不扣，
+        事实只挂 `exitPriority.failOpenReason` 与 `exitFailOpenRounds` 单独记账。勿把两支合并——
+        那等于让一次超时冒充一次复核官签字。
+
+        真实 `abort` ⇒ 降级 hold，`degrade` 取**原门禁码**：用户此刻最需要知道的是「差几轮确认」，
+        而不是「复核官不同意」——后者进注记与轨迹的反思段，两者都不丢。
+        """
+        if not pending:
+            return decision, degrade
+        gate_reason = self._horizon.last_pending_reason
+        if decision.action == "close":
+            if verdict is not None and verdict.degrade_reason is None:
+                self._adjudicate_exit_priority()
+            return decision, degrade
+        return decision, (gate_reason or degrade)
 
     async def _begin_reflection_trace(self, round_no: int, ts: int,
                                       decision: TradeDecision) -> None:
@@ -1501,13 +1808,17 @@ class AiTradeSession:
                                              final: TradeDecision) -> None:
         """reflection_verdict：落裁决/理由/实际收缩后仓位并清在飞指示（装配走 trace.py builder，RV-2）。"""
         adjusted = applied_shrink(original, final)
+        # exit-priority §6.3：最终档位（含 `adjudicated` / `failOpenReason`）搭既有相位的车，
+        # **不新开 `exit_priority` 相位**——那会把前端手抄面从一处扩到四处（R-9）。
+        exit_wire = (self._exit_priority.wire or None) if self._exit_priority else None
         trace = self._round_trace
         if trace is not None:
             trace["reflectionVerdict"] = verdict.verdict
             trace["reflectionReason"] = verdict.reason
             trace["reflectionAdjustedSize"] = adjusted
             trace["reflectionPending"] = False
-        await self._push(reflection_verdict_event(round_no, ts, verdict, adjusted))
+            trace["exitPriority"] = exit_wire
+        await self._push(reflection_verdict_event(round_no, ts, verdict, adjusted, exit_wire))
 
     def _round_reflection_summary(self) -> tuple[str | None, str | None]:
         """从在飞轮次取本轮反思裁决/理由（供 decision 事件搭顺风车；hold/关闭轮为 (None, None)）。"""
@@ -1556,17 +1867,34 @@ class AiTradeSession:
         trace["retries"] = int(trace.get("retries", 0)) + 1
         trace["lastRetryReason"] = part.get("reason")
 
-    async def _emit_tool_call_trace(self, round_no: int, ts: int,
-                                    decision: TradeDecision) -> None:
-        """tool_call：门禁后最终决策工具入参（与真实执行一致，降级则如实呈现 hold）。"""
+    async def _emit_tool_call_trace(self, round_no: int, ts: int, decision: TradeDecision,
+                                    proposed: TradeDecision | None = None) -> None:
+        """tool_call：门禁后最终决策工具入参（与真实执行一致，降级则如实呈现 hold）。
+
+        F-6：三个**加法键**保真「模型提议了什么、被谁拦下」。原来的卡片只显示「决策工具 · 观望」
+        ——「与真实执行一致」是对的，「如实」不是：模型提交的入参是 `close`，用户唯一能看到的
+        线索是折叠在下面的一行降级码。三键作为 `trace_event` 的**兄弟键**下发，**不塞进 `input`**
+        （`input` 的语义是「模型提交的工具入参」，掺进非入参的键会让卡片本身开始撒谎）。
+        `proposed is None` / 未被拦 ⇒ 三键为 `None` ⇒ 前端逐字节回退（老快照零影响）。
+        """
         tool_input = {"action": decision.action, "sizeFraction": decision.size_fraction,
                       "confidence": decision.confidence, "reason": decision.reason,
                       "orderType": decision.ord_type, "limitPrice": decision.limit_px}
+        # 作用域钉死在**本层**：`vetoedBy` 只会是 `"horizon"`，故判据也必须是「本层真的拦了」。
+        # 反思否决另有 `reflection_verdict` 相位承载，混进来会让卡片说「被交易周期层降级」而其实
+        # 不是——那是本轮要根除的同一种不诚实，只是换了个方向。
+        vetoed = (proposed is not None and proposed.action != decision.action
+                  and self._horizon.last_reason is not None)
+        extra = {"proposedAction": proposed.action if vetoed else None,
+                 "proposedReason": (str(proposed.reason or "")[:_ANALYSIS_EXCERPT_CHARS]
+                                    if vetoed else None),
+                 "vetoedBy": "horizon" if vetoed else None}
         if self._round_trace is not None:
             self._round_trace["toolCall"] = tool_input
             self._round_trace["toolCallPending"] = False
+            self._round_trace.update(extra)
         await self._push(trace_event("tool_call", round_no, ts,
-                                     name=DECISION_TOOL_NAME, input=tool_input))
+                                     name=DECISION_TOOL_NAME, input=tool_input, **extra))
 
     async def _emit_result_trace(self, round_no: int, ts: int, executed: dict,
                                  degrade: str | None) -> None:
@@ -1649,25 +1977,128 @@ class AiTradeSession:
                                                            BAR_SECONDS[self.bar]))
 
     async def _apply_horizon_gate(self, round_no: int, ts: int, decision: TradeDecision,
-                                  degrade: str | None) -> tuple[TradeDecision, str | None]:
+                                  degrade: str | None
+                                  ) -> tuple[TradeDecision, str | None, bool]:
         """薄封装 `HorizonRuntime.gate`（§2.5）；未装配 ⇒ 原样直通、零轨迹。
 
         [P1-7] 断面在此**重新采集**（payload 那一份隔着一次完整 LLM 调用），方向安全：两次之间只有
         时间向前流逝。轨迹取 `last_reason` 而非合成 `degrade`——后者先手胜出会把本层的码吞掉。
+
+        Returns:
+            `(decision, degrade, pending)`——第三元为真表示本轮**挂起待裁决**（exit-priority
+            §4.4.1）：decision 保持 `close` 继续下行，本层**不 veto、不写 `degrade`**。
         """
         if self.horizon_rule is None:
-            return decision, degrade
-        decision, degrade, snap = self._horizon.gate(decision, degrade,
-                                                     self._horizon_facts(time.time()))
-        self._round_horizon = snap
+            return decision, degrade, False
+        decision, degrade, snap, pending = self._horizon.gate(
+            decision, degrade, self._horizon_facts(time.time()),
+            priority=self._exit_priority)
+        self._round_horizon = self._attach_exit_wires(snap)
         reason = self._horizon.last_reason
+        if pending:
+            self._mark_exit_pending(self._horizon.last_pending_reason)
         status = horizon_gate_status(snap, reason)
         apply_horizon_trace(self._round_trace, snap, status, reason)
         await self._push(horizon_event(round_no, ts, snap, status, reason))
         if self._horizon.released_streak == _HORIZON_RELEASED_ALERT_ROUNDS:
             await self._push(horizon_released_event(ts, self._horizon.released_streak,
                                                     (snap or {}).get("releaseReason")))
-        return decision, degrade
+        return decision, degrade, pending
+
+    # ---------- 离场优先级（exit-priority 轴 B；判定全在纯核心，此处只做装配与记账）----------
+    def _resolve_exit_priority(self, decision: TradeDecision) -> None:
+        """★ W-2：算本轮离场优先级（纯同步）；未装配 ⇒ 恒 `normal` 且 wire 整键缺席。
+
+        `hold_seconds` 现算而不读快照：快照是 round-start 采的，隔着一次完整 LLM 调用，用它判
+        60 秒绝对地板会系统性偏松（[P1-7] 的双快照纪律在这一侧同样成立）。
+        """
+        state = self._horizon.state
+        hold_s = (max(0.0, time.time() - float(state.opened_wall)) if state.epoch else 0.0)
+        self._exit_input = ExitPriorityInput(
+            action=decision.action, position_side=self.executor.projected,
+            gate_reverse=bool(getattr(self.horizon_rule, "gate_reverse", True)),
+            conviction=decision.exit_conviction, evidence=decision.exit_evidence,
+            intent_streak=int(state.exit_confirm_streak),
+            intent_lapses=int(state.exit_intent_lapses),
+            hold_seconds=hold_s, overrides_used=int(self._horizon.exit_overrides_used))
+        priority = resolve_exit_priority(
+            self._exit_input, getattr(self.horizon_rule, "exit_priority", None))
+        if priority.may_pend and not self.decider.reflection_enabled:
+            # 没有复核官就没有裁决：挂起会退化成「`ledger_short` 一律放行」，即绕过账本门槛本身
+            # （spec 未覆盖「反思整层关闭」这一路径，见 §十一 D-3）。
+            priority = replace(priority, may_pend=False)
+            priority.wire["mayPend"] = False
+        self._exit_priority = priority
+
+    def _mark_exit_pending(self, gate_reason: str | None) -> None:
+        """挂起轮的留痕：**只写 wire 与轨迹，绝不写 `degrade`**（§5.5：放行码不进闸计数）。"""
+        priority = self._exit_priority
+        if priority is None or not priority.wire:
+            return
+        priority.wire["pending"] = True
+        priority.wire["pendingReason"] = gate_reason
+
+    def _adjudicate_exit_priority(self) -> None:
+        """★ W-4b：复核官背书后**重跑同一个纯函数**取最终档位（§4.4.2）。
+
+        刻意不就地改 `level` 字符串：那会让 `released_gates` / `reason` / `wire` 三者分叉，而
+        trace、`aiStats.horizon.*`、退出归因三处读的正是它们。配额在 `note_exit_priority` 自增
+        之前已由 `may_pend` 判过一次（X-4b）。
+        """
+        if self._exit_input is None:
+            return
+        pending_reason = (self._exit_priority.wire or {}).get("pendingReason")
+        priority = adjudicate_exit_priority(
+            self._exit_input, getattr(self.horizon_rule, "exit_priority", None))
+        if priority.wire:
+            priority.wire["pendingReason"] = pending_reason
+        self._exit_priority = priority
+        # `adjudicate` 产出的是**新对象、新 wire dict**，而快照里还挂着裁决前那一份——不重挂，
+        # status 与下一轮 prompt 会显示一个比实际更低的档位（而这一轮其实是按更高优先级放行的）。
+        self._attach_exit_wires(self._round_horizon)
+
+    def _note_exit_priority_round(self) -> None:
+        """档位定型：计数 + 置退出归因的**一次性槽**（须在 `_execute_decision` 之前）。"""
+        priority = self._exit_priority
+        self._horizon.note_exit_priority(priority)
+        self._pending_exit_priority = (
+            priority.level if priority is not None
+            and priority.level in (LEVEL_OVERRIDE, LEVEL_ADJUDICATED) else None)
+
+    def _note_exit_fail_open(self, code: str) -> None:
+        """记一笔 fail-open 放行（【R:P1-3】：它**不进 `degrade`**，故必须有自己的落点与计数）。"""
+        self._horizon.note_exit_fail_open()
+        priority = self._exit_priority
+        if priority is not None and priority.wire:
+            priority.wire["failOpenReason"] = code
+
+    def _attach_exit_wires(self, snapshot: dict | None) -> dict | None:
+        """把 `exitPriority` / `exitCommitment` 挂进**快照**（未装配 / 未武装 ⇒ 整键缺席）。
+
+        挂在快照下而不是契约下，理由与 `turnover` / `backstop` 两键完全同款：嵌套即自动搭上
+        payload / decision / status / trace 四条既有载体（均为整对象透传），前端 `store.ts` 的
+        逐键手抄 reducer 一行都不必动。
+        """
+        if not snapshot:
+            return snapshot
+        priority = self._exit_priority
+        if priority is not None and priority.wire:
+            snapshot["exitPriority"] = priority.wire
+        wire = exit_commitment_wire(self._exit_commit, self._exit_commit_rule,
+                                    now_wall=time.time())
+        if wire is not None:
+            snapshot["exitCommitment"] = wire
+        return snapshot
+
+    def _exit_epoch(self) -> tuple[str, int] | None:
+        """离场意图的身份戳 `(side, seq)`——与持仓周期层 / 利润保护层**完全同源**。"""
+        side = self.executor.projected
+        return None if side not in ("long", "short") else (side, self._position_seq)
+
+    def _resting_close(self) -> bool:
+        """当前是否有**平仓**挂单在飞（轴 C 的第二层防线，【R:P0-3】）。"""
+        resting = self.executor.resting
+        return resting is not None and resting.intent == "close"
 
     async def _apply_edge_gate(self, round_no: int, ts: int, ref_px: float,
                                decision: TradeDecision, degrade: str | None
@@ -1739,13 +2170,15 @@ class AiTradeSession:
         signals = self._decision_to_signals(decision, board_digest=self._board_digest())
         if not signals:
             return {"ok": True, "action": decision.action, "skipped": False,
+                    "closedFilled": False,
                     "side": self.executor.projected, "qty": self.executor.entry_qty_sz,
                     "positionAfter": self.executor.projected}
         order_plan = decision_to_order_plan(decision)
         async with self._exec_lock:
             if self.state != "running":       # stop() 抢先置 stopped：本轮不再下单（避免停止竞态下多此一举的开仓+随即被 flatten 平掉，白付手续费）
                 return {"ok": True, "action": decision.action, "skipped": True,
-                        "reason": "stopped", "side": self.executor.projected,
+                        "reason": "stopped", "closedFilled": False,
+                        "side": self.executor.projected,
                         "qty": self.executor.entry_qty_sz,
                         "positionAfter": self.executor.projected}
             events = await self.executor.apply(signals, ref_px=ref_px, bar_index=i, ts=ts,
@@ -1755,7 +2188,15 @@ class AiTradeSession:
         self._cost.claim_estimate(self.executor.resting)   # [P0-2] 限价开仓单：估计随 clOrdId 冻结
         await self._push_status_if_side_changed()
         traded = any(e.get("type") == "trade" for e in events)
+        # 【R:P0-4】`closedFilled` 是轴 C 武装判据的**唯一**载体：`events` 是本函数的局部量、已在
+        # 内部 `_dispatch` 掉，调用点拿到的只有这个 dict——在 dict 上迭代 `type=="trade"` 永远迭
+        # 不出任何东西，那样写会得到一个恒成立的判据、每一轮 close 都武装。判据本身不变（以 close
+        # 成交事件为唯一成交判据，与 `_report_profit_exit` 同一条纪律），只是换了载体。
         return {"ok": True, "action": decision.action, "skipped": False, "traded": traded,
+                "closedFilled": _has_close_fill(events),
+                # §5.5：本轮**真的没平成**的原因码（`None` = 未发生）。它是降级码而非放行码——
+                # 一次没发生的平仓理应进闸计数，而这条路径此前完全静默。
+                "closeBlocked": self.executor.last_close_block,
                 "side": self.executor.projected, "qty": self.executor.entry_qty_sz,
                 "positionAfter": self.executor.projected}
 
@@ -1767,12 +2208,14 @@ class AiTradeSession:
         async with self._exec_lock:
             if self.state != "running":
                 return {"ok": True, "action": decision.action, "skipped": True,
-                        "reason": "stopped", "side": self.executor.projected,
+                        "reason": "stopped", "closedFilled": False,
+                        "side": self.executor.projected,
                         "qty": self.executor.entry_qty_sz,
                         "positionAfter": self.executor.projected}
             events = await self.executor.cancel_resting("agent", ts)
         await self._dispatch(events)
         return {"ok": True, "action": decision.action, "skipped": False, "traded": False,
+                "closedFilled": False,
                 "side": self.executor.projected, "qty": self.executor.entry_qty_sz,
                 "positionAfter": self.executor.projected}
 
@@ -2047,7 +2490,8 @@ class AiTradeSession:
         self._inject_profit_guard(payload)      # §2.6 b/d：未装配 ⇒ 整键缺席 ⇒ prompt 逐字回退
         # 持仓周期段（§2.4 双快照契约）：这是 **round-start** 那一份（带 asOfWall），只喂 prompt；判定
         # 另在 gate 里重采。须在 `_inject_profit_guard` 之后——它顺带给保护快照打 `horizonArmed` 标记。
-        self._horizon.inject(payload, self._horizon.refresh(self._horizon_facts(time.time())))
+        self._horizon.inject(payload, self._attach_exit_wires(
+            self._horizon.refresh(self._horizon_facts(time.time()))))
         self._sizing.inject(payload)            # 同款「整键缺席」范式（vol-sizing §3.8）
         priors = self._prior.build(board, payload.get("marketContext"),
                                    self._window.base_df())
