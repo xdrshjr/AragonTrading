@@ -327,3 +327,154 @@ async def test_a_failing_stream_handler_never_kills_the_connection():
     await _run_briefly(sup, 0.1)
 
     assert factory.calls == 1
+
+
+# ---------------- ⑥ 通道级数据静默（ai-trade-feed-self-healing 轴 A） ----------------
+class _PongOnlyConn:
+    """健康的握手、健康的订阅确认、健康的心跳应答，**一帧业务数据都不来**。
+
+    这正是本轮要抓的那一形态，也是「K 线断连 21 小时而系统毫无反应」的现场原型：`last_inbound`
+    被 `pong` 一直刷新，于是既有的 `silence_timeout` 永远不会命中。
+    """
+
+    def __init__(self, frames: list[str] | None = None):
+        self.sent: list[str] = []
+        self.closed = False
+        self._queue: asyncio.Queue = asyncio.Queue()
+        for frame in frames or [_ACK]:
+            self._queue.put_nowait(frame)
+
+    async def __aenter__(self) -> "_PongOnlyConn":
+        return self
+
+    async def __aexit__(self, *_exc) -> bool:
+        return False
+
+    async def send(self, payload: str) -> None:
+        self.sent.append(payload)
+        if payload == "ping":
+            self._queue.put_nowait("pong")     # 心跳一直是健康的
+
+    async def recv(self) -> str:
+        return await self._queue.get()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _DataDripConn(_PongOnlyConn):
+    """心跳照回，且每隔一小段真的推一帧业务数据 —— 这条连接必须活下来。"""
+
+    def __init__(self, interval_s: float):
+        super().__init__()
+        self._interval = interval_s
+        self._task: asyncio.Task | None = None
+
+    async def __aenter__(self) -> "_DataDripConn":
+        self._task = asyncio.create_task(self._drip())
+        return self
+
+    async def __aexit__(self, *_exc) -> bool:
+        if self._task is not None:
+            self._task.cancel()
+        return False
+
+    async def _drip(self) -> None:
+        while True:
+            await asyncio.sleep(self._interval)
+            self._queue.put_nowait(_DATA)
+
+
+def _silent_settings(**over) -> Settings:
+    """数据静默预算夹到 0.1 秒（下界=上界），其余阈值沿用既有极小值。"""
+    base = dict(okx_link_ws_data_silence_factor=1.0, okx_link_ws_data_silence_min_s=0.1,
+                okx_link_ws_data_silence_max_s=0.1)
+    base.update(over)
+    return _settings(**base)
+
+
+async def test_pong_alone_does_not_keep_a_data_silent_channel_alive():
+    """**本轮的核心资产**：心跳健康、订阅已确认、频道零数据 ⇒ 仍被判失活并重连。
+
+    第二段是反证：把 `factor` 设成 0（整条判据关闭）之后，**同一个替身**跑满一整个
+    `silence_timeout` 都不会被换掉——那正是本特性合入之前的行为，也正是「21 小时无人过问」的
+    机理本身。
+    """
+    conns = [_PongOnlyConn() for _ in range(6)]
+    factory = _Factory(conns)
+    events: list[StreamEvent] = []
+    sup = _make(_silent_settings(), factory, events)
+
+    snapshot = await _run_briefly(sup, 0.4)
+
+    assert factory.calls >= 2, "数据静默的连接必须被判失活并重连"
+    assert conns[0].closed is True
+    row = snapshot["channels"][0]
+    assert row["lastErrorCode"] == "WS_DATA_SILENCE"
+    assert "订阅频道长时间无数据" in row["lastErrorMessage"]
+
+    # 反证：关掉这条判据 ⇒ 同一个替身长命百岁（`silence_timeout` 被 pong 刷成永不命中）。
+    forever = [_PongOnlyConn() for _ in range(6)]
+    forever_factory = _Factory(forever)
+    sup2 = _make(_silent_settings(okx_link_ws_data_silence_factor=0.0), forever_factory, [])
+    await _run_briefly(sup2, 0.4)
+    assert forever_factory.calls == 1, "关掉判据后这类断线确实永远不会被重连（合入前的行为）"
+
+
+async def test_data_frames_refresh_the_data_clock_but_pongs_do_not():
+    """`last_data` 只被业务数据帧刷新——这正是它与 `last_inbound` 的**全部**差别。"""
+    alive = [_DataDripConn(0.03) for _ in range(4)]
+    alive_factory = _Factory(alive)
+    sup = _make(_silent_settings(), alive_factory, [])
+
+    await _run_briefly(sup, 0.4)
+
+    assert alive_factory.calls == 1, "还在送数据的连接绝不许被数据静默判据拆掉"
+
+
+def test_data_silence_budget_is_clamped_by_bar_seconds():
+    """按算式实算，不是按直觉：`bar >= 15m` 一律落上界（**不是** `bar_seconds` 本身）。
+
+    这不是缺陷：candle 频道推的是**未确认根**，推送密度只与成交密度相关、与 K 线周期无关，
+    故上界是一条与周期无关的绝对静默上限；`bar_seconds` 派生只在 1m～15m 区间真正起作用。
+    """
+    from dataclasses import replace
+
+    def budget(bar_seconds: int, **over) -> float:
+        cfg = replace(_CFG, bar_seconds=bar_seconds)
+        sup = WSSupervisor(cfg, settings=_settings(**over), connect_factory=_Factory([]),
+                           on_raw=_noop_raw, on_stream=_noop_events)
+        return sup._data_silence_budget()
+
+    assert budget(0) == 120.0          # public 端点 ⇒ 下界
+    assert budget(60) == 120.0         # 1m ⇒ 下界
+    assert budget(300) == 300.0        # 5m ⇒ 原值
+    assert budget(900) == 900.0        # 15m ⇒ 恰好上界
+    assert budget(3600) == 900.0       # 1H ⇒ **上界**，不是 3600
+    assert budget(86400) == 900.0      # 1D ⇒ 上界
+    assert budget(3600, okx_link_ws_data_silence_factor=0.0) == 0.0    # 关得掉的取值
+
+
+async def test_data_silence_reconnect_emits_a_full_down_to_live_cycle():
+    """顺带修复 RC-5：一次数据静默重连会走完整的 `degraded → connecting → subscribing → live`，
+    于是 `SessionLink._on_recovered` 得到重试机会，缺根补齐。**轴 A 不需要为补根写一行新代码。**"""
+    factory = _Factory([_PongOnlyConn(), _Conn([_ACK, _DATA])])
+    events: list[StreamEvent] = []
+    sup = _make(_silent_settings(), factory, events)
+
+    await _run_briefly(sup, 0.4)
+
+    states = [e.state for e in events]
+    assert states[:1] == ["connecting"]
+    for expected in ("subscribing", "degraded", "connecting", "subscribing", "live"):
+        assert expected in states, f"缺少 {expected} 迁移：{states}"
+    live = next(e for e in events if e.state == "live")
+    assert live.downtime_s > 0, "回到 live 必须结算本次断开时长（补根判据读的正是它）"
+
+
+async def _noop_raw(_raw: str) -> None:
+    return None
+
+
+async def _noop_events(_event: StreamEvent) -> None:
+    return None

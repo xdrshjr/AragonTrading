@@ -14,6 +14,10 @@
 新鲜度豁免的唯一真源——补根若照抄 `feed_candle` 的确认根分支，一次 10 分钟断线之后保护层会认为
 判定价是「0 秒前的」，据此执行棘轮与兑现。同一形状的坑上一轮已在 `ai-trade-profit-protection`
 的 D-1 付过一次代价。`live_auto` 的 `_last_candle_wall` 同理（它是行情停滞看门狗的基准）。
+
+**唯一的例外是 `ingest_ai_auto_live`（feed-self-healing 轴 B）**：那条路径取的是「最新一根」，
+拿到的**可能**是当下的证据。它是一个**独立函数**而不是本函数的一个 flag，理由见它自己的
+docstring——两种证据性质不同，合并的那一天禁令就会在新通道上被绕过。
 """
 from __future__ import annotations
 
@@ -65,6 +69,10 @@ async def ingest_ai_auto(session, candles: list[Candle]) -> int:
     禁写四字段见模块 docstring。`_atr_px` 与 `_wake.note_atr(...)` 必须**同进同出**：
     `session.py:658-660` 的注释写明「ATR 判据与参照断面共用这一个数（唯一入口）」，
     只刷前者会把这个唯一入口劈成两份，唤醒器据旧 ATR 判定。
+
+    **欠账（feed-self-healing 评审 R:P2-6）**：本函数同样**不逐根步进影子**，故一次补根之后的
+    信号板是跳根算出来的。这是既有缺陷、不在那一轮的范围内；`ingest_ai_auto_live` 新增的
+    `session.note_live_bar(...)` 逐根回调可以直接复用到这条路径上，修的时候不必再造一遍。
     """
     from ..ai_auto.profit_guard import safe_atr
 
@@ -83,6 +91,88 @@ async def ingest_ai_auto(session, candles: list[Candle]) -> int:
     session._sizing.note_candles([c["c"] for c in session._window.candles],
                                  int(candles[-1].ts))
     return appended
+
+
+async def ingest_ai_auto_live(session, candles: list[Candle], *, bar_seconds: int,
+                              now_wall: float) -> dict:
+    """ai_auto 的**活性补取**入窗（ai-trade-feed-self-healing §3.3.2）。
+
+    与 `ingest_ai_auto`（断线补根）**刻意分成两个函数**，两者的差别只有一条：这里补进来的最后一根
+    有可能是「刚刚收线的那一根」，即**当下的证据**；而断线补根拿到的一律是历史证据。禁写四字段的
+    纪律（见模块 docstring）针对的是后者，故这里必须是两个函数、两条注释，**绝不复用同一个 ingest**
+    ——有人「顺手统一」它们的那一天，断线后的 Agent 会拿 21 小时前的价对真实资金下单。
+
+    做的三件事：
+
+    · **每一根**（含最后一根）都走 `session.note_live_bar(...)` 逐根步进影子。
+      **不可只在最后一根算一次信号板**：`evaluate_signal_board` 是有状态的逐根回放（`signals.py`
+      的 docstring 自己写着「暖机段调用本函数但丢弃返回值，仅为逐根种入影子与策略内部状态」），
+      跳根算出来的 `_last_board` 是一份**被悄悄改写过的立场**，而墙钟定时唤醒会拿它去起真实资金
+      决策。帧只建一次、索引逐根前移（与 `session._prime()` 的因果帧假设逐字同源）——`prepare`
+      是因果的，故批量建帧在索引 i 上的取值与「喂到第 i 根时建帧」相同，而逐根建帧会在补 300 根
+      时把 5 秒的盯市 tick 拖垮。
+    · 除最后一根外的所有根 ⇒ 逐字走 `ingest_ai_auto` 的既有语义（只进窗、刷 ATR / sizing、推
+      candle，**不写四个墙钟字段、不 note_new_bar、不驱动决策**）。
+    · 最后一根**若且仅若** `now_wall - (ts + bar_seconds) <= bar_seconds` 才写四个墙钟字段并
+      `note_new_bar()`。判据收紧到**一根**（不是 `stale_after_s` 的三根）：REST 健康时最新已收线根
+      的年龄天然小于一根，用三根的容差只会把「行情真的停了」误判成「我刚拿到数据」。
+
+    **写值口径（绝不可简化成两个 `now_wall`）**：
+
+        _last_candle_wall = now_wall          # 语义 = 「我最后一次拿到当下这一根的时刻」
+        _last_px_wall     = ts + bar_seconds  # 语义 = 「这个价**真**的那一刻」
+
+    两者语义不同，取值也必须不同。`_last_px_wall` 是利润保护层新鲜度豁免的唯一真源
+    （`ProfitGuardRule.max_px_age_s = 90.0`）——把它写成 `now_wall` 等于告诉保护层「这个价是 0 秒
+    前的」，据此对真实资金执行棘轮与兑现。`ts + bar_seconds` 让 `px_age_s` 恰好等于真实价龄：价真的
+    新 ⇒ 保护层照常工作；价其实旧 ⇒ 保护层自己判 `unavailable` 并零动作（fail-open），**不需要本层
+    替它做任何决定**。
+
+    最后一根**不新鲜** ⇒ 一个字段都不写，`_stale_degraded` 保持为真。**诚实优先于自愈**：REST 也
+    拿不到当下的根，说明是真的行情中断 / 标的停牌 / 交易所故障，此时假装「我刚拿到数据」比什么都
+    不做更危险。
+
+    Args:
+        session: `AiTradeSession`。
+        candles: `gap_repair.fetch_missing` 取回的升序确认根（已过滤未收线根）。
+        bar_seconds: 基础周期秒数（新鲜判据与 `_last_px_wall` 的口径都用它）。
+        now_wall: 本次补取的墙钟秒（判定与写值共用同一个数，避免两处各读一次时钟）。
+
+    Returns:
+        `{"appended": int, "fresh": bool, "lastTs": int | None}` —— 会话侧据 `fresh` 决定要不要
+        解锁唤醒。`fresh` 为真**当且仅当**四个墙钟字段真的被写了。
+    """
+    from ..ai_auto.profit_guard import safe_atr
+
+    rows: list[dict] = []
+    for candle in candles:
+        if session._window.is_duplicate(candle):
+            continue
+        row = session._window.append_confirmed(candle)
+        rows.append(row)
+        await session._push({"type": "candle", "data": {**row, "confirm": True}})
+    if not rows:
+        return {"appended": 0, "fresh": False, "lastTs": None}
+    # 与 `ingest_ai_auto` 逐字同源：`_atr_px` 与 `_wake.note_atr(...)` 必须**同进同出**。
+    session._atr_px = safe_atr(session._window.base_df(),
+                               session.executor.settings.ai_trade_profit_guard_atr_period)
+    session._wake.note_atr(session._atr_px)
+    session._sizing.note_candles([c["c"] for c in session._window.candles],
+                                 int(rows[-1]["ts"]))
+    frames = session._window.build_strategy_frames()
+    first_index = session._window.cur_index() - len(rows) + 1
+    for offset, row in enumerate(rows):
+        session.note_live_bar(row, index=first_index + offset, frames=frames)
+    last = rows[-1]
+    last_ts = int(last["ts"])
+    fresh = (now_wall - (last_ts + bar_seconds)) <= bar_seconds
+    if fresh:
+        session._last_candle_wall = now_wall            # 「我最后一次拿到当下这一根的时刻」
+        session._last_px_wall = float(last_ts + bar_seconds)   # 「这个价**真**的那一刻」
+        session._last_live_px = float(last["c"])
+        session.executor.bar_anchor_ts = last_ts
+        session._wake.note_new_bar()
+    return {"appended": len(rows), "fresh": bool(fresh), "lastTs": last_ts}
 
 
 async def ingest_paper(session, candles: list[Candle]) -> int:

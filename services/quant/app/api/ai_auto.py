@@ -37,6 +37,7 @@ from ..ai_auto.experience import (
     resolve_experience,
     resolve_experience_settings,
 )
+from ..ai_auto.feed_runtime import AiTradeFeedSelfHealDisabled
 from ..ai_auto.hold_horizon import HorizonRule, resolve_horizon_rule
 from ..ai_auto.hold_horizon_profiles import profiles_wire
 from ..ai_auto.manager import (
@@ -435,6 +436,36 @@ async def ai_trade_member_exit(group_id: str, inst_id: str) -> dict:
     try:
         result = await get_ai_trade_manager().exit_member(group_id, inst_id)
     except AiTradeManualExitDisabled as exc:
+        raise HTTPException(409, detail={"code": exc.code, "message": exc.message}) from exc
+    if result is None:
+        raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "分组或成员不存在"})
+    return result
+
+
+@router.post("/ai-trade/{group_id}/member/{inst_id}/relink")
+async def ai_trade_member_relink(group_id: str, inst_id: str) -> dict:
+    """人工授权的**单次**强制重连 + REST 活性补取（ai-trade-feed-self-healing §4.2）。
+
+    语义：换一条新的 K 线 WS，再立刻取一次最新已收线根。**不停止会话、不平仓、不改分组生命周期**
+    （与 `/member/{inst}/exit`、`/backstop/repair` 的姿态同源）。它是本轮人机交互的兜底——自动阶梯
+    走到 `stuck` 之后，用户永远有一个不经模型、不停会话的重试按钮。
+
+    **刻意不守 AI 总闸**（`ai_trade_enabled`）：恢复观测是**收敛**风险的动作，任何时候都该能执行。
+    它守的是运维总闸 `ai_trade_feed_selfheal_enabled`（关 ⇒ 409 `AI_TRADE_FEED_SELFHEAL_DISABLED`）。
+
+    **交易所侧失败刻意不映射成 502**（与 `/exit` 同理）：会话层不抛 `OKXError`——它内部被一条硬
+    死线（`ai_trade_feed_relink_deadline_s`，默认 12 秒）包住并返回结构化失败，故这里写一个
+    `except OKXPrivateError` 只会得到一段不可达的死代码。失败沿 200 + `{"ok": false, "message"}`
+    返回。死线本身也**不映射 504**：前端对本路径落 `FAST_MS = 20_000`，而本端点最该被点击的场景
+    就是「网络不通」——12 秒内必须给出一个诚实的回执，绝不让用户在唯一的兜底按钮上读到
+    「本次操作结果未知」。
+
+    **返回裸 `dict`、不绑 `response_model`**：`response_model` 会静默吞掉新 wire 键，那是本仓库
+    出过事的形态（同类三个端点同款）。
+    """
+    try:
+        result = await get_ai_trade_manager().relink_member(group_id, inst_id)
+    except AiTradeFeedSelfHealDisabled as exc:
         raise HTTPException(409, detail={"code": exc.code, "message": exc.message}) from exc
     if result is None:
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "分组或成员不存在"})

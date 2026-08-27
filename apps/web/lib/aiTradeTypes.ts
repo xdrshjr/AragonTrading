@@ -1465,6 +1465,60 @@ export interface AiTradeMemberLifecycle {
   pausedTs: number;
   resumedTs: number;
   stopReason: string | null;
+  /**
+   * 行情断连自愈的进度（ai-trade-feed-self-healing §4.1）。
+   *
+   * 键的存在性有**三档，缺一不可**：整键缺席（`undefined`）= 后端没上线这个特性（运维总闸关）；
+   * `null` = 已上线、行情正常；对象 = 正在自愈 / 已升级。前端对前两档表现一致（不渲染），但
+   * wire 里两者可被反证——这正是 `member_lifecycle_wire` 那句「前端要能区分『没数据』与『后端没
+   * 上线这个键』」要求的。
+   */
+  feedRecovery?: AiTradeFeedRecovery | null;
+}
+
+/** 恢复卡三态。`healthy` 不会出现在 wire 里（那一档下发的是 `null`），保留是为了值域完整。 */
+export type AiTradeFeedRecoveryState = "healthy" | "recovering" | "stuck";
+
+/** 自愈阶梯的阶段码（与后端 `feed_watchdog.STAGE_*` 镜像；后端 wire 只发枚举值）。 */
+export type AiTradeFeedStage = "fresh" | "degraded" | "backfill" | "relink" | "escalated";
+
+/**
+ * 成员级 `feedRecovery`（§4.1）。
+ *
+ * 纪律（沿用 `aiTradeExit.ts` / `aiTradeHorizon.ts` 的成文教训）：**这里的每一个数都由后端算好**
+ * ——重连次数、倒计时、行情年龄一个都不许前端自己算，中文也一句都不许前端自己拼
+ * （`recoveryText` 由 `feed_watchdog.describe` 单点生成）。一张前后端各存一份的表必然漂移。
+ */
+export interface AiTradeFeedRecovery {
+  state: AiTradeFeedRecoveryState;
+  stage: AiTradeFeedStage;
+  attempts: { backfill: number; relink: number };
+  lastAttemptTs: number;
+  /** 距下一次尝试的秒数；`null` = 无待办倒计时（冷却外 / 已升级）⇒ **整行不读秒**。 */
+  nextAttemptInS: number | null;
+  lastOutcome: "ok" | "no_data" | "failed" | null;
+  lastOutcomeText: string | null;
+  /** 最后一根确认根的来源；`rest` = 当前跑在 REST 生命维持上。`null` = 尚无。 */
+  source: "ws" | "rest" | null;
+  /** 判定性文案的**唯一**来源（后端单点生成）。 */
+  recoveryText: string;
+}
+
+/**
+ * `POST /ai-trade/{gid}/member/{inst}/relink` 的回执（feed-self-healing §4.2）。
+ *
+ * 后端**刻意返回裸 dict、不绑 `response_model`**（同类三个端点同款）：`response_model` 会静默吞掉
+ * 新 wire 键，那是本仓库出过事的形态。故此处声明的是「至少有这些键」，多余键原样保留。
+ */
+export interface AiTradeRelinkResult {
+  ok: boolean;
+  instId: string;
+  groupId?: string;
+  relinked?: boolean;
+  appended?: number;
+  fresh?: boolean;
+  lastTs?: number | null;
+  message?: string;
 }
 
 /**

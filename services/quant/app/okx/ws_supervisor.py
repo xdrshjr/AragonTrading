@@ -1,14 +1,19 @@
 """单条 OKX WebSocket 连接的状态机（okx-link-resilience §2.2）——根因 A / B 的正面修复。
 
 今天 ``ws_client._run_endpoint`` 的存活判定只剩「``async for raw in ws`` 会不会抛异常」：
-``ping_interval=None`` 同时关掉了库的协议级 ping 与 pong 超时，应用层虽然每 20s 发一个 ``"ping"``，
+``ping_interval=None`` 同时关掉了库的协议级 ping 与 pong 超时，应用层虽然按
+``okx_link_ws_ping_interval_s``（默认 15s）发一个 ``"ping"``，
 但**没有任何人检查 ``"pong"`` 回没回来**。代理中断、NAT 老化、笔记本休眠唤醒、机场节点切换——这些
 最常见的断线形态恰恰都是「不 FIN 不 RST，就是不再来数据」，于是**这类断线现在永远不会重连**，
 只表现为「K 线不动了」，最后由会话看门狗在 ``bar × 3`` 之后说一句「行情连接异常」（1H 周期下
 就是 3 小时）。
 
-本模块给一条连接补上三重活性判据（心跳-应答 / 静默看门狗 / 订阅确认）与一套不会被「连上就断」
-骗到的退避，并把每一次状态迁移如实写进健康登记簿。
+本模块给一条连接补上四重活性判据（心跳-应答 / 静默看门狗 / **通道级数据静默** / 订阅确认）与一套
+不会被「连上就断」骗到的退避，并把每一次状态迁移如实写进健康登记簿。
+
+第三条是 ai-trade-feed-self-healing 轴 A 补上的：静默看门狗读的 ``last_inbound`` **会被 ``pong``
+刷新**，于是「socket 活着、心跳正常、``candle*`` 频道再也不推数据」这一形态在它之前永远不会触发
+重连——也就永不产生 ``down → live`` 的迁移，``SessionLink`` 的补根与告警全部空转。
 
 **它不 import 任何 live_auto / ai_auto / paper**：补根之类需要业务窗口口径的事，通过
 ``on_stream`` 回调交回给 session 自己完成。
@@ -43,6 +48,11 @@ class WSStreamConfig:
     kind: Kind
     label: str
     key: str
+    # 本连接订阅的 K 线周期秒数（ai-trade-feed-self-healing 轴 A）。`channel` 名是 `candle1H`
+    # 这类字符串，反解不可靠，故由 `ws_client._stream_config` 显式填入；public 端点（trades /
+    # tickers / books5）没有周期概念 ⇒ 填 0 ⇒ 数据静默预算落下界。
+    # **加法字段带默认值** ⇒ 既有构造点（含测试替身）零改动。
+    bar_seconds: int = 0
 
 
 @dataclass(frozen=True)
@@ -70,6 +80,11 @@ class _PumpState:
     opened_at: float
     last_inbound: float
     pending: set[str]
+    # 最后一帧**业务数据**的时刻（轴 A）。`last_inbound` 被 `pong` 刷新，故它回答的是「socket 还
+    # 活着吗」；本字段只被 `_consume` 的数据帧分支刷新，回答的是「订阅的频道还在送数据吗」。
+    # 默认值 = 0.0 时由 `_open()` 显式置成 `opened_at`：**连上了但一帧数据都没来过同样要被判失活**，
+    # 否则一次「握手成功、订阅 ack 成功、数据一帧不来」的连接会长命百岁。
+    last_data: float = 0.0
     ping_sent_at: float | None = None
     got_data: bool = False
     acked: bool = False
@@ -142,7 +157,7 @@ class WSSupervisor:
     async def _open(self, ws, attempt: int) -> _PumpState:
         """发订阅并初始化判据状态；建连即喂一次静默看门狗。"""
         now = self._clock()
-        state = _PumpState(opened_at=now, last_inbound=now,
+        state = _PumpState(opened_at=now, last_inbound=now, last_data=now,
                            pending={_channel_key(a) for a in self._cfg.args})
         await ws.send(json.dumps({"op": "subscribe", "args": self._cfg.args}))
         get_link_registry().note_ws(self._cfg.key, kind=self._cfg.kind, label=self._cfg.label,
@@ -179,10 +194,20 @@ class WSSupervisor:
         return "stopped"
 
     def _expired(self, state: _PumpState, now: float, idle: float) -> str | None:
-        """三重活性判据的纯判定（顺序即优先级）；任一命中即返回终止原因。"""
+        """四重活性判据的纯判定（顺序即优先级）；任一命中即返回终止原因。
+
+        `data_silence` 排在 `silence_timeout` **之后**、`pong_timeout` 之前：连接级的硬失活
+        （什么帧都不来了）比通道级的软静默（心跳还在、只是频道不推数据）更致命，应先被报出来。
+
+        检测延迟与 ping 周期无关：`_pump` 每跳的等待上限由 `tick_timeout` 夹在 `[0.05, 1.0]` 秒
+        （`retry.py`），故本函数每秒至少被求值一次。
+        """
         cfg = self._settings
         if cfg.okx_link_ws_silence_timeout_s > 0 and idle >= cfg.okx_link_ws_silence_timeout_s:
             return "silence_timeout"
+        data_silence = self._data_silence_budget()
+        if data_silence > 0 and now - state.last_data >= data_silence:
+            return "data_silence"
         if (state.ping_sent_at is not None and cfg.okx_link_ws_pong_timeout_s > 0
                 and now - state.ping_sent_at >= cfg.okx_link_ws_pong_timeout_s):
             return "pong_timeout"
@@ -190,6 +215,26 @@ class WSSupervisor:
                 and now - state.opened_at >= cfg.okx_link_ws_subscribe_timeout_s):
             return "subscribe_timeout"
         return None
+
+    def _data_silence_budget(self) -> float:
+        """本连接的「数据静默」预算（秒）。返回 0 ⇒ 整条判据关闭。
+
+        算式 = `clamp(bar_seconds × factor, min, max)`。**对 `bar >= 15m` 恒等于上界（默认 900 秒），
+        这不是缺陷、也不要试图去「修」它**：candle 频道推送的是**未确认根**，推送密度只与成交密度
+        相关、与 K 线周期无关，故上界是一条**与周期无关**的绝对静默上限；`bar_seconds` 派生只在
+        1m～15m 区间真正起作用（让极短周期不必干等 15 分钟）。
+
+        `public` 端点（trades / tickers / books5）的 `bar_seconds` 为 0 ⇒ 恒取下界 120 秒。冷门标的
+        深夜可能真的 120 秒无盘口变动 ⇒ 周期性重连；这**无害**：`SessionLink._on_recovered` 的补根
+        判据是 `_pending_repair or downtime_s >= bar_seconds`，快速重连两者皆假 ⇒ 不打 REST、
+        不推文案，故它不烧公共读配额。
+        """
+        cfg = self._settings
+        if cfg.okx_link_ws_data_silence_factor <= 0:
+            return 0.0
+        raw = float(self._cfg.bar_seconds) * cfg.okx_link_ws_data_silence_factor
+        return min(max(raw, cfg.okx_link_ws_data_silence_min_s),
+                   cfg.okx_link_ws_data_silence_max_s)
 
     async def _consume(self, raw: str, state: _PumpState) -> str | None:
         """把一帧原样交给既有处理器，同时抽出订阅 ack / 错误。返回致命原因或 ``None``。
@@ -220,6 +265,10 @@ class WSSupervisor:
         if event is not None:
             return None
         state.got_data = True
+        # 轴 A：**只有**业务数据帧刷新 `last_data`。`pong`（上面 `raw == "pong"` 那一支）、
+        # `event: subscribe`、`event: error` 三条分支**一律不动它**——这正是它与 `last_inbound`
+        # 的全部差别所在，也是「心跳正常但频道静默」这一形态唯一的出口。
+        state.last_data = self._clock()
         # 数据比 ack 更硬：收到某频道的数据即视为该频道已订阅成功（漏掉一条 ack 不该拆掉一条
         # 正在送数据的连接）。
         state.pending.discard(_channel_key(msg.get("arg") or {}))
@@ -283,6 +332,7 @@ def _reason_code(reason: str) -> str:
 
 _REASON_TEXT = {
     "silence_timeout": "长时间无任何入站数据，已强制重连",
+    "data_silence": "订阅频道长时间无数据，已强制重连",
     "pong_timeout": "心跳应答超时，已强制重连",
     "subscribe_timeout": "订阅确认超时，已强制重连",
     "closed_by_peer": "连接被对端关闭，正在重连",

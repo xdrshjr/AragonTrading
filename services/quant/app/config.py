@@ -57,6 +57,16 @@ class Settings(BaseSettings):
     # 全局建连速率闸，**只作用于重连**（attempt ≥ 1）：首次建连不取令牌。需要被压制的是故障期间的
     # 重连风暴，而首建并发度本就由 live_auto_start_concurrency 与「一个浏览器一次订阅」约束住。
     okx_link_ws_connect_rate_per_s: float = 2.0    # 0 = 不限
+    # 通道级**数据静默**判据（ai-trade-feed-self-healing 轴 A）。与 okx_link_ws_silence_timeout_s
+    # 的差别是**唯一**的：那条读 last_inbound（任何入站帧，含 pong），这条读 last_data（仅业务数据
+    # 帧）。「socket 活着、心跳正常、candle 频道再也不推数据」是最常见也最难查的一类断线——在本判据
+    # 出现之前它**永远不会触发重连**，只表现为「K 线不动了」。
+    # 预算 = clamp(bar_seconds × factor, min, max)。**对 bar ≥ 15m 恒等于上界 900 秒，这不是缺陷**：
+    # candle 频道推送的是**未确认根**，推送密度只与成交密度相关、与 K 线周期无关，故 900 秒是一条
+    # 与周期无关的绝对静默上限；bar_seconds 派生只在 1m～15m 区间真正起作用。
+    okx_link_ws_data_silence_factor: float = 1.0    # × bar 秒数；0 = 整条判据关闭
+    okx_link_ws_data_silence_min_s: float = 120.0   # 夹取下界（盘口频道与 1m 周期用这个）
+    okx_link_ws_data_silence_max_s: float = 900.0   # 夹取上界（6H/12H/1D 不至于等一整根）
     okx_link_rest_max_attempts: int = 4            # 公共 REST 最大尝试次数（含首次；1=不重试）
     okx_link_rest_budget_s: float = 25.0           # 单次公共调用总墙钟预算（含等待）
     okx_link_public_rate_per_s: float = 8.0        # 公共 REST 令牌桶速率（0=不限；≈既有 0.12s 间隔）
@@ -415,6 +425,27 @@ class Settings(BaseSettings):
     # DISABLED`），面板按钮**照常渲染**、点下去如实回显那句中文——本值不进任何 wire，前端无从
     # 预知它。这是刻意的取舍：为一个运维态开关多开一条下发通道，比让用户点一次看见原因更贵。
     ai_trade_manual_exit_enabled: bool = True                                      # C-13
+    # ---- 行情断连自愈（ai-trade-feed-self-healing 轴 B / 轴 C）----
+    # 今天的 `_check_staleness` 只置标志 + 推文案，而 `_stale_degraded` 是一个**吸收态**：三条唤醒源
+    # 全被它挡住，而唯一能清它的是那条已经死掉的 WS 自己。本组开关把这条链路从「观测」升级为「自愈」。
+    # 总闸关 ⇒ 四处逐字回落：plan() 只回 clear/degrade/none 三态、`feedRecovery` 整键缺席、
+    # /relink 端点 409、前端因键缺席而不渲染恢复卡。**四处回落缺一，这个开关就只是一句声明。**
+    ai_trade_feed_selfheal_enabled: bool = True                                    # 整轴总闸
+    ai_trade_feed_backfill_interval_s: float = Field(default=60.0, gt=0)           # REST 活性补取冷却
+    # × stale_after（= bar × live_auto_staleness_factor(3)）才换链 ⇒ 会话级换链门槛 = bar × 6，
+    # 1H 周期下是 6 小时。这不是笔误：判定表第 2 行（not ws_alive / link_state == "down"）才是常态下
+    # 的换链触发点，本门槛只是「WS 任务活着、登记簿也没判 down、但根就是不来」的最后一层兜底。
+    ai_trade_feed_relink_factor: float = Field(default=2.0, ge=1.0)
+    ai_trade_feed_relink_min_interval_s: float = Field(default=120.0, gt=0)        # 换链冷却
+    ai_trade_feed_escalate_after_relinks: int = Field(default=3, ge=0)             # 0 = 永不升级
+    # 人工 /relink 的**服务端硬死线**：前端对本路径落 FAST_MS = 20_000（httpTimeout.ts 的长跑白名单
+    # 不含它），而本端点最该被点击的场景恰恰是「网络仍不通」——此时 fetch_missing 会走完整的 REST
+    # 重试 / 退避，很容易越过 20 秒，用户就会在**唯一一个兜底按钮**上读到「本次操作结果未知」。
+    ai_trade_feed_relink_deadline_s: float = Field(default=12.0, gt=0)
+    # 盯市判定价的 REST 回落阈值（轴 C）：判据用 `_last_px_wall` 而**不是** `_last_candle_wall`
+    # ——后者在 12H/1D 周期下几十小时不跳，用它会让回落在正常运行时也恒生效、每 5 秒打一次 REST。
+    # 0 = 关（逐字回退到本轮之前：窗口非空即用最后一根收盘价）。
+    ai_trade_mark_px_fallback_after_s: float = Field(default=180.0, ge=0)
     # ---- 交易所侧兜底真值化（§2.3）----
     # 「交易所侧还有兜底」是一句从未被核实过的话（真源是本地成交回执，从不查交易所），而它恰是
     # 跨日模式「不必每轮盯盘」的唯一授权来源。总闸关 ⇒ 一个请求都不发、兜底文案逐字回退到本地

@@ -14,6 +14,7 @@ import type {
   AiTradeGroupStopResult,
   AiTradeMemberExitResult,
   AiTradePauseResult,
+  AiTradeRelinkResult,
   AiTradeResumePreview,
 } from "./aiTradeTypes";
 
@@ -81,6 +82,15 @@ export const aiTradeApi = {
   exitMember: (groupId: string, instId: string) =>
     request<AiTradeMemberExitResult>(
       `/ai-trade/${groupId}/member/${encodeURIComponent(instId)}/exit`,
+      { method: "POST" },
+    ),
+  // 人工授权的**单次**强制重连 + REST 活性补取（feed-self-healing §4.2）：换一条新的 K 线 WS，
+  // 再立刻取一次最新已收线根。**不停会话、不平仓**。服务端有 12 秒硬死线，故落 FAST_MS 是安全的
+  // ——12 秒内必然回一个诚实的回执，绝不让用户在唯一的兜底按钮上读到「本次操作结果未知」。
+  // 运维总闸关 ⇒ 409 `AI_TRADE_FEED_SELFHEAL_DISABLED`。
+  relinkMember: (groupId: string, instId: string) =>
+    request<AiTradeRelinkResult>(
+      `/ai-trade/${groupId}/member/${encodeURIComponent(instId)}/relink`,
       { method: "POST" },
     ),
   // 当前活跃分组 + 是否启用（只读，重载后据此重连各成员 WS）。

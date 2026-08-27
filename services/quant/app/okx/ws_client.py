@@ -18,6 +18,7 @@ import websockets
 
 from ..config import Settings, get_settings
 from .types import (
+    BAR_SECONDS,
     BAR_TO_WS_CHANNEL,
     Candle,
     MarketTicker,
@@ -173,6 +174,11 @@ class OKXMarketWSClient:
         通道键含 ``owner`` 段（``ws:{endpoint}:{instId}:{bar}:{owner}``）：不加这一段，一个
         live_auto 会话与一个浏览器图表订阅同一 ``BTC-USDT-SWAP:1H`` 时会**共写同一条记录**，
         一方断线另一方健康 → 面板状态来回翻，而两条连接的真实健康度谁也没被如实表达。
+
+        ``bar_seconds``（feed-self-healing 轴 A）只对 business 端点有意义（它订阅的是 ``candle*``
+        频道）；public 端点订阅的 trades / tickers / books5 没有周期概念 ⇒ 填 0 ⇒ supervisor 的数据
+        静默预算落下界。**在这里填而不是在 supervisor 里反解**：``channel`` 名是 ``candle1H`` 这类
+        字符串，反解不可靠，而 ``bar`` 的真源本就在本对象上。
         """
         is_business = endpoint == "business"
         url = self._settings.okx_ws_business if is_business else self._settings.okx_ws_public
@@ -184,6 +190,7 @@ class OKXMarketWSClient:
             kind="wsBusiness" if is_business else "wsPublic",
             label=label,
             key=f"ws:{endpoint}:{self.inst_id}:{self.bar}:{self._owner}",
+            bar_seconds=BAR_SECONDS.get(self.bar, 0) if is_business else 0,
         )
 
     async def _run_endpoint(self, cfg: WSStreamConfig) -> None:

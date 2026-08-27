@@ -61,6 +61,8 @@ from .exit_priority import (
     resolve_exit_priority,
 )
 from .experience import ExperienceRuntime
+from . import feed_watchdog
+from .feed_runtime import FeedRuntime
 from .hold_horizon import HorizonFacts, HorizonRule, gate_status as horizon_gate_status
 from .horizon_acceptance import ai_stats_keys, build_bundle
 from .horizon_runtime import HorizonRuntime, build_gate_veto_note, build_horizon_facts
@@ -359,6 +361,8 @@ class AiTradeSession:
         self.hold_streak = 0
         self.max_hold_streak = 0
         self._stale_degraded = False
+        # 行情断连自愈（feed-self-healing 轴 B）：状态 / 五个动作 / wire 装配全部下沉 `FeedRuntime`
+        self._feed = FeedRuntime(self)          # （范式同 `HorizonRuntime` / `CostRuntime`）
         self._degraded_seen = False
         # F1：盯市 tick 的连续失败计数与「已推过降级」标志（守护循环的可见性，见 `_monitor_loop`）。
         self._tick_fail_streak = 0
@@ -1078,8 +1082,11 @@ class AiTradeSession:
         # 不是给界面看的 wire——总闸只回滚「对外说什么」，不回滚「服务端内部怎么核实」。
         return {"ok": True, "state": self.state, "lifecycle": wire}
 
-    async def _rearm_feed(self) -> None:
+    async def _rearm_feed(self, *, force: bool = False) -> None:
         """WS 死了就**换一个新的**（幂等：`is_alive` 为真则零动作）。
+
+        `force=True`（自愈层 / 人工兜底）跳过 `is_alive` 短路、无条件换代；`force=False` 时行为
+        **逐字不变**（`resume()` 的调用点一个字都不用改）。
 
         [评审 R0-4] **绝不能对同一个客户端 `stop()` 之后再 `start()`**：`OKXMarketWSClient._stop`
         是 latched `asyncio.Event` —— `stop()` 置位后从不清、`start()` 也不清，而 supervisor 的
@@ -1089,9 +1096,11 @@ class AiTradeSession:
 
         竞态（风险 R-4）：`is_alive` 为假才动手；换代前必须 `await old.stop()`（它会 cancel 并
         await 全部 endpoint task），故旧 supervisor 绝不会与新的同时在线；`_window.is_duplicate`
-        是既有的去重护栏。
+        是既有的去重护栏。**本方法自身的并发**由 `_feed.rearm_lock` 串行化：本轮之前它只有
+        `resume()` 一个调用点（不可能自我并发），自愈层与人工兜底把它变成了三个，而后到的那条会
+        看见中途置空的 `_ws`、跳过收尸另建一条，留下一条没人停得掉的野连接一直烧配额。
         """
-        if self._ws is not None and self._ws.is_alive:
+        if not force and self._ws is not None and self._ws.is_alive:
             return                                  # 正常热续跑路径：零动作
         link = getattr(self, "_link", None)
         if link is None:
@@ -1101,18 +1110,19 @@ class AiTradeSession:
             logger.warning("ai-trade feed re-arm skipped, session never started: %s",
                            self.session_id)
             return
-        old, self._ws = self._ws, None
-        if old is not None:
-            try:
-                await old.stop()
-            except Exception as exc:  # noqa: BLE001 —— 收尸失败不该挡住续跑
-                logger.warning("ai-trade ws teardown failed (%s): %s", self.inst_id, exc)
-        # 与 `start()` 的装配**逐字同源**（见 start()），不另起一套。
-        self._ws = OKXWSClient(self.inst_id, self.bar, self.feed_candle,
-                               on_stream=link.on_stream, owner=f"ai:{self.session_id}")
-        self._ws.start()
-        logger.info("ai-trade feed re-armed on resume: session=%s inst=%s",
-                    self.session_id, self.inst_id)
+        async with self._feed.rearm_lock:
+            old, self._ws = self._ws, None
+            if old is not None:
+                try:
+                    await old.stop()
+                except Exception as exc:  # noqa: BLE001 —— 收尸失败不该挡住续跑
+                    logger.warning("ai-trade ws teardown failed (%s): %s", self.inst_id, exc)
+            # 与 `start()` 的装配**逐字同源**（见 start()），不另起一套。
+            self._ws = OKXWSClient(self.inst_id, self.bar, self.feed_candle,
+                                   on_stream=link.on_stream, owner=f"ai:{self.session_id}")
+            self._ws.start()
+        logger.info("ai-trade feed re-armed: session=%s inst=%s force=%s",
+                    self.session_id, self.inst_id, force)
 
     # ---------- 生命周期真值（ai-trade-lifecycle-truth B-5 / L-2）----------
     def lifecycle_readings(self) -> lifecycle_core.MemberReadings:
@@ -1151,10 +1161,15 @@ class AiTradeSession:
         return "unknown" if link is None else link.channel_state(f"ai:{self.session_id}")
 
     def lifecycle_wire(self) -> dict:
-        """成员级 `lifecycle`（§5.2）：`_status_payload` / `info()` / manager 成员行共用同一次装配。"""
-        return lifecycle_core.member_lifecycle_wire(
+        """成员级 `lifecycle`（§5.2）：`_status_payload` / `info()` / manager 成员行共用同一次装配。
+
+        `feedRecovery` 挂同一层但装配在这里（`lifecycle.py` 是零 IO 纯核心）；键的存在性三档纪律
+        （总闸关 ⇒ 整键缺席 / 行情正常 ⇒ `null` / 自愈中 ⇒ 对象）见 `FeedRuntime.recovery_key`。
+        """
+        return {**lifecycle_core.member_lifecycle_wire(
             self.lifecycle_readings(), paused_ts=self.paused_ts,
-            resumed_ts=int(getattr(self, "resumed_ts", 0) or 0))
+            resumed_ts=int(getattr(self, "resumed_ts", 0) or 0)),
+            **self._feed.recovery_key()}
 
     @property
     def lifecycle_truth_enabled(self) -> bool:
@@ -1393,14 +1408,27 @@ class AiTradeSession:
         return self._last_live_px if self._last_live_px is not None else self._ref_px()
 
     async def _latest_mark_px(self) -> float:
+        """盯市判定价：窗口非空**且判定价未超龄**时用最后收盘价，超龄则回落 REST ticker（轴 C）。
+
+        断流期间直接返回 `candles[-1]["c"]` 会让 `reconcile` 与 `_maybe_session_exit` 全程吃一个
+        21 小时前的价（RC-6）。判据用 `_last_px_wall` 而**不是** `_last_candle_wall`：后者在 12H/1D
+        下几十小时不跳，用它会让回落在正常运行时也恒生效、每 5 秒打一次 REST（第三次踩这个坑）。
+        `= 0` ⇒ 逐字回退旧行为。本方法**纯读**，三个墙钟字段一个都不写——写了会在「真实价 ↔ 化石
+        价」之间每 180 秒摆一次，且会让一次 ticker 取数顺手解锁利润保护层。
+        """
+        fallback_after = float(self.executor.settings.ai_trade_mark_px_fallback_after_s)
+        fresh = (fallback_after <= 0 or self._last_px_wall <= 0
+                 or (time.time() - self._last_px_wall) <= fallback_after)
         c = self._window.candles
-        if c:
+        if c and fresh:
             return float(c[-1]["c"])
         try:
             px = await get_rest_client().get_ticker(self.inst_id)
-        except Exception:  # noqa: BLE001 —— 取价失败回落 entry_price（降级，不阻塞盯市）
+        except Exception:  # noqa: BLE001 —— 取价失败回落既有口径（降级，不阻塞盯市）
             px = None
-        return float(px) if px is not None else self.executor.entry_price
+        if px is not None:
+            return float(px)
+        return float(c[-1]["c"]) if c else self.executor.entry_price
 
     async def _check_staleness(self, now_ts: int) -> None:
         """行情停滞看门狗。判据是 `is_active`（§3.1.2 row 4，减风险侧）。
@@ -1414,17 +1442,30 @@ class AiTradeSession:
         settings = self.executor.settings
         stale_after = BAR_SECONDS.get(self.bar, 60) * settings.live_auto_staleness_factor
         elapsed = now_ts - self._last_candle_wall
-        if elapsed <= stale_after:
-            await self._clear_stale_if_recovered()
-            return
+        # 强平分支**逐字保留在最前面**（L-2）：提到早退之前是逐字等价的重写（`> stale_after * 4`
+        # 蕴含 `> stale_after`）。本轮不新增自动平仓路径，也不删既有的。
         if settings.live_auto_flatten_on_stale and elapsed > stale_after * 4:
             await self.stop("stale_feed")
             return
-        if not self._stale_degraded:
-            self._stale_degraded = True
-            await self._push({"type": "status", "data": {
-                **self._status_payload(),
-                "message": "行情连接异常，AI 自动交易暂停响应 K 线（交易所侧止盈止损仍生效）"}})
+        readings = self._feed.readings(feed_age_s=max(0.0, float(elapsed)),
+                                       stale_after_s=float(stale_after), now_wall=time.time())
+        await self._feed.apply(feed_watchdog.plan(readings, self._feed.config()))
+
+    async def relink_feed(self) -> dict:
+        """人工授权的**单次**强制重连 + 活性补取（§4.2）；实体在 `FeedRuntime.relink_now`。"""
+        return await self._feed.relink_now()
+
+    def note_live_bar(self, row: dict, *, index: int, frames) -> None:
+        """活性补取的逐根影子步进（与 `feed_candle` 确认根分支共用同一段尾巴，绝不另起一套）。
+
+        纯同步、零 IO、**不起决策轮**（起不起由 `FeedRuntime._resume_wakes` 统一走既有唤醒守卫）。
+        住在会话侧是因为它要读 `self._specs` / `self._shadows`；`frames` 由调用方一次建好逐根复用。
+
+        **刻意不写 `_last_live_px`**（与 `feed_candle` 尾巴的唯一差别，见 spec 的 F-1）：它是禁写
+        四字段之一，只有「最后一根确实是当下的证据」才可动，那一笔由 `okx/session_link.py` 的活性
+        补取入窗单点负责——在这里写，一次不新鲜的补取就会把当前价改成 20 小时前的收盘价。"""
+        self._last_board = evaluate_signal_board(self._specs, self._shadows, frames, index)
+        self._last_bar_index = index
 
     async def _clear_stale_if_recovered(self) -> None:
         if not self._stale_degraded:
@@ -1457,6 +1498,7 @@ class AiTradeSession:
         row = self._window.append_confirmed(candle)
         self.executor.bar_anchor_ts = int(row["ts"])   # 轴 D：相位真源 = 交易所给的最近一根确认根
         self._last_candle_wall = self._last_px_wall = time.time()
+        self._feed.note_ws_bar()          # 自愈层的**唯一**复位点（证据驱动，见 note_ws_bar）
         self._wake.note_new_bar()         # 轴 C：新根 = 新证据，解锁同方向翻转的防抖锁存
         self._live_row = None             # 该根已收线，旧的未确认行不再有意义
         # F1（§2.1.2）：ATR 是波动**尺度**，只在确认根刷新（允许滞后一根）；不可用 ⇒ None ⇒

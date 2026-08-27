@@ -25,6 +25,7 @@ import {
 } from "@/lib/aiTradeDiscipline";
 import { describeHorizonStatus } from "@/lib/aiTradeHorizon";
 import { AiTradeExitCard } from "./AiTradeExitCard";
+import { AiTradeFeedRecoveryCard } from "./AiTradeFeedRecoveryCard";
 import { describeTradability } from "@/lib/aiTradeTradability";
 import { describeTurnoverChip } from "@/lib/aiTradeTurnover";
 import { COST_BASIS_HINT, describeCostBasis } from "@/lib/aiTradeCost";
@@ -152,6 +153,7 @@ export default function AiTradePanel({
       {lifecycle === "running" && !armed.unavailable && !armed.armed && (
         <NotArmedBanner rows={armed.rows} total={armed.membersTotal} />
       )}
+      <AiTradeFeedRecoveryCard groupId={group.groupId} members={members} />
 
       {/* 可交易性红条 + 长期记忆停摆徽标（tradability-and-open-funnel 轴 A / 轴 D）。
           放在纪律条**之上**：当探针判定「这个周期几乎开不出单」时，那是用户最该先看到的一句话

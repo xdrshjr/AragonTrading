@@ -1333,6 +1333,19 @@ class AiTradeManager:
         member = next((m for m in group.members if m.inst_id == inst_id), None)
         return None if member is None else await member.session.exit_now()
 
+    async def relink_member(self, group_id: str, inst_id: str) -> dict | None:
+        """人工授权的**单次**强制重连 + 活性补取（feed-self-healing §4.2）；缺失 ⇒ `None` → 404。
+
+        镜像 `exit_member` / `repair_member` 的既有姿态：只按 `(group_id, inst_id)` 定位成员并
+        转发，判定、冷却与死线一律在会话侧（`AiTradeSession.relink_feed`）——manager 不做任何业务
+        判断，**也不改分组生命周期**（`/relink` 是会话继续运行的中途动作，不是 `stop`）。
+        """
+        group = self._group
+        if group is None or group.group_id != group_id:
+            return None
+        member = next((m for m in group.members if m.inst_id == inst_id), None)
+        return None if member is None else await member.session.relink_feed()
+
     async def repair_member(self, group_id: str, inst_id: str) -> dict | None:
         """人工授权的单次兜底补挂（backstop-repair §4.1）；分组 / 成员不存在 ⇒ `None` → 404。
 

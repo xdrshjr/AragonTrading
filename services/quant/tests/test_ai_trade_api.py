@@ -26,6 +26,9 @@ _CONFIG = {"instrumentSupported": True, "availUsdt": 1000.0, "posMode": "long_sh
 class _FakeSession:
     """轻量会话桩：start/stop 不触网、不 priming；info/snapshot 供 status/WS。"""
 
+    # 【立即重连】的三种结局（feed-self-healing §4.2）：类级旋钮，`_fresh()` 每次复位。
+    relink_outcome: str = "ok"
+
     def __init__(self, session_id, run_id, specs, inst_id, bar, executor, decider, **kw):
         self.session_id = session_id
         self.run_id = run_id
@@ -48,6 +51,25 @@ class _FakeSession:
 
     async def start(self):
         return None
+
+    async def relink_feed(self):
+        """【立即重连】的会话桩（feed-self-healing §4.2）。
+
+        真实会话把失败包成 **200 + `ok: false`**（不映射 502）：会话层不抛 `OKXError`，它被一条
+        12 秒硬死线包住并返回结构化失败，故端点层写 `except OKXPrivateError` 只会得到死代码。
+        """
+        from app.ai_auto.feed_runtime import AiTradeFeedSelfHealDisabled
+
+        if _FakeSession.relink_outcome == "disabled":
+            raise AiTradeFeedSelfHealDisabled()
+        if _FakeSession.relink_outcome == "no_data":
+            return {"ok": False, "instId": self.inst_id, "groupId": self.group_id,
+                    "relinked": True, "appended": 0, "fresh": False, "lastTs": None,
+                    "message": "已重建行情连接，但交易所仍未返回更新的 K 线；"
+                               "该标的可能已停牌或交易所行情中断"}
+        return {"ok": True, "instId": self.inst_id, "groupId": self.group_id,
+                "relinked": True, "appended": 3, "fresh": True, "lastTs": 1_756_269_900,
+                "message": "已重建行情连接并补齐 3 根 K 线，Agent 已恢复响应"}
 
     def discipline_wire(self):
         """生效纪律自检的会话桩（discipline-preset 轴 B）：桩不装配任何层 ⇒ 空行 + 无提示。
@@ -120,6 +142,7 @@ async def _fresh() -> int:
     await init_db()
     get_ai_trade_manager()._group = None
     get_live_auto_manager()._group = None
+    _FakeSession.relink_outcome = "ok"
     sm = get_sessionmaker()
     async with sm() as session:
         for row in await repo.list_okx_accounts(session):
@@ -844,5 +867,111 @@ async def test_discipline_presets_endpoint_serves_labels_and_thresholds(monkeypa
             assert all(row["label"] and row["value"] for row in balanced["rows"])
             assert next(p for p in body["presets"] if p["id"] == "off")["rows"] == []
     finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+# ---------------- 【立即重连】端点（ai-trade-feed-self-healing §4.2） ----------------
+def _relink_url(group_id: str, inst_id: str = "BTC-USDT-SWAP") -> str:
+    return f"/api/ai-trade/{group_id}/member/{inst_id}/relink"
+
+
+async def _start_group(client, strategy_id: int) -> str:
+    await _seed_account(client)
+    started = await client.post("/api/ai-trade/start", json=_start_body(strategy_id))
+    assert started.status_code == 200, started.text
+    return started.json()["groupId"]
+
+
+async def test_relink_returns_200_and_leaves_the_session_running(monkeypatch):
+    """成功回执自解释；会话**仍在运行**（`/relink` 不是 `/stop`，也不平仓）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            group_id = await _start_group(client, strategy_id)
+            res = await client.post(_relink_url(group_id))
+            assert res.status_code == 200, res.text
+            body = res.json()
+            assert body["ok"] is True and body["relinked"] is True and body["appended"] == 3
+            assert body["instId"] == "BTC-USDT-SWAP"
+            status = await client.get("/api/ai-trade/status")
+            assert status.json()["group"]["state"] == "running"
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_relink_does_not_guard_the_ai_master_switch(monkeypatch):
+    """**恢复观测是收敛风险的动作**：AI 总闸关闭时仍 200（与 `/stop`、`/exit` 同理）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            group_id = await _start_group(client, strategy_id)
+            _override(app, ai=False)          # 起完组之后再关总闸
+            assert (await client.post(_relink_url(group_id))).status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_relink_ops_switch_off_returns_409(monkeypatch):
+    """运维总闸关 ⇒ 409 `AI_TRADE_FEED_SELFHEAL_DISABLED`（端点层是唯一的翻译点）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            group_id = await _start_group(client, strategy_id)
+            _FakeSession.relink_outcome = "disabled"
+            res = await client.post(_relink_url(group_id))
+            assert res.status_code == 409, res.text
+            assert res.json()["error"]["code"] == "AI_TRADE_FEED_SELFHEAL_DISABLED"
+    finally:
+        _FakeSession.relink_outcome = "ok"
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_relink_missing_group_or_member_returns_404(monkeypatch):
+    """分组 / 成员缺失 ⇒ 404（镜像 `stop_member`）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            assert (await client.post(_relink_url("no-such-group"))).status_code == 404
+            group_id = await _start_group(client, strategy_id)
+            res = await client.post(_relink_url(group_id, "ETH-USDT-SWAP"))
+            assert res.status_code == 404
+    finally:
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_a_failed_relink_is_200_with_ok_false_not_502(monkeypatch):
+    """交易所仍不通 ⇒ **200 + `ok: false`**，且 `message` 自解释（绝不映射 502 / 504）。"""
+    strategy_id = await _fresh()
+    app = _load_app()
+    _override(app)
+    _patch(monkeypatch)
+    try:
+        async with await _client(app) as client:
+            group_id = await _start_group(client, strategy_id)
+            _FakeSession.relink_outcome = "no_data"
+            res = await client.post(_relink_url(group_id))
+            assert res.status_code == 200, res.text
+            body = res.json()
+            assert body["ok"] is False and body["relinked"] is True
+            assert "仍未返回更新的 K 线" in body["message"]
+    finally:
+        _FakeSession.relink_outcome = "ok"
         app.dependency_overrides.clear()
         await dispose_engine()

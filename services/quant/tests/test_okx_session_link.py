@@ -227,6 +227,12 @@ class _Window:
         import pandas as pd
         return pd.DataFrame(self.candles)
 
+    def cur_index(self) -> int:
+        return len(self.candles) - 1
+
+    def build_strategy_frames(self) -> list:
+        return ["frames"]
+
 
 class _Wake:
     def __init__(self):
@@ -304,6 +310,112 @@ async def test_ai_auto_backfill_with_nothing_new_does_nothing():
     session = _AiSession()
     assert await sl.ingest_ai_auto(session, [_candle(1_699_000_000)]) == 0
     assert session._wake.atr_calls == []
+
+
+# ---------------- 活性补取（feed-self-healing §3.3.2）：与断线补根的**唯一**差别 ----------------
+
+
+class _LiveAiSession(_AiSession):
+    """活性补取需要的额外面：逐根影子步进 + 相位锚点。"""
+
+    def __init__(self):
+        super().__init__()
+        self.executor.bar_anchor_ts = 0
+        self.live_bars: list[tuple[int, dict]] = []
+
+    def note_live_bar(self, row: dict, *, index: int, frames) -> None:
+        assert frames == ["frames"], "帧必须由调用方一次建好逐根复用"
+        self.live_bars.append((index, row))
+
+
+_BAR_S = 3600
+
+
+async def test_live_backfill_with_a_stale_last_bar_writes_nothing():
+    """**L-1 的核心护栏**：REST 只拿得到 20 小时前的根 ⇒ 一个墙钟字段都不许动。
+
+    诚实优先于自愈——REST 也拿不到当下的根，说明是真的行情中断 / 标的停牌 / 交易所故障，
+    此时假装「我刚拿到数据」比什么都不做更危险。
+    """
+    session = _LiveAiSession()
+    before = (session._last_candle_wall, session._last_px_wall,
+              session._live_row, session._last_live_px, session.executor.bar_anchor_ts)
+    stale_ts = 1_700_003_600
+    now = stale_ts + _BAR_S + 20 * 3600      # 那根收线之后又过了 20 小时
+
+    result = await sl.ingest_ai_auto_live(session, [_candle(stale_ts)],
+                                          bar_seconds=_BAR_S, now_wall=now)
+
+    assert result == {"appended": 1, "fresh": False, "lastTs": stale_ts}
+    assert (session._last_candle_wall, session._last_px_wall, session._live_row,
+            session._last_live_px, session.executor.bar_anchor_ts) == before
+    assert session._wake.new_bars == 0, "不新鲜的根绝不解锁防抖锁存"
+
+
+async def test_live_backfill_freshness_window_is_one_bar_not_three():
+    """判据收紧到**一根**（不是 `stale_after_s` 的三根）。
+
+    这条用「三根」的容差会绿、用「一根」才红——它是这条收紧的唯一护栏。1H 会话下一根「2 小时前
+    收线」的根仍在 `stale_after`（3 小时）之内，但它显然**不是当下的证据**。
+    """
+    ts = 1_700_003_600
+    now = ts + _BAR_S + 2 * 3600             # 收线之后过了 2 小时（< 3 小时，> 1 根）
+    session = _LiveAiSession()
+
+    result = await sl.ingest_ai_auto_live(session, [_candle(ts)],
+                                          bar_seconds=_BAR_S, now_wall=now)
+
+    assert result["fresh"] is False
+    assert session._last_candle_wall == 111.0 and session._last_px_wall == 222.0
+
+
+async def test_live_backfill_stamps_px_wall_at_bar_close_not_now():
+    """**两个字段取值不同这件事本身就是断言的一部分。**
+
+    `_last_candle_wall = now`（「我最后一次拿到当下这一根的时刻」）而
+    `_last_px_wall = ts + bar_seconds`（「这个价**真**的那一刻」）。把后者写成 `now` 等于告诉利润
+    保护层「这个价是 0 秒前的」，据此对真实资金执行棘轮与兑现。
+    """
+    ts = 1_700_003_600
+    now = ts + _BAR_S + 600.0                # 刚收线 10 分钟（< 一根 ⇒ 新鲜）
+    session = _LiveAiSession()
+
+    result = await sl.ingest_ai_auto_live(session, [_candle(ts, c=123.5)],
+                                          bar_seconds=_BAR_S, now_wall=now)
+
+    assert result == {"appended": 1, "fresh": True, "lastTs": ts}
+    assert session._last_candle_wall == now
+    assert session._last_px_wall == float(ts + _BAR_S)
+    assert session._last_px_wall != session._last_candle_wall, "两者语义不同，取值必须不同"
+    assert now - session._last_px_wall == 600.0, "价龄必须等于**真实**价龄"
+    assert session._last_live_px == 123.5
+    assert session.executor.bar_anchor_ts == ts
+    assert session._wake.new_bars == 1
+
+
+async def test_live_backfill_steps_every_shadow_bar_not_only_the_last():
+    """跳根算出来的 `_last_board` 是一份被悄悄改写过的立场，而定时唤醒会拿它起真实资金决策。"""
+    session = _LiveAiSession()
+    base = 1_700_003_600
+    candles = [_candle(base + i * _BAR_S, c=100.0 + i) for i in range(5)]
+    now = base + 4 * _BAR_S + _BAR_S + 10.0
+
+    result = await sl.ingest_ai_auto_live(session, candles, bar_seconds=_BAR_S, now_wall=now)
+
+    assert result["appended"] == 5
+    assert len(session.live_bars) == 5, "每一根都要步进影子，不是只算最后一根"
+    indexes = [i for i, _ in session.live_bars]
+    assert indexes == sorted(indexes) and indexes[-1] == session._window.cur_index()
+    assert session._wake.atr_calls[-1] is session._atr_px    # ATR 与 note_atr 同进同出
+    assert session._sizing.calls == 1                        # 补完之后统一刷一次
+
+
+async def test_live_backfill_with_nothing_new_is_a_noop():
+    session = _LiveAiSession()
+    result = await sl.ingest_ai_auto_live(session, [_candle(1_699_000_000)],
+                                          bar_seconds=_BAR_S, now_wall=1_700_000_000.0)
+    assert result == {"appended": 0, "fresh": False, "lastTs": None}
+    assert session._wake.atr_calls == [] and session.live_bars == []
 
 
 # ---------------- B-3（ai-trade-lifecycle-truth，修 D-6）：暂停期不是观测盲区 ----------------
