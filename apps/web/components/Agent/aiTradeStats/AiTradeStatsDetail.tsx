@@ -33,9 +33,14 @@ import {
   realizedRows,
 } from "@/lib/aiTradeProfitability";
 import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
-import type { AiTradeHistoryDetailOut, AiTradeHistoryMember } from "@/lib/aiTradeHistoryTypes";
+import type {
+  AiTradeHistoryDetailOut,
+  AiTradeHistoryMember,
+  AiTradeReasoningStats,
+} from "@/lib/aiTradeHistoryTypes";
 import type { AiTradeHorizonStats } from "@/lib/aiTradeTypes";
 import { type AiObservability, aggregateAiObservability } from "@/lib/aiTradeObservability";
+import { REASONING_DEPTH_LABELS } from "@/lib/aiTrade";
 import { colorForReturn, fmtNum, fmtPct, fmtTime, signed } from "@/lib/format";
 import type { EquityPoint } from "@/lib/types";
 
@@ -352,6 +357,7 @@ function AiStatsCard({
       </p>
       <RealizedKpiGroup stats={aiStats.realized ?? null} />
       <HorizonKpiGroup stats={aiStats.horizon ?? null} />
+      <ReasoningKpiGroup stats={aiStats.reasoning ?? null} />
       {observability && (
         <>
           <div className="mt-2 grid grid-cols-3 gap-2 sm:grid-cols-6">
@@ -464,6 +470,49 @@ function PrimaryKpi({ label, value, color }: { label: string; value: string; col
         {value}
       </span>
     </div>
+  );
+}
+
+/**
+ * 研判概况（ai-trade-deep-reasoning-chain §6.2 第 25 项）：阶段中位数 / 篇幅 / 截断 / token。
+ *
+ * 未开深度档 / 老记录 ⇒ 整段不渲染（绝不显示一排 0——那会让人以为「跑了但没想」）。
+ * token 一栏在 `tokensProviderKnown === false` 时显示「该服务未回报用量」而不是 0：
+ * 「没花 token」与「provider 没告诉我们花了多少」是两个截然不同的结论。
+ */
+function ReasoningKpiGroup({ stats }: { stats: AiTradeReasoningStats | null }) {
+  if (!stats || !stats.rounds) return null;
+  const known = stats.tokensProviderKnown !== false;
+  const tokenText = known
+    ? `${fmtNum((stats.inputTokens ?? 0) / 1000, 1)}k 入 / ${fmtNum((stats.outputTokens ?? 0) / 1000, 1)}k 出`
+    : "该服务未回报用量";
+  return (
+    <>
+      <div className="mt-2 grid grid-cols-3 gap-2 sm:grid-cols-6">
+        <Kpi label="研判深度档" value={REASONING_DEPTH_LABELS[stats.depth] ?? stats.depth} />
+        <Kpi label="阶段中位数" value={`${stats.medianStages ?? "—"}/12`} />
+        <Kpi
+          label="研判篇幅中位数"
+          value={stats.medianChars == null ? "—" : `${fmtNum(stats.medianChars / 1000, 1)}k 字`}
+        />
+        <Kpi label="截断轮" value={`${stats.truncatedRounds ?? 0}`} />
+        <Kpi
+          label="深化追问"
+          value={`${stats.reaskAdoptedRounds ?? 0}/${stats.reaskedRounds ?? 0}`}
+        />
+        <Kpi label="会话 token" value={tokenText} />
+      </div>
+      <p className="mt-1 text-[10px] leading-relaxed text-[var(--muted)]">
+        「深化追问」= 采纳数 / 触发数（追问只提升质量，失败或更浅一律保留首次决策，绝不降级）；
+        截断轮 = 输出预算在调用决策工具前耗尽的轮数。
+        {(stats.deadlineHitRounds ?? 0) > 0
+          ? `另有 ${stats.deadlineHitRounds} 轮因超时预算用尽提前收敛。`
+          : ""}
+        {(stats.contentFilteredRounds ?? 0) > 0
+          ? ` ${stats.contentFilteredRounds} 轮被模型侧内容安全拦截（不重试）。`
+          : ""}
+      </p>
+    </>
   );
 }
 

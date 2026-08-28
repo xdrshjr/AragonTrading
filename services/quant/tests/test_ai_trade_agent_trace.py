@@ -105,7 +105,7 @@ def _candle(idx: int, price: float = 30000.0) -> Candle:
 
 
 def _make_session(*, action="open_long", size=0.5, run_id=1, context_rounds=10,
-                  settings=None):
+                  settings=None, depth=None):
     settings = settings or Settings()
     calls = {"orders": [], "closes": []}
 
@@ -131,7 +131,8 @@ def _make_session(*, action="open_long", size=0.5, run_id=1, context_rounds=10,
         place_order_fn=place_order_fn, close_position_fn=close_position_fn,
         positions_fn=positions_fn)
     decider = AiTradeDecider(_TraceLLM(action, size), "sys",
-                             context_refresh_rounds=context_rounds, settings=settings)
+                             context_refresh_rounds=context_rounds, settings=settings,
+                             depth_profile=depth)
     spec = PaperStrategySpec(1, "S", "atomic", _StubStrategy({}), {})
     session = AiTradeSession("aitrade_trace", run_id, [spec], "BTC-USDT-SWAP", "1H", executor,
                              decider, priming=False, priming_bars=10,
@@ -339,5 +340,114 @@ async def test_run_finalizes_repo_for_summary_round(monkeypatch):
         await _settle(session)
         assert session.rounds_completed == 1
         assert session.decider.summary == "综合摘要：偏多"
+    finally:
+        await dispose_engine()
+
+
+# ============ 深度思维链的轨迹装配（ai-trade-deep-reasoning-chain §7.5 S-1 / S-6 / S-6b）============
+from app.ai_auto.trace import (                                     # noqa: E402
+    _TraceCoalescer,
+    _TRACE_FLUSH_CHARS,
+    _TRACE_MAX_CHARS,
+    _TRACE_ROUND_TOTAL_MAX,
+    PHASES,
+    ROUND_TEXT_KEYS,
+    append_round_text,
+)
+
+
+def test_reask_is_a_first_class_phase():
+    """追问必须是**独立相位**：并进 `analysis` 会把 S1–S12 追加成两遍（P0-3）。"""
+    assert "reask" in PHASES
+    assert set(ROUND_TEXT_KEYS) == {"thinking", "analysis", "reflection", "reaskAnalysis"}
+
+
+def test_new_round_trace_carries_the_two_reasoning_keys():
+    """轮次初值是**逐键手抄**装配：漏抄一个键，后端发什么前端都收不到（且不报错）。"""
+    trace = new_round_trace(1, _START_TS, 30000.0, {}, [])
+    assert trace["reaskAnalysis"] == ""
+    assert trace["reasoning"] is None
+
+
+def test_trace_thresholds_are_five_times_today():
+    """§3.3.4：单 phase 上限 ×5；冲刷阈同步抬高，否则 1000 槽位的订阅队列会被压满而静默丢帧。"""
+    assert _TRACE_MAX_CHARS == 20000
+    assert _TRACE_FLUSH_CHARS == 160
+    assert _TRACE_ROUND_TOTAL_MAX == 36000
+
+
+def test_round_total_trace_cap_is_enforced_across_all_four_slots():
+    """S-6b：四个槽位**合计**超过上限时按先到先得丢弃尾部（单成员常驻内存据此有界）。"""
+    trace = new_round_trace(1, _START_TS, 30000.0, {}, [])
+    assert append_round_text(trace, "analysis", "a" * 20000) == "a" * 20000
+    assert append_round_text(trace, "thinking", "t" * 20000) == "t" * 16000   # 只剩 16000 配额
+    assert append_round_text(trace, "reflection", "r" * 10) == ""             # 配额已耗尽
+    total = sum(len(trace[k] or "") for k in ROUND_TEXT_KEYS)
+    assert total == _TRACE_ROUND_TOTAL_MAX
+
+
+def test_round_total_cap_is_a_no_op_without_a_round():
+    """无在飞轮次（`trace is None`）时原样放行——回测 / 单测路径零副作用。"""
+    assert append_round_text(None, "analysis", "abc") == "abc"
+
+
+async def test_trace_flush_threshold_keeps_frame_count_flat():
+    """S-6：5× 文本量下**四槽位合计**的 delta 帧数 ≤ 合入前单轮帧数 × 2。
+
+    合入前：4000 字符 / 48 = ~84 帧。合入后：20000 字符 / 160 = ~125 帧（analysis）+ thinking。
+    """
+    collector = _EmitCollector()
+    pump = _TraceCoalescer(collector)
+    await pump.feed("analysis", "a" * 20000)
+    await pump.feed("thinking", "t" * 20000)
+    await pump.flush()
+    frames = [p for p in collector.parts if p.get("delta")]
+    assert len(frames) <= 2 * (4000 // 48 + 1) * 2
+
+
+async def test_result_event_carries_reasoning_block():
+    """S-1：`result` 帧带完整的 `reasoning` 对象；`off` 档 / 未装配 ⇒ **整键缺席**。
+
+    判据取自**经会话推出去的那一份 wire**，而不是 `ReasoningMeta.wire()` 的直接返回值。
+    """
+    from app.ai_auto.reasoning_protocol import profile_by_name
+
+    await init_db()
+    try:
+        settings = Settings(ai_trade_decision_max_retries=0, ai_trade_reasoning_reask_max=0)
+        session, _ = _make_session(settings=settings, depth=profile_by_name("deep"))
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        results = [e["data"] for e in _drain(q)
+                   if e.get("type") == "agent_trace" and e["data"].get("phase") == "result"]
+        assert results, "本轮没有 result 帧"
+        wire = results[-1]["reasoning"]
+        assert wire["depth"] == "deep"
+        assert wire["chars"] > 0 and wire["stages"] == 0      # 桩不按协议输出阶段标记
+        assert wire["truncated"] is False and wire["reasked"] is False
+        assert "elapsedMs" in wire and wire["elapsedMs"] >= 0
+        # 会话级观测同步落痕，且 status 的三个加法键真的挂上去了。
+        status = session._status_payload()
+        assert status["reasoningDepth"] == "deep"
+    finally:
+        await dispose_engine()
+
+
+async def test_result_event_omits_reasoning_without_a_depth_profile():
+    """未装配深度档（今日形态）⇒ `result` 帧与 `status` 都**整键缺席**（逐字回退）。"""
+    await init_db()
+    try:
+        session, _ = _make_session(
+            settings=Settings(ai_trade_decision_max_retries=0))
+        q = session.subscribe()
+        await session.feed_candle(_candle(0))
+        await _settle(session)
+        results = [e["data"] for e in _drain(q)
+                   if e.get("type") == "agent_trace" and e["data"].get("phase") == "result"]
+        assert results and "reasoning" not in results[-1]
+        status = session._status_payload()
+        assert "reasoningDepth" not in status
+        assert "reasoningTokens" not in status and "reasoningPressure" not in status
     finally:
         await dispose_engine()

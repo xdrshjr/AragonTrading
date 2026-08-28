@@ -9,6 +9,20 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+
+from .prompts_en import (
+    DECISION_TASK_INSTRUCTION_EN,
+    DECISION_TOOL_DESCRIPTION_EN,
+    REFLECTION_TASK_INSTRUCTION_EN,
+    SystemPromptOptions,
+    SystemPromptTexts,
+    exit_priority_tool_suffix_en,
+    hold_exit_tool_suffix_en,
+    limit_tool_suffix_en,
+    render_review_spine_en,
+    render_spine_en,
+)
 
 # 决策工具名（决策器据 tool_use_start.name 匹配；系统 prompt 亦引用）。
 DECISION_TOOL_NAME = "submit_trade_decision"
@@ -67,57 +81,70 @@ def _hold_exit_tool_description_suffix() -> str:
     )
 
 
-def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
-                                 leverage: float, position_step_pct: float = 0.0,
-                                 allow_limit: bool = False,
-                                 limit_band_pct: float = 0.02,
-                                 base_rules_text: str = "",
-                                 profit_guard_text: str = "",
-                                 sizing_text: str = "",
-                                 tactical_bars_text: str = "",
-                                 cost_text: str = "",
-                                 horizon_text: str = "") -> str:
-    """决策者系统 prompt：信号仅供参考 + 分步思维链纪律 + 风险偏好 + 只用真数据 + 收尾必调决策工具。
+# 九个旧关键字（六个文本段 + 三个开关）的兼容垫片键集（[P1-8]）。仓库里有上百条冻结断言以
+# 关键字直连调用 `build_ai_trade_system_prompt`，垫片不可省；但**未知键必须抛 TypeError**——
+# 一个拼错的关键字被 `**legacy` 静默吞掉，症状是「宪章章没进 prompt 而且不报错」。
+_LEGACY_TEXT_KEYS = ("base_rules_text", "profit_guard_text", "sizing_text",
+                     "tactical_bars_text", "cost_text", "horizon_text")
+_LEGACY_OPTION_KEYS = ("position_step_pct", "allow_limit", "limit_band_pct")
 
-    `position_step_pct`（默认 0.0 → 连续、原文逐字不变、零回归）：当 `>0` 时把决策纪律 #3 的
-    「sizeFraction 保守（默认 ≤0.5）」整句**替换**为「只能从允许档位中选择」（[R-8]，非追加——否则与档位
-    约束并存自相矛盾）。软引导，服务端 `quantize_size_fraction` 才是硬保证。
 
-    `allow_limit`（默认 False → 原文逐字不变、零回归）：当 `True` 时把纪律 #4 的动作清单整句
-    **替换**为含 `cancel_order` 与限价说明的版本（M-5，同样是替换而非追加——否则新旧动作清单并存
-    自相矛盾）。
+def _fold_legacy_kwargs(texts: "SystemPromptTexts | None",
+                        options: "SystemPromptOptions | None",
+                        legacy: dict) -> tuple[SystemPromptTexts, SystemPromptOptions]:
+    """把旧关键字折进两个聚合结构（两种写法产出 sha256 相同，用例 G-1b 冻结）。"""
+    unknown = set(legacy) - set(_LEGACY_TEXT_KEYS) - set(_LEGACY_OPTION_KEYS)
+    if unknown:
+        raise TypeError("build_ai_trade_system_prompt() 收到未知关键字："
+                        f"{sorted(unknown)}（旧键仅限 {_LEGACY_TEXT_KEYS + _LEGACY_OPTION_KEYS}）")
+    merged_texts = texts or SystemPromptTexts()
+    text_changes = {k: legacy[k] for k in _LEGACY_TEXT_KEYS if legacy.get(k)}
+    if text_changes:
+        merged_texts = replace(merged_texts, **text_changes)
+    merged_options = options or SystemPromptOptions()
+    option_changes = {k: legacy[k] for k in _LEGACY_OPTION_KEYS if k in legacy}
+    if option_changes:
+        merged_options = replace(merged_options, **option_changes)
+    return merged_texts, merged_options
 
-    `limit_band_pct`（末位，默认 0.02）：价带比例文案（F-3）。签名默认**只是零回归垫片**（保证既有
-    直连调用逐字不变），运行时唯一真源恒为 `settings.ai_trade_limit_price_max_deviation_pct`——
-    生产调用点（manager 装配）显式传参；`allow_limit=False` 路径不消费该参数。
 
-    `base_rules_text`（末位，默认 `""` → 渲染逐字节不变、零回归，ai-trade-base-strategy-ma-band P1-3）：
-    【基础策略】铁律章（`base_rules.format_charter` 产物）。非空时插在「首要原则」之后、「决策纪律」
-    之前——**位置本身就是优先级声明**：信号可被推翻，铁律不可违反。
+def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float, leverage: float, *,
+                                 texts: SystemPromptTexts | None = None,
+                                 options: SystemPromptOptions | None = None,
+                                 **legacy: object) -> str:
+    """决策者系统 prompt：中文脊柱（默认）或英文脊柱（`texts.reasoning_text` 非空时）。
 
-    `profit_guard_text`（末位，默认 `""` → 渲染逐字节不变、零回归，ai-trade-profit-protection §2.6 a）：
-    利润保护宪章章（`profit_guard_text.format_profit_guard_charter` 产物）。非空时紧随基础策略铁律章之后
-    ——两者都是「系统强制执行」的层，但语义互补：一个约束在哪开仓，一个约束利润何时被强制锁定。
+    [P1-8] 形参由 13 收敛到 6（4 位置 + `texts` + `options`），兑现
+    `.claude-index/config.md` 偏离表首行那条已登记的还债指示。九个旧关键字
+    （`base_rules_text` / `profit_guard_text` / `sizing_text` / `tactical_bars_text` /
+    `cost_text` / `horizon_text` / `position_step_pct` / `allow_limit` / `limit_band_pct`）
+    保留为兼容垫片：收到即折进两个聚合结构，产出 sha256 与直传聚合相同。
 
-    `sizing_text`（末位，默认 `""` → 渲染逐字节不变、零回归，vol-sizing-and-drawdown-brake §3.8）：
-    仓位与风险层宪章章（`sizing_text.format_sizing_charter` 产物）。紧随利润保护章之后——它约束的是
-    **下多大注**，与前两者「在哪开」「何时锁」构成完整的三段式硬约束声明。
+    分叉（ai-trade-deep-reasoning-chain §3.1.6）：
+    - `texts.reasoning_text == ""`（默认 / `off` 档）⇒ 走今日的中文渲染路径，**一个字符都不改**
+      （sha256 冻结门禁 G-7 / G-1 据此成立）；
+    - 非空 ⇒ 走 `prompts_en.render_spine_en`：英文脊柱 + 语言契约 + 术语表 + **中文五段宪章**
+      + 审议协议 + 五条英文纪律（第 5 条仍是收尾硬约束，占近因位）。
 
-    `cost_text`（末位，默认 `""` → 逐字节回退，cost-truth-and-net-pnl D-4）：交易成本宪章章，**置于
-    `sizing_text` 之后**——四段顺序即「在哪开 → 何时锁 → 下多大注 → 每笔要付多少」。
-
-    `horizon_text`（末位，默认 `""` → 逐字节回退，ai-trade-holding-horizon-modes §2.9）：交易周期
-    模式宪章章，**置于 `cost_text` 之后**——五段顺序即「在哪开 → 何时锁 → 下多大注 → 每笔要付多少
-    → 应该持有多久」。它必须排在成本之后：只有先知道一次往返要付多少，「不要为了一个还没覆盖手续费
-    的浮盈去付两笔手续费」这句话才成立。
-
-    `tactical_bars_text`（末位，默认 `""` → 渲染逐字节不变、零回归，ai-trade-wake-aware-context §2.8）：
-    本会话实际注入的战术周期串（`"5m → 1m"`）。非空时在决策纪律 #1 的中线背景子句之后**插入**一句
-    择时核对指令——「说的」与「给的」必须是同一批周期，故取值只能来自 `WakeRuntime` 的同一个真源。
+    各文本段的语义与插入位置与合入前逐字一致，详见 `SystemPromptTexts` 各字段。
     """
+    texts, options = _fold_legacy_kwargs(texts, options, legacy)
+    if texts.reasoning_text:
+        return render_spine_en(inst_id, bar, budget_usd, leverage, texts=texts,
+                               position_step_pct=options.position_step_pct,
+                               allow_limit=options.allow_limit,
+                               band_text=_fmt_band_pct(options.limit_band_pct))
+    return _render_spine_zh(inst_id, bar, budget_usd, leverage,
+                            texts=texts, options=options)
+
+
+def _render_spine_zh(inst_id: str, bar: str, budget_usd: float, leverage: float, *,
+                     texts: SystemPromptTexts, options: SystemPromptOptions) -> str:
+    """中文脊柱（本特性合入前的**逐字节**原文；`off` 档的真源，勿改一个字符）。"""
     charter = "".join(
         f"{text}\n\n" for text in
-        (base_rules_text, profit_guard_text, sizing_text, cost_text, horizon_text) if text)
+        (texts.base_rules_text, texts.profit_guard_text, texts.sizing_text,
+         texts.cost_text, texts.horizon_text) if text)
     return (
         "你是一名严谨、纪律性极强的加密合约自动交易决策者。你不是聊天助手，也不是信号复读机——你的"
         f"**唯一职责**是在每个决策轮，为标的 {inst_id}（周期 {bar}）做出一个受严格约束的交易决策。"
@@ -130,7 +157,7 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
         "决策纪律：\n"
         "1. **每轮必须先输出一段分步骤的研判（思维链）**。输入提供可用多周期证据时，先按 "
         "1D → 12H → 4H → 1H 研判中线背景、趋势一致性、候选支撑阻力与超买/超卖，"
-        f"{_tactical_discipline(tactical_bars_text)}再依次思考："
+        f"{_tactical_discipline(texts.tactical_bars_text)}再依次思考："
         "① 价格走势（方向、动量、均线结构、"
         "区间位置）；② 成交量（量能、量比、放缩、异常放量）；③ 市场体制（趋势/震荡/高低波动/事件）；"
         "④ 技术因子读数（RSI/MACD/布林/ATR/动量各说明什么）；⑤ 逐一批判各策略信号——每个策略此刻的"
@@ -142,9 +169,9 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float,
         "反转时优先考虑 close；陈旧或缺失周期不得补猜。观望是需要当前证据支撑的主动决策，不是默认"
         "答案；不要因历史摘要中长期观望而路径依赖。\n"
         f"3. 风险优先：已持仓且多数证据转为反向时，优先 close 保护利润 / 止损；空仓且多数证据同向、"
-        f"研判充分时才开仓，{_size_discipline(position_step_pct, bool(sizing_text))}，"
+        f"研判充分时才开仓，{_size_discipline(options.position_step_pct, bool(texts.sizing_text))}，"
         "避免频繁反手与过度交易。\n"
-        f"4. {_action_discipline(allow_limit, limit_band_pct)}"
+        f"4. {_action_discipline(options.allow_limit, options.limit_band_pct)}"
         "真实下单由系统的守护执行器落地并继承全部资金护栏，你只需给出决策与理由。\n"
         "5. **收尾硬约束（务必遵守）：每轮在完成上述分步研判之后，必须且只能调用一次 "
         "`submit_trade_decision` 工具提交本轮决策——绝不允许只输出研判文字而不调用决策工具。**"
@@ -202,22 +229,28 @@ def _size_discipline(position_step_pct: float, sizing_enabled: bool = False) -> 
 def build_decision_tool_description(allow_limit: bool = False, *,
                                     limit_band_pct: float = 0.02,
                                     allow_hold_exit: bool = False,
-                                    allow_exit_priority: bool = False) -> str:
-    """决策工具散文描述；`allow_limit` / `allow_hold_exit` 皆假（默认）**恒等**返回模块常量（零回归，M-4）。
+                                    allow_exit_priority: bool = False,
+                                    lang: str = "zh") -> str:
+    """决策工具散文描述；三个总闸皆假 **且** `lang="zh"` 时**恒等**返回模块常量（零回归，M-4）。
 
     `limit_band_pct`（keyword-only，F-3）：价带比例文案；默认 0.02 渲染与参数化前逐字节相同。
     `allow_hold_exit`（keyword-only，C1）：为真时在尾部追加承诺退出线说明；关闭时逐字节回退（G-2）。
     `allow_exit_priority`（keyword-only，exit-priority §6.1）：同款——为真时追加离场优先通道说明。
+    `lang`（keyword-only，deep-reasoning-chain §3.1.7）：`"zh"`（默认）⇒ 今日中文常量与中文
+        后缀，逐字节回退；`"en"` ⇒ **整体**换英文（基础描述与三段后缀一并换，绝不中英混排）。
     """
-    if not allow_limit and not allow_hold_exit and not allow_exit_priority:
+    english = str(lang or "zh").strip().lower() == "en"
+    if not english and not allow_limit and not allow_hold_exit and not allow_exit_priority:
         return DECISION_TOOL_DESCRIPTION
-    text = DECISION_TOOL_DESCRIPTION
+    text = DECISION_TOOL_DESCRIPTION_EN if english else DECISION_TOOL_DESCRIPTION
     if allow_limit:
-        text += _limit_tool_description_suffix(limit_band_pct)
+        text += (limit_tool_suffix_en(_fmt_band_pct(limit_band_pct)) if english
+                 else _limit_tool_description_suffix(limit_band_pct))
     if allow_hold_exit:
-        text += _hold_exit_tool_description_suffix()
+        text += hold_exit_tool_suffix_en() if english else _hold_exit_tool_description_suffix()
     if allow_exit_priority:
-        text += _exit_priority_tool_description_suffix()
+        text += (exit_priority_tool_suffix_en() if english
+                 else _exit_priority_tool_description_suffix())
     return text
 
 
@@ -239,7 +272,8 @@ def _exit_priority_tool_description_suffix() -> str:
 def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = False,
                                limit_band_pct: float = 0.02,
                                allow_hold_exit: bool = False,
-                               allow_exit_priority: bool = False) -> dict:
+                               allow_exit_priority: bool = False,
+                               allow_reasoning_digest: bool = False) -> dict:
     """按档位步长 + 限价总闸 + 承诺退出线总闸构造决策工具 `input_schema`（[R-5] `enum` 取真源）。
 
     `step<=0` **且** `allow_limit=False` **且** `allow_hold_exit=False`（含全部默认调用）原样返回模块
@@ -262,9 +296,11 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
         `validate_limit_intent`），本 schema 只是软引导。
     """
     step = max(0.0, float(position_step_pct))
-    # 【R:P1-9a】早退判据必须同时含 `allow_exit_priority`——漏了它，总闸开着时 schema 会原样返回
-    # 模块常量，两个新字段永远露不出来，而**不报任何错**（G-2 的直接依赖）。
-    if step <= 0 and not allow_limit and not allow_hold_exit and not allow_exit_priority:
+    # 【R:P1-9a】早退判据必须同时含每一个总闸——漏一个，该总闸开着时 schema 会原样返回模块常量，
+    # 新字段永远露不出来，而**不报任何错**（G-2 的直接依赖）。`allow_reasoning_digest`
+    # （deep-reasoning-chain §3.1.7）同理。
+    if (step <= 0 and not allow_limit and not allow_hold_exit and not allow_exit_priority
+            and not allow_reasoning_digest):
         return DECISION_TOOL_SCHEMA
     schema = dict(DECISION_TOOL_SCHEMA)
     props = dict(DECISION_TOOL_SCHEMA["properties"])   # 独立浅拷贝，杜绝改动泄漏回模块常量
@@ -283,6 +319,15 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
                            "绝不放松，且不会劣于保本线。给了它等于让系统替你守住这条线，你无需每轮盯盘。"}
     if allow_exit_priority:
         _apply_exit_priority_properties(props)
+    if allow_reasoning_digest:
+        # deep-reasoning-chain §3.1.7：可选的中文证据摘要（`required` 不变，永远可选）。仅在
+        # 调用方自己的 props 浅拷贝上补，绝不改模块常量。
+        # ⚠️ 它**绝不**参与任何交易语义：缺席 / 非字符串 / 超长 / 写成英文 四种情形一律不产生
+        # degrade（用例 D-11 / D-12）——一个摘要写错是排版问题，不是安全问题。
+        props["evidenceDigest"] = {
+            "type": "string", "maxLength": 400,
+            "description": "（可选，用简体中文写）给人类操作员看的证据摘要：你采纳了哪些信号、"
+                           "推翻了哪些、决定性证据是什么、什么会让你改变主意。不要复述行情数字。"}
     schema["properties"] = props
     return schema
 
@@ -743,9 +788,12 @@ def build_decision_prompt(payload: dict) -> str:
     ]
     if summary:
         parts.append(f"\n【此前执行摘要（你的长期记忆）】\n{summary}")
+    # deep-reasoning-chain §3.1.6：收尾任务指令按 `reasoningDepth`（**加法键**）分叉。
+    # 键缺席（回测老 payload / off 档 / 全部既有用例）⇒ 中文原句逐字节回退（G-1 冻结）。
     parts.append(
-        f"\n请先按上述纪律逐步研判（思维链），再必须且只能调用一次 {DECISION_TOOL_NAME} "
-        "提交本轮决策——不得只输出研判文字。")
+        DECISION_TASK_INSTRUCTION_EN if payload.get("reasoningDepth") else
+        (f"\n请先按上述纪律逐步研判（思维链），再必须且只能调用一次 {DECISION_TOOL_NAME} "
+         "提交本轮决策——不得只输出研判文字。"))
     return "\n".join(parts)
 
 
@@ -775,7 +823,7 @@ REFLECTION_TOOL_DESCRIPTION = (
 )
 
 
-def build_reflection_system_prompt(horizon_text: str = "") -> str:
+def build_reflection_system_prompt(horizon_text: str = "", reasoning_text: str = "") -> str:
     """反思复核官系统 prompt：分级复核标准（有名有姓才否决，收缩优先），只可收紧，收尾必调反思工具。
 
     hold-inertia-fix F1：删除「任何不放心即 abort（宁可错过不可做错）」的不对称保守标准——它把 abort
@@ -786,7 +834,17 @@ def build_reflection_system_prompt(horizon_text: str = "") -> str:
     `horizon_text`（默认 `""` → 逐字节回退，holding-horizon §2.9 c）：持仓周期模式的补充段，**追加
     而非替换**既有的「`close` 是风险收敛动作」一句——那句仍然成立，本段补的是它缺失的对称性：
     「过早的 `close`」与「该平不平」是两种同样真实的错误。
+
+    `reasoning_text`（末位，默认 `""` → 逐字节回退，deep-reasoning-chain §3.2）：《对抗式复核
+    协议》R1–R7 正文。非空 ⇒ 整体换英文复核官脊柱；安全语义（只能收紧 / abort 须指名实质性
+    缺陷 / 机会成本对称 / fail-closed）**一个字节都不改**，改的只有「怎么想」。
+
+    ⚠️ 本函数全仓**唯一**的调用点是 `decider._stream_reflection`（每轮现造 `system`）。
+    manager 与 backtest **从未**引用过它——在那里注入 `reasoning_text` 是一条不报错、不判红、
+    轴 B 整条死掉的死路（spec §3.2 / P0-5，装配判据见用例 S-7 / S-9）。
     """
+    if reasoning_text:
+        return render_review_spine_en(reasoning_text, horizon_text)
     return (
         "你是一名独立的下单前风控复核官。刚才另一名交易员基于同样的证据给出了一个**交易决策**（会真实"
         "下单、动用真金）。你的职责**不是**重新交易，而是**批判性地复核这个决策是否稳健**："
@@ -845,7 +903,9 @@ def build_reflection_prompt(payload: dict, decision) -> str:
         "反手 / 证据严重不足却重仓）时才 `abort`，`reason` 须引用具体证据。错过一笔证据充分的交易与做错"
         "一笔同样是损失；只能收紧、不得放大或改向。"
         f"你的**唯一任务**是必须且只能调用一次 {REFLECTION_TOOL_NAME} 提交裁决——不得只输出复核文字，"
-        "也不得调用其它工具。")
+        "也不得调用其它工具。"
+        # 同款按 `reasoningDepth` 分叉的英文收尾指令（键缺席 ⇒ 整段不追加，逐字节回退）。
+        + (REFLECTION_TASK_INSTRUCTION_EN if payload.get("reasoningDepth") else ""))
 
 
 def build_summary_system_prompt() -> str:

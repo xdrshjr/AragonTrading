@@ -224,6 +224,10 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     proposedReason: null,
     vetoedBy: null,
     exitPriority: null,
+    // 深度思维链（deep-reasoning-chain §4.2）：本函数是**逐键手抄**装配，漏抄这两键
+    // `AiTradeRoundTrace` 永远拿不到本层数据 ⇒ 后端发什么前端都收不到（跑不出错、功能静默缺失）。
+    reaskAnalysis: "",
+    reasoning: null,
     state: "deciding",
   };
 }
@@ -235,6 +239,10 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
       return { ...t, thinking: t.thinking + (evt.delta ?? "") };
     case "analysis":
       return { ...t, analysis: t.analysis + (evt.delta ?? "") };
+    case "reask":
+      // 浅研判追问（P0-3）：累积进**独立**字段，`analysis` 一个字符都不动。两份并列呈现是
+      // 刻意的——被拒收的那一份正是「模型第二次反而想得更浅」的现场证据。
+      return { ...t, reaskAnalysis: (t.reaskAnalysis ?? "") + (evt.delta ?? "") };
     case "tool_call_start":
       return { ...t, toolCallPending: true };
     case "tool_call":
@@ -253,6 +261,8 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
         ...t,
         executed: evt.executed ?? null,
         degradeReason: evt.degradeReason ?? null,
+        // 整份归约（不逐键手抄）：下次后端加字段时不会漏抄——`horizonWire` 已确立这个先例。
+        reasoning: evt.reasoning ?? null,
         state: evt.executed?.skipped ? "skipped" : "done",
       };
     case "summary":
@@ -265,6 +275,11 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
         ...t,
         thinking: "",
         analysis: "",
+        // 追问槽位与后端 `_apply_retry_marker` 逐字对齐：两侧清零集合一旦分叉，重连回放
+        // 与在线归约就会给出两份不同的界面。`reasoning` 只在 `result` 相位定型（后端
+        // 因此无需清），这里一并置空是为了乱序 / 重放帧下不会把上一次尝试的读数留在卡上。
+        reaskAnalysis: "",
+        reasoning: null,
         toolCallPending: false, // R-1：与后端一致，清失败尝试残留的工具挂起指示
         state: "deciding",
         retries: (t.retries ?? 0) + 1,

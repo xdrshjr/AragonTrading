@@ -68,6 +68,25 @@ export interface AiTradeHistorySummary {
 }
 
 // metrics_json 解析（全可选，缺失即优雅降级——崩溃 / 对账会话没有富化字段）。
+// 深度思维链的会话级观测（§3.4.4）。`inputTokens/outputTokens` 在
+// `tokensProviderKnown === false` 时为 **null 而非 0**。
+export interface AiTradeReasoningStats {
+  depth: string;
+  rounds: number;
+  medianChars?: number | null;
+  medianStages?: number | null;
+  truncatedRounds?: number;
+  reaskedRounds?: number;
+  reaskAdoptedRounds?: number;
+  deadlineHitRounds?: number;
+  contentFilteredRounds?: number;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  tokensProviderKnown?: boolean;
+  reflectionRounds?: number;
+  reflectionMedianChars?: number | null;
+}
+
 export interface AiTradeRunMetrics {
   totalReturn?: number;
   tradeCount?: number;
@@ -111,6 +130,11 @@ export interface AiTradeRunMetrics {
       previewErrors?: number;
       previewDisabled?: boolean;
     };
+    // 深度思维链观测（ai-trade-deep-reasoning-chain §3.4.4）：加法写既有 JSON 列，老记录 /
+    // off 档缺键 ⇒ 整段隐藏（绝不显示一排误导性的 0）。
+    // `tokensProviderKnown=false` 时 `inputTokens/outputTokens` 为 **null 而非 0**——「没花
+    // token」与「provider 没告诉我们花了多少」是两个截然不同的结论，混成 0 会误导后续调参。
+    reasoning?: AiTradeReasoningStats;
     // 成本真值化（cost-truth §5.4，**顶层**加法键）：老记录缺键 ⇒ 整段隐藏（绝不显示误导性的 0）。
     feeRates?: FeeRatesWire;
     reconcile?: ReconcileWire;

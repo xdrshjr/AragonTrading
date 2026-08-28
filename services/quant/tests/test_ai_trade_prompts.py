@@ -6,15 +6,29 @@
 """
 from __future__ import annotations
 
+import hashlib
+
+import pytest
+
 from app.ai_auto.decider import TradeDecision
 from app.ai_auto.prompts import (
+    DECISION_TOOL_DESCRIPTION,
     DECISION_TOOL_NAME,
+    DECISION_TOOL_SCHEMA,
     REFLECTION_TOOL_NAME,
     _format_position,
     build_ai_trade_system_prompt,
     build_decision_prompt,
+    build_decision_tool_description,
+    build_decision_tool_schema,
     build_reflection_prompt,
     build_reflection_system_prompt,
+)
+from app.ai_auto.prompts_en import SystemPromptOptions, SystemPromptTexts
+from app.ai_auto.reasoning_protocol import (
+    build_deliberation_protocol,
+    build_review_protocol,
+    profile_by_name,
 )
 
 
@@ -792,3 +806,95 @@ def test_armed_horizon_renders_the_round_section():
     assert "离场连续确认：1/2" in text
     assert "需浮盈 ≥ 19.5bps" in text
     assert "交易所侧未挂止盈止损" in text          # 两者皆空时如实说没有（诚实约束）
+
+
+# ============ 深度思维链的零回归门禁（ai-trade-deep-reasoning-chain §7.1 G-1/G-1b/G-2/G-3）============
+_ARGS = ("BTC-USDT-SWAP", "1H", 100.0, 3.0)
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_off_depth_keeps_three_prompts_byte_identical():
+    """G-1：不传 `texts` 与传全空 `SystemPromptTexts()` 产出 sha256 相同；反思与决策 prompt 同款。"""
+    assert _sha(build_ai_trade_system_prompt(*_ARGS)) == _sha(
+        build_ai_trade_system_prompt(*_ARGS, texts=SystemPromptTexts()))
+    assert _sha(build_reflection_system_prompt()) == _sha(
+        build_reflection_system_prompt("", ""))
+    payload = _payload_with_digest()
+    assert "reasoningDepth" not in payload      # 老 payload 无该键 ⇒ 收尾指令逐字回退
+    assert build_decision_prompt(payload).rstrip().endswith("不得只输出研判文字。")
+
+
+def test_legacy_text_kwargs_equal_aggregated_texts():
+    """G-1b：九个旧关键字逐一直传，与折进两个聚合结构传入，产出 sha256 **相等**。
+
+    这条用例是聚合迁移的安全网：仓库里有上百条冻结断言以关键字直连调用本函数。
+    """
+    legacy = build_ai_trade_system_prompt(
+        *_ARGS, position_step_pct=0.25, allow_limit=True, limit_band_pct=0.015,
+        base_rules_text="A", profit_guard_text="B", sizing_text="C",
+        tactical_bars_text="5m → 1m", cost_text="D", horizon_text="E")
+    aggregated = build_ai_trade_system_prompt(
+        *_ARGS,
+        options=SystemPromptOptions(position_step_pct=0.25, allow_limit=True,
+                                    limit_band_pct=0.015),
+        texts=SystemPromptTexts(base_rules_text="A", profit_guard_text="B", sizing_text="C",
+                                tactical_bars_text="5m → 1m", cost_text="D",
+                                horizon_text="E"))
+    assert _sha(legacy) == _sha(aggregated)
+
+
+def test_unknown_legacy_kwarg_raises_instead_of_being_swallowed():
+    """垫片必须**拒收**未知键：静默吞掉一个拼错的关键字 = 宪章章没进 prompt 且不报错。"""
+    with pytest.raises(TypeError):
+        build_ai_trade_system_prompt(*_ARGS, base_rule_text="typo")
+
+
+def test_off_depth_tool_schema_identity():
+    """G-2：`build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA` 仍成立（恒等，非相等）。"""
+    assert build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA
+    opened = build_decision_tool_schema(0.0, allow_reasoning_digest=True)
+    assert opened is not DECISION_TOOL_SCHEMA
+    assert "evidenceDigest" not in DECISION_TOOL_SCHEMA["properties"]   # 常量未被就地改
+
+
+def test_off_depth_tool_description_identity():
+    """G-3：默认调用**恒等**返回今日常量；`lang="en"` 才整体换英文（且三段后缀一并换）。"""
+    assert build_decision_tool_description() is DECISION_TOOL_DESCRIPTION
+    assert build_decision_tool_description(lang="zh") is DECISION_TOOL_DESCRIPTION
+    english = build_decision_tool_description(True, allow_hold_exit=True,
+                                              allow_exit_priority=True, lang="en")
+    assert english.startswith("Submit the single trading decision")
+    assert "提交本轮" not in english and "另可给 orderType" not in english
+
+
+def test_english_spine_keeps_the_chinese_charter_and_ends_with_the_hard_constraint():
+    """英文脊柱下：五段**中文**宪章原样注入（§1.2 非目标），收尾硬约束仍占近因位（P-3）。"""
+    deep = profile_by_name("deep")
+    text = build_ai_trade_system_prompt(
+        *_ARGS, texts=SystemPromptTexts(reasoning_text=build_deliberation_protocol(deep),
+                                        base_rules_text="【基础策略】中文铁律章"))
+    assert "【基础策略】中文铁律章" in text
+    assert "GLOSSARY" in text and "LANGUAGE CONTRACT" in text
+    assert text.rstrip().endswith("never acceptable and costs the round.**")
+
+
+def test_reflection_prompt_switches_to_english_only_with_a_protocol():
+    """反思侧同款分叉：`reasoning_text=""` ⇒ 今日中文原文；非空 ⇒ 英文复核官脊柱 + R1–R7。"""
+    zh = build_reflection_system_prompt()
+    en = build_reflection_system_prompt("", build_review_protocol(profile_by_name("deep")))
+    assert "独立的下单前风控复核官" in zh and "## R7" not in zh
+    assert "independent pre-trade risk reviewer" in en and "## R7" in en
+    # 安全锚点在两种语言下都必须在（英文脊柱不得稀释安全语义）。
+    assert "只能" in zh and "only tighten" in en
+
+
+def test_decision_prompt_task_instruction_forks_on_reasoning_depth():
+    """收尾任务指令按 `reasoningDepth` **加法键**分叉；键缺席 ⇒ 中文原句逐字节回退。"""
+    payload = {"round": 1, "barTs": 1, "lastPx": 1.0, "signalBoard": []}
+    zh = build_decision_prompt(payload)
+    en = build_decision_prompt({**payload, "reasoningDepth": "deep"})
+    assert zh.rstrip().endswith("不得只输出研判文字。")
+    assert "S1 -> S12" in en and "Simplified Chinese" in en

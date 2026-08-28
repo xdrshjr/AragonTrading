@@ -302,7 +302,11 @@ export type AiTradeTracePhase =
   // 仓位求解 + ATR 止损 + 回撤刹车段（vol-sizing-and-drawdown-brake §3.9）：仅规则装配的会话每轮一条。
   | "sizing"
   // 持仓周期铁律段（ai-trade-holding-horizon-modes §4.4）：仅契约装配的会话每轮一条（含放行轮）。
-  | "horizon";
+  | "horizon"
+  // 浅研判追问的流式文本（ai-trade-deep-reasoning-chain §4.2 / P0-3）：**独立相位**，归约进
+  // `reaskAnalysis` 而非 `analysis`——后者是纯追加、唯一清零点是 `retry`，并进去会把 S1–S12
+  // 追加成两遍，而追问**本来就可能被拒收**。两份并列呈现是刻意的。
+  | "reask";
 
 // ---- 交易周期模式（ai-trade-holding-horizon-modes §4.1/§5.4，与后端 hold_horizon 逐键镜像）----
 export type AiTradeHorizonProfileId =
@@ -896,6 +900,34 @@ export interface AiTradeCostSnapshot {
   priorAgeS?: number | null;
 }
 
+// 深度思维链的逐轮元数据（ai-trade-deep-reasoning-chain §4.2）：**整份**挂在 `result` 相位上
+// （沿用 `horizonWire` 整对象透传的先例），后端刻意不新增 `result` 子相位——新增一个相位在本
+// 仓库的代价是 8 个前端镜像点，而这是一份轮末才定型的只读读数。off 档 ⇒ 整键缺席 ⇒ 全段不渲染。
+export interface AiTradeReasoningWire {
+  depth: string; // off | standard | deep | exhaustive
+  chars: number; // 研判全文字符数（截断后）
+  stages: number; // 命中的 `## S<k>` 阶段标记数
+  truncated: boolean; // 输出预算耗尽在工具调用之前（provider 归一口径）
+  reasked: boolean; // 本轮触发过浅研判追问
+  reaskAdopted: boolean; // 追问结果被采纳（false = 追问跑了但保留首次决策）
+  deadlineHit: boolean; // 本轮因轮级墙钟闸提前收敛
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  elapsedMs?: number | null;
+  reflectionChars?: number | null;
+  reflectionStages?: number | null;
+}
+
+// 「研判耗时逼近唤醒周期」压力提示（§3.4.3）：**只读提示，绝不自动改唤醒周期**。
+// 关闭定时唤醒（`wakeIntervalMinutes = 0`）的会话恒不下发这个键——对不按周期交易的人提周期
+// 建议是纯噪音。字段名是 `ewmaMs` 而非 `p50Ms`：算的是 α=0.3 的指数移动平均，不是中位数。
+export interface AiTradeReasoningPressure {
+  ewmaMs: number;
+  intervalS: number;
+  suggestIntervalMin: number;
+  level: string; // warn
+}
+
 // agent_trace 事件 data（各字段按 phase 可选；前端 reducer 按 phase 归约）。
 export interface AiTradeTraceEvent {
   phase: AiTradeTracePhase;
@@ -910,9 +942,14 @@ export interface AiTradeTraceEvent {
     reason: string;
     orderType?: "market" | "limit" | null; // 委托方式（缺省 market）
     limitPrice?: number | null;
+    // 面向操作员的中文证据摘要（deep-reasoning-chain §3.1.7）：模型提交的可选工具入参。
+    // 未装配 / off 档 / 模型没给 ⇒ **整键缺席**（不是 null）⇒ 收起态标题回退到 S12 首句。
+    evidenceDigest?: string | null;
   }; // tool_call：门禁后最终决策工具入参
   executed?: AiTradeDecision["executed"]; // result（复用既有 executed 形状）
   degradeReason?: string | null; // result
+  // result：深度思维链元数据（整份对象；off 档 ⇒ 整键缺席）。
+  reasoning?: AiTradeReasoningWire | null;
   summary?: string; // summary
   message?: string; // error
   lastPx?: number; // round_start
@@ -1037,6 +1074,13 @@ export interface AiTradeRoundTrace {
   experience?: import("./experienceTypes").AiTradeExperienceInjection | null;
   thinking: string; // 累积深度思考（未开启扩展思考时通常为空）
   analysis: string; // 累积自然语言研判分析（流式主可见内容）
+  // 浅研判追问的**独立**累积槽位（deep-reasoning-chain §4.2 / P0-3）：**绝不并进 `analysis`**。
+  // `analysis` 是纯追加归约、唯一清零点是 `retry` 相位，而追问跑在重试循环之后——沿用同一字段
+  // 会把 S1–S12 追加成两遍（导轨读出 24/12），而追问**本来就可能被拒收**。两份并列呈现是刻意的。
+  // **必须与 emptyRoundTrace 的逐键手抄保持一致**——漏一个键，后端发什么前端都收不到。
+  reaskAnalysis?: string;
+  // 本轮研判元数据（`result` 相位整份归约）；未装配 / off 档恒为 null ⇒ 相关段整段不渲染。
+  reasoning?: AiTradeReasoningWire | null;
   toolCallPending?: boolean;
   toolCall?: AiTradeTraceEvent["input"] | null;
   executed?: AiTradeDecision["executed"];
@@ -1141,6 +1185,12 @@ export interface AiTradeSessionRow {
   contextSummary?: string | null;
   degraded?: boolean | null;
   wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭）
+  // 深度研判三键（deep-reasoning-chain §4.3）：status 事件经 `patchAiTradeMemberStatus` **整体
+  // spread** 合并进 `m.session`，故运行期数据本来就在——漏的只是类型声明。未装配 / off 档 ⇒
+  // 三键整键缺席（不是 null）⇒ 概览条上的深度 chip / token 累计 / 压力提示条全部不渲染。
+  reasoningDepth?: string;
+  reasoningTokens?: { inputTokens: number; outputTokens: number };
+  reasoningPressure?: AiTradeReasoningPressure;
   // hold-inertia-observability O2：唤醒守卫抑制计数 / 连续真实观望轮数（status/snapshot.status 经
   // 全量 spread 合并进 member.session；REST info() 不带 → WS 连上前短暂 undefined，呈现「—」）。
   wakeSkips?: number;
@@ -1207,6 +1257,11 @@ export interface AiTradeStatusEvent {
   roundsSinceSummary?: number;
   contextRefreshRounds?: number;
   wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭）
+  // 深度研判三键（同 AiTradeSessionRow）：status 事件经 patchAiTradeMemberStatus 整体 spread
+  // 合并进 m.session，故两侧类型必须同时声明——只补一处，刷新页面后那三个键会在成员卡上凭空消失。
+  reasoningDepth?: string;
+  reasoningTokens?: { inputTokens: number; outputTokens: number };
+  reasoningPressure?: AiTradeReasoningPressure;
   // hold-inertia-observability O2：第 1 轮后端已发 wakeSkips（本轮补齐类型）；holdStreak 为本轮新增。
   wakeSkips?: number;
   holdStreak?: number;
@@ -1328,6 +1383,9 @@ export interface AiTradeGroupStartReq {
   primingBars?: number;
   positionStepPct?: number | null;  // 仓位操作档位步长（fraction；留空→服务端默认；0→连续）
   wakeIntervalMinutes?: number | null;  // Agent 墙钟定时唤醒周期（分钟；留空→服务端默认 2；0→关闭）
+  // 研判深度档（§4.4）：留空 ⇒ 服务端用 `AI_TRADE_REASONING_DEPTH`（默认 deep）。**仅实盘下发**
+  // ——回测档由服务端独立取 `AI_TRADE_REASONING_DEPTH_BACKTEST`（默认 standard，§3.6 成本护栏）。
+  reasoningDepth?: AiTradeReasoningDepth | null;
   baseRules?: AiTradeBaseRules | null;  // 【基础策略】铁律（字段省略→服务端默认开启）
   profitGuard?: AiTradeProfitGuardRule | null;  // 利润保护层（字段省略→服务端默认开启）
   tradingHorizon?: AiTradeHorizonRule | null;   // 交易周期模式（字段省略→服务端默认开启）
@@ -1845,7 +1903,13 @@ export interface AiTradeConfig {
   // （**不**为此改 persist version，沿用 baseRules 先例，避免动 migration 链）。
   tradingHorizon?: AiTradeHorizonRule;
   experience?: import("./experienceTypes").AiTradeExperienceRule;   // 经验模式偏好（可选，同款兜底）
+  // 研判深度档偏好（可选，同款兜底：读点一律 `?? AI_TRADE_DEFAULT_REASONING_DEPTH`）。
+  // **不**为此改 persist version，沿用 baseRules 先例，避免动 migration 链。
+  reasoningDepth?: AiTradeReasoningDepth;
 }
+
+// 研判深度四档（ai-trade-deep-reasoning-chain §3.1.1）：与后端 `Literal` 逐字对应。
+export type AiTradeReasoningDepth = "off" | "standard" | "deep" | "exhaustive";
 
 // ---- 止损来源七态（tradability-and-open-funnel 轴 B · R-5）----
 // 五态 → 七态。**三处漏一处即静默显示空串**：本类型、`lib/aiTrade.ts` 的 `STOP_SOURCE_LABEL`、

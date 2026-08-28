@@ -33,10 +33,15 @@ if TYPE_CHECKING:                       # 仅类型标注用，运行期不导�
 # 一条。它与 `retry` 面包屑同款：一条灰色注记，说明「长期记忆这一次没刷新成、连续第几次了」。
 # 值得新增一个相位的理由：摘要失败在合入前**没有任何呈现落点**（`_status_payload` 只有
 # `roundsSinceSummary`），而实测出现过 4 条连续失败且诊断串全为空——那正是「后端算了但用户看不见」。
+# reask：浅研判追问的流式文本（ai-trade-deep-reasoning-chain §3.4.2 / P0-3）。**必须是独立相位**
+# ——前端对 `analysis` 是纯追加归约、全流程唯一清零点是 `retry` 相位，而追问跑在重试循环**之后**、
+# 不经 `_emit_retry`。沿用 `analysis` 相位会把 S1–S12 追加成两遍（阶段导轨读出 24/12）；改用
+# `emit=None` 则界面上留着的是被丢弃的浅研判——两种写法都让「界面上的研判」与「实际生效的决策」
+# 不是同一份。两份并列呈现是刻意的：被拒收的那一份正是「模型第二次反而想得更浅」的现场证据。
 PHASES = ("round_start", "thinking", "analysis", "tool_call_start",
           "tool_call", "result", "summary", "error", "retry",
           "reflection_start", "reflection", "reflection_verdict", "base_rule", "edge_gate",
-          "sizing", "horizon", "summary_failed")
+          "sizing", "horizon", "summary_failed", "reask")
 
 # `sizing` 事件与在飞轮次共用的键集合（**单一真源**：事件装配、轮次初值、前端镜像三处照它对齐）。
 SIZING_TRACE_KEYS = (
@@ -46,12 +51,54 @@ SIZING_TRACE_KEYS = (
     "stopPct", "takePct", "stopSource", "effectiveExposure", "effectiveExposureCap",
     "corrScale", "exposureCapUnreachable")
 
-# 合并冲刷阈值：累计 ≥48 字符 / 相变 / 工具起始 / 收尾 即冲刷一条 delta（轮间隔以分钟计，量级极低）。
-_TRACE_FLUSH_CHARS = 48
-# 整轮单 phase 累计文本硬上限（防滥用），超出后丢弃尾部。
-_TRACE_MAX_CHARS = 4000
+# 合并冲刷阈值：累计 ≥160 字符 / 相变 / 工具起始 / 收尾 即冲刷一条 delta（轮间隔以分钟计，量级极低）。
+# [deep-reasoning-chain §3.3.4] 48 → 160：5× 文本量下 48 字符一帧会把 1000 槽位的订阅队列压满而
+# **静默丢帧**（`session._push` 的 `QueueFull: pass`）。160 使单轮 delta 帧数与今日同量级。
+_TRACE_FLUSH_CHARS = 160
+# 整轮单 phase 累计文本硬上限（防滥用），超出后丢弃尾部。[§3.3.4] 4000 → 20000（5×）。
+_TRACE_MAX_CHARS = 20000
+# 单轮**四槽位合计**上限（新增，§3.3.4 / P1-6）。`_TRACE_MAX_CHARS` 是**单 phase** 的，而一轮最多
+# 有 analysis / thinking / reflection / reaskAnalysis 四个累积槽位：各 20000 ⇒ 80000/轮 ⇒
+# ×`_TRACES_MAX`(20) ⇒ **1.6MB/成员**，一个 5 标的分组即 8MB 常驻，且 WS 快照重放会把它整份推给
+# 每一个新订阅者（订阅队列只有 1000 槽、满了就静默丢）。合计闸把最坏量级压回 ~720KB/成员。
+_TRACE_ROUND_TOTAL_MAX = 36000
 # 轮次轨迹环形容量（仅内存 / 快照回放，进程内随会话结束回收）。
 _TRACES_MAX = 20
+
+# 在飞轮次里的四个文本累积槽位（**单一真源**：轮次初值、合计闸、session 的 emit 闭包三处照它对齐）。
+# 键名与 phase 名的唯一分歧是 `reask` → `reaskAnalysis`：前者是 wire 相位名，后者是前端字段名。
+ROUND_TEXT_KEYS = ("thinking", "analysis", "reflection", "reaskAnalysis")
+# wire 相位名 → 在飞轮次的文本槽位键。
+PHASE_TO_TEXT_KEY = {"thinking": "thinking", "analysis": "analysis",
+                     "reflection": "reflection", "reask": "reaskAnalysis"}
+
+
+def append_round_text(trace: dict | None, key: str, delta: str, *,
+                      round_max: int = _TRACE_ROUND_TOTAL_MAX) -> str:
+    """把一段增量并进在飞轮次的文本槽位，施加**单轮四槽合计**上限；返回真正被接受的那一段。
+
+    返回值同时被 session 用作**外发 delta**——超出配额的尾部既不进内存也不进 WS，否则合计闸
+    只压住了服务端而前端仍会收到全量（前端的 trace 对象是同一个形状的第二份内存）。
+
+    Args:
+        trace: 在飞轮次对象（`None` ⇒ 无轮次，原样放行，不做任何截断）。
+        key: `ROUND_TEXT_KEYS` 之一。
+        delta: 待追加的增量。
+        round_max: 单轮四槽合计上限（keyword-only，默认 `_TRACE_ROUND_TOTAL_MAX`）。
+
+    Returns:
+        被接受的增量（可能被截断，配额耗尽时为空串）。
+    """
+    if trace is None or not delta:
+        return delta
+    used = sum(len(trace.get(k) or "") for k in ROUND_TEXT_KEYS)
+    remaining = round_max - used
+    if remaining <= 0:
+        return ""
+    accepted = delta if len(delta) <= remaining else delta[:remaining]
+    trace[key] = (trace.get(key) or "") + accepted
+    return accepted
+
 
 # 由 session 注入的 push 闭包：接收 `{phase, delta}` 或 `{phase:tool_call_start, name}`，补 round/ts 后扇出。
 TraceEmit = Callable[[dict], Awaitable[None]]
@@ -131,6 +178,11 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         # **跑不出错、功能静默缺失**。未装配的会话恒为 None ⇒ 前端整枚徽标不渲染。
         "experience": payload.get("experience"),
         "thinking": "", "analysis": "",
+        # 深度思维链（ai-trade-deep-reasoning-chain §3.4.1 / §3.4.2）：**显式取键**装配，漏抄这
+        # 两键 `AiTradeRoundTrace` 永远拿不到本层数据 ⇒ 后端发什么前端都收不到（跑不出错、功能
+        # 静默缺失）。`reaskAnalysis` 是追问的**独立**累积槽位（绝不并进 `analysis`，P0-3）；
+        # `reasoning` 是轮末定型的整份只读读数（沿用 `horizonWire` 整对象透传的先例）。
+        "reaskAnalysis": "", "reasoning": None,
         "toolCallPending": False, "toolCall": None,
         "executed": None, "degradeReason": None,
         "summary": None, "errorMessage": None,

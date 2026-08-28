@@ -555,7 +555,59 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
     prefix: "horizon_backstop_uncovered",
     label: "交易所兜底未覆盖当前持仓，暂停继续加仓（平仓与新开仓不受影响）",
   },
+  // 深度思维链两码（ai-trade-deep-reasoning-chain §3.3.3）：合入前它们都被吞成 `no_tool_call`
+  // ——「预算耗尽在调用工具之前」与「模型没调工具」是两回事，而用户从界面上分不出来。
+  // `reasoning_truncated` 可重试（带压缩提示）；`content_filtered` **不可**重试。
+  {
+    prefix: "reasoning_truncated",
+    label: "研判过长，输出预算在调用决策工具前耗尽（已带压缩提示重试）",
+  },
+  {
+    prefix: "content_filtered",
+    label: "模型侧内容安全拦截，本轮观望（重试同一份输入只会再被拦一次，故不重试）",
+  },
 ];
+
+/** 研判深度档的默认值（与后端 `AI_TRADE_REASONING_DEPTH` 的默认档一致）。 */
+export const AI_TRADE_DEFAULT_REASONING_DEPTH = "deep";
+
+/** 四档的代价说明：**必须写清代价**——深度不是免费的，用户有权在按下启动前知道账单量级。 */
+export const REASONING_DEPTH_HINTS: Record<string, string> = {
+  off: "关闭：回退到合入前的浅研判形态（约 0.5k 字、单轮数十秒），token 最省。",
+  standard: "标准：每轮约 3–5k 字研判，用时约 1–2 分钟，token 约为关闭档的 3 倍。",
+  deep: "深度（推荐）：每轮约 6–9k 字研判，用时约 2–4 分钟，token 约为标准档 2 倍。",
+  exhaustive:
+    // ⚠️ 本表的值被直接渲染进 JSX 文本节点，**不要**写 markdown 粗体——`**x**` 在那里是
+    // 四个字面星号（本仓库已复发三次）。要强调就换措辞或在组件里用 <strong>。
+    "极致：每轮约 12–18k 字研判，单轮可能长达 5–10 分钟，token 约为深度档 2 倍；适合日线级别、一天几轮的慢速账户。",
+};
+
+// 研判深度四档的中文标签（启动弹窗 / 概览条 chip 共用**同一份**，杜绝两处各写一套）。
+export const REASONING_DEPTH_LABELS: Record<string, string> = {
+  off: "关闭",
+  standard: "标准",
+  deep: "深度",
+  exhaustive: "极致",
+};
+
+/** 深度 chip 文案；未知档名原样回退（与 describeDegradeReason 同款极性）。 */
+export function describeReasoningDepth(depth?: string | null): string {
+  if (!depth) return "";
+  return `深度研判 · ${REASONING_DEPTH_LABELS[depth] ?? depth}`;
+}
+
+/**
+ * 研判耗时压力提示文案（§3.4.3）：**只提示、不自动改**——唤醒周期由用户的交易节奏决定，
+ * 静默替用户改参数是本仓库明令禁止的形态。后端已保证关闭定时唤醒的会话不下发这个键。
+ */
+export function describeReasoningPressure(
+  pressure?: { ewmaMs: number; intervalS: number; suggestIntervalMin: number } | null,
+): string {
+  if (!pressure) return "";
+  const mins = (pressure.ewmaMs / 60000).toFixed(1);
+  const cycle = (pressure.intervalS / 60).toFixed(1);
+  return `研判耗时逼近唤醒周期（近期均值 ${mins} 分钟 / 周期 ${cycle} 分钟），建议把唤醒周期调到 ≥ ${pressure.suggestIntervalMin} 分钟`;
+}
 
 /**
  * 降级原因中文化（P1-9）：裸英文码会直接怼到用户脸上，而基础策略是**高频**触发项（震荡市里大多数轮

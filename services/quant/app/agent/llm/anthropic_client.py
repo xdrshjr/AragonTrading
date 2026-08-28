@@ -30,7 +30,8 @@ class AnthropicClient:
     def __init__(self, *, base_url: str, api_key: str, model: str,
                  anthropic_version: str, user_agent: str, max_tokens: int,
                  temperature: float, top_p: float, timeout: float,
-                 proxy: str | None, retry: RetryConfig | None = None):
+                 proxy: str | None, retry: RetryConfig | None = None,
+                 thinking_budget_tokens: int = 0):
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._model = model
@@ -42,6 +43,10 @@ class AnthropicClient:
         self._timeout = timeout
         self._proxy = proxy
         self._retry = retry or RetryConfig()
+        # 扩展思考预算（deep-reasoning-chain §3.3.2）：**默认 0 = 不发该字段**，请求体与本
+        # 特性合入前逐字节相同（用例 G-4）。>0 时 Anthropic 硬性要求 temperature=1 且不接受
+        # top_p——两者一并在 `_body` 里处理，绝不发一个必然 400 的请求体。
+        self._thinking_budget = max(0, int(thinking_budget_tokens or 0))
 
     def _headers(self) -> dict:
         return {
@@ -62,6 +67,10 @@ class AnthropicClient:
             "top_p": self._top_p,
             "stream": True,
         }
+        if self._thinking_budget > 0:
+            body["thinking"] = {"type": "enabled", "budget_tokens": self._thinking_budget}
+            body["temperature"] = 1.0     # Anthropic 扩展思考硬要求 temperature=1
+            body.pop("top_p", None)       # 同上：扩展思考下不接受 top_p
         if tools:
             body["tools"] = [
                 {"name": t.name, "description": t.description, "input_schema": t.input_schema}

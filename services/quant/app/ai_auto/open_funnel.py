@@ -68,9 +68,12 @@ _DEGRADE_PREFIXES: tuple[tuple[str, str], ...] = (
 _OPEN_ONLY_DEGRADES = ("low_confidence",)
 
 # **仅** LLM 故障类降级码（[P0-4b] 收窄后的 `llmDegraded` 口径）。`low_confidence` 刻意不在集内。
+# ⚠️ ai-trade-deep-reasoning-chain §3.3.3 把 `no_tool_call` 细分成了两个更诚实的码
+# （`reasoning_truncated` = 输出预算耗尽在工具调用之前；`content_filtered` = 模型侧内容拦截）。
+# 两者**必须一并登记**：同一个物理事件换了个码就掉出 `llmDegraded` 计数，是一次静默的观测回归。
 _LLM_FAILURE_PREFIXES = ("llm_error", "decision_timeout", "no_tool_call", "invalid_action",
                          "missing_size", "missing_limit_price", "limit_price_out_of_band",
-                         "invalid_order_type")
+                         "invalid_order_type", "reasoning_truncated", "content_filtered")
 
 # 两个口径词的共享常量（[P2-6]）：漏斗是**全程累计**，而归因账本 `AttributionLedger._trips` 是
 # `deque(maxlen=200)` 的滚动窗口。两张卡并排时读者极易串口径，故两处文案各引用一个常量。

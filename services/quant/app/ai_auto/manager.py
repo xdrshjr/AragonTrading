@@ -59,7 +59,10 @@ from .decider import AiTradeDecider
 from .experience import ExperienceRule, ExperienceRuntime, SessionGraph
 from .experience import scheduler
 from .experience.events import EventIdentity
+from .llm_budget import build_ai_trade_llm_clients
 from .prompts import build_ai_trade_system_prompt
+from .prompts_en import SystemPromptOptions, SystemPromptTexts
+from .reasoning_protocol import build_deliberation_protocol, resolve_depth_profile
 from .session import AiTradeSession
 from .sizing import SizingRule, StopRule, check_window_capacity, parse_sizing_rule, parse_stop_rule
 from .sizing_runtime import build_sizing_runtime, sizing_config_wire
@@ -187,6 +190,10 @@ class AiTradeGroupStartRequest:
     default_budget_frac: float = 0.01        # 留空默认分数（avail×该值），由 api 解析（默认 1%）
     position_step_pct: float = 0.0           # 仓位操作档位步长（fraction；0=连续，直接构造该 dataclass 的既有测试零回归）
     wake_interval_s: float = 0.0             # 墙钟定时唤醒周期（秒；0=关闭，直接构造该 dataclass 的既有测试零回归）
+    # 研判深度档（deep-reasoning-chain §4.4 / P1-1）：`None` ⇒ 用 settings 默认档（直接构造该
+    # dataclass 的既有测试零回归）。**深度档必须落在请求对象上**——只读 settings 会让启动请求里
+    # 的 `reasoningDepth` 被接收、校验、然后丢弃，且暂停→续跑会静默降档而不报错。
+    reasoning_depth: str | None = None
     # 【基础策略】MA 通道开单铁律：默认 **None=不装配**（直接构造该 dataclass 的既有测试零回归，P1-5）。
     # 「缺省即开启」的语义**只在 API 层解析**（`_resolve_base_rules`），绝不在此给开启默认值。
     base_rule: MaBandRule | None = None
@@ -654,49 +661,74 @@ class AiTradeManager:
         # 使宪章说的、成本判定用的、先验校验的是同一个数（未装配 ⇒ None ⇒ 三处逐字回退）。
         risk = self._resolve_trade_risk(req, req.settings)
         hold_bars = None if req.horizon_rule is None else req.horizon_rule.expected_hold_bars
+        # 研判深度档（deep-reasoning-chain §3.0）：**一次解析、三处使用**——三份 LLM 预算、
+        # 决策系统 prompt 的审议协议、以及决策器（超时 / 墙钟闸 / 追问阈 / 反思侧复核协议）。
+        # 反思协议**不在这里注入**：`build_reflection_system_prompt` 全仓唯一的调用点是
+        # `decider._stream_reflection`（每轮现造 system），在这里传 `reasoning_text` 会落空
+        # 且不报错、不判红（spec §3.2 / P0-5，装配判据见用例 S-7）。
+        depth = resolve_depth_profile(req.settings, override=req.reasoning_depth)
+        clients = build_ai_trade_llm_clients(
+            ctx.provider, req.settings, profile=depth,
+            # 工厂必须从**本模块**传进去：20+ 个测试文件按
+            # `app.ai_auto.manager.make_llm_client_from_config` 注入假客户端，换到 llm_budget
+            # 内解析会一次性打翻它们全部（本仓库前科：「换代打破测试注入缝」）。
+            make_client=make_llm_client_from_config)
         decider = AiTradeDecider(
-            make_llm_client_from_config(ctx.provider),
-            build_ai_trade_system_prompt(plan.inst_id, req.bar, plan.budget_usd, ctx.lever,
-                                         position_step_pct=req.position_step_pct,
-                                         allow_limit=allow_limit,
-                                         # F-3：价带文案与本地门禁同源（settings 唯一真源）
-                                         limit_band_pct=req.settings
-                                         .ai_trade_limit_price_max_deviation_pct,
-                                         # 【基础策略】宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变
-                                         base_rules_text=format_charter(req.base_rule),
-                                         # 利润保护宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变
-                                         profit_guard_text=format_profit_guard_charter(
-                                             req.profit_rule),
-                                         # 成本宪章章（轴 D）；总闸关 → "" ⇒ 渲染逐字节不变
-                                         cost_text=build_charter_text(
-                                             req.settings, plan.inst_id,
-                                             fee_rates_wire=plan.fee_rates_wire,
-                                             bar_seconds=BAR_SECONDS[req.bar],
-                                             allow_limit=allow_limit,
-                                             expected_hold_bars=hold_bars),
-                                         # 交易周期宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变。
-                                         # 解除阈按**本会话真实的** OCO 止损与杠杆现算，绝不写死算例。
-                                         horizon_text=format_horizon_charter(
-                                             req.horizon_rule,
-                                             stop_loss_pct=risk.stop_loss_pct,
-                                             take_profit_pct=risk.take_profit_pct,
-                                             leverage=ctx.lever,
-                                             # 「不必每轮盯盘」这句授权只有在**真的有核实通道**
-                                             # 时才成立（turnover-budget §2.3.3）：总闸关或无凭证
-                                             # ⇒ 改口为「尚无核实通道」，绝不据一句未经核实的
-                                             # 承诺让模型放松盯盘。
-                                             backstop_armed=bool(
-                                                 req.settings.ai_trade_backstop_check_enabled
-                                                 and ctx.creds is not None)),
-                                         # 仓位与风险层宪章章；三条规则全未装配 → "" ⇒ 渲染逐字节不变
-                                         sizing_text=format_sizing_charter(
-                                             sizing.rule, sizing.stop_rule, sizing.brake_rule),
-                                         # 战术周期串：与会话真正注入的周期集合**同源**（共用
-                                         # `tactical_bars_for`），说的和给的必须是同一批周期
-                                         tactical_bars_text=format_tactical_bars_text(
-                                             tactical_bars_for(req.settings, req.bar,
-                                                               req.wake_interval_s))),
+            clients.decision,
+            build_ai_trade_system_prompt(
+                plan.inst_id, req.bar, plan.budget_usd, ctx.lever,
+                options=SystemPromptOptions(
+                    position_step_pct=req.position_step_pct,
+                    allow_limit=allow_limit,
+                    # F-3：价带文案与本地门禁同源（settings 唯一真源）
+                    limit_band_pct=req.settings.ai_trade_limit_price_max_deviation_pct),
+                texts=SystemPromptTexts(
+                    # 审议协议 + 输出预算纪律；off 档 → "" ⇒ 中文脊柱逐字节回退
+                    reasoning_text=build_deliberation_protocol(
+                        depth,
+                        reserve_tokens=req.settings
+                        .ai_trade_reasoning_reserve_tokens),
+                    # 【基础策略】宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变
+                    base_rules_text=format_charter(req.base_rule),
+                    # 利润保护宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变
+                    profit_guard_text=format_profit_guard_charter(
+                        req.profit_rule),
+                    # 成本宪章章（轴 D）；总闸关 → "" ⇒ 渲染逐字节不变
+                    cost_text=build_charter_text(
+                        req.settings, plan.inst_id,
+                        fee_rates_wire=plan.fee_rates_wire,
+                        bar_seconds=BAR_SECONDS[req.bar],
+                        allow_limit=allow_limit,
+                        expected_hold_bars=hold_bars),
+                    # 交易周期宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变。
+                    # 解除阈按**本会话真实的** OCO 止损与杠杆现算，绝不写死算例。
+                    horizon_text=format_horizon_charter(
+                        req.horizon_rule,
+                        stop_loss_pct=risk.stop_loss_pct,
+                        take_profit_pct=risk.take_profit_pct,
+                        leverage=ctx.lever,
+                        # 「不必每轮盯盘」这句授权只有在**真的有核实通道**
+                        # 时才成立（turnover-budget §2.3.3）：总闸关或无凭证
+                        # ⇒ 改口为「尚无核实通道」，绝不据一句未经核实的
+                        # 承诺让模型放松盯盘。
+                        backstop_armed=bool(
+                            req.settings.ai_trade_backstop_check_enabled
+                            and ctx.creds is not None)),
+                    # 仓位与风险层宪章章；三条规则全未装配 → "" ⇒ 渲染逐字节不变
+                    sizing_text=format_sizing_charter(
+                        sizing.rule, sizing.stop_rule, sizing.brake_rule),
+                    # 战术周期串：与会话真正注入的周期集合**同源**（共用
+                    # `tactical_bars_for`），说的和给的必须是同一批周期
+                    tactical_bars_text=format_tactical_bars_text(
+                        tactical_bars_for(req.settings, req.bar,
+                                          req.wake_interval_s)))),
             context_refresh_rounds=req.context_refresh_rounds, settings=req.settings,
+            # 三份预算 + 深度档（§3.3.1 / §3.1.1）：反思与摘要各走自己的 client，深度档是决策器
+            # 上的唯一开关（超时 / 尝试次数闸 / 轮级墙钟闸 / 追问阈 / 反思侧复核协议全由它派生）。
+            reflection_llm=clients.reflection, summary_llm=clients.summary,
+            depth_profile=depth,
+            # 中文证据摘要（§3.1.7）：随深度档露出；off 档 ⇒ schema 恒等回退（G-2）。
+            allow_reasoning_digest=depth.enabled,
             position_step_pct=req.position_step_pct,
             reflection_enabled=req.settings.ai_trade_reflection_enabled,   # 生产实盘显式开（默认 True）
             allow_limit=allow_limit,

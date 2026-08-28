@@ -101,6 +101,8 @@ from .signals import (
 )
 from .sizing_runtime import SizingRuntime
 from .track_record import TrackRecordRuntime
+from .reasoning_protocol import resolve_analysis_excerpt
+from .reasoning_runtime import ReasoningRuntime
 from .trace import (
     _TRACES_MAX,
     TraceEmit,
@@ -113,6 +115,8 @@ from .trace import (
     horizon_event,
     horizon_released_event,
     maybe_emit_summary_failed,
+    PHASE_TO_TEXT_KEY,
+    append_round_text,
     new_round_trace,
     reflection_start_event,
     reflection_verdict_event,
@@ -319,6 +323,10 @@ class AiTradeSession:
         # 唤醒感知上下文（wake-aware-context §2.6）：必须**先于** `MarketWindow` 构造——窗口的
         # `WindowOptions.tactical_bars` 要吃 `self._wake.tactical_bars`，战术集合的唯一真源在此。
         self._wake = WakeRuntime(bar, wake_interval_s, executor.settings)
+        # 深度研判的会话级观测（deep-reasoning-chain 轴 D）：纯计算、只读，不参与任何交易判据。
+        # 未装配深度档 ⇒ 全部 wire 恒为 None ⇒ status / aiStats 整键缺席（逐字回退）。
+        self._reasoning = ReasoningRuntime(executor.settings, wake_interval_s=wake_interval_s)
+        self._reasoning_elapsed_ms: float | None = None   # 本轮 decide() 的墙钟耗时（供 result 帧）
         self._window = MarketWindow(
             inst_id,
             bar,
@@ -1561,8 +1569,11 @@ class AiTradeSession:
             consensus = compute_consensus(board)                 # E2：每轮只算一次（供门禁 + wire）
             payload["consensus"] = self._consensus_wire(consensus)
             await self._begin_round_trace(round_no, ts, ref_px, payload, board)  # RV-7：consensus 之后
+            decide_started = time.monotonic()          # 单调钟：墙钟耗时不受系统时钟跳变影响
             decision, degrade = await self.decider.decide(
                 payload, emit=self._make_trace_emit(round_no, ts))
+            self._reasoning_elapsed_ms = (time.monotonic() - decide_started) * 1000.0
+            llm_degrade = degrade                      # 轴 D：门禁改写之前的**模型侧**降级码
             # N2（hold-inertia-observability）：以第一阶段原始输出立即更新连续观望计数——须在共识门禁
             # 与反思之前（此时的 decision/degrade 正是第一阶段输出，惯性以模型真实意愿为准）。
             self._update_hold_streak(decision.action, degrade)
@@ -1624,7 +1635,7 @@ class AiTradeSession:
             self.rounds_completed = round_no
             # RC-2/RC-3：研判全文只走 agent_trace/_traces；进 journal 与 decision 事件的取有界摘录（≤400）。
             # 降级轮 last_analysis 恒为空串（RC-1）→ excerpt=None（journal/事件不带残段）。
-            excerpt = self.decider.last_analysis[:_ANALYSIS_EXCERPT_CHARS] or None
+            excerpt = self._analysis_excerpt(decision)
             # R-P1-3：commit_round 收门禁后的最终 decision，journal/摘要据此记真实动作（保持上下文纯净）。
             # D-5：`defer_summary=True` ⇒ 到期只记账，真正的 LLM 调用挪到 `_emit_decision` 之后
             # （否则「成交已发生、决策已完成」之后界面上的决策事件还要再等最多一个摘要超时才出现）。
@@ -1635,6 +1646,11 @@ class AiTradeSession:
                                                self._exit_priority),
                 defer_summary=True)
             await self._emit_tool_call_trace(round_no, ts, decision, gate_entry)
+            # 轴 D：`note_round` 必须排在 `_emit_result_trace` **之前**——反思已经跑完，
+            # `last_reasoning` 里的 reflectionChars/Stages 此刻才是完整的那一份。
+            self._reasoning.note_round(self.decider.last_reasoning,
+                                       elapsed_ms=self._reasoning_elapsed_ms or 0.0,
+                                       degrade=llm_degrade)
             await self._emit_result_trace(round_no, ts, executed, degrade)
             reflection_verdict, reflection_reason = self._round_reflection_summary()
             await self._emit_decision(round_no, ts, decision, board, executed,
@@ -1862,6 +1878,28 @@ class AiTradeSession:
             trace["exitPriority"] = exit_wire
         await self._push(reflection_verdict_event(round_no, ts, verdict, adjusted, exit_wire))
 
+    def _analysis_excerpt(self, decision: TradeDecision) -> str | None:
+        """journal 摘录与左栏决策卡首段的**同一份**取值（三级回退，§3.3.4 / 补根因 C-6）。
+
+        合入前这里是 `last_analysis[:400]`。12 阶段协议下那 400 字符恒为 S1 的样板抬头，长期
+        记忆会被样板文喂满，而决策卡首段也会变成 `## S1 REGIME - Higher-timeframe regime…`。
+
+        三级来源：
+          ① `decision.evidence_digest` —— 模型自己写的中文证据摘要（首选）。**先过语言守卫**：
+             整份 prompt 通篇要求用英文思考，模型回一段英文摘要是完全现实的失败模式，而这个值
+             同时是三处中文界面的取值源。不达标 ⇒ 视作未提供，回落 ②；它**绝不**产生 degrade、
+             **绝不**改 `TradeDecision`、**绝不**触发追问（§3.1.7 三条铁律）。
+          ② S12（校准结论）段落的前 400 字符 —— 模型自己的结论，而不是抬头。
+          ③ 研判全文前 400 字符 —— 合入前的行为，零回归回退路径（无阶段标记时走这条）。
+
+        ⚠️ 本方法的返回值有**两个**消费者：`commit_round(analysis=…)`（→ journal → 滚动摘要）
+        与 `_emit_decision(analysis=…)`（→ `decision` 事件 → 左栏决策卡首段 + WS 快照重放）。
+        换源因此同时重定义了一处用户天天在看的界面文案——这是**有意**的净改善，但两处必须始终
+        取到同一份（用例 S-2）。降级轮 `last_analysis` 恒为空串 ⇒ 返回 None（不带残段）。
+        """
+        return resolve_analysis_excerpt(decision.evidence_digest, self.decider.last_analysis,
+                                        limit=_ANALYSIS_EXCERPT_CHARS)
+
     def _round_reflection_summary(self) -> tuple[str | None, str | None]:
         """从在飞轮次取本轮反思裁决/理由（供 decision 事件搭顺风车；hold/关闭轮为 (None, None)）。"""
         trace = self._round_trace
@@ -1881,9 +1919,14 @@ class AiTradeSession:
                 return
             delta = part.get("delta")
             if delta is not None:
+                # 四个文本槽位共用一份单轮配额（§3.3.4 / P1-6）：超出的尾部**既不进内存也不进
+                # WS**——只压服务端等于没压，前端的 trace 对象是同一形状的第二份内存。
+                key = PHASE_TO_TEXT_KEY.get(phase)
+                if key is not None:
+                    delta = append_round_text(trace, key, delta)
+                    if not delta:
+                        return
                 data["delta"] = delta
-                if trace is not None and phase in ("thinking", "analysis", "reflection"):
-                    trace[phase] += delta
             name = part.get("name")
             if name is not None:
                 data["name"] = name
@@ -1904,6 +1947,9 @@ class AiTradeSession:
             return
         trace["thinking"] = ""
         trace["analysis"] = ""
+        # 追问槽位同样清零（与前端 `store.ts` 的 retry 分支逐字对齐）：追问跑在重试循环之后，
+        # 正常情况下不会有残留，但两侧清零集合一旦分叉，重连回放与在线归约就会给出两份不同的界面。
+        trace["reaskAnalysis"] = ""
         trace["toolCallPending"] = False
         trace["state"] = "deciding"
         trace["retries"] = int(trace.get("retries", 0)) + 1
@@ -1922,6 +1968,11 @@ class AiTradeSession:
         tool_input = {"action": decision.action, "sizeFraction": decision.size_fraction,
                       "confidence": decision.confidence, "reason": decision.reason,
                       "orderType": decision.ord_type, "limitPrice": decision.limit_px}
+        # 中文证据摘要（deep-reasoning-chain §3.5.2 ②）：它是模型提交的**工具入参**，故归属
+        # `input` 而非兄弟键（与上面 docstring 立的规矩一致）。**仅非空时才写这个键**——off 档
+        # 与未装配会话下 wire 逐字节回退（G-7 要求加法键在 off 档一并缺席）。
+        if decision.evidence_digest:
+            tool_input["evidenceDigest"] = decision.evidence_digest
         # 作用域钉死在**本层**：`vetoedBy` 只会是 `"horizon"`，故判据也必须是「本层真的拦了」。
         # 反思否决另有 `reflection_verdict` 相位承载，混进来会让卡片说「被交易周期层降级」而其实
         # 不是——那是本轮要根除的同一种不诚实，只是换了个方向。
@@ -1942,12 +1993,43 @@ class AiTradeSession:
                                  degrade: str | None) -> None:
         """result：守护执行结果 + 降级原因；state=skipped→"skipped"，否则"done"。"""
         state = "skipped" if executed.get("skipped") else "done"
+        # 深度研判元数据（§4.2）：**整份**对象挂在 `result` 相位上（沿用 `horizonWire` 整对象
+        # 透传的先例），刻意不新增 `result` 子相位——新增一个相位在本仓库的代价是 8 个前端镜像
+        # 点，而这是一份轮末才定型的只读读数。未装配 / off 档 ⇒ `reasoning` 整键缺席。
+        extra = self._reasoning_result_keys()
         if self._round_trace is not None:
             self._round_trace["executed"] = executed
             self._round_trace["degradeReason"] = degrade
             self._round_trace["state"] = state
+            self._round_trace["reasoning"] = extra.get("reasoning")
         await self._push(trace_event("result", round_no, ts,
-                                     executed=executed, degradeReason=degrade))
+                                     executed=executed, degradeReason=degrade, **extra))
+
+    def _reasoning_result_keys(self) -> dict:
+        """`result` 相位的 `reasoning` 加法键；未装配 / off 档 ⇒ `{}`（整键缺席，逐字回退）。"""
+        meta = self.decider.last_reasoning
+        if meta is None:
+            return {}
+        elapsed = self._reasoning_elapsed_ms
+        return {"reasoning": {**meta.wire(),
+                              "elapsedMs": None if elapsed is None else round(elapsed)}}
+
+    def _reasoning_status_keys(self) -> dict:
+        """`status` / `info()` 的三个加法键；未装配 / off 档 ⇒ `{}`（整键缺席，§4.3）。
+
+        沿用本仓库「未装配即缺席，绝不出现半截空信息」的既有范式：一枚空的深度 chip 比没有
+        chip 更糟——它让用户以为深度档开着而实际没开。
+        """
+        if not self._reasoning.depth:
+            return {}
+        keys: dict = {"reasoningDepth": self._reasoning.depth}
+        tokens = self._reasoning.tokens_wire()
+        if tokens is not None:
+            keys["reasoningTokens"] = tokens
+        pressure = self._reasoning.pressure_wire()
+        if pressure is not None:
+            keys["reasoningPressure"] = pressure
+        return keys
 
     async def _emit_summary_trace(self, round_no: int, ts: int, summary: str) -> None:
         """summary：到期上下文刷新（历史执行摘要），呼应「上下文纯净」机制（G2）。"""
@@ -2517,6 +2599,12 @@ class AiTradeSession:
                 self._window.base_df(), self.bar, self.executor.settings),
             "multiTimeframeContext": self._build_multi_timeframe_context(ts, ref_px),
             "signalBoard": [self._view_full(v) for v in board]}
+        # deep-reasoning-chain §3.1.6：研判深度档的**加法键**。单一真源是决策器持有的
+        # `DepthProfile`（`decider.depth_name`），不是 settings——两处各读一次必然漂移，而这里
+        # 漂移的表现是「决策器按英文档跑、prompt 却发中文收尾指令」，且**不会报任何错**。
+        # 未装配 / off 档 ⇒ 空串 ⇒ **整键缺席** ⇒ `build_decision_prompt` 逐字节回退。
+        if self.decider.depth_name:
+            payload["reasoningDepth"] = self.decider.depth_name
         # N3（hold-inertia-observability）：连续观望达到阈值才注入（0=关闭）。payload 在 decide 之前
         # 装配，故值 = 截至上一轮的连续观望数。阈值未达/关闭/回测（backtest.py 自建 payload）→ 键缺失
         # → prompt 逐字节不变（F4a 冻结范式）。注记文本会经 commit_round 重放进 _context 该轮 user
@@ -2735,6 +2823,8 @@ class AiTradeSession:
                 # 经验层观测（W-11）：未装配 ⇒ None ⇒ §7.3 的 `ExperienceCard` 整卡不渲染。
                 # `harvestGap` 与 `graphAsOfTs` 是两个**诚实性键**（I-8），各有明确渲染落点。
                 "experience": self._experience.stats(),
+                # 深度研判三键（deep-reasoning-chain §4.3）：未装配 / off 档 ⇒ 整键缺席。
+                **self._reasoning_status_keys(),
                 "stopReason": self.stop_reason,
                 "degraded": (self.executor.degraded or self._stale_degraded
                              or self.degraded or self._tick_degraded),
@@ -2790,6 +2880,9 @@ class AiTradeSession:
                 "lastDecision": self._last_decision, "contextSummary": self.decider.summary,
                 "degraded": (self.executor.degraded or self._stale_degraded
                              or self.degraded or self._tick_degraded),
+                # 深度研判三键（§4.3）：`/ai-trade/status` 的成员行取自本方法，故两处装配都要
+                # 有——只挂 `_status_payload` 的话，刷新页面后那三个键会在成员卡上凭空消失。
+                **self._reasoning_status_keys(),
                 "flattenFailed": self.flatten_failed}
 
     # ---------- 持久化 ----------
@@ -2856,6 +2949,11 @@ class AiTradeSession:
             metrics["aiStats"]["trackRecordShown"] = self._track.shown
             # 经验层观测（W-11）：供事后按「有没有喂经验」分臂对账（R-16）；未装配 ⇒ None。
             metrics["aiStats"]["experience"] = self._experience.stats()
+            # 深度研判观测（§3.4.4）：**零迁移**（`aiStats` 是既有 JSON blob）。零样本 ⇒ 不写这
+            # 个键，供事后按「有没有开深度档」分臂对账 token 成本与研判篇幅的实际收益。
+            reasoning_stats = self._reasoning.stats()
+            if reasoning_stats is not None:
+                metrics["aiStats"]["reasoning"] = reasoning_stats
         except Exception as exc:  # noqa: BLE001 —— 富化对 finalize 是加法且可失败，绝不阻断落库收尾
             logger.warning("ai-trade finalize enrichment skipped for run %s: %s", self.run_id, exc)
             for key in ("equityDigest", "decisionsDigest", "aiStats"):

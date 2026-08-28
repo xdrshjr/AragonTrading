@@ -21,6 +21,7 @@ import {
   AI_TRADE_BASE_RULE_DEFAULTS,
   AI_TRADE_DEFAULT_CONTEXT_ROUNDS,
   AI_TRADE_DEFAULT_POSITION_STEP,
+  AI_TRADE_DEFAULT_REASONING_DEPTH,
   AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN,
   AI_TRADE_GIVEBACK_TIER_PRESETS,
   AI_TRADE_MAX_SL_PCT,
@@ -29,6 +30,8 @@ import {
   AI_TRADE_MAX_TP_PCT,
   AI_TRADE_POSITION_STEP_OPTIONS,
   AI_TRADE_PROFIT_GUARD_DEFAULTS,
+  REASONING_DEPTH_HINTS,
+  REASONING_DEPTH_LABELS,
   deriveDefaultBudget,
   marginReturnFromPricePct,
   positionLadder,
@@ -70,6 +73,7 @@ import type {
   AiTradeHorizonRule,
   AiTradeMaBandRule,
   AiTradeProfitGuardRule,
+  AiTradeReasoningDepth,
 } from "@/lib/aiTradeTypes";
 import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
 import { tradingApi } from "@/lib/tradingApi";
@@ -122,6 +126,10 @@ export interface AiTradeLaunchOpts {
   // Agent 墙钟定时唤醒周期（分钟）：[RN-1] 声明为**可选**（对齐 backtest-only 可选字段），仅 live 分支透传、
   // base 不含、回测省略——若定为非可选，回测 onConfirm 不带该键将 tsc 编译失败。0/关闭 = 仅按 K 线与策略触发。
   wakeIntervalMinutes?: number | null;
+  // 研判深度档（deep-reasoning-chain §3.5.3 / P2-2）：与 `wakeIntervalMinutes` 同款——**仅 live
+  // 分支透传、base 不含**。落进 `base` 会让用户在回测 tab 选「深度」直接推翻 §3.6 那道成本护栏，
+  // 而那正是它存在的理由。回测档只读展示，改档走设置页。
+  reasoningDepth?: AiTradeReasoningDepth | null;
   // 回测专属（mode==="backtest" 时有效）
   startTs?: number;
   endTs?: number;
@@ -158,6 +166,7 @@ export default function AiTradeLaunchModal({
   defaultContextRounds,
   defaultPositionStepPct,
   defaultWakeIntervalMinutes,
+  defaultReasoningDepth,
   defaultBaseRule,
   defaultProfitGuard,
   defaultTradingHorizon,
@@ -184,6 +193,8 @@ export default function AiTradeLaunchModal({
   defaultContextRounds: number;
   defaultPositionStepPct: number;     // 上次所选仓位操作档位（aiTradeConfig?.positionStepPct ?? 默认，回填弹窗）
   defaultWakeIntervalMinutes: number; // 上次所选 Agent 唤醒周期（aiTradeConfig?.wakeIntervalMinutes ?? 默认，回填弹窗）
+  // 上次所选研判深度档（可选：老 localStorage 无此键 ⇒ 回落 AI_TRADE_DEFAULT_REASONING_DEPTH）。
+  defaultReasoningDepth?: AiTradeReasoningDepth;
   defaultBaseRule: AiTradeMaBandRule; // 上次所选【基础策略】参数（aiTradeConfig?.baseRules ?? 默认，回填弹窗）
   defaultProfitGuard: AiTradeProfitGuardRule; // 上次所选利润保护参数（aiTradeConfig?.profitGuard ?? 默认）
   // 上次所选交易周期模式（aiTradeConfig?.tradingHorizon）；**无本地预设兜底**——模式表由服务端下发，
@@ -221,6 +232,10 @@ export default function AiTradeLaunchModal({
   // Agent 墙钟定时唤醒周期（分钟，仅实盘段）：初值取 defaultWakeIntervalMinutes（用 ?? 保留 0=关闭偏好）。
   const [wakeIntervalRaw, setWakeIntervalRaw] = useState(
     String(defaultWakeIntervalMinutes ?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN),
+  );
+  // 研判深度档（仅实盘段）：初值取上次所选，缺省回落默认档。
+  const [reasoningDepth, setReasoningDepth] = useState<AiTradeReasoningDepth>(
+    defaultReasoningDepth ?? (AI_TRADE_DEFAULT_REASONING_DEPTH as AiTradeReasoningDepth),
   );
   // 【基础策略】铁律（默认开启；数值走 raw 串以免输入中途被 Number 归一，与既有金额输入同风格）。
   const [baseRuleEnabled, setBaseRuleEnabled] = useState(
@@ -338,6 +353,7 @@ export default function AiTradeLaunchModal({
     setRoundsRaw(String(defaultContextRounds || AI_TRADE_DEFAULT_CONTEXT_ROUNDS));
     setPositionStep(defaultPositionStepPct || AI_TRADE_DEFAULT_POSITION_STEP);
     setWakeIntervalRaw(String(defaultWakeIntervalMinutes ?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN));
+    setReasoningDepth(defaultReasoningDepth ?? (AI_TRADE_DEFAULT_REASONING_DEPTH as AiTradeReasoningDepth));
     setBaseRuleEnabled(defaultBaseRule.enabled ?? AI_TRADE_BASE_RULE_DEFAULTS.enabled);
     setBaseRulePeriodRaw(String(defaultBaseRule.period ?? AI_TRADE_BASE_RULE_DEFAULTS.period));
     setBaseRuleStdRaw(String(defaultBaseRule.stdMult ?? AI_TRADE_BASE_RULE_DEFAULTS.stdMult));
@@ -620,6 +636,8 @@ export default function AiTradeLaunchModal({
       onConfirm({
         mode: "live", members, allocationMode, instId: members[0]?.instId ?? instId,
         ...base, wakeIntervalMinutes: wakeMinutes ?? 0, profitGuard: profitGuardPayload,
+        // [P2-2] 与 wakeIntervalMinutes 同款：**仅 live 分支带上**，绝不落进 base。
+        reasoningDepth,
       });
       return;
     }
@@ -1121,7 +1139,45 @@ export default function AiTradeLaunchModal({
               除按 K 线与策略触发外，每隔此分钟数 Agent 也会用<strong className="text-[var(--text)]">当前实时价</strong>重新研判；
               越小唤醒越频繁、LLM 调用越多；留空 / 0 = 仅按 K 线与策略触发。
             </span>
+            {reasoningDepth === "exhaustive" && wakeMinutes != null && wakeMinutes > 0 && wakeMinutes < 6 && (
+              // **非阻断**提示（不禁用提交）：交易节奏由用户决定，静默替用户改参数是更坏的形态。
+              <span className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1 leading-relaxed text-[var(--text)]">
+                「极致」档单轮可能 5–10 分钟，而当前唤醒周期是 {wakeMinutes} 分钟——推理会挤占交易节奏，
+                建议把周期调到 ≥ 6 分钟（仅提示，不阻止启动）。
+              </span>
+            )}
           </label>
+        )}
+
+        {/* 研判深度（deep-reasoning-chain §3.5.3）：**仅实盘段露出**。回测档由服务端独立取
+            `AI_TRADE_REASONING_DEPTH_BACKTEST`（默认「标准」，§3.6 的成本护栏），此处只读展示——
+            若把选择器落进两 tab 共用的 base，用户在回测 tab 选「深度」会直接推翻那道护栏。 */}
+        {mode === "live" ? (
+          <label className="flex flex-col gap-1 text-[11px] text-[var(--muted)]">
+            <span>研判深度（思维链）</span>
+            <Select
+              value={reasoningDepth}
+              disabled={submitting}
+              onChange={(e) => setReasoningDepth(e.target.value as AiTradeReasoningDepth)}
+              className="text-xs"
+              aria-label="研判深度"
+            >
+              {(["off", "standard", "deep", "exhaustive"] as const).map((d) => (
+                <option key={d} value={d}>
+                  {REASONING_DEPTH_LABELS[d]}
+                </option>
+              ))}
+            </Select>
+            <span className="leading-relaxed text-[var(--muted)]">
+              {REASONING_DEPTH_HINTS[reasoningDepth]}
+            </span>
+          </label>
+        ) : (
+          <p className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1.5 text-[11px] leading-relaxed text-[var(--muted)]">
+            回测使用<strong className="text-[var(--text)]">独立</strong>的研判深度档（默认「标准」），
+            以免一次 500 轮回测变成一笔意外的高额 token 账单；如需调整请到设置中心改{" "}
+            <code>AI_TRADE_REASONING_DEPTH_BACKTEST</code>。
+          </p>
         )}
 
         {/* 交易纪律预设（discipline-preset 轴 A）：**实盘与回测两段都渲染**——两侧走同一个服务端

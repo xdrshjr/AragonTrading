@@ -899,6 +899,11 @@ class AiTradeGroupStartIn(BaseModel):
     # Agent 墙钟定时唤醒周期（分钟）：null/缺省→服务端默认(2)；0→关闭定时唤醒；>0→服务端夹到 [floor_s, ceil_min]。
     # 入口仅校验 ge=0（0 合法=关闭）；越界不拒绝、由 _resolve_wake_interval_s 防御性夹紧（UX 友好）。
     wakeIntervalMinutes: float | None = Field(default=None, ge=0)
+    # 研判深度档（ai-trade-deep-reasoning-chain §4.4）：留空 ⇒ 用 settings 默认档。越界值直接
+    # 422（`Literal` 校验），**不做静默夹紧**——一个拼错的深度档静默回落会让用户以为自己开了
+    # 深度档。该字段随 `start_wire` 原样落库，冷续跑重跑同一条解析链即自动同档（用例 S-8）。
+    # ⚠️ 仅实盘 tab 下发（回测档走设置页的 AI_TRADE_REASONING_DEPTH_BACKTEST，§3.6 成本护栏）。
+    reasoningDepth: Literal["off", "standard", "deep", "exhaustive"] | None = None
     priming: bool = True
     primingBars: int = Field(default=300, ge=10, le=PAPER_WINDOW_MAX)
     # 仓位操作档位步长（fraction）：null/缺省→服务端默认；0→连续（仅 API/后端退出口，UI 不露出）。

@@ -2,7 +2,13 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui";
-import { describeConsensus, describeRegime, describeStance } from "@/lib/aiTrade";
+import {
+  describeConsensus,
+  describeReasoningDepth,
+  describeReasoningPressure,
+  describeRegime,
+  describeStance,
+} from "@/lib/aiTrade";
 import type { AiTradeGroupState, AiTradeRoundTrace, AiTradeSessionRow } from "@/lib/aiTradeTypes";
 import { fmtMoney, fmtNum } from "@/lib/format";
 import AiTradeTraceRound from "./AiTradeTraceRound";
@@ -22,6 +28,9 @@ function TraceOverview({ session }: { session: AiTradeSessionRow }) {
     0,
     (session.contextRefreshRounds ?? 0) - (session.roundsSinceSummary ?? 0),
   );
+  const depthChip = describeReasoningDepth(session.reasoningDepth);
+  const tokens = session.reasoningTokens ?? null;
+  const pressure = describeReasoningPressure(session.reasoningPressure);
   return (
     <div className="flex flex-col gap-1.5 border-b border-[var(--border)] px-3 py-2">
       <div className="flex items-center justify-between gap-2">
@@ -50,7 +59,23 @@ function TraceOverview({ session }: { session: AiTradeSessionRow }) {
         </span>
         {roundsToSummary > 0 ? <span>距上下文刷新 {roundsToSummary} 根K线</span> : null}
         {consensus && <span>{consensus}</span>}
+        {/* 深度研判 chip + 会话 token 累计（deep-reasoning-chain §3.5.3）：未装配 / off 档 ⇒
+            后端整键缺席 ⇒ 两段都不渲染（绝不出现一枚空 chip——那比没有 chip 更糟）。 */}
+        {depthChip && <Badge tone="neutral">{depthChip}</Badge>}
+        {tokens && (
+          <span className="tabular">
+            token {fmtNum(tokens.inputTokens / 1000, 1)}k 入 / {fmtNum(tokens.outputTokens / 1000, 1)}k 出
+          </span>
+        )}
       </div>
+      {/* 研判耗时压力提示：**只提示、不自动改**——唤醒周期由用户的交易节奏决定。 */}
+      {pressure && (
+        <p className="rounded border border-[var(--border)] bg-[var(--warn-soft)] px-2 py-1 text-[10px] text-[var(--warn)]">
+          {/* 警告面一律 `--warn-soft` 打底 + 前缀符号，绝不靠颜色单通道传达（色觉障碍友好）。 */}
+          <span aria-hidden>⏱ </span>
+          {pressure}
+        </p>
+      )}
       {session.degraded && (
         <p className="rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1 text-[10px] text-[var(--short-ink)]">
           决策降级观望（多次重试仍失败 / 置信度不足 / 未产出有效决策 → 本轮回落观望，资金安全优先）

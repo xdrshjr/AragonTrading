@@ -530,3 +530,449 @@ def test_decider_exposes_hold_exit_field_only_when_allowed():
                         allow_hold_exit=True)
     assert "holdExitPx" not in off._tool.input_schema["properties"]
     assert "holdExitPx" in on._tool.input_schema["properties"]
+
+
+# ================= 深度思维链（ai-trade-deep-reasoning-chain §7.3 / §7.4）=================
+from app.ai_auto.decider import _RETRYABLE_DEGRADE_REASONS      # noqa: E402
+from app.ai_auto.reasoning_protocol import profile_by_name      # noqa: E402
+
+_DEEP = profile_by_name("deep")
+
+
+def _text_only(text: str, *, stop_reason: str = "end_turn", usage: dict | None = None):
+    """只吐文本、不调工具的一次流（截断 / 内容拦截 / 浅研判三类用例的共同底座）。"""
+    return [StreamEvent("text_delta", text=text),
+            StreamEvent("message_done", stop_reason=stop_reason, usage=usage)]
+
+
+def _deep_decider(scripts, *, settings=None, depth=None, emit=None):
+    return AiTradeDecider(_ScriptedLLM(scripts), "sys", context_refresh_rounds=10,
+                          settings=settings or _retry_settings(
+                              ai_trade_decision_max_retries=0,
+                              ai_trade_reasoning_reask_max=0),
+                          depth_profile=depth or _DEEP)
+
+
+# ---------------------------------------------------------------- D-1 / D-1b / D-1c
+async def test_max_tokens_stop_reason_maps_to_reasoning_truncated():
+    """D-1：`stop_reason="max_tokens"`（anthropic 口径）⇒ `reasoning_truncated`，不是 no_tool_call。"""
+    d = _deep_decider([_text_only("long analysis", stop_reason="max_tokens")])
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade == "reasoning_truncated"
+    assert decision.action == "hold"                # 安全回落语义逐字不变
+
+
+async def test_openai_length_finish_reason_also_maps_to_truncated():
+    """D-1b：同款输入但 `stop_reason="length"`（OpenAI 把 finish_reason 塞进同一字段）⇒ 同样判截断。
+
+    **这条用例的价值就是会因为有人把判据写回 `== "max_tokens"` 而判红。**
+    """
+    d = _deep_decider([_text_only("long analysis", stop_reason="length")])
+    _, degrade = await d.decide(_payload(1))
+    assert degrade == "reasoning_truncated"
+
+
+async def test_content_filter_is_not_retryable():
+    """D-1c：`content_filter` ⇒ `content_filtered` 且**不在**可重试集合里。
+
+    重试同一份 prompt 只会再被拦一次，白烧一次预算与一次超时——它与「写太长」是两回事。
+    """
+    d = _deep_decider([_text_only("blocked", stop_reason="content_filter")],
+                      settings=_retry_settings(ai_trade_decision_max_retries=3,
+                                               ai_trade_reasoning_reask_max=0))
+    _, degrade = await d.decide(_payload(1))
+    assert degrade == "content_filtered"
+    assert "content_filtered" not in _RETRYABLE_DEGRADE_REASONS
+    assert d._llm.calls == 1                        # 零重试
+
+
+async def test_truncated_is_retryable_and_the_hint_asks_for_compression():
+    """D-2：截断可重试，且第二次尝试的 user 文本含**压缩**指令、不含通用 hint；上下文未被污染。"""
+    d = _deep_decider([_text_only("x", stop_reason="max_tokens"),
+                       _valid_open_long()],
+                      settings=_retry_settings(ai_trade_decision_max_retries=2,
+                                               ai_trade_reasoning_reask_max=0))
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade is None and decision.action == "open_long"
+    second = d._llm.last_messages[-1].content[0].text
+    assert "Compress" in second and "S10-S12" in second
+    assert "【系统提示】" not in second              # 深度档下纠偏提示整段英文
+    assert d._context == [] and d._journal == []     # 一次性提示绝不落上下文
+
+
+# ---------------------------------------------------------------- D-3 / D-4 / D-5
+def _reask_settings(**kw):
+    base = dict(ai_trade_decision_max_retries=0, ai_trade_reasoning_reask_max=1,
+                ai_trade_reasoning_min_chars=3000)
+    base.update(kw)
+    return _retry_settings(**base)
+
+
+async def test_shallow_analysis_triggers_exactly_one_reask():
+    """D-3：首次研判 200 字符（阈 3000）⇒ 恰好多打一次 LLM；`last_reasoning.reasked` 为真。"""
+    shallow = [StreamEvent("text_delta", text="s" * 200), *_valid_open_long()]
+    deeper = [StreamEvent("text_delta", text="d" * 5000), *_valid_open_long()]
+    d = _deep_decider([shallow, deeper], settings=_reask_settings())
+    decision, degrade = await d.decide(_payload(1))
+    assert d._llm.calls == 2
+    assert degrade is None and decision.action == "open_long"
+    assert d.last_reasoning.reasked is True and d.last_reasoning.reask_adopted is True
+    assert len(d.last_analysis) == 5000
+
+
+async def test_shallow_reask_never_downgrades_the_decision():
+    """D-4（本轴最重要的一条）：追问失败 ⇒ **原样保留第一次的 open_long**，degrade 恒 None。
+
+    浅研判是质量问题、不是安全问题。把它接到降级链上会造出「模型话少 ⇒ 全部降级观望」的新
+    吸收态——本仓库为「反思致永不开单」已经付过一次学费。
+    """
+    shallow = [StreamEvent("text_delta", text="s" * 200), *_valid_open_long()]
+    d = _deep_decider([shallow, _error_script()], settings=_reask_settings())
+    decision, degrade = await d.decide(_payload(1))
+    assert decision.action == "open_long" and degrade is None
+    assert d.last_reasoning.reasked is True
+    assert d.last_reasoning.reask_adopted is False
+    assert d.last_analysis == "s" * 200              # 研判全文回到第一次那一份
+
+
+async def test_shallow_reask_keeps_the_deeper_of_the_two():
+    """D-5：追问**更浅** ⇒ 保留首次决策与首次研判（追问必须是单向增益）。"""
+    shallow = [StreamEvent("text_delta", text="s" * 200),
+               *_tool_events({"action": "open_long", "sizeFraction": 0.25,
+                              "confidence": 0.9, "reason": "first"})]
+    shallower = [StreamEvent("text_delta", text="t" * 50),
+                 *_tool_events({"action": "close", "reason": "second"}, tool_id="t2")]
+    d = _deep_decider([shallow, shallower], settings=_reask_settings())
+    decision, _ = await d.decide(_payload(1))
+    assert decision.action == "open_long" and decision.reason == "first"
+    assert d.last_reasoning.reask_adopted is False
+    assert d.last_analysis == "s" * 200
+
+
+async def test_reask_emits_into_its_own_phase():
+    """D-5b：追问的文本增量全部落在 `phase="reask"`，`analysis` 在追问期间**一帧都不再新增**。"""
+    seen: list[tuple[str, int]] = []
+
+    async def _emit(part):
+        seen.append((part.get("phase"), len(part.get("delta") or "")))
+
+    shallow = [StreamEvent("text_delta", text="s" * 200), *_valid_open_long()]
+    deeper = [StreamEvent("text_delta", text="d" * 5000), *_valid_open_long()]
+    d = _deep_decider([shallow, deeper], settings=_reask_settings())
+    await d.decide(_payload(1), emit=_emit)
+    analysis_chars = sum(n for phase, n in seen if phase == "analysis")
+    reask_chars = sum(n for phase, n in seen if phase == "reask")
+    assert analysis_chars == 200                     # 首次研判原样保留，未被追加污染
+    assert reask_chars == 5000                       # 追问全部落在独立相位
+
+
+async def test_reask_uses_extra_instruction_not_hint():
+    """D-5c：追问那次尝试的 user 文本含追问提示、**不含**任何 `_retry_hint_suffix` 文案。
+
+    `hint` 的值域是 degrade 码（`_retry_hint_suffix` 的查表键），塞自由文本进去会让那张表多出
+    一条永远不匹配的分支。
+    """
+    shallow = [StreamEvent("text_delta", text="s" * 200), *_valid_open_long()]
+    deeper = [StreamEvent("text_delta", text="d" * 5000), *_valid_open_long()]
+    d = _deep_decider([shallow, deeper], settings=_reask_settings())
+    await d.decide(_payload(1))
+    second = d._llm.last_messages[-1].content[0].text
+    assert "this is a depth request, not a rejection" in second
+    assert "ran out of output budget" not in second
+    assert d._context == [] and d._journal == []
+
+
+async def test_reask_disabled_when_min_chars_is_zero():
+    """D-6：`reask_max=0` 或 `min_chars=0` ⇒ LLM 调用次数与今日相同。"""
+    shallow = [StreamEvent("text_delta", text="s" * 10), *_valid_open_long()]
+    from app.ai_auto.reasoning_protocol import resolve_depth_profile
+
+    zero_reask = _reask_settings(ai_trade_reasoning_reask_max=0)
+    d = _deep_decider([list(shallow)], settings=zero_reask,
+                      depth=resolve_depth_profile(zero_reask))
+    await d.decide(_payload(1))
+    assert d._llm.calls == 1
+    zero_chars = _reask_settings(ai_trade_reasoning_min_chars=0)
+    d2 = _deep_decider([list(shallow)], settings=zero_chars,
+                       depth=resolve_depth_profile(zero_chars))
+    assert resolve_depth_profile(zero_chars).min_analysis_chars == 0
+    await d2.decide(_payload(1))
+    assert d2._llm.calls == 1
+
+
+async def test_no_reask_without_a_depth_profile():
+    """未装配深度档（32 个既有假客户端用例的形态）⇒ 追问整段空转，元数据恒 None。"""
+    shallow = [StreamEvent("text_delta", text="s" * 10), *_valid_open_long()]
+    d = AiTradeDecider(_ScriptedLLM([shallow]), "sys", context_refresh_rounds=10,
+                       settings=_reask_settings())
+    await d.decide(_payload(1))
+    assert d._llm.calls == 1
+    assert d.last_reasoning is None
+    assert d.depth_name == ""
+
+
+# ---------------------------------------------------------------- D-5d（轮级墙钟闸）
+async def test_round_deadline_stops_new_attempts_only(monkeypatch):
+    """D-5d：墙钟耗尽后不再发起新尝试，但**不中断在飞的那一次**；沿用当前 degrade，不新造码。
+
+    用假单调钟而不是「设一个极小的超时」：后者依赖机器有多快，是一条会偶发翻绿的用例。
+    """
+    import types
+
+    import app.ai_auto.decider as decider_mod
+
+    calls = {"n": 0}
+
+    def _fake_monotonic() -> float:
+        calls["n"] += 1
+        return 0.0 if calls["n"] == 1 else 999.0    # 开轮 0s，此后每次检查都已过 999s
+
+    # 替换的是**决策器模块自己的 `time` 引用**，不是全局 `time.monotonic`——后者会把 asyncio
+    # 的定时器一并打翻（那是一条与本用例无关的红）。
+    monkeypatch.setattr(decider_mod, "time", types.SimpleNamespace(monotonic=_fake_monotonic))
+    d = _deep_decider([_error_script(), _valid_open_long()],
+                      settings=_retry_settings(ai_trade_decision_max_retries=3,
+                                               ai_trade_reasoning_reask_max=0))
+    decision, degrade = await d.decide(_payload(1))
+    assert d._llm.calls == 1                        # 首次已发起并跑完，之后不再追加
+    assert degrade == "llm_error"                   # 沿用当前码，绝不新造 round_deadline
+    assert decision.action == "hold"
+    assert d.last_reasoning.deadline_hit is True
+
+
+async def test_reask_is_skipped_and_flagged_when_the_round_deadline_is_gone(monkeypatch):
+    """想追问但墙钟预算已耗尽 ⇒ 不再发起，且 `deadline_hit` 明示（否则就是新的静默行为）。"""
+    import types
+
+    import app.ai_auto.decider as decider_mod
+
+    calls = {"n": 0}
+
+    def _fake_monotonic() -> float:
+        calls["n"] += 1
+        return 0.0 if calls["n"] == 1 else 999.0
+
+    monkeypatch.setattr(decider_mod, "time", types.SimpleNamespace(monotonic=_fake_monotonic))
+    shallow = [StreamEvent("text_delta", text="s" * 200), *_valid_open_long()]
+    d = _deep_decider([shallow, _valid_open_long()], settings=_reask_settings())
+    decision, degrade = await d.decide(_payload(1))
+    assert d._llm.calls == 1                      # 追问没被发起
+    assert decision.action == "open_long" and degrade is None
+    assert d.last_reasoning.reasked is False
+    assert d.last_reasoning.deadline_hit is True
+
+
+async def test_rejected_reask_is_not_reported_as_a_deadline_hit():
+    """一次纯质量拒收不得被报成「本轮超时预算用尽」——墙钟没有阻止任何事。"""
+    shallow = [StreamEvent("text_delta", text="s" * 200), *_valid_open_long()]
+    shallower = [StreamEvent("text_delta", text="t" * 50), *_valid_open_long()]
+    d = _deep_decider([shallow, shallower], settings=_reask_settings())
+    await d.decide(_payload(1))
+    assert d.last_reasoning.reasked is True
+    assert d.last_reasoning.reask_adopted is False
+    assert d.last_reasoning.deadline_hit is False
+
+
+async def test_attempts_cap_bounds_the_round_even_with_three_retries():
+    """尝试次数闸：`deep` 档 cap=2 ⇒ 即使 settings 允许 3 次重试，一轮也只发起 2 次尝试。"""
+    d = _deep_decider([_error_script(), _error_script(), _error_script(), _valid_open_long()],
+                      settings=_retry_settings(ai_trade_decision_max_retries=3,
+                                               ai_trade_reasoning_reask_max=0))
+    _, degrade = await d.decide(_payload(1))
+    assert d._llm.calls == 2
+    assert degrade == "llm_error"
+
+
+async def test_attempts_cap_is_absent_without_a_depth_profile():
+    """未装配深度档 ⇒ 尝试次数逐字回退到 settings（4 次 = 首次 + 3 重试）。"""
+    d = AiTradeDecider(_ScriptedLLM([_error_script(), _error_script(), _error_script(),
+                                     _valid_open_long()]), "sys", context_refresh_rounds=10,
+                       settings=_retry_settings(ai_trade_decision_max_retries=3))
+    decision, degrade = await d.decide(_payload(1))
+    assert d._llm.calls == 4 and degrade is None and decision.action == "open_long"
+
+
+# ---------------------------------------------------------------- D-7 / B-7 / B-8 / B-9
+async def test_usage_is_normalised_and_carried_into_meta():
+    """D-7：anthropic 风格 usage ⇒ `ReasoningMeta.input_tokens/output_tokens` 正确。"""
+    script = [StreamEvent("text_delta", text="a" * 4000),
+              StreamEvent("tool_use_start", id="t1", name="submit_trade_decision"),
+              StreamEvent("tool_use_args_delta", id="t1",
+                          partial_json=json.dumps({"action": "hold", "reason": "r"})),
+              StreamEvent("message_done", stop_reason="tool_use",
+                          usage={"input_tokens": 12083, "output_tokens": 3401})]
+    d = _deep_decider([script])
+    await d.decide(_payload(1))
+    assert d.last_reasoning.input_tokens == 12083
+    assert d.last_reasoning.output_tokens == 3401
+    assert d.last_reasoning.depth == "deep"
+
+
+async def test_openai_second_message_done_backfills_usage():
+    """B-7：OpenAI 的真实顺序是两条 `message_done`——第一条带 finish_reason 且 usage 为 None，
+    第二条 `choices` 为空只带 usage。合入前「首条即 break」的写法在此判红。"""
+    script = [StreamEvent("text_delta", text="a" * 100),
+              StreamEvent("tool_use_start", id="t1", name="submit_trade_decision"),
+              StreamEvent("tool_use_args_delta", id="t1",
+                          partial_json=json.dumps({"action": "hold", "reason": "r"})),
+              StreamEvent("message_done", stop_reason="tool_calls", usage=None),
+              StreamEvent("message_done", stop_reason=None,
+                          usage={"input_tokens": 777, "output_tokens": 88})]
+    d = _deep_decider([script])
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade is None and decision.action == "hold"
+    assert d.last_reasoning.input_tokens == 777
+    assert d.last_reasoning.output_tokens == 88
+
+
+async def test_events_after_message_done_are_ignored():
+    """B-8：收尾之后到达的 `text_delta` / `error` 一律不生效——`last_analysis` 与「见到即 break」
+    的结果**逐字相同**，且晚到的 error 不把一轮已成功的决策变成 `llm_error`。"""
+    script = [StreamEvent("text_delta", text="kept"),
+              StreamEvent("tool_use_start", id="t1", name="submit_trade_decision"),
+              StreamEvent("tool_use_args_delta", id="t1",
+                          partial_json=json.dumps({"action": "hold", "reason": "r"})),
+              StreamEvent("message_done", stop_reason="tool_use"),
+              StreamEvent("text_delta", text="DROPPED"),
+              StreamEvent("error", code="LATE", message="late failure")]
+    d = _deep_decider([script])
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade is None and decision.action == "hold"
+    assert d.last_analysis == "kept"
+
+
+async def test_usage_accumulates_across_attempts_within_a_round():
+    """一轮内的每一次尝试都真的花了钱：token 用量必须**累加**，不能只留最后一次。
+
+    只留最后一次等于系统性低估成本，而成本可见（G-8）正是本特性对「token 成本 5 倍」这条
+    头号真金风险的主要对价——一个少报的数字比没有数字更坏。
+    """
+    first = [StreamEvent("text_delta", text="s" * 200),
+             StreamEvent("tool_use_start", id="t1", name="submit_trade_decision"),
+             StreamEvent("tool_use_args_delta", id="t1",
+                         partial_json=json.dumps({"action": "hold", "reason": "r"})),
+             StreamEvent("message_done", stop_reason="tool_use",
+                         usage={"input_tokens": 100, "output_tokens": 10})]
+    second = [StreamEvent("text_delta", text="d" * 5000),
+              StreamEvent("tool_use_start", id="t2", name="submit_trade_decision"),
+              StreamEvent("tool_use_args_delta", id="t2",
+                          partial_json=json.dumps({"action": "hold", "reason": "r"})),
+              StreamEvent("message_done", stop_reason="tool_use",
+                          usage={"input_tokens": 900, "output_tokens": 90})]
+    d = _deep_decider([first, second], settings=_reask_settings())
+    await d.decide(_payload(1))
+    assert d._llm.calls == 2
+    assert d.last_reasoning.input_tokens == 1000
+    assert d.last_reasoning.output_tokens == 100
+
+
+async def test_rejected_reask_restores_the_first_attempt_stop_reason():
+    """被拒收的追问不得改写 `truncated`——那个位必须描述**被采纳**的那一次尝试。"""
+    first = [StreamEvent("text_delta", text="s" * 200), *_valid_open_long()]
+    truncated_reask = _text_only("x" * 300, stop_reason="max_tokens")
+    d = _deep_decider([first, truncated_reask], settings=_reask_settings())
+    decision, degrade = await d.decide(_payload(1))
+    assert decision.action == "open_long" and degrade is None
+    assert d.last_reasoning.reask_adopted is False
+    assert d.last_reasoning.truncated is False       # 首次尝试没被截断
+
+
+async def test_usage_absent_marks_provider_unknown():
+    """B-9：provider 全程不回 usage ⇒ 两个 token 读数为 `None` 而不是 0。"""
+    d = _deep_decider([_valid_open_long()])
+    await d.decide(_payload(1))
+    assert d.last_reasoning.input_tokens is None
+    assert d.last_reasoning.output_tokens is None
+
+
+# ---------------------------------------------------------------- D-9（上限 ×5）
+async def test_analysis_cap_is_twenty_thousand():
+    """D-9：25000 字符输入 ⇒ `len(last_analysis) == 20000`（5× 上限真的生效）。"""
+    script = [StreamEvent("text_delta", text="x" * 25000), *_valid_open_long()]
+    d = _deep_decider([script])
+    await d.decide(_payload(1))
+    assert len(d.last_analysis) == 20000
+
+
+# ---------------------------------------------------------------- D-11 / D-12（证据摘要）
+def _digest_decider(args: dict, *, allow: bool = True):
+    return AiTradeDecider(_ScriptedLLM([_tool_events(args)]), "sys",
+                          context_refresh_rounds=10,
+                          settings=_retry_settings(ai_trade_decision_max_retries=0,
+                                                   ai_trade_reasoning_reask_max=0),
+                          depth_profile=_DEEP, allow_reasoning_digest=allow)
+
+
+async def test_evidence_digest_is_optional_and_never_downgrades():
+    """D-11：缺席 / 非字符串 / 超长三种输入都不产生 degrade；超长按 400 截断。"""
+    d = _digest_decider({"action": "hold", "reason": "r"})
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade is None and decision.evidence_digest is None
+
+    d2 = _digest_decider({"action": "hold", "reason": "r", "evidenceDigest": 12345})
+    decision2, degrade2 = await d2.decide(_payload(1))
+    assert degrade2 is None and decision2.evidence_digest == "12345"
+
+    d3 = _digest_decider({"action": "hold", "reason": "r", "evidenceDigest": "摘" * 900})
+    decision3, degrade3 = await d3.decide(_payload(1))
+    assert degrade3 is None and len(decision3.evidence_digest) == 400
+
+
+async def test_english_digest_never_downgrades_or_changes_the_decision():
+    """D-12：摘要写成英文 ⇒ 决策器**原样收下**（语言校验是呈现层的事，见 session 侧用例）。
+
+    三条铁律：绝不产生 degrade、绝不改 `TradeDecision` 的其余字段、绝不触发追问。
+    """
+    d = _digest_decider({"action": "open_long", "sizeFraction": 0.25, "confidence": 0.9,
+                         "reason": "理由", "evidenceDigest": "Adopted the 4H trend."})
+    decision, degrade = await d.decide(_payload(1))
+    assert degrade is None
+    assert decision.action == "open_long" and decision.size_fraction == 0.25
+    assert decision.evidence_digest == "Adopted the 4H trend."
+    assert d.last_reasoning.reasked is False
+
+
+async def test_digest_is_absent_when_the_gate_is_closed():
+    """总闸关 ⇒ 恒 None（老会话 / off 档 wire 逐字回退）。"""
+    d = _digest_decider({"action": "hold", "reason": "r", "evidenceDigest": "中文摘要"},
+                        allow=False)
+    decision, _ = await d.decide(_payload(1))
+    assert decision.evidence_digest is None
+
+
+def test_decider_exposes_digest_field_only_when_allowed():
+    """schema 恒等断言：总闸关 ⇒ 原样返回模块常量（G-2）。"""
+    from app.ai_auto.prompts import DECISION_TOOL_SCHEMA, build_decision_tool_schema
+
+    assert build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA
+    opened = build_decision_tool_schema(0.0, allow_reasoning_digest=True)
+    assert "evidenceDigest" in opened["properties"]
+    assert "evidenceDigest" not in DECISION_TOOL_SCHEMA["properties"]
+
+
+# ---------------------------------------------------------------- D-10（安全契约冻结）
+async def test_cancelled_error_still_propagates_on_the_deep_path():
+    """D-10：深度档下 `asyncio.CancelledError` 仍原样上抛（绝不吞、绝不降级）。"""
+    class _Cancel:
+        provider = "anthropic"
+        calls = 0
+
+        async def stream(self, *, system, messages, tools):
+            raise asyncio.CancelledError()
+            yield   # pragma: no cover
+
+    d = AiTradeDecider(_Cancel(), "sys", context_refresh_rounds=10,
+                       settings=_retry_settings(ai_trade_decision_max_retries=3),
+                       depth_profile=_DEEP)
+    with pytest.raises(asyncio.CancelledError):
+        await d.decide(_payload(1))
+
+
+# ---------------------------------------------------------------- 摘要字符兜底
+async def test_summary_seed_is_bounded_by_the_character_cap():
+    """§3.3.4：摘要种子除模型侧预算外再加一道字符兜底（它是每轮都会被重读的那一段）。"""
+    long_summary = [StreamEvent("text_delta", text="摘" * 5000),
+                    StreamEvent("message_done", stop_reason="end_turn")]
+    d = _deep_decider([long_summary])
+    text = await d.summarize()
+    assert len(text) == 3000

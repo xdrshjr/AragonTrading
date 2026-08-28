@@ -21,8 +21,9 @@ import json
 import logging
 import math
 import random
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..agent.llm.base import (
     LLMClient,
@@ -32,7 +33,7 @@ from ..agent.llm.base import (
     ToolSchema,
     ToolUseBlock,
 )
-from ..agent.llm.retry import backoff_delay_ms
+from ..agent.llm.retry import backoff_delay_ms, normalize_usage
 from ..config import Settings
 from ..live_auto.resting import validate_limit_intent
 from .hold_horizon_text import format_reflection_note
@@ -49,6 +50,14 @@ from .prompts import (
     build_summary_prompt,
     build_summary_system_prompt,
 )
+from .reasoning_protocol import (
+    CONTENT_FILTER_STOP_REASONS,
+    TRUNCATION_STOP_REASONS,
+    DepthProfile,
+    build_review_protocol,
+    count_stages,
+)
+from .prompts_en import RETRY_HINT_GENERIC_EN, RETRY_HINT_TRUNCATED_EN, build_reask_instruction
 from .summary_health import SummaryHealth, health_wire
 from .trace import TraceEmit, _TraceCoalescer
 
@@ -66,7 +75,14 @@ ORDERING_ACTIONS = ("open_long", "open_short", "close")
 
 # 本轮研判思维链全文的硬上限（ai-trade-reasoning-chain §2.5）：`_last_analysis` 只经 agent_trace 流与
 # _traces(≤20) 承载给 UI，超出即截断；进 journal / decision 事件的是调用方派生的有界摘录（≤400，RC-2/3）。
-_ANALYSIS_MAX_CHARS = 4000
+# [deep-reasoning-chain §3.3.4] 4000 → 20000（5×）：12 阶段协议下一份完整研判约 6~9k 字符，
+# 4000 会在 S7 附近把后半截思维链整段丢掉——而丢掉的恰好是证伪（S11）与结论（S12）两段。
+_ANALYSIS_MAX_CHARS = 20000
+# 滚动摘要种子的字符兜底（新增，§3.3.4）：摘要客户端预算 1536 token，本常量是第二道闸，
+# 防一次异常长的摘要撑爆 `_context`（摘要是每轮都会被重读的那一段）。
+_SUMMARY_MAX_CHARS = 3000
+# 中文证据摘要的落痕上限（与工具 schema 的 `maxLength: 400` 同数；schema 是软引导、本常量是硬约束）。
+_EVIDENCE_DIGEST_MAX_CHARS = 400
 # 离场证据的落痕上限（与工具 schema 的 `maxLength: 300` 同数；schema 是软引导、本常量是硬约束）。
 _EXIT_EVIDENCE_MAX_CHARS = 300
 
@@ -80,9 +96,13 @@ _EXIT_EVIDENCE_MAX_CHARS = 300
 # ——同一轮内价格与 MA 通道都是常量，重试必然被同样否决，每次重试白烧一次 LLM 调用与最多 60s 超时
 # 预算。基础策略门禁因此刻意落在 `decide()` **之后**（session/backtest 调 base_rules 纯核心），
 # 而不是 `_map_decision` 内。冻结断言见 tests/test_ai_trade_decider.py。
+# ⚠️ deep-reasoning-chain §3.3.3：`reasoning_truncated`（输出预算耗尽在工具调用之前）**入**本
+# 集合——带压缩提示重试一次极可能成功；而 `content_filtered`（内容安全拦截）**绝不入**：同一份
+# prompt 重试只会再被拦一次，白烧一次预算与一次超时。
 _RETRYABLE_DEGRADE_REASONS = frozenset(
     {"decision_timeout", "llm_error", "no_tool_call", "invalid_action", "missing_size",
-     "missing_limit_price", "limit_price_out_of_band", "invalid_order_type"})
+     "missing_limit_price", "limit_price_out_of_band", "invalid_order_type",
+     "reasoning_truncated"})
 # 每次重试前退避的抖动上限（ms），镜像 agent/llm/retry.py 的 _JITTER_MS 语义（§4.3）。
 _RETRY_JITTER_MS = 250
 
@@ -102,10 +122,63 @@ def _is_retryable_reflection(reason: str | None) -> bool:
     return reason in _RETRYABLE_REFLECTION_REASONS
 
 
-def _retry_hint_suffix(reason: str) -> str:
-    """重试时追加进瞬时 user_msg 的一次性纠偏提示（不落 _context/_journal，§4.5）。"""
-    return (f"\n\n【系统提示】上一次未产出有效决策（{reason}）。"
-            f"请务必**只调用一次** submit_trade_decision 并给出完整合法入参。")
+def _retry_hint_suffix(reason: str, *, english: bool = False) -> str:
+    """重试时追加进瞬时 user_msg 的一次性纠偏提示（不落 _context/_journal，§4.5）。
+
+    `english`（keyword-only，默认 False ⇒ 与本特性合入前**逐字节相同**）：深度档生效时整段换
+    英文，与英文指令层同语言。截断码有**专属**文案——它要求压缩 S1–S9 而不是「再调一次工具」，
+    因为上一次失败的原因恰恰是话说太长（§3.3.3）。
+    """
+    if not english:
+        return (f"\n\n【系统提示】上一次未产出有效决策（{reason}）。"
+                f"请务必**只调用一次** submit_trade_decision 并给出完整合法入参。")
+    if reason == "reasoning_truncated":
+        return RETRY_HINT_TRUNCATED_EN
+    return RETRY_HINT_GENERIC_EN.format(reason=reason)
+
+
+@dataclass(frozen=True)
+class _StreamOutcome:
+    """一次决策流的全部产出：工具入参 + provider 归一的收尾读数（§3.3.3）。
+
+    合入前 `_stream_decision` 只返回 `dict | None`，`message_done` 携带的 `stop_reason` 与
+    `usage` 被解析出来又原地丢掉——于是「输出预算耗尽在工具调用之前」表现为 `no_tool_call`
+    → 重试 → 再次耗尽 → 降级 `hold`，日志与界面上**看不出**真实原因（根因 C-4）。
+    """
+
+    raw: dict | None
+    stop_reason: str | None = None
+    usage: dict | None = None
+
+
+@dataclass(frozen=True)
+class ReasoningMeta:
+    """逐轮研判元数据（§3.4.1）：深度、篇幅、阶段数、截断、追问、墙钟闸与 token 用量。
+
+    经 `AiTradeDecider.last_reasoning` 只读取用（与 `last_analysis` 同款范式），使 `decide()`
+    的签名契约零改动。`off` 档 / 未装配深度档 ⇒ 恒 `None` ⇒ wire 上整键缺席。
+    """
+
+    depth: str
+    chars: int
+    stages: int
+    truncated: bool
+    reasked: bool
+    reask_adopted: bool
+    deadline_hit: bool
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    reflection_chars: int | None = None
+    reflection_stages: int | None = None
+
+    def wire(self) -> dict:
+        """`result` 轨迹事件与 `aiStats` 共用的**唯一**一份 camelCase 装配（杜绝逐键手抄漂移）。"""
+        return {"depth": self.depth, "chars": self.chars, "stages": self.stages,
+                "truncated": self.truncated, "reasked": self.reasked,
+                "reaskAdopted": self.reask_adopted, "deadlineHit": self.deadline_hit,
+                "inputTokens": self.input_tokens, "outputTokens": self.output_tokens,
+                "reflectionChars": self.reflection_chars,
+                "reflectionStages": self.reflection_stages}
 
 
 @dataclass
@@ -130,6 +203,17 @@ class TradeDecision:
     # 的 F-2 先例：一个读不懂的确信度不该把最安全的动作降级）。
     exit_conviction: str | None = None
     exit_evidence: str | None = None
+    # 面向操作员的中文证据摘要（deep-reasoning-chain §3.1.7）：同款末位带默认值 ⇒ 既有全部位置
+    # 构造与解包零改动。**纯呈现物**——缺席 / 非字符串 / 超长 / 写成英文四种情形一律不产生
+    # degrade、不改任何交易语义（用例 D-11 / D-12）。
+    evidence_digest: str | None = None
+
+
+def _add_tokens(prev, current):
+    """两个可空 token 读数相加；两者皆缺 ⇒ `None`（「没被告知」不该被写成 0）。"""
+    if prev is None and current is None:
+        return None
+    return int(prev or 0) + int(current or 0)
 
 
 def _hold(reason: str) -> TradeDecision:
@@ -182,8 +266,19 @@ class AiTradeDecider:
                  context_refresh_rounds: int, settings: Settings,
                  position_step_pct: float = 0.0, reflection_enabled: bool = False,
                  allow_limit: bool = False, allow_hold_exit: bool = False,
-                 allow_exit_priority: bool = False):
+                 allow_exit_priority: bool = False,
+                 reflection_llm: LLMClient | None = None,
+                 summary_llm: LLMClient | None = None,
+                 allow_reasoning_digest: bool = False,
+                 depth_profile: DepthProfile | None = None):
         self._llm = llm
+        # 三份预算（deep-reasoning-chain §3.3.1）：默认 `None` ⇒ 三者同为 `llm` ⇒ 现有全部直接
+        # 构造（回测早期路径、32 个假客户端单测、`decider.llm` 蒸馏出口）逐字零回归（用例 G-5）。
+        self._reflection_llm = reflection_llm or llm
+        self._summary_llm = summary_llm or llm
+        # 本特性在决策器上的**唯一**开关：超时、轮级墙钟闸、尝试次数上限、追问阈、以及反思侧的
+        # 复核协议文本全部由它派生。`None`（既有直接构造）⇒ 全部逐字回退到今日的 settings 读法。
+        self._depth = depth_profile
         self.system_prompt = system_prompt
         self.context_refresh_rounds = max(1, int(context_refresh_rounds))
         self.settings = settings
@@ -200,22 +295,30 @@ class AiTradeDecider:
         # 离场优先通道总闸（默认 **False**，镜像 allow_limit / allow_hold_exit）：默认 False 是硬
         # 约束——它让 `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA` 恒等断言原样通过。
         self.allow_exit_priority = bool(allow_exit_priority)
+        # 中文证据摘要总闸（默认 **False**，镜像上面三个总闸）：默认 False 是硬约束——它让
+        # `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA` 恒等断言原样通过（G-2）。
+        self.allow_reasoning_digest = bool(allow_reasoning_digest)
         # 下单前二次反思总闸（默认关；直接构造该决策器的既有测试/回测 → reflect 无副作用直通、逐字零回归。
         # 生产装配 manager/backtest_manager 从 req.settings.ai_trade_reflection_enabled 显式打开，§2.3）。
         self.reflection_enabled = bool(reflection_enabled)
         # F-3：价带比例文案由 settings 派生（运行时唯一真源），prompt 与本地门禁恒同一口径。
         band_pct = settings.ai_trade_limit_price_max_deviation_pct
+        # 工具描述的语言与指令层同源：深度档生效 ⇒ 整体英文；否则恒等返回今日中文常量（G-3）。
+        tool_lang = "en" if self._depth_on else "zh"
         self._tool = ToolSchema(
             name=DECISION_TOOL_NAME,
             description=build_decision_tool_description(self.allow_limit,
                                                         limit_band_pct=band_pct,
                                                         allow_hold_exit=self.allow_hold_exit,
-                                                        allow_exit_priority=self.allow_exit_priority),
-            input_schema=build_decision_tool_schema(self._position_step,
-                                                    allow_limit=self.allow_limit,
-                                                    limit_band_pct=band_pct,
-                                                    allow_hold_exit=self.allow_hold_exit,
-                                                    allow_exit_priority=self.allow_exit_priority))
+                                                        allow_exit_priority=self.allow_exit_priority,
+                                                        lang=tool_lang),
+            input_schema=build_decision_tool_schema(
+                self._position_step,
+                allow_limit=self.allow_limit,
+                limit_band_pct=band_pct,
+                allow_hold_exit=self.allow_hold_exit,
+                allow_exit_priority=self.allow_exit_priority,
+                allow_reasoning_digest=self.allow_reasoning_digest))
         # 反思唯一放行工具（镜像决策工具的「唯一放行」范式，安全由回落兜底，§2.2）。
         self._reflection_tool = ToolSchema(name=REFLECTION_TOOL_NAME,
                                            description=REFLECTION_TOOL_DESCRIPTION,
@@ -231,6 +334,13 @@ class AiTradeDecider:
         self._summary_skip_rounds = 0     # 退避：本次成功前额外要跳过的到期点轮数
         self._summary_due = False         # D-5：到期了但被 `defer_summary` 推迟到轮末再跑
         self._last_analysis: str = ""      # 本轮研判思维链全文（R3；每次尝试入口清零，RC-1，§4.2/R-6）
+        # 反思复核推理全文（补根因 C-3）：合入前完全不留存（只作为 trace delta 扇出），
+        # 事后无法度量、无法沉淀。入口清零、流正常结束才落、上限同 `_ANALYSIS_MAX_CHARS`。
+        self._last_reflection_analysis: str = ""
+        # 本轮研判元数据（§3.4.1）；`off` 档 / 未装配深度档恒 None ⇒ wire 整键缺席。
+        self._last_reasoning: ReasoningMeta | None = None
+        self._last_stop_reason: str | None = None   # 本轮最后一次尝试的收尾码（provider 原样）
+        self._last_usage: dict | None = None        # 归一后的 {inputTokens, outputTokens}
 
     # ---------- 只读状态（供 status / snapshot）----------
     @property
@@ -257,6 +367,43 @@ class AiTradeDecider:
         return self._last_analysis
 
     @property
+    def last_reflection_analysis(self) -> str:
+        """本轮反思复核推理全文（补 C-3）；未反思 / 反思失败的轮次为空串。"""
+        return self._last_reflection_analysis
+
+    @property
+    def last_reasoning(self) -> ReasoningMeta | None:
+        """本轮研判元数据（§3.4.1）；`off` 档 / 未装配深度档恒 `None`（wire 整键缺席）。"""
+        return self._last_reasoning
+
+    @property
+    def depth_name(self) -> str:
+        """本会话生效的研判深度档名；未装配 / `off` 档恒空串。
+
+        payload 的 `reasoningDepth` **加法键**取自这里（单一真源）：prompts 的收尾任务指令、
+        session 的 wire 与 `aiStats` 三处读的都是同一个数，杜绝「决策器走英文档、prompt 走中文
+        档」这类不会报错的漂移。
+        """
+        return self._depth.name if self._depth_on else ""
+
+    @property
+    def _depth_on(self) -> bool:
+        """深度档是否真的生效（未装配 / `off` 档一律 False ⇒ 全链路逐字节回退）。"""
+        return self._depth is not None and self._depth.enabled
+
+    @property
+    def _decision_timeout_s(self) -> float:
+        """单次决策尝试超时：深度档生效取档位值，否则**逐字回退**到 settings（今日行为）。"""
+        return (self._depth.decision_timeout_s if self._depth_on
+                else float(self.settings.ai_trade_decision_timeout_s))
+
+    @property
+    def _reflection_timeout_s(self) -> float:
+        """单次反思尝试超时：同款——深度档取档位值，否则逐字回退到 settings。"""
+        return (self._depth.reflection_timeout_s if self._depth_on
+                else float(self.settings.ai_trade_reflection_timeout_s))
+
+    @property
     def position_step(self) -> float:
         """开仓档位步长（fraction，只读）；供 session 反思收缩量化吸附到合法档位（§2.3/RV-4）。"""
         return self._position_step
@@ -274,35 +421,159 @@ class AiTradeDecider:
         `ai_trade_decision_max_retries` 次，全部失败才降级；模型真实终态决策（合法动作 / 刻意 hold /
         low_confidence 门禁）零重试、行为逐字不变；`asyncio.CancelledError` 立即向上抛（绝不吞、绝不降级）。
         `max_retries=0` 逐字回退旧行为「首次失败即降级」。
+
+        深度档生效时**额外**叠加两道只收敛尝试次数、**绝不改变任何安全回落语义**的闸（§3.3.5）：
+        尝试次数闸 `max_attempts_cap` 与轮级墙钟闸 `round_deadline_s`（全部尝试 + 追问共享）。
+        闸耗尽**不是新的降级码**：沿用当前已有的 `degrade`（多半是 `decision_timeout`），只是不再
+        发起新尝试；读数经 `last_reasoning.deadline_hit` 在界面上明示，绝不静默。
         """
-        max_retries = max(0, int(self.settings.ai_trade_decision_max_retries))
+        self._reset_round_reasoning()
+        deadline = self._round_deadline()
+        max_retries = self._effective_max_retries()
         decision, degrade = await self._attempt_decision(payload, emit)   # 首次：hint=None
         attempt = 0
+        deadline_hit = False
         while (degrade is not None and _is_retryable_degrade(degrade)
                and attempt < max_retries):
+            if self._deadline_exhausted(deadline):
+                deadline_hit = True                # 只停止追加尝试，绝不中断在飞的那一次
+                break
             attempt += 1
             await self._emit_retry(emit, attempt, max_retries, degrade)   # 面包屑 + 前端本轮累积重置
             await self._retry_backoff(attempt)                            # 可被 cancel 中断
             decision, degrade = await self._attempt_decision(payload, emit, hint=degrade)
+        decision, degrade, reask = await self._maybe_reask(
+            payload, emit, decision=decision, degrade=degrade, deadline=deadline)
+        self._last_reasoning = self._build_reasoning_meta(
+            reasked=reask[0], reask_adopted=reask[1],
+            deadline_hit=deadline_hit or reask[2])
         return decision, degrade
 
+    def _reset_round_reasoning(self) -> None:
+        """轮入口清零本轮遥测（与 `_last_analysis` 的入口清零同款范式，RC-1）。"""
+        self._last_reasoning = None
+        self._last_stop_reason = None
+        self._last_usage = None
+        self._last_reflection_analysis = ""
+
+    def _effective_max_retries(self) -> int:
+        """本轮**有效**重试次数 = min(settings 的重试数, 档位尝试上限 − 1)；未封顶即逐字回退。"""
+        max_retries = max(0, int(self.settings.ai_trade_decision_max_retries))
+        cap = self._depth.max_attempts_cap if self._depth_on else 0
+        return max_retries if cap <= 0 else max(0, min(max_retries, cap - 1))
+
+    def _round_deadline(self) -> float | None:
+        """轮级墙钟闸的到期时刻（单调钟）；未设闸 ⇒ `None`。
+
+        必须用 `monotonic()` 而非 `time.time()`：本仓库已经为「双时钟」栽过一次
+        （docs/plans/ai-trade-wake-aware-context），墙钟闸尤其不能被系统时钟跳变打翻。
+        """
+        if not self._depth_on or self._depth.round_deadline_s <= 0:
+            return None
+        return time.monotonic() + float(self._depth.round_deadline_s)
+
+    @staticmethod
+    def _deadline_exhausted(deadline: float | None) -> bool:
+        return deadline is not None and time.monotonic() >= deadline
+
+    def _build_reasoning_meta(self, *, reasked: bool, reask_adopted: bool,
+                              deadline_hit: bool) -> ReasoningMeta | None:
+        """装配本轮 `ReasoningMeta`；深度档未生效 ⇒ `None`（wire 整键缺席，逐字回退）。"""
+        if not self._depth_on:
+            return None
+        usage = self._last_usage or {}
+        return ReasoningMeta(
+            depth=self._depth.name,
+            chars=len(self._last_analysis),
+            stages=count_stages(self._last_analysis, "S"),
+            truncated=self._last_stop_reason in TRUNCATION_STOP_REASONS,
+            reasked=reasked, reask_adopted=reask_adopted, deadline_hit=deadline_hit,
+            input_tokens=usage.get("inputTokens"), output_tokens=usage.get("outputTokens"))
+
+    def _wants_reask(self, degrade: str | None) -> bool:
+        """本轮**是否需要**追问（§3.4.2）：已经拿到一个真实决策，但研判确实过浅。
+
+        刻意与「墙钟预算还够不够」分开判：两者合成一个谓词会让「想追问但没预算」变成一条
+        静默路径，而那正是 `deadline_hit` 这个读数存在的理由。
+        """
+        if not self._depth_on or degrade is not None:
+            return False
+        if self._depth.min_analysis_chars <= 0:
+            return False
+        if int(self.settings.ai_trade_reasoning_reask_max) <= 0:
+            return False
+        return len(self._last_analysis) < self._depth.min_analysis_chars
+
+    async def _maybe_reask(self, payload: dict, emit: TraceEmit | None, *,
+                           decision: TradeDecision, degrade: str | None,
+                           deadline: float | None
+                           ) -> tuple[TradeDecision, str | None, tuple[bool, bool, bool]]:
+        """至多一次的深度追问：**只提质量，永不降级**（§3.4.2 / 用例 D-4）。
+
+        采纳规则（安全关键）：追问成功且更深 ⇒ 采纳；追问失败 / 更浅 / 产生 degrade ⇒ **原样
+        保留第一次的决策与第一次的研判全文**。任何情况下都不会因为「研判太浅」而把决策改成
+        `hold`——浅研判是质量问题，不是安全问题；把它接到降级链上会造出「模型话少 ⇒ 全部降级
+        观望」的新吸收态（本仓库为「反思致永不开单」已经付过一次学费，R-4）。
+
+        Returns:
+            `(decision, degrade, (reasked, reask_adopted, deadline_hit))`。
+        """
+        if not self._wants_reask(degrade):
+            return decision, degrade, (False, False, False)
+        if self._deadline_exhausted(deadline):
+            # 想追问、但轮级墙钟预算已经耗尽 ⇒ 不再发起，并**在界面上明示**（`deadlineHit`）。
+            # 不明示就成了新的静默行为——而本特性的另一半正是「诚实」。
+            return decision, degrade, (False, False, True)
+        first_analysis = self._last_analysis
+        first_stop_reason = self._last_stop_reason
+        instruction = build_reask_instruction(
+            stages=count_stages(first_analysis, "S"), chars=len(first_analysis),
+            words_per_stage=self._depth.words_per_stage)
+        # 流式产出走**独立相位** `reask`：前端对 `analysis` 是纯追加归约、唯一清零点是 `retry`
+        # 相位，沿用同一相位会把 S1–S12 追加成两遍（导轨读出 24/12）；改用 emit=None 则界面上
+        # 留着的是被丢弃的浅研判。两种写法都让「界面上的研判」与「实际生效的决策」不是同一份。
+        deeper, deeper_degrade = await self._attempt_decision(
+            payload, emit, extra_instruction=instruction, text_phase="reask")
+        if deeper_degrade is None and len(self._last_analysis) > len(first_analysis):
+            return deeper, None, (True, True, False)
+        # 未采纳：研判全文与收尾码原样回到第一次那一份（`truncated` 必须描述**被采纳**的那次
+        # 尝试；描述一次被丢弃的尝试是另一种形态的不诚实）。usage **不**回滚——那两次调用是
+        # 真的都花了钱。
+        self._last_analysis = first_analysis
+        self._last_stop_reason = first_stop_reason
+        # 第三元恒 False：追问**跑过了**，墙钟没有阻止任何事——把它报成 deadline_hit 会让界面
+        # 上的「本轮超时预算用尽」在一次纯质量拒收上误报。
+        return decision, degrade, (True, False, False)
+
     async def _attempt_decision(self, payload: dict, emit: TraceEmit | None = None,
-                                *, hint: str | None = None
+                                *, hint: str | None = None,
+                                extra_instruction: str | None = None,
+                                text_phase: str = "analysis"
                                 ) -> tuple[TradeDecision, str | None]:
         """单次决策尝试（= 今日 decide 主体）：入口清零 last_analysis → 流式研判 → 映射。
 
         `hint`（keyword-only，默认 None → 与今日首次尝试逐字一致）：上一次失败的 degrade 原因，
         仅追加进**当次瞬时** user_msg（§4.5），绝不落 `_context/_journal`——上下文零污染。
+
+        `extra_instruction`（keyword-only，默认 None → 逐字一致）：浅研判追问提示（§3.4.2）。
+        **刻意不复用 `hint`**：`hint` 的值域是 degrade 码、是 `_retry_hint_suffix` 的查表键，
+        塞一段自由文本进去会让那张表多出一条永远不匹配的分支（用例 D-5c）。
+
+        `text_phase`（keyword-only，默认 `"analysis"`）：本次尝试的文本增量落在哪个轨迹相位。
+        追问走 `"reask"`，使首次研判在轨迹流上既不被覆盖也不被追加污染（用例 D-5b）。
         """
         self._last_analysis = ""     # RC-1（跨尝试版）：每次尝试入口清零，重试不残留上一次尝试的研判
         prompt_text = build_decision_prompt(payload)
         if hint:
-            prompt_text += _retry_hint_suffix(hint)   # §4.5：仅当次重试的一次性纠偏提示（首次不触发）
+            # §4.5：仅当次重试的一次性纠偏提示（首次不触发）。深度档生效时整段英文，与指令层同语言。
+            prompt_text += _retry_hint_suffix(hint, english=self._depth_on)
+        if extra_instruction:
+            prompt_text += extra_instruction
         user_msg = LlmMessage("user", [TextBlock(prompt_text)])
         try:
-            raw = await asyncio.wait_for(
-                self._stream_decision(user_msg, emit),
-                timeout=self.settings.ai_trade_decision_timeout_s)
+            outcome = await asyncio.wait_for(
+                self._stream_decision(user_msg, emit, text_phase=text_phase),
+                timeout=self._decision_timeout_s)
         except asyncio.TimeoutError:
             return _hold("decision_timeout"), "decision_timeout"
         except asyncio.CancelledError:
@@ -310,8 +581,42 @@ class AiTradeDecider:
         except Exception as exc:  # noqa: BLE001 —— 任何 LLM/网络失败回落 hold（绝不在不确定时下单）
             logger.warning("ai-trade decide attempt failed: %s", exc)
             return _hold("llm_error"), "llm_error"
+        self._note_stream_outcome(outcome)
         # §2.6：last_px 取自 payload（`_build_decision_payload` 已含 lastPx）——与喂给 prompt 的价同源。
-        return self._map_decision(raw, last_px=payload.get("lastPx"))
+        decision, degrade = self._map_decision(outcome.raw, last_px=payload.get("lastPx"))
+        return decision, self._honest_no_tool_reason(degrade, outcome.stop_reason)
+
+    def _note_stream_outcome(self, outcome: _StreamOutcome) -> None:
+        """把本次尝试的收尾读数记进轮级遥测（`usage` 归一复用 agent 层的同一份口径）。
+
+        **usage 在一轮内累加**：一轮可能有重试与一次追问，每一次都真的花了钱。只留最后一次
+        等于系统性低估 token 成本，而成本可见（G-8）正是本特性对 R-3（token 成本 5 倍）的
+        主要对价——一个少报的数字比没有数字更坏。
+        """
+        self._last_stop_reason = outcome.stop_reason
+        usage = normalize_usage(getattr(self._llm, "provider", "anthropic"), outcome.usage)
+        if usage is None:
+            return
+        prev = self._last_usage or {}
+        self._last_usage = {
+            "inputTokens": _add_tokens(prev.get("inputTokens"), usage.get("inputTokens")),
+            "outputTokens": _add_tokens(prev.get("outputTokens"), usage.get("outputTokens"))}
+
+    @staticmethod
+    def _honest_no_tool_reason(degrade: str | None, stop_reason: str | None) -> str | None:
+        """把 `no_tool_call` 细分成「预算耗尽」与「内容被拦」两个诚实的码（§3.3.3 / 根因 C-4）。
+
+        判据取 `reasoning_protocol.TRUNCATION_STOP_REASONS` 这一**唯一真源**：Anthropic 报
+        `max_tokens`、OpenAI 标准把 `finish_reason="length"` 塞进同一个字段。任何写死一家口径
+        的判据都会让另外半个 provider 家族原样退回「看不出原因」的形态（用例 D-1b）。
+        """
+        if degrade != "no_tool_call" or not stop_reason:
+            return degrade
+        if stop_reason in TRUNCATION_STOP_REASONS:
+            return "reasoning_truncated"
+        if stop_reason in CONTENT_FILTER_STOP_REASONS:
+            return "content_filtered"
+        return degrade
 
     async def _retry_backoff(self, attempt: int) -> None:
         """第 `attempt` 次（1-based）重试前的有界指数退避 + 抖动；可被 cancel / 会话停止中断（§4.3）。"""
@@ -327,23 +632,46 @@ class AiTradeDecider:
         await emit({"phase": "retry", "attempt": attempt,
                     "maxAttempts": max_retries, "reason": reason})
 
-    async def _stream_decision(self, user_msg: LlmMessage,
-                               emit: TraceEmit | None = None) -> dict | None:
-        """流式累积首个 `submit_trade_decision` 的 partial_json 并解析（P1-5）；无工具调用→None。
+    async def _stream_decision(self, user_msg: LlmMessage, emit: TraceEmit | None = None,
+                               *, text_phase: str = "analysis") -> _StreamOutcome:
+        """流式累积首个 `submit_trade_decision` 的 partial_json 并解析（P1-5）；无工具调用→raw=None。
 
         旁路：text_delta（分析）/ thinking_delta（深度思考）经 `_TraceCoalescer` 合并后 `emit`；
         `emit is None` 时合并器空转，取工具入参逻辑与今日逐字不变（安全契约不受影响）。
+
+        收尾语义（§3.3.3 / P0-2）：**首条 `message_done` 不再直接 `break`**，而是置 `done` 标志
+        并继续消费到流自然结束，只为**回填 usage**。理由：OpenAI 的 usage 走
+        `stream_options.include_usage`，它在一个独立的、`choices` 为空的收尾 chunk 里到达，
+        因而会产生**第二条** `message_done`——首条那一条的 `usage` 恒为 `None`。合入前「见到即
+        break」使 token 用量在半个 provider 家族上恒空，G-8 与探针判据一并落空。
+
+        三条铁律：① `done` 之后**只接受** `message_done` 做回填，`text_delta` 一律丢弃，使
+        `last_analysis` 与今日 `break` 的结果逐字相同（用例 B-8）；② 外层 `asyncio.wait_for` 仍
+        兜住「provider 不关流」的极端情形，故这里不需要第二个超时；③ `error` 事件在 `done` 之后
+        到达也一并丢弃——工具入参已经拿到，此时抛异常会把一轮已经成功的决策变成 `llm_error`。
         """
         accs: dict[str, dict] = {}
         order: list[str] = []
         analysis_parts: list[str] = []           # R3：累积研判全文（与 emit 解耦，回测 emit=None 也留痕）
         pump = _TraceCoalescer(emit)             # emit=None → 全程空转（回测 / 单测无订阅）
+        done = False
+        stop_reason: str | None = None
+        usage: dict | None = None
         async for ev in self._llm.stream(system=self.system_prompt,
                                           messages=self._context + [user_msg],
                                           tools=[self._tool]):
+            if ev.kind == "message_done":
+                stop_reason = ev.stop_reason or stop_reason   # 非空者胜（第二条通常只带 usage）
+                usage = ev.usage or usage                     # 只回填，绝不用 None 覆盖已有值
+                if not done:
+                    await pump.flush()
+                    done = True
+                continue
+            if done:
+                continue                         # 收尾之后到达的任何事件一律丢弃（语义等价今日 break）
             if ev.kind == "text_delta":
                 analysis_parts.append(ev.text or "")
-                await pump.feed("analysis", ev.text or "")
+                await pump.feed(text_phase, ev.text or "")
             elif ev.kind == "thinking_delta":
                 await pump.feed("thinking", ev.text or "")
             elif ev.kind == "tool_use_start":
@@ -357,19 +685,16 @@ class AiTradeDecider:
             elif ev.kind == "error":
                 await pump.flush()
                 raise RuntimeError(ev.message or ev.code or "LLM_ERROR")
-            elif ev.kind == "message_done":
-                await pump.flush()
-                break
         # R3：流正常结束才落全文（超时/取消/error 提前退出则不赋值，_last_analysis 维持入口清零的空串）。
         self._last_analysis = "".join(analysis_parts).strip()[:_ANALYSIS_MAX_CHARS]
         for tid in order:                       # 取首条有效 submit_trade_decision（多调用取其一）
             if accs[tid]["name"] == DECISION_TOOL_NAME:
                 raw = "".join(accs[tid]["parts"]).strip() or "{}"
                 try:
-                    return json.loads(raw)
+                    return _StreamOutcome(json.loads(raw), stop_reason, usage)
                 except json.JSONDecodeError:
-                    return None                 # 入参非法 → hold
-        return None                             # 未产生工具调用 → hold
+                    return _StreamOutcome(None, stop_reason, usage)   # 入参非法 → hold
+        return _StreamOutcome(None, stop_reason, usage)               # 未产生工具调用 → hold
 
     @property
     def _allowed_actions(self) -> tuple[str, ...]:
@@ -401,6 +726,9 @@ class AiTradeDecider:
         if action not in self._allowed_actions:
             return _hold("invalid_action"), "invalid_action"
         confidence = _clamp01(raw.get("confidence"))
+        # deep-reasoning-chain §3.1.7：中文证据摘要是**纯呈现物**——总闸关 / 缺席 / 非字符串 /
+        # 超长一律安全归一为 None 或截断，**绝不据它降级**（沿用 orderType 的 F-2 先例）。
+        digest = self._resolve_evidence_digest(raw)
         # C1（[P2-3]）：`_map_decision` 无字面 `action == "hold"` 分支（hold/close/cancel_order 同走
         # 下方 fall-through），故承诺退出线**必须显式以 `action == "hold"` 为条件**解析——否则残留的
         # holdExitPx 会泄漏到 close/cancel_order。非法值 ⇒ None，绝不降级（hold 已是最安全动作）。
@@ -424,7 +752,8 @@ class AiTradeDecider:
             # missing_size）；step=0 时逐字等价旧行为（连续直通）。
             from .signals import quantize_size_fraction
             size = quantize_size_fraction(size, self._position_step)
-            return TradeDecision(action, size, confidence, reason, ord_type, limit_px), None
+            return (TradeDecision(action, size, confidence, reason, ord_type, limit_px,
+                                  evidence_digest=digest), None)
         # exit-priority §6.1【R:P1-9b】：**只改这一条返回**。`open_long`/`open_short` 走的是上面
         # 那条 6 位置参的提前 return（连 hold_exit_px 都不带），按 X-1b 反手一律不进本层（先降级
         # 为 close 再判）——去动它会把一个开仓决策变成潜在的解闸入口，直接违反 X-1。
@@ -432,7 +761,21 @@ class AiTradeDecider:
         # 本函数没有字面 `action == "close"` 分支，不显式判条件残留值会泄漏到 hold/cancel_order）。
         conviction, evidence = self._resolve_exit_intent(raw, action)
         return (TradeDecision(action, None, confidence, reason, ord_type, limit_px,
-                              hold_exit_px, conviction, evidence), None)
+                              hold_exit_px, conviction, evidence,
+                              evidence_digest=digest), None)
+
+    def _resolve_evidence_digest(self, raw: dict) -> str | None:
+        """解析可选的中文证据摘要（总闸关 / 缺席 / 非字符串 ⇒ `None`；超长按 400 截断）。
+
+        **绝不降级**（用例 D-11 / D-12）：这个字段只喂三处中文界面（journal 摘录、收起态标题、
+        左栏决策卡首段），一个写错的摘要是排版问题，不是安全问题。语言校验刻意**不放在这里**
+        ——它是呈现层的取值回落（`session` 侧的 `is_probably_chinese`），放进决策映射会让一段
+        英文摘要改变 `TradeDecision`，而那正是 R-4 的教训。
+        """
+        if not self.allow_reasoning_digest:
+            return None
+        text = str(raw.get("evidenceDigest") or "").strip()[:_EVIDENCE_DIGEST_MAX_CHARS]
+        return text or None
 
     def _resolve_exit_intent(self, raw: dict,
                              action: str) -> tuple[str | None, str | None]:
@@ -474,7 +817,21 @@ class AiTradeDecider:
             attempt += 1
             await self._retry_backoff(attempt)                # 复用 decide 退避（可被 cancel 中断）
             verdict = await self._attempt_reflection(payload, decision, emit)
+        self._note_reflection_depth()
         return verdict
+
+    def _note_reflection_depth(self) -> None:
+        """把本轮复核的篇幅与阶段数回填进 `ReasoningMeta`（G-2 的可证伪判据）。
+
+        `_last_reasoning` 是 frozen dataclass，故用 `replace` 生成新实例；深度档未生效
+        （`_last_reasoning is None`）⇒ 整段空转，wire 上依旧整键缺席。
+        """
+        if self._last_reasoning is None:
+            return
+        text = self._last_reflection_analysis
+        self._last_reasoning = replace(self._last_reasoning,
+                                       reflection_chars=len(text),
+                                       reflection_stages=count_stages(text, "R"))
 
     async def _attempt_reflection(self, payload: dict, decision: TradeDecision,
                                   emit: TraceEmit | None) -> ReflectionVerdict:
@@ -482,7 +839,7 @@ class AiTradeDecider:
         try:
             raw = await asyncio.wait_for(
                 self._stream_reflection(payload, decision, emit),
-                timeout=self.settings.ai_trade_reflection_timeout_s)
+                timeout=self._reflection_timeout_s)
         except asyncio.TimeoutError:
             return _fail_closed("reflection_timeout")
         except asyncio.CancelledError:
@@ -498,18 +855,40 @@ class AiTradeDecider:
 
         复核推理经 `phase="reflection"` 合并后 `emit`（`emit is None` 时空转，回测/单测零副作用）；反思
         工具起始**不**发 tool_call_start（裁决经 reflection_verdict 呈现，非工具卡）。无有效工具调用 → None。
+
+        **复核协议的唯一注入点就在这里**（deep-reasoning-chain §3.2 / P0-5）：
+        `build_reflection_system_prompt` 全仓只有本处一个调用点，且每轮用当轮 payload 现造
+        `system`。manager / backtest **从未**引用过它——在那两处注入 R1–R7 是一条不报错、不判红、
+        轴 B 整条死掉的死路。`self._depth is None`（既有直接构造 / 全部离线用例）⇒ 传 `""` ⇒
+        反思系统 prompt **逐字节回退**，`test_ai_trade_exit_freeze.py` 那条 sha256 冻结断言原样成立。
         """
         # holding-horizon §2.9 c：持仓周期补充段随本轮 payload 现取（payload 就在手上，零额外管线）；
         # 契约未装配 ⇒ 键缺席 ⇒ `""` ⇒ 反思系统 prompt 逐字节回退（G-1 的 sha256 冻结门禁据此成立）。
+        reasoning_text = "" if self._depth is None else build_review_protocol(self._depth)
         system = build_reflection_system_prompt(
-            format_reflection_note(payload.get("tradingHorizon")))
+            format_reflection_note(payload.get("tradingHorizon")), reasoning_text)
         user_msg = LlmMessage("user", [TextBlock(build_reflection_prompt(payload, decision))])
         accs: dict[str, dict] = {}
         order: list[str] = []
+        reflection_parts: list[str] = []         # 补根因 C-3：复核推理服务端留存（只收 text_delta）
         pump = _TraceCoalescer(emit)             # emit=None → 全程空转
-        async for ev in self._llm.stream(system=system, messages=[user_msg],
-                                          tools=[self._reflection_tool]):
+        done = False
+        self._last_reflection_analysis = ""      # 每次尝试入口清零（镜像 `_last_analysis` 的 RC-1）
+        async for ev in self._reflection_llm.stream(system=system, messages=[user_msg],
+                                                    tools=[self._reflection_tool]):
+            if ev.kind == "message_done":
+                if not done:
+                    await pump.flush()
+                    done = True
+                continue                         # 与决策侧同款：收尾后只等流自然结束，不再消费
+            if done:
+                continue
             if ev.kind in ("text_delta", "thinking_delta"):
+                # [P2-3] 累积**只挂在 `text_delta` 上**：本方法把两种增量合喂同一个 phase（那是
+                # 呈现层的合并，与服务端留存是两件事）。照抄那一行的位置累积，扩展思考一旦开启，
+                # 模型的思考文本会混进 `_last_reflection_analysis`，令 R1–R7 计数虚高、篇幅失真。
+                if ev.kind == "text_delta":
+                    reflection_parts.append(ev.text or "")
                 await pump.feed("reflection", ev.text or "")
             elif ev.kind == "tool_use_start":
                 await pump.flush()               # 复核文本段结束，先冲刷（反思无 tool_call_start 占位）
@@ -521,9 +900,8 @@ class AiTradeDecider:
             elif ev.kind == "error":
                 await pump.flush()
                 raise RuntimeError(ev.message or ev.code or "LLM_ERROR")
-            elif ev.kind == "message_done":
-                await pump.flush()
-                break
+        # 与决策侧同款：流正常结束才落全文（超时/取消/error 提前退出 ⇒ 维持入口清零的空串）。
+        self._last_reflection_analysis = "".join(reflection_parts).strip()[:_ANALYSIS_MAX_CHARS]
         for tid in order:                        # 取首条有效 submit_trade_reflection
             if accs[tid]["name"] == REFLECTION_TOOL_NAME:
                 raw = "".join(accs[tid]["parts"]).strip() or "{}"
@@ -723,7 +1101,7 @@ class AiTradeDecider:
 
     async def _stream_summary(self, prev: str | None, journal: list[dict]) -> str:
         parts: list[str] = []
-        async for ev in self._llm.stream(
+        async for ev in self._summary_llm.stream(
                 system=build_summary_system_prompt(),
                 messages=[LlmMessage("user", [TextBlock(build_summary_prompt(prev, journal))])],
                 tools=[]):
@@ -733,7 +1111,9 @@ class AiTradeDecider:
                 raise RuntimeError(ev.message or ev.code or "LLM_ERROR")
             elif ev.kind == "message_done":
                 break
-        return "".join(parts).strip()
+        # §3.3.4：摘要种子是**每轮都会被重读**的那一段，故除了 1536 token 的模型侧预算之外
+        # 再加一道字符兜底——一次异常长的摘要会把 `_context` 一路撑到窗口上限。
+        return "".join(parts).strip()[:_SUMMARY_MAX_CHARS]
 
     def _trim_context(self) -> None:
         """两次摘要间硬上限兜底：裁到近 N 条且首条为 user 轮（避免孤儿 tool_result，参照 _trimmed_messages）。"""

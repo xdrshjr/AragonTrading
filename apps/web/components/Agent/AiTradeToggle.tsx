@@ -144,6 +144,7 @@ export default function AiTradeToggle() {
         takeProfitPct: opts.takeProfitPct,   // E4：单仓 OCO 止盈%
         positionStepPct: opts.positionStepPct,   // 仓位操作档位（透传，服务端默认回填/量化）
         wakeIntervalMinutes: opts.wakeIntervalMinutes,   // Agent 墙钟定时唤醒周期（透传，服务端默认回填/夹紧）
+        reasoningDepth: opts.reasoningDepth,     // 研判深度档（透传；留空=服务端默认 deep，仅实盘）
         baseRules: opts.baseRules,               // 【基础策略】铁律（透传；取消勾选即 enabled:false）
         profitGuard: opts.profitGuard,           // 利润保护层（透传；取消勾选即 enabled:false）
         tradingHorizon: opts.tradingHorizon,     // 交易周期模式（同上；缺省=服务端默认开启）
@@ -161,6 +162,8 @@ export default function AiTradeToggle() {
         contextRefreshRounds: res.contextRefreshRounds,
         positionStepPct: opts.positionStepPct,
         wakeIntervalMinutes: opts.wakeIntervalMinutes ?? undefined,
+        // [R-4] 同理取 opts：回执不回显研判深度档，取 res 会让这个选择每次重开都回落默认。
+        reasoningDepth: opts.reasoningDepth ?? undefined,
         // [R-4] 同理：res 不回显完整规则参数，取 opts 才能让所选铁律参数真正持久（回执只镜像装配态）。
         baseRules: opts.baseRules.maBandEntry ?? undefined,
         // 同上取 opts：诊断根因 ③ 的根治点——单仓 OCO 与利润保护偏好从此被记住并回填，
@@ -599,6 +602,7 @@ export default function AiTradeToggle() {
         defaultContextRounds={aiTradeConfig?.contextRefreshRounds ?? AI_TRADE_DEFAULT_CONTEXT_ROUNDS}
         defaultPositionStepPct={aiTradeConfig?.positionStepPct ?? AI_TRADE_DEFAULT_POSITION_STEP}
         defaultWakeIntervalMinutes={aiTradeConfig?.wakeIntervalMinutes ?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN}
+        defaultReasoningDepth={aiTradeConfig?.reasoningDepth}
         defaultProfitGuard={aiTradeConfig?.profitGuard ?? AI_TRADE_PROFIT_GUARD_DEFAULTS}
         defaultStopLossPct={aiTradeConfig?.stopLossPct ?? undefined}
         defaultTakeProfitPct={aiTradeConfig?.takeProfitPct ?? undefined}

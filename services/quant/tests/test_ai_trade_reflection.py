@@ -359,3 +359,70 @@ def test_note_fail_closed_flagged_distinct_from_model_abort():
     assert note["vetoed"] is True
     assert note["failClosed"] is True
     assert note["finalAction"] == "hold"
+
+
+# ============ 复核推理的服务端留存（ai-trade-deep-reasoning-chain §7.3 D-8 / 补根因 C-3）============
+async def test_reflection_analysis_is_retained_and_bounded():
+    """D-8：反思推理落 `last_reflection_analysis`、超 20000 被截断；**只收 text_delta**。
+
+    [P2-3] `_stream_reflection` 把 `text_delta` 与 `thinking_delta` 合喂同一个 phase（那是呈现层
+    的合并）。照抄那一行的位置累积，扩展思考一旦开启，思考文本会混进复核全文，令 R1–R7 计数
+    虚高、篇幅失真。
+    """
+    from app.ai_auto.reasoning_protocol import profile_by_name
+
+    script = [StreamEvent("text_delta", text="## R1 RESTATE\n" + "r" * 25000),
+              StreamEvent("thinking_delta", text="THINKING SHOULD NOT BE COUNTED"),
+              *_reflection_events({"verdict": "confirm", "reason": "ok"})]
+    d = AiTradeDecider(_ScriptedLLM([script]), "sys", context_refresh_rounds=10,
+                       settings=Settings(ai_trade_reflection_max_retries=0),
+                       reflection_enabled=True, depth_profile=profile_by_name("deep"))
+    verdict = await d.reflect({"round": 1, "signalBoard": []},
+                              TradeDecision("open_long", 0.25, 0.8, "r"))
+    assert verdict.verdict == "confirm"
+    assert len(d.last_reflection_analysis) == 20000
+    assert "THINKING SHOULD NOT BE COUNTED" not in d.last_reflection_analysis
+
+
+async def test_reflection_analysis_is_empty_when_the_stream_fails():
+    """反思超时 / 取消 ⇒ 维持入口清零的空串（不留半截文本冒充一次完整复核）。"""
+    from app.ai_auto.reasoning_protocol import profile_by_name
+
+    d = AiTradeDecider(_ScriptedLLM([[StreamEvent("error", code="E", message="boom")]]),
+                       "sys", context_refresh_rounds=10,
+                       settings=Settings(ai_trade_reflection_max_retries=0),
+                       reflection_enabled=True, depth_profile=profile_by_name("deep"))
+    verdict = await d.reflect({"round": 1, "signalBoard": []},
+                              TradeDecision("open_long", 0.25, 0.8, "r"))
+    assert verdict.degrade_reason == "reflection_llm_error"
+    assert d.last_reflection_analysis == ""
+
+
+async def test_reflection_depth_is_backfilled_into_the_reasoning_meta():
+    """G-2 的可证伪判据：复核篇幅与 R1–R7 计数回填进 `ReasoningMeta`。"""
+    from app.ai_auto.reasoning_protocol import profile_by_name
+
+    body = "\n".join(f"## R{i} X\nbody {i}" for i in range(1, 8))
+    script = [StreamEvent("text_delta", text=body),
+              *_reflection_events({"verdict": "confirm", "reason": "ok"})]
+
+    class _Both:
+        provider = "anthropic"
+
+        def __init__(self):
+            self._inner = _ScriptedLLM([script])
+
+        async def stream(self, *, system, messages, tools):
+            async for ev in self._inner.stream(system=system, messages=messages, tools=tools):
+                yield ev
+
+    d = AiTradeDecider(_Both(), "sys", context_refresh_rounds=10,
+                       settings=Settings(ai_trade_decision_max_retries=0,
+                                         ai_trade_reflection_max_retries=0,
+                                         ai_trade_reasoning_reask_max=0),
+                       reflection_enabled=True, depth_profile=profile_by_name("deep"))
+    await d.decide({"round": 1, "signalBoard": []})
+    await d.reflect({"round": 1, "signalBoard": []},
+                    TradeDecision("open_long", 0.25, 0.8, "r"))
+    assert d.last_reasoning.reflection_stages == 7
+    assert d.last_reasoning.reflection_chars == len(body)

@@ -20,8 +20,12 @@ def make_llm_client_from_config(cfg: "LlmProviderConfig") -> LLMClient:
             base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
             anthropic_version=cfg.anthropic_version, user_agent=cfg.user_agent,
             max_tokens=cfg.max_tokens, temperature=cfg.temperature, top_p=cfg.top_p,
-            timeout=cfg.timeout, proxy=cfg.proxy, retry=cfg.retry)
+            timeout=cfg.timeout, proxy=cfg.proxy, retry=cfg.retry,
+            # 扩展思考预算（deep-reasoning-chain §3.3.2）：默认 0 ⇒ 请求体逐字节不变。
+            thinking_budget_tokens=getattr(cfg, "thinking_budget_tokens", 0))
     if std == "openai":
+        # OpenAI 标准**显式不接** thinking 预算：该标准无此概念，显式不透传比静默忽略诚实
+        # （用例 B-4 冻结「构造不含该参数」这一点）。
         return OpenAIClient(
             base_url=cfg.base_url, api_key=cfg.api_key, model=cfg.model,
             max_tokens=cfg.max_tokens, temperature=cfg.temperature, top_p=cfg.top_p,

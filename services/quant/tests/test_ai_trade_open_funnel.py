@@ -202,3 +202,18 @@ def test_every_hint_branch_is_plain_text_not_markdown():
         hint = strictness_hint(rows, StrictnessFacts(rounds_completed=20, opens=0,
                                                      funnel=funnel_wire(one)))
         assert hint is not None and "**" not in hint, key
+
+
+# ============ 深度思维链细分出的两个降级码（ai-trade-deep-reasoning-chain §3.3.3）============
+def test_split_no_tool_call_codes_stay_inside_the_llm_failure_bucket():
+    """`no_tool_call` 被细分成两个更诚实的码之后，**同一个物理事件不得掉出 `llmDegraded`**。
+
+    这是本轮最容易漏的一处：截断与内容拦截在合入前都表现为 `no_tool_call`（在集内）；只改码不
+    登记，会让漏斗的「模型调用失败」计数**静默少报**，而界面上看不出任何异常。
+    """
+    from app.ai_auto.open_funnel import classify_block, is_llm_failure
+
+    for code in ("reasoning_truncated", "content_filtered"):
+        assert is_llm_failure(code) is True, code
+        # 归类与合入前的 `no_tool_call` 保持一致（它本就不在 `_DEGRADE_PREFIXES` 里 ⇒ "other"）。
+        assert classify_block(code) == classify_block("no_tool_call") == "other"

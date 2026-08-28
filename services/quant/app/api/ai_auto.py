@@ -373,6 +373,11 @@ async def build_start_request(session: AsyncSession, settings: Settings,
         budget_cap_frac=cap_frac, default_budget_frac=settings.ai_trade_default_capital_frac,
         position_step_pct=_resolve_position_step(body.positionStepPct, settings),
         wake_interval_s=_resolve_wake_interval_s(body.wakeIntervalMinutes, settings),
+        # 研判深度档（§4.4 / P1-1）：**必须落在请求对象上**，不能在装配时再读一次 settings——
+        # 否则请求里的 `reasoningDepth` 会通过 422 校验、进 `start_wire`、然后在装配时被 settings
+        # 默认值覆盖；而「暂停 → 冷续跑」走的正是「用 `start_wire` 重跑本函数」，深度档会静默
+        # 降回默认档且**不报任何错**（用例 S-8）。
+        reasoning_depth=body.reasoningDepth,
         base_rule=_resolve_base_rules(body.baseRules, settings),
         profit_rule=_resolve_profit_guard(body.profitGuard, settings),
         horizon_rule=_resolve_horizon(body.tradingHorizon, settings, bar=body.bar),

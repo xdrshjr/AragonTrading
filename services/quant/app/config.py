@@ -226,6 +226,37 @@ class Settings(BaseSettings):
     ai_trade_multi_timeframe_context: bool = True  # 多周期中线背景总开关（只读；缺数时显式降级）
     ai_trade_digest_trend_window: int = Field(default=20, ge=2)  # 价格走势/区间位置回看根数
     ai_trade_digest_vol_window: int = Field(default=20, ge=2)    # 成交量均值/zscore 回看根数
+    # ---- AI 自动交易 · 深度思维链与对抗式反思（ai-trade-deep-reasoning-chain §5.3）----
+    # 档位是**唯一**总闸：off ⇒ 三份 prompt、预算、追问、截断码、wire 加法键、**以及超时 /
+    # 重试次数上限 / 轮级墙钟闸**全部与本特性合入前逐字节相同（sha256 门禁 G-7、行为门禁 G-7b）。
+    # env 名 AI_TRADE_REASONING_* 已在 desktop config.js 的 prod 透传白名单内（AI_TRADE_ 前缀），
+    # AGENT_THINKING_* 同理（AGENT_ 前缀）——两者都无需改 desktop 白名单，此处显式记录以免下次误改。
+    ai_trade_reasoning_depth: Literal["off", "standard", "deep", "exhaustive"] = "deep"
+    # 回测独立档，默认 standard：deep 档会让一次 500 轮回测的 token 成本涨到 4~5 倍（§3.6）——
+    # 把它做成与实盘同档，等于把「用户点一次回测」变成一次意外的高额账单。
+    ai_trade_reasoning_depth_backtest: Literal["off", "standard", "deep", "exhaustive"] = "standard"
+    # 0 ⇒ 用档位表的值；>0 ⇒ 覆盖。决策与反思各一份，绝不共用（共用正是根因 C-1 的形状）。
+    ai_trade_reasoning_max_tokens: int = Field(default=0, ge=0, le=32768)
+    ai_trade_reflection_max_tokens: int = Field(default=0, ge=0, le=32768)
+    ai_trade_summary_max_tokens: int = Field(default=1536, ge=256, le=8192)
+    # 留给收尾工具调用的输出 token；协议正文按它现算「预算纪律」那一段，绝不写死算例。
+    ai_trade_reasoning_reserve_tokens: int = Field(default=768, ge=256, le=4096)
+    # 浅研判追问阈（英文字符）；-1 ⇒ 用档位表的值，0 ⇒ 关闭追问。
+    ai_trade_reasoning_min_chars: int = Field(default=-1, ge=-1, le=40000)
+    # 追问总闸：0 = 关，1 = 开。上界是 **1** 而不是 spec §5.3 写的 2：§3.4.2 与架构图都写死
+    # 「至多 1 次深度追问」，`_maybe_reask` 也只跑一次。上界留 2 会让一个填 2 的运维开关
+    # 通过校验、然后静默地只生效一半——那正是本仓库反复栗过的「被静默忽略的旋钮」。
+    ai_trade_reasoning_reask_max: int = Field(default=1, ge=0, le=1)
+    # 研判耗时压力提示阈（占唤醒周期的比例）；0 ⇒ 关闭提示。判据只在 wake_interval_s > 0 时
+    # 成立——0 = 用户刻意关掉了定时唤醒，对不按周期交易的人提周期建议是纯噪音（§3.4.3 / P1-5）。
+    ai_trade_reasoning_pressure_ratio: float = Field(default=0.6, ge=0, le=1)
+    # 单轮墙钟总闸（秒）：一轮内「全部尝试 + 追问」共享；0 ⇒ 用档位表的 round_deadline_s（§3.3.5）。
+    ai_trade_reasoning_round_deadline_s: float = Field(default=0.0, ge=0, le=3600)
+    # ---- [P0-4] **不再**调整 ai_trade_decision_timeout_s / ai_trade_reflection_timeout_s 的
+    # 全局默认（两者仍是上方的 60.0 / 45.0）。改全局默认会让 AI_TRADE_REASONING_DEPTH=off 之后
+    # 一次挂死的 LLM 调用仍要 210 秒而非 60 秒才回落 hold——恰恰在「出事了要止血」的回退路径上
+    # 把安全回落时延放大 3.5 倍。两个超时改为随 DepthProfile 派生（reasoning_protocol.py），
+    # 上方两行是 `depth_profile is None` 时的回退真源。
     # ---- Agent 墙钟定时唤醒（ai-auto-trading-wake-interval §2.5）----
     # 在既有「确认 K 线 → 决策」触发之外叠加第三个唤醒源：一个独立于 K 线周期的墙钟定时唤醒，默认每 2
     # 分钟让 Agent 用「当前实时价 + 最近信号板 + 持仓」重新研判（两根 K 线之间也能及时止盈损/调仓）。
@@ -892,6 +923,10 @@ class Settings(BaseSettings):
     agent_max_tokens: int = 2048
     agent_temperature: float = 1.0
     agent_top_p: float = 0.95
+    # Anthropic 扩展思考（ai-trade-deep-reasoning-chain §3.3.2）：0 = **不发该字段** ⇒ 请求体
+    # 与本特性合入前逐字节相同（用例 G-4）；>0 时强制 temperature=1 并移除 top_p（Anthropic 硬
+    # 要求）。仅 api_standard == "anthropic" 生效；openai 标准显式不接。这是第二个独立回退开关。
+    agent_thinking_budget_tokens: int = Field(default=0, ge=0, le=32768)
     # 失控护栏 / 上下文裁剪（RS-13 边界校验：轮数 ≥1、回喂条数 ≥2，杜绝 .env 误填 0/负值）。
     agent_max_tool_rounds: int = Field(default=12, ge=1)     # 失控护栏（spec §2.3）
     agent_max_context_messages: int = Field(default=40, ge=2)  # 回喂模型的近 N 条裁剪（P2-2）
@@ -947,6 +982,40 @@ class Settings(BaseSettings):
                 f"DISCOVERY_HEALTH_WINDOW_BARS({self.discovery_health_window_bars})，"
                 "否则体检的 fresh 段恒为空、全部资产永久「暂不评级」")
         return self
+
+    @model_validator(mode="after")
+    def _check_reasoning_budget(self) -> "Settings":
+        """预算必须容得下「思考 + 收尾工具调用」，否则每一轮都必然截断而**不报任何错**。
+
+        预算不足的症状是「每轮都降级观望」，而用户从界面上完全看不出这是配置问题——这类
+        不报错的空转只能在启动时挡下来（与 `_check_health_window` 同款理由）。
+
+        只校验**当前生效的那一档**，不遍历四档：一个用户永远不会用到的档位配得不合理，不该
+        让整个后端起不来（与「拼错的运维开关不该让整个会话起不来」是同一条取舍）。
+        """
+        from .ai_auto.reasoning_protocol import profile_by_name   # 延迟导入打破启动期循环
+
+        profile = profile_by_name(self.ai_trade_reasoning_depth)
+        if not profile.enabled:
+            return self                      # off 档不消费任何预算，校验无意义
+        budget = self.ai_trade_reasoning_max_tokens or profile.decision_max_tokens
+        floor = self.ai_trade_reasoning_reserve_tokens + self.agent_thinking_budget_tokens
+        if budget > floor:
+            return self
+        hint = ""
+        if profile.name == "exhaustive":
+            # [P2-4] 本地校验器看不见模型侧的 max_tokens 上限；不写清这句，用户会在本地设置里
+            # 反复找一个不存在的问题。
+            hint = ("；另注意 exhaustive 档的 16384 可能超出部分模型自身的 max_tokens 上限，"
+                    "若 provider 回 400 且提示 max_tokens 超限，请调低 "
+                    "AI_TRADE_REASONING_MAX_TOKENS 或换档——那是模型侧上限，不是本地配置错误")
+        raise ValueError(
+            f"AI 深度研判预算不足：决策输出预算 {budget} 必须大于「收尾预留 "
+            f"{self.ai_trade_reasoning_reserve_tokens} + 扩展思考 "
+            f"{self.agent_thinking_budget_tokens}」= {floor}（当前档位 {profile.name}）。"
+            "否则每一轮都会在调用决策工具之前耗尽预算并降级观望，且界面上看不出原因。"
+            "请调高 AI_TRADE_REASONING_MAX_TOKENS，或调低 AI_TRADE_REASONING_RESERVE_TOKENS / "
+            f"AGENT_THINKING_BUDGET_TOKENS{hint}")
 
     @model_validator(mode="after")
     def _check_tradability_thresholds(self) -> "Settings":

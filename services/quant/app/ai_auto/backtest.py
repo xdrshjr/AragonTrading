@@ -23,7 +23,6 @@ import pandas as pd
 from fastapi import HTTPException
 from fastapi.concurrency import run_in_threadpool
 
-from ..agent.llm.factory import make_llm_client_from_config
 from ..config import Settings
 from ..db import repositories as repo
 from ..db.session import get_sessionmaker
@@ -90,7 +89,11 @@ from .profit_guard import (
 )
 from .profit_guard_bar import BarFacts, evaluate_bar
 from .profit_guard_text import format_profit_guard_charter
+from ..agent.llm.factory import make_llm_client_from_config
+from .llm_budget import build_ai_trade_llm_clients
 from .prompts import build_ai_trade_system_prompt
+from .prompts_en import SystemPromptOptions, SystemPromptTexts
+from .reasoning_protocol import build_deliberation_protocol, resolve_depth_profile
 from .reflection import apply_reflection, build_reflection_note
 from .signals import (
     Consensus,
@@ -319,24 +322,39 @@ class AiBacktestRunner:
         # 开盘无条件成交」的一根队列、`_Order` 连价格字段都没有。放任 Agent 在回测里挂限价而每单必成，
         # 会**系统性高估**限价策略——这比「回测不支持限价」严重得多。故回测里 Agent 根本看不到
         # orderType/limitPrice，只能市价：零分歧、诚实。此处显式写出（而非依赖默认值）以表明是决策。
+        # 研判深度档：**取回测档**（默认 `standard`，§3.6 的成本护栏）——一次 500 轮的 AI 回测
+        # 在 deep 档下 token 成本约为今日的 4~5 倍且墙钟成倍拉长，把它做成与实盘同档是把「用户
+        # 点一次回测」变成一次意外的高额账单。与实盘走**同一条**注入路径（S-9 断言取到的是回测档）。
+        depth = resolve_depth_profile(self.settings, backtest=True)
+        clients = build_ai_trade_llm_clients(
+            spec.provider, self.settings, profile=depth,
+            # 同 manager：工厂从**本模块**传入，保住 `app.ai_auto.backtest.` 那条测试注入缝。
+            make_client=make_llm_client_from_config)
         self.decider = AiTradeDecider(
-            make_llm_client_from_config(spec.provider),
-            build_ai_trade_system_prompt(self.inst_id, self.bar, self.initial_capital, self.leverage,
-                                         position_step_pct=self.position_step_pct,
-                                         allow_limit=False,
-                                         # 铁律宪章同源注入；未装配 → "" ⇒ 渲染逐字节不变
-                                         base_rules_text=format_charter(self.base_rule),
-                                         # 利润保护宪章同源注入（F3）；未装配 → "" ⇒ 同上零回归
-                                         profit_guard_text=format_profit_guard_charter(
-                                             self.profit_rule,
-                                             horizon_armed=self.horizon_rule is not None),
-                                         # 交易周期宪章同源注入；未装配 → "" ⇒ 同上零回归。解除阈按
-                                         # 本次回测真实的 OCO 止损与杠杆现算，绝不写死算例。
-                                         horizon_text=format_horizon_charter(
-                                             self.horizon_rule,
-                                             stop_loss_pct=spec.stop_loss_pct,
-                                             take_profit_pct=spec.take_profit_pct,
-                                             leverage=self.leverage)),
+            clients.decision,
+            build_ai_trade_system_prompt(
+                self.inst_id, self.bar, self.initial_capital, self.leverage,
+                options=SystemPromptOptions(position_step_pct=self.position_step_pct,
+                                            allow_limit=False),
+                texts=SystemPromptTexts(
+                    # 审议协议 + 输出预算纪律；off 档 → "" ⇒ 中文脊柱逐字节回退
+                    reasoning_text=build_deliberation_protocol(
+                        depth,
+                        reserve_tokens=self.settings
+                        .ai_trade_reasoning_reserve_tokens),
+                    # 铁律宪章同源注入；未装配 → "" ⇒ 渲染逐字节不变
+                    base_rules_text=format_charter(self.base_rule),
+                    # 利润保护宪章同源注入（F3）；未装配 → "" ⇒ 同上零回归
+                    profit_guard_text=format_profit_guard_charter(
+                        self.profit_rule,
+                        horizon_armed=self.horizon_rule is not None),
+                    # 交易周期宪章同源注入；未装配 → "" ⇒ 同上零回归。解除阈按
+                    # 本次回测真实的 OCO 止损与杠杆现算，绝不写死算例。
+                    horizon_text=format_horizon_charter(
+                        self.horizon_rule,
+                        stop_loss_pct=spec.stop_loss_pct,
+                        take_profit_pct=spec.take_profit_pct,
+                        leverage=self.leverage))),
             context_refresh_rounds=self.context_refresh_rounds, settings=self.settings,
             position_step_pct=self.position_step_pct, reflection_enabled=self.reflection_enabled,
             allow_limit=False,
@@ -345,7 +363,12 @@ class AiBacktestRunner:
             allow_hold_exit=(self.profit_rule is not None and self.profit_rule.commit_enabled),
             # exit-priority §7.1 #12：回测侧同样露出 `exitConviction` / `exitEvidence`（轴 B 是
             # 决策语义、与「回测每单必成」的高估问题无关），由回测侧独立总闸派生。
-            allow_exit_priority=self._exit_rule is not None)
+            allow_exit_priority=self._exit_rule is not None,
+            # 回测车道与实盘共用同一批装配（§3.6）：三份预算 + 同一个 `DepthProfile`。两处是各自
+            # 手抄的装配点，本仓库刚在 `ai-trade-backstop-repair` 上栽过「双通道共用纯核心时只有
+            # 自动侧被实现」——用例 S-9 与 S-7 同形，且额外断言取到的是**回测档**。
+            reflection_llm=clients.reflection, summary_llm=clients.summary,
+            depth_profile=depth, allow_reasoning_digest=depth.enabled)
         self._oco_risk = RiskParams(
             stop_loss_pct=spec.stop_loss_pct or None, take_profit_pct=spec.take_profit_pct or None,
             max_hold_bars=self.settings.ai_trade_default_max_hold_bars or None)
@@ -1040,6 +1063,13 @@ class AiBacktestRunner:
         # 交易周期段（§2.10）：同款「整键缺席」范式；须在 profitGuard 之后——它顺带给保护快照打
         # `horizonArmed` 标记（§2.9 a/b 的两处抢跑文案据它切换，两侧同源）。
         self._horizon.inject(payload, self._horizon.refresh(self._horizon_facts(i, ts, ref_px)))
+        # 研判深度档的**加法键**（deep-reasoning-chain §3.1.6）：与实盘 `session._build_decision_payload`
+        # 逐字对称，单一真源同样是 `decider.depth_name`。漏写这一行的后果不报错也不判红：
+        # 系统 prompt 已经是英文脊柱（回测默认 standard 档即生效），而收尾任务指令却停在中文原句，
+        # 反思侧的英文收尾指令也永远不会追加——「说的」与「给的」不是同一份，正是本轮要根除的形状。
+        # 未装配 / `off` 档 ⇒ 空串 ⇒ **整键缺席** ⇒ `build_decision_prompt` 逐字节回退。
+        if self.decider.depth_name:
+            payload["reasoningDepth"] = self.decider.depth_name
         return payload
 
     def _build_multi_timeframe_context(

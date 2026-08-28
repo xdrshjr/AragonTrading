@@ -43,6 +43,11 @@ class LlmProviderConfig:
     anthropic_version: str
     proxy: str | None
     retry: RetryConfig
+    # Anthropic 扩展思考预算（ai-trade-deep-reasoning-chain §3.3.2）：**末位带默认 0** ⇒ 既有
+    # 全部位置/关键字构造零改动，且 0 = 不往请求体里写 `thinking` 字段 ⇒ 请求体逐字节不变
+    # （用例 G-4 冻结）。仅 `api_standard == "anthropic"` 消费；openai 标准无此概念，
+    # factory 显式不透传（显式不接比静默忽略诚实）。
+    thinking_budget_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -94,6 +99,7 @@ def provider_config_from_settings(settings: Settings) -> LlmProviderConfig:
         anthropic_version=settings.agent_anthropic_version,
         proxy=settings.agent_proxy_url,
         retry=_retry_from_settings(settings),
+        thinking_budget_tokens=settings.agent_thinking_budget_tokens,
     )
 
 
@@ -115,6 +121,7 @@ def config_from_row(row: AgentProvider, settings: Settings) -> LlmProviderConfig
         anthropic_version=settings.agent_anthropic_version,
         proxy=settings.agent_proxy_url,
         retry=_retry_from_settings(settings),
+        thinking_budget_tokens=settings.agent_thinking_budget_tokens,
     )
 
 

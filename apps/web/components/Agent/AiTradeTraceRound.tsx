@@ -33,6 +33,7 @@ import {
   describeWakeReason,
 } from "@/lib/aiTrade";
 import { describeHorizonGate, formatHoldDuration } from "@/lib/aiTradeHorizon";
+import AiTradeReasoningBlock, { ReasoningStageView } from "./AiTradeReasoningBlock";
 import { ExitPriorityRow, ProposedVetoRow } from "./AiTradeExitPriorityRows";
 import type {
   AiTradeRoundTrace,
@@ -40,7 +41,6 @@ import type {
   TacticalContext,
 } from "@/lib/aiTradeTypes";
 import { fmtNum, fmtPrice, fmtTime } from "@/lib/format";
-import { renderMarkdown } from "@/lib/markdown";
 
 const TONE_VAR: Record<AiTraceTone, string> = {
   long: "var(--long)",
@@ -106,37 +106,6 @@ function RetryBreadcrumb({ trace }: { trace: AiTradeRoundTrace }) {
         <span className="inline-block h-1 w-1 animate-pulse rounded-full bg-[var(--accent)]" />
       )}
     </p>
-  );
-}
-
-/** 思考/分析：深度思考折叠置于其上；分析流式走 pre-wrap + 光标，轮结束走安全 markdown。 */
-function AnalysisBlock({ trace }: { trace: AiTradeRoundTrace }) {
-  const streaming = trace.state === "deciding";
-  const hasAnalysis = trace.analysis.length > 0;
-  if (!hasAnalysis && !streaming && !trace.thinking) return null;
-  return (
-    <div className="flex flex-col gap-1.5">
-      {trace.thinking && (
-        <details className="text-[11px] text-[var(--muted)]">
-          <summary className="cursor-pointer select-none text-[var(--text)]">深度思考</summary>
-          <p className="mt-1 whitespace-pre-wrap leading-relaxed">{trace.thinking}</p>
-        </details>
-      )}
-      {(hasAnalysis || streaming) && (
-        <div className="rounded-[10px] bg-[var(--surface-2)] px-2.5 py-2 text-[12px] leading-relaxed text-[var(--text)]">
-          {!hasAnalysis ? (
-            <span className="text-[var(--muted)]">正在研判…</span>
-          ) : streaming ? (
-            <span className="whitespace-pre-wrap">
-              {trace.analysis}
-              <span className="ml-0.5 inline-block h-3.5 w-[2px] translate-y-0.5 animate-pulse bg-current align-middle" />
-            </span>
-          ) : (
-            <div className="flex flex-col">{renderMarkdown(trace.analysis)}</div>
-          )}
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -518,13 +487,10 @@ function ReflectionBlock({ trace }: { trace: AiTradeRoundTrace }) {
         <div className="text-[11px] leading-relaxed text-[var(--muted)]">
           {!text ? (
             <span>正在复核…</span>
-          ) : streaming ? (
-            <span className="whitespace-pre-wrap">
-              {text}
-              <span className="ml-0.5 inline-block h-3 w-[2px] translate-y-0.5 animate-pulse bg-current align-middle" />
-            </span>
           ) : (
-            <div className="flex flex-col">{renderMarkdown(text)}</div>
+            // 复核段与研判段**视觉同源、解析同源**（`kind="review"` ⇒ 7 格导轨、R6/R7 默认展开）；
+            // 未按协议输出阶段标记时优雅回退到整段渲染（与合入前逐字一致）。
+            <ReasoningStageView text={text} kind="review" streaming={streaming} />
           )}
         </div>
       )}
@@ -827,7 +793,7 @@ export default function AiTradeTraceRound({ trace }: { trace: AiTradeRoundTrace 
     <div className="flex flex-col gap-2 rounded-[12px] border border-[var(--border)] bg-[var(--surface)] px-3 py-2.5">
       <RoundHeader trace={trace} />
       <RetryBreadcrumb trace={trace} />
-      <AnalysisBlock trace={trace} />
+      <AiTradeReasoningBlock trace={trace} />
       <DecisionToolCard trace={trace} />
       <BaseRuleBlock trace={trace} />
       <HorizonBlock trace={trace} />
