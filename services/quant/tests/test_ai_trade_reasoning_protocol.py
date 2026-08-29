@@ -205,3 +205,70 @@ def test_every_stage_carries_a_non_trivial_mandate():
     for stage in DECISION_STAGES + REVIEW_STAGES:
         assert len(stage.mandate) >= 120, stage.id
         assert stage.code and stage.title
+
+
+# ============ 方向对称化（ai-trade-directional-symmetry 轴 C） ============
+#
+# 用户诉求的原话是「研判交易决策和行动的时候，要考虑方向性，不能无脑开多」。它在协议正文里
+# 此前**没有任何落点**：S10 只要求「三个候选，其中一个必须是 hold」——`open_long 25% /
+# open_long 50% / hold` 完全合规；S11 的 "the reverse action" 在空仓状态下可以被合理地读成
+# `hold` 而不是「反方向开仓」。
+
+def test_symmetry_off_is_byte_identical():
+    """总闸关（默认）⇒ 三处 mandate 与 R7 **逐字节回退**到本特性合入前。"""
+    assert build_deliberation_protocol(_DEEP) == build_deliberation_protocol(_DEEP,
+                                                                             symmetry=False)
+    assert build_review_protocol(_DEEP) == build_review_protocol(_DEEP, symmetry=False)
+    plain = build_deliberation_protocol(_DEEP)
+    assert "at least one short candidate" not in plain
+    assert "not holding" not in plain
+
+
+def test_s10_requires_both_directions_on_the_table():
+    """S10：候选集必须**同时**含做多与做空——只列一个方向等同于没有完成 S10。"""
+    text = build_deliberation_protocol(_DEEP, symmetry=True)
+    s10 = text[text.index("## S10 "):text.index("## S11 ")]
+    assert "at least one long candidate" in s10
+    assert "at least one short candidate" in s10
+    assert "only one direction" in s10
+    # 既有正文一个字都不改（只追加）。
+    assert "Put at least three candidate actions on the table (one of them must be `hold`)." in s10
+
+
+def test_s11_reverse_action_is_not_holding():
+    """S11：空仓时的 "reverse action" 必须被明确成「反方向开仓」，而不是观望。"""
+    text = build_deliberation_protocol(_DEEP, symmetry=True)
+    s11 = text[text.index("## S11 "):text.index("## S12 ")]
+    assert "opening in the opposite" in s11 and "not holding" in s11
+
+
+def test_s7_requires_the_opposite_case():
+    text = build_deliberation_protocol(_DEEP, symmetry=True)
+    s7 = text[text.index("## S7 "):text.index("## S8 ")]
+    assert "strongest case for the **opposite** direction" in s7
+
+
+def test_review_r7_applies_the_same_standard_to_a_short():
+    """R7：对做空提议适用与做多**完全相同**的证据标准；安全语义一个字节都不改。"""
+    text = build_review_protocol(_DEEP, symmetry=True)
+    r7 = text[text.index("## R7 "):]
+    assert "same standard of evidence to a short proposal" in r7
+    assert "never weaker merely because it is a short" in r7
+    # 三条安全锚点仍在（只能收紧 / abort 需指名缺陷 / 机会成本对称）。
+    assert "You may only tighten." in r7
+    assert "name one substantive defect" in r7
+
+
+def test_off_depth_still_returns_empty_even_with_symmetry():
+    """`off` 档是运维回退开关：它必须回退**全部**行为，方向对称条款也不例外。"""
+    assert build_deliberation_protocol(_OFF, symmetry=True) == ""
+    assert build_review_protocol(_OFF, symmetry=True) == ""
+
+
+def test_symmetry_never_changes_the_stage_count_or_order():
+    """追加 mandate 不得改变阶段数、编号或顺序（S9 要求模型逐条复述，编号是稳定契约）。"""
+    text = build_deliberation_protocol(_DEEP, symmetry=True)
+    positions = [text.index(f"## S{i} ") for i in range(1, 13)]
+    assert positions == sorted(positions)
+    assert count_stages(text, "S") == 12
+    assert "## S13" not in text

@@ -98,10 +98,39 @@ class RetrievalResult:
     disputed: list[tuple[str, str]] = field(default_factory=list)
     suppressed: list[str] = field(default_factory=list)
     activation: dict[str, float] = field(default_factory=dict)
+    # 轴 E-2：`side` 轴方向退化时**有样本的那一侧**（`long` / `short`）；未退化 / 未开启 ⇒ None。
+    side_degeneracy: str | None = None
 
     def ids(self) -> tuple[str, ...]:
         """L0∪L1 的 key 元组——档位判定（§4.8）拿它与上轮比对，判断语境是否真的移动了。"""
         return tuple([item.node.key for item in self.l0] + [item.node.key for item in self.l1])
+
+
+def side_degeneracy(graph: Graph) -> str | None:
+    """经验图谱的 `side` 轴是否**方向退化**；退化 ⇒ 返回**有样本的那一侧**，否则 `None`。
+
+    判据：`side` 轴上恰有一侧的语境节点 `support > 0`，另一侧缺席或为 0
+    （directional-symmetry 轴 E-2）。
+
+    为什么这件事必须被特判：不做空 ⇒ 无做空样本 ⇒ `side:short` 语境节点在图里根本不存在 ⇒
+    检索在结构上**只可能**召回做多教训 ⇒ 模型读到的经验永远说「做多是有效的」。而「做空侧没有
+    教训」与「做空侧的教训是负面的」在模型看来是不可区分的两件事——这是一个不会自己走出来的
+    吸收态。本函数把它变成一个可判定、可披露的事实。
+    """
+    support = {}
+    for side in ("long", "short"):
+        node = graph.nodes.get(tax.canonical_key(tax.AXIS_SIDE, side))
+        support[side] = int(getattr(node, "support", 0) or 0) if node is not None else 0
+    if support["long"] > 0 and support["short"] <= 0:
+        return "long"
+    if support["short"] > 0 and support["long"] <= 0:
+        return "short"
+    return None
+
+
+def _axis_of(context_key: str) -> str:
+    """语境 key（`axis:value`）→ 轴 id；不含冒号的 key 原样返回（不猜、不抛）。"""
+    return context_key.split(":", 1)[0]
 
 
 def activate(graph: Graph, seed: ContextSeed, cfg: RetrievalConfig) -> dict[str, float]:
@@ -125,7 +154,8 @@ def activate(graph: Graph, seed: ContextSeed, cfg: RetrievalConfig) -> dict[str,
 
 
 def _score(node: GraphNode, activation: dict[str, float], graph: Graph,
-           seed: ContextSeed, cfg: RetrievalConfig) -> ScoredLesson:
+           seed: ContextSeed, cfg: RetrievalConfig,
+           drop_axes: frozenset[str] = frozenset()) -> ScoredLesson:
     """步骤 3 · 打分 `match · evidence · recency · scope · (pinned ? 1.5 : 1)`。
 
     ★ **E-2（F-5 下半）· `match` 的语义订正为「这条经验自身的条件被当前语境满足的比例」**，
@@ -137,8 +167,13 @@ def _score(node: GraphNode, activation: dict[str, float], graph: Graph,
     **分母用「边权之和」而不是 `len(node.signature)`**：签名与边可能因物化撕裂而不同步
     （`v1:E-14` 刻意保留了撕裂可见这一形态），用边算才是用「图上真的有什么」算；且
     `_attach_seeded_lessons` 给 manual / imported / narrative 补的边权同样是 1.0，两者一致。
+
+    `drop_axes`（directional-symmetry 轴 E-2）：该轴的边**整轴退出评分**——既不进分子也不进
+    分母。方向退化时把 `side` 留在分母里，会让「本轮是做空」这个语境对每一条（清一色做多的）
+    经验都判为不匹配，于是覆盖率被一个结构性缺样本的轴系统性压低。默认空集 ⇒ 逐字节回退。
     """
-    edges = graph.applies_in.get(node.key, ())
+    edges = [(context_key, weight) for context_key, weight in graph.applies_in.get(node.key, ())
+             if _axis_of(context_key) not in drop_axes]
     denominator = sum(float(weight) for _context, weight in edges) or 1.0
     match = sum(activation.get(context_key, 0.0) * float(weight)
                 for context_key, weight in edges) / denominator
@@ -194,15 +229,25 @@ def _scope_factor(node: GraphNode, seed: ContextSeed) -> float:
     return 1.0 if (seed_symbol and lesson_symbol == seed_symbol) else 0.0
 
 
-def retrieve(graph: Graph, seed: ContextSeed, cfg: RetrievalConfig) -> RetrievalResult:
-    """完整检索链；空图 / 全零候选 ⇒ 空结果（调用方据此整段不渲染，绝不产出空壳）。"""
+def retrieve(graph: Graph, seed: ContextSeed, cfg: RetrievalConfig,
+             *, direction_debias: bool = False) -> RetrievalResult:
+    """完整检索链；空图 / 全零候选 ⇒ 空结果（调用方据此整段不渲染，绝不产出空壳）。
+
+    `direction_debias`（directional-symmetry 轴 E-2，keyword-only）：`True` 且图上的 `side` 轴
+    方向退化时，该轴**整轴退出评分**（`_score` 的 `drop_axes`）。**只加不减**：退化判据不成立
+    时 `drop_axes` 为空集 ⇒ 打分逐字节回退。退化事实本身由 `RetrievalResult.side_degeneracy`
+    带出去，在注入抬头如实声明——**静默地改掉打分而不告诉读者**，是本轮要根除的那种不诚实。
+    """
     result = RetrievalResult()
     if graph is None or graph.is_empty:
         return result
+    degenerate = side_degeneracy(graph) if direction_debias else None
+    result.side_degeneracy = degenerate
+    drop_axes = frozenset({tax.AXIS_SIDE}) if degenerate else frozenset()
     activation = activate(graph, seed, cfg)
     result.activation = activation
     candidates = _collect(graph, activation, cfg)
-    scored = [_score(node, activation, graph, seed, cfg) for node in candidates]
+    scored = [_score(node, activation, graph, seed, cfg, drop_axes) for node in candidates]
     scored = [item for item in scored if item.score > 0]          # 评审 P2-5：零分先剔除
     if not scored:
         return result

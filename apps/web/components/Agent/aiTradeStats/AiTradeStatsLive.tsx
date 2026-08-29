@@ -6,6 +6,7 @@ import DisciplineCard from "./DisciplineCard";
 import ExitSourceCard from "./ExitSourceCard";
 import ExperienceCard from "./ExperienceCard";
 import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
+import DirectionBalanceCard from "./DirectionBalanceCard";
 import OpenFunnelCard from "./OpenFunnelCard";
 import TradabilityCard from "./TradabilityCard";
 import TurnoverBackstopCard, { type RepairPendingState } from "./TurnoverBackstopCard";
@@ -216,6 +217,7 @@ export default function AiTradeStatsLive() {
           }
           memberCount={Object.keys(group.members).length}
           summaryHealth={Object.values(group.members)[0]?.session?.summaryHealth}
+          direction={group.direction}
         />
         {/* 可交易性预检 + 开仓漏斗（tradability-and-open-funnel 轴 A / 轴 C）：紧跟纪律卡——
             「AI 为什么不开单」的完整答案是这三张卡连起来读的（哪些闸开着 → 这个周期上它们会拦掉
@@ -225,6 +227,11 @@ export default function AiTradeStatsLive() {
         ))}
         {Object.values(group.members).map((m) => (
           <OpenFunnelCard key={`funnel-${m.instId}`} funnel={m.session?.openFunnel} />
+        ))}
+        {/* 方向分布（directional-symmetry 轴 D）：紧贴漏斗卡下方——两者是同一个问题的两半，
+            漏斗说「被哪一层拦下」，本卡说「拦掉的是哪个方向」。老会话 / 总闸关 ⇒ 整卡不渲染。 */}
+        {Object.values(group.members).map((m) => (
+          <DirectionBalanceCard key={`dir-${m.instId}`} funnel={m.session?.openFunnel} />
         ))}
         {/* 经验模式（experience-context-graph §7.3）：数据源同为**成员级实时快照**。
             未装配 ⇒ 整卡不渲染（`ExperienceCard` 自己门控），绝不挂一排「—」。 */}

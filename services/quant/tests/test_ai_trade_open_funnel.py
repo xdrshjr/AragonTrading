@@ -10,6 +10,7 @@ from app.ai_auto.open_funnel import (
     OpenFunnelCounters,
     classify_block,
     conversion,
+    direction_verdict,
     funnel_advice,
     funnel_wire,
     is_llm_failure,
@@ -217,3 +218,154 @@ def test_split_no_tool_call_codes_stay_inside_the_llm_failure_bucket():
         assert is_llm_failure(code) is True, code
         # 归类与合入前的 `no_tool_call` 保持一致（它本就不在 `_DEGRADE_PREFIXES` 里 ⇒ "other"）。
         assert classify_block(code) == classify_block("no_tool_call") == "other"
+
+
+# ============ 方向轴（ai-trade-directional-symmetry 轴 D） ============
+#
+# 方向切分是对**同一批事件的重新分组**，不是第二次计数——三侧求和必须逐字等于既有的四个标量。
+
+def _full_round(counters, action, *, degrade=None, gate=None, size=0.5, skipped=False,
+           fill_side=None):
+    """跑一整轮的记点序（与 `session._run_decision_round` 的真实调用序同构）。"""
+    counters.note_intent(action, degrade)
+    final_degrade = degrade or gate
+    final_action = "hold" if final_degrade else action
+    counters.note_sizing(final_action, size)
+    counters.note_executed(final_action, skipped)
+    if fill_side is not None:
+        counters.note_filled(fill_side)
+    counters.note_block(final_degrade)
+    counters.end_round()
+
+
+def test_by_side_closes_per_direction_and_sums_to_the_scalars():
+    counters = OpenFunnelCounters()
+    _full_round(counters, "open_long", fill_side="long")
+    _full_round(counters, "open_long", gate="low_consensus(0/1)")
+    _full_round(counters, "open_short", gate="low_consensus(0/1)")
+    _full_round(counters, "open_short", size=0.0)
+    _full_round(counters, "hold", degrade="low_confidence")       # 方向不可知
+    wire = funnel_wire(counters, directional=True)
+    by_side = wire["bySide"]
+    # ① 每一侧各自闭合
+    for side in ("long", "short", "unknown"):
+        row = by_side[side]
+        assert sum(row["blocked"].values()) + row["submitted"] + row["sizingZeroed"] \
+            <= row["intents"]
+    # ② 三侧求和逐字等于既有四个标量（重新分组，不是二次计数）
+    assert sum(by_side[s]["intents"] for s in ("long", "short", "unknown")) == wire["intents"]
+    assert sum(by_side[s]["submitted"] for s in ("long", "short", "unknown")) == wire["submitted"]
+    assert sum(by_side[s]["sizingZeroed"] for s in ("long", "short", "unknown")) \
+        == wire["sizingZeroed"]
+    assert sum(by_side[s]["filled"] for s in ("long", "short", "unknown")) == wire["filled"]
+    flat = {}
+    for side in ("long", "short", "unknown"):
+        for key, value in by_side[side]["blocked"].items():
+            flat[key] = flat.get(key, 0) + value
+    assert flat == wire["blocked"]
+
+
+def test_low_confidence_falls_into_unknown_and_never_becomes_a_fourth_bucket():
+    """`low_confidence` 轮记进 `unknown`，**不猜方向**，也绝不写成 `"hold"`（评审 P2-1）。"""
+    counters = OpenFunnelCounters()
+    _full_round(counters, "hold", degrade="low_confidence")
+    assert counters.intents_by_side == {"unknown": 1}
+    assert "hold" not in counters.intents_by_side
+    assert counters.blocked_by_side["unknown"] == {"confidence": 1}
+
+
+def test_filled_by_side_uses_the_fill_leg_side():
+    """★ 评审 P0-1 的直接守卫：先 `note_executed`（它清 `_intent_pending`）再 `note_filled`。
+
+    若实现去读轮级 `_intent_side`，本条必红——而那正是 v1 的写法，且它**不报任何错**。
+    """
+    counters = OpenFunnelCounters()
+    counters.note_intent("open_short", None)
+    counters.note_executed("open_short", False)      # 此刻 `_intent_side` 已被消费清空
+    counters.note_filled("short")                    # 跨轮到达的成交腿同理
+    counters.end_round()
+    counters.note_filled("short")                    # 部分成交的第二条腿
+    assert counters.filled_by_side == {"short": 2}
+    assert counters.filled == 2
+
+
+def test_filled_with_an_unknown_side_never_guesses():
+    counters = OpenFunnelCounters()
+    counters.note_filled("")
+    counters.note_filled("close")
+    assert counters.filled_by_side == {"unknown": 2}
+
+
+def test_submitted_and_sizing_zeroed_split_by_side():
+    """两个 v1 漏声明的字段各一例（评审 P0-1）。"""
+    counters = OpenFunnelCounters()
+    _full_round(counters, "open_short")                    # 委托发出
+    _full_round(counters, "open_long", size=0.0)           # 仓位解到 0
+    assert counters.submitted_by_side == {"short": 1}
+    assert counters.sizing_zeroed_by_side == {"long": 1}
+
+
+def test_intent_side_cleared_on_exception_path():
+    """决策轮抛异常时 `note_block` 不会被调到 —— `end_round` 必须兜底清零（R-12 同款）。"""
+    counters = OpenFunnelCounters()
+    counters.note_intent("open_short", None)
+    counters.end_round()                              # 模拟异常路径
+    _full_round(counters, "open_long", gate="low_consensus(0/1)")
+    assert counters.blocked_by_side == {"long": {"consensus": 1}}   # 绝不泄漏成 short
+
+
+def test_verdict_denominator_excludes_unknown():
+    """`unknown` 一律不进分母：3 多 / 0 空 / 40 不可知 ⇒ `insufficient`，不是 `long_skewed`。"""
+    counters = OpenFunnelCounters()
+    for _ in range(3):
+        _full_round(counters, "open_long")
+    for _ in range(40):
+        _full_round(counters, "hold", degrade="low_confidence")
+    wire = funnel_wire(counters, directional=True)
+    balance = wire["directionBalance"]
+    assert balance["verdict"] == "insufficient"
+    assert balance["unknownIntents"] == 40
+    assert direction_verdict(counters) == "insufficient"
+
+
+def test_direction_verdict_never_fabricates_a_percentage():
+    counters = OpenFunnelCounters()
+    balance = funnel_wire(counters, directional=True)["directionBalance"]
+    assert balance["verdict"] == "insufficient"
+    assert balance["shortIntentShare"] is None and balance["shortFillShare"] is None
+
+
+def test_direction_verdict_thresholds():
+    counters = OpenFunnelCounters()
+    for _ in range(10):
+        _full_round(counters, "open_long")
+    assert direction_verdict(counters) == "long_skewed"          # 弱侧 0
+    for _ in range(9):
+        _full_round(counters, "open_short")
+    assert direction_verdict(counters) == "balanced"             # 9/19 远超 15%
+    lopsided = OpenFunnelCounters()
+    for _ in range(20):
+        _full_round(lopsided, "open_short")
+    _full_round(lopsided, "open_long")                                # 1/21 < 15%
+    assert direction_verdict(lopsided) == "short_skewed"
+
+
+def test_direction_keys_absent_when_switch_off():
+    """总闸关 ⇒ 两键**整键缺席** ⇒ wire 逐字节等于本特性合入前（前端整卡不渲染）。"""
+    counters = OpenFunnelCounters()
+    _full_round(counters, "open_long")
+    wire = funnel_wire(counters)
+    assert "bySide" not in wire and "directionBalance" not in wire
+
+
+def test_contrarian_passed_is_not_a_block():
+    """逆势放行是独立计数，**不进 `blocked`**（镜像 `sizing_zeroed` 不是一道闸的纪律）。"""
+    counters = OpenFunnelCounters()
+    counters.note_intent("open_short", None)
+    counters.note_contrarian()
+    counters.note_executed("open_short", False)
+    counters.note_block(None)
+    counters.end_round()
+    assert counters.contrarian_passed == 1
+    assert counters.blocked == {} and counters.blocked_by_side == {}
+    assert funnel_wire(counters, directional=True)["directionBalance"]["contrarianPassed"] == 1

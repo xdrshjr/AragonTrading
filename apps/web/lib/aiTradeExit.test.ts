@@ -65,6 +65,23 @@ describe("未装配时整块不渲染", () => {
   });
 });
 
+// ---------------- 层名泛化（ai-trade-directional-symmetry B-3）----------------
+describe("describeVetoedProposal 的层名", () => {
+  it("有 layerLabel ⇒ 用后端下发的中文层名", () => {
+    expect(describeVetoedProposal("open_short", "consensus", "同向共识门槛")).toBe(
+      "模型提议的是「开空」，被同向共识门槛降级",
+    );
+  });
+
+  it("老快照（无 layerLabel）：horizon 走既有映射，其余层回落「门禁」——**绝不显示英文 key**", () => {
+    expect(describeVetoedProposal("close", "horizon")).toContain("交易周期层");
+    const generic = describeVetoedProposal("open_short", "consensus")!;
+    expect(generic).toContain("门禁");
+    expect(generic).not.toContain("consensus");
+    expect(describeVetoedProposal("open_long", "baseRuleMaBand")).not.toContain("baseRuleMaBand");
+  });
+});
+
 // ---------------- 五档中文化 ----------------
 describe("describeExitPriority", () => {
   it("expedite 只报 G2，且徽标用 accent（放行不是拦截，绝不用红色）", () => {

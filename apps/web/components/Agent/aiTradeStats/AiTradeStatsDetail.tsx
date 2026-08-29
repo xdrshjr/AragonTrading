@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 import { PeriodReturnBars, UnderwaterChart } from "@/components/Chart/aiBacktest/charts";
 import AutoTradeRoundTripRow from "@/components/Chart/AutoTradeRoundTripRow";
 import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
+import DirectionBalanceCard from "./DirectionBalanceCard";
 import ExitSourceCard from "./ExitSourceCard";
 import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
 import WakeAttributionCard from "./WakeAttributionCard";
@@ -157,6 +158,10 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
               缺席 ⇒ 不渲染。两卡同样是两个独立入参（[P0-4]）。 */}
           <HorizonAcceptanceCard acceptance={summary.horizonAcceptance} />
           <ExitSourceCard exits={summary.exits} />
+          {/* 方向分布（directional-symmetry 轴 D）：本页**没有** OpenFunnelCard（它只在 Live 页），
+              故挂在这里。数据源是落库的 `aiStats.openFunnel`——与实时侧同形同源（`build_funnel_stats`
+              整体带上 `bySide` / `directionBalance`，零 DB 迁移）。老记录缺键 ⇒ 整卡不渲染。 */}
+          <DirectionBalanceCard funnel={aiStats?.openFunnel} />
 
           <WakeAttributionCard trips={ledger} />
 

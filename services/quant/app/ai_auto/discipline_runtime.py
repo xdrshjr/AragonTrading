@@ -100,8 +100,16 @@ class DisciplineRuntime:
             funnel=self.funnel_wire(), tradability_level=self._tradability_level()))
 
     def funnel_wire(self) -> dict | None:
-        """开仓漏斗 wire（`status.openFunnel` 与落库 `aiStats.openFunnel` 的**同一次**装配）。"""
-        return funnel_wire(self.funnel)
+        """开仓漏斗 wire（`status.openFunnel` 与落库 `aiStats.openFunnel` 的**同一次**装配）。
+
+        方向轴两键（`bySide` / `directionBalance`）跟随总闸下发：关 ⇒ 整键缺席 ⇒ wire 逐字节
+        等于 directional-symmetry 合入前（前端渲染门控据此整卡不渲染）。阈值取会话那份**派生**
+        settings 副本，与其它纪律阈值同源。
+        """
+        settings = self._session.executor.settings
+        return funnel_wire(self.funnel,
+                           directional=settings.ai_trade_directional_symmetry_enabled,
+                           min_samples=settings.ai_trade_direction_balance_min_samples)
 
     def tradability_status(self) -> dict | None:
         """`status.tradability`：启动断面的瘦身投影（未探测 ⇒ `None` ⇒ 前端整段不渲染）。"""

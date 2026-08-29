@@ -16,6 +16,7 @@ from app.ai_auto.experience.aggregate import EventView, compute_stats, enumerate
 from app.ai_auto.experience.disclosure import (
     FRAME_OVERHEAD,
     MIN_ITEM_BUDGET,
+    SIDE_NOTE_OVERHEAD,
     TIER_REPEAT,
     budget_floor,
     experience_tier,
@@ -25,7 +26,12 @@ from app.ai_auto.experience.disclosure import (
 from app.ai_auto.experience.events import ContextFacts, EventIdentity, build_event, freeze_open_context
 from app.ai_auto.experience.graph import Graph, GraphEdge, GraphNode, MaterializeOptions, materialize
 from app.ai_auto.experience.promote import PromoteRule, resolve_tier, roll_sign
-from app.ai_auto.experience.retrieval import ContextSeed, RetrievalConfig, retrieve
+from app.ai_auto.experience.retrieval import (
+    ContextSeed,
+    RetrievalConfig,
+    retrieve,
+    side_degeneracy,
+)
 from app.ai_auto.experience.runtime import ExperienceRuntime
 from app.ai_auto.experience.rules import ExperienceRule
 
@@ -79,6 +85,9 @@ class _Settings:
     ai_trade_experience_global_min_symbols = 3
     ai_trade_experience_cost_regime_min_samples = 30
     ai_trade_experience_graph_node_cap = 4000
+    # directional-symmetry 轴 E-2：`side` 轴方向退化时整轴退出评分（`retrieve` 的 keyword-only
+    # 入参由 runtime 从这里取）。替身默认**开**，与生产默认一致。
+    ai_trade_directional_symmetry_enabled = True
 
 
 def _facts(regime: str = "range") -> ContextFacts:
@@ -432,6 +441,83 @@ def test_a39_frame_overhead_constant_matches_the_real_rendering():
     l1 = format_l1(one, budget_floor("l1"))
     assert l1 and "长" * 120 in l1 and len(l1) <= budget_floor("l1")
     assert budget_floor("l0") == FRAME_OVERHEAD["l0"] + MIN_ITEM_BUDGET
+
+
+# ============ 轴 E-2 · 经验图谱的方向退化（ai-trade-directional-symmetry） ============
+#
+# 不做空 => 无做空样本 => `side:short` 语境节点在图里根本不存在 => 检索在结构上**只可能**召回
+# 做多教训 => 模型读到的经验永远说「做多是有效的」。而「做空侧没有教训」与「做空侧的教训是
+# 负面的」在模型看来不可区分——这是一个不会自己走出来的吸收态。本节把它钉成可判定的事实。
+
+def _side_context(value: str, support: int) -> GraphNode:
+    return GraphNode(key=tax.canonical_key(tax.AXIS_SIDE, value), kind="context",
+                     axis=tax.AXIS_SIDE, value=value, weight=1.0, support=support)
+
+
+def _side_graph(long_support: int, short_support: int) -> Graph:
+    """一条经验 + symbol 语境 + 两个 side 语境（support 为 0 即「这一侧一条样本都没有」）。"""
+    lesson = _lesson("lesson:side", signature={"symbol": "BTC-USDT-SWAP",
+                                               tax.AXIS_SIDE: "long"})
+    symbol = GraphNode(key="symbol:BTC-USDT-SWAP", kind="context", axis="symbol",
+                       value="BTC-USDT-SWAP", weight=1.0)
+    contexts = [symbol, _side_context("long", long_support), _side_context("short", short_support)]
+    edges = _applies(lesson, ["symbol:BTC-USDT-SWAP",
+                              tax.canonical_key(tax.AXIS_SIDE, "long")])
+    return _graph_with([lesson] + contexts, edges)
+
+
+def test_side_degeneracy_names_the_side_that_actually_has_samples():
+    """恰有一侧有样本 => 返回那一侧；两侧都有 / 两侧都没有 => `None`（**绝不猜**）。"""
+    assert side_degeneracy(_side_graph(28, 0)) == "long"
+    assert side_degeneracy(_side_graph(0, 12)) == "short"
+    assert side_degeneracy(_side_graph(28, 12)) is None
+    assert side_degeneracy(_side_graph(0, 0)) is None
+
+
+def test_side_axis_leaves_scoring_only_when_the_graph_is_degenerate():
+    """退化 + 总闸开 => `side` 轴整轴退出评分；其余三种组合**逐字节回退**。
+
+    把 `side` 留在分母里，会让「本轮是做空」这个语境对每一条（清一色做多的）经验都判为不匹配,
+    于是覆盖率被一个**结构性缺样本**的轴系统性压低——那正是吸收态的第一条腿。
+    """
+    seed = ContextSeed(axes={"symbol": "BTC-USDT-SWAP", tax.AXIS_SIDE: "short"},
+                       now_wall=1_700_000_000)
+    cfg = RetrievalConfig.from_settings(_Settings())
+    degenerate = _side_graph(28, 0)
+    off = retrieve(degenerate, seed, cfg)
+    on = retrieve(degenerate, seed, cfg, direction_debias=True)
+    assert off.side_degeneracy is None and on.side_degeneracy == "long"
+    assert on.l0 and off.l0
+    assert on.l0[0].match > off.l0[0].match          # 缺样本的那一轴不再压低覆盖率
+    # 两侧都有样本 => 判据不成立 => 打分与总闸关时逐字相同（只加不减）。
+    healthy = _side_graph(28, 12)
+    plain = retrieve(healthy, seed, cfg)
+    debiased = retrieve(healthy, seed, cfg, direction_debias=True)
+    assert debiased.side_degeneracy is None
+    assert [item.match for item in debiased.l0] == [item.match for item in plain.l0]
+
+
+def test_side_note_is_declared_and_fits_the_reserved_frame_overhead():
+    """退化声明句进 **L0 页眉**，故它的长度必须真的被 `SIDE_NOTE_OVERHEAD` 预留出来。
+
+    低估它的后果与 `v1:E-7` 逐字同形：`l0_max_chars` 落在旧下限附近的配置会**通过**启动期校验,
+    却在经验库真的方向退化的那一天让整层一个字都渲染不出来——一个不报错的空转。
+    """
+    from app.ai_auto.experience.disclosure import _side_degeneracy_note
+
+    for side in ("long", "short"):
+        assert len(_side_degeneracy_note(side)) <= SIDE_NOTE_OVERHEAD
+    assert _side_degeneracy_note(None) == ""          # 未退化 => 页眉逐字节回退
+    # 三层下限：只有 L0 抬高，且抬高的量恰是预留量。
+    assert budget_floor("l0", side_note=True) - budget_floor("l0") == SIDE_NOTE_OVERHEAD
+    assert budget_floor("l1", side_note=True) == budget_floor("l1")
+    assert budget_floor("l2", side_note=True) == budget_floor("l2")
+    # 抬高后的下限恰好仍装得下一条满长经验 + 声明句（A-39 的同款可观测判据）。
+    worst = {"lessons": 9_999_999, "events": 9_999_999, "sessions": 9_999_999}
+    one = [{"text": "长" * 120, "support": 20, "tStat": -3.0}]
+    out = format_l0(one, worst, budget_floor("l0", side_note=True), side_degeneracy="long")
+    assert "长" * 120 in out and "不可" in out
+    assert len(out) <= budget_floor("l0", side_note=True)
 
 
 def test_a10_repeat_tier_compresses_the_whole_block_to_one_line():

@@ -88,8 +88,12 @@ class PriorRuntime:
         self._long = self._resolve(view, active, regime, "long")
         self._short = self._resolve(view, active, regime, "short")
         priors = {"long": self._long, "short": self._short}
-        weighted = (compute_weighted_consensus(board, priors)
-                    if self.settings.ai_trade_weighted_consensus_enabled else None)
+        # 轴 E-1（directional-symmetry）：`debias` 打开后，一侧无证据不再按中性 0.5 参与比较
+        # ——那条路径是一个自我强化的吸收态（不做空 ⇒ 无做空样本 ⇒ 先验恒偏多 ⇒ 更不做空）。
+        weighted = (compute_weighted_consensus(
+            board, priors,
+            debias=self.settings.ai_trade_directional_symmetry_enabled)
+            if self.settings.ai_trade_weighted_consensus_enabled else None)
         self._coverage = board_prior_coverage(board, priors)
         return prior_wire(self._long, self._short, weighted_consensus_wire(weighted),
                           self._round_meta(regime))
@@ -103,7 +107,12 @@ class PriorRuntime:
     def _round_meta(self, regime: str | None) -> dict:
         """本轮 wire 的元信息：快照年龄 + 实际命中的体制桶（可能是降级到的 `all`）。"""
         hit = self._long or self._short
+        # 轴 E-1：把「本会话是否启用方向去偏」如实写进 wire——渲染层只读 wire、绝不读 settings
+        # （否则 `commit_round` 重渲染那一次与模型真正看到的那一份可能不同源）。总闸关 ⇒ `False`
+        # ⇒ 「无证据」的措辞逐字节回退。
         return {**self._meta, "ageS": self._age_s(),
+                "directionDebias": bool(
+                    self.settings.ai_trade_directional_symmetry_enabled),
                 "regimeUsed": hit.regime_used if hit is not None else regime,
                 "coverage": ({"boardWithPrior": self._coverage[0],
                               "boardTotal": self._coverage[1]}

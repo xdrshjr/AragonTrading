@@ -229,6 +229,39 @@ console. Write these in Simplified Chinese, and only these:
   - `exitEvidence`    - the named new evidence for a high-conviction exit.
 Everything else you write is English."""
 
+# —— 方向对称化的三处 mandate 追加（ai-trade-directional-symmetry 轴 C · C-1）——
+# **只追加、不改写**既有正文：S7 / S10 / S11 的原句一个字节都不动，故总闸关时
+# `_render_stages` 的产物与本特性合入前逐字相同（用例 C-4 冻结这一点）。
+#
+# 用户诉求的原话是「研判交易决策和行动的时候，要考虑方向性，不能无脑开多」。它在协议正文里
+# 此前**没有任何落点**：S10 只要求「三个候选，其中一个必须是 hold」——`open_long 25% /
+# open_long 50% / hold` 完全合规；S11 的 "the reverse action" 在空仓状态下可以被合理地读成
+# `hold` 而不是「反方向开仓」。
+_SYMMETRY_MANDATES: dict[str, str] = {
+    "S7": (" State also the strongest case for the **opposite** direction, phrased as its own "
+           "advocate would phrase it. If you cannot state the opposite case, you have not "
+           "finished this stage."),
+    "S10": (" The candidate set **must** contain at least one long candidate, at least one short "
+            "candidate, and `hold` - listing candidates in only one direction means S10 is not "
+            "done. Short and long are first-class, perfectly symmetric actions on this account: "
+            "they share the same sizing, cost, stop and gate standards."),
+    "S11": (" When you are flat, `the reverse action` means **opening in the opposite "
+            "direction**, not holding."),
+}
+
+_REVIEW_SYMMETRY_MANDATES: dict[str, str] = {
+    "R7": (" Apply exactly the same standard of evidence to a short proposal as you would to a "
+           "long one; a proposal is never weaker merely because it is a short."),
+}
+
+
+def _with_symmetry(stages: tuple[ReasoningStage, ...],
+                   mandates: dict[str, str]) -> tuple[ReasoningStage, ...]:
+    """把方向对称条款追加进指定阶段的 mandate 末尾；未列出的阶段**原对象直通**。"""
+    return tuple(replace(stage, mandate=stage.mandate + mandates[stage.id])
+                 if stage.id in mandates else stage for stage in stages)
+
+
 _STAGE_HEADING_RULE = (
     "each opened by a line that begins exactly with `## S<k>` (no leading spaces, exactly one "
     "space between `##` and `S`) followed by the stage code")
@@ -295,14 +328,22 @@ def _render_stages(stages: tuple[ReasoningStage, ...]) -> str:
 
 
 def build_deliberation_protocol(profile: DepthProfile, *,
-                                reserve_tokens: int = DEFAULT_RESERVE_TOKENS) -> str:
+                                reserve_tokens: int = DEFAULT_RESERVE_TOKENS,
+                                symmetry: bool = False) -> str:
     """渲染决策侧《审议协议》正文（`profile.enabled=False` ⇒ 空串 ⇒ 系统 prompt 逐字节回退）。
 
     篇幅、预算、收尾预留三个数一律**现算**（沿用 `format_horizon_charter` 按本会话真实杠杆
     现算解除阈的先例）——写死算例会在换档后说谎，而说谎的 prompt 不会报错。
+
+    Args:
+        profile: 本会话的研判深度档。
+        reserve_tokens: 留给收尾工具调用的输出 token。
+        symmetry: 方向对称性总闸（directional-symmetry C-1）。`False`（默认）⇒ S7 / S10 / S11
+            三处 mandate **逐字节回退**；`True` ⇒ 各追加一句方向对称条款。
     """
     if not profile.enabled:
         return ""
+    stages = _with_symmetry(DECISION_STAGES, _SYMMETRY_MANDATES) if symmetry else DECISION_STAGES
     total = len(DECISION_STAGES)
     return (
         "# DELIBERATION PROTOCOL - MANDATORY\n\n"
@@ -316,7 +357,7 @@ def build_deliberation_protocol(profile: DepthProfile, *,
         "make a claim, name the input line it comes from. If an input is missing, stale, or\n"
         "contradicts another input, say so at the stage where you first notice it - silent\n"
         "smoothing over a gap is the single most expensive mistake you can make here.\n\n"
-        f"{_render_stages(DECISION_STAGES)}\n\n"
+        f"{_render_stages(stages)}\n\n"
         "# OUTPUT BUDGET DISCIPLINE\n"
         f"Your entire response for this turn is capped at {profile.decision_max_tokens} output\n"
         f"tokens, and the final tool call must fit inside the last ~{reserve_tokens} of them.\n"
@@ -326,16 +367,24 @@ def build_deliberation_protocol(profile: DepthProfile, *,
         "lost round and the system will fall back to `hold`.**")
 
 
-def build_review_protocol(profile: DepthProfile) -> str:
+def build_review_protocol(profile: DepthProfile, *, symmetry: bool = False) -> str:
     """渲染反思侧《对抗式复核协议》正文（`profile.enabled=False` ⇒ 空串 ⇒ 逐字节回退）。
 
     ⚠️ 本文本的**唯一**注入路径是 `decider._stream_reflection` 每轮现造 `system` 时传给
     `build_reflection_system_prompt(reasoning_text=…)`（spec §3.2 / P0-5）。manager 与
     backtest **从未**调用过 `build_reflection_system_prompt`——在那里注入是一条不报错、
     不判红、轴 B 整条死掉的死路。装配判据见用例 S-7 / S-9。
+
+    Args:
+        profile: 本会话的研判深度档。
+        symmetry: 方向对称性总闸（directional-symmetry C-3）。`True` ⇒ R7 追加「对做空提议
+            适用与做多**完全相同**的证据标准」。复核官「只能收紧、不能改方向」的既有语义
+            **一个字节都不改**。
     """
     if not profile.enabled:
         return ""
+    stages = (_with_symmetry(REVIEW_STAGES, _REVIEW_SYMMETRY_MANDATES) if symmetry
+              else REVIEW_STAGES)
     total = len(REVIEW_STAGES)
     words = max(1, profile.words_per_stage // 2)   # 复核比研判短，但同样按档位现算
     return (
@@ -345,7 +394,7 @@ def build_review_protocol(profile: DepthProfile) -> str:
         "optional and may not be merged.\n"
         f"Write at least {words} words per stage. You are auditing another trader's work: your\n"
         "value comes from what you check, not from how confident you sound.\n\n"
-        f"{_render_stages(REVIEW_STAGES)}")
+        f"{_render_stages(stages)}")
 
 
 def count_stages(text: str, prefix: str = "S") -> int:

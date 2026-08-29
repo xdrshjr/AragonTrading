@@ -60,10 +60,11 @@ from .experience import ExperienceRule, ExperienceRuntime, SessionGraph
 from .experience import scheduler
 from .experience.events import EventIdentity
 from .llm_budget import build_ai_trade_llm_clients
-from .prompts import build_ai_trade_system_prompt
+from .prompts import build_ai_trade_system_prompt, format_direction_charter
 from .prompts_en import SystemPromptOptions, SystemPromptTexts
 from .reasoning_protocol import build_deliberation_protocol, resolve_depth_profile
 from .session import AiTradeSession
+from .signals import consensus_rule_from_settings, contrarian_schema
 from .sizing import SizingRule, StopRule, check_window_capacity, parse_sizing_rule, parse_stop_rule
 from .sizing_runtime import build_sizing_runtime, sizing_config_wire
 from .sizing_text import format_sizing_charter
@@ -683,11 +684,20 @@ class AiTradeManager:
                     # F-3：价带文案与本地门禁同源（settings 唯一真源）
                     limit_band_pct=req.settings.ai_trade_limit_price_max_deviation_pct),
                 texts=SystemPromptTexts(
-                    # 审议协议 + 输出预算纪律；off 档 → "" ⇒ 中文脊柱逐字节回退
+                    # 审议协议 + 输出预算纪律；off 档 → "" ⇒ 中文脊柱逐字节回退。
+                    # `symmetry` 把 S7 / S10 / S11 三处 mandate 方向对称化（轴 C-1）；
+                    # 总闸关 → 三处逐字节回退。
                     reasoning_text=build_deliberation_protocol(
                         depth,
                         reserve_tokens=req.settings
-                        .ai_trade_reasoning_reserve_tokens),
+                        .ai_trade_reasoning_reserve_tokens,
+                        symmetry=req.settings
+                        .ai_trade_directional_symmetry_enabled),
+                    # 方向对称宪章章（轴 C-2 的第六段）；总闸关 → "" ⇒ 两条脊柱逐字节回退。
+                    # ⚠️ `backtest.py` 是同款的第二个 `SystemPromptTexts` 构造点，只填一处会让
+                    # 实盘与回测的 prompt 分叉（`base_rules` P1-4 的成文教训）。
+                    direction_text=format_direction_charter(
+                        req.settings.ai_trade_directional_symmetry_enabled),
                     # 【基础策略】宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变
                     base_rules_text=format_charter(req.base_rule),
                     # 利润保护宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变
@@ -737,7 +747,12 @@ class AiTradeManager:
             # exit-priority §6.1：离场优先通道总闸经既有 horizon 契约通路派生（装配了周期层且
             # 本层已装配时才露出 `exitConviction` / `exitEvidence`）。未装配 ⇒ schema / 描述 /
             # 三份 prompt 全部逐字节回退（X-7）。
-            allow_exit_priority=getattr(req.horizon_rule, "exit_priority", None) is not None)
+            allow_exit_priority=getattr(req.horizon_rule, "exit_priority", None) is not None,
+            # directional-symmetry A-3：`contrarianEvidence` 随逆势通路露出。两个总闸任一关 /
+            # `min_consensus<=0`（共识门禁本就不触发）⇒ `None` ⇒ 工具 schema 逐字节回退。
+            # `req.settings` 是 `_resolve_discipline` 之后的派生副本，与 executor 那一份同源。
+            contrarian_schema=contrarian_schema(
+                consensus_rule_from_settings(req.settings)))
         # 不变式 I-3（续跑不新建 run）：冷续跑逐成员**复用同一 `run_id`**，成交 / 指标 / 历史聚合
         # 天然连续，一次交易在历史列表里永远只有一条。这是本方法与 `start` 路径的**唯一**差异。
         run_id = ((ctx.req.resume_of or {}).get("runIds") or {}).get(plan.inst_id)
@@ -1514,6 +1529,11 @@ class AiTradeManager:
                 # **分组共享**的（同一份派生 settings），逐成员各发一份只是噪音；成员之间真正会
                 # 分叉的只有 `exchangeBackstop` 那一行，它已随各成员的 `status.disciplines` 下发。
                 "discipline": self._discipline_wire(group),
+                # 方向对称性回执镜像（directional-symmetry §7.1）：**服务端解析后的生效值**，
+                # `null` = 未装配（总闸关 / 用户显式关闭 / 该预设的 `minConsensus<=0` 使共识门禁
+                # 本就不触发）。回执必须能逐字段核对，否则「我在弹窗里关掉的逆势通路到底有没有
+                # 生效」这个问题在产品里无从回答。
+                "direction": self._direction_wire(group),
                 # 轴 A 启动断面（§5.4）：**逐成员一份的列表**，各带 `instId` 与 `asOfTs`。
                 # 桌面旧包 / 直接调 API 的用户拿不到弹窗那块预检，本回执是他们唯一的告知面。
                 # 该端点 `-> dict` 且无 `response_model`，故新键不会被 FastAPI 静默吞掉（已核实）。
@@ -1533,6 +1553,22 @@ class AiTradeManager:
                 # 消费，是分组口径唯一的实时来源（成员级实时数据仍走既有成员 WS status）。
                 **self._acceptance_bundle(group),
                 "members": [self._member_row(m) for m in group.members]}
+
+    @staticmethod
+    def _direction_wire(group: AiTradeGroup) -> dict | None:
+        """分组级方向对称性回执；未装配 ⇒ `None` ⇒ 前端整段不渲染。
+
+        取任一成员会话上的那份 `ConsensusRule`——它是**分组共享**的同一份派生 settings 派生出来
+        的（`consensus_rule_from_settings`），逐成员各发一份只是噪音。
+
+        `getattr` 兜底与本方法上下的 `tradability` / 生命周期三键**同款**：既有测试替身用
+        `SimpleNamespace` 直接构造分组与会话，新增字段对它们必须是**加法**——不能让一个只读
+        视图把它们打红（本仓库为这条已立过明文）。
+        """
+        if not group.members:
+            return None
+        reader = getattr(group.members[0].session, "direction_wire", None)
+        return reader() if callable(reader) else None
 
     @staticmethod
     def _discipline_wire(group: AiTradeGroup) -> dict:

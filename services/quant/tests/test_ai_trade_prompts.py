@@ -898,3 +898,67 @@ def test_decision_prompt_task_instruction_forks_on_reasoning_depth():
     en = build_decision_prompt({**payload, "reasoningDepth": "deep"})
     assert zh.rstrip().endswith("不得只输出研判文字。")
     assert "S1 -> S12" in en and "Simplified Chinese" in en
+
+
+# ============ 方向对称条款与逆势通路（ai-trade-directional-symmetry 轴 A-5 / C-2） ============
+def test_direction_charter_is_empty_when_not_armed():
+    """未装配 ⇒ **空串垫片** ⇒ 两条脊柱的拼接结果与本特性合入前逐字节相同。"""
+    from app.ai_auto.prompts import format_direction_charter
+
+    assert format_direction_charter(False) == ""
+    armed = format_direction_charter(True)
+    assert "方向对称条款" in armed and "完全对等" in armed
+    assert "只列出一个方向的候选，等同于没有完成 S10" in armed
+
+
+def test_direction_charter_reaches_both_spines():
+    """C-2 的核心：中文脊柱另有一份内联拼接、根本不调 `charter()`——只改一处就只到一条路径。"""
+    from app.ai_auto.prompts import build_ai_trade_system_prompt, format_direction_charter
+    from app.ai_auto.prompts_en import SystemPromptTexts
+
+    clause = format_direction_charter(True)
+    zh = build_ai_trade_system_prompt("BTC-USDT-SWAP", "1H", 1000.0, 3.0,
+                                      texts=SystemPromptTexts(direction_text=clause))
+    en = build_ai_trade_system_prompt("BTC-USDT-SWAP", "1H", 1000.0, 3.0,
+                                      texts=SystemPromptTexts(direction_text=clause,
+                                                              reasoning_text="X"))
+    assert "方向对称条款" in zh          # 中文脊柱（off 档真源）
+    assert "方向对称条款" in en          # 英文脊柱（生产路径）
+    assert "Direction is symmetric" in en   # 英文决策纪律里的孪生子句
+    # 未装配 ⇒ 两条脊柱都不含它（逐字节回退）。
+    bare_zh = build_ai_trade_system_prompt("BTC-USDT-SWAP", "1H", 1000.0, 3.0,
+                                           texts=SystemPromptTexts())
+    assert "方向对称条款" not in bare_zh
+    bare_en = build_ai_trade_system_prompt("BTC-USDT-SWAP", "1H", 1000.0, 3.0,
+                                           texts=SystemPromptTexts(reasoning_text="X"))
+    assert "Direction is symmetric" not in bare_en
+
+
+def test_contrarian_lane_line_is_absent_when_key_missing():
+    """A-5：`contrarian` 整键缺席 ⇒ 共识那一行逐字节回退。"""
+    from app.ai_auto.prompts import _format_consensus
+
+    base = {"longVotes": 2, "shortVotes": 0, "flatVotes": 0, "netStance": "long",
+            "agreement": 1.0}
+    plain = _format_consensus(base)
+    assert "逆势通路" not in plain and "\n" not in plain
+    armed = _format_consensus({**base, "contrarian": {
+        "available": True, "minConfidence": 0.65, "minEvidenceChars": 60,
+        "maxOpposingVotes": 1, "remaining": 3, "sizeMult": 0.5}})
+    assert armed.startswith(plain)         # 只追加一行，原文一个字不改
+    assert "逆势通路" in armed and "contrarianEvidence" in armed
+    assert "不少于 60 字" in armed and "还剩 3 次" in armed
+    # 名额用尽 ⇒ 措辞改口，绝不还说「系统会放行」。
+    used_up = _format_consensus({**base, "contrarian": {
+        "available": True, "minConfidence": 0.65, "minEvidenceChars": 60,
+        "maxOpposingVotes": 1, "remaining": 0, "sizeMult": 0.5}})
+    assert "名额已用尽" in used_up and "系统会放行" not in used_up
+
+
+def test_prior_no_evidence_wording_is_gated():
+    """E-1：「无证据」的措辞追加「样本不足 ≠ 胜率低」，且随总闸逐字回退。"""
+    from app.ai_auto.prompts import _format_prior_side
+
+    assert _format_prior_side(None) == "无证据"
+    assert "样本不足" in _format_prior_side(None, True)
+    assert "不是该方向胜率低的证据" in _format_prior_side(None, True)

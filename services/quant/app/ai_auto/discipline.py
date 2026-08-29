@@ -62,6 +62,9 @@ _PRESETS: dict[str, dict[str, float | int | bool]] = {
         "ai_trade_brake_loss_streak": 3,
         "ai_trade_brake_loss_cooldown_bars": 6.0,
         "ai_trade_profit_guard_hard_tp_return_pct": 0.30,
+        # 逆势通路（directional-symmetry 轴 A）：稳健档**默认关**——它的 `min_consensus=2` 本就
+        # 是「两条策略同向才许开」的强约束，在这一档开后门与这一档的定位矛盾。
+        "ai_trade_consensus_contrarian_enabled": False,
     },
     "balanced": {
         "ai_trade_edge_gate_k_min": 1.5,
@@ -80,6 +83,10 @@ _PRESETS: dict[str, dict[str, float | int | bool]] = {
         "ai_trade_brake_loss_streak": 4,
         "ai_trade_brake_loss_cooldown_bars": 4.0,
         "ai_trade_profit_guard_hard_tp_return_pct": 0.50,
+        # 逆势通路：均衡档**默认开**。生产回归窗口装的正是这一档（`min_consensus=1`），而
+        # 1540 次开仓意愿里 832 次死在共识门禁——「同向票数 >= 1」在单边行情里对逆势方向恒不
+        # 成立，这一档是本轴真正要救的那一档。
+        "ai_trade_consensus_contrarian_enabled": True,
     },
     "aggressive": {
         "ai_trade_edge_gate_k_min": 1.0,
@@ -100,6 +107,11 @@ _PRESETS: dict[str, dict[str, float | int | bool]] = {
         "ai_trade_profit_guard_hard_tp_return_pct": 0.0,   # 激进档不设硬止盈
     },
 }
+
+# ⚠️ **逆势通路的真实作用域只有 `steady`(2) 与 `balanced`(1)**（directional-symmetry 评审 P1-2）：
+# `aggressive` 的 `ai_trade_min_consensus` 就是 `0`、`off` 走 `config.py` 的默认 `0`，共识门禁在
+# 这两档**根本不触发**，逆势通路在那里是死配置。故上表只给这两档配了默认值，另两档一个键都不加
+# ——加一个永远不会被读到的键，就是在阈值表里放一句假话。
 
 # 各预设下「解算仓位」的保守下界（[P0-4] 启动期最小下单量复核专用，不参与任何交易判定）。
 _F_FLOOR: dict[str, float] = {"steady": 0.15, "balanced": 0.20, "aggressive": 0.30}
@@ -148,6 +160,8 @@ def preset_rows(preset_id: str) -> list[dict]:
     """某预设的只读阈值表（中文标签 + 已格式化的展示值），供启动弹窗在按下按钮**之前**展开核对。
 
     `sizing_enabled` 这类纯布尔总闸不进表——它不是「阈值」，且它开没开由其它行的存在本身回答。
+    `ai_trade_consensus_contrarian_enabled`（directional-symmetry 轴 A）同属此类：它的开关态在
+    启动弹窗里有专门的一块（`AiTradeDirectionFields`），不在这张**阈值**表里重复一遍。
     """
     table = _PRESETS.get(preset_id, {})
     rows = []

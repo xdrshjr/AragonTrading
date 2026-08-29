@@ -37,6 +37,7 @@ import {
   positionLadder,
   priceMoveFromMarginPct,
   validateContextRounds,
+  validateDirectionRule,
   validateProfitGuard,
   validateStrategySelection,
   validateWakeInterval,
@@ -65,6 +66,7 @@ import {
 import type {
   AiTradeBackstopRepairMode,
   AiTradeBaseRules,
+  AiTradeDirectionRule,
   AiTradeDisciplineIn,
   AiTradeDisciplinePresetsResponse,
   AiTradeGivebackTier,
@@ -80,6 +82,7 @@ import { tradingApi } from "@/lib/tradingApi";
 import type { Bar } from "@/lib/types";
 import { AI_TRADE_EXPERIENCE_DEFAULTS } from "@/lib/experience";
 import type { AiTradeExperienceRule } from "@/lib/experienceTypes";
+import AiTradeDirectionFields from "./AiTradeDirectionFields";
 import AiTradeExperienceFields from "./AiTradeExperienceFields";
 import AiTradeHorizonFields, { type HorizonCustomKey } from "./AiTradeHorizonFields";
 import AiTradeTradabilityFields, {
@@ -122,6 +125,10 @@ export interface AiTradeLaunchOpts {
   // 交易纪律预设（**实盘与回测同源**，discipline-preset R-3）：只带 `{preset}`，阈值一律由服务端
   // 的冻结表决定。整键不发 ⇒ 服务端按 `ai_trade_discipline_default_preset` 装配（老客户端同样受保护）。
   discipline?: AiTradeDisciplineIn;
+  // 方向对称性 / 逆势通路（**实盘与回测同源**，directional-symmetry §7.1）：勾选 ⇒ 带
+  // `{contrarianEnabled:true, ...留空即服务端默认}`；取消勾选 ⇒ `{contrarianEnabled:false}`
+  // （**显式关闭**，与「字段缺省=默认开启」语义严格区分）。
+  direction?: AiTradeDirectionRule;
   contextRefreshRounds: number;
   // Agent 墙钟定时唤醒周期（分钟）：[RN-1] 声明为**可选**（对齐 backtest-only 可选字段），仅 live 分支透传、
   // base 不含、回测省略——若定为非可选，回测 onConfirm 不带该键将 tsc 编译失败。0/关闭 = 仅按 K 线与策略触发。
@@ -256,6 +263,13 @@ export default function AiTradeLaunchModal({
   // 交易纪律预设（discipline-preset 轴 A）：**只存一个 id**，阈值一概不在前端保存或重算——
   // 生效值恒以启动回执 `discipline` 为准（前后端各存一份口径必漂移，`edgeSource` 的成文教训）。
   const [disciplinePreset, setDisciplinePreset] = useState(DEFAULT_DISCIPLINE_PRESET);
+  // 方向对称性 / 逆势通路（directional-symmetry D-5）：默认开启（与服务端「字段缺省即开启」的
+  // 语义一致）；三个数值走 raw 串、**留空即服务端默认**——前端不存任何默认数值（唯一真源在
+  // `config.py`，前端存一份下次调参就会静默分叉）。
+  const [directionEnabled, setDirectionEnabled] = useState(true);
+  const [directionConfidenceRaw, setDirectionConfidenceRaw] = useState("");
+  const [directionQuotaRaw, setDirectionQuotaRaw] = useState("");
+  const [directionSizeMultRaw, setDirectionSizeMultRaw] = useState("");
   // 可交易性预检的二次确认态（轴 A）：受控 state 留在父组件，子组件内不写任何 reset effect。
   const [tradabilityConfirmed, setTradabilityConfirmed] = useState(false);
   // 是否**要求**那次确认（= 预检判定 infeasible）。由子组件按 level 上报，**刻意不进下面那个
@@ -384,6 +398,12 @@ export default function AiTradeLaunchModal({
     setHorizonCustom(seedHorizonCustom(defaultTradingHorizon));
     setRepairMode(null);   // 同上：新增受控输入**必须**塞进这个既有 [open] effect（U-21 守它）
     setDisciplinePreset(DEFAULT_DISCIPLINE_PRESET);   // 同上（discipline-preset 轴 A 的受控输入）
+    // 方向对称性的四个受控输入**必须塞进这个既有 [open] effect**（见上一段注释：另写 effect =
+    // ai-trade-modal-revert-recurrence 复发，输入约 1 秒后被冲回默认）。
+    setDirectionEnabled(true);
+    setDirectionConfidenceRaw("");
+    setDirectionQuotaRaw("");
+    setDirectionSizeMultRaw("");
     setTradabilityConfirmed(false);   // 同上（tradability 轴 A：**必须**塞进这个既有 [open] effect）
     setCapitalRaw("");
     setLeverageRaw("");
@@ -595,10 +615,22 @@ export default function AiTradeLaunchModal({
   const budgetCap = groupBudgetCap(availUsdt, maxBudgetPct);
 
   const usingDefault = capital.value == null;
+  // 方向对称性（directional-symmetry D-5）：三个数值**留空即整键不发** ⇒ 服务端回填默认。
+  // 越界在这里即时报错（区间与后端 `AiTradeDirectionIn` 的 `Field` 逐字一致），但**不阻断启动
+  // 按钮**——校验错误进 `directionError`，与既有 `baseRuleError` / `profitGuardError` 同款并进
+  // `baseValid`。
+  const directionPayload: AiTradeDirectionRule = {
+    contrarianEnabled: directionEnabled,
+    contrarianMinConfidence: rawToNumber(directionConfidenceRaw),
+    contrarianMaxPerSession: rawToNumber(directionQuotaRaw),
+    contrarianSizeMult: rawToNumber(directionSizeMultRaw),
+  };
+  const directionError = validateDirectionRule(directionPayload);
+
   // 利润保护校验并入 baseValid：两模式共用（P2-8），避免回测下「校验会跑但拦不住提交」。
   const baseValid =
     !inputError && !strategyError && !roundsError && !baseRuleError && !profitGuardError
-    && !horizonError;
+    && !horizonError && !directionError;
   const ready =
     mode === "live"
       ? baseValid && !membersError && !wakeError && acknowledged
@@ -608,7 +640,6 @@ export default function AiTradeLaunchModal({
   // 建议的探针更坏）。故按钮照旧可点，拦在提交路径上并同屏给出该做什么——若只把勾选态存进 state
   // 而没有任何读点，那一行二次确认就纯粹是装饰，一次点击照样能在几乎开不出单的周期上起会话。
   const tradabilityBlocked = tradabilityNeedsConfirm && !tradabilityConfirmed;
-
   const handleConfirm = () => {
     if (!ready || submitting || tradabilityBlocked) return;
     const base = {
@@ -628,6 +659,9 @@ export default function AiTradeLaunchModal({
       // 交易纪律预设（同一服务端解析点 `_resolve_discipline`，实盘与回测两侧同源，R-3）。
       // **只下发 preset，不下发任何阈值**：阈值的唯一真源是后端那张冻结表。
       discipline: { preset: disciplinePreset },
+      // 方向对称性：整键**恒下发**——`{contrarianEnabled:false}` 是「用户亲手取消了勾选」，与
+      // 「整键缺省 ⇒ 服务端默认开启」严格区分。三个数值留空即 `null` ⇒ 服务端回填默认。
+      direction: directionPayload,
       contextRefreshRounds: roundsValue,
       bar,                                          // 可编辑周期真正生效（不再被 store.bar 覆盖）
     };
@@ -1190,6 +1224,25 @@ export default function AiTradeLaunchModal({
           table={disciplineQ.data ?? null}
         />
 
+        {/* 方向对称 · 逆势通路（directional-symmetry D-5）：紧接「交易纪律预设」——那张阈值表里
+            的「同向共识门槛」正是本块要放开的那一道闸，两块不相邻就读不懂。**实盘与回测两段都
+            渲染**：两侧走同一个 `_resolve_direction`，只在一边露出就会让用户拿回测调出来的配置
+            在实盘失真（base_rules P1-4 的成文教训）。 */}
+        <AiTradeDirectionFields
+          value={directionPayload}
+          onChange={(next) => setDirectionEnabled(next.contrarianEnabled)}
+          confidenceRaw={directionConfidenceRaw}
+          quotaRaw={directionQuotaRaw}
+          sizeMultRaw={directionSizeMultRaw}
+          onRawChange={(key, raw) => {
+            if (key === "confidence") setDirectionConfidenceRaw(raw);
+            else if (key === "quota") setDirectionQuotaRaw(raw);
+            else setDirectionSizeMultRaw(raw);
+          }}
+          disabled={submitting}
+          error={directionError}
+        />
+
         {/* 可交易性预检（tradability-and-open-funnel 轴 A）：挂在「交易纪律」正下方——它算的正是
             「这组纪律阈值在这个周期上会拦掉多少」，两块必须相邻才读得懂。只提示、不阻断。 */}
         <AiTradeTradabilityFields
@@ -1396,6 +1449,15 @@ function seedHorizonCustom(rule: AiTradeHorizonRule | undefined) {
     targetMinHoursRaw: secondsToHoursRaw(rule?.targetHoldMinSeconds),
     targetMaxHoursRaw: secondsToHoursRaw(rule?.targetHoldMaxSeconds),
   };
+}
+
+function rawToNumber(raw: string): number | null {
+  // 留空 ⇒ `null` ⇒ 整字段不发 ⇒ **服务端回填默认**（前端不存任何默认数值，唯一真源在 config.py）。
+  // 非数字串同样回 `null`：输入中途的半截串不该被当成一个真值提交，也不该拦住启动。
+  const text = raw.trim();
+  if (!text) return null;
+  const n = Number(text);
+  return Number.isFinite(n) ? n : null;
 }
 
 function numToRaw(value: number | null | undefined): string {

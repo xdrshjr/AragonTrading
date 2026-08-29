@@ -34,14 +34,24 @@ class SystemPromptTexts:
     tactical_bars_text: str = ""
     cost_text: str = ""
     horizon_text: str = ""
+    # 方向对称条款（ai-trade-directional-symmetry C-2）：第六段宪章。空 ⇒ 两条脊柱**逐字节回退**
+    # 到本特性合入前。它必须是 `SystemPromptTexts` 上的一个字段而不是 `charter()` 里的硬编码
+    # ——中文脊柱 `_render_spine_zh` 另有一份内联的同款拼接、根本不调 `charter()`，只改一处
+    # 条款就只出现在一条语言路径上（评审 P1-4）。
+    direction_text: str = ""
     # 本特性新增：审议协议 + 输出预算纪律（空 ⇒ 走中文脊柱，逐字节回退）。
     reasoning_text: str = ""
 
     def charter(self) -> str:
-        """五段宪章拼接（顺序与今日**完全一致**：在哪开 → 何时锁 → 下多大注 → 付多少 → 持多久）。"""
+        """宪章拼接（顺序与今日**完全一致**：在哪开 → 何时锁 → 下多大注 → 付多少 → 持多久
+        → **往哪边开**）。
+
+        末位第六段是方向对称条款（directional-symmetry C-2）；未装配 ⇒ 空串 ⇒ 拼接结果与本
+        特性合入前逐字节相同。
+        """
         return "".join(f"{text}\n\n" for text in
                        (self.base_rules_text, self.profit_guard_text, self.sizing_text,
-                        self.cost_text, self.horizon_text) if text)
+                        self.cost_text, self.horizon_text, self.direction_text) if text)
 
 
 @dataclass(frozen=True)
@@ -101,6 +111,25 @@ def _action_discipline_en(allow_limit: bool, band_text: str = "2%") -> str:
             "for; anything urgent (stop protection) must be market. ")
 
 
+def _direction_discipline_en(armed: bool) -> str:
+    """决策纪律 #3 之后的方向对称子句（directional-symmetry C-2 的英文半边）；未装配 ⇒ 空串。
+
+    刻意**不重新编号**后面的第 4/5 条：编号是稳定契约（S9 要求模型逐条复述，冻结断言
+    也按编号对拍），插进去一条新编号会让「第 4 条」在两个版本里指不同的东西。故本段作为第 3
+    条的续写紧随其后，不占编号。
+    """
+    if not armed:
+        return ""
+    # 折行宽度与本模块其余各条纪律一致（渲染后 ~75 列）：脊柱是一整块等宽正文，混进一条
+    # 140 列的长行，模型读到的段落结构就与其它条目不同。
+    return ("   Direction is symmetric: `open_short` is a first-class action carrying\n"
+            "   exactly the same sizing, cost, stop and gate standards as `open_long`.\n"
+            "   In an uptrend, long is not the default answer - it is merely the answer\n"
+            "   the present evidence supports more strongly; the same holds for short in\n"
+            "   a downtrend. Put both directions on the table in S10 and say in S12 why\n"
+            "   you took this one and dropped the other.\n")
+
+
 def render_spine_en(inst_id: str, bar: str, budget_usd: float, leverage: float, *,
                     texts: SystemPromptTexts, position_step_pct: float = 0.0,
                     allow_limit: bool = False, band_text: str = "2%") -> str:
@@ -152,6 +181,7 @@ def render_spine_en(inst_id: str, bar: str, budget_usd: float, leverage: float, 
         "   agrees and the deliberation is complete, and "
         f"{_size_discipline_en(position_step_pct, bool(texts.sizing_text))};\n"
         "   avoid churn and over-trading.\n"
+        f"{_direction_discipline_en(bool(texts.direction_text))}"
         f"4. {_action_discipline_en(allow_limit, band_text)}The guarded executor places the real\n"
         "   order and inherits every capital guardrail; you only supply the decision and the\n"
         "   reasoning.\n"

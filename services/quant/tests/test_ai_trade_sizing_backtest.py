@@ -251,7 +251,9 @@ def test_backtest_same_insertion_order():
     bt = inspect.getsource(backtest_module.AiBacktestRunner._run_decision)
     live = inspect.getsource(session_module.AiTradeSession._run_decision_round)
     assert _order(bt, {"cooldown": "apply_profit_cooldown(", "brake": "_sizing.gate(",
-                       "consensus": "apply_consensus_gate(", "edge": "evaluate_edge_gate(",
+                       # directional-symmetry 轴 A：回测侧改调 `resolve_consensus_gate`
+                       # （与实盘**同一个纯核心**）；插入位置一个字没动。
+                       "consensus": "resolve_consensus_gate(", "edge": "evaluate_edge_gate(",
                        "reflect": "apply_reflection(", "sizing": "_sizing.resolve(",
                        "execute": "self._execute("}) == [
         "cooldown", "brake", "consensus", "edge", "reflect", "sizing", "execute"]

@@ -77,6 +77,37 @@ describe("applyAiTradeTracePhase", () => {
     expect(t[0].toolCallPending).toBe(false);
   });
 
+  // ---- 「提议 X → 被 Y 拦下」的四个兄弟键（directional-symmetry B-3）----
+  // `emptyRoundTrace` 与 `reduceRoundPhase` 的 `case "tool_call"` 是**两处逐键手抄**点：
+  // 漏抄任一处的表现是「后端发了、前端收不到、跑不出错」。
+  it("tool_call 归约必须收得到 layerLabel（漏抄即静默丢数据）", () => {
+    let t = applyAiTradeTracePhase([], ev("round_start", 1));
+    expect(t[0].layerLabel).toBeNull();      // 初始化也必须有这个键
+    t = applyAiTradeTracePhase(
+      t,
+      ev("tool_call", 1, {
+        input: { action: "hold", reason: "观望" },
+        proposedAction: "open_short",
+        proposedReason: "净立场偏多但结构已破",
+        vetoedBy: "consensus",
+        layerLabel: "同向共识门槛",
+      }),
+    );
+    expect(t[0].proposedAction).toBe("open_short");
+    expect(t[0].vetoedBy).toBe("consensus");
+    expect(t[0].layerLabel).toBe("同向共识门槛");
+  });
+
+  it("老快照（无 layerLabel）⇒ 该键为 null，其余三键逐字回退", () => {
+    let t = applyAiTradeTracePhase([], ev("round_start", 1));
+    t = applyAiTradeTracePhase(
+      t,
+      ev("tool_call", 1, { input: { action: "hold", reason: "观望" }, proposedAction: "close", vetoedBy: "horizon" }),
+    );
+    expect(t[0].layerLabel).toBeNull();
+    expect(t[0].vetoedBy).toBe("horizon");
+  });
+
   it("result 写 executed/degrade 并据 skipped 派生 state", () => {
     let t = applyAiTradeTracePhase([], ev("round_start", 1));
     t = applyAiTradeTracePhase(

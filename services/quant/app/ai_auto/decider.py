@@ -42,6 +42,7 @@ from .prompts import (
     REFLECTION_TOOL_DESCRIPTION,
     REFLECTION_TOOL_NAME,
     REFLECTION_TOOL_SCHEMA,
+    ContrarianSchemaOptions,
     build_decision_prompt,
     build_decision_tool_description,
     build_decision_tool_schema,
@@ -83,6 +84,8 @@ _ANALYSIS_MAX_CHARS = 20000
 _SUMMARY_MAX_CHARS = 3000
 # 中文证据摘要的落痕上限（与工具 schema 的 `maxLength: 400` 同数；schema 是软引导、本常量是硬约束）。
 _EVIDENCE_DIGEST_MAX_CHARS = 400
+# 逆势证据串的截断上限（与 schema 的 `maxLength` 同源，见 `prompts` 的同名常量）。
+_CONTRARIAN_EVIDENCE_MAX_CHARS = 600
 # 离场证据的落痕上限（与工具 schema 的 `maxLength: 300` 同数；schema 是软引导、本常量是硬约束）。
 _EXIT_EVIDENCE_MAX_CHARS = 300
 
@@ -207,6 +210,16 @@ class TradeDecision:
     # 构造与解包零改动。**纯呈现物**——缺席 / 非字符串 / 超长 / 写成英文四种情形一律不产生
     # degrade、不改任何交易语义（用例 D-11 / D-12）。
     evidence_digest: str | None = None
+    # 逆势开仓的证据（directional-symmetry A-3）：仅 `open_long` / `open_short` 携带的合法值有
+    # 意义。同款末位带默认值 ⇒ 既有全部位置构造与元组解包零改动。
+    #
+    # ⚠️ **刻意不复用 `evidence_digest`**：那个字段上面白纸黑字冻结着「纯呈现物、四种情形一律
+    # 不产生 degrade、不改任何交易语义」，把它变成承重字段是一次静默的契约破坏。本字段镜像
+    # `exit_evidence` 的既有先例另开一个专用字段。
+    #
+    # 值域外 / 类型错**一律忽略、绝不据它降级**（沿用 `orderType` 的 F-2 先例）：它的缺席只会
+    # 让逆势通路不可用，而那本就是旧行为。
+    contrarian_evidence: str | None = None
 
 
 def _add_tokens(prev, current):
@@ -270,6 +283,7 @@ class AiTradeDecider:
                  reflection_llm: LLMClient | None = None,
                  summary_llm: LLMClient | None = None,
                  allow_reasoning_digest: bool = False,
+                 contrarian_schema: ContrarianSchemaOptions | None = None,
                  depth_profile: DepthProfile | None = None):
         self._llm = llm
         # 三份预算（deep-reasoning-chain §3.3.1）：默认 `None` ⇒ 三者同为 `llm` ⇒ 现有全部直接
@@ -298,6 +312,11 @@ class AiTradeDecider:
         # 中文证据摘要总闸（默认 **False**，镜像上面三个总闸）：默认 False 是硬约束——它让
         # `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA` 恒等断言原样通过（G-2）。
         self.allow_reasoning_digest = bool(allow_reasoning_digest)
+        # 逆势证据总闸（默认 **None**，镜像上面四个总闸）：默认缺席是硬约束——它让
+        # `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA` 恒等断言原样通过。
+        # 生产装配点从会话的 `ConsensusRule` 派生（manager / backtest 各自决定）。
+        self._contrarian_schema = contrarian_schema
+        self.allow_contrarian_evidence = contrarian_schema is not None
         # 下单前二次反思总闸（默认关；直接构造该决策器的既有测试/回测 → reflect 无副作用直通、逐字零回归。
         # 生产装配 manager/backtest_manager 从 req.settings.ai_trade_reflection_enabled 显式打开，§2.3）。
         self.reflection_enabled = bool(reflection_enabled)
@@ -318,7 +337,8 @@ class AiTradeDecider:
                 limit_band_pct=band_pct,
                 allow_hold_exit=self.allow_hold_exit,
                 allow_exit_priority=self.allow_exit_priority,
-                allow_reasoning_digest=self.allow_reasoning_digest))
+                allow_reasoning_digest=self.allow_reasoning_digest,
+                contrarian=self._contrarian_schema))
         # 反思唯一放行工具（镜像决策工具的「唯一放行」范式，安全由回落兜底，§2.2）。
         self._reflection_tool = ToolSchema(name=REFLECTION_TOOL_NAME,
                                            description=REFLECTION_TOOL_DESCRIPTION,
@@ -752,8 +772,15 @@ class AiTradeDecider:
             # missing_size）；step=0 时逐字等价旧行为（连续直通）。
             from .signals import quantize_size_fraction
             size = quantize_size_fraction(size, self._position_step)
+            # directional-symmetry A-3：`contrarianEvidence` **只在开仓分支解析**（与 `holdExitPx`
+            # 只在 hold 分支、`exitConviction` 只在 close 分支解析的成文纪律逐字同构）——本方法
+            # 没有字面 `action == "open_*"` 分支，不显式限定作用域，残留值会泄漏到别的动作上。
+            # 落点必须是这条**提前 return**：开仓走的是它，不是文件末尾那条六位置参的 return，
+            # 改错行的表现是字段恒为 None 且不报任何错。
             return (TradeDecision(action, size, confidence, reason, ord_type, limit_px,
-                                  evidence_digest=digest), None)
+                                  evidence_digest=digest,
+                                  contrarian_evidence=self._resolve_contrarian_evidence(raw)),
+                    None)
         # exit-priority §6.1【R:P1-9b】：**只改这一条返回**。`open_long`/`open_short` 走的是上面
         # 那条 6 位置参的提前 return（连 hold_exit_px 都不带），按 X-1b 反手一律不进本层（先降级
         # 为 close 再判）——去动它会把一个开仓决策变成潜在的解闸入口，直接违反 X-1。
@@ -775,6 +802,18 @@ class AiTradeDecider:
         if not self.allow_reasoning_digest:
             return None
         text = str(raw.get("evidenceDigest") or "").strip()[:_EVIDENCE_DIGEST_MAX_CHARS]
+        return text or None
+
+    def _resolve_contrarian_evidence(self, raw: dict) -> str | None:
+        """解析逆势开仓证据（总闸关 / 缺席 / 非字符串 ⇒ `None`；超长按上限截断）。
+
+        **绝不降级**（沿用 `orderType` 的 F-2 先例）：一个读不懂的证据串只会让逆势通路不可用，
+        而那正是本特性合入前的行为。字数是否达标由**纯核心** `signals._contrarian_block` 判定
+        并产出 `low_consensus_evidence` 码——判据只有一处，本方法不复制它。
+        """
+        if not self.allow_contrarian_evidence:
+            return None
+        text = str(raw.get("contrarianEvidence") or "").strip()[:_CONTRARIAN_EVIDENCE_MAX_CHARS]
         return text or None
 
     def _resolve_exit_intent(self, raw: dict,
@@ -864,7 +903,11 @@ class AiTradeDecider:
         """
         # holding-horizon §2.9 c：持仓周期补充段随本轮 payload 现取（payload 就在手上，零额外管线）；
         # 契约未装配 ⇒ 键缺席 ⇒ `""` ⇒ 反思系统 prompt 逐字节回退（G-1 的 sha256 冻结门禁据此成立）。
-        reasoning_text = "" if self._depth is None else build_review_protocol(self._depth)
+        # directional-symmetry C-3：R7 追加「对做空提议适用与做多**完全相同**的证据标准」。
+        # 复核官「只能收紧、不能改方向」的既有安全语义一个字节都不改；总闸关 ⇒ 逐字节回退。
+        reasoning_text = ("" if self._depth is None else build_review_protocol(
+            self._depth,
+            symmetry=self.settings.ai_trade_directional_symmetry_enabled))
         system = build_reflection_system_prompt(
             format_reflection_note(payload.get("tradingHorizon")), reasoning_text)
         user_msg = LlmMessage("user", [TextBlock(build_reflection_prompt(payload, decision))])

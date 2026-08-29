@@ -30,12 +30,15 @@ function toneSoft(tone: AiTraceTone): string {
 }
 
 /**
- * 决策工具卡片的「提议 → 被拦」保真行（F-6）。
+ * 决策工具卡片的「提议 → 被拦」保真行（F-6 + directional-symmetry B-3）。
  *
  * 未被拦（`proposedAction` 为空）⇒ `null` ⇒ 卡片逐字节回退到本特性合入前的样子（老快照零影响）。
+ * 作用域已覆盖八道确定性门禁：合入前这句话只有持仓周期层说得出，其余七层是空白。
  */
 export function ProposedVetoRow({ trace }: { trace: AiTradeRoundTrace }) {
-  const text = describeVetoedProposal(trace.proposedAction, trace.vetoedBy);
+  // directional-symmetry B-3：中文层名由后端下发（`layerLabel`），老快照缺它时回落到既有的
+  // `horizon` 映射——**绝不**回落到 `vetoedBy` 本身（那会显示英文 key）。
+  const text = describeVetoedProposal(trace.proposedAction, trace.vetoedBy, trace.layerLabel);
   if (!text) return null;
   return (
     <div

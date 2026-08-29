@@ -566,6 +566,38 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
     prefix: "content_filtered",
     label: "模型侧内容安全拦截，本轮观望（重试同一份输入只会再被拦一次，故不重试）",
   },
+  // 同向共识门槛六码（ai-trade-directional-symmetry 轴 A）。合入前本表**没有任何**
+  // `low_consensus` 条目，而该门槛在生产回归窗口拦下了 54% 的开仓意愿——那些轮的降级码是以
+  // 原始英文出现在决策卡与成交行上的。
+  //
+  // ⚠️ **顺序敏感**（`describeDegradeReason` 用 `find(startsWith)`）：五个细分码必须排在裸
+  // `low_consensus` **之前**，与后端 `open_funnel._DEGRADE_PREFIXES` 里 `horizon_turnover_*`
+  // 排在裸 `horizon_` 之前的成文纪律逐字同构。调换顺序不会报错，只会让细分码全部退化成裸码
+  // 的文案——用户再也分不出「差几票」与「证据没写够」。
+  {
+    prefix: "low_consensus_opposed",
+    label: "同向共识不足，且信号板反向票数过多，本轮不开放逆势通路",
+  },
+  {
+    prefix: "low_consensus_quota",
+    label: "同向共识不足，本会话的逆势试探名额已用尽（重启会话即刷新）",
+  },
+  {
+    prefix: "low_consensus_conf",
+    label: "同向共识不足，模型自报置信度未达逆势通路门槛",
+  },
+  {
+    prefix: "low_consensus_evidence",
+    label: "同向共识不足，模型未写足逆势开仓所需的证据说明",
+  },
+  {
+    prefix: "low_consensus_size",
+    label: "同向共识不足，逆势通路的强制降档后仓位已不足最小档位",
+  },
+  {
+    prefix: "low_consensus",
+    label: "同向策略票数不足门槛，本轮不开新仓（平仓不受影响）",
+  },
 ];
 
 /** 研判深度档的默认值（与后端 `AI_TRADE_REASONING_DEPTH` 的默认档一致）。 */
@@ -620,6 +652,35 @@ export function describeDegradeReason(reason?: string | null): string {
   if (!hit) return reason;
   const suffix = reason.slice(hit.prefix.length);
   return suffix ? `${hit.label}${suffix}` : hit.label;
+}
+
+/**
+ * 校验方向对称性入参（ai-trade-directional-symmetry §7.1）：区间与后端 `AiTradeDirectionIn` 的
+ * `Field` 边界**逐字一致**（前端即时报错，后端越界 422），返回错误文案或 `null`。
+ *
+ * 三个值一律**留空即用服务端默认**——前端不存任何默认数值（唯一真源在 `config.py`）。
+ * `contrarianEnabled=false` 时其余输入被忽略、一律合法：关闭态的残留值不该阻塞提交。
+ */
+export function validateDirectionRule(rule: {
+  contrarianEnabled: boolean;
+  contrarianMinConfidence?: number | null;
+  contrarianMaxPerSession?: number | null;
+  contrarianSizeMult?: number | null;
+}): string | null {
+  if (!rule.contrarianEnabled) return null;
+  const conf = rule.contrarianMinConfidence;
+  if (conf != null && (!Number.isFinite(conf) || conf <= 0 || conf > 1)) {
+    return "逆势置信度下界需为 0~1（不含 0）";
+  }
+  const quota = rule.contrarianMaxPerSession;
+  if (quota != null && (!Number.isInteger(quota) || quota < 0 || quota > 50)) {
+    return "逆势会话配额需为 0~50 的整数";
+  }
+  const mult = rule.contrarianSizeMult;
+  if (mult != null && (!Number.isFinite(mult) || mult <= 0 || mult > 1)) {
+    return "逆势降档系数需为 0~1（不含 0）";
+  }
+  return null;
 }
 
 /**

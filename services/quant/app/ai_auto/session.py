@@ -64,8 +64,9 @@ from .experience import ExperienceRuntime
 from . import feed_watchdog
 from .feed_runtime import FeedRuntime
 from .hold_horizon import HorizonFacts, HorizonRule, gate_status as horizon_gate_status
+from .gate_veto import build_gate_veto_note, veto_layer, veto_layer_label
 from .horizon_acceptance import ai_stats_keys, build_bundle
-from .horizon_runtime import HorizonRuntime, build_gate_veto_note, build_horizon_facts
+from .horizon_runtime import HorizonRuntime, build_horizon_facts
 from . import lifecycle as lifecycle_core
 from .market_context import build_market_context
 from .market_digest import build_market_digest
@@ -93,11 +94,13 @@ from .signal_preview import PreviewRequest, PreviewRunner
 from .signals import (
     Consensus,
     StrategySignalView,
-    apply_consensus_gate,
     compute_consensus,
+    consensus_rule_from_settings,
+    contrarian_payload,
     decision_to_signals,
     evaluate_signal_board,
     make_shadow_broker,
+    resolve_consensus_gate,
 )
 from .sizing_runtime import SizingRuntime
 from .track_record import TrackRecordRuntime
@@ -289,6 +292,14 @@ class AiTradeSession:
                                          self._cost.attribution.settled_trips)
         # 生效纪律自检（discipline-preset §3.2）：同款下沉门面，须排在上面各运行时之后（它持它们的引用）。
         self._discipline = DisciplineRuntime(self, preset_id=discipline_preset)
+        # 共识门禁的会话级配置（directional-symmetry 轴 A）。取 `executor.settings` 是**刻意**的：
+        # 它就是 `_resolve_discipline` 产出的那份派生副本（`manager._build_executor` 用 `req.settings`
+        # 构造 executor），也正是 `_apply_consensus_gate` 今天现读的那一个对象。
+        # `_contrarian_used` **不落库、冷续跑归零**：配额的语义是「一个会话内的逆势试探次数」，
+        # 而冷续跑本就是新会话；落库反而要多维护一份可能漂移的状态（A-4 / RK-10）。
+        # 本会话已用 N/M 经 `status.discipline.contrarian` 下发，使「重启刷配额」可见（[P2-4]）。
+        self._consensus_rule = consensus_rule_from_settings(executor.settings)
+        self._contrarian_used = 0
         # 交易经验上下文图（ai-trade-experience-context-graph §4.10 · W-6）：同款「运行时对象 +
         # inject(payload)」下沉范式。**两个形参都带默认值** ⇒ 既有构造点逐字节零回归：未装配
         # （空对象模式）⇒ payload 无 `experience` 键 ⇒ `build_decision_prompt` 输出与本特性合入前
@@ -452,7 +463,9 @@ class AiTradeSession:
                     self._sizing.note_close(trade, now_wall=time.time())   # 连亏计数同挂唯一收口
                     self._horizon.note_close(trade, time.time())   # 真实持仓时长样本同挂唯一收口
                 else:   # 开仓成交：锁定 epoch 的 opened_wall（部分成交同一 epoch ⇒ 内部幂等不重置）
-                    self._discipline.funnel.note_filled()   # 轴 C：漏斗末格（事件级口径）
+                    # 轴 C：漏斗末格（事件级口径）。方向取**成交腿自己的 side**——本记点排在
+                    # `note_executed` 之后，轮级 `_intent_side` 早已被清（directional-symmetry P0-1）。
+                    self._discipline.funnel.note_filled(str(trade.get("side") or ""))
                     self._horizon.note_open(trade, time.time(), seq=self._position_seq)
                     self._repair.note_epoch(self._position_seq)   # 新持仓周期 ⇒ 补挂配额清零
                     self._backstop.force_next()   # 随单 OCO 是否真的挂上，是开仓后最该立刻知道的事
@@ -1568,12 +1581,21 @@ class AiTradeSession:
                                         now_wall=time.time())
             consensus = compute_consensus(board)                 # E2：每轮只算一次（供门禁 + wire）
             payload["consensus"] = self._consensus_wire(consensus)
+            # A-5：逆势通路的四个阈值 + 剩余名额。通路不可用 / 总闸关 ⇒ **整键缺席** ⇒ prompt
+            # 逐字节回退。没有它，逆势通路就是一个「有写点没读点」的功能——模型既不知道存在这条
+            # 门槛，也不知道要写 `contrarianEvidence` 才能走。
+            contrarian = contrarian_payload(self._consensus_rule, self._contrarian_used)
+            if contrarian is not None:
+                payload["consensus"]["contrarian"] = contrarian
             await self._begin_round_trace(round_no, ts, ref_px, payload, board)  # RV-7：consensus 之后
             decide_started = time.monotonic()          # 单调钟：墙钟耗时不受系统时钟跳变影响
             decision, degrade = await self.decider.decide(
                 payload, emit=self._make_trace_emit(round_no, ts))
             self._reasoning_elapsed_ms = (time.monotonic() - decide_started) * 1000.0
             llm_degrade = degrade                      # 轴 D：门禁改写之前的**模型侧**降级码
+            # directional-symmetry B-2 留存点：**任何门禁之前**的决策引用。它是 `gateVeto` 里
+            # `proposedAction` 的唯一来源，而那个字段带着方向（`open_short`）正是本轴的全部价值。
+            stage1_decision = decision
             # N2（hold-inertia-observability）：以第一阶段原始输出立即更新连续观望计数——须在共识门禁
             # 与反思之前（此时的 decision/degrade 正是第一阶段输出，惯性以模型真实意愿为准）。
             self._update_hold_streak(decision.action, degrade)
@@ -1597,9 +1619,10 @@ class AiTradeSession:
             self._resolve_exit_priority(decision)
             decision, degrade = await self._apply_base_rule_gate(
                 round_no, ts, payload, decision, degrade)
-            # F-2 留存点（【R:P2-7】）：取**进入 `_apply_horizon_gate` 那一刻**的引用——该函数返回
-            # 时 decision 已被 `_veto` 换成一个新建的 hold 对象，调用点再也拿不回原来的 close。
-            gate_entry = decision
+            # F-2 的留存点（【R:P2-7】）已并入上面的 `stage1_decision`（directional-symmetry
+            # B-2）：注记与 `tool_call` 相位都改吃它。基础策略层放行时返回**同一个对象**、被它
+            # 拦下时 degrade 是 `base_rule_*`（此后 horizon 不会再拦一次），故 horizon 否决轮的
+            # `proposedAction` / `proposedReason` 与合入前逐字相同。
             # ★ 持仓周期铁律门禁（holding-horizon §2.5）：基础策略**之后**、冷却**之前**。
             decision, degrade, pending = await self._apply_horizon_gate(
                 round_no, ts, decision, degrade)
@@ -1621,6 +1644,12 @@ class AiTradeSession:
             # F2（hold-inertia-fix）：第三元 reflection_note 保真「提议了什么、为何被否决」。
             decision, degrade, reflection_note = await self._reflect_before_execute(
                 round_no, ts, payload, decision, degrade, pending=pending)
+            # directional-symmetry B-2 第二个留存点：**执行之前**的 degrade。往下一行 `degrade`
+            # 就会被 `degrade or executed.get("closeBlocked")` 污染，而 `exit_order_slot_busy`
+            # 不在任何前缀里、会经 `classify_block` 落进 `"other"` ⇒ 模型读到一条凭空捏造的
+            # 「我被『其它』层拦下了」。**判据不依赖任何对象身份**：`_apply_sizing` 本就 replace
+            # 出新对象，`decision is not stage1_decision` 在任何开仓轮恒为真、什么都筛不出来。
+            gate_degrade = degrade
             decision = await self._apply_sizing(round_no, ts, ref_px, decision)   # ★ 第 11 步
             # ★ 档位定型（X-9）：计数 + 退出归因打标槽，**必须在真实执行之前**——打标由
             # `_inject_explain_meta` 在 `_dispatch` 的成交事件上消费。
@@ -1642,10 +1671,13 @@ class AiTradeSession:
             summary = await self.decider.commit_round(
                 payload, decision, executed, analysis=excerpt, reflection=reflection_note,
                 # F-2：门禁否决轮也要留注记，否则模型下一轮读到的自己的历史是「上轮我决定观望」。
-                gate_veto=build_gate_veto_note(gate_entry, self._horizon.last_reason,
-                                               self._exit_priority),
+                # directional-symmetry 轴 B：注记泛化到**八道**确定性门禁（合入前只有持仓周期
+                # 层会写回来，其余七道对模型完全静默 ⇒ 模型读到的自己的历史是「上轮我决定观望」）。
+                gate_veto=self._gate_veto_note(stage1_decision, gate_degrade, llm_degrade),
                 defer_summary=True)
-            await self._emit_tool_call_trace(round_no, ts, decision, gate_entry)
+            await self._emit_tool_call_trace(round_no, ts, decision, stage1_decision,
+                                             gate_degrade=gate_degrade,
+                                             llm_degrade=llm_degrade)
             # 轴 D：`note_round` 必须排在 `_emit_result_trace` **之前**——反思已经跑完，
             # `last_reasoning` 里的 reflectionChars/Stages 此刻才是完整的那一份。
             self._reasoning.note_round(self.decider.last_reasoning,
@@ -1955,8 +1987,44 @@ class AiTradeSession:
         trace["retries"] = int(trace.get("retries", 0)) + 1
         trace["lastRetryReason"] = part.get("reason")
 
+    def _gate_veto_note(self, proposed: TradeDecision, gate_degrade: str | None,
+                        llm_degrade: str | None) -> dict | None:
+        """本轮门禁否决的记忆注记（轴 B）；未被任何确定性门禁改写 ⇒ `None`。
+
+        总闸开 ⇒ 覆盖八道确定性门禁，并附中文 `layerLabel` 与共识层的票数快照。
+        总闸关 ⇒ **逐字节回退**：只喂持仓周期层的 `last_reason`、不传 `llm_degrade`、
+        不带共识快照、不加第五键 —— 产物与 `horizon_runtime.build_gate_veto_note` 合入前相同。
+        """
+        if not self.executor.settings.ai_trade_directional_symmetry_enabled:
+            return build_gate_veto_note(proposed, self._horizon.last_reason,
+                                        priority=self._exit_priority)
+        return build_gate_veto_note(
+            proposed, gate_degrade, llm_degrade=llm_degrade, priority=self._exit_priority,
+            consensus_wire=(self._round_trace or {}).get("consensusGate"), layer_label=True)
+
+    def _trace_veto_layer(self, decision: TradeDecision, proposed: TradeDecision | None,
+                          gate_degrade: str | None, llm_degrade: str | None) -> str | None:
+        """`tool_call` 相位的 `vetoedBy`：本轮的否决归属哪一层；未被拦 ⇒ `None`（B-3）。
+
+        总闸开 ⇒ 与 `gate_veto.build_gate_veto_note` **共用同一个判定函数、同一组入参**，
+        作用域覆盖八道确定性门禁；判据取 `gate_degrade` 而不是 `proposed.action != decision.action`
+        ——后者会被 `_apply_sizing` 的 replace 弄失真（那一步本就产出新对象）。
+        `llm_degrade` **必须一并传**：少传它，`low_confidence` 这类第一阶段模型侧的码会被
+        `classify_block` 归成一次门禁否决，卡片上就会出现一条凭空捏造的「模型提议的是『观望』，
+        被『置信度门槛』降级」——而注记侧对同一轮返回的是 `None`，两处当场分叉。
+        总闸关 ⇒ **逐字节回退**到合入前的形态：作用域钉死在持仓周期层，判据也是那一条。
+        """
+        if proposed is None:
+            return None
+        if not self.executor.settings.ai_trade_directional_symmetry_enabled:
+            return ("horizon" if (proposed.action != decision.action
+                                  and self._horizon.last_reason is not None) else None)
+        return veto_layer(gate_degrade, llm_degrade=llm_degrade)
+
     async def _emit_tool_call_trace(self, round_no: int, ts: int, decision: TradeDecision,
-                                    proposed: TradeDecision | None = None) -> None:
+                                    proposed: TradeDecision | None = None, *,
+                                    gate_degrade: str | None = None,
+                                    llm_degrade: str | None = None) -> None:
         """tool_call：门禁后最终决策工具入参（与真实执行一致，降级则如实呈现 hold）。
 
         F-6：三个**加法键**保真「模型提议了什么、被谁拦下」。原来的卡片只显示「决策工具 · 观望」
@@ -1964,6 +2032,11 @@ class AiTradeSession:
         线索是折叠在下面的一行降级码。三键作为 `trace_event` 的**兄弟键**下发，**不塞进 `input`**
         （`input` 的语义是「模型提交的工具入参」，掺进非入参的键会让卡片本身开始撒谎）。
         `proposed is None` / 未被拦 ⇒ 三键为 `None` ⇒ 前端逐字节回退（老快照零影响）。
+
+        directional-symmetry B-3：作用域由 `"horizon"` 泛化到**八道**确定性门禁，判定与
+        `gate_veto.py` **共用同一个函数**（`veto_layer`）——合入前这里硬编码着第二份层名，两处
+        不同源必漂移，而漂移的表现（界面显示一个不存在的层名）不报任何错。中文 `layerLabel`
+        随总闸作为第四个兄弟键下发；总闸关 ⇒ 该键缺席 ⇒ 前端逐字回退。
         """
         tool_input = {"action": decision.action, "sizeFraction": decision.size_fraction,
                       "confidence": decision.confidence, "reason": decision.reason,
@@ -1973,15 +2046,16 @@ class AiTradeSession:
         # 与未装配会话下 wire 逐字节回退（G-7 要求加法键在 off 档一并缺席）。
         if decision.evidence_digest:
             tool_input["evidenceDigest"] = decision.evidence_digest
-        # 作用域钉死在**本层**：`vetoedBy` 只会是 `"horizon"`，故判据也必须是「本层真的拦了」。
-        # 反思否决另有 `reflection_verdict` 相位承载，混进来会让卡片说「被交易周期层降级」而其实
-        # 不是——那是本轮要根除的同一种不诚实，只是换了个方向。
-        vetoed = (proposed is not None and proposed.action != decision.action
-                  and self._horizon.last_reason is not None)
+        layer = self._trace_veto_layer(decision, proposed, gate_degrade, llm_degrade)
+        vetoed = layer is not None
         extra = {"proposedAction": proposed.action if vetoed else None,
                  "proposedReason": (str(proposed.reason or "")[:_ANALYSIS_EXCERPT_CHARS]
                                     if vetoed else None),
-                 "vetoedBy": "horizon" if vetoed else None}
+                 "vetoedBy": layer}
+        if self.executor.settings.ai_trade_directional_symmetry_enabled:
+            # 中文层名**由后端下发**（`discipline._THRESHOLD_LABELS` 的成文纪律）：前端抄一份，
+            # 下次加一层就会把英文 key 怼到用户脸上。总闸关 ⇒ 整键缺席 ⇒ 前端逐字回退。
+            extra["layerLabel"] = veto_layer_label(layer)
         if self._round_trace is not None:
             self._round_trace["toolCall"] = tool_input
             self._round_trace["toolCallPending"] = False
@@ -2272,14 +2346,29 @@ class AiTradeSession:
 
     def _apply_consensus_gate(self, decision: TradeDecision, consensus: Consensus,
                               degrade: str | None) -> tuple[TradeDecision, str | None]:
-        """薄封装 `signals.apply_consensus_gate`（§2.8/R1）：传 `settings.ai_trade_min_consensus`。
+        """薄封装 `signals.resolve_consensus_gate`（§2.8/R1 + directional-symmetry 轴 A）。
 
         对外行为逐字不变——门禁降级则 `degradeReason` 归并为 `degrade or gate_reason`（保留决策器
-        先前的回落原因，如 timeout），否则透传原 `degrade`。共识门禁纯核心已上移至 `signals` 供回测共用。
+        先前的回落原因，如 timeout），否则透传原 `degrade`。共识门禁纯核心在 `signals` 供回测共用。
+
+        逆势通路放行时：会话配额 +1、漏斗的 `contrarianPassed` +1（**它不是降级、不进 `blocked`**）。
+        `position_step` 的真源是 `decider.position_step`（`session.py` 另有两处同款取法）——步长是
+        决策器的属性，把它拷进 `ConsensusRule` 就会出现「规则里的 step 与决策器的不是同一个」。
         """
-        decision, gate_reason = apply_consensus_gate(
-            decision, consensus, self.executor.settings.ai_trade_min_consensus)
-        return decision, (degrade or gate_reason)
+        out = resolve_consensus_gate(decision, consensus, self._consensus_rule,
+                                     position_step=self.decider.position_step,
+                                     used_contrarian=self._contrarian_used)
+        if out.contrarian_used:
+            self._contrarian_used += 1
+            self._discipline.funnel.note_contrarian()
+        # 总闸关 ⇒ 轨迹不带 `consensusGate` 键 ⇒ wire 形状逐字节回退（`gateVeto` 的共识快照同源）。
+        # 判据是**总闸 + 本层真的判过**（`exempt` = `min_consensus<=0` 或非开仓动作，本层没话说），
+        # 而不是逆势通路开没开：`steady` 档的通路默认关，但它的 `min_consensus=2` 恰恰是最需要把
+        # 「还差几票」写回注记的一档——按通路开关门控，那一档的模型永远不知道自己差在哪。
+        if (self._round_trace is not None and out.lane != "exempt"
+                and self.executor.settings.ai_trade_directional_symmetry_enabled):
+            self._round_trace["consensusGate"] = out.wire
+        return out.decision, (degrade or out.reason)
 
     async def _execute_decision(self, decision: TradeDecision, ref_px: float, i: int,
                                 ts: int) -> dict:
@@ -2831,9 +2920,38 @@ class AiTradeSession:
                 "flattenFailed": self.flatten_failed, "residual": self.residual}
 
     def discipline_wire(self) -> dict:
-        """生效纪律自检（轴 B）：13 行固定顺序 + [P1-9] 恒真自检提示；装配全在 `discipline_runtime`。"""
+        """生效纪律自检（轴 B）：13 行固定顺序 + [P1-9] 恒真自检提示；装配全在 `discipline_runtime`。
+
+        directional-symmetry [P2-4]：逆势配额**不落库、冷续跑归零**是一个有意的取舍，但
+        「本会话已用 N/M」必须让用户看得见——否则「重启刷配额」是一个既存在又不可见的行为。
+        通路未装配 / 总闸关 ⇒ 整键缺席 ⇒ 前端整段不渲染。
+        """
         rows = self._discipline.rows()
-        return {"rows": rows, "hint": self._discipline.hint(rows)}
+        wire = {"rows": rows, "hint": self._discipline.hint(rows)}
+        rule = self._consensus_rule
+        if rule.contrarian_enabled and rule.min_consensus > 0:
+            wire["contrarian"] = {
+                "used": self._contrarian_used,
+                "remaining": max(0, rule.contrarian_max_per_session - self._contrarian_used),
+                "maxPerSession": rule.contrarian_max_per_session}
+        return wire
+
+    def direction_wire(self) -> dict | None:
+        """方向对称性回执（directional-symmetry §7.1）；未装配 ⇒ `None` ⇒ 前端整段不渲染。
+
+        它是**服务端解析后的生效值**，不是入参回显——「我在弹窗里关掉的逆势通路到底有没有生效」
+        这个问题只能由生效值回答（`baseRules` / `tradingHorizon` 两处回执的成文姿态）。
+        """
+        rule = self._consensus_rule
+        if not rule.contrarian_enabled or rule.min_consensus <= 0:
+            return None
+        return {"contrarianEnabled": True,
+                "minConsensus": rule.min_consensus,
+                "contrarianMinConfidence": rule.contrarian_min_confidence,
+                "contrarianMaxOpposingVotes": rule.contrarian_max_opposing_votes,
+                "contrarianMinEvidenceChars": rule.contrarian_min_evidence_chars,
+                "contrarianMaxPerSession": rule.contrarian_max_per_session,
+                "contrarianSizeMult": rule.contrarian_size_mult}
 
     def acceptance_bundle(self) -> dict:
         """验收闭环四键（status / 落库 / 分组合并共用**同一次**装配，绝不两处各算一份）。"""

@@ -56,11 +56,17 @@ MIN_ITEM_BUDGET_L2 = 120
 # 却让 L2 永远渲染不出一个字——一个不报错的空转。
 FRAME_OVERHEAD = {"l0": 96, "l1": 40, "l2": 88}
 
+# ★ 轴 E-2（directional-symmetry）· 方向退化声明句是 **L0 页眉的一部分**，故它的长度必须计进
+# 框架开销——不计，`l0_max_chars` 落在旧下限附近的配置会**通过**启动期校验，却在经验库真的方向
+# 退化的那一天让整层一个字都渲染不出来（与 `v1:E-7` 逐字同形的不报错空转）。
+# 实算：`_side_degeneracy_note` 最长 50 字（两侧措辞等长），向上取整留 4 字裕量。
+SIDE_NOTE_OVERHEAD = 54
+
 _L0_FOOTER = "以上为统计结论，非指令；与当前证据冲突时以当前证据为准，并在研判中说明理由。"
 _REPEAT_LINE = "【交易经验】同上 {n} 条铁律（未变化）"
 
 
-def budget_floor(layer: str) -> int:
+def budget_floor(layer: str, *, side_note: bool = False) -> int:
     """某一层字符预算的**唯一**下限判据（三处共用：启动期校验 / `PUT /settings/experience` / L2）。
 
     ★ E-7（评审 P1-1）：`_check_experience_budgets` 只在 `Settings` 构造时跑，而
@@ -70,13 +76,16 @@ def budget_floor(layer: str) -> int:
 
     Args:
         layer: `"l0"` | `"l1"` | `"l2"`。
+        side_note: 方向对称性总闸（轴 E-2，keyword-only）。`True` 时 L0 的框架开销再加上方向
+            退化声明句。`False`（默认）⇒ 三层的下限**逐字回退**到本特性合入前。
 
     Returns:
         该层 `max_chars` 的最小合法值 = 框架句开销 + 单条上限；L0/L1 的单条上限含序号与换行
         （124），L2 无序号故为 120 ⇒ `budget_floor("l2") == 208`（★ E-6）。
     """
     item = MIN_ITEM_BUDGET_L2 if layer == "l2" else MIN_ITEM_BUDGET
-    return int(FRAME_OVERHEAD[layer]) + item
+    extra = SIDE_NOTE_OVERHEAD if (side_note and layer == "l0") else 0
+    return int(FRAME_OVERHEAD[layer]) + item + extra
 
 
 def experience_tier(result: RetrievalResult, prev_ids: tuple[str, ...] | None,
@@ -117,6 +126,10 @@ def build_wire(result: RetrievalResult, *, tier: str, totals: dict,
         "totals": dict(totals),
         "maxChars": dict(max_chars),
         "graphAsOfTs": int(graph_as_of_ts),
+        # 轴 E-2（directional-symmetry）：`side` 轴方向退化时有样本的那一侧；未退化 ⇒ `None`
+        # ⇒ L0 页眉逐字节回退。**这个事实必须随 wire 走**，因为 `commit_round` 会把 prompt 再
+        # 渲染一次塞进 `_context`，渲染函数现场重算会让两次渲染不同源。
+        "sideDegeneracy": result.side_degeneracy,
     }
 
 
@@ -141,13 +154,15 @@ def format_experience(wire: dict | None) -> str:
     if tier == TIER_REPEAT:
         return _REPEAT_LINE.format(n=len(l0)) if l0 else ""
     budgets = wire.get("maxChars") or {}
-    blocks = [format_l0(l0, wire.get("totals") or {}, int(budgets.get("l0") or 0))]
+    blocks = [format_l0(l0, wire.get("totals") or {}, int(budgets.get("l0") or 0),
+                        side_degeneracy=wire.get("sideDegeneracy"))]
     if tier == TIER_FULL:
         blocks.append(format_l1(wire.get("l1") or [], int(budgets.get("l1") or 0)))
     return "\n".join(block for block in blocks if block)
 
 
-def format_l0(items: list[dict], totals: dict, max_chars: int) -> str:
+def format_l0(items: list[dict], totals: dict, max_chars: int, *,
+              side_degeneracy: str | None = None) -> str:
     """L0 常驻纲要（≤3 条铁律 + 声明句）；装不下第一条 ⇒ **整段空串**。
 
     **页眉里的两个整数必须为真**（不变式 I-9）：它们来自 `SessionGraph.totals`，与
@@ -160,7 +175,23 @@ def format_l0(items: list[dict], totals: dict, max_chars: int) -> str:
     """
     header = (f"【交易经验 · 铁律】（来自 {int(totals.get('sessions') or 0)} 组有成交记录的自动交易的 "
               f"{int(totals.get('events') or 0)} 笔已结算往返）")
+    # 轴 E-2：页眉里追加退化声明，且**因为它进了 header，预算自动被 `_render` 先扣后装**——
+    # 另起一行拼在返回值上会绕过预算，把 L0 撑出 `l0_max_chars`。
+    header += _side_degeneracy_note(side_degeneracy)
     return _render(items, header=header, footer=_L0_FOOTER, max_chars=max_chars)
+
+
+def _side_degeneracy_note(side: str | None) -> str:
+    """经验库方向退化的如实声明（轴 E-2）；未退化 ⇒ 空串 ⇒ 页眉逐字节回退。
+
+    措辞的要点只有一条：**「没有样本」不是「更差」的证据**。不写这一句，模型读到清一色的做多
+    经验，会合理地把它当成「做空这边试过、不行」——而那正是那个吸收态的第三条腿。
+    """
+    if side not in ("long", "short"):
+        return ""
+    have, missing = ("做多", "做空") if side == "long" else ("做空", "做多")
+    return (f"；⚠ 经验库当前**只有{have}样本**，{missing}侧一条都没有——"
+            f"这是样本缺失，**不可**据此推断{missing}更差")
 
 
 def format_l1(items: list[dict], max_chars: int) -> str:

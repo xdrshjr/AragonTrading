@@ -143,3 +143,23 @@ def test_decision_to_signals_maps_pure_core_without_explain():
     assert shorts[0].side == "short" and abs(shorts[0].strength - 0.3) < 1e-9
     closes = decision_to_signals(TradeDecision("close", None, None, "exit"))
     assert closes[0].side == "close" and closes[0].reason == "exit"
+
+
+# ============ 单侧先验不再倾向（ai-trade-directional-symmetry 轴 E-1） ============
+def test_single_side_prior_no_longer_leans():
+    """一侧无证据时按中性 0.5 参与比较，是一个**自我强化的吸收态**的第一条腿。
+
+    不做空 ⇒ 无做空样本 ⇒ `p_short is None` ⇒ 只要 `p_long > 0.5` 净立场恒为 `long`
+    ⇒ 更不做空。`debias=True` 时改判 `flat`；总闸关（默认）时逐字回退。
+    """
+    from app.ai_auto.signals import _weighted_net_stance, net_stance_basis
+
+    assert _weighted_net_stance(0.55, None) == "long"                  # 逐字回退
+    assert _weighted_net_stance(0.55, None, debias=True) == "flat"     # 去偏后不再倾向
+    assert _weighted_net_stance(None, 0.55, debias=True) == "flat"     # 两个方向逐字同构
+    # 两侧都有证据时**行为完全不变**（去偏只管「没有证据」这一种情形）。
+    assert _weighted_net_stance(0.6, 0.4, debias=True) == "long"
+    assert _weighted_net_stance(0.4, 0.6, debias=True) == "short"
+    assert net_stance_basis(0.55, None) == "single_side"
+    assert net_stance_basis(None, None) == "none"
+    assert net_stance_basis(0.6, 0.4) == "both"

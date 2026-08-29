@@ -465,7 +465,10 @@ class ExperienceRuntime:
         """
         if not self.armed:
             return
-        result = retrieve(self.graph, seed, RetrievalConfig.from_settings(self.settings))
+        # 轴 E-2（directional-symmetry）：`side` 轴方向退化时整轴退出评分，并在 L0 页眉如实声明。
+        # 总闸关 ⇒ 打分与页眉逐字节回退。
+        result = retrieve(self.graph, seed, RetrievalConfig.from_settings(self.settings),
+                          direction_debias=self.settings.ai_trade_directional_symmetry_enabled)
         # 检索结果**无条件**留存：L2 的争议对在 `_suppress` 那一步就被踢出了 L0/L1，于是
         # 「本轮全部候选都是势均力敌的矛盾对」恰恰是 L0/L1 皆空的一种。早退时不留 `_last_result`
         # ⇒ 那些争议哪里都不会出现，而 §7.1 与执行轨迹上那两句「它们只会进入下单前的反思环节」

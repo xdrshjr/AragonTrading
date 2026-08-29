@@ -9,6 +9,8 @@
 // 3. 汇总只数「后端说 armed 的行」，绝不在前端重算 armed——那会造出第二份判据。
 
 import type {
+  AiTradeContrarianQuota,
+  AiTradeDirectionRule,
   AiTradeDisciplineDigest,
   AiTradeDisciplinePreset,
   AiTradeDisciplineRow,
@@ -108,6 +110,32 @@ export function memberDisciplines(
   if (memberDigest && memberDigest.rows?.length) return memberDigest;
   if (groupDigest && groupDigest.rows?.length) return groupDigest;
   return null;
+}
+
+/**
+ * 「逆势通路」那一行的文案（ai-trade-directional-symmetry [P2-4]）——**唯一真源**，卡片只做布局。
+ *
+ * 两件事必须同时说清楚，少一件这一行就没有存在的必要：
+ * 1. **本会话已用 N/M**。配额刻意不落库、冷续跑归零（A-4 / RK-10），那是一个有意的取舍；但
+ *    不把它画出来，「重启会话就能刷新配额」就是一个既存在又不可见的行为。
+ * 2. **生效阈值**（置信度下界 / 降档系数）取自**服务端解析后的回执**，不是弹窗里那份入参
+ *    ——「我在弹窗里填的到底生效了没有」只能由生效值回答（`baseRules` / `tradingHorizon`
+ *    两处回执的成文姿态）。前端一个阈值都不重算。
+ *
+ * 未装配（总闸关 / 用户取消勾选 / 该预设 `minConsensus<=0` 使共识门禁本就不触发）⇒ `null`
+ * ⇒ 整行不渲染，绝不挂一行「—」。
+ */
+export function describeContrarianQuota(
+  quota: AiTradeContrarianQuota | null | undefined,
+  rule?: (AiTradeDirectionRule & { minConsensus?: number }) | null,
+): string | null {
+  if (!quota) return null;
+  const parts = [`本会话已用 ${quota.used}/${quota.maxPerSession}`];
+  if (rule?.contrarianMinConfidence != null) {
+    parts.push(`置信度 ≥${rule.contrarianMinConfidence}`);
+  }
+  if (rule?.contrarianSizeMult != null) parts.push(`仓位 ×${rule.contrarianSizeMult}`);
+  return `${parts.join(" · ")}。配额不落库，重启会话后重新计数。`;
 }
 
 /** 触发次数的读数：`null`＝算不出（显示「—」），`0`＝确实一次都没触发。两者不可互相冒充。 */

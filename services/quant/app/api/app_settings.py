@@ -67,8 +67,10 @@ async def _experience_wire(session: AsyncSession, settings: Settings) -> dict:
     # 矛盾——总闸关掉后弹窗仍显示勾选且可勾。总闸只经环境变量 / `.env` 调整。
     wire["enabled"] = bool(derived.ai_trade_experience_enabled)
     # 下限如实下发，使 UI 能在提交前就说清楚为什么不合法（I-8：算了却看不见等于死码）。
-    wire["l0MinChars"] = budget_floor("l0")
-    wire["l1MinChars"] = budget_floor("l1")
+    # 轴 E-2：下限随方向对称性总闸抬高（L0 页眉可能多一句退化声明）。三处调用点同一判据（★ E-7）。
+    side_note = derived.ai_trade_directional_symmetry_enabled
+    wire["l0MinChars"] = budget_floor("l0", side_note=side_note)
+    wire["l1MinChars"] = budget_floor("l1", side_note=side_note)
     return wire
 
 
@@ -94,9 +96,10 @@ async def update_experience_settings(body: ExperienceSettingsIn,
     都没有（不变式 I-10 / 用例 A-41）。
     """
     patch = body.model_dump(exclude_none=True)
+    side_note = settings.ai_trade_directional_symmetry_enabled   # 轴 E-2：与上面同一判据
     for layer in ("l0", "l1"):
         key = f"{layer}MaxChars"
-        floor = budget_floor(layer)
+        floor = budget_floor(layer, side_note=side_note)
         if key in patch and int(patch[key]) < floor:
             raise HTTPException(422, detail={
                 "code": "EXPERIENCE_BUDGET_TOO_SMALL",

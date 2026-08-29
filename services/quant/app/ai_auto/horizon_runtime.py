@@ -19,6 +19,7 @@ from collections import Counter
 from dataclasses import replace
 
 from .exit_attribution import ExitLedger
+from .gate_veto import build_gate_veto_note as build_generic_gate_veto_note
 from .exit_intent import RELEASE_EXIT_PENDING, advance_intent, contradicts_exit
 from .exit_priority import (
     CONVICTION_FINAL,
@@ -61,17 +62,19 @@ _VETO_COUNTER_KEY = {
 }
 
 
-# 门禁否决注记里提议理由的截断长度（与 `_ANALYSIS_EXCERPT_CHARS` 同款「有界摘录」纪律）。
-_PROPOSED_REASON_CHARS = 200
-
-
 def build_gate_veto_note(proposed, reason: str | None, priority=None) -> dict | None:
-    """把本轮**门禁**否决压成记忆注记（exit-priority F-2）；未被否决 ⇒ `None`。
+    """把本轮**持仓周期层**的否决压成记忆注记（exit-priority F-2）；未被否决 ⇒ `None`。
 
     被 G2 拦下的那一轮，`decision.action` 已经是 `"hold"`、`decision.reason` 已被
     `hold_horizon._veto` 改写成降级码，于是模型下一轮读到的自己的历史是「上轮我决定观望」。
     反思否决轮早有对等注记（`build_reflection_note`），**门禁否决轮没有**——F-1 断的是系统侧的
     计数，F-2 断的是模型侧的论证连续性，两者互为因果，共同构成那条没有出口的活锁。
+
+    ⚠️ **本函数的三参签名保留、行为逐字不变，实现已委托给 `gate_veto.build_gate_veto_note`**
+    （directional-symmetry 轴 B）：那里把同一件事泛化到了八道确定性门禁，而层名的判定只有
+    `open_funnel.classify_block` 一份真源。`last_reason` 只可能是本层的三个码
+    （`horizon_min_hold` / `horizon_exit_unconfirmed` / `horizon_turnover_hysteresis`），
+    三者经 `classify_block` 全部归到 `"horizon"`，故委托后产物逐字节相同。
 
     Args:
         proposed: 进入 `_apply_horizon_gate` **那一刻**的 decision 引用（【R:P2-7】：不取更早的
@@ -84,17 +87,7 @@ def build_gate_veto_note(proposed, reason: str | None, priority=None) -> dict | 
     Returns:
         注记 dict 或 `None`。
     """
-    if reason is None or proposed is None:
-        return None
-    note = {"vetoedBy": "horizon", "reason": reason,
-            "proposedAction": proposed.action,
-            "proposedReason": str(proposed.reason or "")[:_PROPOSED_REASON_CHARS]}
-    if priority is not None:
-        note.update({"exitConviction": priority.declared, "exitLevel": priority.level,
-                     "downgradeReason": priority.downgrade_reason,
-                     "intentStreak": int(priority.wire.get("intentStreak") or 0),
-                     "intentLapses": int(priority.wire.get("intentLapses") or 0)})
-    return note
+    return build_generic_gate_veto_note(proposed, reason, priority=priority)
 
 
 def build_horizon_facts(executor, readings, *, stale_feed: bool,

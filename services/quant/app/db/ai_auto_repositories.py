@@ -460,13 +460,21 @@ def _group_comparison_row(runs: list[StrategyRun], trades_by_run: dict[int, list
     veto = sum(_num((s.get("edgeGate") or {}).get("veto")) for s in stats)
     intents = sum(_num((s.get("openFunnel") or {}).get("intents")) for s in stats)
     filled = sum(_num((s.get("openFunnel") or {}).get("filled")) for s in stats)
+    # 方向轴（directional-symmetry 轴 D · D-3）：两个纯加法读点，使「历史上这台机器到底有没有
+    # 做空过」可以跨会话回答。老 run / 总闸关的会话缺 `directionBalance` ⇒ 按 0 计**但也不进
+    # 任何分母**（`_summarize_preset` 只把它们相加、不做比值），绝不把「没有这个字段」画成
+    # 「做空 0 次」。
+    balance = [(s.get("openFunnel") or {}).get("directionBalance") or {} for s in stats]
+    long_intents = sum(_num(b.get("longIntents")) for b in balance)
+    short_intents = sum(_num(b.get("shortIntents")) for b in balance)
     # E-2（realized-edge-calibration D-2）：返回**分子分母**而不是比值——`_summarize_preset` 求和
     # 后再除即得池化口径。合入前这三个比例走的是「各组比值的算术平均」，而各组的分母从 1 笔到
     # 39 笔不等（实测池化胜率 40.74% vs 等权 36.11%，差 4.63 pp）。
     return {"netPnlUsd": summary["realizedPnlUsd"], "roundTrips": summary["tradeCount"],
             "wins": int(summary.get("wins") or 0),
             "edgeGated": gated, "edgeVeto": veto,
-            "openIntents": intents, "openFilled": filled}
+            "openIntents": intents, "openFilled": filled,
+            "longIntents": long_intents, "shortIntents": short_intents}
 
 
 def _summarize_preset(preset: str, rows: list[dict]) -> dict:
@@ -483,7 +491,11 @@ def _summarize_preset(preset: str, rows: list[dict]) -> dict:
             "roundTrips": int(sum(_num(r["roundTrips"]) for r in rows)),
             "winRate": _pooled_rate(rows, "wins", "roundTrips"),
             "edgeVetoRate": _pooled_rate(rows, "edgeVeto", "edgeGated"),
-            "openConversion": _pooled_rate(rows, "openFilled", "openIntents")}
+            "openConversion": _pooled_rate(rows, "openFilled", "openIntents"),
+            # 方向轴（directional-symmetry D-3）：两个**计数**而不是比值——`directionBalance`
+            # 缺席的老 run 贡献 0，把它们除一除就会把「这一档没有方向数据」画成「这一档从不做空」。
+            "longIntents": int(sum(_num(r.get("longIntents")) for r in rows)),
+            "shortIntents": int(sum(_num(r.get("shortIntents")) for r in rows))}
 
 
 def _pooled_rate(rows: list[dict], numerator: str, denominator: str) -> float | None:

@@ -179,13 +179,24 @@ export const MANUAL_EXIT_TITLE = "立即离场";
 export const MANUAL_EXIT_CONFIRM_TEXT = "确认离场";
 export const MANUAL_EXIT_CANCEL_TEXT = "再想想";
 
-/** 「离场提议被拦下」那一行（决策工具卡片的保真行，F-6）。 */
+/**
+ * 「提议被拦下」那一行（决策工具卡片的保真行，F-6 + directional-symmetry B-3）。
+ *
+ * 作用域已从 `horizon` 泛化到八道确定性门禁，故层名**必须吃后端下发的 `layerLabel`**。
+ * 保留 `vetoedBy === "horizon"` 那条映射**只是为了老快照**（本特性合入前落的 trace 里没有
+ * `layerLabel`）。
+ *
+ * ⚠️ **绝不允许回退到 `vetoedBy ?? "门禁"`**：泛化之后 `vetoedBy` 会是 `consensus` /
+ * `baseRuleMaBand` 这样的英文 key，那条旧分支会把它们原样怼到用户脸上——而本轮的主张恰恰是
+ * 「让方向被拦这件事对用户可读」。
+ */
 export function describeVetoedProposal(
   proposedAction?: string | null,
   vetoedBy?: string | null,
+  layerLabel?: string | null,
 ): string | null {
   if (!proposedAction) return null;
-  const by = vetoedBy === "horizon" ? "交易周期层" : (vetoedBy ?? "门禁");
+  const by = layerLabel ?? (vetoedBy === "horizon" ? "交易周期层" : "门禁");
   return `模型提议的是「${ACTION_LABEL[proposedAction] ?? proposedAction}」，被${by}降级`;
 }
 

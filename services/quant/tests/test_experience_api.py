@@ -225,7 +225,10 @@ async def test_a40_put_settings_cannot_bypass_the_budget_floor():
     """
     await _fresh()
     try:
-        floor = budget_floor("l0")
+        # directional-symmetry 轴 E-2（I-3）：总闸开时 L0 页眉可能多一句方向退化声明，它是页眉
+        # 的一部分、要先扣后装，故下限随之抬高。端点读的是同一个判据，用例也必须读同一个
+        # ——在这里抄一个数字，就是 ★ E-7 明令禁止的「两处各写一份」。
+        floor = budget_floor("l0", side_note=get_settings().ai_trade_directional_symmetry_enabled)
         async with _client() as client:
             bad = await client.put("/api/settings/experience", json={"l0MaxChars": floor - 1})
             good = await client.put("/api/settings/experience", json={"l0MaxChars": 480})

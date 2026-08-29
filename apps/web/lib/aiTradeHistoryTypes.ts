@@ -6,6 +6,7 @@ import type {
   AiTradeExitMix,
   AiTradeFundingStats,
   AiTradeHorizonStats,
+  AiTradeOpenFunnel,
 } from "./aiTradeTypes";
 import type { AiTradeRealizedStats } from "./aiTradeProfitability";
 import type { Trade } from "./types";
@@ -154,6 +155,10 @@ export interface AiTradeRunMetrics {
     realized?: AiTradeRealizedStats | null;
     // [P1-9] 本会话到底有没有把历史战绩喂给模型（事后按臂对账用）。
     trackRecordShown?: boolean;
+    // 开仓漏斗（tradability-and-open-funnel 轴 C）：经 `build_funnel_stats` 落进 `aiStats`，
+    // 故与实时侧**同形同源**。方向轴两键（`bySide` / `directionBalance`）随它整体带上
+    // （directional-symmetry 轴 D，零 DB 迁移）。老记录缺键 ⇒ 方向卡整卡不渲染。
+    openFunnel?: AiTradeOpenFunnel | null;
   };
 }
 

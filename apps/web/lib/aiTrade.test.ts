@@ -55,6 +55,7 @@ import {
   priceMoveFromMarginPct,
   resolveAiTradeGate,
   validateContextRounds,
+  validateDirectionRule,
   validateProfitGuard,
   validateStrategySelection,
   validateWakeInterval,
@@ -370,7 +371,10 @@ describe("describeExecuted (E3, four states + tone)", () => {
     const view = describeExecuted("open_long", { traded: false }, "low_consensus(0/1)");
     expect(view.tone).toBe("short");
     expect(view.label).toMatch(/已降级观望/);
-    expect(view.label).toMatch(/low_consensus\(0\/1\)/);
+    // `low_consensus` 自 ai-trade-directional-symmetry 起已中文化（评审 P0-4，**预期变更**）；
+    // 票数后缀仍原样保留，那是排查时唯一的定位线索。
+    expect(view.label).toMatch(/同向策略票数不足门槛/);
+    expect(view.label).toMatch(/\(0\/1\)/);
   });
   it("filled open colored by side", () => {
     expect(describeExecuted("open_long", { traded: true }, null)).toEqual({ label: "已成交", tone: "long" });
@@ -547,20 +551,79 @@ describe("describeDegradeReason", () => {
     );
   });
 
-  it("未命中一律原样回退（既有 low_consensus / decision_timeout 展示逐字不变，P1-9）", () => {
-    expect(describeDegradeReason("low_consensus(1/2)")).toBe("low_consensus(1/2)");
+  it("未命中一律原样回退（decision_timeout 展示逐字不变，P1-9）", () => {
     expect(describeDegradeReason("decision_timeout")).toBe("decision_timeout");
     expect(describeDegradeReason(null)).toBe("");
     expect(describeDegradeReason(undefined)).toBe("");
   });
 
-  it("describeExecuted 经其渲染：既有码逐字不变，新码中文化", () => {
-    expect(describeExecuted("hold", null, "low_consensus(1/2)").label).toBe(
-      "已降级观望（low_consensus(1/2)）",
+  // ---- 同向共识门槛六码（ai-trade-directional-symmetry 轴 A / 评审 P0-4）----
+  it("五个细分码各得自己的中文，且参数后缀原样保留", () => {
+    expect(describeDegradeReason("low_consensus_opposed(0/1)")).toBe(
+      "同向共识不足，且信号板反向票数过多，本轮不开放逆势通路(0/1)",
+    );
+    expect(describeDegradeReason("low_consensus_quota(0/1)")).toContain("名额已用尽");
+    expect(describeDegradeReason("low_consensus_conf(0/1)")).toContain("置信度");
+    expect(describeDegradeReason("low_consensus_evidence(0/1)")).toContain("证据说明");
+    expect(describeDegradeReason("low_consensus_size(0/1)")).toContain("最小档位");
+  });
+
+  it("裸 low_consensus 也中文化，且**不会抢先命中**四个细分码（顺序守卫）", () => {
+    expect(describeDegradeReason("low_consensus(1/2)")).toBe(
+      "同向策略票数不足门槛，本轮不开新仓（平仓不受影响）(1/2)",
+    );
+    // 顺序一旦被调换，细分码会全部退化成裸码的文案——用户再也分不出「差几票」与「证据没写够」。
+    for (const code of ["opposed", "quota", "conf", "evidence", "size"]) {
+      expect(describeDegradeReason(`low_consensus_${code}(0/1)`)).not.toContain("票数不足门槛");
+    }
+  });
+
+  it("界面上不得出现任何原始英文降级码（验收标准 7）", () => {
+    for (const code of [
+      "low_consensus(1/2)",
+      "low_consensus_opposed(0/1)",
+      "low_consensus_quota(0/1)",
+      "low_consensus_conf(0/1)",
+      "low_consensus_evidence(0/1)",
+      "low_consensus_size(0/1)",
+    ]) {
+      expect(describeDegradeReason(code)).not.toMatch(/^low_consensus/);
+    }
+  });
+
+  it("describeExecuted 经其渲染：新码中文化", () => {
+    expect(describeExecuted("hold", null, "low_consensus(1/2)").label).toContain(
+      "同向策略票数不足门槛",
     );
     expect(describeExecuted("hold", null, "base_rule_band_unavailable").label).toContain(
       "基础策略否决",
     );
+  });
+});
+
+
+// ---------------- 方向对称性入参（ai-trade-directional-symmetry §7.1）----------------
+describe("validateDirectionRule", () => {
+  it("三个值留空（null）一律合法 —— 留空即用服务端默认", () => {
+    expect(validateDirectionRule({ contrarianEnabled: true })).toBeNull();
+  });
+
+  it("关闭时忽略其余输入（残留值不该阻塞提交）", () => {
+    expect(
+      validateDirectionRule({ contrarianEnabled: false, contrarianSizeMult: 99 }),
+    ).toBeNull();
+  });
+
+  it("越界逐项报错（与后端 AiTradeDirectionIn 的 Field 边界一致）", () => {
+    expect(
+      validateDirectionRule({ contrarianEnabled: true, contrarianMinConfidence: 0 }),
+    ).toContain("置信度下界");
+    expect(
+      validateDirectionRule({ contrarianEnabled: true, contrarianMaxPerSession: 51 }),
+    ).toContain("会话配额");
+    expect(
+      validateDirectionRule({ contrarianEnabled: true, contrarianSizeMult: 1.5 }),
+    ).toContain("降档系数");
   });
 });
 

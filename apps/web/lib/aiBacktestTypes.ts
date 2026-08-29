@@ -45,6 +45,9 @@ export interface AiBacktestStartReq {
   // 交易纪律预设：与实盘**同一个** `_resolve_discipline`（discipline-preset R-3）。回测正是唯一能
   // 对这组阈值做「开 vs 不开」净额对照的地方，两侧不同源就等于把校准路径也一起废掉。
   discipline?: AiTradeDisciplineIn | null;
+  // 方向对称性 / 逆势通路：与实盘**同字段同语义、同一 `_resolve_direction` 解析**——回测正是
+  // 唯一能对「开 vs 不开逆势通路」做净额对照的地方，两侧不同源就等于那个对照跑的不是实盘参数。
+  direction?: import("./aiTradeTypes").AiTradeDirectionRule | null;
 }
 
 export interface AiBacktestStartResult {

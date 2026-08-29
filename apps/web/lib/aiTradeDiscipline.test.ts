@@ -3,6 +3,7 @@ import {
   DEFAULT_DISCIPLINE_PRESET,
   DISCIPLINE_COPY,
   DISCIPLINE_PRESETS,
+  describeContrarianQuota,
   disciplineRow,
   formatFiredCount,
   isNakedPosition,
@@ -152,6 +153,44 @@ describe("groupStateFromStatus", () => {
   it("degrades to null (not undefined) when an older backend omits the key", () => {
     const { discipline: _omit, ...withoutDiscipline } = groupRow;
     expect(groupStateFromStatus(withoutDiscipline as AiTradeGroupRow).discipline).toBeNull();
+  });
+
+  // directional-symmetry §7.1：`direction` 是**分组级**回执，落在同一个逐键手抄的映射里。
+  // 漏抄它的症状与上面那条逐字同形：WS 通路好的，只有「刷新页面后重发现」拿不到生效值。
+  it("carries the directional-symmetry receipt through the same hand-copied mapping", () => {
+    const direction = {
+      contrarianEnabled: true, minConsensus: 1, contrarianMinConfidence: 0.65,
+      contrarianMaxOpposingVotes: 1, contrarianMinEvidenceChars: 60,
+      contrarianMaxPerSession: 3, contrarianSizeMult: 0.5,
+    };
+    expect(groupStateFromStatus({ ...groupRow, direction }).direction).toEqual(direction);
+    expect(groupStateFromStatus(groupRow).direction).toBeNull();
+  });
+});
+
+describe("describeContrarianQuota", () => {
+  // [P2-4]：配额不落库、冷续跑归零是有意的取舍，但「本会话已用 N/M」必须让用户看得见——
+  // 否则「重启刷配额」是一个既存在又不可见的行为。
+  it("says how much of the session quota is spent and that it resets on restart", () => {
+    const text = describeContrarianQuota({ used: 1, remaining: 2, maxPerSession: 3 }, {
+      contrarianEnabled: true, contrarianMinConfidence: 0.65, contrarianSizeMult: 0.5,
+    });
+    expect(text).toContain("本会话已用 1/3");
+    expect(text).toContain("置信度 ≥0.65");
+    expect(text).toContain("仓位 ×0.5");
+    expect(text).toContain("重启会话后重新计数");
+  });
+
+  it("renders nothing when the lane is not armed (never a row of dashes)", () => {
+    expect(describeContrarianQuota(null)).toBeNull();
+    expect(describeContrarianQuota(undefined, null)).toBeNull();
+  });
+
+  it("omits a threshold the receipt does not carry instead of inventing one", () => {
+    const text = describeContrarianQuota({ used: 0, remaining: 3, maxPerSession: 3 }, null);
+    expect(text).toContain("本会话已用 0/3");
+    expect(text).not.toContain("置信度");
+    expect(text).not.toContain("仓位 ×");
   });
 });
 

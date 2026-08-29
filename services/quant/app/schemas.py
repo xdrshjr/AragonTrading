@@ -826,6 +826,33 @@ class AiTradeExperienceIn(BaseModel):
     write: bool | None = None       # None = 按服务端写闸（`ai_trade_experience_write_enabled`）
 
 
+class AiTradeDirectionIn(BaseModel):
+    """方向对称性入参（ai-trade-directional-symmetry §7.1）。
+
+    **字段整键缺省 ⇒ 服务端按 settings 装配开启态**——沿用 `baseRules` / `profitGuard` /
+    `tradingHorizon` / `discipline` / `experience` 的成文惯例：「老客户端没发这个字段」与
+    「用户亲手取消了勾选」是两件不同的事。`{"contrarianEnabled": false}` 是显式关闭的唯一途径。
+
+    值域**一次性在本层校验**（越界 422）；服务端 `_resolve_direction` 只做缺省回填、不复夹
+    （沿用 `_resolve_position_step` 的 [R-2] 惯例）。
+
+    ⚠️ **作用域只有 `steady`(2) 与 `balanced`(1)**：`aggressive` 与 `off` 的 `minConsensus`
+    都是 0，共识门禁根本不触发，逆势通路在那两档是死配置。
+    """
+
+    contrarianEnabled: bool = True
+    contrarianMinConfidence: float | None = Field(default=None, gt=0, le=1)
+    contrarianMaxOpposingVotes: int | None = Field(default=None, ge=0, le=8)
+    contrarianMinEvidenceChars: int | None = Field(default=None, ge=0, le=1000)
+    contrarianMaxPerSession: int | None = Field(default=None, ge=0, le=50)
+    contrarianSizeMult: float | None = Field(default=None, gt=0, le=1)
+
+    def overrides(self) -> dict:
+        """非空覆盖字段（camelCase）。键集与 `api/ai_auto._DIRECTION_TO_SETTING` 一一对应。"""
+        return {key: value for key, value in self.model_dump().items()
+                if key != "contrarianEnabled" and value is not None}
+
+
 class AiTradeDisciplineIn(BaseModel):
     """交易纪律预设入参（ai-trade-discipline-preset-and-integrity §5.1）。
 
@@ -928,6 +955,10 @@ class AiTradeGroupStartIn(BaseModel):
     # `{"enabled":false}` ⇒ 该会话**既不读取也不沉淀**经验（★ E-15）。`start_wire` 原文含本键，
     # 故冷续跑（`resume.py` 的 S2 重跑 `build_start_request`）自动同配置，无需额外代码。
     experience: AiTradeExperienceIn | None = None
+    # 方向对称性 / 逆势通路（默认开启，同上「字段缺省 ⇒ 开启」语义，解析点 `_resolve_direction`）；
+    # `{"contrarianEnabled":false}` ⇒ 该会话不装配逆势通路（等价本特性合入前的共识门禁）。
+    # **实盘与回测两处启动体都接该字段、走同一解析点**——否则用户拿回测调出来的参数在实盘失真。
+    direction: AiTradeDirectionIn | None = None
 
     @field_validator("members")
     @classmethod
@@ -1074,6 +1105,9 @@ class AiTradeGroupRow(BaseModel):
     # 形状：`{preset, presetLabel, adjustments: [{field,from,to,reason}], rows: [...]}`；
     # 整轴未装配 ⇒ `{"preset": "off", ...}`（而不是 null——「关着」也是一个要如实回答的事实）。
     discipline: dict | None = None
+    # 方向对称性回执镜像（directional-symmetry §7.1）：为**服务端解析后的生效值**；
+    # `null` = 未装配（总闸关 / 用户显式关闭 / 该预设的 `minConsensus<=0` 使门禁本就不触发）。
+    direction: dict | None = None
 
 
 class AiTradeGroupStartOut(AiTradeGroupRow):
@@ -1124,6 +1158,9 @@ class AiBacktestStartIn(BaseModel):
     # 回测会让回测结论无法与历史回测对比；且回测跑得快，几分钟就能生成上万条事件淹没资产。
     # 接住它是为了「前端两个 tab 共用同一张卡片」以及下一轮开放时不必改 wire。
     experience: AiTradeExperienceIn | None = None
+    # 方向对称性 / 逆势通路：与实盘**同字段同语义、同一 `_resolve_direction` 解析**——回测正是
+    # 唯一能对「开 vs 不开逆势通路」做净额对照的地方，两侧不同源就等于那个对照跑的不是实盘参数。
+    direction: AiTradeDirectionIn | None = None
 
 
 class AiBacktestStartOut(BaseModel):

@@ -781,6 +781,25 @@ class Settings(BaseSettings):
     ai_trade_experience_utility_t_threshold: float = Field(default=2.0, gt=0, le=100)
     ai_trade_experience_utility_detail_rows: int = Field(default=20, ge=1, le=200)
 
+    # ---- 方向对称性修复（ai-trade-directional-symmetry §7.3，8 项）----
+    # 总闸：False ⇒ **全仓逐字节回退**到本特性合入前——prompt 渲染（方向对称条款 + 三处 mandate
+    # + 逆势通路那一行）、payload 的 `consensus.contrarian` 段、`openFunnel` 的 `bySide` /
+    # `directionBalance` 两键、`tool_call` 相位的 `layerLabel`、`gateVeto` 的第五键、五个细分
+    # 降级码一律回到旧形态。这是本仓库处理「向决策链插入新语义」的成文纪律。
+    ai_trade_directional_symmetry_enabled: bool = True
+    # 逆势通路：共识门禁的**方向对称证据通道**。⚠️ 作用域只有 `steady`(2) 与 `balanced`(1)
+    # ——`aggressive` 与 `off` 的 `ai_trade_min_consensus` 都是 0，共识门禁在那两档根本不触发，
+    # 本项在那里是死配置（评审 P1-2）。
+    ai_trade_consensus_contrarian_enabled: bool = True
+    ai_trade_consensus_contrarian_min_confidence: float = Field(default=0.65, gt=0, le=1)
+    ai_trade_consensus_contrarian_max_opposing_votes: int = Field(default=1, ge=0, le=8)
+    ai_trade_consensus_contrarian_min_evidence_chars: int = Field(default=60, ge=0, le=1000)
+    ai_trade_consensus_contrarian_max_per_session: int = Field(default=3, ge=0, le=50)
+    ai_trade_consensus_contrarian_size_mult: float = Field(default=0.5, gt=0, le=1)
+    # 方向分布判「样本不足」的下界。**分母只数方向可辨的开仓意愿**（long+short），`unknown`
+    # 一律不进分母也不进任何占比——把 21% 方向不可知的轮次算进去会得出一句数据不支持的结论。
+    ai_trade_direction_balance_min_samples: int = Field(default=8, ge=1, le=1000)
+
     # ---- W-A 采全（1 项）----
     # False ⇒ 退回上一轮行为：接管 / 离线平仓的往返**只计缺口、不补采**。
     ai_trade_experience_adopt_harvest_enabled: bool = True
@@ -1049,10 +1068,13 @@ class Settings(BaseSettings):
             budget_floor,
         )
 
+        # 轴 E-2（directional-symmetry）：总闸开时 L0 页眉可能多出一句方向退化声明，它是页眉的
+        # 一部分、要先扣后装，故下限随之抬高。总闸关 ⇒ 三层下限**逐字回退**。
+        side_note = self.ai_trade_directional_symmetry_enabled
         for name, value, layer in (
                 ("AI_TRADE_EXPERIENCE_L0_MAX_CHARS", self.ai_trade_experience_l0_max_chars, "l0"),
                 ("AI_TRADE_EXPERIENCE_L1_MAX_CHARS", self.ai_trade_experience_l1_max_chars, "l1")):
-            floor = budget_floor(layer)     # ★ E-7：与 `PUT /settings/experience` 共用同一判据
+            floor = budget_floor(layer, side_note=side_note)   # ★ E-7：与 `PUT /settings/experience` 共用同一判据
             if value < floor:
                 raise ValueError(
                     f"{name}({value}) 必须 ≥ {floor}（框架句 {FRAME_OVERHEAD[layer]} 字 + 单条上限 "

@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from .prompts_en import (
     DECISION_TASK_INSTRUCTION_EN,
@@ -138,13 +138,44 @@ def build_ai_trade_system_prompt(inst_id: str, bar: str, budget_usd: float, leve
                             texts=texts, options=options)
 
 
+def format_direction_charter(enabled: bool) -> str:
+    """系统 prompt 的**方向对称条款**（directional-symmetry C-2）；未启用 ⇒ **空串垫片**。
+
+    与既有五段宪章逐字同构（`base_rules.format_charter` 等），故零新机制：空串 ⇒
+    两条脊柱的拼接结果与本特性合入前逐字节相同。
+
+    它是**软引导层**：硬保证在共识门禁的方向对称通道（轴 A）与十二阶段协议的 S10 / S11
+    硬约束（轴 C-1）。三者缺一不可：只改协议，模型提了做空也会被门禁拦下；
+    只改门禁，模型从来不提做空。
+    """
+    if not enabled:
+        return ""
+    return (
+        "**方向对称条款**：这是一个可以双向交易的永续合约账户。"
+        "做空与做多在本系统里是**完全对等**的一等动作，"
+        "二者共用同一套仓位、成本、止损与门禁标准。"
+        "上涨行情里做多不是默认答案，它只是「当下证据更强的那一个答案」；"
+        "同理，下跌行情里做空也不是默认答案。"
+        "你必须在 S10 同时给出做多与做空两个候选并各自算出净期望值，"
+        "然后在 S12 说明你为什么选了这一个、放弃了另一个。"
+        "**只列出一个方向的候选，等同于没有完成 S10。**"
+    )
+
+
 def _render_spine_zh(inst_id: str, bar: str, budget_usd: float, leverage: float, *,
                      texts: SystemPromptTexts, options: SystemPromptOptions) -> str:
-    """中文脊柱（本特性合入前的**逐字节**原文；`off` 档的真源，勿改一个字符）。"""
+    """中文脊柱（`off` 档的真源）。
+
+    本特性合入前的**逐字节**原文，勿改一个字符。唯一的变量是孪生拼接里多出的第六段
+    （directional-symmetry C-2 的 `direction_text`）：未装配 ⇒ 空串 ⇒ 拼接结果与合入前逐字节相同。
+
+    ⚙ 这份拼接与 `SystemPromptTexts.charter()` 是**两份同款内联**（中文脊柱根本不调 `charter()`），
+    改一处必须改两处——只改一处，条款就只出现在一条语言路径上（评审 P1-4）。
+    """
     charter = "".join(
         f"{text}\n\n" for text in
         (texts.base_rules_text, texts.profit_guard_text, texts.sizing_text,
-         texts.cost_text, texts.horizon_text) if text)
+         texts.cost_text, texts.horizon_text, texts.direction_text) if text)
     return (
         "你是一名严谨、纪律性极强的加密合约自动交易决策者。你不是聊天助手，也不是信号复读机——你的"
         f"**唯一职责**是在每个决策轮，为标的 {inst_id}（周期 {bar}）做出一个受严格约束的交易决策。"
@@ -269,11 +300,30 @@ def _exit_priority_tool_description_suffix() -> str:
     )
 
 
+# 逆势证据串的截断上限（与 `evidence_digest` 同款「有界字段」纪律；判定字数下限的真源在
+# `signals._contrarian_block`，本常量只管截断）。
+_CONTRARIAN_EVIDENCE_MAX_CHARS = 600
+
+
+@dataclass(frozen=True)
+class ContrarianSchemaOptions:
+    """决策工具 schema 里 `contrarianEvidence` 那段描述要用到的三个阈值（A-3）。
+
+    它们**必须由后端下发进 prompt**：模型不知道门槛是多少就永远写不够字数，逆势通路就成了一个
+    「有写点没读点」的功能。三个数的唯一真源是会话那份 `ConsensusRule`。
+    """
+
+    min_chars: int
+    min_confidence: float
+    size_mult: float
+
+
 def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = False,
                                limit_band_pct: float = 0.02,
                                allow_hold_exit: bool = False,
                                allow_exit_priority: bool = False,
-                               allow_reasoning_digest: bool = False) -> dict:
+                               allow_reasoning_digest: bool = False,
+                               contrarian: ContrarianSchemaOptions | None = None) -> dict:
     """按档位步长 + 限价总闸 + 承诺退出线总闸构造决策工具 `input_schema`（[R-5] `enum` 取真源）。
 
     `step<=0` **且** `allow_limit=False` **且** `allow_hold_exit=False`（含全部默认调用）原样返回模块
@@ -290,6 +340,8 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
             默认 0.02 渲染与参数化前逐字节相同（恒等断言据此原样通过）。
         allow_hold_exit: 承诺退出线总闸（keyword-only，C1，默认 False）。`True` 时露出可选
             `holdExitPx` 字段（`required` 不变，承诺退出线永远可选）。
+        contrarian: 逆势通路的 schema 选项（directional-symmetry A-3，keyword-only）。
+            `None`（默认）⇒ 不露出 `contrarianEvidence` ⇒ schema 逐字节回退。
 
     Returns:
         决策工具的 `input_schema`（JSON Schema）。硬保证仍在服务端（`quantize_size_fraction` 与
@@ -300,7 +352,7 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
     # 新字段永远露不出来，而**不报任何错**（G-2 的直接依赖）。`allow_reasoning_digest`
     # （deep-reasoning-chain §3.1.7）同理。
     if (step <= 0 and not allow_limit and not allow_hold_exit and not allow_exit_priority
-            and not allow_reasoning_digest):
+            and not allow_reasoning_digest and contrarian is None):
         return DECISION_TOOL_SCHEMA
     schema = dict(DECISION_TOOL_SCHEMA)
     props = dict(DECISION_TOOL_SCHEMA["properties"])   # 独立浅拷贝，杜绝改动泄漏回模块常量
@@ -328,6 +380,18 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
             "type": "string", "maxLength": 400,
             "description": "（可选，用简体中文写）给人类操作员看的证据摘要：你采纳了哪些信号、"
                            "推翻了哪些、决定性证据是什么、什么会让你改变主意。不要复述行情数字。"}
+    if contrarian is not None:
+        # directional-symmetry A-3：逆势开仓证据（`required` 不变，永远可选）。字数下限由后端的
+        # 纯核心判定并产出 `low_consensus_evidence` 码——这里只把那个数**如实告诉模型**，绝不
+        # 在前端 / schema 里再写死一份（两处各写一个必然分叉，而分叉不会报错）。
+        props["contrarianEvidence"] = {
+            "type": "string", "maxLength": _CONTRARIAN_EVIDENCE_MAX_CHARS,
+            "description": (
+                f"（可选，用简体中文写，不少于 {contrarian.min_chars} 字）当你的开仓方向与信号板"
+                "净立场相反时**必须**填：你推翻了哪几条信号、依据是什么、什么现象会让你立刻认错。"
+                "写满并把 confidence 提到 "
+                f"{contrarian.min_confidence:g} 以上，系统会放行这笔逆势开仓，但仓位强制乘以 "
+                f"{contrarian.size_mult:g}。顺势开仓不需要填。")}
     schema["properties"] = props
     return schema
 
@@ -409,12 +473,40 @@ def _format_market_context(mc: dict | None) -> str:
 
 
 def _format_consensus(consensus: dict | None) -> str:
-    """把策略共识度压成一行（E2）；`consensus is None` 时返回空串（该段省略）。"""
+    """把策略共识度压成一行（E2）；`consensus is None` 时返回空串（该段省略）。
+
+    directional-symmetry A-5：`contrarian` 子对象存在时**追加一行**，把「存在这条门槛、走逆势
+    通路要满足什么、还剩几次」如实告诉模型。合入前 `minConsensus` 这个阈值在实盘 payload 里
+    **根本不存在**——模型不但事后不知道自己被拦了（轴 B），事前也不知道有这条门槛。
+    整键缺席（总闸关 / 通路不可用）⇒ 该行不渲染 ⇒ prompt 逐字节回退。
+    """
     if not consensus:
         return ""
-    return (f"策略共识：{consensus.get('longVotes')}多 / {consensus.get('shortVotes')}空 / "
+    head = (f"策略共识：{consensus.get('longVotes')}多 / {consensus.get('shortVotes')}空 / "
             f"{consensus.get('flatVotes')}空仓，净立场={consensus.get('netStance')}，"
             f"一致度={consensus.get('agreement')}")
+    lane = _format_contrarian_lane(consensus.get("contrarian"))
+    return f"{head}\n{lane}" if lane else head
+
+
+def _format_contrarian_lane(contrarian: dict | None) -> str:
+    """逆势通路那一行（A-5）；整键缺席 / 不可用 ⇒ 空串 ⇒ 上一行逐字节回退。
+
+    这一行是**方向对称的**：措辞讲的是「与信号板净立场相反」，而不是「做空」。给做空开后门与
+    给做多开后门是同一种偏斜，只是方向相反。
+    """
+    if not contrarian or not contrarian.get("available"):
+        return ""
+    remaining = int(contrarian.get("remaining") or 0)
+    if remaining <= 0:
+        return ("逆势通路：本会话的逆势试探名额已用尽，与信号板净立场相反的开仓本轮不会被放行"
+                "（平仓与顺势开仓不受影响）。")
+    return (f"逆势通路：若你要开的方向与信号板净立场相反、同向票数不足门槛，请把 confidence 提到 "
+            f"≥{float(contrarian.get('minConfidence') or 0):g} 并在 `contrarianEvidence` 里用不少于 "
+            f"{int(contrarian.get('minEvidenceChars') or 0)} 字写清你推翻了哪几条信号、"
+            f"什么现象会让你立刻认错——系统会放行，但仓位强制乘以 "
+            f"{float(contrarian.get('sizeMult') or 0):g}。本会话还剩 {remaining} 次；"
+            f"反向票数超过 {int(contrarian.get('maxOpposingVotes') or 0)} 票时本通路不开放。")
 
 
 def _format_signal_priors(priors: dict | None) -> str:
@@ -441,13 +533,20 @@ def _format_prior_directions(priors: dict) -> str:
     coverage = priors.get("coverage") or {}
     cov = (f"；覆盖率 {coverage.get('boardWithPrior')}/{coverage.get('boardTotal')}"
            if coverage.get("boardTotal") else "")
-    return (f"做多 {_format_prior_side(priors.get('long'))}，"
-            f"做空 {_format_prior_side(priors.get('short'))}{cov}。")
+    debias = bool(priors.get("directionDebias"))
+    return (f"做多 {_format_prior_side(priors.get('long'), debias)}，"
+            f"做空 {_format_prior_side(priors.get('short'), debias)}{cov}。")
 
 
-def _format_prior_side(side: dict | None) -> str:
+def _format_prior_side(side: dict | None, debias: bool = False) -> str:
+    """某一侧的先验读数；该侧无贡献者即如实写「无证据」（**不写 p=0.5**）。
+
+    directional-symmetry E-1（`debias=True` ⇒ 总闸开）：措辞追加一句「样本不足 ≠ 该方向胜率低」。
+    合入前的裸「无证据」与「p=0.42」在模型看来是可比的两个读数，于是「做空侧没有样本」被当成
+    「做空侧证据不利」——那正是那个自我强化吸收态的第二条腿。总闸关 ⇒ 逐字节回退。
+    """
     if not side:
-        return "无证据"
+        return "无证据（样本不足，不是该方向胜率低的证据）" if debias else "无证据"
     return f"p={side.get('p')}（{side.get('contributorN')} 条证据，IR 加权，EV {side.get('evBps')}bps）"
 
 

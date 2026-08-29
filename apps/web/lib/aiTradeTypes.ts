@@ -491,6 +491,17 @@ export interface AiTradeDisciplineRow {
 export interface AiTradeDisciplineDigest {
   rows: AiTradeDisciplineRow[];
   hint?: string | null;
+  // 逆势通路的会话配额（directional-symmetry [P2-4]）：**不落库、冷续跑归零**是一个有意的
+  // 取舍，但「本会话已用 N/M」必须让用户看得见——否则「重启刷配额」是一个既存在又不可见的
+  // 行为。未装配 / 总闸关 ⇒ 整键缺席 ⇒ 那一行不渲染。
+  contrarian?: AiTradeContrarianQuota | null;
+}
+
+/** `status.disciplines.contrarian`：本会话逆势试探的已用 / 剩余 / 上限。 */
+export interface AiTradeContrarianQuota {
+  used: number;
+  remaining: number;
+  maxPerSession: number;
 }
 
 /** 分组级 `group.discipline`：静态预设回执 + 上面那份 digest（`rows` / `hint` 平铺在同层）。 */
@@ -1045,6 +1056,10 @@ export interface AiTradeTraceEvent {
   proposedAction?: AiTradeAction | null;
   proposedReason?: string | null;
   vetoedBy?: string | null;
+  // 中文层名（directional-symmetry B-3）：作用域从 `horizon` 泛化到八道确定性门禁之后，
+  // **标签必须由后端下发**（`discipline._THRESHOLD_LABELS` 的成文纪律）——前端抄一份，下次加
+  // 一层就会把 `consensus` 这样的英文 key 怼到用户脸上。总闸关 / 老快照 ⇒ 缺席 ⇒ 逐字回退。
+  layerLabel?: string | null;
   // reflection_verdict：反思**之后**才定型的最终离场档位（含 `adjudicated` / `failOpenReason`）。
   // **刻意不新开 `exit_priority` 相位**：那要付出四处逐键手抄的代价，而漏抄不会报错、只会静默
   // 功能缺失（R-9）。非反思轮读 `horizonWire.exitPriority`（整对象透传的那一份）即可。
@@ -1157,6 +1172,9 @@ export interface AiTradeRoundTrace {
   proposedAction?: AiTradeAction | null;
   proposedReason?: string | null;
   vetoedBy?: string | null;
+  // directional-symmetry B-3：与上面三键**同为逐键手抄**——`emptyRoundTrace` 与
+  // `reduceRoundPhase` 的 `case "tool_call"` 两处都要写，漏抄不报错、只会安静地什么都不显示。
+  layerLabel?: string | null;
   exitPriority?: AiTradeExitPriorityWire | null;
   state: "deciding" | "done" | "skipped" | "error";
 }
@@ -1392,6 +1410,8 @@ export interface AiTradeGroupStartReq {
   discipline?: AiTradeDisciplineIn | null;      // 交易纪律预设（字段省略→服务端默认 balanced）
   // 经验模式（字段省略→服务端按 `ai_trade_experience_default_on` 装配，默认开启）。
   experience?: import("./experienceTypes").AiTradeExperienceRule | null;
+  // 方向对称性 / 逆势通路（字段省略→服务端按 settings 与纪律预设装配）。
+  direction?: AiTradeDirectionRule | null;
 }
 
 // 分组成员行（start 回执 / status 视图共用）：完整会话行 + 分配占比。
@@ -1435,6 +1455,9 @@ export interface AiTradeGroupRow {
   // 老后端 / 总闸关 ⇒ 两键缺席 ⇒ 前端自动回落到 `state`（一键逐字回滚的第四处落点）。
   declaredState?: AiTradeLifecycleState | null;
   lifecycle?: AiTradeLifecycleWire | null;
+  // 方向对称性回执镜像（directional-symmetry §7.1）：**服务端解析后的生效值**；
+  // `null` = 未装配（总闸关 / 用户显式关闭 / 该预设的 minConsensus<=0 使门禁本就不触发）。
+  direction?: (AiTradeDirectionRule & { minConsensus: number }) | null;
 }
 
 /** 分组生命周期态（后端 `group.state` 与会话 `status.state` 共用同一值域）。 */
@@ -1825,6 +1848,10 @@ export interface AiTradeGroupState {
   // 分组共享的纪律预设回执。由 `groupStateFromStatus` **逐键手抄**写入——那正是本仓库「静默吞新键」
   // 缺陷的那个函数，不补就永远拿不到（`aiTradeDiscipline.test.ts` 有一条用例专门守它）。
   discipline?: AiTradeDisciplineWire | null;
+  // 方向对称性回执（directional-symmetry §7.1）：**服务端解析后的生效值**，分组共享一份。
+  // 同上——由 `groupStateFromStatus` 逐键手抄写入，不补这一行，「我在弹窗里关掉的逆势通路到底
+  // 有没有生效」在「刷新页面后重发现」这条路径上就恒无解（`aiTradeDiscipline.test.ts` 守它）。
+  direction?: (AiTradeDirectionRule & { minConsensus: number }) | null;
   // 暂停 / 继续（pause-resume D-7）：值域从 `"running" | "stopped"` 扩为三态。这里此前被
   // `groupStateFromStatus` **写死**成 "running"，故暂停态在「刷新页面后重发现」这条路径上会恒显示
   // 运行中——最难被发现的那种坑。`aiTrade.test.ts` 有一条用例专门守它。
@@ -1998,6 +2025,50 @@ export interface AiTradeOpenFunnel {
   conversion: number | null;   // `intents == 0` ⇒ null（**绝不**把 0/0 画成 0%）
   layers: string[];            // 决策链顺序（后端下发，前端只做布局）
   scope: string;               // 口径词（全程累计 vs 滚动窗口）
+  // ---- 方向轴（ai-trade-directional-symmetry 轴 D）----
+  // 成员级 `status` 走**整体 spread** 合并进 `m.session`（`store.ts` 的 patchAiTradeMemberStatus），
+  // 故这两个键**不需要**改 store.ts —— 漏的只有类型声明。总闸关 / 老会话 ⇒ 两键缺席 ⇒ 卡片不渲染。
+  bySide?: Record<AiTradeIntentSide, AiTradeSideFunnel> | null;
+  directionBalance?: AiTradeDirectionBalance | null;
+}
+
+// 方向三格：`unknown` **单列**、绝不并进任何一侧（置信度门槛在方向可见之前就拦掉的那些轮）。
+export type AiTradeIntentSide = "long" | "short" | "unknown";
+
+export interface AiTradeSideFunnel {
+  intents: number;
+  blocked: Record<string, number>;
+  sizingZeroed: number;
+  submitted: number;
+  filled: number;
+}
+
+export type AiTradeDirectionVerdict = "balanced" | "long_skewed" | "short_skewed" | "insufficient";
+
+export interface AiTradeDirectionBalance {
+  longIntents: number;
+  shortIntents: number;
+  longFilled: number;
+  shortFilled: number;
+  shortIntentShare: number | null;   // 分母（long+short）为 0 ⇒ null，**绝不写 0**
+  shortFillShare: number | null;
+  // 方向不可知的开仓意愿数。**必须有可见落点**：不披露它，`verdict` 就是一句数据不支持的断言
+  // ——「模型没提过做空」与「提过但在方向可见之前被置信度门槛拦掉」在这份数据里不可区分。
+  unknownIntents: number;
+  unknownFilled: number;
+  contrarianPassed: number;          // 走逆势通路放行的轮数（**不是**降级）
+  minSamples: number;                // 判「样本不足」的下界（后端下发，前端不硬编码）
+  verdict: AiTradeDirectionVerdict;
+}
+
+// 方向对称性 / 逆势通路的启动入参与回执镜像（§7.1）。
+export interface AiTradeDirectionRule {
+  contrarianEnabled: boolean;
+  contrarianMinConfidence?: number | null;
+  contrarianMaxOpposingVotes?: number | null;
+  contrarianMinEvidenceChars?: number | null;
+  contrarianMaxPerSession?: number | null;
+  contrarianSizeMult?: number | null;
 }
 
 // ---- 滚动摘要健康度（轴 D · §5.3）----

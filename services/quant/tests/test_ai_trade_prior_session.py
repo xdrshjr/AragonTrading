@@ -168,6 +168,13 @@ async def test_enabled_without_snapshot_is_also_absent():
 
 # ============================ T-16：装配后的 payload / prompt / wire ============================
 async def test_enabled_snapshot_lands_in_payload_and_prompt():
+    """装配后的 payload / prompt。
+
+    ⚠️ `netStance` 的期望值随 ai-trade-directional-symmetry 轴 E-1 **有意改变**（RK-4 的
+    「总闸开组」）：只有做多一侧有先验时，合入前按中性 0.5 参与比较 ⇒ 恒 `long`；那是一个
+    自我强化的吸收态（不做空 ⇒ 无做空样本 ⇒ 先验恒偏多 ⇒ 更不做空）。总闸开 ⇒ 改判 `flat`
+    并如实标注 `netStanceBasis="single_side"`。总闸关时的逐字回退由下一条用例守。
+    """
     await init_db()
     try:
         session = _make_session(settings=_prior_settings(), prior_snapshot=_snapshot())
@@ -175,10 +182,32 @@ async def test_enabled_snapshot_lands_in_payload_and_prompt():
         priors = payload["signalPriors"]
         assert priors["long"]["p"] == 0.6 and priors["short"] is None
         assert priors["coverage"] == {"boardWithPrior": 1, "boardTotal": 1}
-        assert priors["weighted"]["netStance"] == "long"
+        assert priors["weighted"]["netStance"] == "flat"
+        assert priors["weighted"]["netStanceBasis"] == "single_side"
+        assert priors["directionDebias"] is True
         prompt = build_decision_prompt(payload)
         assert "历史统计，非当下保证" in prompt          # 渲染硬约束 ①
         assert "做空 无证据" in prompt                    # 无贡献者如实呈现，**不写 p=0.5**
+        # E-1：措辞必须点明「样本不足 ≠ 该方向胜率低」，否则「没有样本」会被读成「证据不利」。
+        assert "样本不足，不是该方向胜率低的证据" in prompt
+    finally:
+        await dispose_engine()
+
+
+async def test_single_side_prior_leans_again_when_the_switch_is_off():
+    """总闸关 ⇒ 单侧先验的净立场与「无证据」措辞**逐字节回退**到本特性合入前。"""
+    await init_db()
+    try:
+        session = _make_session(
+            settings=_prior_settings(ai_trade_directional_symmetry_enabled=False),
+            prior_snapshot=_snapshot())
+        payload = _payload(session)
+        priors = payload["signalPriors"]
+        assert priors["weighted"]["netStance"] == "long"
+        assert priors["directionDebias"] is False
+        prompt = build_decision_prompt(payload)
+        assert "做空 无证据，" in prompt or "做空 无证据；" in prompt or "做空 无证据。" in prompt
+        assert "样本不足" not in prompt
     finally:
         await dispose_engine()
 

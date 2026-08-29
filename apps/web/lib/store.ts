@@ -223,6 +223,9 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     proposedAction: null,
     proposedReason: null,
     vetoedBy: null,
+    // directional-symmetry B-3：中文层名（后端下发）。与上面三键同为**逐键手抄**——漏抄它
+    // `AiTradeRoundTrace` 永远拿不到，界面会退回到「被门禁降级」这句没有信息量的话。
+    layerLabel: null,
     exitPriority: null,
     // 深度思维链（deep-reasoning-chain §4.2）：本函数是**逐键手抄**装配，漏抄这两键
     // `AiTradeRoundTrace` 永远拿不到本层数据 ⇒ 后端发什么前端都收不到（跑不出错、功能静默缺失）。
@@ -255,6 +258,9 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
         proposedAction: evt.proposedAction ?? null,
         proposedReason: evt.proposedReason ?? null,
         vetoedBy: evt.vetoedBy ?? null,
+        // directional-symmetry B-3：第四个兄弟键。`emptyRoundTrace` 与这里**两处都要写**，
+        // 漏任一处即静默丢数据（该文件已有四条同款警示注释）。
+        layerLabel: evt.layerLabel ?? null,
       };
     case "result":
       return {

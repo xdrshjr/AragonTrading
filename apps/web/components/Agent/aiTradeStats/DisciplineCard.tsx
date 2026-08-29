@@ -1,11 +1,13 @@
 "use client";
 
 import {
+  describeContrarianQuota,
   disciplineRow,
   formatFiredCount,
   summarizeDisciplines,
 } from "@/lib/aiTradeDiscipline";
 import type {
+  AiTradeDirectionRule,
   AiTradeDisciplineRow,
   AiTradeDisciplineWire,
   AiTradeSummaryHealth,
@@ -44,11 +46,17 @@ export default function DisciplineCard({
   wire,
   memberCount = 1,
   summaryHealth,
+  direction,
 }: {
   wire?: AiTradeDisciplineWire | null;
   memberCount?: number;
   /** 轴 D 的第二个渲染落点（`AiTradePanel` 是第一个）：停摆事实必须两处都看得到。 */
   summaryHealth?: AiTradeSummaryHealth | null;
+  /**
+   * 分组级方向对称性回执（directional-symmetry §7.1）：**服务端解析后的生效值**。
+   * 未装配 ⇒ 缺席 ⇒ 逆势通路那一行不渲染。
+   */
+  direction?: (AiTradeDirectionRule & { minConsensus?: number }) | null;
 }) {
   const rows = wire?.rows ?? [];
   // 老后端 / 还没成员 ⇒ 整卡不渲染（绝不在一个没有数据的会话上挂出一排「—」，那会被读成统计坏了）。
@@ -56,6 +64,9 @@ export default function DisciplineCard({
   const summary = summarizeDisciplines(rows);
   const adjustments = wire.adjustments ?? [];
   const naked = disciplineRow(rows, "exchangeBackstop");
+  // 逆势通路（directional-symmetry [P2-4]）：配额读**成员级** digest（那是现算的会话状态），
+  // 阈值读**分组级**回执（那是服务端解析后的生效值）。判据与文案的唯一真源在 lib。
+  const contrarian = describeContrarianQuota(wire.contrarian, direction);
 
   return (
     <div
@@ -107,6 +118,18 @@ export default function DisciplineCard({
           <DisciplineRowView key={row.key} row={row} />
         ))}
       </div>
+
+      {contrarian && (
+        <div
+          className="flex flex-col gap-0.5 rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1"
+          data-testid="ai-discipline-contrarian"
+        >
+          <span className="text-[10px] font-medium text-[var(--text)]">
+            逆势通路 · 已放开
+          </span>
+          <span className="text-[10px] leading-relaxed text-[var(--muted)]">{contrarian}</span>
+        </div>
+      )}
 
       {memberCount > 1 && (
         <p className="text-[10px] leading-relaxed text-[var(--muted)]">

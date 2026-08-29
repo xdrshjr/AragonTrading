@@ -82,7 +82,9 @@ describe("describeDegradeReason（edge_below_cost 前缀）", () => {
   });
 
   it("既有降级码的展示逐字不变（未命中一律原样回退）", () => {
-    expect(describeDegradeReason("low_consensus(1/2)")).toBe("low_consensus(1/2)");
+    // `low_consensus` 自 ai-trade-directional-symmetry 起已登记中文（评审 P0-4，**预期变更**）；
+    // 这条契约要守的是「未命中一律原样回退」，故改用一个仍然未登记的码。
+    expect(describeDegradeReason("some_unregistered_code(1/2)")).toBe("some_unregistered_code(1/2)");
     expect(describeDegradeReason("decision_timeout")).toBe("decision_timeout");
   });
 });

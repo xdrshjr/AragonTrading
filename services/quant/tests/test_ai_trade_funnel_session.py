@@ -7,9 +7,10 @@
 """
 from __future__ import annotations
 
-from app.ai_auto.decider import AiTradeDecider
+from app.ai_auto.decider import AiTradeDecider, TradeDecision
 from app.ai_auto.discipline import preset_table
 from app.ai_auto.session import AiTradeSession
+from app.ai_auto.signals import StrategySignalView, compute_consensus
 from app.ai_auto.sizing_runtime import build_sizing_runtime
 from app.config import Settings
 from app.db.session import dispose_engine, init_db
@@ -70,7 +71,9 @@ def _round(session: AiTradeSession, stage1: str, *, stage1_degrade: str | None =
     funnel.note_sizing(action, size_fraction)
     funnel.note_executed(action, skipped)
     if filled:
-        funnel.note_filled()
+        # directional-symmetry 轴 D：成交腿自带方向（本记点排在 `note_executed` 之后，轮级
+        # `_intent_side` 已被清），故这里传的必须是**成交腿自己的 side**。
+        funnel.note_filled(stage1[len("open_"):] if stage1.startswith("open_") else "")
     session._discipline.note_round(degrade)
     funnel.end_round()
 
@@ -235,5 +238,138 @@ async def test_hint_names_the_top_blocker_once_there_are_real_intents():
                    gate="edge_below_cost(edge=8.1bps,cost=13.0bps,k=1.5)")
         hint = session.discipline_wire()["hint"]
         assert hint is not None and "最小 edge 门禁" in hint and "9 次" in hint
+    finally:
+        await dispose_engine()
+
+
+# ============ 方向轴的会话级贯通（ai-trade-directional-symmetry 轴 A / D） ============
+#
+# 纯函数看不见的那件事：**在真实调用序下，一个「信号板全多头 + 模型要做空」的轮次到底走到哪
+# 一步**。合入前它恒停在共识门禁；本节断言它能一路走到「委托真的发出」，且方向、仓位、计数、
+# 注记四件事全部对得上。
+
+_SHORT_EVIDENCE = ("净立场偏多但 4H 结构已在关键位破位，成交量在反弹段持续萎缩；我推翻策略 15 "
+                   "的因子得分与策略 28 的趋势带立场——二者的前提在当前体制下都不成立。若价格"
+                   "重新站回中轨并伴随放量，我立刻认错离场。")
+
+
+def _consensus_session(*, contrarian: bool, symmetry: bool = True) -> AiTradeSession:
+    """信号板全多头（1 票多 / 0 票空）+ balanced 预设（`min_consensus=1`）的会话。
+
+    ⚠️ 两个总闸必须在**构造之前**定好：`ConsensusRule` 是会话级不可变快照（`__init__` 里从
+    `executor.settings` 派生一次），事后改 settings 不会改它——生产路径也正是这个语义。
+    """
+    settings = Settings(_env_file=None, **preset_table("balanced"))
+    settings = settings.model_copy(update={
+        "ai_trade_consensus_contrarian_enabled": contrarian,
+        "ai_trade_directional_symmetry_enabled": symmetry})
+    executor = LiveExecutor(
+        creds=AccountCredentials("ak", "sk-000000", "pp-000000"), account_id=1,
+        inst_id="BTC-USDT-SWAP", td_mode="cross", pos_mode="long_short_mode",
+        leverage=3.0, budget_usd=1000.0, risk=RiskParams(), ct_val=0.01, lot_sz=0.01,
+        min_sz=0.01, settings=settings, bar_seconds=BAR_SECONDS["1H"])
+    decider = AiTradeDecider(object(), "sys", context_refresh_rounds=50, settings=settings)
+    return AiTradeSession(
+        "aitrade_dir", 1,
+        [PaperStrategySpec(1, "S", "atomic", _Stub({}), {})],
+        "BTC-USDT-SWAP", "1H", executor, decider, priming=False, priming_bars=10,
+        context_refresh_rounds=50,
+        sizing=build_sizing_runtime(settings, "BTC-USDT-SWAP", BAR_SECONDS["1H"],
+                                    budget_usd=1000.0),
+        discipline_preset="balanced")
+
+
+def _long_board():
+    return compute_consensus([StrategySignalView(
+        strategy_id=1, name="S", stance="long", latest_signal="none",
+        strength=0.0, reason="", risk_params=RiskParams())])
+
+
+async def test_short_reaches_the_order_when_the_evidence_is_there():
+    """信号板全多、模型要做空 ⇒ 逆势通路放行：方向为 short、仓位减半、漏斗记 contrarianPassed。"""
+    await init_db()
+    try:
+        session = _consensus_session(contrarian=True)
+        decision = TradeDecision("open_short", 0.5, 0.72, "r",
+                                 contrarian_evidence=_SHORT_EVIDENCE)
+        session._discipline.note_intent("open_short", None)
+        out, degrade = session._apply_consensus_gate(decision, _long_board(), None)
+        assert out.action == "open_short" and degrade is None
+        assert out.size_fraction == 0.25                      # 强制降档 ×0.5
+        session._discipline.funnel.note_executed(out.action, False)
+        session._discipline.note_round(degrade)
+        session._discipline.funnel.end_round()
+        wire = session._status_payload()["openFunnel"]
+        assert wire["bySide"]["short"]["submitted"] == 1
+        assert wire["directionBalance"]["contrarianPassed"] == 1
+        assert wire["directionBalance"]["shortIntents"] == 1
+        assert wire["blocked"] == {}                          # 逆势放行不是降级
+        assert session.discipline_wire()["contrarian"]["remaining"] == 2
+    finally:
+        await dispose_engine()
+
+
+async def test_short_is_blocked_and_the_note_keeps_the_direction():
+    """同一场景关掉逆势通路 ⇒ 降级 hold、方向轴记在 short 上、注记里的提议仍是 `open_short`。"""
+    await init_db()
+    try:
+        session = _consensus_session(contrarian=False)
+        stage1 = TradeDecision("open_short", 0.5, 0.72, "r",
+                               contrarian_evidence=_SHORT_EVIDENCE)
+        session._discipline.note_intent("open_short", None)
+        out, degrade = session._apply_consensus_gate(stage1, _long_board(), None)
+        assert out.action == "hold" and degrade.startswith("low_consensus")
+        session._discipline.funnel.note_executed(out.action, False)
+        session._discipline.note_round(degrade)
+        session._discipline.funnel.end_round()
+        wire = session._status_payload()["openFunnel"]
+        assert wire["bySide"]["short"]["blocked"] == {"consensus": 1}
+        assert wire["directionBalance"]["verdict"] == "insufficient"   # 样本不足，不下结论
+        # ★ 轴 B：`commit_round` 收的注记必须带方向——合入前这条路径完全静默。
+        note = session._gate_veto_note(stage1, degrade, None)
+        assert note["vetoedBy"] == "consensus"
+        assert note["proposedAction"] == "open_short"
+        assert note["layerLabel"] == "同向共识门槛"
+    finally:
+        await dispose_engine()
+
+
+async def test_llm_stage_round_never_shows_a_fabricated_gate_veto():
+    """★ 第一阶段模型侧的码：注记与 `tool_call` 相位**同时闭嘴**（两处共用同一判定）。
+
+    `low_confidence` 轮此刻 `stage1_decision.action` 已被 `_map_decision` 洗成 hold。若相位侧
+    漏传 `llm_degrade`，`classify_block` 会把它归到 `confidence` 那一层，卡片上就会出现
+    「模型提议的是『观望』，被『置信度门槛』降级」——一条凭空捏造的门禁事实。
+    """
+    await init_db()
+    try:
+        session = _consensus_session(contrarian=True)
+        hold = TradeDecision("hold", None, None, "low_confidence")
+        for code in ("low_confidence", "no_tool_call", "llm_error"):
+            assert session._gate_veto_note(hold, code, code) is None, code
+            assert session._trace_veto_layer(hold, hold, code, code) is None, code
+        # 对照组：确定性门禁的码两处都必须认得出，且认的是同一层。
+        stage1 = TradeDecision("open_short", 0.5, 0.72, "r")
+        note = session._gate_veto_note(stage1, "low_consensus(0/1)", "low_confidence")
+        layer = session._trace_veto_layer(hold, stage1, "low_consensus(0/1)", "low_confidence")
+        assert note["vetoedBy"] == layer == "consensus"
+    finally:
+        await dispose_engine()
+
+
+async def test_direction_axis_absent_when_master_switch_off():
+    """总闸关 ⇒ `openFunnel` 两键整键缺席、注记回落四键 ⇒ wire 逐字节回退。"""
+    await init_db()
+    try:
+        session = _consensus_session(contrarian=True, symmetry=False)
+        session._discipline.note_intent("open_short", None)
+        session._discipline.note_round("low_consensus(0/1)")
+        session._discipline.funnel.end_round()
+        wire = session._status_payload()["openFunnel"]
+        assert "bySide" not in wire and "directionBalance" not in wire
+        assert "contrarian" not in session.discipline_wire()
+        # 总闸关时的注记只认持仓周期层，且恒为四键（`layerLabel` 不出现）。
+        stage1 = TradeDecision("open_short", 0.5, 0.72, "r")
+        assert session._gate_veto_note(stage1, "low_consensus(0/1)", None) is None
     finally:
         await dispose_engine()

@@ -68,6 +68,11 @@ export function groupStateFromStatus(row: AiTradeGroupRow): AiTradeGroupState {
     // 纪律条在「刷新页面后重发现」这条路径上就恒为空（而 WS status 那条通路是好的，故这个坑
     // 只在重载后复现，最难被发现）。`aiTradeDiscipline.test.ts` 有一条用例专门守它。
     discipline: row.discipline ?? null,
+    // 方向对称性回执（directional-symmetry §7.1）：同上，本函数是逐键手抄的映射。spec §五那一行
+    // 写的是「本轴的新键都挂在成员级 openFunnel 之下，故本文件不需要改」——但 `direction` 是
+    // **分组级**回执，它落在这里，漏抄的表现就是那条注释警告过的形状：WS 通路是好的，只有刷新
+    // 页面后重发现才拿不到生效值，而且不报任何错。
+    direction: row.direction ?? null,
     // pause-resume D-7：这里此前**写死**成 "running"，于是暂停态在「刷新页面后重发现」这条路径上
     // 恒显示为运行中——最难被发现的那种坑。`?? "running"` 让老后端逐字回退。
     // lifecycle-truth L-1：`state` 优先吃后端**派生**的那个（`lifecycle.state`），其次

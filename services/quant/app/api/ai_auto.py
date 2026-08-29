@@ -64,6 +64,7 @@ from ..paper.strategy_factory import build_paper_strategy_spec
 from ..schemas import (
     AiBacktestStartIn,
     AiTradeBaseRulesIn,
+    AiTradeDirectionIn,
     AiTradeDisciplineIn,
     AiTradeGroupStartIn,
     AiTradeHistoryDetailOut,
@@ -149,6 +150,46 @@ def _resolve_discipline(raw: AiTradeDisciplineIn | None, settings: Settings, *,
             "reason": f"仓位层需要 {need} 根收盘价（波动率窗口与相关性样本的较大者），已自动抬高暖机根数"})
         priming_bars = need
     return derived, preset, priming_bars
+
+
+# 方向对称性覆盖字段（camelCase wire）→ settings 键。值域已由 `AiTradeDirectionIn` 的 `Field`
+# 在入口校验，本层**只做映射与缺省回填、不复夹**（沿用 `_resolve_position_step` 的 [R-2] 惯例）。
+_DIRECTION_TO_SETTING: dict[str, str] = {
+    "contrarianMinConfidence": "ai_trade_consensus_contrarian_min_confidence",
+    "contrarianMaxOpposingVotes": "ai_trade_consensus_contrarian_max_opposing_votes",
+    "contrarianMinEvidenceChars": "ai_trade_consensus_contrarian_min_evidence_chars",
+    "contrarianMaxPerSession": "ai_trade_consensus_contrarian_max_per_session",
+    "contrarianSizeMult": "ai_trade_consensus_contrarian_size_mult",
+}
+
+
+def _resolve_direction(raw: AiTradeDirectionIn | None, settings: Settings) -> Settings:
+    """方向对称性「缺省即开启」语义的**唯一解析点**（directional-symmetry §7.1）。
+
+    与 `_resolve_base_rules` / `_resolve_horizon` 的成文惯例逐字同构：字段缺省 ⇒ 按 settings
+    装配开启态（老客户端 / 桌面旧包不发该字段也默认开启）；显式 `contrarianEnabled=false` ⇒
+    该会话不装配逆势通路；运维总闸 `AI_TRADE_DIRECTIONAL_SYMMETRY_ENABLED=false` ⇒ 恒不装配。
+
+    产出的是**又一层派生 settings 副本**（镜像 `_resolve_discipline` 与 `resolve_experience_settings`
+    的既有姿态），而不是一个规则对象：本轴的六个阈值本来就住在 settings 上，
+    `signals.consensus_rule_from_settings` 是它们唯一的读点，多造一个规则对象等于多一份会漂移的真源。
+
+    ⚠️ **调用点必须排在 `_resolve_discipline` 之后**：纪律预设的 `steady` / `balanced` 两档各自带了
+    `ai_trade_consensus_contrarian_enabled` 的默认值，早一步派生就会被预设覆盖掉用户的显式选择。
+
+    Returns:
+        原对象本身（无需改动时，`is` 相等）或新的派生副本。
+    """
+    if not settings.ai_trade_directional_symmetry_enabled:
+        return settings
+    if raw is None:
+        return settings                      # 缺省 ⇒ 按 settings（含纪律预设）装配，零改动
+    updates: dict = {"ai_trade_consensus_contrarian_enabled": bool(raw.contrarianEnabled)}
+    for wire_key, setting_key in _DIRECTION_TO_SETTING.items():
+        value = raw.overrides().get(wire_key)
+        if value is not None:
+            updates[setting_key] = value
+    return settings.model_copy(update=updates)
 
 
 def _resolve_position_step(raw: float | None, settings: Settings) -> float:
@@ -347,6 +388,10 @@ async def build_start_request(session: AsyncSession, settings: Settings,
     # 那 15 项可写阈值（`app_settings["experience.*"]`）并回 `Settings`；没有这一座桥，那个面板就是
     # 一个用户改得动、系统永远不读、而且不报错的假面板（不变式 I-10，用例 A-41）。
     settings = await resolve_experience_settings(session, settings)
+    # 方向对称性（directional-symmetry §7.1）：**必须排在 `_resolve_discipline` 之后**——
+    # `steady` / `balanced` 两档预设各自带了 `ai_trade_consensus_contrarian_enabled` 的默认值，
+    # 早一步派生就会被预设覆盖掉用户的显式选择。本步在其结果上**再派生一次**。
+    settings = _resolve_direction(body.direction, settings)
     experience_rule = resolve_experience(
         body.experience.model_dump() if body.experience is not None else None, settings)
     experience_snapshot = await load_session_graph(
@@ -796,6 +841,9 @@ async def ai_backtest_start(body: AiBacktestStartIn, session: AsyncSession = Dep
     # `primingBars` 抬升在此不适用（传 0 ⇒ 恒不触发；回测窗口由 `start_ts/end_ts` 决定）。
     settings, discipline, _ = _resolve_discipline(
         body.discipline, settings, spec_count=len(specs), priming_bars=0)
+    # 方向对称性：与实盘**同一解析点、同一顺序**（纪律预设之后）。两侧不同源，用户拿回测调出来
+    # 的逆势通路参数在实盘直接失真（`base_rules` P1-4 的成文教训）。
+    settings = _resolve_direction(body.direction, settings)
     req = AiBacktestStartRequest(
         specs=specs, inst_id=body.instId, bar=body.bar, start_ts=body.startTs, end_ts=body.endTs,
         settings=settings, context_refresh_rounds=body.contextRefreshRounds,
@@ -820,7 +868,11 @@ async def ai_backtest_start(body: AiBacktestStartIn, session: AsyncSession = Dep
             # 「我在回测里调好的那组阈值到底跑没跑」这个问题在回测侧无从回答。
             "discipline": {"preset": discipline.preset_id,
                            "minConsensus": runner.min_consensus,
-                           "adjustments": discipline.adjustments}}
+                           "adjustments": discipline.adjustments},
+            # 方向对称性回执（directional-symmetry §7.1）：与实盘同一解析点、同一形状。
+            # 未装配 ⇒ `null`——回测侧也必须能回答「这一跑到底开没开逆势通路」，否则「开 vs 不开」
+            # 的净额对照跑的是什么参数就说不清了。
+            "direction": runner.direction_wire()}
 
 
 @router.post("/ai-trade/backtest/{job_id}/cancel")

@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pandas as pd
 
@@ -25,6 +25,9 @@ from ..paper.strategy_factory import PaperStrategySpec
 from ..strategies.base import Signal
 from .decider import TradeDecision
 from .signal_prior import TIE_EPS
+
+# 开仓动作枚举（与 `open_funnel._OPEN_ACTIONS` 同值；共识门禁的作用域判据）。
+_OPEN_ACTIONS = ("open_long", "open_short")
 
 # 影子 broker 名义资金（仅用于读立场；stance 只取决于开/平信号，与具体权益无关）。
 _SHADOW_CAPITAL = 10_000.0
@@ -89,6 +92,9 @@ class WeightedConsensus:
     p_long: float | None       # 该方向无贡献者 ⇒ None（**不是 0.5**）
     p_short: float | None
     net_stance: str            # long | short | flat（差值不超过 TIE_EPS 即 flat）
+    # 净立场的证据基础（轴 E-1）：both | single_side | none。**末位以外的位置须带默认值**会破坏
+    # 既有位置构造，故本字段插在这里、由 `compute_weighted_consensus` 关键字构造统一填充。
+    net_stance_basis: str
     weight_long: float
     weight_short: float
     contributors_long: int
@@ -96,8 +102,8 @@ class WeightedConsensus:
     coverage: float | None     # 有立场的板上策略里有先验的比例；全板空仓 ⇒ None（**不是 0.0**）
 
 
-def compute_weighted_consensus(board: list["StrategySignalView"],
-                               priors) -> WeightedConsensus | None:
+def compute_weighted_consensus(board: list["StrategySignalView"], priors,
+                               *, debias: bool = False) -> WeightedConsensus | None:
     """按方向先验聚合出加权共识；先验缺席 / 两侧皆无贡献者 ⇒ `None` ⇒ payload 整键缺席。
 
     **本轮不接门禁**：`apply_consensus_gate` 的入参与行为逐字不变，加权结果只进 payload / prompt /
@@ -106,6 +112,8 @@ def compute_weighted_consensus(board: list["StrategySignalView"],
     Args:
         board: 本轮信号板。
         priors: `{"long": DirectionPrior|None, "short": DirectionPrior|None}`；`None` ⇒ 返回 None。
+        debias: 方向对称性总闸（轴 E-1）。`True` ⇒ 单侧无证据不再按 0.5 参与比较、净立场判 `flat`；
+            `False`（默认）⇒ 逐字节回退。
 
     Returns:
         `WeightedConsensus` 或 `None`。
@@ -119,7 +127,8 @@ def compute_weighted_consensus(board: list["StrategySignalView"],
     p_short = None if short is None else short.p
     return WeightedConsensus(
         p_long=p_long, p_short=p_short,
-        net_stance=_weighted_net_stance(p_long, p_short),
+        net_stance=_weighted_net_stance(p_long, p_short, debias=debias),
+        net_stance_basis=net_stance_basis(p_long, p_short),
         weight_long=0.0 if long_ is None else long_.w_sum,
         weight_short=0.0 if short is None else short.w_sum,
         contributors_long=0 if long_ is None else long_.contributor_n,
@@ -127,12 +136,33 @@ def compute_weighted_consensus(board: list["StrategySignalView"],
         coverage=_weighted_coverage(board, priors))
 
 
-def _weighted_net_stance(p_long: float | None, p_short: float | None) -> str:
-    """净立场判定：无证据的一侧按中性 0.5 **参与比较**，但 `p_long`/`p_short` 仍如实为 `None`。
+def net_stance_basis(p_long: float | None, p_short: float | None) -> str:
+    """净立场的**证据基础**：`both`（两侧都有先验）/ `single_side`（只有一侧）/ `none`（都没有）。
 
-    把 0.5 写进 wire 会让「没有证据」和「证据说五五开」变成同一个数；只在比较这一处用中性值，
-    是为了让「只有一侧有先验」的轮次仍能给出方向，而不是一律 flat。
+    它是 `netStance` 那个词的资格证明。没有它，「flat」在 wire 上与「两侧都有先验、正好打平」
+    长得一模一样，而两者对模型的含义完全相反。
     """
+    if p_long is not None and p_short is not None:
+        return "both"
+    return "none" if p_long is None and p_short is None else "single_side"
+
+
+def _weighted_net_stance(p_long: float | None, p_short: float | None,
+                         *, debias: bool = False) -> str:
+    """净立场判定；两侧都有先验时按差值定向，差值不超过 `TIE_EPS` 即 `flat`。
+
+    `debias`（directional-symmetry 轴 E-1）：
+
+    - `False`（默认，总闸关）⇒ **逐字节回退**：无证据的一侧按中性 `0.5` 参与比较。
+    - `True` ⇒ 一侧无证据即返回 `"flat"`。理由是这里有一个会自我强化的吸收态：不做空 ⇒ 无做空
+      样本 ⇒ `p_short is None` ⇒ 按 0.5 参与比较 ⇒ 只要 `p_long > 0.5` 净立场恒为 `long`
+      ⇒ 更不做空。用中性值补一个**不存在的**读数，等于把「没有证据」当成「证据说五五开」，
+      而那正是本轮要根除的那种不诚实。
+
+    `p_long` / `p_short` 在 wire 上仍如实为 `None`——把 0.5 写进 wire 会让两者变成同一个数。
+    """
+    if debias and (p_long is None or p_short is None):
+        return "flat"
     lo = 0.5 if p_long is None else p_long
     sh = 0.5 if p_short is None else p_short
     if lo - sh > TIE_EPS:
@@ -171,7 +201,10 @@ def weighted_consensus_wire(weighted: WeightedConsensus | None) -> dict | None:
     if weighted is None:
         return None
     return {"pLong": weighted.p_long, "pShort": weighted.p_short,
-            "netStance": weighted.net_stance, "weightLong": round(weighted.weight_long, 4),
+            "netStance": weighted.net_stance,
+            # 轴 E-1：让「没有证据」与「证据说五五开」在 wire 上可区分。
+            "netStanceBasis": weighted.net_stance_basis,
+            "weightLong": round(weighted.weight_long, 4),
             "weightShort": round(weighted.weight_short, 4),
             "contributorsLong": weighted.contributors_long,
             "contributorsShort": weighted.contributors_short,
@@ -232,6 +265,243 @@ def evaluate_signal_board(specs: list[PaperStrategySpec], shadows: list[SimBroke
 
 
 # ============================ 共识门禁 + 决策→信号（session 与 backtest 共用核心，§2.8/R1） ============================
+@dataclass(frozen=True)
+class ConsensusRule:
+    """共识门禁的会话级不可变配置（随 `AiTradeSession` / `AiBacktestRunner` 生命周期）。
+
+    `contrarian_enabled=False` ⇒ `resolve_consensus_gate` 的行为**逐字等于**旧版三参
+    `apply_consensus_gate`（用例 `test_contrarian_disabled_is_byte_identical_to_legacy`）。
+
+    ⚠️ **本对象刻意不带 `position_step`**：步长是决策器的属性、不是纪律阈值，放进规则对象就会
+    出现「规则里的 step 与决策器的 step 不是同一个」这种不报错的分叉。它作为 keyword-only 实参
+    由调用方从 `decider.position_step` 传入（`session.py` 已有两处同款取法）。
+
+    ⚠️ **`min_consensus` 必须取自 `_resolve_discipline` 之后的那份派生 settings 副本**。在
+    `AiTradeSession.__init__` 里抢先快照会读到**旧的 settings 对象**——`api/ai_auto.py` 的
+    [P1-2] / G-13 已经把这个顺序钉死过一次，纪律预设的阈值在那之前全是死字母。
+    """
+
+    min_consensus: int = 0
+    contrarian_enabled: bool = False          # 逆势通路总闸；False ⇒ 行为逐字等于旧版
+    contrarian_min_confidence: float = 0.65   # 模型自报置信度下界
+    contrarian_max_opposing_votes: int = 1    # 反向票数上限（板子一边倒得太厉害就不放）
+    contrarian_min_evidence_chars: int = 60   # `contrarianEvidence` 最小长度（字符数）
+    contrarian_max_per_session: int = 3       # 会话级配额
+    contrarian_size_mult: float = 0.5         # 强制降档系数（量化前）
+
+
+@dataclass(frozen=True)
+class ConsensusGateOutcome:
+    """一次共识门禁判定的完整产物（`reason is None` = 放行）。"""
+
+    decision: TradeDecision
+    reason: str | None          # None = 放行
+    lane: str                   # "exempt" | "consensus" | "contrarian" | "veto"
+    contrarian_used: bool       # True ⇒ 调用方把会话配额 +1
+    wire: dict                  # 进 trace / 注记 / payload 的 camelCase 快照
+
+
+# 逆势通路的五个细分降级码。**全部以 `low_consensus` 开头**是刻意的：`open_funnel._DEGRADE_PREFIXES`
+# 与 `discipline_runtime._DEGRADE_PREFIXES` 里的 `low_consensus` 条目因此**零改动**即可把五个码
+# 归到 `consensus` 那一格，漏斗继续闭合。细分码是给人看的，归类真源只有一处。
+# ⚠️ 第三个消费者必须显式补：`apps/web/lib/aiTrade.ts::DEGRADE_REASON_LABELS` 是降级码中文化的
+# 唯一表，且它用 `find(startsWith)`、**顺序敏感**——四个细分码必须排在裸 `low_consensus` 之前。
+REASON_OPPOSED = "low_consensus_opposed"
+REASON_QUOTA = "low_consensus_quota"
+REASON_CONFIDENCE = "low_consensus_conf"
+REASON_EVIDENCE = "low_consensus_evidence"
+REASON_SIZE = "low_consensus_size"
+
+
+def _is_finite(value) -> bool:
+    """`value` 是不是一个有限实数（fail-closed 判据：非有限 / 非数 ⇒ 假）。"""
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def resolve_consensus_gate(decision: TradeDecision, consensus: Consensus, rule: ConsensusRule,
+                           *, position_step: float,
+                           used_contrarian: int) -> ConsensusGateOutcome:
+    """共识门禁的**纯核心**（实盘 session 与回测 runner 共用；directional-symmetry 轴 A）。
+
+    ## 这一层解决什么
+
+    旧版判据 `votes >= min_consensus` **看起来对称**（两个方向用同一个阈值），**在物理上却只会
+    拦逆势那一侧**：单边行情里信号板必然一边倒，于是「同向票数 >= 1」对顺势方向恒成立、对逆势
+    方向恒不成立。它把宪章里那句「你有权推翻任何单一信号」在**开仓这个唯一有意义的场景**里
+    变成了空头支票（生产实测：回归窗口 1540 次开仓意愿里 832 次死在本层）。
+
+    本函数保留门禁的保护意图，另给一条**受严格约束、必须降档、有会话配额、对两个方向逐字同构**
+    的逆势通路。
+
+    ## 五条不可动摇的不变式（改本函数前先读）
+
+    1. **对两个方向逐字同构**。判定分支里除了 `votes` / `opposing` 的取数那一行，**不允许出现
+       任何 `action == "open_short"` 的字面判断**。否则我们只是把偏斜换了个方向。
+    2. **只可能更宽、绝不更窄**。逆势通路只在「原本必然被拦死」的轮次生效；它不可能把一个原本
+       放行的决策变成 hold，也不可能放大仓位。
+    3. **fail-closed**。任一入参缺失 / 非法（`confidence` 非有限、`contrarian_evidence` 非字符串、
+       `used_contrarian` 非整数）=> 不走逆势通路，退回原否决。「无法验证」不等于「合规」。
+    4. **全部新降级码以 `low_consensus` 开头**（见上方常量注释）。
+    5. **`contrarian` 不是降级**。它进漏斗的 `contrarianPassed` 独立计数，**不进 `blocked`**
+       （镜像 `sizing_zeroed` 不是一道闸的成文纪律）。
+
+    Args:
+        decision: 决策器本轮产出（已过安全回落与置信度门）。
+        consensus: 本轮共识度（`compute_consensus` 产物）。
+        rule: 本会话的共识门禁配置。
+        position_step: 仓位档位步长，真源是 `decider.position_step`（keyword-only）。
+        used_contrarian: 本会话**已经**用掉的逆势名额（纯核心不持状态，由调用方持有并传入）。
+
+    Returns:
+        `ConsensusGateOutcome`。
+    """
+    if rule.min_consensus <= 0 or decision.action not in _OPEN_ACTIONS:
+        # 豁免轮返回**同一个** decision 对象（`is` 相等），绝不顺手 replace。
+        return ConsensusGateOutcome(decision, None, "exempt", False,
+                                    _consensus_wire("exempt", rule, 0, 0, used_contrarian, None))
+    # ★ 全函数**唯一**一处按方向取数（不变式 1）：此行之下不允许再出现任何方向字面判断。
+    long_side = decision.action == "open_long"
+    votes = consensus.long_votes if long_side else consensus.short_votes
+    opposing = consensus.short_votes if long_side else consensus.long_votes
+    if votes >= rule.min_consensus:
+        return ConsensusGateOutcome(decision, None, "consensus", False,
+                                    _consensus_wire("consensus", rule, votes, opposing,
+                                                    used_contrarian, None))
+    tally = f"({votes}/{rule.min_consensus})"
+    if not rule.contrarian_enabled:
+        # 逐字节回退：降级码与旧版 `apply_consensus_gate` 完全相同。
+        return _veto(decision, f"low_consensus{tally}", rule, votes, opposing, used_contrarian)
+    blocked = _contrarian_block(rule, decision, opposing=opposing,
+                                used_contrarian=used_contrarian)
+    if blocked is not None:
+        return _veto(decision, f"{blocked}{tally}", rule, votes, opposing, used_contrarian)
+    # 强制降档（不变式 2：只可能更小）。三种情形一律退回否决，报 `low_consensus_size`：
+    #   ① 被档位地板吃到 0 —— 绝不发一张零张的单；
+    #   ② 量化向上吸附把仓位放大到原值以上 —— 本通路只可能更宽，绝不可能放大仓位；
+    #   ③ **降档被请求了却没有真的发生**（`mult<1` 而量化把它吸附回了原值）。
+    # ③ 是实施期发现的方案缺陷（见 spec §实施过程发现的方案缺陷 I-1）：spec 的伪代码只判了
+    # `size <= 0`。在 `step=0.5` 这类粗档位上 `0.5×0.5=0.25` 会被吸附回 0.5，于是逆势通路会
+    # **按原仓位全额放行**——RK-1 承诺的那道「强制降档 ×0.5」当场失效，且不报任何错。
+    proposed = float(decision.size_fraction or 0.0)
+    target = proposed * rule.contrarian_size_mult
+    size = quantize_size_fraction(target, position_step)
+    shrink_requested = rule.contrarian_size_mult < 1.0
+    if size <= 0 or size > proposed or (shrink_requested and size >= proposed):
+        return _veto(decision, f"{REASON_SIZE}{tally}", rule, votes, opposing, used_contrarian)
+    return ConsensusGateOutcome(replace(decision, size_fraction=size), None, "contrarian", True,
+                                _consensus_wire("contrarian", rule, votes, opposing,
+                                                used_contrarian, None))
+
+
+def _contrarian_block(rule: ConsensusRule, decision: TradeDecision, *, opposing: int,
+                      used_contrarian: int) -> str | None:
+    """逆势通路的四条件（**顺序即降级码**：先判到哪条就报哪条）；全过 ⇒ `None`。
+
+    fail-closed（不变式 3）：`used_contrarian` 非整数、`confidence` 非有限、证据非字符串，
+    三者一律判为不通过——「无法验证」不等于「合规」。
+    """
+    if opposing > rule.contrarian_max_opposing_votes:
+        return REASON_OPPOSED
+    if not isinstance(used_contrarian, int) or used_contrarian >= rule.contrarian_max_per_session:
+        return REASON_QUOTA
+    if (not _is_finite(decision.confidence)
+            or float(decision.confidence) < rule.contrarian_min_confidence):
+        return REASON_CONFIDENCE
+    evidence = decision.contrarian_evidence
+    if not isinstance(evidence, str) or len(evidence.strip()) < rule.contrarian_min_evidence_chars:
+        return REASON_EVIDENCE
+    return None
+
+
+def _veto(decision: TradeDecision, reason: str, rule: ConsensusRule, votes: int,
+          opposing: int, used_contrarian: int) -> ConsensusGateOutcome:
+    """把开仓硬降级为 hold（构造出的 hold 与旧版 `apply_consensus_gate` **逐字相同**）。"""
+    hold = TradeDecision(action="hold", size_fraction=None, confidence=None, reason=reason)
+    return ConsensusGateOutcome(hold, reason, "veto", False,
+                                _consensus_wire("veto", rule, votes, opposing,
+                                                used_contrarian, reason))
+
+
+def _consensus_wire(lane: str, rule: ConsensusRule, votes: int, opposing: int,
+                    used_contrarian: int, reason: str | None) -> dict:
+    """门禁判定的 camelCase 只读快照（trace 相位 / `gateVeto` 注记 / payload 共用同一份）。"""
+    used = used_contrarian if isinstance(used_contrarian, int) else 0
+    remaining = max(0, rule.contrarian_max_per_session - used) if rule.contrarian_enabled else 0
+    return {"lane": lane, "votes": votes, "opposingVotes": opposing,
+            "minConsensus": rule.min_consensus, "reason": reason,
+            "contrarianAvailable": bool(rule.contrarian_enabled),
+            "contrarianUsed": used, "contrarianRemaining": remaining,
+            "contrarianMinConfidence": rule.contrarian_min_confidence,
+            "contrarianMinEvidenceChars": rule.contrarian_min_evidence_chars,
+            "contrarianMaxOpposingVotes": rule.contrarian_max_opposing_votes,
+            "contrarianSizeMult": rule.contrarian_size_mult}
+
+
+def consensus_rule_from_settings(settings) -> ConsensusRule:
+    """settings -> `ConsensusRule` 的**唯一**转换点（实盘 session 与回测 runner 共用）。
+
+    ⚠️ 传进来的必须是 `_resolve_discipline` **之后**那份派生 settings 副本
+    （`executor.settings` / `runner.settings` 都是它）：纪律预设的 `ai_trade_min_consensus`
+    只存在于派生副本上，读进程级单例会拿到一组死字母阈值（`api/ai_auto.py` 的 [P1-2] / G-13）。
+
+    逆势通路要**两个总闸同时开**：方向对称性总闸关掉时整个特性逐字节回退，故它优先。
+    """
+    return ConsensusRule(
+        min_consensus=int(settings.ai_trade_min_consensus),
+        contrarian_enabled=bool(settings.ai_trade_directional_symmetry_enabled
+                                and settings.ai_trade_consensus_contrarian_enabled),
+        contrarian_min_confidence=float(settings.ai_trade_consensus_contrarian_min_confidence),
+        contrarian_max_opposing_votes=int(
+            settings.ai_trade_consensus_contrarian_max_opposing_votes),
+        contrarian_min_evidence_chars=int(
+            settings.ai_trade_consensus_contrarian_min_evidence_chars),
+        contrarian_max_per_session=int(settings.ai_trade_consensus_contrarian_max_per_session),
+        contrarian_size_mult=float(settings.ai_trade_consensus_contrarian_size_mult))
+
+
+def contrarian_schema(rule: ConsensusRule):
+    """`ConsensusRule` -> 决策工具 schema 的三个阈值；通路不可用 ⇒ `None` ⇒ schema 逐字节回退。
+
+    实盘与回测**共用本函数**：只在一处露出 `contrarianEvidence`，另一处的逆势通路就恒不可达
+    （证据字段永远为 None ⇒ `low_consensus_evidence`），而两边的行为分叉不会报任何错。
+
+    返回类型是 `prompts.ContrarianSchemaOptions | None`——**刻意不写进注解**：模块级引用
+    `prompts` 会造出 `signals → prompts → signals` 的 import 环（`position_ladder` 那条延迟导入
+    正是为它存在的）。
+
+    Returns:
+        `ContrarianSchemaOptions` 或 `None`（通路不可用）。
+    """
+    if not rule.contrarian_enabled or rule.min_consensus <= 0:
+        return None
+    from .prompts import ContrarianSchemaOptions   # 延迟导入打破 signals→prompts 模块级循环
+
+    return ContrarianSchemaOptions(min_chars=rule.contrarian_min_evidence_chars,
+                                   min_confidence=rule.contrarian_min_confidence,
+                                   size_mult=rule.contrarian_size_mult)
+
+
+def contrarian_payload(rule: ConsensusRule, used_contrarian: int) -> dict | None:
+    """`payload["consensus"]["contrarian"]`：**让模型知道这条通路存在**（A-5）。
+
+    没有这一段，逆势通路就是一个「有写点没读点」的功能：模型不知道存在这条门槛、不知道差几票、
+    也不知道要写 `contrarianEvidence` 才能走。通路不可用 ⇒ 返回 `None` ⇒ **整键缺席** ⇒
+    prompt 逐字节回退。
+    """
+    if not rule.contrarian_enabled or rule.min_consensus <= 0:
+        return None
+    used = used_contrarian if isinstance(used_contrarian, int) else 0
+    return {"available": True,
+            "minConfidence": rule.contrarian_min_confidence,
+            "minEvidenceChars": rule.contrarian_min_evidence_chars,
+            "maxOpposingVotes": rule.contrarian_max_opposing_votes,
+            "remaining": max(0, rule.contrarian_max_per_session - used),
+            "sizeMult": rule.contrarian_size_mult}
+
+
 def apply_consensus_gate(decision: TradeDecision, consensus: Consensus,
                          min_consensus: int) -> tuple[TradeDecision, str | None]:
     """共识不足则把开仓硬降级为 hold（E2 补偿控制，独立于 LLM，仅更保守）。
@@ -248,15 +518,15 @@ def apply_consensus_gate(decision: TradeDecision, consensus: Consensus,
     Returns:
         `(decision, gate_reason)`——`gate_reason` 非 None 表示本轮被共识门禁降级为 hold
         （带 `low_consensus(k/n)` 计数）；未降级则 `gate_reason is None`。
+
+    **三参旧签名保留不动，实现已降为 `resolve_consensus_gate` 的薄封装**
+    （directional-symmetry 轴 A）：`ConsensusRule(min_consensus=...)` 的
+    `contrarian_enabled` 默认 `False` ⇒ 逆势通路不参与 ⇒ 既有单测与任何未迁移调用点
+    **逐字节回退**（放行轮同样返回同一个对象，`is` 相等）。
     """
-    if min_consensus <= 0 or decision.action not in ("open_long", "open_short"):
-        return decision, None
-    votes = consensus.long_votes if decision.action == "open_long" else consensus.short_votes
-    if votes < min_consensus:
-        reason = f"low_consensus({votes}/{min_consensus})"
-        hold = TradeDecision(action="hold", size_fraction=None, confidence=None, reason=reason)
-        return hold, reason
-    return decision, None
+    out = resolve_consensus_gate(decision, consensus, ConsensusRule(min_consensus=min_consensus),
+                                 position_step=0.0, used_contrarian=0)
+    return out.decision, out.reason
 
 
 def decision_to_signals(decision: TradeDecision) -> list[Signal]:

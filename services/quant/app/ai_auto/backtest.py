@@ -91,15 +91,18 @@ from .profit_guard_bar import BarFacts, evaluate_bar
 from .profit_guard_text import format_profit_guard_charter
 from ..agent.llm.factory import make_llm_client_from_config
 from .llm_budget import build_ai_trade_llm_clients
-from .prompts import build_ai_trade_system_prompt
+from .prompts import build_ai_trade_system_prompt, format_direction_charter
 from .prompts_en import SystemPromptOptions, SystemPromptTexts
 from .reasoning_protocol import build_deliberation_protocol, resolve_depth_profile
 from .reflection import apply_reflection, build_reflection_note
 from .signals import (
     Consensus,
     StrategySignalView,
-    apply_consensus_gate,
     compute_consensus,
+    consensus_rule_from_settings,
+    contrarian_payload,
+    contrarian_schema,
+    resolve_consensus_gate,
     decision_to_signals,
     evaluate_signal_board,
     make_shadow_broker,
@@ -252,6 +255,14 @@ class AiBacktestRunner:
         self.planned_rounds = spec.planned_rounds
         self.max_rounds = spec.settings.ai_backtest_max_rounds
         self.settings = spec.settings
+        # 共识门禁的**同一份纯核心**（directional-symmetry 轴 A）：回测与实盘共用
+        # `resolve_consensus_gate`，否则用户在回测里调出来的方向对称参数在实盘直接失真
+        # （`base_rules` P1-4 的成文教训）。**必须排在 `self.settings` 赋值之后**。
+        # `min_consensus` 用 spec 的那一份——回测侧允许启动请求显式覆盖它
+        # （`backtest_manager` 的「显式请求字段 > 预设 > config 默认」）。
+        self._consensus_rule = replace(consensus_rule_from_settings(self.settings),
+                                       min_consensus=self.min_consensus)
+        self._contrarian_used = 0
         self.rest = spec.rest
         self.position_step_pct = spec.position_step_pct   # 档位吸附（实盘/回测经共享决策脑单点收口，§2.3）
         # 下单前二次反思（RV-1：经数据类字段传参，__init__ 一次性构造决策器时接收；默认关 → 直接构造
@@ -337,11 +348,18 @@ class AiBacktestRunner:
                 options=SystemPromptOptions(position_step_pct=self.position_step_pct,
                                             allow_limit=False),
                 texts=SystemPromptTexts(
-                    # 审议协议 + 输出预算纪律；off 档 → "" ⇒ 中文脊柱逐字节回退
+                    # 审议协议 + 输出预算纪律；off 档 → "" ⇒ 中文脊柱逐字节回退。
+                    # `symmetry` 与实盘 `manager._build_member` **同源同参**（轴 C-1）。
                     reasoning_text=build_deliberation_protocol(
                         depth,
                         reserve_tokens=self.settings
-                        .ai_trade_reasoning_reserve_tokens),
+                        .ai_trade_reasoning_reserve_tokens,
+                        symmetry=self.settings
+                        .ai_trade_directional_symmetry_enabled),
+                    # 方向对称宪章章（轴 C-2）：与实盘同源——两处只填一处，用户拿回测调出来的
+                    # 方向对称行为在实盘就会失真（`base_rules` P1-4 的成文教训）。
+                    direction_text=format_direction_charter(
+                        self.settings.ai_trade_directional_symmetry_enabled),
                     # 铁律宪章同源注入；未装配 → "" ⇒ 渲染逐字节不变
                     base_rules_text=format_charter(self.base_rule),
                     # 利润保护宪章同源注入（F3）；未装配 → "" ⇒ 同上零回归
@@ -358,6 +376,9 @@ class AiBacktestRunner:
             context_refresh_rounds=self.context_refresh_rounds, settings=self.settings,
             position_step_pct=self.position_step_pct, reflection_enabled=self.reflection_enabled,
             allow_limit=False,
+            # directional-symmetry A-3：`contrarianEvidence` 与实盘同源露出（回测共用同一纯核心，
+            # 不露出就等于回测里的逆势通路恒不可达、与实盘行为分叉）。
+            contrarian_schema=contrarian_schema(self._consensus_rule),
             # C5 §2.5：回测决策器同样露出 holdExitPx（allow_limit 恒 False 不变）——承诺退出线是决策
             # 语义、与限价的「回测每单必成」高估问题无关，故只随 commit_enabled 派生。
             allow_hold_exit=(self.profit_rule is not None and self.profit_rule.commit_enabled),
@@ -871,7 +892,12 @@ class AiBacktestRunner:
             decision, None, position_side=self.main.pos.side, now_wall=float(ts))
         backstop_reason = None   # 轴 B 不在回测装配：回测没有交易所，恒 None（形状仍与实盘同构）
         decision, brake_reason = self._sizing.gate(decision, None, now_wall=float(ts))  # ★ 刹车（第 7 步）
-        decision, consensus_reason = apply_consensus_gate(decision, consensus, self.min_consensus)
+        consensus_out = resolve_consensus_gate(
+            decision, consensus, self._consensus_rule,
+            position_step=self.position_step_pct, used_contrarian=self._contrarian_used)
+        if consensus_out.contrarian_used:
+            self._contrarian_used += 1
+        decision, consensus_reason = consensus_out.decision, consensus_out.reason
         # ★ 最小 edge 门禁（§3.7）：与实盘**同一纯核心、同位插入**（共识后、反思前）；k_min=0（默认）
         # ⇒ 恒返回 None ⇒ 既有回测结果逐字节相同。成本用 SimBroker 实收常数（两侧各自对自己的世界说真话）。
         # 轴 B：本轮决策的资金费入参在此**取一次并计数**（`_cost_funding` 在 `_horizon_facts` 里
@@ -1031,6 +1057,19 @@ class AiBacktestRunner:
             self._exit_reason = reason
 
     # ---------- payload / 统计 / 事件 ----------
+    def direction_wire(self) -> dict | None:
+        """方向对称性回执（与实盘 `AiTradeSession.direction_wire` **逐字同形**）；未装配 ⇒ `None`。"""
+        rule = self._consensus_rule
+        if not rule.contrarian_enabled or rule.min_consensus <= 0:
+            return None
+        return {"contrarianEnabled": True,
+                "minConsensus": rule.min_consensus,
+                "contrarianMinConfidence": rule.contrarian_min_confidence,
+                "contrarianMaxOpposingVotes": rule.contrarian_max_opposing_votes,
+                "contrarianMinEvidenceChars": rule.contrarian_min_evidence_chars,
+                "contrarianMaxPerSession": rule.contrarian_max_per_session,
+                "contrarianSizeMult": rule.contrarian_size_mult}
+
     def _build_payload(self, round_no: int, ts: int, ref_px: float, main_df: pd.DataFrame,
                        context_frames: dict[str, pd.DataFrame], i: int,
                        board: list[StrategySignalView], consensus: Consensus) -> dict:
@@ -1047,6 +1086,12 @@ class AiBacktestRunner:
                 context_frames, ts, ref_px),
             "consensus": _consensus_wire(consensus),
             "signalBoard": [_view_full(v) for v in board]}
+        # A-5：逆势通路的阈值与剩余名额，与实盘**同一个纯函数**。通路不可用 / 总闸关 ⇒ 整键缺席
+        # ⇒ prompt 逐字节回退。只在实盘注入会让回测里的模型永远不知道这条通路存在，于是回测跑出
+        # 来的方向分布与实盘不可比（`base_rules` P1-4 的成文教训）。
+        contrarian = contrarian_payload(self._consensus_rule, self._contrarian_used)
+        if contrarian is not None:
+            payload["consensus"]["contrarian"] = contrarian
         # 【基础策略】通道快照：未装配 ⇒ **整键缺席**（prompt 逐字节回退）；band 取回测帧到当前根的
         # 因果切片 iloc[:i+1]，与 marketContext/marketDigest 同一取数姿态（绝不引入未来根）。
         if self.base_rule is not None:
@@ -1360,7 +1405,10 @@ class AiBacktestRunner:
                 # 「回执与 config_json 由 rule_wire 镜像全部字段」承诺矛盾）。未装配 → None。
                 "profitGuard": rule_wire(self.profit_rule),
                 # 同上：不回填本次周期契约，run 的 config_json 就复现不了这次回测（含两个派生量）。
-                "tradingHorizon": horizon_rule_wire(self.horizon_rule)}
+                "tradingHorizon": horizon_rule_wire(self.horizon_rule),
+                # 同上（directional-symmetry §7.1）：不回填逆势通路，「开 vs 不开」的对照回测在
+                # config_json 上就分辨不出来了。未装配 → None。
+                "direction": self.direction_wire()}
 
 
 def _compute_warmup(specs: list[PaperStrategySpec], regime_enabled: bool) -> int:

@@ -150,6 +150,7 @@ export default function AiTradeToggle() {
         tradingHorizon: opts.tradingHorizon,     // 交易周期模式（同上；缺省=服务端默认开启）
         discipline: opts.discipline,             // 交易纪律预设（同上；缺省=服务端默认 balanced）
         experience: opts.experience,             // 经验模式（同上；取消勾选即 enabled:false）
+        direction: opts.direction,               // 方向对称性（同上；取消勾选即 contrarianEnabled:false）
         contextRefreshRounds: opts.contextRefreshRounds,
       }),
     onSuccess: (res, opts) => {
@@ -214,6 +215,8 @@ export default function AiTradeToggle() {
         // 回测同享交易纪律预设（同一 `_resolve_discipline`，R-3）。同一条理由：不同源就失真，
         // 且回测正是唯一能对这组阈值做「开 vs 不开」净额对照的地方。
         discipline: opts.discipline,
+        // 回测同享方向对称性（同一 `_resolve_direction`）。同一条理由：不同源就失真。
+        direction: opts.direction,
       }),
     onSuccess: (res, opts) => {
       setAiBacktestJobId(res.jobId);

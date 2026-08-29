@@ -218,7 +218,8 @@ async def resolve_experience_settings(session: AsyncSession, settings):
             return settings
         if raw is None:
             continue
-        value = _cast_setting(field, raw, caster)
+        value = _cast_setting(field, raw, caster,
+                              side_note=settings.ai_trade_directional_symmetry_enabled)
         if value is not None and value != getattr(settings, field, None):
             updates[field] = value
     if not updates:
@@ -230,8 +231,13 @@ async def resolve_experience_settings(session: AsyncSession, settings):
         return settings
 
 
-def _cast_setting(field: str, raw, caster: type):
-    """把 DB 里的原始值转成字段类型并夹紧到域内；无法解析 ⇒ `None`（该项忽略）。"""
+def _cast_setting(field: str, raw, caster: type, *, side_note: bool = False):
+    """把 DB 里的原始值转成字段类型并夹紧到域内；无法解析 ⇒ `None`（该项忽略）。
+
+    `side_note`（directional-symmetry 轴 E-2）：方向对称性总闸开时 L0 页眉多一句退化声明，
+    下限随之抬高。三个 `budget_floor` 调用点必须传**同一个**判据（★ E-7），少传一处，那一处
+    就会用一个偏小的下限放行一个「整层渲染不出一个字」的配置。
+    """
     try:
         value = bool(raw) if caster is bool else caster(raw)
     except (TypeError, ValueError):
@@ -241,7 +247,8 @@ def _cast_setting(field: str, raw, caster: type):
         # ⚠️ **本分支只认 l0 / l1**（按字段名猜层）。`reflection_max_chars`（L2）**不在**桥表里，
         # 故它今天够用；但下一轮把 L2 放进设置面板之前**必须先改这里**，否则它会静默拿 L1 的
         # 下限（164）去夹一个下限为 208 的值——一个改得动、却把整层关掉的假控件。
-        floor = budget_floor("l0" if "l0" in field else "l1")   # ★ E-7：与校验器同一判据
+        floor = budget_floor("l0" if "l0" in field else "l1",   # ★ E-7：与校验器同一判据
+                             side_note=side_note)
         if value < floor:
             logger.warning("ai-trade experience %s clamped %s → %s", field, value, floor)
             value = floor
