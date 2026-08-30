@@ -48,10 +48,11 @@ export default function AutoTradeMemberRow({
 
   return (
     <div
+      data-nowrap="row"
       draggable={!locked}
       onDragStart={(e) => (locked ? e.preventDefault() : onDragStart(e, inst.instId))}
       className={clsx(
-        "group flex items-center gap-1.5 border-l-2 pl-1.5 pr-2 transition-colors",
+        "group flex items-center gap-1.5 whitespace-nowrap border-l-2 pl-1.5 pr-2 transition-colors",
         active
           ? "border-[var(--accent)] bg-[var(--surface-2)]"
           : "border-transparent hover:bg-[var(--surface-2)]",
@@ -78,10 +79,10 @@ export default function AutoTradeMemberRow({
           <span className="truncate text-xs font-medium text-[var(--text)]">{inst.instId}</span>
           <span className="truncate text-[10px] text-[var(--muted)]">
             {running ? (
-              <span className="inline-flex items-center gap-1">
+              <span className="inline-flex shrink-0 items-center gap-1">
                 <span
                   className={clsx(
-                    "h-1.5 w-1.5 rounded-full",
+                    "h-1.5 w-1.5 shrink-0 rounded-full",
                     side === "long"
                       ? "bg-[var(--long)]"
                       : side === "short"
@@ -91,7 +92,7 @@ export default function AutoTradeMemberRow({
                 />
                 {POSITION_LABEL[side] ?? "空仓"}
                 {pnl != null && (
-                  <span className="tabular" style={{ color: colorForReturn(pnl) }}>
+                  <span className="shrink-0 tabular" style={{ color: colorForReturn(pnl) }}>
                     {fmtMoney(pnl)}
                   </span>
                 )}

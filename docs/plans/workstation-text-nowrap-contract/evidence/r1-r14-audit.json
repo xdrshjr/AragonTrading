@@ -1,0 +1,1499 @@
+[
+ {
+  "scenario": {
+   "id": "R1-R4-sidebar-min-200",
+   "w": 1440,
+   "h": 900,
+   "note": "R1/R2/R3：左侧栏拖到最窄 200px（停止态 + 8 个自选）"
+  },
+  "geom": {
+   "viewport": 1440,
+   "docScrollWidth": 1440,
+   "horizontalOverflow": 0,
+   "sidebar": 200,
+   "sidebarStyleWidth": "200px",
+   "sidebarScrollX": 0,
+   "center": 634,
+   "depthWidth": 160,
+   "depthFlexShrink": "1",
+   "sidebarFlexShrink": "1",
+   "depth": {
+    "w": 160,
+    "h": 276,
+    "sw": 160,
+    "cw": 160
+   },
+   "toolbar": {
+    "w": 602,
+    "h": 72,
+    "sw": 602,
+    "cw": 602
+   },
+   "headerBar": {
+    "w": 634,
+    "h": 88,
+    "sw": 634,
+    "cw": 634
+   },
+   "autoHeaderRow": {
+    "w": 184,
+    "h": 24,
+    "sw": 184,
+    "cw": 184
+   },
+   "autoSummaryRow": {
+    "w": 184,
+    "h": 19,
+    "sw": 184,
+    "cw": 184
+   }
+  },
+  "wrapped": [
+   {
+    "text": "把下方自选标的拖到这里，或点其「＋」加入；启动后将对所有成员同时自动交易",
+    "lines": 3,
+    "whiteSpace": "normal",
+    "declaredNormal": true,
+    "insideNowrapAnchor": false,
+    "path": "div > div > div > section > div > p"
+   }
+  ],
+  "anchors": [
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "section > div > div > div > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 184,
+    "path": "div[data-testid=\"auto-trade-header-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 184,
+    "path": "div > div > div > section > header > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 184,
+    "path": "div[data-testid=\"auto-trade-summary-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > div > section > header[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 602,
+    "path": "div[data-testid=\"chart-toolbar\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 634,
+    "path": "div[data-testid=\"chart-header-bar\"]"
+   },
+   {
+    "value": "scope",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 160,
+    "path": "div[data-testid=\"market-depth-panel\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 1006,
+    "path": "div > div > main > section > div > div[data-nowrap=\"row\"]"
+   }
+  ],
+  "tables": [],
+  "sweep": null
+ },
+ {
+  "scenario": {
+   "id": "R5-R14-overconstrained",
+   "w": 1440,
+   "h": 900,
+   "note": "R5/R14：右栏拖到 640 + 左栏拖到 460 的过约束档"
+  },
+  "geom": {
+   "viewport": 1440,
+   "docScrollWidth": 1440,
+   "horizontalOverflow": 0,
+   "sidebar": 334,
+   "sidebarStyleWidth": "460px",
+   "sidebarScrollX": 0,
+   "center": 240,
+   "depthWidth": 160,
+   "depthFlexShrink": "1",
+   "sidebarFlexShrink": "1",
+   "depth": {
+    "w": 160,
+    "h": 276,
+    "sw": 160,
+    "cw": 160
+   },
+   "toolbar": {
+    "w": 208,
+    "h": 220,
+    "sw": 264,
+    "cw": 208
+   },
+   "headerBar": {
+    "w": 240,
+    "h": 125,
+    "sw": 240,
+    "cw": 240
+   },
+   "autoHeaderRow": {
+    "w": 318,
+    "h": 24,
+    "sw": 318,
+    "cw": 318
+   },
+   "autoSummaryRow": {
+    "w": 318,
+    "h": 19,
+    "sw": 318,
+    "cw": 318
+   }
+  },
+  "wrapped": [
+   {
+    "text": "把下方自选标的拖到这里，或点其「＋」加入；启动后将对所有成员同时自动交易",
+    "lines": 2,
+    "whiteSpace": "normal",
+    "declaredNormal": true,
+    "insideNowrapAnchor": false,
+    "path": "div > div > div > section > div > p"
+   }
+  ],
+  "anchors": [
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 334,
+    "path": "section > div > div > div > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 318,
+    "path": "div[data-testid=\"auto-trade-header-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 318,
+    "path": "div > div > div > section > header > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 318,
+    "path": "div[data-testid=\"auto-trade-summary-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 334,
+    "path": "div > div > div > div > section > header[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 334,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 334,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 334,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": true,
+    "width": 208,
+    "path": "div[data-testid=\"chart-toolbar\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div[data-testid=\"chart-header-bar\"]"
+   },
+   {
+    "value": "scope",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 160,
+    "path": "div[data-testid=\"market-depth-panel\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 746,
+    "path": "div > div > main > section > div > div[data-nowrap=\"row\"]"
+   }
+  ],
+  "tables": [],
+  "sweep": null
+ },
+ {
+  "scenario": {
+   "id": "R6-narrow-860",
+   "w": 860,
+   "h": 900,
+   "note": "R6：桌面端最窄窗口 860（N3 已知残留档）"
+  },
+  "geom": {
+   "viewport": 860,
+   "docScrollWidth": 860,
+   "horizontalOverflow": 0,
+   "sidebar": 200,
+   "sidebarStyleWidth": "200px",
+   "sidebarScrollX": 0,
+   "center": 240,
+   "depthWidth": 160,
+   "depthFlexShrink": "1",
+   "sidebarFlexShrink": "1",
+   "depth": {
+    "w": 160,
+    "h": 276,
+    "sw": 160,
+    "cw": 160
+   },
+   "toolbar": {
+    "w": 208,
+    "h": 220,
+    "sw": 264,
+    "cw": 208
+   },
+   "headerBar": {
+    "w": 240,
+    "h": 125,
+    "sw": 240,
+    "cw": 240
+   },
+   "autoHeaderRow": {
+    "w": 184,
+    "h": 24,
+    "sw": 184,
+    "cw": 184
+   },
+   "autoSummaryRow": {
+    "w": 184,
+    "h": 19,
+    "sw": 184,
+    "cw": 184
+   }
+  },
+  "wrapped": [
+   {
+    "text": "把下方自选标的拖到这里，或点其「＋」加入；启动后将对所有成员同时自动交易",
+    "lines": 3,
+    "whiteSpace": "normal",
+    "declaredNormal": true,
+    "insideNowrapAnchor": false,
+    "path": "div > div > div > section > div > p"
+   }
+  ],
+  "anchors": [
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "section > div > div > div > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 184,
+    "path": "div[data-testid=\"auto-trade-header-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 184,
+    "path": "div > div > div > section > header > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 184,
+    "path": "div[data-testid=\"auto-trade-summary-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > div > section > header[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": true,
+    "width": 208,
+    "path": "div[data-testid=\"chart-toolbar\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div[data-testid=\"chart-header-bar\"]"
+   },
+   {
+    "value": "scope",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 160,
+    "path": "div[data-testid=\"market-depth-panel\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 426,
+    "path": "div > div > main > section > div > div[data-nowrap=\"row\"]"
+   }
+  ],
+  "tables": [],
+  "sweep": null
+ },
+ {
+  "scenario": {
+   "id": "R6-wide-1920",
+   "w": 1920,
+   "h": 1000,
+   "note": "R6：1920 宽档回程（默认三档宽）"
+  },
+  "geom": {
+   "viewport": 1920,
+   "docScrollWidth": 1920,
+   "horizontalOverflow": 0,
+   "sidebar": 240,
+   "sidebarStyleWidth": "240px",
+   "sidebarScrollX": 0,
+   "center": 1011,
+   "depthWidth": 223,
+   "depthFlexShrink": "1",
+   "sidebarFlexShrink": "1",
+   "depth": {
+    "w": 223,
+    "h": 276,
+    "sw": 223,
+    "cw": 223
+   },
+   "toolbar": {
+    "w": 979,
+    "h": 68,
+    "sw": 979,
+    "cw": 979
+   },
+   "headerBar": {
+    "w": 1011,
+    "h": 49,
+    "sw": 1011,
+    "cw": 1011
+   },
+   "autoHeaderRow": {
+    "w": 224,
+    "h": 24,
+    "sw": 224,
+    "cw": 224
+   },
+   "autoSummaryRow": {
+    "w": 224,
+    "h": 19,
+    "sw": 224,
+    "cw": 224
+   }
+  },
+  "wrapped": [
+   {
+    "text": "把下方自选标的拖到这里，或点其「＋」加入；启动后将对所有成员同时自动交易",
+    "lines": 2,
+    "whiteSpace": "normal",
+    "declaredNormal": true,
+    "insideNowrapAnchor": false,
+    "path": "div > div > div > section > div > p"
+   }
+  ],
+  "anchors": [
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "section > div > div > div > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 224,
+    "path": "div[data-testid=\"auto-trade-header-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 224,
+    "path": "div > div > div > section > header > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 224,
+    "path": "div[data-testid=\"auto-trade-summary-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div > div > div > div > section > header[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 979,
+    "path": "div[data-testid=\"chart-toolbar\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 1011,
+    "path": "div[data-testid=\"chart-header-bar\"]"
+   },
+   {
+    "value": "scope",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 223,
+    "path": "div[data-testid=\"market-depth-panel\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 1486,
+    "path": "div > div > main > section > div > div[data-nowrap=\"row\"]"
+   }
+  ],
+  "tables": [],
+  "sweep": null
+ },
+ {
+  "scenario": {
+   "id": "R10-rightpanel-320",
+   "w": 1200,
+   "h": 900,
+   "note": "R10：右栏拖到最窄 320px（交易策略面板 + 运行历史 + 指标卡）"
+  },
+  "geom": {
+   "viewport": 1200,
+   "docScrollWidth": 1200,
+   "horizontalOverflow": 0,
+   "sidebar": 240,
+   "sidebarStyleWidth": "240px",
+   "sidebarScrollX": 0,
+   "center": 414,
+   "depthWidth": 160,
+   "depthFlexShrink": "1",
+   "sidebarFlexShrink": "1",
+   "depth": {
+    "w": 160,
+    "h": 276,
+    "sw": 160,
+    "cw": 160
+   },
+   "toolbar": {
+    "w": 382,
+    "h": 108,
+    "sw": 382,
+    "cw": 382
+   },
+   "headerBar": {
+    "w": 414,
+    "h": 88,
+    "sw": 414,
+    "cw": 414
+   },
+   "autoHeaderRow": {
+    "w": 224,
+    "h": 24,
+    "sw": 224,
+    "cw": 224
+   },
+   "autoSummaryRow": {
+    "w": 224,
+    "h": 19,
+    "sw": 224,
+    "cw": 224
+   }
+  },
+  "wrapped": [
+   {
+    "text": "把下方自选标的拖到这里，或点其「＋」加入；启动后将对所有成员同时自动交易",
+    "lines": 2,
+    "whiteSpace": "normal",
+    "declaredNormal": true,
+    "insideNowrapAnchor": false,
+    "path": "div > div > div > section > div > p"
+   }
+  ],
+  "anchors": [
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "section > div > div > div > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 224,
+    "path": "div[data-testid=\"auto-trade-header-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 224,
+    "path": "div > div > div > section > header > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 224,
+    "path": "div[data-testid=\"auto-trade-summary-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div > div > div > div > section > header[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 382,
+    "path": "div[data-testid=\"chart-toolbar\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 414,
+    "path": "div[data-testid=\"chart-header-bar\"]"
+   },
+   {
+    "value": "scope",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 160,
+    "path": "div[data-testid=\"market-depth-panel\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 826,
+    "path": "div > div > main > section > div > div[data-nowrap=\"row\"]"
+   }
+  ],
+  "tables": [
+   {
+    "cls": "w-full min-w-[620px] text-xs",
+    "tableWidth": 802,
+    "scrollHost": "div > main > section > div > div > div",
+    "hostScrollable": false,
+    "clipped": false
+   },
+   {
+    "cls": "w-full min-w-[420px] text-xs",
+    "tableWidth": 420,
+    "scrollHost": "div > div > div > div > div > div",
+    "hostScrollable": true,
+    "clipped": false
+   }
+  ],
+  "sweep": null
+ },
+ {
+  "scenario": {
+   "id": "R11-dark-1024",
+   "w": 1024,
+   "h": 900,
+   "note": "R11：暗色主题 1024 档"
+  },
+  "geom": {
+   "viewport": 1024,
+   "docScrollWidth": 1024,
+   "horizontalOverflow": 0,
+   "sidebar": 200,
+   "sidebarStyleWidth": "200px",
+   "sidebarScrollX": 0,
+   "center": 240,
+   "depthWidth": 160,
+   "depthFlexShrink": "1",
+   "sidebarFlexShrink": "1",
+   "depth": {
+    "w": 160,
+    "h": 276,
+    "sw": 160,
+    "cw": 160
+   },
+   "toolbar": {
+    "w": 208,
+    "h": 220,
+    "sw": 264,
+    "cw": 208
+   },
+   "headerBar": {
+    "w": 240,
+    "h": 125,
+    "sw": 240,
+    "cw": 240
+   },
+   "autoHeaderRow": {
+    "w": 184,
+    "h": 24,
+    "sw": 184,
+    "cw": 184
+   },
+   "autoSummaryRow": {
+    "w": 184,
+    "h": 19,
+    "sw": 184,
+    "cw": 184
+   }
+  },
+  "wrapped": [
+   {
+    "text": "把下方自选标的拖到这里，或点其「＋」加入；启动后将对所有成员同时自动交易",
+    "lines": 3,
+    "whiteSpace": "normal",
+    "declaredNormal": true,
+    "insideNowrapAnchor": false,
+    "path": "div > div > div > section > div > p"
+   }
+  ],
+  "anchors": [
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "section > div > div > div > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 184,
+    "path": "div[data-testid=\"auto-trade-header-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 184,
+    "path": "div > div > div > section > header > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 184,
+    "path": "div[data-testid=\"auto-trade-summary-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > div > section > header[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": true,
+    "width": 208,
+    "path": "div[data-testid=\"chart-toolbar\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div[data-testid=\"chart-header-bar\"]"
+   },
+   {
+    "value": "scope",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 160,
+    "path": "div[data-testid=\"market-depth-panel\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 590,
+    "path": "div > div > main > section > div > div[data-nowrap=\"row\"]"
+   }
+  ],
+  "tables": [],
+  "sweep": null
+ },
+ {
+  "scenario": {
+   "id": "R7-R8-live-bottom",
+   "w": 1200,
+   "h": 900,
+   "note": "R7/R8：实盘下方右栏（10 列委托表 / 持仓表）"
+  },
+  "geom": {
+   "viewport": 1200,
+   "docScrollWidth": 1200,
+   "horizontalOverflow": 0,
+   "sidebar": 240,
+   "sidebarStyleWidth": "240px",
+   "sidebarScrollX": 0,
+   "center": 414,
+   "depthWidth": 160,
+   "depthFlexShrink": "1",
+   "sidebarFlexShrink": "1",
+   "depth": {
+    "w": 160,
+    "h": 276,
+    "sw": 160,
+    "cw": 160
+   },
+   "toolbar": {
+    "w": 382,
+    "h": 108,
+    "sw": 382,
+    "cw": 382
+   },
+   "headerBar": {
+    "w": 414,
+    "h": 88,
+    "sw": 414,
+    "cw": 414
+   },
+   "autoHeaderRow": {
+    "w": 224,
+    "h": 24,
+    "sw": 224,
+    "cw": 224
+   },
+   "autoSummaryRow": {
+    "w": 224,
+    "h": 19,
+    "sw": 224,
+    "cw": 224
+   }
+  },
+  "wrapped": [
+   {
+    "text": "把下方自选标的拖到这里，或点其「＋」加入；启动后将对所有成员同时自动交易",
+    "lines": 2,
+    "whiteSpace": "normal",
+    "declaredNormal": true,
+    "insideNowrapAnchor": false,
+    "path": "div > div > div > section > div > p"
+   }
+  ],
+  "anchors": [
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "section > div > div > div > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 224,
+    "path": "div[data-testid=\"auto-trade-header-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 224,
+    "path": "div > div > div > section > header > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 224,
+    "path": "div[data-testid=\"auto-trade-summary-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div > div > div > div > section > header[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 382,
+    "path": "div[data-testid=\"chart-toolbar\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 414,
+    "path": "div[data-testid=\"chart-header-bar\"]"
+   },
+   {
+    "value": "scope",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 160,
+    "path": "div[data-testid=\"market-depth-panel\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 826,
+    "path": "div > div > main > section > div > div[data-nowrap=\"row\"]"
+   }
+  ],
+  "tables": [
+   {
+    "cls": "w-full min-w-[420px] text-xs",
+    "tableWidth": 420,
+    "scrollHost": "div > div > div > div > div > div",
+    "hostScrollable": true,
+    "clipped": false
+   }
+  ],
+  "sweep": null
+ },
+ {
+  "scenario": {
+   "id": "R9-trade-explain-expanded",
+   "w": 860,
+   "h": 900,
+   "note": "R9：最窄档展开成交触发原因详情（散文仍换行 / 指标网格按容器掉列）"
+  },
+  "geom": {
+   "viewport": 860,
+   "docScrollWidth": 860,
+   "horizontalOverflow": 0,
+   "sidebar": 200,
+   "sidebarStyleWidth": "240px",
+   "sidebarScrollX": 0,
+   "center": 240,
+   "depthWidth": 160,
+   "depthFlexShrink": "1",
+   "sidebarFlexShrink": "1",
+   "depth": {
+    "w": 160,
+    "h": 276,
+    "sw": 160,
+    "cw": 160
+   },
+   "toolbar": {
+    "w": 208,
+    "h": 220,
+    "sw": 264,
+    "cw": 208
+   },
+   "headerBar": {
+    "w": 240,
+    "h": 125,
+    "sw": 240,
+    "cw": 240
+   },
+   "autoHeaderRow": {
+    "w": 184,
+    "h": 24,
+    "sw": 184,
+    "cw": 184
+   },
+   "autoSummaryRow": {
+    "w": 184,
+    "h": 19,
+    "sw": 184,
+    "cw": 184
+   }
+  },
+  "wrapped": [
+   {
+    "text": "把下方自选标的拖到这里，或点其「＋」加入；启动后将对所有成员同时自动交易",
+    "lines": 3,
+    "whiteSpace": "normal",
+    "declaredNormal": true,
+    "insideNowrapAnchor": false,
+    "path": "div > div > div > section > div > p"
+   },
+   {
+    "text": "这一句是散文：它必须继续正常换行，绝不能被继承来的 nowrap 截成一行加省略号。多写一些字用来把这段话撑到需要换行的…",
+    "lines": 2,
+    "whiteSpace": "normal",
+    "declaredNormal": true,
+    "insideNowrapAnchor": false,
+    "path": "table > tbody > tr > td > div > p"
+   }
+  ],
+  "anchors": [
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "section > div > div > div > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 184,
+    "path": "div[data-testid=\"auto-trade-header-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 184,
+    "path": "div > div > div > section > header > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 184,
+    "path": "div[data-testid=\"auto-trade-summary-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > div > section > header[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 200,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": true,
+    "width": 208,
+    "path": "div[data-testid=\"chart-toolbar\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 240,
+    "path": "div[data-testid=\"chart-header-bar\"]"
+   },
+   {
+    "value": "scope",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 160,
+    "path": "div[data-testid=\"market-depth-panel\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 486,
+    "path": "div > div > main > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "scope",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 578,
+    "path": "div[data-testid=\"trade-explain-metrics-grid\"]"
+   }
+  ],
+  "tables": [
+   {
+    "cls": "w-full min-w-[620px] text-xs",
+    "tableWidth": 620,
+    "scrollHost": "div > main > section > div > div > div",
+    "hostScrollable": true,
+    "clipped": false
+   },
+   {
+    "cls": "w-full min-w-[420px] text-xs",
+    "tableWidth": 420,
+    "scrollHost": "div > div > div > div > div > div",
+    "hostScrollable": true,
+    "clipped": false
+   }
+  ],
+  "sweep": null
+ },
+ {
+  "scenario": {
+   "id": "R4-drag-sweep",
+   "w": 1440,
+   "h": 900,
+   "note": "R4：左侧栏在 200↔460 之间连续拖动 20 次"
+  },
+  "geom": {
+   "viewport": 1440,
+   "docScrollWidth": 1440,
+   "horizontalOverflow": 0,
+   "sidebar": 460,
+   "sidebarStyleWidth": "460px",
+   "sidebarScrollX": 0,
+   "center": 374,
+   "depthWidth": 160,
+   "depthFlexShrink": "1",
+   "sidebarFlexShrink": "1",
+   "depth": {
+    "w": 160,
+    "h": 276,
+    "sw": 160,
+    "cw": 160
+   },
+   "toolbar": {
+    "w": 342,
+    "h": 144,
+    "sw": 342,
+    "cw": 342
+   },
+   "headerBar": {
+    "w": 374,
+    "h": 88,
+    "sw": 374,
+    "cw": 374
+   },
+   "autoHeaderRow": {
+    "w": 444,
+    "h": 24,
+    "sw": 444,
+    "cw": 444
+   },
+   "autoSummaryRow": {
+    "w": 444,
+    "h": 19,
+    "sw": 444,
+    "cw": 444
+   }
+  },
+  "wrapped": [],
+  "anchors": [
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 460,
+    "path": "section > div > div > div > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 444,
+    "path": "div[data-testid=\"auto-trade-header-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 444,
+    "path": "div > div > div > section > header > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 444,
+    "path": "div[data-testid=\"auto-trade-summary-row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 460,
+    "path": "div > div > div > div > section > header[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 460,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 460,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 460,
+    "path": "div > div > div > section > div > div[data-nowrap=\"row\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 342,
+    "path": "div[data-testid=\"chart-toolbar\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 374,
+    "path": "div[data-testid=\"chart-header-bar\"]"
+   },
+   {
+    "value": "scope",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 160,
+    "path": "div[data-testid=\"market-depth-panel\"]"
+   },
+   {
+    "value": "row",
+    "whiteSpace": "nowrap",
+    "overflowing": false,
+    "width": 1006,
+    "path": "div > div > main > section > div > div[data-nowrap=\"row\"]"
+   }
+  ],
+  "tables": [],
+  "sweep": [
+   {
+    "sidebar": 200,
+    "styleW": "200px",
+    "sidebarScrollX": 0,
+    "center": 634
+   },
+   {
+    "sidebar": 460,
+    "styleW": "460px",
+    "sidebarScrollX": 0,
+    "center": 374
+   },
+   {
+    "sidebar": 200,
+    "styleW": "200px",
+    "sidebarScrollX": 0,
+    "center": 634
+   },
+   {
+    "sidebar": 460,
+    "styleW": "460px",
+    "sidebarScrollX": 0,
+    "center": 374
+   },
+   {
+    "sidebar": 200,
+    "styleW": "200px",
+    "sidebarScrollX": 0,
+    "center": 634
+   },
+   {
+    "sidebar": 460,
+    "styleW": "460px",
+    "sidebarScrollX": 0,
+    "center": 374
+   },
+   {
+    "sidebar": 200,
+    "styleW": "200px",
+    "sidebarScrollX": 0,
+    "center": 634
+   },
+   {
+    "sidebar": 460,
+    "styleW": "460px",
+    "sidebarScrollX": 0,
+    "center": 374
+   },
+   {
+    "sidebar": 200,
+    "styleW": "200px",
+    "sidebarScrollX": 0,
+    "center": 634
+   },
+   {
+    "sidebar": 460,
+    "styleW": "460px",
+    "sidebarScrollX": 0,
+    "center": 374
+   },
+   {
+    "sidebar": 200,
+    "styleW": "200px",
+    "sidebarScrollX": 0,
+    "center": 634
+   },
+   {
+    "sidebar": 460,
+    "styleW": "460px",
+    "sidebarScrollX": 0,
+    "center": 374
+   },
+   {
+    "sidebar": 200,
+    "styleW": "200px",
+    "sidebarScrollX": 0,
+    "center": 634
+   },
+   {
+    "sidebar": 460,
+    "styleW": "460px",
+    "sidebarScrollX": 0,
+    "center": 374
+   },
+   {
+    "sidebar": 200,
+    "styleW": "200px",
+    "sidebarScrollX": 0,
+    "center": 634
+   },
+   {
+    "sidebar": 460,
+    "styleW": "460px",
+    "sidebarScrollX": 0,
+    "center": 374
+   },
+   {
+    "sidebar": 200,
+    "styleW": "200px",
+    "sidebarScrollX": 0,
+    "center": 634
+   },
+   {
+    "sidebar": 460,
+    "styleW": "460px",
+    "sidebarScrollX": 0,
+    "center": 374
+   },
+   {
+    "sidebar": 200,
+    "styleW": "200px",
+    "sidebarScrollX": 0,
+    "center": 634
+   },
+   {
+    "sidebar": 460,
+    "styleW": "460px",
+    "sidebarScrollX": 0,
+    "center": 374
+   }
+  ]
+ }
+]

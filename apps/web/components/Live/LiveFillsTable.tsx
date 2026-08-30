@@ -66,11 +66,11 @@ export function FillsTableView({ fills }: { fills: LiveFill[] }) {
     });
 
   return (
-    <table className="w-full text-xs">
+    <table className="w-full min-w-[520px] text-xs">
       <caption className="pb-1.5 text-left text-[10px] text-[var(--muted)]">
         点击带角标的成交行展开查看自动交易触发原因
       </caption>
-      <thead className="sticky top-0 bg-[var(--surface)] text-[var(--muted)]">
+      <thead className="sticky top-0 whitespace-nowrap bg-[var(--surface)] text-[var(--muted)]">
         <tr className="text-left">
           <th className="w-5 py-1.5" aria-hidden />
           <th className="py-1.5 pr-2 font-medium">时间</th>
@@ -123,7 +123,7 @@ function FillRow({
       <tr
         {...interactiveProps}
         className={clsx(
-          "border-t border-[var(--border)]",
+          "whitespace-nowrap border-t border-[var(--border)]",
           explain &&
             "cursor-pointer hover:bg-[var(--surface-2)]/50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)]",
         )}
@@ -143,7 +143,7 @@ function FillRow({
       </tr>
       {explain && open && (
         <tr>
-          <td colSpan={COL_COUNT} className="px-2 pb-3 pt-0.5">
+          <td colSpan={COL_COUNT} className="whitespace-normal px-2 pb-3 pt-0.5">
             <TradeExplainDetail explain={explain} />
           </td>
         </tr>

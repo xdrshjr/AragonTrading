@@ -82,8 +82,8 @@ export function OpenOrdersTableView({
 }) {
   const sorted = sortOpenOrders(orders, instId);
   return (
-    <table className="w-full text-xs">
-      <thead className="sticky top-0 bg-[var(--surface)] text-[var(--muted)]">
+    <table className="w-full min-w-[760px] text-xs">
+      <thead className="sticky top-0 whitespace-nowrap bg-[var(--surface)] text-[var(--muted)]">
         <tr className="text-left">
           <th className="py-1.5 pr-2 font-medium">合约</th>
           <th className="py-1.5 pr-2 font-medium">类型</th>
@@ -124,7 +124,7 @@ function OpenOrderRow({
   return (
     <tr
       className={clsx(
-        "border-t border-[var(--border)]",
+        "whitespace-nowrap border-t border-[var(--border)]",
         highlighted && "bg-[var(--surface-2)]/50",
       )}
     >

@@ -89,9 +89,12 @@ export default function AiTradePanel({
 
   return (
     <div className="flex flex-col gap-2 border-b border-[var(--border)] px-3 py-2.5">
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-xs font-semibold text-[var(--text)]">AI 自动交易</span>
+      <div
+        data-nowrap="row"
+        className="flex items-center justify-between gap-2 whitespace-nowrap"
+      >
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+          <span className="shrink-0 text-xs font-semibold text-[var(--text)]">AI 自动交易</span>
           <Badge tone={badge.tone}>
             <span data-testid="ai-trade-panel-badge">{badge.label}</span>
           </Badge>
@@ -107,10 +110,12 @@ export default function AiTradePanel({
             </span>
           )}
           {members.length > 1 && (
-            <span className="text-[10px] text-[var(--muted)]">{members.length} 个标的</span>
+            <span className="shrink-0 text-[10px] text-[var(--muted)]">
+              {members.length} 个标的
+            </span>
           )}
         </div>
-        <span className="flex items-center gap-1.5">
+        <span className="flex shrink-0 items-center gap-1.5">
           {netBasis && (
             <span
               title={COST_BASIS_HINT}
@@ -156,8 +161,8 @@ export default function AiTradePanel({
 
       <DisciplineStrip group={group} />
 
-      <div className="flex flex-col gap-1">
-        <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
+      <div className="flex min-w-0 flex-col gap-1">
+        <span className="truncate text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
           自动交易标的
         </span>
         {/* 离场卡**必须在 MemberRow 之外**（exit-priority §4.6.3）：MemberRow 本体是一个

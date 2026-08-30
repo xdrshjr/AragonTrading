@@ -33,15 +33,21 @@ export default function MetricsCards({ metrics, loading }: { metrics?: Metrics; 
   ];
 
   return (
-    <div className="grid grid-cols-2 gap-2">
+    <div
+      data-nowrap="scope"
+      className="grid grid-cols-2 gap-2 whitespace-nowrap"
+    >
       {items.map((it) => (
         <div
           key={it.label}
-          className="rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2"
+          className="min-w-0 rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2"
         >
-          <div className="text-[11px] text-[var(--muted)]">{it.label}</div>
+          <div className="truncate text-[11px] text-[var(--muted)]" title={it.label}>
+            {it.label}
+          </div>
           <div
-            className="tabular text-base font-semibold"
+            className="truncate tabular text-base font-semibold"
+            title={it.value}
             style={{
               color:
                 it.tone === "long"

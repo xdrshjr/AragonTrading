@@ -60,13 +60,13 @@ export default function RunHistory() {
       {isLoading ? (
         <div className="py-8 text-center text-xs text-[var(--muted)]">加载运行历史…</div>
       ) : !runs || runs.length === 0 ? (
-        <div className="py-8 text-center text-xs text-[var(--muted)]">
+        <div className="whitespace-normal break-words py-8 text-center text-xs text-[var(--muted)]">
           暂无运行历史，运行回测 / 对比 / 模拟后显示。
         </div>
       ) : (
         <div className="max-h-[320px] overflow-auto">
-          <table className="w-full text-xs">
-            <thead className="sticky top-0 bg-[var(--surface)] text-[var(--muted)]">
+          <table className="w-full min-w-[420px] text-xs">
+            <thead className="sticky top-0 whitespace-nowrap bg-[var(--surface)] text-[var(--muted)]">
               <tr className="text-left">
                 <th className="py-1.5 pr-2 font-medium">标的</th>
                 <th className="py-1.5 pr-2 font-medium">来源</th>
@@ -79,7 +79,7 @@ export default function RunHistory() {
                 <tr
                   key={r.id}
                   onClick={() => open(r)}
-                  className="cursor-pointer border-t border-[var(--border)] hover:bg-[var(--surface-2)]"
+                  className="cursor-pointer whitespace-nowrap border-t border-[var(--border)] hover:bg-[var(--surface-2)]"
                 >
                   <td className="py-1.5 pr-2">
                     <div className="text-[var(--text)]">{r.instId}</div>

@@ -160,8 +160,8 @@ export default function CompareView() {
 
       {rows.length > 0 && (
         <div className="overflow-x-auto">
-          <table className="w-full text-xs">
-            <thead className="text-[var(--muted)]">
+          <table className="w-full min-w-[560px] text-xs">
+            <thead className="whitespace-nowrap text-[var(--muted)]">
               <tr className="text-left">
                 <th className="py-1.5 pr-2 font-medium">策略</th>
                 {COLUMNS.map((c) => (
@@ -179,7 +179,7 @@ export default function CompareView() {
             </thead>
             <tbody>
               {rows.map((it) => (
-                <tr key={it.runId} className="border-t border-[var(--border)]">
+                <tr key={it.runId} className="whitespace-nowrap border-t border-[var(--border)]">
                   <td className="py-1.5 pr-2">
                     <span className="flex items-center gap-1.5">
                       <span

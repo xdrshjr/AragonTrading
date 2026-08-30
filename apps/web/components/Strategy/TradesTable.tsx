@@ -26,7 +26,7 @@ export default function TradesTable({ trades, loading }: { trades?: Trade[]; loa
   }
   if (!trades || trades.length === 0) {
     return (
-      <div className="py-8 text-center text-xs text-[var(--muted)]">
+      <div className="whitespace-normal break-words py-8 text-center text-xs text-[var(--muted)]">
         暂无成交记录，运行回测或启动模拟后显示。
       </div>
     );
@@ -36,8 +36,8 @@ export default function TradesTable({ trades, loading }: { trades?: Trade[]; loa
 
   return (
     <div className="max-h-[320px] overflow-auto">
-      <table className="w-full text-xs">
-        <thead className="sticky top-0 bg-[var(--surface)] text-[var(--muted)]">
+      <table className="w-full min-w-[620px] text-xs">
+        <thead className="sticky top-0 whitespace-nowrap bg-[var(--surface)] text-[var(--muted)]">
           <tr className="text-left">
             <th className="py-1.5 pr-2 font-medium">时间</th>
             <th className="py-1.5 pr-2 font-medium">方向</th>
@@ -73,7 +73,7 @@ function TradeRow({ trade: t }: { trade: Trade }) {
     <>
       <tr
         className={
-          "border-t border-[var(--border)]" +
+          "whitespace-nowrap border-t border-[var(--border)]" +
           (t.seeded ? " bg-[var(--surface-2)]/40" : "") +
           (expandable ? " cursor-pointer hover:bg-[var(--surface-2)]/50" : "")
         }
@@ -136,7 +136,7 @@ function TradeRow({ trade: t }: { trade: Trade }) {
       </tr>
       {expandable && open && (
         <tr className="border-t border-[var(--border)]">
-          <td colSpan={COLUMN_COUNT} className="px-2 pb-3 pt-1">
+          <td colSpan={COLUMN_COUNT} className="whitespace-normal px-2 pb-3 pt-1">
             <TradeExplainDetail trade={t} />
           </td>
         </tr>

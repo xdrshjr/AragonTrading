@@ -49,8 +49,12 @@ export default function ChartToolbar({
     useAppStore();
 
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <div className="flex gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-0.5">
+    <div
+      data-nowrap="row"
+      data-testid="chart-toolbar"
+      className="flex flex-wrap items-center gap-2 whitespace-nowrap"
+    >
+      <div className="flex shrink-0 gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-0.5">
         {BARS.map((b) => (
           <button
             key={b}
@@ -67,9 +71,14 @@ export default function ChartToolbar({
         ))}
       </div>
 
-      <IndicatorMenu />
+      {/* IndicatorMenu / ConnectionStatus 的根节点是它们自己文件里的 <div className="relative">
+          （下拉定位的包含块，不能动）；工具栏行的 flex item 就是那个根节点，所以收缩控制
+          只能加在**外面**这一层。包一层不影响 relative 的定位语义。 */}
+      <div className="shrink-0">
+        <IndicatorMenu />
+      </div>
 
-      <div className="flex gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-0.5">
+      <div className="flex shrink-0 gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-0.5">
         <button
           onClick={() => onChartViewChange("live-follow")}
           className={
@@ -104,7 +113,7 @@ export default function ChartToolbar({
           const ts = Math.floor(new Date(`${e.target.value}T00:00:00Z`).getTime() / 1000);
           onJumpDate(ts);
         }}
-        className="rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)] hover:border-[var(--accent)]"
+        className="shrink-0 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)] hover:border-[var(--accent)]"
         aria-label="跳转日期"
       />
 
@@ -115,7 +124,7 @@ export default function ChartToolbar({
           if (!e.target.value) return;
           setBacktestRange(dateStartTs(e.target.value), backtestEndTs);
         }}
-        className="rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)] hover:border-[var(--accent)]"
+        className="shrink-0 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)] hover:border-[var(--accent)]"
         aria-label="回测开始日期"
       />
 
@@ -126,12 +135,12 @@ export default function ChartToolbar({
           if (!e.target.value) return;
           setBacktestRange(backtestStartTs, dateEndTs(e.target.value));
         }}
-        className="rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)] hover:border-[var(--accent)]"
+        className="shrink-0 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)] hover:border-[var(--accent)]"
         aria-label="回测结束日期"
       />
 
-      <div className="ml-auto flex items-center gap-2">
-        <div className="flex gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-0.5">
+      <div className="ml-auto flex shrink-0 items-center gap-2">
+        <div className="flex shrink-0 gap-0.5 rounded-[10px] bg-[var(--surface-2)] p-0.5">
           {MODES.map((m) => (
             <button
               key={m.key}
@@ -149,14 +158,16 @@ export default function ChartToolbar({
         </div>
 
         <LivePrice liveWsOpen={liveWsOpen} lastPrice={lastPrice} />
-        <ConnectionStatus
-          connectivity={connectivity}
-          okxUp={okxUp}
-          latencyMs={latencyMs}
-          lastOkTs={lastOkTs}
-          onOpenChange={onConnectivityOpenChange}
-          onProbe={onConnectivityProbe}
-        />
+        <div className="shrink-0">
+          <ConnectionStatus
+            connectivity={connectivity}
+            okxUp={okxUp}
+            latencyMs={latencyMs}
+            lastOkTs={lastOkTs}
+            onOpenChange={onConnectivityOpenChange}
+            onProbe={onConnectivityProbe}
+          />
+        </div>
       </div>
     </div>
   );
@@ -174,11 +185,11 @@ function LivePrice({
   const open = !!liveWsOpen;
   return (
     <span
-      className="flex items-center gap-1.5 rounded-[10px] bg-[var(--surface-2)] px-2 py-1 text-xs"
+      className="flex shrink-0 items-center gap-1.5 rounded-[10px] bg-[var(--surface-2)] px-2 py-1 text-xs"
       title={open ? "实时行情流已连接（最右一根随真实成交跳动）" : "实时行情流连接中…"}
     >
       <span
-        className="inline-block h-1.5 w-1.5 rounded-full"
+        className="inline-block h-1.5 w-1.5 shrink-0 rounded-full"
         style={{
           background: open ? "var(--long)" : "var(--muted)",
           animation: open ? "shimmer 1.4s ease-in-out infinite" : undefined,

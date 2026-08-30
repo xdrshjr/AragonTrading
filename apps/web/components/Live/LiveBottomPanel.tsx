@@ -40,7 +40,7 @@ export default function LiveBottomPanel({
       </div>
 
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <div className="shrink-0 px-3 pt-2">
+        <div data-nowrap="row" className="shrink-0 whitespace-nowrap px-3 pt-2">
           <Tabs
             variant="underline"
             tabs={RIGHT_TABS}

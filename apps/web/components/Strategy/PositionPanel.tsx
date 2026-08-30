@@ -19,7 +19,7 @@ export default function PositionPanel({ trades, markPrice, instId }: PositionPan
 
   if (!pos) {
     return (
-      <div className="py-8 text-center text-xs text-[var(--muted)]">
+      <div className="whitespace-normal break-words py-8 text-center text-xs text-[var(--muted)]">
         当前无持仓，运行回测或启动模拟后显示。
       </div>
     );
@@ -28,7 +28,13 @@ export default function PositionPanel({ trades, markPrice, instId }: PositionPan
   const pnlColor = pos.unrealizedPnl != null ? colorForReturn(pos.unrealizedPnl) : "var(--muted)";
 
   return (
-    <div className="grid grid-cols-2 gap-x-6 gap-y-3 text-xs sm:grid-cols-3 lg:grid-cols-6">
+    // 列数由**容器**宽决定，与视口无关（sm: / lg: 跟的是视口宽，而这块面板的宽度由
+    // rightPanelWidth / chartSplitRatio / 下方左右分栏共同决定）。每格最少 120px，放不下就少一列。
+    <div
+      data-nowrap="scope"
+      data-testid="position-panel-grid"
+      className="grid grid-cols-[repeat(auto-fit,minmax(120px,1fr))] gap-x-6 gap-y-3 whitespace-nowrap text-xs"
+    >
       <Cell label="合约">
         <span className="font-medium text-[var(--text)]">{instId}</span>
       </Cell>
@@ -57,9 +63,13 @@ export default function PositionPanel({ trades, markPrice, instId }: PositionPan
 
 function Cell({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="flex flex-col gap-1">
-      <span className="text-[10px] text-[var(--muted)]">{label}</span>
-      {children}
+    // min-w-0：grid item 的 min-width 同样默认 auto，不清零则下面两处 truncate 永不触发。
+    <div className="flex min-w-0 flex-col gap-1">
+      <span className="truncate text-[10px] text-[var(--muted)]" title={label}>
+        {label}
+      </span>
+      {/* 值由调用方以 children 传入，截断只能在这里统一包一层（6 个调用点零改动）。 */}
+      <span className="block min-w-0 truncate">{children}</span>
     </div>
   );
 }

@@ -68,20 +68,24 @@ function BreakdownTable({ rows }: { rows: ComboPreviewResult["combo"]["breakdown
   return (
     <div className="flex flex-col gap-1.5">
       <span className="text-[11px] font-medium text-[var(--text)]">分体制贡献</span>
-      <table className="w-full text-xs">
-        <thead className="text-[var(--muted)]">
-          <tr className="text-left">
-            <th className="py-1 pr-2 font-medium">体制 / 成员</th>
-            <th className="py-1 pr-2 text-right font-medium">根数</th>
-            <th className="py-1 text-right font-medium">贡献</th>
-          </tr>
-        </thead>
-        <tbody>
-          {groups.map((group) => (
-            <RegimeRows key={group.regime} group={group} />
-          ))}
-        </tbody>
-      </table>
+      {/* 四张策略面板表里唯一没有自有滚动宿主的一张：不新建这层，横向压力会传导到
+          整块 StrategyPanel 的滚动条上（§4.5.3 / K2）。 */}
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[360px] text-xs">
+          <thead className="whitespace-nowrap text-[var(--muted)]">
+            <tr className="text-left">
+              <th className="py-1 pr-2 font-medium">体制 / 成员</th>
+              <th className="py-1 pr-2 text-right font-medium">根数</th>
+              <th className="py-1 text-right font-medium">贡献</th>
+            </tr>
+          </thead>
+          <tbody>
+            {groups.map((group) => (
+              <RegimeRows key={group.regime} group={group} />
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -89,13 +93,13 @@ function BreakdownTable({ rows }: { rows: ComboPreviewResult["combo"]["breakdown
 function RegimeRows({ group }: { group: ReturnType<typeof groupBreakdownByRegime>[number] }) {
   return (
     <>
-      <tr className="border-t border-[var(--border)]">
+      <tr className="whitespace-nowrap border-t border-[var(--border)]">
         <td className="py-1 pr-2 font-medium text-[var(--text)]">{regimeLabel(group.regime)}</td>
         <td className="py-1 pr-2 text-right tabular text-[var(--muted)]">{group.bars}</td>
         <td className="py-1 text-right" />
       </tr>
       {group.rows.map((row) => (
-        <tr key={`${group.regime}-${row.memberKey}`}>
+        <tr key={`${group.regime}-${row.memberKey}`} className="whitespace-nowrap">
           <td className="py-1 pl-3 pr-2 text-[var(--muted)]">{row.memberName}</td>
           <td className="py-1 pr-2 text-right tabular">{row.bars}</td>
           <td

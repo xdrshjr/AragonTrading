@@ -105,7 +105,7 @@ function FilterChips<T extends string>({
   onChange: (v: T) => void;
 }) {
   return (
-    <div className="flex flex-wrap gap-1">
+    <div data-nowrap="row" className="flex flex-wrap gap-1 whitespace-nowrap">
       {options.map((o) => (
         <button
           key={o.key}
@@ -113,7 +113,7 @@ function FilterChips<T extends string>({
           aria-pressed={value === o.key}
           onClick={() => onChange(o.key)}
           className={clsx(
-            "rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors",
+            "shrink-0 rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors",
             value === o.key
               ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
               : "bg-[var(--surface-2)] text-[var(--muted)] hover:text-[var(--text)]",
@@ -190,7 +190,10 @@ export default function InstrumentSidebar({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="shrink-0 space-y-2 border-b border-[var(--border)] bg-[var(--surface)] px-2 pb-2 pt-2">
+      <div
+        data-nowrap="row"
+        className="shrink-0 space-y-2 whitespace-nowrap border-b border-[var(--border)] bg-[var(--surface)] px-2 pb-2 pt-2"
+      >
         <Tabs tabs={SIDEBAR_TABS} active={tab} onChange={(k) => setTab(k as InstSidebarTab)} />
         <SearchBar value={query} onChange={setQuery} />
         {tab === "swap" && (
@@ -211,7 +214,7 @@ export default function InstrumentSidebar({
         )}
 
         {isError && (
-          <div className="flex flex-col items-start gap-2 p-3">
+          <div className="flex flex-col items-start gap-2 whitespace-normal break-words p-3">
             <p className="text-[11px] font-medium text-[var(--short-ink)]">
               无法连接 OKX，请检查网络 / 代理。
             </p>
@@ -240,7 +243,7 @@ export default function InstrumentSidebar({
 
         {showEmpty && (
           <div className="flex flex-col items-center gap-1.5 px-3 py-8 text-center">
-            <p className="text-[11px] text-[var(--muted)]">
+            <p className="whitespace-normal break-words text-[11px] text-[var(--muted)]">
               {query ? `未找到匹配「${query}」的标的` : "暂无标的"}
             </p>
           </div>
@@ -261,7 +264,7 @@ export default function InstrumentSidebar({
               />
             ))}
             {view.truncated && (
-              <p className="px-3 py-2 text-center text-[10px] text-[var(--muted)]">
+              <p className="whitespace-normal break-words px-3 py-2 text-center text-[10px] text-[var(--muted)]">
                 仅显示前 {MAX_VISIBLE_ROWS} 条（共 {view.total}），输入关键字以精确查找
               </p>
             )}

@@ -109,8 +109,8 @@ export default function WalkForwardResults({
       <WalkForwardChart windows={windows} bestIndex={best} worstIndex={worst} />
 
       <div className="max-h-[320px] overflow-auto">
-        <table className="w-full text-xs">
-          <thead className="sticky top-0 bg-[var(--surface)] text-[var(--muted)]">
+        <table className="w-full min-w-[560px] text-xs">
+          <thead className="sticky top-0 whitespace-nowrap bg-[var(--surface)] text-[var(--muted)]">
             <tr className="text-left">
               <th className="py-1.5 pr-2 font-medium">窗口</th>
               <th className="py-1.5 pr-2 font-medium">时间区间</th>
@@ -121,7 +121,10 @@ export default function WalkForwardResults({
           </thead>
           <tbody>
             {windows.map((w, i) => (
-              <tr key={`${w.startTs}-${i}`} className="border-t border-[var(--border)]">
+              <tr
+                key={`${w.startTs}-${i}`}
+                className="whitespace-nowrap border-t border-[var(--border)]"
+              >
                 <td className="py-1.5 pr-2">
                   <span className="flex items-center gap-1">
                     #{i + 1}

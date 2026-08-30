@@ -141,7 +141,7 @@ export default function LiveTradePanel({
   }
   if (configQ.isError || !config || !meta) {
     return (
-      <div className="flex flex-col items-start gap-2 p-4 text-xs text-[var(--short-ink)]">
+      <div className="flex flex-col items-start gap-2 whitespace-normal break-words p-4 text-xs text-[var(--short-ink)]">
         <span>加载下单上下文失败：{(configQ.error as Error)?.message || "请稍后重试"}</span>
         <Button variant="ghost" size="sm" onClick={() => void configQ.refetch()}>
           重试
@@ -209,14 +209,17 @@ export default function LiveTradePanel({
   return (
     <div className="flex flex-col gap-3 p-3">
       {blockedReason && (
-        <p className="rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-[11px] leading-relaxed text-[var(--muted)]">
+        <p className="whitespace-normal break-words rounded-[10px] border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-[11px] leading-relaxed text-[var(--muted)]">
           {blockedReason}
         </p>
       )}
 
       <DirectionToggle value={direction} onChange={setDirection} disabled={controlsDisabled} />
 
-      <div className="flex items-center gap-2">
+      <div
+        data-nowrap="row"
+        className="flex items-center gap-2 whitespace-nowrap"
+      >
         <SegToggle
           options={[
             { key: "limit", label: "限价" },
@@ -239,7 +242,7 @@ export default function LiveTradePanel({
 
       {ordType === "limit" ? (
         <label className="flex flex-col gap-1.5">
-          <span className="text-xs font-medium text-[var(--muted)]">委托价格（USDT）</span>
+          <span className="truncate text-xs font-medium text-[var(--muted)]">委托价格（USDT）</span>
           <Input
             type="number"
             inputMode="decimal"
@@ -256,7 +259,7 @@ export default function LiveTradePanel({
           )}
         </label>
       ) : (
-        <p className="rounded-[10px] bg-[var(--surface-2)] px-3 py-2 text-[11px] text-[var(--muted)]">
+        <p className="whitespace-normal break-words rounded-[10px] bg-[var(--surface-2)] px-3 py-2 text-[11px] text-[var(--muted)]">
           市价单按最新价 {lastPx != null ? fmtPrice(lastPx) : "—"} 估算名义 / 保证金，实际成交含滑点。
         </p>
       )}
@@ -362,7 +365,10 @@ function SegToggle({
   disabled?: boolean;
 }) {
   return (
-    <div className="flex flex-1 gap-1 rounded-[10px] bg-[var(--surface-2)] p-1">
+    <div
+      data-nowrap="row"
+      className="flex flex-1 gap-1 whitespace-nowrap rounded-[10px] bg-[var(--surface-2)] p-1"
+    >
       {options.map((opt) => (
         <button
           key={opt.key}
@@ -370,7 +376,7 @@ function SegToggle({
           disabled={disabled}
           onClick={() => onChange(opt.key)}
           className={clsx(
-            "flex-1 rounded-[7px] px-2 py-1 text-[11px] font-medium transition-all duration-150",
+            "flex-1 whitespace-nowrap rounded-[7px] px-2 py-1 text-[11px] font-medium transition-all duration-150",
             "disabled:cursor-not-allowed disabled:opacity-40",
             value === opt.key
               ? "bg-[var(--surface)] text-[var(--text)] shadow-soft"

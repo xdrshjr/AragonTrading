@@ -224,15 +224,19 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
       ref={splitContainerRef}
       className="flex h-full min-h-0 min-w-0 flex-col"
     >
+      {/* overflow-hidden 是轴 E 的**配套**（终审补）：E-2 给中栏加了 240px 地板后，本行三列的硬地板
+          合计 612px，桌面端 minWidth 860 档下上区实宽只有 426px —— 溢出的 186px 过去无人裁切
+          （<main> 的 overflow-hidden 位于本行之外、比本行宽），盘口列会直接**盖在右侧策略面板上**。
+          K9 承诺的退化是「盘口列被裁掉一部分」，这一行就是让那句承诺成立的地方。 */}
       <div
         ref={topRef}
-        className="flex min-h-0 min-w-0 flex-row"
+        className="flex min-h-0 min-w-0 flex-row overflow-hidden"
         style={{ flexGrow: chartSplitRatio, flexShrink: 1, flexBasis: 0 }}
       >
         {/* 左栏：盘口面板已迁出到 K 线右侧（需求二），此处仅保留标的列表并占满整列高度。 */}
         {/* 需求二（本轮）：改像素宽，右边框可拖调宽（夹取 [200,460] + min-w-[200px] CSS 兜底），双击复位默认。 */}
         <div
-          className="flex min-h-0 shrink-0 min-w-[200px] flex-col"
+          className="flex min-h-0 min-w-[200px] shrink flex-col"
           style={{ width: instrumentSidebarWidth }}
         >
           <div className="min-h-0 flex-1">
@@ -249,22 +253,22 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
           onReset={onSidebarReset}
           ariaLabel="拖动调整标的侧栏宽度，双击复位"
         />
-        <div className="flex min-h-[320px] min-w-0 flex-1 flex-col">
+        <div className="flex min-h-[320px] min-w-[240px] flex-1 flex-col">
           <div className="shrink-0 border-b border-[var(--border)] px-4 py-2.5">
             <ChartToolbar {...toolbar} />
           </div>
           {dataSource === "cache" && (
-            <div className="shrink-0 border-b border-[var(--accent)] bg-[var(--accent-soft)] px-4 py-1.5 text-[11px] font-medium text-[var(--accent-ink)]">
+            <div className="shrink-0 whitespace-normal break-words border-b border-[var(--accent)] bg-[var(--accent-soft)] px-4 py-1.5 text-[11px] font-medium text-[var(--accent-ink)]">
               缓存样例 · OKX 暂不可达，当前显示本地缓存历史。
             </div>
           )}
           {tradeCapReached && (
-            <div className="shrink-0 border-b border-[var(--border)] bg-[var(--surface-2)] px-4 py-1.5 text-[11px] font-medium text-[var(--muted)]">
+            <div className="shrink-0 whitespace-normal break-words border-b border-[var(--border)] bg-[var(--surface-2)] px-4 py-1.5 text-[11px] font-medium text-[var(--muted)]">
               Backtest trade cap reached: showing the latest 5000 returned trades.
             </div>
           )}
           {liveTradeCapReached && (
-            <div className="shrink-0 border-b border-[var(--border)] bg-[var(--surface-2)] px-4 py-1.5 text-[11px] font-medium text-[var(--muted)]">
+            <div className="shrink-0 whitespace-normal break-words border-b border-[var(--border)] bg-[var(--surface-2)] px-4 py-1.5 text-[11px] font-medium text-[var(--muted)]">
               实时成交仅保留最近 {TRADES_MAX} 笔，更早的记录见运行历史。
             </div>
           )}
@@ -321,7 +325,7 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
         />
         <div
           className="flex min-h-0 min-w-[160px] max-w-[420px] flex-col overflow-auto"
-          style={{ flexGrow: 0, flexShrink: 0, flexBasis: `${depthPanelRatio * 100}%` }}
+          style={{ flexGrow: 0, flexShrink: 1, flexBasis: `${depthPanelRatio * 100}%` }}
         >
           <MarketDepthPanel market={market} activeCandle={displayCandle} />
         </div>
@@ -343,11 +347,11 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
         ) : (
           <>
         {mode === "paper" && paperSessionId && (
-          <div className="shrink-0 border-b border-[var(--border)] bg-[var(--surface-2)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
+          <div className="shrink-0 whitespace-normal break-words border-b border-[var(--border)] bg-[var(--surface-2)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
             已启动实时模拟 · 下方成交和持仓按策略标签切换查看。
           </div>
         )}
-        <div className="shrink-0 px-3 pt-2">
+        <div data-nowrap="row" className="shrink-0 whitespace-nowrap px-3 pt-2">
           <Tabs
             variant="underline"
             tabs={BOTTOM_TABS}
@@ -356,7 +360,7 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
           />
         </div>
         {paperStrategies.length > 1 && (
-          <div className="shrink-0 overflow-x-auto px-3 pt-1">
+          <div className="shrink-0 overflow-x-auto whitespace-nowrap px-3 pt-1">
             <div className="flex min-w-max gap-1">
               {paperStrategies.map((strategy) => {
                 const active = activePaperStrategyId === strategy.strategyId;
@@ -365,7 +369,7 @@ export default function ChartWorkspace(props: ChartWorkspaceProps) {
                     key={strategy.strategyId}
                     type="button"
                     onClick={() => onActivePaperStrategyChange?.(strategy.strategyId)}
-                    className="h-7 rounded border px-2 text-[11px] font-medium"
+                    className="h-7 shrink-0 whitespace-nowrap rounded border px-2 text-[11px] font-medium"
                     style={{
                       borderColor: active ? strategy.color : "var(--border)",
                       color: active ? "var(--text)" : "var(--muted)",

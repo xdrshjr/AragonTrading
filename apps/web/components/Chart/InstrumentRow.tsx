@@ -62,10 +62,11 @@ export default function InstrumentRow({
 
   return (
     <div
+      data-nowrap="row"
       draggable={draggable}
       onDragStart={draggable && onDragStart ? (e) => onDragStart(e, inst.instId) : undefined}
       className={clsx(
-        "group flex items-center gap-2 border-l-2 pl-2 pr-3 transition-colors",
+        "group flex items-center gap-2 whitespace-nowrap border-l-2 pl-2 pr-3 transition-colors",
         active
           ? "border-[var(--accent)] bg-[var(--surface-2)]"
           : "border-transparent hover:bg-[var(--surface-2)]",

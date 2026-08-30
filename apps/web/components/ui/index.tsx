@@ -479,7 +479,7 @@ export function Tabs({
             key={t.key}
             {...tabProps(t)}
             className={clsx(
-              "-mb-px shrink-0 border-b-2 px-3 py-1.5 text-xs font-medium transition-colors duration-150",
+              "-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-1.5 text-xs font-medium transition-colors duration-150",
               active === t.key
                 ? "border-[var(--accent)] text-[var(--text)]"
                 : "border-transparent text-[var(--muted)] hover:text-[var(--text)]",
@@ -505,7 +505,7 @@ export function Tabs({
           key={t.key}
           {...tabProps(t)}
           className={clsx(
-            "flex-1 rounded-[7px] px-3 py-1.5 text-xs font-medium transition-all duration-150",
+            "flex-1 whitespace-nowrap rounded-[7px] px-3 py-1.5 text-xs font-medium transition-all duration-150",
             active === t.key
               ? "bg-[var(--surface)] text-[var(--text)] shadow-soft"
               : "text-[var(--muted)] hover:text-[var(--text)]",

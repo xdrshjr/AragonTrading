@@ -110,8 +110,8 @@ export default function LivePositionsTable({
         </Button>
       </div>
 
-      <table className="w-full text-xs">
-        <thead className="sticky top-0 bg-[var(--surface)] text-[var(--muted)]">
+      <table className="w-full min-w-[640px] text-xs">
+        <thead className="sticky top-0 whitespace-nowrap bg-[var(--surface)] text-[var(--muted)]">
           <tr className="text-left">
             <th className="py-1.5 pr-2 font-medium">合约</th>
             <th className="py-1.5 pr-2 font-medium">方向</th>
@@ -194,7 +194,7 @@ function PositionRow({
   const isLong = pos.posSide === "long" || (pos.posSide === "net" && (pos.pos ?? 0) > 0);
   return (
     <>
-      <tr className="border-t border-[var(--border)]">
+      <tr className="whitespace-nowrap border-t border-[var(--border)]">
         <td className="py-1.5 pr-2 font-medium text-[var(--text)]">
           <span className="inline-flex items-center gap-1">
             <CollapseToggle expanded={expanded} onToggle={onToggle} instId={pos.instId} />
@@ -234,7 +234,7 @@ function PositionRow({
       </tr>
       {expanded && (
         <tr>
-          <td colSpan={8} className="bg-[var(--surface-2)]/40 px-2 pb-2">
+          <td colSpan={8} className="whitespace-normal bg-[var(--surface-2)]/40 px-2 pb-2">
             <PositionOrdersRow orders={orders} refPx={pos.last ?? null} />
           </td>
         </tr>

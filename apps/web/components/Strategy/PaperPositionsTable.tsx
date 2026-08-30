@@ -14,7 +14,7 @@ interface PaperPositionsTableProps {
 export default function PaperPositionsTable({ rows, instId }: PaperPositionsTableProps) {
   if (rows.length === 0) {
     return (
-      <div className="py-8 text-center text-xs text-[var(--muted)]">
+      <div className="whitespace-normal break-words py-8 text-center text-xs text-[var(--muted)]">
         当前无持仓，启动实时模拟后按策略显示。
       </div>
     );
@@ -22,8 +22,8 @@ export default function PaperPositionsTable({ rows, instId }: PaperPositionsTabl
 
   return (
     <div className="max-h-[320px] overflow-auto">
-      <table className="w-full text-xs">
-        <thead className="sticky top-0 bg-[var(--surface)] text-[var(--muted)]">
+      <table className="w-full min-w-[560px] text-xs">
+        <thead className="sticky top-0 whitespace-nowrap bg-[var(--surface)] text-[var(--muted)]">
           <tr className="text-left">
             <th className="py-1.5 pr-2 font-medium">策略</th>
             <th className="py-1.5 pr-2 font-medium">方向</th>
@@ -49,7 +49,7 @@ function PositionRow({ row }: { row: PaperPositionRow }) {
   const pos = row.position;
   const pnlColor = pos?.unrealizedPnl != null ? colorForReturn(pos.unrealizedPnl) : "var(--muted)";
   return (
-    <tr className="border-t border-[var(--border)]">
+    <tr className="whitespace-nowrap border-t border-[var(--border)]">
       <td className="py-1.5 pr-2">
         <span className="inline-flex items-center gap-1.5">
           <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: row.color }} />
@@ -71,7 +71,7 @@ function PositionRow({ row }: { row: PaperPositionRow }) {
           </td>
         </>
       ) : (
-        <td className="py-1.5 pr-2 text-[var(--muted)]" colSpan={5}>
+        <td className="whitespace-normal py-1.5 pr-2 text-[var(--muted)]" colSpan={5}>
           当前无持仓
         </td>
       )}

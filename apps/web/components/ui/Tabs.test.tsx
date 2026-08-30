@@ -86,6 +86,15 @@ describe.each(["segmented", "underline"] as const)("ui — Tabs（%s 变体）",
     fireEvent.click(screen.getByRole("tab", { name: "丙" }));
     expect(onChange).toHaveBeenCalledWith("c");
   });
+
+  // T15（workstation-text-nowrap-contract §4.4.1）：`Tabs` 是 N1「不给基类加 nowrap」的
+  // 刻意例外——它的 label 是闭集短字符串，而 segmented 变体的 flex-1 会**主动**制造压缩。
+  it("页签按钮声明了不折行（label 是闭集短语，宽度一紧也不得逐字劈开）", () => {
+    renderTabs(variant);
+    for (const tab of screen.getAllByRole("tab")) {
+      expect(tab.className).toContain("whitespace-nowrap");
+    }
+  });
 });
 
 describe("ui — Tabs 不传 label 时不渲染 aria-label", () => {

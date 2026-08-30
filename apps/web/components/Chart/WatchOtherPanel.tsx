@@ -59,15 +59,21 @@ export default function WatchOtherPanel({
         dragOver && "bg-[var(--accent-soft)]/40 ring-2 ring-inset ring-[var(--accent)]/60",
       )}
     >
-      <header className="flex shrink-0 items-center justify-between px-2 py-1">
-        <span className="text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]">
+      <header
+        data-nowrap="row"
+        className="flex shrink-0 items-center justify-between gap-2 whitespace-nowrap px-2 py-1"
+      >
+        <span
+          title={title}
+          className="min-w-0 truncate text-[10px] font-semibold uppercase tracking-wide text-[var(--muted)]"
+        >
           {title}
         </span>
-        <span className="text-[10px] tabular text-[var(--muted)]">{rows.length}</span>
+        <span className="shrink-0 text-[10px] tabular text-[var(--muted)]">{rows.length}</span>
       </header>
       <div className="min-h-0 flex-1 overflow-auto pb-1">
         {rows.length === 0 ? (
-          <p className="px-3 py-4 text-center text-[11px] leading-relaxed text-[var(--muted)]">
+          <p className="whitespace-normal break-words px-3 py-4 text-center text-[11px] leading-relaxed text-[var(--muted)]">
             {resolvedEmptyHint}
           </p>
         ) : (

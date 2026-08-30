@@ -64,11 +64,22 @@ function Header({ explain }: { explain: TriggerExplain }) {
 
 function MetricsGrid({ metrics }: { metrics: TriggerMetric[] }) {
   return (
-    <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 sm:grid-cols-3">
+    // 与 PositionPanel 同款容器自适应：这块网格渲染在 TradesTable 展开行的 <td colSpan> 里，
+    // 宽度由「窗口宽 − 49 − 6 − rightPanelWidth」决定，与视口宽同样毫无关系。
+    <div
+      data-nowrap="scope"
+      data-testid="trade-explain-metrics-grid"
+      className="grid grid-cols-[repeat(auto-fit,minmax(140px,1fr))] gap-x-4 gap-y-1.5 whitespace-nowrap"
+    >
       {metrics.map((m, i) => (
-        <div key={`${m.label}-${i}`} className="flex flex-col gap-0.5" title={m.hint}>
-          <span className="text-[10px] uppercase tracking-wide text-[var(--muted)]">{m.label}</span>
-          <span className="text-xs tabular font-medium" style={{ color: metricColor(m.tone) }}>
+        <div key={`${m.label}-${i}`} className="flex min-w-0 flex-col gap-0.5" title={m.hint}>
+          <span className="truncate text-[10px] uppercase tracking-wide text-[var(--muted)]">
+            {m.label}
+          </span>
+          <span
+            className="truncate text-xs tabular font-medium"
+            style={{ color: metricColor(m.tone) }}
+          >
             {m.value}
           </span>
         </div>

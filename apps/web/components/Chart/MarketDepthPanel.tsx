@@ -15,12 +15,18 @@ export default function MarketDepthPanel({ market, activeCandle }: MarketDepthPa
   const bids = market.book?.bids.slice(0, 5) ?? [];
   const updated = market.updatedTs ? fmtTime(market.updatedTs, false) : "-";
 
+  // Type S 继承子树根：一次 whitespace-nowrap 覆盖标题 / 四格指标 / 买卖档 / 成交流；
+  // 其中每一处可压缩文本各自 truncate（它们本就不在同一行，不受「每行唯一吸收点」约束）。
   return (
-    <div className="flex min-h-0 flex-col gap-2 px-2 py-2 text-[11px]">
+    <div
+      data-nowrap="scope"
+      data-testid="market-depth-panel"
+      className="flex min-h-0 flex-col gap-2 whitespace-nowrap px-2 py-2 text-[11px]"
+    >
       <div className="border-b border-[var(--border)] pb-2">
         <div className="flex items-center gap-1">
           <span
-            className="h-1.5 w-1.5 rounded-full"
+            className="h-1.5 w-1.5 shrink-0 rounded-full"
             style={{ background: market.connected ? "var(--long)" : "var(--muted)" }}
           />
           <span className="truncate font-semibold text-[var(--text)]">{market.instId}</span>
@@ -31,7 +37,12 @@ export default function MarketDepthPanel({ market, activeCandle }: MarketDepthPa
         <div className="truncate text-[var(--muted)]">
           {market.connected ? updated : "disconnected"}
         </div>
-        {market.error && <div className="mt-1 text-[var(--short-ink)]">{market.error}</div>}
+        {/* 错误必须读得全：显式把继承来的 nowrap 覆盖掉（Type D）。 */}
+        {market.error && (
+          <div className="mt-1 whitespace-normal break-words text-[var(--short-ink)]">
+            {market.error}
+          </div>
+        )}
       </div>
 
       <div className="grid grid-cols-2 gap-1 border-b border-[var(--border)] pb-2 tabular">
@@ -47,7 +58,9 @@ export default function MarketDepthPanel({ market, activeCandle }: MarketDepthPa
       <div className="min-h-0 border-t border-[var(--border)] pt-2">
         <div className="mb-1 font-medium text-[var(--muted)]">Trades</div>
         {market.trades.length === 0 ? (
-          <div className="text-[var(--muted)]">Waiting for OKX trades</div>
+          <div className="whitespace-normal break-words text-[var(--muted)]">
+            Waiting for OKX trades
+          </div>
         ) : (
           <div className="flex max-h-40 flex-col gap-1 overflow-hidden tabular">
             {market.trades.slice(0, 8).map((trade) => (
@@ -84,7 +97,11 @@ function BookSide({ side, levels }: { side: "ask" | "bid"; levels: OrderBookLeve
   const max = Math.max(...totals, 0);
   const tone = side === "ask" ? "var(--short)" : "var(--long)";
   if (levels.length === 0) {
-    return <div className="text-[var(--muted)]">Waiting for OKX {side}s</div>;
+    return (
+      <div className="whitespace-normal break-words text-[var(--muted)]">
+        Waiting for OKX {side}s
+      </div>
+    );
   }
   return (
     <div className="flex flex-col gap-1 tabular">
@@ -97,7 +114,9 @@ function BookSide({ side, levels }: { side: "ask" | "bid"; levels: OrderBookLeve
               style={{ width, background: tone }}
             />
             <div className="relative grid grid-cols-[1fr_1fr] gap-1">
-              <span style={{ color: tone }}>{fmtPrice(level.price)}</span>
+              <span className="truncate" style={{ color: tone }}>
+                {fmtPrice(level.price)}
+              </span>
               <span className="truncate text-right text-[var(--text)]">{fmtQty(level.qty)}</span>
             </div>
           </div>

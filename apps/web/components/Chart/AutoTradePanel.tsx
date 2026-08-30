@@ -87,27 +87,103 @@ export default function AutoTradePanel({
       )}
     >
       <header className="shrink-0 space-y-1.5 border-b border-[var(--border)] bg-[var(--surface)] px-2 py-1.5">
-        <div className="flex items-center justify-between gap-2">
-          <span className="flex items-center gap-1.5 text-[11px] font-semibold text-[var(--text)]">
-            自动交易
+        {/* 第 1 行 Type A：左簇标题为唯一压力吸收点，右簇开关恒不收缩。
+            min-h-[24px] 把停止 / 运行两态行高锁成同值，避免启停瞬间抖一格并推动下面两行。 */}
+        <div
+          data-nowrap="row"
+          data-testid="auto-trade-header-row"
+          className="flex min-h-[24px] items-center justify-between gap-2 whitespace-nowrap"
+        >
+          <span className="flex min-w-0 items-center gap-1.5 text-[11px] font-semibold text-[var(--text)]">
+            <span className="min-w-0 truncate" title="自动交易">
+              自动交易
+            </span>
             {running ? (
-              <span className="inline-flex items-center gap-1 text-[var(--long-ink)]">
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--long)]" />
+              <span className="inline-flex shrink-0 items-center gap-1 text-[var(--long-ink)]">
+                <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-[var(--long)]" />
                 运行中
               </span>
             ) : (
-              <span className="text-[10px] font-normal text-[var(--muted)]">已停止</span>
+              <span className="shrink-0 text-[10px] font-normal text-[var(--muted)]">已停止</span>
             )}
             {running && aggregatePnl != null && (
-              <span className="tabular text-[11px]" style={{ color: colorForReturn(aggregatePnl) }}>
+              <span
+                className="shrink-0 tabular text-[11px]"
+                style={{ color: colorForReturn(aggregatePnl) }}
+              >
                 {fmtMoney(aggregatePnl)}
               </span>
             )}
+          </span>
+          <div
+            title={gateReason ?? (running ? "停止全部自动交易并平仓" : "启动整组自动交易")}
+            className={clsx("shrink-0", blocked && "cursor-not-allowed opacity-40")}
+          >
+            <Switch
+              checked={running}
+              onChange={(next) => (blocked || submitting ? undefined : onToggle(next))}
+              label="自动交易分组开关"
+            />
+          </div>
+        </div>
+
+        {/* 第 2 行 Type A：两个条目都不可压缩，宽度不足时整行由 header 的既有边界兜住。 */}
+        <div
+          data-nowrap="row"
+          className="flex items-center justify-between gap-2 whitespace-nowrap"
+        >
+          <ModeToggle mode={allocationMode} disabled={running} onChange={onAllocationModeChange} />
+          {allocationMode === "even" && (
+            <button
+              type="button"
+              onClick={onEvenSplit}
+              disabled={running || members.length === 0}
+              className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent-ink)] hover:bg-[var(--accent-soft)] disabled:opacity-40"
+            >
+              均分
+            </button>
+          )}
+        </div>
+
+        {/* 第 3 行 Type A：左侧汇总是本行唯一吸收点（min-w-0 truncate + title），
+            右簇「成员计数 + 收益记录」恒不收缩。「收益记录」从第 1 行下沉到这里：
+            它是低频查看动作，不该与「立即停止全部自动交易并平仓」的开关并排（§8.4）。
+            max_ratio 的「（各标的独立）」降级进 title —— 它与正上方 ModeToggle 的
+            「最大比例」是同一件事的第二次表述，却占掉 200px 档 38% 的可用宽。 */}
+        <div
+          data-nowrap="row"
+          data-testid="auto-trade-summary-row"
+          className="flex items-center justify-between gap-2 whitespace-nowrap text-[10px]"
+        >
+          <span
+            data-testid="auto-trade-allocation-summary"
+            className="min-w-0 truncate tabular text-[var(--muted)]"
+            title={
+              allocationMode === "even"
+                ? "已分配占总预算的比例，Σ 不得超过 100%"
+                : "每个标的各自的仓位上限，各标的独立，合计可超过 100%"
+            }
+          >
+            {allocationMode === "even" ? "已分配 " : "合计上限 "}
+            <span
+              className={clsx(
+                "font-semibold",
+                overLimit ? "text-[var(--short-ink)]" : "text-[var(--text)]",
+              )}
+            >
+              {Math.round(totalPct * 100) / 100}%
+            </span>
+            {allocationMode === "even" ? "/100%" : ""}
+          </span>
+          <span className="flex shrink-0 items-center gap-1.5">
+            <span className="tabular text-[var(--muted)]">
+              {members.length}/{LIVE_AUTO_MAX_GROUP_SYMBOLS}
+            </span>
             <button
               type="button"
               onClick={onOpenRecords}
               title="按时间维度查看每次完整交易的收益与总收益率"
-              className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent-ink)] transition-colors hover:bg-[var(--accent-soft)]"
+              className="inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent-ink)] transition-colors hover:bg-[var(--accent-soft)]"
             >
               <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden>
                 <path
@@ -120,53 +196,14 @@ export default function AutoTradePanel({
               收益记录
             </button>
           </span>
-          <div
-            title={gateReason ?? (running ? "停止全部自动交易并平仓" : "启动整组自动交易")}
-            className={clsx(blocked && "cursor-not-allowed opacity-40")}
-          >
-            <Switch
-              checked={running}
-              onChange={(next) => (blocked || submitting ? undefined : onToggle(next))}
-              label="自动交易分组开关"
-            />
-          </div>
-        </div>
-
-        <div className="flex items-center justify-between gap-2">
-          <ModeToggle mode={allocationMode} disabled={running} onChange={onAllocationModeChange} />
-          {allocationMode === "even" && (
-            <button
-              type="button"
-              onClick={onEvenSplit}
-              disabled={running || members.length === 0}
-              className="rounded px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent-ink)] hover:bg-[var(--accent-soft)] disabled:opacity-40"
-            >
-              均分
-            </button>
-          )}
-        </div>
-
-        <div className="flex items-center justify-between gap-2 text-[10px]">
-          {allocationMode === "even" ? (
-            <span className="tabular text-[var(--muted)]">
-              已分配{" "}
-              <span className={clsx("font-semibold", overLimit ? "text-[var(--short-ink)]" : "text-[var(--text)]")}>
-                {Math.round(totalPct * 100) / 100}%
-              </span>
-              /100% · {members.length}/{LIVE_AUTO_MAX_GROUP_SYMBOLS}
-            </span>
-          ) : (
-            <span className="tabular text-[var(--muted)]">
-              合计上限{" "}
-              <span className="font-semibold text-[var(--text)]">{Math.round(totalPct * 100) / 100}%</span>
-              （各标的独立）· {members.length}/{LIVE_AUTO_MAX_GROUP_SYMBOLS}
-            </span>
-          )}
         </div>
 
         {/* 禁用 / 拖入错误就地可见原因（HCI：避免守门被误判为「按钮坏了」）。 */}
         {(blocked && gateReason) || dropError ? (
-          <p className="truncate text-[10px] text-[var(--short-ink)]" title={dropError ?? gateReason ?? ""}>
+          <p
+            className="whitespace-normal break-words text-[10px] text-[var(--short-ink)]"
+            title={dropError ?? gateReason ?? ""}
+          >
             {dropError ?? gateReason}
           </p>
         ) : null}
@@ -174,7 +211,7 @@ export default function AutoTradePanel({
 
       <div className="min-h-0 flex-1 overflow-auto py-1">
         {members.length === 0 ? (
-          <p className="px-3 py-4 text-center text-[11px] leading-relaxed text-[var(--muted)]">
+          <p className="whitespace-normal break-words px-3 py-4 text-center text-[11px] leading-relaxed text-[var(--muted)]">
             把下方自选标的拖到这里，或点其「＋」加入；启动后将对所有成员同时自动交易
           </p>
         ) : (
@@ -221,7 +258,7 @@ function ModeToggle({
     <div
       role="group"
       aria-label="分配模式"
-      className="flex items-center gap-0.5 rounded-md bg-[var(--surface-2)] p-0.5"
+      className="flex shrink-0 items-center gap-0.5 rounded-md bg-[var(--surface-2)] p-0.5"
     >
       {(Object.keys(MODE_LABELS) as AutoTradeAllocationMode[]).map((m) => (
         <button
@@ -231,7 +268,7 @@ function ModeToggle({
           aria-pressed={mode === m}
           onClick={() => onChange(m)}
           className={clsx(
-            "rounded px-2 py-0.5 text-[10px] font-medium transition-colors",
+            "shrink-0 rounded px-2 py-0.5 text-[10px] font-medium transition-colors",
             mode === m
               ? "bg-[var(--surface)] text-[var(--text)] shadow-sm"
               : "text-[var(--muted)] hover:text-[var(--text)]",
