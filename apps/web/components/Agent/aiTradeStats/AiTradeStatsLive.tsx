@@ -328,7 +328,9 @@ function MemberObservabilityRow({ member }: { member: AiTradeGroupMemberState })
 const WAKE_SCHEDULER_HINT =
   "补跑 A/B：B = 到点却撞上在飞轮的唤醒次数（其中一部分即便不在飞也会被守卫跳过，故它不等于" +
   "「系统漏掉了这么多次决策」），A = 其中真的补跑了一轮的次数。" +
-  "持仓省 = 保护线在岗（armed）时跳过的持仓盯市轮；翻转唤 = 未收线预演出立场翻转而起的轮。";
+  "持仓省 = 保护线在岗（armed）时跳过的持仓盯市轮；翻转唤 = 未收线预演出立场翻转而起的轮。" +
+  "情报唤 A/B：A = 高危市场情报真的多起了一轮决策的次数，B = 告警到手却没能起轮（会话不在运行 /" +
+  "行情陈旧 / 尚无信号板 / 超时 / 撞上在飞轮）。两者口径不同，不要相加。";
 
 // 唤醒调度闭环四计数（§4.3）。四个数全为 0 ⇒ 返回 null ⇒ **整段不出现**：轴未生效的会话不该看到
 // 一排 0，那会被读成「统计坏了」——与本页「老记录缺键即整行隐藏」的既有纪律同款。
@@ -337,10 +339,17 @@ function describeWakeScheduler(session: AiTradeSessionRow | null | undefined): s
   const catchups = session?.wakeCatchups ?? 0;
   const positionWatchSkips = session?.positionWatchSkips ?? 0;
   const signalFlipWakes = session?.signalFlipWakes ?? 0;
+  // actionability §3.4.4 (d)：**两个新计数的唯一展示点**。沿用同一条「零值不显示」的范式——
+  // 轴未生效的会话不该看到一排 0，那会被读成「统计坏了」。
+  const intelAlertWakes = session?.intelAlertWakes ?? 0;
+  const intelAlertDrops = session?.intelAlertDrops ?? 0;
   const parts: string[] = [];
   if (drops || catchups) parts.push(`补跑 ${catchups}/${drops}`);
   if (positionWatchSkips) parts.push(`持仓省 ${positionWatchSkips}`);
   if (signalFlipWakes) parts.push(`翻转唤 ${signalFlipWakes}`);
+  if (intelAlertWakes || intelAlertDrops) {
+    parts.push(`情报唤 ${intelAlertWakes}/${intelAlertDrops}`);
+  }
   return parts.length ? parts.join(" · ") : null;
 }
 

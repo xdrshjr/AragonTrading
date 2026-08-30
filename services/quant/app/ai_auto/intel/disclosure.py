@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from . import taxonomy as tax
 from .citation import format_ref
+from .conflict import pair_index
 from .gate import IntelItem, score_item
 from .taxonomy import IntelLimits
 
@@ -38,11 +39,21 @@ _CITE_NOTE = ("（每条前面的 [Ixx] 是这一轮的情报编号。submit_tra
 # 注入排序：长期 → 中期 → 超短。时间与来源尺度由远及近，与系统 prompt 的思维链步骤同序。
 _TIER_RANK: dict[str, int] = {"long": 0, "mid": 1, "ultra": 2}
 
+# actionability 轴 C：矛盾标注在第一遍预算里为每一条相关行**预留**的字符数。
+# 它是一个**上界**（实际标注 ≤ 它），故第二遍的总长度恒 ≤ 第一遍的预算上界 ⇒ **永不超预算**。
+CONFLICT_MARKER_RESERVE = 24
+# 无编号时的固定文案（`cite=False` ⇒ 没有 [Ixx] 可指）。
+_CONFLICT_MARK_PLAIN = "（与库中另一条同题反向情报冲突）"
+# 段末说明句：**只在真的渲染出标注时**追加。它要求模型明确表态采信哪一条——「让分歧可见」
+# 而不给出一句「你该怎么办」，模型多半会当成两条独立证据各自加权，那正是轴 C 要修的东西。
+_CONFLICT_NOTE = ("（标注为「相互矛盾」的两条情报指向同一主题但方向相反，"
+                  "请在推理中明确说明你采信哪一条以及为什么。）")
+
 
 def relative_time(ts: int, now: float) -> str:
     """相对时间的中文口径（未来事件说「N 天后」，无日期说「时间未知」）。
 
-    **公开名**：整理轮的紧凑清单（`service.render_listing`）也要用它。同包里跨模块 import 一个
+    **公开名**：整理轮的紧凑清单（`service_curate.render_listing`）也要用它。同包里跨模块 import 一个
     下划线私有名，等于把它的签名变成公开契约却没有任何地方说明这件事。
     """
     if not ts:
@@ -77,8 +88,83 @@ def render_line(item: IntelItem, *, now: float, ref: str = "") -> str:
     return f"[{ref}] {body}" if ref else body
 
 
+def _reorder_for_conflicts(live: list[IntelItem], pairs: dict[int, int]) -> list[IntelItem]:
+    """把每个矛盾对的后一项移到前一项的紧后面（**只在同一 `_TIER_RANK` 分块内部**）。
+
+    ⚠️ **跨层的矛盾对不重排**（评审 P1-8）。排序首键是 `_TIER_RANK`，而预算循环是
+    ``break`` 不是 ``continue``：把一条 long 层的条目拖进 ultra 块会同时干两件坏事——打乱层
+    分组（渲染行上还写着「长期」，读者会以为排序坏了），以及让一条更长的行提前进队列，可能
+    使整个循环**提前 break**，于是本来能装下的若干条一条都进不来。跨层对双方仍各自渲染标注
+    （只要两端都被收进），只是不挪位置。
+
+    Args:
+        live: 已按 ``(_TIER_RANK, -score)`` 排好的库存。
+        pairs: ``item_id → 对方 item_id``。
+
+    Returns:
+        重排后的新列表（**稳定移动**，不改其余相对次序）。
+    """
+    if not pairs:
+        return live
+    ordered: list[IntelItem] = []
+    placed: set[int] = set()
+    by_id = {int(it.item_id): it for it in live if it.item_id}
+    for item in live:
+        key = int(item.item_id or 0)
+        if key in placed:
+            continue
+        ordered.append(item)
+        placed.add(key)
+        other = by_id.get(int(pairs.get(key, 0)))
+        if (other is not None and int(other.item_id) not in placed
+                and _TIER_RANK.get(other.tier, 9) == _TIER_RANK.get(item.tier, 9)):
+            ordered.append(other)
+            placed.add(int(other.item_id))
+    return ordered
+
+
+def _fit_lines(live: list[IntelItem], *, limits: IntelLimits, now: float, cite: bool,
+               reserve: frozenset[int]) -> list[IntelItem]:
+    """**第一遍（预算）**：按重排后的顺序算出「装得下哪些条目」。
+
+    属于某个矛盾对的行额外预留 `CONFLICT_MARKER_RESERVE` 字符——标注文本里的编号要等这一行被
+    收进 `lines` 才知道，那是一个循环依赖，预留是解开它的代价。
+
+    Returns:
+        被收进来的条目（顺序即渲染顺序）。
+    """
+    budget = max(0, int(limits.prompt_max_chars))
+    used = 0
+    picked: list[IntelItem] = []
+    for item in live:
+        ref = format_ref(len(picked) + 1) if cite else ""
+        need = len(render_line(item, now=now, ref=ref)) + 1
+        if int(item.item_id or 0) in reserve:
+            need += CONFLICT_MARKER_RESERVE
+        # **绝不半截截断一条**：装不下就停，剩下的如实报成「另有 N 条未展示」。
+        if used + need > budget:
+            break
+        picked.append(item)
+        used += need
+    return picked
+
+
 def build_digest(items: list[IntelItem], *, limits: IntelLimits, now: float,
-                 last_collect_ts: int | None, cite: bool = False) -> dict:
+                 last_collect_ts: int | None, cite: bool = False, eff=None,
+                 conflicts: tuple = ()) -> dict:
+    """`build_digest_and_ids` 的薄壳（**wire 一个字节不变**）。
+
+    绝大多数调用点只要 wire；只有 `IntelRuntime.refresh` 需要那份 id 集合（`in_digest` 的判据）。
+    把 id 集合塞进 wire 是不行的——G-3 用 `sha256` 冻结这份 wire，多一个键就是一次逐字节变更。
+    """
+    return build_digest_and_ids(items, limits=limits, now=now,
+                                last_collect_ts=last_collect_ts, cite=cite, eff=eff,
+                                conflicts=conflicts)[0]
+
+
+def build_digest_and_ids(items: list[IntelItem], *, limits: IntelLimits, now: float,
+                         last_collect_ts: int | None, cite: bool = False, eff=None,
+                         conflicts: tuple = ()) -> tuple[dict, frozenset[int]]:
     """把当前库存定稿成注入用的 wire。
 
     Args:
@@ -90,9 +176,16 @@ def build_digest(items: list[IntelItem], *, limits: IntelLimits, now: float,
             的无谓风险）。
         cite: 轴 A 单键（keyword-only，默认 False ⇒ G-1 逐字节回退）。**取值只有一个来源**
             （评审 P1-15）：`build_snapshot` 传 `cite=bool(settings.ai_trade_intel_cite_enabled)`。
+        eff: actionability 轴 B 的战绩先验，一路透传给 `score_item`。``None`` ⇒ 排序逐字节回退。
+        conflicts: actionability 轴 C 的矛盾对（`conflict.ConflictPair` 元组）。**默认空元组
+            ⇒ 重排与两遍预算全部跳过 ⇒ 产物逐字节回退**（照抄 `limits=None` 的既有范式）。
+            纯核心不自己读 `Settings`，`conflict_enabled` 的效果体现为调用方传不传它。
 
     Returns:
-        ``{"lines": [...], "hidden": int}``；零条目时 ``lines`` 为空列表 ⇒ `format_intel` 回空串。
+        ``(wire, picked_ids)``。`wire` 形如 ``{"lines": [...], "hidden": int}``；零条目时
+        ``lines`` 为空列表 ⇒ `format_intel` 回空串。`picked_ids` 是**真正被收进 `lines`** 的
+        条目 id 集合——它**不进 wire**（G-3 用 sha256 冻结 wire），只交给
+        `IntelRuntime.refresh` 去回答「这条告警情报到底在不在 prompt 里」（评审 P0-3）。
         `cite=True` 时**额外**带 ``{"refs": {"I01": item_id, ...}, "citeEnabled": True}``，`refs`
         的键序与 `lines` 严格一致且无空洞（G-2）；`cite=False` 时两键**整键缺席**。
 
@@ -104,32 +197,55 @@ def build_digest(items: list[IntelItem], *, limits: IntelLimits, now: float,
         看到的库存与注入看到的库存分叉，而分叉不报错（评审 P1-15）。
     """
     if last_collect_ts is None:
-        return {"lines": [], "hidden": 0}
+        return {"lines": [], "hidden": 0}, frozenset()
     # ★ closed-loop §3.3.4：被证伪的条目**立即停止注入**，受保护条目同样生效——置顶与手改保护的
     # 是「这条记录别被系统删掉」，不是「这条记录必须继续影响真实资金」。
     live = [it for it in items if it.status == "active" and not it.refuted]
     live.sort(key=lambda it: (_TIER_RANK.get(it.tier, 9),
-                              -score_item(it, now=now, limits=limits)))
-    lines: list[str] = []
+                              -score_item(it, now=now, limits=limits, eff=eff)))
+    pairs = conflict_pair_index(conflicts)
+    live = _reorder_for_conflicts(live, pairs)
+    picked = _fit_lines(live, limits=limits, now=now, cite=cite,
+                        reserve=frozenset(pairs))
+    # **第二遍（定稿）内部还要再分两小步**：先把 `refs` 与 id → 下标全部定稿，**再**渲染标注
+    # ——`（与 [I05] 相互矛盾）` 里的 I05 是对方的编号，而对方可能排在自己后面。
     refs: dict[str, int] = {}
-    used = 0
-    budget = max(0, int(limits.prompt_max_chars))
-    for item in live:
-        ref = format_ref(len(lines) + 1) if cite else ""
-        line = render_line(item, now=now, ref=ref)
-        # **绝不半截截断一条**：装不下就停，剩下的如实报成「另有 N 条未展示」。
-        # `len(line)` 天然含前缀，故 budget 计算自动把编号算进去。
-        if used + len(line) + 1 > budget:
-            break
-        lines.append(line)
-        used += len(line) + 1
+    token_of: dict[int, str] = {}
+    for index, item in enumerate(picked, start=1):
+        ref = format_ref(index) if cite else ""
         if ref and item.item_id:
             refs[ref] = int(item.item_id)
+            token_of[int(item.item_id)] = ref
+    inside = {int(it.item_id) for it in picked if it.item_id}
+    lines: list[str] = []
+    marked = False
+    for index, item in enumerate(picked, start=1):
+        ref = format_ref(index) if cite else ""
+        line = render_line(item, now=now, ref=ref)
+        other = int(pairs.get(int(item.item_id or 0), 0))
+        # **当且仅当矛盾对的两端都被收进**才渲染标注：否则标注会指向一个不存在的编号。
+        if other and other in inside:
+            token = token_of.get(other, "")
+            line += f"（与 [{token}] 相互矛盾）" if token else _CONFLICT_MARK_PLAIN
+            marked = True
+        lines.append(line)
     wire: dict = {"lines": lines, "hidden": max(0, len(live) - len(lines))}
     if cite:
         wire["refs"] = refs
         wire["citeEnabled"] = True
-    return wire
+    if marked:
+        wire["conflictNote"] = True
+    return wire, frozenset(inside)
+
+
+def conflict_pair_index(conflicts) -> dict[int, int]:
+    """``item_id → 对方 item_id``（薄转发到 `conflict.pair_index`，避免第二份口径）。
+
+    `conflict` 只 import `quotes`，不成环，故这是一个**模块级** import——函数内的局部 import
+    在本仓库是用来打破真实循环的（`runtime.invalidate` 那一处），拿它当风格用会让下一个人
+    误以为这里有环（上一轮终审刚为同一形状修过 `evidence_repositories`）。
+    """
+    return pair_index(conflicts)
 
 
 def format_intel(wire: dict | None) -> str:
@@ -152,4 +268,8 @@ def format_intel(wire: dict | None) -> str:
     parts = [f"\n{_HEADER}", _BANNER, *lines, footer]
     if wire.get("citeEnabled"):
         parts.append(_CITE_NOTE)
+    # actionability 轴 C：段末说明句**只在真的渲染出标注时**出现（`conflictNote` 整键缺席 ⇒
+    # 逐字节回退）。放在 `_CITE_NOTE` 之后，与它同为「读这一段的方法」而不是情报本身。
+    if wire.get("conflictNote"):
+        parts.append(_CONFLICT_NOTE)
     return "\n".join(parts)

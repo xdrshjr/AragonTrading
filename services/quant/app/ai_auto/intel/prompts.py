@@ -96,7 +96,32 @@ def build_collect_tool_schema(limits: IntelLimits) -> dict:
 
 
 def build_curate_tool_schema(limits: IntelLimits) -> dict:
-    """整理工具的入参 schema。"""
+    """整理工具的入参 schema。
+
+    `action` 的枚举从 `taxonomy` 的**单一真源**生成（本轮之前它是硬写在这里的一行 JSON 数组，
+    而 `gate.CurationAction.action` 只有一行注释镜像它）。
+
+    ⚠️ **枚举按 `limits.conflict_enabled` 条件化**（评审 P0-4）：`keep_both` 是轴 C 的产物，
+    而 §3.0 第 2 条要求矛盾开关关掉时整理链路**逐字节**回到 4b9c352。一个无条件含 `keep_both`
+    的枚举会让那条自我约束被本特性自己破坏——模型可以发出一个必然被 `keep_both_bad_pair` 驳回
+    的动作，白占一个 `curate_max_actions` 名额，而界面上只会多出一行驳回码。
+    `pairId` 属性、system prompt 的裁决纪律、user prompt 的矛盾段**三者同条件缺席**（G-30）。
+    """
+    conflict_on = bool(limits.conflict_enabled)
+    actions = tax.CURATE_ACTIONS if conflict_on else tax.CURATE_ACTIONS_BASE
+    properties: dict = {
+        "id": {"type": "integer", "description": "条目编号（清单里的 #N）"},
+        "action": {"type": "string", "enum": list(actions)},
+        "toTier": {"type": "string", "enum": list(tax.TIERS)},
+        "mergeIntoId": {"type": "integer",
+                        "description": "action=merge 时，并入哪一条的编号"},
+        "reason": {"type": "string", "maxLength": 120,
+                   "description": "**具体**理由，引用条目编号与事实"},
+    }
+    if conflict_on:
+        properties["pairId"] = {
+            "type": "integer",
+            "description": "action=keep_both 时**必填**：与本条构成矛盾对的那一条的编号"}
     return {
         "type": "object",
         "properties": {
@@ -105,16 +130,7 @@ def build_curate_tool_schema(limits: IntelLimits) -> dict:
                 "maxItems": max(1, min(40, limits.curate_max_actions * 2)),
                 "items": {
                     "type": "object",
-                    "properties": {
-                        "id": {"type": "integer", "description": "条目编号（清单里的 #N）"},
-                        "action": {"type": "string",
-                                   "enum": ["promote", "demote", "archive", "merge", "keep"]},
-                        "toTier": {"type": "string", "enum": list(tax.TIERS)},
-                        "mergeIntoId": {"type": "integer",
-                                        "description": "action=merge 时，并入哪一条的编号"},
-                        "reason": {"type": "string", "maxLength": 120,
-                                   "description": "**具体**理由，引用条目编号与事实"},
-                    },
+                    "properties": properties,
                     "required": ["id", "action", "reason"],
                 },
             },
@@ -122,6 +138,23 @@ def build_curate_tool_schema(limits: IntelLimits) -> dict:
         },
         "required": ["actions"],
     }
+
+
+def _curate_conflict_rules(limits: IntelLimits) -> list[str]:
+    """整理协议的矛盾裁决纪律（`conflict_enabled=False` ⇒ **整段缺席**，G-30）。
+
+    ⚠️ **不要写 `supersede`**：`gate.CurationAction.action` 的值域里没有这个动作，它只是
+    `merge` 的落库效果（`supersedes_id` 列）。把一个不存在的动作名写进 system prompt，模型会
+    照着发，然后被 `bad_action` 驳回，而界面上没有任何线索指向这句 prompt。
+    """
+    if not limits.conflict_enabled:
+        return []
+    return [
+        "R7 裁决矛盾：清单末尾列出的每一个【矛盾对】都必须得到一个动作——降级（demote）、"
+        "归档（archive）、合并（merge），或者显式的 keep_both 并在 reason 里说明**为什么两条"
+        "方向相反的情报可以同时成立**（例如它们讲的是不同时间尺度、或不同口径的同一件事）。"
+        "keep_both 必须同时填 pairId（对方的条目编号），且理由不得少于 20 字。",
+    ]
 
 
 def _collect_quote_stage(limits: IntelLimits) -> list[str]:
@@ -197,6 +230,7 @@ def build_curate_system_prompt(inst_id: str, limits: IntelLimits) -> str:
         "R4 逐条判断长期层：它是否已经过时（政策已落地、解锁已完成）？是 → 降回中期或归档。",
         "R5 给每一个动作写一句**具体**理由（引用条目编号与事实，不写「不重要」这类空话）。",
         "R6 自查：我提议归档的条目里，有没有仅仅因为「我不喜欢这个方向」而被归档的？有就撤回。",
+        *_curate_conflict_rules(limits),
         "",
         "## 硬约束",
         "C1 你只能提议，系统会复核。不满足升级门槛的提议会被驳回并记录，这不是错误。",
@@ -206,13 +240,24 @@ def build_curate_system_prompt(inst_id: str, limits: IntelLimits) -> str:
     ])
 
 
-def build_curate_user_prompt(listing: str) -> str:
-    """整理轮的 user 消息：紧凑清单 + 一句收尾指令。"""
-    return "\n".join([
-        listing,
+def build_curate_user_prompt(listing: str, conflicts: str = "") -> str:
+    """整理轮的 user 消息：紧凑清单 + 未裁决的矛盾对 + 一句收尾指令。
+
+    Args:
+        listing: `service_curate.render_listing` 的产物。
+        conflicts: `service_curate.render_conflicts` 的产物（actionability 轴 C）。
+            **空串 ⇒ 整段缺席且收尾指令退回 R1–R6** ⇒ 产物与本轮合入前**逐字节相同**
+            （G-3 的第四件产物 / G-30）。轴 C 总闸关闭时它恒为空串。
+    """
+    stages = "R1–R7" if conflicts else "R1–R6"
+    parts = [listing]
+    if conflicts:
+        parts.extend(["", conflicts])
+    parts.extend([
         "",
-        f"请按 R1–R6 逐阶段研判，然后必须且只能调用一次 {CURATE_TOOL_NAME} 提交动作。",
+        f"请按 {stages} 逐阶段研判，然后必须且只能调用一次 {CURATE_TOOL_NAME} 提交动作。",
     ])
+    return "\n".join(parts)
 
 
 # ---------------- 核查协议（intel-closed-loop 轴 C，§3.3.3） ----------------
@@ -314,7 +359,7 @@ def render_verify_candidates(items, *, now: float) -> str:
     """待核查条目清单。
 
     **只给四样东西：`C` 编号 / headline / summary / 事件时刻**（评审 P1-11）。
-    **绝不复用 `service.render_listing`**，也绝不带 `stance`（利多/利空）、`impact`、
+    **绝不复用 `service_curate.render_listing`**，也绝不带 `stance`（利多/利空）、`impact`、
     `confidence`、`tier`、`domain_count`：把「这条是利多」摆在核查员眼前，再在硬约束里要求他
     「不得因为方向倾向任何判定」，是在同一段 prompt 里用输入反驳自己的指令。
     """

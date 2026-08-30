@@ -29,6 +29,12 @@ const PROBE_KEYS = [
   "AI_TRADE_INTEL_CITE_ENABLED",
   "AI_TRADE_INTEL_ATTRIBUTION_ENABLED",
   "AI_TRADE_INTEL_VERIFY_MAX_TOKENS",
+  // ai-trade-intel-actionability §6.3：本轮 18 项新配置**同样沿用 `AI_TRADE_INTEL_` 前缀**，
+  // 故桌面壳零改动即可拿到它们。补进探针的是三把总闸——它们要是被静默丢掉，症状是
+  // 「桌面端上高危情报永远不唤醒，而开发机上一切正常」。
+  "AI_TRADE_INTEL_ALERT_ENABLED",
+  "AI_TRADE_INTEL_EFFICACY_ENABLED",
+  "AI_TRADE_INTEL_CONFLICT_ENABLED",
   "INTEL_VERIFY_ENABLED",
 ];
 
@@ -58,6 +64,10 @@ test("prod backendEnv forwards the closed-loop AI_TRADE_INTEL_* knobs from agent
         AI_TRADE_INTEL_CITE_ENABLED: "false",
         AI_TRADE_INTEL_ATTRIBUTION_ENABLED: "false",
         AI_TRADE_INTEL_VERIFY_MAX_TOKENS: "4096",
+        // ai-trade-intel-actionability 的三把总闸（同一前缀，桌面壳零改动即可穿到后端）。
+        AI_TRADE_INTEL_ALERT_ENABLED: "false",
+        AI_TRADE_INTEL_EFFICACY_ENABLED: "false",
+        AI_TRADE_INTEL_CONFLICT_ENABLED: "false",
         // 前缀不沾 `AI_TRADE_` 的裸名：它**必须**被挡在外面，否则「按前缀」这条结论就是假的。
         INTEL_VERIFY_ENABLED: "true",
       },
@@ -68,6 +78,10 @@ test("prod backendEnv forwards the closed-loop AI_TRADE_INTEL_* knobs from agent
     assert.equal(env.AI_TRADE_INTEL_CITE_ENABLED, "false");
     assert.equal(env.AI_TRADE_INTEL_ATTRIBUTION_ENABLED, "false");
     assert.equal(env.AI_TRADE_INTEL_VERIFY_MAX_TOKENS, "4096");
+    assert.equal(env.AI_TRADE_INTEL_ALERT_ENABLED, "false",
+      "告警总闸没穿过白名单：桌面端上高危情报会照默认值唤醒，而用户以为自己关掉了");
+    assert.equal(env.AI_TRADE_INTEL_EFFICACY_ENABLED, "false");
+    assert.equal(env.AI_TRADE_INTEL_CONFLICT_ENABLED, "false");
     assert.equal(env.INTEL_VERIFY_ENABLED, undefined, "白名单之外的键一律不进后端 env");
   });
 });

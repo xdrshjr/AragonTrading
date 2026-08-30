@@ -2823,6 +2823,16 @@ class IntelSettingsIn(BaseModel):
     readerEnabled: bool | None = None
     readerTopK: int | None = Field(default=None, ge=1, le=12)
     quoteMode: Literal["off", "soft", "strict"] | None = None
+    # ---- ai-trade-intel-actionability §3.4.2：三把总闸 + 三个告警旋钮 ----
+    # ⚠️ 值域**必须**收在这里而不是只在前端：设置端点是公开的，而 `alertMinImpact` 的一个坏值
+    # 会经 `settings.model_copy(update=…)` 绕过 `Literal`（`model_copy` 不做校验）。第二道保险
+    # 在 `intel/settings_bridge.py::resolve_intel_settings` 的读回处。
+    alertEnabled: bool | None = None
+    alertMinImpact: Literal["medium", "high"] | None = None
+    alertCooldownMin: float | None = Field(default=None, ge=1, le=720)
+    alertDailyCap: int | None = Field(default=None, ge=1, le=48)
+    efficacyEnabled: bool | None = None
+    conflictEnabled: bool | None = None
 
 
 class IntelProbeIn(BaseModel):
@@ -2867,6 +2877,21 @@ class IntelSettingsOut(BaseModel):
     # 近 20 轮引文命中率（`None` = 分母 0，「没提过引文」与「提了全没中」是两句不同的话）。
     # 它是把 `quoteMode` 调到 strict 的**唯一**判据在设置卡上的落点。
     quoteHitRate: float | None = None
+    # ---- actionability：与 `IntelSettingsIn` 的六个新键逐个对称。**回执必须带上它们**——
+    # `response_model` 会静默丢弃未声明的键，症状是「开关点了、回读还是旧值」。
+    alertEnabled: bool
+    alertMinImpact: str
+    alertCooldownMin: float
+    alertDailyCap: int
+    efficacyEnabled: bool
+    conflictEnabled: bool
+    # `alertRequireQuote` 是**生效值**（`quoteMode="off"` 时降级为 False），设置卡据它写明
+    # 当前到底要不要引文以及为什么。它不在 `IntelSettingsIn` 里——本轮不让用户从面板改它。
+    alertRequireQuote: bool = True
+    # 待处理告警的时限（秒，同样只读）。动态页签用它把「还没回」与「再也不会回」分开：不下发
+    # 它，前端只能写死一个数，而它是一个 30–900 的配置项——把它调到 900 的用户会在第 180 秒
+    # 看到「会话未在时限内响应」，而后端那一侧还在正常等着。
+    alertPendingTtlS: float = 180.0
 
 
 class ErrorBody(BaseModel):

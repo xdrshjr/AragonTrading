@@ -2,8 +2,10 @@
 
 import { Skeleton } from "@/components/ui";
 import { sortItems } from "@/lib/intel";
+import { conflictPartners } from "@/lib/intelActionability";
 import type {
   AiTradeIntelSummary,
+  IntelConflict,
   IntelEvidence,
   IntelItem,
   IntelTier,
@@ -33,6 +35,8 @@ export default function IntelList({
   evidenceLoadingId = null,
   evidenceErrors = {},
   blockedDomains = [],
+  conflicts = [],
+  itemsById = {},
 }: {
   items: IntelItem[];
   tier: IntelTier;
@@ -54,6 +58,10 @@ export default function IntelList({
   /** 读取失败的原因**按 `itemId` 存**：一个弹窗级的字符串会让 A 的失败落到 B 的抽屉上。 */
   evidenceErrors?: Record<number, string>;
   blockedDomains?: string[];
+  /** 当前库存里的矛盾对（轴 C）；空数组 ⇒ 徽标整段不渲染。 */
+  conflicts?: IntelConflict[];
+  /** 全部条目按 id 索引：矛盾对的另一端可能**不在当前这一层**，故不能只在 `items` 里找。 */
+  itemsById?: Record<number, IntelItem>;
 }) {
   if (loading) {
     return (
@@ -78,6 +86,7 @@ export default function IntelList({
     );
   }
 
+  const partners = conflictPartners(conflicts);
   return (
     <div className="flex flex-col gap-1.5 p-3" data-testid="intel-list">
       {sortItems(items, nowMs).map((item) => (
@@ -91,6 +100,8 @@ export default function IntelList({
           evidenceLoading={evidenceLoadingId === item.id}
           evidenceError={evidenceErrors[item.id] ?? ""}
           blockedDomains={blockedDomains}
+          conflict={conflicts.find((p) => p.aId === item.id || p.bId === item.id)}
+          conflictPartner={itemsById[partners[item.id]]}
         />
       ))}
     </div>

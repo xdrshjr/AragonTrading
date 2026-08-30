@@ -21,7 +21,13 @@ from app.ai_auto.intel import service
 from app.ai_auto.intel.search import SearchDoc, SearchRunner
 from app.config import Settings
 from app.db import repositories as repo
-from app.db.models import AiIntelCitation, AiIntelItem, AiIntelRound, AiIntelWatch
+from app.db.models import (
+    AiIntelAlert,
+    AiIntelCitation,
+    AiIntelItem,
+    AiIntelRound,
+    AiIntelWatch,
+)
 from app.db.session import get_sessionmaker, init_db
 
 # 假时钟比真实时钟**快一小时**：`ensure_intel_watch` 用真实 `time.time()` 写 `next_due_ts`，
@@ -86,7 +92,8 @@ async def _fresh() -> None:
     await init_db()
     sm = get_sessionmaker()
     async with sm() as session:
-        for table in (AiIntelCitation, AiIntelItem, AiIntelRound, AiIntelWatch):
+        for table in (AiIntelAlert, AiIntelCitation, AiIntelItem, AiIntelRound,
+                      AiIntelWatch):
             await session.execute(delete(table))
         await session.commit()
 
@@ -578,3 +585,68 @@ async def test_curate_round_prunes_the_document_cache():
     assert outcome.actions.get("documents_pruned") == 1
     async with get_sessionmaker()() as session:
         assert (await repo.document_health(session))["cachedDocs"] == 0
+
+
+# ---------- ai-trade-intel-actionability：G-25 + 采集轮的告警写段 ----------
+@pytest.mark.asyncio
+async def test_the_summary_always_carries_the_actionability_keys():
+    """G-25：`alerts24h` / `lastAlertTs` / `efficacy` **在位**（形状恒一致）。
+
+    未装配的分组由 `runtime._static_summary` 给出同形状的零值——前端读到 `undefined` 会把
+    「情报层没装上」画成「零告警」，本仓库已在 `citations` / `verify` / `quoteHitRate` 上
+    连踩三次。
+    """
+    await _fresh()
+    deps = _deps(provider=FakeProvider(), llm=FakeLLM(_COLLECT_PAYLOAD))
+    snapshot = await service.build_snapshot(deps, INST)
+    summary = snapshot["summary"]
+    assert summary["alerts24h"] == 0
+    assert summary["lastAlertTs"] is None, "从未告警过 ≠ 1970 年告警过"
+    assert summary["efficacy"]["enabled"] is True
+    assert summary["efficacy"]["overall"]["accuracy"] is None
+    assert snapshot["conflicts"] == []
+    assert isinstance(snapshot["digestItemIds"], frozenset)
+    # 两条通路（WS 推送 / REST 读取）共用**同一个**装配点，故形状逐键一致——写在
+    # `build_snapshot` 里会让 REST 那一份少一个键，而少键**不报错**。
+    async with get_sessionmaker()() as session:
+        fresh = await service.read_summary(session, INST, settings=deps.settings,
+                                           provider_configured=True, now=NOW)
+    assert set(fresh) == set(summary)
+
+
+@pytest.mark.asyncio
+async def test_every_collect_round_writes_exactly_one_ledger_row():
+    """**无论 fired 与否都写**：「今天为什么一次都没告警」的答案就住在这些行里。
+
+    同一次 `commit`（评审 P1-5）：条目回滚而告警行留下，等于凭空多出一条指向不存在条目的告警。
+    """
+    await _fresh()
+    deps = _deps(provider=FakeProvider(), llm=FakeLLM(_COLLECT_PAYLOAD))
+    outcome = await service.run_collect_round(deps, INST)
+    assert outcome.status == "ok"
+    async with get_sessionmaker()() as session:
+        rows, _ = await repo.list_intel_alerts(session, inst_id=INST)
+        items = await repo.load_intel_scope(session, INST)
+    assert len(rows) == 1
+    row = rows[0]
+    # 默认阈值下这条 macro 情报只有 2 个域名、没有引文 ⇒ 被 `no_quote` 压下去，
+    # 但台账**照样有一行**，且它说得出被压下去的是哪一条。
+    assert row["fired"] is False and row["suppressedCode"]
+    assert row["itemId"] == items[0]["id"]
+    assert row["headline"] == items[0]["headline"]
+    assert row["roundId"] > 0
+
+
+@pytest.mark.asyncio
+async def test_a_degraded_round_writes_no_ledger_row_at_all():
+    """降级路径（`finish_degraded`）不走写段 ⇒ 一条台账都不该产生。
+
+    它们的解释落在轮存根的 `degradeCode` 上；在告警台账里再写一行「因为检索失败所以没告警」
+    是同一个事实的第二份账。
+    """
+    await _fresh()
+    deps = _deps(provider=None, llm=None)
+    await service.run_collect_round(deps, INST)
+    async with get_sessionmaker()() as session:
+        rows, _ = await repo.list_intel_alerts(session, inst_id=INST)
+    assert rows == []

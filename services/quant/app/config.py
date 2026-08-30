@@ -1079,6 +1079,39 @@ class Settings(BaseSettings):
     ai_trade_intel_reader_cache_max_rows: int = Field(default=4000, ge=200, le=50_000)
     ai_trade_intel_quote_mode: Literal["off", "soft", "strict"] = "soft"
 
+    # ---- 情报可行动化（ai-trade-intel-actionability §十一，18 项；前缀仍是 `AI_TRADE_INTEL_`）----
+    # 三把总闸，任一关闭 ⇒ 对应链路的产物与 `4b9c352` 逐字节相同：
+    #   ALERT_ENABLED=false    ⇒ 不发任何 handoff，唤醒链路无第九种 kind；
+    #   EFFICACY_ENABLED=false ⇒ `score_item` 的第二个加分项不参与运算，四个消费点全部回退；
+    #   CONFLICT_ENABLED=false ⇒ digest 行体、整理工具 schema、两段整理 prompt 四者一起回退。
+    # ⚠️ 六把键露在 `PUT /settings/intel` 上，故 `intel/service.py::INTEL_SETTING_BRIDGE`
+    # **必须**同时有对应行——不扩那张表，它们就是「面板上改得动、系统永远不读、而且不报错」
+    # 的假开关（本仓库已为此栽过两次）。
+    ai_trade_intel_alert_enabled: bool = True
+    ai_trade_intel_alert_min_impact: Literal["medium", "high"] = "high"
+    # csv；空串 ⇒ **全类别**。元素必须 ∈ `taxonomy.CATEGORIES`，由启动期校验器兑现。
+    ai_trade_intel_alert_categories: str = "risk,macro,project"
+    # 须有逐字原文引证才够格打断一次决策。`QUOTE_MODE=off` 时**在单一生效值读点**
+    # （`taxonomy.resolve_require_quote`）降级为 False——存储的偏好一个字节不改。
+    ai_trade_intel_alert_require_quote: bool = True
+    ai_trade_intel_alert_min_domains: int = Field(default=2, ge=1, le=5)
+    ai_trade_intel_alert_min_confidence: float = Field(default=0.6, ge=0, le=1)
+    ai_trade_intel_alert_max_event_age_min: float = Field(default=180.0, ge=5, le=1440)
+    ai_trade_intel_alert_cooldown_min: float = Field(default=20.0, ge=1, le=720)
+    ai_trade_intel_alert_daily_cap: int = Field(default=6, ge=1, le=48)
+    ai_trade_intel_alert_allow_scheduled: bool = False
+    # 待处理告警的最长存活；超时丢弃并记 `dropped_expired`。**跨字段校验器**钉死它
+    # ≥ 2 × `live_auto_poll_interval_s`（见 `_check_intel_actionability`）。
+    ai_trade_intel_alert_pending_ttl_s: float = Field(default=180.0, ge=30, le=900)
+    ai_trade_intel_alert_retention_d: float = Field(default=30.0, ge=1, le=365)
+    ai_trade_intel_efficacy_enabled: bool = True
+    ai_trade_intel_efficacy_k_min: int = Field(default=8, ge=1, le=100)
+    # 先验对 `score_item` 的**绝对**封顶：先验只改变排序，绝不改变准入或注入（R-6）。
+    ai_trade_intel_efficacy_max_weight: float = Field(default=0.25, ge=0, le=1)
+    ai_trade_intel_efficacy_min_domain_samples: int = Field(default=3, ge=1, le=50)
+    ai_trade_intel_conflict_enabled: bool = True
+    ai_trade_intel_conflict_min_overlap: float = Field(default=0.35, ge=0.1, le=0.9)
+
     # ---- 信任边界（trust-boundary-and-signal-integrity D1 / §6.1）----
     # 逗号分隔的 Origin 白名单；空 = 用 `app/security/origins.py` 的 DEFAULT_ORIGINS。
     # 显式配置即**完全替换**默认（不做合并，避免「以为收紧了其实没有」）。
@@ -1272,6 +1305,44 @@ class Settings(BaseSettings):
                 f"AI_TRADE_INTEL_READER_TOP_K({self.ai_trade_intel_reader_top_k}) 必须 ≤ "
                 f"AI_TRADE_INTEL_CORPUS_MAX_DOCS({self.ai_trade_intel_corpus_max_docs})："
                 "抓得比语料还多篇没有任何意义，多出来的那几次出网既进不了语料也进不了引文")
+        return self
+
+    @model_validator(mode="after")
+    def _check_intel_actionability(self) -> "Settings":
+        """情报可行动化的两条启动期约束（ai-trade-intel-actionability §十一）。
+
+        1. `alert_categories` 的每个元素必须 ∈ `taxonomy.CATEGORIES`。写错一个（`risks`、
+           `Macro`）不会报错，只会让那一类**永远不告警**——而「今天为什么一次都没告警」的答案
+           会指向一个用户以为自己已经打开了的类别。
+        2. `alert_pending_ttl_s` 必须 **≥ 2 × `live_auto_poll_interval_s`**（评审 P1-6）。
+           这是一条**跨字段**约束：`ge=30` 那个字段级下限拦不住真正的坏配置——
+           `live_auto_poll_interval_s` 是一个**无上界**的普通 `int = 5`，用户把盯市周期调到
+           60s 时，`alert_pending_ttl_s=30` 就是「告警在被 tick 看到之前必然过期」，是一个
+           **永远不会唤醒**的配置，且没有任何错误。同一条不变式也写在 `_maybe_intel_wake` 的
+           docstring 里。
+
+        Raises:
+            ValueError: 任一条不成立（构造期即失败，绝不留一个静默失效的开关）。
+        """
+        # 延迟导入打破启动期循环：`app.ai_auto.intel.taxonomy` 的包 `__init__` 会反向 import
+        # 本模块（与 `_check_reasoning_budget` 的既有做法同源）。
+        from .ai_auto.intel.taxonomy import CATEGORIES
+
+        raw = (self.ai_trade_intel_alert_categories or "").strip()
+        bad = [part.strip() for part in raw.split(",")
+               if part.strip() and part.strip() not in CATEGORIES]
+        if bad:
+            raise ValueError(
+                f"AI_TRADE_INTEL_ALERT_CATEGORIES 含非法类别 {bad}："
+                f"可选值只有 {list(CATEGORIES)}；写错的那一类不会报错，只会永远不告警")
+        floor = 2 * self.live_auto_poll_interval_s
+        if self.ai_trade_intel_alert_pending_ttl_s < floor:
+            raise ValueError(
+                f"AI_TRADE_INTEL_ALERT_PENDING_TTL_S"
+                f"({self.ai_trade_intel_alert_pending_ttl_s}) 必须 ≥ 2 × "
+                f"LIVE_AUTO_POLL_INTERVAL_S({self.live_auto_poll_interval_s}) = {floor}："
+                "小于它时告警在被盯市 tick 看到之前就过期了，是一个永远不会唤醒的配置，"
+                "而且没有任何错误")
         return self
 
     def allowed_origin_list(self) -> list[str]:

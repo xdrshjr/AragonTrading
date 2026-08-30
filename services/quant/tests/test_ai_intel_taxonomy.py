@@ -79,3 +79,50 @@ def test_limits_from_settings_converts_units():
     assert limits.forward_window_s == 30 * 86400
     assert limits.promote_min_age_s == 3600
     assert limits.lapse_grace_s == 24 * 3600
+
+
+# ---------- ai-trade-intel-actionability：两组新码与两张中文表 ----------
+def test_alert_code_tables_cover_every_declared_code():
+    """进 wire 的文案**由后端下发**（跟随 `degrade_wire` 的既有裁决）：两张表必须逐值齐备。
+
+    漏一个的症状是用户在动态页签上看到一个裸 slug——本仓库为这件事栽过三次。
+    """
+    from app.ai_auto.intel import taxonomy as tax
+
+    assert set(tax.ALERT_SUPPRESS_LABELS) == set(tax.ALERT_SUPPRESS_CODES)
+    assert set(tax.ALERT_OUTCOME_LABELS) == set(tax.ALERT_OUTCOMES)
+    assert all(tax.ALERT_SUPPRESS_LABELS[code] for code in tax.ALERT_SUPPRESS_CODES)
+    assert all(tax.ALERT_OUTCOME_LABELS[code] for code in tax.ALERT_OUTCOMES)
+
+
+def test_unknown_codes_fall_back_to_an_honest_sentence_not_an_empty_string():
+    from app.ai_auto.intel import taxonomy as tax
+
+    assert tax.alert_suppress_label("never_seen") == "未告警（never_seen）"
+    assert tax.alert_outcome_label("") == ""          # 「尚无结果」由展示层决定说哪一句
+    assert tax.alert_outcome_label("never_seen") == "未知结果（never_seen）"
+
+
+def test_curate_actions_keeps_its_prefix_byte_for_byte():
+    """`CURATE_ACTIONS` 由 `CURATE_ACTIONS_BASE` 拼出 ⇒ **顺序天然保持**（G-27 的一半）。"""
+    from app.ai_auto.intel import taxonomy as tax
+
+    assert tax.CURATE_ACTIONS[:len(tax.CURATE_ACTIONS_BASE)] == tax.CURATE_ACTIONS_BASE
+    assert tax.CURATE_ACTIONS[-1] == "keep_both"
+    assert len(set(tax.CURATE_ACTIONS)) == len(tax.CURATE_ACTIONS)
+
+
+def test_the_three_new_review_reject_codes_are_registered():
+    from app.ai_auto.intel import taxonomy as tax
+
+    for code in ("promote_weak_record", "keep_both_bad_pair", "keep_both_thin_note"):
+        assert code in tax.REVIEW_REJECT_CODES
+
+
+def test_min_impacts_excludes_low_on_purpose():
+    """`low` 不是一个合法的告警门槛：`IMPACT_W["low"] == 0.0` 让「低影响力恒不告警」成为一条
+    算术性质，把 `low` 放进值域会让那条性质失效而且不报错。"""
+    from app.ai_auto.intel import taxonomy as tax
+
+    assert tax.MIN_IMPACTS == ("medium", "high")
+    assert tax.IMPACT_W["low"] == 0.0

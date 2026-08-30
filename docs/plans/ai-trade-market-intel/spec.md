@@ -1423,6 +1423,14 @@ PR 描述里给出这条直跑命令。
    重复进入只会稀释情报段的信噪比。
 6. **多语种界面**。产出恒简体中文（与仓库既有证据渲染层一致）。
 
+> **转记（ai-trade-intel-actionability，第 4 轮）**：本节的十条非目标经
+> `ai-trade-intel-closed-loop` 与 `ai-trade-intel-evidence-grounding` 两轮转记之后，在第 4 轮
+> `docs/plans/ai-trade-intel-actionability/spec.md` §十 里被再次逐条确认，并新增三条：
+> **不用 LLM 判断告警**（三条轴的判定全部是确定性纯函数）、**不自动调整告警门槛**（一个会自己
+> 改变唤醒频率的系统，其行为无法被任何一次回归覆盖）、**不自动裁决矛盾**（确定性层没有能力判断
+> 两条相反的报道里哪一条为真）。`ai_auto/prompts.py` 的 `_format_*` 外移欠账在第 4 轮同样**没有
+> 被触发**，继续挂账。
+
 ---
 
 ## 十一、配置项清单（`services/quant/app/config.py`，全部 `ai_trade_intel_` 前缀）

@@ -33,6 +33,9 @@ function summary(over: Partial<AiTradeIntelSummary> = {}): AiTradeIntelSummary {
       neverCited: 7 },
     verify: { confirmed: 2, refuted: 1, unresolved: 3, pending: 9, lastVerifyTs: 1_700_000 },
     quoteHitRate: null,
+    alerts24h: 0,
+    lastAlertTs: null,
+    efficacy: { enabled: false, kMin: 8, sampleN: 0, overall: { settled: 0, wins: 0, netPnlUsd: 0, confirmed: 0, refuted: 0, unresolved: 0, samples: 0, accuracy: null }, byCategory: [] },
     ...over,
   };
 }
@@ -70,5 +73,27 @@ describe("setAiTradeIntelSummary · closed-loop 的两块新读数", () => {
     useAppStore.getState().setAiTradeIntelSummary(INST, null);
 
     expect(useAppStore.getState().aiTradeIntel[INST]?.verify.pending).toBe(9);
+  });
+});
+
+describe("setAiTradeIntelSummary · actionability 的两个新键", () => {
+  it("`alerts24h` / `lastAlertTs` / `efficacy` 随整对象一起进 store", () => {
+    // 已实读确认零改动即可带上新键（`setAiTradeIntelSummary` 是整对象替换）。**但这件事仍要
+    // 被钉住**：某次重构把整对象换成逐键解构时，唯一的症状会是「界面上那几块永远是 0」。
+    useAppStore.setState({ aiTradeIntel: {} });
+    const next = summary({ alerts24h: 4, lastAlertTs: 1_788_110_000 });
+
+    useAppStore.getState().setAiTradeIntelSummary(INST, next);
+
+    const stored = useAppStore.getState().aiTradeIntel[INST];
+    expect(stored?.alerts24h).toBe(4);
+    expect(stored?.lastAlertTs).toBe(1_788_110_000);
+    expect(stored?.efficacy).toEqual(next.efficacy);
+  });
+
+  it("`lastAlertTs` 为 null 时原样保留：「从未告警过」不该被写成 1970 年", () => {
+    useAppStore.setState({ aiTradeIntel: {} });
+    useAppStore.getState().setAiTradeIntelSummary(INST, summary({ lastAlertTs: null }));
+    expect(useAppStore.getState().aiTradeIntel[INST]?.lastAlertTs).toBeNull();
   });
 });

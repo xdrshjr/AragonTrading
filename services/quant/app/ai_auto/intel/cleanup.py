@@ -44,7 +44,7 @@ def _all_sources_blocked(item: IntelItem, blocked: frozenset[str]) -> bool:
 
 
 def plan_cleanup(items: list[IntelItem], *, limits: IntelLimits, now: float,
-                 blocked_domains: frozenset[str]) -> CleanupPlan:
+                 blocked_domains: frozenset[str], eff=None) -> CleanupPlan:
     """按当前库存算出四步清理动作。
 
     这四步是「噪声或无效的短线情报可以进行整理或清理」这条需求的**兜底实现**：模型哑火时噪声
@@ -58,6 +58,9 @@ def plan_cleanup(items: list[IntelItem], *, limits: IntelLimits, now: float,
         blocked_domains: 用户拉黑的可注册域名。**无默认值的 keyword-only 必填形参**（评审 P1-8）
             ——给它一个 `frozenset()` 默认值，漏传的症状就是「扫除永远算出空集」而不是一个
             `TypeError`，而静默空转正是本轮要修的那类缺陷。
+        eff: actionability 轴 B 的战绩先验（消费点 #3）。**一路透传给 `score_item`，绝不新增
+            第二套打分**——溢出淘汰与注入排序共用同一个打分函数是 §3.4.4 的既有裁决。
+            ``None`` ⇒ 淘汰顺序与合入前逐字节相同。
 
     Returns:
         `CleanupPlan`。**被证伪不是一条归档理由**（评审 P1-12）：归档只由这四条不依赖模型判断的
@@ -112,6 +115,6 @@ def plan_cleanup(items: list[IntelItem], *, limits: IntelLimits, now: float,
             continue
         # closed-loop §3.2.4 第 3 条：**必须把 limits 显式传下去**——不传就是「第 1 条写了但
         # 溢出淘汰这一路没走到」，正是本仓库的成文教训「用例绿着但分支从没被走到」。
-        rows.sort(key=lambda it: score_item(it, now=now, limits=limits))
+        rows.sort(key=lambda it: score_item(it, now=now, limits=limits, eff=eff))
         overflow.extend(int(it.item_id) for it in rows[:held - cap] if it.item_id)
     return CleanupPlan(tuple(expire), tuple(overflow), tuple(lapsed), tuple(blocked_ids))

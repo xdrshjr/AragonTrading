@@ -38,9 +38,11 @@ _TACTICAL_LADDER = ("1m", "5m", "15m", "30m", "1H", "4H", "12H")
 # 升档集合：这些唤醒原因下本轮「有料」，战术段值得展开成每周期两行。
 # `signal_flip` 在列：翻转轮是「立场可能正在改变」的时刻，值得看全量战术明细。
 # `_EXECUTION_FULL_KINDS` 刻意**不增**——执行周期证据自上一轮起没变，压缩档仍正确。
+# `intel_alert` 在列（intel-actionability §3.1.5 #4）：一条刚到的高危情报正是最需要细看战术
+# 明细的那一轮；漏了它，最该展开的那一轮反而拿到压缩档，而且不报错。
 _FULL_TIER_KINDS = frozenset(
-    {"candle_close", "bar_advanced", "signal_flip", "price_breakout", "profit_tier",
-     "resting_order"})
+    {"candle_close", "intel_alert", "bar_advanced", "signal_flip", "price_breakout",
+     "profit_tier", "resting_order"})
 # 执行周期段全量披露的唤醒原因：只有「这根 K 线第一次被研判」时才值得重复整段中线背景与证据摘要。
 _EXECUTION_FULL_KINDS = frozenset({"candle_close", "bar_advanced"})
 _EXTREME_RSI_LABELS = frozenset({"overbought", "oversold"})

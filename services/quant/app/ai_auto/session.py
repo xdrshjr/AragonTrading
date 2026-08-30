@@ -62,7 +62,12 @@ from .exit_priority import (
 )
 from .experience import ExperienceRuntime
 from . import feed_watchdog
-from .intel import IntelAttribution, intel_digest_for, intel_summary_for
+from .intel import (
+    IntelAttribution,
+    intel_digest_for,
+    intel_summary_for,
+    note_alert_outcome,
+)
 from .feed_runtime import FeedRuntime
 from .hold_horizon import HorizonFacts, HorizonRule, gate_status as horizon_gate_status
 from .gate_veto import build_gate_veto_note, veto_layer, veto_layer_label
@@ -318,6 +323,14 @@ class AiTradeSession:
             enabled=bool(getattr(executor.settings, "ai_trade_intel_enabled", False)
                          and getattr(executor.settings,
                                      "ai_trade_intel_attribution_enabled", False)))
+        # 情报告警（ai-trade-intel-actionability 轴 A）：**至多一条**待处理告警，覆盖式。
+        # 它不是共享状态——只被 `note_intel_alert`（情报后台任务里的同步回调，事件循环单线程）
+        # 与 `_maybe_intel_wake`（同一循环的盯市 tick）读写，无竞态。
+        self._pending_intel_alert = None
+        # 已经为哪一条告警记过 `deferred`。**按 handoff 节流**：一轮决策要跑几秒，而盯市 tick
+        # 默认 5s ——不节流的话同一条告警会在同一次等待里把 `intelAlertDrops` 打上去好几次，
+        # 而那个数的语义是「告警到手却没能起轮的**次数**」，不是「被 tick 看到过几回」。
+        self._deferred_alert_id = 0
         # P0-1：会话级单调持仓序号——`_dispatch` 观察到任一 `side=="close"` 成交即 +1。epoch 身份的一半，
         # 没有它，「保护平仓 → 同一 tick 内同向重开」的新仓会继承旧峰值并被当场强平（真实资金）。
         self._position_seq = 0
@@ -1358,6 +1371,15 @@ class AiTradeSession:
         # §3.1.2 row 12：战术窗口只服务决策轮，暂停期刷它是白烧 REST 配额 ⇒ paused 时跳过。
         if self.state == "running":
             await self._window.maybe_refresh_tactical(now_ts, time.time())
+        # 情报告警排在最前的两条理由（intel-actionability §3.1.4，**评审 P2-7 更正过一次**）：
+        # ① **时延**——反过来排会让一条刚到的高危情报白等一个 tick（默认 5s）甚至更久；
+        # ② **外生离散事件优先于内生预演信号**——预演是对「未收线的信号板可能翻转」的估计，
+        #    情报告警是一件**已经发生**的外部事实。
+        # 安全性由 `_maybe_signal_flip_wake` 的早退判据保证：`_deciding` 为真时它**不消费任何
+        # 锁存**（`plan_signal_flip` 根本不被调用），故那次翻转确认不会被白白吃掉。
+        # ⚠️ 不要写成「能省掉那一次白跑的预演」——那是不成立的：它先 `await self._preview.run(...)`
+        # 才判 `self._deciding`，预演照跑，一次也省不掉。
+        await self._maybe_intel_wake()           # 轴 A：外生离散事件优先于内生预演信号
         await self._maybe_signal_flip_wake()     # 轴 C：须在定时唤醒之前（翻转优先于墙钟到点）
         await self._maybe_interval_wake()
 
@@ -1781,6 +1803,110 @@ class AiTradeSession:
         self._last_round_bar_index = self._last_bar_index
         self._last_round_px = ref_px
         self._last_decision_started_wall = now
+        self._decision_task = asyncio.create_task(
+            self._run_decision_round(self._last_board, self._last_bar_index,
+                                     ref_px, int(now), wake))
+
+    def note_intel_alert(self, handoff) -> None:
+        """收下一条待处理告警（**同步 setter，绝不 await**，intel-actionability §3.1.3 第三跳）。
+
+        **至多一条，用 `severity` 比大小覆盖，不排队**：一个五分钟前的旧告警与一个刚到的新告警
+        排在一起时，先跑旧的是错的。被覆盖掉的那一条**立刻结账**（`superseded`）——否则台账上
+        会永久留着一行「已告警 · 等待会话响应」，而它其实早就不在任何人手上了。
+
+        Args:
+            handoff: `intel.AlertHandoff`；``None`` ⇒ no-op。
+        """
+        if handoff is None:
+            return
+        current = self._pending_intel_alert
+        if current is not None:
+            loser = current if handoff.severity >= current.severity else handoff
+            keeper = handoff if loser is current else current
+            note_alert_outcome(self.inst_id, loser.alert_id, outcome="superseded")
+            self._pending_intel_alert = keeper
+            return
+        self._pending_intel_alert = handoff
+
+    def _drop_intel_alert(self, outcome: str) -> None:
+        """丢弃待处理告警并回写台账（五条抑制路径共用；**每一条抑制都要留痕**）。"""
+        handoff = self._pending_intel_alert
+        self._pending_intel_alert = None
+        self._deferred_alert_id = 0
+        if handoff is not None:
+            self._wake.note_intel_alert_drop()
+            note_alert_outcome(self.inst_id, handoff.alert_id, outcome=outcome)
+
+    async def _maybe_intel_wake(self) -> None:
+        """轴 A：一条高危市场情报到手即认领决策槽位并起一轮标准决策。
+
+        **关键不变式（本轴全部安全性的支点）**：本方法调用的是**同一个** `_run_decision_round`，
+        共识门禁、铁律层、edge 门禁、仓位层、反思层、离场优先级**全部照跑，一道不绕**。告警的
+        全部权力就是「让 AI 提前被问一次」，它既不下单、也不改仓位、也不绕过任何门禁。
+
+        **会话侧永不复读 `ai_trade_intel_alert_enabled`**（§3.4.3 的第三道防线）。理由是成文的：
+        会话持的是 `executor.settings`（分组启动时定稿的那一份），而情报设置住在 `app_settings`
+        里、经 `model_copy` 派生——两份在用户改设置之后**必然不同步**，会话侧那一判会变成
+        「面板上关了但还在唤醒」或「面板上开了却永不唤醒」。总闸只在服务端读一次
+        （`taxonomy.limits_from_settings`），关掉时 `plan_alert` 返回 `disabled` 且**不发
+        handoff**，会话因此根本收不到东西。
+
+        **不依赖墙钟唤醒是否启用**：本方法**没有** `wake_interval_s <= 0` 这道判据。把墙钟唤醒
+        设成 0 的 `trend_hold` 用户，情报告警是他们唯一的日内触发源——这恰恰是本轮最主要的
+        受益场景。
+
+        **保留 vs 清空的分界线是成文的**：`_deciding` 是一个**几秒内必然消失**的状态，而在飞的
+        那一轮**看不到**这条新情报（它的 payload 在告警之前就定稿了），所以等下一 tick 是对的；
+        其余四条都是「等下去也不会变好」的状态，留着只会让一条陈旧情报在用户恢复会话时突然唤醒
+        一轮。
+
+        ⚠️ 与 `alert_pending_ttl_s` 的跨字段不变式：它必须 ≥ `2 × live_auto_poll_interval_s`
+        （`config._check_intel_actionability` 在构造期钉死），否则告警在被这个 tick 看到之前就
+        已经过期——那是一个**永远不会唤醒**的配置，而且没有任何错误。
+        """
+        handoff = self._pending_intel_alert
+        if handoff is None:
+            return
+        if self.state != "running":
+            self._drop_intel_alert("dropped_not_running")
+            return
+        if self._stale_degraded:
+            self._drop_intel_alert("dropped_feed_stale")
+            return
+        if self._last_board is None:
+            self._drop_intel_alert("dropped_no_board")
+            return
+        now = time.time()
+        ttl = float(getattr(self.executor.settings,
+                            "ai_trade_intel_alert_pending_ttl_s", 180.0))
+        if now - float(handoff.created_wall) > ttl:
+            self._drop_intel_alert("dropped_expired")
+            return
+        if self._deciding:
+            # **保留**（下个 tick 再试），并按 handoff **节流记一次**：`_deciding` 是一个几秒内
+            # 必然消失的状态，而在飞的那一轮**看不到**这条新情报（它的 payload 在告警之前就
+            # 定稿了），所以等下一 tick 是对的。落库那一侧本就幂等（`mark_intel_alert_outcome`
+            # 只写 `outcome == ""` 的行），节流守的是**计数**——不然一次等待会被记成好几次丢弃。
+            if self._deferred_alert_id != handoff.alert_id:
+                self._deferred_alert_id = handoff.alert_id
+                self._wake.note_intel_alert_drop()
+                note_alert_outcome(self.inst_id, handoff.alert_id, outcome="deferred")
+            return
+        ref_px = self._current_px()           # 纯同步取实时价（不 await）
+        wake = self._wake.plan_intel_alert(handoff, self._wake_readings("interval", ref_px),
+                                           now_wall=now)
+        if wake is None:
+            return
+        self._pending_intel_alert = None
+        self._deferred_alert_id = 0
+        self._deciding = True                 # 同步认领槽位：check→set 之间无 await
+        self._last_round_bar_index = self._last_bar_index
+        self._last_round_px = ref_px
+        # 与 `signal_flip` 轮的既有行为一致：**刻意保持一致而不是特事特办**——它会把下一次墙钟
+        # 唤醒推迟一个完整周期。
+        self._last_decision_started_wall = now
+        note_alert_outcome(self.inst_id, handoff.alert_id, outcome="woke",
+                           run_id=self.run_id, round_no=self.rounds_completed + 1)
         self._decision_task = asyncio.create_task(
             self._run_decision_round(self._last_board, self._last_bar_index,
                                      ref_px, int(now), wake))

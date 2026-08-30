@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable, Iterable
+from dataclasses import replace
 
 from . import service
 from .service import IntelDeps, RoundOutcome
@@ -51,6 +52,15 @@ def _static_summary(inst_id: str, *, code: str) -> dict:
         # evidence-grounding §4.2：静态 summary 上也必须**在位**（形状一致），否则未装配的分组会
         # 让前端读到 `undefined`。`None` = 分母 0（「没提过引文」），与 0（「提了全没中」）分开。
         "quoteHitRate": None,
+        # actionability §4.2：轴 A 的两个新键与轴 B 的摘要块**在静态 summary 上同样必须在位**
+        # ——上一轮 `citations` / `verify` / `quoteHitRate` 三次踩过同一个坑：前端读到
+        # `undefined` 会把「情报层没装上」画成「零告警」。
+        "alerts24h": 0,
+        "lastAlertTs": None,
+        "efficacy": {"enabled": False, "kMin": 0, "sampleN": 0,
+                     "overall": {"settled": 0, "wins": 0, "netPnlUsd": 0.0,
+                                 "confirmed": 0, "refuted": 0, "unresolved": 0,
+                                 "samples": 0, "accuracy": None}},
     }
 
 
@@ -62,15 +72,20 @@ class IntelRuntime:
     """
 
     def __init__(self, group_id: str, members: Iterable[str], deps: IntelDeps, *,
-                 notify: Callable[[str, dict], None] | None = None, enabled: bool = True):
+                 notify: Callable[[str, dict], None] | None = None, enabled: bool = True,
+                 notify_alert: Callable[[str, object], None] | None = None):
         self.group_id = group_id
         self.members: list[str] = list(members)
         self.deps = deps
         self.enabled = bool(enabled)
         self.paused = False
         self._notify = notify or (lambda inst_id, summary: None)
+        # actionability 轴 A 的第三跳（**同步回调，逐行镜像 `_notify`**）。缺省 no-op ⇒ 未接线
+        # 的运行时（回测车道、离线用例）整条告警链路不存在。
+        self._notify_alert = notify_alert or (lambda inst_id, handoff: None)
         self._lock = asyncio.Lock()
         self._digest: dict[str, dict] = {}
+        self._digest_ids: dict[str, frozenset[int]] = {}
         self._summary: dict[str, dict] = {}
         self._in_flight: set[str] = set()
         for inst_id in self.members:
@@ -123,6 +138,10 @@ class IntelRuntime:
             logger.warning("ai-trade intel snapshot failed for %s: %s", inst_id, exc)
             return self._summary.get(inst_id)
         self._digest[inst_id] = snapshot["digest"]
+        # ★ 评审 P0-3：`in_digest` 的判据。`cite=False` 时 wire 上没有 `refs`，而「这一条到底
+        # 有没有进 prompt」仍然必须答得出来——故定稿时把收进来的 id 集合一并记下，绝不在别处
+        # 从渲染文本里反查标题（那会在标题相同的两条上判错，且不报错）。
+        self._digest_ids[inst_id] = frozenset(snapshot.get("digestItemIds") or ())
         summary = snapshot["summary"]
         if degrade_code:
             due = summary.get("nextDueTs")
@@ -190,6 +209,48 @@ class IntelRuntime:
     async def _after_round(self, inst_id: str, outcome: RoundOutcome) -> None:
         await self.refresh(inst_id, degrade_code=outcome.degrade_code,
                            reason=outcome.error_text, rejected=outcome.rejected)
+        self._alert(inst_id, getattr(outcome, "alert", None))
+
+    def _alert(self, inst_id: str, handoff) -> None:
+        """把一条待处理告警交给该标的的交易会话（actionability §3.1.3 的第二跳）。
+
+        **顺序不可换**：必须排在 `refresh` **之后**。两件事都依赖那份**刚刚重算好**的 digest：
+
+        - `ref` 要从它的 `refs` 反查（``item_id → "I03"``），这样 prompt 里的唤醒句能说「本轮由
+          情报 [I03] 触发」，而模型可以用同一个编号把它引用回来（复用 7e2d5be 的既有编号表，
+          不发明第二套标识）；`cite_enabled=False` 时 `refs` 整键缺席 ⇒ `ref` 为 ``""``。
+        - ★ `in_digest` 要从它的 `lines` 反查（评审 P0-3）。「这条情报有编号」与「这条情报真的
+          出现在 prompt 里」**不是同一件事**：`_TIER_RANK` 让 ultra 排在最后、`prompt_max_chars`
+          默认只装得下 ~5–6 行，长期层一旦攒到 6 条 active，告警条目在**稳态上**就进不了
+          prompt；`inject_enabled=False` 时整段情报都不存在。用「有 ref」冒充「在 prompt 里」，
+          会把一句确定错误的话逐字写进一次真实资金决策的 prompt 首行。
+
+        算出来的这两样还要**补写进台账**（`stamp_intel_alert_digest`，台账三个写点里的第二个）：
+        建行那一刻它们还不知道，而动态页签的 `[Ixx]` 前缀与「未进入情报段」都只读它们。
+
+        **未装配的 runtime 壳上是 no-op**：那种 runtime 不起任何后台任务，也不该产生告警。
+        """
+        if handoff is None or not self.enabled:
+            return
+        digest = self._digest.get(inst_id) or {}
+        item_id = int(handoff.candidate.item_id)
+        refs = digest.get("refs") or {}
+        ref = next((token for token, key in refs.items() if int(key) == item_id), "")
+        # ★ `cite` 关时 `refs` 整键缺席，而「这一条到底在不在 prompt 里」仍然必须答得出来。
+        # 判据取自 `build_digest_and_ids` 在**定稿那一刻**一并交出来的 id 集合，**不是**从
+        # 渲染文本里反查标题（那会在两条同题条目上判错，而且不报错），也**不是**「有没有 ref」。
+        in_digest = item_id in (self._digest_ids.get(inst_id) or frozenset())
+        # 两者也必须**落进台账**：它们在建行那一刻还不知道（那时 digest 还是上一轮的），而
+        # 动态页签的「未进入情报段」与 `[Ixx]` 前缀都读它们。不补这一跳，两列就是「有列、有
+        # 读点、没有写点」——界面会给每一条告警挂一句关于数据的假话。
+        # 写法逐行照抄同文件的 `note_alert_outcome`：同步上下文里 `scheduler.schedule(...)`
+        # 一个协程，交给既有 tracked 任务集（已被 `_shutdown_steps` 第 7 步 drain）。
+        from . import scheduler
+
+        if handoff.alert_id:
+            scheduler.schedule(_stamp_alert_digest(self, int(handoff.alert_id), ref=ref,
+                                                   in_digest=in_digest))
+        self._notify_alert(inst_id, replace(handoff, ref=ref, in_digest=in_digest))
 
 
 # ---------------- 注册表 ----------------
@@ -242,6 +303,65 @@ def intel_summary_for(inst_id: str) -> dict | None:
     return runtime.summary_for(inst_id) if runtime is not None else None
 
 
+def note_alert_outcome(inst_id: str, alert_id: int, *, outcome: str, run_id: int = 0,
+                       round_no: int = 0) -> None:
+    """回写一条告警的结果（台账的第二个写点；**同步函数，绝不是协程**）。
+
+    评审 P1-10：「结账」要写一次库，而 `session.note_intel_alert` 与 `_maybe_intel_wake` 的
+    清理分支**都在同步上下文里**。修法逐行照抄同文件里的 `invalidate`——同步函数体内
+    `scheduler.schedule(...)` 一个协程，交给既有的 tracked 任务集（它已被 `_shutdown_steps`
+    第 7 步 drain，故本轮**不新增任何关停步骤**）。
+
+    Args:
+        inst_id: 目标标的（只用来定位 runtime 与它的 sessionmaker）。
+        alert_id: 台账行 id（来自 `AlertHandoff.alert_id`）。
+        outcome: `taxonomy.ALERT_OUTCOMES` 的元素。
+        run_id / round_no: 只在 ``outcome == "woke"`` 时有意义。
+
+    Note:
+        运行时不在（会话已停、回测车道）⇒ **no-op**。一条留在库里 `outcome == ""` 的行由动态
+        页签按 TTL 渲染成 `expired_no_response`——渲染期判定，**不回写**（一个只为了让界面好看
+        而产生的写操作会与真正的回写竞态）。
+    """
+    runtime = _BY_INST.get(inst_id)
+    if runtime is None or not alert_id:
+        return
+    from . import scheduler
+
+    scheduler.schedule(_write_alert_outcome(runtime, int(alert_id), outcome=outcome,
+                                            run_id=int(run_id), round_no=int(round_no)))
+
+
+async def _stamp_alert_digest(runtime: "IntelRuntime", alert_id: int, *, ref: str,
+                              in_digest: bool) -> None:
+    """`_alert` 的写段。**绝不抛**：台账是加法，失败只放弃这一次补写。"""
+    from ...db import repositories as repo
+
+    try:
+        async with runtime.deps.sessionmaker()() as db:
+            await repo.stamp_intel_alert_digest(db, alert_id, ref=ref, in_digest=in_digest)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 —— 见 docstring
+        logger.warning("ai-trade intel alert digest stamp failed (#%s): %s", alert_id, exc)
+
+
+async def _write_alert_outcome(runtime: "IntelRuntime", alert_id: int, *, outcome: str,
+                               run_id: int, round_no: int) -> None:
+    """`note_alert_outcome` 的写段。**绝不抛**：台账是加法，失败只放弃这一次回写。"""
+    from ...db import repositories as repo
+
+    try:
+        async with runtime.deps.sessionmaker()() as db:
+            await repo.mark_intel_alert_outcome(db, alert_id, outcome=outcome,
+                                                outcome_ts=int(runtime.deps.now()),
+                                                run_id=run_id, round_no=round_no)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 —— 见 docstring
+        logger.warning("ai-trade intel alert outcome write failed (#%s): %s", alert_id, exc)
+
+
 def invalidate(inst_id: str) -> None:
     """通知运行时「这个标的的库存变了，请重算快照」。运行时不在时是 no-op。
 
@@ -261,7 +381,8 @@ def invalidate(inst_id: str) -> None:
 async def build_group_runtime(*, group_id: str, members: Iterable[str], settings,
                               sessionmaker, provider_cfg, make_client,
                               bar: str = "15m", change_24h_pct=None,
-                              notify: Callable[[str, dict], None] | None = None
+                              notify: Callable[[str, dict], None] | None = None,
+                              notify_alert: Callable[[str, object], None] | None = None
                               ) -> "IntelRuntime":
     """装配一个分组的情报运行时（`manager.start_group` / `resume_group` 的唯一入口）。
 
@@ -276,6 +397,9 @@ async def build_group_runtime(*, group_id: str, members: Iterable[str], settings
         make_client: 造 LLM client 的工厂（**调用方必须传自己模块里的那一份**，见 `intel/llm.py`）。
         change_24h_pct: 同步取「近 24 小时涨跌」的回调；取不到回 None ⇒ 该行省略。
         notify: `(inst_id, summary) -> None`，把 summary 推给会话的 WS 出口。
+        notify_alert: `(inst_id, AlertHandoff) -> None`，把一条待处理告警交给会话（**同步**，
+            绝不 await——情报后台任务里出现一次对会话的 await，就等于把「停止按钮」的响应时间
+            与情报轮绑在一起）。
 
     Returns:
         `IntelRuntime`。总闸关 / 未配置检索源 ⇒ `enabled=False` 的**壳**（不起任务、不查库，
@@ -291,7 +415,7 @@ async def build_group_runtime(*, group_id: str, members: Iterable[str], settings
     if not bool(getattr(derived, "ai_trade_intel_enabled", False)):
         shell = IntelRuntime(group_id, members,
                              IntelDeps(settings=derived, sessionmaker=sessionmaker),
-                             notify=notify, enabled=False)
+                             notify=notify, enabled=False, notify_alert=notify_alert)
         for inst_id in shell.members:
             shell._summary[inst_id] = _static_summary(inst_id, code="disabled")
         return shell
@@ -304,7 +428,7 @@ async def build_group_runtime(*, group_id: str, members: Iterable[str], settings
     if provider is None:
         return IntelRuntime(group_id, members,
                             IntelDeps(settings=derived, sessionmaker=sessionmaker),
-                            notify=notify, enabled=False)
+                            notify=notify, enabled=False, notify_alert=notify_alert)
     runner = search_mod.SearchRunner(
         provider, timeout_s=float(derived.ai_trade_intel_search_timeout_s))
     # closed-loop 评审 P1-3：核查轮的**第二个** client（`verify_max_tokens` 只能走构造参）。
@@ -327,4 +451,5 @@ async def build_group_runtime(*, group_id: str, members: Iterable[str], settings
                                                 make_client=make_client),
                      verify_llm=verify_llm, reader=evidence.reader_config(derived),
                      group_id=group_id, bar=bar, change_24h_pct=change_24h_pct)
-    return IntelRuntime(group_id, members, deps, notify=notify, enabled=True)
+    return IntelRuntime(group_id, members, deps, notify=notify, enabled=True,
+                        notify_alert=notify_alert)

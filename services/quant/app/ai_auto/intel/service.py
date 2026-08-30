@@ -17,7 +17,6 @@ SQLite 是单写者——一个横跨 60 秒 LLM 调用的写事务会把**全�
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
 import random
@@ -26,14 +25,16 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ...db import repositories as repo
-from . import cleanup as cleanup_mod
+from . import alert as alert_mod
+from . import conflict as conflict_mod
+from . import efficacy as efficacy_mod
 from . import corpus as corpus_mod
 from . import gate, prompts
 from . import evidence as evidence_mod
 from . import quotes as quotes_mod
 from . import taxonomy as tax
 from .agent import run_round
-from .disclosure import build_digest
+from .disclosure import build_digest_and_ids
 from .gate import IntelItem, IntelSource
 from .search import IntelSearchError, SearchRunner
 from .taxonomy import IntelLimits, limits_from_settings
@@ -205,6 +206,10 @@ class RoundOutcome:
     rejected: int = 0
     actions: dict = field(default_factory=dict)
     error_text: str = ""
+    # actionability 轴 A：本轮判定出来的待处理告警（`fired=False` ⇒ 恒为 None）。
+    # **带默认值的第十个字段** ⇒ 既有九个构造点一个字节不改。`IntelRuntime._after_round` 在
+    # `refresh` **之后**把它交给会话（顺序不可换：`ref` / `in_digest` 要从刚刷新的 digest 反查）。
+    alert: alert_mod.AlertHandoff | None = None
 
 
 # ---------------- 采集轮 ----------------
@@ -281,7 +286,11 @@ async def run_collect_round(deps: IntelDeps, inst_id: str, *,
     return await _persist_collect(deps, inst_id, started=started, queries=queries,
                                   corpus=built, admitted=admitted, usage=result,
                                   reader_counts=reader_counts,
-                                  quotes_proposed=quotes_mod.count_proposed(proposals))
+                                  quotes_proposed=quotes_mod.count_proposed(proposals),
+                                  # actionability 评审 P1-4：**merges 分支的全部内容字段只能
+                                  # 从这张表出**——`MergeOp` 一个内容字段都没有，而「同一条
+                                  # 风险情报被第二个域名再次报道」恰恰只走那条分支。
+                                  existing=existing)
 
 
 async def _gather_corpus(deps: IntelDeps, inst_id: str, ctx, *, blocked, queries: list[str],
@@ -314,8 +323,16 @@ async def _gather_corpus(deps: IntelDeps, inst_id: str, ctx, *, blocked, queries
 
 async def _persist_collect(deps: IntelDeps, inst_id: str, *, started: int,
                            queries: list[str], corpus, admitted, usage,
-                           reader_counts: dict, quotes_proposed: int) -> RoundOutcome:
-    """采集轮的步骤 ⑧–⑨：落条目 + 落引文 + 落轮 + 推节律，**一次提交**（不变式 I-4 的写段）。"""
+                           reader_counts: dict, quotes_proposed: int,
+                           existing: dict | None = None) -> RoundOutcome:
+    """采集轮的步骤 ⑧–⑨：落条目 + 落引文 + 落告警台账 + 落轮 + 推节律，**一次提交**。
+
+    ★ actionability 评审 P1-5：**告警判定必须落在这里，不是 `run_collect_round` 的函数体**。
+    三条理由缺一不可：① `item_id` 只有 `upsert_intel_items` 的返回值知道，出了这个 `async with`
+    就再也拿不到；② 冷却时刻与日配额的两条 SELECT 也要一个会话，而这一个是本轮唯一开着的写
+    会话，另开一个就是 SQLite 单写者下的嵌套会话；③ 台账行必须与条目行**同生共死**——条目
+    回滚而告警行留下，等于凭空多出一条指向不存在条目的告警。
+    """
     status = "ok" if (admitted.accepted or admitted.merges) else "degraded"
     degrade_code = "" if status == "ok" else "all_rejected"
     verified_total = sum(len(v) for v in admitted.quotes.values())
@@ -355,185 +372,194 @@ async def _persist_collect(deps: IntelDeps, inst_id: str, *, started: int,
         await repo.bump_intel_watch(
             db, inst_id, kind="collect", status=status,
             next_due_ts=next_due_for(deps, fail_streak=0), commit=False)
+        # 投影在**这里**做而不是在 `_persist_alert` 里：`admitted` / `existing` /
+        # `item_ids` 三样只有这一处同时持有，而把它们一路带进去会让那个函数到 7 个形参
+        # （越 CLAUDE.md 的 5 个上限）。`candidates_from_round` 是纯函数，放在写会话里
+        # 不额外开销。
+        handoff = await _persist_alert(
+            deps, db, inst_id, round_id=round_id,
+            candidates=alert_mod.candidates_from_round(admitted, existing or {},
+                                                       item_ids=item_ids))
         await db.commit()
     return RoundOutcome(inst_id, "collect", status, degrade_code, len(admitted.accepted),
-                        len(admitted.merges), admitted.total_rejected)
+                        len(admitted.merges), admitted.total_rejected, alert=handoff)
 
 
-# ---------------- 整理轮 ----------------
-async def run_curate_round(deps: IntelDeps, inst_id: str) -> RoundOutcome:
-    """跑一轮整理：模型提议 → 服务端复核 → 执行 → **确定性清理** → 写轮。
+async def _persist_alert(deps: IntelDeps, db, inst_id: str, *, round_id: int,
+                         candidates: list):
+    """算一次告警判定并落一行台账（**同一个会话、同一次 commit**）。
 
-    确定性清理（TTL / 溢出 / 已排期失效 / 孤儿 superseded）**不依赖模型**：模型哑火时噪声照样
-    被清。这正是「噪声或无效的短线情报可以进行整理或清理」这条需求的兜底实现。
+    **无论 fired 与否都写**——「今天为什么一次都没告警」的答案就住在这些行里，空轮同理。
+
+    Args:
+        deps: 依赖聚合（取 `limits` 与 `now`）。
+        db: `_persist_collect` 持有的那个写会话（**同一个**，见该函数的方框）。
+        inst_id: 目标标的。
+        round_id: 产生本次判定的采集轮。
+        candidates: `alert.candidates_from_round` 的产物（**投影在调用点做**：只有那里
+            同时持有 `admitted` / `existing` / `item_ids` 三样）。
+
+    Returns:
+        `alert.AlertHandoff`（`fired=True`）或 ``None``。`ref` 与 `in_digest` 在这里**故意
+        留空**：它们要从 `IntelRuntime._after_round` 里那份**刚刷新完**的 digest 反查
+        （评审 P0-3），此刻的 digest 还是上一轮的。
     """
     now = deps.now()
-    started = int(now)
-    async with deps.sessionmaker()() as db:
-        scope = await repo.load_intel_scope(db, inst_id)
-        # closed-loop 评审 P1-8：整理轮的只读会话此前**不查**黑名单（只有采集轮查）。不补这一行，
-        # `plan_cleanup` 的存量扫除就永远算出空集——而 `blocked_domains` 是必填形参，漏传会是
-        # `TypeError` 而不是静默空转，两条一起才根治。
-        blocked = frozenset(await repo.list_intel_blocked_domains(db, inst_id))
-    items = [item_from_wire(w) for w in scope]
-    live = [it for it in items if it.status == "active" and it.item_id]
-
-    review = None
-    usage_in = usage_out = 0
-    degrade_code = ""
-    if deps.llm is not None and live:
-        result = await run_round(
-            deps.llm,
-            system=prompts.build_curate_system_prompt(inst_id, deps.limits),
-            user=prompts.build_curate_user_prompt(render_listing(live, now=now)),
-            tool_name=prompts.CURATE_TOOL_NAME,
-            tool_description=prompts.CURATE_TOOL_DESCRIPTION,
-            tool_schema=prompts.build_curate_tool_schema(deps.limits),
-            timeout_s=float(deps.settings.ai_trade_intel_timeout_s))
-        usage_in, usage_out = result.input_tokens, result.output_tokens
-        if result.degrade:
-            degrade_code = result.degrade
-        else:
-            review = gate.review_actions(list(result.raw.get("actions") or []),
-                                         {int(it.item_id): it for it in live},
-                                         limits=deps.limits, now=now)
-    elif deps.llm is None:
-        degrade_code = "no_provider"
-
-    actions = list(review.approved) if review else []
-    # 存量扫除单键（closed-loop §11）：关掉时**传空集**而不是跳过整步——`blocked_domains` 是必填
-    # 形参，空集是它的诚实取值，而「跳过整步」会让 `counts["blocked_sweep"]` 这一键整键缺席。
-    sweep_on = bool(getattr(deps.settings, "ai_trade_intel_blocked_sweep_enabled", True))
-    # §3.4.4：确定性清理跑在**模型动作执行之后**。用动作前的快照算清理计划会让一条刚被升进中期
-    # 的情报仍然按超短层参与溢出淘汰——那正是「算了却算错了对象」的形状。
-    plan = cleanup_mod.plan_cleanup(_after_actions(live, actions), limits=deps.limits,
-                                    now=now,
-                                    blocked_domains=(blocked if sweep_on else frozenset()))
-    counts: dict[str, int] = dict(review.counts) if review else {}
-    rejects = dict(review.rejects) if review else {}
-    return await _persist_curate(deps, inst_id, started=started, actions=actions, plan=plan,
-                                 counts=counts, rejects=rejects, degrade_code=degrade_code,
-                                 tokens=(usage_in, usage_out))
+    state = await repo.alert_cooldown_state(db, inst_id, now=now)
+    decision = alert_mod.plan_alert(candidates, limits=deps.limits, now=now,
+                                    last_fired_ts=int(state["lastFiredTs"]),
+                                    day_fired=int(state["dayFired"]))
+    candidate = decision.candidate
+    alert_id = await repo.write_intel_alert(db, {
+        "instId": inst_id, "groupId": deps.group_id,
+        "itemId": candidate.item_id if candidate else 0,
+        "roundId": round_id, "createdTs": int(now),
+        "severity": decision.severity, "fired": decision.fired,
+        "suppressedCode": decision.suppressed_code,
+        "headline": candidate.headline if candidate else "",
+        "category": candidate.category if candidate else "",
+        "tier": candidate.tier if candidate else "",
+        "stance": candidate.stance if candidate else "",
+        "impact": candidate.impact if candidate else "",
+        "domainCount": candidate.domain_count if candidate else 0,
+        "quoted": candidate.quoted if candidate else False,
+        "confidence": candidate.confidence if candidate else 0.0,
+        "reasons": decision.reasons}, commit=False)
+    if not decision.fired or candidate is None:
+        return None
+    return alert_mod.AlertHandoff(alert_id=alert_id, candidate=candidate,
+                                  severity=decision.severity, created_wall=now)
 
 
-async def _persist_curate(deps: IntelDeps, inst_id: str, *, started: int, actions, plan,
-                          counts: dict, rejects: dict, degrade_code: str,
-                          tokens: tuple[int, int]) -> RoundOutcome:
-    """整理轮的写段：复核通过的动作 → 三步确定性清理 → 写轮 → 推节律，**一次提交**。"""
-    usage_in, usage_out = tokens
-    async with deps.sessionmaker()() as db:
-        applied = await repo.apply_intel_curation(db, [
-            {"itemId": a.item_id, "action": a.action, "toTier": a.to_tier,
-             "mergeIntoId": a.merge_into_id, "reason": a.reason, "expiresTs": a.expires_ts}
-            for a in actions], now=started, commit=False)
-        lapsed = await repo.apply_intel_curation(db, [
-            {"itemId": a.item_id, "action": a.action, "toTier": a.to_tier,
-             "mergeIntoId": None, "reason": a.reason, "expiresTs": a.expires_ts}
-            for a in plan.lapsed], now=started, commit=False)
-        await repo.archive_intel_items(db, list(plan.expire_ids), reason="ttl", now=started,
-                                       commit=False)
-        await repo.archive_intel_items(db, list(plan.overflow_ids), reason="overflow",
-                                       now=started, commit=False)
-        # closed-loop §3.4.2 第 5 步：全部来源都被拉黑的存量条目（G-9②）。
-        await repo.archive_intel_items(db, list(plan.blocked_ids), reason="source_blocked",
-                                       now=started, commit=False)
-        await repo.purge_orphan_superseded(db, inst_id, commit=False)
-        # closed-loop G-13：引用明细的保留期裁剪顺手挂在整理轮末尾。**只删明细、不回滚统计列**
-        # ——统计列是已发布的读数，为了省几行明细去追溯改写它们比多留几行明细坏得多。
-        pruned = await repo.prune_intel_citations(
-            db, before_ts=int(started - float(getattr(
-                deps.settings, "ai_trade_intel_cite_retention_d", 180.0)) * 86400),
-            commit=False)
-        histogram = {**counts, **{f"applied_{k}": v for k, v in applied.items()},
-                     **plan.counts, **{f"rejected_{k}": v for k, v in rejects.items()}}
-        if lapsed:
-            histogram["applied_lapsed"] = sum(lapsed.values())
-        if pruned:
-            histogram["citations_pruned"] = pruned
-        # evidence-grounding §3.1.4 第 6 步：正文缓存的三道闸（TTL / 行数 / 字节）。
-        # **只删缓存，绝不动引文**——引文自带原文副本，它必须比缓存活得久。
-        docs_pruned = await _prune_documents(deps, db, now=started)
-        if docs_pruned:
-            histogram["documents_pruned"] = docs_pruned
-        status = "degraded" if degrade_code else "ok"
-        await repo.write_intel_round(db, {
-            "instId": inst_id, "kind": "curate", "groupId": deps.group_id,
-            "startedTs": started, "finishedTs": int(deps.now()), "status": status,
-            "actions": histogram, "inputTokens": usage_in, "outputTokens": usage_out,
-            "degradeCode": degrade_code}, commit=False)
-        await repo.bump_intel_watch(db, inst_id, kind="curate", status=status,
-                                    next_due_ts=next_due_for(deps, fail_streak=0),
-                                    curate_reset=True, commit=False)
-        await db.commit()
-    return RoundOutcome(inst_id, "curate", status, degrade_code, actions=histogram)
+# 战绩求解一次读多少行引用明细。行数本来就被 `cite_retention_d`（默认 180 天）天然封顶，
+# 这个上界只是为了让「一个跑了三年的标的」不会在一次快照里把整张表读进内存。
+# **两个求解点必须用同一个数**——否则 G-28 的「两处逐字段相等」会在库大了之后悄悄变假。
+_EFFICACY_MAX_ROWS = 2000
+# 推算 `openRounds` 时回看多少次整理轮。超过它就说「至少这么多轮」——一个悬置了 40 轮的矛盾对
+# 与一个悬置了 200 轮的，在界面上是同一句话。
+_CURATE_ROUND_LOOKBACK = 40
 
 
-async def _prune_documents(deps: IntelDeps, db, *, now: int) -> int:
-    """跑一遍正文缓存的三道闸；返回删掉的总行数。**绝不阻断整理轮**（不变式 I-2）。"""
-    ttl_h = float(getattr(deps.settings, "ai_trade_intel_reader_cache_ttl_h", 72.0))
-    max_rows = int(getattr(deps.settings, "ai_trade_intel_reader_cache_max_rows", 4000))
-    body_max = int(getattr(deps.settings, "ai_trade_intel_reader_body_max_chars", 20_000))
-    try:
-        counts = await repo.prune_documents(db, now=now, ttl_s=ttl_h * 3600.0,
-                                            max_rows=max_rows,
-                                            max_bytes=max_rows * body_max, commit=False)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:      # noqa: BLE001 —— 缓存清理是加法，失败只放弃这一次
-        logger.warning("ai-trade intel document prune failed: %s", exc)
-        return 0
-    return sum(counts.values())
+async def solve_efficacy(db, deps: IntelDeps, inst_id: str, scope: list[dict]):
+    """求解该标的的战绩与信誉先验（**两个求解点共用这一个入口**）。
 
+    * actionability 评审 P0-1：`build_snapshot` 与 `run_curate_round` **各求一次**，这不构成
+    第二个真源——`efficacy.solve` 是纯函数，同一批 ``(citation_rows, item_rows, limits, now)``
+    在哪里求都得到同一个值，而两处的输入来自同一张表、同一个标的、相隔至多一个 tick
+    （G-28 冻结这条）。整理轮够不着 `IntelRuntime._efficacy` 那份缓存：`IntelDeps` **没有任何
+    指向 runtime 的引用**，它被刻意设计成「显式注入，使离线用例不必造一个真的会话」。
 
-def _after_actions(items: list[IntelItem], actions) -> list[IntelItem]:
-    """把已过复核的动作投影到内存中的库存快照上（**不落库**，只为算清理计划）。
+    Args:
+        db: 调用方持有的只读会话。
+        deps: 依赖聚合（取 `limits` 与 `now`）。
+        inst_id: 目标标的。
+        scope: `load_intel_scope` 的 wire 行（**复用调用方已经取好的那一份**，不再查一次）。
 
-    与 `repo.apply_intel_curation` 的语义逐条对齐：`promote`/`demote` 改 tier 与寿命、`archive`
-    置 `archived`、`merge` 置 `superseded`。两处一旦漂移，清理就会按一份不存在的库存来算。
+    Returns:
+        `efficacy.Efficacy`；总闸关 ⇒ 空产物（全部权重为 0 ⇒ 四个消费点逐字节回退）。
     """
-    from dataclasses import replace as _replace
-
-    projected = {int(it.item_id): it for it in items if it.item_id}
-    for action in actions:
-        item = projected.get(int(action.item_id))
-        if item is None:
-            continue
-        if action.action in ("promote", "demote"):
-            projected[item.item_id] = _replace(item, tier=str(action.to_tier),
-                                               expires_ts=int(action.expires_ts))
-        elif action.action == "archive":
-            projected[item.item_id] = _replace(item, status="archived")
-        elif action.action == "merge":
-            projected[item.item_id] = _replace(item, status="superseded")
-    return list(projected.values())
+    if not deps.limits.efficacy_enabled:
+        return efficacy_mod.Efficacy()
+    rows, _has_more = await repo.list_intel_citations(db, inst_id=inst_id,
+                                                      limit=_EFFICACY_MAX_ROWS)
+    return efficacy_mod.solve(rows, scope, limits=deps.limits, now=deps.now())
 
 
-def render_listing(items: list[IntelItem], *, now: float, max_rows: int = 80) -> str:
-    """整理轮的紧凑清单（按层分组、层内按 score 降序、总数封顶）。"""
-    from .disclosure import relative_time     # 同包复用，避免第二份相对时间口径
+async def read_efficacy(db, inst_id: str, *, limits: IntelLimits, now: float):
+    """REST 侧的战绩求解入口（**与 `solve_efficacy` 同一批入参、同一个纯函数**）。
 
-    rows: list[str] = []
-    remaining = max_rows
-    for tier in ("long", "mid", "ultra"):
-        group = sorted([it for it in items if it.tier == tier],
-                       key=lambda it: gate.score_item(it, now=now), reverse=True)
-        if not group:
-            continue
-        rows.append(f"【{tax.TIER_LABELS[tier]} {len(group)} 条】")
-        for item in group[:max(0, remaining)]:
-            flags = "".join(["【置顶】" if item.pinned else "",
-                             "【用户编辑】" if item.user_edited else "",
-                             "【已排期】" if item.is_scheduled else ""])
-            rows.append(
-                f"#{item.item_id} [{tax.CATEGORY_LABELS[item.category]}·"
-                f"{tax.STANCE_LABELS[item.stance]}·{tax.IMPACT_LABELS[item.impact]}] "
-                f"置信{item.confidence:.2f} · 事件{relative_time(item.event_ts, now)} · "
-                f"{item.domain_count} 源{flags} · 「{item.headline}」")
-            rows.append(f"     摘要：{item.summary[:80]}")
-        remaining -= len(group)
-        if remaining <= 0:
-            break
-    return "\n".join(rows) if rows else "（本标的当前没有任何在库情报。）"
+    端点层拿不到 `IntelDeps`（它是情报后台任务的依赖聚合，而 REST 请求手上只有一个会话与
+    `Settings`），故这里自己取一次 scope。**这不构成第三个真源**：`efficacy.solve` 是纯函数，
+    同一批 ``(citation_rows, item_rows, limits, now)`` 在哪里求都得到同一个值（G-28 的性质）。
+    """
+    if not limits.efficacy_enabled:
+        return efficacy_mod.Efficacy()
+    scope = await repo.load_intel_scope(db, inst_id)
+    rows, _has_more = await repo.list_intel_citations(db, inst_id=inst_id,
+                                                      limit=_EFFICACY_MAX_ROWS)
+    return efficacy_mod.solve(rows, scope, limits=limits, now=now)
+
+
+def efficacy_wire(eff, *, limits: IntelLimits) -> dict:
+    """`GET /impact` 的 `efficacy` 块（**唯一**装配点；`IntelEfficacyOut` 与它逐键同构）。"""
+    rows = [{**efficacy_mod.stat_wire(stat), "category": name,
+             "weight": round(float(eff.weights.get(name, 0.0)), 6)}
+            for name, stat in sorted(eff.by_category.items())]
+    return {"enabled": bool(limits.efficacy_enabled),
+            "kMin": int(limits.efficacy_k_min),
+            "sampleN": int(eff.overall.samples),
+            "overall": efficacy_mod.stat_wire(eff.overall),
+            "byCategory": rows}
+
+
+def source_reputation_wire(eff, *, limits: IntelLimits) -> dict[str, dict]:
+    """域名 → 三个判定计数 + 准确率（信源页签的三列）。
+
+    **样本不足时 `accuracy` 恒为 `None`**（低于 `efficacy_min_domain_samples`）：一个用两条样本
+    算出来的 100% 准确率，比不显示准确率更容易让人拉黑错的那个源——而拉黑是这一页上唯一的
+    破坏性动作。
+    """
+    floor = max(1, int(limits.efficacy_min_domain_samples))
+    out: dict[str, dict] = {}
+    for domain, stat in eff.by_domain.items():
+        wire = efficacy_mod.stat_wire(stat)
+        if stat.samples < floor:
+            wire["accuracy"] = None
+        out[domain] = wire
+    return out
+
+
+async def load_conflicts(db, inst_id: str, *, limits: IntelLimits, now: float,
+                         items: list[IntelItem] | None = None):
+    """找出该标的库存里的立场矛盾对，并算出每一对悬置了几轮整理。
+
+    **注入端、整理轮与 REST 三处共用这一个入口**：`find_conflicts` 是纯函数，三处同值。
+
+    Args:
+        db: 只读会话（只用来取整理轮流水，`openRounds` 由它推算）。
+        inst_id: 目标标的。
+        limits: 提供 `conflict_enabled` 与 `conflict_min_overlap`（纯核心不读 `Settings`）。
+        now: 墙钟秒。
+        items: 已在手的库存；``None`` 时本函数自己取一次。
+
+    Returns:
+        ``(pairs, wire_rows)``；总闸关 ⇒ ``((), [])`` ⇒ 注入端与 REST 双双逐字节回退。
+        `wire_rows` 按「悬置轮数降序、重叠度降序」——久未裁决的对必须排在下一轮整理的最前面。
+    """
+    if not limits.conflict_enabled:
+        return (), []
+    rows = items if items is not None else [
+        item_from_wire(w) for w in await repo.load_intel_scope(db, inst_id)]
+    pairs = tuple(conflict_mod.find_conflicts(
+        rows, min_overlap=limits.conflict_min_overlap,
+        max_pairs=conflict_mod.MAX_CONFLICT_PAIRS, now=now))
+    if not pairs:
+        return (), []
+    by_id = {int(it.item_id): it for it in rows if it.item_id}
+    curate_ts = [int(row.get("startedTs") or 0) for row in await repo.list_intel_rounds(
+        db, inst_id, kind="curate", limit=_CURATE_ROUND_LOOKBACK)]
+    wire = [pair.wire(open_rounds=conflict_mod.open_rounds_for(
+        pair, by_id, curate_round_ts=curate_ts)) for pair in pairs]
+    wire.sort(key=lambda row: (-row["openRounds"], -row["overlap"]))
+    return pairs, wire
+
+
+# ---------------- 整理轮（**已外移**到 `intel/service_curate.py`） ----------------
+# 本文件在 actionability 轮实测 919 行，越过 CLAUDE.md 的 800 行阈值，处置是「再下沉一层」而
+# 不是放宽阈值（§十二 / `EG-I2` 的成文修法：纯搬运、零语义变化）。文件名沿用同目录里
+# `service_verify.py` 的既有范式。
+
+
+async def run_curate_round(deps: IntelDeps, inst_id: str) -> RoundOutcome:
+    """跑一轮整理（**薄转发**，判定与编排全在 `service_curate`）。
+
+    延迟导入是必需的而不是风格选择：`service_curate` 反向依赖本模块的公开面
+    （`IntelDeps` / `solve_efficacy` / `load_conflicts` / `finish_degraded`），模块级互相
+    import 会成环。逐行照抄 `IntelRuntime.run_verify` 对 `service_verify` 的既有做法。
+    """
+    from .service_curate import run_curate_round as _run_curate_round
+
+    return await _run_curate_round(deps, inst_id)
 
 
 # ---------------- 降级收尾 ----------------
@@ -600,15 +626,26 @@ async def build_snapshot(deps: IntelDeps, inst_id: str) -> dict:
         summary = await read_summary(db, inst_id, settings=deps.settings,
                                      provider_configured=deps.search is not None, now=now)
         scope = await repo.load_intel_scope(db, inst_id)
-    items = [item_from_wire(w) for w in scope]
+        eff = await solve_efficacy(db, deps, inst_id, scope)
+        items = [item_from_wire(w) for w in scope]
+        conflicts, conflict_rows = await load_conflicts(db, inst_id, limits=deps.limits,
+                                                        now=now, items=items)
     inject_on = bool(getattr(deps.settings, "ai_trade_intel_inject", True))
     # ★ closed-loop 评审 P1-15：`cite` **只有这一个取值来源**。写在别处会让 REST 读到的库存与
     # 注入看到的库存分叉，而分叉不报错。
     cite_on = bool(getattr(deps.settings, "ai_trade_intel_cite_enabled", False))
-    digest = (build_digest(items, limits=deps.limits, now=now,
-                           last_collect_ts=summary["lastCollectTs"], cite=cite_on)
-              if inject_on else {"lines": [], "hidden": 0})
-    return {"digest": digest, "summary": summary}
+    digest, digest_ids = (
+        build_digest_and_ids(items, limits=deps.limits, now=now,
+                             last_collect_ts=summary["lastCollectTs"], cite=cite_on,
+                             eff=eff if deps.limits.efficacy_enabled else None,
+                             conflicts=conflicts)
+        # `inject` 关掉时情报段整段不存在 ⇒ id 集合**必须为空**：`in_digest` 因此恒为 False，
+        # 唤醒句走内联态并如实说「注入已关闭」（评审 P0-3 的第二条路径）。
+        if inject_on else ({"lines": [], "hidden": 0}, frozenset()))
+    # `summary["efficacy"]` **不在这里拼**：它由 `read_summary` 这个唯一装配点给出（见那里的
+    # 方框）。在这里再拼一次，就会让 WS 推的那一份与 `GET /intel/{instId}` 的那一份各拼各的。
+    return {"digest": digest, "summary": summary, "conflicts": conflict_rows,
+            "digestItemIds": digest_ids}
 
 
 async def read_summary(db, inst_id: str, *, settings, provider_configured: bool,
@@ -628,6 +665,17 @@ async def read_summary(db, inst_id: str, *, settings, provider_configured: bool,
     # evidence-grounding 评审 P1-13：`quoteHitRate` 就在**这一个只读会话**里求出。写在
     # `build_snapshot` 里要么多开一个会话，要么走进「同步路径造不出一个 DB 派生键」那个坑。
     quote_stats = await repo.count_recent_quote_stats(db, inst_id)
+    # actionability §4.2：告警的两个会话级读数走**既有** `intel` 事件，不新增任何 WS 事件类型。
+    alerts = await repo.count_recent_alerts(db, inst_id, since_ts=int(wall) - 86400)
+    # actionability §3.2.4：**摘要形态**的四个数（完整的 `by_category` / `by_domain` 由 REST
+    # 拉——summary 走 WS 逐轮广播给每个前端连接，一张几十行的表广播出去是纯浪费）。
+    #
+    # ⚠️ 拼在这里而不是 `build_snapshot` 里：本函数是 `AiTradeIntelSummary` 的**唯一**装配点，
+    # 而 `api/ai_intel._summary` 也调它。写在 `build_snapshot` 里会让 WS 推的那一份带
+    # `efficacy`、REST 读的那一份不带 —— 两条通路形状分叉，而分叉**不报错**。
+    # 代价是快照路径上多求解一次：`efficacy.solve` 是纯函数，两处同值（G-28 的性质）。
+    limits = tax.limits_from_settings(settings)
+    eff = await read_efficacy(db, inst_id, limits=limits, now=wall)
     return {
         "instId": inst_id,
         "counts": {"ultra": counts["ultra"], "mid": counts["mid"], "long": counts["long"],
@@ -662,6 +710,17 @@ async def read_summary(db, inst_id: str, *, settings, provider_configured: bool,
         # 近 20 轮 `quotesVerified / quotesProposed`。**分母 0 ⇒ `None` 而不是 0**：
         # 「没提过引文」与「提了全没中」在设置卡上是两句不同的话。
         "quoteHitRate": quote_stats["hitRate"],
+        # actionability 轴 A：近 24 小时 fired 计数与最近一次告警时刻。
+        # `lastAlertTs` 为 `None` = **从未告警过**，与 0 分开（后者会被渲染成 1970 年）。
+        # 未装配的分组由 `runtime._static_summary` 给出**同形状**的零值（G-25）。
+        "alerts24h": int(alerts["alerts24h"]),
+        "lastAlertTs": alerts["lastAlertTs"],
+        "efficacy": {
+            "enabled": bool(limits.efficacy_enabled),
+            "kMin": int(limits.efficacy_k_min),
+            "sampleN": int(eff.overall.samples),
+            "overall": efficacy_mod.stat_wire(eff.overall),
+        },
     }
 
 
@@ -694,75 +753,14 @@ def estimate_daily_cost(*, symbols: int, interval_min: float, corpus_docs: int,
             "inputTokensPerDay": int(total / 2.5)}
 
 
-# ---------------- 设置解析（DB 行优先、env 回落，与 `resolve_active_provider` 同构） ----------------
-# `(wire 键, app_settings 键, Settings 字段, 类型)`。**单一真源**：读端点、写端点与运行时装配点
-# 共用它，避免「面板上改得动、系统永远不读、而且不报错」这类假面板（experience 的 I-10 教训）。
-INTEL_SETTING_BRIDGE: tuple[tuple[str, str, str, type], ...] = (
-    ("enabled", "ai_intel.enabled", "ai_trade_intel_enabled", bool),
-    ("injectEnabled", "ai_intel.inject", "ai_trade_intel_inject", bool),
-    ("provider", "ai_intel.provider", "ai_trade_intel_search_provider", str),
-    ("collectIntervalMin", "ai_intel.collect_interval_min",
-     "ai_trade_intel_collect_interval_min", float),
-    ("curateEveryNCollects", "ai_intel.curate_every_n",
-     "ai_trade_intel_curate_every_n_collects", int),
-    ("dailyCap", "ai_intel.daily_cap", "ai_trade_intel_daily_round_cap", int),
-    # ---- closed-loop 评审 P0-5：三把安全单键 + 五个核查旋钮**必须**扩这张表。
-    # 不扩 ⇒ 请求 200、面板上开关照动、`Settings` 上的值**永远不变**——用户在设置卡上关掉核查轮，
-    # 系统照跑照降级。把安全开关做成假开关是本轮最不可接受的一种失败（G-18 逐键往返冻结）。
-    ("citeEnabled", "ai_intel.cite_enabled", "ai_trade_intel_cite_enabled", bool),
-    ("attributionEnabled", "ai_intel.attribution_enabled",
-     "ai_trade_intel_attribution_enabled", bool),
-    ("verifyEnabled", "ai_intel.verify_enabled", "ai_trade_intel_verify_enabled", bool),
-    ("verifyEveryNCurates", "ai_intel.verify_every_n",
-     "ai_trade_intel_verify_every_n_curates", int),
-    ("verifyMaxItems", "ai_intel.verify_max_items", "ai_trade_intel_verify_max_items", int),
-    ("verifyDocsPerItem", "ai_intel.verify_docs_per_item",
-     "ai_trade_intel_verify_docs_per_item", int),
-    ("blockedSweepEnabled", "ai_intel.blocked_sweep",
-     "ai_trade_intel_blocked_sweep_enabled", bool),
-    ("citeMaxRefs", "ai_intel.cite_max_refs", "ai_trade_intel_cite_max_refs", int),
-    # ---- evidence-grounding：轴 A / 轴 B 的三把单键。**不扩这张表 ⇒ 假面板**（E-14）：
-    # 请求 200、开关照动、`Settings` 上的值永远不变，而且不报错。
-    ("readerEnabled", "ai_intel.reader_enabled", "ai_trade_intel_reader_enabled", bool),
-    ("readerTopK", "ai_intel.reader_top_k", "ai_trade_intel_reader_top_k", int),
-    ("quoteMode", "ai_intel.quote_mode", "ai_trade_intel_quote_mode", str),
+# ---------------- 设置解析（**已外移**到 `intel/settings_bridge.py`） ----------------
+# 本文件在 actionability 轮越过 CLAUDE.md 的 800 行阈值，处置是「再下沉一层」而不是放宽阈值
+# （§十二 / `EG-I2` 的成文修法：纯搬运、零语义变化）。四个公开名在这里**原样重新导出**，
+# 故 `intel_service.INTEL_SETTING_BRIDGE` / `intel_service.resolve_intel_settings` 等既有
+# 调用点一个字节不改。
+from .settings_bridge import (  # noqa: E402,F401
+    INTEL_API_KEY_APP_KEY,
+    INTEL_SETTING_BRIDGE,
+    resolve_api_key,
+    resolve_intel_settings,
 )
-# 密钥的 app_settings 键。**绝不出接口**（`GET /settings/intel` 只回 `hasKey` / `keyPreview`）、
-# **绝不进日志**（`IntelSearchError` 构造时即脱敏）。
-INTEL_API_KEY_APP_KEY = "ai_intel.search_api_key"
-
-
-async def resolve_intel_settings(session, settings):
-    """把库内行叠加到 `Settings` 上，产出**运行时真正会读到的那一份**。
-
-    产出会话私有副本而不是改全局：`get_settings()` 是进程级 `lru_cache` 单例，且 `LiveExecutor`
-    被 `ai_auto` 与 `live_auto` 共用同一个 settings 对象，`setattr` 会让情报设置静默溢出到非 AI
-    链路（本仓库的历史坑）。
-    """
-    updates: dict = {}
-    for _wire_key, app_key, field_name, caster in INTEL_SETTING_BRIDGE:
-        stored = await repo.get_app_setting(session, app_key, None)
-        if stored is None:
-            continue
-        try:
-            value = bool(stored) if caster is bool else caster(stored)
-        except (TypeError, ValueError):
-            continue
-        # ⚠️ `settings.model_copy(update=…)` **不做校验**（评审 P2-9）：一个从库内行读回来的坏值
-        # 会绕过 pydantic 的 `Literal`。故在这里再收一次值域，不在集合内即跳过该键——与上面那条
-        # `except: continue` 同形（「读不出来就当没配过」）。
-        if field_name == "ai_trade_intel_quote_mode" and value not in tax.QUOTE_MODES:
-            continue
-        updates[field_name] = value
-    stored_key = await repo.get_app_setting(session, INTEL_API_KEY_APP_KEY, None)
-    if isinstance(stored_key, str) and stored_key:
-        updates["ai_trade_intel_search_api_key"] = stored_key
-    return settings.model_copy(update=updates) if updates else settings
-
-
-async def resolve_api_key(session, settings) -> str:
-    """检索源密钥：库内行优先、env 回落（§3.2.3 的解析优先级）。"""
-    stored = await repo.get_app_setting(session, INTEL_API_KEY_APP_KEY, None)
-    if isinstance(stored, str) and stored.strip():
-        return stored.strip()
-    return str(getattr(settings, "ai_trade_intel_search_api_key", "") or "").strip()

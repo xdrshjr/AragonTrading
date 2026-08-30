@@ -127,6 +127,13 @@ export interface AiTradeRunMetrics {
       catchupCeilingHits?: number;
       positionWatchSkips?: number;
       signalFlipWakes?: number;
+      // ⚠️ actionability 评审 P1-7：**这是一处纯声明位**。后端 `session.py` 把
+      // `self._wake.stats(...)` **整体赋值**进 `metrics["aiStats"]["wakeScheduler"]`，故新键
+      // 天然落库，与本类型毫无关系；而 `wakeScheduler` 在 `apps/web` 里**至今没有任何读点**
+      // （历史页看不到任何调度计数，登记为既有欠账）。补它是为了类型与 wire 不分叉，
+      // **不是**防丢失措施——照「缺它就永久丢失」去写用例，只会得到一条断言类型声明的空闸。
+      intelAlertWakes?: number;
+      intelAlertDrops?: number;
       previewTimeouts?: number;
       previewErrors?: number;
       previewDisabled?: boolean;

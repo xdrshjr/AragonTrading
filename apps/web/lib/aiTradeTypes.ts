@@ -136,6 +136,10 @@ export interface MultiTimeframeContext {
 // 翻转」是信息量最高的一件事（ai-trade-wake-scheduler-closed-loop 轴 C）。
 export type WakeKind =
   | "candle_close"
+  // 情报告警（ai-trade-intel-actionability 轴 A）：插在 `candle_close` 之后、`bar_advanced`
+  // 之前。它是**外生**的既成事实，而且这一轮之所以存在就是因为它——标成 `bar_advanced` 会让
+  // 唤醒句说「你补看一根新 K 线」，真正的原因从标题里消失。
+  | "intel_alert"
   | "bar_advanced"
   | "signal_flip"
   | "resting_order"
@@ -166,6 +170,29 @@ export interface WakeInfo {
   dropped?: boolean; // 被 in-flight 守卫丢弃的 K 线轮
   backlog?: WakeBacklogInfo | null; // 仅补跑轮出现（轴 A）
   flip?: WakeFlipInfo | null; // 仅 signal_flip 轮出现（轴 C）
+  intel?: WakeIntelInfo | null; // 仅 intel_alert 轮出现（actionability 轴 A）
+}
+
+// 触发本轮的那一条高危市场情报（ai-trade-intel-actionability 轴 A）。**不含 URL、不含域名、
+// 不含正文**（提示注入防护姿态）。`inDigest=false` ⇒ 唤醒句会把摘要就地内联进 prompt 并如实
+// 说明「它没出现在下方情报段中」——「有编号」与「真的在 prompt 里」不是同一件事。
+export interface WakeIntelInfo {
+  alertId: number;
+  itemId: number;
+  ref: string;
+  inDigest: boolean;
+  headline: string;
+  summary: string;
+  label: string; // 「风险事件·偏空·高」，后端下发
+  category: string;
+  tier: string;
+  stance: string;
+  impact: string;
+  domainCount: number;
+  quoted: boolean;
+  confidence: number;
+  severity: number;
+  ageMin: number;
 }
 
 // 上一轮研判期间被在飞守卫吞掉的唤醒（轴 A）。`waitedS` 的口径是「自**首次**丢弃至今」，
@@ -1222,6 +1249,11 @@ export interface AiTradeSessionRow {
   wakeCatchups?: number;
   positionWatchSkips?: number;
   signalFlipWakes?: number;
+  // 情报告警的两个计数（actionability §3.4.4）：`intelAlertWakes` = 真的多起了一轮决策的次数，
+  // `intelAlertDrops` = 到手却没能起轮（会话不在运行 / 行情陈旧 / 无信号板 / 过期 / 撞上在飞轮）。
+  // 两者口径不同，**绝不相加**。
+  intelAlertWakes?: number;
+  intelAlertDrops?: number;
   // 持仓周期快照（holding-horizon [P1-4] 第 2 处）：`patchAiTradeMemberStatus` 把 status 整体浅合并
   // 进 `m.session`，**类型里没有这个键则面板取不到**（tsc 报错而非静默丢数据，但极易被「后端已下发」
   // 骗过去）。未装配 / 老后端 ⇒ undefined 或 null ⇒ chip 整段不渲染。
@@ -1288,6 +1320,9 @@ export interface AiTradeStatusEvent {
   wakeCatchups?: number;
   positionWatchSkips?: number;
   signalFlipWakes?: number;
+  // 情报告警两计数（同上；口径见 AiTradeSessionRow 上的注释）。
+  intelAlertWakes?: number;
+  intelAlertDrops?: number;
   degraded?: boolean;
   stopReason?: string | null;
   flattenFailed?: boolean;

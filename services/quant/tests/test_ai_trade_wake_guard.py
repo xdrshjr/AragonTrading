@@ -153,3 +153,25 @@ def test_position_watch_ceiling_of_one_forces_a_round_after_every_single_skip():
     policy = _policy(position_watch_max_skip_streak=1)
     assert should_skip_wake(_wake("position_watch", skipStreak=0, **armed), policy) is True
     assert should_skip_wake(_wake("position_watch", skipStreak=1, **armed), policy) is False
+
+
+
+# ---------- G-8（ai-trade-intel-actionability）：新 kind 不可被跳过 ----------
+def test_intel_alert_wake_is_never_skipped_by_the_guard():
+    """`should_skip_wake` 只跳 `heartbeat` 与 `position_watch`——但**必须写一条用例冻结它**。
+
+    「新 kind 意外落进可跳过集合」是一个**静默失效**：一条高危情报会照常写台账、照常标成
+    `woke`，然后被守卫吃掉，界面上完全看不出区别（R-3）。
+    """
+    from app.ai_auto.wake_guard import SkipPolicy, should_skip_wake
+
+    policies = [
+        SkipPolicy(threshold_pct=0.0005, threshold_atr_mult=0.5),
+        SkipPolicy(threshold_pct=0.0005, threshold_atr_mult=0.5, max_skip_streak=1,
+                   position_watch_enabled=True, position_watch_max_skip_streak=1),
+        SkipPolicy(threshold_pct=0.0, threshold_atr_mult=0.0),
+    ]
+    for policy in policies:
+        for streak in (0, 5, 99):
+            wake = {"kind": "intel_alert", "skipStreak": streak, "guardStatus": "armed"}
+            assert should_skip_wake(wake, policy) is False

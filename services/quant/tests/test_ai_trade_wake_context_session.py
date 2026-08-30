@@ -1167,3 +1167,38 @@ async def _no_trade_fee(_inst_id):
 async def _no_position_history():
     """持仓历史取数桩：恒空 ⇒ 对账 status="unavailable"，绝不触网。"""
     return []
+
+
+# ---------- G-17（ai-trade-intel-actionability）：两个新计数的两处出口同值 ----------
+def test_intel_alert_counters_appear_in_both_status_and_metrics():
+    """`status_counts()` 与 `stats()` **同源**：后者被 `session.py` 整体赋值进
+    `metrics_json["aiStats"]["wakeScheduler"]`，故新键天然落库（评审 P1-7）。
+
+    判据落在**后端**：`lib/aiTradeHistoryTypes.ts` 是一处今天就没有任何读点的纯声明位，
+    断言它只会得到一条空闸。
+    """
+    runtime = WakeRuntime(_BAR, 120.0, Settings())
+    assert runtime.status_counts()["intelAlertWakes"] == 0
+    assert runtime.stats()["intelAlertDrops"] == 0
+
+    class _Handoff:
+        def wire(self, *, now):
+            return {"itemId": 7}
+
+    readings = WakeReadings(trigger="interval", position_side="flat", has_resting=False,
+                            bar_index=3, px=30000.0)
+    wake = runtime.plan_intel_alert(_Handoff(), readings, now_wall=time.time())
+    runtime.note_intel_alert_drop()
+    assert wake["kind"] == "intel_alert" and wake["intel"] == {"itemId": 7}
+    assert runtime.stats()["intelAlertWakes"] == 1
+    assert runtime.status_counts()["intelAlertWakes"] == runtime.stats()["intelAlertWakes"]
+    assert runtime.status_counts()["intelAlertDrops"] == runtime.stats()["intelAlertDrops"] == 1
+
+
+def test_planning_without_a_handoff_changes_nothing():
+    """`handoff is None` ⇒ 不计数、不产 wake（非告警轮逐字节回退）。"""
+    runtime = WakeRuntime(_BAR, 120.0, Settings())
+    readings = WakeReadings(trigger="interval", position_side="flat", has_resting=False,
+                            bar_index=3, px=30000.0)
+    assert runtime.plan_intel_alert(None, readings, now_wall=time.time()) is None
+    assert runtime.stats()["intelAlertWakes"] == 0

@@ -16,11 +16,25 @@ from dataclasses import dataclass
 
 from .profit_guard import ARMED_STATUSES
 
-# 八种唤醒原因，按判定优先级排列（首个命中即为 kind，其余成立项进 alsoTrue）。
+# 九种唤醒原因，按判定优先级排列（首个命中即为 kind，其余成立项进 alsoTrue）。
 # `signal_flip` 插在 `bar_advanced` 之后、`resting_order` 之前：真的收了新根永远优先；除此之外，
 # 「某个策略的立场正在翻转」是信息量最高的一件事（wake-scheduler-closed-loop §2.4）。
-WAKE_KINDS = ("candle_close", "bar_advanced", "signal_flip", "resting_order", "profit_tier",
-              "price_breakout", "position_watch", "heartbeat")
+#
+# `intel_alert` 插在 `candle_close` 之后、`bar_advanced` 之前（intel-actionability §3.1.6）。
+# 它与 `signal_flip` 的取向**不冲突**：后者是**内生**的预演估计（对未收线数据的猜测），让位给
+# 「真的收了新根」是对的；`intel_alert` 是**外生**的既成事实，而且**这一轮之所以存在就是因为
+# 它**——把它标成 `bar_advanced` 会让唤醒句说「你补看一根新 K 线」，真正的原因从标题里消失。
+# 证据不丢：`bar_advanced` 若同时成立会进 `alsoTrue`。
+# 算术依据（Q2 裁决）：`_maybe_intel_wake` 认领槽位时传的 `trigger` 恒为 `"interval"`，而
+# `candle_close` 的判据是 `facts.trigger == "candle"` ⇒ **在告警自己认领的那一轮里
+# `candle_close` 恒不成立，`intel_alert` 恒为首位**（G-7 冻结）。
+#
+# ⚠️ 本元组是**九组注册表**的源。新增一个 kind 必须同时落进：本文件的 `conditions`、
+# `wake_text` 的 `_ALSO_TRUE_LABEL` 与 `_WAKE_BODY`、`tactical_context._FULL_TIER_KINDS`、
+# `experience/taxonomy.VALUE_LABEL_ZH`，以及前端四处。漏掉后端那四处**不报错**
+# （G-9 的并集断言正是为它们写的）。
+WAKE_KINDS = ("candle_close", "intel_alert", "bar_advanced", "signal_flip", "resting_order",
+              "profit_tier", "price_breakout", "position_watch", "heartbeat")
 
 
 @dataclass(frozen=True)
@@ -59,6 +73,9 @@ class WakeFacts:
     # 轴 C：未确认根预演出的投影净共识翻转（`signal_preview.flip_signature` 的 wire + 防抖读数）。
     # None ⇒ `flip` 整键缺席 ⇒ 非翻转轮的 wire 逐字节回退 a7ed70c。
     flip: dict | None = None
+    # intel-actionability 轴 A：本轮由哪一条高危市场情报触发（`AlertHandoff.wire()` 的产物）。
+    # None ⇒ `intel_alert` 条件不成立、wire 无 `intel` 键 ⇒ 非告警轮逐字节回退 4b9c352。
+    intel: dict | None = None
 
 
 def horizon_scale(wake_interval_s: float, bar_seconds: int) -> float:
@@ -134,6 +151,7 @@ def classify_wake(facts: WakeFacts, *, move_atr_mult: float, move_pct: float,
     in_position = facts.position_side != "flat"
     conditions = (
         ("candle_close", facts.trigger == "candle"),
+        ("intel_alert", facts.intel is not None),
         ("bar_advanced", bar_advanced),
         ("signal_flip", facts.flip is not None),
         ("resting_order", facts.has_resting),
@@ -165,4 +183,6 @@ def classify_wake(facts: WakeFacts, *, move_atr_mult: float, move_pct: float,
     }
     if facts.flip is not None:      # 缺席即整键不出现（与 tacticalContext / baseRules 同款范式）
         wire["flip"] = facts.flip
+    if facts.intel is not None:     # 同上：非告警轮 wire 逐字节回退 4b9c352
+        wire["intel"] = facts.intel
     return wire

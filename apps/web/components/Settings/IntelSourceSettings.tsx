@@ -35,6 +35,16 @@ function cadenceOf(settings: IntelSettings | null): CadenceDraft {
   };
 }
 
+/** 告警两项的草稿（同上：走草稿 + 显式保存，逐次敲键就 PUT 会发出一串越界的中间态）。 */
+type AlertDraft = { alertCooldownMin: string; alertDailyCap: string };
+
+function alertOf(settings: IntelSettings | null): AlertDraft {
+  return {
+    alertCooldownMin: String(settings?.alertCooldownMin ?? ""),
+    alertDailyCap: String(settings?.alertDailyCap ?? ""),
+  };
+}
+
 /**
  * 设置中心「情报检索源」卡片（ai-trade-market-intel §3.8.5）。
  *
@@ -51,6 +61,7 @@ export default function IntelSourceSettings() {
   const [error, setError] = useState("");
   const [probe, setProbe] = useState<IntelProbeResult | null>(null);
   const [draft, setDraft] = useState<CadenceDraft>(() => cadenceOf(null));
+  const [alertDraft, setAlertDraft] = useState<AlertDraft>(() => alertOf(null));
   const [health, setHealth] = useState<IntelProviderHealth | null>(null);
 
   useEffect(() => {
@@ -59,6 +70,7 @@ export default function IntelSourceSettings() {
       .then((next) => {
         setSettings(next);
         setDraft(cadenceOf(next));
+        setAlertDraft(alertOf(next));
       })
       .catch((err) => setError(err instanceof Error ? err.message : "读取设置失败"));
     // 每源健康是**观测**（closed-loop §3.4.4）：不新建任何表、不新建任何计数器，纯读
@@ -73,6 +85,9 @@ export default function IntelSourceSettings() {
   const dirty =
     settings !== null &&
     JSON.stringify(draft) !== JSON.stringify(cadenceOf(settings));
+  const alertDirty =
+    settings !== null &&
+    JSON.stringify(alertDraft) !== JSON.stringify(alertOf(settings));
 
   const save = async (patch: Partial<IntelSettings> & { apiKey?: string }) => {
     setBusy(true);
@@ -96,9 +111,18 @@ export default function IntelSourceSettings() {
         readerEnabled: patch.readerEnabled,
         readerTopK: patch.readerTopK,
         quoteMode: patch.quoteMode,
+        // actionability：三把总闸 + 三个告警旋钮，同样**逐个透传**（`...patch` 会把
+        // `hasKey` / `estimate` 这些只读键一起 PUT 出去并 422）。
+        alertEnabled: patch.alertEnabled,
+        alertMinImpact: patch.alertMinImpact,
+        alertCooldownMin: patch.alertCooldownMin,
+        alertDailyCap: patch.alertDailyCap,
+        efficacyEnabled: patch.efficacyEnabled,
+        conflictEnabled: patch.conflictEnabled,
       });
       setSettings(next);
       setDraft(cadenceOf(next));
+      setAlertDraft(alertOf(next));
       if (patch.apiKey) setApiKey("");
     } catch (err) {
       setError(err instanceof Error ? err.message : "保存失败");
@@ -326,6 +350,118 @@ export default function IntelSourceSettings() {
       </Card>
 
       <IntelReaderSettings settings={settings} busy={busy} onSave={(patch) => void save(patch)} />
+
+      <Card className="flex flex-col gap-3 p-4" data-testid="intel-alert-settings">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <span className="text-sm font-semibold text-[var(--text)]">
+              高危情报当场唤醒一次决策
+            </span>
+            <span className="text-[11px] leading-relaxed text-[var(--muted)]">
+              一条够格的高危情报（影响力达标 · 类别在范围内 · 有逐字原文引证 · 至少两个独立来源 ·
+              置信度达标 · 事件足够新）会让该标的多问一次 AI——走的是同一个决策轮，
+              共识门禁、风控铁律、成本门禁、仓位层、下单前复核全部照跑，一道不绕。
+              它既不下单，也不改仓位。每一次判定（含「没告警」）都写进情报弹窗的「动态」页签。
+            </span>
+          </div>
+          <Switch
+            checked={settings.alertEnabled}
+            onChange={(checked) => void save({ alertEnabled: checked })}
+            label="启用情报告警唤醒"
+          />
+        </div>
+
+        <div className="grid grid-cols-3 gap-3">
+          <Field label="影响力门槛" htmlFor="intel-alert-impact">
+            <Select
+              id="intel-alert-impact"
+              value={settings.alertMinImpact}
+              disabled={busy || !settings.alertEnabled}
+              onChange={(e) =>
+                void save({ alertMinImpact: e.target.value as "medium" | "high" })}
+            >
+              <option value="high">只有「高」才唤醒（推荐）</option>
+              <option value="medium">「中」及以上都唤醒</option>
+            </Select>
+          </Field>
+          <Field label="冷却（分钟）" htmlFor="intel-alert-cooldown">
+            <Input
+              id="intel-alert-cooldown"
+              type="number"
+              min={1}
+              max={720}
+              value={alertDraft.alertCooldownMin}
+              disabled={busy || !settings.alertEnabled}
+              onChange={(e) =>
+                setAlertDraft((prev) => ({ ...prev, alertCooldownMin: e.target.value }))}
+            />
+          </Field>
+          <Field label="每标的每日上限" htmlFor="intel-alert-cap">
+            <Input
+              id="intel-alert-cap"
+              type="number"
+              min={1}
+              max={48}
+              value={alertDraft.alertDailyCap}
+              disabled={busy || !settings.alertEnabled}
+              onChange={(e) =>
+                setAlertDraft((prev) => ({ ...prev, alertDailyCap: e.target.value }))}
+            />
+          </Field>
+        </div>
+        <div className="flex items-center justify-end gap-2">
+          <Button variant="ghost" size="sm" disabled={busy || !alertDirty}
+                  onClick={() => setAlertDraft(alertOf(settings))}>
+            还原
+          </Button>
+          <Button variant="primary" size="sm" disabled={busy || !alertDirty}
+                  onClick={() => void save({
+                    alertCooldownMin: Number(alertDraft.alertCooldownMin),
+                    alertDailyCap: Number(alertDraft.alertDailyCap),
+                  })}>
+            {busy ? "保存中…" : "保存告警阈值"}
+          </Button>
+        </div>
+
+        {/* 「须有逐字原文引证」是一个**只读的生效值**：`quoteMode="off"` 或抓取关闭时它被系统
+            降级为「不要求」，而用户存下来的偏好一个字节没动。不说清楚这件事，「要求引文 +
+            引文关闭」这个从面板就能走进来的组合会让告警**一次都不发生且没有任何错误**。 */}
+        <span
+          data-testid="intel-alert-require-quote"
+          className={
+            settings.alertRequireQuote
+              ? "text-[11px] text-[var(--muted)]"
+              : "text-[11px] text-[var(--warn)]"
+          }
+        >
+          {settings.alertRequireQuote
+            ? "当前要求：够格的情报必须带一段可核对的原文引证。"
+            : "当前不要求原文引证——因为上面的「引文要求」是「不要求」或原文抓取已关闭。" +
+              "打开其中任一项即自动恢复（你的偏好没有被改写）。"}
+        </span>
+      </Card>
+
+      <Card className="flex flex-col gap-3 p-4" data-testid="intel-actionability-switches">
+        <span className="text-sm font-semibold text-[var(--text)]">情报的战绩与去噪</span>
+        <span className="text-[11px] leading-relaxed text-[var(--muted)]">
+          两把开关都只改变排序与提示，不改变任何一条情报能不能入库、能不能被注入。
+          关掉之后，注入顺序与整理轮的工具定义会逐字节回到没有本功能的样子。
+        </span>
+        <ToggleRow
+          label="用历史战绩给情报排序"
+          hint="按类别聚合「采信之后赚没赚到钱」与「事后被证实还是被证伪」，样本不足时权重恒为 0。它只影响排序与「升长期要写多少理由」，不是门禁。"
+          checked={settings.efficacyEnabled}
+          disabled={busy}
+          onChange={(checked) => void save({ efficacyEnabled: checked })}
+        />
+        <ToggleRow
+          label="标出互相矛盾的情报"
+          hint="同类别、方向相反、主题高度重叠的两条会成对出现在决策 prompt 里，并要求整理轮给出裁决。系统不会自动删除任何一方——哪一条为真，确定性规则判断不了。"
+          checked={settings.conflictEnabled}
+          disabled={busy}
+          onChange={(checked) => void save({ conflictEnabled: checked })}
+        />
+      </Card>
 
       <Card className="flex items-start justify-between gap-3 p-4">
         <div className="flex flex-col gap-0.5">

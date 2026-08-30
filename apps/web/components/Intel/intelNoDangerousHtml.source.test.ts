@@ -29,10 +29,14 @@ describe("components/Intel/**", () => {
   it("扫到了全部情报组件（漏扫等于没扫）", () => {
     const files = sources().map((s) => s.file).sort();
     expect(files).toEqual([
+      "IntelActivityTab.tsx",
+      "IntelAlertRow.tsx",
       "IntelAttributionRail.tsx",
       "IntelBlockSourceDialog.tsx",
       "IntelCard.tsx",
+      "IntelConflictBadge.tsx",
       "IntelEditor.tsx",
+      "IntelEfficacyBlock.tsx",
       "IntelEmptyStates.tsx",
       "IntelEvidenceDrawer.tsx",
       "IntelEvidenceTrigger.tsx",

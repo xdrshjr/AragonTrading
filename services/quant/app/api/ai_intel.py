@@ -69,6 +69,16 @@ async def _require_known_inst(session: AsyncSession, inst_id: str) -> None:
         "message": f"{inst_id} 既不在当前自动交易分组，也不在自选列表里"})
 
 
+async def _effective_limits(session: AsyncSession, settings: Settings):
+    """端点侧的**生效** `IntelLimits`（库内行叠加到 `Settings` 之后）。
+
+    与运行时读的是同一条通路（`resolve_intel_settings` → `limits_from_settings`）：两处各读一份
+    的后果是「面板上关了，可这一页还按开着算」。
+    """
+    derived = await intel_service.resolve_intel_settings(session, settings)
+    return tax.limits_from_settings(derived)
+
+
 # 只有运行时知道的三个瞬态：轮是不是正在飞、本轮降级成什么、这个分组到底有没有装配上检索源。
 # 其余全部是库存事实，必须取**当次查库**的值。
 _RUNTIME_ONLY_KEYS = ("inFlight", "degrade", "providerConfigured")
@@ -84,8 +94,14 @@ async def _summary(session: AsyncSession, inst_id: str, settings: Settings) -> d
     反过来整份查库也不对：`inFlight` 与本轮 `degrade` 在库里根本没有落点。
     """
     cached = intel_runtime.intel_summary_for(inst_id)
+    # ★ 传**派生副本**而不是进程级 `Settings`：`read_summary` 会读 `dailyCap` 与
+    # actionability 的 `efficacy` 块，而这两样都住在 `app_settings` 里、由面板改写。传原始
+    # `Settings` 的后果就是 `_effective_limits` 那段注释写的那一句——「面板上关了，可这一页
+    # 还按开着算」，而且 WS 通路（`build_snapshot` 用的是 `deps.settings`，本来就是派生的）
+    # 与 REST 通路会给出两个不同的答案，两边都不报错。
+    derived = await intel_service.resolve_intel_settings(session, settings)
     fresh = await intel_service.read_summary(
-        session, inst_id, settings=settings,
+        session, inst_id, settings=derived,
         provider_configured=intel_runtime.runtime_for(inst_id) is not None)
     if cached is None:
         return fresh
@@ -261,9 +277,28 @@ async def read_intel_evidence(itemId: int,
 
 @router.get("/intel/{instId}/sources", response_model=IntelSourceListOut)
 async def read_intel_sources(instId: str,
-                             session: AsyncSession = Depends(get_session)) -> dict:
-    """当前库存的域名聚合（域名 / 条数 / 最近一次 / 当前 block|trust 状态，§4.1 #17）。"""
-    return {"rows": await repo.list_intel_source_rows(session, instId)}
+                             session: AsyncSession = Depends(get_session),
+                             settings: Settings = Depends(get_settings)) -> dict:
+    """当前库存的域名聚合 + **每个域名的核查信誉**（§4.1 #17 + actionability 轴 B）。
+
+    「证实 / 证伪 / 准确率」三列是拉黑决策**唯一需要**的数据——上一轮做好了拉黑功能，用户却
+    只能看着 `coindesk.com` 与某个内容农场并排列在这一页上，手里没有任何数据可以决定该拉黑
+    哪一个。样本不足时 `accuracy` 下发 `null`（**不是 0**）。
+    """
+    rows = await repo.list_intel_source_rows(session, instId)
+    limits = await _effective_limits(session, settings)
+    eff = await intel_service.read_efficacy(session, instId, limits=limits, now=time.time())
+    reputation = intel_service.source_reputation_wire(eff, limits=limits)
+    return {"rows": [{**row, **_reputation_of(reputation, row["domain"])} for row in rows]}
+
+
+def _reputation_of(reputation: dict[str, dict], domain: str) -> dict:
+    """一个域名的四个信誉键；没有任何判定样本时 ⇒ 三个 0 + `accuracy=None`。"""
+    stat = reputation.get(domain) or {}
+    return {"confirmed": int(stat.get("confirmed", 0)),
+            "refuted": int(stat.get("refuted", 0)),
+            "unresolved": int(stat.get("unresolved", 0)),
+            "accuracy": stat.get("accuracy")}
 
 
 @router.get("/intel/{instId}")
@@ -287,9 +322,37 @@ async def read_intel(instId: str, tier: str | None = None, category: str | None 
             limit=limit, offset=offset)
         tiers[name] = {"items": items, "total": total}
     counts = await repo.count_intel_by_tier(session, instId)
+    limits = await _effective_limits(session, settings)
+    # actionability 轴 C：矛盾对是**当前库存的函数**，不落库（持久化只会带来陈旧）。本端点
+    # **未挂** `response_model`（模块 docstring 第一条纪律），故可以直接加键。
+    _pairs, conflicts = await intel_service.load_conflicts(
+        session, instId, limits=limits, now=time.time())
     return {"instId": instId, "summary": await _summary(session, instId, settings),
             "tiers": tiers, "archivedTotal": counts["archived"],
-            "mutedTotal": counts["muted"]}
+            "mutedTotal": counts["muted"], "conflicts": conflicts}
+
+
+@router.get("/intel/{instId}/alerts")
+async def read_intel_alerts(instId: str,
+                            limit: int = Query(default=50, ge=1, le=200),
+                            before: int | None = None,
+                            session: AsyncSession = Depends(get_session)) -> dict:
+    """情报告警台账（按 `id` 降序游标分页，actionability §4.1 #1）。
+
+    **含「没告警」的行**：空轮也写一行，因此「今天为什么一次都没告警」永远有答案——那些行的
+    `fired=False` 且带一个抑制码与它的中文文案。
+
+    游标是 `id` 而不是时间戳：同一秒里的多行用时间戳翻页会漏行（沿用 `/citations` 的既有裁决）。
+
+    ⚠️ **本端点刻意不挂 `response_model`**（评审 P2-9）：告警行 wire 上有 `reasons` 这个自由
+    形状的判据明细字典，挂模型只会得到「加了新判据、界面上看不到、也不报错」。`/citations`
+    挂着模型是那一轮的例外，本轮跟随模块 docstring 第一条纪律而不是跟随它。
+
+    **不设总闸**：看自己的告警历史不动任何资金（与 `GET /intel/{instId}` 同一条纪律）。
+    """
+    rows, has_more = await repo.list_intel_alerts(session, inst_id=instId, limit=limit,
+                                                  before=before)
+    return {"alerts": rows, "hasMore": has_more}
 
 
 @router.get("/intel/{instId}/rounds")
@@ -517,13 +580,21 @@ async def mark_intel_seen(instId: str, body: IntelSeenIn | None = None,
 @router.get("/intel/{instId}/impact", response_model=IntelImpactOut)
 async def read_intel_impact(instId: str,
                             limit: int = Query(default=10, ge=1, le=50),
-                            session: AsyncSession = Depends(get_session)) -> dict:
-    """影响力页签的全部读数（§4.1 #18）。
+                            session: AsyncSession = Depends(get_session),
+                            settings: Settings = Depends(get_settings)) -> dict:
+    """影响力页签的全部读数（§4.1 #18 + actionability 轴 B 的「战绩与信誉」块）。
 
     `totals.netPnlUsd` 是**关联**净额：这些数字是**共现**统计，不是因果归因——一笔交易通常
     同时采信了多条证据（R-1）。这条口径必须一路带到 UI 文案上。
+
+    ⚠️ 本端点**挂着** `response_model=IntelImpactOut`（E-19 点名的那一个例外）：新增的
+    `efficacy` 键必须同时出现在模型里，否则被**静默丢弃**（G-23 从 HTTP 响应体断言，
+    不是从仓库函数的返回值）。
     """
-    return await repo.read_intel_impact(session, instId, limit=limit)
+    report = await repo.read_intel_impact(session, instId, limit=limit)
+    limits = await _effective_limits(session, settings)
+    eff = await intel_service.read_efficacy(session, instId, limits=limits, now=time.time())
+    return {**report, "efficacy": intel_service.efficacy_wire(eff, limits=limits)}
 
 
 @router.get("/intel/{instId}/citations", response_model=IntelCitationListOut)

@@ -86,6 +86,9 @@ function summary(over: Partial<AiTradeIntelSummary> = {}): AiTradeIntelSummary {
     citations: { cited: 0, entryCited: 0, settledTrips: 0, winCount: 0, netPnlUsd: 0, neverCited: 0 },
     verify: { confirmed: 0, refuted: 0, unresolved: 0, pending: 0, lastVerifyTs: null },
     quoteHitRate: null,
+    alerts24h: 0,
+    lastAlertTs: null,
+    efficacy: { enabled: false, kMin: 8, sampleN: 0, overall: { settled: 0, wins: 0, netPnlUsd: 0, confirmed: 0, refuted: 0, unresolved: 0, samples: 0, accuracy: null }, byCategory: [] },
     ...over,
   };
 }

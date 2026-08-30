@@ -475,3 +475,68 @@ def test_negative_cache_window_is_derived_not_configured():
     ttl2, negative2 = intel_evidence._cache_windows(
         Settings(ai_trade_intel_reader_cache_ttl_h=24.0))
     assert ttl2 == 24 * 3600.0 and negative2 == 2 * 3600.0
+
+
+# ---------- G-16（ai-trade-intel-actionability）：六把新键逐键往返 ----------
+@pytest.mark.asyncio
+async def test_every_actionability_key_round_trips_through_the_bridge():
+    """判据是 `resolve_intel_settings` 的**产物**，不是「请求没报错」。
+
+    不扩 `INTEL_SETTING_BRIDGE` 的症状是：请求 200、面板上开关照动、`Settings` 上的值**永远
+    不变**，而且不报错——把安全开关做成假开关是最不可接受的一种失败（本仓库已两次前科）。
+    """
+    from app.ai_auto.intel import service as intel_service
+    from app.config import Settings
+    from app.db import repositories as repo
+    from app.db.session import get_sessionmaker, init_db
+
+    await init_db()
+    cases = {
+        "ai_intel.alert_enabled": ("ai_trade_intel_alert_enabled", False),
+        "ai_intel.alert_min_impact": ("ai_trade_intel_alert_min_impact", "medium"),
+        "ai_intel.alert_cooldown_min": ("ai_trade_intel_alert_cooldown_min", 45.0),
+        "ai_intel.alert_daily_cap": ("ai_trade_intel_alert_daily_cap", 12),
+        "ai_intel.efficacy_enabled": ("ai_trade_intel_efficacy_enabled", False),
+        "ai_intel.conflict_enabled": ("ai_trade_intel_conflict_enabled", False),
+    }
+    async with get_sessionmaker()() as session:
+        for app_key, (_field, value) in cases.items():
+            await repo.set_app_setting(session, app_key, value)
+        derived = await intel_service.resolve_intel_settings(session, Settings())
+    for _app_key, (field, value) in cases.items():
+        assert getattr(derived, field) == value, field
+
+
+@pytest.mark.asyncio
+async def test_an_illegal_min_impact_is_dropped_rather_than_passed_through():
+    """`model_copy(update=…)` **不跑校验器**：一个从库内行读回来的坏值会一路穿到 `IntelLimits`，
+    让「影响力门槛」变成一个恒不成立的判据。桥的循环里必须再收一次值域。"""
+    from app.ai_auto.intel import service as intel_service
+    from app.config import Settings
+    from app.db import repositories as repo
+    from app.db.session import get_sessionmaker, init_db
+
+    await init_db()
+    async with get_sessionmaker()() as session:
+        await repo.set_app_setting(session, "ai_intel.alert_min_impact", "low")
+        derived = await intel_service.resolve_intel_settings(session, Settings())
+    assert derived.ai_trade_intel_alert_min_impact == "high", "坏值被丢弃，回落默认"
+
+
+@pytest.mark.asyncio
+async def test_the_settings_wire_carries_the_pending_ttl_so_the_ui_need_not_hardcode_it():
+    """动态页签用它把「还没回」与「再也不会回」分开。
+
+    不下发它，前端只能写死一个数——而它是一个 30–900 的配置项：把它调到 900 的用户会在第
+    180 秒看到一句「会话未在时限内响应」，而后端那一侧还在正常等着。它是**只读**的
+    （不在 `IntelSettingsIn` 里），故这里断言的是「回执上在位且等于生效值」。
+    """
+    from app.api.app_settings import _intel_wire
+    from app.config import Settings
+    from app.db.session import get_sessionmaker, init_db
+
+    await init_db()
+    settings = Settings(ai_trade_intel_alert_pending_ttl_s=600.0)
+    async with get_sessionmaker()() as session:
+        wire = await _intel_wire(session, settings)
+    assert wire["alertPendingTtlS"] == 600.0

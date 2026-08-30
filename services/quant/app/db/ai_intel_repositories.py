@@ -541,6 +541,11 @@ async def apply_intel_curation(session: AsyncSession, actions: list[dict], *,
         elif kind == "merge":
             row.status = "superseded"
             row.supersedes_id = int(action.get("mergeIntoId") or 0) or None
+        elif kind == "keep_both":
+            # ai-trade-intel-actionability 轴 C：**tier 与 status 一个字节不变**（G-21）。
+            # 它是一次**有记录的不作为**——把「模型看过这一对并决定两条都留着」写进
+            # `curation_note`，而不是一次静默的忽略。落库动作只有下面那三行公共赋值。
+            pass
         else:
             continue
         row.curation_note = str(action.get("reason") or "")[:200]

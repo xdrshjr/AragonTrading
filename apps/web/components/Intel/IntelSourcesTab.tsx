@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import clsx from "clsx";
 import { absoluteTime, relativeTime } from "@/lib/intel";
+import { accuracyLabel, sortSourcesByAccuracy } from "@/lib/intelActionability";
 import { sourceStateLabel } from "@/lib/intelClosedLoop";
 import { intelApi } from "@/lib/intelApi";
 import type { IntelFeedbackRow, IntelSourceRow } from "@/lib/intelTypes";
@@ -31,6 +32,10 @@ export default function IntelSourcesTab({
   const [notice, setNotice] = useState("");
   const [blocking, setBlocking] = useState<string>("");
   const [nowMs, setNowMs] = useState(() => Date.now());
+  // 排序开关：默认按条数（既有行为），可切到按准确率——**拉黑决策就在这一页上做**，而
+  // 「谁说过的话事后被证伪得最多」正是它唯一需要的排序。样本不足的行恒排在最后，
+  // 不与真实读数混排（一个用两条样本算出来的 100%，比不显示更容易让人拉黑错的那个源）。
+  const [byAccuracy, setByAccuracy] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -72,17 +77,28 @@ export default function IntelSourcesTab({
   return (
     <div className="flex flex-col gap-3 px-4 py-3" data-testid="intel-sources-tab">
       <section className="flex flex-col gap-1">
-        <h3 className="text-[11px] font-medium text-[var(--text)]">
-          当前库存的来源
-          <span className="ml-1.5 text-[10px] font-normal text-[var(--muted)]">
-            拉黑之后的采集与核查都会跳过它
+        <h3 className="flex items-center justify-between gap-2 text-[11px] font-medium text-[var(--text)]">
+          <span>
+            当前库存的来源
+            <span className="ml-1.5 text-[10px] font-normal text-[var(--muted)]">
+              拉黑之后的采集与核查都会跳过它
+            </span>
           </span>
+          <button
+            type="button"
+            data-testid="intel-sources-sort"
+            aria-pressed={byAccuracy}
+            onClick={() => setByAccuracy((v) => !v)}
+            className="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-normal text-[var(--muted)] outline-none transition-colors hover:bg-[var(--surface-2)] hover:text-[var(--text)] focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+          >
+            {byAccuracy ? "按准确率排序" : "按条数排序"}
+          </button>
         </h3>
         {rows.length === 0 ? (
           <p className="text-[11px] text-[var(--muted)]">本标的的情报库里还没有任何来源。</p>
         ) : (
           <ul className="flex flex-col gap-1">
-            {rows.map((row) => (
+            {(byAccuracy ? sortSourcesByAccuracy(rows) : rows).map((row) => (
               <li
                 key={row.domain}
                 className="flex items-center justify-between gap-2 rounded-[10px] border border-[var(--border)] bg-[var(--bg)] px-2.5 py-1.5"
@@ -91,6 +107,12 @@ export default function IntelSourcesTab({
                   {row.domain}
                   <span className="ml-1.5 text-[10px] text-[var(--muted)]" title={absoluteTime(row.lastTs)}>
                     {row.itemCount} 条 · 最近 {relativeTime(row.lastTs, nowMs)}
+                  </span>
+                  {/* actionability 轴 B：这三列 + 准确率是**拉黑决策唯一需要的数据**。
+                      `accuracy` 为 null ⇒ 「样本不足」，绝不显示一个假的 0%。 */}
+                  <span data-testid="intel-source-reputation" className="ml-1.5 text-[10px] tabular text-[var(--muted)]">
+                    证实 {row.confirmed} · 证伪 {row.refuted} · 待定 {row.unresolved} ·
+                    准确率 {accuracyLabel(row.accuracy)}
                   </span>
                   {row.state && (
                     <span

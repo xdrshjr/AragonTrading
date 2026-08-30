@@ -29,11 +29,11 @@ vi.mock("@/lib/intelApi", () => ({
 beforeEach(() => {
   sourceRows = [
     { domain: "coinmarketwatch.example", itemCount: 3, lastTs: NOW_S - 3600, state: "",
-      stateInstId: "" },
+      stateInstId: "", confirmed: 0, refuted: 0, unresolved: 0, accuracy: null },
     // 这一行的取舍是**全局**的（`stateInstId: ""`），而列表本身是按标的取的 —— 撤销必须按
     // 记录自己的作用域发，否则删不中那一行。
     { domain: "coindesk.com", itemCount: 5, lastTs: NOW_S - 7200, state: "trusted",
-      stateInstId: "" },
+      stateInstId: "", confirmed: 0, refuted: 0, unresolved: 0, accuracy: null },
   ];
   feedbackRows = [
     { id: 1, scope: "domain", key: "coindesk.com", action: "trust", instId: "",
@@ -124,5 +124,48 @@ describe("IntelSourcesTab", () => {
     renderTab();
     expect(await screen.findByText("黑白名单")).toBeInTheDocument();
     expect(screen.getByText(/全局生效/)).toBeInTheDocument();
+  });
+});
+
+describe("信誉三列（ai-trade-intel-actionability 轴 B）", () => {
+  it("每行都带证实 / 证伪 / 待定与准确率——拉黑决策就在这一页上做", async () => {
+    sourceRows = [
+      { domain: "coindesk.com", itemCount: 9, lastTs: NOW_S - 60, state: "",
+        stateInstId: "", confirmed: 8, refuted: 1, unresolved: 2, accuracy: 0.888 },
+    ];
+    render(<IntelSourcesTab instId={INST} onChanged={() => undefined} />);
+    const row = await screen.findByTestId("intel-source-reputation");
+    expect(row.textContent).toContain("证实 8");
+    expect(row.textContent).toContain("证伪 1");
+    expect(row.textContent).toContain("待定 2");
+    expect(row.textContent).toContain("准确率 89%");
+  });
+
+  it("样本不足时写「样本不足」而不是一个用两条样本算出来的 100%", async () => {
+    sourceRows = [
+      { domain: "farm.example", itemCount: 2, lastTs: NOW_S - 60, state: "",
+        stateInstId: "", confirmed: 2, refuted: 0, unresolved: 0, accuracy: null },
+    ];
+    render(<IntelSourcesTab instId={INST} onChanged={() => undefined} />);
+    expect((await screen.findByTestId("intel-source-reputation")).textContent)
+      .toContain("准确率 样本不足");
+  });
+
+  it("排序开关可切到按准确率，样本不足的行恒排最后（不与真实读数混排）", async () => {
+    sourceRows = [
+      { domain: "unknown.example", itemCount: 9, lastTs: 1, state: "", stateInstId: "",
+        confirmed: 0, refuted: 0, unresolved: 0, accuracy: null },
+      { domain: "good.example", itemCount: 2, lastTs: 1, state: "", stateInstId: "",
+        confirmed: 9, refuted: 0, unresolved: 0, accuracy: 1 },
+    ];
+    render(<IntelSourcesTab instId={INST} onChanged={() => undefined} />);
+    const toggle = await screen.findByTestId("intel-sources-sort");
+    expect(toggle).toHaveTextContent("按条数排序");
+    fireEvent.click(toggle);
+    expect(toggle).toHaveTextContent("按准确率排序");
+    const rows = screen.getAllByTestId("intel-source-reputation")
+      .map((node) => node.parentElement?.textContent ?? "");
+    expect(rows[0]).toContain("good.example");
+    expect(rows[1]).toContain("unknown.example");
   });
 });

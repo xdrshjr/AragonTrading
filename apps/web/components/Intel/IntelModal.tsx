@@ -14,9 +14,12 @@ import {
 } from "@/lib/intel";
 import { intelApi } from "@/lib/intelApi";
 import { quoteHitRateLabel } from "@/lib/intelEvidence";
+import { conflictIds } from "@/lib/intelActionability";
 import type {
   AiTradeIntelSummary,
+  IntelAlert,
   IntelCategory,
+  IntelConflict,
   IntelEvidence,
   IntelItem,
   IntelItemInput,
@@ -26,13 +29,13 @@ import type {
   IntelTier,
 } from "@/lib/intelTypes";
 import { useAppStore } from "@/lib/store";
+import IntelActivityTab from "./IntelActivityTab";
 import IntelEditor from "./IntelEditor";
 import { IntelDegradeBanner } from "./IntelEmptyStates";
 import IntelList from "./IntelList";
 import type { IntelCardActions } from "./IntelCard";
 import IntelBlockSourceDialog from "./IntelBlockSourceDialog";
 import IntelImpactTab from "./IntelImpactTab";
-import IntelRoundsTab from "./IntelRoundsTab";
 import IntelSourcesTab from "./IntelSourcesTab";
 
 const CATEGORIES: IntelCategory[] = [
@@ -48,9 +51,11 @@ const CATEGORIES: IntelCategory[] = [
 // 的那一小段——故意慢，5 秒一次不会让一个开着的弹窗变成一个持续的请求源。
 const POLL_MS = 5_000;
 
-type TabKey = IntelTier | "impact" | "sources" | "archived" | "rounds";
-/** 三层 + 影响力 + 信源 + 已归档 + 审计 = 7 个页签（closed-loop §3.7.3）。 */
+type TabKey = IntelTier | "impact" | "sources" | "archived" | "activity";
+/** 三层 + 影响力 + 信源 + 已归档 + 动态 = 7 个页签（actionability §3.4.1：**零新增页签**）。 */
 const LIST_TABS: TabKey[] = ["ultra", "mid", "long", "archived"];
+/** 待处理告警时限（秒）的**回落值**：真值走 `settings.alertPendingTtlS`，写死会与后端判定分叉。 */
+const DEFAULT_ALERT_TTL_S = 180;
 
 /**
  * 标的情报库弹窗（ai-trade-market-intel §3.8.3）。
@@ -85,6 +90,9 @@ export default function IntelModal({
   // 得到的永远是空数组，于是「已归档 N」这个页签会一边报着 N 条、一边什么都不显示。
   const [inactive, setInactive] = useState<IntelItem[]>([]);
   const [rounds, setRounds] = useState<IntelRound[]>([]);
+  const [alerts, setAlerts] = useState<IntelAlert[]>([]);
+  /** 「仅看冲突（N）」筛选（轴 C）。矛盾是条目的属性，故它是一个筛选 chip 而不是第八个页签。 */
+  const [onlyConflicts, setOnlyConflicts] = useState(false);
   const [settings, setSettings] = useState<IntelSettings | null>(null);
   const [blocking, setBlocking] = useState("");
   /** 每次写动作成功后 +1；影响力页签据此重取（它不在 5 秒轮询里）。 */
@@ -173,13 +181,14 @@ export default function IntelModal({
       .catch(() => undefined);
   }, [open, instId, actionToken]);
 
+  // 两条取数**一起发**：只取到一半的时间线会让链路断在中间。
   useEffect(() => {
-    if (!open || tab !== "rounds") return;
-    intelApi
-      .rounds(instId)
-      .then((res) => setRounds(res.rounds))
-      .catch(() => undefined);
-  }, [open, tab, instId]);
+    if (!open || tab !== "activity") return;
+    void Promise.all([
+      intelApi.rounds(instId).then((res) => setRounds(res.rounds)),
+      intelApi.alerts(instId).then((res) => setAlerts(res.alerts)),
+    ]).catch(() => undefined);
+  }, [open, tab, instId, actionToken]);
 
   useEffect(() => {
     if (!open || tab !== "archived") return;
@@ -208,10 +217,23 @@ export default function IntelModal({
       { key: "impact", label: "影响力" },
       { key: "sources", label: "信源" },
       { key: "archived", label: `已归档 ${archived}` },
-      { key: "rounds", label: "整理记录" },
+      // 「整理记录」→「动态」：轮次与告警合流成一条时间线（详见 `IntelActivityTab`）。
+      { key: "activity", label: "动态" },
     ],
     [summary, archived],
   );
+
+  const conflicts: IntelConflict[] = useMemo(() => data?.conflicts ?? [], [data]);
+  const conflicted = useMemo(() => conflictIds(conflicts), [conflicts]);
+  /** 全部层的条目按 id 索引：矛盾对的另一端可能**不在当前这一层**。 */
+  const itemsById = useMemo(() => {
+    const out: Record<number, IntelItem> = {};
+    for (const tier of TIER_ORDER) {
+      for (const item of data?.tiers[tier]?.items ?? []) out[item.id] = item;
+    }
+    for (const item of inactive) out[item.id] = item;
+    return out;
+  }, [data, inactive]);
 
   const visible = useMemo(() => {
     if (!LIST_TABS.includes(tab)) return [];
@@ -220,13 +242,14 @@ export default function IntelModal({
     const needle = query.trim().toLowerCase();
     return source.filter((item) => {
       if (category && item.category !== category) return false;
+      if (onlyConflicts && !conflicted.has(item.id)) return false;
       if (!needle) return true;
       return (
         item.headline.toLowerCase().includes(needle) ||
         item.summary.toLowerCase().includes(needle)
       );
     });
-  }, [data, inactive, tab, category, query]);
+  }, [data, inactive, tab, category, query, onlyConflicts, conflicted]);
 
   const guard = async (run: () => Promise<unknown>) => {
     setBusy(true);
@@ -382,6 +405,13 @@ export default function IntelModal({
                 onClick={() => setCategory(c)}
               />
             ))}
+            {conflicted.size > 0 && (
+              <FilterChip
+                label={`仅看冲突（${conflicted.size}）`}
+                active={onlyConflicts}
+                onClick={() => setOnlyConflicts((v) => !v)}
+              />
+            )}
             {/* 这里用裸 `<input>` 而不是 `ui/Input`：后者是普通函数组件、拿不到 `ref`，而
                 「按 / 聚焦搜索」必须有 ref。样式与 `ui/Input` 同源，只是尺寸收窄到过滤条高度。 */}
             <input
@@ -406,8 +436,14 @@ export default function IntelModal({
         )}
 
         <div className="min-h-0 flex-1 overflow-y-auto">
-          {tab === "rounds" ? (
-            <IntelRoundsTab rounds={rounds} loading={!rounds.length && !data} nowMs={nowMs} />
+          {tab === "activity" ? (
+            <IntelActivityTab
+              rounds={rounds}
+              alerts={alerts}
+              loading={!rounds.length && !alerts.length && !data}
+              nowMs={nowMs}
+              pendingTtlS={settings?.alertPendingTtlS ?? DEFAULT_ALERT_TTL_S}
+            />
           ) : tab === "impact" ? (
             <IntelImpactTab
               instId={instId}
@@ -427,7 +463,7 @@ export default function IntelModal({
               summary={summary}
               loading={data === null}
               archivedView={tab === "archived"}
-              filtered={!!query.trim() || !!category}
+              filtered={!!query.trim() || !!category || onlyConflicts}
               actions={actions}
               nowMs={nowMs}
               onOpenSettings={openSettings}
@@ -435,11 +471,14 @@ export default function IntelModal({
               onClearFilters={() => {
                 setQuery("");
                 setCategory("");
+                setOnlyConflicts(false);
               }}
               evidenceById={evidenceById}
               evidenceLoadingId={evidenceLoadingId}
               evidenceErrors={evidenceErrors}
               blockedDomains={blockedDomains}
+              conflicts={conflicts}
+              itemsById={itemsById}
             />
           )}
         </div>

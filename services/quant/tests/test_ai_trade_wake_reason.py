@@ -1,6 +1,6 @@
 """唤醒原因判定单测（ai-trade-wake-aware-context §6.1 T-4/T-5/T-6/T-22 + 本轮 T-19）。
 
-覆盖：八种 kind 的优先级表、`alsoTrue` 不丢证据、ATR / pct 双判据、价不可信 fail-open、
+覆盖：九种 kind 的优先级表、`alsoTrue` 不丢证据、ATR / pct 双判据、价不可信 fail-open、
 **`horizon_scale` 校准（T-22，P0-2）**、`signal_flip` 的优先级与 `flip` 键缺席回退。纯函数，无 IO。
 """
 from __future__ import annotations
@@ -29,9 +29,10 @@ _FLIP = {"netStanceFrom": "flat", "netStanceTo": "long",
          "provisional": True, "heldS": 47.3, "samples": 4, "barTs": 1_785_600_000}
 
 
-# ---------- T-4 / T-19：八态优先级 ----------
+# ---------- T-4 / T-19：九态优先级 ----------
 @pytest.mark.parametrize(("overrides", "expected"), [
     ({"trigger": "candle"}, "candle_close"),
+    ({"intel": {"itemId": 7, "ref": "I01"}}, "intel_alert"),
     ({"bar_index": 9}, "bar_advanced"),
     ({"flip": _FLIP}, "signal_flip"),
     ({"has_resting": True, "resting_age_s": 240.0}, "resting_order"),
@@ -48,8 +49,70 @@ def test_classify_wake_priority_table(overrides, expected):
 
 def test_every_declared_kind_is_reachable():
     assert set(WAKE_KINDS) == {
-        "candle_close", "bar_advanced", "signal_flip", "resting_order", "profit_tier",
-        "price_breakout", "position_watch", "heartbeat"}
+        "candle_close", "intel_alert", "bar_advanced", "signal_flip", "resting_order",
+        "profit_tier", "price_breakout", "position_watch", "heartbeat"}
+
+
+# ---------- G-9（后端一侧）：九组注册表的并集断言 ----------
+def test_every_wake_kind_is_registered_in_all_backend_tables():
+    """`WAKE_KINDS` 与四张后端表**逐值一致**（ai-trade-intel-actionability G-9）。
+
+    四处漏掉都**不报错**：`conditions` 少一条 ⇒ 判定永远落不到那个 kind；`_WAKE_BODY` 少一条
+    ⇒ `format_wake_for_prompt` 直接返回空串（**整段唤醒句连同 alsoTrue 一起消失**）；
+    `_ALSO_TRUE_LABEL` 少一条 ⇒ 该项被列表推导**静默过滤掉**（证据消失比裸 slug 更难发现）；
+    `VALUE_LABEL_ZH` 少一条 ⇒ 经验图节点标签是裸 slug。
+    """
+    from app.ai_auto.experience.taxonomy import VALUE_LABEL_ZH
+    from app.ai_auto.wake_text import _ALSO_TRUE_LABEL, _WAKE_BODY
+
+    kinds = set(WAKE_KINDS)
+    # `conditions` 的名字集合：`heartbeat` 是兜底态，不在 `conditions` 里。
+    fired = {name for name, _ok in _conditions_names()}
+    assert fired | {"heartbeat"} == kinds
+    assert set(_WAKE_BODY) == kinds
+    # `_ALSO_TRUE_LABEL` 不含 `heartbeat`：兜底态永远不会作为「同时成立项」出现。
+    assert set(_ALSO_TRUE_LABEL) | {"heartbeat"} == kinds
+    assert kinds <= set(VALUE_LABEL_ZH)
+
+
+def _conditions_names() -> list[tuple[str, bool]]:
+    """把 `classify_wake` 里那张 `conditions` 元组的名字集合抠出来（同一个真源）。"""
+    import inspect
+    import re
+
+    from app.ai_auto import wake_reason
+
+    source = inspect.getsource(wake_reason.classify_wake)
+    block = source.split("conditions = (", 1)[1].split("\n    )", 1)[0]
+    return [(name, True) for name in re.findall(r'\("([a-z_]+)",', block)]
+
+
+def test_intel_alert_is_a_full_tier_kind_but_not_an_execution_full_kind():
+    """§3.1.5 #4：升档集加它、执行周期全量披露集**不加**（后者「刻意不增」）。"""
+    from app.ai_auto.tactical_context import _EXECUTION_FULL_KINDS, _FULL_TIER_KINDS
+
+    assert "intel_alert" in _FULL_TIER_KINDS
+    assert "intel_alert" not in _EXECUTION_FULL_KINDS
+
+
+def test_intel_key_is_absent_entirely_when_there_is_no_alert():
+    """非告警轮 wire **无 `intel` 键**（不是 None）⇒ 逐字节回退 4b9c352 的 payload。"""
+    payload = {"itemId": 7, "ref": "I01"}
+    assert "intel" not in _classify(_steady())
+    assert _classify(_steady(intel=payload))["intel"] is payload
+
+
+def test_intel_alert_outranks_bar_advanced_but_yields_to_a_real_candle_close():
+    """插位：`candle_close` 之后、`bar_advanced` 之前（§3.1.6 / Q2 的裁决）。
+
+    第二条断言是那条算术依据的另一半：告警自己认领的那一轮 `trigger` 恒为 `"interval"`，
+    故 `candle_close` 在**那一轮里**恒不成立，`intel_alert` 恒为首位。
+    """
+    payload = {"itemId": 7}
+    wake = _classify(_steady(bar_index=9, intel=payload))
+    assert wake["kind"] == "intel_alert"
+    assert "bar_advanced" in wake["alsoTrue"]          # 判定只决定标签，绝不丢证据
+    assert _classify(_steady(trigger="candle", intel=payload))["kind"] == "candle_close"
 
 
 # ---------- 本轮轴 C：signal_flip 的插位与 flip 键的加法性 ----------

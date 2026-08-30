@@ -7,7 +7,11 @@ import { verdictNoRefNote, verifyRoundSummary } from "@/lib/intelClosedLoop";
 import type { IntelRound } from "@/lib/intelTypes";
 
 // 拒收码 / 动作码 → 中文。**只做展示层翻译**，判据与计数全部来自后端的直方图。
-const CODE_LABEL: Record<string, string> = {
+//
+// ⚠️ **`export` 是刻意的、也是单一真源**（intel-actionability 评审 P2-5）：「动态」页签
+// （`IntelActivityTab`）渲染的是同一批码，它 **import 这一份**而不是抄第二份——两张表各解析
+// 一次同一个后端常量，第二天就会有一份被改坏而没人发现。
+export const CODE_LABEL: Record<string, string> = {
   bad_ref: "引用了不存在的语料编号",
   unsourced_number: "数字在被引用文档中找不到",
   too_long: "标题或摘要超长",
@@ -55,6 +59,14 @@ const CODE_LABEL: Record<string, string> = {
   need_quote: "升长期需要可核对的原文引证（被驳回）",
   refute_without_quote: "证伪未附原文引证，已降为待定",
   documents_pruned: "正文缓存到期清理",
+  // ---- ai-trade-intel-actionability 的新码（后端三张 tuple 的并集 ⊆ 本表，G-24 冻结）----
+  promote_weak_record: "该类别历史战绩为负，升长期的理由不足（被驳回）",
+  keep_both_bad_pair: "两条并不构成本轮列出的矛盾对（被驳回）",
+  keep_both_thin_note: "宣布两条可同时成立，理由不足（被驳回）",
+  keep_both: "保留双方（有记录的不作为）",
+  conflictsOpen: "本轮开始时未裁决的矛盾对",
+  conflictsResolved: "本轮之后不再成对的矛盾对",
+  alerts_pruned: "告警台账到期裁剪",
 };
 
 // 降级码 → 中文。轮存根里的 `degradeCode` 是一个**裸码**（summary 里那份才带后端下发的
@@ -130,7 +142,11 @@ export default function IntelRoundsTab({
   );
 }
 
-function RoundRow({ round, nowMs }: { round: IntelRound; nowMs: number }) {
+/**
+ * 一行轮次存根。**导出**供「动态」页签复用——那一屏把轮次与告警合流成一条时间线，而轮次行的
+ * 渲染必须是同一份（抄第二份就等于让两屏在下一次改版里各说各的）。
+ */
+export function RoundRow({ round, nowMs }: { round: IntelRound; nowMs: number }) {
   const [open, setOpen] = useState(false);
   const histogram = round.kind === "collect" ? round.rejects : round.actions;
   const entries = Object.entries(histogram || {}).filter(([, n]) => n > 0);

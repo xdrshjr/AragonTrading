@@ -1123,6 +1123,20 @@ from .ai_intel_citation_repositories import (  # noqa: E402,F401
     sweep_blocked_source_items,
 )
 
+# ai_intel_alert_repositories：情报告警台账（ai-trade-intel-actionability §5.1；同样是「不让
+# 既有三个情报数据层越 800 线」的处置）。同一条再导出纪律适用：漏一个是静默空转，不是
+# ImportError。
+from .ai_intel_alert_repositories import (  # noqa: E402,F401
+    alert_cooldown_state,
+    count_recent_alerts,
+    intel_alert_out,
+    list_intel_alerts,
+    mark_intel_alert_outcome,
+    prune_intel_alerts,
+    stamp_intel_alert_digest,
+    write_intel_alert,
+)
+
 # ai_intel_evidence_repositories：网页正文缓存 + 逐字引文
 # （ai-trade-intel-evidence-grounding §5.1/§5.2；同样是「不让既有两个情报数据层越 800 线」的
 # 处置）。同一条再导出纪律适用：漏一个是静默空转，不是 ImportError。

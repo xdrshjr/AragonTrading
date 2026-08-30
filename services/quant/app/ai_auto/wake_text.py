@@ -13,10 +13,13 @@
 """
 from __future__ import annotations
 
+# ⚠️ 渲染是 `[_ALSO_TRUE_LABEL[name] for name in ... if name in _ALSO_TRUE_LABEL]`：不认识的键
+# 被**直接过滤掉**。漏登记的症状因此不是「显示一个裸 slug」而是**证据静默消失**，比前者更难发现
+# （intel-actionability 评审 P2-3）。G-9 的后端并集断言覆盖它。
 _ALSO_TRUE_LABEL = {
-    "candle_close": "新 K 线收盘", "bar_advanced": "补看新 K 线", "signal_flip": "立场翻转",
-    "resting_order": "挂单盯守", "profit_tier": "浮盈跨档", "price_breakout": "价格异动",
-    "position_watch": "持仓盯市",
+    "candle_close": "新 K 线收盘", "intel_alert": "情报告警", "bar_advanced": "补看新 K 线",
+    "signal_flip": "立场翻转", "resting_order": "挂单盯守", "profit_tier": "浮盈跨档",
+    "price_breakout": "价格异动", "position_watch": "持仓盯市",
 }
 _TRUNCATION_HINT = "…（战术周期证据已按 {max_chars} 字上限截断）"
 
@@ -117,6 +120,43 @@ def _wake_signal_flip(wake: dict) -> str:
             "请把它当作择时线索而非既成事实")
 
 
+def _wake_intel_alert(wake: dict) -> str:
+    """情报告警轮的唤醒句（intel-actionability §4.3）。**必须两态**（评审 P0-3）。
+
+    「这条情报有编号」与「这条情报真的出现在 prompt 里」**不是同一件事**。两条独立路径会让
+    「详见下方情报段」变成一句假话：① `_TIER_RANK` 让注入排序 long 在最前、ultra 在最后，而
+    `prompt_max_chars` 默认只装得下 ~5–6 行、长期层上限却有 16 条 ⇒ 长期层攒到 6 条 active 之后
+    告警条目在**稳态上**就进不了 prompt；② `inject_enabled=False` 时情报段整段不存在。
+
+    故 `inDigest=False` 时**把摘要就地内联进唤醒句**，并如实说明它为什么不在下面。把一句确定
+    错误的话逐字写进一次**真实资金**决策的 prompt 首行，是本仓库栽过的那一类错误里最坏的一种。
+    """
+    intel = wake.get("intel") or {}
+    ref = intel.get("ref") or ""
+    label = intel.get("label") or "市场情报"
+    meta = f"{label}｜{intel.get('domainCount', 0)} 源｜{_age_text(intel.get('ageMin'))}"
+    head = f"[{ref}]｜{meta}" if ref else meta
+    headline = intel.get("headline") or ""
+    tail = ("请在推理中明确说明你是否采信它、以及它如何改变（或不改变）你的结论")
+    if intel.get("inDigest"):
+        return (f"高危市场情报（{head}）：{headline}。"
+                f"该情报已在下方情报段中列出；{tail}")
+    summary = intel.get("summary") or ""
+    body = f"{headline} —— {summary}" if summary else headline
+    return (f"高危市场情报（{head}）：{body}。"
+            "**该情报未出现在下方情报段中**（情报段已达长度上限或注入已关闭），"
+            f"本段就是你能看到的全部内容；{tail}")
+
+
+def _age_text(age_min) -> str:
+    """事件年龄（分钟）→ 中文；未来事件说「N 分钟后」，缺失说「时间未知」（绝不假数据）。"""
+    if not isinstance(age_min, (int, float)):
+        return "时间未知"
+    span = abs(float(age_min))
+    text = f"{span / 60:.0f} 小时" if span >= 60 else f"{max(1, int(span))} 分钟"
+    return f"{text}后" if age_min < 0 else f"{text}前"
+
+
 def _backlog_clause(wake: dict) -> str:
     """补跑子句（追加在任意 kind 的原因之后，**只在 `backlog` 存在时**出现）。
 
@@ -168,8 +208,11 @@ def _wake_heartbeat(wake: dict) -> str:
             "——**若**本轮证据确与上轮相同，重复数据下的观望不构成新的独立证据）")
 
 
+# ⚠️ 缺一个键的症状是 `_WAKE_BODY.get(kind)` 为 None ⇒ `format_wake_for_prompt` 直接
+# `return ""` ⇒ **整段唤醒句连同 `alsoTrue` 与 backlog 子句一起消失**，而不是少一句话。
 _WAKE_BODY = {
     "candle_close": _wake_candle_close,
+    "intel_alert": _wake_intel_alert,
     "bar_advanced": _wake_bar_advanced,
     "signal_flip": _wake_signal_flip,
     "resting_order": _wake_resting_order,

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
-import { AXIS_LABEL_ZH, VALUE_LABEL_ZH } from "./experience";
+import { AXIS_LABEL_ZH, AXIS_VALUES, VALUE_LABEL_ZH } from "./experience";
 
 // 门禁 G-7 · 前后端中文词表同步（ai-trade-experience-context-graph §4.2）。
 //
@@ -14,6 +14,12 @@ import { AXIS_LABEL_ZH, VALUE_LABEL_ZH } from "./experience";
 
 const TAXONOMY = path.resolve(
   __dirname, "..", "..", "..", "services", "quant", "app", "ai_auto", "experience", "taxonomy.py",
+);
+// 九组唤醒注册表里**只有 `AXIS_VALUES.wake` 真正静默**（#6/#7 由 tsc 强制、#5+#8 由本文件的
+// 前两条 `it` 双向兜住）。G-9 的前端一侧因此**扩这条既有用例**而不是新建第二条源码扫描——
+// 同一个 Python 常量被两条用例各解析一次，第二天就会有一条被改坏而没人发现。
+const WAKE_REASON = path.resolve(
+  __dirname, "..", "..", "..", "services", "quant", "app", "ai_auto", "wake_reason.py",
 );
 
 /** 从 Python 常量表里解析 `"key": "值",` 对（只认单行形式，与源文件写法一致）。 */
@@ -58,6 +64,22 @@ describe("前后端中文词表同步（G-7）", () => {
       .filter(([key, label]) => VALUE_LABEL_ZH[key] !== label);
     expect(missing).toEqual([]);
     expect(VALUE_LABEL_ZH.position_watch).toBe("持仓盯市");
+  });
+
+  it("AXIS_VALUES.wake 覆盖后端全部 WAKE_KINDS（G-9 前端一侧）", () => {
+    // 漏一个值的症状：**经验图预演选择器里根本选不到那一类**，而 tsc / vitest 都不会红
+    // ——`AXIS_VALUES` 是 `Record<string, string[]>`，多一个少一个都合法。
+    // core.autocrlf=true。跨行正则写成 CR 可选 + LF 的形态，否则干净检出上恒红。
+    const source = fs.readFileSync(WAKE_REASON, "utf8");
+    const block = /WAKE_KINDS = \(([\s\S]*?)\)/.exec(source);
+    if (!block) throw new Error("wake_reason.py 里找不到 WAKE_KINDS——这条门禁会假绿");
+    const kinds = Array.from(block[1].matchAll(/"([a-z_]+)"/g)).map((m) => m[1]);
+    expect(kinds.length).toBeGreaterThan(5);      // 先证明真的解析到了东西
+    const declared = new Set(AXIS_VALUES.wake);
+    expect(kinds.filter((kind) => !declared.has(kind))).toEqual([]);
+    expect(declared.has("unknown")).toBe(true);
+    // 反向：前端多出来的那一条永远匹配不到任何一条经验样本。
+    expect(AXIS_VALUES.wake.filter((v) => v !== "unknown" && !kinds.includes(v))).toEqual([]);
   });
 
   it("前端没有多出后端不认识的取值（多出来的那一条永远匹配不到任何东西）", () => {

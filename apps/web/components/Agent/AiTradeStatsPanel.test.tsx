@@ -233,11 +233,26 @@ describe("AiTradeStatsPanel", () => {
     expect(strip.getAttribute("title")).toMatch(/不等于「系统漏掉了这么多次决策」/);
   });
 
+  // ai-trade-intel-actionability §3.4.4 (d)：两个新计数的**唯一展示点**。G-17 的前端一侧。
+  it("renders the intel-alert wake / drop counters with their caliber in the tooltip", () => {
+    const group = makeGroup();
+    group.members["BTC-USDT-SWAP"].session = sessionRow({
+      wakeSkips: 0, wakeDrops: 0, wakeCatchups: 0, positionWatchSkips: 0,
+      signalFlipWakes: 0, intelAlertWakes: 3, intelAlertDrops: 1,
+    });
+    useAppStore.setState({ aiTradeGroup: group });
+    renderPanel();
+    const strip = within(screen.getByRole("dialog")).getByTestId("wake-scheduler-counts");
+    expect(strip).toHaveTextContent("情报唤 3/1");
+    expect(strip.getAttribute("title")).toMatch(/两者口径不同，不要相加/);
+  });
+
   it("hides the wake-scheduler counters entirely when every counter is zero", () => {
     // 轴未生效的会话不该看到一排 0——那会被读成「统计坏了」（与老记录缺键即整行隐藏同款纪律）。
     const group = makeGroup();
     group.members["BTC-USDT-SWAP"].session = sessionRow({
       wakeSkips: 5, wakeDrops: 0, wakeCatchups: 0, positionWatchSkips: 0, signalFlipWakes: 0,
+      intelAlertWakes: 0, intelAlertDrops: 0,
     });
     useAppStore.setState({ aiTradeGroup: group });
     renderPanel();

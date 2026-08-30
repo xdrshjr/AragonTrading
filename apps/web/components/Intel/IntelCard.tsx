@@ -16,11 +16,13 @@ import {
 import { REFUTED_WARNING } from "@/lib/intelClosedLoop";
 import type {
   AiTradeIntelSummary,
+  IntelConflict,
   IntelEvidence,
   IntelItem,
   IntelTier,
 } from "@/lib/intelTypes";
 import IntelAttributionRail from "./IntelAttributionRail";
+import IntelConflictBadge from "./IntelConflictBadge";
 import IntelEvidenceDrawer from "./IntelEvidenceDrawer";
 import IntelEvidenceTrigger from "./IntelEvidenceTrigger";
 import IntelSourceChips from "./IntelSourceChips";
@@ -73,11 +75,17 @@ export default function IntelCard({
   evidenceLoading = false,
   evidenceError = "",
   blockedDomains = [],
+  conflict,
+  conflictPartner,
 }: {
   item: IntelItem;
   summary: AiTradeIntelSummary | null;
   actions: IntelCardActions;
   nowMs: number;
+  /** 这一条所属的矛盾对；缺省 ⇒ **徽标整枚不渲染**（老后端 / 总闸关时逐字节回退）。 */
+  conflict?: IntelConflict;
+  /** 矛盾对的另一端（只用于悬浮说明里那句「与「…」冲突」）。 */
+  conflictPartner?: IntelItem;
   /** 该条目的证据（`undefined` = 还没取过）。 */
   evidence?: IntelEvidence | null;
   evidenceLoading?: boolean;
@@ -129,6 +137,9 @@ export default function IntelCard({
             {item.userEdited && " · 用户编辑"}
             {item.isScheduled && " · 已排期"}
           </span>
+          {/* 矛盾徽标紧跟在「方向 · 类别 · 影响力」之后：它回答的是同一个问题的另一半——
+              「这条的方向可信吗」。挂在动作区旁边会被 hover 显形的那组按钮盖住。 */}
+          <IntelConflictBadge item={item} pair={conflict} partner={conflictPartner} />
         </span>
         <span
           className="shrink-0 text-[10px] tabular text-[var(--muted)]"

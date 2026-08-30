@@ -1485,7 +1485,8 @@ class AiTradeManager:
                 # 注入假客户端，把工厂换到别处解析会一次性打翻它们全部（E-5）。
                 make_client=make_llm_client_from_config, bar=group.bar,
                 change_24h_pct=partial(self._intel_change_pct, group.group_id),
-                notify=partial(self._on_intel_summary, group.group_id))
+                notify=partial(self._on_intel_summary, group.group_id),
+                notify_alert=partial(self._on_intel_alert, group.group_id))
             intel_runtime.register(runtime)
             intel_scheduler.start(runtime)
         except Exception as exc:  # noqa: BLE001 —— 见 docstring
@@ -1518,6 +1519,20 @@ class AiTradeManager:
         if member is None:
             return
         intel_scheduler.schedule(member.session.push_intel(summary))
+
+    def _on_intel_alert(self, group_id: str, inst_id: str, handoff) -> None:
+        """告警的第三跳（**同步回调，不 await**）：逐行镜像 `_on_intel_summary`。
+
+        `note_intel_alert` 是一个同步 setter，故这里连 `intel_scheduler.schedule` 都不需要——
+        `_on_intel_summary` 之所以要排一个任务，是因为 `push_intel` 是协程（要走 WS 出口）。
+        """
+        group = self._group
+        if group is None or group.group_id != group_id:
+            return
+        member = next((m for m in group.members if m.inst_id == inst_id), None)
+        if member is None:
+            return
+        member.session.note_intel_alert(handoff)
 
     async def drain_intel_tasks(self) -> None:
         """关停链的一步（`main._shutdown_steps()` 的第 7 步）：先 cancel、再有界收敛。

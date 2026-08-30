@@ -109,12 +109,86 @@ REVIEW_REJECT_CODES: tuple[str, ...] = (
     "truncated_actions",
     # evidence-grounding §3.2.4：仅 strict —— 升长期额外要求一条可核对的原文引证。
     "need_quote",
+    # ---- ai-trade-intel-actionability §5.2 的三个新驳回码 ----
+    # ⚠️ 与上面那七个同一条纪律：必须与前端 `IntelRoundsTab.tsx` 的 `CODE_LABEL` 并集对齐
+    # （G-24），漏登记不报错，症状是用户在动态页签上看到一个裸码。
+    "promote_weak_record",     # 轴 B：目标类别历史战绩为负，升长期的理由写得太短
+    "keep_both_bad_pair",      # 轴 C：`keep_both` 的两个 id 不构成本轮列出的矛盾对
+    "keep_both_thin_note",     # 轴 C：`keep_both` 的理由短于 `KEEP_BOTH_MIN_REASON_CHARS`
 )
+
+# ---------------- 整理动作的值域（ai-trade-intel-actionability §5.2） ----------------
+# ★ 本轮之前**没有**这张表：动作枚举手写在 `prompts.build_curate_tool_schema` 的 JSON schema 里，
+# 而 `gate.CurationAction.action` 只有一行注释镜像它。新建单一真源并让 schema 从它生成。
+# **元素顺序必须逐字保持**，否则工具 schema 的字节会变（G-27 用 sha256 冻结「未加 `keep_both`
+# 时 schema 与合入前逐字节相同」）。
+#
+# ⚠️ **拆成两个名字，不是一个**（评审 P0-4）：`keep_both` 是轴 C 的产物，而 §3.0 第 2 条要求
+# `conflict_enabled=False` 时整理链路逐字节回到 4b9c352。一个无条件含 `keep_both` 的元组会让
+# 那条自我约束被本特性自己破坏——工具 schema 的枚举多一项，模型可以发出一个必然被
+# `keep_both_bad_pair` 驳回的动作，白占一个 `curate_max_actions` 名额。
+# 两个名字仍然只有一个真源：后者由前者拼出，**顺序天然保持**。
+CURATE_ACTIONS_BASE: tuple[str, ...] = ("promote", "demote", "archive", "merge", "keep")
+CURATE_ACTIONS: tuple[str, ...] = CURATE_ACTIONS_BASE + ("keep_both",)
+
+# ---------------- 告警台账的两组码与两张中文表（ai-trade-intel-actionability §5.2） ----------------
+# 抑制码：一次告警判定**为什么没发**。空轮也写一行 ⇒「今天为什么一次都没告警」永远有答案。
+ALERT_SUPPRESS_CODES: tuple[str, ...] = (
+    "disabled", "no_candidate", "daily_cap", "cooldown",
+    "impact_below_bar", "category_out", "refuted",
+    "scheduled_future", "stale_event", "few_domains",
+    "low_confidence", "no_quote",
+)
+# 结果码：一条**已发出**的告警最终变成了什么。由会话侧经 `note_alert_outcome` 回写。
+ALERT_OUTCOMES: tuple[str, ...] = (
+    "woke", "deferred", "superseded", "dropped_not_running",
+    "dropped_feed_stale", "dropped_no_board", "dropped_expired",
+)
+# 两张文案表**由后端下发**（进 wire），与 `DEGRADE_TEXT` 同一条裁决：进 wire 的文案由后端管，
+# 只在轮存根直方图里出现的码由前端 `CODE_LABEL` 管。不这么做就是第三次「后端加了码、前端没
+# 登记、用户看到裸 slug」。
+ALERT_SUPPRESS_LABELS: dict[str, str] = {
+    "disabled": "情报告警已在设置中关闭",
+    "no_candidate": "本轮没有任何新情报",
+    "daily_cap": "今日告警额度已用尽",
+    "cooldown": "距上次告警不足冷却时间",
+    "impact_below_bar": "影响力未达门槛",
+    "category_out": "类别不在告警范围内",
+    "refuted": "该情报已被核查证伪",
+    "scheduled_future": "已排期的未来事件不打断决策",
+    "stale_event": "事件时刻过旧",
+    "few_domains": "独立来源数不足",
+    "low_confidence": "置信度未达门槛",
+    "no_quote": "缺少可核对的原文引证",
+}
+ALERT_OUTCOME_LABELS: dict[str, str] = {
+    "woke": "已唤醒一轮决策",
+    "deferred": "上一轮决策仍在进行，已推迟",
+    "superseded": "被一条更重要的告警覆盖",
+    "dropped_not_running": "会话未在运行，已丢弃",
+    "dropped_feed_stale": "行情通道降级，已丢弃",
+    "dropped_no_board": "尚无信号板，已丢弃",
+    "dropped_expired": "超过待处理时限，已丢弃",
+}
+# `alert_min_impact` 的值域。**不复用 `IMPACTS`**：`low` 不是一个合法的告警门槛
+# （`IMPACT_W["low"] == 0.0` 会让「低影响力恒不告警」成为一条算术性质，见 `alert.severity`）。
+MIN_IMPACTS: tuple[str, ...] = ("medium", "high")
+
+
+def alert_suppress_label(code: str) -> str:
+    """抑制码 → 中文一句话（未知码回落成一句诚实的「未知」而不是空串）。"""
+    return ALERT_SUPPRESS_LABELS.get(code) or (f"未告警（{code}）" if code else "")
+
+
+def alert_outcome_label(code: str) -> str:
+    """结果码 → 中文一句话；``""``（尚无结果）回空串，由展示层决定说哪一句。"""
+    return ALERT_OUTCOME_LABELS.get(code) or (f"未知结果（{code}）" if code else "")
 
 # 拒收码的**中文文案不在后端**：轮存根里落的是直方图（码 → 条数），文案在展示层
 # （`components/Intel/IntelRoundsTab.tsx` 的 `CODE_LABEL`，它还要翻译复核驳回码与清理码）。
 # 这里再写一份只会得到一张没有任何读点、也因此永远不会被发现已经漂移的表。
 # （降级码是另一回事：它的文案进 `AiTradeIntelSummary` 的 wire，故必须由后端下发。）
+
 
 # ---------------- 降级码 → 中文文案（单一真源，§3.7.4） ----------------
 # 后端下发 `message`，前端**不再二次编**——两处各写一份文案必漂移，而这块面板的全部价值就在于
@@ -280,6 +354,28 @@ class IntelLimits:
     # 单篇喂进 prompt 的正文上限。**与入库正文上限刻意不同**：prompt 要省 token，比对要全文
     # ——一段引文可能来自文章第 8000 字，而 `verify_one` 的 haystack 取的是**长版本**。
     body_per_doc_chars: int = 2400
+    # ---- ai-trade-intel-actionability 的 16 个新阈值（告警 10 + 战绩 4 + 矛盾 2）----
+    # **刻意不新建 `AlertLimits` / `EfficacyLimits` / `ConflictLimits` 三个家族**（评审 P1-2）：
+    # `alert.py` 必须 import 本模块的 `IMPACT_W`，若本模块反向 import 一个 `alert.AlertLimits`
+    # 就是一次循环 import。三个新纯核心因此**只 import taxonomy、不被 taxonomy import**。
+    # 三把总闸也走这条路（评审 P1-9）：纯核心从不 `getattr(settings, …)`。
+    # 全部带默认值 ⇒ 既有构造零改动。
+    alert_enabled: bool = False
+    alert_min_impact: str = "high"            # "medium" | "high"
+    alert_categories: frozenset[str] = frozenset({"risk", "macro", "project"})
+    alert_require_quote: bool = True          # 生效值由 `resolve_require_quote` 降级
+    alert_min_domains: int = 2
+    alert_min_confidence: float = 0.6
+    alert_max_event_age_min: float = 180.0
+    alert_cooldown_min: float = 20.0
+    alert_daily_cap: int = 6
+    alert_allow_scheduled: bool = False       # 未来事件（is_scheduled）默认不告警
+    efficacy_enabled: bool = False
+    efficacy_k_min: int = 8                   # 层级收缩强度（伪计数）
+    efficacy_max_weight: float = 0.25         # 先验对 `score_item` 的绝对封顶
+    efficacy_min_domain_samples: int = 3      # 域名信誉的最小样本，低于它显示「样本不足」
+    conflict_enabled: bool = False
+    conflict_min_overlap: float = 0.35        # 主题重叠阈值（Jaccard）
 
     def __post_init__(self) -> None:
         if self.ttl_s is None:
@@ -311,6 +407,44 @@ def resolve_quote_mode(settings) -> str:
     if mode == "strict" and not bool(getattr(settings, "ai_trade_intel_reader_enabled", True)):
         return "soft"
     return mode
+
+
+def resolve_require_quote(settings) -> bool:
+    """`Settings` → 告警「须有逐字引文」的**生效值**（actionability §3.1.1.1）。
+
+    与 `resolve_quote_mode` **并列**放在本模块，而不是在 `alert.py` 里另开第二处：「生效值读点」
+    在本仓库已经有唯一归属地，再开一处只会让下一个人两边找，而「两处各读一次同一件事」正是
+    本轮要修的那类缺陷本身（评审 P2-8）。
+
+    `require_quote=True` 与 `quote_mode="off"`（或 `reader_enabled=False`）组合时 `quoted` 恒为
+    False ⇒ **一次告警都不会发生，且没有任何错误**。两把单键各自独立地写进 `app_settings`，而
+    `model_copy(update=…)` 不跑校验器，故用户完全可以从设置面板走进这个坏状态（与上一轮终审的
+    `EG-FINAL-2` 同形）。修法逐行照抄那一次：在**唯一**的生效值读点上降级为 ``False``，
+    **存储的偏好一个字节不改**（重新打开引文要求即恢复）。
+
+    Args:
+        settings: 运行时生效的 `Settings`（`resolve_intel_settings` 的派生副本）。
+
+    Returns:
+        告警判据 #11 真正会用的那个布尔值。
+    """
+    if not bool(getattr(settings, "ai_trade_intel_alert_require_quote", True)):
+        return False
+    if resolve_quote_mode(settings) == "off":
+        return False
+    # `reader_enabled=False` 同样降级（G-6 逐字要求）。没有正文时引文只能靠 snippet 命中，
+    # 命中率低到让「有逐字引证」这条判据实际上把告警**系统性归零**——而它在界面上与
+    # 「今天真的没有够格的情报」不可区分，正是本节要拦的那个坏状态。
+    return bool(getattr(settings, "ai_trade_intel_reader_enabled", True))
+
+
+def _alert_categories(settings) -> frozenset[str]:
+    """`"risk,macro,project"` → 类别集合（空串 ⇒ **全类别**，值域外的元素直接丢弃）。"""
+    raw = str(getattr(settings, "ai_trade_intel_alert_categories", "") or "").strip()
+    if not raw:
+        return frozenset(CATEGORIES)
+    picked = {part.strip() for part in raw.split(",") if part.strip()}
+    return frozenset(picked & set(CATEGORIES)) or frozenset(CATEGORIES)
 
 
 def limits_from_settings(settings) -> IntelLimits:
@@ -354,4 +488,32 @@ def limits_from_settings(settings) -> IntelLimits:
         promote_requires_quote=(quote_mode == "strict"),
         body_per_doc_chars=int(
             getattr(settings, "ai_trade_intel_corpus_body_per_doc_chars", 2400)),
+        # actionability：16 行映射与上面 16 个新字段一一对应。三把总闸也走这里——纯核心里
+        # 一个 `getattr(settings, …)` 都不许有（评审 P1-9）。`getattr` 兜底同上：给那些直接
+        # 构造 `Settings` 替身的既有用例留的。
+        alert_enabled=bool(getattr(settings, "ai_trade_intel_alert_enabled", False)),
+        alert_min_impact=(
+            str(getattr(settings, "ai_trade_intel_alert_min_impact", "high") or "high")
+            if str(getattr(settings, "ai_trade_intel_alert_min_impact", "high")) in MIN_IMPACTS
+            else "high"),
+        alert_categories=_alert_categories(settings),
+        alert_require_quote=resolve_require_quote(settings),
+        alert_min_domains=int(getattr(settings, "ai_trade_intel_alert_min_domains", 2)),
+        alert_min_confidence=float(
+            getattr(settings, "ai_trade_intel_alert_min_confidence", 0.6)),
+        alert_max_event_age_min=float(
+            getattr(settings, "ai_trade_intel_alert_max_event_age_min", 180.0)),
+        alert_cooldown_min=float(getattr(settings, "ai_trade_intel_alert_cooldown_min", 20.0)),
+        alert_daily_cap=int(getattr(settings, "ai_trade_intel_alert_daily_cap", 6)),
+        alert_allow_scheduled=bool(
+            getattr(settings, "ai_trade_intel_alert_allow_scheduled", False)),
+        efficacy_enabled=bool(getattr(settings, "ai_trade_intel_efficacy_enabled", False)),
+        efficacy_k_min=int(getattr(settings, "ai_trade_intel_efficacy_k_min", 8)),
+        efficacy_max_weight=float(
+            getattr(settings, "ai_trade_intel_efficacy_max_weight", 0.25)),
+        efficacy_min_domain_samples=int(
+            getattr(settings, "ai_trade_intel_efficacy_min_domain_samples", 3)),
+        conflict_enabled=bool(getattr(settings, "ai_trade_intel_conflict_enabled", False)),
+        conflict_min_overlap=float(
+            getattr(settings, "ai_trade_intel_conflict_min_overlap", 0.35)),
     )

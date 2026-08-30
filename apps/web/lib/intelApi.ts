@@ -5,6 +5,7 @@
 import { ApiRequestError, toApiError } from "./api";
 import { timeoutFor, withTimeout } from "./httpTimeout";
 import type {
+  IntelAlert,
   IntelCitationRow,
   IntelDocumentHealth,
   IntelEvidence,
@@ -183,6 +184,21 @@ export const intelApi = {
    */
   evidence: (itemId: number) =>
     request<IntelEvidence>(`/intel/items/${itemId}/evidence`),
+  // ---------------- actionability（§4.1 #1） ----------------
+  /**
+   * 告警台账（游标分页，按 `id` 降序）。
+   *
+   * **含「没告警」的行**：空轮也写一行，因此「今天为什么一次都没告警」永远有答案。
+   * 游标是 `id` 而不是时间戳——同一秒里的多行用时间戳翻页会漏行。
+   */
+  alerts: (instId: string, params: { limit?: number; before?: number } = {}) => {
+    const qs = new URLSearchParams();
+    qs.set("limit", String(params.limit ?? 50));
+    if (params.before) qs.set("before", String(params.before));
+    return request<{ alerts: IntelAlert[]; hasMore: boolean }>(
+      `/intel/${enc(instId)}/alerts?${qs}`,
+    );
+  },
   /** 正文缓存的只读读数（设置卡「原文缓存」那一行）。 */
   documentHealth: () => request<IntelDocumentHealth>("/intel/documents/health"),
   /** 测试连接（服务端总耗时硬封顶 12 秒）。 */

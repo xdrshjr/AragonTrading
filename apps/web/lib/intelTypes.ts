@@ -184,6 +184,104 @@ export interface IntelRound {
   quotesVerified: number;
 }
 
+// ---------------- ai-trade-intel-actionability（§4.1） ----------------
+
+/**
+ * 一行告警台账（含「没告警」与「告警了但没能唤醒」）。
+ *
+ * `suppressedText` / `outcomeText` **由后端下发**：进 wire 的文案由后端管，只在轮存根直方图里
+ * 出现的码才由前端 `CODE_LABEL` 管（跟随 `degrade` 的既有裁决）。两处各写一份必漂移，而漂移的
+ * 症状是用户看到一个裸 slug。
+ */
+export interface IntelAlert {
+  id: number;
+  instId: string;
+  groupId: string;
+  /** 0 = 本轮一条候选都没有（空轮也写一行 ⇒「今天为什么没告警」永远有答案）。 */
+  itemId: number;
+  roundId: number;
+  createdTs: number;
+  severity: number;
+  fired: boolean;
+  /** `fired=true` 时恒为空串。 */
+  suppressedCode: string;
+  suppressedText: string;
+  /** `""` = 尚无结果；超过待处理时限仍为空 ⇒ **渲染期**判为「未在时限内响应」，不回写库。 */
+  outcome: string;
+  outcomeText: string;
+  outcomeTs: number;
+  /** `outcome="woke"` 时指向那一轮决策（可跳到轨迹）。 */
+  runId: number;
+  roundNo: number;
+  headline: string;
+  category: IntelCategory | "";
+  tier: IntelTier | "";
+  stance: IntelStance | "";
+  impact: IntelImpact | "";
+  domainCount: number;
+  quoted: boolean;
+  confidence: number;
+  /**
+   * 本轮的注入编号（`"I02"`）；`cite` 关时为空串。
+   *
+   * 与 `inDigest` **一起**由第三跳（`IntelRuntime._alert`）在 digest 刚重算完那一刻补写进
+   * 台账——两者在建行的那一刻都还不知道（digest 尚是上一轮的）。
+   */
+  ref: string;
+  /**
+   * 这条情报**真的出现在了决策 prompt 的情报段里**吗。
+   *
+   * **绝不能用 `!ref` 冒充它**：`cite` 关时全库都没有编号，而条目照样在情报段里；反过来，
+   * 超短层排在注入顺序最后，长期层一攒满，有编号的告警条目也进不了 prompt（R-15）。这一列
+   * 就是 R-15 在界面上的落点——唤醒句那一侧已经据同一个事实分两态渲染。
+   */
+  inDigest: boolean;
+  /** 判据明细（severity 的各分量、ageMin 等）。**自由形状**，故该端点不挂 `response_model`。 */
+  reasons: Record<string, number | boolean>;
+}
+
+/** 一个战绩 / 信誉桶。`accuracy` **可空**：`null` = 样本不足，**绝不是 0**。 */
+export interface IntelStat {
+  settled: number;
+  wins: number;
+  netPnlUsd: number;
+  confirmed: number;
+  refuted: number;
+  unresolved: number;
+  samples: number;
+  accuracy: number | null;
+}
+
+export interface IntelEfficacyCategory extends IntelStat {
+  category: IntelCategory;
+  /** `[-maxWeight, +maxWeight]`。**只影响排序与举证责任，不是门禁**（R-6）。 */
+  weight: number;
+}
+
+/** 影响力页签「战绩与信誉」块的全部读数。 */
+export interface IntelEfficacy {
+  enabled: boolean;
+  /** 收缩伪计数：样本少于它的桶权重恒为 0。 */
+  kMin: number;
+  sampleN: number;
+  overall: IntelStat;
+  byCategory: IntelEfficacyCategory[];
+}
+
+/**
+ * 一对立场矛盾（同类别、方向相反、主题高度重叠、事件时刻同窗）。
+ *
+ * `openRounds` **不落库**：由两端的 `lastCuratedTs` 与整理轮流水推算。
+ */
+export interface IntelConflict {
+  aId: number;
+  bId: number;
+  overlap: number;
+  windowH: number;
+  category: IntelCategory;
+  openRounds: number;
+}
+
 /** 降级态。**文案由后端下发**，前端不二次编（两处各写一份必漂移）。 */
 export interface IntelDegrade {
   code: string;
@@ -228,6 +326,12 @@ export interface AiTradeIntelSummary {
    * **`null` = 分母 0**（「没提过引文」），与 `0`（「提了全没中」）是两句不同的话。
    */
   quoteHitRate: number | null;
+  /** actionability 轴 A：近 24 小时 fired 计数。未装配 ⇒ 0（形状恒一致，绝不 `undefined`）。 */
+  alerts24h: number;
+  /** 最近一次告警时刻；**`null` = 从未告警过**（与 0 分开——后者会被渲染成 1970 年）。 */
+  lastAlertTs: number | null;
+  /** actionability 轴 B 的摘要形态（完整的 byCategory / byDomain 由 REST 拉，不进 WS）。 */
+  efficacy: IntelEfficacy;
 }
 
 export interface IntelTierBucket {
@@ -241,6 +345,8 @@ export interface IntelReadResponse {
   tiers: Record<IntelTier, IntelTierBucket>;
   archivedTotal: number;
   mutedTotal: number;
+  /** actionability 轴 C：当前库存里的矛盾对（老后端 ⇒ 缺席 ⇒ 徽标与筛选整段不渲染）。 */
+  conflicts?: IntelConflict[];
 }
 
 export interface IntelSourceInput {
@@ -300,6 +406,26 @@ export interface IntelSettings {
   quoteMode: "off" | "soft" | "strict";
   /** 近 20 轮命中率；`null` = 还没提过引文。 */
   quoteHitRate: number | null;
+  // ---- actionability：三把总闸 + 三个告警旋钮（与 `INTEL_SETTING_BRIDGE` 逐键对应）----
+  alertEnabled: boolean;
+  alertMinImpact: "medium" | "high";
+  alertCooldownMin: number;
+  alertDailyCap: number;
+  efficacyEnabled: boolean;
+  conflictEnabled: boolean;
+  /**
+   * 「须有逐字原文引证」的**生效值**（不是存储值）：`quoteMode="off"` 或抓取关闭时它被降级为
+   * `false`，而用户存下来的偏好一个字节没动。设置卡据它把复选框置灰并写明原因。
+   */
+  alertRequireQuote: boolean;
+  /**
+   * 待处理告警的时限（秒，只读；本轮不让用户从面板改它）。
+   *
+   * 动态页签用它把「还没回」与「再也不会回」分开。**必须从后端读而不是在前端写死一个数**：
+   * 它是一个 30–900 的配置项，写死之后一个把它调到 900 的用户会在 180 秒时看到一句
+   * 「会话未在时限内响应」——而后端那一侧还在正常等着。
+   */
+  alertPendingTtlS: number;
 }
 
 export interface IntelSettingsPatch {
@@ -322,6 +448,12 @@ export interface IntelSettingsPatch {
   readerEnabled?: boolean;
   readerTopK?: number;
   quoteMode?: "off" | "soft" | "strict";
+  alertEnabled?: boolean;
+  alertMinImpact?: "medium" | "high";
+  alertCooldownMin?: number;
+  alertDailyCap?: number;
+  efficacyEnabled?: boolean;
+  conflictEnabled?: boolean;
 }
 
 export interface IntelProbeResult {
@@ -359,6 +491,12 @@ export interface IntelSourceRow {
   state: "" | "blocked" | "trusted";
   /** 生效的那条取舍记录的作用域（`""` = 全局）。撤销必须按它发，否则删不中那一行。 */
   stateInstId: string;
+  // ---- actionability 轴 B：这一页上做拉黑决策**唯一需要**的三列 + 准确率 ----
+  confirmed: number;
+  refuted: number;
+  unresolved: number;
+  /** `null` = 样本不足（低于 `efficacyMinDomainSamples`）。**绝不显示一个假的 0%**。 */
+  accuracy: number | null;
 }
 
 /** 影响力页签的全部读数。`netPnlUsd` 一律称「**关联**净额」（R-1）。 */
@@ -374,6 +512,8 @@ export interface IntelImpactReport {
   top: IntelItem[];
   worst: IntelItem[];
   neverCited: number;
+  /** actionability 轴 B 的「战绩与信誉」块（老后端 ⇒ 缺席 ⇒ 整块不渲染）。 */
+  efficacy?: IntelEfficacy;
 }
 
 /** 一条引用明细。`netPnlUsd` 可空：`null` = 结算不可得（`outcome="void"`）。 */

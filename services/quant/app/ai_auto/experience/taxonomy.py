@@ -103,8 +103,9 @@ VALUE_LABEL_ZH: dict[str, str] = {
     "crash": "急跌", "breakout": "突破", "none": "无事件",
     # side
     "long": "做多", "short": "做空",
-    # wake（八值，逐字对齐 WAKE_KINDS）
-    "candle_close": "新K线收线", "bar_advanced": "补跑上根", "signal_flip": "信号翻转",
+    # wake（九值，逐字对齐 WAKE_KINDS）
+    "candle_close": "新K线收线", "intel_alert": "情报告警", "bar_advanced": "补跑上根",
+    "signal_flip": "信号翻转",
     "resting_order": "挂单待成", "profit_tier": "利润档位", "price_breakout": "价格异动",
     "position_watch": "持仓盯market", "heartbeat": "心跳",
     # exit（十值，逐字对齐 EXIT_SOURCES；`AXIS_VALUES[exit]` 自动跟随，**标签是手抄的**）

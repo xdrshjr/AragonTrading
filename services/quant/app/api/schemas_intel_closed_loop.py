@@ -13,6 +13,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from .schemas_intel_actionability import IntelEfficacyOut
+
 
 class IntelFeedbackIn(BaseModel):
     """写一条来源取舍（`POST /intel/feedback` 与 `POST /intel/feedback/preview` 共用）。
@@ -83,6 +85,15 @@ class IntelSourceRowOut(BaseModel):
     lastTs: int
     state: str          # "" | blocked | trusted
     stateInstId: str = ""
+    # ---- ai-trade-intel-actionability 轴 B：信誉三列 + 准确率 ----
+    # ⚠️ **不扩这四个字段 = 后端算了、界面上永远是空**：本模型挂在 `GET /intel/{instId}/sources`
+    # 上，`response_model` 会静默丢弃未声明的键（E-19 / R-5）。
+    # `accuracy` **可空**：`None` = 样本不足（低于 `efficacy_min_domain_samples`），**不是 0.0**
+    # ——一个用两条样本算出来的 100%，比不显示更容易让人拉黑错的那个源。
+    confirmed: int = 0
+    refuted: int = 0
+    unresolved: int = 0
+    accuracy: float | None = None
 
 
 class IntelSourceListOut(BaseModel):
@@ -111,6 +122,10 @@ class IntelImpactOut(BaseModel):
     top: list[dict]
     worst: list[dict]
     neverCited: int
+    # ---- ai-trade-intel-actionability 轴 B：战绩与信誉块 ----
+    # ⚠️ 同上，本模型挂在 `GET /intel/{instId}/impact` 上，不扩即**静默吞键**（E-19）。
+    # 带默认值 ⇒ 未装配 / 总闸关时形状仍然一致（前端不会读到 `undefined`）。
+    efficacy: IntelEfficacyOut | None = None
 
 
 class IntelCitationRowOut(BaseModel):

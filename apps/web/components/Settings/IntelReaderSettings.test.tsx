@@ -22,6 +22,9 @@ function settings(over: Partial<IntelSettings> = {}): IntelSettings {
     verifyEveryNCurates: 1, verifyMaxItems: 3, verifyDocsPerItem: 4,
     blockedSweepEnabled: true, citeMaxRefs: 8,
     readerEnabled: true, readerTopK: 6, quoteMode: "soft", quoteHitRate: 0.78,
+    alertEnabled: true, alertMinImpact: "high", alertCooldownMin: 20, alertDailyCap: 6,
+    efficacyEnabled: true, conflictEnabled: true, alertRequireQuote: true,
+    alertPendingTtlS: 180,
     ...over,
   };
 }

@@ -49,6 +49,9 @@ function summary(over: Partial<AiTradeIntelSummary> = {}): AiTradeIntelSummary {
       neverCited: 0 },
     verify: { confirmed: 0, refuted: 0, unresolved: 0, pending: 0, lastVerifyTs: null },
     quoteHitRate: null,
+    alerts24h: 0,
+    lastAlertTs: null,
+    efficacy: { enabled: false, kMin: 8, sampleN: 0, overall: { settled: 0, wins: 0, netPnlUsd: 0, confirmed: 0, refuted: 0, unresolved: 0, samples: 0, accuracy: null }, byCategory: [] },
     ...over,
   };
 }
@@ -140,5 +143,33 @@ describe("IntelImpactTab", () => {
     // 一次成功的写动作在用户眼里就是一次「点了没反应」。
     view.rerender(tab({ reloadToken: 1 }));
     await waitFor(() => expect(impactMock).toHaveBeenCalledTimes(2));
+  });
+});
+
+describe("战绩与信誉块（ai-trade-intel-actionability 轴 B）", () => {
+  it("`efficacy` 在位 ⇒ 渲染战绩块并如实写出先验是否已生效", async () => {
+    impact = report({
+      efficacy: {
+        enabled: true, kMin: 8, sampleN: 12,
+        overall: { settled: 4, wins: 3, netPnlUsd: 41.2, confirmed: 6, refuted: 2,
+          unresolved: 0, samples: 12, accuracy: 0.75 },
+        byCategory: [{ category: "risk", settled: 3, wins: 3, netPnlUsd: 51.2,
+          confirmed: 5, refuted: 0, unresolved: 0, samples: 8, accuracy: 1, weight: 0.18 }],
+      },
+    });
+    render(<IntelImpactTab instId={INST} summary={summary()} settingsCiteEnabled
+      settingsAttributionEnabled onClearVerdict={() => undefined}
+      onVerifyNow={() => undefined} />);
+    expect(await screen.findByTestId("intel-efficacy-block")).toBeInTheDocument();
+    expect(screen.getByTestId("intel-efficacy-ready")).toHaveTextContent("已生效");
+  });
+
+  it("老后端不带 `efficacy` ⇒ 整块不渲染（绝不显示一个凭空的 0%）", async () => {
+    impact = report();
+    render(<IntelImpactTab instId={INST} summary={summary()} settingsCiteEnabled
+      settingsAttributionEnabled onClearVerdict={() => undefined}
+      onVerifyNow={() => undefined} />);
+    await screen.findByTestId("intel-impact-tab");
+    expect(screen.queryByTestId("intel-efficacy-block")).toBeNull();
   });
 });

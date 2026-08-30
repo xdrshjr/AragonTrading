@@ -56,6 +56,7 @@ export const VALUE_LABEL_ZH: Record<string, string> = {
   long: "做多",
   short: "做空",
   candle_close: "新K线收线",
+  intel_alert: "情报告警",
   bar_advanced: "补跑上根",
   signal_flip: "信号翻转",
   resting_order: "挂单待成",
@@ -89,8 +90,11 @@ export const AXIS_VALUES: Record<string, string[]> = {
   volatility: ["high_volatility", "low_volatility", "normal", "unknown"],
   event: ["crash", "breakout", "none", "unknown"],
   side: ["long", "short", "unknown"],
-  wake: ["candle_close", "bar_advanced", "signal_flip", "resting_order", "profit_tier",
-         "price_breakout", "position_watch", "heartbeat", "unknown"],
+  // ⚠️ 与 `exit` 同一条警告：硬编码数组，必须与后端 `WAKE_KINDS` 逐值对齐——漏一个值，
+  // 经验图预演选择器里**根本选不到**那一类，而 tsc / vitest 都不会红。九处注册表里**只有
+  // 这一处真正静默**，故 `experienceLabels.source.test.ts` 为它单加了一条断言（G-9 前端一侧）。
+  wake: ["candle_close", "intel_alert", "bar_advanced", "signal_flip", "resting_order",
+         "profit_tier", "price_breakout", "position_watch", "heartbeat", "unknown"],
   // ⚠️ 硬编码数组，必须与后端 `EXIT_SOURCES` 逐值对齐——漏一个值，经验图预演选择器里**根本
   // 选不到**那一类（X-9 在经验图那一侧就无法被查询），而 tsc / vitest 都不会红。
   exit: ["agent", "agentOverride", "agentReverse", "profitGuard", "exchangeOco", "timeExit",

@@ -30,6 +30,9 @@ const settingsMock = vi.fn(async () => ({
   citeEnabled: true, attributionEnabled: true, verifyEnabled: true, verifyEveryNCurates: 1,
   verifyMaxItems: 3, verifyDocsPerItem: 4, blockedSweepEnabled: true, citeMaxRefs: 8,
   readerEnabled: true, readerTopK: 6, quoteMode: "soft" as const, quoteHitRate: 0.78,
+  alertEnabled: true, alertMinImpact: "high" as const, alertCooldownMin: 20, alertDailyCap: 6,
+  efficacyEnabled: true, conflictEnabled: true, alertRequireQuote: true,
+  alertPendingTtlS: 180,
 }));
 const verifyMock = vi.fn(async () => ({ queued: true }));
 const verifyItemMock = vi.fn(async () => ({ queued: true }));
@@ -108,6 +111,9 @@ function response(over: Partial<IntelReadResponse> = {}): IntelReadResponse {
         netPnlUsd: 0, neverCited: 0 },
       verify: { confirmed: 0, refuted: 0, unresolved: 0, pending: 0, lastVerifyTs: null },
       quoteHitRate: null,
+      alerts24h: 0,
+      lastAlertTs: null,
+      efficacy: { enabled: false, kMin: 8, sampleN: 0, overall: { settled: 0, wins: 0, netPnlUsd: 0, confirmed: 0, refuted: 0, unresolved: 0, samples: 0, accuracy: null }, byCategory: [] },
     },
     tiers: {
       ultra: { items: [item(), item({ id: 2, category: "macro", headline: "CPI 数据即将公布" })], total: 2 },
@@ -150,7 +156,7 @@ async function open(res?: IntelReadResponse) {
 }
 
 describe("IntelModal", () => {
-  it("七个页签都可达（超短 / 中期 / 长期 / 影响力 / 信源 / 已归档 / 整理记录）", async () => {
+  it("七个页签都可达（超短 / 中期 / 长期 / 影响力 / 信源 / 已归档 / 动态）", async () => {
     await open();
     await waitFor(() => expect(screen.getByRole("tab", { name: "超短 2" })).toBeInTheDocument());
     expect(screen.getByRole("tab", { name: "中期 1" })).toBeInTheDocument();
@@ -158,7 +164,8 @@ describe("IntelModal", () => {
     expect(screen.getByRole("tab", { name: "影响力" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "信源" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "已归档 3" })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: "整理记录" })).toBeInTheDocument();
+    // actionability §3.4.1：「整理记录」升级为「动态」（轮次 + 告警合流），**零新增页签**。
+    expect(screen.getByRole("tab", { name: "动态" })).toBeInTheDocument();
   });
 
   it("影响力与信源两个页签各自能被打开（closed-loop §3.7.3）", async () => {

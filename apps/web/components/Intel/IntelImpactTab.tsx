@@ -11,6 +11,7 @@ import {
 import { intelApi } from "@/lib/intelApi";
 import type { AiTradeIntelSummary, IntelImpactReport, IntelItem } from "@/lib/intelTypes";
 import IntelAttributionRail from "./IntelAttributionRail";
+import IntelEfficacyBlock from "./IntelEfficacyBlock";
 import IntelVerdictBadge from "./IntelVerdictBadge";
 
 /**
@@ -107,6 +108,10 @@ export default function IntelImpactTab({
           />
         </>
       )}
+
+      {/* 「战绩与信誉」块排在空态判定**之外**：即使一次引用都还没有，用户也该看到核查判定
+          积累到了哪一步——那是本轮见效最快的一半（每个核查轮都在产出判定）。 */}
+      <IntelEfficacyBlock efficacy={impact?.efficacy} />
 
       <p className="text-[10px] leading-relaxed text-[var(--muted)]">
         从未被引用：{impact?.neverCited ?? 0} 条。

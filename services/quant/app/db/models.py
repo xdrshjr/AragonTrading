@@ -1007,6 +1007,77 @@ class AiIntelCitation(Base):
     created_ts: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class AiIntelAlert(Base):
+    """情报告警台账：一次告警判定的完整记录（ai-trade-intel-actionability §5.1）。
+
+    含「没告警」与「告警了但没能唤醒」两种行——**空轮也写一行**，因此「今天为什么一次都没
+    告警」永远有答案。
+
+    为什么是新表而不是 ``ai_intel_items`` 上的几列：告警是**事件流**（同一条情报可能因冷却而
+    被抑制多次），条目是**状态**。把事件流塞进状态行会让每次判定都变成一次读-改-写，而情报轮
+    与决策轮跑在不同的 DB 会话里——读改写会丢更新，且丢更新不会报错（逐行照抄
+    ``AiIntelCitation`` 的既有裁决）。
+
+    ⚠️ **三个写点，每一个都独占一组列**（纪律不是「只许写一次」，而是「同一列只有一个人写」
+    ——那才是丢更新的来源）：
+
+    1. ``write_intel_alert``：创建，落在 ``_persist_collect`` 的同一次 commit 里。
+       ``outcome`` 在创建时恒为 ``""``，**绝不预填**——一个「预填了又被改回来」的列会让
+       「等待会话响应」这个状态无法与「已经回答过了」区分。
+    2. ``stamp_intel_alert_digest``：只写 ``ref_token`` / ``in_digest`` 两列。它们在建行那一刻
+       **还不知道**——digest 要等 ``IntelRuntime.refresh`` 重算完才有编号，而那发生在采集轮
+       提交之后。少了这一跳，两列就是「有列、有读点、没有写点」：界面上每一条告警都会挂着
+       一句「未进入情报段」，而那是一句关于数据的假话。
+    3. ``mark_intel_alert_outcome``：只写 ``outcome`` / ``outcome_ts`` / ``run_id`` /
+       ``round_no``，由会话侧经 ``intel_runtime.note_alert_outcome`` 转发。
+
+    ``create_all`` 会建这张缺失的表 ⇒ **零迁移**（本轮不给任何既有表补列，
+    ``db/session.py::_ensure_ai_intel_columns`` 一个字节不改）。
+    """
+
+    __tablename__ = "ai_intel_alerts"
+    __table_args__ = (
+        Index("ix_ai_intel_alert_scope", "inst_id", "id"),
+        Index("ix_ai_intel_alert_item", "item_id"),
+        # 冷却时刻与日配额**从本表现算**（§5.1「为什么零 ALTER」第 1 条），两条点查走这个索引。
+        Index("ix_ai_intel_alert_fired", "inst_id", "fired", "created_ts"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    inst_id: Mapped[str] = mapped_column(String(32), index=True, default="")
+    group_id: Mapped[str] = mapped_column(String(48), default="")
+    item_id: Mapped[int] = mapped_column(Integer, default=0)      # 0 = 本轮没有任何候选
+    round_id: Mapped[int] = mapped_column(Integer, default=0)     # 产生它的采集轮
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)   # 墙钟秒 UTC
+    severity: Mapped[float] = mapped_column(Float, default=0.0)
+    fired: Mapped[bool] = mapped_column(Boolean, default=False)
+    # `taxonomy.ALERT_SUPPRESS_CODES`；``fired=True`` 时恒为 ""。
+    suppressed_code: Mapped[str] = mapped_column(String(24), default="")
+    # `taxonomy.ALERT_OUTCOMES`；"" = 尚无结果（渲染期按 TTL 判 `expired_no_response`，**不回写**）。
+    outcome: Mapped[str] = mapped_column(String(24), default="")
+    outcome_ts: Mapped[int] = mapped_column(Integer, default=0)
+    run_id: Mapped[int] = mapped_column(Integer, default=0)       # outcome="woke" 时指向那一轮
+    round_no: Mapped[int] = mapped_column(Integer, default=0)
+    # 冗余快照：条目可能已被整理轮归档 / 合并，台账要能**独立可读**。
+    headline: Mapped[str] = mapped_column(String(160), default="")
+    category: Mapped[str] = mapped_column(String(16), default="")
+    tier: Mapped[str] = mapped_column(String(8), default="")
+    stance: Mapped[str] = mapped_column(String(8), default="")
+    impact: Mapped[str] = mapped_column(String(8), default="")
+    domain_count: Mapped[int] = mapped_column(Integer, default=0)
+    quoted: Mapped[bool] = mapped_column(Boolean, default=False)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    # ---- 第三跳（`IntelRuntime._alert`）补写的两列，见类 docstring 的写点表 ----
+    ref_token: Mapped[str] = mapped_column(String(4), default="")   # "I02"；cite 关时为 ""
+    # 这条情报**真的进了决策 prompt 的情报段**吗。与 `ref_token` 是两件事（closed-loop 之后
+    # 的 P0-3 就是为这次混淆写的）：`cite` 关时全库都没有编号，条目却照样在情报段里；反过来
+    # 超短层排在注入顺序最后，有编号的告警条目也可能被 `prompt_max_chars` 挡在外面（R-15）。
+    in_digest: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 判据明细（severity 的各分量、ageMin 等）。**自由形状**——故 `GET /alerts` 刻意不挂
+    # `response_model`，挂了只会得到「加了新判据、界面上看不到、也不报错」。
+    reasons_json: Mapped[str] = mapped_column(Text, default="{}")
+
+
 class AiIntelRound(Base):
     """一次采集 / 整理 / 核查轮的审计存根（market-intel §3.7.1 + closed-loop §3.6）。append-only。
 

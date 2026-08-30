@@ -27,6 +27,9 @@ from typing import TYPE_CHECKING
 
 from . import quotes as quotes_mod
 from . import taxonomy as tax
+# 整理轮复核的三条判据下沉在 `review.py`（§十二：本文件越过 800 行的成文修法）。
+# **单向依赖**：`review` 不 import 本模块，三条判据只返回码、由这里去构造 `CurationAction`。
+from .review import ReviewContext, keep_both_code, review_promote, weak_record_code
 from .taxonomy import IntelLimits
 
 if TYPE_CHECKING:                       # 只为类型标注；运行期以鸭子类型消费（corpus 不反向依赖本模块）
@@ -180,7 +183,8 @@ def expires_for_tier(*, tier: str, event_ts: int, captured_ts: int, pinned: bool
     return int(max(int(event_ts or 0), int(captured_ts or 0)) + ttl)
 
 
-def score_item(item: IntelItem, *, now: float, limits: IntelLimits | None = None) -> float:
+def score_item(item: IntelItem, *, now: float, limits: IntelLimits | None = None,
+               eff=None) -> float:
     """溢出淘汰与注入排序共用的打分：置信度 × 影响力 × 时间衰减（§3.4.4 第 2 步）。
 
     未来事件（`is_scheduled`）不衰减：一件还没发生的事不会因为「我们早就知道了」而变得不重要。
@@ -192,6 +196,14 @@ def score_item(item: IntelItem, *, now: float, limits: IntelLimits | None = None
             ``None`` ⇒ **不计 bonus、返回值与本轮合入前逐字节相同**（评审 P1-1：现签名的四个
             调用点没有一个能拿到 `cite_score_bonus`，给新形参一个默认值让 `admit` 与
             `render_listing` 两处零改动）。
+        eff: actionability 轴 B 的战绩先验（`efficacy.Efficacy`，keyword-only、**带默认值**）。
+            ``None`` ⇒ **第二个加分项整段不参与运算、返回值逐字节回退**——逐行照抄上面那条
+            `limits=None` 的既有范式。**只读 `eff.weights`，不调 `efficacy.weight_for`**：
+            那会让 `gate` import `efficacy`，而 `efficacy` 已经被禁止 import `gate`
+            （评审 P1-3），一个方向的边就够了。
+            ⚠️ 四个调用点里**只有两个**传它（`build_digest` 与 `plan_cleanup`）：
+            `admit` 的 over_cap 截断与 `service.render_listing` 的清单排序**必须**保持与合入前
+            逐字节相同（G-13），那是两处没人要求、也没人会发现的行为变更。
 
     Returns:
         非负打分。加分项 `cite_bonus = cite_score_bonus × tanh(cite_entry_count / 3) × sign_bias`，
@@ -204,12 +216,14 @@ def score_item(item: IntelItem, *, now: float, limits: IntelLimits | None = None
     half_life = tax.HALF_LIFE_DAYS.get(item.tier, 1.0)
     decay = math.exp(-age_days / half_life) if half_life > 0 else 1.0
     base = float(item.confidence) * SCORE_IMPACT_W.get(item.impact, 0.5) * decay
+    # actionability 轴 B 消费点 #1：类别级战绩先验。`eff is None` ⇒ 恒为 0.0 ⇒ 逐字节回退。
+    eff_bonus = 0.0 if eff is None else float(eff.weights.get(item.category, 0.0))
     if limits is None:
-        return base
+        return base + eff_bonus
     sign_bias = 1.0 if float(item.net_pnl_usd or 0.0) >= 0.0 else 0.0
     bonus = (float(limits.cite_score_bonus)
              * math.tanh(max(0, int(item.cite_entry_count)) / 3.0) * sign_bias)
-    return base + bonus
+    return base + bonus + eff_bonus
 
 
 # ---------------- 去重键 ----------------
@@ -621,6 +635,12 @@ def admit(proposals: list[dict], corpus: "Corpus", existing: dict[str, IntelItem
 
 
 # ---------------- 整理轮的服务端复核表（§3.4.3） ----------------
+# 升级复核的判据已下沉到 `review.review_promote`（§十二：本文件越过 800 行的成文修法）。
+# 保留旧的私有别名：它是**既有用例的调用点**（`test_ai_intel_gate` 直接断言它的返回码），
+# 而「搬家不改任何调用点」正是这条修法「纯搬运、零语义变化」的含义。
+_review_promote = review_promote
+
+
 @dataclass(frozen=True)
 class CurationAction:
     """一个已通过复核的动作（`apply_curation` 的唯一入参形态）。"""
@@ -640,36 +660,9 @@ class ReviewResult:
     counts: dict[str, int]      # 动作直方图（含被驳回的），逐轮落 `ai_intel_rounds`
 
 
-def _review_promote(item: IntelItem, to_tier: str | None, *, limits: IntelLimits,
-                    now: float) -> str | None:
-    """升级复核；返回驳回码或 `None`（通过）。"""
-    target = to_tier or tax.next_tier(item.tier)
-    if target is None or tax.TIER_ORDER.get(target, -1) != tax.TIER_ORDER.get(item.tier, -1) + 1:
-        return "promote_insufficient_evidence"
-    if item.status != "active" or item.undated:
-        return "promote_insufficient_evidence"
-    if item.domain_count < limits.promote_min_domains:
-        return "promote_insufficient_evidence"
-    if now - item.captured_ts < limits.promote_min_age_s:
-        return "promote_insufficient_evidence"
-    if item.impact == "low":
-        return "promote_insufficient_evidence"
-    if target == "long":
-        # **`abs()` 不是笔误**（评审 P0-1）：`now - event_ts ≥ 3d` 对未来事件恒为负，照 v1 写法
-        # 一条已排期的解锁 / 议息**永远升不进长期**——而那恰恰是长期层语义里点名的内容。
-        if abs(now - item.event_ts) < limits.promote_long_min_gap_s:
-            return "promote_insufficient_evidence"
-        if item.impact != "high" and item.category not in ("macro", "project"):
-            return "promote_insufficient_evidence"
-        # evidence-grounding §3.2.4：**仅 `strict`**（`promote_requires_quote`）。soft / off 下
-        # 该判据整条不存在 ⇒ 升级路径逐字节不变。
-        if limits.promote_requires_quote and not item.quoted:
-            return "need_quote"
-    return None
-
-
 def review_actions(actions: list[dict], items: dict[int, IntelItem], *, limits: IntelLimits,
-                   now: float | None = None) -> ReviewResult:
+                   now: float | None = None,
+                   context: ReviewContext | None = None) -> ReviewResult:
     """模型提议 → 服务端裁决。**模型只提议，服务端裁决，两边的分歧全部写进审计。**
 
     Args:
@@ -677,11 +670,14 @@ def review_actions(actions: list[dict], items: dict[int, IntelItem], *, limits: 
         items: 该标的当前全部候选条目（`item_id → IntelItem`）。
         limits: 阈值聚合（升级门槛 / 单轮动作上限 / TTL）。
         now: 墙钟秒。
+        context: actionability 的两样可选证据（战绩先验 + 本轮矛盾对）。``None`` ⇒ 两条新判据
+            整段不参与 ⇒ 结果与合入前逐字节相同。
 
     Returns:
         `ReviewResult`：通过的动作、驳回码直方图、动作直方图。
     """
     wall = time.time() if now is None else float(now)
+    ctx = context or ReviewContext()
     rejects: dict[str, int] = {}
     counts: dict[str, int] = {}
     approved: list[CurationAction] = []
@@ -697,13 +693,41 @@ def review_actions(actions: list[dict], items: dict[int, IntelItem], *, limits: 
         if item is None or item.item_id is None:
             _bump(rejects, "unknown_item")
             continue
-        _bump(counts, str(entry.get("action") or "").strip() or "unknown")
+        name = str(entry.get("action") or "").strip() or "unknown"
+        _bump(counts, name)
+        if name == "keep_both":
+            # ★ 轴 C 的第六个动作在这里**被拦在 `_review_one` 之前**：让它落进去只会撞上那条
+            # `else: return None, "bad_action"`，而 `_review_one` 的函数体必须一个字节不改
+            # （G-2 的逐字节回退才有意义）。
+            _judge_keep_both(entry, item, ctx=ctx, rejects=rejects, approved=approved)
+            continue
         action, code = _review_one(entry, item, items, limits=limits, now=wall)
         if code:
             _bump(rejects, code)
-        elif action is not None:
-            approved.append(action)
+            continue
+        if action is None:
+            continue
+        # ★ 评审 P0-2：战绩举证责任落在**这里**，不在 `_review_promote`——后者的入参里根本没有
+        # `reason`（它只存在于这个 `entry` dict 里），而这一层同时持有 `entry` / `item` / `ctx`
+        # 三样。`_review_promote` 的签名与函数体因此一个字节不改。
+        weak = weak_record_code(item, action.action, action.to_tier,
+                                str(entry.get("reason") or ""), ctx=ctx)
+        if weak:
+            _bump(rejects, weak)
+            continue
+        approved.append(action)
     return ReviewResult(tuple(approved), rejects, counts)
+
+
+def _judge_keep_both(entry: dict, item: IntelItem, *, ctx: ReviewContext,
+                     rejects: dict[str, int], approved: list[CurationAction]) -> None:
+    """`keep_both` 的落地（判据在 `review.keep_both_code`，本函数只负责记账与建动作）。"""
+    reason = str(entry.get("reason") or "").strip()[:120]
+    code = keep_both_code(int(item.item_id), int(entry.get("pairId") or 0), reason, ctx=ctx)
+    if code:
+        _bump(rejects, code)
+        return
+    approved.append(CurationAction(item.item_id, "keep_both", None, None, reason, 0))
 
 
 def _review_one(entry: dict, item: IntelItem, items: dict[int, IntelItem], *,
@@ -736,7 +760,7 @@ def _review_one(entry: dict, item: IntelItem, items: dict[int, IntelItem], *,
             return None, "merge_bad_target"
         return CurationAction(item.item_id, "merge", None, target_id, reason, 0), None
     if action == "promote":
-        code = _review_promote(item, to_tier, limits=limits, now=now)
+        code = review_promote(item, to_tier, limits=limits, now=now)
         if code:
             return None, code
         target = to_tier or tax.next_tier(item.tier) or item.tier

@@ -92,6 +92,10 @@ class WakeRuntime:
             min_samples=settings.ai_trade_signal_wake_min_samples)
         self._signal_flip_wakes = 0
         self._position_watch_skips = 0
+        # intel-actionability 轴 A 的两个计数。**刻意不复用 `wake_skips` / `wakeDrops` 口径**：
+        # 那两个的语义是「原本会发生的墙钟唤醒被抑制了多少次」，而告警是一个全新的触发源。
+        self._intel_alert_wakes = 0
+        self._intel_alert_drops = 0
         self._last_flip_wake_wall = 0.0
         # 最近一次判为「应跳过」的 kind。由 `should_skip` 就地记下、`note_skip` 按同一节流口径消费
         # ——分列计数因此与 `wake_skips` **同源同口径**，不会出现第二个口径（本仓库付过学费的失效模式）。
@@ -151,6 +155,16 @@ class WakeRuntime:
     def signal_flip_wakes(self) -> int:
         return self._signal_flip_wakes
 
+    @property
+    def intel_alert_wakes(self) -> int:
+        """情报告警真的起了轮的次数（轴 A）。"""
+        return self._intel_alert_wakes
+
+    @property
+    def intel_alert_drops(self) -> int:
+        """情报告警被丢弃 / 推迟的次数（会话不在运行、行情陈旧、无信号板、过期、在飞轮）。"""
+        return self._intel_alert_drops
+
     # ---------- 记账 ----------
     def note_guard_status(self, status: str | None) -> None:
         """利润保护快照 status 的**唯一**入口（盯市 tick 每次 `_refresh_profit_state` 之后即记）。
@@ -199,10 +213,11 @@ class WakeRuntime:
 
     # ---------- 分类 / 跳过 ----------
     def classify(self, readings: WakeReadings, *, now_wall: float,
-                 flip: dict | None = None) -> dict:
+                 flip: dict | None = None, intel: dict | None = None) -> dict:
         """组装 `WakeFacts` 并判定唤醒原因；返回可直接进 payload / 事件 / 轨迹的 wire。
 
-        `flip` 缺省 None ⇒ `signal_flip` 条件不成立、wire 无 `flip` 键 ⇒ 非翻转轮逐字节回退。
+        `flip` / `intel` 缺省 None ⇒ 对应条件不成立、wire 无该键 ⇒ 非翻转轮 / 非告警轮**逐字节
+        回退**。
         """
         since = (max(0.0, now_wall - self._last_round_wall) if self._last_round_wall else 0.0)
         facts = WakeFacts(
@@ -219,6 +234,7 @@ class WakeRuntime:
             since_last_round_s=since,
             resting_age_s=readings.resting_age_s,
             flip=flip,
+            intel=intel,
         )
         self._last_facts = facts
         wake = classify_wake(
@@ -332,6 +348,30 @@ class WakeRuntime:
         self._signal_flip_wakes += 1
         return self.classify(readings, now_wall=now_wall, flip=flip)
 
+    # ---------- intel-actionability 轴 A：情报告警唤醒 ----------
+    def plan_intel_alert(self, handoff, readings: WakeReadings, *,
+                         now_wall: float) -> dict | None:
+        """告警唤醒判定（镜像 `plan_signal_flip`）；`handoff` 为 None ⇒ None。
+
+        **与 `plan_signal_flip` 的关键差别是它没有副作用**：告警的「消费」由会话侧清空
+        `_pending_intel_alert` 表达，本方法只负责把 handoff 翻译成一个 `wake` wire 并计数。
+        判据（会话是否在运行、行情是否陈旧、有没有信号板、是否过期、是否撞上在飞轮）全部留在
+        会话侧——它们读的是会话自己的状态，搬到这里只会让 `WakeRuntime` 反向依赖会话。
+
+        **关键不变式**：本方法返回的 wake **只影响 `payload["wake"]`**。会话随后调用的是同一个
+        `_run_decision_round`，共识门禁、铁律层、edge 门禁、仓位层、反思层、离场优先级全部照跑，
+        一道不绕。这条是轴 A 全部安全性的支点（逐行照抄 `plan_signal_flip` 那句同形声明）。
+        """
+        if handoff is None:
+            return None
+        self._intel_alert_wakes += 1
+        return self.classify(readings, now_wall=now_wall,
+                             intel=handoff.wire(now=now_wall))
+
+    def note_intel_alert_drop(self) -> None:
+        """记一次「告警到手却没能起轮」（丢弃或推迟）。**不节流**：每一次都是独立事实。"""
+        self._intel_alert_drops += 1
+
     def stats(self, preview_stats: dict | None = None) -> dict:
         """调度层观测键（进 `status` 与 `metrics_json.aiStats.wakeScheduler`）。
 
@@ -341,6 +381,11 @@ class WakeRuntime:
         return {**self._backlog.stats(),
                 "positionWatchSkips": self._position_watch_skips,
                 "signalFlipWakes": self._signal_flip_wakes,
+                # intel-actionability §3.4.4：两个新计数与既有四个并列。它们随
+                # `session.py` 的 `metrics["aiStats"]["wakeScheduler"] = self._wake.stats(...)`
+                # **整体赋值**天然落库——那一行是整体赋值，不是逐键手抄（评审 P1-7）。
+                "intelAlertWakes": self._intel_alert_wakes,
+                "intelAlertDrops": self._intel_alert_drops,
                 **(preview_stats or {})}
 
     def status_counts(self, preview_stats: dict | None = None) -> dict:
@@ -352,7 +397,9 @@ class WakeRuntime:
         stats = self.stats(preview_stats)
         return {"wakeDrops": stats["drops"], "wakeCatchups": stats["catchups"],
                 "positionWatchSkips": stats["positionWatchSkips"],
-                "signalFlipWakes": stats["signalFlipWakes"]}
+                "signalFlipWakes": stats["signalFlipWakes"],
+                "intelAlertWakes": stats["intelAlertWakes"],
+                "intelAlertDrops": stats["intelAlertDrops"]}
 
     # ---------- payload 注入 ----------
     def inject(self, payload: dict, ctx: InjectionContext) -> None:

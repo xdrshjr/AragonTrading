@@ -32,6 +32,9 @@ const SETTINGS = {
   citeEnabled: true, attributionEnabled: true, verifyEnabled: true, verifyEveryNCurates: 1,
   verifyMaxItems: 3, verifyDocsPerItem: 4, blockedSweepEnabled: true, citeMaxRefs: 8,
   readerEnabled: true, readerTopK: 6, quoteMode: "soft" as const, quoteHitRate: 0.78,
+  alertEnabled: true, alertMinImpact: "high" as const, alertCooldownMin: 20, alertDailyCap: 6,
+  efficacyEnabled: true, conflictEnabled: true, alertRequireQuote: true,
+  alertPendingTtlS: 180,
 };
 
 beforeEach(() => {

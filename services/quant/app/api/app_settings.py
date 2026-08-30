@@ -196,6 +196,20 @@ async def _intel_wire(session: AsyncSession, settings: Settings) -> dict:
         # 「这个标的还没提过引文」不该把整张卡上的读数吃掉；一个都没有时才留 `None`
         # （绝不显示一个假的 0）。
         "quoteHitRate": await _intel_quote_hit_rate(session),
+        # ---- actionability：三把总闸 + 三个告警旋钮的**生效值**回读 ----
+        "alertEnabled": bool(derived.ai_trade_intel_alert_enabled),
+        "alertMinImpact": str(derived.ai_trade_intel_alert_min_impact),
+        "alertCooldownMin": float(derived.ai_trade_intel_alert_cooldown_min),
+        "alertDailyCap": int(derived.ai_trade_intel_alert_daily_cap),
+        "efficacyEnabled": bool(derived.ai_trade_intel_efficacy_enabled),
+        "conflictEnabled": bool(derived.ai_trade_intel_conflict_enabled),
+        # ★ **生效值**而不是存储值（§3.1.1.1）：`quoteMode="off"` 或抓取关掉时它降级为 False，
+        # 而用户存下来的偏好一个字节没动。设置卡据它把复选框置灰并写明原因——不这么做，
+        # 「要求引文 + 引文关闭」这个组合会让告警**一次都不发生且没有任何错误**。
+        "alertRequireQuote": intel_tax.resolve_require_quote(derived),
+        # 只读：动态页签据它把「等待会话响应」与「未在时限内响应」分开（前端写死一个数，
+        # 就会在用户调宽时限之后给出一句与后端不一致的判定）。
+        "alertPendingTtlS": float(derived.ai_trade_intel_alert_pending_ttl_s),
     }
 
 

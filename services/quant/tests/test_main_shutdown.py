@@ -164,3 +164,18 @@ def test_shutdown_steps_are_zero_arg_factories_in_the_legacy_order():
         "okx_rest", "okx_pool", "db_engine",
     ]
     assert all(callable(factory) for _, factory in steps)
+
+
+def test_the_intel_drain_is_still_the_seventh_step_and_no_step_was_added():
+    """ai-trade-intel-actionability G-26：**本轮不新增任何关停步骤**。
+
+    告警的台账回写走 `intel_scheduler.schedule(...)` 这个既有 tracked 任务集，它已经被第 7 步
+    `ai_trade_intel` drain 掉。评审 P2-12：**不要断言「该函数逐字节未变」**——它的 docstring
+    明写「这里不再写死一个数字」，注释本身是会动的。
+    """
+    from app.main import _shutdown_steps
+
+    names = [name for name, _fn in _shutdown_steps()]
+    assert names[6] == "ai_trade_intel"
+    assert names.count("ai_trade_intel") == 1
+    assert not any("alert" in name for name in names)

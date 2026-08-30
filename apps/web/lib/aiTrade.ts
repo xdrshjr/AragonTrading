@@ -1147,6 +1147,10 @@ export interface AiTradeTriggerView {
 // 声明为 `Record<WakeKind, …>` ⇒ 后端新增 kind 时 tsc 强制要求补齐，不会静默漏一个展示点。
 export const WAKE_LABELS: Record<WakeKind, AiTradeTriggerView> = {
   candle_close: { label: "K 线收盘 · 信号板已重算", tone: "muted" },
+  // spec §3.1.5 #7 写的是 `tone: "warn"`，而 `AiTraceTone` 的值域只有
+  // long | short | muted | accent（tsc 当场红）——见 spec《实施过程发现的方案缺陷》I-5。
+  // 取 `accent`：它与「补看新 K 线 / 立场翻转 / 价格异动」同属「值得注意」的那一档。
+  intel_alert: { label: "情报告警 · 高危市场情报", tone: "accent" },
   bar_advanced: { label: "补看新 K 线 · 首次研判", tone: "accent" },
   signal_flip: { label: "策略立场翻转 · 未收线预演", tone: "accent" },
   resting_order: { label: "挂单盯守 · 未成交委托", tone: "accent" },

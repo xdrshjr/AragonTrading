@@ -17,10 +17,13 @@
 `scheduler` 反向依赖 `runtime` 的注册表，故 `runtime.invalidate` 里那一处 import 是**延迟**的
 （见该函数的 docstring）。
 """
+from .alert import AlertCandidate, AlertDecision, AlertHandoff, plan_alert
 from .attribution import IntelAttribution
 from .cleanup import CleanupPlan, plan_cleanup
+from .conflict import ConflictPair, find_conflicts
 from .citation import CitationResolution, classify_outcome, resolve_citations
 from .disclosure import format_intel
+from .efficacy import Efficacy, Stat, accuracy, solve
 from .extract import ExtractResult, extract_main_text
 from .gate import IntelItem, IntelSource
 from .quotes import VerifiedQuote, normalize_for_match, verify_item_quotes
@@ -31,6 +34,7 @@ from .runtime import (
     intel_digest_for,
     intel_summary_for,
     invalidate,
+    note_alert_outcome,
     register,
     runtime_for,
     unregister,
@@ -40,8 +44,13 @@ from .service_verify import run_verify_round
 from .taxonomy import IntelLimits, limits_from_settings
 
 __all__ = [
+    "AlertCandidate",
+    "AlertDecision",
+    "AlertHandoff",
     "CitationResolution",
     "CleanupPlan",
+    "ConflictPair",
+    "Efficacy",
     "ExtractResult",
     "IntelAttribution",
     "IntelDeps",
@@ -51,18 +60,23 @@ __all__ = [
     "IntelSource",
     "ReaderConfig",
     "ReaderResult",
+    "Stat",
     "VerifiedQuote",
     "build_group_runtime",
     "extract_main_text",
     "fetch_many",
     "guard_url",
+    "accuracy",
     "classify_outcome",
+    "find_conflicts",
     "format_intel",
     "intel_digest_for",
     "intel_summary_for",
     "invalidate",
     "limits_from_settings",
     "normalize_for_match",
+    "note_alert_outcome",
+    "plan_alert",
     "plan_cleanup",
     "register",
     "resolve_citations",
@@ -70,6 +84,7 @@ __all__ = [
     "run_curate_round",
     "run_verify_round",
     "runtime_for",
+    "solve",
     "unregister",
     "verify_item_quotes",
 ]
