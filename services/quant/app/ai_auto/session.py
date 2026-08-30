@@ -62,6 +62,7 @@ from .exit_priority import (
 )
 from .experience import ExperienceRuntime
 from . import feed_watchdog
+from .intel import intel_digest_for, intel_summary_for
 from .feed_runtime import FeedRuntime
 from .hold_horizon import HorizonFacts, HorizonRule, gate_status as horizon_gate_status
 from .gate_veto import build_gate_veto_note, veto_layer, veto_layer_label
@@ -2735,6 +2736,12 @@ class AiTradeSession:
             payload, wake_kind=self._wake.last_round_kind,
             horizon_profile_id=self._horizon_profile(),
             position_side=self.executor.projected)
+        # 市场情报（market-intel §3.6.1）：**同步、读进程内快照、不触 DB**——热路径查库会让一次
+        # 决策的时延取决于情报库有多大。未装配 / 零条目 / 尚未成功采集过 ⇒ **整键缺席**（不是
+        # None）⇒ `build_decision_prompt` 输出与本特性合入前**逐字节相同**（G-6）。
+        intel = intel_digest_for(self.inst_id)
+        if intel:
+            payload["intel"] = intel
         return payload
 
     def _build_multi_timeframe_context(self, ts: int, ref_px: float) -> dict | None:
@@ -2959,6 +2966,34 @@ class AiTradeSession:
                             settings=self.executor.settings,
                             wall_seconds=time.time() - self.started_ts)
 
+    async def push_intel(self, summary: dict) -> None:
+        """把一份情报 summary 经既有 WS 出口推给前端（market-intel §3.7.2）。
+
+        由 `IntelRuntime.notify` → `manager._on_intel_summary` 调用，**绝不**在决策链上被 await。
+        """
+        await self._push({"type": "intel", "data": summary})
+
+    def change_24h_pct(self) -> float | None:
+        """近 24 小时涨跌（%），取自**既有** K 线缓存；样本不足 ⇒ None ⇒ 情报上下文整行省略。
+
+        情报采集轮的本地事实之一（market-intel §3.3.2）。**只读内存、不发任何请求**：为了给一句
+        可选的上下文去打一次交易所，是本仓库明确不做的那类交换。
+        """
+        rows = list(self._window.candles)
+        if len(rows) < 2:
+            return None
+        span = max(1, int(86400 // BAR_SECONDS.get(self.bar, 60)))
+        if len(rows) <= span:
+            span = len(rows) - 1
+        try:
+            last = float(rows[-1]["c"])
+            base = float(rows[-1 - span]["c"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if base <= 0:
+            return None
+        return round((last / base - 1.0) * 100.0, 2)
+
     def _wake_interval_minutes(self) -> float | None:
         """墙钟定时唤醒周期回执换算（秒→分，关闭态存 None，与分组/config 口径统一，RN-7）。"""
         return round(self.wake_interval_s / 60, 4) if self.wake_interval_s > 0 else None
@@ -2970,13 +3005,17 @@ class AiTradeSession:
         # await 期间决策任务续写导致重连客户端对同段文字二次追加（每段增量恰好下发一次）。
         # D4：**下发**封顶末 2000 条（断线重放载荷与前端内存的安全网）；`executor.trades` 本体
         # 是换手闸 / run metrics / 成本对账的会计真值，**绝不裁剪**（见 app/wire_caps.py）。
+        # `intel` 是第八键（market-intel §3.7.3）：**WS 事件与快照两处都要装**——只挂事件的话，
+        # 刷新页面后未读徽标与降级提示会凭空消失，而 WS 通路却是好的（`info()` / `_status_payload()`
+        # 双装配的成文教训）。取数同步读进程内缓存，未装配 ⇒ `None` ⇒ 前端整段不渲染。
         return {"trades": tail_trades(self.executor.trades),
                 "equity": list(self._equity),
                 "position": self._position_payload(mark),
                 "status": self._status_payload(),
                 "decisions": list(self._decisions),
                 "contextSummary": self.decider.summary,
-                "agentTraces": [dict(t) for t in self._traces]}
+                "agentTraces": [dict(t) for t in self._traces],
+                "intel": intel_summary_for(self.inst_id)}
 
     def info(self) -> dict:
         return {"sessionId": self.session_id, "runId": self.run_id, "state": self.state,

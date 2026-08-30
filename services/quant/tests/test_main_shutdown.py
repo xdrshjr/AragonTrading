@@ -151,11 +151,16 @@ def test_shutdown_steps_are_zero_arg_factories_in_the_legacy_order():
     之后、`db_engine` 之前**：先停会话（它在返回前 spawn 终局物化与蒸馏），再收那些后台任务；
     收不干净的任务会活着穿过 `dispose_engine`，而 SQLite 引擎在还有活任务持着会话时被 dispose
     的后果只在日志里留一行「did not settle」。
+
+    `ai_trade_intel`（ai-trade-market-intel §3.5.1）位置同理，且**必须排在
+    `ai_trade_experience` 之后**——两者都是「先停会话、再收后台任务」，情报轮里还夹着第三方
+    出网调用，放在更靠后的位置能让它多拿到一点收敛时间。这张清单是一份**冻结注册表**：
+    加一步就必须在这里改一行，否则新步骤有没有真的接上完全无从判断。
     """
     steps = _shutdown_steps()
     assert [name for name, _ in steps] == [
         "health_guard", "agent", "discovery", "paper", "ai_trade", "ai_trade_experience",
-        "ai_backtest", "live_auto", "weight_batch", "weight_train", "okx_rest", "okx_pool",
-        "db_engine",
+        "ai_trade_intel", "ai_backtest", "live_auto", "weight_batch", "weight_train",
+        "okx_rest", "okx_pool", "db_engine",
     ]
     assert all(callable(factory) for _, factory in steps)

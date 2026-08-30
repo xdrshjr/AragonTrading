@@ -1069,3 +1069,36 @@ from .ai_experience_repositories import (  # noqa: E402,F401
     unmute_reappeared as unmute_reappeared_experience_lessons,
     upsert_lesson_nodes,
 )
+# ai_intel_repositories：标的市场情报层的四张表（ai-trade-market-intel §五；自包含，与
+# `ai_experience_repositories` 同一拆分范式，调用点仍写 `repo.X`）。
+# ⚠️ **新数据层函数必须在这里再导出**：漏一个的后果不是 ImportError 而是运行期
+# `AttributeError` 被上游的裸 `except` 吞成一行 warning ⇒ 整条特性静默空转。
+from .ai_intel_repositories import (  # noqa: E402,F401
+    apply_intel_curation,
+    archive_intel_items,
+    bump_intel_watch,
+    clear_intel_feedback,
+    count_intel_by_tier,
+    count_intel_rounds_today,
+    count_intel_unread,
+    delete_intel_item,
+    ensure_intel_watch,
+    get_intel_item,
+    intel_item_out,
+    intel_round_out,
+    intel_watch_out,
+    list_intel_blocked_domains,
+    list_intel_items,
+    list_intel_rounds,
+    load_intel_scope,
+    load_intel_watch,
+    mark_intel_seen,
+    merge_intel_sources,
+    patch_intel_item,
+    purge_orphan_superseded,
+    set_intel_feedback,
+    set_intel_watch_enabled,
+    upsert_intel_items,
+    utc_day_key as intel_utc_day_key,
+    write_intel_round,
+)

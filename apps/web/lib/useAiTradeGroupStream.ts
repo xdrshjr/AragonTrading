@@ -21,6 +21,7 @@ import type {
   AiTradeStatusEvent,
   AiTradeTraceEvent,
 } from "./aiTradeTypes";
+import type { AiTradeIntelSummary } from "./intelTypes";
 import { useAppStore } from "./store";
 import type { PaperPositionEvent, Trade } from "./types";
 import type { WsEvent } from "./ws";
@@ -120,6 +121,7 @@ export function useAiTradeGroupStream() {
   const setAiTradeMemberTraces = useAppStore((s) => s.setAiTradeMemberTraces);
   const upsertAiTradeMemberTracePhase = useAppStore((s) => s.upsertAiTradeMemberTracePhase);
   const setAiTradeMemberSummary = useAppStore((s) => s.setAiTradeMemberSummary);
+  const setAiTradeIntelSummary = useAppStore((s) => s.setAiTradeIntelSummary);
 
   // ---- 生命周期对账器（lifecycle-truth F-2，本轮最高杠杆的一处）----
   //
@@ -227,6 +229,7 @@ export function useAiTradeGroupStream() {
           setAiTradeMemberTraces,
           upsertAiTradeMemberTracePhase,
           setAiTradeMemberSummary,
+          setAiTradeIntelSummary,
           requestAiTradeReconcile,
           // F-4（修 D-9）：后端对不存在的会话回一帧 `{"type":"error","code":"NOT_FOUND"}` 后
           // 关闭，而 `ReconnectingWS` 会无限重连 —— 后端重启后页面停在「运行中」并静默重连风暴，
@@ -250,6 +253,7 @@ export function useAiTradeGroupStream() {
     setAiTradeMemberTraces,
     upsertAiTradeMemberTracePhase,
     setAiTradeMemberSummary,
+    setAiTradeIntelSummary,
     requestAiTradeReconcile,
   ]);
 }
@@ -265,6 +269,8 @@ interface MemberSetters {
   setAiTradeMemberTraces: (instId: string, traces: AiTradeRoundTrace[]) => void;
   upsertAiTradeMemberTracePhase: (instId: string, evt: AiTradeTraceEvent) => void;
   setAiTradeMemberSummary: (instId: string, summary: string | null) => void;
+  /** 市场情报 summary（WS `intel` 事件 + `snapshot.intel` 两处装配，market-intel §4.2）。 */
+  setAiTradeIntelSummary: (instId: string, summary: AiTradeIntelSummary | null) => void;
   /** 请一次即时对账（分组级结论仍由后端算，前端只负责把成员事实更新掉）。 */
   requestAiTradeReconcile: () => void;
   /** 停止对这条会话重连（`NOT_FOUND` 之后再连只会造成重连风暴）。 */
@@ -281,6 +287,12 @@ function routeMemberEvent(instId: string, event: WsEvent, setters: MemberSetters
       setters.setAiTradeMemberDecisions(instId, snap.decisions ?? []);
       setters.setAiTradeMemberTraces(instId, snap.agentTraces ?? []);
       setters.setAiTradeMemberSummary(instId, snap.contextSummary ?? null);
+      // 快照的第八键（market-intel §3.7.3）：**两处都要装**——只消费下面那条 `intel` 事件的话，
+      // 刷新页面后未读徽标与降级提示会凭空消失，而 WS 通路却是好的（本仓库的成文教训）。
+      setters.setAiTradeIntelSummary(
+        instId,
+        ((snap as { intel?: AiTradeIntelSummary | null }).intel ?? null),
+      );
       if (snap.status) setters.patchAiTradeMemberStatus(instId, snap.status);
       return;
     }
@@ -308,6 +320,11 @@ function routeMemberEvent(instId: string, event: WsEvent, setters: MemberSetters
       setters.patchAiTradeMemberSession(instId, { contextSummary: summary });
       return;
     }
+    // 市场情报（market-intel §4.2）：情报轮结束、用户改动条目、标记已读之后各推一次。
+    // 事件形状与 `snapshot.intel` 同构，故两处共用同一个 setter（两处各写一份必漂移）。
+    case "intel":
+      setters.setAiTradeIntelSummary(instId, event.data as AiTradeIntelSummary);
+      return;
     // F-3（修 D-10）：唯一一条**实时**的暂停 / 继续信号。上一轮后端推了、前端没有 case，
     // 于是它被丢在地上；本轮才第一次消费它。
     //

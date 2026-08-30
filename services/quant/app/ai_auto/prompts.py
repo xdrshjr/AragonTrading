@@ -803,6 +803,21 @@ def _format_experience(wire: dict | None) -> str:
     return format_experience(wire)
 
 
+def _format_intel(wire: dict | None) -> str:
+    """外部市场情报段（ai-trade-market-intel §3.6.3）；键缺席 / 零条目 ⇒ 空串 ⇒ 整段省略。
+
+    全文渲染在 `intel/disclosure.py`（沿用「长文本渲染下沉、`prompts.py` 只留 3 行」的既有纪律）。
+    **每一行都已在采集 / 整理轮结束时定稿**，本函数只做拼接：`commit_round` 会把 prompt 再渲染
+    一次塞进 `_context`，两次渲染之间任何状态漂移（哪怕只是「4 小时前」变成「5 小时前」）都会让
+    上下文里的那一份与模型真正看到的那一份不一致。
+    """
+    if not wire:
+        return ""
+    from .intel.disclosure import format_intel   # 延迟导入，同 _format_experience
+
+    return format_intel(wire)
+
+
 def _format_experience_counter(wire: dict | None) -> str:
     """反思轮的 L2 反例段（与提议动作最相冲突的一条）；键缺失 ⇒ 空串 ⇒ 整段省略。"""
     if not wire:
@@ -874,6 +889,11 @@ def build_decision_prompt(payload: dict) -> str:
         # 位置：紧随实测战绩之后、证据摘要之前——「本账户的历史成绩」与「从历史里提炼的教训」
         # 是同一类证据的两个粒度，放在一起模型才不必跨段回忆。
         parts.append(experience_line)
+    intel_line = _format_intel(payload.get("intel"))
+    if intel_line:                           # 键缺失 / 零条目 ⇒ 整段省略（G-6 的零回归路径）
+        # 位置：历史教训（内生）→ 外部情报（外生）→ 本轮行情证据（当下）。三者的时间与来源尺度
+        # 由远及近，与系统 prompt 的思维链步骤同序。
+        parts.append(intel_line)
     parts.extend(_digest_lines(payload))     # R1：各段 None 时整段省略（同 E1/E2 降级范式）
     # 战术周期段（时间尺度由远及近单调收缩）：中线背景 → 体制 → 共识 → 先验 → 执行周期证据 →
     # **战术周期** → 基础策略铁律 → 信号板 → 摘要，与系统 prompt 的思维链步骤同序。

@@ -23,6 +23,7 @@ from .api import (
     accounts,
     agent,
     ai_auto,
+    ai_intel,
     ai_trade_lifecycle,
     app_settings,
     discovery,
@@ -85,7 +86,10 @@ ShutdownStep = tuple[str, Callable[[], Awaitable[object]]]
 
 
 def _shutdown_steps() -> tuple[ShutdownStep, ...]:
-    """关停步骤表（顺序逐字保持既有 lifespan 的 12 步，spec D1）。
+    """关停步骤表（顺序逐字保持既有 lifespan 的次序，spec D1；本表当前 14 步）。
+
+    步数会随特性增长，故这里**不再写死一个数字**——写死的那个数会在下一次加步骤时静默过期，
+    而一份说错了自己有几步的关停表比没有注释更坏。
 
     **每一项都是零参 lambda**：单例 getter 与它返回的协程一起在 `_run_shutdown` 的 `try` 内求值，
     这样「getter 自己抛」也只损失那一步，不会把整张表连根拔掉。
@@ -105,6 +109,12 @@ def _shutdown_steps() -> tuple[ShutdownStep, ...]:
         # `shutdown_step_timeout_s`（默认 20.0）；倒挂时外层先 cancel、内层清理永不执行，
         # 后台任务会活着穿过下面的 `db_engine` 那一步（★ E-4 / 评审 P0-4）。
         ("ai_trade_experience", lambda: get_ai_trade_manager().drain_experience_tasks()),
+        # 情报层的后台任务（ai-trade-market-intel §3.5.1）：位置是**硬性**的——必须排在
+        # `ai_trade` 之后（先停会话，它在返回前可能 spawn 最后一轮）、`db_engine` 之前
+        # （否则后台任务会活着穿过 `dispose_engine`）。入口统一走 manager 薄转发，
+        # `main.py` 不直接 import `intel/scheduler`（评审 P1-7）。死线
+        # `ai_trade_intel_drain_timeout_s`（默认 5.0）由启动期校验器钉死 < `shutdown_step_timeout_s`。
+        ("ai_trade_intel", lambda: get_ai_trade_manager().drain_intel_tasks()),
         ("ai_backtest", lambda: get_ai_backtest_manager().shutdown()),
         ("live_auto", lambda: get_live_auto_manager().shutdown()),
         # 关停顺序（weight-multi-model-training §2.6）：先停批次泵、再停底层作业，避免泵在作业消失后空转。
@@ -455,6 +465,7 @@ app.include_router(ai_auto.router, prefix="/api")   # AI 自动交易（ai-auto-
 app.include_router(ai_trade_lifecycle.router, prefix="/api")  # AI 自动交易生命周期（暂停/继续/结束，ai-trade-pause-resume §五）
 app.include_router(app_settings.router, prefix="/api")  # 第 11 个路由（设置中心 · 自动交易设置 §4.1）
 app.include_router(experience.router, prefix="/api")  # 交易经验库（ai-trade-experience-context-graph §五）
+app.include_router(ai_intel.router, prefix="/api")  # 标的市场情报库（ai-trade-market-intel §4.1）
 app.include_router(workspace.router, prefix="/api")  # 第 12 个路由（workspace 偏好持久化，watchlist-auto-trade-persistence §3）
 app.include_router(weight_models.router, prefix="/api")  # 权重模型工作区（weight-model-workspace §五；含 WS /ws/weight-train/{jobId}）
 app.include_router(weight_batches.router, prefix="/api")  # 多模型训练竞技场（weight-multi-model-training §四；含 WS /ws/weight-batch/{batchId}）

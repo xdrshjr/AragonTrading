@@ -1622,8 +1622,13 @@ class AgentConfigOut(BaseModel):
 
 
 # ---------------- AI 模型服务商（设置中心） ----------------
-def _key_preview(api_key: str) -> str:
-    """密钥脱敏预览：仅末 4 位，前缀点号；无 key 返回空串（绝不外泄明文，R-Sec）。"""
+def key_preview(api_key: str) -> str:
+    """密钥脱敏预览：仅末 4 位，前缀点号；无 key 返回空串（绝不外泄明文，R-Sec）。
+
+    **公开名**：`api/app_settings.py` 的情报检索源卡片也要用它。一个下划线开头的名字被两个模块
+    共用，等于把它的签名变成公开契约却没有任何地方说明这件事（同 `intel/search.py::_redact`
+    那条注释里立下的判据）。
+    """
     key = (api_key or "").strip()
     return f"····{key[-4:]}" if key else ""
 
@@ -1634,7 +1639,7 @@ def provider_out(row: AgentProvider) -> dict:
     return {
         "id": row.id, "slug": row.slug, "kind": row.kind, "label": row.label,
         "apiStandard": row.api_standard, "baseUrl": row.base_url, "model": row.model,
-        "userAgent": row.user_agent, "hasKey": has_key, "keyPreview": _key_preview(row.api_key),
+        "userAgent": row.user_agent, "hasKey": has_key, "keyPreview": key_preview(row.api_key),
         "isDefault": bool(row.is_default), "deletable": row.kind == "custom",
         "createdTs": int(row.created_at.timestamp()) if row.created_at else 0,
         "updatedTs": int(row.updated_at.timestamp()) if row.updated_at else 0,
@@ -1749,12 +1754,12 @@ def tool_out(meta: dict, enabled: bool) -> dict:
 def account_out(row: OkxAccount) -> dict:
     """OkxAccount 行 → 前端 dict（camelCase）。**绝不含 raw secret/passphrase / 完整 api_key**。
 
-    掩码复用 `_key_preview`（P2-Naming：字段名取 `apiKeyPreview` 而非 `keyPreview`，多密钥实体下更清晰）；
+    掩码复用 `key_preview`（P2-Naming：字段名取 `apiKeyPreview` 而非 `keyPreview`，多密钥实体下更清晰）；
     时间照 `provider_out` 输出秒级 UTC 整数（P2-Time，全系统时间口径一致）。
     """
     return {
         "id": row.id, "label": row.label,
-        "apiKeyPreview": _key_preview(row.api_key),
+        "apiKeyPreview": key_preview(row.api_key),
         "hasSecret": bool((row.secret_key or "").strip()),
         "hasPassphrase": bool((row.passphrase or "").strip()),
         "ipWhitelist": row.ip_whitelist, "permissions": row.permissions,
@@ -2711,6 +2716,117 @@ class ExperienceSettingsOut(BaseModel):
     utilityTThreshold: float
     l0MinChars: int          # 下限判据如实下发，使 UI 能在提交前就说清楚为什么不合法（I-8）
     l1MinChars: int
+
+
+# ============================ 标的市场情报（ai-trade-market-intel §4.1）============================
+# 本节**只定义入参**（`/intel/*` 一律不挂 `response_model`：它们回的是带嵌套结构的领域对象，
+# 未在模型里声明的 wire 键会被静默丢弃，本仓库为此栽过），外加一个 `IntelSettingsOut`——
+# `/settings/intel*` 落在 `api/app_settings.py`，而该文件既有的两组设置端点**都挂了**
+# `response_model`；在一个百来行的文件里造出两种口径比统一到任一种都差（评审 P2-4）。
+class IntelSourceIn(BaseModel):
+    """用户手工新增情报时填的一条来源。"""
+
+    url: str = Field(max_length=512)
+    title: str = Field(default="", max_length=120)
+    publishedTs: int | None = None
+
+    @field_validator("url")
+    @classmethod
+    def _http_only(cls, value: str) -> str:
+        """仅 http(s)。`javascript:` / `file:` / `mailto:` 一律拒——这条链路的终点是一个用户会
+        点击的外链，而桌面端的外链走系统浏览器。"""
+        raw = (value or "").strip()
+        if not (raw.startswith("http://") or raw.startswith("https://")):
+            raise ValueError("来源链接必须是 http(s) 绝对地址")
+        return raw
+
+
+class IntelItemIn(BaseModel):
+    """手工新增一条情报（`origin="user"`）。"""
+
+    tier: Literal["ultra", "mid", "long"] = "ultra"
+    category: Literal["market", "sentiment", "macro", "onchain", "project", "risk"]
+    headline: str = Field(min_length=1, max_length=40)
+    summary: str = Field(min_length=1, max_length=400)
+    stance: Literal["bullish", "bearish", "neutral"] = "neutral"
+    impact: Literal["low", "medium", "high"] = "medium"
+    eventTs: int | None = None
+    sources: list[IntelSourceIn] = Field(default_factory=list, max_length=6)
+    pinned: bool = False
+
+
+class IntelItemPatchIn(BaseModel):
+    """编辑 / 移层 / 置顶 / 静音（全部可选；一个非 None 都没有 ⇒ 422）。"""
+
+    tier: Literal["ultra", "mid", "long"] | None = None
+    category: Literal["market", "sentiment", "macro", "onchain", "project", "risk"] | None = None
+    headline: str | None = Field(default=None, min_length=1, max_length=40)
+    summary: str | None = Field(default=None, min_length=1, max_length=400)
+    stance: Literal["bullish", "bearish", "neutral"] | None = None
+    impact: Literal["low", "medium", "high"] | None = None
+    pinned: bool | None = None
+    status: Literal["active", "archived", "muted"] | None = None
+
+    @model_validator(mode="after")
+    def _at_least_one(self) -> "IntelItemPatchIn":
+        """空 patch 一律 422：静默地「保存成功但什么都没改」是本仓库明令禁止的形状。"""
+        if not self.model_dump(exclude_none=True):
+            raise ValueError("至少要给出一个待修改字段")
+        return self
+
+
+class IntelMoveIn(BaseModel):
+    """移层（`POST /intel/items/{id}/move`）。"""
+
+    tier: Literal["ultra", "mid", "long"]
+
+
+class IntelSeenIn(BaseModel):
+    """标记已读（缺省取服务端 now；未读徽标的唯一真值写入口，评审 P1-2）。"""
+
+    ts: int | None = None
+
+
+class IntelSettingsIn(BaseModel):
+    """设置中心「情报检索源」卡片的可写字段。
+
+    `apiKey` 的三态语义：``""``（或缺席）= 保持不变；``"__clear__"`` = 清除；其余 = 写入。
+    没有这三态，用户就无法在「不重新输入密钥」的前提下改别的字段。
+    """
+
+    enabled: bool | None = None
+    injectEnabled: bool | None = None
+    provider: Literal["none", "tavily", "brave", "serper"] | None = None
+    apiKey: str | None = None
+    collectIntervalMin: float | None = Field(default=None, ge=5, le=1440)
+    curateEveryNCollects: int | None = Field(default=None, ge=1, le=24)
+    dailyCap: int | None = Field(default=None, ge=1, le=1000)
+
+
+class IntelProbeIn(BaseModel):
+    """测试连接（不传即用已存配置）。"""
+
+    provider: Literal["none", "tavily", "brave", "serper"] | None = None
+    apiKey: str | None = None
+
+
+class IntelCostEstimateOut(BaseModel):
+    roundsPerDay: int
+    inputTokensPerDay: int
+
+
+class IntelSettingsOut(BaseModel):
+    """`GET/PUT /settings/intel` 的回执。**绝不含 raw key**，仅 hasKey/keyPreview（§3.2.3）。"""
+
+    enabled: bool
+    injectEnabled: bool
+    provider: str
+    hasKey: bool
+    keyPreview: str
+    collectIntervalMin: float
+    curateEveryNCollects: int
+    dailyCap: int
+    estimate: IntelCostEstimateOut
 
 
 class ErrorBody(BaseModel):

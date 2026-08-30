@@ -321,3 +321,67 @@ describe("useAiTradeGroupStream · WS 两个新 case（用例 14）", () => {
     expect(close).not.toHaveBeenCalled();
   });
 });
+
+describe("useAiTradeGroupStream · 市场情报（ai-trade-market-intel §4.2）", () => {
+  const INST = "BTC-USDT-SWAP";
+  const SUMMARY = {
+    instId: INST,
+    counts: { ultra: 2, mid: 1, long: 0, archived: 0 },
+    unread: 2,
+    lastSeenTs: 0,
+    lastCollectTs: 1_700_000_000,
+    lastCurateTs: null,
+    nextDueTs: null,
+    inFlight: false,
+    degrade: null,
+    providerConfigured: true,
+    dailyUsed: 1,
+    dailyCap: 96,
+  };
+
+  function captureRouter() {
+    let onEvent: ((e: { type: string; data: unknown }) => void) | null = null;
+    vi.mocked(aiTradeWS).mockImplementation(((_sid: string, handler: never) => {
+      onEvent = handler as never;
+      return { connect: vi.fn(), close: vi.fn() } as never;
+    }) as never);
+    return { getOnEvent: () => onEvent };
+  }
+
+  async function mount() {
+    const captured = captureRouter();
+    seedLocalGroup();
+    vi.mocked(aiTradeApi.status).mockResolvedValue({
+      group: HOT, aiTradeEnabled: true, resumable: null,
+    } as never);
+    renderHook(() => useAiTradeGroupStream());
+    await waitFor(() => expect(captured.getOnEvent()).toBeTruthy());
+    return captured;
+  }
+
+  it("`intel` 事件落进 store 的情报切片", async () => {
+    const { getOnEvent } = await mount();
+    act(() => getOnEvent()!({ type: "intel", data: SUMMARY }));
+    expect(useAppStore.getState().aiTradeIntel[INST].unread).toBe(2);
+  });
+
+  it("`snapshot.intel` 也要落——**只消费事件的话，刷新页面后徽标会凭空消失**", async () => {
+    const { getOnEvent } = await mount();
+    act(() =>
+      getOnEvent()!({
+        type: "snapshot",
+        data: { trades: [], decisions: [], agentTraces: [], intel: SUMMARY },
+      }),
+    );
+    expect(useAppStore.getState().aiTradeIntel[INST].unread).toBe(2);
+  });
+
+  it("老后端不下发 `intel` 键时静默向前兼容（不抛、不清）", async () => {
+    const { getOnEvent } = await mount();
+    act(() => getOnEvent()!({ type: "intel", data: SUMMARY }));
+    act(() =>
+      getOnEvent()!({ type: "snapshot", data: { trades: [], decisions: [], agentTraces: [] } }),
+    );
+    expect(useAppStore.getState().aiTradeIntel[INST].unread).toBe(2);
+  });
+});

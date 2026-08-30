@@ -59,6 +59,8 @@ from .decider import AiTradeDecider
 from .experience import ExperienceRule, ExperienceRuntime, SessionGraph
 from .experience import scheduler
 from .experience.events import EventIdentity
+from .intel import runtime as intel_runtime
+from .intel import scheduler as intel_scheduler
 from .llm_budget import build_ai_trade_llm_clients
 from .prompts import build_ai_trade_system_prompt, format_direction_charter
 from .prompts_en import SystemPromptOptions, SystemPromptTexts
@@ -388,6 +390,9 @@ class AiTradeManager:
             # 只覆盖 `paused` 行。挪到成功之后**零信息损失**：`session.start()` 只做暖机 + 建 WS +
             # 起 monitor，**不下任何单**，启动失败时交易所上不可能有本会话开出的仓位。
             await self._persist_group_state(launched, status=pause_core.STATUS_RUNNING)
+            # 市场情报层（market-intel §3.5.1）：装配排在启动成功之后——它是一条**加法**流水线，
+            # 绝不允许它的任何失败影响真实资金会话的启动（判定与 fail-open 都在 `_wire_intel`）。
+            await self._wire_intel(launched, provider=provider)
             return launched
 
     @staticmethod
@@ -820,6 +825,7 @@ class AiTradeManager:
                          "runId": member.run_id, "flattened": flat})
         self._group = None
         self._forget_paused_ref(group_id)   # I-2：`_group` 与 `_paused_ref` 永不同时非空
+        self._unwire_intel(group_id)        # **同步**：只 cancel、不 await（G-8 的时延门禁）
         return {"groupId": group_id, "stopReason": reason, "members": rows}
 
     def _forget_paused_ref(self, group_id: str) -> None:
@@ -865,6 +871,8 @@ class AiTradeManager:
         group.state = pause_core.STATUS_PAUSED
         group.pause_reason = reason
         group.paused_ts = int(time.time())
+        # 情报调度同步暂停：**只停调度、不取消在飞轮**，在飞轮跑完自然收敛（§3.5.1）。
+        intel_scheduler.pause(group_id)
         rows = self._state_member_rows(group, receipts)
         await self._persist_group_state(group, status=pause_core.STATUS_PAUSED,
                                         member_rows=rows)     # W4（失败必须上抛）
@@ -915,6 +923,7 @@ class AiTradeManager:
                 group.resumed_count += 1
                 await self._persist_group_state(group, status=pause_core.STATUS_RUNNING)
                 self._forget_paused_ref(group_id)
+                intel_scheduler.resume(group_id)   # 热续跑：runtime 还在，只需放开调度
                 return group
             from .resume import resume_cold_group     # 延迟导入：resume.py 反向依赖本模块
             started = time.time()
@@ -928,6 +937,9 @@ class AiTradeManager:
             await self._verify_armed(resumed, None, cold=True)                      # ⑤
             self._group = resumed
             self._paused_ref = None
+            # 冷续跑：进程里没有 runtime 了，必须整个重建。`ai_intel_watch.next_due_ts` 让它接着
+            # 上次的节奏跑，而不是一开机就把 N 个标的一起打出去（R-10）。
+            await self._wire_intel(resumed)
             await self._persist_group_state(resumed, status=pause_core.STATUS_RUNNING)
             return resumed
 
@@ -1121,6 +1133,7 @@ class AiTradeManager:
             await self._archive_cold_runs(members)
         await self._mark_state_ended(group_id)
         self._forget_paused_ref(group_id)
+        self._unwire_intel(group_id)
         # `flattened` 描述的是**结果**而不是意图：请求平仓但有成员没平掉 ⇒ 它必须是 False，
         # 且那几笔如实进 `orphanPositions`（回执里这两个键绝不能互相打架）。
         return {"groupId": group_id, "endedFrom": ended_from,
@@ -1445,6 +1458,78 @@ class AiTradeManager:
     async def drain_experience_tasks(self) -> None:
         """关停链的一步：**先 cancel、再有界收敛**（★ E-4，死线由启动期校验器钉死 < 单步死线）。"""
         await scheduler.drain(self._experience_drain_timeout())
+
+    # ---------- 市场情报层的薄转发（market-intel §6.1 #21；**判定全在 `intel/` 包内**）----------
+    async def _wire_intel(self, group: AiTradeGroup, *, provider=None) -> None:
+        """装配一个分组的情报流水线。**全程 fail-open**。
+
+        情报是一条加法流水线：检索源没配、key 过期、模型不可用——任何一种都不该让一次真实资金
+        的启动失败。这与 `_probe_tradability` 的取舍同源：一个旁路统计量把用户挡在门外，比给错
+        建议更坏。
+        """
+        try:
+            settings = self._group_settings(group)
+            cfg = provider or await resolve_active_provider(get_sessionmaker(), settings)
+            runtime = await intel_runtime.build_group_runtime(
+                group_id=group.group_id,
+                members=[member.inst_id for member in group.members],
+                settings=settings, sessionmaker=get_sessionmaker(), provider_cfg=cfg,
+                # **必须传本模块里的这一份** `make_llm_client_from_config`：20+ 个测试文件以
+                # `monkeypatch.setattr("app.ai_auto.manager.make_llm_client_from_config", …)`
+                # 注入假客户端，把工厂换到别处解析会一次性打翻它们全部（E-5）。
+                make_client=make_llm_client_from_config, bar=group.bar,
+                change_24h_pct=partial(self._intel_change_pct, group.group_id),
+                notify=partial(self._on_intel_summary, group.group_id))
+            intel_runtime.register(runtime)
+            intel_scheduler.start(runtime)
+        except Exception as exc:  # noqa: BLE001 —— 见 docstring
+            logger.warning("ai-trade intel wiring skipped for %s: %s", group.group_id, exc)
+
+    def _unwire_intel(self, group_id: str) -> None:
+        """**同步**拆卸：只 cancel、不 await（G-8：`stop_group` 串行遍历成员，客户端超时档 20s）。"""
+        intel_scheduler.cancel(group_id)
+        intel_runtime.unregister(group_id)
+
+    def _intel_change_pct(self, group_id: str, inst_id: str) -> float | None:
+        """近 24 小时涨跌（**同步、只读会话内存的 K 线缓存**）；取不到 ⇒ None ⇒ 该行省略。"""
+        group = self._group
+        if group is None or group.group_id != group_id:
+            return None
+        member = next((m for m in group.members if m.inst_id == inst_id), None)
+        if member is None:
+            return None
+        try:
+            return member.session.change_24h_pct()
+        except Exception:  # noqa: BLE001 —— 一行可选的上下文，绝不允许它打断一轮情报
+            return None
+
+    def _on_intel_summary(self, group_id: str, inst_id: str, summary: dict) -> None:
+        """情报轮的 WS 出口（**同步回调，不 await**）：把 summary 推给对应成员会话。"""
+        group = self._group
+        if group is None or group.group_id != group_id:
+            return
+        member = next((m for m in group.members if m.inst_id == inst_id), None)
+        if member is None:
+            return
+        intel_scheduler.schedule(member.session.push_intel(summary))
+
+    async def drain_intel_tasks(self) -> None:
+        """关停链的一步（`main._shutdown_steps()` 的第 7 步）：先 cancel、再有界收敛。
+
+        死线是**独立设置项**而不是运行期算的比例，且由启动期校验器钉死 <
+        `shutdown_step_timeout_s`——倒挂时外层先 cancel、内层清理永不执行（评审 P1-7）。
+        """
+        await intel_scheduler.drain(self._intel_drain_timeout())
+
+    def _intel_drain_timeout(self) -> float:
+        """drain 死线：优先取活跃分组的派生副本，无分组时回落进程级默认。"""
+        group = self._group
+        settings = self._group_settings(group) if group is not None and group.members else None
+        if settings is None:
+            from ..config import get_settings
+
+            settings = get_settings()
+        return float(getattr(settings, "ai_trade_intel_drain_timeout_s", 5.0))
 
     def _experience_drain_timeout(self) -> float:
         """drain 死线：优先取活跃分组的派生副本，无分组时回落进程级默认。"""

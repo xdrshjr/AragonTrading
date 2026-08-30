@@ -13,8 +13,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ..ai_auto import get_ai_trade_manager
 from ..ai_auto.experience.disclosure import budget_floor
 from ..ai_auto.experience.service import resolve_experience_settings, setting_bridge
+from ..ai_auto.intel import search as intel_search
+from ..ai_auto.intel import service as intel_service
 from ..config import Settings, get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
@@ -23,6 +26,10 @@ from ..schemas import (
     AutoTradeSettingsOut,
     ExperienceSettingsIn,
     ExperienceSettingsOut,
+    IntelProbeIn,
+    IntelSettingsIn,
+    IntelSettingsOut,
+    key_preview,
 )
 
 router = APIRouter(tags=["settings"])
@@ -111,3 +118,97 @@ async def update_experience_settings(body: ExperienceSettingsIn,
         value = bool(patch[wire_key]) if caster is bool else caster(patch[wire_key])
         await repo.set_app_setting(session, app_key, value)
     return await _experience_wire(session, settings)
+
+
+# ---------------- 情报检索源（ai-trade-market-intel §4.1）----------------
+# 尚无在跑分组时，成本估算按这个标的数算（与 §3.8.5 文案里的「5 个标的」同一个数）。
+_ESTIMATE_FALLBACK_SYMBOLS = 5
+
+
+async def _intel_wire(session: AsyncSession, settings: Settings) -> dict:
+    """把**运行时真正会读到的那一份**设置渲染成面板回执。
+
+    与上面 `_experience_wire` 同款理由：直接读 `app_settings` 的原始键，回执说的是「库里存了
+    什么」，而用户想知道的是「系统实际会用什么」。两者在「DB 里有个越界值被夹紧了」时并不相等。
+
+    **绝不外泄明文密钥**（§3.2.3）：只回 `hasKey` / `keyPreview`，掩码复用既有单一真源
+    `schemas.key_preview`，不再写第二份。
+    """
+    derived = await intel_service.resolve_intel_settings(session, settings)
+    api_key = await intel_service.resolve_api_key(session, derived)
+    # 估算的标的数取**当前在跑的分组**；没有分组时用一个典型规模兜底，好让这块面板在按下开关
+    # **之前**就能给出一个量级——一张写着「0 轮 / 0 token」的成本卡等于没有成本卡。
+    members = len((get_ai_trade_manager().group_status() or {}).get("members") or [])
+    members = members or _ESTIMATE_FALLBACK_SYMBOLS
+    return {
+        "enabled": bool(derived.ai_trade_intel_enabled),
+        "injectEnabled": bool(derived.ai_trade_intel_inject),
+        "provider": str(derived.ai_trade_intel_search_provider),
+        "hasKey": bool(api_key),
+        "keyPreview": key_preview(api_key),
+        "collectIntervalMin": float(derived.ai_trade_intel_collect_interval_min),
+        "curateEveryNCollects": int(derived.ai_trade_intel_curate_every_n_collects),
+        "dailyCap": int(derived.ai_trade_intel_daily_round_cap),
+        # 成本估算直接进回执（R-4）：让「一天大概多少 token」在按下开关**之前**就看得见，
+        # 而不是月底看账单时才知道。
+        "estimate": intel_service.estimate_daily_cost(
+            symbols=members,
+            interval_min=float(derived.ai_trade_intel_collect_interval_min),
+            corpus_docs=int(derived.ai_trade_intel_corpus_max_docs),
+            snippet_chars=int(derived.ai_trade_intel_snippet_max_chars)),
+    }
+
+
+@router.get("/settings/intel", response_model=IntelSettingsOut)
+async def read_intel_settings(session: AsyncSession = Depends(get_session),
+                              settings: Settings = Depends(get_settings)) -> dict:
+    """读情报检索源设置（缺记录回 `config.py` 默认）。"""
+    return await _intel_wire(session, settings)
+
+
+@router.put("/settings/intel", response_model=IntelSettingsOut)
+async def update_intel_settings(body: IntelSettingsIn,
+                                session: AsyncSession = Depends(get_session),
+                                settings: Settings = Depends(get_settings)) -> dict:
+    """写情报检索源设置（只写用户显式给出的字段；越界 422 由 schema 触发）。
+
+    `apiKey` 三态：``""`` / 缺席 = 保持不变；``"__clear__"`` = 清除；其余 = 写入。没有这三态，
+    用户就无法在「不重新输入密钥」的前提下改别的字段——而那是这块面板最常见的操作。
+
+    写完立刻回读**生效值**：「保存成功」与「真的生效了」不是一回事。
+    """
+    patch = body.model_dump(exclude_none=True)
+    for wire_key, app_key, _field, caster in intel_service.INTEL_SETTING_BRIDGE:
+        if wire_key not in patch:
+            continue
+        value = bool(patch[wire_key]) if caster is bool else caster(patch[wire_key])
+        await repo.set_app_setting(session, app_key, value)
+    api_key = patch.get("apiKey")
+    if api_key == "__clear__":
+        await repo.set_app_setting(session, intel_service.INTEL_API_KEY_APP_KEY, "")
+    elif isinstance(api_key, str) and api_key.strip():
+        await repo.set_app_setting(session, intel_service.INTEL_API_KEY_APP_KEY,
+                                   api_key.strip())
+    return await _intel_wire(session, settings)
+
+
+@router.post("/settings/intel/probe")
+async def probe_intel_source(body: IntelProbeIn,
+                             session: AsyncSession = Depends(get_session),
+                             settings: Settings = Depends(get_settings)) -> dict:
+    """「测试连接」：一次受**硬封顶 12 秒**约束的真实检索（评审 P1-6）。
+
+    前端的 REST 超时集中在 `lib/httpTimeout.ts`，默认档 `FAST_MS = 20_000`。probe 是本特性里
+    唯一一个「同步的第三方出网调用」，而 `search_timeout_s` 可配到 60s、`max_retries` 可配到 5
+    ⇒ 最坏耗时远超 FAST 档，症状是「后端其实成功了，按钮却报超时」。故这里 `max_retries=0` 且
+    总耗时硬封顶——probe 是配置校验，不是生产取数。
+    """
+    derived = await intel_service.resolve_intel_settings(session, settings)
+    provider = body.provider or str(derived.ai_trade_intel_search_provider)
+    api_key = (body.apiKey or "").strip() or await intel_service.resolve_api_key(
+        session, derived)
+    return await intel_search.probe_provider(
+        slug=provider, api_key=api_key,
+        base_url=str(derived.ai_trade_intel_search_base_url),
+        timeout_s=float(derived.ai_trade_intel_search_timeout_s),
+        proxy=derived.proxy_url)

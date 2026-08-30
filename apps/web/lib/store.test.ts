@@ -965,3 +965,52 @@ describe("app store — 生命周期对账的三个瞬态字段与窄 action", (
     expect(until).toBeLessThanOrEqual(before + 31_000);
   });
 });
+
+describe("app store — 市场情报切片（ai-trade-market-intel §6.2 #38）", () => {
+  const INST = "BTC-USDT-SWAP";
+  const summary = {
+    instId: INST,
+    counts: { ultra: 2, mid: 1, long: 0, archived: 0 },
+    unread: 3,
+    lastSeenTs: 0,
+    lastCollectTs: 1,
+    lastCurateTs: null,
+    nextDueTs: null,
+    inFlight: false,
+    degrade: null,
+    providerConfigured: true,
+    dailyUsed: 1,
+    dailyCap: 96,
+  };
+
+  beforeEach(() => useAppStore.setState({ aiTradeIntel: {}, aiTradeGroup: null }));
+
+  it("按 instId 落库，互不覆盖", () => {
+    useAppStore.getState().setAiTradeIntelSummary(INST, summary as never);
+    useAppStore.getState().setAiTradeIntelSummary("ETH-USDT-SWAP",
+      { ...summary, instId: "ETH-USDT-SWAP", unread: 0 } as never);
+    const slice = useAppStore.getState().aiTradeIntel;
+    expect(slice[INST].unread).toBe(3);
+    expect(slice["ETH-USDT-SWAP"].unread).toBe(0);
+  });
+
+  it("`null` 是 no-op（一条读不到的推送不该把已有徽标抹掉）", () => {
+    useAppStore.getState().setAiTradeIntelSummary(INST, summary as never);
+    useAppStore.getState().setAiTradeIntelSummary(INST, null);
+    expect(useAppStore.getState().aiTradeIntel[INST].unread).toBe(3);
+  });
+
+  it("clearAiTradeRuntime 一并清情报切片", () => {
+    // 不清的话，下一次开另一个标的时旧的未读红点会挂在一个已经不在跑的标的上——
+    // 一个指向已归档会话的红点比没有红点更坏。
+    useAppStore.getState().setAiTradeIntelSummary(INST, summary as never);
+    useAppStore.getState().clearAiTradeRuntime();
+    expect(useAppStore.getState().aiTradeIntel).toEqual({});
+  });
+
+  it("情报切片**不进 partialize**（它是服务端真值的镜像，重连即补齐）", () => {
+    useAppStore.getState().setAiTradeIntelSummary(INST, summary as never);
+    const persisted = JSON.parse(localStorage.getItem("aragon-ui") ?? "{}");
+    expect(persisted?.state?.aiTradeIntel).toBeUndefined();
+  });
+});

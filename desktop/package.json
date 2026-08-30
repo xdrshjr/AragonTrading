@@ -31,6 +31,7 @@
     "check:buildweb": "node --check scripts/build-web.mjs",
     "check:verifydist": "node --check scripts/verify-dist.mjs",
     "check:agentenv": "node --check src/lib/agent-env.js",
+    "check:externallinks": "node --check src/lib/external-links.js",
     "check:rendererhealth": "node --check src/lib/renderer-health.js",
     "check:startupfailure": "node --check src/lib/startup-failure.js",
     "check:buildagentenv": "node --check scripts/build-agent-env.mjs"

@@ -17,6 +17,7 @@ const {
   createReloadBudget,
   describeLoadFailure,
 } = require('./lib/renderer-health');
+const { wireExternalLinks } = require('./lib/external-links');
 const { describeStartupFailure } = require('./lib/startup-failure');
 const {
   ProcessManager,
@@ -278,6 +279,9 @@ function createWindow() {
   wireWindowShortcuts(win);
   // 渲染进程崩溃 / 无响应 / 加载失败的兜底（spec D5）。
   wireRendererHealth(win);
+  // 外链交给系统浏览器（market-intel §3.9 / G-10）：情报的来源链接是本仓库第一次需要外链，
+  // 不接这一行，打包后点击来源会开出一个无外壳的 Electron 窗口，且 will-navigate 可被劫持。
+  wireExternalLinks(win, { shell, log: logMain });
   // 就绪前先显示内置过渡页，避免白屏 / ERR_CONNECTION_REFUSED 闪现（spec §4.2 step8）。
   win.loadFile(path.join(__dirname, 'loading.html'));
   win.on('closed', () => {

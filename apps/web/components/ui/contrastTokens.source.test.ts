@@ -142,11 +142,14 @@ describe("④ lib/** 下每一个 fetch 都经 withTimeout（D3）", () => {
   // （通用 `request` 一处 + NDJSON 导出一处——后者要拿 `res.text()` 而不是 `res.json()`，
   // 走不了通用包装）。于是 18 → 20 个调用点、18 → 19 个文件。**这个数字每次都要人来对一遍**，
   // 那正是它存在的理由：一个新 `*Api.ts` 忘了接超时时，按钮会静默冻结最长 5 分钟。
-  it("扫到了全部 fetch 调用点（20 个调用点 / 19 个文件）", () => {
+  //
+  // ai-trade-market-intel 新增 `intelApi.ts`：**1 个调用点 / 1 个文件**（全部端点共用
+  // 同一个通用 `request`）。于是 20 → 21 个调用点、19 → 20 个文件。
+  it("扫到了全部 fetch 调用点（21 个调用点 / 20 个文件）", () => {
     const sites = LIB.reduce((n, s) => n + (s.text.match(/\bfetch\(/g)?.length ?? 0), 0);
     const files = LIB.filter((s) => /\bfetch\(/.test(s.text));
-    expect(sites).toBe(20);
-    expect(files.length).toBe(19);
+    expect(sites).toBe(21);
+    expect(files.length).toBe(20);
   });
 
   // 判据是**调用点**不是文件：`aiTradeHorizonApi.ts` 一个文件里就有 3 个彼此独立的 fetch 且没有共享

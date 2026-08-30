@@ -8,6 +8,7 @@ import AgentToolsSection from "./AgentToolsSection";
 import AiModelsSection from "./AiModelsSection";
 import AutoTradeSettingsSection from "./AutoTradeSettingsSection";
 import ExperienceSection from "./ExperienceSection";
+import IntelSourceSettings from "./IntelSourceSettings";
 import OkxAccountsSection from "./OkxAccountsSection";
 import SettingsNav from "./SettingsNav";
 
@@ -65,6 +66,8 @@ export default function SettingsPanel() {
             <AutoTradeSettingsSection />
           ) : section === "experience" ? (
             <ExperienceSection />
+          ) : section === "intel-source" ? (
+            <IntelSourceSettings />
           ) : section === "about" ? (
             <AboutSection />
           ) : (

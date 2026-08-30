@@ -865,3 +865,130 @@ class AiExperienceInjection(Base):
     fee_known: Mapped[bool] = mapped_column(Boolean, default=False)
     cost_basis: Mapped[str] = mapped_column(String(8), default="gross")
     created_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiIntelItem(Base):
+    """一条已过闸的标的市场情报（ai-trade-market-intel §3.1.2）。
+
+    为什么是新表而不是复用 ``ai_experience_nodes``：经验节点是**从自家成交里提炼**的内生教训，
+    其物化可以整表重算；情报是**外部检索**的一次性事实，重算不可能（历史语料取不回来），
+    且带 URL / 发布时间 / 独立域名计数这些经验节点没有也不该有的列。两者混表会让
+    ``experience`` 的「随时可以整表重算」这一可修复性来源当场失效。
+
+    ``create_all`` **会**建缺失的表、**不会**给既有表补列（见 ``db/session.py`` 的四个
+    ``_ensure_*_columns`` 补丁）。四张全部是新表 ⇒ 零迁移代码、老库首次启动自动获得。
+    """
+
+    __tablename__ = "ai_intel_items"
+    __table_args__ = (
+        # **约束作用域跨全部 status**（评审 P0-3）：闸⑤ 的查询作用域必须与它一致，否则一条被 TTL
+        # 归档的旧闻在被再次报道时会绕过闸⑤、直接撞这里，整轮事务回滚、round 记 failed、退避加倍。
+        # `upsert_items` 另以 `sqlite_insert(...).on_conflict_do_update` 兜第二道保险。
+        UniqueConstraint("inst_id", "dedup_key", name="uq_ai_intel_dedup"),
+        Index("ix_ai_intel_scope", "inst_id", "tier", "status", "event_ts"),
+        Index("ix_ai_intel_updated", "inst_id", "updated_ts"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    inst_id: Mapped[str] = mapped_column(String(32), index=True, default="")
+    tier: Mapped[str] = mapped_column(String(8), default="ultra")      # ultra|mid|long
+    category: Mapped[str] = mapped_column(String(16), default="market")
+    headline: Mapped[str] = mapped_column(String(160), default="")
+    summary: Mapped[str] = mapped_column(Text, default="")
+    stance: Mapped[str] = mapped_column(String(8), default="neutral")  # bullish|bearish|neutral
+    impact: Mapped[str] = mapped_column(String(8), default="medium")   # low|medium|high
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    event_ts: Mapped[int] = mapped_column(Integer, default=0)          # 墙钟秒 UTC
+    captured_ts: Mapped[int] = mapped_column(Integer, default=0)
+    updated_ts: Mapped[int] = mapped_column(Integer, default=0)
+    # 0 = 不过期（置顶）。**随 tier 变更必须在同一事务内重算**（不变式 I-3，评审 P0-2）：不重算的
+    # 后果不是「某条情报早退休了」，而是整座多级库在事件发生 72 小时后被确定性清理整层扫空。
+    expires_ts: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(12), default="active")  # active|archived|superseded|muted
+    pinned: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 用户手改过。**与 pinned 并列的第二把免死金牌**——`gate.review_actions` 是纯核心、只读传进去的
+    # `IntelItem`，漏了这一列金牌就静默失效（评审 P1-5）。
+    user_edited: Mapped[bool] = mapped_column(Boolean, default=False)
+    undated: Mapped[bool] = mapped_column(Boolean, default=False)      # 无任何发布时间 ⇒ 永不可升级
+    is_scheduled: Mapped[bool] = mapped_column(Boolean, default=False)  # 事件在未来（前向窗，P0-1）
+    origin: Mapped[str] = mapped_column(String(8), default="agent")     # agent|user
+    origin_group_id: Mapped[str] = mapped_column(String(48), default="")
+    origin_round_id: Mapped[int] = mapped_column(Integer, default=0)
+    sources_json: Mapped[str] = mapped_column(Text, default="[]")
+    source_count: Mapped[int] = mapped_column(Integer, default=0)
+    # 提列而不是留在 sources_json 里：它是升级门槛的分母，逐行解 JSON 会让复核表变成热路径上的开销。
+    domain_count: Mapped[int] = mapped_column(Integer, default=0)
+    dedup_key: Mapped[str] = mapped_column(String(40), default="")
+    supersedes_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    promote_count: Mapped[int] = mapped_column(Integer, default=0)
+    demote_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_curated_ts: Mapped[int] = mapped_column(Integer, default=0)
+    curation_note: Mapped[str] = mapped_column(String(200), default="")
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiIntelRound(Base):
+    """一次采集 / 整理轮的审计存根（ai-trade-market-intel §3.7.1）。append-only。
+
+    ``status`` 只有三个取值：未到期时**不写 round 行**（§3.3.1 步骤 1），故 ``skipped`` 会是死值。
+    """
+
+    __tablename__ = "ai_intel_rounds"
+    __table_args__ = (Index("ix_ai_intel_round_scope", "inst_id", "started_ts"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    inst_id: Mapped[str] = mapped_column(String(32), index=True, default="")
+    kind: Mapped[str] = mapped_column(String(8), default="collect")     # collect|curate
+    group_id: Mapped[str] = mapped_column(String(48), default="")
+    started_ts: Mapped[int] = mapped_column(Integer, default=0)
+    finished_ts: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(12), default="ok")       # ok|degraded|failed
+    search_provider: Mapped[str] = mapped_column(String(16), default="")
+    queries_json: Mapped[str] = mapped_column(Text, default="[]")
+    doc_count: Mapped[int] = mapped_column(Integer, default=0)
+    domain_count: Mapped[int] = mapped_column(Integer, default=0)
+    accepted: Mapped[int] = mapped_column(Integer, default=0)
+    rejected: Mapped[int] = mapped_column(Integer, default=0)
+    merged: Mapped[int] = mapped_column(Integer, default=0)
+    rejects_json: Mapped[str] = mapped_column(Text, default="{}")       # {"bad_ref": 2, ...}
+    actions_json: Mapped[str] = mapped_column(Text, default="{}")       # {"promote": 2, ...}
+    llm_input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    llm_output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    degrade_code: Mapped[str] = mapped_column(String(24), default="")
+    error_text: Mapped[str] = mapped_column(String(400), default="")    # 已脱敏
+
+
+class AiIntelWatch(Base):
+    """每个标的的采集节律与健康（ai-trade-market-intel §3.5.2）。``inst_id`` 为主键，一行一标的。"""
+
+    __tablename__ = "ai_intel_watch"
+
+    inst_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_collect_ts: Mapped[int] = mapped_column(Integer, default=0)
+    last_curate_ts: Mapped[int] = mapped_column(Integer, default=0)
+    next_due_ts: Mapped[int] = mapped_column(Integer, default=0)
+    # 用户最后一次看过该标的情报的墙钟秒（**未读徽标的唯一真值**，评审 P1-2）。没有它，`unread`
+    # 只能退化成前端 localStorage —— 换台机器、重装桌面端即失效，且与「服务端下发 summary」相悖。
+    last_seen_ts: Mapped[int] = mapped_column(Integer, default=0)
+    collects_since_curate: Mapped[int] = mapped_column(Integer, default=0)
+    fail_streak: Mapped[int] = mapped_column(Integer, default=0)
+    cooldown_until_ts: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str] = mapped_column(String(200), default="")
+    day_key: Mapped[str] = mapped_column(String(10), default="")        # "YYYY-MM-DD"（UTC）
+    day_rounds: Mapped[int] = mapped_column(Integer, default=0)
+    updated_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiIntelFeedback(Base):
+    """用户对来源的取舍（「不再采纳此源」）。整理轮与闸层读它做过滤。"""
+
+    __tablename__ = "ai_intel_feedback"
+    __table_args__ = (UniqueConstraint("scope", "key", "inst_id", name="uq_ai_intel_feedback"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scope: Mapped[str] = mapped_column(String(8), default="domain")
+    key: Mapped[str] = mapped_column(String(128), default="")           # 可注册域名
+    action: Mapped[str] = mapped_column(String(8), default="block")     # block|trust
+    inst_id: Mapped[str] = mapped_column(String(32), default="")        # "" = 全局
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)

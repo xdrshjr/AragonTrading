@@ -964,6 +964,63 @@ class Settings(BaseSettings):
     agent_heartbeat_seconds: float = Field(default=20.0, gt=0)      # run 期心跳间隔（须 < 中间层 idle 超时）
     agent_event_buffer_size: int = Field(default=512, ge=64)        # 会话事件缓冲上限（重放窗口）
 
+    # ---- 标的市场情报层（ai-trade-market-intel §十一，34 项）----
+    # 字段名即环境变量名（AI_TRADE_INTEL_*，大小写不敏感）。前缀刻意统一为 `AI_TRADE_`：
+    # `desktop/src/lib/config.js:80` 的透传白名单以**前缀**决定哪些 env 进得了打包后端子进程，
+    # 而 prod 的 PyInstaller 后端**不读 .env、只读进程 env**——换一个前缀就等于打包形态下这 34
+    # 个旋钮全部静默失效（本仓库已为这类漏改栽过两次）。
+    #
+    # 两个运维单键：`ai_trade_intel_enabled=False` ⇒ 不建后台任务、不注册前端按钮、决策 prompt
+    # **逐字节**回到本特性合入前；`ai_trade_intel_inject=False` ⇒ 情报照常采集与展示，但**一个字
+    # 都不喂给交易 Agent**。回滚粒度分开是有意的：只想停注入时不该把整条采集流水线一并关掉。
+    ai_trade_intel_enabled: bool = True
+    ai_trade_intel_inject: bool = True
+    # 检索源。`none` = 未配置 ⇒ 全链路诚实降级（按钮仍在、弹窗明说、**绝不**由模型凭空生成情报）。
+    # v1 只实现 tavily（评审裁决 Q3）；brave / serper 的接入参数已在 spec §3.2.1 登记，v1.1 补。
+    # DB 行（`app_settings["ai_intel.search"]`）优先，本项是 env 回落，与 `resolve_active_provider`
+    # 的「库内行优先、env 回落」完全同构。
+    ai_trade_intel_search_provider: str = "none"
+    ai_trade_intel_search_api_key: str = ""      # 绝不出接口、绝不进日志（§3.2.3）
+    ai_trade_intel_search_base_url: str = ""     # 留空用适配器内置端点
+    ai_trade_intel_search_timeout_s: float = Field(default=12.0, ge=2, le=60)
+    # 只对 429/5xx/连接错误重试；4xx（除 429）**不重试**——那是配置错，重试只会更快烧掉配额。
+    ai_trade_intel_search_max_retries: int = Field(default=2, ge=0, le=5)
+    ai_trade_intel_collect_interval_min: float = Field(default=30.0, ge=5, le=1440)
+    ai_trade_intel_collect_jitter_pct: float = Field(default=0.15, ge=0, le=0.5)
+    ai_trade_intel_curate_every_n_collects: int = Field(default=4, ge=1, le=24)
+    ai_trade_intel_queries_per_round: int = Field(default=4, ge=1, le=8)
+    ai_trade_intel_docs_per_query: int = Field(default=6, ge=1, le=20)
+    ai_trade_intel_corpus_max_docs: int = Field(default=16, ge=4, le=40)
+    ai_trade_intel_snippet_max_chars: int = Field(default=500, ge=120, le=2000)
+    ai_trade_intel_items_per_round: int = Field(default=5, ge=1, le=12)
+    # 摘要硬上限：**超出即拒收并计数，绝不静默截断**（G-3）。工具 schema 的上限刻意放宽到 400，
+    # 好让「模型系统性写太长」成为一个可观测的事实，而不是被 schema 悄悄压平的假象。
+    ai_trade_intel_summary_max_chars: int = Field(default=160, ge=60, le=400)
+    # 情报 client 的**独立**输出预算（第四份，见 ai_auto/intel/llm.py）。不独立的话它会去抢
+    # `agent_max_tokens` 那个全后端共用的上限。
+    ai_trade_intel_max_tokens: int = Field(default=3072, ge=512, le=16384)
+    ai_trade_intel_timeout_s: float = Field(default=60.0, ge=10, le=300)
+    ai_trade_intel_max_active_ultra: int = Field(default=40, ge=5, le=200)
+    ai_trade_intel_max_active_mid: int = Field(default=24, ge=5, le=200)
+    ai_trade_intel_max_active_long: int = Field(default=16, ge=5, le=200)
+    ai_trade_intel_ultra_ttl_h: float = Field(default=72.0, ge=6, le=720)
+    ai_trade_intel_mid_ttl_d: float = Field(default=45.0, ge=3, le=365)
+    ai_trade_intel_long_ttl_d: float = Field(default=400.0, ge=30, le=3650)
+    ai_trade_intel_promote_min_domains: int = Field(default=2, ge=1, le=5)
+    ai_trade_intel_promote_min_age_min: float = Field(default=60.0, ge=0, le=10080)
+    ai_trade_intel_curate_max_actions: int = Field(default=24, ge=1, le=100)
+    ai_trade_intel_prompt_max_chars: int = Field(default=1200, ge=200, le=6000)
+    ai_trade_intel_daily_round_cap: int = Field(default=96, ge=1, le=1000)
+    ai_trade_intel_fail_backoff_base_s: float = Field(default=120.0, ge=10, le=3600)
+    ai_trade_intel_fail_backoff_max_s: float = Field(default=3600.0, ge=60, le=86400)
+    # 已排期**未来事件**的准入前向窗（评审 P0-1）。`0` ⇒ 退回「只收已发生的事件」，届时
+    # 「今晚的 CPI」「明天的解锁」一条都进不来——而那恰恰是本特性的头号用例。
+    ai_trade_intel_forward_window_d: float = Field(default=30.0, ge=0, le=365)
+    # 已排期事件过了 `event_ts` 多久仍无后续报道即判失效（降级 / 归档），防「永远的明天」堆积。
+    ai_trade_intel_lapse_grace_h: float = Field(default=24.0, ge=1, le=168)
+    # 关停时情报后台任务的有界收敛死线。**启动期校验器钉死它 < shutdown_step_timeout_s**。
+    ai_trade_intel_drain_timeout_s: float = Field(default=5.0, gt=0, le=60)
+
     # ---- 信任边界（trust-boundary-and-signal-integrity D1 / §6.1）----
     # 逗号分隔的 Origin 白名单；空 = 用 `app/security/origins.py` 的 DEFAULT_ORIGINS。
     # 显式配置即**完全替换**默认（不做合并，避免「以为收紧了其实没有」）。
@@ -1110,6 +1167,26 @@ class Settings(BaseSettings):
                 f"AI_TRADE_EXPERIENCE_DRAIN_TIMEOUT_S({self.ai_trade_experience_drain_timeout_s})"
                 f" 必须 < SHUTDOWN_STEP_TIMEOUT_S({self.shutdown_step_timeout_s})，否则外层先 "
                 "cancel、drain 内层的清理永不执行，后台任务会活着穿过 dispose_engine")
+        return self
+
+    @model_validator(mode="after")
+    def _check_intel_drain_deadline(self) -> "Settings":
+        """情报层关停 drain 的死线**必须**严格小于单步关停死线——倒挂即拒绝启动（评审 P1-7）。
+
+        与 `_check_experience_drain_deadline` 逐字同形，理由也同源：`main._run_shutdown` 的单步
+        死线取 `shutdown_step_timeout_s`，超时即 `cancel` 该步。若 drain 内部等得比它久，外层的
+        cancel 会把 drain 打断在 `asyncio.wait` 上，**drain 自己那半段「cancel 剩余任务」永远不会
+        执行**——恰恰在它被设计来应对的那一种情况下。那些后台任务于是活着穿过
+        `("db_engine", dispose_engine)` 那一步。
+
+        这条不等式一旦倒挂，失败是**完全静默**的：日志里只多一行「shutdown step … did not
+        settle」。故只能在构造期挡下来。
+        """
+        if self.ai_trade_intel_drain_timeout_s >= self.shutdown_step_timeout_s:
+            raise ValueError(
+                f"AI_TRADE_INTEL_DRAIN_TIMEOUT_S({self.ai_trade_intel_drain_timeout_s})"
+                f" 必须 < SHUTDOWN_STEP_TIMEOUT_S({self.shutdown_step_timeout_s})，否则外层先 "
+                "cancel、drain 内层的清理永不执行，情报后台任务会活着穿过 dispose_engine")
         return self
 
     def allowed_origin_list(self) -> list[str]:

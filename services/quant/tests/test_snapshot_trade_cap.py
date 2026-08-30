@@ -56,6 +56,10 @@ def test_ai_trade_snapshot_caps_the_wire_but_not_the_ledger():
     executor = SimpleNamespace(trades=_dict_trades(OVERFLOW))
     fake = SimpleNamespace(
         executor=executor,
+        # `inst_id`：`snapshot()` 的第八键 `intel` 用它去查进程内快照（market-intel §3.7.3）。
+        # 替身 self 必须携带 `snapshot()` **实际读到的**每一个字段——这份替身就是那份契约的注册表，
+        # 少一个字段的症状是 AttributeError，而不是「切尾切错了」。
+        inst_id="BTC-USDT-SWAP",
         _equity=[],
         _decisions=[],
         _traces=[],

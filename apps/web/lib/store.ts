@@ -40,6 +40,7 @@ import type {
   AiTradeTraceEvent,
 } from "./aiTradeTypes";
 import type { AiBacktestConfig } from "./aiBacktestTypes";
+import type { AiTradeIntelSummary } from "./intelTypes";
 import type { FactorEditTarget, FactorTargetRef, SymbolGroup } from "./factorTypes";
 import type { WeightTrainResult, WeightTrainTarget } from "./weightModelTypes";
 import type { WeightBatchTarget } from "./weightBatchTypes";
@@ -472,6 +473,13 @@ interface AppState {
   aiTradeReconcileUntil: number | null;
   /** 后端总闸。**唯一写点 = 对账器**（Toggle 不再自己轮询，[评审 R0-7] 的单 owner 收敛）。 */
   aiTradeEnabled: boolean;
+  // 标的市场情报的 summary 切片（ai-trade-market-intel §6.2 #38）。按 instId 映射、**瞬态**
+  // （不进 partialize：它是服务端真值的镜像，重连后由 WS `snapshot.intel` 与 `intel` 事件补齐）。
+  //
+  // 刻意**不挂在 `aiTradeGroup` 之下**：`groupStateFromStatus` 是一个逐键手抄的映射，本仓库
+  // 反复在它身上栽「WS 通路是好的、刷新后重发现拿不到值」的坑（E-10）。独立切片 + 独立 REST
+  // 从结构上绕开它。
+  aiTradeIntel: Record<string, AiTradeIntelSummary>;
   // AI 回测（ai-auto-trading-backtest §5.4）：aiBacktestJobId 瞬态（GET /ai-trade/backtest/{id} 重发现）；
   // aiBacktestConfig 为持久化偏好（记忆决策间隔 / 刷新轮数，进 partialize，v25 承载无需升版）。
   aiBacktestJobId: string | null;
@@ -597,6 +605,8 @@ interface AppState {
   requestAiTradeReconcile: () => void;
   setAiTradeSyncState: (state: "ok" | "unknown") => void;
   setAiTradeEnabled: (enabled: boolean) => void;
+  /** 单标的情报 summary 落库（WS `intel` 事件与 `snapshot.intel` 共用；`null` 是 no-op）。 */
+  setAiTradeIntelSummary: (instId: string, summary: AiTradeIntelSummary | null) => void;
   setAiTradeMemberTrades: (instId: string, trades: Trade[]) => void;
   appendAiTradeMemberTrade: (instId: string, trade: Trade) => void;
   setAiTradeMemberPosition: (instId: string, pos: PaperPositionEvent | null) => void;
@@ -766,6 +776,7 @@ export const useAppStore = create<AppState>()(
       aiTradeSyncState: "ok",
       aiTradeReconcileUntil: null,
       aiTradeEnabled: false,
+      aiTradeIntel: {},
       aiBacktestJobId: null,
       aiBacktestConfig: null,
       theme: "light",
@@ -1093,9 +1104,18 @@ export const useAppStore = create<AppState>()(
       setAiTradeMemberSummary: (instId, summary) =>
         set((s) => patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({ ...m, summary }))),
       setAiTradeAcknowledged: (aiTradeAcknowledged) => set({ aiTradeAcknowledged }),
+      setAiTradeIntelSummary: (instId, summary) =>
+        set((s) =>
+          summary
+            ? { aiTradeIntel: { ...s.aiTradeIntel, [instId]: summary } }
+            : {},
+        ),
       // 停止 / 结束后**同时**清冷占位：只清 aiTradeGroup 会在页面上留一张指向已归档会话的
-      // 续跑卡，而那张卡点下去是一次真实资金的开仓授权。
-      clearAiTradeRuntime: () => set({ aiTradeGroup: null, aiTradeResumable: null }),
+      // 续跑卡，而那张卡点下去是一次真实资金的开仓授权。**情报切片一并清**：
+      // 留着的话，下一次开另一个标的时旧的未读徽标会挂在一个已经不在跑的标的上——
+      // 一个指向已归档会话的红点比没有红点更坏。
+      clearAiTradeRuntime: () =>
+        set({ aiTradeGroup: null, aiTradeResumable: null, aiTradeIntel: {} }),
       setAiTradeConfig: (aiTradeConfig) => set({ aiTradeConfig }),
       setAiBacktestJobId: (aiBacktestJobId) => set({ aiBacktestJobId }),
       setAiBacktestConfig: (aiBacktestConfig) => set({ aiBacktestConfig }),
