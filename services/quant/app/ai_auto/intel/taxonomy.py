@@ -21,7 +21,18 @@ STANCES: tuple[str, ...] = ("bullish", "bearish", "neutral")
 IMPACTS: tuple[str, ...] = ("low", "medium", "high")
 STATUSES: tuple[str, ...] = ("active", "archived", "superseded", "muted")
 ORIGINS: tuple[str, ...] = ("agent", "user")
-ROUND_KINDS: tuple[str, ...] = ("collect", "curate")
+ROUND_KINDS: tuple[str, ...] = ("collect", "curate", "verify")
+# 核查判定的值域（closed-loop 轴 C）。``""`` = 尚未核查过，与三个判定并列而不是第四个枚举值：
+# 「没判过」与「判过但没判出来（unresolved）」是两件事，写成同一个值就等于把一次没跑过的核查
+# 伪装成一次「查不到」。
+VERDICTS: tuple[str, ...] = ("confirmed", "refuted", "unresolved")
+# 引用行的三种角色（closed-loop 轴 B）。只有 entry / exit 可结算：「情报影响了这笔开仓 / 这次
+# 离场」可证伪，「情报影响了这次继续持有」不可证伪。
+CITATION_ROLES: tuple[str, ...] = ("entry", "exit", "hold")
+CITATION_OUTCOMES: tuple[str, ...] = ("win", "loss", "flat", "void")
+
+VERDICT_LABELS: dict[str, str] = {"confirmed": "已证实", "refuted": "已证伪",
+                                  "unresolved": "待定"}
 ROUND_STATUSES: tuple[str, ...] = ("ok", "degraded", "failed")
 
 TIER_LABELS: dict[str, str] = {"ultra": "超短", "mid": "中期", "long": "长期"}
@@ -80,6 +91,8 @@ REVIEW_REJECT_CODES: tuple[str, ...] = (
     "promote_insufficient_evidence",
     "demote_skips_tier",
     "archive_protected",
+    # closed-loop §3.2.4 第 2 条：归档一条有正战绩的情报，理由必须写足（举证责任，非免死金牌）。
+    "archive_profitable",
     "merge_bad_target",
     "unknown_item",
     "bad_action",
@@ -106,6 +119,12 @@ DEGRADE_TEXT: dict[str, str] = {
     "circuit_open": "检索源连续失败已暂停",
     "paused": "AI 自动交易已暂停，情报采集同步暂停",
     "disabled": "情报采集已在设置中关闭",
+    # ---- closed-loop 轴 C 的四个核查降级码（评审 P1-4：文案表是本字典，不是 `service.degrade_wire`；
+    # 漏登记不报错，用户看到的会是裸码「情报流水线降级（verify_no_corpus）」）。G-19 逐码冻结。
+    "verify_no_provider": "尚未配置情报检索源，情报核查未启动",
+    "verify_search_failed": "核查检索请求失败（{reason}）",
+    "verify_no_corpus": "本轮核查没有检索到任何可用材料，相关条目记为待定",
+    "verify_llm_failed": "核查模型调用失败（{reason}）",
 }
 
 
@@ -223,6 +242,17 @@ class IntelLimits:
     curate_max_actions: int = 24
     lapse_grace_s: int = 24 * 3600
     prompt_max_chars: int = 1200
+    # ---- closed-loop 的七个新阈值（评审 P1-1 / P1-2）----
+    # 纯核心从不自己读 `Settings`，而 `plan_verification` 与 `score_item` 的 cite 加分都在纯核心；
+    # 不把这七项放进来，§3.3.1 与 §3.2.4 **写不出来**。全部带默认值 ⇒ 既有构造零改动。
+    cite_score_bonus: float = 0.15        # 注入排序里「被引用且盈利」的有界加分上限
+    verify_min_age_h: float = 12.0        # 条目多老才值得核查（太新 ⇒ 后续报道还没出来）
+    verify_recheck_h: float = 48.0        # `unresolved` / 首击 `refuted` 多久后可重核
+    verify_max_attempts: int = 3          # 同一条最多核查几次（防无限烧预算）
+    verify_max_items: int = 3             # 单轮候选上限（同时是工具 schema 的 maxItems）
+    verify_confirm_bonus: float = 0.05    # `confirmed` 的置信度加成（封顶仍是 1.0）
+    verify_refute_penalty: float = 0.5    # `refuted` 的置信度乘数
+    trust_bonus: float = 0.05             # `trust` 域名的置信度先验（**绝不加 domain_count**）
 
     def __post_init__(self) -> None:
         if self.ttl_s is None:
@@ -253,4 +283,16 @@ def limits_from_settings(settings) -> IntelLimits:
         curate_max_actions=int(settings.ai_trade_intel_curate_max_actions),
         lapse_grace_s=int(float(settings.ai_trade_intel_lapse_grace_h) * 3600),
         prompt_max_chars=int(settings.ai_trade_intel_prompt_max_chars),
+        # closed-loop（评审 P1-2）：七行映射与上面的七个字段一一对应。`getattr` 兜底是给那些
+        # 直接构造 `Settings` 替身的既有用例留的——它们不该因为本轮新增七个键而一起变红。
+        cite_score_bonus=float(getattr(settings, "ai_trade_intel_cite_score_bonus", 0.15)),
+        verify_min_age_h=float(getattr(settings, "ai_trade_intel_verify_min_age_h", 12.0)),
+        verify_recheck_h=float(getattr(settings, "ai_trade_intel_verify_recheck_h", 48.0)),
+        verify_max_attempts=int(getattr(settings, "ai_trade_intel_verify_max_attempts", 3)),
+        verify_max_items=int(getattr(settings, "ai_trade_intel_verify_max_items", 3)),
+        verify_confirm_bonus=float(
+            getattr(settings, "ai_trade_intel_verify_confirm_bonus", 0.05)),
+        verify_refute_penalty=float(
+            getattr(settings, "ai_trade_intel_verify_refute_penalty", 0.5)),
+        trust_bonus=float(getattr(settings, "ai_trade_intel_trust_bonus", 0.05)),
     )

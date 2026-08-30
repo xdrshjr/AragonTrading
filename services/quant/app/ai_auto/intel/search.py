@@ -4,10 +4,12 @@
 它只能看到后端替它检索回来、编号为 `[D1]…[Dn]` 的语料，提交条目时**只能引用编号**。模型能编造
 文字，但编造不出一个后端语料里不存在的编号。
 
-v1 只实现 `tavily` 一个适配器（评审裁决 Q3）。协议层照抽——`slug` 解析与 `none` 降级一并保留，
-`brave`（`X-Subscription-Token` / `freshness=pd|pw|pm` / `description` / `page_age`）与
-`serper`（`X-API-KEY` / `tbs=qdr:d|w|m` / `snippet` / `date`）的接入参数登记在此，v1.1 补时各约
-50 行且**不改协议**。
+三个适配器：`tavily`（body 传 key 的 POST）、`brave`（`X-Subscription-Token` 头的 GET，
+`freshness=pd|pw|pm`，日期是 RFC3339 的 `page_age`）、`serper`（`X-API-KEY` 头的 POST，
+`tbs=qdr:d|w|m`，日期是 `"3 days ago"` 这样的**相对文案**）。协议层没有为它们改过一个字节
+——`brave` / `serper` 是 intel-closed-loop 轴 D 补的，只多了一个共用重试骨架 `_HttpProvider`。
+
+**仍是单活**：设置里选一个，不做多源扇出（closed-loop §十 非目标 3）。
 
 密钥三条纪律（§3.2.3）：库内行优先 / 绝不进日志 / 绝不出接口。
 """
@@ -16,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -36,10 +39,16 @@ _BACKOFF_BASE_MS = 500
 _BACKOFF_MAX_MS = 8000
 
 TAVILY_ENDPOINT = "https://api.tavily.com/search"
-PROVIDER_SLUGS: tuple[str, ...] = ("none", "tavily")
-# v1.1 待办（§3.2.1 已登记接入参数，不改协议）。此表是**给下一个人看的**，不是死码：它让
-# 「为什么只有一个适配器」这件事有一个可读的答案，而不是一处看起来漏写的地方。
-PLANNED_SLUGS: tuple[str, ...] = ("brave", "serper")
+BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+SERPER_ENDPOINT = "https://google.serper.dev/search"
+PROVIDER_SLUGS: tuple[str, ...] = ("none", "tavily", "brave", "serper")
+# 曾经的 v1.1 待办（`brave` / `serper`）已由 ai-trade-intel-closed-loop 轴 D 兑现，故此表清空。
+# **保留这个名字而不是删掉它**：`test_ai_intel_search_providers.py` 拿它断言「那条债确实还清了」，
+# 而一个空表比一条 commit message 更难被下一个人读漏。下一次再登记待接入的 slug 时填回这里。
+# （拼错的 provider 名由 `resolve_search_provider` 末尾那条 `logger.info` 兜底，与本表无关。）
+PLANNED_SLUGS: tuple[str, ...] = ()
+# 单次检索的条数硬上限（两家的 API 各自封顶 20；超出先夹紧而不是让对端 400）。
+_PROVIDER_MAX_RESULTS = 20
 
 
 class IntelSearchError(Exception):
@@ -236,6 +245,182 @@ class TavilyProvider:
         raise last or IntelSearchError("network_error", "检索请求失败")
 
 
+# ---------------- brave / serper（intel-closed-loop 轴 D §3.4.3） ----------------
+_RELATIVE_DATE_RE = re.compile(
+    r"^(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago$", re.IGNORECASE)
+_RELATIVE_SECONDS = {"minute": 60, "hour": 3600, "day": 86400, "week": 7 * 86400,
+                     "month": 30 * 86400, "year": 365 * 86400}
+
+
+def _parse_relative_date(raw, *, now: float) -> int:
+    """serper 的 `date` 字段 → 墙钟秒。支持 ``"3 days ago"`` 与 ``"Jan 5, 2026"``。
+
+    **任何解析失败一律返回 0**（⇒ `undated=True` ⇒ 该条永不可升级，v1 既有规则）。
+    **绝不**在解析失败时回落到 `now`（G-14）：把「不知道什么时候发的」写成「刚刚发的」会让
+    时效闸与升级门槛同时失守，且不报任何错。非英文文案同样落 0 而不是猜。
+    """
+    if not raw or not isinstance(raw, str):
+        return 0
+    text = raw.strip()
+    match = _RELATIVE_DATE_RE.match(text)
+    if match:
+        span = _RELATIVE_SECONDS.get(match.group(2).lower())
+        if not span:
+            return 0
+        return max(0, int(float(now) - int(match.group(1)) * span))
+    for fmt in ("%b %d, %Y", "%B %d, %Y"):
+        try:
+            parsed = datetime.strptime(text, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        return int(parsed.timestamp())
+    return 0
+
+
+def _freshness_token(freshness_days: int, *, tokens: tuple[str, str, str]) -> str:
+    """`freshness_days` → 适配器自己的时效枚举（`<=1` / `<=7` / 其余，两家同一映射）。"""
+    days = max(1, int(freshness_days))
+    if days <= 1:
+        return tokens[0]
+    return tokens[1] if days <= 7 else tokens[2]
+
+
+class _HttpProvider:
+    """brave / serper 共用的重试骨架（`TavilyProvider.search` 的形状，只换请求与解析）。
+
+    刻意不把 `TavilyProvider` 改成继承它：tavily 是 body 传 key 的 POST、brave 是 query 串的
+    GET，硬凑一个基类只会让两边的差异藏进条件分支里。这里复用的是**重试与脱敏**，不是请求。
+    """
+
+    slug = ""
+
+    def __init__(self, *, api_key: str, endpoint: str, base_url: str = "",
+                 timeout_s: float = 12.0, max_retries: int = 2, proxy: str | None = None):
+        self._api_key = api_key
+        self._endpoint = (base_url or endpoint).rstrip("/")
+        self._timeout = float(timeout_s)
+        self._max_retries = max(0, int(max_retries))
+        self._proxy = proxy
+
+    async def _request(self, client: httpx.AsyncClient, query: str, limit: int,
+                       freshness_days: int) -> httpx.Response:
+        raise NotImplementedError
+
+    @staticmethod
+    def _parse(payload: dict, *, now: float) -> list[SearchDoc]:
+        raise NotImplementedError
+
+    async def search(self, query: str, *, limit: int, freshness_days: int) -> list[SearchDoc]:
+        """一次检索（含有界重试）。失败一律抛 `IntelSearchError`。"""
+        last: IntelSearchError | None = None
+        capped = max(1, min(int(limit), _PROVIDER_MAX_RESULTS))
+        for attempt in range(self._max_retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=self._timeout,
+                                             proxy=self._proxy) as client:
+                    resp = await self._request(client, query, capped, freshness_days)
+                if resp.status_code >= 400:
+                    detail = resp.text[:200]
+                    if resp.status_code in RETRYABLE_STATUS and attempt < self._max_retries:
+                        last = IntelSearchError(
+                            "http_error", f"HTTP {resp.status_code}: {detail}", self._api_key)
+                        await _sleep_backoff(attempt)
+                        continue
+                    raise IntelSearchError(
+                        "http_error", f"HTTP {resp.status_code}: {detail}", self._api_key)
+                return self._parse(resp.json(), now=time.time())
+            except IntelSearchError:
+                raise
+            except _RETRYABLE_EXC as exc:
+                last = IntelSearchError("network_error", str(exc), self._api_key)
+                if attempt >= self._max_retries:
+                    raise last from exc
+                await _sleep_backoff(attempt)
+            except httpx.HTTPError as exc:
+                raise IntelSearchError("network_error", str(exc), self._api_key) from exc
+            except ValueError as exc:       # json 解析失败
+                raise IntelSearchError("bad_response", str(exc), self._api_key) from exc
+        raise last or IntelSearchError("network_error", "检索请求失败")
+
+
+class BraveProvider(_HttpProvider):
+    """brave `/res/v1/web/search` 适配器（GET，`X-Subscription-Token` 头，`page_age` 是 RFC3339）。"""
+
+    slug = "brave"
+
+    def __init__(self, **kwargs):
+        super().__init__(endpoint=BRAVE_ENDPOINT, **kwargs)
+
+    async def _request(self, client, query: str, limit: int, freshness_days: int):
+        return await client.get(
+            self._endpoint,
+            params={"q": query, "count": limit,
+                    "freshness": _freshness_token(freshness_days,
+                                                  tokens=("pd", "pw", "pm"))},
+            headers={"Accept": "application/json",
+                     "X-Subscription-Token": self._api_key})
+
+    @staticmethod
+    def _parse(payload: dict, *, now: float) -> list[SearchDoc]:
+        rows = ((payload or {}).get("web") or {}).get("results")
+        if not isinstance(rows, list):
+            raise IntelSearchError("bad_response", "检索源返回了无法解析的结果结构")
+        docs: list[SearchDoc] = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            url = str(row.get("url") or "").strip()
+            if not url:
+                continue
+            profile = row.get("profile")
+            docs.append(SearchDoc(
+                title=str(row.get("title") or "").strip(), url=url,
+                snippet=str(row.get("description") or "").strip(),
+                publisher=str((profile or {}).get("name") or "").strip()
+                if isinstance(profile, dict) else "",
+                published_ts=_parse_rfc3339(row.get("page_age")),
+                # brave 不给分数：用名次折成一个单调递减的分（`corpus.build` 只用它排序）。
+                score=max(0.0, 1.0 - index * 0.01)))
+        return docs
+
+
+class SerperProvider(_HttpProvider):
+    """serper `/search` 适配器（POST JSON，`X-API-KEY` 头，`date` 是**相对文案**）。"""
+
+    slug = "serper"
+
+    def __init__(self, **kwargs):
+        super().__init__(endpoint=SERPER_ENDPOINT, **kwargs)
+
+    async def _request(self, client, query: str, limit: int, freshness_days: int):
+        return await client.post(
+            self._endpoint,
+            json={"q": query, "num": limit,
+                  "tbs": _freshness_token(freshness_days,
+                                          tokens=("qdr:d", "qdr:w", "qdr:m"))},
+            headers={"Content-Type": "application/json", "X-API-KEY": self._api_key})
+
+    @staticmethod
+    def _parse(payload: dict, *, now: float) -> list[SearchDoc]:
+        rows = (payload or {}).get("organic")
+        if not isinstance(rows, list):
+            raise IntelSearchError("bad_response", "检索源返回了无法解析的结果结构")
+        docs: list[SearchDoc] = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            url = str(row.get("link") or row.get("url") or "").strip()
+            if not url:
+                continue
+            docs.append(SearchDoc(
+                title=str(row.get("title") or "").strip(), url=url,
+                snippet=str(row.get("snippet") or "").strip(),
+                publisher=str(row.get("source") or "").strip(),
+                published_ts=_parse_relative_date(row.get("date"), now=now),
+                score=max(0.0, 1.0 - index * 0.01)))
+        return docs
+
+
 async def _sleep_backoff(attempt: int) -> None:
     """指数退避 + 抖动（可被 cancel 中断，语义与 `agent/llm/retry.py` 同源）。"""
     base = min(_BACKOFF_BASE_MS * (2 ** attempt), _BACKOFF_MAX_MS)
@@ -256,8 +441,14 @@ def resolve_search_provider(*, slug: str, api_key: str, base_url: str = "",
     if key == "tavily":
         return TavilyProvider(api_key=api_key.strip(), base_url=base_url,
                               timeout_s=timeout_s, max_retries=max_retries, proxy=proxy)
-    logger.info("ai-trade intel: 未实现的检索源 %s，按未配置处理（v1.1 待办：%s）",
-                key, "/".join(PLANNED_SLUGS))
+    if key == "brave":
+        return BraveProvider(api_key=api_key.strip(), base_url=base_url,
+                             timeout_s=timeout_s, max_retries=max_retries, proxy=proxy)
+    if key == "serper":
+        return SerperProvider(api_key=api_key.strip(), base_url=base_url,
+                              timeout_s=timeout_s, max_retries=max_retries, proxy=proxy)
+    logger.info("ai-trade intel: 未实现的检索源 %s，按未配置处理（已实现：%s）",
+                key, "/".join(PROVIDER_SLUGS[1:]))
     return None
 
 

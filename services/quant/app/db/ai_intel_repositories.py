@@ -86,6 +86,19 @@ def intel_item_out(row: AiIntelItem) -> dict:
         "lastCuratedTs": int(row.last_curated_ts or 0),
         "curationNote": row.curation_note or "",
         "createdTs": int(row.created_ts or 0),
+        # ---- closed-loop §5.2 的十个新键（E-16：本函数是条目 wire 的**唯一**装配点，
+        # `apps/web/lib/intelTypes.ts` 与它逐键同构，改这里必须同时改那里）。
+        # `getattr` 兜底是给「补列 patcher 尚未跑过」的极早期读留的安全网，不是常态路径。
+        "citeCount": int(getattr(row, "cite_count", 0) or 0),
+        "citeEntryCount": int(getattr(row, "cite_entry_count", 0) or 0),
+        "settledCount": int(getattr(row, "settled_count", 0) or 0),
+        "winCount": int(getattr(row, "win_count", 0) or 0),
+        "netPnlUsd": round(float(getattr(row, "net_pnl_usd", 0.0) or 0.0), 6),
+        "lastCitedTs": int(getattr(row, "last_cited_ts", 0) or 0),
+        "verdict": getattr(row, "verdict", "") or "",
+        "verdictTs": int(getattr(row, "verdict_ts", 0) or 0),
+        "verdictNote": getattr(row, "verdict_note", "") or "",
+        "verifyCount": int(getattr(row, "verify_count", 0) or 0),
     }
 
 
@@ -131,6 +144,9 @@ def intel_watch_out(row: AiIntelWatch) -> dict:
         "dayKey": row.day_key or "",
         "dayRounds": int(row.day_rounds or 0),
         "updatedTs": int(row.updated_ts or 0),
+        # ---- closed-loop §5.3 的两个新键 ----
+        "lastVerifyTs": int(getattr(row, "last_verify_ts", 0) or 0),
+        "curatesSinceVerify": int(getattr(row, "curates_since_verify", 0) or 0),
     }
 
 
@@ -159,12 +175,29 @@ async def ensure_intel_watch(session: AsyncSession, inst_id: str, *, next_due_ts
 async def bump_intel_watch(session: AsyncSession, inst_id: str, *, kind: str, status: str,
                            next_due_ts: int, cooldown_until_ts: int = 0,
                            last_error: str = "", curate_reset: bool = False,
-                           commit: bool = True) -> dict:
+                           verify_reset: bool = False, commit: bool = True) -> dict:
     """一轮结束后推进节律与健康计数。
 
     `fail_streak` 的三态语义（§3.5.2）：`ok` 清零；`degraded` **不增不减**（拿到了东西但没过闸，
     不是链路故障）；`failed` +1。把 degraded 也算成失败，会让「模型今天比较保守」被当成链路故障
     一路退避到一小时一轮。
+
+    ⚠️ **kind 分支必须显式三分**（closed-loop 评审 P0-3）。合入前它是一个二值 catch-all
+    （`if kind == "collect": … else: row.last_curate_ts = now`），第三种 kind 会静默落进 `else`：
+
+    1. 核查轮会改写整理轮的节律真值（`last_curate_ts` 被当成「刚整理过」），弹窗上的「上次整理」
+       从此指着一个从没整理过的时刻；
+    2. `curates_since_verify` 会**没有任何自增点**，恒为 0 ⇒ `_verify_due` 的
+       `0 + 1 >= verify_every_n_curates` 只有默认值 1 才为真 —— 用户把这个 `ge=1, le=12` 的设置
+       调到 2，核查轮从此**一次都不会跑**，界面上也不会有任何异样。
+
+    未知 `kind` 一律**只推公共计数**（`day_rounds` / `fail_streak` / `next_due_ts`）而不碰任何
+    节律字段——一个不认识的轮种不该有能力改写别人的节律。
+
+    Args:
+        kind: `collect` / `curate` / `verify`（其余值只推公共计数）。
+        curate_reset: 整理轮跑完 ⇒ 清 `collects_since_curate`。
+        verify_reset: 核查轮跑完 ⇒ 清 `curates_since_verify`（closed-loop §3.3.5 步骤 6）。
     """
     row = await session.get(AiIntelWatch, inst_id)
     now = int(time.time())
@@ -179,10 +212,16 @@ async def bump_intel_watch(session: AsyncSession, inst_id: str, *, kind: str, st
     if kind == "collect":
         row.last_collect_ts = now if status == "ok" else int(row.last_collect_ts or 0)
         row.collects_since_curate = int(row.collects_since_curate or 0) + 1
-    else:
+    elif kind == "curate":
         row.last_curate_ts = now
+        # ★ 核查节律的**唯一**自增点（closed-loop 评审 P0-3）。
+        row.curates_since_verify = int(row.curates_since_verify or 0) + 1
+    elif kind == "verify":
+        row.last_verify_ts = now        # **绝不动 last_curate_ts**（G-16）
     if curate_reset:
         row.collects_since_curate = 0
+    if verify_reset:
+        row.curates_since_verify = 0
     if status == "ok":
         row.fail_streak = 0
     elif status == "failed":
@@ -585,6 +624,34 @@ async def list_intel_blocked_domains(session: AsyncSession, inst_id: str = "") -
     else:
         stmt = stmt.where(AiIntelFeedback.inst_id == "")
     return [row for row in (await session.execute(stmt)).scalars().all() if row]
+
+
+async def list_intel_trusted_domains(session: AsyncSession, inst_id: str = "") -> list[str]:
+    """用户标记「更信任此源」的域名（全局 + 该标的）。
+
+    与 `list_intel_blocked_domains` **逐字同构**，只把 `action == "block"` 换成 `"trust"`
+    （closed-loop 评审 P1-7）。没有它，`trust` 就是第二个「有写点没读点」——用户点下的
+    「更信任这个源」会变成一次什么都没发生的点击，而这件事不会报任何错。
+    """
+    stmt = select(AiIntelFeedback.key).where(AiIntelFeedback.action == "trust")
+    if inst_id:
+        stmt = stmt.where(AiIntelFeedback.inst_id.in_(("", inst_id)))
+    else:
+        stmt = stmt.where(AiIntelFeedback.inst_id == "")
+    return [row for row in (await session.execute(stmt)).scalars().all() if row]
+
+
+async def list_intel_feedback(session: AsyncSession, inst_id: str = "") -> list[dict]:
+    """来源取舍清单（`GET /intel/feedback`）。`inst_id` 缺省 ⇒ 全部（全局 + 每个标的）。"""
+    stmt = select(AiIntelFeedback)
+    if inst_id:
+        stmt = stmt.where(AiIntelFeedback.inst_id.in_(("", inst_id)))
+    rows = (await session.execute(
+        stmt.order_by(AiIntelFeedback.created_ts.desc(),
+                      AiIntelFeedback.id.desc()))).scalars().all()
+    return [{"id": row.id, "scope": row.scope, "key": row.key, "action": row.action,
+             "instId": row.inst_id or "", "createdTs": int(row.created_ts or 0)}
+            for row in rows]
 
 
 async def set_intel_feedback(session: AsyncSession, *, key: str, action: str,

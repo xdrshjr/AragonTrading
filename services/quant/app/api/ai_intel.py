@@ -33,6 +33,17 @@ from ..db import repositories as repo
 from ..db.session import get_session
 from ..schemas import IntelItemIn, IntelItemPatchIn, IntelMoveIn, IntelSeenIn
 from .ai_auto import _require_ai_enabled
+from .schemas_intel_closed_loop import (
+    IntelCitationListOut,
+    IntelFeedbackIn,
+    IntelFeedbackListOut,
+    IntelFeedbackPreviewOut,
+    IntelFeedbackWriteOut,
+    IntelImpactOut,
+    IntelProviderHealthOut,
+    IntelQueuedOut,
+    IntelSourceListOut,
+)
 
 router = APIRouter(tags=["ai-intel"])
 
@@ -77,6 +88,139 @@ async def _summary(session: AsyncSession, inst_id: str, settings: Settings) -> d
     if cached is None:
         return fresh
     return {**fresh, **{key: cached[key] for key in _RUNTIME_ONLY_KEYS if key in cached}}
+
+
+# ⚠️ **字面量路径必须声明在 `/intel/{instId}` 之前**：FastAPI 按注册顺序匹配，
+# `GET /intel/feedback` 若排在后面会被 `{instId}` 吃掉（`instId="feedback"`），
+# 症状是一次 500 而不是 404 —— 路由被静默劫持是本仓库容易漏掉的一类接线错误。
+# ---------------- 轴 D：信源治理（closed-loop §4.1 #13-#17） ----------------
+@router.get("/intel/feedback", response_model=IntelFeedbackListOut)
+async def read_intel_feedback(instId: str | None = None,
+                              session: AsyncSession = Depends(get_session)) -> dict:
+    """黑白名单清单（`instId` 缺省 = 全部：全局 + 每个标的）。
+
+    **不设总闸**：看自己拉黑过谁不动任何资金，与 `GET /intel/{instId}` 同一条纪律。
+    """
+    return {"rows": await repo.list_intel_feedback(session, instId or "")}
+
+
+async def _blocked_scope(session: AsyncSession, body: IntelFeedbackIn) -> set[str]:
+    """本次拉黑之后**该作用域内**的完整黑名单（存量扫除与 preview 共用同一个口径）。"""
+    domains = set(await repo.list_intel_blocked_domains(session, body.instId or ""))
+    domains.add(body.key.strip().lower())
+    return domains
+
+
+@router.post("/intel/feedback", response_model=IntelFeedbackWriteOut)
+async def write_intel_feedback(body: IntelFeedbackIn,
+                               session: AsyncSession = Depends(get_session),
+                               settings: Settings = Depends(get_settings)) -> dict:
+    """记一条来源取舍；`block` 且存量扫除单键开着 ⇒ **同事务**扫除存量并返回归档条数。
+
+    扫除的判据是「`sources` 非空且**每一个** source 的 domain 都在黑名单里」——只要还有一个
+    干净来源，条目就留着（G-9②的另一半）。受保护条目（置顶 / 手改）跳过。
+    """
+    _require_ai_enabled(settings)
+    if body.instId:
+        await _require_known_inst(session, body.instId)
+    key = body.key.strip().lower()
+    # ★ 存量扫除单键必须读**运行时真正会读到的那一份**（`resolve_intel_settings` 的产物），
+    # 而不是进程 env 上的 `Settings`：这个键露在 `PUT /settings/intel` 上、存在 `app_settings`
+    # 表里，读进程副本就等于「面板上关得掉、系统永远照扫」——正是评审 P0-5 那类假开关。
+    derived = await intel_service.resolve_intel_settings(session, settings)
+    await repo.set_intel_feedback(session, key=key, action=body.action,
+                                  inst_id=body.instId or "", commit=False)
+    archived = 0
+    if body.action == "block" and derived.ai_trade_intel_blocked_sweep_enabled:
+        archived = await repo.sweep_blocked_source_items(
+            session, body.instId or "", await _blocked_scope(session, body), commit=False)
+    await session.commit()
+    _invalidate_scope(body.instId or "")
+    return {"ok": True, "archived": archived}
+
+
+@router.post("/intel/feedback/preview", response_model=IntelFeedbackPreviewOut)
+async def preview_intel_feedback(body: IntelFeedbackIn,
+                                 session: AsyncSession = Depends(get_session)) -> dict:
+    """给确认框算受影响条数（**纯读，绝不写库**，§4.1 #15b）。
+
+    `trust` 恒回 0：它不归档任何东西。
+    """
+    if body.action != "block":
+        return {"affected": 0}
+    return {"affected": await repo.count_items_all_sources_blocked(
+        session, body.instId or "", await _blocked_scope(session, body))}
+
+
+@router.delete("/intel/feedback", status_code=204)
+async def delete_intel_feedback(scope: str = Query(default="domain"),
+                                key: str = Query(min_length=1),
+                                instId: str = Query(default=""),
+                                session: AsyncSession = Depends(get_session),
+                                settings: Settings = Depends(get_settings)) -> None:
+    """撤销一条来源取舍。
+
+    **不复活**任何条目（G-9③）：归档是一次带理由的状态迁移，自动复活会让用户在两次点击之间
+    看到条目数跳来跳去。恢复路径是「已归档」页签里那颗已经存在的恢复按钮。
+    """
+    _require_ai_enabled(settings)
+    if scope != "domain":
+        raise HTTPException(422, detail={"code": "intel_bad_scope",
+                                         "message": "目前只支持 domain 作用域"})
+    await repo.clear_intel_feedback(session, key=key.strip().lower(), inst_id=instId or "")
+    _invalidate_scope(instId or "")
+
+
+def _invalidate_scope(inst_id: str) -> None:
+    """让受影响标的重算快照。作用域为空（全局）⇒ **全部**已装配标的都要重算。
+
+    少这一步，用户拉黑之后决策 prompt 里还是旧的那一份，而**这件事不会报任何错**。
+    """
+    if inst_id:
+        intel_runtime.invalidate(inst_id)
+        return
+    for runtime in intel_runtime.all_runtimes():
+        for member in runtime.members:
+            intel_runtime.invalidate(member)
+
+
+@router.get("/intel/settings/health", response_model=IntelProviderHealthOut)
+async def read_intel_provider_health(
+        limit: int = Query(default=20, ge=1, le=50),
+        session: AsyncSession = Depends(get_session)) -> dict:
+    """最近 N 轮的检索源成败聚合 + 熔断剩余秒（§4.1 #16）。
+
+    **不新建任何表、不新建任何计数器**：`ai_intel_rounds.search_provider` 已经逐轮记着实际用的
+    slug，熔断剩余秒来自进程内 breaker（没有已装配的 runtime ⇒ 0，不是猜一个数）。
+    """
+    rounds: list[dict] = []
+    for runtime in intel_runtime.all_runtimes():
+        for member in runtime.members:
+            rounds.extend(await repo.list_intel_rounds(session, member, limit=limit))
+    rounds.sort(key=lambda row: int(row.get("startedTs") or 0), reverse=True)
+    rounds = rounds[:limit]
+    provider = next((str(row.get("searchProvider") or "") for row in rounds
+                     if row.get("searchProvider")), "")
+    breaker_left = 0
+    for runtime in intel_runtime.all_runtimes():
+        search = getattr(runtime.deps, "search", None)
+        if search is not None:
+            breaker_left = max(breaker_left, int(search.breaker.remaining_s()))
+    return {
+        "provider": provider,
+        "rounds": len(rounds),
+        "ok": sum(1 for row in rounds if row.get("status") == "ok"),
+        "failed": sum(1 for row in rounds if row.get("status") == "failed"),
+        "degraded": sum(1 for row in rounds if row.get("status") == "degraded"),
+        "breakerRemainingS": breaker_left,
+    }
+
+
+@router.get("/intel/{instId}/sources", response_model=IntelSourceListOut)
+async def read_intel_sources(instId: str,
+                             session: AsyncSession = Depends(get_session)) -> dict:
+    """当前库存的域名聚合（域名 / 条数 / 最近一次 / 当前 block|trust 状态，§4.1 #17）。"""
+    return {"rows": await repo.list_intel_source_rows(session, instId)}
 
 
 @router.get("/intel/{instId}")
@@ -221,13 +365,63 @@ async def patch_intel_item(itemId: int, body: IntelItemPatchIn,
     await _require_known_inst(session, item["instId"])
     derived = await intel_service.resolve_intel_settings(session, settings)
     patch = body.model_dump(exclude_none=True)
+    # 「我不同意」（closed-loop §4.1 #22）：它不是 `patch_intel_item` 的一个普通字段——
+    # 清 verdict 的同时**必须**置 `user_edited`（兼任判定锁）且**绝不清 `verify_count`**。
+    # 清了它，这条目下一轮就会回到候选池最前面被重新判成 refuted，撤销出口当场变成旋转门
+    # （评审 P0-4）。故它单独走一条写路径，且要在 `patch` 交给仓库层之前摘掉。
+    clear_verdict = bool(patch.pop("clearVerdict", False))
     limits = tax.limits_from_settings(derived)
-    updated = await repo.patch_intel_item(
-        session, itemId, patch,
-        expires_ts=(_expires_for(item, patch, limits)
-                    if ("tier" in patch or "pinned" in patch) else None))
+    updated = item
+    if patch:
+        updated = await repo.patch_intel_item(
+            session, itemId, patch,
+            expires_ts=(_expires_for(item, patch, limits)
+                        if ("tier" in patch or "pinned" in patch) else None))
+    if clear_verdict:
+        updated = await repo.clear_intel_verdict(session, itemId)
     intel_runtime.invalidate(item["instId"])
     return {"item": updated}
+
+
+@router.post("/intel/{instId}/verify", status_code=202, response_model=IntelQueuedOut)
+async def trigger_verify(instId: str, session: AsyncSession = Depends(get_session),
+                         settings: Settings = Depends(get_settings)) -> dict:
+    """手动触发一轮核查（closed-loop §4.1 #20，**排队即返回**）。"""
+    _require_ai_enabled(settings)
+    await _require_known_inst(session, instId)
+    runtime = _require_runtime(instId)
+    if runtime.lock.locked():
+        raise HTTPException(409, detail={"code": "intel_busy",
+                                         "message": "该标的已有一轮情报正在进行中"})
+    intel_scheduler.schedule(runtime.run_verify(instId))
+    return {"queued": True}
+
+
+@router.post("/intel/items/{itemId}/verify", status_code=202, response_model=IntelQueuedOut)
+async def trigger_item_verify(itemId: int, session: AsyncSession = Depends(get_session),
+                              settings: Settings = Depends(get_settings)) -> dict:
+    """只核查这一条（closed-loop §4.1 #21）。
+
+    **显式绕过 `plan_verification` 的全部候选过滤**（`origin` / `verify_count` / `user_edited` /
+    `verify_min_age_h` 一概不看，评审 P2-11）——它是一条**人类显式指令**，不是自动池的一员。
+    这也是用户手写条目与「我不同意」过的条目**唯一**的核查途径。仍受日配额与 `_require_runtime`
+    约束（额度是成本闸，手动触发不该能绕过它）。
+    """
+    _require_ai_enabled(settings)
+    item = await _load_item_or_404(session, itemId)
+    inst_id = item["instId"]
+    await _require_known_inst(session, inst_id)
+    runtime = _require_runtime(inst_id)
+    if runtime.lock.locked():
+        raise HTTPException(409, detail={"code": "intel_busy",
+                                         "message": "该标的已有一轮情报正在进行中"})
+    watch = await repo.load_intel_watch(session, inst_id) or {}
+    if intel_service.daily_used(watch) >= int(settings.ai_trade_intel_daily_round_cap):
+        raise HTTPException(429, detail={
+            "code": "intel_budget_exhausted",
+            "message": tax.degrade_message("budget_exhausted")})
+    intel_scheduler.schedule(runtime.run_verify(inst_id, only_item_id=itemId))
+    return {"queued": True}
 
 
 @router.post("/intel/items/{itemId}/move")
@@ -274,3 +468,30 @@ async def mark_intel_seen(instId: str, body: IntelSeenIn | None = None,
     # 走 `_summary` 而不是直接 `read_summary`：后者算不出 `inFlight` / 本轮 `degrade`
     # （库里没有落点），弹窗拿到这份回执后会把一个正在降级的标的画成一切正常。
     return {"summary": await _summary(session, instId, settings)}
+
+
+# ---------------- 轴 B：影响力与引用明细（closed-loop §4.1 #18-#19） ----------------
+@router.get("/intel/{instId}/impact", response_model=IntelImpactOut)
+async def read_intel_impact(instId: str,
+                            limit: int = Query(default=10, ge=1, le=50),
+                            session: AsyncSession = Depends(get_session)) -> dict:
+    """影响力页签的全部读数（§4.1 #18）。
+
+    `totals.netPnlUsd` 是**关联**净额：这些数字是**共现**统计，不是因果归因——一笔交易通常
+    同时采信了多条证据（R-1）。这条口径必须一路带到 UI 文案上。
+    """
+    return await repo.read_intel_impact(session, instId, limit=limit)
+
+
+@router.get("/intel/{instId}/citations", response_model=IntelCitationListOut)
+async def read_intel_citations(instId: str, itemId: int | None = None,
+                               limit: int = Query(default=50, ge=1, le=200),
+                               before: int | None = None,
+                               session: AsyncSession = Depends(get_session)) -> dict:
+    """引用明细（游标分页，按 `id` 降序，§4.1 #19）。
+
+    游标是 `id` 而不是时间戳：同一秒里的多条引用用时间戳翻页会漏行。
+    """
+    rows, has_more = await repo.list_intel_citations(
+        session, inst_id=instId, item_id=itemId, limit=limit, before=before)
+    return {"rows": rows, "hasMore": has_more}

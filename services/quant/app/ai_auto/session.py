@@ -62,7 +62,7 @@ from .exit_priority import (
 )
 from .experience import ExperienceRuntime
 from . import feed_watchdog
-from .intel import intel_digest_for, intel_summary_for
+from .intel import IntelAttribution, intel_digest_for, intel_summary_for
 from .feed_runtime import FeedRuntime
 from .hold_horizon import HorizonFacts, HorizonRule, gate_status as horizon_gate_status
 from .gate_veto import build_gate_veto_note, veto_layer, veto_layer_label
@@ -310,6 +310,14 @@ class AiTradeSession:
         # 后台物化任务（去抖 + 进程级单槽，§4.5）——**同步调用、绝不 await**，因为它跑在
         # `_dispatch` 这个全部 executor 事件的唯一收口上。
         self._on_experience_dirty = on_experience_dirty or (lambda: None)
+        # 情报引用归因（ai-trade-intel-closed-loop 轴 B）：同款「运行时对象 + 薄接线」下沉范式。
+        # **判定全在纯核心**（`intel/citation.py` 与 `intel/attribution.py`），本文件只有六处调用点。
+        # 两把总闸都开才装配；未装配 ⇒ 全部方法空转、一个字节都不写（G-5）。
+        self._intel_cite = IntelAttribution(
+            inst_id, run_id,
+            enabled=bool(getattr(executor.settings, "ai_trade_intel_enabled", False)
+                         and getattr(executor.settings,
+                                     "ai_trade_intel_attribution_enabled", False)))
         # P0-1：会话级单调持仓序号——`_dispatch` 观察到任一 `side=="close"` 成交即 +1。epoch 身份的一半，
         # 没有它，「保护平仓 → 同一 tick 内同向重开」的新仓会继承旧峰值并被当场强平（真实资金）。
         self._position_seq = 0
@@ -480,6 +488,9 @@ class AiTradeSession:
                                                    market_context=self._market_context(),
                                                    wake_kind=self._wake.last_round_kind,
                                                    horizon_profile_id=self._horizon_profile()))
+                    # closed-loop 轴 B：引用行绑定持仓周期。先按 `clOrdId` 认领（限价跨轮），
+                    # 认领不到再回退本轮待写行（市价恒走回退）——两条路都取不到就什么都不做。
+                    self._intel_cite.note_open(trade, seq=self._position_seq)
                 self._sizing.note_executor(self.executor, self._current_px())   # [P1-8] 敞口簿
                 self._inject_explain_meta(trade)
                 await self._persist_trade(trade)
@@ -491,7 +502,14 @@ class AiTradeSession:
                     self._experience.note_close(
                         trade, (trade.get("explain") or {}).get("meta") or {},
                         self._cost.last_settled_trip())
+                    # closed-loop 轴 B：同一处、同一条纪律（必须在 `_inject_explain_meta` 之后，
+                    # `exitSource` 与往返结算都在那一步才写进 meta）。★ 结算的 seq 只能取
+                    # `trip.seq`——`self._position_seq` 在本分支第一行就已经 +1 了（P0-2）。
+                    self._intel_cite.note_close(
+                        trade, (trade.get("explain") or {}).get("meta") or {},
+                        self._cost.last_settled_trip())
                     await self._experience.persist_pending()
+                    await self._intel_cite.persist_pending()
                     if self._experience.take_dirty():
                         self._on_experience_dirty()      # 同步回调，**不 await**（G-5 时延门禁）
                 # W2（pause-resume §3.4.2）：持仓事实**只在成交时变**，故契约的持仓断面事件驱动
@@ -714,6 +732,10 @@ class AiTradeSession:
             trades=self.executor.trades, push=self._push, final=True)
         await self._experience.flush()             # W-10：毫秒级本地 INSERT（物化与蒸馏都不在这条链上）
         await self._experience.persist_harvest_gap()   # ★ E-8：不落库那个数字在概览条上恒为 0
+        # closed-loop 评审 P2-12：尚未落盘的引用行与认领槽**一并丢弃并计入 `dropped`**，
+        # **不新增任何关停步骤**（`_shutdown_steps` 第 7 步已被用例冻结）。落在 `_finalize_run`
+        # **之前**——`aiStats.intel.dropped` 要带上这一次丢弃，否则那个数在收尾快照里恒少一批。
+        self._intel_cite.stop()
         await self._finalize_run(ts)
         await self._notify_stopped()
         await self._push({"type": "status", "data": self._status_payload()})
@@ -1601,6 +1623,12 @@ class AiTradeSession:
             # 与反思之前（此时的 decision/degrade 正是第一阶段输出，惯性以模型真实意愿为准）。
             self._update_hold_streak(decision.action, degrade)
             self._discipline.note_intent(decision.action, degrade)   # 轴 C：开仓漏斗的**分母**
+            # 情报引用归因（closed-loop 轴 A/B）：**取 `stage1_decision`**（E-4，任何门禁之前的
+            # 那一个）。取门禁后的会让「模型采信了情报却被冷却门禁拦下」变成「模型没采信情报」。
+            # 编号表随注入快照一起来（热路径不查库，§3.0 第 1 条）。
+            self._intel_cite.note_decision(
+                stage1_decision, round_no=round_no, ts=ts,
+                refmap=(payload.get("intel") or {}).get("refs"))
             # 同上落点（§2.6 c）：盈利持有链条同样以第一阶段真实意愿为准，据本轮保护快照的浮盈正负推进。
             self._update_profit_hold_streak(decision.action, degrade,
                                             payload.get("profitGuard"))
@@ -1662,6 +1690,10 @@ class AiTradeSession:
             self._arm_exit_commitment(decision, executed)          # ★ W-5
             self._discipline.funnel.note_executed(decision.action, bool(executed.get("skipped")))
             self._cost.note_round(bool(executed.get("traded")))          # §6.3 决策转化率
+            # closed-loop P0-1：限价开仓单会 resting 若干轮，故在**下单那一刻**按 `clOrdId` 把本轮
+            # 引用行冻结进跨轮认领槽（逐行镜像紧邻的 `self._cost.claim_estimate(...)`）。
+            self._intel_cite.note_executed(decision.action, executed,
+                                           resting=self.executor.resting)
             self.rounds_completed = round_no
             # RC-2/RC-3：研判全文只走 agent_trace/_traces；进 journal 与 decision 事件的取有界摘录（≤400）。
             # 降级轮 last_analysis 恒为空串（RC-1）→ excerpt=None（journal/事件不带残段）。
@@ -1698,6 +1730,9 @@ class AiTradeSession:
                                       context_disclosure=payload.get("contextDisclosure"),
                                       reflection_verdict=reflection_verdict,
                                       reflection_reason=reflection_reason)
+            # closed-loop §3.2.1：引用行落库排在**决策事件推送之后**——决策卡是用户最在意的那个
+            # 延迟，一次本地 INSERT 虽是毫秒级，但排在推送之后最坏也只让统计晚一瞬间。
+            await self._intel_cite.persist_pending()
             self._discipline.note_round(degrade)   # 轴 B/C：闸计数 + 开仓漏斗的首拦截层归类
             if degrade:
                 await self._emit_degraded(ts, degrade)
@@ -1719,6 +1754,9 @@ class AiTradeSession:
             self._deciding = False
             self._discipline.funnel.end_round()   # R-12：轮级标志兜底清零（异常路径也走这里）
             self._cost.end_round()   # 轴 A：轮级估计同址清零（D-3：被否的意图绝不改绑到下一笔往返）
+            # closed-loop 评审 P1-9：同一处、同一条纪律——一次在 `note_decision` 之后、
+            # `persist_pending` 之前抛错的轮，绝不可把它的引用行留给下一轮。**认领槽不清**。
+            self._intel_cite.end_round()
             self._maybe_catchup_wake()       # 轴 A：纯同步，check→claim 之间无 await
 
     def _maybe_catchup_wake(self) -> None:
@@ -2047,6 +2085,9 @@ class AiTradeSession:
         # 与未装配会话下 wire 逐字节回退（G-7 要求加法键在 off 档一并缺席）。
         if decision.evidence_digest:
             tool_input["evidenceDigest"] = decision.evidence_digest
+        # closed-loop 轴 A：模型本轮点名采信的情报编号（同款「仅非空时才写」，总闸关 ⇒ 键缺席）。
+        if decision.intel_refs:
+            tool_input["intelRefs"] = list(decision.intel_refs)
         layer = self._trace_veto_layer(decision, proposed, gate_degrade, llm_degrade)
         vetoed = layer is not None
         extra = {"proposedAction": proposed.action if vetoed else None,
@@ -3106,6 +3147,9 @@ class AiTradeSession:
             metrics["aiStats"]["trackRecordShown"] = self._track.shown
             # 经验层观测（W-11）：供事后按「有没有喂经验」分臂对账（R-16）；未装配 ⇒ None。
             metrics["aiStats"]["experience"] = self._experience.stats()
+            # 情报引用归因观测（closed-loop §3.6）：合并落在**调用点**（评审 P2-9），
+            # `_compute_ai_stats` 是模块级函数、一字不动。未装配 ⇒ None ⇒ 该键为 None。
+            metrics["aiStats"]["intel"] = self._intel_cite.stats()
             # 深度研判观测（§3.4.4）：**零迁移**（`aiStats` 是既有 JSON blob）。零样本 ⇒ 不写这
             # 个键，供事后按「有没有开深度档」分臂对账 token 成本与研判篇幅的实际收益。
             reasoning_stats = self._reasoning.stats()

@@ -967,7 +967,7 @@ class Settings(BaseSettings):
     # ---- 标的市场情报层（ai-trade-market-intel §十一，34 项）----
     # 字段名即环境变量名（AI_TRADE_INTEL_*，大小写不敏感）。前缀刻意统一为 `AI_TRADE_`：
     # `desktop/src/lib/config.js:80` 的透传白名单以**前缀**决定哪些 env 进得了打包后端子进程，
-    # 而 prod 的 PyInstaller 后端**不读 .env、只读进程 env**——换一个前缀就等于打包形态下这 34
+    # 而 prod 的 PyInstaller 后端**不读 .env、只读进程 env**——换一个前缀就等于打包形态下这 51
     # 个旋钮全部静默失效（本仓库已为这类漏改栽过两次）。
     #
     # 两个运维单键：`ai_trade_intel_enabled=False` ⇒ 不建后台任务、不注册前端按钮、决策 prompt
@@ -990,6 +990,9 @@ class Settings(BaseSettings):
     ai_trade_intel_curate_every_n_collects: int = Field(default=4, ge=1, le=24)
     ai_trade_intel_queries_per_round: int = Field(default=4, ge=1, le=8)
     ai_trade_intel_docs_per_query: int = Field(default=6, ge=1, le=20)
+    # `le=40` 同时守住语料编号的值域：编号正则是 `^D[0-9]{1,2}$`，第 100 篇拿不到一个模型
+    # 写得出来的编号（closed-loop 评审 P2-10）。**这条约束就写在这里、由 pydantic 兑现**——
+    # 再在 `_check_cross_field` 里加一条 `>99` 的运行期断言是一条永远走不到的分支。
     ai_trade_intel_corpus_max_docs: int = Field(default=16, ge=4, le=40)
     ai_trade_intel_snippet_max_chars: int = Field(default=500, ge=120, le=2000)
     ai_trade_intel_items_per_round: int = Field(default=5, ge=1, le=12)
@@ -1020,6 +1023,36 @@ class Settings(BaseSettings):
     ai_trade_intel_lapse_grace_h: float = Field(default=24.0, ge=1, le=168)
     # 关停时情报后台任务的有界收敛死线。**启动期校验器钉死它 < shutdown_step_timeout_s**。
     ai_trade_intel_drain_timeout_s: float = Field(default=5.0, gt=0, le=60)
+
+    # ---- 情报闭环（ai-trade-intel-closed-loop §十一，17 项；前缀仍是 `AI_TRADE_INTEL_`）----
+    # 三把逐层收窄的运维单键：`cite` ⇒ 注入行与决策工具 schema 逐字节回到 52f466e；
+    # `attribution` ⇒ 引用照记、不结算不回写；`verify` ⇒ 不跑核查轮、不写 verdict。
+    # 上一轮的 `ai_trade_intel_enabled` 总闸仍是最外层。
+    # ⚠️ 三把都露在 `PUT /settings/intel` 上，故 `intel/service.py::INTEL_SETTING_BRIDGE`
+    # **必须**同时有对应行——不扩那张表，它们就是「面板上改得动、系统永远不读、而且不报错」
+    # 的假开关（评审 P0-5）。
+    ai_trade_intel_cite_enabled: bool = True
+    ai_trade_intel_cite_max_refs: int = Field(default=8, ge=1, le=16)
+    ai_trade_intel_attribution_enabled: bool = True
+    ai_trade_intel_cite_score_bonus: float = Field(default=0.15, ge=0, le=1)
+    # 引用明细保留天数；到期由整理轮裁剪，**只删明细不回滚统计**（统计列是已发布的读数）。
+    ai_trade_intel_cite_retention_d: float = Field(default=180.0, ge=7, le=3650)
+    ai_trade_intel_verify_enabled: bool = True
+    ai_trade_intel_verify_every_n_curates: int = Field(default=1, ge=1, le=12)
+    ai_trade_intel_verify_max_items: int = Field(default=3, ge=1, le=10)
+    ai_trade_intel_verify_docs_per_item: int = Field(default=4, ge=1, le=12)
+    ai_trade_intel_verify_min_age_h: float = Field(default=12.0, ge=1, le=720)
+    ai_trade_intel_verify_recheck_h: float = Field(default=48.0, ge=1, le=720)
+    ai_trade_intel_verify_max_attempts: int = Field(default=3, ge=1, le=10)
+    ai_trade_intel_verify_confirm_bonus: float = Field(default=0.05, ge=0, le=0.3)
+    ai_trade_intel_verify_refute_penalty: float = Field(default=0.5, ge=0.1, le=1.0)
+    # 核查 Agent 的输出预算。**落点是 `build_intel_llm_client(..., max_tokens_override=…)` 造的
+    # 第二个 client（`IntelDeps.verify_llm`），不是 `run_round` 的形参**——`LLMClient.stream` 是
+    # Protocol，32 个测试文件实现了它，给它加参数会一次性打翻它们全部（评审 P1-3）。
+    ai_trade_intel_verify_max_tokens: int = Field(default=2048, ge=512, le=16384)
+    # `trust` 域名的置信度先验。**绝不加 `domain_count`**——那是「来源独立性」的分母。
+    ai_trade_intel_trust_bonus: float = Field(default=0.05, ge=0, le=0.3)
+    ai_trade_intel_blocked_sweep_enabled: bool = True
 
     # ---- 信任边界（trust-boundary-and-signal-integrity D1 / §6.1）----
     # 逗号分隔的 Origin 白名单；空 = 用 `app/security/origins.py` 的 DEFAULT_ORIGINS。
@@ -1187,6 +1220,19 @@ class Settings(BaseSettings):
                 f"AI_TRADE_INTEL_DRAIN_TIMEOUT_S({self.ai_trade_intel_drain_timeout_s})"
                 f" 必须 < SHUTDOWN_STEP_TIMEOUT_S({self.shutdown_step_timeout_s})，否则外层先 "
                 "cancel、drain 内层的清理永不执行，情报后台任务会活着穿过 dispose_engine")
+        # ai-trade-intel-closed-loop §十一：核查语料的两条值域约束。**不是形式主义**——不加第一条，
+        # 一个把 `verify_max_items` 调到 8 的用户会得到一个「后 4 条永远待定」的系统，而且不报
+        # 任何错（`corpus.build` 会静默截断，排在后面的候选拿不到任何文档）。
+        verify_docs = (self.ai_trade_intel_verify_max_items
+                       * self.ai_trade_intel_verify_docs_per_item)
+        if verify_docs > self.ai_trade_intel_corpus_max_docs:
+            raise ValueError(
+                f"AI_TRADE_INTEL_VERIFY_MAX_ITEMS({self.ai_trade_intel_verify_max_items})"
+                f" × AI_TRADE_INTEL_VERIFY_DOCS_PER_ITEM"
+                f"({self.ai_trade_intel_verify_docs_per_item}) 必须 ≤ "
+                f"AI_TRADE_INTEL_CORPUS_MAX_DOCS({self.ai_trade_intel_corpus_max_docs})，"
+                "否则核查语料会被 corpus.build 截断，排在后面的候选将拿不到任何文档、"
+                "被系统性判成 unresolved")
         return self
 
     def allowed_origin_list(self) -> list[str]:

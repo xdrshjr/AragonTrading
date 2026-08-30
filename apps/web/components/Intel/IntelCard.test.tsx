@@ -41,6 +41,16 @@ function item(over: Partial<IntelItem> = {}): IntelItem {
     demoteCount: 0,
     lastCuratedTs: 0,
     curationNote: "",
+    citeCount: 0,
+    citeEntryCount: 0,
+    settledCount: 0,
+    winCount: 0,
+    netPnlUsd: 0,
+    lastCitedTs: 0,
+    verdict: "",
+    verdictTs: 0,
+    verdictNote: "",
+    verifyCount: 0,
     createdTs: NOW_S,
     ...over,
   };
@@ -59,6 +69,8 @@ const summary: AiTradeIntelSummary = {
   providerConfigured: true,
   dailyUsed: 1,
   dailyCap: 96,
+  citations: { cited: 0, entryCited: 0, settledTrips: 0, winCount: 0, netPnlUsd: 0, neverCited: 0 },
+  verify: { confirmed: 0, refuted: 0, unresolved: 0, pending: 0, lastVerifyTs: null },
 };
 
 function actions(): IntelCardActions {
@@ -68,6 +80,9 @@ function actions(): IntelCardActions {
     onEdit: vi.fn(),
     onMute: vi.fn(),
     onDelete: vi.fn(),
+    onClearVerdict: vi.fn(),
+    onVerifyItem: vi.fn(),
+    onBlockSource: vi.fn(),
     onRestore: vi.fn(),
   };
 }
@@ -152,5 +167,68 @@ describe("IntelCard", () => {
     expect(screen.getByText(/已置顶/)).toBeInTheDocument();
     expect(screen.getByText(/用户编辑/)).toBeInTheDocument();
     expect(screen.getByText(/已排期/)).toBeInTheDocument();
+  });
+});
+
+
+// ---------------- closed-loop：归因轨 / 判定徽章 / 证伪警示 / 来源拉黑 ----------------
+describe("IntelCard · 情报闭环", () => {
+  it("零引用且无判定 ⇒ 卡片与合入前一样（两块都不渲染）", () => {
+    render(<IntelCard item={item()} summary={summary} actions={actions()} nowMs={NOW_MS} />);
+    expect(screen.queryByTestId("intel-attribution-rail")).toBeNull();
+    expect(screen.queryByTestId("intel-verdict-badge")).toBeNull();
+    expect(screen.queryByTestId("intel-refuted-warning")).toBeNull();
+  });
+
+  it("被引用过 ⇒ 归因轨在位，并说「关联净额」", () => {
+    render(<IntelCard
+      item={item({ citeCount: 12, citeEntryCount: 5, settledCount: 4, winCount: 3,
+        netPnlUsd: 18.4 })}
+      summary={summary} actions={actions()} nowMs={NOW_MS} />);
+    expect(screen.getByTestId("intel-attribution-rail")).toHaveTextContent("关联净额");
+  });
+
+  it("被证伪 ⇒ 出现警示行且卡片带降透明度类名", () => {
+    render(<IntelCard item={item({ verdict: "refuted" })} summary={summary}
+      actions={actions()} nowMs={NOW_MS} />);
+
+    expect(screen.getByTestId("intel-refuted-warning"))
+      .toHaveTextContent("已停止喂给交易 Agent");
+    expect(screen.getByTestId("intel-card").className).toContain("opacity-60");
+  });
+
+  it("已证实 ⇒ 只有徽章，没有警示行、也不降透明度", () => {
+    render(<IntelCard item={item({ verdict: "confirmed" })} summary={summary}
+      actions={actions()} nowMs={NOW_MS} />);
+
+    expect(screen.getByTestId("intel-verdict-badge")).toHaveTextContent("已证实");
+    expect(screen.queryByTestId("intel-refuted-warning")).toBeNull();
+    expect(screen.getByTestId("intel-card").className).not.toContain("opacity-60");
+  });
+
+  it("「我不同意」经卡片动作透传出去", () => {
+    const acts = actions();
+    const target = item({ verdict: "refuted" });
+    render(<IntelCard item={target} summary={summary} actions={acts} nowMs={NOW_MS} />);
+    fireEvent.click(screen.getByTestId("intel-verdict-badge"));
+    fireEvent.click(screen.getByRole("button", { name: "我不同意，恢复注入" }));
+
+    expect(acts.onClearVerdict).toHaveBeenCalledWith(target);
+  });
+
+  it("来源 chip 上的 ✕ 是 `<a>` 的**兄弟**节点，不是子节点", () => {
+    const acts = actions();
+    render(<IntelCard item={item()} summary={summary} actions={acts} nowMs={NOW_MS} />);
+
+    const remove = screen.getByRole("button", { name: "不再采纳 theblock.co" });
+    expect(remove.closest("a")).toBeNull();
+    fireEvent.click(remove);
+    expect(acts.onBlockSource).toHaveBeenCalledWith("theblock.co");
+  });
+
+  it("✕ 键盘可达（只在 hover 时出现的破坏性操作对键盘用户等于不存在）", () => {
+    render(<IntelCard item={item()} summary={summary} actions={actions()} nowMs={NOW_MS} />);
+    expect(screen.getByRole("button", { name: "不再采纳 theblock.co" }).className)
+      .toContain("focus-visible:opacity-100");
   });
 });

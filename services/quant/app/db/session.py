@@ -96,6 +96,7 @@ async def init_db() -> None:
         await _ensure_weight_run_columns(conn)
         await _ensure_weight_batch_columns(conn)
         await _ensure_live_auto_group_columns(conn)
+        await _ensure_ai_intel_columns(conn)
     await _seed_builtin_strategies()
     await _seed_builtin_factors()
     await _seed_agent_providers()
@@ -190,6 +191,46 @@ async def _ensure_live_auto_group_columns(conn) -> None:
             )
     await conn.execute(text(
         "CREATE INDEX IF NOT EXISTS ix_strategy_runs_group ON strategy_runs(group_id)"))
+
+
+async def _ensure_ai_intel_columns(conn) -> None:
+    """老库幂等补列（ai-trade-intel-closed-loop §5.2/§5.3）：``ai_intel_items`` 与
+    ``ai_intel_watch`` 是 52f466e 建的**既有**表，``create_all`` 不会为它们补列——须此处
+    ``ALTER TABLE ADD COLUMN`` 幂等补齐（仿 ``_ensure_trade_risk_columns``），否则老库
+    INSERT/SELECT 立即 ``no such column``、连既有的情报读取一并崩。
+
+    新库同样安全：``create_all`` 先建全列表，``PRAGMA table_info`` 求差集后无一需要补。
+
+    两条实现约束：SQLite 的 ``ADD COLUMN`` 只接受**常量**默认值（下表全部合规）；补列后的老行
+    ``verdict`` 是 ``''``（=待验证），这正是我们要的语义——**绝不做任何历史回填**（沿用
+    ``position_pct`` 那条「旧库自然补 NULL，不做不可靠历史回填」的成文纪律）。
+    """
+    item_columns = {
+        "cite_count": "INTEGER DEFAULT 0",
+        "cite_entry_count": "INTEGER DEFAULT 0",
+        "settled_count": "INTEGER DEFAULT 0",
+        "win_count": "INTEGER DEFAULT 0",
+        "net_pnl_usd": "FLOAT DEFAULT 0.0",
+        "last_cited_ts": "INTEGER DEFAULT 0",
+        "verdict": "VARCHAR(12) DEFAULT ''",
+        "verdict_ts": "INTEGER DEFAULT 0",
+        "verdict_note": "VARCHAR(200) DEFAULT ''",
+        "verify_count": "INTEGER DEFAULT 0",
+    }
+    watch_columns = {
+        "last_verify_ts": "INTEGER DEFAULT 0",
+        "curates_since_verify": "INTEGER DEFAULT 0",
+    }
+    for table, columns in (("ai_intel_items", item_columns), ("ai_intel_watch", watch_columns)):
+        rows = (await conn.execute(text(f"PRAGMA table_info({table})"))).all()
+        existing = {row[1] for row in rows}
+        for name, sql_type in columns.items():
+            if name not in existing:
+                await conn.execute(
+                    text(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+                )
+    await conn.execute(text(
+        "CREATE INDEX IF NOT EXISTS ix_ai_intel_verdict ON ai_intel_items(inst_id, verdict)"))
 
 
 async def _reconcile_orphan_ai_trade_runs() -> None:

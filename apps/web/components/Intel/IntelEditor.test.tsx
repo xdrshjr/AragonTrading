@@ -83,6 +83,8 @@ describe("IntelEditor", () => {
       sources: [{ url: "https://a.com/x", title: "T", publisher: "a.com", domain: "a.com", publishedTs: 0 }],
       sourceCount: 1, domainCount: 1, dedupKey: "k", supersedesId: null, promoteCount: 0,
       demoteCount: 0, lastCuratedTs: 0, curationNote: "", createdTs: 0,
+      citeCount: 0, citeEntryCount: 0, settledCount: 0, winCount: 0, netPnlUsd: 0,
+      lastCitedTs: 0, verdict: "" as const, verdictTs: 0, verdictNote: "", verifyCount: 0,
     };
     render(<IntelEditor open item={item} onClose={() => {}} onSubmit={vi.fn(async () => {})} />);
     expect(screen.getByText("编辑情报")).toBeInTheDocument();

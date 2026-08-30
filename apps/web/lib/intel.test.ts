@@ -53,6 +53,16 @@ function item(over: Partial<IntelItem> = {}): IntelItem {
     demoteCount: 0,
     lastCuratedTs: 0,
     curationNote: "",
+    citeCount: 0,
+    citeEntryCount: 0,
+    settledCount: 0,
+    winCount: 0,
+    netPnlUsd: 0,
+    lastCitedTs: 0,
+    verdict: "",
+    verdictTs: 0,
+    verdictNote: "",
+    verifyCount: 0,
     createdTs: NOW_S,
     ...over,
   };
@@ -72,6 +82,8 @@ function summary(over: Partial<AiTradeIntelSummary> = {}): AiTradeIntelSummary {
     providerConfigured: true,
     dailyUsed: 18,
     dailyCap: 96,
+    citations: { cited: 0, entryCited: 0, settledTrips: 0, winCount: 0, netPnlUsd: 0, neverCited: 0 },
+    verify: { confirmed: 0, refuted: 0, unresolved: 0, pending: 0, lastVerifyTs: null },
     ...over,
   };
 }
@@ -150,6 +162,15 @@ describe("降级", () => {
   it("弱提示不染警示色（常亮的警告会失去意义）", () => {
     expect(isSevereDegrade({ code: "search_empty", message: "m", retryInS: null })).toBe(false);
     expect(isSevereDegrade({ code: "no_provider", message: "m", retryInS: null })).toBe(true);
+  });
+
+  it("核查轮的四个降级码逐个分级：只有「没检索到可核对的材料」是弱提示", () => {
+    // 空核查轮是例行结果（相关条目已被诚实记成待定），漏登记它会让按钮长期挂着警示色。
+    expect(isSevereDegrade({ code: "verify_no_corpus", message: "m", retryInS: null }))
+      .toBe(false);
+    for (const code of ["verify_no_provider", "verify_search_failed", "verify_llm_failed"]) {
+      expect(isSevereDegrade({ code, message: "m", retryInS: null })).toBe(true);
+    }
   });
 
   it("按钮 title 在降级时追加降级文案（不打开弹窗也知道出问题了）", () => {

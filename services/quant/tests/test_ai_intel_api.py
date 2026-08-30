@@ -15,7 +15,13 @@ from app.ai_auto.intel import runtime as intel_runtime
 from app.ai_auto.intel import service as intel_service
 from app.config import get_settings
 from app.db import repositories as repo
-from app.db.models import AiIntelItem, AiIntelRound, AiIntelWatch, AppSetting
+from app.db.models import (
+    AiIntelCitation,
+    AiIntelItem,
+    AiIntelRound,
+    AiIntelWatch,
+    AppSetting,
+)
 from app.db.session import dispose_engine, get_sessionmaker, init_db
 
 INST = "BTC-USDT-SWAP"
@@ -39,7 +45,7 @@ async def _fresh(*, watchlist=(INST,)) -> None:
     await init_db()
     sm = get_sessionmaker()
     async with sm() as session:
-        for table in (AiIntelItem, AiIntelRound, AiIntelWatch):
+        for table in (AiIntelCitation, AiIntelItem, AiIntelRound, AiIntelWatch):
             await session.execute(delete(table))
         await session.execute(delete(AppSetting))
         await session.commit()
@@ -305,3 +311,228 @@ async def test_probe_without_config_is_honest():
         res = await client.post("/api/settings/intel/probe", json={})
     assert res.status_code == 200
     assert res.json()["ok"] is False
+
+
+# ---------------- closed-loop：wire 扩键 / 清判定 / 手动核查 / 影响力与引用明细 ----------------
+_NEW_ITEM_KEYS = ("citeCount", "citeEntryCount", "settledCount", "winCount", "netPnlUsd",
+                  "lastCitedTs", "verdict", "verdictTs", "verdictNote", "verifyCount")
+
+
+async def _seed_item(**over) -> int:
+    payload = {"instId": INST, "tier": "mid", "category": "macro", "headline": "议息会议",
+               "summary": "下周举行。", "stance": "neutral", "impact": "high",
+               "confidence": 0.6, "eventTs": NOW - 86400, "capturedTs": NOW - 86400,
+               "expiresTs": NOW + 86400, "status": "active", "origin": "agent",
+               "sources": [{"url": "https://a.com/x", "domain": "a.com", "publishedTs": 0}],
+               "domainCount": 1, "dedupKey": "seed-1"}
+    payload.update(over)
+    async with get_sessionmaker()() as session:
+        ids = await repo.upsert_intel_items(session, [payload])
+    return ids[0]
+
+
+@pytest.mark.asyncio
+async def test_read_carries_every_new_wire_key():
+    """§4.1 的 `response_model` 纪律：10 个新键**逐个存在**（不是断言「不报错」）。
+
+    v1 终审记过一条「`response_model` 静默吞新 wire 键」的教训——症状是后端算了、前端永远是 0。
+    """
+    await _fresh()
+    await _seed_item()
+    async with _client() as client:
+        body = (await client.get(f"/api/intel/{INST}")).json()
+
+    item = body["tiers"]["mid"]["items"][0]
+    for key in _NEW_ITEM_KEYS:
+        assert key in item, f"{key} 没进 intel_item_out ⇒ 前端永远读到 undefined"
+    assert "citations" in body["summary"] and "verify" in body["summary"]
+    assert set(body["summary"]["citations"]) == {
+        "cited", "entryCited", "settledTrips", "winCount", "netPnlUsd", "neverCited"}
+    assert set(body["summary"]["verify"]) == {
+        "confirmed", "refuted", "unresolved", "pending", "lastVerifyTs"}
+    await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_clear_verdict_keeps_verify_count_and_sets_user_edited():
+    """P0-4：清 verdict 的同时置 `user_edited`，且**绝不清 `verify_count`**。
+
+    清了它，这条目下一轮就会回到候选池最前面被重新判成 refuted——撤销出口当场变成旋转门。
+    """
+    await _fresh()
+    item_id = await _seed_item()
+    async with get_sessionmaker()() as session:
+        await repo.apply_intel_verdicts(session, [{
+            "itemId": item_id, "verdict": "refuted", "reason": "被后续报道推翻",
+            "confidence": 0.3, "toTier": None, "expiresTs": None, "verifyCount": 1}],
+            now=NOW)
+
+    async with _client() as client:
+        res = await client.patch(f"/api/intel/items/{item_id}", json={"clearVerdict": True})
+
+    assert res.status_code == 200
+    item = res.json()["item"]
+    assert item["verdict"] == "" and item["verdictNote"] == "" and item["verdictTs"] == 0
+    assert item["verifyCount"] == 1, "清了它，撤销出口就是一扇旋转门"
+    assert item["userEdited"] is True, "`user_edited` 在这里兼任判定锁"
+    await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_empty_patch_is_still_rejected():
+    """既有纪律不变：一个非 None 都没有的 patch 一律 422。"""
+    await _fresh()
+    item_id = await _seed_item()
+    async with _client() as client:
+        res = await client.patch(f"/api/intel/items/{item_id}", json={})
+    assert res.status_code == 422
+    await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_manual_verify_needs_a_runtime():
+    """两个手动核查端点都复用 `_require_runtime`：未装配 ⇒ 409，**绝不假装在核查**。"""
+    await _fresh()
+    item_id = await _seed_item()
+    async with _client() as client:
+        assert (await client.post(f"/api/intel/{INST}/verify")).status_code == 409
+        assert (await client.post(f"/api/intel/items/{item_id}/verify")).status_code == 409
+    await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_manual_item_verify_bypasses_candidate_filters():
+    """P2-11：它是一条**人类显式指令**——`origin="user"` 且 `user_edited=True` 的条目照样受理。"""
+    await _fresh()
+    item_id = await _seed_item(origin="user", userEdited=True, dedupKey="seed-user")
+    queued: list[dict] = []
+
+    class _Runtime:
+        enabled = True
+        deps = None
+
+        class _Lock:
+            @staticmethod
+            def locked():
+                return False
+
+        lock = _Lock()
+
+        def run_verify(self, inst_id, *, only_item_id=None):
+            queued.append({"instId": inst_id, "onlyItemId": only_item_id})
+
+            async def _noop():
+                return None
+
+            return _noop()
+
+    intel_runtime._BY_INST[INST] = _Runtime()
+    try:
+        async with _client() as client:
+            res = await client.post(f"/api/intel/items/{item_id}/verify")
+    finally:
+        intel_runtime._BY_INST.pop(INST, None)
+
+    assert res.status_code == 202 and res.json() == {"queued": True}
+    assert queued == [{"instId": INST, "onlyItemId": item_id}]
+    await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_manual_item_verify_404_on_unknown_item():
+    await _fresh()
+    async with _client() as client:
+        assert (await client.post("/api/intel/items/999999/verify")).status_code == 404
+    await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_impact_and_citations_endpoints():
+    """#18 / #19：影响力读数与引用明细的正常路径。"""
+    await _fresh()
+    item_id = await _seed_item()
+    async with get_sessionmaker()() as session:
+        await repo.append_intel_citations(session, [{
+            "itemId": item_id, "instId": INST, "runId": 3, "roundNo": 7, "citedTs": NOW,
+            "refToken": "I01", "role": "entry", "positionSeq": 2, "traded": True}])
+        await repo.settle_intel_citations(session, run_id=3, position_seq=2,
+                                          net_pnl_usd=18.4, hold_s=900,
+                                          exit_source="agent", outcome="win", now=NOW)
+
+    async with _client() as client:
+        impact = (await client.get(f"/api/intel/{INST}/impact")).json()
+        rows = (await client.get(f"/api/intel/{INST}/citations")).json()
+
+    assert impact["totals"]["citeEntryCount"] == 1
+    assert impact["totals"]["netPnlUsd"] == pytest.approx(18.4)
+    assert impact["neverCited"] == 0
+    assert [it["id"] for it in impact["top"]] == [item_id]
+    assert rows["hasMore"] is False
+    assert rows["rows"][0]["outcome"] == "win" and rows["rows"][0]["refToken"] == "I01"
+    await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_citations_pagination_is_cursor_based():
+    """游标是 `id` 而不是时间戳：同一秒里的多条引用用时间戳翻页会漏行。"""
+    await _fresh()
+    item_id = await _seed_item()
+    async with get_sessionmaker()() as session:
+        await repo.append_intel_citations(session, [
+            {"itemId": item_id, "instId": INST, "runId": 1, "roundNo": i, "citedTs": NOW,
+             "refToken": "I01", "role": "hold"} for i in range(3)])
+
+    cursor_query = "limit=2&before="
+    async with _client() as client:
+        first = (await client.get(f"/api/intel/{INST}/citations?limit=2")).json()
+        rest = (await client.get(
+            f"/api/intel/{INST}/citations?{cursor_query}{first['rows'][-1]['id']}")).json()
+
+    assert first["hasMore"] is True and len(first["rows"]) == 2
+    assert rest["hasMore"] is False and len(rest["rows"]) == 1
+    await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_provider_health_is_honest_when_nothing_is_armed():
+    """没有已装配的 runtime ⇒ 0 轮 / 0 秒，而不是猜一个数。"""
+    await _fresh()
+    async with _client() as client:
+        health = (await client.get("/api/intel/settings/health")).json()
+    assert health == {"provider": "", "rounds": 0, "ok": 0, "failed": 0, "degraded": 0,
+                      "breakerRemainingS": 0}
+    await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_settings_expose_the_eight_new_keys():
+    """G-18 的端点侧：8 个新键写进去、读出来、**逐键**比对。"""
+    await _fresh()
+    async with _client() as client:
+        saved = (await client.put("/api/settings/intel", json={
+            "citeEnabled": False, "attributionEnabled": False, "verifyEnabled": False,
+            "verifyEveryNCurates": 3, "verifyMaxItems": 2, "verifyDocsPerItem": 5,
+            "blockedSweepEnabled": False, "citeMaxRefs": 4})).json()
+        read = (await client.get("/api/settings/intel")).json()
+
+    for payload in (saved, read):
+        assert payload["citeEnabled"] is False
+        assert payload["attributionEnabled"] is False
+        assert payload["verifyEnabled"] is False
+        assert payload["verifyEveryNCurates"] == 3
+        assert payload["verifyMaxItems"] == 2
+        assert payload["verifyDocsPerItem"] == 5
+        assert payload["blockedSweepEnabled"] is False
+        assert payload["citeMaxRefs"] == 4
+    await dispose_engine()
+
+
+@pytest.mark.asyncio
+async def test_settings_reject_out_of_range_verify_values():
+    await _fresh()
+    async with _client() as client:
+        assert (await client.put("/api/settings/intel",
+                                 json={"verifyMaxItems": 99})).status_code == 422
+        assert (await client.put("/api/settings/intel",
+                                 json={"citeMaxRefs": 0})).status_code == 422
+    await dispose_engine()

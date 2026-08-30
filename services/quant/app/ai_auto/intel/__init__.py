@@ -14,6 +14,8 @@
 `scheduler` 反向依赖 `runtime` 的注册表，故 `runtime.invalidate` 里那一处 import 是**延迟**的
 （见该函数的 docstring）。
 """
+from .attribution import IntelAttribution
+from .citation import CitationResolution, classify_outcome, resolve_citations
 from .disclosure import format_intel
 from .gate import IntelItem, IntelSource
 from .runtime import (
@@ -27,23 +29,29 @@ from .runtime import (
     unregister,
 )
 from .service import IntelDeps, run_collect_round, run_curate_round
+from .service_verify import run_verify_round
 from .taxonomy import IntelLimits, limits_from_settings
 
 __all__ = [
+    "CitationResolution",
+    "IntelAttribution",
     "IntelDeps",
     "IntelItem",
     "IntelLimits",
     "IntelRuntime",
     "IntelSource",
     "build_group_runtime",
+    "classify_outcome",
     "format_intel",
     "intel_digest_for",
     "intel_summary_for",
     "invalidate",
     "limits_from_settings",
     "register",
+    "resolve_citations",
     "run_collect_round",
     "run_curate_round",
+    "run_verify_round",
     "runtime_for",
     "unregister",
 ]

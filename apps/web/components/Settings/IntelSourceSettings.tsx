@@ -3,16 +3,25 @@
 import { useEffect, useState } from "react";
 import { Button, Card, Field, Input, Select, Switch } from "@/components/ui";
 import { intelApi } from "@/lib/intelApi";
-import type { IntelProbeResult, IntelSettings } from "@/lib/intelTypes";
+import type { IntelProbeResult, IntelProviderHealth, IntelSettings } from "@/lib/intelTypes";
 
-// v1 只实现 tavily（评审裁决 Q3）。brave / serper 的接入参数已在 spec §3.2.1 登记，v1.1 补时
-// 各约 50 行且不改协议——**故意不在下拉里列出它们**：一个选了就不工作的选项比没有这个选项更坏。
+// 三个适配器都已实现（intel-closed-loop 轴 D 兑现了 v1 登记的那条待办），故三项全部列出——
+// v1 时代「故意不列出未实现的选项」的理由（一个选了就不工作的选项比没有这个选项更坏）在这里
+// 已经不成立。**仍是单活**：选一个，不做多源扇出（§十 非目标 3）。
 const PROVIDERS = [
-  { value: "none", label: "不使用（关闭情报采集）" },
-  { value: "tavily", label: "Tavily（api.tavily.com）" },
+  { value: "none", label: "不使用（关闭情报采集）", apply: "" },
+  { value: "tavily", label: "Tavily（api.tavily.com）", apply: "https://tavily.com" },
+  { value: "brave", label: "Brave Search（api.search.brave.com）", apply: "https://brave.com/search/api" },
+  { value: "serper", label: "Serper（google.serper.dev）", apply: "https://serper.dev" },
 ];
 
-const APPLY_LINK = "https://tavily.com";
+/**
+ * 申请地址**必须跟着当前选中的源走**。三个源各自发各自的 key，把一个选了 Brave 的用户指去
+ * tavily.com 不是排版瑕疵——那是一条会让他白跑一趟并断定「这功能没做完」的错误指引。
+ */
+function applyLinkFor(provider: string): string {
+  return PROVIDERS.find((p) => p.value === provider)?.apply ?? "";
+}
 
 /** 节律三项的草稿（字符串：用户把框清空的那一瞬不该变成 `0`）。 */
 type CadenceDraft = { collectIntervalMin: string; curateEveryNCollects: string; dailyCap: string };
@@ -41,6 +50,7 @@ export default function IntelSourceSettings() {
   const [error, setError] = useState("");
   const [probe, setProbe] = useState<IntelProbeResult | null>(null);
   const [draft, setDraft] = useState<CadenceDraft>(() => cadenceOf(null));
+  const [health, setHealth] = useState<IntelProviderHealth | null>(null);
 
   useEffect(() => {
     intelApi
@@ -50,6 +60,12 @@ export default function IntelSourceSettings() {
         setDraft(cadenceOf(next));
       })
       .catch((err) => setError(err instanceof Error ? err.message : "读取设置失败"));
+    // 每源健康是**观测**（closed-loop §3.4.4）：不新建任何表、不新建任何计数器，纯读
+    // `ai_intel_rounds` 的聚合 + 进程内 breaker 剩余秒。取不到时整行不渲染，不显示一个假的 0。
+    intelApi
+      .providerHealth()
+      .then(setHealth)
+      .catch(() => undefined);
   }, []);
 
   // “改过”才能保存：一个永远亮着的保存按钮说不清自己到底有没有事情可做。
@@ -69,6 +85,12 @@ export default function IntelSourceSettings() {
         collectIntervalMin: patch.collectIntervalMin,
         curateEveryNCollects: patch.curateEveryNCollects,
         dailyCap: patch.dailyCap,
+        // closed-loop 的三把安全单键。**逐个透传**而不是 `...patch`：那会把
+        // `hasKey` / `keyPreview` / `estimate` 这些只读键一起 PUT 出去（422），而
+        // 「保存失败」在一块开关面板上会被读成「这个开关坏了」。
+        citeEnabled: patch.citeEnabled,
+        attributionEnabled: patch.attributionEnabled,
+        verifyEnabled: patch.verifyEnabled,
       });
       setSettings(next);
       setDraft(cadenceOf(next));
@@ -141,7 +163,9 @@ export default function IntelSourceSettings() {
           hint={
             settings.hasKey
               ? `已保存（${settings.keyPreview}）。留空即保持不变；填入新值即覆盖。`
-              : `尚未保存。可在 ${APPLY_LINK} 申请，免费额度足够日常使用。`
+              : applyLinkFor(settings.provider)
+                ? `尚未保存。可在 ${applyLinkFor(settings.provider)} 申请，免费额度足够日常使用。`
+                : "尚未保存。先在上面选一个检索源，再来填它的 API Key。"
           }
         >
           <div className="flex items-center gap-1.5">
@@ -260,6 +284,42 @@ export default function IntelSourceSettings() {
         </span>
       </Card>
 
+      <Card className="flex flex-col gap-3 p-4" data-testid="intel-closed-loop-switches">
+        <span className="text-sm font-semibold text-[var(--text)]">情报闭环</span>
+        <span className="text-[11px] leading-relaxed text-[var(--muted)]">
+          让每一条情报可被引用、可被结算、可被证伪。三把开关逐层收窄：关掉「引用编号」，
+          注入行与决策工具会**逐字节**回到没有本功能的样子；关掉「引用归因」，引用照记但不结算；
+          关掉「定期核查」，不再有任何自动的证实 / 证伪判定。已有的统计与判定一律原样保留。
+        </span>
+        <ToggleRow
+          label="给情报编号，让模型能点名引用"
+          hint="注入行前面加 [I01] 这样的编号；模型可在决策里写下它实际采信了哪几条。纯观测，不参与任何风控判定。"
+          checked={settings.citeEnabled}
+          disabled={busy}
+          onChange={(checked) => void save({ citeEnabled: checked })}
+        />
+        <ToggleRow
+          label="按往返净额结算引用战绩"
+          hint="平仓时把这笔往返的净额回写到当轮引用过的每一条情报上。这些数字是共现统计，不是因果归因。"
+          checked={settings.attributionEnabled}
+          disabled={busy}
+          onChange={(checked) => void save({ attributionEnabled: checked })}
+        />
+        <ToggleRow
+          label="定期核查已入库的情报"
+          hint={`每 ${settings.verifyEveryNCurates} 次整理轮跑一次核查，单轮最多 ${settings.verifyMaxItems} 条、每条检索 ${settings.verifyDocsPerItem} 篇。首次判「已证伪」只停止注入、不改层级。`}
+          checked={settings.verifyEnabled}
+          disabled={busy}
+          onChange={(checked) => void save({ verifyEnabled: checked })}
+        />
+        {health && health.rounds > 0 && (
+          <span data-testid="intel-provider-health" className="text-[11px] text-[var(--muted)]">
+            最近 {health.rounds} 轮：{health.provider || "未知源"} {health.ok} 成功 /{" "}
+            {health.failed + health.degraded} 失败或降级，熔断剩余 {health.breakerRemainingS} 秒
+          </span>
+        )}
+      </Card>
+
       <Card className="flex items-start justify-between gap-3 p-4">
         <div className="flex flex-col gap-0.5">
           <span className="text-sm font-semibold text-[var(--text)]">喂给交易 Agent</span>
@@ -275,6 +335,42 @@ export default function IntelSourceSettings() {
           label="把情报注入交易决策"
         />
       </Card>
+    </div>
+  );
+}
+
+/** 一行开关（标题 + 一句「关掉会怎样」+ Switch）。三把安全单键共用同一形状。 */
+function ToggleRow({
+  label,
+  hint,
+  checked,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  hint: string;
+  checked: boolean;
+  disabled: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3">
+      <div className="flex min-w-0 flex-col gap-0.5">
+        <span className="text-[12px] text-[var(--text)]">{label}</span>
+        <span className="text-[11px] leading-relaxed text-[var(--muted)]">{hint}</span>
+      </div>
+      {/* `ui/Switch` 是一个 `role="switch"` 的 `<button>`，但它**没有透出 `disabled`**。保存在飞
+          时因此只能靠回调忽略这一次点击；那必须配一个看得见的失效态，否则就成了「看起来能点、
+          点了什么也不发生」——本轮要修的正是这一类沉默。为一处调用点去改共用原子组件的公开面，
+          代价大于收益。 */}
+      <Switch
+        checked={checked}
+        onChange={(next) => {
+          if (!disabled) onChange(next);
+        }}
+        label={label}
+        className={disabled ? "pointer-events-none opacity-50" : undefined}
+      />
     </div>
   );
 }

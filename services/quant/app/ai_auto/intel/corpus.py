@@ -120,7 +120,8 @@ def _fmt_date(ts: int) -> str:
 
 
 def build(docs: list[SearchDoc], ctx: IntelContext, *, max_docs: int,
-          snippet_max_chars: int, blocked_domains: frozenset[str] = frozenset()) -> Corpus:
+          snippet_max_chars: int, blocked_domains: frozenset[str] = frozenset(),
+          trusted_domains: frozenset[str] = frozenset()) -> Corpus:
     """归一化 → 去重 → 截断 → 编号 → 渲染不可信语料块。
 
     Args:
@@ -129,13 +130,20 @@ def build(docs: list[SearchDoc], ctx: IntelContext, *, max_docs: int,
         max_docs: 语料总封顶。
         snippet_max_chars: 单文档正文片段封顶。
         blocked_domains: 用户标记「不再采纳此源」的可注册域名。
+        trusted_domains: 用户标记「更信任此源」的可注册域名（closed-loop 评审 P1-7）。
+            **只用在 `sorted(...)` 的排序键上打破并列**——`trust` 是「同分时优先留谁」，
+            不是「多留一篇」；截断规则一个字节不改。
 
     Returns:
         `Corpus`。零文档时 `block` 为空串——调用方据此记 `search_empty` 并**不调 LLM**。
     """
     seen: set[str] = set()
     picked: list[SearchDoc] = []
-    for doc in sorted(docs or [], key=lambda d: (-float(d.score or 0.0), d.url)):
+    trusted = trusted_domains or frozenset()
+    for doc in sorted(docs or [],
+                      key=lambda d: (-float(d.score or 0.0),
+                                     0 if tax.normalize_domain(d.url) in trusted else 1,
+                                     d.url)):
         if not tax.is_http_url(doc.url):
             continue
         domain = tax.normalize_domain(doc.url)

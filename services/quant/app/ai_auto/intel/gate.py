@@ -42,6 +42,10 @@ _REF_RE = re.compile(r"^D([0-9]{1,2})$")
 # （实施过程发现的方案缺陷 #1，已登记在 spec 的《实施过程发现的方案缺陷》一节。）
 SCORE_IMPACT_W: dict[str, float] = {"low": 0.34, "medium": 0.67, "high": 1.0}
 
+# 归档一条「被当作入场依据引用过且关联净额为正」的情报时，模型必须写足的理由字数
+# （closed-loop §3.2.4 第 2 条）。它是一道**举证责任**，不是一张免死金牌：写足了照样能归档。
+_ARCHIVE_PROFITABLE_MIN_CHARS = 30
+
 
 # ---------------- 领域对象（与 DB 行 1:1，与 wire 1:1 但键名 camelCase） ----------------
 @dataclass(frozen=True)
@@ -83,11 +87,29 @@ class IntelItem:
     origin: str = "agent"
     dedup_key: str = ""
     updated_ts: int = 0
+    # ---- closed-loop §5.2 的十个新列（引用战绩六 + 判定四）。全部带默认值 ⇒ 既有构造零改动。
+    # 它们只走**读**方向（`service.item_from_wire` 带上它们）；写方向的 `item_to_payload` 一个
+    # 都不许带（评审 P1-6：进了 `_item_values` 就会在再次报道时被清零，且不报错）。
+    cite_count: int = 0
+    cite_entry_count: int = 0
+    settled_count: int = 0
+    win_count: int = 0
+    net_pnl_usd: float = 0.0
+    last_cited_ts: int = 0
+    verdict: str = ""              # ""|confirmed|refuted|unresolved
+    verdict_ts: int = 0
+    verdict_note: str = ""
+    verify_count: int = 0
 
     @property
     def protected(self) -> bool:
         """两把免死金牌：自动路径（TTL / 溢出 / 整理轮 archive）一律跳过它。"""
         return bool(self.pinned or self.user_edited)
+
+    @property
+    def refuted(self) -> bool:
+        """已被后续报道推翻 ⇒ **立即停止注入**（closed-loop §3.3.4，受保护条目同样生效）。"""
+        return self.verdict == "refuted"
 
 
 @dataclass(frozen=True)
@@ -140,16 +162,36 @@ def expires_for_tier(*, tier: str, event_ts: int, captured_ts: int, pinned: bool
     return int(max(int(event_ts or 0), int(captured_ts or 0)) + ttl)
 
 
-def score_item(item: IntelItem, *, now: float) -> float:
+def score_item(item: IntelItem, *, now: float, limits: IntelLimits | None = None) -> float:
     """溢出淘汰与注入排序共用的打分：置信度 × 影响力 × 时间衰减（§3.4.4 第 2 步）。
 
     未来事件（`is_scheduled`）不衰减：一件还没发生的事不会因为「我们早就知道了」而变得不重要。
+
+    Args:
+        item: 目标条目。
+        now: 墙钟秒。
+        limits: closed-loop §3.2.4 的引用加分来源（keyword-only，**带默认值**）。
+            ``None`` ⇒ **不计 bonus、返回值与本轮合入前逐字节相同**（评审 P1-1：现签名的四个
+            调用点没有一个能拿到 `cite_score_bonus`，给新形参一个默认值让 `admit` 与
+            `render_listing` 两处零改动）。
+
+    Returns:
+        非负打分。加分项 `cite_bonus = cite_score_bonus × tanh(cite_entry_count / 3) × sign_bias`，
+        其中 `sign_bias = 1.0`（净额 ≥ 0）否则 `0.0`：**被引用过且赚过钱的情报排前面；被引用过
+        但亏钱的情报不加分，也不减分**。不减分的理由是成文的——一条情报被引用后亏钱，可能是情报
+        错了，也可能是仓位错了、时机错了；把它降到「不如从没被引用过」不可辩护。
     """
     ref = item.event_ts if item.event_ts > 0 else item.captured_ts
     age_days = max(0.0, (float(now) - float(ref or now)) / 86400.0)
     half_life = tax.HALF_LIFE_DAYS.get(item.tier, 1.0)
     decay = math.exp(-age_days / half_life) if half_life > 0 else 1.0
-    return float(item.confidence) * SCORE_IMPACT_W.get(item.impact, 0.5) * decay
+    base = float(item.confidence) * SCORE_IMPACT_W.get(item.impact, 0.5) * decay
+    if limits is None:
+        return base
+    sign_bias = 1.0 if float(item.net_pnl_usd or 0.0) >= 0.0 else 0.0
+    bonus = (float(limits.cite_score_bonus)
+             * math.tanh(max(0, int(item.cite_entry_count)) / 3.0) * sign_bias)
+    return base + bonus
 
 
 # ---------------- 去重键 ----------------
@@ -172,17 +214,29 @@ def dedup_key(headline: str, urls: list[str] | tuple[str, ...]) -> str:
 
 # ---------------- 置信度：**服务端算，不是模型自报**（§3.3.5） ----------------
 def solve_confidence(*, domain_count: int, has_published: bool, impact: str, undated: bool,
-                     all_same_domain: bool) -> float:
+                     all_same_domain: bool, has_trusted: bool = False,
+                     trust_bonus: float = 0.0) -> float:
     """按求解式给出 0.05..0.95 的置信度。
 
     模型的工具 schema 里**没有** `confidence` 字段：让模型给自己的产出打分，得到的永远是 0.8。
+
+    Args:
+        has_trusted: 本条来源里有没有**用户标记为可信**的域名（closed-loop 评审 P1-7 的第 6 个
+            keyword-only 形参，默认 False ⇒ 既有全部调用点与全部置信度断言零改动）。
+        trust_bonus: 上一项为真时的置信度先验幅度（本函数是纯核心、拿不到 `IntelLimits`，故幅度
+            由调用方传入；默认 0 ⇒ 逐字节回退）。
+
+    Note:
+        **绝不让可信域名多算一次 `domain_count`**——那是「来源独立性」的分母，被信任不等于变成了
+        两个独立信源；混淆这两件事会让「两个独立来源才能升长期」这道闸被一次点击绕过。
     """
     value = (0.30
              + 0.15 * min(int(domain_count), 3)
              + 0.10 * (1.0 if has_published else 0.0)
              + 0.10 * tax.IMPACT_W.get(impact, 0.5)
              - 0.20 * (1.0 if undated else 0.0)
-             - 0.15 * (1.0 if all_same_domain else 0.0))
+             - 0.15 * (1.0 if all_same_domain else 0.0)
+             + (max(0.0, float(trust_bonus)) if has_trusted else 0.0))
     return round(min(0.95, max(0.05, value)), 4)
 
 
@@ -287,7 +341,8 @@ def _resolve_refs(proposal: dict, corpus: "Corpus") -> list | None:
 
 
 def _admit_one(proposal: dict, corpus: "Corpus", *, inst_id: str, limits: IntelLimits,
-               now: float, rejects: dict[str, int]) -> IntelItem | None:
+               now: float, rejects: dict[str, int],
+               trusted_domains: frozenset[str] = frozenset()) -> IntelItem | None:
     """单条提案过六道闸；任一不过即计数并回 ``None``。"""
     shape_reject = _check_shape(proposal, limits=limits)
     if shape_reject:
@@ -327,7 +382,8 @@ def _admit_one(proposal: dict, corpus: "Corpus", *, inst_id: str, limits: IntelL
             _bump(rejects, "stale_event")
             return None
 
-    sources, confidence = _solve_sources(docs, impact=impact, undated=undated)
+    sources, confidence = _solve_sources(docs, impact=impact, undated=undated, limits=limits,
+                                         trusted_domains=trusted_domains)
     # 一切新采集条目的唯一落点是 `ultra`：升进中期 / 长期只能由整理轮提议并经服务端复核。
     return IntelItem(
         item_id=None, inst_id=inst_id, tier="ultra", category=category, headline=headline,
@@ -341,11 +397,14 @@ def _admit_one(proposal: dict, corpus: "Corpus", *, inst_id: str, limits: IntelL
         dedup_key=dedup_key(headline, [s.url for s in sources]), updated_ts=captured_ts)
 
 
-def _solve_sources(docs, *, impact: str, undated: bool
+def _solve_sources(docs, *, impact: str, undated: bool, limits: IntelLimits,
+                   trusted_domains: frozenset[str] = frozenset()
                    ) -> tuple[tuple[IntelSource, ...], float]:
     """把被引用文档折成来源元组，并**在服务端求解**置信度。
 
     `undated` 的封顶（≤0.4）写在这里而不是调用点：置信度只有这一个产出口，两处各夹一次必漂移。
+    `trusted_domains` 只压成一个 bool 交给 `solve_confidence`（评审 P1-7）——它是「置信度先验」，
+    不是「多一个独立来源」。
     """
     sources = tuple(IntelSource(url=doc.url, title=doc.title, publisher=doc.publisher,
                                 domain=doc.domain, published_ts=int(doc.published_ts or 0))
@@ -354,7 +413,9 @@ def _solve_sources(docs, *, impact: str, undated: bool
     confidence = solve_confidence(
         domain_count=len(domains),
         has_published=any(int(getattr(d, "published_ts", 0) or 0) > 0 for d in docs),
-        impact=impact, undated=undated, all_same_domain=len(domains) <= 1)
+        impact=impact, undated=undated, all_same_domain=len(domains) <= 1,
+        has_trusted=bool(domains & (trusted_domains or frozenset())),
+        trust_bonus=float(limits.trust_bonus))
     return sources, (min(confidence, 0.4) if undated else confidence)
 
 
@@ -379,7 +440,8 @@ def _merge_existing(candidate: IntelItem, prior: IntelItem, *, limits: IntelLimi
 
 
 def admit(proposals: list[dict], corpus: "Corpus", existing: dict[str, IntelItem], *,
-          inst_id: str, limits: IntelLimits, now: float | None = None) -> AdmitResult:
+          inst_id: str, limits: IntelLimits, now: float | None = None,
+          trusted_domains: frozenset[str] = frozenset()) -> AdmitResult:
     """六道闸 + 去重 + 条目数封顶。
 
     Args:
@@ -389,6 +451,8 @@ def admit(proposals: list[dict], corpus: "Corpus", existing: dict[str, IntelItem
         inst_id: 恒为完整 instId，不做资产级归并。
         limits: 阈值聚合。
         now: 墙钟秒；缺省取 `time.time()`（纯核心不自带时钟是为了可测，这里只是便利默认）。
+        trusted_domains: 用户标记「更信任此源」的可注册域名（closed-loop 评审 P1-7）。
+            只进置信度先验，**绝不加 `domain_count`**；缺省空集 ⇒ 逐字节回退。
 
     Returns:
         `AdmitResult`。被截断到 `items_per_round` 的部分计 `over_cap`——配置项必须有服务端落点，
@@ -404,7 +468,7 @@ def admit(proposals: list[dict], corpus: "Corpus", existing: dict[str, IntelItem
             _bump(rejects, "bad_field")
             continue
         item = _admit_one(proposal, corpus, inst_id=inst_id, limits=limits, now=wall,
-                          rejects=rejects)
+                          rejects=rejects, trusted_domains=trusted_domains)
         if item is None:
             continue
         prior = existing.get(item.dedup_key)
@@ -521,6 +585,11 @@ def _review_one(entry: dict, item: IntelItem, items: dict[int, IntelItem], *,
     if action == "archive":
         if item.protected:
             return None, "archive_protected"          # 两把免死金牌（评审 P1-5）
+        # closed-loop §3.2.4 第 2 条：**举证责任的抬高，不是免死金牌**。一条被当作入场依据引用过
+        # 且关联净额为正的情报，要归档它就得写出比一句「不重要」更具体的理由。
+        if (item.cite_entry_count > 0 and float(item.net_pnl_usd or 0.0) > 0.0
+                and len(reason) < _ARCHIVE_PROFITABLE_MIN_CHARS):
+            return None, "archive_profitable"
         return CurationAction(item.item_id, "archive", None, None, reason, 0), None
     if action == "merge":
         target_id = int(entry.get("mergeIntoId") or 0)
@@ -551,27 +620,51 @@ def _review_one(entry: dict, item: IntelItem, items: dict[int, IntelItem], *,
 # ---------------- 确定性清理（§3.4.4，**不依赖模型**） ----------------
 @dataclass(frozen=True)
 class CleanupPlan:
-    """三步纯规则清理的产物（TTL / 溢出 / 已排期失效）。全部跳过两把免死金牌。"""
+    """四步纯规则清理的产物（TTL / 溢出 / 已排期失效 / 存量扫除）。全部跳过两把免死金牌。"""
 
     expire_ids: tuple[int, ...]
     overflow_ids: tuple[int, ...]
     lapsed: tuple[CurationAction, ...]
+    # closed-loop §3.4.2 第 5 步：「`sources` 非空且**每一个** source 的 domain 都被拉黑」的条目。
+    blocked_ids: tuple[int, ...] = ()
 
     @property
     def counts(self) -> dict[str, int]:
+        # `blocked_sweep` 必须在这张表里（漏了它，`actions_json` 里那个数永远是 0，而拉黑到底
+        # 扫掉了几条是用户唯一能看见的后果）。
         return {"ttl": len(self.expire_ids), "overflow": len(self.overflow_ids),
-                "lapsed_schedule": len(self.lapsed)}
+                "lapsed_schedule": len(self.lapsed), "blocked_sweep": len(self.blocked_ids)}
 
 
-def plan_cleanup(items: list[IntelItem], *, limits: IntelLimits, now: float) -> CleanupPlan:
-    """按当前库存算出三步清理动作。
+def _all_sources_blocked(item: IntelItem, blocked: frozenset[str]) -> bool:
+    """该条目的**每一个**来源域名是否都在黑名单里（来源为空 ⇒ False，绝不扫掉无来源条目）。"""
+    domains = [s.domain for s in item.sources if s.domain]
+    return bool(domains) and all(domain in blocked for domain in domains)
 
-    这三步是「噪声或无效的短线情报可以进行整理或清理」这条需求的**兜底实现**：模型哑火时噪声
+
+def plan_cleanup(items: list[IntelItem], *, limits: IntelLimits, now: float,
+                 blocked_domains: frozenset[str]) -> CleanupPlan:
+    """按当前库存算出四步清理动作。
+
+    这四步是「噪声或无效的短线情报可以进行整理或清理」这条需求的**兜底实现**：模型哑火时噪声
     照样被清。`expires_ts` 恒由**当前 tier** 求出（不变式 I-3）——只要它没随升级重算，第 1 步就会
     在事件发生 72 小时后把中期与长期两层一并扫空。
+
+    Args:
+        items: 该标的的库存（本函数自行过滤非 active）。
+        limits: 阈值聚合（TTL / 层上限 / 失效宽限 / 引用加分）。
+        now: 墙钟秒。
+        blocked_domains: 用户拉黑的可注册域名。**无默认值的 keyword-only 必填形参**（评审 P1-8）
+            ——给它一个 `frozenset()` 默认值，漏传的症状就是「扫除永远算出空集」而不是一个
+            `TypeError`，而静默空转正是本轮要修的那类缺陷。
+
+    Returns:
+        `CleanupPlan`。**被证伪不是一条归档理由**（评审 P1-12）：归档只由这四条不依赖模型判断的
+        确定性规则做出。
     """
     expire: list[int] = []
     lapsed: list[CurationAction] = []
+    blocked_ids: list[int] = []
     survivors: list[IntelItem] = []
     for item in items:
         if item.status != "active" or item.item_id is None:
@@ -581,6 +674,10 @@ def plan_cleanup(items: list[IntelItem], *, limits: IntelLimits, now: float) -> 
             continue
         if item.expires_ts > 0 and now > item.expires_ts:
             expire.append(item.item_id)
+            continue
+        # 第 5 步：存量扫除。排在 TTL 之后、溢出之前——一条已经过期的条目不必再被算一次拉黑。
+        if _all_sources_blocked(item, blocked_domains):
+            blocked_ids.append(item.item_id)
             continue
         # 已排期事件失效（评审 P0-1）：没有这一步，「永远的明天」会在库里堆成一排再也不会发生的
         # 预告，而它们的 `stance` 还在持续喂给交易 Agent。
@@ -606,6 +703,8 @@ def plan_cleanup(items: list[IntelItem], *, limits: IntelLimits, now: float) -> 
         held = len([it for it in survivors if it.tier == tier])
         if held <= cap:
             continue
-        rows.sort(key=lambda it: score_item(it, now=now))
+        # closed-loop §3.2.4 第 3 条：**必须把 limits 显式传下去**——不传就是「第 1 条写了但
+        # 溢出淘汰这一路没走到」，正是本仓库的成文教训「用例绿着但分支从没被走到」。
+        rows.sort(key=lambda it: score_item(it, now=now, limits=limits))
         overflow.extend(int(it.item_id) for it in rows[:held - cap] if it.item_id)
-    return CleanupPlan(tuple(expire), tuple(overflow), tuple(lapsed))
+    return CleanupPlan(tuple(expire), tuple(overflow), tuple(lapsed), tuple(blocked_ids))

@@ -1088,8 +1088,10 @@ from .ai_intel_repositories import (  # noqa: E402,F401
     intel_round_out,
     intel_watch_out,
     list_intel_blocked_domains,
+    list_intel_feedback,
     list_intel_items,
     list_intel_rounds,
+    list_intel_trusted_domains,
     load_intel_scope,
     load_intel_watch,
     mark_intel_seen,
@@ -1101,4 +1103,22 @@ from .ai_intel_repositories import (  # noqa: E402,F401
     upsert_intel_items,
     utc_day_key as intel_utc_day_key,
     write_intel_round,
+)
+# ai_intel_citation_repositories：引用明细 / 影响力 / 信源聚合 / 核查判定
+# （ai-trade-intel-closed-loop §5.5；新开一个平级文件正是「不让 `ai_intel_repositories` 越 800
+# 线」的处置）。同一条再导出纪律适用：漏一个是静默空转，不是 ImportError。
+from .ai_intel_citation_repositories import (  # noqa: E402,F401
+    append_intel_citations,
+    apply_intel_verdicts,
+    clear_intel_verdict,
+    count_intel_verdicts,
+    count_items_all_sources_blocked,
+    intel_citation_out,
+    list_intel_citations,
+    list_intel_source_rows,
+    promote_intel_citations_to_entry,
+    prune_intel_citations,
+    read_intel_impact,
+    settle_intel_citations,
+    sweep_blocked_source_items,
 )

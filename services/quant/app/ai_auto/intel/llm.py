@@ -25,13 +25,19 @@ if TYPE_CHECKING:                       # 仅类型标注；运行期延迟导�
 
 
 def build_intel_llm_client(cfg: "LlmProviderConfig", settings: "Settings", *,
-                           make_client=None) -> LLMClient:
+                           make_client=None,
+                           max_tokens_override: int | None = None) -> LLMClient:
     """按情报专用预算造一个 client。
 
     Args:
         cfg: 当前生效的 provider 配置（`resolve_active_provider` 的产物）。
         settings: 读 `ai_trade_intel_max_tokens`。
         make_client: 造 client 的工厂（keyword-only，默认 `make_llm_client_from_config`）。
+        max_tokens_override: 覆盖输出预算（intel-closed-loop 评审 P1-3，keyword-only）。
+            `None`（默认）⇒ **今日行为逐字节不变**、既有调用点零改动。核查轮的
+            `ai_trade_intel_verify_max_tokens` 只能走这条路——`run_round(...)` 没有 `max_tokens`
+            形参，而 `LLMClient.stream` 是 Protocol、32 个测试文件实现了它，给它加参数会一次性
+            打翻它们全部（见模块 docstring）。
 
     Returns:
         输出预算为 `ai_trade_intel_max_tokens`、**不开扩展思考**的客户端。情报轮要的是提炼与
@@ -43,5 +49,6 @@ def build_intel_llm_client(cfg: "LlmProviderConfig", settings: "Settings", *,
     factory = make_client or make_llm_client_from_config
     if not is_dataclass(cfg):
         return factory(cfg)
-    return factory(replace(cfg, max_tokens=int(settings.ai_trade_intel_max_tokens),
-                           thinking_budget_tokens=0))
+    budget = int(max_tokens_override if max_tokens_override is not None
+                 else settings.ai_trade_intel_max_tokens)
+    return factory(replace(cfg, max_tokens=budget, thinking_budget_tokens=0))

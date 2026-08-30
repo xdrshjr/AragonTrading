@@ -155,7 +155,21 @@ async def _intel_wire(session: AsyncSession, settings: Settings) -> dict:
             symbols=members,
             interval_min=float(derived.ai_trade_intel_collect_interval_min),
             corpus_docs=int(derived.ai_trade_intel_corpus_max_docs),
-            snippet_chars=int(derived.ai_trade_intel_snippet_max_chars)),
+            snippet_chars=int(derived.ai_trade_intel_snippet_max_chars),
+            # closed-loop §3.5：核查轮**必须**被算进估算——日配额被三种轮共享是刻意的，把它
+            # 悄悄扩大一倍不是一个可以由实现自行决定的事。
+            verify_enabled=bool(derived.ai_trade_intel_verify_enabled),
+            verify_docs=int(derived.ai_trade_intel_verify_max_items
+                            * derived.ai_trade_intel_verify_docs_per_item)),
+        # ---- closed-loop：三把安全单键 + 五个核查旋钮的**生效值**回读 ----
+        "citeEnabled": bool(derived.ai_trade_intel_cite_enabled),
+        "attributionEnabled": bool(derived.ai_trade_intel_attribution_enabled),
+        "verifyEnabled": bool(derived.ai_trade_intel_verify_enabled),
+        "verifyEveryNCurates": int(derived.ai_trade_intel_verify_every_n_curates),
+        "verifyMaxItems": int(derived.ai_trade_intel_verify_max_items),
+        "verifyDocsPerItem": int(derived.ai_trade_intel_verify_docs_per_item),
+        "blockedSweepEnabled": bool(derived.ai_trade_intel_blocked_sweep_enabled),
+        "citeMaxRefs": int(derived.ai_trade_intel_cite_max_refs),
     }
 
 

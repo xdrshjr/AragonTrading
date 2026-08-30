@@ -24,6 +24,7 @@ export default function ConfirmDialog({
   danger = true,
   onConfirm,
   onCancel,
+  children,
 }: {
   open: boolean;
   title: string;
@@ -33,6 +34,14 @@ export default function ConfirmDialog({
   danger?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
+  /**
+   * 可选的补充控件（作用域勾选框之类），渲染在说明与按钮之间。
+   *
+   * 加这个插槽而不是另造一个确认弹窗：焦点陷阱、Esc、遮罩、**以及「初始焦点钉在取消上」**这条
+   * 不可逆动作的默认极性，都只有一份实现才守得住（ai-trade-intel-closed-loop §3.7.2 的需要）。
+   * 缺省 `undefined` ⇒ 既有全部调用点逐字节不变。
+   */
+  children?: React.ReactNode;
 }) {
   const titleId = useId();
   const cancelRef = useRef<HTMLButtonElement>(null);
@@ -47,6 +56,7 @@ export default function ConfirmDialog({
       <div className="flex flex-col gap-3 p-5">
         <h2 id={titleId} className="text-sm font-semibold text-[var(--text)]">{title}</h2>
         <p className="text-[13px] leading-relaxed text-[var(--muted)]">{message}</p>
+        {children}
         <div className="mt-1 flex items-center justify-end gap-2">
           <Button ref={cancelRef} variant="ghost" size="sm" onClick={onCancel}>{cancelText}</Button>
           <Button

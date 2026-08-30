@@ -212,7 +212,9 @@ DECISION_TOOL_DESCRIPTION_EN = (
     "close / hold and give a short justification in `reason` (Simplified Chinese, for the human "
     "operator). Opening may carry `sizeFraction` (notional share of the budget, 0~1) and "
     "`confidence` (0~1). Optionally give `evidenceDigest` (Simplified Chinese): what you adopted, "
-    "what you overturned, and what would change your mind."
+    "what you overturned, and what would change your mind. Optionally give `intelRefs`: the "
+    "external-intel reference ids you actually relied on this round; it is used for post-hoc "
+    "attribution only and takes no part in any risk or sizing decision."
 )
 
 

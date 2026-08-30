@@ -143,8 +143,20 @@ export function degradeText(degrade: IntelDegrade | null): string {
   return `${base}，${degrade.retryInS}s 后自动重试`;
 }
 
-/** 降级是否值得把按钮染成警示色（弱提示的三种不上色，避免「常亮的警告」失去意义）。 */
-const WEAK_DEGRADE = new Set(["search_empty", "no_tool_call", "all_rejected"]);
+/**
+ * 降级是否值得把按钮染成警示色（弱提示的四种不上色，避免「常亮的警告」失去意义）。
+ *
+ * `verify_no_corpus` 是 `search_empty` 在核查轮上的同义码（intel-closed-loop 轴 C）：
+ * 「这一轮没检索到可核对的新材料」是一个**正常且频繁**的结论，相关条目已被诚实地记成待定。
+ * 漏登记它，一次例行的空核查轮会把标的卡片上的情报按钮一直染成警示色，直到下一轮把它冲掉
+ * ——而一个常亮的警告等于没有警告。另外三个 `verify_*` 码与它们的采集轮同义码同为强提示。
+ */
+const WEAK_DEGRADE = new Set([
+  "search_empty",
+  "no_tool_call",
+  "all_rejected",
+  "verify_no_corpus",
+]);
 
 export function isSevereDegrade(degrade: IntelDegrade | null): boolean {
   return !!degrade && !WEAK_DEGRADE.has(degrade.code);

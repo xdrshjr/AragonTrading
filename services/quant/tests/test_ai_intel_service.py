@@ -21,7 +21,7 @@ from app.ai_auto.intel import service
 from app.ai_auto.intel.search import SearchDoc, SearchRunner
 from app.config import Settings
 from app.db import repositories as repo
-from app.db.models import AiIntelItem, AiIntelRound, AiIntelWatch
+from app.db.models import AiIntelCitation, AiIntelItem, AiIntelRound, AiIntelWatch
 from app.db.session import get_sessionmaker, init_db
 
 # 假时钟比真实时钟**快一小时**：`ensure_intel_watch` 用真实 `time.time()` 写 `next_due_ts`，
@@ -86,7 +86,7 @@ async def _fresh() -> None:
     await init_db()
     sm = get_sessionmaker()
     async with sm() as session:
-        for table in (AiIntelItem, AiIntelRound, AiIntelWatch):
+        for table in (AiIntelCitation, AiIntelItem, AiIntelRound, AiIntelWatch):
             await session.execute(delete(table))
         await session.commit()
 
@@ -413,3 +413,113 @@ async def test_snapshot_respects_inject_switch():
     snapshot = await service.build_snapshot(deps, INST)
     assert snapshot["summary"]["counts"]["ultra"] == 1
     assert snapshot["digest"] == {"lines": [], "hidden": 0}
+
+
+# ---------------- closed-loop：设置桥 / 降级文案 / 估算 / 整理轮末尾的两件事 ----------------
+def test_every_new_intel_setting_key_round_trips_through_the_bridge():
+    """G-18 / P0-5：**逐键**断言 8 个新键都在 `INTEL_SETTING_BRIDGE` 里，且 wire 键与字段对得上。
+
+    不扩那张表 ⇒ 请求 200、面板上开关照动、`Settings` 上的值**永远不变**。断言「请求不报错」
+    抓不到这件事，故这里断言的是键映射本身。
+    """
+    bridge = {wire: (app_key, field, caster)
+              for wire, app_key, field, caster in service.INTEL_SETTING_BRIDGE}
+    expected = {
+        "citeEnabled": ("ai_trade_intel_cite_enabled", bool),
+        "attributionEnabled": ("ai_trade_intel_attribution_enabled", bool),
+        "verifyEnabled": ("ai_trade_intel_verify_enabled", bool),
+        "verifyEveryNCurates": ("ai_trade_intel_verify_every_n_curates", int),
+        "verifyMaxItems": ("ai_trade_intel_verify_max_items", int),
+        "verifyDocsPerItem": ("ai_trade_intel_verify_docs_per_item", int),
+        "blockedSweepEnabled": ("ai_trade_intel_blocked_sweep_enabled", bool),
+        "citeMaxRefs": ("ai_trade_intel_cite_max_refs", int),
+    }
+    settings = Settings()
+    for wire, (field, caster) in expected.items():
+        assert wire in bridge, f"{wire} 没进 INTEL_SETTING_BRIDGE ⇒ 它是一个假开关"
+        app_key, mapped_field, mapped_caster = bridge[wire]
+        assert (mapped_field, mapped_caster) == (field, caster), wire
+        assert app_key.startswith("ai_intel."), wire
+        assert hasattr(settings, field), f"{field} 在 Settings 上不存在"
+
+
+@pytest.mark.asyncio
+async def test_new_setting_keys_are_readable_after_being_written():
+    """G-18 的另一半：写进去 → `resolve_intel_settings` 读出来 → **逐键**比对生效值。"""
+    await _fresh()
+    writes = {"ai_intel.cite_enabled": False, "ai_intel.attribution_enabled": False,
+              "ai_intel.verify_enabled": False, "ai_intel.verify_every_n": 3,
+              "ai_intel.verify_max_items": 2, "ai_intel.verify_docs_per_item": 5,
+              "ai_intel.blocked_sweep": False, "ai_intel.cite_max_refs": 4}
+    async with get_sessionmaker()() as session:
+        for key, value in writes.items():
+            await repo.set_app_setting(session, key, value)
+        derived = await service.resolve_intel_settings(session, Settings())
+
+    assert derived.ai_trade_intel_cite_enabled is False
+    assert derived.ai_trade_intel_attribution_enabled is False
+    assert derived.ai_trade_intel_verify_enabled is False
+    assert derived.ai_trade_intel_verify_every_n_curates == 3
+    assert derived.ai_trade_intel_verify_max_items == 2
+    assert derived.ai_trade_intel_verify_docs_per_item == 5
+    assert derived.ai_trade_intel_blocked_sweep_enabled is False
+    assert derived.ai_trade_intel_cite_max_refs == 4
+
+
+def test_every_new_degrade_code_has_copy():
+    """G-19 / P1-4：四个新码**逐个**断言不等于兜底串。
+
+    漏登记不报错——`degrade_message` 会回落成 `f"情报流水线降级（{code}）"`，用户看到的就是裸码。
+    """
+    from app.ai_auto.intel import taxonomy as tax
+
+    for code in ("verify_no_provider", "verify_search_failed", "verify_no_corpus",
+                 "verify_llm_failed"):
+        message = tax.degrade_message(code, reason="x")
+        assert message != f"情报流水线降级（{code}）", f"{code} 没进 DEGRADE_TEXT"
+        assert code not in message, f"{code} 的文案里露出了裸码"
+    assert len(tax.degrade_message("verify_no_corpus")) > 4
+
+
+def test_estimate_daily_cost_counts_the_verify_round():
+    """§3.5：核查轮**必须**被算进估算——把日配额悄悄扩大一倍不是实现能自行决定的事。"""
+    base = service.estimate_daily_cost(symbols=2, interval_min=30, corpus_docs=16,
+                                       snippet_chars=500)
+    with_verify = service.estimate_daily_cost(symbols=2, interval_min=30, corpus_docs=16,
+                                              snippet_chars=500, verify_enabled=True,
+                                              verify_docs=12)
+
+    assert with_verify["roundsPerDay"] > base["roundsPerDay"]
+    assert with_verify["inputTokensPerDay"] > base["inputTokensPerDay"]
+    # 默认形参 ⇒ 既有调用点逐字节回退。
+    assert service.estimate_daily_cost(symbols=2, interval_min=30, corpus_docs=16,
+                                       snippet_chars=500, verify_enabled=True,
+                                       verify_docs=0) == base
+
+
+@pytest.mark.asyncio
+async def test_curate_round_prunes_citations_and_sweeps_blocked_items():
+    """整理轮末尾的两件事：引用明细到期裁剪 + 全部来源被拉黑的存量归档。"""
+    await _fresh()
+    async with get_sessionmaker()() as session:
+        ids = await repo.upsert_intel_items(session, [{
+            "instId": INST, "tier": "ultra", "category": "market", "headline": "脏源独家",
+            "summary": "s", "stance": "neutral", "impact": "medium", "confidence": 0.5,
+            "eventTs": NOW - 3600, "capturedTs": NOW - 3600, "expiresTs": NOW + 86400,
+            "status": "active", "origin": "agent", "dedupKey": "dirty",
+            "sources": [{"url": "https://bad.example/x", "domain": "bad.example",
+                         "publishedTs": 0}], "domainCount": 1}])
+        await repo.set_intel_feedback(session, key="bad.example", action="block", inst_id=INST)
+        await repo.append_intel_citations(session, [{
+            "itemId": ids[0], "instId": INST, "runId": 1, "roundNo": 1,
+            "citedTs": NOW - 400 * 86400, "refToken": "I01", "role": "hold"}])
+
+    outcome = await service.run_curate_round(_deps(provider=None, llm=None), INST)
+
+    assert outcome.actions.get("blocked_sweep") == 1
+    assert outcome.actions.get("citations_pruned") == 1
+    async with get_sessionmaker()() as session:
+        assert (await repo.get_intel_item(session, ids[0]))["status"] == "archived"
+        rows, _more = await repo.list_intel_citations(session, inst_id=INST, limit=10)
+    assert rows == [], "只删明细"
+    assert (await _items())[0]["citeCount"] == 1, "**不回滚统计列**"

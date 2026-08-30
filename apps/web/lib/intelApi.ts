@@ -5,14 +5,20 @@
 import { ApiRequestError, toApiError } from "./api";
 import { timeoutFor, withTimeout } from "./httpTimeout";
 import type {
+  IntelCitationRow,
+  IntelFeedbackInput,
+  IntelFeedbackRow,
+  IntelImpactReport,
   IntelItem,
   IntelItemInput,
   IntelItemPatch,
   IntelProbeResult,
+  IntelProviderHealth,
   IntelReadResponse,
   IntelRound,
   IntelSettings,
   IntelSettingsPatch,
+  IntelSourceRow,
   IntelTier,
   AiTradeIntelSummary,
 } from "./intelTypes";
@@ -69,7 +75,7 @@ export const intelApi = {
     return request<IntelReadResponse>(`/intel/${enc(instId)}${suffix}`);
   },
   /** 采集 / 整理轮的审计时间线。 */
-  rounds: (instId: string, kind?: "collect" | "curate", limit = 20) =>
+  rounds: (instId: string, kind?: "collect" | "curate" | "verify", limit = 20) =>
     request<{ rounds: IntelRound[] }>(
       `/intel/${enc(instId)}/rounds?limit=${limit}${kind ? `&kind=${kind}` : ""}`,
     ),
@@ -114,6 +120,58 @@ export const intelApi = {
       method: "PUT",
       body: JSON.stringify(patch),
     }),
+  // ---------------- closed-loop（§4.1 #13-#21） ----------------
+  /** 手动触发一轮核查（202 排队即返回）。 */
+  verify: (instId: string) =>
+    request<{ queued: boolean }>(`/intel/${enc(instId)}/verify`, { method: "POST" }),
+  /** 只核查这一条：**显式绕过全部候选过滤**（人类显式指令，不是自动池的一员）。 */
+  verifyItem: (itemId: number) =>
+    request<{ queued: boolean }>(`/intel/items/${itemId}/verify`, { method: "POST" }),
+  /** 黑白名单清单（`instId` 缺省 = 全局 + 每个标的）。 */
+  feedback: (instId?: string) =>
+    request<{ rows: IntelFeedbackRow[] }>(
+      `/intel/feedback${instId ? `?instId=${enc(instId)}` : ""}`,
+    ),
+  /** 记一条来源取舍；`block` 会同事务扫除存量并回执归档条数。 */
+  writeFeedback: (body: IntelFeedbackInput) =>
+    request<{ ok: boolean; archived: number }>("/intel/feedback", {
+      method: "POST",
+      body: JSON.stringify({ scope: "domain", instId: "", ...body }),
+    }),
+  /** 给确认框算受影响条数（**纯读**，绝不写库）。 */
+  previewFeedback: (body: IntelFeedbackInput) =>
+    request<{ affected: number }>("/intel/feedback/preview", {
+      method: "POST",
+      body: JSON.stringify({ scope: "domain", instId: "", ...body }),
+    }),
+  /** 撤销一条来源取舍。**不复活**任何已归档条目。 */
+  clearFeedback: (key: string, instId = "") =>
+    request<void>(
+      `/intel/feedback?scope=domain&key=${enc(key)}&instId=${enc(instId)}`,
+      { method: "DELETE" },
+    ),
+  /** 检索源健康读数（最近 N 轮的成败聚合 + 熔断剩余秒）。 */
+  providerHealth: (limit = 20) =>
+    request<IntelProviderHealth>(`/intel/settings/health?limit=${limit}`),
+  /** 当前库存的域名聚合（信源页签上半）。 */
+  sources: (instId: string) =>
+    request<{ rows: IntelSourceRow[] }>(`/intel/${enc(instId)}/sources`),
+  /** 影响力页签的全部读数。 */
+  impact: (instId: string, limit = 10) =>
+    request<IntelImpactReport>(`/intel/${enc(instId)}/impact?limit=${limit}`),
+  /** 引用明细（游标分页，按 id 降序）。 */
+  citations: (
+    instId: string,
+    params: { itemId?: number; limit?: number; before?: number } = {},
+  ) => {
+    const qs = new URLSearchParams();
+    if (params.itemId) qs.set("itemId", String(params.itemId));
+    qs.set("limit", String(params.limit ?? 50));
+    if (params.before) qs.set("before", String(params.before));
+    return request<{ rows: IntelCitationRow[]; hasMore: boolean }>(
+      `/intel/${enc(instId)}/citations?${qs}`,
+    );
+  },
   /** 测试连接（服务端总耗时硬封顶 12 秒）。 */
   probe: (body: { provider?: string; apiKey?: string } = {}) =>
     request<IntelProbeResult>("/settings/intel/probe", {

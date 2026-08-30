@@ -254,6 +254,87 @@ def test_session_snapshot_declares_the_intel_key():
     assert '"intel": intel_summary_for(self.inst_id)' in source
 
 
+# ---------------- closed-loop：六处薄接线的读点都必须真的存在 ----------------
+def _session_source(name: str) -> str:
+    import inspect
+
+    from app.ai_auto.session import AiTradeSession
+
+    return inspect.getsource(getattr(AiTradeSession, name))
+
+
+def test_session_wires_every_attribution_hook():
+    """轴 B 的六个钩子在 `session` 里**确有调用点**（源码扫描 + 下方行为断言双保险）。
+
+    这是本仓库「写点有、读点无」那类缺陷唯一会判红的地方：`IntelAttribution` 自己全绿，
+    而 `session` 忘了调 `note_open`，症状是 `cite_entry_count` 恒 0 且不报任何错。
+    """
+    dispatch = _session_source("_dispatch")
+    assert "self._intel_cite.note_open(trade, seq=self._position_seq)" in dispatch
+    assert "self._intel_cite.note_close(" in dispatch
+    assert "await self._intel_cite.persist_pending()" in dispatch
+
+    round_src = _session_source("_run_decision_round")
+    assert "self._intel_cite.note_decision(" in round_src
+    # E-4：引用必须取自任何门禁**之前**的那一个决策。
+    assert "stage1_decision" in round_src.split("note_decision(", 1)[1][:200]
+    assert "self._intel_cite.note_executed(" in round_src
+    assert "self._intel_cite.end_round()" in round_src
+
+
+def test_close_hook_runs_after_inject_explain_meta():
+    """E-5 的顺序约束：`exitSource` 与往返结算都在 `_inject_explain_meta` 那一步才写进 meta。"""
+    dispatch = _session_source("_dispatch")
+    assert dispatch.index("self._inject_explain_meta(trade)") < dispatch.index(
+        "self._intel_cite.note_close(")
+
+
+def test_attribution_persist_is_not_awaited_before_the_decision_event():
+    """R-5④：落库排在决策事件推送**之后**——决策卡是用户最在意的那个延迟。"""
+    round_src = _session_source("_run_decision_round")
+    assert round_src.index("await self._emit_decision(") < round_src.index(
+        "await self._intel_cite.persist_pending()")
+
+
+def test_ai_stats_merges_intel_at_the_call_site():
+    """P2-9：合并落在**调用点** `_build_run_metrics`，`_compute_ai_stats` 一字不动。"""
+    import inspect
+
+    from app.ai_auto import session as session_mod
+
+    assert 'metrics["aiStats"]["intel"] = self._intel_cite.stats()' in _session_source(
+        "_build_run_metrics")
+    assert "intel" not in inspect.getsource(session_mod._compute_ai_stats)
+
+
+def test_scheduler_runs_verify_before_curate():
+    """§3.3.6：核查轮排在整理轮**之前**——整理轮的升降级复核要读 verdict。"""
+    import inspect
+
+    tick = inspect.getsource(intel_scheduler._tick)
+    assert "runtime.run_verify(inst_id)" in tick
+    assert tick.index("run_verify(inst_id)") < tick.index("run_curate(inst_id)")
+    assert "service.verify_due(" in tick
+
+
+def test_shutdown_steps_are_unchanged_by_the_closed_loop():
+    """评审 P2-12：本轮**不新增任何关停步骤**——尚未落盘的引用行按 `dropped` 计并放弃。"""
+    from app.main import _shutdown_steps
+
+    names = [name for name, _ in _shutdown_steps()]
+    assert names.count("ai_trade_intel") == 1
+    assert names.index("ai_trade_intel") == 6, "第 7 步的位置被本文件冻结"
+
+
+def test_intel_package_exports_the_new_surface():
+    """包导出面是本包对外的全部契约（漏导出的症状是运行期 AttributeError 被裸 except 吞掉）。"""
+    from app.ai_auto import intel as intel_pkg
+
+    for name in ("IntelAttribution", "run_verify_round", "resolve_citations",
+                 "classify_outcome"):
+        assert name in intel_pkg.__all__ and hasattr(intel_pkg, name), name
+
+
 def _async_return(value):
     async def _inner(*args, **kwargs):
         return value
@@ -263,3 +344,111 @@ def _async_return(value):
 
 async def _forever(_runtime):
     await asyncio.sleep(3600)
+
+
+def test_no_degrade_code_originates_from_intel_layer():
+    """C-6 / 承诺二：轴 A/B/C/D 的任何异常路径都**不产出**新的 `TradeDecision` 降级码。
+
+    情报是加法流水线：它的任何失败都必须收敛成「情报段少几条」「统计列没更新」「verdict 停留在
+    unresolved」，而不是收敛成一笔没做成或做错方向的真实交易。这条用例的判据是**源码扫描**——
+    它要挡的正是「下一次有人在归因层里顺手 `return _hold(...)`」这种改动。
+    """
+    import inspect
+
+    from app.ai_auto.decider import AiTradeDecider
+    from app.ai_auto.intel import attribution as attr_mod
+    from app.ai_auto.intel import citation as citation_mod
+    from app.ai_auto.intel import verify as verify_mod
+
+    for module in (citation_mod, attr_mod, verify_mod):
+        source = inspect.getsource(module)
+        # 判据落在**可执行的引用**上而不是散落的文字：这三个模块既不 import 决策器，也不构造
+        # 或改写 `TradeDecision`，更不会走 `_hold(...)` 那条降级出口。
+        assert "from ..decider" not in source, f"{module.__name__} import 了决策器"
+        assert "TradeDecision(" not in source, f"{module.__name__} 构造了决策对象"
+        assert "_hold(" not in source, f"{module.__name__} 产出了一个降级"
+
+    resolver = inspect.getsource(AiTradeDecider._resolve_intel_refs)
+    assert "return ()" in resolver, "总闸关 / 类型错一律回空元组"
+    assert "_hold(" not in resolver, \
+        "解析器**绝不降级**：一个写错的编号是排版问题，不是安全问题"
+
+
+def test_intel_refs_never_reach_any_gate():
+    """承诺二的另一半：`intel_refs` 不参与任何仓位 / 风控判定。
+
+    八道确定性门禁与仓位求解全在 `ai_auto/` 的这几个模块里；它们**一个字都不该提到**这个字段。
+    """
+    import inspect
+
+    from app.ai_auto import gate_veto, hold_horizon, signals, sizing
+
+    for module in (signals, sizing, gate_veto, hold_horizon):
+        assert "intel_refs" not in inspect.getsource(module), \
+            f"{module.__name__} 读了 intel_refs ⇒ 归因变成了门禁"
+
+
+@pytest.mark.asyncio
+async def test_verify_client_assembly_failure_falls_back_instead_of_killing_the_group():
+    """核查轮的第二个 client 造不出来 ⇒ `verify_llm=None` 回落，而不是整组情报层不装配。
+
+    §十一 对 `ai_trade_intel_verify_max_tokens` 的定稿写着「装配失败 ⇒ 回落 `deps.llm`，
+    **不报错**」。核查是加法，采集是本体：为了一个更大的输出预算把整个情报层拖下水，正好把
+    这条特性的成本收益反过来。回落之后 `_run_verify_agent` 的 `deps.verify_llm or deps.llm`
+    照常拿到采集轮那一个 client（该分支另有用例）。
+    """
+    from dataclasses import dataclass
+
+    from app.db.session import init_db
+
+    @dataclass
+    class _Cfg:
+        max_tokens: int = 2048
+        thinking_budget_tokens: int = 0
+
+    settings = Settings(ai_trade_intel_enabled=True,
+                        ai_trade_intel_search_provider="tavily",
+                        ai_trade_intel_search_api_key="k",
+                        ai_trade_intel_verify_max_tokens=8192)
+
+    def make_client(cfg):
+        # 只有核查轮那一个预算会炸——采集轮那一个必须照常造出来。
+        if int(getattr(cfg, "max_tokens", 0)) == 8192:
+            raise RuntimeError("verify client boom")
+        return SimpleNamespace(provider="anthropic")
+
+    await init_db()
+    runtime = await intel_runtime.build_group_runtime(
+        group_id="g-verify-fallback", members=[INST], settings=settings,
+        sessionmaker=get_sessionmaker, provider_cfg=_Cfg(), make_client=make_client)
+
+    assert runtime.enabled, "核查预算装配失败绝不允许把整组情报层降成一个壳"
+    assert runtime.deps.verify_llm is None
+    assert runtime.deps.llm is not None
+
+
+def test_every_intel_setting_is_registered_in_env_example():
+    """`.env.example` 与 `Settings` 的 `ai_trade_intel_*` 家族**双向逐键对齐**。
+
+    本仓库为这件事栽过两次，而两次的症状都一样：**漏登记是静默的**。prod 的 PyInstaller 后端
+    不读 `.env`、只读进程 env，而桌面壳按 `AI_TRADE_` 前缀从 `agent.env` 透传 —— 一个没写进
+    `.env.example` 的旋钮，用户在打包形态下**没有任何途径**知道它存在，更不会去调它；反过来，
+    一个写在 `.env.example` 却已被删掉的键，是一句会被照抄进真实配置的废话。
+    `.env.example` 此前**没有任何扫描用例**（那正是它两次漏登记的原因），本用例把这个家族补上。
+
+    判红之后的唯一正确动作是**把缺的那一行补进 `.env.example`**（或删掉多余的那一行），
+    不是放宽这里的正则。
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[3]
+    cfg = (root / "services" / "quant" / "app" / "config.py").read_text(encoding="utf-8")
+    env = (root / ".env.example").read_text(encoding="utf-8")
+
+    fields = {name.upper() for name in
+              re.findall(r"^    (ai_trade_intel_[a-z0-9_]+)\s*:", cfg, re.M)}
+    declared = set(re.findall(r"^(AI_TRADE_INTEL_[A-Z0-9_]+)=", env, re.M))
+    assert fields, "正则没匹配到任何字段 ⇒ 本用例已经失效，先修它"
+    assert fields - declared == set(), f"这些设置没写进 .env.example：{sorted(fields - declared)}"
+    assert declared - fields == set(), f".env.example 里有已不存在的键：{sorted(declared - fields)}"

@@ -925,10 +925,75 @@ class AiIntelItem(Base):
     last_curated_ts: Mapped[int] = mapped_column(Integer, default=0)
     curation_note: Mapped[str] = mapped_column(String(200), default="")
     created_ts: Mapped[int] = mapped_column(Integer, default=0)
+    # ---- ai-trade-intel-closed-loop §5.2：引用战绩六列 + 判定四列（**必须 ALTER 补列**）----
+    # 这十列是 52f466e 之后追加的，而 ``create_all`` **不会**给既有表补列——补列走
+    # ``db/session.py`` 的第五个 patcher ``_ensure_ai_intel_columns``（G-10）。
+    #
+    # ⚠️ 它们**绝不允许**出现在 ``ai_intel_repositories._item_values`` 里（评审 P1-6）：
+    # ``upsert_intel_items`` 的冲突分支用 ``_item_values`` 的键集减 ``_PRESERVED_ON_CONFLICT``
+    # 求 ``update_cols``，统计列一旦进去，同一条情报被再次报道时全部引用战绩会被**清零**且不报错。
+    cite_count: Mapped[int] = mapped_column(Integer, default=0)          # 被引用总次数（含 hold 轮）
+    cite_entry_count: Mapped[int] = mapped_column(Integer, default=0)    # 作为入场依据被引用的次数
+    settled_count: Mapped[int] = mapped_column(Integer, default=0)       # 已结算且非 void 的引用数
+    win_count: Mapped[int] = mapped_column(Integer, default=0)
+    net_pnl_usd: Mapped[float] = mapped_column(Float, default=0.0)       # 已结算净额累加（可负）
+    last_cited_ts: Mapped[int] = mapped_column(Integer, default=0)
+    # ''|confirmed|refuted|unresolved。``refuted`` ⇒ **立即停止注入**（§3.3.4 首击）。
+    verdict: Mapped[str] = mapped_column(String(12), default="")
+    verdict_ts: Mapped[int] = mapped_column(Integer, default=0)
+    verdict_note: Mapped[str] = mapped_column(String(200), default="")   # 模型给的一句话理由
+    verify_count: Mapped[int] = mapped_column(Integer, default=0)        # 已核查次数（两击制的判据）
+
+
+class AiIntelCitation(Base):
+    """交易 Agent 对一条情报的一次引用，及其（可能的）往返结算结果（closed-loop §5.1）。
+
+    append-only + 一次结算 UPDATE。
+
+    为什么是新表而不是往 ``ai_intel_items`` 里塞 JSON：引用是**事件流**（一条情报会被引用几十次），
+    条目是**状态**。把事件流塞进状态行的 JSON 列，会让每一次引用都变成一次「读-改-写」，而情报轮
+    与决策轮跑在不同的 DB 会话里 —— 读改写会丢更新，且丢更新不会报错。
+
+    ``create_all`` 会建这张缺失的表 ⇒ **零迁移**（补列的是那两张既有表）。
+    """
+
+    __tablename__ = "ai_intel_citations"
+    __table_args__ = (
+        Index("ix_ai_intel_cite_item", "item_id", "id"),
+        Index("ix_ai_intel_cite_scope", "inst_id", "cited_ts"),
+        Index("ix_ai_intel_cite_epoch", "run_id", "position_seq"),
+        Index("ix_ai_intel_cite_claim", "run_id", "cl_ord_id"),   # P0-1 的跨轮认领
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    item_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    inst_id: Mapped[str] = mapped_column(String(32), index=True, default="")
+    # **Integer 不是 String**（评审 P2-1）：``AiTradeSession.run_id`` 是 ``int``。
+    run_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    round_no: Mapped[int] = mapped_column(Integer, default=0)
+    cited_ts: Mapped[int] = mapped_column(Integer, default=0)          # 墙钟秒 UTC
+    ref_token: Mapped[str] = mapped_column(String(4), default="")      # "I01"
+    # P0-1：限价开仓单会 resting 若干轮，成交由盯市 tick 上另一条 ``_dispatch`` 发出。下单那一刻
+    # 冻结委托号，成交时按它认领 —— 逐行镜像 ``AttributionLedger.claim_estimate/_take_estimate``。
+    # 市价单恒为空串，走「回退本轮待写行」那条路。
+    cl_ord_id: Mapped[str] = mapped_column(String(64), default="")
+    role: Mapped[str] = mapped_column(String(8), default="hold")       # entry|exit|hold
+    proposed_action: Mapped[str] = mapped_column(String(16), default="")  # 模型真实意愿（门禁前）
+    final_action: Mapped[str] = mapped_column(String(16), default="")     # 八道门禁之后
+    traded: Mapped[bool] = mapped_column(Boolean, default=False)
+    position_seq: Mapped[int] = mapped_column(Integer, default=0)      # 0 = 未绑定持仓周期
+    settled: Mapped[bool] = mapped_column(Boolean, default=False)
+    settled_ts: Mapped[int] = mapped_column(Integer, default=0)
+    # **可空**：``None`` = 结算不可得 ⇒ outcome="void"。绝不用 0.0 冒充「没结算」（§3.2.2）。
+    net_pnl_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    hold_s: Mapped[int] = mapped_column(Integer, default=0)
+    exit_source: Mapped[str] = mapped_column(String(24), default="")
+    outcome: Mapped[str] = mapped_column(String(8), default="")        # win|loss|flat|void
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class AiIntelRound(Base):
-    """一次采集 / 整理轮的审计存根（ai-trade-market-intel §3.7.1）。append-only。
+    """一次采集 / 整理 / 核查轮的审计存根（market-intel §3.7.1 + closed-loop §3.6）。append-only。
 
     ``status`` 只有三个取值：未到期时**不写 round 行**（§3.3.1 步骤 1），故 ``skipped`` 会是死值。
     """
@@ -938,7 +1003,8 @@ class AiIntelRound(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     inst_id: Mapped[str] = mapped_column(String(32), index=True, default="")
-    kind: Mapped[str] = mapped_column(String(8), default="collect")     # collect|curate
+    # collect|curate|verify（closed-loop 评审 P2-6；``String(8)`` 容得下 "verify"，无须改类型）
+    kind: Mapped[str] = mapped_column(String(8), default="collect")
     group_id: Mapped[str] = mapped_column(String(48), default="")
     started_ts: Mapped[int] = mapped_column(Integer, default=0)
     finished_ts: Mapped[int] = mapped_column(Integer, default=0)
@@ -978,6 +1044,11 @@ class AiIntelWatch(Base):
     day_key: Mapped[str] = mapped_column(String(10), default="")        # "YYYY-MM-DD"（UTC）
     day_rounds: Mapped[int] = mapped_column(Integer, default=0)
     updated_ts: Mapped[int] = mapped_column(Integer, default=0)
+    # ---- closed-loop §5.3（**必须 ALTER 补列**）----
+    last_verify_ts: Mapped[int] = mapped_column(Integer, default=0)
+    # 距上次核查已跑过几次整理（``_verify_due`` 的判据）。**唯一自增点**在 ``bump_intel_watch``
+    # 的 ``curate`` 分支（评审 P0-3：没有自增点时它恒 0，核查轮在非默认配置下一次都不会跑）。
+    curates_since_verify: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class AiIntelFeedback(Base):

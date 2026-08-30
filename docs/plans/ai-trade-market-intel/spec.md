@@ -1756,3 +1756,8 @@ v1 把三个问题留给评审拍板。三条裁决如下，正文已按裁决�
 但 §4.1 的 12 个端点里没有任何一个能写 `set_intel_feedback`，前端也没有「不再采纳此源」入口。
 故该表在 v1 恒为空、那道过滤器恒为空转。**不在终审节点自行扩展 API 面**（那是一次未经评审的接口
 新增），也不删表（§五 明写四张表、且零迁移成本）；在此登记，使它不是一处**静默**的空转。
+
+> **已由 `docs/plans/ai-trade-intel-closed-loop/spec.md`（轴 D）兑现**：`POST/DELETE /intel/feedback`
+> 与 `POST /intel/feedback/preview` 补上了写点与预览，前端在来源 chip 上给了「不再采纳此源」入口，
+> `trust` 也一并补了读点（`list_intel_trusted_domains` → 置信度先验 + `corpus.build` 的排序并列打破）。
+> 同一轮还兑现了本文档另一条待办：`brave` / `serper` 两个检索适配器。

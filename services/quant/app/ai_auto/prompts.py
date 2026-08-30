@@ -323,7 +323,9 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
                                allow_hold_exit: bool = False,
                                allow_exit_priority: bool = False,
                                allow_reasoning_digest: bool = False,
-                               contrarian: ContrarianSchemaOptions | None = None) -> dict:
+                               contrarian: ContrarianSchemaOptions | None = None,
+                               allow_intel_refs: bool = False,
+                               intel_max_refs: int = 8) -> dict:
     """按档位步长 + 限价总闸 + 承诺退出线总闸构造决策工具 `input_schema`（[R-5] `enum` 取真源）。
 
     `step<=0` **且** `allow_limit=False` **且** `allow_hold_exit=False`（含全部默认调用）原样返回模块
@@ -342,6 +344,10 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
             `holdExitPx` 字段（`required` 不变，承诺退出线永远可选）。
         contrarian: 逆势通路的 schema 选项（directional-symmetry A-3，keyword-only）。
             `None`（默认）⇒ 不露出 `contrarianEvidence` ⇒ schema 逐字节回退。
+        allow_intel_refs: 情报引用总闸（intel-closed-loop 轴 A，keyword-only，默认 False）。
+            `True` 时露出可选 `intelRefs`（`required` 不变）。**默认 False 是硬约束**：它让
+            `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA` 恒等断言原样通过（G-1）。
+        intel_max_refs: `intelRefs` 的 `maxItems`（仅 `allow_intel_refs=True` 分支消费）。
 
     Returns:
         决策工具的 `input_schema`（JSON Schema）。硬保证仍在服务端（`quantize_size_fraction` 与
@@ -352,7 +358,7 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
     # 新字段永远露不出来，而**不报任何错**（G-2 的直接依赖）。`allow_reasoning_digest`
     # （deep-reasoning-chain §3.1.7）同理。
     if (step <= 0 and not allow_limit and not allow_hold_exit and not allow_exit_priority
-            and not allow_reasoning_digest and contrarian is None):
+            and not allow_reasoning_digest and contrarian is None and not allow_intel_refs):
         return DECISION_TOOL_SCHEMA
     schema = dict(DECISION_TOOL_SCHEMA)
     props = dict(DECISION_TOOL_SCHEMA["properties"])   # 独立浅拷贝，杜绝改动泄漏回模块常量
@@ -392,6 +398,18 @@ def build_decision_tool_schema(position_step_pct: float, *, allow_limit: bool = 
                 "写满并把 confidence 提到 "
                 f"{contrarian.min_confidence:g} 以上，系统会放行这笔逆势开仓，但仓位强制乘以 "
                 f"{contrarian.size_mult:g}。顺势开仓不需要填。")}
+    if allow_intel_refs:
+        # intel-closed-loop §3.1.2：可选的情报引用编号（`required` 不变，永远可选）。
+        # ⚠️ 它**绝不**参与任何交易语义：写不存在的编号只会被服务端丢弃并计一次 `fabricated_ref`，
+        # 不产生任何 degrade、不改写 `TradeDecision` 的任何其它字段（G-3 / 承诺二）。
+        props["intelRefs"] = {
+            "type": "array",
+            "items": {"type": "string", "pattern": "^I[0-9]{2}$"},
+            "maxItems": max(1, int(intel_max_refs)),
+            "description": ("（可选）你在本轮研判中实际采信的外部情报编号，如 [\"I01\",\"I03\"]。"
+                            "只能写情报段里出现过的编号；写不存在的编号会被系统丢弃。"
+                            "它只用于事后复盘归因，不参与任何风控或仓位判定。"),
+        }
     schema["properties"] = props
     return schema
 

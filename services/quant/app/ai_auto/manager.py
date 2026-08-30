@@ -757,7 +757,13 @@ class AiTradeManager:
             # `min_consensus<=0`（共识门禁本就不触发）⇒ `None` ⇒ 工具 schema 逐字节回退。
             # `req.settings` 是 `_resolve_discipline` 之后的派生副本，与 executor 那一份同源。
             contrarian_schema=contrarian_schema(
-                consensus_rule_from_settings(req.settings)))
+                consensus_rule_from_settings(req.settings)),
+            # intel-closed-loop 轴 A：`intelRefs` 随情报总闸与 cite 单键露出。任一关 ⇒ 工具
+            # schema **对象恒等**回退到 `DECISION_TOOL_SCHEMA`（G-1）。回测车道恒不装配（R-12
+            # 红线：历史 point-in-time 语料取不回来，接入必然前视偏差）。
+            allow_intel_refs=bool(req.settings.ai_trade_intel_enabled
+                                  and req.settings.ai_trade_intel_cite_enabled),
+            intel_max_refs=int(req.settings.ai_trade_intel_cite_max_refs))
         # 不变式 I-3（续跑不新建 run）：冷续跑逐成员**复用同一 `run_id`**，成交 / 指标 / 历史聚合
         # 天然连续，一次交易在历史列表里永远只有一条。这是本方法与 `start` 路径的**唯一**差异。
         run_id = ((ctx.req.resume_of or {}).get("runIds") or {}).get(plan.inst_id)

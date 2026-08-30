@@ -42,8 +42,14 @@ def test_resolve_returns_none_for_unconfigured_source():
     """未配置 ⇒ `None` ⇒ 全链路诚实降级；**绝不**悄悄回落到「让模型自己写一条」。"""
     assert resolve_search_provider(slug="none", api_key=KEY) is None
     assert resolve_search_provider(slug="tavily", api_key="") is None
-    assert resolve_search_provider(slug="brave", api_key=KEY) is None, "v1 未实现 ⇒ 按未配置处理"
+    # `brave` / `serper` 自 ai-trade-intel-closed-loop 轴 D 起**已实现**（本文件原先断言它们
+    # 「按未配置处理」，那是 v1 的事实）。仍然按未配置处理的只剩下**拼错的 slug**——这条路
+    # 必须留着：删掉它，一个手写错的 provider 名会变成一次静默的「未配置」。
+    assert resolve_search_provider(slug="typo-search", api_key=KEY) is None
     assert isinstance(resolve_search_provider(slug="tavily", api_key=KEY), TavilyProvider)
+    assert resolve_search_provider(slug="brave", api_key=KEY) is not None
+    assert resolve_search_provider(slug="serper", api_key=KEY) is not None
+    assert resolve_search_provider(slug="brave", api_key="") is None
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import random
+import re
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -88,6 +89,10 @@ _EVIDENCE_DIGEST_MAX_CHARS = 400
 _CONTRARIAN_EVIDENCE_MAX_CHARS = 600
 # 离场证据的落痕上限（与工具 schema 的 `maxLength: 300` 同数；schema 是软引导、本常量是硬约束）。
 _EXIT_EVIDENCE_MAX_CHARS = 300
+# 情报引用编号的形态（intel-closed-loop 轴 A）。**两位定长**，与语料的 `D[0-9]{1,2}` 和核查候选的
+# `C[0-9]{1,2}` 互斥；判据的唯一真源在 `intel/citation.REF_RE`，此处只是同一条正则的解析侧复刻
+# （`decider` 不 import `intel` 包：那会把一个可选特性变成决策器的模块级依赖）。
+_INTEL_REF_RE = re.compile(r"^I[0-9]{2}$")
 
 # 「可重试」degrade 原因白名单（瞬时 LLM 失败 / 未产出有效决策）；其余（low_confidence 等）为终态决策，
 # 绝不重试（ai-trade-decision-llm-retry §4.1）。
@@ -220,6 +225,10 @@ class TradeDecision:
     # 值域外 / 类型错**一律忽略、绝不据它降级**（沿用 `orderType` 的 F-2 先例）：它的缺席只会
     # 让逆势通路不可用，而那本就是旧行为。
     contrarian_evidence: str | None = None
+    # 本轮实际采信的外部情报编号（intel-closed-loop 轴 A）。同款末位带默认值 ⇒ 既有全部位置构造
+    # 与元组解包零改动。**纯观测量**：它不产生任何 degrade、不改写任何其它字段、不参与任何仓位
+    # 或风控判定（承诺二）。编号是否真实存在由服务端的 `intel/citation.resolve_citations` 裁决。
+    intel_refs: tuple[str, ...] = ()
 
 
 def _add_tokens(prev, current):
@@ -284,7 +293,8 @@ class AiTradeDecider:
                  summary_llm: LLMClient | None = None,
                  allow_reasoning_digest: bool = False,
                  contrarian_schema: ContrarianSchemaOptions | None = None,
-                 depth_profile: DepthProfile | None = None):
+                 depth_profile: DepthProfile | None = None,
+                 allow_intel_refs: bool = False, intel_max_refs: int = 8):
         self._llm = llm
         # 三份预算（deep-reasoning-chain §3.3.1）：默认 `None` ⇒ 三者同为 `llm` ⇒ 现有全部直接
         # 构造（回测早期路径、32 个假客户端单测、`decider.llm` 蒸馏出口）逐字零回归（用例 G-5）。
@@ -317,6 +327,11 @@ class AiTradeDecider:
         # 生产装配点从会话的 `ConsensusRule` 派生（manager / backtest 各自决定）。
         self._contrarian_schema = contrarian_schema
         self.allow_contrarian_evidence = contrarian_schema is not None
+        # 情报引用总闸（默认 **False**，镜像上面五个总闸）：默认 False 是硬约束——它让
+        # `build_decision_tool_schema(0.0) is DECISION_TOOL_SCHEMA` 恒等断言原样通过（G-1）。
+        # 生产装配点从 `settings.ai_trade_intel_cite_enabled` 派生（manager 决定；回测恒关，R-12）。
+        self.allow_intel_refs = bool(allow_intel_refs)
+        self.intel_max_refs = max(1, int(intel_max_refs))
         # 下单前二次反思总闸（默认关；直接构造该决策器的既有测试/回测 → reflect 无副作用直通、逐字零回归。
         # 生产装配 manager/backtest_manager 从 req.settings.ai_trade_reflection_enabled 显式打开，§2.3）。
         self.reflection_enabled = bool(reflection_enabled)
@@ -338,7 +353,9 @@ class AiTradeDecider:
                 allow_hold_exit=self.allow_hold_exit,
                 allow_exit_priority=self.allow_exit_priority,
                 allow_reasoning_digest=self.allow_reasoning_digest,
-                contrarian=self._contrarian_schema))
+                contrarian=self._contrarian_schema,
+                allow_intel_refs=self.allow_intel_refs,
+                intel_max_refs=self.intel_max_refs))
         # 反思唯一放行工具（镜像决策工具的「唯一放行」范式，安全由回落兜底，§2.2）。
         self._reflection_tool = ToolSchema(name=REFLECTION_TOOL_NAME,
                                            description=REFLECTION_TOOL_DESCRIPTION,
@@ -779,7 +796,8 @@ class AiTradeDecider:
             # 改错行的表现是字段恒为 None 且不报任何错。
             return (TradeDecision(action, size, confidence, reason, ord_type, limit_px,
                                   evidence_digest=digest,
-                                  contrarian_evidence=self._resolve_contrarian_evidence(raw)),
+                                  contrarian_evidence=self._resolve_contrarian_evidence(raw),
+                                  intel_refs=self._resolve_intel_refs(raw)),
                     None)
         # exit-priority §6.1【R:P1-9b】：**只改这一条返回**。`open_long`/`open_short` 走的是上面
         # 那条 6 位置参的提前 return（连 hold_exit_px 都不带），按 X-1b 反手一律不进本层（先降级
@@ -787,9 +805,12 @@ class AiTradeDecider:
         # 显式以 `action == "close"` 为条件解析（与 C1 给 holdExitPx 立的 [P2-3] 纪律逐字同构：
         # 本函数没有字面 `action == "close"` 分支，不显式判条件残留值会泄漏到 hold/cancel_order）。
         conviction, evidence = self._resolve_exit_intent(raw, action)
+        # intel-closed-loop 轴 A：**两条返回路径都要带上它**——`contrarian_evidence` 的注释已经
+        # 把「改错行的表现是字段恒为 None 且不报任何错」写死在上面那条提前 return 旁边。
         return (TradeDecision(action, None, confidence, reason, ord_type, limit_px,
                               hold_exit_px, conviction, evidence,
-                              evidence_digest=digest), None)
+                              evidence_digest=digest,
+                              intel_refs=self._resolve_intel_refs(raw)), None)
 
     def _resolve_evidence_digest(self, raw: dict) -> str | None:
         """解析可选的中文证据摘要（总闸关 / 缺席 / 非字符串 ⇒ `None`；超长按 400 截断）。
@@ -815,6 +836,31 @@ class AiTradeDecider:
             return None
         text = str(raw.get("contrarianEvidence") or "").strip()[:_CONTRARIAN_EVIDENCE_MAX_CHARS]
         return text or None
+
+    def _resolve_intel_refs(self, raw: dict) -> tuple[str, ...]:
+        """解析可选的情报引用编号（总闸关 / 缺席 / 类型错 ⇒ 空元组）。**绝不降级**。
+
+        **刻意不限定 action 作用域**（与 `holdExitPx` / `exitConviction` / `contrarianEvidence`
+        三个先例不同，理由写在这里而不是留给读者猜）：hold 轮的引用同样要记，那正是归因层区分
+        `entry` / `hold` 的前提；而「残留值泄漏到别的 action 上」在这里不成立——它是一个纯观测
+        字段，泄漏只会让统计多一条 `role="hold"` 的行，不会改变任何交易语义。
+
+        编号是否**真实存在**不在这里判：编号表在 session 侧（随注入快照一起来），服务端裁决在
+        纯核心 `intel/citation.resolve_citations`。本方法只做正则、去重与截断。
+        """
+        if not self.allow_intel_refs:
+            return ()
+        items = raw.get("intelRefs")
+        if not isinstance(items, list):
+            return ()
+        seen: list[str] = []
+        for entry in items:
+            token = str(entry or "").strip().upper()
+            if _INTEL_REF_RE.match(token) and token not in seen:
+                seen.append(token)
+            if len(seen) >= self.intel_max_refs:
+                break
+        return tuple(seen)
 
     def _resolve_exit_intent(self, raw: dict,
                              action: str) -> tuple[str | None, str | None]:

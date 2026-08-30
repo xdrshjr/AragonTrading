@@ -42,6 +42,12 @@ def _static_summary(inst_id: str, *, code: str) -> dict:
         "nextDueTs": None, "inFlight": False,
         "degrade": service.degrade_wire(code),
         "providerConfigured": False, "dailyUsed": 0, "dailyCap": 0,
+        # closed-loop §3.6：两块新读数在**静态 summary 上也必须在位**（形状一致），否则未装配的
+        # 分组会让前端读到 `undefined` 并把「情报层没装上」画成「引用了 0 次」。
+        "citations": {"cited": 0, "entryCited": 0, "settledTrips": 0, "winCount": 0,
+                      "netPnlUsd": 0.0, "neverCited": 0},
+        "verify": {"confirmed": 0, "refuted": 0, "unresolved": 0, "pending": 0,
+                   "lastVerifyTs": None},
     }
 
 
@@ -133,6 +139,24 @@ class IntelRuntime:
         """跑一轮整理并刷新快照（分组内串行）。"""
         return await self._run(inst_id, "curate",
                                service.run_curate_round(self.deps, inst_id))
+
+    async def run_verify(self, inst_id: str, *,
+                         only_item_id: int | None = None) -> RoundOutcome | None:
+        """跑一轮核查并刷新快照（closed-loop 轴 C）。
+
+        **逐行镜像 `run_curate`**：同一把 `_lock`、同一个 `_in_flight`、同一个 `_run` 护栏、同一个
+        `_after_round`——**不新建任何任务集、不新建任何循环**（E-13）。快照刷新由 `_after_round`
+        承担，编排里不得再刷一次（评审 P2-7）。
+
+        Args:
+            inst_id: 目标标的。
+            only_item_id: 只核查这一条（`POST /intel/items/{itemId}/verify`，绕过候选过滤）。
+        """
+        from .service_verify import run_verify_round   # 延迟导入：它反向依赖 service 的公开面
+
+        return await self._run(inst_id, "verify",
+                               run_verify_round(self.deps, inst_id,
+                                                only_item_id=only_item_id))
 
     async def _run(self, inst_id: str, kind: str, coro) -> RoundOutcome | None:
         """两个轮入口共用的护栏：串行锁 + 在飞标记 + **绝不抛**。
@@ -279,8 +303,21 @@ async def build_group_runtime(*, group_id: str, members: Iterable[str], settings
                             notify=notify, enabled=False)
     runner = search_mod.SearchRunner(
         provider, timeout_s=float(derived.ai_trade_intel_search_timeout_s))
+    # closed-loop 评审 P1-3：核查轮的**第二个** client（`verify_max_tokens` 只能走构造参）。
+    # 装配失败 ⇒ `verify_llm=None` ⇒ 编排层回落 `deps.llm`，**不报错**（§十一 该行的定稿）。
+    # 这个 try 不是防御性噪音：它守的是「核查轮的预算装配」这一件**加法**的事，而它下面那次
+    # `build_intel_llm_client` 守的是采集轮——采集轮造不出 client 就该照旧向上抛，两者不同命。
+    try:
+        verify_llm = build_intel_llm_client(
+            provider_cfg, derived, make_client=make_client,
+            max_tokens_override=int(getattr(derived, "ai_trade_intel_verify_max_tokens", 2048)))
+    except Exception as exc:  # noqa: BLE001 —— 见上：回落比整组不装配好
+        logger.warning("ai-trade intel: 核查轮 client 装配失败，回落采集轮预算（%s）: %s",
+                       group_id, exc)
+        verify_llm = None
     deps = IntelDeps(settings=derived, sessionmaker=sessionmaker, search=runner,
                      llm=build_intel_llm_client(provider_cfg, derived,
                                                 make_client=make_client),
+                     verify_llm=verify_llm,
                      group_id=group_id, bar=bar, change_24h_pct=change_24h_pct)
     return IntelRuntime(group_id, members, deps, notify=notify, enabled=True)

@@ -13,8 +13,11 @@ import {
   relativeTime,
   stanceColor,
 } from "@/lib/intel";
+import { REFUTED_WARNING } from "@/lib/intelClosedLoop";
 import type { AiTradeIntelSummary, IntelItem, IntelTier } from "@/lib/intelTypes";
+import IntelAttributionRail from "./IntelAttributionRail";
 import IntelSourceChips from "./IntelSourceChips";
+import IntelVerdictBadge from "./IntelVerdictBadge";
 
 export interface IntelCardActions {
   onTogglePin: (item: IntelItem) => void;
@@ -24,6 +27,12 @@ export interface IntelCardActions {
   onDelete: (item: IntelItem) => void;
   /** 把已归档 / 已静音的条目放回在库（`PATCH {status:"active"}`）。 */
   onRestore: (item: IntelItem) => void;
+  /** 「我不同意」：清判定、恢复注入，并**永久**把它移出自动候选池（closed-loop P0-4）。 */
+  onClearVerdict: (item: IntelItem) => void;
+  /** 只核查这一条（绕过全部候选过滤，是一条人类显式指令）。 */
+  onVerifyItem: (item: IntelItem) => void;
+  /** 「不再采纳此源」：由卡片上的来源 chip 发起，走确认框。 */
+  onBlockSource: (domain: string) => void;
 }
 
 const MOVE_TARGETS: IntelTier[] = ["ultra", "mid", "long"];
@@ -53,6 +62,7 @@ export default function IntelCard({
   nowMs: number;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const refuted = item.verdict === "refuted";
   const [moveOpen, setMoveOpen] = useState(false);
   const unread = isUnread(item, summary);
   const shortTitle = item.headline.slice(0, 12);
@@ -66,8 +76,18 @@ export default function IntelCard({
         unread
           ? "border-[var(--accent)] bg-[var(--accent-soft)]/30"
           : "border-[var(--border)] bg-[var(--bg)]",
+        // 被证伪 ⇒ 整卡降透明度：它已经不再进决策 prompt，视觉上必须与在用的那些区分开。
+        refuted && "opacity-60",
       )}
     >
+      {refuted && (
+        <span
+          data-testid="intel-refuted-warning"
+          className="text-[10px] leading-relaxed text-[var(--danger)]"
+        >
+          {REFUTED_WARNING}
+        </span>
+      )}
       <div className="flex items-center justify-between gap-2">
         <span className="flex min-w-0 items-center gap-1.5">
           <span
@@ -178,7 +198,18 @@ export default function IntelCard({
         </span>
       </div>
 
-      <IntelSourceChips sources={item.sources} />
+      {/* 归因轨与判定徽章插在来源 chips **之上**：它们回答的是「这条到底有没有用 / 还真不真」，
+          比「谁说的」更靠近用户在这一步的判断。零引用 / 无判定时两者各自整块不渲染。 */}
+      <div className="flex items-center justify-between gap-2">
+        <IntelAttributionRail item={item} />
+        <IntelVerdictBadge
+          item={item}
+          onClearVerdict={actions.onClearVerdict}
+          onVerifyNow={actions.onVerifyItem}
+        />
+      </div>
+
+      <IntelSourceChips sources={item.sources} onBlock={actions.onBlockSource} />
       {item.curationNote && (
         <span className="truncate text-[10px] text-[var(--muted)]" title={item.curationNote}>
           整理记录：{item.curationNote}

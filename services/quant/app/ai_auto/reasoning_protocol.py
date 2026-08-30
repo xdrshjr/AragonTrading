@@ -227,7 +227,13 @@ console. Write these in Simplified Chinese, and only these:
   - `reason`          - the operator-facing justification of the decision.
   - `evidenceDigest`  - the operator-facing digest of what you adopted and what you overturned.
   - `exitEvidence`    - the named new evidence for a high-conviction exit.
-Everything else you write is English."""
+Everything else you write is English.
+
+One further optional field is language-neutral and may be written whenever the intel section
+carries `[Ixx]` markers:
+  - `intelRefs`       - the ids of the external-intel lines you actually relied on. It is a
+                        post-hoc attribution record only; it changes no risk or sizing decision,
+                        so leaving it empty when you relied on none costs you nothing."""
 
 # —— 方向对称化的三处 mandate 追加（ai-trade-directional-symmetry 轴 C · C-1）——
 # **只追加、不改写**既有正文：S7 / S10 / S11 的原句一个字节都不动，故总闸关时

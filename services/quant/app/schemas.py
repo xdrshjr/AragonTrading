@@ -2756,7 +2756,7 @@ class IntelItemIn(BaseModel):
 
 
 class IntelItemPatchIn(BaseModel):
-    """编辑 / 移层 / 置顶 / 静音（全部可选；一个非 None 都没有 ⇒ 422）。"""
+    """编辑 / 移层 / 置顶 / 静音 / 清判定（全部可选；一个非 None 都没有 ⇒ 422）。"""
 
     tier: Literal["ultra", "mid", "long"] | None = None
     category: Literal["market", "sentiment", "macro", "onchain", "project", "risk"] | None = None
@@ -2766,6 +2766,10 @@ class IntelItemPatchIn(BaseModel):
     impact: Literal["low", "medium", "high"] | None = None
     pinned: bool | None = None
     status: Literal["active", "archived", "muted"] | None = None
+    # 「我不同意」（closed-loop §4.1 #22）：清 `verdict` / `verdictTs` / `verdictNote`、置
+    # `userEdited`，**`verifyCount` 保持不变**。清了它这条目下一轮就会被自动重判回去，撤销出口
+    # 会变成一扇旋转门（评审 P0-4）。
+    clearVerdict: Literal[True] | None = None
 
     @model_validator(mode="after")
     def _at_least_one(self) -> "IntelItemPatchIn":
@@ -2801,6 +2805,17 @@ class IntelSettingsIn(BaseModel):
     collectIntervalMin: float | None = Field(default=None, ge=5, le=1440)
     curateEveryNCollects: int | None = Field(default=None, ge=1, le=24)
     dailyCap: int | None = Field(default=None, ge=1, le=1000)
+    # ---- ai-trade-intel-closed-loop §4.1 #23：三把安全单键 + 五个核查旋钮 ----
+    # ⚠️ 这 8 个键的**唯一**落点是 `intel/service.py::INTEL_SETTING_BRIDGE`。只在这里声明、
+    # 不扩那张表 ⇒ 请求 200、面板上开关照动、`Settings` 上的值永远不变（评审 P0-5 的假面板）。
+    citeEnabled: bool | None = None
+    attributionEnabled: bool | None = None
+    verifyEnabled: bool | None = None
+    verifyEveryNCurates: int | None = Field(default=None, ge=1, le=12)
+    verifyMaxItems: int | None = Field(default=None, ge=1, le=10)
+    verifyDocsPerItem: int | None = Field(default=None, ge=1, le=12)
+    blockedSweepEnabled: bool | None = None
+    citeMaxRefs: int | None = Field(default=None, ge=1, le=16)
 
 
 class IntelProbeIn(BaseModel):
@@ -2827,6 +2842,16 @@ class IntelSettingsOut(BaseModel):
     curateEveryNCollects: int
     dailyCap: int
     estimate: IntelCostEstimateOut
+    # ---- closed-loop：与 `IntelSettingsIn` 的 8 个新键逐个对称。**回执必须带上它们**——
+    # `response_model` 会静默丢弃未声明的键，症状是「开关点了、回读还是旧值」（v1 终审教训）。
+    citeEnabled: bool
+    attributionEnabled: bool
+    verifyEnabled: bool
+    verifyEveryNCurates: int
+    verifyMaxItems: int
+    verifyDocsPerItem: int
+    blockedSweepEnabled: bool
+    citeMaxRefs: int
 
 
 class ErrorBody(BaseModel):

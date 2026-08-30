@@ -139,6 +139,11 @@ async def _tick(runtime: IntelRuntime) -> None:
             continue
         every = int(runtime.deps.settings.ai_trade_intel_curate_every_n_collects)
         if int(watch.get("collectsSinceCurate") or 0) + 1 >= every:
+            # 核查轮排在整理轮**之前**（closed-loop §3.3.6）：整理轮的升降级复核要读 verdict，
+            # 读旧 verdict 就是「算了却算错了对象」（与 §3.4.4 那句「用动作前的快照算清理计划」
+            # 同形的错）。这是本文件**唯一**一处改动——不新建循环、不新建任务集。
+            if service.verify_due(runtime.deps.settings, watch):
+                await runtime.run_verify(inst_id)
             await runtime.run_curate(inst_id)
         return          # 一个 tick 只推进一个标的：N 个标的排队，绝不并发撞限流
 

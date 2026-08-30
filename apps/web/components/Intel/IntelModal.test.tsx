@@ -23,6 +23,15 @@ const curateMock = vi.fn(async () => ({ queued: true }));
 const seenMock = vi.fn(async () => ({ summary: readResponse.summary }));
 const patchMock = vi.fn(async () => ({ item: readResponse.tiers.ultra.items[0] }));
 const deleteMock = vi.fn(async () => undefined);
+const settingsMock = vi.fn(async () => ({
+  enabled: true, injectEnabled: true, provider: "tavily", hasKey: true, keyPreview: "…abcd",
+  collectIntervalMin: 30, curateEveryNCollects: 4, dailyCap: 96,
+  estimate: { roundsPerDay: 240, inputTokensPerDay: 1_000_000 },
+  citeEnabled: true, attributionEnabled: true, verifyEnabled: true, verifyEveryNCurates: 1,
+  verifyMaxItems: 3, verifyDocsPerItem: 4, blockedSweepEnabled: true, citeMaxRefs: 8,
+}));
+const verifyMock = vi.fn(async () => ({ queued: true }));
+const verifyItemMock = vi.fn(async () => ({ queued: true }));
 
 vi.mock("@/lib/intelApi", () => ({
   intelApi: {
@@ -35,6 +44,24 @@ vi.mock("@/lib/intelApi", () => ({
     moveItem: vi.fn(async () => ({ item: {} })),
     deleteItem: (...a: unknown[]) => deleteMock(...(a as [])),
     createItem: vi.fn(async () => ({ item: {} })),
+    // closed-loop：弹窗新增的六个取数点。**`read` mock 必须按 `status` 分发**（v1 终审的成文
+    // 教训：不分发的 mock 会让用例空跑通过），新加的这些同理——一个返回 `undefined` 的
+    // `settings()` 会让整个弹窗在 effect 里抛，而症状是十几条不相干的用例一起变红。
+    settings: (...a: unknown[]) => settingsMock(...(a as [])),
+    verify: (...a: unknown[]) => verifyMock(...(a as [])),
+    verifyItem: (...a: unknown[]) => verifyItemMock(...(a as [])),
+    impact: async () => ({
+      instId: INST,
+      totals: { citeCount: 0, citeEntryCount: 0, settledCount: 0, winCount: 0, netPnlUsd: 0 },
+      top: [],
+      worst: [],
+      neverCited: 0,
+    }),
+    sources: async () => ({ rows: [] }),
+    feedback: async () => ({ rows: [] }),
+    writeFeedback: async () => ({ ok: true, archived: 0 }),
+    previewFeedback: async () => ({ affected: 0 }),
+    clearFeedback: async () => undefined,
   },
 }));
 
@@ -46,7 +73,9 @@ function item(over: Partial<IntelItem> = {}): IntelItem {
     updatedTs: NOW_S, expiresTs: NOW_S + 86400, status: "active", pinned: false,
     userEdited: false, undated: false, isScheduled: false, origin: "agent", sources: [],
     sourceCount: 0, domainCount: 2, dedupKey: "k", supersedesId: null, promoteCount: 0,
-    demoteCount: 0, lastCuratedTs: 0, curationNote: "", createdTs: NOW_S, ...over,
+    demoteCount: 0, lastCuratedTs: 0, curationNote: "", createdTs: NOW_S,
+    citeCount: 0, citeEntryCount: 0, settledCount: 0, winCount: 0, netPnlUsd: 0,
+    lastCitedTs: 0, verdict: "", verdictTs: 0, verdictNote: "", verifyCount: 0, ...over,
   };
 }
 
@@ -58,6 +87,9 @@ function response(over: Partial<IntelReadResponse> = {}): IntelReadResponse {
       lastSeenTs: NOW_S, lastCollectTs: NOW_S - 600, lastCurateTs: null,
       nextDueTs: NOW_S + 720, inFlight: false, degrade: null, providerConfigured: true,
       dailyUsed: 18, dailyCap: 96,
+      citations: { cited: 0, entryCited: 0, settledTrips: 0, winCount: 0,
+        netPnlUsd: 0, neverCited: 0 },
+      verify: { confirmed: 0, refuted: 0, unresolved: 0, pending: 0, lastVerifyTs: null },
     },
     tiers: {
       ultra: { items: [item(), item({ id: 2, category: "macro", headline: "CPI 数据即将公布" })], total: 2 },
@@ -86,6 +118,9 @@ beforeEach(() => {
   collectMock.mockClear();
   curateMock.mockClear();
   seenMock.mockClear();
+  verifyMock.mockClear();
+  verifyItemMock.mockClear();
+  settingsMock.mockClear();
   useAppStore.setState({ aiTradeIntel: {} });
 });
 afterEach(cleanup);
@@ -97,13 +132,29 @@ async function open(res?: IntelReadResponse) {
 }
 
 describe("IntelModal", () => {
-  it("五个页签带计数（超短 / 中期 / 长期 / 已归档 / 整理记录）", async () => {
+  it("七个页签都可达（超短 / 中期 / 长期 / 影响力 / 信源 / 已归档 / 整理记录）", async () => {
     await open();
     await waitFor(() => expect(screen.getByRole("tab", { name: "超短 2" })).toBeInTheDocument());
     expect(screen.getByRole("tab", { name: "中期 1" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "长期 0" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "影响力" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "信源" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "已归档 3" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "整理记录" })).toBeInTheDocument();
+  });
+
+  it("影响力与信源两个页签各自能被打开（closed-loop §3.7.3）", async () => {
+    await open();
+    fireEvent.click(await screen.findByRole("tab", { name: "影响力" }));
+    expect(await screen.findByTestId("intel-impact-tab")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("tab", { name: "信源" }));
+    expect(await screen.findByTestId("intel-sources-tab")).toBeInTheDocument();
+  });
+
+  it("footer 的「立即核查」触发 POST /intel/{instId}/verify", async () => {
+    await open();
+    fireEvent.click(await screen.findByRole("button", { name: "立即核查" }));
+    await waitFor(() => expect(verifyMock).toHaveBeenCalled());
   });
 
   it("打开即标记已读（真值落服务端，而不是前端 localStorage）", async () => {

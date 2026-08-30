@@ -20,6 +20,7 @@ import type {
   IntelItemInput,
   IntelReadResponse,
   IntelRound,
+  IntelSettings,
   IntelTier,
 } from "@/lib/intelTypes";
 import { useAppStore } from "@/lib/store";
@@ -27,7 +28,10 @@ import IntelEditor from "./IntelEditor";
 import { IntelDegradeBanner } from "./IntelEmptyStates";
 import IntelList from "./IntelList";
 import type { IntelCardActions } from "./IntelCard";
+import IntelBlockSourceDialog from "./IntelBlockSourceDialog";
+import IntelImpactTab from "./IntelImpactTab";
 import IntelRoundsTab from "./IntelRoundsTab";
+import IntelSourcesTab from "./IntelSourcesTab";
 
 const CATEGORIES: IntelCategory[] = [
   "market",
@@ -42,7 +46,9 @@ const CATEGORIES: IntelCategory[] = [
 // 的那一小段——故意慢，5 秒一次不会让一个开着的弹窗变成一个持续的请求源。
 const POLL_MS = 5_000;
 
-type TabKey = IntelTier | "archived" | "rounds";
+type TabKey = IntelTier | "impact" | "sources" | "archived" | "rounds";
+/** 三层 + 影响力 + 信源 + 已归档 + 审计 = 7 个页签（closed-loop §3.7.3）。 */
+const LIST_TABS: TabKey[] = ["ultra", "mid", "long", "archived"];
 
 /**
  * 标的情报库弹窗（ai-trade-market-intel §3.8.3）。
@@ -77,6 +83,10 @@ export default function IntelModal({
   // 得到的永远是空数组，于是「已归档 N」这个页签会一边报着 N 条、一边什么都不显示。
   const [inactive, setInactive] = useState<IntelItem[]>([]);
   const [rounds, setRounds] = useState<IntelRound[]>([]);
+  const [settings, setSettings] = useState<IntelSettings | null>(null);
+  const [blocking, setBlocking] = useState("");
+  /** 每次写动作成功后 +1；影响力页签据此重取（它不在 5 秒轮询里）。 */
+  const [actionToken, setActionToken] = useState(0);
   const [tab, setTab] = useState<TabKey>("ultra");
   const [category, setCategory] = useState<IntelCategory | "">("");
   const [query, setQuery] = useState("");
@@ -132,6 +142,16 @@ export default function IntelModal({
     return () => clearInterval(timer);
   }, [open, instId, load, setAiTradeIntelSummary]);
 
+  // 三把单键的**生效值**只影响空态文案的选择（closed-loop §3.7.3 的四段文案）。取一次即可：
+  // 它们是设置，不是行情——每 5 秒重取一次只会给一块不会变的面板加一个请求源。
+  useEffect(() => {
+    if (!open) return;
+    intelApi
+      .settings()
+      .then(setSettings)
+      .catch(() => undefined);
+  }, [open]);
+
   useEffect(() => {
     if (!open || tab !== "rounds") return;
     intelApi
@@ -164,6 +184,8 @@ export default function IntelModal({
         key: tier,
         label: `${TIER_LABEL[tier]} ${summary?.counts[tier] ?? 0}`,
       })),
+      { key: "impact", label: "影响力" },
+      { key: "sources", label: "信源" },
       { key: "archived", label: `已归档 ${archived}` },
       { key: "rounds", label: "整理记录" },
     ],
@@ -171,7 +193,7 @@ export default function IntelModal({
   );
 
   const visible = useMemo(() => {
-    if (tab === "rounds") return [];
+    if (!LIST_TABS.includes(tab)) return [];
     const source =
       tab === "archived" ? inactive : (data?.tiers[tab as IntelTier]?.items ?? []);
     const needle = query.trim().toLowerCase();
@@ -193,6 +215,9 @@ export default function IntelModal({
       await load();
       // 归档页签上的动作（恢复 / 删除）不改在库列表，只有这一次重取才能让它看到结果。
       if (tab === "archived") await loadInactive();
+      // 影响力页签自己取数、且**不进 5 秒轮询**（它是聚合读数，不是行情）。少这一步，用户在
+      // 榜单上点掉一个判定之后那张卡片纹丝不动 —— 一次「点了没反应」，而它其实成功了。
+      setActionToken((n) => n + 1);
     } catch (err) {
       setNotice(err instanceof Error ? err.message : "操作失败，请稍后重试");
     } finally {
@@ -210,6 +235,11 @@ export default function IntelModal({
     onMute: (item) => void guard(() => intelApi.patchItem(item.id, { status: "muted" })),
     onRestore: (item) => void guard(() => intelApi.patchItem(item.id, { status: "active" })),
     onDelete: (item) => setPendingDelete(item),
+    // 「我不同意」：清判定 ⇒ 注入立刻恢复，且该条目**永久**移出自动候选池（closed-loop P0-4）。
+    onClearVerdict: (item) =>
+      void guard(() => intelApi.patchItem(item.id, { clearVerdict: true })),
+    onVerifyItem: (item) => void guard(() => intelApi.verifyItem(item.id)),
+    onBlockSource: (domain) => setBlocking(domain),
   };
 
   const submitEditor = async (draft: IntelItemInput) => {
@@ -290,7 +320,7 @@ export default function IntelModal({
           />
         </div>
 
-        {tab !== "rounds" && (
+        {LIST_TABS.includes(tab) && (
           <div className="flex flex-wrap items-center gap-1.5 border-b border-[var(--border)] px-4 py-2">
             <FilterChip label="全部" active={category === ""} onClick={() => setCategory("")} />
             {CATEGORIES.map((c) => (
@@ -327,6 +357,18 @@ export default function IntelModal({
         <div className="min-h-0 flex-1 overflow-y-auto">
           {tab === "rounds" ? (
             <IntelRoundsTab rounds={rounds} loading={!rounds.length && !data} nowMs={nowMs} />
+          ) : tab === "impact" ? (
+            <IntelImpactTab
+              instId={instId}
+              reloadToken={actionToken}
+              summary={summary}
+              settingsCiteEnabled={settings?.citeEnabled ?? true}
+              settingsAttributionEnabled={settings?.attributionEnabled ?? true}
+              onClearVerdict={actions.onClearVerdict}
+              onVerifyNow={actions.onVerifyItem}
+            />
+          ) : tab === "sources" ? (
+            <IntelSourcesTab instId={instId} onChanged={() => void load()} />
           ) : (
             <IntelList
               items={visible}
@@ -358,6 +400,14 @@ export default function IntelModal({
               variant="ghost"
               size="sm"
               disabled={busy}
+              onClick={() => void guard(() => intelApi.verify(instId))}
+            >
+              立即核查
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busy}
               onClick={() => void guard(() => intelApi.curate(instId))}
             >
               立即整理
@@ -382,6 +432,28 @@ export default function IntelModal({
           onSubmit={submitEditor}
         />
       )}
+      <IntelBlockSourceDialog
+        open={blocking !== ""}
+        domain={blocking}
+        instId={instId}
+        onCancel={() => setBlocking("")}
+        onConfirm={(scopeInstId) => {
+          const domain = blocking;
+          setBlocking("");
+          void guard(async () => {
+            const res = await intelApi.writeFeedback({
+              key: domain,
+              action: "block",
+              instId: scopeInstId,
+            });
+            setNotice(
+              res.archived > 0
+                ? `已不再采纳 ${domain}；${res.archived} 条情报已归档，可在「已归档」中恢复`
+                : `已不再采纳 ${domain}`,
+            );
+          });
+        }}
+      />
       <ConfirmDialog
         open={pendingDelete !== null}
         title="删除这条情报？"

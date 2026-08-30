@@ -290,14 +290,14 @@ def test_cleanup_expires_ttl_but_spares_protected_items():
     items = [_item(item_id=1, expires_ts=NOW - 1),
              _item(item_id=2, expires_ts=NOW - 1, pinned=True),
              _item(item_id=3, expires_ts=NOW - 1, user_edited=True)]
-    plan = gate.plan_cleanup(items, limits=LIMITS, now=NOW)
+    plan = gate.plan_cleanup(items, limits=LIMITS, now=NOW, blocked_domains=frozenset())
     assert plan.expire_ids == (1,)
 
 
 def test_cleanup_evicts_overflow_by_lowest_score():
     limits = IntelLimits(max_active={"ultra": 2, "mid": 24, "long": 16})
     items = [_item(item_id=i, confidence=0.1 * i, expires_ts=NOW + 999) for i in (1, 2, 3)]
-    plan = gate.plan_cleanup(items, limits=limits, now=NOW)
+    plan = gate.plan_cleanup(items, limits=limits, now=NOW, blocked_domains=frozenset())
     assert plan.overflow_ids == (1,), "淘汰的必须是 score 最低的那一条"
 
 
@@ -305,8 +305,124 @@ def test_cleanup_demotes_lapsed_scheduled_event():
     """评审 P0-1：没有这一步，「永远的明天」会堆成一排再也不会发生的预告。"""
     lapsed = _item(item_id=5, tier="mid", is_scheduled=True, event_ts=NOW - 2 * 86400,
                    updated_ts=NOW - 3 * 86400, expires_ts=NOW + 99999)
-    plan = gate.plan_cleanup([lapsed], limits=LIMITS, now=NOW)
+    plan = gate.plan_cleanup([lapsed], limits=LIMITS, now=NOW, blocked_domains=frozenset())
     assert len(plan.lapsed) == 1
     assert plan.lapsed[0].action == "demote"
     assert plan.lapsed[0].to_tier == "ultra"
     assert plan.lapsed[0].expires_ts > 0
+
+
+# ---------------- closed-loop：引用加分 / 存量扫除 / 举证责任 / 信任先验 ----------------
+def _cited(item_id: int, *, entries: int, net: float, **over) -> gate.IntelItem:
+    return _item(item_id=item_id, cite_entry_count=entries, net_pnl_usd=net, **over)
+
+
+def test_score_item_without_limits_is_byte_identical_to_today():
+    """P1-1 的零回归判据：`limits is None` ⇒ 打分与本轮合入前逐字节相同。"""
+    winner = _cited(1, entries=9, net=99.0)
+    assert gate.score_item(winner, now=NOW) == gate.score_item(
+        _item(item_id=2), now=NOW), "不传 limits 时 cite 加分一个字节都不该进来"
+
+
+def test_cite_bonus_moves_profitable_item_up():
+    """§3.2.4 第 1 条：被引用过且赚过钱的情报排前面。"""
+    plain = _item(item_id=1)
+    winner = _cited(2, entries=3, net=18.4)
+
+    assert gate.score_item(winner, now=NOW, limits=LIMITS) > gate.score_item(
+        plain, now=NOW, limits=LIMITS)
+
+
+def test_losing_cited_item_is_not_penalised_below_uncited():
+    """§3.2.4 的成文选择：亏钱的**不加分，也不减分**。
+
+    一条情报被引用后亏钱，可能是情报错了，也可能是仓位错了、时机错了。把它降权是可辩护的，
+    把它降到「不如从没被引用过」不可辩护。
+    """
+    plain = _item(item_id=1)
+    loser = _cited(2, entries=3, net=-18.4)
+
+    assert gate.score_item(loser, now=NOW, limits=LIMITS) == gate.score_item(
+        plain, now=NOW, limits=LIMITS)
+
+
+def test_cite_bonus_is_bounded_by_cite_score_bonus():
+    """R-1③：净额**不参与**任何自动淘汰的判据，只作为一个**有界**加分项。"""
+    huge = _cited(1, entries=10_000, net=1e9)
+    plain = _item(item_id=2)
+    delta = gate.score_item(huge, now=NOW, limits=LIMITS) - gate.score_item(
+        plain, now=NOW, limits=LIMITS)
+
+    assert delta <= LIMITS.cite_score_bonus + 1e-9
+
+
+def test_overflow_eviction_actually_reads_the_bonus():
+    """防「用例绿着但分支从没被走到」：`plan_cleanup` 必须把 limits 显式传给 `score_item`。"""
+    limits = IntelLimits(max_active={"ultra": 1, "mid": 24, "long": 16}, cite_score_bonus=0.9)
+    weak_but_cited = _cited(1, entries=9, net=10.0, confidence=0.10, expires_ts=NOW + 999)
+    strong_but_uncited = _item(item_id=2, confidence=0.40, expires_ts=NOW + 999)
+
+    plan = gate.plan_cleanup([weak_but_cited, strong_but_uncited], limits=limits, now=NOW,
+                             blocked_domains=frozenset())
+
+    assert plan.overflow_ids == (2,), "加分没进溢出淘汰这一路 ⇒ 被淘汰的会是被引用过的那条"
+
+
+def test_plan_cleanup_requires_blocked_domains_explicitly():
+    """P1-8：少传即 `TypeError`，不是「扫除永远算出空集」这种静默空转。"""
+    import pytest
+
+    with pytest.raises(TypeError):
+        gate.plan_cleanup([], limits=LIMITS, now=NOW)
+
+
+def test_blocked_sweep_only_takes_items_whose_every_source_is_blocked():
+    """§3.4.2 第 5 步：只要还有一个干净来源就留着；受保护条目跳过。"""
+    dirty = gate.IntelSource(url="https://bad.example/x", domain="bad.example")
+    clean = gate.IntelSource(url="https://coindesk.com/y", domain="coindesk.com")
+    all_bad = _item(item_id=1, sources=(dirty,), expires_ts=NOW + 999)
+    mixed = _item(item_id=2, sources=(dirty, clean), expires_ts=NOW + 999)
+    protected = _item(item_id=3, sources=(dirty,), pinned=True, expires_ts=NOW + 999)
+    sourceless = _item(item_id=4, sources=(), expires_ts=NOW + 999)
+
+    plan = gate.plan_cleanup([all_bad, mixed, protected, sourceless], limits=LIMITS, now=NOW,
+                             blocked_domains=frozenset({"bad.example"}))
+
+    assert plan.blocked_ids == (1,)
+    assert plan.counts["blocked_sweep"] == 1, "漏了这一键，actions_json 里那个数永远是 0"
+
+
+def test_archive_of_a_profitable_item_needs_a_longer_reason():
+    """§3.2.4 第 2 条：这不是免死金牌，是一道**举证责任的抬高**。"""
+    profitable = _cited(1, entries=2, net=12.0)
+    items = {1: profitable}
+
+    thin = gate.review_actions([{"id": 1, "action": "archive", "reason": "不重要"}],
+                               items, limits=LIMITS, now=NOW)
+    assert thin.approved == () and thin.rejects.get("archive_profitable") == 1
+
+    thick = gate.review_actions(
+        [{"id": 1, "action": "archive", "reason": "该解锁已于上周完成，链上数据显示抛压已被消化，"
+                                                 "这条情报对后续判断不再有增量信息"}],
+        items, limits=LIMITS, now=NOW)
+    assert len(thick.approved) == 1, "写足了理由照样能归档"
+
+
+def test_uncited_item_archive_needs_no_extra_evidence():
+    """没有战绩的条目照旧一句话即可归档——举证责任只加在**有正战绩**的那些上。"""
+    review = gate.review_actions([{"id": 1, "action": "archive", "reason": "噪声"}],
+                                 {1: _item(item_id=1)}, limits=LIMITS, now=NOW)
+    assert len(review.approved) == 1
+
+
+def test_trusted_domain_does_not_raise_domain_count():
+    """§3.4.2 的红线：被信任不等于变成了两个独立信源。"""
+    corpus = _corpus(_doc("D1", domain="trusted.example"))
+    result = gate.admit([_proposal()], corpus, {}, inst_id="BTC-USDT-SWAP", limits=LIMITS,
+                        now=NOW, trusted_domains=frozenset({"trusted.example"}))
+    baseline = gate.admit([_proposal()], corpus, {}, inst_id="BTC-USDT-SWAP", limits=LIMITS,
+                          now=NOW)
+
+    assert result.accepted[0].domain_count == baseline.accepted[0].domain_count == 1
+    assert result.accepted[0].confidence > baseline.accepted[0].confidence, \
+        "trust 只进置信度先验"
