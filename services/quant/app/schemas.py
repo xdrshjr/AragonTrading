@@ -2816,6 +2816,13 @@ class IntelSettingsIn(BaseModel):
     verifyDocsPerItem: int | None = Field(default=None, ge=1, le=12)
     blockedSweepEnabled: bool | None = None
     citeMaxRefs: int | None = Field(default=None, ge=1, le=16)
+    # ---- ai-trade-intel-evidence-grounding §4.1 M-3：轴 A / 轴 B 的三把单键 ----
+    # ⚠️ 值域**必须**收在这里而不是只在前端：设置端点是公开的，而 `quoteMode` 的一个坏值会经
+    # `settings.model_copy(update=…)` 绕过 `Literal`（`model_copy` 不做校验）。第二道保险在
+    # `intel/service.py::resolve_intel_settings` 的读回处。
+    readerEnabled: bool | None = None
+    readerTopK: int | None = Field(default=None, ge=1, le=12)
+    quoteMode: Literal["off", "soft", "strict"] | None = None
 
 
 class IntelProbeIn(BaseModel):
@@ -2852,6 +2859,14 @@ class IntelSettingsOut(BaseModel):
     verifyDocsPerItem: int
     blockedSweepEnabled: bool
     citeMaxRefs: int
+    # ---- evidence-grounding：与 `IntelSettingsIn` 的三个新键逐个对称。**回执必须带上它们**
+    # ——`response_model` 会静默丢弃未声明的键，症状是「开关点了、回读还是旧值」。
+    readerEnabled: bool
+    readerTopK: int
+    quoteMode: str
+    # 近 20 轮引文命中率（`None` = 分母 0，「没提过引文」与「提了全没中」是两句不同的话）。
+    # 它是把 `quoteMode` 调到 strict 的**唯一**判据在设置卡上的落点。
+    quoteHitRate: float | None = None
 
 
 class ErrorBody(BaseModel):

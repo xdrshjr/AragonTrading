@@ -36,6 +36,9 @@ VERDICT_REJECT_CODES: tuple[str, ...] = (
     "verdict_no_ref",    # 非 unresolved 却指不出任何有效 D 编号 ⇒ 降为 unresolved（G-7）
     "verdict_no_reason",  # reason 空白 ⇒ 降为 unresolved
     "dup_item_ref",      # 同一 itemRef 出现多次 ⇒ 取第一条
+    # evidence-grounding §3.3.3：仅 strict —— `refuted` 是本层**唯一**会立刻停止一条情报注入的
+    # 判定，它的举证责任应当高于 `confirmed`。指不出一段已验证原文的证伪，降为 unresolved。
+    "refute_without_quote",
 )
 
 
@@ -59,6 +62,9 @@ class VerdictPlan:
         overwrite_verdict: ``unresolved`` 判定是否覆盖既有 verdict。恒 False——
             「这次没查出来」不该抹掉「上次查实了」。
         verify_count: 落库的新核查次数（**恒为旧值 +1**，绝不清零）。
+        resolve_schedule: 轴 D 的兑现位（evidence-grounding §3.4.2）。为真 ⇒ 写段把
+            ``is_scheduled`` 置假并落 ``schedule_resolved_ts = now``，该条目从此退出「已排期
+            事件失效」这条确定性清理。**带默认值 ⇒ 既有构造零改动**。
     """
 
     item_id: int
@@ -70,6 +76,7 @@ class VerdictPlan:
     expires_ts: int = 0
     overwrite_verdict: bool = True
     verify_count: int = 1
+    resolve_schedule: bool = False
 
 
 @dataclass(frozen=True)
@@ -152,11 +159,27 @@ def _clean_refs(raw, doc_refs: frozenset[str], counts: dict[str, int]) -> tuple[
 
 
 def _plan_confirmed(item: IntelItem, reason: str, refs: tuple[str, ...], *,
-                    limits: IntelLimits) -> VerdictPlan:
-    """``confirmed``：置信度加成（**封顶仍是 1.0**），tier / status 不动。"""
+                    limits: IntelLimits, now: float) -> VerdictPlan:
+    """``confirmed``：置信度加成（**封顶仍是 1.0**），tier / status 不动。
+
+    evidence-grounding §3.4.2：一件**已排期且时刻已过**的事被证实 ⇒ 置 `resolve_schedule`。
+
+    Args:
+        now: 墙钟秒。**必填 keyword-only、绝不给默认值**——给 `now=None` 再 `time.time()` 兜底，
+            漏传的症状就不是 `TypeError`，而是「判据用了一个跟这一轮无关的时刻」；而漏掉
+            `event_ts <= now` 这半条的后果是：一条被 P2 通道（中长期从未核查）选中的**未来**
+            排期事件被判 `confirmed`，立刻落兑现位，从此**永不失效**——那正是 F-1 换了个位置复发。
+
+    Note:
+        **不动 `event_ts`、不动 `tier`、不动 `expires_ts`**。后者容易被「顺手补上」以致违反
+        不变式 I-3——但 `expires_for_tier` 的输入是 `max(event_ts, captured_ts)` 与 `tier`，
+        两者都没变，重算的结果与原值逐字节相同；写一次多余的 UPDATE 只会让「哪里必须重算
+        expires」这条不变式的边界变模糊。
+    """
     confidence = min(1.0, round(float(item.confidence) + limits.verify_confirm_bonus, 4))
+    resolved = bool(item.is_scheduled and item.event_ts > 0 and item.event_ts <= float(now))
     return VerdictPlan(int(item.item_id), "confirmed", reason, refs, confidence=confidence,
-                       verify_count=int(item.verify_count) + 1)
+                       verify_count=int(item.verify_count) + 1, resolve_schedule=resolved)
 
 
 def _plan_refuted(item: IntelItem, reason: str, refs: tuple[str, ...], *,
@@ -192,8 +215,16 @@ def _plan_refuted(item: IntelItem, reason: str, refs: tuple[str, ...], *,
 
 
 def _plan_one(entry: dict, item: IntelItem, doc_refs: frozenset[str], *,
-              limits: IntelLimits, counts: dict[str, int]) -> VerdictPlan | None:
-    """单条判定的复核 → 后果计划；整条被丢弃时回 ``None``。"""
+              limits: IntelLimits, counts: dict[str, int], now: float,
+              has_quote: bool) -> VerdictPlan | None:
+    """单条判定的复核 → 后果计划；整条被丢弃时回 ``None``。
+
+    Args:
+        now: 墙钟秒（逐层下传到 `_plan_confirmed`，**无默认值**）。
+        has_quote: 这条判定有没有 ≥1 段**已验证**原文引证（evidence-grounding §3.3.3）。
+            纯核心自己判不了这件事——`doc_refs` 只是一个字符串集合、没有任何正文，故由
+            `service_verify` 先跑 `quotes.verify_verdict_quotes` 再把结论传进来。
+    """
     verdict = str(entry.get("verdict") or "").strip()
     if verdict not in tax.VERDICTS:
         _bump(counts, "bad_verdict")
@@ -207,9 +238,13 @@ def _plan_one(entry: dict, item: IntelItem, doc_refs: frozenset[str], *,
         # G-7：空口断言一律降为待定，**且不执行任何降级**。
         _bump(counts, "verdict_no_ref")
         verdict = "unresolved"
+    elif verdict == "refuted" and limits.quote_mode == "strict" and not has_quote:
+        # evidence-grounding §3.3.3：`soft` 下**不降级**（只记数），与「soft 只加不减」一致。
+        _bump(counts, "refute_without_quote")
+        verdict = "unresolved"
     _bump(counts, verdict)
     if verdict == "confirmed":
-        return _plan_confirmed(item, reason, refs, limits=limits)
+        return _plan_confirmed(item, reason, refs, limits=limits, now=now)
     if verdict == "refuted":
         return _plan_refuted(item, reason, refs, limits=limits)
     # `unresolved` 只写 verdict_ts / verify_count；**不覆盖已有的 confirmed**。
@@ -219,7 +254,7 @@ def _plan_one(entry: dict, item: IntelItem, doc_refs: frozenset[str], *,
 
 
 def review_verdicts(verdicts, candidates: dict[str, IntelItem], doc_refs, *,
-                    limits: IntelLimits) -> VerifyReview:
+                    limits: IntelLimits, now: float, quotes_by_ref) -> VerifyReview:
     """模型判定 → 服务端裁决。**模型只提议，服务端裁决，两边的分歧全部写进审计。**
 
     Args:
@@ -227,10 +262,17 @@ def review_verdicts(verdicts, candidates: dict[str, IntelItem], doc_refs, *,
         candidates: 本轮候选的 ``C 编号 → IntelItem``。
         doc_refs: 本轮语料的 ``D`` 编号集合（`corpus.index` 的键）。
         limits: 置信度加成 / 惩罚系数的来源。
+        now: 墙钟秒。**必填 keyword-only、无默认值**（evidence-grounding 评审 P1-1）——
+            本模块的 docstring 第一段就写着「无时钟」，而轴 D 的兑现判据需要它。
+        quotes_by_ref: ``{C 编号: 已验证引文元组}``（evidence-grounding 评审 P1-3）。
+            键**是 `C` 编号不是 `D` 编号**：两张表是分开的命名空间，串号不报错。
+            **不给默认值**：给了默认值，漏传的症状就是「strict 下 `refute_without_quote`
+            这条硬约束永远不生效」而不是一个 `TypeError`——那正是本仓库反复登记的静默空转。
 
     Returns:
         `VerifyReview`：后果计划 + 计数直方图（含被驳回的）。
     """
+    quotes = quotes_by_ref or {}
     counts: dict[str, int] = {}
     plans: list[VerdictPlan] = []
     seen: set[str] = set()
@@ -248,7 +290,8 @@ def review_verdicts(verdicts, candidates: dict[str, IntelItem], doc_refs, *,
             _bump(counts, "dup_item_ref")
             continue
         seen.add(token)
-        plan = _plan_one(entry, item, refs_set, limits=limits, counts=counts)
+        plan = _plan_one(entry, item, refs_set, limits=limits, counts=counts, now=now,
+                         has_quote=bool(quotes.get(token)))
         if plan is not None:
             plans.append(plan)
     return VerifyReview(tuple(plans), counts)

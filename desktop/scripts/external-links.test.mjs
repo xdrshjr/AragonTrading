@@ -129,3 +129,24 @@ test("缺 shell 时静默不接线（绝不抛，避免拖垮窗口创建）", (
   assert.doesNotThrow(() => wireExternalLinks(win, {}));
   assert.equal(win.webContents._openHandler, undefined);
 });
+
+// ---------------- ai-trade-intel-evidence-grounding §6.3：证据抽屉的 [原文↗] ----------------
+// 本轮的桌面侧**零改动**：抽屉里那条外链走的是同一个 handler。把「零改动」变成一条**会红**的
+// 断言而不是一句话——扩既有用例而不是新开一个测同一个 handler 的文件（两份断言必然漂移，
+// 而漂移的那一天没有人会发现）。
+test("证据抽屉的 [原文↗] 与来源 chip 走同一条路：http(s) 外开、其余一律 deny", () => {
+  const win = fakeWin();
+  const shell = fakeShell();
+  wireExternalLinks(win, { shell });
+  // 引文的出处链接与来源 chip 的链接形态完全一致（都是 `<a target="_blank">`）。
+  const quoteSource = "https://www.reuters.com/markets/us/core-cpi-2026-08-29/";
+  assert.deepEqual(win.webContents._openHandler({ url: quoteSource }), { action: "deny" });
+  assert.deepEqual(shell.calls, [quoteSource], "原文必须开在用户真正的浏览器里");
+
+  // 一段被抓回的正文里若混进了一条 `javascript:` 链接，它同样到不了 openExternal。
+  assert.deepEqual(
+    win.webContents._openHandler({ url: "javascript:fetch('/api/py/ai-trade/stop')" }),
+    { action: "deny" },
+  );
+  assert.deepEqual(shell.calls, [quoteSource], "外部正文里的伪协议链接一次都不该被执行");
+});

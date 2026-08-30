@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useId, useState } from "react";
 import clsx from "clsx";
 import {
   CATEGORY_LABEL,
@@ -14,8 +14,15 @@ import {
   stanceColor,
 } from "@/lib/intel";
 import { REFUTED_WARNING } from "@/lib/intelClosedLoop";
-import type { AiTradeIntelSummary, IntelItem, IntelTier } from "@/lib/intelTypes";
+import type {
+  AiTradeIntelSummary,
+  IntelEvidence,
+  IntelItem,
+  IntelTier,
+} from "@/lib/intelTypes";
 import IntelAttributionRail from "./IntelAttributionRail";
+import IntelEvidenceDrawer from "./IntelEvidenceDrawer";
+import IntelEvidenceTrigger from "./IntelEvidenceTrigger";
 import IntelSourceChips from "./IntelSourceChips";
 import IntelVerdictBadge from "./IntelVerdictBadge";
 
@@ -33,6 +40,13 @@ export interface IntelCardActions {
   onVerifyItem: (item: IntelItem) => void;
   /** 「不再采纳此源」：由卡片上的来源 chip 发起，走确认框。 */
   onBlockSource: (domain: string) => void;
+  /**
+   * 展开证据抽屉时的**懒加载**（evidence-grounding §3.3.2）。
+   *
+   * 结果按 `itemId` 缓存在弹窗里、收起不清缓存 ⇒ 同一次弹窗生命周期内只发一次。
+   * 缺省 ⇒ 卡片不渲染任何证据入口（编辑器预览等只读场景）。
+   */
+  onLoadEvidence?: (item: IntelItem) => void;
 }
 
 const MOVE_TARGETS: IntelTier[] = ["ultra", "mid", "long"];
@@ -55,13 +69,26 @@ export default function IntelCard({
   summary,
   actions,
   nowMs,
+  evidence,
+  evidenceLoading = false,
+  evidenceError = "",
+  blockedDomains = [],
 }: {
   item: IntelItem;
   summary: AiTradeIntelSummary | null;
   actions: IntelCardActions;
   nowMs: number;
+  /** 该条目的证据（`undefined` = 还没取过）。 */
+  evidence?: IntelEvidence | null;
+  evidenceLoading?: boolean;
+  evidenceError?: string;
+  /** 已被用户拉黑的域名：抽屉里那几条外链据此变灰。 */
+  blockedDomains?: string[];
 }) {
   const [expanded, setExpanded] = useState(false);
+  // ⚠️ **与摘要展开是两个独立的 state**：用户想读原文时，不该被迫先展开摘要。
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const drawerId = useId();
   const refuted = item.verdict === "refuted";
   const [moveOpen, setMoveOpen] = useState(false);
   const unread = isUnread(item, summary);
@@ -206,8 +233,38 @@ export default function IntelCard({
           item={item}
           onClearVerdict={actions.onClearVerdict}
           onVerifyNow={actions.onVerifyItem}
+          verifyQuoteCount={
+            evidence?.quotes.filter((quote) => quote.role === "verify").length ?? 0
+          }
         />
       </div>
+
+      {actions.onLoadEvidence && (
+        <>
+          <IntelEvidenceTrigger
+            item={item}
+            open={evidenceOpen}
+            controls={drawerId}
+            onToggle={() => {
+              const next = !evidenceOpen;
+              setEvidenceOpen(next);
+              // 收起不清缓存：再次展开时**不重发**（§3.3.2 的懒加载纪律）。
+              if (next && evidence === undefined) actions.onLoadEvidence?.(item);
+            }}
+          />
+          {evidenceOpen && (
+            <IntelEvidenceDrawer
+              id={drawerId}
+              evidence={evidence ?? null}
+              loading={evidenceLoading}
+              error={evidenceError}
+              blockedDomains={blockedDomains}
+              nowMs={nowMs}
+              onBlockSource={actions.onBlockSource}
+            />
+          )}
+        </>
+      )}
 
       <IntelSourceChips sources={item.sources} onBlock={actions.onBlockSource} />
       {item.curationNote && (

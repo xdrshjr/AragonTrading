@@ -21,7 +21,10 @@ import math
 
 from ...db import repositories as repo
 from . import corpus as corpus_mod
-from . import prompts, verify
+from . import evidence as evidence_mod
+from . import prompts
+from . import quotes as quotes_mod
+from . import verify
 from .agent import run_round
 from .service import (
     IntelDeps,
@@ -54,26 +57,44 @@ def _freshness_days(items, *, now: float) -> int:
 
 async def _persist_verify(deps: IntelDeps, inst_id: str, *, started: int, plans,
                           counts: dict, doc_count: int, domain_count: int,
-                          degrade_code: str, tokens: tuple[int, int]) -> RoundOutcome:
-    """核查轮的写段：判定落库 → 写轮 → 推节律，**一次提交**。"""
+                          degrade_code: str, tokens: tuple[int, int],
+                          quote_rows: list[dict] | None = None,
+                          reader_counts: dict | None = None,
+                          quotes_proposed: int = 0) -> RoundOutcome:
+    """核查轮的写段：判定落库 → 写轮 → 引文落库 → 推节律，**一次提交**。"""
     usage_in, usage_out = tokens
     status = "degraded" if degrade_code else "ok"
+    rows = quote_rows or []
     async with deps.sessionmaker()() as db:
         applied = await repo.apply_intel_verdicts(
             db, [{"itemId": plan.item_id, "verdict": plan.verdict, "reason": plan.reason,
                   "confidence": plan.confidence, "toTier": plan.to_tier,
                   "expiresTs": plan.expires_ts if plan.to_tier else None,
                   "overwriteVerdict": plan.overwrite_verdict,
-                  "verifyCount": plan.verify_count}
+                  "verifyCount": plan.verify_count,
+                  # ★ evidence-grounding 评审 P1-2：这张 wire 是**逐列手抄**的第三处。不加这一行，
+                  # `VerdictPlan.resolve_schedule` 会一直是 True 而库里那一列恒为 0，任何只断言
+                  # dataclass 的用例都会绿。
+                  "resolveSchedule": plan.resolve_schedule}
                  for plan in plans], now=started, commit=False)
         histogram = {**counts, **{f"applied_{k}": v for k, v in applied.items()}}
-        await repo.write_intel_round(db, {
+        # ⚠️ **先写轮存根再写引文**：引文行上的 `round_id` 只有拿到 round id 之后才填得出来，
+        # 而它是「这段核查原文是哪一轮产生的」在审计上的唯一线索。
+        round_id = await repo.write_intel_round(db, {
             "instId": inst_id, "kind": "verify", "groupId": deps.group_id,
             "startedTs": started, "finishedTs": int(deps.now()), "status": status,
             "searchProvider": deps.search.slug if deps.search else "",
             "docCount": doc_count, "domainCount": domain_count, "actions": histogram,
             "inputTokens": usage_in, "outputTokens": usage_out,
-            "degradeCode": degrade_code}, commit=False)
+            "degradeCode": degrade_code,
+            # evidence-grounding 评审 P1-6：核查轮同样带四个计数。不带的后果不是「少两列」，
+            # 而是命中率的分母**系统性偏小** ⇒ 把 `quote_mode` 翻到 strict 的判据永远达不成。
+            "readerAttempt": int((reader_counts or {}).get("readerAttempt", 0)),
+            "readerOk": int((reader_counts or {}).get("readerOk", 0)),
+            "quotesProposed": int(quotes_proposed),
+            "quotesVerified": len(rows)}, commit=False)
+        await repo.write_intel_quotes(db, [{**row, "roundId": round_id} for row in rows],
+                                      commit=False)
         # ★ 评审 P0-3：走**第三个**分支——写 `last_verify_ts`、清 `curates_since_verify`、
         # **绝不动 `last_curate_ts`**（G-16 冻结「上次整理一秒都没变」）。
         await repo.bump_intel_watch(db, inst_id, kind="verify", status=status,
@@ -127,9 +148,9 @@ async def run_verify_round(deps: IntelDeps, inst_id: str, *,
 
     # ②–④ 全程**无会话**：检索与 LLM 都在这一段。
     queries = _verify_queries(candidates, inst_id=inst_id)
-    built, degrade = await _gather_verify_corpus(deps, inst_id, queries=queries,
-                                                 blocked=blocked, now=now,
-                                                 candidates=candidates)
+    built, ctx, degrade = await _gather_verify_corpus(deps, inst_id, queries=queries,
+                                                      blocked=blocked, now=now,
+                                                      candidates=candidates)
     if degrade == "verify_search_failed":
         return await finish_degraded(deps, inst_id, kind="verify", started=started,
                                      code=degrade, status="failed", queries=queries)
@@ -140,8 +161,15 @@ async def run_verify_round(deps: IntelDeps, inst_id: str, *,
                                      counts={"unresolved": len(plans)}, doc_count=0,
                                      domain_count=0, degrade_code="verify_no_corpus",
                                      tokens=(0, 0))
+    # ③·5 / ③·6（evidence-grounding §3.1.1 的核查轮那一列）：**复用同一份缓存、同一条
+    # `reader_round_deadline_s`、同一个 `reader_top_k` 上限**，不按 `verify_max_items ×
+    # verify_docs_per_item` 扇出（§十三 Q3 的裁决）。
+    # ⚠️ 用的必须是 `_gather_verify_corpus` **建库时的那个 `ctx`**，不能在这里另造一个：
+    # `attach_bodies` 会拿它整体重渲染 `block`，两个 ctx 今天恰好等价，但只要日后有人给建库那侧
+    # 补上 `existing_headlines` 或 `change_24h_pct`，这里就会**静默地把它们从语料块里抹掉**。
+    built, reader_counts = await evidence_mod.attach_document_bodies(deps, ctx, built)
     return await _run_verify_agent(deps, inst_id, started=started, candidates=candidates,
-                                   corpus=built, now=now)
+                                   corpus=built, now=now, reader_counts=reader_counts)
 
 
 async def _gather_verify_corpus(deps: IntelDeps, inst_id: str, *, queries: list[str],
@@ -149,37 +177,46 @@ async def _gather_verify_corpus(deps: IntelDeps, inst_id: str, *, queries: list[
     """核查轮的检索 + 装语料。**全程无 DB 会话**。
 
     Returns:
-        `(Corpus, None)`；检索失败 `(None, "verify_search_failed")`；零文档 `(None, None)`。
+        `(Corpus, IntelContext, None)`；检索失败 `(None, ctx, "verify_search_failed")`；
+        零文档 `(None, ctx, None)`。**`ctx` 一并回出**：抓回正文之后 `attach_bodies` 要拿它
+        整体重渲染语料块，而另造一个等价的 ctx 只是把「哪一天它们不再等价」推给下一个人。
     """
     from .search import IntelSearchError
 
+    ctx = corpus_mod.build_context(inst_id=inst_id, bar=deps.bar, now_wall=int(now))
     try:
         docs = await deps.search.search_many(
             queries, limit=int(deps.settings.ai_trade_intel_verify_docs_per_item),
             freshness_days=_freshness_days(candidates, now=now))
     except IntelSearchError as exc:
         logger.info("ai-trade intel verify search failed for %s: %s", inst_id, exc.message)
-        return None, "verify_search_failed"
-    ctx = corpus_mod.build_context(inst_id=inst_id, bar=deps.bar, now_wall=int(now))
+        return None, ctx, "verify_search_failed"
     built = corpus_mod.build(
         docs, ctx, max_docs=int(deps.settings.ai_trade_intel_corpus_max_docs),
         snippet_max_chars=int(deps.settings.ai_trade_intel_snippet_max_chars),
         blocked_domains=blocked)
-    return (built, None) if built.docs else (None, None)
+    return (built, ctx, None) if built.docs else (None, ctx, None)
 
 
 async def _run_verify_agent(deps: IntelDeps, inst_id: str, *, started: int, candidates,
-                            corpus, now: float) -> RoundOutcome:
-    """调核查 Agent 并把判定过一遍服务端复核表。"""
+                            corpus, now: float,
+                            reader_counts: dict | None = None) -> RoundOutcome:
+    """调核查 Agent 并把判定过一遍服务端复核表。
+
+    **装配顺序是定死的**（evidence-grounding 评审 P1-3）：引文比对必须在这里先做，产出的
+    `quotes_by_ref` 再作为**必填 keyword-only** 传进 `review_verdicts`——纯核心手里只有
+    `doc_refs` 这个字符串集合，没有任何正文，判不了「这条判定有没有已验证引文」。
+    """
     # ★ 评审 P1-3：`verify_llm is None` ⇒ **回落 `deps.llm`**（用采集轮的预算跑，而不是报错）。
     llm = deps.verify_llm or deps.llm
     if llm is None:
         return await finish_degraded(deps, inst_id, kind="verify", started=started,
                                      code="verify_no_provider", status="degraded",
-                                     doc_count=len(corpus.docs), corpus=corpus)
+                                     doc_count=len(corpus.docs), corpus=corpus,
+                                     reader_counts=reader_counts)
     result = await run_round(
         llm,
-        system=prompts.build_verify_system_prompt(),
+        system=prompts.build_verify_system_prompt(deps.limits),
         user=prompts.build_verify_user_prompt(
             prompts.render_verify_candidates(candidates, now=now), corpus),
         tool_name=prompts.VERIFY_TOOL_NAME,
@@ -190,11 +227,39 @@ async def _run_verify_agent(deps: IntelDeps, inst_id: str, *, started: int, cand
         return await finish_degraded(deps, inst_id, kind="verify", started=started,
                                      code="verify_llm_failed", status="degraded",
                                      doc_count=len(corpus.docs), corpus=corpus,
-                                     usage=result)
+                                     usage=result, reader_counts=reader_counts)
+    verdicts = list(result.raw.get("verdicts") or [])
+    quotes_by_ref, quote_rejects = quotes_mod.verify_verdict_quotes(
+        verdicts, corpus.index, limits=deps.limits)
     indexed = {verify.format_item_ref(i + 1): item for i, item in enumerate(candidates)}
-    review = verify.review_verdicts(list(result.raw.get("verdicts") or []), indexed,
-                                    tuple(corpus.index.keys()), limits=deps.limits)
+    review = verify.review_verdicts(verdicts, indexed, tuple(corpus.index.keys()),
+                                    limits=deps.limits, now=now,
+                                    quotes_by_ref=quotes_by_ref)
+    counts = {**dict(review.counts), **quote_rejects}
+    rows = _verify_quote_rows(inst_id, plans=review.plans, indexed=indexed,
+                              quotes_by_ref=quotes_by_ref, now=int(now))
     return await _persist_verify(deps, inst_id, started=started, plans=review.plans,
-                                counts=dict(review.counts), doc_count=len(corpus.docs),
-                                domain_count=corpus.domain_count, degrade_code="",
-                                tokens=(result.input_tokens, result.output_tokens))
+                                 counts=counts, doc_count=len(corpus.docs),
+                                 domain_count=corpus.domain_count, degrade_code="",
+                                 tokens=(result.input_tokens, result.output_tokens),
+                                 quote_rows=rows, reader_counts=reader_counts,
+                                 quotes_proposed=quotes_mod.count_proposed(verdicts))
+
+
+def _verify_quote_rows(inst_id: str, *, plans, indexed: dict, quotes_by_ref: dict,
+                       now: int) -> list[dict]:
+    """核查引文 → `write_intel_quotes` 的 payload（`role="verify"`）。
+
+    只落**判定真的写下去了**的那些条目的引文：一条被整条丢弃的判定（`bad_item_ref` /
+    `bad_verdict`）没有宿主，落库只会写出孤儿行。
+    """
+    kept = {int(plan.item_id) for plan in plans}
+    rows: list[dict] = []
+    for token, quotes in (quotes_by_ref or {}).items():
+        item = indexed.get(token)
+        if item is None or int(item.item_id or 0) not in kept:
+            continue
+        rows.extend(evidence_mod.quote_row(inst_id, int(item.item_id), 0, quote,
+                                           role="verify", now=now)
+                    for quote in quotes)
+    return rows

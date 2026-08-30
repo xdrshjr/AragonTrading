@@ -24,6 +24,7 @@ function item(over: Partial<IntelItem> = {}): IntelItem {
     demoteCount: 0, lastCuratedTs: 0, curationNote: "", createdTs: 0,
     citeCount: 12, citeEntryCount: 5, settledCount: 4, winCount: 3, netPnlUsd: 18.4,
     lastCitedTs: 0, verdict: "", verdictTs: 0, verdictNote: "", verifyCount: 0,
+    quoted: false, quoteCount: 0, quoteState: "", scheduleResolvedTs: 0,
     ...over,
   };
 }
@@ -47,6 +48,7 @@ function summary(over: Partial<AiTradeIntelSummary> = {}): AiTradeIntelSummary {
     citations: { cited: 0, entryCited: 0, settledTrips: 0, winCount: 0, netPnlUsd: 0,
       neverCited: 0 },
     verify: { confirmed: 0, refuted: 0, unresolved: 0, pending: 0, lastVerifyTs: null },
+    quoteHitRate: null,
     ...over,
   };
 }

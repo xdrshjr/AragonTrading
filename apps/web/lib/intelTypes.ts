@@ -75,6 +75,79 @@ export interface IntelItem {
   verdictTs: number;
   verdictNote: string;
   verifyCount: number;
+  // ---- evidence-grounding §4.2 的四个新键（与 `intel_item_out` 逐键同构）----
+  /** 是否有 >=1 条已通过逐字比对的原文引证。 */
+  quoted: boolean;
+  /** 已验证引文条数（准入 + 核查合计）。 */
+  quoteCount: number;
+  /**
+   * 无引文时的**原因**，由后端下发（前端不猜——它手里没有任何能区分这四种情况的信息）：
+   * `""` = 有引文 | `legacy` = 本条早于原文取证功能 | `modeOff` = 引文要求已关闭
+   * | `noBody` = 该条来源均未抓到正文 | `modelOmitted` = 有正文但模型没给
+   * | `verifyFailed` = 给了但一条都没比中
+   */
+  quoteState: IntelQuoteState;
+  /** 已排期事件的兑现时刻；`0` = 未兑现 / 非排期。 */
+  scheduleResolvedTs: number;
+}
+
+/** 无引证的五种原因 + 有引证的空串（后端下发，前端只做文案映射）。 */
+export type IntelQuoteState =
+  | ""
+  | "legacy"
+  | "modeOff"
+  | "noBody"
+  | "modelOmitted"
+  | "verifyFailed";
+
+/** 一段已通过逐字比对的原文引证（与 `intel_quote_out` 逐键同构）。 */
+export interface IntelQuote {
+  id: number;
+  itemId: number;
+  instId: string;
+  roundId: number;
+  /** `admit` = 准入时的原文依据；`verify` = 核查判定的依据。两组在抽屉里分开渲染。 */
+  role: "admit" | "verify";
+  ref: string;
+  /** **文档里的原文形态**，不是模型给的那一串。 */
+  text: string;
+  sourceField: "body" | "snippet" | "title";
+  docUrl: string;
+  docDomain: string;
+  docPublishedTs: number;
+  /** 原文里含劝告性措辞 ⇒ 加一枚中性标记。**不是拒收**：它是真实原文。 */
+  hasImperative: boolean;
+  verifiedTs: number;
+}
+
+/** 一篇来源网页在正文缓存里的当前状态；缓存已淘汰 ⇒ 该 URL **不出现**在 `docs` 里。 */
+export interface IntelDocState {
+  url: string;
+  finalUrl: string;
+  domain: string;
+  title: string;
+  status: string;
+  httpStatus: number;
+  fetchedTs: number;
+  bodyChars: number;
+  truncated: boolean;
+}
+
+/** `GET /intel/items/{itemId}/evidence` 的回执。无引文 ⇒ 200 + 空数组（不是 404）。 */
+export interface IntelEvidence {
+  itemId: number;
+  quoteMode: "off" | "soft" | "strict";
+  quotes: IntelQuote[];
+  docs: IntelDocState[];
+}
+
+/** 设置卡「原文缓存」那一行。`bodyBytes` 是**真实字节**，不是前端乘出来的。 */
+export interface IntelDocumentHealth {
+  cachedDocs: number;
+  bodyBytes: number;
+  oldestFetchedTs: number;
+  lastPrunedTs: number;
+  readerEnabled: boolean;
 }
 
 export interface IntelRound {
@@ -100,6 +173,15 @@ export interface IntelRound {
   outputTokens: number;
   degradeCode: string;
   errorText: string;
+  // ---- evidence-grounding §4.2 的四个新计数（轮次页签的两列 + 命中率徽标）----
+  /** 本轮打算取正文的篇数（含命中缓存的）。 */
+  readerAttempt: number;
+  /** 真的拿到正文的篇数。 */
+  readerOk: number;
+  /** 模型本轮声称给出的引文条数（命中率的分母）。 */
+  quotesProposed: number;
+  /** 通过逐字比对并落库的引文条数（命中率的分子）。 */
+  quotesVerified: number;
 }
 
 /** 降级态。**文案由后端下发**，前端不二次编（两处各写一份必漂移）。 */
@@ -141,6 +223,11 @@ export interface AiTradeIntelSummary {
     pending: number;
     lastVerifyTs: number | null;
   };
+  /**
+   * 近 20 轮 `quotesVerified / quotesProposed`。
+   * **`null` = 分母 0**（「没提过引文」），与 `0`（「提了全没中」）是两句不同的话。
+   */
+  quoteHitRate: number | null;
 }
 
 export interface IntelTierBucket {
@@ -207,6 +294,12 @@ export interface IntelSettings {
   verifyDocsPerItem: number;
   blockedSweepEnabled: boolean;
   citeMaxRefs: number;
+  // ---- evidence-grounding：轴 A / 轴 B 的三把单键（与 `INTEL_SETTING_BRIDGE` 逐键对应）----
+  readerEnabled: boolean;
+  readerTopK: number;
+  quoteMode: "off" | "soft" | "strict";
+  /** 近 20 轮命中率；`null` = 还没提过引文。 */
+  quoteHitRate: number | null;
 }
 
 export interface IntelSettingsPatch {
@@ -226,6 +319,9 @@ export interface IntelSettingsPatch {
   verifyDocsPerItem?: number;
   blockedSweepEnabled?: boolean;
   citeMaxRefs?: number;
+  readerEnabled?: boolean;
+  readerTopK?: number;
+  quoteMode?: "off" | "soft" | "strict";
 }
 
 export interface IntelProbeResult {

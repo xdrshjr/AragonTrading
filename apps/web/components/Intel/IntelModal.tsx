@@ -13,9 +13,11 @@ import {
   relativeTime,
 } from "@/lib/intel";
 import { intelApi } from "@/lib/intelApi";
+import { quoteHitRateLabel } from "@/lib/intelEvidence";
 import type {
   AiTradeIntelSummary,
   IntelCategory,
+  IntelEvidence,
   IntelItem,
   IntelItemInput,
   IntelReadResponse,
@@ -96,6 +98,11 @@ export default function IntelModal({
   const [editorOpen, setEditorOpen] = useState(false);
   const [pendingDelete, setPendingDelete] = useState<IntelItem | null>(null);
   const [nowMs, setNowMs] = useState(() => Date.now());
+  // 证据按 `itemId` 缓存在**弹窗生命周期**内：展开时才发，收起再展开**不重发**（§3.3.2）。
+  const [evidenceById, setEvidenceById] = useState<Record<number, IntelEvidence>>({});
+  const [evidenceLoadingId, setEvidenceLoadingId] = useState<number | null>(null);
+  const [evidenceErrors, setEvidenceErrors] = useState<Record<number, string>>({});
+  const [blockedDomains, setBlockedDomains] = useState<string[]>([]);
 
   // WS 推来的 summary 优先（它带 `inFlight` 与本轮降级），REST 的那一份只在 WS 尚未推过时兜底。
   const summary: AiTradeIntelSummary | null = liveSummary ?? data?.summary ?? null;
@@ -151,6 +158,20 @@ export default function IntelModal({
       .then(setSettings)
       .catch(() => undefined);
   }, [open]);
+
+  // 拉黑清单只取一次：它是设置，不是行情。抽屉里那几条外链据此变灰（一个仍然可点的
+  // 「已屏蔽来源」是自相矛盾的）。
+  useEffect(() => {
+    if (!open) return;
+    intelApi
+      .feedback(instId)
+      .then((res) =>
+        setBlockedDomains(
+          res.rows.filter((row) => row.action === "block").map((row) => row.key),
+        ),
+      )
+      .catch(() => undefined);
+  }, [open, instId, actionToken]);
 
   useEffect(() => {
     if (!open || tab !== "rounds") return;
@@ -240,6 +261,28 @@ export default function IntelModal({
       void guard(() => intelApi.patchItem(item.id, { clearVerdict: true })),
     onVerifyItem: (item) => void guard(() => intelApi.verifyItem(item.id)),
     onBlockSource: (domain) => setBlocking(domain),
+    onLoadEvidence: (item) => {
+      if (evidenceById[item.id] !== undefined || evidenceLoadingId === item.id) return;
+      setEvidenceLoadingId(item.id);
+      // ⚠️ 错误**按 itemId 存**，不是一个弹窗级的字符串：后者会让 A 的失败在 B 展开时被清掉，
+      // 而 A 那个还开着的抽屉于是从「读取失败」变成「这一条没有留存任何原文引证」——把一次
+      // 请求失败说成一句关于数据的断言，是四句话里最不该出现的那一句。
+      setEvidenceErrors((prev) => {
+        if (prev[item.id] === undefined) return prev;
+        const { [item.id]: _dropped, ...rest } = prev;
+        return rest;
+      });
+      intelApi
+        .evidence(item.id)
+        .then((res) => setEvidenceById((prev) => ({ ...prev, [item.id]: res })))
+        .catch((err) =>
+          setEvidenceErrors((prev) => ({
+            ...prev,
+            [item.id]: err instanceof Error ? err.message : "读取原文引证失败",
+          })),
+        )
+        .finally(() => setEvidenceLoadingId(null));
+    },
   };
 
   const submitEditor = async (draft: IntelItemInput) => {
@@ -282,6 +325,14 @@ export default function IntelModal({
           </h2>
           <span className="flex shrink-0 items-center gap-2 text-[10px] text-[var(--muted)]">
             {summary?.inFlight && <span data-testid="intel-in-flight">采集中…</span>}
+            {quoteHitRateLabel(summary?.quoteHitRate ?? null) && (
+              <span
+                data-testid="intel-hit-rate"
+                title="这是把「引文要求」调到「必须附可核对引文」的判据：连续 20 轮 ≥ 70% 再考虑收紧。"
+              >
+                {quoteHitRateLabel(summary?.quoteHitRate ?? null)}
+              </span>
+            )}
             {summary?.lastCollectTs != null && (
               <span title={absoluteTime(summary.lastCollectTs)}>
                 最近采集 {relativeTime(summary.lastCollectTs, nowMs)}
@@ -385,6 +436,10 @@ export default function IntelModal({
                 setQuery("");
                 setCategory("");
               }}
+              evidenceById={evidenceById}
+              evidenceLoadingId={evidenceLoadingId}
+              evidenceErrors={evidenceErrors}
+              blockedDomains={blockedDomains}
             />
           )}
         </div>

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Button, Card, Field, Input, Select, Switch } from "@/components/ui";
 import { intelApi } from "@/lib/intelApi";
 import type { IntelProbeResult, IntelProviderHealth, IntelSettings } from "@/lib/intelTypes";
+import IntelReaderSettings from "./IntelReaderSettings";
 
 // 三个适配器都已实现（intel-closed-loop 轴 D 兑现了 v1 登记的那条待办），故三项全部列出——
 // v1 时代「故意不列出未实现的选项」的理由（一个选了就不工作的选项比没有这个选项更坏）在这里
@@ -91,6 +92,10 @@ export default function IntelSourceSettings() {
         citeEnabled: patch.citeEnabled,
         attributionEnabled: patch.attributionEnabled,
         verifyEnabled: patch.verifyEnabled,
+        // evidence-grounding：轴 A / 轴 B 的三把单键，同样**逐个透传**。
+        readerEnabled: patch.readerEnabled,
+        readerTopK: patch.readerTopK,
+        quoteMode: patch.quoteMode,
       });
       setSettings(next);
       setDraft(cadenceOf(next));
@@ -288,7 +293,7 @@ export default function IntelSourceSettings() {
         <span className="text-sm font-semibold text-[var(--text)]">情报闭环</span>
         <span className="text-[11px] leading-relaxed text-[var(--muted)]">
           让每一条情报可被引用、可被结算、可被证伪。三把开关逐层收窄：关掉「引用编号」，
-          注入行与决策工具会**逐字节**回到没有本功能的样子；关掉「引用归因」，引用照记但不结算；
+          注入行与决策工具会逐字节回到没有本功能的样子；关掉「引用归因」，引用照记但不结算；
           关掉「定期核查」，不再有任何自动的证实 / 证伪判定。已有的统计与判定一律原样保留。
         </span>
         <ToggleRow
@@ -319,6 +324,8 @@ export default function IntelSourceSettings() {
           </span>
         )}
       </Card>
+
+      <IntelReaderSettings settings={settings} busy={busy} onSave={(patch) => void save(patch)} />
 
       <Card className="flex items-start justify-between gap-3 p-4">
         <div className="flex flex-col gap-0.5">

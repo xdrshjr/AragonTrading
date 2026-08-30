@@ -29,7 +29,9 @@ def _verdict(ref: str, verdict: str, *, reason: str = "语料明确写到了这�
 
 def _review(entries, candidates):
     indexed = {verify.format_item_ref(i + 1): it for i, it in enumerate(candidates)}
-    return verify.review_verdicts(entries, indexed, DOC_REFS, limits=LIMITS)
+    # evidence-grounding 评审 P1-1 / P1-3：两个新形参**都没有默认值**，故构造点必须显式给。
+    return verify.review_verdicts(entries, indexed, DOC_REFS, limits=LIMITS, now=NOW,
+                                  quotes_by_ref={})
 
 
 # ---------------- 候选选取（§3.3.1） ----------------

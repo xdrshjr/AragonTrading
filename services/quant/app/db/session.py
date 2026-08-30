@@ -216,12 +216,30 @@ async def _ensure_ai_intel_columns(conn) -> None:
         "verdict_ts": "INTEGER DEFAULT 0",
         "verdict_note": "VARCHAR(200) DEFAULT ''",
         "verify_count": "INTEGER DEFAULT 0",
+        # ---- ai-trade-intel-evidence-grounding §5.3：四个新列 ----
+        # ⚠️ ``quote_state`` 的 ALTER 默认取 ``'legacy'``（= 本条早于原文取证功能），**不能取
+        # ``''``**：空串已经被 wire 用作「有引文」的取值，两者撞在一起会让一条 2026 年 8 月的
+        # 老情报在界面上显示成「有引证」而抽屉是空的。模型侧的 Python 默认则刻意是 ``''``——
+        # 见 ``models.AiIntelItem.quote_state`` 的注释与 ``write_intel_quote_state``。
+        "quoted": "BOOLEAN DEFAULT 0",
+        "quote_count": "INTEGER DEFAULT 0",
+        "quote_state": "VARCHAR(16) DEFAULT 'legacy'",
+        "schedule_resolved_ts": "INTEGER DEFAULT 0",
     }
     watch_columns = {
         "last_verify_ts": "INTEGER DEFAULT 0",
         "curates_since_verify": "INTEGER DEFAULT 0",
     }
-    for table, columns in (("ai_intel_items", item_columns), ("ai_intel_watch", watch_columns)):
+    # ai-trade-intel-evidence-grounding §5.3：``ai_intel_rounds`` 作为**第三张表**加入本循环，
+    # **不新建第六个 patcher**。
+    round_columns = {
+        "reader_attempt": "INTEGER DEFAULT 0",
+        "reader_ok": "INTEGER DEFAULT 0",
+        "quotes_proposed": "INTEGER DEFAULT 0",
+        "quotes_verified": "INTEGER DEFAULT 0",
+    }
+    for table, columns in (("ai_intel_items", item_columns), ("ai_intel_watch", watch_columns),
+                           ("ai_intel_rounds", round_columns)):
         rows = (await conn.execute(text(f"PRAGMA table_info({table})"))).all()
         existing = {row[1] for row in rows}
         for name, sql_type in columns.items():

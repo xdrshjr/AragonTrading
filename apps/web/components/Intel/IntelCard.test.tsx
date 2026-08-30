@@ -51,6 +51,7 @@ function item(over: Partial<IntelItem> = {}): IntelItem {
     verdictTs: 0,
     verdictNote: "",
     verifyCount: 0,
+    quoted: false, quoteCount: 0, quoteState: "", scheduleResolvedTs: 0,
     createdTs: NOW_S,
     ...over,
   };
@@ -71,6 +72,7 @@ const summary: AiTradeIntelSummary = {
   dailyCap: 96,
   citations: { cited: 0, entryCited: 0, settledTrips: 0, winCount: 0, netPnlUsd: 0, neverCited: 0 },
   verify: { confirmed: 0, refuted: 0, unresolved: 0, pending: 0, lastVerifyTs: null },
+  quoteHitRate: null,
 };
 
 function actions(): IntelCardActions {
@@ -230,5 +232,70 @@ describe("IntelCard · 情报闭环", () => {
     render(<IntelCard item={item()} summary={summary} actions={actions()} nowMs={NOW_MS} />);
     expect(screen.getByRole("button", { name: "不再采纳 theblock.co" }).className)
       .toContain("focus-visible:opacity-100");
+  });
+
+  // ---------------- evidence-grounding 轴 C：证据抽屉 ----------------
+  it("摘要展开与证据展开是**两个独立的 state**：想读原文时不该被迫先展开摘要", () => {
+    const acts = { ...actions(), onLoadEvidence: vi.fn() };
+    render(<IntelCard item={item({ quoted: true, quoteCount: 2 })} summary={summary}
+                      actions={acts} nowMs={NOW_MS} />);
+    // 摘要触发器是那颗 `aria-expanded` 且**没有** `aria-label` 的按钮（动作区那几颗都有）。
+    const summaryToggle = screen
+      .getAllByRole("button", { name: /某跨链桥今晨被盗/ })
+      .find((node) => !node.getAttribute("aria-label"))!;
+    const evidenceToggle = screen.getByTestId("intel-evidence-trigger");
+    expect(summaryToggle).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(evidenceToggle);
+    expect(evidenceToggle).toHaveAttribute("aria-expanded", "true");
+    expect(summaryToggle).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.click(summaryToggle);
+    expect(summaryToggle).toHaveAttribute("aria-expanded", "true");
+    expect(evidenceToggle).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("展开才发那一次请求；收起再展开**不重发**（收起不清缓存）", () => {
+    const onLoadEvidence = vi.fn();
+    const acts = { ...actions(), onLoadEvidence };
+    const { rerender } = render(
+      <IntelCard item={item({ quoted: true, quoteCount: 1 })} summary={summary}
+                 actions={acts} nowMs={NOW_MS} />);
+    expect(onLoadEvidence).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("intel-evidence-trigger"));
+    expect(onLoadEvidence).toHaveBeenCalledTimes(1);
+
+    // 弹窗把结果缓存下来之后，收起再展开不该再发。
+    const evidence = {
+      itemId: 1, quoteMode: "soft" as const, docs: [],
+      quotes: [{
+        id: 5, itemId: 1, instId: "BTC-USDT-SWAP", roundId: 1, role: "admit" as const,
+        ref: "D1", text: "原文一段", sourceField: "body" as const,
+        docUrl: "https://reuters.com/a", docDomain: "reuters.com", docPublishedTs: 0,
+        hasImperative: false, verifiedTs: 0,
+      }],
+    };
+    rerender(<IntelCard item={item({ quoted: true, quoteCount: 1 })} summary={summary}
+                        actions={acts} nowMs={NOW_MS} evidence={evidence} />);
+    fireEvent.click(screen.getByTestId("intel-evidence-trigger"));
+    fireEvent.click(screen.getByTestId("intel-evidence-trigger"));
+    expect(onLoadEvidence).toHaveBeenCalledTimes(1);
+  });
+
+  it("没有 `onLoadEvidence`（只读场景）⇒ 卡片上不出现任何证据入口", () => {
+    render(<IntelCard item={item({ quoted: true, quoteCount: 2 })} summary={summary}
+                      actions={actions()} nowMs={NOW_MS} />);
+    expect(screen.queryByTestId("intel-evidence-trigger")).toBeNull();
+    expect(screen.queryByTestId("intel-no-evidence")).toBeNull();
+  });
+
+  it("无引文 ⇒ 一枚带原因的「无引证」标记，而不是一个点开永远是空的触发器", () => {
+    const acts = { ...actions(), onLoadEvidence: vi.fn() };
+    render(<IntelCard item={item({ quoteState: "noBody" })} summary={summary}
+                      actions={acts} nowMs={NOW_MS} />);
+    expect(screen.queryByTestId("intel-evidence-trigger")).toBeNull();
+    expect(screen.getByTestId("intel-no-evidence"))
+      .toHaveAttribute("title", "这几个来源都没能抓到正文");
   });
 });

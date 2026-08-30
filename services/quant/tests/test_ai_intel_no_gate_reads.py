@@ -94,6 +94,57 @@ def test_backtest_lane_carries_no_intel_key():
         assert "intel" not in code.lower(), rel
 
 
+def test_body_is_only_read_inside_render_block():
+    """evidence-grounding §3.6 第 3 条：抓回的正文**只**进不可信区。
+
+    `render_local_facts`（可信区）一个字节不改；`doc.body` 只在 `render_block` 与
+    `attach_bodies` 里被读。多一个读点就是把外部网页文本放进可信区的一条新通道，而那条通道
+    不会报错。
+    """
+    tree = ast.parse((_APP / "ai_auto" / "intel" / "corpus.py").read_text(encoding="utf-8"))
+    readers = set()
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef):
+            continue
+        for node in ast.walk(func):
+            if (isinstance(node, ast.Attribute) and node.attr == "body") or (
+                    isinstance(node, ast.keyword) and node.arg == "body"):
+                readers.add(func.name)
+    assert readers <= {"render_block", "attach_bodies"}, \
+        f"`body` 多出了读点：{sorted(readers - {'render_block', 'attach_bodies'})}"
+
+
+def test_pure_core_evidence_modules_import_no_io():
+    """`extract.py` / `quotes.py` 是纯核心：零 IO、零网络、零 DB、零时钟。"""
+    forbidden = {"httpx", "socket", "asyncio", "sqlalchemy", "time", "logging", "random"}
+    for name in ("extract.py", "quotes.py"):
+        tree = ast.parse((_APP / "ai_auto" / "intel" / name).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = {alias.name.split(".")[0] for alias in node.names}
+            elif isinstance(node, ast.ImportFrom):
+                names = {(node.module or "").split(".")[0]}
+            else:
+                continue
+            assert not (names & forbidden), f"{name} import 了 IO 模块：{names & forbidden}"
+
+
+def test_reader_is_the_only_module_that_goes_out():
+    """不变式 I-5：出网抓取的调用点被**唯一化**在 `reader.py` 里。
+
+    放开它等于把一个受限于搜索源的取数器变成一个通用的服务端代理——SSRF 的实质风险面从
+    「搜索源被投毒」放大到「任何能写库的人」。
+    """
+    offenders = []
+    for path in sorted((_APP / "ai_auto" / "intel").glob("*.py")):
+        if path.name in ("reader.py", "search.py"):
+            continue
+        code = _code_without_docstrings(path)
+        if "httpx" in code:
+            offenders.append(path.name)
+    assert offenders == [], f"{offenders} 里出现了出网 client"
+
+
 def test_frontend_intel_components_never_use_dangerous_html():
     """情报文本来自不可信网页；`dangerouslySetInnerHTML` 在这里等于把 XSS 邀请进来。"""
     intel_dir = _WEB / "components" / "Intel"

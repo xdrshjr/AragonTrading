@@ -8,16 +8,23 @@
 包内模块之间的依赖是单向的：
 
     taxonomy ← gate ← disclosure
+    taxonomy ← gate ← cleanup
+    taxonomy ← quotes ← gate
     taxonomy ← corpus ← prompts
+    extract ← reader（reader 是本包**唯一**出网抓取的模块）
     search / corpus / gate / prompts / agent → service → runtime → scheduler
 
 `scheduler` 反向依赖 `runtime` 的注册表，故 `runtime.invalidate` 里那一处 import 是**延迟**的
 （见该函数的 docstring）。
 """
 from .attribution import IntelAttribution
+from .cleanup import CleanupPlan, plan_cleanup
 from .citation import CitationResolution, classify_outcome, resolve_citations
 from .disclosure import format_intel
+from .extract import ExtractResult, extract_main_text
 from .gate import IntelItem, IntelSource
+from .quotes import VerifiedQuote, normalize_for_match, verify_item_quotes
+from .reader import ReaderConfig, ReaderResult, fetch_many, guard_url
 from .runtime import (
     IntelRuntime,
     build_group_runtime,
@@ -34,19 +41,29 @@ from .taxonomy import IntelLimits, limits_from_settings
 
 __all__ = [
     "CitationResolution",
+    "CleanupPlan",
+    "ExtractResult",
     "IntelAttribution",
     "IntelDeps",
     "IntelItem",
     "IntelLimits",
     "IntelRuntime",
     "IntelSource",
+    "ReaderConfig",
+    "ReaderResult",
+    "VerifiedQuote",
     "build_group_runtime",
+    "extract_main_text",
+    "fetch_many",
+    "guard_url",
     "classify_outcome",
     "format_intel",
     "intel_digest_for",
     "intel_summary_for",
     "invalidate",
     "limits_from_settings",
+    "normalize_for_match",
+    "plan_cleanup",
     "register",
     "resolve_citations",
     "run_collect_round",
@@ -54,4 +71,5 @@ __all__ = [
     "run_verify_round",
     "runtime_for",
     "unregister",
+    "verify_item_quotes",
 ]

@@ -15,6 +15,7 @@ function round(over: Partial<IntelRound> = {}): IntelRound {
     docCount: 16, domainCount: 6, accepted: 2, rejected: 1, merged: 0,
     rejects: { bad_ref: 1 }, actions: {}, inputTokens: 100, outputTokens: 20,
     degradeCode: "", errorText: "",
+    readerAttempt: 0, readerOk: 0, quotesProposed: 0, quotesVerified: 0,
     ...over,
   };
 }
@@ -92,5 +93,37 @@ describe("IntelRoundsTab · 核查轮", () => {
     expect(screen.getByText(/来源已拉黑，存量归档 × 2/)).toBeInTheDocument();
     expect(screen.getByText(/引用明细到期裁剪 × 9/)).toBeInTheDocument();
     expect(screen.getByText(/理由不足（被驳回） × 1/)).toBeInTheDocument();
+  });
+
+  // ---------------- evidence-grounding §3.3.4：两列新指标 ----------------
+  it("正文与引文两列按「命中 / 尝试」渲染", () => {
+    render(<IntelRoundsTab rounds={[round({
+      readerAttempt: 6, readerOk: 5, quotesProposed: 9, quotesVerified: 7,
+    })]} loading={false} nowMs={NOW_MS} />);
+    expect(screen.getByTestId("intel-round-reader")).toHaveTextContent("正文 5/6");
+    expect(screen.getByTestId("intel-round-quotes")).toHaveTextContent("引文 7/9");
+  });
+
+  it("分母 0 ⇒ `—`：「这一轮没抓」与「抓了全失败」是两句不同的话", () => {
+    render(<IntelRoundsTab rounds={[round()]} loading={false} nowMs={NOW_MS} />);
+    expect(screen.getByTestId("intel-round-reader")).toHaveTextContent("正文 —");
+    expect(screen.getByTestId("intel-round-quotes")).toHaveTextContent("引文 —");
+  });
+
+  it.each([
+    ["quote_bad_ref", "引文指向了本条没声明的来源"],
+    ["quote_too_short", "引文过短，不足以作为证据"],
+    ["quote_not_found", "引文在原文里找不到（逐字比对未通过）"],
+    ["quote_over_cap", "单条引文数超上限，多余的已丢弃"],
+    ["quote_span_too_wide", "引文跨度过长，已丢弃"],
+    ["no_verified_quote", "没有一条可核对的原文引证（严格模式）"],
+    ["quote_orphan_dropped", "引文所属条目已被合并或截断，未落库"],
+    ["need_quote", "升长期需要可核对的原文引证（被驳回）"],
+    ["refute_without_quote", "证伪未附原文引证，已降为待定"],
+  ])("新拒收码 %s 有中文文案，不落到裸码", (code, label) => {
+    render(<IntelRoundsTab rounds={[round({ rejects: { [code]: 2 } })]} loading={false}
+                           nowMs={NOW_MS} />);
+    fireEvent.click(screen.getByRole("button", { name: /篇材料/ }));
+    expect(screen.getByText(`${label} × 2`)).toBeInTheDocument();
   });
 });

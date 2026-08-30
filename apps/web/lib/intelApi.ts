@@ -6,6 +6,8 @@ import { ApiRequestError, toApiError } from "./api";
 import { timeoutFor, withTimeout } from "./httpTimeout";
 import type {
   IntelCitationRow,
+  IntelDocumentHealth,
+  IntelEvidence,
   IntelFeedbackInput,
   IntelFeedbackRow,
   IntelImpactReport,
@@ -172,6 +174,17 @@ export const intelApi = {
       `/intel/${enc(instId)}/citations?${qs}`,
     );
   },
+  // ---------------- evidence-grounding（§4.1 N-1 / N-2） ----------------
+  /**
+   * 一条情报的全部原文引证 + 它那几个来源当前的缓存状态。
+   *
+   * **懒加载**：抽屉展开时才发，结果按 `itemId` 缓存在弹窗里（收起再展开不重发）。
+   * 无引文回的是 200 + 空数组，**不是 404**。
+   */
+  evidence: (itemId: number) =>
+    request<IntelEvidence>(`/intel/items/${itemId}/evidence`),
+  /** 正文缓存的只读读数（设置卡「原文缓存」那一行）。 */
+  documentHealth: () => request<IntelDocumentHealth>("/intel/documents/health"),
   /** 测试连接（服务端总耗时硬封顶 12 秒）。 */
   probe: (body: { provider?: string; apiKey?: string } = {}) =>
     request<IntelProbeResult>("/settings/intel/probe", {

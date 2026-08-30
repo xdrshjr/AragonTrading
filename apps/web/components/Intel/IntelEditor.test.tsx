@@ -85,6 +85,7 @@ describe("IntelEditor", () => {
       demoteCount: 0, lastCuratedTs: 0, curationNote: "", createdTs: 0,
       citeCount: 0, citeEntryCount: 0, settledCount: 0, winCount: 0, netPnlUsd: 0,
       lastCitedTs: 0, verdict: "" as const, verdictTs: 0, verdictNote: "", verifyCount: 0,
+      quoted: false, quoteCount: 0, quoteState: "" as const, scheduleResolvedTs: 0,
     };
     render(<IntelEditor open item={item} onClose={() => {}} onSubmit={vi.fn(async () => {})} />);
     expect(screen.getByText("编辑情报")).toBeInTheDocument();

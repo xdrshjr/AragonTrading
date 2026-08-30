@@ -1122,3 +1122,21 @@ from .ai_intel_citation_repositories import (  # noqa: E402,F401
     settle_intel_citations,
     sweep_blocked_source_items,
 )
+
+# ai_intel_evidence_repositories：网页正文缓存 + 逐字引文
+# （ai-trade-intel-evidence-grounding §5.1/§5.2；同样是「不让既有两个情报数据层越 800 线」的
+# 处置）。同一条再导出纪律适用：漏一个是静默空转，不是 ImportError。
+from .ai_intel_evidence_repositories import (  # noqa: E402,F401
+    count_recent_quote_stats,
+    delete_item_quotes,
+    document_health,
+    get_cached_documents,
+    intel_document_out,
+    intel_quote_out,
+    list_documents_for_urls,
+    list_item_quotes,
+    prune_documents,
+    upsert_documents,
+    write_intel_quote_state,
+    write_intel_quotes,
+)

@@ -99,6 +99,14 @@ def intel_item_out(row: AiIntelItem) -> dict:
         "verdictTs": int(getattr(row, "verdict_ts", 0) or 0),
         "verdictNote": getattr(row, "verdict_note", "") or "",
         "verifyCount": int(getattr(row, "verify_count", 0) or 0),
+        # ---- ai-trade-intel-evidence-grounding §5.3.1 R-a：**读出通路的第一跳** ----
+        # 漏了这四个键，前端恒收不到 ⇒ 卡片恒渲染「无引证」、轴 C 的入口**永远不出现**；而只断言
+        # 「库里有引文行」的端到端用例照样全绿。`quoteState` 必须由后端下发（前端手里没有任何
+        # 能区分「模式关 / 没抓到正文 / 模型没给 / 给了没比中」的信息）。
+        "quoted": bool(getattr(row, "quoted", False)),
+        "quoteCount": int(getattr(row, "quote_count", 0) or 0),
+        "quoteState": getattr(row, "quote_state", "") or "",
+        "scheduleResolvedTs": int(getattr(row, "schedule_resolved_ts", 0) or 0),
     }
 
 
@@ -125,6 +133,13 @@ def intel_round_out(row: AiIntelRound) -> dict:
         "outputTokens": int(row.llm_output_tokens or 0),
         "degradeCode": row.degrade_code or "",
         "errorText": row.error_text or "",
+        # ---- ai-trade-intel-evidence-grounding §5.3.1 R-d：round wire 的**唯一**装配点 ----
+        # 漏了这四个键，轮次页签的两列恒 `0/0`、命中率徽标恒 0 ⇒ 把 `quote_mode` 翻到 strict 的
+        # 运维判据**永远达不成**，而它是 R-4 唯一的缓解手段。
+        "readerAttempt": int(getattr(row, "reader_attempt", 0) or 0),
+        "readerOk": int(getattr(row, "reader_ok", 0) or 0),
+        "quotesProposed": int(getattr(row, "quotes_proposed", 0) or 0),
+        "quotesVerified": int(getattr(row, "quotes_verified", 0) or 0),
     }
 
 
@@ -471,10 +486,18 @@ async def patch_intel_item(session: AsyncSession, item_id: int, patch: dict, *,
 
 async def delete_intel_item(session: AsyncSession, item_id: int, *,
                             commit: bool = True) -> bool:
-    """物理删除（**唯一**的硬删路径；自动清理一律走软删 `archived`）。"""
+    """物理删除（**唯一**的硬删路径；自动清理一律走软删 `archived`）。
+
+    ai-trade-intel-evidence-grounding §3.3.1：**删条目必删引文**，且在**同一个事务**里。
+    本仓库的 SQLite 表一律不建外键，少了这一句会留下一堆没有宿主的证据行——它们在任何界面上
+    都不可见，只会让 `ai_intel_quotes` 无限长。
+    """
+    from .ai_intel_evidence_repositories import delete_item_quotes   # 同层复用，避免第二份口径
+
     row = await session.get(AiIntelItem, int(item_id))
     if row is None:
         return False
+    await delete_item_quotes(session, int(item_id), commit=False)
     await session.delete(row)
     if commit:
         await session.commit()
@@ -584,7 +607,14 @@ async def write_intel_round(session: AsyncSession, payload: dict, *,
         llm_input_tokens=int(payload.get("inputTokens") or 0),
         llm_output_tokens=int(payload.get("outputTokens") or 0),
         degrade_code=(payload.get("degradeCode") or "")[:24],
-        error_text=(payload.get("errorText") or "")[:400])
+        error_text=(payload.get("errorText") or "")[:400],
+        # ---- ai-trade-intel-evidence-grounding §5.3：四个抓取 / 引文计数 ----
+        # 本函数是**逐列手抄**的 payload 映射：新列不在这里加一行赋值，落库恒为 0 且不报错
+        # （`append_live_trade` 逐列手抄的同形坑）。读点在 `intel_round_out`。
+        reader_attempt=int(payload.get("readerAttempt") or 0),
+        reader_ok=int(payload.get("readerOk") or 0),
+        quotes_proposed=int(payload.get("quotesProposed") or 0),
+        quotes_verified=int(payload.get("quotesVerified") or 0))
     session.add(row)
     if commit:
         await session.commit()

@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai_auto import get_ai_trade_manager
+from ..ai_auto.intel import corpus as intel_corpus
 from ..ai_auto.intel import gate as intel_gate
 from ..ai_auto.intel import runtime as intel_runtime
 from ..ai_auto.intel import scheduler as intel_scheduler
@@ -44,6 +45,7 @@ from .schemas_intel_closed_loop import (
     IntelQueuedOut,
     IntelSourceListOut,
 )
+from .schemas_intel_evidence import IntelDocumentHealthOut, IntelEvidenceOut
 
 router = APIRouter(tags=["ai-intel"])
 
@@ -214,6 +216,47 @@ async def read_intel_provider_health(
         "degraded": sum(1 for row in rounds if row.get("status") == "degraded"),
         "breakerRemainingS": breaker_left,
     }
+
+
+# ---------------- 轴 C：证据可读（evidence-grounding §4.1 N-1 / N-2） ----------------
+# ⚠️ `/intel/documents/health` 是**字面量路径**，必须声明在 `/intel/{instId}` 之前：FastAPI 按
+# 注册顺序匹配，排在后面会被 `{instId}` 吃掉（`instId="documents"`），症状是一次 500 而不是 404。
+@router.get("/intel/documents/health", response_model=IntelDocumentHealthOut)
+async def read_intel_document_health(
+        session: AsyncSession = Depends(get_session),
+        settings: Settings = Depends(get_settings)) -> dict:
+    """正文缓存的只读读数（设置卡「原文缓存」那一行）。
+
+    `readerEnabled` 取**运行时真正会读到的那一份**（库内行叠加到 `Settings` 之后），与设置卡
+    上那个开关同源——两处各读一份的后果是「关掉了但这一行还说开着」。
+    """
+    derived = await intel_service.resolve_intel_settings(session, settings)
+    health = await repo.document_health(session)
+    return {**health,
+            "readerEnabled": bool(getattr(derived, "ai_trade_intel_reader_enabled", True))}
+
+
+@router.get("/intel/items/{itemId}/evidence", response_model=IntelEvidenceOut)
+async def read_intel_evidence(itemId: int,
+                              session: AsyncSession = Depends(get_session),
+                              settings: Settings = Depends(get_settings)) -> dict:
+    """一条情报的全部原文引证 + 它那几个来源当前的缓存状态（证据抽屉的**唯一**读点）。
+
+    **不设总闸**：读自己库里的证据不动任何资金（与 `GET /intel/{instId}` 同一条纪律）。
+    条目不存在 ⇒ 404；**无引文 ⇒ 200 + 空数组**（不是 404——「这条没有引证」是一个正常状态，
+    把它做成 404 会让前端把一次正常展开画成一次请求失败）。
+    """
+    item = await repo.get_intel_item(session, itemId)
+    if item is None:
+        raise HTTPException(404, detail={"code": "intel_item_not_found",
+                                         "message": f"情报 #{itemId} 不存在"})
+    derived = await intel_service.resolve_intel_settings(session, settings)
+    keys = [intel_corpus.document_key(str(source.get("url") or ""))
+            for source in (item.get("sources") or []) if source.get("url")]
+    return {"itemId": int(itemId),
+            "quoteMode": tax.resolve_quote_mode(derived),
+            "quotes": await repo.list_item_quotes(session, itemId),
+            "docs": await repo.list_documents_for_urls(session, keys)}
 
 
 @router.get("/intel/{instId}/sources", response_model=IntelSourceListOut)

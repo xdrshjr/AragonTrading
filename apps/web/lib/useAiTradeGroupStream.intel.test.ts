@@ -32,6 +32,7 @@ function summary(over: Partial<AiTradeIntelSummary> = {}): AiTradeIntelSummary {
     citations: { cited: 12, entryCited: 5, settledTrips: 4, winCount: 3, netPnlUsd: 18.4,
       neverCited: 7 },
     verify: { confirmed: 2, refuted: 1, unresolved: 3, pending: 9, lastVerifyTs: 1_700_000 },
+    quoteHitRate: null,
     ...over,
   };
 }

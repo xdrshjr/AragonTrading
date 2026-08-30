@@ -4,7 +4,7 @@
 """
 from __future__ import annotations
 
-from app.ai_auto.intel import gate
+from app.ai_auto.intel import cleanup, gate
 from app.ai_auto.intel.corpus import Corpus, CorpusDoc
 from app.ai_auto.intel.taxonomy import IntelLimits
 
@@ -290,14 +290,14 @@ def test_cleanup_expires_ttl_but_spares_protected_items():
     items = [_item(item_id=1, expires_ts=NOW - 1),
              _item(item_id=2, expires_ts=NOW - 1, pinned=True),
              _item(item_id=3, expires_ts=NOW - 1, user_edited=True)]
-    plan = gate.plan_cleanup(items, limits=LIMITS, now=NOW, blocked_domains=frozenset())
+    plan = cleanup.plan_cleanup(items, limits=LIMITS, now=NOW, blocked_domains=frozenset())
     assert plan.expire_ids == (1,)
 
 
 def test_cleanup_evicts_overflow_by_lowest_score():
     limits = IntelLimits(max_active={"ultra": 2, "mid": 24, "long": 16})
     items = [_item(item_id=i, confidence=0.1 * i, expires_ts=NOW + 999) for i in (1, 2, 3)]
-    plan = gate.plan_cleanup(items, limits=limits, now=NOW, blocked_domains=frozenset())
+    plan = cleanup.plan_cleanup(items, limits=limits, now=NOW, blocked_domains=frozenset())
     assert plan.overflow_ids == (1,), "淘汰的必须是 score 最低的那一条"
 
 
@@ -305,7 +305,7 @@ def test_cleanup_demotes_lapsed_scheduled_event():
     """评审 P0-1：没有这一步，「永远的明天」会堆成一排再也不会发生的预告。"""
     lapsed = _item(item_id=5, tier="mid", is_scheduled=True, event_ts=NOW - 2 * 86400,
                    updated_ts=NOW - 3 * 86400, expires_ts=NOW + 99999)
-    plan = gate.plan_cleanup([lapsed], limits=LIMITS, now=NOW, blocked_domains=frozenset())
+    plan = cleanup.plan_cleanup([lapsed], limits=LIMITS, now=NOW, blocked_domains=frozenset())
     assert len(plan.lapsed) == 1
     assert plan.lapsed[0].action == "demote"
     assert plan.lapsed[0].to_tier == "ultra"
@@ -362,8 +362,8 @@ def test_overflow_eviction_actually_reads_the_bonus():
     weak_but_cited = _cited(1, entries=9, net=10.0, confidence=0.10, expires_ts=NOW + 999)
     strong_but_uncited = _item(item_id=2, confidence=0.40, expires_ts=NOW + 999)
 
-    plan = gate.plan_cleanup([weak_but_cited, strong_but_uncited], limits=limits, now=NOW,
-                             blocked_domains=frozenset())
+    plan = cleanup.plan_cleanup([weak_but_cited, strong_but_uncited], limits=limits, now=NOW,
+                                blocked_domains=frozenset())
 
     assert plan.overflow_ids == (2,), "加分没进溢出淘汰这一路 ⇒ 被淘汰的会是被引用过的那条"
 
@@ -373,7 +373,7 @@ def test_plan_cleanup_requires_blocked_domains_explicitly():
     import pytest
 
     with pytest.raises(TypeError):
-        gate.plan_cleanup([], limits=LIMITS, now=NOW)
+        cleanup.plan_cleanup([], limits=LIMITS, now=NOW)
 
 
 def test_blocked_sweep_only_takes_items_whose_every_source_is_blocked():
@@ -385,8 +385,8 @@ def test_blocked_sweep_only_takes_items_whose_every_source_is_blocked():
     protected = _item(item_id=3, sources=(dirty,), pinned=True, expires_ts=NOW + 999)
     sourceless = _item(item_id=4, sources=(), expires_ts=NOW + 999)
 
-    plan = gate.plan_cleanup([all_bad, mixed, protected, sourceless], limits=LIMITS, now=NOW,
-                             blocked_domains=frozenset({"bad.example"}))
+    plan = cleanup.plan_cleanup([all_bad, mixed, protected, sourceless], limits=LIMITS, now=NOW,
+                                blocked_domains=frozenset({"bad.example"}))
 
     assert plan.blocked_ids == (1,)
     assert plan.counts["blocked_sweep"] == 1, "漏了这一键，actions_json 里那个数永远是 0"

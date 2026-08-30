@@ -4,9 +4,10 @@
 SQLite 是单写者——一个横跨 60 秒 LLM 调用的写事务会把**全库**其它写入（成交落库、run metrics、
 经验层物化）一起阻塞数十秒。落地形态：
 
-- 采集轮：步骤 1 开一个**只读**短会话取 watch 行与库存后立即关闭；步骤 2–7 全程**无会话**
-  （检索与 LLM 都在这一段）；步骤 8–9 再开一个写会话，`upsert_items` + `write_round` +
-  `bump_watch` **一次提交**。
+- 采集轮：步骤 ① 开一个**只读**短会话取 watch 行与库存后立即关闭；步骤 ②–⑦ **不持有跨网络
+  `await` 的会话**（检索、抓取与 LLM 都在这一段；③·5 的两个**毫秒级**短会话开在两次网络
+  `await` 之间）；步骤 ⑧–⑨ 再开一个写会话，`upsert_items` + `write_quotes` +
+  `write_quote_state` + `write_round` + `bump_watch` **一次提交**。
 - 整理轮：取快照用只读短会话；LLM 全程无会话；复核 → 执行 → 确定性清理 → 写轮在一个写会话内
   一次提交。§3.4.4 那句「在模型动作执行之后、事务提交之前」描述的是**写会话内部**的次序，
   不是「事务从轮开始就开着」。
@@ -16,6 +17,7 @@ SQLite 是单写者——一个横跨 60 秒 LLM 调用的写事务会把**全�
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import random
@@ -24,8 +26,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ...db import repositories as repo
+from . import cleanup as cleanup_mod
 from . import corpus as corpus_mod
 from . import gate, prompts
+from . import evidence as evidence_mod
+from . import quotes as quotes_mod
 from . import taxonomy as tax
 from .agent import run_round
 from .disclosure import build_digest
@@ -128,7 +133,14 @@ def item_from_wire(wire: dict) -> IntelItem:
         verdict=wire.get("verdict", "") or "",
         verdict_ts=int(wire.get("verdictTs") or 0),
         verdict_note=wire.get("verdictNote", "") or "",
-        verify_count=int(wire.get("verifyCount") or 0))
+        verify_count=int(wire.get("verifyCount") or 0),
+        # ---- evidence-grounding §5.3.1 R-b：**读出通路的第二跳** ----
+        # 漏了 `scheduleResolvedTs` 这一行，`plan_cleanup` 的新判据 `schedule_resolved_ts == 0`
+        # **恒真** ⇒ F-1 从「被核查过就永不降层」翻成「兑现了也照样降层」，方向相反、同样静默。
+        quoted=bool(wire.get("quoted")),
+        quote_count=int(wire.get("quoteCount") or 0),
+        quote_state=wire.get("quoteState", "") or "",
+        schedule_resolved_ts=int(wire.get("scheduleResolvedTs") or 0))
 
 
 def item_to_payload(item: IntelItem, *, group_id: str = "", round_id: int = 0) -> dict:
@@ -165,6 +177,10 @@ class IntelDeps:
     # ``None`` ⇒ **回落 `llm`**（用采集轮的预算跑，而不是报错——一个因为预算装配没做好就整轮
     # 不跑的核查层，比一个预算稍大的核查层坏得多）。
     verify_llm: object | None = None
+    # evidence-grounding 轴 A：**只持配置**的抓取器（`ReaderConfig` 是 frozen dataclass，
+    # `httpx.AsyncClient` 在 `fetch_many` 内部 `async with` 建与关）。``None`` ⇒ **不抓、不报错**，
+    # 语料块逐字节回到本轮合入前。这也是「不新增关停步骤」唯一能成立的前提。
+    reader: object | None = None
     group_id: str = ""
     bar: str = "15m"
     change_24h_pct: Callable[[str], float | None] | None = None
@@ -236,12 +252,15 @@ async def run_collect_round(deps: IntelDeps, inst_id: str, *,
         change_24h_pct=deps.change_24h_pct(inst_id) if deps.change_24h_pct else None,
         existing_headlines=headlines)
 
-    # ②–⑦ 全程**无会话**：检索与 LLM 都在这一段。
+    # ②–⑦ 本段**不持有跨网络 `await` 的会话**（不变式 I-4）：检索、抓取与 LLM 都在这一段，
+    # 而 ③·5 的两个毫秒级短会话开在两次网络 `await` **之间**。
     queries = corpus_mod.plan_queries(ctx, count=int(deps.settings.ai_trade_intel_queries_per_round))
     built, failed = await _gather_corpus(deps, inst_id, ctx, blocked=blocked, queries=queries,
                                          started=started, trusted=trusted)
     if built is None:
         return failed
+    # ③·5 / ③·6：抓正文 → 挂进语料（**整体重建** docs / block / index）。
+    built, reader_counts = await evidence_mod.attach_document_bodies(deps, ctx, built)
     result = await run_round(
         deps.llm,
         system=prompts.build_collect_system_prompt(ctx, deps.limits),
@@ -253,12 +272,16 @@ async def run_collect_round(deps: IntelDeps, inst_id: str, *,
     if result.degrade:
         return await finish_degraded(deps, inst_id, kind="collect", started=started,
                                      code=result.degrade, status="degraded", queries=queries,
-                                     doc_count=len(built.docs), corpus=built, usage=result)
-    admitted = gate.admit(list(result.raw.get("items") or []), built, existing,
+                                     doc_count=len(built.docs), corpus=built, usage=result,
+                                     reader_counts=reader_counts)
+    proposals = list(result.raw.get("items") or [])
+    admitted = gate.admit(proposals, built, existing,
                           inst_id=inst_id, limits=deps.limits, now=now,
                           trusted_domains=trusted)
     return await _persist_collect(deps, inst_id, started=started, queries=queries,
-                                  corpus=built, admitted=admitted, usage=result)
+                                  corpus=built, admitted=admitted, usage=result,
+                                  reader_counts=reader_counts,
+                                  quotes_proposed=quotes_mod.count_proposed(proposals))
 
 
 async def _gather_corpus(deps: IntelDeps, inst_id: str, ctx, *, blocked, queries: list[str],
@@ -290,10 +313,12 @@ async def _gather_corpus(deps: IntelDeps, inst_id: str, ctx, *, blocked, queries
 
 
 async def _persist_collect(deps: IntelDeps, inst_id: str, *, started: int,
-                           queries: list[str], corpus, admitted, usage) -> RoundOutcome:
-    """采集轮的步骤 ⑧–⑨：落条目 + 落轮 + 推节律，**一次提交**（不变式 I-4 的写段）。"""
+                           queries: list[str], corpus, admitted, usage,
+                           reader_counts: dict, quotes_proposed: int) -> RoundOutcome:
+    """采集轮的步骤 ⑧–⑨：落条目 + 落引文 + 落轮 + 推节律，**一次提交**（不变式 I-4 的写段）。"""
     status = "ok" if (admitted.accepted or admitted.merges) else "degraded"
     degrade_code = "" if status == "ok" else "all_rejected"
+    verified_total = sum(len(v) for v in admitted.quotes.values())
     async with deps.sessionmaker()() as db:
         round_id = await repo.write_intel_round(db, {
             "instId": inst_id, "kind": "collect", "groupId": deps.group_id,
@@ -303,9 +328,16 @@ async def _persist_collect(deps: IntelDeps, inst_id: str, *, started: int,
             "accepted": len(admitted.accepted), "rejected": admitted.total_rejected,
             "merged": len(admitted.merges), "rejects": admitted.rejects,
             "inputTokens": usage.input_tokens, "outputTokens": usage.output_tokens,
-            "degradeCode": degrade_code}, commit=False)
+            "degradeCode": degrade_code,
+            "readerAttempt": int(reader_counts.get("readerAttempt", 0)),
+            "readerOk": int(reader_counts.get("readerOk", 0)),
+            "quotesProposed": int(quotes_proposed),
+            "quotesVerified": verified_total}, commit=False)
+        item_ids: list[int] = []
         if admitted.accepted:
-            await repo.upsert_intel_items(
+            # ★ 必须**接住**返回值：它是 accepted 的引文找到自己 `item_id` 的唯一途径
+            # （`upsert_intel_items` 按入参顺序返回）。
+            item_ids = await repo.upsert_intel_items(
                 db, [item_to_payload(it, group_id=deps.group_id, round_id=round_id)
                      for it in admitted.accepted], commit=False)
         for merge in admitted.merges:
@@ -316,6 +348,10 @@ async def _persist_collect(deps: IntelDeps, inst_id: str, *, started: int,
                          for s in merge.sources],
                 domain_count=merge.domain_count, expires_ts=merge.expires_ts,
                 revive=merge.revive, updated_ts=merge.updated_ts, commit=False)
+        quote_rows, states = evidence_mod.plan_quote_writes(
+            inst_id, round_id, admitted, item_ids, now=int(deps.now()))
+        await repo.write_intel_quotes(db, quote_rows, commit=False)
+        await repo.write_intel_quote_state(db, states, commit=False)
         await repo.bump_intel_watch(
             db, inst_id, kind="collect", status=status,
             next_due_ts=next_due_for(deps, fail_streak=0), commit=False)
@@ -370,8 +406,9 @@ async def run_curate_round(deps: IntelDeps, inst_id: str) -> RoundOutcome:
     sweep_on = bool(getattr(deps.settings, "ai_trade_intel_blocked_sweep_enabled", True))
     # §3.4.4：确定性清理跑在**模型动作执行之后**。用动作前的快照算清理计划会让一条刚被升进中期
     # 的情报仍然按超短层参与溢出淘汰——那正是「算了却算错了对象」的形状。
-    plan = gate.plan_cleanup(_after_actions(live, actions), limits=deps.limits, now=now,
-                             blocked_domains=(blocked if sweep_on else frozenset()))
+    plan = cleanup_mod.plan_cleanup(_after_actions(live, actions), limits=deps.limits,
+                                    now=now,
+                                    blocked_domains=(blocked if sweep_on else frozenset()))
     counts: dict[str, int] = dict(review.counts) if review else {}
     rejects = dict(review.rejects) if review else {}
     return await _persist_curate(deps, inst_id, started=started, actions=actions, plan=plan,
@@ -413,6 +450,11 @@ async def _persist_curate(deps: IntelDeps, inst_id: str, *, started: int, action
             histogram["applied_lapsed"] = sum(lapsed.values())
         if pruned:
             histogram["citations_pruned"] = pruned
+        # evidence-grounding §3.1.4 第 6 步：正文缓存的三道闸（TTL / 行数 / 字节）。
+        # **只删缓存，绝不动引文**——引文自带原文副本，它必须比缓存活得久。
+        docs_pruned = await _prune_documents(deps, db, now=started)
+        if docs_pruned:
+            histogram["documents_pruned"] = docs_pruned
         status = "degraded" if degrade_code else "ok"
         await repo.write_intel_round(db, {
             "instId": inst_id, "kind": "curate", "groupId": deps.group_id,
@@ -424,6 +466,23 @@ async def _persist_curate(deps: IntelDeps, inst_id: str, *, started: int, action
                                     curate_reset=True, commit=False)
         await db.commit()
     return RoundOutcome(inst_id, "curate", status, degrade_code, actions=histogram)
+
+
+async def _prune_documents(deps: IntelDeps, db, *, now: int) -> int:
+    """跑一遍正文缓存的三道闸；返回删掉的总行数。**绝不阻断整理轮**（不变式 I-2）。"""
+    ttl_h = float(getattr(deps.settings, "ai_trade_intel_reader_cache_ttl_h", 72.0))
+    max_rows = int(getattr(deps.settings, "ai_trade_intel_reader_cache_max_rows", 4000))
+    body_max = int(getattr(deps.settings, "ai_trade_intel_reader_body_max_chars", 20_000))
+    try:
+        counts = await repo.prune_documents(db, now=now, ttl_s=ttl_h * 3600.0,
+                                            max_rows=max_rows,
+                                            max_bytes=max_rows * body_max, commit=False)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:      # noqa: BLE001 —— 缓存清理是加法，失败只放弃这一次
+        logger.warning("ai-trade intel document prune failed: %s", exc)
+        return 0
+    return sum(counts.values())
 
 
 def _after_actions(items: list[IntelItem], actions) -> list[IntelItem]:
@@ -491,7 +550,8 @@ def next_due_for(deps: IntelDeps, *, fail_streak: int) -> int:
 async def finish_degraded(deps: IntelDeps, inst_id: str, *, kind: str, started: int,
                           code: str, status: str, error: str = "",
                           queries: list[str] | None = None, doc_count: int = 0,
-                          corpus=None, usage=None) -> RoundOutcome:
+                          corpus=None, usage=None,
+                          reader_counts: dict | None = None) -> RoundOutcome:
     """把一条失败路径落成「一行 round 存根 + 一次退避」。
 
     **公开名**（closed-loop）：`service_verify.run_verify_round` 的五条降级路径也走它。同包里
@@ -511,7 +571,11 @@ async def finish_degraded(deps: IntelDeps, inst_id: str, *, kind: str, started: 
             "domainCount": corpus.domain_count if corpus else 0,
             "inputTokens": usage.input_tokens if usage else 0,
             "outputTokens": usage.output_tokens if usage else 0,
-            "degradeCode": code, "errorText": error}, commit=False)
+            "degradeCode": code, "errorText": error,
+            # evidence-grounding：一次在 LLM 阶段失败的轮，抓取成本**照样已经花掉了**。
+            # 不记它，命中率的分母会随降级系统性变小（带默认值 ⇒ 既有全部调用点零改动）。
+            "readerAttempt": int((reader_counts or {}).get("readerAttempt", 0)),
+            "readerOk": int((reader_counts or {}).get("readerOk", 0))}, commit=False)
         cooldown = 0
         if code == "circuit_open" and deps.search is not None:
             cooldown = int(deps.now()) + deps.search.breaker.remaining_s()
@@ -561,6 +625,9 @@ async def read_summary(db, inst_id: str, *, settings, provider_configured: bool,
         db, inst_id, last_seen_ts=int(watch.get("lastSeenTs") or 0))
     impact = await repo.read_intel_impact(db, inst_id, limit=1)
     verdicts = await repo.count_intel_verdicts(db, inst_id)
+    # evidence-grounding 评审 P1-13：`quoteHitRate` 就在**这一个只读会话**里求出。写在
+    # `build_snapshot` 里要么多开一个会话，要么走进「同步路径造不出一个 DB 派生键」那个坑。
+    quote_stats = await repo.count_recent_quote_stats(db, inst_id)
     return {
         "instId": inst_id,
         "counts": {"ultra": counts["ultra"], "mid": counts["mid"], "long": counts["long"],
@@ -592,6 +659,9 @@ async def read_summary(db, inst_id: str, *, settings, provider_configured: bool,
             "pending": int(verdicts.get("pending", 0)),
             "lastVerifyTs": int(watch.get("lastVerifyTs") or 0) or None,
         },
+        # 近 20 轮 `quotesVerified / quotesProposed`。**分母 0 ⇒ `None` 而不是 0**：
+        # 「没提过引文」与「提了全没中」在设置卡上是两句不同的话。
+        "quoteHitRate": quote_stats["hitRate"],
     }
 
 
@@ -651,6 +721,11 @@ INTEL_SETTING_BRIDGE: tuple[tuple[str, str, str, type], ...] = (
     ("blockedSweepEnabled", "ai_intel.blocked_sweep",
      "ai_trade_intel_blocked_sweep_enabled", bool),
     ("citeMaxRefs", "ai_intel.cite_max_refs", "ai_trade_intel_cite_max_refs", int),
+    # ---- evidence-grounding：轴 A / 轴 B 的三把单键。**不扩这张表 ⇒ 假面板**（E-14）：
+    # 请求 200、开关照动、`Settings` 上的值永远不变，而且不报错。
+    ("readerEnabled", "ai_intel.reader_enabled", "ai_trade_intel_reader_enabled", bool),
+    ("readerTopK", "ai_intel.reader_top_k", "ai_trade_intel_reader_top_k", int),
+    ("quoteMode", "ai_intel.quote_mode", "ai_trade_intel_quote_mode", str),
 )
 # 密钥的 app_settings 键。**绝不出接口**（`GET /settings/intel` 只回 `hasKey` / `keyPreview`）、
 # **绝不进日志**（`IntelSearchError` 构造时即脱敏）。
@@ -670,9 +745,15 @@ async def resolve_intel_settings(session, settings):
         if stored is None:
             continue
         try:
-            updates[field_name] = bool(stored) if caster is bool else caster(stored)
+            value = bool(stored) if caster is bool else caster(stored)
         except (TypeError, ValueError):
             continue
+        # ⚠️ `settings.model_copy(update=…)` **不做校验**（评审 P2-9）：一个从库内行读回来的坏值
+        # 会绕过 pydantic 的 `Literal`。故在这里再收一次值域，不在集合内即跳过该键——与上面那条
+        # `except: continue` 同形（「读不出来就当没配过」）。
+        if field_name == "ai_trade_intel_quote_mode" and value not in tax.QUOTE_MODES:
+            continue
+        updates[field_name] = value
     stored_key = await repo.get_app_setting(session, INTEL_API_KEY_APP_KEY, None)
     if isinstance(stored_key, str) and stored_key:
         updates["ai_trade_intel_search_api_key"] = stored_key

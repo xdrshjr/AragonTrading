@@ -16,8 +16,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..ai_auto import get_ai_trade_manager
 from ..ai_auto.experience.disclosure import budget_floor
 from ..ai_auto.experience.service import resolve_experience_settings, setting_bridge
+from ..ai_auto.intel import runtime as intel_runtime
 from ..ai_auto.intel import search as intel_search
 from ..ai_auto.intel import service as intel_service
+from ..ai_auto.intel import taxonomy as intel_tax
 from ..config import Settings, get_settings
 from ..db import repositories as repo
 from ..db.session import get_session
@@ -125,6 +127,21 @@ async def update_experience_settings(body: ExperienceSettingsIn,
 _ESTIMATE_FALLBACK_SYMBOLS = 5
 
 
+async def _intel_quote_hit_rate(session: AsyncSession) -> float | None:
+    """设置卡上那一行命中率：**第一个真的有读数的成员**。
+
+    Returns:
+        近 20 轮的 `quotesVerified / quotesProposed`；没有已装配的分组、或每一个成员的分母都是 0
+        ⇒ ``None``（「没提过引文」与「提了全没中」是两句不同的话，不显示一个假的 0）。
+    """
+    for runtime in intel_runtime.all_runtimes():
+        for member in runtime.members:
+            stats = await repo.count_recent_quote_stats(session, member)
+            if stats["hitRate"] is not None:
+                return stats["hitRate"]
+    return None
+
+
 async def _intel_wire(session: AsyncSession, settings: Settings) -> dict:
     """把**运行时真正会读到的那一份**设置渲染成面板回执。
 
@@ -170,6 +187,15 @@ async def _intel_wire(session: AsyncSession, settings: Settings) -> dict:
         "verifyDocsPerItem": int(derived.ai_trade_intel_verify_docs_per_item),
         "blockedSweepEnabled": bool(derived.ai_trade_intel_blocked_sweep_enabled),
         "citeMaxRefs": int(derived.ai_trade_intel_cite_max_refs),
+        # ---- evidence-grounding：轴 A / 轴 B 的三把单键 + 命中率的**生效值**回读 ----
+        "readerEnabled": bool(derived.ai_trade_intel_reader_enabled),
+        "readerTopK": int(derived.ai_trade_intel_reader_top_k),
+        "quoteMode": intel_tax.resolve_quote_mode(derived),
+        # 命中率取**第一个真的有读数的成员**：它是一个「这台机器最近抓得怎么样」的量级读数，
+        # 不是某个标的的属性。跳过 `None` 的那些（而不是取字面意义上的第一个成员）是因为
+        # 「这个标的还没提过引文」不该把整张卡上的读数吃掉；一个都没有时才留 `None`
+        # （绝不显示一个假的 0）。
+        "quoteHitRate": await _intel_quote_hit_rate(session),
     }
 
 

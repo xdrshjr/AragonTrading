@@ -48,6 +48,9 @@ def _static_summary(inst_id: str, *, code: str) -> dict:
                       "netPnlUsd": 0.0, "neverCited": 0},
         "verify": {"confirmed": 0, "refuted": 0, "unresolved": 0, "pending": 0,
                    "lastVerifyTs": None},
+        # evidence-grounding §4.2：静态 summary 上也必须**在位**（形状一致），否则未装配的分组会
+        # 让前端读到 `undefined`。`None` = 分母 0（「没提过引文」），与 0（「提了全没中」）分开。
+        "quoteHitRate": None,
     }
 
 
@@ -278,6 +281,7 @@ async def build_group_runtime(*, group_id: str, members: Iterable[str], settings
         `IntelRuntime`。总闸关 / 未配置检索源 ⇒ `enabled=False` 的**壳**（不起任务、不查库，
         但仍持一份静态降级 summary，使 `no_provider` 在界面上可见——评审 P1-3）。
     """
+    from . import evidence
     from . import search as search_mod
     from .llm import build_intel_llm_client
 
@@ -315,9 +319,12 @@ async def build_group_runtime(*, group_id: str, members: Iterable[str], settings
         logger.warning("ai-trade intel: 核查轮 client 装配失败，回落采集轮预算（%s）: %s",
                        group_id, exc)
         verify_llm = None
+    # evidence-grounding 轴 A：抓取器**只持配置**（frozen dataclass），`httpx.AsyncClient` 在
+    # `fetch_many` 内部 `async with` 建与关。`proxy` 复用进程代理（E-15），**不新增配置项**；
+    # 关掉 `reader_enabled` ⇒ `fetch_many` 一个请求都不发、语料块逐字节回到上一轮。
     deps = IntelDeps(settings=derived, sessionmaker=sessionmaker, search=runner,
                      llm=build_intel_llm_client(provider_cfg, derived,
                                                 make_client=make_client),
-                     verify_llm=verify_llm,
+                     verify_llm=verify_llm, reader=evidence.reader_config(derived),
                      group_id=group_id, bar=bar, change_24h_pct=change_24h_pct)
     return IntelRuntime(group_id, members, deps, notify=notify, enabled=True)

@@ -85,6 +85,16 @@ REJECT_CODES: tuple[str, ...] = (
     "bad_field",          # 闸①前置：类别 / 方向 / 影响力不在值域内
     "imperative_text",    # 闸⑥：摘要含祈使 / 角色设定 / 元指令（评审 P1-4）
     "over_cap",           # 过闸后按 score 截断到每轮上限（评审 P2-5）
+    # ---- ai-trade-intel-evidence-grounding 闸⑦：逐字引文（§3.2.6）----
+    # ⚠️ 这七个码必须与前端 `IntelRoundsTab.tsx` 的 `CODE_LABEL` 逐个对齐（G-24 做并集断言）。
+    # 漏登记不报错，症状是用户在轮次页签上看到一个裸码。
+    "quote_bad_ref",        # 引文指向了本条没声明为来源的文档
+    "quote_too_short",      # 归一后短于 `quote_min_chars`
+    "quote_not_found",      # body / snippet / title 三个字段都没逐字命中
+    "quote_over_cap",       # 单条情报的引文数超上限，多余的丢弃（不丢整条）
+    "quote_span_too_wide",  # 回切后的原文跨度超上限 ⇒ **丢弃并计数**，绝不静默截断
+    "no_verified_quote",    # 仅 strict：一条可核对的原文引证都没有
+    "quote_orphan_dropped",  # 引文所属条目被合并 / 同轮同题 / over_cap ⇒ 无宿主，不落库
 )
 MERGE_CODES: tuple[str, ...] = ("dup", "revived")   # 闸⑤ 的两个分支：合并 / 复活
 REVIEW_REJECT_CODES: tuple[str, ...] = (
@@ -97,6 +107,8 @@ REVIEW_REJECT_CODES: tuple[str, ...] = (
     "unknown_item",
     "bad_action",
     "truncated_actions",
+    # evidence-grounding §3.2.4：仅 strict —— 升长期额外要求一条可核对的原文引证。
+    "need_quote",
 )
 
 # 拒收码的**中文文案不在后端**：轮存根里落的是直方图（码 → 条数），文案在展示层
@@ -253,6 +265,21 @@ class IntelLimits:
     verify_confirm_bonus: float = 0.05    # `confirmed` 的置信度加成（封顶仍是 1.0）
     verify_refute_penalty: float = 0.5    # `refuted` 的置信度乘数
     trust_bonus: float = 0.05             # `trust` 域名的置信度先验（**绝不加 domain_count**）
+    # ---- ai-trade-intel-evidence-grounding 的六个新阈值 ----
+    # `quote_mode` 是轴 B 的三态单键：`off` ⇒ 工具 schema **对象恒等**回退、闸② haystack 逐字节
+    # 回退；`soft`（默认）⇒ 只加不减（haystack 变大、无引文照常入库）；`strict` ⇒ 真正的收紧。
+    quote_mode: str = "soft"
+    # 下面四个是**纯核心阈值**，刻意不做成配置项（它们只在拒收统计与置信度小数点后两位上有
+    # 可见后果，做成旋钮只会让 `.env` 更长而没有任何人会去调）。
+    quote_min_chars: int = 24
+    quote_max_per_item: int = 3
+    quote_bonus: float = 0.05
+    quote_span_max_chars: int = 1200
+    # 升长期是否额外要求 `quoted`（= `quote_mode == "strict"`；soft / off 下该判据**不存在**）。
+    promote_requires_quote: bool = False
+    # 单篇喂进 prompt 的正文上限。**与入库正文上限刻意不同**：prompt 要省 token，比对要全文
+    # ——一段引文可能来自文章第 8000 字，而 `verify_one` 的 haystack 取的是**长版本**。
+    body_per_doc_chars: int = 2400
 
     def __post_init__(self) -> None:
         if self.ttl_s is None:
@@ -262,8 +289,33 @@ class IntelLimits:
             object.__setattr__(self, "max_active", {"ultra": 40, "mid": 24, "long": 16})
 
 
+QUOTE_MODES: tuple[str, ...] = ("off", "soft", "strict")
+
+
+def resolve_quote_mode(settings) -> str:
+    """`Settings` → 轴 B 的三态单键的**生效值**（值域外一律回落 `soft`）。
+
+    两件事都收在这里而不是各调用点：
+
+    1. **值域**。`settings.model_copy(update=…)` **不做校验**，一个从库内行读回来的坏值可以
+       绕过 pydantic 的 `Literal`（评审 P2-9）。
+    2. **`strict` 对 reader 的依赖**。`config.py` 的启动期校验器只看得住 `.env`——而这三把单键
+       同时露在 `PUT /settings/intel` 上，两把开关各自独立地写进 `app_settings` 表，用户完全
+       可以先选 strict 再关掉抓取（或反过来）。没有正文时 strict 的准入率**系统性归零**，而它
+       在界面上与「今天真的没新闻」长得一模一样——正是启动期校验器要拦的那个坏状态，只是走了
+       另一扇门。故在**唯一**的生效值读点上把它降回 `soft`：用户存下来的偏好不动（重新打开
+       抓取即恢复 strict），而设置卡回读的是**生效值**，那个下拉框会当场退回「记录但不强制」。
+    """
+    raw = str(getattr(settings, "ai_trade_intel_quote_mode", "soft") or "soft").strip().lower()
+    mode = raw if raw in QUOTE_MODES else "soft"
+    if mode == "strict" and not bool(getattr(settings, "ai_trade_intel_reader_enabled", True)):
+        return "soft"
+    return mode
+
+
 def limits_from_settings(settings) -> IntelLimits:
     """`Settings` → `IntelLimits`（**唯一**的配置读点；纯核心从不自己读 settings）。"""
+    quote_mode = resolve_quote_mode(settings)
     return IntelLimits(
         summary_max_chars=int(settings.ai_trade_intel_summary_max_chars),
         items_per_round=int(settings.ai_trade_intel_items_per_round),
@@ -295,4 +347,11 @@ def limits_from_settings(settings) -> IntelLimits:
         verify_refute_penalty=float(
             getattr(settings, "ai_trade_intel_verify_refute_penalty", 0.5)),
         trust_bonus=float(getattr(settings, "ai_trade_intel_trust_bonus", 0.05)),
+        # evidence-grounding：三行真正来自配置的映射（其余四个新字段是纯核心阈值，走 dataclass
+        # 默认值 —— 给它们一行 `getattr` 只会造出四个没有任何写点的死读点）。
+        # `getattr` 兜底是给那些直接构造 `Settings` 替身的既有用例留的（与上面七行同源）。
+        quote_mode=quote_mode,
+        promote_requires_quote=(quote_mode == "strict"),
+        body_per_doc_chars=int(
+            getattr(settings, "ai_trade_intel_corpus_body_per_doc_chars", 2400)),
     )

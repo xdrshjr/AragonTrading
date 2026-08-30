@@ -25,8 +25,57 @@ CURATE_TOOL_DESCRIPTION = (
     "每个动作都会经服务端复核，不满足门槛的会被驳回并记录，这不是错误。")
 
 
+# ai-trade-intel-evidence-grounding §3.2.5：引文子 schema。
+# `quote_mode == "off"` 时**整个键缺席**且 schema 其余部分**对象恒等**回退到上一轮（G-2）。
+_QUOTE_ITEM_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "ref": {"type": "string", "pattern": "^D[0-9]{1,2}$",
+                "description": "这段原文出自哪一篇；必须是本条 sourceRefs 里已经写过的编号"},
+        "text": {"type": "string", "minLength": 24, "maxLength": 300,
+                 "description": "从该编号文档的**正文**里逐字复制的一段原文。不得改写、"
+                                "不得翻译、不得跨段拼接、不得省略中间部分。它会被服务端与原文"
+                                "逐字比对，比不中即作废。"},
+    },
+    "required": ["ref", "text"],
+}
+
+
+def _quotes_property(limits: IntelLimits) -> dict:
+    """引文数组的 schema 片段（采集与核查共用同一份形状）。"""
+    return {"type": "array", "minItems": 1,
+            "maxItems": max(1, int(limits.quote_max_per_item)),
+            "items": _QUOTE_ITEM_SCHEMA}
+
+
 def build_collect_tool_schema(limits: IntelLimits) -> dict:
-    """采集工具的入参 schema。**没有 `confidence` 字段**——让模型给自己的产出打分，得到的永远是 0.8。"""
+    """采集工具的入参 schema。**没有 `confidence` 字段**——让模型给自己的产出打分，得到的永远是 0.8。
+
+    `quote_mode != "off"` 时每个 item 多一个 `quotes`；`strict` 下它进 `required`。
+    `off` 下**整个键缺席**，且 schema 其余部分对象恒等回退（G-2 取 `==` 而不是 sha256——
+    schema 是 dict，字典比较对键序变化更宽容，对内容变化同样敏感）。
+    """
+    item_properties: dict = {
+        "headline": {"type": "string", "maxLength": limits.headline_max_chars,
+                     "description": "一眼可读的标题"},
+        "summary": {"type": "string", "maxLength": 400,
+                    "description": "几句话说清「发生了什么 + 为什么与本标的有关」"},
+        "category": {"type": "string", "enum": list(tax.CATEGORIES)},
+        "stance": {"type": "string", "enum": list(tax.STANCES),
+                   "description": "对该标的**价格**的方向含义"},
+        "impact": {"type": "string", "enum": list(tax.IMPACTS)},
+        "eventTs": {"type": "integer",
+                    "description": "事件发生/将发生/发布的 Unix 秒；不确定填 0"},
+        "sourceRefs": {
+            "type": "array", "minItems": 1, "maxItems": 6,
+            "items": {"type": "string", "pattern": "^D[0-9]{1,2}$"},
+            "description": "只能写本轮语料里的 D 编号，不得自己写网址"},
+    }
+    required = ["headline", "summary", "category", "stance", "impact", "sourceRefs"]
+    if limits.quote_mode != "off":
+        item_properties["quotes"] = _quotes_property(limits)
+        if limits.quote_mode == "strict":
+            required = [*required, "quotes"]
     return {
         "type": "object",
         "properties": {
@@ -35,24 +84,8 @@ def build_collect_tool_schema(limits: IntelLimits) -> dict:
                 "maxItems": 12,
                 "items": {
                     "type": "object",
-                    "properties": {
-                        "headline": {"type": "string", "maxLength": limits.headline_max_chars,
-                                     "description": "一眼可读的标题"},
-                        "summary": {"type": "string", "maxLength": 400,
-                                    "description": "几句话说清「发生了什么 + 为什么与本标的有关」"},
-                        "category": {"type": "string", "enum": list(tax.CATEGORIES)},
-                        "stance": {"type": "string", "enum": list(tax.STANCES),
-                                   "description": "对该标的**价格**的方向含义"},
-                        "impact": {"type": "string", "enum": list(tax.IMPACTS)},
-                        "eventTs": {"type": "integer",
-                                    "description": "事件发生/将发生/发布的 Unix 秒；不确定填 0"},
-                        "sourceRefs": {
-                            "type": "array", "minItems": 1, "maxItems": 6,
-                            "items": {"type": "string", "pattern": "^D[0-9]{1,2}$"},
-                            "description": "只能写本轮语料里的 D 编号，不得自己写网址"},
-                    },
-                    "required": ["headline", "summary", "category", "stance", "impact",
-                                 "sourceRefs"],
+                    "properties": item_properties,
+                    "required": required,
                 },
             },
             "note": {"type": "string", "maxLength": 200,
@@ -91,8 +124,23 @@ def build_curate_tool_schema(limits: IntelLimits) -> dict:
     }
 
 
+def _collect_quote_stage(limits: IntelLimits) -> list[str]:
+    """采集协议的**第 4.5 阶段**（取证）。`quote_mode == "off"` 时**整段缺席**（G-2）。"""
+    if limits.quote_mode == "off":
+        return []
+    closing = ("**必须**为每一条都附上引文，附不出来的条目宁可不报。"
+               if limits.quote_mode == "strict"
+               else "附不出引文的条目仍可提交，但它在库里会被标为「无引证」。")
+    return [
+        "S7.5 取证：为每一条你准备提交的情报，从它的来源文档**正文**里挑出最能支撑它的一段原文，"
+        "**逐字复制**到 quotes（不得改写、不得翻译、不得跨段拼接、不得省略中间部分）。"
+        "你写下的摘要里出现的每一个数字，都应当能在你挑的这段原文里找到。"
+        "服务端会拿它与原文逐字比对，比不中即作废。" + closing,
+    ]
+
+
 def build_collect_system_prompt(ctx: IntelContext, limits: IntelLimits) -> str:
-    """采集协议（八阶段，简体中文）。"""
+    """采集协议（八阶段 + 取证阶段，简体中文）。"""
     return "\n".join([
         "你是一名加密市场情报分析员。你**不做交易决策**，也**没有任何交易权限**。",
         f"你的唯一产出是：把下面给你的检索语料，提炼成不超过 {limits.items_per_round} 条"
@@ -109,6 +157,7 @@ def build_collect_system_prompt(ctx: IntelContext, limits: IntelLimits) -> str:
         f"（≤{limits.summary_max_chars} 字，几句话说清「发生了什么 + 为什么与本标的有关」）。",
         "S6 为每件事标方向（bullish/bearish/neutral）与影响力（low/medium/high）。",
         "S7 为每件事列出引用编号（只能写 D 开头的编号，**不得自己写网址**）。",
+        *_collect_quote_stage(limits),
         "S8 自查：摘要里出现的每一个数字，是否都能在你引用的文档里找到原文？找不到的删掉。",
         "",
         "## 硬约束",
@@ -197,6 +246,8 @@ def build_verify_tool_schema(limits: IntelLimits) -> dict:
                         "refs": {"type": "array", "maxItems": 6,
                                  "items": {"type": "string", "pattern": "^D[0-9]{1,2}$"},
                                  "description": "只能写本轮语料里的 D 编号，不得自己写网址"},
+                        **({"quotes": _quotes_property(limits)}
+                           if limits.quote_mode != "off" else {}),
                     },
                     "required": ["itemRef", "verdict", "reason"],
                 },
@@ -206,12 +257,34 @@ def build_verify_tool_schema(limits: IntelLimits) -> dict:
     }
 
 
-def build_verify_system_prompt() -> str:
-    """核查协议（五阶段，简体中文）。
+def _verify_quote_stage(limits: IntelLimits) -> list[str]:
+    """核查协议的**第 6 阶段**（取证）。`quote_mode == "off"` 时**整段缺席**。
+
+    缺席不是可选的：`off` 下 `build_verify_tool_schema` 里根本没有 `quotes` 这个属性，留着这一
+    阶段就是在协议里要求模型填一个工具签名上不存在的字段——它既拿不到任何引文，又让核查轮的
+    system prompt 无法回退到本轮合入前，而两者都不会报错。
+    """
+    if limits.quote_mode == "off":
+        return []
+    closing = ("；一条指不出原文的「已证伪」会被降为待定。"
+               if limits.quote_mode == "strict" else "。")
+    return [
+        "V6 取证：为每一条 confirmed / refuted 从它依据的那篇语料正文里**逐字复制**一段原文填进"
+        " quotes。服务端会与原文逐字比对" + closing,
+    ]
+
+
+def build_verify_system_prompt(limits: IntelLimits) -> str:
+    """核查协议（五阶段 + 取证阶段，简体中文）。
 
     角色是**核查员，不是分析师**。三条最重要的约束写死在这里：没有交易工具、不知道任何持仓与
     盈亏、「没找到反证」不是 confirmed。它们不是洁癖——一个知道「我们现在是多头」的核查员，判
     `refuted` 的门槛会不一样。
+
+    Args:
+        limits: 阈值聚合。**必填**——第 6 阶段与 `build_verify_tool_schema` 的 `quotes` 属性
+            必须由**同一个** `quote_mode` 决定；给它一个默认值，两者就能各自漂移，而漂移的形态
+            恰恰是「协议要求模型填一个 schema 里没有的字段」。
     """
     return "\n".join([
         "你是一名事实核查员。你**不做交易决策**，也**没有任何交易权限**。",
@@ -226,6 +299,7 @@ def build_verify_system_prompt() -> str:
         "V4 为每一条判定写一句 ≤120 字的理由，并列出你依据的语料编号（只能写 D 开头的编号）。",
         "V5 自查：我判 confirmed / refuted 的每一条，是不是都指着一个**具体的** D 编号？"
         "指不出来的，改成 unresolved。",
+        *_verify_quote_stage(limits),
         "",
         "## 硬约束",
         "- 你**没有**交易工具，也**不知道**任何持仓、盈亏或方向。你的唯一任务是核对事实。",

@@ -2,7 +2,12 @@
 
 import { Skeleton } from "@/components/ui";
 import { sortItems } from "@/lib/intel";
-import type { AiTradeIntelSummary, IntelItem, IntelTier } from "@/lib/intelTypes";
+import type {
+  AiTradeIntelSummary,
+  IntelEvidence,
+  IntelItem,
+  IntelTier,
+} from "@/lib/intelTypes";
 import IntelCard, { type IntelCardActions } from "./IntelCard";
 import { IntelEmptyState, type IntelEmptyKind } from "./IntelEmptyStates";
 
@@ -24,6 +29,10 @@ export default function IntelList({
   onOpenSettings,
   onCollect,
   onClearFilters,
+  evidenceById = {},
+  evidenceLoadingId = null,
+  evidenceErrors = {},
+  blockedDomains = [],
 }: {
   items: IntelItem[];
   tier: IntelTier;
@@ -39,6 +48,12 @@ export default function IntelList({
   onOpenSettings: () => void;
   onCollect: () => void;
   onClearFilters: () => void;
+  /** 弹窗持有的证据缓存（按 `itemId`）；缺键 = 还没取过 ⇒ 展开时才发那一次请求。 */
+  evidenceById?: Record<number, IntelEvidence>;
+  evidenceLoadingId?: number | null;
+  /** 读取失败的原因**按 `itemId` 存**：一个弹窗级的字符串会让 A 的失败落到 B 的抽屉上。 */
+  evidenceErrors?: Record<number, string>;
+  blockedDomains?: string[];
 }) {
   if (loading) {
     return (
@@ -72,6 +87,10 @@ export default function IntelList({
           summary={summary}
           actions={actions}
           nowMs={nowMs}
+          evidence={evidenceById[item.id]}
+          evidenceLoading={evidenceLoadingId === item.id}
+          evidenceError={evidenceErrors[item.id] ?? ""}
+          blockedDomains={blockedDomains}
         />
       ))}
     </div>

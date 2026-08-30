@@ -23,10 +23,13 @@ export default function IntelVerdictBadge({
   item,
   onClearVerdict,
   onVerifyNow,
+  verifyQuoteCount = 0,
 }: {
   item: IntelItem;
   onClearVerdict: (item: IntelItem) => void;
   onVerifyNow?: (item: IntelItem) => void;
+  /** 该条目的**核查**引文条数（evidence-grounding §3.3.3）；0 ⇒ 这一行不渲染。 */
+  verifyQuoteCount?: number;
 }) {
   const [open, setOpen] = useState(false);
   const label = verdictLabel(item.verdict);
@@ -63,6 +66,11 @@ export default function IntelVerdictBadge({
           {item.verdictTs > 0 && (
             <span className="text-[10px] text-[var(--muted)]">
               判定于 {absoluteTime(item.verdictTs)}（已核查 {item.verifyCount} 次）
+            </span>
+          )}
+          {verifyQuoteCount > 0 && (
+            <span data-testid="intel-verdict-quotes" className="text-[10px] text-[var(--muted)]">
+              有 {verifyQuoteCount} 段核查原文，展开下方「原文引证」可读
             </span>
           )}
           <span className="flex items-center gap-1.5">

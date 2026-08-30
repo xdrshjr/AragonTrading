@@ -101,3 +101,58 @@ def test_existing_headlines_live_inside_the_untrusted_block():
 def test_local_facts_line_omits_change_when_unknown():
     assert "近 24 小时涨跌" in corpus_mod.render_local_facts(_ctx())
     assert "近 24 小时涨跌" not in corpus_mod.render_local_facts(_ctx(change_24h_pct=None))
+
+
+# ---------------- evidence-grounding 轴 A：正文挂载（G-22） ----------------
+def _built(**over):
+    docs = [SearchDoc(title="Core CPI report", url="https://reuters.com/a",
+                      snippet="Core CPI above consensus.", published_ts=NOW - 3600,
+                      score=0.9),
+            SearchDoc(title="Rate cut bets", url="https://theblock.co/b",
+                      snippet="Bets pushed back.", published_ts=NOW - 7200, score=0.8)]
+    kwargs = dict(max_docs=16, snippet_max_chars=500)
+    kwargs.update(over)
+    return corpus_mod.build(docs, _ctx(), **kwargs)
+
+
+def test_canonical_url_is_public_and_document_key_follows_it():
+    """键的语义与归一函数绑在一起：改归一函数必然改键，不会出现「老缓存按旧键命中」。"""
+    assert corpus_mod.canonical_url("https://Reuters.com/A/?utm=x#frag") == \
+        "https://reuters.com/a"
+    assert corpus_mod.document_key("https://reuters.com/a") == \
+        corpus_mod.document_key("https://reuters.com/a/?utm=1")
+    assert len(corpus_mod.document_key("https://reuters.com/a")) == 40
+
+
+def test_attach_bodies_rebuilds_docs_block_and_index():
+    """G-22：三者**同时**重建。只换 docs 不换 index ⇒ 闸② 与闸⑦ 拿到的还是旧对象。"""
+    built = _built()
+    attached = corpus_mod.attach_bodies(
+        built, {"https://reuters.com/a": "抓回来的正文足够长，能进语料块。"}, _ctx(),
+        per_doc_chars=2400)
+    assert attached is not built and built.docs[0].body == ""
+    assert attached.docs[0].body.startswith("抓回来的正文")
+    assert attached.index["D1"].body == attached.docs[0].body
+    assert "抓回来的正文" in attached.block
+
+
+def test_render_block_body_section_only_for_docs_with_a_body():
+    built = _built()
+    attached = corpus_mod.attach_bodies(built, {"https://reuters.com/a": "只有第一篇有正文。"},
+                                        _ctx(), per_doc_chars=2400)
+    assert attached.block.count("正文（截自原文") == 1
+
+
+def test_render_block_is_byte_identical_without_bodies():
+    """「reader 关掉」与「reader 开着但全失败」在语料块上是同一个字节序列。"""
+    built = _built()
+    assert corpus_mod.render_block(built.docs, _ctx(), body_per_doc_chars=2400) == built.block
+
+
+def test_attached_body_is_truncated_only_at_render_time():
+    """入库正文是**长版本**（比对用），进 prompt 的才截断——两个上限刻意不同。"""
+    long_body = "正" * 5000
+    attached = corpus_mod.attach_bodies(_built(), {"https://reuters.com/a": long_body},
+                                        _ctx(), per_doc_chars=100)
+    assert len(attached.docs[0].body) == 5000, "haystack 恒为长版本"
+    assert "正" * 100 in attached.block and "正" * 200 not in attached.block

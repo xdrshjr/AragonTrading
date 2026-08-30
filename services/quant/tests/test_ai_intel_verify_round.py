@@ -372,3 +372,44 @@ async def test_verify_prompt_carries_no_position_facts():
     assert "不知道**任何持仓、盈亏或方向" in capture[0]["system"]
     assert [t.name for t in capture[0]["tools"]] == [intel_prompts.VERIFY_TOOL_NAME], \
         "核查 Agent 的 tools 恒为单元素，结构上无法交易"
+
+
+# ---------------- evidence-grounding §3.3.3：证伪的举证责任 ----------------
+@pytest.mark.asyncio
+async def test_strict_refuted_without_a_verified_quote_is_downgraded():
+    """`refuted` 是本层**唯一**会立刻停止注入的判定，它的举证责任应当高于 `confirmed`。
+
+    `soft` 下**不降级**（只记数），与「soft 只加不减」一致；`strict` 下降为 `unresolved`
+    并计 `refute_without_quote`。
+    """
+    await _fresh()
+    item_id = await _seed_item(dedupKey="k-strict")
+    deps = _deps(provider=FakeProvider(), llm=FakeLLM(_verdicts("refuted")),
+                 ai_trade_intel_quote_mode="strict")
+    await service_verify.run_verify_round(deps, INST, only_item_id=item_id)
+    row = await _item(item_id)
+    assert row["verdict"] == "unresolved", "指不出原文的证伪不该能停掉一条情报的注入"
+    rounds = await _rounds()
+    assert rounds[0]["actions"].get("refute_without_quote") == 1
+
+
+@pytest.mark.asyncio
+async def test_soft_refuted_without_a_quote_still_stands():
+    await _fresh()
+    item_id = await _seed_item(dedupKey="k-soft")
+    deps = _deps(provider=FakeProvider(), llm=FakeLLM(_verdicts("refuted")))
+    await service_verify.run_verify_round(deps, INST, only_item_id=item_id)
+    assert (await _item(item_id))["verdict"] == "refuted"
+
+
+@pytest.mark.asyncio
+async def test_verify_round_carries_the_four_new_counters_even_without_a_reader():
+    """核查轮的 round 存根同样带四个计数：不带 ⇒ 命中率的分母系统性偏小。"""
+    await _fresh()
+    item_id = await _seed_item(dedupKey="k-counters")
+    deps = _deps(provider=FakeProvider(), llm=FakeLLM(_verdicts("unresolved")))
+    await service_verify.run_verify_round(deps, INST, only_item_id=item_id)
+    row = (await _rounds())[0]
+    for key in ("readerAttempt", "readerOk", "quotesProposed", "quotesVerified"):
+        assert key in row, f"轮次 wire 少了 {key}"
+    assert row["readerAttempt"] == 0, "未装配 reader ⇒ 一次抓取都不该发生"

@@ -1054,6 +1054,31 @@ class Settings(BaseSettings):
     ai_trade_intel_trust_bonus: float = Field(default=0.05, ge=0, le=0.3)
     ai_trade_intel_blocked_sweep_enabled: bool = True
 
+    # ---- 情报证据接地（ai-trade-intel-evidence-grounding §十一，13 项；前缀仍是 `AI_TRADE_INTEL_`）----
+    # 两把逐层收窄的运维单键：`READER_ENABLED=false` ⇒ **不发任何出网抓取请求**，语料块逐字节
+    # 回到 7e2d5be；`QUOTE_MODE=off` ⇒ 采集 / 核查工具 schema **对象恒等**回退、闸② 判据逐字节
+    # 回退。上两轮的 `ENABLED` / `VERIFY_ENABLED` 仍是更外层。
+    # ⚠️ `READER_ENABLED` / `READER_TOP_K` / `QUOTE_MODE` 三个键露在 `PUT /settings/intel` 上，
+    # 故 `intel/service.py::INTEL_SETTING_BRIDGE` **必须**同时有对应行——不扩那张表，它们就是
+    # 「面板上改得动、系统永远不读、而且不报错」的假开关。
+    ai_trade_intel_reader_enabled: bool = True
+    ai_trade_intel_reader_top_k: int = Field(default=6, ge=1, le=12)
+    ai_trade_intel_reader_timeout_s: float = Field(default=8.0, ge=2, le=30)
+    ai_trade_intel_reader_round_deadline_s: float = Field(default=25.0, ge=5, le=120)
+    ai_trade_intel_reader_concurrency: int = Field(default=4, ge=1, le=8)
+    ai_trade_intel_reader_max_bytes: int = Field(default=1_500_000, ge=100_000, le=10_000_000)
+    ai_trade_intel_reader_max_redirects: int = Field(default=3, ge=0, le=5)
+    ai_trade_intel_reader_max_per_domain: int = Field(default=2, ge=1, le=6)
+    # **入库**正文上限（比对用的长版本）。`verify_one` 的 haystack 取的是它，不是下面那个短版本。
+    ai_trade_intel_reader_body_max_chars: int = Field(default=20_000, ge=2_000, le=80_000)
+    # **进 prompt** 的单篇正文上限（省 token 的短版本）。两个上限刻意不同，见 §3.1.5 第 2 条。
+    ai_trade_intel_corpus_body_per_doc_chars: int = Field(default=2400, ge=400, le=8000)
+    # 正缓存窗。**负缓存是派生量** `min(6h, 本值/12)`，不是配置项——少一个键就少一行必须双向
+    # 对齐的门禁，也少一个「两个键各调一半」的坏状态。
+    ai_trade_intel_reader_cache_ttl_h: float = Field(default=72.0, ge=1, le=720)
+    ai_trade_intel_reader_cache_max_rows: int = Field(default=4000, ge=200, le=50_000)
+    ai_trade_intel_quote_mode: Literal["off", "soft", "strict"] = "soft"
+
     # ---- 信任边界（trust-boundary-and-signal-integrity D1 / §6.1）----
     # 逗号分隔的 Origin 白名单；空 = 用 `app/security/origins.py` 的 DEFAULT_ORIGINS。
     # 显式配置即**完全替换**默认（不做合并，避免「以为收紧了其实没有」）。
@@ -1233,6 +1258,20 @@ class Settings(BaseSettings):
                 f"AI_TRADE_INTEL_CORPUS_MAX_DOCS({self.ai_trade_intel_corpus_max_docs})，"
                 "否则核查语料会被 corpus.build 截断，排在后面的候选将拿不到任何文档、"
                 "被系统性判成 unresolved")
+        # ai-trade-intel-evidence-grounding §4.1：轴 A 与轴 B 的两条值域约束。
+        # 第一条不加，一个把 `QUOTE_MODE` 调到 strict 却关着 reader 的用户会得到一个准入率
+        # **系统性归零**的系统，而界面上只显示「本轮检索到 N 篇材料，但没有一条通过真实性校验」
+        # ——与「今天真的没新闻」长得一模一样。
+        if self.ai_trade_intel_quote_mode == "strict" and not self.ai_trade_intel_reader_enabled:
+            raise ValueError(
+                "AI_TRADE_INTEL_QUOTE_MODE=strict 要求 AI_TRADE_INTEL_READER_ENABLED=true："
+                "没有正文时 strict 只能靠 snippet 命中引文，准入率会系统性归零，而它在界面上"
+                "与「今天真的没新闻」不可区分")
+        if self.ai_trade_intel_reader_top_k > self.ai_trade_intel_corpus_max_docs:
+            raise ValueError(
+                f"AI_TRADE_INTEL_READER_TOP_K({self.ai_trade_intel_reader_top_k}) 必须 ≤ "
+                f"AI_TRADE_INTEL_CORPUS_MAX_DOCS({self.ai_trade_intel_corpus_max_docs})："
+                "抓得比语料还多篇没有任何意义，多出来的那几次出网既进不了语料也进不了引文")
         return self
 
     def allowed_origin_list(self) -> list[str]:

@@ -44,6 +44,17 @@ const CODE_LABEL: Record<string, string> = {
   blocked_sweep: "来源已拉黑，存量归档",
   citations_pruned: "引用明细到期裁剪",
   verify_skipped: "本轮没有待核查条目",
+  // ---- evidence-grounding §3.2.6 的 9 个新码（后端三张 tuple 的并集 ⊆ 本表，G-24 冻结）----
+  quote_bad_ref: "引文指向了本条没声明的来源",
+  quote_too_short: "引文过短，不足以作为证据",
+  quote_not_found: "引文在原文里找不到（逐字比对未通过）",
+  quote_over_cap: "单条引文数超上限，多余的已丢弃",
+  quote_span_too_wide: "引文跨度过长，已丢弃",
+  no_verified_quote: "没有一条可核对的原文引证（严格模式）",
+  quote_orphan_dropped: "引文所属条目已被合并或截断，未落库",
+  need_quote: "升长期需要可核对的原文引证（被驳回）",
+  refute_without_quote: "证伪未附原文引证，已降为待定",
+  documents_pruned: "正文缓存到期清理",
 };
 
 // 降级码 → 中文。轮存根里的 `degradeCode` 是一个**裸码**（summary 里那份才带后端下发的
@@ -138,11 +149,22 @@ function RoundRow({ round, nowMs }: { round: IntelRound; nowMs: number }) {
             {roundSummary(round, entries)}
           </span>
         </span>
-        <span
-          className="shrink-0 text-[10px] tabular text-[var(--muted)]"
-          title={absoluteTime(round.startedTs)}
-        >
-          {relativeTime(round.startedTs, nowMs)}
+        <span className="flex shrink-0 items-center gap-2 text-[10px] tabular text-[var(--muted)]">
+          {/* evidence-grounding §3.3.4 的两列：分母 0 ⇒ `—`（「这一轮没抓 / 没提」与
+              「抓了全失败」是两句不同的话，用 0/0 表达前者会把它读成后者）。 */}
+          <span data-testid="intel-round-reader" title="正文：抓到 / 尝试">
+            正文 {round.readerAttempt > 0
+              ? `${round.readerOk}/${round.readerAttempt}`
+              : "—"}
+          </span>
+          <span data-testid="intel-round-quotes" title="引文：比中 / 模型提交">
+            引文 {round.quotesProposed > 0
+              ? `${round.quotesVerified}/${round.quotesProposed}`
+              : "—"}
+          </span>
+          <span title={absoluteTime(round.startedTs)}>
+            {relativeTime(round.startedTs, nowMs)}
+          </span>
         </span>
       </button>
       {open && (

@@ -523,3 +523,58 @@ async def test_curate_round_prunes_citations_and_sweeps_blocked_items():
         rows, _more = await repo.list_intel_citations(session, inst_id=INST, limit=10)
     assert rows == [], "只删明细"
     assert (await _items())[0]["citeCount"] == 1, "**不回滚统计列**"
+
+
+# ---------------- evidence-grounding：抓取接线（§3.1.1） ----------------
+@pytest.mark.asyncio
+async def test_round_row_carries_four_new_counters():
+    """G-14：`write_intel_round` 是**逐列手抄**的 payload 映射；新列不加一行即恒为 0 且不报错。"""
+    await _fresh()
+    deps = _deps(provider=FakeProvider(), llm=FakeLLM(_COLLECT_PAYLOAD))
+    await service.run_collect_round(deps, INST)
+    async with get_sessionmaker()() as session:
+        row = (await repo.list_intel_rounds(session, INST))[0]
+    for key in ("readerAttempt", "readerOk", "quotesProposed", "quotesVerified"):
+        assert key in row, f"轮次 wire 少了 {key}（写→读两端都要通）"
+
+
+@pytest.mark.asyncio
+async def test_reader_none_means_no_fetch_and_no_error():
+    """`IntelDeps.reader is None` ⇒ **不抓、不报错**，语料块逐字节回到本轮合入前。"""
+    await _fresh()
+    deps = _deps(provider=FakeProvider(), llm=FakeLLM(_COLLECT_PAYLOAD))
+    assert deps.reader is None
+    outcome = await service.run_collect_round(deps, INST)
+    assert outcome.status == "ok"
+    async with get_sessionmaker()() as session:
+        health = await repo.document_health(session)
+    assert health["cachedDocs"] == 0
+
+
+@pytest.mark.asyncio
+async def test_zero_quote_item_gets_a_reason_not_legacy():
+    """G-25：今天入库的零引文条目**不叫** `legacy`——那是四句话里唯一一句确定错误的。"""
+    await _fresh()
+    deps = _deps(provider=FakeProvider(), llm=FakeLLM(_COLLECT_PAYLOAD))
+    await service.run_collect_round(deps, INST)
+    rows = await _items("active")
+    assert rows[0]["quoteState"] == "noBody"
+    assert rows[0]["quoteState"] != "legacy"
+
+
+@pytest.mark.asyncio
+async def test_curate_round_prunes_the_document_cache():
+    """整理轮的第 6 步：正文缓存的三道闸。**只删缓存，绝不动引文**。"""
+    await _fresh()
+    from app.ai_auto.intel.corpus import document_key
+
+    async with get_sessionmaker()() as session:
+        await repo.upsert_documents(session, [{
+            "urlHash": document_key("https://reuters.com/old"),
+            "url": "https://reuters.com/old", "domain": "reuters.com", "body": "旧正文",
+            "bodyChars": 3, "status": "ok", "fetchedTs": NOW - 400 * 3600}])
+    deps = _deps(provider=FakeProvider(), llm=None)
+    outcome = await service.run_curate_round(deps, INST)
+    assert outcome.actions.get("documents_pruned") == 1
+    async with get_sessionmaker()() as session:
+        assert (await repo.document_health(session))["cachedDocs"] == 0

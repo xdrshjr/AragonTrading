@@ -12,7 +12,8 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import hashlib
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 from . import taxonomy as tax
@@ -90,6 +91,11 @@ class CorpusDoc:
     publisher: str
     snippet: str
     published_ts: int
+    # ai-trade-intel-evidence-grounding 轴 A：第一方抓回的正文（**长版本**，
+    # `reader_body_max_chars`）。它同时是 `quotes.verify_one` 的 haystack，故**恒为长版本**——
+    # 截断只发生在渲染时（`render_block(..., body_per_doc_chars=…)`）。
+    # 空串 = 没抓到 / reader 关着 ⇒ 该文档的语料块渲染**逐字节**等于本轮合入前。
+    body: str = ""
 
 
 @dataclass(frozen=True)
@@ -105,12 +111,26 @@ class Corpus:
         return len({d.domain for d in self.docs if d.domain})
 
 
-def _canonical_url(url: str) -> str:
-    """去查询串与锚点后的归一 URL（跨 query 去重的键）。"""
+def canonical_url(url: str) -> str:
+    """去查询串与锚点后的归一 URL（跨 query 去重的键，也是文档缓存的键的输入）。
+
+    **公开名**（evidence-grounding §3.1.4）：文档缓存按它算键，而同包跨模块 import 一个下划线
+    私有名，等于把签名变成公开契约却没有任何地方说明这件事（closed-loop 已为 `relative_time`
+    立过这条先例）。
+    """
     raw = (url or "").strip()
     for sep in ("#", "?"):
         raw = raw.split(sep, 1)[0]
     return raw.rstrip("/").lower()
+
+
+def document_key(url: str) -> str:
+    """正文缓存的主键：``sha1(canonical_url(url)).hexdigest()[:40]``。
+
+    把归一结果的哈希当键，让「键的语义」与「归一函数」绑在一起——改归一函数时必然要改键，
+    不会出现「归一变了、老缓存还在按旧键命中」的静默错配。
+    """
+    return hashlib.sha1(canonical_url(url).encode("utf-8")).hexdigest()[:40]
 
 
 def _fmt_date(ts: int) -> str:
@@ -149,7 +169,7 @@ def build(docs: list[SearchDoc], ctx: IntelContext, *, max_docs: int,
         domain = tax.normalize_domain(doc.url)
         if not domain or domain in blocked_domains:
             continue
-        key = _canonical_url(doc.url)
+        key = canonical_url(doc.url)
         if key in seen:
             continue
         seen.add(key)
@@ -168,20 +188,65 @@ def build(docs: list[SearchDoc], ctx: IntelContext, *, max_docs: int,
     return Corpus(built, render_block(built, ctx), {doc.ref: doc for doc in built})
 
 
-def render_block(docs: tuple[CorpusDoc, ...], ctx: IntelContext) -> str:
-    """渲染不可信语料块（含「已在库」清单，两者同处不可信标注内）。"""
+def render_block(docs: tuple[CorpusDoc, ...], ctx: IntelContext, *,
+                 body_per_doc_chars: int = 0) -> str:
+    """渲染不可信语料块（含「已在库」清单，两者同处不可信标注内）。
+
+    Args:
+        docs: 本轮语料。
+        ctx: 只用于渲染「已在库」清单。
+        body_per_doc_chars: 单篇正文的渲染上限。**默认 0 ⇒ 一行正文都不渲染**——`build` 的
+            既有调用点因此一个字节不用改，「reader 关掉」与「reader 开着但全失败」在语料块上
+            也就是同一个字节序列（G-2 的冻结点）。
+
+    Returns:
+        `<<<UNTRUSTED_SEARCH_RESULTS>>>` 包裹内的完整语料块。
+    """
     lines = [_BLOCK_OPEN, _BLOCK_NOTE, ""]
+    cap = max(0, int(body_per_doc_chars))
     for doc in docs:
         lines.append(f"[{doc.ref}] {doc.title}")
         lines.append(f"    来源 {doc.domain}｜{_fmt_date(doc.published_ts)}")
         if doc.snippet:
             lines.append(f"    正文片段：{doc.snippet}")
+        if cap and doc.body:
+            # 「仅供逐字引用」是给模型的**用途限定**，不是安全措施——安全措施是包裹本身与闸⑥。
+            lines.append(f"    正文（截自原文 {len(doc.body)} 字，仅供逐字引用）：")
+            lines.append(f"    {doc.body[:cap]}")
     if ctx.existing_headlines:
         lines.append("")
         lines.append("【已在库（上一轮及更早由你自己写下的标题，同样属于不可信素材）】")
         lines.extend(f"    - {headline}" for headline in ctx.existing_headlines)
     lines.append(_BLOCK_CLOSE)
     return "\n".join(lines)
+
+
+def attach_bodies(corpus: Corpus, bodies: dict[str, str], ctx: IntelContext, *,
+                  per_doc_chars: int) -> Corpus:
+    """把抓回的正文挂进语料并**整体重建** `Corpus`（evidence-grounding §3.1.5）。
+
+    纯函数：入参 `corpus` 一个字节不变。
+
+    Args:
+        corpus: `build` 产出的、只有 snippet 的那一份。
+        bodies: ``{doc.url: 正文}``（**长版本**，`reader_body_max_chars`）。缺席 / 空串 ⇒ 该文档
+            逐字节保持今日形态。
+        ctx: `render_block` 渲染「已在库」清单需要它——`Corpus` 不持有 `ctx`，所以它**必须**
+            进签名。
+        per_doc_chars: 单篇正文进 prompt 的渲染上限。
+
+    Returns:
+        一个新的 `Corpus`。**`docs` / `block` / `index` 三者同时重建**，缺一即静默失效：
+        `gate._resolve_refs` **只读 `index`**，只换 `docs` 不换 `index` 会让闸② 与闸⑦ 拿到
+        没有 body 的旧对象 ⇒ 出网成本照付、引文一条都比不中、soft 的 haystack 根本没变大，
+        **而且全程没有任何错误**。
+    """
+    if not corpus.docs:
+        return corpus
+    new_docs = tuple(replace(doc, body=str(bodies.get(doc.url, "") or ""))
+                     for doc in corpus.docs)
+    return Corpus(new_docs, render_block(new_docs, ctx, body_per_doc_chars=per_doc_chars),
+                  {doc.ref: doc for doc in new_docs})
 
 
 def render_local_facts(ctx: IntelContext) -> str:

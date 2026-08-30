@@ -68,10 +68,39 @@ CREATE TABLE ai_intel_watch (
 )
 """
 
+# 7e2d5be 时代的 `ai_intel_rounds`（evidence-grounding 把它作为**第三张表**加进同一个 patcher）。
+_V1_ROUNDS_DDL = """
+CREATE TABLE ai_intel_rounds (
+    id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+    inst_id VARCHAR(32),
+    kind VARCHAR(8),
+    group_id VARCHAR(48),
+    started_ts INTEGER,
+    finished_ts INTEGER,
+    status VARCHAR(12),
+    search_provider VARCHAR(16),
+    queries_json TEXT,
+    doc_count INTEGER,
+    domain_count INTEGER,
+    accepted INTEGER,
+    rejected INTEGER,
+    merged INTEGER,
+    rejects_json TEXT,
+    actions_json TEXT,
+    llm_input_tokens INTEGER,
+    llm_output_tokens INTEGER,
+    degrade_code VARCHAR(24),
+    error_text VARCHAR(400)
+)
+"""
+
 NEW_ITEM_COLUMNS = ("cite_count", "cite_entry_count", "settled_count", "win_count",
                     "net_pnl_usd", "last_cited_ts", "verdict", "verdict_ts", "verdict_note",
                     "verify_count")
 NEW_WATCH_COLUMNS = ("last_verify_ts", "curates_since_verify")
+# ---- evidence-grounding §5.3 的 8 个新列 ----
+EVIDENCE_ITEM_COLUMNS = ("quoted", "quote_count", "quote_state", "schedule_resolved_ts")
+EVIDENCE_ROUND_COLUMNS = ("reader_attempt", "reader_ok", "quotes_proposed", "quotes_verified")
 
 
 async def _columns(conn, table: str) -> set[str]:
@@ -84,6 +113,10 @@ async def _old_db(tmp_path):
     async with engine.begin() as conn:
         await conn.execute(text(_V1_ITEMS_DDL))
         await conn.execute(text(_V1_WATCH_DDL))
+        await conn.execute(text(_V1_ROUNDS_DDL))
+        await conn.execute(text(
+            "INSERT INTO ai_intel_rounds (inst_id, kind, status) "
+            "VALUES ('BTC-USDT-SWAP', 'collect', 'ok')"))
         await conn.execute(text(
             "INSERT INTO ai_intel_items (inst_id, tier, status, headline, dedup_key)"
             " VALUES ('BTC-USDT-SWAP', 'mid', 'active', '旧闻', 'k1')"))
@@ -103,6 +136,8 @@ async def test_old_db_gets_new_columns(tmp_path):
 
         assert set(NEW_ITEM_COLUMNS) <= await _columns(conn, "ai_intel_items")
         assert set(NEW_WATCH_COLUMNS) <= await _columns(conn, "ai_intel_watch")
+        assert set(EVIDENCE_ITEM_COLUMNS) <= await _columns(conn, "ai_intel_items")
+        assert set(EVIDENCE_ROUND_COLUMNS) <= await _columns(conn, "ai_intel_rounds")
         # 补列后的**老行**：`verdict` 是 ''（=待验证），统计列是 0。**绝不做任何历史回填**。
         row = (await conn.execute(text(
             "SELECT verdict, cite_count, verify_count FROM ai_intel_items"))).one()
@@ -111,6 +146,51 @@ async def test_old_db_gets_new_columns(tmp_path):
             "UPDATE ai_intel_items SET cite_count = cite_count + 3, verdict = 'refuted'"))
         assert (await conn.execute(text(
             "SELECT cite_count FROM ai_intel_items"))).scalar() == 3
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_legacy_rows_are_marked_legacy_not_empty(tmp_path):
+    """G-13：老行的 `quote_state` 必须是 `'legacy'`，**不能是 `''`**。
+
+    空串已经被 wire 用作「有引文」的取值：两者撞在一起会让一条 2026 年 8 月的老情报在界面上
+    显示成「有引证」而抽屉是空的——四句话里挑中了唯一一句确定错误的。
+    """
+    engine = await _old_db(tmp_path)
+    async with engine.begin() as conn:
+        await _ensure_ai_intel_columns(conn)
+        state, quoted, resolved = (await conn.execute(text(
+            "SELECT quote_state, quoted, schedule_resolved_ts FROM ai_intel_items"))).one()
+        assert state == "legacy", "老行必须自称 legacy（本条早于原文取证功能）"
+        assert not quoted and resolved == 0, "绝不做任何历史回填"
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_today_zero_quote_item_is_not_called_legacy(tmp_path):
+    """G-25：**已 ALTER 过的老库**上，今天入库的零引文条目不叫 `legacy`。
+
+    SQLite 的 `ADD COLUMN ... DEFAULT 'legacy'` 会让 `'legacy'` 同时成为该表后续 INSERT 的
+    服务端默认值，而 `_item_values` 又刻意不带这一列——两件事叠起来，一条今天入库、模型只是
+    没给引文的条目会被界面说成「本条早于原文取证功能」。`write_intel_quote_state` 对本轮
+    **全部** accepted + merges **无条件**写，正是为了堵这条链。
+    """
+    engine = await _old_db(tmp_path)
+    async with engine.begin() as conn:
+        await _ensure_ai_intel_columns(conn)
+        await conn.execute(text(
+            "INSERT INTO ai_intel_items (inst_id, tier, status, headline, dedup_key)"
+            " VALUES ('BTC-USDT-SWAP', 'ultra', 'active', '今天的', 'k2')"))
+        # 不写状态时，服务端默认值确实会把今天的条目染成 legacy —— 这正是那条链的第一环。
+        assert (await conn.execute(text(
+            "SELECT quote_state FROM ai_intel_items WHERE dedup_key = 'k2'"))).scalar() \
+            == "legacy"
+        # `write_intel_quote_state` 的等价写入（无条件覆盖）之后，它说出的是真实原因。
+        await conn.execute(text(
+            "UPDATE ai_intel_items SET quote_state = 'modelOmitted' WHERE dedup_key = 'k2'"))
+        assert (await conn.execute(text(
+            "SELECT quote_state FROM ai_intel_items WHERE dedup_key = 'k2'"))).scalar() \
+            == "modelOmitted"
     await engine.dispose()
 
 
@@ -151,7 +231,7 @@ def test_item_values_carries_no_statistics_column():
 
     values = _item_values({"instId": "X", "category": "market", "headline": "h",
                            "summary": "s", "dedupKey": "k"}, now=0)
-    for column in NEW_ITEM_COLUMNS:
+    for column in (*NEW_ITEM_COLUMNS, *EVIDENCE_ITEM_COLUMNS):
         assert column not in values, f"{column} 进了 _item_values ⇒ 再次报道即清零战绩"
 
     from app.ai_auto.intel.gate import IntelItem
@@ -159,8 +239,10 @@ def test_item_values_carries_no_statistics_column():
     payload = item_to_payload(IntelItem(
         item_id=1, inst_id="X", tier="ultra", category="market", headline="h", summary="s",
         stance="neutral", impact="high", confidence=0.5, event_ts=0, captured_ts=0,
-        expires_ts=0, cite_count=9, verdict="refuted"))
+        expires_ts=0, cite_count=9, verdict="refuted", quote_count=3,
+        schedule_resolved_ts=7))
     assert "citeCount" not in payload and "verdict" not in payload
+    assert "quoteCount" not in payload and "scheduleResolvedTs" not in payload
 
 
 def test_asyncio_marker_is_registered():

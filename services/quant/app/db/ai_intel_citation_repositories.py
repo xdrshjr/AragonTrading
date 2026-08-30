@@ -479,6 +479,13 @@ async def apply_intel_verdicts(session: AsyncSession, plans: list[dict], *, now:
             row.tier = str(to_tier)
             row.expires_ts = int(plan["expiresTs"])
             row.demote_count = int(row.demote_count or 0) + 1
+        # ★ evidence-grounding §3.4.2 的**读点**：`resolveSchedule` 是 `service_verify` 那张
+        # 逐列手抄的 wire 表里新加的那一行。少了这里，`VerdictPlan.resolve_schedule` 会一直是
+        # True 而库里那一列恒为 0——任何只断言 dataclass 的用例都会绿。
+        # **不动 `event_ts` / `tier` / `expires_ts`**（见 `verify._plan_confirmed` 的 Note）。
+        if plan.get("resolveSchedule"):
+            row.is_scheduled = False
+            row.schedule_resolved_ts = int(now)
         row.updated_ts = int(now)
         counts[verdict] = counts.get(verdict, 0) + 1
     if commit:

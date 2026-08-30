@@ -63,6 +63,7 @@ function item(over: Partial<IntelItem> = {}): IntelItem {
     verdictTs: 0,
     verdictNote: "",
     verifyCount: 0,
+    quoted: false, quoteCount: 0, quoteState: "", scheduleResolvedTs: 0,
     createdTs: NOW_S,
     ...over,
   };
@@ -84,6 +85,7 @@ function summary(over: Partial<AiTradeIntelSummary> = {}): AiTradeIntelSummary {
     dailyCap: 96,
     citations: { cited: 0, entryCited: 0, settledTrips: 0, winCount: 0, netPnlUsd: 0, neverCited: 0 },
     verify: { confirmed: 0, refuted: 0, unresolved: 0, pending: 0, lastVerifyTs: null },
+    quoteHitRate: null,
     ...over,
   };
 }

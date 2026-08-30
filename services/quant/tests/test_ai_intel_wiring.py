@@ -452,3 +452,26 @@ def test_every_intel_setting_is_registered_in_env_example():
     assert fields, "正则没匹配到任何字段 ⇒ 本用例已经失效，先修它"
     assert fields - declared == set(), f"这些设置没写进 .env.example：{sorted(fields - declared)}"
     assert declared - fields == set(), f".env.example 里有已不存在的键：{sorted(declared - fields)}"
+
+
+def test_reader_config_is_derived_from_the_effective_settings():
+    """evidence-grounding：抓取配置的**唯一**读点，且 `proxy` 复用进程代理（零新增配置项）。"""
+    from app.ai_auto.intel import evidence as intel_evidence
+    from app.config import Settings
+
+    settings = Settings(ai_trade_intel_reader_top_k=9, ai_trade_intel_reader_enabled=False)
+    cfg = intel_evidence.reader_config(settings)
+    assert cfg.top_k == 9 and cfg.enabled is False
+    assert cfg.proxy == settings.proxy_url
+
+
+def test_negative_cache_window_is_derived_not_configured():
+    """负缓存窗是**派生量** `min(6h, 正窗/12)`：少一个键就少一行必须双向对齐的门禁。"""
+    from app.ai_auto.intel import evidence as intel_evidence
+    from app.config import Settings
+
+    ttl, negative = intel_evidence._cache_windows(Settings())
+    assert ttl == 72 * 3600.0 and negative == 6 * 3600.0
+    ttl2, negative2 = intel_evidence._cache_windows(
+        Settings(ai_trade_intel_reader_cache_ttl_h=24.0))
+    assert ttl2 == 24 * 3600.0 and negative2 == 2 * 3600.0

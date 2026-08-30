@@ -29,9 +29,20 @@ const settingsMock = vi.fn(async () => ({
   estimate: { roundsPerDay: 240, inputTokensPerDay: 1_000_000 },
   citeEnabled: true, attributionEnabled: true, verifyEnabled: true, verifyEveryNCurates: 1,
   verifyMaxItems: 3, verifyDocsPerItem: 4, blockedSweepEnabled: true, citeMaxRefs: 8,
+  readerEnabled: true, readerTopK: 6, quoteMode: "soft" as const, quoteHitRate: 0.78,
 }));
 const verifyMock = vi.fn(async () => ({ queued: true }));
 const verifyItemMock = vi.fn(async () => ({ queued: true }));
+// evidence-grounding：证据抽屉的懒加载点。返回值固定，用例只关心**它被调了几次**。
+const evidenceMock = vi.fn(async (itemId: number) => ({
+  itemId, quoteMode: "soft" as const, docs: [],
+  quotes: [{
+    id: 5, itemId, instId: INST, roundId: 1, role: "admit" as const, ref: "D1",
+    text: "准入时看到的那一段原文", sourceField: "body" as const,
+    docUrl: "https://reuters.com/a", docDomain: "reuters.com", docPublishedTs: 0,
+    hasImperative: false, verifiedTs: 0,
+  }],
+}));
 
 vi.mock("@/lib/intelApi", () => ({
   intelApi: {
@@ -62,6 +73,10 @@ vi.mock("@/lib/intelApi", () => ({
     writeFeedback: async () => ({ ok: true, archived: 0 }),
     previewFeedback: async () => ({ affected: 0 }),
     clearFeedback: async () => undefined,
+    evidence: (...a: unknown[]) => evidenceMock(...(a as [number])),
+    documentHealth: async () => ({
+      cachedDocs: 0, bodyBytes: 0, oldestFetchedTs: 0, lastPrunedTs: 0, readerEnabled: true,
+    }),
   },
 }));
 
@@ -75,7 +90,9 @@ function item(over: Partial<IntelItem> = {}): IntelItem {
     sourceCount: 0, domainCount: 2, dedupKey: "k", supersedesId: null, promoteCount: 0,
     demoteCount: 0, lastCuratedTs: 0, curationNote: "", createdTs: NOW_S,
     citeCount: 0, citeEntryCount: 0, settledCount: 0, winCount: 0, netPnlUsd: 0,
-    lastCitedTs: 0, verdict: "", verdictTs: 0, verdictNote: "", verifyCount: 0, ...over,
+    lastCitedTs: 0, verdict: "", verdictTs: 0, verdictNote: "", verifyCount: 0,
+    quoted: false, quoteCount: 0, quoteState: "", scheduleResolvedTs: 0,
+    ...over,
   };
 }
 
@@ -90,6 +107,7 @@ function response(over: Partial<IntelReadResponse> = {}): IntelReadResponse {
       citations: { cited: 0, entryCited: 0, settledTrips: 0, winCount: 0,
         netPnlUsd: 0, neverCited: 0 },
       verify: { confirmed: 0, refuted: 0, unresolved: 0, pending: 0, lastVerifyTs: null },
+      quoteHitRate: null,
     },
     tiers: {
       ultra: { items: [item(), item({ id: 2, category: "macro", headline: "CPI 数据即将公布" })], total: 2 },
@@ -316,5 +334,84 @@ describe("IntelModal", () => {
       });
     });
     expect(screen.getByTestId("intel-in-flight")).toBeInTheDocument();
+  });
+
+  // ---------------- evidence-grounding 轴 C：懒加载与命中率徽标 ----------------
+  it("证据只在展开时取一次；收起再展开**不重发**", async () => {
+    readResponse = response({
+      tiers: {
+        ultra: { items: [item({ quoted: true, quoteCount: 1 })], total: 1 },
+        mid: { items: [], total: 0 },
+        long: { items: [], total: 0 },
+      },
+    });
+    render(<IntelModal instId={INST} open onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId("intel-list")).toBeInTheDocument());
+    expect(evidenceMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("intel-evidence-trigger"));
+    await waitFor(() => expect(evidenceMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.getByText("准入时看到的那一段原文")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("intel-evidence-trigger"));   // 收起
+    fireEvent.click(screen.getByTestId("intel-evidence-trigger"));   // 再展开
+    await waitFor(() =>
+      expect(screen.getByText("准入时看到的那一段原文")).toBeInTheDocument());
+    expect(evidenceMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("顶部命中率徽标是把引文要求收紧的判据在界面上的落点", async () => {
+    readResponse = response({
+      summary: { ...response().summary, quoteHitRate: 0.78 },
+    });
+    render(<IntelModal instId={INST} open onClose={vi.fn()} />);
+    await waitFor(() =>
+      expect(screen.getByTestId("intel-hit-rate")).toHaveTextContent("近 20 轮引文命中率 78%"));
+  });
+
+  it("还没提过引文（`null`）⇒ 徽标整块不渲染，绝不显示一个假的 0%", async () => {
+    readResponse = response();
+    render(<IntelModal instId={INST} open onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId("intel-list")).toBeInTheDocument());
+    expect(screen.queryByTestId("intel-hit-rate")).toBeNull();
+  });
+
+  // 终审补：错误必须**按 itemId 存**。弹窗级的一个字符串会让 A 的失败在 B 展开时被清掉，
+  // 而 A 那个还开着的抽屉于是从「读取失败」变成「这一条没有留存任何原文引证」——把一次请求
+  // 失败说成一句关于数据的断言，是四句话里最不该出现的那一句。
+  it("一条取证失败，不会把另一条的抽屉染成失败，也不会自己变成「没有引证」", async () => {
+    readResponse = response({
+      tiers: {
+        ultra: {
+          items: [item({ id: 1, quoted: true, quoteCount: 1 }),
+                  item({ id: 2, headline: "CPI 数据即将公布", quoted: true, quoteCount: 1 })],
+          total: 2,
+        },
+        mid: { items: [], total: 0 },
+        long: { items: [], total: 0 },
+      },
+    });
+    evidenceMock.mockImplementation(async (itemId: number) => {
+      if (itemId === 1) throw new Error("读取原文引证失败：网络错误");
+      return { itemId, quoteMode: "soft" as const, docs: [], quotes: [{
+        id: 9, itemId, instId: INST, roundId: 1, role: "admit" as const, ref: "D1",
+        text: "第二条的那一段原文", sourceField: "body" as const,
+        docUrl: "https://reuters.com/b", docDomain: "reuters.com", docPublishedTs: 0,
+        hasImperative: false, verifiedTs: 0,
+      }] };
+    });
+    render(<IntelModal instId={INST} open onClose={vi.fn()} />);
+    await waitFor(() => expect(screen.getByTestId("intel-list")).toBeInTheDocument());
+    const triggers = screen.getAllByTestId("intel-evidence-trigger");
+    fireEvent.click(triggers[0]);
+    await waitFor(() =>
+      expect(screen.getByText("读取原文引证失败：网络错误")).toBeInTheDocument());
+    fireEvent.click(screen.getAllByTestId("intel-evidence-trigger")[1]);
+    await waitFor(() =>
+      expect(screen.getByText("第二条的那一段原文")).toBeInTheDocument());
+    // 第一条仍然在说「读取失败」，而不是改口说这一条没有引证。
+    expect(screen.getByText("读取原文引证失败：网络错误")).toBeInTheDocument();
+    expect(screen.queryByText("这一条没有留存任何原文引证。")).toBeNull();
   });
 });

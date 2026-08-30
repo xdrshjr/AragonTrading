@@ -943,6 +943,21 @@ class AiIntelItem(Base):
     verdict_ts: Mapped[int] = mapped_column(Integer, default=0)
     verdict_note: Mapped[str] = mapped_column(String(200), default="")   # 模型给的一句话理由
     verify_count: Mapped[int] = mapped_column(Integer, default=0)        # 已核查次数（两击制的判据）
+    # ---- ai-trade-intel-evidence-grounding §5.3：四个新列（**同样必须 ALTER 补列**）----
+    # 与上面十列同一条纪律：**绝不允许**出现在 ``_item_values`` 里。它们各自的写点唯一——
+    # ``quoted`` / ``quote_count`` / ``quote_state`` 由 ``write_intel_quote_state`` 对本轮
+    # **全部** accepted + merges 无条件写；``schedule_resolved_ts`` 只由 ``apply_intel_verdicts`` 写。
+    quoted: Mapped[bool] = mapped_column(Boolean, default=False)         # 有 ≥1 条已验证引文
+    quote_count: Mapped[int] = mapped_column(Integer, default=0)
+    # ''|legacy|modeOff|noBody|modelOmitted|verifyFailed —— 无引文时的**原因**，由后端下发。
+    # ⚠️ 模型侧默认是 ``""``，而 ALTER 的默认是 ``'legacy'``，**两者刻意不同**（评审 P1-8）：
+    # SQLite 的 ``ADD COLUMN ... DEFAULT 'legacy'`` 会让 ``'legacy'`` 同时成为该表后续 INSERT 的
+    # 服务端默认值，而 ``_item_values`` 又刻意不带这一列 —— 于是一条**今天**入库、模型只是没给
+    # 引文的条目会被界面说成「本条早于原文取证功能」，四句话里挑中了唯一一句确定错误的。
+    quote_state: Mapped[str] = mapped_column(String(16), default="")
+    # 轴 D 的兑现位（F-1 的修法）：0 = 未兑现 / 非排期。**绝不复用 ``updated_ts``**——
+    # 把「有人动过」与「这件事已经兑现」压在同一列上，正是 F-1 的成因。
+    schedule_resolved_ts: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class AiIntelCitation(Base):
@@ -1022,6 +1037,14 @@ class AiIntelRound(Base):
     llm_output_tokens: Mapped[int] = mapped_column(Integer, default=0)
     degrade_code: Mapped[str] = mapped_column(String(24), default="")
     error_text: Mapped[str] = mapped_column(String(400), default="")    # 已脱敏
+    # ---- ai-trade-intel-evidence-grounding §5.3：四个抓取 / 引文计数（**必须 ALTER 补列**）----
+    # 它们的**唯一**写点是 ``write_intel_round``（逐列手抄的 payload 映射），唯一读点是
+    # ``intel_round_out``。少任何一处，轮次页签的两列恒 ``0/0``、命中率徽标恒 0，
+    # 而把 ``quote_mode`` 翻到 strict 的运维判据正是读这两个数。
+    reader_attempt: Mapped[int] = mapped_column(Integer, default=0)
+    reader_ok: Mapped[int] = mapped_column(Integer, default=0)
+    quotes_proposed: Mapped[int] = mapped_column(Integer, default=0)
+    quotes_verified: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class AiIntelWatch(Base):
@@ -1063,3 +1086,80 @@ class AiIntelFeedback(Base):
     action: Mapped[str] = mapped_column(String(8), default="block")     # block|trust
     inst_id: Mapped[str] = mapped_column(String(32), default="")        # "" = 全局
     created_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiIntelDocument(Base):
+    """一篇被抓回的网页正文快照（ai-trade-intel-evidence-grounding §5.1）。
+
+    **纯缓存**：可以随时清空而不损失任何已落盘的证据——引文自带原文副本（见 ``AiIntelQuote``），
+    它必须比缓存活得久（一条 400 天有效期的长期情报，证据不能因为 72 小时后缓存被清就消失）。
+
+    ⚠️ **这张表刻意是跨标的共享的，而它不违反「跨标的情报关联」那条红线**：共享的是**原始文档**
+    （一段公开网页文本），不是**情报条目**（带 tier / 战绩 / 判定的记录）。它没有 tier、没有战绩、
+    没有判定，与情报条目不是同一类对象。**不要**顺手把它升级成一张跨标的情报表。
+
+    ``create_all`` 会建这张缺失的表 ⇒ **零迁移**。
+    """
+
+    __tablename__ = "ai_intel_documents"
+    __table_args__ = (
+        UniqueConstraint("url_hash", name="uq_ai_intel_doc_url"),
+        Index("ix_ai_intel_doc_fetched", "fetched_ts"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # sha1(canonical_url)[:40]。**用哈希而不是 URL 本身做唯一键**：让「键的语义」与「归一函数」
+    # 绑在一起，改归一函数时必然要改键，不会出现「归一变了、老缓存还在按旧键命中」的静默错配。
+    url_hash: Mapped[str] = mapped_column(String(40), index=True, default="")
+    url: Mapped[str] = mapped_column(String(600), default="")        # 规范化后的绝对 URL
+    final_url: Mapped[str] = mapped_column(String(600), default="")  # 重定向终点（可与 url 相同）
+    domain: Mapped[str] = mapped_column(String(128), index=True, default="")
+    title: Mapped[str] = mapped_column(String(300), default="")      # <title>，可空
+    body: Mapped[str] = mapped_column(Text, default="")              # 抽出的正文（已截断）
+    body_chars: Mapped[int] = mapped_column(Integer, default=0)
+    byte_len: Mapped[int] = mapped_column(Integer, default=0)        # 原始响应字节（审计用）
+    # ok|blocked|http_error|timeout|network_error|not_html|too_large|empty
+    status: Mapped[str] = mapped_column(String(16), default="ok")
+    http_status: Mapped[int] = mapped_column(Integer, default=0)     # 0 = 没走到 HTTP
+    fetched_ts: Mapped[int] = mapped_column(Integer, default=0)
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiIntelQuote(Base):
+    """一条情报的一段已验证原文引证（ai-trade-intel-evidence-grounding §5.2）。append-only。
+
+    **自带原文副本，不依赖文档缓存**：存「文档 id + 偏移量」更省空间，但文档表是纯缓存、会被
+    定期淘汰，而「原文页面 404 了 / 网站改版了 / 域名被拉黑了」这三件事都不该让用户读不到当年
+    那段字。这是本轮对「真实可信」四个字最实在的一次兑现。
+
+    ``item_id`` 的清理由 ``delete_intel_item`` 的同事务 DELETE 负责（本仓库的 SQLite 表一律不建
+    外键）。整理轮的清理**不删引文**——归档是软删，条目还在。
+    """
+
+    __tablename__ = "ai_intel_quotes"
+    __table_args__ = (
+        Index("ix_ai_intel_quote_item", "item_id", "id"),
+        Index("ix_ai_intel_quote_scope", "inst_id", "verified_ts"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    item_id: Mapped[int] = mapped_column(Integer, index=True, default=0)
+    inst_id: Mapped[str] = mapped_column(String(32), index=True, default="")
+    round_id: Mapped[int] = mapped_column(Integer, default=0)      # 产生它的那一轮
+    role: Mapped[str] = mapped_column(String(8), default="admit")  # admit|verify
+    doc_ref: Mapped[str] = mapped_column(String(4), default="")    # "D3"（只为审计）
+    doc_url: Mapped[str] = mapped_column(String(600), default="")
+    doc_domain: Mapped[str] = mapped_column(String(128), default="")
+    doc_published_ts: Mapped[int] = mapped_column(Integer, default=0)
+    source_field: Mapped[str] = mapped_column(String(8), default="body")  # body|snippet|title
+    # **文档里的原文形态**，不是模型给的那一串。列宽 400 > schema 的 maxLength 300：归一会把
+    # 连续空白折叠成一个空格，回切到原文时那些空白会**长回来**，300 字符的归一串完全可能对应
+    # 一段 340 字符的原文。真正的上限由 `quotes.verify_one` 的 `quote_span_max_chars` 执行
+    # （超了**丢弃并计数**，绝不静默截断——SQLite 不强制 VARCHAR 长度，这个声明拦不住任何东西）。
+    text: Mapped[str] = mapped_column(String(400), default="")
+    char_start: Mapped[int] = mapped_column(Integer, default=0)    # 归一串偏移，只为审计
+    # §3.6 第 2 条的中性标记：原文里有一句劝告 ⇒ **入库但打标**，绝不拒收（拒收会把
+    # 「原文有句劝告」变成「这条情报没有证据」，两件事差得太远）。
+    has_imperative: Mapped[bool] = mapped_column(Boolean, default=False)
+    verified_ts: Mapped[int] = mapped_column(Integer, default=0)
