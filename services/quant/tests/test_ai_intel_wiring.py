@@ -193,6 +193,56 @@ async def test_manager_wires_and_unwires_the_intel_runtime(monkeypatch):
     assert intel_runtime.runtime_for(INST) is None
 
 
+def test_build_group_runtime_keeps_its_public_signature():
+    """G-19：`build_group_runtime` 的公开签名逐字段不变（10 个 keyword-only 形参）。
+
+    arm-state 把 `IntelDeps` 的构造收敛进了 `_build_deps`——那是**内部**重构。签名一旦漂移，
+    上面那条 `fake_build(**kwargs)` 替身会静默接受任何入参，于是 manager 与装配点之间的接线
+    错了也不会有人知道。
+    """
+    import inspect
+
+    params = inspect.signature(intel_runtime.build_group_runtime).parameters
+    assert list(params) == ["group_id", "members", "settings", "sessionmaker", "provider_cfg",
+                            "make_client", "bar", "change_24h_pct", "notify", "notify_alert"]
+    assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values())
+    assert params["bar"].default == "15m"
+    assert params["change_24h_pct"].default is None
+
+
+@pytest.mark.asyncio
+async def test_wire_intel_passes_the_sessionmaker_factory_not_a_session(monkeypatch):
+    """实施发现 I-4：`sessionmaker` 必须是**取 sessionmaker 的那个函数**，不是它的返回值。
+
+    全部 `deps.sessionmaker()()` 调用点都按两跳写（`IntelDeps.sessionmaker: Callable[[], object]`）。
+    传进去一个 `async_sessionmaker` 实例，第二跳就是 `AsyncSession()` ⇒ `TypeError`，而
+    `_wire_intel` 全程 fail-open ⇒ 异常被吞、`register` 从没被调到、`_RUNTIMES` 恒空 ⇒ 面板恒说
+    「尚未配置情报检索源」。这正是本轮用户报告的那句假话的根因，且它对上层**完全静默**。
+    """
+    from app.ai_auto.manager import AiTradeManager
+
+    manager = AiTradeManager()
+    group = _fake_group()
+    manager._group = group
+    monkeypatch.setattr(manager, "_group_settings", lambda g: Settings())
+    monkeypatch.setattr("app.ai_auto.manager.resolve_active_provider",
+                        _async_return(object()))
+    seen: dict = {}
+
+    async def capture(**kwargs):
+        seen.update(kwargs)
+        deps = intel_service.IntelDeps(settings=Settings(), sessionmaker=kwargs["sessionmaker"],
+                                       group_id="grp-1")
+        return intel_runtime.IntelRuntime("grp-1", [INST], deps, enabled=False)
+
+    monkeypatch.setattr(intel_runtime, "build_group_runtime", capture)
+    await manager._wire_intel(group)
+    assert seen["sessionmaker"] is get_sessionmaker
+    # 两跳必须真的走得通——只断言身份还不够，那正是这个缺陷活了四轮的原因。
+    async with seen["sessionmaker"]()() as session:
+        assert session is not None
+
+
 @pytest.mark.asyncio
 async def test_manager_wiring_is_fail_open(monkeypatch):
     """情报是加法流水线：它的任何失败都不该让一次真实资金的启动失败。"""

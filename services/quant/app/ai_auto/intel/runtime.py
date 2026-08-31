@@ -19,11 +19,19 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 from collections.abc import Callable, Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
+from . import arming
 from . import service
+from .arming import (  # noqa: F401 —— 原样重新导出，见下方注释
+    arm_error_for,
+    clear_arm_error,
+    record_arm_error,
+)
+from .arming import ArmState
 from .service import IntelDeps, RoundOutcome
 
 logger = logging.getLogger(__name__)
@@ -32,17 +40,37 @@ logger = logging.getLogger(__name__)
 # 「runtime 活得比 manager 实例久」这件事在类型上就不可能发生（镜像 `experience/scheduler.py`）。
 _RUNTIMES: dict[str, "IntelRuntime"] = {}
 _BY_INST: dict[str, "IntelRuntime"] = {}
+# 进程级单调重装序号（`itertools.count`）：只增不减、**不按分组分区**——序号只用于比大小，
+# 跨分组共用一个计数器不会出错且少一层字典。
+_ARM_SEQ = itertools.count(1)
+# 「分组没在跑」的**唯一**回执模板（`rearm_group` / `manager.rearm_intel` 共用；两处各拼一份
+# 必漂移，而这块面板的全部价值就在于「失败要出声」）。**调用点一律 `dict(...)` 取副本**。
+ARM_NOT_RUNNING: dict = {"rearmed": False, "pending": False, "armed": False,
+                         "reason": "not_running", "detail": "", "changed": False}
+# `_ARM_ERRORS` 与三个读写函数住在 `arming.py`（实施发现 I-1）：`resolve_arm` 的 `arm_failed`
+# 分支要读它，而 `arming` 依评审 P0-2 不许 import `runtime`。这里**原样重新导出**，故
+# `intel_runtime.record_arm_error(...)` / `clear_arm_error(...)` 的调用点一个字节不改。
 
 
 def _static_summary(inst_id: str, *, code: str) -> dict:
-    """未装配 / 已关闭时的静态 summary（**仍然下发**，否则降级在界面上恒不可见）。"""
+    """未装配 / 已关闭时的静态 summary（**仍然下发**，否则降级在界面上恒不可见）。
+
+    **签名一个字节不改**（评审 P1-2）：`code` 仍是一个降级码，arm 四键由
+    `arming.arm_of_code(code)` 解出来之后经 `arm_wire` 这**同一个**写点出键，§3.0 第 3 条
+    「同一列只有一个人写」因此没有被破坏，而 `tests/test_ai_intel_alert_shutdown.py` 里那次
+    `_static_summary(INST, code="no_provider")` 也继续绿（`no_provider` 不在 `ARM_REASONS` 里，
+    走 `arm_of_code` 的诚实回落分支）。
+
+    `"degrade": None` 是一个**占位**（与 `service.read_summary` 逐字同形）：`arm_wire` 只在未
+    装配时写它，占位保证这个键恒在位——前端读到 `undefined` 会把「没装上」画成「一切正常」。
+    """
     return {
         "instId": inst_id,
         "counts": {"ultra": 0, "mid": 0, "long": 0, "archived": 0},
         "unread": 0, "lastSeenTs": 0, "lastCollectTs": None, "lastCurateTs": None,
         "nextDueTs": None, "inFlight": False,
-        "degrade": service.degrade_wire(code),
-        "providerConfigured": False, "dailyUsed": 0, "dailyCap": 0,
+        "degrade": None,
+        "dailyUsed": 0, "dailyCap": 0,
         # closed-loop §3.6：两块新读数在**静态 summary 上也必须在位**（形状一致），否则未装配的
         # 分组会让前端读到 `undefined` 并把「情报层没装上」画成「引用了 0 次」。
         "citations": {"cited": 0, "entryCited": 0, "settledTrips": 0, "winCount": 0,
@@ -61,6 +89,8 @@ def _static_summary(inst_id: str, *, code: str) -> dict:
                      "overall": {"settled": 0, "wins": 0, "netPnlUsd": 0.0,
                                  "confirmed": 0, "refuted": 0, "unresolved": 0,
                                  "samples": 0, "accuracy": None}},
+        # arm-state 轴 A：四键 + `degrade` 从**同一个写点**出（§3.0 第 3 条）。
+        **arming.arm_wire(arming.arm_of_code(code)),
     }
 
 
@@ -88,13 +118,24 @@ class IntelRuntime:
         self._digest_ids: dict[str, frozenset[int]] = {}
         self._summary: dict[str, dict] = {}
         self._in_flight: set[str] = set()
+        # 一轮的**收尾段**（`_after_round`）跑在锁外、且在 `_in_flight` 被清掉之后，故它需要
+        # 自己的计数器；`_await_round_settled` 靠它才等得到那次快照刷新与告警交接（实施发现 I-3）。
+        self._tail = 0
+        # arm-state 轴 A / 轴 B：装配状态的唯一真值 + 重装序号 + 配置指纹 + 拆卸标志。
+        # **全部私有**，外部一律经 `arm` / `arm_pending` / `arm_fingerprint` 三个只读 property
+        # 读（评审 P1-6：公私成员名对不上，实现出来就是 `AttributeError`）。
+        self._arm: ArmState = arming.arm_of_deps(deps)
+        self._arm_seq = 0
+        self._arm_fingerprint: tuple = ()
+        self._retired = False
         for inst_id in self.members:
             # 首帧兜底：`scheduler._loop` 起步就会 refresh 一次，但 `snapshot()` 可能更早被调到。
-            # 装配成功的运行时在首帧就必须如实说 `providerConfigured=True`——否则弹窗会在最初
-            # 那一瞬显示「未配置检索源」并给出一个用户根本不需要点的设置入口。
-            seed = _static_summary(inst_id, code="no_provider")
-            if self.enabled:
-                seed["providerConfigured"] = True
+            # arm 四键由 `summary_for` 在**出口**统一打戳，故这里只剩 `degrade` 需要兜一手：
+            # `arm_wire` 在 armed 时**刻意不写** `degrade`（那个键要留给一次真实的轮内降级），
+            # 于是一个装配成功的运行时若沿用未装配 seed 的 `degrade`，弹窗会在最初那一瞬显示
+            # 「尚未配置情报检索源」并给出一个用户根本不需要点的设置入口。
+            seed = _static_summary(inst_id, code=self._arm.reason or "no_provider")
+            if self._arm.armed:
                 seed["degrade"] = None
             self._summary[inst_id] = seed
 
@@ -103,14 +144,95 @@ class IntelRuntime:
         return self._digest.get(inst_id)
 
     def summary_for(self, inst_id: str) -> dict | None:
+        """缓存里的那一份 + 两个出口瞬态。
+
+        arm 四键在**出口**统一打戳：缓存里的那一份可能是上一次装配期写的，而 `rearm` 之后它
+        必须立刻说新话。这也是 §3.0 第 3 条「同一列只有一个人写」的落点。
+        """
         summary = self._summary.get(inst_id)
         if summary is None:
             return None
-        return {**summary, "inFlight": inst_id in self._in_flight}
+        return {**summary, "inFlight": inst_id in self._in_flight,
+                **arming.arm_wire(self._arm)}
 
     @property
     def lock(self) -> asyncio.Lock:
         return self._lock
+
+    # ---------- 装配状态：三个只读 property + 一个置位方法（写点全部收敛在类内） ----------
+    @property
+    def arm(self) -> ArmState:
+        return self._arm
+
+    @property
+    def arm_pending(self) -> bool:
+        """是否有一次重装排在队里等这一轮跑完。
+
+        **不是**一个独立的自变量：它就是 ``self._arm.reason == "arm_pending"``。把它做成第二个
+        字段的那一刻，`read_summary`（不传 pending）与缓存那条打了戳的通路就会在同一份 wire 上
+        说两句相反的话（评审 P1-8）。这里让它退化成 `_arm` 的一个投影，物理上杜绝分叉。
+        """
+        return self._arm.reason == "arm_pending"
+
+    @property
+    def arm_fingerprint(self) -> tuple:
+        return self._arm_fingerprint
+
+    @property
+    def busy(self) -> bool:
+        """这一轮真的收完尾了吗。
+
+        `_in_flight` **不够**：`_run` 的 `async with self._lock` 在 `await self._after_round(...)`
+        **之前**就退出了，而 `_in_flight.discard` 又在那把锁里的 `finally` 上——于是快照刷新与
+        告警交接这两件事发生在「`_in_flight` 已空」之后。只看 `_in_flight` 的等待会立刻返回，
+        然后 `scheduler.cancel` 把它们静默丢掉（实施发现 I-3）。
+        """
+        return bool(self._in_flight) or self._tail > 0
+
+    def mark_arm_pending(self) -> None:
+        """把这个运行时标成「重装排队中」（`rearm_group` 的超时支路唯一的置位入口）。
+
+        **不动 `enabled`、不动 `deps`**：旧配置继续跑，只是界面上多一句「设置已保存，当前这一轮
+        情报跑完后自动生效」。
+        """
+        self._arm = arming.arm_of_code("arm_pending")
+
+    async def rearm(self, deps: IntelDeps, arm: ArmState, seq: int,
+                    fingerprint: tuple) -> bool:
+        """就地换掉这个运行时的配置。**同一实例、同一把锁、同一份缓存。**
+
+        Args:
+            deps / arm: `_build_deps` 在**锁外**造好的新依赖与新状态（造它可能失败，而一次失败
+                的重装绝不允许把一条正在正常工作的流水线弄停——§3.0 第 2 条）。
+            seq: 单调递增的重装序号。**只应用 `seq >= self._arm_seq` 的那一次**：用户连点两个
+                开关会排出两次后台重装，晚发起的那一次必须赢。
+            fingerprint: 这份配置的指纹。★ 它**必须和 `deps` 在同一把锁内、同一时刻**赋值
+                （评审 P1-9）：让调用方在 `wait_for` **之前**先写指纹，两个 PUT 在
+                `resolve_intel_settings` 那次 `await` 上交错时就会出现「B 的配置应用了、A 的
+                指纹后写进去了」——运行时跑着 B、指纹说是 A，此后任何一次把设置改回 A 的保存都
+                被 `changed=False` 短路，**A 永远装不上，且不报错**。指纹是「此刻真的在跑的那份
+                配置」的标签，谁应用谁贴。
+
+        Returns:
+            是否真的应用了。`retired`（分组已拆卸）或 `seq` 过期 ⇒ False。
+
+        ⚠️ **锁内不得有任何 await。** 五次赋值原子完成，故一次被 `wait_for` 取消的等待要么完全
+        没应用、要么完全应用，不存在中间态。
+        """
+        if self._retired:
+            return False
+        async with self._lock:                      # 等在飞轮跑完；绝不打断它
+            if self._retired or seq < self._arm_seq:
+                return False
+            self.deps, self._arm, self._arm_seq = deps, arm, seq
+            self._arm_fingerprint = fingerprint
+            self.enabled = arm.armed
+        await _sync_scheduler(self)                 # 起 / 停调度循环（延迟导入，同 invalidate）
+        return True
+
+    def retire(self) -> None:
+        """分组拆卸时置位。此后 `rearm` / `refresh` 全部是 no-op。"""
+        self._retired = True
 
     # ---------- 刷新 ----------
     async def refresh(self, inst_id: str, *, degrade_code: str = "",
@@ -126,12 +248,19 @@ class IntelRuntime:
         缓存里的那个旧值算出来的倒计时会指向一个已经过去的时刻——一个走到 0 却什么都没发生的
         倒计时，比不显示倒计时更坏。
         """
+        if self._retired:
+            return self._summary.get(inst_id)
         if not self.enabled:
-            summary = self._summary.get(inst_id) or _static_summary(inst_id, code="no_provider")
+            if inst_id not in self._summary:
+                # 兜底也必须走同一个写点：**绝不**把一份没有 arm 四键的裸字典推出去。前端读到
+                # `undefined` 会把「没装上」画成「一切正常」（E-18；历轮四次踩过同一个坑）。
+                self._summary[inst_id] = _static_summary(
+                    inst_id, code=self._arm.reason or "no_provider")
+            summary = self.summary_for(inst_id)
             self._notify(inst_id, summary)
             return summary
         try:
-            snapshot = await service.build_snapshot(self.deps, inst_id)
+            snapshot = await service.build_snapshot(self.deps, inst_id, arm=self._arm)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 —— 快照是加法；失败只放弃这一次刷新
@@ -203,7 +332,14 @@ class IntelRuntime:
                 self._in_flight.discard(inst_id)
         if outcome is None:
             return None
-        await self._after_round(inst_id, outcome)
+        # 收尾段跑在锁**外**（快照刷新 + 告警交接），故 `_in_flight` 已经空了。`_tail` 是
+        # `_await_round_settled` 唯一等得到它的抓手——少这一层，一次「关掉总闸」会把这一轮的
+        # `_alert` 告警交接静默丢掉，症状是「今天为什么一次都没告警」恰好在这一次没有答案。
+        self._tail += 1
+        try:
+            await self._after_round(inst_id, outcome)
+        finally:
+            self._tail -= 1
         return outcome
 
     async def _after_round(self, inst_id: str, outcome: RoundOutcome) -> None:
@@ -265,8 +401,10 @@ def unregister(group_id: str) -> None:
     """拆卸（`stop_group` / `end_group`）。**按身份比对再删** `_BY_INST`：同一标的可能已经属于
     下一个分组了。"""
     runtime = _RUNTIMES.pop(group_id, None)
+    arming.clear_arm_error(group_id)      # 残留会让下一个分组读到上一个分组的失败原因
     if runtime is None:
         return
+    runtime.retire()
     for inst_id in list(_BY_INST):
         if _BY_INST.get(inst_id) is runtime:
             del _BY_INST[inst_id]
@@ -405,51 +543,232 @@ async def build_group_runtime(*, group_id: str, members: Iterable[str], settings
         `IntelRuntime`。总闸关 / 未配置检索源 ⇒ `enabled=False` 的**壳**（不起任务、不查库，
         但仍持一份静态降级 summary，使 `no_provider` 在界面上可见——评审 P1-3）。
     """
+    async with sessionmaker()() as db:
+        derived = await service.resolve_intel_settings(db, settings)
+        api_key = await service.resolve_api_key(db, derived)
+    deps, arm = _build_deps(
+        settings=derived, api_key=api_key, provider_cfg=provider_cfg, make_client=make_client,
+        ident=GroupIdentity(sessionmaker=sessionmaker, group_id=group_id, bar=bar,
+                            change_24h_pct=change_24h_pct))
+    return IntelRuntime(group_id, members, deps, notify=notify, enabled=arm.armed,
+                        notify_alert=notify_alert)
+
+
+@dataclass(frozen=True)
+class GroupIdentity:
+    """分组身份：**与设置无关、重装时必须原样带过去**的四个字段。"""
+
+    sessionmaker: object
+    group_id: str
+    bar: str
+    change_24h_pct: object | None
+
+
+def identity_of(deps: IntelDeps) -> GroupIdentity:
+    """从一份在跑的依赖里取出分组身份（重装时原样带给下一份）。"""
+    return GroupIdentity(sessionmaker=deps.sessionmaker, group_id=deps.group_id,
+                         bar=deps.bar, change_24h_pct=deps.change_24h_pct)
+
+
+def _build_deps(*, settings, api_key: str, provider_cfg, make_client,
+                ident: GroupIdentity) -> tuple[IntelDeps, ArmState]:
+    """按**已解析好的** settings 造一份新依赖（纯装配，无 DB 会话、无出网）。
+
+    Args:
+        settings: `resolve_intel_settings` 的派生副本。
+        api_key: `resolve_api_key` 的产物（**显式入参**——评审 P1-1）。
+        provider_cfg / make_client: LLM provider 配置与 client 工厂。
+        ident: 分组身份。★ **评审 P0-1**：这四个字段**必须显式传**，绝不能「从上一份继承」。
+            原实现的两个壳分支构造 `IntelDeps` 时只传了 `settings` 与 `sessionmaker`，
+            `group_id` / `bar` / `change_24h_pct` 取的是 dataclass 默认值 `""` / `"15m"` /
+            `None`——**壳恰恰是没有分组身份的那一个**。而「开跑时没配源、跑起来之后才去设置里
+            配」正是本轮用户报告的那一种处境：从壳继承身份，会让修好之后采到的每一条情报都挂着
+            空 `groupId`、三种轮存根同样落空、Agent 拿到写死的 15m 市场上下文、「近 24 小时
+            涨跌」整行消失——**而且没有任何东西会报错**。
+
+    Returns:
+        `(deps, arm)`。检索源装不上 ⇒ 返回一个 `search=None` 的 deps 与一个未装配的
+        `ArmState`——**不抛**，「没配源」是一个正常状态而不是错误。
+
+    ⚠️ 本函数是 `IntelDeps` 的**唯一**构造点：`build_group_runtime` 的三条分支（总闸关 /
+    没配源 / 实装）与 `rearm_group` 全部走它，于是「两条壳分支形状不一致」与「壳没有身份」被
+    同一次重构一起消灭。
+    """
     from . import evidence
     from . import search as search_mod
     from .llm import build_intel_llm_client
 
-    async with sessionmaker()() as db:
-        derived = await service.resolve_intel_settings(db, settings)
-        api_key = await service.resolve_api_key(db, derived)
-    if not bool(getattr(derived, "ai_trade_intel_enabled", False)):
-        shell = IntelRuntime(group_id, members,
-                             IntelDeps(settings=derived, sessionmaker=sessionmaker),
-                             notify=notify, enabled=False, notify_alert=notify_alert)
-        for inst_id in shell.members:
-            shell._summary[inst_id] = _static_summary(inst_id, code="disabled")
-        return shell
+    base = {"settings": settings, "sessionmaker": ident.sessionmaker,
+            "group_id": ident.group_id, "bar": ident.bar,
+            "change_24h_pct": ident.change_24h_pct}
+    code = arming.classify_config(settings)
+    if code:
+        return IntelDeps(**base), arming.arm_of_code(code)
     provider = search_mod.resolve_search_provider(
-        slug=str(derived.ai_trade_intel_search_provider), api_key=api_key,
-        base_url=str(derived.ai_trade_intel_search_base_url),
-        timeout_s=float(derived.ai_trade_intel_search_timeout_s),
-        max_retries=int(derived.ai_trade_intel_search_max_retries),
-        proxy=derived.proxy_url)
+        slug=str(settings.ai_trade_intel_search_provider), api_key=api_key,
+        base_url=str(settings.ai_trade_intel_search_base_url),
+        timeout_s=float(settings.ai_trade_intel_search_timeout_s),
+        max_retries=int(settings.ai_trade_intel_search_max_retries),
+        proxy=settings.proxy_url)
     if provider is None:
-        return IntelRuntime(group_id, members,
-                            IntelDeps(settings=derived, sessionmaker=sessionmaker),
-                            notify=notify, enabled=False, notify_alert=notify_alert)
+        # `classify_config` 说配齐了、适配器却造不出来。两张真值表本该同源（G-25），走到这里
+        # 只可能是适配器构造本身失败——那是装配失败，不是「你没配」。
+        return IntelDeps(**base), arming.arm_of_code("arm_failed")
     runner = search_mod.SearchRunner(
-        provider, timeout_s=float(derived.ai_trade_intel_search_timeout_s))
+        provider, timeout_s=float(settings.ai_trade_intel_search_timeout_s))
     # closed-loop 评审 P1-3：核查轮的**第二个** client（`verify_max_tokens` 只能走构造参）。
     # 装配失败 ⇒ `verify_llm=None` ⇒ 编排层回落 `deps.llm`，**不报错**（§十一 该行的定稿）。
     # 这个 try 不是防御性噪音：它守的是「核查轮的预算装配」这一件**加法**的事，而它下面那次
     # `build_intel_llm_client` 守的是采集轮——采集轮造不出 client 就该照旧向上抛，两者不同命。
     try:
         verify_llm = build_intel_llm_client(
-            provider_cfg, derived, make_client=make_client,
-            max_tokens_override=int(getattr(derived, "ai_trade_intel_verify_max_tokens", 2048)))
+            provider_cfg, settings, make_client=make_client,
+            max_tokens_override=int(getattr(settings, "ai_trade_intel_verify_max_tokens",
+                                            2048)))
     except Exception as exc:  # noqa: BLE001 —— 见上：回落比整组不装配好
         logger.warning("ai-trade intel: 核查轮 client 装配失败，回落采集轮预算（%s）: %s",
-                       group_id, exc)
+                       ident.group_id, exc)
         verify_llm = None
     # evidence-grounding 轴 A：抓取器**只持配置**（frozen dataclass），`httpx.AsyncClient` 在
     # `fetch_many` 内部 `async with` 建与关。`proxy` 复用进程代理（E-15），**不新增配置项**；
     # 关掉 `reader_enabled` ⇒ `fetch_many` 一个请求都不发、语料块逐字节回到上一轮。
-    deps = IntelDeps(settings=derived, sessionmaker=sessionmaker, search=runner,
-                     llm=build_intel_llm_client(provider_cfg, derived,
+    deps = IntelDeps(**base, search=runner,
+                     llm=build_intel_llm_client(provider_cfg, settings,
                                                 make_client=make_client),
-                     verify_llm=verify_llm, reader=evidence.reader_config(derived),
-                     group_id=group_id, bar=bar, change_24h_pct=change_24h_pct)
-    return IntelRuntime(group_id, members, deps, notify=notify, enabled=True,
-                        notify_alert=notify_alert)
+                     verify_llm=verify_llm, reader=evidence.reader_config(settings))
+    return deps, ArmState(True, True, True)
+
+
+# ---------------- 轴 B：就地热重装（换配置、不换实例） ----------------
+# 收尾等待的轮询节拍。比 `TICK_SECONDS` 小两个数量级——它等的是一次已经在跑的收尾段，不是排期。
+_SETTLE_POLL_S = 0.02
+
+
+async def _await_round_settled(runtime: "IntelRuntime", timeout_s: float) -> bool:
+    """有界地等这一轮收完尾（**不取锁**）。返回是否等到了。
+
+    取锁会与 `rearm` 刚释放的那把锁排队，把一次有界等待变成无界等待——那正是本函数存在的理由
+    的反面。判据取 `runtime.busy`（`_in_flight` **或** 收尾段计数器），因为 `_after_round`
+    跑在锁外、且在 `_in_flight` 被清掉之后（实施发现 I-3）。
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, float(timeout_s))
+    while runtime.busy:
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(_SETTLE_POLL_S)
+    return True
+
+
+async def _sync_scheduler(runtime: "IntelRuntime") -> None:
+    """让调度循环与 `runtime.enabled` 对齐。
+
+    ★ 评审 P1-10：停机分支**不能直接 cancel**。`_run` 的 `async with self._lock` 在
+    `await self._after_round(...)` **之前**就退出了，所以此刻上一轮的收尾段可能正在跑；
+    `scheduler.cancel` 取消的正是承载它的那个 `_loop` 任务 ⇒ 这一轮的快照刷新与 `_alert`
+    告警交接被静默丢弃。告警交接是「一条够格的高危情报当场多问一次 AI」那条链的第二跳，把它
+    丢在一次开关拨动上，症状是「今天为什么一次都没告警」这个问题**恰好在这一次没有答案**。
+    故：先给收尾段一个**有界**的窗口（复用同一条重装死线），超时才硬 cancel 并如实记 warning。
+    """
+    from . import scheduler
+
+    if runtime.enabled:
+        scheduler.start(runtime)        # 已有循环时它自己 return（既有幂等保护）
+        return
+    settled = await _await_round_settled(
+        runtime, float(getattr(runtime.deps.settings,
+                               "ai_trade_intel_rearm_deadline_s", 2.5)))
+    if not settled:
+        logger.warning("ai-trade intel: 分组 %s 的收尾段在死线内没有跑完，直接取消调度循环"
+                       "（这一轮的快照刷新与告警交接会丢失）", runtime.group_id)
+    scheduler.cancel(runtime.group_id)
+    for inst_id in runtime.members:     # 停下来这件事也必须立刻在界面上看得见
+        scheduler.schedule(runtime.refresh(inst_id))
+
+
+def _arm_result(*, rearmed: bool, pending: bool, arm: ArmState, changed: bool) -> dict:
+    """`rearm_group` / `arm_result_for` 的**同一张 6 键回执**（两处各拼一份必漂移）。"""
+    return {"rearmed": bool(rearmed), "pending": bool(pending), "armed": bool(arm.armed),
+            "reason": str(arm.reason), "detail": str(arm.detail), "changed": bool(changed)}
+
+
+def arm_result_for(group_id: str) -> dict:
+    """按 `rearm_group` 的同一张回执读一个分组此刻的装配结论（`manager` 的回落支路用）。
+
+    两处各拼一份回执必漂移，而这块面板的全部价值就在于「失败要出声」。
+    """
+    runtime = _RUNTIMES.get(group_id)
+    if runtime is None:
+        detail = arming.arm_error_for(group_id)
+        arm = (ArmState(True, True, False, "arm_failed", detail) if detail
+               else arming.arm_of_code("not_running"))
+        return _arm_result(rearmed=False, pending=False, arm=arm, changed=False)
+    return _arm_result(rearmed=True, pending=runtime.arm_pending,
+                       arm=runtime.arm, changed=True)
+
+
+async def rearm_group(*, group_id: str, settings, provider_cfg, make_client,
+                      deadline_s: float = 2.5) -> dict:
+    """重装一个分组的情报运行时（`manager.rearm_intel` 的唯一实现）。
+
+    `sessionmaker` / `members` / `bar` / `change_24h_pct` / `notify` / `notify_alert` 全部
+    **从已注册的那个运行时上取**——它们是分组身份的一部分，与设置无关；这也让形参收在 5 个
+    以内（CLAUDE.md 二）。
+
+    Returns:
+        `{"rearmed", "pending", "armed", "reason", "detail", "changed"}`。**一次装配失败不抛**
+        ——它被收敛成 `reason="arm_failed"` 的回执并记进 `_ARM_ERRORS`（与 `_wire_intel` 的
+        fail-open 同源）：调用点是一个设置保存请求，情报层装不上不该让「保存设置」失败。
+
+    ⚠️ 本函数**不是**全局的 fail-open 点：库读不出来（`resolve_intel_settings` /
+    `resolve_api_key`）这类 IO 异常仍然原样上抛，由**唯一**那个吞异常的地方
+    `api/app_settings._rearm_intel_pipeline` 接住。把 `except Exception` 撒在每一层，真正的
+    失败就再也没有人看得见了（CLAUDE.md 五：捕获异常时尽量缩小作用域）。
+
+    Note:
+        `_RUNTIMES` 里没有这个分组时回 `not_running` 并**把裁决权交回 `manager.rearm_intel`**
+        ——★ 评审 P0-3：`_wire_intel` 的 fail-open 是在 `register` **之前**吞的异常，所以
+        「分组在跑、却一个 runtime 都没有」正是那个自救入口唯一要救的处境。在这里直接回
+        `not_running` 就是对一个正在跑的分组说「AI 自动交易未在运行」——一句确定错误的话。
+    """
+    runtime = _RUNTIMES.get(group_id)
+    if runtime is None:
+        return dict(ARM_NOT_RUNNING)
+    ident = identity_of(runtime.deps)
+    async with ident.sessionmaker()() as db:
+        derived = await service.resolve_intel_settings(db, settings)
+        api_key = await service.resolve_api_key(db, derived)
+    fingerprint = arming.settings_fingerprint(derived, api_key)
+    if fingerprint == runtime.arm_fingerprint and not runtime.arm_pending:
+        # 一次真正的空操作：连锁都不碰（G-18 用一把会计数的替身锁冻结这一条）。
+        return _arm_result(rearmed=False, pending=False, arm=runtime.arm,
+                           changed=False)
+    try:
+        deps, arm = _build_deps(settings=derived, api_key=api_key, provider_cfg=provider_cfg,
+                                make_client=make_client, ident=ident)
+    except Exception as exc:  # noqa: BLE001 —— 见 docstring：保存设置绝不因情报层失败而失败
+        logger.warning("ai-trade intel rearm build failed (%s): %s", group_id, exc)
+        arming.record_arm_error(group_id, exc)
+        # **旧运行时一个字段都没被改**（§3.0 第 2 条：一次失败的重装绝不允许把一条正在正常
+        # 工作的流水线弄停）。
+        return _arm_result(rearmed=False, pending=False,
+                           arm=ArmState(True, True, False, "arm_failed", str(exc)[:200]),
+                           changed=False)
+    from . import scheduler
+
+    seq = next(_ARM_SEQ)
+    try:
+        await asyncio.wait_for(runtime.rearm(deps, arm, seq, fingerprint),
+                               timeout=max(0.0, float(deadline_s)))
+    except asyncio.TimeoutError:
+        # 有一轮在飞（可达 60 秒）。**不阻塞这个 HTTP 请求**：把重装排进既有 tracked 任务集
+        # （它已被 `_shutdown_steps` 第 7 步 drain，故本轮不新增任何关停步骤），并如实回执。
+        runtime.mark_arm_pending()              # ★ 只改 `_arm`，不动 `enabled` / `deps`
+        scheduler.schedule(runtime.rearm(deps, arm, seq, fingerprint))
+        return _arm_result(rearmed=False, pending=True, arm=runtime.arm,
+                           changed=True)
+    if arm.reason == "arm_failed":
+        arming.record_arm_error(group_id, "检索源适配器构造失败")
+    else:
+        arming.clear_arm_error(group_id)
+    return _arm_result(rearmed=True, pending=False, arm=arm, changed=True)

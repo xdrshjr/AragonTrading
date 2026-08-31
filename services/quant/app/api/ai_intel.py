@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai_auto import get_ai_trade_manager
+from ..ai_auto.intel import arming
 from ..ai_auto.intel import corpus as intel_corpus
 from ..ai_auto.intel import gate as intel_gate
 from ..ai_auto.intel import runtime as intel_runtime
@@ -79,9 +80,38 @@ async def _effective_limits(session: AsyncSession, settings: Settings):
     return tax.limits_from_settings(derived)
 
 
-# 只有运行时知道的三个瞬态：轮是不是正在飞、本轮降级成什么、这个分组到底有没有装配上检索源。
-# 其余全部是库存事实，必须取**当次查库**的值。
-_RUNTIME_ONLY_KEYS = ("inFlight", "degrade", "providerConfigured")
+# 只有运行时知道的**两个**瞬态：轮是不是正在飞、本轮降级成什么。其余全部是库存事实，必须取
+# **当次查库**的值。
+#
+# ★ arm-state 轴 A：`providerConfigured` **移出**这张表。它从来就不是一个运行时瞬态——
+# 「检索源配没配」住在 `app_settings` 里，把它交给运行时缓存，等于让一个**装配事实**冒充一个
+# **配置事实**：壳运行时缓存的那个 `False` 恒覆盖库值，于是一个已经配好了源的用户被告知
+# 「尚未配置情报检索源」。
+#
+# ⚠️ `degrade` **只在流水线真的装上时**从缓存优先（实施发现 I-9）。一次真实的轮内降级
+# （`search_failed` / `circuit_open` / `budget_exhausted`）只有运行时知道，它比一个静态的 arm
+# 结论更值得显示——**但那种降级只可能发生在一个装上了的流水线上**（未装配的运行时一轮都不跑）。
+# 反过来，未装配时缓存里那个 `degrade` 是**装配期**打的戳，它会过期：一个开跑时没配源的壳，
+# `_arm` 恒是 `provider_unset`，而此刻库里可能早已配齐、只是重装失败了（`arm_failed`）。
+# 无条件让缓存赢，就会出现 `armReason="arm_failed"` 而 `degrade.code="provider_unset"`——
+# 同一份 wire 的两个键说两句相反的话，正是本轮立项要消灭的东西（P1-8 / G-31 的同形）。
+# 故：`armed` 时取缓存（轮内降级 > 无），未装配时取当次算出来的 arm 码（它是刚刚算的，缓存不是）。
+_RUNTIME_ONLY_KEYS = ("inFlight", "degrade")
+# 未装配时仍然从缓存取的那些键：只剩 `inFlight`（它在库里没有落点，且与 arm 无关）。
+_RUNTIME_ONLY_KEYS_UNARMED = ("inFlight",)
+
+
+def _is_group_member(inst_id: str) -> bool:
+    """这个标的此刻是不是正在跑的自动交易分组的成员（**同步、不查库**）。
+
+    判据取 `group_status()` 的 `members`——`api/app_settings.py` 的成本估算已经是这个用法，
+    本轮不发明第二个口径。`group_status()` 在无活跃分组时回 `None`，故「没在跑」与「跑着但不含
+    这个标的」在这里天然合流成同一个 `False`（§十三 Q4 的裁决：一句「该标的的情报不会自动
+    采集」两种情况都成立，不为一个用户分不清的区别多造一个码）。
+    """
+    status = get_ai_trade_manager().group_status() or {}
+    return any(str(member.get("instId")) == inst_id
+               for member in (status.get("members") or []))
 
 
 async def _summary(session: AsyncSession, inst_id: str, settings: Settings) -> dict:
@@ -100,12 +130,13 @@ async def _summary(session: AsyncSession, inst_id: str, settings: Settings) -> d
     # 还按开着算」，而且 WS 通路（`build_snapshot` 用的是 `deps.settings`，本来就是派生的）
     # 与 REST 通路会给出两个不同的答案，两边都不报错。
     derived = await intel_service.resolve_intel_settings(session, settings)
-    fresh = await intel_service.read_summary(
-        session, inst_id, settings=derived,
-        provider_configured=intel_runtime.runtime_for(inst_id) is not None)
+    arm = arming.resolve_arm(derived, runtime=intel_runtime.runtime_for(inst_id),
+                             member=_is_group_member(inst_id))
+    fresh = await intel_service.read_summary(session, inst_id, settings=derived, arm=arm)
     if cached is None:
         return fresh
-    return {**fresh, **{key: cached[key] for key in _RUNTIME_ONLY_KEYS if key in cached}}
+    keys = _RUNTIME_ONLY_KEYS if arm.armed else _RUNTIME_ONLY_KEYS_UNARMED
+    return {**fresh, **{key: cached[key] for key in keys if key in cached}}
 
 
 # ⚠️ **字面量路径必须声明在 `/intel/{instId}` 之前**：FastAPI 按注册顺序匹配，
@@ -367,14 +398,26 @@ async def read_intel_rounds(instId: str, kind: str | None = None,
     return {"rounds": await repo.list_intel_rounds(session, instId, kind=kind, limit=limit)}
 
 
-def _require_runtime(inst_id: str):
-    """取该标的的情报运行时；未装配 / 未配置检索源 ⇒ 409（**诚实降级，绝不假装在采**）。"""
+async def _require_runtime(session: AsyncSession, inst_id: str, settings: Settings):
+    """取该标的的情报运行时；未装配 ⇒ 409，**并说出真正的原因**。
+
+    ★ 评审 P0-4：判据**只留一份**——与 `_summary` 调同一个 `arming.resolve_arm`，吃同一份
+    `resolve_intel_settings` 的派生副本。给这里配第二个「同步、没有会话」的判定函数，在
+    「一个 runtime 都没有」这条**最需要说实话**的支路上它拿不到 provider / key 的库内值，只能
+    猜——于是本轮花整章消灭的那句假话，会从 `GET /intel/{instId}` 原样挪到「立即采集」的 409 里。
+
+    兜底码用 `no_provider`（而不是一个 `ARM_REASONS` 之外的新码）：拼出来的 `intel_<码>` 要让
+    `degrade_message` 找得到文案，否则用户看到的是一句裸码。
+    """
     runtime = intel_runtime.runtime_for(inst_id)
-    if runtime is None or not runtime.enabled:
-        raise HTTPException(409, detail={
-            "code": "intel_no_provider",
-            "message": tax.degrade_message("no_provider")})
-    return runtime
+    if runtime is not None and runtime.enabled:
+        return runtime
+    derived = await intel_service.resolve_intel_settings(session, settings)
+    arm = arming.resolve_arm(derived, runtime=runtime, member=_is_group_member(inst_id))
+    raise HTTPException(409, detail={
+        "code": f"intel_{arm.reason or 'no_provider'}",
+        "message": tax.degrade_message(arm.reason or "no_provider",
+                                       reason=arm.detail or "原因未记录")})
 
 
 @router.post("/intel/{instId}/collect", status_code=202)
@@ -383,7 +426,7 @@ async def trigger_collect(instId: str, session: AsyncSession = Depends(get_sessi
     """手动触发一轮采集（**排队即返回**，故前端超时档走 FAST 即可）。"""
     _require_ai_enabled(settings)
     await _require_known_inst(session, instId)
-    runtime = _require_runtime(instId)
+    runtime = await _require_runtime(session, instId, settings)
     if runtime.lock.locked():
         raise HTTPException(409, detail={"code": "intel_busy",
                                          "message": "该标的已有一轮情报正在进行中"})
@@ -402,7 +445,7 @@ async def trigger_curate(instId: str, session: AsyncSession = Depends(get_sessio
     """手动触发一轮整理。"""
     _require_ai_enabled(settings)
     await _require_known_inst(session, instId)
-    runtime = _require_runtime(instId)
+    runtime = await _require_runtime(session, instId, settings)
     if runtime.lock.locked():
         raise HTTPException(409, detail={"code": "intel_busy",
                                          "message": "该标的已有一轮情报正在进行中"})
@@ -495,7 +538,7 @@ async def trigger_verify(instId: str, session: AsyncSession = Depends(get_sessio
     """手动触发一轮核查（closed-loop §4.1 #20，**排队即返回**）。"""
     _require_ai_enabled(settings)
     await _require_known_inst(session, instId)
-    runtime = _require_runtime(instId)
+    runtime = await _require_runtime(session, instId, settings)
     if runtime.lock.locked():
         raise HTTPException(409, detail={"code": "intel_busy",
                                          "message": "该标的已有一轮情报正在进行中"})
@@ -517,7 +560,7 @@ async def trigger_item_verify(itemId: int, session: AsyncSession = Depends(get_s
     item = await _load_item_or_404(session, itemId)
     inst_id = item["instId"]
     await _require_known_inst(session, inst_id)
-    runtime = _require_runtime(inst_id)
+    runtime = await _require_runtime(session, inst_id, settings)
     if runtime.lock.locked():
         raise HTTPException(409, detail={"code": "intel_busy",
                                          "message": "该标的已有一轮情报正在进行中"})

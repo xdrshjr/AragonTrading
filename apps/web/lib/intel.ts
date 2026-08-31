@@ -156,10 +156,57 @@ const WEAK_DEGRADE = new Set([
   "no_tool_call",
   "all_rejected",
   "verify_no_corpus",
+  // ai-trade-intel-arm-state：两个**装配**码同样是弱提示。`not_running` 在自动交易没开的
+  // 整段时间里恒成立，染色等于把警示色常亮；`arm_pending` 最多持续一轮。按同一把尺子，
+  // 它们比既有的 `search_empty` 更没有资格染色。
+  // 反过来 `arm_failed` / `provider_unset` / `key_missing` / `provider_unknown` 是**强提示**，
+  // 保持染色——那四种是「用户不动手就永远不会有情报」。
+  "not_running",
+  "arm_pending",
 ]);
 
 export function isSevereDegrade(degrade: IntelDegrade | null): boolean {
   return !!degrade && !WEAK_DEGRADE.has(degrade.code);
+}
+
+/** 降级 banner 上那个按钮该做什么（**单一真源**，设置卡与弹窗共用）。 */
+export type IntelDegradeAction = "settings" | "rearm" | "retry" | "none";
+
+/** 「去设置」能解决的降级码：它们全都是用户在设置中心动一下手就能修好的。 */
+const SETTINGS_CODES = new Set([
+  "no_provider",
+  "disabled",
+  "provider_unset",
+  "key_missing",
+  "provider_unknown",
+]);
+
+/**
+ * 「重新装配」能解决的降级码。**只有 `arm_failed` 一个**。
+ *
+ * `not_running`（要用户去开自动交易）与 `arm_pending`（只要等一轮跑完）刻意不在表里：给一个
+ * 点了什么也不发生的按钮，比不给按钮更坏。
+ */
+export const REARM_CODES = new Set(["arm_failed"]);
+
+/** 给不出任何按钮的两个码：一个要用户去开自动交易，一个只要等一轮跑完。 */
+const NO_ACTION_CODES = new Set(["not_running", "arm_pending"]);
+
+/**
+ * 降级码 → 该给哪一个按钮。
+ *
+ * 取代了此前那句 `code === "no_provider" || code === "disabled" ? 去设置 : 立即重试` 的二分：
+ * 两个语义完全不同的码共用同一个按钮，正是本轮要修的那类「把不同的事压成同一句话」。
+ *
+ * `"retry"` 这一支**刻意保留**：`search_failed` / `circuit_open` / `budget_exhausted` 这些
+ * **轮内**降级码在本轮之前就归它管，砍掉它等于顺手拿走一个正常工作的重试入口。
+ */
+export function degradeAction(degrade: IntelDegrade | null): IntelDegradeAction {
+  if (!degrade) return "none";
+  if (SETTINGS_CODES.has(degrade.code)) return "settings";
+  if (REARM_CODES.has(degrade.code)) return "rearm";
+  if (NO_ACTION_CODES.has(degrade.code)) return "none";
+  return "retry";
 }
 
 /** 下一次采集的倒计时文案；无排期 ⇒ 空串 ⇒ 该行不渲染。 */

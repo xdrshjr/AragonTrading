@@ -289,6 +289,39 @@ export interface IntelDegrade {
   retryInS: number | null;
 }
 
+/**
+ * 装配状态码（与后端 `taxonomy.ARM_REASONS` **逐字对齐**）。
+ *
+ * `""` = 已装配。其余七个各自对应一句不同的话与一条不同的出路——把它们压成一个布尔，就会让
+ * 「你没配」出现在一个**已经配好了**的用户面前，那是系统在对用户说一句关于用户自己配置的假话。
+ */
+export type IntelArmReason =
+  | ""
+  | "disabled"
+  | "provider_unset"
+  | "key_missing"
+  | "provider_unknown"
+  | "not_running"
+  | "arm_failed"
+  | "arm_pending";
+
+/** `GET/PUT/POST /settings/intel*` 回执里的装配状态块（9 键，后端 `arm_settings_wire` 装配）。 */
+export interface IntelArm {
+  providerConfigured: boolean;
+  intelEnabled: boolean;
+  armed: boolean;
+  /** 与 `AiTradeIntelSummary.armReason` **恒同值**（同值不同名，后端 G-29 冻结）。 */
+  reason: IntelArmReason;
+  /** 后端下发的一句话，前端**一个字都不编**。 */
+  message: string;
+  /** `arm_failed` 时的异常文本（已截断、已脱敏）；其余情况为空串。 */
+  detail: string;
+  groupRunning: boolean;
+  armedMembers: string[];
+  /** = (reason === "arm_pending")，**不是第二个自变量**。 */
+  pending: boolean;
+}
+
 export interface AiTradeIntelSummary {
   instId: string;
   counts: { ultra: number; mid: number; long: number; archived: number };
@@ -301,7 +334,19 @@ export interface AiTradeIntelSummary {
   nextDueTs: number | null;
   inFlight: boolean;
   degrade: IntelDegrade | null;
+  /**
+   * ★ 语义修正（ai-trade-intel-arm-state）：**库里配没配**，不再是「进程里装没装」。
+   *
+   * 它此前被定义成「这个进程里此刻有没有一个 enabled 的 IntelRuntime」——一个**装配事实**冒充
+   * 一个**配置事实**，于是四种完全不同的处境被压成同一个 false、同一句「尚未配置情报检索源」。
+   */
   providerConfigured: boolean;
+  /** 总闸（设置里的「启用市场情报采集」）。配好了源但关着总闸，是另一句话、另一条出路。 */
+  intelEnabled: boolean;
+  /** 此刻真的在跑吗。**`armed` 为真 ⇒ 前两者必为真**（后端不变式，前端可放心先看它）。 */
+  armed: boolean;
+  /** `armed=false` 时的原因码；`armed=true` 时恒为 `""`。 */
+  armReason: IntelArmReason;
   dailyUsed: number;
   dailyCap: number;
   /** closed-loop 轴 B 的会话级读数。`netPnlUsd` 是**关联**净额（共现，不是因果）。 */
@@ -426,6 +471,8 @@ export interface IntelSettings {
    * 「会话未在时限内响应」——而后端那一侧还在正常等着。
    */
   alertPendingTtlS: number;
+  /** 装配状态：「我刚保存的这份设置，此刻到底有没有在跑」。 */
+  arm: IntelArm;
 }
 
 export interface IntelSettingsPatch {

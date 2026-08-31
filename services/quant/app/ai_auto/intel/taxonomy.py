@@ -211,7 +211,36 @@ DEGRADE_TEXT: dict[str, str] = {
     "verify_search_failed": "核查检索请求失败（{reason}）",
     "verify_no_corpus": "本轮核查没有检索到任何可用材料，相关条目记为待定",
     "verify_llm_failed": "核查模型调用失败（{reason}）",
+    # ---- arm-state §3.1.3：六条**装配状态**文案（`disabled` 已在表内，复用）。
+    # 它们与上面那些「轮内降级」不同命：轮内降级说的是「这一轮出了什么事」，装配码说的是
+    # 「这条流水线到底装没装上、为什么没装上、用户该做什么」。把两者压成同一个
+    # `no_provider`，就是在对一个**已经配好了**的用户说一句关于他自己配置的假话。
+    "provider_unset": "尚未选择情报检索源，情报采集未启动",
+    "key_missing": "已选择检索源，但还没有保存它的 API Key，情报采集未启动",
+    "provider_unknown": "配置的检索源不在已实现列表内，已按未配置处理",
+    "not_running": "AI 自动交易未在运行，该标的的情报不会自动采集",
+    # ⚠️ `{reason}` 占位：`degrade_message` 在占位缺失时**保留原样文本**（下面那条
+    # `except (KeyError, IndexError): return template`），意味着漏传会让用户看到字面的
+    # `{reason}`。故 `arming.arm_wire` 无条件传 `reason=state.detail or "原因未记录"`（G-6）。
+    "arm_failed": "情报流水线装配失败（{reason}），检索源配置本身没有问题",
+    "arm_pending": "设置已保存，当前这一轮情报跑完后自动生效",
 }
+
+# ---------------- 装配状态码（单一真源，前后端共用；arm-state §3.1.3） ----------------
+# 顺序 = 判定顺序 = 「越靠外层的原因越先解释」。
+#
+# ⚠️ 旧码 `no_provider` **不在本表里且刻意保留不动**：它仍表达「轮跑起来了但 `deps.search` 是
+# None」这一种**轮内**降级（`service.py` / `service_curate.py` / `service_verify.py` 四处），
+# 与装配码不同命。改名等同于破坏性变更（CLAUDE.md 五）。
+ARM_REASONS: tuple[str, ...] = (
+    "disabled",           # 总闸关（复用既有降级码，文案已在 DEGRADE_TEXT）
+    "provider_unset",     # 没选源
+    "key_missing",        # 选了源、没存 key
+    "provider_unknown",   # 源名不在已实现列表里
+    "not_running",        # 配置齐，但自动交易没在跑 / 该标的不在分组内
+    "arm_failed",         # 配置齐、分组在跑，但装配抛异常（fail-open 吞掉了）
+    "arm_pending",        # 设置已保存，重装排队中（等当前这一轮跑完）
+)
 
 
 def degrade_message(code: str, **fields) -> str:
@@ -231,6 +260,20 @@ def degrade_message(code: str, **fields) -> str:
         return template.format(**fields)
     except (KeyError, IndexError):
         return template
+
+
+def degrade_wire(code: str, *, retry_in_s: int | None = None, **fields) -> dict:
+    """降级码 → wire（文案**由后端下发**，前端不二次编，§3.7.4）。
+
+    ⚠️ **本函数是从 `service.py` 单向搬过来的，零语义变化**（arm-state 评审 P0-2）：它与
+    `DEGRADE_TEXT` / `degrade_message` 本就同源，而留在 `service.py` 会让新的纯核心模块
+    `arming.py` 为了拼一个三键字典去 import `service`——那与 `service` 反向 import `arming`
+    模块级成环，**先解析 `arming` 的入口会让整个后端起不来**。`service.py` 原样重新导出本名，
+    故 `service.degrade_wire(...)` 的既有调用点一个字节不改（照抄 `settings_bridge` 那次单向
+    搬家的先例）。
+    """
+    return {"code": code, "message": degrade_message(code, **fields),
+            "retryInS": retry_in_s}
 
 
 # ---------------- 闸⑥：指令剥离的模式表（评审 P1-4） ----------------

@@ -31,6 +31,7 @@ export default function IntelList({
   onOpenSettings,
   onCollect,
   onClearFilters,
+  onRearm,
   evidenceById = {},
   evidenceLoadingId = null,
   evidenceErrors = {},
@@ -52,6 +53,8 @@ export default function IntelList({
   onOpenSettings: () => void;
   onCollect: () => void;
   onClearFilters: () => void;
+  /** 重新装配（`arm_failed` 的空态与 banner 共用）。 */
+  onRearm?: () => void;
   /** 弹窗持有的证据缓存（按 `itemId`）；缺键 = 还没取过 ⇒ 展开时才发那一次请求。 */
   evidenceById?: Record<number, IntelEvidence>;
   evidenceLoadingId?: number | null;
@@ -82,6 +85,7 @@ export default function IntelList({
         onOpenSettings={onOpenSettings}
         onCollect={onCollect}
         onClearFilters={onClearFilters}
+        onRearm={onRearm}
       />
     );
   }
@@ -109,11 +113,15 @@ export default function IntelList({
 }
 
 /**
- * 空态判据（顺序有意义）：未配置源 > 搜索无结果 > 归档页签 > 从未采集过 > 本层为空。
+ * 空态判据（顺序有意义）：未配源 > 总闸关 > 未装配 > 搜索无结果 > 归档页签 > 从未采集 > 本层为空。
  *
- * 「未配置源」必须排第一：它是唯一一种**用户不动手就永远不会有情报**的状态，把它排在后面会让
- * 用户以为只是「还没采到」而一直等下去。归档页签必须排在「从未采集过」之前：一个空的归档抽屉
- * 说「还没采集过、点这里立即采集」是答非所问。
+ * 前三条必须排在最前，且**必须互相分开**：它们是仅有的三种「用户不动手就永远不会有情报」的
+ * 状态，而它们的出路完全不同——第一种要去选源存 key，第二种只要打开一个开关，第三种连设置都
+ * 不用碰（点一次「重新装配」，或者根本就是自动交易没在跑）。把三者压成一句「尚未配置情报检索
+ * 源」，会让一个**已经配好了**的用户去设置里反复确认自己没配错，然后断定这个功能坏了。
+ *
+ * 归档页签必须排在「从未采集过」之前：一个空的归档抽屉说「还没采集过、点这里立即采集」是
+ * 答非所问。
  */
 function emptyKind({
   summary,
@@ -127,6 +135,8 @@ function emptyKind({
   archivedView?: boolean;
 }): IntelEmptyKind {
   if (summary && !summary.providerConfigured) return "no-provider";
+  if (summary && !summary.intelEnabled) return "intel-off";
+  if (summary && !summary.armed) return "not-armed";
   if (filtered) return "no-match";
   if (archivedView) return "none-archived";
   if (summary && summary.lastCollectTs == null) return "not-collected";

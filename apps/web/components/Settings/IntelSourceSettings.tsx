@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Button, Card, Field, Input, Select, Switch } from "@/components/ui";
 import { intelApi } from "@/lib/intelApi";
 import type { IntelProbeResult, IntelProviderHealth, IntelSettings } from "@/lib/intelTypes";
+import IntelArmStatusCard from "./IntelArmStatusCard";
 import IntelReaderSettings from "./IntelReaderSettings";
 
 // 三个适配器都已实现（intel-closed-loop 轴 D 兑现了 v1 登记的那条待办），故三项全部列出——
@@ -131,6 +132,22 @@ export default function IntelSourceSettings() {
     }
   };
 
+  /**
+   * 手动重新装配。**回执与 `save()` 走同一条路**（整份 `IntelSettings`，含 `arm`），故这张卡
+   * 上的状态在点完之后立刻说新话，不需要刷新页面。
+   */
+  const rearm = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      setSettings(await intelApi.rearm());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "重新装配失败");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const runProbe = async () => {
     setBusy(true);
     setProbe(null);
@@ -249,6 +266,10 @@ export default function IntelSourceSettings() {
         </div>
         {error && <span className="text-[11px] text-[var(--short-ink)]">{error}</span>}
       </Card>
+
+      {/* 生效状态卡挂在「情报检索源」卡**正下方**：用户刚存完 key，视线就在那里。
+          「保存成功」与「真的生效了」不是一回事，而这块面板此前连一条读路径都没有。 */}
+      <IntelArmStatusCard arm={settings.arm} busy={busy} onRearm={() => void rearm()} />
 
       <Card className="flex flex-col gap-3 p-4">
         <span className="text-sm font-semibold text-[var(--text)]">采集节律与额度</span>

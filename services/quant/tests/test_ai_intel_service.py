@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy import delete
 
 from app.agent.llm.base import StreamEvent
+from app.ai_auto.intel import arming
 from app.ai_auto.intel import prompts as intel_prompts
 from app.ai_auto.intel import service
 from app.ai_auto.intel.search import SearchDoc, SearchRunner
@@ -610,7 +611,7 @@ async def test_the_summary_always_carries_the_actionability_keys():
     # `build_snapshot` 里会让 REST 那一份少一个键，而少键**不报错**。
     async with get_sessionmaker()() as session:
         fresh = await service.read_summary(session, INST, settings=deps.settings,
-                                           provider_configured=True, now=NOW)
+                                           arm=arming.arm_of_deps(deps), now=NOW)
     assert set(fresh) == set(summary)
 
 

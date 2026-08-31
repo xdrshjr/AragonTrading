@@ -27,6 +27,11 @@ function summary(over: Partial<AiTradeIntelSummary> = {}): AiTradeIntelSummary {
     inFlight: false,
     degrade: null,
     providerConfigured: true,
+    // ai-trade-intel-arm-state 轴 A：三个新键**必填**（TS 侧刻意不加 `?`——`tsc` 是这里唯一
+    // 可靠的门禁）。前端读到 `undefined` 会把「没装上」画成「一切正常」。
+    intelEnabled: true,
+    armed: true,
+    armReason: "" as const,
     dailyUsed: 4,
     dailyCap: 96,
     citations: { cited: 12, entryCited: 5, settledTrips: 4, winCount: 3, netPnlUsd: 18.4,

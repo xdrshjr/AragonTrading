@@ -33,7 +33,15 @@ const settingsMock = vi.fn(async () => ({
   alertEnabled: true, alertMinImpact: "high" as const, alertCooldownMin: 20, alertDailyCap: 6,
   efficacyEnabled: true, conflictEnabled: true, alertRequireQuote: true,
   alertPendingTtlS: 180,
+  arm: {
+    providerConfigured: true, intelEnabled: true, armed: true, reason: "" as const,
+    message: "情报采集正在运行：BTC-USDT-SWAP", detail: "", groupRunning: true,
+    armedMembers: [INST], pending: false,
+  },
 }));
+// ai-trade-intel-arm-state：弹窗的第七个取数点。一个返回 `undefined` 的 `rearm()` 会让
+// 【重新装配】那一次点击静默失败，而症状是「点了没反应」——它其实成功了才是更坏的那一种。
+const rearmMock = vi.fn(async () => await settingsMock());
 const verifyMock = vi.fn(async () => ({ queued: true }));
 const verifyItemMock = vi.fn(async () => ({ queued: true }));
 // evidence-grounding：证据抽屉的懒加载点。返回值固定，用例只关心**它被调了几次**。
@@ -62,6 +70,7 @@ vi.mock("@/lib/intelApi", () => ({
     // 教训：不分发的 mock 会让用例空跑通过），新加的这些同理——一个返回 `undefined` 的
     // `settings()` 会让整个弹窗在 effect 里抛，而症状是十几条不相干的用例一起变红。
     settings: (...a: unknown[]) => settingsMock(...(a as [])),
+    rearm: (...a: unknown[]) => rearmMock(...(a as [])),
     verify: (...a: unknown[]) => verifyMock(...(a as [])),
     verifyItem: (...a: unknown[]) => verifyItemMock(...(a as [])),
     impact: async () => ({
@@ -106,6 +115,8 @@ function response(over: Partial<IntelReadResponse> = {}): IntelReadResponse {
       instId: INST, counts: { ultra: 2, mid: 1, long: 0, archived: 3 }, unread: 0,
       lastSeenTs: NOW_S, lastCollectTs: NOW_S - 600, lastCurateTs: null,
       nextDueTs: NOW_S + 720, inFlight: false, degrade: null, providerConfigured: true,
+      // ai-trade-intel-arm-state 轴 A：三个新键**必填**（`tsc` 强制，不是可选）。
+      intelEnabled: true, armed: true, armReason: "" as const,
       dailyUsed: 18, dailyCap: 96,
       citations: { cited: 0, entryCited: 0, settledTrips: 0, winCount: 0,
         netPnlUsd: 0, neverCited: 0 },
@@ -219,6 +230,27 @@ describe("IntelModal", () => {
       expect(screen.getByTestId("intel-empty-no-provider")).toBeInTheDocument());
     expect(screen.queryByText("暂无情报")).toBeNull();
     expect(screen.getByRole("button", { name: "去设置检索源" })).toBeInTheDocument();
+  });
+
+  it("装配失败 ⇒ 点【重新装配】真的发出 POST（而不是又一次「去设置」）", async () => {
+    await open(response({
+      summary: {
+        ...response().summary, armed: false, armReason: "arm_failed", lastCollectTs: null,
+        degrade: {
+          code: "arm_failed",
+          message: "情报流水线装配失败（LLM provider 未配置），检索源配置本身没有问题",
+          retryInS: null,
+        },
+      },
+      tiers: { ultra: { items: [], total: 0 }, mid: { items: [], total: 0 }, long: { items: [], total: 0 } },
+    }));
+    await waitFor(() =>
+      expect(screen.getByTestId("intel-empty-not-armed")).toBeInTheDocument());
+    // banner 与空态两处都给这条出路；点任意一处都必须真的打出去。
+    const buttons = screen.getAllByRole("button", { name: "重新装配" });
+    expect(buttons.length).toBeGreaterThan(0);
+    fireEvent.click(buttons[0]);
+    await waitFor(() => expect(rearmMock).toHaveBeenCalledTimes(1));
   });
 
   it("已配置但从未采集 ⇒ 给倒计时 + 立即采集", async () => {

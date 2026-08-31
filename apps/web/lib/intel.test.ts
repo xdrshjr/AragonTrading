@@ -5,6 +5,7 @@ import {
   TIER_LABEL,
   absoluteTime,
   confidenceBand,
+  degradeAction,
   degradeText,
   intelButtonLabel,
   intelButtonTitle,
@@ -81,6 +82,11 @@ function summary(over: Partial<AiTradeIntelSummary> = {}): AiTradeIntelSummary {
     inFlight: false,
     degrade: null,
     providerConfigured: true,
+    // ai-trade-intel-arm-state 轴 A：三个新键**必填**（TS 侧刻意不加 `?`——`tsc` 是这里唯一
+    // 可靠的门禁）。前端读到 `undefined` 会把「没装上」画成「一切正常」。
+    intelEnabled: true,
+    armed: true,
+    armReason: "" as const,
     dailyUsed: 18,
     dailyCap: 96,
     citations: { cited: 0, entryCited: 0, settledTrips: 0, winCount: 0, netPnlUsd: 0, neverCited: 0 },
@@ -176,6 +182,35 @@ describe("降级", () => {
     for (const code of ["verify_no_provider", "verify_search_failed", "verify_llm_failed"]) {
       expect(isSevereDegrade({ code, message: "m", retryInS: null })).toBe(true);
     }
+  });
+
+  it("装配码不染警示色的只有两个：给不出出路的那两个（arm-state）", () => {
+    // `not_running` 在自动交易没开的整段时间里恒成立，染色等于把警示色常亮；`arm_pending`
+    // 最多持续一轮。反过来那四个「用户不动手就永远不会有情报」的码必须染色。
+    for (const code of ["not_running", "arm_pending"]) {
+      expect(isSevereDegrade({ code, message: "m", retryInS: null })).toBe(false);
+    }
+    for (const code of ["provider_unset", "key_missing", "provider_unknown", "arm_failed"]) {
+      expect(isSevereDegrade({ code, message: "m", retryInS: null })).toBe(true);
+    }
+  });
+
+  it("按钮按码四分叉：去设置 / 重新装配 / 立即重试 / 什么都不给（arm-state I-5）", () => {
+    // ★ 这条闸守的是「三分叉不许顺手拿走一个正常工作的重试入口」：`search_failed` /
+    // `circuit_open` / `budget_exhausted` 这些**轮内**降级码在本轮之前就归【立即重试】管，
+    // 把它们一并并进「无按钮」，症状是用户点不动一个本来能自愈的降级，而且不报错。
+    for (const code of ["no_provider", "disabled", "provider_unset", "key_missing",
+                        "provider_unknown"]) {
+      expect(degradeAction({ code, message: "m", retryInS: null })).toBe("settings");
+    }
+    expect(degradeAction({ code: "arm_failed", message: "m", retryInS: null })).toBe("rearm");
+    for (const code of ["not_running", "arm_pending"]) {
+      expect(degradeAction({ code, message: "m", retryInS: null })).toBe("none");
+    }
+    for (const code of ["search_failed", "circuit_open", "budget_exhausted", "llm_failed"]) {
+      expect(degradeAction({ code, message: "m", retryInS: null })).toBe("retry");
+    }
+    expect(degradeAction(null)).toBe("none");
   });
 
   it("按钮 title 在降级时追加降级文案（不打开弹窗也知道出问题了）", () => {

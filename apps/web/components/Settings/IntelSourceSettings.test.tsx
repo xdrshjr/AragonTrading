@@ -9,11 +9,13 @@ import IntelSourceSettings from "./IntelSourceSettings";
 // 逐个走到 `PUT /settings/intel` —— 一个只在代码里存在、界面上打不开的开关，与没有这个开关等价。
 const settingsMock = vi.fn();
 const saveMock = vi.fn();
+const rearmMock = vi.fn();
 
 vi.mock("@/lib/intelApi", () => ({
   intelApi: {
     settings: () => settingsMock(),
     saveSettings: (patch: unknown) => saveMock(patch),
+    rearm: () => rearmMock(),
     providerHealth: async () => ({
       provider: "tavily", rounds: 0, ok: 0, failed: 0, degraded: 0, breakerRemainingS: 0,
     }),
@@ -35,11 +37,28 @@ const SETTINGS = {
   alertEnabled: true, alertMinImpact: "high" as const, alertCooldownMin: 20, alertDailyCap: 6,
   efficacyEnabled: true, conflictEnabled: true, alertRequireQuote: true,
   alertPendingTtlS: 180,
+  // ai-trade-intel-arm-state：装配状态块（`tsc` 强制必填）。
+  arm: {
+    providerConfigured: true, intelEnabled: true, armed: true, reason: "" as const,
+    message: "情报采集正在运行：BTC-USDT-SWAP", detail: "", groupRunning: true,
+    armedMembers: ["BTC-USDT-SWAP"], pending: false,
+  },
+};
+
+const ARM_FAILED = {
+  ...SETTINGS,
+  arm: {
+    providerConfigured: true, intelEnabled: true, armed: false,
+    reason: "arm_failed" as const,
+    message: "情报流水线装配失败（LLM provider 未配置），检索源配置本身没有问题",
+    detail: "LLM provider 未配置", groupRunning: true, armedMembers: [], pending: false,
+  },
 };
 
 beforeEach(() => {
   settingsMock.mockResolvedValue(SETTINGS);
   saveMock.mockResolvedValue(SETTINGS);
+  rearmMock.mockResolvedValue(SETTINGS);
 });
 
 afterEach(() => {
@@ -80,5 +99,31 @@ describe("IntelSourceSettings · 原文取证组", () => {
     expect(patch).not.toHaveProperty("hasKey");
     expect(patch).not.toHaveProperty("estimate");
     expect(patch).not.toHaveProperty("quoteHitRate");
+  });
+});
+
+describe("IntelSourceSettings · 生效状态卡（ai-trade-intel-arm-state）", () => {
+  it("已生效时说清楚在为哪些标的跑，且不给一个点了什么也不发生的按钮", async () => {
+    render(<IntelSourceSettings />);
+    await waitFor(() =>
+      expect(screen.getByTestId("intel-arm-status")).toBeInTheDocument());
+    expect(screen.getByTestId("intel-arm-message")).toHaveTextContent(
+      "情报采集正在运行：BTC-USDT-SWAP");
+    expect(screen.queryByTestId("intel-arm-rearm")).toBeNull();
+  });
+
+  it("装配失败 ⇒ 露出【重新装配】，点一次真的发出 POST 并用回执刷新这张卡", async () => {
+    settingsMock.mockResolvedValue(ARM_FAILED);
+    rearmMock.mockResolvedValue(SETTINGS);
+    render(<IntelSourceSettings />);
+    await waitFor(() =>
+      expect(screen.getByTestId("intel-arm-rearm")).toBeInTheDocument());
+    expect(screen.getByTestId("intel-arm-message")).toHaveTextContent("装配失败");
+
+    fireEvent.click(screen.getByTestId("intel-arm-rearm"));
+    await waitFor(() => expect(rearmMock).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.getByTestId("intel-arm-message")).toHaveTextContent("正在运行"));
+    expect(screen.queryByTestId("intel-arm-rearm")).toBeNull();
   });
 });

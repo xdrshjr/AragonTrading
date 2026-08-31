@@ -45,6 +45,8 @@ function summary(over: Partial<AiTradeIntelSummary> = {}): AiTradeIntelSummary {
     instId: INST, counts: { ultra: 1, mid: 1, long: 0, archived: 0 }, unread: 0,
     lastSeenTs: 0, lastCollectTs: 1, lastCurateTs: null, nextDueTs: null, inFlight: false,
     degrade: null, providerConfigured: true, dailyUsed: 0, dailyCap: 96,
+    // ai-trade-intel-arm-state 轴 A：三个新键**必填**（`tsc` 强制，不是可选）。
+    intelEnabled: true, armed: true, armReason: "" as const,
     citations: { cited: 0, entryCited: 0, settledTrips: 0, winCount: 0, netPnlUsd: 0,
       neverCited: 0 },
     verify: { confirmed: 0, refuted: 0, unresolved: 0, pending: 0, lastVerifyTs: null },
@@ -119,7 +121,10 @@ describe("IntelImpactTab", () => {
     const cases: Array<Partial<Parameters<typeof IntelImpactTab>[0]>> = [
       { settingsCiteEnabled: false },
       { settingsAttributionEnabled: false },
-      { summary: summary({ providerConfigured: false }) },
+      // ai-trade-intel-arm-state 评审 P2-7：判据从 `providerConfigured` 改读 `armed` 之后，
+      // 一个「配好了但没装上」的 summary 才落在 `not-armed` 上；仍传 `providerConfigured:false`
+      // 会让它掉到 `no-citations`，与第四个 case 撞成同一段文案而把这条断言判红。
+      { summary: summary({ armed: false }) },
       {},
     ];
     impact = report({ totals: { citeCount: 0, citeEntryCount: 0, settledCount: 0,

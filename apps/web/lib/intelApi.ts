@@ -117,12 +117,20 @@ export const intelApi = {
     }),
   /** 读检索源设置（**绝不含明文密钥**）。 */
   settings: () => request<IntelSettings>("/settings/intel"),
-  /** 写检索源设置（只写显式给出的字段）。 */
+  /** 写检索源设置（只写显式给出的字段）。**服务端写完当场重装**，回执里的 `arm` 即生效状态。 */
   saveSettings: (patch: IntelSettingsPatch) =>
     request<IntelSettings>("/settings/intel", {
       method: "PUT",
       body: JSON.stringify(patch),
     }),
+  /**
+   * 手动重新装配情报流水线（幂等，无请求体）。
+   *
+   * 存在的理由：装配是 fail-open 的，一次失败（LLM provider 暂时不可用、检索源 key 刚过期）
+   * 会让分组在整个生命周期里都没有情报层，而用户此前**唯一**的自救手段是停掉一次正在管理真实
+   * 资金的自动交易会话再重开——那个代价与这个问题完全不成比例。
+   */
+  rearm: () => request<IntelSettings>("/settings/intel/rearm", { method: "POST" }),
   // ---------------- closed-loop（§4.1 #13-#21） ----------------
   /** 手动触发一轮核查（202 排队即返回）。 */
   verify: (instId: string) =>

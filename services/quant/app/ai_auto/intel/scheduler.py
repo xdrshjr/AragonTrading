@@ -49,7 +49,13 @@ def schedule(coro) -> asyncio.Task:
 
 
 def start(runtime: IntelRuntime) -> None:
-    """为一个分组起调度循环。未装配（`enabled=False`）⇒ **一个任务都不建**（纪律 3）。"""
+    """为一个分组起调度循环。未装配（`enabled=False`）⇒ **一个任务都不建**（纪律 3）。
+
+    **幂等**：同一分组已有在跑的循环时直接 return（下面那两行 `existing` 判定）。这条性质在
+    ai-trade-intel-arm-state 之前只被 `_wire_intel` 一个调用点依赖，本轮起 `_sync_scheduler`
+    是第二个——一次「关掉总闸再打开」会连着调它两次，而重装刻意**不换实例**，故循环也不该
+    被换掉：换掉它就等于撕断在飞的那一轮。
+    """
     if not runtime.enabled:
         logger.info("ai-trade intel: 分组 %s 未配置检索源，只注册 runtime 壳、不起后台任务",
                     runtime.group_id)

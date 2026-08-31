@@ -2847,6 +2847,28 @@ class IntelCostEstimateOut(BaseModel):
     inputTokensPerDay: int
 
 
+class IntelArmOut(BaseModel):
+    """`GET/PUT/POST /settings/intel*` 回执里的装配状态块（ai-trade-intel-arm-state §3.3.4）。
+
+    它回答的是「我刚保存的这份设置，此刻到底有没有在跑」——在此之前，这块面板只能回答
+    「库里存了什么」，而那两件事在一个**正在运行**的分组上从来就不相等。
+
+    `reason` 与 summary 那份 wire 的 `armReason` **恒同值**（两块都由 `intel/arming.py` 装配，
+    G-29 冻结）；`message` 由后端下发，前端一个字都不编（与 `degradeText` 同一条纪律）。
+    """
+
+    providerConfigured: bool
+    intelEnabled: bool
+    armed: bool
+    reason: str
+    message: str
+    detail: str
+    groupRunning: bool
+    armedMembers: list[str]
+    # = (reason == "arm_pending")，**不是第二个自变量**（评审 P1-8）。
+    pending: bool
+
+
 class IntelSettingsOut(BaseModel):
     """`GET/PUT /settings/intel` 的回执。**绝不含 raw key**，仅 hasKey/keyPreview（§3.2.3）。"""
 
@@ -2892,6 +2914,9 @@ class IntelSettingsOut(BaseModel):
     # 它，前端只能写死一个数，而它是一个 30–900 的配置项——把它调到 900 的用户会在第 180 秒
     # 看到「会话未在时限内响应」，而后端那一侧还在正常等着。
     alertPendingTtlS: float = 180.0
+    # arm-state 轴 C：装配状态块。**回执必须带上它**——`response_model` 会静默丢弃未声明的键，
+    # 症状是「设置卡上那张生效状态卡永远说不出话」（本仓库成文教训，历轮三次）。
+    arm: IntelArmOut
 
 
 class ErrorBody(BaseModel):

@@ -83,7 +83,11 @@ async def test_no_task_when_provider_unconfigured_but_summary_still_visible():
     summary = intel_runtime.intel_summary_for(INST)
     assert summary is not None
     assert summary["providerConfigured"] is False
-    assert summary["degrade"]["code"] == "no_provider"
+    # arm-state C-8：**刻意的语义升级**，不是回归。壳的真实处境就是「总闸开着、一个源都没选」，
+    # `no_provider` 是它的粗粒度前身；分叉之后「没选源」与「配好了没装上」必须是两个码。
+    assert summary["degrade"]["code"] == "provider_unset"
+    assert summary["armed"] is False
+    assert summary["armReason"] == "provider_unset"
     # 未装配 ⇒ 注入端整键缺席 ⇒ 决策 prompt 逐字节回退。
     assert intel_runtime.intel_digest_for(INST) is None
 

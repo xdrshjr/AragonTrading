@@ -1479,7 +1479,16 @@ class AiTradeManager:
             runtime = await intel_runtime.build_group_runtime(
                 group_id=group.group_id,
                 members=[member.inst_id for member in group.members],
-                settings=settings, sessionmaker=get_sessionmaker(), provider_cfg=cfg,
+                # ★★ 实施发现 I-4（**本轮用户报告的真正根因**）：这里必须传 `get_sessionmaker`
+                # 这个**函数本身**，不是它的返回值。`build_group_runtime` 与全部
+                # `deps.sessionmaker()()` 调用点都按「先取 sessionmaker、再开会话」两跳来写
+                # （`IntelDeps.sessionmaker: Callable[[], object]`），传进去一个
+                # `async_sessionmaker` 实例会让第二跳变成 `AsyncSession()` ⇒
+                # `TypeError: 'AsyncSession' object is not callable`。而 `_wire_intel` 全程
+                # fail-open ⇒ 异常被 `except` 吞掉、`register` 从没被调到、`_RUNTIMES` 恒空。
+                # 于是自 `52f466e` 起，情报流水线在**每一次**启动上都装配失败且没有任何人知道，
+                # 面板恒说「尚未配置情报检索源」——正是本轮要修的那句假话。
+                settings=settings, sessionmaker=get_sessionmaker, provider_cfg=cfg,
                 # **必须传本模块里的这一份** `make_llm_client_from_config`：20+ 个测试文件以
                 # `monkeypatch.setattr("app.ai_auto.manager.make_llm_client_from_config", …)`
                 # 注入假客户端，把工厂换到别处解析会一次性打翻它们全部（E-5）。
@@ -1489,8 +1498,55 @@ class AiTradeManager:
                 notify_alert=partial(self._on_intel_alert, group.group_id))
             intel_runtime.register(runtime)
             intel_scheduler.start(runtime)
+            intel_runtime.clear_arm_error(group.group_id)
         except Exception as exc:  # noqa: BLE001 —— 见 docstring
             logger.warning("ai-trade intel wiring skipped for %s: %s", group.group_id, exc)
+            # ★ arm-state：E-10 那个「fail-open 把原因吞了」的正面修法。原因从此有一个进程级
+            # 落点，并经 `arming.resolve_arm` 的 `arm_failed` 分支到达界面——在此之前，一次
+            # 装配失败在整个分组生命周期里都不会有任何人知道。
+            intel_runtime.record_arm_error(group.group_id, exc)
+
+    async def rearm_intel(self, *, deadline_s: float | None = None) -> dict:
+        """设置改动之后就地重装情报运行时。
+
+        装配本身的失败（LLM provider 暂时不可用、检索源装不上）被收敛成回执里的
+        `reason="arm_failed"` 并记进 `_ARM_ERRORS`，绝不上抛；IO 层的意外异常仍原样上抛，由
+        **唯一**那个 fail-open 点 `api/app_settings._rearm_intel_pipeline` 接住（理由见
+        `intel_runtime.rearm_group` 的同一条注记）。
+
+        Args:
+            deadline_s: 等「当前这一轮情报跑完」的硬死线；缺省取派生副本里的
+                `ai_trade_intel_rearm_deadline_s`。超时即转后台并如实回执 `pending=true`。
+
+        Returns:
+            `rearm_group` 的那张 6 键回执（**同一张**，两处各拼一份必漂移）。
+        """
+        group = self._group
+        if group is None:
+            return dict(intel_runtime.ARM_NOT_RUNNING)
+        settings = self._group_settings(group)
+        try:
+            cfg = await resolve_active_provider(get_sessionmaker(), settings)
+        except Exception as exc:  # noqa: BLE001 —— LLM provider 不可用不该挡住设置保存
+            intel_runtime.record_arm_error(group.group_id, exc)
+            return {**intel_runtime.ARM_NOT_RUNNING, "reason": "arm_failed",
+                    "detail": str(exc)[:200]}
+        result = await intel_runtime.rearm_group(
+            group_id=group.group_id, settings=settings, provider_cfg=cfg,
+            make_client=make_llm_client_from_config,
+            deadline_s=(deadline_s if deadline_s is not None
+                        else float(settings.ai_trade_intel_rearm_deadline_s)))
+        if result["reason"] != "not_running":
+            return result
+        # ★ 评审 P0-3：`rearm_group` 回 `not_running` **而分组明明在跑**，只可能是一种处境——
+        # `_wire_intel` 的 fail-open 在 `register` **之前**就把异常吞了，于是 `_RUNTIMES` 里什么
+        # 都没有。而那**恰恰是**手动【重新装配】那个自救入口唯一的立项理由。直接把 `not_running`
+        # 回给用户，等于在一个正跑着的分组上说「AI 自动交易未在运行」——一句确定错误的话，
+        # 而且自救入口对自己要救的那件事束手无策。
+        # 回落走一次完整装配：`_wire_intel` 本就幂等（`register` 覆盖同 key、`scheduler.start`
+        # 自带幂等保护）且 fail-open，重跑一次没有任何副作用；失败原因由它的 `except` 记录。
+        await self._wire_intel(group, provider=cfg)
+        return intel_runtime.arm_result_for(group.group_id)
 
     def _unwire_intel(self, group_id: str) -> None:
         """**同步**拆卸：只 cancel、不 await（G-8：`stop_group` 串行遍历成员，客户端超时档 20s）。"""

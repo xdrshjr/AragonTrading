@@ -1,7 +1,7 @@
 "use client";
 
 import { Button } from "@/components/ui";
-import { degradeText, nextDueText } from "@/lib/intel";
+import { degradeAction, degradeText, nextDueText } from "@/lib/intel";
 import type { AiTradeIntelSummary, IntelDegrade } from "@/lib/intelTypes";
 
 /**
@@ -17,13 +17,22 @@ export function IntelDegradeBanner({
   degrade,
   onOpenSettings,
   onRetry,
+  onRearm,
 }: {
   degrade: IntelDegrade | null;
   onOpenSettings: () => void;
   onRetry: () => void;
+  /** 重新装配（`arm_failed` 专用）。缺省 ⇒ 该分支退化成无按钮，绝不误导。 */
+  onRearm?: () => void;
 }) {
   if (!degrade) return null;
-  const isNoProvider = degrade.code === "no_provider" || degrade.code === "disabled";
+  // 按钮按降级码三分叉（ai-trade-intel-arm-state §3.4.2）。此前是一句
+  // `code === "no_provider" || code === "disabled"` 的二分：两个语义完全不同的码共用同一个
+  // 按钮，而「总闸关着」的出路和「没选源」并不是同一个动作。
+  const action = degradeAction(degrade);
+  const handler =
+    action === "settings" ? onOpenSettings : action === "rearm" ? onRearm : onRetry;
+  const label = action === "settings" ? "去设置" : action === "rearm" ? "重新装配" : "立即重试";
   return (
     <div
       role="status"
@@ -33,15 +42,21 @@ export function IntelDegradeBanner({
       <span className="min-w-0 truncate text-[11px] text-[var(--text)]">
         ⚠ {degradeText(degrade)}
       </span>
-      <Button variant="ghost" size="sm" onClick={isNoProvider ? onOpenSettings : onRetry}>
-        {isNoProvider ? "去设置" : "立即重试"}
-      </Button>
+      {/* `none` 与「拿不到 onRearm」两种情况都不渲染按钮：一个点了什么也不发生的按钮，
+          比不给按钮更坏。 */}
+      {action !== "none" && handler ? (
+        <Button variant="ghost" size="sm" onClick={handler}>
+          {label}
+        </Button>
+      ) : null}
     </div>
   );
 }
 
 export type IntelEmptyKind =
   | "no-provider"
+  | "intel-off"
+  | "not-armed"
   | "not-collected"
   | "other-tier"
   | "no-match"
@@ -58,6 +73,7 @@ export function IntelEmptyState({
   onOpenSettings,
   onCollect,
   onClearFilters,
+  onRearm,
 }: {
   kind: IntelEmptyKind;
   summary: AiTradeIntelSummary | null;
@@ -65,8 +81,15 @@ export function IntelEmptyState({
   onOpenSettings: () => void;
   onCollect: () => void;
   onClearFilters: () => void;
+  /** 重新装配（只在 `arm_failed` 下渲染）。缺省 ⇒ 该按钮整个不出现。 */
+  onRearm?: () => void;
 }) {
   const due = nextDueText(summary, nowMs);
+  // `not-armed` 的正文**取后端下发的 `degrade.message`**：它区分 `not_running` /
+  // `arm_failed` / `arm_pending` 三种处境，而前端再编一份必漂移。
+  const armHint =
+    summary?.degrade?.message ?? "情报流水线目前没有在为这个标的采集。";
+  const canRearm = summary?.degrade ? degradeAction(summary.degrade) === "rearm" : false;
   const body: Record<IntelEmptyKind, { title: string; hint: string; action?: React.ReactNode }> = {
     "no-provider": {
       title: "尚未配置情报检索源",
@@ -77,6 +100,25 @@ export function IntelEmptyState({
           去设置检索源
         </Button>
       ),
+    },
+    "intel-off": {
+      title: "市场情报采集已关闭",
+      hint: "检索源已经配好了。打开设置里的「启用市场情报采集」，这个标的就会按节律开始采集；已经存下来的情报一条都不会丢。",
+      action: (
+        <Button variant="primary" size="sm" onClick={onOpenSettings}>
+          去设置里开启
+        </Button>
+      ),
+    },
+    "not-armed": {
+      title: "检索源已配好，但这个标的的情报流水线没有在跑",
+      hint: armHint,
+      action:
+        canRearm && onRearm ? (
+          <Button variant="primary" size="sm" onClick={onRearm}>
+            重新装配
+          </Button>
+        ) : undefined,
     },
     "not-collected": {
       title: "已配置，但这个标的还没有完成过一轮采集",

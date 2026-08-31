@@ -35,6 +35,10 @@ const PROBE_KEYS = [
   "AI_TRADE_INTEL_ALERT_ENABLED",
   "AI_TRADE_INTEL_EFFICACY_ENABLED",
   "AI_TRADE_INTEL_CONFLICT_ENABLED",
+  // ai-trade-intel-arm-state §6.3：本轮唯一的新配置项同样沿用 `AI_TRADE_INTEL_` 前缀，故桌面壳
+  // **产品代码零改动**。补这一行不是为了让它通过，而是为了在将来有人把前缀规则改窄时立刻判红
+  // ——那正是这张表存在的全部理由。
+  "AI_TRADE_INTEL_REARM_DEADLINE_S",
   "INTEL_VERIFY_ENABLED",
 ];
 

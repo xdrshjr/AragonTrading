@@ -25,6 +25,12 @@ function settings(over: Partial<IntelSettings> = {}): IntelSettings {
     alertEnabled: true, alertMinImpact: "high", alertCooldownMin: 20, alertDailyCap: 6,
     efficacyEnabled: true, conflictEnabled: true, alertRequireQuote: true,
     alertPendingTtlS: 180,
+    // ai-trade-intel-arm-state 轴 C：装配状态块**必填**（`tsc` 强制，不是可选）。
+    arm: {
+      providerConfigured: true, intelEnabled: true, armed: true, reason: "" as const,
+      message: "情报采集正在运行：BTC-USDT-SWAP", detail: "", groupRunning: true,
+      armedMembers: ["BTC-USDT-SWAP"], pending: false,
+    },
     ...over,
   };
 }

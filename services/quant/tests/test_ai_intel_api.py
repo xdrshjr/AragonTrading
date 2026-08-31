@@ -13,6 +13,7 @@ from sqlalchemy import delete
 
 from app.ai_auto.intel import runtime as intel_runtime
 from app.ai_auto.intel import service as intel_service
+from app.ai_auto.intel import taxonomy as tax
 from app.config import get_settings
 from app.db import repositories as repo
 from app.db.models import (
@@ -190,12 +191,19 @@ async def test_unknown_inst_rejected_on_write_only():
 
 @pytest.mark.asyncio
 async def test_collect_409_when_no_provider():
-    """诚实降级：未配置检索源时**绝不假装在采**。"""
+    """诚实降级：未配置检索源时**绝不假装在采**，且 409 说得出**真正的**原因。
+
+    arm-state C-8：码从粗粒度的 `intel_no_provider` 升级为 `intel_provider_unset`。
+    「没选源」与「配好了没装上」必须是两个码——那正是本轮的立项理由；反向去改 `arm_wire`
+    让它继续回 `no_provider`，等于把本轮做个空。
+    """
     await _fresh()
     async with _client() as client:
         res = await client.post(f"/api/intel/{INST}/collect")
     assert res.status_code == 409
-    assert res.json()["error"]["code"] == "intel_no_provider"
+    body = res.json()["error"]
+    assert body["code"] == "intel_provider_unset"
+    assert body["message"] == tax.DEGRADE_TEXT["provider_unset"]
 
 
 # ---------------- 未读徽标（G-16 / 评审 P1-2） ----------------
@@ -242,8 +250,13 @@ async def test_read_summary_counts_are_fresh_while_runtime_flags_come_from_the_r
             summary = (await client.get(f"/api/intel/{INST}")).json()["summary"]
         assert summary["counts"]["ultra"] == 1, "刚加的那一条必须立刻计进页签，不能等下一次刷新"
         assert summary["unread"] == 1, "未读同样是库存事实，必须查库"
-        assert summary["degrade"]["code"] == "no_provider", "降级在库里没有落点，只能取运行时"
+        # arm-state C-8：壳的真实处境是「总闸开着、一个源都没选」，`no_provider` 是它的粗粒度
+        # 前身。这是**刻意的**语义升级，不是回归。
+        assert summary["degrade"]["code"] == "provider_unset", "降级在库里没有落点，只能取运行时"
         assert summary["providerConfigured"] is False
+        assert summary["intelEnabled"] is True, "总闸是开着的——「没选源」与「关了总闸」不同命"
+        assert summary["armed"] is False
+        assert summary["armReason"] == "provider_unset"
     finally:
         intel_runtime.unregister("grp-1")
 

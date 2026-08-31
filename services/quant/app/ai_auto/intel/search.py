@@ -427,6 +427,36 @@ async def _sleep_backoff(attempt: int) -> None:
     await asyncio.sleep((base + random.uniform(0, _JITTER_MS)) / 1000.0)
 
 
+def classify_provider(slug: str, api_key: str) -> str:
+    """检索源配置的分类判定（**纯函数，无 IO**）。
+
+    Args:
+        slug: 用户选中的检索源 slug（大小写与前后空格在这里归一）。
+        api_key: 该源的 API Key（库内行优先的那一份）。
+
+    Returns:
+        ``""`` = 可以装配；否则是 `taxonomy.ARM_REASONS` 里的一个码：
+        ``"provider_unset"`` / ``"key_missing"`` / ``"provider_unknown"``。
+
+    本函数是「检索源到底算不算配好了」的**唯一**判据。`resolve_search_provider` 与
+    `arming.classify_config` 都调它——两处各手抄一份真值表，就会出现「面板说配好了、运行时说
+    没配」这种两边都不报错的分叉，而那正是 ai-trade-intel-arm-state 要修的缺陷本身。
+
+    ⚠️ 判定顺序上有一处**刻意的**行为变化（arm-state §3.1.1 / G-2）：原实现先判空 key、再判
+    slug 是否实现，故「拼错的 slug + 空 key」走的是静默的空 key 分支；这里把 `provider_unknown`
+    排在 `key_missing` 之前，那种组合会多打一行 `logger.info`。用户拼错了源名比「key 没填」更
+    值得说出来。
+    """
+    key = (slug or "none").strip().lower()
+    if key in ("", "none"):
+        return "provider_unset"
+    if key not in PROVIDER_SLUGS[1:]:
+        return "provider_unknown"
+    if not (api_key or "").strip():
+        return "key_missing"
+    return ""
+
+
 def resolve_search_provider(*, slug: str, api_key: str, base_url: str = "",
                             timeout_s: float = 12.0, max_retries: int = 2,
                             proxy: str | None = None) -> IntelSearchProvider | None:
@@ -434,9 +464,17 @@ def resolve_search_provider(*, slug: str, api_key: str, base_url: str = "",
 
     **绝不**在这里悄悄回落到「让模型自己写一条」：未配置时本特性诚实降级——按钮仍在、弹窗明说
     「未配置情报检索源」并给出设置入口，一条情报都不产出（G-7）。
+
+    判据取自 `classify_provider`（**同一张真值表**，绝不在这里再抄一份）；三种「没配好」在返回值
+    上仍然不可区分（恒 `None`），要区分的调用方去问 `classify_provider`。
     """
     key = (slug or "none").strip().lower()
-    if key in ("", "none") or not (api_key or "").strip():
+    verdict = classify_provider(key, api_key)
+    if verdict == "provider_unknown":
+        logger.info("ai-trade intel: 未实现的检索源 %s，按未配置处理（已实现：%s）",
+                    key, "/".join(PROVIDER_SLUGS[1:]))
+        return None
+    if verdict:
         return None
     if key == "tavily":
         return TavilyProvider(api_key=api_key.strip(), base_url=base_url,
@@ -447,8 +485,6 @@ def resolve_search_provider(*, slug: str, api_key: str, base_url: str = "",
     if key == "serper":
         return SerperProvider(api_key=api_key.strip(), base_url=base_url,
                               timeout_s=timeout_s, max_retries=max_retries, proxy=proxy)
-    logger.info("ai-trade intel: 未实现的检索源 %s，按未配置处理（已实现：%s）",
-                key, "/".join(PROVIDER_SLUGS[1:]))
     return None
 
 

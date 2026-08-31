@@ -1023,6 +1023,13 @@ class Settings(BaseSettings):
     ai_trade_intel_lapse_grace_h: float = Field(default=24.0, ge=1, le=168)
     # 关停时情报后台任务的有界收敛死线。**启动期校验器钉死它 < shutdown_step_timeout_s**。
     ai_trade_intel_drain_timeout_s: float = Field(default=5.0, gt=0, le=60)
+    # 设置保存之后等待「当前这一轮情报跑完」的硬死线。超时即把重装转入后台并如实回执
+    # `pending=true`——**绝不**让一个设置保存请求陪着一轮 60 秒的情报轮一起等。
+    # 启动期校验器钉死它 < 10.0（客户端 FAST 档是 20 秒，留一半裕量给往返与写库）。
+    # ⚠️ 上界写 `lt` 而不是 `le`：`le=10.0` 会与那条「>= 10.0 即抛」的校验器在 10.0 这一点上
+    # 互相矛盾（Field 放行、校验器拒绝）。校验器**仍然保留**——它守的是「将来有人放宽 Field
+    # 上界」这条路，且它的报错信息说得出**为什么**是 10 秒（Field 说不出）。
+    ai_trade_intel_rearm_deadline_s: float = Field(default=2.5, ge=0.2, lt=10.0)
 
     # ---- 情报闭环（ai-trade-intel-closed-loop §十一，17 项；前缀仍是 `AI_TRADE_INTEL_`）----
     # 三把逐层收窄的运维单键：`cite` ⇒ 注入行与决策工具 schema 逐字节回到 52f466e；
@@ -1278,6 +1285,12 @@ class Settings(BaseSettings):
                 f"AI_TRADE_INTEL_DRAIN_TIMEOUT_S({self.ai_trade_intel_drain_timeout_s})"
                 f" 必须 < SHUTDOWN_STEP_TIMEOUT_S({self.shutdown_step_timeout_s})，否则外层先 "
                 "cancel、drain 内层的清理永不执行，情报后台任务会活着穿过 dispose_engine")
+        # ai-trade-intel-arm-state §十一：重装死线必须**远小于**客户端 FAST 档（20 秒）。
+        # 倒挂时症状是「保存」按钮假超时——后端其实成功了，界面却说「请检查后端是否响应」。
+        if self.ai_trade_intel_rearm_deadline_s >= 10.0:
+            raise ValueError(
+                f"AI_TRADE_INTEL_REARM_DEADLINE_S({self.ai_trade_intel_rearm_deadline_s})"
+                " 必须 < 10.0：客户端 REST 超时档为 20 秒，留一半裕量给往返与写库。")
         # ai-trade-intel-closed-loop §十一：核查语料的两条值域约束。**不是形式主义**——不加第一条，
         # 一个把 `verify_max_items` 调到 8 的用户会得到一个「后 4 条永远待定」的系统，而且不报
         # 任何错（`corpus.build` 会静默截断，排在后面的候选拿不到任何文档）。

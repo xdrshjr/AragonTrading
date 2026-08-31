@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 
 from ...db import repositories as repo
 from . import alert as alert_mod
+from . import arming
 from . import conflict as conflict_mod
 from . import efficacy as efficacy_mod
 from . import corpus as corpus_mod
@@ -615,16 +616,22 @@ async def finish_degraded(deps: IntelDeps, inst_id: str, *, kind: str, started: 
 
 
 # ---------------- 快照（供 runtime 缓存；**热路径不查库**） ----------------
-async def build_snapshot(deps: IntelDeps, inst_id: str) -> dict:
+async def build_snapshot(deps: IntelDeps, inst_id: str, *, arm=None) -> dict:
     """一次性算出注入用的 digest 与界面用的 summary（唯一的查库点）。
 
     `IntelRuntime` 在每一轮结束、用户经 REST 改动条目后、以及 `POST /seen` 之后调它刷新，
     决策热路径只读缓存（§3.6.1）。
+
+    Args:
+        arm: 该分组此刻的 `arming.ArmState`。**带默认值的 keyword-only 形参** ⇒ 既有调用点
+            （`build_snapshot(deps, INST)`）一个字节不改，回落 `arm_of_deps(deps)`——它以
+            `deps.search is not None` 为最硬证据，故离线用例那条「有 runner 即 armed」的既有
+            断言继续成立。生产路径由 `IntelRuntime.refresh` 显式传 `self.arm`。
     """
     now = deps.now()
+    arm = arm if arm is not None else arming.arm_of_deps(deps)
     async with deps.sessionmaker()() as db:
-        summary = await read_summary(db, inst_id, settings=deps.settings,
-                                     provider_configured=deps.search is not None, now=now)
+        summary = await read_summary(db, inst_id, settings=deps.settings, arm=arm, now=now)
         scope = await repo.load_intel_scope(db, inst_id)
         eff = await solve_efficacy(db, deps, inst_id, scope)
         items = [item_from_wire(w) for w in scope]
@@ -648,12 +655,17 @@ async def build_snapshot(deps: IntelDeps, inst_id: str) -> dict:
             "digestItemIds": digest_ids}
 
 
-async def read_summary(db, inst_id: str, *, settings, provider_configured: bool,
+async def read_summary(db, inst_id: str, *, settings, arm,
                        now: float | None = None) -> dict:
     """`AiTradeIntelSummary` 的**唯一**装配点（runtime 快照与 REST 读端点共用）。
 
     两处各拼一份的后果不是抽象的：本仓库的 `groupStateFromStatus` 就是那样一个逐键手抄的映射，
     它反复制造「WS 通路是好的，只有刷新后重发现拿不到值」这类最难发现的坑。
+
+    Args:
+        arm: `arming.ArmState`（**取代**原来的 `provider_configured: bool`，形参个数不变）。
+            arm 四键 + 未装配时的 `degrade` 由 `arming.arm_wire` 这**一个**写点在返回字典的
+            末尾展开——§3.0 第 3 条「同一列只有一个人写」的落点。
     """
     wall = time.time() if now is None else now
     watch = await repo.load_intel_watch(db, inst_id) or {}
@@ -687,7 +699,6 @@ async def read_summary(db, inst_id: str, *, settings, provider_configured: bool,
         "nextDueTs": int(watch.get("nextDueTs") or 0) or None,
         "inFlight": False,
         "degrade": None,
-        "providerConfigured": bool(provider_configured),
         "dailyUsed": daily_used(watch, now=wall),
         "dailyCap": int(settings.ai_trade_intel_daily_round_cap),
         # ---- closed-loop §3.6：两块新读数（`snapshot()` 的第八键与 WS `intel` 事件共用同一个
@@ -721,13 +732,12 @@ async def read_summary(db, inst_id: str, *, settings, provider_configured: bool,
             "sampleN": int(eff.overall.samples),
             "overall": efficacy_mod.stat_wire(eff.overall),
         },
+        # arm-state 轴 A：`providerConfigured` / `intelEnabled` / `armed` / `armReason` 四键 +
+        # 未装配时的 `degrade`，**全部由这一个写点出**。展开在字典**末尾**是刻意的：它对
+        # `degrade` 的写入要盖住上面那行 `"degrade": None`，而 `IntelRuntime.refresh` 里那段
+        # 「本轮降级」的覆写仍在本函数**之后**发生 —— 三者的优先级：轮内降级 > 未装配 > 无。
+        **arming.arm_wire(arm),
     }
-
-
-def degrade_wire(code: str, *, retry_in_s: int | None = None, **fields) -> dict:
-    """降级码 → wire（文案**由后端下发**，前端不二次编，§3.7.4）。"""
-    return {"code": code, "message": tax.degrade_message(code, **fields),
-            "retryInS": retry_in_s}
 
 
 def estimate_daily_cost(*, symbols: int, interval_min: float, corpus_docs: int,
@@ -764,3 +774,10 @@ from .settings_bridge import (  # noqa: E402,F401
     resolve_api_key,
     resolve_intel_settings,
 )
+
+# ---------------- 降级 wire（**已外移**到 `intel/taxonomy.py`） ----------------
+# arm-state 评审 P0-2：`degrade_wire` 留在本文件会让纯核心 `intel/arming.py` 为了拼一个三键字典
+# 去 import `service`，与 `service` 反向 import `arming` 模块级成环——先解析 `arming` 的入口会
+# `ImportError`，整个后端起不来。搬家方向**单向**、零语义变化，这里原样重新导出，故
+# `intel_service.degrade_wire(...)` / `service.degrade_wire(...)` 的既有调用点一个字节不改。
+from .taxonomy import degrade_wire  # noqa: E402,F401

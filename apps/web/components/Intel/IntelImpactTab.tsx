@@ -133,7 +133,9 @@ function resolveEmptyKind({
   citeEnabled: boolean;
   attributionEnabled: boolean;
 }): ImpactEmptyKind | null {
-  if (summary && !summary.providerConfigured) return "not-armed";
+  // ai-trade-intel-arm-state §3.4.4：这个 kind 本来就叫 `not-armed`，本轮才第一次名副其实。
+  // 读 `providerConfigured`（「库里配没配」）来回答「装没装上」，是把两个不同的事实当成一个。
+  if (summary && !summary.armed) return "not-armed";
   if (!citeEnabled) return "cite-off";
   if (!attributionEnabled) return "attribution-off";
   if (impact && impact.totals.citeCount === 0) return "no-citations";

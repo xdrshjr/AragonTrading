@@ -10,12 +10,15 @@
 """
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai_auto import get_ai_trade_manager
 from ..ai_auto.experience.disclosure import budget_floor
 from ..ai_auto.experience.service import resolve_experience_settings, setting_bridge
+from ..ai_auto.intel import arming
 from ..ai_auto.intel import runtime as intel_runtime
 from ..ai_auto.intel import search as intel_search
 from ..ai_auto.intel import service as intel_service
@@ -33,6 +36,8 @@ from ..schemas import (
     IntelSettingsOut,
     key_preview,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["settings"])
 
@@ -142,6 +147,22 @@ async def _intel_quote_hit_rate(session: AsyncSession) -> float | None:
     return None
 
 
+def _intel_arm_wire(derived: Settings, member_ids: list[str], *,
+                    group_running: bool) -> dict:
+    """设置面板那一块 `arm`：与 summary 那份 wire **共用同一个 `ArmState`**。
+
+    分组内的每个成员共用**同一个** `IntelRuntime`（`_BY_INST` 的每个键都指向它），故「这个
+    分组装没装上」取任一挂得上的成员即可；一个都挂不上时 `runtime=None`，判据回落到库里的
+    配置本身——那正是 `_wire_intel` fail-open 之后的处境。
+    """
+    runtime = next((rt for rt in (intel_runtime.runtime_for(m) for m in member_ids)
+                    if rt is not None), None)
+    arm = arming.resolve_arm(derived, runtime=runtime, member=bool(member_ids))
+    armed = [m for m in member_ids
+             if (rt := intel_runtime.runtime_for(m)) is not None and rt.enabled]
+    return arming.arm_settings_wire(arm, group_running=group_running, armed_members=armed)
+
+
 async def _intel_wire(session: AsyncSession, settings: Settings) -> dict:
     """把**运行时真正会读到的那一份**设置渲染成面板回执。
 
@@ -155,9 +176,16 @@ async def _intel_wire(session: AsyncSession, settings: Settings) -> dict:
     api_key = await intel_service.resolve_api_key(session, derived)
     # 估算的标的数取**当前在跑的分组**；没有分组时用一个典型规模兜底，好让这块面板在按下开关
     # **之前**就能给出一个量级——一张写着「0 轮 / 0 token」的成本卡等于没有成本卡。
-    members = len((get_ai_trade_manager().group_status() or {}).get("members") or [])
-    members = members or _ESTIMATE_FALLBACK_SYMBOLS
+    status = get_ai_trade_manager().group_status()
+    member_ids = [str(m.get("instId")) for m in ((status or {}).get("members") or [])]
+    members = len(member_ids) or _ESTIMATE_FALLBACK_SYMBOLS
     return {
+        # ★ arm-state 轴 C：装配状态块。**由 `arming.arm_settings_wire` 装配，路由层一行都不
+        # 手拼**（评审 P1-7）——arm 四个事实的赋值只允许发生在 `arming` 里的那两个写点，在这里
+        # 用另一套键名再拼一遍，就是本仓库点名过的 `groupStateFromStatus` 形状：两张手抄表，
+        # 漂移了不报错。`armedMembers` 以 `group_status()` 为准而不是遍历 `_BY_INST`——后者会
+        # 把上一个分组的残留成员算进来（评审新增的第 5 个问题）。
+        "arm": _intel_arm_wire(derived, member_ids, group_running=status is not None),
         "enabled": bool(derived.ai_trade_intel_enabled),
         "injectEnabled": bool(derived.ai_trade_intel_inject),
         "provider": str(derived.ai_trade_intel_search_provider),
@@ -243,6 +271,43 @@ async def update_intel_settings(body: IntelSettingsIn,
     elif isinstance(api_key, str) and api_key.strip():
         await repo.set_app_setting(session, intel_service.INTEL_API_KEY_APP_KEY,
                                    api_key.strip())
+    # ★ arm-state 轴 C：写完立刻重装。没有这一跳，情报层的设置在分组启动那一刻就被冻结、此后
+    # 永不重读——被冻结的不只是检索源，采集间隔、日配额、整理频率、核查开关、抓取开关、告警
+    # 阈值全部在一个正在跑的分组上改不动，而每一次保存都返回 200、开关照动、回读也是新值。
+    # 顺序不可换：必须先 `set_app_setting`（自带 commit）再重装，否则 `rearm_group` 里那次
+    # `resolve_intel_settings` 读到的还是旧行。
+    # 它**绝不抛**、**绝不让保存失败**——情报层是加法流水线（与 `_wire_intel` 的 fail-open 同源）。
+    await _rearm_intel_pipeline()
+    return await _intel_wire(session, settings)
+
+
+async def _rearm_intel_pipeline() -> None:
+    """重装情报流水线并把失败吞掉（`PUT` 与手动入口共用）。
+
+    情报层的任何失败都不该让「保存设置」这个动作失败：一次保存返回 500，用户会去改回一个他本来
+    改对了的值。失败原因由 `_wire_intel` / `rearm_group` 记进 `_ARM_ERRORS`，并经回执里那个
+    `arm` 块如实出声——**吞掉的是异常，不是原因**。
+    """
+    try:
+        await get_ai_trade_manager().rearm_intel()
+    except Exception as exc:  # noqa: BLE001 —— 见 docstring
+        logger.warning("ai-trade intel rearm after settings save failed: %s", exc)
+
+
+@router.post("/settings/intel/rearm", response_model=IntelSettingsOut)
+async def rearm_intel_pipeline(session: AsyncSession = Depends(get_session),
+                               settings: Settings = Depends(get_settings)) -> dict:
+    """手动重新装配情报流水线（**幂等**）。
+
+    存在的理由：`_wire_intel` 是 fail-open 的，一次装配失败（LLM provider 暂时不可用、检索源
+    key 刚过期）会让分组在整个生命周期里都没有情报层，而用户此前**唯一**的自救手段是停掉一次
+    正在管理真实资金的自动交易会话再重开。那个代价与这个问题完全不成比例。
+
+    **不设** `_require_ai_enabled`（与两个既有 `/settings/intel*` 端点一致）：它不动任何资金，
+    而在自动交易总闸关着的时候用户同样要能回答「我这份检索源配置到底装没装上」——那正是
+    `not_running` 这个码存在的意义。走既有 `OriginGuardMiddleware`。
+    """
+    await _rearm_intel_pipeline()
     return await _intel_wire(session, settings)
 
 

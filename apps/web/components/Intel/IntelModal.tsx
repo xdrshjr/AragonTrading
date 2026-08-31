@@ -324,6 +324,14 @@ export default function IntelModal({
     await load();
   };
 
+  /**
+   * 重新装配：`arm_failed` 的空态与降级 banner 共用的那一条出路。
+   *
+   * 走 `guard` 是刻意的——它已经承担了 busy 态、错误文案与那次 `load()` 重取；重装成功之后
+   * summary 会立刻说新话，用户不必关掉弹窗再打开。
+   */
+  const rearm = () => void guard(() => intelApi.rearm());
+
   const openSettings = () => {
     setSettingsSection("intel-source");
     setShowSettings(true);
@@ -382,6 +390,7 @@ export default function IntelModal({
           degrade={summary?.degrade ?? null}
           onOpenSettings={openSettings}
           onRetry={() => void guard(() => intelApi.collect(instId))}
+          onRearm={rearm}
         />
 
         <div className="px-4 pt-2">
@@ -468,6 +477,7 @@ export default function IntelModal({
               nowMs={nowMs}
               onOpenSettings={openSettings}
               onCollect={() => void guard(() => intelApi.collect(instId))}
+              onRearm={rearm}
               onClearFilters={() => {
                 setQuery("");
                 setCategory("");
