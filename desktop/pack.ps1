@@ -94,40 +94,14 @@ function Test-Tool([string]$Name) {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
-function Get-RunningDistProcesses([string]$UnpackedDir) {
-    $root = [System.IO.Path]::GetFullPath($UnpackedDir).TrimEnd([char[]]"\/")
-    $rootBackslash = "$root\"
-    $rootForward = $root.Replace('\', '/')
-    $rootForwardSlash = "$rootForward/"
-    $comparison = [System.StringComparison]::OrdinalIgnoreCase
-
-    Get-CimInstance Win32_Process |
-        Where-Object {
-            $pidValue = [int]$_.ProcessId
-            if ($pidValue -eq $PID) { return $false }
-
-            $exe = [string]$_.ExecutablePath
-            $cmd = [string]$_.CommandLine
-            $exeInDist =
-                $exe -and $exe.StartsWith($rootBackslash, $comparison)
-            $cmdInDist =
-                $cmd -and (
-                    $cmd.IndexOf($rootBackslash, $comparison) -ge 0 -or
-                    $cmd.IndexOf($rootForwardSlash, $comparison) -ge 0
-                )
-
-            return $exeInDist -or $cmdInDist
-        } |
-        Sort-Object ProcessId
+# 旧产物进程扫描独立成库：既让打包主流程不再直连 WMI（WMI 卡死会让整个打包在此
+# 无限挂起，见该文件头注释与 docs/diagnoses/desktop-packaging-wmi-process-scan-hang/），
+# 也让这段逻辑能被 scripts/dist-process-scan.test.mjs 真实驱动。
+$DistProcessScanLib = Join-Path $DesktopDir 'scripts/dist-process-scan.ps1'
+if (-not (Test-Path $DistProcessScanLib)) {
+    Fail "缺少 $DistProcessScanLib，无法在打包前回收旧产物进程。" 2
 }
-
-function Format-DistProcessList($Processes) {
-    return ($Processes |
-        ForEach-Object {
-            $path = if ($_.ExecutablePath) { $_.ExecutablePath } else { $_.CommandLine }
-            "PID $($_.ProcessId) $($_.Name) $path"
-        }) -join "`n    "
-}
+. $DistProcessScanLib
 
 function Stop-RunningDistProcesses([string]$UnpackedDir, [bool]$StopProcesses) {
     $running = @(Get-RunningDistProcesses $UnpackedDir)
@@ -353,7 +327,14 @@ try {
     Write-Host '────────────────────────────────────────────' -ForegroundColor Green
 }
 catch {
-    Fail $_.Exception.Message 1
+    # NativeCommandError 等情形下 Exception.Message 可能为空，而 Fail 打出一行空
+    # 错误等于什么都没报；逐级回落到类别原因与出错位置，保证总有可追的线索。
+    $detail = "$($_.Exception.Message)".Trim()
+    if (-not $detail) { $detail = "$($_.CategoryInfo.Reason)".Trim() }
+    if (-not $detail) { $detail = '未知终止错误' }
+    $position = "$($_.InvocationInfo.PositionMessage)".Trim()
+    if ($position) { $detail = "$detail`n    $position" }
+    Fail $detail 1
 }
 finally {
     Pop-Location
