@@ -207,7 +207,19 @@ async def _set_pruned_ts(session: AsyncSession, now: int) -> None:
 
 
 async def document_health(session: AsyncSession) -> dict:
-    """设置卡「原文缓存」那一行的只读读数（**真实字节，不是前端乘出来的**）。"""
+    """设置卡「原文缓存」那一行的只读读数（**真实字节，不是前端乘出来的**）。
+
+    自 ai-trade-silent-degradation-repair 轴 B-2 起，它同时是**抓取健康**四个加法读数的
+    **唯一装配点**——端点只做一件事（叠 `readerEnabled`），判定与取数全在 repo 层，这是本包的
+    既有分工。`ai_intel_rounds` 的聚合**合并进这同一次调用**，不新开第二个 repo 函数
+    （否则端点上会出现两处取数点，而它们迟早会漂移）。
+
+    要修的事实（§一 E-14）：`cachedDocs=29, bodyBytes=0` 这对读数**三个星期来一直显示在设置
+    页上**——「缓存了 29 篇文档、正文合计 0 字节」在一个健康的安装上是不可能出现的组合，只是
+    没有任何一处把它翻译成一句人能读懂的结论。而 `reader_attempt` / `reader_ok` 有逐轮读点
+    （轮次页那一行「正文 5/6」），却**从不聚合成结论、从不跨轮判趋势、从不告警**——一个人
+    要发现「16 轮全零」，得自己翻 16 行然后自己做加法。
+    """
     total = int((await session.execute(
         select(func.count()).select_from(AiIntelDocument))).scalar() or 0)
     body_bytes = int((await session.execute(
@@ -219,8 +231,49 @@ async def document_health(session: AsyncSession) -> dict:
         pruned_ts = int(pruned.value) if pruned is not None else 0
     except (TypeError, ValueError):
         pruned_ts = 0
+    blocked_rows = (await session.execute(
+        select(AiIntelDocument.status, func.count())
+        .where(AiIntelDocument.status != "ok")
+        .group_by(AiIntelDocument.status))).all()
+    fetch = await _reader_fetch_stats(session)
     return {"cachedDocs": total, "bodyBytes": body_bytes, "oldestFetchedTs": oldest,
-            "lastPrunedTs": pruned_ts}
+            "lastPrunedTs": pruned_ts,
+            # **持久**、跨重启：直接从 `ai_intel_documents.status` GROUP BY（零迁移即可算）。
+            # 刻意**不叫** `blockedByCode`：`status` 存的是 `ok|blocked|http_error|timeout|…`，
+            # **不是** `private_host` 这类拒因——拒因今天只出现在一行 `logger.info` 里、从不落库
+            # （评审 P1-5）。拒因分布走进程内计数器，见端点侧的 `rejectCodesSinceStart`。
+            "blockedByStatus": {str(code or ""): int(n) for code, n in blocked_rows},
+            **fetch}
+
+
+# 连续零命中最多回看多少轮（避免全表扫；超过它的连续失败已经足够说明问题）。
+_ZERO_STREAK_SCAN_ROUNDS = 50
+
+
+async def _reader_fetch_stats(session: AsyncSession) -> dict:
+    """`ai_intel_rounds`（`kind='collect'`）的抓取聚合：三个加法读数（轴 B-2）。
+
+    `zeroOkStreak` 的边界（评审 P2-6，v1 未写会导致两种实现）：从最近一轮往回数，**只计
+    `reader_attempt > 0` 的轮次**；`reader_attempt == 0` 的轮次**跳过不计，也不中断连续**
+    （一轮没有候选不该洗掉一条真实的连续失败）；遇到第一个 `reader_ok > 0` 即停止。
+    """
+    totals = (await session.execute(
+        select(func.sum(AiIntelRound.reader_attempt), func.sum(AiIntelRound.reader_ok))
+        .where(AiIntelRound.kind == "collect"))).one()
+    recent = (await session.execute(
+        select(AiIntelRound.reader_attempt, AiIntelRound.reader_ok)
+        .where(AiIntelRound.kind == "collect")
+        .order_by(AiIntelRound.id.desc())
+        .limit(_ZERO_STREAK_SCAN_ROUNDS))).all()
+    streak = 0
+    for attempt, ok in recent:
+        if int(attempt or 0) <= 0:
+            continue                     # 没有候选的轮次：跳过不计，也不中断连续
+        if int(ok or 0) > 0:
+            break
+        streak += 1
+    return {"fetchAttempt": int(totals[0] or 0), "fetchOk": int(totals[1] or 0),
+            "zeroOkStreak": streak}
 
 
 async def list_documents_for_urls(session: AsyncSession, url_hashes: list[str]) -> list[dict]:

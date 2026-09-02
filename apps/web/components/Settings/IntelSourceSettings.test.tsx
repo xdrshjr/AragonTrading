@@ -34,6 +34,8 @@ const SETTINGS = {
   citeEnabled: true, attributionEnabled: true, verifyEnabled: true, verifyEveryNCurates: 1,
   verifyMaxItems: 3, verifyDocsPerItem: 4, blockedSweepEnabled: true, citeMaxRefs: 8,
   readerEnabled: true, readerTopK: 6, quoteMode: "soft" as const, quoteHitRate: 0.78,
+  // silent-degradation-repair 轴 B-1 / B-2：解析策略 + 两把只读旋钮的生效值回读。
+  readerResolver: "auto" as const, readerHealthVisible: true, readerZeroStreakWarn: 3,
   alertEnabled: true, alertMinImpact: "high" as const, alertCooldownMin: 20, alertDailyCap: 6,
   efficacyEnabled: true, conflictEnabled: true, alertRequireQuote: true,
   alertPendingTtlS: 180,

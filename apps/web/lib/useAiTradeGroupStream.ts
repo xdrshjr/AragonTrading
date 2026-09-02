@@ -88,6 +88,9 @@ export function groupStateFromStatus(row: AiTradeGroupRow): AiTradeGroupState {
     // `?? null` 要求后端恒下发，才能把「本轮没数据」与「后端还没上线这个键」区分开。
     declaredState: row.declaredState ?? null,
     lifecycle: row.lifecycle ?? null,
+    // 费率来源（silent-degradation-repair 轴 A-4）：**第五条同款注释**——本函数是逐键手抄的
+    // 映射，漏抄的表现永远是同一个形状：WS 通路好的，只有刷新页面后重发现才拿不到，且不报错。
+    feeRates: row.feeRates ?? null,
     startedTs: row.createdTs,
     members,
   };

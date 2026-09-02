@@ -39,7 +39,17 @@ const PROBE_KEYS = [
   // **产品代码零改动**。补这一行不是为了让它通过，而是为了在将来有人把前缀规则改窄时立刻判红
   // ——那正是这张表存在的全部理由。
   "AI_TRADE_INTEL_REARM_DEADLINE_S",
+  // ai-trade-silent-degradation-repair §6.3 / 评审 P0-5：本轮 12 项新配置全部落在 `AI_TRADE_`
+  // （9 项）与 `OKX_`（3 项）两个既有前缀内，故桌面壳**产品代码零改动**。补这两行同样不是为了
+  // 让它通过，而是为了在将来有人把前缀白名单改窄时立刻判红——`AI_TRADE_LOG_HTTP_CLIENT_LEVEL`
+  // 与 `OKX_CALL_STATS_ENABLED` 一旦被静默丢掉，症状是「桌面端上日志照旧 254 MB / 调用统计
+  // 恒空，而开发机上一切正常」。
+  "AI_TRADE_LOG_HTTP_CLIENT_LEVEL",
+  "OKX_CALL_STATS_ENABLED",
   "INTEL_VERIFY_ENABLED",
+  // 反向探针（G-D7 ②）：v1 曾把这把闸命名为裸名 `LOG_HTTP_CLIENT_LEVEL`——它一个前缀都不沾，
+  // 在打包桌面端里等于不存在。这一行**必须穿不过去**，那是这条门禁的全部意义。
+  "LOG_HTTP_CLIENT_LEVEL",
 ];
 
 function withCleanEnv(run) {
@@ -72,8 +82,12 @@ test("prod backendEnv forwards the closed-loop AI_TRADE_INTEL_* knobs from agent
         AI_TRADE_INTEL_ALERT_ENABLED: "false",
         AI_TRADE_INTEL_EFFICACY_ENABLED: "false",
         AI_TRADE_INTEL_CONFLICT_ENABLED: "false",
-        // 前缀不沾 `AI_TRADE_` 的裸名：它**必须**被挡在外面，否则「按前缀」这条结论就是假的。
+        // ai-trade-silent-degradation-repair 的两把闸（`AI_TRADE_` 与 `OKX_` 两个前缀各一）。
+        AI_TRADE_LOG_HTTP_CLIENT_LEVEL: "INFO",
+        OKX_CALL_STATS_ENABLED: "false",
+        // 前缀不沾白名单的裸名：它们**必须**被挡在外面，否则「按前缀」这条结论就是假的。
         INTEL_VERIFY_ENABLED: "true",
+        LOG_HTTP_CLIENT_LEVEL: "INFO",
       },
     });
 
@@ -86,7 +100,13 @@ test("prod backendEnv forwards the closed-loop AI_TRADE_INTEL_* knobs from agent
       "告警总闸没穿过白名单：桌面端上高危情报会照默认值唤醒，而用户以为自己关掉了");
     assert.equal(env.AI_TRADE_INTEL_EFFICACY_ENABLED, "false");
     assert.equal(env.AI_TRADE_INTEL_CONFLICT_ENABLED, "false");
+    assert.equal(env.AI_TRADE_LOG_HTTP_CLIENT_LEVEL, "INFO",
+      "httpx 日志级别的回退档没穿过白名单：桌面端上那把「一键恢复 INFO」的闸按不下去");
+    assert.equal(env.OKX_CALL_STATS_ENABLED, "false",
+      "调用统计总闸没穿过白名单：压掉 httpx 日志之后，桌面端会同时失去日志与统计两个来源");
     assert.equal(env.INTEL_VERIFY_ENABLED, undefined, "白名单之外的键一律不进后端 env");
+    assert.equal(env.LOG_HTTP_CLIENT_LEVEL, undefined,
+      "裸名（无前缀）必须穿不过去——这一条是反向断言，它绿了才证明「按前缀」不是一句空话");
   });
 });
 

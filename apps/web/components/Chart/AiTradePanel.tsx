@@ -23,7 +23,8 @@ import { AiTradeIntelButton } from "./AiTradeIntelButton";
 import { AiTradeExitCard } from "./AiTradeExitCard";
 import { AiTradeFeedRecoveryCard } from "./AiTradeFeedRecoveryCard";
 import { describeTradability } from "@/lib/aiTradeTradability";
-import { COST_BASIS_HINT, describeCostBasis } from "@/lib/aiTradeCost";
+import { COST_BASIS_HINT, describeCostBasis, describeFeeRates } from "@/lib/aiTradeCost";
+import { describeTruthDigest } from "@/lib/truthSources";
 import { fmtMoney, fmtNum, fmtPrice } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
 import { ApiRequestError } from "@/lib/api";
@@ -77,6 +78,10 @@ export default function AiTradePanel({
   // 净额徽标的门控**只认后端下发的口径标记**，绝不据配置或猜测推断：口径是会话级静态量，
   // 前端说「已扣手续费」而后端其实是毛额，比不显示徽标危险得多。
   const netBasis = members.some((m) => m.position?.costAwareness?.netBasis === true);
+  // 真值源摘要取**任一成员**那一份：它是进程级读数（费率 / 配额 / 决策模型都不按标的分），
+  // 逐成员各画一枚芯片只是噪音。总闸关 / 老后端 ⇒ 整键缺席 ⇒ `null` ⇒ 不渲染。
+  const truthChip = describeTruthDigest(
+    members.map((m) => m.session?.truthSources).find((d) => d) ?? null);
   // L-4：**生命周期只有一个推导点**。此前这里有两行自拼的判据（`group.state === "stopped" ||
   // members.every(...)`），与 `AiTradeToggle` 走的 `resolveAiTradeLifecycle` 口径不同 —— 于是
   // 面板徽标说「已暂停 / 已停止」，头部开关同时还是开的，用户对着两个互相矛盾的控件做真实资金
@@ -113,6 +118,18 @@ export default function AiTradePanel({
           {members.length > 1 && (
             <span className="shrink-0 text-[10px] text-[var(--muted)]">
               {members.length} 个标的
+            </span>
+          )}
+          {/* 真值源芯片（silent-degradation-repair 轴 E / §11.2）：只在**有降级**时出现，
+              且文案由 `describeTruthDigest` 单点装配、必须写明分母是 3——顶栏这一格若写成
+              「真值源 2 项降级」，用户会以为四行都在被实时监视，而第 4 行只在 REST 上。 */}
+          {truthChip && (
+            <span
+              data-testid="ai-truth-sources-chip"
+              title="点开设置中心「真值源」看四行明细"
+              className="shrink-0 rounded border border-[var(--accent)] bg-[var(--accent-soft)] px-1 py-px text-[9px] text-[var(--accent-ink)]"
+            >
+              {truthChip}
             </span>
           )}
         </div>
@@ -165,6 +182,11 @@ export default function AiTradePanel({
           ——否则「开着、在跑、每轮都有分析、就是从不开单」只会被读成「AI 坏了」。 */}
       <TradabilityStrip members={members} />
       <SummaryStalledStrip members={members} />
+
+      {/* 费率来源（silent-degradation-repair 轴 A-4）：排在纪律条**之上**——它回答的是
+          「下面那些成本阈值到底按谁的费率在算」，而生产上这个答案三周来一直是「本地猜的」
+          且从未被任何一处界面说出来（1,524 次官方费率请求，0 次成功）。 */}
+      <FeeSourceStrip group={group} />
 
       <DisciplineStrip group={group} />
 
@@ -420,6 +442,44 @@ function SummaryStalledStrip({ members }: { members: AiTradeGroupMemberState[] }
       <strong>长期记忆已停摆</strong>（连续 {health.failures} 次摘要失败）：
       模型仍在按当前行情决策，但会逐渐忘记更早的执行历程。
     </p>
+  );
+}
+
+/**
+ * 费率来源条（silent-degradation-repair 轴 A-4 · 启动回执落点）。
+ *
+ * 一句话，两态：
+ *
+ * * `交易所官方档位 Lv1：maker 2.00 / taker 5.00 bps`
+ * * `本地保守常数：maker 2.00 / taker 5.00 bps —— 交易所拒绝了费率查询（51000 …），成本与净额按保守常数计算`
+ *
+ * 三条纪律：
+ *
+ * 1. **文案一个字都不在前端拼**——`describeFeeRates` 是唯一装配点，历史详情卡与真值源卡片读
+ *    的是同一个函数。两处各写一遍必然与后端真正用来记账的那个 `source` 分叉。
+ * 2. **降级态才带颜色**。一切正常时它只是一行灰字：一条常驻的彩色横幅会在两天内变成背景噪声。
+ * 3. **缺键即整段不渲染**（老后端 / 总闸 `ai_trade_fee_rate_origin_visible=False` / 无凭证）
+ *    ——绝不在没有读数时编一句「按官方档位」。
+ */
+function FeeSourceStrip({ group }: { group: AiTradeGroupState }) {
+  const rates = group.feeRates ?? null;
+  const line = describeFeeRates(rates);
+  if (!line) return null;
+  const degraded = rates?.source === "config";
+  return (
+    <div
+      data-testid="ai-fee-source-strip"
+      data-degraded={degraded ? "1" : "0"}
+      className={
+        degraded
+          ? "rounded border border-[var(--accent)] bg-[var(--accent-soft)] px-2 py-1 text-[10px] leading-relaxed text-[var(--accent-ink)]"
+          : "rounded border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-[10px] leading-relaxed text-[var(--muted)]"
+      }
+    >
+      <span className="font-medium">费率来源</span>
+      <span className="mx-1">·</span>
+      <span>{line}</span>
+    </div>
   );
 }
 

@@ -99,7 +99,14 @@ async def trading_config(instId: str = Query(...), accountId: int | None = Query
 @router.get("/positions", response_model=LivePositionsOut)
 async def trading_positions(accountId: int | None = Query(None),
                             session: AsyncSession = Depends(get_session)) -> dict:
-    """真实持仓（轮询源）。"""
+    """真实持仓（轮询源）。
+
+    **不走轴 C 的共享快照，且将来也不许接上去**（silent-degradation-repair §七 C-2 第 5 行）：
+    它是用户主动点开的只读面板，语义是「现在到底有多少仓」；接上缓存会让「刷新」这个动作
+    变得不可信——用户点了刷新、数字没变，而系统其实根本没去问交易所。
+    此处显式登记为**不得接入**，防止下一轮有人「顺手」把它也接上去
+    （门禁 G-C13 用 AST 断言本文件不 import `positions_cache`）。
+    """
     row = await _resolve_account(session, accountId)
     return {"positions": await fetch_live_positions(_creds_from_row(row))}
 

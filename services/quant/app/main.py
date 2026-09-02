@@ -37,6 +37,7 @@ from .api import (
     runs,
     strategies,
     trading,
+    truth_sources,
     weight_batches,
     weight_models,
     workspace,
@@ -57,6 +58,30 @@ from .security.origin_middleware import OriginGuardMiddleware
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("aragon")
+
+
+def _tune_http_client_logging() -> None:
+    """把 `httpx` / `httpcore` 的请求日志压到 `WARNING`（silent-degradation-repair 轴 D-2）。
+
+    真机实测：`backend.log` 254.7 MB 单文件无轮转，其中 **90.9% 的字节 / 85.7% 的行**是 `httpx`
+    的 `INFO`，仅 `GET /api/v5/account/positions` 一行就占了全部日志行的 **61.0%**。用户被要求
+    「看看桌面端的日志」，而这份日志里每 100 行有 61 行是同一个后台轮询——在这样的信噪比下，
+    本轮找到的四条根因**没有一条**可能被人眼发现。
+
+    信息不会因此丢失：OKX 侧端点 × 状态码的分布由轴 D-3 的 `CallStats` 承接（三个客户端全接），
+    LLM 侧同样（两个 provider 的响应出口共用的 `_run_attempt` 已接线）。
+    `AI_TRADE_LOG_HTTP_CLIENT_LEVEL=INFO` ⇒ 逐字节回到今天。
+
+    **键名带 `AI_TRADE_` 前缀是硬约束**：`desktop/src/lib/config.js` 的后端 env 透传白名单按
+    前缀放行，裸名 `LOG_HTTP_CLIENT_LEVEL` 在打包桌面端里会被静默丢弃——那把闸按不下去。
+    """
+    level = getattr(logging, get_settings().ai_trade_log_http_client_level.strip().upper(),
+                    logging.WARNING)
+    for name in ("httpx", "httpcore"):
+        logging.getLogger(name).setLevel(level)
+
+
+_tune_http_client_logging()
 
 
 @asynccontextmanager
@@ -472,6 +497,10 @@ app.include_router(weight_batches.router, prefix="/api")  # 多模型训练竞�
 app.include_router(discovery.router, prefix="/api")  # 第 16 个路由（策略与因子挖掘 §四；含 WS /ws/discovery/{runId}）
 app.include_router(okx_link.router, prefix="/api")   # OKX 链路健康只读端点（okx-link-resilience §四）
 app.include_router(discovery_assets.router, prefix="/api")  # 第 17 个路由（成果资产台账与持续体检 §四，无 WS）
+# 真值源只读端点（ai-trade-silent-degradation-repair 轴 E）。**总闸关 ⇒ 路由不注册 ⇒ 404**，
+# 而不是注册一个恒回空的端点——「装了但什么都不说」正是本轮要消灭的形状。
+if get_settings().ai_trade_truth_sources_enabled:
+    app.include_router(truth_sources.router, prefix="/api")
 
 
 @app.get("/")

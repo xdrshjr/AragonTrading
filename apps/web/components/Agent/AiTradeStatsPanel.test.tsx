@@ -565,7 +565,13 @@ describe("AiTradeStatsDetail cost readings", () => {
     expect(within(card).getByText("21.40")).toBeInTheDocument();       // 交易所手续费
     expect(within(card).getByText("1.20")).toBeInTheDocument();        // 交易所资金费
     expect(within(card).getByText(/交易所口径自检通过/)).toBeInTheDocument();
-    expect(within(card).getByText(/交易所官方档位 Lv1/)).toBeInTheDocument();
+    // 费率来源行自 silent-degradation-repair 轴 A-4 起**不在对账卡里**了：那张卡在
+    // `describeReconcile(rec)` 为空时整段隐藏，而生产库 211 条 run 里绝大多数根本没有对账
+    // 读数——「这笔账按谁的费率算的」这句话因此从来没有被任何人看见过。它现在住在独立的
+    // `FeeSourceCard`（缺键才不渲染），故这里断言的是「它不再被那张会自我隐藏的卡片挟持」。
+    expect(within(card).queryByText(/交易所官方档位 Lv1/)).not.toBeInTheDocument();
+    const feeCard = await screen.findByTestId("ai-fee-source-card");
+    expect(within(feeCard).getByText(/交易所官方档位 Lv1/)).toBeInTheDocument();
   });
 
   it("hides the reconciliation card when the reading is absent", async () => {

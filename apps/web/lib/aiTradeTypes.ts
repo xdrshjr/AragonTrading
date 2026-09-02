@@ -1334,6 +1334,11 @@ export interface AiTradeSessionRow {
   // **两个接口都要声明**：只声明一处会让另一条通路上的横幅恒不渲染（`trendVerdict` 的同款教训）。
   // 总闸关 / 老后端 ⇒ 整键缺席 ⇒ 横幅整段不渲染。
   liveness?: AiTradeLiveness | null;
+  // 真值源计数摘要（silent-degradation-repair 轴 E / §11.2）：**只带三行**——`intelReader`
+  // 的真源是一次 async DB 读，而后端 `_status_payload()` 是同步方法，它进不去，只走 REST。
+  // 故 `trackedCount` 恒为 3，顶栏文案必须写「3 项真值源中 N 项降级」而不是「真值源 N 项降级」
+  // ——后者会让用户以为四行都在被实时监视。总闸关 / 老后端 ⇒ 整键缺席 ⇒ 芯片不渲染。
+  truthSources?: AiTradeTruthDigest | null;
   // C-2：结构上不可能产生任何合法动作而被整轮跳过的次数。`roundsCompleted` **刻意不含它们**
   // ——那一轮没做过任何决策，算进轮数会污染「N 轮 0 成交」这个度量本身。总闸默认关 ⇒ 恒 0。
   roundsSkipped?: number;
@@ -1418,6 +1423,11 @@ export interface AiTradeStatusEvent {
   // **两个接口都要声明**：只声明一处会让另一条通路上的横幅恒不渲染（`trendVerdict` 的同款教训）。
   // 总闸关 / 老后端 ⇒ 整键缺席 ⇒ 横幅整段不渲染。
   liveness?: AiTradeLiveness | null;
+  // 真值源计数摘要（silent-degradation-repair 轴 E / §11.2）：**只带三行**——`intelReader`
+  // 的真源是一次 async DB 读，而后端 `_status_payload()` 是同步方法，它进不去，只走 REST。
+  // 故 `trackedCount` 恒为 3，顶栏文案必须写「3 项真值源中 N 项降级」而不是「真值源 N 项降级」
+  // ——后者会让用户以为四行都在被实时监视。总闸关 / 老后端 ⇒ 整键缺席 ⇒ 芯片不渲染。
+  truthSources?: AiTradeTruthDigest | null;
   // C-2：结构上不可能产生任何合法动作而被整轮跳过的次数。`roundsCompleted` **刻意不含它们**
   // ——那一轮没做过任何决策，算进轮数会污染「N 轮 0 成交」这个度量本身。总闸默认关 ⇒ 恒 0。
   roundsSkipped?: number;
@@ -1570,6 +1580,22 @@ export interface AiTradeGroupRow {
   // 方向对称性回执镜像（directional-symmetry §7.1）：**服务端解析后的生效值**；
   // `null` = 未装配（总闸关 / 用户显式关闭 / 该预设的 minConsensus<=0 使门禁本就不触发）。
   direction?: (AiTradeDirectionRule & { minConsensus: number }) | null;
+  // 费率来源回执（silent-degradation-repair 轴 A-4）：分组共享一份。成功态即归一 wire、
+  // 降级态带 `lastError`（「交易所拒绝了费率查询：51000 …」）、`null` = 未装配。
+  feeRates?: FeeRatesWire | null;
+}
+
+/**
+ * 真值源计数摘要（silent-degradation-repair 轴 E）。**只有计数与键名，没有文案**——
+ * 文案的唯一装配点在后端 `ai_auto/truth_wire.py`，由 `GET /api/system/truth-sources` 取。
+ */
+export interface AiTradeTruthDigest {
+  scope: "process";
+  /** 被 WS 实时跟踪的行数（恒为 3；第 4 行 `intelReader` 只在 REST 上）。 */
+  trackedCount: number;
+  degradedCount: number;
+  /** 降级那几行的键名（`feeRates` / `privateQuota` / `decisionModel`）。 */
+  keys: string[];
 }
 
 /** 分组生命周期态（后端 `group.state` 与会话 `status.state` 共用同一值域）。 */
@@ -1979,6 +2005,11 @@ export interface AiTradeGroupState {
   // 而 `lifecycle` 是让人能反驳它的那份证据；两者缺一，「运行中」就重新变成一句无法核对的话。
   declaredState?: AiTradeLifecycleState | null;
   lifecycle?: AiTradeLifecycleWire | null;
+  // 费率来源（silent-degradation-repair 轴 A-4）：分组共享一份（同一账户、同一档位家族）。
+  // 同样由 `groupStateFromStatus` **逐键手抄**写入——这已经是本文件第五条同款注释了：不补那一行，
+  // 「刷新页面后重发现」这条路径上费率来源恒缺席，而 WS 通路是好的，于是坑只在重载后复现。
+  // `null` = 未装配（总闸关 / 无凭证 / 压根没尝试过取数）⇒ 面板整段不渲染。
+  feeRates?: FeeRatesWire | null;
   startedTs: number;
   members: Record<string, AiTradeGroupMemberState>;
 }

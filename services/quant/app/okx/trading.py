@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 import time
 from dataclasses import replace
 
@@ -36,10 +37,11 @@ from .order_builder import (
     validate_close,
     validate_order,
 )
+from .positions_cache import get_positions_cache
 from .private_client import OKXPrivateError
 from .rest_client import OKXError, get_rest_client, infer_inst_type
 from .trade_client import OKXTradeClient
-from .types import _optional_float
+from .types import FeeAttemptError, FeeFetchOutcome, _optional_float
 
 # 市价单名义上限校验的保守滑点缓冲（§2.4 / C2-3）：买多放大、买空缩小参考价以免越限漏拦。
 _MARKET_NOTIONAL_BUFFER = 0.02
@@ -54,6 +56,8 @@ _CLOSE_LOCAL_REJECT_CODES = {
 # `_map_okx_code` 对未知码一律拍平为 OKX_ERROR，端点就再也分不清「本地拒」与「交易所拒」。
 _BACKSTOP_LOCAL_REJECT_CODES = {
     "LIVE_BACKSTOP_REJECTED_LOCAL", "LIVE_BACKSTOP_SIZE_EXCEEDS", "LIVE_NO_POSITION"}
+logger = logging.getLogger(__name__)
+
 # clOrdId 进程内单调序号（与毫秒时间戳拼接，确保同毫秒并发也唯一，C1-2）。
 _clord_counter = itertools.count()
 
@@ -174,6 +178,7 @@ async def place_live_order(session: AsyncSession, creds: AccountCredentials, acc
             await client.set_leverage(order.inst_id, order.lever, order.td_mode,
                                       _leverage_pos_side(order, pos_mode))
         row = await client.place_order(payload)
+        _drop_positions_cache(client)          # 轴 C-3：写即作废（成功路径唯一落点）
     except OKXError as exc:
         mapped = _map_trade_code(exc.code)
         status = "rejected" if mapped in _LOCAL_REJECT_CODES else "error"
@@ -260,6 +265,7 @@ async def close_live_position(session: AsyncSession, creds: AccountCredentials, 
                 build_close_order_payload(close, meta, pos_mode, sz, cl_ord_id))
             ord_id, closed_sz = str(row.get("ordId") or ""), sz
             sz_audit = sz
+        _drop_positions_cache(client)          # 轴 C-3：市价 / 限价两支共用这一个成功出口
     except OKXError as exc:
         mapped = _map_trade_code(exc.code)
         status = "rejected" if mapped in (_LOCAL_REJECT_CODES | _CLOSE_LOCAL_REJECT_CODES) else "error"
@@ -327,6 +333,7 @@ async def place_backstop_stop(session: AsyncSession, creds: AccountCredentials, 
         sz = validate_algo_stop(stop, meta, abs_pos=abs_pos)["sz"]
         row = await client.place_algo_order(
             build_algo_stop_payload(replace(stop, sz=sz), meta, pos_mode))
+        _drop_positions_cache(client)          # 轴 C-3：算法委托同样是一次成功的私有写
     except OKXError as exc:
         mapped = _map_trade_code(exc.code)
         status = "rejected" if mapped in _BACKSTOP_LOCAL_REJECT_CODES else "error"
@@ -386,6 +393,9 @@ async def cancel_live_order(session: AsyncSession, creds: AccountCredentials, ac
     client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
     try:
         row = await client.cancel_order(cancel.inst_id, cl_ord_id=cancel.cl_ord_id)
+        # 轴 C-3：撤单也可能改变持仓——「撤单请求发出的同时那笔挂单成交了」是本仓库明文登记的
+        # 第三态（`_CANCEL_OUTCOME_BY_CODE`），此时交易所侧持仓已经变了。
+        _drop_positions_cache(client)
     except OKXError as exc:
         mapped = _map_trade_code(exc.code)
         outcome = _cancel_outcome(mapped)
@@ -488,6 +498,7 @@ async def close_all_live_positions(session: AsyncSession, creds: AccountCredenti
                 results.append({"instId": inst_id, "posSide": pos_side, "ok": True,
                                 "clOrdId": str(row.get("clOrdId") or cl_ord_id),
                                 "code": None, "message": None})
+                _drop_positions_cache(client)   # 轴 C-3：逐仓作废（整批可能跨越多个 TTL 窗口）
                 closed += 1
             except OKXError as exc:
                 mapped = _map_trade_code(exc.code)
@@ -517,17 +528,103 @@ async def set_account_leverage(creds: AccountCredentials, inst_id: str, lever: f
     return {"ok": True, "instId": inst_id, "lever": lever, "mgnMode": mgn_mode, "posSide": pos_side}
 
 
-async def fetch_live_positions(creds: AccountCredentials) -> list[dict]:
-    """真实持仓（§4.4，复用 ``_normalize_position`` 与 OkxAccountPosition 形态）。"""
+async def fetch_live_positions(creds: AccountCredentials, *, use_cache: bool = False,
+                               ttl_s: float = 0.0, force: bool = False) -> list[dict]:
+    """真实持仓（§4.4，复用 ``_normalize_position`` 与 OkxAccountPosition 形态）。
+
+    **它是账户级读数**：签名里没有 ``instId``，返回的是全账户持仓（附录 D F-1）。这正是轴 C
+    存在的理由——N 个成员各拉一份**完全相同**的快照，请求量 N 倍而信息量 1 倍。
+
+    Args:
+        creds: 账户凭证。
+        use_cache: 是否允许命中进程内共享快照。**默认 ``False``**——调用方必须**显式**选择走
+            缓存，于是本轮之前的每一处调用点都逐字节保持今天的行为，而「哪些点可以共享读数」
+            这个有交易后果的判断被留在了调用点上（§七 C-2 的分级表）。
+        ttl_s: 共享窗口（秒），仅 ``use_cache=True`` 时有意义；``<= 0`` ⇒ 完全旁路。
+        force: **强制穿透**——必发一次真实请求且不写缓存。反手前的净仓确认与暂停时的持仓真值
+            读用它：那两条路径都有交易后果，读一份 4 秒前的答案会把「等净仓归零」变成一个恒假
+            的死循环。
+
+    Returns:
+        归一后的持仓行（``list[dict]``——缓存内部不可变，**在这里 ``list(...)`` 一次**再交给
+        调用方；让缓存的内部不可变性泄漏到 executor 只会换来一批与本轴无关的类型噪声）。
+    """
     client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
+
+    async def _pull() -> list[dict]:
+        try:
+            positions = await client.get_positions()
+        except OKXError as exc:
+            raise OKXPrivateError(
+                _map_trade_code(exc.code),
+                _redact(exc.message, creds.secret_key, creds.passphrase)) from exc
+        return [_normalize_position(p) for p in positions]
+
     try:
-        positions = await client.get_positions()
-    except OKXError as exc:
-        raise OKXPrivateError(_map_trade_code(exc.code),
-                              _redact(exc.message, creds.secret_key, creds.passphrase)) from exc
+        if not use_cache or force or ttl_s <= 0:
+            return await _pull()
+        # 指纹**一律由 client 现算**（评审 P1-10）：这些函数本来就为这次调用建了一个 client
+        # 实例，在这里取一次零额外成本。严禁在本文件里重新拼 `get_settings()` 的三个字段——
+        # 两份指纹一旦漂移，缓存就会跨账户串数据（门禁 G-C12 用 AST 钉死这一条）。
+        snapshot = await get_positions_cache().get(
+            client._fingerprint(), _pull, ttl_s=float(ttl_s))
+        return list(snapshot.rows)
     finally:
         await client.aclose()
-    return [_normalize_position(p) for p in positions]
+
+
+async def fetch_live_positions_at(creds: AccountCredentials, *, use_cache: bool = False,
+                                  ttl_s: float = 0.0,
+                                  force: bool = False) -> tuple[list[dict], float]:
+    """同 ``fetch_live_positions``，但**多回一个「这份读数真实取得的时刻」**（轴 C-4）。
+
+    为什么需要它：C-4 的判据是「这份数据比我那次写更新吗」，而一份 4 秒前的缓存快照此刻被交到
+    手上，它承载的事实仍然是 4 秒前的。只回 ``list[dict]`` 的话，调用方唯一能用的时间戳就是
+    「我收到它的时刻」——那等于让缓存把自己洗成新鲜的，C-4 就成了一句空话。
+
+    ``fetch_live_positions`` 保持 ``list[dict]`` 的既有签名不变（它有 4 个既有调用点与一批
+    替身），本函数是给**唯一**需要这个时刻的地方（`LiveExecutor` 的两个默认读法）用的。
+    """
+    client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
+
+    async def _pull() -> list[dict]:
+        try:
+            positions = await client.get_positions()
+        except OKXError as exc:
+            raise OKXPrivateError(
+                _map_trade_code(exc.code),
+                _redact(exc.message, creds.secret_key, creds.passphrase)) from exc
+        return [_normalize_position(p) for p in positions]
+
+    try:
+        if not use_cache or force or ttl_s <= 0:
+            return await _pull(), time.time()
+        snapshot = await get_positions_cache().get(
+            client._fingerprint(), _pull, ttl_s=float(ttl_s))
+        return list(snapshot.rows), snapshot.taken_wall
+    finally:
+        await client.aclose()
+
+
+def _drop_positions_cache(client: OKXTradeClient) -> None:
+    """一次**成功的私有写**之后作废该账户的持仓快照（轴 C-3）。
+
+    判据是「私有写成功」而不是「会话认为自己成交了」：后者会漏掉交易所侧 OCO 触发那一类我方
+    没有下过单的持仓变化，而那一类正好由 TTL 兜住（≤ 4 秒）。
+
+    **必须在 ``finally: await client.aclose()`` 之前调用**——`_fingerprint()` 读的是实例上的
+    凭证与 settings，与关不关连接无关，但把它写在 `finally` 之后会让「作废」发生在一个已经被
+    归还的实例上，语义上说不清楚。
+
+    **整段吞异常，且这不是防御性噪声**：它跑在**一次已经成功的私有写**之后——那一刻交易所侧
+    的仓位已经变了、审计还没落、回执还没返回。让一个纯观测性的缓存作废动作把这条路径打成异常，
+    等于「单下出去了，但接口告诉你失败了」，是本仓最不能接受的一类失败。作废失败的后果被
+    C-4 的构造性保证兜住（陈旧快照不得裁决幻影平仓），而那正是 C-3 / C-4 冗余的意义。
+    """
+    try:
+        get_positions_cache().invalidate(client._fingerprint())
+    except Exception as exc:  # noqa: BLE001 —— 见 docstring：绝不让它污染一次成功的写
+        logger.debug("positions cache invalidate skipped: %s", exc)
 
 
 async def fetch_live_fills(creds: AccountCredentials, inst_id: str | None = None,
@@ -569,21 +666,49 @@ def _normalize_fill(r: dict) -> dict:
     }
 
 
-async def fetch_trade_fee(creds: AccountCredentials, inst_id: str, *,
-                          inst_type: str = "SWAP") -> dict | None:
-    """本账户在该合约上的**官方**费率档位（ai-trade-cost-truth-and-net-pnl 轴 A）。
+async def fetch_trade_fee_ex(creds: AccountCredentials, inst_id: str, *,
+                             inst_type: str = "SWAP") -> FeeFetchOutcome:
+    """本账户在该合约上的**官方**费率档位 + **每一跳的失败原因**（silent-degradation 轴 A-2/A-5）。
 
-    错误映射与 ``fetch_live_fills`` 逐字同构。归一后任一侧不可用 ⇒ ``None``（调用方回落配置常数）。
+    这是轴 A 的**唯一**取数入口（它取代了本轮之前的 ``fetch_trade_fee``）。差别只在返回契约：
+    老契约是 ``dict | None``，那个签名里**没有第二个格子**能放失败原因——于是 O-2 承诺的
+    「`config` 时携带最近一次失败的 `code`/`msg`」在今天的回落链上没有任何一处宿主
+    （A-5 的四重截断之②）。老名字**不留薄封装**：它的最后一个调用点已随本轮迁走，留下一个
+    零调用点的同义函数只会让下一轮有人对着它写新代码，然后再一次丢掉失败原因。
+
+    错误映射与 ``fetch_live_fills`` 逐字同构：**不该推进阶梯的失败原样上抛**（传输层 / 429 /
+    401 / 5xx），只有「参数不对」那一类才被吸收进 ``errors``。
+
+    Returns:
+        ``FeeFetchOutcome``——``wire`` 为归一后的费率 dict（阶梯全败或归一后任一侧缺失 ⇒
+        ``None``），``errors`` 为每一跳的 ``FeeAttemptError``（成功即空）。
     """
     client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
     try:
-        raw = await client.get_trade_fee(inst_type, inst_id)
+        raw, rung, errors = await client.get_trade_fee(inst_type, inst_id)
     except OKXError as exc:
         raise OKXPrivateError(_map_trade_code(exc.code),
                               _redact(exc.message, creds.secret_key, creds.passphrase)) from exc
     finally:
         await client.aclose()
-    return _normalize_trade_fee(raw, inst_id)
+    safe = tuple(_redact_attempt(err, creds) for err in errors)
+    if rung is None:                   # 一跳都没成功（`""` 是「今天那一跳成了」，两件事）
+        return FeeFetchOutcome(wire=None, errors=safe)
+    wire = _normalize_trade_fee(raw, inst_id, rung=rung or None)
+    if wire is None and not safe:
+        # 阶梯成功但归一后仍不可用（OKX 回了一行、两个 bps 却都缺）——这同样是「取不到」，
+        # 且它此前**没有任何原因可讲**。如实造一条：一个没有原因的降级正是本轮要消灭的东西。
+        safe = (FeeAttemptError(rung=rung, http_status=200, code="",
+                                msg="交易所返回的档位里缺 maker / taker 费率"),)
+    return FeeFetchOutcome(wire=wire, errors=safe)
+
+
+def _redact_attempt(err: FeeAttemptError, creds: AccountCredentials) -> FeeAttemptError:
+    """阶梯失败原因同样过一次脱敏（C7 单点收口——它会一路进日志、wire 与界面）。"""
+    return FeeAttemptError(
+        rung=err.rung, http_status=err.http_status,
+        code=_redact(err.code, creds.secret_key, creds.passphrase),
+        msg=_redact(err.msg, creds.secret_key, creds.passphrase))
 
 
 def _fee_tier_fields(inst_id: str) -> tuple[str, str]:
@@ -608,8 +733,14 @@ def _fee_bps(raw: dict, tier_key: str, base_key: str) -> float | None:
     return None
 
 
-def _normalize_trade_fee(raw: dict, inst_id: str) -> dict | None:
+def _normalize_trade_fee(raw: dict, inst_id: str, *, rung: str | None = None) -> dict | None:
     """OKX ``account/trade-fee`` 单行 → 归一费率快照；任一侧不可用 ⇒ ``None``。
+
+    ``rung``（silent-degradation-repair 轴 A-2）：阶梯上**哪一跳**拿到的这份档位。
+    ``"family"`` ⇒ ``source="exchange:family"``、``"type"`` ⇒ ``"exchange:type"``；
+    ``None``（老调用点 / 单测）⇒ **逐字保留** ``"exchange"``。
+    **本函数是 ``source`` 的唯一产出点**——只改 ``ai_auto/fee_rates.py``（它是**读**这个值的）
+    永远不会让新值出现（评审 P1-6）。
 
     **负 bps（返佣）一律夹紧到 0.0 后才交给下游**（P1-4）：记账链与决策链一视同仁。真实返佣与一次
     符号解析错误在数值上不可区分，而不夹紧的代价是「盈亏可能被凭空抬高」——那正是本 spec 要修的方向
@@ -626,7 +757,8 @@ def _normalize_trade_fee(raw: dict, inst_id: str) -> dict | None:
             "level": str((raw or {}).get("level") or ""),
             "ruleType": str((raw or {}).get("ruleType") or ""),
             "rebate": bool(maker_raw < 0 or taker_raw < 0),
-            "ts": int(_optional_float((raw or {}).get("ts")) or 0), "source": "exchange"}
+            "ts": int(_optional_float((raw or {}).get("ts")) or 0),
+            "source": f"exchange:{rung}" if rung else "exchange"}
 
 
 async def fetch_position_history(creds: AccountCredentials, inst_id: str, *, limit: int = 50,

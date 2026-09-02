@@ -11,6 +11,9 @@ const SECTIONS = [
   { key: "auto-trade", label: "自动交易设置", desc: "总预算上限与分配默认" },
   { key: "experience", label: "交易经验库", desc: "AI 沉淀的经验与教训" },
   { key: "intel-source", label: "情报检索源", desc: "市场情报的检索与采集节律" },
+  // 真值源（silent-degradation-repair 轴 E）：排在「关于 / 诊断」**之前**——它回答的是
+  // 「系统现在有没有在对我说真话」，比版本号更该先被看到。
+  { key: "truth-sources", label: "真值源", desc: "四条对外取数通路的健康" },
   { key: "about", label: "关于 / 诊断", desc: "版本信息与日志目录" },
 ];
 

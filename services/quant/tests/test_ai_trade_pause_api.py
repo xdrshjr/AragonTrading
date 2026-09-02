@@ -155,7 +155,9 @@ def _patch(monkeypatch, *, positions=None, pending=None) -> None:
     monkeypatch.setattr("app.ai_auto.manager.fetch_trading_config", fake_config)
     monkeypatch.setattr("app.ai_auto.manager.fetch_live_positions", fake_positions)
     monkeypatch.setattr("app.ai_auto.manager.fetch_live_open_orders", fake_open_orders)
-    monkeypatch.setattr("app.ai_auto.manager.fetch_trade_fee", no_fee_rate)
+    # 轴 A-2/A-5 之后启动期走 `fetch_trade_fee_ex`（它多带一份「每一跳为什么失败」）。
+    # 替身返回 `None`，由 `fee_rates.as_outcome` 归一成「没取到、也没有原因可讲」。
+    monkeypatch.setattr("app.ai_auto.manager.fetch_trade_fee_ex", no_fee_rate)
     monkeypatch.setattr("app.ai_auto.manager.resolve_active_provider", fake_resolve)
     monkeypatch.setattr("app.ai_auto.manager.make_llm_client_from_config", lambda cfg: object())
     monkeypatch.setattr("app.ai_auto.manager.AiTradeSession", _FakeSession)

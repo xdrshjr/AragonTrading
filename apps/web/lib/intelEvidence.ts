@@ -2,6 +2,7 @@
 // **零 React、零请求**——它们全部可单测，且被抽屉、卡片、设置卡三处共用。
 import type {
   IntelDocState,
+  IntelDocumentHealth,
   IntelEvidence,
   IntelItem,
   IntelQuote,
@@ -81,6 +82,60 @@ export function strictReadiness(rate: number | null): string {
   return rate >= 0.7
     ? "命中率已达到收紧的建议线（≥70%）。"
     : "命中率低于 70% 时不建议开启「必须附可核对引文」。";
+}
+
+/** 抓取健康的三态（silent-degradation-repair 轴 B-2）。 */
+export type ReaderHealthTone = "neutral" | "danger" | "ok";
+
+export interface ReaderHealthView {
+  tone: ReaderHealthTone;
+  /** 一句话读数（「正文抓取 0/96 全部失败」）。 */
+  text: string;
+  /** 危险态才有的一句成因提示；其余为空串。 */
+  hint: string;
+}
+
+/**
+ * 「正文到底抓下来没有」的三态（轴 B-2）。
+ *
+ * 这两列（`reader_attempt` / `reader_ok`）**有逐轮读点**——轮次页那一行「正文 5/6」——
+ * 但**从不聚合成结论、从不跨轮判趋势、从不告警**。一个人要发现「16 轮全零」，得自己翻 16 行
+ * 然后自己做加法。本函数做的正是那三个「从不」里的第一个。
+ *
+ * 老回执（两个键都缺席）⇒ `null` ⇒ 调用方整行不渲染，**绝不**把 `undefined` 当成 0 去渲染
+ * 一个假的「0/0 全部失败」。
+ */
+export function describeReaderHealth(
+  health: Pick<IntelDocumentHealth, "fetchAttempt" | "fetchOk"> | null | undefined,
+): ReaderHealthView | null {
+  if (!health || health.fetchAttempt == null || health.fetchOk == null) return null;
+  const attempt = Math.max(0, health.fetchAttempt);
+  const ok = Math.max(0, health.fetchOk);
+  if (attempt === 0) {
+    return { tone: "neutral", text: "本轮未尝试抓取正文", hint: "" };
+  }
+  if (ok === 0) {
+    return {
+      tone: "danger",
+      text: `正文抓取 0/${attempt} 全部失败`,
+      hint: "常见成因：本机 DNS 把公网域名解析成了合成地址（198.18.0.0/15，"
+        + "透明代理的 fake-IP 模式），可在上方切换解析策略后重试。",
+    };
+  }
+  return { tone: "ok", text: `正文抓取 ${ok}/${attempt}`, hint: "" };
+}
+
+/**
+ * 「缓存了 N 篇文档、正文合计 0 字节」——一个在健康安装上**定义上不可能**的组合（§一 E-14）。
+ *
+ * 这两个数三个星期来一直显示在设置页上，只是没有任何一处把它翻译成一句人能读懂的结论。
+ * 不成立 ⇒ `null` ⇒ 不追加任何尾注。
+ */
+export function describeEmptyBodyCache(
+  health: Pick<IntelDocumentHealth, "cachedDocs" | "bodyBytes"> | null | undefined,
+): string | null {
+  if (!health || health.cachedDocs <= 0 || health.bodyBytes !== 0) return null;
+  return "—— 这些文档一篇正文都没抓下来";
 }
 
 /** 缓存体积的人类可读形态（后端下发的是**真实字节**，这里只做单位换算）。 */

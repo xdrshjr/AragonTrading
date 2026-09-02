@@ -26,6 +26,7 @@ from ..ai_auto import get_ai_trade_manager
 from ..ai_auto.intel import arming
 from ..ai_auto.intel import corpus as intel_corpus
 from ..ai_auto.intel import gate as intel_gate
+from ..ai_auto.intel import reader as intel_reader
 from ..ai_auto.intel import runtime as intel_runtime
 from ..ai_auto.intel import scheduler as intel_scheduler
 from ..ai_auto.intel import service as intel_service
@@ -280,7 +281,13 @@ async def read_intel_document_health(
     derived = await intel_service.resolve_intel_settings(session, settings)
     health = await repo.document_health(session)
     return {**health,
-            "readerEnabled": bool(getattr(derived, "ai_trade_intel_reader_enabled", True))}
+            "readerEnabled": bool(getattr(derived, "ai_trade_intel_reader_enabled", True)),
+            # 轴 B-2：拒因分布只能来自**进程内**计数器——`ai_intel_documents.status` 存的是
+            # `ok|blocked|http_error|…`，不是 `private_host` 这类拒因，而本轮零迁移。
+            # `sinceProcessStart` 必须一起下发：一个重启就归零的计数器如果不说自己会归零，
+            # 就是在制造第五条静默降级。
+            "rejectCodesSinceStart": intel_reader.reject_counts(),
+            "sinceProcessStart": True}
 
 
 @router.get("/intel/items/{itemId}/evidence", response_model=IntelEvidenceOut)

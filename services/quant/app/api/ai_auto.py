@@ -613,6 +613,30 @@ async def ai_trade_member_exit(group_id: str, inst_id: str) -> dict:
     return result
 
 
+@router.post("/ai-trade/fee-rates/refresh")
+async def ai_trade_refresh_fee_rates() -> dict:
+    """人工重取一次交易所官方费率档位（silent-degradation-repair 轴 A-4）。
+
+    真机实测：`GET /account/trade-fee` **1,524 次请求、0 次成功**（自 2026-08-11 起），于是三周来
+    成本模型、`edge` 门禁的成本项、净额盈亏的扣减**全部跑在本地保守常数上**。轴 A-2 把参数改成
+    阶梯之后，这个端点是「改完之后立刻看一眼对不对」的那个按钮——真值源卡片第 1 行的 `action`
+    指向它，而那条纪律是「每一行的 action 都必须真的点得下去」。
+
+    **只读私有 GET**：不触碰任何写路径，故与 `/okx/connectivity/probe` 同源，**不要求**
+    `live_trading_enabled`；带单飞锁。分组未在跑 ⇒ **409 而不是静默成功**——一个点了没反应的
+    按钮比没有按钮更糟。
+
+    **返回裸 `dict`、不绑 `response_model`**（同族三个端点同款纪律：绑上之后新 wire 键会被
+    FastAPI 静默剔除）。
+    """
+    wire = await get_ai_trade_manager().refresh_fee_rates()
+    if wire is None:
+        raise HTTPException(409, detail={
+            "code": "AI_TRADE_NOT_RUNNING",
+            "message": "当前没有在跑的 AI 自动交易分组，无法重取费率档位"})
+    return {"ok": True, "feeRates": wire}
+
+
 @router.post("/ai-trade/{group_id}/member/{inst_id}/relink")
 async def ai_trade_member_relink(group_id: str, inst_id: str) -> dict:
     """人工授权的**单次**强制重连 + REST 活性补取（ai-trade-feed-self-healing §4.2）。

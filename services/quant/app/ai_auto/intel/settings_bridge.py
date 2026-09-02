@@ -48,6 +48,10 @@ INTEL_SETTING_BRIDGE: tuple[tuple[str, str, str, type], ...] = (
     ("readerEnabled", "ai_intel.reader_enabled", "ai_trade_intel_reader_enabled", bool),
     ("readerTopK", "ai_intel.reader_top_k", "ai_trade_intel_reader_top_k", int),
     ("quoteMode", "ai_intel.quote_mode", "ai_trade_intel_quote_mode", str),
+    # ---- silent-degradation-repair 轴 B-1：解析策略。**不扩这张表 ⇒ 假面板**（第四次同形
+    # 前科）。它必须能从面板改回 `strict`：本轮把默认改成了 `auto`，而一个安全相关的放宽如果
+    # 只能改 env、在打包桌面端上就等于改不了。
+    ("readerResolver", "ai_intel.reader_resolver", "ai_trade_intel_reader_resolver", str),
     # ---- ai-trade-intel-actionability：三把总闸 + 三个告警旋钮。**不扩这张表 ⇒ 假面板**：
     # 请求 200、开关照动、`Settings` 上的值永远不变，而且不报错（G-16 逐键往返冻结）。
     ("alertEnabled", "ai_intel.alert_enabled", "ai_trade_intel_alert_enabled", bool),
@@ -89,6 +93,12 @@ async def resolve_intel_settings(session, settings):
         # 让「影响力门槛」变成一个恒不成立的判据（`IMPACT_W.get(坏值, 1.0)`）。
         if (field_name == "ai_trade_intel_alert_min_impact"
                 and value not in tax.MIN_IMPACTS):
+            continue
+        # 第三处同形收口（轴 B-1）：`ai_trade_intel_reader_resolver` 只有两个合法取值，而
+        # `model_copy(update=…)` 不跑校验器——一个从库内行读回来的坏值会让解析闸落到
+        # `strict` 分支上而没有任何提示，也就是把一个用户以为已经打开的放宽悄悄关掉。
+        if (field_name == "ai_trade_intel_reader_resolver"
+                and value not in ("auto", "strict")):
             continue
         updates[field_name] = value
     stored_key = await repo.get_app_setting(session, INTEL_API_KEY_APP_KEY, None)

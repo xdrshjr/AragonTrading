@@ -18,6 +18,7 @@ import logging
 
 from fastapi import APIRouter
 
+from ..okx.call_stats import get_call_stats
 from ..okx.clock import get_server_clock
 from ..okx.link_state import get_link_registry
 from ..okx.rest_client import get_rest_client
@@ -30,11 +31,20 @@ _probe_lock = asyncio.Lock()
 
 
 def _snapshot() -> dict:
-    """登记簿快照 + 时钟偏移两个加法键（``clockOffsetMs`` 在面板上解释 50102 类失败）。"""
+    """登记簿快照 + 时钟偏移 + 调用统计三个加法键（``clockOffsetMs`` 在面板上解释 50102 类失败）。
+
+    ``callStats``（silent-degradation-repair 轴 D-3）：轴 D-2 把 `httpx` 的 `INFO` 压掉之后，
+    「哪个端点最热 / 谁在拒我」这个问题的答案只剩这一处。总闸关 ⇒ ``wire()`` 返回 ``{}`` ⇒
+    该键**整段不出现**（逐字节回到今天）。本端点明文禁止声明 ``response_model``，故加法键
+    不会被 FastAPI 静默剔除。
+    """
     clock = get_server_clock()
     snap = get_link_registry().snapshot()
     snap["clockOffsetMs"] = round(clock.offset_ms)
     snap["clockSyncedTs"] = int(clock.synced_ts) if clock.synced_ts else None
+    stats = get_call_stats().wire()
+    if stats:
+        snap["callStats"] = stats
     return snap
 
 

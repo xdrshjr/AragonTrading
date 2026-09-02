@@ -124,7 +124,12 @@ async def test_documents_health_is_not_hijacked_by_read_intel():
     body = res.json()
     assert body["cachedDocs"] == 1 and body["bodyBytes"] > 0
     assert set(body) == {"cachedDocs", "bodyBytes", "oldestFetchedTs", "lastPrunedTs",
-                         "readerEnabled"}
+                         "readerEnabled",
+                         # silent-degradation-repair 轴 B-2 的六个加法键。它们必须**真的到达
+                         # 客户端**——本端点声明了 `response_model`，schema 漏改时 FastAPI 会
+                         # 一声不响地把它们全部剔除（评审 P0-2，阻断级）。
+                         "fetchAttempt", "fetchOk", "zeroOkStreak", "blockedByStatus",
+                         "rejectCodesSinceStart", "sinceProcessStart"}
 
 
 # ---------------- M-1 / M-2：出参补键（G-21 的读出通路） ----------------

@@ -224,7 +224,8 @@ class LiveAutoManager:
 
         configs = await asyncio.gather(*[_bounded_config(m.inst_id) for m in members])
         async with sem:
-            positions = await fetch_live_positions(creds)
+            # 轴 C-2（silent-degradation-repair）：启动前置**强制新鲜**，理由同 `ai_auto` 侧。
+            positions = await fetch_live_positions(creds, force=True)
         config_map = {m.inst_id: cfg for m, cfg in zip(members, configs)}
         avail = next((cfg.get("availUsdt") or 0.0 for cfg in configs), 0.0)
         return avail, positions, config_map

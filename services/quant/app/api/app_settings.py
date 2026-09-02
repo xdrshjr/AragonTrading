@@ -219,6 +219,11 @@ async def _intel_wire(session: AsyncSession, settings: Settings) -> dict:
         "readerEnabled": bool(derived.ai_trade_intel_reader_enabled),
         "readerTopK": int(derived.ai_trade_intel_reader_top_k),
         "quoteMode": intel_tax.resolve_quote_mode(derived),
+        # 轴 B-1：解析策略的**生效值**回读（库内行叠加之后的那一份）。
+        "readerResolver": str(derived.ai_trade_intel_reader_resolver),
+        # 轴 B-2 的两把只读旋钮：抓取健康行 / 零命中横幅要不要渲染、连续多少轮升横幅。
+        "readerHealthVisible": bool(derived.ai_trade_intel_reader_health_visible),
+        "readerZeroStreakWarn": int(derived.ai_trade_intel_reader_zero_streak_warn),
         # 命中率取**第一个真的有读数的成员**：它是一个「这台机器最近抓得怎么样」的量级读数，
         # 不是某个标的的属性。跳过 `None` 的那些（而不是取字面意义上的第一个成员）是因为
         # 「这个标的还没提过引文」不该把整张卡上的读数吃掉；一个都没有时才留 `None`

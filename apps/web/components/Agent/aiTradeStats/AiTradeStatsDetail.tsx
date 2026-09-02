@@ -131,6 +131,7 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
             costBasisAssumed={detail.costBasisAssumed === true}
           />
 
+          <FeeSourceCard members={detail.members} />
           <ReconcileCard members={detail.members} />
 
           <Section title="权益 / 回撤">
@@ -290,11 +291,9 @@ function KpiGrid({
  */
 function ReconcileCard({ members }: { members: AiTradeHistoryMember[] }) {
   const rec = members.map((m) => m.metrics.aiStats?.reconcile).find((r) => r) ?? null;
-  const rates = members.map((m) => m.metrics.aiStats?.feeRates).find((r) => r) ?? null;
   const view = describeReconcile(rec);
   if (!view) return null;
   const identity = describeIdentityCheck(rec);
-  const feeLine = describeFeeRates(rates);
   return (
     <Section title="交易所对账">
       <div className="flex flex-col gap-1.5 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2" data-testid="ai-reconcile-card">
@@ -310,7 +309,32 @@ function ReconcileCard({ members }: { members: AiTradeHistoryMember[] }) {
           <Kpi label="本地往返数" value={`${rec?.localTrips ?? 0} 笔`} />
         </div>
         {identity && <p className="text-[10px] text-[var(--muted)]">{identity}</p>}
-        {feeLine && <p className="text-[10px] text-[var(--muted)]">{feeLine}</p>}
+      </div>
+    </Section>
+  );
+}
+
+/**
+ * 费率来源卡（silent-degradation-repair 轴 A-4 的历史侧落点）。
+ *
+ * **它必须是一张独立的卡，不能再挂在 `ReconcileCard` 里面**：那张卡在 `describeReconcile(rec)`
+ * 为空时 `return null` **整段隐藏**，于是「这笔账到底按官方档位还是本地常数算的」这句唯一能
+ * 说真话的文案，被放在了一间平时不开门的房间里——生产上 211 条 run 里绝大多数根本没有对账
+ * 读数，那一行因此从来没有被任何人看见过。
+ *
+ * 缺键（老记录 / 总闸关）⇒ 整段不渲染；**绝不**在没有读数时编一句「按官方档位」。
+ */
+function FeeSourceCard({ members }: { members: AiTradeHistoryMember[] }) {
+  const rates = members.map((m) => m.metrics.aiStats?.feeRates).find((r) => r) ?? null;
+  const feeLine = describeFeeRates(rates);
+  if (!feeLine) return null;
+  return (
+    <Section title="费率来源">
+      <div
+        className="rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2"
+        data-testid="ai-fee-source-card"
+      >
+        <p className="text-[11px] leading-relaxed text-[var(--text)]">{feeLine}</p>
       </div>
     </Section>
   );

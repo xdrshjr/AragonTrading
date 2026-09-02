@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from typing import Literal
 
@@ -1192,6 +1193,54 @@ class Settings(BaseSettings):
     # `discipline.adjustments` 里被如实说出来（`sizing_runtime.margin_precheck_notice` 是唯一读点）。
     ai_trade_sizing_margin_precheck: bool = False
 
+    # ---- AI 自动交易 · 静默降级修复（ai-trade-silent-degradation-repair §十三，12 项）----
+    # 本段修的是**四条「向外界要真话」的通路在真机上全部静默返回空**：官方费率 1,524 次请求 0 次
+    # 成功、情报正文 96 次抓取 0 次成功、账户级持仓被按成员重复了 5 遍（占全部出网 78.3%）、
+    # 4xx 上交易所自己的解释被整个丢弃。每一把闸置回退档，对应链路**逐字节**回到 `8451163`。
+    #
+    # ⚠️ 前缀是硬约束（评审 P0-5）：`desktop/src/lib/config.js` 的后端 env 透传白名单是**前缀式**
+    # 的（`AGENT_ | LIVE_ | AI_TRADE_ | DISCOVERY_ | OKX_ | SECURITY_`），而 prod 的 PyInstaller
+    # 后端**不读 `.env`、只读进程 env**。任何不带这六个前缀的键，在打包桌面端里等于不存在
+    # （`Settings` 是 `extra="ignore"`，静默丢弃）——一把「按不下去的回退开关」比没有更糟。
+    # 故本段 12 个键只用 `OKX_`（3 个）与 `AI_TRADE_`（9 个）两个前缀。
+    #
+    # 轴 A-1：非 429 的 4xx/5xx 上，异常 message 是否带 OKX 的 `code`/`msg`。
+    # 关 ⇒ 两处（`private_client._get` / `trade_client._post`）都回到 `f"OKX HTTP {status}"`。
+    okx_http_error_detail_enabled: bool = True
+    # 轴 A-3：非 429 的 4xx 是否计入链路健康的**连续失败**。**新默认即新行为**（False = 不计入，
+    # 改走中性的 `note_rejected`）；置 True ⇒ 逐字节回到今天。一个永久性的参数错被记成「链路故障」，
+    # 会让 `consecutive_failures` 与 `last_error_code` 对真正的链路故障失去分辨力。
+    okx_link_treat_4xx_as_link_failure: bool = False
+    # 轴 D-3：按 `(method, path)` / `(method, host)` 的进程内调用与错误滑窗计数。
+    # 关 ⇒ `note` 立即 return、`wire()` 返回 `{}`，`/okx/connectivity` 上不出现 `callStats` 键。
+    okx_call_stats_enabled: bool = True
+    # 轴 A-2：`trade-fee` 是否走 `instFamily` → `instType` 参数阶梯。
+    # 关 ⇒ 只发今天那一跳（`instType` + `instId`），逐字节等价。
+    ai_trade_fee_rate_family_fallback_enabled: bool = True
+    # 轴 A-4 / A-5：费率来源（含**失败原因**）是否在启动回执 / 成本卡 / 真值源卡片上渲染。
+    # 关 ⇒ `FeeRateCache.wire()` 在无快照时逐字节回到 `None`，三处都不渲染新行。
+    ai_trade_fee_rate_origin_visible: bool = True
+    # 轴 B-1：情报抓取的解析闸是二值还是四值。`auto`（新默认）把解析结果三分为
+    # public / private / synthetic，合成段（fake-IP 代理的 198.18.0.0/15）降级为「域名闸 + 出网后
+    # 对端复核」；`strict` ⇒ `guard_hop` 逐字节回到今天（synthetic 与 unresolved 都记 private_host）。
+    ai_trade_intel_reader_resolver: str = "auto"          # auto | strict
+    # 追加的合成地址段（逗号分隔 CIDR），留给用 `240.0.0.0/4` 一类段做 fake-IP 的代理实现。
+    # 解析失败的条目**跳过并 warning 一次**，绝不让一个打错的 CIDR 把整个闸变成 unresolved。
+    ai_trade_intel_reader_synthetic_cidrs: str = ""
+    # 轴 B-2：抓取健康行 / 零命中横幅是否渲染。关 ⇒ 四个加法读数仍照算（它们零成本），只是不渲染。
+    ai_trade_intel_reader_health_visible: bool = True
+    # 连续多少轮 `reader_attempt>0 且 reader_ok==0` 升琥珀色横幅（50 = 实际上不升）。
+    ai_trade_intel_reader_zero_streak_warn: int = Field(default=3, ge=1, le=50)
+    # 轴 C：账户级持仓快照的共享 TTL（秒）。`0` ⇒ **完全旁路**，逐字节回到今天（每个成员各发一次）。
+    # 上界由 `_check_positions_snapshot_ttl` 钉死在 `< live_auto_poll_interval_s`。
+    ai_trade_positions_snapshot_ttl_s: float = Field(default=4.0, ge=0, le=30)
+    # 轴 D-2：`httpx` / `httpcore` 的日志级别。生产日志里 90.9% 的字节是它们的 `INFO`，
+    # 其中单 `GET /account/positions` 一行就占全部日志行的 61.0%。置 `"INFO"` ⇒ 逐字节回到今天。
+    ai_trade_log_http_client_level: str = "WARNING"
+    # 轴 E：真值源端点与卡片是否装配。关 ⇒ `/system/truth-sources` 路由不注册（404），
+    # `_status_payload()` 里不出现 `truthSources` 键。
+    ai_trade_truth_sources_enabled: bool = True
+
     # ---- 信任边界（trust-boundary-and-signal-integrity D1 / §6.1）----
     # 逗号分隔的 Origin 白名单；空 = 用 `app/security/origins.py` 的 DEFAULT_ORIGINS。
     # 显式配置即**完全替换**默认（不做合并，避免「以为收紧了其实没有」）。
@@ -1429,6 +1478,42 @@ class Settings(BaseSettings):
                 f"LIVE_AUTO_POLL_INTERVAL_S({self.live_auto_poll_interval_s}) = {floor}："
                 "小于它时告警在被盯市 tick 看到之前就过期了，是一个永远不会唤醒的配置，"
                 "而且没有任何错误")
+        return self
+
+    @model_validator(mode="after")
+    def _check_silent_degradation_repair(self) -> "Settings":
+        """静默降级修复的两条启动期约束（ai-trade-silent-degradation-repair §十三）。
+
+        1. ``ai_trade_positions_snapshot_ttl_s > 0`` ⇒ 必须 **<**
+           ``live_auto_poll_interval_s``。TTL ≥ 盯市周期意味着存在「整轮盯市都读不到新持仓」的
+           可能，那是一个**会静默改变交易行为**的配置。与 ``alert_pending_ttl_s ≥ 2 ×
+           live_auto_poll_interval_s`` 是同一族的跨字段不变式，实现风格逐字对齐。
+        2. ``ai_trade_intel_reader_resolver`` 只有两个取值。写错一个（``strick``、``Auto``）不会
+           报错，只会让解析闸静默落回**某一档**——而「这台机器上情报到底能不能抓」正取决于它。
+        3. ``ai_trade_log_http_client_level`` 必须是一个 ``logging`` 认得的级别名。写错即
+           ``getattr`` 回落 ``WARNING``，用户以为自己恢复了 ``INFO`` 而其实没有。
+
+        Raises:
+            ValueError: 任一条不成立（构造期即失败，绝不留一个静默失效的开关）。
+        """
+        ttl = float(self.ai_trade_positions_snapshot_ttl_s)
+        if ttl > 0 and ttl >= float(self.live_auto_poll_interval_s):
+            raise ValueError(
+                f"AI_TRADE_POSITIONS_SNAPSHOT_TTL_S({ttl}) 必须 < "
+                f"LIVE_AUTO_POLL_INTERVAL_S({self.live_auto_poll_interval_s})："
+                "TTL ≥ 盯市周期时存在「整轮盯市都读不到新持仓」的可能，那会静默改变交易行为；"
+                "把 TTL 调到盯市周期以下，或置 0 完全旁路该缓存")
+        resolver = (self.ai_trade_intel_reader_resolver or "").strip()
+        if resolver not in ("auto", "strict"):
+            raise ValueError(
+                f"AI_TRADE_INTEL_READER_RESOLVER({resolver!r}) 只能是 'auto' 或 'strict'："
+                "写错的值不会报错，只会让解析闸静默落回某一档，而这台机器上情报能不能抓正取决于它")
+        level = (self.ai_trade_log_http_client_level or "").strip().upper()
+        if not isinstance(getattr(logging, level, None), int):
+            raise ValueError(
+                f"AI_TRADE_LOG_HTTP_CLIENT_LEVEL({self.ai_trade_log_http_client_level!r}) "
+                "不是一个合法的日志级别名（DEBUG/INFO/WARNING/ERROR/CRITICAL）："
+                "写错时它会静默回落 WARNING，而你以为自己已经恢复了 INFO")
         return self
 
     def allowed_origin_list(self) -> list[str]:

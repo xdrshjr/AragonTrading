@@ -36,15 +36,16 @@ from ..live_auto.executor import LiveExecutor
 from ..live_auto.fee_ledger import build_fee_ledger
 from ..okx.accounts import AccountCredentials
 from ..okx.order_builder import snap_size
-from ..okx.trading import (fetch_live_open_orders, fetch_live_positions, fetch_trade_fee,
+from ..okx.trading import (fetch_live_open_orders, fetch_live_positions, fetch_trade_fee_ex,
                           fetch_trading_config)
-from ..okx.types import BAR_SECONDS
+from ..okx.types import BAR_SECONDS, FeeAttemptError, FeeFetchOutcome
 from ..paper.strategy_factory import PaperStrategySpec
 from .admission import get_admission_lock
 from .base_rules import MaBandRule, format_charter, rule_wire
 from .cost_runtime import build_charter_text
 from .discipline import PRESET_LABELS
 from .exposure_book import GroupExposureBook
+from .fee_rates import as_outcome, resolve_fee_rates
 from .hold_horizon import HorizonRule
 from .hold_horizon import rule_wire as horizon_wire
 from .horizon_acceptance import input_from_wire, merge_bundle
@@ -254,6 +255,31 @@ class AiTradeGroupMember:
     run_id: int
 
 
+def _fee_rates_receipt(plans: list["_MemberPlan"], settings) -> dict | None:
+    """启动回执里的费率来源（轴 A-4 的**唯一**装配点）。
+
+    三态，且三态都必须能被读者一眼分辨：
+
+    * 取到了官方档位 ⇒ 归一 wire 原样（`source` 形如 `exchange:family`），`lastError` 为 `None`；
+    * 没取到但**知道为什么** ⇒ 降级形状（`source="config"` + 回落常数 + `lastError`）；
+    * 总闸关 / 无凭证 / 压根没尝试 ⇒ `None` ⇒ 前端整段不渲染。
+      **绝不**在这一格里编一句「一切正常」——`attempted` 的既有纪律原文是「还没轮到取数就先
+      告知一遍，说的是一件当时并不成立的事」。
+    """
+    if not plans or not settings.ai_trade_fee_rate_origin_visible:
+        return None
+    wire = next((p.fee_rates_wire for p in plans if p.fee_rates_wire), None)
+    if wire:
+        return {**wire, "attempted": True, "lastError": None}
+    error = next((p.fee_rates_error for p in plans if p.fee_rates_error), None)
+    if error is None:
+        return None
+    maker, taker, _ = resolve_fee_rates(settings, None)
+    return {"makerBps": maker, "takerBps": taker, "level": "", "ruleType": "",
+            "source": "config", "rebate": False, "stale": False,
+            "attempted": True, "lastError": error}
+
+
 @dataclass
 class AiTradeGroup:
     """进程内当前活跃 AI 分组（一次至多一个）。"""
@@ -290,6 +316,10 @@ class AiTradeGroup:
     resumed_count: int = 0
     account_id: int = 0                      # 续跑要用哪个 OKX 账户的凭证（config_json 缺这个数）
     start_wire: dict = field(default_factory=dict)      # 启动请求原文（续跑唯一真源）
+    # 轴 A-4（silent-degradation-repair）：启动那一刻的费率来源**与失败原因**。
+    # 它是分组共享的（同一账户、同一档位家族），故只存一份而不是逐成员各存一份。
+    # `None` = 未装配（总闸关 / 无凭证），前端整段不渲染。
+    fee_rates: dict | None = None
 
 
 @dataclass
@@ -328,6 +358,7 @@ class _MemberPlan:
     # 轴 A 启动期预取的官方费率快照（P1-7）：`_create_group_run` 是 @staticmethod，既拿不到
     # config_map 也拿不到执行器，故这个值只能随成员计划下传。取数失败 ⇒ None ⇒ 回落配置常数。
     fee_rates_wire: dict | None = None
+    fee_rates_error: dict | None = None   # 轴 A-5：启动期取数失败的原因（成功 ⇒ None）
 
 
 @dataclass
@@ -357,6 +388,8 @@ class AiTradeManager:
         self._group: AiTradeGroup | None = None
         # start 关键区互斥锁，消除「容量检查 → 置位 self._group」之间的 TOCTOU（单活跃分组）。
         self._start_lock = asyncio.Lock()
+        # 人工重取费率的单飞锁（轴 A-4）：连点不该变成一串探活请求。
+        self._fee_refresh_lock = asyncio.Lock()
         # 冷启后的轻量占位（pause-resume §3.3）。`_group` 与 `_paused_ref` **永不同时非空**（G-9）。
         self._paused_ref: PausedGroupRef | None = None
         # [P0-3] 水合盲区标志：**「读不到」与「没有」在真实资金上不是同一件事**。置真时
@@ -410,6 +443,33 @@ class AiTradeManager:
             # 绝不允许它的任何失败影响真实资金会话的启动（判定与 fail-open 都在 `_wire_intel`）。
             await self._wire_intel(launched, provider=provider)
             return launched
+
+    async def refresh_fee_rates(self) -> dict | None:
+        """人工重取一次官方费率档位（silent-degradation-repair 轴 A-4 · `POST /fee-rates/refresh`）。
+
+        **只读语义**：走 A-2 的完整阶梯（一次签名私有 GET），不触碰任何写路径、不下任何单，
+        因此与 `/okx/connectivity/probe` 同源——不要求 `live_trading_enabled`。
+
+        单飞：in-flight 时直接返回当前读数，避免用户连点造成探活风暴（评审附录 B′ Q3）。
+
+        Returns:
+            与启动回执同形的 `feeRates` dict（成功态 / 降级态皆有）；分组未在跑 ⇒ `None`
+            （端点据此回 409——**不许静默成功**，否则又是一个「按了没反应的按钮」）。
+        """
+        group = self._group
+        if group is None or not group.members:
+            return None
+        async with self._fee_refresh_lock:
+            member = group.members[0]
+            runtime = getattr(member.session, "_cost", None)
+            if runtime is None:
+                return group.fee_rates
+            cache = runtime.fee_rates
+            cache.expire()                    # 强制穿透 TTL：这是一个**人工**触发的重取
+            await runtime.refresh_fee_rates(time.time())
+            wire = cache.wire(time.time(), runtime.settings)
+            group.fee_rates = wire            # 启动回执那一格随之刷新（单一真源）
+            return wire
 
     @staticmethod
     async def _probe_tradability(group: AiTradeGroup, req: AiTradeGroupStartRequest) -> None:
@@ -474,28 +534,50 @@ class AiTradeManager:
                 return await fetch_trading_config(
                     creds, req.account_row.id, inst_id, settings=req.settings)
 
-        async def _bounded_fee_rate(inst_id: str) -> dict | None:
+        async def _bounded_fee_rate(inst_id: str) -> FeeFetchOutcome:
             """轴 A：官方费率档位（签名私有 GET，并入同一并发预算）。
 
-            **失败一律 None ⇒ 回落配置常数，绝不阻断启动**——可用性不得成为开仓能力的函数。
+            **失败一律降级 ⇒ 回落配置常数，绝不阻断启动**——可用性不得成为开仓能力的函数。
+
+            但「降级」不等于「什么都不说」（silent-degradation-repair 轴 A-5）：本函数此前是
+            `except … logger.info(…) ; return None`，于是生产上 1,524 次失败的原因**全部**停在
+            一行 `INFO` 里，而 `INFO` 正是本轮 D-2 要压掉的那一档。改为返回 `FeeFetchOutcome`：
+            wire 照旧（成功即归一 dict、失败即 `None`），失败原因随 `errors` 一并带回，由
+            `_gather_context` 放进 config_map、经 `_MemberPlan` → `build_fee_ledger` →
+            `CostRuntime.seed` 一路到达启动回执与成本卡。
+
+            日志级别同步从 `info` 提到 `warning`（§4.0 原则 3「失败必须比成功更响」）。
             """
             if not req.settings.ai_trade_fee_rate_source_enabled:
-                return None
+                return FeeFetchOutcome()
             async with sem:
                 try:
-                    return await fetch_trade_fee(creds, inst_id)
+                    # `as_outcome` 归一：既有测试替身按老契约返回 `dict | None`，本层不因此变红。
+                    return as_outcome(await fetch_trade_fee_ex(creds, inst_id))
                 except Exception as exc:  # noqa: BLE001 —— 费率取数失败只降级，不拒绝启动
-                    logger.info("ai-trade trade-fee prefetch failed (%s): %s", inst_id, exc)
-                    return None
+                    logger.warning("ai-trade trade-fee prefetch failed (%s): %s", inst_id, exc)
+                    code = getattr(exc, "code", "") or type(exc).__name__
+                    msg = getattr(exc, "message", "") or str(exc)
+                    return FeeFetchOutcome(wire=None, errors=(FeeAttemptError(
+                        rung="type", http_status=getattr(exc, "http_status", None),
+                        code=str(code), msg=str(msg)[:200]),))
 
         configs = await asyncio.gather(*[_bounded_config(m.inst_id) for m in members])
         fee_rates = await asyncio.gather(*[_bounded_fee_rate(m.inst_id) for m in members])
         async with sem:
-            positions = await fetch_live_positions(creds)
+            # 轴 C-2：启动前置**强制新鲜**。前置门禁要判「这个标的现在有没有仓」，
+            # 用一份陈旧读数会放过一个已有仓的成员——那是一条有资金后果的路径。
+            positions = await fetch_live_positions(creds, force=True)
         async with sem:                       # 复用同一并发预算（规避已知的启动 429）
             pending = await self._fetch_blocking_pending(creds)
-        config_map = {m.inst_id: {**cfg, "feeRates": fr}
-                      for m, cfg, fr in zip(members, configs, fee_rates)}
+        # `feeRates` 是**成功态**的归一 wire（下游 `build_fee_ledger` 直接读它的 makerBps/takerBps）；
+        # 失败原因走**兄弟键** `feeRatesError`，不塞进同一个 dict——把一个没有 bps 的降级 dict 放进
+        # `feeRates` 会让 `build_fee_ledger` 当场 KeyError，而给它补上配置常数的 bps 又会让
+        # `snapshot_from_wire` 铸出一份「冒充官方档位的本地常数」快照，那恰恰是本轮要消灭的形状。
+        config_map = {m.inst_id: {**cfg, "feeRates": out.wire,
+                                  "feeRatesError": (out.last_error.wire()
+                                                    if out.last_error else None)}
+                      for m, cfg, out in zip(members, configs, fee_rates)}
         avail = next((cfg.get("availUsdt") or 0.0 for cfg in configs), 0.0)
         return avail, positions, config_map, pending
 
@@ -528,7 +610,8 @@ class AiTradeManager:
                 failures.append(fail)
             else:
                 plans.append(_MemberPlan(m.inst_id, m.allocation_pct, budget_i, cfg,
-                                         fee_rates_wire=cfg.get("feeRates")))
+                                         fee_rates_wire=cfg.get("feeRates"),
+                                         fee_rates_error=cfg.get("feeRatesError")))
         if failures:
             raise AiTradeGroupPreflightError(failures)
         return plans
@@ -653,7 +736,10 @@ class AiTradeManager:
             discipline_thresholds=req.discipline_thresholds,
             discipline_inert=list(req.discipline_inert),
             account_id=req.account_row.id, start_wire=dict(req.start_wire or {}),
-            resumed_count=int(resume_of.get("resumedCount") or 0))
+            resumed_count=int(resume_of.get("resumedCount") or 0),
+            # 轴 A-4：费率来源取**任一成员**那一份——它是分组共享的（同一账户、同一档位家族），
+            # 逐成员各发一份只是噪音（与 `_discipline_wire` / `_direction_wire` 同一条理由）。
+            fee_rates=_fee_rates_receipt(plans, req.settings))
         for member in members:
             # 可续跑契约的两条会话侧接线（pause-resume §3.4.2）：`group_id` 让 W2/W3 的增量写有
             # 落点；`on_stopped` 是 W5——会话**自终止**（暂停期止盈止损 / stale_feed / 启动回滚 /
@@ -1780,6 +1866,10 @@ class AiTradeManager:
                 # 桌面旧包 / 直接调 API 的用户拿不到弹窗那块预检，本回执是他们唯一的告知面。
                 # 该端点 `-> dict` 且无 `response_model`，故新键不会被 FastAPI 静默吞掉（已核实）。
                 "tradability": list(getattr(group, "tradability", None) or []),
+                # 轴 A-4：费率来源（含**失败原因**）进启动回执。此前它在界面上的唯一落点是历史
+                # 详情里的 `ReconcileCard`，而那张卡片在缺键时**整段隐藏**——一个能说真话的组件
+                # 被放在了一间平时不开门的房间里。`None` = 未装配 ⇒ 前端整段不渲染。
+                "feeRates": getattr(group, "fee_rates", None),
                 "createdTs": group.created_ts,
                 # 分组生命周期（pause-resume §5.6）：`running` | `paused`。前端 `groupStateFromStatus`
                 # 是**逐键手抄**的映射且此前把 `state` 写死成 "running"，那正是本仓库「静默吞新键」
@@ -2112,7 +2202,8 @@ class AiTradeManager:
             min_sz=meta.get("minSz") or 0.0, settings=settings,
             # 成本记账的作用域缝（§3.2.0）：**只有** AI 链路注入账本；live_auto 不传 ⇒ 逐字节回退。
             fee_ledger=build_fee_ledger(settings, ct_val=meta.get("ctVal") or 0.0,
-                                        fee_rates=config.get("feeRates")),
+                                        fee_rates=config.get("feeRates"),
+                                        fee_rates_error=config.get("feeRatesError")),
             # 成交时钟对齐（discipline-preset-and-integrity 轴 D / D-3）：同款「只有 AI 链路传」的
             # 作用域缝。锚点（相位）由会话在每根确认根落地时写入 `executor.bar_anchor_ts`——这里
             # 只给周期长度，绝不预设 UTC 相位（OKX 的 12H/1D 是港时开盘，[P0-1]）。

@@ -201,7 +201,11 @@ def test_snapshot_wire_shape_is_complete():
     assert set(snap["channels"][0]) == {
         "key", "kind", "label", "state", "lastOkTs", "lastErrorTs", "lastErrorCode",
         "lastErrorMessage", "latencyMs", "consecutiveFailures", "reconnects1h",
-        "resubscribes1h", "gapRepairs1h", "lastMessageTs", "circuit", "circuitOpenUntilTs"}
+        "resubscribes1h", "gapRepairs1h", "lastMessageTs", "circuit", "circuitOpenUntilTs",
+        # silent-degradation-repair 轴 A-3 的三个**加法**键（都不参与 derive_state / overall）：
+        # 「请求到了、被业务拒了」既不是链路失败也不是一次成功，此前它无处可记，于是每次启动
+        # 私有链路都要凭空吃 N 次「失败」（生产上 1,524 次 trade-fee 400 全部记进了这里）。
+        "rejected4xx", "lastRejectedTs", "lastRejectedStatus"}
 
 
 def test_note_circuit_only_touches_an_existing_channel():

@@ -465,3 +465,65 @@ describe("AiTradePanel · 生命周期真值", () => {
       .toHaveTextContent("行情连接异常");
   });
 });
+
+// ---------------- silent-degradation-repair 轴 A-4 / 轴 E 的两个面板落点 ----------------
+describe("AiTradePanel · 真值源与费率来源", () => {
+  it("轴 A-4：降级态的费率来源必须**带着原因**出现在面板上（§14.4 第 1 步的硬判据）", () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP")]),
+        lifecycle: panelGroupWire(),
+        feeRates: {
+          makerBps: 2, takerBps: 5, level: "", ruleType: "", source: "config",
+          rebate: false, ageS: 0, stale: false, makerBpsRaw: 2, takerBpsRaw: 5,
+          attempted: true,
+          lastError: { rung: "type", httpStatus: 400, code: "50016",
+                       msg: "instId and instType don't match" },
+        },
+      } as never,
+    });
+    renderPanel();
+    const strip = screen.getByTestId("ai-fee-source-strip");
+    expect(strip).toHaveAttribute("data-degraded", "1");
+    expect(strip).toHaveTextContent("本地保守常数：maker 2 / taker 5 bps");
+    // 「这是猜的」不够，还要说**为什么**猜——三周来用户看到的一直是一个没有原因的降级。
+    expect(strip).toHaveTextContent("交易所拒绝了费率查询（50016 instId and instType don't match）");
+  });
+
+  it("缺键（老后端 / 总闸关）⇒ 整段不渲染，绝不编一句「按官方档位」", () => {
+    useAppStore.setState({
+      aiTradeGroup: { ...makeGroup([makeSession("BTC-USDT-SWAP")]),
+                      lifecycle: panelGroupWire() } as never,
+    });
+    renderPanel();
+    expect(screen.queryByTestId("ai-fee-source-strip")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("ai-truth-sources-chip")).not.toBeInTheDocument();
+  });
+
+  it("轴 E：顶栏芯片只在有降级时出现，且**分母写明是 3**（第 4 行只在 REST 上）", () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP", {
+          truthSources: { scope: "process", trackedCount: 3, degradedCount: 2,
+                          keys: ["feeRates", "decisionModel"] } })]),
+        lifecycle: panelGroupWire(),
+      } as never,
+    });
+    renderPanel();
+    const chip = screen.getByTestId("ai-truth-sources-chip");
+    expect(chip).toHaveTextContent("3 项真值源中 2 项降级");
+    expect(chip.textContent ?? "").not.toContain("**");
+  });
+
+  it("全部正常 ⇒ 芯片不出现（一条常驻的彩色横幅会在两天内变成背景噪声）", () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP", {
+          truthSources: { scope: "process", trackedCount: 3, degradedCount: 0, keys: [] } })]),
+        lifecycle: panelGroupWire(),
+      } as never,
+    });
+    renderPanel();
+    expect(screen.queryByTestId("ai-truth-sources-chip")).not.toBeInTheDocument();
+  });
+});

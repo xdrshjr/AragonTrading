@@ -27,6 +27,7 @@ from ..engine.metrics import _empty_metrics
 from ..live_auto.executor import LiveExecutor
 from ..live_auto.explain import build_atomic_explain, build_profit_guard_explain
 from ..live_auto.resting import resting_payload
+from ..okx.call_stats import get_call_stats
 from ..okx.rest_client import get_rest_client
 from ..okx.types import BAR_SECONDS, Candle
 from ..okx.session_link import make_session_link
@@ -119,6 +120,8 @@ from .signals import (
 )
 from .sizing_runtime import SizingRuntime
 from .track_record import TrackRecordRuntime
+from .truth_wire import build_sources as build_truth_sources
+from .truth_wire import ws_digest as truth_ws_digest
 from .reasoning_protocol import resolve_analysis_excerpt
 from .reasoning_runtime import ReasoningRuntime
 from .trace import (
@@ -1167,7 +1170,11 @@ class AiTradeSession:
         续跑时该成员直接判 `unverifiable_identity`（诚实不变式 I-4：读不到 ≠ 没有）。
         """
         try:
-            rows = await self.executor._read_positions()
+            # 轴 C-2（silent-degradation-repair）：**强制穿透**那条既有取数缝。
+            # 「我关机时到底还有多少仓」这个数不该来自本地投影——同理也不该来自一份 4 秒前的
+            # 共享缓存。`_read_positions_fresh` 与 `_read_positions` 由同一个 `positions_fn`
+            # 派生，故全部注入替身照常拦得住这条路径（门禁 G-C13）。
+            rows = await self.executor._read_positions_fresh()
         except Exception as exc:  # noqa: BLE001 —— 取数失败不阻断暂停，但必须如实标注
             logger.warning("ai-trade pause position read failed (%s): %s", self.inst_id, exc)
             return None, True
@@ -3447,10 +3454,38 @@ class AiTradeSession:
                 "experience": self._experience.stats(),
                 # 深度研判三键（deep-reasoning-chain §4.3）：未装配 / off 档 ⇒ 整键缺席。
                 **self._reasoning_status_keys(),
+                # 真值源计数摘要（silent-degradation-repair 轴 E / §11.2）：**只带三行**
+                # （费率 / 配额 / 决策模型），`intelReader` 由 REST 独占——它的真源是一次
+                # async DB 读，而本方法是**同步**的（附录 D F-15）。`trackedCount` 显式下发，
+                # 绝不让前端以为分母是 4。
+                # 它必须**每次都带**：`store.patchAiTradeMemberStatus` 是整体浅合并，只在降级时
+                # 带会让一次恢复把它留在旧值上（`_note_tick_recovered` 的成文警告）。
+                **self._truth_sources_key(),
                 "stopReason": self.stop_reason,
                 "degraded": (self.executor.degraded or self._stale_degraded
                              or self.degraded or self._tick_degraded),
                 "flattenFailed": self.flatten_failed, "residual": self.residual}
+
+    def _truth_sources_key(self) -> dict:
+        """轴 E 的 WS 加法键；总闸关 ⇒ **整键缺席**（不是 null），逐字节回退。
+
+        **零 IO**：三行全部由进程内状态派生（费率缓存 wire / 调用统计 / 整理健康），
+        故它可以待在一个同步方法里。
+        """
+        settings = self.executor.settings          # 会话没有自己的 settings，真源在执行器上
+        if not settings.ai_trade_truth_sources_enabled:
+            return {}
+        try:
+            sources = build_truth_sources(
+                fee_wire=self._cost.fee_rates.wire(time.time(), settings),
+                running=self.state == "running", intel_health=None,
+                call_stats=get_call_stats().wire() or None,
+                positions_ttl_s=float(settings.ai_trade_positions_snapshot_ttl_s),
+                summary_health=self.decider.summary_health_wire())
+            return {"truthSources": truth_ws_digest(sources)}
+        except Exception as exc:  # noqa: BLE001 —— 观测键绝不让一次 status 推送失败
+            logger.debug("ai-trade truth sources digest skipped: %s", exc)
+            return {}
 
     def discipline_wire(self) -> dict:
         """生效纪律自检（轴 B）：13 行固定顺序 + [P1-9] 恒真自检提示；装配全在 `discipline_runtime`。

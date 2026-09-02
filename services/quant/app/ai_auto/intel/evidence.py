@@ -41,7 +41,12 @@ def reader_config(settings) -> reader_mod.ReaderConfig:
         max_redirects=int(getattr(settings, "ai_trade_intel_reader_max_redirects", 3)),
         max_per_domain=int(getattr(settings, "ai_trade_intel_reader_max_per_domain", 2)),
         body_max_chars=int(getattr(settings, "ai_trade_intel_reader_body_max_chars", 20_000)),
-        proxy=getattr(settings, "proxy_url", None))
+        proxy=getattr(settings, "proxy_url", None),
+        # 轴 B-1（silent-degradation-repair）：解析闸的档位与追加合成段。**这是唯一的接线点**
+        # ——漏了它，`ReaderConfig` 会用自己的默认值，而「配置项存在但接不进来」正是本轮要
+        # 消灭的那类静默失效。
+        resolver=str(getattr(settings, "ai_trade_intel_reader_resolver", "auto")),
+        synthetic_cidrs=str(getattr(settings, "ai_trade_intel_reader_synthetic_cidrs", "")))
 
 
 def _cache_windows(settings) -> tuple[float, float]:

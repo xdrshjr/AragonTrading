@@ -68,6 +68,12 @@ class ChannelHealth:
     circuit_open_until: float | None = None
     closed: bool = False
     updated_ts: float = 0.0
+    # ---- silent-degradation-repair 轴 A-3：中性的「请求到了、被业务拒了」登记 ----
+    # 三个**加法**字段，**都不参与** `derive_state` / `overall`：一次 400 参数错既不是链路
+    # 失败（链路是好的），也不是一次成功（「请求到了」≠「拿到过正确答案」）。老快照缺键即默认值。
+    rejected_4xx: int = 0
+    last_rejected_ts: float | None = None
+    last_rejected_status: int = 0
 
     def has_samples(self) -> bool:
         return (self.last_ok_ts is not None or self.last_error_ts is not None
@@ -126,6 +132,34 @@ class LinkRegistry:
         h.last_error_code = str(code or "")[:64]
         h.last_error_message = str(message or "")[:_MESSAGE_MAX]
         h.consecutive_failures += 1
+
+    def note_rejected(self, key: str, *, kind: Kind, label: str, status: int,
+                      now: float | None = None) -> None:
+        """一次**业务拒绝**（非 429 的 4xx）：只累加中性计数，不动状态机的任何一格。
+
+        为什么不能记成 ``note_ok``（评审 P1-3 否决了 v1 的写法）：``note_ok`` 会把
+        ``consecutive_failures`` **清零**，而私有通道上所有端点共用同一个 key，于是
+        「真失败 → 真失败 → 一次 400 参数错 → 真失败 → 真失败」这条序列**永远达不到降级
+        阈值**——用一个假阴性换掉另一个假阴性不是修复。
+
+        为什么也不能记成 ``note_failure``：`trade-fee` 那 1,524 次 400 是一个**永久性的参数
+        错**，把它计进链路健康，等于每次启动都让私有链路凭空吃 N 次「失败」，
+        ``consecutive_failures`` 与 ``last_error_code`` 因此对真正的链路故障失去分辨力。
+
+        Args:
+            key: 通道键（私有面恒 ``rest:private``）。
+            kind: 通道类别。
+            label: 中文标签。
+            status: 被拒的 HTTP 状态码（进 ``last_rejected_status``，只作面板读数）。
+            now: 注入时钟（缺省取墙钟）。
+        """
+        ts = now if now is not None else time.time()
+        h = self._touch(key, kind, label, ts)
+        h.rejected_4xx += 1
+        h.last_rejected_ts = ts
+        h.last_rejected_status = int(status or 0)
+        # 刻意**不动** consecutive_failures（它不是一次失败）、**不动** last_ok_ts（它也不是
+        # 一次成功）。这两行注释是本方法存在的全部理由，删掉任何一行都会让下一轮有人「顺手」补上。
 
     def note_ws(self, key: str, *, kind: Kind, label: str, event: WsNote,
                 detail: str | None = None, now: float | None = None) -> None:
@@ -246,6 +280,11 @@ class LinkRegistry:
             "lastMessageTs": int(h.last_message_ts) if h.last_message_ts else None,
             "circuit": h.circuit,
             "circuitOpenUntilTs": (int(h.circuit_open_until) if h.circuit_open_until else None),
+            # 轴 A-3 的三个**加法**键：`api/okx_link.py` 明文禁止声明 `response_model`，故它们
+            # 不会被 FastAPI 静默剔除；前端老版本缺 case 即整体忽略（加法键路线）。
+            "rejected4xx": h.rejected_4xx,
+            "lastRejectedTs": int(h.last_rejected_ts) if h.last_rejected_ts else None,
+            "lastRejectedStatus": h.last_rejected_status or None,
         }
 
 

@@ -13,12 +13,20 @@ import asyncio
 import time
 from dataclasses import dataclass
 
+from .error_http import _redact
 from .private_client import OKXPrivateClient, OKXPrivateError
 from .types import _optional_float
 
+# ``_redact`` 的实现自 ai-trade-silent-degradation-repair 轴 A-1 起住在叶子模块
+# ``okx/error_http.py``：本模块**反向 import 了** ``private_client``，而 A-1 需要在
+# ``private_client`` / ``trade_client`` 里脱敏，在那边 ``from .accounts import _redact``
+# 即 import 期环（整个后端起不来）。此处 re-export 保证「单点收口」不变、既有 import
+# 面（``trading.py:23`` 等）一字不改，且拿到的是**同一个函数对象**（门禁 G-A13）。
+__all__ = ["AccountCredentials", "_map_okx_code", "_normalize_position", "_redact",
+           "fetch_account_detail", "probe_account"]
+
 # 探测请求软上限（秒）：避免无谓阻塞（实际超时仍以客户端 timeout 为准）。
 _PROBE_TIMEOUT_CAP = 15.0
-_MESSAGE_MAX = 200
 
 # OKX 账户层级（acctLv）→ 中文文案。
 _ACCT_LEVEL_LABEL = {
@@ -62,16 +70,6 @@ def _map_okx_code(okx_code: str) -> str:
     if okx_code in ("OKX_UNREACHABLE", "OKX_HTTP_ERROR"):
         return "CONNECTION_FAILED"
     return "OKX_ERROR"                   # 其它非 0：透传原码于 message
-
-
-def _redact(text: str, *secrets: str) -> str:
-    """把 secret / passphrase 子串（长度 ≥6）替换为脱敏占位再截断（C7 单点收口）。"""
-    out = text or ""
-    for s in secrets:
-        s = (s or "").strip()
-        if s and len(s) >= 6:
-            out = out.replace(s, "····")
-    return out[:_MESSAGE_MAX]
 
 
 async def probe_account(creds: AccountCredentials) -> dict:

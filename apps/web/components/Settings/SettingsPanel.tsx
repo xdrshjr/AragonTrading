@@ -11,6 +11,7 @@ import ExperienceSection from "./ExperienceSection";
 import IntelSourceSettings from "./IntelSourceSettings";
 import OkxAccountsSection from "./OkxAccountsSection";
 import SettingsNav from "./SettingsNav";
+import TruthSourcesCard from "./TruthSourcesCard";
 
 /**
  * 设置中心外壳：顶部标题「设置」+ 返回工作台；body 左右布局（左 15% 导航 / 右 75% 内容 + 对称留白）。
@@ -68,6 +69,8 @@ export default function SettingsPanel() {
             <ExperienceSection />
           ) : section === "intel-source" ? (
             <IntelSourceSettings />
+          ) : section === "truth-sources" ? (
+            <TruthSourcesCard />
           ) : section === "about" ? (
             <AboutSection />
           ) : (

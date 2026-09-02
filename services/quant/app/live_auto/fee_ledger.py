@@ -95,6 +95,10 @@ class FeeLedger:
         self.params = params
         self.rate_source = str(rate_source)   # "exchange"（官方档位）| "config"（回落常数）
         self.fee_rate_wire: dict | None = None  # 启动期官方费率快照（轴 A；供 CostRuntime 播种缓存）
+        # 启动期取数**失败**的原因（silent-degradation-repair 轴 A-5）。与上一行是同一条搬运缝：
+        # `CostRuntime` 从账本上取它去播种 `FeeRateCache.last_error`，于是「交易所到底说了什么」
+        # 从启动那一刻就有宿主，而不是等到会话跑起来第一次刷新失败才有。
+        self.fee_rate_error: dict | None = None
         self._session_fee_usd = 0.0           # 本会话已付手续费累计（进 costSnapshot.cost）
         self._pending: dict[str, FillAudit] = {}
         self._pending_capacity = max(1, audit_capacity * _PENDING_CAPACITY_FACTOR)
@@ -294,7 +298,8 @@ class FeeLedger:
 _SKIPPED = object()
 
 
-def build_fee_ledger(settings, *, ct_val: float, fee_rates: dict | None = None) -> FeeLedger:
+def build_fee_ledger(settings, *, ct_val: float, fee_rates: dict | None = None,
+                     fee_rates_error: dict | None = None) -> FeeLedger:
     """AI 链路的费率账本构造点（§3.2.0 的作用域缝；`live_auto` 不调用本函数即逐字节回退）。
 
     Args:
@@ -302,12 +307,16 @@ def build_fee_ledger(settings, *, ct_val: float, fee_rates: dict | None = None) 
         ct_val: 合约乘数。
         fee_rates: 轴 A 启动期预取的官方费率归一 wire（`okx.trading._normalize_trade_fee` 产物）；
             `None` ⇒ 费率取配置常数 ⇒ 与本特性合入前逐字相同。
+        fee_rates_error: 启动期取数失败的原因 wire（`FeeAttemptError.wire()` 产物，
+            silent-degradation-repair 轴 A-5）；`None` ⇒ 没失败过、或该链路未装配。
+            **它只被搬运，绝不参与任何费率数值的计算**——一个失败原因不该有能力改变记账。
     """
     rates = ((float(fee_rates["makerBps"]), float(fee_rates["takerBps"]))
              if fee_rates else None)
     ledger = FeeLedger(ct_val=ct_val, params=resolve_fee_params(settings, rates=rates),
                        rate_source=str((fee_rates or {}).get("source") or "config"))
     ledger.fee_rate_wire = dict(fee_rates) if fee_rates else None
+    ledger.fee_rate_error = dict(fee_rates_error) if fee_rates_error else None
     return ledger
 
 

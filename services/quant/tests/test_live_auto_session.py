@@ -310,7 +310,10 @@ async def test_a_failing_monitor_tick_never_kills_the_loop_nor_the_session_stop_
     """
     await init_db()
     session, calls, pos_state = _make_session({1: [Signal(side="long")]}, stop_loss_usd=50.0)
-    session.executor.settings = Settings(live_auto_poll_interval_s=1)
+    # `ai_trade_positions_snapshot_ttl_s=0`：轴 C 的启动期跨字段校验钉死
+    # `TTL < LIVE_AUTO_POLL_INTERVAL_S`；把盯市周期调到 1 秒就必须同时把快照旁路掉。
+    session.executor.settings = Settings(ai_trade_positions_snapshot_ttl_s=0.0,
+                                         live_auto_poll_interval_s=1)
     ticks = {"n": 0}
     original_tick = session._monitor_tick
 

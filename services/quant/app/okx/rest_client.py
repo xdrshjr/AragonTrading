@@ -14,6 +14,7 @@ from collections.abc import Callable
 import httpx
 
 from ..config import Settings, get_settings
+from .call_stats import get_call_stats
 from .link_state import get_link_registry
 from .rate_limit import get_limiters
 from .retry import (
@@ -289,6 +290,7 @@ class OKXRestClient:
         try:
             resp = await client.get(path, params=params)
         except Exception as exc:  # noqa: BLE001 —— 分级交给 classify_exception，此处只搬运
+            get_call_stats().note("GET", path, transport_fail=True)   # 轴 D-3：公共 REST 出口
             # 失效即换代。谓词是「进了这个 except 分支」而不是 `httpx.TransportError`：这个
             # except 的唯一来源就是上面那句 `client.get`，所以它在语义上**就等于**传输层失败；
             # 而生产日志证明真实发生过的失败类里有 `anyio.ClosedResourceError`（代理 CONNECT
@@ -297,6 +299,7 @@ class OKXRestClient:
             # 于是 `market_window` 每 5 秒一次的硬超时放弃不会被误当成换代信号。
             await self._invalidate_client(client)
             return classify_exception(exc), None, exc, None
+        get_call_stats().note("GET", path, status=resp.status_code)
         outcome = classify_status(resp.status_code)
         if outcome != "ok":
             retry_after = parse_retry_after(resp.headers.get("Retry-After"))

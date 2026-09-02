@@ -16,11 +16,21 @@
 4. **请求里零本地事实**：固定 UA / Accept，**不带 Cookie、不带 Referer、不带 instId**——
    抓取只拿 URL。日志只记 `domain + status`，不记完整 URL（可能带 tracking id）、不记正文。
 
-**代理下的语义**（评审 P1-10）：抓取器复用进程代理 `derived.proxy_url`，而 `httpx` 走代理时
-**真正的 DNS 解析发生在代理侧**——本地 `getaddrinfo` 的结论与实际连接目标无关，桌面用户的代理
-又常常就在 `127.0.0.1`。因此第一段（语法闸）恒为主防线，第二段（解析闸）在有代理时降级为
-「尽力而为」但**照常执行**：它仍拦得住直接写死内网域名的那一类，而少跑一次的收益是零。
-残余的 TOCTOU（DNS rebinding）已在 spec §3.1.2 与 §八 R-1 / R-3 诚实登记，不假装解决。
+**代理 / TUN 下的语义**（ai-trade-silent-degradation-repair 轴 B-1 重写了这一段）：
+
+此前这里写的是「解析闸在有代理时降级为『尽力而为』但**照常执行**……少跑一次的收益是零」。
+**那句自陈在事实上是错的**：它不是「尽力而为」，它是 fail-closed 且因此是全称的。在 fake-IP
+透明代理（Clash / sing-box / Surge 一类）下，本机每一个域名都解析进 `198.18.0.0/15`，而
+`ipaddress.is_private` 对该段为 True ⇒ **这道闸对每一个公开域名都判假**。生产实测：96 次抓取、
+`reader_ok = 0`、`ai_intel_documents` 29 行全部 `blocked (private_host)`，覆盖 26 个互不相同的
+公开域名（coindesk / coinbase / binance / tradingview …）。而注释里的判据是「有没有配代理」，
+这台机器上一个代理键都没有（透明 TUN 不需要），所以任何以「配了代理才放宽」为形状的修法在真机上
+一次都不会生效。
+
+现在的判据是**三分类 + 出网后对端复核**（见 `intel/netpolicy.py` 与 `guard_hop`）：
+`private` 仍拒；`synthetic`（合成段）降级为「域名闸 + 连接建立后的真实对端地址复核」——后者与
+「这个连接到底通到哪」有**因果关系**，而 DNS 预判没有。`strict` 档逐字保留今天的行为。
+残余的 TOCTOU（DNS rebinding）反而被对端复核**补上了一半**（复核发生在连接建立之后）。
 """
 from __future__ import annotations
 
@@ -36,8 +46,31 @@ import httpx
 
 from . import taxonomy as tax
 from .extract import extract_main_text
+from .netpolicy import classify_addr, classify_resolution, normalize_peer, parse_cidrs
 
 logger = logging.getLogger(__name__)
+
+# 轴 B-2：**进程内**拒因计数器（重启归零）。拒因今天只出现在一行 `logger.info` 里、从不落库，
+# 而本轮是零迁移，故它无处可持久化——那就如实做成一个进程内计数器，并在 wire 上带
+# `sinceProcessStart: true`。一个重启就归零的计数器如果不说自己会归零，就是在制造第五条静默降级。
+_reject_counter: dict[str, int] = {}
+
+
+def note_reject(code: str) -> None:
+    """记一次拒绝（`guard_hop` 每返回一个拒因即 +1）。"""
+    if not code:
+        return
+    _reject_counter[code] = _reject_counter.get(code, 0) + 1
+
+
+def reject_counts() -> dict[str, int]:
+    """本次运行以来的拒因分布（只读副本）。"""
+    return dict(_reject_counter)
+
+
+def reset_reject_counts() -> None:
+    """仅测试用：清空计数（进程单例的既有复位范式）。"""
+    _reject_counter.clear()
 
 USER_AGENT = "AragonTrading-IntelReader/1.0 (+quant research; contact via app)"
 _HEADERS: dict[str, str] = {
@@ -76,6 +109,12 @@ class ReaderConfig:
     max_per_domain: int = 2
     body_max_chars: int = 20_000
     proxy: str | None = None
+    # 轴 B-1：`auto` = 解析结果三分类（合成段降级放行 + 对端复核）；`strict` = 逐字节回到今天。
+    # 默认取**新行为**而不是老行为：默认老行为意味着「忘了接线 = 功能关着」，那恰恰是本轮要
+    # 消灭的静默降级形状。
+    resolver: str = "auto"
+    # 追加的合成地址段（逗号分隔 CIDR），留给用 `240.0.0.0/4` 一类段做 fake-IP 的代理实现。
+    synthetic_cidrs: str = ""
 
 
 @dataclass(frozen=True)
@@ -92,6 +131,10 @@ class ReaderResult:
     byte_len: int = 0
     http_status: int = 0
     truncated: bool = False
+    # 轴 B-1c：这一篇的**对端地址**有没有真的被复核过。经显式代理出网时它恒为 `False`
+    # （TCP 对端是代理，不是目标站点），健康行据此如实显示「经代理出网，对端不可判」——
+    # **降级要有声，哪怕降的是一道防护**。
+    peer_checked: bool = False
 
     @property
     def ok(self) -> bool:
@@ -144,40 +187,166 @@ def guard_url(url: str) -> str | None:
 
 
 # ---------------- 第二段：解析闸（一次 getaddrinfo，跑在默认线程池里） ----------------
-async def resolve_is_public(host: str) -> bool:
-    """解析出的**每一个**地址都必须是公网地址；解析失败即视为不通过。
-
-    有代理时这一段是「尽力而为」（真正的解析发生在代理侧），但**照常执行**——它仍拦得住
-    直接写死内网域名的那一类，而少跑一次的收益是零。
-    """
+async def resolve_addresses(host: str) -> list[str]:
+    """本机解析出的全部地址（解析失败 ⇒ 空列表 ⇒ 上游判 `unresolved`）。"""
     if not host:
-        return False
+        return []
     try:
         infos = await asyncio.to_thread(socket.getaddrinfo, host, None, 0,
                                         socket.SOCK_STREAM)
     except asyncio.CancelledError:
         raise
     except OSError:
-        return False
-    addresses = [str(info[4][0]).split("%", 1)[0] for info in infos if info and info[4]]
+        return []
+    return [str(info[4][0]).split("%", 1)[0] for info in infos if info and info[4]]
+
+
+async def resolve_is_public(host: str) -> bool:
+    """解析出的**每一个**地址都必须是公网地址（`strict` 档的判据，逐字保留今天的行为）。"""
+    addresses = await resolve_addresses(host)
     return bool(addresses) and all(_is_public_ip(addr) for addr in addresses)
 
 
-async def guard_hop(url: str) -> str | None:
-    """一跳的完整两段闸（**每一跳都要过**，见 `_fetch_one` 的循环）。"""
+def _host_is_ip_literal(host: str) -> bool:
+    """主机名是不是 IP 字面量（`guard_url` 用的同一条判据）。"""
+    return ":" in host or host.replace(".", "").isdigit()
+
+
+async def guard_hop(url: str, *, cfg: ReaderConfig | None = None) -> str | None:
+    """一跳的完整两段闸（**每一跳都要过**，见 `_fetch_one` 的循环）。
+
+    `strict` 档（`cfg is None` 时的兼容默认亦然）逐字节等于今天：语法闸 → 解析闸二值判定，
+    `synthetic` 与解析失败都记 `private_host`。
+
+    `auto` 档把解析结果四分（`intel/netpolicy.classify_resolution`）：
+
+    ==============  ==========================================================
+    解析结果        `auto` 的处置
+    ==============  ==========================================================
+    `public`        放行
+    `private`       拒（`private_host`）——混合了真实私有地址也走这一格
+    `synthetic`     **降级放行**：DNS 不再有否决权，改由出网后的对端复核兜底
+    `unresolved`    拒，但记**新拒因** `dns_failed`——「本机 DNS 坏了」与「这个域名指向内网」
+                    是两件事，压成同一个码会让台账再也答不出「今天为什么一篇都没抓到」
+    ==============  ==========================================================
+
+    `synthetic` 的降级放行还要求两件事同时成立：
+
+    1. **主机不是 IP 字面量。** 这一条在正常拓扑下**不可达**（IP 字面量的 `getaddrinfo` 返回
+       它自己 ⇒ `classify_resolution` 恒得 `public`），保留它的理由必须写清楚，否则下一轮
+       一定会被当成噪声删掉：它守的是两类未来——①解析器被污染（`/etc/hosts`、恶意 DNS、
+       企业 DoH 策略）把一个 IP 字面量映到别处；②本仓某天引入自定义 resolver 或 `httpx`
+       的 transport 级解析钩子。门禁 G-B5 因此写成**注入解析替身**的白盒用例。
+    2. `taxonomy.normalize_domain(host)` 能归一出一个非空注册域（拒绝畸形主机名）。
+    """
     code = guard_url(url)
     if code:
+        note_reject(code)
         return code
     host = (urlsplit(url).hostname or "").strip().lower()
-    return None if await resolve_is_public(host) else "private_host"
+    resolver = (cfg.resolver if cfg else "strict").strip().lower()
+    if resolver != "auto":
+        if await resolve_is_public(host):
+            return None
+        note_reject("private_host")
+        return "private_host"
+    extra = parse_cidrs(cfg.synthetic_cidrs if cfg else "")
+    verdict = classify_resolution(await resolve_addresses(host), extra)
+    if verdict == "public":
+        return None
+    if verdict == "unresolved":
+        note_reject("dns_failed")
+        return "dns_failed"
+    if verdict == "private":
+        note_reject("private_host")
+        return "private_host"
+    if _host_is_ip_literal(host) or not tax.normalize_domain(url):
+        note_reject("private_host")
+        return "private_host"
+    return None
 
 
 # ---------------- 抓取 ----------------
 def _result(url: str, *, status: str, final_url: str = "", http_status: int = 0,
-            byte_len: int = 0) -> ReaderResult:
+            byte_len: int = 0, peer_checked: bool = False) -> ReaderResult:
     return ReaderResult(url=url, status=status, final_url=final_url or url,
                         domain=tax.normalize_domain(url), http_status=http_status,
-                        byte_len=byte_len)
+                        byte_len=byte_len, peer_checked=peer_checked)
+
+
+def peer_verdict(response: httpx.Response, *, cfg: ReaderConfig) -> tuple[bool, str | None]:
+    """出网**之后**的对端地址复核（轴 B-1c）：`(是否真的复核过, 拒因或 None)`。
+
+    这是本轮把否决权还给「有因果关系的判据」的那一步——DNS 预判说的是「我这台机器怎么解析
+    这个名字」，而对端地址说的是「这条连接实际通到哪」。它只增强、不放松，故三个档位下全开。
+
+    **但「全开」被下面第 1 条收窄为「在能判的时候全开」**（评审 P0-1，阻断级）：
+
+    1. **`cfg.proxy` 非空 ⇒ 整条跳过并返回 `(False, None)`。** `intel/evidence.py` 把
+       `settings.proxy_url` 原样传进 `ReaderConfig.proxy`，`fetch_many` 用
+       `httpx.AsyncClient(..., proxy=cfg.proxy or None)` 出网——**此时 TCP 对端是代理，
+       不是目标站点**，而本项目目标用户的常见形态正是 `http://127.0.0.1:7890` 一类的本地代理，
+       `classify_addr("127.0.0.1")` 判回环 ⇒ `private` ⇒ **每一篇都被拒**。那会把「TUN 机器上
+       0 成功」原样换成「配了代理的机器上 0 成功」——与本轮 §二 R-2 总结的根因一字不差。
+       跳过时如实记 `peer_checked=False`，由 B-2 的健康行说出「经代理出网，对端不可判」。
+    1b. **对端是回环地址 ⇒ 同样整条跳过**（实施节点补，spec §实施过程发现的方案缺陷 I-2）。
+       上面那条判据看不见 `httpx` 的 `trust_env` 代理与系统代理——它们不出现在 `cfg.proxy` 里，
+       却同样会把 TCP 对端变成 `127.0.0.1`。本机实测就撞在这一格上，三篇全被判 `private_peer`。
+       回环对端只可能意味着「这一跳经本机代理出去了」，见下方分支里的完整论证。
+    2. **`server_addr` 是 `(host, port)` 元组**，归一由 `netpolicy.normalize_peer` 单点负责
+       （含 IPv6 `%scope` 后缀）。这段跑在**已经拿到响应之后**——一个会抛的复核函数等于把
+       「抓到了正文」变成「抓取器自己崩了」。
+    3. **取不到对端（HTTP/2、非 httpcore transport、`MockTransport`、测试替身）⇒ 视为未知，
+       不拒**。否则一次 `httpx` 版本变化会静默关掉整个功能（本仓已在「`websockets` 15 的
+       `proxy` 默认值」上栽过一次同形的跟头）。
+
+    `synthetic` 的对端**不拒**（TUN 下对端本来就是合成地址）；只有**真实私有**对端才拒。
+    """
+    if cfg.proxy:
+        logger.debug("ai-trade intel reader peer check skipped (proxy configured)")
+        return False, None
+    raw = _peer_addr(response)
+    if raw is None:
+        return False, None
+    if _is_loopback(raw):
+        # 【实施节点在真机上量出来的第二个同形缺口，见 spec §实施过程发现的方案缺陷 I-2】
+        # 设计只把「`cfg.proxy` 非空」当作代理豁免的判据，但 `httpx` 默认 `trust_env=True`：
+        # 进程环境里的 `HTTPS_PROXY` / 系统代理**根本不会出现在 `cfg.proxy` 里**，而它们同样
+        # 会把 TCP 对端变成 `127.0.0.1:7897`。本机实测正是这一格——三篇全被判 `private_peer`，
+        # `reader_ok` 又回到 0。判据与被判定的事实之间再一次没有因果关系。
+        #
+        # **回环对端只可能有一个含义：这一跳是经本机代理出去的。** 它永远不可能是目标站点
+        # 本身——「这个公开域名解析到 127.0.0.1」那一类早在解析闸（`private`）就被拒了，
+        # 根本走不到这里。故这里放行不打开任何一道前面已经关上的门。
+        logger.debug("ai-trade intel reader peer check skipped (loopback peer via local proxy)")
+        return False, None
+    extra = parse_cidrs(cfg.synthetic_cidrs)
+    return True, ("private_peer" if classify_addr(raw, extra) == "private" else None)
+
+
+def _is_loopback(raw: str) -> bool:
+    """这一跳的 TCP 对端是不是本机（`127.0.0.0/8` / `::1`）。"""
+    try:
+        return ipaddress.ip_address(raw).is_loopback
+    except ValueError:
+        return False
+
+
+def _peer_addr(response: httpx.Response) -> str | None:
+    """从 `httpx` 响应上取真实对端地址；取不到 ⇒ `None`（视为未知，**不拒**）。
+
+    `httpx` 把底层连接挂在 `response.extensions["network_stream"]`，`server_addr` 由它的
+    `get_extra_info` 给出、形状是 `(host, port)`。HTTP/2、`MockTransport`、测试替身与未来的
+    版本变化都可能让这条路取不到——**任何一步失败都退回「未知」**，绝不让一次库升级静默关掉
+    整个抓取功能。
+    """
+    try:
+        stream = (response.extensions or {}).get("network_stream")
+        if stream is None:
+            return None
+        return normalize_peer(stream.get_extra_info("server_addr"))
+    except Exception:  # noqa: BLE001 —— 见 docstring：复核取不到即未知
+        return None
 
 
 async def _read_bounded(response: httpx.Response, *, max_bytes: int) -> tuple[bytes, bool]:
@@ -198,18 +367,29 @@ async def _read_bounded(response: httpx.Response, *, max_bytes: int) -> tuple[by
 
 async def _read_response(url: str, current: str, response: httpx.Response, *,
                          cfg: ReaderConfig) -> ReaderResult:
-    """响应闸：状态码 → Content-Type → 流式大小 → 正文抽取。"""
+    """响应闸：**对端复核** → 状态码 → Content-Type → 流式大小 → 正文抽取。
+
+    对端复核排在最前：它决定的是「这条连接该不该被读下去」，读完正文再判等于已经把内网服务的
+    响应体读进了内存。
+    """
+    checked, reject = peer_verdict(response, cfg=cfg)
+    if reject:
+        note_reject(reject)
+        logger.info("ai-trade intel reader blocked %s (%s)",
+                    tax.normalize_domain(current) or "?", reject)
+        return _result(url, status="blocked", final_url=current, peer_checked=True)
     if response.status_code >= 400:
         return _result(url, status="http_error", final_url=current,
-                       http_status=response.status_code)
+                       http_status=response.status_code, peer_checked=checked)
     content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
     if not content_type.startswith(_HTML_PREFIXES):
         return _result(url, status="not_html", final_url=current,
-                       http_status=response.status_code)
+                       http_status=response.status_code, peer_checked=checked)
     payload, over = await _read_bounded(response, max_bytes=cfg.max_bytes)
     if over:
         return _result(url, status="too_large", final_url=current,
-                       http_status=response.status_code, byte_len=len(payload))
+                       http_status=response.status_code, byte_len=len(payload),
+                       peer_checked=checked)
     encoding = response.charset_encoding or "utf-8"
     try:
         html = payload.decode(encoding, errors="replace")
@@ -218,12 +398,13 @@ async def _read_response(url: str, current: str, response: httpx.Response, *,
     extracted = extract_main_text(html, max_chars=cfg.body_max_chars)
     if not extracted.block_count:
         return _result(url, status="empty", final_url=current,
-                       http_status=response.status_code, byte_len=len(payload))
+                       http_status=response.status_code, byte_len=len(payload),
+                       peer_checked=checked)
     return ReaderResult(
         url=url, status="ok", final_url=current, domain=tax.normalize_domain(current),
         title=extracted.title, body=extracted.text, body_chars=len(extracted.text),
         byte_len=len(payload), http_status=response.status_code,
-        truncated=extracted.truncated)
+        truncated=extracted.truncated, peer_checked=checked)
 
 
 async def _fetch_one(client: httpx.AsyncClient, url: str, *,
@@ -235,7 +416,7 @@ async def _fetch_one(client: httpx.AsyncClient, url: str, *,
     """
     current = url
     for _hop in range(max(0, int(cfg.max_redirects)) + 1):
-        code = await guard_hop(current)
+        code = await guard_hop(current, cfg=cfg)
         if code:
             logger.info("ai-trade intel reader blocked %s (%s)",
                         tax.normalize_domain(current) or "?", code)
@@ -256,7 +437,8 @@ async def _fetch_one(client: httpx.AsyncClient, url: str, *,
             return _result(url, status="timeout", final_url=current)
         except (httpx.HTTPError, ValueError, OSError):
             return _result(url, status="network_error", final_url=current)
-    return _result(url, status="blocked", final_url=current)   # 跳数超限
+    note_reject("too_many_redirects")                          # 跳数超限：此前它静默进 blocked
+    return _result(url, status="blocked", final_url=current)
 
 
 def select_targets(urls, *, cfg: ReaderConfig) -> list[str]:

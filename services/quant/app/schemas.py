@@ -2886,6 +2886,9 @@ class IntelSettingsIn(BaseModel):
     readerEnabled: bool | None = None
     readerTopK: int | None = Field(default=None, ge=1, le=12)
     quoteMode: Literal["off", "soft", "strict"] | None = None
+    # 轴 B-1（silent-degradation-repair）：解析策略。值域收在这里而不是只在前端——设置端点是
+    # 公开的，而一个坏值会让解析闸静默落到某一档，「这台机器上情报能不能抓」正取决于它。
+    readerResolver: Literal["auto", "strict"] | None = None
     # ---- ai-trade-intel-actionability §3.4.2：三把总闸 + 三个告警旋钮 ----
     # ⚠️ 值域**必须**收在这里而不是只在前端：设置端点是公开的，而 `alertMinImpact` 的一个坏值
     # 会经 `settings.model_copy(update=…)` 绕过 `Literal`（`model_copy` 不做校验）。第二道保险
@@ -2959,6 +2962,14 @@ class IntelSettingsOut(BaseModel):
     readerEnabled: bool
     readerTopK: int
     quoteMode: str
+    # 轴 B-1：与 `IntelSettingsIn.readerResolver` 对称。**回执必须带上它**——`response_model`
+    # 会静默丢弃未声明的键，症状是「开关点了、回读还是旧值」。
+    readerResolver: str = "auto"
+    # 轴 B-2 的两把**只读**旋钮（不在 `IntelSettingsIn` 里——本轮不让用户从面板改它们）。
+    # 它们必须下发，理由与 `alertPendingTtlS` 那一行逐字同源：**前端写死一个数，就会在用户
+    # 调过阈值之后给出一句与后端不一致的判定**。不下发 = 一把有写点没读点的旋钮 = 假开关。
+    readerHealthVisible: bool = True
+    readerZeroStreakWarn: int = 3
     # 近 20 轮引文命中率（`None` = 分母 0，「没提过引文」与「提了全没中」是两句不同的话）。
     # 它是把 `quoteMode` 调到 strict 的**唯一**判据在设置卡上的落点。
     quoteHitRate: float | None = None

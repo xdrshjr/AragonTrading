@@ -493,6 +493,11 @@ async def test_a_failing_monitor_tick_never_kills_the_loop_nor_the_interval_wake
     await init_db()
     session = _make_session(action="hold", wake_interval_s=120,
                             settings=Settings(ai_trade_wake_skip_unchanged_pct=0.0,
+                                              # 盯市周期调到 1 秒（把用例跑快）时**必须**同时把
+                                              # 持仓快照 TTL 置 0：轴 C 的启动期跨字段校验钉死
+                                              # `TTL < LIVE_AUTO_POLL_INTERVAL_S`，而 0 正是它
+                                              # 的「完全旁路」档（也是真实用户该做的那件事）。
+                                              ai_trade_positions_snapshot_ttl_s=0.0,
                                               live_auto_poll_interval_s=1))
     ticks = {"n": 0}
     original_tick = session._monitor_tick
@@ -568,7 +573,8 @@ async def test_a_throwing_recovery_notice_never_kills_the_loop_either():
     """
     await init_db()
     session = _make_session(action="hold", wake_interval_s=120,
-                            settings=Settings(live_auto_poll_interval_s=1))
+                            settings=Settings(ai_trade_positions_snapshot_ttl_s=0.0,
+                                              live_auto_poll_interval_s=1))
     notices = {"n": 0}
 
     async def flaky_notice():

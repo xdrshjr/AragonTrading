@@ -28,6 +28,7 @@
     "check:config": "node --check src/lib/config.js",
     "check:paths": "node --check src/lib/paths.js",
     "check:pm": "node --check src/lib/process-manager.js",
+    "check:rotatinglog": "node --check src/lib/rotating-log.js",
     "check:buildweb": "node --check scripts/build-web.mjs",
     "check:verifydist": "node --check scripts/verify-dist.mjs",
     "check:agentenv": "node --check src/lib/agent-env.js",

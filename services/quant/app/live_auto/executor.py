@@ -33,7 +33,7 @@ from ..okx.trading import (
     close_live_position,
     fetch_live_fills,
     fetch_live_order,
-    fetch_live_positions,
+    fetch_live_positions_at,
     place_live_order,
 )
 from ..wire_caps import TRADE_LEDGER_MAX
@@ -154,7 +154,21 @@ class LiveExecutor:
 
         self._place_order = place_order_fn or self._default_place_order
         self._close_position = close_position_fn or self._default_close_position
+        # 轴 C-2（silent-degradation-repair）：**两个属性，由同一个 `positions_fn` 派生两条规则**。
+        # 刻意不写成「两个方法」——`self._read_positions = ...` 这一行是属性赋值，同名方法会被它
+        # 遮掉，而遮掉的方向取决于赋值顺序，是一个会随重构静默翻转的行为。
+        #
+        # `positions_fn` 一旦给出，**两条路径都用它**：30+ 个用例的替身否则只能拦住一半调用，
+        # 另一半会真的出网（门禁 G-C13 守的正是这件事）。
         self._read_positions = positions_fn or self._default_read_positions
+        self._read_positions_fresh = positions_fn or self._default_read_positions_fresh
+        # 轴 C-4 防御纵深：本执行器最近一次**自己发起的私有写**的墙钟。比它更早的持仓快照
+        # 不得用来裁决幻影平仓（构造性保证，不依赖 C-3 的 `invalidate` 被正确调用）。
+        # 进程内、重启即 0 ⇒ 冷启后第一轮不设防，与本轮之前逐字一致。
+        self._last_private_write_wall = 0.0
+        # 本轮持仓读数**真实取得**的墙钟。`reconcile` 每轮先把它置成「此刻」（这样注入替身与
+        # `live_auto` 的行为逐字节不变，恒 fail-open），两个默认读法再各自覆盖成真值。
+        self._positions_taken_wall = 0.0
         # P1-2：挂单生命周期依赖的两个新缝（镜像上方三缝的既有范式）——没有它们，限价整组单测无法脱网。
         self._cancel_order = cancel_order_fn or self._default_cancel_order
         self._get_order = get_order_fn or self._default_get_order
@@ -173,7 +187,29 @@ class LiveExecutor:
             return await close_live_position(s, self.creds, self.account_id, close)
 
     async def _default_read_positions(self) -> list[dict]:
-        return await fetch_live_positions(self.creds)
+        """盯市 `reconcile` 的读法：**允许命中进程内共享快照**（轴 C-2）。
+
+        语义是「校正」，本来就是 `live_auto_poll_interval_s` 秒一次；N 个成员共享一份不改变任何
+        单个成员看到的内容（`_net_abs_pos` 按 `instId` 过滤，成员之间本就互不消费对方的持仓）。
+        `ai_trade_positions_snapshot_ttl_s = 0` ⇒ 完全旁路 ⇒ 逐字节回到今天。
+        """
+        rows, taken_wall = await fetch_live_positions_at(
+            self.creds, use_cache=True,
+            ttl_s=float(self.settings.ai_trade_positions_snapshot_ttl_s))
+        self._positions_taken_wall = taken_wall
+        return rows
+
+    async def _default_read_positions_fresh(self) -> list[dict]:
+        """**强制穿透**的读法（轴 C-2 的两个有交易后果的消费点）。
+
+        `_confirm_net_cleared` 是一个**轮询等待**：读缓存会让每次重试拿到同一个答案，等于把
+        「等净仓归零」变成一个恒假的死循环。`session._read_exchange_position`（暂停时读持仓
+        真值）同理——它的既有 docstring 已经写死了理由：「我关机时到底还有多少仓」这个数不该
+        来自本地投影，同样也不该来自一份 4 秒前的缓存。
+        """
+        rows, taken_wall = await fetch_live_positions_at(self.creds, force=True)
+        self._positions_taken_wall = taken_wall
+        return rows
 
     async def _default_cancel_order(self, cancel: CancelOrderInput) -> dict:
         sm = get_sessionmaker()
@@ -315,6 +351,7 @@ class LiveExecutor:
                            tp_trigger_px=tp, sl_trigger_px=sl)
         try:
             result = await self._place_order(order)
+            self._note_private_write()             # 轴 C-4：成功的写才置位
         except OKXError as exc:
             return pre + [self._error_event(ts, exc)]
         if limit_px is not None:      # I-2a：挂单期间**不写 projected**，绕开幻影成交陷阱（R-1）
@@ -365,6 +402,7 @@ class LiveExecutor:
         explain = self._close_explain(close_kind, reason, signal, ref_px)
         try:
             result = await self._close_position(close)
+            self._note_private_write()             # 轴 C-4：成功的写才置位
         except OKXError as exc:
             if exc.code == "LIVE_NO_POSITION":
                 # F-4 放行分支的第二个后果（【R:P1-1】）：挂单还在飞 ⇒ 交易所侧已无仓这件事**多半
@@ -461,6 +499,7 @@ class LiveExecutor:
             return "canceled", []
         try:
             result = await self._cancel_order(self._cancel_input(order))
+            self._note_private_write()             # 轴 C-4：撤单也可能改变持仓（三态之「已成交」）
         except OKXError as exc:      # 连通类失败：状态未知 → 保留挂单，下轮 _poll_resting 再判
             return "unknown", [self._error_event(ts, exc)]
         outcome = str(result.get("outcome") or "unknown")
@@ -645,7 +684,9 @@ class LiveExecutor:
         if self.pos_mode != "net_mode":
             return True
         for attempt in range(_CLEAR_CONFIRM_MAX_TRIES):
-            if self._net_abs_pos(await self._read_positions()) <= 0:
+            # 轴 C-2：**每一次重试都强制穿透**。走缓存会让三次重试读到同一个答案，
+            # 于是「等净仓归零」变成一个恒假的死循环（门禁 G-C7 直接构造这个场景）。
+            if self._net_abs_pos(await self._read_positions_fresh()) <= 0:
                 return True
             if attempt < _CLEAR_CONFIRM_MAX_TRIES - 1:
                 await asyncio.sleep(_CLEAR_CONFIRM_INTERVAL_S)
@@ -667,6 +708,9 @@ class LiveExecutor:
         events = await self._poll_resting(ts)          # O-1：必须最先；异常已在内部自隔离
         await audit_fills(self.fee_ledger, fills_fn=self._read_fills,
                           now_wall=time.time(), settings=self.settings)
+        # 轴 C-4：默认「此刻」——注入替身不会覆盖它，于是 30+ 个用例与 `live_auto` 的行为逐字节
+        # 不变（恒 fail-open）；两个默认读法会把它覆盖成这份读数**真实取得**的时刻。
+        self._positions_taken_wall = time.time()
         try:
             positions = await self._read_positions()
         except OKXError as exc:
@@ -691,6 +735,7 @@ class LiveExecutor:
         self.gross_unrealized_usd = self._net_upl(positions)     # OKX upl：纯价差、不含任何费用
         self.unrealized_usd = self._net_unrealized(self.gross_unrealized_usd, mark_px)
         if (self.projected != "flat" and abs_pos <= 0 and not grace
+                and self._snapshot_outranks_last_write()
                 and not self._external_close_suppressed()):
             # v2（P1-1）：侦测到交易所侧 / 外部已平仓，合成只读 external_close 成交后再校正为 flat。
             events += self._synthesize_external_close(mark_px, ts, source="external")
@@ -702,6 +747,43 @@ class LiveExecutor:
             self.entry_position_pct = None
             events.append(self._status_event("持仓已在交易所侧平仓 / 外部干预，已校正为 flat"))
         return events
+
+    def _snapshot_outranks_last_write(self) -> bool:
+        """这份持仓读数是不是**比我自己最近一次私有写更新**（轴 C-4 防御纵深）。
+
+        与 C-3（写即作废）是**有意的冗余**：C-3 是「记得调用」的纪律，C-4 是「忘了调用也不会
+        出事」的构造性保证。不许以「重复」为由删掉任何一半——一次刚成交的开仓撞上一份 4 秒前的
+        空快照，会被 `_on_reconcile_ok` 合成为 `external_close` 幻影平仓并按 mark_px 捏造盈亏，
+        那正是 `ai-trade-limit-orders` O-3 已经付过一次代价的形状。
+
+        条件不满足 ⇒ 本轮**只更新未实现盈亏，不裁决幻影**（与既有 `_fill_grace` 的「延后一轮」
+        代价完全相同，且两者可叠加）。
+
+        判据用的是 `self._positions_taken_wall`——**这份读数真实取得的时刻**，而不是 tick 的
+        `ts`，也不是「我收到它的时刻」。一份 4 秒前的缓存快照此刻被交到手上，它承载的事实仍然
+        是 4 秒前的；用收到时刻去比，等于让缓存把自己洗成新鲜的，C-4 就成了一句空话。
+
+        **两条 fail-open 的退路，一条都不许省**（极性弄反 = 幻影平仓再也不会被裁决，而那是一条
+        真实存在、必须被裁决的路径——交易所侧 OCO 触发就走它）：
+
+        1. `_last_private_write_wall == 0`（没写过 / 冷启后第一轮）⇒ 恒真 ⇒ 逐字节回到今天。
+        2. `_positions_taken_wall == 0`（**不知道这份读数是什么时候取的**）⇒ 同样恒真。
+           它发生在两种情形：注入了 `positions_fn` 替身，或调用方绕过 `reconcile()` 直接调
+           `_on_reconcile_ok`。C-4 是一道「知道得更多时才更严」的防御纵深，**不知道的时候它必须
+           什么都不做**——否则一个测试替身或一条未来的新调用路径会静默关掉幻影平仓的裁决。
+        """
+        if self._last_private_write_wall <= 0 or self._positions_taken_wall <= 0:
+            return True
+        return self._positions_taken_wall >= self._last_private_write_wall
+
+    def _note_private_write(self) -> None:
+        """记下「我刚刚成功发出了一次会改变持仓的私有写」（轴 C-4 的置位点）。
+
+        四个调用点（开仓 / 平仓 / 撤单 / flatten）都紧跟在 `await` 成功返回之后——**失败的写
+        不置位**：一次被拒的下单没有改变任何持仓，把它记成「刚写过」只会让下一轮白白放弃一次
+        本来正确的幻影判定。
+        """
+        self._last_private_write_wall = time.time()
 
     def _clear_degraded_if_recovered(self) -> list[dict]:
         """成功 reconcile：清零失败计数；若此前降级则消降级并推一条「已恢复」status。"""
@@ -750,6 +832,7 @@ class LiveExecutor:
         for attempt in range(self.settings.live_auto_flatten_max_retries + 1):
             try:
                 result = await self._close_position(close)
+                self._note_private_write()         # 轴 C-4：flatten 同样是一次会改仓的私有写
             except OKXError as exc:
                 if exc.code == "LIVE_NO_POSITION":
                     benign = self._settle_benign_close(ref_px, ts)

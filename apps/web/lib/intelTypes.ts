@@ -148,6 +148,19 @@ export interface IntelDocumentHealth {
   oldestFetchedTs: number;
   lastPrunedTs: number;
   readerEnabled: boolean;
+  // ---- 抓取健康（silent-degradation-repair 轴 B-2）：全部 optional，老回执缺席即回到今天 ----
+  /** Σ `ai_intel_rounds.reader_attempt`（`kind='collect'`）。 */
+  fetchAttempt?: number;
+  /** Σ `ai_intel_rounds.reader_ok`。真机实测：96 次尝试、**0 次成功**。 */
+  fetchOk?: number;
+  /** 最近连续多少轮「尝试了但一篇都没抓到」（`reader_attempt==0` 的轮次跳过不计）。 */
+  zeroOkStreak?: number;
+  /** `ai_intel_documents` 里 `status != 'ok'` 的分布（**持久**、跨重启）。 */
+  blockedByStatus?: Record<string, number>;
+  /** 拒因分布（**进程内**计数器，重启归零——见 `sinceProcessStart`）。 */
+  rejectCodesSinceStart?: Record<string, number>;
+  /** 上一行会归零这件事，后端自己说出来；前端文案据此写「本次运行以来」。 */
+  sinceProcessStart?: boolean;
 }
 
 export interface IntelRound {
@@ -449,6 +462,20 @@ export interface IntelSettings {
   readerEnabled: boolean;
   readerTopK: number;
   quoteMode: "off" | "soft" | "strict";
+  /**
+   * 解析策略（silent-degradation-repair 轴 B-1）的**生效值**。
+   *
+   * `auto` = 解析结果三分类：透明代理的合成地址段（198.18.0.0/15）不再等同于内网，改由
+   * 「域名闸 + 出网后对端地址复核」把关；`strict` = 逐字节回到本轮之前（合成段一律拒）。
+   */
+  readerResolver: "auto" | "strict";
+  /**
+   * 抓取健康行 / 零命中横幅要不要渲染，以及连续多少轮升横幅（silent-degradation-repair 轴 B-2）。
+   * **只读**（不在 `IntelSettingsPatch` 里）。它们必须由后端下发，理由与 `alertPendingTtlS`
+   * 逐字同源：前端写死一个数，就会在用户调过阈值之后给出一句与后端不一致的判定。
+   */
+  readerHealthVisible: boolean;
+  readerZeroStreakWarn: number;
   /** 近 20 轮命中率；`null` = 还没提过引文。 */
   quoteHitRate: number | null;
   // ---- actionability：三把总闸 + 三个告警旋钮（与 `INTEL_SETTING_BRIDGE` 逐键对应）----
@@ -495,6 +522,7 @@ export interface IntelSettingsPatch {
   readerEnabled?: boolean;
   readerTopK?: number;
   quoteMode?: "off" | "soft" | "strict";
+  readerResolver?: "auto" | "strict";
   alertEnabled?: boolean;
   alertMinImpact?: "medium" | "high";
   alertCooldownMin?: number;

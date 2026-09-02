@@ -65,10 +65,27 @@ class IntelEvidenceOut(BaseModel):
 
 class IntelDocumentHealthOut(BaseModel):
     """设置卡「原文缓存」那一行。`bodyBytes` 是**真实字节**（`length(CAST(body AS BLOB))`），
-    不是前端拿字符数乘出来的——中文正文在 UTF-8 下是 3 字节/字。"""
+    不是前端拿字符数乘出来的——中文正文在 UTF-8 下是 3 字节/字。
+
+    ⚠️ **本端点声明了 `response_model`，往它加键必须同步改这个类**（silent-degradation-repair
+    评审 P0-2，阻断级）。`/intel/documents/health` 是 `intel` 家族里少见的例外——同族的
+    `/okx/connectivity` 与 `/okx/link` 都**明文禁止**声明 `response_model`。往处理函数的返回
+    dict 里多塞键而不改这里，FastAPI 会在序列化时**一声不响地扔掉它们**，本仓已为 `edgeSource`
+    付过一次一模一样的代价。
+
+    也**不许**用「去掉 `response_model`」的办法绕过：这个 schema 正被前端类型文件对着抄，
+    去掉它是把一个静默剔除换成一个静默漂移。
+    """
 
     cachedDocs: int
     bodyBytes: int
     oldestFetchedTs: int
     lastPrunedTs: int
     readerEnabled: bool
+    # ---- 轴 B-2 的五个加法字段（全部带默认值，老调用点零回归）----
+    fetchAttempt: int = 0                    # Σ ai_intel_rounds.reader_attempt（kind='collect'）
+    fetchOk: int = 0                         # Σ ai_intel_rounds.reader_ok
+    zeroOkStreak: int = 0                    # 最近连续多少轮「尝试了但一篇都没抓到」
+    blockedByStatus: dict[str, int] = {}     # 持久：ai_intel_documents 里 status != 'ok' 的分布
+    rejectCodesSinceStart: dict[str, int] = {}   # **进程内**计数器，重启归零
+    sinceProcessStart: bool = True           # 上一行会归零这件事，必须自己说出来

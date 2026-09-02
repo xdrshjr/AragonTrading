@@ -27,18 +27,38 @@ export interface ReconcileWire {
   windowStartTs: number;
 }
 
+// 一次费率取数失败的事实（后端 `okx.types.FeeAttemptError.wire()` 产物，
+// ai-trade-silent-degradation-repair 轴 A-5）。它存在的全部理由是：生产上
+// `GET /account/trade-fee` **1,524 次请求 0 次成功**，而这个失败此前没有任何一处宿主。
+export interface FeeRateAttemptError {
+  /** 阶梯上哪一跳：`family`（instFamily）| `type`（账户通用档）。 */
+  rung: string;
+  /** HTTP 状态码；`null` = 传输层失败（那里确实没有状态码）。 */
+  httpStatus: number | null;
+  code: string;
+  msg: string;
+}
+
 // 官方费率档位读数（后端 `ai_auto/fee_rates.FeeRateCache.wire` 产物）。
 export interface FeeRatesWire {
   makerBps: number;
   takerBps: number;
   level: string;
   ruleType: string;
-  source: "exchange" | "config" | string;
+  /**
+   * 值域自轴 A-2 起是 4 个：`exchange:family`（阶梯第 1 跳）/ `exchange:type`（第 2 跳，账户
+   * 通用档）/ `exchange`（**本轮之前的老记录，必须继续被识别**）/ `config`（本地保守常数）。
+   */
+  source: "exchange" | "exchange:family" | "exchange:type" | "config" | string;
   rebate: boolean;
   ageS: number;
   stale: boolean;
   makerBpsRaw: number;
   takerBpsRaw: number;
+  /** 是否真的尝试过取数（轴 A-5；老回执缺席 ⇒ `undefined`）。 */
+  attempted?: boolean;
+  /** 最近一次取数失败的原因；`null` = 没失败过。 */
+  lastError?: FeeRateAttemptError | null;
 }
 
 /** 盈亏口径徽标文案；`assumed` 为真时必须说明这是**推定**而非已知（P0-3）。 */
@@ -113,12 +133,47 @@ export function describeIdentityCheck(rec: ReconcileWire | null | undefined): st
     : `交易所口径自检未通过（最大偏离 ${+(rec.identityMaxGapUsd ?? 0).toFixed(6)} USDT）`;
 }
 
-/** 费率来源徽标：官方档位 vs 本地常数——数从哪来决定它可不可信，绝不含糊其辞。 */
+/**
+ * 费率来源徽标：官方档位 vs 本地常数——数从哪来决定它可不可信，绝不含糊其辞。
+ *
+ * 值域 2 → 4（轴 A-2）：阶梯的两跳各有自己的档位语义，把它们压成同一句话会让「我这个账户
+ * 的真实档位到底取到没有」重新变得不可回答；老值 `exchange` **必须继续被识别**——生产库里
+ * 已经落了带这个值的历史记录。
+ *
+ * `lastError` 尾注（轴 A-5）：本地常数只说「这是猜的」是不够的，还要说**为什么猜**。三周来
+ * 用户看到的一直是一个没有原因的降级，而原因就写在每一次 400 的响应体里。
+ */
 export function describeFeeRates(rates: FeeRatesWire | null | undefined): string | null {
   if (!rates) return null;
-  const origin = rates.source === "exchange"
-    ? `交易所官方档位${rates.level ? ` ${rates.level}` : ""}`
-    : "本地保守常数";
+  const origin = feeOriginLabel(rates);
   const stale = rates.stale ? "（读数已陈旧）" : "";
-  return `${origin}：maker ${+rates.makerBps.toFixed(2)} / taker ${+rates.takerBps.toFixed(2)} bps${stale}`;
+  const head = `${origin}：maker ${+rates.makerBps.toFixed(2)} / taker ${+rates.takerBps.toFixed(2)} bps${stale}`;
+  const why = describeFeeRateError(rates.lastError);
+  return why ? `${head} —— ${why}` : head;
+}
+
+/** `source` → 中文档位名（四个值域各一句，未知值一律按「本地保守常数」保守处理）。 */
+export function feeOriginLabel(rates: FeeRatesWire): string {
+  const level = rates.level ? ` ${rates.level}` : "";
+  if (rates.source === "exchange:family") return `交易所官方档位${level}`;
+  if (rates.source === "exchange:type") return `交易所账户通用档位${level}`;
+  if (rates.source === "exchange") return `交易所官方档位${level}`;
+  return "本地保守常数";
+}
+
+/**
+ * 取数失败的一句人话；没有失败过 ⇒ `null`（调用方据此不渲染尾注）。
+ *
+ * **原始码只出现在括号里**：第一屏给的是「交易所拒绝了费率查询」，`51000` 这样的码是给排查
+ * 用的补充信息，不是给用户读的主语。
+ */
+export function describeFeeRateError(
+  error: FeeRateAttemptError | null | undefined,
+): string | null {
+  if (!error || (!error.code && !error.msg)) return null;
+  const detail = [error.code, error.msg].filter(Boolean).join(" ");
+  if (error.httpStatus === null || error.httpStatus === undefined) {
+    return `未能连上交易所查询费率（${detail}），成本与净额按保守常数计算`;
+  }
+  return `交易所拒绝了费率查询（${detail}），成本与净额按保守常数计算`;
 }

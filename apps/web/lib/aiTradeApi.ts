@@ -17,6 +17,8 @@ import type {
   AiTradeRelinkResult,
   AiTradeResumePreview,
 } from "./aiTradeTypes";
+import type { FeeRatesWire } from "./aiTradeCost";
+import type { TruthSourcesWire } from "./truthSources";
 
 const BASE = "/api/py";
 
@@ -123,6 +125,14 @@ export const aiTradeApi = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  // 人工重取一次交易所官方费率档位（silent-degradation-repair 轴 A-4）。
+  // **只读私有 GET**：不下任何单、不触碰写路径。分组未在跑 ⇒ 409（绝不静默成功——一个点了
+  // 没反应的按钮比没有按钮更糟）。
+  refreshFeeRates: () =>
+    request<{ ok: boolean; feeRates: FeeRatesWire | null }>(
+      "/ai-trade/fee-rates/refresh", { method: "POST" }),
+  // 四行真值源快照（silent-degradation-repair 轴 E）。只读、永不 5xx。
+  truthSources: () => request<TruthSourcesWire>("/system/truth-sources"),
 };
 
 /** 打开一条 AI 自动交易会话 WS（事件协议 {type,data}，含 decision/summary/agent_trace；每成员一条）。 */

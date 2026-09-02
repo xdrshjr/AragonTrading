@@ -18,8 +18,44 @@ import json
 
 import httpx
 
+from .call_stats import get_call_stats
+from .inst_family import inst_family_of
 from .private_client import OKXPrivateClient, OKXPrivateError, _iso_timestamp
+from .types import FeeAttemptError
 from .write_safety import may_retry_write
+
+
+def should_advance(exc: OKXPrivateError) -> bool:
+    """这一跳的失败是不是「参数不对」——**只有它才配让费率阶梯往下走一格**（轴 A-2）。
+
+    判据取自 ``exc.http_status``（A-1 新增的只读加法字段），**严禁解析 message 字符串**：
+    今天 ``_get`` 把「HTTP 400 参数错」与「429 退避耗尽」都抛成
+    ``OKXPrivateError("OKX_HTTP_ERROR", …)``，以 message 为判据就是在一个**不携带该信息的
+    入参**上做判定（本仓成文的缺陷形状，黑板已为它登记过四次）。
+
+    真值表（逐格由门禁 G-A7b 冻结）：
+
+    ==================== ======= ==============================================
+    ``http_status``      结果    理由
+    ==================== ======= ==============================================
+    ``None``             False   传输层失败 / ``OKX_UNREACHABLE``：换个参数也连不上
+    ``429``              False   退避已耗尽，再发一跳是在给限频火上浇油
+    ``401`` / ``403``    False   凭证问题，与参数无关
+    ``400 ≤ s < 500``    True    「你传错了，具体是这个」——正是阶梯要处理的那一类
+    ``s ≥ 500``          False   交易所侧故障，重试策略归 ``_get`` 管，不归阶梯管
+    ==================== ======= ==============================================
+
+    **不推进即原样上抛，而不是返回空**：后者会把一次真实的链路故障静默降级成「费率取不到」，
+    于是真值源卡片会在断网时说「交易所拒绝了费率查询」——一句**指着错误方向**的人话，比不
+    说话更糟。
+    """
+    status = getattr(exc, "http_status", None)
+    if status is None:
+        return False
+    code = int(status)
+    if code in (401, 403, 429):
+        return False
+    return 400 <= code < 500
 
 
 class OKXTradeClient(OKXPrivateClient):
@@ -61,12 +97,14 @@ class OKXTradeClient(OKXPrivateClient):
             try:
                 resp = await client.post(path, content=body, headers=headers)
             except Exception as exc:  # noqa: BLE001 —— 谓词见 docstring：进了这里即传输层失败
+                get_call_stats().note("POST", path, transport_fail=True)  # 轴 D-3：签名 POST 出口
                 last_exc = exc                   # 传输层异常：只有幂等写才允许再发一次
                 rate_limited = False
                 await self._invalidate_pooled()
                 if not retryable:
                     break
                 continue
+            get_call_stats().note("POST", path, status=resp.status_code)
             if resp.status_code == 429:   # 限流：退避后重试，不直接抛
                 rate_limited = True
                 await asyncio.sleep(0.5 * (2 ** attempt))
@@ -74,14 +112,17 @@ class OKXTradeClient(OKXPrivateClient):
             try:
                 resp.raise_for_status()
             except httpx.HTTPStatusError as exc:  # 非 429 的 4xx/5xx：语义不变，立即上抛
-                self._note_link_fail("OKX_HTTP_ERROR", f"{path}: HTTP {exc.response.status_code}")
-                raise OKXPrivateError("OKX_HTTP_ERROR",
-                                      f"OKX HTTP {exc.response.status_code}") from exc
+                # 轴 A-1 / A-3（POST 侧，与基类 `_get` 逐字同形）：带出 OKX 的 code/msg，并按
+                # HTTP 状态分级登记（4xx 走中性的 `note_rejected`，不再污染链路连续失败计数）。
+                status = exc.response.status_code
+                detail = self._http_detail(status, exc.response.content)
+                self._note_http_status(path, status, detail)
+                raise OKXPrivateError("OKX_HTTP_ERROR", detail, http_status=status) from exc
             self._note_link_ok()
             return resp.json()
         if rate_limited:   # 退避耗尽仍 429：显式回 OKX_HTTP_ERROR，避免 last_exc=None 的误导串
             self._note_link_fail("OKX_HTTP_ERROR", f"{path}: HTTP 429")
-            raise OKXPrivateError("OKX_HTTP_ERROR", "OKX HTTP 429")
+            raise OKXPrivateError("OKX_HTTP_ERROR", "OKX HTTP 429", http_status=429)
         self._note_link_fail("OKX_UNREACHABLE", f"{path}: {last_exc}")
         raise OKXPrivateError("OKX_UNREACHABLE", f"无法连接 OKX ({path}): {last_exc}")
 
@@ -280,25 +321,89 @@ class OKXTradeClient(OKXPrivateClient):
             params["instId"] = inst_id
         return await self._get("/api/v5/trade/fills", params)
 
-    async def get_trade_fee(self, inst_type: str, inst_id: str | None = None) -> dict:
-        """``GET /api/v5/account/trade-fee``：本账户在该合约上的**真实**费率档位（签名 GET）。
+    async def get_trade_fee(self, inst_type: str, inst_id: str | None = None
+                            ) -> tuple[dict, str | None, tuple[FeeAttemptError, ...]]:
+        """``GET /api/v5/account/trade-fee``：本账户的**真实**费率档位，走参数阶梯（轴 A-2）。
 
         关键回读字段：``level``（如 ``Lv1``）/ ``ruleType``/ ``maker``/``taker``（币本位与现货）/
         ``makerU``/``takerU``（USDT 保证金合约）/ ``makerUSDC``/``takerUSDC``。费率为**有符号字符串**，
         负数 = 平台收取、正数 = 返佣（归一与夹紧在服务层 ``_normalize_trade_fee``）。
 
+        阶梯（`ai_trade_fee_rate_family_fallback_enabled=False` ⇒ 只发今天那一跳，逐字节等价）::
+
+            ① {"instType": …, "instFamily": inst_family_of(instId)}   family 为 None ⇒ 直接跳 ②
+               should_advance(exc) 为真  ⇒ 记下这一跳的 (status, code, msg)，跳 ②
+               否则（传输层 / 429 / 401 / 5xx）⇒ **原样上抛，绝不跳 ②**
+            ② {"instType": …}                                          账户在该产品类型上的通用档
+               should_advance(exc) 为真  ⇒ 记下，返回 ({}, None, errors)
+               否则                      ⇒ 原样上抛
+
+        **本方法是唯一知道「哪一跳成功了」的地方**，故 ``rung`` 由它产出并一路带到
+        ``trading._normalize_trade_fee``——``source`` 的唯一产出点在那里，只改 ``fee_rates.py``
+        （它是**读**这个值的）永远不会让 ``exchange:family`` 这个值出现（评审 P1-6）。
+
+        次数代价（评审 P1-11 更正了 v1 的量纲误用）：阶梯把启动期私有 GET 的**次数**从 N 提到
+        最坏 2N；在按账户 5 次/秒的令牌桶下，N=5 的最坏增量是 1 秒量级的排队。而**真实断网时
+        次数一次都不会翻倍**——``should_advance`` 为假，第 ① 跳直接上抛。
+
         Args:
             inst_type: 产品类型（本项目恒 ``"SWAP"``）。
-            inst_id: 合约 ID（可选；不传即取该 instType 的账户通用档位）。
+            inst_id: 合约 ID（用于推 ``instFamily``；``SPOT``/``MARGIN`` 仍按 ``instId`` 发）。
 
         Returns:
-            ``data[0]``；OKX 回空数组时为 ``{}``。
+            ``(row, rung, errors)``——``row`` 是 ``data[0]``（全败即 ``{}``），
+            ``errors`` 是每一跳的失败事实（成功即空元组），``rung`` 是**哪一跳成功了**：
+
+            * ``"family"`` / ``"type"``：阶梯的第 ① / ② 跳，下游据此产出
+              ``source="exchange:family"`` / ``"exchange:type"``；
+            * ``""``：**今天那一跳**（总闸关，或 ``SPOT``/``MARGIN`` 的 ``instId`` 契约）。
+              空串让下游 ``_normalize_trade_fee`` 逐字保留老值 ``"exchange"``——回退档必须
+              **连 wire 上的字符串都回到** ``8451163``，否则「逐字节回退」是一句自称；
+            * ``None``：一跳都没成功（与 ``""`` 是两件事，不许压成同一个假值）。
+
+        Raises:
+            OKXPrivateError: 任何**不该推进阶梯**的失败（传输层 / 429 / 401 / 403 / 5xx）原样上抛。
         """
-        params: dict[str, str] = {"instType": inst_type}
+        errors: list[FeeAttemptError] = []
+        for rung, params in self._fee_rungs(inst_type, inst_id):
+            try:
+                rows = await self._get("/api/v5/account/trade-fee", params)
+            except OKXPrivateError as exc:
+                if not should_advance(exc):
+                    raise
+                errors.append(FeeAttemptError(
+                    rung=rung, http_status=getattr(exc, "http_status", None),
+                    code=str(exc.code or ""), msg=str(exc.message or "")))
+                continue
+            return (rows[0] if rows else {}), rung, tuple(errors)
+        return {}, None, tuple(errors)
+
+    def _fee_rungs(self, inst_type: str, inst_id: str | None
+                   ) -> list[tuple[str, dict[str, str]]]:
+        """阶梯的参数表（纯函数，无 IO）。总闸关 ⇒ **只有今天那一跳**。
+
+        ``SPOT`` / ``MARGIN`` 走 ``instId``（OKX 对这两类接受它），其余产品类型才推 ``instFamily``。
+        ``instId`` 形参因此保留——本仓今天不走现货，但契约不该被删掉。
+
+        今天那一跳的 rung 名是**空串**而不是 ``"type"``：它发的参数里带 ``instId``，与阶梯第 ②
+        跳（账户在该产品类型上的通用档）**不是同一件事**。叫成 ``"type"`` 会有两个后果，每个
+        都是本轮在修的那类假话——回退档下 ``source`` 变成 ``"exchange:type"``（不再逐字节等于
+        ``8451163`` 的 ``"exchange"``），而界面会把一份按 ``instId`` 取到的档位说成「账户通用档位」。
+        """
+        upper = str(inst_type or "").upper()
+        legacy = {"instType": upper}
         if inst_id:
-            params["instId"] = inst_id
-        rows = await self._get("/api/v5/account/trade-fee", params)
-        return rows[0] if rows else {}
+            legacy["instId"] = inst_id
+        if not self._settings.ai_trade_fee_rate_family_fallback_enabled:
+            return [("", legacy)]
+        if upper in ("SPOT", "MARGIN"):
+            return [("", legacy)]
+        family = inst_family_of(inst_id or "")
+        rungs: list[tuple[str, dict[str, str]]] = []
+        if family:
+            rungs.append(("family", {"instType": upper, "instFamily": family}))
+        rungs.append(("type", {"instType": upper}))
+        return rungs
 
     async def get_position_history(self, inst_type: str, inst_id: str | None = None, *,
                                    limit: int = 50, after_ms: int | None = None) -> list:

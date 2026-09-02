@@ -44,6 +44,8 @@ describe("components/Intel/**", () => {
       "IntelList.tsx",
       "IntelModal.tsx",
       "IntelQuoteBlock.tsx",
+      // silent-degradation-repair 轴 B-2：情报正文的零命中横幅（连续 N 轮一篇都没抓到）。
+      "IntelReaderBanner.tsx",
       "IntelRoundsTab.tsx",
       "IntelSourceChips.tsx",
       "IntelSourcesTab.tsx",

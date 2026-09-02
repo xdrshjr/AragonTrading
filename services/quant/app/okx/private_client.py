@@ -21,8 +21,10 @@ import hmac
 import httpx
 
 from ..config import Settings, get_settings
+from .call_stats import get_call_stats
 from .client_pool import POOL_LIMITS, fingerprint, get_client_pool
 from .clock import get_server_clock
+from .error_http import _redact, describe_http_error
 from .link_state import get_link_registry
 from .rate_limit import get_limiters
 from .rest_client import OKXError
@@ -38,7 +40,26 @@ class OKXPrivateError(OKXError):
 
     子类化既有 ``OKXError``，复用其 ``code/message`` 构造，从而被 ``main.okx_error_handler``
     自动捕获并统一回 502 `{error:{code,message}}`（P1-ErrHandler）。
+
+    ``http_status``（silent-degradation-repair 轴 A-1，**只读加法字段**）：这一次失败对应的
+    HTTP 状态码，没有即 ``None``。它不是可选项，而是 A-2 参数阶梯能不能成立的前提——今天
+    ``_get`` 把「HTTP 400 参数错」与「429 退避耗尽」**都**抛成
+    ``OKXPrivateError("OKX_HTTP_ERROR", …)``，阶梯若以「HTTP 非 2xx」为推进判据，就是在一个
+    **不携带该信息的入参**上做判定（本仓成文的缺陷形状）。
+
+    三条形状约束：
+
+    1. **默认 ``None``、位置参数签名一字不动**——既有构造点有数十处（含 ``trading.py`` 的六个
+       ``_map_trade_code`` 映射点），它们一个都不改。
+    2. 只在**真的知道 HTTP 状态**的分支里填（``_get`` / ``_post`` 的状态分支、429 退避耗尽
+       分支）；传输层失败（``OKX_UNREACHABLE``）留 ``None``——那里确实没有状态码，编一个
+       进去就是造第二句假话。
+    3. **不进任何 wire**：它是给同进程调用方做分支用的，不是给前端看的。
     """
+
+    def __init__(self, code: str, message: str, *, http_status: int | None = None):
+        super().__init__(code, message)
+        self.http_status = http_status
 
 
 def _iso_timestamp() -> str:
@@ -182,6 +203,42 @@ class OKXPrivateClient:
         get_link_registry().note_failure(PRIVATE_LINK_KEY, kind="restPrivate",
                                          label=PRIVATE_LINK_LABEL, code=code, message=message)
 
+    # ---------- 轴 A-1 / A-3：把「交易所到底说了什么」带出来，并按状态分级登记 ----------
+    def _http_detail(self, status: int, body: bytes | str | None) -> str:
+        """非 2xx 的对外描述。总闸关 ⇒ 逐字回到 ``f"OKX HTTP {status}"``。
+
+        产物**一律再过一次 ``_redact``**：OKX 的错误体本不含密钥，但「凡是要进日志的外部串都过
+        脱敏」是本仓既有纪律，不在这里破例。
+        """
+        if not self._settings.okx_http_error_detail_enabled:
+            return f"OKX HTTP {status}"
+        return _redact(describe_http_error(status, body), self._secret_key, self._passphrase)
+
+    def _note_http_status(self, path: str, status: int, detail: str) -> None:
+        """按 HTTP 状态把这一次非 2xx 记进链路健康登记簿（轴 A-3 的分级表）。
+
+        | 状态 | 记法 |
+        |---|---|
+        | 5xx / 传输层 | ``note_failure``（今天的行为，见调用方） |
+        | 429 | ``note_failure``（今天的行为，已被 ``tests/test_okx_signing.py`` 冻结） |
+        | 4xx（非 429/401/403） | ``note_rejected``——请求到了、被业务拒了，链路是好的 |
+        | 401 / 403 | ``note_failure``，但 ``code`` 换成 ``OKX_AUTH_REJECTED`` |
+
+        ``okx_link_treat_4xx_as_link_failure=True`` ⇒ **逐字节回到今天**（一律 ``note_failure``
+        且 ``code`` 恒为 ``OKX_HTTP_ERROR``、message 恒为 ``f"{path}: HTTP {status}"``）。
+        """
+        if self._settings.okx_link_treat_4xx_as_link_failure:
+            self._note_link_fail("OKX_HTTP_ERROR", f"{path}: HTTP {status}")
+            return
+        if status in (401, 403):
+            self._note_link_fail("OKX_AUTH_REJECTED", f"{path}: {detail}")
+            return
+        if 400 <= status < 500:
+            get_link_registry().note_rejected(PRIVATE_LINK_KEY, kind="restPrivate",
+                                              label=PRIVATE_LINK_LABEL, status=status)
+            return
+        self._note_link_fail("OKX_HTTP_ERROR", f"{path}: {detail}")
+
     async def __aenter__(self) -> "OKXPrivateClient":
         return self
 
@@ -233,10 +290,12 @@ class OKXPrivateClient:
             try:
                 resp = await client.get(path, params=params, headers=headers)
             except Exception as exc:  # noqa: BLE001 —— 谓词见 docstring：进了这里即传输层失败
+                get_call_stats().note("GET", path, transport_fail=True)   # 轴 D-3：签名 GET 出口
                 last_exc = exc
                 rate_limited = False
                 await self._invalidate_pooled()   # 抖动即整池换代，而非让后续请求各自超时一遍
                 continue
+            get_call_stats().note("GET", path, status=resp.status_code)
             if resp.status_code == 429:   # 限流：退避后重试，不直接抛
                 rate_limited = True
                 await asyncio.sleep(0.5 * (2 ** attempt))
@@ -244,9 +303,10 @@ class OKXPrivateClient:
             try:
                 resp.raise_for_status()
             except httpx.HTTPStatusError as exc:  # 非 429 的 4xx/5xx：语义不变，立即上抛
-                self._note_link_fail("OKX_HTTP_ERROR", f"{path}: HTTP {exc.response.status_code}")
-                raise OKXPrivateError("OKX_HTTP_ERROR",
-                                      f"OKX HTTP {exc.response.status_code}") from exc
+                status = exc.response.status_code
+                detail = self._http_detail(status, exc.response.content)
+                self._note_http_status(path, status, detail)
+                raise OKXPrivateError("OKX_HTTP_ERROR", detail, http_status=status) from exc
             body = resp.json()
             if str(body.get("code")) != "0":
                 await self._maybe_heal_clock(str(body.get("code")))
@@ -258,7 +318,9 @@ class OKXPrivateClient:
             # 【有意的不对齐，spec §2.3.5 / §十一 D-1】公共侧改抛 OKX_RATE_LIMITED，私有侧**一字不动**：
             # 它被 tests/test_okx_signing.py:95 逐字冻结，而那条用例本轮必须未经改动仍绿。
             self._note_link_fail("OKX_HTTP_ERROR", f"{path}: HTTP 429")
-            raise OKXPrivateError("OKX_HTTP_ERROR", "OKX HTTP 429")
+            # `http_status=429`：这条分支**真的知道**自己是 429，故如实填（A-2 的 `should_advance`
+            # 据它判「不推进」）。message 与登记逐字不动——它被 tests/test_okx_signing.py:95 冻结。
+            raise OKXPrivateError("OKX_HTTP_ERROR", "OKX HTTP 429", http_status=429)
         self._note_link_fail("OKX_UNREACHABLE", f"{path}: {last_exc}")
         raise OKXPrivateError("OKX_UNREACHABLE", f"无法连接 OKX ({path}): {last_exc}")
 

@@ -16,14 +16,14 @@ import time
 
 from ..live_auto.fee_ledger import explain_meta_fields
 from ..okx.rest_client import get_rest_client
-from ..okx.trading import fetch_position_history, fetch_trade_fee
+from ..okx.trading import fetch_position_history, fetch_trade_fee_ex
 from .attribution import AttributionLedger
 from .cost_model import (CostBreakdown, estimate_round_trip_cost, query_for_decision,
                         query_for_preview, resolve_cost_params)
 from .cost_text import format_cost_charter
 from .cost_view import build_cost_view, funding_accrued_view
 from .edge_gate import EdgeGateOutcome, evaluate_edge_gate
-from .fee_rates import FeeRateCache, snapshot_from_wire
+from .fee_rates import FeeRateCache, attempt_from_wire, snapshot_from_wire
 from .funding import FundingCache
 from .funding_ledger import FundingLedger
 from .reconcile import (build_reconciliation, drift_message, local_net_view,
@@ -81,10 +81,15 @@ class CostRuntime:
         # 起来 5s 后立刻再发一次同样的请求。
         self.fee_rates = FeeRateCache(
             inst_id, ttl_s=settings.ai_trade_fee_rate_ttl_s,
-            enabled=bool(settings.ai_trade_fee_rate_source_enabled) and creds is not None)
+            enabled=bool(settings.ai_trade_fee_rate_source_enabled) and creds is not None,
+            origin_visible=bool(settings.ai_trade_fee_rate_origin_visible))
         now_wall = time.time()
+        # 轴 A-5：**失败也一起播种**。启动期那一次取数是这台机器上唯一一次真的发生过的取数
+        # （TTL 3600s ⇒ 会话内第二次要等一小时），不把它的失败原因带进来，界面就要空等一小时
+        # 才能说出「交易所拒绝了费率查询」。
         self.fee_rates.seed(
-            snapshot_from_wire(getattr(fee_ledger, "fee_rate_wire", None), now_wall), now_wall)
+            snapshot_from_wire(getattr(fee_ledger, "fee_rate_wire", None), now_wall), now_wall,
+            last_error=attempt_from_wire(getattr(fee_ledger, "fee_rate_error", None)))
         self.last_reconcile: dict | None = None    # 轴 C 最近一次对账读数（进 costSnapshot）
         self._maintenance: asyncio.Task | None = None   # 在途的后台网络维护（单飞，见 I-1）
         self._reconcile_streak = 0                 # 连续 drift 轮数（终态对账不推进，P1-5）
@@ -289,9 +294,13 @@ class CostRuntime:
                                    source=snap.source)
         return ok
 
-    async def _fetch_fee_rate(self, inst_id: str) -> dict | None:
-        """把凭证绑进取数函数（缓存本身不认识凭证，镜像 `FundingCache` 只认 `inst_id` 的姿态）。"""
-        return await fetch_trade_fee(self.creds, inst_id)
+    async def _fetch_fee_rate(self, inst_id: str):
+        """把凭证绑进取数函数（缓存本身不认识凭证，镜像 `FundingCache` 只认 `inst_id` 的姿态）。
+
+        返回 `FeeFetchOutcome`（轴 A-2/A-5）：`FeeRateCache.refresh` 经 `as_outcome` 归一，
+        既有的 `dict | None` 替身照常工作。
+        """
+        return await fetch_trade_fee_ex(self.creds, inst_id)
 
     async def _fetch_position_history(self) -> list[dict]:
         """轴 C 取数的可注入缝（镜像 `_fetch_fee_rate` 与 executor 的五个回调缝）：脱网单测用。"""
@@ -588,12 +597,13 @@ class CostRuntime:
     def snapshot(self) -> dict:
         return self._with_realized(self._with_prior(build_cost_stats(
             self.attribution.stats(), self.fee_ledger,
-            fee_rates=self.fee_rates.wire(time.time()), reconcile=self.last_reconcile)))
+            fee_rates=self.fee_rates.wire(time.time(), self.settings),
+            reconcile=self.last_reconcile)))
 
     def snapshot_if_due(self, round_no: int) -> dict | None:
         """L0/L1 通道的节流快照（§5.4）；未到轮次 ⇒ `None`。"""
         snap = cost_snapshot_wire(round_no, self.attribution.stats(), self.fee_ledger,
-                                  fee_rates=self.fee_rates.wire(time.time()),
+                                  fee_rates=self.fee_rates.wire(time.time(), self.settings),
                                   reconcile=self.last_reconcile)
         return None if snap is None else self._with_realized(self._with_prior(snap))
 

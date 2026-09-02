@@ -67,12 +67,18 @@ async def test_connectivity_returns_the_full_wire_shape():
     assert resp.status_code == 200
     body = resp.json()
     assert set(body) == {"ts", "overall", "accountState", "summary", "channels",
-                         "clockOffsetMs", "clockSyncedTs"}
+                         "clockOffsetMs", "clockSyncedTs",
+                         # silent-degradation-repair 轴 D-3：按端点的调用 / 错误滑窗计数。
+                         # 轴 D-2 把 httpx 的 INFO 压掉之后，「哪个端点最热 / 谁在拒我」这个
+                         # 问题的答案只剩它一处。总闸关 ⇒ 该键**整段不出现**（G-D6②）。
+                         "callStats"}
     row = body["channels"][0]
     assert set(row) == {"key", "kind", "label", "state", "lastOkTs", "lastErrorTs",
                         "lastErrorCode", "lastErrorMessage", "latencyMs",
                         "consecutiveFailures", "reconnects1h", "resubscribes1h",
-                        "gapRepairs1h", "lastMessageTs", "circuit", "circuitOpenUntilTs"}
+                        "gapRepairs1h", "lastMessageTs", "circuit", "circuitOpenUntilTs",
+                        # 轴 A-3 的三个中性登记键（都不参与 derive_state / overall）。
+                        "rejected4xx", "lastRejectedTs", "lastRejectedStatus"}
     assert row["key"] == "rest:public" and row["latencyMs"] == 28
 
 

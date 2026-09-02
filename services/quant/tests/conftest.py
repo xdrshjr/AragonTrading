@@ -54,17 +54,38 @@ def _reset_okx_link_singletons():
     ``import`` 放在函数体内：夹具在收集期就会被装配，而模块级导入 app 包会在**设置 DB_PATH 之前**
     触发 ``app.config`` 的加载顺序问题。
     """
+    from app.okx.call_stats import get_call_stats
     from app.okx.client_pool import get_client_pool
     from app.okx.clock import get_server_clock
     from app.okx.link_state import get_link_registry
+    from app.okx.positions_cache import get_positions_cache
     from app.okx.rate_limit import get_limiters
 
-    singletons = [get_link_registry(), get_limiters(), get_client_pool(), get_server_clock()]
+    # `CallStats`（silent-degradation-repair 轴 D-3）是第 5 个进程单例：不复位的话，一个用例
+    # 造出来的调用计数会让下一个用例读到「上一轮的 429」，而它正是 `/okx/connectivity` 的加法键。
+    # `PositionsCache`（轴 C）是第 6 个进程单例：不复位的话，一个用例写进去的持仓快照会在
+    # TTL 窗口内被下一个用例读到——而它决定的是「这个标的现在有没有仓」，跨用例污染即假绿。
+    singletons = [get_link_registry(), get_limiters(), get_client_pool(), get_server_clock(),
+                  get_call_stats(), get_positions_cache()]
     for s in singletons:
         s.reset()
+    _reset_intel_reject_counter()
     yield
     for s in singletons:
         s.reset()
+    _reset_intel_reject_counter()
+
+
+def _reset_intel_reject_counter() -> None:
+    """情报抓取的**进程内**拒因计数器（silent-degradation-repair 轴 B-2）。
+
+    它不是一个带 `reset()` 的对象而是一个模块级 dict，故单列一个复位点。不复位的话，一个用例
+    造出来的拒因会漏进下一个用例读到的 `rejectCodesSinceStart`——而那个键正是设置卡上「本次
+    运行以来为什么一篇都没抓到」的唯一来源。
+    """
+    from app.ai_auto.intel import reader as intel_reader
+
+    intel_reader.reset_reject_counts()
 
 
 @pytest.fixture(autouse=True)

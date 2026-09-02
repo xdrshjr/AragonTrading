@@ -12,6 +12,7 @@ const { app, BrowserWindow, dialog, ipcMain, shell, Menu } = require('electron')
 const cfg = require('./lib/config');
 const paths = require('./lib/paths');
 const agentEnvLib = require('./lib/agent-env');
+const { openRotating, resolveLogOptions } = require('./lib/rotating-log');
 const {
   describeRendererGone,
   createReloadBudget,
@@ -40,11 +41,17 @@ let enginesReady = false; // 两个子进程均就绪并已开窗后置真，作
 let lastOverlayState = null;
 
 // ----------------------------- 日志 -----------------------------
+// 轴 D-1（ai-trade-silent-degradation-repair）：日志参数的取值链是**三级回落**，不是只读
+// `process.env`。`openLogStreams()` 跑在 `bootstrap()` 的第一行，而 `agentEnv` 要到后端子进程
+// 装配时才被读（:backendSpec）；一个从开始菜单 / 桌面图标启动的 Electron 进程，`process.env`
+// 里**不会有**任何用户设的键——只读 `process.env` 的话，「ARAGON_LOG_MAX_BYTES=0 ⇒ 逐字节回到
+// 今天」这句承诺在唯一的产品形态里是空的（评审 P0-5）。
 function openLogStreams() {
-  // dev：转控制台（返回 null）；prod：写 userData/logs/{backend,web,main}.log
+  // dev：转控制台（返回 null）；prod：写 userData/logs/{backend,web,main}.log（带上限轮转）
   if (!paths.isPackaged()) return { backend: null, web: null, main: null };
   const dir = paths.ensureLogsDir();
-  const open = (name) => fs.createWriteStream(path.join(dir, `${name}.log`), { flags: 'a' });
+  const opts = resolveLogOptions(agentEnvLib.loadAgentEnv);
+  const open = (name) => openRotating(dir, name, opts);
   return { backend: open('backend'), web: open('web'), main: open('main') };
 }
 

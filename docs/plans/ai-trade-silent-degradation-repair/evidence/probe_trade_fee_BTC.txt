@@ -1,0 +1,14 @@
+账户 #1 · instId=BTC-USDT-SWAP · instType=SWAP · instFamily='BTC-USDT'
+
+[① instFamily] GET /api/v5/account/trade-fee  params={'instType': 'SWAP', 'instFamily': 'BTC-USDT'}
+  → HTTP 200  level='Lv1' ruleType='normal'
+     maker='' taker='' makerU='-0.0002' takerU='-0.0005'
+
+[② instType] GET /api/v5/account/trade-fee  params={'instType': 'SWAP'}
+  → HTTP 200  level='Lv1' ruleType='normal'
+     maker='-0.0002' taker='-0.0005' makerU='-0.0002' takerU='-0.0005'
+
+[③ instType+instId（本轮之前的写法）] GET /api/v5/account/trade-fee  params={'instType': 'SWAP', 'instId': 'BTC-USDT-SWAP'}
+  → HTTP 400  code=OKX_HTTP_ERROR  msg=OKX HTTP 400 [50016] instId and instType don't match
+
+结论： 至少有一跳成功 ⇒ 阶梯可以取到官方档位

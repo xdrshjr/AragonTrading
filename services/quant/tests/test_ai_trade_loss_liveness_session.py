@@ -808,9 +808,13 @@ async def test_e8_margin_precheck_knob_is_disclosed_in_the_start_receipt(monkeyp
         await dispose_engine()
 
 
-# ============================ A1：11 把总闸全关时的零回归门禁 ============================
+# ============================ A1：总闸全关时的零回归门禁（11 + 12 = 23 把） ============================
 async def test_a1_every_new_switch_off_adds_nothing_to_payload_status_or_events():
-    """`A1`（§8.1）的**可执行**形态。
+    """`A1`（§8.1）+ `G-X1`（ai-trade-silent-degradation-repair §14.2 跨轴）的**可执行**形态。
+
+    **本用例是被扩展的，不是被复制的**（silent-degradation-repair 放行条件 C-8）：新写一条
+    平行用例意味着两份「本轮新增了哪些键」的清单，而它们必然在下一轮分叉——那正是这条门禁
+    要防的东西本身。
 
     原文写的是「payload / prompt / decision / snapshot 逐字节等于 `5337da1`」——那需要一份 golden
     快照，而 golden 会在下一轮任何一次合法改动上变红，且红了也判断不出该不该红。故本用例断言它
@@ -833,6 +837,19 @@ async def test_a1_every_new_switch_off_adds_nothing_to_payload_status_or_events(
         ai_trade_exit_verdict_min_samples=0,               # 轴 F
         ai_trade_exit_discretion_autotune_enabled=False,   # 轴 F（本轮只建不开）
         ai_trade_sizing_margin_precheck=False,             # E-8
+        # ---- silent-degradation-repair 的 12 把闸（G-X1）----
+        okx_http_error_detail_enabled=False,               # 轴 A-1
+        okx_link_treat_4xx_as_link_failure=True,           # 轴 A-3（True 才是回退档）
+        okx_call_stats_enabled=False,                      # 轴 D-3
+        ai_trade_fee_rate_family_fallback_enabled=False,   # 轴 A-2
+        ai_trade_fee_rate_origin_visible=False,            # 轴 A-4 / A-5
+        ai_trade_intel_reader_resolver="strict",           # 轴 B-1
+        ai_trade_intel_reader_synthetic_cidrs="",          # 轴 B-1（默认档即回退档）
+        ai_trade_intel_reader_health_visible=False,        # 轴 B-2
+        ai_trade_intel_reader_zero_streak_warn=50,         # 轴 B-2（实际上不升横幅）
+        ai_trade_positions_snapshot_ttl_s=0.0,             # 轴 C（完全旁路）
+        ai_trade_log_http_client_level="INFO",             # 轴 D-2
+        ai_trade_truth_sources_enabled=False,              # 轴 E
     )
     rule = resolve_horizon_rule({"profile": "intraday_swing"}, settings, bar="1H")
     session = _make_session(settings, base_rule=resolve_ma_band_rule({"enabled": True}, settings))
@@ -846,10 +863,15 @@ async def test_a1_every_new_switch_off_adds_nothing_to_payload_status_or_events(
         payload = session._build_decision_payload(
             4, _START_TS, _PX, [], {"kind": "heartbeat", "trigger": "interval"})
         blob = json.dumps(payload, ensure_ascii=False, default=str)
-        for token in ("liveness", RELEASE_LOSS_COVERED, "exitDiscretion", "roundsSkipped"):
+        for token in ("liveness", RELEASE_LOSS_COVERED, "exitDiscretion", "roundsSkipped",
+                      # silent-degradation-repair：轴 E 的 WS 摘要键。
+                      "truthSources"):
             assert token not in blob, f"总闸全关时 payload 里出现了本轮新增的 `{token}`"
         for wire in (session.info(), session._status_payload()):
             assert "liveness" not in wire, "总闸关 ⇒ 整键**缺席**（不是 null）"
+            assert "truthSources" not in wire, "轴 E 总闸关 ⇒ 整键**缺席**（不是 null）"
+        # 轴 A-4 / A-5 的回退档：无快照时 `feeRates` 逐字节回到 `None` ⇒ `aiStats` 上整键缺席。
+        assert session._cost.fee_rates.wire(_START_TS, settings) is None
         assert session.rounds_skipped == 0
         # E-3 的回退档：峰值追踪跟着保护层一起不装配 ⇒ 逐字回到今天的「恒 NULL」
         assert session._guard.take_peak_pnl() is None

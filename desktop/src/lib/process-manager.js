@@ -345,7 +345,9 @@ class ManagedChild {
    * @param {string[]} o.args
    * @param {string} o.cwd
    * @param {NodeJS.ProcessEnv} o.env
-   * @param {import('fs').WriteStream|null} o.logStream prod 写文件，dev 传 null（转控制台）
+   * @param {{write: (chunk: any) => boolean}|null} o.logStream prod 写文件，dev 传 null（转控制台）。
+   *   prod 传的是 `lib/rotating-log.openRotating()` 的产物（带上限轮转的同步写入器），
+   *   **不再是** `fs.WriteStream`——本类只用到 `.write`，故契约按它写。
    */
   constructor({ name, command, args, cwd, env, logStream }) {
     this.name = name;

@@ -5,11 +5,57 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger("aragon.okx.types")
+
+
+# ---------------- 费率取数的结果契约（silent-degradation-repair 轴 A · A-5）----------------
+# 为什么需要它：O-2 承诺「`config` 时携带最近一次失败的 `code`/`msg`」，而今天这句话在回落链上
+# **没有任何一处宿主**——失败信息被连续四次丢弃（`_normalize_trade_fee({}) → None` ⇒
+# 取数函数的 `dict | None` 老签名没有第二个格子 ⇒ `FeeRateCache.refresh` 的
+# `except … logger.debug` ⇒ `FeeRateCache.wire()` 在无快照时整段返回 `None`）。也就是说，在本轮
+# 唯一真实发生的那个场景里（1,524/1,524 全败），`aiStats.feeRates` 这个键**根本不存在**。
+
+
+@dataclass(frozen=True)
+class FeeAttemptError:
+    """费率阶梯上**一跳**的失败事实（不可变；四个字段都可能是「不知道」）。
+
+    `rung`：`"family"` | `"type"` —— 这一跳发的是哪一组参数。
+    `http_status`：`None` = 传输层失败（那里确实没有状态码，编一个进去就是造第二句假话）。
+    `code` / `msg`：OKX 回执里它自己说的话（A-1 之前它们被整个丢弃）。
+    """
+
+    rung: str
+    http_status: int | None = None
+    code: str = ""
+    msg: str = ""
+
+    def wire(self) -> dict:
+        """camelCase 只读回执（进 `aiStats.feeRates.lastError` 与启动回执）。"""
+        return {"rung": self.rung, "httpStatus": self.http_status,
+                "code": self.code, "msg": self.msg}
+
+
+@dataclass(frozen=True)
+class FeeFetchOutcome:
+    """一次费率取数的完整结果：归一后的 wire（失败即 `None`）+ **每一跳**的失败原因。
+
+    `errors` 为空即成功。它是 A-5 的核心——「交易所到底说了什么」这条本轮的核心产出，
+    必须有一个能一路带到界面的容器，否则它会在第一个 `return None` 上蒸发。
+    """
+
+    wire: dict | None = None
+    errors: tuple[FeeAttemptError, ...] = ()
+
+    @property
+    def last_error(self) -> FeeAttemptError | None:
+        """最后一跳的失败（界面只显示这一条：它是离「真正的原因」最近的那个）。"""
+        return self.errors[-1] if self.errors else None
 
 
 class Candle(BaseModel):
