@@ -162,6 +162,63 @@ def format_direction_charter(enabled: bool) -> str:
     )
 
 
+def format_trend_charter(bar: str, rule) -> str:
+    """系统 prompt 的**趋势基调条款**（execution-trend-verdict §3.4.3 a）；未装配 ⇒ **空串垫片**。
+
+    与既有六段宪章逐字同构（`base_rules.format_charter` / `format_direction_charter` 等），故零新
+    机制：空串 ⇒ 两条脊柱的拼接结果与本特性合入前逐字节相同。
+
+    它是**软引导层**：硬保证在轴 D 的三条确定性调制通路与《审议协议》S1/S2/S12 的 mandate。
+    三者缺一不可——只改协议，模型说了偏空也开不出空单；只改门禁，模型从来不说偏空。
+
+    `rule` 刻意**不加类型注解**：模块级引用 `trend_verdict` 会造出
+    `trend_verdict -> signals -> prompts -> trend_verdict` 的 import 环（`contrarian_schema` 的
+    同款处置）。本函数只读它的总闸。
+
+    Args:
+        bar: 用户所选执行周期（判定所在的级别）。
+        rule: `trend_verdict.TrendVerdictRule` 或 `None`。
+
+    Returns:
+        条款正文；`rule` 为 None / 总闸关 / `bar` 为空 ⇒ `""`。
+    """
+    if rule is None or not getattr(rule, "enabled", False) or not bar:
+        return ""
+    return (
+        f"**趋势基调条款**：你正在交易 {bar} 级别，因此本轮的方向基调**判定在 {bar} 上**。"
+        f"系统每轮会给你一份《本轮趋势基调》：它综合了 {bar} 的体制结构、均线结构、净变化、"
+        "区间结构与动量，并把更高周期作为**权重受限的调制项**——高周期可以削弱这份基调的强度，"
+        f"但**不能替你决定 {bar} 的方向**。"
+        "基调为偏多时，你的开仓应优先考虑做多；基调为偏空时，应优先考虑做空。"
+        "这是起点，不是命令：你可以逆着基调开仓，但必须在 S12 指名是哪一条 "
+        f"{bar} 级别的证据强到足以推翻它，并接受更高的置信度门槛与强制降档。"
+        "基调为中性 / 不可用时，本条款不产生任何偏好。"
+    )
+
+
+def _trend_read_order(trend_bar: str) -> str:
+    """决策纪律 #1 的多周期读序子句（**整条**，含尾部逗号）。
+
+    ⚠️ 收成一个函数、两态各给逐字全文，是**刻意的**（评审 RP1-4）：v1 只说「插在某句之后、
+    并把原句改写为其续写」，按字面实现会渲染出「…再按 1D -> 12H -> 4H -> 1H 把中线背景当作
+    佐证来读，**先按 1D -> 12H -> 4H -> 1H 研判中线背景**…」——同一句读序连说两遍且互相矛盾。
+    原句**不再以字面量出现在脊柱里**：它搬进了本函数的 disarmed 分支，那是它唯一的落点，
+    因此不可能出现「两句读序同时在场」。
+
+    Args:
+        trend_bar: 执行周期名；**空串 ⇒ 返回合入前的原句，逐字节回退**（G-1 的 sha256 冻结据此成立）。
+
+    Returns:
+        整条读序子句（含尾部的中文逗号）。
+    """
+    if not trend_bar:
+        return "先按 1D → 12H → 4H → 1H 研判中线背景、趋势一致性、候选支撑阻力与超买/超卖，"
+    return (f"先在执行周期 {trend_bar} 上给出本轮趋势基调（方向 + 强度 + 最强反证），"
+            "再按 1D → 12H → 4H → 1H 把中线背景、趋势一致性、候选支撑阻力与超买/超卖当作对该"
+            "基调的**佐证**来读——高周期可以削弱这份基调的强度，"
+            f"但不能替你决定 {trend_bar} 的方向，")
+
+
 def _render_spine_zh(inst_id: str, bar: str, budget_usd: float, leverage: float, *,
                      texts: SystemPromptTexts, options: SystemPromptOptions) -> str:
     """中文脊柱（`off` 档的真源）。
@@ -175,7 +232,12 @@ def _render_spine_zh(inst_id: str, bar: str, budget_usd: float, leverage: float,
     charter = "".join(
         f"{text}\n\n" for text in
         (texts.base_rules_text, texts.profit_guard_text, texts.sizing_text,
-         texts.cost_text, texts.horizon_text, texts.direction_text) if text)
+         texts.cost_text, texts.horizon_text, texts.direction_text,
+         texts.trend_text) if text)
+    # 读序子句的装配判据**只有一个**：第七段宪章装没装（`texts.trend_text`）。绝不另读一次
+    # settings——两处各读一次必漂移，而这里漂移的表现是「宪章说基调判在 15m、纪律 #1 却仍
+    # 要求先读日线」，且不报任何错。`bar` 本就是本函数的形参，故零新字段（评审 RP1-4 的收口）。
+    trend_bar = bar if texts.trend_text else ""
     return (
         "你是一名严谨、纪律性极强的加密合约自动交易决策者。你不是聊天助手，也不是信号复读机——你的"
         f"**唯一职责**是在每个决策轮，为标的 {inst_id}（周期 {bar}）做出一个受严格约束的交易决策。"
@@ -186,8 +248,8 @@ def _render_spine_zh(inst_id: str, bar: str, budget_usd: float, leverage: float,
         "自己下判断**——你有权采纳、存疑或**推翻**任何单一信号。\n\n"
         f"{charter}"
         "决策纪律：\n"
-        "1. **每轮必须先输出一段分步骤的研判（思维链）**。输入提供可用多周期证据时，先按 "
-        "1D → 12H → 4H → 1H 研判中线背景、趋势一致性、候选支撑阻力与超买/超卖，"
+        "1. **每轮必须先输出一段分步骤的研判（思维链）**。输入提供可用多周期证据时，"
+        f"{_trend_read_order(trend_bar)}"
         f"{_tactical_discipline(texts.tactical_bars_text)}再依次思考："
         "① 价格走势（方向、动量、均线结构、"
         "区间位置）；② 成交量（量能、量比、放缩、异常放量）；③ 市场体制（趋势/震荡/高低波动/事件）；"
@@ -655,6 +717,22 @@ def _format_tactical(payload: dict) -> list[str]:
                                       max_chars=int(context.get("maxChars") or 0))
 
 
+def _trend_verdict_lines(payload: dict) -> list[str]:
+    """《本轮趋势基调》段；`payload["trendVerdict"]` **键缺席** ⇒ 空表（整段省略，逐字节回退）。
+
+    档位与 `_multi_timeframe_lines` / `_digest_lines` 的既有姿态逐字同构：重复轮
+    （`contextDisclosure == "repeat"`）压成两行，其余情形全量——RK-4 承诺的「压缩轮同样压缩
+    基调段」就落在这一行上（评审 RP1-11）。
+    """
+    verdict = payload.get("trendVerdict")
+    if not verdict:
+        return []
+    from .trend_text import format_trend_verdict_for_prompt   # 延迟导入，同 _format_tactical
+
+    tier = "brief" if payload.get("contextDisclosure") == "repeat" else "full"
+    return format_trend_verdict_for_prompt(verdict, tier)
+
+
 def _multi_timeframe_lines(payload: dict) -> list[str]:
     """中线背景段：重复轮压缩成表头 + 一句说明，其余情形逐字节沿用既有全量渲染。"""
     context = payload.get("multiTimeframeContext")
@@ -858,8 +936,11 @@ def build_decision_prompt(payload: dict) -> str:
         f"决策轮 #{payload.get('round')}｜barTs={payload.get('barTs')}｜最新价={payload.get('lastPx')}"
         # 唤醒原因优先（七态结构化措辞）；`wake` 键缺席时逐字节回退既有二值触发源标注。
         + (_format_wake(payload.get("wake")) or _trigger_suffix(payload.get("trigger"))),
-        _format_position(payload.get("position")),
     ]
+    # 轴 B：《本轮趋势基调》是本轮**第一段实质证据**——「第一步」在证据排序上的兑现。
+    # 键缺席 ⇒ 空表 ⇒ 整段省略 ⇒ 与本特性合入前逐字节相同（G-1 / S-5 的零回归路径）。
+    parts.extend(_trend_verdict_lines(payload))
+    parts.append(_format_position(payload.get("position")))
     guard_line = _format_profit_guard(payload.get("profitGuard"))
     if guard_line:                           # 键缺失时整段省略（零回归；未装配的会话无此键）
         parts.append(guard_line)
@@ -960,7 +1041,8 @@ REFLECTION_TOOL_DESCRIPTION = (
 )
 
 
-def build_reflection_system_prompt(horizon_text: str = "", reasoning_text: str = "") -> str:
+def build_reflection_system_prompt(horizon_text: str = "", reasoning_text: str = "",
+                                  trend_bar: str = "") -> str:
     """反思复核官系统 prompt：分级复核标准（有名有姓才否决，收缩优先），只可收紧，收尾必调反思工具。
 
     hold-inertia-fix F1：删除「任何不放心即 abort（宁可错过不可做错）」的不对称保守标准——它把 abort
@@ -981,7 +1063,7 @@ def build_reflection_system_prompt(horizon_text: str = "", reasoning_text: str =
     轴 B 整条死掉的死路（spec §3.2 / P0-5，装配判据见用例 S-7 / S-9）。
     """
     if reasoning_text:
-        return render_review_spine_en(reasoning_text, horizon_text)
+        return render_review_spine_en(reasoning_text, horizon_text, trend_bar)
     return (
         "你是一名独立的下单前风控复核官。刚才另一名交易员基于同样的证据给出了一个**交易决策**（会真实"
         "下单、动用真金）。你的职责**不是**重新交易，而是**批判性地复核这个决策是否稳健**："
@@ -992,7 +1074,8 @@ def build_reflection_system_prompt(horizon_text: str = "", reasoning_text: str =
         "1. **默认立场**：提议决策与证据大体一致、风险敞口可控 → `confirm`；仅对仓位偏重有疑虑 → "
         "**优先**用 `confirm` + `adjustedSizeFraction` 收缩仓位（收缩是你的首选保守工具，而非 abort）。\n"
         "2. **abort 门槛**：仅当你能**指名一条实质性缺陷**时才 `abort`——(a) 方向与关键证据直接矛盾；"
-        "(b) 与更高周期背景强冲突且决策未给出对冲理由；(c) 当前持仓与会话盈亏下新增敞口不可接受；"
+        f"(b) {_review_conflict_clause(trend_bar, '与更高周期背景强冲突且决策未给出对冲理由')}；"
+        "(c) 当前持仓与会话盈亏下新增敞口不可接受；"
         "(d) 明显追高/杀跌/频繁反手；(e) 证据严重不足却重仓。`reason` 必须引用具体证据；"
         "「泛化的不放心」不构成否决理由。\n"
         "3. **机会成本对称**：错过一笔证据充分的交易与做错一笔交易同样是损失；你的职责是拦截"
@@ -1002,6 +1085,37 @@ def build_reflection_system_prompt(horizon_text: str = "", reasoning_text: str =
         "收尾必须且只能调用一次 `submit_trade_reflection` 提交裁决——绝不允许只输出复核文字而不调用工具。"
         f"{horizon_text}"
     )
+
+
+def _review_conflict_clause(trend_bar: str, legacy: str) -> str:
+    """复核官评级标准 (b) 的**条件化**子句（execution-trend-verdict 轴 C′ / 评审 RP0-4）。
+
+    根因 R-5：反思复核官位于整条决策链的**最下游**（共识与 edge 门禁之后、真实下单之前），
+    而它的评级标准逐字写着「与**高周期**强冲突且无对冲理由 ⇒ abort」。于是本特性的目标断面会
+    走出这样一条完整链路：15m 翻空 → 基调判偏空 → 模型据此提议 open_short → 前面每一层全部
+    放行 → 复核官按「与高周期冲突」abort。它不是 bug，是复核官**被明文要求**做的事。
+
+    修法是**条件化**而不是删除：与高周期冲突，只有在**同时与执行周期基调冲突**时才算实质性
+    缺陷。复核官「只能收紧、不能改方向、不能放大、abort 须指名实质性缺陷、fail-closed」这五条
+    安全语义**一个字节不动**。
+
+    ⚠️ **`legacy` 由调用方传入**：本条在中文侧有**两份措辞不同**的镜像——复核官系统 prompt 写的
+    是「与更高周期背景强冲突且决策未给出对冲理由」，而反思任务 prompt 的散文写的是「与高周期强
+    冲突且无对冲理由」。共用一个写死的 disarmed 串会让其中一处在总闸关时**静默改文案**，而
+    sha256 冻结门禁恰好只守另一处。armed 文本两处共用同一句（它们说的是同一条判据）。
+
+    Args:
+        trend_bar: 本轮执行周期名；**空串 ⇒ 原样返回 `legacy`，逐字节回退**（用例 P-9 冻结）。
+        legacy: 该调用点在合入前的**逐字原句**。
+
+    Returns:
+        (b) 条的正文（不含编号与分隔符）。
+    """
+    if not trend_bar:
+        return legacy
+    return (f"与**{trend_bar} 执行周期趋势基调**强冲突且无对冲理由"
+            f"（仅与更高周期冲突、但顺着 {trend_bar} 基调的提议，**不**构成缺陷——那处分歧已经"
+            "在基调段里如实披露过一次，不再第二次构成否决理由）")
 
 
 def _format_reflection_decision(decision) -> str:
@@ -1023,6 +1137,11 @@ def build_reflection_prompt(payload: dict, decision) -> str:
     决策一次性传入，让复核官在同一证据面上独立批判研判（ai-trade-pre-trade-reflection §八 RV-5 落地）。
     """
     evidence = build_decision_prompt(payload)
+    # 轴 C′：基调段**自动**进入复核官视野（本行就是 `build_decision_prompt(payload)`，反思用的是
+    # 同一个 payload）。这条连锁通路本轮正好是我们想要的，但**必须被用例钉死而不是碰巧成立**
+    # （market-intel 那轮吃过一次亏：改决策 prompt 会同时改反思 prompt）。
+    # `trend_bar` 从**当轮 payload** 现取，绝不再读一次 settings——键缺席 ⇒ 空串 ⇒ 原句逐字保留。
+    trend_bar = str((payload.get("trendVerdict") or {}).get("bar") or "")
     # L2 反例段（经验层 W-12）：**必须自带足够的自解释**——当轮档位可能是 `repeat`，复核官看到的
     # L0 只是一行压缩形态，任何「见上文第 N 条」的引用都会指向已被压缩掉的内容（§4.8）。
     counter = _format_experience_counter(payload.get("experienceCounter"))
@@ -1036,7 +1155,8 @@ def build_reflection_prompt(payload: dict, decision) -> str:
         "请以资深风控/交易员的批判视角复核上述交易决策是否稳健（方向、与高周期背景是否冲突、当前持仓与"
         "会话盈亏下风险敞口是否可接受、仓位是否偏重、有无证据不足强行交易）。提议决策与证据大体一致即 "
         "`confirm`；对仓位偏重有疑虑时**优先**以 `confirm` + `adjustedSizeFraction` 收缩；仅当能指名一条"
-        "实质性缺陷（方向与关键证据矛盾 / 与高周期强冲突且无对冲理由 / 敞口不可接受 / 明显追高杀跌频繁"
+        "实质性缺陷（方向与关键证据矛盾 / "
+        f"{_review_conflict_clause(trend_bar, '与高周期强冲突且无对冲理由')} / 敞口不可接受 / 明显追高杀跌频繁"
         "反手 / 证据严重不足却重仓）时才 `abort`，`reason` 须引用具体证据。错过一笔证据充分的交易与做错"
         "一笔同样是损失；只能收紧、不得放大或改向。"
         f"你的**唯一任务**是必须且只能调用一次 {REFLECTION_TOOL_NAME} 提交裁决——不得只输出复核文字，"

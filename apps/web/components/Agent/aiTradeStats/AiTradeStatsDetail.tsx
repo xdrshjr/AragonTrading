@@ -6,6 +6,7 @@ import { PeriodReturnBars, UnderwaterChart } from "@/components/Chart/aiBacktest
 import AutoTradeRoundTripRow from "@/components/Chart/AutoTradeRoundTripRow";
 import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
 import DirectionBalanceCard from "./DirectionBalanceCard";
+import TrendAlignmentCard from "./TrendAlignmentCard";
 import ExitSourceCard from "./ExitSourceCard";
 import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
 import WakeAttributionCard from "./WakeAttributionCard";
@@ -162,6 +163,10 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
               故挂在这里。数据源是落库的 `aiStats.openFunnel`——与实时侧同形同源（`build_funnel_stats`
               整体带上 `bySide` / `directionBalance`，零 DB 迁移）。老记录缺键 ⇒ 整卡不渲染。 */}
           <DirectionBalanceCard funnel={aiStats?.openFunnel} />
+          {/* 顺势 / 逆势（execution-trend-verdict §3.7.5）：数据源是**落库**的
+              `aiStats.trendVerdict`——与实时页那张卡同形同源（同一次 `stats_wire()` 的产物，
+              零 DB 迁移）。老记录缺键 ⇒ 整卡不渲染。 */}
+          <TrendAlignmentCard stats={aiStats?.trendVerdict} />
 
           <WakeAttributionCard trips={ledger} />
 

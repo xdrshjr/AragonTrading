@@ -291,6 +291,8 @@ export interface AiTradeDecision {
   analysis?: string | null;               // R1：研判思维链有界摘录（≤400 字；完整全文见 agentTraces）
   marketDigest?: MarketDigest | null;     // R1：价格走势/成交量/因子证据摘要（可为 null）
   multiTimeframeContext?: MultiTimeframeContext | null;
+  // 执行周期趋势基调（execution-trend-verdict §3.7.4）：未装配 / 老事件 ⇒ null 或缺席。
+  trendVerdict?: AiTradeTrendVerdict | null;
   trigger?: "candle" | "interval";        // wake-interval：唤醒来源（K 线唤醒 / 墙钟定时唤醒）
   // 唤醒感知上下文（wake-aware-context §4.3）：总闸关闭 / 老事件 → null 或缺席。
   wake?: WakeInfo | null;
@@ -997,6 +999,8 @@ export interface AiTradeTraceEvent {
   consensus?: Consensus | null; // round_start
   marketDigest?: MarketDigest | null; // round_start（R1：价格走势/成交量/因子证据摘要）
   multiTimeframeContext?: MultiTimeframeContext | null; // round_start（决策级中线背景）
+  // round_start：执行周期趋势基调（execution-trend-verdict §5.2）。未装配 ⇒ null。
+  trendVerdict?: AiTradeTrendVerdict | null;
   profitGuard?: ProfitGuardSnapshot | null; // round_start：利润保护断面（未装配→ null）
   // round_start：保护性平仓冷却期（未激活→ null）。轨迹上「本轮为什么被降级」靠它自解释。
   profitGuardCooldown?: ProfitGuardCooldown | null;
@@ -1087,6 +1091,9 @@ export interface AiTradeTraceEvent {
   // **标签必须由后端下发**（`discipline._THRESHOLD_LABELS` 的成文纪律）——前端抄一份，下次加
   // 一层就会把 `consensus` 这样的英文 key 怼到用户脸上。总闸关 / 老快照 ⇒ 缺席 ⇒ 逐字回退。
   layerLabel?: string | null;
+  // tool_call：趋势基调闸的判定快照（execution-trend-verdict §5.3）。本层没判过（`exempt`）/
+  // 未装配 ⇒ 整键缺席 ⇒ 前端逐字回退。
+  trendGate?: AiTradeTrendGate | null;
   // reflection_verdict：反思**之后**才定型的最终离场档位（含 `adjudicated` / `failOpenReason`）。
   // **刻意不新开 `exit_priority` 相位**：那要付出四处逐键手抄的代价，而漏抄不会报错、只会静默
   // 功能缺失（R-9）。非反思轮读 `horizonWire.exitPriority`（整对象透传的那一份）即可。
@@ -1104,6 +1111,9 @@ export interface AiTradeRoundTrace {
   consensus?: Consensus | null;
   marketDigest?: MarketDigest | null; // R1：价格走势/成交量/因子证据摘要（round_start 承载）
   multiTimeframeContext?: MultiTimeframeContext | null;
+  // 执行周期趋势基调（§3.7.4-4）：**必须与 emptyRoundTrace 的逐键手抄保持一致**——
+  // 漏抄这一键，后端发什么前端都收不到，且 tsc / vitest 都不会红。
+  trendVerdict?: AiTradeTrendVerdict | null;
   trigger?: "candle" | "interval"; // wake-interval：唤醒来源（供 describeTrigger 区分周期唤醒）
   // 唤醒感知上下文（wake-aware-context §3.3）：三总闸全关的会话恒为 null ⇒ 轮头与战术块整段回退。
   // **必须与 emptyRoundTrace 的逐键手抄保持一致**——漏一个键，后端发什么前端都收不到。
@@ -1202,6 +1212,9 @@ export interface AiTradeRoundTrace {
   // directional-symmetry B-3：与上面三键**同为逐键手抄**——`emptyRoundTrace` 与
   // `reduceRoundPhase` 的 `case "tool_call"` 两处都要写，漏抄不报错、只会安静地什么都不显示。
   layerLabel?: string | null;
+  // 趋势基调闸（§3.7.4-5）：`trendGate` 走 `tool_call` 相位、`trendVerdict` 走 `round_start`
+  // 相位，是**两条不同的手抄轨**，不可互相顶替。
+  trendGate?: AiTradeTrendGate | null;
   exitPriority?: AiTradeExitPriorityWire | null;
   state: "deciding" | "done" | "skipped" | "error";
 }
@@ -1274,6 +1287,10 @@ export interface AiTradeSessionRow {
   // 未装配 / 零样本 / 老后端 ⇒ null 或 undefined ⇒ 各自的卡片整段不渲染。
   tradability?: AiTradeTradabilitySnapshot | null;
   openFunnel?: AiTradeOpenFunnel | null;
+  // 执行周期趋势基调统计（execution-trend-verdict 评审 RP1-2）：**必须与 `openFunnel` 并列**
+  // ——实时页读的是这份成员级 status 快照，历史详情页读的才是落库的 `aiStats.trendVerdict`；
+  // 只声明一处会让另一页那张卡恒为空。未装配 / 零样本 ⇒ null ⇒ 整卡不渲染。
+  trendVerdict?: AiTradeTrendStats | null;
   summaryHealth?: AiTradeSummaryHealth | null;
   // 会话级已实现读数（realized-edge-calibration 轴 A）：挂 `_status_payload` **顶层**而不是
   // `costSnapshot` 之下——后者只在 `k_min<=0`（门禁空转）时才发，装了纪律预设的会话一次都收不到。
@@ -1346,6 +1363,10 @@ export interface AiTradeStatusEvent {
   // 未装配 / 零样本 / 老后端 ⇒ null 或 undefined ⇒ 各自的卡片整段不渲染。
   tradability?: AiTradeTradabilitySnapshot | null;
   openFunnel?: AiTradeOpenFunnel | null;
+  // 执行周期趋势基调统计（execution-trend-verdict 评审 RP1-2）：**必须与 `openFunnel` 并列**
+  // ——实时页读的是这份成员级 status 快照，历史详情页读的才是落库的 `aiStats.trendVerdict`；
+  // 只声明一处会让另一页那张卡恒为空。未装配 / 零样本 ⇒ null ⇒ 整卡不渲染。
+  trendVerdict?: AiTradeTrendStats | null;
   summaryHealth?: AiTradeSummaryHealth | null;
   // 会话级已实现读数（realized-edge-calibration 轴 A）：挂 `_status_payload` **顶层**而不是
   // `costSnapshot` 之下——后者只在 `k_min<=0`（门禁空转）时才发，装了纪律预设的会话一次都收不到。
@@ -1447,6 +1468,9 @@ export interface AiTradeGroupStartReq {
   experience?: import("./experienceTypes").AiTradeExperienceRule | null;
   // 方向对称性 / 逆势通路（字段省略→服务端按 settings 与纪律预设装配）。
   direction?: AiTradeDirectionRule | null;
+  // 执行周期趋势基调（execution-trend-verdict §5.1）：整键缺省 ⇒ 服务端按 settings 装配
+  // 开启态；`{enabled:false}` 是显式关闭的唯一途径。实盘与回测两侧同一解析点。
+  trend?: AiTradeTrendRule | null;
 }
 
 // 分组成员行（start 回执 / status 视图共用）：完整会话行 + 分配占比。
@@ -2094,6 +2118,97 @@ export interface AiTradeDirectionBalance {
   contrarianPassed: number;          // 走逆势通路放行的轮数（**不是**降级）
   minSamples: number;                // 判「样本不足」的下界（后端下发，前端不硬编码）
   verdict: AiTradeDirectionVerdict;
+}
+
+// ---- 执行周期趋势基调（ai-trade-execution-trend-verdict §3.2.4 / §5.3 / §5.4）----
+export type AiTradeTrendDirection = "up" | "down" | "range" | "unknown";
+export type AiTradeTrendBias = "long" | "short" | "neutral";
+export type AiTradeTrendStrength = "strong" | "moderate" | "weak";
+export type AiTradeTrendConflict = "none" | "htf_conflict" | "tactical_conflict" | "both";
+export type AiTradeTrendAlignment = "aligned" | "counter" | "neutral";
+
+export interface AiTradeTrendComponent {
+  key: string;
+  label: string;
+  /** `null` = 该成分不可用（**绝不补猜**，也绝不当成中性 0 计入分母）。 */
+  score: number | null;
+  weight: number;
+  detail: string;
+}
+
+export interface AiTradeTrendVerdict {
+  bar: string;                       // 判定所在的级别 = 用户所选执行周期
+  asOfTs: number;
+  /** 含高周期调制的合成分 ⇒ 决定 `direction`；降级轮为 null。 */
+  score: number | null;
+  /** **只由执行周期五项**合成 ⇒ 决定 `strength`（高周期不参与，评审 RP0-3）。 */
+  execScore: number | null;
+  direction: AiTradeTrendDirection;
+  bias: AiTradeTrendBias;
+  strength: AiTradeTrendStrength;
+  /** **纯呈现**，绝不参与任何门禁判定（判据一律取模型自报的 `modelConfidence`）。 */
+  verdictConfidence: number | null;
+  components: AiTradeTrendComponent[];
+  missing: string[];
+  availableWeight: number;
+  execAvailableWeight: number;
+  higherTimeframe: {
+    status: string | null;
+    agree: boolean | null;
+    bullishBars: string[];
+    bearishBars: string[];
+  };
+  tacticalAlignment: string | null;  // 回测侧结构性缺席 ⇒ 恒 null
+  conflict: AiTradeTrendConflict;
+  bonusWithheld: boolean;            // 冲突 ⇒ 撤销两条放宽通路（**只收紧、不放松**）
+  counterGate: { armed: boolean; minConfidence: number | null; sizeMult: number | null };
+  degraded: boolean;
+  degradeReason: string | null;
+}
+
+/** `tool_call` 相位的基调闸判定快照；本层没判过（`exempt`）⇒ 整键缺席。 */
+export interface AiTradeTrendGate {
+  lane: "exempt" | "aligned" | "counter" | "veto";
+  alignment: AiTradeTrendAlignment;
+  strength: AiTradeTrendStrength | null;
+  score: number | null;
+  execScore: number | null;
+  minConfidence: number;
+  /** ★ 判据取这个（**模型自报**置信度）。 */
+  modelConfidence: number | null;
+  /** ★ 纯呈现，绝不参与判定——两个 confidence 必须各有其名，取错方向相反。 */
+  verdictConfidence: number | null;
+  sizeMult: number;
+  sizeBefore: number | null;
+  sizeAfter: number | null;
+  reason: string | null;
+}
+
+/** 会话统计（`aiStats.trendVerdict` 与成员级 `status.trendVerdict` 是**同一份** wire）。 */
+export interface AiTradeTrendStats {
+  armed: boolean;
+  bar: string | null;
+  verdictRounds: Record<AiTradeTrendDirection, number>;
+  /** 第三格叫 `unknown` 而不是 `neutral`（与 `openFunnel` 的 `SIDES` 同姿态）。 */
+  intents: Record<AiTradeTrendAlignmentBucket, number>;
+  counterBlocked: { confidence: number; size: number };
+  counterPassed: number;             // 逆势**放行**（不是降级，绝不并进 counterBlocked）
+  bonusLanes: Record<string, number>;
+  filled: Record<AiTradeTrendAlignmentBucket, number>;
+  netPnlUsd: Record<AiTradeTrendAlignmentBucket, number>;
+  minSamples: number;
+}
+
+export type AiTradeTrendAlignmentBucket = "aligned" | "counter" | "unknown";
+
+/** 趋势基调的启动入参镜像（§5.1）；三把子闸的极性分开，运维可只回退「变宽」的那一半。 */
+export interface AiTradeTrendRule {
+  enabled: boolean;
+  counterGateEnabled?: boolean | null;
+  counterMinConfidence?: number | null;
+  counterSizeMult?: number | null;
+  consensusVoteEnabled?: boolean | null;
+  contrarianAllowanceEnabled?: boolean | null;
 }
 
 // 方向对称性 / 逆势通路的启动入参与回执镜像（§7.1）。

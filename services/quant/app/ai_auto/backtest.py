@@ -91,7 +91,8 @@ from .profit_guard_bar import BarFacts, evaluate_bar
 from .profit_guard_text import format_profit_guard_charter
 from ..agent.llm.factory import make_llm_client_from_config
 from .llm_budget import build_ai_trade_llm_clients
-from .prompts import build_ai_trade_system_prompt, format_direction_charter
+from .prompts import (build_ai_trade_system_prompt,
+                      format_direction_charter, format_trend_charter)
 from .prompts_en import SystemPromptOptions, SystemPromptTexts
 from .reasoning_protocol import build_deliberation_protocol, resolve_depth_profile
 from .reflection import apply_reflection, build_reflection_note
@@ -109,6 +110,15 @@ from .signals import (
 )
 from .sizing_runtime import SizingContext, build_sizing_runtime
 from .sizing_text import SIZING_BACKTEST_NOTE
+from .trend_verdict import (
+    TrendInputs,
+    apply_trend_bias_gate,
+    build_trend_verdict,
+    trend_bonus_lane,
+    trend_consensus_bonus,
+    trend_contrarian_allowance,
+    trend_rule_from_settings,
+)
 from .turnover_discipline import rule_from_horizon as turnover_rule_from_horizon
 
 logger = logging.getLogger(__name__)
@@ -263,6 +273,14 @@ class AiBacktestRunner:
         self._consensus_rule = replace(consensus_rule_from_settings(self.settings),
                                        min_consensus=self.min_consensus)
         self._contrarian_used = 0
+        # 执行周期趋势基调（execution-trend-verdict 轴 F）：与实盘**同一个纯核心、同一个解析
+        # 点**。回测走独立总闸 `ai_trade_trend_verdict_backtest_enabled`（沿用 horizon /
+        # profit_guard 的既有先例）：两把闸任一关 ⇒ 规则不装配 ⇒ payload / 两段 prompt / 门禁
+        # 全链路逐字节回退。
+        self._trend_verdict: dict | None = None   # 轮级：`_build_payload` 每轮覆盖
+        self._trend_rule = trend_rule_from_settings(self.settings)
+        if not self.settings.ai_trade_trend_verdict_backtest_enabled:
+            self._trend_rule = replace(self._trend_rule, enabled=False)
         self.rest = spec.rest
         self.position_step_pct = spec.position_step_pct   # 档位吸附（实盘/回测经共享决策脑单点收口，§2.3）
         # 下单前二次反思（RV-1：经数据类字段传参，__init__ 一次性构造决策器时接收；默认关 → 直接构造
@@ -355,11 +373,16 @@ class AiBacktestRunner:
                         reserve_tokens=self.settings
                         .ai_trade_reasoning_reserve_tokens,
                         symmetry=self.settings
-                        .ai_trade_directional_symmetry_enabled),
+                        .ai_trade_directional_symmetry_enabled,
+                        # 趋势基调的 S1/S2/S12（轴 C）：与实盘同源同参。空串 ⇒ 逐字节回退。
+                        trend_bar=(self.bar if self._trend_rule.enabled else "")),
                     # 方向对称宪章章（轴 C-2）：与实盘同源——两处只填一处，用户拿回测调出来的
                     # 方向对称行为在实盘就会失真（`base_rules` P1-4 的成文教训）。
                     direction_text=format_direction_charter(
                         self.settings.ai_trade_directional_symmetry_enabled),
+                    # 趋势基调宪章（第七段，轴 B）：与实盘同源——两处只填一处，用户拿回测调
+                    # 出来的基调行为在实盘就会失真（`base_rules` P1-4 的成文教训）。
+                    trend_text=format_trend_charter(self.bar, self._trend_rule),
                     # 铁律宪章同源注入；未装配 → "" ⇒ 渲染逐字节不变
                     base_rules_text=format_charter(self.base_rule),
                     # 利润保护宪章同源注入（F3）；未装配 → "" ⇒ 同上零回归
@@ -892,9 +915,22 @@ class AiBacktestRunner:
             decision, None, position_side=self.main.pos.side, now_wall=float(ts))
         backstop_reason = None   # 轴 B 不在回测装配：回测没有交易所，恒 None（形状仍与实盘同构）
         decision, brake_reason = self._sizing.gate(decision, None, now_wall=float(ts))  # ★ 刹车（第 7 步）
+        # ★ 趋势基调·逆势门槛（execution-trend-verdict 轴 D-2）：与实盘**同一纯核心、同位插入**
+        # （刹车后、共识前）。未装配 ⇒ 原样直通（`is` 相等）。
+        trend_out = apply_trend_bias_gate(decision, self._trend_verdict, self._trend_rule,
+                                          position_step=self.position_step_pct)
+        decision, trend_reason = trend_out.decision, trend_out.reason
+        # ★ 两条顺势放宽通路（轴 D-1a / D-1b）：与实盘同源同参，**首参同样是本轮动作**（RP0-1）。
+        trend_lane = trend_bonus_lane(decision.action, self._trend_verdict, consensus,
+                                      self._trend_rule)
         consensus_out = resolve_consensus_gate(
             decision, consensus, self._consensus_rule,
-            position_step=self.position_step_pct, used_contrarian=self._contrarian_used)
+            position_step=self.position_step_pct, used_contrarian=self._contrarian_used,
+            bonus_votes=trend_consensus_bonus(decision.action, self._trend_verdict, consensus,
+                                              self._trend_rule),
+            opposing_allowance=trend_contrarian_allowance(decision.action, self._trend_verdict,
+                                                          self._trend_rule),
+            bonus_lane=trend_lane)
         if consensus_out.contrarian_used:
             self._contrarian_used += 1
         decision, consensus_reason = consensus_out.decision, consensus_out.reason
@@ -917,9 +953,13 @@ class AiBacktestRunner:
         # 解释力强于票数），然后换手纪律与兜底覆盖，最后刹车、共识与成本门禁——与实盘
         # `degrade or reason` 的链序逐字同构（[P1-10]：原注释自称「五元」而实为六元，本轮顺手改正
         # 注释，判定式一个字符不动）。
+        # ★ 评审 RP1-9：**九元**合成（本轮由八元扩为九元）。只插调用而不把 `trend_reason` 并进
+        # 这条链，被基调闸拦下的轮会变成「决策是 hold、没有任何降级码」——回测的漏斗与统计当场
+        # 对不上，**且不报任何错**。位置与实盘 `degrade or reason` 的链序逐字同构：刹车之后、
+        # 共识之前，与 `open_funnel.LAYERS` 的层序同构。
         gate_reason = (base_reason or horizon_reason or cooldown_reason
                        or turnover_reason or backstop_reason
-                       or brake_reason or consensus_reason or edge_reason)
+                       or brake_reason or trend_reason or consensus_reason or edge_reason)
         # 二次反思（决策脑不变式：回测复用同一 decider.reflect，emit=None 轨迹全程空转）。verdict 须在分支外
         # 预置 None（RV-3），否则 hold 轮走 else 分支时 _tally_reflection(verdict) 会 NameError。
         verdict = None
@@ -1115,6 +1155,23 @@ class AiBacktestRunner:
         # 未装配 / `off` 档 ⇒ 空串 ⇒ **整键缺席** ⇒ `build_decision_prompt` 逐字节回退。
         if self.decider.depth_name:
             payload["reasoningDepth"] = self.decider.depth_name
+        # ★ 执行周期趋势基调（轴 F-1）：与实盘**同一个纯核心**，入参是同样那四份已算好的 wire。
+        # ⚠️ **两处必须如实披露的回测/实盘差异**（评审 RP2-4，不得写成「逐字同构」）：
+        # 本方法**没有战术周期证据段**（全文无那几个键，也不起唤醒运行时；那是 G-2 的一道
+        # **源码字面扫描**门禁在守的事，故此处刻意不写出那几个 camelCase 键名），故
+        # `tacticalAlignment` 恒为 null、`conflict` 在回测侧永远取不到 `tactical_conflict` /
+        # `both`——轴 D-1b 那条「战术背离即不放宽」的护栏因此在回测里恒不触发，回测会比实盘
+        # **略宽**。该差异已写进 `format_backtest_notes` 的回测说明。
+        # 总闸关（含回测独立总闸）⇒ `None` ⇒ **整键缺席** ⇒ prompt 逐字节回退。
+        self._trend_verdict = build_trend_verdict(TrendInputs(
+            execution_bar=self.bar,
+            regime=payload.get("marketContext"),
+            digest=payload.get("marketDigest"),
+            multi_timeframe=payload.get("multiTimeframeContext"),
+            tactical=None,
+            as_of_ts=int(ts)), self._trend_rule)
+        if self._trend_verdict is not None:
+            payload["trendVerdict"] = self._trend_verdict
         return payload
 
     def _build_multi_timeframe_context(
@@ -1303,7 +1360,25 @@ class AiBacktestRunner:
         notes.extend(format_backtest_notes(self.horizon_rule, BAR_SECONDS[self.bar],
                                            turnover=self._horizon.turnover_rule))
         notes.extend(self._funding_notes())
+        notes.extend(self._trend_notes())
         return notes
+
+    def _trend_notes(self) -> list[str]:
+        """趋势基调层在回测世界的**两条如实披露**（execution-trend-verdict §3.8 / 评审 RP2-4）。
+
+        本轮唯一的产品承诺是「用户在回测里调出来的基调参数在实盘逐字生效」；把一条结构性
+        不可达的差异说成「同构」，会让用户拿回测里的多空比去推断实盘。未装配 ⇒ `[]`。
+        """
+        if not self._trend_rule.enabled:
+            return []
+        return [
+            f"执行周期趋势基调在本次回测中判定在 {self.bar} 上，与实盘**同一个纯核心、同一组"
+            "阈值**（同一个解析点 `trend_rule_from_settings`）。",
+            "⚠ 回测 payload **没有战术周期证据段**（该段在回测侧结构性缺席：回测引擎只有执行"
+            "周期 OHLCV，强行注入日内细粒度数据等于制造未来函数），故基调"
+            "的 `tacticalAlignment` 恒为空、`conflict` 永远取不到「战术背离」这一格——"
+            "「战术背离即不放宽顺势通路」那道护栏在回测里恒不触发，**回测因此比实盘略宽**；"
+            "本次回测的顺势 / 逆势成交比不得直接用于推断实盘。"]
 
     def _funding_notes(self) -> list[str]:
         """资金费口径免责（horizon-acceptance §2.2.4 第 4、5 点 + 本轮轴 B §2.4.4）。

@@ -7,6 +7,7 @@ import ExitSourceCard from "./ExitSourceCard";
 import ExperienceCard from "./ExperienceCard";
 import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
 import DirectionBalanceCard from "./DirectionBalanceCard";
+import TrendAlignmentCard from "./TrendAlignmentCard";
 import OpenFunnelCard from "./OpenFunnelCard";
 import TradabilityCard from "./TradabilityCard";
 import TurnoverBackstopCard, { type RepairPendingState } from "./TurnoverBackstopCard";
@@ -232,6 +233,12 @@ export default function AiTradeStatsLive() {
             漏斗说「被哪一层拦下」，本卡说「拦掉的是哪个方向」。老会话 / 总闸关 ⇒ 整卡不渲染。 */}
         {Object.values(group.members).map((m) => (
           <DirectionBalanceCard key={`dir-${m.instId}`} funnel={m.session?.openFunnel} />
+        ))}
+        {/* 顺势 / 逆势（execution-trend-verdict §3.7.5）：紧贴方向分布卡下方——两张卡是同一
+            问题的两个切面（「多空意愿比」vs「顺势逆势比与各自的成绩」）。数据源同为**成员级
+            实时快照** `m.session.trendVerdict`（评审 RP1-2：只落 aiStats 会让本页恒空）。 */}
+        {Object.values(group.members).map((m) => (
+          <TrendAlignmentCard key={`trend-${m.instId}`} stats={m.session?.trendVerdict} />
         ))}
         {/* 经验模式（experience-context-graph §7.3）：数据源同为**成员级实时快照**。
             未装配 ⇒ 整卡不渲染（`ExperienceCard` 自己门控），绝不挂一排「—」。 */}

@@ -268,6 +268,89 @@ def _with_symmetry(stages: tuple[ReasoningStage, ...],
                  if stage.id in mandates else stage for stage in stages)
 
 
+# —— 执行周期趋势基调的三处 mandate（ai-trade-execution-trend-verdict 轴 C）——
+#
+# 根因 R-1：协议的第一步锚在高周期，执行周期被降格为「附议」。S1 逐字要求「按 1D -> 12H ->
+# 4H -> 1H 读高周期并给出 dominant regime」，S2 的原文是「说明执行周期与 S1 是否一致，并量化
+# 分歧」，S3 又明令战术周期**绝不能**单独反转 S1。三句连起来的语义是：**基调由高周期产生，
+# 执行周期只能附议或提异议**。而用户的诉求是基调由**他所选的执行周期**产生。
+#
+# S1 是**整体替换**（题面 + mandate），S2 / S12 是**只追加不改写**，故总闸关（`trend_bar=""`）
+# 时 `_render_stages` 的产物与本特性合入前逐字节相同（用例 P-3 冻结）。
+# `id` / `code` **一个字节不改**——它们是稳定契约，前端阶段表与 `STAGE_HEADING_RE` 三处消费者
+# 都按它对拍。
+_TREND_S1_TITLE = "Execution-bar trend verdict, then higher-timeframe corroboration"
+
+
+def _trend_s1_mandate(bar: str) -> str:
+    """S1 的 armed mandate（**整体替换**：基调先行，高周期降为佐证）。"""
+    return (
+        f"First state the trend verdict for the execution bar {bar}, quoting the "
+        "system-supplied 《本轮趋势基调》 block: direction, strength, the continuous score, "
+        "and the single strongest piece of evidence against it. You may disagree with the "
+        f"supplied verdict, but you must say so explicitly and name the {bar} evidence that "
+        "overrides it. Only then read the higher-timeframe context in the order 1D -> 12H -> "
+        "4H -> 1H, and for each frame state trend direction, structure (higher-highs / "
+        "lower-lows / range), the nearest support and resistance with its distance in %, and "
+        "whether RSI is at an extreme. Higher frames are corroboration for the "
+        f"{bar} verdict: they may weaken its strength, they may not by themselves reverse its "
+        f"direction - only stronger evidence on {bar} itself can. Mark any missing or stale "
+        "frame explicitly; never infer a frame that was not given.")
+
+
+def _trend_mandates(bar: str) -> dict[str, str]:
+    """S2 / S12 的 armed **追加**句（原文一字不改，故 disarmed 路径逐字节回退）。"""
+    return {
+        "S2": (" If the structure you have just described contradicts the S1 verdict, "
+               "re-derive the verdict here and state plainly what changed and why; do not "
+               "carry a verdict forward that your own S2 analysis has just falsified."),
+        "S12": (" State the round's trend verdict, whether your chosen action is with it "
+                "(aligned) or against it (counter-trend), and - if counter-trend - the "
+                f"specific {bar} evidence that justifies going against it, together with the "
+                "confidence floor and size multiplier you are accepting."),
+    }
+
+
+def _trend_review_mandates(bar: str) -> dict[str, str]:
+    """R4 的 armed **追加**句（评审 RP0-4：不改它，本特性会死在链路的最后一米）。
+
+    复核官位于整条决策链的**最下游**（共识与 edge 门禁之后、真实下单之前），而它的评级标准与
+    R4 的 mandate 都逐字要求它按「与高周期冲突」否掉提议——正是本特性想放行的那一种单。
+    改的只有「高周期分歧本身算不算一条实质性缺陷」这**一个判据**；复核官「只能收紧、不能改
+    方向、不能放大、abort 须指名实质性缺陷、fail-closed」这五条安全语义**一个字节不动**。
+    """
+    return {
+        "R4": (f" When a trend verdict for the execution bar {bar} was supplied, judge the "
+               "conflict against **that** verdict first. A disagreement with a higher "
+               "timeframe is a substantive defect only when the proposal **also** runs "
+               f"against the {bar} verdict; when the proposal is aligned with the {bar} "
+               "verdict, the higher-timeframe disagreement has already been disclosed in the "
+               "verdict block and is not on its own a reason to abort. Say explicitly which "
+               "of the two cases you are in.")
+    }
+
+
+def _with_trend_first(stages: tuple[ReasoningStage, ...],
+                      bar: str) -> tuple[ReasoningStage, ...]:
+    """把「基调先行」装进 S1（整体替换）与 S2 / S12（追加）；未列出的阶段**原对象直通**。"""
+    appended = _trend_mandates(bar)
+    out: list[ReasoningStage] = []
+    for stage in stages:
+        if stage.id == "S1":
+            out.append(replace(stage, title=_TREND_S1_TITLE, mandate=_trend_s1_mandate(bar)))
+        elif stage.id in appended:
+            out.append(replace(stage, mandate=stage.mandate + appended[stage.id]))
+        else:
+            out.append(stage)
+    return tuple(out)
+
+
+def _with_trend_review(stages: tuple[ReasoningStage, ...],
+                       bar: str) -> tuple[ReasoningStage, ...]:
+    """把 R4 的条件化子句追加进复核协议；未列出的阶段**原对象直通**。"""
+    return _with_symmetry(stages, _trend_review_mandates(bar))
+
+
 _STAGE_HEADING_RULE = (
     "each opened by a line that begins exactly with `## S<k>` (no leading spaces, exactly one "
     "space between `##` and `S`) followed by the stage code")
@@ -335,7 +418,7 @@ def _render_stages(stages: tuple[ReasoningStage, ...]) -> str:
 
 def build_deliberation_protocol(profile: DepthProfile, *,
                                 reserve_tokens: int = DEFAULT_RESERVE_TOKENS,
-                                symmetry: bool = False) -> str:
+                                symmetry: bool = False, trend_bar: str = "") -> str:
     """渲染决策侧《审议协议》正文（`profile.enabled=False` ⇒ 空串 ⇒ 系统 prompt 逐字节回退）。
 
     篇幅、预算、收尾预留三个数一律**现算**（沿用 `format_horizon_charter` 按本会话真实杠杆
@@ -346,10 +429,21 @@ def build_deliberation_protocol(profile: DepthProfile, *,
         reserve_tokens: 留给收尾工具调用的输出 token。
         symmetry: 方向对称性总闸（directional-symmetry C-1）。`False`（默认）⇒ S7 / S10 / S11
             三处 mandate **逐字节回退**；`True` ⇒ 各追加一句方向对称条款。
+        trend_bar: 执行周期趋势基调的总闸兼参数（execution-trend-verdict 轴 C）。
+            **空串（默认）⇒ S1 / S2 / S12 三处 mandate 逐字节回退**（用例 P-3 冻结）；
+            非空 ⇒ S1 整体替换为「基调先行、高周期降为佐证」，S2 / S12 各追加一句。
+
+    ⚠️ **两个总闸的复合顺序必须写死并冻结**（评审 RP1-13）：两者互相独立、四种组合都必须成立。
+    它们的阶段集合不相交（S7/S10/S11 vs S1/S2/S12），故当下顺序不影响产物——但下一轮往任一
+    集合里加一个阶段就会静默改变产物，故顺序不是「随便哪个都行」而是一条被用例 P-4b 冻结的契约。
     """
     if not profile.enabled:
         return ""
-    stages = _with_symmetry(DECISION_STAGES, _SYMMETRY_MANDATES) if symmetry else DECISION_STAGES
+    stages = DECISION_STAGES
+    if symmetry:
+        stages = _with_symmetry(stages, _SYMMETRY_MANDATES)   # S7 / S10 / S11
+    if trend_bar:
+        stages = _with_trend_first(stages, trend_bar)         # S1 / S2 / S12
     total = len(DECISION_STAGES)
     return (
         "# DELIBERATION PROTOCOL - MANDATORY\n\n"
@@ -373,7 +467,8 @@ def build_deliberation_protocol(profile: DepthProfile, *,
         "lost round and the system will fall back to `hold`.**")
 
 
-def build_review_protocol(profile: DepthProfile, *, symmetry: bool = False) -> str:
+def build_review_protocol(profile: DepthProfile, *, symmetry: bool = False,
+                          trend_bar: str = "") -> str:
     """渲染反思侧《对抗式复核协议》正文（`profile.enabled=False` ⇒ 空串 ⇒ 逐字节回退）。
 
     ⚠️ 本文本的**唯一**注入路径是 `decider._stream_reflection` 每轮现造 `system` 时传给
@@ -386,11 +481,22 @@ def build_review_protocol(profile: DepthProfile, *, symmetry: bool = False) -> s
         symmetry: 方向对称性总闸（directional-symmetry C-3）。`True` ⇒ R7 追加「对做空提议
             适用与做多**完全相同**的证据标准」。复核官「只能收紧、不能改方向」的既有语义
             **一个字节都不改**。
+        trend_bar: 执行周期趋势基调（execution-trend-verdict 轴 C′ / 评审 RP0-4）。
+            **空串（默认）⇒ R1–R7 逐字节回退**（用例 P-8 冻结）；非空 ⇒ R4 追加一句
+            **条件化**子句：与高周期冲突，只有在**同时**与执行周期基调冲突时才算实质性缺陷。
+            装配判据是「本轮 payload 里有 `trendVerdict`」，由**唯一**调用点
+            `decider._stream_reflection` 从当轮 payload 现取——绝不再读一次 settings。
+
+    复合顺序与 `build_deliberation_protocol` 同款写死（先 symmetry 后 trend）；两者的阶段集合
+    不相交（R7 vs R4），顺序不影响产物，但顺序本身是被冻结的契约（评审 RP1-13）。
     """
     if not profile.enabled:
         return ""
-    stages = (_with_symmetry(REVIEW_STAGES, _REVIEW_SYMMETRY_MANDATES) if symmetry
-              else REVIEW_STAGES)
+    stages = REVIEW_STAGES
+    if symmetry:
+        stages = _with_symmetry(stages, _REVIEW_SYMMETRY_MANDATES)   # R7
+    if trend_bar:
+        stages = _with_trend_review(stages, trend_bar)               # R4
     total = len(REVIEW_STAGES)
     words = max(1, profile.words_per_stage // 2)   # 复核比研判短，但同样按档位现算
     return (

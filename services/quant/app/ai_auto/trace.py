@@ -177,6 +177,12 @@ def new_round_trace(round_no: int, ts: int, ref_px: float,
         # `AiTradeRoundTrace` 永远拿不到本轮实际喂入的经验 ⇒ 后端发什么前端都收不到，
         # **跑不出错、功能静默缺失**。未装配的会话恒为 None ⇒ 前端整枚徽标不渲染。
         "experience": payload.get("experience"),
+        # 执行周期趋势基调（execution-trend-verdict §3.7.4）：同款**显式取键**装配，漏抄这两键
+        # `AiTradeRoundTrace` 永远拿不到本层数据 ⇒ 后端发什么前端都收不到（跑不出错、功能静默
+        # 缺失）。`trendVerdict` 随 `round_start` 一次装配；`trendGate` 是轮中由
+        # `session._apply_trend_bias_gate` **原地写入**的（走 `tool_call` 相位下发），故初值 None。
+        "trendVerdict": payload.get("trendVerdict"),
+        "trendGate": None,
         "thinking": "", "analysis": "",
         # 深度思维链（ai-trade-deep-reasoning-chain §3.4.1 / §3.4.2）：**显式取键**装配，漏抄这
         # 两键 `AiTradeRoundTrace` 永远拿不到本层数据 ⇒ 后端发什么前端都收不到（跑不出错、功能

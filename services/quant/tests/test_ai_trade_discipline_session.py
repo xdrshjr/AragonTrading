@@ -92,13 +92,13 @@ async def test_off_preset_leaves_every_dark_switch_dark():
         await dispose_engine()
 
 
-# ============================ G-10：13 行齐、armed=false 必带 note ============================
-async def test_digest_has_thirteen_rows_in_a_fixed_order_and_never_leaves_grey_unexplained():
+# ============================ G-10：14 行齐、armed=false 必带 note ============================
+async def test_digest_has_fourteen_rows_in_a_fixed_order_and_never_leaves_grey_unexplained():
     await init_db()
     try:
         wire = _session(_derived("balanced")).discipline_wire()
         rows = wire["rows"]
-        assert len(rows) == 13
+        assert len(rows) == 14
         assert [r["key"] for r in rows][:4] == ["baseRuleMaBand", "consensus", "confidence",
                                                 "edgeGate"]
         assert all(r["label"] for r in rows)
@@ -110,7 +110,7 @@ async def test_digest_has_thirteen_rows_in_a_fixed_order_and_never_leaves_grey_u
 
 
 async def test_signal_prior_row_explains_how_to_turn_it_on():
-    """[P2-5]：这一行与其余 12 行不同源，note 必须写「怎么开」而不是只写一个 false。"""
+    """[P2-5]：这一行与其余 13 行不同源，note 必须写「怎么开」而不是只写一个 false。"""
     await init_db()
     try:
         row = _rows(_session(_derived("balanced")))["signalPrior"]
@@ -275,7 +275,7 @@ async def test_status_payload_carries_the_digest_so_the_frontend_can_actually_re
     await init_db()
     try:
         payload = _session(_derived("balanced"))._status_payload()
-        assert len(payload["disciplines"]["rows"]) == 13
+        assert len(payload["disciplines"]["rows"]) == 14
         assert "hint" in payload["disciplines"]
     finally:
         await dispose_engine()
@@ -336,7 +336,7 @@ def test_edge_gate_is_completely_off_under_the_off_preset():
 
 
 def test_every_digest_row_matches_the_declared_wire_contract():
-    """13 行的形状由 `AiTradeDisciplineRowOut` 声明——让那个模型**真的守门**，而不是一份说明文档。
+    """14 行的形状由 `AiTradeDisciplineRowOut` 声明——让那个模型**真的守门**，而不是一份说明文档。
 
     这两个端点都没有 `response_model`（wire 的真源是 `group_status()` / `_status_payload()`），
     故模型不会在运行时被 FastAPI 校验。用例在此替它跑一遍：少一个 `source`、`armed` 写成字符串、

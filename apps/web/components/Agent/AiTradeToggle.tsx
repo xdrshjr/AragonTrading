@@ -151,6 +151,7 @@ export default function AiTradeToggle() {
         discipline: opts.discipline,             // 交易纪律预设（同上；缺省=服务端默认 balanced）
         experience: opts.experience,             // 经验模式（同上；取消勾选即 enabled:false）
         direction: opts.direction,               // 方向对称性（同上；取消勾选即 contrarianEnabled:false）
+        trend: opts.trend,                       // 执行周期趋势基调（同上；取消勾选即 enabled:false）
         contextRefreshRounds: opts.contextRefreshRounds,
       }),
     onSuccess: (res, opts) => {
@@ -217,6 +218,9 @@ export default function AiTradeToggle() {
         discipline: opts.discipline,
         // 回测同享方向对称性（同一 `_resolve_direction`）。同一条理由：不同源就失真。
         direction: opts.direction,
+        // 回测同享执行周期趋势基调（同一 `_resolve_trend`，评审 RP1-10）。回测正是唯一能对
+        // 「开 vs 不开基调层」做净额对照的地方，两侧不同源就等于那个对照跑的不是实盘参数。
+        trend: opts.trend,
       }),
     onSuccess: (res, opts) => {
       setAiBacktestJobId(res.jobId);

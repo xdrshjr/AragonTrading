@@ -29,6 +29,11 @@ _DEGRADE_PREFIXES = (
     ("low_consensus", "consensus"),
     ("low_confidence", "confidence"),
     ("base_rule_", "baseRuleMaBand"),
+    # 趋势基调·逆势门槛（execution-trend-verdict 轴 E）。⚠️ 这条前缀**必须**配一个读点：
+    # 它只喂 `self._degrades`，而 `_gate_counts()` 的产物被 `build_discipline_digest` 按固定的
+    # `discipline_view.ROW_KEYS` 取用——没有 `trendBias` 那一行，计数写进去就蒸发（评审 RP1-3）。
+    # 本轮已把第 14 行开齐（`ROW_KEYS` / `_LABELS` / `_BUILDERS` / 前端 `DisciplineCard`）。
+    ("counter_trend_", "trendBias"),
 )
 
 
@@ -170,7 +175,11 @@ class DisciplineRuntime:
             prior_armed=session._prior.coverage_wire() is not None,
             spec_count=len(session._specs),
             # [P0-4] 启动期的事前复核结论（`manager._build_executor` 置入；非 AI 链路恒 False）。
-            dust_risk=bool(getattr(session.executor, "dust_risk", False)))
+            dust_risk=bool(getattr(session.executor, "dust_risk", False)),
+            # execution-trend-verdict 第 14 行：取会话那份**已夹紧**的规则对象本身，绝不从
+            # settings 再读一次（`trend_rule_from_settings` 会夹阈值与封顶 htf 权重，读原值会让
+            # 面板报出一个「用户改了但运行期并没有生效」的数）。未装配的会话恒 None ⇒ 该行灰。
+            trend_rule=getattr(session, "_trend_rule", None))
 
     # ---------- 取数细节 ----------
     def _backstop_wire(self) -> dict | None:

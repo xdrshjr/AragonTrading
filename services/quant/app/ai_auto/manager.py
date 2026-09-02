@@ -62,7 +62,8 @@ from .experience.events import EventIdentity
 from .intel import runtime as intel_runtime
 from .intel import scheduler as intel_scheduler
 from .llm_budget import build_ai_trade_llm_clients
-from .prompts import build_ai_trade_system_prompt, format_direction_charter
+from .prompts import (build_ai_trade_system_prompt, format_direction_charter,
+                      format_trend_charter)
 from .prompts_en import SystemPromptOptions, SystemPromptTexts
 from .reasoning_protocol import build_deliberation_protocol, resolve_depth_profile
 from .session import AiTradeSession
@@ -71,6 +72,7 @@ from .sizing import SizingRule, StopRule, check_window_capacity, parse_sizing_ru
 from .sizing_runtime import build_sizing_runtime, sizing_config_wire
 from .sizing_text import format_sizing_charter
 from .tradability_probe import probe_members
+from .trend_verdict import trend_rule_from_settings
 from .wake_runtime import format_tactical_bars_text, tactical_bars_for
 
 logger = logging.getLogger(__name__)
@@ -673,6 +675,13 @@ class AiTradeManager:
         # `decider._stream_reflection`（每轮现造 system），在这里传 `reasoning_text` 会落空
         # 且不报错、不判红（spec §3.2 / P0-5，装配判据见用例 S-7）。
         depth = resolve_depth_profile(req.settings, override=req.reasoning_depth)
+        # 执行周期趋势基调（execution-trend-verdict 轴 B / C）：**一次解析、两处使用**——第七段
+        # 宪章与《审议协议》S1/S2/S12 的 `trend_bar`。`req.settings` 是 `_resolve_discipline` /
+        # `_resolve_trend` 之后那份派生副本，与 `executor.settings`（会话构造 `TrendRuntime` 时
+        # 读的那一个）**同一个对象**，故 prompt 说的与门禁用的必然是同一组阈值。
+        # 复核侧的 R4 **不在这里注入**：`build_review_protocol` 全仓唯一的调用点是
+        # `decider._stream_reflection`（每轮现造 system），在这里传是一条不报错、不判红的死路。
+        trend_rule = trend_rule_from_settings(req.settings)
         clients = build_ai_trade_llm_clients(
             ctx.provider, req.settings, profile=depth,
             # 工厂必须从**本模块**传进去：20+ 个测试文件按
@@ -697,12 +706,18 @@ class AiTradeManager:
                         reserve_tokens=req.settings
                         .ai_trade_reasoning_reserve_tokens,
                         symmetry=req.settings
-                        .ai_trade_directional_symmetry_enabled),
+                        .ai_trade_directional_symmetry_enabled,
+                        # 趋势基调的 S1 / S2 / S12（轴 C）；总闸关 → 空串 ⇒ 三处逐字节回退。
+                        trend_bar=(req.bar if trend_rule.enabled else "")),
                     # 方向对称宪章章（轴 C-2 的第六段）；总闸关 → "" ⇒ 两条脊柱逐字节回退。
                     # ⚠️ `backtest.py` 是同款的第二个 `SystemPromptTexts` 构造点，只填一处会让
                     # 实盘与回测的 prompt 分叉（`base_rules` P1-4 的成文教训）。
                     direction_text=format_direction_charter(
                         req.settings.ai_trade_directional_symmetry_enabled),
+                    # 趋势基调宪章（第七段，轴 B）；未装配 → "" ⇒ 两条脊柱逐字节回退。
+                    # ⚠️ `backtest.py` 是同款的第二个 `SystemPromptTexts` 构造点，只填一处会让
+                    # 实盘与回测的 prompt 分叉（`base_rules` P1-4 的成文教训）。
+                    trend_text=format_trend_charter(req.bar, trend_rule),
                     # 【基础策略】宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变
                     base_rules_text=format_charter(req.base_rule),
                     # 利润保护宪章章（软引导）；未装配 → "" ⇒ 渲染逐字节不变

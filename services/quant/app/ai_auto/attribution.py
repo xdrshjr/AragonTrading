@@ -202,6 +202,18 @@ class AttributionLedger:
                           * self.ct_val),
             cost_bps=self._last_cost_bps, edge_bps=self._last_edge_bps))
 
+    def last_close_net_usd(self) -> float | None:
+        """最近一笔平仓成交的**净额**盈亏（`record_close` 那一份），一笔都没有 ⇒ `None`。
+
+        存在的理由（execution-trend-verdict 评审 RP0-5 的实施落点）：顺势 / 逆势的成绩卡要在
+        平仓结算时回流净额，而 spec 明写「口径**取自本模块 `record_close` 已算好的 `net`**，
+        不另算」——两处各算一次必漂移，而那两个数会并排出现在同一张卡上。合入前本模块没有
+        任何**公开**读点，调用方只能去摸 `_trips`；本访问器就是为堵掉那条路而加的。
+
+        纯读、无副作用、绝不改 `_trips`。
+        """
+        return self._trips[-1].net_pnl_usd if self._trips else None
+
     def note_gate(self, status: str, *, cost_bps: float | None = None,
                   edge_bps: float | None = None) -> None:
         """记一轮门禁判定（pass / veto / unavailable）并留存本轮成本与 edge 读数。"""

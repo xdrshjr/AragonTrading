@@ -425,6 +425,127 @@ describe("AiTradeAgentTrace", () => {
     expect(screen.getAllByTestId("tactical-frame")).toHaveLength(2);
   });
 
+  it("keeps the section alive on a trend-verdict-only round (F-2 早退门控回归护栏)", () => {
+    // 板空 + 其余输入全空、**仅有** trendVerdict：早退门控漏了它，整段「输入信号板」会静默
+    // 消失（跑不出错、永远空白）。这是同一处门控在本轮的第三次复发形态，故必须有专属用例。
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            state: "done",
+            signalBoard: [],
+            marketContext: null,
+            consensus: null,
+            marketDigest: null,
+            multiTimeframeContext: null,
+            tacticalContext: null,
+            trendVerdict: {
+              bar: "15m",
+              asOfTs: 1,
+              score: -0.32,
+              execScore: -0.61,
+              direction: "down",
+              bias: "short",
+              strength: "strong",
+              verdictConfidence: 0.59,
+              components: [
+                { key: "regime", label: "体制结构", score: -0.72, weight: 0.26, detail: "…" },
+              ],
+              missing: [],
+              availableWeight: 0.86,
+              execAvailableWeight: 0.84,
+              higherTimeframe: {
+                status: "bullish",
+                agree: false,
+                bullishBars: ["1D"],
+                bearishBars: [],
+              },
+              tacticalAlignment: null,
+              conflict: "htf_conflict",
+              bonusWithheld: true,
+              counterGate: { armed: true, minConfidence: 0.65, sizeMult: 0.5 },
+              degraded: false,
+              degradeReason: null,
+            },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    expect(screen.getByText("输入信号板")).toBeInTheDocument();
+    const evidence = screen.getByTestId("trend-verdict-evidence");
+    expect(evidence).toHaveTextContent("偏空");
+    expect(evidence).toHaveTextContent("只由 15m 证据算出");
+    // 高周期的硬边界必须写出来（它是本需求「判在我所选级别」的可执行译文）。
+    expect(evidence).toHaveTextContent("不能反转本级别的方向");
+  });
+
+  it("renders the trend-bias gate row on both of its lanes (write point needs a read point)", () => {
+    // `trendGate` 是 `tool_call` 相位的兄弟键、走 store 的逐键手抄轨。少了这一行渲染，它就是
+    // 一份「后端算了、类型补了、没有渲染落点」的死数据——尤其是**逆势放行并被强制降档**那一档，
+    // 它在别处（降级码文案 / 层名）完全不可见，因为那一轮压根没有降级码。
+    const { unmount } = render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            state: "done",
+            toolCall: { action: "open_short", sizeFraction: 0.25, confidence: 0.8, reason: "逆势" },
+            trendGate: {
+              lane: "counter",
+              alignment: "counter",
+              strength: "strong",
+              score: -0.32,
+              execScore: -0.61,
+              minConfidence: 0.65,
+              modelConfidence: 0.8,
+              verdictConfidence: 0.59,
+              sizeMult: 0.5,
+              sizeBefore: 0.5,
+              sizeAfter: 0.25,
+              reason: null,
+            },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    const passed = screen.getByTestId("trend-gate-row");
+    expect(passed).toHaveTextContent("逆势");
+    expect(passed).toHaveTextContent("50% → 25%");
+    unmount();
+
+    render(
+      <AiTradeAgentTrace
+        group={groupWith(SESSION, [
+          round({
+            state: "done",
+            toolCall: { action: "hold", reason: "逆势置信度不足" },
+            trendGate: {
+              lane: "veto",
+              alignment: "counter",
+              strength: "strong",
+              score: -0.32,
+              execScore: -0.61,
+              minConfidence: 0.65,
+              // ★ 判据取模型自报值；`verdictConfidence` 再高也不放行（取错方向正好相反）。
+              modelConfidence: 0.4,
+              verdictConfidence: 0.99,
+              sizeMult: 0.5,
+              sizeBefore: 0.5,
+              sizeAfter: null,
+              reason: "counter_trend_confidence(score=-0.61,conf=0.40/0.65)",
+            },
+          }),
+        ])}
+        activeInstId="BTC-USDT-SWAP"
+      />,
+    );
+    const vetoed = screen.getByTestId("trend-gate-row");
+    expect(vetoed).toHaveTextContent("模型自报置信 40%");
+    expect(vetoed).toHaveTextContent("门槛 65%");
+    expect(vetoed).not.toHaveTextContent("99%");
+  });
+
   it("keeps the section alive on a backlog-only round and renders the catch-up evidence", () => {
     // 只有补跑信息、其余输入全空的轮次**仍要渲染**（镜像点 12：早退门控漏了 backlog 就整段空白）。
     // 这里正是上一轮 RV-2 的原址——新增边缘态字段必须验证渲染门控没把该态排除掉。

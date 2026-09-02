@@ -962,3 +962,198 @@ def test_prior_no_evidence_wording_is_gated():
     assert _format_prior_side(None) == "无证据"
     assert "样本不足" in _format_prior_side(None, True)
     assert "不是该方向胜率低的证据" in _format_prior_side(None, True)
+
+
+# ============================ 执行周期趋势基调（execution-trend-verdict §7.4）============================
+def _trend_wire(**over) -> dict:
+    base = {
+        "bar": "15m", "asOfTs": 1756700000, "score": -0.32, "execScore": -0.61,
+        "direction": "down", "bias": "short", "strength": "strong", "verdictConfidence": 0.59,
+        "components": [
+            {"key": "regime", "label": "体制结构", "score": -0.72, "weight": 0.26,
+             "detail": "primary=trend_down"},
+            {"key": "ema", "label": "均线结构", "score": -0.68, "weight": 0.22, "detail": "…"},
+            {"key": "netChange", "label": "净变化", "score": -0.55, "weight": 0.20, "detail": "…"},
+            {"key": "structure", "label": "区间与连阳连阴", "score": -0.40, "weight": 0.16,
+             "detail": "…"},
+            {"key": "momentum", "label": "动量", "score": None, "weight": 0.16,
+             "detail": "macdHist 与 rocPct 均不可用"},
+            {"key": "htf", "label": "高周期背景", "score": 1.0, "weight": 0.18, "detail": "…"},
+        ],
+        "missing": ["momentum"], "availableWeight": 0.86, "execAvailableWeight": 0.84,
+        "higherTimeframe": {"status": "bullish", "agree": False,
+                            "bullishBars": ["1D", "4H"], "bearishBars": []},
+        "tacticalAlignment": "diverged", "conflict": "both", "bonusWithheld": True,
+        "counterGate": {"armed": True, "minConfidence": 0.65, "sizeMult": 0.5},
+        "degraded": False, "degradeReason": None,
+    }
+    base.update(over)
+    return base
+
+
+def test_trend_charter_is_an_empty_shim_when_unarmed():
+    """P-1：未装配 ⇒ `""`；装配 ⇒ 含 `bar` 字面量与「不能替你决定」一句。"""
+    from app.ai_auto.prompts import format_trend_charter
+    from app.ai_auto.trend_verdict import TrendVerdictRule
+
+    assert format_trend_charter("15m", None) == ""
+    assert format_trend_charter("15m", TrendVerdictRule(enabled=False)) == ""
+    assert format_trend_charter("", TrendVerdictRule(enabled=True)) == ""
+    armed = format_trend_charter("15m", TrendVerdictRule(enabled=True))
+    assert "15m" in armed and "不能替你决定" in armed
+
+
+def test_both_spines_carry_the_trend_charter():
+    """P-2：**中文脊柱与英文脊柱各自都装了第七段**（只改一处即红——P1-4 的回归护栏）。"""
+    zh = build_ai_trade_system_prompt("BTC-USDT-SWAP", "15m", 1000.0, 5.0,
+                                      texts=SystemPromptTexts(trend_text="趋势基调条款：…"))
+    en = build_ai_trade_system_prompt("BTC-USDT-SWAP", "15m", 1000.0, 5.0,
+                                      texts=SystemPromptTexts(reasoning_text="PROTO",
+                                                              trend_text="趋势基调条款：…"))
+    assert "趋势基调条款" in zh and "趋势基调条款" in en
+
+
+def test_trend_read_order_appears_exactly_once_when_armed():
+    """P-10（评审 RP1-4）：disarmed 逐字节回退；armed 里读序**只出现一次**。
+
+    v1 的写法（「插在原句之后、把原句改写为续写」）会让 `1D → 12H → 4H → 1H` 出现两遍且
+    互相矛盾——同一句读序连说两遍，模型读到的是一条自相矛盾的纪律。
+    """
+    from app.ai_auto.prompts import _trend_read_order
+    from app.ai_auto.prompts_en import _trend_read_order_en
+
+    assert _trend_read_order("") == (
+        "先按 1D → 12H → 4H → 1H 研判中线背景、趋势一致性、候选支撑阻力与超买/超卖，")
+    armed = _trend_read_order("15m")
+    assert armed.count("1D → 12H → 4H → 1H") == 1
+    assert "先在执行周期 15m 上给出本轮趋势基调" in armed
+    assert _trend_read_order_en("").startswith("Work the")
+    armed_en = _trend_read_order_en("15m")
+    assert armed_en.count("1D -> 12H -> 4H -> 1H") == 1
+    assert "execution bar 15m" in armed_en
+
+
+def test_spine_read_order_is_gated_by_the_charter_alone():
+    """读序子句的装配判据**只有一个**：第七段宪章装没装（绝不另读一次 settings）。"""
+    plain = build_ai_trade_system_prompt("BTC-USDT-SWAP", "15m", 1000.0, 5.0)
+    armed = build_ai_trade_system_prompt("BTC-USDT-SWAP", "15m", 1000.0, 5.0,
+                                         texts=SystemPromptTexts(trend_text="X"))
+    assert "先按 1D → 12H → 4H → 1H 研判中线背景" in plain
+    assert "先在执行周期 15m 上给出本轮趋势基调" in armed
+    assert "先按 1D → 12H → 4H → 1H 研判中线背景" not in armed
+
+
+def test_trend_section_is_the_first_substantive_evidence():
+    """P-6：基调段的下标小于「自管持仓」与「中线背景」两者。
+
+    锚点用 `自管持仓` 而不是 `当前自管持仓`（评审 RP2-3：空仓轮渲染的是「当前无自管持仓
+    （flat）」，后者取不到下标）。
+    """
+    payload = {"round": 1, "barTs": 1, "lastPx": 100.0, "signalBoard": [],
+               "trendVerdict": _trend_wire(),
+               "multiTimeframeContext": {"executionBar": "15m", "frames": [],
+                                         "trendAlignment": {"status": "bullish",
+                                                            "bullishBars": [], "bearishBars": [],
+                                                            "rangeBars": []},
+                                         "rsiOverboughtBars": [], "rsiOversoldBars": [],
+                                         "nearestSupport": None, "nearestResistance": None,
+                                         "missingBars": [], "staleBars": []}}
+    text = build_decision_prompt(payload)
+    assert text.index("【本轮趋势基调") < text.index("自管持仓")
+    assert text.index("【本轮趋势基调") < text.index("中线背景")
+
+
+def test_trend_section_absent_key_is_byte_identical():
+    """S-5 的 prompt 半边：**键缺席 ⇒ 整段省略 ⇒ 与合入前逐字节相同**。"""
+    payload = {"round": 1, "barTs": 1, "lastPx": 100.0, "signalBoard": []}
+    before = hashlib.sha256(build_decision_prompt(payload).encode()).hexdigest()
+    payload_with_none = {**payload, "trendVerdict": None}
+    assert hashlib.sha256(
+        build_decision_prompt(payload_with_none).encode()).hexdigest() == before
+
+
+def test_trend_section_degraded_has_no_direction_word():
+    """P-5：`degraded=True` ⇒ 只出两行、**不含任何方向词**，且缺失成分被显式列出。"""
+    from app.ai_auto.trend_text import format_trend_verdict_for_prompt
+
+    lines = format_trend_verdict_for_prompt(_trend_wire(
+        degraded=True, direction="unknown", bias="neutral", score=None, execScore=None,
+        degradeReason="insufficient_components"))
+    assert len(lines) == 2
+    body = "".join(lines)
+    assert "偏多" not in body and "偏空" not in body
+    assert "动量" in body and "冒充本级别基调" in body
+
+
+def test_trend_section_brief_tier_drops_component_detail():
+    """P-6b（评审 RP1-11）：`contextDisclosure="repeat"` ⇒ 只剩两行且**不含**逐成分明细。"""
+    verdict = _trend_wire()
+    payload = {"round": 1, "barTs": 1, "lastPx": 100.0, "signalBoard": [],
+               "trendVerdict": verdict}
+    full = build_decision_prompt(payload)
+    brief = build_decision_prompt({**payload, "contextDisclosure": "repeat"})
+    assert "判据（按权重）" in full
+    assert "判据（按权重）" not in brief
+    assert "【本轮趋势基调 · 15m】" in brief
+
+
+def test_trend_section_never_hardcodes_the_counter_gate_thresholds():
+    """渲染层**不写死算例**：两个阈值随 wire 的 `counterGate` 下发（实施期发现 F-1）。"""
+    from app.ai_auto.trend_text import format_trend_verdict_for_prompt
+
+    body = "".join(format_trend_verdict_for_prompt(_trend_wire(
+        counterGate={"armed": True, "minConfidence": 0.71, "sizeMult": 0.4})))
+    assert "≥0.71" in body and "×0.4" in body
+    off = "".join(format_trend_verdict_for_prompt(_trend_wire(
+        counterGate={"armed": False, "minConfidence": None, "sizeMult": None})))
+    assert "未装配逆势降档闸" in off
+
+
+def test_reflection_prompt_carries_trend_verdict():
+    """P-7：反思侧的连锁通路——`build_reflection_prompt` 第一行就是 `build_decision_prompt`。
+
+    这条通路本轮正好是我们想要的，但**必须被用例钉死而不是碰巧成立**（market-intel 那轮吃过
+    一次亏：改决策 prompt 会同时改反思 prompt）。
+    """
+    decision = TradeDecision(action="open_short", size_fraction=0.25, confidence=0.8, reason="x")
+    payload = {"round": 1, "barTs": 1, "lastPx": 100.0, "signalBoard": [],
+               "trendVerdict": _trend_wire()}
+    assert "【本轮趋势基调" in build_reflection_prompt(payload, decision)
+
+
+def test_reviewer_conflict_clause_is_conditional_on_the_verdict():
+    """P-9（评审 RP0-4）的三处：中文系统 prompt / 英文评级标准 / 中文散文，各带一条回退断言。"""
+    from app.ai_auto.prompts_en import render_review_spine_en
+
+    # ① 中文复核官系统 prompt（off 档真源）
+    assert "(b) 与更高周期背景强冲突且决策未给出对冲理由；" in build_reflection_system_prompt()
+    armed_zh = build_reflection_system_prompt(trend_bar="15m")
+    assert "15m 执行周期趋势基调" in armed_zh
+    assert "(b) 与更高周期背景强冲突且决策未给出对冲理由；" not in armed_zh
+
+    # ② 英文评级标准 2(b)
+    plain_en = render_review_spine_en("PROTO")
+    assert ("(b) it strongly conflicts with the\n   higher-timeframe context and the decision "
+            "offers no hedge rationale;") in plain_en
+    armed_en = render_review_spine_en("PROTO", "", "15m")
+    assert "execution-bar (15m) trend verdict" in armed_en
+    assert "is not a defect" in armed_en
+
+    # ③ 中文散文（`build_reflection_prompt`）
+    decision = TradeDecision(action="open_short", size_fraction=0.25, confidence=0.8, reason="x")
+    plain = build_reflection_prompt({"round": 1, "signalBoard": []}, decision)
+    assert "与高周期强冲突且无对冲理由" in plain
+    armed = build_reflection_prompt(
+        {"round": 1, "signalBoard": [], "trendVerdict": _trend_wire()}, decision)
+    assert "15m 执行周期趋势基调" in armed
+    assert "与高周期强冲突且无对冲理由 /" not in armed
+
+
+def test_reflection_system_prompt_is_byte_identical_without_trend_bar():
+    """三处条件化子句的共同回退路径：`trend_bar=""` ⇒ 与合入前 sha256 相同。"""
+    from app.ai_auto.prompts_en import render_review_spine_en
+
+    assert (hashlib.sha256(build_reflection_system_prompt("H", "").encode()).hexdigest()
+            == hashlib.sha256(
+                build_reflection_system_prompt("H", "", "").encode()).hexdigest())
+    assert render_review_spine_en("P", "H") == render_review_spine_en("P", "H", "")

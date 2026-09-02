@@ -33,10 +33,19 @@ import {
   describeWakeReason,
 } from "@/lib/aiTrade";
 import { describeHorizonGate, formatHoldDuration } from "@/lib/aiTradeHorizon";
+import {
+  describeTrendAlignment,
+  describeTrendGateAlignment,
+  describeTrendVerdict,
+  missingLabels,
+  trendVerdictTone,
+} from "@/lib/aiTradeTrend";
 import AiTradeReasoningBlock, { ReasoningStageView } from "./AiTradeReasoningBlock";
 import { ExitPriorityRow, ProposedVetoRow } from "./AiTradeExitPriorityRows";
 import type {
   AiTradeRoundTrace,
+  AiTradeTrendGate,
+  AiTradeTrendVerdict,
   MultiTimeframeContext,
   TacticalContext,
 } from "@/lib/aiTradeTypes";
@@ -109,6 +118,43 @@ function RetryBreadcrumb({ trace }: { trace: AiTradeRoundTrace }) {
   );
 }
 
+/**
+ * 趋势基调·逆势门槛的判定行（execution-trend-verdict §3.7.4-3 / §5.3）。
+ *
+ * 后端**只在本层真的判过**（`lane != "exempt"`）的轮次下发这个键，故它一出现就必然有话要说：
+ * 顺势直通、逆势放行（连同被强制降到多少）、还是逆势被拦（模型自报的置信度差在哪里）。
+ * 少了这一行，`trendGate` 就是一份「后端算了、类型补了、没有渲染落点」的死数据——逆势**放行并
+ * 被 ×0.5 降档**那一档在界面上会完全不可见（被拦的那一档尚可从降级码文案读到）。
+ *
+ * **两个 confidence 必须各有其名**：这里显示的是 `modelConfidence`（模型本轮自报、是本层唯一
+ * 的判据）；`verdictConfidence` 是基调自身的置信度、纯呈现，取错方向正好相反，故不并进同一句。
+ */
+function TrendGateRow({ gate }: { gate: AiTradeTrendGate }) {
+  const score =
+    gate.execScore == null ? "执行周期分不可用" : `执行周期分 ${gate.execScore.toFixed(2)}`;
+  let detail: string;
+  if (gate.lane === "veto") {
+    const model = gate.modelConfidence == null
+      ? "不可用"
+      : `${fmtNum(gate.modelConfidence * 100, 0)}%`;
+    detail = `模型自报置信 ${model} · 门槛 ${fmtNum(gate.minConfidence * 100, 0)}% ⇒ 本轮观望`;
+  } else if (gate.sizeBefore != null && gate.sizeAfter != null) {
+    detail =
+      `仓位 ${fmtNum(gate.sizeBefore * 100, 0)}% → ${fmtNum(gate.sizeAfter * 100, 0)}%` +
+      `（强制降档 ×${gate.sizeMult}）`;
+  } else {
+    detail = "本层未收紧本轮仓位";
+  }
+  return (
+    <p
+      className="border-t border-[var(--border)] px-2.5 py-1.5 text-[11px] leading-relaxed text-[var(--muted)]"
+      data-testid="trend-gate-row"
+    >
+      趋势基调·逆势门槛：{describeTrendGateAlignment(gate.alignment)}（{score}）· {detail}
+    </p>
+  );
+}
+
 /** 决策工具卡：动作 + 仓位/置信 + reason，可展开原始 input JSON；pending 时占位。 */
 function DecisionToolCard({ trace }: { trace: AiTradeRoundTrace }) {
   const [open, setOpen] = useState(false);
@@ -149,6 +195,7 @@ function DecisionToolCard({ trace }: { trace: AiTradeRoundTrace }) {
         <span className="text-[var(--muted)]">{open ? "▾" : "▸"}</span>
       </button>
       <ProposedVetoRow trace={trace} />
+      {trace.trendGate ? <TrendGateRow gate={trace.trendGate} /> : null}
       {call.reason && (
         <p className="border-t border-[var(--border)] px-2.5 py-1.5 text-[11px] leading-relaxed text-[var(--muted)]">
           {call.reason}
@@ -535,6 +582,44 @@ function ResultRow({ trace }: { trace: AiTradeRoundTrace }) {
 
 const MTF_ORDER = new Map(["1D", "12H", "4H", "1H"].map((bar, index) => [bar, index]));
 
+/**
+ * 本轮趋势基调（execution-trend-verdict §3.7.4-7）。
+ *
+ * 渲染在 `MultiTimeframeEvidence` **之前**——阅读顺序即证据顺序：用户诉求的第一步是
+ * 「先判我所选的这个级别是涨是跌」，中线背景只是对它的佐证。
+ *
+ * 两条呈现纪律：
+ * - **两个分分开写**：`execScore` 决定强度（只由执行周期证据算出）、`score` 决定方向（含高
+ *   周期调制）。合并成一个数，用户就无法回答「这个强度里有多少是日线给的」。
+ * - **缺失成分如实列出**，绝不补猜；降级轮不出现任何方向词。
+ */
+function TrendVerdictEvidence({ verdict }: { verdict: AiTradeTrendVerdict }) {
+  const tone = trendVerdictTone(verdict);
+  const missing = missingLabels(verdict);
+  return (
+    <div className="flex flex-col gap-0.5" data-testid="trend-verdict-evidence">
+      <div className="font-medium" style={{ color: TONE_VAR[tone] }}>
+        {describeTrendVerdict(verdict)}
+      </div>
+      {!verdict.degraded && (
+        <>
+          <div className="flex flex-wrap gap-x-2 gap-y-0.5">
+            {verdict.components.map((component) => (
+              <span key={component.key} data-testid="trend-component">
+                {component.label}{" "}
+                {component.score == null ? "不可用" : component.score.toFixed(2)}
+                <span className="opacity-60">（权重 {component.weight.toFixed(2)}）</span>
+              </span>
+            ))}
+          </div>
+          <div>{describeTrendAlignment(verdict)}</div>
+        </>
+      )}
+      {missing.length > 0 && <div>成分缺失：{missing.join("、")}（不得补猜）</div>}
+    </div>
+  );
+}
+
 function MultiTimeframeEvidence({ context }: { context: MultiTimeframeContext }) {
   if (!context.frames.length) {
     return <div>中线背景暂不可用，已回退基础周期</div>;
@@ -659,6 +744,7 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
   const price = describePriceAction(digest?.priceAction);
   const volume = describeVolume(digest?.volume);
   const factors = describeFactors(digest?.factors);
+  const trendVerdict = trace.trendVerdict ?? null;
   const multiTimeframe = trace.multiTimeframeContext ?? null;
   const tactical = trace.tacticalContext ?? null;
   const wakeReason = describeWakeReason(trace.wake);
@@ -676,6 +762,7 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
     !volume &&
     !factors &&
     !multiTimeframe &&
+    !trendVerdict &&
     !tactical &&
     !wakeReason &&
     !backlog &&
@@ -694,6 +781,7 @@ function SignalContext({ trace }: { trace: AiTradeRoundTrace }) {
         {wakeReason ? <div data-testid="wake-reason">{wakeReason}</div> : null}
         {backlog ? <WakeBacklogEvidence backlog={backlog} /> : null}
         {flip ? <WakeFlipEvidence flip={flip} /> : null}
+        {trendVerdict ? <TrendVerdictEvidence verdict={trendVerdict} /> : null}
         {multiTimeframe ? <MultiTimeframeEvidence context={multiTimeframe} /> : null}
         {tactical ? <TacticalEvidence context={tactical} /> : null}
         {(regime || consensus) && (

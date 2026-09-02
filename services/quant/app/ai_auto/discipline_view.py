@@ -19,10 +19,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# 13 行的固定顺序（wire 契约的一部分：前端按序渲染，不重排）。
+# 14 行的固定顺序（wire 契约的一部分：前端按序渲染，不重排）。
+# 第 14 行 `trendBias` 由 execution-trend-verdict 加入，且它**必须与 `discipline_runtime`
+# 的 `("counter_trend_", "trendBias")` 前缀同轮加**：只加前缀不开这一行 = 有写点没读点，
+# 计数写进 `_degrades` 后在 `build_discipline_digest` 这一步蒸发（评审 RP1-3）。
 ROW_KEYS = ("baseRuleMaBand", "consensus", "confidence", "edgeGate", "volSizing", "atrStop",
             "drawdownBrake", "lossStreak", "exposureCap", "profitGuard", "horizon",
-            "exchangeBackstop", "signalPrior")
+            "exchangeBackstop", "signalPrior", "trendBias")
 
 _LABELS = {
     "baseRuleMaBand": "基础策略·MA 通道", "consensus": "同向共识门槛",
@@ -30,6 +33,7 @@ _LABELS = {
     "atrStop": "ATR 止损覆盖", "drawdownBrake": "回撤刹车", "lossStreak": "连亏熔断",
     "exposureCap": "有效敞口上限", "profitGuard": "利润保护棘轮", "horizon": "持仓周期纪律",
     "exchangeBackstop": "交易所侧兜底", "signalPrior": "信号先验 EV",
+    "trendBias": "趋势基调·逆势门槛",
 }
 
 # 恒真自检的最小样本轮数（[P1-9]）：低于它不提示——刚启动的会话本来就没开过仓，那时提示只会被无视。
@@ -56,6 +60,12 @@ class DisciplineFacts:
     # [P0-4] 启动期复核结论：按本预设的保守仓位下界解算，单笔委托量可能低于交易所最小下单量。
     # 它与运行期的 `volSizingDustSkips` 计数是**同一件事的先后两态**——先示警，真发生了再计数。
     dust_risk: bool = False
+    # execution-trend-verdict 第 14 行：**取会话那份 `TrendVerdictRule` 本身**而不是从 settings
+    # 再读一次——`trend_rule_from_settings` 会做两处夹紧（阈值倒挂 / htf 权重封顶），读 settings
+    # 原值会让面板报出一个「用户改了但运行期并没有生效」的数（本仓库对此已有成文教训）。
+    # 追加在**末位**：本类的既有字段全部带默认值，新字段跟在最后既满足 dataclass「无默认值字段
+    # 必须在前」的约束，也让既有的按位置构造点一个都不用改。
+    trend_rule: object | None = None
 
 
 def naked_backstop(wire: dict | None, min_coverage: float) -> bool:
@@ -73,7 +83,7 @@ def naked_backstop(wire: dict | None, min_coverage: float) -> bool:
 
 
 def build_discipline_digest(facts: DisciplineFacts) -> list[dict]:
-    """13 行固定顺序的纪律自检 wire。
+    """14 行固定顺序的纪律自检 wire。
 
     每行 `{key, label, armed, threshold, source, note, firedCount, tone}`；`source` ∈
     `preset`（阈值来自 settings）/ `rule`（会话级契约对象）/ `runtime`（运行期核实结果）。
@@ -189,6 +199,9 @@ _BLOCKER_ADVICE = {
     "drawdownBrake": "回撤刹车 / 连亏熔断正在阻止开新仓——这通常是应该被拦住的断面，先复盘亏损原因。",
     "exchangeBackstop": "交易所侧兜底止损未覆盖当前持仓，系统据此暂停加仓。请先补挂止损。",
     "reflection": "下单前二次反思否决了这些开仓。可在设置中关闭反思，但那会去掉一层安全网。",
+    "trendBias": ("这些开仓与本级别的趋势基调相反，且模型自报的置信度没达到逆势门槛。"
+                  "若你认为基调本身判错了，请先看统计卡的「本会话基调分布」；"
+                  "确要放宽，可在启动弹窗的「趋势基调」分区调低逆势置信度下界或整条关闭它。"),
     "other": _BLOCKER_ADVICE_DEFAULT,
 }
 
@@ -389,10 +402,33 @@ def _signal_prior_row(facts: DisciplineFacts) -> dict:
                       "运维可用 POST /ai-trade/priors/rebuild 重建。")
 
 
+def _trend_bias_row(facts: DisciplineFacts) -> dict:
+    """第 14 行：趋势基调·逆势门槛（execution-trend-verdict 轴 E / 评审 RP1-3）。
+
+    两级未装配态各有各的话要说（`armed=false` 必须带 `note`，硬约束 2）：总闸关 = 整个特性没
+    装配；只关子闸 = 基调仍进 prompt 与统计，只是不再拦任何一笔。
+    """
+    rule = facts.trend_rule
+    if rule is None or not getattr(rule, "enabled", False):
+        return _base("trendBias", False, source="rule",
+                     note="未装配趋势基调层（AI_TRADE_TREND_VERDICT_ENABLED=false 或本会话显式"
+                          "关闭）。开启后系统每轮会在你所选的执行周期上给出方向基调。")
+    if not getattr(rule, "counter_gate_enabled", False):
+        return _base("trendBias", False, source="rule",
+                     note="基调仍进研判与统计，但逆势门槛已关闭：逆势开仓不再需要更高置信度、"
+                          "也不再被强制降档。可在启动弹窗的「趋势基调」分区重新勾选。")
+    floor = float(getattr(rule, "counter_min_confidence", 0.0) or 0.0)
+    mult = float(getattr(rule, "counter_size_mult", 0.0) or 0.0)
+    return _base("trendBias", True, source="preset",
+                 threshold=f"逆势开仓需自报置信度 ≥{floor:.2f}，且仓位 ×{mult:g}",
+                 fired=_count(facts, "trendBias"))
+
+
 _BUILDERS = {
     "baseRuleMaBand": _base_rule_row, "consensus": _consensus_row, "confidence": _confidence_row,
     "edgeGate": _edge_gate_row, "volSizing": _vol_sizing_row, "atrStop": _atr_stop_row,
     "drawdownBrake": _drawdown_row, "lossStreak": _loss_streak_row, "exposureCap": _exposure_row,
     "profitGuard": _profit_guard_row, "horizon": _horizon_row,
     "exchangeBackstop": _backstop_row, "signalPrior": _signal_prior_row,
+    "trendBias": _trend_bias_row,
 }

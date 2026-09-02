@@ -322,8 +322,9 @@ def _is_finite(value) -> bool:
 
 
 def resolve_consensus_gate(decision: TradeDecision, consensus: Consensus, rule: ConsensusRule,
-                           *, position_step: float,
-                           used_contrarian: int) -> ConsensusGateOutcome:
+                           *, position_step: float, used_contrarian: int,
+                           bonus_votes: int = 0, opposing_allowance: int = 0,
+                           bonus_lane: str = "none") -> ConsensusGateOutcome:
     """共识门禁的**纯核心**（实盘 session 与回测 runner 共用；directional-symmetry 轴 A）。
 
     ## 这一层解决什么
@@ -354,30 +355,48 @@ def resolve_consensus_gate(decision: TradeDecision, consensus: Consensus, rule: 
         rule: 本会话的共识门禁配置。
         position_step: 仓位档位步长，真源是 `decider.position_step`（keyword-only）。
         used_contrarian: 本会话**已经**用掉的逆势名额（纯核心不持状态，由调用方持有并传入）。
+        bonus_votes: 趋势基调的**顺势追加票**（execution-trend-verdict 轴 D-1a，0 或 1）。
+            默认 0 ⇒ 既有全部调用与单测**逐字节回退**（放行轮同样返回同一对象，`is` 相等）。
+            它加在 `decision.action` **那一侧**的票上，故其判据**必须含本轮动作**——判定源是
+            `trend_verdict.trend_consensus_bonus(action, ...)`，本函数只负责加。
+        opposing_allowance: 趋势基调的**顺势反向票上限放宽**（轴 D-1b，0 或 1）。默认 0 ⇒ 同上
+            逐字节回退。它**不发票**，只抬高 `_contrarian_block` 首行那条上限；逆势通路的
+            逐字证据、置信度下界、会话配额与强制降档**一条不减**。
+        bonus_lane: 轴 D-1a 的**五态归因**（`none` / `applied` / `blocked_not_aligned` /
+            `blocked_conflict` / `blocked_no_native_vote`）。默认 `"none"` ⇒ wire 与合入前
+            形状一致的那一格。**它是入参而不是在这里重判一次**：本函数拿不到 verdict，重判
+            必然造出第二份会漂移的判据；判定源是 `trend_verdict.trend_bonus_lane`。
 
     Returns:
         `ConsensusGateOutcome`。
     """
+    bonus = max(0, int(bonus_votes or 0))
+    allowance = max(0, int(opposing_allowance or 0))
+    max_opposing = rule.contrarian_max_opposing_votes + allowance
     if rule.min_consensus <= 0 or decision.action not in _OPEN_ACTIONS:
         # 豁免轮返回**同一个** decision 对象（`is` 相等），绝不顺手 replace。
-        return ConsensusGateOutcome(decision, None, "exempt", False,
-                                    _consensus_wire("exempt", rule, 0, 0, used_contrarian, None))
+        return ConsensusGateOutcome(decision, None, "exempt", False, _consensus_wire(
+            "exempt", ConsensusWireFacts(rule, 0, 0, used_contrarian, None, bonus, allowance,
+                                         str(bonus_lane or "none"))))
     # ★ 全函数**唯一**一处按方向取数（不变式 1）：此行之下不允许再出现任何方向字面判断。
     long_side = decision.action == "open_long"
     votes = consensus.long_votes if long_side else consensus.short_votes
     opposing = consensus.short_votes if long_side else consensus.long_votes
-    if votes >= rule.min_consensus:
+    effective = votes + bonus                       # 轴 D-1a：顺势追加票（判据不在本函数）
+    facts = ConsensusWireFacts(rule, votes, opposing, used_contrarian, None, bonus, allowance,
+                               str(bonus_lane or "none"))
+    if effective >= rule.min_consensus:
         return ConsensusGateOutcome(decision, None, "consensus", False,
-                                    _consensus_wire("consensus", rule, votes, opposing,
-                                                    used_contrarian, None))
-    tally = f"({votes}/{rule.min_consensus})"
+                                    _consensus_wire("consensus", facts))
+    tally = f"({effective}/{rule.min_consensus})"
     if not rule.contrarian_enabled:
         # 逐字节回退：降级码与旧版 `apply_consensus_gate` 完全相同。
-        return _veto(decision, f"low_consensus{tally}", rule, votes, opposing, used_contrarian)
+        return _veto(decision, f"low_consensus{tally}", facts)
     blocked = _contrarian_block(rule, decision, opposing=opposing,
-                                used_contrarian=used_contrarian)
+                                used_contrarian=used_contrarian,
+                                max_opposing=max_opposing)
     if blocked is not None:
-        return _veto(decision, f"{blocked}{tally}", rule, votes, opposing, used_contrarian)
+        return _veto(decision, f"{blocked}{tally}", facts)
     # 强制降档（不变式 2：只可能更小）。三种情形一律退回否决，报 `low_consensus_size`：
     #   ① 被档位地板吃到 0 —— 绝不发一张零张的单；
     #   ② 量化向上吸附把仓位放大到原值以上 —— 本通路只可能更宽，绝不可能放大仓位；
@@ -390,20 +409,26 @@ def resolve_consensus_gate(decision: TradeDecision, consensus: Consensus, rule: 
     size = quantize_size_fraction(target, position_step)
     shrink_requested = rule.contrarian_size_mult < 1.0
     if size <= 0 or size > proposed or (shrink_requested and size >= proposed):
-        return _veto(decision, f"{REASON_SIZE}{tally}", rule, votes, opposing, used_contrarian)
+        return _veto(decision, f"{REASON_SIZE}{tally}", facts)
     return ConsensusGateOutcome(replace(decision, size_fraction=size), None, "contrarian", True,
-                                _consensus_wire("contrarian", rule, votes, opposing,
-                                                used_contrarian, None))
+                                _consensus_wire("contrarian", facts))
 
 
 def _contrarian_block(rule: ConsensusRule, decision: TradeDecision, *, opposing: int,
-                      used_contrarian: int) -> str | None:
+                      used_contrarian: int, max_opposing: int | None = None) -> str | None:
     """逆势通路的四条件（**顺序即降级码**：先判到哪条就报哪条）；全过 ⇒ `None`。
 
     fail-closed（不变式 3）：`used_contrarian` 非整数、`confidence` 非有限、证据非字符串，
     三者一律判为不通过——「无法验证」不等于「合规」。
+
+    `max_opposing`（execution-trend-verdict 轴 D-1b）：**只**替换首行那条反向票上限；缺省 ⇒
+    取 `rule.contrarian_max_opposing_votes`（逐字节回退）。其余三条判据（会话配额 / 置信度
+    下界 / 逐字证据长度）与其后的强制降档**一个字节不动**——本通路放宽的是「门槛之上的
+    天花板」，不是门槛本身。
     """
-    if opposing > rule.contrarian_max_opposing_votes:
+    ceiling = (rule.contrarian_max_opposing_votes if max_opposing is None
+               else int(max_opposing))
+    if opposing > ceiling:
         return REASON_OPPOSED
     if not isinstance(used_contrarian, int) or used_contrarian >= rule.contrarian_max_per_session:
         return REASON_QUOTA
@@ -416,28 +441,59 @@ def _contrarian_block(rule: ConsensusRule, decision: TradeDecision, *, opposing:
     return None
 
 
-def _veto(decision: TradeDecision, reason: str, rule: ConsensusRule, votes: int,
-          opposing: int, used_contrarian: int) -> ConsensusGateOutcome:
+@dataclass(frozen=True)
+class ConsensusWireFacts:
+    """`_consensus_wire` 的聚合入参（评审 RP2-1 的**还债**）。
+
+    本函数合入前已是 6 个位置形参（CLAUDE.md 上限 5，已登记为偏离），
+    execution-trend-verdict 又要给它加五键——照旧写法会到 9 个。故同轮收成一个 frozen 结构体，
+    签名降到 2 个形参，`.claude-index/config.md` 里那条偏离本轮**已还清**。
+    """
+
+    rule: ConsensusRule
+    votes: int                 # 策略板**原始**票数（语义不变）
+    opposing: int
+    used_contrarian: int
+    reason: str | None
+    bonus_votes: int = 0       # 轴 D-1a 追加票
+    opposing_allowance: int = 0  # 轴 D-1b 反向票上限放宽额度
+    bonus_lane: str = "none"   # 轴 D-1a 的五态归因（判定源在 `trend_verdict.trend_bonus_lane`）
+
+
+def _veto(decision: TradeDecision, reason: str,
+          facts: ConsensusWireFacts) -> ConsensusGateOutcome:
     """把开仓硬降级为 hold（构造出的 hold 与旧版 `apply_consensus_gate` **逐字相同**）。"""
     hold = TradeDecision(action="hold", size_fraction=None, confidence=None, reason=reason)
     return ConsensusGateOutcome(hold, reason, "veto", False,
-                                _consensus_wire("veto", rule, votes, opposing,
-                                                used_contrarian, reason))
+                                _consensus_wire("veto", replace(facts, reason=reason)))
 
 
-def _consensus_wire(lane: str, rule: ConsensusRule, votes: int, opposing: int,
-                    used_contrarian: int, reason: str | None) -> dict:
-    """门禁判定的 camelCase 只读快照（trace 相位 / `gateVeto` 注记 / payload 共用同一份）。"""
-    used = used_contrarian if isinstance(used_contrarian, int) else 0
+def _consensus_wire(lane: str, facts: ConsensusWireFacts) -> dict:
+    """门禁判定的 camelCase 只读快照（trace 相位 / `gateVeto` 注记 / payload 共用同一份）。
+
+    **原值与合成值同时下发是硬要求**（execution-trend-verdict §3.6.2）：只发合成值，用户就
+    无法回答「这一票是策略给的还是趋势给的」「这单是本来就够格还是被基调放宽了」。故
+    `votes` / `contrarianMaxOpposingVotes` 两键**语义不变**（仍是策略板原始票数与配置原值），
+    另加五个键说明本轮的放宽。
+    """
+    rule = facts.rule
+    used = facts.used_contrarian if isinstance(facts.used_contrarian, int) else 0
     remaining = max(0, rule.contrarian_max_per_session - used) if rule.contrarian_enabled else 0
-    return {"lane": lane, "votes": votes, "opposingVotes": opposing,
-            "minConsensus": rule.min_consensus, "reason": reason,
+    return {"lane": lane, "votes": facts.votes, "opposingVotes": facts.opposing,
+            "minConsensus": rule.min_consensus, "reason": facts.reason,
             "contrarianAvailable": bool(rule.contrarian_enabled),
             "contrarianUsed": used, "contrarianRemaining": remaining,
             "contrarianMinConfidence": rule.contrarian_min_confidence,
             "contrarianMinEvidenceChars": rule.contrarian_min_evidence_chars,
             "contrarianMaxOpposingVotes": rule.contrarian_max_opposing_votes,
-            "contrarianSizeMult": rule.contrarian_size_mult}
+            "contrarianSizeMult": rule.contrarian_size_mult,
+            # ---- 轴 D-1a / D-1b 的五个加法键（execution-trend-verdict §5.3）----
+            "trendBonusVotes": int(facts.bonus_votes),
+            "effectiveVotes": int(facts.votes) + int(facts.bonus_votes),
+            "trendBonusLane": facts.bonus_lane,
+            "trendOpposingAllowance": int(facts.opposing_allowance),
+            "effectiveMaxOpposingVotes": (rule.contrarian_max_opposing_votes
+                                          + int(facts.opposing_allowance))}
 
 
 def consensus_rule_from_settings(settings) -> ConsensusRule:

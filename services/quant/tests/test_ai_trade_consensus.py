@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 from app.ai_auto.decider import TradeDecision
 from app.ai_auto.session import AiTradeSession
+from app.ai_auto.trend_runtime import TrendRuntime
+from app.ai_auto.trend_verdict import TrendVerdictRule
 from app.ai_auto.open_funnel import OpenFunnelCounters, classify_block
 from app.ai_auto.signals import (
     ConsensusRule,
@@ -60,6 +62,11 @@ def _gate(need: int, decision: TradeDecision, board_stances: list[str], degrade=
         _consensus_rule=consensus_rule_from_settings(settings),
         _contrarian_used=used,
         _round_trace=None,
+        # execution-trend-verdict：`_apply_consensus_gate` 现在还会读会话的趋势基调运行时来解
+        # 两条顺势放宽通路。替身 self 必须同步补齐——**未装配的 rule ⇒ 两条通路恒返回 0** ⇒
+        # 本文件全部断言与本特性合入前逐字相同（这正是「总闸关即逐字节回退」的会话级证明）。
+        _trend_rule=TrendVerdictRule(),
+        _trend=TrendRuntime(TrendVerdictRule()),
         _discipline=SimpleNamespace(funnel=OpenFunnelCounters()))
     consensus = compute_consensus([_view(s) for s in board_stances])
     return AiTradeSession._apply_consensus_gate(host, decision, consensus, degrade)
@@ -229,6 +236,10 @@ def test_session_gate_counts_contrarian_and_never_calls_it_a_block():
         _consensus_rule=consensus_rule_from_settings(settings),
         _contrarian_used=0,
         _round_trace={},
+        # 同上：替身 self 必须带上会话的趋势基调运行时（未装配 ⇒ 两条通路恒返回 0 ⇒
+        # 本用例的断言与本特性合入前逐字相同）。
+        _trend_rule=TrendVerdictRule(),
+        _trend=TrendRuntime(TrendVerdictRule()),
         _discipline=SimpleNamespace(funnel=funnel))
     out, degrade = AiTradeSession._apply_consensus_gate(
         host, decision, compute_consensus([_view("long")]), None)

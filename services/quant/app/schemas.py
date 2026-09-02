@@ -853,6 +853,39 @@ class AiTradeDirectionIn(BaseModel):
                 if key != "contrarianEnabled" and value is not None}
 
 
+class AiTradeTrendIn(BaseModel):
+    """执行周期趋势基调入参（ai-trade-execution-trend-verdict §5.1）。
+
+    **字段整键缺省 ⇒ 服务端按 settings 装配开启态**——沿用 `baseRules` / `profitGuard` /
+    `tradingHorizon` / `discipline` / `direction` 的成文惯例：「老客户端没发这个字段」与
+    「用户亲手取消了勾选」是两件不同的事。`{"enabled": false}` 是显式关闭的唯一途径。
+
+    值域**一次性在本层校验**（越界 422）；服务端 `_resolve_trend` 只做缺省回填、不复夹
+    （沿用 `_resolve_position_step` 的 [R-2] 惯例）。
+
+    **三把子闸的极性必须分开记**（RK-3 的可回退性依赖这一点）：`counterGateEnabled` 是唯一会
+    **减少**成交的那一把（逆势开仓需更高置信度 + 强制降档）；`consensusVoteEnabled` 与
+    `contrarianAllowanceEnabled` 是唯二会**增加**成交的两条通路。把它们绑在一起，运维就无法
+    只回退「变宽」的那一半。
+    """
+
+    enabled: bool = True
+    counterGateEnabled: bool | None = None
+    counterMinConfidence: float | None = Field(default=None, gt=0, le=1)
+    counterSizeMult: float | None = Field(default=None, gt=0, le=1)
+    consensusVoteEnabled: bool | None = None
+    contrarianAllowanceEnabled: bool | None = None
+
+    def overrides(self) -> dict:
+        """非空覆盖字段（camelCase）。键集与 `api/ai_auto._TREND_TO_SETTING` 一一对应。
+
+        `enabled` **单独处理**（与 `AiTradeDirectionIn.contrarianEnabled` 同姿态）：它是装配
+        与否的开关，不是一个可覆盖的阈值。
+        """
+        return {key: value for key, value in self.model_dump().items()
+                if key != "enabled" and value is not None}
+
+
 class AiTradeDisciplineIn(BaseModel):
     """交易纪律预设入参（ai-trade-discipline-preset-and-integrity §5.1）。
 
@@ -959,6 +992,11 @@ class AiTradeGroupStartIn(BaseModel):
     # `{"contrarianEnabled":false}` ⇒ 该会话不装配逆势通路（等价本特性合入前的共识门禁）。
     # **实盘与回测两处启动体都接该字段、走同一解析点**——否则用户拿回测调出来的参数在实盘失真。
     direction: AiTradeDirectionIn | None = None
+    # 执行周期趋势基调（默认开启，同上语义，解析点 `_resolve_trend`，**必须排在
+    # `_resolve_discipline` 之后**）；`{"enabled":false}` ⇒ 该会话不装配基调层。
+    # **实盘与回测两处启动体都接该字段、走同一解析点**（评审 RP1-10）：只接实盘一侧，
+    # 「用户在回测里调出来的参数在实盘生效」这条承诺就在**反方向**上破了。
+    trend: AiTradeTrendIn | None = None
 
     @field_validator("members")
     @classmethod
@@ -1161,6 +1199,10 @@ class AiBacktestStartIn(BaseModel):
     # 方向对称性 / 逆势通路：与实盘**同字段同语义、同一 `_resolve_direction` 解析**——回测正是
     # 唯一能对「开 vs 不开逆势通路」做净额对照的地方，两侧不同源就等于那个对照跑的不是实盘参数。
     direction: AiTradeDirectionIn | None = None
+    # 执行周期趋势基调：与实盘**同字段同语义、同一 `_resolve_trend` 解析**（评审 RP1-10）。
+    # 同一条理由：回测是唯一能对「开 vs 不开基调层」做净额对照的地方，两侧不同源就等于那个
+    # 对照跑的不是实盘参数。
+    trend: AiTradeTrendIn | None = None
 
 
 class AiBacktestStartOut(BaseModel):

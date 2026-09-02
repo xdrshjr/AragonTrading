@@ -369,3 +369,39 @@ def test_contrarian_passed_is_not_a_block():
     assert counters.contrarian_passed == 1
     assert counters.blocked == {} and counters.blocked_by_side == {}
     assert funnel_wire(counters, directional=True)["directionBalance"]["contrarianPassed"] == 1
+
+
+# ============ 趋势基调·逆势门槛（execution-trend-verdict §7.3 S-3 / S-4）============
+def test_trend_bias_layer_is_classified_and_ordered_before_consensus():
+    """`counter_trend_*` 归 `trendBias`；层序与决策链逐字同构（刹车之后、共识之前）。"""
+    assert classify_block("counter_trend_confidence(score=-0.61,conf=0.40/0.65)") == "trendBias"
+    assert classify_block("counter_trend_size(score=-0.32)") == "trendBias"
+    assert LAYERS.index("drawdownBrake") < LAYERS.index("trendBias") < LAYERS.index("consensus")
+    assert "trendBias" in funnel_wire(OpenFunnelCounters())["layers"]
+
+
+def test_funnel_still_closes_with_the_new_layer():
+    """S-3：新层加入后 `sum(blocked) + sizingZeroed + submitted == intents` 仍然闭合。"""
+    counters = OpenFunnelCounters()
+    for degrade in ("counter_trend_confidence(x)", "counter_trend_size(x)", None):
+        counters.note_intent("open_short", None)
+        action = "hold" if degrade else "open_short"
+        counters.note_sizing(action, 0.5)
+        counters.note_executed(action, False)
+        counters.note_block(degrade)
+        counters.end_round()
+    wire = funnel_wire(counters)
+    assert wire["blocked"] == {"trendBias": 2}
+    assert sum(wire["blocked"].values()) + wire["sizingZeroed"] + wire["submitted"] == wire[
+        "intents"] == 3
+
+
+def test_wants_open_is_the_single_source_for_the_denominator():
+    """`wants_open` 是分母判据的**唯一**落点（漏斗与趋势基调门面共用它，评审 RP1-1）。"""
+    from app.ai_auto.open_funnel import wants_open
+
+    assert wants_open("open_short", None) is True
+    assert wants_open("hold", "low_confidence") is True     # action 已被洗成 hold
+    assert wants_open("hold", None) is False
+    assert wants_open("close", None) is False
+    assert wants_open("hold", "llm_error") is False

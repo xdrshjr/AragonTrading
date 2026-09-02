@@ -48,6 +48,10 @@ export interface AiBacktestStartReq {
   // 方向对称性 / 逆势通路：与实盘**同字段同语义、同一 `_resolve_direction` 解析**——回测正是
   // 唯一能对「开 vs 不开逆势通路」做净额对照的地方，两侧不同源就等于那个对照跑的不是实盘参数。
   direction?: import("./aiTradeTypes").AiTradeDirectionRule | null;
+  // 执行周期趋势基调：与实盘**同字段同语义、同一 `_resolve_trend` 解析**（评审 RP1-10）。
+  // 回测是唯一能对「开 vs 不开基调层」做净额对照的地方，两侧不同源就等于那个对照跑的
+  // 不是实盘参数。
+  trend?: import("./aiTradeTypes").AiTradeTrendRule | null;
 }
 
 export interface AiBacktestStartResult {

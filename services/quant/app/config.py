@@ -800,6 +800,39 @@ class Settings(BaseSettings):
     # 一律不进分母也不进任何占比——把 21% 方向不可知的轮次算进去会得出一句数据不支持的结论。
     ai_trade_direction_balance_min_samples: int = Field(default=8, ge=1, le=1000)
 
+    # ---- AI 自动交易 · 执行周期趋势基调（ai-trade-execution-trend-verdict §6.3，10 项）----
+    # 总闸：False ⇒ **全链路逐字节回退**到本特性合入前——payload 的 `trendVerdict` 键、决策
+    # prompt 的《本轮趋势基调》段与第七段宪章、决策纪律 #1 的读序、《审议协议》S1/S2/S12 与
+    # **复核侧 R4 与两条评级标准**、逆势降档闸、两条顺势放宽通路、trace 两相位的新键、
+    # 开仓漏斗的 `trendBias` 层与统计卡全部回到旧形态。
+    ai_trade_trend_verdict_enabled: bool = True
+    # 回测侧独立总闸（沿用 `horizon` / `profit_guard` 的既有先例）。
+    ai_trade_trend_verdict_backtest_enabled: bool = True
+    # 对称死区：**`|score|`**（含高周期调制）达该值才给方向。
+    ai_trade_trend_enter_threshold: float = Field(default=0.22, gt=0, le=1)
+    # 记 `strong` 的下界，判据是 **`|execScore|`**（**不含**高周期，评审 RP0-3——让高周期参与
+    # 强度，等于让它在「日线看多、15m 翻空」这个目标断面上一键关停整个特性）。
+    # 解析点 `trend_rule_from_settings` 夹紧到 `> enter + 0.05`（两阈值倒挂时 strength 语义会崩）。
+    ai_trade_trend_strong_threshold: float = Field(default=0.55, gt=0, le=1)
+    # 高周期调制项权重（解析点封顶到 `_HTF_WEIGHT_CAP=0.30`，与 `_MIN_EXEC_WEIGHT=0.5` 一起
+    # **构造性地**保证「高周期永远翻不动执行周期的结论」，即不变式 I-1）。
+    ai_trade_trend_htf_weight: float = Field(default=0.18, ge=0, le=0.4)
+    # 轴 D-2 逆势降档闸独立总闸。**它是三把子闸里唯一会减少成交的那一把**，故与下面两把
+    # 「放宽」通路分开，运维可以只回退变宽的那一半。
+    ai_trade_trend_counter_gate_enabled: bool = True
+    # 逆势开仓的置信度下界。**比的是 `decision.confidence`（模型自报值）**，与既有逆势通路
+    # `_contrarian_block` 的判据同源；绝不是 `verdictConfidence`（取后者等于「基调越强越容易
+    # 开逆势单」，极性正好反了）。
+    ai_trade_trend_counter_min_confidence: float = Field(default=0.65, gt=0, le=1)
+    # 逆势开仓的强制降档倍数（量化后仍须严格小于原提议，否则报 `counter_trend_size`）。
+    ai_trade_trend_counter_size_mult: float = Field(default=0.5, gt=0, le=1)
+    # 轴 **D-1a** 顺势追加一票独立总闸（「锦上添花，不雪中送炭」：该方向须已有 ≥1 张原生票）。
+    ai_trade_trend_consensus_vote: bool = True
+    # 轴 **D-1b** 顺势放宽逆势通路反向票上限（+1）独立总闸。它**不发票**，只抬高
+    # `_contrarian_block` 首行那条上限；逆势通路的逐字证据、置信度下界、会话配额与强制
+    # ×0.5 降档一条不减。它是「信号板一票都没有」那个断面的唯一出口。
+    ai_trade_trend_contrarian_allowance: bool = True
+
     # ---- W-A 采全（1 项）----
     # False ⇒ 退回上一轮行为：接管 / 离线平仓的往返**只计缺口、不补采**。
     ai_trade_experience_adopt_harvest_enabled: bool = True

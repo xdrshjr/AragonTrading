@@ -7,6 +7,7 @@ import type {
   AiTradeFundingStats,
   AiTradeHorizonStats,
   AiTradeOpenFunnel,
+  AiTradeTrendStats,
 } from "./aiTradeTypes";
 import type { AiTradeRealizedStats } from "./aiTradeProfitability";
 import type { Trade } from "./types";
@@ -166,6 +167,10 @@ export interface AiTradeRunMetrics {
     // 故与实时侧**同形同源**。方向轴两键（`bySide` / `directionBalance`）随它整体带上
     // （directional-symmetry 轴 D，零 DB 迁移）。老记录缺键 ⇒ 方向卡整卡不渲染。
     openFunnel?: AiTradeOpenFunnel | null;
+    // 执行周期趋势基调（execution-trend-verdict §3.7.5）：经 `build_trend_stats` 落进
+    // `aiStats`，与实时侧的成员级 `status.trendVerdict` **同形同源**（同一次 `stats_wire()`
+    // 调用的产物）。老记录缺键 ⇒ 整卡不渲染（绝不显示一排误导性的 0）。
+    trendVerdict?: AiTradeTrendStats | null;
   };
 }
 

@@ -132,6 +132,17 @@ from .trace import (
     sizing_event,
     trace_event,
 )
+from .trend_runtime import TrendRuntime
+from .trend_verdict import (
+    TrendInputs,
+    alignment_of,
+    apply_trend_bias_gate,
+    build_trend_verdict,
+    trend_bonus_lane,
+    trend_consensus_bonus,
+    trend_contrarian_allowance,
+    trend_rule_from_settings,
+)
 from .turnover_discipline import rule_from_horizon as turnover_rule_from_horizon
 from .wake_reason import WakeReadings
 from .wake_runtime import InjectionContext, WakeRuntime
@@ -306,6 +317,18 @@ class AiTradeSession:
         # 本会话已用 N/M 经 `status.discipline.contrarian` 下发，使「重启刷配额」可见（[P2-4]）。
         self._consensus_rule = consensus_rule_from_settings(executor.settings)
         self._contrarian_used = 0
+        # 执行周期趋势基调（execution-trend-verdict 轴 A / E）：同款下沉范式——**判定全在
+        # `trend_verdict.py`（纯核心）与 `trend_runtime.py`（会话门面）**，本文件只有薄接线。
+        # `executor.settings` 与上一行同源：它就是 `_resolve_discipline` / `_resolve_trend`
+        # 产出的那份派生副本，读进程级单例会拿到一组死字母阈值。
+        # 总闸关 ⇒ `build_trend_verdict` 恒返回 None ⇒ payload 无键 ⇒ prompt / 协议 / 门禁 /
+        # trace / 统计**全链路逐字节回退**（用例 S-5）。
+        self._trend_rule = trend_rule_from_settings(executor.settings)
+        self._trend = TrendRuntime(
+            self._trend_rule,
+            min_samples=executor.settings.ai_trade_direction_balance_min_samples)
+        # 轮级槽：`tool_call` 相位的 `trendGate` 兄弟键（`_begin_round_trace` 每轮复位）。
+        self._trend_gate_wire: dict | None = None
         # 交易经验上下文图（ai-trade-experience-context-graph §4.10 · W-6）：同款「运行时对象 +
         # inject(payload)」下沉范式。**两个形参都带默认值** ⇒ 既有构造点逐字节零回归：未装配
         # （空对象模式）⇒ payload 无 `experience` 键 ⇒ `build_decision_prompt` 输出与本特性合入前
@@ -488,6 +511,9 @@ class AiTradeSession:
                     # 轴 C：漏斗末格（事件级口径）。方向取**成交腿自己的 side**——本记点排在
                     # `note_executed` 之后，轮级 `_intent_side` 早已被清（directional-symmetry P0-1）。
                     self._discipline.funnel.note_filled(str(trade.get("side") or ""))
+                    # 趋势基调（评审 RP0-5）：按 `clOrdId` 认领**开仓那一刻定格**的 alignment，
+                    # 认领不到即计入 `unknown`（接管仓位 / 离线平仓 / 重启后续跑）。绝不猜。
+                    self._trend.note_fill(trade)
                     self._horizon.note_open(trade, time.time(), seq=self._position_seq)
                     self._repair.note_epoch(self._position_seq)   # 新持仓周期 ⇒ 补挂配额清零
                     self._backstop.force_next()   # 随单 OCO 是否真的挂上，是开仓后最该立刻知道的事
@@ -521,6 +547,10 @@ class AiTradeSession:
                     self._intel_cite.note_close(
                         trade, (trade.get("explain") or {}).get("meta") or {},
                         self._cost.last_settled_trip())
+                    # 趋势基调（评审 RP0-5）：净额盈亏**口径取自 `AttributionLedger` 里
+                    # `record_close` 已算好的那一份 `net`**，本层绝不另算——两处各算一次必漂移，
+                    # 而这两个数会并排出现在同一张卡上。取不到 ⇒ 只释放归属、不记数。
+                    self._trend.note_settled(self._cost.last_close_net_usd())
                     await self._experience.persist_pending()
                     await self._intel_cite.persist_pending()
                     if self._experience.take_dirty():
@@ -1645,6 +1675,10 @@ class AiTradeSession:
             # 与反思之前（此时的 decision/degrade 正是第一阶段输出，惯性以模型真实意愿为准）。
             self._update_hold_streak(decision.action, degrade)
             self._discipline.note_intent(decision.action, degrade)   # 轴 C：开仓漏斗的**分母**
+            # ★ 趋势基调的开仓意愿分母（轴 E）：判据**逐字复用** `open_funnel.wants_open`——
+            # `low_confidence` 轮此刻 action 已被 `_map_decision` 洗成 hold（实测占开仓意愿
+            # 21%），只按 action 判会把每一轮（含纯观望轮）都计进去（评审 RP1-1）。
+            self._trend.note_intent(decision.action, degrade, payload.get("trendVerdict"))
             # 情报引用归因（closed-loop 轴 A/B）：**取 `stage1_decision`**（E-4，任何门禁之前的
             # 那一个）。取门禁后的会让「模型采信了情报却被冷却门禁拦下」变成「模型没采信情报」。
             # 编号表随注入快照一起来（热路径不查库，§3.0 第 1 条）。
@@ -1686,6 +1720,11 @@ class AiTradeSession:
             decision, degrade = self._horizon.backstop_gate(
                 decision, degrade, position_side=self.executor.projected)
             decision, degrade = self._sizing.gate(decision, degrade)   # ★ 回撤刹车 / 连亏熔断（第 7 步）
+            # ★ 趋势基调·逆势门槛（execution-trend-verdict 轴 D-2）：刹车**之后**、共识**之前**。
+            # 排序理由：基调是「方向层」的判据、共识是「证据数量层」的判据，方向层先判使漏斗
+            # 层序读起来是「先问往哪边、再问有几个人同意」；且被基调拦下的轮此时已是 hold，
+            # `resolve_consensus_gate` 首行对 hold 本就直通 ⇒ 两条放宽通路自动不生效（S-2）。
+            decision, degrade = self._apply_trend_bias_gate(decision, degrade)
             decision, degrade = self._apply_consensus_gate(decision, consensus, degrade)  # E2 门禁
             # ★ 最小 edge 门禁（§3.7）：共识后、反思前——被拦轮此时已是 hold，而反思对 hold 本就
             # 直通 ⇒ EV 不足的轮次自动省掉一次反思 LLM 调用，门禁本身就是省钱项。
@@ -1705,6 +1744,12 @@ class AiTradeSession:
             # ★ 档位定型（X-9）：计数 + 退出归因打标槽，**必须在真实执行之前**——打标由
             # `_inject_explain_meta` 在 `_dispatch` 的成交事件上消费。
             self._note_exit_priority_round()
+            # ★ 评审 RP0-5 第一步：alignment **在委托发出之前**置进轮级槽。落点必须在
+            # `_execute_decision` **之前**（实施期发现 F-7）——市价单的成交事件是在它内部经
+            # `_dispatch` 发出的，排在它之后每一笔市价开仓腿都会落进 `unknown` 且不报错。
+            # 与 `self._cost.note_estimate(...)` / `claim_estimate(...)` 的两步姿态逐字同构。
+            # `alignment_of` 对 hold / close / 被拦轮恒返回 `neutral` ⇒ 本行自动空转。
+            self._trend.note_alignment(alignment_of(decision.action, self._trend.verdict))
             executed = await self._execute_decision(decision, ref_px, i, ts)
             # F-4 的另一半：「提议了平仓、也放行了，但挂单槽位没腾出来所以本轮什么都没平」此前
             # 是一条完全静默的路径（无成交、无降级码）。合成仍遵循「先执行者胜出」。
@@ -1716,6 +1761,11 @@ class AiTradeSession:
             # 引用行冻结进跨轮认领槽（逐行镜像紧邻的 `self._cost.claim_estimate(...)`）。
             self._intel_cite.note_executed(decision.action, executed,
                                            resting=self.executor.resting)
+            # ★ 评审 RP0-5 第二步：限价开仓单会 resting 若干轮，故在**下单那一刻**按 `clOrdId`
+            # 把轮级 alignment 冻结进跨轮认领表（逐行镜像上一行的 `claim_estimate`）。
+            # 已实现净额要到平仓结算才出现，那时基调早已翻面——读「当轮基调」去归因会把成绩
+            # 系统性地记到错误的一侧，而单轮用例恒绿。
+            self._trend.claim_alignment(self.executor.resting)
             self.rounds_completed = round_no
             # RC-2/RC-3：研判全文只走 agent_trace/_traces；进 journal 与 decision 事件的取有界摘录（≤400）。
             # 降级轮 last_analysis 恒为空串（RC-1）→ excerpt=None（journal/事件不带残段）。
@@ -1776,6 +1826,7 @@ class AiTradeSession:
             self._deciding = False
             self._discipline.funnel.end_round()   # R-12：轮级标志兜底清零（异常路径也走这里）
             self._cost.end_round()   # 轴 A：轮级估计同址清零（D-3：被否的意图绝不改绑到下一笔往返）
+            self._trend.end_round()  # 同款纪律：一次被否的开仓意图绝不改绑到下一笔成交上
             # closed-loop 评审 P1-9：同一处、同一条纪律——一次在 `note_decision` 之后、
             # `persist_pending` 之前抛错的轮，绝不可把它的引用行留给下一轮。**认领槽不清**。
             self._intel_cite.end_round()
@@ -1948,6 +1999,7 @@ class AiTradeSession:
         """round_start：装配在飞轮次（引用入环、后续原地累积）+ 推输入快照（RV-7：须在 consensus 之后）。"""
         slim = [self._view_slim(v) for v in board]
         self._round_trace = new_round_trace(round_no, ts, ref_px, payload, slim)
+        self._trend_gate_wire = None      # 轮级槽：`tool_call` 相位的 `trendGate` 兄弟键
         self._traces.append(self._round_trace)
         trace = self._round_trace
         await self._push(trace_event(
@@ -1959,7 +2011,9 @@ class AiTradeSession:
             profitGuardCooldown=trace["profitGuardCooldown"],
             signalPriors=trace["signalPriors"], wake=trace["wake"],
             tacticalContext=trace["tacticalContext"], tacticalTier=trace["tacticalTier"],
-            contextDisclosure=trace["contextDisclosure"]))
+            contextDisclosure=trace["contextDisclosure"],
+            # 执行周期趋势基调（§3.7.4-2）：未装配 ⇒ None ⇒ 前端整段不渲染。
+            trendVerdict=trace["trendVerdict"]))
 
     # ---------- 下单前二次反思编排（ai-trade-pre-trade-reflection §2.3；精简，装配下沉 trace.py）----------
     async def _reflect_before_execute(self, round_no: int, ts: int, payload: dict,
@@ -2220,6 +2274,10 @@ class AiTradeSession:
                  "proposedReason": (str(proposed.reason or "")[:_ANALYSIS_EXCERPT_CHARS]
                                     if vetoed else None),
                  "vetoedBy": layer}
+        # 执行周期趋势基调的判定快照（§3.7.4-3）：与既有 `consensusGate` 走同一条轨，门控判据
+        # 同样是「**本层真的判过**」而不是总闸——按总闸门控会让绝大多数轮次发一个空壳。
+        if self._trend_gate_wire is not None:
+            extra["trendGate"] = self._trend_gate_wire
         if self.executor.settings.ai_trade_directional_symmetry_enabled:
             # 中文层名**由后端下发**（`discipline._THRESHOLD_LABELS` 的成文纪律）：前端抄一份，
             # 下次加一层就会把英文 key 怼到用户脸上。总闸关 ⇒ 整键缺席 ⇒ 前端逐字回退。
@@ -2512,6 +2570,25 @@ class AiTradeSession:
             await self._push(sizing_event(round_no, ts, wire))
         return decision
 
+    def _apply_trend_bias_gate(self, decision: TradeDecision,
+                               degrade: str | None) -> tuple[TradeDecision, str | None]:
+        """薄封装 `trend_verdict.apply_trend_bias_gate`（execution-trend-verdict 轴 D-2）。
+
+        逆势开仓需过一道**模型自报**置信度下界并被强制降档；不达标退回 hold。总闸关 / 非开仓 /
+        顺势 / 基调不强 ⇒ 原对象直通（`is` 相等）。
+
+        `trendGate` 的下发门控是「**本层真的判过**」（`out.lane != "exempt"`），与
+        `_apply_consensus_gate` 里那条判据逐字同构——按总闸门控会让绝大多数轮次发一个
+        `lane="exempt"` 的空壳。
+        """
+        out = apply_trend_bias_gate(decision, self._trend.verdict, self._trend_rule,
+                                    position_step=self.decider.position_step)
+        self._trend.note_gate(out)
+        if self._round_trace is not None and out.lane != "exempt":
+            self._round_trace["trendGate"] = out.wire
+        self._trend_gate_wire = out.wire if out.lane != "exempt" else None
+        return out.decision, (degrade or out.reason)
+
     def _apply_consensus_gate(self, decision: TradeDecision, consensus: Consensus,
                               degrade: str | None) -> tuple[TradeDecision, str | None]:
         """薄封装 `signals.resolve_consensus_gate`（§2.8/R1 + directional-symmetry 轴 A）。
@@ -2523,9 +2600,21 @@ class AiTradeSession:
         `position_step` 的真源是 `decider.position_step`（`session.py` 另有两处同款取法）——步长是
         决策器的属性，把它拷进 `ConsensusRule` 就会出现「规则里的 step 与决策器的不是同一个」。
         """
+        # ★ 两条顺势放宽通路（execution-trend-verdict 轴 D-1a / D-1b）：**首参必须是本轮动作**
+        # （评审 RP0-1）——`resolve_consensus_gate` 把追加票加到 `decision.action` 那一侧，判据
+        # 不含动作就会给逆势开仓白发一票，与「顺势才追加」正好相反且不报任何错。
+        # 此处的 `decision` 是**过了基调闸之后**的那一个：被基调闸拦下的轮此刻已是 hold，
+        # 门禁首行的 `_OPEN_ACTIONS` 判据会让它直通 exempt，两条通路自动不生效（用例 S-2）。
+        verdict = self._trend.verdict
+        lane = trend_bonus_lane(decision.action, verdict, consensus, self._trend_rule)
+        allowance = trend_contrarian_allowance(decision.action, verdict, self._trend_rule)
+        self._trend.note_bonus(lane, allowance)
         out = resolve_consensus_gate(decision, consensus, self._consensus_rule,
                                      position_step=self.decider.position_step,
-                                     used_contrarian=self._contrarian_used)
+                                     used_contrarian=self._contrarian_used,
+                                     bonus_votes=trend_consensus_bonus(
+                                         decision.action, verdict, consensus, self._trend_rule),
+                                     opposing_allowance=allowance, bonus_lane=lane)
         if out.contrarian_used:
             self._contrarian_used += 1
             self._discipline.funnel.note_contrarian()
@@ -2895,6 +2984,21 @@ class AiTradeSession:
             as_of_ts=self._decision_as_of_ts(ts, wake), last_px=ref_px,
             position_side=self.executor.projected,
             execution_primary=(payload.get("marketContext") or {}).get("primary")))
+        # ★ 执行周期趋势基调（轴 B / §3.4.1）：**必须排在 `self._wake.inject(...)` 之后**——
+        # `conflict` 的战术分支读 `payload["tacticalContext"]`，而那个键由 wake 层在上面这一段
+        # 才写入。排在它之前，`conflict` 恒 `"none"`、战术背离永不生效，**且不报任何错**
+        # （用例 S-1 直接断言顺序；这是经验层 W-8 那条「必须是最后一步」的同款形状）。
+        # 总闸关 ⇒ `None` ⇒ **整键缺席**（不是 None）⇒ `build_decision_prompt` 逐字节回退。
+        verdict = build_trend_verdict(TrendInputs(
+            execution_bar=self.bar,
+            regime=payload.get("marketContext"),
+            digest=payload.get("marketDigest"),
+            multi_timeframe=payload.get("multiTimeframeContext"),
+            tactical=payload.get("tacticalContext"),
+            as_of_ts=self._decision_as_of_ts(ts, wake)), self._trend_rule)
+        if verdict is not None:
+            payload["trendVerdict"] = verdict
+        self._trend.note_verdict(verdict)
         # 经验层 W-8：**必须是本方法的最后一步**，排在 `self._wake.inject(...)` 之后——档位判定读
         # `payload["contextDisclosure"]`，而那个键由 wake 层在上面这一段才写入。排在它之前，
         # 该键恒缺席 ⇒ 档位恒 `full` ⇒ §4.8 的整套压缩静默失效，而那正是本需求点名要解决的
@@ -3068,6 +3172,10 @@ class AiTradeSession:
                 # （§十.5：后端算了、类型补了、没有渲染落点 = 死数据）。
                 "tradability": self._discipline.tradability_status(),
                 "openFunnel": self._discipline.funnel_wire(),
+                # 趋势基调统计（execution-trend-verdict 评审 RP1-2）：**必须与 `openFunnel`
+                # 并列挂在这里**——实时页读的是成员级 status 快照，历史详情页读的才是
+                # `aiStats`；只落一处会让另一页那张卡恒为空。未装配 / 零样本 ⇒ None。
+                "trendVerdict": self._trend.stats_wire(),
                 "summaryHealth": self.decider.summary_health_wire(),
                 # 轴 A 已实现读数（realized-edge-calibration [P1-2]）：**必须挂在这里**，不能只走
                 # `costSnapshot`——那条通道只在 `k_min<=0`（门禁空转）时才发，装了纪律预设的会话
@@ -3276,6 +3384,10 @@ class AiTradeSession:
             # 情报引用归因观测（closed-loop §3.6）：合并落在**调用点**（评审 P2-9），
             # `_compute_ai_stats` 是模块级函数、一字不动。未装配 ⇒ None ⇒ 该键为 None。
             metrics["aiStats"]["intel"] = self._intel_cite.stats()
+            # 趋势基调观测（execution-trend-verdict §3.7.5）：同款**调用点合并**（`_compute_ai_stats`
+            # 是模块级纯函数、拿不到 `self`）。未装配 / 零样本 ⇒ 整键缺席，供事后按「有没有开
+            # 基调层」分臂对账顺势 / 逆势各自的成交与净额。
+            metrics["aiStats"] = self._trend.merge_into(metrics["aiStats"])
             # 深度研判观测（§3.4.4）：**零迁移**（`aiStats` 是既有 JSON blob）。零样本 ⇒ 不写这
             # 个键，供事后按「有没有开深度档」分臂对账 token 成本与研判篇幅的实际收益。
             reasoning_stats = self._reasoning.stats()

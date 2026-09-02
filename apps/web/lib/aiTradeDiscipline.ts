@@ -1,7 +1,7 @@
 // 交易纪律预设与生效自检的前端纯函数（ai-trade-discipline-preset-and-integrity 轴 A/B/C）。
 //
 // 全部无副作用、不依赖 React/store/时钟。三条纪律：
-// 1. **阈值与 13 行的 label 一律由后端下发**，本文件只放弹窗要用的「一句话后果说明」——本仓库已有
+// 1. **阈值与 14 行的 label 一律由后端下发**，本文件只放弹窗要用的「一句话后果说明」——本仓库已有
 //    前后端各存一份口径导致静默漂移的事故（`edgeSource` 逐键手抄吞新键）。
 // 2. `isNakedPosition` **不重算**裸仓判据，只读后端已判好的那一行——`coverageRatio == null`
 //    是「还不知道」、`0` 是「确认裸露」，这个三态判据在前后端各写一遍就是两份口径，而误报会把
@@ -57,7 +57,7 @@ export const DISCIPLINE_COPY: Record<AiTradeDisciplinePreset, DisciplinePresetCo
 export interface DisciplineSummary {
   armed: number;
   total: number;
-  /** `已生效 9/13`。总数为 0（老后端 / 还没成员）⇒ `null` ⇒ 整条纪律条不渲染。 */
+  /** `已生效 9/14`。总数为 0（老后端 / 还没成员）⇒ `null` ⇒ 整条纪律条不渲染。 */
   label: string | null;
   /** 至少一行处于危险态（当前只有裸仓）——纪律条右侧升级为红色警示。 */
   danger: boolean;
@@ -65,7 +65,7 @@ export interface DisciplineSummary {
   warnings: number;
 }
 
-/** 13 行 → 紧凑徽标读数。**只数后端说 armed 的行**，绝不在前端重算判据。 */
+/** 14 行 → 紧凑徽标读数。**只数后端说 armed 的行**，绝不在前端重算判据。 */
 export function summarizeDisciplines(rows: AiTradeDisciplineRow[] | null | undefined):
 DisciplineSummary {
   const list = rows ?? [];

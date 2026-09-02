@@ -156,6 +156,11 @@ function emptyRoundTrace(evt: AiTradeTraceEvent): AiTradeRoundTrace {
     // 交易经验（experience-context-graph W-13 的前端镜像）：同款逐键手抄纪律——漏抄这一键，
     // 「经验 ×N」徽标永远拿不到数据，而 tsc / vitest 都不会红。
     experience: evt.experience ?? null,
+    // 执行周期趋势基调（execution-trend-verdict §3.7.4-4）：同款逐键手抄纪律——`round_start`
+    // **只经过这一个装配点**（`applyAiTradeTracePhase` 在该分支里直接 `emptyRoundTrace(evt)`，
+    // 不走 `reduceRoundPhase`），漏抄这一键后端发什么前端都收不到，且 tsc / vitest 都不会红。
+    trendVerdict: evt.trendVerdict ?? null,
+    trendGate: null,
     thinking: "",
     analysis: "",
     toolCallPending: false,
@@ -262,6 +267,10 @@ function reduceRoundPhase(t: AiTradeRoundTrace, evt: AiTradeTraceEvent): AiTrade
         // directional-symmetry B-3：第四个兄弟键。`emptyRoundTrace` 与这里**两处都要写**，
         // 漏任一处即静默丢数据（该文件已有四条同款警示注释）。
         layerLabel: evt.layerLabel ?? null,
+        // 趋势基调闸（execution-trend-verdict §3.7.4-5）：本层没判过的轮次后端不发这个键，
+        // 故用 `?? t.trendGate ??` 保住同一轮里先到的那一份（`trendVerdict` 走的是
+        // `round_start` 那条轨，两条轨不可互相顶替）。
+        trendGate: evt.trendGate ?? t.trendGate ?? null,
       };
     case "result":
       return {

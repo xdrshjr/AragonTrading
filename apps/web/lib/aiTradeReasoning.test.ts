@@ -23,7 +23,9 @@ describe("parseReasoningStages", () => {
     expect(stages).toHaveLength(12);
     expect(preamble).toBe("");
     // F-1：中文阶段名取自**静态映射**，不依赖模型给的 code。
-    expect(stages[0].titleZh).toBe("多周期背景");
+    // F-6（execution-trend-verdict 轴 C）：S1 的题面由「高周期体制」改为「基调 + 佐证」。
+    // 这个改名在总闸开与关两种形态下都是真话，故**不随总闸联动**。
+    expect(stages[0].titleZh).toBe("趋势基调与多周期背景");
     expect(stages[10].titleZh).toBe("证伪与事前验尸");
     expect(stages[11].titleZh).toBe("校准结论");
     expect(stages[0].code).toBe("CODE1");

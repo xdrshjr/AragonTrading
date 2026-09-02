@@ -46,12 +46,14 @@ _SKEW_SHARE = 0.15
 # 末位 `other` 承接未知前缀——**未知前缀归 other 而不是静默丢弃**（G-11）：静默丢弃会让
 # `sum(blocked)` 小于真实拦截数，而这张图唯一的价值就是它闭合。
 LAYERS = ("baseRuleMaBand", "horizon", "profitCooldown", "turnover", "exchangeBackstop",
-          "drawdownBrake", "consensus", "confidence", "edgeGate", "reflection", "other")
+          "drawdownBrake", "trendBias", "consensus", "confidence", "edgeGate", "reflection",
+          "other")
 
 LAYER_LABELS = {
     "baseRuleMaBand": "基础策略·MA 通道", "horizon": "持仓周期纪律",
     "profitCooldown": "保护性平仓冷却", "turnover": "换手预算",
     "exchangeBackstop": "交易所侧兜底", "drawdownBrake": "回撤刹车 / 连亏熔断",
+    "trendBias": "趋势基调·逆势门槛",
     "consensus": "同向共识门槛", "confidence": "置信度门槛",
     "edgeGate": "最小 edge 门禁", "reflection": "下单前二次反思", "other": "其它",
 }
@@ -69,6 +71,10 @@ _DEGRADE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("profit_cooldown", "profitCooldown"),
     ("drawdown_brake", "drawdownBrake"),
     ("loss_streak", "drawdownBrake"),
+    # 趋势基调·逆势门槛（execution-trend-verdict 轴 E）：`counter_trend_` 与既有任何前缀都不撞，
+    # 位置只影响可读性——但「顺序即优先级」的纪律要求新增条目显式声明自己的位置，故与 `LAYERS`
+    # 的层序同构地排在 `low_consensus` 之前。
+    ("counter_trend_", "trendBias"),
     ("low_consensus", "consensus"),
     ("low_confidence", "confidence"),
     ("edge_below_cost", "edgeGate"),
@@ -93,6 +99,20 @@ _LLM_FAILURE_PREFIXES = ("llm_error", "decision_timeout", "no_tool_call", "inval
 # 两个口径词的共享常量（[P2-6]）：漏斗是**全程累计**，而归因账本 `AttributionLedger._trips` 是
 # `deque(maxlen=200)` 的滚动窗口。两张卡并排时读者极易串口径，故两处文案各引用一个常量。
 LIFETIME_SCOPE_TEXT = "本会话全程累计"
+
+
+def wants_open(action: str, degrade: str | None) -> bool:
+    """本轮是不是一次**真实的开仓意愿**（漏斗分母的**唯一**判据）。
+
+    `low_confidence` 轮此刻 `action` 已被 `_map_decision` 洗成 `"hold"`
+    （`decider.py:393-398` 只在开仓分支里返回这个码，实测占开仓意愿的 21%），故必须按码显式
+    接住它——只按 `action` 判，置信度门禁在漏斗里将**恒不可见**。
+
+    ⚠️ 本函数是这条判据的唯一落点：`OpenFunnelCounters.note_intent` 与
+    `trend_runtime.TrendRuntime.note_intent`（execution-trend-verdict 评审 RP1-1）**共用它**。
+    在第二处另写一遍，两个分母就会在下一次改动时静默分叉——而它们并排出现在同一张卡上。
+    """
+    return (action in _OPEN_ACTIONS and degrade is None) or degrade in _OPEN_ONLY_DEGRADES
 
 
 def classify_block(degrade: str | None) -> str | None:
@@ -173,13 +193,13 @@ class OpenFunnelCounters:
         置信度门禁在漏斗里将**恒不可见**（`_intent_pending` 为假 ⇒ `note_block` 第一行就返回），
         而 spec 的 G-10c 明确要求它的唯一落点是 `blocked["confidence"]`。故按码显式接住它。
         """
-        wants_open = (action in _OPEN_ACTIONS and degrade is None) or degrade in _OPEN_ONLY_DEGRADES
-        self._intent_pending = wants_open
+        opening = wants_open(action, degrade)
+        self._intent_pending = opening
         # 轴 D：**绝不写 `action.removeprefix("open_")`**——`low_confidence` 那条路径此刻 action
         # 已被 `_map_decision` 洗成 `"hold"`，`removeprefix` 会原样返回它，凭空造出第四个桶。
         self._intent_side = (action[len("open_"):] if action in _OPEN_ACTIONS
-                             else UNKNOWN_SIDE) if wants_open else None
-        if wants_open:
+                             else UNKNOWN_SIDE) if opening else None
+        if opening:
             self.intents += 1
             _bump(self.intents_by_side, self._intent_side)
         elif is_llm_failure(degrade):

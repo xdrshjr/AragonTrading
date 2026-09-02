@@ -574,6 +574,23 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
   // `low_consensus` **之前**，与后端 `open_funnel._DEGRADE_PREFIXES` 里 `horizon_turnover_*`
   // 排在裸 `horizon_` 之前的成文纪律逐字同构。调换顺序不会报错，只会让细分码全部退化成裸码
   // 的文案——用户再也分不出「差几票」与「证据没写够」。
+  // 趋势基调·逆势门槛两码 + 一条裸码兜底（execution-trend-verdict §3.7.3）。
+  // ⚠️ **顺序敏感**（`describeDegradeReason` 用 `find(startsWith)`）：两个细分码必须排在裸
+  // `counter_trend` **之前**，与 `low_consensus_*` 的成文纪律逐字同构。
+  // 裸 `counter_trend` 条目今天**永不命中**（后端只产出两个细分码），保留它是**有意为之**的
+  // 廉价保险：下一轮若新增第三个细分码，用户看到的会是一句中文而不是一串英文原始码。
+  {
+    prefix: "counter_trend_confidence",
+    label: "逆势开仓：与本级别趋势基调相反，置信度未达门槛，本轮观望（平仓不受影响）",
+  },
+  {
+    prefix: "counter_trend_size",
+    label: "逆势开仓：强制降档后仓位不合法（被档位吸附回原值或归零），本轮观望",
+  },
+  {
+    prefix: "counter_trend",
+    label: "逆势开仓未通过趋势基调门槛，本轮观望（平仓不受影响）",
+  },
   {
     prefix: "low_consensus_opposed",
     label: "同向共识不足，且信号板反向票数过多，本轮不开放逆势通路",
@@ -661,6 +678,27 @@ export function describeDegradeReason(reason?: string | null): string {
  * 三个值一律**留空即用服务端默认**——前端不存任何默认数值（唯一真源在 `config.py`）。
  * `contrarianEnabled=false` 时其余输入被忽略、一律合法：关闭态的残留值不该阻塞提交。
  */
+/**
+ * 校验趋势基调入参（execution-trend-verdict §5.1）：区间与后端 `AiTradeTrendIn` 的 `Field`
+ * 边界**逐字一致**（前端即时报错，后端越界 422），返回错误文案或 `null`。
+ *
+ * 两个值一律**留空即用服务端默认**——前端不存任何默认数值（唯一真源在 `config.py`）。
+ * `enabled=false` 或逆势闸关闭时其余输入被忽略、一律合法：关闭态的残留值不该阻塞提交。
+ */
+export function validateTrendRule(rule: {
+  enabled: boolean;
+  counterGateEnabled?: boolean | null;
+  counterMinConfidence?: number | null;
+  counterSizeMult?: number | null;
+}): string | null {
+  if (!rule.enabled || rule.counterGateEnabled === false) return null;
+  const floor = rule.counterMinConfidence;
+  if (floor != null && !(floor > 0 && floor <= 1)) return "逆势置信度下界需在 0~1 之间（不含 0）";
+  const mult = rule.counterSizeMult;
+  if (mult != null && !(mult > 0 && mult <= 1)) return "逆势降档系数需在 0~1 之间（不含 0）";
+  return null;
+}
+
 export function validateDirectionRule(rule: {
   contrarianEnabled: boolean;
   contrarianMinConfidence?: number | null;

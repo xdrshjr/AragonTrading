@@ -951,11 +951,18 @@ class AiTradeDecider:
         # 契约未装配 ⇒ 键缺席 ⇒ `""` ⇒ 反思系统 prompt 逐字节回退（G-1 的 sha256 冻结门禁据此成立）。
         # directional-symmetry C-3：R7 追加「对做空提议适用与做多**完全相同**的证据标准」。
         # 复核官「只能收紧、不能改方向」的既有安全语义一个字节都不改；总闸关 ⇒ 逐字节回退。
+        # execution-trend-verdict 轴 C′（评审 RP0-4）：`trend_bar` 从**当轮 payload** 现取，
+        # 绝不从 settings 再读一次（两处各读一次必漂移；且总闸关时 payload 本就无键，判据天然
+        # 同源）。它同时喂 R4 的条件化子句与复核官系统 prompt 的评级标准 (b)——两处**必须同源**，
+        # 否则「R4 说顺着基调不算缺陷、评级标准仍说与高周期冲突就 abort」会互相打架。
+        # 键缺席 ⇒ 空串 ⇒ 两处逐字节回退（用例 P-8 / P-9 冻结）。
+        trend_bar = str((payload.get("trendVerdict") or {}).get("bar") or "")
         reasoning_text = ("" if self._depth is None else build_review_protocol(
             self._depth,
-            symmetry=self.settings.ai_trade_directional_symmetry_enabled))
+            symmetry=self.settings.ai_trade_directional_symmetry_enabled,
+            trend_bar=trend_bar))
         system = build_reflection_system_prompt(
-            format_reflection_note(payload.get("tradingHorizon")), reasoning_text)
+            format_reflection_note(payload.get("tradingHorizon")), reasoning_text, trend_bar)
         user_msg = LlmMessage("user", [TextBlock(build_reflection_prompt(payload, decision))])
         accs: dict[str, dict] = {}
         order: list[str] = []

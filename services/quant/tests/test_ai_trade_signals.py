@@ -163,3 +163,45 @@ def test_single_side_prior_no_longer_leans():
     assert net_stance_basis(0.55, None) == "single_side"
     assert net_stance_basis(None, None) == "none"
     assert net_stance_basis(0.6, 0.4) == "both"
+
+
+# ==== 趋势基调的两条放宽入参（execution-trend-verdict §7.2 D-10 / §3.6.2 的五键 wire）====
+def test_consensus_wire_carries_both_raw_and_effective_values():
+    """原值与合成值**同时下发**是硬要求。
+
+    只发合成值，用户就无法回答「这一票是策略给的还是趋势给的」「这单是本来就够格还是被基调
+    放宽了」。`votes` 与 `contrarianMaxOpposingVotes` 两键**语义不变**。
+    """
+    from app.ai_auto.decider import TradeDecision
+    from app.ai_auto.signals import Consensus, ConsensusRule, resolve_consensus_gate
+
+    board = Consensus(long_votes=0, short_votes=1, flat_votes=0, total=1,
+                      net_stance="short", agreement=1.0)
+    decision = TradeDecision(action="open_short", size_fraction=0.5, confidence=0.8, reason="x")
+    rule = ConsensusRule(min_consensus=2, contrarian_enabled=True,
+                         contrarian_max_opposing_votes=1)
+    out = resolve_consensus_gate(decision, board, rule, position_step=0.25, used_contrarian=0,
+                                 bonus_votes=1, opposing_allowance=1, bonus_lane="applied")
+    wire = out.wire
+    assert wire["votes"] == 1 and wire["effectiveVotes"] == 2
+    assert wire["contrarianMaxOpposingVotes"] == 1 and wire["effectiveMaxOpposingVotes"] == 2
+    assert wire["trendBonusVotes"] == 1 and wire["trendOpposingAllowance"] == 1
+    assert wire["trendBonusLane"] == "applied"
+
+
+def test_zero_relaxation_wire_is_shaped_like_before():
+    """D-10：两个入参全 0 ⇒ 五个新键取「什么都没发生」那一格，其余键逐字不变。"""
+    from app.ai_auto.decider import TradeDecision
+    from app.ai_auto.signals import Consensus, ConsensusRule, resolve_consensus_gate
+
+    board = Consensus(long_votes=2, short_votes=0, flat_votes=0, total=2,
+                      net_stance="long", agreement=1.0)
+    decision = TradeDecision(action="open_long", size_fraction=0.5, confidence=0.8, reason="x")
+    out = resolve_consensus_gate(decision, board, ConsensusRule(min_consensus=1),
+                                 position_step=0.25, used_contrarian=0)
+    assert out.decision is decision                     # 放行轮返回同一对象
+    assert out.wire["trendBonusVotes"] == 0
+    assert out.wire["trendBonusLane"] == "none"
+    assert out.wire["trendOpposingAllowance"] == 0
+    assert out.wire["effectiveVotes"] == out.wire["votes"]
+    assert out.wire["effectiveMaxOpposingVotes"] == out.wire["contrarianMaxOpposingVotes"]

@@ -31,6 +31,7 @@ const LAYER_LABEL: Record<string, string> = {
   turnover: "换手预算",
   exchangeBackstop: "交易所侧兜底",
   drawdownBrake: "回撤刹车 / 连亏熔断",
+  trendBias: "趋势基调·逆势门槛",
   consensus: "同向共识门槛",
   confidence: "置信度门槛",
   edgeGate: "最小 edge 门禁",

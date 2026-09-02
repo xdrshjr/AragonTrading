@@ -40,6 +40,7 @@ import {
   validateDirectionRule,
   validateProfitGuard,
   validateStrategySelection,
+  validateTrendRule,
   validateWakeInterval,
 } from "@/lib/aiTrade";
 import { validateHorizon } from "@/lib/aiTradeHorizon";
@@ -76,6 +77,7 @@ import type {
   AiTradeMaBandRule,
   AiTradeProfitGuardRule,
   AiTradeReasoningDepth,
+  AiTradeTrendRule,
 } from "@/lib/aiTradeTypes";
 import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
 import { tradingApi } from "@/lib/tradingApi";
@@ -129,6 +131,10 @@ export interface AiTradeLaunchOpts {
   // `{contrarianEnabled:true, ...留空即服务端默认}`；取消勾选 ⇒ `{contrarianEnabled:false}`
   // （**显式关闭**，与「字段缺省=默认开启」语义严格区分）。
   direction?: AiTradeDirectionRule;
+  // 执行周期趋势基调（**实盘与回测同源**，execution-trend-verdict §5.1）：勾选 ⇒ 带
+  // `{enabled,counterGateEnabled,…}`；取消勾选 ⇒ `{enabled:false}`（**显式关闭**，与
+  // 「字段缺省=默认开启」语义严格区分）。两侧走同一个 `_resolve_trend`（评审 RP1-10）。
+  trend?: AiTradeTrendRule;
   contextRefreshRounds: number;
   // Agent 墙钟定时唤醒周期（分钟）：[RN-1] 声明为**可选**（对齐 backtest-only 可选字段），仅 live 分支透传、
   // base 不含、回测省略——若定为非可选，回测 onConfirm 不带该键将 tsc 编译失败。0/关闭 = 仅按 K 线与策略触发。
@@ -270,6 +276,16 @@ export default function AiTradeLaunchModal({
   const [directionConfidenceRaw, setDirectionConfidenceRaw] = useState("");
   const [directionQuotaRaw, setDirectionQuotaRaw] = useState("");
   const [directionSizeMultRaw, setDirectionSizeMultRaw] = useState("");
+  // 执行周期趋势基调（execution-trend-verdict §5.1 / 评审 RP1-12）：四个受控状态**必须与上面
+  // 那批并列住在父组件**，且它们的重置一律走下面那个依赖收敛为 `[open]` 的既有 effect——
+  // 另写第二个 reset effect 正是 ai-trade-modal-revert-recurrence 的复发根因（输入约 1 秒
+  // 后被冲回默认）。默认全开，与服务端「字段缺省即开启」的语义一致。
+  const [trendEnabled, setTrendEnabled] = useState(true);
+  const [trendCounterGate, setTrendCounterGate] = useState(true);
+  const [trendVoteEnabled, setTrendVoteEnabled] = useState(true);
+  const [trendAllowanceEnabled, setTrendAllowanceEnabled] = useState(true);
+  const [trendConfidenceRaw, setTrendConfidenceRaw] = useState("");
+  const [trendSizeMultRaw, setTrendSizeMultRaw] = useState("");
   // 可交易性预检的二次确认态（轴 A）：受控 state 留在父组件，子组件内不写任何 reset effect。
   const [tradabilityConfirmed, setTradabilityConfirmed] = useState(false);
   // 是否**要求**那次确认（= 预检判定 infeasible）。由子组件按 level 上报，**刻意不进下面那个
@@ -373,6 +389,14 @@ export default function AiTradeLaunchModal({
     setBaseRuleStdRaw(String(defaultBaseRule.stdMult ?? AI_TRADE_BASE_RULE_DEFAULTS.stdMult));
     setBaseRuleTolerance(defaultBaseRule.tolerance ?? AI_TRADE_BASE_RULE_DEFAULTS.tolerance);
     setBaseRuleDirectional(defaultBaseRule.directional ?? AI_TRADE_BASE_RULE_DEFAULTS.directional);
+    // 趋势基调的六个受控输入**必须塞进这个既有 [open] effect**（见下方注释：另写 effect =
+    // ai-trade-modal-revert-recurrence 复发）。默认全开 + 两个数值留空 = 服务端默认。
+    setTrendEnabled(true);
+    setTrendCounterGate(true);
+    setTrendVoteEnabled(true);
+    setTrendAllowanceEnabled(true);
+    setTrendConfidenceRaw("");
+    setTrendSizeMultRaw("");
     setProfitGuardEnabled(defaultProfitGuard.enabled ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.enabled);
     setArmReturnRaw(pctToRaw100(defaultProfitGuard.armReturnPct,
       AI_TRADE_PROFIT_GUARD_DEFAULTS.armReturnPct));
@@ -626,11 +650,21 @@ export default function AiTradeLaunchModal({
     contrarianSizeMult: rawToNumber(directionSizeMultRaw),
   };
   const directionError = validateDirectionRule(directionPayload);
+  // 趋势基调：两个数值**留空即整键不发** ⇒ 服务端回填默认；三把子闸的极性不同，各自独立下发。
+  const trendPayload: AiTradeTrendRule = {
+    enabled: trendEnabled,
+    counterGateEnabled: trendCounterGate,
+    counterMinConfidence: rawToNumber(trendConfidenceRaw),
+    counterSizeMult: rawToNumber(trendSizeMultRaw),
+    consensusVoteEnabled: trendVoteEnabled,
+    contrarianAllowanceEnabled: trendAllowanceEnabled,
+  };
+  const trendError = validateTrendRule(trendPayload);
 
   // 利润保护校验并入 baseValid：两模式共用（P2-8），避免回测下「校验会跑但拦不住提交」。
   const baseValid =
     !inputError && !strategyError && !roundsError && !baseRuleError && !profitGuardError
-    && !horizonError && !directionError;
+    && !horizonError && !directionError && !trendError;
   const ready =
     mode === "live"
       ? baseValid && !membersError && !wakeError && acknowledged
@@ -662,6 +696,9 @@ export default function AiTradeLaunchModal({
       // 方向对称性：整键**恒下发**——`{contrarianEnabled:false}` 是「用户亲手取消了勾选」，与
       // 「整键缺省 ⇒ 服务端默认开启」严格区分。三个数值留空即 `null` ⇒ 服务端回填默认。
       direction: directionPayload,
+      // 趋势基调：整键**恒下发**——`{enabled:false}` 是「用户亲手取消了勾选」，与「整键缺省
+      // ⇒ 服务端默认开启」严格区分。**实盘与回测两侧同源**（同一个 `_resolve_trend`）。
+      trend: trendPayload,
       contextRefreshRounds: roundsValue,
       bar,                                          // 可编辑周期真正生效（不再被 store.bar 覆盖）
     };
@@ -1241,6 +1278,20 @@ export default function AiTradeLaunchModal({
           }}
           disabled={submitting}
           error={directionError}
+          trend={trendPayload}
+          onTrendChange={(next) => {
+            setTrendEnabled(next.enabled);
+            setTrendCounterGate(next.counterGateEnabled !== false);
+            setTrendVoteEnabled(next.consensusVoteEnabled !== false);
+            setTrendAllowanceEnabled(next.contrarianAllowanceEnabled !== false);
+          }}
+          trendConfidenceRaw={trendConfidenceRaw}
+          trendSizeMultRaw={trendSizeMultRaw}
+          onTrendRawChange={(key, raw) => {
+            if (key === "confidence") setTrendConfidenceRaw(raw);
+            else setTrendSizeMultRaw(raw);
+          }}
+          trendError={trendError}
         />
 
         {/* 可交易性预检（tradability-and-open-funnel 轴 A）：挂在「交易纪律」正下方——它算的正是

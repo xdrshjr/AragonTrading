@@ -485,6 +485,10 @@ class CostRuntime:
         self.attribution.record_close(trade)
         self.funding_ledger.note_close(trade, time.time())
 
+    def last_close_net_usd(self) -> float | None:
+        """最近一笔平仓成交的净额盈亏（薄转发；口径与账本同源，绝不另算）。"""
+        return self.attribution.last_close_net_usd()
+
     # ---------- 轴 A（realized-edge-calibration）：四个薄转发 ----------
     def note_estimate(self, out, decision, wake_kind: str | None) -> None:
         """冻结本轮门禁估计（轮级）；总闸关 ⇒ 空转 ⇒ `explain.meta` 逐字回退。

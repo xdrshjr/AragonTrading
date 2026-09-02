@@ -278,6 +278,43 @@ describe("applyAiTradeTracePhase", () => {
     expect(t[0].contextDisclosure).toBeNull();
   });
 
+  it("趋势基调走两条不同的手抄轨：verdict 在 round_start、gate 在 tool_call", () => {
+    // execution-trend-verdict §3.7.4-4/5：`round_start` **只经过** `emptyRoundTrace` 这一个
+    // 装配点，`trendGate` 走 `reduceRoundPhase` 的 `case "tool_call"`。两条轨不可互相顶替，
+    // 漏抄任一处都不会报错，只会安静地什么都不显示。
+    const verdict = {
+      bar: "15m", asOfTs: 1, score: -0.32, execScore: -0.61,
+      direction: "down" as const, bias: "short" as const, strength: "strong" as const,
+      verdictConfidence: 0.59, components: [], missing: [],
+      availableWeight: 0.86, execAvailableWeight: 0.84,
+      higherTimeframe: { status: "bullish", agree: false, bullishBars: ["1D"], bearishBars: [] },
+      tacticalAlignment: null, conflict: "htf_conflict" as const, bonusWithheld: true,
+      counterGate: { armed: true, minConfidence: 0.65, sizeMult: 0.5 },
+      degraded: false, degradeReason: null,
+    };
+    const gate = {
+      lane: "veto" as const, alignment: "counter" as const, strength: "strong" as const,
+      score: -0.32, execScore: -0.61, minConfidence: 0.65, modelConfidence: 0.4,
+      verdictConfidence: 0.59, sizeMult: 0.5, sizeBefore: 0.5, sizeAfter: null,
+      reason: "counter_trend_confidence(conf=0.40/0.65)",
+    };
+    let t = applyAiTradeTracePhase([], ev("round_start", 1, { trendVerdict: verdict }));
+    expect(t[0].trendVerdict).toBe(verdict);
+    expect(t[0].trendGate).toBeNull();
+    t = applyAiTradeTracePhase(t, ev("tool_call", 1, { trendGate: gate }));
+    expect(t[0].trendGate).toBe(gate);
+    expect(t[0].trendVerdict).toBe(verdict);   // round_start 那一份不被 tool_call 冲掉
+    // 本层没判过的轮次后端不发这个键 ⇒ 保住同一轮里先到的那一份。
+    t = applyAiTradeTracePhase(t, ev("tool_call", 1, {}));
+    expect(t[0].trendGate).toBe(gate);
+  });
+
+  it("老后端不发趋势基调两键时恒为 null（整段不渲染，不炸）", () => {
+    const t = applyAiTradeTracePhase([], ev("round_start", 1));
+    expect(t[0].trendVerdict).toBeNull();
+    expect(t[0].trendGate).toBeNull();
+  });
+
   it("环形容量：超过 20 轮裁最旧", () => {
     let t: AiTradeRoundTrace[] = [];
     for (let r = 1; r <= 25; r++) t = applyAiTradeTracePhase(t, ev("round_start", r));

@@ -77,6 +77,7 @@ from ..schemas import (
     AiTradeProfitabilityOut,
     AiTradeProfitGuardIn,
     AiTradeTradabilityOut,
+    AiTradeTrendIn,
     trade_out,
 )
 from .ws_guard import guard_ws_origin
@@ -187,6 +188,48 @@ def _resolve_direction(raw: AiTradeDirectionIn | None, settings: Settings) -> Se
     updates: dict = {"ai_trade_consensus_contrarian_enabled": bool(raw.contrarianEnabled)}
     for wire_key, setting_key in _DIRECTION_TO_SETTING.items():
         value = raw.overrides().get(wire_key)
+        if value is not None:
+            updates[setting_key] = value
+    return settings.model_copy(update=updates)
+
+
+# 趋势基调覆盖字段（camelCase wire）→ settings 键。值域已由 `AiTradeTrendIn` 的 `Field` 在入口
+# 校验，本层**只做映射与缺省回填、不复夹**（沿用 `_resolve_position_step` 的 [R-2] 惯例）。
+_TREND_TO_SETTING: dict[str, str] = {
+    "counterGateEnabled": "ai_trade_trend_counter_gate_enabled",
+    "counterMinConfidence": "ai_trade_trend_counter_min_confidence",
+    "counterSizeMult": "ai_trade_trend_counter_size_mult",
+    "consensusVoteEnabled": "ai_trade_trend_consensus_vote",
+    "contrarianAllowanceEnabled": "ai_trade_trend_contrarian_allowance",
+}
+
+
+def _resolve_trend(raw: AiTradeTrendIn | None, settings: Settings) -> Settings:
+    """执行周期趋势基调「缺省即开启」语义的**唯一解析点**（execution-trend-verdict §5.1）。
+
+    与 `_resolve_direction` / `_resolve_horizon` 的成文惯例逐字同构：字段缺省 ⇒ 按 settings
+    装配开启态（老客户端 / 桌面旧包不发该字段也默认开启）；显式 `enabled=false` ⇒ 该会话不
+    装配基调层；运维总闸 `AI_TRADE_TREND_VERDICT_ENABLED=false` ⇒ **恒不装配**（`raw` 一律被
+    忽略）——它是回退开关，一个还生效着的用户覆盖会让「按下总闸」之后仍有一层合入前不存在的东西。
+
+    产出的是**又一层派生 settings 副本**（镜像 `_resolve_direction`），而不是一个规则对象：
+    十个阈值本来就住在 settings 上，`trend_verdict.trend_rule_from_settings` 是它们唯一的读点，
+    多造一个规则对象等于多一份会漂移的真源。
+
+    ⚠️ **调用点必须排在 `_resolve_discipline` 之后**：纪律预设把 `settings` 换成了派生副本，
+    早一步派生就会被预设覆盖掉用户的显式选择（与 `_resolve_direction` 同一条纪律）。
+
+    Returns:
+        原对象本身（无需改动时，`is` 相等）或新的派生副本。
+    """
+    if not settings.ai_trade_trend_verdict_enabled:
+        return settings
+    if raw is None:
+        return settings                      # 缺省 ⇒ 按 settings 装配，零改动
+    updates: dict = {"ai_trade_trend_verdict_enabled": bool(raw.enabled)}
+    overrides = raw.overrides()
+    for wire_key, setting_key in _TREND_TO_SETTING.items():
+        value = overrides.get(wire_key)
         if value is not None:
             updates[setting_key] = value
     return settings.model_copy(update=updates)
@@ -392,6 +435,9 @@ async def build_start_request(session: AsyncSession, settings: Settings,
     # `steady` / `balanced` 两档预设各自带了 `ai_trade_consensus_contrarian_enabled` 的默认值，
     # 早一步派生就会被预设覆盖掉用户的显式选择。本步在其结果上**再派生一次**。
     settings = _resolve_direction(body.direction, settings)
+    # 执行周期趋势基调（execution-trend-verdict §5.1）：**同样必须排在 `_resolve_discipline`
+    # 之后**，在其结果上再派生一次。与 `_resolve_direction` 的顺序无关（两者改的键不相交）。
+    settings = _resolve_trend(body.trend, settings)
     experience_rule = resolve_experience(
         body.experience.model_dump() if body.experience is not None else None, settings)
     experience_snapshot = await load_session_graph(
@@ -844,6 +890,9 @@ async def ai_backtest_start(body: AiBacktestStartIn, session: AsyncSession = Dep
     # 方向对称性：与实盘**同一解析点、同一顺序**（纪律预设之后）。两侧不同源，用户拿回测调出来
     # 的逆势通路参数在实盘直接失真（`base_rules` P1-4 的成文教训）。
     settings = _resolve_direction(body.direction, settings)
+    # 执行周期趋势基调：与实盘**同一解析点、同一顺序**（纪律预设之后）。两侧不同源，用户拿
+    # 回测调出来的基调参数在实盘直接失真（评审 RP1-10 / `base_rules` P1-4 的成文教训）。
+    settings = _resolve_trend(body.trend, settings)
     req = AiBacktestStartRequest(
         specs=specs, inst_id=body.instId, bar=body.bar, start_ts=body.startTs, end_ts=body.endTs,
         settings=settings, context_refresh_rounds=body.contextRefreshRounds,

@@ -153,6 +153,39 @@ def merge_funnel_stats(base: dict, ext: dict) -> dict:
     return merged
 
 
+def build_trend_stats(trend_wire: dict | None) -> dict:
+    """趋势基调的落库加法键（execution-trend-verdict §3.7.5）；算不出 ⇒ **整键缺席**。
+
+    与 `build_funnel_stats` 同款：合并落点在 `_finalize_run` 的**调用点**而不是
+    `_compute_ai_stats` 内部——后者是模块级纯函数、拿不到 `self`（RV-1）。
+
+    ⚠️ **同一份 wire 必须同时挂在 `session._status_payload` 上**（评审 RP1-2）：实时页读的是
+    成员级 status 快照，历史详情页读的才是 `aiStats`；只落一处会让另一页那张卡恒为空，而
+    `session.py` 上方注释已白纸黑字写着「后端算了、类型补了、没有渲染落点 = 死数据」。
+
+    Args:
+        trend_wire: `trend_runtime.TrendRuntime.stats_wire()` 产物或 `None`。
+
+    Returns:
+        `{"trendVerdict": {...}}` 或 `{}`（未装配 / 零样本）。
+    """
+    return {} if trend_wire is None else {"trendVerdict": trend_wire}
+
+
+def merge_trend_stats(base: dict, ext: dict) -> dict:
+    """把趋势基调统计并入既有 `aiStats`；**任一键冲突即抛**（镜像 `merge_cost_stats`）。
+
+    Raises:
+        ValueError: `ext` 的某个键已存在于 `base`（附冲突键名，便于定位）。
+    """
+    merged = dict(base or {})
+    clashes = sorted(set(merged) & set(ext or {}))
+    if clashes:
+        raise ValueError(f"trend stats key clash with existing aiStats: {','.join(clashes)}")
+    merged.update(ext or {})
+    return merged
+
+
 def cost_snapshot_wire(round_no: int, attribution_stats: dict, fee_ledger, *,
                        every: int = _COST_SNAPSHOT_EVERY_ROUNDS,
                        fee_rates: dict | None = None,

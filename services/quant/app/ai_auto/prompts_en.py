@@ -41,17 +41,23 @@ class SystemPromptTexts:
     direction_text: str = ""
     # 本特性新增：审议协议 + 输出预算纪律（空 ⇒ 走中文脊柱，逐字节回退）。
     reasoning_text: str = ""
+    # 趋势基调条款（execution-trend-verdict §3.4.3 a）：**第七段宪章**。空 ⇒ 两条脊柱**逐字节
+    # 回退**到本特性合入前。它同时是决策纪律 #1 读序子句与复核官评级标准 (b) 的**唯一装配判据**
+    # ——两处各读一次 settings 必漂移，而漂移的表现是「宪章说基调判在 15m、纪律 #1 却仍要求先读
+    # 日线」，且不报任何错。
+    trend_text: str = ""
 
     def charter(self) -> str:
         """宪章拼接（顺序与今日**完全一致**：在哪开 → 何时锁 → 下多大注 → 付多少 → 持多久
         → **往哪边开**）。
 
-        末位第六段是方向对称条款（directional-symmetry C-2）；未装配 ⇒ 空串 ⇒ 拼接结果与本
-        特性合入前逐字节相同。
+        末位第六段是方向对称条款（directional-symmetry C-2）、第七段是趋势基调条款
+        （execution-trend-verdict §3.4.3 a）；未装配 ⇒ 空串 ⇒ 拼接结果与本特性合入前逐字节相同。
         """
         return "".join(f"{text}\n\n" for text in
                        (self.base_rules_text, self.profit_guard_text, self.sizing_text,
-                        self.cost_text, self.horizon_text, self.direction_text) if text)
+                        self.cost_text, self.horizon_text, self.direction_text,
+                        self.trend_text) if text)
 
 
 @dataclass(frozen=True)
@@ -111,6 +117,30 @@ def _action_discipline_en(allow_limit: bool, band_text: str = "2%") -> str:
             "for; anything urgent (stop protection) must be market. ")
 
 
+def _trend_read_order_en(trend_bar: str) -> str:
+    """决策纪律 #1 的多周期读序子句（英文孪生，**整条**，含尾部空格）。
+
+    `trend_bar == ""` ⇒ 返回合入前的原句，**逐字节回退**（G-1 的 sha256 冻结据此成立）。
+    与中文孪生 `prompts._trend_read_order` 同一条纪律：原句**不再以字面量出现在脊柱里**，
+    它搬进了本函数的 disarmed 分支，故不可能出现「两句读序同时在场」（评审 RP1-4）。
+
+    折行宽度与本模块其余各条纪律一致（渲染后 ~80 列，续行缩进 3 空格）——脊柱是一整块等宽
+    正文，混进一条 140 列的长行会让模型读到的段落结构与其它条目不同。
+    """
+    if not trend_bar:
+        return ("Work the\n"
+                "   higher-timeframe context first (1D -> 12H -> 4H -> 1H): trend alignment, "
+                "candidate\n"
+                "   support and resistance, overbought/oversold. ")
+    return ("\n"
+            f"   First state the trend verdict for the execution bar {trend_bar} (direction,\n"
+            "   strength, and the strongest evidence against it), then read the\n"
+            "   higher-timeframe context (1D -> 12H -> 4H -> 1H) as corroboration for that\n"
+            "   verdict: trend alignment, candidate support and resistance,\n"
+            "   overbought/oversold. Higher frames may weaken the verdict; they may not\n"
+            f"   decide the direction on {trend_bar} for you. ")
+
+
 def _direction_discipline_en(armed: bool) -> str:
     """决策纪律 #3 之后的方向对称子句（directional-symmetry C-2 的英文半边）；未装配 ⇒ 空串。
 
@@ -135,8 +165,11 @@ def render_spine_en(inst_id: str, bar: str, budget_usd: float, leverage: float, 
                     allow_limit: bool = False, band_text: str = "2%") -> str:
     """英文决策系统 prompt（`texts.reasoning_text` 非空时的分叉路径，§3.1.6）。
 
-    结构（顺序即优先级声明）：角色 → 首要原则 → 语言契约 → 术语表 → 硬约束框注 → **五段中文
+    结构（顺序即优先级声明）：角色 → 首要原则 → 语言契约 → 术语表 → 硬约束框注 → **七段中文
     宪章** → 审议协议 + 输出预算纪律 → 五条决策纪律（第 5 条是收尾硬约束，占近因位）。
+
+    决策纪律 #1 的多周期读序由 `_trend_read_order_en` 整条给出：`texts.trend_text` 未装配 ⇒
+    逐字回退到合入前那句「先读高周期」（execution-trend-verdict §3.4.3 b）。
     """
     return (
         "You are a disciplined, risk-first execution trader running one crypto perpetual-swap\n"
@@ -161,9 +194,10 @@ def render_spine_en(inst_id: str, bar: str, budget_usd: float, leverage: float, 
         f"{texts.charter()}"
         f"{texts.reasoning_text}\n\n"
         "# DECISION DISCIPLINE\n"
-        "1. Follow the deliberation protocol above for every round without exception. Work the\n"
-        "   higher-timeframe context first (1D -> 12H -> 4H -> 1H): trend alignment, candidate\n"
-        "   support and resistance, overbought/oversold. "
+        "1. Follow the deliberation protocol above for every round without exception. "
+        # 装配判据**只有一个**：第七段宪章装没装（`texts.trend_text`）。`bar` 本就是本函数的
+        # 形参，故零新字段——与中文脊柱的 `trend_bar = bar if texts.trend_text else ""` 同源。
+        f"{_trend_read_order_en(bar if texts.trend_text else '')}"
         f"{_tactical_discipline_en(texts.tactical_bars_text)}"
         "Then work down through the stages\n"
         "   in order. The analysis is for a human reader; only the tool call takes effect.\n"
@@ -256,7 +290,29 @@ def exit_priority_tool_suffix_en() -> str:
         "when the session ends.")
 
 
-def render_review_spine_en(reasoning_text: str, horizon_text: str = "") -> str:
+def _review_conflict_clause_en(trend_bar: str) -> str:
+    """复核官评级标准 2(b) 的**条件化**子句（execution-trend-verdict 轴 C′ / 评审 RP0-4）。
+
+    复核官位于整条决策链的**最下游**，而它的评级标准逐字要求它否掉「与高周期强冲突」的提议
+    ——正是本特性想放行的那一种单。不改它，前面十层放行的单会全部死在这最后一米，而那是复核官
+    **被明文指示**要做的事（根因 R-5）。
+
+    改的只有「高周期分歧本身算不算一条实质性缺陷」这**一个判据**；复核官「只能收紧、不能改
+    方向、不能放大、abort 须指名实质性缺陷、fail-closed」这五条安全语义**一个字节不动**。
+
+    `trend_bar == ""` ⇒ 返回原句，**逐字节回退**（用例 P-8 / P-9 冻结）。
+    """
+    if not trend_bar:
+        return ("it strongly conflicts with the\n"
+                "   higher-timeframe context and the decision offers no hedge rationale;")
+    return ("it strongly conflicts with the\n"
+            f"   execution-bar ({trend_bar}) trend verdict and the decision offers no hedge\n"
+            "   rationale (a conflict with a higher timeframe alone, when the proposal follows\n"
+            "   the execution-bar verdict, is not a defect);")
+
+
+def render_review_spine_en(reasoning_text: str, horizon_text: str = "",
+                           trend_bar: str = "") -> str:
     """英文反思复核官系统 prompt（`build_reflection_system_prompt` 的分叉路径，§3.2）。
 
     安全语义**一个字节都不改**：只能收紧、`abort` 需指名实质性缺陷、机会成本对称、
@@ -279,8 +335,9 @@ def render_review_spine_en(reasoning_text: str, horizon_text: str = "") -> str:
         "   first-choice conservative tool, not `abort`.\n"
         "2. **Bar for abort**: `abort` only when you can **name one substantive defect**"
         " - (a) the\n"
-        "   direction directly contradicts key evidence; (b) it strongly conflicts with the\n"
-        "   higher-timeframe context and the decision offers no hedge rationale; (c) the added\n"
+        "   direction directly contradicts key evidence; (b) "
+        f"{_review_conflict_clause_en(trend_bar)}"
+        " (c) the added\n"
         "   exposure is unacceptable given the current position and session P&L; (d) obvious\n"
         "   chasing / panic selling / churn; (e) badly insufficient evidence behind a heavy size.\n"
         "   `reason` must quote the specific evidence. A generic unease is not a defect.\n"

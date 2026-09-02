@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import AiTradeDirectionFields from "./AiTradeDirectionFields";
-import type { AiTradeDirectionRule } from "@/lib/aiTradeTypes";
+import type { AiTradeDirectionRule, AiTradeTrendRule } from "@/lib/aiTradeTypes";
 
 // 启动弹窗的「方向对称 · 逆势通路」整段（directional-symmetry D-5）。
 //
@@ -15,9 +15,17 @@ function rule(over: Partial<AiTradeDirectionRule> = {}): AiTradeDirectionRule {
   return { contrarianEnabled: true, ...over };
 }
 
+// 执行周期趋势基调分组（execution-trend-verdict §5.1）：四个受控值同样由父组件持有，
+// 本组件内不得写任何 effect（ai-trade-modal-revert-recurrence 的复发根因）。
+function trendRule(over: Partial<AiTradeTrendRule> = {}): AiTradeTrendRule {
+  return { enabled: true, counterGateEnabled: true, ...over };
+}
+
 function renderFields(over: Partial<React.ComponentProps<typeof AiTradeDirectionFields>> = {}) {
   const onChange = vi.fn();
   const onRawChange = vi.fn();
+  const onTrendChange = vi.fn();
+  const onTrendRawChange = vi.fn();
   render(
     <AiTradeDirectionFields
       value={rule()}
@@ -26,10 +34,15 @@ function renderFields(over: Partial<React.ComponentProps<typeof AiTradeDirection
       quotaRaw=""
       sizeMultRaw=""
       onRawChange={onRawChange}
+      trend={trendRule()}
+      onTrendChange={onTrendChange}
+      trendConfidenceRaw=""
+      trendSizeMultRaw=""
+      onTrendRawChange={onTrendRawChange}
       {...over}
     />,
   );
-  return { onChange, onRawChange };
+  return { onChange, onRawChange, onTrendChange, onTrendRawChange };
 }
 
 afterEach(cleanup);
@@ -74,5 +87,53 @@ describe("AiTradeDirectionFields", () => {
     renderFields({ disabled: true });
     expect(screen.getByLabelText("启用逆势通路")).toBeDisabled();
     expect(screen.getByTestId("ai-direction-confidence")).toBeDisabled();
+  });
+});
+
+describe("AiTradeDirectionFields · 趋势基调分区（execution-trend-verdict §5.1）", () => {
+  it("默认开启，三把子闸各自可勾选、两个数值留空且占位符是「服务端默认」", () => {
+    renderFields();
+    expect(screen.getByLabelText("启用执行周期趋势基调")).toBeChecked();
+    expect(screen.getByLabelText("启用逆势降档闸")).toBeChecked();
+    expect(screen.getByLabelText("启用顺势追加一票")).toBeChecked();
+    expect(screen.getByLabelText("启用顺势放宽反向票上限")).toBeChecked();
+    for (const testId of ["ai-trend-confidence", "ai-trend-size-mult"]) {
+      const input = screen.getByTestId(testId) as HTMLInputElement;
+      expect(input.value).toBe("");
+      expect(input).toHaveAttribute("placeholder", "服务端默认");
+    }
+  });
+
+  it("总闸取消勾选 ⇒ 三把子闸与两个数值输入整体不渲染（改得动却毫无作用的输入比不显示更坏）", () => {
+    renderFields({ trend: trendRule({ enabled: false }) });
+    expect(screen.queryByLabelText("启用逆势降档闸")).toBeNull();
+    expect(screen.queryByTestId("ai-trend-confidence")).toBeNull();
+  });
+
+  it("RP1-12：用户能在弹窗里直接关掉逆势闸（此前只有一个运维 env、没有任何接口）", () => {
+    const { onTrendChange } = renderFields();
+    fireEvent.click(screen.getByLabelText("启用逆势降档闸"));
+    expect(onTrendChange).toHaveBeenCalledWith(
+      expect.objectContaining({ enabled: true, counterGateEnabled: false }),
+    );
+  });
+
+  it("逆势闸关掉时两个数值输入置灰（它们此刻不产生任何作用，不能假装还在生效）", () => {
+    renderFields({ trend: trendRule({ counterGateEnabled: false }) });
+    expect(screen.getByTestId("ai-trend-confidence")).toBeDisabled();
+    expect(screen.getByTestId("ai-trend-size-mult")).toBeDisabled();
+  });
+
+  it("三把子闸的**极性**必须写在界面上：一把收紧、两把放宽，可分别回退", () => {
+    renderFields();
+    const section = screen.getByTestId("ai-trade-trend-fields");
+    expect(section).toHaveTextContent("收紧");
+    expect(section).toHaveTextContent("放宽");
+    expect(section).toHaveTextContent("不发票");
+  });
+
+  it("校验错误如实呈现（区间与后端 `AiTradeTrendIn` 的 Field 逐字一致）", () => {
+    renderFields({ trendError: "逆势置信度下界需在 0~1 之间（不含 0）" });
+    expect(screen.getByTestId("ai-trend-error")).toHaveTextContent("0~1");
   });
 });

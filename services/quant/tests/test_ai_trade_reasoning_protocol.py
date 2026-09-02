@@ -272,3 +272,82 @@ def test_symmetry_never_changes_the_stage_count_or_order():
     assert positions == sorted(positions)
     assert count_stages(text, "S") == 12
     assert "## S13" not in text
+
+
+# ============================ 执行周期趋势基调的三处 mandate（§7.4 P-3 / P-4 / P-4b / P-8）====
+def test_deliberation_protocol_is_byte_identical_without_trend_bar():
+    """P-3：`trend_bar=""` ⇒ 与合入前**逐字节相同**（G-1 的零回归路径）。"""
+    profile = profile_by_name("deep")
+    assert build_deliberation_protocol(profile) == build_deliberation_protocol(
+        profile, trend_bar="")
+
+
+def test_trend_first_rewrites_s1_and_appends_to_s2_s12_only():
+    """P-4：S1 整体替换、S2 / S12 各追加一句，**其余九个阶段逐字节不变**。"""
+    profile = profile_by_name("deep")
+    plain = build_deliberation_protocol(profile)
+    armed = build_deliberation_protocol(profile, trend_bar="15m")
+    assert "execution bar 15m" in armed
+    assert "may not by themselves reverse" in armed
+    assert "re-derive the verdict here" in armed          # S2
+    assert "with it (aligned) or against it (counter-trend)" in armed   # S12
+    # `id` / `code` 是稳定契约，一个字节都不改。
+    assert "## S1 REGIME" in armed and "## S2 EXECUTION" in armed
+    # 其余九个阶段逐字节不变（按阶段切块对拍）。
+    def stages(text: str) -> dict[str, str]:
+        out, current, buf = {}, None, []
+        for line in text.splitlines():
+            if line.startswith("## S"):
+                if current:
+                    out[current] = "\n".join(buf)
+                current, buf = line.split()[1], []
+            elif current:
+                buf.append(line)
+        if current:
+            out[current] = "\n".join(buf)
+        return out
+
+    before, after = stages(plain), stages(armed)
+    untouched = set(before) - {"S1", "S2", "S12"}
+    assert untouched and all(before[key] == after[key] for key in untouched)
+
+
+def test_symmetry_and_trend_switches_compose_in_a_frozen_order():
+    """P-4b（评审 RP1-13）：`(symmetry, trend_bar)` 四种组合都成立，且复合顺序被写死。
+
+    两者的阶段集合不相交（S7/S10/S11 vs S1/S2/S12），故当下顺序不影响产物——但顺序本身是
+    契约：下一轮往任一集合里加一个阶段就会静默改变产物。
+    """
+    profile = profile_by_name("deep")
+    both = build_deliberation_protocol(profile, symmetry=True, trend_bar="15m")
+    only_sym = build_deliberation_protocol(profile, symmetry=True)
+    only_trend = build_deliberation_protocol(profile, trend_bar="15m")
+    plain = build_deliberation_protocol(profile)
+    assert len({both, only_sym, only_trend, plain}) == 4
+    for marker in ("the strongest case for the **opposite** direction",
+                   "at least one short candidate"):
+        assert marker in both and marker in only_sym and marker not in plain
+    assert "execution bar 15m" in both and "execution bar 15m" in only_trend
+
+
+def test_review_protocol_is_byte_identical_without_trend_bar():
+    """P-8：`build_review_protocol(..., trend_bar="")` 与合入前**逐字节相同**。"""
+    profile = profile_by_name("deep")
+    assert build_review_protocol(profile) == build_review_protocol(profile, trend_bar="")
+    assert (build_review_protocol(profile, symmetry=True)
+            == build_review_protocol(profile, symmetry=True, trend_bar=""))
+
+
+def test_review_r4_conditionalises_the_higher_timeframe_conflict():
+    """P-9①（评审 RP0-4）：R4 追加条件化句，**其余六个复核阶段逐字节不变**。"""
+    profile = profile_by_name("deep")
+    plain = build_review_protocol(profile)
+    armed = build_review_protocol(profile, trend_bar="15m")
+    assert "judge the conflict against **that** verdict first" in armed
+    assert "is not on its own a reason to abort" in armed
+    # 复核官的安全语义一个字节不改。
+    assert "You may only tighten" in armed
+    for stage_id in ("R1", "R2", "R3", "R5", "R6", "R7"):
+        head = f"## {stage_id} "
+        assert plain[plain.index(head):].split("## ")[1] == armed[
+            armed.index(head):].split("## ")[1]

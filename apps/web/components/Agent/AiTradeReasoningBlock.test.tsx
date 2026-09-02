@@ -65,7 +65,8 @@ describe("AiTradeReasoningBlock", () => {
     // F-5：S11 / S12 默认展开，其余关闭。
     const s11 = screen.getByText(/S11 证伪与事前验尸/).closest("details");
     const s12 = screen.getByText(/S12 校准结论/).closest("details");
-    const s1 = screen.getByText(/S1 多周期背景/).closest("details");
+    // execution-trend-verdict 轴 C：S1 的中文题面已改为「趋势基调与多周期背景」。
+    const s1 = screen.getByText(/S1 趋势基调与多周期背景/).closest("details");
     expect(s11).toHaveAttribute("open");
     expect(s12).toHaveAttribute("open");
     expect(s1).not.toHaveAttribute("open");
