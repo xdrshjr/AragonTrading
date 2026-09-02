@@ -264,6 +264,11 @@ def test_round_one_gate_matrix_is_frozen():
         # 故解 G1 在预设上恒为死码；而 `custom` 允许两者脱钩，一旦脱钩解 G1 就是一个真实的洞。
         # 上面四条的**逐格取值在本轮一个字符都没动**——这才是本断言真正冻结的东西。
         "exit_pending": ("G2", "G3"),
+        # ai-trade-loss-and-liveness-hardening 轴 B：`loss_release` 的**同位替换**（同一个 `if`
+        # 分支按交易所兜底覆盖态返回两者之一），**不占新位次、既有四行逐字未动**。
+        # 只解 G2/G3 的理由：真止损位已由交易所侧 OCO 兜底，`loss_release` 实际提供的是一条
+        # 「在半止损位由 LLM 自由裁量提前割肉」的通道——实测 13 笔合计 −40.89 USDT。
+        "loss_release_covered": ("G2", "G3"),
     }
     for action, side, expected in [
             ("close", "long", "close"), ("close", "short", "close"),

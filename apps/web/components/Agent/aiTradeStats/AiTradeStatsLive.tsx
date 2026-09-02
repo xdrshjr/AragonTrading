@@ -50,7 +50,12 @@ import { TRADES_MAX } from "@/lib/wireCaps";
 // AI 自动交易统计「当前」视图（ai-trade-stats-dashboard §3.10.1）：读瞬态 store.aiTradeGroup，复用
 // autoTradePnl 纯函数把各成员成交配对为完整交易往返，按时间维度汇总总收益 / 收益率 / 胜率 + 当前持仓浮盈
 // （诚实降级）+ 倒序往返明细。运行期态；停止后转入「历史」持久保存。
-export default function AiTradeStatsLive() {
+export default function AiTradeStatsLive({
+  onOpenProfitGuard,
+}: {
+  /** 轴 F 结论行的「去开启利润保护」落点（由统计面板传入；缺省 ⇒ 只渲染结论、不渲染按钮）。 */
+  onOpenProfitGuard?: () => void;
+} = {}) {
   const group = useAppStore((s) => s.aiTradeGroup);
   const [range, setRange] = useState<AutoTradeRange>("all");
   // 「立即补挂」的请求态按 `instId` 键（[P2-5]：卡片保持无状态）。状态流转本身由后端在
@@ -262,7 +267,7 @@ export default function AiTradeStatsLive() {
           onRepair={repair}
           repairPending={repairState}
         />
-        <ExitSourceCard exits={group.exits} />
+        <ExitSourceCard exits={group.exits} onOpenProfitGuard={onOpenProfitGuard} />
         <ProfitCaptureCard capture={capture} />
         <RealizedLiveCard group={group} />
         <WakeAttributionCard trips={ledger} />
@@ -319,6 +324,14 @@ function MemberObservabilityRow({ member }: { member: AiTradeGroupMemberState })
       <span className="tabular text-[var(--muted)]">
         反思 {counts.runs}（放行 {counts.confirms} · 否决 {counts.aborts} · 故障 {counts.failClosed}）
         · 唤醒抑制 {wakeSkips ?? "—"} · 连续观望 {holdStreak === null ? "—" : `${holdStreak} 轮`}
+        {/* C-2（loss-and-liveness-hardening）：跳轮数只在**真的跳过时**才渲染——总闸默认关，
+            恒 0 的那一格挂在这里只是噪音。 */}
+        {(member.session?.roundsSkipped ?? 0) > 0 ? (
+          <span data-testid="ai-rounds-skipped" title="结构上不可能产生任何合法动作而被整轮跳过的次数（未计入决策轮数）">
+            {" "}
+            · 跳轮 {member.session!.roundsSkipped}
+          </span>
+        ) : null}
         {scheduler ? (
           <span data-testid="wake-scheduler-counts" title={WAKE_SCHEDULER_HINT}>
             {" "}

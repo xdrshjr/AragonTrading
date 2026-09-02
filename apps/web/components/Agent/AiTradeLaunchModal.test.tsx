@@ -150,7 +150,11 @@ const DISCIPLINE_PRESETS_FIXTURE = {
                off: false }] },
     { id: "balanced" as const, label: "均衡",
       rows: [{ key: "ai_trade_edge_gate_k_min", label: "最小 edge 门禁", value: "1.5 ×成本",
-               off: false }] },
+               off: false },
+             // ai-trade-loss-and-liveness-hardening A-3 / A-4：这一行正是生产里那 45 条 run 的
+             // 症结——预设承诺了硬止盈，而它的唯一执行者（利润保护层）被另一个复选框关掉了。
+             { key: "ai_trade_profit_guard_hard_tp_return_pct", label: "利润保护·硬止盈",
+               value: "50%", off: false }] },
     { id: "aggressive" as const, label: "激进",
       rows: [{ key: "ai_trade_profit_guard_hard_tp_return_pct", label: "利润保护·硬止盈",
                value: "0%", off: true }] },
@@ -790,9 +794,65 @@ describe("AiTradeLaunchModal", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" }));
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
+    // ai-trade-loss-and-liveness-hardening A-3：关掉利润保护后需要**二次确认**（按钮不禁用，
+    // 拦在提交路径上）。第一次点击必须什么都不发生——那正是这条修法的全部意义。
+    fireEvent.click(confirm);
+    expect(onConfirm).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByTestId("ai-profit-guard-unguarded-confirm"));
     fireEvent.click(confirm);
     const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
     expect(opts.profitGuard).toEqual({ enabled: false });
+  });
+
+  it("A-3：关闭利润保护 ⇒ 逐条列出将失效的机制，且数值全部来自受控值 / 后端下发", async () => {
+    // 生产实证：193 / 211 条 run 的利润保护层未装配，其中 45 条同时选了承诺硬止盈的纪律预设
+    // ——用户看得见那个数，它却逐字节不作数。关闭是用户的权利，**后果必须被说出来**。
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    expect(screen.queryByTestId("ai-profit-guard-unguarded-notice")).toBeNull();
+    fireEvent.click(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" }));
+    const notice = screen.getByTestId("ai-profit-guard-unguarded-notice");
+    expect(notice).toHaveAttribute("role", "alert");
+    expect(notice).toHaveTextContent("回吐棘轮");
+    expect(notice).toHaveTextContent("保本线");
+    expect(notice).toHaveTextContent("峰值浮盈与利润捕获率读数");
+    expect(notice).toHaveTextContent("同向冷却");
+    // 硬止盈那一条：**整句取自后端下发的只读阈值表**（标签 + 已格式化的值），前端不复制数字。
+    const hardTp = await screen.findByTestId("ai-profit-guard-unguarded-hardtp");
+    expect(hardTp).toHaveTextContent("利润保护·硬止盈");
+    expect(hardTp).toHaveTextContent("该项由利润保护层执行，关闭后不生效");
+  });
+
+  it("A-4：关闭利润保护 ⇒ 只读阈值表里那一行加删除线 + 「未装配，不生效」尾注", async () => {
+    renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    fireEvent.click(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" }));
+    fireEvent.click(await screen.findByRole("button", { name: "查看这一档的阈值" }));
+    const row = await screen.findByTestId(
+      "ai-discipline-threshold-inert-ai_trade_profit_guard_hard_tp_return_pct");
+    expect(row).toHaveTextContent("未装配，不生效");
+  });
+
+  it("A-1：422 的三条补救渲染成按钮，且点击真的把对应开关拨过去（文案由后端下发）", async () => {
+    const { rerender } = renderModal({ defaultStrategyIds: [1] });
+    await screen.findByText("均线策略");
+    rerender({
+      error: "已选择「日内波段」持仓周期，但利润保护层被关闭",
+      errorRemedies: [
+        { id: "enable_profit_guard", label: "开启利润保护（推荐）" },
+        { id: "disable_horizon", label: "关闭持仓周期约束" },
+        { id: "ops_override", label: "运维总闸 AI_TRADE_REQUIRE_PROFIT_EXIT_WITH_HORIZON=false" },
+      ],
+    });
+    const box = await screen.findByTestId("ai-start-remedies");
+    expect(box).toHaveTextContent("运维总闸 AI_TRADE_REQUIRE_PROFIT_EXIT_WITH_HORIZON=false");
+    // 运维那一条**不是按钮**（前端拨不动它，做成按钮就是一个点了没反应的控件）
+    expect(screen.queryByTestId("ai-start-remedy-ops_override")).toBeNull();
+    // 先取消勾选，再点「开启利润保护」⇒ 勾选态真的被拨回来
+    fireEvent.click(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" }));
+    expect(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" })).not.toBeChecked();
+    fireEvent.click(screen.getByTestId("ai-start-remedy-enable_profit_guard"));
+    expect(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" })).toBeChecked();
   });
 
   it("越界回吐比例即时报错并禁用确认（前端即时反馈，后端另有 422 兜边界）", async () => {

@@ -32,7 +32,12 @@ from .acceptance_text import (
     turnover_note,
     within_target_note,
 )
-from .exit_attribution import EXIT_SOURCE_AGENT_OVERRIDE, ExitLedger, exit_counters
+from .exit_attribution import (
+    EXIT_SOURCE_AGENT_OVERRIDE,
+    ExitLedger,
+    attach_exit_discretion,
+    exit_counters,
+)
 from .funding_ledger import merge_funding_wires
 from .turnover_discipline import derive_turnover_per_day
 
@@ -320,7 +325,14 @@ def build_bundle(horizon, cost, *, settings, wall_seconds: float) -> dict:
 
 def bundle_from_input(inp: AcceptanceInput | None, *, rule, settings,
                       exits: dict | None, funding: dict | None) -> dict:
-    """四键装配（运行期 / 分组 / 历史 / 回测四处共用；总闸关 ⇒ 卡片为 `None`）。"""
+    """四键装配（运行期 / 分组 / 历史 / 回测四处共用；总闸关 ⇒ 卡片为 `None`）。
+
+    轴 F（loss-and-liveness-hardening §4.6）：`exits` 在这里、**且只在这里**被挂上
+    `exitDiscretion`。四条通路全部经本函数，故一次装配即四处可见；分头挂等于四份口径。
+    `ai_trade_exit_verdict_min_samples = 0` ⇒ 整键缺席 ⇒ 逐字回退。
+    """
+    exits = attach_exit_discretion(
+        exits, min_samples=int(getattr(settings, "ai_trade_exit_verdict_min_samples", 0)))
     card = None
     if getattr(settings, "ai_trade_acceptance_enabled", True):
         card = build_acceptance(inp, rule, resolve_thresholds(settings, rule),

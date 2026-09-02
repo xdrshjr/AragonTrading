@@ -31,6 +31,33 @@ from .wake_guard import SkipPolicy, should_skip_interval_wake, should_skip_wake
 from .wake_reason import WakeFacts, WakeReadings, classify_wake, horizon_scale
 
 
+def coherent_wake_floor_s(horizon_rule, *, divisor: int) -> float:
+    """与目标持仓**相干**的唤醒周期下限（秒）；未装配 / `divisor <= 0` ⇒ `0.0`（= 不约束）。
+
+    量纲失配的实测形态（loss-and-liveness-hardening §三 D3）：`wakeIntervalMinutes=3`
+    × `targetHold 4–12h` ⇒ 单次持仓被问 **80–240 次**「要不要走」。每一轮都是一次让模型自主
+    平仓通道（净额 −67.52 USDT）开火的机会；实测中位持仓 30 分钟 ≈ 10 轮。下限取
+    `targetHoldMinSeconds / divisor`，即「一次目标持仓期内至多被问 `divisor` 次」。
+
+    **纯函数，零 IO、不碰 settings**：抬升与 `discipline.adjustments` 回执落在 API 装配层
+    （`api/ai_auto._resolve_wake_interval_s` 与 `_resolve_discipline` 的产物都住在那里，
+    而纯核心模块既拿不到 `adjustments`、也不该开始知道「服务端替我改了什么」这条通道的存在）。
+
+    Args:
+        horizon_rule: 已解析的持仓周期契约；`None` = 未装配。
+        divisor: 一次目标持仓期内允许的最多决策次数；**默认 0 = 只观测不改行为**。
+
+    Returns:
+        下限秒数；不约束时为 `0.0`。
+    """
+    if horizon_rule is None or int(divisor) <= 0:
+        return 0.0
+    target_min_s = float(getattr(horizon_rule, "target_hold_min_s", 0.0) or 0.0)
+    if target_min_s <= 0:
+        return 0.0
+    return target_min_s / float(int(divisor))
+
+
 def tactical_bars_for(settings: Settings, execution_bar: str,
                       wake_interval_s: float) -> tuple[str, ...]:
     """战术周期集合的**唯一**入口（`WakeRuntime` 与 manager 的 system prompt 装配点共用）。

@@ -109,12 +109,34 @@ export default function OpenFunnelCard({
         </>
       )}
 
+      {(funnel.insufficientBalance ?? 0) > 0 && (
+        // E-8（**纯观测**）：仓位求解结果超过可用保证金时今天以报错收场（实测 53 次），
+        // 事后既不进任何计数、也无从回答「到底差多少」。本轮先让它可见；逐档降档挂在
+        // `AI_TRADE_SIZING_MARGIN_PRECHECK`（默认关），下一轮才有数据回答「降一档够不够」。
+        <p
+          className="text-[10px] leading-relaxed text-[var(--short-ink)]"
+          data-testid="ai-open-funnel-insufficient-balance"
+        >
+          另有 <strong>{funnel.insufficientBalance}</strong>{" "}
+          次委托被交易所判「可用余额 / 保证金不足」而未成交。这不是任何一道纪律拦的——是解算出的
+          张数超过了账户此刻的可用保证金。
+        </p>
+      )}
+
       <p className="text-[10px] leading-relaxed text-[var(--muted)]">
         「开仓意愿」= 模型第一阶段真的给出了开多 / 开空；各层拦截
         <strong className="text-[var(--text)]">按决策链顺序只归给第一个拦下它的闸</strong>
         （不是该层的总拦截能力）。「仓位解到 0」不是一道闸，是求解结果。
         <strong className="text-[var(--text)]">平仓侧</strong>
         被持仓周期 / 兜底拦下的轮次一律不进本图。
+        {funnel.expired != null && (
+          <>
+            {" "}
+            「挂单未成交即撤」与「真的成交」
+            <strong className="text-[var(--text)]">互斥</strong>
+            ：两者都发生在委托之后，前者是模型想开、闸也放行了，只是价格没到。
+          </>
+        )}
       </p>
     </div>
   );

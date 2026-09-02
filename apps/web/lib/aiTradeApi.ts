@@ -38,17 +38,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     let code = String(res.status);
     let message = res.statusText;
     let members: { instId: string; code: string; message: string }[] | undefined;
+    // ai-trade-loss-and-liveness-hardening A-1：422 `AI_TRADE_UNGUARDED_HORIZON` 携带的
+    // **可执行补救**（镜像上一行 `members` 的既有先例）。不带过来的话，后端那三条出路在界面上
+    // 就只剩一句「浮盈回吐将没有任何自动兑现通道」——用户知道坏了，却不知道该点哪里。
+    let remedies: { id: string; label: string }[] | undefined;
     try {
       const body = await res.json();
       if (body?.error) {
         code = body.error.code ?? code;
         message = body.error.message ?? message;
         members = body.error.members;
+        if (Array.isArray(body.error.remedies)) remedies = body.error.remedies;
       }
     } catch {
       // 非 JSON 错误体：保留状态码文案
     }
-    throw new ApiRequestError(code, message, res.status, members);
+    throw new ApiRequestError(code, message, res.status, members, remedies);
   }
   return res.status === 204 ? (undefined as T) : ((await res.json()) as T);
 }

@@ -523,7 +523,8 @@ class LiveAutoManager:
                         "allocationPct": plan.allocation_pct,
                         "allocationMode": ctx.req.allocation_mode,
                         "totalBudgetUsd": ctx.total_budget_usd},
-                status="running")
+                status="running",
+                start_ts=int(time.time()))   # E-4：会话时长的唯一起点（历史行保持 0，不回填）
             return run.id
 
 

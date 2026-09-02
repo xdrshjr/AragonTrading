@@ -226,6 +226,9 @@ class AiTradeGroupStartRequest:
     discipline_f_floor: float = 1.0          # [P0-4] 最小下单量复核用的保守仓位下界（1.0=不复核）
     discipline_adjustments: list[dict] = field(default_factory=list)
     discipline_thresholds: dict = field(default_factory=dict)
+    # ★ 轴 A-4（loss-and-liveness-hardening）：在本会话中「其消费层未装配因而不作数」的阈值键。
+    # 只披露、不改行为；空列表 = 表里每一行都真的作数（**不是**「后端没上线这个键」）。
+    discipline_inert: list[str] = field(default_factory=list)
     # 启动请求**原文**（ai-trade-pause-resume D-2）：续跑的唯一真源。`config_json` 缺 accountId /
     # stopLossPct / takeProfitPct / primingBars，照它续跑会静默把用户设的止损换成服务端默认。
     # 只落请求体（`AiTradeGroupStartIn`），**绝不**含 apiKey/secret/passphrase（[P2-11]）。
@@ -274,6 +277,7 @@ class AiTradeGroup:
     discipline_preset: str = "off"           # 交易纪律预设 id（"off"=整轴未装配），回显 discipline
     discipline_adjustments: list[dict] = field(default_factory=list)
     discipline_thresholds: dict = field(default_factory=dict)
+    discipline_inert: list[str] = field(default_factory=list)   # ★ 轴 A-4：失效阈值键（只读披露）
     # 轴 A 启动断面（tradability-and-open-funnel §3.1.3）：**逐成员一份**，与各成员会话 status 里
     # 的那一份是**同一个对象**（同一 `asOfTs`）。R-10：分组级刻意不做任何合并——一个「平均否决率」
     # 既没有操作含义，AI-trade 也没有分组级实时通道可以可信地下发它。
@@ -341,6 +345,11 @@ class _GroupBuildCtx:
     book: GroupExposureBook | None = None     # 分组共享敞口簿（总闸③关 ⇒ None ⇒ corrScale ≡ 1.0）
 
 
+# 活性看门狗停手任务的关停死线（秒）。**必须远小于** `shutdown_step_timeout_s`（默认 20）：
+# 倒挂时外层先 cancel，内层什么都收不干净（经验层 ★ E-4 的成文教训）。
+_LIVENESS_DRAIN_TIMEOUT_S = 5.0
+
+
 class AiTradeManager:
     """进程内单活跃 AI 分组注册表（真实资金，一次至多一个 group，含 1..N 个标的会话）。"""
 
@@ -356,6 +365,11 @@ class AiTradeManager:
         self._hydration_failed = False
         # 「意图态 != 派生态」的告警去重（风险 R-9）：只在迁移瞬间记一次。
         self._last_logged_mismatch: tuple[str, str, str] | None = None
+        # ★ 轴 D（loss-and-liveness-hardening §4.4 D-3）：活性看门狗的停手任务集。
+        # 会话在决策轮**内部**只投递意图，真正的 `pause_group` 必须跑在决策轮**之外**——
+        # `Session.pause` 的第 ③ 步是 cancel 决策任务，从轮内 await 它就是自己 cancel 自己。
+        # 持强引用是必需的：`asyncio` 只持弱引用，不留着任务可能被 GC 中途回收。
+        self._liveness_tasks: set[asyncio.Task] = set()
 
     # ---------- 分组启动（两段式：全量门禁 → 建会话 → 起会话 / 回滚）----------
     async def start_group(self, req: AiTradeGroupStartRequest) -> AiTradeGroup:
@@ -637,6 +651,7 @@ class AiTradeManager:
             discipline_preset=req.discipline_preset,
             discipline_adjustments=req.discipline_adjustments,
             discipline_thresholds=req.discipline_thresholds,
+            discipline_inert=list(req.discipline_inert),
             account_id=req.account_row.id, start_wire=dict(req.start_wire or {}),
             resumed_count=int(resume_of.get("resumedCount") or 0))
         for member in members:
@@ -645,6 +660,8 @@ class AiTradeManager:
             # stop_member）之后把状态表收敛，否则磁盘上会留一张指向已平仓会话的续跑卡。
             member.session.group_id = group.group_id
             member.session.on_stopped = partial(self._note_session_stopped, group)
+            # ★ 轴 D：活性看门狗判到 `halt` 时的**同步**投递口（与 `on_stopped` 同款接线）。
+            member.session.on_liveness_halt = partial(self._request_liveness_pause, group)
         return group
 
     async def _build_member(self, ctx: _GroupBuildCtx, plan: _MemberPlan) -> AiTradeGroupMember:
@@ -1349,6 +1366,54 @@ class AiTradeManager:
             rows.append(row)
         return rows
 
+    def _request_liveness_pause(self, group: AiTradeGroup) -> None:
+        """★ 轴 D：接住会话侧的停手请求，起一个后台任务在决策轮**之外**整组暂停（同步、不 await）。
+
+        走的是**既有** `pause_group`，不是 `session.pause`：组状态行 W4 落盘、`group.state` /
+        `pause_reason` / `paused_ts`、情报调度暂停、经验层物化**全在 `pause_group` 里**。绕过它
+        直接调 `session.pause` ⇒ 磁盘上这一组仍是 `running`，进程重启后会被复活成「运行中」——
+        而它恰恰是刚刚被判定为「已死」的那个会话（评审 P0-4 ②）。
+
+        `flatten=False` 是硬约束（`G-D4` 冻结）：阻塞态下我们恰恰**不确定行情是否可信**，
+        此刻自动平仓是拿一个不可信的价格去动真实资金。
+
+        **粒度是组级**：`pause_group` 没有成员粒度。四条阻塞码里三条的根因是行情通道、几乎必然
+        组级同因，而「只停一个、另外两个继续在同一条坏通道上跑」是更差的结果。代价与理由写在
+        §九 R11，横幅文案逐字说明了「将暂停整组」。
+        """
+        if self._group is None or self._group.group_id != group.group_id:
+            return          # 分组已换代 / 已清空：这条请求属于上一个分组，丢弃（与 `_clear_group_if_current` 同款身份守卫）
+        task = asyncio.create_task(self._liveness_pause(group.group_id))
+        self._liveness_tasks.add(task)
+        task.add_done_callback(self._liveness_tasks.discard)
+
+    async def _drain_liveness_tasks(self) -> None:
+        """**等它跑完**，超时才 cancel——与 `experience` / `intel` 两条 drain 的极性刻意相反。
+
+        那两条 drain 的是「攒素材 / 蒸馏」这类可丢弃的工作，先 cancel 最省事；而这一条正在做的事
+        是 `pause_group`——一次半途而废的暂停会留下「会话已挂起、状态行没落盘」的中间态，
+        那恰恰是本轮轴 D 要消灭的形态（磁盘上仍是 `running`，重启后被复活成「运行中」）。
+        它很短（一次本地暂停 + 一次写库）；真超时了才 cancel，且之后 `shutdown()` 自己那次
+        pause / stop 会把状态收敛回去。
+
+        死线**刻意写死**而不是再开一个设置项：它只需要满足「远小于 `shutdown_step_timeout_s`
+        （默认 20s）」，而这一条与经验层 / 情报层那两条不同，没有任何用户可调的语义。
+        """
+        tasks = [task for task in self._liveness_tasks if not task.done()]
+        if not tasks:
+            return
+        _done, pending = await asyncio.wait(tasks, timeout=_LIVENESS_DRAIN_TIMEOUT_S)
+        for task in pending:
+            task.cancel()
+
+    async def _liveness_pause(self, group_id: str) -> None:
+        """真正执行整组暂停；**绝不外泄异常**（它跑在一个没有调用方的后台任务里）。"""
+        try:
+            await self.pause_group(group_id, reason=pause_core.PAUSE_REASON_LIVENESS,
+                                   flatten=False)
+        except Exception as exc:  # noqa: BLE001 —— 后台任务，失败只留日志（横幅已经发出去了）
+            logger.warning("ai-trade liveness pause failed (group=%s): %s", group_id, exc)
+
     async def _note_session_stopped(self, group: AiTradeGroup,
                                     session: AiTradeSession) -> None:
         """W5：某成员会话**自终止**后收敛状态表（置 `ended` 或只摘掉该成员）。
@@ -1761,6 +1826,10 @@ class AiTradeManager:
                                                  group.discipline_preset),
                 "thresholds": group.discipline_thresholds,
                 "adjustments": group.discipline_adjustments,
+                # ★ 轴 A-4：与 `config_json.discipline.inert` **同值**（同一装配点，不得各算一份）。
+                # `getattr` 兜底与 `tradability` / 生命周期三键同款：既有测试替身用 `SimpleNamespace`
+                # 直接构造分组，新增字段对它们必须是加法。
+                "inert": list(getattr(group, "discipline_inert", None) or []),
                 **digest}
 
     @staticmethod
@@ -1850,6 +1919,11 @@ class AiTradeManager:
 
         已是 `paused` 的分组在两种配置下都**只 touch 时间戳、不平仓**。
         """
+        # ★ 轴 D：先收掉活性看门狗投出的停手任务。它做的事就是 `pause_group`，而 `pause_group`
+        # 会写库（`_persist_group_state`）——关停链再往后几步就是 `db_engine` 那一步的
+        # `dispose_engine`，一个活着穿过引擎释放的写任务会当场抛（经验层 ★ E-4 的同款教训）。
+        # **关停步骤表一步都不加**：收敛落在既有的 `ai_trade` 那一步内部。
+        await self._drain_liveness_tasks()
         group = self._group
         if group is None:
             return {"action": "noop", "groupId": None, "paused": False}
@@ -2085,7 +2159,11 @@ class AiTradeManager:
                         # 服务端替我改了什么」——这正是后续用验收卡校准这组阈值的前提。
                         "discipline": {"preset": req.discipline_preset,
                                        "thresholds": req.discipline_thresholds,
-                                       "adjustments": req.discipline_adjustments},
+                                       "adjustments": req.discipline_adjustments,
+                                       # ★ 轴 A-4：失效阈值键随 config_json 落库（零列迁移）。
+                                       # 历史会话据此回答「当时表上那一行到底作不作数」——G-A7
+                                       # 断言它与 `group_status()` 那一份**同值**（同一装配点）。
+                                       "inert": list(req.discipline_inert)},
                         # 会话级静态口径标记（cost-truth §3.2 B-4，零迁移）：聚合层据此判断
                         # trades.pnl 是净额还是毛额；缺键的老 run 走 legacy 推定 + costBasisAssumed。
                         "costBasis": ("net" if req.settings.ai_trade_net_pnl_enabled
@@ -2095,7 +2173,11 @@ class AiTradeManager:
                 # ai-trade-stats-dashboard §3.2：填既有 group_* 列（零迁移），使 ai-trade run 可按组聚合
                 # 出历史会话；各成员冗余同值。组级秒级起点为 ctx.created_ts（P1-3；ctx 无 started_ts）。
                 group_id=ctx.group_id, group_started_ts=ctx.created_ts,
-                group_total_budget_usd=ctx.total_budget_usd)
+                group_total_budget_usd=ctx.total_budget_usd,
+                # E-4：`start_ts` 此前 211/211 条 ai-trade run 全是 0 ⇒ 会话时长不可得 ⇒ 换手率/日、
+                # 年化投影、每小时成本这类读数无从计算。组级起点用 `ctx.created_ts`（与 `group_started_ts`
+                # 同源同值），成员间因此不会各写一个差几毫秒的墙钟。
+                start_ts=ctx.created_ts)
             return run.id
 
 

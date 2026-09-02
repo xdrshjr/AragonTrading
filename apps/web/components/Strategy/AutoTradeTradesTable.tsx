@@ -7,6 +7,7 @@ import { useAppStore } from "@/lib/store";
 import { fmtPrice, fmtQty, fmtTime, signed } from "@/lib/format";
 import { Badge } from "@/components/ui";
 import { explainKindLabel, explainKindTone } from "@/lib/tradeExplain";
+import { describeTradeReason } from "@/lib/aiTrade";
 import { TRADES_MAX } from "@/lib/wireCaps";
 import TradeExplainDetail from "./TradeExplainDetail";
 
@@ -111,7 +112,9 @@ function TradeRow({
           <Badge tone={SIDE_TONE[trade.side]}>{SIDE_LABEL[trade.side]}</Badge>
         </span>
         <span className="flex min-w-0 flex-col gap-0.5">
-          <span className="truncate text-[var(--text)]">{trade.reason || "—"}</span>
+          {/* E-1：`reason` 现在可能是机器码（AI 决策那条通路），prose 在 `explain.headline` 里。
+              `describeTradeReason` 是这三条来源的唯一读序，老行（64 字截断的 prose）照旧可读。 */}
+          <span className="truncate text-[var(--text)]">{describeTradeReason(trade) || "—"}</span>
           <span className="flex items-center gap-1">
             <span
               className={clsx(

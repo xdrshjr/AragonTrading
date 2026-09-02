@@ -36,6 +36,14 @@ export interface ProfitGuardFieldsProps {
   onCooldownChange: (value: string) => void;
   disabled: boolean;
   preview: string;
+  /**
+   * ai-trade-loss-and-liveness-hardening A-3：关闭时要逐条列出的**后果清单**。
+   *
+   * 全部取自**已经在本组件上的受控值**（用户此刻填的那几个数）与一条**后端下发**的硬止盈行
+   * ——本文件**一个阈值字面量都不许出现**（`G-A5` 源码扫描门禁）。前端复制一份后端阈值，
+   * 下次调参时用户看到的就与真正生效的那组数分叉，比不给更坏。
+   */
+  hardTakeProfitText?: string | null;
 }
 
 export default function ProfitGuardFields({
@@ -60,6 +68,7 @@ export default function ProfitGuardFields({
   onCooldownChange,
   disabled,
   preview,
+  hardTakeProfitText,
 }: ProfitGuardFieldsProps) {
   return (
     <div className="flex flex-col gap-1.5 rounded-md border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_5%,transparent)] px-3 py-2">
@@ -96,6 +105,44 @@ export default function ProfitGuardFields({
           </span>
         </span>
       </label>
+      {!enabled && (
+        // ★ A-3：关闭是用户的权利，但**后果必须被说出来**。
+        // 生产实证：193 / 211 条 run 的利润保护层未装配，其中 45 条同时选了承诺「硬止盈」的纪律
+        // 预设——用户看得见那个数，它却逐字节不作数（`hard_tp_return_pct` 的唯一消费点在保护层里）。
+        // 更要命的是持仓周期层只有**亏损侧**豁免：浮亏到半个止损距离 ⇒ 三闸全开、可以随时割肉；
+        // 浮盈任意幅度 ⇒ 三闸全关、在最短持仓之内**没有任何通道**兑现利润。
+        <div
+          role="alert"
+          className="mt-1 flex flex-col gap-1 rounded border border-[var(--short)] bg-[var(--short-soft)] px-2 py-1.5 text-[11px] leading-relaxed text-[var(--text)]"
+          data-testid="ai-profit-guard-unguarded-notice"
+        >
+          <span className="font-medium">关闭后，以下机制在本次会话中全部不生效：</span>
+          <ul className="flex list-disc flex-col gap-0.5 pl-4">
+            <li>
+              回吐棘轮：浮盈达 <strong>{armReturnRaw || "—"}%</strong>{" "}
+              后记录峰值，自峰值回吐超{" "}
+              <strong>{givebackRaw || "—"}%</strong>（按所选阶梯逐级收紧）即由系统平仓。
+            </li>
+            <li>
+              保本线：浮盈达 <strong>{breakevenArmRaw || "—"}%</strong>{" "}
+              后把退出线上移到入场价附近，跌回即离场。
+            </li>
+            {hardTakeProfitText && (
+              <li data-testid="ai-profit-guard-unguarded-hardtp">
+                {hardTakeProfitText}
+                ——<strong>该项由利润保护层执行，关闭后不生效</strong>。
+              </li>
+            )}
+            <li>峰值浮盈与利润捕获率读数（关掉它，你就没有了「本该拦住多少钱」这个证据）。</li>
+            <li>
+              保护性平仓后的同向冷却 <strong>{cooldownRaw || "—"}</strong> 秒。
+            </li>
+          </ul>
+          <span className="text-[var(--muted)]">
+            若同时开着「持仓周期」模式，服务端会拒绝启动：那种组合下浮盈回吐没有任何自动兑现通道。
+          </span>
+        </div>
+      )}
       {enabled && (
         <div className="mt-1 flex flex-col gap-1.5 text-[11px] text-[var(--muted)]">
           <div className="grid grid-cols-2 gap-2">

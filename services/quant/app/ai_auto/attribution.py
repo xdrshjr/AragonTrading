@@ -30,6 +30,77 @@ _CAPACITY = 200
 _ROUND_USD = 6
 _ROUND_RATIO = 4
 
+# ---- 轴 F（loss-and-liveness-hardening §4.6）：退出裁量权的**只读结论**，无任何门禁 ----
+# `ExitSourceCard` 的文档注释里已经记着与本轮 §2.2 完全一致的观察（「16 次往返、15 次 Agent 主动
+# 平仓、唯一一次保护层平仓反而净赚 1.87 USDT」），而卡片同时明确声明 `exitMix` **不参与任何判定**
+# ——理由是「把它做成门槛会诱导『故意不平仓等保护层』」。**那条理由是对的，本轮不推翻它。**
+# 但「不做硬门槛」不等于「什么都不做」：这里产出一句**数据化**的结论，让用户自己去按那个开关。
+DISCRETION_LEVEL_INSUFFICIENT = "insufficient"
+DISCRETION_LEVEL_ADVERSE = "adverse"
+DISCRETION_LEVEL_NEUTRAL = "neutral"
+
+
+def exit_discretion_verdict(rows: list[dict] | None, *, min_samples: int,
+                            discretionary: tuple[str, ...],
+                            deterministic: tuple[str, ...],
+                            labels: dict[str, str] | None = None) -> dict | None:
+    """退出裁量权结论（**纯读数**）；`min_samples <= 0` ⇒ `None` ⇒ 整键缺席 ⇒ 逐字回退。
+
+    判定只有三档，且每一档都必须能被 `rows` 里的数字逐字复算：
+
+    - `insufficient`：模型自主平仓的样本数还不到门槛 ⇒ 如实写「样本 M/N，结论未生效」。
+    - `adverse`：样本够了、模型自主平仓合计为**负**、且至少一条确定性来源合计为**正**。
+    - `neutral`：样本够了但上面那两个条件不同时成立 —— 不下任何结论。
+
+    文案里**不得出现「已校准」「经回测验证」**这类措辞（`G-F2` 源码正则门禁）：本轮的阈值一个都
+    没有被回测校准过，说它校准过就是一句会被用户当依据的假话。
+
+    Args:
+        rows: `ExitLedger.stats()["bySource"]` 的行（`source` / `count` / `netUsd` / …）。
+        min_samples: 出结论所需的最小自主平仓往返数；`0` ⇒ 恒不出结论。
+        discretionary: 属于「模型自由裁量」的来源枚举（调用方从 `EXIT_SOURCES` 派生，不手抄）。
+        deterministic: 属于「确定性通道」的来源枚举（同上）。
+        labels: 来源枚举 → 中文标签（调用方从 `acceptance_text.EXIT_SOURCE_LABELS` 取，
+            那是这张表的**唯一真源**）。**结论是给人读的**：缺了它 `note` 里会出现一个裸英文
+            枚举（`profitGuard`），那是本仓库明令禁止的形态。缺省 ⇒ 原样用枚举值（只在单测里发生）。
+
+    Returns:
+        `{level, agentTrips, agentNetUsd, minSamples, bestDeterministic, note}`；
+        `bestDeterministic` 在没有任何正的确定性来源时为 `None`。
+    """
+    if int(min_samples) <= 0:
+        return None
+    by_source = {str(row.get("source") or ""): row for row in (rows or [])}
+    agent_trips = sum(int(by_source.get(key, {}).get("count") or 0) for key in discretionary)
+    agent_net = sum(_finite(by_source.get(key, {}).get("netUsd")) for key in discretionary)
+    best = None
+    for key in deterministic:
+        row = by_source.get(key)
+        if row is None or _finite(row.get("netUsd")) <= 0:
+            continue
+        if best is None or _finite(row.get("netUsd")) > best["netUsd"]:
+            best = {"source": key, "label": (labels or {}).get(key, key),
+                    "trips": int(row.get("count") or 0),
+                    "netUsd": round(_finite(row.get("netUsd")), _ROUND_USD)}
+    agent_net = round(agent_net, _ROUND_USD)
+    if agent_trips < int(min_samples):
+        return {"level": DISCRETION_LEVEL_INSUFFICIENT, "agentTrips": agent_trips,
+                "agentNetUsd": agent_net, "minSamples": int(min_samples),
+                "bestDeterministic": best,
+                "note": f"样本 {agent_trips}/{int(min_samples)}，结论未生效。"}
+    if agent_net < 0 and best is not None:
+        return {"level": DISCRETION_LEVEL_ADVERSE, "agentTrips": agent_trips,
+                "agentNetUsd": agent_net, "minSamples": int(min_samples),
+                "bestDeterministic": best,
+                "note": (f"模型自主平仓 {agent_trips} 笔合计 {agent_net:+.2f} USDT；"
+                         f"{best['label']}平仓 {best['trips']} 笔合计 "
+                         f"{best['netUsd']:+.2f} USDT。")}
+    return {"level": DISCRETION_LEVEL_NEUTRAL, "agentTrips": agent_trips,
+            "agentNetUsd": agent_net, "minSamples": int(min_samples),
+            "bestDeterministic": best,
+            "note": (f"模型自主平仓 {agent_trips} 笔合计 {agent_net:+.2f} USDT，"
+                     "未出现「自主通道为负而确定性通道为正」的分化。")}
+
 
 @dataclass(frozen=True)
 class RoundTrip:

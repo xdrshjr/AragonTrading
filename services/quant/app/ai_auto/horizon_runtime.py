@@ -40,6 +40,8 @@ from .hold_horizon import (
     gated_kind,
 )
 from .exchange_backstop import apply_backstop_gate
+# ★ 轴 B：`covered` 的**唯一派生点**（`pause` 只 import `dataclasses`，无环）。
+from .pause import is_backstop_covered
 from .profit_guard_runtime import exchange_oco_px
 from .turnover_discipline import (
     TurnoverRule,
@@ -220,11 +222,38 @@ class HorizonRuntime:
         now_wall = float(facts.now_wall)
         self.turnover_state = refill(self.turnover_state, self.turnover_rule,
                                      now_wall=now_wall)
+        wire = self._backstop_wire(now_wall)
         return build_snapshot(
             self.rule, self.state, facts,
             turnover=build_turnover_wire(self.turnover_state, self.turnover_rule,
                                          now_wall=now_wall),
-            backstop=self._backstop_wire(now_wall))
+            backstop=wire, backstop_covered=self._backstop_covered(wire))
+
+    def _backstop_covered(self, wire: dict | None) -> bool | None:
+        """★ 轴 B（loss-and-liveness-hardening §4.2）：兜底是否**确定已覆盖**——**唯一现算点**。
+
+        判据复用 `pause.is_backstop_covered`（`covered` 的唯一派生点，其 docstring 逐字写着
+        「`classify_backstop` 的 wire 里**没有** `covered` 这个键」——它只给 `basis` /
+        `coverageRatio`，覆盖是两者的合取）。阈值恒复用 `ai_trade_backstop_min_coverage`，
+        与 `discipline_view.naked_backstop` / 续跑门禁**同一个数**，本轮不新开旋钮。
+
+        落点在这里而不是 `build_horizon_facts`：那里只有 executor 与 readings，拿不到 backstop
+        运行时；而本方法与 `_backstop_wire` 在**同一个函数体**里被调，两者读的是同一份 wire、
+        同一个时刻，不存在错位（评审 P0-2）。
+
+        三条结构性回退保证（都不靠默认值碰巧成立）：
+        - 未装配核实层 ⇒ `self.backstop is None` ⇒ `wire is None` ⇒ 返回 `None`；
+        - 总闸关 ⇒ wire 是 `local(disabled)` 空壳 ⇒ `basis != "exchange"` ⇒ `False`；
+        - 轴 B 总闸 `ai_trade_loss_release_requires_uncovered=False` ⇒ 恒返回 `None`
+          ⇒ `release_reason_for` 恒返回 `RELEASE_LOSS`，逐字节回退今天的行为。
+        """
+        if wire is None or self.backstop is None:
+            return None
+        settings = self.backstop.settings
+        if not getattr(settings, "ai_trade_loss_release_requires_uncovered", False):
+            return None
+        return is_backstop_covered(
+            wire, float(getattr(settings, "ai_trade_backstop_min_coverage", 0.999)))
 
     def _backstop_wire(self, now_wall: float) -> dict | None:
         """检测层 wire + 自愈层的**嵌套加法子键**（backstop-repair §4.4 / 上一轮 D-10）。

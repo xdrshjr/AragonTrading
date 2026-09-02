@@ -17,6 +17,7 @@ import {
   memberDisciplines,
   summarizeDisciplines,
 } from "@/lib/aiTradeDiscipline";
+import AiTradeLivenessBanner from "@/components/Agent/AiTradeLivenessBanner";
 import AiTradeMemberRow from "./AiTradeMemberRow";
 import { AiTradeIntelButton } from "./AiTradeIntelButton";
 import { AiTradeExitCard } from "./AiTradeExitCard";
@@ -151,6 +152,12 @@ export default function AiTradePanel({
       {lifecycle === "running" && !armed.unavailable && !armed.armed && (
         <NotArmedBanner rows={armed.rows} total={armed.membersTotal} />
       )}
+
+      {/* 活性看门狗（loss-and-liveness-hardening 轴 D）：排在 `NotArmedBanner` **之后**、
+          可交易性红条**之前**。三者回答的是三个不同的问题，顺序即「坏得有多彻底」：
+          「没武装」＞「武装了但结构上长期开不出仓」＞「这个周期本来就很难开出仓」。
+          总闸关 / 老后端 / 一切正常 ⇒ 整段不渲染。 */}
+      <AiTradeLivenessBanner members={members} />
       <AiTradeFeedRecoveryCard groupId={group.groupId} members={members} />
 
       {/* 可交易性红条 + 长期记忆停摆徽标（tradability-and-open-funnel 轴 A / 轴 D）。

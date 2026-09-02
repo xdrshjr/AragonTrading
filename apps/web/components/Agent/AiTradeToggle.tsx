@@ -70,6 +70,9 @@ export default function AiTradeToggle() {
   const [nowTs, setNowTs] = useState(() => Math.floor(Date.now() / 1000));
   const [modalOpen, setModalOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // ai-trade-loss-and-liveness-hardening A-1：422 `AI_TRADE_UNGUARDED_HORIZON` 随错误体带回的
+  // **可执行补救**（文案由后端下发，前端只把它渲染成按钮）。其余错误 ⇒ 恒 null ⇒ 逐字回退。
+  const [startRemedies, setStartRemedies] = useState<{ id: string; label: string }[] | null>(null);
   const [pauseOpen, setPauseOpen] = useState(false);
   const [resumeOpen, setResumeOpen] = useState(false);
   const [endOpen, setEndOpen] = useState(false);
@@ -181,11 +184,15 @@ export default function AiTradeToggle() {
       });
       setModalOpen(false);
       setError(null);
+      setStartRemedies(null);
       // 新会话起来了，上一次的生命周期提示就过期了（那笔孤儿仓的告知使命到此为止）。
       setAiTradeLifecycleNotice(null);
       qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
     },
-    onError: (e) => setError(e instanceof ApiRequestError ? describeStartError(e) : "启动失败，请稍后重试"),
+    onError: (e) => {
+      setError(e instanceof ApiRequestError ? describeStartError(e) : "启动失败，请稍后重试");
+      setStartRemedies(e instanceof ApiRequestError ? (e.remedies ?? null) : null);
+    },
   });
 
   const startBacktestM = useMutation({
@@ -596,6 +603,7 @@ export default function AiTradeToggle() {
         onClose={() => {
           setModalOpen(false);
           setError(null);
+          setStartRemedies(null);
         }}
         onConfirm={(opts) => (opts.mode === "backtest" ? startBacktestM.mutate(opts) : startM.mutate(opts))}
         submitting={startM.isPending || startBacktestM.isPending}
@@ -619,6 +627,7 @@ export default function AiTradeToggle() {
         defaultTradingHorizon={aiTradeConfig?.tradingHorizon}
         defaultExperience={aiTradeConfig?.experience}
         error={error}
+        errorRemedies={startRemedies}
         liveGateReason={liveGateReason}
         defaultStartTs={backtestStartTs}
         defaultEndTs={backtestEndTs}

@@ -84,7 +84,11 @@ class Trade(Base):
     fee: Mapped[float] = mapped_column(Float)
     pnl: Mapped[float] = mapped_column(Float, default=0.0)   # 平仓净实现盈亏，开仓为 0
     position_after: Mapped[float] = mapped_column(Float, default=0.0)
-    reason: Mapped[str] = mapped_column(String(64), default="")
+    # ai-trade-loss-and-liveness-hardening E-2：`String(64)` 时 221 笔 LLM 平仓的 reason 长度
+    # **全部恰好 64**（100% 被静默截断）。扩到 128 对 SQLite 是零迁移的（不强制 VARCHAR 长度，
+    # 老库直接就能写；新建库由本定义生效），故 `db/session.py` 的补列器**刻意不碰**——它只会
+    # `ADD COLUMN`，而 `reason` 早在列集里，加一行进那张表是纯死码。
+    reason: Mapped[str] = mapped_column(String(128), default="")
     stop_loss_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     take_profit_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
     max_hold_bars: Mapped[int | None] = mapped_column(Integer, nullable=True)

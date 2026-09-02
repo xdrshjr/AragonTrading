@@ -732,6 +732,20 @@ function patchAiTradeMember(
   return { aiTradeGroup: { ...group, members: { ...group.members, [instId]: updater(member) } } };
 }
 
+/**
+ * 从**持久化偏好**里剥掉 `profitGuard.enabled`（ai-trade-loss-and-liveness-hardening A-2）。
+ *
+ * 写侧（`setAiTradeConfig`）与 persist v31 迁移**共用这一个函数**：只做其中一处都不成立——
+ * 写侧管未来，迁移管那 193 份已经躺在 localStorage 里的「关」。
+ * `config` 为 null / 无 `profitGuard` ⇒ 原样返回（**必须 null 守卫**：aiTradeConfig 的初始值与
+ * 多个版本落点都是 null，对 null 取属性赋值会抛 TypeError 直接崩掉水合，见 v28/v29 的成文教训）。
+ */
+function stripProfitGuardEnabled(config: AiTradeConfig | null): AiTradeConfig | null {
+  if (!config || !config.profitGuard) return config;
+  const { enabled: _dropped, ...rest } = config.profitGuard;
+  return { ...config, profitGuard: rest };
+}
+
 export const useAppStore = create<AppState>()(
   persist(
     (set) => ({
@@ -1125,7 +1139,16 @@ export const useAppStore = create<AppState>()(
       // 一个指向已归档会话的红点比没有红点更坏。
       clearAiTradeRuntime: () =>
         set({ aiTradeGroup: null, aiTradeResumable: null, aiTradeIntel: {} }),
-      setAiTradeConfig: (aiTradeConfig) => set({ aiTradeConfig }),
+      // ai-trade-loss-and-liveness-hardening A-2：**利润保护的开关不进偏好**（写侧剥离）。
+      // 合入前它是一个粘性偏好：取消一次勾选 ⇒ 提交体 `{enabled:false}` ⇒ 存进 aiTradeConfig ⇒
+      // 此后每一次启动都默认关闭、永不回弹、也不再提示。实测 **193 / 211** 条 run 的利润保护层
+      // 未装配，其中 45 条同时选了承诺「硬止盈 50%」的纪律预设——用户看得见那个数，它却逐字节
+      // 不作数。目标不是「不让用户关」，而是**不能一次关掉、永远关掉**。
+      // 剥完之后弹窗读到的 `defaultProfitGuard.enabled` 是 undefined，
+      // `AiTradeLaunchModal` 既有的 `?? AI_TRADE_PROFIT_GUARD_DEFAULTS.enabled` 兜底自然回弹为
+      // true——**弹窗与 AiTradeToggle 一行都不用改**（读点本来就有兜底）。
+      setAiTradeConfig: (aiTradeConfig) =>
+        set({ aiTradeConfig: stripProfitGuardEnabled(aiTradeConfig) }),
       setAiBacktestJobId: (aiBacktestJobId) => set({ aiBacktestJobId }),
       setAiBacktestConfig: (aiBacktestConfig) => set({ aiBacktestConfig }),
       setBacktestRange: (backtestStartTs, backtestEndTs) =>
@@ -1292,7 +1315,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 30,
+      version: 31,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -1490,6 +1513,17 @@ export const useAppStore = create<AppState>()(
           // 策略与因子挖掘：补分区默认（老用户从未持久化过 discoverySection）；
           // discoveryRun / discoveryRunId 为瞬态（不入 partialize），浅合并回落即可。
           next = { ...next, discoverySection: "overview" };
+        }
+        if (version < 31) {
+          // ai-trade-loss-and-liveness-hardening A-2 的**另一半**：把**已经落盘**的
+          // `profitGuard.enabled` 剥掉。只做写侧剥离救不了它要救的那批人——193 条 run 的
+          // `enabled:false` 此刻就躺在用户的 localStorage 里，升级后第一次打开弹窗读到的仍然是
+          // 「关」。剥掉之后读点的 `?? AI_TRADE_PROFIT_GUARD_DEFAULTS.enabled` 自然回弹为 true。
+          // **必须 null 守卫**（镜像 v28 / v29 的成文教训）：aiTradeConfig 的初始值与多个版本落点
+          // 都是 null，对 null 取属性赋值会抛 TypeError 直接崩掉水合。
+          // 与 v28 / v29 同款的显式收窄：`next` 是 persist 给的 `unknown` 形状。
+          const cfg = next.aiTradeConfig as AiTradeConfig | null;
+          next = { ...next, aiTradeConfig: stripProfitGuardEnabled(cfg) };
         }
         return next as never;
       },

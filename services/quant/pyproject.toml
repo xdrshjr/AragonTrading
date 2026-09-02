@@ -3,8 +3,15 @@
 asyncio_mode = "auto"
 testpaths = ["tests"]
 # 裸跑 pytest 默认排除真实网络用例（不污染离线 CI）；opt-in 用 `pytest -m network` (C4)
-addopts = "-m 'not network'"
-markers = ["network: 需真实 OKX 连通的端到端用例（默认排除，opt-in: pytest -m network）"]
+# `audit` 同款 opt-in（ai-trade-loss-and-liveness-hardening R10）：它读的是**用户的真实生产库**
+# （119 MB）与后端日志（253 MB），既不该进 CI，也不该在别人的机器上凭空失败。
+# **默认排除不是自动的**：`addopts` 与 `markers` 两处都要写——只加 markers 会让它照进全量跑，
+# 只加 addopts 会让 pytest 对未注册 marker 告警。
+addopts = "-m 'not network and not audit'"
+markers = [
+    "network: 需真实 OKX 连通的端到端用例（默认排除，opt-in: pytest -m network）",
+    "audit: 读真实生产库 / 日志的证据复算（默认排除，opt-in: pytest -m audit）",
+]
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.ruff]

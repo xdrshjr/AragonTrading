@@ -418,6 +418,9 @@ export interface AiTradeHorizonProfilesResponse {
   // 离场优先通道的只读说明块（exit-priority §6.2）；总闸关 ⇒ 整块缺席 ⇒ 前端不渲染。
   // 同上一条纪律：档位标签、配额、地板与那句安全承诺**全部由后端下发**，前端一个字都不硬编。
   exitPriority?: AiTradeExitPriorityConfig | null;
+  // ai-trade-loss-and-liveness-hardening C-1：唤醒下限除数（`0` = 只观测不改行为，本轮默认）。
+  // 前端**不复制这个数**，只用它决定渲不渲染那句提示并按下发值现算下限。
+  wakeHorizonDivisor?: number;
   profiles: AiTradeHorizonProfile[];
 }
 
@@ -540,6 +543,11 @@ export interface AiTradeDisciplineWire extends AiTradeDisciplineDigest {
   thresholds?: Record<string, number | boolean> | null;
   // 服务端替用户改过的每一处（共识夹紧 / 暖机根数抬升 / 最小下单量风险），**如实列出**。
   adjustments?: { field: string; from?: number | null; to?: number | null; reason: string }[];
+  // ai-trade-loss-and-liveness-hardening A-4：在本会话中「其消费层未装配因而**不作数**」的阈值键。
+  // 这是 D2「显示了但不作数」的通用修法——`balanced` 预设承诺的硬止盈 50% 在利润保护层未装配时
+  // 逐字节不生效，而实测 45 条 run 正处于这个状态且界面上没有任何一处说出来。
+  // 空数组 = 表上每一行都真的作数；缺席 = 老后端没下发这个键（两者不同，故渲染门控读它在不在）。
+  inert?: string[];
 }
 
 /** 只读阈值表的一行（`GET /ai-trade/discipline-presets`）。中文标签与已格式化的值全由后端下发。 */
@@ -821,6 +829,31 @@ export interface AiTradeExitSourceRow {
 export interface AiTradeExitMix {
   totalExits: number;
   bySource: AiTradeExitSourceRow[];
+  // ai-trade-loss-and-liveness-hardening 轴 F：退出裁量权的**只读结论**（无任何门禁）。
+  // 嵌在既有整对象里 ⇒ 前端 reducer 一行不必动。`AI_TRADE_EXIT_VERDICT_MIN_SAMPLES=0`
+  // ⇒ 后端整键缺席 ⇒ 结论行不渲染。
+  exitDiscretion?: AiTradeExitDiscretion | null;
+}
+
+/** 三档：样本不足 / 自主通道为负而确定性通道为正 / 未出现该分化。 */
+export type AiTradeExitDiscretionLevel = "insufficient" | "adverse" | "neutral";
+
+/**
+ * 轴 F 的结论。**`note` 由后端下发，前端一个字都不拼**——它是一句带数字的判定性说明，
+ * 两处各写一遍必然与后端真正据以判定的数字分叉。
+ *
+ * `ExitSourceCard` 的原始立场（「`exitMix` 不参与任何判定，把它做成门槛会诱导『故意不平仓等
+ * 保护层』」）**本轮不推翻**：这里给的是一句读数，不是一道闸。
+ */
+export interface AiTradeExitDiscretion {
+  level: AiTradeExitDiscretionLevel;
+  agentTrips: number;
+  agentNetUsd: number;
+  minSamples: number;
+  // `label` 是**后端下发的中文标签**（`acceptance_text.EXIT_SOURCE_LABELS`）：`note` 整句由后端
+  // 拼好，这里只是让前端在需要单独渲染来源时也不必自己映射一次。老后端 ⇒ 缺席。
+  bestDeterministic: { source: string; label?: string; trips: number; netUsd: number } | null;
+  note: string;
 }
 
 export interface AiTradeFundingStats {
@@ -900,7 +933,11 @@ export type AiTradeEdgeGateStatus = "pass" | "veto" | "unavailable";
 // 利润保护层入参（与后端 profit_guard.ProfitGuardRule 镜像；数值字段留空→服务端按 settings 回填）。
 // 全部收益率为**保证金收益率口径**（5× 杠杆下标的 10% ≈ 保证金 +50%，用标的口径根本触发不到）。
 export interface AiTradeProfitGuardRule {
-  enabled: boolean;
+  // ai-trade-loss-and-liveness-hardening A-2 起**可选**：`store.setAiTradeConfig` 与 persist v31
+  // 迁移会把这一位从**持久化偏好**里剥掉（「可以每次关它，但不能一次关掉、永远关掉」）。
+  // 提交体与回执镜像里它照旧恒有值——两个读点（`AiTradeLaunchModal` 的初值与重置 effect）
+  // 本来就写着 `?? AI_TRADE_PROFIT_GUARD_DEFAULTS.enabled`，拿到 undefined 即自然回弹为 true。
+  enabled?: boolean;
   armReturnPct?: number | null;              // 武装移动止盈的峰值保证金收益率（0~5）
   givebackPct?: number | null;               // 自峰值允许回吐比例（0~1）
   breakevenArmReturnPct?: number | null;     // 武装保本线的峰值收益率（0=关闭保本）
@@ -1292,6 +1329,14 @@ export interface AiTradeSessionRow {
   // 只声明一处会让另一页那张卡恒为空。未装配 / 零样本 ⇒ null ⇒ 整卡不渲染。
   trendVerdict?: AiTradeTrendStats | null;
   summaryHealth?: AiTradeSummaryHealth | null;
+  // ai-trade-loss-and-liveness-hardening 轴 D：活性断面。两条通路都下发它——REST 成员行取自
+  // `session.info()`、WS `status` 经 `patchAiTradeMemberStatus` 整体 spread 合并进 `m.session`。
+  // **两个接口都要声明**：只声明一处会让另一条通路上的横幅恒不渲染（`trendVerdict` 的同款教训）。
+  // 总闸关 / 老后端 ⇒ 整键缺席 ⇒ 横幅整段不渲染。
+  liveness?: AiTradeLiveness | null;
+  // C-2：结构上不可能产生任何合法动作而被整轮跳过的次数。`roundsCompleted` **刻意不含它们**
+  // ——那一轮没做过任何决策，算进轮数会污染「N 轮 0 成交」这个度量本身。总闸默认关 ⇒ 恒 0。
+  roundsSkipped?: number;
   // 会话级已实现读数（realized-edge-calibration 轴 A）：挂 `_status_payload` **顶层**而不是
   // `costSnapshot` 之下——后者只在 `k_min<=0`（门禁空转）时才发，装了纪律预设的会话一次都收不到。
   // 零往返 / 老后端 ⇒ null 或 undefined ⇒ 整段不渲染（G-9b 的实时侧读点）。
@@ -1368,6 +1413,14 @@ export interface AiTradeStatusEvent {
   // 只声明一处会让另一页那张卡恒为空。未装配 / 零样本 ⇒ null ⇒ 整卡不渲染。
   trendVerdict?: AiTradeTrendStats | null;
   summaryHealth?: AiTradeSummaryHealth | null;
+  // ai-trade-loss-and-liveness-hardening 轴 D：活性断面。两条通路都下发它——REST 成员行取自
+  // `session.info()`、WS `status` 经 `patchAiTradeMemberStatus` 整体 spread 合并进 `m.session`。
+  // **两个接口都要声明**：只声明一处会让另一条通路上的横幅恒不渲染（`trendVerdict` 的同款教训）。
+  // 总闸关 / 老后端 ⇒ 整键缺席 ⇒ 横幅整段不渲染。
+  liveness?: AiTradeLiveness | null;
+  // C-2：结构上不可能产生任何合法动作而被整轮跳过的次数。`roundsCompleted` **刻意不含它们**
+  // ——那一轮没做过任何决策，算进轮数会污染「N 轮 0 成交」这个度量本身。总闸默认关 ⇒ 恒 0。
+  roundsSkipped?: number;
   // 会话级已实现读数（realized-edge-calibration 轴 A）：挂 `_status_payload` **顶层**而不是
   // `costSnapshot` 之下——后者只在 `k_min<=0`（门禁空转）时才发，装了纪律预设的会话一次都收不到。
   // 零往返 / 老后端 ⇒ null 或 undefined ⇒ 整段不渲染（G-9b 的实时侧读点）。
@@ -1535,7 +1588,10 @@ export type AiTradePauseReason =
   | "app_quit"
   | "process_restart"
   | "disabled_by_config"
-  | "resume_rollback";
+  | "resume_rollback"
+  // ai-trade-loss-and-liveness-hardening 轴 D：活性看门狗判到「连续 N 轮结构上无法开仓且零成交」
+  // 后请求的整组自动停手。**绝不平仓**——阻塞态下我们恰恰不确定行情是否可信。
+  | "liveness_blocked";
 
 // ============ 生命周期真值（ai-trade-lifecycle-truth §5.1 / §5.2）============
 
@@ -2073,6 +2129,30 @@ export interface AiTradeTradabilitySnapshot {
 }
 
 // ---- 开仓漏斗（轴 C · §5.3）----
+// ============ 活性看门狗（ai-trade-loss-and-liveness-hardening 轴 D / §6.1）============
+
+/** 三档：`ok`（一切正常）/ `degraded`（橙色横幅）/ `halt`（已请求整组自动停手）。 */
+export type AiTradeLivenessLevel = "ok" | "degraded" | "halt";
+
+/**
+ * `status.members[].liveness` 与 WS `liveness` 事件**同一份 wire**（后端同一次装配）。
+ *
+ * 生产实证：最近一条会话跑满 456 轮决策、0 笔成交，而面板上什么都没说——系统进入了一个
+ * 「运行中 / 无成交 / 不报警 / 不自愈 / 不停止」的吸收态，持续 260+ 轮。
+ *
+ * **`message` / `advice` 一律由后端下发，前端一个字都不拼**（沿用 `/ai-trade/horizon-profiles`
+ * 的既有纪律）：一句判定性的话如果两处各写一遍，用户拿着真钱看到的那一句迟早与后端真正据以
+ * 停手的判据分叉。总闸关 / 老后端 ⇒ 整键缺席 ⇒ 横幅整段不渲染。
+ */
+export interface AiTradeLiveness {
+  level: AiTradeLivenessLevel;
+  code: string | null;      // `liveness.BLOCKING_CODES` 之一；`ok` 档为 null
+  streak: number;           // 同一个阻塞码连续了多少轮（含本轮）
+  sinceWall: number;        // 这一段连续阻塞开始的墙钟秒；`0` = 还没起算（**不编时间**）
+  message: string;
+  advice: string;
+}
+
 export interface AiTradeOpenFunnel {
   intents: number;
   blocked: Record<string, number>;
@@ -2081,6 +2161,10 @@ export interface AiTradeOpenFunnel {
   sizingZeroed: number;  // 不是一道闸，是求解结果 ⇒ 画在「委托」前的最后一格
   submitted: number;
   filled: number;
+  // ai-trade-loss-and-liveness-hardening E-7 / E-8：委托**之后**的两格（`expired` 与 `filled`
+  // 互斥、都排在「委托」之后，故漏斗闭合不变式逐字不变）。老会话 / 老后端 ⇒ 缺席 ⇒ 那两格不渲染。
+  expired?: number;              // 限价开仓委托未成交即被撤（实测 602 笔限价开仓里 223 笔如此收场）
+  insufficientBalance?: number;  // 委托被交易所判「可用余额 / 保证金不足」（本轮**纯观测**）
   conversion: number | null;   // `intents == 0` ⇒ null（**绝不**把 0/0 画成 0%）
   layers: string[];            // 决策链顺序（后端下发，前端只做布局）
   scope: string;               // 口径词（全程累计 vs 滚动窗口）
@@ -2100,6 +2184,7 @@ export interface AiTradeSideFunnel {
   sizingZeroed: number;
   submitted: number;
   filled: number;
+  expired?: number;    // E-7：方向取**委托腿自己的** side（跨轮撤单，轮级方向标志早已清零）
 }
 
 export type AiTradeDirectionVerdict = "balanced" | "long_skewed" | "short_skewed" | "insufficient";

@@ -507,3 +507,28 @@ def sizing_config_wire(settings, bar_seconds: int) -> dict | None:
                          "haltDdPct": brake.halt_dd_pct, "lossStreak": brake.loss_streak,
                          "lossCooldownSeconds": brake.loss_cooldown_s}
     return wire
+
+
+# ============================ E-8（loss-and-liveness-hardening 轴 E）============================
+# **本轮只做观测。** 仓位求解结果超过账户可用保证金时，今天以交易所回执 `INSUFFICIENT_BALANCE`
+# 收场（实测 53 次），事后既不进任何计数、也无从回答「到底差多少」。会话侧已把它记进开仓漏斗
+# 的 `insufficientBalance` 一格（`session._dispatch` 是全部 executor 事件的唯一收口）。
+#
+# **逐档降档本轮不实现**，理由写在 §十一.7：`LiveExecutor` 全文没有任何可用保证金读数
+# （`grep -n "avail" live_auto/executor.py` 零命中），可用余额只在 `manager._gather_context` 的
+# **启动期**取过一次。要在下单前预检只有两条路——热路径每次开仓多打一发 REST（新增 IO，而链路
+# 上已有 1152 次 429），或拿一个启动期的陈旧值去决定真实仓位（更糟）。
+#
+# 那么 `ai_trade_sizing_margin_precheck` 这个键为什么现在就存在？因为它是**这条边界的显式声明**：
+# 下一轮实现降档时，行为改动必须有一把已经存在、已经登记、已经被用户看得见的总闸。但一个「置 true
+# 也什么都不会发生」的开关如果不说出来，就是本仓库明令禁止的「显示了但不作数」。故本函数是它**唯一
+# 的读点**，产物如实进启动回执的 `discipline.adjustments`——用户在按下启动键之后就会看到那句话。
+def margin_precheck_notice(settings) -> dict | None:
+    """`ai_trade_sizing_margin_precheck` 的唯一读点；关（默认）⇒ `None` ⇒ 回执逐字不变。"""
+    if not getattr(settings, "ai_trade_sizing_margin_precheck", False):
+        return None
+    return {
+        "field": "sizingMarginPrecheck", "from": True, "to": False,
+        "reason": "下单前可用保证金预检（逐档降档）本轮尚未实现，该开关当前不改变任何一次真实"
+                  "提交张数；已把可用余额不足的次数记进开仓漏斗，下一轮据此校准降档档位",
+    }

@@ -28,9 +28,11 @@ from ..ai_auto.discipline import (
     PRESET_IDS,
     PRESET_LABELS,
     DisciplinePreset,
+    inert_thresholds,
     preset_rows,
     preset_table,
     resolve_updates,
+    unguarded_horizon,
 )
 from ..ai_auto.experience import (
     load_session_graph,
@@ -52,8 +54,10 @@ from ..ai_auto.profit_guard import ProfitGuardRule, resolve_profit_guard_rule
 from ..ai_auto.session import AiTradeManualExitDisabled
 from ..ai_auto.signal_prior import resolve_prior_params, strategy_fingerprint
 from ..ai_auto.sizing import parse_sizing_rule, window_need
+from ..ai_auto.sizing_runtime import margin_precheck_notice
 from ..ai_auto.track_record_service import build_profitability, resolve_track_record
 from ..ai_auto.tradability_probe import probe
+from ..ai_auto.wake_runtime import coherent_wake_floor_s
 from ..config import Settings, get_settings
 from ..db import ai_prior_repositories as prior_repo
 from ..db import repositories as repo
@@ -400,6 +404,7 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
     """
     _require_ai_enabled(settings)
     req = await build_start_request(session, settings, body)
+    _require_profit_exit_with_horizon(req, settings)
     try:
         await get_ai_trade_manager().start_group(req)
     except AiTradeGroupPreflightError as exc:
@@ -409,6 +414,44 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
     except (AiTradeSessionLimitError, AiTradePreflightError) as exc:
         raise HTTPException(exc.status, detail={"code": exc.code, "message": exc.message})
     return get_ai_trade_manager().group_status()
+
+
+def _require_profit_exit_with_horizon(req: AiTradeGroupStartRequest,
+                                      settings: Settings) -> None:
+    """★ 轴 A-1 互锁（loss-and-liveness-hardening §4.1）：致命组合**不可被新启动**。
+
+    **落点必须在本端点内，绝不在 `build_start_request` 里**（评审 P0-3）：冷续跑
+    （`ai_auto/resume.py`）延迟导入并用 `start_wire` 原文重跑同一个 `build_start_request`，
+    而 `_rebuild_request` 把任何 `HTTPException` 一律翻成 409「启动契约已失效，无法继续」。
+    判据放进装配链 ⇒ 生产里那 50 条「周期已装配 + 保护层未装配」的会话一旦暂停就**再也续不回来**，
+    而续不回来的会话可能正持有真实仓位。互锁只拦「新建」，不碰「续跑」（`G-A8` 在同一个用例里
+    同时断言这两件事，任何把判据挪回装配链的改动都会当场判红）。
+
+    错误体给出**三条可执行的出路**，前端逐条渲染为按钮、不自造文案；选 422 而不是「后端自动补装
+    保护层」，是因为后者会静默改变用户提交的语义，而本仓库对「服务端替我改了什么」的既有纪律是
+    **必须显式回执**。
+
+    Raises:
+        HTTPException: 422 `AI_TRADE_UNGUARDED_HORIZON`。
+    """
+    if not unguarded_horizon(req.profit_rule, req.horizon_rule,
+                             enabled=settings.ai_trade_require_profit_exit_with_horizon):
+        return
+    rule = req.horizon_rule
+    minutes = int(float(getattr(rule, "min_hold_s", 0.0) or 0.0) // 60)
+    raise HTTPException(422, detail={
+        "code": "AI_TRADE_UNGUARDED_HORIZON",
+        "message": (f"已选择「{getattr(rule, 'title', '') or '持仓周期'}」持仓周期"
+                    f"（最短持仓 {minutes} 分钟），但利润保护层被关闭："
+                    "浮盈回吐将没有任何自动兑现通道。"),
+        "horizon": {"profileId": getattr(rule, "profile_id", None),
+                    "minHoldSeconds": float(getattr(rule, "min_hold_s", 0.0) or 0.0)},
+        "remedies": [
+            {"id": "enable_profit_guard", "label": "开启利润保护（推荐）"},
+            {"id": "disable_horizon", "label": "关闭持仓周期约束"},
+            {"id": "ops_override",
+             "label": "运维总闸 AI_TRADE_REQUIRE_PROFIT_EXIT_WITH_HORIZON=false"},
+        ]})
 
 
 async def build_start_request(session: AsyncSession, settings: Settings,
@@ -445,6 +488,32 @@ async def build_start_request(session: AsyncSession, settings: Settings,
     priors = await _resolve_prior_snapshots(
         session, settings, inst_ids=[m.instId for m in body.members], bar=body.bar,
         fingerprints=fingerprints)
+    # ★ 轴 A-4 / C-1（loss-and-liveness-hardening）：这两步都要在 `req` 装配**之前**拿到三条
+    # 已解析的契约，故在这里各解析一次并把结果复用进 `req`——`_resolve_*` 是纯函数、无副作用，
+    # 但**绝不调用两遍**（两份产物在下一次改动时会静默分叉，而它们并排出现在同一张回执上）。
+    horizon_rule = _resolve_horizon(body.tradingHorizon, settings, bar=body.bar)
+    profit_rule = _resolve_profit_guard(body.profitGuard, settings)
+    # ★ C-1：与目标持仓相干的唤醒下限。抬升写成装配层的一行 + 一条如实回执，
+    # **不抛错**——它与 A-1 的 422 极性相反：这一条在冷续跑时会再跑一遍，而那是安全且想要的
+    # （同一份 `start_wire` 得到同一个 `wake_s`，抬升是幂等的纯派生）。`divisor=0`（默认）⇒
+    # `floor_s == 0` ⇒ 唤醒周期逐字不变、`adjustments` 不变。
+    wake_s = _resolve_wake_interval_s(body.wakeIntervalMinutes, settings)
+    floor_s = coherent_wake_floor_s(horizon_rule,
+                                    divisor=settings.ai_trade_wake_horizon_divisor)
+    if floor_s > 0 and 0 < wake_s < floor_s:
+        discipline.adjustments.append({
+            "field": "wakeIntervalMinutes",
+            "from": round(wake_s / 60.0, 4), "to": round(floor_s / 60.0, 4),
+            "reason": (f"所选持仓周期的目标最短持仓是 {int(horizon_rule.target_hold_min_s // 60)} "
+                       f"分钟，唤醒周期已抬到 1/{settings.ai_trade_wake_horizon_divisor}，"
+                       "避免一次持仓被反复问「要不要走」")})
+        wake_s = floor_s
+    # ★ E-8：`ai_trade_sizing_margin_precheck` 的**唯一读点**——它本轮不改任何行为，故必须在
+    # 回执里如实说出这件事。一个「置 true 也什么都不会发生」的开关如果不说出来，就是本仓库
+    # 明令禁止的「显示了但不作数」。默认关 ⇒ 恒 `None` ⇒ 回执逐字不变。
+    precheck_notice = margin_precheck_notice(settings)
+    if precheck_notice is not None:
+        discipline.adjustments.append(precheck_notice)
     at = await repo.get_auto_trade_settings(session)
     # 天花板委托给账户级 maxBudgetPct 与运营天花板（与 effectiveMaxBudgetPct 同源，min 只收紧不放大）；
     # ai_trade_max_capital_frac 默认 1.0=不额外约束，运维可下调为 AI 专属更紧的绝对上限。
@@ -463,15 +532,15 @@ async def build_start_request(session: AsyncSession, settings: Settings,
         priming=body.priming, priming_bars=priming_bars,   # R-2 抬升后的值（如实列在 adjustments）
         budget_cap_frac=cap_frac, default_budget_frac=settings.ai_trade_default_capital_frac,
         position_step_pct=_resolve_position_step(body.positionStepPct, settings),
-        wake_interval_s=_resolve_wake_interval_s(body.wakeIntervalMinutes, settings),
+        wake_interval_s=wake_s,          # ★ C-1：可能已被相干下限抬升（如实进 adjustments）
         # 研判深度档（§4.4 / P1-1）：**必须落在请求对象上**，不能在装配时再读一次 settings——
         # 否则请求里的 `reasoningDepth` 会通过 422 校验、进 `start_wire`、然后在装配时被 settings
         # 默认值覆盖；而「暂停 → 冷续跑」走的正是「用 `start_wire` 重跑本函数」，深度档会静默
         # 降回默认档且**不报任何错**（用例 S-8）。
         reasoning_depth=body.reasoningDepth,
         base_rule=_resolve_base_rules(body.baseRules, settings),
-        profit_rule=_resolve_profit_guard(body.profitGuard, settings),
-        horizon_rule=_resolve_horizon(body.tradingHorizon, settings, bar=body.bar),
+        profit_rule=profit_rule,         # ★ 上面已解析一次，绝不再解析第二遍（两份产物必分叉）
+        horizon_rule=horizon_rule,
         prior_snapshots=priors,
         track_records=await resolve_track_record(   # 轴 D：启动期一次性快照（会话内不刷新，R-5）
             session, settings, inst_ids=[m.instId for m in body.members], bar=body.bar),
@@ -480,6 +549,12 @@ async def build_start_request(session: AsyncSession, settings: Settings,
         discipline_preset=discipline.preset_id, discipline_f_floor=discipline.f_floor,
         discipline_adjustments=discipline.adjustments,
         discipline_thresholds=preset_table(discipline.preset_id),
+        # ★ 轴 A-4：在本会话中「其消费层未装配因而不作数」的阈值键。这是 D2「显示了但不作数」
+        # 的通用修法——`balanced` 预设承诺的硬止盈 50% 在保护层未装配时逐字节不作数，而实测
+        # 45 条 run 正处于这个状态且界面上没有任何一处说出来。**只披露，不改任何行为。**
+        discipline_inert=inert_thresholds(
+            preset_table(discipline.preset_id), profit_rule=profit_rule,
+            sizing_rule=parse_sizing_rule(settings), horizon_rule=horizon_rule),
         # 经验层 W-1：规则与启动期快照（`SessionGraph{graph, totals, as_of_ts}` —— 图与库存总量
         # **同一次取数**，因为那两个整数要被逐字渲染进 L0 页眉喂给下真单的模型，不变式 I-9）。
         experience_rule=experience_rule, experience_snapshot=experience_snapshot,

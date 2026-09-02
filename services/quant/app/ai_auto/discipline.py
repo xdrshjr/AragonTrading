@@ -244,3 +244,65 @@ def resolve_updates(preset_id: str, overrides: dict | None,
             "reason": f"本会话只有 {int(spec_count)} 个策略，同向共识门槛已按策略数夹紧"
                       "（不夹紧会让开仓永久不可达）"})
     return DisciplinePreset(preset_id=preset_id, updates=updates, adjustments=adjustments)
+
+
+# ============================ 轴 A（loss-and-liveness-hardening §4.1）============================
+def unguarded_horizon(profit_rule, horizon_rule, *, enabled: bool) -> bool:
+    """「装了持仓周期锁却没有利润侧钥匙」——本轮**唯一**的致命组合判据（唯一真源）。
+
+    生产实证：`profitGuard` 回执为 `null`（= 利润保护层未装配）的 run 有 **193 / 211**；其中
+    **45 条**同时带着 `discipline.preset="balanced"` —— 用户选了承诺「硬止盈 50%」的纪律预设，
+    却因为另一个复选框而拿到了一个**没有任何利润侧离场**的会话。而持仓周期层的三道闸只有亏损侧
+    豁免、没有利润侧对手盘：浮亏到半个止损距离 ⇒ 三闸全开、Agent 可以随时割肉；浮盈任意幅度 ⇒
+    三闸全关、Agent 在 `min_hold_s`（默认 7200s）之内**没有任何通道**可以兑现利润。
+    **锁被装上了，钥匙被拔走了。**
+
+    ⚠️ **本判据只允许在 `ai_trade_start` 端点内求值**（评审 P0-3）。装配链
+    `api/ai_auto.build_start_request` 被**冷续跑复用**（`resume.py` 延迟导入并用 `start_wire`
+    原文重跑它），而 `_rebuild_request` 把任何 `HTTPException` 一律翻成
+    `409 AI_TRADE_RESUME_CONTRACT_INVALID`「启动契约已失效，无法继续」——把 422 放进装配链
+    ⇒ 生产里那 **50 条**「周期已装配 + 保护层未装配」的会话一旦暂停就再也续不回来，
+    而续不回来的会话可能正持有真实仓位。互锁的职责是「不让新的致命会话被创建」，
+    **不是「把已经存在的会话锁死」**。
+
+    Args:
+        profit_rule: 已解析的利润保护契约；`None` = 未装配。
+        horizon_rule: 已解析的持仓周期契约；`None` = 未装配。
+        enabled: 运维总闸 `ai_trade_require_profit_exit_with_horizon`；`False` ⇒ **恒 `False`**。
+
+    Returns:
+        真 ⇒ 这是致命组合，端点应当 422 并给出三条可执行的补救。
+    """
+    return bool(enabled) and profit_rule is None and horizon_rule is not None \
+        and float(getattr(horizon_rule, "min_hold_s", 0.0) or 0.0) > 0
+
+
+def inert_thresholds(thresholds: dict | None, *, profit_rule, sizing_rule,
+                     horizon_rule) -> list[str]:
+    """在本会话中**其消费层未装配**、因而不作数的阈值键（只读披露，不改任何行为）。
+
+    这是 D2「显示了但不作数」的**通用修法**：启动弹窗把纪律预设的阈值表原样展示给用户，而其中
+    一部分的唯一消费点可能整层没装配 —— `ai_trade_profit_guard_hard_tp_return_pct` 的唯一消费点
+    在 `profit_guard.py`（`grep` 全仓确认），保护层未装配时它**逐字节不作数**，实测 45 条 run
+    正处于这个状态。后续新增阈值只需往下面这张判据表里加一行。
+
+    `sizing_rule` / `horizon_rule` 本轮**没有成员**，但它们是这张表的自然扩展维度，形参先立在
+    这里以免下一轮为了加一个判据去改所有调用点的签名（`ai_trade_stop_atr_mult` 等在仓位层未装配
+    时同属此类，但本轮不声称已核实，故不写进表里——**宁可少说一条，不说一句没核过的**）。
+
+    Args:
+        thresholds: `preset_table(preset_id)` 的产物；空 / `None` ⇒ 返回空列表。
+        profit_rule: 已解析的利润保护契约（`None` = 未装配）。
+        sizing_rule: 已解析的仓位 / 刹车契约（本轮不参与判定）。
+        horizon_rule: 已解析的持仓周期契约（本轮不参与判定）。
+
+    Returns:
+        失效阈值键的列表（**保持 `thresholds` 的键序**，使回执可逐字对拍）。
+    """
+    del sizing_rule, horizon_rule          # 本轮无判据；形参见 docstring
+    if not thresholds:
+        return []
+    inert: list[str] = []
+    if profit_rule is None and "ai_trade_profit_guard_hard_tp_return_pct" in thresholds:
+        inert.append("ai_trade_profit_guard_hard_tp_return_pct")
+    return inert

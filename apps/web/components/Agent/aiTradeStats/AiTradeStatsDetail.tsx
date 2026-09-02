@@ -191,6 +191,25 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
   );
 }
 
+/**
+ * 混装口径提示（E-6）：能说出笔数就说出来，说不出就逐字回退到合入前那句话。
+ *
+ * **绝不用 0 冒充「没有毛额笔」**：`counts` 整个缺席（老后端）与 `{net: n, gross: 0}` 是两个
+ * 结论，前者根本没有这个读数，后者是「真的一笔毛额都没有」。
+ */
+function describeCostBasisMix(counts?: Record<string, number> | null): string {
+  const gross = counts?.gross;
+  const net = counts?.net;
+  const tail =
+    gross != null && net != null
+      ? `其中 ${gross} 笔为毛额口径（不含手续费）、${net} 笔为净额口径。`
+      : "";
+  return (
+    "该会话跨 run 出现两种盈亏口径（净额 / 毛额），上方已实现总收益按各 run 各自口径还原为净额后相加。" +
+    tail
+  );
+}
+
 // 组级口径：成员一致即取该值；跨 run 出现两种 ⇒ undefined ⇒ 文案退回「口径未知」并由 costBasisMixed
 // 徽标说明成因。**绝不硬编码 "net"**——老会话整组都是毛额，硬编码会让它谎报自己已扣过手续费。
 function resolveCostBasis(members: AiTradeHistoryMember[]): "net" | "gross" | undefined {
@@ -232,8 +251,12 @@ function KpiGrid({
             <Kpi label="盈亏口径" value={describeCostBasis(summary.costBasisMixed ? undefined : costBasis, costBasisAssumed)} />
           </div>
           <p className="text-[10px] leading-relaxed text-[var(--muted)]" title={COST_BASIS_HINT}>
+            {/* ai-trade-loss-and-liveness-hardening E-6：`costBasisMixed` 只说得出「有混装」，
+                说不出「多少笔」——用户因此无从判断这份混装到底污染了多大比例的读数（实测
+                66 / 94 条有成交的 run 全腿 fee==0）。**扩展既有键**，绝不另起第二个真源。
+                老后端不下发 `costBasisCounts` ⇒ 逐字回退到原来那句话。 */}
             {summary.costBasisMixed
-              ? "该会话跨 run 出现两种盈亏口径（净额 / 毛额），上方已实现总收益按各 run 各自口径还原为净额后相加。"
+              ? describeCostBasisMix(summary.costBasisCounts)
               : COST_BASIS_HINT}
           </p>
         </div>

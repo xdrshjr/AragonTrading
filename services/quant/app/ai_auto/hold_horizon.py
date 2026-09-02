@@ -45,12 +45,23 @@ _ALL_GATES: tuple[str, ...] = (GATE_MIN_HOLD, GATE_EXIT_CONFIRM, GATE_HYSTERESIS
 # 豁免原因（§2.3.3 冻结矩阵的键）。`epoch_estimated` **只解 G1**——受污染的只有「持仓时长」这一个
 # 量，全解等于借一个局部不确定性把整层关掉（[P0-2]）。
 RELEASE_LOSS = "loss_release"
+# ★ 轴 B（loss-and-liveness-hardening §4.2）：**已被交易所侧止损核实覆盖**时的浮亏豁免。
+# 它是 `RELEASE_LOSS` 的**同位替换**（同一个 `if` 分支返回两者之一），**不占新位次**——
+# `release_reason_for` 里四条既有豁免的相对顺序是冻结口径，不得因新增而改动。
+#
+# 为什么只解 G2/G3：`RELEASE_LOSS` 的原始理由是「亏到解除阈时必须允许随时离场」，而**这个保护
+# 职能已经由交易所侧 OCO 止损承担了**，且 OCO 是在**真止损位**、不是在半个止损位。它实际提供的
+# 是一条「在半止损位由 LLM 自由裁量提前割肉」的通道——实测 13 笔合计 **−40.89 USDT**（11 笔亏损，
+# 均值 −3.15）。全库 `releaseReasons` 聚合是 `{"loss_release": 12}`，其余四条豁免**一次都没触发过**，
+# 故本轮收窄的正是历史上唯一开过火的那条通路，打击面精确、不会误伤任何一条从未生效的豁免。
+RELEASE_LOSS_COVERED = "loss_release_covered"
 RELEASE_STALE_PX = "stale_px"
 RELEASE_EPOCH_ESTIMATED = "epoch_estimated"
 RELEASE_MAX_HOLD_BARS = "max_hold_bars"
 # 逐闸解除矩阵（冻结口径；`test_ai_trade_horizon_exemptions.py` 与 H-11~H-14 逐格对照）。
 RELEASE_GATES: dict[str, tuple[str, ...]] = {
     RELEASE_LOSS: _ALL_GATES,
+    RELEASE_LOSS_COVERED: (GATE_EXIT_CONFIRM, GATE_HYSTERESIS),   # ★ 轴 B：**不解 G1**
     RELEASE_STALE_PX: _ALL_GATES,
     RELEASE_EPOCH_ESTIMATED: (GATE_MIN_HOLD,),
     RELEASE_MAX_HOLD_BARS: _ALL_GATES,
@@ -505,16 +516,25 @@ def _is_bad_px(value) -> bool:
 
 
 def release_reason_for(rule: HorizonRule, state: HorizonState, facts: HorizonFacts,
-                       *, return_pct: float | None) -> str | None:
+                       *, return_pct: float | None,
+                       backstop_covered: bool | None = None) -> str | None:
     """本轮命中的豁免原因（§2.3.3 表，**自上而下取第一条**）；未命中 ⇒ `None`。
 
     优先级 `loss_release > stale_px > epoch_estimated > max_hold_bars` 是冻结口径：亏到解除阈时
     必须允许随时离场，这条结论不该被任何其它豁免的顺序影响。
+
+    Args:
+        backstop_covered: ★ 轴 B —— 交易所侧兜底止损是否**确定已覆盖**当前持仓。
+            `True` ⇒ 浮亏豁免降级为 `RELEASE_LOSS_COVERED`（只解 G2/G3，**不解 G1**）；
+            `False` / `None`（未覆盖 / 未知 / 回测 / 未装配核实层 / 总闸关）⇒ **逐字回退今天的
+            行为**（`RELEASE_LOSS` 三闸全解）。默认值就是这条零回归保证的结构性支点——
+            回测（`backtest.py` 不传该键）与全部既有直接调用点自动落在这一格。
     """
     threshold = loss_release_return_pct(rule, stop_loss_pct=facts.stop_loss_pct,
                                         leverage=facts.leverage)
     if return_pct is not None and threshold > 0 and return_pct <= -threshold:
-        return RELEASE_LOSS
+        # 同位替换：命中的仍是**同一条**豁免、仍在**同一个位次**上，只是解闸集合按兜底覆盖态分档。
+        return RELEASE_LOSS_COVERED if backstop_covered is True else RELEASE_LOSS
     stale = (facts.stale_feed or _is_bad_px(facts.mark_px) or _is_bad_px(facts.entry_px)
              or (facts.px_age_s is not None and rule.max_px_age_s > 0
                  and float(facts.px_age_s) > rule.max_px_age_s))
@@ -560,7 +580,8 @@ def _fmt_minutes(seconds: float) -> str:
 
 def build_snapshot(rule: HorizonRule, state: HorizonState, facts: HorizonFacts, *,
                    turnover: dict | None = None,
-                   backstop: dict | None = None) -> dict:
+                   backstop: dict | None = None,
+                   backstop_covered: bool | None = None) -> dict:
     """§5.4 形状的 wire 快照（payload / decision / status / trace 共用的**唯一真源**）。
 
     纯函数：状态推进由 `HorizonRuntime` 负责，本函数只读。文案模块 `hold_horizon_text` 只读本产物、
@@ -571,12 +592,19 @@ def build_snapshot(rule: HorizonRule, state: HorizonState, facts: HorizonFacts, 
             （不是 `null`）——键缺席是本仓库「prompt 逐字节回退」的既定判据。
             **空仓分支同样要带它**：`flat` 恰是 G4/G5 唯一真正会拦人的状态（[P0-3]）。
         backstop: 交易所侧兜底核实 wire；`None` ⇒ 整键缺席（回测恒缺席，D-5）。
+        backstop_covered: ★ 轴 B —— 兜底是否**确定已覆盖**（`HorizonRuntime._snapshot` 用它已经
+            在建的那份 wire 现算，复用 `pause.is_backstop_covered` 这个**唯一派生点**）。
+            **它不是 `HorizonFacts` 的字段**：断面由 `build_horizon_facts(executor, readings, …)`
+            装配，那里根本拿不到 backstop 运行时；塞进去就得让会话侧再算一次覆盖率，
+            那是第二份口径且必然与快照里的 `backstop` 在时间上错位（评审 P0-2）。
+            `None`（默认）⇒ 逐字回退今天的行为。
     """
     hold_s = max(0.0, float(facts.now_wall) - float(state.opened_wall)) if state.epoch else 0.0
     return_pct = _return_pct(facts)
     move_bps = _move_bps(facts)
     reason = (None if facts.side not in ("long", "short")
-              else release_reason_for(rule, state, facts, return_pct=return_pct))
+              else release_reason_for(rule, state, facts, return_pct=return_pct,
+                                      backstop_covered=backstop_covered))
     gates = RELEASE_GATES.get(reason or "", ())
     status = (STATUS_FLAT if facts.side not in ("long", "short")
               else STATUS_RELEASED if reason is not None else STATUS_HOLDING)
@@ -712,6 +740,46 @@ def _veto(decision, reason: str):
     from .decider import TradeDecision
 
     return TradeDecision(action="hold", size_fraction=None, confidence=None, reason=reason)
+
+
+# ★ C-2（loss-and-liveness-hardening §4.3）：允许被跳过的唤醒种类——**白名单，不是黑名单**。
+# 兜底的方向必须是「不动」，而这里的「不动」= 照常调 LLM。用黑名单意味着将来任何一个新 kind
+# 默认可跳，而新 kind 恰恰多半是「有事发生了」（`signals.decision_to_signals` 的 [P0-1] 同款纪律）。
+SKIPPABLE_WAKE_KINDS: tuple[str, ...] = ("heartbeat", "position_watch")
+
+
+def round_is_structurally_idle(snapshot: dict | None, *, wake_kind: str | None,
+                               guard_armed: bool) -> bool:
+    """本轮**结构上不可能产生任何合法动作**吗（C-2 跳轮的唯一判据）。
+
+    实测中位持仓 30 分钟、唤醒 3 分钟 ⇒ 一次持仓约 10 轮，其中前 `minHoldSeconds/interval` 轮
+    结构上不可能平仓——每一次都在白烧一次 LLM 调用（同期 1123 次调用失败、779 次供应商过载），
+    而且每一次都给「冲动平仓」多开一扇门。
+
+    四个条件**全部成立**才跳（缺一即照常调用）：
+
+    1. 真的有持仓（`status == "holding"`：非 `flat`、非 `released`）；
+    2. 一道闸都没被豁免解除，且最短持仓还剩时间（`minHoldRemainingSeconds > 0`）；
+    3. 本轮唤醒在 `SKIPPABLE_WAKE_KINDS` 白名单内（**安全内核**：外部事件驱动的唤醒一律不跳）；
+    4. 利润保护快照未武装（**安全内核**：已武装说明有事可做，必须让模型看到）。
+
+    Args:
+        snapshot: `build_snapshot` 产物；`None`（未装配周期模式）⇒ 恒 `False`。
+        wake_kind: 本轮唤醒种类（`wake["kind"]`）。
+        guard_armed: 利润保护快照是否处于 `ARMED_STATUSES`。
+
+    Returns:
+        真 ⇒ 可以跳过本轮 LLM 调用，只推一条 `round_skipped` 事件。
+    """
+    if not snapshot or guard_armed:
+        return False
+    if str(wake_kind or "") not in SKIPPABLE_WAKE_KINDS:
+        return False
+    if snapshot.get("status") != STATUS_HOLDING:
+        return False
+    if snapshot.get("releasedGates"):
+        return False
+    return float(snapshot.get("minHoldRemainingSeconds") or 0.0) > 0
 
 
 def gate_status(snapshot: dict | None, gate_reason: str | None) -> str:

@@ -77,6 +77,7 @@ class PaperManager:
                 s, strategy_id=strategy_id, inst_id=inst_id, bar=bar, mode="paper",
                 config=config,
                 status="running",
+                start_ts=int(time.time()),   # E-4：会话时长的唯一起点（历史行保持 0，不回填）
             )
             run_id = run.id
 

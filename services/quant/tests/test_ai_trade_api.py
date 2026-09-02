@@ -550,8 +550,12 @@ async def test_profit_guard_explicit_disable_turns_layer_off(monkeypatch):
     try:
         async with await _client(app) as client:
             await _seed_account(client)
+            # ai-trade-loss-and-liveness-hardening 轴 A-1：关掉利润保护的**同时**必须关掉持仓
+            # 周期锁，否则这正是本轮新增的致命组合（422 `AI_TRADE_UNGUARDED_HORIZON`）。
+            # 本用例要验的是「显式关闭 ⇒ 保护层不装配」，与互锁无关，故显式关掉周期层。
             r = await client.post("/api/ai-trade/start", json=_start_body(
-                strategy_id, profitGuard={"enabled": False}))
+                strategy_id, profitGuard={"enabled": False},
+                tradingHorizon={"enabled": False}))
             assert r.status_code == 200, r.text
             assert r.json()["profitGuard"] is None
             assert get_ai_trade_manager()._group.profit_rule is None
@@ -572,8 +576,10 @@ async def test_profit_guard_master_switch_off_never_assembles(monkeypatch):
     try:
         async with await _client(app) as client:
             await _seed_account(client)
+            # 同上（轴 A-1）：运维关掉保护层总闸 ⇒ 本会话恒无利润侧钥匙，故周期锁须一并关掉。
             r = await client.post("/api/ai-trade/start", json=_start_body(
-                strategy_id, profitGuard={"enabled": True, "armReturnPct": 0.1}))
+                strategy_id, profitGuard={"enabled": True, "armReturnPct": 0.1},
+                tradingHorizon={"enabled": False}))
             assert r.status_code == 200, r.text
             assert r.json()["profitGuard"] is None
             assert get_ai_trade_manager()._group.profit_rule is None

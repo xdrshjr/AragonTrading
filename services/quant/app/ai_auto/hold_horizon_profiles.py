@@ -85,6 +85,8 @@ def profiles_wire(settings, *, estimated_cost_bps: float | None = None) -> dict:
             "backstopRepair": _backstop_repair_wire(settings),
             # 离场优先通道的只读说明块（exit-priority §6.2）；总闸关 ⇒ `None` ⇒ 前端整块不渲染。
             "exitPriority": exit_profiles_block(settings),
+            # C-1（loss-and-liveness-hardening）：唤醒下限除数；`0` = 本轮默认（只观测不改行为）。
+            "wakeHorizonDivisor": int(getattr(settings, "ai_trade_wake_horizon_divisor", 0) or 0),
             "profiles": [profile_wire(PROFILES[key], acceptance=_acceptance_preview(
                 settings, PROFILES[key]), turnover=_turnover_preview(
                 settings, PROFILES[key])) for key in PROFILES]}

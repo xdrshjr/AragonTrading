@@ -28,6 +28,7 @@ from .exit_priority import (
 from .hold_horizon import (
     RELEASE_EPOCH_ESTIMATED,
     RELEASE_LOSS,
+    RELEASE_LOSS_COVERED,
     RELEASE_MAX_HOLD_BARS,
     RELEASE_STALE_PX,
     STATUS_FLAT,
@@ -65,6 +66,9 @@ _REPAIR_BLOCK_LABEL = {
 
 _RELEASE_LABEL = {
     RELEASE_LOSS: "浮亏已达解除阈",
+    # ★ 轴 B（loss-and-liveness-hardening §4.2）：**必须如实写明「不解最短持仓」**——
+    # 只说「限制已解除」会让模型（和用户）以为三闸全开，而这一档恰恰是 G1 仍然生效的那一档。
+    RELEASE_LOSS_COVERED: "浮亏已达解除阈，但已被交易所止损兜底，故不解最短持仓",
     RELEASE_STALE_PX: "判定价不可信",
     RELEASE_EPOCH_ESTIMATED: "持仓起点为估算值",
     RELEASE_MAX_HOLD_BARS: "已达强制时间平仓上限",

@@ -49,7 +49,10 @@ export default function AiTradeStatsPanel({ open, onClose }: { open: boolean; on
           历史·列表不分栏，单独包一层滚动。 */}
       <div className="flex min-h-0 max-h-[72vh] flex-col overflow-y-auto px-5 py-4 md:overflow-hidden">
         {active === "live" ? (
-          <AiTradeStatsLive />
+          // 轴 F：「去开启利润保护」的落点。统计面板是一层 Modal，而利润保护开关住在它底下的
+          // 【启动 AI 自动交易】弹窗里；关掉本面板就是走向那个开关的第一步，也是本组件树里
+          // 唯一一个**真的会发生点什么**的动作（绝不给一个点了没反应的按钮）。
+          <AiTradeStatsLive onOpenProfitGuard={onClose} />
         ) : selectedGroupId ? (
           <AiTradeStatsDetail groupId={selectedGroupId} onBack={() => setSelectedGroupId(null)} />
         ) : (

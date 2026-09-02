@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import uuid
 from dataclasses import dataclass
@@ -28,6 +29,28 @@ from .models import (
     StrategyRun,
     Trade,
 )
+
+
+logger = logging.getLogger(__name__)
+
+# ai-trade-loss-and-liveness-hardening E-2：`trades.reason` 的列宽（与 `models.Trade.reason` 同值）。
+# 写入点此前是裸 `[:64]`——**按字节截断且完全静默**：实测 221 笔 LLM 平仓的 reason 长度全部恰好
+# 64，事后既不是可聚合的分类、也不是读得懂的说明。本轮扩到 128 并在真的截断时告警一次。
+TRADE_REASON_MAX_CHARS = 128
+
+
+def _fit_reason(raw: str) -> str:
+    """把成交理由收进列宽——**按字符**（不是字节，绝不切碎半个汉字），截断即告警一次。
+
+    静默截断是本轮要修的归因缺陷本身（§三 D6）：日志里必须留下「原文有多长、被切成了什么」，
+    否则下一次超长写入依旧无人知晓。
+    """
+    text = str(raw or "")
+    if len(text) <= TRADE_REASON_MAX_CHARS:
+        return text
+    logger.warning("trade reason truncated: %d chars > %d, kept=%r",
+                   len(text), TRADE_REASON_MAX_CHARS, text[:TRADE_REASON_MAX_CHARS])
+    return text[:TRADE_REASON_MAX_CHARS]
 
 
 # ============================ Strategies ============================
@@ -132,14 +155,22 @@ async def delete_strategy(session: AsyncSession, strategy_id: int) -> str:
 async def create_run(session: AsyncSession, *, strategy_id: int, inst_id: str, bar: str,
                      mode: str, config: dict, status: str = "running",
                      group_id: str | None = None, group_started_ts: int | None = None,
-                     group_total_budget_usd: float | None = None) -> StrategyRun:
+                     group_total_budget_usd: float | None = None,
+                     start_ts: int | None = None) -> StrategyRun:
     """建一行 run。``group_*`` 仅 live-auto 分组成员传入（auto-trading-earnings-persistence §5.2）；
-    其余调用方省略 → NULL（历史列表按单成员会话展示，不伪造分组）。"""
+    其余调用方省略 → NULL（历史列表按单成员会话展示，不伪造分组）。
+
+    ``start_ts``（ai-trade-loss-and-liveness-hardening E-4）：实时会话（ai-trade / live-auto /
+    paper）的开始墙钟秒。省略 ⇒ 沿用模型默认 `0`（回测由 ``persist_backtest_result`` 另写区间）。
+    **历史行不回填**——真实起点已无从考证，一个看起来合理的假值比一个诚实的「未记录」更糟；
+    读侧必须先判 ``start_ts > 0`` 再算时长。
+    """
     run = StrategyRun(
         strategy_id=strategy_id, inst_id=inst_id, bar=bar, mode=mode, status=status,
         config_json=json.dumps(config, ensure_ascii=False),
         group_id=group_id, group_started_ts=group_started_ts,
         group_total_budget_usd=group_total_budget_usd,
+        **({} if start_ts is None else {"start_ts": int(start_ts)}),
     )
     session.add(run)
     await session.commit()
@@ -300,7 +331,7 @@ async def append_live_trade(session: AsyncSession, run_id: int, trade: dict) -> 
         price=float(trade.get("price", 0.0)), qty=float(trade.get("qty", 0.0)),
         fee=float(trade.get("fee", 0.0) or 0.0), pnl=float(trade.get("pnl", 0.0) or 0.0),
         position_after=float(trade.get("positionAfter", 0.0) or 0.0),
-        reason=str(trade.get("reason", ""))[:64],
+        reason=_fit_reason(trade.get("reason", "")),
         stop_loss_pct=trade.get("stopLossPct"), take_profit_pct=trade.get("takeProfitPct"),
         max_hold_bars=trade.get("maxHoldBars"), stop_loss_price=trade.get("stopLossPrice"),
         take_profit_price=trade.get("takeProfitPrice"),

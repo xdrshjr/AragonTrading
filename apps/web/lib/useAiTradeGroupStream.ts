@@ -15,6 +15,7 @@ import type {
   AiTradeGroupRow,
   AiTradeGroupState,
   AiTradeLifecycleEvent,
+  AiTradeLiveness,
   AiTradeRoundTrace,
   AiTradeSessionRow,
   AiTradeSnapshot,
@@ -341,6 +342,22 @@ function routeMemberEvent(instId: string, event: WsEvent, setters: MemberSetters
       setters.requestAiTradeReconcile();
       return;
     }
+    // ai-trade-loss-and-liveness-hardening 轴 D：活性档位**跃迁**时后端推一条。它与
+    // `status.liveness` 是同一份 wire（后端同一次装配），本 case 只是让横幅在跃迁的那一刻
+    // 就更新，而不必等下一条 status。缺 case 就是一条「后端推了、前端丢在地上」的通路
+    // （`lifecycle` 事件的成文教训）。
+    case "liveness":
+      setters.patchAiTradeMemberSession(instId, {
+        liveness: event.data as AiTradeLiveness,
+      });
+      return;
+    // C-2：结构上不可能产生任何合法动作的轮次被整轮跳过。**计数随事件下发**，前端只做一次
+    // 乐观更新、绝不自己自增（第二个自增点必然与后端的权威值分叉）。总闸默认关 ⇒ 恒不发。
+    case "round_skipped":
+      setters.patchAiTradeMemberSession(instId, {
+        roundsSkipped: (event.data as { roundsSkipped?: number }).roundsSkipped,
+      });
+      return;
     // F-4（修 D-9）：`NOT_FOUND` ⇒ 停连 + 立即对账（由对账决定最终态）；其余错误码落
     // `member.session.message`，由既有状态行渲染 —— 一条静默的重连风暴是本轮要消灭的
     // 「没有任何一处出声」。

@@ -108,8 +108,14 @@ class ProfitGuardRuntime:
             作用域状态，必须与 `peak_px` 共用 `(side, seq)` 身份，随 `advance_state` 的新 epoch 复位。
     """
 
-    def __init__(self, rule: ProfitGuardRule | None):
+    def __init__(self, rule: ProfitGuardRule | None, *, peak_tracking_always: bool = False):
         self.rule = rule
+        # ★ E-3（loss-and-liveness-hardening 轴 E）：峰值浮盈与保护层规则**解耦**。
+        # 合入前 `peak_pnl` 在 257 笔平仓里 213 笔为 NULL（82.9%），根因就是「规则未装配 ⇒
+        # `refresh` 第一行 return ⇒ 峰值永远不被缓存」——恰恰关掉了唯一能证明该开保护层的证据。
+        # 峰值浮盈是纯派生量（`qty × signed(peak_px − entry)`），不需要任何规则就能算。
+        # 默认 `False` 使既有直接构造该运行时的单测逐字节零回归；生产由会话按总闸传入。
+        self.peak_tracking_always = bool(peak_tracking_always)
         self.state: ProfitGuardState | None = None
         self.cooldown: CooldownState | None = None
         self.hold_streak = 0
@@ -149,7 +155,7 @@ class ProfitGuardRuntime:
             camelCase wire 快照；规则未装配 → None。
         """
         if self.rule is None:
-            return None
+            return self._peak_only(facts, stale_feed=stale_feed)
         reason = unavailable_reason_for(facts, self.rule, px_age_s=facts.px_age_s,
                                         stale_feed=stale_feed)
         self.state = advance_state(self.state, facts)
@@ -170,6 +176,30 @@ class ProfitGuardRuntime:
             # 一个不作数的数字去当捕获率分母。
             self.last_peak_pnl_usd = snapshot.get("peakUnrealizedPnlUsd")
         return snapshot
+
+    def _peak_only(self, facts: PositionFacts, *, stale_feed: bool) -> None:
+        """★ E-3：保护层未装配时的**只算峰值、不做任何判定**分支；**恒返回 `None`**。
+
+        返回 `None` 是硬约束：调用点据它决定 payload 带不带 `profitGuard` 键，返回一个快照就等于
+        在未装配的会话里凭空多出一段 prompt。本分支只做两件事——推进**同一个** `advance_state`
+        （绝不另写第二份 epoch 判据，两份必漂移）、把峰值浮盈缓存进 `last_peak_pnl_usd`。
+
+        fail-open 前置校验复用 `unavailable_reason_for(facts, None, …)`：判定价不可信 / 仓位读数
+        不成立 / 行情降级时**不缓存**——那正是 F4 立下的纪律（用一个不作数的数字当捕获率分母，
+        比没有这个数更糟）。缓存不上时 `last_peak_pnl_usd` 保持 `None`，**绝不填 0**。
+        """
+        if not self.peak_tracking_always:
+            return None
+        reason = unavailable_reason_for(facts, None, px_age_s=facts.px_age_s,
+                                        stale_feed=stale_feed)
+        self.state = advance_state(self.state, facts)
+        if reason is None:
+            # 与 `profit_guard._derive` 的 `peakUnrealizedPnlUsd` 逐字同式：
+            # `qty_coin × signed(side, peak_px − entry)`。
+            delta = self.state.peak_px - facts.entry_px
+            self.last_peak_pnl_usd = facts.qty_coin * (
+                delta if facts.side == "long" else -delta)
+        return None
 
     def record_commitment(self, proposed_px, snapshot: dict | None) -> None:
         """把模型本轮承诺的退出线经**武装门控 → 纯几何夹紧 → 单调棘轮**记进运行时（本轮 C2）。

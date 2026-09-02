@@ -164,6 +164,10 @@ const AI_TRADE_DEFAULT_OCO_TP_PCT = 0.1;
  * 超出提示并禁增；每成员 allocation% + 移除 + 均分 + even/max_ratio 段控）+ **可编辑时间级别** + 多选策略 +
  * 预算/杠杆/OCO/总止盈损 + 上下文轮数 + 真实资金勾选。回测段：仍单标的（默认 members[0]），同享可编辑周期。
  */
+// ★ A-3：关掉利润保护后的二次确认提示（与既有 `TRADABILITY_CONFIRM_REQUIRED_TEXT` 同款位置）。
+const UNGUARDED_CONFIRM_REQUIRED_TEXT =
+  "已关闭利润保护：请先阅读上方的后果清单并勾选确认，再启动。";
+
 export default function AiTradeLaunchModal({
   open,
   onClose,
@@ -187,6 +191,7 @@ export default function AiTradeLaunchModal({
   defaultStopLossPct,
   defaultTakeProfitPct,
   error,
+  errorRemedies = null,
   liveGateReason = null,
   defaultStartTs,
   defaultEndTs,
@@ -218,6 +223,9 @@ export default function AiTradeLaunchModal({
   defaultStopLossPct?: number;
   defaultTakeProfitPct?: number;
   error?: string | null;
+  // ai-trade-loss-and-liveness-hardening A-1：422 `AI_TRADE_UNGUARDED_HORIZON` 随错误体带回的
+  // **可执行补救**。文案由后端下发、前端只负责把它渲染成按钮并把对应的开关真的拨过去。
+  errorRemedies?: { id: string; label: string }[] | null;
   liveGateReason?: string | null;     // 实盘不可用原因（非 null → 段控禁用实盘、默认落回测，R6）
   defaultStartTs?: number;
   defaultEndTs?: number;
@@ -292,6 +300,10 @@ export default function AiTradeLaunchModal({
   // `[open]` 重置 effect**：它不是用户输入而是探针的派生事实，重置它反而会在「关掉又打开、参数
   // 没变故 level 没变」时让子组件不再上报 ⇒ 拦截静默失效。用户输入 `tradabilityConfirmed` 才重置。
   const [tradabilityNeedsConfirm, setTradabilityNeedsConfirm] = useState(false);
+  // ★ A-3：关掉利润保护后的**二次确认**（镜像上面 `tradabilityConfirmed` 的既有范式）。
+  // 用户可以关它，但必须在看过后果清单之后再按一次——这是「让致命组合难以被无意中选中」
+  // 与「不剥夺用户的选择权」之间唯一诚实的落点。
+  const [unguardedConfirmed, setUnguardedConfirmed] = useState(false);
   // 利润保护层（默认开启）：四个数值输入一律走**百分数**（用户口径），提交时统一 /100 转 fraction。
   const [profitGuardEnabled, setProfitGuardEnabled] = useState(
     defaultProfitGuard.enabled ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.enabled,
@@ -369,6 +381,21 @@ export default function AiTradeLaunchModal({
     enabled: open,
   });
 
+  // ★ A-3（loss-and-liveness-hardening）：当前纪律预设里的「利润保护·硬止盈」那一行。
+  // **整句取自后端下发的只读阈值表**（`label` + 已格式化的 `value`），前端不复制任何一个数字
+  // ——这张表下次调参时若与真正生效的那组数分叉，比不给更坏（`horizon-profiles` 的成文纪律）。
+  // 取不到表 / 该预设不含这一行（如 `aggressive` 的硬止盈就是 0）⇒ null ⇒ 后果清单不渲染那一条。
+  // ★ A-4：本次启动中会失效的阈值键。判据与后端 `discipline.inert_thresholds()` **逐字同构**
+  // （`profit_rule is None` ⇒ 硬止盈失效），两侧同值由 `G-A6` 钉死。启动之前服务端还没被问过，
+  // 故这里现算一次；启动之后权威值随 `group_status().discipline.inert` 下发。
+  const inertThresholdKeys = profitGuardEnabled ? [] : ["ai_trade_profit_guard_hard_tp_return_pct"];
+
+  const hardTakeProfitText = (() => {
+    const rows = disciplineQ.data?.presets.find((p) => p.id === disciplinePreset)?.rows;
+    const row = rows?.find((r) => r.key === "ai_trade_profit_guard_hard_tp_return_pct");
+    return row && !row.off ? `${row.label} ${row.value}` : null;
+  })();
+
   // 弹窗每次打开：回落默认段 / 成员 / 分配模式 / 周期 / 策略 / 轮数 / 区间并清空金额输入。
   useEffect(() => {
     if (!open) return;
@@ -398,6 +425,9 @@ export default function AiTradeLaunchModal({
     setTrendConfidenceRaw("");
     setTrendSizeMultRaw("");
     setProfitGuardEnabled(defaultProfitGuard.enabled ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.enabled);
+    // ★ A-3 的二次确认**必须塞进这个既有 [open] effect**（绝不另写第二个 reset effect：
+    // 非稳定依赖的第二个 effect 正是 ai-trade-modal-revert-recurrence 的复发根因）。
+    setUnguardedConfirmed(false);
     setArmReturnRaw(pctToRaw100(defaultProfitGuard.armReturnPct,
       AI_TRADE_PROFIT_GUARD_DEFAULTS.armReturnPct));
     setGivebackRaw(pctToRaw100(defaultProfitGuard.givebackPct,
@@ -674,8 +704,11 @@ export default function AiTradeLaunchModal({
   // 建议的探针更坏）。故按钮照旧可点，拦在提交路径上并同屏给出该做什么——若只把勾选态存进 state
   // 而没有任何读点，那一行二次确认就纯粹是装饰，一次点击照样能在几乎开不出单的周期上起会话。
   const tradabilityBlocked = tradabilityNeedsConfirm && !tradabilityConfirmed;
+  // ★ A-3：关掉利润保护即需要二次确认（**只在实盘段**——回测不动真钱，那里再拦一次是噪音）。
+  // 与 `tradabilityBlocked` 逐字同款的极性：**按钮永不禁用**，拦在提交路径上并同屏说清理由。
+  const unguardedBlocked = mode === "live" && !profitGuardEnabled && !unguardedConfirmed;
   const handleConfirm = () => {
-    if (!ready || submitting || tradabilityBlocked) return;
+    if (!ready || submitting || tradabilityBlocked || unguardedBlocked) return;
     const base = {
       strategyIds: selectedIds,
       capitalUsd: capital.value,
@@ -742,6 +775,8 @@ export default function AiTradeLaunchModal({
     (mode === "backtest" ? rangeError || everyError || minConsensusError || roundsCapError : null) ||
     // 排在既有校验之后：它不是输入非法，而是一次需要用户拍板的风险确认，不该盖住真正的填写错误。
     (tradabilityBlocked ? TRADABILITY_CONFIRM_REQUIRED_TEXT : null) ||
+    // ★ A-3：同上极性、同上位次。
+    (unguardedBlocked ? UNGUARDED_CONFIRM_REQUIRED_TEXT : null) ||
     error;
 
   const title = mode === "backtest" ? "AI 自动交易 · 回测" : "启动 AI 自动交易";
@@ -1259,6 +1294,7 @@ export default function AiTradeLaunchModal({
           onChange={setDisciplinePreset}
           disabled={submitting}
           table={disciplineQ.data ?? null}
+          inertKeys={inertThresholdKeys}
         />
 
         {/* 方向对称 · 逆势通路（directional-symmetry D-5）：紧接「交易纪律预设」——那张阈值表里
@@ -1334,7 +1370,25 @@ export default function AiTradeLaunchModal({
           onCooldownChange={setCooldownRaw}
           disabled={submitting}
           preview={guardPreview(armReturnRaw, givebackRaw, armPriceMovePct)}
+          hardTakeProfitText={hardTakeProfitText}
         />
+
+        {mode === "live" && !profitGuardEnabled && (
+          // ★ A-3 的二次确认（镜像可交易性预检那一行的既有范式）。**按钮不禁用**，只在提交路径
+          // 上拦一次并同屏说清理由——把用户挡在门外的探针比给错建议的探针更坏（轴 A 的极性）。
+          <label className="flex cursor-pointer items-start gap-2 px-1 text-[11px] leading-relaxed text-[var(--text)]">
+            <input
+              type="checkbox"
+              checked={unguardedConfirmed}
+              disabled={submitting}
+              onChange={(e) => setUnguardedConfirmed(e.target.checked)}
+              className="mt-0.5 h-3.5 w-3.5 shrink-0 accent-[var(--short)]"
+              data-testid="ai-profit-guard-unguarded-confirm"
+              aria-label="我已了解关闭利润保护的后果，仍要启动"
+            />
+            <span>我已了解上述后果，仍要在<strong>没有任何自动兑现通道</strong>的情况下启动。</span>
+          </label>
+        )}
 
         {mode === "backtest" && (
           <div className="grid grid-cols-2 gap-3">
@@ -1387,6 +1441,38 @@ export default function AiTradeLaunchModal({
           <p role="alert" className="text-[11px] font-medium text-[var(--short-ink)]">
             {firstError}
           </p>
+        )}
+
+        {errorRemedies && errorRemedies.length > 0 && (
+          // ★ A-1：422 的三条**可执行**出路。文案逐条由后端下发（前端不自造），而每一条按钮
+          // 真的把对应的开关拨过去——「知道坏了却不知道该点哪里」是本轮明确要消灭的形态。
+          // `ops_override` 是运维侧动作（改 env 后重启后端），前端拨不动它，故只渲染成说明。
+          <div className="flex flex-wrap items-center gap-1.5" data-testid="ai-start-remedies">
+            {errorRemedies.map((remedy) =>
+              remedy.id === "ops_override" ? (
+                <span
+                  key={remedy.id}
+                  className="rounded border border-dashed border-[var(--border)] px-2 py-0.5 text-[10px] text-[var(--muted)]"
+                >
+                  {remedy.label}
+                </span>
+              ) : (
+                <button
+                  key={remedy.id}
+                  type="button"
+                  disabled={submitting}
+                  data-testid={`ai-start-remedy-${remedy.id}`}
+                  onClick={() => {
+                    if (remedy.id === "enable_profit_guard") setProfitGuardEnabled(true);
+                    if (remedy.id === "disable_horizon") setHorizonEnabled(false);
+                  }}
+                  className="rounded border border-[var(--accent)] bg-[var(--accent-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--accent-ink)] hover:opacity-90 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)] disabled:opacity-50"
+                >
+                  {remedy.label}
+                </button>
+              ),
+            )}
+          </div>
         )}
       </div>
 
@@ -1566,11 +1652,19 @@ function DisciplinePresetFields({
   onChange,
   disabled,
   table,
+  inertKeys = [],
 }: {
   value: (typeof DISCIPLINE_PRESETS)[number];
   onChange: (next: (typeof DISCIPLINE_PRESETS)[number]) => void;
   disabled: boolean;
   table: AiTradeDisciplinePresetsResponse | null;
+  /**
+   * ★ 轴 A-4（loss-and-liveness-hardening）：在本次启动中「其消费层未装配因而**不作数**」的
+   * 阈值键。判据的**权威真源是后端** `discipline.inert_thresholds()`（其产物随 `config_json`
+   * 与 `group_status().discipline.inert` 下发）；启动**之前**服务端还没被问过，故这里按同一条
+   * 判据在本地现算一次，`G-A6` 用例钉死两侧同值。
+   */
+  inertKeys?: string[];
 }) {
   const [open, setOpen] = useState(false);
   const rows = table?.presets.find((p) => p.id === value)?.rows ?? [];
@@ -1618,17 +1712,32 @@ function DisciplinePresetFields({
               className="grid grid-cols-2 gap-x-3 gap-y-0.5 rounded-md border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5"
               data-testid="ai-discipline-threshold-table"
             >
-              {rows.map((r) => (
-                <span key={r.key} className="flex items-center justify-between gap-2 text-[10px]">
-                  <span className="truncate text-[var(--muted)]">{r.label}</span>
+              {rows.map((r) => {
+                // ★ A-4：失效的那一行加删除线 + 尾注。**「显示了但不作数」是本轮要消灭的形态**
+                // ——用户选了承诺硬止盈的预设，却因为另一个复选框而拿到一个没有执行者的承诺。
+                const inert = inertKeys.includes(r.key);
+                return (
                   <span
-                    className="tabular shrink-0"
-                    style={{ color: r.off ? "var(--muted)" : "var(--text)" }}
+                    key={r.key}
+                    className="flex items-center justify-between gap-2 text-[10px]"
+                    data-testid={inert ? `ai-discipline-threshold-inert-${r.key}` : undefined}
                   >
-                    {r.off ? "关闭" : r.value}
+                    <span className="truncate text-[var(--muted)]">
+                      {r.label}
+                      {inert && <span className="ml-1 text-[9px]">（未装配，不生效）</span>}
+                    </span>
+                    <span
+                      className="tabular shrink-0"
+                      style={{
+                        color: r.off || inert ? "var(--muted)" : "var(--text)",
+                        textDecoration: inert ? "line-through" : undefined,
+                      }}
+                    >
+                      {r.off ? "关闭" : r.value}
+                    </span>
                   </span>
-                </span>
-              ))}
+                );
+              })}
             </div>
           )}
         </>

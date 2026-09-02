@@ -25,11 +25,18 @@ import { colorForReturn, signed } from "@/lib/format";
  *
  * `exitMix` **不参与任何判定**（无 verdict）：保护层平仓占比高本身既不是好事也不是坏事，把它
  * 做成门槛会诱导出「故意不主动平仓、等保护层」这种劣化行为。它是记录项 + 诊断输入。
+ *
+ * ai-trade-loss-and-liveness-hardening 轴 F：**上面那条理由本轮不推翻**，但「不做硬门槛」不等于
+ * 「什么都不做」。卡底新增一行由后端下发的、**数据化的**结论（`exitDiscretion`）——它仍然不是
+ * 一道闸，只是把「我们早就看见了却没动」的那个观察说出来，并给一个能真的去改的入口。
  */
 export default function ExitSourceCard({
   exits,
+  onOpenProfitGuard,
 }: {
   exits: AiTradeExitMix | null | undefined;
+  /** 「去开启利润保护」的落点；未提供 ⇒ 只渲染结论、不渲染按钮（绝不给一个点了没反应的按钮）。 */
+  onOpenProfitGuard?: () => void;
 }) {
   if (!hasExitAttribution(exits)) return null;
   const mix = exits as AiTradeExitMix;
@@ -87,6 +94,34 @@ export default function ExitSourceCard({
           </div>
         ))}
       </div>
+
+      {mix.exitDiscretion && (
+        // 轴 F：**文案整句由后端下发**，前端一个字都不拼——它是一句带数字的判定性说明，
+        // 两处各写一遍必然与后端真正据以判定的数字分叉（`horizon-profiles` 的成文纪律）。
+        <div
+          className={
+            mix.exitDiscretion.level === "adverse"
+              ? "flex flex-col gap-1 rounded border border-[var(--short)] bg-[var(--short-soft)] px-2 py-1.5"
+              : "flex flex-col gap-1 rounded border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1.5"
+          }
+          data-testid="ai-exit-discretion"
+          data-level={mix.exitDiscretion.level}
+        >
+          <p className="text-[10px] leading-relaxed text-[var(--text)]">
+            {mix.exitDiscretion.note}
+          </p>
+          {mix.exitDiscretion.level === "adverse" && onOpenProfitGuard && (
+            <button
+              type="button"
+              onClick={onOpenProfitGuard}
+              className="self-start rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-0.5 text-[10px] text-[var(--text)] hover:bg-[var(--surface-2)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+              data-testid="ai-exit-discretion-cta"
+            >
+              去开启利润保护
+            </button>
+          )}
+        </div>
+      )}
 
       <p className="text-[10px] leading-relaxed text-[var(--muted)]">
         按<span className="text-[var(--text)]">平仓</span>成交的退出路径归集，

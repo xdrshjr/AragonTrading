@@ -69,7 +69,14 @@ from .intel import (
     note_alert_outcome,
 )
 from .feed_runtime import FeedRuntime
-from .hold_horizon import HorizonFacts, HorizonRule, gate_status as horizon_gate_status
+from .hold_horizon import (
+    HorizonFacts,
+    HorizonRule,
+    gate_status as horizon_gate_status,
+    round_is_structurally_idle,
+)
+from .liveness import LEVEL_HALT, LivenessRuntime, rule_from_settings
+from .liveness_text import halt_event as liveness_halt_event, liveness_event
 from .gate_veto import build_gate_veto_note, veto_layer, veto_layer_label
 from .horizon_acceptance import ai_stats_keys, build_bundle
 from .horizon_runtime import HorizonRuntime, build_horizon_facts
@@ -78,11 +85,13 @@ from .market_context import build_market_context
 from .market_digest import build_market_digest
 from .market_window import MarketWindow, WindowOptions
 from .multi_timeframe_context import build_multi_timeframe_context
+from .open_funnel import is_llm_failure
 from .order_plan import decision_to_order_plan
 from . import pause as pause_core
 from .prior_runtime import PriorRuntime
 from .profit_cooldown import apply_profit_cooldown, build_cooldown_view
 from .profit_guard import (
+    ARMED_STATUSES,
     STATUS_UNAVAILABLE,
     ProfitGuardRule,
     evaluate_profit_guard,
@@ -214,6 +223,19 @@ _ACTION_LABEL = {"open_long": "开多", "open_short": "开空", "close": "平仓
 _ACTIVE_STATES = ("running", "paused")
 # 决策动作 → `Signal.side`（M-6：原为 `_ai_explain` 内的裸下标，新动作当轮即 KeyError）。
 _ACTION_SIDE = {"open_long": "long", "open_short": "short", "close": "close"}
+# ★ E-1（loss-and-liveness-hardening 轴 E）：LLM 决策落进 `trades.reason` 的**机器码**。
+# 合入前这条通路把模型的中文 headline 原样塞进 `reason`，而写入点按 64 字节静默截断——实测
+# 221 笔 LLM 平仓的 `reason` 长度**全部恰好 64**：既不是可聚合的分类，也不是读得懂的说明。
+# prose 一个字都不丢，它继续完整存在于 `explain.headline`（本就未截断，实测 520/520 行都有）。
+#
+# ⚠️ **作用域钉死在「今天写 prose 的那条通路」**（评审 P0-5）：`trades.reason` 里已经稳定存在
+# 五个机器短码（`external_close` / `session_stop` / `profit_guard_committed_exit` /
+# `profit_guard_trailing` / `offline_exit`），它们有前端标签、且 `exit_attribution._BACKTEST_REASONS`
+# 与 `is_deterministic_reason()` 按**字面量**吃这类值。本表**只**覆盖 LLM 决策产出的那三种动作，
+# 既有短码逐字不动（G-E11 冻结）。新增码须同步 `apps/web/lib/aiTrade.ts` 的 `DEGRADE_REASON_LABELS`
+# ——漏加不会报错，只会让成交列表显示一个裸英文码。
+_DECISION_REASON_CODE = {"open_long": "open_long", "open_short": "open_short",
+                         "close": "agent_close"}
 
 
 class AiTradeSession:
@@ -254,14 +276,32 @@ class AiTradeSession:
         # 不带 baseRules 键、prompt 逐字节不变、门禁直通、轨迹零条（既有直接构造会话的单测零回归）；
         # 生产装配由 manager 从 API 层解析结果显式传入（默认开启只在 API 层解析，P1-5）。
         self.base_rule = base_rule
-        self._band_unavailable_streak = 0     # 连续通道不可用轮数（§2.6 告警升级）
+        # ★ 轴 D（loss-and-liveness-hardening §4.4 D-1）：活性看门狗。它同时**接管**了原先住在
+        # `_emit_base_rule_trace` 里的 `_band_unavailable_streak`——「并排再造一个计数器」正是本仓库
+        # 反复警告的『第二份口径』，故那个 int 变成了下面那个只读 property，真源只有一处。
+        # 总闸关 ⇒ `rule is None` ⇒ 判定恒 `ok`、`liveness` 键整键缺席、绝不请求停手，而 band 计数
+        # 与第 3 轮那条 error 事件逐字节回退到合入前（G-D5）。
+        self._liveness = LivenessRuntime(rule_from_settings(executor.settings))
+        self._liveness_halt_requested = False
+        # 轮末投递槽（见 `_flush_liveness_halt`）：判到 halt 的那一刻**只置意图**，真正把请求交给
+        # manager 必须等本轮跑完——否则后台的 `pause_group` 会在本轮的下一个 await 点把它 cancel 掉。
+        self._liveness_halt_pending = False
+        # manager 侧接线（W-D）：会话在决策轮**内部**只置意图并投递请求，真正的
+        # `pause_group(..., flatten=False)` 由 manager 在决策轮**之外**执行——`Session.pause` 的第 ③
+        # 步是 cancel 决策任务，从轮内 await 它就是自己 cancel 自己（评审 P0-4 ③）。
+        self.on_liveness_halt = None
         # 利润保护层（ai-trade-profit-protection §2.8）。默认 None=不装配 ⇒ payload 不带 profitGuard 键、
         # prompt 逐字节不变、盯市不判定、零事件（既有直接构造会话的单测零回归，与 base_rule 同款垫片）；
         # 生产装配由 manager 从 API 层解析结果显式传入（默认开启只在 API 层解析）。
         self.profit_rule = profit_rule
         # F0（adaptive §2.0）：状态 / 快照 / 计数 / payload 注入全部下沉 `ProfitGuardRuntime`（纯同步）；
         # 会话只留三个 async 编排点（_maybe/_apply/_report_profit_exit）与时钟读数打包。
-        self._guard = ProfitGuardRuntime(profit_rule)
+        self._guard = ProfitGuardRuntime(
+            profit_rule,
+            # ★ E-3：峰值追踪与保护层规则解耦的总闸（默认开）。关 ⇒ `_peak_only` 恒空转 ⇒
+            # `peak_pnl` 回到今天的「保护层未装配即恒 NULL」。
+            peak_tracking_always=bool(getattr(
+                executor.settings, "ai_trade_peak_tracking_always", False)))
         self._atr_px: float | None = None     # 确认根 ATR（F1）；None ⇒ 回吐距离上下界不生效
         # 成本记账与最小 edge 门禁（§3.10）：状态 / 快照 / 计数全部下沉 `CostRuntime`（镜像 F0 把
         # 利润保护下沉 `ProfitGuardRuntime` 的同款范式），会话只留薄封装调用。
@@ -283,6 +323,17 @@ class AiTradeSession:
             turnover_rule=turnover_rule_from_horizon(horizon_rule, executor.settings),
             backstop=self._backstop, repair=self._repair)
         self._round_horizon: dict | None = None      # 本轮 gate 快照（decision 事件与判定同源）
+        # ★ E-5（loss-and-liveness-hardening 轴 E）：本轮持仓周期闸判定的**一次性槽**，由
+        # `_note_exit_priority_round()` 在真实执行**之前**置位、`_inject_explain_meta` 在平仓
+        # 成交上消费即清空（与 `_pending_exit_priority` 逐字同款的槽纪律）。合入前「这笔为什么
+        # 能在最短持仓之内平掉」在产品里**无从回答**——`horizonGate` / `horizonRelease` 全库零命中。
+        self._pending_horizon_meta: dict | None = None
+        # ★ C-2：本会话跳过的决策轮数。`rounds_completed` **刻意不含它们**——那一轮没有做过
+        # 任何决策，算进轮数会污染「N 轮 0 成交」这类读数，而那正是本轮要修的活性问题的度量。
+        self.rounds_skipped = 0
+        # ★ E-7：已同步进漏斗的「限价开仓单撤销」累计数（按方向）。executor 侧是单调计数，
+        # 本槽记「已消费到哪」——`_dispatch` 是全部 executor 事件的唯一收口，故差量在那里补齐。
+        self._expired_seen: dict[str, int] = {}
         # ---- 离场优先级与离场意图兑现（exit-priority §4.1）----
         # 三者未装配时全部退化为零动作：`exitPriority` / `exitCommitment` 两键整键缺席、
         # prompt 逐字节回退、门禁解闸集合为空 ⇒ 与本特性合入前逐字等价（X-7）。
@@ -493,9 +544,21 @@ class AiTradeSession:
         合成成交，三处均经 `_make_trade(ts, "close", …)` 产出）。而**开仓部分成交**发的是 long/short
         的 trade，`seq` 不动 ⇒ 同一 epoch 的 `peak_px` 正确保留，恰是 §2.3 想要的语义。
         """
+        # ★ E-7：限价开仓单撤销的差量补进漏斗末格。挂在这条唯一收口上而不是 executor 内部，
+        # 是因为漏斗是 AI-trade 会话的读数——executor 由 `live_auto` 共用，那边没有开仓漏斗。
+        self._sync_open_expired()
         for event in events:
+            # ★ E-8（**纯观测**）：下单被交易所判可用保证金不足（实测 53 次）。今天它只是一条
+            # 一闪而过的 error 事件，事后既不进任何计数、也无从回答「到底差多少」。降档行为挂
+            # `ai_trade_sizing_margin_precheck`（默认关），本轮一次真实提交张数都不改。
+            if (event.get("type") == "error"
+                    and (event.get("data") or {}).get("code") == "INSUFFICIENT_BALANCE"):
+                self._discipline.funnel.note_insufficient_balance()
             if event.get("type") == "trade" and isinstance(event.get("data"), dict):
                 trade = event["data"]
+                # ★ 轴 D：**任何一次成交都清零**——系统证明了自己还活着。挂在事件上而不是轮末，
+                # 因为限价成交可能在数轮之后才被采纳，那一刻才是「它还活着」的真实时刻。
+                self._liveness.note_fill()
                 if trade.get("clOrdId"):        # pause-resume §6.2：本会话下过的单（unknown_order 判据）
                     self._note_cl_ord_id(str(trade["clOrdId"]))
                 if trade.get("side") == "close":
@@ -561,6 +624,23 @@ class AiTradeSession:
                 await self._persist_state_position()
             await self._push(event)
 
+    def _sync_open_expired(self) -> None:
+        """★ E-7：把 executor 侧「开仓挂单未成交即撤」的单调计数补进漏斗（按方向逐次记点）。
+
+        用差量而不是事件，理由是撤单常在数轮之后才发生：委托腿的方向在那时只有 executor 还记得
+        （轮级 `_intent_side` 早被 `note_executed` 清零），而 `note_expired(side)` 要的正是那个值。
+        `live_auto` 的市价路径恒无挂单 ⇒ 计数恒空 ⇒ 本方法逐字空转。
+        """
+        counts = getattr(self.executor, "open_expired_by_side", None) or {}
+        for side, total in counts.items():
+            seen = int(self._expired_seen.get(side, 0))
+            delta = int(total) - seen
+            if delta <= 0:
+                continue
+            for _ in range(delta):
+                self._discipline.funnel.note_expired(side)
+            self._expired_seen[side] = int(total)
+
     @property
     def experience(self) -> ExperienceRuntime:
         """经验层门面的**只读**出口（manager 侧的后台任务据它取蒸馏素材与换快照）。
@@ -606,6 +686,14 @@ class AiTradeSession:
         if (trade.get("side") == "close"
                 and self.executor.settings.ai_trade_exit_attribution_enabled):
             meta.setdefault("exitSource", self._consume_exit_source(explain))
+        # ★ E-5：持仓周期闸的四键判定（`horizonGate` / `horizonRelease` / `minHoldSeconds` /
+        # `exitPriorityLevel`）。**只打在平仓成交上**（开仓腿无「为什么能平」可言），且**消费即清空**
+        # ——`_inject_explain_meta` 跑在每一条成交事件上，槽若不清，下一笔任意平仓都会继承本轮的判定。
+        # 周期模式未装配 ⇒ 槽恒 `None` ⇒ 四键整键缺席 ⇒ meta 逐字回退（老行同样缺键 = 「未记录」）。
+        if trade.get("side") == "close":
+            slot, self._pending_horizon_meta = self._pending_horizon_meta, None
+            for key, value in (slot or {}).items():
+                meta.setdefault(key, value)
         # 轴 A 往返结算（realized-edge-calibration §3.1.1）：**必须在 exitSource 打标之后**——本层
         # 只读那个键、绝不自己再判一次（[P1-1]）。总闸关 / 非平仓 / 无开仓断面 ⇒ 空转 ⇒ meta 逐字回退。
         self._cost.apply_trip_meta(meta, trade)
@@ -1156,6 +1244,11 @@ class AiTradeSession:
         self.pause_reason = None
         self.resumed_ts = int(now)
         self._pause_result = None
+        # ★ 轴 D：续跑即给看门狗重新上弦——用户点【继续】就是在说「我处理过了，再试一次」。
+        # 不清这两个的话，一次自动停手之后看门狗要么再也不发第二次（`halt_requested` 恒真），
+        # 要么带着旧 streak 在第一轮就立刻再停一次，两种都让【继续】这个按钮变成一句空话。
+        self._liveness_halt_requested = False
+        self._liveness.reset()
         if self._monitor_task is None or self._monitor_task.done():
             self._monitor_task = asyncio.create_task(self._monitor_loop())
         wire = self.lifecycle_wire()
@@ -1639,6 +1732,38 @@ class AiTradeSession:
         self._decision_task = asyncio.create_task(
             self._run_decision_round(board, i, ref_px, ts, wake))
 
+    async def _maybe_skip_round(self, round_no: int, ts: int, wake: dict) -> bool:
+        """★ C-2：本轮该不该整轮跳过；跳过时推一条 `round_skipped` 事件并返回 `True`。
+
+        `rounds_completed` **刻意不自增**：这一轮没有做任何决策，把它算进轮数会污染
+        「456 轮 0 成交」这类读数——而那正是本轮要修的活性问题的度量本身。跳过的轮次由
+        `round_skipped` 事件独立可数。
+
+        断面在这里**现算一次**（而不是复用上一轮的 `last_snapshot`）：判据要回答的是「此刻」
+        还剩多少最短持仓，而盯市 tick 与决策轮之间隔着最多一个唤醒周期。
+        """
+        settings = self.executor.settings
+        if not getattr(settings, "ai_trade_skip_round_when_gated", False):
+            return False
+        if self.horizon_rule is None:
+            return False
+        now_wall = time.time()
+        snapshot = self._horizon.refresh(self._horizon_facts(now_wall))
+        guard_snapshot = self._refresh_profit_state(now_wall)
+        if not round_is_structurally_idle(
+                snapshot, wake_kind=wake.get("kind"),
+                guard_armed=(guard_snapshot or {}).get("status") in ARMED_STATUSES):
+            return False
+        self.rounds_skipped += 1
+        await self._push({"type": "round_skipped", "data": {
+            "ts": int(ts), "roundNo": round_no, "reason": "horizon_locked",
+            "minHoldRemainingSeconds": snapshot.get("minHoldRemainingSeconds"),
+            "wakeKind": wake.get("kind"),
+            # 计数随事件一起下发：前端据它做一次乐观更新，下一条 `status` 再用权威值覆盖
+            # ——事件与计数**同一个数**，不给前端第二个自增点。
+            "roundsSkipped": self.rounds_skipped}})
+        return True
+
     async def _run_decision_round(self, board: list[StrategySignalView], i: int,
                                   ref_px: float, ts: int, wake: dict) -> None:
         """一个决策轮：装配输入 → AI 决策 → 映射 Signal 守护执行 → 记录/摘要 → 推事件（含认知轨迹）。
@@ -1649,6 +1774,12 @@ class AiTradeSession:
         """
         round_no = self.rounds_completed + 1     # RV-5：try 之前绑定，except 可安全引用
         try:
+            # ★ C-2（loss-and-liveness-hardening §4.3）：结构上不可能产生任何合法动作的轮次
+            # 直接跳过，**连 payload 都不建**（省一次完整的 LLM 调用与一次 prompt 装配）。
+            # 判据是纯函数 `round_is_structurally_idle`，四个条件里的第 3、4 条是安全内核。
+            # 总闸 `ai_trade_skip_round_when_gated` 默认关 ⇒ 本段整体不执行 ⇒ 逐字节回退。
+            if await self._maybe_skip_round(round_no, ts, wake):
+                return
             payload = self._build_decision_payload(round_no, ts, ref_px, board, wake)
             # 断面冻结须在 payload 之后：`changeSinceLastRound` / `closedBars` 参照的是**上一**轮。
             self._wake.note_round_start(wake, px=ref_px, bar_index=i,
@@ -1668,6 +1799,18 @@ class AiTradeSession:
                 payload, emit=self._make_trace_emit(round_no, ts))
             self._reasoning_elapsed_ms = (time.monotonic() - decide_started) * 1000.0
             llm_degrade = degrade                      # 轴 D：门禁改写之前的**模型侧**降级码
+            # ★ 活性看门狗（loss-and-liveness-hardening 轴 D）：**落点必须在这里**——
+            # ① `_emit_base_rule_trace` 读的是本调用推进后的 `band_streak`，故须排在
+            #    `_apply_base_rule_gate` 之前；
+            # ② 四个输入在这一刻全部已知，且**没有一个取自模型的动作**（`llm_failed` 问的是
+            #    「这次调用成没成」，不是「模型说了什么」）。数降级码的看门狗在真实事故形态下
+            #    永远数不到 2——456 轮里只有 12 轮产生过开仓意愿（评审 P0-1）。
+            self._liveness.advance_round(
+                ma_band_armed=self.base_rule is not None,
+                ma_band=(payload.get("baseRules") or {}).get("maBand"),
+                mark_px=ref_px, stale_feed=self._stale_degraded,
+                llm_failed=is_llm_failure(llm_degrade), now_wall=time.time())
+            await self._emit_liveness(ts)
             # directional-symmetry B-2 留存点：**任何门禁之前**的决策引用。它是 `gateVeto` 里
             # `proposedAction` 的唯一来源，而那个字段带着方向（`open_short`）正是本轴的全部价值。
             stage1_decision = decision
@@ -1827,6 +1970,9 @@ class AiTradeSession:
             self._discipline.funnel.end_round()   # R-12：轮级标志兜底清零（异常路径也走这里）
             self._cost.end_round()   # 轴 A：轮级估计同址清零（D-3：被否的意图绝不改绑到下一笔往返）
             self._trend.end_round()  # 同款纪律：一次被否的开仓意图绝不改绑到下一笔成交上
+            # ★ 轴 D：停手请求在**这里**才交给 manager（见 `_flush_liveness_halt` 的成文理由）。
+            # 放在 `finally` 而不是 try 的末尾：本轮即便抛异常，那条「它已经死了」的判定也照样成立。
+            self._flush_liveness_halt()
             # closed-loop 评审 P1-9：同一处、同一条纪律——一次在 `note_decision` 之后、
             # `persist_pending` 之前抛错的轮，绝不可把它的引用行留给下一轮。**认领槽不清**。
             self._intel_cite.end_round()
@@ -2364,6 +2510,66 @@ class AiTradeSession:
         await self._emit_base_rule_trace(round_no, ts, band, reason)
         return decision, (degrade or reason)
 
+    @property
+    def _band_unavailable_streak(self) -> int:
+        """【基础策略】通道连续不可用轮数——**读的是活性看门狗的那一个状态**（D-1：不新建第二份计数）。
+
+        合入前这是 `__init__` 里的一个 int，由 `_emit_base_rule_trace` 自增。本轮把持有权交给
+        `LivenessRuntime`：它每轮推进一次同一个状态机，而 `ma_band_unavailable` 恰是 `probe` 的第
+        一优先级码，故「band 为 None」这一事实映射到的 streak 与合入前逐字相同。
+        """
+        return self._liveness.band_streak
+
+    def _liveness_key(self) -> dict:
+        """`liveness` 键的**唯一装配点**（`info()` 与 `_status_payload` 各调一次）。
+
+        总闸关 ⇒ `wire()` 为 `None` ⇒ 返回空 dict ⇒ **整键缺席**（不是 `null`）——键缺席是本仓库
+        「逐字节回退」的既定判据，而前端的横幅渲染门控读的正是这个键在不在。
+        """
+        wire = self._liveness.wire()
+        return {} if wire is None else {"liveness": wire}
+
+    async def _emit_liveness(self, ts: int) -> None:
+        """轴 D 的两个出口：**跃迁**时推一条 `liveness` 事件；到 `halt` 则投递一次停手请求。
+
+        本方法**绝不 await 任何暂停**：`Session.pause` 的第 ③ 步是 cancel 决策任务，从
+        `_run_decision_round` 内部调用它 = 自己 cancel 自己（评审 P0-4 ③）。这里只置意图 +
+        推事件（先让用户看见），真正的整组暂停由 manager 在决策轮之外执行。
+
+        停手请求**只投一次**（`_liveness_halt_requested` 幂等）：`pause_group` 本身也是幂等的，
+        但重复投递会在每一轮都排一个后台任务，而这一层恰恰是「系统已经不正常」的时刻。
+        """
+        if not self._liveness.enabled:
+            return
+        level, _code = self._liveness.verdict()
+        payload = self._liveness.wire()
+        if self._liveness.take_transition() is not None and payload is not None:
+            await self._push(liveness_event(ts, payload))
+        if level != LEVEL_HALT or self._liveness_halt_requested:
+            return
+        self._liveness_halt_requested = True
+        if payload is not None:
+            await self._push(liveness_halt_event(ts, payload))
+        self._liveness_halt_pending = True     # ← 真正的投递在轮末（`_flush_liveness_halt`）
+
+    def _flush_liveness_halt(self) -> None:
+        """把停手请求交给 manager——**必须在轮末**（`_run_decision_round` 的 `finally`）。
+
+        `manager.pause_group` 的第一步就是逐成员 `session.pause()`，而 `Session.pause` 的第 ③ 步是
+        **cancel 决策任务**。若在判到 halt 的那一刻就投递，后台任务会在本轮的下一个 await 点把本轮
+        cancel 掉，这一轮的 trace 与决策事件就此丢失——那是评审 P0-4 ③「自己 cancel 自己」的一个更
+        隐蔽的变体（`G-D7` 守的正是这条）。
+
+        排在 `finally` 里还有一个结构性保证：`callback()` 是**同步**的，它只 `create_task`；单线程
+        事件循环下那个任务最早也要等本协程返回之后才会跑，故「本轮先跑完」不是靠时序碰巧成立。
+        """
+        if not self._liveness_halt_pending:
+            return
+        self._liveness_halt_pending = False
+        callback = self.on_liveness_halt
+        if callable(callback):
+            callback()          # 同步投递（manager 侧起后台任务），**不 await**
+
     async def _emit_base_rule_trace(self, round_no: int, ts: int, band: dict | None,
                                     reason: str | None) -> None:
         """base_rule 轨迹段 + 连续不可用告警升级（§2.6/§2.9）；仅规则装配时被调用。"""
@@ -2375,10 +2581,11 @@ class AiTradeSession:
             trace["baseRulePctB"] = (band or {}).get("pctB")
             trace["baseRuleReason"] = reason
         await self._push(base_rule_event(round_no, ts, band, status, reason))
+        # ★ 轴 D：计数不再在这里推进——它由 `_liveness.advance_round()`（本轮更早、`decide()` 返回
+        # 之后）统一推进，本处只**读**。判据与文案逐字保留：第 3 轮那条 error 是「第一声」，
+        # 比活性横幅早 17 轮，有独立价值（评审 P1-1）。
         if band is not None:
-            self._band_unavailable_streak = 0
             return
-        self._band_unavailable_streak += 1
         if self._band_unavailable_streak == _BAND_UNAVAILABLE_ALERT_ROUNDS:
             await self._push({"type": "error", "data": {
                 "ts": ts, "code": "AI_TRADE_BASE_RULE_UNAVAILABLE",
@@ -2488,6 +2695,28 @@ class AiTradeSession:
         self._pending_exit_priority = (
             priority.level if priority is not None
             and priority.level in (LEVEL_OVERRIDE, LEVEL_ADJUDICATED) else None)
+        self._pending_horizon_meta = self._horizon_meta_slot()
+
+    def _horizon_meta_slot(self) -> dict | None:
+        """★ E-5：本轮持仓周期闸判定的四键断面；周期模式未装配 ⇒ `None` ⇒ meta 逐字回退。
+
+        取的是 `_apply_horizon_gate` **判定用的那一份快照**（`self._round_horizon`）与它的降级码，
+        不是盯市 tick 上更新的 `last_snapshot`——平仓成交发生后仓位已归 flat，那一份的 `status`
+        会变成 `flat`，用它打标等于事后把「当时到底解没解闸」抹掉。
+
+        `holdSeconds` **刻意不在其中**（评审 P1-6）：它已有唯一写点（`trip_ledger` 经
+        `_cost.apply_trip_meta`），再写一份就是两个写点两种语义，而漂移的正好是本轮唯一要回答的问题。
+        """
+        if self.horizon_rule is None:
+            return None
+        snapshot = self._round_horizon or {}
+        return {
+            "horizonGate": horizon_gate_status(self._round_horizon, self._horizon.last_reason),
+            "horizonRelease": snapshot.get("releaseReason"),
+            "minHoldSeconds": self.horizon_rule.min_hold_s,
+            "exitPriorityLevel": (self._exit_priority.level
+                                  if self._exit_priority is not None else None),
+        }
 
     def _note_exit_fail_open(self, code: str) -> None:
         """记一笔 fail-open 放行（【R:P1-3】：它**不进 `degrade`**，故必须有自己的落点与计数）。"""
@@ -2700,8 +2929,14 @@ class AiTradeSession:
             return signals
         explain = self._ai_explain(decision.action, decision.reason, decision.confidence,
                                    board_digest)
+        # ★ E-1：`reason` 改写为机器码，prose 由上一行的 `explain.headline` 完整承载。落点选在这里
+        # 而不是纯核心 `decision_to_signals`——回测走的是纯核心，那边的 `reason` 参与
+        # `exit_attribution.classify_backtest` 的字面量判据，改它会当场打坏回测归因。
+        code = _DECISION_REASON_CODE.get(decision.action)
         for sig in signals:
             sig.explain = explain
+            if code is not None:
+                sig.reason = code
         return signals
 
     @staticmethod
@@ -2775,7 +3010,10 @@ class AiTradeSession:
         本方法是保护快照 status 的**唯一**产出点，故 `WakeRuntime.note_guard_status` 挂在这里：唤醒
         分类要读的「本 tick 保护状态」与保护层真正据以平仓的是同一个数，调用方不得另取一次。
         """
-        if self.profit_rule is None:
+        # ★ E-3：保护层未装配 + 峰值追踪总闸开 ⇒ **继续往下走**（`refresh` 会落进只算峰值的
+        # `_peak_only` 分支并恒返回 `None`，故 payload / prompt / 事件全部逐字回退）。总闸关时
+        # 判据与合入前逐字相同。
+        if self.profit_rule is None and not self._guard.peak_tracking_always:
             self._wake.note_guard_status(None)
             return None
         if self.executor.projected == "flat":
@@ -2797,7 +3035,13 @@ class AiTradeSession:
         # §3.1.2 row 5（I-1 的招牌条款）：判据是 `is_active` —— 暂停期利润保护**照旧平仓**。
         # 反例说明为什么：用户暂停后去睡觉，一个已浮盈 8% 的仓位会失去唯一的本地退出执行者，
         # 而他以为自己做的是一个**降低**风险的动作。
-        if self.profit_rule is None or not self.is_active:
+        if not self.is_active:
+            return
+        if self.profit_rule is None:
+            # ★ E-3：未装配保护层时本方法**不做任何判定**（它没有规则可判），但峰值仍要推进——
+            # 「关掉保护层的同时也关掉了『保护层本该拦住多少钱』这个读数」恰恰关掉了唯一能证明
+            # 该开保护层的证据。总闸关 ⇒ `_refresh_profit_state` 第一行即返回 ⇒ 逐字回退。
+            self._refresh_profit_state(time.time())
             return
         snap = self._refresh_profit_state(time.time())
         if snap is None or snap.get("status") == STATUS_UNAVAILABLE:
@@ -3166,6 +3410,8 @@ class AiTradeSession:
                 "contextRefreshRounds": self.context_refresh_rounds,
                 "wakeIntervalMinutes": self._wake_interval_minutes(),
                 "wakeSkips": self.wake_skips,
+                # ★ C-2：结构上不可能产生任何合法动作而被整轮跳过的次数（总闸默认关 ⇒ 恒 0）。
+                "roundsSkipped": self.rounds_skipped,
                 "disciplines": self.discipline_wire(),   # 轴 B：13 行自检 + 恒真自检提示
                 # tradability-and-open-funnel 三新键（未装配 / 零样本 ⇒ None 而非缺席）：
                 # 可交易性启动断面 / 开仓漏斗 / 摘要健康度。三者各自的渲染落点都在本轮内做完
@@ -3188,6 +3434,11 @@ class AiTradeSession:
                                                            now_wall=time.time()),
                 # 持仓周期快照（§4.4）：供面板 chip 在无决策事件时也能更新倒计时；未装配 ⇒ None。
                 "horizon": self._horizon.last_snapshot,
+                # ★ 轴 D：活性断面**两条通路都要下发**——REST 成员行取 `info()`、WS `status` 取本
+                # 方法（经 `patchAiTradeMemberStatus` 整体 spread 合并进 `m.session`）。只挂一处，
+                # 横幅就会在另一条通路上恒不渲染（`trendVerdict` 的同款教训，见上方注释）。
+                # 总闸关 ⇒ `wire()` 为 None ⇒ **整键缺席**（不是 null）。
+                **self._liveness_key(),
                 # 验收闭环四键（horizon-acceptance [P0-3] 主通路）：成员级实时刷新走这条既有 WS
                 # status；分组合并口径另走 15s REST 轮询。未装配 / 零样本 ⇒ 各键为 None 而非缺席。
                 **self.acceptance_bundle(),
@@ -3315,6 +3566,9 @@ class AiTradeSession:
                 # 深度研判三键（§4.3）：`/ai-trade/status` 的成员行取自本方法，故两处装配都要
                 # 有——只挂 `_status_payload` 的话，刷新页面后那三个键会在成员卡上凭空消失。
                 **self._reasoning_status_keys(),
+                # ★ 轴 D（loss-and-liveness-hardening §6.1）：活性断面（与 `_status_payload`
+                # **同一个装配点**；两处义务不同但形状必须一致，见 `_liveness_key`）。
+                **self._liveness_key(),
                 "flattenFailed": self.flatten_failed}
 
     # ---------- 持久化 ----------

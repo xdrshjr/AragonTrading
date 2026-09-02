@@ -280,6 +280,57 @@ describe("useAiTradeGroupStream · WS 两个新 case（用例 14）", () => {
     expect(useAppStore.getState().aiTradeReconcileUntil).toBeTruthy();
   });
 
+  it("`liveness` 事件即时更新成员的活性断面（loss-and-liveness-hardening 轴 D）", async () => {
+    // 缺这个 case 就是又一条「后端推了、前端丢在地上」的通路——`lifecycle` 事件在上一轮
+    // 正是这么被丢了一整轮的。横幅因此要等下一条 status 才更新（最坏一个唤醒周期）。
+    const { getOnEvent } = captureRouter();
+    seedLocalGroup();
+    vi.mocked(aiTradeApi.status).mockResolvedValue({
+      group: HOT, aiTradeEnabled: true, resumable: null,
+    } as never);
+
+    renderHook(() => useAiTradeGroupStream());
+    await waitFor(() => expect(getOnEvent()).toBeTruthy());
+
+    act(() =>
+      getOnEvent()!({
+        type: "liveness",
+        data: {
+          ts: 1_700_000_000, level: "degraded", code: "ma_band_unavailable", streak: 23,
+          sinceWall: 1_700_000_000, message: "已连续 23 轮…", advice: "检查行情连接",
+        },
+      }),
+    );
+
+    const member = useAppStore.getState().aiTradeGroup!.members["BTC-USDT-SWAP"];
+    expect(member.session?.liveness?.level).toBe("degraded");
+    expect(member.session?.liveness?.streak).toBe(23);
+    // 窄 patch 绝不许把既有成交清掉（本文件反复守的那条不变式）
+    expect(member.trades).toHaveLength(1);
+  });
+
+  it("`round_skipped` 只做一次**乐观更新**，计数由后端随事件下发（前端绝不自增）", async () => {
+    const { getOnEvent } = captureRouter();
+    seedLocalGroup();
+    vi.mocked(aiTradeApi.status).mockResolvedValue({
+      group: HOT, aiTradeEnabled: true, resumable: null,
+    } as never);
+
+    renderHook(() => useAiTradeGroupStream());
+    await waitFor(() => expect(getOnEvent()).toBeTruthy());
+
+    act(() =>
+      getOnEvent()!({
+        type: "round_skipped",
+        data: { ts: 1, roundNo: 7, reason: "horizon_locked",
+                minHoldRemainingSeconds: 900, wakeKind: "heartbeat", roundsSkipped: 3 },
+      }),
+    );
+    expect(
+      useAppStore.getState().aiTradeGroup!.members["BTC-USDT-SWAP"].session?.roundsSkipped,
+    ).toBe(3);
+  });
+
   it("`error` 的 `NOT_FOUND` ⇒ **停止重连** + 立即对账（D-9：此前是一场静默的重连风暴）", async () => {
     const { getOnEvent, close } = captureRouter();
     seedLocalGroup();

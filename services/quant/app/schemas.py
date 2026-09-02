@@ -636,6 +636,10 @@ class AiTradeExitMixOut(BaseModel):
 
     totalExits: int
     bySource: list[AiTradeExitSourceRowOut] = Field(default_factory=list)
+    # 轴 F（loss-and-liveness-hardening §4.6）：退出裁量权的**只读结论**（无任何门禁）。
+    # 历史详情走 `response_model=AiTradeHistoryDetailOut`，**不在这里声明就会被 FastAPI 静默
+    # 吞掉、面板永远是空的**——本仓库已成文的前科。`min_samples=0` ⇒ 后端整键缺席 ⇒ 这里为 None。
+    exitDiscretion: dict | None = None
 
 
 class AiTradeFundingOut(BaseModel):
@@ -788,6 +792,11 @@ class AiTradeHorizonProfilesOut(BaseModel):
     # **形状刻意用 `dict`**：档位标签与那句安全承诺全部由后端下发，用一个逐字段声明的模型反而会在
     # 下一次加字段时静默吞掉新键（同类端点 `/stop`、`/backstop/repair` 返回裸 dict 正是为此）。
     exitPriority: dict | None = None
+    # ai-trade-loss-and-liveness-hardening C-1：唤醒下限除数（`0` = 只观测不改行为，本轮默认）。
+    # 下发它是为了让弹窗能在**按下启动键之前**说出「唤醒周期会被抬到多少」——服务端替用户改了
+    # 什么必须显式告知（`discipline.adjustments` 的既有纪律），而那条回执要等启动之后才看得到。
+    # 前端**不复制这个数**，只用它决定渲不渲染那句提示并按下发值现算。
+    wakeHorizonDivisor: int = 0
     profiles: list[AiTradeHorizonProfileOut] = Field(default_factory=list)
 
 
@@ -1389,6 +1398,9 @@ class AiTradeHistoryEntry(BaseModel):
     feeUsd: float = 0.0
     grossPnlUsd: float = 0.0
     costBasisMixed: bool = False
+    # E-6（loss-and-liveness-hardening）：混装到底污染了多大比例——`costBasisMixed` 只说「有」，
+    # 说不出「多少笔」。**不改 schema 就会被 `response_model` 静默吞掉**（本仓库已成文的前科）。
+    costBasisCounts: dict[str, int] = Field(default_factory=dict)
 
 
 class AiTradeHistoryListOut(BaseModel):
@@ -1503,6 +1515,8 @@ class AiTradeHistorySummary(BaseModel):
     feeUsd: float = 0.0
     grossPnlUsd: float = 0.0
     costBasisMixed: bool = False
+    # E-6：同上，历史详情走 `response_model=AiTradeHistoryDetailOut` 那条路，漏声明即静默丢键。
+    costBasisCounts: dict[str, int] = Field(default_factory=dict)
     # 周期验收闭环（horizon-acceptance [P1-9]）：**在后端合并各成员 run 的原始计数器后判定一次**，
     # 故这里是一张组级卡而不是 N 张。任一成员缺 `acceptanceInput`（老记录）⇒ 两键缺席 ⇒ 前端整卡
     # 不渲染（绝不用半组数据冒充整组结论）。
@@ -1596,6 +1610,13 @@ def trade_out(t: Trade) -> dict:
         # explain 信封落库、读侧在此提回顶层；其余结算键由查询层直接读 `explain.meta`。
         # 老数据 / 总闸关 / 算不出（无止损、ct_val 未知）⇒ None ⇒ 前端整列不渲染，**绝不填 0**。
         "rMultiple": ((envelope or {}).get("meta") or {}).get("rMultiple"),
+        # ★ E-5（loss-and-liveness-hardening 轴 E）：持仓周期闸的四键判定，同款「搭 explain 信封
+        # 落库、读侧提回顶层」。合入前「这笔为什么能在最短持仓之内平掉」在产品里**无从回答**
+        # ——`horizonGate` / `horizonRelease` / `exitPriorityLevel` 全库零命中。
+        # 老行 / 周期模式未装配 / 开仓腿 ⇒ 缺键 ⇒ None ⇒ 前端如实显示「未记录」，**绝不填默认值**。
+        # `holdSeconds` 刻意不在此列：它已有唯一写点（`trip_ledger`），提第二遍就是两份语义。
+        **{key: ((envelope or {}).get("meta") or {}).get(key)
+           for key in ("horizonGate", "horizonRelease", "minHoldSeconds", "exitPriorityLevel")},
         # explain 键恒在（缺列 / 坏 JSON → None），与既有恒含全键风格一致（§5.2 / P2-6）。
         "explain": _public_explain(envelope),
     }

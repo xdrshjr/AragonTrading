@@ -35,6 +35,13 @@ EXIT_SOURCES: tuple[str, ...] = (
     "timeExit", "sessionStop", "windowEnd", "external", "unknown",
 )
 
+# 轴 F（loss-and-liveness-hardening §4.6）：两个子集**从 `EXIT_SOURCES` 派生**，绝不手抄第二遍。
+# `unknown` 两边都不进——它既不是「模型选的」也不是「某条确定性通道走的」，把它算进任何一侧都是
+# 在给一句结论掺进一批来源不明的样本。
+DISCRETIONARY_SOURCES: tuple[str, ...] = ("agent", EXIT_SOURCE_AGENT_OVERRIDE, "agentReverse")
+DETERMINISTIC_SOURCES: tuple[str, ...] = tuple(
+    src for src in EXIT_SOURCES if src not in DISCRETIONARY_SOURCES and src != "unknown")
+
 # 被区间 / 会话边界**截断**的持仓样本来源：它们的持仓时长不是「Agent 选择的」而是「时间到了」，
 # 会系统性压低平均持仓时间。**不从样本里剔除**（剔除即幸存者偏差），只在验收卡第 1 行如实披露。
 TRUNCATING_SOURCES: tuple[str, ...] = ("windowEnd", "sessionStop")
@@ -187,6 +194,26 @@ class ExitLedger:
             "winRate": (round(self.wins.get(key, 0) / count, _ROUND_RATIO)
                         if count >= self.min_win_rate_samples else None),
         }
+
+
+def attach_exit_discretion(exits: dict | None, *, min_samples: int) -> dict | None:
+    """把轴 F 的只读结论**嵌进既有 `exits` 整对象**（加法子键；`None` / 缺席时原样返回）。
+
+    嵌在既有对象里而不是另起一个顶层键，沿用本仓库「前端 reducer 一行不必动」的成文姿势；
+    判定本体是 `attribution.exit_discretion_verdict` 那个纯函数，本函数只负责把两个来源子集
+    （由 `EXIT_SOURCES` 派生）喂给它——依赖方向单向：`attribution` 不 import 本模块。
+    """
+    from .acceptance_text import EXIT_SOURCE_LABELS
+    from .attribution import exit_discretion_verdict
+
+    if not exits:
+        return exits
+    verdict = exit_discretion_verdict(exits.get("bySource"), min_samples=min_samples,
+                                      discretionary=DISCRETIONARY_SOURCES,
+                                      deterministic=DETERMINISTIC_SOURCES,
+                                      # 中文标签的**唯一真源**（`acceptance_text` 是叶子模块，无环）。
+                                      labels=EXIT_SOURCE_LABELS)
+    return exits if verdict is None else {**exits, "exitDiscretion": verdict}
 
 
 def exit_counters(ledger: ExitLedger | None) -> dict:

@@ -142,6 +142,10 @@ class LiveExecutor:
         # 当前挂着的那一笔限价委托（不变式 I-1：单会话至多一笔）。恒为 None ⇒ 市价路径 ⇒ live_auto
         # 的每一处判定都短路，行为与本特性合入前逐字相同。
         self.resting: RestingOrder | None = None
+        # E-7（loss-and-liveness-hardening 轴 E）：**开仓**限价委托未成交即被撤销的单调累计计数，
+        # 按委托腿自己的方向分格。撤单常在数轮之后才发生，会话侧的轮级方向标志那时早已清零，故
+        # 方向必须在这里定格（`open_funnel.note_expired` 的成文理由）。live_auto（市价路径）恒为空。
+        self.open_expired_by_side: dict[str, int] = {}
         # 最近一次 `apply` 中「平仓未下发」的原因码（exit-priority §5.5）；`None` = 未发生。
         # 会话侧据它把 F-4 那条**此前完全静默**的路径写进本轮 `degrade`。
         self.last_close_block: str | None = None
@@ -461,6 +465,7 @@ class LiveExecutor:
             return "unknown", [self._error_event(ts, exc)]
         outcome = str(result.get("outcome") or "unknown")
         if outcome == "canceled":
+            self._note_open_expired(order)          # E-7：委托发出了、没成交、没了
             self.resting = None
             return "canceled", [self._status_event(f"已撤销未成交挂单（{reason}）")]
         if outcome == "filled":
@@ -508,6 +513,7 @@ class LiveExecutor:
         if phase == "partial":
             return self._adopt_partial(order, state, ts)
         if phase == "canceled":
+            self._note_open_expired(order)          # E-7：同上（交易所侧撤 / TTL 到期撤）
             self.resting = None
             return [self._status_event("挂单已撤销（我方或交易所侧），已收敛为无挂单")]
         if phase == "live" and is_expired(order, ts):
@@ -1040,3 +1046,14 @@ class LiveExecutor:
     def _error_event(self, ts: int, exc: OKXError) -> dict:
         return {"type": "error", "data": {"ts": int(ts), "code": exc.code,
                                           "message": exc.message}}
+
+    def _note_open_expired(self, order: RestingOrder | None) -> None:
+        """一笔**开仓**挂单未成交即消失（我方撤 / 到期撤 / 交易所侧撤）：记进 E-7 的累计计数。
+
+        平仓挂单不计——「想平没平成」由 `last_close_block` 与 `exit_order_slot_busy` 承载，
+        与开仓漏斗不是同一张图。方向取委托腿自己的 `side`（跨轮到达，轮级标志不可用）。
+        """
+        if order is None or order.intent != "open":
+            return
+        side = order.side if order.side in ("long", "short") else "unknown"
+        self.open_expired_by_side[side] = self.open_expired_by_side.get(side, 0) + 1

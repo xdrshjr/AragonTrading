@@ -31,16 +31,22 @@ export class ApiRequestError extends Error {
   status: number;
   // 分组前置门禁失败（LIVE_AUTO_GROUP_PREFLIGHT）携带的逐标的明细（可选，向后兼容）。
   members?: { instId: string; code: string; message: string }[];
+  // ai-trade-loss-and-liveness-hardening A-1：422 `AI_TRADE_UNGUARDED_HORIZON` 携带的**可执行
+  // 补救**（镜像上面 `members` 的既有先例）。不带过来的话，后端那三条出路在界面上就只剩一句
+  // 「浮盈回吐将没有任何自动兑现通道」——用户知道坏了，却不知道该点哪里。**文案一律由后端下发**。
+  remedies?: { id: string; label: string }[];
   constructor(
     code: string,
     message: string,
     status: number,
     members?: { instId: string; code: string; message: string }[],
+    remedies?: { id: string; label: string }[],
   ) {
     super(message);
     this.code = code;
     this.status = status;
     this.members = members;
+    this.remedies = remedies;
   }
 }
 
@@ -97,11 +103,14 @@ async function rawRequest<T>(
   if (!res.ok) {
     let code = String(res.status);
     let message = res.statusText;
+    let remedies: { id: string; label: string }[] | undefined;
     try {
       const body = await res.json();
       if (body?.error) {
         code = body.error.code ?? code;
         message = body.error.message ?? message;
+        // A-1：加法字段，缺席即 undefined ⇒ 既有错误路径逐字不变。
+        if (Array.isArray(body.error.remedies)) remedies = body.error.remedies;
       } else {
         const validationMessage = formatValidationDetail(body?.detail);
         if (validationMessage) {
@@ -112,7 +121,7 @@ async function rawRequest<T>(
     } catch {
       /* ignore parse error */
     }
-    throw new ApiRequestError(code, message, res.status);
+    throw new ApiRequestError(code, message, res.status, undefined, remedies);
   }
   const data = res.status === 204 ? (undefined as T) : ((await res.json()) as T);
   return { data, res };

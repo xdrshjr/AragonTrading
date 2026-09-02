@@ -155,6 +155,9 @@ class OpenFunnelCounters:
         submitted_by_side: 方向 → 真的发出开仓委托的轮数。
         sizing_zeroed_by_side: 方向 → 仓位解到 0 的轮数。
         filled_by_side: 方向 → 开仓腿成交次数（**事件级**，方向取成交腿自己的 `side`）。
+        expired: 限价开仓委托未成交即被撤销的次数（E-7；实测 602 笔限价开仓里 223 笔如此收场）。
+        expired_by_side: 方向 → 同上（方向取**委托腿自己的** `side`，见 `note_expired`）。
+        insufficient_balance: 开仓委托被交易所以 `INSUFFICIENT_BALANCE` 拒绝的次数（E-8 观测）。
         contrarian_passed: 走逆势通路放行的轮数。它**不是降级**，故不进 `blocked`
             （镜像 `sizing_zeroed` 不是一道闸的成文纪律）。
         _intent_pending: 轮级标志——本轮记过 intent 吗。它是本类**唯一**的跨调用状态，
@@ -179,6 +182,10 @@ class OpenFunnelCounters:
     filled_by_side: dict = field(default_factory=dict)          # {side: n}（**成交腿自己的 side**）
     contrarian_passed: int = 0                                  # 走逆势通路放行的轮数（不进 blocked）
     _intent_side: str | None = None                             # 轮级：本轮开仓意愿的方向
+    # ---- E-7 / E-8（loss-and-liveness-hardening 轴 E）：委托发出之后的两格 ----
+    expired: int = 0                                            # 限价开仓单未成交即撤（事件级）
+    expired_by_side: dict = field(default_factory=dict)         # {side: n}（**委托腿自己的 side**）
+    insufficient_balance: int = 0                               # 下单被交易所判可用保证金不足
 
     # ---------- 喂数（三个记点 + 一个轮末兜底）----------
     def note_intent(self, action: str, degrade: str | None) -> None:
@@ -259,6 +266,32 @@ class OpenFunnelCounters:
         """
         self.filled += 1
         _bump(self.filled_by_side, side if side in ("long", "short") else UNKNOWN_SIDE)
+
+    def note_expired(self, side: str) -> None:
+        """限价开仓委托未成交即被撤销（E-7；`filled` 的兄弟格，两者互斥）。
+
+        **必须显式带方向**（评审 P2-4）：`expired` 是**跨轮事件级**读数——限价开仓单常在数轮之后
+        才被撤，那时 `_intent_pending` / `_intent_side` 早已被 `note_executed` 清零。照轮级标志去读，
+        `expired_by_side` 会**恒为 0 且不报任何错**，正是 `note_filled` 文档注释里写下的那个坑。
+        调用点（撤单回执）本来就持有委托腿的 `side`，零新取数。
+
+        **不进 `blocked`**：委托已经发出去了，这不是任何一道闸拦的——它画在漏斗的「委托」之后、
+        与 `filled` 并列，故 `sum(blocked) + submitted + sizingZeroed <= intents` 的闭合不变式不受影响。
+
+        Args:
+            side: 委托腿的方向（`"long"` / `"short"`）；其它值一律归 `unknown`，绝不猜。
+        """
+        self.expired += 1
+        _bump(self.expired_by_side, side if side in ("long", "short") else UNKNOWN_SIDE)
+
+    def note_insufficient_balance(self) -> None:
+        """开仓委托被交易所判「可用余额 / 保证金不足」（E-8 **纯观测**）。
+
+        本轮**不改任何一次真实提交张数**：仓位求解结果超过可用保证金时今天以报错收场（实测 53 次），
+        而 `LiveExecutor` 全文没有任何可用保证金读数，要预检就得在下单热路径上多打一发 REST。
+        先把它变成一个看得见的数，下一轮才有数据回答「降一档到底够不够」。
+        """
+        self.insufficient_balance += 1
 
     def note_contrarian(self) -> None:
         """逆势通路放行了一轮（directional-symmetry 轴 A）。
@@ -345,6 +378,7 @@ def by_side_wire(counters: OpenFunnelCounters) -> dict:
         "sizingZeroed": int(counters.sizing_zeroed_by_side.get(side, 0)),
         "submitted": int(counters.submitted_by_side.get(side, 0)),
         "filled": int(counters.filled_by_side.get(side, 0)),
+        "expired": int(counters.expired_by_side.get(side, 0)),
     } for side in SIDES}
 
 
@@ -404,6 +438,10 @@ def funnel_wire(counters: OpenFunnelCounters | None, *, directional: bool = Fals
         "sizingZeroed": counters.sizing_zeroed,
         "submitted": counters.submitted,
         "filled": counters.filled,
+        # E-7 / E-8：委托之后的两格。`expired` 与 `filled` 互斥且都在「委托」之后，故闭合不变式
+        # （`sum(blocked) + submitted + sizingZeroed <= intents`）逐字不变。
+        "expired": counters.expired,
+        "insufficientBalance": counters.insufficient_balance,
         "conversion": conversion(counters),
         "layers": list(LAYERS),
         "scope": LIFETIME_SCOPE_TEXT,

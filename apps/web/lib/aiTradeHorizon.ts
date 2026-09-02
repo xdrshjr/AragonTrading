@@ -241,6 +241,14 @@ export interface HorizonCoherenceInput {
   bar: string;
   wakeMinutes: number | null;
   leverage: number | null;
+  /**
+   * ai-trade-loss-and-liveness-hardening C-1：唤醒下限除数（**由后端下发**，`0` = 不约束）。
+   *
+   * 下限 = 目标最短持仓 / 除数，即「一次目标持仓期内至多被问 `divisor` 次」。服务端会在启动时
+   * 把低于下限的唤醒周期抬上去并写进 `discipline.adjustments` 回执——但那条回执要等**启动之后**
+   * 才看得到，而这句提示出现在**按下启动键之前**。前端不硬编这个数，只按下发值现算。
+   */
+  wakeFloorDivisor?: number | null;
 }
 
 /**
@@ -268,6 +276,18 @@ export function horizonCoherenceHints(input: HorizonCoherenceInput): string[] {
   if (cap != null && input.leverage != null && input.leverage > cap) {
     hints.push(`杠杆高于本模式建议上限 ${cap}×，手续费对预算的侵蚀会成比例放大。`);
   }
+  // C-1：与目标持仓相干的唤醒下限。**只在服务端真的开着这条抬升时才提示**（`divisor > 0`）
+  // ——除数默认 0（只观测不改行为），那时说一句「会被抬到 N 分钟」就是一句假话。
+  const divisor = input.wakeFloorDivisor ?? 0;
+  if (divisor > 0 && targetMin > 0 && wakeSeconds > 0) {
+    const floorMinutes = targetMin / divisor / 60;
+    if (wakeSeconds < targetMin / divisor) {
+      hints.push(
+        `唤醒周期短于与目标持仓相干的下限：启动时会被自动抬到约 ${floorMinutes.toFixed(1)} 分钟` +
+          `（= 目标最短持仓 / ${divisor}），并如实列在启动回执的「服务端调整」里。`,
+      );
+    }
+  }
   return hints;
 }
 
@@ -283,6 +303,10 @@ const HORIZON_RELEASE_LABEL: Record<string, string> = {
   max_hold_bars: "已达强制平仓上限",
   // exit-priority 轴 A 的第二把钥匙；漏加这一条，豁免轮 UI 只会显示「限制已解除」而说不出为什么。
   exit_pending: "离场意图已挂起超过上界",
+  // ai-trade-loss-and-liveness-hardening 轴 B：浮亏豁免在交易所止损已核实覆盖时降级为只解 G2/G3。
+  // **必须写明「不解最短持仓」**——只说「限制已解除」会让用户以为三闸全开，而这一档恰恰是 G1
+  // 仍然生效的那一档。后端 `hold_horizon_text._RELEASE_LABEL` 是这一行的镜像（G-B6 等值门禁）。
+  loss_release_covered: "浮亏已达解除阈，但已被交易所止损兜底，故不解最短持仓",
 };
 
 /**

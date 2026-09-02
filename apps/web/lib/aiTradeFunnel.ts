@@ -59,7 +59,7 @@ export function funnelStages(funnel: AiTradeOpenFunnel | null | undefined): Funn
   const total = funnel.intents;
   const blocked = sumBlocked(funnel);
   const ratio = (n: number) => (total > 0 ? clamp01(n / total) : null);
-  return [
+  const stages: FunnelStage[] = [
     { key: "intents", label: "开仓意愿", count: total, ratio: total > 0 ? 1 : null, tone: "muted" },
     { key: "blocked", label: "被纪律拦下", count: blocked, ratio: ratio(blocked), tone: "short" },
     {
@@ -71,7 +71,19 @@ export function funnelStages(funnel: AiTradeOpenFunnel | null | undefined): Funn
     },
     { key: "submitted", label: "发出委托", count: funnel.submitted, ratio: ratio(funnel.submitted), tone: "accent" },
     { key: "filled", label: "真的成交", count: funnel.filled, ratio: ratio(funnel.filled), tone: "long" },
+    // ai-trade-loss-and-liveness-hardening E-7：与「真的成交」并列的**互斥末格**。合入前限价
+    // 开仓单 602 笔里 223 笔（37%）从未成交而被撤销——模型决定开、闸全放行、单也发出去了，
+    // 却在漏斗上不留痕，于是这张图系统性**高估**了「意愿 → 成交」的转化率。
+    // 后端未上线该键 ⇒ `undefined` ⇒ 本格 count 为 0 且不渲染（见下方 `filter`）。
+    {
+      key: "expired",
+      label: "挂单未成交即撤",
+      count: funnel.expired ?? 0,
+      ratio: ratio(funnel.expired ?? 0),
+      tone: "short",
+    },
   ];
+  return stages.filter((stage) => stage.key !== "expired" || funnel.expired != null);
 }
 
 export function sumBlocked(funnel: AiTradeOpenFunnel | null | undefined): number {

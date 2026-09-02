@@ -92,8 +92,10 @@ export default function AiTradeHorizonFields(props: AiTradeHorizonFieldsProps) {
         bar: props.bar,
         wakeMinutes: props.wakeMinutes,
         leverage: props.leverage,
+        // C-1：除数由 `GET /ai-trade/horizon-profiles` 下发；`0`（本轮默认）⇒ 那句提示不渲染。
+        wakeFloorDivisor: data?.wakeHorizonDivisor ?? 0,
       }),
-    [active, props.bar, props.wakeMinutes, props.leverage],
+    [active, props.bar, props.wakeMinutes, props.leverage, data?.wakeHorizonDivisor],
   );
 
   return (

@@ -33,6 +33,9 @@ export interface AiTradeHistoryEntry {
   feeUsd?: number;
   grossPnlUsd?: number;
   costBasisMixed?: boolean;
+  // ai-trade-loss-and-liveness-hardening E-6：混装到底占多少笔。`costBasisMixed` 只说得出「有」。
+  // **整键缺席**（老后端）与 `{net: n, gross: 0}` 是两个结论，故读点绝不用 `?? 0` 抹平。
+  costBasisCounts?: Record<string, number>;
 }
 
 export interface AiTradeHistoryListOut {
@@ -61,6 +64,8 @@ export interface AiTradeHistorySummary {
   feeUsd?: number;
   grossPnlUsd?: number;
   costBasisMixed?: boolean;
+  // E-6：同上（历史详情走 `response_model` 那条路，后端 schema 与这里两处都要有）。
+  costBasisCounts?: Record<string, number>;
   // 周期验收闭环（horizon-acceptance [P1-9]）：**后端合并各成员 run 的原始计数器后判定一次**，
   // 故这里恒是**一张**组级卡而不是 N 张（比例类指标不可在前端平均）。任一成员缺
   // `acceptanceInput`（本特性上线前的老记录）⇒ 两键缺席 ⇒ 整卡不渲染。

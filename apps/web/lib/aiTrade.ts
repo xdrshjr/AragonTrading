@@ -615,6 +615,20 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
     prefix: "low_consensus",
     label: "同向策略票数不足门槛，本轮不开新仓（平仓不受影响）",
   },
+  // ai-trade-loss-and-liveness-hardening E-1：LLM 决策落进 `trades.reason` 的三个**机器码**。
+  // 合入前那条通路把模型的中文 headline 原样塞进 `reason`，而写入点按 64 字节静默截断——实测
+  // 221 笔 LLM 平仓的长度**全部恰好 64**（半句话，且按字节切碎 UTF-8）。prose 一个字都没丢，
+  // 它完整存在于 `explain.headline`；这三行是「机器码 → 人话」的落点。
+  // ⚠️ 漏加不会报错，只会让成交列表显示一个裸英文码（本仓库已栽过的同款坑）。
+  { prefix: "agent_close", label: "AI 决策平仓" },
+  { prefix: "open_long", label: "AI 决策开多" },
+  { prefix: "open_short", label: "AI 决策开空" },
+  // 轴 D 的四条**结构性阻塞码**（`liveness.py` 的 `BLOCKING_CODES`）。它们不是降级码，但会出现
+  // 在活性横幅与轨迹上；放进同一张表使「码 → 人话」只有一份真源。
+  { prefix: "ma_band_unavailable", label: "均线通道数据不足，无法验证开单位置" },
+  { prefix: "mark_px_unavailable", label: "判定价不可用" },
+  { prefix: "feed_degraded", label: "行情通道已降级" },
+  { prefix: "llm_unavailable", label: "模型决策连续重试耗尽" },
 ];
 
 /** 研判深度档的默认值（与后端 `AI_TRADE_REASONING_DEPTH` 的默认档一致）。 */
@@ -669,6 +683,29 @@ export function describeDegradeReason(reason?: string | null): string {
   if (!hit) return reason;
   const suffix = reason.slice(hit.prefix.length);
   return suffix ? `${hit.label}${suffix}` : hit.label;
+}
+
+/**
+ * 成交行的「触发原因」文案（ai-trade-loss-and-liveness-hardening E-1 的**唯一**跨端契约变更）。
+ *
+ * 三条来源按优先级读，缺一不可：
+ *
+ * 1. `explain.headline` —— **新行的 prose 在这里**（未被截断，实测 520/520 行都有）；
+ * 2. `reason` 经 `describeDegradeReason` 中文化 —— 机器码行与既有五个短码
+ *    （`external_close` / `session_stop` / `profit_guard_*` / `offline_exit`）走这一条；
+ * 3. `reason` 原样 —— **老行**（64 字截断的中文 prose、无 headline）走这一条，它本身就是可读的。
+ *
+ * 缺三者 ⇒ `null`，调用方渲染破折号。**老行与新行必须都渲染得出可读文案**（`G-E3` 双向用例）。
+ */
+export function describeTradeReason(trade: {
+  reason?: string | null;
+  explain?: { headline?: string | null } | null;
+}): string | null {
+  const headline = trade.explain?.headline?.trim();
+  if (headline) return headline;
+  const reason = (trade.reason ?? "").trim();
+  if (!reason) return null;
+  return describeDegradeReason(reason) || reason;
 }
 
 /**
@@ -1568,4 +1605,9 @@ export const AI_TRADE_PAUSE_REASON_TEXT: Record<string, string> = {
   app_quit: "软件退出时自动暂停",
   process_restart: "上次未正常退出，已自动暂停",
   disabled_by_config: "本机已关闭 AI 自动交易，此会话只能结束归档",
+  // 本表此前**漏了 `resume_rollback`**（后端 `PAUSE_REASON_TEXT` 有它、类型联合也有它），
+  // 症状正是这张表自己的注释预言的那一句：「界面上就是空的」。顺手补齐。
+  resume_rollback: "继续失败，已退回暂停",
+  // ai-trade-loss-and-liveness-hardening 轴 D：活性看门狗自动停手（仓位一律保留、绝不平仓）。
+  liveness_blocked: "长时间无法开仓且零成交，已自动停手（仓位保留）",
 };

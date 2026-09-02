@@ -165,6 +165,13 @@ def _summarize_pairs(trips: list[_Trip], total_budget_usd: float) -> dict:
         "feeUsd": fee_total,
         "grossPnlUsd": gross_total,
         "costBasisMixed": len({t.cost_basis for t in trips}) > 1,
+        # E-6（ai-trade-loss-and-liveness-hardening）：`costBasisMixed` 是个布尔，说不出
+        # 「多少笔」——用户因此无法判断这份混装到底污染了多大比例的读数（实测 66/94 条有成交
+        # 的 run 全腿 fee==0）。**同一处现算**，绝不在第二处再判一次口径。
+        "costBasisCounts": {
+            "net": sum(1 for t in trips if t.cost_basis == "net"),
+            "gross": sum(1 for t in trips if t.cost_basis != "net"),
+        },
         "peakPnlUsd": peak_total,
         "capturedPnlUsd": captured_total,
         "captureRatio": captured_total / peak_total if peak_total > 0 else 0.0,

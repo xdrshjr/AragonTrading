@@ -81,6 +81,14 @@ async def _rebuild_request(row: dict, settings):
 
     延迟导入 `api.ai_auto` 是刻意的：那是唯一一条解析链的所在地，而 `api` 依赖 `ai_auto`——
     在函数体内导入既复用了它，又不制造模块层循环依赖（同 `manager._require_capacity` 的既有姿态）。
+
+    ⚠️ **冷续跑不经轴 A-1 互锁**（loss-and-liveness-hardening 评审 P0-3 / `G-A8` 冻结这一条）：
+    `_require_profit_exit_with_horizon` 落在 `ai_trade_start` **端点内**，本函数调用的是
+    `build_start_request` 本身，故那条 422 在这条路径上结构性地不可达。这不是疏忽而是设计：
+    下面的 `except HTTPException` 会把**任何** 422 一律翻成 409「启动契约已失效，无法继续」，
+    而生产里有 **50 条**「周期已装配 + 保护层未装配」的会话——把互锁挪进装配链，它们一旦暂停
+    就再也续不回来，而续不回来的会话可能正持有真实仓位。
+    互锁的职责是「不让新的致命会话被创建」，**不是「把已经存在的会话锁死」**。
     """
     from fastapi import HTTPException
 

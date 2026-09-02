@@ -1152,6 +1152,46 @@ class Settings(BaseSettings):
     ai_trade_intel_conflict_enabled: bool = True
     ai_trade_intel_conflict_min_overlap: float = Field(default=0.35, ge=0.1, le=0.9)
 
+    # ---- AI 自动交易 · 亏损根因与活性加固（ai-trade-loss-and-liveness-hardening §6.3，11 项）----
+    # 全部键须在**仓库根目录**的 `.env.example` 登记（G-Env 双向门禁）：prod 的 PyInstaller 后端
+    # 不读 `.env`、只读进程 env，而桌面壳按 `AI_TRADE_` 前缀透传——漏登记不会报错，只会让打包版的
+    # 运维旋钮**静默失效**（本仓库已为此栽过两次）。
+    #
+    # 轴 A 互锁总闸：「装了持仓周期锁却没有利润侧钥匙」这个致命组合不可被**新启动**（422）。
+    # 关 ⇒ 判据整段不执行、行为逐字节回退。判据**只在 `ai_trade_start` 端点内**求值，
+    # `build_start_request`（冷续跑复用它）一行不动——否则 50 条可能带着真实持仓的暂停会话
+    # 会被 409「启动契约已失效」永久锁死（评审 P0-3）。
+    ai_trade_require_profit_exit_with_horizon: bool = True
+    # 轴 B 总闸：浮亏解除三闸的豁免在**交易所侧止损已核实覆盖**时只解 G2/G3，不再解 G1。
+    # 关 ⇒ `RELEASE_LOSS` 恒全解（今日行为）。实测该通道 13 笔 −40.89 USDT，且全库聚合显示
+    # 它是历史上**唯一开过火**的豁免（其余四条一次都没触发过）。
+    ai_trade_loss_release_requires_uncovered: bool = True
+    # 轴 D 总闸：活性看门狗。关 ⇒ 不装配、`liveness` 整键缺席、WS 不发该事件，既有的
+    # `AI_TRADE_BASE_RULE_UNAVAILABLE`（第 3 轮那一条）逐字节照发。
+    ai_trade_liveness_enabled: bool = True
+    # 连续多少轮**同一个结构性阻塞码**且零成交后置 `degraded` 横幅 / 请求自动暂停（`0` = 该档关闭）。
+    # 阈值本轮**未经校准**：先建、先观测，下一轮按验收卡定值——任何文案都不得声称它「已校准」。
+    ai_trade_liveness_warn_rounds: int = Field(default=20, ge=0, le=10000)
+    ai_trade_liveness_halt_rounds: int = Field(default=60, ge=0, le=10000)
+    # 轴 C-1：与目标持仓相干的唤醒周期下限除数（`targetHoldMinSeconds / divisor`）。
+    # **默认 0 = 只观测不改行为**；下一轮按验收卡定值（建议 24）。
+    ai_trade_wake_horizon_divisor: int = Field(default=0, ge=0, le=1000)
+    # 轴 C-2：结构上不可能产生任何合法动作的轮次跳过 LLM 调用（默认关，先看观测）。
+    ai_trade_skip_round_when_gated: bool = False
+    # E-3：峰值浮盈追踪与利润保护层规则解耦。关 ⇒ `peak_pnl` 回到「保护层未装配即恒 NULL」
+    # ——那恰恰关掉了唯一能证明该开保护层的证据（实测 82.9% 为 NULL）。
+    ai_trade_peak_tracking_always: bool = True
+    # 轴 F：退出裁量权结论的最小样本；`0` ⇒ **恒不出结论**（`exitDiscretion` 整键缺席）。
+    ai_trade_exit_verdict_min_samples: int = Field(default=20, ge=0, le=10000)
+    # 轴 F：按结论自动收紧 `exit_priority` 配额。**本轮只建不开**，留给下一轮按验收卡定阈值。
+    ai_trade_exit_discretion_autotune_enabled: bool = False
+    # E-8：下单前可用保证金预检 ⇒ 逐档降档的总闸。**本轮只建不实现**——降档要改真实提交张数，
+    # 而 `LiveExecutor` 今天没有任何可用保证金读数（要预检就得在下单热路径上多打一发 REST，
+    # 而链路上已有 1152 次 429，见 §十一.7）。本轮的观测（`INSUFFICIENT_BALANCE` 进开仓漏斗）
+    # **与本键无关、恒生效**；置 `True` 当前**不改变任何一次真实提交**，且会在启动回执的
+    # `discipline.adjustments` 里被如实说出来（`sizing_runtime.margin_precheck_notice` 是唯一读点）。
+    ai_trade_sizing_margin_precheck: bool = False
+
     # ---- 信任边界（trust-boundary-and-signal-integrity D1 / §6.1）----
     # 逗号分隔的 Origin 白名单；空 = 用 `app/security/origins.py` 的 DEFAULT_ORIGINS。
     # 显式配置即**完全替换**默认（不做合并，避免「以为收紧了其实没有」）。

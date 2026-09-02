@@ -339,8 +339,16 @@ def _exposure_row(facts: DisciplineFacts) -> dict:
 def _profit_guard_row(facts: DisciplineFacts) -> dict:
     rule = facts.profit_rule
     if rule is None:
+        # ★ 轴 A-4（loss-and-liveness-hardening）：**「显示了但不作数」必须被说出来**。
+        # `hard_tp_return_pct` 的唯一消费点在 `profit_guard.py` 里；保护层未装配时，纪律预设
+        # 承诺的那个硬止盈逐字节不生效，而它照旧被渲染在启动弹窗的只读阈值表上——实测 45 条 run
+        # 正处于这个状态。阈值取**会话私有派生 settings**（预设的唯一真源），绝不另抄一份。
+        hard = float(getattr(facts.settings, "ai_trade_profit_guard_hard_tp_return_pct", 0.0) or 0.0)
+        inert = (f"本会话纪律预设承诺的「利润保护·硬止盈 {_pct(hard)}」也随之失效——"
+                 "它的唯一执行者就是本层。" if hard > 0 else "")
         return _base("profitGuard", False, source="rule",
-                     note="未装配 ⇒ 浮盈回吐不会触发保护性平仓。在弹窗「利润保护」分区开启。")
+                     note="未装配 ⇒ 浮盈回吐不会触发保护性平仓。在弹窗「利润保护」分区开启。"
+                          + inert)
     hard = rule.hard_tp_return_pct
     tail = f" / 硬止盈 {_pct(hard)}" if hard and hard > 0 else ""
     return _base("profitGuard", True, source="rule",
