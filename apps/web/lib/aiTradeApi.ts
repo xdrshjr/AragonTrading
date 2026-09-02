@@ -14,6 +14,7 @@ import type {
   AiTradeGroupStopResult,
   AiTradeMemberExitResult,
   AiTradePauseResult,
+  AiTradeAdoptOrphanResult,
   AiTradeRelinkResult,
   AiTradeResumePreview,
 } from "./aiTradeTypes";
@@ -99,6 +100,16 @@ export const aiTradeApi = {
     request<AiTradeRelinkResult>(
       `/ai-trade/${groupId}/member/${encodeURIComponent(instId)}/relink`,
       { method: "POST" },
+    ),
+  // 人工授权的**单次**孤儿持仓接管（fill-truth-and-effective-controls 轴 B）。
+  // `confirm: true` 是**后端强制**的二次确认（缺失即 400 `CONFIRM_REQUIRED`）：这是本轮唯一一个
+  // 会改写真实资金立场的端点，而它接管的是一笔来路不明的持仓。路径与既有五个成员端点同构
+  // ——多标的分组是既有能力，同一个 instId 可以同时出现在两个运行中的分组里，丢掉 groupId 会让
+  // 404 的语义在那时是错的。
+  adoptOrphan: (groupId: string, instId: string) =>
+    request<AiTradeAdoptOrphanResult>(
+      `/ai-trade/${groupId}/member/${encodeURIComponent(instId)}/adopt-orphan`,
+      { method: "POST", body: JSON.stringify({ confirm: true }) },
     ),
   // 当前活跃分组 + 是否启用（只读，重载后据此重连各成员 WS）。
   status: () => request<AiTradeGroupStatusResponse>("/ai-trade/status"),

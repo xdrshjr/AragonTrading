@@ -20,6 +20,7 @@ import {
   describeFeeRates,
   describeIdentityCheck,
   describeReconcile,
+  describeSettlementCoverage,
 } from "@/lib/aiTradeCost";
 import {
   horizonEstimatedNote,
@@ -133,6 +134,7 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
 
           <FeeSourceCard members={detail.members} />
           <ReconcileCard members={detail.members} />
+          <SizingCard members={detail.members} />
 
           <Section title="权益 / 回撤">
             {combinedEquity.length >= 2 ? (
@@ -163,7 +165,10 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
           {/* 方向分布（directional-symmetry 轴 D）：本页**没有** OpenFunnelCard（它只在 Live 页），
               故挂在这里。数据源是落库的 `aiStats.openFunnel`——与实时侧同形同源（`build_funnel_stats`
               整体带上 `bySide` / `directionBalance`，零 DB 迁移）。老记录缺键 ⇒ 整卡不渲染。 */}
-          <DirectionBalanceCard funnel={aiStats?.openFunnel} />
+          <DirectionBalanceCard
+            funnel={aiStats?.openFunnel}
+            contrarianBlocked={aiStats?.consensus?.contrarianBlocked}
+          />
           {/* 顺势 / 逆势（execution-trend-verdict §3.7.5）：数据源是**落库**的
               `aiStats.trendVerdict`——与实时页那张卡同形同源（同一次 `stats_wire()` 的产物，
               零 DB 迁移）。老记录缺键 ⇒ 整卡不渲染。 */}
@@ -294,6 +299,7 @@ function ReconcileCard({ members }: { members: AiTradeHistoryMember[] }) {
   const view = describeReconcile(rec);
   if (!view) return null;
   const identity = describeIdentityCheck(rec);
+  const coverage = describeSettlementCoverage(rec);
   return (
     <Section title="交易所对账">
       <div className="flex flex-col gap-1.5 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2" data-testid="ai-reconcile-card">
@@ -308,7 +314,89 @@ function ReconcileCard({ members }: { members: AiTradeHistoryMember[] }) {
           <Kpi label="交易所样本数" value={`${rec?.samples ?? 0} 笔`} />
           <Kpi label="本地往返数" value={`${rec?.localTrips ?? 0} 笔`} />
         </div>
+        {/* ★ 轴 A/F：结算覆盖率。整键缺席（一次外部平仓都还没发生 / 轴 A 未装配）⇒ 整行不渲染
+            ——绝不显示 `0/0`：「还没发生」与「发生了但一次都没拿到真值」是两件完全不同的事。
+            它是验收判据 `AC-1` 的唯一读点，也是上面那句差额说明的成因之一。 */}
+        {coverage && (
+          <p
+            className="text-[10px] leading-relaxed"
+            style={{
+              // 面色（`--long` / `--short` / `--accent`）**绝不能进 `color:`**——它们是给
+              // backgroundColor / borderColor 用的填充色，当文字色对比度不达标（仓库级门禁
+              // `contrastTokens.source.test.ts` 守着这条）。文字一律用墨色变体。
+              color: coverage.tone === "ok" ? "var(--long-ink)"
+                : coverage.tone === "warn" ? "var(--warn)" : "var(--muted)",
+            }}
+            data-testid="ai-settlement-coverage"
+          >
+            {coverage.text}
+          </p>
+        )}
         {identity && <p className="text-[10px] text-[var(--muted)]">{identity}</p>}
+      </div>
+    </Section>
+  );
+}
+
+/**
+ * 仓位求解卡（fill-truth-and-effective-controls 轴 C / G-2）。
+ *
+ * `quantizeErasedRounds` 在本轮之前**全仓零读点**：`sizing.py` 的模块 docstring 早已如实登记过
+ * 「第一档减速与相关性缩减在最常见断面上是 no-op」，但「暴露」那一半没做完——算出来了，没人
+ * 看得见。生产实测最新那一组 5 个成员上 `scaledRounds` 与 `quantizeErasedRounds` **逐个相等**
+ * （命中率 100%），ETH 那 13 轮的 `avgScaleRatio` 是 0.1846：风控层解出「只该开模型提议的
+ * 18%」，实际开出去的是 100%，超配 5.4 倍。
+ *
+ * `scaledRounds === 0` ⇒ 不渲染档位抹除那一行（绝不显示 `0/0`）；整段缺键 ⇒ 整卡不渲染。
+ */
+function SizingCard({ members }: { members: AiTradeHistoryMember[] }) {
+  const sizing = members.map((m) => m.metrics.aiStats?.sizing).find((s) => s) ?? null;
+  if (!sizing) return null;
+  const scaled = sizing.scaledRounds ?? 0;
+  const erased = sizing.quantizeErasedRounds ?? 0;
+  const zeroed = sizing.solvedZeroVetoes ?? 0;
+  const belowFloor = sizing.belowFloorVetoes ?? 0;
+  const kept = sizing.restingKept ?? 0;
+  const repriced = sizing.restingRepriced ?? 0;
+  const expired = sizing.restingExpired ?? 0;
+  return (
+    <Section title="仓位求解与挂单去留">
+      <div
+        className="flex flex-col gap-1.5 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2"
+        data-testid="ai-sizing-card"
+      >
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <Kpi label="本层缩减轮数" value={`${scaled}`} />
+          <Kpi
+            label="风控解出零"
+            value={`${zeroed} 轮`}
+            color={zeroed > 0 ? "var(--warn)" : undefined}
+          />
+          <Kpi label="保留原挂单" value={`${kept} 次`} />
+          <Kpi label="撤单重挂" value={`${repriced} 次`} />
+        </div>
+        {scaled > 0 && (
+          <p
+            className={erased > 0 ? "text-[10px] leading-relaxed text-[var(--warn)]"
+              : "text-[10px] leading-relaxed text-[var(--muted)]"}
+            data-testid="ai-sizing-quantize-erased"
+          >
+            档位吸附抹掉了 {erased}/{scaled} 次缩减
+            {erased >= scaled && scaled > 0
+              ? "——这一层每一次缩减都被档位地板原样吃了回去，改用更细的档位可让它真的作用到下单量上。"
+              : "。"}
+          </p>
+        )}
+        {belowFloor > 0 && (
+          <p className="text-[10px] text-[var(--muted)]">
+            另有 {belowFloor} 轮因解算仓位低于「最小一格 × 地板比例」而未开仓。
+          </p>
+        )}
+        {expired > 0 && (
+          <p className="text-[10px] text-[var(--muted)]">
+            其中 {expired} 笔挂单是到期未成交被自动撤销的。
+          </p>
+        )}
       </div>
     </Section>
   );
@@ -396,21 +484,28 @@ function AiStatsCard({
 }) {
   const [open, setOpen] = useState(false);
   const counts = aiStats.actionCounts ?? {};
+  // 轴 G-1：口径文案的唯一来源。老记录缺 `sampleScope` ⇒ 回退到合入前那句话（不谎报一个数）。
+  const scope = aiStats.sampleScope ?? "近 50 轮";
   return (
     <Section title="AI 决策概况">
       {/* E-3（realized-edge-calibration D-8）：`decisionRounds` 是**全程**真实轮数，而 `holdRate`
           的分母是最近 50 轮的保留样本——两个分母并排渲染而不标口径，用户读到的就是错的。
           口径直接写进 label 而不是 `title` 提示：悬停才可见的提示等于没显示（触屏与用例都读不到）。 */}
+      {/* ★ 轴 G-1：口径**取自后端下发的 `sampleScope`**，绝不在前端硬编码「近 50 轮」。
+          环形容量是后端 `_DECISIONS_MAX` 一个常量，写死在这里等于造出第二个会漂移的真源——
+          它一改，这三个标签就会集体开始说谎，而且不会有任何一处报错。老记录缺键 ⇒ 回退旧文案。 */}
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
         <Kpi label="决策轮数（全程）" value={`${aiStats.decisionRounds}`} />
-        <Kpi label="观望占比（近 50 轮）" value={fmtPct(aiStats.holdRate)} />
-        <Kpi label="平均置信度（近 50 轮）" value={fmtPct(aiStats.avgConfidence)} />
+        <Kpi label={`观望占比（${scope}）`} value={fmtPct(aiStats.holdRate)} />
+        <Kpi label={`平均置信度（${scope}）`} value={fmtPct(aiStats.avgConfidence)} />
         {/* `degradedRounds` 与 `holdRate` / `avgConfidence` 同源——都在 `_compute_ai_stats` 的
-            ≤50 条决策样本上求（`session.py` 的 `_DECISIONS_MAX`），**不是**全程计数。 */}
-        <Kpi label="共识降级（近 50 轮）" value={`${aiStats.degradedRounds} 轮`} />
+            保留决策样本上求（`session.py` 的 `_DECISIONS_MAX`），**不是**全程计数。 */}
+        <Kpi label={`共识降级（${scope}）`} value={`${aiStats.degradedRounds} 轮`} />
       </div>
       <p className="mt-1 text-[10px] leading-relaxed text-[var(--muted)]">
-        「全程」为会话完整轮数；「近 50 轮」取自决策保留样本（环形缓冲），两者在长会话上必然不等。
+        「全程」为会话完整轮数；「{scope}」取自决策保留样本（环形缓冲）
+        {aiStats.sampleRounds != null ? `，本会话实际留存 ${aiStats.sampleRounds} 条` : ""}
+        ，两者在长会话上必然不等。开仓漏斗那张卡的分母是「本会话全程累计」，与这里不是同一个。
       </p>
       <RealizedKpiGroup stats={aiStats.realized ?? null} />
       <HorizonKpiGroup stats={aiStats.horizon ?? null} />

@@ -132,24 +132,49 @@ class FeeLedger:
         return notional * self.leg_fee_bps(ord_type) / 1e4
 
     def on_trade(self, *, cl_ord_id: str | None, side: str, sz: float, px: float,
-                 ord_type: str, expected_px: float | None) -> dict:
+                 ord_type: str, expected_px: float | None,
+                 override_fee_usd: float | None = None) -> dict:
         """成交记录的四个费率加法键 + 顺带挂账待审计（`executor._make_trade` 的唯一调用点）。
 
         记账关闭 ⇒ 返回 `{}` ⇒ 四个键**整键缺席**（不是 `None`）⇒ `trade` 的键集合与本特性合入前
         完全相同（Z-5）。`expectedPx` 缺失时同样省略键（沿用 `clOrdId`/`ordId` 的既有风格）。
+
+        `override_fee_usd`（fill-truth-and-effective-controls 轴 A-4，**默认 None ⇒ 逐字回退**）：
+        这条腿的费率**已经从交易所拿到真值**，不要再按本地常数算。三处必须一起改，缺一处口径就
+        打架（评审 RV-P1-8）——
+
+        1. 返回的 `fee` 取它；
+        2. `self._session_fee_usd` 累加的**也必须是它**，否则 `costSnapshot.cost` 会与这条腿的
+           `fee` 不一致；
+        3. 返回的 `feeBps` 改为**按本腿名义值现算**（`fee / notional × 1e4`）而不是
+           `leg_fee_bps(ord_type)` 那个常数——`explain_meta_fields` 把 `feeUsd` 与 `feeBps` 一起写进
+           `meta`，两者不同源就会出现「费 0.31 而 bps 说 2.0」这种自相矛盾的一行。
+
+        `register()` 那一步不受影响：合成成交没有 `clOrdId`，`register` 首行就早退（无 `clOrdId`
+        的合成成交不挂账），故真值费率不会污染 fills 审计的校准样本。
         """
         if not self.params.accounting_enabled:
             return {}
         # RV-10：市价腿的 `expectedPx` 与 `price` 必然是同一个数（本仓库从不回查市价单的真实成交价），
         # 故滑点**只能**由 fills 审计产出，严禁试图从 trade 的 price/expectedPx 之差推导（那恒为 0）。
         expected = float(px if expected_px is None else expected_px)
-        fee = self.leg_fee(sz=sz, px=px, ord_type=ord_type)
+        model_fee = self.leg_fee(sz=sz, px=px, ord_type=ord_type)
+        fee = model_fee if override_fee_usd is None else _finite(override_fee_usd)
         self._session_fee_usd += fee
         self.register(cl_ord_id=cl_ord_id or "", direction=self._direction_for(side),
                       ord_type=ord_type, expected_px=expected, sz=_finite(sz),
-                      model_fee_usd=fee)
-        return {"fee": fee, "feeBps": self.leg_fee_bps(ord_type), "ordType": ord_type,
+                      model_fee_usd=model_fee)
+        fee_bps = (self.leg_fee_bps(ord_type) if override_fee_usd is None
+                   else self._bps_for(fee, sz=sz, px=px))
+        return {"fee": fee, "feeBps": fee_bps, "ordType": ord_type,
                 "expectedPx": expected}
+
+    def _bps_for(self, fee_usd: float, *, sz: float, px: float) -> float:
+        """真值费率 → 本腿名义值上的 bps；名义值不可算 ⇒ 回落 0.0（绝不用一个常数冒充实测）。"""
+        notional = _finite(sz) * _finite(px) * self.ct_val
+        if notional <= 0:
+            return 0.0
+        return round(_finite(fee_usd) / notional * 1e4, 6)
 
     def register(self, *, cl_ord_id: str, direction: str, ord_type: str,
                  expected_px: float, sz: float, model_fee_usd: float) -> None:
@@ -324,6 +349,8 @@ def trade_fee_fields(ledger: FeeLedger | None, **leg) -> dict:
     """`executor._make_trade` 的一行委托：账本未装配（live_auto 全部路径）⇒ `{}` ⇒ 键集合逐字回退。
 
     None 判定放在这里而不是调用点，是为了让 `executor.py`（已超 800 行红线）只留搬运、零业务分支。
+    `**leg` 直通 `FeeLedger.on_trade`，故新增的 `override_fee_usd` 无需在本函数里露面——但它的
+    三处落点必须同轮改，见 `on_trade` 的 docstring（评审 RV-P1-8）。
     """
     return {} if ledger is None else ledger.on_trade(**leg)
 

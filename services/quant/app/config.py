@@ -1241,6 +1241,69 @@ class Settings(BaseSettings):
     # `_status_payload()` 里不出现 `truthSources` 键。
     ai_trade_truth_sources_enabled: bool = True
 
+    # ==== AI 自动交易 · 成交真值化与「真正会生效」的风控层（fill-truth-and-effective-controls）====
+    # 本段 13 项的作用域全部是 AI 会话。九把闸（1/5/7/8/9/10/11/12/13）各自置回退档 ⇒ 对应链路
+    # **逐字节**回到 `ca40b6b`；四个参数（2/3/4/6）没有自己的回退档，回退由所属轴的总闸承担。
+    # 前缀 `AI_TRADE_` 是硬约束：`desktop/src/lib/config.js` 的后端 env 透传白名单是**前缀式**的，
+    # 而打包后端不读 `.env`、只读进程 env——换个前缀等于这把开关在唯一的产品形态里按不下去。
+
+    # ---- 轴 A：外部平仓的价格与费率向交易所要（settlement truth）----
+    # 1) 总闸。关 ⇒ `LiveExecutor` 的 `settling` 状态机**整条不存在**，`_on_reconcile_ok` 走今天的
+    #    立即合成（按本地 `mark_px` 捏价）。默认 True 的理由：它修的是一条**已经在报假数**的通路
+    #    （生产实测本地账本比交易所少报 24.6% 的真实亏损），且 fail-safe 方向就是今天的行为。
+    ai_trade_settlement_truth_enabled: bool = True
+    # 2) 侦测到「交易所已平仓」之后，最多等多久去取回结算价；到点即按侦测那一刻的 `mark_px` 落账。
+    #    绝不把一条已经发生的平仓留在中间态里（R-1 的第一重保险）。
+    ai_trade_settlement_deadline_s: float = Field(default=90.0, gt=0, le=600)
+    # 3) 等待期间的取数节流。`_settling` 为空时**一个请求都不发**（镜像 `audit_fills` 的短路）。
+    ai_trade_settlement_poll_interval_s: float = Field(default=8.0, gt=0, le=60)
+    # 4) 结算行匹配的时间窗容差（秒），覆盖本地墙钟与交易所时钟的现实偏差。
+    ai_trade_settlement_match_tol_s: int = Field(default=60, ge=0, le=3600)
+
+    # ---- 轴 B：交易所侧存在应用不知道的持仓（孤儿持仓）----
+    # 5) 总闸。关 ⇒ `_on_reconcile_ok` 的对称分支整条不存在。默认 True：本轴**只写状态与事件、
+    #    零交易所写请求**（不变式 I-4），风险面为零。
+    ai_trade_orphan_detect_enabled: bool = True
+    # 6) 连续多少轮判定成立才转 `confirmed`（≈15s @ 盯市 5s）。它是 `_fill_grace` 的镜像：那一条
+    #    防「刚开的仓交易所还没跟上」，这一条防「刚下的开仓单成交了、本地还没接管」。
+    ai_trade_orphan_confirm_rounds: int = Field(default=3, ge=1, le=60)
+    # 7) `confirmed` 时是否连带把该标的的开仓路径钉死。关 ⇒ 只告警不封锁。默认 True：在一笔无人
+    #    看管的持仓上再叠一笔自动仓位，是本轮能想到的最坏结果。
+    ai_trade_orphan_block_open: bool = True
+
+    # ---- 轴 C：档位量化不得把「风控解出零」翻译成「开最小一格」----
+    # 8) `f_raw` 精确为 0 ⇒ 不开这一单（而不是被 `quantize_size_fraction` 的 `max(1, …)` 抬到最小
+    #    一格）。这是本轮**唯一**默认开启的真实下单行为收紧，方向单调——只可能少开一单。
+    #    `corr_scale ∈ [0,1]`、`brake_mult ∈ (0,1]`，解出精确的 0 只有一个含义：风险预算为零。
+    ai_trade_sizing_zero_is_veto: bool = True
+    # 9) `0 < f_raw < step × ratio` 也否决。**默认 0.0 = 该判据逐字不存在**：它会把「解出 0.19 而
+    #    最小格是 0.5」这类断面也变成不开仓，杀伤面比上一条大得多，合适的比值需要先有
+    #    `belowFloorVetoes` 的观测数据。
+    ai_trade_sizing_floor_ratio: float = Field(default=0.0, ge=0, lt=1)
+
+    # ---- 轴 D：逆势通路的强制降档改用档位语义（掉一格）----
+    # 10) **一把闸管两处是刻意的**：`signals.resolve_consensus_gate` 与
+    #     `trend_verdict.apply_trend_bias_gate` 的降档段是逐字同构的两份，且后者**排在前者之前**。
+    #     分开回退只会造出「一半修好一半没修」这种最难归因的状态。关 ⇒ 两处同时退回乘性降档。
+    ai_trade_contrarian_gear_downgrade: bool = True
+
+    # ---- 轴 E：限价挂单的 TTL 必须与判定它的那个时钟同源 ----
+    # 11) `_enter_resting` 今天用**决策轮的 `ts`** 盖 `created_ts`，而确认根唤醒里那个 `ts` 是
+    #     **K 线开盘时间戳**；`is_expired` 却与盯市循环的**墙钟**比。15m 根 + TTL 300s ⇒ 挂单
+    #     出生即过期，下一个盯市 tick（2~5s）立刻撤掉——生产实测 5 次同价重挂里有 2 次就是它，
+    #     且状态文案还在对用户说「300s 未成交则自动撤销」。置 True ⇒ TTL 一律按墙钟起算（与
+    #     判定它的那个时钟同源）；置 False ⇒ 逐字回退今天的双时钟行为。
+    ai_trade_resting_ttl_wall_clock: bool = True
+
+    # ---- 轴 F：终态对账不得无条件报「已对上」----
+    # 12) `final` 分支今天恒返回 `ok`，于是 6 条合计 7.41 USDT 差额的记录顶着绿色徽章，而同一行
+    #     正文写着「差 +1.528 USDT」——产品在自相矛盾。伪阳性（刚平的那一笔结算延迟）由既有的
+    #     `coverageMismatch ⇒ partial` 分支单独接住，实测那 6 条全部 `mismatch=False`。
+    ai_trade_reconcile_final_verdict_strict: bool = True
+    # 13) 容差按本金收紧的比例。**默认 0.0 ⇒ 容差公式逐字等于今天**：不与上一条同时收紧两个判据，
+    #     否则轴 A 的效果无法归因。
+    ai_trade_reconcile_capital_tol_ratio: float = Field(default=0.0, ge=0, le=1)
+
     # ---- 信任边界（trust-boundary-and-signal-integrity D1 / §6.1）----
     # 逗号分隔的 Origin 白名单；空 = 用 `app/security/origins.py` 的 DEFAULT_ORIGINS。
     # 显式配置即**完全替换**默认（不做合并，避免「以为收紧了其实没有」）。
@@ -1514,6 +1577,30 @@ class Settings(BaseSettings):
                 f"AI_TRADE_LOG_HTTP_CLIENT_LEVEL({self.ai_trade_log_http_client_level!r}) "
                 "不是一个合法的日志级别名（DEBUG/INFO/WARNING/ERROR/CRITICAL）："
                 "写错时它会静默回落 WARNING，而你以为自己已经恢复了 INFO")
+        return self
+
+    @model_validator(mode="after")
+    def _check_settlement_window(self) -> "Settings":
+        """结算等待窗的跨字段不变式（fill-truth-and-effective-controls 轴 A）—— 启动即 fail-fast。
+
+        ``ai_trade_settlement_poll_interval_s`` 必须 **<** ``ai_trade_settlement_deadline_s``：
+        节流间隔 ≥ 死线时，`_settling` 从建立到到期之间**一次取数都发不出去**，于是轴 A 100%
+        静默空转——每一笔外部平仓照旧按本地 `mark_px` 落账，而 `settlementCoverage.ratio` 只会
+        显示一个 0，没人能从中读出原因。范式沿用同文件既有的
+        ``alert_pending_ttl_s ≥ 2 × live_auto_poll_interval_s``：**绝不允许一条永远不会被求值的
+        配置存在**（这正是评审 RV-P1-2 在挂单 TTL 上钉死过一次的同一个形状）。
+
+        Raises:
+            ValueError: 节流间隔 ≥ 死线（构造期即失败）。
+        """
+        poll = float(self.ai_trade_settlement_poll_interval_s)
+        deadline = float(self.ai_trade_settlement_deadline_s)
+        if poll >= deadline:
+            raise ValueError(
+                f"AI_TRADE_SETTLEMENT_POLL_INTERVAL_S({poll}) 必须 < "
+                f"AI_TRADE_SETTLEMENT_DEADLINE_S({deadline})：节流间隔不小于死线时，"
+                "结算等待窗内一次取数都发不出去，整条成交真值化会静默空转（外部平仓仍按本地"
+                "标记价入账），而界面上只会显示一个没有解释的覆盖率 0")
         return self
 
     def allowed_origin_list(self) -> list[str]:

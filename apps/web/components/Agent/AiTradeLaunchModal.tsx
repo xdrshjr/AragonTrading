@@ -43,6 +43,10 @@ import {
   validateTrendRule,
   validateWakeInterval,
 } from "@/lib/aiTrade";
+import {
+  describeGearResolution,
+  gearResolutionNote,
+} from "@/lib/aiTradeGearResolution";
 import { validateHorizon } from "@/lib/aiTradeHorizon";
 import { aiTradeDisciplineApi, aiTradeHorizonApi } from "@/lib/aiTradeHorizonApi";
 import {
@@ -250,6 +254,12 @@ export default function AiTradeLaunchModal({
   const [takeProfitPctRaw, setTakeProfitPctRaw] = useState(pctToRaw(defaultTakeProfitPct));
   const [roundsRaw, setRoundsRaw] = useState(String(defaultContextRounds || AI_TRADE_DEFAULT_CONTEXT_ROUNDS));
   const [positionStep, setPositionStep] = useState(defaultPositionStepPct || AI_TRADE_DEFAULT_POSITION_STEP);
+  // 轴 C-2：这个档位会让哪几层风控在多少格上完全失效。`null` ⇒ 整条警示不渲染（细档位上本就
+  // 没什么可说的）。判定纯前端、零后端往返——它必须在用户按下「启动」**之前**就在屏幕上。
+  const gearNote = useMemo(
+    () => gearResolutionNote(describeGearResolution(positionStep)),
+    [positionStep],
+  );
   // Agent 墙钟定时唤醒周期（分钟，仅实盘段）：初值取 defaultWakeIntervalMinutes（用 ?? 保留 0=关闭偏好）。
   const [wakeIntervalRaw, setWakeIntervalRaw] = useState(
     String(defaultWakeIntervalMinutes ?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN),
@@ -1224,6 +1234,25 @@ export default function AiTradeLaunchModal({
             可用档位：{positionLadder(positionStep).map((g) => `${Math.round(g * 100)}%`).join(" / ")}；档位仅约束
             <strong className="text-[var(--text)]">开仓规模</strong>（非分批加/减仓，平仓为全平），AI 每次开仓将吸附到最近的合法档位。
           </span>
+          {/*
+            档位分辨率警示（fill-truth-and-effective-controls 轴 C-2 落点 ①）。
+
+            这段文字**必须在点「启动」之前就出现**，不是启动之后的回执：档位是一个一旦选定就会
+            静默作用一整个会话的东西。生产实测 `positionStepPct = 0.5` 占全库 147 条 run 的
+            88.4%，而在那一档上「回撤刹车第一档」「逆势通路强制降档」「相关性缩减」三者的缩减
+            会被量化吸附回原值——最新那一组 5 个成员上 `scaledRounds` 与 `quantizeErasedRounds`
+            逐个相等，命中率 100%。此前界面对此只字不提。
+
+            判据与后端 `gear_resolution.describe_gear_resolution` 逐字同构（门禁 G-C5 冻结）。
+          */}
+          {gearNote && (
+            <span
+              data-testid="gear-resolution-warning"
+              className="rounded border border-[var(--warn)] bg-[var(--surface-2)] px-2 py-1 leading-relaxed text-[var(--warn)]"
+            >
+              {gearNote}
+            </span>
+          )}
         </label>
 
         {/* Agent 唤醒周期（仅实盘段）：在「确认 K 线 / 策略触发 → 决策」之外叠加墙钟定时唤醒；回测走逐根决策、

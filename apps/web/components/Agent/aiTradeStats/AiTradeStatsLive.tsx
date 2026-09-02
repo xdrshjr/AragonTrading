@@ -157,6 +157,10 @@ export default function AiTradeStatsLive({
 
   // §3.2 双栏骨架：左栏承载统计数据（起始提示 / 运行观测 / KPI 概览 / 预计年化 / 持仓浮盈），
   // 右栏承载交易记录（倒序完整往返，可展开行内 K 线）。窄屏（<md）上下堆叠。左右各自 `overflow-y-auto`。
+  // 轴 G-1：口径文案的唯一来源（成员级 status 与落库 aiStats 同源）。缺键 ⇒ 回退旧文案。
+  const sampleScope = Object.values(group.members)
+    .map((m) => m.session?.sampleScope)
+    .find((v) => v) ?? "近 50 轮";
   return (
     <div className="flex min-h-0 flex-1 gap-4 max-md:flex-col">
       <aside className="flex w-[40%] shrink-0 flex-col gap-3 overflow-y-auto pr-1 max-md:w-full max-md:overflow-visible">
@@ -186,8 +190,13 @@ export default function AiTradeStatsLive({
           </p>
         )}
         <div className="flex flex-col gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2">
-          <p className="text-[10px] text-[var(--muted)]">
-            运行观测 · 反思计数为近 50 轮样本口径；唤醒抑制 / 连续观望为会话级实时值
+          {/* ★ 轴 G-1（G-G2 的第二个读点）：口径取自后端下发的 `sampleScope`，绝不硬编码。
+              这一屏与开仓漏斗那张卡并排出现，而两者的分母不是同一个——漏斗是「本会话全程累计」，
+              这里是保留的决策样本。两个分母各自带标签，否则用户读到的就是错的（生产实测
+              run 1627 因此显示「484 轮里 100% 观望」，而真相是想开 117 次、被拦 106 次）。 */}
+          <p className="text-[10px] text-[var(--muted)]" data-testid="ai-live-sample-scope">
+            运行观测 · 反思计数为{sampleScope}样本口径；唤醒抑制 / 连续观望为会话级实时值
+            （开仓漏斗按本会话全程累计，与此处不是同一个分母）
           </p>
           {Object.values(group.members).map((m) => (
             <MemberObservabilityRow key={m.instId} member={m} />
@@ -237,7 +246,11 @@ export default function AiTradeStatsLive({
         {/* 方向分布（directional-symmetry 轴 D）：紧贴漏斗卡下方——两者是同一个问题的两半，
             漏斗说「被哪一层拦下」，本卡说「拦掉的是哪个方向」。老会话 / 总闸关 ⇒ 整卡不渲染。 */}
         {Object.values(group.members).map((m) => (
-          <DirectionBalanceCard key={`dir-${m.instId}`} funnel={m.session?.openFunnel} />
+          <DirectionBalanceCard
+            key={`dir-${m.instId}`}
+            funnel={m.session?.openFunnel}
+            contrarianBlocked={m.session?.contrarianBlocked}
+          />
         ))}
         {/* 顺势 / 逆势（execution-trend-verdict §3.7.5）：紧贴方向分布卡下方——两张卡是同一
             问题的两个切面（「多空意愿比」vs「顺势逆势比与各自的成绩」）。数据源同为**成员级

@@ -1,6 +1,7 @@
 // AI 自动交易 wire 类型（camelCase，与后端 schemas.py 的 AiTrade* 同构）。
 // 运行期句柄（sessionId 等）为瞬态（store 不入 partialize）；aiTradeConfig 为持久化偏好。
 import type { FeeRatesWire, ReconcileWire } from "./aiTradeCost";
+import type { AiTradeContrarianBlocked } from "./aiTradeHistoryTypes";
 import type { AiTradeRealizedStats } from "./aiTradeProfitability";
 import type {
   PaperPositionEvent,
@@ -1334,6 +1335,30 @@ export interface AiTradeSessionRow {
   // **两个接口都要声明**：只声明一处会让另一条通路上的横幅恒不渲染（`trendVerdict` 的同款教训）。
   // 总闸关 / 老后端 ⇒ 整键缺席 ⇒ 横幅整段不渲染。
   liveness?: AiTradeLiveness | null;
+  // ---- fill-truth-and-effective-controls 轴 A / B（两个接口都要声明）----
+  // **两处都加**是硬要求：REST 成员行取自 `session.info()`、WS `status` 经
+  // `patchAiTradeMemberStatus` 的整体 spread 合并进 `m.session`。只声明一处会让另一条通路上的
+  // 芯片/横幅恒不渲染——那正是 `trendVerdict` 与 `liveness` 已经各付过一次代价的教训。
+  /**
+   * 轴 A：交易所侧已平仓、正在取回真实结算价的中间态。未决态不存在 ⇒ 整键缺席 ⇒ 芯片不渲染。
+   *
+   * 这枚芯片是**必需的而不是可选的**：`settling` 期间一切出站平仓被短路，用户点「手动平仓」
+   * 会得到一句「本轮不发平仓单」；如果界面还写着「持有中」，那句话就变成了一个无法解释的拒绝。
+   */
+  settling?: AiTradeSettling | null;
+  /** 轴 B：交易所侧存在本会话不知道的持仓。`state === "none"` ⇒ 后端整键省略 ⇒ 横幅不渲染。 */
+  orphan?: AiTradeOrphan | null;
+  /**
+   * 轴 G-1：`actionCounts` / `holdRate` / `avgConfidence` 这一族读数的分母口径文案。
+   *
+   * 数字取自后端的环形容量常量（`session._DECISIONS_MAX`），**绝不在前端硬编码**——写死一个
+   * 50 等于造出第二个会漂移的真源，它一改这些标签就会集体开始说谎且不报任何错。老后端缺键
+   * ⇒ 前端回退到合入前那句文案。
+   */
+  sampleScope?: string;
+  sampleRounds?: number;
+  /** 轴 D-2：逆势通路五格细分（与落库的 `aiStats.consensus.contrarianBlocked` 同形同源）。 */
+  contrarianBlocked?: AiTradeContrarianBlocked | null;
   // 真值源计数摘要（silent-degradation-repair 轴 E / §11.2）：**只带三行**——`intelReader`
   // 的真源是一次 async DB 读，而后端 `_status_payload()` 是同步方法，它进不去，只走 REST。
   // 故 `trackedCount` 恒为 3，顶栏文案必须写「3 项真值源中 N 项降级」而不是「真值源 N 项降级」
@@ -1423,6 +1448,30 @@ export interface AiTradeStatusEvent {
   // **两个接口都要声明**：只声明一处会让另一条通路上的横幅恒不渲染（`trendVerdict` 的同款教训）。
   // 总闸关 / 老后端 ⇒ 整键缺席 ⇒ 横幅整段不渲染。
   liveness?: AiTradeLiveness | null;
+  // ---- fill-truth-and-effective-controls 轴 A / B（两个接口都要声明）----
+  // **两处都加**是硬要求：REST 成员行取自 `session.info()`、WS `status` 经
+  // `patchAiTradeMemberStatus` 的整体 spread 合并进 `m.session`。只声明一处会让另一条通路上的
+  // 芯片/横幅恒不渲染——那正是 `trendVerdict` 与 `liveness` 已经各付过一次代价的教训。
+  /**
+   * 轴 A：交易所侧已平仓、正在取回真实结算价的中间态。未决态不存在 ⇒ 整键缺席 ⇒ 芯片不渲染。
+   *
+   * 这枚芯片是**必需的而不是可选的**：`settling` 期间一切出站平仓被短路，用户点「手动平仓」
+   * 会得到一句「本轮不发平仓单」；如果界面还写着「持有中」，那句话就变成了一个无法解释的拒绝。
+   */
+  settling?: AiTradeSettling | null;
+  /** 轴 B：交易所侧存在本会话不知道的持仓。`state === "none"` ⇒ 后端整键省略 ⇒ 横幅不渲染。 */
+  orphan?: AiTradeOrphan | null;
+  /**
+   * 轴 G-1：`actionCounts` / `holdRate` / `avgConfidence` 这一族读数的分母口径文案。
+   *
+   * 数字取自后端的环形容量常量（`session._DECISIONS_MAX`），**绝不在前端硬编码**——写死一个
+   * 50 等于造出第二个会漂移的真源，它一改这些标签就会集体开始说谎且不报任何错。老后端缺键
+   * ⇒ 前端回退到合入前那句文案。
+   */
+  sampleScope?: string;
+  sampleRounds?: number;
+  /** 轴 D-2：逆势通路五格细分（与落库的 `aiStats.consensus.contrarianBlocked` 同形同源）。 */
+  contrarianBlocked?: AiTradeContrarianBlocked | null;
   // 真值源计数摘要（silent-degradation-repair 轴 E / §11.2）：**只带三行**——`intelReader`
   // 的真源是一次 async DB 读，而后端 `_status_payload()` 是同步方法，它进不去，只走 REST。
   // 故 `trackedCount` 恒为 3，顶栏文案必须写「3 项真值源中 N 项降级」而不是「真值源 N 项降级」
@@ -2184,6 +2233,61 @@ export interface AiTradeLiveness {
   advice: string;
 }
 
+// ============ 成交真值化与孤儿持仓（ai-trade-fill-truth-and-effective-controls 轴 A / B）============
+
+/**
+ * `POST /ai-trade/{gid}/member/{inst}/adopt-orphan` 的回执（轴 B）。
+ *
+ * 端点**不绑 `response_model`**（那会静默吞掉新 wire 键，是本仓库出过事的形态），故本类型是
+ * 一份如实镜像而不是契约来源。
+ */
+export interface AiTradeAdoptOrphanResult {
+  ok: boolean;
+  adopted?: boolean;
+  instId?: string;
+  qty?: number;
+  avgPx?: number;
+  posSide?: string;
+  entryTs?: number;
+  source?: string;
+}
+
+/**
+ * 结算中间态（fill-truth-and-effective-controls 轴 A）。
+ *
+ * 今天 `LiveExecutor` 侦测到「本地有仓、交易所没仓」时会**按本地 `mark_px` 合成**一条平仓成交
+ * ——代码自己的注释把这件事叫做「按 mark_px 捏造盈亏」。生产实测 20 条有交易所结算读数的 run
+ * 上，本地账本比交易所可比口径少报了 24.6% 的真实亏损。本轮把「用哪个价落这条腿」的决定推迟到
+ * 能拿到真值为止，这个 dataclass 就是那段等待。
+ */
+export interface AiTradeSettling {
+  active: boolean;
+  /** 侦测到交易所侧已平仓的那一秒。 */
+  detectTs: number;
+  /** 墙钟死线；到点即按 `markPx` 落账（绝不把一条已经发生的平仓留在中间态里）。 */
+  deadlineTs: number;
+  /** 侦测那一刻的本地标记价（落不到真值时就用它，逐字等于今天的行为）。 */
+  markPx: number;
+  waitedS: number;
+}
+
+/**
+ * 孤儿持仓（fill-truth-and-effective-controls 轴 B）。
+ *
+ * `_on_reconcile_ok` 今天全文只有「本地有仓、交易所没仓」这一个方向，**没有对称的那一半**。
+ * 后果是一笔因撤单竞态 / 部分成交 / 用户手工下单而出现在交易所的持仓，对整条自动交易链完全
+ * 不可见——不受持仓周期闸管、不受利润保护管、不受活性看门狗管。
+ */
+export interface AiTradeOrphan {
+  /** `pending` = 看见了但还没连续够轮数（不推事件、不封锁开仓）；`confirmed` = 已确认。 */
+  state: "pending" | "confirmed";
+  qty: number;
+  avgPx?: number;
+  uplUsd?: number;
+  /** 第一次判定成立的那一秒。 */
+  sinceTs: number;
+}
+
 export interface AiTradeOpenFunnel {
   intents: number;
   blocked: Record<string, number>;
@@ -2297,6 +2401,15 @@ export interface AiTradeTrendGate {
   sizeMult: number;
   sizeBefore: number | null;
   sizeAfter: number | null;
+  /**
+   * 强制降档走的是哪条通路（fill-truth-and-effective-controls 轴 D）。
+   *
+   * `mult` = 乘性降档（今日行为，也是总闸关时的回退档）；`gear` = 在档位阶梯上下调一档；
+   * `floor_is_min` = 已经在最低格，视为已降档并放行。**渲染必须读它**：轴 D 之后
+   * 「×{sizeMult}」这句话只在 `mult` 上成立，而 `floor_is_min` 上 `sizeBefore === sizeAfter`。
+   * 老会话 / 总闸关 ⇒ 整键缺席 ⇒ 逐字回退旧文案（那时它是对的）。
+   */
+  downgradeLane?: "mult" | "gear" | "floor_is_min" | null;
   reason: string | null;
 }
 

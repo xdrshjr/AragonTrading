@@ -61,6 +61,10 @@ export const AI_TRADE_DEFAULT_POSITION_STEP = 0.25;
 // 弹窗预设档位（[R-6] 仅 10/20/25/50/100%，**不含**「连续/AI 自由」——需求明确判定该行为错误）。
 // value 为 fraction 步长；连续（step=0）仅作后端零回归默认 + API 退出口，不在此露出。
 export const AI_TRADE_POSITION_STEP_OPTIONS: { value: number; label: string }[] = [
+  // fill-truth-and-effective-controls 轴 C-3：只**加**一档更细的，`AI_TRADE_DEFAULT_POSITION_STEP`
+  // 一个字节不动（改默认值会让全仓上百条冻结断言与用户已落盘的偏好一起动）。加它的理由是
+  // 轴 C-2 的那句警示需要有一个「改用更细的档位」可以真的点进去。
+  { value: 0.05, label: "每档 5%（5/10/…/100%）" },
   { value: 0.1, label: "每档 10%（10/20/…/100%）" },
   { value: 0.2, label: "每档 20%（20/40/…/100%）" },
   { value: 0.25, label: "每档 25%（25/50/75/100%）" },
@@ -501,6 +505,10 @@ export function describeTraceState(trace: {
 // 降级原因的中文前缀映射（ai-trade-base-strategy-ma-band P1-9）：键为**码前缀**，因为基础策略的码带
 // 参数后缀（`base_rule_ma_band(pctB=0.42)`，与既有 `low_consensus(k/n)` 同风格）。
 const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
+  // 孤儿持仓（fill-truth-and-effective-controls 轴 B）：交易所侧存在一笔本会话不知道的持仓时，
+  // 该标的的开仓路径被钉死。它是**事实性**阻断而不是一条可以权衡的门槛，故排在表首；与既有
+  // 任何前缀都不撞（本表用 `find(startsWith)`、顺序敏感）。
+  { prefix: "orphan_position_blocked", label: "交易所侧存在未接管持仓：已暂停该标的的自动开仓" },
   { prefix: "base_rule_ma_band_direction", label: "基础策略否决：方向与所处均线锚区不符" },
   { prefix: "base_rule_band_unavailable", label: "基础策略否决：均线通道数据不足，无法验证开单位置" },
   { prefix: "base_rule_ma_band", label: "基础策略否决：开单价不在均线通道上/中/下轨附近" },
@@ -508,6 +516,11 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
   // ⚠️ `exit_priority_*` / `exit_adjudicated` / fail-open 三类是**放行码**，一律不进 degrade，
   // 故此处**不加**它们的条目——把放行塞进降级表会让闸计数把一次成功离场记成一次被拦。
   { prefix: "exit_order_slot_busy", label: "本轮未平成：原挂单撤销未获确认，已保留挂单待下轮核对" },
+  // 成交真值化（fill-truth-and-effective-controls 不变式 I-2b）：仓位在交易所侧**已经不在了**，
+  // 此刻再发一张平仓单只会换回一个 LIVE_NO_POSITION，而那条良性分支会按标记价抢先落一次账 ⇒
+  // 与随后的结算落账双记已实现盈亏。它与 `exit_order_slot_busy` 同族——都是「本轮真的没平成」，
+  // 故同样进 degrade；没有这条标签，界面上会出现一串生的机器码。
+  { prefix: "settlement_pending", label: "本轮未平成：该持仓已在交易所侧平掉，正在取回真实结算价" },
   // 利润保护三码：它们不是「降级」而是**系统主动平仓**的成交原因，但同样会出现在成交列表的原因位上。
   // §六.1b：**不写「已锁定利润」**——码本身不含盈亏符号，保本线触发 / 滑点不利时这笔可能打平甚至
   // 净亏；具体金额由成交行的 pnl 呈现，这里只说触发了什么规则。

@@ -18,6 +18,7 @@ import {
   summarizeDisciplines,
 } from "@/lib/aiTradeDiscipline";
 import AiTradeLivenessBanner from "@/components/Agent/AiTradeLivenessBanner";
+import AiTradeOrphanBanner from "@/components/Agent/AiTradeOrphanBanner";
 import AiTradeMemberRow from "./AiTradeMemberRow";
 import { AiTradeIntelButton } from "./AiTradeIntelButton";
 import { AiTradeExitCard } from "./AiTradeExitCard";
@@ -175,6 +176,13 @@ export default function AiTradePanel({
           「没武装」＞「武装了但结构上长期开不出仓」＞「这个周期本来就很难开出仓」。
           总闸关 / 老后端 / 一切正常 ⇒ 整段不渲染。 */}
       <AiTradeLivenessBanner members={members} />
+      {/* 孤儿持仓（fill-truth-and-effective-controls 轴 B）：排在活性横幅**之后**、行情自愈卡
+          **之前**。顺序理由与上面同源——「交易所侧有一笔我们不知道的真实持仓」比「行情通道抖动」
+          更该先被看见：前者是一笔无人看管的真钱，后者只是观测降级。总闸关 / 无孤儿 ⇒ 不渲染。 */}
+      <AiTradeOrphanBanner
+        members={members}
+        onAdopt={(instId) => aiTradeApi.adoptOrphan(group.groupId, instId).then(() => undefined)}
+      />
       <AiTradeFeedRecoveryCard groupId={group.groupId} members={members} />
 
       {/* 可交易性红条 + 长期记忆停摆徽标（tradability-and-open-funnel 轴 A / 轴 D）。

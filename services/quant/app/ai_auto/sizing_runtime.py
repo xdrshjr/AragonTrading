@@ -27,6 +27,7 @@ from .drawdown_brake import (
 )
 from .exposure_book import GroupExposureBook, exposure_wire
 from .sizing import (
+    SizingFloorPolicy,
     SizingInputs,
     SizingOutcome,
     SizingRule,
@@ -34,6 +35,7 @@ from .sizing import (
     StopRule,
     annual_to_bar_vol,
     apply_size_fraction,
+    parse_floor_policy,
     parse_sizing_rule,
     parse_stop_rule,
     realized_vol_bar,
@@ -47,6 +49,17 @@ from .stats_ext import build_sizing_stats, merge_sizing_stats
 _GATED_ACTIONS = ("open_long", "open_short")
 _ACTION_SIDE = {"open_long": "long", "open_short": "short"}
 _EPS = 1e-12
+
+
+def _to_hold(decision, verdict: str):
+    """地板否决 ⇒ hold（构造出的 hold 与其余各闸的否决产物**逐字同形**，轴 C-1）。
+
+    降级码带 `sizing_` 前缀是刻意的：它**不进 `openFunnel.blocked`**——`note_sizing` 判的就是
+    `size_fraction is None or <= 0`，会把它正确落进既有的 `sizing_zeroed` 那一格，而那一格按成文
+    纪律不是一道闸（镜像 `contrarianPassed` 的同一条理由）。这里只负责让 `action` 不再是 `open_*`。
+    """
+    return replace(decision, action="hold", size_fraction=None,
+                   reason=f"sizing_{verdict}")
 
 
 # ============================ `executor.risk` 的唯一写点（[P0-1]）============================
@@ -160,6 +173,11 @@ class _Counters:
     # 结构已经彻底不可行」——只报前者会让后者永远看不见（[P0-2]）。
     stop_floored_rounds: int = 0
     floor_above_cap_rounds: int = 0
+    # 轴 C-1（fill-truth-and-effective-controls）：风控层解出**零**而被否决的轮数 / 解出一个低于
+    # 「最小一格 × floor_ratio」的正数而被否决的轮数。两者不可互相换算：前者是一个恒等式（风险
+    # 预算为零），后者是一个可调阈值——只报合计会让「闸 9 到底该不该打开」永远没有依据。
+    solved_zero_vetoes: int = 0
+    below_floor_vetoes: int = 0
 
 
 class SizingRuntime:
@@ -173,8 +191,12 @@ class SizingRuntime:
     def __init__(self, rule: SizingRule | None = None, stop_rule: StopRule | None = None,
                  brake_rule: BrakeRule | None = None, *, inst_id: str = "",
                  bar_seconds: int = 60, book: GroupExposureBook | None = None,
-                 budget_usd: float = 0.0) -> None:
+                 budget_usd: float = 0.0,
+                 floor_policy: SizingFloorPolicy | None = None) -> None:
         self.rule = rule
+        # 轴 C-1：**默认 None ⇒ 两条地板判据整体不存在 ⇒ 逐字回退**（回测与全部既有单测走的就是
+        # 它）。实盘由 `manager` 在构造期用 `parse_floor_policy(settings)` 解析一次后传入。
+        self.floor_policy = floor_policy
         self.stop_rule = stop_rule
         self.brake_rule = brake_rule
         self.inst_id = inst_id
@@ -257,7 +279,25 @@ class SizingRuntime:
                            exposure_wire(exposure, corr_scale=corr))
         wire["realizedVolAnnual"] = self._vol_annual()
         self._last_wire = wire
+        if outcome.floor_verdict != "none":
+            # ★ 评审 RV-P1-4 / 放行条件 C-7：**必须在这里就把决策改成 hold**。只把 `size_fraction`
+            # 置 0 是不够的——`apply_size_fraction` 刻意「只改 size_fraction、action 一字不动」，
+            # 于是这个 `open_*` 决策会继续往下走，撞进 `executor._do_open` 的 `sz <= 0` 分支，
+            # 后果有两个都不能接受：①同一件事被记两次（`openFunnel.sizing_zeroed` 与
+            # `executor.dust_skips` 各 +1）；②产品对用户说了一句假话——那条分支推的 status 是
+            # 「预算 / 杠杆过小，单笔不足最小下单量」，而纪律自检的 `volSizing` 行会据 `dust_skips`
+            # 写「提高总预算或该标的百分比可消除」。**风控解出零跟预算大小毫无关系**，照那条提示去
+            # 加预算只会让下一次开得更大。
+            self._tally_floor(outcome.floor_verdict)
+            return _to_hold(decision, outcome.floor_verdict), plan, wire
         return apply_size_fraction(decision, outcome), plan, wire
+
+    def _tally_floor(self, verdict: str) -> None:
+        """地板否决分格计数（`aiStats.sizing` 的两个读点）。"""
+        if verdict == "solved_zero":
+            self.counters.solved_zero_vetoes += 1
+        elif verdict == "below_gear_floor":
+            self.counters.below_floor_vetoes += 1
 
     def _apply_stop(self, executor, plan: StopPlan | None, action: str, *,
                     skip_reason: str | None = None) -> str:
@@ -306,11 +346,11 @@ class SizingRuntime:
             cost_bps=ctx.cost_bps, stop_bps=stop_bps, take_bps=take_bps,
             realized_vol_bar=self._vol, brake_mult=(1.0 if view is None else view.mult),
             corr_scale=1.0, step=ctx.step)
-        pre = resolve_size_fraction(base, self.rule, self.bar_seconds)
+        pre = resolve_size_fraction(base, self.rule, self.bar_seconds, self.floor_policy)
         exposure, corr = self._correlation(decision.action, pre, ctx, executor)
         outcome = (pre if corr >= 1.0 - _EPS
                    else resolve_size_fraction(replace(base, corr_scale=corr), self.rule,
-                                              self.bar_seconds))
+                                              self.bar_seconds, self.floor_policy))
         self._tally(outcome, base, exposure, corr)
         return outcome, exposure, corr
 
@@ -449,13 +489,18 @@ class SizingRuntime:
         wire["realizedVolAnnual"] = self._vol_annual()
         return wire or None
 
-    def merge_into(self, ai_stats: dict) -> dict:
-        """把 `sizing` 加法键并入既有 `aiStats`（键冲突即抛，绝不静默覆盖）。"""
-        return merge_sizing_stats(ai_stats, self.snapshot())
+    def merge_into(self, ai_stats: dict, executor=None) -> dict:
+        """把 `sizing` 加法键并入既有 `aiStats`（键冲突即抛，绝不静默覆盖）。
 
-    def snapshot(self) -> dict:
+        `executor`（轴 E，默认 None ⇒ 三个挂单计数整键缺席）：挂单的生命周期跨轮，计数只能住在
+        执行器上；本层不 import `LiveExecutor`，按鸭子类型读（与 `cost_runtime.note_settlement`
+        同一范式）。
+        """
+        return merge_sizing_stats(ai_stats, self.snapshot(executor))
+
+    def snapshot(self, executor=None) -> dict:
         """`aiStats.sizing` 的唯一装配点（会话内读数与落库富化同出一次调用）。"""
-        return build_sizing_stats(self.counters, self.brake_counters, self.state)
+        return build_sizing_stats(self.counters, self.brake_counters, self.state, executor)
 
     def _vol_annual(self) -> float | None:
         """把每根波动率还原成年化（仅展示；判定一律走单根口径，绝不与年化直接相除）。"""
@@ -478,7 +523,11 @@ def build_sizing_runtime(settings, inst_id: str, bar_seconds: int, *,
     return SizingRuntime(
         parse_sizing_rule(settings), parse_stop_rule(settings),
         parse_brake_rule(settings, bar_seconds),
-        inst_id=inst_id, bar_seconds=bar_seconds, book=book, budget_usd=budget_usd)
+        inst_id=inst_id, bar_seconds=bar_seconds, book=book, budget_usd=budget_usd,
+        # 轴 C-1 的地板判据在**这一个**解析点装配，故实盘与回测拿到的是同一套规则。刻意不只给
+        # 实盘：一条只在实盘存在的风控会让回测系统性偏乐观（它会成交一批实盘根本不会开的单），
+        # 而那正是「回测与实盘各写一份」这条本仓库反复付过代价的形状。两条判据各有独立回退档。
+        floor_policy=parse_floor_policy(settings))
 
 
 def sizing_config_wire(settings, bar_seconds: int) -> dict | None:

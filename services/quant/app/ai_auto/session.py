@@ -27,6 +27,7 @@ from ..engine.metrics import _empty_metrics
 from ..live_auto.executor import LiveExecutor
 from ..live_auto.explain import build_atomic_explain, build_profit_guard_explain
 from ..live_auto.resting import resting_payload
+from ..live_auto.settlement import settlement_meta_wire
 from ..okx.call_stats import get_call_stats
 from ..okx.rest_client import get_rest_client
 from ..okx.types import BAR_SECONDS, Candle
@@ -104,6 +105,7 @@ from .profit_guard_runtime import (
     SessionReadings,
     build_position_facts,
 )
+from .orphan import DEGRADE_ORPHAN_BLOCKED
 from .prompts import DECISION_TOOL_NAME
 from .reflection import applied_shrink, apply_reflection, build_reflection_note
 from .signal_preview import PreviewRequest, PreviewRunner
@@ -119,6 +121,7 @@ from .signals import (
     resolve_consensus_gate,
 )
 from .sizing_runtime import SizingRuntime
+from .stats_ext import build_consensus_stats
 from .track_record import TrackRecordRuntime
 from .truth_wire import build_sources as build_truth_sources
 from .truth_wire import ws_digest as truth_ws_digest
@@ -697,6 +700,24 @@ class AiTradeSession:
             slot, self._pending_horizon_meta = self._pending_horizon_meta, None
             for key, value in (slot or {}).items():
                 meta.setdefault(key, value)
+        # ★ 成交真值化（fill-truth-and-effective-controls 轴 A）：八个 `settlement*` 键的**唯一**
+        # 装配点。同样**必须在 exitSource 打标之后**（与下面 `apply_trip_meta` 同一条顺序纪律）。
+        # 数据由 `executor._pending_settlement_meta` 这个轮级槽递过来，**消费即清空**。
+        #
+        # 为什么不写在 `live_auto/explain.build_external_close_explain` 里：那是 `live_auto` 与
+        # `ai_auto` 的**共用**模块，写在那里会同时改掉非 AI 链路的 `external_close` explain 形状
+        # （撞既有键集冻结用例），并造出本仓库第二个 `explain.meta` 装配现场（评审 RV-P0-6）。
+        # 轴 A 总闸关 / `settlement_fn is None` ⇒ 槽恒 None ⇒ 八键整键缺席（A-4 ⓐ 列的零加法键是
+        # **构造性**成立的：`live_auto` 根本没有 `_inject_explain_meta` 这一步）。
+        if trade.get("side") == "close":
+            slot = self.executor.take_settlement_meta()
+            if slot is not None:
+                for key, value in settlement_meta_wire(
+                        slot.get("fact"), mark_px=float(slot.get("markPx") or 0.0),
+                        waited_s=int(slot.get("waitedS") or 0),
+                        booked_open_fee_usd=float(slot.get("bookedOpenFeeUsd") or 0.0),
+                        reject_reason=slot.get("rejectReason")).items():
+                    meta.setdefault(key, value)
         # 轴 A 往返结算（realized-edge-calibration §3.1.1）：**必须在 exitSource 打标之后**——本层
         # 只读那个键、绝不自己再判一次（[P1-1]）。总闸关 / 非平仓 / 无开仓断面 ⇒ 空转 ⇒ meta 逐字回退。
         self._cost.apply_trip_meta(meta, trade)
@@ -861,7 +882,13 @@ class AiTradeSession:
             # `flatten=False` 只有一个调用方：`end_group` 的「保留持仓、仅结束本地会话」分支
             # （pause-resume §5.4，用户已显式勾选确认）。默认恒 True ⇒ 既有全部调用点逐字节不变。
             self.flatten_result = {"ok": True, "closedSz": 0, "skipped": "hold_position"}
-        await self._cost.reconcile_tick(          # 轴 C：终态对账（硬超时，永不判 drift）
+        # ★ 轴 A-6：结算若仍未决，在**落库之前**带硬超时再问一次，仍不命中即按本地标记价立刻
+        # 落账。绝不把一条已经发生的平仓留在 `settling` 里带进关停——那会让这笔往返在历史详情里
+        # 整条消失（R-1 的第二重保险；`flatten` 里还有第一重）。必须排在对账**之前**：这条腿要
+        # 进得了 `local_net_view` 的窗口，终态差额才算得对。
+        await self._dispatch(await self.executor.drain_settlement(ts))
+        self._cost.note_settlement(self.executor)
+        await self._cost.reconcile_tick(          # 轴 C：终态对账（硬超时）
             time.time(), window_start_ts=self.started_ts,
             trades=self.executor.trades, push=self._push, final=True)
         await self._experience.flush()             # W-10：毫秒级本地 INSERT（物化与蒸馏都不在这条链上）
@@ -1114,6 +1141,11 @@ class AiTradeSession:
         self._cancel_task("_decision_task")                      # ③
         ts = self._ref_ts()
         flattened, resting_cancelled = await self._pause_unwind(flatten, ts)     # ④
+        # ★ 轴 A-6（fill-truth-and-effective-controls）：暂停同样要把未决的结算收掉，且必须排在
+        # ⑤读交易所持仓与⑦落契约**之前**。否则暂停契约会在 `projected` 仍说「有仓」、而交易所
+        # 侧早已空、这条腿又还没落账的断面上定格——冷续跑时 `resume` 拿这份契约与交易所对不上，
+        # 一笔真实发生过的平仓会在历史详情里整条消失（`stop()` 里那一处是同一条理由）。
+        await self._dispatch(await self.executor.drain_settlement(ts))
         position, unknown = await self._read_exchange_position()                 # ⑤
         backstop = await self._pause_backstop(position)                          # ⑥
         await self._experience.flush()                 # W-10：暂停同样要保住收据（毫秒级本地 IO）
@@ -1484,6 +1516,9 @@ class AiTradeSession:
         await self._maybe_session_exit(mark, now_ts)
         # §3.1：网络 IO 只跑在盯市 tick 上；三条刷新（资金费率 / 官方费率 / 交易所对账）离开
         # tick 的关键路径跑在后台单飞任务里——串行 await 会把 5s 盯市周期翻倍（I-1）。
+        # 轴 A/F：把结算覆盖计数与本金抄给成本层（同步、零 IO），**必须在排后台对账之前**——
+        # 后台那一批会立刻用它建 `settlementCoverage`，晚一步就会用上一轮的旧读数。
+        self._cost.note_settlement(self.executor)
         self._cost.schedule_maintenance(time.time(), window_start_ts=self.started_ts,
                                         trades=self.executor.trades, push=self._push,
                                         mark_px=self._current_px())
@@ -1854,6 +1889,10 @@ class AiTradeSession:
             self._resolve_exit_priority(decision)
             decision, degrade = await self._apply_base_rule_gate(
                 round_no, ts, payload, decision, degrade)
+            # ★ 孤儿持仓硬拒（fill-truth-and-effective-controls 轴 B）：排在基础策略**之后**、
+            # 持仓周期**之前**——它是比任何纪律都更靠前的**事实性**阻断（交易所侧存在一笔本会话
+            # 不知道的持仓），而不是一条可以权衡的门槛。总闸关 ⇒ 原对象直通（`is` 相等）。
+            decision, degrade = self._apply_orphan_gate(decision, degrade)
             # F-2 的留存点（【R:P2-7】）已并入上面的 `stage1_decision`（directional-symmetry
             # B-2）：注记与 `tool_call` 相位都改吃它。基础策略层放行时返回**同一个对象**、被它
             # 拦下时 degrade 是 `base_rule_*`（此后 horizon 不会再拦一次），故 horizon 否决轮的
@@ -2516,6 +2555,85 @@ class AiTradeSession:
                                               last_px=payload.get("lastPx"))
         await self._emit_base_rule_trace(round_no, ts, band, reason)
         return decision, (degrade or reason)
+
+    async def adopt_orphan(self) -> dict:
+        """把交易所侧那笔未接管持仓接进本会话（轴 B 的唯一用户出口）。
+
+        **绝不自动调用**：接管会改写 `projected` / `entry_price` / `entry_qty_sz` 三个真实资金
+        立场字段，那必须是用户的一次显式点击（不变式 I-4，端点侧另有 `confirm: true` 二次确认）。
+
+        取数**强制穿透缓存**（`_read_positions_fresh`）：接管的是「我此刻到底还有多少仓」，那个数
+        不该来自一份 4 秒前的共享快照——`_confirm_net_cleared` 与 `_read_exchange_position` 立的是
+        同一条规矩。
+
+        复用 `resume.adopt_position` 而不是另写一份：它已经封装了「取交易所真值而不是本地快照」
+        与「`posSide` 缺失时按 `pos` 的符号定向」这两条约束（离线期间部分平仓会让快照高估持仓）。
+
+        Returns:
+            `{"ok": True, "adopted": True, ...}`；当前不处于 `orphan=confirmed` ⇒
+            `{"ok": False, "code": "NO_ORPHAN"}`；交易所不可达 ⇒ 抛 `OKXPrivateError`（端点译 502）。
+
+        暂停态**照常可用**（§十三 Q5 的裁定）：留在孤儿态同样无人看管，而且还多一层「系统不知道
+        它存在」。回执因此必须写明后果，让用户知道自己接管的是什么。
+        """
+        # 延迟导入打破 `session → resume → manager → session` 的模块级循环（`resume` 顶层要
+        # `AiTradeGroup`）。范式与本包 `__init__.py` 的 PEP 562 惰性导出同源。
+        from .resume import adopt_position
+
+        view = getattr(self.executor, "orphan", None)
+        if not isinstance(view, dict) or view.get("state") != "confirmed":
+            return {"ok": False, "code": "NO_ORPHAN",
+                    "message": "当前没有已确认的未接管持仓，无需接管"}
+        rows = await self.executor._read_positions_fresh()
+        actual = next((r for r in rows
+                       if str(r.get("instId") or "") == self.inst_id
+                       and abs(float(r.get("pos") or 0.0)) > 0), None)
+        if actual is None:
+            self.executor.orphan = None
+            self.executor._orphan_streak = 0
+            self.executor.orphan_alerted = False
+            return {"ok": False, "code": "NO_ORPHAN",
+                    "message": "交易所侧此刻已无该持仓（可能刚被平掉），无需接管"}
+        adopt_position(self.executor, actual)
+        self.executor.entry_bar = self._window.cur_index()
+        self.executor.entry_position_pct = None
+        # 接管成功即清孤儿态：这笔仓从此归本会话账本管，再报「未接管」就是一句假话。
+        self.executor.orphan = None
+        self.executor._orphan_streak = 0
+        self.executor._orphan_since_ts = 0
+        self.executor.orphan_alerted = False
+        await self._push({"type": "status", "data": {
+            **self._status_payload(),
+            "message": f"已接管 {self.inst_id} 在交易所侧的持仓："
+                       f"{self.executor.entry_qty_sz:g} 张 @ {self.executor.entry_price:g}。"
+                       + ("该持仓在会话继续之前不受任何自动风控管辖，止盈止损仍由交易所侧已挂的"
+                          "委托承担。" if self.state != "running" else
+                          "它从本轮起纳入持仓周期、利润保护与活性看门狗的管辖。")}})
+        return {"ok": True, "adopted": True, "instId": self.inst_id,
+                "qty": self.executor.entry_qty_sz, "avgPx": self.executor.entry_price,
+                "posSide": self.executor.projected, "source": "exchange",
+                "entryTs": int(float(actual.get("cTimeS") or 0) or 0)}
+
+    def _apply_orphan_gate(self, decision: TradeDecision,
+                           degrade: str | None) -> tuple[TradeDecision, str | None]:
+        """交易所侧存在未接管持仓时，把该标的的**开仓**路径钉死（轴 B；平仓永不被拦）。
+
+        判据只有一个真源：`executor.orphan`（由 `_note_orphan` 在盯市轮里按 `classify_orphan`
+        写出，`state == "confirmed"` 才算数）。两把开关任一关闭 ⇒ 原对象直通、`is` 相等：
+        `ai_trade_orphan_detect_enabled` 关 ⇒ `executor.orphan` 恒 None；
+        `ai_trade_orphan_block_open` 关 ⇒ 只告警不封锁（横幅仍在，交易行为逐字回退）。
+
+        **绝不拦平仓**：一笔无人看管的持仓之外还有一笔本会话自己的持仓时，让后者也平不掉是把
+        一个观测问题升级成一个资金问题。
+        """
+        view = getattr(self.executor, "orphan", None)
+        if (decision.action not in ("open_long", "open_short")
+                or not isinstance(view, dict) or view.get("state") != "confirmed"
+                or not self.executor.settings.ai_trade_orphan_block_open):
+            return decision, degrade
+        reason = f"{DEGRADE_ORPHAN_BLOCKED}(qty={view.get('qty')})"
+        hold = TradeDecision(action="hold", size_fraction=None, confidence=None, reason=reason)
+        return hold, (degrade or reason)
 
     @property
     def _band_unavailable_streak(self) -> int:
@@ -3401,6 +3519,27 @@ class AiTradeSession:
         self._last_status_side = side
         await self._push({"type": "status", "data": self._status_payload()})
 
+    def _settling_key(self) -> dict:
+        """轴 A：`settling` 中间态。未决态不存在 ⇒ **整键省略**（老前端与回退档都看不到这个键）。
+
+        Q3 的裁定：这枚芯片是必需的而不是可选的——`settling` 期间一切出站平仓被短路，用户点
+        「手动平仓」会得到一句「本轮不发平仓单」；如果界面还写着「持有中」，那句话就变成了一个
+        无法解释的拒绝。
+        """
+        pending = getattr(self.executor, "_settling", None)
+        if pending is None:
+            return {}
+        now = int(time.time())
+        return {"settling": {
+            "active": True, "detectTs": int(pending.detect_ts),
+            "deadlineTs": int(pending.deadline), "markPx": float(pending.mark_px),
+            "waitedS": max(0, now - int(pending.detect_ts))}}
+
+    def _orphan_key(self) -> dict:
+        """轴 B：孤儿持仓。总闸关 / 无孤儿 ⇒ **整键省略**（`G-B7` 的逐字回退靠它）。"""
+        view = getattr(self.executor, "orphan", None)
+        return {"orphan": view} if view else {}
+
     def _status_payload(self) -> dict:
         return {"state": self.state,
                 # 暂停 / 继续（§5.7）：`state` 现可为 `"paused"`；`pauseReason` 供前端选文案。
@@ -3413,6 +3552,13 @@ class AiTradeSession:
                 "positionSide": self.executor.projected,
                 "budgetUsd": self.executor.budget_usd, "leverage": self.executor.leverage,
                 "roundsCompleted": self.rounds_completed,
+                # ★ 轴 G-1：样本口径。**两条通路都要下发**——实时页读的是这份成员级 status 快照，
+                # 历史详情页读的才是落库的 `aiStats.sampleScope`；只落一处会让另一页的标签恒回退到
+                # 一个硬编码的「近 50 轮」，而那个数一旦与 `_DECISIONS_MAX` 分叉就会开始说谎
+                # （`trendVerdict` 与 `liveness` 已经各为这条纪律付过一次代价）。零 DB 读，可以搭
+                # 这班同步 payload 的车。
+                "sampleScope": f"最近 {_DECISIONS_MAX} 轮决策",
+                "sampleRounds": len(self._decisions),
                 "roundsSinceSummary": self.decider.rounds_since_summary,
                 "contextRefreshRounds": self.context_refresh_rounds,
                 "wakeIntervalMinutes": self._wake_interval_minutes(),
@@ -3425,10 +3571,20 @@ class AiTradeSession:
                 # （§十.5：后端算了、类型补了、没有渲染落点 = 死数据）。
                 "tradability": self._discipline.tradability_status(),
                 "openFunnel": self._discipline.funnel_wire(),
+                # 成交真值化 / 孤儿持仓（fill-truth-and-effective-controls 轴 A / B）：两块都是
+                # **进程内读数、零 DB 读**，可以搭这班同步 payload 的车（F-15 记的正是「往一个
+                # 同步 payload 里塞 DB 读」那个坑）。未装配 / 无事发生 ⇒ 整键省略。
+                **self._settling_key(), **self._orphan_key(),
                 # 趋势基调统计（execution-trend-verdict 评审 RP1-2）：**必须与 `openFunnel`
                 # 并列挂在这里**——实时页读的是成员级 status 快照，历史详情页读的才是
                 # `aiStats`；只落一处会让另一页那张卡恒为空。未装配 / 零样本 ⇒ None。
                 "trendVerdict": self._trend.stats_wire(),
+                # ★ 轴 D-2：逆势通路五格细分。**必须与 `openFunnel` / `trendVerdict` 并列挂在这里**
+                # ——实时页读的是这份成员级 status 快照，历史详情页读的才是落库的
+                # `aiStats.consensus`；只落一处会让另一页那一行恒为空（这正是 `trendVerdict` 的
+                # 评审 RP1-2 已经钉死过一次的形状）。一次逆势否决都没发生 ⇒ 整键缺席。
+                **({"contrarianBlocked": self._discipline.contrarian_blocked()}
+                   if self._discipline.contrarian_blocked() else {}),
                 "summaryHealth": self.decider.summary_health_wire(),
                 # 轴 A 已实现读数（realized-edge-calibration [P1-2]）：**必须挂在这里**，不能只走
                 # `costSnapshot`——那条通道只在 `k_min<=0`（门禁空转）时才发，装了纪律预设的会话
@@ -3661,7 +3817,12 @@ class AiTradeSession:
             metrics["aiStats"]["wakeScheduler"] = self._wake.stats(self._preview.stats())
             # 成本记账与门禁观测（§3.8，RV-1）：合并落在**调用点**，`_compute_ai_stats` 一字不动。
             metrics["aiStats"] = self._cost.merge_into(metrics["aiStats"])
-            metrics["aiStats"] = self._sizing.merge_into(metrics["aiStats"])   # 同款调用点合并
+            metrics["aiStats"] = self._sizing.merge_into(
+                metrics["aiStats"], self.executor)                             # 同款调用点合并
+            # 轴 D-2：逆势通路五格细分（`_compute_ai_stats` 是模块级纯函数、拿不到 `self`，故与
+            # 上面几条一样走**调用点合并**）。一次逆势否决都没发生过 ⇒ 整段缺席。
+            metrics["aiStats"].update(build_consensus_stats(
+                self._discipline.contrarian_blocked()))
             metrics["aiStats"] = self._horizon.merge_into(metrics["aiStats"])  # §2.12 验收指标
             metrics["aiStats"].update(ai_stats_keys(self.acceptance_bundle()))  # 验收闭环四键
             metrics["aiStats"] = self._discipline.merge_into(metrics["aiStats"])  # 纪律预设观测
@@ -3780,6 +3941,13 @@ def _compute_ai_stats(records, rounds: int) -> dict:
     sample = len(decisions)
     return {
         "decisionRounds": int(rounds),
+        # ★ 轴 G-1（fill-truth-and-effective-controls）：`actionCounts` / `holdRate` /
+        # `avgConfidence` 的分母是**保留的 ≤N 条决策样本**，而 `decisionRounds` 是会话真实完成
+        # 轮数——两个分母并排出现在同一张卡上，而 wire 上此前没有任何字段承载这件事。生产实测
+        # run 1627 因此对用户说「484 轮里 100% 观望、一次都没想过开仓」，而真相是「想开 117 次，
+        # 其中 106 次被同向共识拦下」。`sampleScope` 里的数字取自环形容量常量，**绝不硬编码 50**。
+        "sampleRounds": sample,
+        "sampleScope": f"最近 {_DECISIONS_MAX} 轮决策",
         "actionCounts": counts,
         "holdRate": round(counts["hold"] / sample, 4) if sample else 0.0,
         "avgConfidence": round(sum(confidences) / len(confidences), 4) if confidences else 0.0,

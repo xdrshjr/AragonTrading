@@ -37,6 +37,7 @@ export default function TradeExplainDetail({
         <FactorContributionBars factors={explain.factors} />
       )}
       <RiskSnapshot explain={explain} />
+      {explain.meta && <SettlementLine explain={explain} />}
       {explain.meta && <MetaLine explain={explain} />}
     </div>
   );
@@ -154,6 +155,60 @@ function RiskSnapshot({ explain }: { explain: TriggerExplain }) {
       )}
     </div>
   );
+}
+
+/**
+ * 结算价来源（fill-truth-and-effective-controls 轴 A / §十三 Q6 的裁定）。
+ *
+ * 这是 `settlementSource` / `settlementPosId` / `settlementPriceGapBps` 三个键的**渲染落点**。
+ * 没有它，这三个键就是原则 6 明令禁止的「有写点没读点」——而它们回答的恰恰是本轮最想问的
+ * 那个问题：这条外部平仓的价格，到底是交易所说的，还是我们自己按标记价猜的？差多少？
+ *
+ * 整键缺席（轴 A 未装配 / 非外部平仓 / 老数据）⇒ 整行不渲染。
+ */
+function SettlementLine({ explain }: { explain: TriggerExplain }) {
+  const meta = explain.meta;
+  if (!meta?.settlementSource) return null;
+  const exchange = meta.settlementSource === "exchange";
+  const gap = meta.settlementPriceGapBps;
+  return (
+    <p
+      className={exchange ? "text-[10px] text-[var(--muted)]" : "text-[10px] text-[var(--warn)]"}
+      data-testid="trade-settlement-source"
+    >
+      <span className="font-medium">
+        {exchange ? "结算价来自交易所" : "结算价为本地标记价（未取回交易所成交价）"}
+      </span>
+      {exchange && meta.settlementPosId ? ` · 持仓号 ${meta.settlementPosId}` : ""}
+      {gap != null ? ` · 与侦测时标记价差 ${gap >= 0 ? "+" : ""}${+gap.toFixed(1)} bps` : ""}
+      {/* 费率残差的**可验算落点**（评审 RV-P2-5 点名要给 `bookedOpenFeeUsd` 一个读点）：这条腿的
+          `fee` = 交易所往返总费 − 本地已记的开仓腿费。两个被减数都摆出来，用户（与事后对账）
+          才能自己把那个减法做一遍——只给结果就等于要求他们相信一个算不出来的数。 */}
+      {exchange && meta.exchangeFeeUsd != null
+        ? ` · 往返总费 ${+meta.exchangeFeeUsd.toFixed(4)}`
+          + (meta.bookedOpenFeeUsd != null
+            ? `（已记开仓腿 ${+meta.bookedOpenFeeUsd.toFixed(4)}）` : "")
+        : ""}
+      {meta.settlementWaitedS != null ? ` · 等待 ${meta.settlementWaitedS}s` : ""}
+      {meta.settlementRejectReason
+        ? ` · 降级原因：${describeSettlementReject(meta.settlementRejectReason)}`
+        : ""}
+    </p>
+  );
+}
+
+/**
+ * 结算降级原因码 → 中文。
+ *
+ * 后端的机器码绝不裸着示人（本仓库为这条纪律付过多次代价，`DEGRADE_REASON_LABELS` 是同一范式）。
+ * 未登记的码**原样透出**而不是隐藏：显示一个我们没预料到的原因，好过让用户以为没有原因。
+ */
+const SETTLEMENT_REJECT_LABELS: Record<string, string> = {
+  fee_residual_negative: "交易所往返总费小于本地已记的开仓腿费，账不自洽，已退回本地标记价",
+};
+
+function describeSettlementReject(code: string): string {
+  return SETTLEMENT_REJECT_LABELS[code] ?? code;
 }
 
 function MetaLine({ explain }: { explain: TriggerExplain }) {

@@ -77,7 +77,12 @@ def test_merge_lands_at_the_call_site_not_inside_compute_ai_stats():
     # （暂停快照与停止落库共用同一段富化，绝不复制）。**本条断言的口径一字未改**——合并仍必须发生
     # 在调用点，只是那个调用点现在叫 `_build_run_metrics`。
     finalize = inspect.getsource(AiTradeSession._build_run_metrics)
-    assert 'self._sizing.merge_into(metrics["aiStats"])' in finalize
+    # 断言口径不变（合并必须发生在调用点），但**不再逐字匹配整个调用表达式**：
+    # fill-truth-and-effective-controls 轴 E 给 `merge_into` 加了第二个实参（`self.executor`，
+    # 三个挂单去留计数住在执行器上），调用因此换行了。把一个源码门禁写成对格式敏感的整串比对，
+    # 会让它在一次纯粹的换行上变红，而那与它要守的不变式毫无关系。
+    assert "self._sizing.merge_into(" in finalize
+    assert 'metrics["aiStats"]' in finalize
 
 
 def test_runtime_merge_into_produces_the_additive_key():

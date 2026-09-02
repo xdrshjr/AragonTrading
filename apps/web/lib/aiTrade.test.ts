@@ -438,10 +438,21 @@ describe("positionLadder (ai-trade-position-sizing-steps, backend position_ladde
 });
 
 describe("AI_TRADE_POSITION_STEP_OPTIONS ([R-6] discrete only, no continuous)", () => {
-  it("exposes exactly 10/20/25/50/100% and excludes 0 (continuous / AI-free)", () => {
+  it("exposes exactly 5/10/20/25/50/100% and excludes 0 (continuous / AI-free)", () => {
     const values = AI_TRADE_POSITION_STEP_OPTIONS.map((o) => o.value);
-    expect(new Set(values)).toEqual(new Set([0.1, 0.2, 0.25, 0.5, 1]));
+    // fill-truth-and-effective-controls 轴 C-3：**只加一档更细的 5%**。
+    //
+    // 加它的理由不是「多给一个选项」：轴 C-2 那句「按当前档位，回撤刹车第一档 / 逆势通路强制
+    // 降档 / 相关性缩减 会被吸附回原值」的警示，必须有一条用户能真的点进去的出路——否则产品
+    // 只是在告诉用户「你选的这一档有问题」，却不给他任何办法。生产实测 `positionStepPct = 0.5`
+    // 占全库 147 条 run 的 88.4%，那正是三条机制全部失效的那一档。
+    //
+    // 本条门禁的**判据一个字没改**：仍然是「离散档位，绝不暴露 0（= AI 自由决定金额）」。
+    // `AI_TRADE_DEFAULT_POSITION_STEP` 同样一个字节不动（见下一条），改默认值会让全仓上百条
+    // 冻结断言与用户已落盘的偏好一起动。
+    expect(new Set(values)).toEqual(new Set([0.05, 0.1, 0.2, 0.25, 0.5, 1]));
     expect(values).not.toContain(0); // 需求明确排斥「AI 自由决定金额」，不作一等选项暴露
+    expect(values.every((v) => v > 0 && v <= 1)).toBe(true);
   });
   it("defaults the step to 0.25 (aligned with backend ai_trade_default_position_step_pct)", () => {
     expect(AI_TRADE_DEFAULT_POSITION_STEP).toBe(0.25);

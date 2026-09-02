@@ -26,6 +26,8 @@ export interface FunnelStage {
 // 逐层明细要自己译一次。**这份表与后端 `open_funnel.LAYER_LABELS` 同源**，改一处必须改两处。
 const LAYER_LABEL: Record<string, string> = {
   baseRuleMaBand: "基础策略·MA 通道",
+  // 轴 B：排在 `baseRuleMaBand` 之后、`horizon` 之前（与后端 `open_funnel.LAYERS` 层序同构）。
+  orphanPosition: "交易所侧存在未接管持仓",
   horizon: "持仓周期纪律",
   profitCooldown: "保护性平仓冷却",
   turnover: "换手预算",

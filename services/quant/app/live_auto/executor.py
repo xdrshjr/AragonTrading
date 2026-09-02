@@ -14,8 +14,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import time
+from dataclasses import dataclass
 
 from ..config import Settings
 from ..db.session import get_sessionmaker
@@ -38,6 +40,17 @@ from ..okx.trading import (
 )
 from ..wire_caps import TRADE_LEDGER_MAX
 from .fee_ledger import FeeLedger, audit_fills, trade_fee_fields
+from ..ai_auto.orphan import (
+    OrphanFacts,
+    classify_orphan,
+    orphan_message,
+    orphan_wire,
+)
+from .settlement import (
+    SettlementFact,
+    SettlementQuery,
+    match_settlement,
+)
 from .explain import (
     as_close,
     build_atomic_explain,
@@ -67,6 +80,44 @@ _FLATTEN_RETRY_INTERVAL_S = 0.5
 _LEDGER_TRIM_SLACK = 500
 
 
+logger = logging.getLogger(__name__)
+
+
+def _num_or_zero(value) -> float:
+    """转有限浮点；非数值 / NaN / inf ⇒ `0.0`（持仓读数里 NaN 比 0 危险得多）。"""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return out if math.isfinite(out) else 0.0
+
+
+# 已认领的结算 `posId` 上限（FIFO 淘汰）。它只是一层**廉价的额外保险**，不是正确性的承重墙：
+# 一笔往返只会进入 `settling` 一次（入口条件是 `projected != "flat"`，落账即归 flat 且
+# `entry_qty_sz = 0`），而 OKX 的 `posId` 对一次持仓生命周期唯一。故「同一 posId 被认领两次」需要
+# 它在 256 笔结算之后**再次出现在 positions-history 里且本地又恰好处于 settling**——`limit=20` 的
+# 窄窗口取数下不可能。淘汰后最坏退化为按 `local_mark` 落账，**不会造成错账**（不变式 I-3）。
+_SETTLED_POS_IDS_MAX = 256
+
+
+@dataclass
+class SettlementPending:
+    """一笔「交易所侧已平仓、正在取回结算价」的未决中间态（至多一笔，随会话回收）。
+
+    刻意**可变**（非 frozen）：`last_poll_wall` 每次取数后就地推进，而它是本对象唯一会变的字段。
+    """
+
+    detect_ts: int          # 侦测到那一秒（也是 `explain.meta.settlementWaitedS` 的起点）
+    mark_px: float          # 侦测那一刻的本地标记价（超时回落就用它，逐字等于今天的行为）
+    deadline: float         # 墙钟死线（R-1 的第一重保险）
+    entry_ts: int           # 本地开仓腿 ts（匹配判据 5）
+    direction: str          # 本地立场（匹配判据 2，fail-open）
+    qty: float              # 侦测那一刻的自管张数（只用于日志与自检）
+    frozen_unrealized: float        # 冻结的净额浮盈（不变式 I-2）
+    frozen_gross_unrealized: float  # 冻结的毛额浮盈
+    last_poll_wall: float = 0.0
+
+
 def _plan_limit_px(order_plan) -> float | None:
     """`OrderPlan | None` → 限价委托价；市价 / 无计划一律 None（= 今日行为，逐字零回归）。"""
     if order_plan is None or getattr(order_plan, "ord_type", "market") != "limit":
@@ -90,6 +141,7 @@ class LiveExecutor:
                  settings: Settings,
                  place_order_fn=None, close_position_fn=None, positions_fn=None,
                  cancel_order_fn=None, get_order_fn=None, fills_fn=None,
+                 settlement_fn=None,
                  fee_ledger: FeeLedger | None = None,
                  bar_seconds: int = 0, bar_anchor_ts: int = 0):
         self.creds = creds
@@ -151,6 +203,34 @@ class LiveExecutor:
         self.last_close_block: str | None = None
         # 刚采纳完开仓成交的一轮宽限（O-3，见 `_on_reconcile_ok`）。恒为 False ⇒ live_auto 零影响。
         self._fill_grace = False
+        # ---- 轴 A：成交真值化（fill-truth-and-effective-controls）----
+        # 第八条可注入缝。**默认 None ⇒ `settling` 状态机整条不存在**，`_on_reconcile_ok` 走今天的
+        # 立即合成 ⇒ `live_auto` 与全部既有单测逐字节回退（`G-A10`）。装配点唯一：
+        # `ai_auto/manager._build_executor` 的函数体内（不新增形参，用已在作用域的 creds/inst_id 闭包）。
+        self._settlement_fn = settlement_fn
+        self._settling: SettlementPending | None = None
+        self._settled_pos_ids: list[str] = []      # 按插入序 FIFO；用 list 而非 set 才能淘汰最旧
+        # 轮级槽：`SettlementFact | None` + 上下文，**消费即清空**。逐字镜像
+        # `session._pending_horizon_meta` 的既有范式——八个 `settlement*` 键的装配点是
+        # `session._inject_explain_meta`（在 `exitSource` 之后），**不是** `live_auto/explain.py`
+        # （那是 live_auto 与 ai_auto 的共用模块，写在那里会同时改掉非 AI 链路的成交形状，
+        # 并造出第二个 explain.meta 装配现场——评审 RV-P0-6）。
+        self._pending_settlement_meta: dict | None = None
+        self.settlement_exchange_count = 0     # 拿到交易所结算价的外部平仓笔数（`AC-1` 的分子）
+        self.settlement_local_mark_count = 0   # 状态机跑过了但没拿到的笔数（`AC-1` 分母的另一半）
+        # ---- 轴 B：孤儿持仓（只写状态与事件，零交易所写请求，不变式 I-4）----
+        self._orphan_streak = 0
+        self._orphan_since_ts = 0
+        self.orphan: dict | None = None
+        self.orphan_alerted = False
+        # ---- 轴 E 观测半：挂单去留三计数（`aiStats.sizing` 的读点）----
+        # `restingKept` 与既有的 `restingSkips` **不是同一件事**，绝不复用（`G-E5`）：后者是
+        # 「因为有挂单而跳过本轮开仓」，前者是「本轮想挂的与已挂的逐字同向同价，于是保留原单
+        # 不撤不重挂」——今天这条幂等短路一次都没有被计数过。
+        self.resting_kept = 0
+        self.resting_repriced = 0
+        self.resting_cancelled = 0
+        self.resting_expired = 0        # 其中因 TTL 到期被撤的笔数（轴 E 双时钟修复的效果读数）
 
         self._place_order = place_order_fn or self._default_place_order
         self._close_position = close_position_fn or self._default_close_position
@@ -378,6 +458,14 @@ class LiveExecutor:
                         close_kind: str = "signal", order_plan=None) -> list[dict]:
         if self.projected == "flat":
             return []
+        if self._settling_blocks_close():
+            # 不变式 I-2b（评审 RV-P0-3）：仓位在交易所侧**已经不在了**，此刻再发一张平仓单只会
+            # 换回一个 `LIVE_NO_POSITION`，而那条良性分支会按 `mark_px` 抢先落一次账 ⇒ 与随后
+            # `_finish_settling` 的落账**双记已实现盈亏**。**不发任何交易所写请求**，本轮止步。
+            self.last_close_block = "settlement_pending"
+            return [self._status_event(
+                "该持仓已在交易所侧平掉，正在取回真实结算价：本轮不再发出平仓单"
+                "（结算落账后会自动归 flat，代价只是延后一轮）")]
         limit_px = _plan_limit_px(order_plan)
         pre, slot_free, outcome = await self._prepare_resting_slot(
             ts, "close", self.projected, limit_px)
@@ -434,9 +522,22 @@ class LiveExecutor:
                        sz: float, strength: float, reason: str) -> list[dict]:
         """下单回执 → `self.resting`；**绝不**乐观置位 projected（I-2a/I-2b，R-1 的正面防线）。"""
         cl_ord_id, ord_id = self._order_ids(result)
+        # ★ 轴 E（fill-truth-and-effective-controls，实施期 E-0 前置调查的产物）：TTL 的起点必须与
+        # **判定它的那个时钟**同源。`ts` 在确认根唤醒里是 `int(row["ts"])` 即 **K 线开盘时间戳**
+        # （`session.py` 的 `_on_confirmed_candle`），而在定时 / 情报 / 信号翻转三种唤醒里又是
+        # `int(time.time())` 墙钟——同一个形参承载两个时钟。而 `is_expired` 恒与盯市循环的墙钟比
+        # （`_monitor_tick` 的 `now_ts = int(time.time())`）。15m 根 + TTL 300s 时
+        # `expire_ts = 开盘 + 300` 而确认轮发生在开盘 + 900 ⇒ **挂单出生即过期**，下一个盯市 tick
+        # （2~5s）立刻把它撤掉。生产日志逐行印证：06:00:53.805 下单 → 06:00:55.284 撤单。
+        # 连带后果有三个：①`resting_payload` 喂给 LLM 的 `expiresInS` 恒为 0；②下方那条状态文案
+        # 对用户说「300s 未成交则自动撤销」是一句假话；③挂单从来没有机会成交（ETH 单标的
+        # `submitted → filled` 只有 15.4%）。总闸关 ⇒ 逐字回退今天的双时钟行为。
+        stamp = (int(time.time())
+                 if getattr(self.settings, "ai_trade_resting_ttl_wall_clock", False)
+                 else int(ts))
         self.resting = build_resting(
             cl_ord_id=cl_ord_id or "", ord_id=ord_id or "", intent=intent, side=side,
-            px=px, sz=sz, strength=strength, reason=reason, now_ts=ts,
+            px=px, sz=sz, strength=strength, reason=reason, now_ts=stamp,
             ttl_s=self.settings.ai_trade_limit_order_ttl_s)
         label = "限价开仓" if intent == "open" else "限价平仓"
         return [self._status_event(
@@ -466,6 +567,10 @@ class LiveExecutor:
         if order is None:
             return [], True, "skipped"
         if limit_px is not None and is_same_intent(order, intent=intent, side=side, px=limit_px):
+            # 轴 E 观测半：这条幂等短路今天**一次都没有被计数过**，于是「本轮保留了原单」在任何
+            # 读数上都不存在。它与既有的 `restingSkips`（因为有挂单而跳过本轮开仓）不是同一件事，
+            # 故另开一个计数器而不是复用（`G-E5`：同一轮里两者至多有一个 +1）。
+            self.resting_kept += 1
             return [self._status_event(          # P2-3 幂等：同向同价不重挂，保住 maker 排队优先级
                 f"同向同价挂单仍在排队（{limit_px}），本轮保留原单不撤不重挂")], False, "skipped"
         outcome, events = await self._cancel_resting("replace", ts)
@@ -505,6 +610,7 @@ class LiveExecutor:
         outcome = str(result.get("outcome") or "unknown")
         if outcome == "canceled":
             self._note_open_expired(order)          # E-7：委托发出了、没成交、没了
+            self._note_resting_cancel(reason)       # 轴 E 观测半：撤单原因分格
             self.resting = None
             return "canceled", [self._status_event(f"已撤销未成交挂单（{reason}）")]
         if outcome == "filled":
@@ -715,6 +821,18 @@ class LiveExecutor:
             positions = await self._read_positions()
         except OKXError as exc:
             return events + self._on_reconcile_failure(ts, exc)
+        if self._settling is not None:
+            # 轴 A：未决态有它自己的三条出路（幻影撤销 / 结算命中 / 死线），**不进** `_on_reconcile_ok`
+            # ——那个函数是同步纯判定，而取回结算价必须 await。分派留在这里即满足原则 2「判定与 IO
+            # 分离」，也使不变式 I-2（`settling` 期间浮盈冻结）成为**构造性**结论而不是一句断言：
+            # 重写 `unrealized_usd` 的那两行根本不在这条路径上。
+            #
+            # ⚠️ 降级恢复**必须照常发生**：这一行读数是真的取回来了（上面的 try 已经过了），
+            # 而 `_clear_degraded_if_recovered` 原本住在 `_on_reconcile_ok` 里。不在这里补一次，
+            # 一次落在结算窗口内的连接恢复就会被推迟最多一整个 deadline（90s）才被承认，
+            # 界面上那条「盯市已降级」会挂着不走——那是一条与轴 A 毫无关系的静默回归。
+            return (events + self._clear_degraded_if_recovered()
+                    + await self._advance_settling(self._net_abs_pos(positions), ts))
         return events + self._on_reconcile_ok(mark_px, positions, ts)
 
     def _on_reconcile_ok(self, mark_px: float, positions: list[dict], ts: int) -> list[dict]:
@@ -732,21 +850,264 @@ class LiveExecutor:
         grace = self._fill_grace
         self._fill_grace = False
         abs_pos = self._net_abs_pos(positions)
-        self.gross_unrealized_usd = self._net_upl(positions)     # OKX upl：纯价差、不含任何费用
+        # 不变式 I-2（轴 A）：`settling` **期间**这两行一次都不会被执行——`reconcile` 在调本方法
+        # 之前就把未决态分派给了 `_advance_settling`。但**建立未决态的这一轮**它们已经跑过了，而
+        # 此刻交易所侧已空 ⇒ `_net_upl` 恒返回 0。所以「冻结在侦测那一刻」要冻的是**上一轮**的值
+        # ——那是这笔仓最后一次真的被看见时的浮盈。不先存下来再回填，界面会显示「持有中 /
+        # 浮盈 0.00」，而那正是评审 RV-P1-9 点名的那个假数字。
+        prev_unrealized, prev_gross = self.unrealized_usd, self.gross_unrealized_usd
+        self.gross_unrealized_usd = self._net_upl(positions)      # OKX upl：纯价差、不含任何费用
         self.unrealized_usd = self._net_unrealized(self.gross_unrealized_usd, mark_px)
         if (self.projected != "flat" and abs_pos <= 0 and not grace
                 and self._snapshot_outranks_last_write()
                 and not self._external_close_suppressed()):
+            if self._settlement_armed():
+                # ① 轴 A：不就地合成，先冻结立场去向交易所要结算价（最多 deadline 秒）。
+                # **本轮不改 projected / realized_pnl_usd / unrealized**（不变式 I-2）。
+                self.unrealized_usd, self.gross_unrealized_usd = prev_unrealized, prev_gross
+                return events + self._begin_settling(mark_px, ts)
             # v2（P1-1）：侦测到交易所侧 / 外部已平仓，合成只读 external_close 成交后再校正为 flat。
-            events += self._synthesize_external_close(mark_px, ts, source="external")
-            self.realized_pnl_usd += self._close_pnl(mark_px)
-            self.unrealized_usd = self.gross_unrealized_usd = 0.0
-            self.projected = "flat"
-            self.entry_qty_sz = 0.0
-            self.entry_fee_usd = 0.0               # §3.3b 复位点 3/3：外部干预平仓（漏掉即静默重扣）
-            self.entry_position_pct = None
+            # 总闸关 / `settlement_fn is None`（live_auto 全部路径）走这里：**零加法键**（A-4 ⓐ 列）。
+            events += self._book_external_close(mark_px, ts, settlement=None)
             events.append(self._status_event("持仓已在交易所侧平仓 / 外部干预，已校正为 flat"))
+            return events
+        return events + self._note_orphan(abs_pos, ts, positions, grace)
+
+    # ---------- 轴 A：settling 状态机（`settlement_fn is None` ⇒ 整条不存在）----------
+    def _settlement_armed(self) -> bool:
+        """轴 A 是否装配：取数缝在 + 总闸开。两者缺一即逐字回退今天的立即合成。"""
+        return (self._settlement_fn is not None
+                and bool(getattr(self.settings, "ai_trade_settlement_truth_enabled", False)))
+
+    def _settling_blocks_close(self) -> bool:
+        """`settling` 期间**禁止一切出站平仓**（不变式 I-2b，评审 RV-P0-3）。
+
+        与既有 `_external_close_suppressed()` 立的是同一条规矩，方向也一致——**延后比编一个数
+        诚实，代价只是延后一轮**。缺了它会出现本轮唯一一条能同时污染真实资金账本与下游全部学习
+        样本的错误：`settling` 期间 `projected` 刻意不变，于是利润保护 / 持仓周期 / 模型 close /
+        flatten 仍会真的发平仓单，交易所回 `LIVE_NO_POSITION` ⇒ `_settle_benign_close` 抢先按
+        `mark_px` 落一条账并 `realized_pnl_usd +=`；下一 tick 结算命中再落一次 ⇒ **已实现盈亏被
+        加了两次**。`_synthesize_external_close` 的首行守卫只挡第二条 `trade`，挡不住调用方那一行。
+        """
+        return self._settling is not None
+
+    def _begin_settling(self, mark_px: float, ts: int) -> list[dict]:
+        """建立未决态：冻结立场与浮盈，推一条能看懂的 status。**不落任何库、不推 trade**（I-1）。"""
+        deadline_s = float(getattr(self.settings, "ai_trade_settlement_deadline_s", 90.0))
+        self._settling = SettlementPending(
+            detect_ts=int(ts), mark_px=float(mark_px),
+            deadline=time.time() + max(1.0, deadline_s),
+            entry_ts=self._entry_wall_ts(), direction=self.projected,
+            qty=self.entry_qty_sz,
+            frozen_unrealized=self.unrealized_usd,
+            frozen_gross_unrealized=self.gross_unrealized_usd)
+        return [self._status_event(
+            f"该持仓已在交易所侧平掉，正在取回真实结算价（最多 {int(deadline_s)} 秒），"
+            "期间本会话不会再对它发出任何平仓单")]
+
+    def _entry_wall_ts(self) -> int:
+        """本地开仓腿的**墙钟**秒（结算匹配判据 5 的左端）。
+
+        取最近一条开仓成交的 `wallTs ?? ts`：`_make_trade` 把 `ts` 吸附到了所属 K 线的开盘秒，而
+        交易所的 `cTime` 是真实墙钟——拿一个被吸附过的秒去比最多会早 `bar_seconds`，那正是判据 5
+        的 `tol_s` 要吸收的东西；但能拿到墙钟就绝不用吸附值（本仓库双时钟的成文教训）。
+        """
+        for trade in reversed(self.trades):
+            if trade.get("side") in ("long", "short"):
+                return int(trade.get("wallTs") or trade.get("ts") or 0)
+        return 0
+
+    async def _advance_settling(self, abs_pos: float, ts: int) -> list[dict]:
+        """未决态的三条出路：幻影撤销 / 结算命中 / 死线到期。**绝不第四条**（R-1）。"""
+        pending = self._settling
+        if pending is None:                      # 防御：并发路径已清掉它
+            return []
+        if abs_pos > 0:
+            # ② a. 幻影：持仓又回来了（快照抖动 / 部分平仓）⇒ 撤销等待，一个字节都不落。
+            self._settling = None
+            self.unrealized_usd = pending.frozen_unrealized
+            self.gross_unrealized_usd = pending.frozen_gross_unrealized
+            return [self._status_event("持仓仍在交易所侧，已撤销本次结算等待，恢复正常盯市")]
+        now = time.time()
+        fact, reject = await self._poll_settlement(pending, now)
+        if fact is not None or reject is not None:
+            return self._finish_settling(fact, ts, reject_reason=reject)
+        if now >= pending.deadline:
+            # ② c. 死线：按侦测那一刻的 `mark_px` 落账（价格与今天**逐位相同**，只多三个留痕键）。
+            return self._finish_settling(None, ts, reject_reason=None)
+        return []
+
+    async def _poll_settlement(self, pending: SettlementPending,
+                               now: float) -> tuple[SettlementFact | None, str | None]:
+        """按节流去取一次结算行；异常一律吞掉并回 `(None, None)`（原则 4：fail-safe 方向是照旧）。
+
+        Returns:
+            `(fact, reject_reason)`——`fact` 非空即命中；`reject_reason` 非空表示**命中了但不自洽**
+            （费率残差为负），调用方据它降级为 `local_mark` 并把原因写进 `explain.meta`。
+        """
+        interval = float(getattr(self.settings, "ai_trade_settlement_poll_interval_s", 8.0))
+        if now - pending.last_poll_wall < max(0.5, interval):
+            return None, None
+        pending.last_poll_wall = now
+        try:
+            rows = await self._settlement_fn()
+        except Exception as exc:  # noqa: BLE001 —— 取数失败绝不把一条已发生的平仓拖住
+            logger.debug("ai-trade settlement fetch failed (%s): %s", self.inst_id, exc)
+            return None, None
+        fact = match_settlement(
+            rows or [], SettlementQuery(
+                inst_id=self.inst_id, direction=pending.direction,
+                entry_ts=pending.entry_ts, detect_ts=pending.detect_ts),
+            claimed=set(self._settled_pos_ids),
+            tol_s=int(getattr(self.settings, "ai_trade_settlement_match_tol_s", 60)))
+        if fact is None:
+            return None, None
+        # 费率残差的守卫有现成先例（`resume._offline_exit_trade` 的 `if fee < 0: return None`）：
+        # 本地已记的开仓腿费比交易所收的往返总费还大，是一个**明确的不自洽**。`max(0.0, …)` 会把
+        # 它静默夹成 0——那正是本轮在治的那类假数字。宁可退回本地合成，并让原因在数据上可见。
+        if fact.fee_usd - self.entry_fee_usd < 0:
+            return None, "fee_residual_negative"
+        return fact, None
+
+    def _finish_settling(self, fact: SettlementFact | None, ts: int, *,
+                         reject_reason: str | None) -> list[dict]:
+        """结束未决态并落账**一次**。首行自检使本方法幂等（评审 RV-P0-3 / 门禁 `G-A13`）。"""
+        pending, self._settling = self._settling, None
+        if pending is None:
+            return []
+        if self.projected == "flat" or self.entry_qty_sz <= 0:
+            # 这笔仓已被别的通路落过账（如 `_settle_benign_close` 抢先）⇒ **一个字节都不落**。
+            # 只清状态并说明，绝不再加一次 `realized_pnl_usd`。
+            return [self._status_event(
+                "结算价取回时该持仓已由其它通路落账，本轮不重复记账（已实现盈亏只计一次）")]
+        if fact is not None:
+            self._claim_pos_id(fact.pos_id)
+            self.settlement_exchange_count += 1
+        else:
+            self.settlement_local_mark_count += 1
+        self._pending_settlement_meta = {
+            "fact": fact, "markPx": pending.mark_px,
+            "waitedS": max(0, int(ts) - pending.detect_ts),
+            "bookedOpenFeeUsd": self.entry_fee_usd, "rejectReason": reject_reason}
+        events = self._book_external_close(pending.mark_px, ts, settlement=fact)
+        if not any(e.get("type") == "trade" for e in events):
+            # 合成抛异常被 best-effort 吞掉（`_synthesize_external_close` 的 except 返回 []）⇒
+            # 槽里那份 meta 没有归属者了。不就地清掉，它会被**下一笔**平仓认领——那是一次张冠李戴
+            # 的归因，而且看起来完全正常。轮级槽的纪律是「消费即清空」，这里是它的异常出口。
+            self._pending_settlement_meta = None
+        source = "交易所结算价" if fact is not None else "本地标记价（未能取回结算价）"
+        return events + [self._status_event(
+            f"持仓已在交易所侧平仓 / 外部干预，已按{source}落账并校正为 flat")]
+
+    def _claim_pos_id(self, pos_id: str) -> None:
+        """认领一个 `posId`（FIFO 淘汰最旧；不变式 I-3 说明了淘汰为什么是安全的）。"""
+        if not pos_id or pos_id in self._settled_pos_ids:
+            return
+        self._settled_pos_ids.append(pos_id)
+        if len(self._settled_pos_ids) > _SETTLED_POS_IDS_MAX:
+            del self._settled_pos_ids[:len(self._settled_pos_ids) - _SETTLED_POS_IDS_MAX]
+
+    def _book_external_close(self, ref_px: float, ts: int, *,
+                             settlement: SettlementFact | None) -> list[dict]:
+        """外部平仓落账的**唯一**出口（合成成交 + 立场复位六行），三列口径见 spec §4.A A-4。
+
+        `settlement is None` 时逐位等于本轮之前那六行（`G-A3` / `G-A8` 守）。
+        """
+        events = self._synthesize_external_close(ref_px, ts, source="external",
+                                                 settlement=settlement)
+        # 与上面那条腿**同源**：命中结算时按 `closeAvgPx` 与交易所口径，否则逐位等于今天。
+        self.realized_pnl_usd += self._settlement_pnl(
+            ref_px if settlement is None else settlement.close_px, settlement)
+        self.unrealized_usd = self.gross_unrealized_usd = 0.0
+        self.projected = "flat"
+        self.entry_qty_sz = 0.0
+        self.entry_fee_usd = 0.0                   # §3.3b 复位点 3/3：外部干预平仓（漏掉即静默重扣）
+        self.entry_position_pct = None
         return events
+
+    def _settlement_pnl(self, ref_px: float, settlement: SettlementFact | None) -> float:
+        """这条平仓腿的 `pnl`；命中结算时按**会话口径**取毛/净（评审 RV-P0-2 / 放行条件 C-2）。
+
+        判据是 `ai_trade_net_pnl_enabled` 而**不是**「`fee_ledger` 已装配」：记账开关
+        （`ai_trade_fee_accounting_enabled`）与口径开关是**两把独立开关**，而 `trades.pnl` 是毛
+        还是净只由后者决定（`reconcile.local_net_view` 的 `net_mode` 形参取的就是它）。在
+        `accounting=True & net_pnl=False` 的断面上按前者判，会把一条**净额** pnl 写进一个**毛额**
+        口径的会话，而 `local_net_view(net_mode=False)` 会再扣一次费 ⇒ 对账差额被人为放大。
+        """
+        if settlement is None:
+            return self._close_pnl(ref_px)
+        if bool(getattr(self.settings, "ai_trade_net_pnl_enabled", False)):
+            return settlement.gross_pnl_usd - settlement.fee_usd
+        return settlement.gross_pnl_usd
+
+    def take_settlement_meta(self) -> dict | None:
+        """取走并清空轮级槽（`session._inject_explain_meta` 的唯一消费点，**消费即清空**）。"""
+        slot, self._pending_settlement_meta = self._pending_settlement_meta, None
+        return slot
+
+    async def drain_settlement(self, ts: int) -> list[dict]:
+        """停手 / 暂停收尾：未决的结算带硬超时再问一次，仍不命中即按 `local_mark` 立刻落账（A-6）。
+
+        **绝不把一条已经发生的平仓留在 settling 里带进关停**——那会让这笔往返在历史详情里整条消失
+        （R-1 的第二重保险）。
+        """
+        pending = self._settling
+        if pending is None:
+            return []
+        timeout = float(getattr(self.settings, "ai_trade_reconcile_stop_timeout_s", 3.0))
+        fact = reject = None
+        if self._settlement_fn is not None:
+            pending.last_poll_wall = 0.0            # 收尾这一次不受节流约束
+            try:
+                fact, reject = await asyncio.wait_for(
+                    self._poll_settlement(pending, time.time()), timeout=max(0.5, timeout))
+            except Exception as exc:  # noqa: BLE001 —— 含 TimeoutError：超时即按本地标记价落账
+                logger.debug("ai-trade settlement drain gave up (%s): %s", self.inst_id, exc)
+        return self._finish_settling(fact, ts, reject_reason=reject)
+
+    # ---------- 轴 B：孤儿持仓的对称分支（只写状态与事件，零交易所写请求）----------
+    def _note_orphan(self, abs_pos: float, ts: int, positions: list[dict],
+                     grace: bool) -> list[dict]:
+        """`projected == "flat" and abs_pos > 0` —— 今天 `_on_reconcile_ok` 全文缺失的那个方向。
+
+        总闸关 ⇒ 本方法整条空转（`self.orphan` 恒 None ⇒ `_status_payload` 无该键，`G-B7`）。
+        """
+        if not bool(getattr(self.settings, "ai_trade_orphan_detect_enabled", False)):
+            return []
+        state = classify_orphan(OrphanFacts(
+            projected=self.projected, abs_pos=abs_pos, settling=self._settling is not None,
+            fill_grace=grace, streak=self._orphan_streak),
+            confirm_rounds=int(getattr(self.settings, "ai_trade_orphan_confirm_rounds", 3)))
+        if state == "none":
+            self._orphan_streak = 0
+            self._orphan_since_ts = 0
+            self.orphan = None
+            self.orphan_alerted = False           # 消失即复位，下次再出现要能重新告警
+            return []
+        self._orphan_streak += 1
+        if self._orphan_since_ts <= 0:
+            self._orphan_since_ts = int(ts)
+        self.orphan = orphan_wire(
+            state, qty=abs_pos, avg_px=self._net_avg_px(positions),
+            upl_usd=self._net_upl(positions), since_ts=self._orphan_since_ts)
+        if state != "confirmed" or self.orphan_alerted:
+            return []
+        self.orphan_alerted = True                # 幂等：只推一条，`resume()` 里清零
+        return [{"type": "error", "data": {
+            "ts": int(ts), "code": "AI_TRADE_ORPHAN_POSITION",
+            "message": orphan_message(
+                self.orphan, inst_id=self.inst_id,
+                block_open=bool(getattr(self.settings, "ai_trade_orphan_block_open", False)))}}]
+
+    def _net_avg_px(self, positions: list[dict]) -> float:
+        """该标的持仓的开仓均价（多行时按张数加权；算不出 ⇒ 0.0）。"""
+        rows = [p for p in positions if str(p.get("instId")) == self.inst_id]
+        weight = sum(abs(_num_or_zero(p.get("pos"))) for p in rows)
+        if weight <= 0:
+            return 0.0
+        total = sum(abs(_num_or_zero(p.get("pos"))) * _num_or_zero(p.get("avgPx"))
+                    for p in rows)
+        return total / weight
 
     def _snapshot_outranks_last_write(self) -> bool:
         """这份持仓读数是不是**比我自己最近一次私有写更新**（轴 C-4 防御纵深）。
@@ -823,6 +1184,11 @@ class LiveExecutor:
         events: list[dict] = []
         if self.resting is not None:
             _, events = await self._cancel_resting("session_stop", ts)   # 采纳成交会改写 projected
+        # 不变式 I-2b：停手时若结算未决，**先把它收掉**（带硬超时）再判早退。收掉之后 projected
+        # 已归 flat，下方早退自然命中——绝不在一笔已经平掉的仓位上再发一张平仓单，也绝不把这条
+        # 已经发生的平仓留在未决态里带进关停（那会让这笔往返在历史详情里整条消失，R-1）。
+        if self._settling is not None:
+            events += await self.drain_settlement(ts)
         if self.projected == "flat":
             return self._with_cancel_events({"ok": True, "closedSz": 0}, events)
         close = ClosePositionInput(
@@ -992,7 +1358,8 @@ class LiveExecutor:
                     sl: float | None = None, explain: dict | None = None,
                     cl_ord_id: str | None = None, ord_id: str | None = None,
                     seeded: bool = False, position_pct: float | None = None,
-                    ord_type: str = "market", expected_px: float | None = None) -> dict:
+                    ord_type: str = "market", expected_px: float | None = None,
+                    override_fee_usd: float | None = None) -> dict:
         position_after = sz if side == "long" else (-sz if side == "short" else 0.0)
         # 轴 D 的**唯一写点**：`ts` 吸附到所属那根 K 线的开盘秒（图表标记 / 悬停索引读它）。
         wall = int(ts)
@@ -1022,7 +1389,8 @@ class LiveExecutor:
         if ord_id:
             trade["ordId"] = ord_id
         trade.update(trade_fee_fields(self.fee_ledger, cl_ord_id=cl_ord_id, side=side, sz=sz,
-                                      px=price, ord_type=ord_type, expected_px=expected_px))
+                                      px=price, ord_type=ord_type, expected_px=expected_px,
+                                      override_fee_usd=override_fee_usd))
         return trade
 
     # ---------- 解释合成（纯函数、异常隔离，绝不进入 place / close 调用栈，R1）----------
@@ -1057,19 +1425,39 @@ class LiveExecutor:
             return as_close(sig_explain)
         return build_atomic_explain("close", reason or "signal_close")
 
-    def _synthesize_external_close(self, ref_px: float, ts: int, *, source: str) -> list[dict]:
-        """合成一条交易所侧 / 外部平仓的只读成交（仅记录已发生的平仓，不下任何单；best-effort，R11）。"""
+    def _synthesize_external_close(self, ref_px: float, ts: int, *, source: str,
+                                   settlement: SettlementFact | None = None) -> list[dict]:
+        """合成一条交易所侧 / 外部平仓的只读成交（仅记录已发生的平仓，不下任何单；best-effort，R11）。
+
+        `settlement`（keyword-only，**默认 None ⇒ 逐字节回退**，`live_auto` 全部路径与全部既有单测
+        走的就是它）：命中交易所结算行时，价格取 `closeAvgPx`、盈亏取交易所口径、费率取
+        **往返总费减去本地已记的开仓腿费**。
+
+        为什么费率取残差而不是直接覆盖两条腿：开仓腿已经落过库、已经进过换手闸与成本模型，回改它
+        违反原则 5（一条成交腿只被写一次）。而 `trip_ledger.SettledTrip.fee_usd` 的定义本来就是
+        `open_fee_usd + close_fee`，故把残差全部记在平仓腿上时**往返口径是精确的**，只有腿间分摊
+        是近似的——而全仓没有任何一个消费者按单腿费率做判定（`realizedCostBps` / `costErrorBps` /
+        `reconcile` 全部是往返口径）。残差为负（明确的不自洽）在上游 `_poll_settlement` 就已被判掉，
+        绝不静默夹成 0。
+
+        `funding` / `liqPenalty` **刻意不进本地账本**（只进 explain.meta）：`reconcile` 的可比口径
+        `exchangeComparable = realized + funding + liq` 依赖本地不记这两项，记进来会让对账的差额
+        恒等于它们本身（`G-A12`）。
+        """
         if self.projected == "flat" or self.entry_qty_sz <= 0:
             return []
         try:
-            pnl = self._close_pnl(ref_px)
-            pnl_pct = self._close_return_pct(ref_px)   # v2（P1-2）：复位前算，先校验后相除
+            exit_px = ref_px if settlement is None else settlement.close_px
+            pnl = self._settlement_pnl(exit_px, settlement)
+            pnl_pct = self._close_return_pct(exit_px)  # v2（P1-2）：复位前算，先校验后相除
             explain = build_external_close_explain(
                 pos_side=self.projected, source=source, entry_price=self.entry_price,
-                exit_price=ref_px, pnl=pnl)
-            trade = self._make_trade(ts, "close", ref_px, self.entry_qty_sz, pnl=pnl,
+                exit_price=exit_px, pnl=pnl)
+            trade = self._make_trade(ts, "close", exit_px, self.entry_qty_sz, pnl=pnl,
                                      pnl_pct=pnl_pct, reason="external_close", explain=explain,
-                                     position_pct=self.entry_position_pct, expected_px=ref_px)
+                                     position_pct=self.entry_position_pct, expected_px=exit_px,
+                                     override_fee_usd=None if settlement is None
+                                     else settlement.fee_usd - self.entry_fee_usd)
             self._record_trade(trade)
             return [{"type": "trade", "data": trade}]
         except Exception:  # noqa: BLE001 —— 合成失败回落原 status，绝不影响 reconcile / flatten 主流程
@@ -1129,6 +1517,22 @@ class LiveExecutor:
     def _error_event(self, ts: int, exc: OKXError) -> dict:
         return {"type": "error", "data": {"ts": int(ts), "code": exc.code,
                                           "message": exc.message}}
+
+    def _note_resting_cancel(self, reason: str) -> None:
+        """一次真的发生了的撤单按原因分格（轴 E 观测半；`aiStats.sizing` 的三个读点之二）。
+
+        `"replace"` = cancel-replace（撤掉再按新价挂回去，真正的「重挂」）；`"expired"` = TTL 到期；
+        其余（`agent` / `pause` / `session_stop`）归 `restingCancelled`。三格分开是刻意的：E-0 前置
+        调查的结论正是「那 5 次同价重挂里一次都不是 cancel-replace」，而只有分格才能让下一轮直接
+        从生产读数上读出这件事，不必再翻一次日志。
+        """
+        if reason == "replace":
+            self.resting_repriced += 1
+        elif reason == "expired":
+            self.resting_expired += 1
+            self.resting_cancelled += 1
+        else:
+            self.resting_cancelled += 1
 
     def _note_open_expired(self, order: RestingOrder | None) -> None:
         """一笔**开仓**挂单未成交即消失（我方撤 / 到期撤 / 交易所侧撤）：记进 E-7 的累计计数。

@@ -11,7 +11,8 @@ import asyncio
 import json
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi import (APIRouter, Body, Depends, HTTPException, Query, WebSocket,
+                     WebSocketDisconnect)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai_auto import get_ai_trade_manager
@@ -664,6 +665,44 @@ async def ai_trade_member_relink(group_id: str, inst_id: str) -> dict:
         raise HTTPException(409, detail={"code": exc.code, "message": exc.message}) from exc
     if result is None:
         raise HTTPException(404, detail={"code": "NOT_FOUND", "message": "分组或成员不存在"})
+    return result
+
+
+@router.post("/ai-trade/{group_id}/member/{inst_id}/adopt-orphan")
+async def ai_trade_member_adopt_orphan(group_id: str, inst_id: str,
+                                       body: dict | None = Body(default=None)) -> dict:
+    """把交易所侧那笔未接管持仓接进当前会话（fill-truth-and-effective-controls 轴 B）。
+
+    路径与既有五个成员端点**同构**（`/ai-trade/{group_id}/member/{inst_id}/…`）：多标的分组是既有
+    能力，同一个 `instId` 可以同时出现在两个运行中的分组里，丢掉 `group_id` 会让 404 的语义在那时
+    是错的（评审 RV-P1-5）。
+
+    **必须二次确认**（`{"confirm": true}`）：这是本轮唯一一个会改写真实资金立场的端点，而它接管的
+    是一笔来路不明的持仓——`confirm` 缺失即 400，绝不让一次误点改变账本。
+
+    **刻意不守 AI 总闸**（与 `/exit`、`/backstop/repair`、`/relink` 同理）：把一笔无人看管的持仓
+    纳入管辖是**收敛**风险的动作，任何时候都该能执行。暂停态同样放行（§十三 Q5 的裁定：留在孤儿态
+    同样无人看管，而且还多一层「系统不知道它存在」），会话侧的回执会写明后果。
+
+    **返回裸 `dict`、不绑 `response_model`**：`response_model` 会静默吞掉新 wire 键（本仓库出过事
+    的形态，同类三个端点同款）。
+    """
+    if not isinstance(body, dict) or body.get("confirm") is not True:
+        raise HTTPException(400, detail={
+            "code": "CONFIRM_REQUIRED",
+            "message": "接管交易所侧持仓会改变本会话的真实资金立场，请显式确认（confirm: true）"})
+    try:
+        result = await get_ai_trade_manager().adopt_orphan_member(group_id, inst_id)
+    except OKXPrivateError as exc:
+        raise HTTPException(502, detail={
+            "code": exc.code,
+            "message": f"向交易所取持仓断面失败：{exc.message}"}) from exc
+    if result is None:
+        raise HTTPException(404, detail={"code": "MEMBER_NOT_FOUND",
+                                         "message": "分组或成员不存在"})
+    if not result.get("ok"):
+        raise HTTPException(409, detail={"code": result.get("code") or "NO_ORPHAN",
+                                         "message": result.get("message") or ""})
     return result
 
 

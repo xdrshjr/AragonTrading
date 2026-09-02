@@ -311,6 +311,40 @@ export interface TriggerExplain {
      * 两处都走 `readRMultiple()` 这一个读点，绝不在渲染点各写一份兜底链。
      */
     rMultiple?: number | null;
+    // ---- 成交真值化（fill-truth-and-effective-controls 轴 A）：外部平仓那条腿的价格来源 ----
+    // 今天 `_synthesize_external_close` 按**本地 `mark_px`** 合成这条腿的价格，代码自己的注释
+    // 把这件事叫做「按 mark_px 捏造盈亏」。生产实测 20 条有交易所结算读数的 run 上，本地账本
+    // 比交易所可比口径少报了 24.6% 的真实亏损，而其中最干净的一条反证（run 1627 / SOL）按
+    // `stop_loss_price` 重算的毛额与交易所回报只差 1.3%——那两笔是被交易所侧的 OCO 止损打掉的。
+    // 算不出的键**整键缺席**（后端 `settlement_meta_wire` 绝不写 null），故这里全部可选。
+    /** `exchange` = 拿到了交易所结算价；`local_mark` = 没拿到，按侦测那一刻的标记价入账。 */
+    settlementSource?: "exchange" | "local_mark";
+    settlementPosId?: string;
+    settlementCloseTs?: number;
+    /** 从侦测到落账等了多少秒。 */
+    settlementWaitedS?: number;
+    markPxAtDetect?: number;
+    /**
+     * `(结算价 − 侦测那一刻的标记价) / 标记价 × 1e4`。
+     *
+     * **这是本轮最重要的一个观测量**：它把「本地合成价到底差多少」从推断变成读数。
+     */
+    settlementPriceGapBps?: number;
+    exchangeGrossPnlUsd?: number;
+    exchangeFeeUsd?: number;
+    /**
+     * 交易所口径的资金费与强平罚金（正 = 支出）。
+     *
+     * 它们**只到 `explain.meta` 为止、绝不进本地账本**：`reconcile` 的可比口径
+     * `exchangeComparable = realized + funding + liq` 依赖本地不记这两项，记进来会让对账的差额
+     * 恒等于它们本身。但它们正是「交易所毛额盈亏」与用户在 OKX 上看到的那个数之间的全部差值，
+     * 故这里是它们唯一的落点。
+     */
+    exchangeFundingUsd?: number;
+    exchangeLiqUsd?: number;
+    bookedOpenFeeUsd?: number;
+    /** 命中了结算行却判定不自洽（如费率残差为负）时的原因码；此时 source 为 `local_mark`。 */
+    settlementRejectReason?: string;
   };
 }
 

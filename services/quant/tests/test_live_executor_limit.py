@@ -9,6 +9,7 @@ OKX 调用全程经注入桩，不触网；铁律：占位假凭证，绝不写�
 """
 from __future__ import annotations
 
+import time
 from dataclasses import asdict
 
 from app.ai_auto.order_plan import OrderPlan
@@ -129,7 +130,12 @@ async def test_resting_open_does_not_set_projected():
     assert calls["orders"][0].ord_type == "limit" and calls["orders"][0].px == _LIMIT_PX
     assert ex.projected == "flat"
     assert ex.resting is not None and ex.resting.intent == "open"
-    assert ex.resting.expire_ts == _TS + int(Settings().ai_trade_limit_order_ttl_s)
+    # TTL 的起点是**墙钟**，不是决策轮的 `ts`（fill-truth-and-effective-controls 轴 E）。本行原本
+    # 断言的是 `_TS + ttl`，而 `_TS` 是一个捏造的 1000——那正好把「用一个 K 线开盘时间戳当 TTL
+    # 起点、却用墙钟判到期」这个双时钟缺陷冻结了下来。生产实测它让挂单出生即过期（存活 2~4 秒）。
+    now = int(time.time())
+    assert now <= ex.resting.expire_ts <= now + int(Settings().ai_trade_limit_order_ttl_s) + 2
+    assert ex.resting.created_ts != _TS
 
 
 async def test_unfilled_resting_survives_reconcile_without_phantom_fill():
@@ -222,13 +228,32 @@ async def test_partially_filled_adopts_only_the_increment():
 
 
 async def test_expired_resting_is_cancelled():
-    """TTL 到期由 `_poll_resting` 撤单：Agent 唤醒是离散的，永不成交的挂单须有兜底。"""
+    """TTL 到期由 `_poll_resting` 撤单：Agent 唤醒是离散的，永不成交的挂单须有兜底。
+
+    `reconcile` 的 `ts` 用**墙钟**推进（轴 E）：`is_expired` 一直就是拿盯市循环的
+    `int(time.time())` 去比的，本用例此前用 `_TS + ttl` 只是恰好与旧的 `created_ts=ts` 自洽。
+    """
     ex, calls = _make_executor(order_state_seq=[{"state": "live"}])
     await _open_resting(ex)
-    expired_ts = _TS + int(Settings().ai_trade_limit_order_ttl_s)
+    expired_ts = int(time.time()) + int(Settings().ai_trade_limit_order_ttl_s) + 1
     await ex.reconcile(_REF_PX, expired_ts)
     assert len(calls["cancels"]) == 1
     assert ex.resting is None
+    assert ex.resting_expired == 1 and ex.resting_cancelled == 1
+
+
+async def test_resting_ttl_wall_clock_gate_off_restores_bar_ts_stamp():
+    """总闸 11 关 ⇒ `created_ts` 逐字回退今天的「决策轮 ts」（双时钟行为原样保留）。
+
+    这是轴 E 的回退档断言：一个新默认必须能被一把开关按回去，否则它不是修复而是一次不可逆的
+    行为变更。
+    """
+    settings = Settings(ai_trade_resting_ttl_wall_clock=False)
+    ex, _ = _make_executor(settings=settings)
+    await _open_resting(ex)
+    assert ex.resting is not None
+    assert ex.resting.created_ts == _TS
+    assert ex.resting.expire_ts == _TS + int(settings.ai_trade_limit_order_ttl_s)
 
 
 async def test_externally_canceled_resting_converges_to_none():

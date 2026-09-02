@@ -7,6 +7,7 @@ import {
   hasDirectionAxis,
   type DirectionRow,
 } from "@/lib/aiTradeFunnel";
+import type { AiTradeContrarianBlocked } from "@/lib/aiTradeHistoryTypes";
 import type { AiTradeOpenFunnel } from "@/lib/aiTradeTypes";
 
 /**
@@ -25,8 +26,19 @@ import type { AiTradeOpenFunnel } from "@/lib/aiTradeTypes";
  */
 export default function DirectionBalanceCard({
   funnel,
+  contrarianBlocked,
 }: {
   funnel: AiTradeOpenFunnel | null | undefined;
+  /**
+   * 逆势通路被拦下的五格细分（fill-truth-and-effective-controls 轴 D-2）。
+   *
+   * 生产实测 `contrarianPassed` 在 2373 个决策轮里恒为 0——而「一次都没放行过」与「放行了但都
+   * 亏了」在这张卡上此前长得一模一样。只有分格才能回答「它到底死在哪一条判据上」，而那正是
+   * 判断「本轮的档位语义修复有没有真的生效」的唯一依据（验收 `AC-5`）。
+   *
+   * 整段缺席（一次逆势否决都没发生 / 老记录）⇒ 不渲染这一段，绝不显示一排全零。
+   */
+  contrarianBlocked?: AiTradeContrarianBlocked | null;
 }) {
   // 老会话 / 总闸关 / 后端未上线方向轴 ⇒ 整卡不渲染（渲染门控：绝不在没有数据的会话上挂一排 0）。
   if (!hasDirectionAxis(funnel)) return null;
@@ -81,6 +93,8 @@ export default function DirectionBalanceCard({
         </p>
       )}
 
+      <ContrarianBlockedRow blocked={contrarianBlocked} />
+
       <p className="text-[10px] leading-relaxed text-[var(--muted)]">
         实心段为
         <strong className="text-[var(--text)]">真的成交</strong>
@@ -91,6 +105,52 @@ export default function DirectionBalanceCard({
         的轮次（置信度门槛在方向可见之前就拦下了它们），它不计入任何方向占比。
       </p>
     </div>
+  );
+}
+
+/**
+ * 逆势通路被拦下的五格细分（轴 D-2）。
+ *
+ * 五个码的判定顺序即这里的展示顺序（`_contrarian_block` 的四条件 + 最后那条强制降档判据）：
+ * 反向票超限 → 会话配额用尽 → 自报置信度不足 → 逐字证据不足 → 强制降档不合法。
+ *
+ * `size`（强制降档不合法）那一格是本轮最该被盯住的：生产实测它在 `step=0.5` 的默认世界里
+ * **吃掉了整条通路**——`0.5 × 0.5 = 0.25` 被量化吸附回 `0.5`，于是「降档被请求了却没有真的
+ * 发生」这条判据恒成立。本轮把它改成了档位语义（掉一格 / 已在最低格即视为已降档），故它应当
+ * 明显下降；若上线后它仍是最大的一格，说明修复没有生效。
+ *
+ * 全零 / 缺席 ⇒ 整行不渲染。
+ */
+function ContrarianBlockedRow({
+  blocked,
+}: {
+  blocked?: AiTradeContrarianBlocked | null;
+}) {
+  if (!blocked) return null;
+  const cells: { key: keyof AiTradeContrarianBlocked; label: string }[] = [
+    { key: "opposed", label: "反向票超限" },
+    { key: "quota", label: "会话配额用尽" },
+    { key: "conf", label: "自报置信度不足" },
+    { key: "evidence", label: "逐字证据不足" },
+    { key: "size", label: "强制降档不合法" },
+  ];
+  const shown = cells.filter((c) => (blocked[c.key] ?? 0) > 0);
+  if (shown.length === 0) return null;
+  return (
+    <p
+      className="text-[10px] leading-relaxed text-[var(--muted)]"
+      data-testid="ai-contrarian-blocked"
+    >
+      逆势通路被拦下：
+      {shown.map((c, i) => (
+        <span key={c.key}>
+          {i > 0 ? " · " : ""}
+          <span className={c.key === "size" ? "text-[var(--warn)]" : undefined}>
+            {c.label} {blocked[c.key]}
+          </span>
+        </span>
+      ))}
+    </p>
   );
 }
 

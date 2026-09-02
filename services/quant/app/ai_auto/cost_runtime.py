@@ -26,6 +26,7 @@ from .edge_gate import EdgeGateOutcome, evaluate_edge_gate
 from .fee_rates import FeeRateCache, attempt_from_wire, snapshot_from_wire
 from .funding import FundingCache
 from .funding_ledger import FundingLedger
+from ..live_auto.settlement import coverage_wire
 from .reconcile import (build_reconciliation, drift_message, local_net_view,
                         resolve_reconcile_params)
 from .stats_ext import build_cost_stats, cost_snapshot_wire, merge_cost_stats
@@ -58,6 +59,13 @@ class CostRuntime:
         # 预览成本的开仓腿意图：**复用会话装配时算出的那个 `allow_limit` 值本身**，不在本层重读
         # settings——否则一旦 `allow_limit` 变成按会话可覆盖，prompt 说的与模型实际能下的就会分叉。
         self.allow_limit = bool(allow_limit)
+        # 轴 A/F：结算覆盖率与本金。**用一个同步 setter 而不是把它们串成 5 层形参**——
+        # `schedule_maintenance → _bounded_maintenance → _maintenance_round → reconcile_tick →
+        # _run_reconcile` 已经是 5 跳，再加两个实参会把中间三个函数一起顶破「形参 ≤5」的红线，
+        # 而它们只是搬运。取数按鸭子类型读 `executor`（与 `claim_estimate(resting)` 同一范式），
+        # 本层不 import `LiveExecutor`。未调用过 ⇒ 两者恒 None ⇒ 两个加法键整键缺席（逐字回退）。
+        self._settlement_coverage: dict | None = None
+        self._capital_usd: float | None = None
         # 轴 D 让 prompt 消费成本读数后，`k_min = 0`（默认）下资金费率**已有消费方**，故构造条件
         # 由「门禁生效」放宽为「门禁生效 或 成本意识开启」（B-6：不是推翻 I-2，而是消费方真的出现了）。
         # [P1-7] 资金费账本（轴 A）是资金费率快照的**第三个**消费方，故它的总闸必须并进这条析取
@@ -446,7 +454,8 @@ class CostRuntime:
         return build_reconciliation(
             local_net_usd=view["netUsd"], local_trips=view["trips"], rows=rows,
             window_start_ts=window_start_ts, params=resolve_reconcile_params(self.settings),
-            final=final, inst_id=self.inst_id)
+            final=final, inst_id=self.inst_id, settlement=self._settlement_coverage,
+            capital_usd=self._capital_usd)
 
     def _drift_event(self, rec: dict, final: bool) -> dict | None:
         """连续 drift 达阈推一条 error 事件；**终态对账不推进连击、不推事件**（P1-5）。"""
@@ -507,6 +516,19 @@ class CostRuntime:
         """
         if self.settings.ai_trade_trip_ledger_enabled:
             self.attribution.note_estimate(build_round_estimate(out, decision, wake_kind))
+
+    def note_settlement(self, executor) -> None:
+        """从执行器抄一份结算覆盖计数与本金（轴 A/F 的**唯一**取数点，同步、零 IO）。
+
+        `coverage_wire` 在两个计数都为 0 时返回 `None` ⇒ `settlementCoverage` **整键省略**：
+        「一次外部平仓都还没发生」与「发生了但一次都没拿到真值」是两件完全不同的事，用同一个 0
+        表示会让 `AC-1` 的分母失去意义（`G-F3`）。
+        """
+        self._settlement_coverage = coverage_wire(
+            int(getattr(executor, "settlement_exchange_count", 0) or 0),
+            int(getattr(executor, "settlement_local_mark_count", 0) or 0))
+        budget = float(getattr(executor, "budget_usd", 0.0) or 0.0)
+        self._capital_usd = budget if budget > 0 else None
 
     def claim_estimate(self, resting) -> None:
         """[P0-2] 下单那一刻按 `clOrdId` 冻结估计；非**开仓**挂单 / 无挂单 ⇒ 空转。

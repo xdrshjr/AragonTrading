@@ -64,7 +64,26 @@ def merge_cost_stats(base: dict, ext: dict) -> dict:
     return merged
 
 
-def build_sizing_stats(counters, brake_counters, brake_state) -> dict:
+def build_consensus_stats(contrarian_blocked: dict | None) -> dict:
+    """逆势通路五格细分 → `aiStats.consensus`（fill-truth-and-effective-controls 轴 D-2）。
+
+    **空 dict ⇒ 返回 `{}` ⇒ 整段缺席**：一次逆势否决都没发生过与「五格全 0」是两件事，后者会让
+    面板上多出一张永远全零的卡，而那正是本仓库反复付过代价的那种「有写点没读点」的镜像形态。
+
+    Args:
+        contrarian_blocked: `discipline_runtime.contrarian_blocked()` 的产物。
+
+    Returns:
+        `{"consensus": {"contrarianBlocked": {...}}}` 或 `{}`。
+    """
+    if not contrarian_blocked:
+        return {}
+    cells = ("opposed", "quota", "conf", "evidence", "size")
+    return {"consensus": {"contrarianBlocked":
+                          {cell: int(contrarian_blocked.get(cell, 0)) for cell in cells}}}
+
+
+def build_sizing_stats(counters, brake_counters, brake_state, executor=None) -> dict:
     """仓位 / 刹车层的加法键（`aiStats.sizing`；vol-sizing-and-drawdown-brake §3.9）。
 
     三组读数刻意分开：`scaledRounds` 说明本层**真的缩过**，`quantizeErasedRounds` 说明其中有多少次
@@ -75,6 +94,8 @@ def build_sizing_stats(counters, brake_counters, brake_state) -> dict:
         counters: `SizingRuntime._Counters`（轮级）。
         brake_counters: `drawdown_brake.BrakeCounters`（档位触发级）。
         brake_state: `drawdown_brake.BrakeState`（会话级最大回撤）。
+        executor: `LiveExecutor | None`——轴 E 的三个挂单去留计数住在它身上（挂单的生命周期跨轮，
+            会话侧的轮级容器承载不了它）。`None` ⇒ 三个键整键缺席（回测与既有调用点逐字回退）。
 
     Returns:
         `{"sizing": {...}}` 形状的纯加法 dict。
@@ -95,7 +116,28 @@ def build_sizing_stats(counters, brake_counters, brake_state) -> dict:
         "atrStopRounds": counters.atr_stop_rounds,
         "reversalSkips": counters.reversal_skips, "restingSkips": counters.resting_skips,
         "corrScaledRounds": counters.corr_scaled_rounds,
-        "exposureUnreachableRounds": counters.exposure_unreachable_rounds}}
+        "exposureUnreachableRounds": counters.exposure_unreachable_rounds,
+        # 轴 C-1：两条地板判据各自的否决轮数。分开报是刻意的——前者是一个恒等式（风险预算为零），
+        # 后者是一个可调阈值；只报合计会让「闸 9 到底该不该打开」永远没有依据。
+        "solvedZeroVetoes": counters.solved_zero_vetoes,
+        "belowFloorVetoes": counters.below_floor_vetoes,
+        **_resting_stats(executor)}}
+
+
+def _resting_stats(executor) -> dict:
+    """轴 E 观测半的三个挂单去留计数；`executor` 缺席 ⇒ `{}`（整键缺席，逐字回退）。
+
+    `restingKept` 与既有的 `restingSkips` **不是同一件事**（`G-E5`）：后者是「因为有挂单而跳过本轮
+    开仓」，前者是「本轮想挂的与已挂的逐字同向同价，于是保留原单不撤不重挂」。同一轮里两者至多
+    有一个 +1。`restingExpired` 是 `restingCancelled` 的子集，单列出来是因为它正是轴 E 那条双时钟
+    修复的效果读数——修好之前它在 15m 根上几乎等于全部挂单笔数。
+    """
+    if executor is None:
+        return {}
+    return {"restingKept": int(getattr(executor, "resting_kept", 0) or 0),
+            "restingRepriced": int(getattr(executor, "resting_repriced", 0) or 0),
+            "restingCancelled": int(getattr(executor, "resting_cancelled", 0) or 0),
+            "restingExpired": int(getattr(executor, "resting_expired", 0) or 0)}
 
 
 def merge_sizing_stats(base: dict, ext: dict) -> dict:

@@ -36,8 +36,8 @@ from ..live_auto.executor import LiveExecutor
 from ..live_auto.fee_ledger import build_fee_ledger
 from ..okx.accounts import AccountCredentials
 from ..okx.order_builder import snap_size
-from ..okx.trading import (fetch_live_open_orders, fetch_live_positions, fetch_trade_fee_ex,
-                          fetch_trading_config)
+from ..okx.trading import (fetch_live_open_orders, fetch_live_positions,
+                          fetch_position_history, fetch_trade_fee_ex, fetch_trading_config)
 from ..okx.types import BAR_SECONDS, FeeAttemptError, FeeFetchOutcome
 from ..paper.strategy_factory import PaperStrategySpec
 from .admission import get_admission_lock
@@ -1578,6 +1578,19 @@ class AiTradeManager:
         member = next((m for m in group.members if m.inst_id == inst_id), None)
         return None if member is None else await member.session.relink_feed()
 
+    async def adopt_orphan_member(self, group_id: str, inst_id: str) -> dict | None:
+        """人工授权的**单次**孤儿持仓接管（轴 B）；分组 / 成员不存在 ⇒ `None` → 404。
+
+        镜像 `relink_member` / `repair_member` 的既有姿态：只按 `(group_id, inst_id)` 定位并转发，
+        判定与写立场一律在会话侧（`AiTradeSession.adopt_orphan`）——manager 不做任何业务判断，
+        **也不改分组生命周期**（接管是会话继续运行的中途动作，不是 `stop`）。
+        """
+        group = self._group
+        if group is None or group.group_id != group_id:
+            return None
+        member = next((m for m in group.members if m.inst_id == inst_id), None)
+        return None if member is None else await member.session.adopt_orphan()
+
     async def repair_member(self, group_id: str, inst_id: str) -> dict | None:
         """人工授权的单次兜底补挂（backstop-repair §4.1）；分组 / 成员不存在 ⇒ `None` → 404。
 
@@ -2207,7 +2220,20 @@ class AiTradeManager:
             # 成交时钟对齐（discipline-preset-and-integrity 轴 D / D-3）：同款「只有 AI 链路传」的
             # 作用域缝。锚点（相位）由会话在每根确认根落地时写入 `executor.bar_anchor_ts`——这里
             # 只给周期长度，绝不预设 UTC 相位（OKX 的 12H/1D 是港时开盘，[P0-1]）。
-            bar_seconds=BAR_SECONDS[req.bar])
+            bar_seconds=BAR_SECONDS[req.bar],
+            # ★ 成交真值化的取数缝（fill-truth-and-effective-controls 轴 A-5）。装配点唯一，且
+            # **不新增形参**——`_build_executor` 已是 6 个形参（既有阈值偏离），`creds` 与
+            # `inst_id` 都已在作用域里，直接闭包构造即可，不把一条既有偏离推得更远（RV-P2-4）。
+            #
+            # `limit=20` 而不是对账那条的 100：这条取数是**高频、窄窗口**的（只关心刚刚那一笔），
+            # 20 行足以覆盖任何现实的并发结算，且把请求体积压到最小。`_settling` 为空时一个请求
+            # 都不发，故它不会给私有配额添任何常态负担。
+            # **`creds is None`（纸面 / 无凭证）⇒ 整条缝不传**，等价于总闸关：`settling` 状态机
+            # 构造性地不存在，`_on_reconcile_ok` 走今天的立即合成。缺了这道判断，纸面会话每遇到
+            # 一次外部平仓就会白等一整个 deadline（取数必然抛，被 fail-safe 兜住但仍是 90 秒的
+            # 无谓延迟），而它本来就没有可问的交易所。同款判据在本文件 `backstop_armed` 上已有先例。
+            settlement_fn=(None if creds is None
+                           else lambda: fetch_position_history(creds, inst_id, limit=20)))
         # [P0-4] 启动期复核结论随执行器走：纪律条的 `volSizing` 行据此**在第一次跳过发生之前**就
         # 示警。只在回执里说一句是不够的——回执用户看一眼就走了，而那一行会一直挂在面板上。
         executor.dust_risk = AiTradeManager._dust_risky(req, config, budget, lever)

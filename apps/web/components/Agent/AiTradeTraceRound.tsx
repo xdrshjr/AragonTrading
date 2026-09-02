@@ -119,6 +119,20 @@ function RetryBreadcrumb({ trace }: { trace: AiTradeRoundTrace }) {
 }
 
 /**
+ * 强制降档走的是哪条通路（fill-truth-and-effective-controls 轴 D 的前端读点）。
+ *
+ * 轴 D 之前这里恒写「（强制降档 ×0.5）」，那时它是对的——降档就是一次乘法。档位语义上线后
+ * 这句话在两条新通路上都成了假话：`gear` 掉的那一格由阶梯决定、与系数无关；而 `floor_is_min`
+ * 更是 `sizeBefore === sizeAfter`，界面会写出「仓位 50% → 50%（强制降档 ×0.5）」这种自相矛盾
+ * 的一行——恰恰是本轮在治的那类假数字。`downgradeLane` 缺席（老会话 / 总闸关）⇒ 回退旧文案。
+ */
+function describeDowngradeLane(gate: AiTradeTrendGate): string {
+  if (gate.downgradeLane === "gear") return "（强制降档：在档位阶梯上下调一档）";
+  if (gate.downgradeLane === "floor_is_min") return "（已在最低档位，无法再降，按最低档放行）";
+  return `（强制降档 ×${gate.sizeMult}）`;
+}
+
+/**
  * 趋势基调·逆势门槛的判定行（execution-trend-verdict §3.7.4-3 / §5.3）。
  *
  * 后端**只在本层真的判过**（`lane != "exempt"`）的轮次下发这个键，故它一出现就必然有话要说：
@@ -141,7 +155,7 @@ function TrendGateRow({ gate }: { gate: AiTradeTrendGate }) {
   } else if (gate.sizeBefore != null && gate.sizeAfter != null) {
     detail =
       `仓位 ${fmtNum(gate.sizeBefore * 100, 0)}% → ${fmtNum(gate.sizeAfter * 100, 0)}%` +
-      `（强制降档 ×${gate.sizeMult}）`;
+      describeDowngradeLane(gate);
   } else {
     detail = "本层未收紧本轮仓位";
   }

@@ -45,12 +45,16 @@ _SKEW_SHARE = 0.15
 # 决策链顺序（与 `session._run_decision_round` 的调用序逐字同构；顺序即漏斗层序）。
 # 末位 `other` 承接未知前缀——**未知前缀归 other 而不是静默丢弃**（G-11）：静默丢弃会让
 # `sum(blocked)` 小于真实拦截数，而这张图唯一的价值就是它闭合。
-LAYERS = ("baseRuleMaBand", "horizon", "profitCooldown", "turnover", "exchangeBackstop",
-          "drawdownBrake", "trendBias", "consensus", "confidence", "edgeGate", "reflection",
-          "other")
+LAYERS = ("baseRuleMaBand", "orphanPosition", "horizon", "profitCooldown", "turnover",
+          "exchangeBackstop", "drawdownBrake", "trendBias", "consensus", "confidence",
+          "edgeGate", "reflection", "other")
 
 LAYER_LABELS = {
-    "baseRuleMaBand": "基础策略·MA 通道", "horizon": "持仓周期纪律",
+    "baseRuleMaBand": "基础策略·MA 通道",
+    # 孤儿持仓（fill-truth-and-effective-controls 轴 B）：它是比任何纪律都更靠前的**事实性**阻断
+    # ——交易所侧存在一笔本会话不知道的持仓，此时再叠一笔自动仓位是本轮能想到的最坏结果。
+    "orphanPosition": "交易所侧存在未接管持仓",
+    "horizon": "持仓周期纪律",
     "profitCooldown": "保护性平仓冷却", "turnover": "换手预算",
     "exchangeBackstop": "交易所侧兜底", "drawdownBrake": "回撤刹车 / 连亏熔断",
     "trendBias": "趋势基调·逆势门槛",
@@ -63,6 +67,8 @@ LAYER_LABELS = {
 # 裸 `horizon_` 之前，否则换手与兜底会被吞进持仓周期那一格。
 _DEGRADE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("base_rule_", "baseRuleMaBand"),
+    # 与既有任何前缀都不撞；位置与 `LAYERS` 的层序同构（「顺序即优先级」要求新增条目显式声明）。
+    ("orphan_position", "orphanPosition"),
     ("horizon_turnover_budget", "turnover"),
     ("horizon_turnover_hysteresis", "horizon"),
     ("horizon_reentry_cooldown", "turnover"),

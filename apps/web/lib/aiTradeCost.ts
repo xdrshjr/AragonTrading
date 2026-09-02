@@ -25,6 +25,15 @@ export interface ReconcileWire {
   identityHolds: boolean | null;
   identityMaxGapUsd: number | null;
   windowStartTs: number;
+  // ---- fill-truth-and-effective-controls 轴 A/F 的两个加法键（老会话缺席 ⇒ 可选）----
+  /** 本次判定用的容差；有它，`ok` 的措辞才答得出「为什么这也叫已对上」。 */
+  tolUsd?: number | null;
+  /**
+   * 外部平仓的结算覆盖率。`exchange + localMark === 0` 时后端**整键省略**——「一次外部平仓都
+   * 还没发生」与「发生了但一次都没拿到真值」是两件完全不同的事，用同一个 0 表示会让验收判据
+   * `AC-1` 的分母失去意义。
+   */
+  settlementCoverage?: { exchange: number; localMark: number; ratio: number } | null;
 }
 
 // 一次费率取数失败的事实（后端 `okx.types.FeeAttemptError.wire()` 产物，
@@ -122,7 +131,36 @@ export function describeReconcile(rec: ReconcileWire | null | undefined): Reconc
     return { ...meta, detail: `差 ${diff}${ratio}；最后一笔尚未在交易所侧结算，稍后可重新对账。` };
   }
   const mismatch = rec.coverageMismatch ? "；本地往返数与交易所结算数不等，可能存在非本会话的手工持仓" : "";
-  return { ...meta, detail: `本地净额与交易所可比口径差 ${diff}${ratio}${mismatch}。` };
+  // 轴 F-4：`ok` 的措辞把「为什么这也叫已对上」当场答掉。合入前 `ok` 与 `drift` 共用这一句，
+  // 于是用户会同时看到绿色的「已对上」徽章与「差 +1.528 USDT」——徽章与它下面那行字互相打脸，
+  // 而那比「把差额藏起来」更坏：它训练用户不去读那个数。轴 F-1 落地后 `ok` 就真的意味着
+  // 「在容差内」了，这里如实把容差写出来。
+  const within = rec.status === "ok" && rec.tolUsd != null
+    ? `，在容差 ${+rec.tolUsd.toFixed(4)} USDT 内`
+    : "";
+  return { ...meta, detail: `本地净额与交易所可比口径差 ${diff}${ratio}${within}${mismatch}。` };
+}
+
+/**
+ * 结算覆盖率一行：外部平仓里有多少笔拿到了交易所的真实结算价（轴 A/F）。
+ *
+ * `settlementCoverage` 整键缺席（一次外部平仓都还没发生 / 轴 A 未装配）⇒ `null` ⇒ **整行不渲染**。
+ * 绝不显示一个 `0/0`——「还没发生」与「发生了但一次都没拿到」是两件完全不同的事。
+ */
+export function describeSettlementCoverage(
+  rec: ReconcileWire | null | undefined,
+): { text: string; tone: "ok" | "warn" | "muted" } | null {
+  const coverage = rec?.settlementCoverage;
+  if (!coverage) return null;
+  const total = (coverage.exchange ?? 0) + (coverage.localMark ?? 0);
+  if (total <= 0) return null;
+  const pct = +((coverage.ratio ?? 0) * 100).toFixed(1);
+  const tone = (coverage.ratio ?? 0) >= 0.9 ? "ok" : (coverage.ratio ?? 0) > 0 ? "warn" : "muted";
+  return {
+    tone,
+    text: `外部平仓中 ${coverage.exchange}/${total}（${pct}%）拿到了交易所结算价`
+      + (coverage.localMark ? `，其余 ${coverage.localMark} 笔按本地标记价入账` : ""),
+  };
 }
 
 /** 恒等式自检徽标：`null`（没跑过）⇒ 不显示，绝不显示一个未经验证的「通过」。 */

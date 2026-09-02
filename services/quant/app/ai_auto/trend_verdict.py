@@ -49,7 +49,7 @@ import math
 from dataclasses import dataclass, replace
 
 from .decider import TradeDecision
-from .signals import quantize_size_fraction
+from .gear_resolution import downgrade_one_gear
 
 # 开仓动作枚举（与 `open_funnel._OPEN_ACTIONS` / `signals._OPEN_ACTIONS` 同值）。
 _OPEN_ACTIONS = ("open_long", "open_short")
@@ -118,6 +118,12 @@ class TrendVerdictRule:
     counter_gate_enabled: bool = True        # 轴 D-2 逆势降档闸
     counter_min_confidence: float = 0.65     # 逆势开仓的**模型自报**置信度下界（RP1-8）
     counter_size_mult: float = 0.5           # 逆势开仓的强制降档倍数
+    # 强制降档改用**档位语义**（fill-truth-and-effective-controls 轴 D）。默认 False ⇒ 逐字回退。
+    # ⚠️ 与 `signals.ConsensusRule.gear_downgrade` **共用同一把总闸与同一个纯核心谓词**：本闸
+    # （`session._run_decision_round` 里排在共识闸**之前**）与那一把是逐字同构的两份字节，只改
+    # 一处会让逆势开仓在 `openFunnel` 的 `trendBias` 那一格被 `counter_trend_size` 拦死，而共识
+    # 那一侧的验收断言照样会绿（评审 RV-P0-1 / 放行条件 C-1）。
+    gear_downgrade: bool = False
     consensus_vote_enabled: bool = True      # 轴 D-1a 顺势追加一票
     contrarian_allowance_enabled: bool = True  # 轴 D-1b 顺势放宽逆势通路反向票上限（RP0-2）
 
@@ -155,7 +161,10 @@ def trend_rule_from_settings(settings) -> TrendVerdictRule:
         counter_size_mult=float(getattr(settings, "ai_trade_trend_counter_size_mult", 0.5)),
         consensus_vote_enabled=bool(getattr(settings, "ai_trade_trend_consensus_vote", True)),
         contrarian_allowance_enabled=bool(
-            getattr(settings, "ai_trade_trend_contrarian_allowance", True)))
+            getattr(settings, "ai_trade_trend_contrarian_allowance", True)),
+        # 轴 D 的总闸：与 `signals.consensus_rule_from_settings` 读**同一个** settings 键。
+        # 一把闸管两处是刻意的（评审 RV-P0-1）——它们是同一个缺陷的两个副本。
+        gear_downgrade=bool(getattr(settings, "ai_trade_contrarian_gear_downgrade", False)))
 
 
 @dataclass(frozen=True)
@@ -628,22 +637,35 @@ def apply_trend_bias_gate(decision: TradeDecision, verdict: dict | None,
                   f"conf={shown}/{rule.counter_min_confidence:.2f})")
         return _veto(decision, reason, verdict, rule)
     proposed = float(_finite(decision.size_fraction) or 0.0)
-    size = quantize_size_fraction(proposed * rule.counter_size_mult, position_step)
+    # 轴 D：与 `signals.resolve_consensus_gate` **共用**同一个降档谓词（绝不在这里再写一份）。
+    size, lane_note = downgrade_one_gear(
+        proposed, step=position_step, size_mult=rule.counter_size_mult,
+        gear_downgrade=rule.gear_downgrade)
     shrink_requested = rule.counter_size_mult < 1.0
-    if size <= 0 or size > proposed or (shrink_requested and size >= proposed):
+    blocked = (size <= 0 or size > proposed
+               or (lane_note == "mult" and shrink_requested and size >= proposed))
+    if blocked:
         reason = f"{REASON_COUNTER_SIZE}(score={(verdict or {}).get('score')})"
-        return _veto(decision, reason, verdict, rule)
+        return _veto(decision, reason, verdict, rule, lane_note=lane_note)
     final = replace(decision, size_fraction=size)
-    return TrendGateOutcome(final, None, "counter",
-                            _gate_wire("counter", final, verdict, rule, (proposed, size)))
+    wire = _gate_wire("counter", final, verdict, rule, (proposed, size))
+    wire["downgradeLane"] = lane_note      # 与 `signals` 那一把逐字同姿态（各写一份，不合成）
+    return TrendGateOutcome(final, None, "counter", wire)
 
 
 def _veto(decision: TradeDecision, reason: str, verdict: dict | None,
-          rule: TrendVerdictRule) -> TrendGateOutcome:
-    """把开仓硬降级为 hold（构造出的 hold 与其余各闸的否决产物逐字同形）。"""
-    wire = _gate_wire("veto", decision, verdict, rule,
-                      (_finite(decision.size_fraction), None))
+          rule: TrendVerdictRule, *, lane_note: str | None = None) -> TrendGateOutcome:
+    """把开仓硬降级为 hold（构造出的 hold 与其余各闸的否决产物逐字同形）。
+
+    `lane_note`（轴 D，默认 None ⇒ 三个加法键整键缺席 ⇒ wire 逐字回退）：否决轮同样要留下
+    「降档走的是哪条通路」——否则 `AC-5` 只能看见 `counter_trend_size` 的笔数，答不出它是因为
+    「乘性降档被吸附回原值」还是「本来就不该开」。
+    """
+    proposed = _finite(decision.size_fraction)
+    wire = _gate_wire("veto", decision, verdict, rule, (proposed, None))
     wire["reason"] = reason
+    if lane_note is not None:
+        wire["downgradeLane"] = lane_note
     hold = TradeDecision(action="hold", size_fraction=None, confidence=None, reason=reason)
     return TrendGateOutcome(hold, reason, "veto", wire)
 

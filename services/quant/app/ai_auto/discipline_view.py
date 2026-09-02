@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .gear_resolution import describe_gear_resolution, gear_resolution_note
+
 # 14 行的固定顺序（wire 契约的一部分：前端按序渲染，不重排）。
 # 第 14 行 `trendBias` 由 execution-trend-verdict 加入，且它**必须与 `discipline_runtime`
 # 的 `("counter_trend_", "trendBias")` 前缀同轮加**：只加前缀不开这一行 = 有写点没读点，
@@ -66,6 +68,13 @@ class DisciplineFacts:
     # 追加在**末位**：本类的既有字段全部带默认值，新字段跟在最后既满足 dataclass「无默认值字段
     # 必须在前」的约束，也让既有的按位置构造点一个都不用改。
     trend_rule: object | None = None
+    # fill-truth-and-effective-controls 轴 C-2 / D-2：档位步长（`decider.position_step` 的转发，
+    # 绝不从 settings 再读一次——那是决策器的属性，读 settings 会拿到一个「用户改了但运行期并没
+    # 有生效」的数）、共识规则本体（取它已夹紧的 `contrarian_size_mult`）、逆势五格细分。
+    # 三者一律追加在**末位**并带默认值，使既有的按位置构造点一个都不用改。
+    position_step: float = 0.0
+    consensus_rule: object | None = None
+    contrarian_blocked: dict | None = None
 
 
 def naked_backstop(wire: dict | None, min_coverage: float) -> bool:
@@ -245,6 +254,18 @@ def _consensus_row(facts: DisciplineFacts) -> dict:
     note = (f"门槛已到本会话策略数上限（共 {total} 个策略，须全部同向才开仓）："
             "服务端按策略数做过夹紧，绝不让它高于策略数——高于即开仓永久不可达。"
             if need >= total > 0 else None)
+    # ★ 轴 D-2：逆势通路五格细分。生产实测 `contrarianPassed` 在 2373 个决策轮里恒为 0，而
+    # 「一次都没放行过」与「放行了但都亏了」在面板上此前长得一模一样——只有分格才能回答
+    # 「它到底死在哪一条判据上」。整段缺席（一次逆势否决都没发生）⇒ 不加这句。
+    blocked = getattr(facts, "contrarian_blocked", None) or {}
+    if blocked:
+        labels = {"opposed": "反向票超限", "quota": "会话配额用尽", "conf": "自报置信度不足",
+                  "evidence": "逐字证据不足", "size": "强制降档不合法"}
+        detail = "、".join(f"{labels[key]} {blocked[key]}"
+                           for key in ("opposed", "quota", "conf", "evidence", "size")
+                           if blocked.get(key))
+        if detail:
+            note = "；".join(part for part in (note, f"逆势通路被拦下的细分：{detail}") if part)
     return _base("consensus", True, threshold=f"≥{need} / 共 {total} 策略", note=note,
                  fired=_count(facts, "consensus"))
 
@@ -285,11 +306,64 @@ def _vol_sizing_row(facts: DisciplineFacts) -> dict:
                 "届时该轮会静默跳过开仓——提高总预算或该标的百分比可消除。")
     else:
         note = None
+    # ★ 轴 C-2 / G-2（fill-truth-and-effective-controls）：档位分辨率与它的运行期实测。
+    # **拼接顺序固定：dust 在前、档位在后**——两者是不同的两件事（一个是「解出来的量太小」，
+    # 一个是「解出来的缩减被档位抹掉了」），照那条 dust 提示去加预算并不能让缩减重新生效。
+    gear = _gear_note(facts)
+    note = _join_clauses([note, gear])
     return _base("volSizing", True,
                  threshold=f"年化 {_pct(rule.vol_target_annual)} / λ={rule.kelly_lambda:g}"
                            f" / 窗口 {rule.vol_window} 根",
                  note=note, fired=_count(facts, "volSizing"),
                  tone="warn" if note else None)
+
+
+def _gear_note(facts: DisciplineFacts) -> str | None:
+    """档位分辨率一句话 + 运行期实测（轴 C-2 落点 ②，`quantizeErasedRounds` 的第一个读点）。
+
+    `quantizeErasedRounds` 在本轮之前**全仓零读点**：`sizing.py` 的模块 docstring 早已如实登记过
+    「第一档减速与相关性缩减在最常见断面上是 no-op」，但「暴露」那一半没做完——算出来了，没人
+    看得见。生产实测最新那一组 5 个成员上 `scaledRounds` 与 `quantizeErasedRounds` **逐个相等**
+    （命中率 100%），而面板上那一行只写着「已装配 / 年化 20% / λ=0.25」。
+
+    `scaledRounds == 0` ⇒ 只给静态那半句（还没缩过，报比例会是 `0/0`）。
+    """
+    # 真源**只有** `facts.position_step`（`discipline_runtime` 从 `decider.position_step` 转发）：
+    # 步长是决策器的属性，从 settings 再读一次会拿到一个「用户改了但运行期并没有生效」的数；
+    # 而 `step <= 0` 是「连续档位」这个合法运行态本身，此时根本没有阶梯，回落到某个默认值只会
+    # 让面板对一个不存在的阶梯报警。
+    step = float(getattr(facts, "position_step", 0.0) or 0.0)
+    if step <= 0:
+        return None
+    res = describe_gear_resolution(
+        step, brake_rule=getattr(facts.sizing, "brake_rule", None),
+        consensus_rule=getattr(facts, "consensus_rule", None))
+    static = gear_resolution_note(res)
+    scaled = _count(facts, "volSizingScaledRounds") or 0
+    erased = _count(facts, "volSizingQuantizeErased") or 0
+    zeroed = _count(facts, "volSizingSolvedZero") or 0
+    below_floor = _count(facts, "volSizingBelowFloor") or 0
+    # 每段自己都以句号收尾，故用 `_join_clauses` 直接相连——`"；".join` 会拼出
+    # 「…作用到下单量上。；本会话已有…」这种在界面上一眼可见的脏标点。
+    parts = [part for part in (static,) if part]
+    if scaled > 0:
+        parts.append(f"本会话已有 {erased}/{scaled} 次缩减被档位吸附抹掉。")
+    if zeroed > 0:
+        parts.append(f"另有 {zeroed} 轮因风控解算结果为零而未开仓（与预算大小无关）。")
+    if below_floor > 0:
+        # `belowFloorVetoes` 的**唯一**读点。它与上一句不可合并计数：一个是恒等式（风险预算为
+        # 零），一个是可调阈值——只报合计会让「地板比例该不该开、开多少」永远没有依据。
+        parts.append(f"另有 {below_floor} 轮因解算仓位低于「最小一格 × 地板比例」而未开仓。")
+    return _join_clauses(parts)
+
+
+def _join_clauses(parts) -> str | None:
+    """把若干**各自成句**的片段拼成一段话；无有效片段 ⇒ `None`（整条 note 不渲染）。
+
+    逐段之间不补任何标点：每段自己已经以句号收尾，再插一个分隔符就会出现「。；」。
+    """
+    kept = [part.strip() for part in parts if part and part.strip()]
+    return "".join(kept) or None
 
 
 def _atr_stop_row(facts: DisciplineFacts) -> dict:

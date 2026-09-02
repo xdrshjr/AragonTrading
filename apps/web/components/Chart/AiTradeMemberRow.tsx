@@ -90,6 +90,8 @@ export default function AiTradeMemberRow({
             {session.message}
           </span>
         )}
+        <SettlingChip member={member} />
+        <OrphanChip member={member} />
         <HorizonChip member={member} />
         <TurnoverChip member={member} />
         <BreakEvenRow member={member} />
@@ -110,6 +112,51 @@ export default function AiTradeMemberRow({
         )}
       </span>
     </button>
+  );
+}
+
+/**
+ * 结算中 chip（fill-truth-and-effective-controls 轴 A，§十三 Q3 的裁定）。
+ *
+ * **这枚芯片是必需的而不是可选的。** `settling` 期间一切出站平仓被短路（不变式 I-2b：仓位在
+ * 交易所侧已经不在了，此刻再发一张平仓单只会换回一个 `LIVE_NO_POSITION`，而那条良性分支会
+ * 按标记价抢先落一次账 ⇒ 与随后的结算落账**双记已实现盈亏**）。于是用户点「手动平仓」会得到
+ * 一句「本轮不发平仓单」——如果这一行还写着「持有中」，那句话就变成了一个无法解释的拒绝。
+ *
+ * 未装配 / 无未决态 ⇒ 后端整键省略 ⇒ 不渲染。
+ */
+function SettlingChip({ member }: { member: AiTradeGroupMemberState }) {
+  const wire = member.session?.settling ?? null;
+  if (!wire?.active) return null;
+  return (
+    <span
+      className="truncate text-[10px] text-[var(--accent-ink)]"
+      data-testid="ai-trade-settling-chip"
+      title={`侦测于 ${new Date(wire.detectTs * 1000).toLocaleTimeString()}；` +
+        "期间本会话不会再对它发出任何平仓单"}
+    >
+      结算中 · 正在取回交易所成交价（已等 {wire.waitedS}s）
+    </span>
+  );
+}
+
+/**
+ * 孤儿持仓 chip（轴 B）：横幅之外的**行内**提示。
+ *
+ * 横幅回答「出了什么事、能怎么办」，这一行只回答「这个标的现在有这件事」——用户在成员列表上
+ * 扫一眼就该看见它，而不必先展开分组。`pending` 不渲染（判定尚未成立，画出来会闪）。
+ */
+function OrphanChip({ member }: { member: AiTradeGroupMemberState }) {
+  const wire = member.session?.orphan ?? null;
+  if (wire?.state !== "confirmed") return null;
+  return (
+    <span
+      className="truncate text-[10px] text-[var(--short-ink)]"
+      data-testid="ai-trade-orphan-chip"
+      title="交易所侧存在本会话不知道的持仓；它不受任何自动风控管辖"
+    >
+      交易所侧有未接管持仓（{wire.qty} 张）
+    </span>
   );
 }
 

@@ -288,6 +288,13 @@ class ConsensusRule:
     contrarian_min_evidence_chars: int = 60   # `contrarianEvidence` 最小长度（字符数）
     contrarian_max_per_session: int = 3       # 会话级配额
     contrarian_size_mult: float = 0.5         # 强制降档系数（量化前）
+    # 强制降档改用**档位语义**（掉一格），已在最低格即视为已降档并放行
+    # （fill-truth-and-effective-controls 轴 D）。**默认 False ⇒ 既有全部单测与回测逐字回退**。
+    # ⚠️ 它与 `trend_verdict.TrendVerdictRule.gear_downgrade` **共用同一把总闸**
+    # （`ai_trade_contrarian_gear_downgrade`），且两处的降档判定**共用同一个纯核心谓词**
+    # `gear_resolution.downgrade_one_gear`——它们是同一个缺陷的两个副本，分开回退只会造出
+    # 「一半修好一半没修」这种最难归因的状态（评审 RV-P0-1 / 放行条件 C-1）。
+    gear_downgrade: bool = False
 
 
 @dataclass(frozen=True)
@@ -404,14 +411,30 @@ def resolve_consensus_gate(decision: TradeDecision, consensus: Consensus, rule: 
     # ③ 是实施期发现的方案缺陷（见 spec §实施过程发现的方案缺陷 I-1）：spec 的伪代码只判了
     # `size <= 0`。在 `step=0.5` 这类粗档位上 `0.5×0.5=0.25` 会被吸附回 0.5，于是逆势通路会
     # **按原仓位全额放行**——RK-1 承诺的那道「强制降档 ×0.5」当场失效，且不报任何错。
+    # 延迟导入打破 `signals → gear_resolution → signals` 的模块级循环——`gear_resolution` 需要
+    # 本模块的 `position_ladder` / `quantize_size_fraction`（档位阶梯的唯一真源在这里），而本函数
+    # 需要它的 `downgrade_one_gear`。范式与本模块 `contrarian_schema` 里那条延迟导入完全相同。
+    from .gear_resolution import downgrade_one_gear
+
     proposed = float(decision.size_fraction or 0.0)
-    target = proposed * rule.contrarian_size_mult
-    size = quantize_size_fraction(target, position_step)
+    # 轴 D：降档判定**下沉到 `gear_resolution.downgrade_one_gear`**（与 `trend_verdict` 那把
+    # 逐字同构的闸共用同一个谓词）。总闸关 ⇒ `lane == "mult"` ⇒ 下面三条判据逐字等于今天。
+    size, lane_note = downgrade_one_gear(
+        proposed, step=position_step, size_mult=rule.contrarian_size_mult,
+        gear_downgrade=rule.gear_downgrade)
     shrink_requested = rule.contrarian_size_mult < 1.0
-    if size <= 0 or size > proposed or (shrink_requested and size >= proposed):
-        return _veto(decision, f"{REASON_SIZE}{tally}", facts)
+    if size <= 0 or size > proposed:                    # 真正的异常才否决（① 与 ②）
+        return _veto(decision, f"{REASON_SIZE}{tally}", facts, lane_note=lane_note)
+    if lane_note == "mult" and shrink_requested and size >= proposed:
+        # ③ **逐字保留今天的第三条判据**：降档被请求了却没有真的发生。它只在乘性通路上成立——
+        # `floor_is_min` 通路的 `size == proposed == 最小一格`，那既没有放大仓位，也确实是本通路
+        # 能给出的最小注（不变式 2 的两个条款都满足，不满足的只是「必须严格小于」这个实现细节，
+        # 而生产实测这条实现细节让整条通路 2373 轮零放行）。
+        return _veto(decision, f"{REASON_SIZE}{tally}", facts, lane_note=lane_note)
+    wire = _consensus_wire("contrarian", facts)
+    wire["downgradeLane"] = lane_note      # 与 `trend_verdict` 那一把逐字同姿态（各写一份）
     return ConsensusGateOutcome(replace(decision, size_fraction=size), None, "contrarian", True,
-                                _consensus_wire("contrarian", facts))
+                                wire)
 
 
 def _contrarian_block(rule: ConsensusRule, decision: TradeDecision, *, opposing: int,
@@ -460,12 +483,21 @@ class ConsensusWireFacts:
     bonus_lane: str = "none"   # 轴 D-1a 的五态归因（判定源在 `trend_verdict.trend_bonus_lane`）
 
 
-def _veto(decision: TradeDecision, reason: str,
-          facts: ConsensusWireFacts) -> ConsensusGateOutcome:
-    """把开仓硬降级为 hold（构造出的 hold 与旧版 `apply_consensus_gate` **逐字相同**）。"""
+def _veto(decision: TradeDecision, reason: str, facts: ConsensusWireFacts, *,
+          lane_note: str | None = None) -> ConsensusGateOutcome:
+    """把开仓硬降级为 hold（构造出的 hold 与旧版 `apply_consensus_gate` **逐字相同**）。
+
+    `lane_note`（轴 D，默认 None ⇒ 该加法键整键缺席 ⇒ wire 逐字回退）：否决轮同样要留下「降档走
+    的是哪条通路」——否则 `AC-5` 只能看见 `low_consensus_size` 的笔数，答不出它是「乘性降档被档位
+    吸附回原值」还是「本来就不该开」。
+
+    否决轮与放行轮一样**只写 `downgradeLane` 这一个键**，与 `trend_verdict._veto` 逐字同姿态。
+    """
     hold = TradeDecision(action="hold", size_fraction=None, confidence=None, reason=reason)
-    return ConsensusGateOutcome(hold, reason, "veto", False,
-                                _consensus_wire("veto", replace(facts, reason=reason)))
+    wire = _consensus_wire("veto", replace(facts, reason=reason))
+    if lane_note is not None:
+        wire["downgradeLane"] = lane_note
+    return ConsensusGateOutcome(hold, reason, "veto", False, wire)
 
 
 def _consensus_wire(lane: str, facts: ConsensusWireFacts) -> dict:
@@ -515,7 +547,9 @@ def consensus_rule_from_settings(settings) -> ConsensusRule:
         contrarian_min_evidence_chars=int(
             settings.ai_trade_consensus_contrarian_min_evidence_chars),
         contrarian_max_per_session=int(settings.ai_trade_consensus_contrarian_max_per_session),
-        contrarian_size_mult=float(settings.ai_trade_consensus_contrarian_size_mult))
+        contrarian_size_mult=float(settings.ai_trade_consensus_contrarian_size_mult),
+        # 轴 D 的总闸（与 `trend_rule_from_settings` 读**同一个** settings 键，绝不各读各的）。
+        gear_downgrade=bool(getattr(settings, "ai_trade_contrarian_gear_downgrade", False)))
 
 
 def contrarian_schema(rule: ConsensusRule):

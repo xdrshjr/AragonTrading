@@ -37,6 +37,18 @@ _DEGRADE_PREFIXES = (
 )
 
 
+# 轴 D-2：逆势通路的五个细分否决码 → `contrarianBlocked` 的格名。**顺序即优先级**，且
+# `low_consensus_size` 必须排在裸 `low_consensus` 之前，否则四个细分码全被吞进 `opposed`。
+# 归类真源仍然只有 `_DEGRADE_PREFIXES` 一处——这里只是并排多一份细分，不改任何一格的归属。
+_CONTRARIAN_CELLS: tuple[tuple[str, str], ...] = (
+    ("low_consensus_size", "size"),
+    ("low_consensus_conf", "conf"),
+    ("low_consensus_evidence", "evidence"),
+    ("low_consensus_quota", "quota"),
+    ("low_consensus_opposed", "opposed"),
+)
+
+
 class DisciplineRuntime:
     """一个会话的纪律自检运行时（纯同步；无 IO、无 await）。
 
@@ -54,6 +66,8 @@ class DisciplineRuntime:
         # 的两面（「哪些闸开着」与「它们各拦下了多少次真实开仓意愿」），且 `session.py` 已 1819 行、
         # 本轮的净增预算是 ≤ 22 行（G-19b）。
         self.funnel = OpenFunnelCounters()
+        # 轴 D-2 的五格细分（`aiStats.consensus.contrarianBlocked` 的唯一来源）。
+        self._contrarian_blocked: dict[str, int] = {}
         # 轴 A：会话启动断面的可交易性只读快照（`manager.start` 算一次，**启动后不变**）。
         self.tradability: dict | None = None
 
@@ -79,6 +93,13 @@ class DisciplineRuntime:
         self.funnel.note_block(degrade)
         if not degrade:
             return
+        # 轴 D-2（fill-truth-and-effective-controls）：逆势通路的五个细分否决码今天只能靠
+        # `decisionsDigest` 的文本残留去数。这里**并排**多记一份细分计数——归类真源仍然只有下面
+        # 那一处（五码继续归 `consensus` 那一格，`_DEGRADE_PREFIXES` 一个字节不动）。
+        for suffix, cell in _CONTRARIAN_CELLS:
+            if degrade.startswith(suffix):
+                self._contrarian_blocked[cell] = self._contrarian_blocked.get(cell, 0) + 1
+                break
         for prefix, key in _DEGRADE_PREFIXES:
             if degrade.startswith(prefix):
                 self._degrades[key] = self._degrades.get(key, 0) + 1
@@ -179,7 +200,13 @@ class DisciplineRuntime:
             # execution-trend-verdict 第 14 行：取会话那份**已夹紧**的规则对象本身，绝不从
             # settings 再读一次（`trend_rule_from_settings` 会夹阈值与封顶 htf 权重，读原值会让
             # 面板报出一个「用户改了但运行期并没有生效」的数）。未装配的会话恒 None ⇒ 该行灰。
-            trend_rule=getattr(session, "_trend_rule", None))
+            trend_rule=getattr(session, "_trend_rule", None),
+            # 轴 C-2 / D-2：档位步长的真源是 `decider.position_step`（`session.py` 另有两处同款
+            # 取法）——步长是决策器的属性，从 settings 再读一次会拿到一个「用户改了但运行期并
+            # 没有生效」的数。共识规则取会话那份**已解析**的对象本身，同理。
+            position_step=float(getattr(session.decider, "position_step", 0.0) or 0.0),
+            consensus_rule=getattr(session, "_consensus_rule", None),
+            contrarian_blocked=self.contrarian_blocked())
 
     # ---------- 取数细节 ----------
     def _backstop_wire(self) -> dict | None:
@@ -202,4 +229,14 @@ class DisciplineRuntime:
         counts["profitGuard"] = int(session.profit_guard_exits)
         counts["horizon"] = int(sum(session._horizon.vetoes.values()))
         counts["exchangeBackstop"] = int(session._horizon.backstop_vetoes)
+        # 轴 C / G-2：档位吸附抹掉了多少次缩减（`quantizeErasedRounds` 在本轮之前**全仓零读点**）
+        # 与它的分母，加上轴 C-1 的两个地板否决计数。四个都是透传键，纪律自检的 `volSizing` 行读它们。
+        counts["volSizingQuantizeErased"] = int(counters.quantize_erased_rounds)
+        counts["volSizingScaledRounds"] = int(counters.scaled_rounds)
+        counts["volSizingSolvedZero"] = int(counters.solved_zero_vetoes)
+        counts["volSizingBelowFloor"] = int(counters.below_floor_vetoes)
         return counts
+
+    def contrarian_blocked(self) -> dict:
+        """逆势通路五格细分的只读快照（`stats_ext.build_consensus_stats` 的唯一入参）。"""
+        return dict(self._contrarian_blocked)

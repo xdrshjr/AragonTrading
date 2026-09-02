@@ -176,7 +176,60 @@ export interface AiTradeRunMetrics {
     // `aiStats`，与实时侧的成员级 `status.trendVerdict` **同形同源**（同一次 `stats_wire()`
     // 调用的产物）。老记录缺键 ⇒ 整卡不渲染（绝不显示一排误导性的 0）。
     trendVerdict?: AiTradeTrendStats | null;
+    // ---- fill-truth-and-effective-controls：本轮四组加法键（老记录缺键 ⇒ 各自整段隐藏）----
+    /**
+     * 轴 G-1：`actionCounts` / `holdRate` / `avgConfidence` 的分母是**保留的 ≤N 条决策样本**，
+     * 而 `decisionRounds` 是会话真实完成轮数——两个分母并排出现在同一张卡上，而 wire 上此前
+     * 没有任何字段承载这件事。生产实测 run 1627 因此对用户说「484 轮里 100% 观望、一次都没
+     * 想过开仓」，而真相是「想开 117 次，其中 106 次被同向共识拦下」。
+     */
+    sampleRounds?: number;
+    sampleScope?: string;
+    /** 轴 C / E：仓位求解与挂单去留的会话级计数（`build_sizing_stats` 的产物）。 */
+    sizing?: AiTradeSizingStats | null;
+    /** 轴 D-2：逆势通路五格细分。一次逆势否决都没发生过 ⇒ 整段缺席（绝不显示一张全零卡）。 */
+    consensus?: { contrarianBlocked?: AiTradeContrarianBlocked | null } | null;
   };
+}
+
+/**
+ * 仓位 / 刹车 / 挂单去留的会话级计数（`aiStats.sizing`）。
+ *
+ * 本轮之前 `quantizeErasedRounds` 在 `apps/web` 全仓**零读点**——`sizing.py` 的模块 docstring
+ * 早已如实登记过「第一档减速与相关性缩减在最常见断面上是 no-op」，但「暴露」那一半没做完：
+ * 算出来了，没人看得见。生产实测最新那一组 5 个成员上 `scaledRounds` 与 `quantizeErasedRounds`
+ * **逐个相等**（命中率 100%）。
+ */
+export interface AiTradeSizingStats {
+  gatedRounds?: number;
+  scaledRounds?: number;
+  scaleRate?: number;
+  avgScaleRatio?: number | null;
+  /** 其中有多少次缩减被档位地板原样吃了回去。它与 `scaledRounds` 不可互相换算。 */
+  quantizeErasedRounds?: number;
+  brakeSlowRounds?: number;
+  brakeHaltRounds?: number;
+  corrScaledRounds?: number;
+  /** 轴 C-1：风控层解出**精确的零**而未开仓的轮数（与预算大小毫无关系）。 */
+  solvedZeroVetoes?: number;
+  /** 轴 C-1：解出一个低于「最小一格 × floor_ratio」的正数而未开仓的轮数（默认闸关 ⇒ 恒 0）。 */
+  belowFloorVetoes?: number;
+  /** 轴 E：本轮想挂的与已挂的逐字同向同价，于是保留原单不撤不重挂。 */
+  restingKept?: number;
+  /** 轴 E：撤掉再按新价挂回去（真正的「重挂」）。 */
+  restingRepriced?: number;
+  restingCancelled?: number;
+  /** 其中因 TTL 到期被撤的笔数——双时钟修复之前，它在 15m 根上几乎等于全部挂单笔数。 */
+  restingExpired?: number;
+}
+
+/** 轴 D-2：逆势通路被拦下的五格细分（顺序即 `_contrarian_block` 的判定序）。 */
+export interface AiTradeContrarianBlocked {
+  opposed?: number;
+  quota?: number;
+  conf?: number;
+  evidence?: number;
+  size?: number;
 }
 
 export interface AiTradeHistoryMember {
