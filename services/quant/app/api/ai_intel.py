@@ -12,6 +12,11 @@
   或用户自选（评审 P2-11）。没有这道校验，任意字符串都能建出 watch 行与条目，库里会长出永远不会
   被采集、也永远不会被清理的孤儿标的。读端点**不设**此闸——历史情报的标的可能已不在自选里，
   而那正是 G-4 要保住的场景。
+- **`status_code=204` 的端点必须 `-> Response` 并 `return Response(status_code=204)`**：本模块开了
+  `from __future__ import annotations`，`-> None` 会被 FastAPI 当成字符串注解解析回 `NoneType`——那是个
+  **真值**，于是它被当作响应模型，import 期就 `AssertionError: Status code 204 must not have a
+  response body`，整个后端起不来（打包冒烟即死在这里）。仓库里另外 11 个 204 端点用的都是
+  `-> Response` 写法，跟着写就不会踩。
 - **每一次写都要 `invalidate`**：用户改完之后决策 prompt 里若还是旧的那一份，**这件事不会报任何
   错**（本仓库「写点有、读点无」的成文缺陷形状）。
 """
@@ -19,7 +24,7 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..ai_auto import get_ai_trade_manager
@@ -207,7 +212,7 @@ async def delete_intel_feedback(scope: str = Query(default="domain"),
                                 key: str = Query(min_length=1),
                                 instId: str = Query(default=""),
                                 session: AsyncSession = Depends(get_session),
-                                settings: Settings = Depends(get_settings)) -> None:
+                                settings: Settings = Depends(get_settings)) -> Response:
     """撤销一条来源取舍。
 
     **不复活**任何条目（G-9③）：归档是一次带理由的状态迁移，自动复活会让用户在两次点击之间
@@ -219,6 +224,7 @@ async def delete_intel_feedback(scope: str = Query(default="domain"),
                                          "message": "目前只支持 domain 作用域"})
     await repo.clear_intel_feedback(session, key=key.strip().lower(), inst_id=instId or "")
     _invalidate_scope(instId or "")
+    return Response(status_code=204)
 
 
 def _invalidate_scope(inst_id: str) -> None:
@@ -599,13 +605,14 @@ async def move_intel_item(itemId: int, body: IntelMoveIn,
 
 @router.delete("/intel/items/{itemId}", status_code=204)
 async def delete_intel_item(itemId: int, session: AsyncSession = Depends(get_session),
-                            settings: Settings = Depends(get_settings)) -> None:
+                            settings: Settings = Depends(get_settings)) -> Response:
     """物理删除（**唯一**的硬删路径；自动清理一律走软删 `archived`）。"""
     _require_ai_enabled(settings)
     item = await _load_item_or_404(session, itemId)
     await _require_known_inst(session, item["instId"])
     await repo.delete_intel_item(session, itemId)
     intel_runtime.invalidate(item["instId"])
+    return Response(status_code=204)
 
 
 @router.post("/intel/{instId}/seen")
