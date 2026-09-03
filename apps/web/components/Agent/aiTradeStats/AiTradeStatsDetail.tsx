@@ -39,6 +39,7 @@ import { aiTradeHistoryApi } from "@/lib/aiTradeHistoryApi";
 import type {
   AiTradeHistoryDetailOut,
   AiTradeHistoryMember,
+  AiTradeIntelDisclosureStats,
   AiTradeReasoningStats,
 } from "@/lib/aiTradeHistoryTypes";
 import type { AiTradeHorizonStats } from "@/lib/aiTradeTypes";
@@ -507,6 +508,7 @@ function AiStatsCard({
         {aiStats.sampleRounds != null ? `，本会话实际留存 ${aiStats.sampleRounds} 条` : ""}
         ，两者在长会话上必然不等。开仓漏斗那张卡的分母是「本会话全程累计」，与这里不是同一个。
       </p>
+      <IntelDisclosureLine stats={aiStats.intelDisclosure ?? null} />
       <RealizedKpiGroup stats={aiStats.realized ?? null} />
       <HorizonKpiGroup stats={aiStats.horizon ?? null} />
       <ReasoningKpiGroup stats={aiStats.reasoning ?? null} />
@@ -552,6 +554,50 @@ function AiStatsCard({
         </div>
       )}
     </Section>
+  );
+}
+
+/**
+ * 「情报上下文」一行（intel-session-binding 轴 D）。
+ *
+ * **键缺席 ⇒ 整行不渲染**：未装配 / 会话未采信且什么都没被静默掉 / 一轮都没注入过。
+ * 绝不先显示一个会被当真的 0。三个重置成因挂在 `title` 上——它们是事后对账时才需要的
+ * 第二层，不该占用第一眼的版面。
+ *
+ * **两种形态**。`roundsInjected === 0` 是「本次会话未采信情报」那一格：后端只在
+ * `alertMuted > 0` 时才下发这个键（见 `intel/binding.disclosure_stats` 的那条例外），
+ * 于是这里只渲染那一个真数——其余读数在这一格全是 0，写出来就是会被当真的假读数。
+ */
+function IntelDisclosureLine({ stats }: { stats?: AiTradeIntelDisclosureStats | null }) {
+  if (!stats) return null;
+  if (stats.roundsInjected <= 0) {
+    if (stats.alertMuted <= 0) return null;
+    return (
+      <p
+        data-testid="ai-stats-intel-muted"
+        className="mt-1 text-[10px] leading-relaxed text-[var(--muted)]"
+      >
+        情报上下文：本次会话未采信市场情报，因此有 {stats.alertMuted} 条高危情报告警
+        没有唤醒决策（情报仍在正常采集，可在下次启动时勾选）。
+      </p>
+    );
+  }
+  const avg = Math.round(stats.charsTotal / stats.roundsInjected);
+  const reset = stats.seenReset ?? { pause: 0, summary: 0, streak: 0 };
+  return (
+    <p
+      data-testid="ai-stats-intel-disclosure"
+      className="mt-1 text-[10px] leading-relaxed text-[var(--muted)]"
+      title={
+        `已看过集合重置：暂停 ${reset.pause} 次 · 上下文摘要 ${reset.summary} 次 · ` +
+        `连续压缩撞上界 ${reset.streak} 次`
+      }
+    >
+      情报上下文：平均 {avg} 字/轮（峰值 {stats.charsMax}）· 注入 {stats.roundsInjected} 轮
+      （其中压缩档 {stats.roundsRepeat} 轮）· 下单前展开 {stats.expandRounds} 次
+      {stats.expandFolded > 0 && `（含 ${stats.expandFolded} 条被压缩后补回）`}
+      {stats.alertMuted > 0 && ` · 因未采信而未唤醒的情报告警 ${stats.alertMuted} 条`}
+    </p>
   );
 }
 

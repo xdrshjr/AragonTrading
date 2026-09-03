@@ -63,6 +63,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const aiTradeApi = {
   // 启动 AI 自动交易分组（受双闸守门；两段式门禁 + 整组回滚；预算按成员 pct 切分）。
+  //
+  // 本函数**没有签名变更**：`req` 是整对象透传，新字段只在 `AiTradeGroupStartReq` 上声明。
+  // 登记一次 intel-session-binding 轴 A 的新键 `intel`：**整键缺省 ⇒ 服务端不注入**（与
+  // `baseRules` / `profitGuard` / `tradingHorizon` / `discipline` / `experience` / `direction`
+  // / `trend` 七个字段「缺省即开启」的惯例**方向相反**，这是需求的明文要求）。
   start: (req: AiTradeGroupStartReq) =>
     request<AiTradeGroupStartResult>("/ai-trade/start", {
       method: "POST",

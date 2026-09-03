@@ -194,20 +194,28 @@ async def test_manager_wires_and_unwires_the_intel_runtime(monkeypatch):
 
 
 def test_build_group_runtime_keeps_its_public_signature():
-    """G-19：`build_group_runtime` 的公开签名逐字段不变（10 个 keyword-only 形参）。
+    """G-19：`build_group_runtime` 的公开签名逐字段不变（11 个 keyword-only 形参）。
 
     arm-state 把 `IntelDeps` 的构造收敛进了 `_build_deps`——那是**内部**重构。签名一旦漂移，
     上面那条 `fake_build(**kwargs)` 替身会静默接受任何入参，于是 manager 与装配点之间的接线
     错了也不会有人知道。
+
+    ★ ai-trade-intel-session-binding 轴 A：第 11 个形参 `session_rule` 是**刻意**加进公开签名
+    的——会话选择**必须**作为一个独立的、显式的 keyword 形参一路传到 `_build_deps`，在
+    `resolve_intel_settings` **之后**才与运维总闸合取。把它编码成
+    `Settings.ai_trade_intel_inject` 会被 `INTEL_SETTING_BRIDGE` 里那一行库内行静默覆盖，
+    而且不报错（spec §3.1 A-2 的陷阱）。默认 `None` ⇒ 既有调用点逐字节回退。
     """
     import inspect
 
     params = inspect.signature(intel_runtime.build_group_runtime).parameters
     assert list(params) == ["group_id", "members", "settings", "sessionmaker", "provider_cfg",
-                            "make_client", "bar", "change_24h_pct", "notify", "notify_alert"]
+                            "make_client", "bar", "change_24h_pct", "notify", "notify_alert",
+                            "session_rule"]
     assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values())
     assert params["bar"].default == "15m"
     assert params["change_24h_pct"].default is None
+    assert params["session_rule"].default is None
 
 
 @pytest.mark.asyncio

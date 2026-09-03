@@ -25,6 +25,7 @@ import { AiTradeExitCard } from "./AiTradeExitCard";
 import { AiTradeFeedRecoveryCard } from "./AiTradeFeedRecoveryCard";
 import { describeTradability } from "@/lib/aiTradeTradability";
 import { COST_BASIS_HINT, describeCostBasis, describeFeeRates } from "@/lib/aiTradeCost";
+import { intelReceiptText } from "@/lib/intel";
 import { describeTruthDigest } from "@/lib/truthSources";
 import { fmtMoney, fmtNum, fmtPrice } from "@/lib/format";
 import { useAppStore } from "@/lib/store";
@@ -195,6 +196,10 @@ export default function AiTradePanel({
           「下面那些成本阈值到底按谁的费率在算」，而生产上这个答案三周来一直是「本地猜的」
           且从未被任何一处界面说出来（1,524 次官方费率请求，0 次成功）。 */}
       <FeeSourceStrip group={group} />
+
+      {/* 情报采信回执（intel-session-binding 轴 A-4）：紧跟费率来源，两者同为「这一次会话
+          到底按什么在跑」的启动期回执。老后端不下发 ⇒ 整段不渲染。 */}
+      <IntelReceiptStrip group={group} />
 
       <DisciplineStrip group={group} />
 
@@ -485,6 +490,47 @@ function FeeSourceStrip({ group }: { group: AiTradeGroupState }) {
       }
     >
       <span className="font-medium">费率来源</span>
+      <span className="mx-1">·</span>
+      <span>{line}</span>
+    </div>
+  );
+}
+
+/**
+ * 情报采信条（intel-session-binding 轴 A-4 · 启动回执落点）。
+ *
+ * 一句话，两态（与 `FeeSourceStrip` 逐行同构，理由也同源）：
+ *
+ * * `情报研判 · 索引档`
+ * * `情报研判 · 全文档 —— 本次会话启动于该开关上线之前，是否采信由服务端设置决定`
+ *
+ * 三条纪律：
+ *
+ * 1. **文案一个字都不在这里拼**——`intelReceiptText` 是唯一装配点。
+ * 2. **服务端改写了用户选择时才带颜色**（`source !== "request"`）。一切照用户所选时它只是
+ *    一行灰字：一条常驻的彩色横幅会在两天内变成背景噪声。
+ * 3. **缺键即整段不渲染**（老后端）——绝不在没有读数时编一句「未采信」。
+ *
+ * 为什么必须有这一行：`source` 的三个非 `request` 取值是「服务端替我决定了什么」的**唯一**
+ * 披露面，而 `legacy_fallback` 那一格只有「刷新页面后重发现一个暂停中的老会话」才走得到。
+ * 后端算了、`groupStateFromStatus` 抄了、却没有任何组件读，就是本仓库反复出现的死数据形状。
+ */
+function IntelReceiptStrip({ group }: { group: AiTradeGroupState }) {
+  const receipt = group.intel ?? null;
+  const line = intelReceiptText(receipt);
+  if (!line) return null;
+  const overridden = receipt !== null && receipt.source !== "request";
+  return (
+    <div
+      data-testid="ai-intel-receipt-strip"
+      data-overridden={overridden ? "1" : "0"}
+      className={
+        overridden
+          ? "rounded border border-[var(--accent)] bg-[var(--accent-soft)] px-2 py-1 text-[10px] leading-relaxed text-[var(--accent-ink)]"
+          : "rounded border border-[var(--border)] bg-[var(--bg)] px-2 py-1 text-[10px] leading-relaxed text-[var(--muted)]"
+      }
+    >
+      <span className="font-medium">情报研判</span>
       <span className="mx-1">·</span>
       <span>{line}</span>
     </div>

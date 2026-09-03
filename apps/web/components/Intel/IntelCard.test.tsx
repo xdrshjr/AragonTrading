@@ -306,4 +306,33 @@ describe("IntelCard · 情报闭环", () => {
     expect(screen.getByTestId("intel-no-evidence"))
       .toHaveAttribute("title", "这几个来源都没能抓到正文");
   });
+
+  // ---- W8（intel-session-binding 轴 C-3）：进了情报段的条目才有竖线与编号 chip ----
+  const bound = (digestItemIds: number[]) => ({
+    ...summary,
+    binding: { bound: true, groupId: "aig-1", mode: "index" as const, injecting: true,
+               reason: "" as const, digestItemIds, lastRound: null },
+  });
+
+  it("W8：命中 `digestItemIds` 的条目才加竖线与 `[Ixx]` chip，编号取渲染序", () => {
+    render(<IntelCard item={item({ id: 7 })} summary={bound([9, 7])} actions={actions()}
+                      nowMs={NOW_MS} />);
+    const chip = screen.getByTestId("intel-card-digest-ref");
+    expect(chip).toHaveTextContent("I02");        // 它排在渲染序第 2 位
+    // 措辞必须精确：「定稿进段」不等于「上一轮渲染出来了」，两者的差额正是横向压缩。
+    expect(chip).toHaveAttribute(
+      "title", "本情报轮已定稿进入情报段；重复唤醒轮可能不重复列出");
+    expect(screen.getByTestId("intel-card").className).toContain("border-l-2");
+  });
+
+  it("W8②：没命中 / 没绑定 ⇒ 既无 chip 也无竖线（逐字节回退）", () => {
+    render(<IntelCard item={item({ id: 7 })} summary={bound([9])} actions={actions()}
+                      nowMs={NOW_MS} />);
+    expect(screen.queryByTestId("intel-card-digest-ref")).toBeNull();
+    expect(screen.getByTestId("intel-card").className).not.toContain("border-l-2");
+    cleanup();
+    render(<IntelCard item={item({ id: 7 })} summary={summary} actions={actions()}
+                      nowMs={NOW_MS} />);
+    expect(screen.queryByTestId("intel-card-digest-ref")).toBeNull();
+  });
 });

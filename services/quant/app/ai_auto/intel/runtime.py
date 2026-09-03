@@ -31,8 +31,20 @@ from .arming import (  # noqa: F401 —— 原样重新导出，见下方注释
     clear_arm_error,
     record_arm_error,
 )
-from .arming import ArmState
+from .arming import ARM_NOT_RUNNING, ArmState  # noqa: F401 —— 原样重新导出
+from .session_rule import IntelSessionRule
+from .binding import (
+    alert_pending_ttl_s,
+    binding_wire,
+    build_binding,
+    live_pin,
+    pin_item_id,
+    set_pin,
+)
 from .service import IntelDeps, RoundOutcome
+# `static_summary` 与 `read_summary` 同为 `AiTradeIntelSummary` 的装配点，故同住 `summary.py`
+# （本文件在 session-binding 轮越 800 行，处置是「再下沉一层」而不是放宽阈值）。
+from .summary import static_summary as _static_summary  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -43,55 +55,9 @@ _BY_INST: dict[str, "IntelRuntime"] = {}
 # 进程级单调重装序号（`itertools.count`）：只增不减、**不按分组分区**——序号只用于比大小，
 # 跨分组共用一个计数器不会出错且少一层字典。
 _ARM_SEQ = itertools.count(1)
-# 「分组没在跑」的**唯一**回执模板（`rearm_group` / `manager.rearm_intel` 共用；两处各拼一份
-# 必漂移，而这块面板的全部价值就在于「失败要出声」）。**调用点一律 `dict(...)` 取副本**。
-ARM_NOT_RUNNING: dict = {"rearmed": False, "pending": False, "armed": False,
-                         "reason": "not_running", "detail": "", "changed": False}
-# `_ARM_ERRORS` 与三个读写函数住在 `arming.py`（实施发现 I-1）：`resolve_arm` 的 `arm_failed`
-# 分支要读它，而 `arming` 依评审 P0-2 不许 import `runtime`。这里**原样重新导出**，故
-# `intel_runtime.record_arm_error(...)` / `clear_arm_error(...)` 的调用点一个字节不改。
-
-
-def _static_summary(inst_id: str, *, code: str) -> dict:
-    """未装配 / 已关闭时的静态 summary（**仍然下发**，否则降级在界面上恒不可见）。
-
-    **签名一个字节不改**（评审 P1-2）：`code` 仍是一个降级码，arm 四键由
-    `arming.arm_of_code(code)` 解出来之后经 `arm_wire` 这**同一个**写点出键，§3.0 第 3 条
-    「同一列只有一个人写」因此没有被破坏，而 `tests/test_ai_intel_alert_shutdown.py` 里那次
-    `_static_summary(INST, code="no_provider")` 也继续绿（`no_provider` 不在 `ARM_REASONS` 里，
-    走 `arm_of_code` 的诚实回落分支）。
-
-    `"degrade": None` 是一个**占位**（与 `service.read_summary` 逐字同形）：`arm_wire` 只在未
-    装配时写它，占位保证这个键恒在位——前端读到 `undefined` 会把「没装上」画成「一切正常」。
-    """
-    return {
-        "instId": inst_id,
-        "counts": {"ultra": 0, "mid": 0, "long": 0, "archived": 0},
-        "unread": 0, "lastSeenTs": 0, "lastCollectTs": None, "lastCurateTs": None,
-        "nextDueTs": None, "inFlight": False,
-        "degrade": None,
-        "dailyUsed": 0, "dailyCap": 0,
-        # closed-loop §3.6：两块新读数在**静态 summary 上也必须在位**（形状一致），否则未装配的
-        # 分组会让前端读到 `undefined` 并把「情报层没装上」画成「引用了 0 次」。
-        "citations": {"cited": 0, "entryCited": 0, "settledTrips": 0, "winCount": 0,
-                      "netPnlUsd": 0.0, "neverCited": 0},
-        "verify": {"confirmed": 0, "refuted": 0, "unresolved": 0, "pending": 0,
-                   "lastVerifyTs": None},
-        # evidence-grounding §4.2：静态 summary 上也必须**在位**（形状一致），否则未装配的分组会
-        # 让前端读到 `undefined`。`None` = 分母 0（「没提过引文」），与 0（「提了全没中」）分开。
-        "quoteHitRate": None,
-        # actionability §4.2：轴 A 的两个新键与轴 B 的摘要块**在静态 summary 上同样必须在位**
-        # ——上一轮 `citations` / `verify` / `quoteHitRate` 三次踩过同一个坑：前端读到
-        # `undefined` 会把「情报层没装上」画成「零告警」。
-        "alerts24h": 0,
-        "lastAlertTs": None,
-        "efficacy": {"enabled": False, "kMin": 0, "sampleN": 0,
-                     "overall": {"settled": 0, "wins": 0, "netPnlUsd": 0.0,
-                                 "confirmed": 0, "refuted": 0, "unresolved": 0,
-                                 "samples": 0, "accuracy": None}},
-        # arm-state 轴 A：四键 + `degrade` 从**同一个写点**出（§3.0 第 3 条）。
-        **arming.arm_wire(arming.arm_of_code(code)),
-    }
+# `ARM_NOT_RUNNING` / `arm_result` / `arm_result_of` **已外移**到 `arming.py`（本文件在
+# session-binding 轮再次越 800 行，处置同 `summary.py`：纯搬运、零语义变化）；`ARM_NOT_RUNNING`
+# 在上面的 import 段原样重新导出，故既有调用点一个字节不改。
 
 
 class IntelRuntime:
@@ -116,6 +82,14 @@ class IntelRuntime:
         self._lock = asyncio.Lock()
         self._digest: dict[str, dict] = {}
         self._digest_ids: dict[str, frozenset[int]] = {}
+        # ★ 评审 P1-1：置顶是**状态**，不是形参。`refresh` 有四个调用点（`_after_round` /
+        # `invalidate`（REST 每一次写，含「标记已读」）/ 停调度收尾 / `scheduler._loop`），
+        # 只在其中一个传参等于「任何一次标记已读都会把置顶抹掉」——而 `_alert` 早已把
+        # `in_digest=True` 戳进台账与唤醒句，于是 prompt 说「已在下方情报段中列出」而它并不在。
+        # 值域 `inst_id -> (item_id, expire_wall)`；窗口复用告警自己的唤醒窗口，不造第二个常数。
+        self._pinned: dict[str, tuple[int, float]] = {}
+        # 轴 C：最近一次决策轮真正渲染出来的读数（由会话经 `binding.note_disclosure` 回填）。
+        self._last_round: dict[str, dict] = {}
         self._summary: dict[str, dict] = {}
         self._in_flight: set[str] = set()
         # 一轮的**收尾段**（`_after_round`）跑在锁外、且在 `_in_flight` 被清掉之后，故它需要
@@ -148,12 +122,45 @@ class IntelRuntime:
 
         arm 四键在**出口**统一打戳：缓存里的那一份可能是上一次装配期写的，而 `rearm` 之后它
         必须立刻说新话。这也是 §3.0 第 3 条「同一列只有一个人写」的落点。
+
+        session-binding 轴 C 的 `binding` 块**同址打戳**（同一条理由 + 同一个写点
+        `binding.binding_wire`）：三条读路径（WS `intel` 事件、`snapshot.intel`、
+        `GET /intel/{instId}`）因此天然同形，不存在「WS 一份、REST 一份」的分叉。
         """
         summary = self._summary.get(inst_id)
         if summary is None:
             return None
         return {**summary, "inFlight": inst_id in self._in_flight,
-                **arming.arm_wire(self._arm)}
+                **arming.arm_wire(self._arm),
+                "binding": binding_wire(build_binding(self, inst_id))}
+
+    def last_round_for(self, inst_id: str) -> dict | None:
+        """`binding.lastRound` 的取数点；该标的还没渲染过任何一轮 ⇒ ``None``。"""
+        return self._last_round.get(inst_id)
+
+    def note_last_round(self, inst_id: str, wire: dict) -> None:
+        """会话回填「上一轮情报段真正渲染成什么样」（`binding.note_disclosure` 的落点）。
+
+        **同步、不查库、不排任务**：它跑在决策 payload 装配那一行之后，一次 await 就会让真实
+        资金决策的时延取决于一块观测数据。
+        """
+        if inst_id in self._summary:
+            self._last_round[inst_id] = dict(wire)
+
+    @property
+    def _pin_enabled(self) -> bool:
+        """轴 B-3 的 L3 总闸（告警置顶）。关 ⇒ `pin_ids` 恒空 ⇒ 注入排序逐字节回退。"""
+        return bool(getattr(self.deps.settings, "ai_trade_intel_alert_pin_enabled", True))
+
+    def _set_pin(self, inst_id: str, item_id: int) -> None:
+        """**唯一**写点（薄转发到 `binding.set_pin`）：`_after_round` 在 `refresh` 之前调它。"""
+        set_pin(self._pinned, inst_id, item_id,
+                now=self.deps.now(),
+                ttl_s=alert_pending_ttl_s(self.deps.settings))
+
+    def _live_pin(self, inst_id: str) -> int:
+        """**唯一**读点（薄转发）：过期即自动为空，故 `refresh` 的四个调用点一字节不改。"""
+        return live_pin(self._pinned, inst_id, now=self.deps.now())
 
     @property
     def lock(self) -> asyncio.Lock:
@@ -260,7 +267,9 @@ class IntelRuntime:
             self._notify(inst_id, summary)
             return summary
         try:
-            snapshot = await service.build_snapshot(self.deps, inst_id, arm=self._arm)
+            # 轴 B-3：置顶从**状态**里取（`_live_pin` 过期即为空）而不是从形参，见 `_set_pin`。
+            snapshot = await service.build_snapshot(self.deps, inst_id, arm=self._arm,
+                                                    pin_item_id=self._live_pin(inst_id))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 —— 快照是加法；失败只放弃这一次刷新
@@ -343,9 +352,14 @@ class IntelRuntime:
         return outcome
 
     async def _after_round(self, inst_id: str, outcome: RoundOutcome) -> None:
+        handoff = getattr(outcome, "alert", None)
+        # ★ 轴 B-3：把「触发了本轮的那条情报」钉进即将定稿的 digest。判据在 `refresh` **之前**
+        # 就已经在手（`outcome.alert`），故不必调换 `refresh` / `_alert` 的顺序（那个顺序是
+        # actionability 评审 P0-3 用血换来的，不许动）。
+        self._set_pin(inst_id, pin_item_id(handoff, enabled=self._pin_enabled))
         await self.refresh(inst_id, degrade_code=outcome.degrade_code,
                            reason=outcome.error_text, rejected=outcome.rejected)
-        self._alert(inst_id, getattr(outcome, "alert", None))
+        self._alert(inst_id, handoff)
 
     def _alert(self, inst_id: str, handoff) -> None:
         """把一条待处理告警交给该标的的交易会话（actionability §3.1.3 的第二跳）。
@@ -520,7 +534,8 @@ async def build_group_runtime(*, group_id: str, members: Iterable[str], settings
                               sessionmaker, provider_cfg, make_client,
                               bar: str = "15m", change_24h_pct=None,
                               notify: Callable[[str, dict], None] | None = None,
-                              notify_alert: Callable[[str, object], None] | None = None
+                              notify_alert: Callable[[str, object], None] | None = None,
+                              session_rule: IntelSessionRule | None = None
                               ) -> "IntelRuntime":
     """装配一个分组的情报运行时（`manager.start_group` / `resume_group` 的唯一入口）。
 
@@ -538,6 +553,11 @@ async def build_group_runtime(*, group_id: str, members: Iterable[str], settings
         notify_alert: `(inst_id, AlertHandoff) -> None`，把一条待处理告警交给会话（**同步**，
             绝不 await——情报后台任务里出现一次对会话的 await，就等于把「停止按钮」的响应时间
             与情报轮绑在一起）。
+        session_rule: 本次会话对情报层的采信约定（session-binding 轴 A）。**必须是一个独立的、
+            显式的 keyword 形参**，在 `resolve_intel_settings` **之后**才与运维总闸合取——
+            把它编码成 `Settings.ai_trade_intel_inject` 会被 `INTEL_SETTING_BRIDGE` 里那一行
+            库内行静默覆盖，而且不报错（spec §3.1 A-2 的陷阱）。``None`` ⇒ 默认规则
+            ⇒ 逐字节回退（由进程级总闸独裁）。
 
     Returns:
         `IntelRuntime`。总闸关 / 未配置检索源 ⇒ `enabled=False` 的**壳**（不起任务、不查库，
@@ -549,25 +569,38 @@ async def build_group_runtime(*, group_id: str, members: Iterable[str], settings
     deps, arm = _build_deps(
         settings=derived, api_key=api_key, provider_cfg=provider_cfg, make_client=make_client,
         ident=GroupIdentity(sessionmaker=sessionmaker, group_id=group_id, bar=bar,
-                            change_24h_pct=change_24h_pct))
+                            change_24h_pct=change_24h_pct,
+                            session_rule=session_rule or IntelSessionRule()))
     return IntelRuntime(group_id, members, deps, notify=notify, enabled=arm.armed,
                         notify_alert=notify_alert)
 
 
 @dataclass(frozen=True)
 class GroupIdentity:
-    """分组身份：**与设置无关、重装时必须原样带过去**的四个字段。"""
+    """分组身份：**与设置无关、重装时必须原样带过去**的五个字段。
+
+    ★ 评审 P0-4：第 5 个字段 `session_rule` 属于这里，理由与本 dataclass 的名字逐字吻合——
+    用户在启动弹窗上的选择是**会话身份**的一部分，与设置无关。不加这一条，
+    `PUT /settings/intel` 触发的 `rearm_group` 会用一个默认规则重建 deps，把「不采信」悄悄
+    翻成「全文采信」，且不报任何错。
+    """
 
     sessionmaker: object
     group_id: str
     bar: str
     change_24h_pct: object | None
+    session_rule: IntelSessionRule = IntelSessionRule()
 
 
 def identity_of(deps: IntelDeps) -> GroupIdentity:
-    """从一份在跑的依赖里取出分组身份（重装时原样带给下一份）。"""
+    """从一份在跑的依赖里取出分组身份（重装时原样带给下一份）。
+
+    ⚠️ 本函数是**逐字段手抄**的构造，而 `rearm_group` 正是经它拿身份。漏抄任何一行的表现都是
+    静默的；`session_rule` 那一行的漏抄方向还是**最坏的那一个**（`off` 翻成 `full`）。
+    """
     return GroupIdentity(sessionmaker=deps.sessionmaker, group_id=deps.group_id,
-                         bar=deps.bar, change_24h_pct=deps.change_24h_pct)
+                         bar=deps.bar, change_24h_pct=deps.change_24h_pct,
+                         session_rule=deps.session_rule)   # ★ P0-4：漏这一行 = off 翻成 full
 
 
 def _build_deps(*, settings, api_key: str, provider_cfg, make_client,
@@ -600,7 +633,11 @@ def _build_deps(*, settings, api_key: str, provider_cfg, make_client,
 
     base = {"settings": settings, "sessionmaker": ident.sessionmaker,
             "group_id": ident.group_id, "bar": ident.bar,
-            "change_24h_pct": ident.change_24h_pct}
+            "change_24h_pct": ident.change_24h_pct,
+            # ★ 评审 P0-4：会话规则同样是分组身份的一部分，**三条壳分支与实装分支都要带**。
+            # 漏掉它 ⇒ 重装后回落 dataclass 默认值（enabled=True, mode="full"），把用户
+            # 启动时选的「不采信」翻成「全文采信」，且不报错。
+            "session_rule": ident.session_rule}
     code = arming.classify_config(settings)
     if code:
         return IntelDeps(**base), arming.arm_of_code(code)
@@ -686,25 +723,12 @@ async def _sync_scheduler(runtime: "IntelRuntime") -> None:
         scheduler.schedule(runtime.refresh(inst_id))
 
 
-def _arm_result(*, rearmed: bool, pending: bool, arm: ArmState, changed: bool) -> dict:
-    """`rearm_group` / `arm_result_for` 的**同一张 6 键回执**（两处各拼一份必漂移）。"""
-    return {"rearmed": bool(rearmed), "pending": bool(pending), "armed": bool(arm.armed),
-            "reason": str(arm.reason), "detail": str(arm.detail), "changed": bool(changed)}
-
-
 def arm_result_for(group_id: str) -> dict:
     """按 `rearm_group` 的同一张回执读一个分组此刻的装配结论（`manager` 的回落支路用）。
 
-    两处各拼一份回执必漂移，而这块面板的全部价值就在于「失败要出声」。
+    薄转发到 `arming.arm_result_of`——本文件只负责从注册表里把运行时找出来。
     """
-    runtime = _RUNTIMES.get(group_id)
-    if runtime is None:
-        detail = arming.arm_error_for(group_id)
-        arm = (ArmState(True, True, False, "arm_failed", detail) if detail
-               else arming.arm_of_code("not_running"))
-        return _arm_result(rearmed=False, pending=False, arm=arm, changed=False)
-    return _arm_result(rearmed=True, pending=runtime.arm_pending,
-                       arm=runtime.arm, changed=True)
+    return arming.arm_result_of(group_id, runtime=_RUNTIMES.get(group_id))
 
 
 async def rearm_group(*, group_id: str, settings, provider_cfg, make_client,
@@ -741,8 +765,8 @@ async def rearm_group(*, group_id: str, settings, provider_cfg, make_client,
     fingerprint = arming.settings_fingerprint(derived, api_key)
     if fingerprint == runtime.arm_fingerprint and not runtime.arm_pending:
         # 一次真正的空操作：连锁都不碰（G-18 用一把会计数的替身锁冻结这一条）。
-        return _arm_result(rearmed=False, pending=False, arm=runtime.arm,
-                           changed=False)
+        return arming.arm_result(rearmed=False, pending=False, arm=runtime.arm,
+                                 changed=False)
     try:
         deps, arm = _build_deps(settings=derived, api_key=api_key, provider_cfg=provider_cfg,
                                 make_client=make_client, ident=ident)
@@ -751,9 +775,10 @@ async def rearm_group(*, group_id: str, settings, provider_cfg, make_client,
         arming.record_arm_error(group_id, exc)
         # **旧运行时一个字段都没被改**（§3.0 第 2 条：一次失败的重装绝不允许把一条正在正常
         # 工作的流水线弄停）。
-        return _arm_result(rearmed=False, pending=False,
-                           arm=ArmState(True, True, False, "arm_failed", str(exc)[:200]),
-                           changed=False)
+        return arming.arm_result(
+            rearmed=False, pending=False,
+            arm=ArmState(True, True, False, "arm_failed", str(exc)[:200]),
+            changed=False)
     from . import scheduler
 
     seq = next(_ARM_SEQ)
@@ -765,10 +790,10 @@ async def rearm_group(*, group_id: str, settings, provider_cfg, make_client,
         # （它已被 `_shutdown_steps` 第 7 步 drain，故本轮不新增任何关停步骤），并如实回执。
         runtime.mark_arm_pending()              # ★ 只改 `_arm`，不动 `enabled` / `deps`
         scheduler.schedule(runtime.rearm(deps, arm, seq, fingerprint))
-        return _arm_result(rearmed=False, pending=True, arm=runtime.arm,
-                           changed=True)
+        return arming.arm_result(rearmed=False, pending=True, arm=runtime.arm,
+                                 changed=True)
     if arm.reason == "arm_failed":
         arming.record_arm_error(group_id, "检索源适配器构造失败")
     else:
         arming.clear_arm_error(group_id)
-    return _arm_result(rearmed=True, pending=False, arm=arm, changed=True)
+    return arming.arm_result(rearmed=True, pending=False, arm=arm, changed=True)

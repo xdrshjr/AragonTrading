@@ -1231,6 +1231,29 @@ class Settings(BaseSettings):
     ai_trade_intel_reader_health_visible: bool = True
     # 连续多少轮 `reader_attempt>0 且 reader_ok==0` 升琥珀色横幅（50 = 实际上不升）。
     ai_trade_intel_reader_zero_streak_warn: int = Field(default=3, ge=1, le=50)
+    # ---- 会话级情报绑定与渐进式披露（ai-trade-intel-session-binding §3.5，9 项）----
+    # 四条轴各带独立总闸，任一置回退档 ⇒ 对应链路的产物与 `4bf512d` **逐字节相同**。
+    #
+    # 轴 A 总闸。`False` ⇒ `resolve_session_rule` 恒回默认规则（注入由 `ai_trade_intel_inject`
+    # 独裁），启动请求里的 `intel` 键被忽略、回执 `source="ops_off"`。
+    ai_trade_intel_session_opt_in_enabled: bool = True
+    # L1 索引档的字符预算（`mode != "index"` 时根本不读它）。
+    ai_trade_intel_index_max_chars: int = Field(default=480, ge=120, le=3000)
+    # L2 总闸（下单前复核轮按需展开）。`False` ⇒ `intelExpand` 整键缺席、`bodies` 不出键、
+    # 索引档段末那句「下单前会自动展开」也不渲染——**那句话必须为真**。
+    ai_trade_intel_expand_enabled: bool = True
+    ai_trade_intel_expand_max_items: int = Field(default=3, ge=1, le=8)
+    ai_trade_intel_expand_max_chars: int = Field(default=900, ge=200, le=4000)
+    # L3 总闸（告警条目置顶）。`False` ⇒ `_pinned` 恒空 ⇒ 注入排序逐字节回退。
+    ai_trade_intel_alert_pin_enabled: bool = True
+    # 横向总闸（同一根 K 线内的重复唤醒只列新增情报）。`False` ⇒ `intel_tier` 恒 `"full"`。
+    ai_trade_intel_repeat_compress_enabled: bool = True
+    # 横向预算；`0` ⇒ `repeat` 轮只渲染页脚一行。上界由 `_check_intel_disclosure` 钉死。
+    ai_trade_intel_repeat_max_chars: int = Field(default=240, ge=0, le=2000)
+    # 连续 `repeat` 轮的**硬上界**。存在的理由：`decider._trim_context` 的左裁是**静默**的、
+    # 会话拿不到任何回执，而「上一轮列出的 N 条仍然有效」这句话的前提正是那些行还在上下文里。
+    # streak 撞到它 ⇒ 本轮强制出一次 `full` 并清零。
+    ai_trade_intel_repeat_max_rounds: int = Field(default=6, ge=1, le=64)
     # 轴 C：账户级持仓快照的共享 TTL（秒）。`0` ⇒ **完全旁路**，逐字节回到今天（每个成员各发一次）。
     # 上界由 `_check_positions_snapshot_ttl` 钉死在 `< live_auto_poll_interval_s`。
     ai_trade_positions_snapshot_ttl_s: float = Field(default=4.0, ge=0, le=30)
@@ -1541,6 +1564,37 @@ class Settings(BaseSettings):
                 f"LIVE_AUTO_POLL_INTERVAL_S({self.live_auto_poll_interval_s}) = {floor}："
                 "小于它时告警在被盯市 tick 看到之前就过期了，是一个永远不会唤醒的配置，"
                 "而且没有任何错误")
+        return self
+
+    @model_validator(mode="after")
+    def _check_intel_disclosure(self) -> "Settings":
+        """渐进式披露的一条跨字段约束（ai-trade-intel-session-binding §3.5）。
+
+        「压缩档比全量档还长」是一个纯粹的自相矛盾配置：`repeat` 轮的预算比它要压缩的那一档
+        还大，等于压缩从未发生，而用户以为自己开了压缩。**直接拒启动而不静默夹紧**——夹紧
+        会让这件事永远没有人知道。
+
+        ★ 评审 P1-7：判据是 `> min(index_max_chars, prompt_max_chars)` 而不是只比索引档。
+        横向压缩对**两个纵向档都成立**（`mode="full"` 的 repeat 轮同样走 `repeat_max_chars`），
+        只比索引档会漏掉「`prompt_max_chars` 被调到 200、而 `repeat_max_chars` 是 240」这种
+        同样自相矛盾的配置。
+
+        与 spec §3.0 原则 5（加法流水线永不阻挡真实资金）**不冲突**：那一条约束的是**请求期**，
+        本校验器是**进程启动期**的，且在任何请求到达之前就已经拦掉了——定位逐行照抄紧邻的
+        `_check_intel_actionability`。
+
+        Raises:
+            ValueError: `repeat_max_chars` 比两个纵向档中较小的那一个还大。
+        """
+        floor = min(int(self.ai_trade_intel_index_max_chars),
+                    int(self.ai_trade_intel_prompt_max_chars))
+        if int(self.ai_trade_intel_repeat_max_chars) > floor:
+            raise ValueError(
+                f"AI_TRADE_INTEL_REPEAT_MAX_CHARS({self.ai_trade_intel_repeat_max_chars}) "
+                f"必须 ≤ min(AI_TRADE_INTEL_INDEX_MAX_CHARS"
+                f"({self.ai_trade_intel_index_max_chars}), AI_TRADE_INTEL_PROMPT_MAX_CHARS"
+                f"({self.ai_trade_intel_prompt_max_chars})) = {floor}："
+                "压缩档比它要压缩的那一档还长，等于压缩从未发生，而用户以为自己开了压缩")
         return self
 
     @model_validator(mode="after")

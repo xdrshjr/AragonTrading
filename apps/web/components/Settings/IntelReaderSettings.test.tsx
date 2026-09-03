@@ -27,6 +27,9 @@ function settings(over: Partial<IntelSettings> = {}): IntelSettings {
     alertEnabled: true, alertMinImpact: "high", alertCooldownMin: 20, alertDailyCap: 6,
     efficacyEnabled: true, conflictEnabled: true, alertRequireQuote: true,
     alertPendingTtlS: 180,
+    // ai-trade-intel-session-binding 轴 A/D：三把总闸 + 两个只读字数（`tsc` 强制）。
+    sessionOptInEnabled: true, expandEnabled: true, repeatCompressEnabled: true,
+    indexMaxChars: 480, promptMaxChars: 1200,
     // ai-trade-intel-arm-state 轴 C：装配状态块**必填**（`tsc` 强制，不是可选）。
     arm: {
       providerConfigured: true, intelEnabled: true, armed: true, reason: "" as const,

@@ -895,6 +895,28 @@ class AiTradeTrendIn(BaseModel):
                 if key != "enabled" and value is not None}
 
 
+class AiTradeIntelIn(BaseModel):
+    """会话级情报采信约定（ai-trade-intel-session-binding 轴 A）。
+
+    **整键缺省 ⇒ 关闭。** 这与本文件其余六个 `*In`（`baseRules` / `profitGuard` /
+    `tradingHorizon` / `discipline` / `experience` / `direction` / `trend`）「字段缺省 ⇒ 开启」
+    的惯例**方向相反**，是需求的明文要求：外部情报是一份会改变证据面的可选输入，用户没有
+    明确要求时不该悄悄进入一次真实资金决策的上下文。解析点**单一**：
+    `intel/session_rule.resolve_session_rule`；反向门禁 `G-A1` 冻结这一条——照抄既有惯例
+    写成 `True` 即判红。
+
+    `{"intel": null}` 与 `{"intel": {}}` 语义相同（都落到 `enabled=False, mode="index"`）；
+    `{"intel": {"enabled": true}}` ⇒ 索引档。
+
+    值域**一次性在本层校验**（越界 422，**不做静默夹紧**）：``"off"`` **不是**一个可请求的
+    档，它只由 `enabled=False` 派生——把它也做成可请求值会造出「开着但档位是关」这种没有
+    任何 renderer 认识、且不报错的第三态（评审 P1-5）。
+    """
+
+    enabled: bool = False
+    mode: Literal["index", "full"] = "index"
+
+
 class AiTradeDisciplineIn(BaseModel):
     """交易纪律预设入参（ai-trade-discipline-preset-and-integrity §5.1）。
 
@@ -1006,6 +1028,11 @@ class AiTradeGroupStartIn(BaseModel):
     # **实盘与回测两处启动体都接该字段、走同一解析点**（评审 RP1-10）：只接实盘一侧，
     # 「用户在回测里调出来的参数在实盘生效」这条承诺就在**反方向**上破了。
     trend: AiTradeTrendIn | None = None
+    # 市场情报研判（ai-trade-intel-session-binding 轴 A）：**整键缺省 ⇒ 不注入**（与上面
+    # 七个字段的惯例方向相反，理由见 `AiTradeIntelIn` 的 docstring）。解析点 `_resolve_intel`。
+    # ⚠️ **仅实盘 tab 下发**：情报层不进回测车道（`ai_auto/backtest.py` 全文 0 次 intel），
+    # 回测启动体不接该字段（与 `reasoningDepth` 同款处置）。
+    intel: AiTradeIntelIn | None = None
 
     @field_validator("members")
     @classmethod
@@ -2899,6 +2926,12 @@ class IntelSettingsIn(BaseModel):
     alertDailyCap: int | None = Field(default=None, ge=1, le=48)
     efficacyEnabled: bool | None = None
     conflictEnabled: bool | None = None
+    # ---- ai-trade-intel-session-binding §4.4：三把新总闸 ----
+    # ⚠️ 这三个键的**唯一**落点是 `intel/settings_bridge.py::INTEL_SETTING_BRIDGE`。只在这里
+    # 声明、不扩那张表 ⇒ 请求 200、面板上开关照动、`Settings` 上的值永远不变（第五次假面板）。
+    sessionOptInEnabled: bool | None = None
+    expandEnabled: bool | None = None
+    repeatCompressEnabled: bool | None = None
 
 
 class IntelProbeIn(BaseModel):
@@ -2988,6 +3021,15 @@ class IntelSettingsOut(BaseModel):
     # 它，前端只能写死一个数，而它是一个 30–900 的配置项——把它调到 900 的用户会在第 180 秒
     # 看到「会话未在时限内响应」，而后端那一侧还在正常等着。
     alertPendingTtlS: float = 180.0
+    # ---- session-binding：与 `IntelSettingsIn` 的三个新键逐个对称 + 两个**只读**回显键 ----
+    # `indexMaxChars` / `promptMaxChars` 不在 `IntelSettingsIn` 里（纯 env 旋钮，`PUT` 忽略
+    # 它们），但**必须下发**：启动弹窗上那两个字数与「上下文开销约 N 倍」的比值都由它们现算，
+    # 前端一个数都不许硬编码（`alertPendingTtlS` 被写死成前端常量 180 是同形前科）。
+    sessionOptInEnabled: bool = True
+    expandEnabled: bool = True
+    repeatCompressEnabled: bool = True
+    indexMaxChars: int = 480
+    promptMaxChars: int = 1200
     # arm-state 轴 C：装配状态块。**回执必须带上它**——`response_model` 会静默丢弃未声明的键，
     # 症状是「设置卡上那张生效状态卡永远说不出话」（本仓库成文教训，历轮三次）。
     arm: IntelArmOut

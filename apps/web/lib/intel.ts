@@ -1,7 +1,13 @@
 // 情报层的纯函数（ai-trade-market-intel §6.2 #37）：标签、相对时间、排序、未读判定、降级兜底文案。
 // **零 React、零请求**——它们全部可单测，且被弹窗、按钮、设置卡三处共用。
+// 分组级回执的类型住在 `aiTradeTypes`（它是 AI 自动交易的启动契约的一部分），文案装配点在
+// 这里——「情报的中文措辞只有一个出处」这条纪律优先于「按文件分家」。**仅类型导入，无环**。
+import type { AiTradeIntelReceipt } from "./aiTradeTypes";
 import type {
+  AiTradeIntelBinding,
   AiTradeIntelSummary,
+  IntelBindingMode,
+  IntelBindingReason,
   IntelCategory,
   IntelDegrade,
   IntelImpact,
@@ -120,15 +126,110 @@ export function intelButtonLabel(instId: string, summary: AiTradeIntelSummary | 
 }
 
 /**
- * 按钮的 `title`：常态一句说明，降级时**追加降级文案**。
+ * 按钮的 `title`：常态一句说明，**依次**追加绑定态与降级文案。
  *
- * 用户不必打开弹窗就该知道情报流水线出问题了——一个假装没有新闻的面板会被读成「市场很平静」。
+ * 用户不必打开弹窗就该知道两件事：这些情报此刻有没有真的在喂给 Agent（绑定态），以及情报
+ * 流水线是不是出问题了（降级）——一个假装没有新闻的面板会被读成「市场很平静」。
  */
 export function intelButtonTitle(summary: AiTradeIntelSummary | null): string {
   const base = "查看该标的的市场情报（超短/中期/长期）";
+  const binding = intelBindingText(summary);
   const degrade = summary?.degrade;
-  if (!degrade) return base;
-  return `${base}｜${degradeText(degrade)}`;
+  const parts = [base];
+  if (binding) parts.push(binding);
+  if (degrade) parts.push(degradeText(degrade));
+  return parts.join("｜");
+}
+
+/** 采信档的中文名（三处共用：按钮 title、弹窗顶部条、启动弹窗）。 */
+export const BINDING_MODE_LABEL: Record<IntelBindingMode, string> = {
+  off: "未采信",
+  index: "索引档",
+  full: "全文档",
+};
+
+/**
+ * 绑定原因码 → 一句中文（**只翻译码，不重新判定**）。
+ *
+ * 判定全部在后端 `intel/binding.py::_not_injecting_reason` 里做完；前端再判一次就是第二个
+ * 真源，而两处判定漂移了不会有任何东西报错。
+ */
+export const BINDING_REASON_LABEL: Record<IntelBindingReason, string> = {
+  "": "",
+  not_bound: "该标的没有在跑的 AI 自动交易",
+  session_off: "本次 AI 自动交易未采信情报（启动时未开启）",
+  not_armed: "情报流水线未装配，暂时没有可注入的内容",
+  ops_inject_off: "运维已关闭情报注入，情报只采集不喂给 Agent",
+  no_items: "已采信，但库里还没有可注入的条目",
+};
+
+/** 三态：`"injecting"`（正在喂）/ `"bound"`（绑了但没喂）/ `"unbound"`（没绑）。 */
+export type IntelBindingState = "injecting" | "bound" | "unbound";
+
+/**
+ * 绑定三态。**靠形状而非仅靠颜色区分**（色觉无障碍）——调用方据它选实心点 / 空心点 / 无叠加。
+ */
+export function intelBindingState(summary: AiTradeIntelSummary | null): IntelBindingState {
+  const binding = summary?.binding ?? null;
+  if (!binding?.bound) return "unbound";
+  return binding.injecting ? "injecting" : "bound";
+}
+
+/**
+ * 绑定态的一句话（`title` / `aria-label` / 弹窗顶部条共用的**唯一**文案装配点）。
+ *
+ * 未绑定 ⇒ **空串** ⇒ 调用方整段不渲染：对一个没在自动交易的标的说「未采信情报」是噪音。
+ */
+export function intelBindingText(summary: AiTradeIntelSummary | null): string {
+  const binding = summary?.binding ?? null;
+  if (!binding?.bound) return "";
+  if (binding.injecting) {
+    return `本次 AI 自动交易正在采信这些情报 · ${BINDING_MODE_LABEL[binding.mode] ?? binding.mode}`;
+  }
+  return BINDING_REASON_LABEL[binding.reason] || "本次 AI 自动交易未采信这些情报";
+}
+
+/**
+ * 弹窗顶部条第二行的「上一轮进入上下文」读数；从未渲染过 ⇒ **空串** ⇒ 整行不渲染。
+ *
+ * 措辞必须区分两个数（后端页脚也是分两句写的）：`same` 是「见过所以折叠」的，`hidden` 是
+ * 「预算装不下」的——并成一个数，用户与模型都会读错。
+ */
+export function intelLastRoundText(binding: AiTradeIntelBinding | null): string {
+  const last = binding?.lastRound ?? null;
+  if (!last) return "";
+  const extra: string[] = [];
+  if (last.same > 0) extra.push(`另有 ${last.same} 条与上一轮相同、未重复列出`);
+  if (last.hidden > 0) extra.push(`另有 ${last.hidden} 条因篇幅未展示`);
+  const head = `上一轮进入上下文 ${last.shown} 条`;
+  return extra.length > 0 ? `${head}（${extra.join("；")}）` : head;
+}
+
+/**
+ * 「服务端替我决定了什么」的一句中文（`group_status().intel.source`）。
+ *
+ * `request` ⇒ **空串**：用户自己选的，没有任何需要披露的东西。其余三格都是服务端**改写了**
+ * 用户的选择，而改写在这个系统里必须出声。
+ */
+export const INTEL_RECEIPT_SOURCE_LABEL: Record<AiTradeIntelReceipt["source"], string> = {
+  request: "",
+  legacy_fallback: "本次会话启动于该开关上线之前，是否采信由服务端设置决定",
+  ops_off: "会话级情报开关已被运维关闭，是否采信由服务端设置决定",
+  resolve_failed: "启动时未能解析你的选择，已按「不采信」处理",
+};
+
+/**
+ * 分组卡上的「情报研判」一行（intel-session-binding 轴 A-4 的**唯一**读点）。
+ *
+ * 老后端不下发 `intel` ⇒ **空串** ⇒ 整段不渲染（绝不在没有读数时编一句「未采信」）。
+ * `source !== "request"` 时把服务端的改写如实附在后面——`legacy_fallback` 那一格尤其重要：
+ * 它对应的是「本会话启动于该开关上线之前」的冷续跑，而那条路径只有刷新页面后重发现才走得到。
+ */
+export function intelReceiptText(receipt: AiTradeIntelReceipt | null): string {
+  if (!receipt) return "";
+  const mode = BINDING_MODE_LABEL[receipt.mode] ?? receipt.mode;
+  const note = INTEL_RECEIPT_SOURCE_LABEL[receipt.source] ?? "";
+  return note ? `${mode} —— ${note}` : mode;
 }
 
 /**

@@ -500,6 +500,45 @@ describe("AiTradePanel · 真值源与费率来源", () => {
     expect(screen.queryByTestId("ai-truth-sources-chip")).not.toBeInTheDocument();
   });
 
+  it("intel-session-binding 轴 A-4：情报采信回执必须在分组卡上有一个读点", () => {
+    // 后端算了、`groupStateFromStatus` 抄了、却没有任何组件读 —— 那就是死数据。
+    // `legacy_fallback` 这一格只有「刷新页面后重发现一个暂停中的老会话」才走得到。
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP")]),
+        lifecycle: panelGroupWire(),
+        intel: { enabled: true, mode: "full", source: "legacy_fallback" },
+      } as never,
+    });
+    renderPanel();
+    const strip = screen.getByTestId("ai-intel-receipt-strip");
+    expect(strip).toHaveAttribute("data-overridden", "1");
+    expect(strip).toHaveTextContent("全文档");
+    expect(strip).toHaveTextContent("该开关上线之前");
+  });
+
+  it("用户自己选的 ⇒ 不带颜色；老后端缺键 ⇒ 整段不渲染", () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup([makeSession("BTC-USDT-SWAP")]),
+        lifecycle: panelGroupWire(),
+        intel: { enabled: false, mode: "off", source: "request" },
+      } as never,
+    });
+    renderPanel();
+    const strip = screen.getByTestId("ai-intel-receipt-strip");
+    expect(strip).toHaveAttribute("data-overridden", "0");
+    expect(strip).toHaveTextContent("未采信");
+
+    cleanup();
+    useAppStore.setState({
+      aiTradeGroup: { ...makeGroup([makeSession("BTC-USDT-SWAP")]),
+                      lifecycle: panelGroupWire() } as never,
+    });
+    renderPanel();
+    expect(screen.queryByTestId("ai-intel-receipt-strip")).not.toBeInTheDocument();
+  });
+
   it("轴 E：顶栏芯片只在有降级时出现，且**分母写明是 3**（第 4 行只在 REST 上）", () => {
     useAppStore.setState({
       aiTradeGroup: {

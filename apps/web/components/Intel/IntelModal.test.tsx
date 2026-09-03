@@ -35,6 +35,9 @@ const settingsMock = vi.fn(async () => ({
   alertEnabled: true, alertMinImpact: "high" as const, alertCooldownMin: 20, alertDailyCap: 6,
   efficacyEnabled: true, conflictEnabled: true, alertRequireQuote: true,
   alertPendingTtlS: 180,
+  // ai-trade-intel-session-binding 轴 A/D：三把总闸 + 两个只读字数（`tsc` 强制）。
+  sessionOptInEnabled: true, expandEnabled: true, repeatCompressEnabled: true,
+  indexMaxChars: 480, promptMaxChars: 1200,
   arm: {
     providerConfigured: true, intelEnabled: true, armed: true, reason: "" as const,
     message: "情报采集正在运行：BTC-USDT-SWAP", detail: "", groupRunning: true,

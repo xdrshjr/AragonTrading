@@ -140,6 +140,38 @@ describe("AiTradeToggle", () => {
     expect(screen.queryByText("AI 自动交易 · 回测")).not.toBeInTheDocument();
   });
 
+  // W4 / W5（intel-session-binding 轴 A）：提交体恒带 `intel`，且**默认不勾**；`setAiTradeConfig`
+  // 记住的是 `opts.intel` 而不是回执（回执里的 `mode` 是服务端解析后的**生效值**，含派生档
+  // `off`——拿它回填会把「我选了索引档但这次被运维总闸忽略了」固化成「我选了关闭」）。
+  it("sends intel in the start body (default off) and persists opts.intel, not the receipt", async () => {
+    vi.mocked(api.strategies).mockResolvedValue([{ id: 1, name: "均线策略" }] as never);
+    const groupRow: AiTradeGroupRow = {
+      groupId: "grp-1", bar: "1H", strategyIds: [1], strategyNames: ["均线策略"],
+      totalBudgetUsd: 100, leverage: 3, contextRefreshRounds: 10, createdTs: 0,
+      members: [], wakeIntervalMinutes: 2,
+      // 服务端把它解析成了「关」（比如运维总闸把请求忽略了）——这一份**不许**被回填。
+      intel: { enabled: false, mode: "off", source: "ops_off" },
+    };
+    vi.mocked(aiTradeApi.start).mockResolvedValue(groupRow);
+    useAppStore.setState({ aiTradeAcknowledged: true });
+    renderToggle();
+    await screen.findByTitle("开启 AI 自动交易 / 回测");
+    fireEvent.click(screen.getByRole("switch"));
+    await screen.findByText("均线策略");
+    const confirm = await screen.findByRole("button", { name: /确认并开始 AI 自动交易/ });
+    await waitFor(() => expect(confirm).not.toBeDisabled());
+    fireEvent.click(confirm);
+    await waitFor(() => expect(aiTradeApi.start).toHaveBeenCalledTimes(1));
+    // W4：整键恒下发，且**默认不勾**（与弹窗里其余六张卡的方向相反，需求的明文要求）。
+    expect(vi.mocked(aiTradeApi.start).mock.calls[0][0].intel)
+      .toEqual({ enabled: false, mode: "index" });
+    // W5：老 localStorage 无此键 ⇒ 回填 `{enabled:false, mode:"index"}`；记住的是 opts 那一份。
+    await waitFor(() =>
+      expect(useAppStore.getState().aiTradeConfig?.intel)
+        .toEqual({ enabled: false, mode: "index" }),
+    );
+  });
+
   // wake-interval（ai-auto-trading-wake-interval §6.2）：startM 请求体携 wakeIntervalMinutes（默认 2），
   // 成功后取自 opts 写入 aiTradeConfig（res 不回显该键，取 res 会让偏好每次重开回落默认）。
   it("sends wakeIntervalMinutes in the start body and persists it to aiTradeConfig", async () => {

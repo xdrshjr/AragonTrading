@@ -78,11 +78,13 @@ import type {
   AiTradeHorizonProfile,
   AiTradeHorizonProfileId,
   AiTradeHorizonRule,
+  AiTradeIntelRule,
   AiTradeMaBandRule,
   AiTradeProfitGuardRule,
   AiTradeReasoningDepth,
   AiTradeTrendRule,
 } from "@/lib/aiTradeTypes";
+import { AI_TRADE_INTEL_RULE_DEFAULT } from "@/lib/aiTradeTypes";
 import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
 import { tradingApi } from "@/lib/tradingApi";
 import type { Bar } from "@/lib/types";
@@ -90,6 +92,7 @@ import { AI_TRADE_EXPERIENCE_DEFAULTS } from "@/lib/experience";
 import type { AiTradeExperienceRule } from "@/lib/experienceTypes";
 import AiTradeDirectionFields from "./AiTradeDirectionFields";
 import AiTradeExperienceFields from "./AiTradeExperienceFields";
+import AiTradeIntelFields from "./AiTradeIntelFields";
 import AiTradeHorizonFields, { type HorizonCustomKey } from "./AiTradeHorizonFields";
 import AiTradeTradabilityFields, {
   TRADABILITY_CONFIRM_REQUIRED_TEXT,
@@ -128,6 +131,10 @@ export interface AiTradeLaunchOpts {
   // `{enabled:false}`（**显式关闭**，与「字段缺省=默认开启」语义严格区分——后者是老客户端
   // 没发这个字段，前者是用户亲手取消了勾选，合成一个判据用户就再也关不掉这个功能）。
   experience?: AiTradeExperienceRule;
+  // 市场情报研判（intel-session-binding 轴 A）：**仅实盘下发**（情报层不进回测车道）。
+  // 勾选 ⇒ `{enabled:true, mode}`；不勾 ⇒ `{enabled:false, mode}`（**显式关闭**）。
+  // ⚠️ 与上面六个字段的方向相反：这一项的**系统默认就是关闭**，「整键缺省 ⇒ 服务端不注入」。
+  intel?: AiTradeIntelRule;
   // 交易纪律预设（**实盘与回测同源**，discipline-preset R-3）：只带 `{preset}`，阈值一律由服务端
   // 的冻结表决定。整键不发 ⇒ 服务端按 `ai_trade_discipline_default_preset` 装配（老客户端同样受保护）。
   discipline?: AiTradeDisciplineIn;
@@ -192,6 +199,7 @@ export default function AiTradeLaunchModal({
   defaultProfitGuard,
   defaultTradingHorizon,
   defaultExperience,
+  defaultIntel,
   defaultStopLossPct,
   defaultTakeProfitPct,
   error,
@@ -223,6 +231,8 @@ export default function AiTradeLaunchModal({
   // 未选过时留 undefined 并采用接口返回的 defaultProfile（前端不复制任何一个预设数值，R-3）。
   defaultTradingHorizon?: AiTradeHorizonRule;
   defaultExperience?: AiTradeExperienceRule;   // 上次所选经验模式（缺省 ⇒ 本地默认全开）
+  // 上次所选的情报研判偏好（缺省 ⇒ `AI_TRADE_INTEL_RULE_DEFAULT`，即**不勾**）。
+  defaultIntel?: AiTradeIntelRule;
   // 上次填过的单仓 OCO（诊断根因 ③：每次都被清空 ⇒ 用户不知不觉一直用 10%/5% 的宽默认）。
   defaultStopLossPct?: number;
   defaultTakeProfitPct?: number;
@@ -245,6 +255,10 @@ export default function AiTradeLaunchModal({
   const [addError, setAddError] = useState<string | null>(null);
   const [experience, setExperience] = useState<AiTradeExperienceRule>(
     defaultExperience ?? AI_TRADE_EXPERIENCE_DEFAULTS);
+  // 市场情报研判：**默认不勾**（`AI_TRADE_INTEL_RULE_DEFAULT`）。持久化的是用户上一次的
+  // 显式选择，系统默认仍是关闭——两者不是一回事。
+  const [intel, setIntel] = useState<AiTradeIntelRule>(
+    defaultIntel ?? AI_TRADE_INTEL_RULE_DEFAULT);
   const [selectedIds, setSelectedIds] = useState<number[]>(defaultStrategyIds);
   const [capitalRaw, setCapitalRaw] = useState("");
   const [leverageRaw, setLeverageRaw] = useState("");
@@ -733,6 +747,11 @@ export default function AiTradeLaunchModal({
       // 经验模式：整键**恒下发**——`{enabled:false}` 是「用户亲手取消了勾选」，与「整键缺省 ⇒
       // 服务端默认开启」严格区分。回测侧由服务端恒不装配（§十一.2），前端不重复那条判据。
       experience,
+      // 市场情报研判（intel-session-binding 轴 A）：整键**恒下发**（实盘侧由 `AiTradeToggle`
+      // 挑出来提交，回测侧不接该字段）。这里恒下发的理由与上面几项相反却同源：后端把
+      // 「整键缺省」定义成**关闭**，显式下发 `{enabled:false}` 与它同值，但能让「用户看过并
+      // 选了不开」在 `start_wire` 里留下痕迹（冷续跑据它区分老会话）。
+      intel,
       // 交易纪律预设（同一服务端解析点 `_resolve_discipline`，实盘与回测两侧同源，R-3）。
       // **只下发 preset，不下发任何阈值**：阈值的唯一真源是后端那张冻结表。
       discipline: { preset: disciplinePreset },
@@ -859,6 +878,17 @@ export default function AiTradeLaunchModal({
         <AiTradeExperienceFields
           value={experience}
           onChange={setExperience}
+          disabled={submitting}
+          backtest={mode === "backtest"}
+        />
+
+        {/* 市场情报研判（intel-session-binding 轴 A）：挂在【经验模式】之后、时间级别之前——
+            两者同为「给 Agent 的额外证据」，一内生一外生，放在一起用户才不必跨段对照。
+            回测 tab 由组件自身整卡不渲染（情报层不进回测车道）。 */}
+        <AiTradeIntelFields
+          value={intel}
+          onChange={setIntel}
+          instIds={mode === "backtest" ? [instId] : members.map((m) => m.instId)}
           disabled={submitting}
           backtest={mode === "backtest"}
         />

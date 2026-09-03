@@ -91,6 +91,12 @@ export function groupStateFromStatus(row: AiTradeGroupRow): AiTradeGroupState {
     // 费率来源（silent-degradation-repair 轴 A-4）：**第五条同款注释**——本函数是逐键手抄的
     // 映射，漏抄的表现永远是同一个形状：WS 通路好的，只有刷新页面后重发现才拿不到，且不报错。
     feeRates: row.feeRates ?? null,
+    // 会话级情报采信回执（intel-session-binding 轴 A-4）：**第六条同款注释**——本函数是逐键
+    // 手抄的映射，漏抄的表现永远是同一个形状：WS 通路是好的，只有刷新页面后重发现才拿不到，
+    // 且不报任何错。而那恰恰是**数十条持仓中的暂停会话**唯一会走的那条路径（`legacy_fallback`
+    // 那一行披露就在这个键上）。`?? null` 要求后端恒下发，才能把「本轮没数据」与「老后端」
+    // 区分开。
+    intel: row.intel ?? null,
     startedTs: row.createdTs,
     members,
   };

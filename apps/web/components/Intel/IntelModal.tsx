@@ -29,6 +29,7 @@ import type {
   IntelTier,
 } from "@/lib/intelTypes";
 import { useAppStore } from "@/lib/store";
+import IntelBindingStrip from "./IntelBindingStrip";
 import IntelActivityTab from "./IntelActivityTab";
 import IntelEditor from "./IntelEditor";
 import { IntelDegradeBanner } from "./IntelEmptyStates";
@@ -385,6 +386,13 @@ export default function IntelModal({
             busy || summary?.inFlight ? "opacity-100" : "opacity-0",
           )}
         />
+
+        {/* 绑定条（session-binding 轴 C-3）：排在降级横幅**之前**——「这些情报此刻有没有
+            在喂给 Agent」比「流水线降级了」更靠前地回答用户打开这个弹窗时的第一个问题。
+            未绑定 ⇒ 组件自身整段不渲染。 */}
+        <div className="px-4 pt-2">
+          <IntelBindingStrip summary={summary} />
+        </div>
 
         <IntelDegradeBanner
           degrade={summary?.degrade ?? null}

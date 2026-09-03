@@ -102,6 +102,14 @@ export default function IntelCard({
   const unread = isUnread(item, summary);
   const shortTitle = item.headline.slice(0, 12);
   const inactive = item.status !== "active";
+  // session-binding 轴 C-3：这一条**本情报轮定稿进了情报段**吗。
+  // 编号**不新造标识**：后端的 `refs` 表就是 `format_ref(i)`（`enumerate(picked, start=1)`），
+  // 而 `digestItemIds` 正是那份 `picked` 的同序快照，故「下标 + 1」与后端编号逐字相同。
+  // ⚠️ 两条限制必须记住：① 「定稿进段」不等于「上一轮渲染出来了」——差额正是横向压缩，
+  // 悬浮提示已说清；② 引用编号总闸（`citeEnabled`）关时 prompt 里根本没有 [Ixx]，此时这个
+  // chip 表示的是「它在本轮情报段里的位次」，不是模型见过的编号。
+  const digestIndex = (summary?.binding?.digestItemIds ?? []).indexOf(item.id);
+  const digestRef = digestIndex >= 0 ? `I${String(digestIndex + 1).padStart(2, "0")}` : "";
 
   return (
     <div
@@ -113,6 +121,8 @@ export default function IntelCard({
           : "border-[var(--border)] bg-[var(--bg)]",
         // 被证伪 ⇒ 整卡降透明度：它已经不再进决策 prompt，视觉上必须与在用的那些区分开。
         refuted && "opacity-60",
+        // 已进情报段 ⇒ 左缘 2px 强调竖线（`border-l-2` 覆盖上面那条 1px 的左边框）。
+        digestRef && "border-l-2 border-l-[var(--accent)]",
       )}
     >
       {refuted && (
@@ -137,6 +147,15 @@ export default function IntelCard({
             {item.userEdited && " · 用户编辑"}
             {item.isScheduled && " · 已排期"}
           </span>
+          {digestRef && (
+            <span
+              data-testid="intel-card-digest-ref"
+              title="本情报轮已定稿进入情报段；重复唤醒轮可能不重复列出"
+              className="shrink-0 rounded-[4px] bg-[var(--accent-soft)] px-1 text-[9px] font-semibold leading-[14px] text-[var(--accent-ink)]"
+            >
+              {digestRef}
+            </span>
+          )}
           {/* 矛盾徽标紧跟在「方向 · 类别 · 影响力」之后：它回答的是同一个问题的另一半——
               「这条的方向可信吗」。挂在动作区旁边会被 hover 显形的那组按钮盖住。 */}
           <IntelConflictBadge item={item} pair={conflict} partner={conflictPartner} />

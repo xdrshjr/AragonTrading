@@ -19,10 +19,23 @@
 """
 from .alert import AlertCandidate, AlertDecision, AlertHandoff, plan_alert
 from .attribution import IntelAttribution
+from .binding import (
+    IntelBinding,
+    alert_pending_ttl_s,
+    attribution_enabled,
+    binding_for,
+    binding_wire,
+    disclosure_stats,
+    intel_limits_for,
+    last_round_wire,
+    new_disclosure_counters,
+    note_disclosure,
+)
 from .cleanup import CleanupPlan, plan_cleanup
 from .conflict import ConflictPair, find_conflicts
 from .citation import CitationResolution, classify_outcome, resolve_citations
-from .disclosure import format_intel
+from .disclosure import DisclosurePlan, format_intel, intel_tier, plan_disclosure
+from .expand import ExpandItem, format_expand, inject_intel_expand, plan_expand
 from .efficacy import Efficacy, Stat, accuracy, solve
 from .extract import ExtractResult, extract_main_text
 from .gate import IntelItem, IntelSource
@@ -40,46 +53,73 @@ from .runtime import (
     unregister,
 )
 from .service import IntelDeps, run_collect_round, run_curate_round
+from .session_rule import (
+    INTEL_MODES,
+    REQUESTABLE_MODES,
+    IntelSessionRule,
+    resolve_session_rule,
+)
 from .service_verify import run_verify_round
 from .taxonomy import IntelLimits, limits_from_settings
 
 __all__ = [
+    "INTEL_MODES",
+    "REQUESTABLE_MODES",
     "AlertCandidate",
     "AlertDecision",
     "AlertHandoff",
     "CitationResolution",
     "CleanupPlan",
     "ConflictPair",
+    "DisclosurePlan",
     "Efficacy",
+    "ExpandItem",
     "ExtractResult",
     "IntelAttribution",
+    "IntelBinding",
     "IntelDeps",
     "IntelItem",
     "IntelLimits",
     "IntelRuntime",
+    "IntelSessionRule",
     "IntelSource",
     "ReaderConfig",
     "ReaderResult",
     "Stat",
     "VerifiedQuote",
+    "binding_for",
+    "binding_wire",
     "build_group_runtime",
+    "disclosure_stats",
     "extract_main_text",
     "fetch_many",
     "guard_url",
     "accuracy",
+    "alert_pending_ttl_s",
+    "attribution_enabled",
     "classify_outcome",
     "find_conflicts",
+    "format_expand",
     "format_intel",
+    "inject_intel_expand",
     "intel_digest_for",
+    "intel_limits_for",
     "intel_summary_for",
+    "intel_tier",
     "invalidate",
+    "last_round_wire",
     "limits_from_settings",
+    "new_disclosure_counters",
     "normalize_for_match",
     "note_alert_outcome",
+    "note_disclosure",
     "plan_alert",
     "plan_cleanup",
+    "plan_disclosure",
+    "plan_expand",
     "register",
     "resolve_citations",
+    "resolve_session_rule",
     "run_collect_round",
     "run_curate_round",
     "run_verify_round",

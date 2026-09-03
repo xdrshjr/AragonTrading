@@ -153,6 +153,10 @@ export default function AiTradeToggle() {
         tradingHorizon: opts.tradingHorizon,     // 交易周期模式（同上；缺省=服务端默认开启）
         discipline: opts.discipline,             // 交易纪律预设（同上；缺省=服务端默认 balanced）
         experience: opts.experience,             // 经验模式（同上；取消勾选即 enabled:false）
+        // 市场情报研判（intel-session-binding 轴 A）：**整键缺省 ⇒ 服务端不注入**（与上面
+        // 六项的方向相反，这是需求的明文要求）。显式下发让「用户看过并选了不开」在
+        // `start_wire` 里留下痕迹，冷续跑据它把老会话与新会话区分开。
+        intel: opts.intel,
         direction: opts.direction,               // 方向对称性（同上；取消勾选即 contrarianEnabled:false）
         trend: opts.trend,                       // 执行周期趋势基调（同上；取消勾选即 enabled:false）
         contextRefreshRounds: opts.contextRefreshRounds,
@@ -181,6 +185,10 @@ export default function AiTradeToggle() {
         takeProfitPct: opts.takeProfitPct ?? undefined,
         // [R-4] 同理取 opts：回执不回显经验模式规则，取 res 会让这个勾选每次重开都回落默认。
         experience: opts.experience,
+        // [R-4] 同理取 opts：回执里的 `intel` 是**服务端解析后的生效值**（含 `source` 与
+        // 派生档 `off`），拿它回填会把「我选了索引档但这次被运维总闸忽略了」固化成「我选了
+        // 关闭」——下次打开弹窗时用户的选择就被服务端的一次临时状态改写了。
+        intel: opts.intel,
       });
       setModalOpen(false);
       setError(null);
@@ -626,6 +634,9 @@ export default function AiTradeToggle() {
         // （弹窗采用接口返回的 defaultProfile）——前端复制一份默认模式必然与服务端漂移（R-3）。
         defaultTradingHorizon={aiTradeConfig?.tradingHorizon}
         defaultExperience={aiTradeConfig?.experience}
+        // 老 localStorage 无此键 ⇒ `undefined` ⇒ 弹窗回落 `AI_TRADE_INTEL_RULE_DEFAULT`
+        // （默认不勾）。**不为此改 persist version**，沿用 baseRules 先例。
+        defaultIntel={aiTradeConfig?.intel}
         error={error}
         errorRemedies={startRemedies}
         liveGateReason={liveGateReason}

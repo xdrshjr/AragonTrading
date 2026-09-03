@@ -243,6 +243,23 @@ ARM_REASONS: tuple[str, ...] = (
 )
 
 
+# ---------------- 绑定状态码（ai-trade-intel-session-binding 轴 C · 单一真源） ----------------
+# 「这份情报此刻正在被哪一个会话、以什么档位采信」在界面上只有五种答案。**码 → 中文短语**
+# 的映射写在这里而不是各处手拼：`IntelBinding.reason` 的值域校验（`binding.binding_wire`）与
+# 前端文案表（`apps/web/lib/intel.ts::BINDING_REASON_LABEL`）都以这张表为准。
+#
+# ⚠️ **文案里一个 markdown 记法都不许有**（`**` / 反引号）。前端把它当纯文本渲染，星号会原样
+# 显示成字面星号——本仓库为同一形状复发过五次，而前端的源码门禁看不见后端的字面量，故守卫
+# 用例（W9）放在后端、扫的正是本表的值。
+BINDING_REASONS: dict[str, str] = {
+    "not_bound": "这个标的没有在跑的 AI 自动交易",
+    "session_off": "本次 AI 自动交易未采信情报（启动时未开启）",
+    "not_armed": "情报流水线未装配，暂时没有可注入的内容",
+    "ops_inject_off": "运维已关闭情报注入，情报只采集不喂给 Agent",
+    "no_items": "已采信，但库里还没有可注入的条目",
+}
+
+
 def degrade_message(code: str, **fields) -> str:
     """降级码 → 中文一句话。未知码回落成一句诚实的「未知降级」而不是空串。
 
@@ -419,6 +436,19 @@ class IntelLimits:
     efficacy_min_domain_samples: int = 3      # 域名信誉的最小样本，低于它显示「样本不足」
     conflict_enabled: bool = False
     conflict_min_overlap: float = 0.35        # 主题重叠阈值（Jaccard）
+    # ---- ai-trade-intel-session-binding 的七个新阈值（纵向 3 + 横向 3 + 索引 1）----
+    # 两把总闸（`expand_enabled` / `repeat_compress_enabled`）**必须**住在这里而不是留在会话侧
+    # 直读 `Settings`：它们的**生效值**由 `resolve_intel_settings` 叠加库内行之后才成立，而会话
+    # 手上的 `executor.settings` 走的是另一条派生链、读不到情报库内行。两处各读一份的后果是
+    # 「面板上关了、会话这侧照旧开着」，请求 200、开关照动、行为不变（spec §3.0 原则 6）。
+    # 这也是 `alert_enabled` 那三把闸当年走进 `IntelLimits` 的同一条理由。
+    index_max_chars: int = 480            # L1 索引档预算（`mode != "index"` 时不读）
+    expand_enabled: bool = True           # L2 总闸
+    expand_max_items: int = 3             # L2 条数上限
+    expand_max_chars: int = 900           # L2 字符上限
+    repeat_compress_enabled: bool = True  # 横向总闸
+    repeat_max_chars: int = 240           # 横向预算（0 ⇒ repeat 轮只渲染页脚一行）
+    repeat_max_rounds: int = 6            # 连续 repeat 轮的硬上界（撞到即强制出一次 full）
 
     def __post_init__(self) -> None:
         if self.ttl_s is None:
@@ -559,4 +589,14 @@ def limits_from_settings(settings) -> IntelLimits:
         conflict_enabled=bool(getattr(settings, "ai_trade_intel_conflict_enabled", False)),
         conflict_min_overlap=float(
             getattr(settings, "ai_trade_intel_conflict_min_overlap", 0.35)),
+        # session-binding：七行映射与上面七个新字段一一对应。`getattr` 兜底同上——给那些
+        # 直接构造 `Settings` 替身的既有用例留的，它们不该因为本轮新增七个键而一起变红。
+        index_max_chars=int(getattr(settings, "ai_trade_intel_index_max_chars", 480)),
+        expand_enabled=bool(getattr(settings, "ai_trade_intel_expand_enabled", True)),
+        expand_max_items=int(getattr(settings, "ai_trade_intel_expand_max_items", 3)),
+        expand_max_chars=int(getattr(settings, "ai_trade_intel_expand_max_chars", 900)),
+        repeat_compress_enabled=bool(
+            getattr(settings, "ai_trade_intel_repeat_compress_enabled", True)),
+        repeat_max_chars=int(getattr(settings, "ai_trade_intel_repeat_max_chars", 240)),
+        repeat_max_rounds=int(getattr(settings, "ai_trade_intel_repeat_max_rounds", 6)),
     )

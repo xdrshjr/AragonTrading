@@ -118,4 +118,38 @@ describe("AiTradeIntelButton", () => {
     fireEvent.click(screen.getByTestId("ai-trade-intel-button"));
     expect(screen.getByTestId("intel-modal")).toHaveTextContent(INST);
   });
+
+  // ---- W7（intel-session-binding 轴 C-3）：绑定三态的叠加点与 a11y ----
+  const binding = (over: Record<string, unknown> = {}) => ({
+    bound: true, groupId: "aig-1", mode: "index" as const, injecting: true,
+    reason: "" as const, digestItemIds: [1], lastRound: null, ...over,
+  });
+
+  it("W7①：正在喂 ⇒ 实心叠加点，且 aria-label 里说得出这件事", () => {
+    seed(summary({ binding: binding() }));
+    render(<AiTradeIntelButton instId={INST} />);
+    expect(screen.getByTestId("ai-trade-intel-binding-injecting")).toBeInTheDocument();
+    expect(screen.getByTestId("ai-trade-intel-button").getAttribute("aria-label"))
+      .toContain("正在采信这些情报 · 索引档");
+  });
+
+  it("W7②：绑了但没在喂 ⇒ **空心**叠加点（靠形状而非仅靠颜色区分，色觉无障碍）", () => {
+    seed(summary({ binding: binding({ injecting: false, mode: "off",
+                                      reason: "session_off", digestItemIds: [] }) }));
+    render(<AiTradeIntelButton instId={INST} />);
+    const dot = screen.getByTestId("ai-trade-intel-binding-bound");
+    expect(dot.className).toContain("border");
+    expect(dot.className).not.toContain("bg-[var(--accent)]");
+    expect(screen.getByTestId("ai-trade-intel-button").getAttribute("aria-label"))
+      .toContain("未采信情报");
+  });
+
+  it("W7③：没在跑自动交易 ⇒ 无叠加点，`title` 与合入前逐字相同", () => {
+    seed(summary());
+    render(<AiTradeIntelButton instId={INST} />);
+    expect(screen.queryByTestId("ai-trade-intel-binding-injecting")).toBeNull();
+    expect(screen.queryByTestId("ai-trade-intel-binding-bound")).toBeNull();
+    expect(screen.getByTestId("ai-trade-intel-button").getAttribute("title"))
+      .toBe("查看该标的的市场情报（超短/中期/长期）");
+  });
 });

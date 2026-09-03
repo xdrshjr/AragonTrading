@@ -1583,6 +1583,29 @@ export interface AiTradeGroupStartReq {
   // 执行周期趋势基调（execution-trend-verdict §5.1）：整键缺省 ⇒ 服务端按 settings 装配
   // 开启态；`{enabled:false}` 是显式关闭的唯一途径。实盘与回测两侧同一解析点。
   trend?: AiTradeTrendRule | null;
+  // 市场情报研判（intel-session-binding 轴 A）：**整键缺省 ⇒ 服务端不注入**（与上面七个字段
+  // 「缺省即开启」的惯例方向相反，这是需求的明文要求）。**仅实盘 tab 下发**：情报层不进回测
+  // 车道，回测启动体不接该字段。
+  intel?: AiTradeIntelRule | null;
+}
+
+/**
+ * 会话级情报采信约定（intel-session-binding 轴 A）。
+ *
+ * `mode` 的值域**只有两个**：`"off"` 不是一个可请求的档，它由 `enabled=false` 派生——把它也
+ * 做成可请求值会造出「开着但档位是关」这种没有任何渲染器认识、且不报错的第三态。
+ */
+export interface AiTradeIntelRule {
+  enabled: boolean;
+  mode: "index" | "full";
+}
+
+/** 分组级情报采信回执（`group_status().intel`；`source` = 服务端替我决定了什么）。 */
+export interface AiTradeIntelReceipt {
+  enabled: boolean;
+  /** **生效档**（`enabled=false` ⇒ `"off"`）——前端不必自己再合取一次，那是第二个真源。 */
+  mode: "off" | "index" | "full";
+  source: "request" | "legacy_fallback" | "ops_off" | "resolve_failed";
 }
 
 // 分组成员行（start 回执 / status 视图共用）：完整会话行 + 分配占比。
@@ -1632,6 +1655,10 @@ export interface AiTradeGroupRow {
   // 费率来源回执（silent-degradation-repair 轴 A-4）：分组共享一份。成功态即归一 wire、
   // 降级态带 `lastError`（「交易所拒绝了费率查询：51000 …」）、`null` = 未装配。
   feeRates?: FeeRatesWire | null;
+  // 会话级情报采信回执（intel-session-binding 轴 A-4）：`source` 是「服务端替我决定了什么」
+  // 的显式披露。`legacy_fallback` 对应「本会话启动于情报开关上线之前」——那是数十条持仓中的
+  // 暂停会话冷续跑时唯一会走的那一格。老后端不下发 ⇒ `null`。
+  intel?: AiTradeIntelReceipt | null;
 }
 
 /**
@@ -2059,6 +2086,10 @@ export interface AiTradeGroupState {
   // 「刷新页面后重发现」这条路径上费率来源恒缺席，而 WS 通路是好的，于是坑只在重载后复现。
   // `null` = 未装配（总闸关 / 无凭证 / 压根没尝试过取数）⇒ 面板整段不渲染。
   feeRates?: FeeRatesWire | null;
+  // 会话级情报采信回执（intel-session-binding 轴 A-4）：**第六条同款注释**——本状态由
+  // `groupStateFromStatus` 逐键手抄写入，漏抄的表现永远是同一个形状：WS 通路是好的，只有
+  // 刷新页面后重发现才拿不到，且不报任何错。`null` = 老后端。
+  intel?: AiTradeIntelReceipt | null;
   startedTs: number;
   members: Record<string, AiTradeGroupMemberState>;
 }
@@ -2128,7 +2159,19 @@ export interface AiTradeConfig {
   // 研判深度档偏好（可选，同款兜底：读点一律 `?? AI_TRADE_DEFAULT_REASONING_DEPTH`）。
   // **不**为此改 persist version，沿用 baseRules 先例，避免动 migration 链。
   reasoningDepth?: AiTradeReasoningDepth;
+  // 市场情报研判偏好（intel-session-binding 轴 A）：可选，读点一律
+  // `?? AI_TRADE_INTEL_RULE_DEFAULT` 兜底。**不**为此改 persist version（沿用 baseRules 先例）。
+  // 系统默认仍是**关闭**——这里持久化的是用户上一次的**显式选择**，两者不是一回事。
+  intel?: AiTradeIntelRule;
 }
+
+/**
+ * 启动弹窗里那张卡的默认值：**默认不勾**。
+ *
+ * 与本文件其余六个 `*_DEFAULTS` 的方向相反，这是需求的明文要求（后端 `_resolve_intel` 的
+ * docstring 与用例 `G-A1` 一起冻结同一条）。
+ */
+export const AI_TRADE_INTEL_RULE_DEFAULT: AiTradeIntelRule = { enabled: false, mode: "index" };
 
 // 研判深度四档（ai-trade-deep-reasoning-chain §3.1.1）：与后端 `Literal` 逐字对应。
 export type AiTradeReasoningDepth = "off" | "standard" | "deep" | "exhaustive";

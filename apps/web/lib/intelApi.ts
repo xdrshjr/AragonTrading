@@ -115,7 +115,12 @@ export const intelApi = {
       method: "POST",
       body: JSON.stringify({ ts: ts ?? null }),
     }),
-  /** 读检索源设置（**绝不含明文密钥**）。 */
+  /**
+   * 读情报设置的**生效值**（**绝不含明文密钥**）。
+   *
+   * 启动弹窗的「市场情报研判」卡片也走这一个端点（**不新增接口**）：它要的三件事——
+   * 运维总闸开没开、索引档多少字、全文档多少字——都在这份回执里。
+   */
   settings: () => request<IntelSettings>("/settings/intel"),
   /** 写检索源设置（只写显式给出的字段）。**服务端写完当场重装**，回执里的 `arm` 即生效状态。 */
   saveSettings: (patch: IntelSettingsPatch) =>

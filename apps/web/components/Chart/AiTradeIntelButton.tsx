@@ -4,6 +4,8 @@ import { useState } from "react";
 import clsx from "clsx";
 import IntelModal from "@/components/Intel/IntelModal";
 import {
+  intelBindingState,
+  intelBindingText,
   intelButtonLabel,
   intelButtonTitle,
   isSevereDegrade,
@@ -32,13 +34,21 @@ export function AiTradeIntelButton({ instId }: { instId: string }) {
   const unread = summary?.unread ?? 0;
   const badge = unreadBadge(unread);
   const severe = isSevereDegrade(summary?.degrade ?? null);
+  // 绑定三态（session-binding 轴 C-3）：**靠形状而非仅靠颜色区分**（色觉无障碍）——
+  // 实心点 = 正在喂给 Agent，空心点 = 绑了但没在喂，无叠加 = 这个标的没在跑自动交易。
+  const binding = intelBindingState(summary);
+  const bindingText = intelBindingText(summary);
 
   return (
     <>
       <button
         type="button"
         data-testid="ai-trade-intel-button"
-        aria-label={intelButtonLabel(instId, summary)}
+        aria-label={
+          bindingText
+            ? `${intelButtonLabel(instId, summary)}，${bindingText}`
+            : intelButtonLabel(instId, summary)
+        }
         title={intelButtonTitle(summary)}
         onClick={() => setOpen(true)}
         className={clsx(
@@ -70,6 +80,18 @@ export function AiTradeIntelButton({ instId }: { instId: string }) {
           <path d="M5.5 12.2a9.5 9.5 0 0 1 13 0" />
           <path d="M2.8 8.9a14 14 0 0 1 18.4 0" />
         </svg>
+        {binding !== "unbound" && (
+          <span
+            data-testid={`ai-trade-intel-binding-${binding}`}
+            aria-hidden="true"
+            className={clsx(
+              "absolute -bottom-0.5 -right-0.5 h-1.5 w-1.5 rounded-full",
+              binding === "injecting"
+                ? "bg-[var(--accent)]"
+                : "border border-[var(--muted)] bg-[var(--bg)]",
+            )}
+          />
+        )}
         {badge && (
           <span
             data-testid="ai-trade-intel-unread"

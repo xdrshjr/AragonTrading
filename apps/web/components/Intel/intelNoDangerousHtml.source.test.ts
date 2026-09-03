@@ -32,6 +32,8 @@ describe("components/Intel/**", () => {
       "IntelActivityTab.tsx",
       "IntelAlertRow.tsx",
       "IntelAttributionRail.tsx",
+      // intel-session-binding 轴 C-3：弹窗顶部的「此刻在不在喂给 Agent」绑定条。
+      "IntelBindingStrip.tsx",
       "IntelBlockSourceDialog.tsx",
       "IntelCard.tsx",
       "IntelConflictBadge.tsx",

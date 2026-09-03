@@ -29,7 +29,14 @@ def _sha(text: str) -> str:
 
 
 def test_cite_off_renders_byte_identical_to_v1():
-    """G-1：`ref=""` / `cite=False` ⇒ 行体与 wire 键集都与合入前逐字节相同。"""
+    """G-1：`ref=""` / `cite=False` ⇒ 行体与**喂给模型的那段文本**都与合入前逐字节相同。
+
+    ★ ai-trade-intel-session-binding 评审 P1-3 / 放行条件 C-5：冻结口径从「整份 wire 的键集」
+    改成「`format_intel(wire)` 的输出 + `wire["refs"]`」。理由是那一轮新增了两个**纯读侧键**
+    （`itemIds` / `bodies`）：`format_intel` 不读它们 ⇒ 它们的出现不改变 prompt 的任何一个
+    字节，而按整份 wire 冻结会让一个「界面读得到、模型读不到」的加法键判红。被冻结的从此是
+    **模型真正看到的那段文本与编号表**本身——那也正是 G-1 一直想守的东西。
+    """
     item = _item(1)
     plain = render_line(item, now=NOW)
 
@@ -37,8 +44,24 @@ def test_cite_off_renders_byte_identical_to_v1():
     assert not plain.startswith("[")
 
     wire = build_digest([item], limits=LIMITS, now=NOW, last_collect_ts=NOW - 600)
-    assert sorted(wire) == ["hidden", "lines"], "cite 关时 refs / citeEnabled 必须**整键缺席**"
+    assert "refs" not in wire and "citeEnabled" not in wire, \
+        "cite 关时 refs / citeEnabled 必须**整键缺席**"
+    assert "plan" not in wire and "mode" not in wire, \
+        "mode=full 的定稿产物里不许出现档位键（`plan` 只由会话在装配期写）"
     assert _sha(format_intel(wire)) == _sha(format_intel({"lines": [plain], "hidden": 0}))
+
+
+def test_read_side_keys_do_not_change_the_prompt_text():
+    """`itemIds` / `bodies` 是**纯读侧键**：删掉它们，`format_intel` 的输出一个字节不变。
+
+    这是上面那条冻结口径改写的正当性证明——不是「口径放宽了」，而是「那两个键根本进不了
+    prompt」。它们的读者分别是 `binding.digestItemIds`（界面 + 横向计划）与复核轮的展开段。
+    """
+    wire = build_digest([_item(1), _item(2)], limits=LIMITS, now=NOW,
+                        last_collect_ts=NOW - 600, cite=True)
+    assert "itemIds" in wire and "bodies" in wire
+    stripped = {k: v for k, v in wire.items() if k not in ("itemIds", "bodies")}
+    assert _sha(format_intel(wire)) == _sha(format_intel(stripped))
 
 
 def test_ref_prefix_is_exactly_one_half_width_space():

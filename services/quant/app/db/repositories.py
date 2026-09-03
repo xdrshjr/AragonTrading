@@ -1180,6 +1180,7 @@ from .ai_intel_evidence_repositories import (  # noqa: E402,F401
     intel_quote_out,
     list_documents_for_urls,
     list_item_quotes,
+    load_intel_quote_texts,
     prune_documents,
     upsert_documents,
     write_intel_quote_state,

@@ -9,6 +9,7 @@ import {
   degradeText,
   intelButtonLabel,
   intelButtonTitle,
+  intelReceiptText,
   isSafeUrl,
   isSevereDegrade,
   isUnread,
@@ -238,5 +239,33 @@ describe("其它纯函数", () => {
     expect(isSafeUrl("https://a.com")).toBe(true);
     expect(isSafeUrl("javascript:alert(1)")).toBe(false);
     expect(isSafeUrl("file:///etc/passwd")).toBe(false);
+  });
+});
+
+describe("分组卡上的情报采信回执（intel-session-binding 轴 A-4）", () => {
+  it("老后端不下发 ⇒ 空串 ⇒ 整段不渲染（绝不在没有读数时编一句「未采信」）", () => {
+    expect(intelReceiptText(null)).toBe("");
+  });
+
+  it("用户自己选的 ⇒ 只说档位，不附任何解释", () => {
+    expect(intelReceiptText({ enabled: true, mode: "index", source: "request" }))
+      .toBe("索引档");
+    expect(intelReceiptText({ enabled: false, mode: "off", source: "request" }))
+      .toBe("未采信");
+  });
+
+  it("服务端改写了用户选择 ⇒ **必须**把改写如实附在后面", () => {
+    // `legacy_fallback` 那一格只有「刷新页面后重发现一个暂停中的老会话」才走得到，
+    // 而它恰恰是数十条持仓中的暂停会话冷续跑时唯一会走的那一格。
+    const legacy = intelReceiptText({
+      enabled: true, mode: "full", source: "legacy_fallback",
+    });
+    expect(legacy).toContain("全文档");
+    expect(legacy).toContain("该开关上线之前");
+
+    expect(intelReceiptText({ enabled: true, mode: "full", source: "ops_off" }))
+      .toContain("运维");
+    expect(intelReceiptText({ enabled: false, mode: "off", source: "resolve_failed" }))
+      .toContain("未能解析");
   });
 });

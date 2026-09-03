@@ -335,6 +335,48 @@ export interface IntelArm {
   pending: boolean;
 }
 
+/** 绑定原因码（`injecting=false` 时给出；与后端 `taxonomy.BINDING_REASONS` 的键**逐字对应**）。 */
+export type IntelBindingReason =
+  | ""
+  | "not_bound"
+  | "session_off"
+  | "not_armed"
+  | "ops_inject_off"
+  | "no_items";
+
+/** 会话对情报的采信档（与后端 `IntelSessionRule.effective_mode` 逐字对应）。 */
+export type IntelBindingMode = "off" | "index" | "full";
+
+/**
+ * 「这份情报此刻正在被哪一个会话、以什么档位采信」（ai-trade-intel-session-binding 轴 C）。
+ *
+ * **永不缺席、形状恒定**：后端在三条读路径（WS `intel` 事件、`snapshot.intel`、
+ * `GET /intel/{instId}`）上由同一个写点 `binding_wire` 出戳。少一个键会让前端读到 `undefined`
+ * 并把「没绑定」画成「一切正常」。
+ */
+export interface AiTradeIntelBinding {
+  /** 这个标的此刻属于某个在跑 / 已暂停的 AI 自动交易分组。 */
+  bound: boolean;
+  groupId: string | null;
+  mode: IntelBindingMode;
+  /** 最终生效：`armed ∧ 运维总闸 ∧ 会话选择 ∧ 有条目`。 */
+  injecting: boolean;
+  /** `injecting=false` 时的原因码；为真时恒为 `""`。 */
+  reason: IntelBindingReason;
+  /** 本情报轮**定稿进情报段**的 item_id（按渲染序）。注意：不等于「上一轮渲染出来了」。 */
+  digestItemIds: number[];
+  /** 最近一次决策轮真正渲染出来的读数；从未渲染 ⇒ `null`。 */
+  lastRound: {
+    round: number;
+    ts: number;
+    tier: "full" | "repeat";
+    shown: number;
+    same: number;
+    hidden: number;
+    chars: number;
+  } | null;
+}
+
 export interface AiTradeIntelSummary {
   instId: string;
   counts: { ultra: number; mid: number; long: number; archived: number };
@@ -390,6 +432,11 @@ export interface AiTradeIntelSummary {
   lastAlertTs: number | null;
   /** actionability 轴 B 的摘要形态（完整的 byCategory / byDomain 由 REST 拉，不进 WS）。 */
   efficacy: IntelEfficacy;
+  /**
+   * session-binding 轴 C：绑定断面。**声明为可选**只为兼容老后端；读点一律
+   * `summary.binding ?? null` 兜底，绝不假定它存在。
+   */
+  binding?: AiTradeIntelBinding | null;
 }
 
 export interface IntelTierBucket {
@@ -498,6 +545,21 @@ export interface IntelSettings {
    * 「会话未在时限内响应」——而后端那一侧还在正常等着。
    */
   alertPendingTtlS: number;
+  // ---- session-binding：三把总闸 + 两个**只读**字数（与 `INTEL_SETTING_BRIDGE` 逐键对应）----
+  /** 启动 AI 自动交易时能不能逐会话选择「让 Agent 参考市场情报」。 */
+  sessionOptInEnabled: boolean;
+  /** 下单前的复核环节按需展开全文（L2）。 */
+  expandEnabled: boolean;
+  /** 同一根 K 线内的重复唤醒只列新增情报（横向压缩）。 */
+  repeatCompressEnabled: boolean;
+  /**
+   * 索引档 / 全文档的字符预算（**只读**，不在 `IntelSettingsPatch` 里）。
+   *
+   * 启动弹窗上那两个字数与「上下文开销约 N 倍」的比值全部由它们现算——前端**一个数都不许
+   * 硬编码**，理由与 `alertPendingTtlS` 逐字同源：运维改一次旋钮，写死的那句话就成了假话。
+   */
+  indexMaxChars: number;
+  promptMaxChars: number;
   /** 装配状态：「我刚保存的这份设置，此刻到底有没有在跑」。 */
   arm: IntelArm;
 }
@@ -529,6 +591,9 @@ export interface IntelSettingsPatch {
   alertDailyCap?: number;
   efficacyEnabled?: boolean;
   conflictEnabled?: boolean;
+  sessionOptInEnabled?: boolean;
+  expandEnabled?: boolean;
+  repeatCompressEnabled?: boolean;
 }
 
 export interface IntelProbeResult {

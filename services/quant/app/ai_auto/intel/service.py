@@ -33,11 +33,11 @@ from . import corpus as corpus_mod
 from . import gate, prompts
 from . import evidence as evidence_mod
 from . import quotes as quotes_mod
-from . import taxonomy as tax
 from .agent import run_round
 from .disclosure import build_digest_and_ids
 from .gate import IntelItem, IntelSource
 from .search import IntelSearchError, SearchRunner
+from .session_rule import IntelSessionRule
 from .taxonomy import IntelLimits, limits_from_settings
 
 logger = logging.getLogger(__name__)
@@ -188,6 +188,35 @@ class IntelDeps:
     change_24h_pct: Callable[[str], float | None] | None = None
     now: Callable[[], float] = time.time
     limits: IntelLimits = field(default=None)   # type: ignore[assignment]
+    # session-binding 轴 A：一次会话对情报层的采信约定。**带默认值 ⇒ 既有 30+ 个直接构造 deps
+    # 的离线用例一个字节不改**，且默认值（enabled=True, mode="full"）就是本特性合入前的行为。
+    #
+    # ⚠️ 会话选择**绝不能**通过在 `Settings` 副本上改 `ai_trade_intel_inject` 来表达：
+    # `build_group_runtime` 的第一件事就是 `resolve_intel_settings(db, settings)`，而
+    # `INTEL_SETTING_BRIDGE` 里恰好有 `("injectEnabled", "ai_intel.inject", …)`——只要用户在
+    # 设置中心动过一次那个开关，库内行就会**静默覆盖**会话的选择，而且不报错。故它必须是一个
+    # 独立的、显式的字段，在 `resolve_intel_settings` **之后**才与运维总闸合取。
+    session_rule: IntelSessionRule = IntelSessionRule()
+
+    @property
+    def inject_on(self) -> bool:
+        """情报是否进入本会话的决策上下文（**全仓唯一判据**）。
+
+        原先散在 `build_snapshot` 里的那一行 `getattr(deps.settings, "ai_trade_intel_inject",
+        True)` 由本属性取代——两处各判一次必然分叉，而分叉不报错。
+
+        ⚠️ **本属性不含 `armed`**：`armed=False` 时 `IntelRuntime` 是一个壳（`refresh` 早退、
+        `_digest` 恒空），第一项天然生效，判两次就是第二个真源。「此刻真的在喂吗」是另一个
+        谓词（`IntelBinding.injecting`），两者不许互相冒充（评审 P1-6）。
+        """
+        if not bool(getattr(self.settings, "ai_trade_intel_inject", True)):
+            return False                       # 运维总闸优先级最高
+        return bool(self.session_rule.enabled)
+
+    @property
+    def intel_mode(self) -> str:
+        """本会话的生效档：`off` | `index` | `full`（`build_snapshot` 据它选 renderer）。"""
+        return self.session_rule.effective_mode if self.inject_on else "off"
 
     def __post_init__(self) -> None:
         if self.limits is None:
@@ -616,7 +645,8 @@ async def finish_degraded(deps: IntelDeps, inst_id: str, *, kind: str, started: 
 
 
 # ---------------- 快照（供 runtime 缓存；**热路径不查库**） ----------------
-async def build_snapshot(deps: IntelDeps, inst_id: str, *, arm=None) -> dict:
+async def build_snapshot(deps: IntelDeps, inst_id: str, *, arm=None,
+                         pin_item_id: int = 0) -> dict:
     """一次性算出注入用的 digest 与界面用的 summary（唯一的查库点）。
 
     `IntelRuntime` 在每一轮结束、用户经 REST 改动条目后、以及 `POST /seen` 之后调它刷新，
@@ -627,9 +657,16 @@ async def build_snapshot(deps: IntelDeps, inst_id: str, *, arm=None) -> dict:
             （`build_snapshot(deps, INST)`）一个字节不改，回落 `arm_of_deps(deps)`——它以
             `deps.search is not None` 为最硬证据，故离线用例那条「有 runner 即 armed」的既有
             断言继续成立。生产路径由 `IntelRuntime.refresh` 显式传 `self.arm`。
+        pin_item_id: session-binding 轴 B-3：要钉进情报段首位的那一条（告警条目）。
+            **默认 0 ⇒ 既有离线调用点逐字节回退**；生产路径由 `IntelRuntime.refresh` 从它
+            自己的 `_pinned` 状态里取（**不是**形参——`refresh` 有四个调用点，只在其中一个
+            传参等于「任何一次标记已读都会把置顶抹掉」，而唤醒句还在说它在，评审 P1-1）。
     """
     now = deps.now()
     arm = arm if arm is not None else arming.arm_of_deps(deps)
+    # **在开会话之前就判**：`inject_on` 为假时下面整份 digest 都会被丢弃，那一次引文查询就是
+    # 纯浪费——而本轮把会话级采信的默认值定成了**关闭**，那格恰恰是最常见的一格。
+    inject_on = deps.inject_on
     async with deps.sessionmaker()() as db:
         summary = await read_summary(db, inst_id, settings=deps.settings, arm=arm, now=now)
         scope = await repo.load_intel_scope(db, inst_id)
@@ -637,7 +674,8 @@ async def build_snapshot(deps: IntelDeps, inst_id: str, *, arm=None) -> dict:
         items = [item_from_wire(w) for w in scope]
         conflicts, conflict_rows = await load_conflicts(db, inst_id, limits=deps.limits,
                                                         now=now, items=items)
-    inject_on = bool(getattr(deps.settings, "ai_trade_intel_inject", True))
+        quotes = (await _expand_quotes(db, items, limits=deps.limits)
+                  if inject_on else None)
     # ★ closed-loop 评审 P1-15：`cite` **只有这一个取值来源**。写在别处会让 REST 读到的库存与
     # 注入看到的库存分叉，而分叉不报错。
     cite_on = bool(getattr(deps.settings, "ai_trade_intel_cite_enabled", False))
@@ -645,7 +683,9 @@ async def build_snapshot(deps: IntelDeps, inst_id: str, *, arm=None) -> dict:
         build_digest_and_ids(items, limits=deps.limits, now=now,
                              last_collect_ts=summary["lastCollectTs"], cite=cite_on,
                              eff=eff if deps.limits.efficacy_enabled else None,
-                             conflicts=conflicts)
+                             conflicts=conflicts, mode=deps.intel_mode,
+                             pin_ids=frozenset({int(pin_item_id)} if pin_item_id else ()),
+                             quotes=quotes)
         # `inject` 关掉时情报段整段不存在 ⇒ id 集合**必须为空**：`in_digest` 因此恒为 False，
         # 唤醒句走内联态并如实说「注入已关闭」（评审 P0-3 的第二条路径）。
         if inject_on else ({"lines": [], "hidden": 0}, frozenset()))
@@ -655,89 +695,32 @@ async def build_snapshot(deps: IntelDeps, inst_id: str, *, arm=None) -> dict:
             "digestItemIds": digest_ids}
 
 
-async def read_summary(db, inst_id: str, *, settings, arm,
-                       now: float | None = None) -> dict:
-    """`AiTradeIntelSummary` 的**唯一**装配点（runtime 快照与 REST 读端点共用）。
+async def _expand_quotes(db, items: list[IntelItem], *,
+                         limits: IntelLimits) -> dict[int, str] | None:
+    """复核轮展开段要用的「每条 ≤1 段已核实引文」（session-binding 轴 B-4）。
 
-    两处各拼一份的后果不是抽象的：本仓库的 `groupStateFromStatus` 就是那样一个逐键手抄的映射，
-    它反复制造「WS 通路是好的，只有刷新后重发现拿不到值」这类最难发现的坑。
+    **一次 `IN` 查询**，且只在本会话真的在采信情报（调用点按 `deps.inject_on` 短路）、L2 总闸
+    开着、且库里真的有带引文的条目时才发——任一不成立 ⇒ 返回 ``None`` ⇒ 一次多余的查询都
+    没有，`bodies` 里 `quote` 恒为空串，产物逐字节回退。
+
+    刻意在**这里**取而不是在会话侧取：决策热路径查库是本仓库明令禁止的，而展开所需的正文必须
+    与 `lines` 在同一次定稿里产生（spec §3.0 原则 3）。
 
     Args:
-        arm: `arming.ArmState`（**取代**原来的 `provider_configured: bool`，形参个数不变）。
-            arm 四键 + 未装配时的 `degrade` 由 `arming.arm_wire` 这**一个**写点在返回字典的
-            末尾展开——§3.0 第 3 条「同一列只有一个人写」的落点。
+        db: `build_snapshot` 已经开着的那个只读会话（**不新开会话**）。
+        items: 该标的的全部条目。
+        limits: 提供 `expand_enabled`。
+
+    Returns:
+        ``item_id → 引文原文``；无候选 ⇒ ``None``。
     """
-    wall = time.time() if now is None else now
-    watch = await repo.load_intel_watch(db, inst_id) or {}
-    counts = await repo.count_intel_by_tier(db, inst_id)
-    unread = await repo.count_intel_unread(
-        db, inst_id, last_seen_ts=int(watch.get("lastSeenTs") or 0))
-    impact = await repo.read_intel_impact(db, inst_id, limit=1)
-    verdicts = await repo.count_intel_verdicts(db, inst_id)
-    # evidence-grounding 评审 P1-13：`quoteHitRate` 就在**这一个只读会话**里求出。写在
-    # `build_snapshot` 里要么多开一个会话，要么走进「同步路径造不出一个 DB 派生键」那个坑。
-    quote_stats = await repo.count_recent_quote_stats(db, inst_id)
-    # actionability §4.2：告警的两个会话级读数走**既有** `intel` 事件，不新增任何 WS 事件类型。
-    alerts = await repo.count_recent_alerts(db, inst_id, since_ts=int(wall) - 86400)
-    # actionability §3.2.4：**摘要形态**的四个数（完整的 `by_category` / `by_domain` 由 REST
-    # 拉——summary 走 WS 逐轮广播给每个前端连接，一张几十行的表广播出去是纯浪费）。
-    #
-    # ⚠️ 拼在这里而不是 `build_snapshot` 里：本函数是 `AiTradeIntelSummary` 的**唯一**装配点，
-    # 而 `api/ai_intel._summary` 也调它。写在 `build_snapshot` 里会让 WS 推的那一份带
-    # `efficacy`、REST 读的那一份不带 —— 两条通路形状分叉，而分叉**不报错**。
-    # 代价是快照路径上多求解一次：`efficacy.solve` 是纯函数，两处同值（G-28 的性质）。
-    limits = tax.limits_from_settings(settings)
-    eff = await read_efficacy(db, inst_id, limits=limits, now=wall)
-    return {
-        "instId": inst_id,
-        "counts": {"ultra": counts["ultra"], "mid": counts["mid"], "long": counts["long"],
-                   "archived": counts["archived"]},
-        "unread": unread,
-        "lastSeenTs": int(watch.get("lastSeenTs") or 0),
-        "lastCollectTs": int(watch.get("lastCollectTs") or 0) or None,
-        "lastCurateTs": int(watch.get("lastCurateTs") or 0) or None,
-        "nextDueTs": int(watch.get("nextDueTs") or 0) or None,
-        "inFlight": False,
-        "degrade": None,
-        "dailyUsed": daily_used(watch, now=wall),
-        "dailyCap": int(settings.ai_trade_intel_daily_round_cap),
-        # ---- closed-loop §3.6：两块新读数（`snapshot()` 的第八键与 WS `intel` 事件共用同一个
-        # 出口，**不新增第九键**）。`netPnlUsd` 是**关联**净额（共现统计，不是因果归因，R-1）。
-        "citations": {
-            "cited": int(impact["totals"]["citeCount"]),
-            "entryCited": int(impact["totals"]["citeEntryCount"]),
-            "settledTrips": int(impact["totals"]["settledCount"]),
-            "winCount": int(impact["totals"]["winCount"]),
-            "netPnlUsd": float(impact["totals"]["netPnlUsd"]),
-            "neverCited": int(impact["neverCited"]),
-        },
-        "verify": {
-            "confirmed": int(verdicts.get("confirmed", 0)),
-            "refuted": int(verdicts.get("refuted", 0)),
-            "unresolved": int(verdicts.get("unresolved", 0)),
-            "pending": int(verdicts.get("pending", 0)),
-            "lastVerifyTs": int(watch.get("lastVerifyTs") or 0) or None,
-        },
-        # 近 20 轮 `quotesVerified / quotesProposed`。**分母 0 ⇒ `None` 而不是 0**：
-        # 「没提过引文」与「提了全没中」在设置卡上是两句不同的话。
-        "quoteHitRate": quote_stats["hitRate"],
-        # actionability 轴 A：近 24 小时 fired 计数与最近一次告警时刻。
-        # `lastAlertTs` 为 `None` = **从未告警过**，与 0 分开（后者会被渲染成 1970 年）。
-        # 未装配的分组由 `runtime._static_summary` 给出**同形状**的零值（G-25）。
-        "alerts24h": int(alerts["alerts24h"]),
-        "lastAlertTs": alerts["lastAlertTs"],
-        "efficacy": {
-            "enabled": bool(limits.efficacy_enabled),
-            "kMin": int(limits.efficacy_k_min),
-            "sampleN": int(eff.overall.samples),
-            "overall": efficacy_mod.stat_wire(eff.overall),
-        },
-        # arm-state 轴 A：`providerConfigured` / `intelEnabled` / `armed` / `armReason` 四键 +
-        # 未装配时的 `degrade`，**全部由这一个写点出**。展开在字典**末尾**是刻意的：它对
-        # `degrade` 的写入要盖住上面那行 `"degrade": None`，而 `IntelRuntime.refresh` 里那段
-        # 「本轮降级」的覆写仍在本函数**之后**发生 —— 三者的优先级：轮内降级 > 未装配 > 无。
-        **arming.arm_wire(arm),
-    }
+    if not limits.expand_enabled:
+        return None
+    ids = [int(it.item_id) for it in items
+           if it.item_id and it.status == "active" and it.quoted]
+    if not ids:
+        return None
+    return await repo.load_intel_quote_texts(db, ids)
 
 
 def estimate_daily_cost(*, symbols: int, interval_min: float, corpus_docs: int,
@@ -774,6 +757,11 @@ from .settings_bridge import (  # noqa: E402,F401
     resolve_api_key,
     resolve_intel_settings,
 )
+
+# ---------------- summary 装配（**已外移**到 `intel/summary.py`） ----------------
+# 本文件在 session-binding 轮越过 800 行阈值，处置同上：纯搬运、零语义变化，这里原样重新导出，
+# 故 `intel_service.read_summary(...)` 的既有三个调用点一个字节不改。
+from .summary import read_summary  # noqa: E402,F401
 
 # ---------------- 降级 wire（**已外移**到 `intel/taxonomy.py`） ----------------
 # arm-state 评审 P0-2：`degrade_wire` 留在本文件会让纯核心 `intel/arming.py` 为了拼一个三键字典

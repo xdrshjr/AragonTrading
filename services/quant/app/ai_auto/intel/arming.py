@@ -166,6 +166,37 @@ def _arm_facts(state: ArmState) -> tuple[bool, bool, bool, str]:
             bool(state.armed), str(state.reason))
 
 
+# `rearm_group` 在「分组不在注册表里」这一格的固定回执（`manager.rearm_intel` 原样返回它的副本）。
+ARM_NOT_RUNNING: dict = {"rearmed": False, "pending": False, "armed": False,
+                         "reason": "not_running",
+                         "detail": "", "changed": False}
+
+
+def arm_result(*, rearmed: bool, pending: bool, arm: ArmState, changed: bool) -> dict:
+    """`rearm_group` / `arm_result_for` 的**同一张 6 键回执**（两处各拼一份必漂移）。"""
+    return {"rearmed": bool(rearmed), "pending": bool(pending), "armed": bool(arm.armed),
+            "reason": str(arm.reason), "detail": str(arm.detail), "changed": bool(changed)}
+
+
+def arm_result_of(group_id: str, *, runtime) -> dict:
+    """一个分组此刻的装配结论（`runtime.arm_result_for` 的实现）。
+
+    Args:
+        group_id: 分组 id（`runtime is None` 时用它反查装配失败原因）。
+        runtime: 注册表里的那个运行时；``None`` = 没注册上。
+
+    Returns:
+        与 `arm_result` 同一张 6 键回执。
+    """
+    if runtime is None:
+        detail = arm_error_for(group_id)
+        state = (ArmState(True, True, False, "arm_failed", detail) if detail
+                 else arm_of_code("not_running"))
+        return arm_result(rearmed=False, pending=False, arm=state, changed=False)
+    return arm_result(rearmed=True, pending=runtime.arm_pending, arm=runtime.arm,
+                      changed=True)
+
+
 def arm_wire(state: ArmState) -> dict:
     """`AiTradeIntelSummary` 上 arm 四键 + `degrade` 的**唯一**写点（§3.0 第 3 条）。
 

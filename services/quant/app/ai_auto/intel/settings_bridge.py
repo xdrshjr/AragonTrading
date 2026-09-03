@@ -61,6 +61,15 @@ INTEL_SETTING_BRIDGE: tuple[tuple[str, str, str, type], ...] = (
     ("alertDailyCap", "ai_intel.alert_daily_cap", "ai_trade_intel_alert_daily_cap", int),
     ("efficacyEnabled", "ai_intel.efficacy_enabled", "ai_trade_intel_efficacy_enabled", bool),
     ("conflictEnabled", "ai_intel.conflict_enabled", "ai_trade_intel_conflict_enabled", bool),
+    # ---- ai-trade-intel-session-binding：三把新总闸。**不扩这张表 ⇒ 假面板**（第五次同形
+    # 前科）。它们同时露在 `PUT /settings/intel` 上，而这三把闸的**生效值**正是会话侧经
+    # `binding.intel_limits_for` 读到的那一份（spec §3.0 原则 6）——不进桥，用户在面板上
+    # 关掉「下单前展开」之后运行时那侧关了、会话这侧照旧展开，请求 200、行为不变。
+    ("sessionOptInEnabled", "ai_intel.session_opt_in",
+     "ai_trade_intel_session_opt_in_enabled", bool),
+    ("expandEnabled", "ai_intel.expand_enabled", "ai_trade_intel_expand_enabled", bool),
+    ("repeatCompressEnabled", "ai_intel.repeat_compress",
+     "ai_trade_intel_repeat_compress_enabled", bool),
 )
 # 密钥的 app_settings 键。**绝不出接口**（`GET /settings/intel` 只回 `hasKey` / `keyPreview`）、
 # **绝不进日志**（`IntelSearchError` 构造时即脱敏）。

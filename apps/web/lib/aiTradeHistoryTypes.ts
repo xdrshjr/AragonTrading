@@ -189,7 +189,47 @@ export interface AiTradeRunMetrics {
     sizing?: AiTradeSizingStats | null;
     /** 轴 D-2：逆势通路五格细分。一次逆势否决都没发生过 ⇒ 整段缺席（绝不显示一张全零卡）。 */
     consensus?: { contrarianBlocked?: AiTradeContrarianBlocked | null } | null;
+    /**
+     * 情报渐进式披露的会话级读数（intel-session-binding 轴 D）。
+     *
+     * 未装配 / 会话未采信情报（`mode="off"`）/ 一轮都没注入过 ⇒ **整键缺席** ⇒ 那一行不渲染。
+     * 绝不先显示一个会被当真的 0：「这次没喂情报」与「喂了但一个字都没进上下文」是两句
+     * 完全不同的话。
+     */
+    intelDisclosure?: AiTradeIntelDisclosureStats | null;
   };
+}
+
+/**
+ * `aiStats.intelDisclosure` 的形状（与后端 `intel/binding.disclosure_stats` 逐键同构）。
+ *
+ * `hidden` 与 `same` 两个数在后端页脚里就是**分两句写**的：前者是「预算装不下」，后者是
+ * 「见过所以折叠」。这里同样不合并——合并之后模型与用户都会读成一个数。
+ */
+export interface AiTradeIntelDisclosureStats {
+  /** 本会话的生效档（`index` | `full`；`off` 时整键根本不出现）。 */
+  mode: string;
+  roundsInjected: number;
+  roundsFull: number;
+  roundsRepeat: number;
+  /** 单轮渲染出来的最大字符数 / 全程累计字符数（平均 = 累计 ÷ roundsInjected）。 */
+  charsMax: number;
+  charsTotal: number;
+  expandRounds: number;
+  expandItems: number;
+  /** 其中因横向折叠而补给复核官的条数（复核是无状态子调用，它从没见过那几条）。 */
+  expandFolded: number;
+  /** 真的进了情报段的告警条数。 */
+  alertPinned: number;
+  /** 因本会话未采信情报而**没有**唤醒决策的告警条数。 */
+  alertMuted: number;
+  /**
+   * 「已看过」集合被重置的次数，**按成因分格**。
+   *
+   * 一个只报「重置过 5 次」的整数在事后对账里回答不了唯一值得问的那个问题——是暂停造成的，
+   * 是上下文被摘要吃掉了，还是压缩连续太久撞了上界。
+   */
+  seenReset: { pause: number; summary: number; streak: number };
 }
 
 /**

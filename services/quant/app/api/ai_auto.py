@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 
 from fastapi import (APIRouter, Body, Depends, HTTPException, Query, WebSocket,
@@ -42,6 +43,7 @@ from ..ai_auto.experience import (
 )
 from ..ai_auto.feed_runtime import AiTradeFeedSelfHealDisabled
 from ..ai_auto.hold_horizon import HorizonRule, resolve_horizon_rule
+from ..ai_auto.intel import IntelSessionRule, resolve_session_rule
 from ..ai_auto.hold_horizon_profiles import profiles_wire
 from ..ai_auto.manager import (
     AiTradeGroupMemberInput,
@@ -86,6 +88,8 @@ from ..schemas import (
     trade_out,
 )
 from .ws_guard import guard_ws_origin
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["ai-trade"])
 
@@ -238,6 +242,57 @@ def _resolve_trend(raw: AiTradeTrendIn | None, settings: Settings) -> Settings:
         if value is not None:
             updates[setting_key] = value
     return settings.model_copy(update=updates)
+
+
+def _resolve_intel(body: AiTradeGroupStartIn,
+                   settings: Settings) -> tuple[IntelSessionRule, str]:
+    """会话级情报采信的**唯一**解析点（ai-trade-intel-session-binding 轴 A）。
+
+    ⚠️ **字段缺省 ⇒ 关闭**——与 `_resolve_base_rules` / `_resolve_profit_guard` /
+    `_resolve_horizon` / `_resolve_direction` / `_resolve_trend` 那五个「缺省即开启」的兄弟
+    函数**方向相反**。这是需求的明文要求，不是笔误：外部情报是一份会改变证据面的可选输入，
+    用户没有明确要求时不该悄悄进入一次真实资金决策的上下文。照抄兄弟函数的默认值即判红
+    （用例 `G-A1`）。
+
+    ⚠️ **绝不通过在 `Settings` 副本上改 `ai_trade_intel_inject` 来表达会话选择**：
+    `build_group_runtime` 的第一件事就是 `resolve_intel_settings(db, settings)`，而
+    `INTEL_SETTING_BRIDGE` 里恰好有 `("injectEnabled", "ai_intel.inject", …)`——只要用户在
+    设置中心动过一次那个开关，库内行就会**静默覆盖**会话的选择，而且不报错。规则因此作为一个
+    独立对象一路传到 `_build_deps`（spec §3.1 A-2）。
+
+    ⚠️ 本函数读的 `ai_trade_intel_session_opt_in_enabled` 来自**启动请求那条派生链**，而
+    `IntelLimits` 里那两把闸（`expand_enabled` / `repeat_compress_enabled`）只能经
+    `intel.intel_limits_for(inst_id)` 到达会话侧。两条链**刻意**分工：轴 A 的总闸必须在启动
+    请求解析时就生效，而那一刻还没有 runtime、也拿不到情报派生副本。别「顺手统一」成一个。
+
+    Args:
+        body: 启动请求体。`legacy` 的判据**只有一个**——`"intel" not in body.model_fields_set`。
+            pydantic v2 的 `model_fields_set` 能区分「键缺席」与「显式传了 null」，而
+            `resume.py` 用 `AiTradeGroupStartIn(**start_wire)` 重建请求体：本特性合入后每一次
+            新启动的 `start_wire` 都必然含 `"intel"` 键，故这个谓词精确地只对「本特性合入前
+            落库、如今才冷续跑」的会话为真。
+        settings: `_resolve_trend` 之后的派生副本。
+
+    Returns:
+        `(规则, source)`，`source ∈ {"request", "legacy_fallback", "ops_off", "resolve_failed"}`
+        ——它进 `group_status().intel`，是「服务端替我决定了什么」的**显式回执**（本仓库对这件
+        事的成文纪律）。
+
+    Note:
+        fail-open 的**唯一**落点就是这里（spec §3.0 原则 5）：任何异常都回退成
+        `enabled=False`（**方向是关闭，不是开启**）并如实回执，绝不让 `/ai-trade/start` 失败，
+        也**不在 `ai_trade_start` 端点外层再包一层 `except`**（CLAUDE.md 五：缩小作用域）。
+    """
+    try:
+        legacy = "intel" not in body.model_fields_set
+        raw = body.intel.model_dump() if body.intel is not None else None
+        rule = resolve_session_rule(raw, settings, legacy=legacy)
+        if not settings.ai_trade_intel_session_opt_in_enabled:
+            return rule, "ops_off"
+        return rule, ("legacy_fallback" if legacy else "request")
+    except Exception as exc:  # noqa: BLE001 —— 见 docstring：情报层绝不阻挡真实资金启动
+        logger.warning("ai-trade intel session rule resolve failed: %s", exc)
+        return IntelSessionRule(enabled=False), "resolve_failed"
 
 
 def _resolve_position_step(raw: float | None, settings: Settings) -> float:
@@ -482,6 +537,10 @@ async def build_start_request(session: AsyncSession, settings: Settings,
     # 执行周期趋势基调（execution-trend-verdict §5.1）：**同样必须排在 `_resolve_discipline`
     # 之后**，在其结果上再派生一次。与 `_resolve_direction` 的顺序无关（两者改的键不相交）。
     settings = _resolve_trend(body.trend, settings)
+    # 会话级情报采信（intel-session-binding 轴 A）：紧跟 `_resolve_trend` 之后。它与其余
+    # `_resolve_*` **不共享任何 Settings 键**（不产出派生副本，只产出一个规则对象），故顺序上
+    # 只有一条硬约束——必须在 `req = AiTradeGroupStartRequest(...)` 之前。
+    intel_rule, intel_source = _resolve_intel(body, settings)
     experience_rule = resolve_experience(
         body.experience.model_dump() if body.experience is not None else None, settings)
     experience_snapshot = await load_session_graph(
@@ -556,6 +615,8 @@ async def build_start_request(session: AsyncSession, settings: Settings,
         discipline_inert=inert_thresholds(
             preset_table(discipline.preset_id), profit_rule=profit_rule,
             sizing_rule=parse_sizing_rule(settings), horizon_rule=horizon_rule),
+        # 会话级情报采信（轴 A）：规则 + 「服务端替我决定了什么」的显式回执。
+        intel_rule=intel_rule, intel_source=intel_source,
         # 经验层 W-1：规则与启动期快照（`SessionGraph{graph, totals, as_of_ts}` —— 图与库存总量
         # **同一次取数**，因为那两个整数要被逐字渲染进 L0 页眉喂给下真单的模型，不变式 I-9）。
         experience_rule=experience_rule, experience_snapshot=experience_snapshot,

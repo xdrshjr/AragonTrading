@@ -102,9 +102,13 @@ async def _effective_limits(session: AsyncSession, settings: Settings):
 # 无条件让缓存赢，就会出现 `armReason="arm_failed"` 而 `degrade.code="provider_unset"`——
 # 同一份 wire 的两个键说两句相反的话，正是本轮立项要消灭的东西（P1-8 / G-31 的同形）。
 # 故：`armed` 时取缓存（轮内降级 > 无），未装配时取当次算出来的 arm 码（它是刚刚算的，缓存不是）。
-_RUNTIME_ONLY_KEYS = ("inFlight", "degrade")
-# 未装配时仍然从缓存取的那些键：只剩 `inFlight`（它在库里没有落点，且与 arm 无关）。
-_RUNTIME_ONLY_KEYS_UNARMED = ("inFlight",)
+#
+# session-binding 轴 C：`binding` 进**两张表**。它在库里没有任何落点（会话规则住在进程内的
+# `AiTradeGroup` 上），故装没装配都必须从缓存取——`read_summary` 那一份恒是「未绑定」，
+# 让它赢会让 REST 通路对一个正在被采信的标的说「没在跑自动交易」，而 WS 通路是好的。
+_RUNTIME_ONLY_KEYS = ("inFlight", "degrade", "binding")
+# 未装配时仍然从缓存取的那些键：`inFlight` 与 `binding`（两者在库里都没有落点，且与 arm 无关）。
+_RUNTIME_ONLY_KEYS_UNARMED = ("inFlight", "binding")
 
 
 def _is_group_member(inst_id: str) -> bool:

@@ -243,6 +243,14 @@ async def _intel_wire(session: AsyncSession, settings: Settings) -> dict:
         # 只读：动态页签据它把「等待会话响应」与「未在时限内响应」分开（前端写死一个数，
         # 就会在用户调宽时限之后给出一句与后端不一致的判定）。
         "alertPendingTtlS": float(derived.ai_trade_intel_alert_pending_ttl_s),
+        # ---- session-binding：三把新总闸的**生效值**回读 + 两个只读回显键 ----
+        # 两个字数是启动弹窗那张卡的唯一取数点（连「上下文开销约 N 倍」这个比值都由它们现算），
+        # 前端一个数都不硬编码——否则运维改一次旋钮，弹窗上那句话就成了假话。
+        "sessionOptInEnabled": bool(derived.ai_trade_intel_session_opt_in_enabled),
+        "expandEnabled": bool(derived.ai_trade_intel_expand_enabled),
+        "repeatCompressEnabled": bool(derived.ai_trade_intel_repeat_compress_enabled),
+        "indexMaxChars": int(derived.ai_trade_intel_index_max_chars),
+        "promptMaxChars": int(derived.ai_trade_intel_prompt_max_chars),
     }
 
 

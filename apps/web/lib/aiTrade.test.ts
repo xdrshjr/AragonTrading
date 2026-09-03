@@ -1175,6 +1175,18 @@ describe("groupStateFromStatus 的 state 不再被写死（D-7 的直接守卫�
   it("老后端不下发该键 ⇒ 逐字回退 running", () => {
     expect(groupStateFromStatus(row()).state).toBe("running");
   });
+
+  // W11（intel-session-binding ★ 评审 P0-5）：**第六条同款守卫**——本函数是逐键手抄的映射，
+  // 漏抄的表现永远是同一个形状：WS 通路是好的，只有刷新页面后重发现才拿不到，且不报错。
+  // 而 `legacy_fallback` 那一行披露恰恰只有「刷新后重发现」这条路径会走到。
+  it("会话级情报采信回执随分组行一起进前端状态", () => {
+    const receipt = { enabled: true, mode: "index", source: "request" } as const;
+    expect(groupStateFromStatus(row({ intel: receipt })).intel).toEqual(receipt);
+  });
+
+  it("老后端不下发 intel ⇒ null（与「本轮没数据」可区分）", () => {
+    expect(groupStateFromStatus(row()).intel).toBeNull();
+  });
 });
 
 // ============ 生命周期真值化（ai-trade-lifecycle-truth §8.2 用例 13 / 15 / 19 / 29）============

@@ -369,6 +369,36 @@ async def list_item_quotes(session: AsyncSession, item_id: int) -> list[dict]:
     return [intel_quote_out(row) for row in rows]
 
 
+async def load_intel_quote_texts(session: AsyncSession,
+                                 item_ids: list[int]) -> dict[int, str]:
+    """一批条目**各取一段**已核实引文（`item_id → 原文`）。
+
+    存在的理由（ai-trade-intel-session-binding 轴 B-4）：复核轮的展开段要给出「标题 + 摘要 +
+    ≤1 条已核实引文」，而引文住在独立的 `ai_intel_quotes` 表里、不在条目行上。
+    **一次 `IN` 查询**而不是逐条 `list_item_quotes`：它跑在 `build_snapshot` 已经开着的那个
+    只读短会话里，N+1 会让一次快照刷新的时长随库存线性增长。
+
+    Args:
+        session: 只读会话。
+        item_ids: 候选条目 id（空列表 ⇒ 不发查询）。
+
+    Returns:
+        每个 `item_id` 至多一条（**按 id 升序取第一条** = 采集轮那一段，核查轮补的排在后面）；
+        没有引文的条目不出现在返回值里。
+    """
+    ids = [int(i) for i in item_ids if int(i or 0) > 0]
+    if not ids:
+        return {}
+    rows = (await session.execute(
+        select(AiIntelQuote.item_id, AiIntelQuote.text)
+        .where(AiIntelQuote.item_id.in_(ids))
+        .order_by(AiIntelQuote.item_id.asc(), AiIntelQuote.id.asc()))).all()
+    out: dict[int, str] = {}
+    for item_id, text in rows:
+        out.setdefault(int(item_id or 0), str(text or ""))
+    return out
+
+
 async def delete_item_quotes(session: AsyncSession, item_id: int, *,
                              commit: bool = True) -> int:
     """删一条情报的全部引文（**只在硬删条目时调**；归档是软删，条目还在，引文照留）。"""

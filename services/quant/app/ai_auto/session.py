@@ -66,9 +66,19 @@ from .experience import ExperienceRuntime
 from . import feed_watchdog
 from .intel import (
     IntelAttribution,
+    alert_pending_ttl_s,
+    attribution_enabled,
+    disclosure_stats,
+    inject_intel_expand,
     intel_digest_for,
+    intel_limits_for,
     intel_summary_for,
+    intel_tier,
+    last_round_wire,
+    new_disclosure_counters,
     note_alert_outcome,
+    note_disclosure,
+    plan_disclosure,
 )
 from .feed_runtime import FeedRuntime
 from .hold_horizon import (
@@ -398,11 +408,33 @@ class AiTradeSession:
         # 情报引用归因（ai-trade-intel-closed-loop 轴 B）：同款「运行时对象 + 薄接线」下沉范式。
         # **判定全在纯核心**（`intel/citation.py` 与 `intel/attribution.py`），本文件只有六处调用点。
         # 两把总闸都开才装配；未装配 ⇒ 全部方法空转、一个字节都不写（G-5）。
+        # ★ 门禁 `G-7`（session-binding §3.3 C-4）：会话侧一个情报设置键都不许直读——取数口径
+        # 逐字节不变，只是读点搬进了情报包（`intel/binding.py`）。见那里的 docstring：本处**刻意**
+        # 读进程级 `Settings` 而不是派生副本，因为此刻情报运行时还没有被 `_wire_intel` 装上。
         self._intel_cite = IntelAttribution(
-            inst_id, run_id,
-            enabled=bool(getattr(executor.settings, "ai_trade_intel_enabled", False)
-                         and getattr(executor.settings,
-                                     "ai_trade_intel_attribution_enabled", False)))
+            inst_id, run_id, enabled=attribution_enabled(executor.settings))
+        # 渐进式披露（session-binding 轴 B）的会话内状态。四者都只被决策轮与暂停/继续读写，
+        # 事件循环单线程 ⇒ 无竞态。
+        #
+        # `_intel_seen_ids`：模型**真的看过**的条目。集合口径 = 本轮 `wire["itemIds"]`（真正被
+        #   收进 `lines` 的那些）——`hidden` 掉的从来没渲染过，把它们记成「见过」会让它们在随后
+        #   每一轮都被当作旧条目折叠，**永远进不了 prompt**，而且不报错（评审 P1-4）。
+        # `_intel_round_ids`：本轮暂存；`commit_round` 返回之后才并进 `_intel_seen_ids`——
+        #   payload 建好之后那一轮仍可能因异常 / 降级而**从未送达模型**，先置位就是把「模型没
+        #   看过」记成「看过」。
+        # `_intel_repeat_streak`：连续 `repeat` 轮计数，撞上界即强制出一次 `full` 并清零。
+        self._intel_seen_ids: frozenset[int] = frozenset()
+        self._intel_round_ids: tuple[int, ...] = ()
+        self._intel_repeat_streak = 0
+        # 一次性旗：四个重置点之后的**下一轮必须重铺全量**。只清空 `_intel_seen_ids` 是不够的
+        # ——清空之后那一轮若仍是 `repeat` 档，会把全部条目当成新条目、再用 `repeat_max_chars`
+        # （默认 240，只有纵向预算的一半）去裁，净效果是「上下文刚被摘要吃掉、情报段却只铺了
+        # 半页」，而那正是重置要解决的问题本身。
+        self._intel_force_full = False
+        self._intel_disclosure = new_disclosure_counters()
+        # 本会话**真正渲染过的那一档**（`index` | `full`）。刻意记下来而不是在终态现算：
+        # `_build_run_metrics` 可能发生在情报运行时已被拆卸之后，现算会把一整份读数悄悄丢掉。
+        self._intel_disclosure_mode = "off"
         # 情报告警（ai-trade-intel-actionability 轴 A）：**至多一条**待处理告警，覆盖式。
         # 它不是共享状态——只被 `note_intel_alert`（情报后台任务里的同步回调，事件循环单线程）
         # 与 `_maybe_intel_wake`（同一循环的盯市 tick）读写，无竞态。
@@ -1136,6 +1168,9 @@ class AiTradeSession:
         # 平仓都不该继承暂停之前那一轮的档位。方向安全——最坏是把一笔本该记 `agentOverride` 的
         # 兑现少记一次（X-9 怕的是系统性**高估**，不是少记）。
         self._pending_exit_priority = None
+        # 轴 B-2 的重置点之一（另外三个：`resume()`、上下文摘要重置、连续 repeat 撞上界）：
+        # 跨越一次暂停，情报段重新铺一遍是对的——续跑之后模型的上下文与暂停之前不可比。
+        self._reset_intel_seen("pause")
         async with self._exec_lock:                              # ②
             pass
         self._cancel_task("_decision_task")                      # ③
@@ -1288,6 +1323,9 @@ class AiTradeSession:
         # 要么带着旧 streak 在第一轮就立刻再停一次，两种都让【继续】这个按钮变成一句空话。
         self._liveness_halt_requested = False
         self._liveness.reset()
+        # 轴 B-2 的重置点之一：跨越一次暂停，情报段重新铺一遍是对的（另外三个点分别是
+        # `pause()`、上下文摘要重置、连续 repeat 撞上界）。
+        self._reset_intel_seen("pause")
         if self._monitor_task is None or self._monitor_task.done():
             self._monitor_task = asyncio.create_task(self._monitor_loop())
         wire = self.lifecycle_wire()
@@ -1969,6 +2007,13 @@ class AiTradeSession:
                 # 层会写回来，其余七道对模型完全静默 ⇒ 模型读到的自己的历史是「上轮我决定观望」）。
                 gate_veto=self._gate_veto_note(stage1_decision, gate_degrade, llm_degrade),
                 defer_summary=True)
+            # ★ 评审 P1-4 / P0-2a：情报「已看过」集合的**唯一**置位点，且必须排在
+            # `commit_round` **之后**——payload 建好之后那一轮仍可能因异常 / 降级而从未送达
+            # 模型，先置位就是把「模型没看过」记成「看过」（用例 `B4c`）。
+            # `summary is not None` = 上下文刚刚被摘要重置：上一轮列出的那几条**已经不在模型的
+            # 上下文里了**，再按编号引用它们就是一句确定错误的话，且会让 `intelRefs` 静默塌成
+            # 空集（用例 `B13`）。
+            self._commit_intel_seen(summary is not None)
             await self._emit_tool_call_trace(round_no, ts, decision, stage1_decision,
                                              gate_degrade=gate_degrade,
                                              llm_degrade=llm_degrade)
@@ -2024,6 +2069,49 @@ class AiTradeSession:
             self._intel_cite.end_round()
             self._maybe_catchup_wake()       # 轴 A：纯同步，check→claim 之间无 await
 
+    def _commit_intel_seen(self, context_reset: bool) -> None:
+        """把本轮真正渲染进 prompt 的条目并进 `_intel_seen_ids`（`commit_round` 之后）。
+
+        Args:
+            context_reset: `commit_round` 返回了一段新摘要 ⇒ `_context` 已被整体换掉。
+        """
+        if context_reset:
+            self._intel_seen_ids = frozenset()
+            self._intel_repeat_streak = 0
+            self._intel_force_full = True        # 下一轮重铺全量（B13 / 人工验收第 6 条）
+            self._intel_disclosure["seenReset"]["summary"] += 1
+            self._intel_round_ids = ()
+            return
+        if self._intel_round_ids:
+            self._intel_seen_ids |= frozenset(self._intel_round_ids)
+        self._intel_round_ids = ()
+
+    def _intel_mode(self) -> str:
+        """本会话的生效档（`off` | `index` | `full`）；未装配 / 回测车道 ⇒ `off`。
+
+        优先取**本会话真正渲染过的那一档**：终态快照可能发生在情报运行时已被拆卸之后
+        （`stop_group` 的顺序今天是「先落 metrics 再 `_unwire_intel`」，但那是一条顺序约束、
+        不是结构保证），现算会把一整份读数悄悄丢掉。
+
+        一轮都没渲染过时才回落 `binding_for`（轴 C 的唯一判定点）——会话侧不许自己再合取一次
+        运维总闸与会话规则，那就是第二个真源。那一格 `disclosure_stats` 本就返回 `None`，
+        回落只是为了不让这个方法在两条路径上说不同的话。
+        """
+        if int(self._intel_disclosure["roundsInjected"]) > 0:
+            return self._intel_disclosure_mode
+        from .intel import binding_for
+
+        return str(binding_for(self.inst_id).mode)
+
+    def _reset_intel_seen(self, cause: str) -> None:
+        """跨越一次暂停 / 继续：重新铺一遍是对的（`seenReset` 按成因分格计数）。"""
+        self._intel_seen_ids = frozenset()
+        self._intel_round_ids = ()
+        self._intel_repeat_streak = 0
+        self._intel_force_full = True            # 跨越一次暂停 ⇒ 下一轮重铺全量
+        if cause in self._intel_disclosure["seenReset"]:
+            self._intel_disclosure["seenReset"][cause] += 1
+
     def _maybe_catchup_wake(self) -> None:
         """上一轮结束即补跑一轮（轴 A）。纯同步：与既有两处槽位认领同范式，无竞态。
 
@@ -2062,6 +2150,11 @@ class AiTradeSession:
         """
         if handoff is None:
             return
+        # 轴 B-3 的观测：这条告警**真的进了情报段**吗（`in_digest` 由 `IntelRuntime._alert` 从
+        # 刚刷新的 digest 反查，置顶成功即为真）。「有编号」不等于「在 prompt 里」，故这个数
+        # 读的是后者。
+        if getattr(handoff, "in_digest", False):
+            self._intel_disclosure["alertPinned"] += 1
         current = self._pending_intel_alert
         if current is not None:
             loser = current if handoff.severity >= current.severity else handoff
@@ -2070,6 +2163,14 @@ class AiTradeSession:
             self._pending_intel_alert = keeper
             return
         self._pending_intel_alert = handoff
+
+    def note_intel_alert_muted(self) -> None:
+        """★ 评审 P0-3：本会话未采信情报，这条告警**不进决策通路**（`manager` 的单点短路）。
+
+        只记一个数：台账与 WS 告警列表在上游已经写完了，用户照常在界面上看得见这条告警——
+        它只是不会唤醒一次决策、更不会把正文内联进 prompt 首行。
+        """
+        self._intel_disclosure["alertMuted"] += 1
 
     def _drop_intel_alert(self, outcome: str) -> None:
         """丢弃待处理告警并回写台账（五条抑制路径共用；**每一条抑制都要留痕**）。"""
@@ -2087,11 +2188,11 @@ class AiTradeSession:
         共识门禁、铁律层、edge 门禁、仓位层、反思层、离场优先级**全部照跑，一道不绕**。告警的
         全部权力就是「让 AI 提前被问一次」，它既不下单、也不改仓位、也不绕过任何门禁。
 
-        **会话侧永不复读 `ai_trade_intel_alert_enabled`**（§3.4.3 的第三道防线）。理由是成文的：
+        **会话侧永不复读告警总闸**（§3.4.3 的第三道防线）。理由是成文的：
         会话持的是 `executor.settings`（分组启动时定稿的那一份），而情报设置住在 `app_settings`
         里、经 `model_copy` 派生——两份在用户改设置之后**必然不同步**，会话侧那一判会变成
         「面板上关了但还在唤醒」或「面板上开了却永不唤醒」。总闸只在服务端读一次
-        （`taxonomy.limits_from_settings`），关掉时 `plan_alert` 返回 `disabled` 且**不发
+        （`taxonomy` 里那个唯一的设置映射点），关掉时 `plan_alert` 返回 `disabled` 且**不发
         handoff**，会话因此根本收不到东西。
 
         **不依赖墙钟唤醒是否启用**：本方法**没有** `wake_interval_s <= 0` 这道判据。把墙钟唤醒
@@ -2120,8 +2221,7 @@ class AiTradeSession:
             self._drop_intel_alert("dropped_no_board")
             return
         now = time.time()
-        ttl = float(getattr(self.executor.settings,
-                            "ai_trade_intel_alert_pending_ttl_s", 180.0))
+        ttl = alert_pending_ttl_s(self.executor.settings)   # 门禁 G-7：读点住在情报包里
         if now - float(handoff.created_wall) > ttl:
             self._drop_intel_alert("dropped_expired")
             return
@@ -2240,6 +2340,16 @@ class AiTradeSession:
         # 逐字回退。影响方向**单侧**（I-1）：反思官只能 confirm / abort / 缩仓，最坏后果恒为
         # 「少做一笔」，永远不会是「多做、做反、做大」。
         self._experience.inject_reflection(payload, decision)
+        # 轴 B-4：只给下单前复核官看的情报展开。展开总闸关 / `intel_limits_for` 回 None /
+        # 两个来源都为空（既没引用、本轮也没折叠掉任何一条）⇒ **整键缺席** ⇒ 反思 prompt
+        # 逐字节回退。
+        # ★ 评审 P0-1：`limits` 只能来自 `intel_limits_for(self.inst_id)`（运行时的派生副本），
+        # 绝不是会话手上那份 `executor.settings` —— 后者读不到情报库内行，`expandEnabled`
+        # 会变成半个假开关。
+        # ★ 评审 P0-2b：**不以 `mode == "index"` 为前提**。`mode="full"` 的 repeat 轮上，
+        # 复核官的情报段同样只剩一行页脚，被折叠掉的那些必须在这里补给它。
+        inject_intel_expand(payload, decision, limits=intel_limits_for(self.inst_id))
+        self._note_intel_expand(payload)
         verdict = await self.decider.reflect(
             payload, decision, emit=self._make_trace_emit(round_no, ts))
         final, new_degrade, fail_open = apply_reflection(
@@ -2252,6 +2362,17 @@ class AiTradeSession:
         await self._emit_reflection_verdict_trace(round_no, ts, verdict, decision, final)
         return final, new_degrade, build_reflection_note(
             decision, verdict, final, pending_exit=self._pending_exit_note(pending))
+
+    def _note_intel_expand(self, payload: dict) -> None:
+        """L2 的观测（展开了几轮 / 几条 / 其中几条是被横向折叠而补上的）。"""
+        wire = payload.get("intelExpand")
+        if not wire:
+            return
+        items = wire.get("items") or []
+        self._intel_disclosure["expandRounds"] += 1
+        self._intel_disclosure["expandItems"] += len(items)
+        self._intel_disclosure["expandFolded"] += sum(
+            1 for item in items if item.get("origin") == "folded")
 
     def _pending_exit_note(self, pending: bool) -> dict | None:
         """挂起轮的记忆注记断面（§4.4.2）；非挂起轮 ⇒ `None` ⇒ journal 形状与今天逐字相同。
@@ -3381,8 +3502,83 @@ class AiTradeSession:
         # None）⇒ `build_decision_prompt` 输出与本特性合入前**逐字节相同**（G-6）。
         intel = intel_digest_for(self.inst_id)
         if intel:
-            payload["intel"] = intel
+            payload["intel"] = self._intel_payload(intel, round_no, ts, payload)
         return payload
+
+    def _intel_payload(self, intel: dict, round_no: int, ts: int, payload: dict) -> dict:
+        """给本轮的情报 wire 定稿一份披露计划（session-binding 轴 B-2）。
+
+        **三条纪律都落在这一个方法里**：
+
+        1. `plan` 写在 `payload["intel"]` 这份**浅拷贝**上，绝不就地改运行时缓存里的那一份——
+           多标的分组共享读同一个运行时，就地改会造成串扰（R-6 / 用例 `B6`）。
+        2. 判定在**装配那一刻**做完，`format_intel` 只按下标挑行（原则 3）：`commit_round` 会把
+           `build_decision_prompt(payload)` 再渲染一次塞进 `_context`，两次渲染之间任何状态漂移
+           都会让上下文里那一份与模型真正看到的那一份不一致，而这不报错。
+        3. 一切情报设置项的生效值**只经 `intel_limits_for`**（原则 6 / 门禁 `G-7`：本文件全文
+           不许出现情报设置键名，连注释里也不行——门禁扫的是源码文本，不区分动机）。
+           它回 ``None``（未装配 / 回测车道）⇒ 横向压缩整段不执行、`plan` 键缺席 ⇒ 逐字节回退。
+
+        Args:
+            intel: `intel_digest_for` 交回来的运行时缓存（**只读**）。
+            round_no / ts: 本轮序号与决策瞬刻（回填观测用）。
+            payload: 已经装好 `contextDisclosure` 的本轮 payload（横向档读它）。
+
+        Returns:
+            要写进 `payload["intel"]` 的那份新字典。
+        """
+        limits = intel_limits_for(self.inst_id)
+        if limits is None:
+            self._intel_round_ids = tuple(int(i) for i in (intel.get("itemIds") or ()))
+            return intel
+        tier = intel_tier(wake_kind=self._wake.last_round_kind,
+                          context_disclosure=payload.get("contextDisclosure"),
+                          enabled=bool(limits.repeat_compress_enabled))
+        # ★ 评审 P0-2a：连续 `repeat` 的**硬上界**。`decider._trim_context` 的左裁是**静默**的、
+        # 会话拿不到任何回执，而「上一轮列出的 N 条仍然有效」这句话的前提正是那些行还在上下文
+        # 里。撞到上界即本轮强制出 `full`（streak 归零在 `_note_intel_round` 里与它一起做）。
+        if tier == "repeat" and self._intel_repeat_streak >= int(limits.repeat_max_rounds):
+            tier = "full"
+            self._intel_seen_ids = frozenset()
+            self._intel_disclosure["seenReset"]["streak"] += 1
+        # 四个重置点之后的第一轮同样强制全量（一次性旗，消费即清）：只清空集合而让本轮仍走
+        # `repeat`，会用横向那半页预算去铺一份本该全量的情报段。
+        if self._intel_force_full:
+            tier = "full"
+            self._intel_force_full = False
+        plan = plan_disclosure(intel, tier=tier, seen_ids=self._intel_seen_ids, limits=limits)
+        wire = {**intel, "plan": plan.wire()}          # ★ 浅拷贝，绝不就地改运行时缓存
+        # ★ 评审 P1-4 的**第二层**：`itemIds` 是「digest 预算收进来的那些」，而 `plan.show`
+        # 才是「本轮真的渲染进 prompt 的那些」。`repeat` 轮的横向预算（`repeat_max_chars`）同样
+        # 会挤掉一部分**没见过**的条目（实施发现 I-4 新增的那一层 `hidden`），照 `itemIds` 记就
+        # 等于把它们记成「模型看过了」——此后每一轮都被当作旧条目折叠，**永远进不了 prompt**，
+        # 而且不报错。`tier == "full"` 时 `show` 恒为全体下标 ⇒ 与按 `itemIds` 记逐字节等价。
+        item_ids = tuple(int(i) for i in (intel.get("itemIds") or ()))
+        self._intel_round_ids = tuple(item_ids[i] for i in plan.show
+                                      if 0 <= i < len(item_ids))
+        self._note_intel_round(wire, plan, round_no=round_no, ts=ts)
+        return wire
+
+    def _note_intel_round(self, wire: dict, plan, *, round_no: int, ts: int) -> None:
+        """本轮情报段的观测与回填（**同步、不查库、不排任务**）。
+
+        `chars` 取 `format_intel(wire)` 的真实长度——「预算是多少」与「真的渲染出多少字」是两个
+        数，观测这条链要的是后者。
+        """
+        from .intel.disclosure import format_intel
+
+        chars = len(format_intel(wire))
+        counters = self._intel_disclosure
+        counters["roundsInjected"] += 1
+        self._intel_disclosure_mode = "index" if wire.get("mode") == "index" else "full"
+        counters["roundsRepeat" if plan.tier == "repeat" else "roundsFull"] += 1
+        counters["charsTotal"] += chars
+        counters["charsMax"] = max(int(counters["charsMax"]), chars)
+        self._intel_repeat_streak = (self._intel_repeat_streak + 1
+                                     if plan.tier == "repeat" else 0)
+        # 轴 C：把「上一轮情报段真正渲染成什么样」回填给运行时，供 `binding.lastRound` 下发。
+        note_disclosure(self.inst_id, last_round_wire(round_no=round_no, ts=ts,
+                                                      plan=plan.wire(), chars=chars))
 
     def _build_multi_timeframe_context(self, ts: int, ref_px: float) -> dict | None:
         try:
@@ -3834,6 +4030,13 @@ class AiTradeSession:
             # 情报引用归因观测（closed-loop §3.6）：合并落在**调用点**（评审 P2-9），
             # `_compute_ai_stats` 是模块级函数、一字不动。未装配 ⇒ None ⇒ 该键为 None。
             metrics["aiStats"]["intel"] = self._intel_cite.stats()
+            # 渐进式披露观测（session-binding 轴 D）：`_intel_cite.stats()` 的**兄弟键**，
+            # 绝不改那一份的形状。未装配 / `mode == "off"` / 一轮都没注入过 ⇒ **整键缺席**
+            # ⇒ 前端那一行不渲染（绝不先显示一个会被当真的 0）。
+            disclosure = disclosure_stats(self._intel_disclosure,
+                                          mode=self._intel_mode())
+            if disclosure is not None:
+                metrics["aiStats"]["intelDisclosure"] = disclosure
             # 趋势基调观测（execution-trend-verdict §3.7.5）：同款**调用点合并**（`_compute_ai_stats`
             # 是模块级纯函数、拿不到 `self`）。未装配 / 零样本 ⇒ 整键缺席，供事后按「有没有开
             # 基调层」分臂对账顺势 / 逆势各自的成交与净额。

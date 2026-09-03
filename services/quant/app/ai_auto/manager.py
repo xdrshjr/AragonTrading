@@ -60,6 +60,7 @@ from .decider import AiTradeDecider
 from .experience import ExperienceRule, ExperienceRuntime, SessionGraph
 from .experience import scheduler
 from .experience.events import EventIdentity
+from .intel import IntelSessionRule
 from .intel import runtime as intel_runtime
 from .intel import scheduler as intel_scheduler
 from .llm_budget import build_ai_trade_llm_clients
@@ -242,6 +243,13 @@ class AiTradeGroupStartRequest:
     # 零回归；未装配 ⇒ 会话侧空对象 ⇒ payload 无 `experience` 键（不变式 I-2）。
     experience_rule: ExperienceRule | None = None
     experience_snapshot: SessionGraph | None = None
+    # 会话级情报采信（intel-session-binding 轴 A）。**带默认值 ⇒ 直接构造该 dataclass 的既有
+    # 测试逐字节零回归**，而那个默认值（enabled=True, mode="full"）恰好就是本特性合入前的行为。
+    # 「缺省即关闭」的语义**只在 API 层 `_resolve_intel` 解析**，绝不在此给关闭默认值——那会
+    # 让 30+ 个直接构造请求对象的用例一起改变行为。
+    intel_rule: IntelSessionRule = field(default_factory=IntelSessionRule)
+    # 「服务端替我决定了什么」的显式回执码，见 `_resolve_intel` 的 Returns。
+    intel_source: str = "request"
 
 
 @dataclass
@@ -320,6 +328,10 @@ class AiTradeGroup:
     # 它是分组共享的（同一账户、同一档位家族），故只存一份而不是逐成员各存一份。
     # `None` = 未装配（总闸关 / 无凭证），前端整段不渲染。
     fee_rates: dict | None = None
+    # 会话级情报采信（intel-session-binding 轴 A）：**分组共享同一份约定**——它是会话级契约
+    # 而非标的属性（与 base_rule / horizon_rule 的分组共享姿态一致）。默认值 = 逐字节回退。
+    intel_rule: IntelSessionRule = field(default_factory=IntelSessionRule)
+    intel_source: str = "request"
 
 
 @dataclass
@@ -737,6 +749,11 @@ class AiTradeManager:
             discipline_inert=list(req.discipline_inert),
             account_id=req.account_row.id, start_wire=dict(req.start_wire or {}),
             resumed_count=int(resume_of.get("resumedCount") or 0),
+            # ★ P1-12：本方法是 `AiTradeGroup` 的**唯一**构造点——`start_group` 与冷续跑
+            # （`resume.resume_cold_group` → `manager._build_group`）都走它，热续跑复用内存里
+            # 那个已经带着规则的分组。故这一行同时覆盖三条路径；在 `resume_group` 里再赋一次
+            # 会是死代码（实施发现 I-2）。
+            intel_rule=req.intel_rule, intel_source=req.intel_source,
             # 轴 A-4：费率来源取**任一成员**那一份——它是分组共享的（同一账户、同一档位家族），
             # 逐成员各发一份只是噪音（与 `_discipline_wire` / `_direction_wire` 同一条理由）。
             fee_rates=_fee_rates_receipt(plans, req.settings))
@@ -1674,7 +1691,13 @@ class AiTradeManager:
                 make_client=make_llm_client_from_config, bar=group.bar,
                 change_24h_pct=partial(self._intel_change_pct, group.group_id),
                 notify=partial(self._on_intel_summary, group.group_id),
-                notify_alert=partial(self._on_intel_alert, group.group_id))
+                notify_alert=partial(self._on_intel_alert, group.group_id),
+                # ★ 轴 A：会话选择作为**独立显式形参**一路传到 `_build_deps`，在
+                # `resolve_intel_settings` **之后**才与运维总闸合取。把它编码成
+                # `Settings.ai_trade_intel_inject` 会被库内行静默覆盖（spec §3.1 A-2 的陷阱）。
+                # `getattr` 兜底与本文件 `tradability` / 生命周期三键同款：既有测试替身用
+                # `SimpleNamespace` 直接构造分组，新增字段对它们必须是**加法**。
+                session_rule=getattr(group, "intel_rule", None) or IntelSessionRule())
             intel_runtime.register(runtime)
             intel_scheduler.start(runtime)
             intel_runtime.clear_arm_error(group.group_id)
@@ -1760,12 +1783,31 @@ class AiTradeManager:
 
         `note_intel_alert` 是一个同步 setter，故这里连 `intel_scheduler.schedule` 都不需要——
         `_on_intel_summary` 之所以要排一个任务，是因为 `push_intel` 是协程（要走 WS 出口）。
+
+        ★ 评审 P0-3：**本会话不采信情报 ⇒ 告警不进决策通路。** 注入与告警在本仓库里是两条
+        独立通路：`wake_text._wake_intel_alert` 在 `inDigest=False` 时会把标题与摘要**就地
+        内联**进唤醒句，而会话选择 `off` 恰恰使 `digest_ids` 恒空 ⇒ `inDigest` 恒 False ⇒
+        每一条高危情报的正文都会写进决策 prompt 的首行。用户勾的是「不让 Agent 参考市场
+        情报」，得到的会是「情报只从另一个门进来，而且专挑最高危的那几条」。
+
+        闸放在这里是**唯一**落点：本跳是这条链上唯一同时看得见 `group`（因而看得见
+        `group.intel_rule`）与 `session` 的那一处。放进 `session` 要给会话再塞一份规则副本
+        （第二个真源）；放进 `IntelRuntime._alert` 则会连带砍掉台账落库与 WS 告警列表——
+        那两样与「要不要喂给模型」无关，用户仍然应该在界面上看得见这条告警。
+
+        总闸 `ai_trade_intel_session_opt_in_enabled=False` ⇒ `intel_rule` 恒为默认规则
+        （`enabled=True`）⇒ 本判据恒不成立 ⇒ 逐字节回退。
         """
         group = self._group
         if group is None or group.group_id != group_id:
             return
         member = next((m for m in group.members if m.inst_id == inst_id), None)
         if member is None:
+            return
+        if not (getattr(group, "intel_rule", None) or IntelSessionRule()).enabled:
+            # 观测落在**会话**上而不是进程级计数器：`aiStats.intelDisclosure.alertMuted` 是
+            # 一个会话级读数，一个进程内的全局计数到不了那张卡（实施发现 I-3）。
+            member.session.note_intel_alert_muted()
             return
         member.session.note_intel_alert(handoff)
 
@@ -1883,6 +1925,11 @@ class AiTradeManager:
                 # 详情里的 `ReconcileCard`，而那张卡片在缺键时**整段隐藏**——一个能说真话的组件
                 # 被放在了一间平时不开门的房间里。`None` = 未装配 ⇒ 前端整段不渲染。
                 "feeRates": getattr(group, "fee_rates", None),
+                # 会话级情报采信回执（intel-session-binding 轴 A-4）：`source` 是「服务端替我
+                # 决定了什么」的显式披露——`legacy_fallback` 尤其重要，它对应的是**数十条持仓
+                # 中的暂停会话**在冷续跑时被按运维默认继续采信情报这件事。`getattr` 兜底与
+                # `feeRates` 那一行同款：既有测试替身用 `SimpleNamespace` 直接构造分组。
+                "intel": self._intel_receipt(group),
                 "createdTs": group.created_ts,
                 # 分组生命周期（pause-resume §5.6）：`running` | `paused`。前端 `groupStateFromStatus`
                 # 是**逐键手抄**的映射且此前把 `state` 写死成 "running"，那正是本仓库「静默吞新键」
@@ -1898,6 +1945,18 @@ class AiTradeManager:
                 # 消费，是分组口径唯一的实时来源（成员级实时数据仍走既有成员 WS status）。
                 **self._acceptance_bundle(group),
                 "members": [self._member_row(m) for m in group.members]}
+
+    @staticmethod
+    def _intel_receipt(group: AiTradeGroup) -> dict:
+        """分组级情报采信回执（**形状恒定、永不缺席**）。
+
+        `mode` 回的是**生效档**（`IntelSessionRule.effective_mode`）而不是存储值：
+        `enabled=False` 时它是 `"off"`，前端因此不必自己合取两个字段再判一次——那正是本仓库
+        「同一件事两处各判一次」的成文缺陷形状。
+        """
+        rule = getattr(group, "intel_rule", None) or IntelSessionRule()
+        return {"enabled": bool(rule.enabled), "mode": rule.effective_mode,
+                "source": str(getattr(group, "intel_source", "request") or "request")}
 
     @staticmethod
     def _direction_wire(group: AiTradeGroup) -> dict | None:

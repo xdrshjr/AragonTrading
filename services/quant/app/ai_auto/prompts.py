@@ -921,6 +921,17 @@ def _format_experience_counter(wire: dict | None) -> str:
     return str(wire.get("rendered") or "")
 
 
+def _format_intel_expand(wire: dict | None) -> str:
+    """复核轮的情报展开段（session-binding 轴 B-4）；键缺失 ⇒ 空串 ⇒ 整段省略。
+
+    与 `_format_experience_counter` 逐行同构：**全文在装配那一刻就已经定稿**
+    （`intel/expand.format_expand`），本函数只取那一份成品，不做任何渲染判定。
+    """
+    if not wire:
+        return ""
+    return str(wire.get("rendered") or "")
+
+
 def build_decision_prompt(payload: dict) -> str:
     """把本轮决策输入（体制/共识 + 信号板 + 真实持仓 + 会话盈亏 + 摘要）压成紧凑文本喂决策器。
 
@@ -1146,12 +1157,21 @@ def build_reflection_prompt(payload: dict, decision) -> str:
     # L0 只是一行压缩形态，任何「见上文第 N 条」的引用都会指向已被压缩掉的内容（§4.8）。
     counter = _format_experience_counter(payload.get("experienceCounter"))
     counter_block = f"{counter}\n\n" if counter else ""
+    # 情报展开段（session-binding 轴 B-4）：与 `counter_block` 完全同形，位置在它**之后**、
+    # 提议决策**之前**。两段的立论也同源——复核官的裁决空间只有 confirm / abort / 缩仓，
+    # **方向单侧**，多给它一份完整证据的最坏后果恒为「少做一笔」。
+    #
+    # ⚠️ 它**不进**决策 prompt：上面那行 `evidence = build_decision_prompt(payload)` 用的是
+    # 同一个 payload，而 `build_decision_prompt` 只读 `payload["intel"]`、不读
+    # `payload["intelExpand"]`，故决策段逐字节不受影响（用例 `B9` 的正反两面）。
+    expand = _format_intel_expand(payload.get("intelExpand"))
+    expand_block = f"{expand}\n\n" if expand else ""
     return (
         "【以下是原交易员看到的本轮全部证据（含其收尾调用 submit_trade_decision 的任务指令）——仅供你复核"
         "时参考其判断依据；那条决策指令**是给原交易员的、与你无关**，你**不要**调用 submit_trade_decision】\n"
         f"{evidence}\n\n"
         "————\n"
-        f"{counter_block}{_format_reflection_decision(decision)}\n\n"
+        f"{counter_block}{expand_block}{_format_reflection_decision(decision)}\n\n"
         "请以资深风控/交易员的批判视角复核上述交易决策是否稳健（方向、与高周期背景是否冲突、当前持仓与"
         "会话盈亏下风险敞口是否可接受、仓位是否偏重、有无证据不足强行交易）。提议决策与证据大体一致即 "
         "`confirm`；对仓位偏重有疑虑时**优先**以 `confirm` + `adjustedSizeFraction` 收缩；仅当能指名一条"
