@@ -43,20 +43,22 @@ def _fill(cl_ord_id: str, *, px: float = _PX, sz: float = 1.0, fee: float = -0.1
 
 
 # ---------- 用例 1：maker / taker 归属 ----------
-def test_leg_fee_bps_splits_maker_and_taker():
+def test_ordinary_limit_uses_conservative_taker_fee():
     ledger = _ledger()
     assert ledger.leg_fee_bps("market") == 5.0
-    assert ledger.leg_fee_bps("limit") == 2.0
+    assert ledger.leg_fee_bps("limit") == 5.0
     assert ledger.leg_fee(sz=1.0, px=_PX, ord_type="market") == pytest.approx(300.0 * 5e-4)
-    assert ledger.leg_fee(sz=1.0, px=_PX, ord_type="limit") == pytest.approx(300.0 * 2e-4)
+    assert ledger.leg_fee(sz=1.0, px=_PX, ord_type="limit") == pytest.approx(300.0 * 5e-4)
 
 
-def test_accounting_disabled_yields_zero_fee_and_no_additive_keys():
-    """A0-1 关 ⇒ 费率恒 0 且四个加法键**整键缺席**（不是 None）——Z-5 的单测面。"""
+def test_accounting_disabled_keeps_zero_placeholder_and_unknown_source():
+    """账本关闭的旧数值占位保持0，v2来源必须明确未知。"""
     ledger = _ledger(ai_trade_fee_accounting_enabled=False)
     assert ledger.leg_fee(sz=1.0, px=_PX, ord_type="market") == 0.0
-    assert ledger.on_trade(cl_ord_id="c1", side="long", sz=1.0, px=_PX,
-                           ord_type="market", expected_px=None) == {}
+    trade = ledger.on_trade(cl_ord_id="c1", side="long", sz=1.0, px=_PX,
+                            ord_type="market", expected_px=None)
+    assert trade["feeKnown"] is False and trade["feeBasis"] == "unknown"
+    assert "feeBps" not in trade
 
 
 # ---------- 用例 2（RV-5）：部分成交按增量计费 ----------
@@ -150,11 +152,10 @@ async def test_entry_fee_is_reset_on_all_three_close_paths(path):
     assert close_trade["pnl"] != pytest.approx(-2 * first_entry_fee - exit_fee, abs=1e-9)
 
 
-def test_limit_close_deducts_the_maker_fee_it_actually_recorded():
+def test_limit_close_deducts_the_same_conservative_fee_it_recorded():
     """平仓腿的 `trade["fee"]` 与净额里扣掉的那一笔必须**同口径**（spec §十二 I-7）。
 
-    限价平仓采纳走 maker，若净额仍按 taker 扣，`归因表的 gross = pnl + fee` 会被系统性低估
-    (taker−maker) bps ——一个静默、只在限价成交上出现、随成交笔数累积的偏差。
+    普通限价未取得真实费用时采用 taker，记账金额必须等于净额扣除金额。
     """
     ex, _ = _executor(fee_ledger=_ledger(ai_trade_net_pnl_enabled=True))
     ex.projected, ex.entry_price, ex.entry_qty_sz = "long", _PX, 10.0
@@ -163,8 +164,9 @@ def test_limit_close_deducts_the_maker_fee_it_actually_recorded():
                           sz=10.0, strength=0.0, reason="r", now_ts=0, ttl_s=300.0)
     events = ex._adopt_close_fill(order, _PX, 1)
     trade = events[0]["data"]
-    assert trade["ordType"] == "limit" and trade["feeBps"] == 2.0
-    # 同价开平 ⇒ 毛为 0 ⇒ 净额恰为「taker 开仓腿 + **maker** 平仓腿」。
+    assert trade["ordType"] == "limit" and trade["feeBps"] == 5.0
+    assert trade["feeBasis"] == "estimated"
+    # 同价开平的净额恰为两条腿已记录的费用。
     exit_fee = ex.fee_ledger.leg_fee(sz=10.0, px=_PX, ord_type="limit")
     assert trade["pnl"] == pytest.approx(-ex_entry_fee(ex, trade) - exit_fee, abs=1e-9)
     assert trade["fee"] == pytest.approx(exit_fee)     # 记的与扣的是同一个数

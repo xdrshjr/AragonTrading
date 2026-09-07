@@ -33,7 +33,7 @@ async def _reset() -> int:
 
 
 async def _add_run(session, *, strategy_id: int, group_id: str, inst_id: str = "BTC-USDT-SWAP",
-                   bar: str = "15m", cost_basis: str | None = None,
+                   bar: str = "15m", cost_basis: str | None = "gross",
                    preset: str = "balanced") -> int:
     config = {"budgetUsd": 100.0, "leverage": 3.0, "allocationPct": 100.0,
               "strategyNames": ["动量"], "groupId": group_id, "totalBudgetUsd": 100.0,
@@ -55,22 +55,27 @@ async def _add_run(session, *, strategy_id: int, group_id: str, inst_id: str = "
 async def _add_trip(session, run_id: int, *, entry: float, exit_px: float, pnl: float,
                     fee: float = 0.0, stop: float | None = None, take: float | None = None,
                     meta: dict | None = None, ts: int = 100, exit_ts: int | None = None,
-                    entry_wall_ts: int | None = None, exit_wall_ts: int | None = None) -> None:
+                    entry_wall_ts: int | None = None, exit_wall_ts: int | None = None,
+                    fee_known: bool = True) -> None:
     """造一笔往返。
 
     `entry_wall_ts` / `exit_wall_ts` / `exit_ts` 均为关键字且默认 `None`（既有调用点零改）：
     它们用来复刻 spec D3 的双时钟形状——`ts` 被吸附到 K 线开盘秒，真值另存
-    `explain_json.meta.wallTs`；开仓腿默认**不带** `explain_json`（老数据形状）。
+    `explain_json.meta.wallTs`；默认只带费用来源、不带结算派生键。
     """
-    entry_explain = ({"kind": "atomic", "meta": {"wallTs": entry_wall_ts}}
-                     if entry_wall_ts is not None else None)
+    fee_meta = ({"feeBasis": "measured", "feeKnown": True, "feeCurrency": "USDT"}
+                if fee_known else {})
+    entry_meta = dict(fee_meta)
+    if entry_wall_ts is not None:
+        entry_meta["wallTs"] = entry_wall_ts
+    entry_explain = {"kind": "atomic", "meta": entry_meta}
     session.add(Trade(run_id=run_id, ts=ts, side="long", price=entry, qty=10.0, fee=fee,
-                      pnl=0.0, position_after=1.0, reason="", stop_loss_price=stop,
+                      pnl=0.0, position_after=10.0, reason="", stop_loss_price=stop,
                       take_profit_price=take,
                       explain_json=(json.dumps(entry_explain, ensure_ascii=False)
                                     if entry_explain else None)))
     await session.commit()
-    exit_meta = {"exitSource": "agent", **(meta or {})}
+    exit_meta = {**fee_meta, "exitSource": "agent", **(meta or {})}
     if exit_wall_ts is not None:
         exit_meta["wallTs"] = exit_wall_ts
     explain = {"kind": "atomic", "meta": exit_meta}
@@ -87,7 +92,7 @@ def _load_app():
 
 
 async def test_query_layer_recomputes_the_legacy_readings():
-    """老数据（无 explain 结算键）必须**追溯复算**出净额 / 位移 / R——否则新卡上线当天是一张空表。"""
+    """历史无结算派生键，只要原始口径和费用来源完整，仍复算净额、位移和 R。"""
     sid = await _reset()
     sm = get_sessionmaker()
     async with sm() as s:
@@ -97,7 +102,7 @@ async def test_query_layer_recomputes_the_legacy_readings():
     assert len(trips) == 1
     row = trips[0]
     assert row["moveBps"] == 100.0 and row["plannedRr"] == 2.0
-    assert row["feeKnown"] is False and row["realizedCostBps"] is None
+    assert row["feeKnown"] is True and row["realizedCostBps"] == 0
     assert row["rMultiple"] is not None and row["exitSource"] == "agent"
     assert row["bar"] == "15m" and row["preset"] == "balanced"
 
@@ -162,9 +167,11 @@ async def test_g6_live_settlement_and_retrospective_recompute_agree():
         trips = await repo.load_profitability_trips(s, repo.TripQuery())
     row = trips[0]
     snap = open_snapshot({"price": 100.0, "qty": 10.0, "fee": 0.05, "ts": 100, "side": "long",
+                          "feeKnown": True, "feeBasis": "measured",
                           "stopLossPrice": 95.0, "takeProfitPrice": 110.0},
                          seq=1, now_wall=0.0, atr_px=None, ct_val=0.01, estimate=None)
-    live = settle(snap, {"price": 102.0, "qty": 10.0, "fee": 0.05, "pnl": 0.1, "ts": 200},
+    live = settle(snap, {"price": 102.0, "qty": 10.0, "fee": 0.05, "pnl": 0.1, "ts": 200,
+                        "feeKnown": True, "feeBasis": "measured"},
                   SettleContext(net_mode=True, ct_val=0.01, exit_source="agent"))
     for retro, direct in (("notionalUsd", live.notional_usd),
                           ("roundTripFeeUsd", live.fee_usd),
@@ -174,19 +181,37 @@ async def test_g6_live_settlement_and_retrospective_recompute_agree():
 
 
 async def test_g6c_cost_basis_is_resolved_per_run_and_counted():
-    """G-6c（[P0-5]）：带 `costBasis` 的 run 与不带的 run 各走各的口径，推定笔数如实计数。"""
+    """原 run 净毛口径各自复算；缺失口径的 run 明确标未知，不能进入收益学习样本。"""
     sid = await _reset()
     sm = get_sessionmaker()
     async with sm() as s:
         known = await _add_run(s, strategy_id=sid, group_id="aiprof_known", cost_basis="net")
-        legacy = await _add_run(s, strategy_id=sid, group_id="aiprof_legacy2")
+        gross = await _add_run(s, strategy_id=sid, group_id="aiprof_gross", cost_basis="gross")
+        legacy = await _add_run(s, strategy_id=sid, group_id="aiprof_legacy2", cost_basis=None)
         await _add_trip(s, known, entry=100.0, exit_px=101.0, pnl=0.1, fee=0.05)
+        await _add_trip(s, gross, entry=100.0, exit_px=101.0, pnl=0.1, fee=0.05)
         await _add_trip(s, legacy, entry=100.0, exit_px=101.0, pnl=0.1, fee=0.05)
         trips = await repo.load_profitability_trips(s, repo.TripQuery())
-    by_assumed = {row["costBasisAssumed"]: row for row in trips}
-    assert by_assumed[False]["netPnlUsd"] == 0.1               # 已知 net：不再扣
-    assert round(by_assumed[True]["netPnlUsd"], 6) == round(0.1 - 0.1, 6)   # 推定 gross：扣双腿
-    assert sum(1 for row in trips if row["costBasisAssumed"]) == 1
+        detail = await repo.get_ai_trade_group_detail(s, "aiprof_legacy2")
+    assert len(trips) == 2
+    assert sorted(row["netPnlUsd"] for row in trips) == [0.0, 0.1]
+    assert not any(row["costBasisAssumed"] for row in trips)
+    economics = detail["summary"]["economics"]
+    assert economics["unknownTripCount"] == 1 and economics["coverage"] == "legacy_partial"
+    assert economics["tradingNetUsd"] is None and economics["grossPnlUsd"] is None
+
+
+async def test_legacy_zero_without_fee_source_is_excluded_and_stays_unknown():
+    sid = await _reset()
+    sm = get_sessionmaker()
+    async with sm() as session:
+        run = await _add_run(session, strategy_id=sid, group_id="aiprof_unknown_fee")
+        await _add_trip(session, run, entry=100, exit_px=101, pnl=.1, fee_known=False)
+        assert await repo.load_profitability_trips(session, repo.TripQuery()) == []
+        detail = await repo.get_ai_trade_group_detail(session, "aiprof_unknown_fee")
+    economics = detail["summary"]["economics"]
+    assert economics["feeUsd"] is None and economics["tradingNetUsd"] is None
+    assert economics["grossPnlUsd"] == .1 and economics["unknownTripCount"] == 1
 
 
 async def test_g21_route_order_profitability_is_not_swallowed_by_group_id():
@@ -236,15 +261,27 @@ async def test_endpoint_filters_by_inst_and_bar():
     assert other_bar.json()["pooled"]["roundTrips"] == 0
 
 
-async def test_g23_bracket_survives_the_response_model():
+async def test_g23_bracket_survives_the_response_model(monkeypatch, synthetic_candles):
     """G-23（[P0-6]）：`bracket` 穿透 `response_model`——手造 wire 的纯前端用例守不住这条。"""
     settings = get_settings()
     assert settings.ai_trade_bracket_check_enabled
+    from types import SimpleNamespace
+    from app.ai_auto import tradability_probe
+
+    requested = []
+
+    async def get_candles(inst_id, bar, limit):
+        requested.append((inst_id, bar))
+        return [SimpleNamespace(**row) for row in synthetic_candles[-limit:]]
+
+    monkeypatch.setattr(tradability_probe, "get_rest_client",
+                        lambda: SimpleNamespace(get_candles=get_candles))
     async with AsyncClient(transport=ASGITransport(app=_load_app()),
                            base_url="http://test") as client:
         res = await client.get("/api/ai-trade/tradability",
                                params={"instId": "BTC-USDT-SWAP", "bar": "15m"})
     assert res.status_code == 200
-    # 取数可能不可达（`level:"unknown"` ⇒ bracket 按设计缺席），故断言的是**键被声明了**：
-    # 未声明的 wire 键会被 FastAPI 静默裁掉，那时 `bracket` 连 None 都不会出现在回执里。
+    # 使用脱网行情走真实探针与响应模型，确保真实非空 bracket 没被 FastAPI 裁掉。
     assert "bracket" in res.json()
+    assert res.json()["bracket"] is not None
+    assert ("BTC-USDT-SWAP", "15m") in requested

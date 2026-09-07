@@ -38,9 +38,11 @@ GLOSSARY: tuple[tuple[str, str], ...] = (
     ("仓位与风险层 · 系统强制执行", "position & risk layer - system enforced"),
     ("仓位约束", "position constraint"),
     ("交易成本", "trading cost"),
+    ("交易成本 · 事前估算", "trading cost - pre-trade estimate"),
     ("交易成本 · 系统确定性扣减", "trading cost - deterministic deduction"),
     ("交易周期 · 换手纪律", "holding horizon - turnover discipline"),
     ("此前执行摘要（你的长期记忆）", "prior execution summary (your long-term memory)"),
+    ("本轮程序事实 · 优先于历史叙述", "current program facts - override historical narrative"),
     # —— 持仓 / 盈亏 ——
     ("当前持仓", "current position"),
     ("当前自管持仓", "current self-managed position"),

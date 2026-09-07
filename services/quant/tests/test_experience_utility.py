@@ -233,7 +233,8 @@ async def test_a26_a27_the_ledger_shares_one_commit_with_the_event_row() -> None
                                        entry={"px": 60000.0, "qty": 3.0, "ts": _START},
                                        open_fee_usd=1.8)
         trip = settle(snapshot, {"ts": _START + 600, "price": 61000.0, "qty": 3.0,
-                                 "fee": -1.8, "pnl": 30.0},
+                                 "fee": 1.8, "pnl": 30.0,
+                                 "feeBasis": "measured", "feeKnown": True},
                       SettleContext(net_mode=True, ct_val=0.01, exit_source="agent"))
         runtime.note_close({"side": "close", "ts": _START + 600},
                            {"exitSource": "agent", "wallTs": _START + 600}, trip)

@@ -110,13 +110,8 @@ class FeeLedger:
 
     # ---------- 记账（确定性，绝不依赖任何外部系统的可用性）----------
     def leg_fee_bps(self, ord_type: str) -> float:
-        """该腿适用的费率（bps）：限价挂单成交按 maker，其余一律 taker。
-
-        **限价挂单未必成交在 maker 侧**（越过盘口的限价单会被 taker 撮合）。本轮按 maker 计并把
-        差额交给实测校准发现：若 `feeDeviationBps` 长期为正且约等于 `taker − maker`，即说明挂价
-        过于激进，处置见 spec §8 R-4（把 maker 常数临时上调至 taker 值）。
-        """
-        return self.params.maker_fee_bps if ord_type == "limit" else self.params.taker_fee_bps
+        """普通 AI limit 可以主动吃单，缺实测费用时统一按 taker 估费。"""
+        return self.params.taker_fee_bps
 
     def leg_fee(self, *, sz: float, px: float, ord_type: str) -> float:
         """一条腿的费率（USD，**正数=支出**）；记账关闭 / 入参非法 ⇒ `0.0`。
@@ -154,11 +149,17 @@ class FeeLedger:
         的合成成交不挂账），故真值费率不会污染 fills 审计的校准样本。
         """
         if not self.params.accounting_enabled:
-            return {}
+            return {"feeBasis": "unknown", "feeKnown": False,
+                    "feeCurrency": "USDT", "accountingVersion": 2}
         # RV-10：市价腿的 `expectedPx` 与 `price` 必然是同一个数（本仓库从不回查市价单的真实成交价），
         # 故滑点**只能**由 fills 审计产出，严禁试图从 trade 的 price/expectedPx 之差推导（那恒为 0）。
         expected = float(px if expected_px is None else expected_px)
         model_fee = self.leg_fee(sz=sz, px=px, ord_type=ord_type)
+        valid_override = (override_fee_usd is not None
+                          and _is_finite(override_fee_usd))
+        fee_known = valid_override if override_fee_usd is not None else (
+            _is_finite(sz) and _is_finite(px) and sz > 0 and px > 0
+            and self.ct_val > 0 and _is_finite(model_fee))
         fee = model_fee if override_fee_usd is None else _finite(override_fee_usd)
         self._session_fee_usd += fee
         self.register(cl_ord_id=cl_ord_id or "", direction=self._direction_for(side),
@@ -167,7 +168,10 @@ class FeeLedger:
         fee_bps = (self.leg_fee_bps(ord_type) if override_fee_usd is None
                    else self._bps_for(fee, sz=sz, px=px))
         return {"fee": fee, "feeBps": fee_bps, "ordType": ord_type,
-                "expectedPx": expected}
+                "expectedPx": expected, "feeKnown": fee_known,
+                "feeBasis": ("measured" if valid_override else "estimated")
+                if fee_known else "unknown", "feeCurrency": "USDT",
+                "accountingVersion": 2}
 
     def _bps_for(self, fee_usd: float, *, sz: float, px: float) -> float:
         """真值费率 → 本腿名义值上的 bps；名义值不可算 ⇒ 回落 0.0（绝不用一个常数冒充实测）。"""
@@ -244,6 +248,10 @@ class FeeLedger:
     def session_fee_usd(self) -> float:
         """本会话累计已付手续费（Σ 每腿 `fee`；记账关闭 ⇒ 恒 `0.0`）。"""
         return self._session_fee_usd
+
+    def restore_accounting(self, session_fee_usd: float | None) -> None:
+        """恢复全 run 已知腿费合计；不重放审计或重新采纳成交。"""
+        self._session_fee_usd = _finite(session_fee_usd)
 
     # ---------- 实测审计（旁路，绝不回写盈亏）----------
     def has_pending(self) -> bool:
@@ -361,13 +369,22 @@ def explain_meta_fields(trade: dict) -> dict:
     `feeBps` 是「A0-1 记账确实开启」的标记键——`fee` 本身恒存在（关闭时为 `0.0`），只看它会给
     每条 live 成交的 explain 注入一个恒零的 `feeUsd`，与「缺失即省略键」的既有风格相悖。
     """
+    out = {key: trade[key] for key in ("feeBasis", "feeKnown", "feeCurrency",
+           "accountingVersion", "accountingEventId") if key in trade}
     if "feeBps" not in trade:
-        return {}
-    out = {"feeUsd": trade.get("fee"), "feeBps": trade["feeBps"],
-           "ordType": trade.get("ordType")}
+        return out
+    out.update(feeUsd=trade.get("fee"), feeBps=trade["feeBps"],
+               ordType=trade.get("ordType"))
     if trade.get("expectedPx") is not None:
         out["expectedPx"] = trade["expectedPx"]
     return out
+
+
+def _is_finite(value) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 async def audit_fills(ledger: FeeLedger | None, *, fills_fn, now_wall: float,

@@ -122,6 +122,7 @@ def _make_session(*, action="hold", size=0.5, run_id=1, stop_loss_usd=None,
     # 本文件承诺的是脱网单测，且真实往返会让每个 tick 多花数秒。
     session._cost._fetch_fee_rate = _no_trade_fee
     session._cost._fetch_position_history = _no_position_history
+    session._cost.refresh_funding = _no_funding_refresh
     return session, calls, pos_state
 
 
@@ -455,6 +456,7 @@ def _make_reflect_session(*, action="open_long", size=0.5, verdict="confirm",
     # 本文件承诺的是脱网单测，且真实往返会让每个 tick 多花数秒。
     session._cost._fetch_fee_rate = _no_trade_fee
     session._cost._fetch_position_history = _no_position_history
+    session._cost.refresh_funding = _no_funding_refresh
     return session, calls, llm
 
 
@@ -599,10 +601,24 @@ async def test_journal_preserves_vetoed_intent():
         await dispose_engine()
 
 
-async def test_non_vetoed_round_tool_result_frozen_byte_identical():
-    """R-05 冻结守门：confirm 直通轮与未触发反思轮的 tool_result 文本 ==
-    json.dumps(executed, ensure_ascii=False) 且不含 "reflection"——钉死「非否决轮内容逐字不变」，
-    防「加字段就全轮富化」型复发。"""
+def _assert_v2_round_context(session, entry, text):
+    """程序事实按 v2 合同追加，原执行结果及真实上下文原文完整保留。"""
+    keys = ("schemaVersion", "proposal", "finalDecision", "facts", "factsHash",
+            "executionReceipt", "gateVeto", "sizingVerdict", "closedBarTs",
+            "evidenceFingerprint", "costModelVersion")
+    expected = {**entry["executed"], **{key: entry[key] for key in keys}}
+    assert text == json.dumps(expected, ensure_ascii=False)
+    assert expected["schemaVersion"] == 2
+    assert expected["factsHash"] == expected["facts"]["factsHash"]
+    assert expected["factsHash"] == session._round_facts["factsHash"]
+    latest = session.decider._context[-1]
+    assert latest.role == "tool"
+    assert latest.content[0].content == text
+    assert "reflection" not in json.loads(text)
+
+
+async def test_non_vetoed_round_tool_result_preserves_execution_and_v2_facts():
+    """confirm 及未触发反思轮保留执行原值，并携带同一轮事实而不伪造否决注记。"""
     await init_db()
     # confirm 直通轮（触发了反思但未否决）
     session, _, llm = _make_reflect_session(action="open_long", verdict="confirm")
@@ -613,8 +629,7 @@ async def test_non_vetoed_round_tool_result_frozen_byte_identical():
         entry = session.decider._journal[-1]
         assert entry["reflection"]["vetoed"] is False    # journal 保真注记
         text = _last_tool_result_text(session)
-        assert text == json.dumps(entry["executed"], ensure_ascii=False)
-        assert "reflection" not in text
+        _assert_v2_round_context(session, entry, text)
     finally:
         await dispose_engine()
     await init_db()
@@ -627,8 +642,7 @@ async def test_non_vetoed_round_tool_result_frozen_byte_identical():
         entry = session.decider._journal[-1]
         assert entry["reflection"] is None
         text = _last_tool_result_text(session)
-        assert text == json.dumps(entry["executed"], ensure_ascii=False)
-        assert "reflection" not in text
+        _assert_v2_round_context(session, entry, text)
     finally:
         await dispose_engine()
 
@@ -1386,6 +1400,11 @@ async def test_session_commitment_resets_on_reopen_same_side():
 async def _no_trade_fee(_inst_id):
     """费率取数桩：恒不可用 ⇒ 回落配置常数（与本文件既有断言的费率口径一致）。"""
     return None
+
+
+async def _no_funding_refresh(_now_wall):
+    """公共资金费刷新同样脱网，避免后台请求及跨事件循环连接残留。"""
+    return False
 
 
 async def _no_position_history():

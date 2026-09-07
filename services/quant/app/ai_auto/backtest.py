@@ -17,7 +17,8 @@ import asyncio
 import logging
 import time
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from uuid import uuid4
 
 import pandas as pd
 from fastapi import HTTPException
@@ -33,6 +34,7 @@ from ..engine.metrics import compute_metrics
 from ..engine.metrics_ext import compute_extended_metrics
 from ..engine.mtf import bar_to_seconds
 from ..engine.simulator import RiskParams, SimBroker, TradeRecord
+from ..live_auto.execution_receipt import OpenAttemptReceipt
 from ..okx.types import BAR_SECONDS
 from ..paper.strategy_factory import PaperStrategySpec
 from ..strategies.base import Signal
@@ -40,12 +42,18 @@ from ..agent.services import load_htf_frames, load_range_candles
 from .backtest_frames import build_backtest_frames
 from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, format_charter
 from .cost_model import (
+    RoundCostSnapshot,
     backtest_params,
     estimate_round_trip_cost,
     funding_periods,
     query_for_preview,
 )
+from .cost_view import build_cost_view
 from .decider import AiTradeDecider, TradeDecision
+from .accounting_replay import TradeAccountingAccumulator
+from .decision_memory import build_decision_facts
+from .entry_quota import EntryQuota
+from .integrity_view import build_round_record
 from .edge_gate import evaluate_edge_gate
 from .exit_attribution import (EXIT_SOURCE_AGENT_OVERRIDE, ExitLedger,
                                classify_backtest, exit_counters,
@@ -273,6 +281,14 @@ class AiBacktestRunner:
         self._consensus_rule = replace(consensus_rule_from_settings(self.settings),
                                        min_consensus=self.min_consensus)
         self._contrarian_used = 0
+        self._entry_quota = EntryQuota(
+            run_id=uuid4().hex,
+            max_per_session=self._consensus_rule.contrarian_max_per_session)
+        self._round_contrarian = False
+        self._round_cost: RoundCostSnapshot | None = None
+        self._accounting = TradeAccountingAccumulator({
+            "costBasis": "net", "ctVal": 1.0})
+        self._accounting_leg_no = 0
         # 执行周期趋势基调（execution-trend-verdict 轴 F）：与实盘**同一个纯核心、同一个解析
         # 点**。回测走独立总闸 `ai_trade_trend_verdict_backtest_enabled`（沿用 horizon /
         # profit_guard 的既有先例）：两把闸任一关 ⇒ 规则不装配 ⇒ payload / 两段 prompt / 门禁
@@ -720,6 +736,12 @@ class AiBacktestRunner:
         L1 要做的事，把它们挂在周期模式的开关下就等于把对照臂的数据抹掉。
         """
         for trade in self._drain_new_trades():
+            self._accounting_leg_no += 1
+            self._accounting.record_trade({
+                **_trade_wire(trade), "id": self._accounting_leg_no,
+                "explain": {"meta": {
+                    "feeKnown": True, "feeBasis": "estimated",
+                    "feeCurrency": "USDT", "accountingVersion": 2}}})
             if trade.side in ("long", "short"):
                 self._note_backtest_open(trade)
             elif trade.side == "close":
@@ -800,10 +822,34 @@ class AiBacktestRunner:
         （`cost_model.py` `query_for_preview` 两条分支），那会让「拉不到历史费率」这件观测层的
         小事静默改变回测的门禁判定。回退到 `(None, False)`（有意不建模）才与本轮之前逐字节相同。
         """
+        if self._round_cost is not None and self._round_cost.as_of_ts == ts:
+            return self._round_cost.funding, self._round_cost.funding_enabled
         if not self.settings.ai_trade_funding_cost_backtest_enabled:
             return None, False
         snap = self._curve.snapshot_at(int(ts))
         return (snap, True) if snap is not None else (None, False)
+
+    def _begin_round_cost(self, ts: int) -> None:
+        """在 LLM 调用前冻结模拟费率和因果资金费，供本轮所有成本读点复用。"""
+        funding, enabled = self._cost_funding(ts)
+        params = replace(backtest_params(
+            self.settings, expected_hold_bars=self._horizon_hold_bars),
+            fee_source="simulation")
+        self._round_cost = RoundCostSnapshot(
+            params, ts, "simulation", False,
+            spread_bps=params.half_spread_fallback_bps,
+            impact_bps=params.impact_bps,
+            funding_bps=funding.rate * 1e4 if funding else None,
+            liquidity_assumption="simulation", funding=funding,
+            funding_enabled=enabled)
+
+    def _cost_params(self, ts: int):
+        """同一模拟根复用冻结参数；非决策根的保护评估用 broker 所属费用世界。"""
+        if self._round_cost is not None and self._round_cost.as_of_ts == ts:
+            return self._round_cost.params
+        return replace(backtest_params(
+            self.settings, expected_hold_bars=self._horizon_hold_bars),
+            fee_source="simulation")
 
     def _sizing_cost_bps(self, ts: int, action: str) -> float | None:
         """仓位层 / 止损下界用的往返成本（bps，**回测世界常数**）；非开仓动作 ⇒ `None`。
@@ -820,8 +866,7 @@ class AiBacktestRunner:
                               side="short" if action == "open_short" else "long",
                               bar_seconds=BAR_SECONDS[self.bar], funding=funding,
                               funding_enabled=funding_on),
-            backtest_params(self.settings,
-                            expected_hold_bars=self._horizon_hold_bars)).total_bps
+            self._cost_params(ts)).total_bps
 
     def _horizon_facts(self, i: int, ts: int, ref_px: float) -> HorizonFacts:
         """回测断面（§2.10 对照表）：`now_wall`=当前根 ts、`mark_px`=当根收盘价、`side`=`pos.side`。
@@ -838,8 +883,7 @@ class AiBacktestRunner:
                 query_for_preview(ord_type="market", side=pos.side,
                                   bar_seconds=BAR_SECONDS[self.bar], funding=funding,
                                   funding_enabled=funding_on),
-                backtest_params(self.settings,
-                                expected_hold_bars=self._horizon_hold_bars)).total_bps
+                self._cost_params(ts)).total_bps
         return HorizonFacts(
             seq=int(pos.entry_bar), side=pos.side, entry_px=float(pos.entry_price or 0.0),
             mark_px=float(ref_px), leverage=float(self.leverage), now_wall=float(ts),
@@ -888,6 +932,13 @@ class AiBacktestRunner:
         payload = self._build_payload(
             round_no, ts, ref_px, main_df, context_frames, i, board, consensus)
         decision, decide_degrade = await self.decider.decide(payload)          # 唯一 async（LLM）
+        proposal = replace(decision)
+        facts_reason = None
+        if (payload["decisionFacts"].get("factsUnavailable")
+                and decision.action in ("open_long", "open_short")):
+            facts_reason = "facts_unavailable"
+            decision = replace(decision, action="hold", size_fraction=None,
+                               reason="本轮程序事实不可用，暂停新增开仓")
         # C5 §2.5：把回测 LLM 本轮承诺的退出线记进 runner 棘轮——第一阶段决策为准（门禁前，同实盘落点）；
         # 快照取自 payload（模型据以决策的那一份），下一根 `_apply_profit_guard_bar` 即据它保守成交序判定。
         self._record_commitment(decision, payload.get("profitGuard"))
@@ -931,8 +982,7 @@ class AiBacktestRunner:
             opposing_allowance=trend_contrarian_allowance(decision.action, self._trend_verdict,
                                                           self._trend_rule),
             bonus_lane=trend_lane)
-        if consensus_out.contrarian_used:
-            self._contrarian_used += 1
+        self._round_contrarian = bool(consensus_out.contrarian_used)
         decision, consensus_reason = consensus_out.decision, consensus_out.reason
         # ★ 最小 edge 门禁（§3.7）：与实盘**同一纯核心、同位插入**（共识后、反思前）；k_min=0（默认）
         # ⇒ 恒返回 None ⇒ 既有回测结果逐字节相同。成本用 SimBroker 实收常数（两侧各自对自己的世界说真话）。
@@ -944,8 +994,7 @@ class AiBacktestRunner:
         edge_out = evaluate_edge_gate(
             decision, settings=self.settings, last_px=ref_px, atr_px=self._atr_at(i),
             take_profit_pct=self._oco_risk.take_profit_pct, bar_seconds=BAR_SECONDS[self.bar],
-            params=backtest_params(self.settings,
-                                   expected_hold_bars=self._horizon_hold_bars),
+            params=self._cost_params(ts),
             funding=edge_funding, funding_enabled=edge_funding_on)
         edge_reason = edge_out.reason if edge_out is not None else None
         decision = edge_out.decision if edge_out is not None else decision
@@ -957,7 +1006,7 @@ class AiBacktestRunner:
         # 这条链，被基调闸拦下的轮会变成「决策是 hold、没有任何降级码」——回测的漏斗与统计当场
         # 对不上，**且不报任何错**。位置与实盘 `degrade or reason` 的链序逐字同构：刹车之后、
         # 共识之前，与 `open_funnel.LAYERS` 的层序同构。
-        gate_reason = (base_reason or horizon_reason or cooldown_reason
+        gate_reason = (facts_reason or base_reason or horizon_reason or cooldown_reason
                        or turnover_reason or backstop_reason
                        or brake_reason or trend_reason or consensus_reason or edge_reason)
         # 二次反思（决策脑不变式：回测复用同一 decider.reflect，emit=None 轨迹全程空转）。verdict 须在分支外
@@ -996,7 +1045,7 @@ class AiBacktestRunner:
         # ② 但它是轴 B 在回测侧生效的**必要条件**：不补，`ctx.cost_bps` 恒 `None` ⇒ 止损下界分支
         #    恒不进 ⇒ 回测与实盘的止损位系统性分叉。本仓库有过「双通道共用纯核心时只有一侧被实现」
         #    的阻断级事故，故这一条**不是可选项**。
-        decision, plan, _ = self._sizing.resolve(decision, SizingContext(
+        decision, plan, sizing_verdict = self._sizing.resolve(decision, SizingContext(
             ref_px=ref_px, atr_px=self._atr_at(i), step=self.position_step_pct, now_wall=float(ts),
             closes=list(main_df["c"].iloc[:i + 1]), fallback_stop_pct=self._oco_risk.stop_loss_pct,
             notional_full=self.main.equity_at(ref_px) * self.leverage,
@@ -1006,7 +1055,7 @@ class AiBacktestRunner:
             self._oco_risk = replace(self._oco_risk, stop_loss_pct=plan.stop_pct,
                                      take_profit_pct=plan.take_pct)
             self.main.set_risk(self._oco_risk)       # ← 缺这一行 = 彻底空转（simulator.py:123 已存在）
-        executed = self._execute(decision)
+        executed = self._execute(decision, ts=ts)
         self.rounds_done = round_no
         self._tally(decision, decide_degrade, gate_reason)
         self._tally_reflection(verdict, size_before, decision)   # verdict is None → 空转（不递增计数）
@@ -1014,7 +1063,12 @@ class AiBacktestRunner:
         # F2：反思注记随 journal 保真被否决意图（verdict None/未跑 → note=None，零回归）。
         summary = await self.decider.commit_round(
             payload, decision, executed,
-            reflection=build_reflection_note(original, verdict, decision))
+            reflection=build_reflection_note(original, verdict, decision),
+            record=build_round_record(payload,
+                proposal if decide_degrade is None else None, decision, {
+                **executed, "sizingVerdict": sizing_verdict or None,
+                "gateVeto": {"reason": gate_reason}
+                if gate_reason else None}))
         self._emit_decision(job, round_no, ts, decision, board, executed, payload,
                             decide_degrade or reflect_reason, verdict)
         if summary is not None:
@@ -1059,10 +1113,24 @@ class AiBacktestRunner:
             return decision, degrade
         return decision, (self._horizon.last_pending_reason or degrade)
 
-    def _execute(self, decision: TradeDecision) -> dict:
+    def _execute(self, decision: TradeDecision, *, ts: int | None = None) -> dict:
         """决策 → Signal（纯核心）→ main.submit（次根开盘成交）；返回本轮执行意图快照。"""
         side_before = self.main.pos.side
         signals = decision_to_signals(decision)
+        opening = decision.action in ("open_long", "open_short")
+        attempt_id = f"{self._entry_quota.run_id}:{uuid4().hex}"
+        cl_ord_id = uuid4().hex
+        observed_ts = ts if ts is not None else self._last_ts or self.start_ts
+        reserved = opening and self._round_contrarian
+        if reserved and not self._entry_quota.reserve(attempt_id, cl_ord_id):
+            return {"ok": False, "action": decision.action, "submitted": False,
+                    "reason": "quota_exhausted",
+                    "executionReceipt": OpenAttemptReceipt(
+                        attempt_id, "not_submitted", "quota_exhausted",
+                        cl_ord_id, None, self.inst_id, False, "not_sent",
+                        observed_ts).to_dict()}
+        pending_before = len(self.main._pending)
+        exit_source_before = self._pending_exit_source
         if signals:
             # 打标槽（轴 B）：运行时**自己**提交的平仓在 submit 之前写槽。反手的平仓腿与主动平仓
             # 是两类退出（前者是换方向、后者是离场），归成一类会让偏置矫正的效果读不出来。
@@ -1076,10 +1144,35 @@ class AiBacktestRunner:
                     else "agent")
             elif side_before in ("long", "short") and decision.action.startswith("open_"):
                 self._pending_exit_source = "agentReverse"
-            self.main.submit(signals)
-        return {"ok": True, "action": decision.action, "submitted": bool(signals),
+        try:
+            if signals:
+                self.main.submit(signals)
+        finally:
+            added = self.main._pending[pending_before:]
+            accepted_open = any(order.action == "open" for order in added)
+            if reserved:
+                if accepted_open:
+                    self._entry_quota.consume(attempt_id)
+                else:
+                    self._entry_quota.release(attempt_id)
+            self._contrarian_used = self._entry_quota.used
+            if not any(order.action == "close" for order in added):
+                self._pending_exit_source = exit_source_before
+        accepted = accepted_open if opening else bool(added)
+        reason = ("accepted" if accepted else "same_side_position"
+                  if side_before == decision.action.removeprefix("open_")
+                  else "pre_submit_error")
+        receipt = (OpenAttemptReceipt(
+            attempt_id, "accepted" if accepted else "not_submitted", reason,
+            cl_ord_id, None, self.inst_id, accepted,
+            "sent" if accepted else "not_sent", observed_ts).to_dict()
+            if opening else None)
+        return {"ok": accepted if opening else True,
+                "action": decision.action, "submitted": accepted,
+                "executionReceipt": receipt,
                 "positionBefore": side_before,
-                "positionAfter": _project_side(side_before, decision.action)}
+                "positionAfter": (_project_side(side_before, decision.action)
+                                  if accepted else side_before)}
 
     def _maybe_session_exit(self, row: pd.Series, i: int, n: int) -> None:
         """会话级 USD 止盈止损：盯市盈亏越阈 → 次根开盘平仓 + 停决策（续盯市至区间末，R11）。"""
@@ -1113,6 +1206,7 @@ class AiBacktestRunner:
     def _build_payload(self, round_no: int, ts: int, ref_px: float, main_df: pd.DataFrame,
                        context_frames: dict[str, pd.DataFrame], i: int,
                        board: list[StrategySignalView], consensus: Consensus) -> dict:
+        self._begin_round_cost(ts)
         session_pnl = self.main.equity_at(ref_px) - self.initial_capital
         payload = {
             "round": round_no, "barTs": ts, "lastPx": ref_px,
@@ -1172,7 +1266,42 @@ class AiBacktestRunner:
             as_of_ts=int(ts)), self._trend_rule)
         if self._trend_verdict is not None:
             payload["trendVerdict"] = self._trend_verdict
+        snap = self._round_cost
+        payload["costAwareness"] = self._build_cost_view(payload, ts, i)
+        payload["decisionFacts"] = build_decision_facts({
+            **payload, "instId": self.inst_id, "bar": self.bar,
+            "runId": self._entry_quota.run_id, "asOfTs": ts,
+            "entryQuota": self._entry_quota.summary(),
+            "rules": {"schemaVersion": 2,
+                      "consensus": asdict(self._consensus_rule),
+                      "baseRules": payload.get("baseRules"),
+                      "risk": asdict(self._oco_risk)},
+            "economics": self._accounting.snapshot({"asOfTs": ts}),
+            "costSnapshot": {"modelVersion": 2, "params": asdict(snap.params),
+                             "liquidityAssumption": "simulation",
+                             "feeSource": "simulation", "asOfTs": ts,
+                             "stale": snap.stale, "spreadBps": snap.spread_bps,
+                             "impactBps": snap.impact_bps,
+                             "fundingBps": snap.funding_bps,
+                             "fundingEnabled": snap.funding_enabled}})
         return payload
+
+    def _build_cost_view(self, payload: dict, ts: int, i: int) -> dict:
+        """空仓预览采用资金费不利侧，持仓回本使用已付费用。"""
+        funding, funding_on = self._cost_funding(ts)
+        position = payload.get("position")
+        sides = [position["side"]] if position else ["long", "short"]
+        previews = [(side, estimate_round_trip_cost(query_for_preview(
+            ord_type="market", side=side, bar_seconds=BAR_SECONDS[self.bar],
+            funding=funding, funding_enabled=funding_on),
+            self._cost_params(ts))) for side in sides]
+        side, cost = max(previews, key=lambda item: item[1].total_bps)
+        view = build_cost_view(
+            cost, fee_snapshot=None, ord_type="market", side=side,
+            position=position, last_px=payload.get("lastPx"),
+            atr_px=self._atr_at(i),
+            session_fee_usd=self._accounting.session_fee_usd, net_basis=True)
+        return {**view, "source": "simulation"}
 
     def _build_multi_timeframe_context(
         self,
@@ -1201,9 +1330,16 @@ class AiBacktestRunner:
         if ctx.position_side == "flat":
             return None
         unrealized = self.main.equity_at(ref_px) - self.main.cash
-        return {"side": ctx.position_side, "avgEntry": round(ctx.entry_price, 6),
-                "size": round(self.main.pos.qty, 8), "unrealizedPnl": round(unrealized, 4),
-                "barsInPosition": ctx.bars_in_position}
+        funding = (self._funding.epoch.accrued_usd
+                   if self._funding.epoch and self._curve.available else None)
+        return {"side": ctx.position_side, "avgEntry": ctx.entry_price,
+                "size": self.main.pos.qty, "unrealizedPnl": round(unrealized, 4),
+                "barsInPosition": ctx.bars_in_position,
+                "positionEpoch": self.main.pos.entry_bar,
+                "qtyCoin": self.main.pos.qty,
+                "openFeeUsd": self.main.pos.entry_fee,
+                "fundingAccruedUsd": funding,
+                "closeFeeRate": self.main.fee_rate}
 
     def _tally(self, decision: TradeDecision, decide_degrade: str | None,
                gate_reason: str | None) -> None:
@@ -1467,6 +1603,7 @@ class AiBacktestRunner:
 
     def _run_config(self) -> dict:
         return {"strategyIds": self.strategy_ids, "strategyNames": self.strategy_names,
+                "costBasis": "net", "accountingVersion": 2, "costModelVersion": 2,
                 "startTs": self.start_ts, "endTs": self.end_ts,
                 "decisionEveryBars": self.decision_every_bars,
                 "contextRefreshRounds": self.context_refresh_rounds,

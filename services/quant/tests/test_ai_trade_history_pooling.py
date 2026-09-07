@@ -23,10 +23,13 @@ class _T:
                  price: float = 100.0) -> None:
         self.id, self.side, self.fee, self.pnl, self.price = tid, side, fee, pnl, price
         self.ts = tid
+        self.qty = 1.0
+        self.position_after = 0.0 if side == "close" else -1.0 if side == "short" else 1.0
         self.peak_pnl = None
         self.stop_loss_price = None
         self.take_profit_price = None
-        self.explain_json = None
+        self.explain_json = json.dumps({"meta": {"feeKnown": True,
+            "feeBasis": "measured", "feeCurrency": "USDT"}})
 
 
 def test_g18_orphan_close_leg_fee_does_not_carry_into_the_next_trip():
@@ -80,7 +83,7 @@ def test_pooled_rate_returns_none_on_a_zero_denominator():
 
 
 async def test_aggregate_group_output_is_untouched():
-    """G-19 的另一半：历史列表卡片的数字不得被本轮追溯改写（`_aggregate_group` 一个字不动）。"""
+    """旧历史数值键保持兼容，v2 明确披露缺少口径与费用来源。"""
     await init_db()
     sm = get_sessionmaker()
     async with sm() as s:
@@ -111,3 +114,5 @@ async def test_aggregate_group_output_is_untouched():
         agg = _aggregate_group([run], trades)
     assert agg["summary"]["realizedPnlUsd"] == 10.0
     assert agg["summary"]["tradeCount"] == 1 and agg["summary"]["winRate"] == 1.0
+    assert agg["summary"]["economics"]["coverage"] == "legacy_partial"
+    assert agg["summary"]["economics"]["tradingNetUsd"] is None

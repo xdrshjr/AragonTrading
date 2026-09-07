@@ -61,6 +61,44 @@ def test_realized_pnl_falls_back_to_gross_when_the_switch_is_off():
     assert ex._close_pnl(60_600.0) == pytest.approx(60.0)
 
 
+@pytest.mark.parametrize("original_basis,current_net,recorded", [
+    ("net", False, 53.97), ("gross", True, 60.0),
+])
+async def test_recovered_run_closes_on_original_basis_across_settings_change(
+        original_basis, current_net, recorded):
+    """恢复后真实 executor 平仓与运行期归因同源，不使用新配置改写旧 run 口径。"""
+    from app.ai_auto.cost_runtime import CostRuntime
+    from app.ai_auto.resume import _restore_cost_basis
+
+    ex = _executor(net=current_net)
+    runtime = CostRuntime(ex.inst_id, ex.settings, ex.fee_ledger)
+    _restore_cost_basis(ex, original_basis)
+    opened = {"id": 1, "runId": 7, "ts": 1, "side": "long", "qty": _SZ,
+              "price": _ENTRY, "fee": 3.0, "pnl": 0, "positionAfter": _SZ,
+              "explain": {"meta": {"feeBasis": "measured", "feeKnown": True,
+                                    "feeCurrency": "USDT"}}}
+    runtime.restore_accounting([opened],
+        {"runId": 7, "costBasis": original_basis, "ctVal": _CT_VAL})
+    _hold_long(ex, entry_fee=runtime.remaining_open_fee_usd)
+
+    async def close_position(_request):
+        return {"ok": True, "clOrdId": "recovered-close", "ordId": "close-1"}
+
+    ex._close_position = close_position
+    events = await ex._do_close(60_600, 2, "恢复后平仓")
+    trade = next(event["data"] for event in events if event["type"] == "trade")
+    assert trade["pnl"] == pytest.approx(recorded)
+    runtime.record_close(trade)
+    economics = runtime.economics_snapshot()
+    assert economics["roundTripCount"] == 1
+    assert economics["grossPnlUsd"] == pytest.approx(60)
+    assert economics["feeUsd"] == pytest.approx(6.03)
+    assert economics["tradingNetUsd"] == pytest.approx(53.97)
+    assert economics["fundingCostUsd"] is None and economics["netAfterFundingUsd"] is None
+    assert runtime.cost_view(bar_seconds=3600)["netBasis"] is (original_basis == "net")
+    assert runtime.remaining_open_fee_usd == 0 and ex.entry_fee_usd == 0
+
+
 # ---------- 用例 2：G-2 未实现净额 ----------
 def test_unrealized_deducts_the_entry_fee_and_an_estimated_exit_leg():
     ex = _executor()
@@ -145,6 +183,7 @@ def test_session_fee_accumulates_across_legs():
 def test_session_fee_stays_zero_when_accounting_is_disabled():
     settings = Settings(ai_trade_fee_accounting_enabled=False)
     ledger = build_fee_ledger(settings, ct_val=_CT_VAL)
-    assert ledger.on_trade(cl_ord_id="c1", side="long", sz=_SZ, px=_ENTRY,
-                           ord_type="market", expected_px=None) == {}
+    trade = ledger.on_trade(cl_ord_id="c1", side="long", sz=_SZ, px=_ENTRY,
+                            ord_type="market", expected_px=None)
+    assert trade["feeKnown"] is False and trade["feeBasis"] == "unknown"
     assert ledger.session_fee_usd == 0.0

@@ -20,6 +20,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
+from uuid import uuid4
 
 from ..db import repositories as repo
 from ..db.session import get_sessionmaker
@@ -40,6 +41,11 @@ from .backstop_repair import (RepairRuntime, repair_now_from_executor,
                               rule_from_settings as repair_rule_from_settings, schedule_repair)
 from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, gate_status
 from .cost_runtime import CostRuntime
+from .entry_quota import EntryQuota
+from .integrity_view import (
+    build_integrity_snapshot, build_round_record, build_session_facts,
+    execution_result_keys,
+)
 from .discipline_runtime import DisciplineRuntime
 from .decider import AiTradeDecider, TradeDecision
 from .exchange_backstop import (BackstopRuntime, check_now_from_executor,
@@ -379,11 +385,21 @@ class AiTradeSession:
         # 共识门禁的会话级配置（directional-symmetry 轴 A）。取 `executor.settings` 是**刻意**的：
         # 它就是 `_resolve_discipline` 产出的那份派生副本（`manager._build_executor` 用 `req.settings`
         # 构造 executor），也正是 `_apply_consensus_gate` 今天现读的那一个对象。
-        # `_contrarian_used` **不落库、冷续跑归零**：配额的语义是「一个会话内的逆势试探次数」，
-        # 而冷续跑本就是新会话；落库反而要多维护一份可能漂移的状态（A-4 / RK-10）。
-        # 本会话已用 N/M 经 `status.discipline.contrarian` 下发，使「重启刷配额」可见（[P2-4]）。
         self._consensus_rule = consensus_rule_from_settings(executor.settings)
         self._contrarian_used = 0
+        self._entry_quota = EntryQuota(
+            run_id=str(run_id),
+            max_per_session=self._consensus_rule.contrarian_max_per_session)
+        self._round_contrarian = False
+        self._round_facts: dict = {}
+        self._round_sizing: dict | None = None
+        self._round_execution_identity = None
+        self._runtime_epoch_started_ts = int(time.time())
+        self._trade_persist_failed = False
+        self._trade_backlog_persist_failed = False
+        self._execution_state_persist_failed = False
+        self._unpersisted_trades: dict[str, dict] = {}
+        self._dispatched_events: set[str] = set()
         # 执行周期趋势基调（execution-trend-verdict 轴 A / E）：同款下沉范式——**判定全在
         # `trend_verdict.py`（纯核心）与 `trend_runtime.py`（会话门面）**，本文件只有薄接线。
         # `executor.settings` 与上一行同源：它就是 `_resolve_discipline` / `_resolve_trend`
@@ -594,68 +610,77 @@ class AiTradeSession:
                 self._discipline.funnel.note_insufficient_balance()
             if event.get("type") == "trade" and isinstance(event.get("data"), dict):
                 trade = event["data"]
-                # ★ 轴 D：**任何一次成交都清零**——系统证明了自己还活着。挂在事件上而不是轮末，
-                # 因为限价成交可能在数轮之后才被采纳，那一刻才是「它还活着」的真实时刻。
-                self._liveness.note_fill()
-                if trade.get("clOrdId"):        # pause-resume §6.2：本会话下过的单（unknown_order 判据）
-                    self._note_cl_ord_id(str(trade["clOrdId"]))
-                if trade.get("side") == "close":
-                    self._position_seq += 1     # 任一平仓成交 = 一个持仓周期终结
-                    self._known_cl_ord_ids.clear()   # 有界：只保留**当前持仓周期**内的
-                    if "peakPnlUsd" not in trade:      # 绝不用 setdefault（P2-7：恒求值实参 ⇒
-                        # 键已存在时也会把峰值消费掉，让下一笔平仓静默拿到 None）
-                        trade["peakPnlUsd"] = self._guard.take_peak_pnl()
-                    self._cost.record_close(trade)      # §3.8：往返归因同挂这个唯一收口
-                    self._sizing.note_close(trade, now_wall=time.time())   # 连亏计数同挂唯一收口
-                    self._horizon.note_close(trade, time.time())   # 真实持仓时长样本同挂唯一收口
-                else:   # 开仓成交：锁定 epoch 的 opened_wall（部分成交同一 epoch ⇒ 内部幂等不重置）
-                    # 轴 C：漏斗末格（事件级口径）。方向取**成交腿自己的 side**——本记点排在
-                    # `note_executed` 之后，轮级 `_intent_side` 早已被清（directional-symmetry P0-1）。
-                    self._discipline.funnel.note_filled(str(trade.get("side") or ""))
-                    # 趋势基调（评审 RP0-5）：按 `clOrdId` 认领**开仓那一刻定格**的 alignment，
-                    # 认领不到即计入 `unknown`（接管仓位 / 离线平仓 / 重启后续跑）。绝不猜。
-                    self._trend.note_fill(trade)
-                    self._horizon.note_open(trade, time.time(), seq=self._position_seq)
-                    self._repair.note_epoch(self._position_seq)   # 新持仓周期 ⇒ 补挂配额清零
-                    self._backstop.force_next()   # 随单 OCO 是否真的挂上，是开仓后最该立刻知道的事
-                    self._cost.note_open(trade, seq=self._position_seq, now_wall=time.time(),
-                                         atr_px=self._atr_px)   # 轴 A：冻结开仓断面（含 stopAtrMult）
-                    # 经验层 W-7①：**语境冻结在开仓那一刻**——出场时体制可能已经变了，用出场语境
-                    # 标注一笔入场决策的教训是错的，而且不会报错（§4.3）。未装配 ⇒ 空转。
-                    self._experience.note_open(trade, seq=self._position_seq,
-                                               facts=self._experience.facts(
-                                                   trade,
-                                                   market_context=self._market_context(),
-                                                   wake_kind=self._wake.last_round_kind,
-                                                   horizon_profile_id=self._horizon_profile()))
-                    # closed-loop 轴 B：引用行绑定持仓周期。先按 `clOrdId` 认领（限价跨轮），
-                    # 认领不到再回退本轮待写行（市价恒走回退）——两条路都取不到就什么都不做。
-                    self._intel_cite.note_open(trade, seq=self._position_seq)
-                self._sizing.note_executor(self.executor, self._current_px())   # [P1-8] 敞口簿
-                self._inject_explain_meta(trade)
+                if not await self._claim_trade_event(trade):
+                    continue
+                try:
+                    # ★ 轴 D：**任何一次成交都清零**——系统证明了自己还活着。挂在事件上而不是轮末，
+                    # 因为限价成交可能在数轮之后才被采纳，那一刻才是「它还活着」的真实时刻。
+                    self._liveness.note_fill()
+                    if trade.get("clOrdId"):        # pause-resume §6.2：本会话下过的单（unknown_order 判据）
+                        self._note_cl_ord_id(str(trade["clOrdId"]))
+                    if trade.get("side") == "close":
+                        self._position_seq += 1     # 任一平仓成交 = 一个持仓周期终结
+                        self._known_cl_ord_ids.clear()   # 有界：只保留**当前持仓周期**内的
+                        if "peakPnlUsd" not in trade:      # 绝不用 setdefault（P2-7：恒求值实参 ⇒
+                            # 键已存在时也会把峰值消费掉，让下一笔平仓静默拿到 None）
+                            trade["peakPnlUsd"] = self._guard.take_peak_pnl()
+                        self._cost.record_close(trade)      # §3.8：往返归因同挂这个唯一收口
+                        self._sizing.note_close(trade, now_wall=time.time())   # 连亏计数同挂唯一收口
+                        self._horizon.note_close(trade, time.time())   # 真实持仓时长样本同挂唯一收口
+                    else:   # 开仓成交：锁定 epoch 的 opened_wall（部分成交同一 epoch ⇒ 内部幂等不重置）
+                        # 轴 C：漏斗末格（事件级口径）。方向取**成交腿自己的 side**——本记点排在
+                        # `note_executed` 之后，轮级 `_intent_side` 早已被清（directional-symmetry P0-1）。
+                        self._discipline.funnel.note_filled(str(trade.get("side") or ""))
+                        # 趋势基调（评审 RP0-5）：按 `clOrdId` 认领**开仓那一刻定格**的 alignment，
+                        # 认领不到即计入 `unknown`（接管仓位 / 离线平仓 / 重启后续跑）。绝不猜。
+                        self._trend.note_fill(trade)
+                        self._horizon.note_open(trade, time.time(), seq=self._position_seq)
+                        self._repair.note_epoch(self._position_seq)   # 新持仓周期 ⇒ 补挂配额清零
+                        self._backstop.force_next()   # 随单 OCO 是否真的挂上，是开仓后最该立刻知道的事
+                        self._cost.note_open(trade, seq=self._position_seq, now_wall=time.time(),
+                                             atr_px=self._atr_px)   # 轴 A：冻结开仓断面（含 stopAtrMult）
+                        # 经验层 W-7①：**语境冻结在开仓那一刻**——出场时体制可能已经变了，用出场语境
+                        # 标注一笔入场决策的教训是错的，而且不会报错（§4.3）。未装配 ⇒ 空转。
+                        self._experience.note_open(trade, seq=self._position_seq,
+                                                   facts=self._experience.facts(
+                                                       trade,
+                                                       market_context=self._market_context(),
+                                                       wake_kind=self._wake.last_round_kind,
+                                                       horizon_profile_id=self._horizon_profile()))
+                        # closed-loop 轴 B：引用行绑定持仓周期。先按 `clOrdId` 认领（限价跨轮），
+                        # 认领不到再回退本轮待写行（市价恒走回退）——两条路都取不到就什么都不做。
+                        self._intel_cite.note_open(trade, seq=self._position_seq)
+                    self._sizing.note_executor(self.executor, self._current_px())   # [P1-8] 敞口簿
+                    self._inject_explain_meta(trade)
+                except Exception as exc:
+                    logger.warning(
+                        'trade enrichment unavailable: %s', exc)
                 await self._persist_trade(trade)
                 # 经验层 W-7②（★ E-12）：**必须是一个新的判据块**，且必须排在
                 # `_inject_explain_meta` 之后——`exitSource` 与往返结算都在那一步才写进 meta，
                 # 挂早了 meta 是空的（§4.1）。`persist_pending` 只做 `INSERT OR IGNORE`（★ D-1），
                 # 物化由 manager 侧的后台任务承担，绝不挂在这条热路径上。
                 if trade.get("side") == "close":
-                    self._experience.note_close(
-                        trade, (trade.get("explain") or {}).get("meta") or {},
-                        self._cost.last_settled_trip())
-                    # closed-loop 轴 B：同一处、同一条纪律（必须在 `_inject_explain_meta` 之后，
-                    # `exitSource` 与往返结算都在那一步才写进 meta）。★ 结算的 seq 只能取
-                    # `trip.seq`——`self._position_seq` 在本分支第一行就已经 +1 了（P0-2）。
-                    self._intel_cite.note_close(
-                        trade, (trade.get("explain") or {}).get("meta") or {},
-                        self._cost.last_settled_trip())
-                    # 趋势基调（评审 RP0-5）：净额盈亏**口径取自 `AttributionLedger` 里
-                    # `record_close` 已算好的那一份 `net`**，本层绝不另算——两处各算一次必漂移，
-                    # 而这两个数会并排出现在同一张卡上。取不到 ⇒ 只释放归属、不记数。
-                    self._trend.note_settled(self._cost.last_close_net_usd())
-                    await self._experience.persist_pending()
-                    await self._intel_cite.persist_pending()
-                    if self._experience.take_dirty():
-                        self._on_experience_dirty()      # 同步回调，**不 await**（G-5 时延门禁）
+                    try:
+                        self._experience.note_close(
+                            trade, (trade.get("explain") or {}).get("meta") or {},
+                            self._cost.last_settled_trip())
+                        # closed-loop 轴 B：同一处、同一条纪律（必须在 `_inject_explain_meta` 之后，
+                        # `exitSource` 与往返结算都在那一步才写进 meta）。★ 结算的 seq 只能取
+                        # `trip.seq`——`self._position_seq` 在本分支第一行就已经 +1 了（P0-2）。
+                        self._intel_cite.note_close(
+                            trade, (trade.get("explain") or {}).get("meta") or {},
+                            self._cost.last_settled_trip())
+                        # 趋势基调（评审 RP0-5）：净额盈亏**口径取自 `AttributionLedger` 里
+                        # `record_close` 已算好的那一份 `net`**，本层绝不另算——两处各算一次必漂移，
+                        # 而这两个数会并排出现在同一张卡上。取不到 ⇒ 只释放归属、不记数。
+                        self._trend.note_settled(self._cost.last_close_net_usd())
+                        await self._experience.persist_pending()
+                        await self._intel_cite.persist_pending()
+                        if self._experience.take_dirty():
+                            self._on_experience_dirty()      # 同步回调，**不 await**（G-5 时延门禁）
+                    except Exception as exc:
+                        logger.warning("trade learning unavailable: %s", exc)
                 # W2（pause-resume §3.4.2）：持仓事实**只在成交时变**，故契约的持仓断面事件驱动
                 # 地写——精确且零轮询开销。挂在 `_persist_trade` 之后（[P2-3]：`_push` 对每一个
                 # 事件都执行，挂那里会被 status/candle 一并触发）。
@@ -755,13 +780,151 @@ class AiTradeSession:
         self._cost.apply_trip_meta(meta, trade)
         explain["meta"] = meta
 
+    async def _claim_trade_event(self, trade: dict) -> bool:
+        """同一成交事件只做一次费用、经验与WS派发，持久化可重试。"""
+        explain = trade.setdefault("explain", {}) or {}
+        trade["explain"] = explain
+        meta = explain.setdefault("meta", {})
+        event_id = meta.setdefault("accountingEventId", uuid4().hex)
+        meta.update(runId=self.run_id, accountingVersion=2)
+        trade["runId"] = self.run_id
+        if event_id in self._dispatched_events:
+            await self._persist_trade(trade)
+            return False
+        self._dispatched_events.add(event_id)
+        return True
+
     async def _persist_trade(self, trade: dict) -> None:
+        """以稳定事件身份幂等落库；旧坏 JSON 不阻断新的原始成交。"""
+        from .trade_persistence import append_trade_once
+        meta = (trade.get("explain") or {}).get("meta") or {}
+        event_id = meta.get("accountingEventId")
+        was_pending = event_id in self._unpersisted_trades
+        # 取消可落在任一数据库 await；预先登记才能由 stop 接管重试。
+        self._unpersisted_trades[event_id] = trade
+        self._trade_persist_failed = True
         try:
             sm = get_sessionmaker()
             async with sm() as s:
-                await repo.append_live_trade(s, self.run_id, trade)
+                await append_trade_once(s, self.run_id, trade)
+            self._unpersisted_trades.pop(event_id, None)
+            attempts = getattr(self.executor, "open_attempts", None)
+            if attempts is not None and event_id:
+                attempts.mark_events_persisted(event_id)
+            self._trade_persist_failed = bool(self._unpersisted_trades)
         except Exception as exc:  # noqa: BLE001 —— best-effort 审计落库，失败不阻塞热路径
+            self._unpersisted_trades[event_id or uuid4().hex] = trade
+            self._trade_persist_failed = True
             logger.warning("append_live_trade failed (run_id=%s): %s", self.run_id, exc)
+        if was_pending or self._trade_persist_failed:
+            await self._persist_trade_backlog()
+
+    async def _persist_trade_backlog(self) -> None:
+        """独立保存未落库原始事件，重启后按相同事件身份补写。"""
+        attempts = getattr(self.executor, "open_attempts", None)
+        if attempts is None:
+            return
+        attempts.set_pending_trades(list(self._unpersisted_trades.values()))
+        self._trade_backlog_persist_failed = not await attempts._persist()
+
+    async def _flush_stopping_trades(self) -> bool:
+        """停止可重试落库，但不会重发平仓订单或重放学习。"""
+        for trade in list(self._unpersisted_trades.values()):
+            await self._persist_trade(trade)
+        if self._trade_backlog_persist_failed:
+            await self._persist_trade_backlog()
+        if (self._trade_persist_failed or self._trade_backlog_persist_failed):
+            if not (self.flatten_result or {}).get("tradePersistenceFailed"):
+                self._flatten_before_trade_persist = self.flatten_result
+            self.flatten_failed = True
+            self.flatten_result = {**(self.flatten_result or {}),
+                "ok": False, "tradePersistenceFailed": True,
+                "message": "成交已发生，但原始记录尚未保存；保留恢复入口"}
+            return False
+        if (self.flatten_result or {}).get("tradePersistenceFailed"):
+            self.flatten_result = self._flatten_before_trade_persist
+            self.flatten_failed = not (self.flatten_result or {}).get("ok")
+        return True
+
+    def install_integrity(self) -> None:
+        """组契约写入前安装开仓事务回调；未经持久化不能发送。"""
+        from .open_attempts import OpenAttemptManager
+        self.executor.open_attempts = OpenAttemptManager(
+            account_id=self.executor.account_id, run_id=self.run_id,
+            inst_id=self.inst_id, quota=self._entry_quota,
+            persist_callback=self._persist_runtime_integrity)
+
+    async def _persist_runtime_integrity(self, integrity: dict) -> bool:
+        """原子提交额度、pending与持仓身份；失败由执行层停止新开仓。"""
+        if not self.group_id:
+            return False
+        from ..db import ai_trade_state_repositories as state_repo
+        patch = {**self.state_member_row(), "runtimeIntegrity": integrity}
+        async with get_sessionmaker()() as db:
+            return await state_repo.patch_runtime_integrity(
+                db, self.group_id, self.inst_id, patch)
+
+    def _execution_identity(self) -> tuple:
+        resting = self.executor.resting
+        return (self._position_seq, self.executor.projected,
+                self.executor.entry_qty_sz,
+                None if resting is None else resting.cl_ord_id)
+
+    def _prepare_open_context(self) -> str | None:
+        """执行锁内核对模型等待期间的真实身份及风险条件。"""
+        if self._round_facts.get("factsUnavailable"):
+            return "facts_unavailable"
+        if (self._round_execution_identity is not None
+                and self._round_execution_identity != self._execution_identity()):
+            return "pre_submit_context_changed"
+        if (self._trade_persist_failed or self._trade_backlog_persist_failed
+                or self._execution_state_persist_failed):
+            return "attempt_persist_failed"
+        if self._cost.pre_submit_context_changed():
+            return "pre_submit_context_changed"
+        attempts = getattr(self.executor, "open_attempts", None)
+        if attempts is not None:
+            attempts.set_context(
+                round=self._round_facts.get("round", self.rounds_completed + 1),
+                runtime_epoch_id=self._discipline.funnel.runtime_epoch_id,
+                lane="contrarian" if self._round_contrarian else "consensus",
+                estimate={**(self._cost.pending_estimate() or {}),
+                          "factsHash": self._round_facts.get("factsHash"),
+                          "costSnapshot": self._cost.round_cost_wire()})
+        return None
+
+    async def _resolve_pending_open(self, ts: int) -> None:
+        """执行锁内查询固定ID，成交落库后才能完成身份转存。"""
+        attempts = getattr(self.executor, "open_attempts", None)
+        if attempts is None:
+            return
+        for trade in list(self._unpersisted_trades.values())[:20]:
+            await self._persist_trade(trade)
+        await self._dispatch(attempts.pending_events())
+        events = await attempts.resolve_pending(self.executor, ts)
+        await self._dispatch(events)
+        receipt = (attempts.last_receipt.to_dict()
+                   if attempts.last_receipt is not None else None)
+        if receipt:
+            self._discipline.funnel.resolve_outcome(
+                receipt.get("attemptId"), receipt.get("status"),
+                receipt.get("reason") or "exchange_rejected")
+        if not self._trade_persist_failed:
+            await attempts.complete_adoption(self.executor)
+        self._contrarian_used = self._entry_quota.used
+
+    async def _sync_execution_integrity(self) -> None:
+        """在执行锁内保存已采纳订单的最终挂单状态，失败阻止下一次开仓。"""
+        attempts = getattr(self.executor, "open_attempts", None)
+        if attempts is not None:
+            self._execution_state_persist_failed = not (
+                await attempts.sync_execution(self.executor))
+
+    def _open_receipt(self) -> dict | None:
+        receipt = getattr(self.executor, "last_open_receipt", None)
+        if receipt is None:
+            return None
+        return receipt if isinstance(receipt, dict) else receipt.to_dict()
 
     # ---------- 可续跑契约的增量写点（ai-trade-pause-resume §3.4.2 W2 / W3）----------
     def _note_cl_ord_id(self, cl_ord_id: str) -> None:
@@ -785,7 +948,13 @@ class AiTradeSession:
                 "position": self._state_position_snapshot(),
                 "positionUnknown": False,
                 "restingClOrdId": None if resting is None else resting.cl_ord_id,
-                "knownClOrdIds": known}
+                "knownClOrdIds": known,
+                "runtimeIntegrity": (
+                    self.executor.open_attempts.runtime_payload()
+                    if getattr(self.executor, "open_attempts", None) else {
+                        "schemaVersion": 2,
+                        "entryQuota": self._entry_quota.to_dict(),
+                        "pendingOpenAttempt": None})}
 
     def _state_position_snapshot(self) -> dict | None:
         """自管持仓断面（无仓 ⇒ None）。`openWallTs` 取当前持仓周期开仓腿的墙钟秒（`entry_bar` 反推的回落源）。"""
@@ -892,6 +1061,12 @@ class AiTradeSession:
         ③ `_backstop.close()` / `_repair.close()` ④ 落 run 终态；pause **四件都不做**。
         """
         if not self.is_active:
+            if (self._trade_persist_failed or self._trade_backlog_persist_failed
+                    or (self.flatten_result or {}).get("tradePersistenceFailed")):
+                async with self._exec_lock:
+                    if await self._flush_stopping_trades():
+                        await self._finalize_run(self._ref_ts())
+                        await self._notify_stopped()
             return self.flatten_result or {"ok": True, "closedSz": 0}
         self.state = "stopped"
         self.stop_reason = reason
@@ -919,6 +1094,16 @@ class AiTradeSession:
         # 整条消失（R-1 的第二重保险；`flatten` 里还有第一重）。必须排在对账**之前**：这条腿要
         # 进得了 `local_net_view` 的窗口，终态差额才算得对。
         await self._dispatch(await self.executor.drain_settlement(ts))
+        async with self._exec_lock:
+            trades_persisted = await self._flush_stopping_trades()
+            await self._sync_execution_integrity()
+            attempts = getattr(self.executor, "open_attempts", None)
+            unresolved = (attempts is not None and attempts.has_pending)
+            unresolved = unresolved or self.executor.resting is not None
+            if flatten and (unresolved or self._execution_state_persist_failed):
+                self.flatten_failed = True
+                self.flatten_result = {**(self.flatten_result or {}),
+                    "ok": False, "message": "委托状态尚未完成核实或保存"}
         self._cost.note_settlement(self.executor)
         await self._cost.reconcile_tick(          # 轴 C：终态对账（硬超时）
             time.time(), window_start_ts=self.started_ts,
@@ -929,8 +1114,9 @@ class AiTradeSession:
         # **不新增任何关停步骤**（`_shutdown_steps` 第 7 步已被用例冻结）。落在 `_finalize_run`
         # **之前**——`aiStats.intel.dropped` 要带上这一次丢弃，否则那个数在收尾快照里恒少一批。
         self._intel_cite.stop()
-        await self._finalize_run(ts)
-        await self._notify_stopped()
+        if trades_persisted:
+            await self._finalize_run(ts)
+            await self._notify_stopped()
         await self._push({"type": "status", "data": self._status_payload()})
         return self.flatten_result
 
@@ -1532,8 +1718,10 @@ class AiTradeSession:
         now_ts = int(time.time())
         mark = await self._latest_mark_px()
         async with self._exec_lock:
+            await self._resolve_pending_open(now_ts)
             events = await self.executor.reconcile(mark, now_ts)
-        await self._dispatch(events)
+            await self._dispatch(events)
+            await self._sync_execution_integrity()
         await self._push_status_if_side_changed()
         if self._discipline.naked_changed():   # 轴 C [P0-2]：裸仓事实翻转 ⇒ 补推一次 status
             await self._push({"type": "status", "data": self._status_payload()})
@@ -1853,6 +2041,12 @@ class AiTradeSession:
         区分唤醒来源；决策安全性不依赖它。
         """
         round_no = self.rounds_completed + 1     # RV-5：try 之前绑定，except 可安全引用
+        self._discipline.funnel.begin_round(round_no)
+        self._round_contrarian = False
+        self._round_sizing = None
+        self.executor.last_open_receipt = None
+        round_receipt = None
+        final_reason = "pre_submit_error"
         try:
             # ★ C-2（loss-and-liveness-hardening §4.3）：结构上不可能产生任何合法动作的轮次
             # 直接跳过，**连 payload 都不建**（省一次完整的 LLM 调用与一次 prompt 装配）。
@@ -1870,9 +2064,14 @@ class AiTradeSession:
             # A-5：逆势通路的四个阈值 + 剩余名额。通路不可用 / 总闸关 ⇒ **整键缺席** ⇒ prompt
             # 逐字节回退。没有它，逆势通路就是一个「有写点没读点」的功能——模型既不知道存在这条
             # 门槛，也不知道要写 `contrarianEvidence` 才能走。
-            contrarian = contrarian_payload(self._consensus_rule, self._contrarian_used)
+            contrarian = contrarian_payload(
+                self._consensus_rule,
+                self._entry_quota.used + self._entry_quota.reserved)
             if contrarian is not None:
+                contrarian["remaining"] = self._entry_quota.remaining
                 payload["consensus"]["contrarian"] = contrarian
+            payload["decisionFacts"] = build_session_facts(self, payload)
+            self._round_facts = payload["decisionFacts"]
             await self._begin_round_trace(round_no, ts, ref_px, payload, board)  # RV-7：consensus 之后
             decide_started = time.monotonic()          # 单调钟：墙钟耗时不受系统时钟跳变影响
             decision, degrade = await self.decider.decide(
@@ -1982,7 +2181,8 @@ class AiTradeSession:
             # 是一条完全静默的路径（无成交、无降级码）。合成仍遵循「先执行者胜出」。
             degrade = degrade or executed.get("closeBlocked")
             self._arm_exit_commitment(decision, executed)          # ★ W-5
-            self._discipline.funnel.note_executed(decision.action, bool(executed.get("skipped")))
+            round_receipt = executed.get("executionReceipt")
+            self._discipline.funnel.note_receipt(round_receipt)
             self._cost.note_round(bool(executed.get("traded")))          # §6.3 决策转化率
             # closed-loop P0-1：限价开仓单会 resting 若干轮，故在**下单那一刻**按 `clOrdId` 把本轮
             # 引用行冻结进跨轮认领槽（逐行镜像紧邻的 `self._cost.claim_estimate(...)`）。
@@ -2006,7 +2206,11 @@ class AiTradeSession:
                 # directional-symmetry 轴 B：注记泛化到**八道**确定性门禁（合入前只有持仓周期
                 # 层会写回来，其余七道对模型完全静默 ⇒ 模型读到的自己的历史是「上轮我决定观望」）。
                 gate_veto=self._gate_veto_note(stage1_decision, gate_degrade, llm_degrade),
-                defer_summary=True)
+                defer_summary=True, record=build_round_record(
+                    payload, None if llm_degrade else stage1_decision, decision, {
+                        **executed, "sizingVerdict": self._round_sizing,
+                        "gateVeto": self._gate_veto_note(
+                            stage1_decision, gate_degrade, llm_degrade)}))
             # ★ 评审 P1-4 / P0-2a：情报「已看过」集合的**唯一**置位点，且必须排在
             # `commit_round` **之后**——payload 建好之后那一轮仍可能因异常 / 降级而从未送达
             # 模型，先置位就是把「模型没看过」记成「看过」（用例 `B4c`）。
@@ -2050,6 +2254,7 @@ class AiTradeSession:
                                             self.decider.summary_health_wire(), round_no, ts)
             await self._post_round(ref_px, ts)
         except asyncio.CancelledError:
+            final_reason = "canceled_before_send"
             raise
         except Exception as exc:  # noqa: BLE001 —— 决策轮异常不崩会话：记 error 事件，等下一根
             logger.warning("ai-trade decision round failed: %s", exc)
@@ -2058,7 +2263,8 @@ class AiTradeSession:
                 "ts": ts, "code": "AI_TRADE_ROUND_FAILED", "message": "本轮决策异常，已跳过"}})
         finally:
             self._deciding = False
-            self._discipline.funnel.end_round()   # R-12：轮级标志兜底清零（异常路径也走这里）
+            self._discipline.funnel.end_round(
+                round_receipt or self._open_receipt(), final_reason)
             self._cost.end_round()   # 轴 A：轮级估计同址清零（D-3：被否的意图绝不改绑到下一笔往返）
             self._trend.end_round()  # 同款纪律：一次被否的开仓意图绝不改绑到下一笔成交上
             # ★ 轴 D：停手请求在**这里**才交给 manager（见 `_flush_liveness_halt` 的成文理由）。
@@ -3035,11 +3241,14 @@ class AiTradeSession:
     async def _apply_sizing(self, round_no: int, ts: int, ref_px: float,
                             decision: TradeDecision) -> TradeDecision:
         """★ 第 11 步：仓位求解 + ATR 止损覆盖（只缩不放、绝不改 action）；未装配 ⇒ 原对象直通零事件。"""
+        original_action = decision.action
         decision, _, wire = self._sizing.resolve_live(
             decision, self.executor, ref_px=ref_px, atr_px=self._atr_px,
             step=self.decider.position_step, prior_view=self._prior.coverage_wire(),
             cost_bps=self._cost.estimate_cost_only(decision, BAR_SECONDS[self.bar]))
-        self._discipline.funnel.note_sizing(decision.action, decision.size_fraction)  # 轴 C
+        self._round_sizing = wire
+        self._discipline.funnel.note_sizing(
+            original_action, decision.size_fraction)
         if wire:
             apply_sizing_trace(self._round_trace, wire)
             await self._push(sizing_event(round_no, ts, wire))
@@ -3071,7 +3280,7 @@ class AiTradeSession:
         对外行为逐字不变——门禁降级则 `degradeReason` 归并为 `degrade or gate_reason`（保留决策器
         先前的回落原因，如 timeout），否则透传原 `degrade`。共识门禁纯核心在 `signals` 供回测共用。
 
-        逆势通路放行时：会话配额 +1、漏斗的 `contrarianPassed` +1（**它不是降级、不进 `blocked`**）。
+        逆势通路放行仅计 `contrarianPassed`；配额在实际订单确认接收后消费。
         `position_step` 的真源是 `decider.position_step`（`session.py` 另有两处同款取法）——步长是
         决策器的属性，把它拷进 `ConsensusRule` 就会出现「规则里的 step 与决策器的不是同一个」。
         """
@@ -3086,12 +3295,13 @@ class AiTradeSession:
         self._trend.note_bonus(lane, allowance)
         out = resolve_consensus_gate(decision, consensus, self._consensus_rule,
                                      position_step=self.decider.position_step,
-                                     used_contrarian=self._contrarian_used,
+                                     used_contrarian=(self._entry_quota.used
+                                                      + self._entry_quota.reserved),
                                      bonus_votes=trend_consensus_bonus(
                                          decision.action, verdict, consensus, self._trend_rule),
                                      opposing_allowance=allowance, bonus_lane=lane)
         if out.contrarian_used:
-            self._contrarian_used += 1
+            self._round_contrarian = True
             self._discipline.funnel.note_contrarian()
         # 总闸关 ⇒ 轨迹不带 `consensusGate` 键 ⇒ wire 形状逐字节回退（`gateVeto` 的共识快照同源）。
         # 判据是**总闸 + 本层真的判过**（`exempt` = `min_consensus<=0` 或非开仓动作，本层没话说），
@@ -3121,15 +3331,28 @@ class AiTradeSession:
         order_plan = decision_to_order_plan(decision)
         async with self._exec_lock:
             if self.state != "running":       # stop() 抢先置 stopped：本轮不再下单（避免停止竞态下多此一举的开仓+随即被 flatten 平掉，白付手续费）
+                if decision.action in ("open_long", "open_short"):
+                    return self._not_submitted_execution(
+                        decision.action, "session_not_running")
                 return {"ok": True, "action": decision.action, "skipped": True,
                         "reason": "stopped", "closedFilled": False,
                         "side": self.executor.projected,
                         "qty": self.executor.entry_qty_sz,
                         "positionAfter": self.executor.projected}
+            if decision.action in ("open_long", "open_short"):
+                reason = self._prepare_open_context()
+                if reason:
+                    return {**self._not_submitted_execution(
+                        decision.action, reason), "executionContextChanged": reason}
             events = await self.executor.apply(signals, ref_px=ref_px, bar_index=i, ts=ts,
                                                order_plan=order_plan)
             events += await self.executor.reconcile(ref_px, ts)
-        await self._dispatch(events)
+            await self._dispatch(events)
+            attempts = getattr(self.executor, "open_attempts", None)
+            if attempts is not None and not self._trade_persist_failed:
+                await attempts.complete_adoption(self.executor)
+            await self._sync_execution_integrity()
+            self._contrarian_used = self._entry_quota.used
         self._cost.claim_estimate(self.executor.resting)   # [P0-2] 限价开仓单：估计随 clOrdId 冻结
         await self._push_status_if_side_changed()
         traded = any(e.get("type") == "trade" for e in events)
@@ -3143,7 +3366,22 @@ class AiTradeSession:
                 # 一次没发生的平仓理应进闸计数，而这条路径此前完全静默。
                 "closeBlocked": self.executor.last_close_block,
                 "side": self.executor.projected, "qty": self.executor.entry_qty_sz,
-                "positionAfter": self.executor.projected}
+                "positionAfter": self.executor.projected,
+                "factsHash": self._round_facts.get("factsHash"),
+                **execution_result_keys(self._open_receipt())}
+
+    def _not_submitted_execution(self, action: str, reason: str) -> dict:
+        """发送前阻断也返回完整的仓位事实与明确回执。"""
+        receipt = {"attemptId": None, "clOrdId": None, "ordId": None,
+                   "status": "not_submitted", "reason": reason,
+                   "submittedNew": False, "submissionPhase": "not_sent",
+                   "instId": self.inst_id, "observedAtTs": time.time()}
+        return {"action": action, "traded": False, "closedFilled": False,
+                "side": self.executor.projected,
+                "qty": self.executor.entry_qty_sz,
+                "positionAfter": self.executor.projected,
+                "factsHash": self._round_facts.get("factsHash"),
+                **execution_result_keys(receipt)}
 
     async def _execute_cancel(self, decision: TradeDecision, ts: int) -> dict:
         """`cancel_order` 前置分发（§2.2a 第一层）：只撤挂单，**绝不触碰任何持仓**。
@@ -3158,9 +3396,11 @@ class AiTradeSession:
                         "qty": self.executor.entry_qty_sz,
                         "positionAfter": self.executor.projected}
             events = await self.executor.cancel_resting("agent", ts)
-        await self._dispatch(events)
-        return {"ok": True, "action": decision.action, "skipped": False, "traded": False,
-                "closedFilled": False,
+            await self._dispatch(events)
+            await self._sync_execution_integrity()
+        return {"ok": True, "action": decision.action, "skipped": False,
+                "traded": any(event.get("type") == "trade" for event in events),
+                "closedFilled": _has_close_fill(events),
                 "side": self.executor.projected, "qty": self.executor.entry_qty_sz,
                 "positionAfter": self.executor.projected}
 
@@ -3419,6 +3659,8 @@ class AiTradeSession:
     def _build_decision_payload(self, round_no: int, ts: int, ref_px: float,
                                 board: list[StrategySignalView],
                                 wake: dict) -> dict:
+        self._cost.begin_round_cost({"bar_seconds": BAR_SECONDS[self.bar]})
+        self._round_execution_identity = self._execution_identity()
         payload = {
             "round": round_no, "barTs": ts, "lastPx": ref_px,
             "trigger": wake.get("trigger", "candle"),
@@ -3503,6 +3745,8 @@ class AiTradeSession:
         intel = intel_digest_for(self.inst_id)
         if intel:
             payload["intel"] = self._intel_payload(intel, round_no, ts, payload)
+        payload["decisionFacts"] = build_session_facts(self, payload)
+        self._round_facts = payload["decisionFacts"]
         return payload
 
     def _intel_payload(self, intel: dict, round_no: int, ts: int, payload: dict) -> dict:
@@ -3648,6 +3892,8 @@ class AiTradeSession:
                 "reason": decision.reason, "signalBoard": [self._view_slim(v) for v in board],
                 "executed": executed, "marketContext": market_context,
                 "consensus": consensus, "degradeReason": degrade_reason,
+                "sizingVerdict": self._round_sizing,
+                "factsHash": self._round_facts.get("factsHash"),
                 "analysis": analysis, "marketDigest": market_digest,
                 "multiTimeframeContext": multi_timeframe_context,
                 "trigger": (wake or {}).get("trigger", "candle"),
@@ -3738,6 +3984,7 @@ class AiTradeSession:
 
     def _status_payload(self) -> dict:
         return {"state": self.state,
+                "integrity": build_integrity_snapshot(self),
                 # 暂停 / 继续（§5.7）：`state` 现可为 `"paused"`；`pauseReason` 供前端选文案。
                 "pauseReason": self.pause_reason, "pausedTs": self.paused_ts,
                 # 生命周期真值（lifecycle-truth B-5 / L-2）：凡是说 `running`，同一份 wire 必须
@@ -3842,18 +4089,14 @@ class AiTradeSession:
     def discipline_wire(self) -> dict:
         """生效纪律自检（轴 B）：13 行固定顺序 + [P1-9] 恒真自检提示；装配全在 `discipline_runtime`。
 
-        directional-symmetry [P2-4]：逆势配额**不落库、冷续跑归零**是一个有意的取舍，但
-        「本会话已用 N/M」必须让用户看得见——否则「重启刷配额」是一个既存在又不可见的行为。
+        逆势配额属于整个 run；已预留和已消耗量都占用余额，冷恢复不补满。
         通路未装配 / 总闸关 ⇒ 整键缺席 ⇒ 前端整段不渲染。
         """
         rows = self._discipline.rows()
         wire = {"rows": rows, "hint": self._discipline.hint(rows)}
         rule = self._consensus_rule
         if rule.contrarian_enabled and rule.min_consensus > 0:
-            wire["contrarian"] = {
-                "used": self._contrarian_used,
-                "remaining": max(0, rule.contrarian_max_per_session - self._contrarian_used),
-                "maxPerSession": rule.contrarian_max_per_session}
+            wire["contrarian"] = self._entry_quota.summary()
         return wire
 
     def direction_wire(self) -> dict | None:
@@ -3932,6 +4175,7 @@ class AiTradeSession:
 
     def info(self) -> dict:
         return {"sessionId": self.session_id, "runId": self.run_id, "state": self.state,
+                "integrity": build_integrity_snapshot(self),
                 "pauseReason": self.pause_reason, "pausedTs": self.paused_ts,
                 "instId": self.inst_id, "bar": self.bar,
                 "strategyIds": self.strategy_ids, "strategyNames": self.strategy_names,
@@ -4050,6 +4294,14 @@ class AiTradeSession:
             logger.warning("ai-trade finalize enrichment skipped for run %s: %s", self.run_id, exc)
             for key in ("equityDigest", "decisionsDigest", "aiStats"):
                 metrics.pop(key, None)
+        integrity = build_integrity_snapshot(self)
+        metrics.setdefault("aiStats", {})["integrity"] = integrity
+        economics = integrity["economics"]
+        for key, source in (("winRate", "winRate"), ("profitFactor", "profitFactor"),
+                            ("avgPnl", "avgPnlUsd")):
+            if economics.get(source) is not None:
+                metrics[key] = economics[source]
+        metrics["roundTripCount"] = economics.get("roundTripCount", 0)
         return metrics
 
 

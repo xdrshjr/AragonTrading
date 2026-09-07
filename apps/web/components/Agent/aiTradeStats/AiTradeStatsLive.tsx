@@ -9,6 +9,8 @@ import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
 import DirectionBalanceCard from "./DirectionBalanceCard";
 import TrendAlignmentCard from "./TrendAlignmentCard";
 import OpenFunnelCard from "./OpenFunnelCard";
+import IntegrityCard from "./IntegrityCard";
+import { readIntegrity } from "@/lib/aiTradeIntegrity";
 import TradabilityCard from "./TradabilityCard";
 import TurnoverBackstopCard, { type RepairPendingState } from "./TurnoverBackstopCard";
 import WakeAttributionCard from "./WakeAttributionCard";
@@ -241,7 +243,11 @@ export default function AiTradeStatsLive({
           <TradabilityCard key={`trad-${m.instId}`} tradability={m.session?.tradability} />
         ))}
         {Object.values(group.members).map((m) => (
-          <OpenFunnelCard key={`funnel-${m.instId}`} funnel={m.session?.openFunnel} />
+          <div key={`funnel-${m.instId}`} className="min-w-0 space-y-2">
+            <IntegrityCard instId={m.instId} integrity={m.session?.integrity} />
+            <OpenFunnelCard funnel={readIntegrity(m.session?.integrity)?.funnel
+              ?? m.session?.openFunnel} />
+          </div>
         ))}
         {/* 方向分布（directional-symmetry 轴 D）：紧贴漏斗卡下方——两者是同一个问题的两半，
             漏斗说「被哪一层拦下」，本卡说「拦掉的是哪个方向」。老会话 / 总闸关 ⇒ 整卡不渲染。 */}

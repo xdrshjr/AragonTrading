@@ -96,4 +96,14 @@ def test_factor_readings_match_engine_indicators():
 def test_last_bar_is_current_confirmed_bar():
     df = _make_df()
     digest = build_market_digest(df, "1H", Settings())
-    assert digest["priceAction"]["lastBar"]["c"] == round(float(df["c"].iloc[-1]), 6)
+    assert digest["priceAction"]["lastBar"]["c"] == float(df["c"].iloc[-1])
+
+
+def test_tiny_ohlc_and_swing_extremes_keep_original_prices():
+    df = _make_df()
+    for key in ("o", "h", "l", "c"):
+        df[key] *= 1e-12
+    price = build_market_digest(df, "1H", Settings())["priceAction"]
+    for key in ("o", "h", "l", "c"):
+        assert price["lastBar"][key] == float(df[key].iloc[-1])
+    assert price["swingHigh"] > price["swingLow"] > 0

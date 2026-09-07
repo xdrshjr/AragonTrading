@@ -6,6 +6,7 @@ import { PeriodReturnBars, UnderwaterChart } from "@/components/Chart/aiBacktest
 import AutoTradeRoundTripRow from "@/components/Chart/AutoTradeRoundTripRow";
 import AnnualizedProjectionCard from "./AnnualizedProjectionCard";
 import DirectionBalanceCard from "./DirectionBalanceCard";
+import IntegrityCard, { EconomicsReadings } from "./IntegrityCard";
 import TrendAlignmentCard from "./TrendAlignmentCard";
 import ExitSourceCard from "./ExitSourceCard";
 import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
@@ -134,6 +135,11 @@ function DetailBody({ detail, onBack }: { detail: AiTradeHistoryDetailOut; onBac
           />
 
           <FeeSourceCard members={detail.members} />
+          {summary.economics && <EconomicsReadings economics={summary.economics} />}
+          {detail.members.map((member) => (
+            <IntegrityCard key={member.instId} instId={member.instId}
+              integrity={member.metrics.aiStats?.integrity} />
+          ))}
           <ReconcileCard members={detail.members} />
           <SizingCard members={detail.members} />
 

@@ -2,8 +2,8 @@
 
 覆盖：执行器各生命周期分支挂对应 kind 的 explain（factor_score / risk_exit / reverse /
 session_stop / external_close）；external_close 为只读合成成交且不触发下单；append_live_trade
-落库（自带 commit）后另开 session 经 trade_out 读回无损；explain 不含凭证；落库 / 单号缺失的
-best-effort 降级。OKX 调用全程桩驱动，不触网；铁律：占位假凭证，绝不写真实凭证。
+落库（自带 commit）后另开 session 经 trade_out 读回无损；explain 不含凭证；未知接收回执
+不合成成交。OKX 调用全程桩驱动，不触网；铁律：占位假凭证，绝不写真实凭证。
 """
 from __future__ import annotations
 
@@ -182,7 +182,7 @@ async def test_external_close_synthesized_on_benign_oco_close():
     assert not [e for e in events if e["type"] == "error"]
 
 
-# ------------------------------ best-effort：单号缺失不阻塞 ------------------------------
+# ------------------------------ 订单身份与接收事实 ------------------------------
 async def test_open_captures_order_ids_when_present():
     ex, _ = _make_executor()
     events = await ex.apply([Signal(side="long")], ref_px=_REF_PX, bar_index=0, ts=1000)
@@ -190,19 +190,51 @@ async def test_open_captures_order_ids_when_present():
     assert trade["clOrdId"] == "aragonx" and trade["ordId"] == "x1"
 
 
-async def test_open_without_order_ids_still_produces_trade_and_explain():
-    ex, _ = _make_executor()
+@pytest.mark.parametrize("managed", [False, True], ids=["普通执行器", "AI执行器"])
+async def test_open_without_order_ids_is_unknown_and_does_not_invent_a_trade(managed):
+    ex, calls = _make_executor()
+    snapshots = []
+    if managed:
+        from app.ai_auto.entry_quota import EntryQuota
+        from app.ai_auto.open_attempts import OpenAttemptManager
+
+        async def persist(snapshot):
+            snapshots.append(snapshot)
+            return True
+
+        ex.open_attempts = OpenAttemptManager(
+            account_id=1, run_id="run", inst_id=ex.inst_id,
+            quota=EntryQuota("run", 2), persist_callback=persist)
+        ex.open_attempts.set_context(round=1, runtime_epoch_id="epoch", lane="contrarian")
 
     async def place_no_ids(order):
+        calls["orders"].append(order)
         return {"ok": True}             # 回执不含 clOrdId / ordId
 
     ex._place_order = place_no_ids
     events = await ex.apply([Signal(side="long", reason="复合得分多头")],
                             ref_px=_REF_PX, bar_index=0, ts=1000)
-    trade = _trade_events(events)[0]["data"]
-    assert trade["side"] == "long"
-    assert "clOrdId" not in trade and "ordId" not in trade   # 缺失即省略键，不阻塞
-    assert trade["explain"] is not None
+    assert _trade_events(events) == []
+    assert ex.trades == [] and ex.projected == "flat"
+    assert ex.last_open_receipt.status == "unknown"
+    assert ex.last_open_receipt.reason == "acceptance_unknown"
+    assert ex.last_open_receipt.submission_phase == "sent"
+    assert ex.last_open_receipt.ord_id is None
+    assert not ex.last_open_receipt.submitted_new
+    assert len(calls["orders"]) == 1
+    if managed:
+        identity = calls["orders"][0].client_order_id
+        assert snapshots[0]["pendingOpenAttempt"]["clOrdId"] == identity
+        assert snapshots[-1]["pendingOpenAttempt"]["phase"] == "sent"
+        assert ex.open_attempts.pending.cl_ord_id == identity
+        assert ex.open_attempts.quota.reserved == 1
+        assert ex.open_attempts.quota.used == 0
+        await ex.apply([Signal(side="long")], ref_px=_REF_PX, bar_index=1, ts=1001)
+        assert len(calls["orders"]) == 1
+        assert ex.open_attempts.pending.cl_ord_id == identity
+    else:
+        assert calls["orders"][0].client_order_id is None
+        assert calls["orders"][0].submission_trace is None
 
 
 # ------------------------------ 无凭证 ------------------------------

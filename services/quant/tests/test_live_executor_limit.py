@@ -108,7 +108,17 @@ async def test_market_path_payload_byte_identical_when_no_order_plan():
     assert asdict(calls["orders"][0]) == {
         "inst_id": "BTC-USDT-SWAP", "direction": "long", "ord_type": "market",
         "td_mode": "cross", "px": None, "sz": 10.0, "lever": 3.0,
-        "tp_trigger_px": None, "sl_trigger_px": None}
+        "tp_trigger_px": None, "sl_trigger_px": None,
+        "client_order_id": None, "submission_trace": None}
+    from app.okx.order_builder import InstrumentMeta, build_order_payload
+    meta = InstrumentMeta(.01, "BTC", .01, .01, .1, 125, "linear", "USDT")
+    payload = build_order_payload(
+        calls["orders"][0], meta, "long_short_mode", "originalid")
+    assert payload == {
+        "instId": "BTC-USDT-SWAP", "tdMode": "cross", "side": "buy",
+        "posSide": "long", "ordType": "market", "sz": "10.00",
+        "clOrdId": "originalid",
+    }
     assert ex.resting is None          # 市价路径绝不进挂单态
     assert ex.projected == "long"      # 市价仍走乐观置位（口径一字不改）
 

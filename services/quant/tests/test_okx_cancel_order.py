@@ -179,9 +179,11 @@ def test_cancel_outcome_chains_from_okx_scode_through_map_trade_code():
 
 def test_normalize_order_maps_fields_and_converts_utime_to_seconds():
     assert _normalize_order({
+        "instId": "BTC-USDT-SWAP", "side": "buy", "posSide": "net",
         "state": "partially_filled", "px": "61234.5", "sz": "0.03", "avgPx": "61230.1",
         "accFillSz": "0.01", "ordId": "9", "clOrdId": "aragon-1", "uTime": "1710000001123",
     }) == {
+        "instId": "BTC-USDT-SWAP", "side": "buy", "posSide": "net",
         "state": "partially_filled", "px": 61234.5, "sz": 0.03, "avgPx": 61230.1,
         "accFillSz": 0.01, "ordId": "9", "clOrdId": "aragon-1", "updatedTs": 1710000001,
     }
@@ -190,17 +192,18 @@ def test_normalize_order_maps_fields_and_converts_utime_to_seconds():
 def test_normalize_order_tolerates_empty_row_from_missing_order():
     """订单不存在（`get_order` 回 `{}`）时归一为全空态，绝不炸——`state==""` 走 unknown 分支。"""
     assert _normalize_order({}) == {
-        "state": "", "px": None, "sz": None, "avgPx": None, "accFillSz": 0.0,
+        "state": "", "px": None, "sz": None, "avgPx": None, "accFillSz": None,
+        "instId": "", "side": "", "posSide": "",
         "ordId": None, "clOrdId": None, "updatedTs": 0,
     }
 
 
 def test_normalize_order_maps_unfilled_live_order_with_blank_avg_px():
-    """未成交挂单的 `avgPx`/`accFillSz` 是空串：前者归 None、后者归 0.0（不得变 None 致下游算术炸）。"""
+    """价格与累计量空串均保留未知；不能把未提供的成交量当作明确零成交。"""
     row = _normalize_order({"state": "live", "px": "100", "sz": "0.03", "avgPx": "",
                             "accFillSz": "", "ordId": "9", "clOrdId": "aragon-1",
                             "uTime": "1710000001999"})
     assert row["state"] == "live"
     assert row["avgPx"] is None
-    assert row["accFillSz"] == 0.0
+    assert row["accFillSz"] is None
     assert row["updatedTs"] == 1710000001

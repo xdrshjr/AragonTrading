@@ -179,6 +179,10 @@ async def test_profit_rule_is_forwarded_to_spec(monkeypatch):
     """
     from app.ai_auto.profit_guard import ProfitGuardRule
 
+    monkeypatch.setattr("app.ai_auto.backtest_manager.resolve_active_provider",
+                        lambda *_a, **_k: _async_obj())
+    monkeypatch.setattr("app.ai_auto.backtest.make_llm_client_from_config",
+                        lambda cfg: object())
     spec = await _seed_spec()
     mgr = _reset_manager()
     monkeypatch.setattr(AiBacktestRunner, "run", _idle_run)
@@ -193,3 +197,4 @@ async def test_profit_rule_is_forwarded_to_spec(monkeypatch):
         assert default_job.runner.profit_rule is None
     finally:
         await _teardown(mgr)
+        await dispose_engine()

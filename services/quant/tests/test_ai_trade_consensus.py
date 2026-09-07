@@ -9,6 +9,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from app.ai_auto.decider import TradeDecision
+from app.ai_auto.entry_quota import EntryQuota
 from app.ai_auto.session import AiTradeSession
 from app.ai_auto.trend_runtime import TrendRuntime
 from app.ai_auto.trend_verdict import TrendVerdictRule
@@ -61,6 +62,7 @@ def _gate(need: int, decision: TradeDecision, board_stances: list[str], degrade=
         decider=SimpleNamespace(position_step=0.0),
         _consensus_rule=consensus_rule_from_settings(settings),
         _contrarian_used=used,
+        _entry_quota=EntryQuota("test", 3, legacy_assumed_used=used),
         _round_trace=None,
         # execution-trend-verdict：`_apply_consensus_gate` 现在还会读会话的趋势基调运行时来解
         # 两条顺势放宽通路。替身 self 必须同步补齐——**未装配的 rule ⇒ 两条通路恒返回 0** ⇒
@@ -226,7 +228,7 @@ def test_contrarian_payload_absent_when_lane_unavailable():
 
 
 def test_session_gate_counts_contrarian_and_never_calls_it_a_block():
-    """会话侧：逆势放行 ⇒ 配额 +1、漏斗 `contrarianPassed` +1，且**不产生任何 degrade**。"""
+    """逆势门禁放行仅计漏斗；收到真实委托接收回执前不消耗额度。"""
     decision = TradeDecision("open_short", 0.5, 0.72, "r", contrarian_evidence=_EVIDENCE)
     settings = Settings(ai_trade_min_consensus=1, ai_trade_consensus_contrarian_enabled=True)
     funnel = OpenFunnelCounters()
@@ -235,6 +237,7 @@ def test_session_gate_counts_contrarian_and_never_calls_it_a_block():
         decider=SimpleNamespace(position_step=0.0),
         _consensus_rule=consensus_rule_from_settings(settings),
         _contrarian_used=0,
+        _entry_quota=EntryQuota("test", 3),
         _round_trace={},
         # 同上：替身 self 必须带上会话的趋势基调运行时（未装配 ⇒ 两条通路恒返回 0 ⇒
         # 本用例的断言与本特性合入前逐字相同）。
@@ -244,7 +247,9 @@ def test_session_gate_counts_contrarian_and_never_calls_it_a_block():
     out, degrade = AiTradeSession._apply_consensus_gate(
         host, decision, compute_consensus([_view("long")]), None)
     assert out.action == "open_short" and out.size_fraction == 0.25 and degrade is None
-    assert host._contrarian_used == 1
+    assert host._contrarian_used == 0
+    assert host._entry_quota.used == host._entry_quota.reserved == 0
+    assert host._round_contrarian is True
     assert funnel.contrarian_passed == 1
     assert funnel.blocked == {}                       # 它不是降级，绝不进 blocked
     assert host._round_trace["consensusGate"]["lane"] == "contrarian"

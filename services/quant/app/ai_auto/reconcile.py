@@ -17,6 +17,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+
+from .accounting_replay import TradeAccountingAccumulator
+from .trade_economics import finite
 
 # 恒等式自检的相对容差（C-3）：交易所侧的四项相加与 realizedPnl 的残差按此判定是否成立。
 _IDENTITY_REL_TOL = 1e-6
@@ -66,18 +70,11 @@ def local_net_view(trades: list[dict], *, net_mode: bool) -> dict:
     Returns:
         `{"netUsd": float, "trips": int}`。
     """
-    net = 0.0
-    trips = 0
-    leg_fee = 0.0
-    for trade in trades or []:
-        leg_fee += _num((trade or {}).get("fee"))
-        if (trade or {}).get("side") in ("long", "short"):
-            continue
-        trips += 1
-        pnl = _num((trade or {}).get("pnl"))
-        net += pnl if net_mode else pnl - leg_fee
-        leg_fee = 0.0
-    return {"netUsd": round(net, 6), "trips": trips}
+    accumulator = TradeAccountingAccumulator({
+        "costBasis": "net" if net_mode else "gross"})
+    snapshot = accumulator.restore(trades or [])
+    return {"netUsd": snapshot["tradingNetUsd"],
+            "trips": snapshot["roundTripCount"]}
 
 
 def _num(value: object) -> float:
@@ -102,15 +99,7 @@ def _select_rows(rows: list[dict], window_start_ts: int, inst_id: str | None) ->
 
 
 def _identity_check(rows: list[dict], abs_tol_usd: float) -> tuple[bool, float]:
-    """官方关系式 `realizedPnl = pnl + fee + fundingFee + liqPenalty` 的运行期数值自检（C-3）。
-
-    §2.3 的官方措辞未能从公开页面逐字取回（`docs-v5` 是 SPA），故本 spec **不把该式当作前提**：
-    让代码自己去证，不成立即在看板上如实标注「交易所口径自检未通过」，而不是给出一个建立在错误
-    假设上的差额。
-
-    Returns:
-        `(identityHolds, identityMaxGapUsd)`。
-    """
+    """旧对账自检展示；v2 完整性单独按内部带符号恒等式核验全部字段。"""
     gaps = [abs(_num(r.get("identityGapUsd"))) for r in rows]
     scale = sum(abs(_num(r.get("realizedPnl"))) for r in rows)
     max_gap = max(gaps) if gaps else 0.0
@@ -134,35 +123,18 @@ def build_reconciliation(*, local_net_usd: float, local_trips: int, rows: list[d
                          window_start_ts: int, params: ReconcileParams,
                          final: bool = False, inst_id: str | None = None,
                          settlement: dict | None = None,
-                         capital_usd: float | None = None) -> dict:
-    """本地净额 vs 交易所**可比口径**的窗口对账；样本不足即 `status="unavailable"`。
+                         capital_usd: float | None = None,
+                         comparison_coverage: dict | None = None) -> dict:
+    """本地已平净额的窗口对账，v2 金额仅在身份和窗口证据完整时返回。
 
-    Args:
-        local_net_usd: 窗口内**已平仓往返**净额之和（`Σ trip.net_pnl`，绝不含未实现，P0-2）。
-        local_trips: 同一窗口内的本地往返笔数（`coverageMismatch` 的对照数）。
-        rows: `okx.trading.fetch_position_history` 的归一产物（三项已归一为「支出为正」）。
-        window_start_ts: 会话起点（秒），按 `uTime` 过滤。
-        params: 容差。
-        final: `True` = stop 收尾那一次。**永不判 drift**（P1-5）：强制对账排在真实资金平仓之后，
-            而 `positions-history` 的 `uTime` 对刚平的那一笔存在结算延迟 ⇒ 终态对账会系统性少一笔，
-            呈现为一个伪 drift，而这偏偏是用户最常看的那一屏。
-        inst_id: 可选的标的过滤（取数已按 instId 发起，此处为二次保险）。
-        settlement: 结算覆盖率（`settlement.coverage_wire` 的产物）；`None` ⇒ **整键省略**。
-        capital_usd: 会话本金（`executor.budget_usd`）；缺失 ⇒ 本金项不参与容差。
-
-    Returns:
-        §5.4 形状的只读 wire；`status ∈ {ok, drift, partial, unavailable}`。
-
-    ⚠️ `final` 的语义在轴 F-1 之后变了：`params.strict_final` 为真且**样本数与本地往返数完全
-    对齐**（`coverageMismatch=False`）时，终态对账**照样会判 drift**。原先「终态永不判 drift」的
-    理由（刚平的那一笔 `uTime` 有结算延迟 ⇒ 终态会系统性少一笔）是对的，但「少一笔」的观测特征
-    恰恰就是 `coverageMismatch`，它已经由 `partial` 分支单独接住——生产实测那 6 条被判 `ok` 却带着
-    合计 7.41 USDT 差额的记录**全部 `mismatch=False`**。那是一次「为了消除伪阳性把真阳性一起消掉」
-    的过度收敛，而它的代价是徽章写「已对上」、同一行正文写「差 +1.528 USDT」，产品在自相矛盾。
+    旧 status 保持兼容；strict_final 开启且笔数一致才在终态判 drift。
+    rows 的手续费、资金费及强平支出已取反，settledPnl 保留原收益符号。
     """
     picked = _select_rows(rows, window_start_ts, inst_id)
+    comparable_view = comparison_view(rows, picked, comparison_coverage)
     base = {"samples": len(picked), "localTrips": int(local_trips), "final": bool(final),
-            "localNetUsd": round(float(local_net_usd), 6),
+            "localNetUsd": round(float(local_net_usd), 6) if local_net_usd is not None else None,
+            **comparable_view,
             "windowStartTs": int(window_start_ts)}
     if settlement:                      # 加法键，`None` / 空 dict ⇒ 整键省略（`G-F3`）
         base["settlementCoverage"] = settlement
@@ -176,24 +148,101 @@ def build_reconciliation(*, local_net_usd: float, local_trips: int, rows: list[d
     fee = sum(_num(r.get("fee")) for r in picked)
     funding = sum(_num(r.get("fundingFee")) for r in picked)
     liq = sum(_num(r.get("liqPenalty")) for r in picked)
-    comparable = realized + funding + liq          # 把本地不记的两项加回去（P0-2）
-    diff = float(local_net_usd) - comparable
+    settlement_adjustment = sum(_num(r.get("settledPnl")) for r in picked)
+    comparable = realized + funding + liq - settlement_adjustment
+    diff = float(local_net_usd) - comparable if local_net_usd is not None else 0.0
     tol = _tolerance(comparable, params, capital_usd)
     mismatch = len(picked) != int(local_trips)
     identity_holds, identity_gap = _identity_check(picked, params.abs_tol_usd)
-    return {**base, "status": _status(diff, tol, mismatch, final,
-                                      strict_final=params.strict_final),
+    return {**base, "status": ("unavailable" if local_net_usd is None else
+                _status(diff, tol, mismatch, final, strict_final=params.strict_final)),
             "coverageMismatch": mismatch,
             # `tolUsd` 是加法键（轴 F-4 的第 1 条要用它）：前端要能把「为什么这也叫已对上」当场
             # 答掉——没有它，`ok` 分支的措辞只能含糊说「在容差内」而说不出容差是多少。
             "tolUsd": round(tol, 6),
             "exchangeRealizedUsd": round(realized, 6),
             "exchangeComparableUsd": round(comparable, 6),
-            "diffUsd": round(diff, 6),
-            "diffRatio": round(diff / max(1e-9, abs(comparable)), 6),
+            "diffUsd": round(diff, 6) if local_net_usd is not None else None,
+            "diffRatio": round(diff / max(1e-9, abs(comparable)), 6)
+            if local_net_usd is not None else None,
             "exchangeFeeUsd": round(fee, 6), "exchangeFundingFeeUsd": round(funding, 6),
             "exchangeLiqPenaltyUsd": round(liq, 6),
             "identityHolds": identity_holds, "identityMaxGapUsd": round(identity_gap, 9)}
+
+
+def comparison_view(rows: list[dict], picked: list[dict], evidence: dict | None) -> dict:
+    """验证身份、窗口、分页和官方恒等式，未证明完整则不产生可比金额。"""
+    coverage = dict(evidence or {})
+    reason = _comparison_reason(rows, picked, coverage)
+    coverage.update(comparable=reason is None, reason=reason,
+                    coverage="complete" if reason is None else "partial")
+    keys = ("exchangeTradingNetUsd", "exchangeFundingCostUsd",
+            "exchangeNetAfterFundingUsd", "exchangeRealizedPnlUsd",
+            "liquidationCostUsd", "settlementAdjustmentUsd")
+    result = {key: None for key in keys}
+    result["comparisonCoverage"] = coverage
+    if reason is not None:
+        return result
+    realized = math.fsum(float(row["realizedPnl"]) for row in picked)
+    funding = math.fsum(float(row["fundingFee"]) for row in picked)
+    liquidation = math.fsum(float(row["liqPenalty"]) for row in picked)
+    settlement = math.fsum(float(row["settledPnl"]) for row in picked)
+    trading = realized + funding + liquidation - settlement
+    result.update(exchangeTradingNetUsd=trading,
+        exchangeFundingCostUsd=funding, exchangeNetAfterFundingUsd=trading - funding,
+        exchangeRealizedPnlUsd=realized, liquidationCostUsd=liquidation,
+        settlementAdjustmentUsd=settlement)
+    return result
+
+
+def _comparison_reason(rows, picked, coverage):
+    if not picked:
+        return "no_samples"
+    if len(rows) >= 100 or not coverage.get("pagesComplete"):
+        return "incomplete_pages"
+    if not coverage.get("accountId") or not coverage.get("identityMatched"):
+        return "missing_identity"
+    trips = set(coverage.get("closedTripIds") or [])
+    links = coverage.get("tripPositionLinks") or {}
+    ids = [str(row.get("posId") or "") for row in picked]
+    expected = {str(value) for value in coverage.get("positionIds") or []}
+    if not trips or set(links) != trips or set(links.values()) != expected:
+        return "missing_identity"
+    if "" in ids or len(ids) != len(set(ids)) or set(ids) != expected:
+        return "position_set_mismatch"
+    start = finite(coverage.get("windowStartTs"))
+    end = finite(coverage.get("windowEndTs"))
+    fetched = finite(coverage.get("fetchedAtTs"))
+    if start is None or end is None or fetched is None or start > end or fetched < end:
+        return "incomplete_window"
+    if coverage.get("currency") != "USDT":
+        return "currency_mismatch"
+    for row in picked:
+        reason = _comparison_row_reason(row, coverage, start, end)
+        if reason:
+            return reason
+    return None
+
+
+def _comparison_row_reason(row, coverage, start, end):
+    if row.get("closed") is not True:
+        return "position_not_closed"
+    if row.get("instId") != coverage.get("instId"):
+        return "missing_identity"
+    if row.get("currency") != "USDT":
+        return "currency_mismatch"
+    opened, closed = finite(row.get("cTime")), finite(row.get("uTime"))
+    if opened is None or closed is None or not start <= opened <= closed <= end:
+        return "incomplete_window"
+    fields = ("pnl", "fee", "fundingFee", "liqPenalty", "settledPnl", "realizedPnl")
+    amounts = [finite(row.get(key)) for key in fields]
+    if any(value is None for value in amounts):
+        return "missing_adjustment"
+    gross, fee, funding, liquidation, settlement, realized = amounts
+    expected = gross - fee - funding - liquidation + settlement
+    if not math.isclose(realized, expected, rel_tol=_IDENTITY_REL_TOL, abs_tol=1e-9):
+        return "identity_mismatch"
+    return None
 
 
 def _status(diff: float, tol: float, mismatch: bool, final: bool, *,

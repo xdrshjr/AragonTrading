@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace, fields
+
+from .accounting_replay import (TradeAccountingAccumulator,
+                                accounting_event_key, leg_fee_evidence, trade_meta)
 
 from .trip_ledger import (
     PENDING_ESTIMATE_MAX,
@@ -136,7 +139,7 @@ class AttributionLedger:
         self._lifetime = {"trips": 0, "gross": 0.0, "fee": 0.0, "net": 0.0,
                           "absGross": 0.0}
         self._close_samples = 0           # 平仓成交样本数（closeFeeCoverage 的分母）
-        self._close_with_fee = 0          # 其中 fee != 0 的条数
+        self._close_with_fee = 0          # 费用来源明确的条数，含零费和返佣
         self._gate = {"pass": 0, "veto": 0, "unavailable": 0}
         self._rounds = 0
         self._traded_rounds = 0
@@ -150,6 +153,12 @@ class AttributionLedger:
         self._pending_estimates: dict[str, RoundEstimate] = {}       # [P0-2] 按 clOrdId 的待成交槽
         self._open: OpenSnapshot | None = None                       # 持仓周期级
         self._settled: deque[SettledTrip] = deque(maxlen=capacity)
+        self.accounting = TradeAccountingAccumulator({
+            "costBasis": "net" if self.net_mode else "gross", "ctVal": self.ct_val})
+        self._last_settled: SettledTrip | None = None
+        self._last_close_net: float | None = None
+        self._settlement_key: tuple | None = None
+        self._pending_settlement: tuple | None = None
 
     # ---------- 轴 A：估计的三个槽位（D-3 的错绑修复） ----------
     def note_estimate(self, est: RoundEstimate | None) -> None:
@@ -175,7 +184,16 @@ class AttributionLedger:
         self._round_estimate = None
 
     def _take_estimate(self, trade: dict) -> RoundEstimate | None:
-        """开仓成交认领估计：**先按 `clOrdId`**（限价跨轮），认领不到再回退轮级槽（市价恒走回退）。"""
+        """优先认领成交保存的冻结估计，再按委托身份、当轮槽回退。"""
+        frozen = trade_meta(trade).get("frozenEstimate")
+        if isinstance(frozen, dict):
+            values = {f.name: frozen[f.name] for f in fields(RoundEstimate)
+                      if f.name in frozen}
+            required = ("est_edge_bps", "est_cost_bps", "edge_source",
+                        "cost_confidence", "decision_confidence", "wake_kind")
+            if all(key in values for key in required):
+                values["facts_hash"] = frozen.get("factsHash", frozen.get("facts_hash"))
+                return RoundEstimate(**values)
         cl_ord_id = trade.get("clOrdId")
         if cl_ord_id and str(cl_ord_id) in self._pending_estimates:
             return self._pending_estimates.pop(str(cl_ord_id))
@@ -184,6 +202,10 @@ class AttributionLedger:
     def note_open(self, trade: dict, *, seq: int, atr_px: float | None = None,
                   now_wall: float = 0.0) -> None:
         """建 / 续开仓断面（同一 `seq` 的第二次调用 = 部分成交 ⇒ **幂等累加**，绝不重置估计）。"""
+        result = self.accounting.record_trade(trade, epoch_id=seq)
+        if result.get("duplicate") or not result.get("opened"):
+            return
+        self._last_settled = None
         if self._open is not None and self._open.seq == int(seq):
             self._open = merge_open_leg(self._open, trade, self.ct_val)
             return
@@ -196,15 +218,23 @@ class AttributionLedger:
         与 `record_close` 分开的理由是**顺序**：`exitSource` 要到 `_inject_explain_meta` 的最后一步
         才写（[P1-1]），而 `record_close` 发生在 `_dispatch` 更早的位置。故结算延后到打标之后。
         """
-        snap, self._open = self._open, None
-        if snap is None:
+        key = accounting_event_key(trade, self.accounting.context.get("runId"))
+        if key != self._settlement_key:
+            self.record_close(trade)
+        if self._pending_settlement is not None:
+            snap, closed = self._pending_settlement
+            self._pending_settlement = None
+            self._last_settled = settle(snap, closed, SettleContext(
+                net_mode=self.net_mode, ct_val=self.ct_val,
+                exit_source=exit_source))
+            if self._last_settled is not None:
+                self._settled.append(self._last_settled)
+        if self._last_settled is None or key != self._settlement_key:
             return {}
-        trip = settle(snap, trade, SettleContext(net_mode=self.net_mode, ct_val=self.ct_val,
-                                                 exit_source=exit_source))
-        if trip is None:
-            return {}
-        self._settled.append(trip)
-        return trip_meta_wire(trip)
+        self._last_settled = replace(self._last_settled, exit_source=exit_source)
+        if self._settled:
+            self._settled[-1] = self._last_settled
+        return trip_meta_wire(self._last_settled)
 
     def settled_trips(self) -> list[SettledTrip]:
         """会话级只读快照（轴 D 的会话段）。"""
@@ -217,7 +247,7 @@ class AttributionLedger:
         `fee_known` / `side` / `entry_ts` / `edge_error_bps`，而那四个正是口径闸、事件表的列与
         「估计偏差型」模板的输入。纯读、无副作用、绝不改 `_settled`。
         """
-        return self._settled[-1] if self._settled else None
+        return self._last_settled
 
     def realized_stats(self) -> dict | None:
         """`aiStats.realized` 加法块；一笔已结算往返都没有 ⇒ `None`（整键缺席，不造空表）。"""
@@ -252,14 +282,25 @@ class AttributionLedger:
         `session.py` 不必自己维护这两个字段——那是业务状态，不该住在已超 800 行红线的会话里。
         `net_mode` 缺省即取构造期读数；显式传值仅供单测直接对拍两种口径。
         """
-        mode = self.net_mode if net_mode is None else bool(net_mode)
-        pnl = _finite(trade.get("pnl"))
-        fee = _finite(trade.get("fee"))
-        gross = pnl + fee if mode else pnl
-        net = pnl if mode else pnl - fee
-        self._close_samples += 1
-        if fee != 0.0:
-            self._close_with_fee += 1
+        self._last_settled = None
+        self._last_close_net = None
+        self._pending_settlement = None
+        self._settlement_key = accounting_event_key(
+            trade, self.accounting.context.get("runId"))
+        result = self.accounting.record_trade(trade)
+        if result.get("duplicate"):
+            return
+        if trade.get("side") == "close":
+            self._close_samples += 1
+            self._close_with_fee += leg_fee_evidence(trade)[0] is not None
+        if not result.get("complete"):
+            return
+        snap, self._open = self._open, None
+        self._last_close_net = result.get("tradingNetUsd")
+        if result.get("coverage") != "complete":
+            return
+        gross, fee, net = (result["grossPnlUsd"], result["feeUsd"],
+                           result["tradingNetUsd"])
         self._lifetime["trips"] += 1
         self._lifetime["gross"] += gross
         self._lifetime["fee"] += fee
@@ -269,9 +310,14 @@ class AttributionLedger:
             ts=int(trade.get("ts") or 0), side=str(trade.get("side") or ""),
             ord_type=str(trade.get("ordType") or "market"),
             gross_pnl_usd=gross, fee_usd=fee, net_pnl_usd=net,
-            notional_usd=(_finite(trade.get("price")) * _finite(trade.get("qty"))
-                          * self.ct_val),
+            notional_usd=result.get("notionalUsd") or 0.0,
             cost_bps=self._last_cost_bps, edge_bps=self._last_edge_bps))
+        if snap is not None:
+            closed = {**trade, "fee": result["closeFeeUsd"],
+                "price": result["exitPrice"],
+                "pnl": net if self.net_mode else gross, "feeKnown": True,
+                "feeBasis": "estimated", "feeCurrency": "USDT"}
+            self._pending_settlement = (snap, closed)
 
     def last_close_net_usd(self) -> float | None:
         """最近一笔平仓成交的**净额**盈亏（`record_close` 那一份），一笔都没有 ⇒ `None`。
@@ -283,7 +329,30 @@ class AttributionLedger:
 
         纯读、无副作用、绝不改 `_trips`。
         """
-        return self._trips[-1].net_pnl_usd if self._trips else None
+        return self._last_close_net
+
+    def restore_accounting(self, trades: list[dict], context: dict) -> dict:
+        """从完整成交重建基础归因和剩余费池；不发事件或学习输出。"""
+        capacity = self._trips.maxlen
+        self.__init__(capacity, net_mode=context.get("costBasis") == "net",
+                      ct_val=context.get("ctVal") or self.ct_val)
+        self.accounting.context = dict(context)
+        self.accounting._legacy = context.get("costBasis") not in ("net", "gross")
+        ordered = sorted(trades, key=lambda row: row.get("id", 0) or 0)
+        seq = 0
+        for trade in ordered:
+            if trade.get("side") in ("long", "short"):
+                meta = trade_meta(trade)
+                self.note_open(trade, seq=seq, now_wall=meta.get("wallTs") or 0)
+            else:
+                self.record_close(trade)
+                # 与 session._dispatch 同源：首仓为 0，每次平仓推进序号。
+                if (trade.get("side") == "close"
+                        and not self.accounting.last_result.get("duplicate")):
+                    seq += 1
+        self._last_settled = None
+        self._last_close_net = None
+        return self.accounting.snapshot()
 
     def note_gate(self, status: str, *, cost_bps: float | None = None,
                   edge_bps: float | None = None) -> None:
@@ -309,8 +378,7 @@ class AttributionLedger:
         gates = sum(self._gate.values())
         return {
             "cost": {
-                # RV-13：分母是**平仓**成交样本数（开仓腿也记费，但 G1 的阻断判据说的是
-                # 「每笔平仓成交都带非零费率」，键名必须自证是哪一个分母）。
+                # 分母是去重后的平仓腿数；已知零费和返佣均算覆盖。
                 "closeFeeCoverage": (round(self._close_with_fee / self._close_samples,
                                            _ROUND_RATIO) if self._close_samples else None),
                 "roundTrips": len(trips),

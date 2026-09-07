@@ -13,13 +13,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import asdict, replace
 
 from ..live_auto.fee_ledger import explain_meta_fields
 from ..okx.rest_client import get_rest_client
 from ..okx.trading import fetch_position_history, fetch_trade_fee_ex
 from .attribution import AttributionLedger
-from .cost_model import (CostBreakdown, estimate_round_trip_cost, query_for_decision,
-                        query_for_preview, resolve_cost_params)
+from .cost_model import (CostBreakdown, RoundCostSnapshot, estimate_round_trip_cost,
+                        query_for_decision, query_for_preview, resolve_cost_params)
 from .cost_text import format_cost_charter
 from .cost_view import build_cost_view, funding_accrued_view
 from .edge_gate import EdgeGateOutcome, evaluate_edge_gate
@@ -27,10 +28,11 @@ from .fee_rates import FeeRateCache, attempt_from_wire, snapshot_from_wire
 from .funding import FundingCache
 from .funding_ledger import FundingLedger
 from ..live_auto.settlement import coverage_wire
-from .reconcile import (build_reconciliation, drift_message, local_net_view,
+from .reconcile import (build_reconciliation, drift_message,
                         resolve_reconcile_params)
 from .stats_ext import build_cost_stats, cost_snapshot_wire, merge_cost_stats
 from .trip_ledger import build_round_estimate
+from .trade_economics import finite
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +116,104 @@ class CostRuntime:
         # `snapshot_if_due()` 只在门禁空转时搭 `status` 事件——只并入其中一条，运维按 runbook 去
         # 另一条里找 `priorCoverage` 会永远找不到（P1-3）。
         self._prior_view: dict | None = None
+        self._round_cost: RoundCostSnapshot | None = None
+        self._funding_closed_epochs: set = set()
+        self._accounting_restored = False
+
+    def begin_round_cost(self, inputs: dict | None = None) -> RoundCostSnapshot:
+        """冻结本轮费率、资金费及执行假设，异步刷新只影响下一轮。"""
+        inputs = inputs or {}
+        now = inputs.get("asOfTs") or time.time()
+        fee = self.fee_rates.snapshot()
+        funding = self.funding.snapshot(now)
+        params = self._current_cost_params()
+        spread = inputs.get("half_spread_bps")
+        if spread is not None:
+            params = replace(params, half_spread_fallback_bps=float(spread))
+        source = getattr(fee, "source", getattr(self.fee_ledger, "rate_source", "config"))
+        params = replace(params, fee_source=source)
+        stale = bool((self.fee_rates.wire(now, self.settings) or {}).get("stale"))
+        self._round_cost = RoundCostSnapshot(params, now, source, stale,
+            spread_bps=params.half_spread_fallback_bps,
+            impact_bps=params.impact_bps,
+            funding_bps=funding.rate * 1e4 if funding else None,
+            funding=funding, fee_snapshot=fee,
+            funding_enabled=bool(self.settings.ai_trade_funding_enabled))
+        return self._round_cost
+
+    def round_cost_wire(self) -> dict | None:
+        """冻结费用断面的可序列化 wire。"""
+        snap = self._round_cost
+        if snap is None:
+            return None
+        return {"modelVersion": 2, "params": asdict(snap.params),
+                "asOfTs": snap.as_of_ts, "feeSource": snap.fee_source,
+                "stale": snap.stale, "spreadBps": snap.spread_bps,
+                "impactBps": snap.impact_bps, "fundingBps": snap.funding_bps,
+                "liquidityAssumption": snap.liquidity_assumption}
+
+    def pre_submit_context_changed(self) -> bool:
+        """执行前识别费用参数变化或断面过期，不改已发送模型事实。"""
+        snap = self._round_cost
+        if snap is None:
+            return False
+        current = self._current_cost_params()
+        if snap.spread_bps is not None:
+            current = replace(current, half_spread_fallback_bps=snap.spread_bps)
+        fee = self.fee_rates.snapshot()
+        current = replace(current, fee_source=getattr(fee, "source",
+            getattr(self.fee_ledger, "rate_source", "config")))
+        stale = bool((self.fee_rates.wire(time.time(), self.settings) or {}).get("stale"))
+        funding_changed = self._funding_terms_changed(snap)
+        return current != snap.params or (stale and not snap.stale) or funding_changed
+
+    def _funding_terms_changed(self, snap: RoundCostSnapshot) -> bool:
+        if not snap.funding_enabled:
+            return False
+        current = self.funding.snapshot(time.time())
+        frozen = snap.funding
+        if current is None or frozen is None:
+            return current != frozen
+        # 仅刷新抓取时间不改变成本；费率、周期和覆盖变化需要复检。
+        return any(getattr(current, key) != getattr(frozen, key) for key in
+                   ("rate", "funding_ts", "next_funding_ts",
+                    "interval_s", "interval_known"))
+
+    def _round_funding(self):
+        return self._round_cost.funding if self._round_cost else self.funding.snapshot(time.time())
+
+    @property
+    def remaining_open_fee_usd(self) -> float | None:
+        """当前剩余开仓费；供恢复 executor 读取，未知值保持 None。"""
+        return self.attribution.accounting.remaining_open_fee_usd
+
+    def restore_accounting(self, trades: list[dict], context: dict) -> dict:
+        """武装前从完整 DB 成交恢复同 run 基础账；不触发持久化或学习。"""
+        context = {"ctVal": getattr(self.fee_ledger, "ct_val", 0), **context}
+        self._accounting_restored = bool(trades)
+        self._funding_closed_epochs.clear()
+        result = self.attribution.restore_accounting(trades, context)
+        if self.fee_ledger is not None:
+            self.fee_ledger.restore_accounting(result["sessionFeeUsd"])
+        return result
+
+    def economics_snapshot(self) -> dict:
+        """全 run 交易净额与同已平集合资金费，保持未知覆盖。"""
+        ledger = self.funding_ledger
+        epoch = ledger.epoch
+        trips = self.attribution.accounting.completed_trips
+        wanted = {t["epochId"] for t in trips}
+        trusted = bool(not self._accounting_restored and ledger.enabled
+            and not (ledger.stale_ticks or ledger.unknown_interval_ticks or ledger.cap_hits))
+        complete = bool(trusted and wanted and wanted == self._funding_closed_epochs)
+        rec = self.last_reconcile or {}
+        return self.attribution.accounting.snapshot({**rec,
+            "asOfTs": time.time(), "scope": "run", "basis": "local_estimate",
+            "fundingCostUsd": ledger.closed_accrued_usd if complete else None,
+            "fundingCoverage": "complete" if complete else "unavailable",
+            "fundingBasis": "accrued" if complete else "unknown",
+            "openFundingAccruedUsd": epoch.accrued_usd
+            if trusted and epoch and epoch.settled_through_ts and not epoch.cap_hits else None})
 
     # ---------- 盯市 tick（唯一的网络 IO 落点；决策轮内零 IO）----------
     def schedule_maintenance(self, now_wall: float, *, window_start_ts: int,
@@ -207,7 +307,7 @@ class CostRuntime:
         out = evaluate_edge_gate(
             decision, settings=self.settings, last_px=last_px, atr_px=atr_px,
             take_profit_pct=take_profit_pct, bar_seconds=bar_seconds,
-            funding=self.funding.snapshot(time.time()), params=self._cost_params(),
+            funding=self._round_funding(), params=self._cost_params(),
             prior_ev_bps=prior_ev_bps, prior_binding=prior_binding,
         )
         if out is not None:
@@ -234,7 +334,7 @@ class CostRuntime:
         """
         cost = estimate_round_trip_cost(
             query_for_decision(decision, bar_seconds=bar_seconds,
-                               funding=self.funding.snapshot(time.time()),
+                               funding=self._round_funding(),
                                funding_enabled=self.settings.ai_trade_funding_enabled),
             self._cost_params())
         return cost.total_bps
@@ -270,6 +370,11 @@ class CostRuntime:
 
     # ---------- 轴 A：官方费率真源（记账链与决策链的同一份数）----------
     def _cost_params(self):
+        if self._round_cost is not None:
+            return self._round_cost.params
+        return self._current_cost_params()
+
+    def _current_cost_params(self):
         """决策链的成本常数：官方档位可用即覆盖 maker/taker，否则与账本读同一对配置常数。
 
         **A-6 单一真源约束的落点**：`FeeLedger.params`（决定 `trade["fee"]` 与净额扣减）与本函数
@@ -327,7 +432,7 @@ class CostRuntime:
         try:
             return estimate_round_trip_cost(
                 query_for_preview(ord_type=ord_type, side=side, bar_seconds=bar_seconds,
-                                  funding=self.funding.snapshot(time.time()),
+                                  funding=self._round_funding(),
                                   funding_enabled=self.settings.ai_trade_funding_enabled),
                 self._cost_params())
         except Exception as exc:  # noqa: BLE001 —— 成本预览是软引导，绝不打断决策轮
@@ -364,12 +469,19 @@ class CostRuntime:
         cost = self.estimate_preview_cost(ord_type=ord_type, side=side, bar_seconds=bar_seconds)
         if cost is None:
             return None
-        view = build_cost_view(
-            cost, fee_snapshot=self.fee_rates.snapshot(), ord_type=ord_type, side=side,
-            position=position, last_px=last_px, atr_px=atr_px,
-            session_fee_usd=(self.fee_ledger.session_fee_usd
-                             if self.fee_ledger is not None else None),
-            net_basis=bool(self.settings.ai_trade_net_pnl_enabled))
+        accounting = self.attribution.accounting
+        economics = self.economics_snapshot()
+        enriched = None if position is None else {**position,
+            "openFeeUsd": accounting.remaining_open_fee_usd,
+            "qtyCoin": accounting.remaining_qty * self.attribution.ct_val,
+            "fundingAccruedUsd": economics["openFundingAccruedUsd"],
+            "closeFeeRate": cost.fee_close_bps / 1e4}
+        view = build_cost_view(cost,
+            fee_snapshot=self._round_cost.fee_snapshot if self._round_cost else self.fee_rates.snapshot(),
+            ord_type=ord_type, side=side, position=enriched,
+            last_px=last_px, atr_px=atr_px,
+            session_fee_usd=accounting.session_fee_usd,
+            net_basis=self.attribution.net_mode)
         # 轴 A 披露（§2.2.5）：未装配 / 空仓 / 账本关 ⇒ **整键缺席** ⇒ prompt 整段省略、逐字节回退。
         accrued = funding_accrued_view(self.funding_stats(), position)
         if accrued is not None:
@@ -442,7 +554,9 @@ class CostRuntime:
         取数失败 / 超时 ⇒ 按**空样本**建对账（`status="unavailable"`）而不是不落读数——「这一轮没
         对上账」与「这一轮没能去对账」都必须在看板上留痕，静默跳过会让上一轮的旧读数冒充新鲜。
         """
-        view = local_net_view(trades, net_mode=bool(self.settings.ai_trade_net_pnl_enabled))
+        economics = self.economics_snapshot()
+        view = {"netUsd": economics["tradingNetUsd"],
+                "trips": economics["roundTripCount"]}
         try:
             fetch = self._fetch_position_history()
             rows = (await asyncio.wait_for(
@@ -455,7 +569,8 @@ class CostRuntime:
             local_net_usd=view["netUsd"], local_trips=view["trips"], rows=rows,
             window_start_ts=window_start_ts, params=resolve_reconcile_params(self.settings),
             final=final, inst_id=self.inst_id, settlement=self._settlement_coverage,
-            capital_usd=self._capital_usd)
+            capital_usd=self._capital_usd,
+            comparison_coverage=self.attribution.accounting.context.get("comparisonCoverage"))
 
     def _drift_event(self, rec: dict, final: bool) -> dict | None:
         """连续 drift 达阈推一条 error 事件；**终态对账不推进连击、不推事件**（P1-5）。"""
@@ -495,13 +610,24 @@ class CostRuntime:
         `atr_px` 为 realized-edge-calibration 轴 A 新增（开仓那一刻的确认根 ATR，用于 `stopAtrMult`）；
         留空即不产出该读数，既有调用点零改动。
         """
-        self.funding_ledger.note_open(trade, seq=seq, now_wall=now_wall)
         self.attribution.note_open(trade, seq=seq, atr_px=atr_px, now_wall=now_wall)
+        result = self.attribution.accounting.last_result or {}
+        if not result.get("duplicate") and result.get("opened"):
+            self.funding_ledger.note_open(trade, seq=seq, now_wall=now_wall)
 
     def record_close(self, trade: dict) -> None:
         """记一笔平仓成交（`session._dispatch` 是全部 executor 事件的唯一收口）。"""
         self.attribution.record_close(trade)
-        self.funding_ledger.note_close(trade, time.time())
+        result = self.attribution.accounting.last_result or {}
+        if result.get("complete") and not result.get("duplicate"):
+            now = finite(trade.get("wallTs")) or time.time()
+            # 最后一次盯市与平仓之间仍可能跨结算点，结转前补齐此区间。
+            self.funding_ledger.accrue(self.funding.snapshot(now),
+                now_wall=now, mark_px=finite(trade.get("price")))
+            epoch = self.funding_ledger.epoch
+            if epoch and epoch.settled_through_ts and not epoch.cap_hits:
+                self._funding_closed_epochs.add(result["epochId"])
+            self.funding_ledger.note_close(trade, now)
 
     def last_close_net_usd(self) -> float | None:
         """最近一笔平仓成交的净额盈亏（薄转发；口径与账本同源，绝不另算）。"""
@@ -509,13 +635,17 @@ class CostRuntime:
 
     # ---------- 轴 A（realized-edge-calibration）：四个薄转发 ----------
     def note_estimate(self, out, decision, wake_kind: str | None) -> None:
-        """冻结本轮门禁估计（轮级）；总闸关 ⇒ 空转 ⇒ `explain.meta` 逐字回退。
+        """冻结待成交订单的本轮估计，独立于可选解释输出开关。"""
+        estimate = build_round_estimate(out, decision, wake_kind)
+        if estimate is not None and self._round_cost is not None:
+            estimate = replace(estimate, as_of_ts=self._round_cost.as_of_ts,
+                               model_version=self._round_cost.model_version)
+        self.attribution.note_estimate(estimate)
 
-        估计的**装配**在 `trip_ledger.build_round_estimate`（模块级纯函数），故 `session.py` 里
-        既不拼 dict 也不必 import 那个函数——它的净增预算是硬验收判据。
-        """
-        if self.settings.ai_trade_trip_ledger_enabled:
-            self.attribution.note_estimate(build_round_estimate(out, decision, wake_kind))
+    def pending_estimate(self) -> dict | None:
+        """返回本轮冻结预测，供订单持久化后跨轮/冷恢复认领。"""
+        estimate = self.attribution._round_estimate
+        return asdict(estimate) if estimate is not None else None
 
     def note_settlement(self, executor) -> None:
         """从执行器抄一份结算覆盖计数与本金（轴 A/F 的**唯一**取数点，同步、零 IO）。
@@ -597,13 +727,13 @@ class CostRuntime:
         rec = self.last_reconcile
         if not rec:
             return None, "not_run"
-        if rec.get("status") not in ("ok", "drift", "partial") or rec.get("coverageMismatch"):
+        if not (rec.get("comparisonCoverage") or {}).get("comparable"):
             return None, "untrusted"
         # `_fetch_position_history` 取 limit=100 且**无分页**：样本触顶即视为可能被截断，绝不拿
         # 一份被截断的合计当权威值（P2-6）。
         if int(rec.get("samples") or 0) >= 100:
             return None, "truncated"
-        funding = rec.get("exchangeFundingFeeUsd")
+        funding = rec.get("exchangeFundingCostUsd")
         return (None, "untrusted") if funding is None else (float(funding), None)
 
     def lifetime_cost(self) -> dict:
@@ -611,7 +741,7 @@ class CostRuntime:
         return self.attribution.lifetime_cost()
 
     def apply_explain_meta(self, meta: dict, trade: dict) -> None:
-        """把成交的费率 / 滑点键搬进 `explain.meta`；A0-1 关闭 ⇒ 空转 ⇒ meta 逐字回退。"""
+        """持久化成交费用来源；关闭记账时仍明确标未知。"""
         for key, value in explain_meta_fields(trade).items():
             meta.setdefault(key, value)
 

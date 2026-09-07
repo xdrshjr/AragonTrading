@@ -65,8 +65,11 @@ def test_rebate_tier_is_clamped_to_zero_on_both_chains():
     runtime = CostRuntime(_INST, Settings(), ledger)
     assert ledger.params.maker_fee_bps == 0.0                 # 记账链
     assert runtime._cost_params().maker_fee_bps == 0.0        # 决策链
-    # 负费用会让净额**高于**毛额，这是全 spec 唯一能凭空抬高盈亏的口子——必须堵死。
-    assert ledger.leg_fee(sz=1.0, px=30_000.0, ord_type="limit") == 0.0
+    # 普通 limit 可吃单，事前采用 taker；maker 返佣档位不构成该订单的实际费用证据。
+    assert ledger.leg_fee(sz=1.0, px=30_000.0, ord_type="limit") == pytest.approx(0.12)
+    measured = ledger.on_trade(cl_ord_id="rebate-fill", side="long", sz=1, px=30_000,
+        ord_type="limit", expected_px=None, override_fee_usd=-0.003)
+    assert measured["fee"] == -0.003 and measured["feeBasis"] == "measured"
 
 
 # ---------- 用例 3：G-4 单一真源（两条链同为交易所值 / 同为配置常数）----------
@@ -173,6 +176,8 @@ async def test_fee_rate_fallback_is_announced_once_and_carries_the_actual_consta
         raise RuntimeError("permission denied")
 
     runtime._fetch_fee_rate = boom
+    runtime.refresh_funding = _no_funding
+    runtime._fetch_position_history = _no_position_history
     await runtime._maintenance_round(_WALL, 0, [], push)
     await runtime._maintenance_round(_WALL + 10_000.0, 0, [], push)
 
@@ -195,6 +200,7 @@ async def test_no_fallback_notice_when_the_official_rates_are_available():
         return _normalize_trade_fee(_raw(), _INST)
 
     runtime._fetch_fee_rate = ok
+    runtime.refresh_funding = _no_funding
     runtime._fetch_position_history = _no_position_history
     await runtime._maintenance_round(_WALL, 0, [], push)
     assert not [e for e in pushed if "官方费率档位" in (e["data"].get("message") or "")]
@@ -203,3 +209,8 @@ async def test_no_fallback_notice_when_the_official_rates_are_available():
 
 async def _no_position_history() -> list[dict]:
     return []
+
+
+async def _no_funding(_now_wall) -> bool:
+    """费率告知场景不访问公共资金费端点，避免异步传输跨测试循环残留。"""
+    return False

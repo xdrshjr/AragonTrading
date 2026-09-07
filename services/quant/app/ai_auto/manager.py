@@ -393,6 +393,7 @@ class _GroupBuildCtx:
 _LIVENESS_DRAIN_TIMEOUT_S = 5.0
 
 
+
 class AiTradeManager:
     """进程内单活跃 AI 分组注册表（真实资金，一次至多一个 group，含 1..N 个标的会话）。"""
 
@@ -444,6 +445,11 @@ class AiTradeManager:
             group = await self._build_group(req, creds, provider, plans, total, lever)
             await self._probe_tradability(group, req)   # 轴 A：启动断面（只提示、绝不阻断启动）
             self._group = group
+            try:
+                await self._persist_group_state(group, status=pause_core.STATUS_RUNNING)
+            except Exception:
+                self._clear_group_if_current(group)
+                raise
             launched = await self._launch_group_or_rollback(group)
             # W1（pause-resume §3.4.2 / [P1-5]）：契约在**启动成功之后**立刻落盘，此后任何时刻断电
             # 都可续跑。刻意不在 `_launch_group_or_rollback` **之前**写——启动失败回滚会把全部成员
@@ -762,6 +768,9 @@ class AiTradeManager:
             # 落点；`on_stopped` 是 W5——会话**自终止**（暂停期止盈止损 / stale_feed / 启动回滚 /
             # stop_member）之后把状态表收敛，否则磁盘上会留一张指向已平仓会话的续跑卡。
             member.session.group_id = group.group_id
+            install = getattr(member.session, "install_integrity", None)
+            if callable(install):
+                install()
             member.session.on_stopped = partial(self._note_session_stopped, group)
             # ★ 轴 D：活性看门狗判到 `halt` 时的**同步**投递口（与 `on_stopped` 同款接线）。
             member.session.on_liveness_halt = partial(self._request_liveness_pause, group)
@@ -964,7 +973,7 @@ class AiTradeManager:
             flat = await self._stop_session(member.session, reason)
             rows.append({"instId": member.inst_id, "sessionId": member.session.session_id,
                          "runId": member.run_id, "flattened": flat})
-        self._group = None
+        self._clear_group_if_current(group)
         self._forget_paused_ref(group_id)   # I-2：`_group` 与 `_paused_ref` 永不同时非空
         self._unwire_intel(group_id)        # **同步**：只 cancel、不 await（G-8 的时延门禁）
         return {"groupId": group_id, "stopReason": reason, "members": rows}
@@ -990,7 +999,7 @@ class AiTradeManager:
             return None
         flat = await self._stop_session(member.session, reason)
         if not any(m.session.is_active for m in group.members):
-            self._group = None
+            self._clear_group_if_current(group)
             self._forget_paused_ref(group_id)
         return {"groupId": group_id, "instId": inst_id, "flattened": flat}
 
@@ -1092,6 +1101,10 @@ class AiTradeManager:
         契约的话，用户照着 409 里那句「请重新启动一个新的分组」去点，会被容量闸拿
         `AI_TRADE_PAUSED_GROUP_EXISTS` 挡回来 —— 一句给不出出路的错误提示，比不给提示更坏。
         """
+        if self._has_pending_trade_persistence(group):
+            raise AiTradePreflightError(
+                "AI_TRADE_PERSIST_PENDING",
+                "原始成交仍待保存，请重试停止以完成持久化", 409)
         if not self._lifecycle_truth_enabled(group):
             return
         states = [m.session.state for m in group.members]
@@ -1242,6 +1255,7 @@ class AiTradeManager:
         state_row = await self._load_state_row(group_id)
         group = self._group if (self._group is not None
                                 and self._group.group_id == group_id) else None
+        self._require_persistence_complete(group)
         ref = self._paused_ref if (self._paused_ref is not None
                                    and self._paused_ref.group_id == group_id) else None
         if group is None and ref is None and state_row is None:
@@ -1264,7 +1278,8 @@ class AiTradeManager:
                     residual.append({"instId": member.inst_id, "position": flat.get("residual"),
                                      "positionUnknown": flat.get("residual") is None,
                                      "backstop": None})
-            self._group = None
+            self._require_persistence_complete(group)
+            self._clear_group_if_current(group)
         else:
             # 冷路径：进程里没有会话、没有 executor、没有装配好的凭证，**没有任何东西能代用户下
             # 平仓单**。此时若照 `flatten=True` 归档，回执会说「已平仓、无孤儿持仓」而交易所上那笔
@@ -1525,15 +1540,13 @@ class AiTradeManager:
         `stop("start_failed")`、`stop_member`。没有它，`strategy_runs` 已 `stopped` 而状态表仍
         `paused` ⇒ 磁盘上留一张指向已平仓会话的续跑卡。
         """
+        if self._has_pending_trade_persistence(group):
+            return
         sm = get_sessionmaker()
         if any(m.session.is_active for m in group.members):
             async with sm() as s:
-                row = await state_repo.load_group_state(s, group.group_id)
-                if row is None:
-                    return
-                rest = [m for m in row["members"]
-                        if str(m.get("instId") or "") != session.inst_id]
-                await state_repo.patch_group_state(s, group.group_id, {"members": rest})
+                await state_repo.remove_member_state(
+                    s, group.group_id, session.inst_id, session.run_id)
             return
         await self._mark_state_ended(group.group_id)
         self._forget_paused_ref(group.group_id)
@@ -1555,8 +1568,25 @@ class AiTradeManager:
         判据用 `group_id` 而不是 `is`：冷续跑会重建分组对象，同一个 `group_id` 的新对象在语义上
         就是它自己。
         """
+        if self._has_pending_trade_persistence(group):
+            return
         if self._group is not None and self._group.group_id == group.group_id:
             self._group = None
+
+    @staticmethod
+    def _has_pending_trade_persistence(group: AiTradeGroup | None) -> bool:
+        """数据库也不可写时，内存原始成交仍须保留原会话供停止重试。"""
+        from .trade_persistence import session_has_pending_persistence
+        return group is not None and any(
+            session_has_pending_persistence(member.session)
+            for member in group.members)
+
+    def _require_persistence_complete(self, group: AiTradeGroup | None) -> None:
+        """归档不能丢弃已发生的成交，先保留原会话供停止重试。"""
+        if self._has_pending_trade_persistence(group):
+            raise AiTradePreflightError(
+                "AI_TRADE_PERSIST_PENDING",
+                "原始成交仍待保存，请重试停止以完成持久化", 409)
 
     @staticmethod
     async def _mark_state_ended(group_id: str) -> None:
@@ -2144,9 +2174,18 @@ class AiTradeManager:
         整轴总闸 `ai_trade_pause_enabled=False` 时**整条新闸不参与**（含它 fail-closed 的那个
         409）——一键回滚必须回滚到本轮之前的**完整**行为，不能留一个只在本轮才可能出现的新失败态。
         """
+        if self._has_pending_trade_persistence(self._group):
+            raise AiTradeSessionLimitError(
+                "AI_TRADE_PERSIST_PENDING",
+                "原分组仍有未保存的成交，请先重试停止完成持久化", 409)
         if settings is None:
             from ..config import get_settings
             settings = get_settings()
+        async with get_sessionmaker()() as db:
+            unresolved = await state_repo.load_pending_groups(db)
+        if unresolved:
+            raise AiTradeSessionLimitError(
+                "acceptance_unknown", "仍有待核实的开仓委托，暂不启动新分组", 409)
         if settings.ai_trade_pause_enabled:
             await self._require_no_paused_group()
         group = self._group
@@ -2344,6 +2383,7 @@ class AiTradeManager:
                         # trades.pnl 是净额还是毛额；缺键的老 run 走 legacy 推定 + costBasisAssumed。
                         "costBasis": ("net" if req.settings.ai_trade_net_pnl_enabled
                                       else "gross"),
+                        "accountingVersion": 2, "costModelVersion": 2,
                         "feeRates": plan.fee_rates_wire},
                 status="running",
                 # ai-trade-stats-dashboard §3.2：填既有 group_* 列（零迁移），使 ai-trade run 可按组聚合

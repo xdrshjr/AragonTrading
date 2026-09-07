@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-import inspect
+from types import SimpleNamespace
 
 import pytest
 
@@ -29,12 +29,16 @@ def _ledger() -> AttributionLedger:
 
 def _open(**over) -> dict:
     row = {"price": 100.0, "qty": 10.0, "fee": 0.02, "ts": 100, "side": "long",
-           "stopLossPrice": 95.0, "takeProfitPrice": 110.0}
+           "stopLossPrice": 95.0, "takeProfitPrice": 110.0,
+           "feeKnown": True, "feeBasis": "measured", "positionAfter": 10}
     row.update(over)
+    row["id"] = row["ts"]
     return row
 
 
-_CLOSE = {"price": 101.0, "qty": 10.0, "fee": 0.02, "pnl": 0.1, "ts": 200, "side": "close"}
+_CLOSE = {"id": 200, "price": 101.0, "qty": 10.0, "fee": 0.02, "pnl": 0.1,
+          "ts": 200, "side": "close", "positionAfter": 0,
+          "feeKnown": True, "feeBasis": "measured"}
 
 
 def test_g3_a_vetoed_intent_after_the_open_never_rebinds_the_estimate():
@@ -124,17 +128,30 @@ def test_exit_source_is_read_not_judged():
 
 
 def test_apply_trip_meta_is_wired_after_the_exit_source_stamp():
-    """[P1-1] 的顺序硬约束：`apply_trip_meta` 必须排在既有 `exitSource` 打标**之后**。
+    """调用真实装配方法，验证结算看到已标出的退出来源且最终持久化该结果。"""
+    calls = []
+    session = object.__new__(AiTradeSession)
+    session.inst_id, session.bar = "BTC-USDT-SWAP", "15m"
+    session._wake = SimpleNamespace(last_round_kind=None)
+    session._pending_horizon_meta = None
+    session.executor = SimpleNamespace(settings=SimpleNamespace(
+        ai_trade_exit_attribution_enabled=True), take_settlement_meta=lambda: None)
 
-    它读的就是那个键（本层只读不判），排在前面会让每一笔往返的 `exitSource` 恒为 `"unknown"`
-    ——一个不会报错、只会让轴 B 的 `byExitSource` 切片整列作废的缺陷。source 断言是这条顺序
-    在用例层唯一守得住的形式（真实会话跑一轮要拉起 WS 与决策器）。
-    """
-    source = inspect.getsource(AiTradeSession._inject_explain_meta)
-    stamp = source.index('meta.setdefault("exitSource"')
-    apply = source.index("self._cost.apply_trip_meta(meta, trade)")
-    assert stamp < apply
-    assert apply < source.index('explain["meta"] = meta')
+    def stamp(_explain):
+        calls.append("stamp")
+        return "agent"
+
+    def enrich(meta, _trade):
+        calls.append("settle")
+        assert meta["exitSource"] == "agent"
+        meta["roundTripFeeUsd"] = .04
+
+    session._consume_exit_source = stamp
+    session._cost = SimpleNamespace(apply_explain_meta=lambda *_: None, apply_trip_meta=enrich)
+    trade = {**_CLOSE, "explain": {"kind": "atomic"}}
+    session._inject_explain_meta(trade)
+    assert calls == ["stamp", "settle"]
+    assert trade["explain"]["meta"]["roundTripFeeUsd"] == .04
 
 
 @pytest.mark.parametrize("enabled", [True, False])
@@ -150,7 +167,10 @@ def test_cost_runtime_trip_ledger_switch_gates_the_meta_enrichment(enabled: bool
         TradeDecision(action="open_long", size_fraction=0.3, confidence=0.62, reason="x"),
         "candle")
     runtime.note_open(_open(), seq=1, now_wall=1.0, atr_px=0.5)
+    runtime.record_close(_CLOSE)
     meta: dict = {"exitSource": "agent"}
     runtime.apply_trip_meta(meta, _CLOSE)
     assert ("rMultiple" in meta) is enabled
     assert meta["exitSource"] == "agent"          # 本层只读，绝不改写既有键
+    assert runtime.remaining_open_fee_usd == 0
+    assert runtime.economics_snapshot()["roundTripCount"] == 1

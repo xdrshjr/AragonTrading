@@ -392,10 +392,11 @@ def test_capture_ratio_denominator_is_revalued_at_final_average_price():
 
 # ============ 成本口径聚合（ai-trade-cost-truth-and-net-pnl §3.2 B-4 / B-5，G-6 / G-14）============
 class _CostTrade:
-    """成交行替身：只带聚合层真正读的四个属性（side / pnl / fee / id）。"""
+    """包含可信增量数量的成交行替身，费用来源仍按各代原始数据。"""
 
-    def __init__(self, side, *, pnl=0.0, fee=0.0, peak_pnl=None, tid=0):
+    def __init__(self, side, *, pnl=0.0, fee=0.0, peak_pnl=None, tid=0, qty=1):
         self.side, self.pnl, self.fee, self.peak_pnl, self.id = side, pnl, fee, peak_pnl, tid
+        self.qty, self.price = qty, 100.0
 
 
 def _round_trip_rows(*, fee: float, pnl: float, peak: float | None = None) -> list:
@@ -408,9 +409,9 @@ def test_leg_fees_are_summed_across_partially_filled_open_legs():
     """B-5：部分成交产生多条开仓腿，配对只留最后一条 ⇒ 按「配对那条腿的 fee」计会漏记先前分批。"""
     from app.db.ai_auto_repositories import _pair_round_trips
 
-    trades = [_CostTrade("long", fee=1.0, tid=1),      # 3 张
-              _CostTrade("long", fee=2.0, tid=2),      # 再 7 张（覆盖上一条开仓腿）
-              _CostTrade("close", pnl=10.0, fee=3.0, tid=3)]
+    trades = [_CostTrade("long", fee=1.0, tid=1, qty=3),
+              _CostTrade("long", fee=2.0, tid=2, qty=7),
+              _CostTrade("close", pnl=10.0, fee=3.0, tid=3, qty=10)]
     trips = _pair_round_trips(trades, "gross")
 
     assert len(trips) == 1

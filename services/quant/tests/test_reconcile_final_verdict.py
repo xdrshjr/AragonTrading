@@ -137,6 +137,7 @@ def test_booking_the_exchange_settlement_makes_the_final_difference_converge():
     # ① 今天：外部平仓按侦测那一刻的 mark_px 合成（生产实测 run 1627 就是这个数）
     today = [{"side": "long", "pnl": 0.0, "fee": 0.10},
              {"side": "close", "pnl": -0.871, "fee": 0.10}]
+    _complete_legs(today)
     view_today = local_net_view(today, net_mode=True)
     rec_today = build_reconciliation(
         local_net_usd=view_today["netUsd"], local_trips=view_today["trips"], rows=[exchange],
@@ -147,6 +148,7 @@ def test_booking_the_exchange_settlement_makes_the_final_difference_converge():
     # ② 本轮：价格取 closeAvgPx、pnl 取交易所毛额减往返总费、fee 取残差
     fixed = [{"side": "long", "pnl": 0.0, "fee": 0.10},
              {"side": "close", "pnl": -4.56 - 0.496, "fee": 0.496 - 0.10}]
+    _complete_legs(fixed)
     view_fixed = local_net_view(fixed, net_mode=True)
     rec_fixed = build_reconciliation(
         local_net_usd=view_fixed["netUsd"], local_trips=view_fixed["trips"], rows=[exchange],
@@ -155,3 +157,10 @@ def test_booking_the_exchange_settlement_makes_the_final_difference_converge():
     assert abs(rec_fixed["diffUsd"]) <= rec_fixed["tolUsd"]
     assert rec_fixed["status"] == "ok"
     assert rec_fixed["settlementCoverage"]["ratio"] == 1.0
+
+
+def _complete_legs(rows):
+    """补齐原对账场景的实际成交数量和费用证据，金额保持原样。"""
+    for number, row in enumerate(rows, 1):
+        row.update(id=number, qty=1, price=100, feeKnown=True, feeBasis="measured",
+                   positionAfter=1 if row["side"] == "long" else 0)

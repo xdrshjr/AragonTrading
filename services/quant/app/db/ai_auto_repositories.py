@@ -18,11 +18,15 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_settings
+from ..ai_auto.accounting_replay import TradeAccountingAccumulator
+from ..ai_auto.trade_economics import (TripPnlInputs, merge_economics_snapshots,
+                                      resolve_trip_economics)
 from .models import StrategyRun, Trade
 
 _AI_TRADE_MODE = "ai-trade"
@@ -57,56 +61,78 @@ class _Trip:
     exit: Trade
     leg_fee_usd: float      # Σ 上一笔平仓之后至本笔平仓（含）的**全部**腿 fee
     cost_basis: str         # 所属 run 的 costBasis（"net" | "gross"）
+    economics: dict | None = None
 
     @property
     def net_pnl(self) -> float:
         """净额（已扣双边手续费）：`"gross"` 的 run 按 `pnl − legFee` 还原。"""
-        pnl = self.exit.pnl or 0.0
-        return pnl if self.cost_basis == "net" else pnl - self.leg_fee_usd
+        resolved = resolve_trip_economics(TripPnlInputs(
+            self.cost_basis, self.exit.pnl, self.leg_fee_usd, 0.0))
+        return _num(resolved.trading_net_usd)
 
     @property
     def gross_pnl(self) -> float:
         """毛额还原（净额行加回腿费）——捕获率分子必须与毛额分母同口径（P1-3）。"""
-        pnl = self.exit.pnl or 0.0
-        return pnl + self.leg_fee_usd if self.cost_basis == "net" else pnl
+        resolved = resolve_trip_economics(TripPnlInputs(
+            self.cost_basis, self.exit.pnl, self.leg_fee_usd, 0.0))
+        return _num(resolved.gross_pnl_usd)
 
 
 def _pair_round_trips(trades: list[Trade], cost_basis: str = "gross") -> list[_Trip]:
-    """逐字移植前端 buildPairedTrails：按**因果序**（id 升序 = 落库序）单持仓 open→close 配对。
+    """按数据库 id 复用增量归并器；派生均价与数量不回写原始腿。"""
+    accumulator = TradeAccountingAccumulator({"costBasis": cost_basis})
+    accumulator.restore([_accounting_trade(t) for t in trades])
+    return [_legacy_trip(row, cost_basis) for row in accumulator.completed_trips]
 
-    side ∈ {long, short} 记为开仓；其余（close）在有未配对开仓时成对，孤儿平仓 / 悬挂开仓丢弃。
-    绝不跨 instId——调用方按 run_id（=单一 instId 成员）分桶后逐桶调用（R-2）。
 
-    排序键不能用 ``ts``：AI 自动交易的 ``trades.ts`` 由两套时钟写入（K 线轮 = bar 开盘时刻 /
-    定时唤醒轮与 monitor 轮 = 墙钟），按 ts 排序会破坏真实的开→平交替 —— 对内逆序整笔丢弃、
-    跨对重叠则错配加丢弃（诊断 ai-trade-stats-missing-round-trips）。``trades.id`` 是落库自增，
-    即真实发生顺序，实测生产库按 id 配对 161 笔平仓零孤儿。仅本函数改排序键：
-    ``_load_trades_by_run`` 的 SQL 仍按 (ts, id) 升序，故 ``_aggregate_group`` 的 endedTs 与
-    ``_group_started_ts`` 的「首元素 == 最早 ts」语义原样成立。
+def _accounting_trade(trade: Trade) -> dict:
+    """完整原始经济输入及 explain 来源，保留空值和事件身份。"""
+    row = {name: getattr(trade, name, None) for name in
+           ("id", "side", "ts", "price", "qty", "fee", "pnl", "reason")}
+    row.update(runId=getattr(trade, "run_id", None),
+        positionAfter=getattr(trade, "position_after", None),
+        explain=_load_config(getattr(trade, "explain_json", None)),
+        stopLossPrice=getattr(trade, "stop_loss_price", None),
+        takeProfitPrice=getattr(trade, "take_profit_price", None),
+        peakPnl=getattr(trade, "peak_pnl", None))
+    return row
 
-    **腿费按区间累计**（B-5）：一笔往返的费用 = 自上一笔平仓（不含）起、到本笔平仓（含）止的
-    **全部**成交腿 fee 之和。按「配对的那条开仓腿的 fee」计是错的——部分成交会产生多条开仓腿而
-    本函数只保留最后一条，会漏记先前分批的费用。腿费累计与配对必须钉死**同一个**排序键（P2-4），
-    否则费用会串窗。
-    """
-    trips: list[_Trip] = []
-    open_trade: Trade | None = None
-    leg_fee = 0.0
-    for t in sorted(trades, key=lambda x: x.id or 0):
-        leg_fee += float(getattr(t, "fee", 0.0) or 0.0)
-        if t.side in ("long", "short"):
-            open_trade = t
-        elif open_trade is not None:
-            trips.append(_Trip(open_trade, t, leg_fee, cost_basis))
-            open_trade = None
-            leg_fee = 0.0
-        else:
-            # E-1（realized-edge-calibration D-7）：**孤儿平仓**按上面 docstring 的承诺「丢弃」。
-            # 合入前它的 `fee` 已经进了 `leg_fee` 却不会被清零，于是被记到**下一笔**往返头上。
-            # 当前生产库零孤儿故未暴露；但 flatten 失败后的残留、外部干预平仓、会话重启后的补记
-            # 正是会造出孤儿平仓的路径，而本轮全部 bps 化成本读数都以 `leg_fee` 为分子。
-            leg_fee = 0.0
-    return trips
+
+def _legacy_trade(row: dict, **overrides):
+    return SimpleNamespace(**{**row, "explain_json": json.dumps(row.get("explain")),
+        "stop_loss_price": row.get("stopLossPrice"),
+        "take_profit_price": row.get("takeProfitPrice"),
+        "peak_pnl": row.get("peakPnl"), **overrides})
+
+
+def _legacy_trip(row: dict, cost_basis: str) -> _Trip:
+    entry = _legacy_trade(row["entryTrade"], price=row["entryPrice"], qty=row["qty"])
+    close = _legacy_trade(row["closeTrade"], pnl=row["recordedPnl"],
+                          price=row["exitPrice"])
+    return _Trip(entry, close, row["recordedFeeUsd"], cost_basis, row)
+
+
+def _run_economics(run: StrategyRun, trades: list[Trade]) -> dict:
+    config = _load_config(run.config_json)
+    accumulator = TradeAccountingAccumulator({"runId": run.id,
+        "costBasis": config.get("costBasis"), "ctVal": config.get("ctVal"),
+        "asOfTs": run.end_ts or run.start_ts})
+    return accumulator.restore([_accounting_trade(t) for t in trades])
+
+
+def _metrics_with_economics(run: StrategyRun, trades: list[Trade]) -> dict:
+    metrics = _load_config(run.metrics_json)
+    economics = _run_economics(run, trades)
+    stats = metrics.setdefault("aiStats", {})
+    stats.setdefault("integrity", {})["economics"] = economics
+    for target, source in (("winRate", "winRate"),
+                           ("profitFactor", "profitFactor"),
+                           ("avgPnl", "avgPnlUsd")):
+        if economics[source] is not None:
+            metrics[target] = economics[source]
+    metrics["roundTripCount"] = economics["roundTripCount"]
+    metrics["tradeCount"] = len(trades)
+    return metrics
 
 
 def _summarize_pairs(trips: list[_Trip], total_budget_usd: float) -> dict:
@@ -156,6 +182,7 @@ def _summarize_pairs(trips: list[_Trip], total_budget_usd: float) -> dict:
         "realizedPnlUsd": realized,
         "returnPct": realized / total_budget_usd if total_budget_usd > 0 else 0.0,
         "tradeCount": count,
+        "roundTripCount": count,
         "winRate": wins / count if count > 0 else 0.0,
         # [P1-7] `wins` 是 E-2 池化所需的**分子**，纯加法键（既有键的值逐位不变，G-19 双向断言）。
         # 靠 `round(winRate × tradeCount)` 反推分子是把浮点误差引进判据，明令禁止。
@@ -273,7 +300,9 @@ def _aggregate_group(runs: list[StrategyRun], trades_by_run: dict[int, list[Trad
         "status": _group_status(runs),
         "totalBudgetUsd": total_budget,
         "costBasisAssumed": assumed,
-        "summary": _summarize_pairs(all_pairs, total_budget),
+        "summary": {**_summarize_pairs(all_pairs, total_budget),
+            "economics": merge_economics_snapshots([
+                _run_economics(run, trades_by_run.get(run.id, [])) for run in runs])},
     }
 
 
@@ -357,7 +386,7 @@ async def get_ai_trade_group_detail(session: AsyncSession, group_id: str) -> dic
             "allocationPct": _num(cfg.get("allocationPct")),
             "strategyNames": _config_strategy_names(cfg), "status": run.status,
             "costBasis": _run_cost_basis(cfg)[0],   # 该成员 run 的盈亏口径（推定与否见组级标记）
-            "metrics": _load_config(run.metrics_json),
+            "metrics": _metrics_with_economics(run, trades_by_run.get(run.id, [])),
             "trades": trades_by_run.get(run.id, []),
         })
     agg = _aggregate_group(runs, trades_by_run)
@@ -593,6 +622,10 @@ def _run_dimensions(run: StrategyRun, cfg: dict, assumed: bool) -> dict:
 
 def _trip_row(trip: _Trip, dims: dict) -> dict | None:
     """一笔往返的归一 dict（轴 B/C 纯核心的输入）；价不可用 ⇒ None（不产出一个算不出分母的样本）。"""
+    if dims.get("costBasisAssumed"):
+        return None
+    if trip.economics is not None and trip.economics["coverage"] != "complete":
+        return None
     entry_px = float(trip.entry.price or 0.0)
     exit_px = float(trip.exit.price or 0.0)
     if entry_px <= 0 or exit_px <= 0:
@@ -637,17 +670,12 @@ def _trip_row(trip: _Trip, dims: dict) -> dict | None:
 
 
 def _fee_known(trip: _Trip) -> bool:
-    """这笔往返到底有没有费率记录（[P0-4]）。
-
-    ⚠️ 追溯路径**分辨不出**「记了一个 0」与「根本没记」：`trades.fee` 是**非空**列，费率记账
-    2026-07-26 才上线，之前的行一律落 `0.0`。故这里的判据是「双腿都非空 **且** 区间腿费 > 0」，
-    与 §附录 A.5 的复算脚本（`if lf > 0`）逐字同构。实盘结算路径（`trip_ledger._leg_fee`）能靠
-    「`fee` 这个键在不在成交 dict 里」分辨，故那边保留了「真实零费率也算已知」的语义——
-    两条路径的判据不同**是有意的**，因为它们手上的信息本来就不一样。
-    """
-    if trip.entry.fee is None or trip.exit.fee is None:
-        return False
-    return float(trip.leg_fee_usd or 0.0) > 0
+    """费用已知与否逐腿读取来源证据，保留合法零与返佣。"""
+    if trip.economics is not None:
+        return trip.economics.get("feeUsd") is not None
+    from ..ai_auto.accounting_replay import leg_fee_evidence
+    return all(leg_fee_evidence(_accounting_trade(leg))[0] is not None
+               for leg in (trip.entry, trip.exit))
 
 
 def _error_bps(realized: float | None, estimate) -> float | None:

@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 from app.ai_auto.decider import AiTradeDecider, TradeDecision
 from app.ai_auto.discipline import preset_table
 from app.ai_auto.session import AiTradeSession
@@ -80,6 +82,84 @@ def _round(session: AiTradeSession, stage1: str, *, stage1_degrade: str | None =
 
 def _wire(session: AiTradeSession) -> dict:
     return session._status_payload()["openFunnel"]
+
+
+async def test_sizing_hold_preserves_original_open_intent(monkeypatch):
+    session = _session()
+    decision = TradeDecision(action="open_long", size_fraction=0.5,
+                             reason="测试", confidence=0.9)
+    session._discipline.funnel.note_intent(decision.action, None)
+    monkeypatch.setattr(session._sizing, "resolve_live", lambda *a, **kw: (
+        replace(decision, action="hold", size_fraction=None), None,
+        {"floorVerdict": "zero"}))
+    result = await session._apply_sizing(1, 100, 100, decision)
+    assert result.action == "hold"
+    assert session._discipline.funnel.sizing_zeroed == 1
+
+
+def test_integrity_is_identical_across_status_and_rediscovery(monkeypatch):
+    session = _session()
+    monkeypatch.setattr("app.ai_auto.session.time.time", lambda: 1700000000)
+    status = session._status_payload()
+    assert status["integrity"] == session.info()["integrity"]
+    assert status["integrity"] == session.snapshot()["status"]["integrity"]
+    assert status["integrity"]["schemaVersion"] == 2
+    assert status["integrity"]["economics"]["winRate"] is None
+
+
+async def test_optional_enrichment_failure_still_persists_trade(monkeypatch):
+    session = _session()
+    persisted = []
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("富化不可用")
+
+    async def persist(trade):
+        persisted.append(trade.copy())
+
+    monkeypatch.setattr(session, "_inject_explain_meta", unavailable)
+    monkeypatch.setattr(session, "_persist_trade", persist)
+    trade = {"side": "long", "price": 100, "qty": 1, "ts": 1,
+             "fee": 0, "pnl": 0, "positionAfter": 1}
+    await session._dispatch([{"type": "trade", "data": trade}])
+    assert len(persisted) == 1
+    assert persisted[0]["price"] == 100
+    assert persisted[0]["explain"]["meta"]["accountingEventId"]
+
+
+async def test_stop_reports_unresolved_accepted_order(monkeypatch):
+    from dataclasses import asdict
+    from app.ai_auto.open_attempts import OpenAttemptManager
+    from app.live_auto.resting import RestingOrder
+    from app.db.ai_trade_state_repositories import _has_pending
+
+    session = _session()
+    resting = RestingOrder("fixed", "accepted", "open", "long",
+                           100, 1, 0.5, "测试", 1, 100)
+    session.executor.resting = resting
+
+    async def saved(snapshot):
+        return True
+
+    async def not_verified(*args, **kwargs):
+        return {"ok": True, "closedSz": 0}
+
+    async def no_io(*args, **kwargs):
+        return None
+
+    attempts = OpenAttemptManager(
+        account_id=1, run_id=1, inst_id=session.inst_id,
+        quota=session._entry_quota, persist_callback=saved)
+    attempts._extras["adoptedOrder"] = {
+        "clOrdId": "fixed", "resting": asdict(resting)}
+    session.executor.open_attempts = attempts
+    monkeypatch.setattr(session.executor, "flatten", not_verified)
+    monkeypatch.setattr(session._cost, "reconcile_tick", no_io)
+    monkeypatch.setattr(session, "_finalize_run", no_io)
+    result = await session.stop()
+    assert not result["ok"]
+    assert session.flatten_failed
+    assert _has_pending(session.state_member_row())
 
 
 # ============================ G-10b：闭合不变式 ============================
@@ -304,7 +384,8 @@ async def test_short_reaches_the_order_when_the_evidence_is_there():
         assert wire["directionBalance"]["contrarianPassed"] == 1
         assert wire["directionBalance"]["shortIntents"] == 1
         assert wire["blocked"] == {}                          # 逆势放行不是降级
-        assert session.discipline_wire()["contrarian"]["remaining"] == 2
+        assert session.discipline_wire()["contrarian"]["remaining"] == 3
+        assert session._entry_quota.used == 0  # 门禁放行不代表交易所已接收
     finally:
         await dispose_engine()
 

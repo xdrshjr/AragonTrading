@@ -408,7 +408,10 @@ async def test_enrichment_failure_never_blocks_run_finalisation(monkeypatch):
             run = await repo.get_run(s, run_id)
         assert run.status == "stopped"                 # 真实资金平仓后的落库收尾绝不被阻断
         metrics = await _run_metrics(sm, run_id)
-        assert "aiStats" not in metrics                # 退回不含富化字段的基础形态
+        assert "cost" not in metrics["aiStats"]        # 可选成本富化失败，不伪造该块
+        integrity = metrics["aiStats"]["integrity"]     # 基础完整性仍须落库
+        assert integrity["economics"]["roundTripCount"] == 0
+        assert integrity["economics"]["tradingNetUsd"] is None
     finally:
         await dispose_engine()
 

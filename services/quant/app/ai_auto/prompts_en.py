@@ -226,6 +226,9 @@ def render_spine_en(inst_id: str, bar: str, budget_usd: float, leverage: float, 
 
 # 决策任务收尾指令（英文档）：`build_decision_prompt` 的末段分叉，缺席 `reasoningDepth` ⇒ 中文。
 DECISION_TASK_INSTRUCTION_EN = (
+    "Current decisionFacts take precedence over historical narratives. "
+    "Use their price units, positions, rules and cost sources; "
+    "unsettled outcomes remain unverified.\n"
     "\nNow run the full deliberation protocol (S1 -> S12) on the evidence above, then call\n"
     "submit_trade_decision exactly once. Analysis without a tool call is a lost round.\n"
     "Remember: `reason` and `evidenceDigest` are written in Simplified Chinese for the operator;\n"

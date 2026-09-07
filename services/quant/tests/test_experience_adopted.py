@@ -38,10 +38,12 @@ _CT_VAL = 0.01
 _CONTRACT = {"position": {"posId": "p-1", "posSide": "long", "avgPx": 60000.0,
                           "size": 3.0, "openCTime": _START}}
 _CLOSE = {"ts": _START + 3600, "side": "close", "price": 61200.0, "qty": 3.0,
-          "fee": -1.8, "pnl": 36.0, "positionAfter": 0.0, "reason": "offline_exit",
+          "fee": 1.8, "pnl": 36.0, "positionAfter": 0.0, "reason": "offline_exit",
           "explain": {"kind": "offline_exit",
                       "meta": {"source": "ai", "exitSource": "offline",
-                               "wallTs": _START + 3600}}}
+                               "wallTs": _START + 3600,
+                               "feeBasis": "measured",
+                               "feeKnown": True, "feeCurrency": "USDT"}}}
 
 
 def _runtime(*, write: bool = True, adopt: bool = True) -> ExperienceRuntime:

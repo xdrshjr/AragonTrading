@@ -26,6 +26,8 @@ const LAYERS = [
 
 function funnel(over: Partial<AiTradeOpenFunnel> = {}): AiTradeOpenFunnel {
   return {
+    schemaVersion: 2, coverage: "complete",
+    executionBlocked: {}, outcomeUnknown: 0,
     intents: 12,
     blocked: { edgeGate: 11, consensus: 1 },
     topBlocker: { key: "edgeGate", label: "最小 edge 门禁", count: 11 },
@@ -66,6 +68,8 @@ describe("漏斗几何", () => {
       "intents",
       "blocked",
       "sizingZeroed",
+      "executionBlocked",
+      "outcomeUnknown",
       "submitted",
       "filled",
     ]);
@@ -79,9 +83,13 @@ describe("漏斗几何", () => {
     expect(stages.find((s) => s.key === "sizingZeroed")?.count).toBe(2);
   });
 
-  it("比例夹在 [0,1]（后端异常也不该画出一条溢出屏幕的条）", () => {
+  it("不闭合的 v2 读数保留计数但不展示比例", () => {
     const stages = funnelStages(funnel({ intents: 2, blocked: { edgeGate: 99 } }));
-    expect(stages.find((s) => s.key === "blocked")?.ratio).toBe(1);
+    expect(stages.find((s) => s.key === "blocked")?.count).toBe(99);
+    expect(stages.every((s) => s.ratio === null)).toBe(true);
+    const broken = funnel({ intents: 2, blocked: { edgeGate: 99 } });
+    expect(blockedRows(broken).every((row) => row.ratio === null)).toBe(true);
+    expect(formatConversion(broken)).toBeNull();
   });
 });
 

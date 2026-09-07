@@ -18,7 +18,16 @@ from app.ai_auto.trip_ledger import (
 
 def _open(**over) -> dict:
     row = {"price": 100.0, "qty": 10.0, "fee": 0.0, "ts": 100, "side": "long",
+           "feeBasis": "measured", "feeKnown": True, "feeCurrency": "USDT",
            "stopLossPrice": 95.0, "takeProfitPrice": 110.0}
+    row.update(over)
+    return row
+
+
+def _close(**over) -> dict:
+    row = {"price": 101.0, "qty": 10.0, "fee": 0.0, "pnl": 0.0,
+           "side": "close", "ts": 200, "positionAfter": 0,
+           "feeBasis": "measured", "feeKnown": True, "feeCurrency": "USDT"}
     row.update(over)
     return row
 
@@ -30,7 +39,7 @@ def _snap(*, ct_val: float = 0.01, estimate=None, atr_px=None, **over):
 
 def test_g1_settlement_arithmetic_is_exact():
     """G-1：entry=100 / exit=101 / qty=10 / ctVal=0.01 / 平仓腿 fee=0.05 / netMode。"""
-    trip = settle(_snap(), {"price": 101.0, "qty": 10.0, "fee": 0.05, "pnl": 0.05, "ts": 200},
+    trip = settle(_snap(), _close(fee=0.05, pnl=0.05),
                   SettleContext(net_mode=True, ct_val=0.01, exit_source="agent"))
     assert trip.notional_usd == 10.0
     assert trip.move_bps == 100.0
@@ -43,17 +52,17 @@ def test_g1_settlement_arithmetic_is_exact():
 
 def test_g2_none_degradation_never_becomes_zero():
     """G-2：`ct_val==0` / 无止损 / 零位移三态下，对应读数恒 None 且**绝不为 0**。"""
-    no_ct = settle(_snap(ct_val=0.0), {"price": 101.0, "pnl": 0.0, "fee": 0.0, "ts": 200},
+    no_ct = settle(_snap(ct_val=0.0), _close(),
                    SettleContext(net_mode=True, ct_val=0.0))
     assert no_ct.notional_usd is None and no_ct.realized_net_bps is None
     assert no_ct.r_multiple is None and no_ct.risk_usd is None
     assert no_ct.move_bps == 100.0        # 位移是纯价格比例，与合约乘数无关
 
-    no_stop = settle(_snap(stopLossPrice=None), {"price": 101.0, "pnl": 0.1, "fee": 0.0, "ts": 2},
+    no_stop = settle(_snap(stopLossPrice=None), _close(pnl=.1, ts=2),
                      SettleContext(net_mode=True, ct_val=0.01))
     assert no_stop.r_multiple is None and no_stop.planned_rr is None
 
-    flat = settle(_snap(), {"price": 100.0, "pnl": 0.0, "fee": 0.0, "ts": 200},
+    flat = settle(_snap(), _close(price=100),
                   SettleContext(net_mode=True, ct_val=0.01))
     assert flat.move_bps == 0.0 and flat.stop_atr_mult is None
 
@@ -74,8 +83,9 @@ def test_g4_settlement_never_raises_and_module_has_no_raise():
 
 def test_g5_net_pnl_is_isomorphic_across_the_three_ledgers():
     """G-5：同一笔平仓喂三个账本，**净额逐位相等**（守「绝不写第三种口径」）。"""
-    close = {"price": 101.0, "qty": 10.0, "fee": 0.07, "pnl": 0.13, "ts": 200, "side": "close"}
+    close = _close(fee=.07, pnl=.13)
     attribution = AttributionLedger(net_mode=False, ct_val=0.01)
+    attribution.note_open(_open(), seq=1)
     attribution.record_close(close)
     exits = ExitLedger(net_mode=False)
     exits.record(close, hold_seconds=100.0, source="agent")
@@ -87,7 +97,7 @@ def test_g5_net_pnl_is_isomorphic_across_the_three_ledgers():
 
 def test_g5b_round_trip_fee_is_both_legs_and_unknown_fee_omits_cost_keys():
     """G-5b：`fee_usd == 开腿 + 平腿`；任一腿缺 `fee` 键 ⇒ 成本类读数恒 None 且 wire 整键省略。"""
-    trip = settle(_snap(fee=0.03), {"price": 101.0, "fee": 0.05, "pnl": 0.1, "ts": 200},
+    trip = settle(_snap(fee=0.03), _close(fee=.05, pnl=.1),
                   SettleContext(net_mode=True, ct_val=0.01))
     assert trip.fee_usd == round(0.03 + 0.05, 6) and trip.fee_known
     assert trip.realized_cost_bps == round(0.08 / 10.0 * 1e4, 4)
@@ -96,17 +106,22 @@ def test_g5b_round_trip_fee_is_both_legs_and_unknown_fee_omits_cost_keys():
     snap = snap.__class__(**{**snap.__dict__, "open_fee_known": False})
     unknown = settle(snap, {"price": 101.0, "pnl": 0.1, "ts": 200},   # 平仓腿也缺 fee 键
                      SettleContext(net_mode=True, ct_val=0.01))
-    assert unknown.fee_known is False
+    assert unknown is not None and unknown.fee_known is False
+    assert unknown.net_pnl_usd == .1 and unknown.realized_net_bps is not None
+    assert unknown.gross_pnl_usd is None and unknown.realized_gross_bps is None
     assert unknown.fee_usd is None and unknown.realized_cost_bps is None
+    assert settle(snap, {"price": 101.0, "pnl": .1},
+                  SettleContext(net_mode=False, ct_val=.01)) is None
     wire = trip_meta_wire(unknown)
     assert "realizedCostBps" not in wire and "roundTripFeeUsd" not in wire
 
 
-def test_record_close_close_leg_fee_semantics_are_untouched():
-    """G-5b 的另一半：既有 `RoundTrip.fee_usd`（**只记平仓腿**）逐位未被本轮改动。"""
+def test_record_close_records_both_leg_fees():
+    """v2 归因与完整往返恒等式共用双腿费用。"""
     ledger = AttributionLedger(net_mode=True, ct_val=0.01)
-    ledger.record_close({"price": 101.0, "qty": 10.0, "fee": 0.05, "pnl": 0.1, "ts": 200})
-    assert ledger._trips[-1].fee_usd == 0.05
+    ledger.note_open(_open(fee=.03), seq=1)
+    ledger.record_close(_close(fee=.05, pnl=.1))
+    assert ledger._trips[-1].fee_usd == .08
 
 
 def test_partial_open_fills_are_idempotent_and_keep_the_estimate():
@@ -124,9 +139,9 @@ def test_partial_open_fills_are_idempotent_and_keep_the_estimate():
 
 def test_stop_atr_mult_uses_the_open_moment_atr():
     """约束 4：`stopAtrMult` = 计划止损距离 / 开仓那一刻的 ATR；ATR 不可用 ⇒ None。"""
-    with_atr = settle(_snap(atr_px=0.5), {"price": 101.0, "pnl": 0.1, "fee": 0.0, "ts": 2},
+    with_atr = settle(_snap(atr_px=0.5), _close(pnl=.1, ts=2),
                       SettleContext(net_mode=True, ct_val=0.01))
     assert with_atr.stop_atr_mult == 10.0
-    without = settle(_snap(atr_px=float("nan")), {"price": 101.0, "pnl": 0.1, "fee": 0.0, "ts": 2},
+    without = settle(_snap(atr_px=float("nan")), _close(pnl=.1, ts=2),
                      SettleContext(net_mode=True, ct_val=0.01))
     assert without.stop_atr_mult is None

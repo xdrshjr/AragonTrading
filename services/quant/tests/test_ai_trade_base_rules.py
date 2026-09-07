@@ -64,9 +64,9 @@ def test_builds_band_from_execution_frame():
     df = _wave()
     band = build_ma_band(df, _RULE)
     upper, mid, lower = bollinger(df["c"], _RULE.period, _RULE.std_mult)
-    assert band["upper"] == round(float(upper.iloc[-1]), 6)
-    assert band["mid"] == round(float(mid.iloc[-1]), 6)      # bollinger 第二返回值即中轨 SMA
-    assert band["lower"] == round(float(lower.iloc[-1]), 6)
+    assert band["upper"] == float(upper.iloc[-1])
+    assert band["mid"] == float(mid.iloc[-1])
+    assert band["lower"] == float(lower.iloc[-1])
     assert band["ruleId"] == "ma_band_entry" and band["period"] == 20
 
 

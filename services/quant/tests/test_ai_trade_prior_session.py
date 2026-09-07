@@ -142,13 +142,20 @@ def _payload(session: AiTradeSession) -> dict:
 
 
 # ============================ T-15：零回归（三总闸默认全关）============================
-async def test_switch_off_payload_is_field_by_field_identical():
-    """总闸①关（默认）+ 给了合法快照 ⇒ payload 与「压根没给快照」时**逐字段相同**。"""
+async def test_switch_off_payload_is_field_by_field_identical(monkeypatch):
+    """同一时刻与运行段，总闸①关时有无先验快照的完整 v2 payload 相同。"""
+    now = time.time()
+    monkeypatch.setattr(time, "time", lambda: now)
     await init_db()
     try:
-        with_snapshot = _payload(_make_session(prior_snapshot=_snapshot()))
-        without = _payload(_make_session(prior_snapshot=None))
+        with_session = _make_session(prior_snapshot=_snapshot())
+        without_session = _make_session(prior_snapshot=None)
+        without_session._discipline.funnel.runtime_epoch_id = (
+            with_session._discipline.funnel.runtime_epoch_id)
+        with_snapshot = _payload(with_session)
+        without = _payload(without_session)
         assert "signalPriors" not in with_snapshot
+        assert with_snapshot["decisionFacts"]["schemaVersion"] == 2
         assert with_snapshot == without
         assert build_decision_prompt(with_snapshot) == build_decision_prompt(without)
         assert "信号先验" not in build_decision_prompt(with_snapshot)

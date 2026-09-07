@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   AiTradeGroupState,
@@ -74,6 +74,45 @@ afterEach(() => {
 });
 
 describe("AiTradePanel", () => {
+  it("极低价格保留非零数值和完整价格单位提示", () => {
+    const instId = "SATS-USDT-SWAP";
+    useAppStore.setState({ aiTradeGroup: makeGroup([makeSession(instId)]) });
+    render(<AiTradePanel rows={[{ instId, instType: "SWAP", base: "SATS",
+      quote: "USDT", last: .0000000123456789 }]}
+      active={instId} livePrice={null} changePct={null} onSelect={noop} />);
+    expect(screen.getByText("1.235e-8")).toBeInTheDocument();
+    expect(screen.getByTitle("0.0000000123456789 USDT")).toBeInTheDocument();
+  });
+  it("五成员各显示服务端原因，状态更新保留选择和成交", () => {
+    const symbols = ["BTC", "ETH", "SOL", "DOGE", "SATS"];
+    const group = makeGroup(symbols.map((symbol) => makeSession(
+      `${symbol}-USDT-SWAP`, { integrity: {
+        schemaVersion: 2, asOfTs: 100,
+        diagnosis: { code: "model_hold", message: `${symbol} 当前证据不足` },
+      } },
+    )));
+    useAppStore.setState({ aiTradeGroup: group });
+    const selected = vi.fn();
+    render(<AiTradePanel rows={ROWS} active="SATS-USDT-SWAP"
+      livePrice={null} changePct={null} onSelect={selected} />);
+    expect(screen.getAllByTestId("ai-member-integrity")).toHaveLength(5);
+    const reason = screen.getByText("SATS 当前证据不足");
+    const button = reason.closest("button")!;
+    expect(button).toHaveAttribute("aria-current", "true");
+    expect(button.querySelector("button")).toBeNull();
+    button.focus();
+    expect(button).toHaveFocus();
+    fireEvent.click(button);
+    expect(selected).toHaveBeenCalledWith("SATS-USDT-SWAP");
+    const before = useAppStore.getState().aiTradeGroup!.members["SATS-USDT-SWAP"];
+    act(() => useAppStore.getState().patchAiTradeMemberStatus("SATS-USDT-SWAP", {
+      state: "running", integrity: { schemaVersion: 2,
+        diagnosis: { code: "pending_unknown", message: "回执待核实" } },
+    }));
+    const after = useAppStore.getState().aiTradeGroup!.members["SATS-USDT-SWAP"];
+    expect(after.trades).toBe(before.trades);
+    expect(after.session?.integrity?.diagnosis?.message).toBe("回执待核实");
+  });
   it("renders nothing when there is no AI trade group", () => {
     useAppStore.setState({ aiTradeGroup: null });
     const { container } = render(

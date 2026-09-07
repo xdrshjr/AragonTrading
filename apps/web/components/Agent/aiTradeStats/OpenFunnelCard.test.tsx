@@ -28,6 +28,20 @@ function funnel(over: Partial<AiTradeOpenFunnel> = {}): AiTradeOpenFunnel {
 afterEach(cleanup);
 
 describe("OpenFunnelCard", () => {
+  it("旧读数显示分类不完整，v2 执行未知和未提交均单列", () => {
+    const view = render(<OpenFunnelCard funnel={funnel({ conversion: .5 })} />);
+    expect(screen.getByText(/历史分类不完整/)).toBeInTheDocument();
+    expect(screen.getByTestId("ai-open-funnel-card").textContent).not.toContain("50.0%");
+    view.rerender(<OpenFunnelCard funnel={funnel({
+      schemaVersion: 2, coverage: "complete", intents: 4, blocked: {},
+      executionBlocked: { below_min_size: 2 }, outcomeUnknown: 1,
+      submitted: 1, scope: "当前运行段累计",
+    })} />);
+    expect(screen.getByText("执行未提交")).toBeInTheDocument();
+    expect(screen.getByText("回执待核实")).toBeInTheDocument();
+    expect(screen.getByText("已接收订单")).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-open-funnel-broken")).toBeNull();
+  });
   it("老会话缺键 ⇒ 整卡不渲染且不崩（渲染门控）", () => {
     const { container } = render(<OpenFunnelCard funnel={null} />);
     expect(container).toBeEmptyDOMElement();

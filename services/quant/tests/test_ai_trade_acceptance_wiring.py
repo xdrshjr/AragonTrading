@@ -7,11 +7,9 @@
 """
 from __future__ import annotations
 
-import asyncio
-import ast
 import json
-import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -322,17 +320,23 @@ def test_ai_stats_keys_shape_is_identical_across_worlds():
 
 
 # ---------------- W-8：既有调用点零回归 ----------------
-def test_schedule_maintenance_without_mark_px_does_not_accrue_or_raise():
+@pytest.mark.asyncio
+async def test_schedule_maintenance_without_mark_px_does_not_accrue_or_raise(monkeypatch):
     """W-8：不传 `mark_px` ⇒ 不计提且不抛（既有调用点零回归）。"""
     runtime = CostRuntime("BTC-USDT-SWAP", Settings(), None, None)
     runtime.funding_ledger.enabled = True
     runtime.funding_ledger.note_open({"side": "long", "qty": 1.0}, seq=1, now_wall=0.0)
+    calls = []
 
-    async def _run():
-        runtime.schedule_maintenance(1000.0, window_start_ts=0, trades=[])
-        await runtime.drain_maintenance()
+    async def funding_rate(inst_id):
+        calls.append(inst_id)
+        return {"fundingRate": "0.0001", "fundingTs": 0, "nextFundingTs": 28800}
 
-    asyncio.run(_run())
+    monkeypatch.setattr("app.ai_auto.cost_runtime.get_rest_client",
+        lambda: SimpleNamespace(get_funding_rate=funding_rate))
+    runtime.schedule_maintenance(1000.0, window_start_ts=0, trades=[])
+    await runtime.drain_maintenance()
+    assert calls == ["BTC-USDT-SWAP"]
     assert runtime.funding_ledger.crossings == 0
 
 
@@ -373,12 +377,17 @@ def test_settled_funding_gate_names_the_door_that_failed():
     assert with_creds._settled_funding_usd() == (None, "not_run")
     with_creds.last_reconcile = {"status": "ok", "coverageMismatch": False,
                                  "samples": 120, "exchangeFundingFeeUsd": 1.0}
+    # 旧成功标志及原始 fee 字段不证明同账户/epoch 覆盖，不得作为结算净额。
+    assert with_creds._settled_funding_usd() == (None, "untrusted")
+    with_creds.last_reconcile["comparisonCoverage"] = {"comparable": True}
     assert with_creds._settled_funding_usd() == (None, "truncated")
     with_creds.last_reconcile = {"status": "ok", "coverageMismatch": True,
-                                 "samples": 5, "exchangeFundingFeeUsd": 1.0}
+        "comparisonCoverage": {"comparable": False, "reason": "epoch_mismatch"},
+        "samples": 5, "exchangeFundingCostUsd": 1.0}
     assert with_creds._settled_funding_usd() == (None, "untrusted")
     with_creds.last_reconcile = {"status": "ok", "coverageMismatch": False,
-                                 "samples": 5, "exchangeFundingFeeUsd": 1.25}
+        "comparisonCoverage": {"comparable": True}, "samples": 5,
+        "exchangeFundingFeeUsd": -1.25, "exchangeFundingCostUsd": 1.25}
     assert with_creds._settled_funding_usd() == (1.25, None)
 
 
@@ -422,77 +431,107 @@ def test_external_close_explain_is_byte_identical_apart_from_source():
     assert classify_live(explain) == "exchangeOco"
 
 
-def _git_diff_names() -> set[str]:
-    out = subprocess.run(["git", "diff", "--name-only", "HEAD"], cwd=_REPO_ROOT,
-                         capture_output=True, text=True, check=False)
-    return {line.strip() for line in out.stdout.splitlines() if line.strip()}
+def test_shared_execution_preserves_simulated_fees_and_cost_evidence():
+    """G-4/G-6：共享文件可按本轮 spec 修改，冻结真正的撮合与成本合同。"""
+    from app.ai_auto.cost_model import (
+        backtest_params, estimate_round_trip_cost, query_for_preview)
+    from app.ai_auto.cost_view import build_cost_view
+    from app.ai_auto.cost_text import format_cost_for_prompt
+    from app.engine.simulator import SimBroker
+    from app.strategies.base import Signal
+
+    settings = Settings(default_taker_fee_bps=5, default_slippage_bps=2)
+    broker = SimBroker(10000, taker_fee_bps=5, slippage_bps=2, leverage=3)
+    broker.submit([Signal(side="long", strength=.5)])
+    assert broker.pos.side == "flat" and len(broker._pending) == 1
+    broker.fill_pending(100, 1000, 1)
+    opened = broker.trades[-1]
+    assert opened.price == pytest.approx(100.02)
+    assert opened.fee == pytest.approx(7.5)
+    broker.submit([Signal(side="close")])
+    broker.fill_pending(110, 1060, 2)
+    closed = broker.trades[-1]
+    assert closed.price == pytest.approx(109.978)
+    expected_fee = opened.fee + closed.qty * closed.price * .0005
+    assert broker.fees_paid == pytest.approx(expected_fee)
+    assert closed.pnl == pytest.approx(
+        opened.qty * (closed.price - opened.price) - expected_fee)
+    assert broker.pos.side == "flat"
+    cost = estimate_round_trip_cost(query_for_preview(
+        ord_type="market", side="long", bar_seconds=3600,
+        funding=None, funding_enabled=False), backtest_params(settings))
+    assert cost.total_bps == 14
+    assert cost.fee_open_bps == cost.fee_close_bps == 5
+    assert cost.crossing_legs == 2 and cost.half_spread_bps == 2
+    assert cost.liquidity_assumption == "simulation"
+    view = build_cost_view(cost, fee_snapshot=None, ord_type="market",
+        side="long", position=None, last_px=100, atr_px=1,
+        session_fee_usd=broker.fees_paid, net_basis=True)
+    assert view["roundTripBps"] == cost.total_bps
+    assert view["sessionFeeUsd"] == pytest.approx(broker.fees_paid, abs=1e-6)
+    assert f"{cost.total_bps} bps" in format_cost_for_prompt(view)
 
 
-def test_shared_execution_files_have_zero_diff():
-    """G-4 / G-6：`SimBroker` / `cost_model` / `cost_text` 零改动。
+@pytest.mark.asyncio
+async def test_backtest_cost_model_funding_args_come_from_one_source(monkeypatch):
+    """G-5：预览、持仓、仓位与 edge 实际消费同一轮冻结费用，缓存变动不漂移。"""
+    from app.ai_auto import backtest
+    from app.ai_auto.decider import TradeDecision
+    from app.ai_auto.funding_ledger import BacktestFundingCurve
+    from .test_ai_trade_memory_integrity import _integrity_backtest
 
-    `SimBroker` 被全仓库所有回测与两条自动交易链路共用；后两者是 [P0-1] 的边界——结算周期未知
-    这条信息只被 `FundingLedger` 消费，成本层继续走它自己的 8h 保守估算（§九 D-9）。
+    runner, frame = _integrity_backtest(monkeypatch)
+    ts = int(frame.iloc[61]["ts"])
+    runner.settings.ai_trade_edge_gate_k_min = .01
+    runner._curve = BacktestFundingCurve([
+        {"fundingTs": ts - 28800, "fundingRate": .001},
+        {"fundingTs": ts, "fundingRate": .001}])
+    runner._execute(TradeDecision("open_long", .5, .9, "测试"))
+    runner.main.fill_pending(100, ts - 3600, 60)
+    observed = {}
+    decide = runner.decider.decide
+    horizon = runner._horizon_facts
+    sizing = runner._sizing_cost_bps
+    edge = backtest.evaluate_edge_gate
 
-    **`live_auto/executor.py` 已从本冻结集移出**（ai-trade-discipline-preset-and-integrity 轴 D，
-    spec §4.1 显式列出该文件）：本轮在 `_make_trade` 这个**唯一成交构造点**做 bar 对齐，修的正是
-    「非 K 线唤醒产生的成交落不到任何一根 K 线上」（D-3）。改一个共用文件必须有等价的护栏顶上，
-    否则移出冻结集就是悄悄放宽：`live_auto` 那条路径的零回归改由
-    `test_ai_trade_switches_never_leak_into_non_ai_executor` 的**键集冻结** +
-    `test_ai_trade_trade_clock.py::test_live_auto_without_bar_seconds_falls_back_verbatim`
-    的**取值冻结**共同承担，两条都直接断言行为而不是断言「文件没被碰过」。
-    """
-    frozen = {"services/quant/app/engine/simulator.py",
-              "services/quant/app/ai_auto/cost_model.py",
-              "services/quant/app/ai_auto/cost_text.py"}
-    changed = _git_diff_names()
-    if not changed:
-        pytest.skip("git diff 不可用（非仓库环境）")
-    assert frozen & changed == set()
+    async def refresh_cache(payload):
+        observed["preview"] = payload["costAwareness"]["roundTripBps"]
+        observed["snapshot"] = runner._round_cost
+        result = await decide(payload)
+        runner._curve = BacktestFundingCurve([])
+        return result
 
+    def horizon_read(*args):
+        result = horizon(*args)
+        observed["horizon"] = result.cost_bps
+        return result
 
-def test_backtest_cost_model_funding_args_come_from_one_source():
-    """G-5 **冻结方向反转**（ai-trade-backstop-repair-and-net-backtest 轴 B）。
+    def sizing_read(*args):
+        result = sizing(*args)
+        observed["sizing"] = result
+        return result
 
-    本轮之前这条用例冻结的是「两处成本估算现场**保持** `funding=None, funding_enabled=False`」，
-    理由是：那时修它们会当场改变 G3 迟滞与 edge 门禁在回测里的判定，与该轮「不动任何既有门禁
-    判定式」的边界正面冲突（登记为欠账 D-9）。轴 B 的边界不同——它**就是**来还这笔账的，方向是
-    让回测向实盘收敛（回测按「资金费为 0」判定、实盘按真实资金费判定，模式越长回测越乐观）。
+    def edge_read(*args, **kwargs):
+        snap = observed["snapshot"]
+        assert kwargs["params"] is snap.params
+        assert kwargs["funding"] is snap.funding
+        assert kwargs["funding_enabled"] is snap.funding_enabled is True
+        result = edge(*args, **kwargs)
+        observed["edge"] = result.cost_bps
+        return result
 
-    故本用例改为冻结新契约，守的东西一个没少：两处判定现场的资金费入参必须来自**同一个**
-    `_cost_funding`（不得出现第二条估算路径），且不得再退回任何字面量。仍按 AST 断言，不靠肉眼。
-    """
-    source = (_REPO_ROOT / "services/quant/app/ai_auto/backtest.py").read_text("utf-8")
-    tree = ast.parse(source)
-    by_callee: dict[str, list[dict]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and getattr(node.func, "id", None) in (
-                "query_for_preview", "evaluate_edge_gate"):
-            by_callee.setdefault(node.func.id, []).append(
-                {kw.arg: kw.value for kw in node.keywords})
-    # 判定现场：G3 换手迟滞（`_horizon_facts`）与轴 B 止损下界（`_sizing_cost_bps`）的往返成本
-    # 估算——**每一处**的两个入参都必须是 `_cost_funding` 解包出来的名字（另有一处
-    # `query_for_preview` 是 notes 的口径披露，不是判定现场，它的 `funding` 是字面量）。
-    #
-    # ⚠️ [tradability-and-open-funnel] 本条断言由「恰好 1 处」改为「每一处都合规」：
-    # 轴 B 的止损下界要求回测侧也传 `cost_bps`（否则下界分支恒不进 ⇒ 回测与实盘的止损位系统性
-    # 分叉，正是「双通道共用纯核心时只有一侧被实现」的成文缺陷模式），于是判定现场从 1 处变为
-    # 2 处。**它守的东西一个没少**——「不得出现第二条估算路径」这条不变式由下面的「现场数 ==
-    # `_cost_funding` 调用数」精确表达，而一个写死的 1 只是那条不变式在当时的一个快照。
-    judged = [kw for kw in (by_callee.get("query_for_preview") or [])
-              if isinstance(kw.get("funding"), ast.Name)]
-    assert len(judged) == 2
-    assert all(isinstance(kw["funding_enabled"], ast.Name) for kw in judged)
-    # 现场二：最小 edge 门禁（`_run_decision`）。
-    gate = by_callee.get("evaluate_edge_gate") or []
-    assert len(gate) == 1
-    assert isinstance(gate[0]["funding"], ast.Name)
-    assert isinstance(gate[0]["funding_enabled"], ast.Name)
-    # 唯一真源：判定现场每一处恰好各调一次 `_cost_funding`，多出来的就是第二条估算路径。
-    sources = [n for n in ast.walk(tree)
-               if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-               and n.func.attr == "_cost_funding"]
-    assert len(sources) == len(judged) + len(gate)
+    monkeypatch.setattr(runner.decider, "decide", refresh_cache)
+    monkeypatch.setattr(runner, "_horizon_facts", horizon_read)
+    monkeypatch.setattr(runner, "_sizing_cost_bps", sizing_read)
+    monkeypatch.setattr(backtest, "evaluate_edge_gate", edge_read)
+    await runner._run_decision(backtest._BacktestJob("funding-source", runner),
+                               frame, {}, 61, [])
+    assert observed["snapshot"].funding_bps == 10
+    assert observed["preview"] > 14  # 确认资金费真正进入成本，不能只传未消费的参数。
+    assert observed["preview"] == observed["horizon"]
+    assert observed["preview"] == observed["sizing"] == observed["edge"]
+    record = runner.decider._journal[-1]
+    assert record["facts"]["costSnapshot"]["fundingBps"] == 10
 
 
 def test_no_new_self_settings_in_session():

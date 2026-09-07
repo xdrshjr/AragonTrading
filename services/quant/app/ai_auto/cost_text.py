@@ -48,9 +48,9 @@ def format_cost_charter(view: dict | None) -> str:
     if not view:
         return ""
     total = view.get("roundTripBps")
-    lines = ["【交易成本 · 系统确定性扣减】"]
+    lines = ["【交易成本 · 事前估算】"]
     lines.append(
-        f"· 本会话每笔往返的确定性成本约 **{total} bps**（≈{_pct_text(total)}）："
+        f"· 本会话每笔往返的预估成本约 **{total} bps**（≈{_pct_text(total)}）："
         f"开仓腿 {view.get('feeOpenBps')} + 平仓腿 {view.get('feeCloseBps')} bps 手续费，"
         f"再加 {view.get('crossingLegs')} 条吃价差腿的价差与冲击"
         f"（半价差 {view.get('halfSpreadBps')} + 冲击 {view.get('impactBps')} bps）"
@@ -60,6 +60,7 @@ def format_cost_charter(view: dict | None) -> str:
         "——这个距离**与杠杆无关**（杠杆只放大保证金收益率，不改变回本所需的价格距离）。"
         "反手（先平后开）要付两倍。")
     lines.append(_basis_line(bool(view.get("netBasis"))))
+    lines.append("· 普通限价可能吃单，按双腿 taker 保守估算；真实成交价格已含价差和滑点，已平净额不再扣模型价差。")
     lines.append(
         "· 频繁进出会把成本乘以次数：每一次「再看看」的开平都在真实扣钱。"
         "只有当你预期的价格空间**明显大于**上面这个往返成本时，这笔交易才值得做。")
@@ -70,7 +71,7 @@ def _funding_clause(view: dict) -> str:
     """资金费子句；缺数据（`None`）⇒ 如实说明未计入，**绝不按 0 计**。"""
     carry = view.get("fundingCarryBps")
     if carry is None:
-        return "（资金费率暂未取到，未计入——真实成本只会更高）"
+        return "（资金费率暂未取到，未计入；实际支出或收入暂不可得）"
     return f"，另含预估资金费 {carry} bps{_funding_periods_clause(view)}" if carry else ""
 
 
@@ -92,10 +93,10 @@ def _funding_periods_clause(view: dict) -> str:
 def _basis_line(net_basis: bool) -> str:
     """盈亏口径声明：模型必须知道它看到的那个盈亏数字是毛额还是净额。"""
     if net_basis:
-        return ("· 你看到的「会话累计盈亏」**已扣除**手续费（净额口径）；持仓浮盈同样按"
+        return ("· 你看到的「会话累计盈亏」**已扣除**双腿手续费（不含资金费的交易净额）；持仓浮盈同样按"
                 "「此刻平掉能拿到手的钱」呈现，不是交易所标记价上的账面浮盈。")
-    return ("· 你看到的「会话累计盈亏」是**毛额**口径（**未扣**手续费）：真实到手金额比它低"
-            "约「往返成本 × 已完成往返笔数」，请自行折算后再判断。")
+    return ("· 你看到的「会话累计盈亏」是**毛额**口径（**未扣**手续费）；"
+            "交易净额按同一已平集合扣双腿手续费，资金费另列，未知费用不可按零计算。")
 
 
 def format_cost_for_prompt(view: dict | None) -> str:
@@ -127,6 +128,8 @@ def _break_even_parts(view: dict) -> list[str]:
     """持仓中的平衡价子句（无持仓 ⇒ 两键为 `None` ⇒ 空表）。"""
     px = view.get("breakEvenPx")
     if px is None:
+        if view.get("hasPosition"):
+            return ["当前持仓的开仓费用或资金费覆盖不足，盈亏平衡价暂不可得"]
         return ["当前空仓：新开一笔即需先赚回上述成本才回到原点"]
     gap = view.get("breakEvenGapPct")
     out = [f"当前持仓的盈亏平衡价≈{px}"]

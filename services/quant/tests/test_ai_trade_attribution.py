@@ -15,14 +15,23 @@ from app.ai_auto.stats_ext import build_cost_stats, cost_snapshot_wire, merge_co
 
 def _close(pnl: float, fee: float, ts: int = 1) -> dict:
     return {"ts": ts, "side": "close", "price": 100.0, "qty": 1.0, "fee": fee, "pnl": pnl,
-            "ordType": "market"}
+            "ordType": "market", "feeBasis": "measured", "feeKnown": True}
+
+
+def _record(ledger, trade):
+    """为原往返统计场景补齐真实开仓腿，零费来源明确。"""
+    number = ledger._close_samples + 1
+    ledger.note_open({"id": 2 * number - 1, "side": "long", "qty": 1,
+                     "price": 100, "fee": 0, "feeBasis": "measured",
+                     "feeKnown": True}, seq=number)
+    ledger.record_close({**trade, "id": 2 * number, "positionAfter": 0})
 
 
 def test_gross_mode_derives_net_by_subtracting_fee():
     """用例 1：三笔往返（+10 / −5 / +2 毛，各 1 费）⇒ 净 4.0、期望 1.333、成本占比 3/17。"""
     ledger = AttributionLedger()
     for pnl in (10.0, -5.0, 2.0):
-        ledger.record_close(_close(pnl, 1.0))
+        _record(ledger, _close(pnl, 1.0))
     cost = ledger.stats()["cost"]
     assert cost["roundTrips"] == 3
     assert cost["grossPnlUsd"] == pytest.approx(7.0)
@@ -34,19 +43,21 @@ def test_gross_mode_derives_net_by_subtracting_fee():
 def test_net_mode_derives_gross_by_adding_fee_back():
     """用例 2：A0-2 开启后 `pnl` 已是净额 ⇒ 毛额 = pnl + fee（绝不重复扣费）。"""
     ledger = AttributionLedger(net_mode=True)
-    ledger.record_close(_close(9.0, 1.0))
+    _record(ledger, _close(9.0, 1.0))
     cost = ledger.stats()["cost"]
     assert cost["netPnlUsd"] == pytest.approx(9.0)
     assert cost["grossPnlUsd"] == pytest.approx(10.0)
 
 
 def test_close_fee_coverage_counts_close_samples_only():
-    """用例 3（RV-13）：零费率的**平仓**样本拉低覆盖率；零费率的**开仓**样本完全不进分母。"""
+    """合法实测零费保持已知；缺费用来源才拉低平仓费用覆盖率。"""
     ledger = AttributionLedger()
-    ledger.record_close(_close(1.0, 0.5))
+    _record(ledger, _close(1.0, 0.5))
     assert ledger.stats()["cost"]["closeFeeCoverage"] == 1.0
-    ledger.record_close(_close(1.0, 0.0))
-    assert ledger.stats()["cost"]["closeFeeCoverage"] == 0.5
+    _record(ledger, _close(1.0, 0.0))
+    assert ledger.stats()["cost"]["closeFeeCoverage"] == 1.0
+    _record(ledger, {**_close(1.0, 0.0), "feeBasis": "unknown", "feeKnown": False})
+    assert ledger.stats()["cost"]["closeFeeCoverage"] == pytest.approx(2 / 3, abs=1e-4)
     # 开仓腿根本不走 record_close（`session._dispatch` 只在 side=="close" 时挂点）⇒ 指标不变。
     assert ledger.stats()["cost"]["roundTrips"] == 2
 
@@ -54,11 +65,11 @@ def test_close_fee_coverage_counts_close_samples_only():
 def test_t_stat_needs_at_least_two_samples_and_nonzero_variance():
     """用例 4：n<2 ⇒ None（不造假显著性）；零方差同样 None。"""
     ledger = AttributionLedger()
-    ledger.record_close(_close(1.0, 0.1))
+    _record(ledger, _close(1.0, 0.1))
     assert ledger.stats()["cost"]["tStat"] is None
-    ledger.record_close(_close(1.0, 0.1))
+    _record(ledger, _close(1.0, 0.1))
     assert ledger.stats()["cost"]["tStat"] is None      # 两笔完全相同 ⇒ 方差 0
-    ledger.record_close(_close(5.0, 0.1))
+    _record(ledger, _close(5.0, 0.1))
     assert ledger.stats()["cost"]["tStat"] is not None
 
 
@@ -66,7 +77,7 @@ def test_ring_buffer_evicts_the_oldest_round_trip():
     """用例 5：环形容量 200 ⇒ 第 201 笔挤掉第 1 笔。"""
     ledger = AttributionLedger(capacity=200)
     for i in range(201):
-        ledger.record_close(_close(1.0, 0.1, ts=i))
+        _record(ledger, _close(1.0, 0.1, ts=i))
     assert ledger.stats()["cost"]["roundTrips"] == 200
 
 
@@ -102,7 +113,7 @@ _EXISTING_AI_STATS = {
 
 def test_merge_keeps_every_existing_key_bit_identical():
     ledger = AttributionLedger()
-    ledger.record_close(_close(1.0, 0.1))
+    _record(ledger, _close(1.0, 0.1))
     merged = merge_cost_stats(_EXISTING_AI_STATS, build_cost_stats(ledger.stats(), None))
     for key, value in _EXISTING_AI_STATS.items():
         assert merged[key] == value
@@ -149,7 +160,7 @@ def test_round_trip_notional_scales_by_the_contract_multiplier():
     `price × qty`。
     """
     ledger = AttributionLedger(ct_val=0.01)
-    ledger.record_close(_close(1.0, 0.1))
+    _record(ledger, _close(1.0, 0.1))
     trip = ledger._trips[-1]
     assert trip.notional_usd == pytest.approx(100.0 * 1.0 * 0.01)
     assert trip.notional_usd != pytest.approx(100.0 * 1.0)

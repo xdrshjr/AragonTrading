@@ -11,6 +11,7 @@ import {
 } from "@/lib/aiTrade";
 import { describeHorizonStatus } from "@/lib/aiTradeHorizon";
 import { describeTurnoverChip } from "@/lib/aiTradeTurnover";
+import { describeIntegrity } from "@/lib/aiTradeIntegrity";
 import { colorForReturn, fmtMoney, fmtNum, fmtPct, fmtPrice } from "@/lib/format";
 import type { AiTradeGroupMemberState, ProfitGuardSnapshot } from "@/lib/aiTradeTypes";
 import type { Instrument } from "@/lib/types";
@@ -62,11 +63,11 @@ export default function AiTradeMemberRow({
       type="button"
       onClick={() => onSelect(instId)}
       aria-current={isActive}
-      className="flex w-full items-center justify-between gap-2 rounded border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-left transition-colors hover:bg-[var(--surface-2)] aria-[current=true]:border-[var(--accent)]"
+      className="flex w-full flex-wrap items-center justify-between gap-x-2 gap-y-0.5 rounded border border-[var(--border)] bg-[var(--bg)] px-2 py-1.5 text-left transition-colors hover:bg-[var(--surface-2)] aria-[current=true]:border-[var(--accent)]"
     >
-      <span className="flex min-w-0 flex-col">
+      <span className="flex min-w-0 flex-1 flex-col">
         <span className="flex items-center gap-1.5">
-          <span className="truncate text-xs font-medium text-[var(--text)]">{instId}</span>
+          <span className="truncate text-xs font-medium text-[var(--text)]" title={instId}>{instId}</span>
           {session?.bar && <span className="shrink-0 text-[10px] text-[var(--muted)]">{session.bar}</span>}
         </span>
         <span className="truncate text-[10px] text-[var(--muted)]">
@@ -102,7 +103,11 @@ export default function AiTradeMemberRow({
         <Badge tone={positionTone(positionSide)}>{describePosition(positionSide)}</Badge>
         {price != null && (
           <span className="flex flex-col items-end">
-            <span className="text-[11px] tabular text-[var(--text)]">{fmtPrice(price)}</span>
+            <span className="max-w-[88px] truncate text-[11px] tabular text-[var(--text)]"
+              title={`${price.toLocaleString("en-US", { maximumSignificantDigits: 21, useGrouping: false })} USDT`}>
+              {price !== 0 && Math.abs(price) < .0001
+                ? price.toExponential(3) : fmtPrice(price)}
+            </span>
             {pct != null && (
               <span className="text-[10px] tabular" style={{ color: colorForReturn(pct) }}>
                 {fmtPct(pct)}
@@ -110,6 +115,15 @@ export default function AiTradeMemberRow({
             )}
           </span>
         )}
+      </span>
+      <span className="min-w-0 basis-full truncate text-[10px] text-[var(--muted)]"
+        data-testid="ai-member-integrity"
+        title={describeIntegrity(session?.integrity) +
+          (session?.integrity?.asOfTs != null
+            ? ` · 更新 ${new Date(session.integrity.asOfTs * 1000).toLocaleTimeString()}`
+            : "")}
+      >
+        {describeIntegrity(session?.integrity)}
       </span>
     </button>
   );

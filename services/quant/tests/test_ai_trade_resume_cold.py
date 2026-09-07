@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import pytest
+import json
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, func, select
 
@@ -24,6 +25,38 @@ from app.live_auto.manager import get_live_auto_manager
 
 _START_TS = 1_700_000_000
 _BAR_SECONDS = 3600            # 1H
+
+
+async def test_rebuild_preserves_ids_meta_and_run_basis_beyond_ui_window():
+    await init_db()
+    try:
+        async with get_sessionmaker()() as db:
+            run = await repo.create_run(
+                db, strategy_id=1, inst_id="BTC-USDT-SWAP", bar="1H",
+                mode="ai-trade", config={"costBasis": "net"}, status="paused")
+            for index in range(402):
+                close = bool(index % 2)
+                db.add(Trade(
+                    run_id=run.id, ts=2000000000 - index,
+                    side="close" if close else "long", price=100.0,
+                    qty=1.0, fee=0.0, pnl=1.0 if close else 0.0,
+                    position_after=0.0 if close else 1.0, reason="测试",
+                    explain_json=json.dumps({"meta": {
+                        "feeKnown": True, "feeBasis": "measured",
+                        "feeCurrency": "USDT", "accountingVersion": 2,
+                        "accountingEventId": f"event-{index}"}})))
+            await db.commit()
+        rebuilt = await rebuild_continuity(run.id, net_mode=False)
+        assert len(rebuilt["trades"]) == 402
+        assert rebuilt["costBasis"] == "net"
+        assert rebuilt["realizedPnlUsd"] == 201
+        assert rebuilt["trades"][0]["side"] == "long"
+        assert rebuilt["trades"][0]["id"] < rebuilt["trades"][-1]["id"]
+        meta = rebuilt["trades"][0]["explain"]["meta"]
+        assert meta["feeKnown"] is True
+        assert meta["accountingEventId"] == "event-0"
+    finally:
+        await dispose_engine()
 _CONFIG = {"instrumentSupported": True, "availUsdt": 1000.0, "posMode": "long_short_mode",
            "instMeta": {"ctVal": 0.01, "lotSz": 0.01, "minSz": 0.01, "tickSz": 0.1,
                         "maxLever": 125.0}, "lastPx": 30000.0}
@@ -72,9 +105,12 @@ class _FakeSession:
         self.take_profit_usd = kw.get("take_profit_usd")
         self.stop_loss_usd = kw.get("stop_loss_usd")
         self._window = _FakeWindow()
+        self.horizon_rule = None
         self._position_seq = 0
         self._known_cl_ord_ids: list[str] = []
         self._last_status_side = "flat"
+        from app.ai_auto.experience.runtime import ExperienceRuntime
+        self.experience = ExperienceRuntime(None, None, executor.settings)
 
     async def start(self):
         if _FakeSession.fail_start:
@@ -189,6 +225,7 @@ def _patch(monkeypatch, *, positions=None, pending=None, positions_error=False) 
     # 替身返回 `None`，由 `fee_rates.as_outcome` 归一成「没取到、也没有原因可讲」。
     monkeypatch.setattr("app.ai_auto.manager.fetch_trade_fee_ex", no_fee_rate)
     monkeypatch.setattr("app.ai_auto.manager.resolve_active_provider", fake_resolve)
+    monkeypatch.setattr("app.agent.providers.resolve_active_provider", fake_resolve)
     monkeypatch.setattr("app.ai_auto.resume.resolve_active_provider", fake_resolve,
                         raising=False)
     monkeypatch.setattr("app.ai_auto.manager.make_llm_client_from_config", lambda cfg: object())
@@ -464,7 +501,8 @@ async def test_continuity_rebuild_matches_hand_computed_numbers():
         assert net["positionSeq"] == 3
         assert net["entryFeeUsd"] == 0.15           # 只算当前未平周期的开仓腿
         assert net["realizedPnlUsd"] == 15.0        # net_mode：pnl 已是净额
-        assert gross["realizedPnlUsd"] == round(3 * (5.0 - 0.3), 6)   # gross：再扣两条腿费
+        assert gross["realizedPnlUsd"] == 15.0  # 旧执行器保持原 run 毛额
+        assert gross["tradingNetUsd"] is None  # 裸费用列没有来源证据
     finally:
         await dispose_engine()
 
@@ -639,13 +677,15 @@ def test_offline_exit_accounting_is_not_a_verbatim_copy_of_realized_pnl():
 
     row = {"posId": "POS-A", "realizedPnl": -12.0, "fee": 1.5, "fundingFee": 0.4,
            "liqPenalty": 0.0, "uTime": _START_TS + 60, "closeAvgPx": 29000.0}
-    expected = {"size": 0.6, "openCTime": _START_TS - 4 * _BAR_SECONDS}
+    row.update(currency="USDT", closed=True, settledPnl=0)
+    expected = {"size": 0.6, "posId": "POS-A",
+                "openCTime": _START_TS - 4 * _BAR_SECONDS}
 
     gross = _offline_exit_trade(row, expected, cost_basis="gross", local_trades=[])
-    assert round(gross["pnl"], 6) == -10.5 and round(gross["fee"], 6) == 1.5
+    assert round(gross["pnl"], 6) == -10.1 and round(gross["fee"], 6) == 1.5
 
     net = _offline_exit_trade(row, expected, cost_basis="net", local_trades=[])
-    assert round(net["pnl"], 6) == -12.4 and round(net["fee"], 6) == 1.5
+    assert round(net["pnl"], 6) == -11.6 and round(net["fee"], 6) == 1.5
     assert net["explain"]["meta"]["offlineFundingUsd"] == 0.4
     assert net["reason"] == "offline_exit"
     assert net["explain"]["meta"]["exitSource"] == "offline"
@@ -657,8 +697,12 @@ def test_offline_exit_only_takes_the_increment_and_bails_out_when_inconsistent()
 
     row = {"posId": "POS-A", "realizedPnl": -12.0, "fee": 1.5, "fundingFee": 0.0,
            "liqPenalty": 0.0, "uTime": _START_TS + 60, "closeAvgPx": 29000.0}
-    expected = {"size": 0.6, "openCTime": _START_TS}
-    local = [{"ts": _START_TS + 10, "side": "close", "pnl": -4.0, "fee": 0.5}]
+    row.update(currency="USDT", closed=True, settledPnl=0)
+    expected = {"size": 0.6, "openCTime": _START_TS, "posId": "POS-A"}
+    evidence = {"posId": "POS-A", "feeBasis": "measured",
+                "feeKnown": True, "feeCurrency": "USDT"}
+    local = [{"ts": _START_TS - 100, "side": "close", "pnl": -4.0,
+              "fee": 0.5, "explain": {"meta": evidence}}]
 
     incremental = _offline_exit_trade(row, expected, cost_basis="net", local_trades=local)
     assert round(incremental["pnl"], 6) == -8.0      # -12.0 减去暂停前已落的 -4.0
@@ -666,7 +710,14 @@ def test_offline_exit_only_takes_the_increment_and_bails_out_when_inconsistent()
 
     over_counted = [{"ts": _START_TS + 10, "side": "close", "pnl": -4.0, "fee": 9.0}]
     assert _offline_exit_trade(row, expected, cost_basis="net",
-                               local_trades=over_counted) is None    # 负手续费 ⇒ 退回缺口
+                               local_trades=over_counted) is None  # 缺身份和费用来源
+    rebate = _offline_exit_trade(row | {"fee": -0.2}, expected,
+                                cost_basis="net", local_trades=[])
+    assert rebate["fee"] == -0.2
+    assert _offline_exit_trade(row, expected, cost_basis="unknown",
+                               local_trades=[]) is None
+    assert _offline_exit_trade(row | {"settledPnl": None}, expected,
+                               cost_basis="net", local_trades=[]) is None
     assert _offline_exit_trade(None, expected, cost_basis="net", local_trades=[]) is None
 
 

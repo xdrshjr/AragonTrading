@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from uuid import uuid4
 
 _OPEN_ACTIONS = ("open_long", "open_short")
 
@@ -104,7 +105,15 @@ _LLM_FAILURE_PREFIXES = ("llm_error", "decision_timeout", "no_tool_call", "inval
 
 # 两个口径词的共享常量（[P2-6]）：漏斗是**全程累计**，而归因账本 `AttributionLedger._trips` 是
 # `deque(maxlen=200)` 的滚动窗口。两张卡并排时读者极易串口径，故两处文案各引用一个常量。
-LIFETIME_SCOPE_TEXT = "本会话全程累计"
+LIFETIME_SCOPE_TEXT = "当前运行段累计"
+
+EXECUTION_REASONS = frozenset({
+    "pre_submit_error", "canceled_before_send", "below_min_size",
+    "existing_order_kept", "position_not_flat", "same_side_position",
+    "exchange_rejected", "insufficient_balance", "attempt_persist_failed",
+    "acceptance_unknown", "pre_submit_context_changed", "facts_unavailable",
+    "quota_exhausted", "session_not_running", "other",
+})
 
 
 def wants_open(action: str, degrade: str | None) -> bool:
@@ -192,6 +201,60 @@ class OpenFunnelCounters:
     expired: int = 0                                            # 限价开仓单未成交即撤（事件级）
     expired_by_side: dict = field(default_factory=dict)         # {side: n}（**委托腿自己的 side**）
     insufficient_balance: int = 0                               # 下单被交易所判可用保证金不足
+    model_hold: int = 0
+    execution_blocked: dict = field(default_factory=dict)
+    execution_blocked_by_side: dict = field(default_factory=dict)
+    outcome_unknown: int = 0
+    outcome_unknown_by_side: dict = field(default_factory=dict)
+    runtime_epoch_id: str = field(default_factory=lambda: uuid4().hex)
+    _round: int = 0
+    _outcomes: dict = field(default_factory=dict)
+
+    def begin_round(self, round_no: int) -> None:
+        """绑定运行段内轮号；跨进程回执不迁移本段计数。"""
+        self.end_round()
+        self._round = round_no
+
+    def note_receipt(self, receipt: dict | None) -> None:
+        """按真实开仓回执收口，一次意图只消费一次。"""
+        if not self._intent_pending or not receipt:
+            return
+        status = receipt.get("status")
+        side = self._take_intent_side()
+        if status == "accepted":
+            self.submitted += 1
+            _bump(self.submitted_by_side, side)
+        elif status == "unknown":
+            self.outcome_unknown += 1
+            _bump(self.outcome_unknown_by_side, side)
+            attempt_id = receipt.get("attemptId")
+            if attempt_id:
+                self._outcomes[attempt_id] = (
+                    side, self.runtime_epoch_id, self._round)
+        else:
+            self._note_execution_block(side, receipt.get("reason"))
+
+    def resolve_outcome(self, attempt_id: str, status: str,
+                        reason: str = "exchange_rejected") -> None:
+        """将本段未知回执移到确认桶；重复及旧段回调均无副作用。"""
+        if status not in ("accepted", "rejected", "not_submitted"):
+            return
+        outcome = self._outcomes.pop(attempt_id, None)
+        if outcome is None or outcome[1] != self.runtime_epoch_id:
+            return
+        side = outcome[0]
+        self.outcome_unknown -= 1
+        self.outcome_unknown_by_side[side] -= 1
+        if status == "accepted":
+            self.submitted += 1
+            _bump(self.submitted_by_side, side)
+        else:
+            self._note_execution_block(side, reason)
+
+    def _note_execution_block(self, side: str, reason: str | None) -> None:
+        key = reason if reason in EXECUTION_REASONS else "other"
+        _bump(self.execution_blocked, key)
+        _bump(self.execution_blocked_by_side.setdefault(side, {}), key)
 
     # ---------- 喂数（三个记点 + 一个轮末兜底）----------
     def note_intent(self, action: str, degrade: str | None) -> None:
@@ -217,6 +280,8 @@ class OpenFunnelCounters:
             _bump(self.intents_by_side, self._intent_side)
         elif is_llm_failure(degrade):
             self.llm_degraded += 1
+        elif action == "hold" and degrade is None:
+            self.model_hold += 1
 
     def note_block(self, degrade: str | None) -> None:
         """轮末归类：把本轮的首个拦截层记进 `blocked`；**非开仓意愿轮直接返回**（[P0-3]）。
@@ -226,9 +291,9 @@ class OpenFunnelCounters:
         if not self._intent_pending:
             return
         key = classify_block(degrade)
-        side = self._take_intent_side()
         if key is None:
             return
+        side = self._take_intent_side()
         self.blocked[key] = self.blocked.get(key, 0) + 1
         _bump(self.blocked_by_side.setdefault(side, {}), key)
 
@@ -307,8 +372,12 @@ class OpenFunnelCounters:
         """
         self.contrarian_passed += 1
 
-    def end_round(self) -> None:
-        """轮末兜底清零（R-12）：决策轮抛异常时 `note_block` 不会被调到，标志会跨轮泄漏。"""
+    def end_round(self, receipt: dict | None = None,
+                  reason: str = "pre_submit_error") -> None:
+        """幂等收口：已确认回执优先，未发送异常不能冒充未知委托。"""
+        self.note_receipt(receipt)
+        if self._intent_pending:
+            self._note_execution_block(self._take_intent_side(), reason)
         self._intent_pending = False
         self._intent_side = None
 
@@ -383,6 +452,9 @@ def by_side_wire(counters: OpenFunnelCounters) -> dict:
                     for key, value in (counters.blocked_by_side.get(side) or {}).items() if value},
         "sizingZeroed": int(counters.sizing_zeroed_by_side.get(side, 0)),
         "submitted": int(counters.submitted_by_side.get(side, 0)),
+        "executionBlocked": dict(
+            counters.execution_blocked_by_side.get(side, {})),
+        "outcomeUnknown": int(counters.outcome_unknown_by_side.get(side, 0)),
         "filled": int(counters.filled_by_side.get(side, 0)),
         "expired": int(counters.expired_by_side.get(side, 0)),
     } for side in SIDES}
@@ -441,8 +513,14 @@ def funnel_wire(counters: OpenFunnelCounters | None, *, directional: bool = Fals
                        else {"key": top[0], "label": LAYER_LABELS.get(top[0], top[0]),
                              "count": top[1]}),
         "llmDegraded": counters.llm_degraded,
+        "modelHold": counters.model_hold,
         "sizingZeroed": counters.sizing_zeroed,
         "submitted": counters.submitted,
+        "executionBlocked": dict(counters.execution_blocked),
+        "outcomeUnknown": counters.outcome_unknown,
+        "schemaVersion": 2,
+        "runtimeEpochId": counters.runtime_epoch_id,
+        "coverage": "partial" if counters._intent_pending else "complete",
         "filled": counters.filled,
         # E-7 / E-8：委托之后的两格。`expired` 与 `filled` 互斥且都在「委托」之后，故闭合不变式
         # （`sum(blocked) + submitted + sizingZeroed <= intents`）逐字不变。

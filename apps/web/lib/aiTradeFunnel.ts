@@ -60,9 +60,10 @@ export function funnelStages(funnel: AiTradeOpenFunnel | null | undefined): Funn
   if (!funnel) return [];
   const total = funnel.intents;
   const blocked = sumBlocked(funnel);
-  const ratio = (n: number) => (total > 0 ? clamp01(n / total) : null);
+  const complete = hasCompleteFunnel(funnel) && isFunnelClosed(funnel);
+  const ratio = (n: number) => (complete && total > 0 ? clamp01(n / total) : null);
   const stages: FunnelStage[] = [
-    { key: "intents", label: "开仓意愿", count: total, ratio: total > 0 ? 1 : null, tone: "muted" },
+    { key: "intents", label: "开仓意愿", count: total, ratio: ratio(total), tone: "muted" },
     { key: "blocked", label: "被纪律拦下", count: blocked, ratio: ratio(blocked), tone: "short" },
     {
       key: "sizingZeroed",
@@ -71,7 +72,7 @@ export function funnelStages(funnel: AiTradeOpenFunnel | null | undefined): Funn
       ratio: ratio(funnel.sizingZeroed),
       tone: "accent",
     },
-    { key: "submitted", label: "发出委托", count: funnel.submitted, ratio: ratio(funnel.submitted), tone: "accent" },
+    { key: "submitted", label: "已接收订单", count: funnel.submitted, ratio: ratio(funnel.submitted), tone: "accent" },
     { key: "filled", label: "真的成交", count: funnel.filled, ratio: ratio(funnel.filled), tone: "long" },
     // ai-trade-loss-and-liveness-hardening E-7：与「真的成交」并列的**互斥末格**。合入前限价
     // 开仓单 602 笔里 223 笔（37%）从未成交而被撤销——模型决定开、闸全放行、单也发出去了，
@@ -85,6 +86,16 @@ export function funnelStages(funnel: AiTradeOpenFunnel | null | undefined): Funn
       tone: "short",
     },
   ];
+  if (funnel.schemaVersion === 2) {
+    const blockedExecution = Object.values(funnel.executionBlocked ?? {})
+      .reduce((sum, count) => sum + count, 0);
+    stages.splice(3, 0,
+      { key: "executionBlocked", label: "执行未提交", count: blockedExecution,
+        ratio: ratio(blockedExecution), tone: "short" },
+      { key: "outcomeUnknown", label: "回执待核实", count: funnel.outcomeUnknown ?? 0,
+        ratio: ratio(funnel.outcomeUnknown ?? 0), tone: "accent" },
+    );
+  }
   return stages.filter((stage) => stage.key !== "expired" || funnel.expired != null);
 }
 
@@ -101,7 +112,17 @@ export function sumBlocked(funnel: AiTradeOpenFunnel | null | undefined): number
  */
 export function isFunnelClosed(funnel: AiTradeOpenFunnel | null | undefined): boolean {
   if (!funnel) return true;
-  return sumBlocked(funnel) + funnel.submitted + funnel.sizingZeroed <= funnel.intents;
+  const known = sumBlocked(funnel) + funnel.submitted + funnel.sizingZeroed;
+  if (!hasCompleteFunnel(funnel)) return known <= funnel.intents;
+  const execution = Object.values(funnel.executionBlocked ?? {})
+    .reduce((sum, count) => sum + count, 0);
+  return known + execution + (funnel.outcomeUnknown ?? 0) === funnel.intents;
+}
+
+/** 旧服务端不能提供闭合终态分母，只展示计数与覆盖说明。 */
+export function hasCompleteFunnel(funnel: AiTradeOpenFunnel): boolean {
+  return funnel.schemaVersion === 2 && funnel.coverage === "complete"
+    && funnel.executionBlocked != null && funnel.outcomeUnknown != null;
 }
 
 /** 逐层拦截明细（按 `layers` 的决策链顺序，只列真的拦过的层）。 */
@@ -116,12 +137,14 @@ export function blockedRows(
       key,
       label: layerLabel(key),
       count: funnel.blocked[key],
-      ratio: funnel.intents > 0 ? clamp01(funnel.blocked[key] / funnel.intents) : null,
+      ratio: hasCompleteFunnel(funnel) && isFunnelClosed(funnel) && funnel.intents > 0
+        ? clamp01(funnel.blocked[key] / funnel.intents) : null,
     }));
 }
 
 /** 转化率的展示串；`conversion == null`（零意愿）⇒ `null` ⇒ 不渲染任何百分比。 */
 export function formatConversion(funnel: AiTradeOpenFunnel | null | undefined): string | null {
+  if (!funnel || !hasCompleteFunnel(funnel) || !isFunnelClosed(funnel)) return null;
   const value = funnel?.conversion;
   if (value == null || !Number.isFinite(value)) return null;
   return `${(value * 100).toFixed(1)}%`;

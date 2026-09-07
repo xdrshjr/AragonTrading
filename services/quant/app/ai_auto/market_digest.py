@@ -97,7 +97,7 @@ def _ema_structure(close: pd.Series) -> dict:
     if len(ema_fast) > _EMA_SLOPE_LOOKBACK and fast_last != 0:
         prev = float(ema_fast.iloc[-1 - _EMA_SLOPE_LOOKBACK])
         slope_pct = round((fast_last - prev) / abs(fast_last) * 100.0, 3)
-    return {"emaFast": round(fast_last, 6), "emaSlow": round(slow_last, 6),
+    return {"emaFast": fast_last, "emaSlow": slow_last,
             "emaRelation": relation, "emaSlopePct": slope_pct}
 
 
@@ -110,8 +110,8 @@ def _range_structure(df: pd.DataFrame, n: int) -> dict:
     swing_low = float(low.iloc[-n:].min())
     span = swing_high - swing_low
     range_pos = round((float(close.iloc[-1]) - swing_low) / span, 4) if span > 0 else None
-    return {"rangePos": range_pos, "swingHigh": round(swing_high, 6),
-            "swingLow": round(swing_low, 6)}
+    return {"rangePos": range_pos, "swingHigh": swing_high,
+            "swingLow": swing_low}
 
 
 def _trend_label(change_pct: float) -> str:
@@ -137,8 +137,7 @@ def _last_bar(df: pd.DataFrame) -> dict:
     row = df.iloc[-1]
     o, h, lo, c = float(row["o"]), float(row["h"]), float(row["l"]), float(row["c"])
     body_pct = round(abs(c - o) / o * 100.0, 3) if o else None
-    return {"o": round(o, 6), "h": round(h, 6), "l": round(lo, 6),
-            "c": round(c, 6), "bodyPct": body_pct}
+    return {"o": o, "h": h, "l": lo, "c": c, "bodyPct": body_pct}
 
 
 # ============================ 成交量 ============================
@@ -209,7 +208,7 @@ def _macd_reading(close: pd.Series) -> dict:
     hist = dif - ema(dif, _MACD_SIGNAL)
     last = float(hist.iloc[-1])
     label = "bullish" if last > 0 else "bearish"
-    return _reading(round(last, 6), label)
+    return _reading(last, label)
 
 
 def _boll_reading(close: pd.Series) -> dict:

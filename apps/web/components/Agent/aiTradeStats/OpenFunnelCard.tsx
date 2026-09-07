@@ -5,6 +5,7 @@ import {
   formatConversion,
   funnelStages,
   hasFunnelSamples,
+  hasCompleteFunnel,
   isFunnelClosed,
 } from "@/lib/aiTradeFunnel";
 import type { AiTradeOpenFunnel } from "@/lib/aiTradeTypes";
@@ -35,7 +36,7 @@ export default function OpenFunnelCard({
 
   return (
     <div
-      className="flex flex-col gap-1.5 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2"
+      className="flex min-w-0 flex-col gap-1.5 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2"
       data-testid="ai-open-funnel-card"
     >
       <div className="flex items-baseline justify-between gap-2">
@@ -45,6 +46,12 @@ export default function OpenFunnelCard({
           {conversion ? ` · 意愿→成交 ${conversion}` : ""}
         </span>
       </div>
+
+      {!hasCompleteFunnel(funnel) && (
+        <p className="text-[10px] text-[var(--muted)]">
+          历史分类不完整，无法验证闭合比例
+        </p>
+      )}
 
       {!enough ? (
         <p
@@ -61,7 +68,7 @@ export default function OpenFunnelCard({
           <div className="flex flex-col gap-0.5" data-testid="ai-open-funnel-stages">
             {stages.map((stage) => (
               <div key={stage.key} className="flex items-center gap-2 text-[11px]">
-                <span className="w-[72px] shrink-0 truncate text-[var(--muted)]">{stage.label}</span>
+                <span className="w-[72px] shrink-0 truncate text-[var(--muted)]" title={stage.label}>{stage.label}</span>
                 <span className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-[var(--surface-2)]">
                   {stage.ratio != null && (
                     <span
@@ -102,8 +109,7 @@ export default function OpenFunnelCard({
               className="text-[10px] leading-relaxed text-[var(--short-ink)]"
               data-testid="ai-open-funnel-broken"
             >
-              ⚠ 漏斗数据不闭合（各层拦截数之和超过了开仓意愿数），请把这条现象反馈给开发者
-              ——这说明后端的归类口径出了问题，本卡上的比例不可信。
+              漏斗数据不闭合，终态计数与开仓意愿不一致，当前比例暂不可用。
             </p>
           )}
         </>

@@ -172,13 +172,22 @@ async def test_g6_open_path_is_verbatim_unchanged_in_all_three_cancel_outcomes()
 
 
 async def test_market_open_payload_stays_byte_identical():
-    """G-6 的另一半：市价开仓 payload 与本特性合入前逐字相同（三元组解包不改一行逻辑）。"""
+    """非 AI 的原始业务字段及真实 wire 保持不变，内部发送身份不入 payload。"""
     ex, calls = _make_executor()
     await ex.apply([_Sig("long")], ref_px=_REF_PX, bar_index=0, ts=_TS)
     assert asdict(calls["orders"][0]) == {
         "inst_id": "BTC-USDT-SWAP", "direction": "long", "ord_type": "market",
         "td_mode": "cross", "px": None, "sz": 10.0, "lever": 3.0,
-        "tp_trigger_px": None, "sl_trigger_px": None}
+        "tp_trigger_px": None, "sl_trigger_px": None,
+        "client_order_id": None, "submission_trace": None}
+    from app.okx.order_builder import InstrumentMeta, build_order_payload
+    meta = InstrumentMeta(.01, "BTC", .01, .01, .1, 125, "linear", "USDT")
+    assert build_order_payload(
+        calls["orders"][0], meta, "long_short_mode", "originalid") == {
+        "instId": "BTC-USDT-SWAP", "tdMode": "cross", "side": "buy",
+        "posSide": "long", "ordType": "market", "sz": "10.00",
+        "clOrdId": "originalid",
+    }
 
 
 # ---------------- 【R:P1-1】放行分支的两个后果 ----------------

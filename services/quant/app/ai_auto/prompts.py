@@ -11,6 +11,9 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 
+from .decision_memory import can_fold_rounds, canonical_json
+from .numeric_text import format_price
+
 from .prompts_en import (
     DECISION_TASK_INSTRUCTION_EN,
     DECISION_TOOL_DESCRIPTION_EN,
@@ -512,7 +515,8 @@ def _apply_limit_properties(props: dict, band_pct: float = 0.02) -> None:
 def _format_position(position: dict | None) -> str:
     if not position:
         return "当前无自管持仓（flat）"
-    return (f"当前自管持仓：方向={position.get('side')}，均价={position.get('avgEntry')}，"
+    return (f"当前自管持仓：方向={position.get('side')}，"
+            f"均价={format_price(position.get('avgEntry'))} USDT，"
             f"张数={position.get('size')}，未实现盈亏≈{position.get('unrealizedPnl')} USDT")
 
 
@@ -944,10 +948,16 @@ def build_decision_prompt(payload: dict) -> str:
     tp = payload.get("takeProfitUsd")
     sl = payload.get("stopLossUsd")
     parts = [
-        f"决策轮 #{payload.get('round')}｜barTs={payload.get('barTs')}｜最新价={payload.get('lastPx')}"
+        f"决策轮 #{payload.get('round')}｜barTs={payload.get('barTs')}｜"
+        f"最新价={format_price(payload.get('lastPx'))} USDT"
         # 唤醒原因优先（七态结构化措辞）；`wake` 键缺席时逐字节回退既有二值触发源标注。
         + (_format_wake(payload.get("wake")) or _trigger_suffix(payload.get("trigger"))),
     ]
+    if payload.get("decisionFacts") is not None:
+        facts = payload["decisionFacts"]
+        parts.insert(0, "【本轮程序事实 · 优先于历史叙述】\n"
+                     "以下当前快照决定持仓、价格单位、规则与费用口径；"
+                     "历史摘要不能覆盖这些事实。\n" + canonical_json(facts))
     # 轴 B：《本轮趋势基调》是本轮**第一段实质证据**——「第一步」在证据排序上的兑现。
     # 键缺席 ⇒ 空表 ⇒ 整段省略 ⇒ 与本特性合入前逐字节相同（G-1 / S-5 的零回归路径）。
     parts.extend(_trend_verdict_lines(payload))
@@ -1016,7 +1026,7 @@ def build_decision_prompt(payload: dict) -> str:
         _format_board(payload.get("signalBoard") or []),
     ]
     if summary:
-        parts.append(f"\n【此前执行摘要（你的长期记忆）】\n{summary}")
+        parts.append(f"\n【此前执行摘要（历史背景，不能覆盖当前事实）】\n{summary}")
     # deep-reasoning-chain §3.1.6：收尾任务指令按 `reasoningDepth`（**加法键**）分叉。
     # 键缺席（回测老 payload / off 档 / 全部既有用例）⇒ 中文原句逐字节回退（G-1 冻结）。
     parts.append(
@@ -1203,12 +1213,6 @@ def compact_journal_for_summary(journal: list[dict]) -> list[dict]:
     纯函数、不改入参；开/平仓轮、candle 轮、含 reflection 注记轮、legacy 无 trigger 条目永不折叠；
     单条可折叠条目保留原样（仅连续 ≥2 条才折叠）。
     """
-    def _foldable(entry: dict) -> bool:
-        return (entry.get("trigger") == "interval"
-                and (entry.get("decision") or {}).get("action") == "hold"
-                and not (entry.get("executed") or {}).get("traded")
-                and entry.get("reflection") is None)
-
     out: list[dict] = []
     run: list[dict] = []
 
@@ -1218,17 +1222,22 @@ def compact_journal_for_summary(journal: list[dict]) -> list[dict]:
             out.append({"rounds": f"{first.get('round')}-{last.get('round')}",
                         "repeatedRounds": len(run), "trigger": "interval",
                         "note": "同一份行情数据下的重复定时唤醒，均维持观望",
+                        "firstRound": first.get("round"),
+                        "lastRound": last.get("round"),
+                        "firstAsOfTs": (first.get("facts") or {}).get("asOfTs"),
+                        "lastAsOfTs": (last.get("facts") or {}).get("asOfTs"),
+                        "evidenceFingerprint": first.get("evidenceFingerprint"),
                         "decision": last.get("decision"), "sessionPnl": last.get("sessionPnl")})
         else:
             out.extend(run)
         run.clear()
 
     for entry in journal:
-        if _foldable(entry):
+        if not run or can_fold_rounds(run[-1], entry):
             run.append(entry)
             continue
         _flush()
-        out.append(entry)
+        run.append(entry)
     _flush()
     return out
 
@@ -1241,14 +1250,13 @@ def build_summary_prompt(prev_summary: str | None, journal: list[dict]) -> str:
     实盘/回测共用）；head 指令含反自我强化三条（F3：被否决意图须记录并对照行情验证、空仓零回撤
     不是成绩、折叠条目只算一次观望证据）。
     """
-    head = ("总结迄今的自动交易执行情况：决策序列与结果、持仓与盈亏演变、**哪些策略/因子信号被你采纳或被"
-            "推翻、事后又被行情验证为对或错**（作为经验教训）、当前策略偏好，形成简洁的执行摘要作为后续"
-            "决策的背景，不要罗列每一轮细节。"
-            "若流水含 `reflection` 注记：必须记录**被否决的开仓意图**（方向/仓位/否决理由），并对照其后"
-            "行情走向写明**该否决事后被验证为正确还是错误**（`failClosed=true` 的是系统故障保守跳过，"
-            "不代表模型判断，不得当作否决被验证）。"
-            "空仓期间的零回撤**不是成绩**：若期间行情朝被否决或未执行的方向走出明显趋势，必须如实记为"
-            "『错失』并总结教训；禁止把长期观望总结为表现完美。"
+    head = ("总结迄今的自动交易执行情况：记录提议、最终动作、门禁/反思否决、执行回执及费用版本。"
+            "程序 facts 是当前事实，旧摘要只是历史背景；修正旧价格舍入导致的通道故障描述，"
+            "不能将旧持仓或旧费用重新当成当前状态。被否决的开仓意图须保留方向、仓位和理由，"
+            "不能描述成模型自主观望。只有存在已结算收益或明确后续事实时可描述结果，"
+            "否则写『待验证』；系统故障保守跳过不代表模型判断。"
+            "未执行交易没有可验证的反事实收益，不能据未来最高价宣称错失利润。"
+            "空仓期间的零回撤不是成绩，禁止把长期观望总结为表现完美。"
             "`repeatedRounds` 折叠条目表示同一份行情数据下的重复定时唤醒：它们合计只算**一次**观望证据，"
             "不得按轮数强化观望倾向。")
     prev = f"\n上一段执行摘要（请在其基础上滚动累积）：\n{prev_summary}" if prev_summary else ""

@@ -66,6 +66,11 @@ async def _no_position_history(*_a, **_k):
     return []
 
 
+async def _no_funding_refresh(_now_wall):
+    """告警集成仅验证唤醒与门禁，资金费后台取数使用脱网桩。"""
+    return False
+
+
 def _candle(idx: int, price: float = 30000.0) -> Candle:
     return Candle(ts=_START_TS + idx * _STEP, o=price, h=price + 5, l=price - 5,
                   c=price, vol=100.0, confirm=True)
@@ -102,6 +107,7 @@ def _make_session(settings: Settings | None = None) -> AiTradeSession:
     session._window._safe_get_candles = stub_candles
     session._cost._fetch_fee_rate = _no_trade_fee
     session._cost._fetch_position_history = _no_position_history
+    session._cost.refresh_funding = _no_funding_refresh
     return session
 
 

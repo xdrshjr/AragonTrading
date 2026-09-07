@@ -1,6 +1,7 @@
 // AI 自动交易 wire 类型（camelCase，与后端 schemas.py 的 AiTrade* 同构）。
 // 运行期句柄（sessionId 等）为瞬态（store 不入 partialize）；aiTradeConfig 为持久化偏好。
 import type { FeeRatesWire, ReconcileWire } from "./aiTradeCost";
+import type { IntegritySnapshot, OpenAttemptReceipt } from "./aiTradeIntegrity";
 import type { AiTradeContrarianBlocked } from "./aiTradeHistoryTypes";
 import type { AiTradeRealizedStats } from "./aiTradeProfitability";
 import type {
@@ -264,6 +265,9 @@ export interface AiTradeRestingOrder {
 
 // 本轮 AI 决策（受约束）：action + 可选仓位占比/置信度 + 理由 + 信号板 + 执行结果 + 体制/共识/降级（E1/E2/E3）。
 export interface AiTradeDecision {
+  factsHash?: string | null;
+  sizingVerdict?: Record<string, unknown> | null;
+  executionReceipt?: OpenAttemptReceipt | null;
   ts: number;
   round: number;
   action: AiTradeAction;
@@ -277,6 +281,9 @@ export interface AiTradeDecision {
   reason: string;
   signalBoard: StrategySignalView[];
   executed?: {
+    factsHash?: string | null;
+    executionReceipt?: OpenAttemptReceipt | null;
+    executionContextChanged?: boolean | string;
     ok?: boolean;
     action?: string;                        // 门禁后最终动作（后端 _execute_decision 回带；与 wire §5.1 一致）
     skipped?: boolean;
@@ -1259,6 +1266,7 @@ export interface AiTradeRoundTrace {
 
 // GET /ai-trade/status 与 WS snapshot 的会话只读视图（info()）。
 export interface AiTradeSessionRow {
+  integrity?: IntegritySnapshot | null;
   sessionId: string;
   runId: number;
   state: string;
@@ -1390,6 +1398,7 @@ export interface AiTradeSessionRow {
 
 // WS status 事件负载（_status_payload / 轻量 status，会话视图的可增量合并子集）。
 export interface AiTradeStatusEvent {
+  integrity?: IntegritySnapshot | null;
   state: string;
   positionSide?: string;
   sessionPnlUsd?: number;
@@ -2332,6 +2341,12 @@ export interface AiTradeOrphan {
 }
 
 export interface AiTradeOpenFunnel {
+  schemaVersion?: number;
+  coverage?: "complete" | "partial";
+  runtimeEpochId?: string;
+  modelHold?: number;
+  executionBlocked?: Record<string, number>;
+  outcomeUnknown?: number;
   intents: number;
   blocked: Record<string, number>;
   topBlocker: { key: string; label: string; count: number } | null;
@@ -2357,6 +2372,8 @@ export interface AiTradeOpenFunnel {
 export type AiTradeIntentSide = "long" | "short" | "unknown";
 
 export interface AiTradeSideFunnel {
+  executionBlocked?: Record<string, number>;
+  outcomeUnknown?: number;
   intents: number;
   blocked: Record<string, number>;
   sizingZeroed: number;

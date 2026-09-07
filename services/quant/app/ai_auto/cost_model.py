@@ -14,10 +14,8 @@ crossingLegs × (halfSpreadBps + impactBps) + fundingCarryBps`。纯函数、无
 3. **资金费率方向感知且只取不利侧**：收费的一侧不给 edge 折扣（绝不因预期收费而放松门禁），
    付费的一侧全额计入。
 
-与 01 号诊断文档的一处**显式泛化**（spec §3.4）：文档写的是固定 `2×` 半价差，本模块按开仓腿的
-委托类型取 `crossing_legs ∈ {1, 2}`——maker 腿按定义是被动方、不吃半价差，固定 `2×` 会抹掉
-maker-first 的一半收益来源，与 D-17 要解决的问题自相矛盾。`ord_type=="market"` 时本式退化为文档
-原式，故是严格泛化而非改口径。
+普通 limit 与 market 采用 may_take：双 taker 费用、双吃价腿。只有明确保证 maker 的执行假设
+才使用单吃价腿；回测显式标记 simulation，费率与模拟执行器同源。
 """
 from __future__ import annotations
 
@@ -30,7 +28,7 @@ DEFAULT_FUNDING_INTERVAL_S: float = 28800.0
 # 成本读数的统一小数位（避免浮点尾巴污染 wire 与断言；不改变任何判定量级）。
 _ROUND_BPS = 6
 
-# 开仓腿吃价差的腿数：市价两腿都吃，限价开仓只有平仓腿吃。
+# 仅 maker_guaranteed 才读取这份映射；普通 limit 恒按双腿计算。
 _CROSSING_LEGS = {"limit": 1, "market": 2}
 
 
@@ -43,6 +41,8 @@ class CostParams:
     half_spread_fallback_bps: float
     impact_bps: float
     expected_hold_bars: int
+    liquidity_assumption: str = "may_take"
+    fee_source: str = "config"
 
 
 @dataclass(frozen=True)
@@ -59,6 +59,8 @@ class CostQuery:
     # 1/2/4/8 小时）。False ⇒ 上面那个数只是保守回落值，文案必须写「结算周期未知，按 8h 保守估算」
     # 而不能报出一个确定的周期（holding-horizon §2.7 的诚实约束）。
     funding_interval_known: bool = False
+    liquidity_assumption: str = "may_take"
+    fee_source: str = "config"
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,27 @@ class CostBreakdown:
     # `funding_interval_s is None` ⇒ 文案如实写「结算周期未知，按 8h 保守估算」。
     funding_periods: int | None = None
     funding_interval_s: float | None = None
+    model_version: int = 2
+    liquidity_assumption: str = "may_take"
+    fee_source: str = "config"
+
+
+@dataclass(frozen=True)
+class RoundCostSnapshot:
+    """同一轮事前所有消费点共用的不可变成本断面。"""
+
+    params: CostParams
+    as_of_ts: float
+    fee_source: str
+    stale: bool
+    spread_bps: float | None = None
+    impact_bps: float = 0.0
+    funding_bps: float | None = None
+    liquidity_assumption: str = "may_take"
+    funding: object = None
+    fee_snapshot: object = None
+    funding_enabled: bool = True
+    model_version: int = 2
 
 
 def resolve_cost_params(settings, *, rates: tuple[float, float] | None = None,
@@ -121,6 +144,7 @@ def backtest_params(settings, *, expected_hold_bars: int | None = None) -> CostP
         taker_fee_bps=float(settings.default_taker_fee_bps),
         half_spread_fallback_bps=float(settings.default_slippage_bps),
         impact_bps=0.0,
+        liquidity_assumption="simulation",
         expected_hold_bars=int(expected_hold_bars if expected_hold_bars is not None
                                else settings.ai_trade_cost_expected_hold_bars))
 
@@ -172,14 +196,14 @@ def estimate_round_trip_cost(query: CostQuery, params: CostParams) -> CostBreakd
         逐项拆开的 `CostBreakdown`；资金费率缺席时 `funding_carry_bps is None` 且
         `confidence == "degraded"`，此时 `total_bps` **不含**资金费率项（不假装它是 0）。
     """
-    ord_type = "limit" if query.ord_type == "limit" else "market"
-    fee_open = params.maker_fee_bps if ord_type == "limit" else params.taker_fee_bps
+    maker = query.liquidity_assumption == "maker_guaranteed"
+    fee_open = params.maker_fee_bps if maker else params.taker_fee_bps
     fee_close = params.taker_fee_bps
     half_spread = _finite(query.half_spread_bps)
     if half_spread is None or half_spread < 0:
         half_spread = params.half_spread_fallback_bps
     impact = max(0.0, params.impact_bps)
-    legs = _CROSSING_LEGS[ord_type]
+    legs = 1 if maker else 2
     carry = _funding_carry_bps(query, params)
     total = fee_open + fee_close + legs * (half_spread + impact) + (carry or 0.0)
     return CostBreakdown(
@@ -193,7 +217,11 @@ def estimate_round_trip_cost(query: CostQuery, params: CostParams) -> CostBreakd
         # 下发——「跨几个结算点」与「这几期要付多少」是两件事，前者不该被后者的缺失连坐。
         funding_periods=funding_periods(query, params),
         funding_interval_s=(_finite(query.funding_interval_s)
-                            if query.funding_interval_known else None))
+                            if query.funding_interval_known else None),
+        liquidity_assumption=("simulation"
+            if params.liquidity_assumption == "simulation"
+            else query.liquidity_assumption), fee_source=(params.fee_source
+                if query.fee_source == "config" else query.fee_source))
 
 
 def cost_wire(cost: CostBreakdown | None) -> dict | None:
@@ -203,7 +231,10 @@ def cost_wire(cost: CostBreakdown | None) -> dict | None:
     return {"feeOpenBps": cost.fee_open_bps, "feeCloseBps": cost.fee_close_bps,
             "halfSpreadBps": cost.half_spread_bps, "impactBps": cost.impact_bps,
             "crossingLegs": cost.crossing_legs, "fundingCarryBps": cost.funding_carry_bps,
-            "totalBps": cost.total_bps, "confidence": cost.confidence}
+            "totalBps": cost.total_bps, "confidence": cost.confidence,
+            "modelVersion": cost.model_version,
+            "liquidityAssumption": cost.liquidity_assumption,
+            "feeSource": cost.fee_source}
 
 
 def query_for_preview(*, ord_type: str, side: str, bar_seconds: int, funding,
@@ -255,3 +286,20 @@ def break_even_px(entry_px: float, *, side: str, cost_bps: float) -> float | Non
     if px is None or px <= 0 or cost is None or side not in ("long", "short"):
         return None
     return px * (1.0 + cost / 1e4) if side == "long" else px * (1.0 - cost / 1e4)
+
+
+def position_break_even_px(inputs: dict) -> float | None:
+    """按剩余开仓费、已计提资金费和一次未来平仓费精确求回本价。"""
+    entry, qty = _finite(inputs.get("avgEntry")), _finite(inputs.get("qtyCoin"))
+    opened = _finite(inputs.get("openFeeUsd"))
+    funding = _finite(inputs.get("fundingAccruedUsd"))
+    rate = _finite(inputs.get("closeFeeRate"))
+    if any(v is None for v in (entry, qty, opened, funding, rate)):
+        return None
+    side = inputs.get("side")
+    if entry <= 0 or qty <= 0 or side not in ("long", "short"):
+        return None
+    sign = 1 if side == "long" else -1
+    denominator = qty * (1 - sign * rate)
+    numerator = qty * entry + sign * (opened + funding)
+    return numerator / denominator if denominator > 0 and numerator > 0 else None

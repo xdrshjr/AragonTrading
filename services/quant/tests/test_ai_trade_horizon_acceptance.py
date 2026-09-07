@@ -123,17 +123,27 @@ def test_wallclock_and_in_position_turnover_are_both_emitted_and_differ():
 
 
 # ---------------- A-6 [P1-1]：全程累计 vs 200 环形窗口 ----------------
+def _record_trip(ledger, pnl):
+    """为累计窗口场景提供完整双腿；开仓真实零费、平仓费用来源明确。"""
+    number = ledger.lifetime_cost()["roundTrips"] + 1
+    shared = {"qty": 1, "price": 100, "feeKnown": True, "feeBasis": "measured"}
+    ledger.note_open({**shared, "id": 2 * number - 1, "side": "long",
+                      "fee": 0, "positionAfter": 1}, seq=number)
+    ledger.record_close({**shared, "id": 2 * number, "side": "close",
+                         "fee": .1, "pnl": pnl, "positionAfter": 0})
+
+
 def test_lifetime_and_rolling_cost_agree_below_capacity_and_diverge_above():
     """A-6：≤200 笔时逐位相等；>200 笔后必然分叉，验收卡取的是 lifetime。"""
     ledger = AttributionLedger(net_mode=True)
     for _ in range(200):
-        ledger.record_close({"pnl": 1.0, "fee": 0.1})
+        _record_trip(ledger, 1.0)
     stats = ledger.stats()
     assert stats["cost"]["costRatio"] == stats["cost"]["lifetime"]["costRatio"]
     assert stats["cost"]["roundTrips"] == stats["cost"]["lifetime"]["roundTrips"]
 
     for _ in range(50):
-        ledger.record_close({"pnl": 3.0, "fee": 0.1})
+        _record_trip(ledger, 3.0)
     stats = ledger.stats()
     assert stats["cost"]["roundTrips"] == 200
     assert stats["cost"]["lifetime"]["roundTrips"] == 250
@@ -144,7 +154,7 @@ def test_build_input_consumes_the_lifetime_block():
     """验收卡的成本四项一律取 `cost.lifetime.*`（写成环形口径会悄悄换时间窗）。"""
     ledger = AttributionLedger(net_mode=True)
     for _ in range(250):
-        ledger.record_close({"pnl": 1.0, "fee": 0.1})
+        _record_trip(ledger, 1.0)
     inp = build_input(horizon_parts={"roundTrips": 250, "holdSecondsSum": 0.0,
                                      "holdSamples": 0, "withinTargetSamples": 0},
                       lifetime_cost=ledger.lifetime_cost(), exit_stats=None,

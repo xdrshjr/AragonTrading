@@ -295,11 +295,13 @@ def test_summary_prompt_carries_anti_reinforcement_instructions():
     from app.ai_auto.prompts import build_summary_prompt
     text = build_summary_prompt(None, [])
     assert "被否决的开仓意图" in text
-    assert "failClosed=true" in text and "系统故障保守跳过" in text
-    assert "零回撤**不是成绩**" in text
+    assert "系统故障保守跳过不代表模型判断" in text
+    assert "零回撤不是成绩" in text
     assert "禁止把长期观望总结为表现完美" in text
     assert "repeatedRounds" in text and "只算**一次**观望" in text
-    assert "哪些策略/因子信号被你采纳或被推翻" in text          # 原句保留（零回归）
+    assert "只有存在已结算收益或明确后续事实" in text
+    assert "否则写『待验证』" in text
+    assert "不能据未来最高价宣称错失利润" in text
 
 
 def test_summary_system_prompt_requires_recording_omissions():
@@ -322,6 +324,9 @@ def test_system_prompt_hold_is_active_not_default():
 def _journal_entry(round_no: int, *, trigger="interval", action="hold", traded=False,
                    reflection=None) -> dict:
     return {"round": round_no, "signalBoard": [],
+            "proposal": {"action": action},
+            "facts": {"position": None, "asOfTs": round_no},
+            "evidenceFingerprint": "same-current-evidence",
             "decision": {"action": action, "sizeFraction": None, "confidence": 0.7,
                          "reason": "r", "orderType": "market", "limitPrice": None},
             "executed": {"ok": True, "action": action, "traded": traded,

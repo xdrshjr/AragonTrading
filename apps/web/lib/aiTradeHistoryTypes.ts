@@ -1,6 +1,7 @@
 // AI 自动交易统计历史 wire 类型（ai-trade-stats-dashboard §3.8）：与后端 schemas.AiTradeHistory* 逐字对齐。
 // 皆为组件 / lib 局部类型，不入 store（历史走 TanStack Query，不持久化）。时间戳全为秒（§6.2 / P2-8）。
 import type { FeeRatesWire, ReconcileWire } from "./aiTradeCost";
+import type { EconomicsSnapshot, IntegritySnapshot } from "./aiTradeIntegrity";
 import type {
   AiTradeAcceptance,
   AiTradeExitMix,
@@ -46,6 +47,7 @@ export interface AiTradeHistoryListOut {
 }
 
 export interface AiTradeHistorySummary {
+  economics?: EconomicsSnapshot | null;
   realizedPnlUsd: number;
   returnPct: number;
   tradeCount: number;
@@ -112,6 +114,7 @@ export interface AiTradeRunMetrics {
     reflectionVerdict?: string | null; // R2-07：后端 _digest_decisions 已下发（缺省 null）
   }[];
   aiStats?: {
+    integrity?: IntegritySnapshot | null;
     decisionRounds: number;
     actionCounts: Record<string, number>;
     holdRate: number;

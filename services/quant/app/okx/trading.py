@@ -101,6 +101,12 @@ def _gen_cl_ord_id() -> str:
     return f"aragon{ms:x}{seq:03x}"
 
 
+def new_client_order_id() -> str:
+    """生成历史不复用的 AI 委托身份（32 位字母数字）。"""
+    from uuid import uuid4
+    return uuid4().hex
+
+
 def _fetch_meta_sync(raw: dict) -> InstrumentMeta:
     """rest 元数据 dict → ``InstrumentMeta`` 值对象。"""
     return InstrumentMeta(
@@ -160,7 +166,8 @@ def _audit_values(account_id: int, order: OrderInput, cl_ord_id: str, *,
 async def place_live_order(session: AsyncSession, creds: AccountCredentials, account_id: int,
                            order: OrderInput, *, settings: Settings) -> dict:
     """完整下单时序（§2.2）：守门→设杠杆→下单→留痕。失败归一并审计后上抛（绝不假成功）。"""
-    cl_ord_id = _gen_cl_ord_id()
+    cl_ord_id = order.client_order_id or _gen_cl_ord_id()
+    trace = order.submission_trace
     client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
     try:
         meta = await _load_meta(order.inst_id)
@@ -177,9 +184,26 @@ async def place_live_order(session: AsyncSession, creds: AccountCredentials, acc
         if order.lever is not None:
             await client.set_leverage(order.inst_id, order.lever, order.td_mode,
                                       _leverage_pos_side(order, pos_mode))
-        row = await client.place_order(payload)
+        if trace is not None:
+            trace.phase = "sent"
+        if order.client_order_id is not None:
+            row = await client.place_order(payload, allow_retry=False)
+        else:
+            row = await client.place_order(payload)
+        ord_id = str(row.get("ordId") or "")
+        if trace is not None and ord_id:
+            trace.ack, trace.ord_id = "accepted", ord_id
+        if order.client_order_id is not None and not ord_id:
+            raise OKXPrivateError("OKX_EMPTY_ORDER_ACK", "委托身份尚未确认")
         _drop_positions_cache(client)          # 轴 C-3：写即作废（成功路径唯一落点）
     except OKXError as exc:
+        if trace is not None and trace.ack == "none":
+            trace.error_code = exc.code
+            if trace.phase == "sent" and exc.code in {
+                "51008", "51004", "51000", "51001", "51010",
+                "51006", "51121",
+            }:
+                trace.ack = "rejected"
         mapped = _map_trade_code(exc.code)
         status = "rejected" if mapped in _LOCAL_REJECT_CODES else "error"
         await repo.create_live_order_audit(session, values=_audit_values(
@@ -454,10 +478,13 @@ def _normalize_order(r: dict) -> dict:
     """OKX ``trade/order`` 单行 → 归一订单状态（camelCase，秒级 UTC，数值容错）。"""
     return {
         "state": str(r.get("state") or ""),
+        "instId": str(r.get("instId") or ""),
+        "side": str(r.get("side") or ""),
+        "posSide": str(r.get("posSide") or ""),
         "px": _optional_float(r.get("px")),
         "sz": _optional_float(r.get("sz")),
         "avgPx": _optional_float(r.get("avgPx")),
-        "accFillSz": _optional_float(r.get("accFillSz")) or 0.0,
+        "accFillSz": _optional_float(r.get("accFillSz")),
         "ordId": str(r.get("ordId") or "") or None,
         "clOrdId": str(r.get("clOrdId") or "") or None,
         "updatedTs": int(r.get("uTime") or 0) // 1000,
@@ -775,19 +802,46 @@ async def fetch_position_history(creds: AccountCredentials, inst_id: str, *, lim
     return [_normalize_position_history(r) for r in rows]
 
 
+def _history_number(value) -> float | None:
+    """结算事实缺失或非有限时保持未知，合法零与返佣保留。"""
+    import math
+    try:
+        number = _optional_float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if number is not None and math.isfinite(number) else None
+
+
+def _history_amounts(row: dict) -> dict:
+    amounts = {}
+    for key in ("pnl", "realizedPnl", "settledPnl",
+                "fee", "fundingFee", "liqPenalty"):
+        value = _history_number(row.get(key))
+        if value is not None and key in {"fee", "fundingFee", "liqPenalty"}:
+            value = -value
+        amounts[key] = value
+    complete = all(value is not None for value in amounts.values())
+    amounts["identityGapUsd"] = (
+        amounts["realizedPnl"] - (
+            amounts["pnl"] - amounts["fee"] - amounts["fundingFee"]
+            - amounts["liqPenalty"] + amounts["settledPnl"])
+        if complete else None)
+    return amounts
+
+
 def _normalize_position_history(r: dict) -> dict:
     """OKX ``positions-history`` 单行 → 归一（秒级时间、**支出为正**、附恒等式自检残差）。
 
     ``fee`` / ``fundingFee`` / ``liqPenalty`` 三项按 OKX 口径为负数=支出，此处**取反**统一为
     「正数 = 支出」；``pnl`` 与 ``realizedPnl`` 保持「正数 = 盈利」原义。``identityGapUsd`` 是官方
-    关系式 ``realizedPnl = pnl + fee + fundingFee + liqPenalty`` 的运行期残差（三项已取反故此处为减）
+    关系式还包含原符号的 ``settledPnl``；缺少任一金额则残差未知。
     ——本 spec 不把该式当前提，只在运行期数值自检（C-3）。
     """
-    fee = -(_optional_float(r.get("fee")) or 0.0)
-    funding = -(_optional_float(r.get("fundingFee")) or 0.0)
-    liq = -(_optional_float(r.get("liqPenalty")) or 0.0)
-    pnl = _optional_float(r.get("pnl")) or 0.0
-    realized = _optional_float(r.get("realizedPnl")) or 0.0
+    inst_id = str(r.get("instId") or "")
+    currency = str(r.get("settleCcy") or r.get("ccy") or "")
+    close_type = str(r.get("type") or "")
+    closed = {"1": False, "2": True, "3": True, "4": False,
+              "5": False, "6": True}.get(close_type)
     return {
         "posId": str(r.get("posId") or ""), "instId": str(r.get("instId") or ""),
         "direction": str(r.get("direction") or ""),
@@ -795,9 +849,12 @@ def _normalize_position_history(r: dict) -> dict:
         "closeAvgPx": _optional_float(r.get("closeAvgPx")) or 0.0,
         "cTime": int(_optional_float(r.get("cTime")) or 0) // 1000,
         "uTime": int(_optional_float(r.get("uTime")) or 0) // 1000,
-        "pnl": pnl, "fee": fee, "fundingFee": funding, "liqPenalty": liq,
-        "realizedPnl": realized,
-        "identityGapUsd": realized - (pnl - fee - funding - liq),
+        **_history_amounts(r),
+        "instType": str(r.get("instType") or ""),
+        "mgnMode": str(r.get("mgnMode") or ""),
+        "ccy": str(r.get("ccy") or ""), "closed": closed,
+        "currency": ("USDT" if currency == "USDT"
+                     and "-USDT-" in inst_id else None),
     }
 
 

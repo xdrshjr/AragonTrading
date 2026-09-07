@@ -27,6 +27,7 @@ from ..okx.order_builder import (
     CancelOrderInput,
     ClosePositionInput,
     OrderInput,
+    SubmissionTrace,
     snap_size,
 )
 from ..okx.rest_client import OKXError
@@ -37,9 +38,11 @@ from ..okx.trading import (
     fetch_live_order,
     fetch_live_positions_at,
     place_live_order,
+    new_client_order_id,
 )
 from ..wire_caps import TRADE_LEDGER_MAX
 from .fee_ledger import FeeLedger, audit_fills, trade_fee_fields
+from .execution_receipt import receipt_from_trace
 from ..ai_auto.orphan import (
     OrphanFacts,
     classify_orphan,
@@ -253,6 +256,9 @@ class LiveExecutor:
         self._cancel_order = cancel_order_fn or self._default_cancel_order
         self._get_order = get_order_fn or self._default_get_order
         self._read_fills = fills_fn or self._default_read_fills
+        self.open_attempts = None
+        self.last_open_receipt = None
+        self._open_attempt_id = ""
 
     # ---------- 默认 OKX 调用（短生命周期 session，R3）----------
     async def _default_place_order(self, order: OrderInput) -> dict:
@@ -350,9 +356,15 @@ class LiveExecutor:
         self._bar_cursor = bar_index
         # exit-priority §5.5：本次 apply 的「平仓未下发」原因码（每次调用先清，绝不跨轮残留）。
         self.last_close_block = None
+        self.last_open_receipt = None
+        self._open_attempt_id = new_client_order_id()
         events: list[dict] = []
         events += await self._maybe_time_exit(ref_px, ts)
         actions = self._project_signals(signals)
+        if not any(action[0] == "open" for action in actions):
+            if any(getattr(signal, "side", None) in ("long", "short")
+                   for signal in signals):
+                self._block_open("same_side_position")
         for index, action in enumerate(actions):
             plan = order_plan if index == len(actions) - 1 else None   # P1-6：只绑终态腿
             if action[0] == "close":
@@ -402,24 +414,74 @@ class LiveExecutor:
         return await self._do_close(ref_px, ts, "max_hold", close_kind="max_hold")
 
     # ---------- 开 / 平 ----------
+    def _block_open(self, reason: str) -> None:
+        self.last_open_receipt = receipt_from_trace(
+            self._open_attempt_id, self.inst_id, None,
+            SubmissionTrace(), reason)
+
+    async def _submit_open(self, order: OrderInput) -> dict | None:
+        """真实发送边界：AI 先持久化，finally 保留不可降级的 ack。"""
+        manager = self.open_attempts
+        if manager is not None:
+            try:
+                prepared = await manager.prepare(order)
+            except asyncio.CancelledError:
+                self._block_open("canceled_before_send")
+                raise
+            if not prepared:
+                self._block_open(manager.block_reason or "attempt_persist_failed")
+                return None
+            self._open_attempt_id = manager.pending.attempt_id
+        trace = order.submission_trace or SubmissionTrace()
+        reason = "pre_submit_error"
+        try:
+            result = await self._place_order(order)
+            # 注入适配器可直接返回确认回执；异常仍以旁路 trace 为准。
+            if result.get("ordId") and trace.ack == "none":
+                trace.phase, trace.ack = "sent", "accepted"
+                trace.ord_id = str(result["ordId"])
+            elif trace.ack == "none":
+                trace.phase = "sent"
+            self._note_private_write()
+            return result if trace.ack == "accepted" else None
+        except asyncio.CancelledError:
+            reason = "canceled_before_send"
+            raise
+        finally:
+            self.last_open_receipt = receipt_from_trace(
+                self._open_attempt_id, self.inst_id,
+                order.client_order_id, trace, reason)
+            if manager is not None:
+                await manager.observe(trace, reason=reason)
+
     async def _do_open(self, side: str, strength: float, ref_px: float, bar_index: int,
                        ts: int, reason: str, *, require_clear: bool, signal=None,
                        order_plan=None) -> list[dict]:
+        if self.open_attempts is not None and self.open_attempts.has_pending:
+            self._block_open("acceptance_unknown")
+            return []
         sz = self._compute_sz(strength, ref_px)
         if sz <= 0 or sz < self.min_sz:
             # [P0-4]：这条 status 文案在 AI-trade 前端**没有渲染落点**，装配仓位层后它又会从
             # 「预检盲区」变成常态（真实下单量是 f×budget，f 常落在 0.2~0.4）。计数使纪律条能说出
             # 「本会话已有 N 次因不足最小下单量跳过开仓」——否则现象与「AI 一直不开单」完全一致。
             self.dust_skips += 1
+            self._block_open("below_min_size")
             return [self._status_event(
                 f"预算 / 杠杆过小，单笔不足最小下单量（{side}），已跳过该信号")]
         limit_px = _plan_limit_px(order_plan)
         # F-4 的作用域边界：**开仓路径逐字不变**（双开风险真实存在，`close_position` 的 autoCxl
         # 论证只对平仓成立）。此处只解包第三元、一行逻辑不改（G-6 冻结）。
-        pre, slot_free, _ = await self._prepare_resting_slot(ts, "open", side, limit_px)
+        pre, slot_free, outcome = await self._prepare_resting_slot(
+            ts, "open", side, limit_px)
         if not slot_free:
+            self._block_open({
+                "skipped": "resting_kept", "filled": "resting_filled",
+                "unknown": "resting_cancel_unknown",
+            }.get(outcome, "resting_slot_busy"))
             return pre
         if require_clear and not await self._confirm_net_cleared():
+            self._block_open("position_not_cleared")
             return pre + [self._status_event(
                 "反手平仓尚未在交易所侧清算，本根跳过开仓，待下一根重试")]
         # §2.7：限价单的**预期成交价是 limit_px 而非 ref_px**——随单 OCO 若仍以 ref_px 为基准，
@@ -428,12 +490,19 @@ class LiveExecutor:
         order = OrderInput(inst_id=self.inst_id, direction=side,
                            ord_type="market" if limit_px is None else "limit",
                            td_mode=self.td_mode, px=limit_px, sz=sz, lever=self.leverage,
-                           tp_trigger_px=tp, sl_trigger_px=sl)
+                           tp_trigger_px=tp, sl_trigger_px=sl,
+                           client_order_id=(new_client_order_id()
+                                            if self.open_attempts else None),
+                           submission_trace=(SubmissionTrace()
+                                             if self.open_attempts else None))
         try:
-            result = await self._place_order(order)
-            self._note_private_write()             # 轴 C-4：成功的写才置位
+            result = await self._submit_open(order)
         except OKXError as exc:
             return pre + [self._error_event(ts, exc)]
+        if result is None:
+            return pre
+        if self.open_attempts is not None:
+            return pre + await self.open_attempts.resolve_pending(self, ts)
         if limit_px is not None:      # I-2a：挂单期间**不写 projected**，绕开幻影成交陷阱（R-1）
             return pre + self._enter_resting(result, ts, intent="open", side=side,
                                              px=limit_px, sz=sz, strength=strength,
@@ -577,6 +646,8 @@ class LiveExecutor:
         if outcome == "canceled":
             return events, True, outcome
         if outcome == "filled":
+            if intent == "close" and order.intent == "open":
+                return events, True, outcome
             return events + [self._status_event(
                 "撤单时原挂单已成交，已采纳该成交；本轮不再下新单（避免在已成交仓位上重复开仓）")], False, outcome
         return events + [self._status_event(
@@ -609,6 +680,8 @@ class LiveExecutor:
             return "unknown", [self._error_event(ts, exc)]
         outcome = str(result.get("outcome") or "unknown")
         if outcome == "canceled":
+            if self.open_attempts is not None and order.intent == "open":
+                return await self._confirm_open_canceled(order, reason, ts)
             self._note_open_expired(order)          # E-7：委托发出了、没成交、没了
             self._note_resting_cancel(reason)       # 轴 E 观测半：撤单原因分格
             self.resting = None
@@ -617,6 +690,29 @@ class LiveExecutor:
             return "filled", await self._adopt_resting_fill(ts)
         return "unknown", [self._status_event(
             f"撤单未获确认（{result.get('code')}），保留挂单待下轮核对状态")]
+
+    async def _confirm_open_canceled(self, order: RestingOrder,
+                                     reason: str, ts: int) -> tuple:
+        """撤单只保证取消剩余量，查清累计成交才能腾出开仓槽。"""
+        try:
+            state = await self._get_order(order.cl_ord_id)
+        except Exception:
+            return "unknown", [self._status_event("撤单后的成交量仍待核实")]
+        if not self.open_attempts.matches_resting(order, state):
+            return "unknown", [self._status_event("撤单后的订单身份仍待核实")]
+        if classify_state(state.get("state")) not in {"canceled", "filled"}:
+            return "unknown", []
+        accumulated = float(state["accFillSz"])
+        price = _num_or_zero(state.get("avgPx"))
+        if accumulated > order.adopted_sz and price <= 0:
+            return "unknown", [self._status_event("已成部分的真实价格仍待核实")]
+        events = self._adopt_partial(order, state, ts)
+        self.resting = None
+        self._note_resting_cancel(reason)
+        if accumulated > 0:
+            return "filled", events
+        self._note_open_expired(order)
+        return "canceled", events + [self._status_event("已核实撤单且无成交")]
 
     async def _adopt_resting_fill(self, ts: int) -> list[dict]:
         """撤单撞成交（`51402`）：回查 `get_order` 取权威 `avgPx`/`accFillSz` 并采纳。
@@ -652,15 +748,21 @@ class LiveExecutor:
     async def _advance_resting(self, order: RestingOrder, state: dict,
                                ts: int) -> list[dict]:
         """按归一生命周期态推进挂单（状态分派走 `resting.classify_state` 查找表，守复杂度红线）。"""
+        if (order.intent == "open" and self.open_attempts is not None
+                and not self.open_attempts.matches_resting(order, state)):
+            return [self._status_event("原挂单的身份与成交事实仍待核实")]
         phase = classify_state(state.get("state"))
         if phase == "filled":
             return self._settle_resting_fill(order, state, ts)
         if phase == "partial":
             return self._adopt_partial(order, state, ts)
         if phase == "canceled":
+            events = (self._adopt_partial(order, state, ts)
+                      if order.intent == "open" else [])
             self._note_open_expired(order)          # E-7：同上（交易所侧撤 / TTL 到期撤）
             self.resting = None
-            return [self._status_event("挂单已撤销（我方或交易所侧），已收敛为无挂单")]
+            return events + [self._status_event(
+                "挂单已撤销（我方或交易所侧），已收敛为无挂单")]
         if phase == "live" and is_expired(order, ts):
             _, events = await self._cancel_resting("expired", ts)
             return events
@@ -668,6 +770,9 @@ class LiveExecutor:
 
     def _settle_resting_fill(self, order: RestingOrder, state: dict, ts: int) -> list[dict]:
         """挂单**全部成交**：按 intent 分派采纳，清空 resting 并推 trade 事件。"""
+        if (order.intent == "open" and self.open_attempts is not None
+                and not self.open_attempts.matches_resting(order, state)):
+            return [self._status_event("原挂单的身份与成交事实仍待核实")]
         self.resting = None
         avg_px = float(state.get("avgPx") or order.px)
         acc = float(state.get("accFillSz") or order.sz)
@@ -675,7 +780,7 @@ class LiveExecutor:
         if delta <= 0:      # 已在此前的 partially_filled 轮全额采纳过，本轮只做收敛
             return [self._status_event("挂单已全部成交（成交量此前已采纳），已收敛为无挂单")]
         if order.intent == "open":
-            return self._adopt_fill(order, avg_px, acc, ts)
+            return self._adopt_fill(order, avg_px, acc, ts, delta_sz=delta)
         return self._adopt_close_fill(order, avg_px, ts)
 
     def _adopt_partial(self, order: RestingOrder, state: dict, ts: int) -> list[dict]:
@@ -703,6 +808,14 @@ class LiveExecutor:
         置 `_fill_grace`（O-3）：本方法把 projected 从 flat 置为有仓，而 `reconcile` 紧接着就会用
         **可能尚未跟上的**持仓读数去判「自管有仓、交易所无仓」——详见 `_on_reconcile_ok` 的 O-3 注释。
         """
+        delta = delta_sz if delta_sz is not None else total_sz
+        previous_notional = order.adopted_sz * self.entry_price
+        if self.open_attempts is not None:
+            known = self.open_attempts.adopted_notional(order.cl_ord_id)
+            if known is not None:
+                previous_notional = known
+        delta_px = ((total_sz * avg_px - previous_notional) / delta
+                    if delta > 0 and order.adopted_sz > 0 else avg_px)
         self._fill_grace = True
         self.projected = order.side
         self.entry_price = avg_px
@@ -713,12 +826,18 @@ class LiveExecutor:
             member_budget_usd=self.budget_usd, leverage=self.leverage)
         # OCO 触发价随单在下单时已按 limit_px 附于交易所侧（§2.7），此处如实回显同一基准。
         tp, sl = self._risk_trigger_px(order.side, order.px)
+        details = (self.open_attempts.order_details(order.cl_ord_id)
+                   if self.open_attempts is not None else {})
+        if details:
+            tp, sl = details.get("tp_trigger_px"), details.get("sl_trigger_px")
+        ord_type = details.get("ord_type", "limit")
         explain = self._open_explain(order.side, order.reason, None, tp, sl)
-        trade = self._make_trade(ts, order.side, avg_px, delta_sz if delta_sz is not None
-                                 else total_sz, pnl=0.0, reason=order.reason or "signal_open",
+        trade = self._make_trade(ts, order.side, delta_px, delta,
+                                 pnl=0.0, reason=order.reason or "signal_open",
                                  tp=tp, sl=sl, explain=explain, cl_ord_id=order.cl_ord_id,
                                  ord_id=order.ord_id, position_pct=self.entry_position_pct,
-                                 ord_type="limit", expected_px=order.px)
+                                 ord_type=ord_type,
+                                 expected_px=order.px if ord_type == "limit" else None)
         self.entry_fee_usd += float(trade["fee"])   # §3.3a：按本轮采纳增量计费（sz 已是 delta）
         self._record_trade(trade)
         return [{"type": "trade", "data": trade}]
@@ -1476,6 +1595,8 @@ class LiveExecutor:
         Args:
             trade: `_make_trade` 产出的成交字典（本方法只读它的 ``side``）。
         """
+        if self.open_attempts is not None:
+            self.open_attempts.decorate_trade(trade)
         self.trades.append(trade)
         self.trade_count += 1
         if trade.get("side") in ("long", "short"):
@@ -1496,6 +1617,8 @@ class LiveExecutor:
             rows: 从 DB 重建的全量成交行。
         """
         self.trades[:] = rows                     # 原地替换，绝不换掉容器对象本身
+        if self.open_attempts is not None:
+            self.open_attempts.restore_adopted(rows)
         self.trade_count = len(rows)
         self.open_count = sum(1 for row in rows if row.get("side") in ("long", "short"))
         if len(self.trades) > TRADE_LEDGER_MAX + _LEDGER_TRIM_SLACK:

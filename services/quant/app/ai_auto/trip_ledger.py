@@ -7,18 +7,11 @@
 
 十条硬约束（改本文件前逐条读一遍）：
 
-1. **口径单点**：`net_mode=True` ⇒ `trade["pnl"]` 已是净额、毛额 = `pnl + fee`；否则相反。与
-   `attribution.record_close`（`attribution.py:71-75`）与 `exit_attribution.ExitLedger.record`
-   逐字同构，本模块**绝不写第三种口径**。
-1b. **成本口径是「往返双腿」**：`SettledTrip.fee_usd = open_fee_usd + close_fee`，与
-   `RoundTrip.fee_usd`（**只记平仓腿**）**不同名不同义**，故 wire 键名用 `roundTripFeeUsd` 杜绝
-   误读。沿用平仓腿会让 `realizedCostBps` 恰好只有追溯复算的一半，而轴 C 问二拿它去比**往返**
-   成本估计，得到的「成本模型高估一倍」将完全是口径造成的假象。
+1. **口径单点**：统一调用 `resolve_trip_economics`；净口径加回双腿费用还原毛额，毛口径扣双腿费用。
+1b. **成本口径是「往返双腿」**：`SettledTrip` 与 `RoundTrip` 均使用带符号的开仓费加平仓费。
 2. **bps 分母恒为开仓名义**：`notional_usd = entry_px × qty × ct_val`；`ct_val == 0` ⇒ 全部 bps 量
    与 `risk_usd` / `r_multiple` **一律 None**，绝不填 0（0 会被聚合读成「成本为零」）。
-2b. **「没记费率」必须与「费率为零」可区分**：任一腿缺 `fee` 键 / 非有限 ⇒ `fee_known=False` ⇒
-   `fee_usd` / `realized_cost_bps` / `cost_error_bps` 一律 None。`fee == 0.0` 且该腿确实带了这个
-   键 ⇒ `fee_known=True`（真实的零费率成交是合法样本）。
+2b. **未知不等于零**：来源明确的零费与返佣均合法。可靠净额可留缺口事件，未知成本不进入学习样本。
 3. **`r_multiple` 缺任一输入即 None**：`stop_px` 缺席 / 止损距离为 0 / `ct_val == 0` 任一成立 ⇒
    None。一个被 0 兜底的 R 比没有 R 更糟。
 4. **`stop_atr_mult` 的 ATR 取开仓那一刻的确认根 ATR**，经 `profit_guard.sanitize_atr` 归一
@@ -41,6 +34,8 @@ import math
 from dataclasses import dataclass
 
 from .profit_guard import sanitize_atr
+from .accounting_replay import leg_fee_evidence, trade_meta
+from .trade_economics import TripPnlInputs, resolve_trip_economics
 
 _ROUND_BPS = 4
 _ROUND_USD = 6
@@ -51,7 +46,7 @@ PENDING_ESTIMATE_MAX = 8
 
 @dataclass(frozen=True)
 class RoundEstimate:
-    """一轮受门禁约束的开仓意图在**决策那一刻**的全部估计（轮级，绝不跨轮存活）。"""
+    """开仓意图在决策时的冻结估计；下单后随订单身份跨轮保存。"""
 
     est_edge_bps: float | None       # edge_gate 的毛 edge 粗估（k_min<=0 ⇒ None）
     est_cost_bps: float | None       # cost_model 的往返成本
@@ -60,6 +55,9 @@ class RoundEstimate:
     decision_confidence: float | None
     wake_kind: str | None
     ord_type: str = "market"         # market | limit
+    model_version: int = 2
+    as_of_ts: float | None = None
+    facts_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -102,7 +100,7 @@ class SettledTrip:
     entry_px: float
     exit_px: float
     notional_usd: float | None
-    gross_pnl_usd: float
+    gross_pnl_usd: float | None
     net_pnl_usd: float
     fee_usd: float | None            # **往返双腿**腿费；`open_fee_known=False` ⇒ None
     fee_known: bool
@@ -193,12 +191,15 @@ def settle(open_snap: OpenSnapshot, close_trade: dict, ctx: SettleContext) -> Se
     exit_px = _positive(close_trade.get("price"))
     if exit_px is None or open_snap.entry_px <= 0:
         return None
-    pnl = _finite(close_trade.get("pnl")) or 0.0
     close_fee, close_fee_known = _leg_fee(close_trade)
-    gross = pnl + close_fee if ctx.net_mode else pnl
-    net = pnl if ctx.net_mode else pnl - close_fee
-    fee_known = bool(open_snap.open_fee_known and close_fee_known)
-    fee_usd = (open_snap.open_fee_usd + close_fee) if fee_known else None
+    economics = resolve_trip_economics(TripPnlInputs(
+        "net" if ctx.net_mode else "gross", close_trade.get("pnl"),
+        open_snap.open_fee_usd if open_snap.open_fee_known else None,
+        close_fee if close_fee_known else None))
+    if economics.trading_net_usd is None:
+        return None
+    gross, net = economics.gross_pnl_usd, economics.trading_net_usd
+    fee_usd = economics.fee_usd
     ct_val = max(0.0, float(ctx.ct_val or 0.0))
     notional = open_snap.entry_px * open_snap.qty * ct_val if ct_val > 0 else None
     unit = open_snap.qty * ct_val if ct_val > 0 else None
@@ -211,15 +212,14 @@ def settle(open_snap: OpenSnapshot, close_trade: dict, ctx: SettleContext) -> Se
     exit_ts = int(close_trade.get("ts") or 0)
     return SettledTrip(
         seq=open_snap.seq, side=open_snap.side, entry_ts=open_snap.ts, exit_ts=exit_ts,
-        hold_seconds=max(0.0, float(exit_ts - open_snap.ts)),
+        hold_seconds=_hold_seconds(open_snap, close_trade),
         entry_px=open_snap.entry_px, exit_px=exit_px,
         notional_usd=_round(notional, _ROUND_USD),
-        gross_pnl_usd=round(gross, _ROUND_USD), net_pnl_usd=round(net, _ROUND_USD),
-        fee_usd=_round(fee_usd, _ROUND_USD), fee_known=fee_known,
+        gross_pnl_usd=_round(gross, _ROUND_USD), net_pnl_usd=round(net, _ROUND_USD),
+        fee_usd=_round(fee_usd, _ROUND_USD), fee_known=fee_usd is not None,
         realized_gross_bps=realized_gross_bps, realized_net_bps=_bps(net, notional),
-        realized_cost_bps=(None if realized_cost_bps is None else abs(realized_cost_bps)),
-        # `move_bps` 是**纯价格比例**（`ct_val` 代数抵消），故它在 `ct_val` 未知的会话上照常可得
-        # ——D-1 的那个量必须尽可能有分母，否则「位移撑不过成本」这条结论会没有样本。
+        realized_cost_bps=realized_cost_bps,
+        # 纯价格比例不依赖 ctVal。
         move_bps=_bps_ratio(abs(exit_px - open_snap.entry_px), open_snap.entry_px),
         risk_usd=_round(risk_usd, _ROUND_USD),
         r_multiple=(_round(net / risk_usd, _ROUND_BPS)
@@ -234,6 +234,14 @@ def settle(open_snap: OpenSnapshot, close_trade: dict, ctx: SettleContext) -> Se
         wake_kind=(est.wake_kind if est else None),
         edge_error_bps=_diff(realized_gross_bps, est.est_edge_bps if est else None),
         cost_error_bps=_diff(realized_cost_bps, est.est_cost_bps if est else None))
+
+
+def _hold_seconds(open_snap: OpenSnapshot, close_trade: dict) -> float:
+    closed = _finite(close_trade.get("wallTs"))
+    if closed is None:
+        closed = _finite(trade_meta(close_trade).get("wallTs"))
+    closed = closed if closed is not None else _finite(close_trade.get("ts"))
+    return max(0.0, (closed or 0.0) - float(open_snap.wall_ts or open_snap.ts))
 
 
 # 结算键 → wire 键（camelCase）。**顺序即 wire 顺序**，「算不出即省略」（约束 6）。
@@ -253,7 +261,7 @@ def trip_meta_wire(trip: SettledTrip | None) -> dict:
     """`explain.meta` 的加法键（**缺失即省略**，绝不写 `None`）。`exitSource` 由会话侧写，本模块不写。"""
     if trip is None:
         return {}
-    out: dict = {}
+    out: dict = {"accountingVersion": 2}
     for attr, key in _WIRE_FIELDS:
         value = getattr(trip, attr, None)
         if value is not None:
@@ -280,15 +288,9 @@ def _stop_atr_mult(snap: OpenSnapshot) -> float | None:
 
 
 def _leg_fee(trade: dict) -> tuple[float, bool]:
-    """一条腿的费率与「这条腿到底记没记费率」（约束 2b）。
-
-    键缺席 / `None` / 非有限 ⇒ `(0.0, False)`；键在且是有限数（含 `0.0`）⇒ `(|fee|, True)`。
-    **`0.0` 与「没记」在数据上不可区分正是 D-9 的根**，故这里必须靠「键在不在」分辨。
-    """
-    if "fee" not in trade:
-        return 0.0, False
-    value = _finite(trade.get("fee"))
-    return (0.0, False) if value is None else (abs(value), True)
+    """带符号费用及逐腿来源；未知的数值占位必须和 False 一起消费。"""
+    value, _ = leg_fee_evidence(trade)
+    return (0.0, False) if value is None else (value, True)
 
 
 def _bps(value: float | None, notional: float | None) -> float | None:

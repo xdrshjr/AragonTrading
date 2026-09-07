@@ -15,9 +15,11 @@
 """
 from __future__ import annotations
 
+import json
+import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from sqlalchemy import select
 
@@ -32,6 +34,7 @@ from .experience.adopted import AdoptedOpen, synth_from_contract
 from .manager import (AiTradeGroup, AiTradeManager, AiTradePreflightError,
                       _creds)
 from .reconcile import local_net_view
+from .trade_economics import finite
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +69,10 @@ async def _load_contract(group_id: str, settings) -> dict:
         row = await state_repo.load_group_state(db, group_id)
     if row is None:
         raise AiTradePreflightError("NOT_FOUND", "分组不存在", 404)
-    if row["status"] != pause_core.STATUS_PAUSED:
+    has_pending = any(state_repo._has_pending(m) for m in row["members"])
+    if row["status"] != pause_core.STATUS_PAUSED and not has_pending:
         raise AiTradePreflightError("AI_TRADE_NOT_PAUSED", "该分组不处于已暂停状态", 409)
-    if pause_core.is_age_exceeded(row["pausedTs"], int(time.time()),
+    if not has_pending and pause_core.is_age_exceeded(row["pausedTs"], int(time.time()),
                                   float(settings.ai_trade_resume_max_age_s)):
         raise AiTradePreflightError(
             "AI_TRADE_RESUME_EXPIRED",
@@ -119,6 +123,7 @@ async def assess_group(manager: AiTradeManager, group_id: str) -> _Assessment:
     """S1~S4：契约 → 解析链 → 交易所真值 → 逐成员 verdict + 组级 verdict。"""
     settings = get_settings()
     row = await _load_contract(group_id, settings)
+    row = await _retry_pending_trade_contract(row)
     req = await _rebuild_request(row, settings)
     creds = _creds(req.account_row)
     assessment = _Assessment(row=row, req=req, creds=creds)
@@ -133,10 +138,101 @@ async def assess_group(manager: AiTradeManager, group_id: str) -> _Assessment:
     assessment.avail, assessment.positions = avail, positions
     assessment.configs, assessment.pending = configs, pending
     assessment.members = _classify_members(row, positions, pending, settings)
+    await _assess_pending_attempts(assessment)
     assessment.verdict = pause_core.group_verdict(
         [m["verdict"] for m in assessment.members],
         [m.get("blockedReason") for m in assessment.members])
     return assessment
+
+
+async def _retry_pending_trade_contract(row: dict) -> dict:
+    """外部预检前先补齐原始腿，避免把已确认平仓当成离线缺口再合成。"""
+    group_id = row["groupId"]
+    try:
+        async with get_sessionmaker()() as db:
+            success = await asyncio.wait_for(
+                state_repo.retry_pending_trades(db, group_id), timeout=5.0)
+            if not success:
+                raise ValueError("成交恢复时分组契约不存在")
+            updated = await state_repo.load_group_state(db, group_id)
+            if updated is None:
+                raise ValueError("成交恢复后分组契约不存在")
+            return updated
+    except Exception as exc:
+        logger.warning("ai-trade pending trade replay failed (%s): %s", group_id, exc)
+        raise AiTradePreflightError(
+            "AI_TRADE_RESUME_UNVERIFIABLE",
+            "原始成交尚未完成持久化，暂不继续（请稍后重试）", 409) from exc
+
+
+async def _assess_pending_attempts(assessment: _Assessment) -> None:
+    """预检只查询固定ID，未找到或身份不符不能当作无挂单。"""
+    from ..okx.trading import fetch_live_order
+    from .open_attempts import OpenAttemptManager
+    from types import SimpleNamespace
+    contracts = {m["instId"]: m for m in assessment.row["members"]}
+    for member in assessment.members:
+        contract = contracts[member["instId"]]
+        runtime = contract.get("runtimeIntegrity") or {}
+        if not state_repo._has_pending(contract):
+            continue
+        attempts = OpenAttemptManager.restore(
+            runtime, account_id=assessment.row["accountId"],
+            run_id=contract["runId"], inst_id=member["instId"],
+            max_per_session=50)
+        attempts.restore_resting(SimpleNamespace(resting=None))
+        pending = attempts.pending
+        state = None
+        if pending is not None:
+            try:
+                state = await fetch_live_order(
+                    assessment.creds, member["instId"], cl_ord_id=pending.cl_ord_id)
+            except Exception as exc:
+                logger.warning("pending open preview unavailable: %s", exc)
+        matched = pending is not None and attempts._matches(pending, state)
+        aligned = pending is not None and _pending_position_matches(
+            member, pending, state or {}, contract)
+        if matched and aligned:
+            required = assessment.req.settings.ai_trade_resume_backstop_required
+            verdict, blocked = pause_core.apply_backstop_requirement(
+                pause_core.VERDICT_MATCHED, member.get("backstop"),
+                required=bool(required and member.get("actual")))
+            member.update(verdict=verdict, blockedReason=blocked,
+                          message="固定订单身份已核实，恢复时接管")
+        else:
+            member.update(verdict=pause_core.VERDICT_UNKNOWN_ORDER,
+                          blockedReason="acceptance_unknown",
+                          message="开仓委托仍待核实，保留原订单身份")
+
+
+def _pending_position_matches(member, pending, state, contract) -> bool:
+    """固定订单只能解释自身成交，不能解除方向、模式及其他委托冲突。"""
+    from ..live_auto.resting import classify_state
+
+    if classify_state(str(state.get("state") or "")) == "unknown":
+        return False
+    if member.get("blockedReason"):
+        return False
+    if member.get("verdict") in {
+        pause_core.VERDICT_SIDE_FLIPPED, pause_core.VERDICT_FOREIGN_POSITION,
+    }:
+        return False
+    known = set(contract.get("knownClOrdIds") or []) | {pending.cl_ord_id}
+    if any(str(o.get("clOrdId") or "") not in known
+           for o in member.get("pendingOrders") or []):
+        return False
+    filled = finite(state.get("accFillSz"))
+    actual = member.get("actual") or {}
+    quantity = finite(actual.get("pos", 0))
+    if filled is None or quantity is None or filled < 0:
+        return False
+    if abs(quantity) > 0:
+        side = pause_core._side_from_okx(actual)
+        if side != pending.order["direction"]:
+            return False
+        if actual.get("mgnMode") not in (None, pending.order.get("td_mode")):
+            return False
+    return abs(abs(quantity) - filled) <= max(1e-10, filled * 1e-8)
 
 
 def _classify_members(row: dict, positions: list[dict], pending: list[dict],
@@ -274,8 +370,6 @@ async def _adopt_group(group: AiTradeGroup, assessment: _Assessment) -> None:
     """S6：把连续量灌回 executor / decider / session（六项，每项都有一个会被漏掉的坑）。"""
     by_inst = {m["instId"]: m for m in assessment.members}
     contract_members = {str(m.get("instId") or ""): m for m in assessment.row["members"]}
-    net_mode = bool(group.members[0].session.executor.settings.ai_trade_net_pnl_enabled) \
-        if group.members else True
     for member in group.members:
         session = member.session
         # `started_ts` 取**原分组** createdTs（不是续跑时刻）：取续跑时刻会让窗口对账只覆盖后半段，
@@ -283,8 +377,10 @@ async def _adopt_group(group: AiTradeGroup, assessment: _Assessment) -> None:
         session.started_ts = int(assessment.row.get("createdTs") or session.started_ts)
         contract = contract_members.get(member.inst_id) or {}
         session._known_cl_ord_ids = [str(c) for c in (contract.get("knownClOrdIds") or [])]
-        continuity = await rebuild_continuity(member.run_id, net_mode=net_mode)
+        continuity = await rebuild_continuity(member.run_id, net_mode=None)
         executor = session.executor
+        _restore_cost_basis(executor, continuity.get("costBasis"))
+        await _restore_runtime_integrity(session, contract, continuity)
         # D5：走 `restore_trades` 而不是直接赋值——它同时**就地派生**两个计数器并施加同一份封顶。
         # 计数器刻意**不落库**：本模块 `rebuild_continuity` 的不变式原文是「派生量绝不落库：落两份
         # 必然漂移，而这里漂移的是真实资金的盈亏显示」，而 `trades` 本就是从 DB 全量 `Trade` 行重建的
@@ -298,22 +394,89 @@ async def _adopt_group(group: AiTradeGroup, assessment: _Assessment) -> None:
             # **必须在重算 pnl 之后、接管之前**：它可能补写一条平仓 trade，而 executor 的成交流
             # 已经从 DB 重建完毕；这一笔只影响历史统计与 `offlineGap` 标注，不改接管后的持仓。
             await settle_closed_offline(member, contract, creds=assessment.creds,
-                                        cost_basis=_cost_basis(session),
+                                        cost_basis=continuity.get("costBasis") or "unknown",
                                         paused_ts=int(assessment.row.get("pausedTs") or 0))
+            continuity = await rebuild_continuity(member.run_id, net_mode=None)
+            executor.restore_trades(continuity["trades"])
+            executor.realized_pnl_usd = continuity["realizedPnlUsd"]
+        if hasattr(session, "_cost"):
+            session._cost.restore_accounting(continuity["trades"], {
+                "runId": member.run_id, "costBasis": continuity.get("costBasis"),
+                "ctVal": executor.ct_val})
+            known_fee = session._cost.remaining_open_fee_usd
+            if known_fee is not None:
+                executor.entry_fee_usd = known_fee
         adopt_position(executor, assessed.get("actual"))
+        attempts = getattr(executor, "open_attempts", None)
+        if attempts is not None and not attempts.restore_resting(executor):
+            raise AiTradeResumeBlocked([{
+                "instId": member.inst_id, "blockedReason": "acceptance_unknown",
+                "message": "原挂单身份不可读，无法安全恢复"}])
+        if hasattr(session, "_resolve_pending_open"):
+            async with session._exec_lock:
+                await session._resolve_pending_open(int(time.time()))
+            if attempts is not None and attempts.has_pending:
+                raise AiTradeResumeBlocked([{
+                    "instId": member.inst_id,
+                    "blockedReason": "acceptance_unknown",
+                    "message": "原订单尚未完成核查和持久化接管"}])
         # W-A · H-3：**仍持仓**的接管。这一类往返在 v1 采不到——`CostRuntime.note_open` 只挂在
         # 开仓成交上，跨进程接管后 `last_settled_trip()` 恒 None ⇒ 该往返只贡献一个 `harvestGap`。
         # 而会被跨进程接管的，恰恰是**那些没能在会话内平掉的**仓位（超时、被套、等反弹），
         # 在净额分布上系统性偏左：整类剔除等于给经验表做了一次幸存者偏差筛选。
         experience = _experience(member)
         if experience is not None:
+            known_fee = (session._cost.remaining_open_fee_usd
+                         if hasattr(session, "_cost") else None)
             experience.adopt_open(_adopted_open(member, assessed.get("actual"),
-                                                continuity["entryFeeUsd"]))
+                                                known_fee))
         session._last_status_side = executor.projected
         snapshot = await _run_snapshot(member.run_id)
         session.rounds_completed = int(snapshot.get("roundsCompleted") or 0)
-        session.decider.seed_from_snapshot(summary=snapshot.get("finalSummary"),
-                                           last_round=session.rounds_completed)
+        seed = {"summary": snapshot.get("finalSummary"),
+                "last_round": session.rounds_completed}
+        if hasattr(session.decider, "memory_wire"):
+            memory = ((snapshot.get("aiStats") or {}).get(
+                "integrity") or {}).get("memory") or {}
+            seed.update(summary_as_of_ts=memory.get("summaryAsOfTs"),
+                        facts_version=(memory.get("factsVersion")
+                                       if not memory.get("legacyNarrative")
+                                       else None))
+        session.decider.seed_from_snapshot(**seed)
+
+
+def _restore_cost_basis(executor, basis: str | None) -> None:
+    """同一 run 继续使用建组时记账口径，设置变更只影响新组。"""
+    if basis not in {"net", "gross"}:
+        return
+    executor.settings = executor.settings.model_copy(update={
+        "ai_trade_net_pnl_enabled": basis == "net"})
+    if executor.fee_ledger is not None:
+        executor.fee_ledger.params = replace(
+            executor.fee_ledger.params, net_pnl_enabled=basis == "net")
+
+
+async def _restore_runtime_integrity(session, contract: dict,
+                                     continuity: dict) -> None:
+    """先恢复额度和受控订单身份，再重放全量成交采纳水位。"""
+    if not hasattr(session, "_entry_quota"):
+        return
+    from .open_attempts import OpenAttemptManager
+    snapshot = await _run_snapshot(session.run_id)
+    legacy_used = ((snapshot.get("aiStats") or {}).get("openFunnel") or {}).get(
+        "contrarianPassed", 0)
+    attempts = OpenAttemptManager.restore(
+        contract.get("runtimeIntegrity"), account_id=session.executor.account_id,
+        run_id=session.run_id, inst_id=session.inst_id,
+        max_per_session=session._consensus_rule.contrarian_max_per_session,
+        persist_callback=session._persist_runtime_integrity,
+        legacy_used=legacy_used)
+    session.executor.open_attempts = attempts
+    session._entry_quota = attempts.quota
+    session._contrarian_used = attempts.quota.used
+    session._consensus_rule = replace(
+        session._consensus_rule,
+        contrarian_max_per_session=attempts.quota.max_per_session)
 
 
 def _experience(member):
@@ -327,13 +490,11 @@ def _experience(member):
     return getattr(getattr(member, "session", None), "experience", None)
 
 
-def _adopted_open(member, actual: dict | None, entry_fee_usd: float) -> AdoptedOpen | None:
+def _adopted_open(member, actual: dict | None,
+                  entry_fee_usd: float | None) -> AdoptedOpen | None:
     """把接管到的交易所真值装配成经验层的合成开仓断面（W-A · H-3）；已平 / 无仓 ⇒ `None`。
 
-    `entry_fee_usd == 0.0` 一律当作**不可知**而不是「零手续费」：`rebuild_continuity` 是
-    `sum(r.fee or 0.0)`，它在结构上分不出这两种情况，而 `trip_ledger` 的约束 2b 要求两者可区分。
-    当作不可知的后果是该事件因 `v1:I-7` 被排除在 bps 统计外但**仍然入表**并计进桶的 `excluded`
-    ——被看见的缺失，而不是一个编出来的零。
+    开仓费来自共享费用池，None 为未知；合法零费和负返佣保持原值。
     """
     executor = member.session.executor
     if executor.projected == "flat" or executor.entry_price <= 0 or executor.entry_qty_sz <= 0:
@@ -343,7 +504,7 @@ def _adopted_open(member, actual: dict | None, entry_fee_usd: float) -> AdoptedO
         entry={"px": float(executor.entry_price), "qty": float(executor.entry_qty_sz),
                # 与平仓 trade 的 `ts` 同一时钟（墙钟秒）：交易所 `cTimeS` 是权威开仓时刻。
                "ts": int((actual or {}).get("cTimeS") or 0)},
-        open_fee_usd=(float(entry_fee_usd) if float(entry_fee_usd or 0.0) > 0 else None),
+        open_fee_usd=finite(entry_fee_usd),
         ct_val=float(getattr(executor, "ct_val", 0.0) or 0.0),
         horizon_profile_id=getattr(member.session.horizon_rule, "profile_id", None))
 
@@ -384,8 +545,9 @@ async def settle_closed_offline(member, contract: dict, *, creds, cost_basis: st
         row = next((r for r in rows if pos_id and str(r.get("posId") or "") == pos_id), None)
     except Exception as exc:  # noqa: BLE001 —— 回读失败只让这一笔缺失，绝不阻断续跑
         logger.warning("ai-trade offline exit readback failed (%s): %s", member.inst_id, exc)
+    full = await rebuild_continuity(member.run_id, net_mode=None)
     trade = _offline_exit_trade(row, expected, cost_basis=cost_basis,
-                                local_trades=member.session.executor.trades)
+                                local_trades=full["trades"])
     if trade is None:
         await _mark_offline_gap(member.run_id, member.inst_id, has_row=row is not None)
         # W-A · H-2（★ F-6 的正解）：**这条早退分支才是「暂停期离线平仓未能采集」的唯一真实
@@ -397,7 +559,10 @@ async def settle_closed_offline(member, contract: dict, *, creds, cost_basis: st
     async with get_sessionmaker()() as db:
         from ..db import repositories as repo
 
-        await repo.append_live_trade(db, member.run_id, trade)
+        event_id = trade["explain"]["meta"]["accountingEventId"]
+        if not any((t.get("explain") or {}).get("meta", {}).get(
+            "accountingEventId") == event_id for t in full["trades"]):
+            await repo.append_live_trade(db, member.run_id, trade)
     # W-A · H-2：有回执 ⇒ 用合成断面跑一次**既有的** `trip_ledger.settle` ⇒ 事件入表并落盘
     # （`origin="adopted"`）。绝不另写一份 bps 换算（A-12 逐位断言）。
     if experience is not None:
@@ -406,39 +571,74 @@ async def settle_closed_offline(member, contract: dict, *, creds, cost_basis: st
 
 def _offline_exit_trade(row: dict | None, expected: dict, *, cost_basis: str,
                         local_trades: list[dict]) -> dict | None:
-    """交易所持仓历史行 → 一条**增量**平仓 trade；不可用 / 不自洽 ⇒ None（退回诚实缺口）。
-
-    `positions-history` 一行覆盖的是**整个持仓生命周期**（按 `posId` 汇总），不是「离线那一段」。
-    若暂停**之前**该持仓已发生过部分平仓并落过本地 `trades` 行，照抄整行会把那部分重复计入。
-    故只取增量：用交易所给的**建仓时刻**划段（比 `positionSeq` 可靠——后者在任一次部分平仓时就
-    会 +1，根本不与一个 `posId` 的生命周期对齐，见 spec §实施过程发现的方案缺陷）。
-    """
-    if not row:
+    """从同持仓、已结算 USDT 数据补增量；未知来源保留离线缺口。"""
+    if not row or cost_basis not in {"gross", "net"}:
         return None
-    fee = float(row.get("fee") or 0.0)
-    realized = float(row.get("realizedPnl") or 0.0)
+    if (row.get("currency") != "USDT" or row.get("closed") is not True
+            or not expected.get("posId")
+            or row.get("posId") != expected["posId"]):
+        return None
+    values = [finite(row.get(key)) for key in (
+        "fee", "realizedPnl", "fundingFee", "liqPenalty", "settledPnl")]
+    if any(value is None for value in values):
+        return None
+    fee, realized, funding, penalty, settled = values
+    pnl = realized + funding + penalty - settled
     if cost_basis == "gross":
-        pnl = realized + fee                         # 把费加回去还原毛额
-    else:
-        pnl = realized - float(row.get("fundingFee") or 0.0) \
-            - float(row.get("liqPenalty") or 0.0)    # 只剥掉本地不入 trades.pnl 的那两项
-    open_ts = int(expected.get("openCTime") or expected.get("openWallTs") or 0)
-    local = [t for t in (local_trades or [])
-             if open_ts > 0 and int(t.get("ts") or 0) >= open_ts]
-    pnl -= sum(float(t.get("pnl") or 0.0) for t in local if t.get("side") == "close")
-    fee -= sum(float(t.get("fee") or 0.0) for t in local)
-    if fee < 0 or (realized and abs(pnl) > abs(realized) * 3):
-        return None                                  # 不自洽 ⇒ 宁可缺一笔并说明
+        pnl += fee
+    local = _offline_epoch_trades(local_trades, expected)
+    if local is None:
+        return None
+    pnl -= sum(float(t.get("pnl") or 0) for t in local
+               if t.get("side") == "close")
+    fee -= sum(float(t.get("fee") or 0) for t in local)
+    meta = _offline_exit_meta(row, local)
     return {"ts": int(row.get("uTime") or 0), "side": "close",
             "price": float(row.get("closeAvgPx") or 0.0),
             "qty": abs(float(expected.get("size") or 0.0)),
             "fee": fee, "pnl": pnl, "positionAfter": 0.0, "reason": "offline_exit",
             "explain": {"kind": "offline_exit", "headline": "离线期间该仓已在交易所侧平掉",
                         "summary": "续跑前从交易所持仓历史回读的一笔平仓",
-                        "meta": {"source": "ai", "exitSource": "offline",
-                                 "posId": str(row.get("posId") or ""),
-                                 "offlineFundingUsd": float(row.get("fundingFee") or 0.0),
-                                 "offlineLiqPenaltyUsd": float(row.get("liqPenalty") or 0.0)}}}
+                        "meta": meta}}
+
+
+def _offline_epoch_trades(trades: list[dict], expected: dict):
+    """按完整 DB 流的仓位边界取未平周期，不按 K 线时间猜成交顺序。"""
+    from .accounting_replay import trade_meta, leg_fee_evidence
+
+    current = []
+    for trade in trades:
+        meta = trade_meta(trade)
+        if meta.get("posId") == expected["posId"]:
+            current.append(trade)
+        elif trade.get("side") in {"long", "short"} or current:
+            current.append(trade)
+        if (trade.get("side") == "close"
+                and trade.get("positionAfter") == 0):
+            current = []
+    if trades and not current:
+        return None
+    if any(leg_fee_evidence(t)[0] is None for t in current):
+        return None
+    if any(t.get("side") == "close" and finite(t.get("pnl")) is None
+           for t in current):
+        return None
+    return current
+
+
+def _offline_exit_meta(row: dict, local: list[dict]) -> dict:
+    from .accounting_replay import leg_fee_evidence
+
+    basis = ("estimated" if any(leg_fee_evidence(t)[1] == "estimated"
+                               for t in local) else "measured")
+    return {"source": "ai", "exitSource": "offline",
+            "posId": row["posId"], "wallTs": row["uTime"],
+            "accountingEventId": f"offline:{row['posId']}:{row['uTime']}",
+            "accountingVersion": 2, "feeKnown": True,
+            "feeCurrency": "USDT", "feeBasis": basis,
+            "offlineFundingUsd": row["fundingFee"],
+            "offlineLiqPenaltyUsd": row["liqPenalty"],
+            "offlineSettledPnlUsd": row["settledPnl"]}
 
 
 async def _mark_offline_gap(run_id: int, inst_id: str, *, has_row: bool) -> None:
@@ -503,27 +703,44 @@ def _adopt_entry_bars(group: AiTradeGroup, assessment: _Assessment) -> None:
         executor.entry_bar = max(0, cur_index - max(0, now - open_ts) // bar_seconds)
 
 
-async def rebuild_continuity(run_id: int, *, net_mode: bool) -> dict:
+async def rebuild_continuity(run_id: int, *, net_mode: bool | None) -> dict:
     """从 `trades` 重算派生量（§3.4.3 右列）：executor 成交流 / 已实现盈亏 / 持仓序号 / 开仓腿费。
 
     **派生量绝不落库**：落两份必然漂移，而这里漂移的是真实资金的盈亏显示。`realized_pnl_usd`
     的 `net_mode` 口径与 `reconcile.local_net_view` **同一条规则**（两侧不可各写一份）。
     """
     async with get_sessionmaker()() as db:
+        run = await db.get(StrategyRun, run_id)
+        config = _parse_json(getattr(run, "config_json", None))
         rows = (await db.execute(
             select(Trade).where(Trade.run_id == run_id)
-            .order_by(Trade.ts.asc(), Trade.id.asc()))).scalars().all()
-    trades = [{"ts": r.ts, "side": r.side, "price": r.price, "qty": r.qty,
-               "fee": r.fee or 0.0, "pnl": r.pnl or 0.0,
+            .order_by(Trade.id.asc()))).scalars().all()
+    basis = config.get("costBasis")
+    if basis in ("net", "gross"):
+        net_mode = basis == "net"
+    trades = [{"id": r.id, "runId": r.run_id,
+               "ts": r.ts, "side": r.side, "price": r.price, "qty": r.qty,
+               "fee": r.fee, "pnl": r.pnl, "explain": _parse_json(r.explain_json),
                "positionAfter": r.position_after, "reason": r.reason}
               for r in rows]
     entry_fee = 0.0
     for trade in trades:      # 只累计**当前**未平持仓周期内的开仓腿费（平仓即清零）
         entry_fee = 0.0 if trade["side"] == "close" else entry_fee + float(trade["fee"] or 0.0)
     return {"trades": trades,
-            "realizedPnlUsd": local_net_view(trades, net_mode=net_mode)["netUsd"],
+            "costBasis": basis if basis in ("net", "gross") else None,
+            "realizedPnlUsd": sum(finite(t.get("pnl")) or 0 for t in trades
+                                  if t["side"] == "close"),
+            "tradingNetUsd": local_net_view(trades, net_mode=net_mode)["netUsd"],
             "positionSeq": sum(1 for t in trades if t["side"] == "close"),
             "entryFeeUsd": entry_fee}
+
+
+def _parse_json(raw: str | None) -> dict:
+    try:
+        parsed = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 async def _run_snapshot(run_id: int) -> dict:

@@ -8,9 +8,12 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass, field
+from functools import wraps
+from weakref import WeakKeyDictionary
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +21,59 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .models import AiTradeGroupState
 
 _PAUSED = "paused"
+_WRITE_LOCKS = WeakKeyDictionary()
+
+
+def state_write_lock() -> asyncio.Lock:
+    """当前后端事件循环的成员状态写锁，所有生命周期写点共用。"""
+    loop = asyncio.get_running_loop()
+    return _WRITE_LOCKS.setdefault(loop, asyncio.Lock())
+
+
+def _serialized_write(operation):
+    @wraps(operation)
+    async def write(session, *args, **kwargs):
+        async with state_write_lock():
+            try:
+                return await operation(session, *args, **kwargs)
+            except BaseException:
+                await session.rollback()
+                raise
+    return write
+
+
+def _has_pending(member: dict) -> bool:
+    """只有显式空值表示无未决记录，不可读身份仍需保留恢复入口。"""
+    runtime = member.get("runtimeIntegrity")
+    if runtime is None:
+        return False
+    if not isinstance(runtime, dict):
+        return True
+    queue = runtime.get("pendingTrades")
+    if queue is not None and queue != []:
+        return True
+    if runtime.get("pendingOpenAttempt") is not None:
+        return True
+    adopted = runtime.get("adoptedOrder")
+    if adopted is None:
+        return False
+    return (not isinstance(adopted, dict)
+            or adopted.get("resting") is not None)
+
+
+def _merge_members(current: list[dict], proposed: list[dict]) -> list[dict]:
+    """普通快照保留最新事务身份；被移除的未决成员继续留档。"""
+    existing = {(m.get("instId"), m.get("runId")): m for m in current}
+    merged = []
+    for member in proposed:
+        previous = existing.pop((member.get("instId"), member.get("runId")), {})
+        row = {**previous, **member}
+        if "runtimeIntegrity" in previous:
+            row["runtimeIntegrity"] = previous["runtimeIntegrity"]
+        merged.append(row)
+    merged.extend({**m, "state": "stopped"} for m in existing.values()
+                  if _has_pending(m))
+    return merged
 
 
 @dataclass
@@ -36,6 +92,7 @@ class GroupStateWrite:
     resumed_count: int = 0
 
 
+@_serialized_write
 async def upsert_group_state(session: AsyncSession, write: GroupStateWrite) -> None:
     """按 `group_id` 整行 upsert（W1 / W4）。自带 commit（镜像 `append_live_trade` 的语义）。"""
     now = int(time.time())
@@ -48,7 +105,8 @@ async def upsert_group_state(session: AsyncSession, write: GroupStateWrite) -> N
     row.bar = str(write.bar or "")
     row.start_wire_json = _dump(write.start_wire)
     row.resolved_echo_json = _dump(write.resolved_echo)
-    row.members_json = _dump(write.members)
+    row.members_json = _dump(_merge_members(
+        _load(row.members_json, []), write.members))
     row.pause_reason = write.pause_reason
     row.paused_ts = write.paused_ts
     row.resumed_count = int(write.resumed_count or 0)
@@ -57,6 +115,7 @@ async def upsert_group_state(session: AsyncSession, write: GroupStateWrite) -> N
     await session.commit()
 
 
+@_serialized_write
 async def patch_group_state(session: AsyncSession, group_id: str, fields: dict) -> bool:
     """局部更新（W2 / W3 / W5）；行不存在 ⇒ False（绝不静默新建一行没人认领的契约）。
 
@@ -75,16 +134,59 @@ async def patch_group_state(session: AsyncSession, group_id: str, fields: dict) 
     if "resumedCount" in fields:
         row.resumed_count = int(fields["resumedCount"] or 0)
     if "members" in fields:
-        row.members_json = _dump(fields["members"])
+        row.members_json = _dump(_merge_members(
+            _load(row.members_json, []), fields["members"]))
     row.last_seen_ts = int(fields.get("lastSeenTs") or time.time())
     row.updated_ts = int(time.time())
     await session.commit()
     return True
 
 
+@_serialized_write
 async def patch_member_state(session: AsyncSession, group_id: str, inst_id: str,
                              patch: dict) -> bool:
     """只改某成员的若干键（W2 成交驱动写点）；组 / 成员不存在 ⇒ False。"""
+    return await _patch_member(session, group_id, inst_id, patch, False)
+
+
+@_serialized_write
+async def patch_runtime_integrity(session: AsyncSession, group_id: str,
+                                  inst_id: str, patch: dict) -> bool:
+    """同一事务提交当前run的额度、待核实订单和持仓身份。"""
+    if patch.get("runId") is None:
+        return False
+    return await _patch_member(session, group_id, inst_id, patch, True)
+
+
+@_serialized_write
+async def retry_pending_trades(session: AsyncSession, group_id: str) -> bool:
+    """恢复前重放原始成交；插入已提交但清队列失败时仍可按事件身份重试。"""
+    from ..ai_auto.trade_persistence import (
+        append_trade_once, pending_trades_for_member,
+    )
+
+    row = await _get_row(session, group_id)
+    if row is None:
+        return False
+    members = _load(row.members_json, [])
+    changed = False
+    for member in members:
+        queue = pending_trades_for_member(member)
+        if not queue:
+            continue
+        for trade in queue:
+            await append_trade_once(session, member["runId"], trade)
+        member["runtimeIntegrity"]["pendingTrades"] = []
+        # 队列只是欠写的子集，成员位置可能已包含之后成功保存的反手开仓。
+        changed = True
+    if changed:
+        row.members_json = _dump(members)
+        row.updated_ts = int(time.time())
+        await session.commit()
+    return True
+
+
+async def _patch_member(session, group_id, inst_id, patch, authoritative):
     row = await _get_row(session, group_id)
     if row is None:
         return False
@@ -92,7 +194,12 @@ async def patch_member_state(session: AsyncSession, group_id: str, inst_id: str,
     hit = False
     for member in members:
         if str(member.get("instId") or "") == inst_id:
-            member.update(patch)
+            if "runId" in patch and member.get("runId") != patch["runId"]:
+                return False
+            changes = dict(patch)
+            if not authoritative and "runtimeIntegrity" in member:
+                changes.pop("runtimeIntegrity", None)
+            member.update(changes)
             hit = True
     if not hit:
         return False
@@ -118,11 +225,49 @@ async def load_paused_group_brief(session: AsyncSession) -> dict | None:
     row = (await session.execute(
         select(AiTradeGroupState).where(AiTradeGroupState.status == _PAUSED)
         .order_by(AiTradeGroupState.updated_ts.desc()).limit(1))).scalars().first()
-    return None if row is None else _row_out(row)
+    if row is not None:
+        return _row_out(row)
+    pending = await load_pending_groups(session)
+    return max(pending, key=lambda item: item["updatedTs"]) if pending else None
 
 
+async def load_pending_groups(session: AsyncSession,
+                              account_id: int | None = None) -> list[dict]:
+    """读取包括ended在内的未决契约，供启动准入及冷恢复核查。"""
+    query = select(AiTradeGroupState)
+    if account_id is not None:
+        query = query.where(AiTradeGroupState.account_id == account_id)
+    rows = (await session.execute(query)).scalars().all()
+    return [_row_out(row) for row in rows
+            if any(_has_pending(m) for m in _load(row.members_json, []))]
+
+
+@_serialized_write
+async def remove_member_state(session: AsyncSession, group_id: str,
+                               inst_id: str, run_id: int) -> bool:
+    """按当前身份摘成员；未决订单仍保留停止态契约。"""
+    row = await _get_row(session, group_id)
+    if row is None:
+        return False
+    members = _load(row.members_json, [])
+    remaining = []
+    for member in members:
+        matches = member.get("instId") == inst_id
+        matches = matches and member.get("runId") == run_id
+        if not matches or _has_pending(member):
+            remaining.append({**member, "state": "stopped"} if matches else member)
+    row.members_json = _dump(remaining)
+    row.updated_ts = int(time.time())
+    await session.commit()
+    return True
+
+
+@_serialized_write
 async def delete_group_state(session: AsyncSession, group_id: str) -> int:
     """删掉该组的契约行（启动回滚的竞态清理，G-30）；返回删除条数。"""
+    row = await _get_row(session, group_id)
+    if row and any(_has_pending(m) for m in _load(row.members_json, [])):
+        return 0
     result = await session.execute(
         delete(AiTradeGroupState).where(AiTradeGroupState.group_id == group_id))
     await session.commit()
@@ -132,7 +277,8 @@ async def delete_group_state(session: AsyncSession, group_id: str) -> int:
 async def _get_row(session: AsyncSession, group_id: str) -> AiTradeGroupState | None:
     return (await session.execute(
         select(AiTradeGroupState)
-        .where(AiTradeGroupState.group_id == group_id))).scalars().first()
+        .where(AiTradeGroupState.group_id == group_id)
+        .execution_options(populate_existing=True))).scalars().first()
 
 
 def _row_out(row: AiTradeGroupState) -> dict:

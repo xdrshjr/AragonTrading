@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 from app.ai_auto.discipline_view import StrictnessFacts, strictness_hint
 from app.ai_auto.open_funnel import (
     LAYERS,
@@ -23,6 +25,49 @@ def _round(counters: OpenFunnelCounters, action: str, degrade: str | None = None
     counters.note_intent(action, degrade)
     counters.note_block(degrade)
     counters.end_round()
+
+
+@pytest.mark.parametrize("status", ["accepted", "rejected"])
+def test_unknown_receipt_resolution_moves_one_original_outcome(status):
+    counters = OpenFunnelCounters()
+    counters.begin_round(7)
+    counters.note_intent("open_short", None)
+    counters.note_receipt({"attemptId": "run:unique", "status": "unknown"})
+    counters.end_round()
+    assert counters.outcome_unknown == 1
+    counters.resolve_outcome("run:unique", status, "exchange_rejected")
+    counters.resolve_outcome("run:unique", status, "exchange_rejected")
+    wire = funnel_wire(counters, directional=True)
+    assert wire["outcomeUnknown"] == 0
+    assert wire["intents"] == 1
+    assert (wire["submitted"] + sum(wire["executionBlocked"].values())) == 1
+    short = wire["bySide"]["short"]
+    assert short["submitted"] + sum(short["executionBlocked"].values()) == 1
+
+
+def test_pre_submit_failure_closes_intent_without_claiming_submission():
+    counters = OpenFunnelCounters()
+    counters.note_intent("open_long", None)
+    counters.end_round()
+    counters.end_round()
+    wire = funnel_wire(counters)
+    assert wire["executionBlocked"] == {"pre_submit_error": 1}
+    assert wire["submitted"] == wire["outcomeUnknown"] == 0
+    assert wire["coverage"] == "complete"
+
+
+def test_old_epoch_resolution_does_not_mutate_new_epoch_counts():
+    counters = OpenFunnelCounters()
+    counters.resolve_outcome("old:attempt", "accepted")
+    assert counters.submitted == counters.outcome_unknown == 0
+
+
+def test_model_hold_count_excludes_low_confidence_and_call_failure():
+    counters = OpenFunnelCounters()
+    _round(counters, "hold")
+    _round(counters, "hold", "low_confidence")
+    _round(counters, "hold", "llm_error")
+    assert funnel_wire(counters)["modelHold"] == 1
 
 
 # ---------- G-10：分母口径 ----------

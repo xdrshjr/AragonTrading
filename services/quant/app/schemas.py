@@ -395,6 +395,8 @@ class AiTradeRestingOrderOut(BaseModel):
 
 
 class AiTradeDecisionOut(BaseModel):
+    factsHash: str | None = None
+    sizingVerdict: dict | None = None
     ts: int
     round: int
     action: str                # open_long|open_short|close|hold|cancel_order
@@ -460,6 +462,7 @@ class AiTradeSessionRow(BaseModel):
     positionSide: str
     sessionPnlUsd: float
     startedTs: int
+    integrity: dict[str, Any] | None = None
     lastDecision: AiTradeDecisionOut | None = None
     contextSummary: str | None = None
     degraded: bool | None = None
@@ -1520,12 +1523,46 @@ class AiTradeProfitabilityOut(BaseModel):
     verdict: dict = Field(default_factory=dict)
 
 
+class AiTradeEconomicsOut(BaseModel):
+    """v2同范围经济读数；未知与无样本保留null。"""
+
+    scope: str = "run"
+    basis: str = "unknown"
+    accountingVersion: int = 2
+    asOfTs: int | float | None = None
+    roundTripCount: int = 0
+    completeFeeTripCount: int = 0
+    unknownTripCount: int = 0
+    winRate: float | None = None
+    profitFactor: float | None = None
+    avgPnlUsd: float | None = None
+    grossPnlUsd: float | None = None
+    feeUsd: float | None = None
+    sessionFeeUsd: float | None = None
+    tradingNetUsd: float | None = None
+    fundingCostUsd: float | None = None
+    fundingBasis: str = "unknown"
+    netAfterFundingUsd: float | None = None
+    openFundingAccruedUsd: float | None = None
+    exchangeTradingNetUsd: float | None = None
+    exchangeFundingCostUsd: float | None = None
+    exchangeNetAfterFundingUsd: float | None = None
+    exchangeRealizedPnlUsd: float | None = None
+    liquidationCostUsd: float | None = None
+    settlementAdjustmentUsd: float | None = None
+    coverage: str = "unavailable"
+    metricCoverage: dict = Field(default_factory=dict)
+    comparisonCoverage: dict = Field(default_factory=dict)
+
+
 class AiTradeHistorySummary(BaseModel):
     """单会话聚合 KPI（与列表行汇总同口径；前端亦可据 members[].trades 复算校验）。"""
 
     realizedPnlUsd: float
+    economics: AiTradeEconomicsOut | None = None
     returnPct: float
     tradeCount: int
+    roundTripCount: int | None = None
     winRate: float
     bestUsd: float
     worstUsd: float

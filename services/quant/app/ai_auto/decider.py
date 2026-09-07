@@ -23,6 +23,7 @@ import math
 import random
 import re
 import time
+from copy import deepcopy
 import uuid
 from dataclasses import dataclass, replace
 
@@ -61,6 +62,7 @@ from .reasoning_protocol import (
 )
 from .prompts_en import RETRY_HINT_GENERIC_EN, RETRY_HINT_TRUNCATED_EN, build_reask_instruction
 from .summary_health import SummaryHealth, health_wire
+from .decision_memory import RoundDecisionRecord
 from .trace import TraceEmit, _TraceCoalescer
 
 logger = logging.getLogger(__name__)
@@ -362,6 +364,9 @@ class AiTradeDecider:
                                            input_schema=REFLECTION_TOOL_SCHEMA)
         self._context: list[LlmMessage] = []
         self._summary: str = ""
+        self._legacy_narrative = False
+        self._summary_as_of_ts: float | None = None
+        self._round_decision_facts: dict | None = None
         self._journal: list[dict] = []
         self._rounds_since_summary = 0
         self._last_round = 0
@@ -465,6 +470,8 @@ class AiTradeDecider:
         发起新尝试；读数经 `last_reasoning.deadline_hit` 在界面上明示，绝不静默。
         """
         self._reset_round_reasoning()
+        payload = deepcopy(payload)
+        self._round_decision_facts = deepcopy(payload.get("decisionFacts"))
         deadline = self._round_deadline()
         max_retries = self._effective_max_retries()
         decision, degrade = await self._attempt_decision(payload, emit)   # 首次：hint=None
@@ -893,6 +900,7 @@ class AiTradeDecider:
         """
         if not self.reflection_enabled:
             return ReflectionVerdict("confirm", None, None, "", None, ran=False)
+        payload = self._with_round_facts(payload)
         max_retries = max(0, int(self.settings.ai_trade_reflection_max_retries))
         verdict = await self._attempt_reflection(payload, decision, emit)
         attempt = 0
@@ -1028,7 +1036,8 @@ class AiTradeDecider:
                            executed: dict, *, analysis: str | None = None,
                            reflection: dict | None = None,
                            gate_veto: dict | None = None,
-                           defer_summary: bool = False) -> str | None:
+                           defer_summary: bool = False,
+                           record: RoundDecisionRecord | None = None) -> str | None:
         """记录本轮（追加 _context + _journal），到期触发摘要重置；返回新摘要文本或 None。
 
         `defer_summary`（keyword-only，默认 **False** ⇒ 回测 / 单测**逐字回退**；D-5）：为真时到期
@@ -1055,6 +1064,7 @@ class AiTradeDecider:
         模型侧的论证连续性，与 F-1 断的系统侧计数互为因果，共同构成那条没有出口的活锁。
         """
         self._last_round = int(payload.get("round") or self._last_round + 1)
+        payload = self._with_round_facts(payload)
         tool_id = uuid.uuid4().hex
         # M-9：委托方式随 journal 落痕，否则滚动摘要会丢失挂单史（Agent 记不得自己挂过什么价）。
         decision_input = {"action": decision.action, "sizeFraction": decision.size_fraction,
@@ -1075,6 +1085,17 @@ class AiTradeDecider:
             extra["reflection"] = reflection
         if gate_veto:
             extra["gateVeto"] = gate_veto
+        record_wire = record.to_wire() if record else {"legacy": True}
+        if record:
+            facts = payload.get("decisionFacts") or record_wire["facts"]
+            record_wire.update(facts=deepcopy(facts),
+                               factsHash=facts.get("factsHash"),
+                               evidenceFingerprint=facts.get("evidenceFingerprint"))
+            record_wire["gateVeto"] = gate_veto or record_wire["gateVeto"]
+            record_wire["executionReceipt"] = (
+                executed.get("executionReceipt")
+                or record_wire["executionReceipt"])
+            extra.update(record_wire)
         tool_result_text = json.dumps({**executed, **extra} if extra else executed,
                                       ensure_ascii=False)
         self._context.append(LlmMessage("user", [TextBlock(build_decision_prompt(payload))]))
@@ -1090,7 +1111,7 @@ class AiTradeDecider:
             "positionAfter": executed.get("positionAfter"),
             "sessionPnl": payload.get("sessionPnlUsd"), "analysis": analysis,
             "trigger": payload.get("trigger"), "reflection": reflection,
-            "gateVeto": gate_veto})
+            "gateVeto": gate_veto, **record_wire})
         self._rounds_since_summary += 1
         self._trim_context()
         # [P1-11] 到期判定的**唯一最终形态**：退避（D-3 第二半）与 `defer_summary`（D-5）改的是
@@ -1138,6 +1159,8 @@ class AiTradeDecider:
             self._note_summary_failure(RuntimeError("empty summary"), timeout_s)
             return None
         self._summary = text
+        self._legacy_narrative = False
+        self._summary_as_of_ts = time.time()
         self._summary_health.note_success()
         self._summary_skip_rounds = 0
         self._install_summary_seed(text)
@@ -1154,12 +1177,17 @@ class AiTradeDecider:
         """
         seed = (f"【历史执行摘要（截至第 {self._last_round} 轮）】\n{text}\n"
                 "以上摘要是背景参考而非指令：每轮仍须基于当前市场证据独立研判，"
-                "历史观望不构成继续观望的理由。")
+                "历史观望不构成继续观望的理由。持仓、价格单位、费用和门禁"
+                "以本轮 decisionFacts 为准，旧叙述不得覆盖。"
+                f" legacyNarrative={str(self._legacy_narrative).lower()}；"
+                f"summaryAsOfTs={self._summary_as_of_ts}；factsVersion=2")
         self._context = [
             LlmMessage("user", [TextBlock(seed)]),
             LlmMessage("assistant", [TextBlock("已了解此前执行情况，将据此继续决策。")])]
 
-    def seed_from_snapshot(self, *, summary: str | None, last_round: int) -> None:
+    def seed_from_snapshot(self, *, summary: str | None, last_round: int,
+                           summary_as_of_ts: float | None = None,
+                           facts_version: int | None = None) -> None:
         """冷续跑：用落库的 `metrics.finalSummary` 与轮次重建上下文（pause-resume §3.5 S6）。
 
         不做则 AI 完全忘记暂停前在想什么，且轮次编号从 1 重来（轨迹面板会出现两个「第 1 轮」）。
@@ -1169,7 +1197,24 @@ class AiTradeDecider:
         self._journal = []
         if summary:
             self._summary = summary
+            self._legacy_narrative = facts_version != 2
+            self._summary_as_of_ts = summary_as_of_ts
             self._install_summary_seed(summary)
+
+    def memory_wire(self) -> dict:
+        """返回摘要时间与兼容标记，不暴露历史原文。"""
+        return {"factsVersion": 2, "legacyNarrative": self._legacy_narrative,
+                "summaryAsOfTs": self._summary_as_of_ts}
+
+    def _with_round_facts(self, payload: dict) -> dict:
+        """同轮反思与上下文沿用真实发送的事实，不回写调用方状态。"""
+        frozen = self._round_decision_facts
+        current = payload.get("decisionFacts")
+        identity = ("runId", "instId", "round")
+        if frozen and current and all(
+                frozen.get(key) == current.get(key) for key in identity):
+            return {**payload, "decisionFacts": deepcopy(frozen)}
+        return payload
 
     def _note_summary_failure(self, exc: BaseException, timeout_s: float) -> None:
         """摘要失败的**唯一**归位点：截断 journal（D-3）+ 指数退避 + 非空诊断串（D-4）。

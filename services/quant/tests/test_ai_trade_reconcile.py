@@ -138,7 +138,8 @@ def test_normalization_flips_the_expense_signs_and_derives_the_identity_gap():
     row = _normalize_position_history({
         "posId": "p", "instId": _INST, "direction": "long", "cTime": "1754400000000",
         "uTime": "1754431200000", "pnl": "-6.0", "fee": "-2.0", "fundingFee": "-0.3",
-        "liqPenalty": "0", "realizedPnl": "-8.3", "openAvgPx": "1", "closeAvgPx": "2"})
+        "liqPenalty": "0", "settledPnl": "0", "realizedPnl": "-8.3",
+        "openAvgPx": "1", "closeAvgPx": "2"})
     assert row["fee"] == 2.0 and row["fundingFee"] == 0.3      # 负数=支出 ⇒ 归一为正
     assert row["uTime"] == 1754431200                          # 毫秒 ⇒ 秒
     assert row["identityGapUsd"] == pytest.approx(0.0)
@@ -148,6 +149,7 @@ def test_normalization_flips_the_expense_signs_and_derives_the_identity_gap():
 def test_local_net_view_reconstructs_net_pnl_when_the_switch_is_off():
     trades = [{"side": "long", "fee": 1.0}, {"side": "close", "fee": 1.0, "pnl": 10.0},
               {"side": "short", "fee": 1.0}, {"side": "close", "fee": 1.0, "pnl": -4.0}]
+    trades = _with_quantity_and_source(trades)
     # 毛额行按 `pnl − Σ腿费` 还原：(10−2) + (−4−2) = 2.0；净额行直接相加 = 6.0。
     assert local_net_view(trades, net_mode=False) == {"netUsd": 2.0, "trips": 2}
     assert local_net_view(trades, net_mode=True) == {"netUsd": 6.0, "trips": 2}
@@ -157,8 +159,15 @@ def test_local_net_view_ignores_a_dangling_open_leg():
     """未平仓的开仓腿绝不进净额：`positions-history` 只覆盖**已结算**持仓，混入即结构性偏差。"""
     trades = [{"side": "long", "fee": 1.0}, {"side": "close", "fee": 1.0, "pnl": 10.0},
               {"side": "long", "fee": 1.0}]
+    trades = _with_quantity_and_source(trades)
     assert local_net_view(trades, net_mode=False)["trips"] == 1
     assert local_net_view(trades, net_mode=False)["netUsd"] == pytest.approx(8.0)
+
+
+def _with_quantity_and_source(trades):
+    return [{**trade, "id": index + 1, "qty": 1, "price": 100,
+             "feeKnown": True, "feeBasis": "measured"}
+            for index, trade in enumerate(trades)]
 
 
 def test_params_resolve_from_settings():

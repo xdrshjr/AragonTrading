@@ -47,6 +47,18 @@ class OrderInput:
     lever: float | None
     tp_trigger_px: float | None
     sl_trigger_px: float | None
+    client_order_id: str | None = None
+    submission_trace: SubmissionTrace | None = None
+
+
+@dataclass
+class SubmissionTrace:
+    """内部发送旁路；绝不序列化到交易所请求体。"""
+
+    phase: str = "not_sent"
+    ack: str = "none"
+    ord_id: str | None = None
+    error_code: str | None = None
 
 
 def is_instrument_supported(meta: InstrumentMeta) -> bool:

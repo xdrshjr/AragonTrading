@@ -10,7 +10,7 @@
 """
 from __future__ import annotations
 
-from .cost_model import CostBreakdown, break_even_px
+from .cost_model import CostBreakdown, position_break_even_px
 
 
 def atr_share(total_bps: float, atr_px: float | None, last_px: float | None) -> float | None:
@@ -29,15 +29,15 @@ def break_even_wire(position: dict | None, total_bps: float,
     都满足「正数 = 尚未回本、负数 = 已覆盖成本」。不方向化会让空头持仓的文案说反。
     """
     side = (position or {}).get("side")
-    entry = (position or {}).get("avgEntry")
-    px = break_even_px(entry, side=side, cost_bps=total_bps) if position else None
+    px = position_break_even_px(position) if position else None
     if px is None:
         return {"breakEvenPx": None, "breakEvenGapPct": None}
     gap = None
     if last_px and float(last_px) > 0:
         raw = (px - float(last_px)) / float(last_px)
         gap = round(raw if side == "long" else -raw, 8)
-    return {"breakEvenPx": round(px, 8), "breakEvenGapPct": gap}
+    return {"breakEvenPx": px, "breakEvenGapPct": gap,
+            "breakEvenBasis": "estimated"}
 
 
 def funding_accrued_view(funding_stats: dict | None,
@@ -89,6 +89,10 @@ def build_cost_view(cost: CostBreakdown, *, fee_snapshot, ord_type: str, side: s
         如实说明「按 X 腿、Y 方向估算」，否则模型会把一个假设当成事实。
     """
     view = {"roundTripBps": cost.total_bps, "roundTripPct": round(cost.total_bps / 1e4, 8),
+            "modelVersion": cost.model_version,
+            "liquidityAssumption": cost.liquidity_assumption,
+            "feeSource": cost.fee_source,
+            "hasPosition": bool(position and position.get("side") in ("long", "short")),
             "feeOpenBps": cost.fee_open_bps, "feeCloseBps": cost.fee_close_bps,
             "halfSpreadBps": cost.half_spread_bps, "impactBps": cost.impact_bps,
             "crossingLegs": cost.crossing_legs,

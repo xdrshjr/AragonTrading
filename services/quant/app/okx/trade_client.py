@@ -68,9 +68,9 @@ class OKXTradeClient(OKXPrivateClient):
         照旧指数退避重试（与基类 ``_get`` 口径一致）；**传输层异常的重试改为按幂等分级放行**
         （okx-link-resilience §2.4.3）：带去重键或天然幂等的写才重试，其余首次异常即上抛。
 
-        为什么必须分级：``place_order`` / ``order-algo`` 重发同一 body 是安全的（OKX 按
-        ``clOrdId`` / ``algoClOrdId`` 去重），但 ``close-position`` **没有这个承诺**——一次「请求已
-        送达、响应在回程丢了」的超时，盲重试就可能变成第二次平仓动作（R-1，本轮最严重的风险）。
+        默认兼容原有写请求重试策略。客户端 ID 仅在当前挂单中唯一，不能视为
+        历史订单幂等保证；AI 开仓必须显式传 False，响应丢失后改查原 ID。
+        ``close-position`` 同样不能盲目重发，否则可能重复平仓。
 
         F2（ai-trade-interval-wake-dead-monitor-loop §8.2）：与 ``_get`` 同款结构化修法——``try``
         收窄到**只包住那一次网络调用**，谓词随之放宽为「进了这个 except 分支」，使
@@ -107,6 +107,8 @@ class OKXTradeClient(OKXPrivateClient):
             get_call_stats().note("POST", path, status=resp.status_code)
             if resp.status_code == 429:   # 限流：退避后重试，不直接抛
                 rate_limited = True
+                if allow_retry is False:
+                    break
                 await asyncio.sleep(0.5 * (2 ** attempt))
                 continue
             try:
@@ -126,13 +128,15 @@ class OKXTradeClient(OKXPrivateClient):
         self._note_link_fail("OKX_UNREACHABLE", f"{path}: {last_exc}")
         raise OKXPrivateError("OKX_UNREACHABLE", f"无法连接 OKX ({path}): {last_exc}")
 
-    async def place_order(self, payload: dict) -> dict:
+    async def place_order(self, payload: dict, *,
+                          allow_retry: bool | None = None) -> dict:
         """``POST /api/v5/trade/order``：先看顶层 ``code`` 再看 ``data[0].sCode``，任一非 ``"0"`` 抛错。
 
         成功返回 ``data[0]``（含 ``ordId / clOrdId``）；失败以**具体 sCode**（缺则顶层 code）抛
         ``OKXPrivateError``，原始 ``sMsg`` 作 message，由服务层归一为语义码（§6）。
         """
-        body = await self._post("/api/v5/trade/order", payload)
+        body = await self._post(
+            "/api/v5/trade/order", payload, allow_retry=allow_retry)
         rows = body.get("data") or []
         row = rows[0] if rows else {}
         top_code = str(body.get("code"))

@@ -38,12 +38,21 @@ def test_market_round_trip_matches_calibration_13_bps():
     assert (cost.fee_open_bps, cost.fee_close_bps) == (5.0, 5.0)
 
 
-def test_limit_open_pays_maker_and_crosses_one_leg_only():
-    """用例 2：限价开仓 ⇒ 2 + 5 + 1×1.5 = 8.5 bps（maker 腿不吃半价差，§3.4 的显式泛化）。"""
+def test_limit_open_may_take_and_crosses_both_legs():
+    """v2 普通限价开仓 ⇒ 5 + 5 + 2×1.5 = 13 bps。"""
     cost = estimate_round_trip_cost(_query(ord_type="limit"), _PARAMS)
-    assert cost.total_bps == 8.5
-    assert cost.fee_open_bps == 2.0
+    assert cost.total_bps == 13.0
+    assert cost.fee_open_bps == 5.0
     assert cost.fee_close_bps == 5.0       # 平仓腿的委托类型未知，保守恒取 taker
+    assert cost.crossing_legs == 2
+    assert cost.liquidity_assumption == "may_take"
+
+
+def test_guaranteed_maker_assumption_requires_explicit_contract():
+    cost = estimate_round_trip_cost(_query(
+        ord_type="limit", liquidity_assumption="maker_guaranteed"), _PARAMS)
+    assert cost.total_bps == 8.5
+    assert cost.fee_open_bps == 2
     assert cost.crossing_legs == 1
 
 

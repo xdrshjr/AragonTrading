@@ -29,6 +29,7 @@ import pandas as pd
 from ..config import Settings
 from ..engine.indicators import bollinger
 from .decider import TradeDecision
+from .numeric_text import format_price
 
 logger = logging.getLogger(__name__)
 
@@ -147,9 +148,9 @@ def build_ma_band(df: pd.DataFrame, rule: MaBandRule | None) -> dict | None:
     pct_b = (last - lower) / span
     return {"ruleId": MA_BAND_RULE_ID, "period": rule.period, "stdMult": rule.std_mult,
             "tolerance": rule.tolerance,
-            "upper": round(upper, 6), "mid": round(mid, 6), "lower": round(lower, 6),
+            "upper": upper, "mid": mid, "lower": lower,
             "bandWidthPct": round(span / mid * 100.0, 4),
-            "pctB": round(pct_b, 4), "zone": classify_zone(pct_b, rule.tolerance),
+            "pctB": pct_b, "zone": classify_zone(pct_b, rule.tolerance),
             "directional": rule.directional}
 
 
@@ -266,12 +267,14 @@ def format_band_for_prompt(band: dict | None) -> str:
     tol = band.get("tolerance")
     pos = (f"{_ZONE_LABEL.get(zone, zone)}锚区内（容差 {tol}）✔ 允许开仓" if zone
            else f"不在任何锚区内（容差 {tol}）✘ 本轮开仓将被系统降级为观望")
-    ranges = " / ".join(f"{lo:.2f}~{hi:.2f}（{_ZONE_LABEL[name]}）"
+    ranges = " / ".join(f"{format_price(lo)}~{format_price(hi)} USDT（{_ZONE_LABEL[name]}）"
                         for name, lo, hi in compliant_price_ranges(band))
     return (f"{head}\n"
             f"  通道(MA{band.get('period')}±{band.get('stdMult')}σ)："
-            f"上轨 {band.get('upper'):.2f} / 中轨 {band.get('mid'):.2f} / "
-            f"下轨 {band.get('lower'):.2f}（带宽 {band.get('bandWidthPct')}%）\n"
+            f"上轨 {format_price(band.get('upper'))} / "
+            f"中轨 {format_price(band.get('mid'))} / "
+            f"下轨 {format_price(band.get('lower'))} USDT"
+            f"（带宽 {band.get('bandWidthPct')}%）\n"
             f"  当前价位置：%B={band.get('pctB')} → {pos}\n"
             f"  合规开单价区间：{ranges}")
 
