@@ -161,6 +161,19 @@ def test_the_settlement_seam_defaults_to_absent_on_the_executor():
     assert sig.parameters["settlement_fn"].default is None
 
 
+def test_identity_tracker_is_scoped_to_the_ai_settlement_port():
+    from app.live_auto.settlement_identity import IdentityConfig
+    from tests.test_external_close_settlement import _make
+
+    ordinary, _ = _make()
+    ordinary.configure_settlement_identity(IdentityConfig(1, 1, "SOL"))
+    assert ordinary.settlement_identity is None
+    ai, calls = _make(settlement_rows=[])
+    assert ai.settlement_identity.config.run_id == 1
+    assert ai.settlement_identity.config.account_id == 1
+    assert calls["reads"] == calls["settlement"] == 0
+
+
 # ---------- G-X3：仓库级文案门禁 ----------
 
 _MESSAGE_SOURCES = ("ai_auto/orphan.py", "ai_auto/gear_resolution.py",

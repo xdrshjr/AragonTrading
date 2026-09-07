@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from copy import deepcopy
 from collections import deque
 from collections.abc import Callable
 from dataclasses import replace
@@ -29,6 +30,12 @@ from ..live_auto.executor import LiveExecutor
 from ..live_auto.explain import build_atomic_explain, build_profit_guard_explain
 from ..live_auto.resting import resting_payload
 from ..live_auto.settlement import settlement_meta_wire
+from ..live_auto.settlement_identity import IdentityConfig
+from ..live_auto.settlement_identity import (
+    SettlementIdentityTracker, has_closed_offline_epoch,
+)
+from .prompts import build_advisory_evidence
+from .advisory_evidence import evidence_hashes
 from ..okx.call_stats import get_call_stats
 from ..okx.rest_client import get_rest_client
 from ..okx.types import BAR_SECONDS, Candle
@@ -285,6 +292,18 @@ class AiTradeSession:
         self.inst_id = inst_id
         self.bar = bar
         self.executor = executor
+        executor.configure_settlement_identity(IdentityConfig(
+            executor.account_id, run_id, inst_id,
+            {**executor.settlement_instrument,
+             "marginMode": executor.td_mode},
+            {"tolS": executor.settings.ai_trade_settlement_match_tol_s,
+             "deadlineS": executor.settings.ai_trade_settlement_deadline_s}))
+        executor.persist_settlement_identity = self._persist_settlement_identity
+        executor.restore_claimed_settlement = self._restore_claimed_settlement
+        self._settlement_observation = None
+        self._settlement_revision = 0
+        self._settlement_persist_failed = False
+        self._settlement_freeze_saved = None
         self.decider = decider
         self.take_profit_usd = take_profit_usd
         self.stop_loss_usd = stop_loss_usd
@@ -612,6 +631,7 @@ class AiTradeSession:
                 trade = event["data"]
                 if not await self._claim_trade_event(trade):
                     continue
+                terminal_close = False
                 try:
                     # ★ 轴 D：**任何一次成交都清零**——系统证明了自己还活着。挂在事件上而不是轮末，
                     # 因为限价成交可能在数轮之后才被采纳，那一刻才是「它还活着」的真实时刻。
@@ -619,14 +639,22 @@ class AiTradeSession:
                     if trade.get("clOrdId"):        # pause-resume §6.2：本会话下过的单（unknown_order 判据）
                         self._note_cl_ord_id(str(trade["clOrdId"]))
                     if trade.get("side") == "close":
-                        self._position_seq += 1     # 任一平仓成交 = 一个持仓周期终结
-                        self._known_cl_ord_ids.clear()   # 有界：只保留**当前持仓周期**内的
-                        if "peakPnlUsd" not in trade:      # 绝不用 setdefault（P2-7：恒求值实参 ⇒
-                            # 键已存在时也会把峰值消费掉，让下一笔平仓静默拿到 None）
-                            trade["peakPnlUsd"] = self._guard.take_peak_pnl()
-                        self._cost.record_close(trade)      # §3.8：往返归因同挂这个唯一收口
-                        self._sizing.note_close(trade, now_wall=time.time())   # 连亏计数同挂唯一收口
-                        self._horizon.note_close(trade, time.time())   # 真实持仓时长样本同挂唯一收口
+                        self._cost.record_close(trade)
+                        result = self._cost.attribution.accounting.last_result
+                        terminal_close = bool(result.get("complete")
+                                              and not result.get("duplicate"))
+                        if terminal_close:
+                            self._position_seq += 1
+                            self._known_cl_ord_ids.clear()
+                            if "peakPnlUsd" not in trade:
+                                trade["peakPnlUsd"] = self._guard.take_peak_pnl()
+                            pnl_key = ("tradingNetUsd" if
+                                self._cost.attribution.net_mode else
+                                "grossPnlUsd")
+                            self._sizing.note_close(
+                                result.get(pnl_key),
+                                now_wall=time.time())
+                            self._horizon.note_close(trade, time.time())
                     else:   # 开仓成交：锁定 epoch 的 opened_wall（部分成交同一 epoch ⇒ 内部幂等不重置）
                         # 轴 C：漏斗末格（事件级口径）。方向取**成交腿自己的 side**——本记点排在
                         # `note_executed` 之后，轮级 `_intent_side` 早已被清（directional-symmetry P0-1）。
@@ -650,7 +678,7 @@ class AiTradeSession:
                         # closed-loop 轴 B：引用行绑定持仓周期。先按 `clOrdId` 认领（限价跨轮），
                         # 认领不到再回退本轮待写行（市价恒走回退）——两条路都取不到就什么都不做。
                         self._intel_cite.note_open(trade, seq=self._position_seq)
-                    self._sizing.note_executor(self.executor, self._current_px())   # [P1-8] 敞口簿
+                    self._note_executor_equity(self._current_px())
                     self._inject_explain_meta(trade)
                 except Exception as exc:
                     logger.warning(
@@ -660,7 +688,7 @@ class AiTradeSession:
                 # `_inject_explain_meta` 之后——`exitSource` 与往返结算都在那一步才写进 meta，
                 # 挂早了 meta 是空的（§4.1）。`persist_pending` 只做 `INSERT OR IGNORE`（★ D-1），
                 # 物化由 manager 侧的后台任务承担，绝不挂在这条热路径上。
-                if trade.get("side") == "close":
+                if terminal_close:
                     try:
                         self._experience.note_close(
                             trade, (trade.get("explain") or {}).get("meta") or {},
@@ -812,6 +840,7 @@ class AiTradeSession:
             if attempts is not None and event_id:
                 attempts.mark_events_persisted(event_id)
             self._trade_persist_failed = bool(self._unpersisted_trades)
+            self._claim_persisted_settlement(trade)
         except Exception as exc:  # noqa: BLE001 —— best-effort 审计落库，失败不阻塞热路径
             self._unpersisted_trades[event_id or uuid4().hex] = trade
             self._trade_persist_failed = True
@@ -841,8 +870,21 @@ class AiTradeSession:
                 "ok": False, "tradePersistenceFailed": True,
                 "message": "成交已发生，但原始记录尚未保存；保留恢复入口"}
             return False
+        if (self.executor._settling is not None
+                or self._settlement_persist_failed):
+            if not (self.flatten_result or {}).get("tradePersistenceFailed"):
+                self._flatten_before_trade_persist = self.flatten_result
+            self.flatten_failed = True
+            self.flatten_result = {**(self.flatten_result or {}),
+                "ok": False, "tradePersistenceFailed": True,
+                "message": "结算观察或成交尚未保存，保留恢复入口"}
+            return False
         if (self.flatten_result or {}).get("tradePersistenceFailed"):
             self.flatten_result = self._flatten_before_trade_persist
+            if ((self.flatten_result or {}).get("code")
+                    == "AI_TRADE_SETTLEMENT_PENDING"
+                    and self.executor.projected == "flat"):
+                self.flatten_result = {"ok": True, "closedSz": 0}
             self.flatten_failed = not (self.flatten_result or {}).get("ok")
         return True
 
@@ -859,10 +901,133 @@ class AiTradeSession:
         if not self.group_id:
             return False
         from ..db import ai_trade_state_repositories as state_repo
-        patch = {**self.state_member_row(), "runtimeIntegrity": integrity}
+        patch = self.state_member_row()
+        patch["accountId"] = self.executor.account_id
+        patch["runtimeIntegrity"] = dict(integrity)
         async with get_sessionmaker()() as db:
             return await state_repo.patch_runtime_integrity(
                 db, self.group_id, self.inst_id, patch)
+
+    def _claim_persisted_settlement(self, trade: dict) -> None:
+        """只有原始成交提交成功才认领官方复合结算身份。"""
+        tracker = self.executor.settlement_identity
+        meta = (trade.get("explain") or {}).get("meta") or {}
+        validation = meta.get("settlementValidation") or {}
+        if tracker is not None and validation.get("status") == "matched":
+            tracker.claim({
+                "settlementKey": validation.get("settlementKey"),
+                "epochKey": validation.get("epochKey"),
+                "accountingEventId": meta.get("accountingEventId")})
+
+    async def _restore_claimed_settlement(self, pending) -> bool:
+        """用完整 DB 终结事件先恢复连续量，不再补第二条 close。"""
+        from .resume import rebuild_continuity, restore_member_continuity
+        from types import SimpleNamespace
+
+        tracker = self.executor.settlement_identity
+        context = pending.context
+        if tracker is None or context is None or not context.epoch_key:
+            return False
+        if self._unpersisted_trades:
+            for trade in list(self._unpersisted_trades.values()):
+                await self._persist_trade(trade)
+            if self._unpersisted_trades:
+                return False
+        continuity = await rebuild_continuity(self.run_id, net_mode=None)
+        rebuilt = SettlementIdentityTracker(tracker.config)
+        rebuilt.restore(continuity["trades"], None)
+        claims = [claim for claim in rebuilt.claimed.values()
+                  if claim.get("epochKey") == context.epoch_key]
+        legacy_closed = has_closed_offline_epoch(
+            continuity["trades"], tracker.config,
+            context.epoch_key, context.pos_id)
+        if not claims and not legacy_closed:
+            return False
+        if rebuilt.context() is not None:
+            self._execution_state_persist_failed = True
+            pending.validation = {**(pending.validation or {}),
+                "status": "already_claimed", "reason": "ownership_conflict"}
+            return False
+        member = SimpleNamespace(session=self, run_id=self.run_id,
+                                 inst_id=self.inst_id)
+        restore_member_continuity(member, continuity, self.state_member_row())
+        self.executor.projected = "flat"
+        self.executor.entry_qty_sz = 0
+        self.executor.entry_fee_usd = 0
+        self.executor.unrealized_usd = self.executor.gross_unrealized_usd = 0
+        self.executor.last_settlement_validation = {
+            **(self.executor.last_settlement_validation or {}),
+            "schemaVersion": 1, "status": "already_claimed",
+            "reason": "already_claimed", "detailReason": None,
+            "epochKey": context.epoch_key,
+            "settlementKey": claims[0]["settlementKey"] if claims else None,
+            "asOfTs": int(time.time())}
+        return True
+
+    async def _persist_settlement_identity(self) -> bool:
+        """成员执行锁内比较并提交观察；失败保留内存并阻止新开仓。"""
+        tracker = self.executor.settlement_identity
+        if tracker is None or not self.group_id:
+            return True
+        observation = tracker.observation_wire()
+        pending = self.executor._settling
+        freeze = pending.detect_ts if pending is not None else None
+        if (observation == self._settlement_observation
+                and freeze == self._settlement_freeze_saved
+                and not self._settlement_persist_failed):
+            return True
+        previous = self._settlement_observation or {}
+        patch = {"accountId": self.executor.account_id, "runId": self.run_id,
+                 "expectedEpochKey": previous.get("epochKey"),
+                 "expectedSettlementRevision": self._settlement_revision,
+                 "runtimeIntegrity": {"settlementContext": observation}}
+        from ..db import ai_trade_state_repositories as state_repo
+        saved = False
+        try:
+            async with get_sessionmaker()() as db:
+                saved = await state_repo.patch_runtime_integrity(
+                    db, self.group_id, self.inst_id, patch)
+                if saved:
+                    self._settlement_revision += 1
+                else:
+                    row = await state_repo.load_group_state(db, self.group_id)
+                    saved = self._reload_settlement_revision(row)
+        except Exception as exc:
+            logger.warning("settlement identity save failed (%s): %s",
+                           self.inst_id, exc)
+        if saved:
+            self._settlement_observation = deepcopy(observation)
+            self._settlement_freeze_saved = freeze
+        self._settlement_persist_failed = not saved
+        self._execution_state_persist_failed |= not saved
+        return saved
+
+    def _reload_settlement_revision(self, row: dict | None) -> bool:
+        """确认已提交的同一观察；其他冲突只重读原 epoch 的版本。"""
+        if not row or row.get("accountId") != self.executor.account_id:
+            return False
+        for member in row.get("members", []):
+            if (member.get("runId") != self.run_id
+                    or member.get("instId") != self.inst_id):
+                continue
+            runtime = member.get("runtimeIntegrity") or {}
+            context = runtime.get("settlementContext")
+            revision = runtime.get("settlementStateRevision", 0)
+            tracker = self.executor.settlement_identity
+            if (tracker is not None and type(revision) is int
+                    and revision > self._settlement_revision
+                    and context == tracker.observation_wire()):
+                self._settlement_revision = revision
+                self._settlement_observation = deepcopy(context)
+                return True
+            old_epoch = (self._settlement_observation or {}).get("epochKey")
+            if (context or {}).get("epochKey") == old_epoch:
+                if tracker is not None and context is not None:
+                    tracker.adopt_observation(context)
+                self._settlement_revision = runtime.get(
+                    "settlementStateRevision", 0)
+                self._settlement_observation = deepcopy(context)
+        return False
 
     def _execution_identity(self) -> tuple:
         resting = self.executor.resting
@@ -916,9 +1081,12 @@ class AiTradeSession:
     async def _sync_execution_integrity(self) -> None:
         """在执行锁内保存已采纳订单的最终挂单状态，失败阻止下一次开仓。"""
         attempts = getattr(self.executor, "open_attempts", None)
+        observations_saved = await self._persist_settlement_identity()
+        attempts_saved = True
         if attempts is not None:
-            self._execution_state_persist_failed = not (
-                await attempts.sync_execution(self.executor))
+            attempts_saved = await attempts.sync_execution(self.executor)
+        self._execution_state_persist_failed = not (
+            observations_saved and attempts_saved)
 
     def _open_receipt(self) -> dict | None:
         receipt = getattr(self.executor, "last_open_receipt", None)
@@ -949,35 +1117,36 @@ class AiTradeSession:
                 "positionUnknown": False,
                 "restingClOrdId": None if resting is None else resting.cl_ord_id,
                 "knownClOrdIds": known,
-                "runtimeIntegrity": (
+                "runtimeIntegrity": {**(
                     self.executor.open_attempts.runtime_payload()
                     if getattr(self.executor, "open_attempts", None) else {
                         "schemaVersion": 2,
                         "entryQuota": self._entry_quota.to_dict(),
-                        "pendingOpenAttempt": None})}
+                        "pendingOpenAttempt": None}),
+                    "settlementContext": deepcopy(self._settlement_observation),
+                    "settlementStateRevision": self._settlement_revision}}
 
     def _state_position_snapshot(self) -> dict | None:
         """自管持仓断面（无仓 ⇒ None）。`openWallTs` 取当前持仓周期开仓腿的墙钟秒（`entry_bar` 反推的回落源）。"""
         if self.executor.projected == "flat":
             return None
+        tracker = self.executor.settlement_identity
+        context = tracker.context() if tracker else None
         return {"side": self.executor.projected, "size": self.executor.entry_qty_sz,
-                "avgEntry": self.executor.entry_price, "posId": "", "openCTime": 0,
+                "avgEntry": self.executor.entry_price,
+                "posId": context.pos_id or "" if context else "",
+                "openCTime": context.c_time_s or 0 if context else 0,
                 "openWallTs": self._open_wall_ts(), "positionSeq": self._position_seq}
 
     def _open_wall_ts(self) -> int:
         """当前持仓周期**开仓腿**的墙钟秒（`_dispatch` 落在 `explain.meta.wallTs` 的那个）；取不到 ⇒ 0。"""
-        for trade in reversed(self.executor.trades or []):
-            if trade.get("side") == "close":
-                break
-            wall = trade.get("wallTs") or ((trade.get("explain") or {}).get("meta") or {}).get("wallTs")
-            if wall:
-                return int(wall)
-        return 0
+        return self.executor._entry_wall_ts()
 
     async def _persist_state_position(self) -> None:
         """W2：成交后把该成员的持仓 / 挂单身份写回状态表。**best-effort**，失败绝不阻塞热路径。"""
         if not self.group_id:
             return
+        await self._persist_settlement_identity()
         try:
             from ..db import ai_trade_state_repositories as state_repo
             sm = get_sessionmaker()
@@ -1060,10 +1229,15 @@ class AiTradeSession:
         pause 与 stop 的区别（写在这里防后人「顺手统一」）：stop ① 停 WS ② 平仓
         ③ `_backstop.close()` / `_repair.close()` ④ 落 run 终态；pause **四件都不做**。
         """
+        if reason == "resume_failed" and not flatten:
+            return await self._dispose_failed_resume()
         if not self.is_active:
             if (self._trade_persist_failed or self._trade_backlog_persist_failed
                     or (self.flatten_result or {}).get("tradePersistenceFailed")):
                 async with self._exec_lock:
+                    await self._dispatch(await self.executor.drain_settlement(
+                        self._ref_ts()))
+                    await self._sync_execution_integrity()
                     if await self._flush_stopping_trades():
                         await self._finalize_run(self._ref_ts())
                         await self._notify_stopped()
@@ -1089,10 +1263,7 @@ class AiTradeSession:
             # `flatten=False` 只有一个调用方：`end_group` 的「保留持仓、仅结束本地会话」分支
             # （pause-resume §5.4，用户已显式勾选确认）。默认恒 True ⇒ 既有全部调用点逐字节不变。
             self.flatten_result = {"ok": True, "closedSz": 0, "skipped": "hold_position"}
-        # ★ 轴 A-6：结算若仍未决，在**落库之前**带硬超时再问一次，仍不命中即按本地标记价立刻
-        # 落账。绝不把一条已经发生的平仓留在 `settling` 里带进关停——那会让这笔往返在历史详情里
-        # 整条消失（R-1 的第二重保险；`flatten` 里还有第一重）。必须排在对账**之前**：这条腿要
-        # 进得了 `local_net_view` 的窗口，终态差额才算得对。
+        # 结算在原截止时间内保持未决；未完成的结构与观察落库会阻止运行终结。
         await self._dispatch(await self.executor.drain_settlement(ts))
         async with self._exec_lock:
             trades_persisted = await self._flush_stopping_trades()
@@ -1119,6 +1290,16 @@ class AiTradeSession:
             await self._notify_stopped()
         await self._push({"type": "status", "data": self._status_payload()})
         return self.flatten_result
+
+    async def _dispose_failed_resume(self) -> dict:
+        """冷恢复失败只清理本地资源，数据库暂停契约留待重试。"""
+        self._cancel_task("_monitor_task")
+        self._cancel_task("_decision_task")
+        self._backstop.close()
+        self._repair.close()
+        if self._ws is not None:
+            await self._ws.stop()
+        return {"ok": True, "closedSz": 0, "skipped": "resume_failed"}
 
     async def _notify_stopped(self) -> None:
         """W5（§3.4.2）：会话**自终止**之后把可续跑契约收敛（置 `ended` 或摘掉本成员）。
@@ -1366,8 +1547,15 @@ class AiTradeSession:
         # ⑤读交易所持仓与⑦落契约**之前**。否则暂停契约会在 `projected` 仍说「有仓」、而交易所
         # 侧早已空、这条腿又还没落账的断面上定格——冷续跑时 `resume` 拿这份契约与交易所对不上，
         # 一笔真实发生过的平仓会在历史详情里整条消失（`stop()` 里那一处是同一条理由）。
-        await self._dispatch(await self.executor.drain_settlement(ts))
-        position, unknown = await self._read_exchange_position()                 # ⑤
+        async with self._exec_lock:
+            await self._dispatch(await self.executor.drain_settlement(ts))
+            await self._sync_execution_integrity()
+            saved = await self._flush_stopping_trades()
+            position, unknown = await self._read_exchange_position()
+            saved = await self._persist_settlement_identity() and saved
+        persistence_pending = not saved or self._execution_state_persist_failed
+        if self.executor._settling is not None:
+            position = self._state_position_snapshot()
         backstop = await self._pause_backstop(position)                          # ⑥
         await self._experience.flush()                 # W-10：暂停同样要保住收据（毫秒级本地 IO）
         await self._experience.persist_harvest_gap()   # ★ E-8：同上
@@ -1376,6 +1564,7 @@ class AiTradeSession:
             "instId": self.inst_id, "sessionId": self.session_id, "runId": self.run_id,
             "state": self.state, "pauseReason": reason, "pausedTs": self.paused_ts,
             "position": position, "positionUnknown": unknown,
+            "persistencePending": persistence_pending,
             "restingCancelled": resting_cancelled, "backstop": backstop,
             "flattened": flattened}
         await self._push({"type": "status", "data": self._status_payload()})
@@ -1431,6 +1620,12 @@ class AiTradeSession:
         except Exception as exc:  # noqa: BLE001 —— 取数失败不阻断暂停，但必须如实标注
             logger.warning("ai-trade pause position read failed (%s): %s", self.inst_id, exc)
             return None, True
+        tracker = self.executor.settlement_identity
+        if (tracker is not None and self.executor._positions_taken_wall > 0
+                and self.executor._snapshot_outranks_last_write()):
+            tracker.observe_position({"positions": rows,
+                "observedAtTs": self.executor._positions_taken_wall,
+                "accountId": self.executor.account_id, "fresh": True})
         for row in rows or []:
             if str(row.get("instId") or "") != self.inst_id:
                 continue
@@ -2070,6 +2265,7 @@ class AiTradeSession:
             if contrarian is not None:
                 contrarian["remaining"] = self._entry_quota.remaining
                 payload["consensus"]["contrarian"] = contrarian
+            self._freeze_advisory_payload(payload)
             payload["decisionFacts"] = build_session_facts(self, payload)
             self._round_facts = payload["decisionFacts"]
             await self._begin_round_trace(round_no, ts, ref_px, payload, board)  # RV-7：consensus 之后
@@ -3456,6 +3652,8 @@ class AiTradeSession:
     async def _maybe_session_exit(self, ref_px: float, ts: int) -> None:
         """会话级金额阈值：累计盈亏 ≥ +TP 或 ≤ −SL → 自动平仓（经 _exec_lock）+ 停会话。"""
         pnl = self.executor.session_pnl_usd
+        if pnl is None:
+            return
         reason = None
         if self.take_profit_usd is not None and pnl >= self.take_profit_usd:
             reason = "session_take_profit"
@@ -3668,7 +3866,8 @@ class AiTradeSession:
             # §4.2：当前挂单只读上下文（无挂单 → None，prompt 整段省略）。Agent 看不见自己的挂单
             # 就无法就它做任何决策——这是 `cancel_order` 可用的前提。
             "restingOrder": resting_payload(self.executor.resting, int(time.time())),
-            "sessionPnlUsd": round(self.executor.session_pnl_usd, 4),
+            "sessionPnlUsd": (None if self.executor.session_pnl_usd is None
+                              else round(self.executor.session_pnl_usd, 4)),
             "budgetUsd": self.executor.budget_usd,
             "takeProfitUsd": self.take_profit_usd, "stopLossUsd": self.stop_loss_usd,
             "marketContext": build_market_context(         # E1：只读；数据不足/禁用/异常 → None
@@ -3745,9 +3944,17 @@ class AiTradeSession:
         intel = intel_digest_for(self.inst_id)
         if intel:
             payload["intel"] = self._intel_payload(intel, round_no, ts, payload)
+        self._freeze_advisory_payload(payload)
         payload["decisionFacts"] = build_session_facts(self, payload)
         self._round_facts = payload["decisionFacts"]
         return payload
+
+    def _freeze_advisory_payload(self, payload: dict) -> None:
+        """在必要事实哈希之前冻结本轮实际来源和渲染文本。"""
+        payload["runId"] = self.run_id
+        if "advisorySnapshot" not in payload:
+            payload["advisorySnapshot"] = build_advisory_evidence(payload)
+        payload["evidenceHashes"] = evidence_hashes(payload["advisorySnapshot"])
 
     def _intel_payload(self, intel: dict, round_no: int, ts: int, payload: dict) -> dict:
         """给本轮的情报 wire 定稿一份披露计划（session-binding 轴 B-2）。
@@ -3941,13 +4148,23 @@ class AiTradeSession:
 
     # ---------- 净值 / 持仓 / 状态 ----------
     async def _emit_equity(self, ref_px: float, ts: int) -> None:
-        equity = self.executor.budget_usd + self.executor.session_pnl_usd
+        self._note_executor_equity(ref_px)
+        pnl = self.executor.session_pnl_usd
+        if pnl is None:
+            return
+        equity = self.executor.budget_usd + pnl
         self._peak_equity = max(self._peak_equity, equity)
         dd = (equity / self._peak_equity - 1.0) if self._peak_equity > 0 else 0.0
-        self._sizing.note_executor(self.executor, ref_px)   # 刹车权益推进 + 敞口簿轮末兜底（S-14）
         record = {"ts": ts, "equity": equity, "drawdown": min(dd, 0.0)}
         self._equity.append(record)
         await self._push({"type": "equity", "data": record})
+
+    def _note_executor_equity(self, ref_px: float) -> None:
+        """未知累计净额不制造权益点，敞口仍按当前仓位更新。"""
+        if self.executor.session_pnl_usd is None:
+            self._sizing.note_notional(self.executor, ref_px)
+        else:
+            self._sizing.note_executor(self.executor, ref_px)
 
     async def _emit_position(self, ref_px: float) -> None:
         pos = self._position_payload(ref_px)     # 富化包装：持仓 payload 搭车利润保护快照（§3.1）
@@ -4227,11 +4444,13 @@ class AiTradeSession:
         budget = self.executor.budget_usd
         realized = self.executor.realized_pnl_usd
         metrics = {**_empty_metrics(),
-                   "totalReturn": (realized / budget) if budget > 0 else 0.0,
+                   "totalReturn": (None if realized is None else
+                                   (realized / budget) if budget > 0 else 0.0),
                    # D5：读显式计数器而不是列表长度——`executor.trades` 现在有内存护栏封顶，
                    # 数长度会在超长会话上静默低报，而这两个数是要落库进 run metrics 的。
                    "tradeCount": self.executor.trade_count,
-                   "avgPnl": realized / max(1, self.executor.trade_count),
+                   "avgPnl": (None if realized is None else
+                              realized / max(1, self.executor.trade_count)),
                    "roundsCompleted": self.rounds_completed,
                    "finalSummary": self.decider.summary,
                    "flattenFailed": self.flatten_failed,

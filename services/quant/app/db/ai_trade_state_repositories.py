@@ -190,6 +190,8 @@ async def _patch_member(session, group_id, inst_id, patch, authoritative):
     row = await _get_row(session, group_id)
     if row is None:
         return False
+    if "accountId" in patch and patch["accountId"] != row.account_id:
+        return False
     members = _load(row.members_json, [])
     hit = False
     for member in members:
@@ -197,7 +199,15 @@ async def _patch_member(session, group_id, inst_id, patch, authoritative):
             if "runId" in patch and member.get("runId") != patch["runId"]:
                 return False
             changes = dict(patch)
-            if not authoritative and "runtimeIntegrity" in member:
+            for key in ("expectedEpochKey", "expectedSettlementRevision",
+                        "accountId"):
+                changes.pop(key, None)
+            if authoritative and "runtimeIntegrity" in patch:
+                runtime = _merge_runtime(member, patch, row.account_id)
+                if runtime is None:
+                    return False
+                changes["runtimeIntegrity"] = runtime
+            elif "runtimeIntegrity" in member:
                 changes.pop("runtimeIntegrity", None)
             member.update(changes)
             hit = True
@@ -207,6 +217,44 @@ async def _patch_member(session, group_id, inst_id, patch, authoritative):
     row.last_seen_ts = row.updated_ts = int(time.time())
     await session.commit()
     return True
+
+
+def _merge_runtime(member: dict, patch: dict, account_id: int) -> dict | None:
+    """事务字段分别归属，结算观察使用旧 epoch/revision 比较后交换。"""
+    previous = member.get("runtimeIntegrity") or {}
+    proposed = patch["runtimeIntegrity"]
+    if not isinstance(previous, dict) or not isinstance(proposed, dict):
+        return None
+    changes = dict(proposed)
+    # revision 只由本事务推进，开仓回调不能回灌旧版本。
+    changes.pop("settlementStateRevision", None)
+    if "settlementContext" in changes:
+        if not _matches_settlement_patch(member, patch, account_id):
+            return None
+        changes["settlementStateRevision"] = (
+            int(previous.get("settlementStateRevision", 0)) + 1)
+    return {**previous, **changes}
+
+
+def _matches_settlement_patch(member, patch, account_id) -> bool:
+    previous = member.get("runtimeIntegrity") or {}
+    old_context = previous.get("settlementContext") or {}
+    if "expectedEpochKey" not in patch:
+        return False
+    if patch["expectedEpochKey"] != old_context.get("epochKey"):
+        return False
+    revision = previous.get("settlementStateRevision", 0)
+    if patch.get("expectedSettlementRevision") != revision:
+        return False
+    context = patch["runtimeIntegrity"]["settlementContext"]
+    if context is None:
+        return True
+    if not isinstance(context, dict) or context.get("schemaVersion") != 1:
+        return False
+    return (context.get("accountId") == account_id
+            and context.get("runId") == member.get("runId")
+            and context.get("instId") == member.get("instId")
+            and bool(context.get("epochKey")))
 
 
 async def load_group_state(session: AsyncSession, group_id: str) -> dict | None:

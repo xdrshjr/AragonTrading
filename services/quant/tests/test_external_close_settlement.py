@@ -13,6 +13,7 @@ from app.config import Settings
 from app.engine.simulator import RiskParams
 from app.live_auto.executor import LiveExecutor
 from app.live_auto.fee_ledger import build_fee_ledger
+from app.live_auto.settlement_identity import IdentityConfig
 from app.okx.accounts import AccountCredentials
 from app.okx.rest_client import OKXError
 
@@ -31,7 +32,15 @@ def _settlement_row(**over) -> dict:
             "cTime": _TS - 3600, "uTime": _TS + 2,
             "pnl": -2.02, "fee": 0.25, "fundingFee": 0.0, "liqPenalty": 0.0,
             "realizedPnl": -2.27, "identityGapUsd": 0.0}
+    base.update(instType="SWAP", currency="USDT", closed=True,
+                type="2", closeTotalPos=_SZ, marginMode="cross",
+                settledPnl=0.0,
+                exchangeCTimeMs=str((_TS - 3600) * 1000),
+                exchangeUTimeMs=str((_TS + 2) * 1000))
     base.update(over)
+    if "realizedPnl" not in over:
+        base["realizedPnl"] = (base["pnl"] - base["fee"]
+                               - base["fundingFee"] - base["liqPenalty"])
     return base
 
 
@@ -71,13 +80,214 @@ def _make(*, settlement_rows=None, settlement_exc=None, settings=None, positions
     executor.entry_price = _ENTRY_PX
     executor.entry_qty_sz = _SZ
     executor.entry_bar = 0
-    executor.trades.append({"side": "long", "ts": _TS - 3600, "wallTs": _TS - 3600,
-                            "price": _ENTRY_PX, "qty": _SZ})
+    executor.configure_settlement_identity(IdentityConfig(
+        1, 1, _INST, {"tickSz": .01, "marginMode": "cross"}))
+    executor.restore_trades([{
+        "id": 1, "side": "long", "ts": _TS - 3600,
+        "wallTs": _TS - 3600, "price": _ENTRY_PX, "qty": _SZ,
+        "fee": 0, "pnl": 0, "feeKnown": True, "feeBasis": "measured"}])
+    _set_open_fee(executor, 0.0)
     return executor, calls
+
+
+@pytest.fixture(autouse=True)
+def _fixed_wall_clock(monkeypatch):
+    monkeypatch.setattr("app.live_auto.executor.time.time", lambda: _TS + 10)
+
+
+def _set_open_fee(executor, fee, basis="measured"):
+    executor.entry_fee_usd = fee
+    tracker = executor.settlement_identity
+    if tracker is None:
+        return
+    executor.trades[0].update(fee=fee, feeBasis=basis)
+    tracker.restore(executor.trades, None)
+    tracker.observe_position({
+        "instId": _INST, "posId": "p1", "pos": _SZ, "posSide": "long",
+        "marginMode": "cross", "avgPx": _ENTRY_PX,
+        "exchangeCTimeMs": str((_TS - 3600) * 1000),
+        "exchangeUTimeMs": str((_TS - 1) * 1000),
+        "observedAtTs": _TS - 1})
 
 
 def _trades(events):
     return [e["data"] for e in events if e["type"] == "trade"]
+
+
+async def test_unknown_realized_external_close_still_finishes_structure():
+    ex, calls = _make(settlement_rows=[_settlement_row()])
+    ex.realized_pnl_usd = None
+    await ex.reconcile(_MARK_PX, _TS)
+    events = await ex.reconcile(_MARK_PX, _TS + 1)
+    assert len(_trades(events)) == 1
+    assert ex.projected == "flat" and ex.entry_qty_sz == 0
+    assert ex.realized_pnl_usd is None
+    assert calls["closes"] == []
+
+
+def test_unknown_realized_pnl_and_equity_context_remain_unknown():
+    ex, _ = _make()
+    ex.realized_pnl_usd = None
+    assert ex.session_pnl_usd is None
+    assert ex.context(1, _MARK_PX).equity is None
+
+
+@pytest.mark.parametrize("path", ["normal", "benign", "flatten"])
+def test_unknown_realized_does_not_block_close_receipt_adoption(path):
+    ex, calls = _make()
+    ex.realized_pnl_usd = None
+    if path == "normal":
+        events = ex._settle_close(_MARK_PX, _TS, "signal_close", {})
+    elif path == "benign":
+        events = ex._settle_benign_close(_MARK_PX, _TS)
+    else:
+        result = ex._settle_flatten_ok(_MARK_PX, _TS, {})
+        assert result["ok"] and result["trade"]
+        events = [{"type": "trade", "data": result["trade"]}]
+    assert len(_trades(events)) == 1
+    assert ex.projected == "flat" and ex.entry_qty_sz == 0
+    assert ex.realized_pnl_usd is None
+    assert calls["closes"] == []
+
+
+async def test_flatten_before_deadline_keeps_pending_without_close_order():
+    ex, calls = _make(settlement_rows=[])
+    await ex.reconcile(_MARK_PX, _TS)
+    assert ex._settling is not None
+    result = await ex.flatten(_MARK_PX, _TS + 1)
+    assert not result["ok"]
+    assert ex._settling is not None
+    assert calls["closes"] == []
+
+
+@pytest.mark.parametrize("path", ["normal", "benign", "external"])
+@pytest.mark.parametrize("net_mode", [False, True])
+async def test_unknown_entry_fee_preserves_unknown_total_and_trade_provenance(
+        path, net_mode):
+    ex, calls = _make(settings=Settings(ai_trade_net_pnl_enabled=net_mode))
+    ex.realized_pnl_usd = 0
+    ex.entry_fee_usd = None
+    if path == "normal":
+        events = ex._settle_close(_MARK_PX, _TS, "signal_close", {})
+    elif path == "benign":
+        events = ex._settle_benign_close(_MARK_PX, _TS)
+    else:
+        events = await ex.reconcile(_MARK_PX, _TS)
+    trades = _trades(events)
+    assert len(trades) == 1
+    assert ex.projected == "flat" and ex.entry_qty_sz == 0
+    if net_mode:
+        assert ex.realized_pnl_usd is None
+    else:
+        expected = (_MARK_PX - _ENTRY_PX) * _SZ * _CT_VAL
+        assert ex.realized_pnl_usd == pytest.approx(expected)
+        from app.ai_auto.accounting_replay import accounted_close_pnl
+        assert accounted_close_pnl(trades[0], "gross") == pytest.approx(
+            ex.realized_pnl_usd)
+    meta = trades[0]["explain"]["meta"]
+    assert meta["pnlBasis"] == "estimated"
+    assert meta["entryFeeBasis"] == "unknown"
+    assert calls["closes"] == []
+
+
+async def test_unknown_position_identity_waits_instead_of_claiming_history():
+    """没有可信观察身份的历史不能被旧时间窗 matcher 采纳。"""
+    executor, calls = _make(settlement_rows=[_settlement_row()])
+    executor.settlement_identity = None
+    await executor.reconcile(_MARK_PX, _TS)
+    events = await executor.reconcile(_MARK_PX, _TS + 1)
+    assert _trades(events) == []
+    assert executor._settling is not None
+    assert calls["settlement"] == 1
+
+
+@pytest.mark.parametrize("changed_after_detection", [False, True])
+@pytest.mark.parametrize("deadline_expired", [False, True])
+async def test_settlement_rejects_projection_quantity_drift(
+        changed_after_detection, deadline_expired):
+    """完整历史不能认证与实际接管剩余量不相容的结算。"""
+    executor, calls = _make(settlement_rows=[_settlement_row()])
+    if not changed_after_detection:
+        executor.entry_qty_sz = 1
+    await executor.reconcile(_MARK_PX, _TS)
+    if changed_after_detection:
+        executor.entry_qty_sz = 1
+    if deadline_expired:
+        executor._settling.deadline = time.time() - 1
+    events = await executor.reconcile(_MARK_PX, _TS + 1)
+    assert _trades(events) == []
+    assert executor.projected == "long"
+    assert executor._settling is not None
+    assert executor.last_settlement_validation["reason"] == (
+        "quantity_mismatch")
+    assert executor.realized_pnl_usd == 0
+    assert calls["closes"] == []
+
+
+@pytest.mark.parametrize("pos_mode", ["net_mode", "long_short_mode"])
+@pytest.mark.parametrize("side", ["long", "short"])
+async def test_pending_settlement_blocks_all_new_orders(pos_mode, side):
+    """未决期间同向、反手和限价开仓都不能越过结算边界。"""
+    from unittest.mock import AsyncMock
+    from .test_live_executor import _Sig
+    executor, calls = _make(settlement_rows=[])
+    executor.pos_mode = pos_mode
+    orders = AsyncMock(return_value={"ok": True, "ordId": "new"})
+    executor._place_order = orders
+    await executor.reconcile(_MARK_PX, _TS)
+    events = await executor.apply([_Sig(side, .01)], ref_px=_MARK_PX,
+                                  bar_index=2, ts=_TS + 1)
+    assert orders.await_count == 0
+    assert _trades(events) == []
+    assert calls["closes"] == []
+    assert executor.projected == "long"
+    assert executor._settling is not None
+
+
+async def test_partial_close_uses_price_and_pnl_residual_once():
+    row = _settlement_row(closeTotalPos=10, closeAvgPx=116,
+                          pnl=151.1, fee=.2)
+    ex, calls = _make(settlement_rows=[row], settings=Settings(
+        ai_trade_net_pnl_enabled=False))
+    opened = {**ex.trades[0], "qty": 10, "fee": .5,
+              "feeBasis": "estimated", "positionAfter": 10}
+    closed = {"id": 2, "side": "close", "ts": _TS - 2,
+              "qty": 4, "price": 110, "pnl": 36.44, "fee": .1,
+              "feeKnown": True, "feeBasis": "measured", "positionAfter": 6}
+    ex.restore_trades([opened, closed])
+    ex.entry_qty_sz = 6
+    ex.realized_pnl_usd = 36.44
+    ex.settlement_identity.observe_position({
+        "instId": _INST, "posId": "p1", "pos": 6, "posSide": "long",
+        "marginMode": "cross", "avgPx": _ENTRY_PX,
+        "exchangeCTimeMs": str((_TS - 3600) * 1000),
+        "exchangeUTimeMs": str((_TS - 1) * 1000), "observedAtTs": _TS})
+    await ex.reconcile(_MARK_PX, _TS)
+    trade = _trades(await ex.reconcile(_MARK_PX, _TS + 1))[0]
+    assert trade["price"] == pytest.approx(120)
+    assert trade["qty"] == 6
+    assert trade["pnl"] == pytest.approx(114.66)
+    assert trade["fee"] == pytest.approx(-.4)
+    assert ex.realized_pnl_usd == pytest.approx(151.1)
+    assert trade["explain"]["meta"]["priceBasis"] == (
+        "exchange_aggregate_residual")
+    assert _trades(await ex.reconcile(_MARK_PX, _TS + 2)) == []
+    assert ex.realized_pnl_usd == pytest.approx(151.1)
+    assert calls["settlement"] == 1
+    assert calls["closes"] == []
+
+
+async def test_missing_fee_waits_for_complete_evidence_without_early_estimate():
+    rows = [_settlement_row(fee=.2)]
+    rows[0]["fee"] = None
+    ex, calls = _make(settlement_rows=rows)
+    await ex.reconcile(_MARK_PX, _TS)
+    assert _trades(await ex.reconcile(_MARK_PX, _TS + 1)) == []
+    assert ex.last_settlement_validation["reason"] == "missing_amount"
+    rows[0] = _settlement_row(fee=.2)
+    ex._settling.last_poll_wall = 0
+    assert len(_trades(await ex.reconcile(_MARK_PX, _TS + 2))) == 1
+    assert calls["settlement"] == 2
 
 
 # ---------- G-A10：取数缝缺席 ⇒ 状态机整条不存在（live_auto 全部路径） ----------
@@ -129,7 +339,7 @@ async def test_settling_freezes_stance_and_books_nothing():
 @pytest.mark.anyio
 async def test_hit_books_the_exchange_price_and_the_fee_residual():
     ex, _ = _make(settlement_rows=[_settlement_row()])
-    ex.entry_fee_usd = 0.10                                  # 本地已记的开仓腿费
+    _set_open_fee(ex, 0.10)                                  # 本地已记的开仓腿费
     await ex.reconcile(_MARK_PX, _TS)                        # ① 侦测
     events = await ex.reconcile(_MARK_PX, _TS + 1)           # ② 轮询命中
     trade = _trades(events)[0]
@@ -169,17 +379,18 @@ async def test_pnl_basis_follows_net_pnl_switch_not_the_accounting_switch():
 # ---------- G-A16（RV-P1-7）：费率残差为负 ⇒ 降级留痕，绝不静默夹 0 ----------
 
 @pytest.mark.anyio
-async def test_negative_fee_residual_degrades_to_local_mark_with_a_reason():
-    """本地已记开仓腿费 > 交易所往返总费 = 明确的不自洽。宁可缺一笔并说明，绝不 `max(0.0, …)`。"""
+async def test_negative_fee_residual_preserves_aggregate_adjustment():
     ex, _ = _make(settlement_rows=[_settlement_row(fee=0.05)])
-    ex.entry_fee_usd = 0.50
+    _set_open_fee(ex, 0.50, "estimated")
     await ex.reconcile(_MARK_PX, _TS)
     events = await ex.reconcile(_MARK_PX, _TS + 1)
     trade = _trades(events)[0]
-    assert trade["price"] == _MARK_PX                        # 退回本地合成
-    slot = ex.take_settlement_meta()
-    assert slot["fact"] is None and slot["rejectReason"] == "fee_residual_negative"
-    assert ex.settlement_local_mark_count == 1 and ex.settlement_exchange_count == 0
+    assert trade["price"] == _CLOSE_PX
+    assert trade["fee"] == pytest.approx(-.45)
+    assert trade["feeBasis"] == "estimated"
+    adjustment = trade["explain"]["meta"]["feeAdjustment"]
+    assert adjustment["kind"] == "aggregate_residual"
+    assert adjustment["residualFeeUsd"] == pytest.approx(-.45)
 
 
 # ---------- G-A5：幻影撤销 ----------
@@ -276,7 +487,10 @@ async def test_drain_on_stop_always_books_the_close():
     ex, _ = _make(settlement_rows=[])
     await ex.reconcile(_MARK_PX, _TS)
     assert ex._settling is not None
-    events = await ex.drain_settlement(_TS + 5)
+    assert _trades(await ex.drain_settlement(_TS + 5)) == []
+    assert ex._settling is not None
+    ex._settling.deadline = time.time() - 1
+    events = await ex.drain_settlement(_TS + 6)
     assert ex._settling is None and ex.projected == "flat"
     assert _trades(events)[0]["price"] == _MARK_PX
 
@@ -294,13 +508,16 @@ async def test_flatten_drains_the_pending_settlement_before_closing():
 # ---------- G-A11：posId 淘汰后最坏退化为 local_mark ----------
 
 @pytest.mark.anyio
-async def test_claimed_pos_ids_are_capped_and_never_cause_a_wrong_price():
+async def test_runtime_does_not_claim_before_trade_is_persisted():
     ex, _ = _make(settlement_rows=[_settlement_row()])
-    for index in range(300):
-        ex._claim_pos_id(f"p{index}")
-    assert len(ex._settled_pos_ids) == 256
-    assert ex._settled_pos_ids[0] == "p44"                   # 最旧的被淘汰
-    assert ex._settled_pos_ids[-1] == "p299"
+    await ex.reconcile(_MARK_PX, _TS)
+    trade = _trades(await ex.reconcile(_MARK_PX, _TS + 1))[0]
+    assert ex.settlement_identity.claimed == {}
+    meta = trade["explain"]["meta"]
+    ex.settlement_identity.claim({
+        **meta["settlementValidation"],
+        "accountingEventId": meta["accountingEventId"]})
+    assert meta["settlementKey"] in ex.settlement_identity.claimed
 
 
 # ---------- 轮级槽的异常出口（实现期自查，spec 未列） ----------
@@ -324,7 +541,9 @@ async def test_the_meta_slot_is_cleared_when_no_trade_was_produced():
     events = await ex.reconcile(_MARK_PX, _TS + 1)
     assert _trades(events) == []                     # 合成失败：没有成交
     assert ex.take_settlement_meta() is None         # ★ 槽已清空，不会被下一笔认领
-    assert ex.projected == "flat"                    # 立场仍照常复位（绝不卡在有仓态）
+    assert ex.projected == "long"
+    assert ex._settling is not None
+    assert ex.realized_pnl_usd == 0
 
 
 # ---------- 降级恢复不得被结算窗口推迟（实现期自查，spec 未列） ----------

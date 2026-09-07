@@ -1026,6 +1026,10 @@ class AiTradeManager:
         rows = self._state_member_rows(group, receipts)
         await self._persist_group_state(group, status=pause_core.STATUS_PAUSED,
                                         member_rows=rows)     # W4（失败必须上抛）
+        if any(receipt.get("persistencePending") for receipt in receipts):
+            raise AiTradePreflightError(
+                "AI_TRADE_SETTLEMENT_UNRESOLVED",
+                "已暂停新开仓，结算或观察记录尚未完成保存；保留恢复入口", 409)
         # 经验层 W-5b（★ E-5 / 评审 P0-5）：**关软件走的是这条路**（`ai_trade_shutdown_action`
         # 默认 `"hold"` ⇒ `shutdown()` 调 `pause_group("app_quit")`，不经 `_stop_session`）。
         # 只挂 stop 等于「桌面端正常退出时终局物化根本不发生」，去抖攒下的脏标志随进程消亡，
@@ -2323,15 +2327,17 @@ class AiTradeManager:
             # **不新增形参**——`_build_executor` 已是 6 个形参（既有阈值偏离），`creds` 与
             # `inst_id` 都已在作用域里，直接闭包构造即可，不把一条既有偏离推得更远（RV-P2-4）。
             #
-            # `limit=20` 而不是对账那条的 100：这条取数是**高频、窄窗口**的（只关心刚刚那一笔），
-            # 20 行足以覆盖任何现实的并发结算，且把请求体积压到最小。`_settling` 为空时一个请求
-            # 都不发，故它不会给私有配额添任何常态负担。
+            # 单页50条与严格结算契约一致，不新增分页或网络调用。
+            # 单页不足如实保留缺口；`_settling` 为空时不发起请求。
             # **`creds is None`（纸面 / 无凭证）⇒ 整条缝不传**，等价于总闸关：`settling` 状态机
             # 构造性地不存在，`_on_reconcile_ok` 走今天的立即合成。缺了这道判断，纸面会话每遇到
             # 一次外部平仓就会白等一整个 deadline（取数必然抛，被 fail-safe 兜住但仍是 90 秒的
             # 无谓延迟），而它本来就没有可问的交易所。同款判据在本文件 `backstop_armed` 上已有先例。
             settlement_fn=(None if creds is None
-                           else lambda: fetch_position_history(creds, inst_id, limit=20)))
+                           else lambda: fetch_position_history(creds, inst_id, limit=50)))
+        executor.settlement_instrument = {
+            "tickSz": meta.get("tickSz"),
+            "marginMode": settings.live_default_td_mode}
         # [P0-4] 启动期复核结论随执行器走：纪律条的 `volSizing` 行据此**在第一次跳过发生之前**就
         # 示警。只在回执里说一句是不够的——回执用户看一眼就走了，而那一行会一直挂在面板上。
         executor.dust_risk = AiTradeManager._dust_risky(req, config, budget, lever)

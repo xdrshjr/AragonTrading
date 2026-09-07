@@ -64,6 +64,30 @@ export interface EntryQuotaSnapshot {
   coverage?: IntegrityCoverage | "legacy_unknown";
 }
 
+export interface FeeAdjustment {
+  kind: string;
+  exchangeTripFeeUsd?: number | null;
+  bookedLocalFeeUsd?: number | null;
+  residualFeeUsd?: number | null;
+  feeBasis?: string | null;
+}
+
+export interface SettlementValidationSnapshot {
+  schemaVersion: number;
+  status?: string | null;
+  reason?: string | null;
+  detailReason?: string | null;
+  message?: string | null;
+  asOfTs?: number | null;
+  epochKey?: string | null;
+  settlementKey?: string | null;
+  identityBasis?: string | null;
+  amountCoverage?: string | null;
+  queryCoverage?: string | null;
+  priceBasis?: string | null;
+  feeAdjustment?: FeeAdjustment | null;
+}
+
 export interface IntegritySnapshot {
   schemaVersion: number;
   asOfTs?: number | null;
@@ -85,8 +109,11 @@ export interface IntegritySnapshot {
     updatedTs?: number;
   } | null;
   economics?: EconomicsSnapshot | null;
+  settlementValidation?: SettlementValidationSnapshot | null;
   memory?: {
     factsVersion?: number;
+    evidenceVersion?: number | null;
+    summaryEvidenceVersion?: number | null;
     legacyNarrative?: boolean;
     summaryAsOfTs?: number | null;
   } | null;
@@ -147,4 +174,68 @@ export function executionReasonLabel(code: string): string {
     other: "其他执行限制",
   };
   return labels[code] ?? "执行原因暂不可得";
+}
+
+/** 原因枚举由服务端裁决；未知枚举仅使用安全说明或未知提示。 */
+export function settlementReasonLabel(
+  code?: string | null, message?: string | null,
+): string {
+  if (message) return message;
+  const labels: Record<string, string> = {
+    identity_unavailable: "持仓身份暂不可得",
+    ownership_conflict: "持仓归属冲突", unsupported_product: "产品暂不支持",
+    currency_unknown: "结算币种未知", not_closed: "持仓尚未全平",
+    identity_mismatch: "持仓身份不符", time_mismatch: "结算时间不符",
+    quantity_mismatch: "结算数量不符", invalid_price: "结算价格无效",
+    missing_amount: "结算金额缺失", identity_failed: "结算金额恒等式不成立",
+    conflicting_duplicate: "重复结算记录冲突", ambiguous: "结算归属存在歧义",
+    not_found: "未找到结算记录", already_claimed: "结算已记账",
+    fetch_failed: "结算查询失败", deadline_exceeded: "结算等待已截止",
+    invalid_amount: "结算金额无效", unsupported_currency: "结算币种暂不支持",
+    increment_invalid: "结算增量无效",
+  };
+  return labels[code ?? ""] ?? "原因暂不可得";
+}
+
+/** 结算协议独立版本化，不能由外层 v2 推断内层可以解释。 */
+export function readSettlementValidation(
+  value?: SettlementValidationSnapshot | null,
+): SettlementValidationSnapshot | null {
+  return value?.schemaVersion === 1 ? value : null;
+}
+
+/** 保留本地估算与已验证结算的边界，不将缺失结果认证为匹配。 */
+export function describeSettlement(
+  value?: SettlementValidationSnapshot | null,
+): string {
+  if (!value) return "旧记录未提供校验结果";
+  const settlement = readSettlementValidation(value);
+  if (!settlement) return "此版本结算详情暂不可读";
+  if (settlement.status === "matched") return "本次持仓匹配通过";
+  if (settlement.status === "already_claimed") return "结算已记账";
+  const reason = settlementReasonLabel(
+    settlement.detailReason ?? settlement.reason, settlement.message,
+  );
+  const labels: Record<string, string> = {
+    local_estimate: "本地估算", pending: "结算待确认",
+    unavailable: "结算暂不可得",
+  };
+  return `${labels[settlement.status ?? ""] ?? "结算状态暂不可得"}：${reason}`;
+}
+
+/** 只解释来源枚举，不从成交金额推断实测来源。 */
+export function settlementBasisLabel(value?: string | null): string {
+  const labels: Record<string, string> = {
+    observed_position: "交易所持仓观察", paused_position: "暂停持仓快照",
+    exchange_position_average: "交易所持仓均价",
+    exchange_aggregate_residual: "累计成交差额", local_mark: "本地标记价",
+    single_page: "单页查询", measured: "实测", estimated: "含本地估算",
+  };
+  return labels[value ?? ""] ?? "来源暂不可得";
+}
+
+/** 运行生产能力与摘要来源分别显示，v3 能力不认证旧摘要。 */
+export function evidenceVersionLabel(value?: number | null): string {
+  if (value == null) return "旧记录未提供证据版本";
+  return value === 3 ? "v3" : "此版本证据暂不可读";
 }

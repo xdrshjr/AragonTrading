@@ -51,6 +51,14 @@ class FeeParams:
 
 
 @dataclass(frozen=True)
+class FeeOverride:
+    """调用方已经核验的带符号费用及来源，聚合残差不冒充逐腿实测。"""
+
+    fee_usd: float
+    fee_basis: str = "measured"
+
+
+@dataclass(frozen=True)
 class FillAudit:
     """一条已消化的实测样本（模型费率 vs 实测费率 / 期望价 vs 实测价）。"""
 
@@ -128,7 +136,8 @@ class FeeLedger:
 
     def on_trade(self, *, cl_ord_id: str | None, side: str, sz: float, px: float,
                  ord_type: str, expected_px: float | None,
-                 override_fee_usd: float | None = None) -> dict:
+                 override_fee_usd: float | None = None,
+                 override: FeeOverride | None = None) -> dict:
         """成交记录的四个费率加法键 + 顺带挂账待审计（`executor._make_trade` 的唯一调用点）。
 
         记账关闭 ⇒ 返回 `{}` ⇒ 四个键**整键缺席**（不是 `None`）⇒ `trade` 的键集合与本特性合入前
@@ -151,12 +160,17 @@ class FeeLedger:
         if not self.params.accounting_enabled:
             return {"feeBasis": "unknown", "feeKnown": False,
                     "feeCurrency": "USDT", "accountingVersion": 2}
+        if override is not None:
+            override_fee_usd = override.fee_usd
         # RV-10：市价腿的 `expectedPx` 与 `price` 必然是同一个数（本仓库从不回查市价单的真实成交价），
         # 故滑点**只能**由 fills 审计产出，严禁试图从 trade 的 price/expectedPx 之差推导（那恒为 0）。
         expected = float(px if expected_px is None else expected_px)
         model_fee = self.leg_fee(sz=sz, px=px, ord_type=ord_type)
         valid_override = (override_fee_usd is not None
                           and _is_finite(override_fee_usd))
+        if override is not None:
+            valid_override = valid_override and override.fee_basis in (
+                "measured", "estimated")
         fee_known = valid_override if override_fee_usd is not None else (
             _is_finite(sz) and _is_finite(px) and sz > 0 and px > 0
             and self.ct_val > 0 and _is_finite(model_fee))
@@ -169,7 +183,8 @@ class FeeLedger:
                    else self._bps_for(fee, sz=sz, px=px))
         return {"fee": fee, "feeBps": fee_bps, "ordType": ord_type,
                 "expectedPx": expected, "feeKnown": fee_known,
-                "feeBasis": ("measured" if valid_override else "estimated")
+                "feeBasis": (override.fee_basis if override is not None else
+                             "measured" if valid_override else "estimated")
                 if fee_known else "unknown", "feeCurrency": "USDT",
                 "accountingVersion": 2}
 
@@ -210,7 +225,8 @@ class FeeLedger:
         return "sell" if self._open_direction == "buy" else "buy"
 
     # ---------- A0-2：净额口径切换 ----------
-    def net_close_pnl(self, gross: float, *, entry_fee_usd: float, exit_px: float,
+    def net_close_pnl(self, gross: float, *, entry_fee_usd: float | None,
+                      exit_px: float,
                       sz: float, ord_type: str = "market") -> float:
         """平仓盈亏的净额口径；总闸关时**恒返回 `gross` 本身**（同一个 float，Z-2 位相同）。
 
@@ -219,9 +235,13 @@ class FeeLedger:
         """
         if not self.params.net_pnl_enabled:
             return gross
-        return gross - float(entry_fee_usd) - self.leg_fee(sz=sz, px=exit_px, ord_type=ord_type)
+        exit_fee = self.leg_fee(sz=sz, px=exit_px, ord_type=ord_type)
+        # 冷恢复缺费不能关闭保护性退出；估算只供执行投影，原证据仍未知。
+        entry_fee = exit_fee if entry_fee_usd is None else float(entry_fee_usd)
+        return gross - entry_fee - exit_fee
 
-    def net_unrealized(self, gross: float, *, entry_fee_usd: float, mark_px: float,
+    def net_unrealized(self, gross: float, *, entry_fee_usd: float | None,
+                       mark_px: float,
                        sz: float) -> float:
         """浮盈的净额口径 = 毛浮盈 − 已付开仓费 − 按标记价预估的平仓腿 taker 费。
 
@@ -229,9 +249,8 @@ class FeeLedger:
         算纯价差、不含任何费用，故持仓期间显示的浮盈比「此刻平掉能拿到手的钱」多出一个开仓费加一个
         预估平仓费。平仓腿恒按 taker 估（保守取贵的一侧，与成本模型 `feeCloseBps` 同口径）。
         """
-        if not self.params.net_pnl_enabled:
-            return gross
-        return gross - float(entry_fee_usd) - self.leg_fee(sz=sz, px=mark_px, ord_type="market")
+        return self.net_close_pnl(gross, entry_fee_usd=entry_fee_usd,
+                                  exit_px=mark_px, sz=sz)
 
     # ---------- 轴 A：官方费率热更新 ----------
     def retune(self, *, maker_bps: float, taker_bps: float, source: str) -> None:
@@ -381,6 +400,8 @@ def explain_meta_fields(trade: dict) -> dict:
 
 
 def _is_finite(value) -> bool:
+    if isinstance(value, bool):
+        return False
     try:
         return math.isfinite(float(value))
     except (TypeError, ValueError, OverflowError):

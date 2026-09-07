@@ -36,6 +36,46 @@ def _ledger(**over) -> FeeLedger:
     return FeeLedger(ct_val=_CT_VAL, params=resolve_fee_params(settings))
 
 
+def test_aggregate_fee_override_preserves_estimated_negative_source():
+    from app.live_auto.fee_ledger import FeeOverride
+    ledger = _ledger()
+    fields = ledger.on_trade(
+        cl_ord_id=None, side="close", sz=10, px=100,
+        ord_type="market", expected_px=None,
+        override=FeeOverride(-.3, "estimated"))
+    assert fields["fee"] == pytest.approx(-.3)
+    assert fields["feeBasis"] == "estimated" and fields["feeKnown"]
+    assert ledger._session_fee_usd == pytest.approx(-.3)
+
+
+@pytest.mark.parametrize("amount,basis", [(True, "measured"),
+                                        (0.0, "unknown")])
+def test_invalid_override_or_unknown_source_does_not_certify_fee(amount, basis):
+    from app.live_auto.fee_ledger import FeeOverride
+    fields = _ledger().on_trade(
+        cl_ord_id=None, side="close", sz=10, px=100,
+        ord_type="market", expected_px=None,
+        override=FeeOverride(amount, basis))
+    assert not fields["feeKnown"]
+    assert fields["feeBasis"] == "unknown"
+
+
+@pytest.mark.parametrize("kind", ["close", "unrealized"])
+def test_unknown_entry_fee_uses_projection_estimate_without_changing_ledger(kind):
+    ledger = _ledger(ai_trade_net_pnl_enabled=True)
+    price, qty, gross = 100, 10, 5
+    estimate = ledger.leg_fee(sz=qty, px=price, ord_type="market")
+    if kind == "close":
+        result = ledger.net_close_pnl(gross, entry_fee_usd=None,
+                                      exit_px=price, sz=qty)
+    else:
+        result = ledger.net_unrealized(gross, entry_fee_usd=None,
+                                       mark_px=price, sz=qty)
+    assert estimate > 0
+    assert result == pytest.approx(gross - 2 * estimate)
+    assert ledger.session_fee_usd == 0
+
+
 def _fill(cl_ord_id: str, *, px: float = _PX, sz: float = 1.0, fee: float = -0.15,
           ccy: str = "USDT") -> dict:
     return {"ts": 1, "instId": "BTC-USDT-SWAP", "side": "buy", "fillPx": px, "fillSz": sz,

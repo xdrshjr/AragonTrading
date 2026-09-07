@@ -8,11 +8,17 @@ from app.ai_auto.prompts import compact_journal_for_summary
 
 
 def entry(round_no=1):
+    from app.ai_auto.advisory_evidence import bound_summary_evidence
+    from app.ai_auto.prompts import build_advisory_evidence
+    scope = {"runId": 71, "instId": "BTC-USDT-SWAP", "bar": "1m"}
+    evidence = bound_summary_evidence(build_advisory_evidence(
+        {**scope, "round": round_no}))
     return {"round": round_no, "trigger": "interval",
+            "evidenceVersion": 3, **evidence,
             "proposal": {"action": "hold"},
             "decision": {"action": "hold"}, "finalDecision": {"action": "hold"},
             "executed": {"ok": True, "traded": False},
-            "facts": {"asOfTs": round_no, "position": None},
+            "facts": {**scope, "asOfTs": round_no, "position": None},
             "evidenceFingerprint": "same", "reflection": None}
 
 
@@ -109,6 +115,58 @@ def test_facts_hash_changes_with_time_but_evidence_only_with_material_facts():
                        ("entryQuota", {"remaining": 0})):
         changed = build_decision_facts({**payload, key: value})
         assert changed["evidenceFingerprint"] != first["evidenceFingerprint"]
+
+
+@pytest.mark.parametrize("key, first, changed", [
+    ("intel", {"text": "利多"}, {"text": "利空"}),
+    ("intel", {"trusted": True}, {"trusted": False}),
+    ("intel", {"references": ["I01"]}, {"references": ["I02"]}),
+    ("experience", {"sampleN": 2}, {"sampleN": 3}),
+    ("experience", {"text": "减仓"}, {"text": "平仓"}),
+    ("signalPriors", {"netStance": "long"}, {"netStance": "short"}),
+    ("signalPriors", {"ageS": 60}, {"ageS": 90}),
+    ("intel", {"updatedTs": 10}, {"updatedTs": 20}),
+    ("runId", 1, 2),
+])
+def test_advisory_wire_changes_are_material_evidence(key, first, changed):
+    from app.ai_auto.decision_memory import build_evidence_fingerprint
+    baseline = {"runId": 1, "instId": "BTC", "lastPx": 100, key: first}
+    assert build_evidence_fingerprint(baseline) != (
+        build_evidence_fingerprint({**baseline, key: changed}))
+
+
+@pytest.mark.parametrize("version", [None, 2, 4])
+def test_non_v3_rounds_never_fold(version):
+    left, right = entry(), entry(2)
+    left["evidenceVersion"] = right["evidenceVersion"] = version
+    assert len(compact_journal_for_summary([left, right])) == 2
+
+
+@pytest.mark.parametrize("key", ["runId", "instId", "bar"])
+def test_identical_text_never_folds_across_scope(key):
+    left, right = entry(), entry(2)
+    left["facts"][key] = "范围一"
+    right["facts"][key] = "范围二"
+    assert len(compact_journal_for_summary([left, right])) == 2
+
+
+@pytest.mark.parametrize("section", ["facts", "advisoryEvidence"])
+@pytest.mark.parametrize("key", ["runId", "instId", "bar"])
+@pytest.mark.parametrize("value", [None, ""])
+def test_unknown_scope_cannot_prove_rounds_equivalent(section, key, value):
+    left, right = entry(), entry(2)
+    left[section][key] = right[section][key] = value
+    assert len(compact_journal_for_summary([left, right])) == 2
+
+
+@pytest.mark.parametrize("patch", [
+    {"omitted": True}, {"sourceHash": "新来源"},
+    {"renderedHash": "新原文"},
+])
+def test_changed_or_omitted_advisory_never_folds(patch):
+    left, right = entry(), entry(2)
+    right["advisoryEvidence"]["intel"].update(patch)
+    assert len(compact_journal_for_summary([left, right])) == 2
 
 
 def test_facts_budget_removes_optional_text_before_failing_closed():

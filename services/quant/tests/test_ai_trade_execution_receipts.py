@@ -364,7 +364,7 @@ def test_position_history_keeps_authoritative_closed_and_currency(kind, closed):
     })
     assert row["closed"] is closed
     assert row["currency"] == "USDT"
-    assert trading._normalize_position_history({"ccy": "BTC"})["currency"] is None
+    assert trading._normalize_position_history({"ccy": "BTC"})["currency"] == "BTC"
 
 
 async def test_cancellation_during_prepare_releases_only_unsent_reservation():

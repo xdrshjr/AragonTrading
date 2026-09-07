@@ -30,6 +30,53 @@ def accumulator(basis="net"):
         {"runId": 7, "costBasis": basis, "ctVal": 1.0})
 
 
+@pytest.mark.parametrize("basis", ["gross", "net"])
+@pytest.mark.parametrize("official_fee", [-.1, 0.0, .2])
+def test_validated_settlement_signed_residual_survives_complete_replay(
+        basis, official_fee):
+    from app.live_auto.settlement import SettlementQuery
+    from app.live_auto.settlement import resolve_settlement_increment
+    from app.live_auto.settlement import validate_settlement
+    from app.live_auto.settlement_identity import IdentityConfig
+    from app.live_auto.settlement_identity import SettlementIdentityTracker
+    tracker = SettlementIdentityTracker(IdentityConfig(
+        1, 7, "SOL-USDT-SWAP", {"marginMode": "cross", "tickSz": .01}))
+    opened = leg(1, "long", 10, 100, .5, after=10,
+                 feeBasis="estimated")
+    tracker.record_trade(opened)
+    tracker.observe_position(dict(instId="SOL-USDT-SWAP", posId="p1",
+        posSide="net", pos=10, avgPx=100, marginMode="cross",
+        exchangeCTimeMs="1000000", exchangeUTimeMs="1100000",
+        observedAtTs=1100))
+    current = tracker.context()
+    query = SettlementQuery("SOL-USDT-SWAP", "long", 1001, 1200,
+                            context=current)
+    normalized = dict(instId="SOL-USDT-SWAP", posId="p1",
+        instType="SWAP", currency="USDT", closed=True, type="2",
+        marginMode="cross", exchangeCTimeMs="1000000",
+        exchangeUTimeMs="1200000", direction="long", closeTotalPos=10,
+        openAvgPx=100, closeAvgPx=101, pnl=10, fee=official_fee,
+        fundingFee=0, liqPenalty=0, settledPnl=0,
+        realizedPnl=10 - official_fee)
+    original = copy.deepcopy(opened)
+    fact = validate_settlement([normalized], query, {}, 1201).fact
+    increment = resolve_settlement_increment(fact, current, basis).increment
+    closed = leg(2, "close", increment.qty, increment.price, increment.fee,
+        increment.pnl, after=0, feeBasis=increment.fee_basis,
+        accountingEventId=increment.accounting_event_id,
+        feeAdjustment=increment.fee_adjustment)
+    acc = accumulator(basis)
+    acc.restore([opened, closed, copy.deepcopy(closed)])
+    snapshot = acc.snapshot()
+    assert snapshot["roundTripCount"] == 1
+    assert snapshot["grossPnlUsd"] == pytest.approx(10, abs=1e-9)
+    assert snapshot["feeUsd"] == pytest.approx(official_fee, abs=1e-9)
+    assert snapshot["tradingNetUsd"] == pytest.approx(
+        10 - official_fee, abs=1e-9)
+    assert closed["explain"]["meta"]["feeBasis"] == "estimated"
+    assert opened == original
+
+
 @pytest.mark.parametrize("basis,pnl", [("net", 9.0), ("gross", 10.0)])
 def test_signed_both_leg_fees_have_one_economic_identity(basis, pnl):
     from app.ai_auto.trade_economics import TripPnlInputs
@@ -49,6 +96,26 @@ def test_unknown_fee_keeps_independently_reliable_net():
     assert result.gross_pnl_usd is None and result.fee_usd is None
     bad = resolve_trip_economics(TripPnlInputs("net", float("nan"), 0, 0))
     assert bad.trading_net_usd is None
+
+
+def test_projected_net_with_unknown_entry_fee_is_not_certified_or_sampled():
+    """执行估算保留原始值，认证统计不能拿它补未知开仓费。"""
+    rows = [leg(1, "long", 1, 100, None, after=1),
+            leg(2, "close", 1, 110, .2, 9.8, after=0,
+                pnlBasis="estimated", entryFeeBasis="unknown")]
+    original = copy.deepcopy(rows)
+    acc = accumulator("net")
+    snap = acc.restore(rows)
+    assert snap["tradingNetUsd"] is None
+    assert snap["winRate"] is None and snap["avgPnlUsd"] is None
+    assert snap["metricCoverage"]["winRate"]["sampleCount"] == 0
+    assert snap["unknownTripCount"] == 1 and snap["roundTripCount"] == 1
+    assert acc.completed_trips[0]["recordedPnl"] == 9.8
+    assert acc.remaining_qty == 0
+    assert rows == original
+    gross = accumulator("gross").restore(rows)
+    assert gross["grossPnlUsd"] == 9.8  # 毛口径不依赖未知开仓费
+    assert gross["tradingNetUsd"] is None
 
 
 def test_partial_fills_and_closes_allocate_fees_and_complete_once():

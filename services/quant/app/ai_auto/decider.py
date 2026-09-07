@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -46,6 +47,8 @@ from .prompts import (
     REFLECTION_TOOL_SCHEMA,
     ContrarianSchemaOptions,
     build_decision_prompt,
+    build_advisory_evidence,
+    build_reflection_evidence,
     build_decision_tool_description,
     build_decision_tool_schema,
     build_reflection_prompt,
@@ -63,6 +66,10 @@ from .reasoning_protocol import (
 from .prompts_en import RETRY_HINT_GENERIC_EN, RETRY_HINT_TRUNCATED_EN, build_reask_instruction
 from .summary_health import SummaryHealth, health_wire
 from .decision_memory import RoundDecisionRecord
+from .advisory_evidence import (
+    attach_snapshot, bound_summary_evidence, evidence_hashes,
+    evidence_identity, has_complete_evidence, unavailable_evidence,
+)
 from .trace import TraceEmit, _TraceCoalescer
 
 logger = logging.getLogger(__name__)
@@ -121,6 +128,12 @@ _RETRY_JITTER_MS = 250
 _RETRYABLE_REFLECTION_REASONS = frozenset(
     {"reflection_timeout", "reflection_llm_error", "reflection_no_tool", "reflection_invalid"})
 
+# error 可由连接建立前的传输失败产生；只有模型响应能证明收到本轮材料。
+_EVIDENCE_RESPONSE_KINDS = frozenset({
+    "text_delta", "thinking_delta", "tool_use_start", "tool_use_args_delta",
+    "tool_use_end", "message_done",
+})
+
 
 def _is_retryable_degrade(reason: str | None) -> bool:
     """该 degrade 原因是否属于瞬时/无有效产出（可重试）；None 与 low_confidence 返回 False。"""
@@ -159,6 +172,11 @@ class _StreamOutcome:
     raw: dict | None
     stop_reason: str | None = None
     usage: dict | None = None
+
+
+def _sha256(text: str) -> str:
+    """计算实际模型请求的内容哈希。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -366,7 +384,12 @@ class AiTradeDecider:
         self._summary: str = ""
         self._legacy_narrative = False
         self._summary_as_of_ts: float | None = None
+        self._summary_evidence_version: int | None = None
         self._round_decision_facts: dict | None = None
+        self._round_advisory_snapshot: dict | None = None
+        self._round_reflection_snapshot: dict | None = None
+        self._round_identity: dict | None = None
+        self._round_evidence_sent = False
         self._journal: list[dict] = []
         self._rounds_since_summary = 0
         self._last_round = 0
@@ -471,7 +494,16 @@ class AiTradeDecider:
         """
         self._reset_round_reasoning()
         payload = deepcopy(payload)
-        self._round_decision_facts = deepcopy(payload.get("decisionFacts"))
+        payload = self._freeze_round_evidence(payload)
+        try:
+            return await self._decide_frozen(payload, emit)
+        except asyncio.CancelledError:
+            self._round_evidence_sent = False
+            raise
+
+    async def _decide_frozen(self, payload: dict, emit: TraceEmit | None
+                             ) -> tuple[TradeDecision, str | None]:
+        """沿用已冻结输入执行原有重试和深度追问控制流。"""
         deadline = self._round_deadline()
         max_retries = self._effective_max_retries()
         decision, degrade = await self._attempt_decision(payload, emit)   # 首次：hint=None
@@ -499,6 +531,11 @@ class AiTradeDecider:
         self._last_stop_reason = None
         self._last_usage = None
         self._last_reflection_analysis = ""
+        self._round_advisory_snapshot = None
+        self._round_reflection_snapshot = None
+        self._round_decision_facts = None
+        self._round_identity = None
+        self._round_evidence_sent = False
 
     def _effective_max_retries(self) -> int:
         """本轮**有效**重试次数 = min(settings 的重试数, 档位尝试上限 − 1)；未封顶即逐字回退。"""
@@ -621,6 +658,7 @@ class AiTradeDecider:
         except asyncio.TimeoutError:
             return _hold("decision_timeout"), "decision_timeout"
         except asyncio.CancelledError:
+            self._round_evidence_sent = False
             raise                    # 会话停止：绝不吞、绝不降级，向上抛（BaseException，不入下方 except）
         except Exception as exc:  # noqa: BLE001 —— 任何 LLM/网络失败回落 hold（绝不在不确定时下单）
             logger.warning("ai-trade decide attempt failed: %s", exc)
@@ -704,6 +742,8 @@ class AiTradeDecider:
         async for ev in self._llm.stream(system=self.system_prompt,
                                           messages=self._context + [user_msg],
                                           tools=[self._tool]):
+            if ev.kind in _EVIDENCE_RESPONSE_KINDS:
+                self._round_evidence_sent = True
             if ev.kind == "message_done":
                 stop_reason = ev.stop_reason or stop_reason   # 非空者胜（第二条通常只带 usage）
                 usage = ev.usage or usage                     # 只回填，绝不用 None 覆盖已有值
@@ -900,16 +940,23 @@ class AiTradeDecider:
         """
         if not self.reflection_enabled:
             return ReflectionVerdict("confirm", None, None, "", None, ran=False)
-        payload = self._with_round_facts(payload)
+        payload = deepcopy(self._with_round_facts(payload))
+        snapshot = build_reflection_evidence(payload)
+        snapshot["sent"] = False
+        self._round_reflection_snapshot = snapshot
         max_retries = max(0, int(self.settings.ai_trade_reflection_max_retries))
-        verdict = await self._attempt_reflection(payload, decision, emit)
-        attempt = 0
-        while (verdict.degrade_reason is not None
-               and _is_retryable_reflection(verdict.degrade_reason)
-               and attempt < max_retries):
-            attempt += 1
-            await self._retry_backoff(attempt)                # 复用 decide 退避（可被 cancel 中断）
+        try:
             verdict = await self._attempt_reflection(payload, decision, emit)
+            attempt = 0
+            while (verdict.degrade_reason is not None
+                   and _is_retryable_reflection(verdict.degrade_reason)
+                   and attempt < max_retries):
+                attempt += 1
+                await self._retry_backoff(attempt)
+                verdict = await self._attempt_reflection(payload, decision, emit)
+        except asyncio.CancelledError:
+            snapshot["sent"] = False
+            raise
         self._note_reflection_depth()
         return verdict
 
@@ -980,6 +1027,14 @@ class AiTradeDecider:
         self._last_reflection_analysis = ""      # 每次尝试入口清零（镜像 `_last_analysis` 的 RC-1）
         async for ev in self._reflection_llm.stream(system=system, messages=[user_msg],
                                                     tools=[self._reflection_tool]):
+            if (ev.kind in _EVIDENCE_RESPONSE_KINDS
+                    and self._round_reflection_snapshot is not None
+                    and not self._round_reflection_snapshot.get("sent")):
+                self._round_reflection_snapshot["sent"] = True
+                text = user_msg.content[0].text
+                self._round_reflection_snapshot["request"] = {
+                    "finalUserText": text, "finalUserSha256": _sha256(text),
+                }
             if ev.kind == "message_done":
                 if not done:
                     await pump.flush()
@@ -1086,6 +1141,7 @@ class AiTradeDecider:
         if gate_veto:
             extra["gateVeto"] = gate_veto
         record_wire = record.to_wire() if record else {"legacy": True}
+        record_wire.update(self._summary_round_evidence(payload))
         if record:
             facts = payload.get("decisionFacts") or record_wire["facts"]
             record_wire.update(facts=deepcopy(facts),
@@ -1159,7 +1215,11 @@ class AiTradeDecider:
             self._note_summary_failure(RuntimeError("empty summary"), timeout_s)
             return None
         self._summary = text
-        self._legacy_narrative = False
+        has_legacy = bool(prev and self._legacy_narrative)
+        has_legacy = has_legacy or any(
+            not has_complete_evidence(entry) for entry in journal)
+        self._legacy_narrative = has_legacy
+        self._summary_evidence_version = None if has_legacy else 3
         self._summary_as_of_ts = time.time()
         self._summary_health.note_success()
         self._summary_skip_rounds = 0
@@ -1187,7 +1247,9 @@ class AiTradeDecider:
 
     def seed_from_snapshot(self, *, summary: str | None, last_round: int,
                            summary_as_of_ts: float | None = None,
-                           facts_version: int | None = None) -> None:
+                           facts_version: int | None = None,
+                           evidence_version: int | None = None,
+                           legacy_narrative: bool = False) -> None:
         """冷续跑：用落库的 `metrics.finalSummary` 与轮次重建上下文（pause-resume §3.5 S6）。
 
         不做则 AI 完全忘记暂停前在想什么，且轮次编号从 1 重来（轨迹面板会出现两个「第 1 轮」）。
@@ -1197,23 +1259,82 @@ class AiTradeDecider:
         self._journal = []
         if summary:
             self._summary = summary
-            self._legacy_narrative = facts_version != 2
+            self._legacy_narrative = (facts_version != 2
+                or evidence_version != 3 or legacy_narrative)
+            self._summary_evidence_version = (
+                None if self._legacy_narrative else 3)
             self._summary_as_of_ts = summary_as_of_ts
             self._install_summary_seed(summary)
 
     def memory_wire(self) -> dict:
         """返回摘要时间与兼容标记，不暴露历史原文。"""
         return {"factsVersion": 2, "legacyNarrative": self._legacy_narrative,
+                "evidenceVersion": 3,
+                "summaryEvidenceVersion": self._summary_evidence_version,
                 "summaryAsOfTs": self._summary_as_of_ts}
+
+    def _freeze_round_evidence(self, payload: dict) -> dict:
+        """发送前一次冻结；会话已算好的 factsHash 原样沿用。"""
+        snapshot = payload.get("advisorySnapshot")
+        if snapshot is None:
+            snapshot = build_advisory_evidence(payload)
+            facts = payload.get("decisionFacts")
+            hashes = evidence_hashes(snapshot)
+            if (facts and not facts.get("factsUnavailable")
+                    and facts.get("evidenceHashes") != hashes):
+                from .decision_memory import build_decision_facts
+                payload["decisionFacts"] = build_decision_facts({
+                    **payload, **facts, "evidenceHashes": hashes})
+        self._round_identity = evidence_identity(payload)
+        self._round_advisory_snapshot = deepcopy(snapshot)
+        self._round_decision_facts = deepcopy(payload.get("decisionFacts"))
+        return attach_snapshot(payload, snapshot, self._round_decision_facts)
+
+    def _summary_round_evidence(self, payload: dict) -> dict:
+        """提交只读本轮真正发出的证据，不从可变 payload 重建。"""
+        snapshot = self._round_advisory_snapshot
+        is_current = self._round_identity == evidence_identity(payload)
+        if not snapshot or not self._round_evidence_sent or not is_current:
+            snapshot = unavailable_evidence("round_not_sent_or_mismatched")
+            reflection = None
+        else:
+            snapshot = {**snapshot, "sent": True}
+            reflection = self._round_reflection_snapshot
+            if reflection is not None and not reflection.get("sent"):
+                reflection = unavailable_evidence("reflection_not_sent")
+            elif (reflection is not None
+                    and reflection.get("identity") != self._round_identity):
+                reflection = unavailable_evidence("reflection_mismatched")
+        return {"evidenceVersion": 3,
+                **bound_summary_evidence(snapshot, reflection)}
+
+    def frozen_round_payload(self, payload: dict) -> dict:
+        """返回供 journal 重建的独立快照；不匹配轮次不补上一轮材料。
+
+        Args:
+            payload: 当前轮最终组装的请求输入。
+        Returns:
+            保留原字段并冻结初次及反思 wire、实际反思 user 文本与 hash。
+        """
+        result = deepcopy(self._with_round_facts(payload))
+        snapshot = self._round_reflection_snapshot
+        is_current = self._round_identity == evidence_identity(payload)
+        if (not is_current or not self._round_evidence_sent
+                or not snapshot or not snapshot.get("sent")):
+            return result
+        if snapshot.get("identity") != self._round_identity:
+            return result
+        result.update(deepcopy(snapshot["wire"]))
+        result["reflectionRequest"] = deepcopy(snapshot.get("request"))
+        return result
 
     def _with_round_facts(self, payload: dict) -> dict:
         """同轮反思与上下文沿用真实发送的事实，不回写调用方状态。"""
-        frozen = self._round_decision_facts
-        current = payload.get("decisionFacts")
-        identity = ("runId", "instId", "round")
-        if frozen and current and all(
-                frozen.get(key) == current.get(key) for key in identity):
-            return {**payload, "decisionFacts": deepcopy(frozen)}
+        snapshot = self._round_advisory_snapshot
+        if (snapshot and self._round_evidence_sent
+                and self._round_identity == evidence_identity(payload)):
+            return attach_snapshot(payload, snapshot,
+                                   self._round_decision_facts)
         return payload
 
     def _note_summary_failure(self, exc: BaseException, timeout_s: float) -> None:

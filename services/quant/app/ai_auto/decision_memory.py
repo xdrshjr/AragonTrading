@@ -11,10 +11,10 @@ FACTS_MAX_CHARS = 8192
 _FACT_FIELDS = (
     "runId", "instId", "bar", "round", "asOfTs", "position",
     "restingOrder", "pendingOpen", "rules", "entryQuota", "funnel",
-    "economics", "costSnapshot",
+    "economics", "costSnapshot", "settlementValidation", "evidenceHashes",
 )
 _EVIDENCE_FIELDS = (
-    "instId", "bar", "barTs", "closedBarTs", "lastPx", "marketDigest",
+    "runId", "instId", "bar", "barTs", "closedBarTs", "lastPx", "marketDigest",
     "multiTimeframeContext", "tacticalContext", "tacticalTier",
     "signalBoard", "consensus", "baseRules", "trendVerdict", "trend",
     "position", "restingOrder", "pendingOpen", "rules", "entryQuota",
@@ -57,15 +57,26 @@ def _evidence_value(value):
 
 
 def build_evidence_fingerprint(payload: dict) -> str:
-    """摘要比较身份；忽略墙钟年龄但保留确认时间、最新价与 stale。"""
+    """行情忽略墙钟噪声；外部材料完整 wire 保留时效与来源状态。"""
     selected = {key: payload.get(key) for key in _EVIDENCE_FIELDS}
-    return _hash(_evidence_value(selected))
+    selected = _evidence_value(selected)
+    wire = (payload.get("advisorySnapshot") or {}).get("wire", payload)
+    for key in ("intel", "experience", "signalPriors"):
+        selected[key] = wire.get(key)
+    return _hash(selected)
 
 
 def build_decision_facts(inputs: dict) -> dict:
     """冻结当前会话事实并计算 hash；必要事实超限时显式不可用。"""
     facts = _finite({key: inputs.get(key) for key in _FACT_FIELDS})
-    facts.update(schemaVersion=2, priceUnit="USDT")
+    if facts["evidenceHashes"] is None:
+        from .advisory_evidence import evidence_hashes
+        from .prompts import build_advisory_evidence
+        snapshot = inputs.get("advisorySnapshot")
+        if snapshot is None:
+            snapshot = build_advisory_evidence(inputs)
+        facts["evidenceHashes"] = evidence_hashes(snapshot)
+    facts.update(schemaVersion=2, evidenceVersion=3, priceUnit="USDT")
     facts["evidenceFingerprint"] = build_evidence_fingerprint(inputs)
     # 可选解释不能挤掉真实持仓、pending、规则或费用来源。
     for key in ("diagnosis", "narrative"):
@@ -78,7 +89,8 @@ def build_decision_facts(inputs: dict) -> dict:
             diagnosis.pop("details", None)
     if len(canonical_json(facts)) > FACTS_MAX_CHARS - 80:
         facts = {key: facts[key] for key in (
-            "schemaVersion", "runId", "instId", "bar", "round", "asOfTs",
+            "schemaVersion", "evidenceVersion", "runId", "instId", "bar",
+            "round", "asOfTs",
             "priceUnit", "evidenceFingerprint",
         )}
         facts.update(factsUnavailable=True, reason="facts_unavailable")
@@ -98,16 +110,23 @@ class RoundDecisionRecord:
     gate_veto: dict | None = None
     sizing_verdict: dict | None = None
     closed_bar_ts: float | None = None
+    advisory_evidence: dict | None = None
+    reflection_evidence: dict | None = None
 
     def __post_init__(self):
         for name in ("proposal", "final_decision", "facts",
-                     "execution_receipt", "gate_veto", "sizing_verdict"):
+                     "execution_receipt", "gate_veto", "sizing_verdict",
+                     "advisory_evidence", "reflection_evidence"):
             object.__setattr__(self, name, deepcopy(getattr(self, name)))
 
     def to_wire(self) -> dict:
         """返回可直接写入工具结果和 journal 的独立 camelCase 快照。"""
         return deepcopy({
-            "schemaVersion": 2, "proposal": self.proposal,
+            "schemaVersion": 2,
+            "evidenceVersion": self.facts.get("evidenceVersion"),
+            "advisoryEvidence": self.advisory_evidence,
+            "reflectionEvidence": self.reflection_evidence,
+            "proposal": self.proposal,
             "finalDecision": self.final_decision, "facts": self.facts,
             "factsHash": self.facts_hash or self.facts.get("factsHash"),
             "executionReceipt": self.execution_receipt,
@@ -120,6 +139,9 @@ class RoundDecisionRecord:
 
 
 def _foldable(entry: dict) -> bool:
+    from .advisory_evidence import has_complete_evidence
+    if not has_complete_evidence(entry):
+        return False
     if entry.get("legacy") or not entry.get("evidenceFingerprint"):
         return False
     if entry.get("trigger") != "interval" or entry.get("gateVeto"):
@@ -153,8 +175,14 @@ def can_fold_rounds(left: dict, right: dict) -> bool:
         return False
     if left["evidenceFingerprint"] != right["evidenceFingerprint"]:
         return False
+    from .advisory_evidence import has_same_evidence
+    if not has_same_evidence(left, right):
+        return False
     keys = ("position", "restingOrder", "pendingOpen", "rules",
             "entryQuota", "costSnapshot")
     before, after = left.get("facts") or {}, right.get("facts") or {}
+    if any(not before.get(key) or before.get(key) != after.get(key)
+           for key in ("runId", "instId", "bar")):
+        return False
     return all(_evidence_value(before.get(key)) ==
                _evidence_value(after.get(key)) for key in keys)

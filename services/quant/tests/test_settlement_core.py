@@ -1,180 +1,204 @@
-"""结算匹配纯核心的七条判据 + wire 省略键（ai-trade-fill-truth-and-effective-controls 轴 A）。
+"""结算身份、候选集合、金额恒等式和累计增量的行为契约。"""
+import pytest
 
-门禁 `G-A1`（七条判据各有一条**会红**的反向用例）、`G-A12`（资金费 / 强平罚金不进本地账本）、
-`G-A15`（`RV-P0-4`：`direction` fail-open、`posId` 空串恒不命中）全部落在本文件。
-"""
-from __future__ import annotations
-
-from app.live_auto.settlement import (
-    SettlementQuery,
-    coverage_wire,
-    match_settlement,
-    settlement_meta_wire,
-)
-
-_INST = "SOL-USDT-SWAP"
-_ENTRY_TS = 1_788_282_000
-_DETECT_TS = 1_788_285_000
+from app.live_auto import settlement
+from app.live_auto.settlement_identity import SettlementContext
 
 
-def _row(**over) -> dict:
-    """一条形状真实的 `_normalize_position_history` 归一产物（三项已归一为「正 = 支出」）。"""
-    base = {"posId": "p1", "instId": _INST, "direction": "long",
-            "openAvgPx": 100.89, "closeAvgPx": 99.88,
-            "cTime": _ENTRY_TS, "uTime": _DETECT_TS + 3,
-            "pnl": -2.49, "fee": 0.25, "fundingFee": 0.01, "liqPenalty": 0.0,
-            "realizedPnl": -2.75, "identityGapUsd": 0.0}
-    base.update(over)
-    return base
+def context(**changes):
+    values = dict(account_id=1, run_id=7, inst_id="SOL-USDT-SWAP",
+                  epoch_key="epoch-1", direction="long", margin_mode="cross",
+                  pos_side="net", pos_id="p1", exchange_ctime_ms="1000000",
+                  exchange_utime_ms="1100000", observed_at_ts=1100,
+                  first_open_wall_ts=1000, total_open_qty=10, closed_qty=0,
+                  remaining_qty=10, entry_avg_px=100, tick_sz=.01,
+                  booked_fee_usd=.5, booked_close_pnl=0,
+                  booked_close_qty_price=0, fee_basis="estimated",
+                  direction_confirmed=True)
+    values.update(changes)
+    return SettlementContext(**values)
 
 
-def _query(**over) -> SettlementQuery:
-    base = {"inst_id": _INST, "direction": "long",
-            "entry_ts": _ENTRY_TS, "detect_ts": _DETECT_TS}
-    base.update(over)
-    return SettlementQuery(**base)
+def row(**changes):
+    values = dict(instId="SOL-USDT-SWAP", posId="p1", direction="long",
+                  instType="SWAP", currency="USDT", closed=True, type="2",
+                  marginMode="cross", exchangeCTimeMs="1000000",
+                  exchangeUTimeMs="1200001", openAvgPx=100, closeAvgPx=101,
+                  closeTotalPos=10, pnl=10, fee=.2, fundingFee=0,
+                  liqPenalty=0, settledPnl=0, realizedPnl=9.8)
+    values.update(changes)
+    return values
 
 
-def _match(rows, *, claimed=None, tol_s=60, query=None):
-    return match_settlement(rows, query or _query(), claimed=claimed or set(), tol_s=tol_s)
+def query(**changes):
+    values = dict(inst_id="SOL-USDT-SWAP", direction="long", entry_ts=1000,
+                  detect_ts=1200, context=context(), tol_s=60)
+    values.update(changes)
+    return settlement.SettlementQuery(**values)
 
 
-# ---------- 正路径 ----------
-
-def test_matches_a_well_formed_row():
-    fact = _match([_row()])
-    assert fact is not None
-    assert (fact.pos_id, fact.close_px) == ("p1", 99.88)
-    assert (fact.gross_pnl_usd, fact.fee_usd) == (-2.49, 0.25)
-    assert (fact.funding_usd, fact.liq_usd) == (0.01, 0.0)
+def validate(rows=None, **changes):
+    return settlement.validate_settlement(
+        [row()] if rows is None else rows, query(**changes), {}, 1205)
 
 
-# ---------- 判据 1：instId ----------
-
-def test_rejects_other_instrument():
-    assert _match([_row(instId="ETH-USDT-SWAP")]) is None
-
-
-# ---------- 判据 2：direction 是 fail-open（G-A15 上半） ----------
-
-def test_direction_criterion_is_skipped_when_exchange_gives_no_usable_direction():
-    """`RV-P0-4`：净持仓模式账户上 `direction` 可能是空串 / `net`，严格相等会让轴 A 100% 静默空转。
-
-    这条**必须**是反向门禁：不命中的回落与今天逐字相同，没有任何一个读数会变红，只会显示一个
-    没人读得懂的 `ratio=0`。仓库里已有反例——`resume` 的离线回读只按 `posId` 匹配、刻意不用
-    `direction`。
-    """
-    for direction in ("", "net", None):
-        assert _match([_row(direction=direction)]) is not None, direction
+def test_legacy_query_cannot_accept_unknown_identity():
+    legacy = settlement.SettlementQuery("SOL-USDT-SWAP", "long", 1000, 1200)
+    assert settlement.match_settlement(
+        [row()], legacy, claimed=set(), tol_s=60) is None
 
 
-def test_rejects_opposite_direction_when_exchange_does_give_one():
-    """给了可用方向就必须一致——fail-open 只针对「交易所没说」，不是「说了但不一样」。"""
-    assert _match([_row(direction="short")]) is None
+def test_complete_row_matches_and_wire_hides_internal_fact():
+    result = validate()
+    assert result.status == "matched"
+    assert result.fact.gross_pnl_usd == 10
+    assert result.wire()["amountCoverage"] == "complete"
+    assert "fact" not in result.wire()
 
 
-# ---------- 判据 3：posId（G-A15 下半 + 重复认领） ----------
-
-def test_blank_pos_id_never_matches():
-    """空串 `posId` 恒不命中：归一化对缺字段回落空串，而空串永远不在 `claimed` 里——
-
-    只判 `not in claimed` 会把一条**没有身份**的结算行当成合法命中并认领掉。
-    """
-    assert _match([_row(posId="")]) is None
-    assert _match([_row(posId=None)]) is None
-
-
-def test_already_claimed_pos_id_is_rejected():
-    assert _match([_row()], claimed={"p1"}) is None
+@pytest.mark.parametrize("field", ["pnl", "fee", "fundingFee",
+                                   "liqPenalty", "realizedPnl"])
+@pytest.mark.parametrize("value,reason", [(None, "missing_amount"),
+    (True, "invalid_amount"), (float("nan"), "invalid_amount"),
+    (float("inf"), "invalid_amount")])
+def test_unknown_and_invalid_amounts_are_never_zero(field, value, reason):
+    result = validate([row(**{field: value})])
+    assert result.fact is None and result.reason == reason
 
 
-# ---------- 判据 4/5：两个时间窗（时间已由归一层整除 1000 变成秒） ----------
-
-def test_rejects_settlement_earlier_than_detection():
-    """结算不得早于侦测——早于即属**上一笔**往返（容差之外）。"""
-    assert _match([_row(uTime=_DETECT_TS - 61)]) is None
-    assert _match([_row(uTime=_DETECT_TS - 59)]) is not None
-
-
-def test_rejects_position_opened_after_local_entry():
-    assert _match([_row(cTime=_ENTRY_TS + 61)]) is None
-    assert _match([_row(cTime=_ENTRY_TS + 59)]) is not None
-
-
-def test_an_unknown_local_entry_time_skips_the_open_window_instead_of_rejecting_everything():
-    """`entry_ts <= 0`（本地不知道这笔仓何时开的）⇒ 判据 5 整条跳过，而不是拒绝一切。
-
-    这是**接管来的孤儿持仓**的常态：`adopt_orphan` 刻意不伪造开仓腿，故台账里没有它，
-    `_entry_wall_ts()` 返回 0。照常比对的话 `cTime <= 0 + tol` 对任何真实时间戳都为假 ⇒ 恒不
-    命中 ⇒ 轴 A 对这类持仓 100% 静默空转——而它恰恰是最需要真值的那一类（它本来就是一笔来路
-    不明的仓）。与判据 2 的 fail-open 是同一条理由：「不知道」不等于「不匹配」。
-    """
-    assert _match([_row(cTime=_ENTRY_TS + 99_999)], query=_query(entry_ts=0)) is not None
-    # 其余判据一条不减：instId / 时间窗右端 / posId / 0 价照常拦。
-    assert _match([_row(instId="ETH-USDT-SWAP")], query=_query(entry_ts=0)) is None
-    assert _match([_row(uTime=_DETECT_TS - 999)], query=_query(entry_ts=0)) is None
-    assert _match([_row(closeAvgPx=0.0)], query=_query(entry_ts=0)) is None
+@pytest.mark.parametrize("change,reason", [
+    ({"instType": "FUTURES"}, "unsupported_product"),
+    ({"currency": None}, "currency_unknown"),
+    ({"currency": "BTC"}, "unsupported_currency"),
+    ({"closed": False, "type": "1"}, "not_closed"),
+    ({"marginMode": ""}, "identity_unavailable"),
+    ({"marginMode": "isolated"}, "identity_mismatch"),
+    ({"exchangeCTimeMs": "999000"}, "identity_mismatch"),
+    ({"exchangeUTimeMs": "1100000"}, "time_mismatch"),
+    ({"exchangeUTimeMs": None}, "identity_unavailable"),
+    ({"closeTotalPos": 999}, "quantity_mismatch"),
+    ({"openAvgPx": 99}, "invalid_price"),
+    ({"closeAvgPx": 0}, "invalid_price"),
+    ({"settledPnl": 1}, "invalid_amount"),
+    ({"realizedPnl": 0, "identityGapUsd": 0}, "identity_failed"),
+])
+def test_rejects_wrong_scope_and_recomputes_amount_identity(change, reason):
+    assert validate([row(**change)]).reason == reason
 
 
-# ---------- 判据 6：绝不用 0 价入账 ----------
-
-def test_zero_close_price_never_matches():
-    """`closeAvgPx` 缺字段时归一层回落 0.0——按它入账正是本轮在治的那类假数字。"""
-    assert _match([_row(closeAvgPx=0.0)]) is None
-    assert _match([_row(closeAvgPx=None)]) is None
+def test_duplicate_pages_deduplicate_but_conflicting_contents_fail():
+    assert validate([row(), row(closeTotalPos=10.0)]).status == "matched"
+    assert validate([row(), row(pnl=11, realizedPnl=10.8)]).reason == (
+        "conflicting_duplicate")
 
 
-# ---------- 判据 7：多行命中取最早 ----------
-
-def test_picks_the_earliest_settlement_when_several_match():
-    early = _row(posId="early", uTime=_DETECT_TS + 1, closeAvgPx=99.0)
-    late = _row(posId="late", uTime=_DETECT_TS + 40, closeAvgPx=98.0)
-    fact = _match([late, early])
-    assert fact is not None and fact.pos_id == "early"
+def test_same_second_different_millisecond_candidates_are_ambiguous():
+    assert validate([row(), row(exchangeUTimeMs="1200002")]).reason == (
+        "ambiguous")
 
 
-# ---------- wire ----------
+def test_unrelated_bad_rows_do_not_hide_unique_valid_candidate():
+    bad = row(posId="unrelated", fee=None)
+    assert validate([bad, row()]).status == "matched"
+    assert validate([row(), bad]).status == "matched"
 
-def test_meta_wire_omits_keys_it_cannot_compute():
-    """算不出即**整键省略**，绝不写 `null`（沿用 `trip_ledger.trip_meta_wire` 的成文纪律）。"""
-    wire = settlement_meta_wire(None, mark_px=0.0, waited_s=7, booked_open_fee_usd=float("nan"))
+
+def test_failure_reason_is_independent_of_input_order():
+    bad = row(fee=None)
+    other = row(closeTotalPos=999)
+    assert validate([bad, other]).reason == validate([other, bad]).reason
+
+
+def test_claims_are_keys_scoped_to_epochs_not_position_ids():
+    fact = validate().fact
+    claimed = {fact.settlement_key: {"epochKey": "epoch-1",
+                                   "accountingEventId": "saved"}}
+    result = settlement.validate_settlement([row()], query(), claimed, 1205)
+    assert result.status == "already_claimed"
+    newer = row(exchangeUTimeMs="1200002")
+    result = settlement.validate_settlement([row(), newer], query(), claimed,
+                                            1205)
+    assert result.status == "matched"
+    assert result.fact.settlement_key != fact.settlement_key
+
+
+def test_direction_missing_requires_fresh_observation_direction_evidence():
+    assert validate([row(direction="")]).status == "matched"
+    assert validate([row(direction="")], context=context(
+        direction_confirmed=False)).reason == "identity_unavailable"
+
+
+def test_offline_boundary_uses_paused_timestamp_and_requires_it():
+    assert validate(mode="offline").reason == "time_mismatch"
+    assert validate(mode="offline", paused_ts=1200).status == "matched"
+    assert validate(mode="offline", paused_ts=1300).reason == "time_mismatch"
+
+
+@pytest.mark.parametrize("basis,pnl", [("gross", 10), ("net", 9.8)])
+def test_negative_residual_retains_estimated_fee_source(basis, pnl):
+    result = settlement.resolve_settlement_increment(
+        validate().fact, context(), basis)
+    leg = result.increment
+    assert leg.fee == pytest.approx(-.3)
+    assert leg.pnl == pytest.approx(pnl)
+    assert leg.fee_basis == "estimated"
+    assert leg.fee_adjustment["kind"] == "aggregate_residual"
+    assert leg.accounting_event_id.startswith("settlement:7:epoch-1:")
+
+
+def test_partial_close_resolves_final_price_and_money_only_once():
+    ctx = context(closed_qty=4, remaining_qty=6, booked_close_qty_price=440,
+                  booked_close_pnl=40, booked_fee_usd=.6)
+    fact = validate([row(closeAvgPx=116, pnl=160, realizedPnl=159.8)],
+                    context=ctx).fact
+    increment = settlement.resolve_settlement_increment(
+        fact, ctx, "gross").increment
+    assert (increment.qty, increment.price, increment.pnl) == (6, 120, 120)
+    assert increment.fee == pytest.approx(-.4)
+    assert increment.price_basis == "exchange_aggregate_residual"
+
+
+@pytest.mark.parametrize("change", [dict(booked_fee_usd=None),
+    dict(booked_close_pnl=None), dict(booked_close_qty_price=float("inf")),
+    dict(remaining_qty=0)])
+def test_unverifiable_increment_does_not_create_trade(change):
+    result = settlement.resolve_settlement_increment(
+        validate().fact, context(**change), "net")
+    assert result.increment is None and result.reason == "increment_invalid"
+
+
+def test_meta_and_coverage_preserve_known_zero_and_unknown_absence():
+    wire = settlement.settlement_meta_wire(
+        None, mark_px=0, waited_s=7, booked_open_fee_usd=float("nan"))
     assert wire["settlementSource"] == "local_mark"
-    assert wire["settlementWaitedS"] == 7
-    for absent in ("markPxAtDetect", "settlementPosId", "settlementPriceGapBps",
-                   "exchangeGrossPnlUsd", "bookedOpenFeeUsd"):
-        assert absent not in wire
+    assert "exchangeGrossPnlUsd" not in wire
+    assert settlement.coverage_wire(0, 0) is None
+    assert settlement.coverage_wire(3, 1)["ratio"] == .75
+    wire = settlement.settlement_meta_wire(
+        validate().fact, mark_px=100, waited_s=7, booked_open_fee_usd=.5)
+    assert wire["exchangeFundingUsd"] == 0
+    assert wire["exchangeRealizedPnlUsd"] == 9.8
 
 
-def test_meta_wire_reports_the_price_gap_in_bps():
-    """本轮最重要的一个观测量：把「合成价到底差多少」从推断变成读数。"""
-    fact = _match([_row(closeAvgPx=99.0)])
-    wire = settlement_meta_wire(fact, mark_px=100.0, waited_s=12, booked_open_fee_usd=0.12)
-    assert wire["settlementSource"] == "exchange"
-    assert wire["settlementPriceGapBps"] == -100.0        # (99 - 100) / 100 * 1e4
-    assert wire["bookedOpenFeeUsd"] == 0.12
-    assert wire["exchangeFeeUsd"] == 0.25
+def test_garbage_rows_do_not_raise():
+    assert validate([None, {}, 12, {"posId": object()}]).reason == "not_found"
 
 
-def test_meta_wire_carries_the_reject_reason_so_it_is_visible_in_the_data():
-    """费率残差不自洽 ⇒ 降级为 `local_mark`，但**原因必须留在数据上**（`G-A16`）。"""
-    wire = settlement_meta_wire(None, mark_px=100.0, waited_s=3, booked_open_fee_usd=0.9,
-                                reject_reason="fee_residual_negative")
-    assert wire["settlementSource"] == "local_mark"
-    assert wire["settlementRejectReason"] == "fee_residual_negative"
+def test_settlement_meta_keeps_unrounded_small_amounts_for_replay():
+    fact = validate([row(pnl=.00000011, fee=.00000002,
+                         realizedPnl=.00000009)]).fact
+    wire = settlement.settlement_meta_wire(
+        fact, mark_px=100, waited_s=1, booked_open_fee_usd=.00000001)
+    assert wire["exchangeGrossPnlUsd"] == .00000011
+    assert wire["exchangeFeeUsd"] == .00000002
+    assert wire["bookedOpenFeeUsd"] == .00000001
 
 
-def test_coverage_wire_is_absent_when_nothing_happened_yet():
-    """`G-F3`：两者皆 0 ⇒ 整键省略。
-
-    「一次外部平仓都还没发生」与「发生了但一次都没拿到真值」是两件完全不同的事，用同一个 0
-    表示会让 `AC-1` 的分母失去意义。
-    """
-    assert coverage_wire(0, 0) is None
-    assert coverage_wire(3, 1) == {"exchange": 3, "localMark": 1, "ratio": 0.75}
+@pytest.mark.parametrize("change", [dict(account_id=True),
+    dict(run_id=False), dict(observed_at_ts=True)])
+def test_boolean_identity_scope_and_observation_are_not_verified(change):
+    assert validate(context=context(**change)).fact is None
 
 
-def test_match_never_raises_on_garbage_rows():
-    """纯核心**绝不抛**：喂进任何形状的垃圾都只会不命中。"""
-    garbage = [None, {}, {"instId": _INST}, {"instId": _INST, "posId": object()},
-               {"instId": _INST, "posId": "x", "uTime": "not-a-number"}]
-    assert _match(garbage) is None
+def test_malformed_context_reports_unavailable_without_raising():
+    assert validate(context=object()).reason == "identity_unavailable"

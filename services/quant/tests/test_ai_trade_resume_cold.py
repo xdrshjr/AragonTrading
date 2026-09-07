@@ -256,6 +256,18 @@ async def _start_and_pause(client, strategy_id: int) -> str:
     started = await client.post("/api/ai-trade/start", json=_start_body(strategy_id))
     assert started.status_code == 200, started.text
     group_id = started.json()["groupId"]
+    # 暂停夹具声明0.6张持仓，必须有同一run的开仓事实支持恢复核对。
+    group = get_ai_trade_manager()._group
+    async with get_sessionmaker()() as db:
+        for member in group.members:
+            await repo.append_live_trade(db, member.run_id, {
+                "ts": _START_TS - 4 * _BAR_SECONDS, "side": "long",
+                "price": 30000.0, "qty": 0.6, "fee": 0, "pnl": 0,
+                "positionAfter": 0.6, "explain": {"meta": {
+                    "accountingEventId": f"paused-open:{member.run_id}",
+                    "wallTs": _START_TS - 4 * _BAR_SECONDS,
+                    "feeKnown": True, "feeBasis": "measured",
+                    "feeCurrency": "USDT"}}})
     paused = await client.post(f"/api/ai-trade/{group_id}/pause", json={})
     assert paused.status_code == 200, paused.text
     return group_id
@@ -404,8 +416,8 @@ async def test_resume_needs_acknowledgement_when_the_position_changed(monkeypatc
 
             ok = await client.post(f"/api/ai-trade/{group_id}/resume",
                                    json={"acknowledge": True})
-            assert ok.status_code == 200, ok.text
-            assert get_ai_trade_manager()._group.members[0].session.executor.projected == "flat"
+            assert ok.status_code == 409, ok.text
+            assert ok.json()["error"]["code"] == "AI_TRADE_RESUME_BLOCKED"
     finally:
         app.dependency_overrides.clear()
         await dispose_engine()
@@ -499,7 +511,7 @@ async def test_continuity_rebuild_matches_hand_computed_numbers():
 
         assert len(net["trades"]) == 7
         assert net["positionSeq"] == 3
-        assert net["entryFeeUsd"] == 0.15           # 只算当前未平周期的开仓腿
+        assert net["entryFeeUsd"] is None  # 裸费用列不能认证剩余费池
         assert net["realizedPnlUsd"] == 15.0        # net_mode：pnl 已是净额
         assert gross["realizedPnlUsd"] == 15.0  # 旧执行器保持原 run 毛额
         assert gross["tradingNetUsd"] is None  # 裸费用列没有来源证据
@@ -650,7 +662,8 @@ async def test_closed_offline_never_writes_a_fake_zero_pnl(monkeypatch):
 
             ok = await client.post(f"/api/ai-trade/{group_id}/resume",
                                    json={"acknowledge": True})
-            assert ok.status_code == 200, ok.text
+            assert ok.status_code == 409, ok.text
+            assert ok.json()["error"]["code"] == "AI_TRADE_RESUME_BLOCKED"
 
             async with sm() as s:
                 after = (await s.execute(select(func.count()).select_from(Trade)
@@ -660,65 +673,74 @@ async def test_closed_offline_never_writes_a_fake_zero_pnl(monkeypatch):
         import json as _json
         gap = _json.loads(run.metrics_json)["aiStats"]["offlineGap"]
         assert gap["pnlUnknown"] is True and gap["instId"] == "BTC-USDT-SWAP"
+        assert get_ai_trade_manager()._group is None
+        async with sm() as s:
+            contract = await state_repo.load_group_state(s, group_id)
+        assert contract["status"] == "paused"
     finally:
         app.dependency_overrides.clear()
         await dispose_engine()
 
 
-def test_offline_exit_accounting_is_not_a_verbatim_copy_of_realized_pnl():
-    """G-13 ②（[P1-7]）：`realizedPnl` 是**已扣费且含资金费**的口径，两种 `costBasis` 各有换算。
 
-    给定一行 `realizedPnl=-12.0, fee=1.5, fundingFee=0.4, liqPenalty=0`（归一后「支出为正」）：
-    - `gross` ⇒ 把费加回去还原毛额 ⇒ `pnl == -10.5`、`fee == 1.5`；
-    - `net`   ⇒ 只剥掉本地不入 `trades.pnl` 的资金费与强平罚金 ⇒ `pnl == -12.4`。
-    资金费只进 `explain.meta`，**不进 pnl**——否则会与 `funding_ledger` 双记。
-    """
+def _validated_offline(context_changes=None, row_changes=None):
+    from dataclasses import replace
+    from app.live_auto.settlement import SettlementQuery, validate_settlement
+    from app.live_auto.settlement_identity import SettlementContext
+
+    context = SettlementContext(account_id=1, run_id=1,
+        inst_id="BTC-USDT-SWAP", epoch_key="epoch-1", direction="long",
+        pos_side="long", margin_mode="cross", pos_id="POS-A",
+        exchange_ctime_ms=str(_START_TS * 1000),
+        exchange_utime_ms=str((_START_TS + 1) * 1000),
+        first_open_wall_ts=_START_TS, total_open_qty=2, remaining_qty=2,
+        entry_avg_px=100, tick_sz=.1, booked_fee_usd=.5,
+        fee_basis="estimated", direction_confirmed=True,
+        identity_basis="paused_position")
+    context = replace(context, **(context_changes or {}))
+    row = {"instId": context.inst_id, "instType": "SWAP", "posId": "POS-A",
+        "direction": "long", "posSide": "long", "marginMode": "cross",
+        "exchangeCTimeMs": context.exchange_ctime_ms,
+        "exchangeUTimeMs": str((_START_TS + 60) * 1000),
+        "currency": "USDT", "closed": True, "type": "2", "pnl": 10,
+        "fee": .2, "fundingFee": .4, "liqPenalty": 0, "settledPnl": 0,
+        "realizedPnl": 9.4, "closeTotalPos": 2, "openAvgPx": 100,
+        "closeAvgPx": 110, **(row_changes or {})}
+    query = SettlementQuery(context.inst_id, "long", _START_TS,
+        _START_TS + 60, context=context, mode="offline", paused_ts=_START_TS)
+    return validate_settlement([row], query, {}, _START_TS + 61), context
+
+
+@pytest.mark.parametrize("basis,pnl", [("gross", 10), ("net", 9.8)])
+def test_offline_exit_accounting_is_not_a_verbatim_copy_of_realized_pnl(
+        basis, pnl):
+    """认证累计结果只扣交易费，资金费仍单列，负调整不冒充实测返佣。"""
     from app.ai_auto.resume import _offline_exit_trade
-
-    row = {"posId": "POS-A", "realizedPnl": -12.0, "fee": 1.5, "fundingFee": 0.4,
-           "liqPenalty": 0.0, "uTime": _START_TS + 60, "closeAvgPx": 29000.0}
-    row.update(currency="USDT", closed=True, settledPnl=0)
-    expected = {"size": 0.6, "posId": "POS-A",
-                "openCTime": _START_TS - 4 * _BAR_SECONDS}
-
-    gross = _offline_exit_trade(row, expected, cost_basis="gross", local_trades=[])
-    assert round(gross["pnl"], 6) == -10.1 and round(gross["fee"], 6) == 1.5
-
-    net = _offline_exit_trade(row, expected, cost_basis="net", local_trades=[])
-    assert round(net["pnl"], 6) == -11.6 and round(net["fee"], 6) == 1.5
-    assert net["explain"]["meta"]["offlineFundingUsd"] == 0.4
-    assert net["reason"] == "offline_exit"
-    assert net["explain"]["meta"]["exitSource"] == "offline"
+    validation, context = _validated_offline()
+    trade = _offline_exit_trade(validation, context, cost_basis=basis)
+    assert trade["pnl"] == pytest.approx(pnl)
+    assert trade["fee"] == pytest.approx(-.3)
+    meta = trade["explain"]["meta"]
+    assert meta["feeBasis"] == "estimated"
+    assert meta["offlineFundingUsd"] == .4
+    assert meta["settlementValidation"]["feeAdjustment"] == meta["feeAdjustment"]
+    assert meta["accountingEventId"].startswith("settlement:1:epoch-1:")
 
 
 def test_offline_exit_only_takes_the_increment_and_bails_out_when_inconsistent():
-    """G-13 ③：`positions-history` 按 `posId` 汇总整个生命周期 ⇒ 只取增量；不自洽即退回诚实缺口。"""
     from app.ai_auto.resume import _offline_exit_trade
-
-    row = {"posId": "POS-A", "realizedPnl": -12.0, "fee": 1.5, "fundingFee": 0.0,
-           "liqPenalty": 0.0, "uTime": _START_TS + 60, "closeAvgPx": 29000.0}
-    row.update(currency="USDT", closed=True, settledPnl=0)
-    expected = {"size": 0.6, "openCTime": _START_TS, "posId": "POS-A"}
-    evidence = {"posId": "POS-A", "feeBasis": "measured",
-                "feeKnown": True, "feeCurrency": "USDT"}
-    local = [{"ts": _START_TS - 100, "side": "close", "pnl": -4.0,
-              "fee": 0.5, "explain": {"meta": evidence}}]
-
-    incremental = _offline_exit_trade(row, expected, cost_basis="net", local_trades=local)
-    assert round(incremental["pnl"], 6) == -8.0      # -12.0 减去暂停前已落的 -4.0
-    assert round(incremental["fee"], 6) == 1.0       # 1.5 减去已落的 0.5
-
-    over_counted = [{"ts": _START_TS + 10, "side": "close", "pnl": -4.0, "fee": 9.0}]
-    assert _offline_exit_trade(row, expected, cost_basis="net",
-                               local_trades=over_counted) is None  # 缺身份和费用来源
-    rebate = _offline_exit_trade(row | {"fee": -0.2}, expected,
-                                cost_basis="net", local_trades=[])
-    assert rebate["fee"] == -0.2
-    assert _offline_exit_trade(row, expected, cost_basis="unknown",
-                               local_trades=[]) is None
-    assert _offline_exit_trade(row | {"settledPnl": None}, expected,
-                               cost_basis="net", local_trades=[]) is None
-    assert _offline_exit_trade(None, expected, cost_basis="net", local_trades=[]) is None
+    validation, context = _validated_offline({"closed_qty": 1,
+        "remaining_qty": 1, "booked_close_pnl": 4,
+        "booked_close_qty_price": 105, "booked_fee_usd": .3})
+    trade = _offline_exit_trade(validation, context, cost_basis="net")
+    assert trade["qty"] == 1
+    assert trade["price"] == 115
+    assert trade["pnl"] == pytest.approx(5.8)
+    assert trade["fee"] == pytest.approx(-.1)
+    assert _offline_exit_trade(validation, context, cost_basis="unknown") is None
+    invalid, context = _validated_offline(row_changes={"fee": None})
+    assert _offline_exit_trade(invalid, context, cost_basis="net") is None
+    assert _offline_exit_trade({}, context, cost_basis="net") is None
 
 
 async def test_cold_end_archives_runs_without_placing_any_order(monkeypatch):

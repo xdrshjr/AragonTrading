@@ -603,7 +603,8 @@ async def test_journal_preserves_vetoed_intent():
 
 def _assert_v2_round_context(session, entry, text):
     """程序事实按 v2 合同追加，原执行结果及真实上下文原文完整保留。"""
-    keys = ("schemaVersion", "proposal", "finalDecision", "facts", "factsHash",
+    keys = ("schemaVersion", "evidenceVersion", "advisoryEvidence",
+            "reflectionEvidence", "proposal", "finalDecision", "facts", "factsHash",
             "executionReceipt", "gateVeto", "sizingVerdict", "closedBarTs",
             "evidenceFingerprint", "costModelVersion")
     expected = {**entry["executed"], **{key: entry[key] for key in keys}}
@@ -942,6 +943,12 @@ def _open_long(session, *, entry: float = _PG_ENTRY, qty: float = _PG_QTY) -> No
     ex.entry_qty_sz = qty
     ex.entry_bar = 0
     ex.entry_position_pct = 0.5
+    session._cost.note_open(
+        {"runId": session.run_id, "side": "long",
+         "ts": _START_TS, "wallTs": _START_TS,
+         "price": entry, "qty": qty, "fee": 0, "pnl": 0,
+         "feeKnown": True, "feeBasis": "measured", "positionAfter": qty},
+        seq=session._position_seq, now_wall=time.time())
     session._last_live_px = entry
     session._last_px_wall = time.time()
 
@@ -1291,14 +1298,14 @@ async def test_close_trade_carries_peak_pnl_read_and_consumed():
         _arm_peak(session, _pg_peak_px(0.10))
         assert session._guard.last_peak_pnl_usd is not None
 
-        first = {"ts": _START_TS, "side": "close", "price": _PG_ENTRY, "qty": 1.0,
+        first = {"ts": _START_TS, "side": "close", "price": _PG_ENTRY, "qty": _PG_QTY,
                  "fee": 0.0, "pnl": 0.1, "positionAfter": 0.0, "reason": "x"}
         second = dict(first, ts=_START_TS + 1)
         await session._dispatch([{"type": "trade", "data": first},
                                  {"type": "trade", "data": second}])
 
         assert first["peakPnlUsd"] is not None and first["peakPnlUsd"] > 0
-        assert second["peakPnlUsd"] is None              # 绝不继承，也绝不补 0
+        assert second.get("peakPnlUsd") is None         # 孤立腿不消费峰值
     finally:
         await dispose_engine()
 

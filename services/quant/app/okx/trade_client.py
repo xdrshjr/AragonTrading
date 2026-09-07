@@ -426,8 +426,8 @@ class OKXTradeClient(OKXPrivateClient):
         params: dict[str, str] = {"instType": inst_type, "limit": str(min(int(limit), 100))}
         if inst_id:
             params["instId"] = inst_id
-        if after_ms:
-            params["after"] = str(int(after_ms))
+        if after_ms is not None:
+            params["before"] = str(max(0, int(after_ms)))
         return await self._get("/api/v5/account/positions-history", params)
 
     async def get_pending_orders(self, inst_id: str | None = None) -> list:

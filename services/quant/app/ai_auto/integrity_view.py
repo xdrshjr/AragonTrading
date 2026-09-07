@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 from dataclasses import asdict
 
 from .decision_memory import RoundDecisionRecord, build_decision_facts
@@ -88,11 +89,9 @@ def build_integrity_snapshot(session) -> dict:
         "entryQuota": session._entry_quota.summary(),
         "pendingOpen": pending,
         "economics": session._cost.economics_snapshot(),
-        "memory": {
-            "factsVersion": 2,
-            "legacyNarrative": getattr(decider, "_legacy_narrative", False),
-            "summaryAsOfTs": getattr(decider, "_summary_as_of_ts", None),
-        },
+        "settlementValidation": deepcopy(getattr(
+            session.executor, "last_settlement_validation", None)),
+        "memory": decider.memory_wire(),
     }
 
 
@@ -116,6 +115,9 @@ def build_session_facts(session, payload: dict) -> dict:
         "funnel": session._discipline.funnel_wire(),
         "economics": session._cost.economics_snapshot(),
         "costSnapshot": session._cost.round_cost_wire(),
+        "settlementValidation": deepcopy(getattr(
+            session.executor, "last_settlement_validation", None)),
+        "evidenceHashes": payload.get("evidenceHashes"),
     })
 
 

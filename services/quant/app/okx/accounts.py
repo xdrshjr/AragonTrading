@@ -149,6 +149,28 @@ def _normalize_balance(balance: dict) -> dict:
     return {"totalEqUsd": _optional_float(balance.get("totalEq")), "details": details}
 
 
+def _position_time_ms(value) -> str | None:
+    """保留交易所原始正整数毫秒，不伪造秒级时间的精度。"""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    text = str(value).strip()
+    if not text.isascii() or not text.isdecimal() or int(text) <= 0:
+        return None
+    return str(int(text))
+
+
+def _position_number(value) -> float | None:
+    """原始持仓数量、价格的非法值保持未知。"""
+    import math
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    try:
+        number = float(value)
+    except (ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _normalize_position(p: dict) -> dict:
     """OKX account/positions 单行 → 归一持仓（camelCase，数值容错）。
 
@@ -166,14 +188,16 @@ def _normalize_position(p: dict) -> dict:
         "instId": str(p.get("instId") or ""),
         "instType": str(p.get("instType") or ""),
         "posSide": str(p.get("posSide") or ""),
-        "pos": _optional_float(p.get("pos")),
-        "avgPx": _optional_float(p.get("avgPx")),
+        "pos": _position_number(p.get("pos")),
+        "avgPx": _position_number(p.get("avgPx")),
         "last": _optional_float(p.get("last")),
         "upl": _optional_float(p.get("upl")),
         "uplRatio": _optional_float(p.get("uplRatio")),
         "lever": _optional_float(p.get("lever")),
         "marginMode": str(p.get("mgnMode") or ""),
         "posId": str(p.get("posId") or ""),
-        "cTimeS": int(_optional_float(p.get("cTime")) or 0) // 1000,
-        "uTimeS": int(_optional_float(p.get("uTime")) or 0) // 1000,
+        "cTimeS": int(_position_time_ms(p.get("cTime")) or 0) // 1000,
+        "uTimeS": int(_position_time_ms(p.get("uTime")) or 0) // 1000,
+        "exchangeCTimeMs": _position_time_ms(p.get("cTime")),
+        "exchangeUTimeMs": _position_time_ms(p.get("uTime")),
     }

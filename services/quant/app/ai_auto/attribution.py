@@ -346,9 +346,9 @@ class AttributionLedger:
                 self.note_open(trade, seq=seq, now_wall=meta.get("wallTs") or 0)
             else:
                 self.record_close(trade)
-                # 与 session._dispatch 同源：首仓为 0，每次平仓推进序号。
-                if (trade.get("side") == "close"
-                        and not self.accounting.last_result.get("duplicate")):
+                result = self.accounting.last_result or {}
+                # 结构全平即推进；缺费不改变仓位边界，部分腿仍属同仓。
+                if result.get("complete") and not result.get("duplicate"):
                     seq += 1
         self._last_settled = None
         self._last_close_net = None

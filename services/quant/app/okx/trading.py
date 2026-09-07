@@ -805,6 +805,8 @@ async def fetch_position_history(creds: AccountCredentials, inst_id: str, *, lim
 def _history_number(value) -> float | None:
     """结算事实缺失或非有限时保持未知，合法零与返佣保留。"""
     import math
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
     try:
         number = _optional_float(value)
     except (TypeError, ValueError, OverflowError):
@@ -814,19 +816,31 @@ def _history_number(value) -> float | None:
 
 def _history_amounts(row: dict) -> dict:
     amounts = {}
+    sources, invalid = {}, []
     for key in ("pnl", "realizedPnl", "settledPnl",
                 "fee", "fundingFee", "liqPenalty"):
         value = _history_number(row.get(key))
+        is_missing = row.get(key) is None or row.get(key) == ""
+        source = "missing" if is_missing else "exchange"
+        if key == "settledPnl" and row.get("instType") == "SWAP":
+            if is_missing:
+                value, source = 0.0, "not_applicable"
+            elif value != 0:
+                value = None
+        if value is None and not is_missing:
+            invalid.append(key)
+            source = "invalid"
         if value is not None and key in {"fee", "fundingFee", "liqPenalty"}:
             value = -value
         amounts[key] = value
+        sources[key] = source
     complete = all(value is not None for value in amounts.values())
     amounts["identityGapUsd"] = (
         amounts["realizedPnl"] - (
             amounts["pnl"] - amounts["fee"] - amounts["fundingFee"]
             - amounts["liqPenalty"] + amounts["settledPnl"])
         if complete else None)
-    return amounts
+    return {**amounts, "amountSources": sources, "invalidFields": invalid}
 
 
 def _normalize_position_history(r: dict) -> dict:
@@ -837,7 +851,7 @@ def _normalize_position_history(r: dict) -> dict:
     关系式还包含原符号的 ``settledPnl``；缺少任一金额则残差未知。
     ——本 spec 不把该式当前提，只在运行期数值自检（C-3）。
     """
-    inst_id = str(r.get("instId") or "")
+    from .accounts import _position_time_ms
     currency = str(r.get("settleCcy") or r.get("ccy") or "")
     close_type = str(r.get("type") or "")
     closed = {"1": False, "2": True, "3": True, "4": False,
@@ -845,16 +859,21 @@ def _normalize_position_history(r: dict) -> dict:
     return {
         "posId": str(r.get("posId") or ""), "instId": str(r.get("instId") or ""),
         "direction": str(r.get("direction") or ""),
-        "openAvgPx": _optional_float(r.get("openAvgPx")) or 0.0,
-        "closeAvgPx": _optional_float(r.get("closeAvgPx")) or 0.0,
-        "cTime": int(_optional_float(r.get("cTime")) or 0) // 1000,
-        "uTime": int(_optional_float(r.get("uTime")) or 0) // 1000,
+        "openAvgPx": _history_number(r.get("openAvgPx")),
+        "closeAvgPx": _history_number(r.get("closeAvgPx")),
+        "cTime": int(_position_time_ms(r.get("cTime")) or 0) // 1000,
+        "uTime": int(_position_time_ms(r.get("uTime")) or 0) // 1000,
+        "exchangeCTimeMs": _position_time_ms(r.get("cTime")),
+        "exchangeUTimeMs": _position_time_ms(r.get("uTime")),
         **_history_amounts(r),
         "instType": str(r.get("instType") or ""),
         "mgnMode": str(r.get("mgnMode") or ""),
+        "marginMode": str(r.get("mgnMode") or ""),
+        "type": close_type, "posSide": str(r.get("posSide") or ""),
+        "closeTotalPos": _history_number(r.get("closeTotalPos")),
+        "openMaxPos": _history_number(r.get("openMaxPos")),
         "ccy": str(r.get("ccy") or ""), "closed": closed,
-        "currency": ("USDT" if currency == "USDT"
-                     and "-USDT-" in inst_id else None),
+        "currency": currency or None,
     }
 
 

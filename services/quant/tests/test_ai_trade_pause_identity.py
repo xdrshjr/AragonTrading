@@ -46,10 +46,11 @@ def test_missing_identity_keys_fall_back_without_raising():
     assert out["posId"] == "" and out["cTimeS"] == 0 and out["uTimeS"] == 0
 
 
-def test_added_keys_are_exactly_three():
+def test_identity_keys_include_exact_milliseconds():
     """只加三键，不多不少——新增键是有代价的（`response_model` 会静默吞掉，见函数 docstring）。"""
     out = _normalize_position(_RAW)
-    assert set(out) - _LEGACY_KEYS == {"posId", "cTimeS", "uTimeS"}
+    assert set(out) - _LEGACY_KEYS == {
+        "posId", "cTimeS", "uTimeS", "exchangeCTimeMs", "exchangeUTimeMs"}
 
 
 def test_account_detail_endpoint_schema_still_drops_them_silently():

@@ -1,9 +1,11 @@
 "use client";
 
 import {
-  coverageLabel, describeIntegrity, economicsSourceLabel,
-  executionReasonLabel, integrityDetailText, readIntegrity,
-  type EconomicsSnapshot, type IntegritySnapshot,
+  coverageLabel, describeIntegrity, describeSettlement, economicsSourceLabel,
+  evidenceVersionLabel, executionReasonLabel, integrityDetailText,
+  readIntegrity, readSettlementValidation, settlementBasisLabel,
+  type EconomicsSnapshot, type FeeAdjustment, type IntegritySnapshot,
+  type SettlementValidationSnapshot,
 } from "@/lib/aiTradeIntegrity";
 import { colorForReturn, fmtTime } from "@/lib/format";
 import { sumBlocked } from "@/lib/aiTradeFunnel";
@@ -20,9 +22,11 @@ function Reading({ label, value, money = false }: {
 }) {
   const known = value != null && Number.isFinite(value);
   return (
-    <div className="flex min-w-0 justify-between gap-2 text-[11px]">
+    <div className="flex min-w-0 flex-wrap justify-between gap-x-2 gap-y-0.5
+      text-[11px]">
       <dt className="min-w-0 break-words text-[var(--muted)]">{label}</dt>
-      <dd className="tabular shrink-0" style={{
+      <dd className="tabular ml-auto min-w-0 max-w-full break-all text-right"
+        style={{
         color: known && money ? colorForReturn(value) : "var(--text)",
       }}>
         {known && !money ? value : valueText(value)}
@@ -74,7 +78,9 @@ export default function IntegrityCard({ instId, integrity }: {
   const diagnosis = describeIntegrity(integrity);
   const quota = wire?.entryQuota;
   return (
-    <section className="min-w-0 space-y-2 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2"
+    <section className="min-w-0 space-y-2 rounded-md border
+      border-[var(--border)] bg-[var(--surface)] px-3 py-2
+      [overflow-wrap:anywhere]"
       data-testid="ai-integrity-card" aria-label={`${instId} 运行诊断`}>
       <h3 className="break-words text-xs font-medium text-[var(--text)]">
         {instId} · 运行诊断
@@ -98,17 +104,37 @@ export default function IntegrityCard({ instId, integrity }: {
 
 function IntegrityDetails({ wire }: { wire: IntegritySnapshot | null }) {
   const funnel = wire?.funnel;
-  const quota = wire?.entryQuota;
   const detail = integrityDetailText(wire?.diagnosis?.details);
   return (
-      <details className="min-w-0 text-[11px]">
-        <summary className="cursor-pointer text-[var(--accent-ink)]">
+      <details className="min-w-0 space-y-2 text-[11px]">
+        <summary className="cursor-pointer text-[var(--accent-ink)]
+          focus-visible:rounded-sm focus-visible:outline
+          focus-visible:outline-[var(--accent-ink)]">
           展开运行明细
         </summary>
         <p className="my-1 text-[10px] text-[var(--muted)]">
           {funnel?.scope ?? "当前运行段范围暂不可得"} ·
           {coverageLabel(funnel?.coverage)}
         </p>
+        <FunnelReadings wire={wire} />
+        {Object.entries(funnel?.executionBlocked ?? {}).map(([code, count]) =>
+          <dl key={code} className="mt-1">
+            <Reading label={executionReasonLabel(code)} value={count} />
+          </dl>)}
+        {detail &&
+          <p className="mt-2 whitespace-pre-wrap break-words text-[var(--muted)]">
+            {detail}
+          </p>}
+        <SettlementDetails value={wire?.settlementValidation} />
+        <EvidenceDetails memory={wire?.memory} />
+      </details>
+  );
+}
+
+function FunnelReadings({ wire }: { wire: IntegritySnapshot | null }) {
+  const funnel = wire?.funnel;
+  const quota = wire?.entryQuota;
+  return (
         <dl className="space-y-1">
           <Reading label="完成轮数" value={wire?.sampleThroughRound} />
           <Reading label="模型自主观望" value={funnel?.modelHold} />
@@ -126,18 +152,95 @@ function IntegrityDetails({ wire }: { wire: IntegritySnapshot | null }) {
           {(quota?.legacyAssumedUsed ?? 0) > 0 &&
             <Reading label="其中旧数据假定占用" value={quota?.legacyAssumedUsed} />}
           <Reading label="额度预留" value={quota?.reserved} />
-          <Reading label="完整费用样本" value={wire?.economics?.completeFeeTripCount} />
+          <Reading label="完整费用样本"
+            value={wire?.economics?.completeFeeTripCount} />
           <Reading label="未知样本" value={wire?.economics?.unknownTripCount} />
-          <Reading label="全程手续费（含未平开仓）" value={wire?.economics?.sessionFeeUsd} money />
+          <Reading label="全程手续费（含未平开仓）"
+            value={wire?.economics?.sessionFeeUsd} money />
         </dl>
-        {Object.entries(funnel?.executionBlocked ?? {}).map(([code, count]) =>
-          <dl key={code} className="mt-1">
-            <Reading label={executionReasonLabel(code)} value={count} />
-          </dl>)}
-        {detail &&
-          <p className="mt-2 whitespace-pre-wrap break-words text-[var(--muted)]">
-            {detail}
-          </p>}
-      </details>
+  );
+}
+
+function SettlementDetails({ value }: {
+  value?: SettlementValidationSnapshot | null;
+}) {
+  const settlement = readSettlementValidation(value);
+  return (
+    <div className="min-w-0 space-y-1 border-t border-[var(--border)] pt-2">
+      <h4 className="font-medium text-[var(--text)]">结算依据</h4>
+      {settlement && <p className="text-[var(--muted)]">
+        {settlement.status === "pending" ? "当前结算" : "上次结算"}
+      </p>}
+      <p className="whitespace-pre-wrap break-words">
+        {describeSettlement(value)}
+      </p>
+      {settlement && <>
+        <p className="text-[var(--muted)]">
+          持仓依据：{settlementBasisLabel(settlement.identityBasis)}
+          {" · "}{coverageLabel(settlement.amountCoverage ?? undefined)}
+        </p>
+        <p className="text-[var(--muted)]">
+          价格依据：{settlementBasisLabel(settlement.priceBasis)}
+          {" · "}{settlementBasisLabel(settlement.queryCoverage)}
+        </p>
+        <dl className="space-y-1 text-[var(--muted)]">
+          <div><dt>结算时间</dt><dd className="tabular">
+            {settlement.asOfTs != null ? fmtTime(settlement.asOfTs)
+              : "暂不可得"}
+          </dd></div>
+          <div><dt>持仓标识</dt><dd className="break-all">
+            {settlement.epochKey ?? "暂不可得"}
+          </dd></div>
+          <div><dt>结算标识</dt><dd className="break-all">
+            {settlement.settlementKey ?? "暂不可得"}
+          </dd></div>
+        </dl>
+        <FeeAdjustmentReadings adjustment={settlement.feeAdjustment} />
+      </>}
+    </div>
+  );
+}
+
+function FeeAdjustmentReadings({ adjustment }: {
+  adjustment?: FeeAdjustment | null;
+}) {
+  if (!adjustment) return null;
+  if (adjustment.kind !== "aggregate_residual") {
+    return <p className="text-[var(--muted)]">此类费用调整暂不可读</p>;
+  }
+  return (
+    <div className="min-w-0 space-y-1 pt-1">
+      <h5 className="font-medium text-[var(--text)]">往返费用调整</h5>
+      <p className="text-[var(--muted)]">
+        费用来源：{settlementBasisLabel(adjustment.feeBasis)}
+      </p>
+      <dl className="space-y-1">
+        <Reading label="交易所往返手续费"
+          value={adjustment.exchangeTripFeeUsd} money />
+        <Reading label="本地已记手续费"
+          value={adjustment.bookedLocalFeeUsd} money />
+        <Reading label="本次费用差额"
+          value={adjustment.residualFeeUsd} money />
+      </dl>
+    </div>
+  );
+}
+
+function EvidenceDetails({ memory }: {
+  memory?: IntegritySnapshot["memory"];
+}) {
+  const summaryVersion = memory?.summaryEvidenceVersion;
+  return (
+    <div className="min-w-0 space-y-1 border-t border-[var(--border)] pt-2">
+      <h4 className="font-medium text-[var(--text)]">上下文证据版本</h4>
+      <p className="text-[var(--muted)]">
+        当前记录 {evidenceVersionLabel(memory?.evidenceVersion)}
+        {" · "}{summaryVersion == null ? "摘要证据未确认"
+          : `摘要 ${evidenceVersionLabel(summaryVersion)}`}
+      </p>
+      {memory?.legacyNarrative && <p className="text-[var(--muted)]">
+        包含旧叙述，需以当前事实核验
+      </p>}
+    </div>
   );
 }

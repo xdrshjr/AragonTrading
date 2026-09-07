@@ -43,6 +43,23 @@ def leg_fee_evidence(trade: dict) -> tuple[float | None, str]:
     return None, "legacy_unknown"
 
 
+def accounted_close_pnl(trade: dict, cost_basis: str | None) -> float | None:
+    """返回可用于认证累计的金额，缺开仓费的净额投影保持未知。"""
+    meta = trade_meta(trade)
+    projected_net = (cost_basis == "net" and meta.get("pnlBasis") == "estimated"
+                     and meta.get("entryFeeBasis") == "unknown")
+    return None if projected_net else finite(trade.get("pnl"))
+
+
+def is_continuity_aligned(continuity: dict, side: str, quantity) -> bool:
+    """核对完整成交余量与接管仓位，缺失金额不能用确认动作补齐。"""
+    expected = finite(continuity["remainingQty"])
+    actual = 0.0 if side == "flat" else finite(quantity)
+    return (expected is not None and actual is not None
+            and math.isclose(expected, actual, rel_tol=1e-9, abs_tol=1e-12)
+            and (expected == 0 or continuity["positionSide"] == side))
+
+
 def accounting_event_key(trade: dict, run_id=None) -> tuple:
     """优先稳定事件身份；历史 id 只决定顺序，不使用 K 线时间去重。"""
     meta = trade_meta(trade)
@@ -96,6 +113,11 @@ class TradeAccountingAccumulator:
     def remaining_qty(self) -> float:
         """尚未由可信 close 增量消费的合约张数。"""
         return self._open.remaining_qty if self._open else 0.0
+
+    @property
+    def position_side(self) -> str:
+        """当前未平周期方向，供恢复与实际仓位交叉核对。"""
+        return self._open.side if self._open else "flat"
 
     @property
     def remaining_open_fee_usd(self) -> float | None:
@@ -208,8 +230,9 @@ class TradeAccountingAccumulator:
         position.exit_notional += qty * price
         position.recorded_fee += finite(trade.get("fee")) or 0.0
         position.sources.add(source)
+        basis = self.context.get("costBasis")
         resolved = resolve_trip_economics(TripPnlInputs(
-            self.context.get("costBasis"), trade.get("pnl"), allocation, fee))
+            basis, accounted_close_pnl(trade, basis), allocation, fee))
         piece = {"grossPnlUsd": resolved.gross_pnl_usd,
                  "feeUsd": resolved.fee_usd,
                  "tradingNetUsd": resolved.trading_net_usd,
