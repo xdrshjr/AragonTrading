@@ -11,6 +11,7 @@ import {
   fmtRate,
   holdDurationText,
   payoffText,
+  riskDistributionText,
   readRMultiple,
   realizedCoverageText,
   realizedRows,
@@ -39,6 +40,11 @@ const POOLED: AiTradePooled = {
   travelToCostRatio: 1.98,
   feeCoverage: 0.1088,
   feeTrips: 21,
+  moveSamples: 193,
+  travelComparisonTrips: 21,
+  travelComparisonCoverage: 0.1088,
+  travelMedianMoveBps: 13.9,
+  travelMedianFeeBps: 7.01,
   costBasisAssumedTrips: 172,
 };
 
@@ -88,13 +94,15 @@ describe("赔率成对、位移/成本带分母（G-9）", () => {
   it("travelToCostRatio 与 feeCoverage 同行下发", () => {
     const text = travelToCostText(POOLED);
     expect(text).toContain("1.98×");
-    expect(text).toContain("21 笔带费率记录");
+    expect(text).toContain("21 笔同笔尺度");
+    expect(text).toContain("往返手续费");
+    expect(text).toContain("不含资金费");
     expect(text).toContain("10.9%");
   });
 
   it("比值算不出时说「成本样本不足」，绝不显示一个 0.0 bps 的成本", () => {
     const text = travelToCostText({ ...POOLED, travelToCostRatio: null, feeTrips: 2 });
-    expect(text).toContain("成本样本不足");
+    expect(text).toContain("手续费比较样本不足");
     expect(text).not.toContain("0.0 bps");
   });
 });
@@ -164,10 +172,29 @@ describe("结论表色调映射齐备", () => {
       "no_edge_yet",
       "negative_significant",
       "insufficient_samples",
+      "insufficient_evidence",
     ]) {
       expect(VERDICT_TONES[code]).toBeDefined();
     }
   });
+});
+
+it("旧后端缺少同笔分母时不展示旧混合比值", () => {
+  const old = { ...POOLED, travelComparisonTrips: undefined };
+  expect(travelToCostText(old)).toContain("旧版未提供同笔尺度");
+  expect(travelToCostText(old)).not.toContain("1.98×");
+});
+
+it("风险子样本分别保留自己的分母", () => {
+  const text = riskDistributionText({
+    rSamples: 3, rP10: -.1, rP50: .1, rP90: .2,
+    reachedOneRShare: 0, withinFifthRShare: .5,
+    plannedRrMedian: 2, plannedRrSamples: 2,
+    stopUtilizationP50: .2, medianStopAtrMult: 1,
+    stopAtrCoverage: .25, stopAtrSamples: 1,
+  });
+  expect(text).toContain("计划盈亏比中位 2.00（2 笔）");
+  expect(text).toContain("1.0×ATR（1 笔，覆盖 25.0%）");
 });
 
 describe("文案禁令（G-10）", () => {

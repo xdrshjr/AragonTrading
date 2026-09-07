@@ -8,6 +8,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 FACTS_MAX_CHARS = 8192
+EVIDENCE_VERSION = 4
 _FACT_FIELDS = (
     "runId", "instId", "bar", "round", "asOfTs", "position",
     "restingOrder", "pendingOpen", "rules", "entryQuota", "funnel",
@@ -61,7 +62,8 @@ def build_evidence_fingerprint(payload: dict) -> str:
     selected = {key: payload.get(key) for key in _EVIDENCE_FIELDS}
     selected = _evidence_value(selected)
     wire = (payload.get("advisorySnapshot") or {}).get("wire", payload)
-    for key in ("intel", "experience", "signalPriors"):
+    from .advisory_evidence import ADVISORY_NAMES
+    for key in ADVISORY_NAMES:
         selected[key] = wire.get(key)
     return _hash(selected)
 
@@ -76,7 +78,8 @@ def build_decision_facts(inputs: dict) -> dict:
         if snapshot is None:
             snapshot = build_advisory_evidence(inputs)
         facts["evidenceHashes"] = evidence_hashes(snapshot)
-    facts.update(schemaVersion=2, evidenceVersion=3, priceUnit="USDT")
+    facts.update(schemaVersion=2, evidenceVersion=EVIDENCE_VERSION,
+                 priceUnit="USDT")
     facts["evidenceFingerprint"] = build_evidence_fingerprint(inputs)
     # 可选解释不能挤掉真实持仓、pending、规则或费用来源。
     for key in ("diagnosis", "narrative"):

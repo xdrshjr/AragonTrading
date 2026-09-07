@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 
-from .decision_memory import can_fold_rounds, canonical_json
+from .decision_memory import EVIDENCE_VERSION, can_fold_rounds, canonical_json
 from .numeric_text import format_price
 
 from .prompts_en import (
@@ -937,9 +937,10 @@ def _format_intel_expand(wire: dict | None) -> str:
 
 
 def build_advisory_evidence(payload: dict) -> dict:
-    """复用本轮 renderer，返回三段 wire 与全文的独立冻结快照。"""
+    """复用本轮 renderer，返回四段 wire 与全文的独立冻结快照。"""
     from .advisory_evidence import freeze_evidence
     return freeze_evidence(payload, {
+        "trackRecord": _format_track_record(payload.get("trackRecord")),
         "intel": _format_intel(payload.get("intel")),
         "experience": _format_experience(payload.get("experience")),
         "signalPriors": _format_signal_priors(payload.get("signalPriors")),
@@ -959,7 +960,12 @@ def build_reflection_evidence(payload: dict) -> dict:
 def _advisory_text(payload: dict, name: str, renderer) -> str:
     snapshot = payload.get("advisorySnapshot")
     if snapshot is not None:
-        return (snapshot.get(name) or {}).get("text") or ""
+        if snapshot.get("evidenceVersion") not in (3, EVIDENCE_VERSION):
+            return ""
+        section = snapshot.get(name) or {}
+        if not section.get("enabled") or section.get("omitted"):
+            return ""
+        return section.get("text") or ""
     return renderer(payload.get(name))
 
 
@@ -1028,7 +1034,7 @@ def build_decision_prompt(payload: dict) -> str:
     priors_line = _advisory_text(payload, "signalPriors", _format_signal_priors)
     if priors_line:                          # 证据相邻性：共识 → 共识的历史质量 → 行情证据
         parts.append(priors_line)
-    track_line = _format_track_record(payload.get("trackRecord"))
+    track_line = _advisory_text(payload, "trackRecord", _format_track_record)
     if track_line:                           # 键缺失 ⇒ 整段省略（四条装配门禁任一不过 / 回测 payload）
         parts.append(track_line)
     experience_line = _advisory_text(payload, "experience", _format_experience)

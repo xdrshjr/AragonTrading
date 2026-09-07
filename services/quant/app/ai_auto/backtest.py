@@ -45,7 +45,6 @@ from .cost_model import (
     RoundCostSnapshot,
     backtest_params,
     estimate_round_trip_cost,
-    funding_periods,
     query_for_preview,
 )
 from .cost_view import build_cost_view
@@ -67,6 +66,7 @@ from .exit_priority import (
 )
 from .funding import FundingSnapshot
 from .funding_ledger import BacktestFundingCurve, FundingLedger
+from .backtest_funding import FundingDecisionEvidence, load_history_curve
 from .hold_horizon import HorizonFacts, HorizonRule
 from .hold_horizon import rule_wire as horizon_rule_wire
 from .hold_horizon_text import format_backtest_notes
@@ -346,11 +346,13 @@ class AiBacktestRunner:
         # 不像实盘账本那样按张数计（实盘要乘 ctVal）。
         self._funding = FundingLedger(
             enabled=bool(spec.settings.ai_trade_funding_ledger_enabled)
-            and bool(spec.settings.ai_trade_funding_backtest_enabled), ct_val=1.0)
+            and bool(spec.settings.ai_trade_funding_backtest_enabled),
+            ct_val=1.0, backtest=True)
         self._curve = BacktestFundingCurve([])
         # 轴 B [P2-1]：曲线起点之前的若干根 `snapshot_at` 恒 `None`，故「本次回测含不含资金费」
         # 不是一个全局布尔——如实计「含资金费的决策轮 / 总决策轮」并写进 notes。
         self._funding_cost_rounds = self._funding_cost_covered = 0
+        self._funding_evidence = FundingDecisionEvidence()
         # 单槽打标：凡是运行时**自己**提交的平仓在 submit 之前写槽，成交被观察到时消费。
         # `SimBroker` 自己的盘中止损止盈 / max_hold / 区间收尾不经运行时 ⇒ 槽为空、由 reason 兜住。
         self._pending_exit_source: str | None = None
@@ -543,25 +545,14 @@ class AiBacktestRunner:
         **绝不按 0 呈现**（回测里资金费恒 0 正是本轮要修的那件事）。异常一律吞掉：回测的主结果
         不该因为一个观测层的公共端点抖动而失败。
         """
-        if not self._funding.enabled:
+        if not (self.settings.ai_trade_funding_cost_backtest_enabled
+                or self._funding.enabled):
             return
-        rows: list[dict] = []
-        after_ms: int | None = (self.end_ts + 1) * 1000
-        try:
-            for _ in range(int(self.settings.ai_trade_funding_history_max_pages)):
-                page = await self.rest.get_funding_rate_history(
-                    self.inst_id, after_ms=after_ms, limit=100)
-                if not page:
-                    break
-                rows.extend(page)
-                oldest = page[0]["fundingTs"]
-                if oldest <= self.start_ts:
-                    break
-                after_ms = oldest * 1000
-        except Exception as exc:  # noqa: BLE001 —— 观测层取数失败绝不打断回测主流程
-            logger.warning("ai-backtest funding curve unavailable (%s): %s",
-                           self.inst_id, exc)
-        self._curve = BacktestFundingCurve(rows)
+        self._curve = await load_history_curve(self.rest, {
+            "inst_id": self.inst_id, "start_ts": self.start_ts,
+            "end_ts": self.end_ts,
+            "max_pages": int(self.settings.ai_trade_funding_history_max_pages),
+        })
 
     async def _load_htf(self, left: int, base_sec: int) -> dict:
         strategy_tfs = {
@@ -815,23 +806,24 @@ class AiBacktestRunner:
                                  exits=self._exits.stats(), funding=funding)
 
     def _cost_funding(self, ts: int) -> tuple[FundingSnapshot | None, bool]:
-        """回测成本模型的资金费入参 `(snapshot | None, funding_enabled)`（轴 B §2.3.2 **唯一真源**）。
-
-        **曲线不可用 ⇒ 逐字回退 `(None, False)`**（§九 D-8）：`funding_enabled=True` +
-        `funding=None` 在 `cost_model` 里的语义是「数据缺失 ⇒ degraded ⇒ 门禁阈值收紧」
-        （`cost_model.py` `query_for_preview` 两条分支），那会让「拉不到历史费率」这件观测层的
-        小事静默改变回测的门禁判定。回退到 `(None, False)`（有意不建模）才与本轮之前逐字节相同。
-        """
+        """本轮冻结的因果快照；缺历史保持开启，仅显式关闭才禁用。"""
         if self._round_cost is not None and self._round_cost.as_of_ts == ts:
             return self._round_cost.funding, self._round_cost.funding_enabled
         if not self.settings.ai_trade_funding_cost_backtest_enabled:
             return None, False
         snap = self._curve.snapshot_at(int(ts))
-        return (snap, True) if snap is not None else (None, False)
+        return snap, True
 
-    def _begin_round_cost(self, ts: int) -> None:
+    def _begin_round_cost(self, ts: int, *, decision_id=None) -> None:
         """在 LLM 调用前冻结模拟费率和因果资金费，供本轮所有成本读点复用。"""
         funding, enabled = self._cost_funding(ts)
+        if decision_id is not None:
+            self._funding_evidence.note(decision_id, funding, enabled)
+            evidence = self._funding_evidence.wire(self._curve)
+            self._funding_cost_rounds = evidence["decisionRounds"]
+            self._funding_cost_covered = evidence["visibleRateRounds"]
+        if self._round_cost is not None and self._round_cost.as_of_ts == ts:
+            return
         params = replace(backtest_params(
             self.settings, expected_hold_bars=self._horizon_hold_bars),
             fee_source="simulation")
@@ -928,6 +920,7 @@ class AiBacktestRunner:
         round_no = self.rounds_done + 1
         row = main_df.iloc[i]
         ts, ref_px = int(row["ts"]), float(row["c"])
+        self._begin_round_cost(ts, decision_id=(round_no, ts))
         consensus = compute_consensus(board)
         payload = self._build_payload(
             round_no, ts, ref_px, main_df, context_frames, i, board, consensus)
@@ -986,11 +979,8 @@ class AiBacktestRunner:
         decision, consensus_reason = consensus_out.decision, consensus_out.reason
         # ★ 最小 edge 门禁（§3.7）：与实盘**同一纯核心、同位插入**（共识后、反思前）；k_min=0（默认）
         # ⇒ 恒返回 None ⇒ 既有回测结果逐字节相同。成本用 SimBroker 实收常数（两侧各自对自己的世界说真话）。
-        # 轴 B：本轮决策的资金费入参在此**取一次并计数**（`_cost_funding` 在 `_horizon_facts` 里
-        # 也会被调一次，但那条只在持仓时走；覆盖率的分母口径是「决策轮」，故计数只挂这一处）。
+        # 只读决策入口已经冻结并计数的资金费断面。
         edge_funding, edge_funding_on = self._cost_funding(ts)
-        self._funding_cost_rounds += 1
-        self._funding_cost_covered += 1 if edge_funding_on else 0
         edge_out = evaluate_edge_gate(
             decision, settings=self.settings, last_px=ref_px, atr_px=self._atr_at(i),
             take_profit_pct=self._oco_risk.take_profit_pct, bar_seconds=BAR_SECONDS[self.bar],
@@ -1277,7 +1267,8 @@ class AiBacktestRunner:
                       "baseRules": payload.get("baseRules"),
                       "risk": asdict(self._oco_risk)},
             "economics": self._accounting.snapshot({"asOfTs": ts}),
-            "costSnapshot": {"modelVersion": 2, "params": asdict(snap.params),
+            "costSnapshot": {"modelVersion": snap.model_version,
+                             "params": asdict(snap.params),
                              "liquidityAssumption": "simulation",
                              "feeSource": "simulation", "asOfTs": ts,
                              "stale": snap.stale, "spreadBps": snap.spread_bps,
@@ -1330,8 +1321,12 @@ class AiBacktestRunner:
         if ctx.position_side == "flat":
             return None
         unrealized = self.main.equity_at(ref_px) - self.main.cash
+        funding_stats = self._funding.stats(settled_usd=None)
+        # wire 只判断覆盖；盈亏平衡必须沿原始计提精度计算。
         funding = (self._funding.epoch.accrued_usd
-                   if self._funding.epoch and self._curve.available else None)
+                   if self._funding.epoch is not None
+                   and (funding_stats or {}).get("accruedOpenUsd") is not None
+                   else None)
         return {"side": ctx.position_side, "avgEntry": ctx.entry_price,
                 "size": self.main.pos.qty, "unrealizedPnl": round(unrealized, 4),
                 "barsInPosition": ctx.bars_in_position,
@@ -1472,6 +1467,7 @@ class AiBacktestRunner:
             # 交易周期层观测（§2.12）：与实盘 `aiStats.horizon` **同名同形**（同一个 `stats()`），
             # 未装配 ⇒ `None` ⇒ UI 整段不渲染（绝不在一次没有周期契约的回测上挂出该卡片）。
             "horizon": self._horizon.stats(),
+            "fundingEvidence": self._funding_evidence.wire(self._curve),
             # 验收闭环四键（horizon-acceptance）：与实盘 `_finalize_run` 的四键**逐键同形**
             # （同一个 builder、同一份 wire），这是回测 vs 实盘可对拍的前提。
             **ai_stats_keys(self._acceptance_bundle())}
@@ -1525,6 +1521,13 @@ class AiBacktestRunner:
         那条曲线（挂在 `format_backtest_notes` 上会因 `rule is None ⇒ []` 而整句消失）。
         """
         notes: list[str] = [self._cost_basis_note()]
+        diagnostics = self._curve.diagnostics()
+        if diagnostics["untimedInvalidRows"]:
+            notes.append(
+                f"历史资金费有 {diagnostics['untimedInvalidRows']} 条无有效时间记录，"
+                "整次数据完整性未知；不将无法定位的异常回写为过去断点。")
+        if diagnostics["loadCoverage"] != "complete":
+            notes.append("历史资金费加载覆盖不足，已保留可见点和缺口诊断。")
         if not self._funding.enabled:
             return notes
         if not self._curve.available:
@@ -1540,34 +1543,25 @@ class AiBacktestRunner:
         return notes
 
     def _cost_basis_note(self) -> str:
-        """本次回测的**往返成本估算**到底含不含资金费（轴 B §2.4.4，取代旧的欠账披露句）。
-
-        旧那句「已知欠账：成本估算仍不含资金费」在轴 B 落地后是一句假话，必须由本函数取代——
-        **一条在事实变化后没被撤下的免责，比没有免责更坏**（[P1-6] / R-14）。
-        括号里的「与最小 edge 门禁」是条件文本：`k_min` 默认 0 时 `evaluate_edge_gate` 第一句即
-        `return None`，无条件写上就又是一句没核实过的承诺（[P1-9]，沿用 `_build_notes` 的同款先例）。
-        """
+        """按实际决策计数披露证据，不用末段周期代表所有过去轮。"""
+        evidence = self._funding_evidence.wire(self._curve)
+        visible = evidence["visibleRateRounds"]
+        total = evidence["decisionRounds"]
+        missing = evidence["missingRounds"]
+        degraded = evidence["degradedRounds"]
         gate = "与最小 edge 门禁" if self.settings.ai_trade_edge_gate_k_min > 0 else ""
-        if self._funding_cost_covered <= 0:
-            # 三种「不含」必须分开说：总闸关是运维选择、曲线不可得是观测层失败、而「曲线在手但本次
-            # 区间的决策轮全落在它起点之前」是第三件事——把它说成「曲线不可得」正是 [P2-1] 要根除的
-            # 那种「一个全局布尔说不清」的口径。
-            why = ("运维总闸 `ai_trade_funding_cost_backtest_enabled` 已关闭"
-                   if not self.settings.ai_trade_funding_cost_backtest_enabled
-                   else "历史资金费曲线不可得" if not self._curve.available
+        if not evidence["enabledRounds"]:
+            return ("本次回测的往返成本估算**不含**资金费（运维总闸已关闭），"
+                    "相对计入资金费的模型更宽松，不得据此为长周期模式背书。")
+        if not visible:
+            why = ("历史资金费曲线不可得" if not self._curve.available
                    else "本次区间没有任何决策轮读到可见的历史结算点")
-            return (f"本次回测的往返成本估算**不含**资金费（{why}），G3 换手迟滞{gate}的判定因此比"
-                    "实盘宽松；持仓越长偏差越大，不得据此为长周期模式背书。")
-        interval_h = float(self._curve.interval_hint or 0.0) / 3600.0
-        periods = funding_periods(
-            query_for_preview(ord_type="market", side="long",
-                              bar_seconds=BAR_SECONDS[self.bar],
-                              funding=self._curve.snapshot_at(self._last_ts or self.end_ts),
-                              funding_enabled=True),
-            backtest_params(self.settings, expected_hold_bars=self._horizon_hold_bars))
-        return (f"本次回测的往返成本估算已含资金费（真实历史曲线，结算周期约 {interval_h:g}h，"
-                f"按目标持仓跨 {periods} 期，覆盖 {self._funding_cost_covered}/"
-                f"{self._funding_cost_rounds} 个决策轮）；G3 换手迟滞{gate}据此判定。")
+            return (f"本次回测的往返成本估算资金费证据缺失（{why}）；"
+                    f"{missing}/{total} 轮缺失，保持开启并降级，未按免费处理。")
+        return ("本次回测的往返成本估算已含资金费（按最近历史间隔估计，"
+                f"覆盖 {visible}/{total} 个决策轮；{degraded} 轮降级，"
+                f"{missing} 轮缺失）；G3 换手迟滞{gate}据此判定，"
+                "历史观察间隔不代表已确认的未来安排。")
 
     def _build_result(self, metrics: dict, ai_stats: dict, notes: list[str]) -> dict:
         equity = [{"ts": e.ts, "equity": round(e.equity, 4), "drawdown": round(e.drawdown, 6)}

@@ -98,7 +98,9 @@ describe("结算来源与证据文案", () => {
   });
 
   it("区分支持的证据版本、旧记录和未来协议", () => {
-    expect(evidenceVersionLabel(3)).toBe("v3");
+    expect(evidenceVersionLabel(2)).toBe("历史证据 v2");
+    expect(evidenceVersionLabel(3)).toBe("历史证据 v3");
+    expect(evidenceVersionLabel(4)).toBe("v4");
     expect(evidenceVersionLabel(null)).toBe("旧记录未提供证据版本");
     expect(evidenceVersionLabel(99)).toBe("此版本证据暂不可读");
     expect(settlementBasisLabel("measured")).toBe("实测");

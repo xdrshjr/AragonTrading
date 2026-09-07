@@ -1512,6 +1512,11 @@ class AiTradeProfitabilityOut(BaseModel):
     `response_model` 会静默吞掉未声明的 wire 键，宽类型可保证后端新增读数时不会被悄悄裁掉。
     """
 
+    schemaVersion: int = 2
+    scope: dict = Field(default_factory=dict)
+    coverage: dict = Field(default_factory=dict)
+    asOfTs: int | None = None
+    snapshotId: str | None = None
     sampleTrips: int
     minTrips: int
     conclusive: bool

@@ -37,6 +37,7 @@ import math
 from dataclasses import dataclass
 
 from .attribution import _t_stat
+from .profitability_sample import ProfitabilityDataset, summarize_coverage
 
 _ROUND_USD = 4
 _ROUND_RATIO = 4
@@ -62,6 +63,7 @@ _VERDICTS: tuple[tuple[str, str], ...] = (
     ("positive_significant", "已实现正期望，且统计显著"),
 )
 VERDICT_TITLES: dict[str, str] = dict(_VERDICTS)
+VERDICT_TITLES["insufficient_evidence"] = "证据不足，不下整体结论"
 
 
 @dataclass(frozen=True)
@@ -72,24 +74,28 @@ class VerdictGates:
     t_threshold: float = 2.0
 
 
-def pooled(trips: list[dict]) -> dict:
+def pooled(trips: list[dict], *, total_trips: int | None = None) -> dict:
     """池化盈利读数（约束 1/2/3）；空样本 ⇒ 全 None + `roundTrips=0`（**不造 0 冒充**）。"""
     total = len(trips)
-    nets = [_finite(t.get("netPnlUsd")) or 0.0 for t in trips]
+    nets = [v for t in trips if (v := _finite(t.get("netPnlUsd"))) is not None]
+    net_count = len(nets)
     wins = [v for v in nets if v > 0]
     losses = [v for v in nets if v <= 0]
     avg_win = (sum(wins) / len(wins)) if wins else None
     avg_loss = (sum(losses) / len(losses)) if losses else None
-    win_rate = (len(wins) / total) if total else None
+    win_rate = (len(wins) / net_count) if net_count else None
     r_values = [v for v in (_finite(t.get("rMultiple")) for t in trips) if v is not None]
     fee_rows = [t for t in trips if t.get("feeKnown")]
     fee_trips = len(fee_rows)
     fee_coverage = (fee_trips / total) if total else None
     median_move = _median([_finite(t.get("moveBps")) for t in trips])
-    median_cost = _median([_finite(t.get("realizedCostBps")) for t in fee_rows])
+    fee_values = [_fee_bps(t) for t in fee_rows]
+    median_cost = _median(fee_values)
+    population = total if total_trips is None else total_trips
     return {
         "roundTrips": total,
-        "netPnlUsd": _round(sum(nets), _ROUND_USD) if total else None,
+        "netSamples": net_count,
+        "netPnlUsd": _round(sum(nets), _ROUND_USD) if net_count else None,
         "grossPnlUsd": _round(sum(_finite(t.get("grossPnlUsd")) or 0.0 for t in trips),
                               _ROUND_USD) if total else None,
         "feeUsd": _round(sum(_finite(t.get("roundTripFeeUsd")) or 0.0 for t in fee_rows),
@@ -98,16 +104,36 @@ def pooled(trips: list[dict]) -> dict:
         "avgWinUsd": _round(avg_win, _ROUND_USD), "avgLossUsd": _round(avg_loss, _ROUND_USD),
         "payoff": _payoff(avg_win, avg_loss),
         "breakevenPayoff": _breakeven_payoff(win_rate),
-        "expectancyUsd": _round(sum(nets) / total, _ROUND_USD) if total else None,
+        "expectancyUsd": _round(sum(nets) / net_count, _ROUND_USD) if net_count else None,
         "expectancyR": _round(sum(r_values) / len(r_values), _ROUND_RATIO) if r_values else None,
         "rSamples": len(r_values),
         "tStat": _t_stat(nets),
         "medianHoldSeconds": _median([_finite(t.get("holdSeconds")) for t in trips]),
         "medianMoveBps": median_move, "medianCostBps": median_cost,
-        "travelToCostRatio": _travel_to_cost(median_move, median_cost, fee_coverage),
+        **_travel_statistics(fee_rows, population),
+        "feeBpsTrips": sum(v is not None for v in fee_values),
+        "feeBpsCoverage": sum(v is not None for v in fee_values) / total if total else None,
+        "moveSamples": sum(_finite(t.get("moveBps")) is not None for t in trips),
+        "holdSamples": sum(_finite(t.get("holdSeconds")) is not None for t in trips),
         "feeCoverage": _round(fee_coverage, _ROUND_RATIO), "feeTrips": fee_trips,
         "costBasisAssumedTrips": sum(1 for t in trips if t.get("costBasisAssumed")),
     }
+
+
+def _fee_bps(trip):
+    return _finite(trip.get("realizedFeeBps", trip.get("realizedCostBps")))
+
+
+def _travel_statistics(fee_rows, population):
+    travel = [t for t in fee_rows if _finite(t.get("moveBps")) is not None
+              and _fee_bps(t) is not None]
+    move = _median([_finite(t.get("moveBps")) for t in travel])
+    fee = _median([_fee_bps(t) for t in travel])
+    coverage = len(travel) / population if population else None
+    return {"travelToCostRatio": _travel_to_cost(move, fee, coverage),
+            "travelComparisonTrips": len(travel),
+            "travelComparisonCoverage": coverage,
+            "travelMedianMoveBps": move, "travelMedianFeeBps": fee}
 
 
 def risk_profile(trips: list[dict]) -> dict:
@@ -123,6 +149,9 @@ def risk_profile(trips: list[dict]) -> dict:
         "withinFifthRShare": (_round(sum(1 for v in r_values if abs(v) < 0.2) / len(r_values),
                                      _ROUND_RATIO) if r_values else None),
         "plannedRrMedian": _median([_finite(t.get("plannedRr")) for t in trips]),
+        "plannedRrSamples": sum(_finite(t.get("plannedRr")) is not None for t in trips),
+        "stopUtilizationSamples": sum(_stop_utilization(t) is not None for t in trips),
+        "stopAtrSamples": len(atr_mults),
         # 「典型交易走完了自己止损距离的百分之几」——D-1 的一句话结论就是这个数。
         "stopUtilizationP50": _median([_stop_utilization(t) for t in trips]),
         "medianStopAtrMult": _median(atr_mults),
@@ -130,40 +159,75 @@ def risk_profile(trips: list[dict]) -> dict:
     }
 
 
-def slice_by(trips: list[dict], key: str) -> list[dict]:
-    """按某个维度分层（六个切片共用）；缺该维度的往返**不计入分母**（而不是计入并填 0）。"""
+def _slice_issues(dataset, key):
+    """只按已知run维度归属问题，不虚构退出来源或置信度。"""
+    if dataset is None:
+        return {}
+    dimensions = {row["runId"]: row for row in dataset.run_dimensions}
+    buckets = {}
+    for issue in dataset.structural_issues:
+        value = dimensions.get(issue["runId"], {}).get(key)
+        if isinstance(value, str) and value.strip() and value != "unknown":
+            buckets.setdefault(value, []).append(issue)
+    return buckets
+
+
+def slice_by(trips: list[dict], key: str, *, dataset=None) -> list[dict]:
+    """六切片都保留 unknown 桶，各行总体与净额子样本分母独立。"""
     buckets: dict[str, list[dict]] = {}
     for trip in trips:
         value = trip.get(key)
-        if value is None or value == "":
-            continue
-        buckets.setdefault(str(value), []).append(trip)
+        name = value if isinstance(value, str) and value.strip() else "unknown"
+        buckets.setdefault(name, []).append(trip)
+    issues = _slice_issues(dataset, key)
+    for name in issues:
+        buckets.setdefault(name, [])
     rows = []
     for name, rows_in in sorted(buckets.items()):
-        stats = pooled(rows_in)
+        eligible = [t for t in rows_in if t.get("netEligible", True)
+                    and _finite(t.get("netPnlUsd")) is not None]
+        stats = pooled(eligible, total_trips=len(rows_in))
+        coverage_rows = [{**t, "netEligible": bool(t.get("netEligible", True)
+                          and _finite(t.get("netPnlUsd")) is not None)} for t in rows_in]
+        coverage = summarize_coverage(ProfitabilityDataset(
+            tuple(coverage_rows), structural_issues=tuple(issues.get(name, ()))))
         rows.append({"key": name, "trips": stats["roundTrips"], "netPnlUsd": stats["netPnlUsd"],
                      "winRate": stats["winRate"], "expectancyUsd": stats["expectancyUsd"],
-                     "medianRMultiple": _median([_finite(t.get("rMultiple")) for t in rows_in])})
+                     "totalTrips": len(rows_in), "netEligibleTrips": len(eligible),
+                     "excludedTrips": len(rows_in) - len(eligible), "coverage": coverage,
+                     "rSamples": stats["rSamples"],
+                     "medianRMultiple": _median([_finite(t.get("rMultiple")) for t in eligible])})
     return rows
 
 
-def slices(trips: list[dict]) -> dict:
+def slices(trips: list[dict], *, dataset=None) -> dict:
     """六个分层切片（键名即 wire 键名）。`byConfidenceBucket` 走冻结桶边界，不按取值散列。"""
     return {
-        "byBar": slice_by(trips, "bar"), "byInstId": slice_by(trips, "instId"),
-        "byExitSource": slice_by(trips, "exitSource"), "byPreset": slice_by(trips, "preset"),
-        "byHorizonProfile": slice_by(trips, "horizonProfile"),
+        "byBar": slice_by(trips, "bar", dataset=dataset),
+        "byInstId": slice_by(trips, "instId", dataset=dataset),
+        "byExitSource": slice_by(trips, "exitSource"),
+        "byPreset": slice_by(trips, "preset", dataset=dataset),
+        "byHorizonProfile": slice_by(trips, "horizonProfile", dataset=dataset),
         "byConfidenceBucket": slice_by([{**t, "confidenceBucket": _bucket_label(t)}
                                         for t in trips], "confidenceBucket"),
     }
 
 
-def verdict(pooled_out: dict, gates: VerdictGates) -> dict:
+def verdict(pooled_out: dict, gates: VerdictGates, coverage: dict | None = None) -> dict:
     """冻结结论表（约束 5）：自上而下取首个命中，`tStat is None` 的两条分支**前置**。"""
     trips = int(pooled_out.get("roundTrips") or 0)
     expectancy = _finite(pooled_out.get("expectancyUsd"))
     t_stat = _finite(pooled_out.get("tStat"))
     code = _verdict_code(trips, expectancy, t_stat, gates)
+    if coverage is not None and (
+        coverage.get("excludedTrips", 0) or coverage.get("structuralIssueCount", 0)
+        or coverage.get("measuredNetTrips") != coverage.get("totalTrips")
+    ):
+        code = "insufficient_evidence"
+        detail = (f"可核算 {coverage['netEligibleTrips']} / 总往返 {coverage['totalTrips']} 笔，"
+                  f"实测净额 {coverage['measuredNetTrips']} 笔；费用或口径证据不足，"
+                  "下列仅为可核算子样本交易净额，不含资金费。")
+        return {"code": code, "title": VERDICT_TITLES[code], "detail": detail}
     return {"code": code, "title": VERDICT_TITLES[code], "detail": _detail(pooled_out, code)}
 
 
@@ -198,9 +262,9 @@ def _detail(pooled_out: dict, code: str) -> str:
 
 
 def _bucket_label(trip: dict) -> str | None:
-    """决策置信度所属的冻结桶；缺 `decisionConfidence` ⇒ None ⇒ 该笔不进这个切片的分母。"""
+    """决策置信度所属的冻结桶；缺失或非法值返回None，归入unknown桶。"""
     value = _finite(trip.get("decisionConfidence"))
-    if value is None:
+    if value is None or not 0 <= value <= 1:
         return None
     for low, high in CONFIDENCE_BUCKETS:
         if low <= value < high or (high >= 1.0 and value >= high):
@@ -269,8 +333,10 @@ def _round(value: float | None, digits: int) -> float | None:
 
 def _finite(value) -> float | None:
     """有限数归一（**保留负号**）：净额为负是一个真实结论，绝不夹到 0。"""
+    if isinstance(value, bool):
+        return None
     try:
         out = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return out if math.isfinite(out) else None

@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass, replace, fields
+from dataclasses import dataclass, replace
+from copy import deepcopy
 
 from .accounting_replay import (TradeAccountingAccumulator,
                                 accounting_event_key, leg_fee_evidence, trade_meta)
+from .profitability_sample import number
 
 from .trip_ledger import (
     PENDING_ESTIMATE_MAX,
@@ -32,6 +34,23 @@ from .trip_ledger import (
 _CAPACITY = 200
 _ROUND_USD = 6
 _ROUND_RATIO = 4
+
+
+def decode_round_estimate(frozen: dict | None) -> RoundEstimate | None:
+    """恢复订单原始估计；缺版本明确为旧版，坏可选字段只形成证据缺口。"""
+    if not isinstance(frozen, dict):
+        return None
+    numeric = {key: number(frozen.get(key)) for key in (
+        "est_edge_bps", "est_cost_bps", "decision_confidence", "as_of_ts", "est_fee_bps")}
+    text = {key: value if isinstance(value := frozen.get(key), str) else None
+            for key in ("edge_source", "cost_confidence", "wake_kind")}
+    versions = {key: value if isinstance(value, int) and not isinstance(value, bool) else None
+                for key, value in (("model_version", frozen.get("model_version", 2)),
+                                   ("comparison_version", frozen.get("comparison_version")))}
+    facts_hash = frozen.get("factsHash", frozen.get("facts_hash"))
+    return RoundEstimate(**numeric, **text, **versions,
+        ord_type=frozen.get("ord_type") if frozen.get("ord_type") in ("market", "limit") else "market",
+        facts_hash=facts_hash if isinstance(facts_hash, str) else None)
 
 # ---- 轴 F（loss-and-liveness-hardening §4.6）：退出裁量权的**只读结论**，无任何门禁 ----
 # `ExitSourceCard` 的文档注释里已经记着与本轮 §2.2 完全一致的观察（「16 次往返、15 次 Agent 主动
@@ -185,15 +204,9 @@ class AttributionLedger:
 
     def _take_estimate(self, trade: dict) -> RoundEstimate | None:
         """优先认领成交保存的冻结估计，再按委托身份、当轮槽回退。"""
-        frozen = trade_meta(trade).get("frozenEstimate")
-        if isinstance(frozen, dict):
-            values = {f.name: frozen[f.name] for f in fields(RoundEstimate)
-                      if f.name in frozen}
-            required = ("est_edge_bps", "est_cost_bps", "edge_source",
-                        "cost_confidence", "decision_confidence", "wake_kind")
-            if all(key in values for key in required):
-                values["facts_hash"] = frozen.get("factsHash", frozen.get("facts_hash"))
-                return RoundEstimate(**values)
+        meta = trade_meta(trade)
+        if "frozenEstimate" in meta:
+            return decode_round_estimate(meta["frozenEstimate"])
         cl_ord_id = trade.get("clOrdId")
         if cl_ord_id and str(cl_ord_id) in self._pending_estimates:
             return self._pending_estimates.pop(str(cl_ord_id))
@@ -222,11 +235,11 @@ class AttributionLedger:
         if key != self._settlement_key:
             self.record_close(trade)
         if self._pending_settlement is not None:
-            snap, closed = self._pending_settlement
+            snap, closed, evidence = self._pending_settlement
             self._pending_settlement = None
             self._last_settled = settle(snap, closed, SettleContext(
                 net_mode=self.net_mode, ct_val=self.ct_val,
-                exit_source=exit_source))
+                exit_source=exit_source, evidence=evidence))
             if self._last_settled is not None:
                 self._settled.append(self._last_settled)
         if self._last_settled is None or key != self._settlement_key:
@@ -256,6 +269,7 @@ class AttributionLedger:
             return None
         total = len(trips)
         r_values = [t.r_multiple for t in trips if t.r_multiple is not None]
+        paired_errors = [t.fee_error_bps for t in trips if number(t.fee_error_bps) is not None]
         return {
             "trips": total,
             "medianMoveBps": _median([t.move_bps for t in trips]),
@@ -268,7 +282,11 @@ class AttributionLedger:
                                        _ROUND_RATIO) if r_values else None),
             "medianStopAtrMult": _median([t.stop_atr_mult for t in trips]),
             "edgeErrorMedianBps": _median([t.edge_error_bps for t in trips]),
-            "costErrorMedianBps": _median([t.cost_error_bps for t in trips]),
+            "costErrorMedianBps": None,
+            "feeErrorMedianBps": _median(paired_errors),
+            "feeComparisonTrips": len(paired_errors),
+            "feeComparisonCoverage": round(len(paired_errors) / total, _ROUND_RATIO),
+            "costComparisonBasis": "fees", "comparisonVersion": 1,
             # 两个分母就是「所有新读数都必须带 coverage」这条产品级不变式的落地。
             "estimateCoverage": round(sum(1 for t in trips if t.est_edge_bps is not None)
                                       / total, _ROUND_RATIO),
@@ -317,7 +335,12 @@ class AttributionLedger:
                 "price": result["exitPrice"],
                 "pnl": net if self.net_mode else gross, "feeKnown": True,
                 "feeBasis": "estimated", "feeCurrency": "USDT"}
-            self._pending_settlement = (snap, closed)
+            evidence = {"feeSources": deepcopy(result.get("feeSources", [])),
+                "closeEvidenceFlags": deepcopy(result.get("closeEvidenceFlags", [])),
+                "closeMeta": deepcopy(result.get("closeMeta", trade_meta(result["closeTrade"]))),
+                "totals": {key: result.get(key) for key in (
+                    "grossPnlUsd", "feeUsd", "tradingNetUsd")}}
+            self._pending_settlement = (snap, closed, evidence)
 
     def last_close_net_usd(self) -> float | None:
         """最近一笔平仓成交的**净额**盈亏（`record_close` 那一份），一笔都没有 ⇒ `None`。
@@ -349,9 +372,11 @@ class AttributionLedger:
                 result = self.accounting.last_result or {}
                 # 结构全平即推进；缺费不改变仓位边界，部分腿仍属同仓。
                 if result.get("complete") and not result.get("duplicate"):
+                    self.settle_close(trade, exit_source=trade_meta(trade).get("exitSource") or "unknown")
                     seq += 1
         self._last_settled = None
         self._last_close_net = None
+        self._pending_settlement = None
         return self.accounting.snapshot()
 
     def note_gate(self, status: str, *, cost_bps: float | None = None,

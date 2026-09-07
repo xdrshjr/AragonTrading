@@ -179,3 +179,50 @@ def test_startup_charter_uses_the_same_assembly_path_as_the_round_section():
                               allow_limit=True)
     assert "Lv1" in text and "交易所官方接口" in text
     assert "开仓腿 4.0" in text  # 普通限价采用官方 taker 档位。
+
+
+@pytest.mark.parametrize("source,known,interval,phrase,periods", [
+    ("historical_observed", False, 3600, "按最近历史间隔估计 1h", 24),
+    ("unknown", False, -1, "周期未知、按模型回落间隔估计 8h", 3),
+    ("exchange_schedule", True, 3600, "当前安排 1h", 24),
+    ("unknown", True, 3600, "周期值可用、来源未记录（1h）", 24),
+])
+def test_funding_interval_text_matches_actual_calculation(
+        source, known, interval, phrase, periods):
+    from app.ai_auto.cost_model import (
+        CostParams, CostQuery, cost_wire, estimate_round_trip_cost,
+    )
+    cost = estimate_round_trip_cost(CostQuery(
+        "market", "long", 3600, funding_rate=0.0001,
+        funding_interval_s=interval, funding_interval_known=known,
+        funding_interval_source=source), CostParams(2, 5, 1, 0, 24))
+    view = build_cost_view(
+        cost, fee_snapshot=None, ord_type="market", side="long",
+        position=None, last_px=100, atr_px=None, session_fee_usd=0,
+        net_basis=True)
+    assert cost.funding_periods == periods
+    assert cost.funding_carry_bps == periods
+    assert phrase in format_cost_charter(view)
+    for key in ("fundingIntervalSource", "fundingAssumedIntervalS"):
+        assert view[key] == cost_wire(cost)[key]
+
+
+def test_disabled_funding_discloses_no_fictional_period():
+    from app.ai_auto.cost_model import (
+        CostParams, CostQuery, estimate_round_trip_cost,
+    )
+    from app.ai_auto.cost_text import _funding_periods_clause
+    cost = estimate_round_trip_cost(CostQuery(
+        "market", "long", 3600, funding_rate=1, funding_enabled=False),
+        CostParams(2, 5, 1, 0, 24))
+    assert cost.funding_carry_bps == 0
+    assert _funding_periods_clause({"fundingPeriods": cost.funding_periods}) == ""
+
+
+@pytest.mark.parametrize("carry", [0, None])
+def test_zero_or_missing_rate_still_discloses_unknown_interval(carry):
+    view = _view(fundingCarryBps=carry, fundingPeriods=24,
+                 fundingIntervalS=None,
+                 fundingIntervalSource="historical_observed",
+                 fundingAssumedIntervalS=3600)
+    assert "按最近历史间隔估计 1h" in format_cost_charter(view)

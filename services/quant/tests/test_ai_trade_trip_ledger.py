@@ -4,6 +4,8 @@ from __future__ import annotations
 import ast
 import pathlib
 
+import pytest
+
 from app.ai_auto.attribution import AttributionLedger
 from app.ai_auto.exit_attribution import ExitLedger
 from app.ai_auto.trip_ledger import (
@@ -145,3 +147,82 @@ def test_stop_atr_mult_uses_the_open_moment_atr():
     without = settle(_snap(atr_px=float("nan")), _close(pnl=.1, ts=2),
                      SettleContext(net_mode=True, ct_val=0.01))
     assert without.stop_atr_mult is None
+
+
+@pytest.mark.parametrize("middle_basis,expected", [
+    ("measured", "measured"), ("estimated", "estimated")])
+def test_two_opens_three_closes_keep_all_original_fee_sources(middle_basis, expected):
+    """合成汇总腿不能丢失中间来源，也不能使全实测退化。"""
+    ledger = AttributionLedger(ct_val=1)
+    ledger.note_open(_open(id=1, qty=2, fee=.2), seq=1)
+    ledger.note_open(_open(id=2, qty=1, fee=.1), seq=1)
+    for identifier in (3, 4, 5):
+        ledger.settle_close(_close(id=identifier, qty=1, fee=.1, pnl=1,
+            positionAfter=5 - identifier,
+            feeBasis=middle_basis if identifier == 4 else "measured"))
+    trip = ledger.last_settled()
+    assert getattr(trip, "fee_measurement", None) == expected
+    assert ledger.accounting.completed_trips[0]["feeSources"] == (
+        ["estimated", "measured"] if middle_basis == "estimated" else ["measured"])
+
+
+def test_open_source_union_preserves_unknown_legacy_snapshot():
+    from dataclasses import replace
+    snap = _snap()
+    assert getattr(snap, "fee_sources", None) == ("measured",)
+    mixed = merge_open_leg(snap, _open(feeBasis="estimated"), 1)
+    assert set(mixed.fee_sources) == {"measured", "estimated"}
+    legacy = replace(snap, fee_sources=())
+    trip = settle(legacy, _close(), SettleContext(net_mode=False, ct_val=1))
+    assert trip.fee_measurement == "unknown"
+
+
+def _official_meta(fee, gross=0):
+    return {"settlementSource": "exchange", "epochKey": "epoch",
+        "settlementKey": "settlement", "exchangeFeeUsd": fee,
+        "exchangeGrossPnlUsd": gross, "settlementValidation": {
+            "status": "matched", "amountCoverage": "complete",
+            "epochKey": "epoch", "settlementKey": "settlement"}}
+
+
+def test_tiny_fee_certification_uses_unrounded_totals():
+    """0.0000004 舍入成零之前须认证；1e-8 容差不能由展示精度决定。"""
+    snap = _snap(fee=.0000002, feeBasis="estimated")
+    trip = settle(snap, _close(fee=.0000002, pnl=0,
+        explain={"meta": _official_meta(.0000004)}),
+        SettleContext(net_mode=False, ct_val=.01))
+    assert getattr(trip, "fee_measurement", None) == "measured"
+    assert trip.fee_usd == 0.0
+
+
+@pytest.mark.parametrize("broken", ["empty_identity", "mismatch", "empty_sources"])
+def test_official_fee_requires_nonempty_identity_and_matching_amounts(broken):
+    from dataclasses import replace
+    snap = _snap(fee=.1, feeBasis="estimated")
+    meta = _official_meta(.2)
+    if broken == "empty_identity":
+        meta["epochKey"] = meta["settlementKey"] = None
+        meta["settlementValidation"].update(epochKey=None, settlementKey=None)
+    elif broken == "mismatch":
+        meta["exchangeFeeUsd"] = .3
+    else:
+        snap = replace(snap, fee_sources=())
+    trip = settle(snap, _close(fee=.1, pnl=0, explain={"meta": meta}),
+        SettleContext(net_mode=False, ct_val=.01))
+    assert getattr(trip, "fee_measurement", None) != "measured"
+
+
+@pytest.mark.parametrize("official_gross,expected", [(None, False), (3, True), (4, False)])
+def test_middle_local_mark_requires_full_official_gross_coverage(official_gross, expected):
+    ledger = AttributionLedger(ct_val=1)
+    ledger.note_open(_open(id=1, qty=3, fee=.3), seq=1)
+    for identifier in (2, 3, 4):
+        meta = {"settlementSource": "local_mark", "pnlBasis": "estimated"}
+        if identifier != 3:
+            meta = {"settlementSource": "exchange"}
+        if identifier == 4 and official_gross is not None:
+            meta = _official_meta(.6, official_gross)
+        ledger.settle_close(_close(id=identifier, qty=1, fee=.1, pnl=1,
+            positionAfter=4 - identifier, explain={"meta": meta}))
+    trip = ledger.last_settled()
+    assert getattr(trip, "measured_net_eligible", None) is expected

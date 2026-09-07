@@ -228,6 +228,12 @@ async def test_g21_route_order_profitability_is_not_swallowed_by_group_id():
     body = res.json()
     assert "pooled" in body and "verdict" in body
     assert "members" not in body and "groupId" not in body      # 详情的形状一个都不该出现
+    assert body["schemaVersion"] == 2
+    assert body["coverage"]["totalTrips"] == body["sampleTrips"] == 1
+    assert body["scope"]["basis"] == "trading_net_ex_funding"
+    assert body["scope"]["sinceField"] == "group_started_ts_or_start_ts"
+    assert body["snapshotId"] and body["asOfTs"]
+    assert body["calibration"]["costModel"]["medianErrorBps"] is None
 
 
 async def test_endpoint_returns_full_shape_even_with_no_history():
@@ -239,6 +245,9 @@ async def test_endpoint_returns_full_shape_even_with_no_history():
     body = res.json()
     assert res.status_code == 200 and body["sampleTrips"] == 0
     assert body["verdict"]["code"] == "insufficient_samples"
+    assert body["coverage"]["totalTrips"] == 0
+    assert body["coverage"]["netCoverage"] is None
+    assert body["calibration"]["costModel"]["coverage"] is None
     assert set(body["calibration"]) == {"edgeNumerator", "costModel", "confidenceReliability"}
 
 

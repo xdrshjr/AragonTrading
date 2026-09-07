@@ -555,39 +555,11 @@ class TripQuery:
 
 
 async def load_profitability_trips(session: AsyncSession, query: TripQuery) -> list[dict]:
-    """全部 ai-trade run 的往返样本（逐 run 分桶 → `_pair_round_trips` → 并入 explain.meta 结算键）。
+    """兼容旧调用方的净额子集；正式总体统计读取完整 dataset。"""
+    from .ai_profitability_repositories import load_profitability_dataset
 
-    **货币类键的唯一权威是追溯复算**（[P0-3]）：`netPnlUsd` / `grossPnlUsd` / `roundTripFeeUsd` /
-    `notionalUsd` / `rMultiple` / `moveBps` 六键一律由本层按 `_Trip` + `_run_cost_basis` 现算；
-    `meta` 里的同名键**只用于成交行展示**。理由：这六个键在两条路径上都算得出来，而「两条路径各算
-    一份」正是本仓库反复出事的形状——必须**先定权威、再谈对拍**。
-    `estEdgeBps` / `estCostBps` / `edgeSource` / `costConfidence` / `decisionConfidence` /
-    `wakeKind` / `stopAtrMult` 七键则**只有 `meta` 一个来源**（追溯不可得）。
-
-    **单一配对真源**：必须复用 `_pair_round_trips`（它的排序键是 `trades.id` 而非 `ts`，那条坑
-    已经踩过一次），不得另写配对。
-
-    `unitUsd` 的代数抵消是关键实现技巧：`ctVal` 不在 `trades` 表里，但
-    `grossPnl = ±(exitPx − entryPx) × qty × ctVal` ⇒ `qty × ctVal = |grossPnl| / |Δpx|`。
-    它必须与实盘结算路径产出**同一个** `notionalUsd`（G-6 双向对拍，相对误差 < 1e-6）。
-    """
-    runs = (await session.execute(
-        select(StrategyRun).where(StrategyRun.mode == _AI_TRADE_MODE)
-        .order_by(StrategyRun.id.asc()))).scalars().all()
-    runs = [r for r in runs if _run_matches(r, query)]
-    if not runs:
-        return []
-    trades_by_run = await _load_trades_by_run(session, [r.id for r in runs])
-    out: list[dict] = []
-    for run in runs:
-        cfg = _load_config(run.config_json)
-        basis, assumed = _run_cost_basis(cfg)
-        dims = _run_dimensions(run, cfg, assumed)
-        for trip in _pair_round_trips(trades_by_run.get(run.id, []), basis):
-            row = _trip_row(trip, dims)
-            if row is not None and _row_matches(row, query):
-                out.append(row)
-    return out
+    dataset = await load_profitability_dataset(session, query)
+    return [row for row in dataset.samples if row["netEligible"]]
 
 
 def _run_matches(run: StrategyRun, query: TripQuery) -> bool:
@@ -618,123 +590,6 @@ def _run_dimensions(run: StrategyRun, cfg: dict, assumed: bool) -> dict:
             "preset": stats.get("disciplinePreset") or "unknown",
             "horizonProfile": (horizon.get("profile") if isinstance(horizon, dict) else None),
             "costBasisAssumed": bool(assumed)}
-
-
-def _trip_row(trip: _Trip, dims: dict) -> dict | None:
-    """一笔往返的归一 dict（轴 B/C 纯核心的输入）；价不可用 ⇒ None（不产出一个算不出分母的样本）。"""
-    if dims.get("costBasisAssumed"):
-        return None
-    if trip.economics is not None and trip.economics["coverage"] != "complete":
-        return None
-    entry_px = float(trip.entry.price or 0.0)
-    exit_px = float(trip.exit.price or 0.0)
-    if entry_px <= 0 or exit_px <= 0:
-        return None
-    net, gross = trip.net_pnl, trip.gross_pnl
-    move = abs(exit_px - entry_px)
-    # `unitUsd = qty × ctVal`：位移为 0 或毛额为 0 的往返算不出来（实测 193 笔里仅 2 笔）。
-    unit = (abs(gross) / move) if (move > 0 and gross != 0) else None
-    notional = entry_px * unit if unit else None
-    fee = float(trip.leg_fee_usd or 0.0)
-    fee_known = _fee_known(trip)
-    stop_px = trip.entry.stop_loss_price
-    stop_distance = abs(entry_px - float(stop_px)) if stop_px else 0.0
-    risk = (stop_distance * unit) if (unit and stop_distance > 0) else None
-    meta = _trip_meta(trip)
-    gross_bps = (gross / notional * 1e4) if notional else None
-    cost_bps = (fee / notional * 1e4) if (notional and fee_known) else None
-    return {
-        **dims,
-        "netPnlUsd": net, "grossPnlUsd": gross,
-        "roundTripFeeUsd": fee if fee_known else None, "feeKnown": fee_known,
-        "notionalUsd": notional,
-        "moveBps": move / entry_px * 1e4,
-        "stopBps": (stop_distance / entry_px * 1e4) if stop_distance > 0 else None,
-        "realizedGrossBps": gross_bps,
-        "realizedNetBps": (net / notional * 1e4) if notional else None,
-        "realizedCostBps": cost_bps,
-        "riskUsd": risk, "rMultiple": (net / risk) if risk else None,
-        "plannedRr": _planned_rr(trip, entry_px, stop_distance),
-        "holdSeconds": _trip_hold_seconds(trip),
-        # [P1-1] `exitSource` **只读** `explain.meta` 那唯一一处打的标；查询侧同样不得另判。
-        "exitSource": str(meta.get("exitSource") or "unknown"),
-        "stopAtrMult": meta.get("stopAtrMult"),
-        "estEdgeBps": meta.get("estEdgeBps"), "estCostBps": meta.get("estCostBps"),
-        # 两条误差是**派生量**：分子取本层现算的已实现 bps（货币类键的权威在本层），分母侧的估计
-        # 只有 `meta` 一个来源。缺估计 ⇒ None ⇒ 该笔不进轴 C 的分母（而不是按 0 计入）。
-        "edgeErrorBps": _error_bps(gross_bps, meta.get("estEdgeBps")),
-        "costErrorBps": _error_bps(cost_bps, meta.get("estCostBps")),
-        "edgeSource": meta.get("edgeSource"), "costConfidence": meta.get("costConfidence"),
-        "decisionConfidence": meta.get("decisionConfidence"), "wakeKind": meta.get("wakeKind"),
-    }
-
-
-def _fee_known(trip: _Trip) -> bool:
-    """费用已知与否逐腿读取来源证据，保留合法零与返佣。"""
-    if trip.economics is not None:
-        return trip.economics.get("feeUsd") is not None
-    from ..ai_auto.accounting_replay import leg_fee_evidence
-    return all(leg_fee_evidence(_accounting_trade(leg))[0] is not None
-               for leg in (trip.entry, trip.exit))
-
-
-def _error_bps(realized: float | None, estimate) -> float | None:
-    """`已实现 − 估计`；任一缺席 / 非有限 ⇒ `None`。"""
-    if realized is None or estimate is None:
-        return None
-    try:
-        value = float(estimate)
-    except (TypeError, ValueError):
-        return None
-    return realized - value if value == value else None
-
-
-def _planned_rr(trip: _Trip, entry_px: float, stop_distance: float) -> float | None:
-    take_px = trip.entry.take_profit_price
-    if not take_px or stop_distance <= 0:
-        return None
-    return abs(float(take_px) - entry_px) / stop_distance
-
-
-def _trip_meta(trip: _Trip) -> dict:
-    """平仓腿 `explain_json` 的 `meta`（坏 JSON / 缺列 ⇒ `{}`，与既有 `run_out` 容错一致）。"""
-    envelope = _load_config(getattr(trip.exit, "explain_json", None))
-    meta = envelope.get("meta")
-    return meta if isinstance(meta, dict) else {}
-
-
-def _leg_wall_ts(trade: Trade) -> int | None:
-    """某一腿的真实墙钟秒（`explain_json.meta.wallTs`）；缺键 / 坏 JSON / 非正数 ⇒ None。"""
-    meta = _load_config(getattr(trade, "explain_json", None)).get("meta")
-    if not isinstance(meta, dict):
-        return None
-    try:
-        wall = int(meta.get("wallTs") or 0)
-    except (TypeError, ValueError):
-        return None
-    return wall if wall > 0 else None
-
-
-def _trip_hold_seconds(trip: _Trip) -> int:
-    """往返持仓秒数：**逐腿**取 `wallTs ?? ts`，与前端 `autoTradePnl` 同一条规则。
-
-    `trades.ts` 被 `_align_bar_ts` 吸附到 K 线开盘秒，1H 周期下一笔 20 分钟的往返会被算成 0
-    或整根 bar（spec D3）。逐腿回退是安全的、而不是听天由命：`executor._make_trade` 里「吸附
-    `ts`」与「写 `wallTs`」由**同一个** `bar_seconds > 0` 判据控制，故缺 `wallTs` 的 executor
-    腿其 `ts` 本就是墙钟；唯一的非 executor 写点 `resume._offline_exit_trade` 也只写墙钟秒
-    （交易所 `uTime`，已归一到秒）。**绝不能写成「双腿全有才用墙钟」**——`offline_exit` 平仓腿
-    永远没有 `wallTs`，那条规则会让这类往返退回「墙钟 − bar 对齐」，恰好是它想避免的混用，
-    而且与前端读出两个不同的数。
-
-    两腿都缺 `wallTs` 时是 best-effort 回退（口径可能混合，见 `_pair_round_trips` 的既有说明），
-    但它在所有既有写路径上都不劣于修改前的值：老数据两腿同为吸附秒，逐值与修改前相同。
-
-    负差压 0 沿用既有 `max(0, ...)`：真实的往返不会先平后开，出现负差即数据异常，报 0 比报一个
-    负持仓时长诚实。
-    """
-    entry = _leg_wall_ts(trip.entry) or int(trip.entry.ts or 0)
-    exit_ = _leg_wall_ts(trip.exit) or int(trip.exit.ts or 0)
-    return max(0, exit_ - entry)
 
 
 async def reconcile_orphan_ai_trade_runs(session: AsyncSession, *,

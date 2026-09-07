@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import CalibrationCard from "./CalibrationCard";
 import ProfitabilityCard from "./ProfitabilityCard";
@@ -22,6 +22,9 @@ const RESPONSE: AiTradeProfitabilityResponse = {
     breakevenPayoff: 1.474, expectancyUsd: -0.0384, expectancyR: -0.011, rSamples: 191,
     tStat: -1.446, medianHoldSeconds: 1271, medianMoveBps: 13.9, medianCostBps: 7.01,
     travelToCostRatio: 1.98, feeCoverage: 0.1088, feeTrips: 21, costBasisAssumedTrips: 172,
+    moveSamples: 193, travelComparisonTrips: 21,
+    travelComparisonCoverage: 0.1088,
+    travelMedianMoveBps: 13.9, travelMedianFeeBps: 7.01,
   },
   risk: {
     rSamples: 191, rP10: -0.053, rP50: -0.011, rP90: 0.063, reachedOneRShare: 0,
@@ -85,13 +88,13 @@ describe("ProfitabilityCard", () => {
     renderCard(<ProfitabilityCard />);
     const row = await screen.findByTestId("ai-profitability-travel");
     expect(row).toHaveTextContent("1.98×");
-    expect(row).toHaveTextContent("21 笔带费率记录");
+    expect(row).toHaveTextContent("21 笔同笔尺度");
     expect(row).toHaveTextContent("10.9%");
   });
 
   it("每个 KPI 都带着它自己的分母", async () => {
     renderCard(<ProfitabilityCard />);
-    expect(await screen.findByText("已实现净额（193 笔）")).toBeInTheDocument();
+    expect(await screen.findByText("交易净额（193 笔，不含资金费）")).toBeInTheDocument();
     expect(screen.getByText("R 中位（191 笔可算）")).toBeInTheDocument();
     expect(screen.getByText("赔率 / 盈亏平衡")).toBeInTheDocument();
     expect(screen.getByText("1.014 / 需 1.474")).toBeInTheDocument();
@@ -160,11 +163,95 @@ describe("CalibrationCard", () => {
   it("成本块的分母注解上屏（「未记录」不等于「零费率」）", async () => {
     renderCard(<CalibrationCard />);
     expect(await screen.findByText(/只有 21 笔带费率记录/)).toBeInTheDocument();
-    expect(screen.getByText("模型常数：13.0 bps")).toBeInTheDocument();
+    expect(screen.getByText("当前配置总成本预览，非历史预测：13.0 bps")).toBeInTheDocument();
   });
 
   it("桶全空时不宣称单调性", async () => {
     renderCard(<CalibrationCard />);
     expect(await screen.findByText(/并非每个区间都有足够样本/)).toBeInTheDocument();
+  });
+});
+
+describe("总体覆盖与缺口", () => {
+  const excluded = {
+    totalTrips: 3, netEligibleTrips: 0, measuredNetTrips: 0,
+    excludedTrips: 3, netCoverage: 0, feeTrips: 0, feeCoverage: 0,
+    notionalKnownTrips: 3, notionalDerivedTrips: 0,
+    structuralIssueCount: 0, openEpochCount: 0,
+    excludedByReason: { economics_incomplete: 3 },
+  };
+
+  it("全部排除仍保留净额未知与所有标的行", async () => {
+    fetchMock.mockResolvedValue({ ...RESPONSE, schemaVersion: 2,
+      sampleTrips: 0, pooled: { ...RESPONSE.pooled, roundTrips: 0,
+        netPnlUsd: null }, coverage: { ...excluded,
+        byInstId: ["BTC", "ETH", "SOL"].map((instId) => ({
+          ...excluded, instId, totalTrips: 1, excludedTrips: 1,
+          excludedByReason: { economics_incomplete: 1 },
+        })),
+      },
+    });
+    renderCard(<ProfitabilityCard />);
+    const card = await screen.findByTestId("ai-profitability-card");
+    expect(card).toHaveTextContent("可核算 0 / 总往返 3");
+    expect(card).toHaveTextContent("实测净额 0 / 3");
+    expect(card).toHaveTextContent("费用或口径证据不足");
+    expect(screen.getByTestId("ai-profitability-net")).toHaveTextContent("—");
+    const expand = screen.getByRole("button", { name: /覆盖明细/ });
+    expand.focus();
+    expect(expand).toHaveFocus();
+    fireEvent.click(expand);
+    expect(expand).toHaveAttribute("aria-expanded", "true");
+    for (const instId of ["BTC", "ETH", "SOL"])
+      expect(screen.getByRole("cell", { name: instId })).toBeInTheDocument();
+    expect(card).toHaveTextContent("经济证据不完整");
+  });
+
+  it("旧后端不推定总体覆盖完整", async () => {
+    renderCard(<ProfitabilityCard />);
+    expect(await screen.findByText("旧版未提供总体覆盖"))
+      .toBeInTheDocument();
+  });
+
+  it("估算可核算也明确含估算", async () => {
+    fetchMock.mockResolvedValue({ ...RESPONSE, schemaVersion: 2,
+      coverage: { ...excluded, netEligibleTrips: 3, excludedTrips: 0,
+        measuredNetTrips: 1, netCoverage: 1, byInstId: [] } });
+    renderCard(<ProfitabilityCard />);
+    expect(await screen.findByText(/金额含估算/)).toBeInTheDocument();
+  });
+
+  it("无往返但有结构异常仍提供原因", async () => {
+    fetchMock.mockResolvedValue({ ...RESPONSE, schemaVersion: 2,
+      sampleTrips: 0, coverage: { ...excluded, totalTrips: 0,
+        excludedTrips: 0, structuralIssueCount: 1, byInstId: [],
+        structuralIssues: [{ runId: 1, eventKey: "close", reason: "missing_open" }],
+      } });
+    renderCard(<ProfitabilityCard />);
+    const button = await screen.findByRole("button", { name: /覆盖明细/ });
+    fireEvent.click(button);
+    expect(screen.getByText(/孤立平仓/)).toBeInTheDocument();
+  });
+
+  it("取数错误可重试且不伪装成无历史", async () => {
+    fetchMock.mockRejectedValueOnce(new Error("offline"));
+    renderCard(<ProfitabilityCard />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("取数失败");
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByTestId("ai-profitability-card")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("分层切片保留服务端总体和排除数", async () => {
+    fetchMock.mockResolvedValue({ ...RESPONSE, schemaVersion: 2,
+      slices: { ...RESPONSE.slices, byInstId: [{ key: "ETH-USDT-SWAP",
+        trips: 0, totalTrips: 3, netEligibleTrips: 0, excludedTrips: 3,
+        netPnlUsd: null, winRate: null, medianRMultiple: null,
+      }] },
+    });
+    renderCard(<ProfitabilityCard />);
+    fireEvent.click(await screen.findByRole("button", { name: /分层切片/ }));
+    expect(screen.getByTestId("ai-profitability-card"))
+      .toHaveTextContent("ETH-USDT-SWAP · 可核算 0 / 总往返 3 笔 · 未纳入 3 笔");
   });
 });

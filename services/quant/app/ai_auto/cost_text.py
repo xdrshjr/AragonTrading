@@ -70,23 +70,34 @@ def format_cost_charter(view: dict | None) -> str:
 def _funding_clause(view: dict) -> str:
     """资金费子句；缺数据（`None`）⇒ 如实说明未计入，**绝不按 0 计**。"""
     carry = view.get("fundingCarryBps")
+    periods_clause = _funding_periods_clause(view)
     if carry is None:
-        return "（资金费率暂未取到，未计入；实际支出或收入暂不可得）"
-    return f"，另含预估资金费 {carry} bps{_funding_periods_clause(view)}" if carry else ""
+        return ("（资金费率暂未取到，未计入；实际支出或收入暂不可得）"
+                + periods_clause)
+    if not carry and not periods_clause:
+        return ""
+    return f"，另含预估资金费 {carry} bps{periods_clause}"
 
 
 def _funding_periods_clause(view: dict) -> str:
-    """资金费**期数**披露（holding-horizon §2.7）；期数缺失 ⇒ 空串（不写噪音）。
-
-    OKX 的结算周期由 `nextFundingTs − fundingTs` 得出、会动态变为 1/2/4/8 小时，故取不到时**绝不**
-    写成一个确定的数——如实写「结算周期未知，按 8h 保守估算」。
-    """
+    """按 wire 的实际间隔与来源披露期数；关闭或旧版缺键返回空串。"""
     periods = view.get("fundingPeriods")
     if not periods:
         return ""
     interval = view.get("fundingIntervalS")
-    detail = ("结算周期未知，按 8h 保守估算" if interval is None
-              else f"当前结算周期 {float(interval) / 3600:g}h，实际以交易所为准")
+    source = view.get("fundingIntervalSource", "unknown")
+    assumed = view.get("fundingAssumedIntervalS")
+    if source == "exchange_schedule" and interval is not None:
+        detail = f"当前安排 {float(interval) / 3600:g}h，实际以交易所为准"
+    elif source == "historical_observed" and assumed is not None:
+        detail = f"按最近历史间隔估计 {float(assumed) / 3600:g}h"
+    elif interval is not None:
+        detail = f"周期值可用、来源未记录（{float(interval) / 3600:g}h）"
+    elif assumed is not None:
+        detail = ("周期未知、按模型回落间隔估计 "
+                  f"{float(assumed) / 3600:g}h")
+    else:
+        detail = "周期未知、回落间隔未记录"
     return f"（按目标持仓预计跨 {int(periods)} 个资金费结算点；{detail}）"
 
 

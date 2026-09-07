@@ -245,7 +245,7 @@ def test_frozen_round_fee_inputs_do_not_change_during_model_wait():
     same = runtime.estimate_preview_cost(
         ord_type="limit", side="long", bar_seconds=900)
     assert cost == same
-    assert runtime.round_cost_wire()["modelVersion"] == 2
+    assert runtime.round_cost_wire()["modelVersion"] == 3
     runtime.begin_round_cost({"bar_seconds": 900})
     changed = runtime.estimate_preview_cost(
         ord_type="limit", side="long", bar_seconds=900)

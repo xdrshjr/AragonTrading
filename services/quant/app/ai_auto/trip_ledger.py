@@ -19,8 +19,7 @@
 5. **结算失败恒返回 None 且绝不抛**：本模块跑在真实资金成交的落库路径上（`_dispatch` →
    `_persist_trade`），任何异常都会中断成交落库。全部计算包在 `_finite()` 归一里，**无 `raise`
    语句**（用例 G-4 用 AST 断言）。
-6. **`trip_meta_wire` 的键一律「算不出即省略」**，不是 `None`——缺键与 `null` 在老数据上必须表现
-   一致，且省略键让 `explain_json` 在低价值往返上不膨胀。
+6. **`trip_meta_wire` 未知数值省略**；旧 `costErrorBps` 固定 null，防止旧客户端继续混比总成本。
 7. **`exit_source` 只读、不判**：必须取 `explain["meta"]["exitSource"]`，那是
    `session._inject_explain_meta` 打的**唯一**标且受 `ai_trade_exit_attribution_enabled` 门控。
    本模块**绝不自己调 `classify_live`**：那会造出第二个分类现场（违反 `exit_attribution.py:11-14`
@@ -34,7 +33,10 @@ import math
 from dataclasses import dataclass
 
 from .profit_guard import sanitize_atr
-from .accounting_replay import leg_fee_evidence, trade_meta
+from .accounting_replay import close_evidence_flags, leg_fee_evidence, trade_meta
+from .profitability_sample import (
+    classify_fee_measurement, has_fee_comparison_basis, is_measured_net_evidence,
+)
 from .trade_economics import TripPnlInputs, resolve_trip_economics
 
 _ROUND_BPS = 4
@@ -55,9 +57,11 @@ class RoundEstimate:
     decision_confidence: float | None
     wake_kind: str | None
     ord_type: str = "market"         # market | limit
-    model_version: int = 2
+    model_version: int | None = 3
     as_of_ts: float | None = None
     facts_hash: str | None = None
+    est_fee_bps: float | None = None
+    comparison_version: int | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +81,7 @@ class OpenSnapshot:
     take_px: float | None = None
     atr_px: float | None = None
     estimate: RoundEstimate | None = None
+    fee_sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,7 @@ class SettleContext:
     net_mode: bool
     ct_val: float
     exit_source: str = "unknown"
+    evidence: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -121,6 +127,14 @@ class SettledTrip:
     wake_kind: str | None = None
     edge_error_bps: float | None = None
     cost_error_bps: float | None = None
+    est_fee_bps: float | None = None
+    realized_fee_bps: float | None = None
+    fee_error_bps: float | None = None
+    comparison_version: int | None = None
+    cost_comparison_basis: str = "fees"
+    fee_measurement: str = "unknown"
+    measured_net_eligible: bool = False
+    model_version: int | None = None
 
 
 def build_round_estimate(out, decision, wake_kind: str | None) -> RoundEstimate | None:
@@ -132,7 +146,16 @@ def build_round_estimate(out, decision, wake_kind: str | None) -> RoundEstimate 
         return None
     # `EdgeGateOutcome` 只有 `cost_bps` / `edge_bps` 两个标量字段，来源与置信度住在 `wire`
     # （`edge_gate.py:230-242`）——**不要凭记忆去读 `out.edge.source`，那两个属性不存在**。
-    wire = getattr(out, "wire", None) or {}
+    wire = getattr(out, "wire", None)
+    wire = wire if isinstance(wire, dict) else {}
+    cost = wire.get("cost")
+    cost = cost if isinstance(cost, dict) else {}
+    fee_open = _finite(cost.get("feeOpenBps"))
+    fee_close = _finite(cost.get("feeCloseBps"))
+    fee = (_finite(fee_open + fee_close)
+           if fee_open is not None and fee_close is not None else None)
+    version = cost.get("modelVersion", 2)
+    version = version if isinstance(version, int) and not isinstance(version, bool) else None
     return RoundEstimate(
         est_edge_bps=_finite(getattr(out, "edge_bps", None)),
         est_cost_bps=_finite(getattr(out, "cost_bps", None)),
@@ -140,7 +163,9 @@ def build_round_estimate(out, decision, wake_kind: str | None) -> RoundEstimate 
         cost_confidence=_text(wire.get("costConfidence")),
         decision_confidence=_finite(getattr(decision, "confidence", None)),
         wake_kind=_text(wake_kind),
-        ord_type=_text(getattr(decision, "ord_type", None)) or "market")
+        ord_type=_text(getattr(decision, "ord_type", None)) or "market",
+        model_version=version, est_fee_bps=fee,
+        comparison_version=1 if fee is not None else None)
 
 
 def open_snapshot(trade: dict, *, seq: int, now_wall: float, atr_px: float | None,
@@ -158,7 +183,8 @@ def open_snapshot(trade: dict, *, seq: int, now_wall: float, atr_px: float | Non
         open_fee_usd=fee, open_fee_known=fee_known,
         stop_px=_positive(trade.get("stopLossPrice")),
         take_px=_positive(trade.get("takeProfitPrice")),
-        atr_px=sanitize_atr(atr_px), estimate=estimate)
+        atr_px=sanitize_atr(atr_px), estimate=estimate,
+        fee_sources=(leg_fee_evidence(trade)[1],))
 
 
 def merge_open_leg(snap: OpenSnapshot, trade: dict, ct_val: float) -> OpenSnapshot:
@@ -181,7 +207,9 @@ def merge_open_leg(snap: OpenSnapshot, trade: dict, ct_val: float) -> OpenSnapsh
         open_fee_usd=snap.open_fee_usd + fee,
         open_fee_known=bool(snap.open_fee_known and fee_known),
         stop_px=snap.stop_px, take_px=snap.take_px, atr_px=snap.atr_px,
-        estimate=snap.estimate)
+        estimate=snap.estimate,
+        fee_sources=tuple(sorted(set(snap.fee_sources or ("unknown",))
+                                 | {leg_fee_evidence(trade)[1]})))
 
 
 def settle(open_snap: OpenSnapshot, close_trade: dict, ctx: SettleContext) -> SettledTrip | None:
@@ -200,6 +228,17 @@ def settle(open_snap: OpenSnapshot, close_trade: dict, ctx: SettleContext) -> Se
         return None
     gross, net = economics.gross_pnl_usd, economics.trading_net_usd
     fee_usd = economics.fee_usd
+    evidence = ctx.evidence if isinstance(ctx.evidence, dict) else {
+        "feeSources": list(open_snap.fee_sources) + [leg_fee_evidence(close_trade)[1]]
+        if open_snap.fee_sources else [],
+        "closeMeta": trade_meta(close_trade),
+        "closeEvidenceFlags": close_evidence_flags(trade_meta(close_trade)),
+        "totals": {"grossPnlUsd": gross, "tradingNetUsd": net, "feeUsd": fee_usd}}
+    sources = evidence.get("feeSources", [])
+    close_meta, totals = evidence.get("closeMeta", {}), evidence.get("totals", {})
+    measurement = classify_fee_measurement(sources, close_meta, totals)
+    measured_net = bool(fee_usd is not None and is_measured_net_evidence(
+        sources, close_meta, totals, evidence.get("closeEvidenceFlags", [])))
     ct_val = max(0.0, float(ctx.ct_val or 0.0))
     notional = open_snap.entry_px * open_snap.qty * ct_val if ct_val > 0 else None
     unit = open_snap.qty * ct_val if ct_val > 0 else None
@@ -209,6 +248,14 @@ def settle(open_snap: OpenSnapshot, close_trade: dict, ctx: SettleContext) -> Se
     est = open_snap.estimate
     realized_gross_bps = _bps(gross, notional)
     realized_cost_bps = _bps(fee_usd, notional) if fee_usd is not None else None
+    raw_fee = _finite(totals.get("feeUsd"))
+    realized_fee = (raw_fee / notional * 1e4
+                    if raw_fee is not None and notional is not None else None)
+    comparable = bool(est and has_fee_comparison_basis({
+        "netEligible": fee_usd is not None,
+        "notionalSource": "contract" if notional is not None else "unavailable",
+        "feeMeasurement": measurement, "modelVersion": est.model_version,
+        "comparisonVersion": est.comparison_version}))
     exit_ts = int(close_trade.get("ts") or 0)
     return SettledTrip(
         seq=open_snap.seq, side=open_snap.side, entry_ts=open_snap.ts, exit_ts=exit_ts,
@@ -233,7 +280,12 @@ def settle(open_snap: OpenSnapshot, close_trade: dict, ctx: SettleContext) -> Se
         decision_confidence=(est.decision_confidence if est else None),
         wake_kind=(est.wake_kind if est else None),
         edge_error_bps=_diff(realized_gross_bps, est.est_edge_bps if est else None),
-        cost_error_bps=_diff(realized_cost_bps, est.est_cost_bps if est else None))
+        est_fee_bps=_finite(est.est_fee_bps) if est else None,
+        realized_fee_bps=realized_cost_bps,
+        fee_error_bps=_diff(realized_fee, _finite(est.est_fee_bps)) if comparable else None,
+        comparison_version=est.comparison_version if est else None,
+        model_version=est.model_version if est else None,
+        fee_measurement=measurement, measured_net_eligible=measured_net)
 
 
 def _hold_seconds(open_snap: OpenSnapshot, close_trade: dict) -> float:
@@ -254,14 +306,18 @@ _WIRE_FIELDS: tuple[tuple[str, str], ...] = (
     ("est_cost_bps", "estCostBps"), ("edge_source", "edgeSource"),
     ("cost_confidence", "costConfidence"), ("decision_confidence", "decisionConfidence"),
     ("wake_kind", "wakeKind"),
+    ("est_fee_bps", "estFeeBps"), ("realized_fee_bps", "realizedFeeBps"),
+    ("fee_error_bps", "feeErrorBps"), ("comparison_version", "comparisonVersion"),
+    ("cost_comparison_basis", "costComparisonBasis"), ("model_version", "modelVersion"),
+    ("fee_measurement", "feeMeasurement"), ("measured_net_eligible", "measuredNetEligible"),
 )
 
 
 def trip_meta_wire(trip: SettledTrip | None) -> dict:
-    """`explain.meta` 的加法键（**缺失即省略**，绝不写 `None`）。`exitSource` 由会话侧写，本模块不写。"""
+    """输出比较证据；未知新数值省略，废弃混比误差为 null，退出来源由会话写。"""
     if trip is None:
         return {}
-    out: dict = {"accountingVersion": 2}
+    out: dict = {"accountingVersion": 2, "costErrorBps": None}
     for attr, key in _WIRE_FIELDS:
         value = getattr(trip, attr, None)
         if value is not None:
@@ -332,6 +388,8 @@ def _text(value) -> str | None:
 
 def _finite(value) -> float | None:
     """有限数归一：非有限 / 不可转 ⇒ `None`（绝不把 NaN 带进任何判定）。"""
+    if isinstance(value, bool):
+        return None
     try:
         out = float(value)
     except (TypeError, ValueError):

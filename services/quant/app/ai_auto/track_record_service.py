@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,6 +19,7 @@ from ..okx.types import BAR_SECONDS
 from .calibration import calibration
 from .cost_runtime import CostRuntime
 from .profitability import VerdictGates, pooled, risk_profile, slices, verdict
+from .profitability_sample import summarize_coverage
 
 logger = logging.getLogger(__name__)
 
@@ -30,20 +33,37 @@ async def build_profitability(session: AsyncSession, settings,
     ④ 口径推定用 `costBasisAssumedTrips`（**计数**，不是布尔）；⑤ `medianCostBps` /
     `travelToCostRatio` 与 `feeCoverage` **必须在同一个对象里**下发。
     """
-    trips = await repo.load_profitability_trips(session, query)
-    stats = pooled(trips)
+    dataset = await repo.load_profitability_dataset(session, query)
+    coverage = summarize_coverage(dataset)
+    trips = [row for row in dataset.samples if row["netEligible"]]
+    stats = pooled(trips, total_trips=len(dataset.samples))
     gates = VerdictGates(min_trips=int(settings.ai_trade_profitability_min_trips),
                          t_threshold=float(settings.ai_trade_profitability_t_threshold))
+    judgment = verdict(stats, gates, coverage)
+    identity = {"samples": dataset.samples, "runs": dataset.run_dimensions,
+                "coverage": coverage, "schemaVersion": 2}
+    snapshot_id = hashlib.sha256(json.dumps(
+        identity, sort_keys=True, ensure_ascii=False, allow_nan=False,
+        separators=(",", ":"), default=str).encode("utf-8")).hexdigest()
     return {
+        "schemaVersion": 2, "coverage": coverage,
+        "asOfTs": dataset.as_of_ts, "snapshotId": snapshot_id,
+        "scope": {"instId": query.inst_id, "bar": query.bar,
+                  "sinceTs": query.since_ts, "sinceBasis": "run_started",
+                  "sinceField": "group_started_ts_or_start_ts",
+                  "preset": query.preset, "horizonProfile": query.horizon_profile,
+                  "basis": "trading_net_ex_funding"},
         "sampleTrips": stats["roundTrips"], "minTrips": gates.min_trips,
-        "conclusive": stats["roundTrips"] >= gates.min_trips,
+        "conclusive": judgment["code"] not in ("insufficient_samples", "insufficient_evidence"),
         "costBasisAssumedTrips": stats["costBasisAssumedTrips"],
-        "pooled": stats, "risk": risk_profile(trips), "slices": slices(trips),
+        "pooled": stats, "risk": risk_profile(trips),
+        "slices": slices(list(dataset.samples), dataset=dataset),
         "calibration": calibration(
-            trips,
+            list(dataset.samples),
             bucket_min_trips=int(settings.ai_trade_profitability_bucket_min_trips),
-            model_constant_bps=_model_constant_bps(settings, query.bar)),
-        "verdict": verdict(stats, gates),
+            model_constant_bps=_model_constant_bps(settings, query.bar),
+            structural_issue_count=coverage["structuralIssueCount"]),
+        "verdict": judgment,
     }
 
 
@@ -82,6 +102,9 @@ async def resolve_track_record(session: AsyncSession, settings, *,
         except Exception as exc:  # noqa: BLE001 —— 历史取数失败只降级，绝不阻断启动
             logger.info("ai-trade track record skipped (%s %s): %s", inst_id, bar, exc)
             continue
-        out[inst_id] = {"pooled": wire["pooled"], "verdict": wire["verdict"],
+        out[inst_id] = {**{key: wire[key] for key in
+                          ("pooled", "risk", "verdict", "coverage", "schemaVersion",
+                           "asOfTs", "snapshotId")},
+                        "basis": "trading_net_ex_funding",
                         "instId": inst_id, "bar": bar}
     return out or None

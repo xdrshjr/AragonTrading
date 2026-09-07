@@ -101,6 +101,8 @@ def build_cost_view(cost: CostBreakdown, *, fee_snapshot, ord_type: str, side: s
             # `fundingIntervalS is None` 表示**结算周期未知**（回落 8h 保守估算），绝不报一个确定值。
             "fundingPeriods": cost.funding_periods,
             "fundingIntervalS": cost.funding_interval_s,
+            "fundingIntervalSource": cost.funding_interval_source,
+            "fundingAssumedIntervalS": cost.funding_assumed_interval_s,
             "source": fee_snapshot.source if fee_snapshot is not None else "config",
             "level": fee_snapshot.level if fee_snapshot is not None else "",
             "previewOrdType": ord_type, "previewSide": side,

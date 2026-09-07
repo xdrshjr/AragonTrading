@@ -234,8 +234,9 @@ export function settlementBasisLabel(value?: string | null): string {
   return labels[value ?? ""] ?? "来源暂不可得";
 }
 
-/** 运行生产能力与摘要来源分别显示，v3 能力不认证旧摘要。 */
+/** 运行能力与摘要来源分别显示，旧摘要不因当前运行版本而升级。 */
 export function evidenceVersionLabel(value?: number | null): string {
   if (value == null) return "旧记录未提供证据版本";
-  return value === 3 ? "v3" : "此版本证据暂不可读";
+  if (value === 2 || value === 3) return `历史证据 v${value}`;
+  return value === 4 ? "v4" : "此版本证据暂不可读";
 }

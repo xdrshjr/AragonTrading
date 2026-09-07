@@ -5,10 +5,10 @@ from copy import deepcopy
 import hashlib
 import json
 
-from .decision_memory import canonical_json
+from .decision_memory import EVIDENCE_VERSION, canonical_json
 
 ADVISORY_SUMMARY_MAX_CHARS = 4096
-ADVISORY_NAMES = ("intel", "experience", "signalPriors")
+ADVISORY_NAMES = ("trackRecord", "intel", "experience", "signalPriors")
 REFLECTION_NAMES = ("experienceCounter", "intelExpand")
 _IDENTITY_FIELDS = ("runId", "instId", "bar", "round")
 _SECTION_FIELDS = (
@@ -28,7 +28,8 @@ def _hash_text(text: str) -> str:
 
 def freeze_evidence(payload: dict, rendered: dict) -> dict:
     """冻结完整 wire 与渲染全文；输入为空文本仍与关闭来源区分。"""
-    snapshot = {"evidenceVersion": 3, "identity": evidence_identity(payload),
+    snapshot = {"evidenceVersion": EVIDENCE_VERSION,
+                "identity": evidence_identity(payload),
                 "wire": {}}
     names = (REFLECTION_NAMES if any(name in rendered
              for name in REFLECTION_NAMES) else ADVISORY_NAMES)
@@ -52,7 +53,7 @@ def freeze_evidence(payload: dict, rendered: dict) -> dict:
 
 
 def evidence_hashes(snapshot: dict) -> dict:
-    """返回必要事实使用的三段哈希，不携带外部原文或 wire。"""
+    """返回必要事实使用的四段哈希，不携带外部原文或 wire。"""
     return {name: {key: (snapshot.get(name) or {}).get(key)
                    for key in ("sourceHash", "renderedHash")}
             for name in ADVISORY_NAMES}
@@ -60,12 +61,14 @@ def evidence_hashes(snapshot: dict) -> dict:
 
 def unavailable_evidence(reason: str) -> dict:
     """返回固定有界的未发送信封；reason 由内部稳定原因码提供。"""
-    return {"evidenceVersion": 3, "evidenceUnavailable": True,
+    return {"evidenceVersion": EVIDENCE_VERSION, "evidenceUnavailable": True,
             **{key: None for key in _IDENTITY_FIELDS},
             "sent": False, "reason": reason}
 
 
 def _summary_metadata(snapshot: dict, names: tuple) -> dict:
+    if snapshot.get("evidenceVersion") != EVIDENCE_VERSION:
+        return unavailable_evidence("evidence_version_unsupported")
     if snapshot.get("evidenceUnavailable"):
         return unavailable_evidence("evidence_unavailable")
     result = {"evidenceVersion": snapshot.get("evidenceVersion"),
@@ -99,7 +102,7 @@ def _fits(envelope: dict) -> bool:
 
 def bound_summary_evidence(snapshot: dict,
                            reflection: dict | None = None) -> dict:
-    """按情报、经验、先验、反思顺序整段回填，总 JSON 不超过 4096 字符。"""
+    """按战绩、情报、经验、先验、反思整段回填，JSON 不超过 4096 字符。"""
     sources = [("advisoryEvidence", snapshot, ADVISORY_NAMES)]
     if reflection is not None:
         sources.append(("reflectionEvidence", reflection, REFLECTION_NAMES))
@@ -147,8 +150,8 @@ def has_same_evidence(left: dict, right: dict) -> bool:
 
 
 def has_complete_evidence(entry: dict) -> bool:
-    """仅完整且已发送的 v3 材料可形成可折叠或非 legacy 摘要。"""
-    if entry.get("evidenceVersion") != 3 or entry.get("legacy"):
+    """仅完整且已发送的当前版本材料可折叠或形成非 legacy 摘要。"""
+    if entry.get("evidenceVersion") != EVIDENCE_VERSION or entry.get("legacy"):
         return False
     advisory = entry.get("advisoryEvidence")
     if not _is_complete(advisory, ADVISORY_NAMES):
@@ -162,7 +165,8 @@ def has_complete_evidence(entry: dict) -> bool:
 def _is_complete(evidence: dict | None, names: tuple) -> bool:
     if not evidence or evidence.get("evidenceUnavailable"):
         return False
-    if evidence.get("evidenceVersion") != 3 or not evidence.get("sent"):
+    if (evidence.get("evidenceVersion") != EVIDENCE_VERSION
+            or not evidence.get("sent")):
         return False
     for name in names:
         section = evidence.get(name)

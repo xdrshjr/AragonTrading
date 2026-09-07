@@ -1058,6 +1058,9 @@ from .ai_auto_repositories import (  # noqa: E402,F401
     load_profitability_trips,
     reconcile_orphan_ai_trade_runs,
 )
+from .ai_profitability_repositories import (  # noqa: E402,F401
+    load_profitability_dataset,
+)
 # ai_experience_repositories：交易经验上下文图的事件 / 节点 / 边数据层
 # （ai-trade-experience-context-graph §六；自包含，含**唯一**的物化 upsert 函数——编排层禁止写第二份
 # SQL，两份必漂移，而这里漂移的是用户亲手按下的「静音」与 iron 档赖以晋升的符号历史）。

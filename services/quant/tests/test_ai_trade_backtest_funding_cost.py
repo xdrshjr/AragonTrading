@@ -145,9 +145,9 @@ def test_snapshot_at_never_reads_the_future():
     """F-1：只取 `ts <= 目标` 的最后一点——回测里唯一不可饶恕的错误是未来函数。"""
     curve = BacktestFundingCurve([{"fundingTs": 1000, "fundingRate": 0.0001},
                                   {"fundingTs": 29800, "fundingRate": 0.0009}])
-    assert curve.snapshot_at(29799).rate == 0.0001      # 第二点尚不可见
+    assert curve.snapshot_at(29799) is None  # 第二点尚不可见，周期不可推。
     assert curve.snapshot_at(29800).rate == 0.0009      # 恰好可见（闭区间）
-    assert curve.snapshot_at(99999).rate == 0.0009
+    assert curve.snapshot_at(99999) is None  # 历史前缀已经过期。
 
 
 def test_snapshot_at_returns_none_before_the_first_point():
@@ -163,18 +163,15 @@ def test_snapshot_at_requires_two_points():
     assert BacktestFundingCurve([]).snapshot_at(9) is None
 
 
-def test_snapshot_at_reports_a_known_interval():
-    """F-4：`interval_s == interval_hint` 且 `interval_known is True`。
-
-    历史曲线自带每一次真实结算时刻，这是本仓库**唯一**一个「结算周期真的可知」的场景——实盘侧的
-    `rest_client` 会把未知兜底成 8h，那个数永远表达不出「不知道」。
-    """
+def test_snapshot_at_reports_historical_observed_interval():
+    """F-4：历史间隔可观察，但下一次安排没有获得交易所确认。"""
     curve = BacktestFundingCurve([{"fundingTs": 3600, "fundingRate": 0.0001},
                                   {"fundingTs": 18000, "fundingRate": 0.0002}])
     snap = curve.snapshot_at(20000)
     assert isinstance(snap, FundingSnapshot)
     assert snap.interval_s == curve.interval_hint == 14400.0
-    assert snap.interval_known is True
+    assert snap.interval_known is False
+    assert snap.interval_source == "historical_observed"
     assert snap.next_funding_ts == 18000 + 14400
 
 
@@ -191,15 +188,11 @@ async def test_cost_funding_falls_back_when_the_master_switch_is_off(monkeypatch
 
 
 async def test_cost_funding_falls_back_when_the_curve_is_unavailable(monkeypatch):
-    """F-6：曲线拉不到 ⇒ `(None, False)`，**不是** `(None, True)`（§九 D-8 / R-7）。
-
-    `(None, True)` 在 `cost_model.query_for_preview` 里的语义是 `funding_rate=None` ⇒
-    `confidence="degraded"` ⇒ 门禁阈值收紧：一次观测层的网络抖动会静默改变回测的门禁判定。
-    """
+    """F-6：按 v2 设计有意修订为缺失仍开启，沿既有门禁降级。"""
     try:
         runner = await _run(monkeypatch, settings=_settings(), rows=None)
         assert runner._curve.available is False
-        assert runner._cost_funding(runner.end_ts) == (None, False)
+        assert runner._cost_funding(runner.end_ts) == (None, True)
     finally:
         await dispose_engine()
 
@@ -241,7 +234,7 @@ def test_funding_makes_the_round_trip_cost_strictly_higher_for_a_paying_side():
         query_for_preview(ord_type="market", side="long", bar_seconds=_BAR_SECONDS,
                           funding=None, funding_enabled=False), params)
     assert on.total_bps > off.total_bps
-    assert on.confidence == "ok"          # 有数就不是 degraded
+    assert on.confidence == "degraded"  # 有历史值，但下一次安排未确认。
     assert on.funding_carry_bps > 0
 
 
@@ -280,8 +273,8 @@ async def test_edge_gate_receives_the_real_funding_snapshot(monkeypatch):
                for k in seen)
 
 
-async def test_edge_gate_funding_input_stays_confident(monkeypatch):
-    """F-11：喂进 edge 门禁的那份快照算出来的成本 `confidence == "ok"`（有数不是 degraded）。"""
+async def test_edge_gate_funding_input_preserves_historical_uncertainty(monkeypatch):
+    """F-11：喂进门禁的历史快照仍保留安排未确认的降级。"""
     seen: list[dict] = []
     real = __import__("app.ai_auto.backtest", fromlist=["evaluate_edge_gate"]).evaluate_edge_gate
 
@@ -300,7 +293,7 @@ async def test_edge_gate_funding_input_stays_confident(monkeypatch):
         query_for_preview(ord_type="market", side="long", bar_seconds=_BAR_SECONDS,
                           funding=armed["funding"], funding_enabled=armed["funding_enabled"]),
         armed["params"])
-    assert cost.confidence == "ok"
+    assert cost.confidence == "degraded"
 
 
 # ==================== F-12~13b · notes 自认口径（宿主是 `_funding_notes`） ====================
@@ -316,9 +309,9 @@ async def test_funding_notes_declare_the_armed_cost_basis(monkeypatch):
         await dispose_engine()
     basis = notes[0]
     assert "往返成本估算已含资金费" in basis
-    assert "结算周期约 8h" in basis
+    assert "按最近历史间隔估计" in basis
     assert f"覆盖 {runner._funding_cost_covered}/{runner._funding_cost_rounds} 个决策轮" in basis
-    assert "按目标持仓跨 2 期" in basis      # 12 根 × 1H ÷ 8h ⇒ ceil(1.5) = 2 期
+    assert "轮降级" in basis
     # 反向冻结：本轮之后那句欠账披露是假话，**必须已被撤下**。
     assert not any("已知欠账" in n for n in notes)
     assert not any("成本估算仍不含资金费" in n for n in notes)
@@ -338,10 +331,9 @@ async def test_funding_notes_declare_the_fallback_and_its_reason(monkeypatch):
     finally:
         await dispose_engine()
     assert "**不含**资金费" in off_note and "已关闭" in off_note
-    assert "**不含**资金费" in blind_note and "历史资金费曲线不可得" in blind_note
-    for note in (off_note, blind_note):
-        assert "比实盘宽松" in note
-        assert "不得据此为长周期模式背书" in note
+    assert "资金费证据缺失" in blind_note and "历史资金费曲线不可得" in blind_note
+    assert "保持开启并降级" in blind_note
+    assert "不得据此为长周期模式背书" in off_note
 
 
 async def test_a_curve_outside_the_range_says_so_instead_of_blaming_the_fetch(monkeypatch):
@@ -359,7 +351,7 @@ async def test_a_curve_outside_the_range_says_so_instead_of_blaming_the_fetch(mo
         assert runner._funding_cost_covered == 0
     finally:
         await dispose_engine()
-    assert "**不含**资金费" in note
+    assert "资金费证据缺失" in note
     assert "没有任何决策轮读到可见的历史结算点" in note
     assert "历史资金费曲线不可得" not in note
 

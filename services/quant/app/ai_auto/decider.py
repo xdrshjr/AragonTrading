@@ -65,7 +65,7 @@ from .reasoning_protocol import (
 )
 from .prompts_en import RETRY_HINT_GENERIC_EN, RETRY_HINT_TRUNCATED_EN, build_reask_instruction
 from .summary_health import SummaryHealth, health_wire
-from .decision_memory import RoundDecisionRecord
+from .decision_memory import EVIDENCE_VERSION, RoundDecisionRecord
 from .advisory_evidence import (
     attach_snapshot, bound_summary_evidence, evidence_hashes,
     evidence_identity, has_complete_evidence, unavailable_evidence,
@@ -1219,7 +1219,7 @@ class AiTradeDecider:
         has_legacy = has_legacy or any(
             not has_complete_evidence(entry) for entry in journal)
         self._legacy_narrative = has_legacy
-        self._summary_evidence_version = None if has_legacy else 3
+        self._summary_evidence_version = None if has_legacy else EVIDENCE_VERSION
         self._summary_as_of_ts = time.time()
         self._summary_health.note_success()
         self._summary_skip_rounds = 0
@@ -1260,16 +1260,16 @@ class AiTradeDecider:
         if summary:
             self._summary = summary
             self._legacy_narrative = (facts_version != 2
-                or evidence_version != 3 or legacy_narrative)
+                or evidence_version != EVIDENCE_VERSION or legacy_narrative)
             self._summary_evidence_version = (
-                None if self._legacy_narrative else 3)
+                None if self._legacy_narrative else EVIDENCE_VERSION)
             self._summary_as_of_ts = summary_as_of_ts
             self._install_summary_seed(summary)
 
     def memory_wire(self) -> dict:
         """返回摘要时间与兼容标记，不暴露历史原文。"""
         return {"factsVersion": 2, "legacyNarrative": self._legacy_narrative,
-                "evidenceVersion": 3,
+                "evidenceVersion": EVIDENCE_VERSION,
                 "summaryEvidenceVersion": self._summary_evidence_version,
                 "summaryAsOfTs": self._summary_as_of_ts}
 
@@ -1305,7 +1305,7 @@ class AiTradeDecider:
             elif (reflection is not None
                     and reflection.get("identity") != self._round_identity):
                 reflection = unavailable_evidence("reflection_mismatched")
-        return {"evidenceVersion": 3,
+        return {"evidenceVersion": EVIDENCE_VERSION,
                 **bound_summary_evidence(snapshot, reflection)}
 
     def frozen_round_payload(self, payload: dict) -> dict:

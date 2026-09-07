@@ -8,6 +8,8 @@
 """
 from dataclasses import dataclass
 
+import pytest
+
 from app.ai_auto.funding_ledger import (
     FundingEpoch,
     FundingLedger,
@@ -254,10 +256,10 @@ def test_truncated_samples_reason_reaches_the_note():
 # ---------------- F-10：回测曲线用真实结算时刻，不平铺 ----------------
 def test_backtest_curve_uses_real_settlement_times_not_a_grid():
     """F-10：8h→4h→8h 的变周期序列 ⇒ `points_in` 逐点取真实 ts。"""
-    rows = [{"fundingTs": 0, "fundingRate": 0.0001},
-            {"fundingTs": 28800, "fundingRate": 0.0002},
-            {"fundingTs": 43200, "fundingRate": 0.0003},      # 只隔 4h
-            {"fundingTs": 72000, "fundingRate": 0.0004}]
+    rows = [{"fundingTs": 0, "realizedRate": 0.0001},
+            {"fundingTs": 28800, "realizedRate": 0.0002},
+            {"fundingTs": 43200, "realizedRate": 0.0003},
+            {"fundingTs": 72000, "realizedRate": 0.0004}]
     curve = BacktestFundingCurve(rows)
     assert curve.available
     assert curve.points_in(0, 72000) == [(28800, 0.0002), (43200, 0.0003),
@@ -282,8 +284,8 @@ def test_empty_curve_is_unavailable():
 def test_accrue_bars_accrues_real_points_only():
     ledger = FundingLedger(enabled=True, ct_val=1.0)
     ledger.note_open({"side": "long", "qty": 2.0}, seq=1, now_wall=0.0)
-    curve = BacktestFundingCurve([{"fundingTs": 100, "fundingRate": 0.001},
-                                  {"fundingTs": 200, "fundingRate": 0.002}])
+    curve = BacktestFundingCurve([{"fundingTs": 100, "realizedRate": 0.001},
+                                  {"fundingTs": 200, "realizedRate": 0.002}])
     ledger.accrue_bars(curve, from_ts=0, to_ts=300, mark_px=1000.0)
     assert ledger.crossings == 2
     assert round(ledger.epoch.accrued_usd, 6) == round(0.003 * 2000.0, 6)
@@ -318,3 +320,80 @@ def test_merge_funding_wires_sums_when_all_members_have_values():
 
 def test_merge_funding_wires_of_nothing_is_none():
     assert merge_funding_wires([None, None]) is None
+
+
+def test_backtest_open_epoch_is_unknown_before_first_observation():
+    ledger = FundingLedger(enabled=True, ct_val=1, backtest=True)
+    ledger.note_open({"side": "long", "qty": 1}, seq=1, now_wall=100)
+    assert ledger.stats(settled_usd=None)["accruedOpenUsd"] is None
+
+
+def test_estimated_point_never_becomes_free_funding():
+    ledger = FundingLedger(enabled=True, ct_val=1)
+    ledger.note_open({"side": "long", "qty": 1}, seq=1, now_wall=150)
+    curve = BacktestFundingCurve([
+        {"fundingTs": 100, "realizedRate": 0},
+        {"fundingTs": 200, "fundingRate": 0},
+    ])
+    ledger.accrue_bars(curve, from_ts=150, to_ts=200, mark_px=100)
+    wire = ledger.stats(settled_usd=None)
+    assert wire["fundingCostUsd"] is None
+    assert wire["knownAccruedUsd"] == 0
+    assert wire["knownAccruedPoints"] == 0
+
+
+@pytest.mark.parametrize("to_ts,coverage,cost", [
+    (299, "complete", 0), (300, "partial", None), (301, "partial", None),
+])
+def test_missing_point_at_due_time_is_not_known_zero(to_ts, coverage, cost):
+    """只有未到期且未跨点的窗口，才可声明完整的零资金费。"""
+    curve = BacktestFundingCurve([
+        {"fundingTs": 100, "realizedRate": .001},
+        {"fundingTs": 200, "realizedRate": .001},
+    ])
+    evidence = curve.window_evidence(200, to_ts)
+    assert evidence["points"] == []
+    assert evidence["coverage"] == coverage
+    ledger = FundingLedger(enabled=True, ct_val=1, backtest=True)
+    ledger.note_open({"side": "long", "qty": 1}, seq=1, now_wall=200)
+    ledger.accrue_bars(curve, from_ts=200, to_ts=to_ts, mark_px=100)
+    wire = ledger.stats(settled_usd=None)
+    assert wire["fundingCostUsd"] == cost
+    assert wire["openCoverage"] == coverage
+    assert wire["knownAccruedUsd"] == 0
+    assert wire["knownAccruedPoints"] == 0
+    # 预测快照沿设计保留严格 >；计提覆盖在到期时已不能证明零。
+    assert (curve.snapshot_at(to_ts) is not None) == (to_ts <= 300)
+
+
+def test_close_exactly_at_missing_settlement_keeps_closed_gap():
+    """在缺失结算点恰好平仓，不能将未知永久结转成零资金费。"""
+    curve = BacktestFundingCurve([
+        {"fundingTs": 100, "realizedRate": .001},
+        {"fundingTs": 200, "realizedRate": .001},
+    ])
+    ledger = FundingLedger(enabled=True, ct_val=1, backtest=True)
+    ledger.note_open({"side": "long", "qty": 1}, seq=1, now_wall=200)
+    ledger.accrue_bars(curve, from_ts=200, to_ts=299, mark_px=100)
+    ledger.accrue_bars(curve, from_ts=299, to_ts=300, mark_px=100)
+    ledger.note_close({}, 300)
+    wire = ledger.stats(settled_usd=None)
+    assert wire["fundingCostUsd"] is None
+    assert wire["closedCoverage"] == "partial"
+    assert wire["accruedClosedUsd"] is None
+    assert wire["knownAccruedUsd"] == 0
+
+
+@pytest.mark.parametrize("mark_px", [None, float("nan"), float("inf")])
+def test_empty_funding_window_does_not_poison_later_accrual(mark_px):
+    """无结算点时无需价格；坏价格不能把后续已知计提污染为NaN。"""
+    curve = BacktestFundingCurve([
+        {"fundingTs": ts, "realizedRate": .001}
+        for ts in (100, 200, 300)
+    ])
+    ledger = FundingLedger(enabled=True, ct_val=1, backtest=True)
+    ledger.note_open({"side": "long", "qty": 1}, seq=1, now_wall=200)
+    ledger.accrue_bars(curve, from_ts=200, to_ts=250, mark_px=mark_px)
+    assert ledger.stats(settled_usd=None)["knownAccruedUsd"] == 0
+    ledger.accrue_bars(curve, from_ts=250, to_ts=300, mark_px=100)
+    assert ledger.stats(settled_usd=None)["fundingCostUsd"] == .1

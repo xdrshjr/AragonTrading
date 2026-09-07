@@ -24,7 +24,9 @@ _BAR_S = 900          # 15m
 
 
 def _query(**over) -> CostQuery:
-    base = {"ord_type": "market", "side": "long", "bar_seconds": _BAR_S, "funding_rate": 0.0}
+    base = {"ord_type": "market", "side": "long",
+            "bar_seconds": _BAR_S, "funding_rate": 0.0,
+            "funding_enabled": "funding_rate" in over}
     base.update(over)
     return CostQuery(**base)
 
@@ -35,6 +37,7 @@ def test_market_round_trip_matches_calibration_13_bps():
     assert cost.total_bps == 13.0
     assert cost.crossing_legs == 2
     assert cost.confidence == "ok"
+    assert cost.model_version == 3
     assert (cost.fee_open_bps, cost.fee_close_bps) == (5.0, 5.0)
 
 
@@ -69,7 +72,7 @@ def test_long_side_pays_one_funding_period():
     cost = estimate_round_trip_cost(_query(funding_rate=0.0001), _PARAMS)
     assert cost.funding_carry_bps == 1.0
     assert cost.total_bps == 14.0
-    assert cost.confidence == "ok"
+    assert cost.confidence == "degraded"  # 费率有值，安排仍未确认。
 
 
 def test_short_side_gets_no_discount_from_receiving_funding():

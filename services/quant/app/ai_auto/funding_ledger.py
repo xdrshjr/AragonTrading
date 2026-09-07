@@ -23,10 +23,10 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 
 from .acceptance_text import funding_note
-from .funding import FundingSnapshot
+from .backtest_funding import BacktestFundingCurve
 
 # 单次计提可平铺的结算点上限：坏读数（interval 极小）下防止一次 tick 造出上万次计提。
 # 触顶即记一次 `capHits`——不记的话，「只取了最近 64 个」与「本来就只跨了这么多」在 wire 上无法
@@ -87,6 +87,7 @@ class FundingEpoch:
     accrued_usd: float = 0.0
     crossings: int = 0
     cap_hits: int = 0
+    coverage: str = "unavailable"
 
 
 def settlement_points(*, from_ts: float, to_ts: float,
@@ -178,7 +179,8 @@ class FundingLedger:
 
     def __init__(self, *, enabled: bool, ct_val: float,
                  min_interval_s: float = 1800.0,
-                 max_interval_s: float = 28800.0) -> None:
+                 max_interval_s: float = 28800.0,
+                 backtest: bool = False) -> None:
         self.enabled = bool(enabled)
         # 合约乘数：名义额 = `张数 × ctVal × 价`。漏掉它会让资金费差一个合约乘数量级
         # （BTC-USDT-SWAP 的 ctVal=0.01 ⇒ 高估 100 倍）。
@@ -195,6 +197,9 @@ class FundingLedger:
         self._interval_known = False
         self._interval_s: float | None = None
         self._last_rate: float | None = None
+        self._backtest = bool(backtest)
+        self._interval_source = "unknown"
+        self.closed_coverage = "complete"
 
     # ---------- 成交事件收口 ----------
     def note_open(self, trade: dict, *, seq: int, now_wall: float) -> None:
@@ -220,6 +225,8 @@ class FundingLedger:
         if not self.enabled or self.epoch is None:
             return
         self.closed_accrued_usd += float(self.epoch.accrued_usd)
+        if self._backtest and self.epoch.coverage != "complete":
+            self.closed_coverage = "partial"
         self.epoch = None
 
     # ---------- 计提挂点 ----------
@@ -259,26 +266,40 @@ class FundingLedger:
     def accrue_bars(self, curve: "BacktestFundingCurve", *, from_ts: int, to_ts: int,
                     mark_px: float) -> None:
         """回测逐根计提：按**真实历史结算时刻**逐点计提（不平铺，见 `BacktestFundingCurve`）。"""
-        if not self.enabled or self.epoch is None or not curve.available:
+        if not self.enabled or self.epoch is None:
             return
+        self._backtest = True
         start = max(int(from_ts), int(self.epoch.settled_through_ts),
                     int(self.epoch.opened_wall))
-        points = curve.points_in(start, int(to_ts))
-        self._interval_known = True
-        self._interval_s = curve.interval_hint
+        if to_ts < start:
+            return
+        evidence = curve.window_evidence(start, int(to_ts))
+        coverage = evidence["coverage"]
+        if (self.epoch.coverage == "partial"
+                or (self.epoch.settled_through_ts
+                    and self.epoch.coverage != "complete")):
+            coverage = "partial"
+        points = evidence["points"]
+        snapshot = curve.snapshot_at(int(to_ts))
+        self._interval_known = False
+        self._interval_source = (snapshot.interval_source if snapshot
+                                 else "unknown")
+        self._interval_s = snapshot.interval_s if snapshot else None
+        if points and not _is_good_px(mark_px):
+            self.epoch = replace(self.epoch, coverage="partial")
+            return
         self.accrual_ticks += 1
-        if not points:
-            self.epoch = replace(self.epoch, settled_through_ts=int(to_ts))
-            return
-        if not _is_good_px(mark_px):
-            return
-        notional = float(self.epoch.qty_coin) * float(mark_px)
         sign = 1.0 if self.epoch.side == "long" else -1.0
-        delta = sum(rate for _, rate in points) * notional * sign
-        self._last_rate = points[-1][1]
-        self.epoch = replace(self.epoch, settled_through_ts=int(points[-1][0]),
+        # 空窗口不需要价格，避免 0 × NaN 污染整个持仓的后续计提。
+        delta = 0.0
+        if points:
+            notional = float(self.epoch.qty_coin) * float(mark_px)
+            delta = sum(rate for _, rate in points) * notional * sign
+            self._last_rate = points[-1][1]
+        self.epoch = replace(self.epoch, settled_through_ts=int(to_ts),
                              accrued_usd=float(self.epoch.accrued_usd) + delta,
-                             crossings=int(self.epoch.crossings) + len(points))
+                             crossings=int(self.epoch.crossings) + len(points),
+                             coverage=coverage)
         self.crossings += len(points)
 
     # ---------- 统计 ----------
@@ -299,7 +320,7 @@ class FundingLedger:
         open_usd = None if self.epoch is None else round(self.epoch.accrued_usd, _ROUND_USD)
         closed_usd = round(self.closed_accrued_usd, _ROUND_USD)
         basis, total = self._compose(settled_usd, closed_usd, open_usd)
-        return {
+        wire = {
             "enabled": True, "basis": basis,
             "accruedClosedUsd": closed_usd, "accruedOpenUsd": open_usd,
             "settledUsd": (None if settled_usd is None
@@ -320,6 +341,34 @@ class FundingLedger:
                                  accrued_closed_usd=closed_usd, accrued_open_usd=open_usd,
                                  unavailable_reason=unavailable_reason),
         }
+        if self._backtest:
+            self._backtest_coverage_wire(wire)
+        return wire
+
+    def _backtest_coverage_wire(self, wire: dict) -> None:
+        """已知计提独立披露，任一持仓历史缺口永久保留。"""
+        epoch = self.epoch
+        open_coverage = epoch.coverage if epoch else None
+        complete = (self.closed_coverage == "complete"
+                    and (epoch is None or open_coverage == "complete"))
+        wire.update({
+            "knownAccruedUsd": round(self.closed_accrued_usd
+                + (epoch.accrued_usd if epoch else 0), _ROUND_USD),
+            "knownAccruedPoints": int(self.crossings),
+            "openCoverage": open_coverage,
+            "closedCoverage": self.closed_coverage,
+            "coverage": "complete" if complete else "partial",
+            "intervalSource": self._interval_source,
+        })
+        if epoch and open_coverage != "complete":
+            wire["accruedOpenUsd"] = None
+        if self.closed_coverage != "complete":
+            wire["accruedClosedUsd"] = None
+        if not complete:
+            wire["fundingCostUsd"] = None
+            wire["basis"] = "unavailable"
+            wire["note"] = (
+                "历史点本地计提覆盖不足；已知计提单列，完整资金费未知。")
 
     def _compose(self, settled_usd: float | None, closed_usd: float,
                  open_usd: float | None) -> tuple[str, float | None]:
@@ -384,76 +433,6 @@ def merge_funding_wires(wires: list[dict | None]) -> dict | None:
 # `basis` 的强弱序（与 `horizon_acceptance` 同一张表：任一成员不可得 ⇒ 合并结果不可得）。
 _BASIS_RANK = {"settled+accrued": 2, "accrued": 1, "unavailable": 0}
 _BASIS_BY_RANK = {2: "settled+accrued", 1: "accrued", 0: "unavailable"}
-
-
-@dataclass
-class BacktestFundingCurve:
-    """历史结算点 → 费率的只读查表（回测世界的资金费真源）。
-
-    **刻意不复用** `settlement_points` 的平铺逻辑：历史数据自带每一次真实结算时刻，而 OKX 会动态
-    把周期改成 1/2/4/8 小时（调查约束 #7 明写）——按固定步长平铺会在改周期的那一段整体错位。
-    两条路径的差别写在这里，是为了让下一个人不要去「统一」它们（§九 D-7）。
-    """
-
-    rows: list[dict] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        points: list[tuple[int, float]] = []
-        for row in self.rows or []:
-            ts = int(_num((row or {}).get("fundingTs")))
-            if ts <= 0:
-                continue
-            rate = (row or {}).get("realizedRate")
-            if rate is None:
-                rate = (row or {}).get("fundingRate")
-            points.append((ts, _num(rate)))
-        points.sort(key=lambda p: p[0])
-        self._points: list[tuple[int, float]] = points
-
-    def points_in(self, from_ts: int, to_ts: int) -> list[tuple[int, float]]:
-        """`(from_ts, to_ts]` 内的真实结算点（升序）。"""
-        return [p for p in self._points if from_ts < p[0] <= to_ts]
-
-    @property
-    def available(self) -> bool:
-        """至少两个点才算「拿到了曲线」——单点无法反映真实周期，也算不出跨点。"""
-        return len(self._points) >= 2
-
-    @property
-    def interval_hint(self) -> float | None:
-        """最近两点之差（秒），仅供展示；曲线不可用 ⇒ `None`。"""
-        if len(self._points) < 2:
-            return None
-        return float(self._points[-1][0] - self._points[-2][0])
-
-    def snapshot_at(self, ts: int, *, now_wall: float = 0.0) -> FundingSnapshot | None:
-        """`ts` 时点可见的最近一次真实结算费率；曲线不可用 ⇒ `None`
-        （ai-trade-backstop-repair-and-net-backtest §2.3.1）。
-
-        产物与实盘**同一个** `FundingSnapshot` 类型——回测的成本模型入参与实盘走同一条形状，
-        才谈得上「回测向实盘收敛」。三条纪律：
-
-        1. **严格无未来函数**：只取 `point.ts <= ts` 的最后一点；一个都没有 ⇒ `None`
-           （曲线起点之前的那几根决策轮就是没有可见费率，绝不拿未来那一点补上）。
-        2. **`available` 是前置条件**（≥2 点）：单点算不出周期，算不出周期就表达不了「几期」。
-        3. `interval_s` 取 `interval_hint`（最近两点之差）且 `interval_known=True`——历史曲线自带
-           每一次真实结算时刻，这是本仓库唯一一个「结算周期真的可知」的场景（调查约束 #7）。
-        """
-        if not self.available:
-            return None
-        target = int(ts)
-        point = None
-        for candidate in self._points:
-            if candidate[0] > target:
-                break
-            point = candidate
-        if point is None:
-            return None
-        interval = float(self.interval_hint or 0.0)
-        return FundingSnapshot(
-            rate=float(point[1]), funding_ts=int(point[0]),
-            next_funding_ts=int(point[0] + interval), interval_s=interval,
-            fetched_wall=float(now_wall), interval_known=True)
 
 
 def _finite(value) -> bool:

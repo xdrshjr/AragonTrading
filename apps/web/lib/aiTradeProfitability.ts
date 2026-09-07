@@ -30,6 +30,34 @@ export interface AiTradePooled {
   feeCoverage: number | null;
   feeTrips: number;
   costBasisAssumedTrips: number;
+  moveSamples?: number;
+  holdSamples?: number;
+  feeBpsTrips?: number;
+  estimatedNetTrips?: number;
+  travelComparisonTrips?: number;
+  travelComparisonCoverage?: number | null;
+  travelMedianMoveBps?: number | null;
+  travelMedianFeeBps?: number | null;
+}
+
+export interface AiTradeCoverageCounts {
+  totalTrips: number;
+  netEligibleTrips: number;
+  measuredNetTrips: number;
+  excludedTrips: number;
+  netCoverage: number | null;
+  feeTrips: number;
+  feeCoverage: number | null;
+  notionalKnownTrips: number;
+  notionalDerivedTrips: number;
+  structuralIssueCount: number;
+  openEpochCount: number;
+  excludedByReason: Record<string, number>;
+}
+
+export interface AiTradeProfitabilityCoverage extends AiTradeCoverageCounts {
+  byInstId: (AiTradeCoverageCounts & { instId: string })[];
+  structuralIssues?: { runId: number; eventKey: string; reason: string }[];
 }
 
 export interface AiTradeRiskProfile {
@@ -43,6 +71,9 @@ export interface AiTradeRiskProfile {
   stopUtilizationP50: number | null;
   medianStopAtrMult: number | null;
   stopAtrCoverage: number | null;
+  plannedRrSamples?: number;
+  stopUtilizationSamples?: number;
+  stopAtrSamples?: number;
 }
 
 export interface AiTradeSliceRow {
@@ -52,6 +83,12 @@ export interface AiTradeSliceRow {
   winRate: number | null;
   expectancyUsd: number | null;
   medianRMultiple: number | null;
+  netSamples?: number;
+  rSamples?: number;
+  totalTrips?: number;
+  netEligibleTrips?: number;
+  excludedTrips?: number;
+  coverage?: AiTradeCoverageCounts;
 }
 
 export interface AiTradeCalibrationBlock {
@@ -68,6 +105,14 @@ export interface AiTradeCalibrationBlock {
   note?: string | null;
   buckets?: AiTradeConfidenceBucket[];
   monotonic?: boolean | null;
+  comparisonBasis?: string;
+  availableEstimateTrips?: number;
+  availableRealizedTrips?: number;
+  medianEstFeeBps?: number | null;
+  medianRealizedFeeBps?: number | null;
+  medianFeeErrorBps?: number | null;
+  medianEstTotalCostBps?: number | null;
+  signSamples?: number;
 }
 
 export interface AiTradeConfidenceBucket {
@@ -76,9 +121,23 @@ export interface AiTradeConfidenceBucket {
   winRate: number | null;
   expectancyUsd: number | null;
   medianRMultiple: number | null;
+  netSamples?: number;
+  rSamples?: number;
 }
 
 export interface AiTradeProfitabilityResponse {
+  schemaVersion?: number;
+  scope?: {
+    instId?: string | null;
+    bar?: string | null;
+    sinceTs?: number | null;
+    sinceBasis?: string;
+    sinceField?: string;
+    preset?: string | null;
+    horizonProfile?: string | null;
+    basis?: string;
+  };
+  coverage?: AiTradeProfitabilityCoverage;
   sampleTrips: number;
   minTrips: number;
   conclusive: boolean;
@@ -109,6 +168,11 @@ export interface AiTradeRealizedStats {
   costErrorMedianBps: number | null;
   estimateCoverage: number | null;
   feeCoverage: number | null;
+  costComparisonBasis?: string | null;
+  comparisonVersion?: number | null;
+  feeComparisonTrips?: number;
+  feeComparisonCoverage?: number | null;
+  feeErrorMedianBps?: number | null;
 }
 
 // 结论徽标的色调（`verdict.code` → tone）。文案一律取后端下发的 `title` / `detail`，前端不重写。
@@ -118,6 +182,7 @@ export const VERDICT_TONES: Record<string, "long" | "short" | "neutral" | "accen
   no_edge_yet: "neutral",
   negative_significant: "short",
   insufficient_samples: "neutral",
+  insufficient_evidence: "neutral",
 };
 
 // 会话级「已实现」三项的最小样本：少于它整段不渲染（绝不显示一个 1 笔样本的中位数）。
@@ -163,12 +228,20 @@ export function payoffText(pooled: Pick<AiTradePooled, "payoff" | "breakevenPayo
  * （[P0-4]）——生产库上 89% 的往返腿费恒 0，那是「没记」不是「免费」。
  */
 export function travelToCostText(pooled: AiTradePooled): string {
+  if (pooled.travelComparisonTrips == null) {
+    return "旧版未提供同笔尺度；往返手续费比较暂不可得，不含资金费";
+  }
   if (pooled.travelToCostRatio == null || !Number.isFinite(pooled.travelToCostRatio)) {
-    return `位移中位 ${fmtBps(pooled.medianMoveBps)}；成本样本不足（${pooled.feeTrips} 笔带费率记录），不下结论`;
+    return `位移中位 ${fmtBps(pooled.medianMoveBps)}` +
+      `（${pooled.moveSamples ?? "—"} 笔）；手续费比较样本不足` +
+      `（${pooled.travelComparisonTrips} 笔同笔尺度），不含资金费`;
   }
   return (
-    `位移中位 ${fmtBps(pooled.medianMoveBps)} / 往返成本 ${fmtBps(pooled.medianCostBps)}` +
-    ` = ${fmtOrDash(pooled.travelToCostRatio, 2)}×（取自 ${pooled.feeTrips} 笔带费率记录的往返，覆盖 ${fmtRate(pooled.feeCoverage)}）`
+    `位移中位 ${fmtBps(pooled.travelMedianMoveBps)} / ` +
+    `往返手续费 ${fmtBps(pooled.travelMedianFeeBps)}` +
+    ` = ${fmtOrDash(pooled.travelToCostRatio, 2)}×` +
+    `（取自 ${pooled.travelComparisonTrips} 笔同笔尺度，` +
+    `覆盖 ${fmtRate(pooled.travelComparisonCoverage)}；不含资金费）`
   );
 }
 
@@ -179,7 +252,8 @@ export function travelToCostText(pooled: AiTradePooled): string {
  * `roundTrips` 是对的：后端的中位数吃的正是全部往返的 `holdSeconds`，不是子样本。
  */
 export function holdDurationText(pooled: AiTradePooled): string {
-  return `中位持仓时长 ${formatHoldDuration(pooled.medianHoldSeconds)}（${pooled.roundTrips} 笔）`;
+  return `中位持仓时长 ${formatHoldDuration(pooled.medianHoldSeconds)}` +
+    `（${pooled.holdSamples ?? pooled.roundTrips} 笔）`;
 }
 
 /**
@@ -194,11 +268,13 @@ export function riskDistributionText(risk: AiTradeRiskProfile): string {
     `R 分布 p10 / p50 / p90 = ${fmtOrDash(risk.rP10, 3)} / ${fmtOrDash(risk.rP50, 3)}` +
       ` / ${fmtOrDash(risk.rP90, 3)}（${risk.rSamples} 笔可算）`,
     `|R| < 0.2 占比 ${fmtRate(risk.withinFifthRShare)}`,
-    `计划盈亏比中位 ${fmtOrDash(risk.plannedRrMedian, 2)}`,
+    `计划盈亏比中位 ${fmtOrDash(risk.plannedRrMedian, 2)}` +
+      `（${risk.plannedRrSamples ?? "—"} 笔）`,
   ];
   if (risk.medianStopAtrMult != null) {
     parts.push(
-      `计划止损 ≈ ${fmtOrDash(risk.medianStopAtrMult, 1)}×ATR（覆盖 ${fmtRate(risk.stopAtrCoverage)}）`,
+      `计划止损 ≈ ${fmtOrDash(risk.medianStopAtrMult, 1)}×ATR` +
+      `（${risk.stopAtrSamples ?? "—"} 笔，覆盖 ${fmtRate(risk.stopAtrCoverage)}）`,
     );
   }
   return parts.join("；");

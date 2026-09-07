@@ -7,6 +7,7 @@ import pytest
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from app.ai_auto.decision_memory import EVIDENCE_VERSION
 from app.db import ai_trade_state_repositories as repo
 from app.db.models import Base
 
@@ -334,7 +335,7 @@ def test_settlement_validation_is_same_source_for_facts_and_status():
     assert status["integrity"]["settlementValidation"] == validation
     facts = build_session_facts(session, {"round": 1})
     assert facts["settlementValidation"] == validation
-    assert status["integrity"]["memory"]["evidenceVersion"] == 3
+    assert status["integrity"]["memory"]["evidenceVersion"] == EVIDENCE_VERSION
 
 
 async def test_observation_save_failure_blocks_open_and_retries_real_sqlite(

@@ -769,7 +769,8 @@ async def test_backtest_cost_uses_simbroker_constants_not_live_ones(monkeypatch)
 
     settings = Settings()
     cost = estimate_round_trip_cost(
-        CostQuery(ord_type="market", side="long", bar_seconds=3600, funding_rate=0.0),
+        CostQuery(ord_type="market", side="long", bar_seconds=3600,
+                  funding_rate=0.0, funding_enabled=False),
         backtest_params(settings))
     assert cost.total_bps == 14.0
     assert cost.confidence == "ok"          # 回测不收资金费率是**有意不建模**，不是数据缺失

@@ -355,10 +355,11 @@ def test_system_prompt_hold_is_active_not_default():
 def _journal_entry(round_no: int, *, trigger="interval", action="hold", traded=False,
                    reflection=None) -> dict:
     from app.ai_auto.advisory_evidence import bound_summary_evidence
+    from app.ai_auto.decision_memory import EVIDENCE_VERSION
     from app.ai_auto.prompts import build_advisory_evidence
     scope = {"runId": 71, "instId": "BTC-USDT-SWAP", "bar": "1m"}
     return {"round": round_no, "signalBoard": [],
-            "evidenceVersion": 3,
+            "evidenceVersion": EVIDENCE_VERSION,
             **bound_summary_evidence(build_advisory_evidence(
                 {**scope, "round": round_no})),
             "proposal": {"action": action},

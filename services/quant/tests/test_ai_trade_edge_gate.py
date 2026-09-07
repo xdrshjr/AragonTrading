@@ -23,7 +23,8 @@ from app.config import Settings
 _SETTINGS = Settings()
 _PARAMS = resolve_cost_params(_SETTINGS)
 _COST_OK = estimate_round_trip_cost(
-    CostQuery(ord_type="market", side="long", bar_seconds=900, funding_rate=0.0), _PARAMS)
+    CostQuery(ord_type="market", side="long", bar_seconds=900,
+              funding_rate=0.0, funding_enabled=False), _PARAMS)
 _COST_DEGRADED = estimate_round_trip_cost(
     CostQuery(ord_type="market", side="long", bar_seconds=900, funding_rate=None), _PARAMS)
 

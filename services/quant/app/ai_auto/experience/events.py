@@ -177,10 +177,11 @@ def _outcome_wire(trip: SettledTrip) -> dict:
     没有入场时刻，口径闸也无从判定（评审 P0-3）。
     """
     wire = dict(trip_meta_wire(trip))
+    wire.pop("costErrorBps", None)
     wire.update({"side": trip.side, "entryTs": trip.entry_ts, "exitTs": trip.exit_ts,
                  "feeKnown": trip.fee_known})
     for attr, key in (("gross_pnl_usd", "grossPnlUsd"), ("net_pnl_usd", "netPnlUsd"),
-                      ("edge_error_bps", "edgeErrorBps"), ("cost_error_bps", "costErrorBps")):
+                      ("edge_error_bps", "edgeErrorBps"), ("fee_error_bps", "feeErrorBps")):
         value = _finite(getattr(trip, attr, None))
         if value is not None:
             wire[key] = value
@@ -189,7 +190,7 @@ def _outcome_wire(trip: SettledTrip) -> dict:
 
 def _finite(value) -> float | None:
     """有限浮点或 `None`（**绝不填 0**：0 会被聚合读成「成本为零」）。"""
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     try:
         number = float(value)

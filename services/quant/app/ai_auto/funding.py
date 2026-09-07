@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -36,6 +37,35 @@ class FundingSnapshot:
     # 资金费账本只认这一个布尔量。默认 `False` 是刻意的方向安全选择：单测里直接构造的快照、以及
     # 升级期尚未刷新过的快照，一律按「未知 ⇒ 不计提」处理，绝不把兜底值当真值记账。
     interval_known: bool = False
+    interval_source: str = "unknown"
+
+
+def _number(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _snapshot_from(row: dict, now_wall: float) -> FundingSnapshot | None:
+    rate = _number(row.get("fundingRate"))
+    if rate is None:
+        return None
+    current = _number(row.get("fundingTs")) or 0
+    upcoming = _number(row.get("nextFundingTs")) or 0
+    interval = _number(row.get("intervalS")) or 0
+    known = (row.get("intervalKnown") is True
+             and current > 0 and upcoming > current
+             and current.is_integer() and upcoming.is_integer()
+             and interval > 0 and interval == upcoming - current)
+    return FundingSnapshot(
+        rate=rate, funding_ts=int(current), next_funding_ts=int(upcoming),
+        interval_s=interval, fetched_wall=float(now_wall),
+        interval_known=known,
+        interval_source="exchange_schedule" if known else "unknown")
 
 
 class FundingCache:
@@ -72,13 +102,10 @@ class FundingCache:
             return False
         if not row:
             return False
-        self._snapshot = FundingSnapshot(
-            rate=float(row.get("fundingRate") or 0.0),
-            funding_ts=int(row.get("fundingTs") or 0),
-            next_funding_ts=int(row.get("nextFundingTs") or 0),
-            interval_s=float(row.get("intervalS") or 0.0),
-            interval_known=bool(row.get("intervalKnown")),
-            fetched_wall=float(now_wall))
+        snapshot = _snapshot_from(row, now_wall)
+        if snapshot is None:
+            return False
+        self._snapshot = snapshot
         return True
 
     def snapshot(self, now_wall: float) -> FundingSnapshot | None:
@@ -98,4 +125,5 @@ class FundingCache:
         return {"fundingRate": snap.rate, "fundingTs": snap.funding_ts,
                 "nextFundingTs": snap.next_funding_ts, "intervalS": snap.interval_s,
                 # 排查资金费账本为何不计提时，第一件要看的就是这个键（[P0-1]）。
-                "intervalKnown": snap.interval_known}
+                "intervalKnown": snap.interval_known,
+                "intervalSource": snap.interval_source}

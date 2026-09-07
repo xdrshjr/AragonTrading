@@ -8,7 +8,7 @@ import pytest
 
 from app.ai_auto import prompts
 from app.ai_auto.decision_memory import (
-    RoundDecisionRecord, build_decision_facts, canonical_json,
+    EVIDENCE_VERSION, RoundDecisionRecord, build_decision_facts, canonical_json,
 )
 
 
@@ -48,7 +48,7 @@ def _hash(text):
 def test_snapshot_distinguishes_disabled_from_enabled_empty_rendering():
     assert callable(getattr(prompts, "build_advisory_evidence", None))
     snapshot = prompts.build_advisory_evidence({"experience": {"l0": []}})
-    assert snapshot["evidenceVersion"] == 3
+    assert snapshot["evidenceVersion"] == EVIDENCE_VERSION
     assert snapshot["intel"]["enabled"] is False
     assert snapshot["intel"]["sourceHash"] is None
     assert snapshot["experience"]["enabled"] is True
@@ -77,7 +77,7 @@ def test_snapshot_matches_renderers_and_freezes_full_wire(monkeypatch):
             "sourceHash": section["sourceHash"],
             "renderedHash": section["renderedHash"],
         }
-    assert payload["decisionFacts"]["evidenceVersion"] == 3
+    assert payload["decisionFacts"]["evidenceVersion"] == EVIDENCE_VERSION
     assert "advisorySnapshot" not in payload["decisionFacts"]
 
 
@@ -167,7 +167,7 @@ async def test_decide_mutation_retry_reflection_and_commit_share_snapshot():
     assert entry["reflectionEvidence"]["intelExpand"]["text"] == (
         "独立反思扩展")
     assert entry["reflectionEvidence"]["sent"] is True
-    assert entry["evidenceVersion"] == 3
+    assert entry["evidenceVersion"] == EVIDENCE_VERSION
 
 
 @pytest.mark.asyncio
@@ -184,7 +184,7 @@ async def test_commit_unsent_or_different_round_never_reuses_prior_snapshot():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", [None, 2, 4])
+@pytest.mark.parametrize("version", [None, 2, 3, 99])
 async def test_old_summary_cannot_upgrade_by_new_capability_or_resummarize(version):
     from app.agent.llm.base import StreamEvent
     decider = _decider([[StreamEvent("text_delta", text="重新摘要"),
@@ -192,7 +192,7 @@ async def test_old_summary_cannot_upgrade_by_new_capability_or_resummarize(versi
     decider.seed_from_snapshot(summary="旧错误结论", last_round=1,
         facts_version=2, evidence_version=version)
     memory = decider.memory_wire()
-    assert memory["evidenceVersion"] == 3
+    assert memory["evidenceVersion"] == EVIDENCE_VERSION
     assert memory["summaryEvidenceVersion"] is None
     assert memory["legacyNarrative"] is True
     assert await decider.summarize() == "重新摘要"
@@ -204,7 +204,7 @@ async def test_old_summary_cannot_upgrade_by_new_capability_or_resummarize(versi
 async def test_summary_failure_and_cancel_preserve_all_provenance_fields():
     decider = _decider([])
     decider.seed_from_snapshot(summary="完整证据摘要", last_round=4,
-        facts_version=2, evidence_version=3, summary_as_of_ts=12)
+        facts_version=2, evidence_version=EVIDENCE_VERSION, summary_as_of_ts=12)
     before = decider.memory_wire()
     assert await decider.summarize() is None
     assert decider.memory_wire() == before
@@ -253,15 +253,17 @@ async def test_successful_summary_tracks_actual_material_completeness(omitted):
     assert await decider.summarize() == "新摘要"
     memory = decider.memory_wire()
     assert memory["legacyNarrative"] is omitted
-    assert memory["summaryEvidenceVersion"] == (None if omitted else 3)
+    assert memory["summaryEvidenceVersion"] == (
+        None if omitted else EVIDENCE_VERSION)
     assert memory["summaryAsOfTs"] is not None
 
 
-def test_legacy_flag_survives_v3_version_and_empty_summary_has_no_version():
+def test_legacy_flag_survives_current_version_and_empty_summary_has_no_version():
     decider = _decider([])
     assert decider.memory_wire()["summaryEvidenceVersion"] is None
     decider.seed_from_snapshot(summary="混合旧证据", last_round=4,
-        facts_version=2, evidence_version=3, legacy_narrative=True)
+        facts_version=2, evidence_version=EVIDENCE_VERSION,
+        legacy_narrative=True)
     assert decider.memory_wire()["summaryEvidenceVersion"] is None
     assert decider.memory_wire()["legacyNarrative"] is True
 

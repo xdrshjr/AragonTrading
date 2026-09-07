@@ -18,6 +18,7 @@ import {
   type AiTradeSliceRow,
 } from "@/lib/aiTradeProfitability";
 import { colorForReturn, signed } from "@/lib/format";
+import ProfitabilityCoverage from "./ProfitabilityCoverage";
 
 /**
  * 跨会话盈利体检卡（ai-trade-realized-edge-calibration 轴 B）。
@@ -48,33 +49,53 @@ export default function ProfitabilityCard() {
     queryFn: () => aiTradeHistoryApi.profitability(),
   });
   const data = query.data;
-  // 没有任何历史往返 ⇒ 整卡不渲染（绝不在一个没有数据的账户上挂一张空表）。
-  if (query.isPending || !data || data.sampleTrips === 0) return null;
+  if (query.isError) return <div role="alert"
+    className="flex min-w-0 flex-wrap gap-2 text-xs text-[var(--muted)]">
+    盈利体检取数失败
+    <button type="button" onClick={() => void query.refetch()}
+      className="rounded focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)]">
+      重试
+    </button>
+  </div>;
+  if (query.isPending || !data) return null;
+  if (data.schemaVersion != null && data.schemaVersion !== 2) {
+    return <p className="text-xs text-[var(--muted)]">此版本盈利详情暂不可读</p>;
+  }
+  if ((data.coverage?.totalTrips ?? data.sampleTrips) === 0
+    && !data.coverage?.structuralIssueCount) return null;
 
   const { pooled, risk, verdict } = data;
   return (
     <div
-      className="flex flex-col gap-2 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2"
+      className="flex min-w-0 max-w-full flex-col gap-2 break-words rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2"
       data-testid="ai-profitability-card"
     >
-      <div className="flex items-baseline justify-between gap-2">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
         <span className="text-xs text-[var(--muted)]">跨会话盈利体检 · 池化口径</span>
         <Badge tone={VERDICT_TONES[verdict.code] ?? "neutral"}>{verdict.title}</Badge>
       </div>
       <p className="text-[10px] leading-relaxed text-[var(--muted)]" data-testid="ai-profitability-verdict">
         {verdict.detail}
       </p>
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <Cell label={`已实现净额（${pooled.roundTrips} 笔）`} value={signed(pooled.netPnlUsd ?? 0)} tone={pooled.netPnlUsd} />
-        <Cell label="胜率" value={fmtRate(pooled.winRate)} />
+      <ProfitabilityCoverage coverage={data.coverage}
+        schemaVersion={data.schemaVersion} />
+      <div className="grid gap-2"
+        style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 140px), 1fr))" }}>
+        <div data-testid="ai-profitability-net">
+          <Cell label={`交易净额（${pooled.roundTrips} 笔，不含资金费）`}
+            value={pooled.netPnlUsd == null ? "—" : signed(pooled.netPnlUsd)}
+            tone={pooled.netPnlUsd} />
+        </div>
+        <Cell label={`胜率（${pooled.roundTrips} 笔）`} value={fmtRate(pooled.winRate)} />
         <Cell label="赔率 / 盈亏平衡" value={payoffText(pooled)} />
-        <Cell label="每笔期望" value={fmtUsd(pooled.expectancyUsd)} tone={pooled.expectancyUsd} />
+        <Cell label={`每笔期望（${pooled.roundTrips} 笔）`} value={fmtUsd(pooled.expectancyUsd)} tone={pooled.expectancyUsd} />
       </div>
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+      <div className="grid gap-2"
+        style={{ gridTemplateColumns: "repeat(auto-fit, minmax(min(100%, 140px), 1fr))" }}>
         <Cell label={`t 统计量（${pooled.roundTrips} 笔）`} value={fmtOrDash(pooled.tStat, 3)} />
         <Cell label={`R 中位（${risk.rSamples} 笔可算）`} value={fmtOrDash(risk.rP50, 3)} />
-        <Cell label="触及 ±1R 占比" value={fmtRate(risk.reachedOneRShare)} />
-        <Cell label="止损利用率中位" value={fmtRate(risk.stopUtilizationP50)} />
+        <Cell label={`触及 ±1R 占比（${risk.rSamples} 笔）`} value={fmtRate(risk.reachedOneRShare)} />
+        <Cell label={`止损利用率中位（${risk.stopUtilizationSamples ?? "—"} 笔）`} value={fmtRate(risk.stopUtilizationP50)} />
       </div>
       {/* [P0-4] 这一行是本轮最该上屏的那个数，且**必须**与 feeCoverage 同行（G-9）。 */}
       <p className="text-[10px] leading-relaxed text-[var(--text)]" data-testid="ai-profitability-travel">
@@ -96,7 +117,7 @@ export default function ProfitabilityCard() {
       <button
         type="button"
         onClick={() => setOpenSlices((v) => !v)}
-        className="self-start text-[10px] text-[var(--muted)] hover:text-[var(--text)]"
+        className="self-start rounded text-[10px] text-[var(--muted)] hover:text-[var(--text)] focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
         aria-expanded={openSlices}
       >
         {openSlices ? "▾" : "▸"} 分层切片（每行自带分母）
@@ -109,7 +130,7 @@ export default function ProfitabilityCard() {
         </div>
       )}
       <p className="text-[10px] leading-relaxed text-[var(--muted)]">
-        全部比例一律池化（Σ分子 / Σ分母），绝不对各局的比值求平均；满 {data.minTrips} 笔往返才下结论。
+        全部比例按各自样本池化；总体证据完整且满 {data.minTrips} 笔往返才下结论。
         这是一张历史统计，不构成对未来的任何承诺。
       </p>
     </div>
@@ -123,9 +144,17 @@ function SliceGroup({ label, rows }: { label: string; rows: AiTradeSliceRow[] })
       <span className="text-[10px] text-[var(--muted)]">{label}</span>
       {rows.map((row) => (
         <span key={row.key} className="tabular text-[10px] text-[var(--text)]">
-          {row.key} · {row.trips} 笔 · 净额{" "}
-          <span style={{ color: colorForReturn(row.netPnlUsd ?? 0) }}>{signed(row.netPnlUsd ?? 0)}</span> · 胜率{" "}
-          {fmtRate(row.winRate)} · R 中位 {fmtOrDash(row.medianRMultiple, 3)}
+          {row.key} · {row.totalTrips == null ? `${row.trips} 笔`
+            : `可核算 ${row.netEligibleTrips ?? row.trips} / 总往返 ${row.totalTrips} 笔 · 未纳入 ${row.excludedTrips ?? "—"} 笔`}
+          {Boolean(row.coverage?.structuralIssueCount) &&
+            ` · 结构异常 ${row.coverage?.structuralIssueCount} 条`}
+          {" · 净额 "}
+          <span style={{ color: row.netPnlUsd == null
+            ? "var(--muted)" : colorForReturn(row.netPnlUsd) }}>
+            {row.netPnlUsd == null ? "—" : signed(row.netPnlUsd)}
+          </span> · 胜率（{row.netSamples ?? row.trips} 笔）{" "}
+          {fmtRate(row.winRate)} · R 中位（{row.rSamples ?? "—"} 笔）{" "}
+          {fmtOrDash(row.medianRMultiple, 3)}
         </span>
       ))}
     </div>
@@ -134,10 +163,10 @@ function SliceGroup({ label, rows }: { label: string; rows: AiTradeSliceRow[] })
 
 function Cell({ label, value, tone }: { label: string; value: string; tone?: number | null }) {
   return (
-    <div className="flex flex-col gap-0.5 rounded-md bg-[var(--surface-2)] px-2.5 py-1.5">
+    <div className="flex min-w-0 flex-col gap-0.5 rounded-md bg-[var(--surface-2)] px-2.5 py-1.5">
       <span className="text-[10px] text-[var(--muted)]">{label}</span>
       <span
-        className="tabular text-sm font-medium"
+        className="overflow-x-auto whitespace-nowrap tabular text-sm font-medium"
         style={{ color: tone == null ? "var(--text)" : colorForReturn(tone) }}
       >
         {value}

@@ -14,7 +14,7 @@ def entry(round_no=1):
     evidence = bound_summary_evidence(build_advisory_evidence(
         {**scope, "round": round_no}))
     return {"round": round_no, "trigger": "interval",
-            "evidenceVersion": 3, **evidence,
+            "evidenceVersion": 4, **evidence,
             "proposal": {"action": "hold"},
             "decision": {"action": "hold"}, "finalDecision": {"action": "hold"},
             "executed": {"ok": True, "traded": False},
@@ -135,8 +135,8 @@ def test_advisory_wire_changes_are_material_evidence(key, first, changed):
         build_evidence_fingerprint({**baseline, key: changed}))
 
 
-@pytest.mark.parametrize("version", [None, 2, 4])
-def test_non_v3_rounds_never_fold(version):
+@pytest.mark.parametrize("version", [None, 2, 3, 99])
+def test_non_v4_rounds_never_fold(version):
     left, right = entry(), entry(2)
     left["evidenceVersion"] = right["evidenceVersion"] = version
     assert len(compact_journal_for_summary([left, right])) == 2
@@ -360,8 +360,9 @@ def test_backtest_position_cost_uses_paid_fee_and_current_funding(monkeypatch, s
     runner, frame = _integrity_backtest(monkeypatch)
     entry_ts, ts = int(frame.iloc[60]["ts"]), int(frame.iloc[61]["ts"])
     runner._curve = BacktestFundingCurve([
-        {"fundingTs": ts - 28800, "fundingRate": .001},
-        {"fundingTs": ts, "fundingRate": .001}])
+        {"fundingTs": ts - 57600, "realizedRate": .001},
+        {"fundingTs": ts - 28800, "realizedRate": .001},
+        {"fundingTs": ts, "realizedRate": .001}])
     runner._execute(TradeDecision(f"open_{side}", .5, .9, "测试"))
     runner.main.fill_pending(1.234e-8, entry_ts, 60)
     runner._track_ledgers(ts, 1.234e-8)

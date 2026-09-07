@@ -86,7 +86,7 @@ it("上次结算标明持仓依据、费用调整来源及未认证的旧摘要"
   expect(screen.getByText("-0.30 USDT")).toBeInTheDocument();
   expect(screen.queryByText(/手续费返现/)).not.toBeInTheDocument();
   expect(screen.getByText("上下文证据版本")).toBeInTheDocument();
-  expect(screen.getByText(/当前记录 v3/)).toBeInTheDocument();
+  expect(screen.getByText(/当前记录 历史证据 v3/)).toBeInTheDocument();
   expect(screen.getByText(/摘要证据未确认/)).toBeInTheDocument();
   expect(screen.getByText(/包含旧叙述/)).toBeInTheDocument();
 });

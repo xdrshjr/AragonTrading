@@ -9,8 +9,8 @@ crossingLegs × (halfSpreadBps + impactBps) + fundingCarryBps`。纯函数、无
 1. **决策轮内零网络 IO**。资金费率由调用方以「会话级内存快照」形式传入（`FundingSnapshot`），
    本模块绝不自己取数。
 2. **取数失败绝不静默按 0 计**（§3.5）：`funding_rate is None` ⇒ `funding_carry_bps is None` +
-   `confidence="degraded"`；而**有意关闭**资金费率建模时调用方传 `0.0` ⇒ `confidence` 保持 `"ok"`。
-   「缺数据」与「有意不建模」是两件事，混为一谈会让门禁在断网时悄悄放松。
+   `confidence="degraded"`；只有 `funding_enabled=False` 表示有意关闭，
+   此时 `confidence="ok"`。零费率不代表证据完整。
 3. **资金费率方向感知且只取不利侧**：收费的一侧不给 edge 折扣（绝不因预期收费而放松门禁），
    付费的一侧全额计入。
 
@@ -53,14 +53,14 @@ class CostQuery:
     side: str                           # "long" | "short"（资金费率收 / 付方向）
     bar_seconds: int
     half_spread_bps: float | None = None    # None ⇒ 回落 params.half_spread_fallback_bps
-    funding_rate: float | None = None       # None ⇒ 缺席降级；0.0 ⇒ 有意不建模
+    funding_rate: float | None = None       # None ⇒ 缺席；有限零也是有效费率
     funding_interval_s: float = DEFAULT_FUNDING_INTERVAL_S
-    # 结算周期是否**真的取自交易所**（OKX 由 `nextFundingTs − fundingTs` 得出真实值，会动态变为
-    # 1/2/4/8 小时）。False ⇒ 上面那个数只是保守回落值，文案必须写「结算周期未知，按 8h 保守估算」
-    # 而不能报出一个确定的周期（holding-horizon §2.7 的诚实约束）。
+    # 已确认安排与历史观察间隔分开；未知安排也可按正有限观察间隔估计。
     funding_interval_known: bool = False
     liquidity_assumption: str = "may_take"
     fee_source: str = "config"
+    funding_enabled: bool = True
+    funding_interval_source: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -75,14 +75,14 @@ class CostBreakdown:
     funding_carry_bps: float | None
     total_bps: float
     confidence: str                     # "ok" | "degraded"
-    # 资金费的**期数与结算周期**（holding-horizon §2.7）：1–2 天持仓必须让模型看见「跨几个结算点」，
-    # 而 OKX 的结算周期会动态变为 1/2/4/8 小时，故绝不能在文案里写死 8h。取不到 `intervalS` 时
-    # `funding_interval_s is None` ⇒ 文案如实写「结算周期未知，按 8h 保守估算」。
+    # 确认周期和实际采用的估计间隔分栏披露，关闭时均为 None。
     funding_periods: int | None = None
     funding_interval_s: float | None = None
-    model_version: int = 2
+    model_version: int = 3
     liquidity_assumption: str = "may_take"
     fee_source: str = "config"
+    funding_interval_source: str = "unknown"
+    funding_assumed_interval_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -100,7 +100,7 @@ class RoundCostSnapshot:
     funding: object = None
     fee_snapshot: object = None
     funding_enabled: bool = True
-    model_version: int = 2
+    model_version: int = 3
 
 
 def resolve_cost_params(settings, *, rates: tuple[float, float] | None = None,
@@ -151,11 +151,33 @@ def backtest_params(settings, *, expected_hold_bars: int | None = None) -> CostP
 
 def _finite(value) -> float | None:
     """数值归一：非有限 / 不可转 ⇒ None（绝不把 NaN 带进成本判定）。"""
+    if isinstance(value, bool):
+        return None
     try:
         out = float(value)
     except (TypeError, ValueError):
         return None
     return out if math.isfinite(out) else None
+
+
+def effective_funding_interval(value) -> float:
+    """所有周期计算和披露共用同一个正有限间隔。"""
+    interval = _finite(value)
+    return (interval if interval is not None and interval > 0
+            else DEFAULT_FUNDING_INTERVAL_S)
+
+
+def _interval_evidence(query: CostQuery) -> tuple[bool, str, float]:
+    interval = _finite(query.funding_interval_s)
+    valid = interval is not None and interval > 0
+    source = query.funding_interval_source
+    if source not in ("unknown", "exchange_schedule", "historical_observed"):
+        source = "unknown"
+    known = (query.funding_interval_known is True and valid
+             and source != "historical_observed")
+    if not valid or (source == "exchange_schedule" and not known):
+        source = "unknown"
+    return known, source, effective_funding_interval(interval)
 
 
 def funding_periods(query: CostQuery, params: CostParams) -> int:
@@ -164,9 +186,9 @@ def funding_periods(query: CostQuery, params: CostParams) -> int:
     抽成公开纯函数是为了让 §2.7 的披露文案与成本判定读**同一个数**——在成本模型里算一遍、又在文案
     里按 8h 现算一遍，正是 [R-5] 那类「UI 说一套、判定做另一套」的起点。
     """
-    interval = _finite(query.funding_interval_s) or DEFAULT_FUNDING_INTERVAL_S
+    interval = effective_funding_interval(query.funding_interval_s)
     hold_s = max(0.0, float(params.expected_hold_bars) * float(query.bar_seconds))
-    return max(1, math.ceil(hold_s / interval)) if interval > 0 else 1
+    return max(1, math.ceil(hold_s / interval))
 
 
 def _funding_carry_bps(query: CostQuery, params: CostParams) -> float | None:
@@ -175,6 +197,8 @@ def _funding_carry_bps(query: CostQuery, params: CostParams) -> float | None:
     `periods = ceil(expected_hold_bars × bar_seconds / funding_interval_s)`（至少 1 期：跨结算点
     的持仓要付整期），`signed = rate × 1e4 × periods × (+1 多 / −1 空)`，取 `max(0.0, signed)`。
     """
+    if not query.funding_enabled:
+        return 0.0
     rate = _finite(query.funding_rate)
     if rate is None:
         return None
@@ -205,6 +229,8 @@ def estimate_round_trip_cost(query: CostQuery, params: CostParams) -> CostBreakd
     impact = max(0.0, params.impact_bps)
     legs = 1 if maker else 2
     carry = _funding_carry_bps(query, params)
+    known, source, interval = _interval_evidence(query)
+    enabled = query.funding_enabled
     total = fee_open + fee_close + legs * (half_spread + impact) + (carry or 0.0)
     return CostBreakdown(
         fee_open_bps=round(fee_open, _ROUND_BPS), fee_close_bps=round(fee_close, _ROUND_BPS),
@@ -212,12 +238,15 @@ def estimate_round_trip_cost(query: CostQuery, params: CostParams) -> CostBreakd
         crossing_legs=legs,
         funding_carry_bps=None if carry is None else round(carry, _ROUND_BPS),
         total_bps=round(total, _ROUND_BPS),
-        confidence="degraded" if carry is None else "ok",
+        confidence=("degraded" if enabled and (carry is None or not known)
+                    else "ok"),
         # 期数恒可算（只依赖 `expected_hold_bars × bar_seconds` 与结算周期），故即使 rate 缺席也如实
         # 下发——「跨几个结算点」与「这几期要付多少」是两件事，前者不该被后者的缺失连坐。
-        funding_periods=funding_periods(query, params),
-        funding_interval_s=(_finite(query.funding_interval_s)
-                            if query.funding_interval_known else None),
+        funding_periods=funding_periods(query, params) if enabled else None,
+        funding_interval_s=interval if enabled and known else None,
+        funding_interval_source=source if enabled else "unknown",
+        funding_assumed_interval_s=(interval if enabled and not known
+                                    else None),
         liquidity_assumption=("simulation"
             if params.liquidity_assumption == "simulation"
             else query.liquidity_assumption), fee_source=(params.fee_source
@@ -234,7 +263,11 @@ def cost_wire(cost: CostBreakdown | None) -> dict | None:
             "totalBps": cost.total_bps, "confidence": cost.confidence,
             "modelVersion": cost.model_version,
             "liquidityAssumption": cost.liquidity_assumption,
-            "feeSource": cost.fee_source}
+            "feeSource": cost.fee_source,
+            "fundingPeriods": cost.funding_periods,
+            "fundingIntervalS": cost.funding_interval_s,
+            "fundingIntervalSource": cost.funding_interval_source,
+            "fundingAssumedIntervalS": cost.funding_assumed_interval_s}
 
 
 def query_for_preview(*, ord_type: str, side: str, bar_seconds: int, funding,
@@ -256,13 +289,35 @@ def query_for_preview(*, ord_type: str, side: str, bar_seconds: int, funding,
     """
     if not funding_enabled:
         return CostQuery(ord_type=ord_type, side=side, bar_seconds=bar_seconds,
-                         half_spread_bps=half_spread_bps, funding_rate=0.0)
+                         half_spread_bps=half_spread_bps, funding_rate=0.0,
+                         funding_enabled=False)
     if funding is None:
         return CostQuery(ord_type=ord_type, side=side, bar_seconds=bar_seconds,
                          half_spread_bps=half_spread_bps, funding_rate=None)
-    return CostQuery(ord_type=ord_type, side=side, bar_seconds=bar_seconds,
-                     half_spread_bps=half_spread_bps, funding_rate=funding.rate,
-                     funding_interval_s=funding.interval_s, funding_interval_known=True)
+    known, source = _snapshot_interval_evidence(funding)
+    return CostQuery(
+        ord_type=ord_type, side=side, bar_seconds=bar_seconds,
+        half_spread_bps=half_spread_bps, funding_rate=_finite(funding.rate),
+        funding_interval_s=effective_funding_interval(funding.interval_s),
+        funding_interval_known=known, funding_interval_source=source)
+
+
+def _snapshot_interval_evidence(funding) -> tuple[bool, str]:
+    interval = _finite(funding.interval_s)
+    current = _finite(getattr(funding, "funding_ts", None))
+    upcoming = _finite(getattr(funding, "next_funding_ts", None))
+    source = getattr(funding, "interval_source", "unknown")
+    valid = interval is not None and interval > 0
+    known = (getattr(funding, "interval_known", False) is True
+             and valid and _finite(funding.rate) is not None
+             and current is not None and current > 0
+             and upcoming is not None and upcoming > current
+             and interval == upcoming - current)
+    if source == "historical_observed" and valid:
+        return False, source
+    if source == "exchange_schedule" and known:
+        return True, source
+    return known, "unknown"
 
 
 def query_for_decision(decision, *, bar_seconds: int, funding, funding_enabled: bool,

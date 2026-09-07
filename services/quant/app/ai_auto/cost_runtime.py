@@ -146,7 +146,7 @@ class CostRuntime:
         snap = self._round_cost
         if snap is None:
             return None
-        return {"modelVersion": 2, "params": asdict(snap.params),
+        return {"modelVersion": snap.model_version, "params": asdict(snap.params),
                 "asOfTs": snap.as_of_ts, "feeSource": snap.fee_source,
                 "stale": snap.stale, "spreadBps": snap.spread_bps,
                 "impactBps": snap.impact_bps, "fundingBps": snap.funding_bps,
@@ -638,8 +638,7 @@ class CostRuntime:
         """冻结待成交订单的本轮估计，独立于可选解释输出开关。"""
         estimate = build_round_estimate(out, decision, wake_kind)
         if estimate is not None and self._round_cost is not None:
-            estimate = replace(estimate, as_of_ts=self._round_cost.as_of_ts,
-                               model_version=self._round_cost.model_version)
+            estimate = replace(estimate, as_of_ts=self._round_cost.as_of_ts)
         self.attribution.note_estimate(estimate)
 
     def pending_estimate(self) -> dict | None:

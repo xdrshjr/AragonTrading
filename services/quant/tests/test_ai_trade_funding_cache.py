@@ -9,6 +9,7 @@ from app.ai_auto.cost_model import estimate_round_trip_cost, resolve_cost_params
 from app.ai_auto.decider import TradeDecision
 from app.ai_auto.funding import FundingCache
 from app.config import Settings
+import pytest
 
 _ROW = {"fundingRate": 0.0001, "fundingTs": 1_700_000_000, "nextFundingTs": 1_700_028_800,
         "intervalS": 28800.0}
@@ -93,3 +94,35 @@ async def test_wire_is_camel_case_readonly_echo():
     await cache.refresh(fetch, 1_000.0)
     wire = cache.wire(1_000.0)
     assert wire["fundingRate"] == 0.0001 and wire["intervalS"] == 28800.0
+
+
+@pytest.mark.parametrize("rate", [None, "", True, float("nan"), float("inf")])
+async def test_bad_rate_does_not_refresh_previous_snapshot_age(rate):
+    cache = FundingCache("X", ttl_s=10, stale_factor=2)
+    fetch, _ = _counting_fetch({**_ROW, "intervalKnown": True})
+    assert await cache.refresh(fetch, 100)
+    original = cache.snapshot(100)
+    bad, _ = _counting_fetch({**_ROW, "fundingRate": rate})
+    assert await cache.refresh(bad, 110) is False
+    assert cache.snapshot(110) is original
+    assert cache.snapshot(121) is None
+
+
+@pytest.mark.parametrize("change", [
+    {"fundingTs": 0}, {"nextFundingTs": 1},
+    {"intervalS": -1}, {"intervalS": True}, {"intervalKnown": False},
+])
+async def test_cache_revalidates_official_schedule(change):
+    cache = FundingCache("X", ttl_s=10)
+    fetch, _ = _counting_fetch({**_ROW, "intervalKnown": True, **change})
+    assert await cache.refresh(fetch, 100)
+    snapshot = cache.snapshot(100)
+    assert snapshot.interval_known is False
+    assert snapshot.interval_source == "unknown"
+
+
+async def test_valid_official_schedule_marks_exchange_source():
+    cache = FundingCache("X", ttl_s=10)
+    fetch, _ = _counting_fetch({**_ROW, "intervalKnown": True})
+    assert await cache.refresh(fetch, 100)
+    assert cache.wire(100)["intervalSource"] == "exchange_schedule"

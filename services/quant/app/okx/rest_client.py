@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import time
 from collections.abc import Callable
@@ -36,6 +37,25 @@ _INST_META_TTL_SECONDS = 3600.0
 _FUNDING_TTL_SECONDS = 30.0
 # 结算周期缺失时的保守回落（OKX 主流永续为 8h）。
 _DEFAULT_FUNDING_INTERVAL_S = 28800.0
+
+
+def _funding_number(value) -> float | None:
+    """资金费端点专用解析，不改变其他端点的兼容归一。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _funding_seconds(value) -> int | None:
+    """仅在 REST 边界将原始毫秒时间归一为正秒值。"""
+    number = _funding_number(value)
+    if number is None or number < 1000 or not number.is_integer():
+        return None
+    return int(number) // 1000
 
 # 公共读链路在健康登记簿里的通道键与中文标签（值域属于后端，前端只转发）。
 PUBLIC_LINK_KEY = "rest:public"
@@ -516,17 +536,17 @@ class OKXRestClient:
         row = next((r for r in rows if r.get("instId") == inst_id), rows[0] if rows else None)
         if row is None:
             return None
-        funding_ts = int(_optional_float(row.get("fundingTime")) or 0.0) // 1000
-        next_ts = int(_optional_float(row.get("nextFundingTime")) or 0.0) // 1000
-        span = next_ts - funding_ts
+        funding_ts = _funding_seconds(row.get("fundingTime"))
+        next_ts = _funding_seconds(row.get("nextFundingTime"))
+        known = (funding_ts is not None and next_ts is not None
+                 and next_ts > funding_ts)
+        span = next_ts - funding_ts if known else None
         out = {
-            "fundingRate": _optional_float(row.get("fundingRate")) or 0.0,
+            "fundingRate": _funding_number(row.get("fundingRate")),
             "fundingTs": funding_ts,
             "nextFundingTs": next_ts,
-            "intervalS": max(60.0, float(span)) if span > 0 else _DEFAULT_FUNDING_INTERVAL_S,
-            # 加法键：既有 `intervalS` 的兜底值**一字不改**（改它会连带改写 cost_model 的资金费期数
-            # 与 prompt 文案，越过「只加观测」的边界并打破 prompt 逐字节冻结）。
-            "intervalKnown": span > 0,
+            "intervalS": float(span) if known else _DEFAULT_FUNDING_INTERVAL_S,
+            "intervalKnown": known,
         }
         self._funding_cache[inst_id] = (time.monotonic() + _FUNDING_TTL_SECONDS, out)
         return out
@@ -562,14 +582,13 @@ class OKXRestClient:
         rows = await self._request("/api/v5/public/funding-rate-history", params)
         out: list[dict] = []
         for row in rows or []:
-            ts = int(_optional_float(row.get("fundingTime")) or 0.0) // 1000
-            if ts <= 0:
-                continue
-            realized = _optional_float(row.get("realizedRate"))
+            ts = _funding_seconds(row.get("fundingTime"))
+            realized = _funding_number(row.get("realizedRate"))
             out.append({"fundingTs": ts,
-                        "fundingRate": _optional_float(row.get("fundingRate")) or 0.0,
+                        "fundingRate": _funding_number(row.get("fundingRate")),
                         "realizedRate": realized})
-        out.sort(key=lambda r: r["fundingTs"])
+        out.sort(key=lambda r: (r["fundingTs"] is None,
+                                r["fundingTs"] or 0))
         return out
 
 

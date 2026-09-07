@@ -43,6 +43,27 @@ def leg_fee_evidence(trade: dict) -> tuple[float | None, str]:
     return None, "legacy_unknown"
 
 
+def close_evidence_flags(meta: dict) -> list[str]:
+    """保留每条平仓腿的非实测标记，最终实测腿不能抹去前腿缺口。"""
+    flags = set()
+    if (meta.get("settlementSource") == "local_mark"
+            or meta.get("priceBasis") == "local_mark"):
+        flags.add("local_mark")
+    if meta.get("pnlBasis") == "estimated":
+        flags.add("pnl_estimated")
+    allowed = {
+        "settlementSource": {None, "exchange", "local_mark"},
+        "priceBasis": {None, "exchange", "measured", "local_mark",
+                       "exchange_position_average", "exchange_aggregate_residual"},
+        "pnlBasis": {None, "exchange", "measured", "estimated", "net", "gross"},
+    }
+    if any(meta.get(key) is not None and (
+            not isinstance(meta[key], str) or meta[key] not in values)
+           for key, values in allowed.items()):
+        flags.add("source_unknown")
+    return sorted(flags)
+
+
 def accounted_close_pnl(trade: dict, cost_basis: str | None) -> float | None:
     """返回可用于认证累计的金额，缺开仓费的净额投影保持未知。"""
     meta = trade_meta(trade)
@@ -89,6 +110,7 @@ class _Position:
     invalid: bool = False
     recorded_fee: float = 0.0
     exit_notional: float = 0.0
+    close_evidence_flags: set[str] = field(default_factory=set)
 
 
 class TradeAccountingAccumulator:
@@ -231,6 +253,7 @@ class TradeAccountingAccumulator:
         position.recorded_fee += finite(trade.get("fee")) or 0.0
         position.sources.add(source)
         basis = self.context.get("costBasis")
+        position.close_evidence_flags.update(close_evidence_flags(trade_meta(trade)))
         resolved = resolve_trip_economics(TripPnlInputs(
             basis, accounted_close_pnl(trade, basis), allocation, fee))
         piece = {"grossPnlUsd": resolved.gross_pnl_usd,
@@ -272,6 +295,8 @@ class TradeAccountingAccumulator:
             "recordedFeeUsd": position.recorded_fee,
             "entryTrade": position.entry, "closeTrade": copy.deepcopy(trade),
             "side": position.side, "feeSources": sorted(position.sources),
+            "closeEvidenceFlags": sorted(position.close_evidence_flags),
+            "closeMeta": copy.deepcopy(trade_meta(trade)),
             "accountingVersion": 2}
 
     def snapshot(self, context: dict | None = None) -> dict:

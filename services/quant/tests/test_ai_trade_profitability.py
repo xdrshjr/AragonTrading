@@ -1,6 +1,8 @@
 """轴 B/C 纯核心：池化 vs 等权反例、结论表五态、覆盖率分母（G-6b / G-7 / G-11 / G-22）。"""
 from __future__ import annotations
 
+import pytest
+
 from app.ai_auto.calibration import calibration
 from app.ai_auto.profitability import (
     VerdictGates,
@@ -15,6 +17,9 @@ from app.ai_auto.profitability import (
 def _trip(net: float, *, fee_known: bool = True, cost_bps: float | None = 7.0,
           move: float = 13.9, r: float | None = -0.01, **over) -> dict:
     row = {"netPnlUsd": net, "grossPnlUsd": net + 0.05, "roundTripFeeUsd": 0.05,
+           "netEligible": True, "measuredNetEligible": fee_known,
+           "notionalSource": "contract", "feeMeasurement": "measured" if fee_known else "unknown",
+           "realizedFeeBps": cost_bps if fee_known else None,
            "feeKnown": fee_known, "realizedCostBps": cost_bps if fee_known else None,
            "realizedGrossBps": (net + 0.05) / 145.0 * 1e4,
            "moveBps": move, "rMultiple": r, "stopBps": 500.0, "plannedRr": 2.0,
@@ -97,11 +102,12 @@ def test_verdict_detail_repeats_the_denominators():
     assert "40 笔" in out["detail"] and "推定" in out["detail"] and "费率记录" in out["detail"]
 
 
-def test_slices_carry_their_own_denominator_and_skip_missing_dimensions():
-    """约束 1：每个切片行必带 `trips`；缺该维度的往返**不计入分母**（不是计入并填 0）。"""
+def test_slices_carry_their_own_denominator_and_keep_unknown_dimensions():
+    """v2有意保留unknown桶，使每个切片总体与全局相等。"""
     trips = [_trip(0.1, bar="15m"), _trip(-0.2, bar="15m"), _trip(0.3, bar=None)]
     rows = slice_by(trips, "bar")
-    assert len(rows) == 1 and rows[0]["key"] == "15m" and rows[0]["trips"] == 2
+    assert len(rows) == 2 and rows[0]["key"] == "15m" and rows[0]["trips"] == 2
+    assert rows[1]["key"] == "unknown" and rows[1]["trips"] == 1
     assert set(slices(trips)) == {"byBar", "byInstId", "byExitSource", "byPreset",
                                   "byHorizonProfile", "byConfidenceBucket"}
 
@@ -128,8 +134,9 @@ def test_calibration_blocks_are_honest_about_zero_coverage():
     trips = [_trip(0.1) for _ in range(20)]
     out = calibration(trips, bucket_min_trips=10, model_constant_bps=13.0)
     assert out["edgeNumerator"]["n"] == 0 and out["edgeNumerator"]["conclusive"] is False
-    assert out["edgeNumerator"]["medianRealizedGrossBps"] is not None   # 已实现侧照常有内容
-    assert out["costModel"]["n"] == 20 and out["costModel"]["conclusive"] is True
+    # v2比较值全部只取同一配对集合；描述值仍在pooled。
+    assert out["edgeNumerator"]["medianRealizedGrossBps"] is None
+    assert out["costModel"]["n"] == 0 and out["costModel"]["conclusive"] is False
     assert out["costModel"]["modelConstantBps"] == 13.0
     assert out["confidenceReliability"]["monotonic"] is None
 
@@ -137,11 +144,13 @@ def test_calibration_blocks_are_honest_about_zero_coverage():
 def test_calibration_cost_block_excludes_fee_unknown_trips():
     """轴 C 问二的分母是 `feeTrips`；`note` 必须把那个分母说出来。"""
     trips = ([_trip(0.1, fee_known=False, cost_bps=None) for _ in range(90)]
-             + [_trip(0.1, cost_bps=7.0) for _ in range(10)])
+             + [_trip(0.1, cost_bps=7.0, estFeeBps=7,
+                      modelVersion=3, comparisonVersion=1) for _ in range(10)])
     block = calibration(trips, bucket_min_trips=10, model_constant_bps=13.0)["costModel"]
     assert block["n"] == 10 and block["coverage"] == 0.1
-    assert block["medianRealizedCostBps"] == 7.0
-    assert block["conclusive"] is True and "10" in (block["note"] or "")
+    assert block["medianRealizedFeeBps"] == 7.0
+    assert block["medianRealizedCostBps"] is None
+    assert block["conclusive"] is False and "10" in (block["note"] or "")
 
 
 def test_calibration_confidence_buckets_hide_under_sampled_rates():
@@ -160,3 +169,193 @@ def test_empty_sample_never_raises():
     assert slices([])["byBar"] == []
     assert calibration([], bucket_min_trips=10, model_constant_bps=None)["costModel"]["n"] == 0
     assert verdict(pooled([]), VerdictGates())["code"] == "insufficient_samples"
+
+
+def test_unknown_net_is_not_a_zero_return():
+    rows = [_trip(0, netPnlUsd=value) for value in (None, float("nan"),
+                                                 float("inf"), True)]
+    stats = pooled(rows + [_trip(-1)])
+    assert stats["expectancyUsd"] == -1
+    assert stats["netSamples"] == 1
+
+
+def test_edge_comparison_uses_the_same_pairs():
+    common = dict(netEligible=True, measuredNetEligible=True,
+                  notionalSource="contract", feeMeasurement="measured")
+    rows = [_trip(1, estEdgeBps=10, realizedGrossBps=2, **common),
+            _trip(1, realizedGrossBps=100, **common)]
+    edge = calibration(rows)["edgeNumerator"]
+    assert edge["medianRealizedGrossBps"] == 2
+    assert edge["medianErrorBps"] == -8
+
+
+def test_realized_fees_without_estimates_are_not_pairs():
+    rows = [_trip(1, netEligible=True, measuredNetEligible=True,
+                  notionalSource="contract", feeMeasurement="measured",
+                  comparisonVersion=1, realizedFeeBps=10) for _ in range(10)]
+    fees = calibration(rows)["costModel"]
+    assert fees["n"] == 0
+    assert fees["coverage"] == 0
+    assert fees["conclusive"] is False
+
+
+def test_one_populated_confidence_bucket_is_inconclusive():
+    rows = [_trip(1, netEligible=True, measuredNetEligible=True,
+                  decisionConfidence=.6) for _ in range(10)]
+    assert calibration(rows)["confidenceReliability"]["conclusive"] is False
+
+
+def _sample(*, multiplier=1, **over):
+    from app.ai_auto.profitability_sample import build_profitability_sample
+    trip = {"tripId": "flat", "entryPrice": 100, "exitPrice": 100,
+            "qty": 1, "grossPnlUsd": 0, "feeUsd": 1, "tradingNetUsd": -1,
+            "coverage": "complete", "feeSources": ["measured"], "side": "long",
+            "entryTrade": {"price": 100, "ts": 1, "stopLossPrice": 95,
+                           "takeProfitPrice": 110, "meta": {"wallTs": 10}},
+            "closeTrade": {"price": 100, "ts": 2, "meta": {"wallTs": 20,
+                           "stopAtrMult": 1, "estEdgeBps": 10}}, **over}
+    return build_profitability_sample(trip, {
+        "runId": 1, "instId": "BTC-USDT-SWAP", "ctVal": multiplier,
+        "costBasis": "gross", "bar": "15m", "preset": "balanced"})
+
+
+def test_flat_price_golden_amounts_and_legacy_risk_fields():
+    row = _sample()
+    assert row["netEligible"] and row["measuredNetEligible"]
+    assert row["notionalUsd"] == 100 and row["notionalSource"] == "contract"
+    assert row["realizedFeeBps"] == 100 and row["realizedNetBps"] == -100
+    assert row["rMultiple"] == -.2 and row["riskUsd"] == 5
+    assert row["plannedRr"] == 2 and row["stopBps"] == 500
+    assert row["stopAtrMult"] == 1 and row["holdSeconds"] == 10
+    assert row["edgeErrorBps"] == -10 and row["costErrorBps"] is None
+
+
+def test_derived_notional_is_descriptive_and_sign_checked():
+    row = _sample(multiplier=None, exitPrice=101, grossPnlUsd=1,
+                  tradingNetUsd=0)
+    assert row["notionalSource"] == "legacy_derived"
+    assert row["notionalUsd"] == 100
+    assert _sample(multiplier=None)["notionalUsd"] is None
+    assert _sample(multiplier=None, exitPrice=101, grossPnlUsd=-1)["notionalUsd"] is None
+    from app.ai_auto.profitability_sample import select_comparison_pairs
+    assert select_comparison_pairs([row], "edge") == ()
+
+
+@pytest.mark.parametrize("value", [None, float("nan"), float("inf"), True])
+def test_invalid_sample_net_is_excluded_and_serializable(value):
+    import json
+    row = _sample(tradingNetUsd=value)
+    assert row["netPnlUsd"] is None and row["netEligible"] is False
+    assert row["exclusionReason"] == "net_invalid"
+    json.dumps(row, allow_nan=False)
+
+
+def test_fee_scale_and_travel_have_separate_same_pair_denominators():
+    rows = [_trip(1, move=10, cost_bps=2),
+            _trip(1, move=100, cost_bps=None),
+            _trip(1, move=None, cost_bps=100)]
+    stats = pooled(rows, total_trips=5)
+    assert stats["feeTrips"] == 3 and stats["feeBpsTrips"] == 2
+    assert stats["travelComparisonTrips"] == 1
+    assert stats["travelComparisonCoverage"] == .2
+    assert stats["travelMedianMoveBps"] == 10
+    assert stats["travelMedianFeeBps"] == 2
+    assert stats["travelToCostRatio"] == 5
+
+
+def test_six_slices_keep_population_and_invalid_confidence_unknown():
+    rows = [_sample(), _sample(feeUsd=None, tradingNetUsd=None,
+                              coverage="partial")]
+    for index, row in enumerate(rows):
+        row["decisionConfidence"] = [True, 2][index]
+    for values in slices(rows).values():
+        assert sum(r["totalTrips"] for r in values) == 2
+        assert sum(r["netEligibleTrips"] for r in values) == 1
+        assert sum(r["excludedTrips"] for r in values) == 1
+    assert slices(rows)["byConfidenceBucket"][0]["key"] == "unknown"
+
+
+def test_fee_comparison_does_not_mix_total_cost_and_fee_cost():
+    row = _trip(1, cost_bps=10, estFeeBps=10, estCostBps=16,
+                modelVersion=3, comparisonVersion=1)
+    fees = calibration([row], bucket_min_trips=1)["costModel"]
+    assert fees["medianFeeErrorBps"] == 0
+    assert fees["medianEstTotalCostBps"] == 16
+    assert fees["medianErrorBps"] is None
+    assert fees["availableEstimateTrips"] == fees["availableRealizedTrips"] == fees["n"] == 1
+    for changed in ({"modelVersion": 9}, {"comparisonVersion": 9},
+                    {"feeMeasurement": "estimated"}, {"netEligible": False}):
+        assert calibration([{**row, **changed}])["costModel"]["n"] == 0
+
+
+def test_legacy_frozen_estimate_cannot_borrow_new_close_comparison_fields():
+    row = _sample(entryTrade={"ts": 1, "meta": {"frozenEstimate": {
+        "est_cost_bps": 16, "est_edge_bps": 10}}},
+        closeTrade={"ts": 2, "meta": {"modelVersion": 3,
+            "comparisonVersion": 1, "estFeeBps": 100}})
+    assert row["modelVersion"] == 2
+    assert row["estFeeBps"] is None and row["comparisonVersion"] is None
+    assert row["feeErrorBps"] is None
+
+
+def test_bad_optional_version_metadata_cannot_break_response_serialization():
+    import json
+    row = _sample(closeTrade={"ts": 2, "meta": {
+        "modelVersion": float("nan"), "comparisonVersion": True}})
+    assert row["modelVersion"] is None and row["comparisonVersion"] is None
+    json.dumps(row, allow_nan=False)
+
+
+@pytest.mark.parametrize("basis", ["exchange_position_average", "exchange_aggregate_residual"])
+def test_existing_exchange_price_provenance_is_recognized(basis):
+    from app.ai_auto.accounting_replay import close_evidence_flags
+    assert close_evidence_flags({"priceBasis": basis}) == []
+
+
+@pytest.mark.parametrize("value", [[], {}, True, 42])
+def test_invalid_provenance_metadata_is_a_gap_not_a_booking_error(value):
+    from app.ai_auto.accounting_replay import close_evidence_flags
+    assert close_evidence_flags({"priceBasis": value}) == ["source_unknown"]
+
+
+@pytest.mark.parametrize("frozen", ["corrupt", None, False, 1])
+def test_explicit_broken_frozen_estimate_never_borrows_later_fields(frozen):
+    row = _sample(entryTrade={"ts": 1, "meta": {"frozenEstimate": frozen}},
+                  closeTrade={"ts": 2, "meta": {"estFeeBps": 100,
+                      "modelVersion": 3, "comparisonVersion": 1}})
+    assert row["estFeeBps"] is None
+    assert row["feeErrorBps"] is None
+
+
+def test_optional_text_metadata_is_safe_to_serialize():
+    import json
+    row = _sample(closeTrade={"ts": 2, "meta": {"edgeSource": float("nan"),
+        "exitSource": float("inf"), "wakeKind": [], "costConfidence": {}}})
+    json.dumps(row, allow_nan=False)
+    assert row["exitSource"] == "unknown"
+    assert row["edgeSource"] is None
+
+
+def test_fee_basis_note_reaches_legacy_clients_in_readable_chinese():
+    note = calibration([])["costModel"]["note"]
+    assert "手续费" in note and "不含资金费" in note
+
+
+def test_structural_issues_reach_only_known_run_dimension_slices():
+    """孤立平仓可归属标的和周期，但不能伪造退出来源或往返。"""
+    from app.ai_auto.profitability_sample import ProfitabilityDataset
+    dataset = ProfitabilityDataset(
+        run_dimensions=({"runId": 9, "instId": "ETH-USDT-SWAP",
+                         "bar": "15m", "preset": "balanced",
+                         "horizonProfile": None},),
+        structural_issues=({"runId": 9, "eventKey": "trade:1",
+                            "reason": "missing_open"},),
+    )
+    result = slices([], dataset=dataset)
+    for key in ("byInstId", "byBar", "byPreset"):
+        assert len(result[key]) == 1
+        row = result[key][0]
+        assert row["totalTrips"] == row["netEligibleTrips"] == 0
+        assert row["coverage"]["structuralIssueCount"] == 1
+    for key in ("byExitSource", "byConfidenceBucket", "byHorizonProfile"):
+        assert result[key] == []
