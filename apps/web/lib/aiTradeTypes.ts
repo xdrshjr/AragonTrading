@@ -429,6 +429,10 @@ export interface AiTradeHorizonProfilesResponse {
   // ai-trade-loss-and-liveness-hardening C-1：唤醒下限除数（`0` = 只观测不改行为，本轮默认）。
   // 前端**不复制这个数**，只用它决定渲不渲染那句提示并按下发值现算下限。
   wakeHorizonDivisor?: number;
+  // ai-trade-guided-launch §5.1：运维互锁总闸（`AI_TRADE_REQUIRE_PROFIT_EXIT_WITH_HORIZON`）的
+  // 只读回执。**可选**：老后端不发该键 ⇒ `undefined` ⇒ 前端按 `false` 处理 ⇒ 不阻断，与本轮
+  // 默认同向，是安全的降级方向。`true` ⇒ 前端恢复二次确认，且服务端会 422。
+  requireProfitExitWithHorizon?: boolean;
   profiles: AiTradeHorizonProfile[];
 }
 

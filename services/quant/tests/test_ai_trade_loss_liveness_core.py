@@ -82,10 +82,15 @@ def test_g_a6b_frontend_inert_predicate_mirrors_the_backend_one():
 
     启动之前服务端还没被问过，故前端必须本地算一次；两侧一旦分叉，用户看到的删除线就会与真正
     失效的那一行不是同一行。**判据同构由本用例钉死**（源码扫描：键名逐字一致）。
+
+    ai-trade-guided-launch 轴 B 把 1937 行的弹窗拆成了「壳 + 六步 + 表单 hook」，这段现算表达式
+    随全部受控派生一起搬进了 `launch/useAiTradeLaunchForm.ts`。扫描落点跟着搬——**判据一个字
+    没改**，改的只是它住在哪个文件里。
     """
-    modal = (_WEB / "components" / "Agent" / "AiTradeLaunchModal.tsx").read_text(encoding="utf-8")
-    assert "const inertThresholdKeys = profitGuardEnabled ? []" in modal
-    assert '"ai_trade_profit_guard_hard_tp_return_pct"' in modal
+    hook = (_WEB / "components" / "Agent" / "launch" / "useAiTradeLaunchForm.ts").read_text(
+        encoding="utf-8")
+    assert "const inertThresholdKeys = profitGuardEnabled ? []" in hook
+    assert '"ai_trade_profit_guard_hard_tp_return_pct"' in hook
 
 
 def test_g_a5_profit_guard_fields_hardcodes_no_threshold_number():
@@ -475,19 +480,37 @@ def test_g_env_every_new_setting_is_registered_in_env_example():
 
 
 def test_new_settings_defaults_are_the_documented_ones():
-    """默认值即「本轮承诺的行为」：三条行为轴默认开，两条待校准的旋钮默认关。"""
+    """默认值即「本轮承诺的行为」：两条行为轴默认开，其余旋钮默认关。
+
+    `B-1`（ai-trade-guided-launch 轴 A）：`ai_trade_require_profit_exit_with_horizon` 由 `True`
+    翻为 `False` 并移入下面「只建不开」那一组——不开启利润保护时也应当能启动自动交易，互锁降为
+    一道运维可选的加固闸（代码路径整段保留，置 `True` 即逐字节恢复）。
+    """
     s = Settings()
-    assert s.ai_trade_require_profit_exit_with_horizon is True
     assert s.ai_trade_loss_release_requires_uncovered is True
     assert s.ai_trade_liveness_enabled is True
     assert (s.ai_trade_liveness_warn_rounds, s.ai_trade_liveness_halt_rounds) == (20, 60)
     assert s.ai_trade_peak_tracking_always is True
     assert s.ai_trade_exit_verdict_min_samples == 20
-    # 三个「只建不开」：本轮不改行为，下一轮按验收卡定值
+    # 四个「只建不开」：本轮不改行为，运维可自行武装
+    assert s.ai_trade_require_profit_exit_with_horizon is False
     assert s.ai_trade_wake_horizon_divisor == 0
     assert s.ai_trade_skip_round_when_gated is False
     assert s.ai_trade_exit_discretion_autotune_enabled is False
     assert s.ai_trade_sizing_margin_precheck is False
+
+
+def test_b5_profiles_wire_carries_the_interlock_flag():
+    """`B-5`（guided-launch §5.1）：互锁总闸的只读回执随 `horizon-profiles` 下发。
+
+    前端的二次确认判据取自这个键而非「本轮默认是 false」这句话——显式配置过该键的环境里，
+    前端拦截与服务端 422 才会自洽地一起出现，不会造出「前端放行、后端 422」的假门禁。
+    """
+    from app.ai_auto.hold_horizon_profiles import profiles_wire
+
+    assert profiles_wire(Settings())["requireProfitExitWithHorizon"] is False
+    armed = profiles_wire(Settings(ai_trade_require_profit_exit_with_horizon=True))
+    assert armed["requireProfitExitWithHorizon"] is True
 
 
 def test_audit_marker_is_registered_and_excluded_by_default():

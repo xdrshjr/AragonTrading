@@ -12,7 +12,35 @@ import { RESUME_MS } from "@/lib/httpTimeout";
 import type { AiTradeGroupRow, AiTradeGroupState } from "@/lib/aiTradeTypes";
 import { useAppStore } from "@/lib/store";
 import { tradingApi } from "@/lib/tradingApi";
+import {
+  AI_TRADE_LAUNCH_STEP_TITLE,
+  type AiTradeLaunchStepId,
+} from "@/lib/aiTradeLaunchSteps";
 import AiTradeToggle from "./AiTradeToggle";
+
+/**
+ * ai-trade-guided-launch 附录 A 的两个迁移 helper（与 `AiTradeLaunchModal.test.tsx` 里那一份同款）。
+ *
+ * 迁移规则按**步骤**计而不是按用例计：一条用例里每个步骤的首个查询目标之前各插一次 `gotoStep`；
+ * 点击 CTA 的语句替换为 `submitLaunch()`。**断言本身一律不改。**
+ */
+async function gotoStep(id: AiTradeLaunchStepId) {
+  fireEvent.click(
+    await screen.findByRole("tab", { name: new RegExp(AI_TRADE_LAUNCH_STEP_TITLE[id]) }),
+  );
+  return screen.findByRole("heading", {
+    level: 3,
+    name: new RegExp(AI_TRADE_LAUNCH_STEP_TITLE[id]),
+  });
+}
+
+async function submitLaunch(name: RegExp = /确认并开始 AI 自动交易/) {
+  await gotoStep("review");
+  const cta = await screen.findByRole("button", { name });
+  await waitFor(() => expect(cta).not.toBeDisabled());
+  fireEvent.click(cta);
+  return cta;
+}
 
 vi.mock("@/lib/aiTradeApi", () => ({
   aiTradeApi: {
@@ -158,9 +186,7 @@ describe("AiTradeToggle", () => {
     await screen.findByTitle("开启 AI 自动交易 / 回测");
     fireEvent.click(screen.getByRole("switch"));
     await screen.findByText("均线策略");
-    const confirm = await screen.findByRole("button", { name: /确认并开始 AI 自动交易/ });
-    await waitFor(() => expect(confirm).not.toBeDisabled());
-    fireEvent.click(confirm);
+    await submitLaunch();
     await waitFor(() => expect(aiTradeApi.start).toHaveBeenCalledTimes(1));
     // W4：整键恒下发，且**默认不勾**（与弹窗里其余六张卡的方向相反，需求的明文要求）。
     expect(vi.mocked(aiTradeApi.start).mock.calls[0][0].intel)
@@ -187,9 +213,7 @@ describe("AiTradeToggle", () => {
     await screen.findByTitle("开启 AI 自动交易 / 回测");
     fireEvent.click(screen.getByRole("switch"));
     await screen.findByText("均线策略");
-    const confirm = await screen.findByRole("button", { name: /确认并开始 AI 自动交易/ });
-    await waitFor(() => expect(confirm).not.toBeDisabled());
-    fireEvent.click(confirm);
+    await submitLaunch();
     await waitFor(() => expect(aiTradeApi.start).toHaveBeenCalledTimes(1));
     expect(vi.mocked(aiTradeApi.start).mock.calls[0][0].wakeIntervalMinutes).toBe(2);
     await waitFor(() =>
@@ -213,9 +237,7 @@ describe("AiTradeToggle", () => {
     await screen.findByTitle("开启 AI 自动交易 / 回测");
     fireEvent.click(screen.getByRole("switch"));
     await screen.findByText("均线策略");
-    const confirm = await screen.findByRole("button", { name: /确认并开始 AI 自动交易/ });
-    await waitFor(() => expect(confirm).not.toBeDisabled());
-    fireEvent.click(confirm);
+    await submitLaunch();
     await waitFor(() => expect(aiTradeApi.start).toHaveBeenCalledTimes(1));
     expect(vi.mocked(aiTradeApi.start).mock.calls[0][0].baseRules).toEqual({
       maBandEntry: { enabled: true, period: 20, stdMult: 2, tolerance: 0.15, directional: false },
@@ -243,11 +265,11 @@ describe("AiTradeToggle", () => {
     await screen.findByTitle("开启 AI 自动交易 / 回测");
     fireEvent.click(screen.getByRole("switch"));
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     fireEvent.change(screen.getByLabelText("允许回吐（%）"), { target: { value: "35" } });
+    await gotoStep("capital");
     fireEvent.change(screen.getByLabelText("单仓止损%（如 0.05＝5%）"), { target: { value: "0.03" } });
-    const confirm = await screen.findByRole("button", { name: /确认并开始 AI 自动交易/ });
-    await waitFor(() => expect(confirm).not.toBeDisabled());
-    fireEvent.click(confirm);
+    await submitLaunch();
     await waitFor(() => expect(aiTradeApi.start).toHaveBeenCalledTimes(1));
     const body = vi.mocked(aiTradeApi.start).mock.calls[0][0];
     expect(body.profitGuard?.enabled).toBe(true);

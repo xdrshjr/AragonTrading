@@ -10,7 +10,36 @@ import {
 } from "@/lib/aiTradeHorizonApi";
 import { autoTradeSettingsApi } from "@/lib/autoTradeSettingsApi";
 import { tradingApi } from "@/lib/tradingApi";
+import {
+  AI_TRADE_LAUNCH_STEP_TITLE,
+  type AiTradeLaunchStepId,
+} from "@/lib/aiTradeLaunchSteps";
 import AiTradeLaunchModal, { type AiTradeLaunchOpts } from "./AiTradeLaunchModal";
+
+/**
+ * ai-trade-guided-launch 附录 A 的**两个迁移 helper**。
+ *
+ * 迁移规则（按**步骤**计，不是按用例计）：在一条用例里，**每一个步骤**的首个查询目标之前各插
+ * 一次 `gotoStep("<该步骤>")`；点击 CTA 的语句替换为 `submitLaunch()`。**断言本身一律不改**
+ * ——一次「顺手改断言」就会把一条守着真实事故的用例悄悄弱化。
+ */
+async function gotoStep(id: AiTradeLaunchStepId) {
+  fireEvent.click(
+    await screen.findByRole("tab", { name: new RegExp(AI_TRADE_LAUNCH_STEP_TITLE[id]) }),
+  );
+  return screen.findByRole("heading", {
+    level: 3,
+    name: new RegExp(AI_TRADE_LAUNCH_STEP_TITLE[id]),
+  });
+}
+
+async function submitLaunch(name: RegExp = /确认并开始 AI 自动交易/) {
+  await gotoStep("review");
+  const cta = await screen.findByRole("button", { name });
+  await waitFor(() => expect(cta).not.toBeDisabled());
+  fireEvent.click(cta);
+  return cta;
+}
 
 vi.mock("@/lib/tradingApi", () => ({ tradingApi: { config: vi.fn() } }));
 // 交易周期模式预设表：与上面两个同级的模块级 mock——弹窗每次打开都会拉它，不 mock 会触发真实 fetch。
@@ -215,20 +244,24 @@ describe("AiTradeLaunchModal", () => {
   it("keeps confirm disabled until at least one strategy is selected", async () => {
     renderModal();
     await screen.findByText("均线策略");
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     expect(confirm).toBeDisabled();
+    await gotoStep("scope");
     expect(screen.getByText("请至少选择一个交易策略")).toBeInTheDocument();
   });
 
   it("confirms with the selected strategy ids and bar", async () => {
     const { onConfirm } = renderModal();
     fireEvent.click(await screen.findByText("均线策略"));
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
     expect(onConfirm).toHaveBeenCalledTimes(1);
     const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
     expect(opts.strategyIds).toEqual([1]);
+    await gotoStep("scope");
     expect(opts.instId).toBe("BTC-USDT-SWAP");
     expect(opts.bar).toBe("1H");
     expect(opts.contextRefreshRounds).toBe(10);
@@ -239,8 +272,10 @@ describe("AiTradeLaunchModal", () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
     // 本轮唯一改变默认行为的地方，必须**明示**而不是静默生效。
+    await gotoStep("guards");
     expect(screen.getByRole("button", { name: /均衡/ })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByText("服务端默认")).toBeInTheDocument();
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -251,7 +286,9 @@ describe("AiTradeLaunchModal", () => {
   it("选中另一个预设后提交体带该 id，且**不带任何阈值**（阈值真源在服务端冻结表）", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     fireEvent.click(screen.getByRole("button", { name: /稳健/ }));
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -263,8 +300,10 @@ describe("AiTradeLaunchModal", () => {
   it("「关闭」是显式退出口，且其后果说明必须写清楚失去了什么", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     fireEvent.click(screen.getByRole("button", { name: /关闭/ }));
     expect(screen.getByText(/没有波动率定标、没有回撤刹车/)).toBeInTheDocument();
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -275,6 +314,7 @@ describe("AiTradeLaunchModal", () => {
   it("展开后的只读阈值表**只渲染后端下发的值**（前端不复制任何一个数）", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     expect(screen.queryByTestId("ai-discipline-threshold-table")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "查看这一档的阈值" }));
     const table = screen.getByTestId("ai-discipline-threshold-table");
@@ -288,6 +328,7 @@ describe("AiTradeLaunchModal", () => {
   it("取值为 0 的阈值显示「关闭」而不是「0」（显式关闭 ≠ 一个很小的数）", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     fireEvent.click(screen.getByRole("button", { name: /激进/ }));
     fireEvent.click(screen.getByRole("button", { name: "查看这一档的阈值" }));
     const table = screen.getByTestId("ai-discipline-threshold-table");
@@ -301,6 +342,7 @@ describe("AiTradeLaunchModal", () => {
     });
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     expect(await screen.findByText(/本机已由运维总闸整轴关闭/)).toBeInTheDocument();
   });
 
@@ -308,7 +350,9 @@ describe("AiTradeLaunchModal", () => {
     vi.mocked(aiTradeDisciplineApi.presets).mockRejectedValue(new Error("boom"));
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     expect(screen.queryByRole("button", { name: "查看这一档的阈值" })).toBeNull();
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -319,6 +363,7 @@ describe("AiTradeLaunchModal", () => {
   it("不得宣称阈值「已校准」（[P1-10]：不得宣称不存在的东西）", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     expect(screen.getByText(/尚未经回测校准/)).toBeInTheDocument();
     expect(screen.queryByText(/已校准|经回测验证/)).toBeNull();
   });
@@ -327,8 +372,10 @@ describe("AiTradeLaunchModal", () => {
   it("默认勾选基础策略，提交体带完整规则参数", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     const box = screen.getByRole("checkbox", { name: "基础策略（铁律 · 默认开启）" });
     expect(box).toBeChecked();
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -341,7 +388,9 @@ describe("AiTradeLaunchModal", () => {
   it("取消勾选后提交体为显式 enabled:false（与「字段缺省=默认开启」严格区分）", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     fireEvent.click(screen.getByRole("checkbox", { name: "基础策略（铁律 · 默认开启）" }));
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -355,15 +404,20 @@ describe("AiTradeLaunchModal", () => {
       defaultBaseRule: { enabled: true, period: 30, stdMult: 2.5, tolerance: 0.05, directional: true },
     });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     const period = screen.getByLabelText("基础策略均线周期") as HTMLInputElement;
     expect(period.value).toBe("30");
     expect(screen.getByLabelText("基础策略方向性模式")).toBeChecked();
 
     fireEvent.change(period, { target: { value: "1" } });
     expect(screen.getByText("基础策略均线周期需为 2~200 的整数")).toBeInTheDocument();
+    await gotoStep("review");
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
 
-    fireEvent.change(period, { target: { value: "40" } });
+    // 回到产地那一步再改：分步之后第 5 步的 DOM 在第 6 步是真卸载的，`period` 已经不在文档里。
+    await gotoStep("guards");
+    fireEvent.change(screen.getByLabelText("基础策略均线周期"), { target: { value: "40" } });
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -376,6 +430,7 @@ describe("AiTradeLaunchModal", () => {
   it("[R-7] 父树重渲染不冲掉正在编辑的基础策略参数（seed effect 依赖仍为 [open]）", async () => {
     const { rerender } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     const period = screen.getByLabelText("基础策略均线周期") as HTMLInputElement;
     fireEvent.change(period, { target: { value: "55" } });
     rerender({ defaultStrategyIds: [1] });          // 新引用的 default 数组，模拟父树每秒重渲染
@@ -406,10 +461,12 @@ describe("AiTradeLaunchModal", () => {
       ],
     });
     await screen.findByText("均线策略");
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
     const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    await gotoStep("scope");
     expect(opts.members).toEqual([
       { instId: "BTC-USDT-SWAP", allocationPct: 60 },
       { instId: "ETH-USDT-SWAP", allocationPct: 40 },
@@ -419,10 +476,12 @@ describe("AiTradeLaunchModal", () => {
   it("falls back to the current chart instId when defaultMembers is empty", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1], defaultMembers: [] });
     await screen.findByText("均线策略");
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
     const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    await gotoStep("scope");
     expect(opts.members).toEqual([{ instId: "BTC-USDT-SWAP", allocationPct: 100 }]);
   });
 
@@ -449,6 +508,7 @@ describe("AiTradeLaunchModal", () => {
       defaultMembers: [{ instId: "BTC-USDT-SWAP", allocationPct: 100 }],
     });
     await screen.findByText("均线策略");
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -473,7 +533,9 @@ describe("AiTradeLaunchModal", () => {
   it("changing the editable timeframe flows into onConfirm", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("rhythm");
     fireEvent.change(screen.getByLabelText("时间级别"), { target: { value: "4H" } });
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -484,7 +546,9 @@ describe("AiTradeLaunchModal", () => {
   it("blocks confirm on an out-of-range context refresh count", async () => {
     renderModal({ defaultContextRounds: 1, defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("rhythm");
     expect(screen.getByText(/上下文刷新轮数需为/)).toBeInTheDocument();
+    await gotoStep("review");
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
   });
 
@@ -495,6 +559,7 @@ describe("AiTradeLaunchModal", () => {
     });
     await screen.findByText("均线策略");
     expect(screen.getByText("不支持")).toBeInTheDocument();
+    await gotoStep("review");
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
   });
 
@@ -502,13 +567,16 @@ describe("AiTradeLaunchModal", () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
     // 总预算与杠杆共用「留空＝默认」占位，取首个（总预算）填入非法负值。
+    await gotoStep("capital");
     fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[0], { target: { value: "-5" } });
+    await gotoStep("review");
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
   });
 
   it("confirms with per-position pct as null when blank (E4)", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -521,16 +589,20 @@ describe("AiTradeLaunchModal", () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
     // 单仓 OCO 的占位文案已被利润保护特性改写为具体默认值，故按标签取元素（比占位序号稳）。
+    await gotoStep("capital");
     fireEvent.change(screen.getByLabelText("单仓止损%（如 0.05＝5%）"), { target: { value: "-1" } });
+    await gotoStep("review");
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
   });
 
   it("clamps an out-of-range per-position pct in the preview, without blocking (E4)", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("capital");
     fireEvent.change(screen.getByLabelText("单仓止损%（如 0.05＝5%）"), { target: { value: "0.9" } });
     // 双口径显性化后：填值夹到 max 0.2 → 20%；留空侧如实写出生效默认 10%（不再只写「默认」）。
     expect(screen.getByText(/SL 20% \/ TP 10%（默认）/)).toBeInTheDocument();
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
   });
@@ -547,7 +619,10 @@ describe("AiTradeLaunchModal", () => {
     });
     await screen.findByText("均线策略");
     // availUsdt=1000、maxBudgetPct=100 → 总预算改 800 后每标的 = 800×50% = 400（修复前压死在 avail×5% 的小值）。
+    await gotoStep("capital");
     fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[0], { target: { value: "800" } });
+    // 每标的预算预览住在第 1 步的分配器里（金额输入在第 3 步），故这里跨回一步再断言。
+    await gotoStep("scope");
     await waitFor(() => expect(screen.getAllByText("400.00 USDT")).toHaveLength(2));
   });
 
@@ -562,9 +637,11 @@ describe("AiTradeLaunchModal", () => {
     });
     await screen.findByText("均线策略");
     // 输入 800 > avail(1000)×effectiveMaxBudgetPct(5%)=50 → 夹到 50，每标的 50×50% = 25，并回显「已按 5% 上限夹紧」。
+    await gotoStep("capital");
     fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[0], { target: { value: "800" } });
-    await waitFor(() => expect(screen.getAllByText("25.00 USDT")).toHaveLength(2));
     expect(screen.getByText(/已按 5% 上限夹紧/)).toBeInTheDocument();
+    await gotoStep("scope");
+    await waitFor(() => expect(screen.getAllByText("25.00 USDT")).toHaveLength(2));
   });
 
   it("keeps the blank-total default at 1% of the available balance (AC-3)", async () => {
@@ -577,7 +654,9 @@ describe("AiTradeLaunchModal", () => {
     });
     await screen.findByText("均线策略");
     // 留空总预算 → 默认 avail(1000)×1% = 10，标签保持「可用余额 × 1%」，每标的 10×50% = 5。
+    await gotoStep("capital");
     expect(screen.getByText("默认总预算（可用余额 × 1%）")).toBeInTheDocument();
+    await gotoStep("scope");
     await waitFor(() => expect(screen.getAllByText("5.00 USDT")).toHaveLength(2));
   });
 
@@ -585,6 +664,7 @@ describe("AiTradeLaunchModal", () => {
   it("renders the position-step select seeded from defaultPositionStepPct", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("capital");
     const select = screen.getByLabelText("仓位操作档位") as HTMLSelectElement;
     expect(select.value).toBe("0.25"); // 默认（aiTradeConfig 缺省 → AI_TRADE_DEFAULT_POSITION_STEP）
     expect(screen.getByText(/可用档位：25% \/ 50% \/ 75% \/ 100%/)).toBeInTheDocument();
@@ -594,6 +674,7 @@ describe("AiTradeLaunchModal", () => {
   it("seeds the position step from the persisted preference prop", async () => {
     renderModal({ defaultStrategyIds: [1], defaultPositionStepPct: 0.5 });
     await screen.findByText("均线策略");
+    await gotoStep("capital");
     expect((screen.getByLabelText("仓位操作档位") as HTMLSelectElement).value).toBe("0.5");
     expect(screen.getByText(/可用档位：50% \/ 100%/)).toBeInTheDocument();
   });
@@ -601,7 +682,9 @@ describe("AiTradeLaunchModal", () => {
   it("flows the chosen position step into onConfirm (live path)", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("capital");
     fireEvent.change(screen.getByLabelText("仓位操作档位"), { target: { value: "0.5" } });
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -612,7 +695,9 @@ describe("AiTradeLaunchModal", () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
     fireEvent.click(screen.getByRole("button", { name: "回测" }));
+    await gotoStep("capital");
     fireEvent.change(screen.getByLabelText("仓位操作档位"), { target: { value: "0.1" } });
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /开始 AI 回测/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -626,6 +711,7 @@ describe("AiTradeLaunchModal", () => {
   it("renders the wake-interval input in the live segment seeded from the default (2 min)", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("rhythm");
     const input = screen.getByLabelText("Agent 唤醒周期（分钟）") as HTMLInputElement;
     expect(input.value).toBe("2");
     expect(screen.getByText(/仅按 K 线与策略触发/)).toBeInTheDocument();
@@ -634,6 +720,7 @@ describe("AiTradeLaunchModal", () => {
   it("seeds the wake interval from the persisted preference prop", async () => {
     renderModal({ defaultStrategyIds: [1], defaultWakeIntervalMinutes: 5 });
     await screen.findByText("均线策略");
+    await gotoStep("rhythm");
     expect((screen.getByLabelText("Agent 唤醒周期（分钟）") as HTMLInputElement).value).toBe("5");
   });
 
@@ -641,13 +728,16 @@ describe("AiTradeLaunchModal", () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
     fireEvent.click(screen.getByRole("button", { name: "回测" }));
+    await gotoStep("rhythm");
     expect(screen.queryByLabelText("Agent 唤醒周期（分钟）")).toBeNull();
   });
 
   it("flows the chosen wake interval into onConfirm (live path)", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("rhythm");
     fireEvent.change(screen.getByLabelText("Agent 唤醒周期（分钟）"), { target: { value: "3" } });
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -657,7 +747,9 @@ describe("AiTradeLaunchModal", () => {
   it("treats a blank wake interval as disabled (sends 0) and stays submittable", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("rhythm");
     fireEvent.change(screen.getByLabelText("Agent 唤醒周期（分钟）"), { target: { value: "" } });
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -667,30 +759,37 @@ describe("AiTradeLaunchModal", () => {
   it("blocks confirm on an out-of-range wake interval", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("rhythm");
     fireEvent.change(screen.getByLabelText("Agent 唤醒周期（分钟）"), { target: { value: "9999" } });
     expect(screen.getByText(/Agent 唤醒周期需为/)).toBeInTheDocument();
+    await gotoStep("review");
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
   });
 
   it("resets the position step to default when the modal reopens (guards inputs-revert)", async () => {
     const { rerender } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("capital");
     fireEvent.change(screen.getByLabelText("仓位操作档位"), { target: { value: "1" } });
     expect((screen.getByLabelText("仓位操作档位") as HTMLSelectElement).value).toBe("1");
     // 关闭后重开：seed effect 依赖 [open]，false→true 复位回默认档位。
     rerender({ defaultStrategyIds: [1], open: false });
     rerender({ defaultStrategyIds: [1], open: true });
+    // 重开即回到第 1 步（向导位置刻意不持久化，进的是那个既有的 [open] effect）。
+    await gotoStep("capital");
     expect((screen.getByLabelText("仓位操作档位") as HTMLSelectElement).value).toBe("0.25");
   });
 
   it("resets the wake interval to default when the modal reopens (RN-2 guards inputs-revert)", async () => {
     const { rerender } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("rhythm");
     fireEvent.change(screen.getByLabelText("Agent 唤醒周期（分钟）"), { target: { value: "9" } });
     expect((screen.getByLabelText("Agent 唤醒周期（分钟）") as HTMLInputElement).value).toBe("9");
     // 关闭后重开：seed 只在 open false→true 那一次转换执行（单行 setWakeIntervalRaw 在既有 [open] effect 内）。
     rerender({ defaultStrategyIds: [1], open: false });
     rerender({ defaultStrategyIds: [1], open: true });
+    await gotoStep("rhythm");
     expect((screen.getByLabelText("Agent 唤醒周期（分钟）") as HTMLInputElement).value).toBe("2");
   });
 
@@ -704,28 +803,37 @@ describe("AiTradeLaunchModal", () => {
 
     // 用户编辑多个字段：追加勾选策略、改仓位档位、改唤醒周期、改时间级别、填总预算。
     fireEvent.click(screen.getByText("动量策略")); // selectedIds: [1] → [1, 2]
+    await gotoStep("capital");
     fireEvent.change(screen.getByLabelText("仓位操作档位"), { target: { value: "0.5" } });
+    await gotoStep("rhythm");
     fireEvent.change(screen.getByLabelText("Agent 唤醒周期（分钟）"), { target: { value: "7" } });
     fireEvent.change(screen.getByLabelText("时间级别"), { target: { value: "4H" } });
+    await gotoStep("capital");
     fireEvent.change(screen.getAllByPlaceholderText("留空＝默认")[0], { target: { value: "500" } });
+    await gotoStep("guards");
     fireEvent.change(screen.getByLabelText("允许回吐（%）"), { target: { value: "55" } });
     fireEvent.change(screen.getByLabelText("ATR 下界倍数（0=关）"), { target: { value: "0.4" } });
     fireEvent.change(screen.getByLabelText("平仓后冷却（秒，0=关）"), { target: { value: "90" } });
     fireEvent.change(screen.getByLabelText("回吐阶梯"), { target: { value: "tight" } });
 
     // 模拟行情流节流 flush 引发的父树重渲染：open 恒为真，但每帧传入全新的默认数组引用。
+    await gotoStep("scope");
     rerender({ defaultStrategyIds: [1], defaultMembers: [{ instId: "ETH-USDT-SWAP", allocationPct: 100 }] });
     rerender({ defaultStrategyIds: [1], defaultMembers: [{ instId: "ETH-USDT-SWAP", allocationPct: 100 }] });
 
     // 未发生 open false→true 转换 → seed effect 不重跑，全部编辑保持不变（RN-2：新增唤醒周期字段同守护）。
+    await gotoStep("capital");
     expect((screen.getByLabelText("仓位操作档位") as HTMLSelectElement).value).toBe("0.5");
+    await gotoStep("rhythm");
     expect((screen.getByLabelText("Agent 唤醒周期（分钟）") as HTMLInputElement).value).toBe("7");
     expect((screen.getByLabelText("时间级别") as HTMLSelectElement).value).toBe("4H");
     // 本轮新增的利润保护输入同守（复发性缺陷的教训：每加一个新字段就要在此加一条断言）。
+    await gotoStep("guards");
     expect((screen.getByLabelText("允许回吐（%）") as HTMLInputElement).value).toBe("55");
     expect((screen.getByLabelText("ATR 下界倍数（0=关）") as HTMLInputElement).value).toBe("0.4");
     expect((screen.getByLabelText("平仓后冷却（秒，0=关）") as HTMLInputElement).value).toBe("90");
     expect((screen.getByLabelText("回吐阶梯") as HTMLSelectElement).value).toBe("tight");
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -742,7 +850,9 @@ describe("AiTradeLaunchModal", () => {
   it("A-23 · 经验模式默认勾选，提交体带完整规则", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("cognition");
     expect(screen.getByRole("checkbox", { name: "启用经验模式" })).toBeChecked();
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -757,7 +867,9 @@ describe("AiTradeLaunchModal", () => {
     // ——本仓库已在 baseRules / profitGuard / tradingHorizon 上踩过三次。
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("cognition");
     fireEvent.click(screen.getByRole("checkbox", { name: "启用经验模式" }));
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -768,7 +880,9 @@ describe("AiTradeLaunchModal", () => {
   it("默认勾选利润保护，提交体带完整参数（UI 百分数 → wire fraction）", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     expect(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" })).toBeChecked();
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -788,17 +902,23 @@ describe("AiTradeLaunchModal", () => {
     });
   });
 
+  // 【W-15 · ai-trade-guided-launch 轴 A 主判据】运维互锁默认已关（wire 上
+  // `requireProfitExitWithHorizon` 缺席 ⇒ 按 false 处理）⇒ 关掉利润保护**不再要求任何额外勾选**，
+  // 一次点击即启动。代价（浮盈没有自动兑现通道）由第 6 步的风险清单如实披露，而不是把用户挡在
+  // 门外。武装态下恢复二次确认的那条路径由 W-16 守。
   it("取消勾选后提交体为显式 enabled:false（与「字段缺省=默认开启」严格区分）", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     fireEvent.click(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" }));
+    await gotoStep("review");
+    // 风险披露恒在：即便不阻断，最后一屏也必须说出这一条。
+    expect(
+      screen.getByTestId("ai-launch-risk-list").querySelector("[data-risk-id=\"profitGuardOff\"]"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-profit-guard-unguarded-confirm")).toBeNull();
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
-    // ai-trade-loss-and-liveness-hardening A-3：关掉利润保护后需要**二次确认**（按钮不禁用，
-    // 拦在提交路径上）。第一次点击必须什么都不发生——那正是这条修法的全部意义。
-    fireEvent.click(confirm);
-    expect(onConfirm).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByTestId("ai-profit-guard-unguarded-confirm"));
     fireEvent.click(confirm);
     const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
     expect(opts.profitGuard).toEqual({ enabled: false });
@@ -809,6 +929,7 @@ describe("AiTradeLaunchModal", () => {
     // ——用户看得见那个数，它却逐字节不作数。关闭是用户的权利，**后果必须被说出来**。
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     expect(screen.queryByTestId("ai-profit-guard-unguarded-notice")).toBeNull();
     fireEvent.click(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" }));
     const notice = screen.getByTestId("ai-profit-guard-unguarded-notice");
@@ -826,6 +947,7 @@ describe("AiTradeLaunchModal", () => {
   it("A-4：关闭利润保护 ⇒ 只读阈值表里那一行加删除线 + 「未装配，不生效」尾注", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     fireEvent.click(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" }));
     fireEvent.click(await screen.findByRole("button", { name: "查看这一档的阈值" }));
     const row = await screen.findByTestId(
@@ -836,6 +958,7 @@ describe("AiTradeLaunchModal", () => {
   it("A-1：422 的三条补救渲染成按钮，且点击真的把对应开关拨过去（文案由后端下发）", async () => {
     const { rerender } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("rhythm");
     rerender({
       error: "已选择「日内波段」持仓周期，但利润保护层被关闭",
       errorRemedies: [
@@ -844,22 +967,28 @@ describe("AiTradeLaunchModal", () => {
         { id: "ops_override", label: "运维总闸 AI_TRADE_REQUIRE_PROFIT_EXIT_WITH_HORIZON=false" },
       ],
     });
+    await gotoStep("review");
     const box = await screen.findByTestId("ai-start-remedies");
     expect(box).toHaveTextContent("运维总闸 AI_TRADE_REQUIRE_PROFIT_EXIT_WITH_HORIZON=false");
     // 运维那一条**不是按钮**（前端拨不动它，做成按钮就是一个点了没反应的控件）
     expect(screen.queryByTestId("ai-start-remedy-ops_override")).toBeNull();
     // 先取消勾选，再点「开启利润保护」⇒ 勾选态真的被拨回来
+    await gotoStep("guards");
     fireEvent.click(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" }));
     expect(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" })).not.toBeChecked();
+    await gotoStep("review");
     fireEvent.click(screen.getByTestId("ai-start-remedy-enable_profit_guard"));
+    await gotoStep("guards");
     expect(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" })).toBeChecked();
   });
 
   it("越界回吐比例即时报错并禁用确认（前端即时反馈，后端另有 422 兜边界）", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     fireEvent.change(screen.getByLabelText("允许回吐（%）"), { target: { value: "150" } });
     expect(screen.getByText("允许回吐比例需为 0~100%")).toBeInTheDocument();
+    await gotoStep("review");
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
   });
 
@@ -870,6 +999,7 @@ describe("AiTradeLaunchModal", () => {
         breakevenArmReturnPct: 0.02, minHoldSeconds: 45 },
     });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     expect((screen.getByLabelText("武装阈值（保证金收益 %）") as HTMLInputElement).value).toBe("8");
     expect((screen.getByLabelText("允许回吐（%）") as HTMLInputElement).value).toBe("30");
     expect((screen.getByLabelText("最短持有（秒）") as HTMLInputElement).value).toBe("45");
@@ -878,6 +1008,7 @@ describe("AiTradeLaunchModal", () => {
   it("单仓 TP/SL 回填上次值，且 placeholder 把「留空＝默认」写成具体数值（诊断根因 ⑤）", async () => {
     renderModal({ defaultStrategyIds: [1], defaultStopLossPct: 0.03, defaultTakeProfitPct: 0.06 });
     await screen.findByText("均线策略");
+    await gotoStep("capital");
     expect((screen.getByLabelText("单仓止损%（如 0.05＝5%）") as HTMLInputElement).value).toBe("0.03");
     expect((screen.getByLabelText("单仓止盈%（如 0.10＝10%）") as HTMLInputElement).value).toBe("0.06");
   });
@@ -885,6 +1016,7 @@ describe("AiTradeLaunchModal", () => {
   it("杠杆留空时只显示价格口径 + 一句诚实提示；填写杠杆后才出保证金口径（[P1-9]）", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("capital");
     const sl = screen.getByLabelText("单仓止损%（如 0.05＝5%）") as HTMLInputElement;
     expect(sl.placeholder).toBe("留空＝默认 5%");
     expect(screen.getByText("保证金口径按下单杠杆换算，填写杠杆后显示")).toBeInTheDocument();
@@ -902,6 +1034,7 @@ describe("AiTradeLaunchModal", () => {
   it("回测段渲染利润保护 UI 且随体提交，文案与实盘段不同（保守近似免责）", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     expect(screen.getByText(/判定只用/)).toBeInTheDocument();          // 实盘段文案
 
     fireEvent.click(screen.getByRole("button", { name: "回测" }));
@@ -910,6 +1043,7 @@ describe("AiTradeLaunchModal", () => {
     expect(screen.getByText(/相对实盘偏保守/)).toBeInTheDocument();
     expect(screen.queryByText(/判定只用/)).not.toBeInTheDocument();    // 回测不得照抄实盘文案
 
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /开始 AI 回测/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -924,11 +1058,13 @@ describe("AiTradeLaunchModal", () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
 
+    await gotoStep("guards");
     fireEvent.change(screen.getByLabelText("ATR 下界倍数（0=关）"), { target: { value: "0.5" } });
     fireEvent.change(screen.getByLabelText("ATR 上界倍数（0=关）"), { target: { value: "2" } });
     fireEvent.change(screen.getByLabelText("平仓后冷却（秒，0=关）"), { target: { value: "240" } });
     fireEvent.change(screen.getByLabelText("回吐阶梯"), { target: { value: "off" } });
 
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -942,9 +1078,11 @@ describe("AiTradeLaunchModal", () => {
   it("ATR 下界大于上界时两模式都拦住提交（P2-8：校验必须真的挡住按钮）", async () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
+    await gotoStep("guards");
     fireEvent.change(screen.getByLabelText("ATR 下界倍数（0=关）"), { target: { value: "5" } });
     fireEvent.change(screen.getByLabelText("ATR 上界倍数（0=关）"), { target: { value: "1" } });
 
+    await gotoStep("review");
     expect(screen.getByRole("alert").textContent).toContain("ATR 下界倍数不可大于上界倍数");
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
 
@@ -962,9 +1100,12 @@ describe("AiTradeLaunchModal · backtest mode", () => {
     renderModal({ defaultStrategyIds: [1] });
     await screen.findByText("均线策略");
     fireEvent.click(screen.getByRole("button", { name: "回测" }));
+    await gotoStep("review");
     expect(screen.queryByLabelText(/我已知晓这是真实资金/)).toBeNull();
+    await gotoStep("scope");
     expect(screen.getByText("回测起始")).toBeInTheDocument();
     expect(screen.getByText("回测结束")).toBeInTheDocument();
+    await gotoStep("rhythm");
     expect(screen.getByText("决策间隔（根/次）")).toBeInTheDocument();
     expect(screen.getByText("模拟回测")).toBeInTheDocument();
   });
@@ -988,6 +1129,7 @@ describe("AiTradeLaunchModal · backtest mode", () => {
     });
     await screen.findByText("均线策略");
     fireEvent.click(screen.getByRole("button", { name: "回测" }));
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /开始 AI 回测/ });
     await waitFor(() => expect(confirm).not.toBeDisabled()); // 无 acknowledged 也可
     fireEvent.click(confirm);
@@ -1010,7 +1152,9 @@ describe("AiTradeLaunchModal · backtest mode", () => {
     });
     await screen.findByText("均线策略");
     fireEvent.click(screen.getByRole("button", { name: "回测" }));
+    await gotoStep("rhythm");
     expect(screen.getByText(/计划决策轮数 501 超上限 400/)).toBeInTheDocument();
+    await gotoStep("review");
     expect(screen.getByRole("button", { name: /开始 AI 回测/ })).toBeDisabled();
   });
 
@@ -1018,6 +1162,7 @@ describe("AiTradeLaunchModal · backtest mode", () => {
     renderModal({ defaultStrategyIds: [1], acknowledged: false });
     await screen.findByText("均线策略");
     // 默认落实盘段，未勾选 acknowledged → CTA 禁用
+    await gotoStep("review");
     expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
   });
 });
@@ -1026,8 +1171,10 @@ describe("AiTradeLaunchModal · backtest mode", () => {
 describe("AiTradeLaunchModal · 交易周期模式", () => {
   it("默认勾选并采用接口下发的 defaultProfile，提交体带 tradingHorizon", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("rhythm");
     await screen.findByRole("radio", { name: /日内波段/ });
     expect(screen.getByRole("checkbox", { name: "交易周期模式（推荐开启）" })).toBeChecked();
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -1038,7 +1185,9 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
   it("预设表读取失败 ⇒ 提交体**省略 profile 键**，由服务端按默认模式装配（不拿 custom 顶上）", async () => {
     vi.mocked(aiTradeHorizonApi.profiles).mockRejectedValue(new Error("boom"));
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("rhythm");
     await screen.findByTestId("ai-trade-horizon-loading");
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -1049,8 +1198,10 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
 
   it("取消勾选 ⇒ 提交体为显式关闭（与「字段缺省=默认开启」严格区分）", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("rhythm");
     await screen.findByRole("radio", { name: /日内波段/ });
     fireEvent.click(screen.getByRole("checkbox", { name: "交易周期模式（推荐开启）" }));
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -1060,7 +1211,9 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
 
   it("切换 profile 联动时间级别与唤醒周期（这正是「模式」的意义）", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("rhythm");
     fireEvent.click(await screen.findByRole("radio", { name: /趋势持仓/ }));
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -1072,11 +1225,16 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
 
   it("[P0-1] 切换 profile **不得**触碰利润保护层的最短持有——那会造出「G1 拦 AI + 保护层停摆」双关窗口", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("rhythm");
     await screen.findByRole("radio", { name: /日内波段/ });
+    await gotoStep("guards");
     const minHold = screen.getByLabelText("最短持有（秒）") as HTMLInputElement;
     const before = minHold.value;
+    await gotoStep("rhythm");
     fireEvent.click(screen.getByRole("radio", { name: /趋势持仓/ }));
+    await gotoStep("guards");
     expect((screen.getByLabelText("最短持有（秒）") as HTMLInputElement).value).toBe(before);
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -1086,10 +1244,12 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
 
   it("切到 custom 露出高级参数且**不联动**任何字段（[P1-8] bar === null）", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("rhythm");
     fireEvent.click(await screen.findByRole("radio", { name: /自定义/ }));
     fireEvent.change(screen.getByLabelText("最短主动平仓窗口（秒，0=不约束）"), {
       target: { value: "300" },
     });
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
@@ -1104,6 +1264,7 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
       const { rerender } = renderModal({ defaultStrategyIds: [1] });
+      await gotoStep("rhythm");
       await screen.findByRole("radio", { name: /日内波段/ });
       fireEvent.click(screen.getByRole("radio", { name: /自定义/ }));
       const input = screen.getByLabelText("最短主动平仓窗口（秒，0=不约束）") as HTMLInputElement;
@@ -1124,6 +1285,7 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
       const { rerender } = renderModal({ defaultStrategyIds: [1] });
+      await gotoStep("rhythm");
       await screen.findByTestId("ai-trade-backstop-repair");
       fireEvent.click(screen.getByTestId("ai-trade-backstop-repair-arm"));
       expect(screen.getByTestId("ai-trade-backstop-repair-arm")).toHaveAttribute(
@@ -1140,15 +1302,19 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
 
   it("自愈模式进 `tradingHorizon` payload；没主动选过 ⇒ **不带该键**（交服务端按运维缺省回填）", async () => {
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("rhythm");
     await screen.findByTestId("ai-trade-backstop-repair");
+    await gotoStep("review");
     const confirm = screen.getByRole("button", { name: /确认并开始 AI 自动交易/ });
     await waitFor(() => expect(confirm).not.toBeDisabled());
     fireEvent.click(confirm);
     expect(
       (onConfirm.mock.calls[0][0] as AiTradeLaunchOpts).tradingHorizon,
     ).not.toHaveProperty("backstopRepair");
+    await gotoStep("rhythm");
     fireEvent.click(screen.getByTestId("ai-trade-backstop-repair-arm"));
-    fireEvent.click(confirm);
+    await gotoStep("review");
+    fireEvent.click(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ }));
     expect((onConfirm.mock.calls[1][0] as AiTradeLaunchOpts).tradingHorizon).toMatchObject({
       backstopRepair: "arm",
     });
@@ -1156,10 +1322,12 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
 
   it("[P2-6] 重开弹窗回到「仅提醒」——`arm` 是一次性授权，刻意**不进偏好回填链**", async () => {
     const { rerender } = renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("rhythm");
     await screen.findByTestId("ai-trade-backstop-repair");
     fireEvent.click(screen.getByTestId("ai-trade-backstop-repair-arm"));
     rerender({ defaultStrategyIds: [1], open: false });
     rerender({ defaultStrategyIds: [1], open: true });
+    await gotoStep("rhythm");
     await waitFor(() =>
       expect(screen.getByTestId("ai-trade-backstop-repair-plan")).toHaveAttribute(
         "aria-checked", "true"),
@@ -1170,7 +1338,9 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
   // state 正确透传**，具体的四档渲染 / 二次确认 / 确认态重置断言全在 AiTradeTradabilityFields.test.tsx。
   it("挂载可交易性预检子组件，并按当前 instId / bar / preset 透传", async () => {
     renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("guards");
     await screen.findByTestId("ai-trade-tradability");
+    await gotoStep("scope");
     await waitFor(() =>
       // 第 4 个入参是单仓止损那一格的现值（realized-edge 轴 E-0）：留空 ⇒ null ⇒ 后端用默认值。
       expect(aiTradeTradabilityApi.probe).toHaveBeenCalledWith(
@@ -1181,7 +1351,9 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
   it("`infeasible` 也**不禁用**启动按钮，但文案改为「仍要启动」——预检只提示、不阻断", async () => {
     vi.mocked(aiTradeTradabilityApi.probe).mockResolvedValue(TRADABILITY_FIXTURE);
     renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("guards");
     await screen.findByTestId("ai-tradability-confirm");
+    await gotoStep("review");
     const confirm = await screen.findByRole("button", { name: /仍要启动 AI 自动交易/ });
     expect(confirm).not.toBeDisabled();
   });
@@ -1191,7 +1363,9 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
   it("`infeasible` 未勾选确认时点击启动**不提交**，并同屏说明该做什么", async () => {
     vi.mocked(aiTradeTradabilityApi.probe).mockResolvedValue(TRADABILITY_FIXTURE);
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("guards");
     await screen.findByTestId("ai-tradability-confirm");
+    await gotoStep("review");
     fireEvent.click(await screen.findByRole("button", { name: /仍要启动 AI 自动交易/ }));
     expect(onConfirm).not.toHaveBeenCalled();
     expect(screen.getByRole("alert").textContent ?? "").toContain("仍要启动");
@@ -1200,9 +1374,11 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
   it("勾选二次确认后即可启动（确认是一次显式动作，不是永久豁免）", async () => {
     vi.mocked(aiTradeTradabilityApi.probe).mockResolvedValue(TRADABILITY_FIXTURE);
     const { onConfirm } = renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("guards");
     const box = await screen.findByLabelText("仍要在该周期上启动");
     fireEvent.click(box);
     await waitFor(() => expect(box).toBeChecked());
+    await gotoStep("review");
     fireEvent.click(screen.getByRole("button", { name: /仍要启动 AI 自动交易/ }));
     await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
   });
@@ -1210,8 +1386,10 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
   it("「一键换周期」改的是本弹窗的时间级别下拉（不自动改预设，不发额外请求）", async () => {
     vi.mocked(aiTradeTradabilityApi.probe).mockResolvedValue(TRADABILITY_FIXTURE);
     renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("guards");
     await screen.findByTestId("ai-tradability-pick-bar");
     fireEvent.click(screen.getByTestId("ai-tradability-pick-bar"));
+    await gotoStep("rhythm");
     await waitFor(() =>
       expect((screen.getByLabelText("时间级别") as HTMLSelectElement).value).toBe("15m"),
     );
@@ -1219,13 +1397,18 @@ describe("AiTradeLaunchModal · 交易周期模式", () => {
 
   it("契约摘要按当前表单值现算：改杠杆 ⇒ 解除阈随之变化（[P1-10]，无静态算例）", async () => {
     renderModal({ defaultStrategyIds: [1] });
+    await gotoStep("rhythm");
     await screen.findByRole("radio", { name: /日内波段/ });
     const summary = () => screen.getByTestId("ai-trade-horizon-contract").textContent ?? "";
     // 杠杆留空 ⇒ 解除阈**诚实降级**为兜底口径（绝不猜一个杠杆去算出一个看起来很确定的数）。
     expect(summary()).toContain("兜底口径");
+    await gotoStep("capital");
     fireEvent.change(screen.getByLabelText("杠杆（×）"), { target: { value: "3" } });
+    await gotoStep("rhythm");
     await waitFor(() => expect(summary()).toContain("−7.50%"));   // 默认止损 5% × 3× × 0.5
+    await gotoStep("capital");
     fireEvent.change(screen.getByLabelText("杠杆（×）"), { target: { value: "5" } });
+    await gotoStep("rhythm");
     await waitFor(() => expect(summary()).toContain("−12.50%"));
   });
 });

@@ -476,6 +476,12 @@ def _require_profit_exit_with_horizon(req: AiTradeGroupStartRequest,
                                       settings: Settings) -> None:
     """★ 轴 A-1 互锁（loss-and-liveness-hardening §4.1）：致命组合**不可被新启动**。
 
+    **本闸默认已关**（`ai_trade_require_profit_exit_with_horizon` 默认 `False`，
+    ai-trade-guided-launch 轴 A）：不开启利润保护时照样可以启动自动交易，代价由启动弹窗最后一步
+    的风险清单如实披露。本函数因而是一道**运维可选的加固闸**——置 `True` 即逐字节恢复今天的行为。
+    函数体不因默认值改变而放松：判据、落点、三条 remedies、错误体形状全部保留，落点也仍**必须**
+    留在端点内（下一段的理由不因默认值改变而失效）。
+
     **落点必须在本端点内，绝不在 `build_start_request` 里**（评审 P0-3）：冷续跑
     （`ai_auto/resume.py`）延迟导入并用 `start_wire` 原文重跑同一个 `build_start_request`，
     而 `_rebuild_request` 把任何 `HTTPException` 一律翻成 409「启动契约已失效，无法继续」。

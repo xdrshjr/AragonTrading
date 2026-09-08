@@ -55,7 +55,15 @@ function read(relToComponents: string): string {
 
 /**
  * 受管文件的**逐一计数表**（G3）。`===` 而不是 `≥`——`≥` 挡不住「加一个新的、删一个旧的」。
- * 合计 19（15 个 `row` + 4 个 `scope`）。走 Type C 的 9 张表与共用 kit 不用锚点，故为 0。
+ * 合计 20（16 个 `row` + 4 个 `scope`）。走 Type C 的 9 张表与共用 kit 不用锚点，故为 0。
+ *
+ * ai-trade-guided-launch §4.3（【v2 · P0-1】）新增第 26 项：AI 自动交易启动向导的**步骤轨**。
+ * 本表与 `TOTAL_ANCHORS` 是**等值冻结**而不是「按目录自动覆盖」——G2 虽然扫全仓，判据却是
+ * `expect(seen).toBe(TOTAL_ANCHORS)`。故新文件加一处锚点就**必须**在这里同步登记，否则 G2 与
+ * G3 双红；反过来，为了让门禁保持绿而不加锚点，新文件上的 Type A 契约就没有任何冻结——
+ * **一条永远不会红的门禁比没有更坏**。步骤轨是本轮**唯一**允许出现 `data-nowrap` 的新文件
+ * （六个 `Step*.tsx` 一律不带锚点：它们是内容区，文本本就该按 Type D 正常换行），
+ * 这样 `20` 这个数才是可对账的。
  */
 const MANAGED: { file: string; anchors: number; marker: string }[] = [
   { file: "ui/index.tsx", anchors: 0, marker: "role=\"tablist\"" },
@@ -83,9 +91,10 @@ const MANAGED: { file: string; anchors: number; marker: string }[] = [
   { file: "Strategy/CompareView.tsx", anchors: 0, marker: "sortCompareItems" },
   { file: "Strategy/ComboResult.tsx", anchors: 0, marker: "groupBreakdownByRegime" },
   { file: "Strategy/MetricsCards.tsx", anchors: 1, marker: "profitFactor" },
+  { file: "Agent/launch/AiTradeLaunchStepRail.tsx", anchors: 1, marker: "railKeyToIndex" },
 ];
 
-const TOTAL_ANCHORS = 19;
+const TOTAL_ANCHORS = 20;
 
 /** 九张受管数据表：`min-w-[N]` 是「不横滚就一定不折行」的阈值常量，逐表在 §4.5.2 / §4.5.3 给定。 */
 const MANAGED_TABLES = [
@@ -151,8 +160,8 @@ function collectSources(dir: string, out: string[] = []): string[] {
 }
 
 describe("交易工作台排版契约（源码冻结）", () => {
-  it("G0 自证：25 个受管文件全部读到、非空、且各含一条标志性内容", () => {
-    expect(MANAGED).toHaveLength(25);
+  it("G0 自证：26 个受管文件全部读到、非空、且各含一条标志性内容", () => {
+    expect(MANAGED).toHaveLength(26);
     for (const { file, marker } of MANAGED) {
       const src = read(file);
       expect(src.length, `${file} 读到的内容过短，路径可能写错`).toBeGreaterThan(500);
@@ -185,7 +194,7 @@ describe("交易工作台排版契约（源码冻结）", () => {
     expect(seen).toBe(TOTAL_ANCHORS);
   });
 
-  it("G3 受管文件逐一计数：锚点数必须与计数表逐文件相等，合计 19", () => {
+  it("G3 受管文件逐一计数：锚点数必须与计数表逐文件相等，合计 20", () => {
     let total = 0;
     for (const { file, anchors } of MANAGED) {
       const src = read(file);

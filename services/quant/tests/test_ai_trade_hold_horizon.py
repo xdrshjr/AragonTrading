@@ -3,6 +3,9 @@
 纯函数、无网络、无 LLM、无 broker：构造断面 → 快照 → 三道闸判定。四条被冻结的不变式各有专项用例
 把守：**只约束主动换手**（H-15/H-16/H-17 豁免矩阵）、**fail-open**（H-10/H-12/H-13）、
 **墙钟不是根数**（H-3/H-20）、**锁必须有钥匙**（H-22/H-23 的确认窗口上界）。
+
+唯一的例外在文件末尾：`B-6`（ai-trade-guided-launch §5.1）必须打**真端点**，因为它守的正是
+「`response_model` 有没有把新键静默剔除」——手造 wire 的用例在那条缺陷上永远是绿的。
 """
 from __future__ import annotations
 
@@ -345,3 +348,32 @@ def test_gate_status_and_rule_wire_shape():
     wire = rule_wire(rule)
     assert wire["expectedHoldBars"] == 12 and wire["confirmWindowSeconds"] == 3600.0
     assert rule_wire(None) is None
+
+
+# ==================== B-6 · 契约链路（真端点） ====================
+async def test_b6_the_profiles_endpoint_actually_carries_the_interlock_flag():
+    """`B-6`（guided-launch §5.1）：打**真端点**断言互锁总闸的只读回执没被 `response_model` 吞掉。
+
+    该端点声明了 `response_model=AiTradeHorizonProfilesOut`，`profiles_wire` 多下发的键会被
+    FastAPI **静默剔除**；而前端规则是「键缺席 ⇒ 按 `false` 处理」，两条一叠就是「互锁武装了
+    却永远拦不住」，且没有任何手造 wire 的用例会红（`backstopRepair` 的成文教训 P0-3）。
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from app.db.session import dispose_engine, init_db
+
+    await init_db()
+    try:
+        from app.main import app
+
+        async with AsyncClient(transport=ASGITransport(app=app),
+                               base_url="http://t") as client:
+            res = await client.get("/api/ai-trade/horizon-profiles")
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert "requireProfitExitWithHorizon" in body, (
+            "新键被 response_model 静默剔除了——前端会按 `false` 处理，互锁武装了也拦不住")
+        assert body["requireProfitExitWithHorizon"] is (
+            Settings().ai_trade_require_profit_exit_with_horizon)
+    finally:
+        await dispose_engine()

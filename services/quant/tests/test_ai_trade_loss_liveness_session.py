@@ -152,11 +152,16 @@ async def _seed_account(client) -> None:
 
 
 async def test_g_a1_unguarded_horizon_is_rejected_with_exactly_three_remedies(monkeypatch):
-    """`G-A1`：致命组合 ⇒ 422 `AI_TRADE_UNGUARDED_HORIZON`，且 `remedies` **恰好三条**。"""
+    """`B-3`（原 `G-A1`）：**显式武装**互锁后，致命组合仍 422，且 `remedies` **恰好三条**。
+
+    `ai_trade_require_profit_exit_with_horizon` 自 ai-trade-guided-launch 轴 A 起默认 `False`，
+    故这里必须显式置 `True` 才走得到 422 分支——回退路径真的存在，不是一句承诺。
+    """
     strategy_id = await _fresh()
     app = _load_app()
     app.dependency_overrides[get_settings] = lambda: Settings(
-        live_trading_enabled=True, ai_trade_enabled=True)
+        live_trading_enabled=True, ai_trade_enabled=True,
+        ai_trade_require_profit_exit_with_horizon=True)
     _patch(monkeypatch)
     try:
         async with AsyncClient(transport=ASGITransport(app=app),
@@ -183,6 +188,30 @@ async def test_g_a2_master_switch_off_lets_the_same_body_through(monkeypatch):
     app.dependency_overrides[get_settings] = lambda: Settings(
         live_trading_enabled=True, ai_trade_enabled=True,
         ai_trade_require_profit_exit_with_horizon=False)
+    _patch(monkeypatch)
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app),
+                               base_url="http://test") as client:
+            await _seed_account(client)
+            r = await client.post("/api/ai-trade/start", json=_body(strategy_id))
+            assert r.status_code == 200, r.text
+    finally:
+        get_ai_trade_manager()._group = None
+        app.dependency_overrides.clear()
+        await dispose_engine()
+
+
+async def test_g_a2b_default_settings_let_the_fatal_combo_through(monkeypatch):
+    """`B-2`（guided-launch 轴 A）：**不传该键**的 `Settings()` 下同一份 body 得 **200**。
+
+    这是本轮需求本体的唯一可证伪判据：用户不开启利润保护时就应当能启动自动交易。与 `G-A2` 的
+    区别在于那条**显式**传了 `ai_trade_require_profit_exit_with_horizon=False`——它守的是「总闸
+    关得掉」，守不住「默认就是关的」。默认值一旦被谁翻回 `True`，这一条当场判红。
+    """
+    strategy_id = await _fresh()
+    app = _load_app()
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        live_trading_enabled=True, ai_trade_enabled=True)
     _patch(monkeypatch)
     try:
         async with AsyncClient(transport=ASGITransport(app=app),
@@ -228,7 +257,10 @@ async def test_g_a8_cold_resume_of_a_fatal_combo_still_works(monkeypatch):
 
     strategy_id = await _fresh()
     app = _load_app()
-    settings = Settings(live_trading_enabled=True, ai_trade_enabled=True)
+    # guided-launch 轴 A：互锁默认已关，必须**显式武装**才走得到那条 422 分支；这条判据不因
+    # 默认值改变而放松（把它挪回装配链仍然当场判红）。
+    settings = Settings(live_trading_enabled=True, ai_trade_enabled=True,
+                        ai_trade_require_profit_exit_with_horizon=True)
     app.dependency_overrides[get_settings] = lambda: settings
     _patch(monkeypatch)
     try:

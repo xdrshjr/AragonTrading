@@ -87,6 +87,12 @@ def profiles_wire(settings, *, estimated_cost_bps: float | None = None) -> dict:
             "exitPriority": exit_profiles_block(settings),
             # C-1（loss-and-liveness-hardening）：唤醒下限除数；`0` = 本轮默认（只观测不改行为）。
             "wakeHorizonDivisor": int(getattr(settings, "ai_trade_wake_horizon_divisor", 0) or 0),
+            # 运维互锁总闸的**只读回执**（guided-launch §5.1）：`false`（默认）⇒ 前端不阻断、
+            # 只在最后一步的风险清单里披露；`true` ⇒ 前端恢复二次确认，且服务端会 422。
+            # 前端判据一律取自这个键，**从不**取自「本轮默认是 false」这句话——否则显式配置过
+            # 该键的环境会出现「前端放行、后端 422」的假门禁。
+            "requireProfitExitWithHorizon": bool(
+                getattr(settings, "ai_trade_require_profit_exit_with_horizon", False)),
             "profiles": [profile_wire(PROFILES[key], acceptance=_acceptance_preview(
                 settings, PROFILES[key]), turnover=_turnover_preview(
                 settings, PROFILES[key])) for key in PROFILES]}

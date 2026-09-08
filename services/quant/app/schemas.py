@@ -800,6 +800,11 @@ class AiTradeHorizonProfilesOut(BaseModel):
     # 什么必须显式告知（`discipline.adjustments` 的既有纪律），而那条回执要等启动之后才看得到。
     # 前端**不复制这个数**，只用它决定渲不渲染那句提示并按下发值现算。
     wakeHorizonDivisor: int = 0
+    # ai-trade-guided-launch §5.1：运维互锁总闸的只读回执。**必须在这里显式开字段**——该端点
+    # 声明了 `response_model`，`profiles_wire` 多下发的键会被 FastAPI 静默剔除；而前端规则是
+    # 「键缺席 ⇒ 按 `false` 处理」，两条一叠就是「互锁武装了却永远拦不住」，且没有任何手造 wire
+    # 的用例会红（`backstopRepair` 的成文教训 P0-3）。
+    requireProfitExitWithHorizon: bool = False
     profiles: list[AiTradeHorizonProfileOut] = Field(default_factory=list)
 
 

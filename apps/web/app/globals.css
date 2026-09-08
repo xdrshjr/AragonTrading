@@ -128,6 +128,19 @@ body {
   animation: shimmer 1.4s ease-in-out infinite;
 }
 
+/* AI 自动交易「引导式启动」的切步过渡（ai-trade-guided-launch §4.3）。
+
+   只做 opacity + transform，**不做高度动画**——内容区里有三处异步落地的数据（预设表、账户配置、
+   可交易性探针），对高度做动画会在数据到达的那一帧抖一下，而抖动恰好发生在用户正在读数字的时候。
+   系统「减少动态效果」偏好下由下方那段全局规则压到 0.01ms，无需在此重复声明。 */
+@keyframes aiLaunchStepIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.ai-launch-panel {
+  animation: aiLaunchStepIn 120ms ease-out;
+}
+
 /* 焦点可达性 */
 :focus-visible {
   outline: 2px solid var(--accent);

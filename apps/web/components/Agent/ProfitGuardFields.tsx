@@ -44,6 +44,15 @@ export interface ProfitGuardFieldsProps {
    * 下次调参时用户看到的就与真正生效的那组数分叉，比不给更坏。
    */
   hardTakeProfitText?: string | null;
+  /**
+   * ai-trade-guided-launch 轴 A：运维互锁总闸的**只读回执**（wire 上的
+   * `requireProfitExitWithHorizon`；键缺席 ⇒ 调用方按 `false` 传）。
+   *
+   * 后果清单最后那一句「若同时开着持仓周期模式，服务端会拒绝启动」在本轮之后**不再普遍成立**
+   * ——互锁默认已关。一句在多数环境里为假的警告比不给更坏：它会让用户以为自己被拦住了，
+   * 而真正拦住他的是别的东西。故那一句改为随本闸如实变文。
+   */
+  interlockArmed?: boolean;
 }
 
 export default function ProfitGuardFields({
@@ -69,6 +78,7 @@ export default function ProfitGuardFields({
   disabled,
   preview,
   hardTakeProfitText,
+  interlockArmed = false,
 }: ProfitGuardFieldsProps) {
   return (
     <div className="flex flex-col gap-1.5 rounded-md border border-[var(--accent-soft)] bg-[color-mix(in_srgb,var(--accent)_5%,transparent)] px-3 py-2">
@@ -138,8 +148,10 @@ export default function ProfitGuardFields({
               保护性平仓后的同向冷却 <strong>{cooldownRaw || "—"}</strong> 秒。
             </li>
           </ul>
-          <span className="text-[var(--muted)]">
-            若同时开着「持仓周期」模式，服务端会拒绝启动：那种组合下浮盈回吐没有任何自动兑现通道。
+          <span className="text-[var(--muted)]" data-testid="ai-profit-guard-interlock-note">
+            {interlockArmed
+              ? "本机构已开启运维互锁：若同时开着「持仓周期」模式，服务端会拒绝启动——那种组合下浮盈回吐没有任何自动兑现通道。"
+              : "若同时开着「持仓周期」模式，浮盈回吐将没有任何自动兑现通道（本机构未开启运维互锁，因此不会拦住你，但这份代价会如实列在最后一步的风险清单里）。"}
           </span>
         </div>
       )}

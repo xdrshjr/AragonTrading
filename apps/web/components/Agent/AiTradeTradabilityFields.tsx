@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo } from "react";
 import {
   describeSource,
   describeTradability,
@@ -8,7 +8,6 @@ import {
   formatBps,
   formatRate,
 } from "@/lib/aiTradeTradability";
-import { aiTradeTradabilityApi } from "@/lib/aiTradeHorizonApi";
 import type { AiTradeTradabilityResponse } from "@/lib/aiTradeTypes";
 
 /**
@@ -19,25 +18,28 @@ import type { AiTradeTradabilityResponse } from "@/lib/aiTradeTypes";
  * `balanced` 预设、市价口径下，**1m 是 98.6%、5m 是 65.0%**——而 `1m` 正是周期下拉的第一项。
  * 用户看到的现象就是「开着、在跑、每轮都有分析、就是从不开单」。
  *
- * 抽成子组件的唯一理由与 `AiTradeHorizonFields` / `ProfitGuardFields` 完全相同——CLAUDE.md 的
- * 800 行红线：`AiTradeLaunchModal.tsx` 开工前已 1542 行，而这一块含取数 effect + debounce +
- * 四档渲染 + 二次确认 + 一键换周期。
+ * ── 本组件是**纯展示**（ai-trade-guided-launch §4.2.4 / 【v2 · P0-2】）────────
+ * 取数、350ms 防抖、`prevLevel` 跃迁检测与「要不要二次确认」的判定**全部住在**
+ * `launch/useAiTradeLaunchForm.ts`。理由是分步化：本块住在第 5 步，而六步里有五步它是**卸载**的。
+ * 取数留在这里 ⇒ 用户在第 2 步改了周期、直达第 6 步启动时探针根本没重跑；`prevLevel` 随卸载丢失
+ * ⇒ 用户在 A 周期上确认过的风险被静默套用到 B 周期；而「要不要确认」若由本组件上报给父级 state，
+ * 那个 state 在五步里**没有任何人写**，`tradabilityBlocked` 恒 `false`——一次真实资金启动就绕过了
+ * 本轮唯一一次 fail-open 确认。**判据取自不携带该信息的入参**，正是本仓库反复付学费的形状。
  *
- * 三条不可动摇的纪律：
+ * 三条不可动摇的纪律（逐字不变）：
  * 1. **只提示、不阻断**：启动按钮**永不禁用**；`infeasible` 只降为一次显式的二次确认；
  *    `unknown` 一律不阻碍任何操作。本仓库四次「永不开单」事故全都源于把「不确定」翻译成「否决」。
  * 2. **判据与文案一个字都不重写**：`level` / `headline` / `advice` 全部服从后端下发的那一份。
  * 3. **确认态的生命周期**：确认一次后在本次弹窗会话内保持，但只要 `level` 发生
- *    **由非 `infeasible` 变为 `infeasible`** 的跃迁（用户换了标的/周期/预设又换回来），确认态
- *    **必须重置**——否则用户在 A 周期上确认过的风险会被静默地套用到 B 周期上。
+ *    **由非 `infeasible` 变为 `infeasible`** 的跃迁，确认态必须重置（现由 hook 里那个跨步骤存活的
+ *    `useRef` 负责——父组件全程不卸载，它才真的能活下来）。
  *
- * **本组件内不写任何「重置表单」的 effect**：弹窗的重置逻辑必须留在父组件那个依赖收敛为 `[open]`
- * 的 effect 里（`ai-trade-modal-revert-recurrence` 的复发根因）。这里唯一的 effect 是取数。
+ * **本组件内不写任何 effect**：既没有取数，也没有「重置表单」的——弹窗的重置逻辑必须留在
+ * hook 那个依赖收敛为 `[open]` 的 effect 里（`ai-trade-modal-revert-recurrence` 的复发根因）。
  */
-const DEBOUNCE_MS = 350;
 
 /**
- * 未完成二次确认时，启动路径上给出的那一句（父组件的错误横幅读它）。
+ * 未完成二次确认时，启动路径上给出的那一句（`useAiTradeLaunchForm` 的错误横幅读它）。
  *
  * 与下面 `ConfirmRow` 的勾选文案住在同一个文件，是为了让「要求什么」与「怎么满足它」不会分头演进。
  */
@@ -45,99 +47,29 @@ export const TRADABILITY_CONFIRM_REQUIRED_TEXT =
   "可交易性预检判定当前周期「不可行」：请在上方勾选「仍要启动」以确认风险，或改用更长的时间级别。";
 
 export interface AiTradeTradabilityFieldsProps {
-  /** 弹窗是否打开（关着就不取数，避免后台空跑）。 */
-  open: boolean;
-  instId: string;
-  bar: string;
-  preset: string;
-  /**
-   * 弹窗里单仓止损那一格的现值（fraction，留空 = 用服务端默认）。
-   *
-   * 风险单位体检（轴 E-0）判的是**按下启动键之后真正会挂出去的那个止损**，而启动路径取的正是
-   * 这一格（`req.stopLossPct or ai_trade_default_sl_pct`）。不传下去，一个已经把止损改到 1% 的
-   * 用户仍会被按出厂的 5% 告知「止损离现价约 500 bps」——判据取自不携带该信息的入参。
-   */
-  stopLossPct?: number | null;
+  /** 探针回执（`null` = 尚未落地 / 取数失败）。**取数由 hook 负责**，本组件不发任何请求。 */
+  data: AiTradeTradabilityResponse | null;
+  loading: boolean;
+  /** 取数失败 ⇒ 只说一句「这不影响启动」，绝不阻碍任何操作。 */
+  failed: boolean;
   /** 「一键换周期」：直接改本弹窗的时间级别下拉，**不发任何请求**、不改预设。 */
   onPickBar: (bar: string) => void;
-  /** 已确认「仍要启动」——受控 state 由父组件持有（本组件不写重置 effect）。 */
+  /** 已确认「仍要启动」——受控 state 由 hook 持有（本组件不写任何 effect）。 */
   confirmed: boolean;
   onConfirmedChange: (value: boolean) => void;
-  /**
-   * 本块**是否要求一次显式确认**（当且仅当 `level === "infeasible"`）。
-   *
-   * 必须向上报：父组件据此在提交路径上拦一次（`confirmed` 若只被写、不被读，那一行勾选就纯粹
-   * 是装饰——用户一次点击照样能在一个几乎开不出单的周期上启动真实资金会话）。
-   */
-  onNeedsConfirmChange?: (needsConfirm: boolean) => void;
   disabled?: boolean;
 }
 
 export default function AiTradeTradabilityFields({
-  open,
-  instId,
-  bar,
-  preset,
-  stopLossPct = null,
+  data,
+  loading,
+  failed,
   onPickBar,
   confirmed,
   onConfirmedChange,
-  onNeedsConfirmChange,
   disabled = false,
 }: AiTradeTradabilityFieldsProps) {
-  const [data, setData] = useState<AiTradeTradabilityResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [failed, setFailed] = useState(false);
-  // 上一次的 level：用于「由非 infeasible 变为 infeasible」的跃迁检测（确认态重置）。
-  const prevLevel = useRef<string | null>(null);
-
-  useEffect(() => {
-    if (!open || !instId || !bar) return;
-    let alive = true;
-    setLoading(true);
-    const timer = setTimeout(() => {
-      aiTradeTradabilityApi
-        .probe(instId, bar, preset, stopLossPct)
-        .then((res) => {
-          if (!alive) return;
-          setData(res);
-          setFailed(false);
-        })
-        .catch(() => {
-          if (!alive) return;
-          // 取数失败**不阻碍任何操作**：后端保证 200 + unknown，走到这里说明是网络/服务不可达。
-          setData(null);
-          setFailed(true);
-        })
-        .finally(() => {
-          if (alive) setLoading(false);
-        });
-    }, DEBOUNCE_MS);
-    return () => {
-      alive = false;
-      clearTimeout(timer);
-    };
-    // `stopLossPct` 进依赖：它改变的是**判据本身**（风险单位体检按它定标），不重取就等于把上一个
-    // 止损的结论贴在新止损上。既有的 350 ms debounce 已经吸收掉逐字输入的抖动。
-  }, [open, instId, bar, preset, stopLossPct]);
-
   const view = useMemo(() => describeTradability(data), [data]);
-
-  useEffect(() => {
-    const level = view?.level ?? null;
-    // 只在「由非 infeasible 跃迁到 infeasible」时重置确认态。相同 level 的重复取数不重置——
-    // 那会让用户每次 debounce 都要重新勾一次，是对同一个风险收第二次税。
-    if (level === "infeasible" && prevLevel.current !== "infeasible" && confirmed) {
-      onConfirmedChange(false);
-    }
-    prevLevel.current = level;
-    // 同一处上报「要不要确认」：判据（level）在这里，拦截点在父组件的提交路径上。两者分处两个
-    // 文件是刻意的——本块只提示、不阻断，真正的放行判定必须与其它启动前校验待在同一个地方。
-    onNeedsConfirmChange?.(level === "infeasible");
-    // `confirmed` / 两个回调刻意不进依赖：本 effect 只对 level 的**跃迁**做反应，
-    // 把它们放进来会在用户刚勾上确认的那一帧再跑一次并当场取消勾选。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view?.level]);
 
   if (!view && !loading && !failed) return null;
 
