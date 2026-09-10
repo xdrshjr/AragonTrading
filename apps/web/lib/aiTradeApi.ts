@@ -7,7 +7,6 @@ import type {
   AiTradeBackstopRepairResult,
   AiTradeEndResult,
   AiTradeGroupMemberStopResult,
-  AiTradeGroupRow,
   AiTradeGroupStartReq,
   AiTradeGroupStartResult,
   AiTradeGroupStatusResponse,
@@ -17,6 +16,7 @@ import type {
   AiTradeAdoptOrphanResult,
   AiTradeRelinkResult,
   AiTradeResumePreview,
+  AiTradeResumeResult,
 } from "./aiTradeTypes";
 import type { FeeRatesWire } from "./aiTradeCost";
 import type { TruthSourcesWire } from "./truthSources";
@@ -129,8 +129,11 @@ export const aiTradeApi = {
   resumePreview: (groupId: string) =>
     request<AiTradeResumePreview>(`/ai-trade/${groupId}/resume-preview`),
   // 继续：`verdict === "needs_confirm"` 时必须携 `acknowledge: true`（后端 400 兜底）。
+  // 回执是 `group_status()` 形状 + 一个**加法键** `notice`（notice-state-sync §5.1）：该端点
+  // `-> dict` 且**无** `response_model`，新键不会被 FastAPI 静默吞掉。`AiTradeResumeResult` 是
+  // `AiTradeGroupRow` 的超集，`groupStateFromStatus(res)` 逐字节兼容，一行都不用改。
   resumeGroup: (groupId: string, body: { acknowledge: boolean }) =>
-    request<AiTradeGroupRow>(`/ai-trade/${groupId}/resume`, {
+    request<AiTradeResumeResult>(`/ai-trade/${groupId}/resume`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

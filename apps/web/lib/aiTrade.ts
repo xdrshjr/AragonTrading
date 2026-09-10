@@ -11,8 +11,10 @@ import type {
   AiTradeGroupState,
   AiTradeGroupStatusResponse,
   AiTradeGivebackTier,
+  AiTradeLifecycle,
   AiTradeLifecycleWire,
   AiTradeNotArmedRow,
+  AiTradeNoticeKind,
   AiTradeProfitGuardRule,
   AiTradeRoundTrace,
   AiTradeStopReason,
@@ -1317,16 +1319,12 @@ function withCatchupMark(
 
 // ============ 暂停 / 继续（ai-trade-pause-resume §3.9.1 + lifecycle-truth §3.4）============
 
-/**
- * AI 自动交易在用户眼里的四态。
- *
- * **[评审 R1-5] 从三态加宽到四态是一次契约变更。** 唯一的门禁调用点把结果喂给
- * `resolveAiTradeGate({ hasActiveSession: running || paused })`；加上 `stopped` 之后该表达式
- * 会把「本地留痕的已停止分组」判成**可启动** —— 这**恰好是对的**（B-1 之后后端此刻已经清了组，
- * 容量闸不会 409），但必须写在这里并配一条守卫用例，否则下一轮一定有人「顺手把 stopped 也算
- * 进 hasActiveSession」，把「会话已结束却再也开不了新的」这个死结重新系上。
- */
-export type AiTradeLifecycle = "idle" | "running" | "paused" | "stopped";
+// AI 自动交易四态的**真源已下沉到叶模块** `aiTradeTypes.ts`（notice-state-sync §5.3 /
+// [评审 RP1-1]）：`AiTradeGroupMemberState.messageEpoch` 需要 `AiTradeNoticeEpoch`，而纪元的
+// 值侧模块 `aiTradeNotice.ts` 依赖本文件 —— 类型留在这里，叶模块就得反向 import，正好成环。
+// 此处**原地再导出**，全仓既有的 `import type { AiTradeLifecycle } from "./aiTrade"` 一行都不用改。
+// 本文件**绝不**导入 `./aiTradeNotice`（源码门禁 G-N4 冻结这条方向）。
+export type { AiTradeLifecycle } from "./aiTradeTypes";
 
 /** `Badge` 组件的既有 `tone` 值域（本轮不动 `components/ui/index.tsx`，只组合既有取值）。 */
 export type AiTradeBadgeTone = "neutral" | "long" | "short" | "accent";
@@ -1496,9 +1494,15 @@ export interface AiTradeReconcileSetters {
   setAiTradeResumable: (resumable: AiTradeResumableGroup | null) => void;
   patchAiTradeGroupLifecycle: (patch: AiTradeGroupLifecyclePatch) => void;
   clearAiTradeRuntime: () => void;
-  setAiTradeSyncState: (state: "ok" | "unknown") => void;
+  /**
+   * `"ok"` 分支必须把**这次对账请求出发**的墙钟一起交出去（notice-state-sync §4.3 /
+   * [评审 RP1-3]）。形参**可选、缺席即 `Date.now()`**，故老调用点逐字兼容、行为只退化不崩。
+   * `"unknown"` 分支**绝不打戳**：读不到 ≠ 已核实。
+   */
+  setAiTradeSyncState: (state: "ok" | "unknown", startedAtMs?: number) => void;
   setAiTradeEnabled: (enabled: boolean) => void;
-  setAiTradeLifecycleNotice: (notice: string | null) => void;
+  /** 铸造一条带纪元戳的提示（`text` 为空 / 全空白 ⇒ 清空，不留空条）。 */
+  noteAiTradeNotice: (kind: AiTradeNoticeKind, text: string | null) => void;
 }
 
 /**
@@ -1557,7 +1561,11 @@ export function reconcileAiTradeLifecycle(
     return;
   }
   setters.clearAiTradeRuntime();
-  setters.setAiTradeLifecycleNotice(
+  // 本行是全仓**唯一**的 `backend_ended` 产生点。它与 `end` 的孤儿仓提示同为本轮唯二的「真钱
+  // 待办」，故规则表给它 `persist:true` + `groupScoped:false` + 无 TTL：结束那一刻 `aiTradeGroup`
+  // 正好被清成 null，按 groupScoped 判会在它最该出现的那一瞬间自己判死自己（§4.2）。
+  setters.noteAiTradeNotice(
+    "backend_ended",
     "AI 自动交易会话已在后端结束（可能是软件重启或会话自行终止），请到实盘面板核对持仓。",
   );
 }

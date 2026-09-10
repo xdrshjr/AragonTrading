@@ -348,6 +348,43 @@ def build_pause_notice(members: list[dict], *, hold_position: bool,
     return notice
 
 
+def build_resume_notice(members: list[dict], *, resumed_count: int) -> str:
+    """续跑回执的 `notice`（与 `build_pause_notice` 同一处收口，§3.10）。
+
+    **只说这一刻已经核实过的事**：`resume_group` 只有在 `_verify_armed` 通过之后才返回，
+    故「重新武装完成」是有据的。持仓张数**一律不复述** —— 热续跑没有重新向交易所读过持仓，
+    照抄本地投影等于在一句判定性文案里混进一个未经核实的数（诚实不变式 I-4：读不到 ≠ 没有，
+    没核实过 ≠ 可以当成核实过）。
+
+    不复述张数还不够：不带回执调用时 `_state_member_rows` 走 `session.state_member_row()`，
+    那里 `positionUnknown` **恒为 `False`**、`position` 取的是 `executor` 的**自管投影** ——
+    换言之点名「哪几个标的有持仓」同样是一句未经核实的断言。故第二句必须**自报数据来源**
+    （「按本会话的自管投影」）并**自报未核实**（「本次继续未重新向交易所核实持仓」），
+    两个短语由 B-2 机械冻结。冷续跑路径已由 `resume-preview` 做过交易所核实，两条路径共用同一
+    措辞是**保守方向**（把已核实的说成未核实，最坏后果是用户多看一眼）。
+
+    纯文本，绝不用 `**粗体**`：后端文案直接进 JSX，markdown 会原样显示成星号（本仓库已复发四次）。
+
+    Args:
+        members: `AiTradeManager._state_member_rows(group)` 的逐成员行（与暂停回执同一形状）。
+        resumed_count: 后端权威的单调计数（每次 pause→resume 往返 +1）。
+
+    Returns:
+        一到三句中文；`members` 为空或全部无仓时只有第一句（与第三句可选追加）。
+    """
+    held = [str(row.get("instId") or "") for row in members or []
+            if _position_view(row.get("position")) is not None]
+    count = len(members or [])
+    notice = (f"已继续：{count} 个标的重新武装完成，暂停期「不开新仓」的限制已解除。"
+              if count else "已继续：暂停期「不开新仓」的限制已解除。")
+    if held:
+        notice += ("按本会话的自管投影，" + "、".join(held)
+                   + " 仍记有持仓并已重新纳入盯市（本次继续未重新向交易所核实持仓）。")
+    if resumed_count > 1:
+        notice += f"（这是本会话第 {resumed_count} 次继续。）"
+    return notice
+
+
 def _residual_lines(residual: list[dict]) -> list[str]:
     """平仓未完成时逐成员如实描述残留（「读不到」与「没有」分开说，诚实不变式 I-4）。"""
     lines = []

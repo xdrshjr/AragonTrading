@@ -121,7 +121,9 @@ export function useAiTradeGroupStream() {
   const requestAiTradeReconcile = useAppStore((s) => s.requestAiTradeReconcile);
   const setAiTradeSyncState = useAppStore((s) => s.setAiTradeSyncState);
   const setAiTradeEnabled = useAppStore((s) => s.setAiTradeEnabled);
-  const setAiTradeLifecycleNotice = useAppStore((s) => s.setAiTradeLifecycleNotice);
+  const noteAiTradeNotice = useAppStore((s) => s.noteAiTradeNotice);
+  const syncAiTradeNotice = useAppStore((s) => s.syncAiTradeNotice);
+  const noteAiTradeMemberMessage = useAppStore((s) => s.noteAiTradeMemberMessage);
   const clearAiTradeRuntime = useAppStore((s) => s.clearAiTradeRuntime);
   const setAiTradeMemberTrades = useAppStore((s) => s.setAiTradeMemberTrades);
   const appendAiTradeMemberTrade = useAppStore((s) => s.appendAiTradeMemberTrade);
@@ -159,7 +161,7 @@ export function useAiTradeGroupStream() {
     clearAiTradeRuntime,
     setAiTradeSyncState,
     setAiTradeEnabled,
-    setAiTradeLifecycleNotice,
+    noteAiTradeNotice,
   };
   useEffect(() => {
     if (accountMode !== "live") return;
@@ -167,13 +169,25 @@ export function useAiTradeGroupStream() {
     const pull = () => {
       // 既有守卫：页面隐藏时不打请求（R-14：长期挂着的看板不该持续烧配额）。
       if (typeof document !== "undefined" && document.hidden) return;
+      // 对账时戳打的是**请求出发**的墙钟，不是回执落地的墙钟（notice-state-sync §4.3 /
+      // [评审 RP1-3]）。它要排除的是「在动作**之前**就已出发」的那一次对账；按落地时刻比，
+      // 一次 `t-100ms` 出发、`t+2000ms` 才落地的对账会当场用一份**不含该动作结果**的快照
+      // 结算掉「本次操作结果未知」——本仓库成文的「判据取自不携带该信息的入参」。
+      // 三个 `"ok"` 调用点全在 `reconcileAiTradeLifecycle` 内，这层闭包一次改全。
+      const startedAtMs = Date.now();
       aiTradeApi
         .status()
         .then((res) => {
           if (cancelled || !settersRef.current) return;
-          reconcileAiTradeLifecycle(res, settersRef.current);
+          reconcileAiTradeLifecycle(res, {
+            ...settersRef.current,
+            setAiTradeSyncState: (state, ms) => setAiTradeSyncState(state, ms ?? startedAtMs),
+          });
+          // store 卫生：把已判死的提示真删掉。渲染安全由渲染点的谓词保证，这里只是不留垃圾——
+          // 它**不能替代**组件对 `aiTradeReconciledAtMs` 的订阅（§4.8-6）。
+          syncAiTradeNotice();
         })
-        // 连不上后端 **≠** 没有分组（L-7 的极性）：只置 `unknown`，什么都不清。
+        // 连不上后端 **≠** 没有分组（L-7 的极性）：只置 `unknown`，什么都不清、**也不打戳**。
         .catch(() => {
           if (!cancelled) setAiTradeSyncState("unknown");
         });
@@ -231,6 +245,7 @@ export function useAiTradeGroupStream() {
         routeMemberEvent(instId, event, {
           patchAiTradeMemberSession,
           patchAiTradeMemberStatus,
+          noteAiTradeMemberMessage,
           setAiTradeMemberTrades,
           appendAiTradeMemberTrade,
           setAiTradeMemberPosition,
@@ -255,6 +270,7 @@ export function useAiTradeGroupStream() {
     memberKey,
     patchAiTradeMemberSession,
     patchAiTradeMemberStatus,
+    noteAiTradeMemberMessage,
     setAiTradeMemberTrades,
     appendAiTradeMemberTrade,
     setAiTradeMemberPosition,
@@ -271,6 +287,8 @@ export function useAiTradeGroupStream() {
 interface MemberSetters {
   patchAiTradeMemberSession: (instId: string, patch: Partial<AiTradeSessionRow>) => void;
   patchAiTradeMemberStatus: (instId: string, status: AiTradeStatusEvent) => void;
+  /** 成员运行期状态行的唯一写点（带纪元戳，notice-state-sync §4.5）。 */
+  noteAiTradeMemberMessage: (instId: string, text: string | null) => void;
   setAiTradeMemberTrades: (instId: string, trades: Trade[]) => void;
   appendAiTradeMemberTrade: (instId: string, trade: Trade) => void;
   setAiTradeMemberPosition: (instId: string, pos: PaperPositionEvent | null) => void;
@@ -378,7 +396,10 @@ function routeMemberEvent(instId: string, event: WsEvent, setters: MemberSetters
         return;
       }
       // **绝不碰 `state`**：一条错误帧不是一次状态迁移，替它猜一个 `state` 就是新造一句谎话。
-      if (err?.message) setters.patchAiTradeMemberSession(instId, { message: err.message });
+      // 走 `noteAiTradeMemberMessage` 而不是裸 patch：这条回声今天没有任何复位点（后端
+      // `_status_payload()` 不含 `message` 键，浅合并永远清不掉；L4 告警又只出声一次），
+      // 盖上纪元戳之后它才会跨过一次暂停/继续往返自行退场（§4.5）。
+      if (err?.message) setters.noteAiTradeMemberMessage(instId, err.message);
       return;
     }
     // equity / candle：净值由面板派生，K 线由市场 WS 兜底。

@@ -105,17 +105,33 @@ async def ai_trade_resume(group_id: str, body: AiTradeResumeIn | None = None,
     `AI_TRADE_GROUP_ENDED` / `AI_TRADE_RESUME_PARTIALLY_DEAD` / `AI_TRADE_RESUME_NOT_ARMED`。
     前端 `describeStartError` 的 code 白名单必须**同时**认得这三个，否则 `.members` 里的逐标的
     明细一个字都不会渲染（[评审 R1-1]：本仓库「wire 里有事实、用户那里没有」的第 N 次复发）。
+
+    notice-state-sync §4.7：回执多一个**加法键** `notice` —— 「继续」此前是全仓唯一一条**没有
+    判定性回执**的生命周期迁移，于是界面上的表现是「暂停那句话凭空不见了」而不是「换了一句话」。
+    本端点 `-> dict` 且**无** `response_model`，新键不会被 FastAPI 静默吞掉。
+
+    **为什么不塞进 `/ai-trade/status`**：那里的 `group` 是一个长期存在的只读视图，往里塞一个
+    只在一次动作里成立的 `notice` 会让它变成第二个真源；`notice` 的有效期是这一次迁移，不是
+    「直到下一次轮询」。前端用一个**扩展类型** `AiTradeResumeResult extends AiTradeGroupRow`
+    承接，`groupStateFromStatus(res)` 是超集入参的消费者，一行都不用改。
     """
     _require_ai_enabled(settings)
     _require_pause_enabled(settings)
     payload = body or AiTradeResumeIn()
     try:
-        await get_ai_trade_manager().resume_group(group_id, acknowledged=payload.acknowledge)
+        group = await get_ai_trade_manager().resume_group(group_id,
+                                                          acknowledged=payload.acknowledge)
     except AiTradeResumeBlocked as exc:
         raise _http_error(exc) from exc
     except AiTradePreflightError as exc:
         raise _http_error(exc) from exc
-    return get_ai_trade_manager().group_status() or {}
+    # **空 body 绝不并 notice**：`group_status()` 返回 `None` 时原样回 `{}`，否则会造出一份
+    # 「只有 notice、没有任何分组字段」的回执体，而 `groupStateFromStatus(res)` 是它的消费者。
+    manager = get_ai_trade_manager()
+    status = manager.group_status()
+    if not status:
+        return {}
+    return {**status, "notice": manager.build_resume_notice_for(group)}
 
 
 @router.post("/ai-trade/{group_id}/end")

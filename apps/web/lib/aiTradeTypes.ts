@@ -2040,12 +2040,92 @@ export interface AiTradeBackstopRepairResult {
   positionSz?: number | null;
 }
 
+// ---- 提示纪元（ai-trade-notice-state-sync §5.3）：**类型全部住在这个叶模块** ----
+// 归属被评审钉死（[评审 RP1-1]）：`messageEpoch` 需要 `AiTradeNoticeEpoch`，而值侧的
+// `aiTradeNotice.ts` 依赖 `aiTrade.ts` → 本文件；类型放在值侧，本文件就得反向 import ⇒ 模块环。
+// 方向恒为 `aiTradeTypes`（叶） ← `aiTrade` ← `aiTradeNotice` ← `store` / 组件，G-N7 冻结本端。
+
+/**
+ * AI 自动交易在用户眼里的四态（**真源在这里**，`lib/aiTrade.ts` 只做原地再导出）。
+ *
+ * **[评审 R1-5] 从三态加宽到四态是一次契约变更。** 唯一的门禁调用点把结果喂给
+ * `resolveAiTradeGate({ hasActiveSession: running || paused })`；加上 `stopped` 之后该表达式
+ * 会把「本地留痕的已停止分组」判成**可启动** —— 这**恰好是对的**（B-1 之后后端此刻已经清了组，
+ * 容量闸不会 409），但必须写在这里并配一条守卫用例，否则下一轮一定有人「顺手把 stopped 也算
+ * 进 hasActiveSession」，把「会话已结束却再也开不了新的」这个死结重新系上。
+ */
+export type AiTradeLifecycle = "idle" | "running" | "paused" | "stopped";
+
+/** 判定性提示的七个种类。新增一种必须在 `AI_TRADE_NOTICE_RULES` 里登记九条判据，漏登记即编译失败（G-2）。 */
+export type AiTradeNoticeKind =
+  | "paused"
+  | "resumed"
+  | "ended"
+  | "backend_ended"
+  | "action_unknown"
+  | "member_status"
+  | "action_error";
+
+/**
+ * 一条提示被**铸造时**的运行时上下文（§4.1）。四位少一位都不行：`groupId`（换组即作废）、
+ * `lifecycle`（主判据）、`resumedCount`（区分「本次 running」与「上一次 running」）、
+ * `reconciledAtMs`（唯一能让「结果未知」如实退场的判据）。
+ */
+export interface AiTradeNoticeEpoch {
+  groupId: string | null;
+  lifecycle: AiTradeLifecycle;
+  resumedCount: number | null;
+  /** 最近一次**确定**结论的对账**请求出发**墙钟（不是落地墙钟，[评审 RP1-3]）。0 = 从未落地过。 */
+  reconciledAtMs: number;
+}
+
+/** 带纪元戳的提示。`ts` 由调用方注入（纯函数不自取时钟，便于用例给定断面）。 */
+export interface AiTradeNotice {
+  kind: AiTradeNoticeKind;
+  text: string;
+  epoch: AiTradeNoticeEpoch;
+  ts: number;
+}
+
+/** 规则表的一行：九条**可证伪**的判据 + 三键呈现（§4.2 / §4.8-1）。 */
+export interface AiTradeNoticeRule {
+  /** 空数组 = 不按 lifecycle 限定（`action_unknown` / `member_status` / `action_error`）。 */
+  validIn: readonly AiTradeLifecycle[];
+  groupScoped: boolean;
+  resumeScoped: boolean;
+  settledByReconcile: boolean;
+  ttlMs: number | null;
+  /** 非 sticky 不得驱逐一条仍判活的 sticky（§4.3 的铸造闸，[评审 RP1-6]）。 */
+  sticky: boolean;
+  /** 只有 `ended` / `backend_ended` 为 true —— 本轮唯二的真钱待办（§6.1，[评审 RP1-5]）。 */
+  persist: boolean;
+  tone: "accent" | "long" | "short" | "warn";
+  /** 分形前缀（无障碍：绝不只靠颜色）。 */
+  glyph: string;
+  /** true ⇒ `role="alert"`（只给需要用户行动的两种，其余是噪音）。 */
+  urgent: boolean;
+  dismissLabel: "知道了" | "关闭";
+}
+
+/**
+ * `POST /ai-trade/{gid}/resume` 的 200 回执（§5.1）：`group_status()` 形状 + 一个**加法键**。
+ * 键缺席（老后端）⇒ `res.notice ?? null` ⇒「只清不换」，G-1 依然成立。
+ */
+export interface AiTradeResumeResult extends AiTradeGroupRow {
+  notice?: string | null;
+}
+
 // 运行期成员槽（瞬态；镜像 LiveAutoGroupMemberState + AI 专属轨迹 / 决策 / 摘要）。
 export interface AiTradeGroupMemberState {
   instId: string;
   sessionId: string;
   allocationPct: number;
   session: AiTradeSessionRow | null;   // 会话只读视图（info + WS status/decision/summary 增量合并）
+  // 与 `session.message` 配对的纪元戳（§4.5 / §6.2）。**可选，且缺席即判活**：老快照与既有用例
+  // 直接构造成员对象、没有这个键，把「没戳」当成「已死」会让一批本该显示的状态行凭空消失。
+  // 这条极性还兼第二职责（[评审 RP1-4]）：`lifecycle` 总闸关时**故意不盖戳**——那时
+  // `AiTradeFeedRecoveryCard` 整块不渲染，清 `message` 等于抹掉一个**仍在持续**的降级。
+  messageEpoch?: AiTradeNoticeEpoch | null;
   trades: Trade[];
   position: PaperPositionEvent | null;
   // 保护性平仓冷却期（adaptive §4.2）：**与 position 平级的独立字段**，绝不挂在 position 之下——

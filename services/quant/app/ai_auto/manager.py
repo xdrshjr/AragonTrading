@@ -1048,6 +1048,20 @@ class AiTradeManager:
                 flatten_on_stale=bool(getattr(settings, "live_auto_flatten_on_stale", False))),
         }
 
+    def build_resume_notice_for(self, group: AiTradeGroup) -> str:
+        """续跑回执的判定性文案（notice-state-sync §4.7）：转调 `pause.build_resume_notice`。
+
+        行形状与暂停回执**同一处构造**（`_state_member_rows`），绝不为续跑另造一份行。
+
+        Args:
+            group: `resume_group` 返回的分组（此刻已置 `running` 且 `resumed_count` 已 +1）。
+
+        Returns:
+            纯文本中文回执（不复述张数，理由见 `pause.build_resume_notice` 的 docstring）。
+        """
+        return pause_core.build_resume_notice(
+            self._state_member_rows(group), resumed_count=group.resumed_count)
+
     async def resume_group(self, group_id: str, *, acknowledged: bool) -> AiTradeGroup:
         """继续：热路径逐成员 `session.resume()`；冷路径委托 `ai_auto/resume.py` 重建。
 

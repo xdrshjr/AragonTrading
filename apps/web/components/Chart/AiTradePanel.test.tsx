@@ -503,6 +503,84 @@ describe("AiTradePanel · 生命周期真值", () => {
     expect(screen.getByTestId("ai-trade-member-message"))
       .toHaveTextContent("行情连接异常");
   });
+
+  // ---- notice-state-sync C-8：状态行的纪元化（§4.5 / §6.2）----
+  //
+  // `session.message` 今天**没有任何复位点**：`_status_payload()` 不含 `message` 键，
+  // `patchAiTradeMemberStatus` 的浅合并永远清不掉它；行情自愈的 L4 告警按设计「只出声一次」，
+  // 也不会有第二条来覆盖。于是它会跨过一次暂停/继续往返继续说旧话。
+  it("C-8：带过期 messageEpoch ⇒ 不渲染；messageEpoch **缺席** ⇒ 照常渲染（老数据兼容）", () => {
+    const group = makeGroup([makeSession("BTC-USDT-SWAP", { message: "行情连接异常，AI 自动交易暂停响应 K 线" })]);
+    // 缺席即渲染：既有用例与老快照直接构造成员对象、没有这个键；把「没戳」当成「已死」
+    // 会让一批本该显示的状态行凭空消失（与本轮修复方向相反）。
+    useAppStore.setState({
+      aiTradeGroup: { ...group, groupId: "g1", state: "running", resumedCount: 1 } as never,
+    });
+    const first = renderPanel();
+    expect(screen.getByTestId("ai-trade-member-message")).toBeInTheDocument();
+    first.unmount();
+
+    // 盖过戳、且戳来自上一段（resumedCount=0）⇒ 跨过一次暂停/继续往返之后判死。
+    const stamped = {
+      ...group,
+      members: {
+        "BTC-USDT-SWAP": {
+          ...group.members["BTC-USDT-SWAP"],
+          messageEpoch: { groupId: "g1", lifecycle: "running", resumedCount: 0, reconciledAtMs: 0 },
+        },
+      },
+    };
+    useAppStore.setState({
+      aiTradeGroup: { ...stamped, groupId: "g1", state: "running", resumedCount: 1 } as never,
+    });
+    renderPanel();
+    expect(screen.queryByTestId("ai-trade-member-message")).not.toBeInTheDocument();
+  });
+
+  it("C-8b：`lifecycle` 总闸关（status 不含该键）⇒ 不盖戳 ⇒ 跨一次往返后状态行**照常渲染**", () => {
+    // [评审 RP1-4]：「清掉一条过期回声是安全的」这条论证的依据，是每一种**仍在持续**的降级都另有
+    // 一处由状态派生的常驻落点在说（`AiTradeFeedRecoveryCard` 读 `session.lifecycle.feedRecovery`）。
+    // 但 `lifecycle` 是**总闸门控、关闭即整键缺席**——那时恢复卡整块不渲染，此刻清掉 `message`
+    // 就是把一个仍在持续的降级抹掉。故盖戳的前置条件必须是「`lifecycle` 键在场」。
+    useAppStore.setState({
+      aiTradeGroup: { ...makeGroup([makeSession("BTC-USDT-SWAP")]),
+                      groupId: "g1", state: "running", resumedCount: 0 } as never,
+    });
+    // 一帧**不含 `lifecycle` 键**的 status（总闸关的形状）带着 message 到达。
+    act(() => useAppStore.getState().patchAiTradeMemberStatus("BTC-USDT-SWAP", {
+      message: "行情连接异常，AI 自动交易暂停响应 K 线",
+    } as never));
+    expect(useAppStore.getState().aiTradeGroup?.members["BTC-USDT-SWAP"].messageEpoch)
+      .toBeUndefined();
+
+    // 走一次暂停 / 继续往返（resumedCount +1）之后，这条状态行**必须仍在**。
+    act(() => useAppStore.setState({
+      aiTradeGroup: { ...useAppStore.getState().aiTradeGroup!, resumedCount: 1 } as never,
+    }));
+    renderPanel();
+    expect(screen.getByTestId("ai-trade-member-message")).toBeInTheDocument();
+  });
+
+  it("C-8c：status 携 `lifecycle` 键 + 非空 message ⇒ 盖戳（有常驻落点时才允许清回声）", () => {
+    useAppStore.setState({
+      aiTradeGroup: { ...makeGroup([makeSession("BTC-USDT-SWAP")]),
+                      groupId: "g1", state: "running", resumedCount: 0 } as never,
+    });
+    act(() => useAppStore.getState().patchAiTradeMemberStatus("BTC-USDT-SWAP", {
+      message: "行情连接异常，AI 自动交易暂停响应 K 线", lifecycle: PANEL_MEMBER_WIRE,
+    } as never));
+    expect(useAppStore.getState().aiTradeGroup?.members["BTC-USDT-SWAP"].messageEpoch)
+      .toMatchObject({ groupId: "g1", resumedCount: 0 });
+
+    // 缺席 `message` 的那些 status 帧**不得**刷戳（保住「浅合并不清空」的既有语义）。
+    act(() => useAppStore.getState().patchAiTradeMemberStatus("BTC-USDT-SWAP", {
+      roundsCompleted: 9, lifecycle: PANEL_MEMBER_WIRE,
+    } as never));
+    expect(useAppStore.getState().aiTradeGroup?.members["BTC-USDT-SWAP"].messageEpoch)
+      .toMatchObject({ resumedCount: 0 });
+    expect(useAppStore.getState().aiTradeGroup?.members["BTC-USDT-SWAP"].session?.message)
+      .toContain("行情连接异常");
+  });
 });
 
 // ---------------- silent-degradation-repair 轴 A-4 / 轴 E 的两个面板落点 ----------------

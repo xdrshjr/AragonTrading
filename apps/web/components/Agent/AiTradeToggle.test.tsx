@@ -123,7 +123,8 @@ beforeEach(() => {
     aiTradeSyncState: "ok",
     aiTradeReconcileUntil: null,
     aiTradeEnabled: false,
-    aiTradeLifecycleNotice: null,
+    aiTradeNotice: null,
+    aiTradeReconciledAtMs: 0,
   });
   vi.mocked(accountApi.accounts.list).mockResolvedValue(READY_ACCOUNTS as never);
   vi.mocked(agentApi.config).mockResolvedValue({ configured: true, provider: "x", model: "y" } as never);
@@ -360,8 +361,11 @@ describe("AiTradeToggle 的三态", () => {
     fireEvent.click(await screen.findByRole("button", { name: "暂停 AI 自动交易" }));
     fireEvent.click(await screen.findByRole("button", { name: "保留持仓并暂停" }));
     await waitFor(() =>
-      expect(useAppStore.getState().aiTradeLifecycleNotice).toContain("平仓没有完成"),
+      expect(useAppStore.getState().aiTradeNotice?.text).toContain("平仓没有完成"),
     );
+    // 铸造那一刻本地 `lifecycle` 还是 "running"（pauseM 不调 setAiTradeGroup）——「未落地宽限」
+    // 负责在权威结论落地之前接住它，kind 一起断死，否则规则表挑错一行这条话就换了一套判据。
+    expect(useAppStore.getState().aiTradeNotice?.kind).toBe("paused");
   });
 
   it("paused（热）：徽标 + 继续 + 结束；开关保持 off 且点它不会触发停止", async () => {
@@ -451,7 +455,8 @@ describe("AiTradeToggle 的三态", () => {
     await waitFor(() => expect(useAppStore.getState().aiTradeResumable).toBeNull());
     // RV-4：`orphanPositions` 必须有读点——归档后 AI 面板整块消失，这条提示是「这些仓从此
     // 没人管了」唯一还能被说出来的地方。
-    expect(useAppStore.getState().aiTradeLifecycleNotice).toContain("BTC-USDT-SWAP");
+    expect(useAppStore.getState().aiTradeNotice?.text).toContain("BTC-USDT-SWAP");
+    expect(useAppStore.getState().aiTradeNotice?.kind).toBe("ended");
   });
 
   it("idle：三个新按钮一个都不出现（既有渲染逐字不变）", async () => {
@@ -666,7 +671,7 @@ describe("AiTradeToggle · 写端点超时（用例 17 / 25 · L-7 · [评审 R0
     fireEvent.click(await screen.findByRole("button", { name: "继续" }));
 
     await waitFor(() =>
-      expect(useAppStore.getState().aiTradeLifecycleNotice).toContain("结果未知"),
+      expect(useAppStore.getState().aiTradeNotice?.text).toContain("结果未知"),
     );
     expect(useAppStore.getState().aiTradeReconcileUntil).toBeTruthy();
     expect(document.body.textContent).not.toContain("失败");
@@ -707,7 +712,7 @@ describe("AiTradeToggle · 写端点超时（用例 17 / 25 · L-7 · [评审 R0
     fireEvent.click(await screen.findByRole("button", { name: "保留持仓并暂停" }));
 
     await waitFor(() =>
-      expect(useAppStore.getState().aiTradeLifecycleNotice).toContain("结果未知"),
+      expect(useAppStore.getState().aiTradeNotice?.text).toContain("结果未知"),
     );
   });
   it("明确的 409 ⇒ **退出**武装清单回到复核屏（不让一次已被拒绝的续跑对着清单空等 45 秒）", async () => {
@@ -736,3 +741,149 @@ describe("AiTradeToggle · 写端点超时（用例 17 / 25 · L-7 · [评审 R0
     expect(screen.getByRole("button", { name: "继续" })).toBeInTheDocument();
   });
 });
+
+
+describe("AiTradeToggle · 提示与状态同步（notice-state-sync C-6 / C-7）", () => {
+  /**
+   * 制造一条**行内可见**的 `action_error`。
+   *
+   * 到达路径只有一条（`AiTradeToggle` 的既有注释已写明）：四个弹窗的 `onClose` 一律清 error，
+   * 故唯一能让行内读点 `(paused || stopped) && liveError && !resumeOpen && !endOpen` 成立的，
+   * 是「续跑复核**在途**时先关掉弹窗、随后复核才失败」这个竞态。所以这里必须用一个可控 promise，
+   * 不能用 `mockRejectedValue`（那样 error 会被紧随其后的 onClose 清掉，用例就成了空转）。
+   */
+  async function seedInlineError() {
+    let reject: (e: unknown) => void = () => {};
+    vi.mocked(aiTradeApi.resumePreview).mockReturnValue(
+      new Promise((_resolve, rej) => { reject = rej; }) as never,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "继续 AI 自动交易" }));
+    await screen.findByTestId("ai-trade-resume-dialog");
+    fireEvent.click(await screen.findByRole("button", { name: "取消" }));
+    await act(async () => { reject(new Error("boom")); });
+    return screen.findByTestId("ai-trade-toggle-error");
+  }
+
+  /** 打开续跑对话框并点「继续」（C-6 用的那一段交互）。 */
+  async function clickResume() {
+    vi.mocked(aiTradeApi.resumePreview).mockResolvedValue({
+      groupId: "grp-1", offlineText: "1 分", pauseReasonText: "", resumedCount: 0,
+      contract: { bar: "1H", instIds: ["BTC-USDT-SWAP"], strategyNames: [] },
+      drift: [], members: [], verdict: "ready",
+    } as never);
+    fireEvent.click(await screen.findByRole("button", { name: "继续 AI 自动交易" }));
+    await screen.findByTestId("ai-trade-resume-dialog");
+    fireEvent.click(await screen.findByRole("button", { name: "继续" }));
+  }
+
+  it("C-6：resume 回执带 notice ⇒ 铸一条 resumed；老后端不带 ⇒ 只清不换（G-1 依然成立）", async () => {
+    // 「继续」此前是全仓唯一一条**没有写点**的生命周期迁移（E-5），也就是用户报告的那条缺陷。
+    useAppStore.setState({
+      aiTradeGroup: armedGroup({ state: "paused", lifecycle: groupWire({ state: "paused" }) }),
+    });
+    vi.mocked(aiTradeApi.resumeGroup).mockResolvedValue({
+      ...statusRowLike(), notice: "已继续：1 个标的重新武装完成，暂停期「不开新仓」的限制已解除。",
+    } as never);
+    renderToggle();
+    await clickResume();
+
+    await waitFor(() =>
+      expect(useAppStore.getState().aiTradeNotice?.kind).toBe("resumed"),
+    );
+    expect(useAppStore.getState().aiTradeNotice?.text).toContain("重新武装完成");
+
+    // 老后端 / 键缺席 ⇒ `res.notice ?? null` ⇒ 只清不换。**后端是增益，不是前提**。
+    cleanup();
+    useAppStore.setState({
+      aiTradeNotice: null,
+      aiTradeGroup: armedGroup({ state: "paused", lifecycle: groupWire({ state: "paused" }) }),
+    });
+    vi.mocked(aiTradeApi.resumeGroup).mockResolvedValue(statusRowLike() as never);
+    renderToggle();
+    await clickResume();
+
+    await waitFor(() => expect(aiTradeApi.resumeGroup).toHaveBeenCalledTimes(2));
+    expect(useAppStore.getState().aiTradeNotice).toBeNull();
+  });
+
+  // ⚠️ 两条分支的顺序是被实施纪律钉死的（RC-2）：**先写外部迁移那条**。
+  // 只走本地 resume 分支的 C-7 在缺陷仍然存在时**恒绿** —— `setError(null)` 本轮之前就已存在于
+  // `resumeM.onSuccess`，那条路上从来就没坏过；E-13 唯一可达的路径是外部发起的继续。
+  it("C-7②【外部迁移，E-13 的可达路径】过期 error 不得在下一次暂停时复活", async () => {
+    useAppStore.setState({
+      aiTradeGroup: armedGroup({ state: "paused", lifecycle: groupWire({ state: "paused" }) }),
+    });
+    renderToggle();
+    const inline = await seedInlineError();
+    expect(inline).toHaveTextContent("无法核对持仓");
+
+    // **不走任何本地 mutation**：另一个窗口点了【继续】/ 活性看门狗自动停手 ⇒ WS lifecycle +
+    // 对账把分组级结论推到 running 且 resumedCount +1。`resumeM.onSuccess` 根本不跑。
+    act(() =>
+      useAppStore.setState({
+        aiTradeGroup: armedGroup({
+          state: "running", resumedCount: 1, lifecycle: groupWire({ state: "running", resumedCount: 1 }),
+        }),
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByTestId("ai-trade-toggle-error")).not.toBeInTheDocument(),
+    );
+
+    // 再暂停一次：`lifecycle` 又回到 "paused"。按 v1 的「只比 lifecycle」写法，这条早已过期的
+    // 错误会在这里**原样复活** —— 那比「不消失」更坏。靠的是 `resumeScoped`（resumedCount 已 +1）。
+    act(() =>
+      useAppStore.setState({
+        aiTradeGroup: armedGroup({
+          state: "paused", resumedCount: 1, lifecycle: groupWire({ state: "paused", resumedCount: 1 }),
+        }),
+      }),
+    );
+    expect(screen.queryByTestId("ai-trade-toggle-error")).not.toBeInTheDocument();
+  });
+
+  // ① 走的是**真的本地 mutation**（不是 setState 推态）。它记录的正是评审 RP0-2 指出的那件事：
+  // 这条分支上 `openResume` 与 `resumeM.onSuccess` 各有一处既有的清除，故它在缺陷仍然存在时
+  // **恒绿**。留着它是为了守住「本地路径没被改坏」，但**它证明不了 E-13 被修好**——那件事只有 ② 能证明。
+  it("C-7①【本地 resume】走完整条 mutation 之后 error 不可见，转回 paused 仍不可见", async () => {
+    vi.mocked(aiTradeApi.resumeGroup).mockResolvedValue(
+      { ...statusRowLike(), notice: "已继续：1 个标的重新武装完成。" } as never,
+    );
+    useAppStore.setState({
+      aiTradeGroup: armedGroup({ state: "paused", lifecycle: groupWire({ state: "paused" }) }),
+    });
+    renderToggle();
+    expect(await seedInlineError()).toBeInTheDocument();
+
+    // 真的点一遍【继续】→ 复核屏 →【继续】：`resumeM.onSuccess` 会把本地态推到 running。
+    await clickResume();
+    await waitFor(() =>
+      expect(useAppStore.getState().aiTradeGroup?.state).toBe("running"),
+    );
+    expect(screen.queryByTestId("ai-trade-toggle-error")).not.toBeInTheDocument();
+
+    act(() =>
+      useAppStore.setState({
+        aiTradeGroup: armedGroup({
+          state: "paused", resumedCount: 1, lifecycle: groupWire({ state: "paused", resumedCount: 1 }),
+        }),
+      }),
+    );
+    expect(screen.queryByTestId("ai-trade-toggle-error")).not.toBeInTheDocument();
+  });
+});
+
+/** `resumeGroup` 的 200 回执（`group_status()` 形状；C-6 在其上加一个 `notice` 加法键）。 */
+function statusRowLike(): Record<string, unknown> {
+  return {
+    groupId: "grp-1", bar: "1H", strategyIds: [1], strategyNames: ["S1"], totalBudgetUsd: 100,
+    leverage: 3, contextRefreshRounds: 10, state: "running", createdTs: 0, resumedCount: 1,
+    lifecycle: groupWire({ state: "running", resumedCount: 1 }),
+    members: [{
+      instId: "BTC-USDT-SWAP", sessionId: "sess-1", allocationPct: 100, runId: 1,
+      state: "running", bar: "1H", strategyIds: [1], strategyNames: ["S1"], budgetUsd: 100,
+      leverage: 3, contextRefreshRounds: 10, roundsCompleted: 0, roundsSinceSummary: 0,
+      positionSide: "flat", sessionPnlUsd: 0, startedTs: 0,
+    }],
+  };
+}

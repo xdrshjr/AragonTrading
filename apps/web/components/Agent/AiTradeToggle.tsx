@@ -20,10 +20,16 @@ import {
   resolveAiTradeGate,
   resolveAiTradeLifecycle,
 } from "@/lib/aiTrade";
+import {
+  currentAiTradeEpoch,
+  isAiTradeNoticeLive,
+  mintAiTradeNotice,
+} from "@/lib/aiTradeNotice";
 import { ApiRequestError } from "@/lib/api";
 import { groupStateFromStatus } from "@/lib/useAiTradeGroupStream";
 import type {
   AiTradeEndResult,
+  AiTradeNotice,
   AiTradeResumableMember,
   AiTradeResumePreview,
 } from "@/lib/aiTradeTypes";
@@ -58,7 +64,9 @@ export default function AiTradeToggle() {
   const aiBacktestConfig = useAppStore((s) => s.aiBacktestConfig);
   const setAiTradeGroup = useAppStore((s) => s.setAiTradeGroup);
   const setAiTradeResumable = useAppStore((s) => s.setAiTradeResumable);
-  const setAiTradeLifecycleNotice = useAppStore((s) => s.setAiTradeLifecycleNotice);
+  const aiTradeReconciledAtMs = useAppStore((s) => s.aiTradeReconciledAtMs);
+  const noteAiTradeNotice = useAppStore((s) => s.noteAiTradeNotice);
+  const dismissAiTradeNotice = useAppStore((s) => s.dismissAiTradeNotice);
   const setAiTradeAcknowledged = useAppStore((s) => s.setAiTradeAcknowledged);
   const setAiTradeConfig = useAppStore((s) => s.setAiTradeConfig);
   const setAiBacktestJobId = useAppStore((s) => s.setAiBacktestJobId);
@@ -69,7 +77,19 @@ export default function AiTradeToggle() {
   // 倒计时每秒 tick 一次（只在有分组时挂表：idle 态挂一个每秒重渲染的定时器纯属浪费）。
   const [nowTs, setNowTs] = useState(() => Math.floor(Date.now() / 1000));
   const [modalOpen, setModalOpen] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  // 局部 `error` 同样纪元化（§4.6，修 E-13）。它**共用同一张规则表、同一个判活谓词**，不新造第二套
+  // 判据。E-13 唯一可达的那条路径是**外部发起**的继续（另一个窗口 / 活性看门狗自动停手）：
+  // `resumeM.onSuccess` 根本不跑，于是一条早已过期的错误会在**下一次暂停时原地复活**——那比
+  // 「不消失」更坏。修它的是 `action_error` 的 `resumeScoped:true`（看的是「这是不是同一段
+  // running/paused」，而不是「态叫什么名字」），且**不依赖任何写点记得去清它**。
+  const [error, setError] = useState<AiTradeNotice | null>(null);
+  // 铸造点读的是**此刻**的 store 断面（`getState()` 而不是闭包里的快照）：本函数身份恒定，
+  // 不会让下游 `useCallback` 的依赖每渲染一次就变一次。
+  const noteError = useCallback((text: string | null) => {
+    const s = useAppStore.getState();
+    setError(mintAiTradeNotice("action_error", text,
+      currentAiTradeEpoch(s.aiTradeGroup, s.aiTradeResumable, s.aiTradeReconciledAtMs), Date.now()));
+  }, []);
   // ai-trade-loss-and-liveness-hardening A-1：422 `AI_TRADE_UNGUARDED_HORIZON` 随错误体带回的
   // **可执行补救**（文案由后端下发，前端只把它渲染成按钮）。其余错误 ⇒ 恒 null ⇒ 逐字回退。
   const [startRemedies, setStartRemedies] = useState<{ id: string; label: string }[] | null>(null);
@@ -107,6 +127,9 @@ export default function AiTradeToggle() {
 
   // 生命周期的唯一推导点（L-4）：任何组件都不得自己拼这个判断。
   const lifecycle = resolveAiTradeLifecycle(aiTradeGroup, aiTradeResumable);
+  // 当前纪元（§4.1）：`liveError` 的判据。它订阅了 `aiTradeReconciledAtMs`，故一次「除了时戳
+  // 什么都没变」的对账同样会让这一行重算。
+  const epoch = currentAiTradeEpoch(aiTradeGroup, aiTradeResumable, aiTradeReconciledAtMs);
   const armed = resolveAiTradeArmed(aiTradeGroup);
   const syncing = aiTradeSyncState === "unknown";
   const running = lifecycle === "running";
@@ -191,14 +214,16 @@ export default function AiTradeToggle() {
         intel: opts.intel,
       });
       setModalOpen(false);
-      setError(null);
+      noteError(null);
       setStartRemedies(null);
       // 新会话起来了，上一次的生命周期提示就过期了（那笔孤儿仓的告知使命到此为止）。
-      setAiTradeLifecycleNotice(null);
+      // 走 `dismiss` 而不是铸一条空提示：语义上这与用户点「知道了」等价，且它是**唯一**能越过
+      // §4.3 铸造闸清掉一条 sticky 的合法出口。
+      dismissAiTradeNotice();
       qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
     },
     onError: (e) => {
-      setError(e instanceof ApiRequestError ? describeStartError(e) : "启动失败，请稍后重试");
+      noteError(e instanceof ApiRequestError ? describeStartError(e) : "启动失败，请稍后重试");
       setStartRemedies(e instanceof ApiRequestError ? (e.remedies ?? null) : null);
     },
   });
@@ -244,10 +269,10 @@ export default function AiTradeToggle() {
         contextRefreshRounds: opts.contextRefreshRounds,
       });
       setModalOpen(false);
-      setError(null);
+      noteError(null);
     },
     onError: (e) =>
-      setError(e instanceof ApiRequestError ? e.message : "回测启动失败，请稍后重试"),
+      noteError(e instanceof ApiRequestError ? e.message : "回测启动失败，请稍后重试"),
   });
 
   const stopM = useMutation({
@@ -276,14 +301,19 @@ export default function AiTradeToggle() {
   const handleActionError = useCallback(
     (e: unknown, fallback: string) => {
       if (e instanceof ApiRequestError && e.code === "TIMEOUT") {
-        setError(null);
-        setAiTradeLifecycleNotice(e.message);   // 文案由 `timeoutMessage` 单点生成，前端不再拼第二句
+        noteError(null);
+        // 文案由 `timeoutMessage` 单点生成，前端不再拼第二句。`action_unknown` 是**唯一**由对账
+        // 结算的种类（`settledByReconcile`）：t+1.5s 之内落地的那次不算（它问的是一个可能还在处理
+        // 这次写请求的后端），t+3s 的快对账落地即判死 —— 这才兑现了旁边那句「由对账给出最终结论」。
+        // 若此刻槽位上压着一条**仍然成立**的 sticky（比如「平仓没有完成，请立即手动处理」），
+        // 铸造闸会丢弃这一条：一句「我不知道现在是什么态」压不过一句真钱待办（§4.3）。
+        noteAiTradeNotice("action_unknown", e.message);
         requestAiTradeReconcile();
         return;
       }
-      setError(e instanceof ApiRequestError ? describeStartError(e) : fallback);
+      noteError(e instanceof ApiRequestError ? describeStartError(e) : fallback);
     },
-    [requestAiTradeReconcile, setAiTradeLifecycleNotice],
+    [noteError, noteAiTradeNotice, requestAiTradeReconcile],
   );
 
   const pauseM = useMutation({
@@ -292,9 +322,13 @@ export default function AiTradeToggle() {
     onSuccess: (res) => {
       // 回执的 `notice` 是后端单点生成的判定性文案（§3.10）：它是唯一一处会说出「平仓其实没成功」
       // 与「此刻没有任何持久化兜底」的地方。只写不读 = 用户永远看不到那句话。
-      setAiTradeLifecycleNotice(res.notice || null);
+      // 铸造时本地 `lifecycle` 仍是 `"running"`：`pause_group` 的回执**不是** `group_status()`
+      // 形状（没有 lifecycle 证据可供 `groupStateFromStatus` 消费），故这里刻意不置本地态——
+      // 让前端自己推导分组结论是 L-1 的反面。谓词的「未落地宽限」子句负责在权威结论落地前
+      // 接住这条刚铸出来的话（§4.4 路径 A′），对账一落地就恢复成硬判据。
+      noteAiTradeNotice("paused", res.notice ?? null);
       setPauseOpen(false);
-      setError(null);
+      noteError(null);
       requestAiTradeReconcile();               // 3 秒快对账：让权威回执尽快确认这次迁移
       qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
     },
@@ -308,7 +342,13 @@ export default function AiTradeToggle() {
       // 续跑成功后热态回来了：装上分组视图并清掉冷占位（两者互斥，绝不同时非空）。
       setAiTradeGroup(groupStateFromStatus(res));
       setAiTradeResumable(null);
-      setError(null);
+      noteError(null);
+      // 用户报告的那条缺陷的**写点**（本轮新增）。但请注意这条链路真正的性质：即使这一行被误删，
+      // 暂停提示照样消失 —— 上一行 `setAiTradeGroup` 已把 lifecycle 推到 `running`，渲染点的谓词
+      // 当场判死它。写点只负责「换上新的那句话」，不负责「记得清掉旧的」，这正是本设计与
+      // 「补一行 setNotice(null)」的本质区别（G-2）。
+      // 老后端没有这个键 ⇒ `?? null` ⇒ 只清不换，G-1 依然成立（后端是增益，不是前提）。
+      noteAiTradeNotice("resumed", res.notice ?? null);
       // **对话框不立刻关闭**（F-8）：进入「正在武装」清单，由 `lifecycle.armed` 决定它什么时候
       // 该消失。点完「继续」就把框关掉，等于把「它到底起来了没有」这个问题重新交还给用户去猜。
       requestAiTradeReconcile();
@@ -331,10 +371,10 @@ export default function AiTradeToggle() {
       clearAiTradeRuntime();
       // `orphanPositions` = 此次结束后仍留在交易所上的持仓（§5.4 要求前端据它出一条**持久**提示）。
       // 归档后 AI 面板整块消失，若这条提示也跟着消失，「这些仓从此没人管了」就再也没人告诉用户。
-      setAiTradeLifecycleNotice(describeOrphanPositions(res.orphanPositions));
+      noteAiTradeNotice("ended", describeOrphanPositions(res.orphanPositions));
       setEndOpen(false);
       setResumeOpen(false);
-      setError(null);
+      noteError(null);
       requestAiTradeReconcile();
       qc.invalidateQueries({ queryKey: ["aiTrade", "status"] });
     },
@@ -345,7 +385,7 @@ export default function AiTradeToggle() {
   // 用户看到的第一屏就是「离线期间发生了什么」，而不是一个空壳弹窗。
   const openResume = useCallback(() => {
     if (!groupId) return;
-    setError(null);
+    noteError(null);
     setPreview(null);
     setArmingSince(null);          // 重新打开即回到第一屏（复核），而不是接着上次的武装清单
     setResumeOpen(true);
@@ -354,7 +394,7 @@ export default function AiTradeToggle() {
       .resumePreview(groupId)
       .then(setPreview)
       .catch((e: unknown) =>
-        setError(e instanceof ApiRequestError ? describeStartError(e) : "无法核对持仓，请稍后重试"),
+        noteError(e instanceof ApiRequestError ? describeStartError(e) : "无法核对持仓，请稍后重试"),
       )
       .finally(() => setPreviewLoading(false));
   }, [groupId]);
@@ -380,7 +420,7 @@ export default function AiTradeToggle() {
   }, [fullyArmed]);
 
   const onToggle = (next: boolean) => {
-    setError(null);
+    noteError(null);
     if (next) {
       if (openBlockedReason) return;
       setModalOpen(true);
@@ -403,6 +443,9 @@ export default function AiTradeToggle() {
   // `unknown` 下动作按钮全部禁用（L-7 的极性：读不到就不让点）。
   const actionsDisabled = syncing || resuming;
   const countdown = formatNextWake(aiTradeGroup?.lifecycle, lifecycle, nowTs);
+  // 全部五个读点（行内一处 + 四个弹窗）一律吃这一个值：写点带纪元、读点过谓词，中间不留第二条
+  // 通路。`action_error` 的 `ttlMs` 为 null，故此处的 `Date.now()` 只是形参，不引入每秒重渲染。
+  const liveError = error && isAiTradeNoticeLive(error, epoch, Date.now()) ? error.text : null;
 
   return (
     <div className="flex w-full min-w-0 flex-col gap-1">
@@ -485,7 +528,7 @@ export default function AiTradeToggle() {
               aria-label="暂停 AI 自动交易"
               disabled={actionsDisabled}
               onClick={() => {
-                setError(null);
+                noteError(null);
                 setPauseOpen(true);
               }}
             >
@@ -509,7 +552,7 @@ export default function AiTradeToggle() {
                 aria-label="结束 AI 自动交易"
                 disabled={actionsDisabled}
                 onClick={() => {
-                  setError(null);
+                  noteError(null);
                   setEndOpen(true);
                 }}
               >
@@ -526,7 +569,7 @@ export default function AiTradeToggle() {
               aria-label="清理已停止的 AI 自动交易面板"
               disabled={syncing}
               onClick={() => {
-                setError(null);
+                noteError(null);
                 clearAiTradeRuntime();
               }}
             >
@@ -539,15 +582,15 @@ export default function AiTradeToggle() {
       {/* 错误文案独占第二行：在通栏里再挤一段截断文本，等于把「继续 / 结束」按钮挤没。
           whitespace-normal 显式覆盖控制条继承下来的 nowrap（这是本方案里唯一需要换行的文本）。
           data-testid 是必需的：四个弹窗里的错误段落同样是 role="alert"，只靠 role 定位有歧义。
-          触发面很窄——四个弹窗的 onClose 一律 setError(null)，唯一到达路径是「续跑复核在途时
+          触发面很窄——四个弹窗的 onClose 一律 noteError(null)，唯一到达路径是「续跑复核在途时
           先关掉弹窗、随后复核失败」这个竞态。 */}
-      {(paused || stopped) && error && !resumeOpen && !endOpen && (
+      {(paused || stopped) && liveError && !resumeOpen && !endOpen && (
         <span
           data-testid="ai-trade-toggle-error"
           className="whitespace-normal break-words text-[10px] leading-relaxed text-[var(--short-ink)]"
           role="alert"
         >
-          {error}
+          {liveError}
         </span>
       )}
 
@@ -555,10 +598,10 @@ export default function AiTradeToggle() {
         open={pauseOpen}
         group={aiTradeGroup}
         submitting={pauseM.isPending}
-        error={pauseOpen ? error : null}
+        error={pauseOpen ? liveError : null}
         onClose={() => {
           setPauseOpen(false);
-          setError(null);
+          noteError(null);
         }}
         onConfirm={(opts) => pauseM.mutate(opts)}
       />
@@ -571,7 +614,7 @@ export default function AiTradeToggle() {
         preview={preview}
         loading={previewLoading}
         submitting={resumeM.isPending}
-        error={resumeOpen ? error : null}
+        error={resumeOpen ? liveError : null}
         arming={armingSince != null}
         armingSince={armingSince}
         lifecycle={aiTradeGroup?.lifecycle ?? null}
@@ -580,7 +623,7 @@ export default function AiTradeToggle() {
         onClose={() => {
           setResumeOpen(false);
           setArmingSince(null);
-          setError(null);
+          noteError(null);
         }}
         onConfirm={(opts) => {
           setArmingSince(Math.floor(Date.now() / 1000));
@@ -599,10 +642,10 @@ export default function AiTradeToggle() {
         // 回 `AI_TRADE_END_FLATTEN_UNAVAILABLE`）。这里**不给**那个选项，而不是给了再报错。
         canFlatten={!!aiTradeGroup}
         submitting={endM.isPending}
-        error={endOpen ? error : null}
+        error={endOpen ? liveError : null}
         onClose={() => {
           setEndOpen(false);
-          setError(null);
+          noteError(null);
         }}
         onConfirm={(opts) => endM.mutate(opts)}
       />
@@ -610,7 +653,7 @@ export default function AiTradeToggle() {
         open={modalOpen}
         onClose={() => {
           setModalOpen(false);
-          setError(null);
+          noteError(null);
           setStartRemedies(null);
         }}
         onConfirm={(opts) => (opts.mode === "backtest" ? startBacktestM.mutate(opts) : startM.mutate(opts))}
@@ -637,7 +680,7 @@ export default function AiTradeToggle() {
         // 老 localStorage 无此键 ⇒ `undefined` ⇒ 弹窗回落 `AI_TRADE_INTEL_RULE_DEFAULT`
         // （默认不勾）。**不为此改 persist version**，沿用 baseRules 先例。
         defaultIntel={aiTradeConfig?.intel}
-        error={error}
+        error={liveError}
         errorRemedies={startRemedies}
         liveGateReason={liveGateReason}
         defaultStartTs={backtestStartTs}

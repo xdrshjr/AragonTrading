@@ -212,6 +212,14 @@ async def test_pause_then_status_then_resume(monkeypatch):
                                         json={"acknowledge": True})
             assert resumed.status_code == 200, resumed.text
             assert resumed.json()["state"] == "running"
+            # B-4（notice-state-sync §8.4）：断言回执里**真的有**这个键，而不是断言后端调用过它。
+            # 本端点 `-> dict` 且无 `response_model`，故新键不会被 FastAPI 静默吞掉——本仓库
+            # 有过 `response_model` 悄悄吞掉新 wire 键的成文事故，这条守的正是那个形状。
+            # 「继续」此前是全仓唯一一条没有判定性回执的生命周期迁移（用户报告的那条缺陷）。
+            assert resumed.json()["notice"]
+            assert "已继续" in resumed.json()["notice"]
+            assert "**" not in resumed.json()["notice"]
+            assert resumed.json()["resumedCount"] == 1
 
             sm = get_sessionmaker()
             async with sm() as s:

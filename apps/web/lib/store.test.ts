@@ -1014,3 +1014,53 @@ describe("app store — 市场情报切片（ai-trade-market-intel §6.2 #38）"
     expect(persisted?.state?.aiTradeIntel).toBeUndefined();
   });
 });
+
+// ---- notice-state-sync §6.1 / U-11 的持久化侧（RC-5：必须**按 persist 位过滤**）----
+describe("aiTradeNotice 的 partialize：只有真钱待办落盘", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useAppStore.setState({
+      aiTradeNotice: null, aiTradeGroup: null, aiTradeResumable: null, aiTradeReconciledAtMs: 0,
+    });
+  });
+
+  /** 触发一次持久化写入并取回快照。 */
+  function persisted() {
+    useAppStore.getState().setTheme("dark");
+    return JSON.parse(localStorage.getItem("aragon-ui") as string);
+  }
+
+  it("ended **进**快照：设计上曾以为「刷新后由对账器重新产生」，取证是假的", () => {
+    // `reconcileAiTradeLifecycle` 在 `if (!local) return;` 处早退，而刷新之后 store 里根本没有
+    // `local` —— 于是「以下持仓从此不再由任何自动化管理」这条真钱待办在一次刷新后**永久消失**。
+    useAppStore.getState().noteAiTradeNotice("ended", "已结束并归档。以下持仓仍留在交易所上…");
+    expect(persisted().state.aiTradeNotice?.kind).toBe("ended");
+  });
+
+  it("backend_ended 同样进快照（它与 ended 是本轮唯二的 persist:true）", () => {
+    useAppStore.getState().noteAiTradeNotice("backend_ended", "会话已在后端结束…");
+    expect(persisted().state.aiTradeNotice?.kind).toBe("backend_ended");
+  });
+
+  it("paused **不进**：跨刷新恢复一条暂停回执 = 在一个刚对过账的界面上放一句来历不明的旧话", () => {
+    useAppStore.setState({
+      aiTradeGroup: { groupId: "g1", state: "paused", resumedCount: 0, members: {} } as never,
+    });
+    useAppStore.getState().noteAiTradeNotice("paused", "已暂停：不再开新仓…");
+    expect(useAppStore.getState().aiTradeNotice?.kind).toBe("paused");   // 内存里有
+    expect(persisted().state.aiTradeNotice).toBeNull();                  // 快照里没有
+  });
+
+  it("resumed / action_unknown / action_error 一律不进（只有 persist 位为真的才放行）", () => {
+    for (const kind of ["resumed", "action_unknown", "action_error"] as const) {
+      useAppStore.setState({ aiTradeNotice: null, aiTradeGroup: null });
+      useAppStore.getState().noteAiTradeNotice(kind, `${kind} 的文案`);
+      expect(persisted().state.aiTradeNotice).toBeNull();
+    }
+  });
+
+  it("aiTradeReconciledAtMs 是瞬态，**不入** partialize", () => {
+    useAppStore.setState({ aiTradeReconciledAtMs: 123_456 });
+    expect(persisted().state).not.toHaveProperty("aiTradeReconciledAtMs");
+  });
+});

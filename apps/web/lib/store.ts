@@ -33,6 +33,8 @@ import type {
   AiTradeDecision,
   AiTradeGroupLifecyclePatch,
   AiTradeGroupState,
+  AiTradeNotice,
+  AiTradeNoticeKind,
   AiTradeResumableGroup,
   AiTradeRoundTrace,
   AiTradeSessionRow,
@@ -52,6 +54,15 @@ import {
   AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN,
   AI_TRADE_RECONCILE_WINDOW_MS,
 } from "./aiTrade";
+// 提示纪元的纯核心（notice-state-sync §5.3）：store 是它的消费者，方向恒为
+// `aiTradeTypes` ← `aiTrade` ← `aiTradeNotice` ← 本文件。
+import {
+  AI_TRADE_NOTICE_RULES,
+  currentAiTradeEpoch,
+  isAiTradeNoticeBlockedBySticky,
+  isAiTradeNoticeLive,
+  mintAiTradeNotice,
+} from "./aiTradeNotice";
 
 // 分组级验收三键的补丁面（横切 `AiTradeGroupState` 的一个**窄**子集，故在此单独取名——
 // 用 `Partial<AiTradeGroupState>` 会让这个 action 有能力覆盖 `members` / `trades`，
@@ -466,11 +477,13 @@ interface AppState {
   // 冷占位（ai-trade-pause-resume §3.9.4）：进程重启后磁盘上仍有一份可续跑契约时非空。
   // **与 `aiTradeGroup` 互斥**——热暂停走 `aiTradeGroup.state === "paused"`，冷暂停才走这里。
   aiTradeResumable: AiTradeResumableGroup | null;
-  // 生命周期回执的**持久**提示（暂停回执 notice / 结束后的孤儿持仓，§3.10 / §5.4）：这两条都是
-  // 后端单点生成的判定性事实，必须有读点且**不能是 toast**——「结束后这些仓没人管了」这句话若
-  // 三秒就消失，等于没说。刻意**不进** `clearAiTradeRuntime`：结束那一刻分组正好被清掉，跟着清
-  // 就等于让这条提示永远显示不出来。
-  aiTradeLifecycleNotice: string | null;
+  // 生命周期回执的判定性提示（notice-state-sync §5.4）。**从裸字符串换成带纪元戳的对象是刻意的**：
+  // 留着旧名旧形状，漏改的写点会悄悄编译通过，而本缺陷的根因正是「有写点、没人负责清」。
+  // 「它此刻还成不成立」由 `isAiTradeNoticeLive` 一个纯谓词判定，写点只负责「说什么」。
+  // 刻意**不进** `clearAiTradeRuntime`：结束那一刻分组正好被清掉，跟着清等于让这条提示永远显示不出来。
+  aiTradeNotice: AiTradeNotice | null;
+  /** 最近一次**确定**结论的对账**请求出发**墙钟（§4.3）。0 = 从未落地过；瞬态、不进 partialize。 */
+  aiTradeReconciledAtMs: number;
   aiTradeAcknowledged: boolean;                   // 首启风险勾选会话记忆，刷新复位
   aiTradeConfig: AiTradeConfig | null;            // 持久化偏好（进 partialize）
   // ---- 生命周期真值化（ai-trade-lifecycle-truth F-9）：三个字段全部**瞬态、不进 partialize** ----
@@ -602,7 +615,14 @@ interface AppState {
   // 摘要，按 instId 路由，镜像 liveAutoGroup member setter）+ 风险勾选 + 清理；aiTradeConfig 为持久化偏好。
   setAiTradeGroup: (group: AiTradeGroupState | null) => void;
   setAiTradeResumable: (resumable: AiTradeResumableGroup | null) => void;
-  setAiTradeLifecycleNotice: (notice: string | null) => void;
+  /** 铸造一条带纪元戳的提示（§4.3 的铸造闸在内；`text` 空 / 全空白 ⇒ 清空）。 */
+  noteAiTradeNotice: (kind: AiTradeNoticeKind, text: string | null) => void;
+  /** 用户主动关闭。与 `syncAiTradeNotice`（系统清）分开命名，好让源码门禁分辨两者。 */
+  dismissAiTradeNotice: () => void;
+  /** store 卫生：对账落地后把已判死的提示真删掉（渲染安全由谓词保证，这里只是不留垃圾）。 */
+  syncAiTradeNotice: () => void;
+  /** 成员运行期状态行的**唯一**写点（带纪元；盖戳前置条件见 §4.5）。 */
+  noteAiTradeMemberMessage: (instId: string, text: string | null) => void;
   setAiTradeMemberSession: (instId: string, session: AiTradeSessionRow | null) => void;
   patchAiTradeMemberSession: (instId: string, patch: Partial<AiTradeSessionRow>) => void;
   patchAiTradeMemberStatus: (instId: string, status: AiTradeStatusEvent) => void;
@@ -612,7 +632,7 @@ interface AppState {
   // `traces` / `summary`（那些是 WS 流的产物，覆盖即闪烁 / 丢历史），也不增删成员槽。
   patchAiTradeGroupLifecycle: (patch: AiTradeGroupLifecyclePatch) => void;
   requestAiTradeReconcile: () => void;
-  setAiTradeSyncState: (state: "ok" | "unknown") => void;
+  setAiTradeSyncState: (state: "ok" | "unknown", startedAtMs?: number) => void;
   setAiTradeEnabled: (enabled: boolean) => void;
   /** 单标的情报 summary 落库（WS `intel` 事件与 `snapshot.intel` 共用；`null` 是 no-op）。 */
   setAiTradeIntelSummary: (instId: string, summary: AiTradeIntelSummary | null) => void;
@@ -790,7 +810,8 @@ export const useAppStore = create<AppState>()(
       // （全新安装只走初始化器、不触发 migrate，故默认值须写在此处）。
       aiTradeGroup: null,
       aiTradeResumable: null,
-      aiTradeLifecycleNotice: null,
+      aiTradeNotice: null,
+      aiTradeReconciledAtMs: 0,
       aiTradeAcknowledged: false,
       aiTradeConfig: null,
       // 生命周期真值化（F-9）：三个瞬态字段。首屏 store 未水合时 `aiTradeEnabled` 是 `false`，
@@ -1023,7 +1044,42 @@ export const useAppStore = create<AppState>()(
       // 持仓 / 决策日志（环形）/ 轨迹（环形）/ 摘要，按 instId 路由）+ 风险勾选 + 清理；aiTradeConfig 持久化。
       setAiTradeGroup: (aiTradeGroup) => set({ aiTradeGroup }),
       setAiTradeResumable: (aiTradeResumable) => set({ aiTradeResumable }),
-      setAiTradeLifecycleNotice: (aiTradeLifecycleNotice) => set({ aiTradeLifecycleNotice }),
+      // 提示的**唯一**铸造点（notice-state-sync §4.3）：纪元在 store 内部读取，调用方只给「说什么」。
+      // 铸造闸的极性是刻意的 —— 一句「我不知道现在是什么态」压不过一句仍然成立的「你有一笔仓没平掉」。
+      noteAiTradeNotice: (kind, text) =>
+        set((s) => {
+          const nowMs = Date.now();
+          const epoch = currentAiTradeEpoch(s.aiTradeGroup, s.aiTradeResumable, s.aiTradeReconciledAtMs);
+          if (isAiTradeNoticeBlockedBySticky(s.aiTradeNotice, kind, epoch, nowMs)) return {};
+          return { aiTradeNotice: mintAiTradeNotice(kind, text, epoch, nowMs) };
+        }),
+      dismissAiTradeNotice: () => set({ aiTradeNotice: null }),
+      syncAiTradeNotice: () =>
+        set((s) => {
+          if (!s.aiTradeNotice) return {};
+          const nowMs = Date.now();
+          const epoch = currentAiTradeEpoch(s.aiTradeGroup, s.aiTradeResumable, s.aiTradeReconciledAtMs);
+          return isAiTradeNoticeLive(s.aiTradeNotice, epoch, nowMs) ? {} : { aiTradeNotice: null };
+        }),
+      // 成员状态行的唯一写点（§4.5）。`session.message` 今天没有复位点：`_status_payload()` 不含
+      // `message` 键，浅合并清不掉；L4 告警又「只出声一次」。改法是写点盖戳、读点过谓词。
+      // **前置条件是 `lifecycle` 键在场**（[评审 RP1-4]）：「清一条过期回声是安全的」这条论证的
+      // 全部依据，是每一种仍在持续的降级都另有一处状态派生的常驻落点在说（`AiTradeFeedRecoveryCard`
+      // 读 `session.lifecycle.feedRecovery`）；而那个键是总闸门控、关闭即整键缺席 —— 落点不在场时
+      // 清掉 `message` 就是抹掉一个仍在持续的降级。键不在场 ⇒ 不盖戳 ⇒ 缺席即渲染 ⇒ 逐字回退。
+      noteAiTradeMemberMessage: (instId, text) =>
+        set((s) => {
+          const epoch = currentAiTradeEpoch(s.aiTradeGroup, s.aiTradeResumable, s.aiTradeReconciledAtMs);
+          return patchAiTradeMember(s.aiTradeGroup, instId, (m) =>
+            m.session
+              ? {
+                  ...m,
+                  session: { ...m.session, message: text },
+                  ...(m.session.lifecycle != null ? { messageEpoch: epoch } : {}),
+                }
+              : m,
+          );
+        }),
       setAiTradeMemberSession: (instId, session) =>
         set((s) => patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({ ...m, session }))),
       patchAiTradeMemberSession: (instId, patch) =>
@@ -1036,15 +1092,22 @@ export const useAppStore = create<AppState>()(
       // 因为面板的 chip 门控须是 `member.profitGuardCooldown != null`——挂在 position 之下则平仓后
       // 恒 null，chip 永远不出现；冷却结束后端会主动再推一次 status（该键为 null）以摘掉 chip。
       patchAiTradeMemberStatus: (instId, status) =>
-        set((s) =>
-          patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({
+        set((s) => {
+          // 状态行纪元（§4.5）：**当且仅当**这一帧真的携带非空 `message` 时刷戳（缺席即不动，
+          // 保住「浅合并不清空」的既有语义），且同样要求 `lifecycle` 键在场（理由见
+          // `noteAiTradeMemberMessage`）。
+          const row = status as Partial<AiTradeSessionRow>;
+          const stamp = !!row.message && row.lifecycle !== undefined;
+          const epoch = stamp
+            ? currentAiTradeEpoch(s.aiTradeGroup, s.aiTradeResumable, s.aiTradeReconciledAtMs)
+            : null;
+          return patchAiTradeMember(s.aiTradeGroup, instId, (m) => ({
             ...m,
             profitGuardCooldown: status.profitGuardCooldown ?? null,
-            session: m.session
-              ? { ...m.session, ...(status as Partial<AiTradeSessionRow>) }
-              : m.session,
-          })),
-        ),
+            ...(epoch ? { messageEpoch: epoch } : {}),
+            session: m.session ? { ...m.session, ...row } : m.session,
+          }));
+        }),
       // 分组级验收三键的**窄** action（horizon-acceptance [P0-3]）：只覆盖这三个加法键，
       // **绝不碰 `members`**。用 `setAiTradeGroup(groupStateFromStatus(...))` 去做这件事会把每个
       // 成员的 `trades` 清空（那条映射写死 `trades: []`），而它跑在一个 15 秒轮询里——
@@ -1075,7 +1138,16 @@ export const useAppStore = create<AppState>()(
         }),
       requestAiTradeReconcile: () =>
         set({ aiTradeReconcileUntil: Date.now() + AI_TRADE_RECONCILE_WINDOW_MS }),
-      setAiTradeSyncState: (aiTradeSyncState) => set({ aiTradeSyncState }),
+      // `"ok"` 时顺手打一枚对账时戳，打的是那次对账**请求出发**的墙钟（§4.3 / [评审 RP1-3]）：
+      // 取落地时刻是错的 —— 超时断面下后端本就慢，一次 `t-100ms` 出发、`t+2000ms` 才落地的对账
+      // 会用一份**不含该动作结果**的快照当场结算掉「结果未知」。形参可选、缺席即 `Date.now()`；
+      // `"unknown"` 分支**绝不打戳**：读不到 ≠ 已核实。
+      setAiTradeSyncState: (aiTradeSyncState, startedAtMs) =>
+        set(
+          aiTradeSyncState === "ok"
+            ? { aiTradeSyncState, aiTradeReconciledAtMs: startedAtMs ?? Date.now() }
+            : { aiTradeSyncState },
+        ),
       setAiTradeEnabled: (aiTradeEnabled) => set({ aiTradeEnabled }),
       setAiTradeMemberTrades: (instId, trades) =>
         set((s) =>
@@ -1349,6 +1421,16 @@ export const useAppStore = create<AppState>()(
         // AI 自动交易偏好（持久化）；aiTrade 运行期态全瞬态，**不**入 partialize（刷新由
         // GET /ai-trade/status 重发现）。
         aiTradeConfig: s.aiTradeConfig,
+        // 唯一的例外（§6.1 / [评审 RP1-5]）：`ended` / `backend_ended` 这两条**真钱待办**必须跨
+        // 刷新存活。设计上曾以为「刷新后由对账器重新产生」，取证是假的 ——
+        // `reconcileAiTradeLifecycle` 在 `if (!local) return;` 早退，刷新后根本没有 `local`。
+        // **必须按 `persist` 位过滤**，不许无条件持久化：其余五种恒写 null，否则就是把一句来历
+        // 不明的旧话放到一个刚对过账的界面上 —— 本轮要消灭的形状本身。水合回来照样过谓词，
+        // 一旦对账发现后端有新的在跑分组即按 `validIn` 判死。无需升 persist 版本（浅合并回落 null）。
+        aiTradeNotice:
+          s.aiTradeNotice && AI_TRADE_NOTICE_RULES[s.aiTradeNotice.kind]?.persist
+            ? s.aiTradeNotice
+            : null,
         // AI 回测偏好（持久化）；aiBacktestJobId 瞬态**不**入 partialize（刷新由 GET 重发现）。
         aiBacktestConfig: s.aiBacktestConfig,
         instSidebarTab: s.instSidebarTab,

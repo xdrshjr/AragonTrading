@@ -246,3 +246,49 @@ def test_classifier_never_raises_on_garbage():
     for bad in (None, {}, {"side": None, "size": "x"}, {"pos": float("nan")}):
         verdict, message = classify_member_drift(DriftInput(expected=bad, actual=bad))
         assert verdict in pause_core.ALL_VERDICTS and isinstance(message, str)
+
+
+# ---------------- notice-state-sync §8.4：续跑回执的判定性文案（B-1 ~ B-3） ----------------
+def test_resume_notice_is_safe_on_an_empty_group():
+    """B-1：空成员表不抛、返回非空中文串，且**不含** markdown 粗体。
+
+    后端文案是**直接进 JSX** 的：`**粗体**` 会原样显示成两颗星号。本仓库已为这条复发过四次，
+    这是第五次守它。
+    """
+    notice = pause_core.build_resume_notice([], resumed_count=1)
+    assert isinstance(notice, str) and notice.strip()
+    assert "已继续" in notice
+    assert "**" not in notice
+
+
+def test_resume_notice_never_restates_an_unverified_position_size():
+    """B-2：点名标的可以，复述张数不行；且必须**自报数据来源与未核实**。
+
+    热续跑路径上这份持仓断面从未向交易所核实过 —— 不带回执调用时 `_state_member_rows` 走
+    `session.state_member_row()`，那里 `positionUnknown` **恒为 `False`**、`position` 取的是
+    `executor` 的自管投影。复述张数等于在一句判定性文案里混进一个未经核实的数（诚实不变式 I-4）。
+    点名标的同样是一句断言，故文案必须自报来源（「自管投影」）并自报未核实。
+    """
+    rows = [{"instId": "BTC-USDT-SWAP", "position": {"side": "long", "size": 7},
+             "positionUnknown": False},
+            {"instId": "ETH-USDT-SWAP", "position": None, "positionUnknown": False}]
+    notice = pause_core.build_resume_notice(rows, resumed_count=1)
+
+    assert "BTC-USDT-SWAP" in notice
+    # 张数**一个字都不许出现**：既不许有那个数，也不许有「张」这个量词。
+    assert "7" not in notice
+    assert "张" not in notice
+    # 两个短语机械冻结（RC-6）：少任何一个，这句话就变成了一句未标注来源的断言。
+    assert "自管投影" in notice
+    assert "未重新向交易所核实" in notice
+    assert "**" not in notice
+
+
+def test_resume_notice_counts_repeat_resumes_but_stays_quiet_on_the_first():
+    """B-3：第 1 次继续不追那句计数（说「这是第 1 次」是噪音），第 3 次才追。"""
+    rows = [{"instId": "BTC-USDT-SWAP", "position": None}]
+    first = pause_core.build_resume_notice(rows, resumed_count=1)
+    assert "次继续" not in first
+
+    third = pause_core.build_resume_notice(rows, resumed_count=3)
+    assert "第 3 次继续" in third

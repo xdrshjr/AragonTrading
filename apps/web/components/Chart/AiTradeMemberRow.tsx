@@ -10,10 +10,12 @@ import {
   isEffectiveExitCommitted,
 } from "@/lib/aiTrade";
 import { describeHorizonStatus } from "@/lib/aiTradeHorizon";
+import { currentAiTradeEpoch, isAiTradeNoticeLive } from "@/lib/aiTradeNotice";
 import { describeTurnoverChip } from "@/lib/aiTradeTurnover";
 import { describeIntegrity } from "@/lib/aiTradeIntegrity";
 import { colorForReturn, fmtMoney, fmtNum, fmtPct, fmtPrice } from "@/lib/format";
 import type { AiTradeGroupMemberState, ProfitGuardSnapshot } from "@/lib/aiTradeTypes";
+import { useAppStore } from "@/lib/store";
 import type { Instrument } from "@/lib/types";
 
 // AI 自动交易「标的行」（ai-trade-market-intel §3.8.1 的**强制前置步骤**）。
@@ -44,6 +46,20 @@ export default function AiTradeMemberRow({
 }) {
   const { instId } = member;
   const session = member.session;
+  // 状态行的判活纪元（notice-state-sync §4.5）：三个订阅源缺一不可，否则「暂停 → 继续之后那条
+  // 橙色状态行消失」在某一条路径上不会重算。`member_status` 的 `ttlMs` 为 null，故无需秒表。
+  const noticeGroup = useAppStore((s) => s.aiTradeGroup);
+  const noticeResumable = useAppStore((s) => s.aiTradeResumable);
+  const noticeReconciledAtMs = useAppStore((s) => s.aiTradeReconciledAtMs);
+  // **缺席即渲染**（§6.2）：只有**盖过戳、且戳已过期**的才隐藏。老快照、既有直接构造成员对象的
+  // 用例、以及 `lifecycle` 总闸关时的「故意不盖戳」，三者都靠这条极性逐字回退到本轮之前的行为。
+  const messageLive =
+    member.messageEpoch == null ||
+    isAiTradeNoticeLive(
+      { kind: "member_status", text: session?.message ?? "", epoch: member.messageEpoch, ts: 0 },
+      currentAiTradeEpoch(noticeGroup, noticeResumable, noticeReconciledAtMs),
+      0,
+    );
   const positionSide = session?.positionSide ?? "flat";
   // 「当前挂单」取最新一轮决策随附的挂单断面（后端 _emit_decision 与决策 prompt 同源 resting_payload）。
   // 无挂单 / 跳过轮（该事件不带此段）→ 整行省略，绝不据 orderType 反推「挂单还在」（可能已成交/撤销）。
@@ -81,8 +97,12 @@ export default function AiTradeMemberRow({
         {/* 会话状态行（lifecycle-truth F-4）：行情断连 / 已恢复 / 补根结果 / WS 错误帧。
             后端**早就在下发它**（`_check_staleness` 与 `SessionLink._push_message` 都推
             `{...status, message}`），但全仓一直没有读点 —— 「wire 里有事实、用户那里没有」
-            的又一处，本轮补上。 */}
-        {session?.message && (
+            的又一处，上一轮补上。
+            notice-state-sync §4.5：这条回声**没有任何复位点**（`_status_payload()` 不含
+            `message` 键，浅合并清不掉；行情自愈的 L4 告警又「只出声一次」），于是它会跨过一次
+            暂停/继续往返继续说旧话。改法是写点盖纪元戳、读点过同一个谓词。
+            清掉一条过期回声是安全的，理由写在 store 的 `noteAiTradeMemberMessage` 上。 */}
+        {session?.message && messageLive && (
           <span
             data-testid="ai-trade-member-message"
             className="truncate text-[10px] text-[var(--warn)]"

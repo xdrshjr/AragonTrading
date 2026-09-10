@@ -1365,7 +1365,7 @@ describe("reconcileAiTradeLifecycle（用例 13：七行判定表**逐格**）",
     const calls: Record<string, unknown[]> = {
       setAiTradeGroup: [], setAiTradeResumable: [], patchAiTradeGroupLifecycle: [],
       clearAiTradeRuntime: [], setAiTradeSyncState: [], setAiTradeEnabled: [],
-      setAiTradeLifecycleNotice: [],
+      noteAiTradeNotice: [],
     };
     const setters = {
       getGroup: () => local,
@@ -1376,7 +1376,7 @@ describe("reconcileAiTradeLifecycle（用例 13：七行判定表**逐格**）",
       clearAiTradeRuntime: () => calls.clearAiTradeRuntime.push(true),
       setAiTradeSyncState: (s: unknown) => calls.setAiTradeSyncState.push(s),
       setAiTradeEnabled: (v: unknown) => calls.setAiTradeEnabled.push(v),
-      setAiTradeLifecycleNotice: (n: unknown) => calls.setAiTradeLifecycleNotice.push(n),
+      noteAiTradeNotice: (kind: unknown, text: unknown) => calls.noteAiTradeNotice.push([kind, text]),
     } as unknown as Parameters<typeof reconcileAiTradeLifecycle>[1];
     return { setters, calls };
   };
@@ -1435,11 +1435,17 @@ describe("reconcileAiTradeLifecycle（用例 13：七行判定表**逐格**）",
       .toBe("stopped");
   });
 
-  it("⑦ 都空且成员未全 stopped ⇒ 清运行期态 + 一条**持久**提示", () => {
+  it("⑦ 都空且成员未全 stopped ⇒ 清运行期态 + 一条 backend_ended 提示", () => {
+    // 全仓唯一的 `backend_ended` 产生点（notice-state-sync §4.2）。kind 必须一起断：它决定了
+    // 这条真钱待办的九条判据（groupScoped:false / 无 TTL / persist:true），弄错一个字，
+    // 这句话就会在「结束那一刻分组被清成 null」的瞬间被自己判死。
     const { setters, calls } = makeSetters(localGroup());
     reconcileAiTradeLifecycle(res(), setters);
     expect(calls.clearAiTradeRuntime).toHaveLength(1);
-    expect(String(calls.setAiTradeLifecycleNotice[0])).toContain("请到实盘面板核对持仓");
+    expect(calls.noteAiTradeNotice).toHaveLength(1);
+    const [kind, text] = calls.noteAiTradeNotice[0] as [string, string];
+    expect(kind).toBe("backend_ended");
+    expect(text).toContain("请到实盘面板核对持仓");
   });
 
   it("aiTradeEnabled 由对账器一并落 store（单 owner 收敛；无分组时也必须落）", () => {
