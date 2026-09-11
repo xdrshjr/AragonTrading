@@ -20,6 +20,10 @@
  *  · `AiTradeExperienceFields` 的「只读模式」提示（`value.write === false`）—— 它是用户**主动
  *    选择的一个正常档位**的回执，`--muted` 色，与 `experienceOff` 的 `--warn` 是两个不同的东西。
  *  · `AiTradeIntelFields` / `AiTradeDirectionFields` 内的档位说明文案 —— 同上，说明而非警示。
+ *  · `AiTradeTrajectoryFields` 的目录与空间说明（ai-trade-trajectory-capture §2.13.3）—— 说明而非
+ *    警示；目录不可用是**阻断错误**，走步骤模型（`trajectoryDirError`）而非风险清单。
+ *  · 第 6 步的 `ai-launch-trajectory-notice` 行（`var(--warn)`，「勾了采集、本次却不会采」）——
+ *    说明而非警示：配置接口一次瞬时失败不该在清单里钉一条风险（不确定一律不翻译成否决）。
  *
  * **实施纪律**：往任一 `Step*.tsx` 或其子组件里新增一处 `var(--warn)` 文本时，必须同时给出
  * 「进注册表」或「进上面这张排除清单」的判断。这条不由门禁守（守不住），由本注释写明——

@@ -93,6 +93,13 @@ export interface AragonBridge {
   platform?: NodeJS.Platform;
   appVersion?(): string;
   openLogsDir?(): Promise<void>;
+  /** 系统「选择文件夹」对话框（后训练数据保存目录）；取消 ⇒ `null`。 */
+  pickDirectory?(opts?: { defaultPath?: string }): Promise<string | null>;
+  /**
+   * 在资源管理器中打开一个**已存在的绝对目录**。成功返回空串；失败返回原因
+   * （`invalid_path` / `not_found` / `not_directory` / 系统错误文本）。
+   */
+  openPath?(target: string): Promise<string>;
   showAbout?(): void;
   windowControls?: WindowControls;
 }

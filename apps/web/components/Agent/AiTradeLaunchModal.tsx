@@ -21,6 +21,7 @@ import type {
 } from "@/lib/aiTradeTypes";
 import type { AiTradeExperienceRule } from "@/lib/experienceTypes";
 import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
+import type { AiTradeTrajectoryRule } from "@/lib/trajectoryTypes";
 import AiTradeLaunchStepRail, {
   type AiTradeLaunchStepView,
 } from "./launch/AiTradeLaunchStepRail";
@@ -65,6 +66,11 @@ export interface AiTradeLaunchOpts {
   // 市场情报研判（intel-session-binding 轴 A）：**仅实盘下发**（情报层不进回测车道）。
   // ⚠️ 与上面六个字段的方向相反：这一项的**系统默认就是关闭**，「整键缺省 ⇒ 服务端不注入」。
   intel?: AiTradeIntelRule;
+  // 后训练轨迹采集（trajectory-capture §2.13.2）：**只在有效开启时携带**——关闭 / 配置读不到 /
+  // 运维关 ⇒ `undefined` ⇒ 启动体整键缺席。仅 live 分支下发。
+  trajectoryCapture?: AiTradeTrajectoryRule;
+  // 用户在卡片上的**原始**选择（与生效值无关），只供 `AiTradeToggle` 记偏好（【v2 · RV3】）。
+  trajectoryPreference?: AiTradeTrajectoryRule;
   // 交易纪律预设（**实盘与回测同源**，discipline-preset R-3）：只带 `{preset}`，阈值一律由服务端
   // 的冻结表决定。整键不发 ⇒ 服务端按 `ai_trade_discipline_default_preset` 装配。
   discipline?: AiTradeDisciplineIn;
@@ -116,6 +122,8 @@ export interface AiTradeLaunchModalProps {
   defaultExperience?: AiTradeExperienceRule;   // 上次所选经验模式（缺省 ⇒ 本地默认全开）
   // 上次所选的情报研判偏好（缺省 ⇒ `AI_TRADE_INTEL_RULE_DEFAULT`，即**不勾**）。
   defaultIntel?: AiTradeIntelRule;
+  // 上次所选的后训练数据采集偏好（缺省 ⇒ `AI_TRADE_TRAJECTORY_RULE_DEFAULT`，即**不勾**）。
+  defaultTrajectoryCapture?: AiTradeTrajectoryRule;
   // 上次填过的单仓 OCO（诊断根因 ③：每次都被清空 ⇒ 用户不知不觉一直用 10%/5% 的宽默认）。
   defaultStopLossPct?: number;
   defaultTakeProfitPct?: number;

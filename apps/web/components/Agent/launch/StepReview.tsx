@@ -8,6 +8,7 @@ import {
 } from "@/lib/aiTradeLaunchSteps";
 import type { AiTradeLaunchRisk } from "@/lib/aiTradeLaunchRisk";
 import type { UseAiTradeLaunchForm } from "./useAiTradeLaunchForm";
+import type { UseTrajectoryCapture } from "./useTrajectoryCapture";
 
 /**
  * 第 6 步：**我到底要启动一个什么东西**（ai-trade-guided-launch §4.2.1 / §4.2.5）。
@@ -37,6 +38,7 @@ export default function StepReview({
     tradabilityConfirmed, setTradabilityConfirmed,
     isUnguardedHorizon, unguardedConfirmed, setUnguardedConfirmed,
     setProfitGuardEnabled, setHorizonEnabled,
+    trajectory, setTrajectory, setTrajectorySkipOnce, trajectoryCapture,
   } = form;
   /**
    * 上一次点过的 remedy 的**就地回执**（§4.2.6）。
@@ -79,6 +81,10 @@ export default function StepReview({
           </div>
         ))}
       </div>
+
+      {/* 后训练数据的去向 / 「勾了却不会采」的说明（trajectory-capture §2.14.1，【v2 · RV3】）。
+          两行互斥。它是说明不是阻断，故不进风险清单（登记在 aiTradeLaunchRisk.ts 的排除项）。 */}
+      {mode === "live" && <TrajectoryReviewLine capture={trajectoryCapture} />}
 
       {/* ② 风险清单（I-1 的可证伪落点：`data-risk-id` 集合 === `collectRisks()` 的 id 集合）。 */}
       <div className="flex flex-col gap-1.5" data-testid="ai-launch-risk-list">
@@ -190,6 +196,24 @@ export default function StepReview({
                         step: "rhythm",
                       });
                     }
+                    // 422 `AI_TRADE_TRAJECTORY_DIR_INVALID` 的两条出路（trajectory-capture §2.14.1）。
+                    if (remedy.id === "trajectory_use_default_dir") {
+                      setTrajectorySkipOnce(false);
+                      setTrajectory({ ...trajectory, directory: null });
+                      setRemedyReceipt({
+                        text: `已改用默认目录（第 4 步 · ${stepTitleOf("cognition")}）`,
+                        step: "cognition",
+                      });
+                    }
+                    // 一次性：只让这一次启动不带采集。拨 `enabled` 会被当成用户的选择记住，
+                    // 正在积累的数据集就从下一次启动起静默断档——与按钮上的「本次」不符。
+                    if (remedy.id === "trajectory_disable") {
+                      setTrajectorySkipOnce(true);
+                      setRemedyReceipt({
+                        text: `已关闭本次数据采集（第 4 步 · ${stepTitleOf("cognition")}）`,
+                        step: "cognition",
+                      });
+                    }
                   }}
                   className="rounded border border-[var(--accent)] bg-[var(--accent-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--accent-ink)] hover:opacity-90 focus-visible:outline focus-visible:outline-2 focus-visible:outline-[var(--accent)] disabled:opacity-50"
                 >
@@ -215,14 +239,18 @@ export default function StepReview({
             </p>
           )}
           {/* 【v2 · P1-7】这一行的所有者是前端，不是 `remedies`——后端错误体一个字节不改。
-              运维总闸在本产品里有三个落点，说不清是哪一个，用户就只能猜。 */}
-          <p
-            className="text-[10px] leading-relaxed text-[var(--muted)]"
-            data-testid="ai-start-remedy-ops-hint"
-          >
-            运维总闸的三个落点：后端进程环境变量、services/quant/.env、桌面端的 agent.env
-            （按 AI_TRADE_ 前缀整段透传给后端子进程）。改完需重启后端才生效。
-          </p>
+              运维总闸在本产品里有三个落点，说不清是哪一个，用户就只能猜。
+              trajectory-capture RV-P2-11：只在 remedies 里真有运维那一条时才说——目录 422 与
+              运维总闸无关，在它下面教用户去改 env 是误导。 */}
+          {errorRemedies.some((remedy) => remedy.id === "ops_override") && (
+            <p
+              className="text-[10px] leading-relaxed text-[var(--muted)]"
+              data-testid="ai-start-remedy-ops-hint"
+            >
+              运维总闸的三个落点：后端进程环境变量、services/quant/.env、桌面端的 agent.env
+              （按 AI_TRADE_ 前缀整段透传给后端子进程）。改完需重启后端才生效。
+            </p>
+          )}
         </div>
       )}
     </div>
@@ -232,6 +260,35 @@ export default function StepReview({
 /** 步骤标题的唯一真源仍是 `AI_TRADE_LAUNCH_STEPS`（G-3：本文件不出现字面量标题）。 */
 function stepTitleOf(id: AiTradeLaunchStepId): string {
   return AI_TRADE_LAUNCH_STEPS.find((step) => step.id === id)?.title ?? "";
+}
+
+/**
+ * 第 6 步的采集去向行（有效开启时）或原因行（勾了、本次却不会采时）；都不成立 ⇒ 不渲染。
+ *
+ * 原因行用 `--warn` + 前缀 △（形状 + 文字双通道）。它是**说明不是阻断**：配置读不到时启动
+ * 照常放行、只是整键不发——「不确定一律不翻译成否决」。
+ */
+function TrajectoryReviewLine({ capture }: { capture: UseTrajectoryCapture }) {
+  if (capture.notice) {
+    return (
+      <p
+        className="text-[10px] leading-relaxed text-[var(--warn)]"
+        data-testid="ai-launch-trajectory-notice"
+      >
+        △ {capture.notice}
+      </p>
+    );
+  }
+  // 目录不可用时不说「将写入 X」：同屏的兜底行正指着第 4 步说这个目录用不了。
+  if (!capture.effectiveEnabled || capture.error) return null;
+  return (
+    <p
+      className="text-[10px] leading-relaxed text-[var(--muted)]"
+      data-testid="ai-launch-trajectory-destination"
+    >
+      后训练数据将写入：{capture.destination ?? "服务端默认目录"}（本机，不上传）
+    </p>
+  );
 }
 
 /** 风险清单里的一条。需要一次显式勾选的，勾选框就长在这条下面（不让用户去别处找）。 */

@@ -19,6 +19,7 @@ const {
   describeLoadFailure,
 } = require('./lib/renderer-health');
 const { wireExternalLinks } = require('./lib/external-links');
+const dirAccess = require('./lib/dir-access');
 const { describeStartupFailure } = require('./lib/startup-failure');
 const {
   ProcessManager,
@@ -469,6 +470,22 @@ function bumpZoom(w, d) {
   w.webContents.setZoomLevel(w.webContents.getZoomLevel() + d);
 }
 
+// 后训练数据目录的系统「选择文件夹」对话框（ai-trade-trajectory-capture §2.15）。取消 ⇒ null。
+// defaultPath 只在渲染层给了合法绝对路径时才带（dirAccess.pickDefaultPath），否则回落系统默认。
+async function pickTrajectoryDirectory(opts) {
+  const options = {
+    title: '选择后训练数据保存目录',
+    properties: ['openDirectory', 'createDirectory', 'dontAddToRecent'],
+  };
+  const defaultPath = dirAccess.pickDefaultPath(opts);
+  if (defaultPath) options.defaultPath = defaultPath;
+  const res = win
+    ? await dialog.showOpenDialog(win, options)
+    : await dialog.showOpenDialog(options);
+  if (res.canceled || !res.filePaths || !res.filePaths[0]) return null;
+  return res.filePaths[0];
+}
+
 // ----------------------------- 启动编排 -----------------------------
 async function startEngines() {
   pm = new ProcessManager({
@@ -615,6 +632,14 @@ if (!gotLock) {
     e.returnValue = app.getVersion();
   });
   ipcMain.handle('aragon:open-logs', () => shell.openPath(paths.ensureLogsDir()));
+  // 后训练数据目录（ai-trade-trajectory-capture §2.15）。**只打开目录、从不打开文件**：
+  // shell.openPath 对文件的语义是「用关联程序打开」，故 IPC 边界只接受存在的绝对目录。
+  ipcMain.handle('aragon:pick-directory', (_e, opts) => pickTrajectoryDirectory(opts));
+  ipcMain.handle('aragon:open-path', async (_e, target) => {
+    const rejected = await dirAccess.openPathRejection(target);
+    if (rejected) return rejected;
+    return (await shell.openPath(target)) || ''; // 空串 = 成功（Electron 约定）
+  });
 
   // 窗口控制 IPC（spec §4.3 / §6）：自定义标题栏的最小化 / 最大化切换 / 关闭 /
   // 查询最大化态 + 触发既有「关于」对话框。关闭仅 win.close()，落既有退出清理链（D3）。

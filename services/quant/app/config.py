@@ -998,6 +998,34 @@ class Settings(BaseSettings):
     agent_heartbeat_seconds: float = Field(default=20.0, gt=0)      # run 期心跳间隔（须 < 中间层 idle 超时）
     agent_event_buffer_size: int = Field(default=512, ge=64)        # 会话事件缓冲上限（重放窗口）
 
+    # ---- AI 自动交易 · 后训练轨迹采集（ai-trade-trajectory-capture §5.5，10 项）----
+    # 采集开关在启动面板上**逐会话勾选、默认关闭**；这里的总闸只决定「能不能勾」。前缀 `AI_TRADE_`
+    # 是硬约束（桌面壳按前缀透传 env），10 项在仓库根 `.env.example` 逐条登记并由
+    # `test_ai_trade_trajectory_settings.py` 双向校验。
+    # 1) 运维可用性总闸。false ⇒ 卡片禁用并说明；请求解析为 ops_off，不建目录 / 不起线程 / 不包装客户端。
+    ai_trade_trajectory_enabled: bool = True
+    # 2) 默认根目录；空 ⇒ `<数据库文件所在目录>/datasets/ai-trade`；相对路径以数据库文件所在目录为根
+    #    （真源 `trajectory.directory.default_root`）。
+    ai_trade_trajectory_default_dir: str = ""
+    # 3) 待写字节预算（128 MiB）。超出即丢新条并记 gap：绝不阻塞决策轮、绝不丢旧条。
+    ai_trade_trajectory_queue_max_bytes: int = Field(default=134217728, ge=1048576,
+                                                     le=4294967296)
+    # 4) 单段明文上限（64 MiB），满即轮转封口。
+    ai_trade_trajectory_segment_max_bytes: int = Field(default=67108864, ge=1048576,
+                                                       le=1073741824)
+    # 5) 封口段 gzip（level 6）。
+    ai_trade_trajectory_compress_segments: bool = True
+    # 6) 可用空间下限（1 GiB）：低于即自动暂停采集（交易不受影响）。0 ⇒ 不检查。
+    ai_trade_trajectory_min_free_bytes: int = Field(default=1073741824, ge=0)
+    # 7) fsync 节流间隔（秒）；0 ⇒ 每批 fsync。
+    ai_trade_trajectory_fsync_interval_s: float = Field(default=5.0, ge=0, le=300)
+    # 8) 关闭排空死线。**必须 < SHUTDOWN_STEP_TIMEOUT_S**（启动期校验器钉死）。
+    ai_trade_trajectory_close_timeout_s: float = Field(default=5.0, gt=0, le=60)
+    # 9) 目录探测 / 打开死线。**必须 ≤ 关闭死线**（同一校验器）。
+    ai_trade_trajectory_probe_timeout_s: float = Field(default=3.0, gt=0, le=30)
+    # 10) 连续写失败达此数 ⇒ failed（不重试、不忙等）。
+    ai_trade_trajectory_max_write_errors: int = Field(default=5, ge=1, le=1000)
+
     # ---- 标的市场情报层（ai-trade-market-intel §十一，34 项）----
     # 字段名即环境变量名（AI_TRADE_INTEL_*，大小写不敏感）。前缀刻意统一为 `AI_TRADE_`：
     # `desktop/src/lib/config.js:80` 的透传白名单以**前缀**决定哪些 env 进得了打包后端子进程，
@@ -1532,6 +1560,31 @@ class Settings(BaseSettings):
                 f"AI_TRADE_INTEL_READER_TOP_K({self.ai_trade_intel_reader_top_k}) 必须 ≤ "
                 f"AI_TRADE_INTEL_CORPUS_MAX_DOCS({self.ai_trade_intel_corpus_max_docs})："
                 "抓得比语料还多篇没有任何意义，多出来的那几次出网既进不了语料也进不了引文")
+        return self
+
+    @model_validator(mode="after")
+    def _check_trajectory_wiring(self) -> "Settings":
+        """后训练轨迹采集的两条启动期校验（ai-trade-trajectory-capture §5.5）——写错即启动失败。
+
+        1. ``AI_TRADE_TRAJECTORY_CLOSE_TIMEOUT_S < SHUTDOWN_STEP_TIMEOUT_S``：倒挂时 ``ai_trade``
+           那一步整体先被外层 cancel，写线程的收尾（关段、压缩、manifest）永远轮不到。与经验层、
+           情报层、交易日志三处的同名校验逐字同款。
+        2. ``AI_TRADE_TRAJECTORY_PROBE_TIMEOUT_S ≤ AI_TRADE_TRAJECTORY_CLOSE_TIMEOUT_S``：打开探测
+           比关闭死线还长，意味着一次卡住的打开会拖过关停预算。
+
+        Raises:
+            ValueError: 任一条不成立（构造期即失败）。
+        """
+        if self.ai_trade_trajectory_close_timeout_s >= self.shutdown_step_timeout_s:
+            raise ValueError(
+                f"AI_TRADE_TRAJECTORY_CLOSE_TIMEOUT_S({self.ai_trade_trajectory_close_timeout_s})"
+                f" 必须 < SHUTDOWN_STEP_TIMEOUT_S({self.shutdown_step_timeout_s})，否则外层先 "
+                "cancel、写线程的关段与 manifest 收尾永远轮不到")
+        if self.ai_trade_trajectory_probe_timeout_s > self.ai_trade_trajectory_close_timeout_s:
+            raise ValueError(
+                f"AI_TRADE_TRAJECTORY_PROBE_TIMEOUT_S({self.ai_trade_trajectory_probe_timeout_s})"
+                f" 必须 ≤ AI_TRADE_TRAJECTORY_CLOSE_TIMEOUT_S"
+                f"({self.ai_trade_trajectory_close_timeout_s})：一次卡住的目录打开不能拖过关停预算")
         return self
 
     @model_validator(mode="after")

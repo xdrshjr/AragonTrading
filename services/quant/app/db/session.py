@@ -20,13 +20,24 @@ _engine = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
 
-def _db_url() -> str:
-    settings = get_settings()
+def db_file_path(settings) -> Path:
+    """数据库文件的绝对路径（`_db_url` 与后训练数据默认根目录共用的**单一真源**）。
+
+    Args:
+        settings: 生效的 `Settings`（只读 `db_path`）。
+
+    Returns:
+        绝对路径；相对的 `db_path` 以 services/quant 为根。
+    """
     db_path = Path(settings.db_path)
     if not db_path.is_absolute():
         # 相对路径：以 services/quant 为根（本文件位于 app/db/ 下，上溯两级）
         db_path = Path(__file__).resolve().parents[2] / settings.db_path
-    return f"sqlite+aiosqlite:///{db_path.as_posix()}"
+    return db_path
+
+
+def _db_url() -> str:
+    return f"sqlite+aiosqlite:///{db_file_path(get_settings()).as_posix()}"
 
 
 def get_engine():

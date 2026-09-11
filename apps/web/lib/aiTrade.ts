@@ -1588,6 +1588,9 @@ function buildLifecyclePatch(row: AiTradeGroupRow): AiTradeGroupLifecyclePatch {
       acceptance: row.acceptance ?? null,
       exits: row.exits ?? null,
       funding: row.funding ?? null,
+      // 后训练轨迹采集回执（trajectory-capture §2.14.3）：15 秒对账的窄 patch 若不抄它，条数与体积
+      // 就只在刷新页面时更新。`groupStateFromStatus` 那条通路另有一行，两处各有用例（F-6）。
+      trajectoryCapture: row.trajectoryCapture ?? null,
     },
     members: (row.members ?? []).map((m) => ({
       instId: m.instId,

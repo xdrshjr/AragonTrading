@@ -6,14 +6,18 @@ import { risksForStep } from "@/lib/aiTradeLaunchRisk";
 import type { AiTradeReasoningDepth } from "@/lib/aiTradeTypes";
 import AiTradeExperienceFields from "../AiTradeExperienceFields";
 import AiTradeIntelFields from "../AiTradeIntelFields";
+import AiTradeTrajectoryFields from "../AiTradeTrajectoryFields";
 import { InlineRiskNote } from "./LaunchPrimitives";
 import type { UseAiTradeLaunchForm } from "./useAiTradeLaunchForm";
 
 /**
  * 第 4 步：**让 Agent 想多深、拿什么当证据**（ai-trade-guided-launch §4.2.1）。
  *
- * 承载今天弹窗里的：研判深度（实盘；回测为只读说明）、经验模式卡、市场情报卡（回测整卡不渲染）。
- * 本步**永不产生阻断错误**——三张卡都只有档位选择，没有可填错的数值（这是设计结论，不是遗漏）。
+ * 承载今天弹窗里的：研判深度（实盘；回测为只读说明）、经验模式卡、市场情报卡（回测整卡不渲染）、
+ * 后训练数据采集卡（回测整卡替换为一行说明，ai-trade-trajectory-capture §2.13）。
+ * 本步**只产生一种阻断错误**：用户勾选了数据采集、而目录被服务端判定不可用
+ * （`trajectoryDirError`，原因就地渲染在采集卡里）。研判深度 / 经验 / 情报三张卡仍只有档位
+ * 选择，没有可填错的数值。
  */
 /** 经验整关那一条由经验卡自己的 `ai-trade-experience-off-note` 就地说出口。 */
 const ALREADY_INLINE = new Set(["experienceOff"]);
@@ -27,7 +31,8 @@ export default function StepCognition({
 }) {
   const {
     mode, reasoningDepth, setReasoningDepth, experience, setExperience, intel, setIntel,
-    members, instId, risks,
+    members, instId, risks, trajectory, setTrajectory, setTrajectorySkipOnce,
+    trajectoryCapture,
   } = form;
   const stepRisks = risksForStep(risks, "cognition");
 
@@ -76,6 +81,20 @@ export default function StepCognition({
         value={intel}
         onChange={setIntel}
         instIds={mode === "backtest" ? [instId] : members.map((m) => m.instId)}
+        disabled={submitting}
+        backtest={mode === "backtest"}
+      />
+
+      {/* 后训练数据采集（trajectory-capture §2.13）：默认不勾；目录不可用是本步唯一的阻断错误，
+          原因就地渲染在卡片里，第 6 步的兜底行指回这里。 */}
+      <AiTradeTrajectoryFields
+        value={trajectory}
+        onChange={(next) => {
+          // 在卡片上重新表态 ⇒ 撤销第 6 步那次一次性的「本次不采集数据」。
+          setTrajectorySkipOnce(false);
+          setTrajectory(next);
+        }}
+        capture={trajectoryCapture}
         disabled={submitting}
         backtest={mode === "backtest"}
       />

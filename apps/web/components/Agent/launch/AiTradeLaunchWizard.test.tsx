@@ -13,8 +13,20 @@ import {
   type AiTradeLaunchStepId,
 } from "@/lib/aiTradeLaunchSteps";
 import { autoTradeSettingsApi } from "@/lib/autoTradeSettingsApi";
+import { ApiRequestError } from "@/lib/api";
 import { tradingApi } from "@/lib/tradingApi";
+import { trajectoryApi } from "@/lib/trajectoryApi";
+import type {
+  AiTradeTrajectoryConfig,
+  AiTradeTrajectoryDirVerdict,
+} from "@/lib/trajectoryTypes";
 import AiTradeLaunchModal, { type AiTradeLaunchOpts } from "../AiTradeLaunchModal";
+
+// 后训练轨迹采集（trajectory-capture F-5 / F-9）的两个只读端点。默认夹具在文件末尾的顶层
+// `beforeEach` 里装：`vi.clearAllMocks()` 不清实现，某条用例改过的返回值会漏进下一条。
+vi.mock("@/lib/trajectoryApi", () => ({
+  trajectoryApi: { config: vi.fn(), validate: vi.fn() },
+}));
 
 /**
  * 引导式启动向导的行为用例（ai-trade-guided-launch §8.2 W-1 ~ W-23）。
@@ -581,5 +593,300 @@ describe("轴 A · 互锁默认关（本轮需求本体）", () => {
     fireEvent.click(screen.getByRole("button", { name: "去看看" }));
     expect(await screen.findByRole("heading", { level: 3, name: /纪律与护栏/ })).toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: "利润保护（推荐开启）" })).toBeChecked();
+  });
+});
+
+// ============ 后训练轨迹采集（ai-trade-trajectory-capture §6.2 F-5 / F-9）============
+
+const TRAJECTORY_CONFIG: AiTradeTrajectoryConfig = {
+  enabled: true,
+  defaultRoot: "C:\\Users\\me\\AppData\\Roaming\\aragon-desktop\\datasets\\ai-trade",
+  minFreeBytes: 1_073_741_824,
+  segmentMaxBytes: 67_108_864,
+  compressSegments: true,
+  schemaVersion: 1,
+  backtestSupported: false,
+  thinkingCapturedProviders: ["anthropic"],
+};
+
+/** 夹具里唯一一个不可写的目录；其余目录（含默认根）一律可写。 */
+const LOCKED_DIR = "D:\\locked";
+
+function verdictFor(directory: string | null): AiTradeTrajectoryDirVerdict {
+  const verdict: AiTradeTrajectoryDirVerdict = {
+    ok: true,
+    code: null,
+    message: null,
+    directory: directory ?? TRAJECTORY_CONFIG.defaultRoot,
+    isDefault: directory == null,
+    exists: true,
+    freeBytes: 137_870_000_000,
+    minFreeBytes: 1_073_741_824,
+  };
+  if (directory !== LOCKED_DIR) return verdict;
+  return {
+    ...verdict,
+    ok: false,
+    code: "TRAJECTORY_DIR_NOT_WRITABLE",
+    message: "目录不可写：拒绝访问（13）",
+  };
+}
+
+// 顶层钩子（按注册顺序排在文件开头那个 `vi.clearAllMocks()` 之后执行，对全部用例生效）。
+beforeEach(() => {
+  vi.mocked(trajectoryApi.config).mockResolvedValue(TRAJECTORY_CONFIG);
+  vi.mocked(trajectoryApi.validate).mockImplementation(async (directory) =>
+    verdictFor(directory),
+  );
+});
+
+const trajectoryBox = () => screen.getByRole("checkbox", { name: /采集后训练数据/ });
+
+async function reviewCta() {
+  await gotoStep("review");
+  return screen.findByRole("button", { name: /确认并开始 AI 自动交易/ });
+}
+
+describe("后训练轨迹采集 · 向导（trajectory-capture F-5 / F-9）", () => {
+  it("AC-1 首次打开第 4 步采集卡默认不勾；提交体没有该键，偏好是原始的「关」", async () => {
+    const { onConfirm } = renderModal();
+    await screen.findByText("均线策略");
+    await gotoStep("cognition");
+    await waitFor(() => expect(trajectoryBox()).not.toBeDisabled());
+    expect(trajectoryBox()).not.toBeChecked();
+    const cta = await reviewCta();
+    expect(screen.queryByTestId("ai-launch-trajectory-destination")).toBeNull();
+    expect(screen.queryByTestId("ai-launch-trajectory-notice")).toBeNull();
+    await waitFor(() => expect(cta).not.toBeDisabled());
+    fireEvent.click(cta);
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.trajectoryCapture).toBeUndefined();
+    expect(opts.trajectoryPreference).toEqual({ enabled: false, directory: null });
+  });
+
+  it("W-T1 勾选采集 + 校验回执 ok=false ⇒ 第 6 步启动按钮禁用，兜底行指向第 4 步", async () => {
+    renderModal();
+    await screen.findByText("均线策略");
+    await gotoStep("cognition");
+    await waitFor(() => expect(trajectoryBox()).not.toBeDisabled());   // 配置落地之前框是禁用的
+    fireEvent.click(trajectoryBox());
+    const input = await screen.findByLabelText("后训练数据保存目录");
+    fireEvent.change(input, { target: { value: LOCKED_DIR } });
+    fireEvent.blur(input);
+    expect(await screen.findByText("⚠ 目录不可写：拒绝访问（13）")).toBeInTheDocument();
+    // 本步自有错误挡住「下一步」（N-2），「跳到确认」也不再渲染（点了没用的按钮更坏）。
+    expect(screen.getByRole("button", { name: "下一步" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "跳到确认" })).toBeNull();
+    const cta = await reviewCta();
+    expect(cta).toBeDisabled();
+    expect(screen.getByTestId("ai-launch-blocking-step")).toHaveTextContent(
+      "第 4 步（Agent 认知）有未解决的输入错误",
+    );
+    // 兜底行正说这个目录用不了，同屏就不许再说「将写入」它。
+    expect(screen.queryByTestId("ai-launch-trajectory-destination")).toBeNull();
+  });
+
+  it("W-T2 兜底行「去处理」回到第 4 步，点「改用默认目录」后启动按钮恢复可点", async () => {
+    renderModal({ defaultTrajectoryCapture: { enabled: true, directory: LOCKED_DIR } });
+    await screen.findByText("均线策略");
+    await gotoStep("review");
+    const row = await screen.findByTestId("ai-launch-blocking-step");
+    expect(screen.getByRole("button", { name: /确认并开始 AI 自动交易/ })).toBeDisabled();
+    fireEvent.click(row.querySelector("button") as HTMLButtonElement);
+    expect(
+      await screen.findByRole("heading", { level: 3, name: /Agent 认知/ }),
+    ).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "改用默认目录" }));
+    const cta = await reviewCta();
+    await waitFor(() => expect(cta).not.toBeDisabled());
+    expect(screen.queryByTestId("ai-launch-blocking-step")).toBeNull();
+    expect(screen.getByTestId("ai-launch-trajectory-destination")).toHaveTextContent(
+      `后训练数据将写入：${TRAJECTORY_CONFIG.defaultRoot}（本机，不上传）`,
+    );
+  });
+
+  it("W-T3 422 的两条 remedies 各自拨动采集状态并给出就地回执（且不渲染运维总闸落点）", async () => {
+    renderModal({
+      defaultTrajectoryCapture: { enabled: true, directory: "E:\\gone" },
+      error: "后训练数据目录不可用：目录不可写：拒绝访问（13）",
+      errorRemedies: [
+        { id: "trajectory_use_default_dir", label: "改用默认目录" },
+        { id: "trajectory_disable", label: "本次不采集数据" },
+      ],
+    });
+    await screen.findByText("均线策略");
+    await gotoStep("review");
+    const summary = screen.getByTestId("ai-launch-summary-cognition");
+    await waitFor(() => expect(summary).toHaveTextContent("采集开"));
+    // RV-P2-11：目录 422 与运维总闸无关，不在它下面教用户去改 env。
+    expect(screen.getByTestId("ai-start-remedies")).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-start-remedy-ops-hint")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("ai-start-remedy-trajectory_use_default_dir"));
+    expect(screen.getByTestId("ai-start-remedy-receipt")).toHaveTextContent(
+      "已改用默认目录（第 4 步 · Agent 认知）",
+    );
+    await waitFor(() => expect(trajectoryApi.validate).toHaveBeenCalledWith(null));
+    expect(screen.getByTestId("ai-launch-trajectory-destination")).toHaveTextContent(
+      TRAJECTORY_CONFIG.defaultRoot,
+    );
+
+    fireEvent.click(screen.getByTestId("ai-start-remedy-trajectory_disable"));
+    expect(screen.getByTestId("ai-start-remedy-receipt")).toHaveTextContent(
+      "已关闭本次数据采集（第 4 步 · Agent 认知）",
+    );
+    await waitFor(() => expect(summary).not.toHaveTextContent("采集开"));
+    fireEvent.click(screen.getByRole("button", { name: "去看看" }));
+    await screen.findByRole("heading", { level: 3, name: /Agent 认知/ });
+    expect(trajectoryBox()).not.toBeChecked();
+  });
+
+  it("W-T3b「本次不采集数据」只作用于这一次：提交体不带采集、记住的偏好原样；在第 4 步重新勾选即撤销", async () => {
+    const preference = { enabled: true, directory: LOCKED_DIR };
+    const { onConfirm } = renderModal({
+      defaultTrajectoryCapture: preference,
+      error: "后训练数据目录不可用：目录不可写：拒绝访问（13）",
+      errorRemedies: [{ id: "trajectory_disable", label: "本次不采集数据" }],
+    });
+    await screen.findByText("均线策略");
+    const cta = await reviewCta();
+    await waitFor(() => expect(cta).toBeDisabled());
+    fireEvent.click(screen.getByTestId("ai-start-remedy-trajectory_disable"));
+    await waitFor(() => expect(cta).not.toBeDisabled());
+    fireEvent.click(cta);
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.trajectoryCapture).toBeUndefined();
+    // 拨成「关」会被当成用户的选择记住：正在积累的数据集就从下一次启动起静默断档。
+    expect(opts.trajectoryPreference).toEqual(preference);
+
+    await gotoStep("cognition");
+    expect(trajectoryBox()).not.toBeChecked();
+    fireEvent.click(trajectoryBox());
+    await waitFor(() => expect(trajectoryBox()).toBeChecked());
+    expect(await screen.findByText("⚠ 目录不可写：拒绝访问（13）")).toBeInTheDocument();
+  });
+
+  it("W-T4 open 恒真 + 父组件以新引用重渲染 ⇒ 已勾选的采集与已提交的目录不被重置", async () => {
+    // 「输入约 1 秒回退」修过三次；这是它在采集卡上的第四道护栏（R13）。
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { rerender } = renderModal();
+      await screen.findByText("均线策略");
+      await gotoStep("cognition");
+      await waitFor(() => expect(trajectoryBox()).not.toBeDisabled());
+      fireEvent.click(trajectoryBox());
+      const input = (await screen.findByLabelText("后训练数据保存目录")) as HTMLInputElement;
+      fireEvent.change(input, { target: { value: "D:\\datasets\\mine" } });
+      fireEvent.blur(input);
+      // 再敲一段**未提交**的草稿：它同样不许被父树重渲染冲掉。
+      fireEvent.change(input, { target: { value: "D:\\datasets\\draft" } });
+      for (let i = 0; i < 3; i += 1) {
+        rerender({
+          defaultStrategyIds: [1],
+          defaultTrajectoryCapture: { enabled: false, directory: null },
+        });
+      }
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2000);
+      });
+      expect(trajectoryBox()).toBeChecked();
+      expect((screen.getByLabelText("后训练数据保存目录") as HTMLInputElement).value).toBe(
+        "D:\\datasets\\draft",
+      );
+      // 切走再回来：未提交的草稿随卸载作废，已提交的目录还在。
+      await gotoStep("guards");
+      await gotoStep("cognition");
+      const again = (await screen.findByLabelText("后训练数据保存目录")) as HTMLInputElement;
+      expect(again.value).toBe("D:\\datasets\\mine");
+      expect(trajectoryBox()).toBeChecked();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("F-9 偏好 enabled:true + 配置接口 404 ⇒ 框未勾且禁用、摘要无「采集开」、第 6 步有说明、提交体不带该键而偏好保留", async () => {
+    vi.mocked(trajectoryApi.config).mockRejectedValue(new ApiRequestError("404", "Not Found", 404));
+    const preference = { enabled: true, directory: "D:\\datasets" };
+    const { onConfirm } = renderModal({ defaultTrajectoryCapture: preference });
+    await screen.findByText("均线策略");
+    await gotoStep("cognition");
+    await waitFor(() =>
+      expect(screen.getByTestId("ai-trade-trajectory-lock-reason")).toHaveTextContent(
+        "无法读取采集配置",
+      ),
+    );
+    expect(trajectoryBox()).not.toBeChecked();
+    expect(trajectoryBox()).toBeDisabled();
+    expect(screen.getByRole("tab", { name: /Agent 认知/ }).getAttribute("title") ?? "")
+      .not.toContain("采集开");
+
+    const cta = await reviewCta();
+    expect(screen.getByTestId("ai-launch-trajectory-notice")).toHaveTextContent(
+      "△ 无法读取采集配置（后端尚未就绪），本次不会采集",
+    );
+    expect(screen.queryByTestId("ai-launch-trajectory-destination")).toBeNull();
+    expect(screen.getByTestId("ai-launch-summary-cognition")).not.toHaveTextContent("采集开");
+    await waitFor(() => expect(cta).not.toBeDisabled());   // 说明不是阻断
+    fireEvent.click(cta);
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.trajectoryCapture).toBeUndefined();
+    expect(opts.trajectoryPreference).toEqual(preference);
+    expect(trajectoryApi.validate).not.toHaveBeenCalled();
+  });
+
+  it("F-9 运维关（config.enabled=false）同形：框禁用、第 6 步说明是运维关、提交体不带该键", async () => {
+    vi.mocked(trajectoryApi.config).mockResolvedValue({ ...TRAJECTORY_CONFIG, enabled: false });
+    const preference = { enabled: true, directory: null };
+    const { onConfirm } = renderModal({ defaultTrajectoryCapture: preference });
+    await screen.findByText("均线策略");
+    await gotoStep("cognition");
+    expect(await screen.findByTestId("ai-trade-trajectory-ops-off")).toBeInTheDocument();
+    expect(trajectoryBox()).toBeDisabled();
+    expect(trajectoryBox()).not.toBeChecked();
+    const cta = await reviewCta();
+    expect(screen.getByTestId("ai-launch-trajectory-notice")).toHaveTextContent(
+      "△ 后训练数据采集已被运维关闭，本次不会采集",
+    );
+    await waitFor(() => expect(cta).not.toBeDisabled());
+    fireEvent.click(cta);
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+    const opts = onConfirm.mock.calls[0][0] as AiTradeLaunchOpts;
+    expect(opts.trajectoryCapture).toBeUndefined();
+    expect(opts.trajectoryPreference).toEqual(preference);
+  });
+
+  it("F-9 配置恢复后重开弹窗 ⇒ 用户上次的选择自动恢复为勾选，提交体带上它", async () => {
+    vi.mocked(trajectoryApi.config).mockRejectedValue(new ApiRequestError("404", "Not Found", 404));
+    const preference = { enabled: true, directory: "D:\\datasets" };
+    const { onConfirm, rerender } = renderModal({ defaultTrajectoryCapture: preference });
+    await screen.findByText("均线策略");
+    await gotoStep("cognition");
+    await waitFor(() =>
+      expect(screen.getByTestId("ai-trade-trajectory-lock-reason")).toHaveTextContent(
+        "无法读取采集配置",
+      ),
+    );
+    expect(trajectoryBox()).not.toBeChecked();
+
+    vi.mocked(trajectoryApi.config).mockResolvedValue(TRAJECTORY_CONFIG);
+    rerender({ open: false });
+    rerender({ open: true });
+    await screen.findByText("均线策略");
+    await gotoStep("cognition");
+    await waitFor(() => expect(trajectoryBox()).toBeChecked());
+    const cta = await reviewCta();
+    expect(screen.getByTestId("ai-launch-summary-cognition")).toHaveTextContent("采集开");
+    expect(screen.getByTestId("ai-launch-trajectory-destination")).toHaveTextContent(
+      "D:\\datasets",
+    );
+    await waitFor(() => expect(cta).not.toBeDisabled());
+    fireEvent.click(cta);
+    await waitFor(() => expect(onConfirm).toHaveBeenCalledTimes(1));
+    expect((onConfirm.mock.calls[0][0] as AiTradeLaunchOpts).trajectoryCapture).toEqual(
+      preference,
+    );
   });
 });

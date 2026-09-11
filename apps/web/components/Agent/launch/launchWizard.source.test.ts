@@ -57,6 +57,8 @@ describe("引导式启动向导（源码冻结）", () => {
       "StepScope.tsx",
       "useAiTradeLaunchForm.ts",
       "useAiTradeLaunchState.ts",
+      // ai-trade-trajectory-capture §2.13.1：取数 / 谓词 / 提交体下沉到这里（【v2 · RV1】）。
+      "useTrajectoryCapture.ts",
     ]) {
       expect(files, `launch/${expected} 不见了`).toContain(expected);
     }
@@ -167,5 +169,19 @@ describe("引导式启动向导（源码冻结）", () => {
       const expected = name === "AiTradeLaunchStepRail.tsx" ? 1 : 0;
       expect(count, `launch/${name} 的锚点数应为 ${expected}，实际 ${count}`).toBe(expected);
     }
+  });
+
+  it("G-7 `useTrajectoryCapture.ts` 里一个 useEffect 都没有，且表单的提交体取自它", () => {
+    // ai-trade-trajectory-capture【v2 · RV1 / RV3】：这个 hook 把「到底采不采」收敛成单一谓词
+    // `effectiveEnabled`。在这里补一个 effect 去「同步」任何东西，要么在表单之外再造一个复位点
+    // （输入回退缺陷的第四次复发），要么把派生值变成 state——而那份 state 的写点会随第 4 步卸载
+    // 而消失。G-2 (a)(b)(c)(d) 只扫表单与状态层两个文件，看不见这里。
+    const hook = read("launch/useTrajectoryCapture.ts");
+    expect(hook, "判据的前提失效：hook 里找不到 effectiveEnabled").toContain("effectiveEnabled");
+    expect((hook.match(/useEffect\(/g) ?? []).length).toBe(0);
+    // 表单只接线：提交体与偏好都从 hook / 受控状态层取，不另起第二份判据。
+    const form = read("launch/useAiTradeLaunchForm.ts");
+    expect(form).toContain("trajectoryCapture: trajectoryCapture.requestRule");
+    expect(form).toContain("trajectoryDirError: trajectoryCapture.error");
   });
 });

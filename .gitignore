@@ -20,6 +20,8 @@ venv/
 *.db-journal
 *.sqlite
 *.sqlite3
+# 后训练轨迹采集的开发形态默认根目录（ai-trade-trajectory-capture §2.12.1）
+services/quant/datasets/
 
 # --- Env / secrets ---
 .env

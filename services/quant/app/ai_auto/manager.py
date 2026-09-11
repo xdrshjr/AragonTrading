@@ -74,6 +74,10 @@ from .sizing import SizingRule, StopRule, check_window_capacity, parse_sizing_ru
 from .sizing_runtime import build_sizing_runtime, sizing_config_wire
 from .sizing_text import format_sizing_charter
 from .tradability_probe import probe_members
+from .trajectory import (NULL_TRAJECTORY, GroupRecorderRequest, TrajectoryOpenError,
+                         TrajectoryRecorder, TrajectoryRule, close_group_recorder_nowait,
+                         close_recorder_nowait, open_group_recorder, trajectory_receipt,
+                         wrap_llm_clients)
 from .trend_verdict import trend_rule_from_settings
 from .wake_runtime import format_tactical_bars_text, tactical_bars_for
 
@@ -250,6 +254,10 @@ class AiTradeGroupStartRequest:
     intel_rule: IntelSessionRule = field(default_factory=IntelSessionRule)
     # 「服务端替我决定了什么」的显式回执码，见 `_resolve_intel` 的 Returns。
     intel_source: str = "request"
+    # 后训练轨迹采集（trajectory-capture §2.10）。带默认值 ⇒ 直接构造本 dataclass 的既有测试逐字节
+    # 零回归，默认值（关闭）恰好就是本特性合入前的行为；「整键缺省即关闭」只在 API 层解析。
+    trajectory_rule: TrajectoryRule = field(default_factory=TrajectoryRule)
+    trajectory_source: str = "not_requested"
 
 
 @dataclass
@@ -332,6 +340,12 @@ class AiTradeGroup:
     # 而非标的属性（与 base_rule / horizon_rule 的分组共享姿态一致）。默认值 = 逐字节回退。
     intel_rule: IntelSessionRule = field(default_factory=IntelSessionRule)
     intel_source: str = "request"
+    # 后训练轨迹采集（§2.10.2）：recorder（未启用 / 打开失败 ⇒ None）+ 规则与 source（回执的
+    # `requested` 据它们算，打开失败时照样可见，RV2）+ 冷续跑打开失败的原因。
+    trajectory: TrajectoryRecorder | None = None
+    trajectory_rule: TrajectoryRule = field(default_factory=TrajectoryRule)
+    trajectory_source: str = "not_requested"
+    trajectory_open_error: dict | None = None
 
 
 @dataclass
@@ -386,6 +400,8 @@ class _GroupBuildCtx:
     group_id: str
     created_ts: int
     book: GroupExposureBook | None = None     # 分组共享敞口簿（总闸③关 ⇒ None ⇒ corrScale ≡ 1.0）
+    trajectory: TrajectoryRecorder | None = None   # 后训练轨迹 recorder（未启用 / 打开失败 ⇒ None）
+    trajectory_open_error: dict | None = None      # 冷续跑打开失败的原因（进回执，§2.10.4）
 
 
 # 活性看门狗停手任务的关停死线（秒）。**必须远小于** `shutdown_step_timeout_s`（默认 20）：
@@ -443,14 +459,18 @@ class AiTradeManager:
             plans = self._preflight_group(members, configs, positions, total, lever, pending)
             self._note_dust_risk(req, plans, lever)   # [P0-4]：如实回执，绝不 422
             group = await self._build_group(req, creds, provider, plans, total, lever)
-            await self._probe_tradability(group, req)   # 轴 A：启动断面（只提示、绝不阻断启动）
-            self._group = group
-            try:
-                await self._persist_group_state(group, status=pause_core.STATUS_RUNNING)
-            except Exception:
-                self._clear_group_if_current(group)
+            try:      # 后训练轨迹所有者帧（RV9）：启动失败的每条回滚路径都关闭写线程
+                await self._probe_tradability(group, req)   # 轴 A：启动断面（只提示、绝不阻断启动）
+                self._group = group
+                try:
+                    await self._persist_group_state(group, status=pause_core.STATUS_RUNNING)
+                except Exception:
+                    self._clear_group_if_current(group)
+                    raise
+                launched = await self._launch_group_or_rollback(group)
+            except BaseException:
+                close_group_recorder_nowait(group.group_id, "start_failed")
                 raise
-            launched = await self._launch_group_or_rollback(group)
             # W1（pause-resume §3.4.2 / [P1-5]）：契约在**启动成功之后**立刻落盘，此后任何时刻断电
             # 都可续跑。刻意不在 `_launch_group_or_rollback` **之前**写——启动失败回滚会把全部成员
             # `stop("start_failed")` 并清组，磁盘上却留下一条 `status='running'` 的幽灵契约，而自愈
@@ -738,43 +758,86 @@ class AiTradeManager:
             sum_pct=sum(p.allocation_pct for p in plans), total_budget_usd=total,
             group_id=str(resume_of.get("groupId") or f"aitradegrp_{uuid.uuid4().hex}"),
             created_ts=created_ts, book=book)
-        members = [await self._build_member(ctx, p) for p in plans]
-        group = AiTradeGroup(
-            group_id=ctx.group_id, bar=req.bar,
-            strategy_ids=[s.strategy_id for s in req.specs],
-            strategy_names=[s.strategy_name for s in req.specs],
-            total_budget_usd=total, leverage=lever,
-            context_refresh_rounds=req.context_refresh_rounds,
-            created_ts=created_ts, members=members,
-            wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
-            profit_rule=req.profit_rule, sizing_rule=rule, exposure_book=book,
-            stop_rule=parse_stop_rule(req.settings), horizon_rule=req.horizon_rule,
-            discipline_preset=req.discipline_preset,
-            discipline_adjustments=req.discipline_adjustments,
-            discipline_thresholds=req.discipline_thresholds,
-            discipline_inert=list(req.discipline_inert),
-            account_id=req.account_row.id, start_wire=dict(req.start_wire or {}),
-            resumed_count=int(resume_of.get("resumedCount") or 0),
-            # ★ P1-12：本方法是 `AiTradeGroup` 的**唯一**构造点——`start_group` 与冷续跑
-            # （`resume.resume_cold_group` → `manager._build_group`）都走它，热续跑复用内存里
-            # 那个已经带着规则的分组。故这一行同时覆盖三条路径；在 `resume_group` 里再赋一次
-            # 会是死代码（实施发现 I-2）。
-            intel_rule=req.intel_rule, intel_source=req.intel_source,
-            # 轴 A-4：费率来源取**任一成员**那一份——它是分组共享的（同一账户、同一档位家族），
-            # 逐成员各发一份只是噪音（与 `_discipline_wire` / `_direction_wire` 同一条理由）。
-            fee_rates=_fee_rates_receipt(plans, req.settings))
-        for member in members:
-            # 可续跑契约的两条会话侧接线（pause-resume §3.4.2）：`group_id` 让 W2/W3 的增量写有
-            # 落点；`on_stopped` 是 W5——会话**自终止**（暂停期止盈止损 / stale_feed / 启动回滚 /
-            # stop_member）之后把状态表收敛，否则磁盘上会留一张指向已平仓会话的续跑卡。
-            member.session.group_id = group.group_id
-            install = getattr(member.session, "install_integrity", None)
-            if callable(install):
-                install()
-            member.session.on_stopped = partial(self._note_session_stopped, group)
-            # ★ 轴 D：活性看门狗判到 `halt` 时的**同步**投递口（与 `on_stopped` 同款接线）。
-            member.session.on_liveness_halt = partial(self._request_liveness_pause, group)
+        # 后训练轨迹 W11（§2.3）：通道要在 `_build_member` 包装客户端之前存在；新启动打开失败即在此
+        # 抛 `TrajectoryOpenError`——此刻尚未建任何 run 行，抛出零残留（RV10）。
+        ctx.trajectory = await self._open_trajectory(req, ctx, creds)
+        try:      # 所有者帧（RV9）：打开写线程之后任何一步抛错，都由本帧关闭，绝不泄漏
+            members = [await self._build_member(ctx, p) for p in plans]
+            group = AiTradeGroup(
+                group_id=ctx.group_id, bar=req.bar,
+                strategy_ids=[s.strategy_id for s in req.specs],
+                strategy_names=[s.strategy_name for s in req.specs],
+                total_budget_usd=total, leverage=lever,
+                context_refresh_rounds=req.context_refresh_rounds,
+                created_ts=created_ts, members=members,
+                wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
+                profit_rule=req.profit_rule, sizing_rule=rule, exposure_book=book,
+                stop_rule=parse_stop_rule(req.settings), horizon_rule=req.horizon_rule,
+                discipline_preset=req.discipline_preset,
+                discipline_adjustments=req.discipline_adjustments,
+                discipline_thresholds=req.discipline_thresholds,
+                discipline_inert=list(req.discipline_inert),
+                account_id=req.account_row.id, start_wire=dict(req.start_wire or {}),
+                resumed_count=int(resume_of.get("resumedCount") or 0),
+                # ★ P1-12：本方法是 `AiTradeGroup` 的**唯一**构造点——`start_group` 与冷续跑
+                # （`resume.resume_cold_group` → `manager._build_group`）都走它，热续跑复用内存里
+                # 那个已经带着规则的分组。故这一行同时覆盖三条路径；在 `resume_group` 里再赋一次
+                # 会是死代码（实施发现 I-2）。
+                intel_rule=req.intel_rule, intel_source=req.intel_source,
+                # 轴 A-4：费率来源取**任一成员**那一份——它是分组共享的（同一账户、同一档位家族），
+                # 逐成员各发一份只是噪音（与 `_discipline_wire` / `_direction_wire` 同一条理由）。
+                fee_rates=_fee_rates_receipt(plans, req.settings),
+                trajectory=ctx.trajectory, trajectory_rule=req.trajectory_rule,
+                trajectory_source=req.trajectory_source,
+                trajectory_open_error=ctx.trajectory_open_error)
+            for member in members:
+                # 可续跑契约的两条会话侧接线（pause-resume §3.4.2）：`group_id` 让 W2/W3 的增量写有
+                # 落点；`on_stopped` 是 W5——会话**自终止**（暂停期止盈止损 / stale_feed / 启动回滚 /
+                # stop_member）之后把状态表收敛，否则磁盘上会留一张指向已平仓会话的续跑卡。
+                member.session.group_id = group.group_id
+                install = getattr(member.session, "install_integrity", None)
+                if callable(install):
+                    install()
+                member.session.on_stopped = partial(self._note_session_stopped, group)
+                # ★ 轴 D：活性看门狗判到 `halt` 时的**同步**投递口（与 `on_stopped` 同款接线）。
+                member.session.on_liveness_halt = partial(self._request_liveness_pause, group)
+                # 后训练轨迹：会话侧通道（未启用 ⇒ None ⇒ 会话保持空对象，十二个写点空转）。
+                # `getattr` 与上面 `install_integrity` 同款：既有用例以替身会话替换 AiTradeSession。
+                attach = getattr(member.session, "attach_trajectory", None)
+                if callable(attach):
+                    attach(None if ctx.trajectory is None
+                           else ctx.trajectory.channel(member.inst_id))
+        except BaseException:
+            close_recorder_nowait(ctx.trajectory, "build_failed")
+            raise
         return group
+
+    async def _open_trajectory(self, req: AiTradeGroupStartRequest, ctx: _GroupBuildCtx,
+                               creds: AccountCredentials | None) -> TrajectoryRecorder | None:
+        """按规则打开分组 recorder（trajectory-capture §2.10.4）。
+
+        规则关 ⇒ `None`（不建目录、不起线程、不包装客户端）。打开失败按路径二分（RV10）：新启动 ⇒
+        抛 `TrajectoryOpenError`（端点转 422——勾选了却静默不采等于替用户丢掉明确要的数据）；冷续跑
+        ⇒ 返回 `None` 并把原因留给回执（`state="failed"`），**绝不阻挡一个可能正持有真实仓位的会话续跑**。
+
+        Raises:
+            TrajectoryOpenError: 新启动（`req.resume_of is None`）时打开失败。
+        """
+        if not req.trajectory_rule.enabled:
+            return None
+        secrets = () if creds is None else (creds.api_key, creds.secret_key, creds.passphrase)
+        result = await open_group_recorder(GroupRecorderRequest(
+            rule=req.trajectory_rule, settings=req.settings, group_id=ctx.group_id,
+            created_ts=ctx.created_ts, resume_of=req.resume_of, start_wire=req.start_wire,
+            secrets=secrets, bar=req.bar,
+            # RV14：本仓模拟盘是进程级 `okx_account_demo`；AI-trade 启动时 creds 恒非 None。
+            env="demo" if req.settings.okx_account_demo else "live"))
+        error = result.error
+        if result.recorder is None and error is not None and req.resume_of is None:
+            raise TrajectoryOpenError(error["code"], error["message"], error.get("directory"),
+                                      is_default=bool(error.get("isDefault")))
+        ctx.trajectory_open_error = error
+        return result.recorder
 
     async def _build_member(self, ctx: _GroupBuildCtx, plan: _MemberPlan) -> AiTradeGroupMember:
         """建单成员会话：Executor（按 budget_i）+ Decider + Run（含 groupId/allocationPct）+ Session。
@@ -817,6 +880,10 @@ class AiTradeManager:
             # `app.ai_auto.manager.make_llm_client_from_config` 注入假客户端，换到 llm_budget
             # 内解析会一次性打翻它们全部（本仓库前科：「换代打破测试注入缝」）。
             make_client=make_llm_client_from_config)
+        # 后训练轨迹（§2.2.1）：包装落在工厂**之后** ⇒ 测试注入缝逐字不变；未勾选 ⇒ 同一批对象。
+        channel = None if ctx.trajectory is None else ctx.trajectory.channel(plan.inst_id)
+        if channel is not None:
+            clients = wrap_llm_clients(clients, channel)
         decider = AiTradeDecider(
             clients.decision,
             build_ai_trade_system_prompt(
@@ -1018,6 +1085,8 @@ class AiTradeManager:
             return {"groupId": group_id, "state": group.state, "alreadyPaused": True}
         receipts = [await member.session.pause(reason, flatten=flatten)
                     for member in group.members]
+        for member in group.members:    # 后训练轨迹 W9：暂停产生的成交 + 令写线程立即 fsync（RV7）
+            getattr(member.session, "trajectory", NULL_TRAJECTORY).note_paused(reason, flatten)
         group.state = pause_core.STATUS_PAUSED
         group.pause_reason = reason
         group.paused_ts = int(time.time())
@@ -1092,17 +1161,23 @@ class AiTradeManager:
                 await self._persist_group_state(group, status=pause_core.STATUS_RUNNING)
                 self._forget_paused_ref(group_id)
                 intel_scheduler.resume(group_id)   # 热续跑：runtime 还在，只需放开调度
+                for member in group.members:        # 后训练轨迹 W10（冷续跑是新 epoch，由 W1 写）
+                    getattr(member.session, "trajectory", NULL_TRAJECTORY).note_resumed("hot")
                 return group
             from .resume import resume_cold_group     # 延迟导入：resume.py 反向依赖本模块
             started = time.time()
-            resumed = await resume_cold_group(self, group_id, acknowledged=acknowledged)
-            # B-9：慢续跑必须可诊断（前端超时档已抬到 3 分钟，但「到底慢在哪」只能由后端说）。
-            logger.info("ai-trade resume cold pipeline took %.1fs (group=%s members=%d)",
-                        time.time() - started, group_id, len(resumed.members))
-            # [评审 R1-2] 冷路径**共用同一段复检**：用户报告里「关软件 → 重开 → 继续」正是这条路。
-            # 复检的价值不在拦截率（刚 `_prime()` 完通常必然 armed），而在「说 running 之前先核实
-            # 一遍」这条纪律**没有第二种写法**。
-            await self._verify_armed(resumed, None, cold=True)                      # ⑤
+            try:      # 后训练轨迹所有者帧（RV9）：冷续跑内的任一回滚路径（含复检未过）都关闭写线程
+                resumed = await resume_cold_group(self, group_id, acknowledged=acknowledged)
+                # B-9：慢续跑必须可诊断（前端超时档已抬到 3 分钟，但「到底慢在哪」只能由后端说）。
+                logger.info("ai-trade resume cold pipeline took %.1fs (group=%s members=%d)",
+                            time.time() - started, group_id, len(resumed.members))
+                # [评审 R1-2] 冷路径**共用同一段复检**：用户报告里「关软件 → 重开 → 继续」正是这条路。
+                # 复检的价值不在拦截率（刚 `_prime()` 完通常必然 armed），而在「说 running 之前先核实
+                # 一遍」这条纪律**没有第二种写法**。
+                await self._verify_armed(resumed, None, cold=True)                      # ⑤
+            except BaseException:
+                close_group_recorder_nowait(group_id, "resume_failed")
+                raise
             self._group = resumed
             self._paused_ref = None
             # 冷续跑：进程里没有 runtime 了，必须整个重建。`ai_intel_watch.next_due_ts` 让它接着
@@ -1589,7 +1664,9 @@ class AiTradeManager:
         if self._has_pending_trade_persistence(group):
             return
         if self._group is not None and self._group.group_id == group.group_id:
-            self._group = None
+            current, self._group = self._group, None
+            # 后训练轨迹（RV8）：清组即同步关闭写线程——真实资金的停止路径绝不 await 后台收尾。
+            close_recorder_nowait(getattr(current, "trajectory", None), "group_cleared")
 
     @staticmethod
     def _has_pending_trade_persistence(group: AiTradeGroup | None) -> bool:
@@ -1978,6 +2055,9 @@ class AiTradeManager:
                 # 中的暂停会话**在冷续跑时被按运维默认继续采信情报这件事。`getattr` 兜底与
                 # `feeRates` 那一行同款：既有测试替身用 `SimpleNamespace` 直接构造分组。
                 "intel": self._intel_receipt(group),
+                # 后训练轨迹采集回执（trajectory-capture §2.9）：形状恒定、永不缺席；前端按 `requested`
+                # 渲染状态条（打开失败 / 写线程崩溃时 `enabled=false`，那正是最需要被看见的状态）。
+                "trajectoryCapture": trajectory_receipt(group),
                 "createdTs": group.created_ts,
                 # 分组生命周期（pause-resume §5.6）：`running` | `paused`。前端 `groupStateFromStatus`
                 # 是**逐键手抄**的映射且此前把 `state` 写死成 "running"，那正是本仓库「静默吞新键」
@@ -2142,18 +2222,39 @@ class AiTradeManager:
         # 默认是 `hold` 就让一个已回滚的部署改变关停语义。
         action = (str(getattr(settings, "ai_trade_shutdown_action", "hold") or "hold")
                   if getattr(settings, "ai_trade_pause_enabled", True) else "flatten")
-        if group.state == pause_core.STATUS_PAUSED:
-            await self._touch_state_row(group.group_id)
-            return {"action": "noop", "groupId": group.group_id, "paused": True}
-        if action == "flatten":
-            for member in group.members:
-                if member.session.is_active:
-                    await self._stop_session(member.session, "shutdown")
-            self._group = None
-            self._forget_paused_ref(group.group_id)
-            return {"action": "flatten", "groupId": group.group_id, "paused": False}
-        await self.pause_group(group.group_id, reason=pause_core.PAUSE_REASON_APP_QUIT)
+        # 后训练轨迹（RV7）：退出路径上的**任何**一次关闭都不压活动段——flatten 分支里会话停止会先经
+        # 清组发一次默认压缩的关闭。三个分支任何一个抛错，写线程都照样在 finally 里有界关闭。
+        recorder = getattr(group, "trajectory", None)
+        if recorder is not None:
+            recorder.skip_active_compression()
+        try:
+            if group.state == pause_core.STATUS_PAUSED:
+                await self._touch_state_row(group.group_id)
+                return {"action": "noop", "groupId": group.group_id, "paused": True}
+            if action == "flatten":
+                for member in group.members:
+                    if member.session.is_active:
+                        await self._stop_session(member.session, "shutdown")
+                self._group = None
+                self._forget_paused_ref(group.group_id)
+                return {"action": "flatten", "groupId": group.group_id, "paused": False}
+            await self.pause_group(group.group_id, reason=pause_core.PAUSE_REASON_APP_QUIT)
+        finally:
+            await self._close_trajectory_on_quit(group)
         return {"action": "hold", "groupId": group.group_id, "paused": True}
+
+    @staticmethod
+    async def _close_trajectory_on_quit(group: AiTradeGroup) -> None:
+        """后训练轨迹的退出收尾（RV7）：不压缩活动段、死线 ≤ 1 秒；绝不抛（`aclose` 自带兜底）。
+
+        桌面端真实退出是 `quit-pause`（2 秒硬超时，随后强杀）→ 本方法；lifespan 与 `atexit` 大概率
+        跑不到。不压活动段，关闭就只剩「排空 + 关文件 + 写 manifest」这几毫秒（读侧兼容明文段）。
+        """
+        recorder = getattr(group, "trajectory", None)
+        if recorder is None:
+            return
+        await recorder.aclose("app_quit", compress_active=False,
+                              timeout_s=min(recorder.config.close_timeout_s, 1.0))
 
     @staticmethod
     def _group_settings(group: AiTradeGroup):

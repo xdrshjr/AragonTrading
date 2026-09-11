@@ -39,6 +39,7 @@ import AiTradeLaunchModal, { type AiTradeLaunchOpts } from "./AiTradeLaunchModal
 import AiTradeEndDialog from "./AiTradeEndDialog";
 import AiTradePauseDialog from "./AiTradePauseDialog";
 import AiTradeResumeDialog from "./AiTradeResumeDialog";
+import AiTradeTrajectoryStatus from "./AiTradeTrajectoryStatus";
 
 /**
  * AI 自动交易开关（ai-trade-multi-symbol-and-timeframe §4.2）：挂 AgentPanel 底部「AI 自动交易
@@ -180,6 +181,9 @@ export default function AiTradeToggle() {
         // 六项的方向相反，这是需求的明文要求）。显式下发让「用户看过并选了不开」在
         // `start_wire` 里留下痕迹，冷续跑据它把老会话与新会话区分开。
         intel: opts.intel,
+        // 后训练轨迹采集（trajectory-capture §2.13）：**只在有效开启时携带**。关闭 / 配置读不到 /
+        // 运维关 ⇒ 整键缺席（不是 `undefined` 值）⇒ 启动体与合入前逐字节相同（范围纪律 2）。
+        ...(opts.trajectoryCapture ? { trajectoryCapture: opts.trajectoryCapture } : {}),
         direction: opts.direction,               // 方向对称性（同上；取消勾选即 contrarianEnabled:false）
         trend: opts.trend,                       // 执行周期趋势基调（同上；取消勾选即 enabled:false）
         contextRefreshRounds: opts.contextRefreshRounds,
@@ -212,6 +216,10 @@ export default function AiTradeToggle() {
         // 派生档 `off`），拿它回填会把「我选了索引档但这次被运维总闸忽略了」固化成「我选了
         // 关闭」——下次打开弹窗时用户的选择就被服务端的一次临时状态改写了。
         intel: opts.intel,
+        // [R-4] 同理取 opts，且取的是 `trajectoryPreference`（用户的**原始**选择）而不是
+        // `trajectoryCapture`（生效值）：配置读取失败的那一次后者是 undefined，拿它回填会把
+        // 用户的勾选与目录抹成空——配置恢复后他正在积累的数据集就静默断档。
+        trajectoryCapture: opts.trajectoryPreference,
       });
       setModalOpen(false);
       noteError(null);
@@ -579,6 +587,12 @@ export default function AiTradeToggle() {
         </div>
       </div>
 
+      {/* 【v2 · RV2】后训练数据采集状态条：按 `requested` 渲染而不是 `enabled`——打开失败 /
+          写线程崩溃时 enabled=false，而那正是最需要被看见的状态（trajectory-capture §2.14.2）。 */}
+      {(running || paused) && aiTradeGroup?.trajectoryCapture?.requested && (
+        <AiTradeTrajectoryStatus receipt={aiTradeGroup.trajectoryCapture} paused={paused} />
+      )}
+
       {/* 错误文案独占第二行：在通栏里再挤一段截断文本，等于把「继续 / 结束」按钮挤没。
           whitespace-normal 显式覆盖控制条继承下来的 nowrap（这是本方案里唯一需要换行的文本）。
           data-testid 是必需的：四个弹窗里的错误段落同样是 role="alert"，只靠 role 定位有歧义。
@@ -680,6 +694,8 @@ export default function AiTradeToggle() {
         // 老 localStorage 无此键 ⇒ `undefined` ⇒ 弹窗回落 `AI_TRADE_INTEL_RULE_DEFAULT`
         // （默认不勾）。**不为此改 persist version**，沿用 baseRules 先例。
         defaultIntel={aiTradeConfig?.intel}
+        // 老 localStorage 无此键 ⇒ `undefined` ⇒ 弹窗回落 `AI_TRADE_TRAJECTORY_RULE_DEFAULT`（默认不勾）。
+        defaultTrajectoryCapture={aiTradeConfig?.trajectoryCapture}
         error={liveError}
         errorRemedies={startRemedies}
         liveGateReason={liveGateReason}

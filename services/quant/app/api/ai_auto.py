@@ -60,6 +60,8 @@ from ..ai_auto.sizing import parse_sizing_rule, window_need
 from ..ai_auto.sizing_runtime import margin_precheck_notice
 from ..ai_auto.track_record_service import build_profitability, resolve_track_record
 from ..ai_auto.tradability_probe import probe
+from ..ai_auto.trajectory import (TrajectoryOpenError, TrajectoryRule, probe_directory,
+                                  resolve_trajectory_rule)
 from ..ai_auto.wake_runtime import coherent_wake_floor_s
 from ..config import Settings, get_settings
 from ..db import ai_prior_repositories as prior_repo
@@ -295,6 +297,21 @@ def _resolve_intel(body: AiTradeGroupStartIn,
         return IntelSessionRule(enabled=False), "resolve_failed"
 
 
+def _resolve_trajectory(body: AiTradeGroupStartIn,
+                        settings: Settings) -> tuple[TrajectoryRule, str]:
+    """会话级后训练轨迹采集的**唯一**解析点（ai-trade-trajectory-capture §2.10.2）。
+
+    ⚠️ **整键缺省 ⇒ 不采集**（与 `_resolve_intel` 同向）。纯函数、零 IO、绝不抛：目录可用性由端点
+    `_require_trajectory_directory` 探测，**绝不在这里校验**——冷续跑用 `start_wire` 重跑本链，任何
+    `HTTPException` 都会把续跑翻成 409。
+
+    Returns:
+        `(规则, source)`，`source ∈ {request, not_requested, ops_off, resolve_failed}`。
+    """
+    raw = body.trajectoryCapture.model_dump() if body.trajectoryCapture is not None else None
+    return resolve_trajectory_rule(raw, settings)
+
+
 def _resolve_position_step(raw: float | None, settings: Settings) -> float:
     """仓位操作档位步长解析（[R-2] **仅**缺省回填）：`None → settings 默认`，否则原样返回。
 
@@ -461,8 +478,14 @@ async def ai_trade_start(body: AiTradeGroupStartIn, session: AsyncSession = Depe
     _require_ai_enabled(settings)
     req = await build_start_request(session, settings, body)
     _require_profit_exit_with_horizon(req, settings)
+    await _require_trajectory_directory(req, settings)
     try:
         await get_ai_trade_manager().start_group(req)
+    except TrajectoryOpenError as exc:
+        # RV10：新启动时 recorder 打开失败（建分组目录 / 写说明卡 / 起线程 / 单写者占用）与目录
+        # 探测失败共用同一个 422——勾选了却静默不采，等于替用户丢掉明确要的数据。
+        raise trajectory_dir_http_error(exc.message, directory=exc.directory,
+                                        reason_code=exc.code, is_default=exc.is_default) from exc
     except AiTradeGroupPreflightError as exc:
         # 整组前置失败须透传逐标的 members 明细（全局处理器据此包成 {error:{code,message,members}}）。
         raise HTTPException(exc.status, detail={
@@ -516,6 +539,44 @@ def _require_profit_exit_with_horizon(req: AiTradeGroupStartRequest,
         ]})
 
 
+async def _require_trajectory_directory(req: AiTradeGroupStartRequest,
+                                        settings: Settings) -> None:
+    """用户勾选了采集而目录不可用 ⇒ 422 + 可执行补救（trajectory-capture §2.10.3）。
+
+    落点只能在端点内（理由同 `_require_profit_exit_with_horizon`：冷续跑重跑解析链，不经本端点）。
+    勾选了却静默不采，等于替用户丢掉明确要的数据；故这里拒绝启动并给出一键出路，而不是「先跑起来
+    再说」。未勾选 ⇒ 一次 IO 都不做。
+
+    Raises:
+        HTTPException: 422 `AI_TRADE_TRAJECTORY_DIR_INVALID`。
+    """
+    if not req.trajectory_rule.enabled:
+        return
+    verdict = await probe_directory(req.trajectory_rule.directory, settings)
+    if verdict.ok:
+        return
+    raise trajectory_dir_http_error(verdict.message or "目录不可用", directory=verdict.directory,
+                                    reason_code=verdict.code, is_default=verdict.is_default)
+
+
+def trajectory_dir_http_error(reason: str, *, directory: str | None, reason_code: str | None,
+                              is_default: bool) -> HTTPException:
+    """目录探测失败与 recorder 打开失败**共用**的 422（同一组 remedies，前端逐条渲染为按钮）。
+
+    Args:
+        reason: 后端中文原因（不含 `**`）。
+        directory: 归一化后的目标目录。
+        reason_code: `TRAJECTORY_DIR_*` 或 `OPEN_FAILED` / `OPEN_TIMEOUT` / `OPEN_BUSY`。
+        is_default: 目标是否已是默认根目录（是 ⇒ 不给「改用默认目录」这条出路）。
+    """
+    remedies = ([] if is_default
+                else [{"id": "trajectory_use_default_dir", "label": "改用默认目录"}])
+    remedies.append({"id": "trajectory_disable", "label": "本次不采集数据"})
+    return HTTPException(422, detail={
+        "code": "AI_TRADE_TRAJECTORY_DIR_INVALID", "message": f"后训练数据目录不可用：{reason}",
+        "directory": directory, "reasonCode": reason_code, "remedies": remedies})
+
+
 async def build_start_request(session: AsyncSession, settings: Settings,
                               body: AiTradeGroupStartIn) -> AiTradeGroupStartRequest:
     """`/ai-trade/start` 的**唯一**解析链（`ai_auto/resume.py` 的 S2 复用同一条，绝不另写一份）。
@@ -547,6 +608,8 @@ async def build_start_request(session: AsyncSession, settings: Settings,
     # `_resolve_*` **不共享任何 Settings 键**（不产出派生副本，只产出一个规则对象），故顺序上
     # 只有一条硬约束——必须在 `req = AiTradeGroupStartRequest(...)` 之前。
     intel_rule, intel_source = _resolve_intel(body, settings)
+    # 后训练轨迹采集（trajectory-capture §2.10.2）：只产出规则对象、不改 Settings；目录校验在端点。
+    trajectory_rule, trajectory_source = _resolve_trajectory(body, settings)
     experience_rule = resolve_experience(
         body.experience.model_dump() if body.experience is not None else None, settings)
     experience_snapshot = await load_session_graph(
@@ -623,6 +686,8 @@ async def build_start_request(session: AsyncSession, settings: Settings,
             sizing_rule=parse_sizing_rule(settings), horizon_rule=horizon_rule),
         # 会话级情报采信（轴 A）：规则 + 「服务端替我决定了什么」的显式回执。
         intel_rule=intel_rule, intel_source=intel_source,
+        # 后训练轨迹采集：规则 + 显式回执码（`start_wire` 原文含本键 ⇒ 冷续跑自动同配置）。
+        trajectory_rule=trajectory_rule, trajectory_source=trajectory_source,
         # 经验层 W-1：规则与启动期快照（`SessionGraph{graph, totals, as_of_ts}` —— 图与库存总量
         # **同一次取数**，因为那两个整数要被逐字渲染进 L0 页眉喂给下真单的模型，不变式 I-9）。
         experience_rule=experience_rule, experience_snapshot=experience_snapshot,

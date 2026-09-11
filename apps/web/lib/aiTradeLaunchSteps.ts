@@ -117,6 +117,7 @@ export const AI_TRADE_LAUNCH_ERROR_KEYS = [
   "unguardedBlocked",
   "acknowledged",
   "serverError",
+  "trajectoryDirError",
 ] as const;
 
 export type AiTradeLaunchErrorKey = (typeof AI_TRADE_LAUNCH_ERROR_KEYS)[number];
@@ -140,6 +141,8 @@ export const READY_INPUTS: readonly AiTradeLaunchErrorKey[] = [
   "everyError",
   "minConsensusError",
   "roundsCapError",
+  // trajectory-capture §2.13.2：只进 `ready`、不进横幅（与 `directionError` 同形）。
+  "trajectoryDirError",
 ] as const;
 
 /** `firstError`（错误横幅）读到的校验量。U-2 的参照集之二。 */
@@ -171,8 +174,10 @@ export interface AiTradeLaunchErrorOwner {
 /**
  * 归属表（**冻结**）：每一个校验量恰好归属一步，无遗漏、无重叠（U-2）。
  *
- * `cognition` 一步不出现在下表里——它**永不产生阻断错误**（研判深度 / 经验 / 情报三张卡都只有
- * 档位选择，没有可填错的数值），这是设计结论而不是遗漏。
+ * `cognition` 一步**只产生一种阻断错误**：用户勾选了后训练数据采集、而目录被服务端判定不可用
+ * （`trajectoryDirError`，ai-trade-trajectory-capture §2.13.2）。研判深度 / 经验 / 情报三张卡
+ * 仍只有档位选择、没有可填错的数值。它与 `directionError` / `trendError` 同形：只进 `ready`、
+ * 就地渲染在卡片里，**不进** `firstError`（第 6 步的兜底行自动覆盖它）。
  */
 export const STEP_ERROR_OWNERS: Record<AiTradeLaunchErrorKey, AiTradeLaunchErrorOwner> = {
   strategyError: { step: "scope", modes: BOTH },
@@ -187,6 +192,8 @@ export const STEP_ERROR_OWNERS: Record<AiTradeLaunchErrorKey, AiTradeLaunchError
   minConsensusError: { step: "rhythm", modes: ["backtest"] },
   roundsCapError: { step: "rhythm", modes: ["backtest"] },
   inputError: { step: "capital", modes: BOTH },
+  // 只在实盘：回测车道不采集（trajectory-capture §1.3 N1），回测段的卡片整卡替换为一行说明。
+  trajectoryDirError: { step: "cognition", modes: ["live"] },
   baseRuleError: { step: "guards", modes: BOTH },
   profitGuardError: { step: "guards", modes: BOTH },
   // 【v2 · P0-3】这两项**不在** `firstError` 里，只进 `ready`。没有归属 ⇒ 第 5 步的「下一步」
@@ -261,6 +268,8 @@ export interface AiTradeLaunchSummaryInput {
   baseRuleEnabled: boolean;
   profitGuardEnabled: boolean;
   riskCount: number;
+  /** 后训练数据采集是否**有效**开启（可选：缺省 / false ⇒ cognition 摘要逐字节不变）。 */
+  trajectoryEnabled?: boolean;
 }
 
 const DOT = " · ";
@@ -300,7 +309,9 @@ export function stepSummary(
       return (
         `${safe(input.reasoningDepthLabel)}${DOT}` +
         `经验${onOff(input.experienceEnabled, "开", "关")}${DOT}` +
-        `情报${onOff(input.intelEnabled, "开", "关")}`
+        `情报${onOff(input.intelEnabled, "开", "关")}` +
+        // 未开启时一个字节都不追加（U-7 冻结「改前逐字相等」）。
+        (input.trajectoryEnabled ? `${DOT}采集开` : "")
       );
     case "guards":
       return (

@@ -12,6 +12,10 @@ contextBridge.exposeInMainWorld('aragon', {
   platform: process.platform,
   // 打开日志目录（prod 落 userData/logs；主进程 shell.openPath）
   openLogsDir: () => ipcRenderer.invoke('aragon:open-logs'),
+  // 后训练数据目录（ai-trade-trajectory-capture §2.15）：系统「选择文件夹」对话框与
+  // 「在资源管理器中打开」。主进程只接受存在的绝对目录（src/lib/dir-access.js）。
+  pickDirectory: (opts) => ipcRenderer.invoke('aragon:pick-directory', opts),
+  openPath: (target) => ipcRenderer.invoke('aragon:open-path', target),
   // 「关于」对话框（补偿被移除菜单的帮助项，主进程 showAbout()）
   showAbout: () => ipcRenderer.send('aragon:show-about'),
   // 自定义标题栏窗口控制（spec §4.3 / §6）：最小化 / 最大化切换 / 关闭 / 查询与订阅最大化态。

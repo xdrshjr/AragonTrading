@@ -5,6 +5,10 @@ import type { IntegritySnapshot, OpenAttemptReceipt } from "./aiTradeIntegrity";
 import type { AiTradeContrarianBlocked } from "./aiTradeHistoryTypes";
 import type { AiTradeRealizedStats } from "./aiTradeProfitability";
 import type {
+  AiTradeTrajectoryReceipt,
+  AiTradeTrajectoryRule,
+} from "./trajectoryTypes";
+import type {
   PaperPositionEvent,
   ProfitGuardCooldown,
   ProfitGuardSnapshot,
@@ -1600,6 +1604,9 @@ export interface AiTradeGroupStartReq {
   // 「缺省即开启」的惯例方向相反，这是需求的明文要求）。**仅实盘 tab 下发**：情报层不进回测
   // 车道，回测启动体不接该字段。
   intel?: AiTradeIntelRule | null;
+  // 后训练轨迹采集（trajectory-capture §2.10.1）：**整键缺省 ⇒ 不采集**（与 `intel` 同向）。
+  // 前端只在「有效开启」时携带；仅实盘 tab 下发，回测启动体不接该字段（§1.3 N1）。
+  trajectoryCapture?: AiTradeTrajectoryRule | null;
 }
 
 /**
@@ -1672,6 +1679,8 @@ export interface AiTradeGroupRow {
   // 的显式披露。`legacy_fallback` 对应「本会话启动于情报开关上线之前」——那是数十条持仓中的
   // 暂停会话冷续跑时唯一会走的那一格。老后端不下发 ⇒ `null`。
   intel?: AiTradeIntelReceipt | null;
+  // 后训练轨迹采集回执（trajectory-capture §2.9）：形状恒定、永不缺席；老后端 ⇒ 整键缺席。
+  trajectoryCapture?: AiTradeTrajectoryReceipt | null;
 }
 
 /**
@@ -2183,6 +2192,9 @@ export interface AiTradeGroupState {
   // `groupStateFromStatus` 逐键手抄写入，漏抄的表现永远是同一个形状：WS 通路是好的，只有
   // 刷新页面后重发现才拿不到，且不报任何错。`null` = 老后端。
   intel?: AiTradeIntelReceipt | null;
+  // 后训练轨迹采集回执（trajectory-capture §2.14.3）：**第七条同款注释**——由
+  // `groupStateFromStatus` 与 `buildLifecyclePatch` 两条通路逐键手抄写入，漏任何一处都不报错。
+  trajectoryCapture?: AiTradeTrajectoryReceipt | null;
   startedTs: number;
   members: Record<string, AiTradeGroupMemberState>;
 }
@@ -2214,6 +2226,7 @@ export interface AiTradeGroupLifecyclePatch {
       | "acceptance"
       | "exits"
       | "funding"
+      | "trajectoryCapture"
     >
   >;
   /** 逐成员的六个生命周期键（按 `instId` 合并；缺席于回执的成员**保留本地行不动，不删**）。 */
@@ -2256,6 +2269,9 @@ export interface AiTradeConfig {
   // `?? AI_TRADE_INTEL_RULE_DEFAULT` 兜底。**不**为此改 persist version（沿用 baseRules 先例）。
   // 系统默认仍是**关闭**——这里持久化的是用户上一次的**显式选择**，两者不是一回事。
   intel?: AiTradeIntelRule;
+  // 后训练数据采集偏好（trajectory-capture §5.4）：用户**上一次的显式选择**（可选；读点一律
+  // `?? AI_TRADE_TRAJECTORY_RULE_DEFAULT` 兜底）。系统默认仍是关闭；**不**改 persist version。
+  trajectoryCapture?: AiTradeTrajectoryRule;
 }
 
 /**

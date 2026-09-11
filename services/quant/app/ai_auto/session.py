@@ -146,6 +146,8 @@ from .signals import (
 from .sizing_runtime import SizingRuntime
 from .stats_ext import build_consensus_stats
 from .track_record import TrackRecordRuntime
+from .trajectory import (NULL_TRAJECTORY, EpisodeEnd, EpisodeFacts, RoundCapture,
+                         SessionBinding, accounting_context_of)
 from .truth_wire import build_sources as build_truth_sources
 from .truth_wire import ws_digest as truth_ws_digest
 from .reasoning_protocol import resolve_analysis_excerpt
@@ -567,6 +569,9 @@ class AiTradeSession:
         self._round_trace: dict | None = None   # 当前在飞轮次（原地累积；snapshot 出口防御性拷贝冻结）
         self._subscribers: set[asyncio.Queue] = set()
         self._ws: OKXWSClient | None = None
+        # 后训练轨迹采集（trajectory-capture §2.3）：空对象兜底 ⇒ 十二个写点无需判 None；真正的通道
+        # 由 manager 在建组接线循环里经 `attach_trajectory` 挂上。
+        self._trajectory = NULL_TRAJECTORY
 
     @property
     def poll_interval_s(self) -> int:
@@ -1177,10 +1182,43 @@ class AiTradeSession:
         except Exception as exc:  # noqa: BLE001 —— 心跳是观测面，失败只降级
             logger.debug("ai-trade state heartbeat skipped (%s): %s", self.inst_id, exc)
 
+    # ---------- 后训练轨迹采集（ai-trade-trajectory-capture §2.3）----------
+    def attach_trajectory(self, channel) -> None:
+        """挂上采集通道；`None`（未勾选 / 运维关 / 打开失败）⇒ 保持空对象，全部写点空转。"""
+        if channel is None:
+            return
+        self._trajectory = channel
+        channel.bind(SessionBinding(self.session_id, self.run_id, self.inst_id, self.bar),
+                     executor=self.executor)
+
+    @property
+    def trajectory(self):
+        """采集通道的只读出口（manager 的暂停 / 继续写点用）；恒非 None。"""
+        return self._trajectory
+
+    def _trajectory_episode_facts(self) -> EpisodeFacts:
+        """W1 的事实：只取既有属性、不做计算。"""
+        return EpisodeFacts(
+            session_id=self.session_id, run_id=self.run_id, inst_id=self.inst_id, bar=self.bar,
+            strategy_ids=list(self.strategy_ids), strategy_names=list(self.strategy_names),
+            context_refresh_rounds=self.context_refresh_rounds,
+            wake_interval_s=self.wake_interval_s, take_profit_usd=self.take_profit_usd,
+            stop_loss_usd=self.stop_loss_usd, started_ts=int(self.started_ts or 0),
+            accounting=accounting_context_of(self))
+
+    def _trajectory_episode_end(self) -> EpisodeEnd:
+        """W8 的收尾事实（`getattr` 兜底：写点绝不因执行器替身缺字段而在停止路径上抛）。"""
+        return EpisodeEnd(stop_reason=self.stop_reason,
+                          trade_count=int(getattr(self.executor, "trade_count", 0) or 0),
+                          realized_pnl_usd=getattr(self.executor, "realized_pnl_usd", None),
+                          flatten_result=self.flatten_result)
+
     # ---------- lifecycle ----------
     async def start(self) -> None:
         """暖机（仅热指标 + 种入影子立场，不下任何真单）后订阅实时 WS 与 monitor 循环。"""
         await self._prime()
+        # 轨迹 W1：暖机不下单；冷续跑的成交台账在 start 之前已回灌 ⇒ 此刻的 trade_count 才是水位。
+        self._trajectory.open_episode(self._trajectory_episode_facts())
         # 链路事件与断线补根的实体全在 okx/session_link.py（本文件只留绑定，见 spec §3.2 注）。
         self._link = make_session_link(self, "ai_auto")
         self._ws = OKXWSClient(self.inst_id, self.bar, self.feed_candle,
@@ -1285,6 +1323,9 @@ class AiTradeSession:
         # **不新增任何关停步骤**（`_shutdown_steps` 第 7 步已被用例冻结）。落在 `_finalize_run`
         # **之前**——`aiStats.intel.dropped` 要带上这一次丢弃，否则那个数在收尾快照里恒少一批。
         self._intel_cite.stop()
+        # 轨迹 W8：平仓回执、结算 drain、成交落库都已发生；先于 `_finalize_run` 的收尾 IO 入队。
+        self._trajectory.sync_fills("stop")
+        self._trajectory.close_episode(self._trajectory_episode_end())
         if trades_persisted:
             await self._finalize_run(ts)
             await self._notify_stopped()
@@ -1935,6 +1976,7 @@ class AiTradeSession:
         self._attach_exit_wires(self._horizon.refresh(self._horizon_facts(time.time())))
         await self._expire_profit_cooldown()
         await self._maybe_session_exit(mark, now_ts)
+        self._trajectory.sync_fills("monitor")     # 轨迹 W7：本 tick 的成交在这之前全部产生
         # §3.1：网络 IO 只跑在盯市 tick 上；三条刷新（资金费率 / 官方费率 / 交易所对账）离开
         # tick 的关键路径跑在后台单飞任务里——串行 await 会把 5s 盯市周期翻倍（I-1）。
         # 轴 A/F：把结算覆盖计数与本金抄给成本层（同步、零 IO），**必须在排后台对账之前**——
@@ -2225,6 +2267,10 @@ class AiTradeSession:
             # 计数随事件一起下发：前端据它做一次乐观更新，下一条 `status` 再用权威值覆盖
             # ——事件与计数**同一个数**，不给前端第二个自增点。
             "roundsSkipped": self.rounds_skipped}})
+        self._trajectory.skip_round(round_no, ts, {    # 轨迹 W6：与上面那条事件同一组键、同一个数
+            "reason": "horizon_locked",
+            "minHoldRemainingSeconds": snapshot.get("minHoldRemainingSeconds"),
+            "wakeKind": wake.get("kind")})
         return True
 
     async def _run_decision_round(self, board: list[StrategySignalView], i: int,
@@ -2242,6 +2288,8 @@ class AiTradeSession:
         self.executor.last_open_receipt = None
         round_receipt = None
         final_reason = "pre_submit_error"
+        # 轨迹 W2：放在 try 之前 ⇒ 本轮每一次 LLM 调用（重试 / 追问 / 反思 / 摘要）都登记得到。
+        self._trajectory.begin_round(round_no, ts, wake)
         try:
             # ★ C-2（loss-and-liveness-hardening §4.3）：结构上不可能产生任何合法动作的轮次
             # 直接跳过，**连 payload 都不建**（省一次完整的 LLM 调用与一次 prompt 装配）。
@@ -2424,6 +2472,14 @@ class AiTradeSession:
                                        degrade=llm_degrade)
             await self._emit_result_trace(round_no, ts, executed, degrade)
             reflection_verdict, reflection_reason = self._round_reflection_summary()
+            # 轨迹 W3a（RV4）：成交已经发生，断面必须先于下面这串 await 暂存——暂停 / 停止在这段
+            # 窗口里 cancel 本轮时，一笔真实成交绝不失去它的观测与动作。同步、零序列化。
+            self._trajectory.stage_round(RoundCapture(
+                round_no=round_no, ts=ts, wake=wake, payload=payload,
+                stage1_decision=stage1_decision, decision=decision, executed=executed,
+                llm_degrade=llm_degrade, gate_degrade=gate_degrade, degrade=degrade,
+                reflection_verdict=reflection_verdict, reflection_reason=reflection_reason,
+                reasoning=self.decider.last_reasoning, elapsed_ms=self._reasoning_elapsed_ms))
             await self._emit_decision(round_no, ts, decision, board, executed,
                                       market_context=payload.get("marketContext"),
                                       consensus=payload.get("consensus"),
@@ -2449,15 +2505,18 @@ class AiTradeSession:
             await maybe_emit_summary_failed(self._push, self._round_trace,        # D-6
                                             self.decider.summary_health_wire(), round_no, ts)
             await self._post_round(ref_px, ts)
+            self._trajectory.end_round(summary_installed=summary is not None)   # 轨迹 W3b
         except asyncio.CancelledError:
             final_reason = "canceled_before_send"
             raise
         except Exception as exc:  # noqa: BLE001 —— 决策轮异常不崩会话：记 error 事件，等下一根
             logger.warning("ai-trade decision round failed: %s", exc)
+            self._trajectory.fail_round(round_no, ts, exc)       # 轨迹 W4（同步、绝不抛）
             await self._emit_error_trace(round_no, ts, "本轮决策异常，已跳过")
             await self._push({"type": "error", "data": {
                 "ts": ts, "code": "AI_TRADE_ROUND_FAILED", "message": "本轮决策异常，已跳过"}})
         finally:
+            self._trajectory.release_round(round_no)   # 轨迹 W5：只处理仍未关闭的作用域
             self._deciding = False
             self._discipline.funnel.end_round(
                 round_receipt or self._open_receipt(), final_reason)

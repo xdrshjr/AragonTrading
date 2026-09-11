@@ -975,6 +975,23 @@ class AiTradeDisciplineRowOut(BaseModel):
     tone: str | None = None           # ok | warn | danger（呈现层用；缺省 ⇒ 按 armed 取色）
 
 
+class AiTradeTrajectoryIn(BaseModel):
+    """会话级后训练轨迹采集约定（ai-trade-trajectory-capture §2.10.1）。
+
+    **整键缺省 ⇒ 不采集**（与 `intel` 同向）。`directory=None` ⇒ 用服务端默认根目录（默认值随部署
+    变，前端不复制）。解析点 `trajectory.rules.resolve_trajectory_rule`；目录可用性由端点校验。
+    """
+
+    enabled: bool = False
+    directory: str | None = Field(default=None, max_length=1024)
+
+
+class AiTradeTrajectoryValidateIn(BaseModel):
+    """`POST /ai-trade/trajectory/validate` 的请求体（`directory=None` ⇒ 校验默认根目录）。"""
+
+    directory: str | None = Field(default=None, max_length=1024)
+
+
 class AiTradeGroupStartIn(BaseModel):
     """启动 AI 自动交易分组请求（金额/杠杆字段可留空→服务端保守默认，§4.1）。
 
@@ -1041,6 +1058,12 @@ class AiTradeGroupStartIn(BaseModel):
     # ⚠️ **仅实盘 tab 下发**：情报层不进回测车道（`ai_auto/backtest.py` 全文 0 次 intel），
     # 回测启动体不接该字段（与 `reasoningDepth` 同款处置）。
     intel: AiTradeIntelIn | None = None
+    # 后训练轨迹采集（ai-trade-trajectory-capture §2.10）：**整键缺省 ⇒ 不采集**（与 `intel` 同向，
+    # 与上面「缺省即开启」的七个字段方向相反）。解析点 `_resolve_trajectory`；目录可用性由端点
+    # `_require_trajectory_directory` 校验——**绝不在 `build_start_request` 里校验**（冷续跑重跑该链，
+    # 任何 HTTPException 都会把续跑翻成 409，见 `_require_profit_exit_with_horizon` 的成文理由）。
+    # ⚠️ 仅实盘 tab 下发；回测启动体不接该字段（§1.3 N1）。
+    trajectoryCapture: AiTradeTrajectoryIn | None = None
 
     @field_validator("members")
     @classmethod

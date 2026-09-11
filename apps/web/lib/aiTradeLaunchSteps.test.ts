@@ -108,9 +108,26 @@ describe("U-2 校验归属表：全覆盖 + 无重叠", () => {
     expect(stepError(liveInst, "scope")).toBeNull();
   });
 
-  it("`cognition` 永不产生阻断错误（设计结论，不是遗漏）", () => {
-    const owners = Object.values(STEP_ERROR_OWNERS).map((o) => o.step);
-    expect(owners).not.toContain("cognition");
+  it("`cognition` 恰好只拥有 `trajectoryDirError`：它在 READY_INPUTS、不在 BANNER_INPUTS", () => {
+    // trajectory-capture F-4：此前的设计结论是「cognition 永不产生阻断错误」。本轮它多了**唯一**
+    // 一种：勾选了数据采集、而目录被服务端判定不可用。与 `directionError` 同形——只进 `ready`、
+    // 就地渲染在卡片里、不进横幅（`firstError` 的表达式因此逐字节不改）。
+    const owned = AI_TRADE_LAUNCH_ERROR_KEYS.filter(
+      (key) => STEP_ERROR_OWNERS[key].step === "cognition",
+    );
+    expect(owned).toEqual(["trajectoryDirError"]);
+    expect(STEP_ERROR_OWNERS.trajectoryDirError.modes).toEqual(["live"]);
+    expect(READY_INPUTS).toContain("trajectoryDirError");
+    expect(BANNER_INPUTS).not.toContain("trajectoryDirError");
+  });
+
+  it("`trajectoryDirError` 只在实盘挡第 4 步；回测段同一个值不挡（回测车道不采集）", () => {
+    const errors = { trajectoryDirError: "目录不可写：拒绝访问（13）" };
+    expect(stepError({ mode: "live", errors }, "cognition")).toBe("目录不可写：拒绝访问（13）");
+    expect(firstErroredStep({ mode: "live", errors })?.id).toBe("cognition");
+    expect(inputStepsClean({ mode: "live", errors })).toBe(false);
+    expect(stepError({ mode: "backtest", errors }, "cognition")).toBeNull();
+    expect(inputStepsClean({ mode: "backtest", errors })).toBe(true);
   });
 
   it("`inputStepsClean` 只看第 1–5 步，`review` 步的错误不影响它（N-10 的判据）", () => {
@@ -169,5 +186,15 @@ describe("U-7 步骤摘要", () => {
   it("`review` 步摘要如实报风险条数（0 条时说「无风险提示」而不是空串）", () => {
     expect(stepSummary(SUMMARY, "review")).toContain("2 条");
     expect(stepSummary({ ...SUMMARY, riskCount: 0 }, "review")).toBe("无风险提示");
+  });
+
+  it("`trajectoryEnabled` 缺省 / false ⇒ cognition 摘要与改前逐字相等；true ⇒ 以「· 采集开」结尾", () => {
+    // trajectory-capture F-4：可选字段 ⇒ 既有调用点（含本文件的 SUMMARY 常量）不改一个字就过 tsc，
+    // 而未勾选时轨上的摘要一个字节都不能多（W-7 等既有用例按 title 子串断言）。
+    const before = "标准 · 经验开 · 情报关";
+    expect(stepSummary(SUMMARY, "cognition")).toBe(before);
+    expect(stepSummary({ ...SUMMARY, trajectoryEnabled: false }, "cognition")).toBe(before);
+    expect(stepSummary({ ...SUMMARY, trajectoryEnabled: true }, "cognition"))
+      .toBe(`${before} · 采集开`);
   });
 });

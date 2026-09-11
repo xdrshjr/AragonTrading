@@ -29,6 +29,8 @@ import type {
 } from "@/lib/aiTradeTypes";
 import { AI_TRADE_INTEL_RULE_DEFAULT } from "@/lib/aiTradeTypes";
 import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
+import { AI_TRADE_TRAJECTORY_RULE_DEFAULT } from "@/lib/trajectoryTypes";
+import type { AiTradeTrajectoryRule } from "@/lib/trajectoryTypes";
 import type { AiTradeLaunchStepId } from "@/lib/aiTradeLaunchSteps";
 import type { AiTradeLaunchMode } from "@/lib/aiTradeLaunchSteps";
 import type { AiTradeLaunchModalProps } from "../AiTradeLaunchModal";
@@ -58,6 +60,7 @@ export function useAiTradeLaunchState(props: AiTradeLaunchModalProps) {
     defaultReasoningDepth, defaultBaseRule, defaultProfitGuard, defaultTradingHorizon,
     defaultExperience, defaultIntel, defaultStopLossPct, defaultTakeProfitPct,
     defaultStartTs, defaultEndTs, defaultDecisionEveryBars,
+    defaultTrajectoryCapture,
   } = props;
   const liveAvailable = liveGateReason == null;
   const [mode, setMode] = useState<AiTradeLaunchMode>(liveAvailable ? "live" : "backtest");
@@ -77,6 +80,13 @@ export function useAiTradeLaunchState(props: AiTradeLaunchModalProps) {
     defaultExperience ?? AI_TRADE_EXPERIENCE_DEFAULTS,
   );
   const [intel, setIntel] = useState<AiTradeIntelRule>(defaultIntel ?? AI_TRADE_INTEL_RULE_DEFAULT);
+  // 后训练数据采集（trajectory-capture §2.13.1）：规则值住在受控状态层，只经 `seed()` 复位。
+  const [trajectory, setTrajectory] = useState<AiTradeTrajectoryRule>(
+    defaultTrajectoryCapture ?? AI_TRADE_TRAJECTORY_RULE_DEFAULT,
+  );
+  // 第 6 步 422 出路「本次不采集数据」是**一次性**的：只让这一次启动不带采集，不改 `trajectory`
+  // ——后者会被当成用户的选择记住，正在积累的数据集就从下一次启动起静默断档（§5.4）。
+  const [trajectorySkipOnce, setTrajectorySkipOnce] = useState(false);
   const [selectedIds, setSelectedIds] = useState<number[]>(defaultStrategyIds);
   const [capitalRaw, setCapitalRaw] = useState("");
   const [leverageRaw, setLeverageRaw] = useState("");
@@ -188,6 +198,8 @@ export function useAiTradeLaunchState(props: AiTradeLaunchModalProps) {
     setAddSymbolRaw("");
     setAddError(null);
     setSelectedIds(defaultStrategyIds);
+    setTrajectory(defaultTrajectoryCapture ?? AI_TRADE_TRAJECTORY_RULE_DEFAULT);
+    setTrajectorySkipOnce(false);
     setRoundsRaw(String(defaultContextRounds || AI_TRADE_DEFAULT_CONTEXT_ROUNDS));
     setPositionStep(defaultPositionStepPct || AI_TRADE_DEFAULT_POSITION_STEP);
     setWakeIntervalRaw(String(defaultWakeIntervalMinutes ?? AI_TRADE_DEFAULT_WAKE_INTERVAL_MIN));
@@ -277,6 +289,7 @@ export function useAiTradeLaunchState(props: AiTradeLaunchModalProps) {
     setHorizonEnabled, horizonProfileRaw, setHorizonProfileRaw, horizonCustom,
     setHorizonCustom, repairMode, setRepairMode, startInput, setStartInput, endInput,
     setEndInput, everyRaw, setEveryRaw, minConsensusRaw, setMinConsensusRaw, liveAvailable,
+    trajectory, setTrajectory, trajectorySkipOnce, setTrajectorySkipOnce,
     seededMembers, seed,
   };
 }

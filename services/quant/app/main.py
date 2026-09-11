@@ -25,6 +25,7 @@ from .api import (
     ai_auto,
     ai_intel,
     ai_trade_lifecycle,
+    ai_trade_trajectory,
     app_settings,
     discovery,
     discovery_assets,
@@ -488,6 +489,7 @@ app.include_router(factors.router, prefix="/api")   # 第 9 个路由（因子�
 app.include_router(live_auto.router, prefix="/api")  # 第 10 个路由（实时自动交易，live-auto-trading §4）
 app.include_router(ai_auto.router, prefix="/api")   # AI 自动交易（ai-auto-trading §4；含 WS /ws/ai-trade/{sid}）
 app.include_router(ai_trade_lifecycle.router, prefix="/api")  # AI 自动交易生命周期（暂停/继续/结束，ai-trade-pause-resume §五）
+app.include_router(ai_trade_trajectory.router, prefix="/api")  # AI 自动交易后训练轨迹采集（ai-trade-trajectory-capture §4.1）
 app.include_router(app_settings.router, prefix="/api")  # 第 11 个路由（设置中心 · 自动交易设置 §4.1）
 app.include_router(experience.router, prefix="/api")  # 交易经验库（ai-trade-experience-context-graph §五）
 app.include_router(ai_intel.router, prefix="/api")  # 标的市场情报库（ai-trade-market-intel §4.1）

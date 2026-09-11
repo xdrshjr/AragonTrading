@@ -1476,3 +1476,60 @@ describe("groupStateFromStatus 的逐键手抄映射（风险 R-8 的第四条�
     expect(state.members["BTC-USDT-SWAP"].session?.lifecycle).toEqual(wire);
   });
 });
+
+// ============ 后训练轨迹采集（ai-trade-trajectory-capture §2.14.3 / F-6）============
+
+describe("trajectoryCapture 回执进入前端状态的两条通路（逐键手抄缺陷的第七处登记）", () => {
+  // 两处漏任何一处都不会让 tsc 或既有用例变红：键在类型上是可选的，既有夹具里也根本没有它。
+  // 所以两条通路各一条**独立**用例——只写一条，另一条通路漏抄时照样全绿。
+  // 夹具刻意取「打开失败」那一格（【v2 · RV2】）：它是状态条最需要看见、也最容易被当成
+  // 「没开」丢掉的那一种。
+  const receipt = {
+    enabled: false,
+    requested: true,
+    source: "request",
+    state: "failed",
+    root: "D:\\data",
+    directory: null,
+    isDefaultRoot: false,
+    counters: {
+      records: 12, llmCalls: 4, rounds: 1, bytesWritten: 2048, segments: 1, dropped: 0,
+      writeErrors: 5, serializeErrors: 0, redactions: 0, lateCalls: 0, manifestWriteErrors: 0,
+    },
+    pendingBytes: 0,
+    freeBytes: null,
+    lastError: { code: "WRITER_CRASHED", message: "写线程异常退出", ts: 1_755_500_000 },
+    schemaVersion: 1,
+  } satisfies NonNullable<AiTradeGroupRow["trajectoryCapture"]>;
+
+  it("groupStateFromStatus（刷新页面后重发现那条路）原样抄过来；老后端不下发 ⇒ null", () => {
+    expect(groupStateFromStatus(statusRow({ trajectoryCapture: receipt })).trajectoryCapture)
+      .toEqual(receipt);
+    expect(groupStateFromStatus(statusRow()).trajectoryCapture).toBeNull();
+  });
+
+  it("buildLifecyclePatch（15 秒对账的同组窄 patch）原样抄过来；老后端不下发 ⇒ null", () => {
+    const patches: { group: Record<string, unknown> }[] = [];
+    const noop = () => {};
+    const setters = {
+      getGroup: () => localGroup(),
+      groupStateFromStatus,
+      setAiTradeGroup: noop,
+      setAiTradeResumable: noop,
+      patchAiTradeGroupLifecycle: (p: { group: Record<string, unknown> }) => patches.push(p),
+      clearAiTradeRuntime: noop,
+      setAiTradeSyncState: noop,
+      setAiTradeEnabled: noop,
+      noteAiTradeNotice: noop,
+    } as unknown as Parameters<typeof reconcileAiTradeLifecycle>[1];
+    const status = (group: AiTradeGroupRow) =>
+      ({ group, aiTradeEnabled: true, resumable: null }) as never;
+
+    reconcileAiTradeLifecycle(status(statusRow({ trajectoryCapture: receipt })), setters);
+    reconcileAiTradeLifecycle(status(statusRow()), setters);
+
+    expect(patches).toHaveLength(2);   // 同 groupId ⇒ 走的确实是窄 patch，而不是换组
+    expect(patches[0].group.trajectoryCapture).toEqual(receipt);
+    expect(patches[1].group.trajectoryCapture).toBeNull();
+  });
+});

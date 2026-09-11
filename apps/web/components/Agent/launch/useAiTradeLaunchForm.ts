@@ -110,6 +110,7 @@ import { TRADABILITY_CONFIRM_REQUIRED_TEXT } from "../AiTradeTradabilityFields";
 // 反向再来一条就成环了；类型侧的「环」不存在，故对外类型仍住在壳文件里（对外接口零破坏）。
 import type { AiTradeLaunchModalProps, AiTradeLaunchOpts } from "../AiTradeLaunchModal";
 import { useAiTradeLaunchState } from "./useAiTradeLaunchState";
+import { useTrajectoryCapture } from "./useTrajectoryCapture";
 import type { AiTradeLaunchMode } from "@/lib/aiTradeLaunchSteps";
 
 /**
@@ -217,7 +218,8 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
     setHorizonEnabled, horizonProfileRaw, setHorizonProfileRaw, horizonCustom,
     setHorizonCustom, repairMode, setRepairMode, startInput, setStartInput, endInput,
     setEndInput, everyRaw, setEveryRaw, minConsensusRaw, setMinConsensusRaw, liveAvailable,
-    seededMembers,
+    seededMembers, trajectory, setTrajectory,
+    trajectorySkipOnce, setTrajectorySkipOnce,
   } = state;
   const truncated = defaultMembers.length > AI_TRADE_MAX_SYMBOLS;
   const atCap = members.length >= AI_TRADE_MAX_SYMBOLS;
@@ -250,6 +252,10 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
     queryKey: ["aiTrade", "disciplinePresets"],
     queryFn: aiTradeDisciplineApi.presets,
     enabled: open,
+  });
+  // 后训练采集：取数 / 有效值谓词 / 提交体全在 hook 里（RV1），本文件只接线。
+  const trajectoryCapture = useTrajectoryCapture({
+    open, mode, rule: trajectory, skipOnce: trajectorySkipOnce,
   });
 
   const capital = parseOptionalUsd(capitalRaw);
@@ -550,6 +556,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
   const ready =
     mode === "live"
       ? baseValid && !membersError && !wakeError && acknowledged
+        && !trajectoryCapture.error
       : baseValid &&
         instSupported &&
         !!instId &&
@@ -634,6 +641,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
     unguardedBlocked: unguardedBlocked ? UNGUARDED_CONFIRM_REQUIRED_TEXT : null,
     acknowledged: acknowledged ? null : "请先勾选「我已知晓这是真实资金 AI 自动交易」",
     serverError: error ?? null,
+    trajectoryDirError: trajectoryCapture.error,
   };
   const stepModel = { mode, errors };
   const inputStepsClean = computeInputStepsClean(stepModel);
@@ -664,6 +672,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
     baseRuleEnabled,
     profitGuardEnabled,
     riskCount: risks.length,
+    trajectoryEnabled: trajectoryCapture.effectiveEnabled,
   };
 
   const visibleSteps = useMemo(() => stepsFor(mode), [mode]);
@@ -709,6 +718,8 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
         wakeIntervalMinutes: wakeMinutes ?? 0,
         profitGuard: profitGuardPayload,
         reasoningDepth,
+        trajectoryCapture: trajectoryCapture.requestRule,
+        trajectoryPreference: trajectory,
       });
       return;
     }
@@ -752,6 +763,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
     positionStep, setPositionStep, gearNote,
     // Agent 认知
     reasoningDepth, setReasoningDepth, experience, setExperience, intel, setIntel,
+    trajectory, setTrajectory, setTrajectorySkipOnce, trajectoryCapture,
     // 纪律与护栏
     disciplinePreset, setDisciplinePreset, inertThresholdKeys, hardTakeProfitText,
     baseRuleEnabled, setBaseRuleEnabled, baseRulePeriodRaw, setBaseRulePeriodRaw,

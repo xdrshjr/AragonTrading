@@ -12,11 +12,18 @@ import { RESUME_MS } from "@/lib/httpTimeout";
 import type { AiTradeGroupRow, AiTradeGroupState } from "@/lib/aiTradeTypes";
 import { useAppStore } from "@/lib/store";
 import { tradingApi } from "@/lib/tradingApi";
+import { trajectoryApi } from "@/lib/trajectoryApi";
+import type { AiTradeTrajectoryReceipt } from "@/lib/trajectoryTypes";
 import {
   AI_TRADE_LAUNCH_STEP_TITLE,
   type AiTradeLaunchStepId,
 } from "@/lib/aiTradeLaunchSteps";
 import AiTradeToggle from "./AiTradeToggle";
+
+// 后训练轨迹采集（trajectory-capture F-7）的两个只读端点。默认夹具在文件末尾的顶层 `beforeEach`。
+vi.mock("@/lib/trajectoryApi", () => ({
+  trajectoryApi: { config: vi.fn(), validate: vi.fn() },
+}));
 
 /**
  * ai-trade-guided-launch 附录 A 的两个迁移 helper（与 `AiTradeLaunchModal.test.tsx` 里那一份同款）。
@@ -887,3 +894,172 @@ function statusRowLike(): Record<string, unknown> {
     }],
   };
 }
+
+// ============ 后训练轨迹采集（ai-trade-trajectory-capture §6.2 F-7）============
+
+const TRAJECTORY_CONFIG = {
+  enabled: true,
+  defaultRoot: "C:\\Users\\me\\AppData\\Roaming\\aragon-desktop\\datasets\\ai-trade",
+  minFreeBytes: 1_073_741_824,
+  segmentMaxBytes: 67_108_864,
+  compressSegments: true,
+  schemaVersion: 1,
+  backtestSupported: false,
+  thinkingCapturedProviders: ["anthropic"],
+};
+
+// 顶层钩子（按注册顺序排在文件开头那个 `vi.clearAllMocks()` 之后执行，对全部用例生效）：
+// `clearAllMocks` 不清实现，某条用例改过的返回值否则会漏进下一条。
+beforeEach(() => {
+  vi.mocked(trajectoryApi.config).mockResolvedValue(TRAJECTORY_CONFIG);
+  vi.mocked(trajectoryApi.validate).mockImplementation(async (directory) => ({
+    ok: true,
+    code: null,
+    message: null,
+    directory: directory ?? TRAJECTORY_CONFIG.defaultRoot,
+    isDefault: directory == null,
+    exists: true,
+    freeBytes: 137_870_000_000,
+    minFreeBytes: 1_073_741_824,
+  }));
+});
+
+function trajectoryReceipt(
+  over: Partial<AiTradeTrajectoryReceipt> = {},
+): AiTradeTrajectoryReceipt {
+  return {
+    enabled: true,
+    requested: true,
+    source: "request",
+    state: "recording",
+    root: "D:\\data",
+    directory: "D:\\data\\20260910-aitradegrp_1",
+    isDefaultRoot: false,
+    counters: {
+      records: 12, llmCalls: 4, rounds: 1, bytesWritten: 2048, segments: 1, dropped: 0,
+      writeErrors: 0, serializeErrors: 0, redactions: 0, lateCalls: 0, manifestWriteErrors: 0,
+    },
+    pendingBytes: 0,
+    freeBytes: null,
+    lastError: null,
+    schemaVersion: 1,
+    ...over,
+  };
+}
+
+const TRAJECTORY_START_ROW: AiTradeGroupRow = {
+  groupId: "grp-1", bar: "1H", strategyIds: [1], strategyNames: ["均线策略"],
+  totalBudgetUsd: 100, leverage: 3, contextRefreshRounds: 10, createdTs: 0,
+  members: [], wakeIntervalMinutes: 2,
+};
+
+/** 打开启动弹窗（已勾知情、有一个可选策略），停在第 1 步。 */
+async function openLaunchModal() {
+  vi.mocked(api.strategies).mockResolvedValue([{ id: 1, name: "均线策略" }] as never);
+  vi.mocked(aiTradeApi.start).mockResolvedValue(TRAJECTORY_START_ROW);
+  useAppStore.setState({ aiTradeAcknowledged: true });
+  renderToggle();
+  await screen.findByTitle("开启 AI 自动交易 / 回测");
+  fireEvent.click(screen.getByRole("switch"));
+  await screen.findByText("均线策略");
+}
+
+/** 等 `startM.onSuccess` 真的跑完（`wakeIntervalMinutes` 只在那里被写进偏好）。 */
+async function waitForPersistedConfig() {
+  await waitFor(() =>
+    expect(useAppStore.getState().aiTradeConfig?.wakeIntervalMinutes).toBe(2),
+  );
+  return useAppStore.getState().aiTradeConfig;
+}
+
+describe("AiTradeToggle · 后训练轨迹采集（trajectory-capture F-7）", () => {
+  it("有效开启 ⇒ 启动体带 trajectoryCapture；偏好记住的是 opts.trajectoryPreference", async () => {
+    const preference = { enabled: true, directory: "D:\\datasets" };
+    useAppStore.setState({
+      aiTradeConfig: { strategyIds: [1], contextRefreshRounds: 10, trajectoryCapture: preference },
+    });
+    await openLaunchModal();
+    await gotoStep("cognition");
+    await waitFor(() =>
+      expect(screen.getByRole("checkbox", { name: /采集后训练数据/ })).toBeChecked(),
+    );
+    await submitLaunch();
+    await waitFor(() => expect(aiTradeApi.start).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(aiTradeApi.start).mock.calls[0][0].trajectoryCapture).toEqual(preference);
+    expect((await waitForPersistedConfig())?.trajectoryCapture).toEqual(preference);
+  });
+
+  it("【RV3】默认没勾 ⇒ 启动体里**没有**这个键（不是一个 undefined 值）；偏好记住原始的「关」", async () => {
+    await openLaunchModal();
+    await submitLaunch();
+    await waitFor(() => expect(aiTradeApi.start).toHaveBeenCalledTimes(1));
+    const body = vi.mocked(aiTradeApi.start).mock.calls[0][0];
+    expect(Object.prototype.hasOwnProperty.call(body, "trajectoryCapture")).toBe(false);
+    expect(JSON.stringify(body)).not.toContain("trajectory");
+    expect((await waitForPersistedConfig())?.trajectoryCapture).toEqual({
+      enabled: false,
+      directory: null,
+    });
+  });
+
+  it("【RV3】偏好是开、但配置接口读不到 ⇒ 启动体不带该键，偏好**不被抹掉**", async () => {
+    vi.mocked(trajectoryApi.config).mockRejectedValue(new ApiRequestError("404", "Not Found", 404));
+    const preference = { enabled: true, directory: "D:\\datasets" };
+    useAppStore.setState({
+      aiTradeConfig: { strategyIds: [1], contextRefreshRounds: 10, trajectoryCapture: preference },
+    });
+    await openLaunchModal();
+    await gotoStep("cognition");
+    await waitFor(() =>
+      expect(screen.getByTestId("ai-trade-trajectory-lock-reason")).toHaveTextContent(
+        "无法读取采集配置",
+      ),
+    );
+    await submitLaunch();
+    await waitFor(() => expect(aiTradeApi.start).toHaveBeenCalledTimes(1));
+    const body = vi.mocked(aiTradeApi.start).mock.calls[0][0];
+    expect(Object.prototype.hasOwnProperty.call(body, "trajectoryCapture")).toBe(false);
+    expect((await waitForPersistedConfig())?.trajectoryCapture).toEqual(preference);
+  });
+
+  it("【RV2】运行中且回执 requested ⇒ 渲染状态条；打开失败（enabled=false、failed）照样说出原因", async () => {
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup(),
+        trajectoryCapture: trajectoryReceipt({
+          enabled: false,
+          state: "failed",
+          directory: null,
+          lastError: { code: "OPEN_FAILED", message: "无法创建分组目录：拒绝访问", ts: 1 },
+        }),
+      },
+    });
+    renderToggle();
+    const bar = await screen.findByTestId("ai-trade-trajectory-status");
+    expect(bar).toHaveAttribute("data-tone", "danger");
+    expect(bar).toHaveTextContent("数据采集已停止：无法创建分组目录：拒绝访问");
+  });
+
+  it("暂停中 ⇒ 状态条改口「待命」；回执 requested=false（没请求 / 运维关）⇒ 不渲染", async () => {
+    useAppStore.setState({
+      aiTradeGroup: { ...makeGroup(), state: "paused", trajectoryCapture: trajectoryReceipt() },
+    });
+    const view = renderToggle();
+    expect(await screen.findByTestId("ai-trade-trajectory-status")).toHaveTextContent(
+      "数据采集待命（交易已暂停）· 12 条",
+    );
+    view.unmount();
+
+    useAppStore.setState({
+      aiTradeGroup: {
+        ...makeGroup(),
+        trajectoryCapture: trajectoryReceipt({
+          requested: false, enabled: false, state: "off", source: "ops_off",
+        }),
+      },
+    });
+    renderToggle();
+    await screen.findByRole("button", { name: "暂停 AI 自动交易" });
+    expect(screen.queryByTestId("ai-trade-trajectory-status")).toBeNull();
+  });
+});

@@ -97,6 +97,10 @@ export function groupStateFromStatus(row: AiTradeGroupRow): AiTradeGroupState {
     // 那一行披露就在这个键上）。`?? null` 要求后端恒下发，才能把「本轮没数据」与「老后端」
     // 区分开。
     intel: row.intel ?? null,
+    // 后训练轨迹采集回执（trajectory-capture §2.14.3）：**第七条同款注释**——本函数是逐键手抄的
+    // 映射，漏抄的表现永远是同一个形状：刷新页面后重发现拿不到，且不报任何错。而「打开失败」
+    // 那一格（`requested=true, enabled=false`）只有被抄进来，开关行下的状态条才看得见它。
+    trajectoryCapture: row.trajectoryCapture ?? null,
     startedTs: row.createdTs,
     members,
   };
