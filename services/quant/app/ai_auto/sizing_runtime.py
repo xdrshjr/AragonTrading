@@ -5,8 +5,7 @@
 800 行红线，只允许新增薄封装）。**本类不持有 `session` 引用**——需要 executor 断面时由调用方把
 `executor` 当形参传进来（与 `profit_guard_runtime.build_position_facts` 的既有先例同款）。
 
-模块内还承载 `executor.risk` 的**唯一写点**（§3.4 的落地缝）：本轮 ATR 止损距离在 `_do_open` 现算随单
-OCO 触发价**之前**被写进 `executor.risk`，故 `live_auto/executor.py` 净增 0 行。
+模块内承载 ATR 风控覆盖与提交保护装配；订单占用随执行器身份和状态读取。
 """
 from __future__ import annotations
 
@@ -25,7 +24,7 @@ from .drawdown_brake import (
     parse_brake_rule,
     unrealized_share,
 )
-from .exposure_book import GroupExposureBook, exposure_wire
+from .exposure_book import GroupExposureBook, OrderRiskGuard, exposure_wire
 from .sizing import (
     SizingFloorPolicy,
     SizingInputs,
@@ -41,6 +40,7 @@ from .sizing import (
     realized_vol_bar,
     resolve_size_fraction,
     resolve_stop_distance,
+    risk_fraction_candidates,
     sizing_wire,
     window_need,
 )
@@ -194,8 +194,7 @@ class SizingRuntime:
                  budget_usd: float = 0.0,
                  floor_policy: SizingFloorPolicy | None = None) -> None:
         self.rule = rule
-        # 轴 C-1：**默认 None ⇒ 两条地板判据整体不存在 ⇒ 逐字回退**（回测与全部既有单测走的就是
-        # 它）。实盘由 `manager` 在构造期用 `parse_floor_policy(settings)` 解析一次后传入。
+        # 保留旧地板阈值，硬风险上限不依赖阈值是否启用。
         self.floor_policy = floor_policy
         self.stop_rule = stop_rule
         self.brake_rule = brake_rule
@@ -208,6 +207,7 @@ class SizingRuntime:
         self._vol: float | None = None           # 最近一次 `note_candles` 算出的每根已实现波动率
         self._vol_source = "insufficient_samples"
         self._last_wire: dict = {}               # 最近一次求解的读数（供 payload 段与前端回放）
+        self.order_risk_limit: tuple[float, float] | None = None
 
     @property
     def armed(self) -> bool:
@@ -218,6 +218,12 @@ class SizingRuntime:
     def window_need(self) -> int:
         """本层需要的收盘价根数；未装配 ⇒ 0。式子的唯一真源在 `sizing.window_need`（复制即漂移）。"""
         return window_need(self.rule)
+
+    def bind_executor(self, executor, *, step: float) -> None:
+        """建组时绑定，恢复中的其他成员也立即占用组合风险。"""
+        if self.rule is not None:
+            executor.open_risk_guard = OrderRiskGuard(
+                executor, self.book, self.rule, step)
 
     # ---------- 门控（第 7 步：回撤刹车 / 连亏熔断）----------
     def gate(self, decision, degrade: str | None, *, now_wall: float | None = None) -> tuple:
@@ -275,19 +281,24 @@ class SizingRuntime:
         view = (evaluate_brake(self.state, self.brake_rule, now_wall=ctx.now_wall or time.time())
                 if self.brake_rule is not None else None)
         outcome, exposure, corr = self._solve(decision, ctx, plan, view, executor)
+        if self.rule is not None and decision.action in _GATED_ACTIONS:
+            full = ctx.notional_full
+            if full is None and executor is not None:
+                full = executor.budget_usd * executor.leverage
+            self.order_risk_limit = (
+                ((outcome.fraction or 0.0) * full, ctx.step)
+                if full is not None else None)
+        guard = getattr(executor, "open_risk_guard", None)
+        if guard is not None and decision.action in _GATED_ACTIONS:
+            guard.step = ctx.step
+            guard.set_limit(outcome.fraction or 0.0,
+                            executor.budget_usd * executor.leverage)
         wire = sizing_wire(outcome, plan, stop_source, brake_wire(view),
                            exposure_wire(exposure, corr_scale=corr))
         wire["realizedVolAnnual"] = self._vol_annual()
         self._last_wire = wire
         if outcome.floor_verdict != "none":
-            # ★ 评审 RV-P1-4 / 放行条件 C-7：**必须在这里就把决策改成 hold**。只把 `size_fraction`
-            # 置 0 是不够的——`apply_size_fraction` 刻意「只改 size_fraction、action 一字不动」，
-            # 于是这个 `open_*` 决策会继续往下走，撞进 `executor._do_open` 的 `sz <= 0` 分支，
-            # 后果有两个都不能接受：①同一件事被记两次（`openFunnel.sizing_zeroed` 与
-            # `executor.dust_skips` 各 +1）；②产品对用户说了一句假话——那条分支推的 status 是
-            # 「预算 / 杠杆过小，单笔不足最小下单量」，而纪律自检的 `volSizing` 行会据 `dust_skips`
-            # 写「提高总预算或该标的百分比可消除」。**风控解出零跟预算大小毫无关系**，照那条提示去
-            # 加预算只会让下一次开得更大。
+            # 零强度开仓会被执行器默认成满仓；必须在映射 Signal 前转为 hold。
             self._tally_floor(outcome.floor_verdict)
             return _to_hold(decision, outcome.floor_verdict), plan, wire
         return apply_size_fraction(decision, outcome), plan, wire
@@ -348,11 +359,31 @@ class SizingRuntime:
             corr_scale=1.0, step=ctx.step)
         pre = resolve_size_fraction(base, self.rule, self.bar_seconds, self.floor_policy)
         exposure, corr = self._correlation(decision.action, pre, ctx, executor)
-        outcome = (pre if corr >= 1.0 - _EPS
+        outcome = (pre if corr >= 1.0
                    else resolve_size_fraction(replace(base, corr_scale=corr), self.rule,
                                               self.bar_seconds, self.floor_policy))
+        outcome = self._check_exposure(decision, outcome, ctx, executor)
         self._tally(outcome, base, exposure, corr)
         return outcome, exposure, corr
+
+    def _check_exposure(self, decision, outcome, ctx, executor):
+        """取档可能削弱对冲，逐档复核最终二次型后再产生信号。"""
+        if outcome.floor_verdict != "none" or self.book is None:
+            return outcome
+        full = ctx.notional_full
+        if full is None and executor is not None:
+            full = executor.budget_usd * executor.leverage
+        if full is None or self.rule.exposure_cap_mult <= 0:
+            return outcome
+        sign = 1 if decision.action == "open_long" else -1
+        fraction = next((value for value in risk_fraction_candidates(
+            outcome.fraction, ctx.step) if self.book.allows(
+                self.inst_id, sign * value * full,
+                self.rule.corr_min_samples)), 0.0)
+        verdict = "none" if fraction > 0 else "exposure_cap"
+        return replace(outcome, fraction=fraction, floor_verdict=verdict,
+                       wire={**outcome.wire, "finalFraction": fraction,
+                             "floorVerdict": verdict})
 
     def _bracket_bps(self, plan: StopPlan | None, ctx: SizingContext,
                      executor) -> tuple[float | None, float | None]:
@@ -435,6 +466,9 @@ class SizingRuntime:
         """
         if self.book is None:
             return
+        guard = getattr(executor, "open_risk_guard", None)
+        if guard is not None and mark_px:
+            guard.mark_px = mark_px
         side = getattr(executor, "projected", "flat")
         px = mark_px if mark_px else getattr(executor, "entry_price", 0.0)
         sign = 1.0 if side == "long" else -1.0 if side == "short" else 0.0

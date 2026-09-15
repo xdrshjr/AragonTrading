@@ -1,0 +1,2515 @@
+{
+  "说明": "只读本地历史记录；净额含估费，不等同交易所结算净额。",
+  "采集时间UTC": "2026-09-15T01:23:53.725402+00:00",
+  "数据库": "C:/Users/user/AppData/Roaming/aragon-desktop/aragon.db",
+  "数据库字节数": 291966976,
+  "摘要": {
+    "分组": "aitradegrp_8b8c35fddac547188a48a6822c3c36b5",
+    "成员数": 5,
+    "成交腿数": 16,
+    "完整往返数": 8,
+    "盈利往返数": 1,
+    "亏损往返数": 7,
+    "本地净损益USDT": -8.62887881,
+    "已计手续费USDT": 1.91153142,
+    "还原毛损益USDT": -6.71734739,
+    "开仓通路": {
+      "contrarian": 8
+    },
+    "费用来源": {
+      "estimated": 16
+    },
+    "仓位求解轮数": 223,
+    "缩减被完全抵消轮数": 177,
+    "零解被拦截轮数": 42
+  },
+  "会话": [
+    {
+      "runId": 1640,
+      "instId": "BTC-USDT-SWAP",
+      "bar": "30m",
+      "status": "paused",
+      "config": {
+        "budgetUsd": 100.0,
+        "leverage": 5.0,
+        "allocationMode": "max_ratio",
+        "allocationPct": 100.0,
+        "totalBudgetUsd": 100.0,
+        "positionStepPct": 0.5,
+        "costBasis": "net",
+        "accountingVersion": 2,
+        "costModelVersion": 2,
+        "profitGuard": null,
+        "discipline": {
+          "preset": "balanced",
+          "thresholds": {
+            "ai_trade_edge_gate_k_min": 1.5,
+            "ai_trade_min_consensus": 1,
+            "ai_trade_min_confidence": 0.5,
+            "ai_trade_sizing_enabled": true,
+            "ai_trade_vol_target_annual": 0.2,
+            "ai_trade_kelly_lambda": 0.25,
+            "ai_trade_realized_vol_window": 96,
+            "ai_trade_effective_exposure_cap_mult": 2.0,
+            "ai_trade_stop_atr_mult": 2.0,
+            "ai_trade_stop_rr": 2.0,
+            "ai_trade_brake_slow_dd_pct": 0.08,
+            "ai_trade_brake_slow_size_mult": 0.5,
+            "ai_trade_brake_halt_dd_pct": 0.15,
+            "ai_trade_brake_loss_streak": 4,
+            "ai_trade_brake_loss_cooldown_bars": 4.0,
+            "ai_trade_profit_guard_hard_tp_return_pct": 0.5,
+            "ai_trade_consensus_contrarian_enabled": true
+          },
+          "adjustments": [],
+          "inert": [
+            "ai_trade_profit_guard_hard_tp_return_pct"
+          ]
+        },
+        "sizing": {
+          "sizing": {
+            "volTargetAnnual": 0.2,
+            "volWindow": 96,
+            "kellyLambda": 0.25,
+            "exposureCapMult": 2.0,
+            "corrMinSamples": 96
+          },
+          "stop": {
+            "stopAtrMult": 2.0,
+            "stopRr": 2.0,
+            "costFloorMult": 2.0
+          },
+          "brake": {
+            "slowDdPct": 0.08,
+            "slowSizeMult": 0.5,
+            "haltDdPct": 0.15,
+            "lossStreak": 4,
+            "lossCooldownSeconds": 7200.0
+          }
+        },
+        "tradingHorizon": {
+          "enabled": true,
+          "profile": "intraday_swing",
+          "title": "日内波段",
+          "targetLabel": "4 – 12 小时",
+          "minHoldSeconds": 7200.0,
+          "exitConfirmRounds": 2,
+          "confirmWindowSeconds": 3600.0,
+          "turnoverHysteresisK": 1.5,
+          "targetHoldMinSeconds": 14400.0,
+          "targetHoldMaxSeconds": 43200.0,
+          "expectedHoldBars": 24,
+          "gateReverse": true,
+          "enforceMaxHold": false,
+          "reentryCooldownSeconds": 3600.0,
+          "reentryScope": "same_side",
+          "turnoverBudgetPerDay": 6.0,
+          "turnoverBudgetCapacity": 3.0,
+          "backstopRepair": "plan",
+          "exitIntentDecayRounds": 2,
+          "exitPendingMaxSeconds": 7200.0,
+          "exitPriority": {
+            "enabled": true,
+            "overrideRounds": 2,
+            "overrideMinHoldSeconds": 60.0,
+            "maxOverridesPerSession": 6,
+            "evidenceMinChars": 10
+          }
+        }
+      },
+      "stats": {
+        "sizing": {
+          "gatedRounds": 10,
+          "scaledRounds": 10,
+          "scaleRate": 1.0,
+          "avgScaleRatio": 0.8,
+          "quantizeErasedRounds": 10,
+          "brakeSlowRounds": 0,
+          "brakeHaltRounds": 0,
+          "lossStreakCooldowns": 0,
+          "maxDrawdownPct": 0.03595,
+          "haltUnrealizedShareAvg": null,
+          "atrStopRounds": 469,
+          "reversalSkips": 0,
+          "restingSkips": 1,
+          "corrScaledRounds": 10,
+          "exposureUnreachableRounds": 0,
+          "solvedZeroVetoes": 0,
+          "belowFloorVetoes": 0,
+          "restingKept": 0,
+          "restingRepriced": 0,
+          "restingCancelled": 1,
+          "restingExpired": 1
+        },
+        "edgeGate": {
+          "pass": 11,
+          "veto": 0,
+          "unavailable": 0,
+          "vetoRate": 0.0
+        },
+        "realized": {
+          "trips": 2,
+          "medianMoveBps": 22.6999,
+          "medianRealizedNetBps": -32.6885,
+          "medianRMultiple": -0.428,
+          "rSamples": 2,
+          "reachedOneRShare": 0.0,
+          "medianStopAtrMult": 1.9315,
+          "edgeErrorMedianBps": -58.8154,
+          "costErrorMedianBps": null,
+          "feeErrorMedianBps": null,
+          "feeComparisonTrips": 0,
+          "feeComparisonCoverage": 0.0,
+          "costComparisonBasis": "fees",
+          "comparisonVersion": 1,
+          "estimateCoverage": 1.0,
+          "feeCoverage": 1.0
+        },
+        "openFunnel": {
+          "intents": 12,
+          "blocked": {
+            "consensus": 1,
+            "reflection": 1
+          },
+          "topBlocker": {
+            "key": "consensus",
+            "label": "同向共识门槛",
+            "count": 1
+          },
+          "llmDegraded": 1,
+          "modelHold": 561,
+          "sizingZeroed": 0,
+          "submitted": 3,
+          "executionBlocked": {
+            "pre_submit_context_changed": 7
+          },
+          "outcomeUnknown": 0,
+          "schemaVersion": 2,
+          "runtimeEpochId": "b50ceb2ebb264b50b8c608909cbf1c89",
+          "coverage": "complete",
+          "filled": 2,
+          "expired": 1,
+          "insufficientBalance": 0,
+          "conversion": 0.166667,
+          "layers": [
+            "baseRuleMaBand",
+            "orphanPosition",
+            "horizon",
+            "profitCooldown",
+            "turnover",
+            "exchangeBackstop",
+            "drawdownBrake",
+            "trendBias",
+            "consensus",
+            "confidence",
+            "edgeGate",
+            "reflection",
+            "other"
+          ],
+          "scope": "当前运行段累计",
+          "bySide": {
+            "long": {
+              "intents": 12,
+              "blocked": {
+                "consensus": 1,
+                "reflection": 1
+              },
+              "sizingZeroed": 0,
+              "submitted": 3,
+              "executionBlocked": {
+                "pre_submit_context_changed": 7
+              },
+              "outcomeUnknown": 0,
+              "filled": 2,
+              "expired": 1
+            },
+            "short": {
+              "intents": 0,
+              "blocked": {},
+              "sizingZeroed": 0,
+              "submitted": 0,
+              "executionBlocked": {},
+              "outcomeUnknown": 0,
+              "filled": 0,
+              "expired": 0
+            },
+            "unknown": {
+              "intents": 0,
+              "blocked": {},
+              "sizingZeroed": 0,
+              "submitted": 0,
+              "executionBlocked": {},
+              "outcomeUnknown": 0,
+              "filled": 0,
+              "expired": 0
+            }
+          },
+          "directionBalance": {
+            "longIntents": 12,
+            "shortIntents": 0,
+            "longFilled": 2,
+            "shortFilled": 0,
+            "shortIntentShare": 0.0,
+            "shortFillShare": 0.0,
+            "unknownIntents": 0,
+            "unknownFilled": 0,
+            "contrarianPassed": 11,
+            "minSamples": 8,
+            "verdict": "long_skewed"
+          }
+        }
+      },
+      "economics": {
+        "scope": "run",
+        "basis": "local_estimate",
+        "accountingVersion": 2,
+        "asOfTs": 1789098530.8127027,
+        "roundTripCount": 2,
+        "completeFeeTripCount": 2,
+        "unknownTripCount": 0,
+        "coverage": "complete",
+        "winRate": 0.0,
+        "profitFactor": 0.0,
+        "avgPnlUsd": -0.8084790849999999,
+        "sessionFeeUsd": 0.49233817,
+        "metricCoverage": {
+          "winRate": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null,
+            "wins": 0
+          },
+          "avgPnlUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null,
+            "netSumUsd": -1.6169581699999998
+          },
+          "profitFactor": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null,
+            "positivePnlUsd": 0.0,
+            "negativePnlUsd": 1.6169581699999998
+          },
+          "maxDrawdown": {
+            "scope": "unavailable",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 2,
+            "reason": "restore_gap"
+          },
+          "sharpe": {
+            "scope": "unavailable",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 2,
+            "reason": "restore_gap"
+          },
+          "grossPnlUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null
+          },
+          "feeUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null
+          },
+          "tradingNetUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null
+          },
+          "fundingCostUsd": {
+            "scope": "run",
+            "basis": "accrued",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null
+          }
+        },
+        "comparisonCoverage": {
+          "comparable": false,
+          "reason": "incomplete_pages",
+          "coverage": "partial"
+        },
+        "grossPnlUsd": -1.1246199999999997,
+        "feeUsd": 0.49233817,
+        "tradingNetUsd": -1.6169581699999998,
+        "fundingCostUsd": 0.016651772232792177,
+        "fundingBasis": "accrued",
+        "netAfterFundingUsd": -1.6336099422327919,
+        "openFundingAccruedUsd": null,
+        "exchangeTradingNetUsd": null,
+        "exchangeFundingCostUsd": null,
+        "exchangeNetAfterFundingUsd": null,
+        "exchangeRealizedPnlUsd": null,
+        "liquidationCostUsd": null,
+        "settlementAdjustmentUsd": null
+      }
+    },
+    {
+      "runId": 1641,
+      "instId": "ETH-USDT-SWAP",
+      "bar": "30m",
+      "status": "paused",
+      "config": {
+        "budgetUsd": 100.0,
+        "leverage": 5.0,
+        "allocationMode": "max_ratio",
+        "allocationPct": 100.0,
+        "totalBudgetUsd": 100.0,
+        "positionStepPct": 0.5,
+        "costBasis": "net",
+        "accountingVersion": 2,
+        "costModelVersion": 2,
+        "profitGuard": null,
+        "discipline": {
+          "preset": "balanced",
+          "thresholds": {
+            "ai_trade_edge_gate_k_min": 1.5,
+            "ai_trade_min_consensus": 1,
+            "ai_trade_min_confidence": 0.5,
+            "ai_trade_sizing_enabled": true,
+            "ai_trade_vol_target_annual": 0.2,
+            "ai_trade_kelly_lambda": 0.25,
+            "ai_trade_realized_vol_window": 96,
+            "ai_trade_effective_exposure_cap_mult": 2.0,
+            "ai_trade_stop_atr_mult": 2.0,
+            "ai_trade_stop_rr": 2.0,
+            "ai_trade_brake_slow_dd_pct": 0.08,
+            "ai_trade_brake_slow_size_mult": 0.5,
+            "ai_trade_brake_halt_dd_pct": 0.15,
+            "ai_trade_brake_loss_streak": 4,
+            "ai_trade_brake_loss_cooldown_bars": 4.0,
+            "ai_trade_profit_guard_hard_tp_return_pct": 0.5,
+            "ai_trade_consensus_contrarian_enabled": true
+          },
+          "adjustments": [],
+          "inert": [
+            "ai_trade_profit_guard_hard_tp_return_pct"
+          ]
+        },
+        "sizing": {
+          "sizing": {
+            "volTargetAnnual": 0.2,
+            "volWindow": 96,
+            "kellyLambda": 0.25,
+            "exposureCapMult": 2.0,
+            "corrMinSamples": 96
+          },
+          "stop": {
+            "stopAtrMult": 2.0,
+            "stopRr": 2.0,
+            "costFloorMult": 2.0
+          },
+          "brake": {
+            "slowDdPct": 0.08,
+            "slowSizeMult": 0.5,
+            "haltDdPct": 0.15,
+            "lossStreak": 4,
+            "lossCooldownSeconds": 7200.0
+          }
+        },
+        "tradingHorizon": {
+          "enabled": true,
+          "profile": "intraday_swing",
+          "title": "日内波段",
+          "targetLabel": "4 – 12 小时",
+          "minHoldSeconds": 7200.0,
+          "exitConfirmRounds": 2,
+          "confirmWindowSeconds": 3600.0,
+          "turnoverHysteresisK": 1.5,
+          "targetHoldMinSeconds": 14400.0,
+          "targetHoldMaxSeconds": 43200.0,
+          "expectedHoldBars": 24,
+          "gateReverse": true,
+          "enforceMaxHold": false,
+          "reentryCooldownSeconds": 3600.0,
+          "reentryScope": "same_side",
+          "turnoverBudgetPerDay": 6.0,
+          "turnoverBudgetCapacity": 3.0,
+          "backstopRepair": "plan",
+          "exitIntentDecayRounds": 2,
+          "exitPendingMaxSeconds": 7200.0,
+          "exitPriority": {
+            "enabled": true,
+            "overrideRounds": 2,
+            "overrideMinHoldSeconds": 60.0,
+            "maxOverridesPerSession": 6,
+            "evidenceMinChars": 10
+          }
+        }
+      },
+      "stats": {
+        "sizing": {
+          "gatedRounds": 97,
+          "scaledRounds": 93,
+          "scaleRate": 0.9588,
+          "avgScaleRatio": 0.6679,
+          "quantizeErasedRounds": 79,
+          "brakeSlowRounds": 0,
+          "brakeHaltRounds": 0,
+          "lossStreakCooldowns": 0,
+          "maxDrawdownPct": 0.023281,
+          "haltUnrealizedShareAvg": null,
+          "atrStopRounds": 460,
+          "reversalSkips": 0,
+          "restingSkips": 1,
+          "corrScaledRounds": 93,
+          "exposureUnreachableRounds": 14,
+          "solvedZeroVetoes": 14,
+          "belowFloorVetoes": 0,
+          "restingKept": 0,
+          "restingRepriced": 0,
+          "restingCancelled": 0,
+          "restingExpired": 0
+        },
+        "edgeGate": {
+          "pass": 104,
+          "veto": 0,
+          "unavailable": 1,
+          "vetoRate": 0.0
+        },
+        "realized": {
+          "trips": 2,
+          "medianMoveBps": 26.1903,
+          "medianRealizedNetBps": -34.2858,
+          "medianRMultiple": -0.3613,
+          "rSamples": 2,
+          "reachedOneRShare": 0.0,
+          "medianStopAtrMult": 2.0524,
+          "edgeErrorMedianBps": -73.8297,
+          "costErrorMedianBps": null,
+          "feeErrorMedianBps": null,
+          "feeComparisonTrips": 0,
+          "feeComparisonCoverage": 0.0,
+          "costComparisonBasis": "fees",
+          "comparisonVersion": 1,
+          "estimateCoverage": 1.0,
+          "feeCoverage": 1.0
+        },
+        "openFunnel": {
+          "intents": 119,
+          "blocked": {
+            "reflection": 8,
+            "consensus": 10,
+            "baseRuleMaBand": 4
+          },
+          "topBlocker": {
+            "key": "consensus",
+            "label": "同向共识门槛",
+            "count": 10
+          },
+          "llmDegraded": 1,
+          "modelHold": 447,
+          "sizingZeroed": 14,
+          "submitted": 2,
+          "executionBlocked": {
+            "pre_submit_context_changed": 81
+          },
+          "outcomeUnknown": 0,
+          "schemaVersion": 2,
+          "runtimeEpochId": "b40b131acbbb4e148823869cf52db2c7",
+          "coverage": "complete",
+          "filled": 2,
+          "expired": 0,
+          "insufficientBalance": 0,
+          "conversion": 0.016807,
+          "layers": [
+            "baseRuleMaBand",
+            "orphanPosition",
+            "horizon",
+            "profitCooldown",
+            "turnover",
+            "exchangeBackstop",
+            "drawdownBrake",
+            "trendBias",
+            "consensus",
+            "confidence",
+            "edgeGate",
+            "reflection",
+            "other"
+          ],
+          "scope": "当前运行段累计",
+          "bySide": {
+            "long": {
+              "intents": 108,
+              "blocked": {
+                "reflection": 8,
+                "consensus": 9,
+                "baseRuleMaBand": 3
+              },
+              "sizingZeroed": 14,
+              "submitted": 2,
+              "executionBlocked": {
+                "pre_submit_context_changed": 72
+              },
+              "outcomeUnknown": 0,
+              "filled": 2,
+              "expired": 0
+            },
+            "short": {
+              "intents": 11,
+              "blocked": {
+                "consensus": 1,
+                "baseRuleMaBand": 1
+              },
+              "sizingZeroed": 0,
+              "submitted": 0,
+              "executionBlocked": {
+                "pre_submit_context_changed": 9
+              },
+              "outcomeUnknown": 0,
+              "filled": 0,
+              "expired": 0
+            },
+            "unknown": {
+              "intents": 0,
+              "blocked": {},
+              "sizingZeroed": 0,
+              "submitted": 0,
+              "executionBlocked": {},
+              "outcomeUnknown": 0,
+              "filled": 0,
+              "expired": 0
+            }
+          },
+          "directionBalance": {
+            "longIntents": 108,
+            "shortIntents": 11,
+            "longFilled": 2,
+            "shortFilled": 0,
+            "shortIntentShare": 0.092437,
+            "shortFillShare": 0.0,
+            "unknownIntents": 0,
+            "unknownFilled": 0,
+            "contrarianPassed": 105,
+            "minSamples": 8,
+            "verdict": "long_skewed"
+          }
+        }
+      },
+      "economics": {
+        "scope": "run",
+        "basis": "local_estimate",
+        "accountingVersion": 2,
+        "asOfTs": 1789098531.2175958,
+        "roundTripCount": 2,
+        "completeFeeTripCount": 2,
+        "unknownTripCount": 0,
+        "coverage": "complete",
+        "winRate": 0.0,
+        "profitFactor": 0.0,
+        "avgPnlUsd": -0.8512073975000027,
+        "sessionFeeUsd": 0.49600479499999994,
+        "metricCoverage": {
+          "winRate": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null,
+            "wins": 0
+          },
+          "avgPnlUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null,
+            "netSumUsd": -1.7024147950000055
+          },
+          "profitFactor": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null,
+            "positivePnlUsd": 0.0,
+            "negativePnlUsd": 1.7024147950000055
+          },
+          "maxDrawdown": {
+            "scope": "unavailable",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 2,
+            "reason": "restore_gap"
+          },
+          "sharpe": {
+            "scope": "unavailable",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 2,
+            "reason": "restore_gap"
+          },
+          "grossPnlUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null
+          },
+          "feeUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null
+          },
+          "tradingNetUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null
+          },
+          "fundingCostUsd": {
+            "scope": "run",
+            "basis": "accrued",
+            "sampleCount": 2,
+            "excludedCount": 0,
+            "reason": null
+          }
+        },
+        "comparisonCoverage": {
+          "comparable": false,
+          "reason": "incomplete_pages",
+          "coverage": "partial"
+        },
+        "grossPnlUsd": -1.2064100000000055,
+        "feeUsd": 0.49600479499999994,
+        "tradingNetUsd": -1.7024147950000055,
+        "fundingCostUsd": 0.0,
+        "fundingBasis": "accrued",
+        "netAfterFundingUsd": -1.7024147950000055,
+        "openFundingAccruedUsd": null,
+        "exchangeTradingNetUsd": null,
+        "exchangeFundingCostUsd": null,
+        "exchangeNetAfterFundingUsd": null,
+        "exchangeRealizedPnlUsd": null,
+        "liquidationCostUsd": null,
+        "settlementAdjustmentUsd": null
+      }
+    },
+    {
+      "runId": 1642,
+      "instId": "SOL-USDT-SWAP",
+      "bar": "30m",
+      "status": "paused",
+      "config": {
+        "budgetUsd": 100.0,
+        "leverage": 5.0,
+        "allocationMode": "max_ratio",
+        "allocationPct": 100.0,
+        "totalBudgetUsd": 100.0,
+        "positionStepPct": 0.5,
+        "costBasis": "net",
+        "accountingVersion": 2,
+        "costModelVersion": 2,
+        "profitGuard": null,
+        "discipline": {
+          "preset": "balanced",
+          "thresholds": {
+            "ai_trade_edge_gate_k_min": 1.5,
+            "ai_trade_min_consensus": 1,
+            "ai_trade_min_confidence": 0.5,
+            "ai_trade_sizing_enabled": true,
+            "ai_trade_vol_target_annual": 0.2,
+            "ai_trade_kelly_lambda": 0.25,
+            "ai_trade_realized_vol_window": 96,
+            "ai_trade_effective_exposure_cap_mult": 2.0,
+            "ai_trade_stop_atr_mult": 2.0,
+            "ai_trade_stop_rr": 2.0,
+            "ai_trade_brake_slow_dd_pct": 0.08,
+            "ai_trade_brake_slow_size_mult": 0.5,
+            "ai_trade_brake_halt_dd_pct": 0.15,
+            "ai_trade_brake_loss_streak": 4,
+            "ai_trade_brake_loss_cooldown_bars": 4.0,
+            "ai_trade_profit_guard_hard_tp_return_pct": 0.5,
+            "ai_trade_consensus_contrarian_enabled": true
+          },
+          "adjustments": [],
+          "inert": [
+            "ai_trade_profit_guard_hard_tp_return_pct"
+          ]
+        },
+        "sizing": {
+          "sizing": {
+            "volTargetAnnual": 0.2,
+            "volWindow": 96,
+            "kellyLambda": 0.25,
+            "exposureCapMult": 2.0,
+            "corrMinSamples": 96
+          },
+          "stop": {
+            "stopAtrMult": 2.0,
+            "stopRr": 2.0,
+            "costFloorMult": 2.0
+          },
+          "brake": {
+            "slowDdPct": 0.08,
+            "slowSizeMult": 0.5,
+            "haltDdPct": 0.15,
+            "lossStreak": 4,
+            "lossCooldownSeconds": 7200.0
+          }
+        },
+        "tradingHorizon": {
+          "enabled": true,
+          "profile": "intraday_swing",
+          "title": "日内波段",
+          "targetLabel": "4 – 12 小时",
+          "minHoldSeconds": 7200.0,
+          "exitConfirmRounds": 2,
+          "confirmWindowSeconds": 3600.0,
+          "turnoverHysteresisK": 1.5,
+          "targetHoldMinSeconds": 14400.0,
+          "targetHoldMaxSeconds": 43200.0,
+          "expectedHoldBars": 24,
+          "gateReverse": true,
+          "enforceMaxHold": false,
+          "reentryCooldownSeconds": 3600.0,
+          "reentryScope": "same_side",
+          "turnoverBudgetPerDay": 6.0,
+          "turnoverBudgetCapacity": 3.0,
+          "backstopRepair": "plan",
+          "exitIntentDecayRounds": 2,
+          "exitPendingMaxSeconds": 7200.0,
+          "exitPriority": {
+            "enabled": true,
+            "overrideRounds": 2,
+            "overrideMinHoldSeconds": 60.0,
+            "maxOverridesPerSession": 6,
+            "evidenceMinChars": 10
+          }
+        }
+      },
+      "stats": {
+        "sizing": {
+          "gatedRounds": 67,
+          "scaledRounds": 67,
+          "scaleRate": 1.0,
+          "avgScaleRatio": 0.5782,
+          "quantizeErasedRounds": 52,
+          "brakeSlowRounds": 0,
+          "brakeHaltRounds": 0,
+          "lossStreakCooldowns": 0,
+          "maxDrawdownPct": 0.0,
+          "haltUnrealizedShareAvg": null,
+          "atrStopRounds": 551,
+          "reversalSkips": 0,
+          "restingSkips": 0,
+          "corrScaledRounds": 37,
+          "exposureUnreachableRounds": 15,
+          "solvedZeroVetoes": 15,
+          "belowFloorVetoes": 0,
+          "restingKept": 0,
+          "restingRepriced": 0,
+          "restingCancelled": 0,
+          "restingExpired": 0
+        },
+        "edgeGate": {
+          "pass": 69,
+          "veto": 0,
+          "unavailable": 2,
+          "vetoRate": 0.0
+        },
+        "realized": null,
+        "openFunnel": {
+          "intents": 81,
+          "blocked": {
+            "consensus": 9,
+            "reflection": 4,
+            "baseRuleMaBand": 1
+          },
+          "topBlocker": {
+            "key": "consensus",
+            "label": "同向共识门槛",
+            "count": 9
+          },
+          "llmDegraded": 0,
+          "modelHold": 486,
+          "sizingZeroed": 15,
+          "submitted": 0,
+          "executionBlocked": {
+            "pre_submit_context_changed": 52
+          },
+          "outcomeUnknown": 0,
+          "schemaVersion": 2,
+          "runtimeEpochId": "fac1a97bb4494fcf8253adc465543686",
+          "coverage": "complete",
+          "filled": 0,
+          "expired": 0,
+          "insufficientBalance": 0,
+          "conversion": 0.0,
+          "layers": [
+            "baseRuleMaBand",
+            "orphanPosition",
+            "horizon",
+            "profitCooldown",
+            "turnover",
+            "exchangeBackstop",
+            "drawdownBrake",
+            "trendBias",
+            "consensus",
+            "confidence",
+            "edgeGate",
+            "reflection",
+            "other"
+          ],
+          "scope": "当前运行段累计",
+          "bySide": {
+            "long": {
+              "intents": 57,
+              "blocked": {
+                "consensus": 7,
+                "reflection": 3,
+                "baseRuleMaBand": 1
+              },
+              "sizingZeroed": 15,
+              "submitted": 0,
+              "executionBlocked": {
+                "pre_submit_context_changed": 31
+              },
+              "outcomeUnknown": 0,
+              "filled": 0,
+              "expired": 0
+            },
+            "short": {
+              "intents": 24,
+              "blocked": {
+                "consensus": 2,
+                "reflection": 1
+              },
+              "sizingZeroed": 0,
+              "submitted": 0,
+              "executionBlocked": {
+                "pre_submit_context_changed": 21
+              },
+              "outcomeUnknown": 0,
+              "filled": 0,
+              "expired": 0
+            },
+            "unknown": {
+              "intents": 0,
+              "blocked": {},
+              "sizingZeroed": 0,
+              "submitted": 0,
+              "executionBlocked": {},
+              "outcomeUnknown": 0,
+              "filled": 0,
+              "expired": 0
+            }
+          },
+          "directionBalance": {
+            "longIntents": 57,
+            "shortIntents": 24,
+            "longFilled": 0,
+            "shortFilled": 0,
+            "shortIntentShare": 0.296296,
+            "shortFillShare": null,
+            "unknownIntents": 0,
+            "unknownFilled": 0,
+            "contrarianPassed": 71,
+            "minSamples": 8,
+            "verdict": "balanced"
+          }
+        }
+      },
+      "economics": {
+        "scope": "run",
+        "basis": "local_estimate",
+        "accountingVersion": 2,
+        "asOfTs": 1789098531.598712,
+        "roundTripCount": 0,
+        "completeFeeTripCount": 0,
+        "unknownTripCount": 0,
+        "coverage": "complete",
+        "winRate": null,
+        "profitFactor": null,
+        "avgPnlUsd": null,
+        "sessionFeeUsd": 0.0,
+        "metricCoverage": {
+          "winRate": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 0,
+            "reason": "no_samples",
+            "wins": 0
+          },
+          "avgPnlUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 0,
+            "reason": "no_samples",
+            "netSumUsd": 0.0
+          },
+          "profitFactor": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 0,
+            "reason": "no_samples",
+            "positivePnlUsd": 0.0,
+            "negativePnlUsd": -0.0
+          },
+          "maxDrawdown": {
+            "scope": "unavailable",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 0,
+            "reason": "restore_gap"
+          },
+          "sharpe": {
+            "scope": "unavailable",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 0,
+            "reason": "restore_gap"
+          },
+          "grossPnlUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 0,
+            "reason": "no_samples"
+          },
+          "feeUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 0,
+            "reason": "no_samples"
+          },
+          "tradingNetUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 0,
+            "reason": "no_samples"
+          },
+          "fundingCostUsd": {
+            "scope": "run",
+            "basis": "unknown",
+            "sampleCount": 0,
+            "excludedCount": 0,
+            "reason": "restore_gap"
+          }
+        },
+        "comparisonCoverage": {
+          "comparable": false,
+          "reason": "no_samples",
+          "coverage": "partial"
+        },
+        "grossPnlUsd": null,
+        "feeUsd": null,
+        "tradingNetUsd": null,
+        "fundingCostUsd": null,
+        "fundingBasis": "unknown",
+        "netAfterFundingUsd": null,
+        "openFundingAccruedUsd": null,
+        "exchangeTradingNetUsd": null,
+        "exchangeFundingCostUsd": null,
+        "exchangeNetAfterFundingUsd": null,
+        "exchangeRealizedPnlUsd": null,
+        "liquidationCostUsd": null,
+        "settlementAdjustmentUsd": null
+      }
+    },
+    {
+      "runId": 1643,
+      "instId": "DOGE-USDT-SWAP",
+      "bar": "30m",
+      "status": "paused",
+      "config": {
+        "budgetUsd": 100.0,
+        "leverage": 5.0,
+        "allocationMode": "max_ratio",
+        "allocationPct": 100.0,
+        "totalBudgetUsd": 100.0,
+        "positionStepPct": 0.5,
+        "costBasis": "net",
+        "accountingVersion": 2,
+        "costModelVersion": 2,
+        "profitGuard": null,
+        "discipline": {
+          "preset": "balanced",
+          "thresholds": {
+            "ai_trade_edge_gate_k_min": 1.5,
+            "ai_trade_min_consensus": 1,
+            "ai_trade_min_confidence": 0.5,
+            "ai_trade_sizing_enabled": true,
+            "ai_trade_vol_target_annual": 0.2,
+            "ai_trade_kelly_lambda": 0.25,
+            "ai_trade_realized_vol_window": 96,
+            "ai_trade_effective_exposure_cap_mult": 2.0,
+            "ai_trade_stop_atr_mult": 2.0,
+            "ai_trade_stop_rr": 2.0,
+            "ai_trade_brake_slow_dd_pct": 0.08,
+            "ai_trade_brake_slow_size_mult": 0.5,
+            "ai_trade_brake_halt_dd_pct": 0.15,
+            "ai_trade_brake_loss_streak": 4,
+            "ai_trade_brake_loss_cooldown_bars": 4.0,
+            "ai_trade_profit_guard_hard_tp_return_pct": 0.5,
+            "ai_trade_consensus_contrarian_enabled": true
+          },
+          "adjustments": [],
+          "inert": [
+            "ai_trade_profit_guard_hard_tp_return_pct"
+          ]
+        },
+        "sizing": {
+          "sizing": {
+            "volTargetAnnual": 0.2,
+            "volWindow": 96,
+            "kellyLambda": 0.25,
+            "exposureCapMult": 2.0,
+            "corrMinSamples": 96
+          },
+          "stop": {
+            "stopAtrMult": 2.0,
+            "stopRr": 2.0,
+            "costFloorMult": 2.0
+          },
+          "brake": {
+            "slowDdPct": 0.08,
+            "slowSizeMult": 0.5,
+            "haltDdPct": 0.15,
+            "lossStreak": 4,
+            "lossCooldownSeconds": 7200.0
+          }
+        },
+        "tradingHorizon": {
+          "enabled": true,
+          "profile": "intraday_swing",
+          "title": "日内波段",
+          "targetLabel": "4 – 12 小时",
+          "minHoldSeconds": 7200.0,
+          "exitConfirmRounds": 2,
+          "confirmWindowSeconds": 3600.0,
+          "turnoverHysteresisK": 1.5,
+          "targetHoldMinSeconds": 14400.0,
+          "targetHoldMaxSeconds": 43200.0,
+          "expectedHoldBars": 24,
+          "gateReverse": true,
+          "enforceMaxHold": false,
+          "reentryCooldownSeconds": 3600.0,
+          "reentryScope": "same_side",
+          "turnoverBudgetPerDay": 6.0,
+          "turnoverBudgetCapacity": 3.0,
+          "backstopRepair": "plan",
+          "exitIntentDecayRounds": 2,
+          "exitPendingMaxSeconds": 7200.0,
+          "exitPriority": {
+            "enabled": true,
+            "overrideRounds": 2,
+            "overrideMinHoldSeconds": 60.0,
+            "maxOverridesPerSession": 6,
+            "evidenceMinChars": 10
+          }
+        }
+      },
+      "stats": {
+        "sizing": {
+          "gatedRounds": 43,
+          "scaledRounds": 43,
+          "scaleRate": 1.0,
+          "avgScaleRatio": 0.4851,
+          "quantizeErasedRounds": 33,
+          "brakeSlowRounds": 0,
+          "brakeHaltRounds": 0,
+          "lossStreakCooldowns": 0,
+          "maxDrawdownPct": 0.036446,
+          "haltUnrealizedShareAvg": null,
+          "atrStopRounds": 468,
+          "reversalSkips": 0,
+          "restingSkips": 0,
+          "corrScaledRounds": 10,
+          "exposureUnreachableRounds": 10,
+          "solvedZeroVetoes": 10,
+          "belowFloorVetoes": 0,
+          "restingKept": 0,
+          "restingRepriced": 0,
+          "restingCancelled": 0,
+          "restingExpired": 0
+        },
+        "edgeGate": {
+          "pass": 46,
+          "veto": 0,
+          "unavailable": 0,
+          "vetoRate": 0.0
+        },
+        "realized": {
+          "trips": 1,
+          "medianMoveBps": 108.1081,
+          "medianRealizedNetBps": -115.0541,
+          "medianRMultiple": -0.9857,
+          "rSamples": 1,
+          "reachedOneRShare": 0.0,
+          "medianStopAtrMult": 1.998,
+          "edgeErrorMedianBps": -166.5253,
+          "costErrorMedianBps": null,
+          "feeErrorMedianBps": null,
+          "feeComparisonTrips": 0,
+          "feeComparisonCoverage": 0.0,
+          "costComparisonBasis": "fees",
+          "comparisonVersion": 1,
+          "estimateCoverage": 1.0,
+          "feeCoverage": 1.0
+        },
+        "openFunnel": {
+          "intents": 56,
+          "blocked": {
+            "consensus": 10,
+            "reflection": 3
+          },
+          "topBlocker": {
+            "key": "consensus",
+            "label": "同向共识门槛",
+            "count": 10
+          },
+          "llmDegraded": 0,
+          "modelHold": 470,
+          "sizingZeroed": 10,
+          "submitted": 1,
+          "executionBlocked": {
+            "pre_submit_context_changed": 32
+          },
+          "outcomeUnknown": 0,
+          "schemaVersion": 2,
+          "runtimeEpochId": "262e06879a564cd5a80a0fffbea25a92",
+          "coverage": "complete",
+          "filled": 1,
+          "expired": 0,
+          "insufficientBalance": 0,
+          "conversion": 0.017857,
+          "layers": [
+            "baseRuleMaBand",
+            "orphanPosition",
+            "horizon",
+            "profitCooldown",
+            "turnover",
+            "exchangeBackstop",
+            "drawdownBrake",
+            "trendBias",
+            "consensus",
+            "confidence",
+            "edgeGate",
+            "reflection",
+            "other"
+          ],
+          "scope": "当前运行段累计",
+          "bySide": {
+            "long": {
+              "intents": 13,
+              "blocked": {
+                "consensus": 1,
+                "reflection": 2
+              },
+              "sizingZeroed": 9,
+              "submitted": 1,
+              "executionBlocked": {},
+              "outcomeUnknown": 0,
+              "filled": 1,
+              "expired": 0
+            },
+            "short": {
+              "intents": 43,
+              "blocked": {
+                "consensus": 9,
+                "reflection": 1
+              },
+              "sizingZeroed": 1,
+              "submitted": 0,
+              "executionBlocked": {
+                "pre_submit_context_changed": 32
+              },
+              "outcomeUnknown": 0,
+              "filled": 0,
+              "expired": 0
+            },
+            "unknown": {
+              "intents": 0,
+              "blocked": {},
+              "sizingZeroed": 0,
+              "submitted": 0,
+              "executionBlocked": {},
+              "outcomeUnknown": 0,
+              "filled": 0,
+              "expired": 0
+            }
+          },
+          "directionBalance": {
+            "longIntents": 13,
+            "shortIntents": 43,
+            "longFilled": 1,
+            "shortFilled": 0,
+            "shortIntentShare": 0.767857,
+            "shortFillShare": 0.0,
+            "unknownIntents": 0,
+            "unknownFilled": 0,
+            "contrarianPassed": 46,
+            "minSamples": 8,
+            "verdict": "balanced"
+          }
+        }
+      },
+      "economics": {
+        "scope": "run",
+        "basis": "local_estimate",
+        "accountingVersion": 2,
+        "asOfTs": 1789098531.941029,
+        "roundTripCount": 1,
+        "completeFeeTripCount": 1,
+        "unknownTripCount": 0,
+        "coverage": "complete",
+        "winRate": 0.0,
+        "profitFactor": 0.0,
+        "avgPnlUsd": -2.8687923000000004,
+        "sessionFeeUsd": 0.1731923,
+        "metricCoverage": {
+          "winRate": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 1,
+            "excludedCount": 0,
+            "reason": null,
+            "wins": 0
+          },
+          "avgPnlUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 1,
+            "excludedCount": 0,
+            "reason": null,
+            "netSumUsd": -2.8687923000000004
+          },
+          "profitFactor": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 1,
+            "excludedCount": 0,
+            "reason": null,
+            "positivePnlUsd": 0.0,
+            "negativePnlUsd": 2.8687923000000004
+          },
+          "maxDrawdown": {
+            "scope": "unavailable",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 1,
+            "reason": "restore_gap"
+          },
+          "sharpe": {
+            "scope": "unavailable",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 1,
+            "reason": "restore_gap"
+          },
+          "grossPnlUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 1,
+            "excludedCount": 0,
+            "reason": null
+          },
+          "feeUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 1,
+            "excludedCount": 0,
+            "reason": null
+          },
+          "tradingNetUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 1,
+            "excludedCount": 0,
+            "reason": null
+          },
+          "fundingCostUsd": {
+            "scope": "run",
+            "basis": "accrued",
+            "sampleCount": 1,
+            "excludedCount": 0,
+            "reason": null
+          }
+        },
+        "comparisonCoverage": {
+          "comparable": false,
+          "reason": "incomplete_pages",
+          "coverage": "partial"
+        },
+        "grossPnlUsd": -2.6956,
+        "feeUsd": 0.1731923,
+        "tradingNetUsd": -2.8687923000000004,
+        "fundingCostUsd": 0.0,
+        "fundingBasis": "accrued",
+        "netAfterFundingUsd": -2.8687923000000004,
+        "openFundingAccruedUsd": null,
+        "exchangeTradingNetUsd": null,
+        "exchangeFundingCostUsd": null,
+        "exchangeNetAfterFundingUsd": null,
+        "exchangeRealizedPnlUsd": null,
+        "liquidationCostUsd": null,
+        "settlementAdjustmentUsd": null
+      }
+    },
+    {
+      "runId": 1644,
+      "instId": "SATS-USDT-SWAP",
+      "bar": "30m",
+      "status": "paused",
+      "config": {
+        "budgetUsd": 100.0,
+        "leverage": 5.0,
+        "allocationMode": "max_ratio",
+        "allocationPct": 100.0,
+        "totalBudgetUsd": 100.0,
+        "positionStepPct": 0.5,
+        "costBasis": "net",
+        "accountingVersion": 2,
+        "costModelVersion": 2,
+        "profitGuard": null,
+        "discipline": {
+          "preset": "balanced",
+          "thresholds": {
+            "ai_trade_edge_gate_k_min": 1.5,
+            "ai_trade_min_consensus": 1,
+            "ai_trade_min_confidence": 0.5,
+            "ai_trade_sizing_enabled": true,
+            "ai_trade_vol_target_annual": 0.2,
+            "ai_trade_kelly_lambda": 0.25,
+            "ai_trade_realized_vol_window": 96,
+            "ai_trade_effective_exposure_cap_mult": 2.0,
+            "ai_trade_stop_atr_mult": 2.0,
+            "ai_trade_stop_rr": 2.0,
+            "ai_trade_brake_slow_dd_pct": 0.08,
+            "ai_trade_brake_slow_size_mult": 0.5,
+            "ai_trade_brake_halt_dd_pct": 0.15,
+            "ai_trade_brake_loss_streak": 4,
+            "ai_trade_brake_loss_cooldown_bars": 4.0,
+            "ai_trade_profit_guard_hard_tp_return_pct": 0.5,
+            "ai_trade_consensus_contrarian_enabled": true
+          },
+          "adjustments": [],
+          "inert": [
+            "ai_trade_profit_guard_hard_tp_return_pct"
+          ]
+        },
+        "sizing": {
+          "sizing": {
+            "volTargetAnnual": 0.2,
+            "volWindow": 96,
+            "kellyLambda": 0.25,
+            "exposureCapMult": 2.0,
+            "corrMinSamples": 96
+          },
+          "stop": {
+            "stopAtrMult": 2.0,
+            "stopRr": 2.0,
+            "costFloorMult": 2.0
+          },
+          "brake": {
+            "slowDdPct": 0.08,
+            "slowSizeMult": 0.5,
+            "haltDdPct": 0.15,
+            "lossStreak": 4,
+            "lossCooldownSeconds": 7200.0
+          }
+        },
+        "tradingHorizon": {
+          "enabled": true,
+          "profile": "intraday_swing",
+          "title": "日内波段",
+          "targetLabel": "4 – 12 小时",
+          "minHoldSeconds": 7200.0,
+          "exitConfirmRounds": 2,
+          "confirmWindowSeconds": 3600.0,
+          "turnoverHysteresisK": 1.5,
+          "targetHoldMinSeconds": 14400.0,
+          "targetHoldMaxSeconds": 43200.0,
+          "expectedHoldBars": 24,
+          "gateReverse": true,
+          "enforceMaxHold": false,
+          "reentryCooldownSeconds": 3600.0,
+          "reentryScope": "same_side",
+          "turnoverBudgetPerDay": 6.0,
+          "turnoverBudgetCapacity": 3.0,
+          "backstopRepair": "plan",
+          "exitIntentDecayRounds": 2,
+          "exitPendingMaxSeconds": 7200.0,
+          "exitPriority": {
+            "enabled": true,
+            "overrideRounds": 2,
+            "overrideMinHoldSeconds": 60.0,
+            "maxOverridesPerSession": 6,
+            "evidenceMinChars": 10
+          }
+        }
+      },
+      "stats": {
+        "sizing": {
+          "gatedRounds": 6,
+          "scaledRounds": 6,
+          "scaleRate": 1.0,
+          "avgScaleRatio": 0.2781,
+          "quantizeErasedRounds": 3,
+          "brakeSlowRounds": 0,
+          "brakeHaltRounds": 0,
+          "lossStreakCooldowns": 0,
+          "maxDrawdownPct": 0.055065,
+          "haltUnrealizedShareAvg": null,
+          "atrStopRounds": 433,
+          "reversalSkips": 0,
+          "restingSkips": 0,
+          "corrScaledRounds": 3,
+          "exposureUnreachableRounds": 3,
+          "solvedZeroVetoes": 3,
+          "belowFloorVetoes": 0,
+          "restingKept": 0,
+          "restingRepriced": 0,
+          "restingCancelled": 0,
+          "restingExpired": 0
+        },
+        "edgeGate": {
+          "pass": 6,
+          "veto": 0,
+          "unavailable": 0,
+          "vetoRate": 0.0
+        },
+        "realized": {
+          "trips": 3,
+          "medianMoveBps": 21.0656,
+          "medianRealizedNetBps": -30.4079,
+          "medianRMultiple": -0.1484,
+          "rSamples": 3,
+          "reachedOneRShare": 0.0,
+          "medianStopAtrMult": 2.0687,
+          "edgeErrorMedianBps": -119.5581,
+          "costErrorMedianBps": null,
+          "feeErrorMedianBps": null,
+          "feeComparisonTrips": 0,
+          "feeComparisonCoverage": 0.0,
+          "costComparisonBasis": "fees",
+          "comparisonVersion": 1,
+          "estimateCoverage": 1.0,
+          "feeCoverage": 1.0
+        },
+        "openFunnel": {
+          "intents": 8,
+          "blocked": {
+            "consensus": 2
+          },
+          "topBlocker": {
+            "key": "consensus",
+            "label": "同向共识门槛",
+            "count": 2
+          },
+          "llmDegraded": 0,
+          "modelHold": 557,
+          "sizingZeroed": 3,
+          "submitted": 3,
+          "executionBlocked": {},
+          "outcomeUnknown": 0,
+          "schemaVersion": 2,
+          "runtimeEpochId": "3d2826af33ee43bba300cb209a22ec9e",
+          "coverage": "complete",
+          "filled": 3,
+          "expired": 0,
+          "insufficientBalance": 0,
+          "conversion": 0.375,
+          "layers": [
+            "baseRuleMaBand",
+            "orphanPosition",
+            "horizon",
+            "profitCooldown",
+            "turnover",
+            "exchangeBackstop",
+            "drawdownBrake",
+            "trendBias",
+            "consensus",
+            "confidence",
+            "edgeGate",
+            "reflection",
+            "other"
+          ],
+          "scope": "当前运行段累计",
+          "bySide": {
+            "long": {
+              "intents": 5,
+              "blocked": {
+                "consensus": 1
+              },
+              "sizingZeroed": 3,
+              "submitted": 1,
+              "executionBlocked": {},
+              "outcomeUnknown": 0,
+              "filled": 1,
+              "expired": 0
+            },
+            "short": {
+              "intents": 3,
+              "blocked": {
+                "consensus": 1
+              },
+              "sizingZeroed": 0,
+              "submitted": 2,
+              "executionBlocked": {},
+              "outcomeUnknown": 0,
+              "filled": 2,
+              "expired": 0
+            },
+            "unknown": {
+              "intents": 0,
+              "blocked": {},
+              "sizingZeroed": 0,
+              "submitted": 0,
+              "executionBlocked": {},
+              "outcomeUnknown": 0,
+              "filled": 0,
+              "expired": 0
+            }
+          },
+          "directionBalance": {
+            "longIntents": 5,
+            "shortIntents": 3,
+            "longFilled": 1,
+            "shortFilled": 2,
+            "shortIntentShare": 0.375,
+            "shortFillShare": 0.666667,
+            "unknownIntents": 0,
+            "unknownFilled": 0,
+            "contrarianPassed": 6,
+            "minSamples": 8,
+            "verdict": "balanced"
+          }
+        }
+      },
+      "economics": {
+        "scope": "run",
+        "basis": "local_estimate",
+        "accountingVersion": 2,
+        "asOfTs": 1789098532.3083315,
+        "roundTripCount": 3,
+        "completeFeeTripCount": 3,
+        "unknownTripCount": 0,
+        "coverage": "complete",
+        "winRate": 0.3333333333333333,
+        "profitFactor": 0.10177397178658214,
+        "avgPnlUsd": -0.8135711804350167,
+        "sessionFeeUsd": 0.7499961513050001,
+        "metricCoverage": {
+          "winRate": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 3,
+            "excludedCount": 0,
+            "reason": null,
+            "wins": 1
+          },
+          "avgPnlUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 3,
+            "excludedCount": 0,
+            "reason": null,
+            "netSumUsd": -2.4407135413050502
+          },
+          "profitFactor": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 3,
+            "excludedCount": 0,
+            "reason": null,
+            "positivePnlUsd": 0.27654632941998114,
+            "negativePnlUsd": 2.717259870725031
+          },
+          "maxDrawdown": {
+            "scope": "unavailable",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 3,
+            "reason": "restore_gap"
+          },
+          "sharpe": {
+            "scope": "unavailable",
+            "basis": "local_estimate",
+            "sampleCount": 0,
+            "excludedCount": 3,
+            "reason": "restore_gap"
+          },
+          "grossPnlUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 3,
+            "excludedCount": 0,
+            "reason": null
+          },
+          "feeUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 3,
+            "excludedCount": 0,
+            "reason": null
+          },
+          "tradingNetUsd": {
+            "scope": "run",
+            "basis": "local_estimate",
+            "sampleCount": 3,
+            "excludedCount": 0,
+            "reason": null
+          },
+          "fundingCostUsd": {
+            "scope": "run",
+            "basis": "accrued",
+            "sampleCount": 3,
+            "excludedCount": 0,
+            "reason": null
+          }
+        },
+        "comparisonCoverage": {
+          "comparable": false,
+          "reason": "incomplete_pages",
+          "coverage": "partial"
+        },
+        "grossPnlUsd": -1.69071739000005,
+        "feeUsd": 0.749996151305,
+        "tradingNetUsd": -2.4407135413050502,
+        "fundingCostUsd": -0.025046910000000002,
+        "fundingBasis": "accrued",
+        "netAfterFundingUsd": -2.4156666313050503,
+        "openFundingAccruedUsd": null,
+        "exchangeTradingNetUsd": null,
+        "exchangeFundingCostUsd": null,
+        "exchangeNetAfterFundingUsd": null,
+        "exchangeRealizedPnlUsd": null,
+        "liquidationCostUsd": null,
+        "settlementAdjustmentUsd": null
+      }
+    }
+  ],
+  "成交": [
+    {
+      "id": 51218,
+      "run_id": 1641,
+      "ts": 1788895800,
+      "side": "long",
+      "price": 2483.5,
+      "qty": 1.0,
+      "fee": 0.124175,
+      "pnl": 0.0,
+      "position_after": 1.0,
+      "reason": "recovered_open",
+      "position_pct": 0.49670000000000003,
+      "peak_pnl": null,
+      "meta": {
+        "wallTs": 1788895830,
+        "round": 23,
+        "entryLane": "contrarian",
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": null,
+        "exitPriorityLevel": null,
+        "holdSeconds": null,
+        "notionalUsd": null,
+        "realizedGrossBps": null,
+        "realizedNetBps": null,
+        "estEdgeBps": null,
+        "estCostBps": null,
+        "edgeSource": null,
+        "feeMeasurement": null,
+        "measuredNetEligible": null
+      }
+    },
+    {
+      "id": 51219,
+      "run_id": 1641,
+      "ts": 1788910200,
+      "side": "close",
+      "price": 2483.97,
+      "qty": 1.0,
+      "fee": 0.12419849999999999,
+      "pnl": -0.20137350000002,
+      "position_after": 0.0,
+      "reason": "agent_close",
+      "position_pct": 0.49670000000000003,
+      "peak_pnl": 0.7159999999999855,
+      "meta": {
+        "wallTs": 1788910566,
+        "round": null,
+        "entryLane": null,
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": "agentOverride",
+        "exitPriorityLevel": "override",
+        "holdSeconds": 14735.27525138855,
+        "notionalUsd": 248.35,
+        "realizedGrossBps": 1.8925,
+        "realizedNetBps": -8.1085,
+        "estEdgeBps": 52.188203,
+        "estCostBps": 13.788908,
+        "edgeSource": "atr",
+        "feeMeasurement": "estimated",
+        "measuredNetEligible": false
+      }
+    },
+    {
+      "id": 51220,
+      "run_id": 1640,
+      "ts": 1788931800,
+      "side": "long",
+      "price": 79088.0,
+      "qty": 0.31,
+      "fee": 0.1225864,
+      "pnl": 0.0,
+      "position_after": 0.31,
+      "reason": "recovered_open",
+      "position_pct": 0.4903456,
+      "peak_pnl": null,
+      "meta": {
+        "wallTs": 1788931841,
+        "round": 128,
+        "entryLane": "contrarian",
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": null,
+        "exitPriorityLevel": null,
+        "holdSeconds": null,
+        "notionalUsd": null,
+        "realizedGrossBps": null,
+        "realizedNetBps": null,
+        "estEdgeBps": null,
+        "estCostBps": null,
+        "edgeSource": null,
+        "feeMeasurement": null,
+        "measuredNetEligible": null
+      }
+    },
+    {
+      "id": 51221,
+      "run_id": 1640,
+      "ts": 1788946200,
+      "side": "close",
+      "price": 79086.2,
+      "qty": 0.31,
+      "fee": 0.12258361,
+      "pnl": -0.250750010000009,
+      "position_after": 0.0,
+      "reason": "agent_close",
+      "position_pct": 0.4903456,
+      "peak_pnl": 2.0274,
+      "meta": {
+        "wallTs": 1788947117,
+        "round": null,
+        "entryLane": null,
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": "agent",
+        "exitPriorityLevel": "expedite",
+        "holdSeconds": 15274.60154223442,
+        "notionalUsd": 245.1728,
+        "realizedGrossBps": -0.2276,
+        "realizedNetBps": -10.2275,
+        "estEdgeBps": 29.215867,
+        "estCostBps": 13.8656,
+        "edgeSource": "atr",
+        "feeMeasurement": "estimated",
+        "measuredNetEligible": false
+      }
+    },
+    {
+      "id": 51222,
+      "run_id": 1644,
+      "ts": 1789025400,
+      "side": "short",
+      "price": 1.04249608e-08,
+      "qty": 2395.0,
+      "fee": 0.12483890558,
+      "pnl": 0.0,
+      "position_after": -2395.0,
+      "reason": "recovered_open",
+      "position_pct": 0.49935562232,
+      "peak_pnl": null,
+      "meta": {
+        "wallTs": 1789025995,
+        "round": 267,
+        "entryLane": "contrarian",
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": null,
+        "exitPriorityLevel": null,
+        "holdSeconds": null,
+        "notionalUsd": null,
+        "realizedGrossBps": null,
+        "realizedNetBps": null,
+        "estEdgeBps": null,
+        "estCostBps": null,
+        "edgeSource": null,
+        "feeMeasurement": null,
+        "measuredNetEligible": null
+      }
+    },
+    {
+      "id": 51223,
+      "run_id": 1643,
+      "ts": 1789036200,
+      "side": "long",
+      "price": 0.0851,
+      "qty": 2.93,
+      "fee": 0.12467150000000002,
+      "pnl": 0.0,
+      "position_after": 2.93,
+      "reason": "recovered_open",
+      "position_pct": 0.498686,
+      "peak_pnl": null,
+      "meta": {
+        "wallTs": 1789036324,
+        "round": 297,
+        "entryLane": "contrarian",
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": null,
+        "exitPriorityLevel": null,
+        "holdSeconds": null,
+        "notionalUsd": null,
+        "realizedGrossBps": null,
+        "realizedNetBps": null,
+        "estEdgeBps": null,
+        "estCostBps": null,
+        "edgeSource": null,
+        "feeMeasurement": null,
+        "measuredNetEligible": null
+      }
+    },
+    {
+      "id": 51224,
+      "run_id": 1644,
+      "ts": 1789038000,
+      "side": "close",
+      "price": 1.0403e-08,
+      "qty": 2395.0,
+      "fee": 0.124575925,
+      "pnl": 0.27654632941998114,
+      "position_after": 0.0,
+      "reason": "agent_close",
+      "position_pct": 0.49935562232,
+      "peak_pnl": 3.088611159999995,
+      "meta": {
+        "wallTs": 1789038000,
+        "round": null,
+        "entryLane": null,
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": "agent",
+        "exitPriorityLevel": "expedite",
+        "holdSeconds": 11884.679721355438,
+        "notionalUsd": 249.677811,
+        "realizedGrossBps": 21.0656,
+        "realizedNetBps": 11.0761,
+        "estEdgeBps": 92.627023,
+        "estCostBps": 13.0,
+        "edgeSource": "atr",
+        "feeMeasurement": "estimated",
+        "measuredNetEligible": false
+      }
+    },
+    {
+      "id": 51225,
+      "run_id": 1643,
+      "ts": 1789043400,
+      "side": "close",
+      "price": 0.08418,
+      "qty": 2.93,
+      "fee": 0.048520799999999975,
+      "pnl": -2.8687923000000004,
+      "position_after": 0.0,
+      "reason": "external_close",
+      "position_pct": 0.498686,
+      "peak_pnl": 1.084100000000027,
+      "meta": {
+        "wallTs": 1789043935,
+        "round": null,
+        "entryLane": null,
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": "exchange",
+        "exitSource": "external",
+        "exitPriorityLevel": "none",
+        "holdSeconds": 7610.020797729492,
+        "notionalUsd": 249.343,
+        "realizedGrossBps": -108.1081,
+        "realizedNetBps": -115.0541,
+        "estEdgeBps": 58.417206,
+        "estCostBps": 15.0,
+        "edgeSource": "atr",
+        "feeMeasurement": "estimated",
+        "measuredNetEligible": false
+      }
+    },
+    {
+      "id": 51226,
+      "run_id": 1644,
+      "ts": 1789045200,
+      "side": "long",
+      "price": 1.0285e-08,
+      "qty": 2432.0,
+      "fee": 0.1250656,
+      "pnl": 0.0,
+      "position_after": 2432.0,
+      "reason": "recovered_open",
+      "position_pct": 0.5002624,
+      "peak_pnl": null,
+      "meta": {
+        "wallTs": 1789045312,
+        "round": 369,
+        "entryLane": "contrarian",
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": null,
+        "exitPriorityLevel": null,
+        "holdSeconds": null,
+        "notionalUsd": null,
+        "realizedGrossBps": null,
+        "realizedNetBps": null,
+        "estEdgeBps": null,
+        "estCostBps": null,
+        "edgeSource": null,
+        "feeMeasurement": null,
+        "measuredNetEligible": null
+      }
+    },
+    {
+      "id": 51227,
+      "run_id": 1644,
+      "ts": 1789052400,
+      "side": "close",
+      "price": 1.0264e-08,
+      "qty": 2432.0,
+      "fee": 0.12481024,
+      "pnl": -0.7605958400000158,
+      "position_after": 0.0,
+      "reason": "agent_close",
+      "position_pct": 0.5002624,
+      "peak_pnl": 1.4591999999999647,
+      "meta": {
+        "wallTs": 1789053679,
+        "round": null,
+        "entryLane": null,
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": "agent",
+        "exitPriorityLevel": "expedite",
+        "holdSeconds": 8168.7054171562195,
+        "notionalUsd": 250.1312,
+        "realizedGrossBps": -20.4181,
+        "realizedNetBps": -30.4079,
+        "estEdgeBps": 99.140048,
+        "estCostBps": 15.0,
+        "edgeSource": "atr",
+        "feeMeasurement": "estimated",
+        "measuredNetEligible": false
+      }
+    },
+    {
+      "id": 51228,
+      "run_id": 1644,
+      "ts": 1789052400,
+      "side": "short",
+      "price": 1.0244055e-08,
+      "qty": 2439.0,
+      "fee": 0.124926250725,
+      "pnl": 0.0,
+      "position_after": -2439.0,
+      "reason": "recovered_open",
+      "position_pct": 0.49970500290000003,
+      "peak_pnl": null,
+      "meta": {
+        "wallTs": 1789052400,
+        "round": 418,
+        "entryLane": "contrarian",
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": null,
+        "exitPriorityLevel": null,
+        "holdSeconds": null,
+        "notionalUsd": null,
+        "realizedGrossBps": null,
+        "realizedNetBps": null,
+        "estEdgeBps": null,
+        "estCostBps": null,
+        "edgeSource": null,
+        "feeMeasurement": null,
+        "measuredNetEligible": null
+      }
+    },
+    {
+      "id": 51229,
+      "run_id": 1644,
+      "ts": 1789054200,
+      "side": "close",
+      "price": 1.0314e-08,
+      "qty": 2439.0,
+      "fee": 0.12577923000000002,
+      "pnl": -1.9566640307250154,
+      "position_after": 0.0,
+      "reason": "agent_close",
+      "position_pct": 0.49970500290000003,
+      "peak_pnl": 0.0013414499999837672,
+      "meta": {
+        "wallTs": 1789054761,
+        "round": null,
+        "entryLane": null,
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": "agentOverride",
+        "exitPriorityLevel": "override",
+        "holdSeconds": 426.74333095550537,
+        "notionalUsd": 249.852501,
+        "realizedGrossBps": -68.2786,
+        "realizedNetBps": -78.3128,
+        "estEdgeBps": 93.056938,
+        "estCostBps": 13.0,
+        "edgeSource": "atr",
+        "feeMeasurement": "estimated",
+        "measuredNetEligible": false
+      }
+    },
+    {
+      "id": 51230,
+      "run_id": 1640,
+      "ts": 1789061400,
+      "side": "long",
+      "price": 77414.9,
+      "qty": 0.32,
+      "fee": 0.12386384,
+      "pnl": 0.0,
+      "position_after": 0.32,
+      "reason": "recovered_open",
+      "position_pct": 0.49545536,
+      "peak_pnl": null,
+      "meta": {
+        "wallTs": 1789061766,
+        "round": 446,
+        "entryLane": "contrarian",
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": null,
+        "exitPriorityLevel": null,
+        "holdSeconds": null,
+        "notionalUsd": null,
+        "realizedGrossBps": null,
+        "realizedNetBps": null,
+        "estEdgeBps": null,
+        "estCostBps": null,
+        "edgeSource": null,
+        "feeMeasurement": null,
+        "measuredNetEligible": null
+      }
+    },
+    {
+      "id": 51231,
+      "run_id": 1640,
+      "ts": 1789063200,
+      "side": "close",
+      "price": 77065.2,
+      "qty": 0.32,
+      "fee": 0.12330432000000001,
+      "pnl": -1.3662081599999907,
+      "position_after": 0.0,
+      "reason": "agent_close",
+      "position_pct": 0.49545536,
+      "peak_pnl": 0.0,
+      "meta": {
+        "wallTs": 1789064485,
+        "round": null,
+        "entryLane": null,
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": "agentOverride",
+        "exitPriorityLevel": "override",
+        "holdSeconds": 2610.3528385162354,
+        "notionalUsd": 247.72768,
+        "realizedGrossBps": -45.1722,
+        "realizedNetBps": -55.1496,
+        "estEdgeBps": 43.015205,
+        "estCostBps": 15.0,
+        "edgeSource": "atr",
+        "feeMeasurement": "estimated",
+        "measuredNetEligible": false
+      }
+    },
+    {
+      "id": 51232,
+      "run_id": 1641,
+      "ts": 1789077600,
+      "side": "long",
+      "price": 2458.0,
+      "qty": 1.01,
+      "fee": 0.124129,
+      "pnl": 0.0,
+      "position_after": 1.01,
+      "reason": "recovered_open",
+      "position_pct": 0.496516,
+      "peak_pnl": null,
+      "meta": {
+        "wallTs": 1789077615,
+        "round": 497,
+        "entryLane": "contrarian",
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": null,
+        "exitPriorityLevel": null,
+        "holdSeconds": null,
+        "notionalUsd": null,
+        "realizedGrossBps": null,
+        "realizedNetBps": null,
+        "estEdgeBps": null,
+        "estCostBps": null,
+        "edgeSource": null,
+        "feeMeasurement": null,
+        "measuredNetEligible": null
+      }
+    },
+    {
+      "id": 51233,
+      "run_id": 1641,
+      "ts": 1789079400,
+      "side": "close",
+      "price": 2445.59,
+      "qty": 1.01,
+      "fee": 0.123502295,
+      "pnl": -1.5010412949999854,
+      "position_after": 0.0,
+      "reason": "agent_close",
+      "position_pct": 0.496516,
+      "peak_pnl": 0.31007000000001655,
+      "meta": {
+        "wallTs": 1789080316,
+        "round": null,
+        "entryLane": null,
+        "feeBasis": "estimated",
+        "pnlBasis": null,
+        "settlementSource": null,
+        "exitSource": "agentOverride",
+        "exitPriorityLevel": "override",
+        "holdSeconds": 2700.1035792827606,
+        "notionalUsd": 248.258,
+        "realizedGrossBps": -50.4882,
+        "realizedNetBps": -60.463,
+        "estEdgeBps": 46.875576,
+        "estCostBps": 13.04771,
+        "edgeSource": "atr",
+        "feeMeasurement": "estimated",
+        "measuredNetEligible": false
+      }
+    }
+  ],
+  "决策日志": {
+    "rows": 2827,
+    "truncatedPayloads": 1186,
+    "filledOpenRounds": [
+      {
+        "id": 2023,
+        "run_id": 1644,
+        "round_no": 267,
+        "wall_ts": 1789026115,
+        "action": "open_short",
+        "final_action": "open_short",
+        "size_fraction": 0.5,
+        "executed": 1,
+        "payload_truncated": 1,
+        "gateReadings": [
+          {
+            "key": "trendBias",
+            "label": "趋势基调·逆势门槛",
+            "armed": true,
+            "verdict": "pass",
+            "readings": {
+              "lane": "aligned",
+              "alignment": "aligned",
+              "strength": "moderate",
+              "score": -0.32,
+              "execScore": -0.38,
+              "minConfidence": 0.65,
+              "modelConfidence": 0.65,
+              "verdictConfidence": 0.59,
+              "sizeMult": 0.5,
+              "sizeBefore": null,
+              "sizeAfter": null,
+              "reason": null
+            }
+          },
+          {
+            "key": "consensus",
+            "label": "同向共识门槛",
+            "armed": true,
+            "verdict": "pass",
+            "readings": {
+              "longVotes": 0,
+              "shortVotes": 0,
+              "flatVotes": 2,
+              "total": 2,
+              "netStance": "flat",
+              "agreement": 0.0,
+              "contrarian": {
+                "available": true,
+                "minConfidence": 0.65,
+                "minEvidenceChars": 60,
+                "maxOpposingVotes": 1,
+                "remaining": 3,
+                "sizeMult": 0.5
+              }
+            }
+          },
+          {
+            "key": "edgeGate",
+            "label": "最小 edge 门禁",
+            "armed": false,
+            "verdict": "skip",
+            "readings": {
+              "status": "pass",
+              "edgeBps": 92.627023,
+              "costBps": 13.0,
+              "source": "atr"
+            }
+          }
+        ]
+      },
+      {
+        "id": 2447,
+        "run_id": 1644,
+        "round_no": 369,
+        "wall_ts": 1789045510,
+        "action": "open_long",
+        "final_action": "open_long",
+        "size_fraction": 0.5,
+        "executed": 1,
+        "payload_truncated": 1,
+        "gateReadings": [
+          {
+            "key": "trendBias",
+            "label": "趋势基调·逆势门槛",
+            "armed": true,
+            "verdict": "pass",
+            "readings": {
+              "lane": "counter",
+              "alignment": "counter",
+              "strength": "strong",
+              "score": -0.78,
+              "execScore": -0.75,
+              "minConfidence": 0.65,
+              "modelConfidence": 0.65,
+              "verdictConfidence": 1.0,
+              "sizeMult": 0.5,
+              "sizeBefore": 0.5,
+              "sizeAfter": 0.5,
+              "reason": null,
+              "downgradeLane": "floor_is_min"
+            }
+          },
+          {
+            "key": "consensus",
+            "label": "同向共识门槛",
+            "armed": true,
+            "verdict": "pass",
+            "readings": {
+              "longVotes": 0,
+              "shortVotes": 0,
+              "flatVotes": 2,
+              "total": 2,
+              "netStance": "flat",
+              "agreement": 0.0,
+              "contrarian": {
+                "available": true,
+                "minConfidence": 0.65,
+                "minEvidenceChars": 60,
+                "maxOpposingVotes": 1,
+                "remaining": 2,
+                "sizeMult": 0.5
+              }
+            }
+          },
+          {
+            "key": "edgeGate",
+            "label": "最小 edge 门禁",
+            "armed": false,
+            "verdict": "skip",
+            "readings": {
+              "status": "pass",
+              "edgeBps": 99.140048,
+              "costBps": 15.0,
+              "source": "atr"
+            }
+          }
+        ]
+      },
+      {
+        "id": 2647,
+        "run_id": 1644,
+        "round_no": 418,
+        "wall_ts": 1789054334,
+        "action": "open_short",
+        "final_action": "open_short",
+        "size_fraction": 0.5,
+        "executed": 1,
+        "payload_truncated": 1,
+        "gateReadings": [
+          {
+            "key": "trendBias",
+            "label": "趋势基调·逆势门槛",
+            "armed": true,
+            "verdict": "pass",
+            "readings": {
+              "lane": "aligned",
+              "alignment": "aligned",
+              "strength": "moderate",
+              "score": -0.5,
+              "execScore": -0.41,
+              "minConfidence": 0.65,
+              "modelConfidence": 0.66,
+              "verdictConfidence": 0.91,
+              "sizeMult": 0.5,
+              "sizeBefore": null,
+              "sizeAfter": null,
+              "reason": null
+            }
+          },
+          {
+            "key": "consensus",
+            "label": "同向共识门槛",
+            "armed": true,
+            "verdict": "pass",
+            "readings": {
+              "longVotes": 0,
+              "shortVotes": 0,
+              "flatVotes": 2,
+              "total": 2,
+              "netStance": "flat",
+              "agreement": 0.0,
+              "contrarian": {
+                "available": true,
+                "minConfidence": 0.65,
+                "minEvidenceChars": 60,
+                "maxOpposingVotes": 1,
+                "remaining": 1,
+                "sizeMult": 0.5
+              }
+            }
+          },
+          {
+            "key": "edgeGate",
+            "label": "最小 edge 门禁",
+            "armed": false,
+            "verdict": "skip",
+            "readings": {
+              "status": "pass",
+              "edgeBps": 93.056938,
+              "costBps": 13.0,
+              "source": "atr"
+            }
+          }
+        ]
+      },
+      {
+        "id": 2795,
+        "run_id": 1640,
+        "round_no": 446,
+        "wall_ts": 1789061874,
+        "action": "open_long",
+        "final_action": "open_long",
+        "size_fraction": 0.5,
+        "executed": 1,
+        "payload_truncated": 1,
+        "gateReadings": [
+          {
+            "key": "trendBias",
+            "label": "趋势基调·逆势门槛",
+            "armed": true,
+            "verdict": "pass"
+          },
+          {
+            "key": "consensus",
+            "label": "同向共识门槛",
+            "armed": true,
+            "verdict": "pass",
+            "readings": {
+              "longVotes": 0,
+              "shortVotes": 0,
+              "flatVotes": 2,
+              "total": 2,
+              "netStance": "flat",
+              "agreement": 0.0,
+              "contrarian": {
+                "available": true,
+                "minConfidence": 0.65,
+                "minEvidenceChars": 60,
+                "maxOpposingVotes": 1,
+                "remaining": 1,
+                "sizeMult": 0.5
+              }
+            }
+          },
+          {
+            "key": "edgeGate",
+            "label": "最小 edge 门禁",
+            "armed": false,
+            "verdict": "skip",
+            "readings": {
+              "status": "pass",
+              "edgeBps": 43.015205,
+              "costBps": 15.0,
+              "source": "atr"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "源码SHA256": {
+    "services/quant/app/ai_auto/sizing.py": "6817028070fc748d5c9cea5b8009b93a87ae95cce0aed1dd06e0da0f0e325930",
+    "services/quant/app/ai_auto/sizing_runtime.py": "a9d3f26a14211ad33437dace82d317fe56885734aa2f3b5d15e5e31cad82f1f5",
+    "services/quant/app/ai_auto/signals.py": "686682342303e534df70525df94579de9dde8839f4dd25055aedc7c130b62db1",
+    "services/quant/app/ai_auto/exposure_book.py": "aee8d456bdc0407ea5b469063456460a9882d1758f8865750eb080f247f47f49",
+    "services/quant/app/ai_auto/manager.py": "6b3ceeffb96a72cc903950d14f3834c825c813eaf70a9a47241825668b984a0c",
+    "services/quant/app/ai_auto/session.py": "7332b67d3738e04d47f9883938e3101813e261831c13ab7ded2ec2086ddbeba0",
+    "services/quant/app/live_auto/executor.py": "a8b74b779942a71cd394320c54fc6dbb2e73de59ebd0c17337d1b053d410f926"
+  },
+  "运行日志摘录": [
+    "main.log:905: 2026-09-08T18:02:53.818Z Aragon Trading 桌面端启动（mode=prod, isPackaged=true）",
+    "backend.log:14350: 2026-09-10 16:27:51,874 WARNING app.ai_auto.decider: ai-trade decide attempt failed: LLM_NETWORK_ERROR",
+    "backend.log:14494: 2026-09-10 22:43:49,389 WARNING app.ai_auto.decider: ai-trade summarize failed: TimeoutError(30s)",
+    "backend.log:14533: 2026-09-10 23:48:52,081 WARNING app.ai_auto.manager: ai-trade lifecycle mismatch: group=aitradegrp_8b8c35fddac547188a48a6822c3c36b5 declared=running derived=paused"
+  ]
+}

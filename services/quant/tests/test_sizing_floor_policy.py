@@ -56,18 +56,20 @@ def test_a_risk_budget_of_exactly_zero_is_a_veto_not_a_minimum_gear():
 
 # ---------- G-C2：闸关 ⇒ 逐字回退 ----------
 
-def test_gate_off_still_lifts_zero_to_the_minimum_gear():
-    """总闸 8 关 ⇒ `f_raw == 0` 仍被抬到最小一格（今天的行为，逐字回退）。"""
-    assert _solve(None, corr_scale=0.0).fraction == 0.5
-    assert _solve(SizingFloorPolicy(zero_is_veto=False), corr_scale=0.0).fraction == 0.5
+def test_legacy_floor_switch_cannot_lift_a_zero_risk_budget():
+    """旧地板开关不允许突破已装配仓位层的硬上限。"""
+    assert _solve(None, corr_scale=0.0).fraction == 0.0
+    assert _solve(SizingFloorPolicy(zero_is_veto=False), corr_scale=0.0).fraction == 0.0
 
 
 # ---------- G-C3：floor_ratio 默认 0 ⇒ 第二条判据不存在 ----------
 
-def test_floor_ratio_zero_makes_the_second_criterion_unreachable():
+def test_floor_ratio_zero_cannot_lift_a_positive_risk_budget():
     policy = SizingFloorPolicy(zero_is_veto=True, floor_ratio=0.0)
     for corr in (0.05, 0.2, 0.37, 0.9):
-        assert _solve(policy, corr_scale=corr).floor_verdict == "none", corr
+        out = _solve(policy, corr_scale=corr)
+        assert out.fraction == 0.0, corr
+        assert out.floor_verdict == "below_gear_floor", corr
 
 
 def test_floor_ratio_when_armed_vetoes_a_positive_but_tiny_solution():
@@ -130,13 +132,13 @@ def test_a_zeroed_solution_becomes_hold_and_never_touches_dust_skips():
     assert runtime.counters.solved_zero_vetoes == 1
     assert wire["floorVerdict"] == "solved_zero"
 
-    # 闸关 ⇒ 逐字回退：同一断面下决策仍是 open_long、仓位被抬到最小一格。
+    # 旧开关关闭仍保留风险上限，拒绝不能映射为零强度开仓。
     off = SizingRuntime(_RULE, None, None, inst_id="DOGE-USDT-SWAP",
                         bar_seconds=_BAR_SECONDS, floor_policy=None)
     off._vol = 0.01
     off._correlation = lambda action, pre, c, ex: (None, 0.0)
     final_off, _, _ = off.resolve(decision, ctx, _FakeExecutor())
-    assert final_off.action == "open_long" and final_off.size_fraction == 0.5
+    assert final_off.action == "hold" and final_off.size_fraction is None
 
 
 def test_floor_verdict_maps_to_hold_with_a_reason_that_is_not_about_budget():
@@ -158,19 +160,20 @@ def test_floor_verdict_maps_to_hold_with_a_reason_that_is_not_about_budget():
 def test_gear_resolution_flags_the_coarse_default_world_and_clears_a_fine_one():
     """`G-C4`：`step=0.5` 三个机制全 erased；`step=0.05` 空集；`step<=0` 空集。"""
     coarse = describe_gear_resolution(0.5)
-    assert set(coarse.erased) == {"brakeSlow", "contrarian", "corrScale"}
+    assert set(coarse.erased) == {"contrarian"}
     assert coarse.gears == 2 and coarse.min_gear == 0.5
     assert describe_gear_resolution(0.05).erased == ()
     assert describe_gear_resolution(0.25).erased == ()
     assert describe_gear_resolution(0.0).erased == ()
     # `step=1.0`（每次全仓）：阶梯只有一格，任何缩减都不可能发生。
-    assert set(describe_gear_resolution(1.0).erased) == {"brakeSlow", "contrarian", "corrScale"}
+    assert set(describe_gear_resolution(1.0).erased) == {"contrarian"}
 
 
 def test_gear_note_is_absent_when_nothing_is_erased():
     assert gear_resolution_note(describe_gear_resolution(0.05)) is None
     note = gear_resolution_note(describe_gear_resolution(0.5))
-    assert note is not None and "回撤刹车第一档" in note and "逆势通路强制降档" in note
+    assert note is not None and "逆势通路强制降档" in note
+    assert "回撤刹车第一档" not in note and "相关性缩减" not in note
 
 
 def test_gear_note_never_contains_literal_bold_markers():
@@ -185,3 +188,83 @@ def test_describe_gear_resolution_never_raises(step):
     res = describe_gear_resolution(step, brake_rule=object(), consensus_rule=None)
     assert isinstance(res.erased, tuple) and isinstance(res.survives, tuple)
     assert set(res.erased) | set(res.survives) == {"brakeSlow", "contrarian", "corrScale"}
+
+
+@pytest.mark.parametrize("step", [0.5, 1.0])
+@pytest.mark.parametrize("key,inputs", [
+    ("brakeSlow", {"brake_mult": 0.5}),
+    ("corrScale", {"corr_scale": 0.5}),
+])
+def test_gear_diagnosis_agrees_with_enforced_risk_reduction(step, key, inputs):
+    """已被仓位层拒绝的最小档，不应再向用户宣称风险缩减失效。"""
+    outcome = _solve(None, model_fraction=step, step=step, **inputs)
+    assert outcome.fraction == 0.0
+    resolution = describe_gear_resolution(step)
+    assert resolution.dead_gears[key] == 0
+    assert key not in resolution.erased
+
+
+@pytest.mark.parametrize("action", ["open_long", "open_short"])
+@pytest.mark.parametrize("step,cap,expected", [
+    (0.5, 200.0, None), (0.25, 200.0, 0.25),
+    (0.05, 218.0, 0.4), (0.0, 218.0002, 218.0002 / 500),
+    (0.25, 250.0, 0.5), (0.25, 249.999999, 0.25),
+])
+def test_final_risk_fraction_never_rounds_above_exposure_cap(action, step, cap, expected):
+    """验证最终动作和名义额，覆盖原始三类超限及展示舍入反例。"""
+    from app.ai_auto.exposure_book import GroupExposureBook
+    from app.ai_auto.signals import decision_to_signals
+
+    book = GroupExposureBook(unit_notional=cap, cap_mult=1.0, bar_seconds=900)
+    runtime = SizingRuntime(_RULE, inst_id="A", book=book, bar_seconds=900)
+    decision = TradeDecision(action=action, size_fraction=0.5, confidence=0.8, reason="测试")
+    final, _, _ = runtime.resolve(decision, SizingContext(step=step, notional_full=500.0))
+    if expected is None:
+        assert final.action == "hold" and decision_to_signals(final) == []
+        assert runtime.counters.below_floor_vetoes == 1
+    else:
+        assert final.action == action
+        assert final.size_fraction == pytest.approx(expected, abs=1e-14)
+        assert final.size_fraction * 500 <= cap + 1e-12
+
+
+@pytest.mark.parametrize("raw", [0.0, 1e-14, 0.249999999, float("nan"), float("inf")])
+@pytest.mark.parametrize("policy", [None, SizingFloorPolicy(False, 0.0)])
+def test_no_legal_gear_never_becomes_an_open_signal(raw, policy):
+    from app.ai_auto.signals import decision_to_signals
+
+    runtime = SizingRuntime(_RULE, floor_policy=policy)
+    decision = TradeDecision(action="open_long", size_fraction=raw, confidence=0.8, reason="测试")
+    final, _, _ = runtime.resolve(decision, SizingContext(step=0.25))
+    assert final.action == "hold"
+    assert decision_to_signals(final) == []
+
+
+@pytest.mark.parametrize("step,proposal,expected", [
+    (0.05, 0.45, 0.45), (0.1, 0.45, 0.4), (0.25, 0.45, None),
+])
+def test_rounded_hedge_must_remain_inside_feasible_interval(step, proposal, expected):
+    from app.ai_auto.exposure_book import GroupExposureBook
+
+    book = GroupExposureBook(unit_notional=200, cap_mult=1, bar_seconds=900)
+    book.publish_notional("B", 400)
+    runtime = SizingRuntime(_RULE, inst_id="A", book=book)
+    decision = TradeDecision(action="open_short", size_fraction=proposal, confidence=0.8, reason="对冲")
+    final, _, _ = runtime.resolve(decision, SizingContext(step=step, notional_full=500))
+    assert final.size_fraction == expected
+    assert final.action == ("hold" if expected is None else "open_short")
+
+
+@pytest.mark.parametrize("floor", ["below_gear_floor", "exposure_cap", "invalid_quantity", None])
+def test_risk_veto_has_an_explainable_diagnosis(floor):
+    from types import SimpleNamespace
+    from app.ai_auto.integrity_view import _diagnosis
+
+    session = SimpleNamespace(_stale_degraded=False,
+        _last_decision={"sizingVerdict": {"floorVerdict": floor},
+            "executed": {"executionReceipt": {
+                "status": "not_submitted", "reason": "sizing_exposure_cap"}}},
+        executor=SimpleNamespace(resting=None, projected="flat"))
+    diagnosis = _diagnosis(session, None)
+    assert "风险" in diagnosis["message"]
+    assert "预算" not in diagnosis["message"]

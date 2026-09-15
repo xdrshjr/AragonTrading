@@ -47,7 +47,8 @@ from .types import FeeAttemptError, FeeFetchOutcome, _optional_float
 _MARKET_NOTIONAL_BUFFER = 0.02
 # 本地拦截类语义码（审计 status=rejected；非此集合的 OKX 业务失败 status=error）。
 _LOCAL_REJECT_CODES = {
-    "LIVE_ORDER_REJECTED_LOCAL", "LIVE_WOULD_REDUCE_POSITION", "LIVE_INSTRUMENT_UNSUPPORTED"}
+    "LIVE_ORDER_REJECTED_LOCAL", "LIVE_WOULD_REDUCE_POSITION", "LIVE_INSTRUMENT_UNSUPPORTED",
+    "sizing_exposure_cap"}
 # 平仓本地拦截类语义码（P1-1）：须显式纳入透传集合与审计分类，否则会被 accounts._map_okx_code
 # 对未知码一律拍平为 OKX_ERROR——既违反「原样回传前端」契约，又使本地拒被误判为 error 而非 rejected。
 _CLOSE_LOCAL_REJECT_CODES = {
@@ -164,7 +165,8 @@ def _audit_values(account_id: int, order: OrderInput, cl_ord_id: str, *,
 
 
 async def place_live_order(session: AsyncSession, creds: AccountCredentials, account_id: int,
-                           order: OrderInput, *, settings: Settings) -> dict:
+                           order: OrderInput, *, settings: Settings,
+                           risk_guard=None) -> dict:
     """完整下单时序（§2.2）：守门→设杠杆→下单→留痕。失败归一并审计后上抛（绝不假成功）。"""
     cl_ord_id = order.client_order_id or _gen_cl_ord_id()
     trace = order.submission_trace
@@ -184,10 +186,21 @@ async def place_live_order(session: AsyncSession, creds: AccountCredentials, acc
         if order.lever is not None:
             await client.set_leverage(order.inst_id, order.lever, order.td_mode,
                                       _leverage_pos_side(order, pos_mode))
-        if trace is not None:
+        if trace is not None and risk_guard is None:
             trace.phase = "sent"
+        before_send = None
+        if risk_guard is not None:
+            def before_send():
+                if not risk_guard.validate(
+                        order, size=float(payload["sz"]), ct_val=meta.ct_val,
+                        px=float(payload.get("px", last_px))):
+                    raise OKXPrivateError(
+                        "sizing_exposure_cap", "实际提交量超过风险上限，暂不建仓")
+                if trace is not None:
+                    trace.phase = "sent"
         if order.client_order_id is not None:
-            row = await client.place_order(payload, allow_retry=False)
+            kwargs = {"before_send": before_send} if before_send is not None else {}
+            row = await client.place_order(payload, allow_retry=False, **kwargs)
         else:
             row = await client.place_order(payload)
         ord_id = str(row.get("ordId") or "")

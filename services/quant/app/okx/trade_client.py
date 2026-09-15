@@ -61,7 +61,8 @@ def should_advance(exc: OKXPrivateError) -> bool:
 class OKXTradeClient(OKXPrivateClient):
     """实盘交易客户端：签名 POST 下单 / 设杠杆 + 签名 GET 查成交 / 挂单。"""
 
-    async def _post(self, path: str, payload: dict, *, allow_retry: bool | None = None) -> dict:
+    async def _post(self, path: str, payload: dict, *, allow_retry: bool | None = None,
+                    before_send=None) -> dict:
         """签名 POST：返回 OKX 完整响应体（dict）；连通 / HTTP 失败抛 ``OKXPrivateError``。
 
         业务码判定交由调用方（下单须同看顶层 ``code`` 与 ``data[0].sCode``，§2.2f）。HTTP ``429``
@@ -94,6 +95,8 @@ class OKXTradeClient(OKXPrivateClient):
             client = await self._get_client()   # 每跳都问池要（换代后立刻拿到新连接，P1-1）
             ts = _iso_timestamp()
             headers = self._headers(ts, "POST", path, body)
+            if before_send is not None:
+                before_send()  # 限流与连接池等待后同步复核；本地否决不进入传输重试。
             try:
                 resp = await client.post(path, content=body, headers=headers)
             except Exception as exc:  # noqa: BLE001 —— 谓词见 docstring：进了这里即传输层失败
@@ -129,14 +132,15 @@ class OKXTradeClient(OKXPrivateClient):
         raise OKXPrivateError("OKX_UNREACHABLE", f"无法连接 OKX ({path}): {last_exc}")
 
     async def place_order(self, payload: dict, *,
-                          allow_retry: bool | None = None) -> dict:
+                          allow_retry: bool | None = None, before_send=None) -> dict:
         """``POST /api/v5/trade/order``：先看顶层 ``code`` 再看 ``data[0].sCode``，任一非 ``"0"`` 抛错。
 
         成功返回 ``data[0]``（含 ``ordId / clOrdId``）；失败以**具体 sCode**（缺则顶层 code）抛
         ``OKXPrivateError``，原始 ``sMsg`` 作 message，由服务层归一为语义码（§6）。
         """
+        kwargs = {"before_send": before_send} if before_send is not None else {}
         body = await self._post(
-            "/api/v5/trade/order", payload, allow_retry=allow_retry)
+            "/api/v5/trade/order", payload, allow_retry=allow_retry, **kwargs)
         rows = body.get("data") or []
         row = rows[0] if rows else {}
         top_code = str(body.get("code"))

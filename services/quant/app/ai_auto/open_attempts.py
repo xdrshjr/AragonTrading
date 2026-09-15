@@ -163,7 +163,7 @@ class OpenAttemptManager:
             None if success is True else "attempt_persist_failed")
         return success is True
 
-    async def prepare(self, order: OrderInput) -> bool:
+    async def prepare(self, order: OrderInput, *, risk_notional_cap=None) -> bool:
         """确认真实发送边界后，原子预写身份和可选逆势预留。"""
         queue = self._extras.get("pendingTrades")
         if queue is not None and queue != []:
@@ -184,6 +184,8 @@ class OpenAttemptManager:
             {key: getattr(order, key) for key in _ORDER_FIELDS},
             order.client_order_id or "", estimate=deepcopy(self._estimate),
             created_ts=now, updated_ts=now)
+        if risk_notional_cap is not None:
+            self.pending.order["riskNotionalCap"] = risk_notional_cap
         try:
             persisted = await self._persist()
         except asyncio.CancelledError:

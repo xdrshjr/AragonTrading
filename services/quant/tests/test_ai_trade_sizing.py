@@ -197,19 +197,20 @@ def test_atr_unavailable_falls_back_verbatim():
 
 
 # ---------- T-18 / T-23：档位地板的分辨率与「反噬」观测量 ----------
-def test_quantize_resolution_documented():
+def test_risk_below_minimum_gear_is_rejected():
     out = resolve_size_fraction(_inputs(model_fraction=0.03, realized_vol_bar=None, p_win=None,
                                         step=0.25), _rule(), _BAR_15M)
-    assert out.fraction == 0.25          # 任何 >0 的开仓意图至少落到最小一格
+    assert out.fraction == 0.0
+    assert out.floor_verdict == "below_gear_floor"
 
 
-def test_quantize_floor_erases_brake_is_detected():
+def test_quantize_floor_cannot_erase_brake():
     out = resolve_size_fraction(_inputs(model_fraction=0.25, brake_mult=0.5,
                                         realized_vol_bar=None, p_win=None, step=0.25),
                                 _rule(), _BAR_15M)
-    assert out.fraction == 0.25          # 0.25 × 0.5 = 0.125 → 吸附回 0.25：第一档减速是纯 no-op
+    assert out.fraction == 0.0           # 减速后的 0.125 达不到最低档，拒绝建仓。
     assert out.fraction_raw == 0.125     # 但吸附前的解如实留痕
-    assert out.scale_erased is True      # 且这件事必须被观测到（否则运维会认定刹车生效了）
+    assert out.scale_erased is False
     assert out.scale_source == "brake"
 
 
@@ -217,7 +218,7 @@ def test_scale_not_erased_with_finer_step():
     out = resolve_size_fraction(_inputs(model_fraction=0.5, brake_mult=0.5,
                                         realized_vol_bar=None, p_win=None, step=0.1),
                                 _rule(), _BAR_15M)
-    assert out.fraction == 0.3 or out.fraction == 0.2   # 0.25 吸附到 0.1 阶梯的最近一格
+    assert out.fraction == 0.2          # 不超过连续风险上限 0.25。
     assert out.scale_erased is False
 
 

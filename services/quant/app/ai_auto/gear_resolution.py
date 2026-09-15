@@ -25,7 +25,7 @@ from .signals import position_ladder, quantize_size_fraction
 
 _EPS = 1e-9
 
-# 会被档位地板吸附回原值的三个机制（声明序即界面展示序）。
+# 三个机制的诊断字段保持兼容；仓位层的硬缩减不会被档位抬回。
 # **相关性缩减没有配置常数**：`corr_scale` 的值域是 `[0,1]`，由组合有效敞口现算；用 0.5 作代表值
 # 是因为它恰是「缩到一半」这个最典型的断面——比它更狠的缩减只会更容易被地板吃掉，故判据保守。
 _CORR_REPRESENTATIVE_MULT = 0.5
@@ -62,7 +62,9 @@ def describe_gear_resolution(step: float, *, brake_rule=None,
                              consensus_rule=None) -> GearResolution:
     """这个档位会让哪几层风控失效（启动弹窗 / 纪律自检 / 启动回执共用同一份判据）。
 
-    判据对每个机制的系数 `m`：**它在这套阶梯上有多少格是彻头彻尾的空转**——
+    仓位层的回撤刹车和相关性缩减采用保守取档，无正档时拒绝开仓，
+    因此不会被档位吸附抵消；两者的失效格数恒为零。
+    逆势通路仍按模型提议的吸附规则评估其系数 `m`：
 
         dead = #{g ∈ ladder | quantize_size_fraction(g × m, step) >= g − eps}
         erased = m < 1 且 dead × 2 >= gears        # 失效面过半
@@ -104,8 +106,9 @@ def describe_gear_resolution(step: float, *, brake_rule=None,
     erased, survives, dead_gears = [], [], {}
     for key in _MECHANISM_LABELS:
         mult = mults[key]
-        dead = sum(1 for gear in ladder
-                   if quantize_size_fraction(gear * mult, step) >= gear - _EPS)
+        dead = (sum(1 for gear in ladder
+                    if quantize_size_fraction(gear * mult, step) >= gear - _EPS)
+                if key == "contrarian" else 0)
         dead_gears[key] = dead
         (erased if mult < 1.0 and dead * 2 >= len(ladder) else survives).append(key)
     return GearResolution(step=float(step), gears=len(ladder), min_gear=ladder[0],

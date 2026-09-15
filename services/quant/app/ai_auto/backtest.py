@@ -1136,7 +1136,9 @@ class AiBacktestRunner:
                 self._pending_exit_source = "agentReverse"
         try:
             if signals:
-                self.main.submit(signals)
+                kwargs = ({"open_risk_limit": self._sizing.order_risk_limit}
+                          if self._sizing.order_risk_limit is not None else {})
+                self.main.submit(signals, **kwargs)
         finally:
             added = self.main._pending[pending_before:]
             accepted_open = any(order.action == "open" for order in added)

@@ -27,6 +27,17 @@ def _round(counters: OpenFunnelCounters, action: str, degrade: str | None = None
     counters.end_round()
 
 
+def test_submit_risk_veto_is_counted_once_as_sizing_zeroed():
+    counters = OpenFunnelCounters()
+    counters.note_intent("open_long", None)
+    receipt = {"status": "not_submitted", "reason": "sizing_exposure_cap"}
+    counters.note_receipt(receipt)
+    counters.end_round(receipt)
+    assert counters.sizing_zeroed == 1
+    assert counters.sizing_zeroed_by_side == {"long": 1}
+    assert sum(counters.execution_blocked.values()) == 0
+
+
 @pytest.mark.parametrize("status", ["accepted", "rejected"])
 def test_unknown_receipt_resolution_moves_one_original_outcome(status):
     counters = OpenFunnelCounters()

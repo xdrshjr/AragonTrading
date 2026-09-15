@@ -76,6 +76,7 @@ class _Order:
     side: Literal["long", "short"] | None = None
     strength: float = 1.0
     reason: str = ""
+    risk_limit: tuple[float, float] | None = None
 
 
 def _positive_float(value) -> float | None:
@@ -164,7 +165,8 @@ class SimBroker:
                 if self.pos.side != "flat":
                     self._close_at(open_price, ts, od.reason or "signal_close")
             elif od.action == "open" and self.pos.side == "flat":
-                self._open(od.side, od.strength, open_price, ts, bar_index, od.reason or "signal_open")
+                self._open(od.side, od.strength, open_price, ts, bar_index,
+                           od.reason or "signal_open", risk_limit=od.risk_limit)
 
     def apply_risk(self, bar_index: int, row, _risk: RiskParams) -> None:
         """阶段 2：本根内风控（止损/止盈触发价强平；max_hold 到期排队次根平）。"""
@@ -203,7 +205,7 @@ class SimBroker:
         dd = (eq / self.peak_equity - 1.0) if self.peak_equity > 0 else 0.0
         self.equity_points.append(EquityRecord(ts=ts, equity=eq, drawdown=min(dd, 0.0)))
 
-    def submit(self, signals: list) -> None:
+    def submit(self, signals: list, *, open_risk_limit=None) -> None:
         """阶段 4：把策略信号翻译为排队订单（次根开盘成交）。"""
         projected = self.pos.side
         for sig in signals:
@@ -220,7 +222,7 @@ class SimBroker:
                 if projected != "flat":            # 反手：先平再开
                     self._pending.append(_Order(action="close", reason=reason or "reverse"))
                 self._pending.append(_Order(action="open", side=side, strength=max(0.0, min(strength, 1.0)),
-                                            reason=reason or "signal_open"))
+                                            reason=reason or "signal_open", risk_limit=open_risk_limit))
                 projected = side
 
     def finalize(self, ts: int, close: float) -> None:
@@ -253,8 +255,16 @@ class SimBroker:
         self._close_at(px, ts, reason)
 
     # ================= 成交内部实现 =================
-    def _open(self, side, strength, ref_price, ts, bar_index, reason) -> None:
+    def _open(self, side, strength, ref_price, ts, bar_index, reason, *, risk_limit=None) -> None:
         strength = max(0.0, min(float(strength), 1.0))
+        if risk_limit is not None:
+            from ..ai_auto.sizing import risk_fraction_candidates
+            cap, step = risk_limit
+            full = self.cash * self.leverage
+            if not math.isfinite(full) or full <= 0 or not math.isfinite(cap):
+                return
+            candidates = risk_fraction_candidates(min(strength, cap / full), step)
+            strength = candidates[0] if candidates else 0.0
         if strength <= 0:
             return
         equity = self.cash  # 开仓时为 flat，equity == cash
@@ -262,7 +272,11 @@ class SimBroker:
         if notional <= 0:
             return
         fill = self._buy_price(ref_price) if side == "long" else self._sell_price(ref_price)
+        if risk_limit is not None and _positive_float(fill) is None:
+            return
         qty = notional / fill
+        if risk_limit is not None and _positive_float(qty) is None:
+            return
         fee = qty * fill * self.fee_rate
         self.cash -= fee
         self.fees_paid += fee

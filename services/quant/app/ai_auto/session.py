@@ -397,6 +397,7 @@ class AiTradeSession:
         self._prior = PriorRuntime(prior_snapshot, executor.settings, horizon_bars=hold_bars)
         # 仓位 / 刹车层（vol-sizing §3.1）：同款下沉；未装配 ⇒ 零动作、无 sizingPlan 键、risk 从不被赋值。
         self._sizing = sizing or SizingRuntime()
+        self._sizing.bind_executor(executor, step=decider.position_step)
         # 实测战绩回喂（realized-edge-calibration 轴 D）：同款「运行时对象 + inject(payload)」范式；
         # 四条门禁任一不满足 ⇒ payload 无 trackRecord 键 ⇒ prompt 逐字节回退。会话段每轮现算（零 IO）。
         self._track = TrackRecordRuntime(track_record, executor.settings,

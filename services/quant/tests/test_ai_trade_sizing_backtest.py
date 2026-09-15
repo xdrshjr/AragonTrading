@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from sqlalchemy import select
 
 from app.agent.llm.base import StreamEvent
@@ -29,6 +31,41 @@ from app.paper.strategy_factory import build_paper_strategy_spec
 from app.strategies.base import Signal
 
 from tests.conftest import make_synthetic_candles
+
+
+@pytest.mark.parametrize("price", [float("nan"), float("inf"), 0.0, -1.0])
+def test_guarded_backtest_rejects_invalid_fill_price(price):
+    broker = SimBroker(100, leverage=5)
+    broker.submit([Signal(side="long", strength=0.4)], open_risk_limit=(200, 0.1))
+    broker.fill_pending(price, 1000, 0)
+    assert broker.pos.side == "flat"
+    assert broker.trades == []
+
+
+@pytest.mark.parametrize("cash,price,expected", [(200, 120, 0.25), (50, 80, 0.5)])
+async def test_backtest_fill_respects_frozen_risk_cap_after_equity_change(
+        monkeypatch, cash, price, expected):
+    from app.ai_auto.sizing_runtime import SizingContext
+
+    try:
+        sid, paper = await _seed_spec()
+        candles = make_synthetic_candles(200)
+        settings = _sizing_settings(ai_trade_vol_target_annual=0)
+        _patch_loaders(monkeypatch, candles, _StubLLM(_alternating))
+        runner = AiBacktestRunner(_spec(sid, paper, candles, settings))
+        runner.main.cash = 100
+        decision = TradeDecision(action="open_long", size_fraction=0.5,
+                                 confidence=0.8, reason="测试")
+        final, _, _ = runner._sizing.resolve(decision, SizingContext(
+            step=0.25, ref_px=100, notional_full=100 * runner.leverage))
+        runner._execute(final, ts=1000)
+        runner.main.cash = cash
+        runner.main.fill_pending(price, 2000, 1)
+        trade = runner.main.trades[-1]
+        assert trade.qty * trade.price == pytest.approx(cash * runner.leverage * expected)
+        assert trade.qty * trade.price <= 50 * runner.leverage + 1e-10
+    finally:
+        await dispose_engine()
 
 
 class _StubLLM:

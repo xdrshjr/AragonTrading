@@ -252,6 +252,10 @@ class OpenFunnelCounters:
             self._note_execution_block(side, reason)
 
     def _note_execution_block(self, side: str, reason: str | None) -> None:
+        if reason and reason.startswith("sizing_"):
+            self.sizing_zeroed += 1
+            _bump(self.sizing_zeroed_by_side, side)
+            return
         key = reason if reason in EXECUTION_REASONS else "other"
         _bump(self.execution_blocked, key)
         _bump(self.execution_blocked_by_side.setdefault(side, {}), key)

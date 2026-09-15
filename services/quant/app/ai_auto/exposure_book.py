@@ -18,7 +18,7 @@ asyncio 事件循环里，同步方法之间不可能交错，因此不需要锁
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 # 每个成员保留的收益率样本上限（按 ts 键存；远超任何合理的 corr_min_samples，防长跑无界增长）。
 _RETURNS_MAX = 2000
@@ -32,7 +32,7 @@ class ExposureView:
         effective: 按**提议原值**（s=1）算出的有效敞口（USD 名义额）。
         cap_abs: 本分组的有效敞口上限 = `exposure_cap_mult × 平均单标的满仓名义额`。
         scale: 闭式解出的缩减系数 ∈ [0,1]（1.0 = 无需缩减）。
-        unreachable: 其余成员自身的二次型已越界，`s=0` 也救不回来（[P1-3] 的边缘态）。
+        unreachable: 当前提议在 `s ∈ [0,1]` 内没有可行解；不表示所有对冲都不可行。
         members: 参与计算的成员数（含本成员）。
         min_overlap: 与其余成员的最小重叠样本数（`None` = 没有其余成员）。
     """
@@ -62,9 +62,8 @@ def solve_exposure_scale(*, a: float, b: float, c: float,
     正确解法是直接解二次不等式 `a·s² + 2b·s + (c − cap²) ≤ 0`。
 
     Returns:
-        `(s, unreachable)`。`unreachable=True` ⇒ `[0,1]` 内无解（其余成员自身已越界），此时返回
-        `s=0` 并**放行**（S-3：本层永不改写 action）——一个算得出来却做不到的上限，必须如实标注而不是
-        假装缩到位了。
+        `(s, unreachable)`。`unreachable=True` 表示该提议在 `[0,1]` 内无解，返回
+        `s=0`；仓位运行时必须拒绝没有可行正仓位的提议。该纯函数不发送订单。
     """
     cap = max(0.0, float(cap_abs))
     q0 = c - cap * cap
@@ -97,6 +96,48 @@ class GroupExposureBook:
         self.bar_seconds = max(1, int(bar_seconds))
         self._returns: dict[str, dict[int, float]] = {}
         self._notional: dict[str, float] = {}
+        self._providers: dict = {}
+
+    def register(self, inst_id: str, provider) -> None:
+        """登记同步断面函数，返回持仓名义额与可能成交的剩余名义额。"""
+        self._providers[inst_id] = provider
+
+    def _bounds(self, exclude: str) -> dict[str, tuple[float, float]]:
+        bounds = {inst: (value, value) for inst, value in self._notional.items()
+                  if inst != exclude}
+        for inst, provider in self._providers.items():
+            if inst == exclude:
+                continue
+            actual, pending = provider()
+            bounds[inst] = (min(actual, actual + pending),
+                            max(actual, actual + pending))
+        return bounds
+
+    def allows(self, inst_id: str, proposed: float, min_samples: int) -> bool:
+        """检查最终名义额及在途订单所有成交端点的保守二次型上界。
+
+        固定持仓按带符号相关性计入；挂单用区间表示，未成交对冲不抵扣。
+        逐项取区间最大值是 O(n²) 的安全上界，可能保守拒绝，绝不放宽上限。
+        容差为计算项量级的 16 ULP（USD²），不使用展示舍入精度。
+        """
+        if _finite(proposed) is None:
+            return False
+        if self.cap_mult <= 0 or self.unit_notional <= 0:
+            return True
+        bounds = self._bounds(inst_id)
+        bounds[inst_id] = (proposed, proposed)
+        terms = []
+        for left, xs in bounds.items():
+            for right, ys in bounds.items():
+                if not all(math.isfinite(v) for v in (*xs, *ys)):
+                    return False
+                rho = self._rho(left, right, min_samples)
+                terms.append(max(x * y * rho for x in xs for y in ys))
+        cap_sq = (self.cap_mult * self.unit_notional) ** 2
+        magnitude = max(cap_sq, math.fsum(abs(term) for term in terms))
+        if not math.isfinite(magnitude):
+            return False
+        return math.fsum(terms) <= cap_sq + 16 * math.ulp(magnitude)
 
     # ---------- 喂数（纯同步，全部无 await）----------
     def publish_returns(self, inst_id: str, closes, as_of_ts: int) -> None:
@@ -134,7 +175,10 @@ class GroupExposureBook:
         if self.cap_mult <= 0 or self.unit_notional <= 0:
             return None
         proposed = _finite(proposed_notional) or 0.0
-        others = [(other, w) for other, w in self._notional.items()
+        current = dict(self._notional)
+        current.update({inst: provider()[0]
+                        for inst, provider in self._providers.items()})
+        others = [(other, w) for other, w in current.items()
                   if other != inst_id and abs(w) > 0]
         cap_abs = self.cap_mult * self.unit_notional
         a = proposed * proposed
@@ -144,8 +188,8 @@ class GroupExposureBook:
         scale, unreachable = solve_exposure_scale(a=a, b=b, c=c, cap_abs=cap_abs)
         overlaps = [self._overlap(inst_id, other) for other, _ in others]
         return ExposureView(
-            effective=round(math.sqrt(max(0.0, a + 2.0 * b + c)), 4),
-            cap_abs=round(cap_abs, 4), scale=round(scale, 6), unreachable=unreachable,
+            effective=math.sqrt(max(0.0, a + 2.0 * b + c)),
+            cap_abs=cap_abs, scale=scale, unreachable=unreachable,
             members=len(others) + 1, min_overlap=min(overlaps) if overlaps else None)
 
     # ---------- 相关性 ----------
@@ -180,7 +224,7 @@ def exposure_wire(view: ExposureView | None, *, corr_scale: float = 1.0) -> dict
     if view is None:
         return {"effectiveExposure": None, "effectiveExposureCap": None,
                 "corrScale": round(corr_scale, 6), "exposureCapUnreachable": False}
-    return {"effectiveExposure": view.effective, "effectiveExposureCap": view.cap_abs,
+    return {"effectiveExposure": round(view.effective, 4), "effectiveExposureCap": round(view.cap_abs, 4),
             "corrScale": round(corr_scale, 6), "exposureCapUnreachable": view.unreachable}
 
 
@@ -190,3 +234,148 @@ def _finite(value) -> float | None:
     except (TypeError, ValueError):
         return None
     return out if math.isfinite(out) else None
+
+
+class OrderRiskGuard:
+    """单成员开仓提交保护，复用执行器订单身份及恢复状态，无 IO。"""
+
+    def __init__(self, executor, book, rule, step: float):
+        self.executor, self.book, self.rule = executor, book, rule
+        self.step = step
+        self.max_fraction = 0.0
+        self.max_notional = 0.0
+        self.mark_px = 0.0
+        self.reserved = None
+        self.close_pending = False
+        if book is not None:
+            book.register(executor.inst_id, self.snapshot)
+
+    def set_limit(self, fraction: float, full: float) -> None:
+        """冻结决策时风险上限，后续权益或预算上涨不能放大该提议。"""
+        self.max_fraction = fraction
+        self.max_notional = fraction * full
+
+    def _allows(self, signed: float) -> bool:
+        return (self.book is None or self.rule.exposure_cap_mult <= 0
+                or self.book.allows(self.executor.inst_id, signed,
+                                    self.rule.corr_min_samples))
+
+    def reserve(self, order, ref_px: float, strength: float):
+        """按实际提交价格取张数，检查并占用在一次同步调用中完成。"""
+        from .sizing import risk_fraction_candidates
+
+        ex = self.executor
+        if ex.projected == "flat":
+            # 反手可在两次组合快照之间完成，旧平仓状态不能传给新开仓腿。
+            self.close_pending = False
+        if self.reserved is not None:
+            return None
+        px = ref_px if order.px is None else order.px
+        full = ex.budget_usd * ex.leverage
+        values = (px, full, ex.ct_val, ex.lot_sz, ex.min_sz,
+                  self.max_fraction, self.max_notional, strength)
+        if not all(_finite(v) is not None and v > 0 for v in values):
+            return None
+        upper = min(strength, self.max_fraction, self.max_notional / full)
+        sign = 1 if order.direction == "long" else -1
+        for fraction in risk_fraction_candidates(upper, self.step):
+            size = ex._compute_sz(fraction, px)
+            notional = size * ex.ct_val * px
+            # snap_size 自带 epsilon；最终比较仍不可把它变成额外风险额度。
+            if notional > fraction * full:
+                size = max(0.0, size - ex.lot_sz)
+                notional = size * ex.ct_val * px
+            if size < ex.min_sz or size <= 0 or not self._allows(sign * notional):
+                continue
+            selected = replace(order, sz=size)
+            self.mark_px = ref_px
+            self.reserved = (selected, notional)
+            return selected
+        return None
+
+    def validate(self, order, *, size: float, ct_val: float, px: float) -> bool:
+        """跨 await 后及传输前按最终量复核；不改已持久化的委托数量。"""
+        if self.reserved is None:
+            return False
+        reserved, cap = self.reserved
+        values = (size, ct_val, px, cap)
+        if not all(_finite(v) is not None and v > 0 for v in values):
+            return False
+        notional = size * ct_val * px
+        if (reserved.client_order_id != order.client_order_id
+                or abs(size - reserved.sz) > 8 * math.ulp(reserved.sz)
+                or notional > cap + 8 * math.ulp(cap)):
+            return False
+        return self._allows(notional if order.direction == "long" else -notional)
+
+    def finish(self, receipt) -> None:
+        """明确未发送/拒绝可释放；确认单移交既有挂单/持仓/恢复身份。"""
+        if self.reserved is None or receipt is None:
+            return
+        order, _ = self.reserved
+        if receipt.cl_ord_id != order.client_order_id:
+            return
+        ex = self.executor
+        pending = getattr(getattr(ex, "open_attempts", None), "pending", None)
+        transferred = (pending is not None and pending.cl_ord_id == receipt.cl_ord_id)
+        if (receipt.status in {"not_submitted", "rejected"} or transferred
+                or (receipt.status == "accepted"
+                    and (ex.resting is not None or ex.projected != "flat"))):
+            self.reserved = None
+
+    def snapshot(self) -> tuple[float, float]:
+        """平仓未决时对冲腿可能归零；撤余单不能证明旧持仓尚完整。"""
+        ex = self.executor
+        actual, pending = self._open_snapshot()
+        if ex.projected == "flat":
+            self.close_pending = False
+        if ((ex.resting is not None and ex.resting.intent == "close")
+                or getattr(ex, "_settling", None) is not None):
+            self.close_pending = True
+        if self.close_pending:
+            # 同时存在未决开仓与平仓时不猜净数量；只限制分组新增风险。
+            return actual, -actual if pending == 0 else math.inf
+        return actual, pending
+
+    def _open_snapshot(self) -> tuple[float, float]:
+        """实时持仓与余单区间，部分成交只计一次；未知恢复契约封闭放行。"""
+        ex = self.executor
+        sign = 1 if ex.projected == "long" else -1 if ex.projected == "short" else 0
+        px = self.mark_px or ex.entry_price
+        actual = sign * ex.entry_qty_sz * ex.ct_val * px
+        attempts = getattr(ex, "open_attempts", None)
+        pending = getattr(attempts, "pending", None)
+        if pending is not None:
+            if pending.ack == "rejected":
+                return actual, 0.0
+            if "riskNotionalCap" not in pending.order:
+                return actual, math.inf
+            return actual, self._pending_notional(
+                pending.order, pending.adopted_qty)
+        if attempts is not None and attempts.has_pending:
+            return actual, math.inf
+        resting = ex.resting
+        if resting is not None and resting.intent == "open":
+            details = attempts.order_details(resting.cl_ord_id) if attempts else {}
+            if attempts is not None and "riskNotionalCap" not in details:
+                return actual, math.inf
+            details = {"sz": resting.sz, "px": resting.px,
+                       "direction": resting.side, **details}
+            return actual, self._pending_notional(details, resting.adopted_sz)
+        if self.reserved is not None:
+            order, notional = self.reserved
+            return actual, notional if order.direction == "long" else -notional
+        return actual, 0.0
+
+    def _pending_notional(self, order: dict, adopted: float) -> float:
+        size = float(order["sz"])
+        cap = order.get("riskNotionalCap")
+        if cap is None:
+            px = order.get("px")
+            if _finite(px) is None or px <= 0:
+                return math.inf
+            cap = size * self.executor.ct_val * px
+        if _finite(cap) is None or cap <= 0 or size <= 0:
+            return math.inf
+        remaining = max(0.0, size - adopted) / size * cap
+        return remaining if order["direction"] == "long" else -remaining

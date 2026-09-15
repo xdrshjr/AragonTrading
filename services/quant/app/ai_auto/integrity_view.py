@@ -20,6 +20,14 @@ _EXECUTION_MESSAGES = {
     "facts_unavailable": "当前事实不完整，暂不提交开仓",
     "quota_exhausted": "本次运行的逆势开仓额度已用尽",
     "session_not_running": "会话已暂停或停止",
+    "sizing_exposure_cap": "实际可执行档位超过风险上限，暂不建仓",
+}
+
+_SIZING_MESSAGES = {
+    "solved_zero": "风险约束下仓位求解为零，未新增开仓",
+    "below_gear_floor": "最小档超过风险上限，暂不建仓",
+    "exposure_cap": "取档后组合风险超过上限，暂不建仓",
+    "invalid_quantity": "风险仓位数值无效，暂不建仓",
 }
 
 
@@ -48,11 +56,9 @@ def _diagnosis(session, pending: dict | None) -> dict:
         code, message = "acceptance_unknown", "开仓回执待核实，暂停新增开仓"
     elif session._stale_degraded:
         code, message = "market_unavailable", "行情证据不可用"
-    elif floor in ("solved_zero", "below_gear_floor"):
+    elif floor in _SIZING_MESSAGES:
         code = "sizing_zeroed"
-        message = ("风险约束下仓位求解为零，未新增开仓"
-                   if floor == "solved_zero" else
-                   "仓位求解低于允许档位，未新增开仓")
+        message = _SIZING_MESSAGES[floor]
     elif reason:
         code = classify_block(reason)
         message = LAYER_LABELS.get(code, "当前条件未通过")

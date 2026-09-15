@@ -5,7 +5,7 @@
 把下注规模从「模型叙事决定」改造为「确定性计算决定」的那一层：
 
     f_core = min(凯利项 × λ, 波动率目标项, f_max)
-    f      = min(f_core, 模型提议) × 刹车系数 × 相关性系数，最后经 `quantize_size_fraction` 吸附
+    f      = min(f_core, 模型提议) × 刹车系数 × 相关性系数，最后保守选择合法档位
 
 **刹车与相关性的作用位置（实施期修正，见 spec §「实施过程发现的方案缺陷」D-1）**：两个乘性系数必须
 作用在「与模型提议取小**之后**」的结果上，而不是只缩系统上限 `f_core`。原因是 `f_core` 在两项都不可算
@@ -17,8 +17,7 @@
 四条不可动摇的不变式（改本文件前先读）：
 
 1. **只收不放（S-1）**：任何路径下的输出都 ≤ 进入本层时的模型提议——本层与模型提议取 `min`，绝不放大。
-2. **永不改写 action（S-3）**：本层只解 `f`。「不该开」由铁律层 / 冷却层 / 共识 / 最小 edge 门禁 / 反思
-   负责，在这里再判一次就是对同一件事收第二次税。
+2. **无可行正仓位必须拒绝**：纯函数返回零占比和原因，运行时在信号生成前转为 hold。
 3. **凯利赔率的 `W`/`L` 恒取本轮实际要挂的那对括号（S-12）**：本模块**不 import `edge_gate`**，也绝不
    读门禁的 edge 读数——那个量的语义随来源变（ATR 时是「若走对能吃到多少」的条件幅度，先验时已是按
    胜率加权的期望），当成赔率再乘一次 `p` 就是对同一个胜率收两次税。`W`/`L` 只能来自 §3.4 解出的、
@@ -27,10 +26,8 @@
    `budget × leverage` 与分组天花板负责。把 `leverage` 再乘进分母等于对同一条红线收两次税——3× 杠杆下
    `f_vol` 会被压到 0.06，永远落到最小格，本层退化为常数。
 
-**诚实声明（分辨率）**：`quantize_size_fraction` 内含 `max(1, …)`，任何 `>0` 的开仓意图至少落到最小一
-格。`step=0.25`（默认）时本层的实际分辨率只有 4 档，一切 `f < 0.25` 的结果都会落到 `0.25`——第一档减速
-（×0.5）与相关性缩减在最常见断面上因此是 **no-op**。本模块**不为自己绕过档位**（档位是用户显式配置的
-硬约束），而是把这件事如实暴露成 `SizingOutcome.scale_erased` + `fraction_raw`（[P1-2]）。
+档位真源仍为 `position_ladder`；风险解低于最低档时拒绝开仓，不能抬高风险解。
+模型提议的就近吸附语义由 `signals.quantize_size_fraction` 保留。
 """
 from __future__ import annotations
 
@@ -39,7 +36,7 @@ from dataclasses import dataclass, field, replace
 
 from .decider import TradeDecision
 from .profit_guard import sanitize_atr
-from .signals import quantize_size_fraction
+from .signals import position_ladder
 
 # 受本层约束的动作（豁免矩阵冻结，与 `edge_gate._GATED_ACTIONS` / `base_rules._GATED_ACTIONS` 逐字同构）。
 _GATED_ACTIONS = ("open_long", "open_short")
@@ -145,7 +142,7 @@ class SizingOutcome:
     """一次求解的产物；`fraction is None` ⇒ 本层不作用（调用方原样直通，`decision` 对象 `is` 相等）。
 
     Attributes:
-        fraction: 最终占比（已吸附）。
+        fraction: 最终占比（保守取档，无合法正档时为零）。
         fraction_raw: **吸附前**的解——§7.3 的「仓位-波动率秩相关」只能用它（[P2-7]：吸附后默认只有
             2~3 个取值，秩相关在统计上不可评估）。
         f_vol: 波动率目标项；`None` = 不参与 `min`。
@@ -154,8 +151,8 @@ class SizingOutcome:
         scale_source: model | vol | kelly | brake | correlation——本层是否真的绑定过（§7.3 的对偶监控）。
         scale_erased: 缩减被档位地板整个吃掉了（[P1-2] 的观测量）。
         vol_source: realized | insufficient_samples | disabled（[P1-6]：暖机不足与配错了不是一回事）。
-        floor_verdict: none | solved_zero | below_gear_floor —— 本层是否在**吸附之前**就判定这一单
-            不该发（fill-truth-and-effective-controls 轴 C-1）。`none` 以外的取值一律伴随
+        floor_verdict: none | solved_zero | below_gear_floor | exposure_cap |
+            invalid_quantity，表示最终风险判定。`none` 以外的取值一律伴随
             `fraction == 0.0`，且调用方**必须**把决策改成 hold（见 `sizing_runtime.resolve`）。
         wire: 本产物自身的 camelCase 只读读数（`sizing_wire` 再与 plan/brake/exposure 合成整段）。
     """
@@ -174,13 +171,10 @@ class SizingOutcome:
 
 @dataclass(frozen=True)
 class SizingFloorPolicy:
-    """吸附之前的两条「这个解算结果该不该变成一张单」判据（轴 C-1）。
+    """保留旧地板设置的解析兼容性；关闭它们不能绕过最终风险上限。
 
     Attributes:
-        zero_is_veto: `f_raw` 精确为 0 时否决。默认由 `ai_trade_sizing_zero_is_veto` 给（True）。
-            理由不是一个阈值而是一个恒等式：`corr_scale ∈ [0,1]`、`brake_mult ∈ (0,1]`，解出精确
-            的 0 只有一个含义——**这一单的风险预算是零**。把它翻译成「开最小一格」不是保守化，是
-            把一个明确的否决改成一次开仓（生产实测 DOGE 两轮 `avgScaleRatio = 0.0`）。
+        zero_is_veto: 开启时把极小正解也视为零；非正风险量始终拒绝。
         floor_ratio: `0 < f_raw < step × floor_ratio` 也否决。**默认 0.0 ⇒ 该判据逐字不存在**。
     """
 
@@ -387,17 +381,16 @@ def resolve_stop_distance(*, atr_px, ref_px, rule: StopRule | None,
 # ============================ 求解（§3.3 的七步）============================
 def resolve_size_fraction(inputs: SizingInputs, rule: SizingRule, bar_seconds: int,
                           policy: "SizingFloorPolicy | None" = None) -> SizingOutcome:
-    """解出本轮下单占比（只收不放、绝不改 action）。
+    """解出本轮下单占比；无合法正档返回否决，运行时负责生成 hold。
 
     步骤与 §3.3 逐条对应：动作白名单 → 波动率目标项 → 凯利项 → 取小夹紧 → 刹车与相关性 → 与模型提议
-    取小 → **地板判据（轴 C-1）** → 档位吸附。任一项不可算都只是「该项不参与 `min`」，绝不翻译成否决。
+    取小 → 地板判据 → 保守取档。缺失的估计项不参与 min，非有限最终量拒绝。
 
     Args:
         inputs: 本轮断面。
         rule: 本会话的仓位规则。
         bar_seconds: 每根秒数（波动率年化 ↔ 每根的换算）。
-        policy: 地板判据（fill-truth-and-effective-controls 轴 C-1）。**默认 None ⇒ 两条判据
-            整体不存在 ⇒ 逐字回退**（回测与全部既有单测走的就是它）。
+        policy: 旧地板阈值；缺席或关闭不能绕过连续风险上限。
     """
     if inputs.action not in _GATED_ACTIONS:
         return SizingOutcome(fraction=None)
@@ -414,44 +407,56 @@ def resolve_size_fraction(inputs: SizingInputs, rule: SizingRule, bar_seconds: i
     # 「刹车与相关性的作用位置」）：只缩上限时，模型给 0.25 而上限是 1.0 的最常见断面上，×0.5 的第一档
     # 减速一点作用都没有——那正是本层要治的东西。
     entry = inputs.model_fraction if inputs.model_fraction is not None else f_core
-    f_raw = min(entry, f_core) * brake * corr
+    valid = all(_finite(value) is not None for value in
+                (entry, f_core, inputs.brake_mult, inputs.corr_scale))
+    f_raw = min(entry, f_core) * brake * corr if valid else float("nan")
     # ★ 轴 C-1：在**吸附之前**先判「这个解算结果该不该变成一张单」。`quantize_size_fraction` 的
     # `max(1, …)` 保证任何 `>0` 的意图至少落到最小一格——它对「模型给了个很小的数」是对的，对
     # 「风控层解出了零」却是把否决改写成开仓。生产实测 DOGE 两轮解出 0.0，被抬成半仓。
     verdict = _floor_verdict(f_raw, policy, step=inputs.step)
     if verdict != "none":
         vetoed = SizingOutcome(
-            fraction=0.0, fraction_raw=round(f_raw, _ROUND),
+            fraction=0.0, fraction_raw=_finite(f_raw),
             f_vol=None if f_vol is None else round(f_vol, _ROUND),
             f_kelly=None if f_kelly is None else round(f_kelly, _ROUND),
             kelly_status=kelly_status,
             scale_source=_scale_source(inputs, f_core, core_source, brake=brake, corr=corr),
             scale_erased=False, vol_source=vol_source, floor_verdict=verdict)
         return replace(vetoed, wire=_floor_wire(vetoed, inputs, rule))
-    fraction = quantize_size_fraction(f_raw, inputs.step)
-    erased = (f_raw < entry - _EPS
-              and fraction >= quantize_size_fraction(entry, inputs.step) - _EPS)
+    fraction = risk_fraction_candidates(f_raw, inputs.step)[0]
     outcome = SizingOutcome(
-        fraction=fraction, fraction_raw=round(f_raw, _ROUND),
+        fraction=fraction, fraction_raw=f_raw,
         f_vol=None if f_vol is None else round(f_vol, _ROUND),
         f_kelly=None if f_kelly is None else round(f_kelly, _ROUND),
         kelly_status=kelly_status,
         scale_source=_scale_source(inputs, f_core, core_source, brake=brake, corr=corr),
-        scale_erased=erased, vol_source=vol_source)
+        scale_erased=False, vol_source=vol_source)
     return replace(outcome, wire=_outcome_wire(outcome, inputs, rule))
 
 
-def _floor_verdict(f_raw: float, policy: "SizingFloorPolicy | None", *, step: float) -> str:
-    """两条地板判据（顺序即优先级）；`policy is None` ⇒ 恒 `"none"`（逐字回退）。
+def risk_fraction_candidates(raw: float, step: float) -> list[float]:
+    """返回不超过未舍入风险上限的候选档，按从大到小排列。
 
-    第二条判据在 `step <= 0`（连续档位）上整条跳过：没有阶梯就没有「地板」这个概念，
-    `step * ratio == 0` 也让它自然恒假。
+    连续模式保留原上限；无正有限解时返回空列表，调用方必须拒绝开仓。
     """
-    if policy is None:
-        return "none"
-    if policy.zero_is_veto and f_raw <= _EPS:
+    if _positive(raw) is None or _finite(step) is None:
+        return []
+    upper = min(raw, 1.0)
+    if step <= 0:
+        return [upper]
+    return [gear for gear in reversed(position_ladder(step))
+            if 0 < gear <= upper]
+
+
+def _floor_verdict(f_raw: float, policy: "SizingFloorPolicy | None", *, step: float) -> str:
+    """硬上限独立于旧地板开关；展示精度不能增加可交易额度。"""
+    if _finite(f_raw) is None or _finite(step) is None:
+        return "invalid_quantity"
+    if f_raw <= 0 or (policy and policy.zero_is_veto and f_raw <= _EPS):
         return "solved_zero"
-    if policy.floor_ratio > 0 and step > 0 and _EPS < f_raw < step * policy.floor_ratio:
+    if not risk_fraction_candidates(f_raw, step):
+        return "below_gear_floor"
+    if policy and policy.floor_ratio > 0 and step > 0 and f_raw < step * policy.floor_ratio:
         return "below_gear_floor"
     return "none"
 
@@ -470,8 +475,7 @@ def _floor_wire(outcome: SizingOutcome, inputs: SizingInputs, rule: SizingRule) 
 def parse_floor_policy(settings) -> SizingFloorPolicy:
     """settings → `SizingFloorPolicy` 的**唯一**解析点（与 `parse_sizing_rule` 同一处调用）。
 
-    两条判据各有独立总闸，且**都可以单独回退**：`zero_is_veto=False` ⇒ `f_raw == 0` 仍被抬到最小
-    一格（逐字回退）；`floor_ratio=0.0` ⇒ 第二条判据在任何输入下都不触发（这是默认值）。
+    保留旧设置的解析兼容性；最终仓位的硬上限不受这些开关影响。
     """
     return SizingFloorPolicy(
         zero_is_veto=bool(getattr(settings, "ai_trade_sizing_zero_is_veto", False)),
@@ -523,7 +527,9 @@ def _outcome_wire(outcome: SizingOutcome, inputs: SizingInputs, rule: SizingRule
               + [rule.f_max])
     return {"modelFraction": inputs.model_fraction, "fVol": outcome.f_vol, "fCap": round(cap, _ROUND),
             "fKelly": outcome.f_kelly, "kellyStatus": outcome.kelly_status,
-            "fFinalRaw": outcome.fraction_raw, "finalFraction": outcome.fraction,
+            "fFinalRaw": (None if outcome.fraction_raw is None
+                          else round(outcome.fraction_raw, _ROUND)),
+            "finalFraction": outcome.fraction,
             "scaleSource": outcome.scale_source, "scaleErased": outcome.scale_erased,
             "volSource": outcome.vol_source, "volTargetAnnual": rule.vol_target_annual,
             "realizedVolBar": (None if inputs.realized_vol_bar is None

@@ -14,6 +14,7 @@ adjacency 由 ``test_ai_trade_backstop_repair_io.py`` 的 AST 门禁替代：它
 from __future__ import annotations
 
 _TRADE_CODE_MESSAGE = {
+    "sizing_exposure_cap": "实际可执行档位超过风险上限，暂不建仓",
     "INSUFFICIENT_BALANCE": "可用余额 / 保证金不足",
     "LEVERAGE_EXCEEDS": "张数超当前杠杆可开上限",
     "ORDER_PARAM_INVALID": "委托参数不合法",

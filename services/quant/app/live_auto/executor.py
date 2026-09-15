@@ -270,13 +270,16 @@ class LiveExecutor:
         self.open_attempts = None
         self.last_open_receipt = None
         self._open_attempt_id = ""
+        self.open_risk_guard = None
 
     # ---------- 默认 OKX 调用（短生命周期 session，R3）----------
     async def _default_place_order(self, order: OrderInput) -> dict:
         sm = get_sessionmaker()
         async with sm() as s:
+            kwargs = ({"risk_guard": self.open_risk_guard}
+                      if self.open_risk_guard is not None else {})
             return await place_live_order(s, self.creds, self.account_id, order,
-                                          settings=self.settings)
+                                          settings=self.settings, **kwargs)
 
     async def _default_close_position(self, close: ClosePositionInput) -> dict:
         sm = get_sessionmaker()
@@ -387,9 +390,13 @@ class LiveExecutor:
                                                close_kind=close_kind, order_plan=plan)
             else:
                 _, side, strength, reason, reverse, sig = action
-                events += await self._do_open(side, strength, ref_px, bar_index, ts,
-                                              reason, require_clear=reverse, signal=sig,
-                                              order_plan=plan)
+                try:
+                    events += await self._do_open(side, strength, ref_px, bar_index, ts,
+                                                  reason, require_clear=reverse, signal=sig,
+                                                  order_plan=plan)
+                finally:
+                    if self.open_risk_guard is not None:
+                        self.open_risk_guard.finish(self.last_open_receipt)
         return events
 
     def _project_signals(self, signals: list) -> list[tuple]:
@@ -436,19 +443,31 @@ class LiveExecutor:
     async def _submit_open(self, order: OrderInput) -> dict | None:
         """真实发送边界：AI 先持久化，finally 保留不可降级的 ack。"""
         manager = self.open_attempts
+        guard = self.open_risk_guard
         if manager is not None:
             try:
-                prepared = await manager.prepare(order)
+                kwargs = ({"risk_notional_cap": guard.reserved[1]}
+                          if guard is not None else {})
+                prepared = await manager.prepare(order, **kwargs)
             except asyncio.CancelledError:
-                self._block_open("canceled_before_send")
+                self.last_open_receipt = receipt_from_trace(
+                    self._open_attempt_id, self.inst_id, order.client_order_id,
+                    SubmissionTrace(), "canceled_before_send")
                 raise
             if not prepared:
-                self._block_open(manager.block_reason or "attempt_persist_failed")
+                self.last_open_receipt = receipt_from_trace(
+                    self._open_attempt_id, self.inst_id, order.client_order_id,
+                    SubmissionTrace(), manager.block_reason or "attempt_persist_failed")
                 return None
             self._open_attempt_id = manager.pending.attempt_id
         trace = order.submission_trace or SubmissionTrace()
         reason = "pre_submit_error"
         try:
+            if guard is not None and not guard.validate(
+                    order, size=order.sz, ct_val=self.ct_val,
+                    px=order.px if order.px is not None else guard.mark_px):
+                reason = "sizing_exposure_cap"
+                return None
             result = await self._place_order(order)
             # 注入适配器可直接返回确认回执；异常仍以旁路 trace 为准。
             if result.get("ordId") and trace.ack == "none":
@@ -462,6 +481,8 @@ class LiveExecutor:
             reason = "canceled_before_send"
             raise
         finally:
+            if trace.error_code and trace.error_code.startswith("sizing_"):
+                reason = trace.error_code
             self.last_open_receipt = receipt_from_trace(
                 self._open_attempt_id, self.inst_id,
                 order.client_order_id, trace, reason)
@@ -477,7 +498,9 @@ class LiveExecutor:
         if self.open_attempts is not None and self.open_attempts.has_pending:
             self._block_open("acceptance_unknown")
             return []
-        sz = self._compute_sz(strength, ref_px)
+        limit_px = _plan_limit_px(order_plan)
+        sz = self._compute_sz(strength, limit_px if (
+            self.open_risk_guard is not None and limit_px is not None) else ref_px)
         if sz <= 0 or sz < self.min_sz:
             # [P0-4]：这条 status 文案在 AI-trade 前端**没有渲染落点**，装配仓位层后它又会从
             # 「预检盲区」变成常态（真实下单量是 f×budget，f 常落在 0.2~0.4）。计数使纪律条能说出
@@ -486,7 +509,6 @@ class LiveExecutor:
             self._block_open("below_min_size")
             return [self._status_event(
                 f"预算 / 杠杆过小，单笔不足最小下单量（{side}），已跳过该信号")]
-        limit_px = _plan_limit_px(order_plan)
         # F-4 的作用域边界：**开仓路径逐字不变**（双开风险真实存在，`close_position` 的 autoCxl
         # 论证只对平仓成立）。此处只解包第三元、一行逻辑不改（G-6 冻结）。
         pre, slot_free, outcome = await self._prepare_resting_slot(
@@ -509,9 +531,16 @@ class LiveExecutor:
                            td_mode=self.td_mode, px=limit_px, sz=sz, lever=self.leverage,
                            tp_trigger_px=tp, sl_trigger_px=sl,
                            client_order_id=(new_client_order_id()
-                                            if self.open_attempts else None),
+                                            if self.open_attempts or self.open_risk_guard else None),
                            submission_trace=(SubmissionTrace()
-                                             if self.open_attempts else None))
+                                             if self.open_attempts or self.open_risk_guard else None))
+        if self.open_risk_guard is not None:
+            order = self.open_risk_guard.reserve(order, ref_px, strength)
+            if order is None:
+                self._block_open("sizing_exposure_cap")
+                return pre + [self._status_event(
+                    "最小可执行档位超过风险上限，暂不建仓")]
+            sz = order.sz
         try:
             result = await self._submit_open(order)
         except OKXError as exc:
@@ -575,6 +604,8 @@ class LiveExecutor:
             px=limit_px, sz=None if limit_px is None else self.entry_qty_sz)
         # 解释须在 _settle_close 复位 projected / entry 前据当前持仓断面合成（信号平仓优先用因子解释）。
         explain = self._close_explain(close_kind, reason, signal, ref_px)
+        if self.open_risk_guard is not None:
+            self.open_risk_guard.close_pending = True
         try:
             result = await self._close_position(close)
             self._note_private_write()             # 轴 C-4：成功的写才置位
@@ -691,6 +722,8 @@ class LiveExecutor:
         order = self.resting
         if order is None:
             return "canceled", []
+        if self.open_risk_guard is not None and order.intent == "close":
+            self.open_risk_guard.close_pending = True
         try:
             result = await self._cancel_order(self._cancel_input(order))
             self._note_private_write()             # 轴 C-4：撤单也可能改变持仓（三态之「已成交」）
@@ -764,8 +797,10 @@ class LiveExecutor:
         return await self._advance_resting(order, state, ts)
 
     async def _advance_resting(self, order: RestingOrder, state: dict,
-                               ts: int) -> list[dict]:
+                                ts: int) -> list[dict]:
         """按归一生命周期态推进挂单（状态分派走 `resting.classify_state` 查找表，守复杂度红线）。"""
+        if self.open_risk_guard is not None and order.intent == "close":
+            self.open_risk_guard.close_pending = True
         if (order.intent == "open" and self.open_attempts is not None
                 and not self.open_attempts.matches_resting(order, state)):
             return [self._status_event("原挂单的身份与成交事实仍待核实")]
@@ -954,6 +989,8 @@ class LiveExecutor:
         `external_close`。`reconcile()` 是全部 6 处调用点的**唯一收口**，在此处收口即全覆盖。
         `resting is None`（含 `live_auto` 全部场景）时 `_poll_resting` 返回 `[]`，行为逐字不变。
         """
+        if self.open_risk_guard is not None:
+            self.open_risk_guard.mark_px = mark_px
         events = await self._poll_resting(ts)          # O-1：必须最先；异常已在内部自隔离
         await audit_fills(self.fee_ledger, fills_fn=self._read_fills,
                           now_wall=time.time(), settings=self.settings)
@@ -1428,6 +1465,8 @@ class LiveExecutor:
             inst_id=self.inst_id, pos_side=self._pos_side(), pos=self._signed_pos(),
             mgn_mode=self.td_mode, ord_type="market", px=None, sz=None)
         last_exc: OKXError | None = None
+        if self.open_risk_guard is not None:
+            self.open_risk_guard.close_pending = True
         for attempt in range(self.settings.live_auto_flatten_max_retries + 1):
             try:
                 result = await self._close_position(close)

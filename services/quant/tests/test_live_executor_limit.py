@@ -10,7 +10,10 @@ OKX 调用全程经注入桩，不触网；铁律：占位假凭证，绝不写�
 from __future__ import annotations
 
 import time
+import asyncio
 from dataclasses import asdict
+
+import pytest
 
 from app.ai_auto.order_plan import OrderPlan
 from app.config import Settings
@@ -18,6 +21,374 @@ from app.engine.simulator import RiskParams
 from app.live_auto.executor import LiveExecutor
 from app.okx.accounts import AccountCredentials
 from app.okx.private_client import OKXPrivateError
+
+
+def _risk_executor(book, inst_id="BTC-USDT-SWAP", *, step=0.1, **over):
+    """装配真实仓位层，保留所有订单 IO 桩。"""
+    from app.ai_auto.decider import TradeDecision
+    from app.ai_auto.sizing import SizingRule
+    from app.ai_auto.sizing_runtime import SizingContext, SizingRuntime
+
+    ex, calls = _make_executor(budget_usd=100, leverage=5, ct_val=1, **over)
+    ex.inst_id = inst_id
+    runtime = SizingRuntime(SizingRule(0, 20, 0, 1, 1, 5),
+                            inst_id=inst_id, book=book)
+    runtime.bind_executor(ex, step=step)
+    runtime.resolve(TradeDecision(action="open_long", size_fraction=0.4,
+                                  confidence=0.8, reason="测试"),
+                    SizingContext(step=step, ref_px=100), ex)
+    return ex, calls, runtime
+
+
+def _risk_book(cap=200):
+    from app.ai_auto.exposure_book import GroupExposureBook
+    return GroupExposureBook(unit_notional=cap, cap_mult=1, bar_seconds=900)
+
+
+def _hedged_risk_group(side="long"):
+    """已有两条等量对冲腿，第三成员的正常提议已冻结。"""
+    book = _risk_book()
+    first, _, _ = _risk_executor(book, "A")
+    second, _, _ = _risk_executor(book, "B")
+    third, calls, _ = _risk_executor(book, "C")
+    opposite = "short" if side == "long" else "long"
+    for executor, direction in ((first, side), (second, opposite)):
+        executor.projected = direction
+        executor.entry_qty_sz = 2
+        executor.entry_price = 100
+    return first, third, calls, opposite
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+@pytest.mark.parametrize("flatten", [False, True])
+async def test_new_open_cannot_rely_on_an_inflight_exit(side, flatten):
+    first, third, calls, opposite = _hedged_risk_group(side)
+    entered, release = asyncio.Event(), asyncio.Event()
+    close = first._close_position
+
+    async def blocked(order):
+        entered.set()
+        await release.wait()
+        return await close(order)
+
+    first._close_position = blocked
+    task = asyncio.create_task(first.flatten(100, _TS) if flatten else
+        first.apply([_Sig("close")], ref_px=100, bar_index=0, ts=_TS))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await third.apply([_Sig(opposite, 0.4)], ref_px=100, bar_index=0, ts=_TS)
+        assert calls["orders"] == []
+    finally:
+        release.set()
+        await task
+    assert first.projected == "flat"
+
+
+@pytest.mark.parametrize("canceled", [False, True])
+async def test_limit_exit_cannot_restore_hedge_credit_before_position_settles(canceled):
+    first, third, calls, opposite = _hedged_risk_group()
+    await first.apply([_Sig("close")], ref_px=100, bar_index=0, ts=_TS,
+                      order_plan=_limit_plan(105))
+    if canceled:
+        # 撤余单前可能已部分成交，旧持仓数量不能继续作为确定对冲。
+        await first.cancel_resting("agent", _TS + 1)
+    await third.apply([_Sig(opposite, 0.4)], ref_px=100, bar_index=0, ts=_TS)
+    assert calls["orders"] == []
+
+
+@pytest.mark.parametrize("error", [asyncio.CancelledError, TimeoutError])
+async def test_uncertain_exit_keeps_risk_bounds(error):
+    first, third, calls, opposite = _hedged_risk_group()
+
+    async def unknown(order):
+        raise error()
+
+    first._close_position = unknown
+    with pytest.raises(error):
+        await first.apply([_Sig("close")], ref_px=100, bar_index=0, ts=_TS)
+    await third.apply([_Sig(opposite, 0.4)], ref_px=100, bar_index=0, ts=_TS)
+    assert calls["orders"] == []
+
+
+async def test_completed_reversal_does_not_keep_the_old_exit_bounds():
+    book = _risk_book()
+    first, _, _ = _risk_executor(book, "A")
+    second, calls, _ = _risk_executor(book, "B")
+    first.projected, first.entry_qty_sz, first.entry_price = "long", 2, 100
+    await first.apply([_Sig("short", 0.4)], ref_px=100, bar_index=0, ts=_TS)
+    assert first.projected == "short"
+    assert first.open_risk_guard.snapshot() == (-200, 0)
+    await second.apply([_Sig("long", 0.4)], ref_px=100, bar_index=0, ts=_TS)
+    assert len(calls["orders"]) == 1
+
+
+@pytest.mark.parametrize("source", ["cancel", "poll", "settlement"])
+async def test_recovered_exit_does_not_supply_stale_hedge_credit(source):
+    first, third, calls, opposite = _hedged_risk_group()
+    if source == "settlement":
+        first._settling = object()
+    else:
+        first._enter_resting({"clOrdId": "recovered", "ordId": "old"}, _TS,
+            intent="close", side="long", px=105, sz=2, strength=0, reason="恢复")
+        if source == "cancel":
+            await first.cancel_resting("agent", _TS + 1)
+        else:
+            await first._advance_resting(first.resting,
+                {"state": "canceled", "accFillSz": 1, "avgPx": 105}, _TS + 1)
+    await third.apply([_Sig(opposite, 0.4)], ref_px=100, bar_index=0, ts=_TS)
+    assert calls["orders"] == []
+
+
+async def test_sizing_reserves_before_another_member_can_submit():
+    book = _risk_book()
+    first, calls, _ = _risk_executor(book, "A")
+    second, second_calls, _ = _risk_executor(book, "B")
+    entered, release = asyncio.Event(), asyncio.Event()
+    place = first._place_order
+
+    async def blocked(order):
+        entered.set()
+        await release.wait()
+        return await place(order)
+
+    first._place_order = blocked
+    task = asyncio.create_task(first.apply([_Sig("long", 0.4)],
+        ref_px=100, bar_index=0, ts=_TS))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await second.apply([_Sig("long", 0.4)], ref_px=100, bar_index=0, ts=_TS)
+        assert second_calls["orders"] == []
+        assert second.last_open_receipt.reason.startswith("sizing_")
+    finally:
+        release.set()
+        await task
+    assert len(calls["orders"]) == 1
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+async def test_sizing_checks_limit_notional_and_contract_step(side):
+    ex, calls, _ = _risk_executor(_risk_book(), lot_sz=0.1)
+    await ex.apply([_Sig(side, 0.4)], ref_px=100, bar_index=0, ts=_TS,
+                   order_plan=_limit_plan(125))
+    order = calls["orders"][0]
+    assert order.sz == 1.6
+    assert order.sz * ex.ct_val * order.px <= 200
+
+
+async def test_sizing_does_not_increase_quantity_to_reach_minimum():
+    ex, calls, _ = _risk_executor(_risk_book(), min_sz=3)
+    await ex.apply([_Sig("long", 0.4)], ref_px=100, bar_index=0, ts=_TS)
+    assert calls["orders"] == []
+
+
+async def test_submission_does_not_enlarge_a_later_smaller_signal():
+    ex, calls, _ = _risk_executor(_risk_book())
+    await ex.apply([_Sig("long", 0.2)], ref_px=100, bar_index=0, ts=_TS)
+    assert calls["orders"][0].sz == 1.0
+
+
+async def test_cancel_before_send_releases_only_that_orders_reservation():
+    from app.ai_auto.entry_quota import EntryQuota
+    from app.ai_auto.open_attempts import OpenAttemptManager
+
+    book = _risk_book()
+    ex, _, _ = _risk_executor(book)
+    entered = asyncio.Event()
+
+    async def persist(payload):
+        if payload["pendingOpenAttempt"] is not None:
+            entered.set()
+            await asyncio.Event().wait()
+        return True
+
+    ex.open_attempts = OpenAttemptManager(account_id=1, run_id="1", inst_id=ex.inst_id,
+        quota=EntryQuota("1", 10), persist_callback=persist)
+    task = asyncio.create_task(ex.apply([_Sig("long", 0.4)],
+        ref_px=100, bar_index=0, ts=_TS))
+    await asyncio.wait_for(entered.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert ex.open_risk_guard.reserved is None
+    assert book.allows("B", 200, 5)
+
+
+async def test_guarded_partial_adoption_transfers_occupancy_without_double_counting():
+    from app.ai_auto.entry_quota import EntryQuota
+    from app.ai_auto.open_attempts import OpenAttemptManager
+
+    book = _risk_book()
+    ex, _, _ = _risk_executor(book)
+
+    async def persist(_payload):
+        return True
+
+    async def state(identity):
+        return {"instId": ex.inst_id, "clOrdId": identity, "ordId": "x1",
+            "side": "buy", "sz": "2", "accFillSz": "1", "avgPx": "100",
+            "state": "partially_filled"}
+
+    ex.open_attempts = OpenAttemptManager(account_id=1, run_id="1", inst_id=ex.inst_id,
+        quota=EntryQuota("1", 10), persist_callback=persist)
+    ex._get_order = state
+    await ex.apply([_Sig("long", 0.4)], ref_px=100, bar_index=0, ts=_TS)
+    assert book.allows("B", 0, 5)
+    assert not book.allows("B", 1, 5)
+    for event in ex.open_attempts.pending_events():
+        ex.open_attempts.mark_events_persisted(event["data"]["explain"]["meta"]["accountingEventId"])
+    assert await ex.open_attempts.complete_adoption(ex)
+    assert book.allows("B", 0, 5)
+    assert not book.allows("B", 1, 5)
+    final = {**await state(ex.resting.cl_ord_id), "state": "filled", "accFillSz": "2"}
+    await ex._advance_resting(ex.resting, final, _TS + 1)
+    assert book.allows("B", 0, 5)
+    assert not book.allows("B", 1, 5)
+
+
+async def test_guarded_reversal_preserves_close_when_new_leg_is_rejected():
+    book = _risk_book()
+    ex, calls, _ = _risk_executor(book)
+    ex.projected, ex.entry_qty_sz, ex.entry_price = "short", 1, 100
+    book.publish_notional("B", 200)
+    await ex.apply([_Sig("long", 0.4)], ref_px=100, bar_index=1, ts=_TS)
+    assert len(calls["closes"]) == 1
+    assert calls["orders"] == []
+    assert ex.projected == "flat"
+
+
+async def test_pending_hedge_does_not_offset_another_members_order():
+    book = _risk_book()
+    ex, _, _ = _risk_executor(book, "A")
+    await ex.apply([_Sig("short", 0.4)], ref_px=100, bar_index=0, ts=_TS,
+                   order_plan=_limit_plan(100))
+    assert not book.allows("B", 300, 5)
+
+
+async def test_partial_fill_and_unknown_cancel_keep_remaining_exposure():
+    book = _risk_book()
+    ex, _, _ = _risk_executor(book, cancel_seq=[{"outcome": "unknown"}])
+    await ex.apply([_Sig("long", 0.4)], ref_px=100, bar_index=0, ts=_TS,
+                   order_plan=_limit_plan(100))
+    ex._adopt_partial(ex.resting, {"accFillSz": "1", "avgPx": "100"}, _TS + 1)
+    await ex.cancel_resting("测试", _TS + 2)
+    assert not book.allows("B", 50, 5)
+    await ex._advance_resting(ex.resting,
+        {"state": "canceled", "accFillSz": "1", "avgPx": "100"}, _TS + 3)
+    assert book.allows("B", 100, 5)
+    assert not book.allows("B", 100.00001, 5)
+
+
+async def test_submission_rechecks_after_persistence_await():
+    from app.ai_auto.entry_quota import EntryQuota
+    from app.ai_auto.open_attempts import OpenAttemptManager
+
+    book = _risk_book()
+    ex, calls, _ = _risk_executor(book)
+
+    async def persist(_payload):
+        book.publish_notional("B", 200)
+        return True
+
+    ex.open_attempts = OpenAttemptManager(account_id=1, run_id="1", inst_id=ex.inst_id,
+        quota=EntryQuota("1", 10), persist_callback=persist)
+    await ex.apply([_Sig("long", 0.4)], ref_px=100, bar_index=0, ts=_TS)
+    assert calls["orders"] == []
+    assert ex.last_open_receipt.status == "not_submitted"
+    assert ex.last_open_receipt.reason.startswith("sizing_")
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_unknown_send_survives_restore_as_risk_occupancy(legacy):
+    from app.ai_auto.entry_quota import EntryQuota
+    from app.ai_auto.open_attempts import OpenAttemptManager
+
+    book = _risk_book()
+    ex, _, _ = _risk_executor(book)
+
+    async def persist(_payload):
+        return True
+
+    async def timeout(order):
+        order.submission_trace.phase = "sent"
+        raise OKXPrivateError("OKX_UNREACHABLE", "测试超时")
+
+    ex.open_attempts = OpenAttemptManager(account_id=1, run_id="1", inst_id=ex.inst_id,
+        quota=EntryQuota("1", 10), persist_callback=persist)
+    ex._place_order = timeout
+    await ex.apply([_Sig("long", 0.4)], ref_px=100, bar_index=0, ts=_TS)
+    assert not book.allows("B", 50, 5)
+    saved = ex.open_attempts.runtime_payload()
+    if legacy:
+        saved["pendingOpenAttempt"]["order"].pop("riskNotionalCap", None)
+        saved["pendingOpenAttempt"]["order"].update(ord_type="limit", px=1)
+    restored_book = _risk_book()
+    restored, _, _ = _risk_executor(restored_book)
+    restored.open_attempts = OpenAttemptManager.restore(saved, account_id=1,
+        run_id="1", inst_id=ex.inst_id, max_per_session=10, persist_callback=persist)
+    assert not restored_book.allows("B", 50, 5)
+
+
+@pytest.mark.parametrize("change", ["tick", "price", "slot", "none", "lot"])
+async def test_final_transport_uses_actual_payload_and_latest_book(monkeypatch, change):
+    from app.okx import trading
+    from app.okx.order_builder import InstrumentMeta
+    from tests.test_okx_write_safety import _client, _FlakyPoster
+
+    book = _risk_book()
+    ex, _, _ = _risk_executor(book)
+    client = _client()
+    poster = _FlakyPoster(0, {"code": "0", "data": [{"sCode": "0", "ordId": "x"}]})
+    client._client = poster
+    audits = []
+
+    async def meta(_inst):
+        return InstrumentMeta(1, "BTC", 0.01, 0.01, 1, 125, "linear", "USDT")
+
+    async def config():
+        return {"posMode": "long_short_mode"}
+
+    async def positions():
+        return []
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def audit(_session, *, values):
+        audits.append(values)
+
+    async def acquire():
+        if change == "slot":
+            book.publish_notional("B", 200)
+
+    class Rest:
+        async def get_ticker(self, _inst):
+            return 570 if change == "lot" else 101 if change == "price" else 100
+
+    client.get_account_config = config
+    client.get_positions = positions
+    client.set_leverage = noop
+    client._acquire_slot = acquire
+    client.aclose = noop
+    monkeypatch.setattr(trading, "OKXTradeClient", lambda *_args: client)
+    monkeypatch.setattr(trading, "_load_meta", meta)
+    monkeypatch.setattr(trading, "get_rest_client", Rest)
+    monkeypatch.setattr(trading.repo, "create_live_order_audit", audit)
+
+    async def place(order):
+        return await trading.place_live_order(None, ex.creds, 1, order,
+            settings=ex.settings, risk_guard=ex.open_risk_guard)
+
+    ex._place_order = place
+    plan = _limit_plan(99.6) if change == "tick" else None
+    await ex.apply([_Sig("long", 0.4)], ref_px=570 if change == "lot" else 100,
+                   bar_index=0, ts=_TS, order_plan=plan)
+    assert poster.posts == (1 if change in {"none", "lot"} else 0)
+    if change not in {"none", "lot"}:
+        assert ex.last_open_receipt.status == "not_submitted"
+        assert ex.last_open_receipt.reason.startswith("sizing_")
+        assert ex.open_risk_guard.reserved is None
+        assert audits[-1].status == "rejected"
+        assert audits[-1].error_code == "sizing_exposure_cap"
 
 _REF_PX = 30000.0
 _LIMIT_PX = 29700.0
