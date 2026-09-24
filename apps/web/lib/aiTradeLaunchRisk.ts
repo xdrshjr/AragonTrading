@@ -12,7 +12,7 @@
  * ——后者没有任何机械判据能覆盖（新警示可以出现在任何一个子组件的任何一行 JSX 里）。故边界
  * 写死在这里：
  *
- * **在册的 10 条**：`AI_TRADE_LAUNCH_RISK_IDS`，走 W-13 / W-14 / W-23 的等值判据。
+ * **在册的 11 条**：`AI_TRADE_LAUNCH_RISK_IDS`，走 W-13 / W-14 / W-23 的等值判据。
  *
  * **已知排除项（本轮明确不进风险清单，各附理由）**：
  *  · `AiTradeHorizonFields` 的「契约摘要」四行 —— 它是**当前选择的说明**，不是警示；进了清单
@@ -45,6 +45,7 @@ export const AI_TRADE_LAUNCH_RISK_IDS = [
   // **用户最可能整步跳过**的步骤里（第 4 步 / 第 2 步），恰恰是 I-1 最该覆盖的那两条。
   "experienceOff", // 经验模式整关：本次会话既不读取也不沉淀
   "wakeFloorRaised", // 唤醒周期低于与目标持仓相干的下限，启动时会被服务端抬上去
+  "profitLockOff", // 收益锁已关闭（profit-lock C-2）：小浮盈没有任何确定性的保本兜底
 ] as const;
 
 export type AiTradeLaunchRiskId = (typeof AI_TRADE_LAUNCH_RISK_IDS)[number];
@@ -123,6 +124,8 @@ export interface AiTradeLaunchRiskInput {
   /** 预检的一句话结论（后端下发，前端一个字都不重写）。 */
   tradabilityHeadline: string | null;
   profitGuardEnabled: boolean;
+  /** 收益锁开关（回测与实盘同源）。 */
+  profitLockEnabled: boolean;
   horizonEnabled: boolean;
   effectiveMinHoldSeconds: number;
   /** wire 上的 `requireProfitExitWithHorizon`（键缺席 ⇒ 调用方按 `false` 传）。 */
@@ -203,6 +206,20 @@ export function collectRisks(input: AiTradeLaunchRiskInput): AiTradeLaunchRisk[]
       title: "利润保护层未装配",
       detail: [base, horizonClause, opsClause].filter(Boolean).join(""),
       ...(requiresAck ? { requiresAck: true } : {}),
+    });
+  }
+
+  if (!input.profitLockEnabled) {
+    // 数字取自生产库取证（spec §2.1，可复算）：不写任何未经复算的比例。
+    risks.push({
+      id: "profitLockOff",
+      steps: ["guards"],
+      tone: "warn",
+      title: "收益锁已关闭",
+      detail:
+        "关闭后，浮盈覆盖往返成本之后没有任何确定性的保本兜底。2026-08 以来的 131 笔真实往返里，" +
+        "有 46 笔曾经浮盈、最后以亏损离场——那正是收益锁要接住的单子。利润保护层的武装线按保证金" +
+        "口径计，5× 杠杆下要浮盈约 60 bps 才启动，管不到这个尺度。",
     });
   }
 

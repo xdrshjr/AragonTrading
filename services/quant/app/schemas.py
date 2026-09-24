@@ -551,6 +551,24 @@ class AiTradeProfitGuardIn(BaseModel):
         return self
 
 
+class AiTradeProfitLockIn(BaseModel):
+    """成本锚定收益锁入参（ai-trade-profit-lock-and-entry-unblock §5.1）：价格 bps 口径。
+
+    字段整体缺省 ⇒ 按 settings 开启；`enabled=false` ⇒ 该会话不装配；数值留空 ⇒ settings 回填。
+    `trailCostMult ≥ armCostMult` 在解析点 `resolve_profit_lock_rule` 与 settings 合并后校验（422）。
+    """
+
+    enabled: bool = True
+    armCostMult: float | None = Field(default=None, ge=1, le=10)
+    armAtrMult: float | None = Field(default=None, ge=0, le=5)
+    bufferBps: float | None = Field(default=None, ge=0, le=50)
+    trailCostMult: float | None = Field(default=None, ge=1.5, le=20)
+    trailAtrMult: float | None = Field(default=None, ge=0, le=10)
+    keepRatio: float | None = Field(default=None, gt=0, le=0.95)
+    minHoldSeconds: float | None = Field(default=None, ge=0, le=3600)
+    confirmSeconds: float | None = Field(default=None, ge=0, le=60)
+
+
 AiTradeHorizonProfileId = Literal[
     "hourly_swing", "intraday_swing", "short_swing", "trend_hold", "custom"]
 
@@ -1032,6 +1050,9 @@ class AiTradeGroupStartIn(BaseModel):
     # `{"enabled":false}` ⇒ 该会话不装配。**实盘与回测两处启动体都接该字段**（adaptive §7.2a I-4：
     # 第 1 轮把回测列为非目标，第 2 轮 F3 用 bar 内 OHLC 极值 + 保守成交序取代了收盘价近似）。
     profitGuard: AiTradeProfitGuardIn | None = None
+    # 收益锁（默认开启，「字段缺省 ⇒ 开启」语义，解析点 `_resolve_profit_lock`）。冷续跑对缺该键的
+    # 老 wire 显式补 `enabled=false`（`resume._rebuild_request`），故老会话续跑时不会突然多一把锁。
+    profitLock: AiTradeProfitLockIn | None = None
     # 交易周期模式（默认开启，同上「字段缺省 ⇒ 开启」语义，解析点 `_resolve_horizon`）；
     # `{"enabled":false}` ⇒ 该会话不装配。**实盘与回测两处启动体都接该字段**（同一解析点，
     # 否则用户拿回测调出来的参数在实盘失真——`base_rules` P1-4 / `profit_guard` I-3 的成文教训）。
@@ -1202,6 +1223,7 @@ class AiTradeGroupRow(BaseModel):
     wakeIntervalMinutes: float | None = None   # Agent 墙钟定时唤醒周期（分钟；null=关闭），契约镜像
     baseRules: dict | None = None              # 【基础策略】铁律回执镜像（null=未装配）
     profitGuard: dict | None = None            # 利润保护层回执镜像（null=未装配）
+    profitLock: dict | None = None             # 收益锁回执镜像（null=未装配；不声明即被静默剔除）
     # 交易周期模式回执镜像（null=未装配）：为**服务端解析后的生效值**，且必须同时带上两个派生量
     # `expectedHoldBars` / `confirmWindowSeconds`（[P1-9]/[P0-3]）——只回显入参等于把派生关系藏起来。
     tradingHorizon: dict | None = None
@@ -1251,6 +1273,8 @@ class AiBacktestStartIn(BaseModel):
     # 回测按 bar 内 OHLC 极值 + 保守成交序近似，运维总闸 `ai_trade_profit_guard_backtest_enabled=false`
     # 可一键回到第 1 轮的「回测无保护层」行为。
     profitGuard: AiTradeProfitGuardIn | None = None
+    # 收益锁：与实盘同字段同语义、同一 `_resolve_profit_lock` 解析，另叠回测运维总闸。
+    profitLock: AiTradeProfitLockIn | None = None
     # 交易周期模式：与实盘同字段同语义、同一 `_resolve_horizon` 解析（回测侧另叠一层运维总闸
     # `ai_trade_horizon_backtest_enabled`）。回测按根推进，故最短持仓窗口的分辨率是一根 K 线——
     # 该免责由 `hold_horizon_text.format_backtest_notes` 写进结果 notes 并在 UI 上显示。
@@ -1609,6 +1633,11 @@ class AiTradeHistorySummary(BaseModel):
     captureRatio: float = 0.0
     capturePairs: int = 0
     noPeakCount: int = 0
+    # 盈转亏 / 收益锁四键（profit-lock 轴 C-3）：response_model 未声明即静默丢键。
+    greenToRedCount: int = 0
+    greenToRedGivebackUsd: float = 0.0
+    lockExitCount: int = 0
+    lockReentryCount: int = 0
     feeUsd: float = 0.0
     grossPnlUsd: float = 0.0
     costBasisMixed: bool = False

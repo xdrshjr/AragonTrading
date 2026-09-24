@@ -111,6 +111,7 @@ export const AI_TRADE_LAUNCH_ERROR_KEYS = [
   "inputError",
   "baseRuleError",
   "profitGuardError",
+  "profitLockError",
   "directionError",
   "trendError",
   "tradabilityBlocked",
@@ -132,6 +133,9 @@ export const READY_INPUTS: readonly AiTradeLaunchErrorKey[] = [
   "horizonError",
   "directionError",
   "trendError",
+  // 收益锁（profit-lock C-2）：与 `directionError` 同形——只进 `ready`、就地渲染在卡片字段旁，
+  // 不进 `firstError`（该表达式逐字节冻结，守着既有用例的次序）；第 6 步兜底行自动覆盖它。
+  "profitLockError",
   "membersError",
   "wakeError",
   "acknowledged",
@@ -196,6 +200,7 @@ export const STEP_ERROR_OWNERS: Record<AiTradeLaunchErrorKey, AiTradeLaunchError
   trajectoryDirError: { step: "cognition", modes: ["live"] },
   baseRuleError: { step: "guards", modes: BOTH },
   profitGuardError: { step: "guards", modes: BOTH },
+  profitLockError: { step: "guards", modes: BOTH },
   // 【v2 · P0-3】这两项**不在** `firstError` 里，只进 `ready`。没有归属 ⇒ 第 5 步的「下一步」
   // 不被它们挡、第 6 步横幅也不提它们，而 `ready === false` 让启动按钮灰着且全屏没有一句理由。
   directionError: { step: "guards", modes: BOTH },
@@ -267,6 +272,7 @@ export interface AiTradeLaunchSummaryInput {
   disciplineLabel: string;
   baseRuleEnabled: boolean;
   profitGuardEnabled: boolean;
+  profitLockEnabled: boolean;
   riskCount: number;
   /** 后训练数据采集是否**有效**开启（可选：缺省 / false ⇒ cognition 摘要逐字节不变）。 */
   trajectoryEnabled?: boolean;
@@ -317,6 +323,7 @@ export function stepSummary(
       return (
         `${safe(input.disciplineLabel)}${DOT}` +
         `铁律${onOff(input.baseRuleEnabled, "开", "关")}${DOT}` +
+        `收益锁${onOff(input.profitLockEnabled, "开", "关")}${DOT}` +
         `利润保护${onOff(input.profitGuardEnabled, "开", "关")}`
       );
     case "review":

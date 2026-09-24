@@ -586,7 +586,7 @@ function ResultRow({ trace }: { trace: AiTradeRoundTrace }) {
         className="inline-block h-1.5 w-1.5 rounded-full"
         style={{ backgroundColor: TONE_VAR[exec.tone] }}
       />
-      <span className="font-medium">{exec.label}</span>
+      <span className="font-medium" title={exec.title}>{exec.label}</span>
       {posAfter && (
         <span className="text-[var(--muted)]">· 结果持仓 {describeStance(posAfter)}</span>
       )}

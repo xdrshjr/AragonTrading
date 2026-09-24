@@ -2,6 +2,7 @@
 // 预算派生/夹紧复用 live-auto 同款（0.01 默认 / 0.05 上限，与后端 ai_trade_default/max_capital_frac 对齐）。
 import type { ApiRequestError } from "./api";
 import { clampBudgetToCap, deriveDefaultBudget } from "./liveAuto";
+import { describePreSubmitCheck } from "./aiTradePreSubmit";
 import type { AccountMode } from "./types";
 import type {
   AiTradeAction,
@@ -531,6 +532,9 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
   { prefix: "profit_guard_hard_take_profit", label: "利润保护：已达硬止盈目标位" },
   // 承诺退出线（commitment C2/C3）：模型自己许下、经棘轮兑现的第三条保护线触发平仓。
   { prefix: "profit_guard_committed_exit", label: "利润保护：已触及你承诺的退出线，按承诺离场" },
+  // 收益锁两码（profit-lock C-4）：同样不写「已锁定利润」，盈亏由成交行 pnl 呈现。
+  { prefix: "profit_lock_breakeven", label: "收益锁：浮盈回落到含费保本线，已离场" },
+  { prefix: "profit_lock_trailing", label: "收益锁：浮盈自峰值回落到锁利线，已离场" },
   // 冷却降级码带参数后缀（profit_cooldown(120s,long)），与基础策略同为**前缀**匹配。
   { prefix: "profit_cooldown", label: "利润保护冷却：刚锁住利润，暂停同向开仓" },
   // 最小 edge 门禁（ai-trade-cost-accounting-and-edge-gate §3.7）：码带参数后缀
@@ -976,6 +980,8 @@ const PROFIT_GUARD_REASON_LABELS: Record<string, string> = {
   profit_guard_breakeven: "保本线",
   profit_guard_hard_take_profit: "硬止盈",
   profit_guard_committed_exit: "承诺退出线",
+  profit_lock_breakeven: "保本锁",
+  profit_lock_trailing: "利润锁",
 };
 
 /** 保护触发码中文化（成交列表 / 轨迹 / 回执共用）；未知码原样回退。 */
@@ -1184,6 +1190,7 @@ function sizingNote(
 export interface AiExecutedView {
   label: string;    // 已成交 / 已跳过 / 已降级观望（reason） / 观望
   tone: AiExecTone; // 净立场着色（long/short/muted）
+  title?: string;   // 悬停说明（下单前复检的完整读数）
 }
 
 /**
@@ -1195,7 +1202,11 @@ export function describeExecuted(
   executed: AiTradeDecision["executed"],
   degradeReason?: string | null,
 ): AiExecutedView {
-  if (executed?.skipped) return { label: "已跳过", tone: "muted" };
+  if (executed?.skipped) {
+    const pre = describePreSubmitCheck(executed);   // 轴 C-5：说清下单前为什么没开
+    if (pre) return { label: pre.label, tone: pre.tone, title: pre.detail };
+    return { label: "已跳过", tone: "muted" };
+  }
   // P1-9：经 describeDegradeReason 渲染（未命中原样回退 ⇒ 既有 `low_consensus(1/2)` 展示逐字不变）。
   if (degradeReason) return { label: `已降级观望（${describeDegradeReason(degradeReason)}）`, tone: "short" };
   if (executed?.traded) {

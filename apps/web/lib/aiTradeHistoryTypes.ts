@@ -62,6 +62,11 @@ export interface AiTradeHistorySummary {
   captureRatio?: number;
   capturePairs?: number;
   noPeakCount?: number;
+  // 盈转亏 / 收益锁四键（profit-lock C-3）：老后端不下发 ⇒ 读点兜底为 0。
+  greenToRedCount?: number;
+  greenToRedGivebackUsd?: number;
+  lockExitCount?: number;
+  lockReentryCount?: number;
   // cost-truth：捕获率五键**分子分母同为毛额**（不随净额总闸变化）；手续费口径看这三键。
   feeUsd?: number;
   grossPnlUsd?: number;

@@ -16,6 +16,7 @@ import type {
   AiTradeIntelRule,
   AiTradeMaBandRule,
   AiTradeProfitGuardRule,
+  AiTradeProfitLockRule,
   AiTradeReasoningDepth,
   AiTradeTrendRule,
 } from "@/lib/aiTradeTypes";
@@ -56,6 +57,8 @@ export interface AiTradeLaunchOpts {
   // 利润保护层（**实盘与回测同源**，adaptive §7.2a）：回测改用 bar 内 OHLC 极值 + 保守成交序后，
   // 该字段两模式都提交。勾选 ⇒ 带完整参数；取消勾选 ⇒ `{enabled:false}`（显式关闭）。
   profitGuard?: AiTradeProfitGuardRule;
+  // 收益锁（profit-lock C-2，**实盘与回测同源**）：开 ⇒ 只带用户改过的字段；关 ⇒ `{enabled:false}`。
+  profitLock?: AiTradeProfitLockRule;
   // 交易周期模式（**实盘与回测同源**，holding-horizon §4.3）：选中模式 ⇒ 带 `{enabled,profile,…}`；
   // 取消勾选 ⇒ `{enabled:false}`（**显式关闭**，与「字段缺省=默认开启」语义严格区分）。
   tradingHorizon?: AiTradeHorizonRule;

@@ -1216,6 +1216,30 @@ class Settings(BaseSettings):
     # E-3：峰值浮盈追踪与利润保护层规则解耦。关 ⇒ `peak_pnl` 回到「保护层未装配即恒 NULL」
     # ——那恰恰关掉了唯一能证明该开保护层的证据（实测 82.9% 为 NULL）。
     ai_trade_peak_tracking_always: bool = True
+    # ---- 收益锁与下单前复检（ai-trade-profit-lock-and-entry-unblock §5.3，16 项）----
+    # 轴 A：下单前成本复检从「参数逐位相等」改为「这笔开仓的往返成本是否明显变贵」。False ⇒ 逐字
+    # 回退到旧判据（资金费率每 ~60s 刷新一次，旧判据在生产上丢掉了 95% 的开仓）。
+    ai_trade_pre_submit_materiality_enabled: bool = True
+    ai_trade_pre_submit_cost_tolerance_bps: float = Field(default=1.0, ge=0, le=50)
+    # 市价开仓的不利价格漂移复检：阈值 = max(min_bps, atr_mult × ATR bps)。
+    ai_trade_pre_submit_drift_guard_enabled: bool = True
+    ai_trade_pre_submit_drift_min_bps: float = Field(default=20.0, gt=0, le=500)
+    ai_trade_pre_submit_drift_atr_mult: float = Field(default=0.5, ge=0, le=5)
+    # 轴 B：成本锚定收益锁（价格 bps 口径，与杠杆无关，不受利润保护开关影响）。运维总闸 False ⇒
+    # 恒不装配；请求体缺省 ⇒ 按本组默认开启。
+    ai_trade_profit_lock_enabled: bool = True
+    ai_trade_profit_lock_arm_cost_mult: float = Field(default=1.5, ge=1, le=10)
+    ai_trade_profit_lock_arm_atr_mult: float = Field(default=0.35, ge=0, le=5)
+    ai_trade_profit_lock_buffer_bps: float = Field(default=2.0, ge=0, le=50)
+    ai_trade_profit_lock_trail_cost_mult: float = Field(default=3.0, ge=1.5, le=20)
+    ai_trade_profit_lock_trail_atr_mult: float = Field(default=0.8, ge=0, le=10)
+    ai_trade_profit_lock_keep_ratio: float = Field(default=0.5, gt=0, le=0.95)
+    ai_trade_profit_lock_min_hold_s: float = Field(default=60.0, ge=0, le=3600)
+    # 越线须持续的**墙钟**秒数（不是调用次数：`_maybe_profit_exit` 有两个调用点）。
+    ai_trade_profit_lock_confirm_s: float = Field(default=8.0, ge=0, le=60)
+    ai_trade_profit_lock_backtest_enabled: bool = True
+    # 轴 B-4：利润保护的保本线不得低于往返成本（5× 下旧偏移只有 4 bps，「保本离场」实为净亏）。
+    ai_trade_profit_guard_breakeven_cost_floor_enabled: bool = True
     # 轴 F：退出裁量权结论的最小样本；`0` ⇒ **恒不出结论**（`exitDiscretion` 整键缺席）。
     ai_trade_exit_verdict_min_samples: int = Field(default=20, ge=0, le=10000)
     # 轴 F：按结论自动收紧 `exit_priority` 配额。**本轮只建不开**，留给下一轮按验收卡定阈值。

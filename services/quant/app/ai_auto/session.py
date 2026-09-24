@@ -48,6 +48,7 @@ from .backstop_repair import (RepairRuntime, repair_now_from_executor,
                               rule_from_settings as repair_rule_from_settings, schedule_repair)
 from .base_rules import MaBandRule, apply_ma_band_gate, build_ma_band, gate_status
 from .cost_runtime import CostRuntime
+from .pre_submit import PreSubmitRuntime
 from .entry_quota import EntryQuota
 from .integrity_view import (
     build_integrity_snapshot, build_round_record, build_session_facts,
@@ -128,6 +129,9 @@ from .profit_guard_runtime import (
     SessionReadings,
     build_position_facts,
 )
+from .profit_lock import ProfitLockRule
+from .profit_lock_runtime import (ProfitLockRuntime, build_exit_snap, build_lock_facts,
+                                  describe_lock_exit)
 from .orphan import DEGRADE_ORPHAN_BLOCKED
 from .prompts import DECISION_TOOL_NAME
 from .reflection import applied_shrink, apply_reflection, build_reflection_note
@@ -279,6 +283,7 @@ class AiTradeSession:
                  context_refresh_rounds: int = 10, wake_interval_s: float = 0.0,
                  base_rule: MaBandRule | None = None,
                  profit_rule: ProfitGuardRule | None = None,
+                 profit_lock_rule: ProfitLockRule | None = None,
                  prior_snapshot: dict | None = None,
                  sizing: SizingRuntime | None = None,
                  horizon_rule: HorizonRule | None = None,
@@ -343,8 +348,10 @@ class AiTradeSession:
             profit_rule,
             # ★ E-3：峰值追踪与保护层规则解耦的总闸（默认开）。关 ⇒ `_peak_only` 恒空转 ⇒
             # `peak_pnl` 回到今天的「保护层未装配即恒 NULL」。
-            peak_tracking_always=bool(getattr(
+            peak_tracking_always=profit_lock_rule is not None or bool(getattr(
                 executor.settings, "ai_trade_peak_tracking_always", False)))
+        # 收益锁（轴 B）：峰值读 `_guard.state`，故装配时上一行强制峰值追踪；None ⇒ 零动作。
+        self._lock = ProfitLockRuntime(profit_lock_rule)
         self._atr_px: float | None = None     # 确认根 ATR（F1）；None ⇒ 回吐距离上下界不生效
         # 成本记账与最小 edge 门禁（§3.10）：状态 / 快照 / 计数全部下沉 `CostRuntime`（镜像 F0 把
         # 利润保护下沉 `ProfitGuardRuntime` 的同款范式），会话只留薄封装调用。
@@ -416,6 +423,7 @@ class AiTradeSession:
         self._round_facts: dict = {}
         self._round_sizing: dict | None = None
         self._round_execution_identity = None
+        self._pre_submit = PreSubmitRuntime(executor.settings)   # 轴 A：下单前复检按重要性判
         self._runtime_epoch_started_ts = int(time.time())
         self._trade_persist_failed = False
         self._trade_backlog_persist_failed = False
@@ -1041,17 +1049,26 @@ class AiTradeSession:
                 self.executor.entry_qty_sz,
                 None if resting is None else resting.cl_ord_id)
 
-    def _prepare_open_context(self) -> str | None:
+    def _prepare_open_context(self, decision, ref_px: float) -> str | None:
         """执行锁内核对模型等待期间的真实身份及风险条件。"""
+        self._pre_submit.begin()
         if self._round_facts.get("factsUnavailable"):
             return "facts_unavailable"
+        identity = self._execution_identity()
         if (self._round_execution_identity is not None
-                and self._round_execution_identity != self._execution_identity()):
+                and self._round_execution_identity != identity):
+            self._pre_submit.note_identity(self._round_execution_identity, identity)
             return "pre_submit_context_changed"
         if (self._trade_persist_failed or self._trade_backlog_persist_failed
                 or self._execution_state_persist_failed):
             return "attempt_persist_failed"
-        if self._cost.pre_submit_context_changed():
+        if self._pre_submit.enabled:       # 轴 A：成本按重要性判 + 市价单不利漂移
+            verdict = self._pre_submit.check(
+                self._cost, decision, bar_seconds=BAR_SECONDS.get(self.bar, 60),
+                ref_px=ref_px, now_px=self._current_px(), atr_px=self._atr_px)
+            if verdict.code:
+                return verdict.code
+        elif self._cost.pre_submit_context_changed():    # 回退档：逐字保留旧判据
             return "pre_submit_context_changed"
         attempts = getattr(self.executor, "open_attempts", None)
         if attempts is not None:
@@ -3596,10 +3613,11 @@ class AiTradeSession:
                         "qty": self.executor.entry_qty_sz,
                         "positionAfter": self.executor.projected}
             if decision.action in ("open_long", "open_short"):
-                reason = self._prepare_open_context()
+                reason = self._prepare_open_context(decision, ref_px)
                 if reason:
                     return {**self._not_submitted_execution(
-                        decision.action, reason), "executionContextChanged": reason}
+                        decision.action, reason), "executionContextChanged": reason,
+                        "preSubmitCheck": self._pre_submit.last}
             events = await self.executor.apply(signals, ref_px=ref_px, bar_index=i, ts=ts,
                                                order_plan=order_plan)
             events += await self.executor.reconcile(ref_px, ts)
@@ -3735,6 +3753,8 @@ class AiTradeSession:
         if pos is not None and self.profit_rule is not None:
             snap = self._refresh_profit_state(time.time())
             pos = pos if snap is None else {**pos, "profitGuard": snap}
+        if pos is not None and self._lock.snapshot() is not None:
+            pos = {**pos, "profitLock": self._lock.snapshot()}
         return self._cost.decorate_position(pos, bar_seconds=BAR_SECONDS[self.bar])
 
     def _session_readings(self, now_wall: float) -> SessionReadings:
@@ -3764,13 +3784,31 @@ class AiTradeSession:
             self._guard.clear_state()
             self._wake.note_guard_status(None)
             return None
-        facts = build_position_facts(self.executor, self._session_readings(now_wall))
+        floor = (self._cost.estimate_cost_for_position(self.executor.projected,
+                                                       BAR_SECONDS[self.bar])
+                 if getattr(self.executor.settings,
+                            "ai_trade_profit_guard_breakeven_cost_floor_enabled", False)
+                 else None)             # 轴 B-4：保本线不低于往返成本 + 2 bps
+        facts = build_position_facts(self.executor, self._session_readings(now_wall),
+                                     cost_floor_bps=floor)
         snap = self._guard.refresh(facts, stale_feed=self._stale_degraded)
         self._wake.note_guard_status((snap or {}).get("status"))
         return snap
 
     async def _maybe_profit_exit(self, ts: int) -> None:
-        """确定性利润保护：峰值回吐 / 保本 / 硬止盈触发即市价平仓（§2.5）。
+        """两步编排：利润保护层先判；本 tick 未动作则收益锁再判（收益锁只有这一个调用点）。
+
+        收益锁不挂在保护层分支里：保护层快照 unavailable 时早退，会把收益锁整体跳过、越线起点
+        无人清理（评审 RV-P0-3）。
+        """
+        if not self.is_active:
+            return
+        if await self._maybe_profit_guard_exit(ts):
+            return
+        await self._maybe_profit_lock_exit(ts)
+
+    async def _maybe_profit_guard_exit(self, ts: int) -> bool:
+        """确定性利润保护：峰值回吐 / 保本 / 硬止盈触发即市价平仓（§2.5）；已尝试平仓 ⇒ True。
 
         本层只会产生 `close`，**永远不会**阻止或改写模型的任何决策；与共识门禁、MA 通道铁律、反思层
         互不干涉（后三者一律不拦 `close`，故不存在「保护要平、门禁不让」的死锁）。判定只用实时价，
@@ -3779,30 +3817,65 @@ class AiTradeSession:
         # §3.1.2 row 5（I-1 的招牌条款）：判据是 `is_active` —— 暂停期利润保护**照旧平仓**。
         # 反例说明为什么：用户暂停后去睡觉，一个已浮盈 8% 的仓位会失去唯一的本地退出执行者，
         # 而他以为自己做的是一个**降低**风险的动作。
-        if not self.is_active:
-            return
         if self.profit_rule is None:
             # ★ E-3：未装配保护层时本方法**不做任何判定**（它没有规则可判），但峰值仍要推进——
             # 「关掉保护层的同时也关掉了『保护层本该拦住多少钱』这个读数」恰恰关掉了唯一能证明
             # 该开保护层的证据。总闸关 ⇒ `_refresh_profit_state` 第一行即返回 ⇒ 逐字回退。
             self._refresh_profit_state(time.time())
-            return
+            return False
         snap = self._refresh_profit_state(time.time())
         if snap is None or snap.get("status") == STATUS_UNAVAILABLE:
-            return                                   # 含 §2.4 第 0/0b 条 fail-open 豁免
+            return False                             # 含 §2.4 第 0/0b 条 fail-open 豁免
         verdict = evaluate_profit_guard(snap, self.profit_rule)
         if verdict is None:
-            return
+            return False
         px = self._current_px()
         events = await self._apply_profit_exit(verdict, snap, px, ts)
         if events is None:
-            return                                   # 取锁期间局面已变（复检失败），静默返回
+            return False                             # 取锁期间局面已变（复检失败），静默返回
         await self._dispatch(events)                 # ← _position_seq 随 close 成交在此自增（§2.3.1）
         await self._push_status_if_side_changed()
         await self._report_profit_exit(verdict, events, ts)
+        return True
 
-    async def _apply_profit_exit(self, verdict, snap: dict, px: float,
-                                 ts: int) -> list[dict] | None:
+    async def _maybe_profit_lock_exit(self, ts: int) -> None:
+        """收益锁（轴 B）：组装断面 → tick → 命中即经同一条 `_apply_profit_exit` 市价平仓。"""
+        if self._lock.rule is None:
+            return
+        now, guard = time.time(), self._guard.state
+        facts = build_lock_facts(
+            self.executor, guard, mark_px=self._current_px(), now_wall=now, atr_px=self._atr_px,
+            cost_bps=self._cost.estimate_cost_for_position(self.executor.projected,
+                                                           BAR_SECONDS[self.bar]))
+        if facts is None:
+            self._lock.clear()
+            return
+        age = now - self._last_px_wall if self._last_px_wall > 0 else 0.0
+        stale = (self._stale_degraded
+                 or age > self.executor.settings.ai_trade_profit_guard_max_px_age_s)
+        verdict = self._lock.tick(facts, epoch=(guard.side, guard.seq), stale=stale)
+        if verdict is None:
+            return
+        events = await self._apply_profit_exit(
+            verdict, build_exit_snap(facts), self._current_px(), ts,
+            trail_extra={"lockStage": verdict.note["lockStage"],
+                         "lockPx": verdict.note["exitPx"], "costBps": facts.cost_bps})
+        if events is None:
+            return
+        await self._dispatch(events)
+        await self._push_status_if_side_changed()
+        closed = _has_close_fill(events)      # 以 close 成交事件为唯一判据（同 [P1-1]）
+        if closed:
+            self._lock.exits += 1
+            self._lock.clear()
+        elif self._lock.warned_seq == self._position_seq:
+            return                            # 每个持仓周期至多推一条 warn
+        self._lock.warned_seq = self._position_seq
+        await self._push({"type": "status", "data": {
+            **self._status_payload(), "message": describe_lock_exit(verdict, closed=closed)}})
+
+    async def _apply_profit_exit(self, verdict, snap: dict, px: float, ts: int, *,
+                                 trail_extra: dict | None = None) -> list[dict] | None:
         """经 `_exec_lock` 走 executor 的**唯一**平仓路径下市价单；取锁后局面已变 → None。
 
         绝不新写平仓路径：`_settle_close` 封装了「先算 pnl/pnlPct 再复位 entry」这个顺序敏感约束。
@@ -3816,7 +3889,7 @@ class AiTradeSession:
             giveback_ratio=snap.get("givebackRatio"), pnl=snap.get("unrealizedPnlUsd"),
             # 只传**规则量**断面：捕获率是成交后量，此刻 trade.pnl 尚不存在（P1-5）。
             trail={"givebackPctEffective": snap.get("givebackPctEffective"),
-                   "trailBasis": snap.get("trailBasis")})
+                   "trailBasis": snap.get("trailBasis"), **(trail_extra or {})})
         async with self._exec_lock:
             # §3.1.2 row 6：内层复检必须与外层同口径（`is_active`），否则外层放行、内层拦下。
             if not self.is_active or self.executor.projected == "flat":
@@ -4315,6 +4388,7 @@ class AiTradeSession:
                 # F2 冷却三载体之一（§4.2）：**不挂 position**——冷却期内按定义已无持仓。
                 "profitGuardCooldown": build_cooldown_view(self._guard.cooldown,
                                                            now_wall=time.time()),
+                **({"profitLock": self._lock.status_wire()} if self._lock.rule else {}),
                 # 持仓周期快照（§4.4）：供面板 chip 在无决策事件时也能更新倒计时；未装配 ⇒ None。
                 "horizon": self._horizon.last_snapshot,
                 # ★ 轴 D：活性断面**两条通路都要下发**——REST 成员行取 `info()`、WS `status` 取本

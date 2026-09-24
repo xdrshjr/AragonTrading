@@ -166,6 +166,11 @@ export function useAiTradeLaunchState(props: AiTradeLaunchModalProps) {
   const [cooldownRaw, setCooldownRaw] = useState(
     String(defaultProfitGuard.cooldownSeconds ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.cooldownSeconds),
   );
+  // 收益锁（profit-lock C-2）：开关 + 高级区三个原始串（空串 = 用服务端默认，不下发）。
+  const [profitLockEnabled, setProfitLockEnabled] = useState(true);
+  const [lockArmCostRaw, setLockArmCostRaw] = useState("");
+  const [lockKeepRatioRaw, setLockKeepRatioRaw] = useState("");
+  const [lockConfirmRaw, setLockConfirmRaw] = useState("");
   const [horizonEnabled, setHorizonEnabled] = useState(defaultTradingHorizon?.enabled ?? true);
   const [horizonProfileRaw, setHorizonProfileRaw] = useState<AiTradeHorizonProfileId | null>(
     defaultTradingHorizon?.profile ?? null,
@@ -242,6 +247,10 @@ export function useAiTradeLaunchState(props: AiTradeLaunchModalProps) {
     setCooldownRaw(
       String(defaultProfitGuard.cooldownSeconds ?? AI_TRADE_PROFIT_GUARD_DEFAULTS.cooldownSeconds),
     );
+    setProfitLockEnabled(true);
+    setLockArmCostRaw("");
+    setLockKeepRatioRaw("");
+    setLockConfirmRaw("");
     setHorizonEnabled(defaultTradingHorizon?.enabled ?? true);
     setHorizonProfileRaw(defaultTradingHorizon?.profile ?? null);
     setHorizonCustom(seedHorizonCustom(defaultTradingHorizon));
@@ -290,6 +299,8 @@ export function useAiTradeLaunchState(props: AiTradeLaunchModalProps) {
     setHorizonCustom, repairMode, setRepairMode, startInput, setStartInput, endInput,
     setEndInput, everyRaw, setEveryRaw, minConsensusRaw, setMinConsensusRaw, liveAvailable,
     trajectory, setTrajectory, trajectorySkipOnce, setTrajectorySkipOnce,
+    profitLockEnabled, setProfitLockEnabled, lockArmCostRaw, setLockArmCostRaw,
+    lockKeepRatioRaw, setLockKeepRatioRaw, lockConfirmRaw, setLockConfirmRaw,
     seededMembers, seed,
   };
 }

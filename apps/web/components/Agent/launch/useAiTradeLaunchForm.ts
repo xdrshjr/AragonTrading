@@ -111,6 +111,7 @@ import { TRADABILITY_CONFIRM_REQUIRED_TEXT } from "../AiTradeTradabilityFields";
 import type { AiTradeLaunchModalProps, AiTradeLaunchOpts } from "../AiTradeLaunchModal";
 import { useAiTradeLaunchState } from "./useAiTradeLaunchState";
 import { useTrajectoryCapture } from "./useTrajectoryCapture";
+import { useProfitLockFields } from "./useProfitLockFields";
 import type { AiTradeLaunchMode } from "@/lib/aiTradeLaunchSteps";
 
 /**
@@ -257,6 +258,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
   const trajectoryCapture = useTrajectoryCapture({
     open, mode, rule: trajectory, skipOnce: trajectorySkipOnce,
   });
+  const profitLock = useProfitLockFields(state);   // 校验与提交体在该文件（本文件贴着 G-1 红线）
 
   const capital = parseOptionalUsd(capitalRaw);
   const leverage = parseOptionalLeverage(leverageRaw);
@@ -549,7 +551,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
     !strategyError &&
     !roundsError &&
     !baseRuleError &&
-    !profitGuardError &&
+    !profitGuardError && !profitLock.error &&
     !horizonError &&
     !directionError &&
     !trendError;
@@ -591,7 +593,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
         gearNote,
         tradabilityLevel: tradabilityView?.level ?? null,
         tradabilityHeadline: tradabilityView?.headline || null,
-        profitGuardEnabled,
+        profitGuardEnabled, profitLockEnabled: state.profitLockEnabled,
         horizonEnabled,
         effectiveMinHoldSeconds,
         interlockArmed,
@@ -615,7 +617,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
       horizonEnabled, effectiveMinHoldSeconds, interlockArmed, hardTakeProfitText, oversubscribed,
       sumPct, isClamped, capital.value, maxBudgetPct, budgetCap, truncated, defaultMembers.length,
       reasoningDepth, wakeMinutes, experience.enabled, horizonQ.data?.wakeHorizonDivisor,
-      activeHorizonProfile?.targetHoldMinSeconds,
+      activeHorizonProfile?.targetHoldMinSeconds, state.profitLockEnabled,
     ],
   );
 
@@ -634,7 +636,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
     roundsCapError,
     inputError,
     baseRuleError,
-    profitGuardError,
+    profitGuardError, profitLockError: profitLock.error,
     directionError,
     trendError,
     tradabilityBlocked: tradabilityBlocked ? TRADABILITY_CONFIRM_REQUIRED_TEXT : null,
@@ -670,7 +672,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
     intelEnabled: mode === "live" && intel.enabled === true,
     disciplineLabel: DISCIPLINE_COPY[disciplinePreset].label,
     baseRuleEnabled,
-    profitGuardEnabled,
+    profitGuardEnabled, profitLockEnabled: state.profitLockEnabled,
     riskCount: risks.length,
     trajectoryEnabled: trajectoryCapture.effectiveEnabled,
   };
@@ -716,7 +718,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
         instId: members[0]?.instId ?? instId,
         ...base,
         wakeIntervalMinutes: wakeMinutes ?? 0,
-        profitGuard: profitGuardPayload,
+        profitGuard: profitGuardPayload, profitLock: profitLock.payload,
         reasoningDepth,
         trajectoryCapture: trajectoryCapture.requestRule,
         trajectoryPreference: trajectory,
@@ -729,7 +731,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
       allocationMode,
       instId,
       ...base,
-      profitGuard: profitGuardPayload,
+      profitGuard: profitGuardPayload, profitLock: profitLock.payload,
       startTs: startTs ?? undefined,
       endTs: endTs ?? undefined,
       decisionEveryBars: everyValue,
@@ -777,7 +779,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
     profitGuardEnabled, setProfitGuardEnabled, armReturnRaw, setArmReturnRaw, givebackRaw,
     setGivebackRaw, breakevenArmRaw, setBreakevenArmRaw, minHoldRaw, setMinHoldRaw,
     tierPreset, setTierPreset, atrFloorRaw, setAtrFloorRaw, atrCapRaw, setAtrCapRaw,
-    cooldownRaw, setCooldownRaw, armPriceMovePct,
+    cooldownRaw, setCooldownRaw, armPriceMovePct, profitLock, state,
     // 可交易性预检（探针已上提；子组件降为纯展示）
     tradabilityView, tradabilityConfirmed, setTradabilityConfirmed, tradabilityNeedsConfirm,
     tradabilityBlocked,

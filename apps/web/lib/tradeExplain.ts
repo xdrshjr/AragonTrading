@@ -59,6 +59,8 @@ function inferKindFromReason(trade: Trade): TriggerExplainKind {
   // 利润保护四码（含 commitment 的 `profit_guard_committed_exit`，ai-trade-profit-protection §2.7 /
   // commitment §2.4）：`profit_guard_` 前缀**自动**把承诺退出线码归入「利润保护」kind，分类零改。
   if (reason.startsWith("profit_guard_")) return "profit_guard";
+  // 收益锁两码（profit-lock B-3）：后端 explain 同样是 kind="profit_guard"，无 explain 的回落与之一致。
+  if (reason.startsWith("profit_lock_")) return "profit_guard";
   if (reason === "session_stop") return "session_stop";
   if (reason === "external_close") return "external_close";
   if (reason === "reverse") return "reverse";

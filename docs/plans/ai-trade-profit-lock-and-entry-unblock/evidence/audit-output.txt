@@ -1,0 +1,16 @@
+trips 131 net -55.17 fees 33.76 winrate 0.382
+long/short Counter({'L': 120, 'S': 11})
+  agent_close                      n= 47 win=0.26 pnl=  -17.62 moveBpsMed=   -9.4 peakBpsMed=  20.6 greenToRed=32 giveback=37.05
+  agent_llm_text                   n= 45 win=0.27 pnl=  -79.12 moveBpsMed=  -31.2 peakBpsMed=  28.9 greenToRed=14 giveback=63.37
+  external_close                   n= 21 win=0.52 pnl=   20.39 moveBpsMed=   15.7 peakBpsMed=  86.7 greenToRed=2 giveback=6.24
+  profit_guard_committed_exit      n= 11 win=0.82 pnl=   14.69 moveBpsMed=   36.9 peakBpsMed=  89.9 greenToRed=2 giveback=5.98
+  profit_guard_trailing            n=  4 win=1.00 pnl=    8.81 moveBpsMed=   63.9 peakBpsMed= 125.9 greenToRed=0 giveback=0.00
+  session_stop                     n=  2 win=1.00 pnl=    0.66 moveBpsMed=   23.4 peakBpsMed=  27.3 greenToRed=0 giveback=0.00
+  offline_exit                     n=  1 win=0.00 pnl=   -2.98 moveBpsMed=  -49.6 peakBpsMed=   nan greenToRed=0 giveback=0.00
+green-to-red losers peakBps quartiles [11.3, 20.2, 32.4]
+non-hold decisions by execution outcome:
+   172 ('open_', 'pre_submit_context_changed', False)
+   7 ('close', None, True)
+   5 ('open_', 'accepted', False)
+   4 ('open_', 'accepted', True)
+llm latency s: median 74.6 p90 108.5 n 2827

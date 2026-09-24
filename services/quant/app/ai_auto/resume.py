@@ -114,7 +114,10 @@ async def _rebuild_request(row: dict, settings):
     from ..schemas import AiTradeGroupStartIn
 
     try:
-        body = AiTradeGroupStartIn(**(row["startWire"] or {}))
+        # 收益锁「缺省即开启」：本特性合入前落库的 wire 缺该键 ⇒ 显式关闭，否则老会话续跑时会
+        # 突然多一把锁、同一 run 前后两段口径不一致。新 wire 恒带该键（含 null）⇒ 原样覆盖。
+        wire = {"profitLock": {"enabled": False}, **(row["startWire"] or {})}
+        body = AiTradeGroupStartIn(**wire)
         async with get_sessionmaker()() as db:
             req = await build_start_request(db, settings, body)
     except HTTPException as exc:      # 账户凭证被清 / 策略被删 ⇒ 契约已失效，明确原因

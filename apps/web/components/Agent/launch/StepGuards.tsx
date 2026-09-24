@@ -8,6 +8,7 @@ import AiTradeDirectionFields from "../AiTradeDirectionFields";
 import AiTradeTradabilityFields from "../AiTradeTradabilityFields";
 import ProfitGuardFields from "../ProfitGuardFields";
 import DisciplinePresetFields from "./DisciplinePresetFields";
+import ProfitLockCard from "./ProfitLockCard";
 import { InlineRiskNote } from "./LaunchPrimitives";
 import type { UseAiTradeLaunchForm } from "./useAiTradeLaunchForm";
 
@@ -46,7 +47,7 @@ export default function StepGuards({
     profitGuardEnabled, setProfitGuardEnabled, armReturnRaw, setArmReturnRaw, givebackRaw,
     setGivebackRaw, breakevenArmRaw, setBreakevenArmRaw, minHoldRaw, setMinHoldRaw,
     tierPreset, setTierPreset, atrFloorRaw, setAtrFloorRaw, atrCapRaw, setAtrCapRaw,
-    cooldownRaw, setCooldownRaw, armPriceMovePct, interlockArmed, risks,
+    cooldownRaw, setCooldownRaw, armPriceMovePct, interlockArmed, risks, profitLock, state,
   } = form;
   const stepRisks = risksForStep(risks, "guards");
 
@@ -189,6 +190,15 @@ export default function StepGuards({
         onPickBar={(next) => setBar(next as never)}
         confirmed={tradabilityConfirmed}
         onConfirmedChange={setTradabilityConfirmed}
+        disabled={submitting}
+      />
+
+      {/* 收益锁（profit-lock C-2）：排在利润保护之前——它在典型波动尺度上更早生效。 */}
+      <ProfitLockCard
+        state={state}
+        view={profitLock}
+        probe={tradabilityQ.data ?? null}
+        mode={mode}
         disabled={submitting}
       />
 

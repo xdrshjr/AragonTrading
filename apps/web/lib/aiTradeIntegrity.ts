@@ -169,7 +169,8 @@ export function executionReasonLabel(code: string): string {
     position_not_flat: "旧仓尚未平清", same_side_position: "已有同向持仓",
     exchange_rejected: "交易所拒绝", insufficient_balance: "可用保证金不足",
     attempt_persist_failed: "开仓状态保存失败", acceptance_unknown: "接收待核实",
-    pre_submit_context_changed: "执行前事实已变化", facts_unavailable: "事实不完整",
+    pre_submit_context_changed: "执行前成本明显上升或持仓已变化",
+    pre_submit_price_drift: "价格已不利移动", facts_unavailable: "事实不完整",
     quota_exhausted: "额度已用尽", session_not_running: "会话已暂停",
     other: "其他执行限制",
   };

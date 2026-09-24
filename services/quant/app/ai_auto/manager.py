@@ -56,6 +56,7 @@ from . import pause as pause_core
 from .profit_guard import ProfitGuardRule
 from .profit_guard_text import format_profit_guard_charter
 from .profit_guard import rule_wire as profit_guard_wire
+from .profit_lock import ProfitLockRule, lock_rule_wire
 from .decider import AiTradeDecider
 from .experience import ExperienceRule, ExperienceRuntime, SessionGraph
 from .experience import scheduler
@@ -212,6 +213,8 @@ class AiTradeGroupStartRequest:
     # 解析）。回测侧的同名规则走 `AiBacktestStartRequest.profit_rule`（同一解析点、另加回测总闸），
     # 见 ai-trade-profit-protection-adaptive §2.3 / §7.2a I-3。
     profit_rule: ProfitGuardRule | None = None
+    # 收益锁：同款零回归垫片（默认 None；「缺省即开启」只在 API 层 `_resolve_profit_lock` 解析）。
+    profit_lock_rule: ProfitLockRule | None = None
     # 信号先验快照，**按 `instId` 键**（signal-prior-and-ev-gate §4.3 / P1-5）。刻意不镜像
     # `base_rule` 的「分组共享单对象」姿态：铁律是同一条规则，先验快照却是 `(instId, bar)` 粒度的
     # 历史统计——照字面共享会让 BTC 的成员拿 ETH 的统计去开真实仓位，且**不会报错**。
@@ -312,6 +315,7 @@ class AiTradeGroup:
     wake_interval_s: float = 0.0             # 墙钟定时唤醒周期（秒；0=关闭），group_status 回显换算为分钟
     base_rule: MaBandRule | None = None      # 【基础策略】铁律（None=未装配），group_status 回显 baseRules
     profit_rule: ProfitGuardRule | None = None   # 利润保护层（None=未装配），回显 profitGuard
+    profit_lock_rule: ProfitLockRule | None = None   # 收益锁（None=未装配），回显 profitLock
     sizing_rule: SizingRule | None = None    # 仓位求解规则（总闸①；None=未装配）
     stop_rule: StopRule | None = None        # ATR 止损规则（总闸②；与①独立）
     exposure_book: GroupExposureBook | None = None   # 分组共享敞口簿（总闸③关 ⇒ None）
@@ -772,6 +776,7 @@ class AiTradeManager:
                 created_ts=created_ts, members=members,
                 wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
                 profit_rule=req.profit_rule, sizing_rule=rule, exposure_book=book,
+                profit_lock_rule=req.profit_lock_rule,
                 stop_rule=parse_stop_rule(req.settings), horizon_rule=req.horizon_rule,
                 discipline_preset=req.discipline_preset,
                 discipline_adjustments=req.discipline_adjustments,
@@ -986,7 +991,7 @@ class AiTradeManager:
             priming=req.priming, priming_bars=req.priming_bars,
             context_refresh_rounds=req.context_refresh_rounds,
             wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
-            profit_rule=req.profit_rule,
+            profit_rule=req.profit_rule, profit_lock_rule=req.profit_lock_rule,
             prior_snapshot=(req.prior_snapshots or {}).get(plan.inst_id), sizing=sizing,
             horizon_rule=req.horizon_rule,
             # 只为落库回答「这次会话开的是哪个预设」；阈值本身已在 executor.settings 那份派生副本里。
@@ -2030,6 +2035,7 @@ class AiTradeManager:
                                         if group.wake_interval_s > 0 else None),
                 "baseRules": rule_wire(group.base_rule),   # 【基础策略】回执镜像（未装配→ null）
                 "profitGuard": profit_guard_wire(group.profit_rule),   # 利润保护回执镜像（同上）
+                "profitLock": lock_rule_wire(group.profit_lock_rule),  # 收益锁回执镜像（同上）
                 # 交易周期模式回执镜像（同上）：**生效值** + 两个派生量，使「弹窗预览 == 落地」可逐
                 # 字段核对（[P1-9]：只回显入参等于把 expectedHoldBars 的派生关系藏起来）。
                 "tradingHorizon": horizon_wire(group.horizon_rule),
@@ -2486,6 +2492,7 @@ class AiTradeManager:
                         "baseRules": rule_wire(req.base_rule),
                         # 利润保护配置随 config_json 落库（零列迁移；未装配存 None）。
                         "profitGuard": profit_guard_wire(req.profit_rule),
+                        "profitLock": lock_rule_wire(req.profit_lock_rule),
                         # 交易周期模式同款落库（零列迁移；未装配存 None）——历史详情接口直读 json 列，
                         # 故「这次会话到底选了哪种周期」事后可核对。
                         "tradingHorizon": horizon_wire(req.horizon_rule),

@@ -174,6 +174,7 @@ export default function AiTradeToggle() {
         reasoningDepth: opts.reasoningDepth,     // 研判深度档（透传；留空=服务端默认 deep，仅实盘）
         baseRules: opts.baseRules,               // 【基础策略】铁律（透传；取消勾选即 enabled:false）
         profitGuard: opts.profitGuard,           // 利润保护层（透传；取消勾选即 enabled:false）
+        profitLock: opts.profitLock,             // 收益锁（透传；取消勾选即 enabled:false）
         tradingHorizon: opts.tradingHorizon,     // 交易周期模式（同上；缺省=服务端默认开启）
         discipline: opts.discipline,             // 交易纪律预设（同上；缺省=服务端默认 balanced）
         experience: opts.experience,             // 经验模式（同上；取消勾选即 enabled:false）
@@ -261,6 +262,7 @@ export default function AiTradeToggle() {
         // F3：回测同享利润保护（bar 内极值 + 保守成交序）。同一条理由——两侧参数不同源，
         // 用户拿回测调出来的参数在实盘直接失真。
         profitGuard: opts.profitGuard,
+        profitLock: opts.profitLock,             // 回测同享收益锁（同一 `_resolve_profit_lock`）
         // 回测同享交易纪律预设（同一 `_resolve_discipline`，R-3）。同一条理由：不同源就失真，
         // 且回测正是唯一能对这组阈值做「开 vs 不开」净额对照的地方。
         discipline: opts.discipline,

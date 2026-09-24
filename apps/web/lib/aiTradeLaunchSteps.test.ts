@@ -39,6 +39,7 @@ const SUMMARY: AiTradeLaunchSummaryInput = {
   disciplineLabel: "均衡",
   baseRuleEnabled: true,
   profitGuardEnabled: true,
+  profitLockEnabled: true,
   riskCount: 2,
 };
 

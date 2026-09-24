@@ -1,7 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   formatProfitCapture,
+  LOCK_REENTRY_WINDOW_S,
   PROFIT_CAPTURE_MIN_PAIRS,
+  summarizeGreenToRed,
+  summarizeGreenToRedAcross,
   summarizeProfitCapture,
   summarizeProfitCaptureAcross,
 } from "./aiTradeCapture";
@@ -111,5 +114,44 @@ describe("formatProfitCapture", () => {
     expect(text).toContain("70%");
     expect(text).toContain("3 笔有峰值样本");
     expect(text).toContain("共 4 笔");
+  });
+});
+
+describe("summarizeGreenToRed（与后端 _green_to_red_keys 同一组判据）", () => {
+  const lockClose = (ts: number, pnl: number, peak: number): Trade => ({
+    ...close(ts, pnl, peak), reason: "profit_lock_trailing",
+  });
+
+  it("曾浮盈却亏损离场 ⇒ 计入盈转亏，回吐 = Σ(peak − pnl)", () => {
+    const summary = summarizeGreenToRed([
+      open(0), close(10, -1, 2),
+      open(20), close(30, 1.5, 2),
+      open(40), close(50, -0.5, null),
+      open(60), lockClose(70, 0.2, 1),
+    ]);
+    expect(summary.greenToRedCount).toBe(1);
+    expect(summary.greenToRedGivebackUsd).toBeCloseTo(3, 10);
+    expect(summary.lockExitCount).toBe(1);
+    expect(summary.lockReentryCount).toBe(0);
+  });
+
+  it("锁平后窗口内同向重开 ⇒ 1；超窗或反向 ⇒ 0；窗口常量与后端同值", () => {
+    expect(LOCK_REENTRY_WINDOW_S).toBe(1800);
+    const within = summarizeGreenToRed([open(0), lockClose(100, 0.1, 1), open(1900), close(3000, 0, 0)]);
+    expect(within.lockReentryCount).toBe(1);
+    const late = summarizeGreenToRed([open(0), lockClose(100, 0.1, 1), open(1901), close(3000, 0, 0)]);
+    expect(late.lockReentryCount).toBe(0);
+    const reverse: Trade = { ...open(200), side: "short" };
+    const flipped = summarizeGreenToRed([open(0), lockClose(100, 0.1, 1), reverse, close(300, 0, 0)]);
+    expect(flipped.lockReentryCount).toBe(0);
+  });
+
+  it("跨成员合并绝不把两个标的的相邻往返当成重开", () => {
+    const merged = summarizeGreenToRedAcross([
+      { trades: [open(0), lockClose(100, 0.1, 1)] },
+      { trades: [open(200), close(300, 0.1, 1)] },
+    ]);
+    expect(merged.lockExitCount).toBe(1);
+    expect(merged.lockReentryCount).toBe(0);
   });
 });

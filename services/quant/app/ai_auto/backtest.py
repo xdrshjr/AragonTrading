@@ -73,6 +73,8 @@ from .hold_horizon_text import format_backtest_notes
 from .hold_horizon_text import format_charter as format_horizon_charter
 from .horizon_acceptance import ai_stats_keys, build_input, bundle_from_input
 from .horizon_runtime import HorizonRuntime
+from .profit_lock import ProfitLockRule
+from .profit_lock_bar import BarLockState, LockBar, evaluate_lock_bar
 from .market_context import build_market_context
 from .market_digest import build_market_digest
 from .multi_timeframe_context import (
@@ -140,6 +142,9 @@ _EQUITY_BUFFER_MAX = 1000      # 权益缓冲上限（滚动迷你图重连回�
 _TERMINAL_TYPES = ("done", "cancelled", "error")
 # 回测保护层的**保守近似免责**（adaptive §2.3.5）：与前端 aiBacktest/panels.tsx 同源文案。绝不宣称
 # 等同实盘——回测接入保护层最大的风险恰恰是「曲线变好看 ⇒ 用户高估实盘」（R-4）。
+_PROFIT_LOCK_BACKTEST_NOTE = (
+    "收益锁在回测中按 K 线极值近似：先用本根不利极值判越线、再用有利极值推进峰值与锁线，越线按锁线"
+    "成交、跳空按开盘价；实盘要求越线持续数秒才触发，回测视为即时。该近似低估收益锁的收益。")
 _PROFIT_GUARD_BACKTEST_NOTE = (
     "利润保护在回测中为 bar 内极值保守近似：① 同一根内的新高不会立即抬高移动止盈线（先判回撤、"
     "后推峰值）；② 跳空穿越按开盘价成交；③ 回测按根推进，实盘每 5 秒盯市一次，触发时机必然更早、"
@@ -204,6 +209,8 @@ class AiBacktestSpec:
     # + `profit_cooldown`），差异只在「谁提供行情断面」。默认 None=不装配 ⇒ `_run_loop` 的 SimBroker
     # 调用序与 payload/prompt 逐字节回退（G-3，既有直接构造该 dataclass 的回测测试零回归）。
     profit_rule: ProfitGuardRule | None = None
+    # 收益锁（profit-lock 轴 B-5）：与实盘共用 `profit_lock` 纯核心；None ⇒ 全部路径空转（零回归）。
+    profit_lock_rule: ProfitLockRule | None = None
     # 交易周期模式（holding-horizon §2.10）：与实盘**共用同一纯核心**（`hold_horizon` +
     # `horizon_runtime`），差别只在时钟与断面来源（墙钟 → bar ts，实时价 → 当根收盘价）。默认
     # None=不装配 ⇒ payload / prompt / 门禁 / notes 逐字节回退（既有回测测试零回归）。
@@ -314,6 +321,8 @@ class AiBacktestRunner:
         self._committed_exit_px: float | None = None
         self._committed_exit_basis: str | None = None
         self.profit_guard_exits = 0
+        self.profit_lock_rule = spec.profit_lock_rule
+        self._lock_bar_state: BarLockState | None = None
         self._atr_series = None            # `_setup` 里一次性向量化；第 i 根用 iloc[i-1]（无未来函数）
         self._bar_ts_index: list[int] | None = None   # 根索引 → ts（把开仓根 ts 当 opened_wall，§2.3.2）
         # 交易周期层（holding-horizon §2.10）：与实盘同一个运行时类，只是喂进去的时钟是 bar ts。
@@ -526,6 +535,7 @@ class AiBacktestRunner:
         # 否则门禁恒 unavailable、fail-open 放行（I-5）。ATR 止损（vol-sizing §3.10 复发点一）同款：不把
         # 总闸②或进来，`_atr_series` 恒 None ⇒ 止损在回测里恒不生效**且不报任何错**（T-19 守这条）。
         if (self.profit_rule is not None or self.settings.ai_trade_edge_gate_k_min > 0
+                or self.profit_lock_rule is not None
                 or self.settings.ai_trade_stop_atr_mult > 0
                 or self.horizon_rule is not None):
             # F1/F3：ATR 一次性向量化（第 i 根取 iloc[i-1]，含本根 h/l 的 ATR 是未来函数）。
@@ -600,6 +610,7 @@ class AiBacktestRunner:
             # ★ 利润保护（F3 §2.3.3）：排在 apply_risk **之后**（交易所侧 OCO 物理上先于本进程存在，
             # 同根同时命中按更保守的先手记因）、mark **之前**（本根内的平仓必须反映进本根权益点）。
             self._apply_profit_guard_bar(i, row)
+            self._apply_profit_lock_bar(i, row)      # 保护层先成交；同根已平 ⇒ 收益锁空转
             self._track_horizon_epoch(int(row["ts"]))
             # 验收闭环三本账（horizon-acceptance）：**独立于 `_track_horizon_epoch`**，故未装配
             # 周期模式的对照臂照样拿得到资金费与退出分布（[P1-4] / [P0-4]）。
@@ -654,7 +665,8 @@ class AiBacktestRunner:
             seq=pos.entry_bar, side=pos.side, entry_px=float(pos.entry_price),
             qty_coin=float(pos.qty), leverage=self.leverage, ts=bar_ts, opened_ts=entry_ts,
             open_px=float(row["o"]), high_px=float(row["h"]), low_px=float(row["l"]),
-            atr_px=self._atr_at(i), committed_exit_px=self._committed_exit_px))
+            atr_px=self._atr_at(i), committed_exit_px=self._committed_exit_px,
+            cost_floor_bps=self._guard_cost_floor(pos.side, bar_ts)))
         self._guard_state = result.state
         if result.verdict is None:
             return
@@ -668,6 +680,46 @@ class AiBacktestRunner:
                 until_wall=bar_ts + self.profit_rule.cooldown_s, side=result.verdict.note["side"],
                 reason_code=result.verdict.reason_code, label=result.verdict.label,
                 scope=self.profit_rule.cooldown_scope)
+
+    def _apply_profit_lock_bar(self, i: int, row: pd.Series) -> None:
+        """本根的保守收益锁判定（轴 B-5）；命中即按锁线平仓并打标 `profitGuard`。"""
+        if self.profit_lock_rule is None:
+            return
+        pos = self.main.pos
+        if pos.side == "flat":
+            self._lock_bar_state = None
+            return
+        bar_ts, entry, atr_px = int(row["ts"]), float(pos.entry_price), self._atr_at(i)
+        result = evaluate_lock_bar(self._lock_bar_state, self.profit_lock_rule, LockBar(
+            seq=pos.entry_bar, side=pos.side, entry_px=entry, qty_coin=float(pos.qty),
+            ts=bar_ts, opened_ts=self._bar_ts(pos.entry_bar, default=bar_ts),
+            open_px=float(row["o"]), high_px=float(row["h"]), low_px=float(row["l"]),
+            close_px=float(row["c"]), cost_bps=self._position_cost_bps(pos.side, bar_ts),
+            atr_bps=(atr_px / entry * 1e4) if atr_px and entry > 0 else None))
+        self._lock_bar_state = result.state
+        if result.verdict is None:
+            return
+        # 不写打标槽 ⇒ `classify_backtest` 查冻结表查不到 ⇒ 归 unknown（评审 RV-P1-1）。
+        self._pending_exit_source = "profitGuard"
+        self.main.close_at_price(float(result.fill_px), bar_ts, result.verdict.reason_code)
+        self._lock_bar_state = None
+
+    def _guard_cost_floor(self, side: str, ts: int) -> float | None:
+        """轴 B-4：保本线成本下界（总闸关 ⇒ None ⇒ 保本线逐字回退）。"""
+        if not self.settings.ai_trade_profit_guard_breakeven_cost_floor_enabled:
+            return None
+        return self._position_cost_bps(side, ts)
+
+    def _position_cost_bps(self, side: str, ts: int) -> float | None:
+        """按**持仓方向**估的往返成本（bps，回测世界常数）；与 `_horizon_facts` 同一纯核心。"""
+        if side not in ("long", "short"):
+            return None
+        funding, funding_on = self._cost_funding(ts)
+        return estimate_round_trip_cost(
+            query_for_preview(ord_type="market", side=side,
+                              bar_seconds=BAR_SECONDS[self.bar], funding=funding,
+                              funding_enabled=funding_on),
+            self._cost_params(ts)).total_bps
 
     def _record_commitment(self, decision: TradeDecision, snapshot: dict | None) -> None:
         """回测侧承诺退出线采集（C5 §2.5）：与实盘 `record_commitment` **同一** `is_commit_armed` +
@@ -868,14 +920,7 @@ class AiBacktestRunner:
         实盘按 12–72 根算，G-3「两侧 reason 逐字相等」不可能通过。
         """
         pos = self.main.pos
-        cost = None
-        if pos.side in ("long", "short"):
-            funding, funding_on = self._cost_funding(ts)      # 轴 B：与实盘同口径的资金费入参
-            cost = estimate_round_trip_cost(
-                query_for_preview(ord_type="market", side=pos.side,
-                                  bar_seconds=BAR_SECONDS[self.bar], funding=funding,
-                                  funding_enabled=funding_on),
-                self._cost_params(ts)).total_bps
+        cost = self._position_cost_bps(pos.side, ts)      # 轴 B：与实盘同口径的资金费入参
         return HorizonFacts(
             seq=int(pos.entry_bar), side=pos.side, entry_px=float(pos.entry_price or 0.0),
             mark_px=float(ref_px), leverage=float(self.leverage), now_wall=float(ts),
@@ -899,7 +944,8 @@ class AiBacktestRunner:
             atr_px=self._atr_at(i),
             # C5：当前棘轮承诺线进快照（模型每轮看到自己的承诺线 + 有效退出线归因，与实盘 refresh 同款）。
             committed_exit_px=self._committed_exit_px,
-            committed_exit_basis=self._committed_exit_basis)
+            committed_exit_basis=self._committed_exit_basis,
+            cost_floor_bps=self._guard_cost_floor(pos.side, self._last_ts))
         return build_snapshot(self.profit_rule, self._guard_state, facts)
 
     def _is_decision_bar(self, i: int, first: int, n: int) -> bool:
@@ -1485,6 +1531,8 @@ class AiBacktestRunner:
             notes.append("历史深度或暖机不足，首个决策晚于所选区间起点，起始若干根未参与决策。")
         if self.profit_rule is not None:
             notes.append(_PROFIT_GUARD_BACKTEST_NOTE)
+        if self.profit_lock_rule is not None:
+            notes.append(_PROFIT_LOCK_BACKTEST_NOTE)
         if self.settings.ai_trade_edge_gate_k_min > 0:
             notes.append(_EDGE_GATE_BACKTEST_NOTE)
         if self._sizing.armed:

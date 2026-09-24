@@ -24,6 +24,7 @@ const CLEAN: AiTradeLaunchRiskInput = {
   tradabilityLevel: "ok",
   tradabilityHeadline: "约 12.0% 的开仓意图会被否决。",
   profitGuardEnabled: true,
+  profitLockEnabled: true,
   horizonEnabled: true,
   effectiveMinHoldSeconds: 7200,
   interlockArmed: false,
@@ -174,6 +175,16 @@ describe("U-3 / U-4 十条风险的触发与不触发断面", () => {
       .not.toContain("wakeFloorRaised");
   });
 
+  it("profitLockOff：收益锁关闭才触发，产地是第 5 步，文案只引用可复算的取证数字", () => {
+    expect(ids({ profitLockEnabled: true })).not.toContain("profitLockOff");
+    const [risk] = collectRisks({ ...CLEAN, profitLockEnabled: false });
+    expect(risk.id).toBe("profitLockOff");
+    expect(risk.steps).toEqual(["guards"]);
+    expect(risk.requiresAck).toBeUndefined();
+    expect(risk.detail).toContain("131 笔");
+    expect(risk.detail).not.toContain("**");
+  });
+
   it("U-4：`collectRisks()` 只会产出注册表里的 id（清单外的一条都不许有）", () => {
     const everything = collectRisks({
       mode: "live",
@@ -181,6 +192,7 @@ describe("U-3 / U-4 十条风险的触发与不触发断面", () => {
       tradabilityLevel: "infeasible",
       tradabilityHeadline: "几乎开不出单",
       profitGuardEnabled: false,
+      profitLockEnabled: false,
       horizonEnabled: true,
       effectiveMinHoldSeconds: 7200,
       interlockArmed: true,

@@ -53,7 +53,8 @@ class SessionReadings:
     atr_px: float | None = None
 
 
-def build_position_facts(executor, readings: SessionReadings) -> PositionFacts:
+def build_position_facts(executor, readings: SessionReadings, *,
+                         cost_floor_bps: float | None = None) -> PositionFacts:
     """把 executor 的持仓读数 + 会话时钟组装成一次评估所需的断面（F0：由 session 迁出）。
 
     判定价恒取 `readings.mark_px`（`_current_px()`），**绝不**取最近确认根收盘价——15m 周期上后者
@@ -68,7 +69,7 @@ def build_position_facts(executor, readings: SessionReadings) -> PositionFacts:
         bars_in_position=((readings.bar_index - executor.entry_bar)
                           if executor.entry_bar >= 0 else None),
         exchange_tp_px=tp_px, exchange_sl_px=sl_px, exchange_oco_source=oco_source,
-        px_age_s=readings.px_age_s, atr_px=readings.atr_px)
+        px_age_s=readings.px_age_s, atr_px=readings.atr_px, cost_floor_bps=cost_floor_bps)
 
 
 def exchange_oco_px(executor, side: str) -> tuple[float | None, float | None, str]:

@@ -529,6 +529,25 @@ export interface ProfitGuardCooldown {
   label: string;
 }
 
+// 持仓行的收益锁快照（§5.2；后端 `profit_lock.lock_wire`）。
+export interface AiTradeProfitLockSnapshot {
+  stage: 0 | 1 | 2;
+  status: "watching" | "breakeven" | "trailing" | "unavailable";
+  unavailableReason: "stale_px" | "cost_unknown" | "min_hold" | null;
+  side: "long" | "short";
+  entryPx: number;
+  peakPx: number;
+  mfeBps: number | null;
+  costBps: number | null;
+  atrBps: number | null;
+  armBps: number | null;
+  trailArmBps: number | null;
+  lockPx: number | null;
+  lockNetBps: number | null;        // 锁线相对「含费保本」的净 bps（目标值，市价离场可能略低）
+  breachSeconds: number;
+  confirmSeconds: number;
+}
+
 export interface PaperPositionEvent {
   side: "long" | "short" | "flat";
   size: number;
@@ -538,6 +557,8 @@ export interface PaperPositionEvent {
   positionPct?: number | null;
   /** 利润保护快照（AI 自动交易且规则已装配时才有；旧前端忽略未知键，向前兼容）。 */
   profitGuard?: ProfitGuardSnapshot | null;
+  /** 收益锁快照（profit-lock §5.2；规则未装配或无仓 ⇒ 缺席）。store 整对象透传，无需逐键登记。 */
+  profitLock?: AiTradeProfitLockSnapshot | null;
   /**
    * 本轮成本证据（ai-trade-cost-truth-and-net-pnl 轴 D；成本意识总闸关 ⇒ 整键缺席）。
    *

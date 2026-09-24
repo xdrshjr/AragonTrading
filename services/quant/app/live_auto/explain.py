@@ -187,13 +187,29 @@ def build_profit_guard_explain(*, pos_side: str, trigger_label: str, entry_price
     trail_metric = _profit_guard_trail_metric(trail)
     if trail_metric is not None:
         metrics.insert(1, trail_metric)
-    return _base("profit_guard", "close", f"利润保护平仓（{trigger_label}）",
+    lock = _profit_lock_trail(trail)
+    if lock is not None:
+        metrics.insert(1, _metric("收益锁线", _fmt_px(lock["lockPx"]),
+                                  hint=f"按往返成本约 {lock['costBps']} bps 锚定"))
+    explain = _base("profit_guard", "close", f"利润保护平仓（{trigger_label}）",
                  # §六.1b / P0-1：措辞由 pnl **符号**派生——保本线触发 / 滑点不利时这笔可能打平甚至
                  # 净亏，无条件写「锁定利润」就是在一笔亏损出场上撒谎。
                  summary=("持仓浮盈自峰值回吐触及系统保护线，由利润保护层直接市价平仓锁定利润"
                           if pnl is not None and float(pnl) > 0
                           else "价格触及系统保护线，由利润保护层直接市价平仓离场"),
                  metrics=metrics)
+    # 收益锁平仓的机器可读断面（profit-lock B-3）：`trail` 本身从不落进 explain，只喂一条 metric，
+    # 故锁的三个读数单独成键；保护层平仓不带 lockStage ⇒ 无此键 ⇒ explain 逐字不变。
+    return explain if lock is None else {**explain, "profitLock": lock}
+
+
+def _profit_lock_trail(trail: dict | None) -> dict | None:
+    """从 `trail` 取收益锁三读数；非收益锁平仓（无 lockStage）⇒ None。"""
+    if not trail or trail.get("lockStage") is None:
+        return None
+    cost = trail.get("costBps")
+    return {"lockStage": trail["lockStage"], "lockPx": trail.get("lockPx"),
+            "costBps": None if cost is None else round(float(cost), 2)}
 
 
 def _profit_guard_trail_metric(trail: dict | None) -> dict | None:

@@ -74,6 +74,7 @@ class BarFacts:
     low_px: float
     atr_px: float | None = None
     committed_exit_px: float | None = None
+    cost_floor_bps: float | None = None     # 轴 B-4 透传；None ⇒ 保本线逐字回退
 
 
 @dataclass(frozen=True)
@@ -90,7 +91,8 @@ def _facts(bar: BarFacts, mark_px: float) -> PositionFacts:
     return PositionFacts(
         seq=bar.seq, side=bar.side, entry_px=bar.entry_px, leverage=bar.leverage,
         qty_coin=bar.qty_coin, mark_px=mark_px, now_wall=float(bar.ts),
-        atr_px=bar.atr_px, committed_exit_px=bar.committed_exit_px)
+        atr_px=bar.atr_px, committed_exit_px=bar.committed_exit_px,
+        cost_floor_bps=bar.cost_floor_bps)
 
 
 def _is_new_epoch(state: ProfitGuardState | None, bar: BarFacts) -> bool:

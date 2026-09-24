@@ -204,7 +204,41 @@ def _summarize_pairs(trips: list[_Trip], total_budget_usd: float) -> dict:
         "captureRatio": captured_total / peak_total if peak_total > 0 else 0.0,
         "capturePairs": capture_pairs,
         "noPeakCount": no_peak,
+        **_green_to_red_keys(trips),
     }
+
+
+# 锁平后「立即同向重开」的判定窗口（秒）。前端 `aiTradeCapture.ts` 有同名常量，由双向断言锁住。
+LOCK_REENTRY_WINDOW_S = 1800
+_LOCK_REASON_PREFIX = "profit_lock_"
+
+
+def _green_to_red_keys(trips: list[_Trip]) -> dict:
+    """盈转亏与收益锁的四个纯加法键（profit-lock 轴 C-3；口径同前端 `summarizeProfitCapture`）。
+
+    - ``greenToRedCount``：曾浮盈（``peak_pnl > 0``）却以净亏（``net <= 0``）离场的往返数；
+    - ``greenToRedGivebackUsd``：这些往返的 ``Σ(peak − gross)``，与捕获率同为毛口径（P1-3）；
+    - ``lockExitCount``：收益锁离场的往返数；
+    - ``lockReentryCount``：锁平后**下一笔**往返同向、且开仓距锁平 ≤ 窗口的次数——「锁平 → 立即
+      同向重开」的手续费失血此前完全不可观测（评审 RV-P1-9）。按 trips 时间序相邻两笔判定。
+    """
+    count, giveback, lock_exits, reentries = 0, 0.0, 0, 0
+    for idx, trip in enumerate(trips):
+        peak = getattr(trip.exit, "peak_pnl", None)
+        if peak is not None and peak > 0 and trip.net_pnl <= 0:
+            count += 1
+            giveback += float(peak) - trip.gross_pnl
+        if not str(getattr(trip.exit, "reason", "") or "").startswith(_LOCK_REASON_PREFIX):
+            continue
+        lock_exits += 1
+        nxt = trips[idx + 1] if idx + 1 < len(trips) else None
+        # 同一 run（同一标的）内才算重开：trips 是逐 run 拼接的，跨 run 相邻不代表先后关系。
+        if (nxt is not None and nxt.entry.run_id == trip.exit.run_id
+                and nxt.entry.side == trip.entry.side
+                and 0 <= int(nxt.entry.ts) - int(trip.exit.ts) <= LOCK_REENTRY_WINDOW_S):
+            reentries += 1
+    return {"greenToRedCount": count, "greenToRedGivebackUsd": giveback,
+            "lockExitCount": lock_exits, "lockReentryCount": reentries}
 
 
 def _run_cost_basis(cfg: dict) -> tuple[str, bool]:

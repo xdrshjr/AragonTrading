@@ -112,6 +112,7 @@ EXECUTION_REASONS = frozenset({
     "existing_order_kept", "position_not_flat", "same_side_position",
     "exchange_rejected", "insufficient_balance", "attempt_persist_failed",
     "acceptance_unknown", "pre_submit_context_changed", "facts_unavailable",
+    "pre_submit_price_drift",
     "quota_exhausted", "session_not_running", "other",
 })
 

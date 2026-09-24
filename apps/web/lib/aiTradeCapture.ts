@@ -100,3 +100,57 @@ export function formatProfitCapture(summary: ProfitCaptureSummary): string {
 export const PROFIT_CAPTURE_HINT =
   "捕获率 = 已实现盈亏 / 峰值浮盈。分母不含手续费、分子含，故小额往返会偏低；"
   + "持仓期间加过仓的往返，峰值为按最终均价重估值。";
+
+// ---------- 盈转亏与收益锁（ai-trade-profit-lock-and-entry-unblock 轴 C-3）----------
+
+/** 锁平后「立即同向重开」的判定窗口（秒）。后端 `ai_auto_repositories.LOCK_REENTRY_WINDOW_S` 同值。 */
+export const LOCK_REENTRY_WINDOW_S = 1800;
+
+export interface GreenToRedSummary {
+  /** 曾浮盈（peak > 0）却以亏损（pnl ≤ 0）离场的往返数。 */
+  greenToRedCount: number;
+  /** 这些往返的 Σ(peak − pnl)：从峰值一路回吐掉的钱。 */
+  greenToRedGivebackUsd: number;
+  /** 收益锁离场的往返数（reason 以 `profit_lock_` 开头）。 */
+  lockExitCount: number;
+  /** 锁平后下一笔同向、且开仓距锁平 ≤ 窗口的次数（手续费失血的观测量）。 */
+  lockReentryCount: number;
+}
+
+const EMPTY_G2R: GreenToRedSummary = {
+  greenToRedCount: 0, greenToRedGivebackUsd: 0, lockExitCount: 0, lockReentryCount: 0,
+};
+
+/**
+ * 单标的成交流 → 盈转亏四键。判据与后端 `_green_to_red_keys` 逐条对应；实时页的回吐额沿用
+ * 本文件 `summarizeProfitCapture` 的分子口径（`exit.pnl`），历史页一律取后端聚合值。
+ */
+export function summarizeGreenToRed(trades: Trade[]): GreenToRedSummary {
+  const segments = buildTradeTrailSegments(trades.filter((t) => !t.seeded));
+  const out = { ...EMPTY_G2R };
+  segments.forEach((seg, idx) => {
+    const peak = seg.exit.peakPnlUsd;
+    if (peak != null && Number.isFinite(peak) && peak > 0 && seg.exit.pnl <= 0) {
+      out.greenToRedCount += 1;
+      out.greenToRedGivebackUsd += peak - seg.exit.pnl;
+    }
+    if (!(seg.exit.reason || "").startsWith("profit_lock_")) return;
+    out.lockExitCount += 1;
+    const next = segments[idx + 1];
+    const gap = next ? next.entry.ts - seg.exit.ts : -1;
+    if (next && next.entry.side === seg.entry.side && gap >= 0 && gap <= LOCK_REENTRY_WINDOW_S) {
+      out.lockReentryCount += 1;
+    }
+  });
+  return out;
+}
+
+/** 跨成员合并（逐成员判定、绝不跨标的相邻）。 */
+export function summarizeGreenToRedAcross(members: { trades: Trade[] }[]): GreenToRedSummary {
+  return members.map((m) => summarizeGreenToRed(m.trades)).reduce((acc, part) => ({
+    greenToRedCount: acc.greenToRedCount + part.greenToRedCount,
+    greenToRedGivebackUsd: acc.greenToRedGivebackUsd + part.greenToRedGivebackUsd,
+    lockExitCount: acc.lockExitCount + part.lockExitCount,
+    lockReentryCount: acc.lockReentryCount + part.lockReentryCount,
+  }), { ...EMPTY_G2R });
+}

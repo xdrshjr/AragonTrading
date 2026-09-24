@@ -18,6 +18,7 @@ import type {
 // 保护快照的形状真源在 types.ts（aiTradeTypes 已 import 它，反向 import 会成环）；此处只做转出口，
 // 使 AI 自动交易侧的消费点无需跨文件二次 import。
 export type { ProfitGuardCooldown, ProfitGuardSnapshot } from "./types";
+export type { AiTradeProfitLockSnapshot } from "./types";
 
 // cancel_order（ai-trade-limit-orders M-11）：撤回本会话未成交的限价挂单，不开不平。
 export type AiTradeAction = "open_long" | "open_short" | "close" | "hold" | "cancel_order";
@@ -288,6 +289,8 @@ export interface AiTradeDecision {
     factsHash?: string | null;
     executionReceipt?: OpenAttemptReceipt | null;
     executionContextChanged?: boolean | string;
+    // 轴 A：下单前复检为什么拦下了这一笔（成本 / 价格漂移 / 身份）；未拦 / 老后端 ⇒ 缺席或 null。
+    preSubmitCheck?: AiTradePreSubmitCheck | null;
     ok?: boolean;
     action?: string;                        // 门禁后最终动作（后端 _execute_decision 回带；与 wire §5.1 一致）
     skipped?: boolean;
@@ -979,6 +982,32 @@ export interface AiTradeGivebackTier {
   givebackPct: number;
 }
 
+// 成本锚定收益锁入参（ai-trade-profit-lock-and-entry-unblock §5.1；与后端 ProfitLockRule 镜像）。
+// **价格 bps 口径**，与杠杆无关；数值字段留空 ⇒ 服务端按 settings 回填；整键缺省 ⇒ 服务端默认开启。
+export interface AiTradeProfitLockRule {
+  enabled: boolean;
+  armCostMult?: number | null;      // 阶段 1 武装：浮盈 ≥ 该倍数 × 往返成本（[1, 10]）
+  armAtrMult?: number | null;
+  bufferBps?: number | null;        // 阶段 1 锁线 = 含费保本 + buffer
+  trailCostMult?: number | null;    // 阶段 2 武装（须 ≥ armCostMult）
+  trailAtrMult?: number | null;
+  keepRatio?: number | null;        // 阶段 2 锁住峰值浮盈的比例（(0, 0.95]）
+  minHoldSeconds?: number | null;
+  confirmSeconds?: number | null;   // 越线须持续的墙钟秒数（[0, 60]）
+}
+
+// status 顶层的收益锁计数（规则未装配 ⇒ 整键缺席）。
+export interface AiTradeProfitLockStatus {
+  exits: number;
+  armedEpochs: number;
+}
+
+// 下单前复检读数（轴 A；`executed.preSubmitCheck`，整对象透传）。
+export type AiTradePreSubmitCheck =
+  | { kind: "cost"; frozenBps: number; currentBps: number; deltaBps: number; toleranceBps: number }
+  | { kind: "drift"; driftBps: number; limitBps: number; refPx: number; nowPx: number }
+  | { kind: "identity"; changed: ("positionSeq" | "side" | "qty" | "restingClOrdId")[] };
+
 // 会话成本快照（ai-trade-cost-truth-and-net-pnl §5.4 / P1-1）：后端 `build_cost_stats` 的唯一产物，
 // 同时作为 WS `costSnapshot` 与落库 `metricsJson.aiStats`——**两条通道必然同形**，故此处一个接口
 // 描述两处。`feeRates` / `reconcile` 挂**顶层**，`sessionFeeUsd` 挂 `cost` 子对象（与实测键同族）。
@@ -1325,6 +1354,8 @@ export interface AiTradeSessionRow {
   // 进 `m.session`，**类型里没有这个键则面板取不到**（tsc 报错而非静默丢数据，但极易被「后端已下发」
   // 骗过去）。未装配 / 老后端 ⇒ undefined 或 null ⇒ chip 整段不渲染。
   horizon?: AiTradeHorizonSnapshot | null;
+  // 收益锁计数（profit-lock §5.2）：同经 status 整体浅合并进 `m.session`；未装配 ⇒ 缺席。
+  profitLock?: AiTradeProfitLockStatus | null;
   // 验收闭环三键（horizon-acceptance [P0-3] 成员级实时通路）：status 事件经
   // `patchAiTradeMemberStatus` **整体 spread** 合并进 `m.session`，故运行期数据本来就在——
   // 漏的只是类型声明。未装配 / 零样本 ⇒ null ⇒ 卡片整段不渲染。
@@ -1442,6 +1473,7 @@ export interface AiTradeStatusEvent {
   // 持仓周期快照（holding-horizon §4.4）：每次 status 事件随附，供面板 chip 在无决策事件时也能更新
   // 倒计时；未装配 ⇒ null。
   horizon?: AiTradeHorizonSnapshot | null;
+  profitLock?: AiTradeProfitLockStatus | null;   // 收益锁计数（规则未装配 ⇒ 缺席）
   // 验收闭环三键（成员级口径）：随每次 status 事件下发，是运行期卡片的**主通路**。
   acceptance?: AiTradeAcceptance | null;
   exits?: AiTradeExitMix | null;
@@ -1591,6 +1623,7 @@ export interface AiTradeGroupStartReq {
   reasoningDepth?: AiTradeReasoningDepth | null;
   baseRules?: AiTradeBaseRules | null;  // 【基础策略】铁律（字段省略→服务端默认开启）
   profitGuard?: AiTradeProfitGuardRule | null;  // 利润保护层（字段省略→服务端默认开启）
+  profitLock?: AiTradeProfitLockRule | null;    // 收益锁（字段省略→服务端默认开启）
   tradingHorizon?: AiTradeHorizonRule | null;   // 交易周期模式（字段省略→服务端默认开启）
   discipline?: AiTradeDisciplineIn | null;      // 交易纪律预设（字段省略→服务端默认 balanced）
   // 经验模式（字段省略→服务端按 `ai_trade_experience_default_on` 装配，默认开启）。
@@ -1647,6 +1680,7 @@ export interface AiTradeGroupRow {
   wakeIntervalMinutes?: number | null; // wake-interval：Agent 墙钟定时唤醒周期（分钟；null=关闭）
   baseRules?: AiTradeBaseRules | null; // 【基础策略】铁律回执镜像（null=未装配）
   profitGuard?: AiTradeProfitGuardRule | null; // 利润保护层回执镜像（null=未装配）
+  profitLock?: AiTradeProfitLockRule | null;   // 收益锁回执镜像（null=未装配）
   // 交易周期模式回执镜像（null=未装配）：**服务端解析后的生效值** + 两个派生量
   // （expectedHoldBars / confirmWindowSeconds），使「弹窗预览 == 落地」可逐字段核对。
   tradingHorizon?: AiTradeHorizonRule | null;

@@ -14,6 +14,7 @@ import WakeAttributionCard from "./WakeAttributionCard";
 import { Badge, Button, Skeleton } from "@/components/ui";
 import { buildLedger, buildRoundTrips, type RoundTrip } from "@/lib/autoTradePnl";
 import { formatProfitCapture, PROFIT_CAPTURE_HINT } from "@/lib/aiTradeCapture";
+import GreenToRedLine from "./GreenToRedLine";
 import {
   COST_BASIS_HINT,
   costShareOfGross,
@@ -290,6 +291,7 @@ function KpiGrid({
           </span>
         </div>
         <p className="text-[10px] leading-relaxed text-[var(--muted)]">{PROFIT_CAPTURE_HINT}</p>
+        <GreenToRedLine summary={summary} />
       </div>
     </div>
   );

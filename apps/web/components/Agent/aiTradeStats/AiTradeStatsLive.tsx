@@ -28,8 +28,11 @@ import {
 import {
   formatProfitCapture,
   PROFIT_CAPTURE_HINT,
+  summarizeGreenToRedAcross,
   summarizeProfitCaptureAcross,
+  type GreenToRedSummary,
 } from "@/lib/aiTradeCapture";
+import GreenToRedLine from "./GreenToRedLine";
 import { memberDisciplines } from "@/lib/aiTradeDiscipline";
 import { formatHoldDuration, horizonLiveKpis } from "@/lib/aiTradeHorizon";
 import { computeReflectionCounts, latestHoldStreak } from "@/lib/aiTradeObservability";
@@ -141,6 +144,11 @@ export default function AiTradeStatsLive({
       summarizeProfitCaptureAcross(
         group ? Object.values(group.members).map((m) => ({ trades: m.trades })) : [],
       ),
+    [group],
+  );
+  const greenToRed = useMemo(
+    () => summarizeGreenToRedAcross(
+      group ? Object.values(group.members).map((m) => ({ trades: m.trades })) : []),
     [group],
   );
 
@@ -287,7 +295,7 @@ export default function AiTradeStatsLive({
           repairPending={repairState}
         />
         <ExitSourceCard exits={group.exits} onOpenProfitGuard={onOpenProfitGuard} />
-        <ProfitCaptureCard capture={capture} />
+        <ProfitCaptureCard capture={capture} greenToRed={greenToRed} />
         <RealizedLiveCard group={group} />
         <WakeAttributionCard trips={ledger} />
         {unrealizedUsd !== null && (
@@ -516,8 +524,10 @@ function RealizedLiveCard({ group }: { group: AiTradeGroupState }) {
  */
 function ProfitCaptureCard({
   capture,
+  greenToRed,
 }: {
   capture: ReturnType<typeof summarizeProfitCaptureAcross>;
+  greenToRed: GreenToRedSummary;
 }) {
   return (
     <div className="flex flex-col gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2">
@@ -528,6 +538,7 @@ function ProfitCaptureCard({
         </span>
       </div>
       <p className="text-[10px] leading-relaxed text-[var(--muted)]">{PROFIT_CAPTURE_HINT}</p>
+      <GreenToRedLine summary={greenToRed} />
     </div>
   );
 }

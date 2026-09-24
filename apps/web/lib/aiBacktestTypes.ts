@@ -10,6 +10,7 @@ import type {
   AiTradeHorizonRule,
   AiTradeHorizonStats,
   AiTradeProfitGuardRule,
+  AiTradeProfitLockRule,
 } from "./aiTradeTypes";
 import type { EquityPoint, Metrics, Trade } from "./types";
 
@@ -39,6 +40,8 @@ export interface AiBacktestStartReq {
   // 利润保护层：本轮 F3 起回测也接该字段（bar 内 OHLC 极值 + 保守成交序，不再是收盘价近似）。
   // 与实盘同一服务端解析点；运维总闸关闭时服务端恒不装配，结果 notes 会写明保守近似免责。
   profitGuard?: AiTradeProfitGuardRule | null;
+  // 收益锁：与实盘同字段同语义、同一 `_resolve_profit_lock` 解析（另叠回测运维总闸）。
+  profitLock?: AiTradeProfitLockRule | null;
   // 交易周期模式：同一 `_resolve_horizon` 解析（回测侧另叠一层运维总闸）。回测按根推进，最短持仓
   // 窗口的分辨率是一根 K 线——该免责由后端写进结果 notes 并在 UI 上显示。
   tradingHorizon?: AiTradeHorizonRule | null;

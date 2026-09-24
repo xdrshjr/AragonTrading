@@ -167,6 +167,18 @@ class CostRuntime:
         funding_changed = self._funding_terms_changed(snap)
         return current != snap.params or (stale and not snap.stale) or funding_changed
 
+    def pre_submit_cost_pair(self, decision, bar_seconds: int) -> tuple:
+        """(冻结断面往返成本, 此刻往返成本) bps；本轮未冻结 ⇒ (None, None)。判定在 pre_submit。"""
+        if (snap := self._round_cost) is None:
+            return None, None
+        current = self._current_cost_params()
+        if snap.spread_bps is not None:
+            current = replace(current, half_spread_fallback_bps=snap.spread_bps)
+        now = estimate_round_trip_cost(query_for_decision(
+            decision, bar_seconds=bar_seconds, funding=self.funding.snapshot(time.time()),
+            funding_enabled=self.settings.ai_trade_funding_enabled), current)
+        return self.estimate_cost_only(decision, bar_seconds), now.total_bps
+
     def _funding_terms_changed(self, snap: RoundCostSnapshot) -> bool:
         if not snap.funding_enabled:
             return False

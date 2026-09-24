@@ -373,7 +373,7 @@ async def test_observation_save_failure_blocks_open_and_retries_real_sqlite(
             "wallTs": 100, "fee": 0, "feeBasis": "measured"})
         event.listen(engine.sync_engine, "before_cursor_execute", reject_update)
         assert not await session._persist_settlement_identity()
-        assert session._prepare_open_context() == "attempt_persist_failed"
+        assert session._prepare_open_context(None, 100.0) == "attempt_persist_failed"
         assert executor.settlement_identity.context() is not None
         await session._sync_execution_integrity()
         assert not session._execution_state_persist_failed

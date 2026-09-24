@@ -56,6 +56,11 @@ REASON_HARD_TAKE_PROFIT = "profit_guard_hard_take_profit"
 # `profit_guard_` 前缀会自动把它归入 profit_guard kind（前端分类零改）。
 REASON_COMMITTED_EXIT = "profit_guard_committed_exit"
 
+# 轴 B-4：保本线相对含费成本的最小净额（bps）。与收益锁的 buffer 同量纲、不开放配置。
+BREAKEVEN_COST_BUFFER_BPS = 2.0
+# 抬高后的保本线须低于峰值至少这么多才武装（与 `profit_lock.MIN_GAP_BPS` 同一不变式）。
+BREAKEVEN_MIN_GAP_BPS = 3.0
+
 _REASON_LABEL = {
     REASON_TRAILING: "移动止盈",
     REASON_BREAKEVEN: "保本线",
@@ -175,6 +180,9 @@ class PositionFacts:
     # 承诺退出线（§2.2.3，第三条下方保护线）；默认 None ⇒ 既有构造零改、判定零变化（G-1/G-3）。
     committed_exit_px: float | None = None
     committed_exit_basis: str | None = None
+    # 轴 B-4：按持仓方向估的往返成本（bps）；非 None ⇒ 保本线偏移不低于「成本 + 2 bps」。
+    # 默认 None ⇒ 保本线逐字回退到保证金口径偏移（5× 下只有 4 bps，低于往返成本）。
+    cost_floor_bps: float | None = None
 
 
 @dataclass(frozen=True)
@@ -507,7 +515,15 @@ def _derive(rule: ProfitGuardRule, state: ProfitGuardState, facts: PositionFacts
     armed = peak_return_pct >= rule.arm_return_pct
     breakeven_armed = (rule.breakeven_arm_return_pct > 0
                        and peak_return_pct >= rule.breakeven_arm_return_pct)
-    breakeven_px = (entry * (1 + _signed(facts.side, rule.breakeven_offset_return_pct / lev))
+    offset = rule.breakeven_offset_return_pct / lev
+    if facts.cost_floor_bps is not None:
+        floor = (facts.cost_floor_bps + BREAKEVEN_COST_BUFFER_BPS) / 1e4
+        if floor > offset:
+            offset = floor
+            # 高杠杆下保证金口径武装点可能低于成本下界：线落在峰值上方 ⇒ 武装即市价平仓。
+            breakeven_armed = (breakeven_armed and peak_move_pct
+                               >= offset + BREAKEVEN_MIN_GAP_BPS / 1e4)
+    breakeven_px = (entry * (1 + _signed(facts.side, offset))
                     if breakeven_armed else None)
     trail = _derive_trail(rule, state, facts, armed=armed, peak_return_pct=peak_return_pct,
                           breakeven_px=breakeven_px)
