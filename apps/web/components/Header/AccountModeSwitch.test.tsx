@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { accountApi } from "@/lib/accountApi";
+import { agentTradingApi } from "@/lib/agentTradingApi";
 import { useAppStore } from "@/lib/store";
 import AccountModeSwitch from "./AccountModeSwitch";
 
@@ -36,6 +37,27 @@ function renderSwitch(placement: "inline" | "rail" = "inline") {
 const liveButton = () => screen.getByRole("radio", { name: /实盘/ });
 const simButton = () => screen.getByRole("radio", { name: "模拟盘" });
 const queryStatus = (qc: QueryClient) => qc.getQueryState(["okx", "accounts"])?.status;
+
+it("聊天绑定CAS失败时保留实盘与原图表模式，并显示具体原因", async () => {
+  vi.mocked(accountApi.accounts.list).mockResolvedValue(READY as any);
+  useAppStore.setState({ agentConversationId: "switch-test", accountMode: "live",
+    mode: "backtest", agentTradingBindingPending: false, agentTradingBindingError: null });
+  const read = vi.spyOn(agentTradingApi, "binding").mockResolvedValue({
+    conversationId: "switch-test", accountId: 1, environment: "demo",
+    accountMode: "live", version: 1, updatedTs: 1,
+  });
+  const write = vi.spyOn(agentTradingApi, "bind")
+    .mockRejectedValue(new Error("提交处理中，暂不能切换"));
+  const { qc } = renderSwitch();
+  await waitFor(() => expect(queryStatus(qc)).toBe("success"));
+  fireEvent.click(simButton());
+  await screen.findByRole("alert");
+  expect(useAppStore.getState().accountMode).toBe("live");
+  expect(useAppStore.getState().mode).toBe("backtest");
+  read.mockRestore();
+  write.mockRestore();
+  act(() => useAppStore.setState({ agentConversationId: "", agentTradingBindingError: null }));
+});
 
 beforeEach(() => {
   vi.clearAllMocks();

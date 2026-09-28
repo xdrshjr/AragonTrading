@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
 
 from ..config import Settings, get_settings
@@ -18,7 +19,7 @@ from ..db.session import get_sessionmaker
 from .conversation import row_to_client_dict
 from .llm.base import LLMClient
 from .llm.factory import make_llm_client, make_llm_client_from_config
-from .loop import AgentSession
+from .loop import AgentSession, RunToolContext
 from .providers import resolve_active_provider
 from .tools.registry import ToolRegistry
 
@@ -122,7 +123,12 @@ class AgentManager:
         sm = self._factory()
         async with sm() as session:
             states = await repo.get_tool_states(session)
-        return {name for name in self._registry.all_names() if states.get(name, True)}
+        return {
+            name for name in self._registry.all_names()
+            if states.get(name, True)
+            and (self._settings.agent_trading_enabled
+                 or self._registry.get(name).category not in {"account", "trading"})
+        }
 
     async def get_or_create(self, conversation_id: str) -> AgentSession:
         """取或建会话：临界区加锁，确保同 convId 跨连接复用同一 AgentSession（H3，无脑裂）。"""
@@ -223,9 +229,16 @@ class AgentManager:
         except Exception:  # noqa: BLE001 —— 取消路径兜底，吞掉后台任务残余异常
             logger.debug("agent run task ended with error during drain", exc_info=True)
 
-    async def handle(self, conversation_id: str, user_text: str, ui: dict | None) -> None:
+    async def handle(self, conversation_id: str, user_text: str, ui: dict | None,
+                     client_message_id: str | None = None) -> None:
         """启动一轮 run：解析当前默认服务、把 client 传入 run（过 BUSY 守卫后才绑定，P1-Race）。"""
         sess = await self.get_or_create(conversation_id)
+        from ..agent_trading.binding import freeze_call
+        call = await freeze_call(
+            self._factory(), conversation_id,
+            client_message_id or str(uuid.uuid4()),
+            (ui or {}).get("accountMode"),
+        )
         client = await self._resolve_client()
         if client is None:
             await sess.notify(_error(
@@ -236,7 +249,10 @@ class AgentManager:
             await sess.load_from_db()
         user_text = self._guard_user_text(user_text, conversation_id)
         enabled = await self.resolve_enabled_tools()
-        task = asyncio.create_task(sess.run(user_text, ui, client=client, enabled_tools=enabled))
+        task = asyncio.create_task(sess.run(
+            user_text, ui, client=client,
+            enabled_tools=RunToolContext(enabled, call),
+        ))
         sess.bind_run_task(task)
         task.add_done_callback(_retrieve_run_exception)
 
@@ -256,9 +272,13 @@ class AgentManager:
             sess.cancel()
 
     async def clear(self, conversation_id: str) -> int:
-        sm = self._factory()
-        async with sm() as session:
-            removed = await repo.clear_agent_messages(session, conversation_id)
+        from ..agent_trading.binding import clear_conversation
+        sess = self._sessions.get(conversation_id)
+        if sess is not None:
+            sess.cancel()
+            await self.drain(sess.run_task,
+                             self._settings.agent_drain_timeout_seconds)
+        removed = await clear_conversation(self._factory(), conversation_id)
         self._cancel_grace(conversation_id)
         # clear 实为字典写入（pop），随 H3 一并纳入同一锁（RN-4）。
         async with self._lock:

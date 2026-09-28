@@ -5,6 +5,15 @@ import type { AgentToolCategory } from "./agentTypes";
 
 // 工具名 → 友好中文标签 + 图标（缺省回落原 name）。
 export const TOOL_LABELS: Record<string, { label: string; icon: string }> = {
+  list_trading_accounts: { label: "交易账户", icon: "▤" },
+  get_account_balance: { label: "账户余额", icon: "▤" },
+  get_account_positions: { label: "真实持仓", icon: "▤" },
+  get_open_orders: { label: "未结委托", icon: "▤" },
+  get_recent_fills: { label: "近期成交", icon: "▤" },
+  get_order_status: { label: "订单状态", icon: "▤" },
+  get_ai_trade_context: { label: "自动交易研判", icon: "▤" },
+  prepare_trade: { label: "交易预览", icon: "◇" },
+  prepare_cancel_order: { label: "撤单预览", icon: "◇" },
   list_instruments: { label: "查询标的列表", icon: "📋" },
   get_market_summary: { label: "行情快照", icon: "📈" },
   get_candles: { label: "拉取 K 线", icon: "🕯️" },
@@ -33,6 +42,8 @@ export function labelFor(name: string): { label: string; icon: string } {
 
 // 分类 key → 中文标题 + 一句话描述（与后端 Tool.category 枚举对齐）。
 export const TOOL_CATEGORIES: Record<AgentToolCategory, { title: string; desc: string }> = {
+  account: { title: "账户查询", desc: "查询绑定账户与自动交易事实" },
+  trading: { title: "指令交易", desc: "生成具体订单预览，由用户提交" },
   market: { title: "行情数据", desc: "查询标的、快照与 K 线等实时行情" },
   ui: { title: "界面控制", desc: "驱动左侧主图等工作台界面动作" },
   strategy: { title: "策略与回测", desc: "列出策略、运行回测与横向对比" },
@@ -44,6 +55,8 @@ export const TOOL_CATEGORIES: Record<AgentToolCategory, { title: string; desc: s
 
 // 分组展示顺序（界面自上而下）。
 export const CATEGORY_ORDER: AgentToolCategory[] = [
+  "account",
+  "trading",
   "market",
   "ui",
   "strategy",

@@ -14,7 +14,8 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 from ..config import Settings
 from ..db import repositories as repo
@@ -29,10 +30,33 @@ from .llm.base import (
 )
 from .llm.retry import normalize_usage
 from .prompts import build_system_prompt
-from .tools.base import ToolContext, UiContext
+from .tools.base import ToolContext, ToolResult, UiContext
 from .tools.registry import ToolRegistry
 
+if TYPE_CHECKING:
+    from ..agent_trading.schemas import AgentCallContext
+
 logger = logging.getLogger("aragon.agent.loop")
+
+
+def _tool_result_block(tool_id: str, result: ToolResult) -> ToolResultBlock:
+    """结构化事实只进入模型正文，卡片使用独立中文摘要。"""
+    content = result.summary
+    if result.model_payload is not None:
+        encoded = json.dumps(result.model_payload, ensure_ascii=False)
+        if len(encoded.encode("utf-8")) > 24 * 1024:
+            encoded = json.dumps({"truncated": True,
+                                  "reason": "结果超出展示上限，请缩小查询范围"},
+                                 ensure_ascii=False)
+        content += "\n" + encoded
+    return ToolResultBlock(
+        tool_use_id=tool_id, content=content, is_error=not result.ok,
+        display_payload=(result.payload if result.model_payload is not None
+                         else None),
+        display_summary=(result.summary if result.model_payload is not None
+                         else None),
+        code=result.code,
+    )
 
 Emit = Callable[[dict], Awaitable[None]]
 
@@ -81,6 +105,13 @@ class _RunStats:
     stop_reason: str | None = None
     in_tokens: int | None = None
     out_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class RunToolContext:
+    """每轮启用集与冻结账户作为一个不可变执行上下文传入。"""
+    enabled: set[str]
+    call: AgentCallContext
 
 
 class AgentSession:
@@ -232,7 +263,7 @@ class AgentSession:
 
     async def run(self, user_text: str, ui: dict | None = None, sink: Emit | None = None,
                   *, client: LLMClient | None = None,
-                  enabled_tools: set[str] | None = None) -> None:
+                  enabled_tools: set[str] | RunToolContext | None = None) -> None:
         """跑一轮 agentic loop。事件经 ``self._emit`` 发出（run/socket 解耦，RS-1）。
 
         Args:
@@ -255,11 +286,13 @@ class AgentSession:
         self._running = True
         if client is not None:  # 过守卫后才绑定：赢得 run 槽的这一轮才换用最新默认服务（P1-Race）。
             self._llm = client
-        self._enabled_tools = enabled_tools  # 与 client 同点位：本轮快照启用集，run 中途开关变更下一轮才生效。
+        run_context = enabled_tools if isinstance(enabled_tools, RunToolContext) else None
+        self._enabled_tools = run_context.enabled if run_context else enabled_tools
         self._cancel = False
         self._buffer.clear()  # 新 run 起始清空事件窗口（缓冲只承载当前 run，R4）
         ctx = ToolContext(session_factory=self._session_factory, ui=UiContext.from_dict(ui),
-                          cancel_check=lambda: self._cancel)
+                          cancel_check=lambda: self._cancel,
+                          call=run_context.call if run_context else None)
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         try:
             await self._run_rounds(user_text, ui, ctx)
@@ -270,7 +303,7 @@ class AgentSession:
     async def _run_rounds(self, user_text: str, ui: dict | None, ctx: ToolContext) -> None:
         await self._append_and_persist(LlmMessage("user", [TextBlock(user_text)]))
         disabled = self._registry.disabled_names(self._enabled_tools)
-        system = build_system_prompt(ui, disabled)
+        system = build_system_prompt(ui, disabled, ctx.call)
         stats = _RunStats()
         outcome = await self._iterate_tool_rounds(system, ctx, stats)
         if outcome == "limit":
@@ -391,16 +424,21 @@ class AgentSession:
                 break
             await self._emit(_event("tool_call", {"id": tu.id, "name": tu.name, "input": tu.input}))
             started = time.perf_counter()
-            result = await self._registry.execute(tu.name, tu.input, ctx,
+            call_ctx = replace(ctx, call=replace(ctx.call, tool_use_id=tu.id)) if ctx.call else ctx
+            result = await self._registry.execute(tu.name, tu.input, call_ctx,
                                                   enabled=self._enabled_tools)
             stats.tools.append({"name": tu.name, "ok": result.ok,
                                 "ms": round((time.perf_counter() - started) * 1000, 1)})
-            await self._emit(_event("tool_result", {"id": tu.id, "name": tu.name,
-                                                    "ok": result.ok, "summary": result.summary}))
+            event = {"id": tu.id, "name": tu.name,
+                     "ok": result.ok, "summary": result.summary}
+            if result.model_payload is not None:
+                event["payload"] = result.payload
+            if result.code is not None:
+                event["code"] = result.code
+            await self._emit(_event("tool_result", event))
             if self._registry.is_ui_action(tu.name) and result.ok and result.payload:
                 await self._emit(_event("ui_action", result.payload))
-            result_blocks.append(ToolResultBlock(tool_use_id=tu.id, content=result.summary,
-                                                 is_error=not result.ok))
+            result_blocks.append(_tool_result_block(tu.id, result))
         # 为未执行的 tool_use 补"已取消"结果，保持 tool_use↔tool_result 配对（resume 无损，P1-D）。
         for tu in tool_uses[len(result_blocks):]:
             result_blocks.append(ToolResultBlock(tool_use_id=tu.id, content="已取消", is_error=True))

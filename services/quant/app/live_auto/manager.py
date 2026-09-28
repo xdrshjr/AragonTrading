@@ -170,6 +170,7 @@ class LiveAutoManager:
         """
         self._require_enabled(req.settings)
         async with get_admission_lock(), self._start_lock:
+            await self._require_chat_trade_idle()
             self._require_capacity()
             members = self._validate_members(req.members_in, req.settings, req.allocation_mode)
             creds = _creds(req.account_row)
@@ -358,6 +359,17 @@ class LiveAutoManager:
         return flat
 
     # ---------- 只读视图 / WS 路由 ----------
+    async def _require_chat_trade_idle(self) -> None:
+        """与聊天提交共用准入锁，不在网络等待期间让出持久占用。"""
+        from ..agent_trading.admission import assert_no_unresolved
+        from ..agent_trading.errors import TradingError
+        try:
+            await assert_no_unresolved(get_sessionmaker())
+        except TradingError as exc:
+            raise LiveAutoPreflightError(
+                exc.code, exc.message, exc.status_code,
+            ) from exc
+
     def group_status(self) -> dict | None:
         """活跃分组只读视图（前端重载后据此重连各成员 WS）；无活跃分组→ None。"""
         group = self._group
@@ -368,6 +380,21 @@ class LiveAutoManager:
                 "bar": group.bar, "totalBudgetUsd": group.total_budget_usd,
                 "leverage": group.leverage, "createdTs": group.created_ts,
                 "members": [self._member_row(m) for m in group.members]}
+
+    def trading_context(self) -> dict | None:
+        """普通自动交易也只暴露冻结身份可证明的只读快照。"""
+        from ..ai_auto.manager import AiTradeManager
+        group = self._group
+        if group is None:
+            return None
+        members = [AiTradeManager._trading_context_member(item)
+                   for item in group.members]
+        identities = [item.pop("identity") for item in members]
+        identity = identities[0] if identities else None
+        if not identity or any(item != identity for item in identities):
+            identity = None
+        return {"groupId": group.group_id, "state": "managed",
+                "identity": identity, "members": members}
 
     @staticmethod
     def _member_row(member: LiveAutoGroupMember) -> dict:

@@ -65,7 +65,12 @@ async def agent_messages(conversation_id: str, limit: int = Query(200, ge=1, le=
 
 @router.delete("/agent/conversations/{conversation_id}", status_code=204)
 async def agent_clear(conversation_id: str) -> Response:
-    await get_agent_manager().clear(conversation_id)
+    from ..agent_trading.errors import TradingError
+    try:
+        await get_agent_manager().clear(conversation_id)
+    except TradingError as exc:
+        raise HTTPException(status_code=exc.status_code,
+                            detail=exc.as_dict()["error"]) from exc
     return Response(status_code=204)
 
 
@@ -265,7 +270,23 @@ async def _handle_user_message(msg, conversation_id: str, manager, sess, websock
         await _send(websocket, "error", {"code": "BUSY", "message": "上一条仍在处理，请稍候。"})
         return
     data = msg.get("data") or {}
-    await manager.handle(conversation_id, data.get("text", ""), data.get("ui"))
+    from uuid import UUID, uuid4
+    try:
+        message_id = str(UUID(str(data.get("clientMessageId") or uuid4())))
+        ui = data.get("ui")
+        if ui is not None and not isinstance(ui, dict):
+            raise ValueError("ui")
+        if (ui or {}).get("accountMode") not in (None, "sim", "live"):
+            raise ValueError("accountMode")
+        if not isinstance(data.get("text", ""), str):
+            raise ValueError("text")
+    except (ValueError, TypeError, AttributeError):
+        await _send(websocket, "error", {
+            "code": "INVALID_TRADING_REQUEST", "message": "消息身份或账户模式无效。",
+        })
+        return
+    await manager.handle(conversation_id, data.get("text", ""), ui,
+                         client_message_id=message_id)
 
 
 def _as_int(value, default: int) -> int:

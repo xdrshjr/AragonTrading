@@ -28,6 +28,24 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 
+it("同一消息重试复用UUID，新消息另建UUID并传递账户模式", () => {
+  const { result } = renderHook(useAgentConversation);
+  const socket = connection();
+  act(() => {
+    socket.state(true);
+    result.current.send("查看持仓");
+    socket.emit({ type: "error", data: { message: "断线" } });
+    result.current.retry();
+    socket.emit({ type: "done", data: {} });
+    result.current.send("重新生成预览");
+  });
+  const requests = socket.ws.send.mock.calls.map(([request]: [any]) => request);
+  expect(requests[0].data.clientMessageId).toMatch(/^[0-9a-f-]{36}$/);
+  expect(requests[1].data.clientMessageId).toBe(requests[0].data.clientMessageId);
+  expect(requests[2].data.clientMessageId).not.toBe(requests[0].data.clientMessageId);
+  expect(requests[0].data.ui.accountMode).toBe(useAppStore.getState().accountMode);
+});
+
 it("首次空内存ID先恢复持久化会话，不能覆盖清空后保存的新ID", () => {
   useAppStore.setState({ agentConversationId: "" });
   const persisted = JSON.parse(localStorage.getItem("aragon-ui")!);

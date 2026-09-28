@@ -453,6 +453,7 @@ class AiTradeManager:
         self._validate_context_rounds(req)
         self._validate_sizing(req)      # 仓位层的两条启动期对账（越界 422，绝不留到运行期静默空转）
         async with get_admission_lock(), self._start_lock:
+            await self._require_chat_trade_idle()
             await self._require_capacity(req.settings)
             members = self._validate_members(req.members_in, req.settings, req.allocation_mode)
             creds = _creds(req.account_row)
@@ -1151,6 +1152,7 @@ class AiTradeManager:
         **不存在「置了 running 但有成员没起来」的中间态**——那正是用户报告的那句「貌似恢复了」。
         """
         async with get_admission_lock(), self._start_lock:
+            await self._require_chat_trade_idle()
             group = self._group
             if group is not None and group.group_id == group_id:
                 if group.state != pause_core.STATUS_PAUSED:
@@ -1985,6 +1987,56 @@ class AiTradeManager:
                 for member in group.members if member.session.is_active]
 
     # ---------- 只读视图 / WS 路由 ----------
+    async def _require_chat_trade_idle(self) -> None:
+        """共享准入锁内检查对话提交，持久状态不明时拒绝启动。"""
+        from ..agent_trading.admission import assert_no_unresolved
+        from ..agent_trading.errors import TradingError
+        try:
+            await assert_no_unresolved(get_sessionmaker())
+        except TradingError as exc:
+            raise AiTradePreflightError(
+                exc.code, exc.message, exc.status_code,
+            ) from exc
+
+    def trading_context(self) -> dict | None:
+        """从会话冻结凭据取身份；冷暂停无身份时不猜测当前环境。"""
+        group = self._group
+        if group is None:
+            return self.status()
+        members = [self._trading_context_member(item) for item in group.members]
+        identities = [item.pop("identity") for item in members]
+        identity = identities[0] if identities else None
+        if not identity or any(item != identity for item in identities):
+            identity = None
+        return {"groupId": group.group_id, "state": group.state,
+                "identity": identity, "members": members}
+
+    @staticmethod
+    def _trading_context_member(member) -> dict:
+        """内部身份仅供适配层比对；不进入通用 status/WS 出口。"""
+        import hashlib
+        session = member.session
+        executor = getattr(session, "executor", None)
+        creds = getattr(executor, "creds", None)
+        settings = getattr(executor, "settings", None)
+        identity = None
+        if creds is not None and settings is not None:
+            fingerprint = hashlib.sha256("\x00".join((
+                creds.api_key, creds.secret_key, creds.passphrase,
+            )).encode()).hexdigest()
+            identity = {
+                "accountId": executor.account_id,
+                "environment": "demo" if settings.okx_account_demo else "live",
+                "credentialFingerprint": fingerprint,
+            }
+        snapshot = session.snapshot() if hasattr(session, "snapshot") else {}
+        return {"identity": identity, "instId": member.inst_id,
+                "runId": member.run_id,
+                "state": getattr(session, "state", "unknown"),
+                "status": snapshot.get("status"),
+                "position": snapshot.get("position"),
+                "decisions": (snapshot.get("decisions") or [])[-3:]}
+
     def status(self) -> dict | None:
         """当前活跃 AI 分组只读视图（= group_status()）。
 

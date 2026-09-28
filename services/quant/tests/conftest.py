@@ -121,3 +121,32 @@ def _reset_ai_trade_pause_state():
     manager = get_ai_trade_manager()
     manager._paused_ref = None
     manager._hydration_failed = False
+
+
+@pytest.fixture(autouse=True)
+def _isolate_agent_trading_admission(request):
+    """旧 manager 单测未启动 lifespan，显式模拟启动完成而不放宽生产门禁。
+
+    新交易与 main 启动用例仍从关闭屏障开始。清扫仅针对本 conftest
+    创建的临时库，避免其他用例留下的未结意图被下一用例误认为真实占位。
+    """
+    from app.agent_trading import admission
+
+    def wipe_test_intents():
+        import sqlite3
+        with sqlite3.connect(_TMP_DB, timeout=5) as connection:
+            existing = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            for table in ("agent_trade_events", "agent_trade_intents",
+                          "agent_trade_bindings"):
+                if table in existing:
+                    connection.execute(f"DELETE FROM {table}")
+
+    wipe_test_intents()
+    startup_test = (request.node.path.name.startswith("test_agent_trading_")
+                    or request.node.path.name == "test_main_shutdown.py")
+    admission.set_ready(True)  # 先清除前一例 shutdown 的内存标记。
+    admission.set_ready(not startup_test)
+    yield
+    admission.begin_shutdown()
+    wipe_test_intents()

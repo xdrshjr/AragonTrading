@@ -16,6 +16,7 @@ import itertools
 import logging
 import time
 from dataclasses import replace
+from decimal import Decimal, InvalidOperation
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -116,11 +117,35 @@ def _fetch_meta_sync(raw: dict) -> InstrumentMeta:
         ct_type=raw["ctType"], settle_ccy=raw["settleCcy"])
 
 
-async def _load_meta(inst_id: str) -> InstrumentMeta:
+async def _load_meta(inst_id: str, *, fresh: bool = False) -> InstrumentMeta:
     """取合约元数据（公共 REST，无签名，C1-1）。"""
     rest = get_rest_client()
+    if fresh:
+        rows = await rest._request("/api/v5/public/instruments", {
+            "instType": infer_inst_type(inst_id), "instId": inst_id})
+        matches = [row for row in rows if row.get("instId") == inst_id]
+        if len(matches) != 1:
+            raise OKXPrivateError("PREVIEW_STALE", "无法确认最新合约规则")
+        raw = matches[0]
+        return InstrumentMeta(
+            _fresh_meta_number(raw, "ctVal"), str(raw.get("ctValCcy") or ""),
+            _fresh_meta_number(raw, "lotSz"), _fresh_meta_number(raw, "minSz"),
+            _fresh_meta_number(raw, "tickSz"), 0,
+            str(raw.get("ctType") or ""), str(raw.get("settleCcy") or ""))
     raw = await rest.get_instrument_meta(infer_inst_type(inst_id), inst_id)
     return _fetch_meta_sync(raw)
+
+
+def _fresh_meta_number(raw, key):
+    try:
+        value = Decimal(str(raw.get(key)))
+        converted = float(value)
+        if (not value.is_finite() or value <= 0
+                or Decimal(str(converted)) != value):
+            raise ValueError(key)
+    except (InvalidOperation, ValueError, OverflowError):
+        raise OKXPrivateError("PRECISION_UNSUPPORTED", "最新合约规则精度不可安全转换") from None
+    return converted
 
 
 def _ref_price(order: OrderInput, last_px: float | None) -> float:
@@ -170,11 +195,21 @@ async def place_live_order(session: AsyncSession, creds: AccountCredentials, acc
     """完整下单时序（§2.2）：守门→设杠杆→下单→留痕。失败归一并审计后上抛（绝不假成功）。"""
     cl_ord_id = order.client_order_id or _gen_cl_ord_id()
     trace = order.submission_trace
-    client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase)
+    dispatch_guard = getattr(order, "dispatch_guard", None)
+    client_options = {"settings": settings} if dispatch_guard is not None else {}
+    client = OKXTradeClient(creds.api_key, creds.secret_key, creds.passphrase,
+                            **client_options)
     try:
-        meta = await _load_meta(order.inst_id)
+        observed_at = time.monotonic()
+        meta = (await _load_meta(order.inst_id, fresh=True)
+                if dispatch_guard is not None else await _load_meta(order.inst_id))
         ensure_instrument_supported(meta)
-        pos_mode = str((await client.get_account_config()).get("posMode") or "long_short_mode")
+        config = await client.get_account_config()
+        pos_mode = str(config.get("posMode") or "long_short_mode")
+        if dispatch_guard is not None:
+            pos_mode = str(config.get("posMode") or "")
+            if order.lever is not None:
+                raise OKXPrivateError("PREVIEW_STALE", "聊天交易不能修改杠杆")
         positions = await client.get_positions()
         if pos_mode == "net_mode" and _would_reduce_net_position(positions, order.inst_id, order.direction):
             raise OKXPrivateError("LIVE_WOULD_REDUCE_POSITION",
@@ -186,21 +221,29 @@ async def place_live_order(session: AsyncSession, creds: AccountCredentials, acc
         if order.lever is not None:
             await client.set_leverage(order.inst_id, order.lever, order.td_mode,
                                       _leverage_pos_side(order, pos_mode))
-        if trace is not None and risk_guard is None:
+        if trace is not None and risk_guard is None and dispatch_guard is None:
             trace.phase = "sent"
         before_send = None
-        if risk_guard is not None:
+        if risk_guard is not None or dispatch_guard is not None:
             def before_send():
-                if not risk_guard.validate(
+                if dispatch_guard is not None:
+                    from ..agent_trading.dispatch_guard import DispatchEvidence
+                    dispatch_guard.validate(DispatchEvidence(
+                        payload, pos_mode, last_px, observed_at, meta, positions,
+                        str(config.get("acctLv") or "")))
+                if risk_guard is not None and not risk_guard.validate(
                         order, size=float(payload["sz"]), ct_val=meta.ct_val,
                         px=float(payload.get("px", last_px))):
                     raise OKXPrivateError(
                         "sizing_exposure_cap", "实际提交量超过风险上限，暂不建仓")
                 if trace is not None:
                     trace.phase = "sent"
+            before_send.prepare = getattr(dispatch_guard, "refresh_identity", None)
         if order.client_order_id is not None:
             kwargs = {"before_send": before_send} if before_send is not None else {}
             row = await client.place_order(payload, allow_retry=False, **kwargs)
+        elif before_send is not None:
+            row = await client.place_order(payload, before_send=before_send)
         else:
             row = await client.place_order(payload)
         ord_id = str(row.get("ordId") or "")
@@ -212,12 +255,17 @@ async def place_live_order(session: AsyncSession, creds: AccountCredentials, acc
     except OKXError as exc:
         if trace is not None and trace.ack == "none":
             trace.error_code = exc.code
-            if trace.phase == "sent" and exc.code in {
+            rejected = exc.code in {
                 "51008", "51004", "51000", "51001", "51010",
                 "51006", "51121",
-            }:
+            }
+            if dispatch_guard is not None:
+                rejected = getattr(exc, "business_rejected", False)
+            if trace.phase == "sent" and rejected:
                 trace.ack = "rejected"
         mapped = _map_trade_code(exc.code)
+        if dispatch_guard is not None and trace is not None and trace.phase == "not_sent":
+            mapped = exc.code
         status = "rejected" if mapped in _LOCAL_REJECT_CODES else "error"
         await repo.create_live_order_audit(session, values=_audit_values(
             account_id, order, cl_ord_id, status=status, ord_id="", error_code=mapped))

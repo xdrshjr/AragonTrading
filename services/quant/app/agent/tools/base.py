@@ -7,8 +7,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from sqlalchemy.ext.asyncio import AsyncSession
+
+if TYPE_CHECKING:
+    from ...agent_trading.schemas import AgentCallContext
 
 
 @dataclass
@@ -21,6 +25,7 @@ class UiContext:
     strategyId: int | None = None
     backtestStartTs: int | None = None
     backtestEndTs: int | None = None
+    accountMode: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "UiContext":
@@ -32,6 +37,7 @@ class UiContext:
             strategyId=data.get("strategyId"),
             backtestStartTs=data.get("backtestStartTs"),
             backtestEndTs=data.get("backtestEndTs"),
+            accountMode=data.get("accountMode"),
         )
 
     def to_dict(self) -> dict:
@@ -39,6 +45,7 @@ class UiContext:
             "instId": self.instId, "bar": self.bar, "mode": self.mode,
             "strategyId": self.strategyId, "backtestStartTs": self.backtestStartTs,
             "backtestEndTs": self.backtestEndTs,
+            "accountMode": self.accountMode,
         }
 
 
@@ -49,6 +56,7 @@ class ToolContext:
     session_factory: Callable[[], AsyncSession]
     ui: UiContext = field(default_factory=UiContext)
     cancel_check: Callable[[], bool] | None = None
+    call: AgentCallContext | None = None
 
 
 @dataclass
@@ -58,6 +66,8 @@ class ToolResult:
     ok: bool
     summary: str
     payload: dict | None = None
+    code: str | None = None
+    model_payload: dict | None = None
 
 
 class Tool:

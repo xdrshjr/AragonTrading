@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
+from typing import Callable
 
 import httpx
 
@@ -23,6 +25,18 @@ from .inst_family import inst_family_of
 from .private_client import OKXPrivateClient, OKXPrivateError, _iso_timestamp
 from .types import FeeAttemptError
 from .write_safety import may_retry_write
+
+
+def _business_rejection(top_code: str, s_code: str) -> bool:
+    """仅完整逐单失败回执证明拒绝；超时与重复 ID 仍须查询原单。
+
+    重试分类的 terminal 只表示不自动重试，并不证明订单未成交。
+    OKX 51149 明确要求查结果，51016 则表示可能已有同 ID 订单。
+    """
+    from .retry import classify_okx_code
+    return (top_code in {"0", "1", "2"} and s_code.isdigit()
+            and s_code not in {"0", "1", "2", "51016", "51149"}
+            and classify_okx_code(s_code) == "terminal")
 
 
 def should_advance(exc: OKXPrivateError) -> bool:
@@ -56,6 +70,14 @@ def should_advance(exc: OKXPrivateError) -> bool:
     if code in (401, 403, 429):
         return False
     return 400 <= code < 500
+
+
+@dataclass(frozen=True)
+class SendOptions:
+    """内部发送选项；缺省保留既有重试策略。"""
+
+    allow_retry: bool | None = None
+    before_send: Callable[[], None] | None = None
 
 
 class OKXTradeClient(OKXPrivateClient):
@@ -93,6 +115,9 @@ class OKXTradeClient(OKXPrivateClient):
         for attempt in range(3):
             await self._acquire_slot()
             client = await self._get_client()   # 每跳都问池要（换代后立刻拿到新连接，P1-1）
+            prepare = getattr(before_send, "prepare", None)
+            if prepare is not None:
+                await prepare()
             ts = _iso_timestamp()
             headers = self._headers(ts, "POST", path, body)
             if before_send is not None:
@@ -148,7 +173,8 @@ class OKXTradeClient(OKXPrivateClient):
         if top_code != "0" or (s_code and s_code != "0"):
             code = s_code if s_code and s_code != "0" else top_code
             msg = row.get("sMsg") or body.get("msg") or "OKX 拒单"
-            raise OKXPrivateError(code, str(msg))
+            raise OKXPrivateError(code, str(msg), business_rejected=(
+                len(rows) == 1 and _business_rejection(top_code, s_code)))
         return row
 
     async def place_algo_order(self, payload: dict) -> dict:
@@ -183,7 +209,8 @@ class OKXTradeClient(OKXPrivateClient):
         return row
 
     async def cancel_order(self, inst_id: str, *, ord_id: str | None = None,
-                           cl_ord_id: str | None = None) -> dict:
+                           cl_ord_id: str | None = None,
+                           options: SendOptions | None = None) -> dict:
         """``POST /api/v5/trade/cancel-order``：撤一笔未成交挂单；``ordId`` 与 ``clOrdId`` 二选一。
 
         与 ``place_order`` 同口径：顶层 ``code`` 与 ``data[0].sCode`` 皆须为 ``"0"``，否则以更具体的
@@ -209,7 +236,11 @@ class OKXTradeClient(OKXPrivateClient):
             payload["ordId"] = ord_id
         if cl_ord_id:
             payload["clOrdId"] = cl_ord_id
-        body = await self._post("/api/v5/trade/cancel-order", payload)
+        kwargs = {} if options is None else {
+            "allow_retry": options.allow_retry,
+            "before_send": options.before_send,
+        }
+        body = await self._post("/api/v5/trade/cancel-order", payload, **kwargs)
         rows = body.get("data") or []
         row = rows[0] if rows else {}
         top_code = str(body.get("code"))
@@ -217,7 +248,8 @@ class OKXTradeClient(OKXPrivateClient):
         if top_code != "0" or (s_code and s_code != "0"):
             code = s_code if s_code and s_code != "0" else top_code
             msg = row.get("sMsg") or body.get("msg") or "OKX 撤单失败"
-            raise OKXPrivateError(code, str(msg))
+            raise OKXPrivateError(code, str(msg), business_rejected=(
+                len(rows) == 1 and _business_rejection(top_code, s_code)))
         return row
 
     async def get_order(self, inst_id: str, *, ord_id: str | None = None,

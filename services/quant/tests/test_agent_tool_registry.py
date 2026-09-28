@@ -37,3 +37,18 @@ async def test_execute_unknown_tool_still_unknown():
     result = await registry.execute("not_a_tool", {}, _ctx(), enabled={"get_candles"})
     assert result.ok is False
     assert "未知工具" in result.summary
+
+
+def test_trading_tools_only_read_or_prepare_never_execute():
+    registry = ToolRegistry()
+    expected = {
+        "list_trading_accounts", "get_account_balance",
+        "get_account_positions", "get_open_orders", "get_recent_fills",
+        "get_order_status", "get_ai_trade_context", "prepare_trade",
+        "prepare_cancel_order",
+    }
+    assert expected <= registry.all_names()
+    assert not {"execute_trade", "confirm_trade"} & registry.all_names()
+    for name in expected:
+        schema = registry.get(name).input_schema
+        assert schema.get("additionalProperties") is False or "oneOf" in schema

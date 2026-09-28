@@ -160,10 +160,64 @@ def test_shutdown_steps_are_zero_arg_factories_in_the_legacy_order():
     steps = _shutdown_steps()
     assert [name for name, _ in steps] == [
         "health_guard", "agent", "discovery", "paper", "ai_trade", "ai_trade_experience",
-        "ai_trade_intel", "ai_backtest", "live_auto", "weight_batch", "weight_train",
-        "okx_rest", "okx_pool", "db_engine",
+        "ai_trade_intel", "ai_backtest", "live_auto", "weight_batch",
+        "weight_train", "agent_trading", "okx_rest", "okx_pool", "db_engine",
     ]
     assert all(callable(factory) for _, factory in steps)
+
+
+def test_agent_trading_drains_before_exchange_and_database():
+    names = [name for name, _ in _shutdown_steps()]
+    assert names.index("weight_train") < names.index("agent_trading")
+    assert names.index("agent_trading") < names.index("okx_rest")
+    assert names.index("agent_trading") < names.index("db_engine")
+
+
+async def test_chat_recovery_waits_for_hydration_before_opening_gate(monkeypatch):
+    import app.main as main
+    from app.agent_trading import admission, reconcile
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def recover(factory):
+        admission.set_ready(False)
+
+    async def hydrate():
+        entered.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(reconcile, "recover_startup", recover)
+    monkeypatch.setattr(reconcile, "start", lambda factory, **kwargs: None)
+    monkeypatch.setattr(main, "_hydrate_paused_ai_trade", hydrate)
+    task = asyncio.create_task(main._recover_agent_trading())
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert not admission.is_ready()
+        release.set()
+        await task
+        assert admission.is_ready()
+    finally:
+        release.set()
+        await task
+        admission.set_ready(False)
+
+
+async def test_failed_hydration_keeps_chat_and_automation_gate_closed(monkeypatch):
+    import app.main as main
+    from app.agent_trading import admission, reconcile
+
+    async def recover(factory):
+        return 0
+
+    async def hydrate():
+        return False
+
+    monkeypatch.setattr(reconcile, "recover_startup", recover)
+    monkeypatch.setattr(reconcile, "start", lambda factory, **kwargs: None)
+    monkeypatch.setattr(main, "_hydrate_paused_ai_trade", hydrate)
+    admission.set_ready(True)
+    await main._recover_agent_trading()
+    assert not admission.is_ready()
 
 
 def test_the_intel_drain_is_still_the_seventh_step_and_no_step_was_added():

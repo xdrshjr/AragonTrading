@@ -13,6 +13,28 @@ function run(events: AgentServerEvent[], initial: ChatMessage[] = []): ChatMessa
   return events.reduce((state, ev) => reduceAgentEvent(state, ev), initial);
 }
 
+it("交易payload与错误码经WS及历史恢复一致，重复工具事件不重复卡片", () => {
+  const payload = { type: "trade_intent", intent: { id: "intent", version: 2 } } as any;
+  const toolCall: AgentServerEvent = { type: "tool_call", data: {
+    id: "tool", name: "prepare_trade", input: {},
+  } };
+  const state = run([
+    { type: "message_start", data: { id: "assistant", role: "assistant" } },
+    toolCall, toolCall,
+    { type: "tool_result", data: { id: "tool", name: "prepare_trade", ok: true,
+      summary: "交易预览", payload, code: "PREPARED" } },
+  ]);
+  expect(state[0].toolCalls).toHaveLength(1);
+  const history = buildHistory([
+    { id: "assistant", role: "assistant", ts: 1,
+      blocks: [{ type: "tool_use", id: "tool", name: "prepare_trade", input: {} }] },
+    { id: "result", role: "tool", ts: 1, blocks: [{ type: "tool_result",
+      toolUseId: "tool", ok: true, summary: "交易预览", payload, code: "PREPARED" }] },
+  ]);
+  expect(history[0].toolCalls[0]).toEqual(state[0].toolCalls[0]);
+  expect(history[0].toolCalls[0].summary).toBe("交易预览");
+});
+
 describe("reduceAgentEvent streaming", () => {
   it("accumulates text deltas into one assistant bubble and ends streaming", () => {
     const state = run([

@@ -14,6 +14,8 @@ import AiTradeAgentTrace from "./AiTradeAgentTrace";
 import AiTradeNoticeBar from "./AiTradeNoticeBar";
 import AiTradeStatsButton from "./AiTradeStatsButton";
 import AiTradeToggle from "./AiTradeToggle";
+import { TradingProvider } from "./trading/TradingContext";
+import TradingAccountBar from "./trading/TradingAccountBar";
 
 type PanelView = "chat" | "aitrade";
 
@@ -52,6 +54,7 @@ export default function AgentPanel() {
   const aiTradeAnyRunning = aiTradeMembers.some((m) => m.session?.state === "running");
 
   return (
+    <TradingProvider>
     <div className="flex h-full min-h-0 flex-col">
       {/* 横栏 A：身份 + 会话动作。行级 whitespace-nowrap 沿 DOM 树继承到每一个按钮文案，
           中文因此不再逐字断行；宽度压力由**唯一**一处 min-w-0 + truncate（模型名）吸收。 */}
@@ -84,6 +87,7 @@ export default function AgentPanel() {
           <AiTradeStatsButton />
         </div>
       </header>
+      <TradingAccountBar />
 
       {!connected && !error && (
         <p role="status" className="px-3 py-2 text-xs text-[var(--muted)]">
@@ -128,7 +132,7 @@ export default function AgentPanel() {
       <div className={`min-h-0 flex-1 ${showTrace ? "" : "overflow-y-auto"}`}>
         {showTrace ? (
           <AiTradeAgentTrace group={aiTradeGroup} activeInstId={instId} />
-        ) : unconfigured ? (
+        ) : unconfigured && messages.length === 0 ? (
           <AgentUnconfigured provider={config.provider} model={config.model} />
         ) : messages.length === 0 ? (
           <AgentEmptyState onPick={send} />
@@ -176,6 +180,7 @@ export default function AgentPanel() {
         />
       )}
     </div>
+    </TradingProvider>
   );
 }
 

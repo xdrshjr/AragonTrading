@@ -57,6 +57,22 @@ async def test_list_tools_returns_all_registry_tools_enabled_by_default():
         await dispose_engine()
 
 
+async def test_capability_switch_filters_all_account_and_trading_tools():
+    await _reset_tool_states()
+    try:
+        manager = AgentManager(
+            Settings(agent_api_key="x", agent_trading_enabled=False),
+            session_factory=get_sessionmaker(),
+        )
+        enabled = await manager.resolve_enabled_tools()
+        assert "get_candles" in enabled
+        assert "get_account_positions" not in enabled
+        assert "prepare_trade" not in enabled
+        assert "prepare_cancel_order" not in enabled
+    finally:
+        await dispose_engine()
+
+
 async def test_put_tool_disable_persists():
     await _reset_tool_states()
     try:

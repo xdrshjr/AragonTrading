@@ -37,6 +37,8 @@ class _FakeExecutor:
 class _FakeSession:
     def __init__(self, inst_id: str, run_id: int, *, state: str = "running"):
         self.executor = _FakeExecutor()
+        from types import SimpleNamespace
+        self.experience = SimpleNamespace(rule=None)
         self.inst_id = inst_id
         self.run_id = run_id
         self.session_id = f"aitrade_{inst_id}"
@@ -122,7 +124,7 @@ def _reset(manager) -> None:
 
 # ---------------- G-11（冻结）：`status()` 的消费者集合 ----------------
 def test_status_consumers_are_frozen_to_the_mutual_exclusion_check():
-    """G-11：`.status()` 的真实调用点只有 live_auto 的互斥判定与 API 层，且都只判 `is not None`。
+    """G-11：自动交易与聊天准入只判断占位非空，不能依赖占位字段。
 
     这是本轮**唯一**一处改变既有函数返回值语义的地方（冷占位下它不再返回 None）；一旦出现第二个
     读它字段的消费者，那处语义变更就会静默地弄坏别人。正则写 `\\r?\\n`（core.autocrlf=true）。
@@ -131,12 +133,16 @@ def test_status_consumers_are_frozen_to_the_mutual_exclusion_check():
     for path in _APP_DIR.rglob("*.py"):
         for line in re.split(r"\r?\n", path.read_text(encoding="utf-8")):
             if ".status()" in line and not line.strip().startswith("#"):
-                hits.append((path.name, line.strip()))
+                hits.append((path.relative_to(_APP_DIR).as_posix(), line.strip()))
     files = {name for name, _ in hits}
-    assert files == {"manager.py"}, hits          # ai_auto/manager.py 的两行文档 + live_auto 的判定
+    assert files == {"ai_auto/manager.py", "live_auto/manager.py",
+                     "agent_trading/admission.py"}, hits
     real_calls = [line for _, line in hits if not line.startswith("`")
                   and not line.startswith("**")]
-    assert real_calls == ["if get_ai_trade_manager().status() is not None:"], real_calls
+    assert set(real_calls) == {
+        "if get_ai_trade_manager().status() is not None:",
+        "if (get_ai_trade_manager().status() is not None",
+        "return self.status()"}, real_calls  # manager 的只读 group_status 委托不解包字段。
 
 
 # ---------------- G-28：水合失败即盲区，绝不表示成「没有」 ----------------

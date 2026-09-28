@@ -967,6 +967,9 @@ class Settings(BaseSettings):
     # ---- Agent（对话式 AI 助手）LLM 接入 (Agent Trading Copilot spec §3.1) ----
     # 字段名即环境变量名（AGENT_*，大小写不敏感）；密钥仅存后端，绝不下发前端 / 不入库 / 不进日志。
     agent_provider: str = "anthropic"                       # anthropic | openai（双标准适配）
+    agent_trading_enabled: bool = True
+    # 发布验收前保持关闭；历史查询和未知订单核对不受此开关影响。
+    agent_trading_execution_enabled: bool = False
     agent_base_url: str = "https://api.kimi.com/coding"     # KIMI Coding 端点
     agent_api_key: str = ""                                 # 缺省为空 → 面板优雅引导而非崩溃
     # 默认采用任务显式指定值 kimi-k2.6；kimi-k2.5 为 docs/examples 已实测可用的回退值（R1/P1-A）。

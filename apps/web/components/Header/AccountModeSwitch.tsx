@@ -38,6 +38,8 @@ export default function AccountModeSwitch({ placement = "inline" }: {
   const accountMode = useAppStore((s) => s.accountMode);
   const setAccountMode = useAppStore((s) => s.setAccountMode);
   const setMode = useAppStore((s) => s.setMode);
+  const bindingPending = useAppStore((s) => s.agentTradingBindingPending);
+  const bindingError = useAppStore((s) => s.agentTradingBindingError);
   const setShowSettings = useAppStore((s) => s.setShowSettings);
   const setSettingsSection = useAppStore((s) => s.setSettingsSection);
 
@@ -64,7 +66,7 @@ export default function AccountModeSwitch({ placement = "inline" }: {
   const selectSim = () => {
     setNotice(null);
     setAccountMode("sim");
-    setMode("paper");
+    if (!useAppStore.getState().agentConversationId) setMode("paper");
   };
 
   const selectLive = () => {
@@ -123,6 +125,7 @@ export default function AccountModeSwitch({ placement = "inline" }: {
           type="button"
           role="radio"
           ref={simRef}
+          disabled={bindingPending}
           tabIndex={placement === "rail" && accountMode !== "sim" ? -1 : 0}
           aria-checked={accountMode === "sim"}
           onClick={selectSim}
@@ -139,6 +142,7 @@ export default function AccountModeSwitch({ placement = "inline" }: {
           type="button"
           role="radio"
           ref={liveRef}
+          disabled={bindingPending}
           tabIndex={placement === "rail" && accountMode !== "live" ? -1 : 0}
           aria-checked={accountMode === "live"}
           onClick={selectLive}
@@ -162,6 +166,8 @@ export default function AccountModeSwitch({ placement = "inline" }: {
           {needsSetup && <Badge tone="neutral">去设置</Badge>}
         </button>
       </div>
+      {bindingPending && <p role="status">正在更新交易模式…</p>}
+      {bindingError && <p role="alert">{bindingError}</p>}
       {notice && (
         <span
           role="status"

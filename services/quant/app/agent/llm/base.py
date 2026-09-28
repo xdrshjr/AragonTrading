@@ -33,6 +33,9 @@ class ToolResultBlock:
     content: str
     is_error: bool = False
     type: str = "tool_result"
+    display_payload: dict | None = None
+    display_summary: str | None = None
+    code: str | None = None
 
 
 Block = Union[TextBlock, ToolUseBlock, ToolResultBlock]

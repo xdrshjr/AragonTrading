@@ -148,11 +148,13 @@ describe("④ lib/** 下每一个 fetch 都经 withTimeout（D3）", () => {
   //
   // ai-trade-trajectory-capture 新增 `trajectoryApi.ts`：**1 个调用点 / 1 个文件**（配置读取与
   // 目录校验共用同一个通用 `request`）。于是 21 → 22 个调用点、20 → 21 个文件。
-  it("扫到了全部 fetch 调用点（22 个调用点 / 21 个文件）", () => {
+  // agent-trading-capabilities 新增 agentTradingApi.ts：一个共用 request，
+  // 唯一 fetch 经 withTimeout(..., 20_000)；22 → 23 个调用点，21 → 22 个文件。
+  it("扫到了全部 fetch 调用点（23 个调用点 / 22 个文件）", () => {
     const sites = LIB.reduce((n, s) => n + (s.text.match(/\bfetch\(/g)?.length ?? 0), 0);
     const files = LIB.filter((s) => /\bfetch\(/.test(s.text));
-    expect(sites).toBe(22);
-    expect(files.length).toBe(21);
+    expect(sites).toBe(23);
+    expect(files.length).toBe(22);
   });
 
   // 判据是**调用点**不是文件：`aiTradeHorizonApi.ts` 一个文件里就有 3 个彼此独立的 fetch 且没有共享

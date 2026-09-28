@@ -6,12 +6,17 @@
 from __future__ import annotations
 
 import logging
+import uuid
 
 from fastapi import HTTPException
+from ...agent_trading.errors import TradingError
+from ...config import get_settings
 
 from ...okx.rest_client import OKXError
 from ..llm.base import ToolSchema
 from .base import Tool, ToolContext, ToolResult
+from .account_tools import ACCOUNT_TOOLS
+from .trade_tools import PrepareTradeTool, PrepareCancelOrderTool
 from .market_tools import GetCandlesTool, GetMarketSummaryTool, ListInstrumentsTool
 from .regime_tools import LabelMarketRegimeTool
 from .run_tools import (
@@ -60,6 +65,9 @@ _ALL_TOOLS: list[Tool] = [
     SaveFactorSetTool(),
     CreateFactorStrategyTool(),
     ShowFactorTool(),
+    *ACCOUNT_TOOLS,
+    PrepareTradeTool(),
+    PrepareCancelOrderTool(),
 ]
 
 
@@ -111,10 +119,15 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return ToolResult(False, f"未知工具：{name}")
+        is_trading = tool.category in {"account", "trading"}
+        if is_trading and not get_settings().agent_trading_enabled:
+            return ToolResult(False, "对话交易功能已关闭",
+                              code="AGENT_TRADING_DISABLED")
         # 纵深防御（在「未知工具」判定之后、校验之前）：禁用工具二次兜底拒绝，schema 硬闸门外再加一道。
         if enabled is not None and name not in enabled:
             return ToolResult(
-                False, f"工具 {name} 已被禁用，请在设置中心 · Agent 工具管理中开启后再使用。")
+                False, f"工具 {name} 已被禁用，请在设置中心 · Agent 工具管理中开启后再使用。",
+                code="TOOL_DISABLED")
         args = args or {}
         # 模型产出的入参即外部输入：边界处一次性校验，非法即拒并回喂模型自纠（H2，不执行）。
         invalid = tool.validate(args)
@@ -122,12 +135,28 @@ class ToolRegistry:
             return ToolResult(False, f"参数无效：{invalid}")
         try:
             return await tool.execute(args, ctx)
+        except TradingError as exc:
+            return ToolResult(False, exc.message, code=exc.code)
         except OKXError as exc:
+            if is_trading:
+                return ToolResult(False, "账户读取失败，请稍后查询。",
+                                  code="ACCOUNT_READ_FAILED")
             return ToolResult(False, f"OKX 暂不可达，无法取数（{exc.message}）。请稍后重试。")
         except HTTPException as exc:
+            if is_trading:
+                return ToolResult(False, "账户操作暂不可用，请核对状态。",
+                                  code="ACCOUNT_READ_FAILED")
             detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
             return ToolResult(False, f"操作失败：{detail.get('message', detail)}")
         except Exception as exc:  # noqa: BLE001 —— 工具边界统一兜底，避免单工具异常拖垮整轮 run
+            if is_trading:
+                correlation_id = uuid.uuid4().hex[:12]
+                logger.error("account tool failed name=%s ref=%s type=%s",
+                             name, correlation_id, type(exc).__name__)
+                return ToolResult(
+                    False, f"账户工具暂不可用，请查询状态（编号 {correlation_id}）。",
+                    code="TOOL_EXECUTION_FAILED",
+                )
             # 脱敏有界根因：仅类型名 + 截断消息，便于模型 / 用户纠正，杜绝栈与密钥（H7 / C7）。
             logger.exception("tool %s execute failed", name)
             return ToolResult(False, f"工具 {name} 执行出错：{type(exc).__name__}: {str(exc)[:200]}")

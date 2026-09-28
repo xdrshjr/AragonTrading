@@ -33,6 +33,8 @@ function applyToolResults(out: ChatMessage[], blocks: AgentBlock[]): void {
       if (call) {
         call.ok = block.ok;
         call.summary = block.summary;
+        call.payload = block.payload;
+        call.code = block.code;
         call.done = true;
         break;
       }
@@ -72,6 +74,9 @@ function addToolCall(
   state: ChatMessage[],
   data: { id: string; name: string; input: Record<string, unknown> },
 ): ChatMessage[] {
+  if (state.some((message) => message.toolCalls.some((call) => call.id === data.id))) {
+    return state;
+  }
   for (let i = state.length - 1; i >= 0; i -= 1) {
     if (state[i].role === "assistant") {
       const next = [...state];
@@ -85,14 +90,15 @@ function addToolCall(
 
 function patchToolResult(
   state: ChatMessage[],
-  data: { id: string; ok: boolean; summary: string },
+  data: Extract<AgentServerEvent, { type: "tool_result" }>["data"],
 ): ChatMessage[] {
   return state.map((m) => {
     if (!m.toolCalls.some((c) => c.id === data.id)) return m;
     return {
       ...m,
       toolCalls: m.toolCalls.map((c) =>
-        c.id === data.id ? { ...c, ok: data.ok, summary: data.summary, done: true } : c,
+        c.id === data.id ? { ...c, ok: data.ok, summary: data.summary,
+          payload: data.payload, code: data.code, done: true } : c,
       ),
     };
   });

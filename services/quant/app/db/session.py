@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from ..config import get_settings
 from ..strategies import BUILTIN_ORDER, STRATEGY_REGISTRY
 from .models import Base, Strategy
+from . import agent_trade_models  # noqa: F401  对话交易新增表注册
 
 logger = logging.getLogger(__name__)
 

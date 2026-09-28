@@ -1,11 +1,13 @@
 // Agent 事件 / 消息 / 工具调用类型（与后端 WS 协议对齐）(Agent Trading Copilot §4)。
 import type { Bar, ChartView, Mode } from "./types";
+import type { TradingPayload } from "./agentTradingTypes";
 
 // 前端连接时上报的当前工作台上下文（注入 system prompt + ui-action 默认值）。
 export interface AgentUiContext {
   instId: string;
   bar: Bar;
   mode: Mode;
+  accountMode?: "sim" | "live";
   strategyId?: number | null;
   backtestStartTs?: number;
   backtestEndTs?: number;
@@ -15,7 +17,8 @@ export interface AgentUiContext {
 export type AgentBlock =
   | { type: "text"; text: string }
   | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> }
-  | { type: "tool_result"; toolUseId: string; ok: boolean; summary: string };
+  | { type: "tool_result"; toolUseId: string; ok: boolean; summary: string;
+      payload?: TradingPayload; code?: string };
 
 export interface AgentMessage {
   id: string | number;
@@ -62,7 +65,8 @@ export type AgentServerEvent =
   | { type: "text_delta"; seq?: number; data: { id: string; text: string } }
   | { type: "thinking_delta"; seq?: number; data: { id: string; text: string } }
   | { type: "tool_call"; seq?: number; data: { id: string; name: string; input: Record<string, unknown> } }
-  | { type: "tool_result"; seq?: number; data: { id: string; name: string; ok: boolean; summary: string } }
+  | { type: "tool_result"; seq?: number; data: { id: string; name: string;
+      ok: boolean; summary: string; payload?: TradingPayload; code?: string } }
   | { type: "ui_action"; seq?: number; data: ShowChartAction | ShowFactorAction }
   | { type: "message_end"; seq?: number; data: { id: string; usage?: AgentUsage } }
   | { type: "done"; seq?: number; data: { cancelled?: boolean } }
@@ -85,6 +89,8 @@ export interface ToolCall {
   input: Record<string, unknown>;
   ok?: boolean;
   summary?: string;
+  payload?: TradingPayload;
+  code?: string;
   done: boolean;
 }
 
@@ -164,6 +170,8 @@ export type AgentToolCategory =
   | "analysis"
   | "factor"
   | "runs"
+  | "account"
+  | "trading"
   | "general";
 
 // 单个工具（与后端 AgentToolOut 对齐）：元信息来自注册表 + 合并后的启用态。

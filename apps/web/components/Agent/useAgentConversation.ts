@@ -46,6 +46,7 @@ class ConversationController {
   generation = 0;
   lastSeq = 0;
   lastUserText = "";
+  lastClientMessageId = "";
   streaming = false;
   pendingGap = false;
 
@@ -76,6 +77,7 @@ class ConversationController {
     this.state = emptyState();
     this.lastSeq = 0;
     this.lastUserText = "";
+    this.lastClientMessageId = "";
     this.streaming = false;
     this.pendingGap = false;
     this.publish(this.state);
@@ -115,6 +117,8 @@ class ConversationController {
         : "连接失败，正在重连…";
       this.update({ error }, scope);
     } else if (!wasConnected) {
+      useAppStore.setState((state) => ({ agentTradingBindingRevision:
+        state.agentTradingBindingRevision + 1 }));
       this.update({ error: null }, scope);
       if (this.streaming) {
         this.ws?.send({ type: "resume", data: { lastSeq: this.lastSeq } });
@@ -192,11 +196,15 @@ class ConversationController {
     this.onControl(scope, event);
   }
 
-  send(text: string, id: string) {
+  send(text: string, id: string, retry = false) {
     const scope = this.scope;
     if (!this.isCurrent(scope) || scope.id !== id) return;
     const trimmed = text.trim();
     if (!this.ws || !trimmed || this.state.running) return;
+    if (useAppStore.getState().agentTradingBindingPending) {
+      this.update({ error: "账户模式更新中，请稍候再发送。" }, scope);
+      return;
+    }
     if (trimmed.length > 16000) {
       this.update({ error: "消息过长，请精简后再发送。" }, scope);
       return;
@@ -206,6 +214,9 @@ class ConversationController {
       return;
     }
     this.lastUserText = trimmed;
+    if (!retry || !this.lastClientMessageId) {
+      this.lastClientMessageId = crypto.randomUUID();
+    }
     this.updateRunning(true, scope);
     const userId = `u-${Date.now()}-${Math.random().toString(36).slice(2)}`;
     this.updateMessages(
@@ -216,8 +227,10 @@ class ConversationController {
     const ui = {
       instId: s.instId, bar: s.bar, mode: s.mode, strategyId: s.strategyId,
       backtestStartTs: s.backtestStartTs, backtestEndTs: s.backtestEndTs,
+      accountMode: s.accountMode,
     };
-    this.ws.send({ type: "user_message", data: { text: trimmed, ui } });
+    this.ws.send({ type: "user_message", data: { text: trimmed, ui,
+      clientMessageId: this.lastClientMessageId } });
   }
 
   stop(id: string) {
@@ -296,7 +309,7 @@ export function useAgentConversation() {
     ...state,
     setInput: (input: string) => controller.update({ input }),
     send: (text: string) => controller.send(text, id),
-    retry: () => controller.send(controller.lastUserText, id),
+    retry: () => controller.send(controller.lastUserText, id, true),
     stop: () => controller.stop(id),
     clearContext: () => controller.clearContext(),
   };

@@ -18,8 +18,19 @@ def block_to_dict(block: Block) -> dict:
     if isinstance(block, ToolUseBlock):
         return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
     if isinstance(block, ToolResultBlock):
-        return {"type": "tool_result", "toolUseId": block.tool_use_id,
-                "ok": not block.is_error, "summary": block.content}
+        result = {
+            "type": "tool_result", "toolUseId": block.tool_use_id,
+            "ok": not block.is_error,
+            "summary": (block.display_summary if block.display_summary
+                        is not None else block.content),
+        }
+        if block.display_summary is not None:
+            result["content"] = block.content
+        if block.display_payload is not None:
+            result["payload"] = block.display_payload
+        if block.code is not None:
+            result["code"] = block.code
+        return result
     raise TypeError(f"unknown block: {block!r}")
 
 
@@ -33,8 +44,12 @@ def dict_to_block(data: dict) -> Block:
                             input=data.get("input") or {})
     if btype == "tool_result":
         return ToolResultBlock(tool_use_id=data.get("toolUseId", ""),
-                               content=data.get("summary", ""),
-                               is_error=not data.get("ok", True))
+                               content=data.get("content", data.get("summary", "")),
+                               is_error=not data.get("ok", True),
+                               display_payload=data.get("payload"),
+                               display_summary=(data.get("summary")
+                                                if "content" in data else None),
+                               code=data.get("code"))
     raise ValueError(f"unknown block dict: {data!r}")
 
 

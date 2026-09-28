@@ -57,9 +57,11 @@ class OKXPrivateError(OKXError):
     3. **不进任何 wire**：它是给同进程调用方做分支用的，不是给前端看的。
     """
 
-    def __init__(self, code: str, message: str, *, http_status: int | None = None):
+    def __init__(self, code: str, message: str, *, http_status: int | None = None,
+                 business_rejected: bool = False):
         super().__init__(code, message)
         self.http_status = http_status
+        self.business_rejected = business_rejected
 
 
 def _iso_timestamp() -> str:
@@ -95,7 +97,7 @@ class OKXPrivateClient:
         self._api_key = api_key
         self._secret_key = secret_key
         self._passphrase = passphrase
-        self._settings = settings or get_settings()
+        self._settings = (settings or get_settings()).model_copy(deep=True)
         self._client: httpx.AsyncClient | None = None
         # 本实例从池里取过几份引用，`aclose()` 须**逐一**归还。F3：按**世代**分桶——换代之后手里
         # 那几份旧世代引用必须还到退役条目上，还到新一代身上就是在减别人的计数（见 `pool.release`）。
@@ -106,6 +108,19 @@ class OKXPrivateClient:
         return fingerprint(self._api_key, self._settings.okx_rest_base,
                            self._settings.okx_account_demo,
                            self._settings.okx_account_timeout_seconds)
+
+    async def get_leverage_info(self, inst_id: str, mgn_mode: str) -> list:
+        """读取当前杠杆；匹配唯一方向由调用方负责，禁止猜测默认值。"""
+        return await self._get("/api/v5/account/leverage-info", {
+            "instId": inst_id, "mgnMode": mgn_mode})
+
+    async def get_max_size(self, inst_id: str, td_mode: str,
+                           px: str | None = None) -> list:
+        """读取现有模式及杠杆下的可开张数，不设置杠杆。"""
+        params = {"instId": inst_id, "tdMode": td_mode}
+        if px is not None:
+            params["px"] = str(px)
+        return await self._get("/api/v5/account/max-size", params)
 
     def _new_client(self) -> httpx.AsyncClient:
         timeout = self._settings.okx_account_timeout_seconds

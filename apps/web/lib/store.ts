@@ -1,6 +1,7 @@
 // 全局 UI / 选择态 (Zustand) (spec §8.2)。
 // F3：用 persist 中间件把选择态/主题落 localStorage（key "aragon-ui"），刷新后恢复上次工作上下文。
 import { create } from "zustand";
+import { agentTradingApi } from "./agentTradingApi";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { type ComboDraft, DEFAULT_COMBO_DRAFT } from "./combo";
 import { applyDiscoveryEvent } from "./discovery";
@@ -443,6 +444,9 @@ interface AppState {
   wfParams: WfParams;
   walkForwardResult: WalkForwardResult | null;
   accountMode: AccountMode;
+  agentTradingBindingPending: boolean;
+  agentTradingBindingError: string | null;
+  agentTradingBindingRevision: number;
   // 运行回测配置弹窗偏好（strategy-backtest-config-modal §五）：区间预设/周期/成本/杠杆；持久化跨刷新恢复。
   // 只持久化 preset 与自定义值本身；预设区间在打开弹窗时按 now 重派生（绝不持久化陈旧绝对时间当预设结果）。
   backtestConfig: BacktestConfig | null;
@@ -766,6 +770,37 @@ function stripProfitGuardEnabled(config: AiTradeConfig | null): AiTradeConfig | 
   return { ...config, profitGuard: rest };
 }
 
+/** 模式仅在绑定 CAS 成功后发布；迟到响应不得切换新会话的模式。 */
+async function updateTradingMode(accountMode: AccountMode) {
+  const state = useAppStore.getState();
+  const cid = state.agentConversationId;
+  const revision = state.agentTradingBindingRevision;
+  const isCurrent = () => useAppStore.getState().agentConversationId === cid
+    && useAppStore.getState().agentTradingBindingRevision === revision;
+  useAppStore.setState({ agentTradingBindingPending: true,
+    agentTradingBindingError: null });
+  try {
+    const binding = await agentTradingApi.binding(cid);
+    if (!isCurrent()) return;
+    await agentTradingApi.bind(cid, {
+      accountId: binding?.accountId ?? null, accountMode,
+      expectedVersion: binding?.version ?? 0,
+    });
+    if (!isCurrent()) return;
+    useAppStore.setState((current) => ({ accountMode,
+      ...(accountMode === "live" ? { chartView: "live-follow" as const }
+        : { mode: "paper" as const }),
+      agentTradingBindingRevision: current.agentTradingBindingRevision + 1,
+    }));
+  } catch (error) {
+    if (!isCurrent()) return;
+    useAppStore.setState({ agentTradingBindingError:
+      error instanceof Error ? error.message : "账户模式更新失败。" });
+  } finally {
+    useAppStore.setState({ agentTradingBindingPending: false });
+  }
+}
+
 export const useAppStore = create<AppState>()(
   persist(
     (set) => ({
@@ -784,6 +819,9 @@ export const useAppStore = create<AppState>()(
       walkForwardResult: null,
       // 本轮需求：实盘模式默认开启。无就绪默认账户时由 AccountModeSwitch 水合守门回落 sim。
       accountMode: "live",
+      agentTradingBindingPending: false,
+      agentTradingBindingError: null,
+      agentTradingBindingRevision: 0,
       // 运行回测配置偏好默认 null（全新安装只走初始化器、不触发 migrate，首开弹窗回落默认成本 + 当前区间）。
       backtestConfig: null,
       liveAcknowledged: false,
@@ -891,8 +929,16 @@ export const useAppStore = create<AppState>()(
       setBacktestConfig: (backtestConfig) => set({ backtestConfig }),
       // 账户模式写：选「实盘」时联动 chartView="live-follow"（§5.3）；「模拟盘」保持现状，
       // setMode("paper") 由组件另行编排。实盘进入由组件做凭证 / 开关守门（C1-5），此处只落状态。
-      setAccountMode: (accountMode) =>
-        set(accountMode === "live" ? { accountMode, chartView: "live-follow" } : { accountMode }),
+      setAccountMode: (accountMode) => {
+        const state = useAppStore.getState();
+        if (state.agentTradingBindingPending) return;
+        if (!state.agentConversationId) {
+          set(accountMode === "live"
+            ? { accountMode, chartView: "live-follow" } : { accountMode });
+          return;
+        }
+        void updateTradingMode(accountMode);
+      },
       // 实盘风险勾选会话记忆（仅记忆勾选本身，不跳过逐单明细复核弹窗，C1-3）。
       setLiveAcknowledged: (liveAcknowledged) => set({ liveAcknowledged }),
       // 模拟资金：夹取到 [MIN, MAX]；非有限数忽略（守住边界，R8）。
@@ -1292,9 +1338,15 @@ export const useAppStore = create<AppState>()(
       setInstSidebarTab: (instSidebarTab) => set({ instSidebarTab }),
       // 右侧页签切换（AI 助手 / 交易策略）；两面板各自持续挂载，切换不破坏状态（§6.2#1）。
       setRightTab: (rightTab) => set({ rightTab }),
-      setAgentConversationId: (agentConversationId) => set({ agentConversationId }),
+      setAgentConversationId: (agentConversationId) => set((state) => ({
+        agentConversationId,
+        agentTradingBindingRevision: state.agentTradingBindingRevision + 1,
+      })),
       // 新对话：生成新会话 uuid（旧消息流随 conversationId 变更而失效，DB 历史仍可经其原 id 查到）。
-      newConversation: () => set({ agentConversationId: makeConversationId() }),
+      newConversation: () => set((state) => ({
+        agentConversationId: makeConversationId(),
+        agentTradingBindingRevision: state.agentTradingBindingRevision + 1,
+      })),
       // 组合草稿：成员选择 / 轮动参数变更（持久化，跨刷新恢复）。
       setComboDraft: (comboDraft) => set({ comboDraft }),
       // 组合编辑指针：进入编辑置 id，保存 / 放弃置 null（瞬态，不持久化）。

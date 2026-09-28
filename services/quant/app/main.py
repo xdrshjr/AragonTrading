@@ -22,6 +22,7 @@ from .ai_auto.experience import scheduler as experience_scheduler
 from .api import (
     accounts,
     agent,
+    agent_trading,
     ai_auto,
     ai_intel,
     ai_trade_lifecycle,
@@ -94,13 +95,15 @@ async def lifespan(app: FastAPI):
     await _reconcile_weight_train_runs()
     sweeper = asyncio.create_task(_weight_train_sweeper())   # H-B6：周期回收过期终态作业（cancel-safe）
     resumer = asyncio.create_task(_resume_discovery_runs())  # 挖掘任务自动续跑（静置延时后拉起）
-    hydrator = asyncio.create_task(_hydrate_paused_ai_trade())  # AI 自动交易冷占位（不启动任何交易）
+    await _recover_agent_trading()
     get_health_guard().start()                 # 持续样本外体检守护（双闸每 tick 重读，D-24）
     link_sweeper = asyncio.create_task(_okx_link_sweeper())   # 私有连接池清扫 + 服务器时钟对齐
     # ★ E-5：消费上一次进程留下的脏标志（关软件走 pause，去抖窗口内那一笔否则永远不进图）。
     catchup = asyncio.create_task(experience_scheduler.catch_up(get_settings()))
-    background = (sweeper, resumer, hydrator, link_sweeper, catchup)
+    background = (sweeper, resumer, link_sweeper, catchup)
     yield
+    from .agent_trading.admission import begin_shutdown
+    begin_shutdown()
     await _cancel_background(background)   # 关停先取消清扫协程（与 manager.shutdown 同段）并有界收敛
     await _run_shutdown(_shutdown_steps(), timeout=get_settings().shutdown_step_timeout_s)
 
@@ -146,6 +149,7 @@ def _shutdown_steps() -> tuple[ShutdownStep, ...]:
         # 关停顺序（weight-multi-model-training §2.6）：先停批次泵、再停底层作业，避免泵在作业消失后空转。
         ("weight_batch", lambda: get_weight_batch_manager().shutdown()),
         ("weight_train", lambda: get_weight_train_manager().shutdown()),
+        ("agent_trading", _stop_agent_trading),
         ("okx_rest", lambda: get_rest_client().aclose()),
         ("okx_pool", lambda: get_client_pool().aclose_all()),   # okx-link-resilience §2.4.1
         ("db_engine", lambda: dispose_engine()),
@@ -307,7 +311,7 @@ async def _resume_discovery_runs() -> None:
         logger.warning("discovery auto-resume skipped: %s", exc)
 
 
-async def _hydrate_paused_ai_trade() -> None:
+async def _hydrate_paused_ai_trade() -> bool:
     """冷启装上「可续跑的 AI 自动交易分组」轻量占位（ai-trade-pause-resume §3.7）。**不启动任何交易。**
 
     姿态镜像 `_backfill_companion_strategies`（一次性 session + 整段 try/except，不阻断启动），
@@ -320,19 +324,16 @@ async def _hydrate_paused_ai_trade() -> None:
     「没有」**。另含 §八风险 11 的自愈：run 已 `stopped` 而状态表仍 `paused` ⇒ 置 `ended`。
     """
     from .ai_auto.manager import paused_ref_from_state_row
-    from .config import get_settings
     from .db import ai_trade_state_repositories as state_repo
     from .db import repositories as repo
     from .db.session import get_sessionmaker
 
-    if not get_settings().ai_trade_pause_enabled:
-        return
     for attempt in range(3):
         try:
             async with get_sessionmaker()() as session:
                 row = await state_repo.load_paused_group_brief(session)
                 if row is None:
-                    return
+                    return True
                 alive = await repo.list_paused_ai_trade_group_ids(session)
                 if row["groupId"] not in alive:
                     # 状态表落后于 run（W5 那次写失败过）：以**状态表为准**是本特性的原则，但当
@@ -342,17 +343,46 @@ async def _hydrate_paused_ai_trade() -> None:
                                                        {"status": "ended"})
                     logger.warning("ai-trade paused contract %s dropped: runs already finalized",
                                    row["groupId"])
-                    return
+                    return True
             get_ai_trade_manager().adopt_paused_ref(paused_ref_from_state_row(row))
             logger.info("ai-trade resumable group hydrated: %s", row["groupId"])
-            return
+            return True
         except asyncio.CancelledError:      # 关停取消时干净退出
-            return
+            get_ai_trade_manager().note_hydration_failed()
+            raise
         except Exception as exc:  # noqa: BLE001 —— 有界重试；三次都失败才置盲区标志
             logger.warning("ai-trade paused-group hydration attempt %d failed: %s",
                            attempt + 1, exc)
             await asyncio.sleep(1.0)
     get_ai_trade_manager().note_hydration_failed()
+    return False
+
+
+async def _recover_agent_trading() -> None:
+    """持久提交与托管占位均加载成功后，才开放共同准入。"""
+    from .agent_trading import admission, reconcile
+    from .db.session import get_sessionmaker
+    admission.set_ready(False)
+    try:
+        async with asyncio.timeout(15):
+            await reconcile.recover_startup(get_sessionmaker())
+            hydrated = await _hydrate_paused_ai_trade()
+        admission.set_ready(hydrated)
+    except Exception as exc:
+        get_ai_trade_manager().note_hydration_failed()
+        logger.warning("agent trading recovery blocked: %s",
+                       type(exc).__name__)
+    reconcile.start(get_sessionmaker(), recovery_probe=_hydrate_paused_ai_trade)
+
+
+async def _stop_agent_trading() -> None:
+    """所有发送任务在数据库和共享 OKX 连接释放之前收束。"""
+    from .agent_trading import admission, execution, reconcile
+    admission.begin_shutdown()
+    budget = min(5.0, get_settings().shutdown_step_timeout_s / 2)
+    async with asyncio.timeout(budget):
+        await reconcile.stop()
+        await execution.shutdown()
 
 
 async def _weight_train_sweeper() -> None:
@@ -483,6 +513,7 @@ app.include_router(runs.router, prefix="/api")
 app.include_router(paper.router, prefix="/api")
 app.include_router(ws_market.router, prefix="/api")
 app.include_router(agent.router, prefix="/api")
+app.include_router(agent_trading.router, prefix="/api")
 app.include_router(accounts.router, prefix="/api")
 app.include_router(trading.router, prefix="/api")
 app.include_router(factors.router, prefix="/api")   # 第 9 个路由（因子层 §3.1）

@@ -51,6 +51,13 @@ class OrderInput:
     submission_trace: SubmissionTrace | None = None
 
 
+@dataclass(frozen=True)
+class IntentOrderInput(OrderInput):
+    """聊天专用内部上下文，不改变旧 OrderInput 的字段或序列化契约。"""
+
+    dispatch_guard: object | None = None
+
+
 @dataclass
 class SubmissionTrace:
     """内部发送旁路；绝不序列化到交易所请求体。"""
@@ -232,7 +239,8 @@ def _close_side(pos_side: str, pos: float) -> str:
 
 
 def build_close_order_payload(close: ClosePositionInput, meta: InstrumentMeta, pos_mode: str,
-                              sz: float, cl_ord_id: str) -> dict:
+                              sz: float, cl_ord_id: str, *,
+                              order_type: str = "limit") -> dict:
     """组装限价平仓 ``/api/v5/trade/order`` 请求体（§2.2/§5）。
 
     对冲模式（long_short_mode）：带 ``posSide`` 锁侧、**不**带 ``reduceOnly``（posSide 已限定平该侧仓，
@@ -243,7 +251,7 @@ def build_close_order_payload(close: ClosePositionInput, meta: InstrumentMeta, p
         "instId": close.inst_id,
         "tdMode": close.mgn_mode,
         "side": _close_side(close.pos_side, close.pos),
-        "ordType": "limit",
+        "ordType": order_type,
         "sz": fmt_step(snap_size(sz, meta.lot_sz), meta.lot_sz),
         "clOrdId": cl_ord_id,
     }
@@ -251,7 +259,7 @@ def build_close_order_payload(close: ClosePositionInput, meta: InstrumentMeta, p
         payload["reduceOnly"] = True
     else:
         payload["posSide"] = close.pos_side
-    if close.px is not None:
+    if order_type == "limit" and close.px is not None:
         payload["px"] = fmt_step(snap_price(close.px, meta.tick_sz), meta.tick_sz)
     return payload
 
@@ -356,7 +364,8 @@ def validate_algo_stop(stop: AlgoStopInput, meta: InstrumentMeta, *, abs_pos: fl
     return {"sz": sz}
 
 
-def validate_close(close: ClosePositionInput, meta: InstrumentMeta, abs_pos: float) -> dict:
+def validate_close(close: ClosePositionInput, meta: InstrumentMeta, abs_pos: float,
+                   *, order_type: str = "limit") -> dict:
     """限价平仓本地越界拦截（§2.4，P1-2）：限价须有正价、取整后 ``sz>0``、``sz≥minSz``、``sz≤|pos|``。
 
     ``abs_pos``：实时持仓的 ``|pos|``（服务层取自 OKX，作 ``sz`` 上限的可信来源——**绝不**信前端 pos）。
@@ -364,7 +373,11 @@ def validate_close(close: ClosePositionInput, meta: InstrumentMeta, abs_pos: flo
     一律绝不发往 OKX。尾仓 ``abs_pos<minSz`` 时默认全仓亦会被 minSz 拦截，UI 应引导改用市价整仓（§2.6）。
     返回取整后的 ``{sz}``。
     """
-    if close.px is None or close.px <= 0:
+    if order_type not in {"limit", "market"}:
+        raise OKXPrivateError("LIVE_CLOSE_REJECTED_LOCAL", "不支持的平仓委托类型")
+    if order_type == "market" and close.px is not None:
+        raise OKXPrivateError("LIVE_CLOSE_REJECTED_LOCAL", "市价平仓不能指定价格")
+    if order_type == "limit" and (close.px is None or close.px <= 0):
         raise OKXPrivateError("LIVE_CLOSE_REJECTED_LOCAL", "限价平仓必须填写大于 0 的委托价格")
     requested = close.sz if close.sz is not None else abs_pos
     sz = snap_size(requested, meta.lot_sz)

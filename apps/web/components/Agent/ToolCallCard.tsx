@@ -4,12 +4,25 @@ import { useState } from "react";
 import clsx from "clsx";
 import { labelFor } from "@/lib/agentToolMeta";
 import type { ToolCall } from "@/lib/agentTypes";
+import AccountSnapshotCard from "./trading/AccountSnapshotCard";
+import AutoTradeContextCard from "./trading/AutoTradeContextCard";
+import TradeIntentCard from "./trading/TradeIntentCard";
 
 export default function ToolCallCard({ call }: { call: ToolCall }) {
   const [open, setOpen] = useState(false);
   const { label, icon } = labelFor(call.name);
   const status = !call.done ? "running" : call.ok ? "ok" : "error";
   const hasInput = Object.keys(call.input || {}).length > 0;
+
+  if (call.payload?.type === "trade_intent") {
+    return <TradeIntentCard intent={call.payload.intent} />;
+  }
+  if (call.payload?.type === "account_snapshot") {
+    return <AccountSnapshotCard snapshot={call.payload.snapshot} toolName={call.name} />;
+  }
+  if (call.payload?.type === "auto_trade_context") {
+    return <AutoTradeContextCard context={call.payload.context} />;
+  }
 
   return (
     <div className="overflow-hidden rounded-[10px] border border-[var(--border)] bg-[var(--surface)] text-xs">
@@ -31,6 +44,11 @@ export default function ToolCallCard({ call }: { call: ToolCall }) {
         </span>
         <span className="text-[var(--muted)]">{open ? "▾" : "▸"}</span>
       </button>
+      {call.code && call.done && !call.ok && call.summary && (
+        <p role="alert" className="px-2.5 pb-2 text-[var(--short-ink)]">
+          {call.summary}
+        </p>
+      )}
       {open && (
         <div className="border-t border-[var(--border)] px-2.5 py-2">
           {hasInput && (
