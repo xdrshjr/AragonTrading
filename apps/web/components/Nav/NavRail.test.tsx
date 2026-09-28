@@ -1,8 +1,17 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAppStore } from "@/lib/store";
 import NavRail from "./NavRail";
+vi.mock("@/lib/accountApi", () => ({ accountApi: {
+  accounts: { list: vi.fn().mockResolvedValue({ accounts: [], defaultId: null }) },
+} }));
+function renderRail() {
+  return render(<QueryClientProvider client={new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })}><NavRail /></QueryClientProvider>);
+}
 
 beforeEach(() => {
   localStorage.clear();
@@ -13,21 +22,21 @@ afterEach(cleanup);
 
 describe("NavRail — 左侧主功能导航", () => {
   it("renders the three primary nav items with accessible names", () => {
-    render(<NavRail />);
+    renderRail();
     expect(screen.getByRole("button", { name: "交易" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "因子实验室" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "策略与因子挖掘" })).toBeTruthy();
   });
 
   it("marks the active view with aria-current=page (trade by default)", () => {
-    render(<NavRail />);
+    renderRail();
     expect(screen.getByRole("button", { name: "交易" })).toHaveAttribute("aria-current", "page");
     expect(screen.getByRole("button", { name: "因子实验室" })).not.toHaveAttribute("aria-current");
     expect(screen.getByRole("button", { name: "策略与因子挖掘" })).not.toHaveAttribute("aria-current");
   });
 
   it("clicking 策略与因子挖掘 switches activeView to discovery", () => {
-    render(<NavRail />);
+    renderRail();
     fireEvent.click(screen.getByRole("button", { name: "策略与因子挖掘" }));
     expect(useAppStore.getState().activeView).toBe("discovery");
     // 选中态视觉与既有两项一致（左侧指示条 + accent 前景）。
@@ -38,14 +47,14 @@ describe("NavRail — 左侧主功能导航", () => {
   });
 
   it("clicking 因子实验室 switches activeView to factor", () => {
-    render(<NavRail />);
+    renderRail();
     fireEvent.click(screen.getByRole("button", { name: "因子实验室" }));
     expect(useAppStore.getState().activeView).toBe("factor");
   });
 
   it("clicking a nav item closes the settings overlay and switches view", () => {
     useAppStore.setState({ showSettings: true });
-    render(<NavRail />);
+    renderRail();
     // 设置浮层打开时各项均不显选中，避免误导。
     expect(screen.getByRole("button", { name: "交易" })).not.toHaveAttribute("aria-current");
     fireEvent.click(screen.getByRole("button", { name: "因子实验室" }));
@@ -54,23 +63,23 @@ describe("NavRail — 左侧主功能导航", () => {
   });
 
   it("renders the item label only as a hover/focus tooltip (icon-only by default)", () => {
-    // 锁定「默认仅图标、文字仅悬浮」契约：改后 label 文本仅存在于气泡 span，按钮可访问名来自
-    // aria-label（属性，不被 getByText 命中），故 getByText 唯一命中气泡 span（评审 P2-4）。
-    render(<NavRail />);
+    renderRail();
+    expect(screen.queryByText("交易")).toBeNull();
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "交易" }));
     const tip = screen.getByText("交易");
     expect(tip).toHaveAttribute("aria-hidden", "true");
-    // jsdom 不计算 :hover/:focus-visible 的实际可见性，故只断言「默认隐藏 + 触发类存在」。
-    expect(tip.className).toContain("opacity-0");
-    expect(tip.className).toContain("group-hover:opacity-100");
+    expect(tip.parentElement).toBe(document.body);
   });
 
-  it("constrains the rail to w-12 (48px = 3/4 of the former 64px)", () => {
-    // 尺寸契约护栏：第 3 轮把栏宽由 w-16(64px) 收窄为 w-12(48px=精确 3/4)。锁定该类，
-    // 防止未来误改回 w-16 等更宽刻度（CLAUDE.md §7 把已修尺寸固化为回归护栏）。
-    render(<NavRail />);
+  it("导航为56px，主功能与工具命中框均为44px", () => {
+    renderRail();
     const rail = screen.getByRole("navigation", { name: "主功能导航" });
-    expect(rail.className).toContain("w-12");
+    expect(rail.className).toContain("w-14");
     expect(rail.className).not.toContain("w-16");
+    for (const button of screen.getAllByRole("button")) {
+      expect(button).toHaveClass("h-11", "w-11", "shrink-0");
+    }
+    expect(rail.lastElementChild).toHaveAttribute("aria-label", "工作台设置");
   });
 });
 

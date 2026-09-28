@@ -7,7 +7,7 @@ import AccountModeSwitch from "./AccountModeSwitch";
 
 // 仅桩掉本测试不关心的网络副作用：账户列表查询是被测三态的输入；模拟盘资金字段无关。
 vi.mock("@/lib/accountApi", () => ({ accountApi: { accounts: { list: vi.fn() } } }));
-vi.mock("./SimBalanceField", () => ({ default: () => null }));
+
 
 const READY = { accounts: [{ id: 1, hasSecret: true, hasPassphrase: true }], defaultId: 1 };
 const NO_DEFAULT = { accounts: [], defaultId: null };
@@ -23,11 +23,11 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function renderSwitch() {
+function renderSwitch(placement: "inline" | "rail" = "inline") {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const utils = render(
     <QueryClientProvider client={qc}>
-      <AccountModeSwitch />
+      <AccountModeSwitch placement={placement} />
     </QueryClientProvider>,
   );
   return { qc, ...utils };
@@ -47,6 +47,97 @@ beforeEach(() => {
   });
 });
 afterEach(cleanup);
+
+describe("左栏账户弹窗", () => {
+  it("关闭期仍运行实盘水合守门", async () => {
+    const pending = deferred<typeof NO_DEFAULT>();
+    vi.mocked(accountApi.accounts.list).mockReturnValue(pending.promise as never);
+    useAppStore.setState({ accountMode: "live" });
+    renderSwitch("rail");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await act(async () => pending.resolve(NO_DEFAULT));
+    await waitFor(() => expect(useAppStore.getState().accountMode).toBe("sim"));
+  });
+
+  it.each([NO_DEFAULT, MISSING_CREDS])("缺账户先显示原因，再主动去设置", async (accounts) => {
+    vi.mocked(accountApi.accounts.list).mockResolvedValue(accounts as never);
+    const { qc } = renderSwitch("rail");
+    await waitFor(() => expect(queryStatus(qc)).toBe("success"));
+    fireEvent.click(screen.getByRole("button", { name: "账户模式：模拟盘" }));
+    fireEvent.click(liveButton());
+    expect(useAppStore.getState().showSettings).toBe(false);
+    expect(screen.getByRole("status").textContent).toMatch(/默认.*账户/);
+    fireEvent.click(screen.getByRole("button", { name: "前往账户设置" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(useAppStore.getState().showSettings).toBe(true);
+    expect(useAppStore.getState().settingsSection).toBe("okx-accounts");
+  });
+
+  it("模拟资金首次Esc取消草稿，第二次关闭并恢复入口焦点", async () => {
+    vi.mocked(accountApi.accounts.list).mockResolvedValue(READY as never);
+    useAppStore.setState({ simBalance: 12345 });
+    renderSwitch("rail");
+    const trigger = screen.getByRole("button", { name: "账户模式：模拟盘" });
+    act(() => trigger.focus());
+    fireEvent.click(trigger);
+    expect(document.activeElement).toBe(simButton());
+    fireEvent.click(screen.getByRole("button", { name: /模拟资金/ }));
+    const input = screen.getByRole("textbox", { name: "模拟资金" });
+    act(() => input.focus());
+    fireEvent.change(input, { target: { value: "98765" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(useAppStore.getState().simBalance).toBe(12345);
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    fireEvent.keyDown(document.activeElement!, { key: "Tab" });
+    expect(screen.getByRole("dialog").contains(document.activeElement)).toBe(true);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("button", { name: /模拟资金/ }));
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "23456" } });
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Enter" });
+    expect(useAppStore.getState().simBalance).toBe(23456);
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    fireEvent.click(trigger);
+    expect(screen.getByRole("button", { name: /模拟资金/ }).textContent).toContain("23,456");
+  });
+
+  it("实盘初始焦点与Tab环绕，方向键沿原守门切换", async () => {
+    vi.mocked(accountApi.accounts.list).mockResolvedValue(READY as never);
+    useAppStore.setState({ accountMode: "live" });
+    const { qc } = renderSwitch("rail");
+    await waitFor(() => expect(queryStatus(qc)).toBe("success"));
+    fireEvent.click(screen.getByRole("button", { name: "账户模式：实盘" }));
+    expect(document.activeElement).toBe(liveButton());
+    fireEvent.keyDown(liveButton(), { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "关闭" }));
+    fireEvent.keyDown(document.activeElement!, { key: "Tab" });
+    expect(document.activeElement).toBe(liveButton());
+    fireEvent.keyDown(liveButton(), { key: "Home" });
+    expect(useAppStore.getState().accountMode).toBe("sim");
+    fireEvent.keyDown(simButton(), { key: "End" });
+    expect(useAppStore.getState().accountMode).toBe("live");
+  });
+
+  it("加载和失败均不进入实盘，失败点击可重试", async () => {
+    const pending = deferred<typeof READY>();
+    vi.mocked(accountApi.accounts.list).mockReturnValueOnce(pending.promise as never);
+    const { qc } = renderSwitch("rail");
+    fireEvent.click(screen.getByRole("button", { name: "账户模式：模拟盘" }));
+    fireEvent.click(liveButton());
+    expect(screen.getByRole("status").textContent).toContain("正在校验");
+    vi.mocked(accountApi.accounts.list).mockResolvedValue(READY as never);
+    await act(async () => pending.reject(new Error("离线")));
+    await waitFor(() => expect(queryStatus(qc)).toBe("error"));
+    fireEvent.click(liveButton());
+    expect(useAppStore.getState().accountMode).toBe("sim");
+    expect(screen.getByRole("status").textContent).toContain("校验失败");
+    await waitFor(() => expect(queryStatus(qc)).toBe("success"));
+    fireEvent.click(liveButton());
+    expect(useAppStore.getState().accountMode).toBe("live");
+  });
+});
 
 describe("AccountModeSwitch — 实盘 switch gating across the three account-query states", () => {
   it("state ④ ready: switches to live when a ready default account exists", async () => {

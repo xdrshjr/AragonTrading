@@ -1,9 +1,10 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import clsx from "clsx";
-import { Badge } from "@/components/ui";
+import RailIconButton from "@/components/Nav/RailIconButton";
+import { Badge, Button, Modal } from "@/components/ui";
 import { accountApi } from "@/lib/accountApi";
 import { useAppStore } from "@/lib/store";
 import SimBalanceField from "./SimBalanceField";
@@ -26,7 +27,14 @@ type SwitchNotice = { tone: "info" | "error"; text: string } | null;
  * - 水合守门（C1-5）：刷新后若持久化的 accountMode 为 "live" 但默认账户已失效 / 未配置，立即回落 "sim"；
  *   与 selectLive 共用同一 isSuccess 前置，消除加载期不对称保护造成的竞态。
  */
-export default function AccountModeSwitch() {
+export default function AccountModeSwitch({ placement = "inline" }: {
+  placement?: "inline" | "rail";
+} = {}) {
+  const [open, setOpen] = useState(false);
+  const titleId = useId();
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const simRef = useRef<HTMLButtonElement>(null);
+  const liveRef = useRef<HTMLButtonElement>(null);
   const accountMode = useAppStore((s) => s.accountMode);
   const setAccountMode = useAppStore((s) => s.setAccountMode);
   const setMode = useAppStore((s) => s.setMode);
@@ -84,13 +92,29 @@ export default function AccountModeSwitch() {
         ? "默认账户凭证不全，请在设置中补全 API secret / passphrase。"
         : "请先在设置中配置默认实盘账户。",
     });
-    setSettingsSection("okx-accounts");
-    setShowSettings(true);
+    if (placement === "inline") {
+      setSettingsSection("okx-accounts");
+      setShowSettings(true);
+    }
   };
 
-  return (
-    <div className="flex items-center gap-2">
+  const selectByKey = (event: React.KeyboardEvent<HTMLDivElement>) => {
+    if (placement !== "rail") return;
+    if (!event.target || !(event.target as HTMLElement).matches('[role="radio"]')) return;
+    const keys = ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"];
+    if (!keys.includes(event.key)) return;
+    event.preventDefault();
+    const nextLive = event.key === "End" || (event.key !== "Home"
+      && event.target === simRef.current);
+    (nextLive ? selectLive : selectSim)();
+    (nextLive ? liveRef : simRef).current?.focus();
+  };
+  const contents = (
+    <div ref={bodyRef} className={placement === "rail"
+      ? "flex min-h-0 flex-col gap-4 overflow-y-auto p-4"
+      : "flex items-center gap-2"}>
       <div
+        onKeyDown={selectByKey}
         role="radiogroup"
         aria-label="账户模式"
         className="flex items-center gap-0.5 rounded-full bg-[var(--surface-2)] p-0.5"
@@ -98,6 +122,8 @@ export default function AccountModeSwitch() {
         <button
           type="button"
           role="radio"
+          ref={simRef}
+          tabIndex={placement === "rail" && accountMode !== "sim" ? -1 : 0}
           aria-checked={accountMode === "sim"}
           onClick={selectSim}
           className={clsx(
@@ -112,6 +138,8 @@ export default function AccountModeSwitch() {
         <button
           type="button"
           role="radio"
+          ref={liveRef}
+          tabIndex={placement === "rail" && accountMode !== "live" ? -1 : 0}
           aria-checked={accountMode === "live"}
           onClick={selectLive}
           title={
@@ -138,14 +166,52 @@ export default function AccountModeSwitch() {
         <span
           role="status"
           className={clsx(
-            "max-w-[16rem] truncate text-[11px]",
+            placement === "rail" ? "whitespace-normal text-xs"
+              : "max-w-[16rem] truncate text-[11px]",
             notice.tone === "error" ? "text-[var(--short-ink)]" : "text-[var(--muted)]",
           )}
         >
           {notice.text}
         </span>
       )}
+      {placement === "rail" && notice && needsSetup && (
+        <Button variant="ghost" size="sm" onClick={() => {
+          setOpen(false);
+          setSettingsSection("okx-accounts");
+          setShowSettings(true);
+        }}>前往账户设置</Button>
+      )}
       {accountMode === "sim" && <SimBalanceField />}
     </div>
   );
+  if (placement === "inline") return contents;
+  return <>
+    <RailIconButton label={`账户模式：${accountMode === "sim" ? "模拟盘" : "实盘"}`}
+      aria-haspopup="dialog" aria-expanded={open} onClick={() => setOpen(true)}>
+      <span className={clsx("flex flex-col items-center gap-0.5 text-[10px]",
+        accountMode === "live" ? "text-[var(--short-ink)]" : "text-[var(--text)]")}>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+          stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+          <path d="M4 6h15v14H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h13v2M19 10h-5v6h5" />
+        </svg>
+        {accountMode === "sim" ? "模拟" : "实盘"}
+      </span>
+    </RailIconButton>
+    <Modal open={open} onClose={() => setOpen(false)} labelledBy={titleId}
+      className="!max-w-sm" initialFocusRef={accountMode === "sim" ? simRef : liveRef}
+      onEscapeKeyDown={(event) => {
+        const target = event.target;
+        if (target instanceof HTMLInputElement
+          && target.getAttribute("aria-label") === "模拟资金"
+          && bodyRef.current?.contains(target)) event.preventDefault();
+      }}>
+      <h2 id={titleId} className="shrink-0 border-b border-[var(--border)] p-4 text-sm font-semibold">
+        账户模式
+      </h2>
+      {contents}
+      <div className="flex shrink-0 justify-end border-t border-[var(--border)] p-4">
+        <Button variant="ghost" size="sm" onClick={() => setOpen(false)}>关闭</Button>
+      </div>
+    </Modal>
+  </>;
 }

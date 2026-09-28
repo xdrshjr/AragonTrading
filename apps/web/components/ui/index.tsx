@@ -249,6 +249,11 @@ export function Slider({
 const FOCUSABLE =
   'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
+function focusableItems(dialog: HTMLElement): HTMLElement[] {
+  return Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE))
+    .filter((element) => element.tabIndex >= 0);
+}
+
 /**
  * 同时打开的对话框登记表（spec D4）；「栈顶」= 唯一有权响应 Esc / Tab 陷阱的那一个。
  *
@@ -292,6 +297,7 @@ export function Modal({
   labelledBy,
   className,
   initialFocusRef,
+  onEscapeKeyDown,
   children,
 }: {
   open: boolean;
@@ -299,6 +305,7 @@ export function Modal({
   labelledBy?: string;
   className?: string;
   initialFocusRef?: React.RefObject<HTMLElement | null>;
+  onEscapeKeyDown?: (event: KeyboardEvent) => void;
   children: React.ReactNode;
 }) {
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -334,7 +341,7 @@ export function Modal({
     if (!open) return;
     restoreFocusRef.current = (document.activeElement as HTMLElement) ?? null;
     const dialog = dialogRef.current;
-    const first = dialog?.querySelector<HTMLElement>(FOCUSABLE);
+    const first = dialog ? focusableItems(dialog)[0] : undefined;
     (initialFocusRef?.current ?? first ?? dialog)?.focus();
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
@@ -355,6 +362,8 @@ export function Modal({
       // 仍在跑，目前只是恰好每个分支都不命中——任何一次 FOCUSABLE 选择器调整都会让它开始抢焦点。
       if (!isTopDialog(entryRef.current!.id)) return;
       if (e.key === "Escape") {
+        onEscapeKeyDown?.(e);
+        if (e.defaultPrevented) return;
         e.stopPropagation();
         // stopPropagation 挡不住**同一个 EventTarget 上的其它监听器**（那需要 stopImmediatePropagation）。
         // 栈顶守卫已经解决了 Modal 之间的相互干扰，这一行是纵深防御：挡住同样挂在 window 捕获期的
@@ -366,7 +375,7 @@ export function Modal({
       if (e.key !== "Tab") return;
       const dialog = dialogRef.current;
       if (!dialog) return;
-      const items = Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE));
+      const items = focusableItems(dialog);
       if (items.length === 0) {
         e.preventDefault();
         dialog.focus();
@@ -375,6 +384,11 @@ export function Modal({
       const first = items[0];
       const last = items[items.length - 1];
       const active = document.activeElement;
+      if (!dialog.contains(active)) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
+        return;
+      }
       if (e.shiftKey && (active === first || active === dialog)) {
         e.preventDefault();
         last.focus();
@@ -385,7 +399,7 @@ export function Modal({
     };
     window.addEventListener("keydown", onKeyDown, true);
     return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [open, onClose]);
+  }, [open, onClose, onEscapeKeyDown]);
 
   if (!open) return null;
 

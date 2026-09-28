@@ -17,6 +17,31 @@ function renderModal(onClose = vi.fn(), open = true) {
 }
 
 describe("ui — Modal primitive", () => {
+  it("Esc委托取消关闭并继续传播到输入框", () => {
+    const close = vi.fn();
+    const inputKey = vi.fn();
+    render(<Modal open onClose={close}
+      onEscapeKeyDown={(event) => event.preventDefault()}>
+      <input aria-label="编辑" onKeyDown={inputKey} />
+    </Modal>);
+    fireEvent.keyDown(screen.getByRole("textbox"), { key: "Escape" });
+    expect(close).not.toHaveBeenCalled();
+    expect(inputKey).toHaveBeenCalledOnce();
+  });
+
+  it("Tab首尾环绕跳过tabIndex=-1的按钮", () => {
+    render(<Modal open onClose={vi.fn()}>
+      <button tabIndex={-1}>跳过</button>
+      <button>当前</button>
+      <button>关闭</button>
+    </Modal>);
+    expect(document.activeElement).toBe(screen.getByText("当前"));
+    fireEvent.keyDown(document.activeElement!, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(screen.getByText("关闭"));
+    fireEvent.keyDown(document.activeElement!, { key: "Tab" });
+    expect(document.activeElement).toBe(screen.getByText("当前"));
+  });
+
   it("renders a labelled dialog with aria-modal when open", () => {
     renderModal();
     const dialog = screen.getByRole("dialog");

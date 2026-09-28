@@ -1,5 +1,6 @@
 import "@testing-library/jest-dom/vitest";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { agentApi } from "@/lib/agentApi";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AiTradeGroupState } from "@/lib/aiTradeTypes";
 import { agentWS } from "@/lib/agentWs";
@@ -78,6 +79,70 @@ beforeEach(() => {
 afterEach(() => cleanup());
 
 describe("AgentPanel 工具栏两横栏", () => {
+  it("未配置或断线仍可清空，标题只有单一入口", () => {
+    render(<AgentPanel />);
+    const emit = vi.mocked(agentWS).mock.calls[0][1];
+    act(() => emit({ type: "ready", data: {
+      configured: false, model: "", provider: "test",
+    } }));
+    expect(screen.getAllByRole("button", { name: "清空上下文" })).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "新对话" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "清除上下文" })).toBeNull();
+    expect(screen.getByRole("button", { name: "清空上下文" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "清空上下文" }));
+    expect(screen.getByText(/历史记录保留，自动交易状态不受影响/)).toBeTruthy();
+  });
+
+  it("聊天生成中切到轨迹且断线仍可停止，清空回聊天不改变交易分组", () => {
+    render(<AgentPanel />);
+    const emit = vi.mocked(agentWS).mock.calls[0][1];
+    const state = vi.mocked(agentWS).mock.calls[0][2]!;
+    const group = traceGroup();
+    act(() => {
+      emit({ type: "message_start", data: { id: "stream", role: "assistant" } });
+      useAppStore.setState({ aiTradeGroup: group });
+      state(false);
+    });
+    expect(screen.getByRole("button", { name: "清空上下文" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "停止当前回答" }));
+    fireEvent.click(screen.getByRole("button", { name: "清空上下文" }));
+    expect(screen.getByRole("tab", { name: "对话" })).toHaveAttribute("aria-selected", "true");
+    expect(useAppStore.getState().aiTradeGroup).toBe(group);
+    expect(screen.getByTestId("agent-composer")).toBeTruthy();
+  });
+
+  it("清空后丢弃旧连接状态，保留新连接", () => {
+    render(<AgentPanel />);
+    const oldState = vi.mocked(agentWS).mock.calls[0][2]!;
+    act(() => oldState(true));
+    fireEvent.click(screen.getByRole("button", { name: /清[空除]上下文/ }));
+    const newState = vi.mocked(agentWS).mock.calls.at(-1)![2]!;
+    act(() => newState(true));
+    act(() => oldState(false));
+    expect(screen.getByTitle("已连接")).toBeInTheDocument();
+    expect(screen.queryByText(/连接中断/)).toBeNull();
+  });
+
+  it("旧会话 gap 对账迟到不能恢复已清空历史", async () => {
+    let resolve!: (value: never[]) => void;
+    vi.mocked(agentApi.messages).mockReturnValueOnce(
+      new Promise((done) => { resolve = done; }),
+    );
+    render(<AgentPanel />);
+    const emit = vi.mocked(agentWS).mock.calls[0][1];
+    act(() => {
+      emit({ type: "resumed", data: { ok: false, reason: "gap" } });
+      emit({ type: "done", data: {} });
+    });
+    fireEvent.click(screen.getByRole("button", { name: /清[空除]上下文/ }));
+    await act(async () => resolve([
+      { id: "old", role: "user", ts: 0,
+        blocks: [{ type: "text", text: "旧会话独特口令" }] } as never,
+    ]));
+    expect(screen.queryByText("旧会话独特口令")).toBeNull();
+    expect(agentApi.clear).not.toHaveBeenCalled();
+  });
+
   it("renders the control bar directly above the composer", () => {
     render(<AgentPanel />);
     expect(screen.getByTestId("ai-trade-control-bar").nextElementSibling).toBe(

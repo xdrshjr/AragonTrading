@@ -1,5 +1,6 @@
 "use client";
 
+import RailIconButton from "@/components/Nav/RailIconButton";
 import clsx from "clsx";
 import { useAppStore } from "@/lib/store";
 
@@ -7,9 +8,28 @@ import { useAppStore } from "@/lib/store";
  * 顶栏齿轮按钮：切换工作台 ↔ 设置面板（内联 SVG，无三方图标依赖，随主题着色）。
  * 处于设置面板时高亮（accent-soft），并以 aria-pressed 表达切换态。
  */
-export default function SettingsGearButton() {
+export default function SettingsGearButton({ placement = "inline" }: {
+  placement?: "inline" | "rail";
+} = {}) {
   const showSettings = useAppStore((s) => s.showSettings);
   const setShowSettings = useAppStore((s) => s.setShowSettings);
+
+  const icon = (
+      <svg width={placement === "rail" ? 20 : 16}
+        height={placement === "rail" ? 20 : 16} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.6" />
+        <path
+          d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"
+          stroke="currentColor"
+          strokeWidth="1.6"
+        />
+      </svg>
+  );
+  if (placement === "rail") {
+    return <RailIconButton id="settings-gear" label="设置"
+      active={showSettings} aria-pressed={showSettings}
+      onClick={() => setShowSettings(!showSettings)}>{icon}</RailIconButton>;
+  }
 
   return (
     <button
@@ -27,14 +47,7 @@ export default function SettingsGearButton() {
           : "text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]",
       )}
     >
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-        <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.6" />
-        <path
-          d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"
-          stroke="currentColor"
-          strokeWidth="1.6"
-        />
-      </svg>
+      {icon}
     </button>
   );
 }

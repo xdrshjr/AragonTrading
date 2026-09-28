@@ -1,13 +1,15 @@
 "use client";
 
-import clsx from "clsx";
+import RailIconButton from "./RailIconButton";
+import NavRailControls from "./NavRailControls";
 import type { ReactNode } from "react";
 import { useAppStore, type WorkbenchView } from "@/lib/store";
 
 /**
  * 左侧竖向主功能导航栏（App Shell 外壳）。
  *
- * 纵向排布一级功能项（交易 / 因子实验室 / 策略与因子挖掘），常驻在 header 之下、内容区最左侧；点击即写入
+ * 纵向排布一级功能项（交易 / 因子实验室 / 策略与因子挖掘），常驻在 header 之下、
+ * 内容区最左侧；点击即写入
  * store.activeView 切换视图，并关闭设置浮层。选中项以赭色强调（--accent）+ 左侧指示条高亮。
  * 内联 SVG，无三方图标依赖（镜像 FactorButton/SettingsGearButton 的着色与圆角 token）。
  * 普通 <button> + aria-current 即满足 Tab/Enter/Space 键盘可达（因子层 NavRail §2.3）。
@@ -78,53 +80,22 @@ export default function NavRail() {
   };
 
   return (
-    <nav
-      aria-label="主功能导航"
-      className="flex w-12 shrink-0 flex-col gap-1 border-r border-[var(--border)] bg-[var(--surface)]/60 px-2 py-3"
-    >
-      {ITEMS.map((item) => {
-        // 设置浮层打开时各项均不显选中，避免误导（高亮以 !showSettings && activeView 计算）。
-        const active = !showSettings && activeView === item.key;
-        return (
-          <button
-            key={item.key}
-            type="button"
-            id={`nav-rail-${item.key}`}
-            onClick={() => select(item.key)}
-            aria-current={active ? "page" : undefined}
-            aria-label={item.label}
-            className={clsx(
-              "group relative flex h-11 items-center justify-center rounded-[12px]",
-              "transition-all duration-150 ease-smooth",
-              active
-                ? "bg-[var(--accent-soft)] text-[var(--accent-ink)]"
-                : "text-[var(--muted)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]",
-            )}
-          >
-            {active && (
-              <span
-                aria-hidden="true"
-                className="absolute left-0 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-full bg-[var(--accent)]"
-              />
-            )}
-            {item.icon}
-            {/* 默认仅图标；hover/focus 时右侧弹出文字气泡。aria-hidden：可访问名仍由 aria-label 提供，
-                不重复朗读；pointer-events-none + 绝对定位：不撑开 48px 栏宽、不拦截命中。 */}
-            <span
-              aria-hidden="true"
-              className={clsx(
-                "pointer-events-none absolute left-full top-1/2 z-50 ml-2 -translate-y-1/2",
-                "whitespace-nowrap rounded-md border border-[var(--border)] bg-[var(--surface)]",
-                "px-2 py-1 text-xs font-medium text-[var(--text)] shadow-sm",
-                "opacity-0 transition-opacity duration-150 ease-smooth",
-                "group-hover:opacity-100 group-focus-visible:opacity-100",
-              )}
-            >
-              {item.label}
-            </span>
-          </button>
-        );
-      })}
+    <nav aria-label="主功能导航"
+      className="flex min-h-0 w-14 shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)]/60 py-3">
+      <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
+        <div className="flex flex-col items-center gap-1">
+          {ITEMS.map((item) => {
+            const active = !showSettings && activeView === item.key;
+            return <RailIconButton key={item.key}
+              id={`nav-rail-${item.key}`} label={item.label}
+              active={active} indicator aria-current={active ? "page" : undefined}
+              onClick={() => select(item.key)}>
+              {item.icon}
+            </RailIconButton>;
+          })}
+        </div>
+      </div>
+      <NavRailControls />
     </nav>
   );
 }

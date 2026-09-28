@@ -7,14 +7,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import AiBacktestModal from "@/components/Chart/AiBacktestModal";
 import ChartWorkspace from "@/components/Chart/ChartWorkspace";
 import WindowControls from "@/components/Desktop/WindowControls";
-import AccountModeSwitch from "@/components/Header/AccountModeSwitch";
 import DiscoveryLab from "@/components/Discovery/DiscoveryLab";
 import FactorLab from "@/components/Factor/FactorLab";
 import NavRail from "@/components/Nav/NavRail";
 import RightPanel from "@/components/RightPanel/RightPanel";
-import SettingsGearButton from "@/components/Settings/SettingsGearButton";
 import SettingsPanel from "@/components/Settings/SettingsPanel";
-import { Button } from "@/components/ui";
 import PanelResizeHandle from "@/components/ui/PanelResizeHandle";
 import { api } from "@/lib/api";
 import {
@@ -104,7 +101,6 @@ export default function Page() {
     appendLiveAutoTrade,
     setLiveAutoPosition,
     pushLiveAutoEvent,
-    toggleTheme,
     setRightPanelWidth,
   } = useAppStore();
 
@@ -592,18 +588,8 @@ export default function Page() {
     updatedTs: lastMarketTs,
   };
 
-  // 顶栏右簇应用控件（模拟盘/实盘切换、主题键、设置齿轮、窗口键）。所有平台均单行内联在标题栏行内、
-  // 置于系统三键左侧（第 2 轮回退 round-1 的两段式布局，诊断 desktop-header-app-controls-inline-single-row）。
-  const appControls = (
-    <>
-      <AccountModeSwitch />
-      <Button variant="ghost" size="sm" onClick={toggleTheme} aria-label="切换主题">
-        {theme === "light" ? "暗色" : "亮色"}
-      </Button>
-      <SettingsGearButton />
-      <WindowControls />
-    </>
-  );
+  // 全局工作台操作归左栏；此处仅保留原系统窗口控制及安全命中区。
+  const appControls = <WindowControls />;
 
   return (
     <div className="flex h-screen flex-col bg-[var(--bg)]">
