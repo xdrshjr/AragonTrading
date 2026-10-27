@@ -1,10 +1,89 @@
-# Aragon Trading — 多策略量化模拟交易平台
+# Aragon Trading — OKX 真实行情驱动的开源多策略量化交易工作台
 
-基于**欧易（OKX）真实行情**的「左图右策略」量化模拟交易工作台。左侧专业 K 线图（缩放 / 平移 / 日期跳转 / 滚动加载历史），右侧选择交易策略并在左图叠加买卖点 markers 与净值/盈亏折线。本期（Phase 1）仅做**模拟快速交易**（内置 SimBroker 撮合），不接入真实下单。
+[![CI](https://github.com/xdrshjr/AragonTrading/actions/workflows/ci.yml/badge.svg)](https://github.com/xdrshjr/AragonTrading/actions/workflows/ci.yml)
+[![Next.js](https://img.shields.io/badge/Next.js-14-black?logo=nextdotjs&logoColor=white)](apps/web)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](services/quant)
+[![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](services/quant/requirements.txt)
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.6-3178C6?logo=typescript&logoColor=white)](apps/web/tsconfig.json)
+[![Electron](https://img.shields.io/badge/Electron-桌面端-47848F?logo=electron&logoColor=white)](desktop)
+[![Tests](https://img.shields.io/badge/tests-3209%20pytest%20%2B%203030%20vitest-success)](#测试)
+[![llms.txt](https://img.shields.io/badge/llms.txt-AI%20可读-blueviolet)](llms.txt)
+
+## Aragon Trading 是什么
+
+**Aragon Trading（阿拉贡量化）是一个本地优先的开源多策略量化交易工作台**：左边是专业 K 线图，
+右边是策略、回测与模拟盘控制台。行情全部取自**欧易 OKX 的真实公开数据**（REST 历史 K 线 +
+WebSocket 实时推送），撮合由内置 SimBroker 完成，策略、因子与回测引擎都跑在本机 SQLite 之上。
+
+它要解决的问题很具体：**策略想法与「这条路到底行不行」之间，隔着一整条链路**——取真实数据、
+对齐时间轴、算指标、跑撮合、扣交易成本、看权益曲线、横向比较多个策略。Aragon Trading 把这
+条链路做成一个能直接点开的工作台，同时守住一条硬规则：**数据只有「真实」与「显式报错」两种
+状态，绝不用合成数据冒充行情**。OKX 不可达时界面会明说连不上，而不是画一条好看的假曲线。
+
+一句话区分：它是**研究、验证与模拟**工具，不是一键托管真钱的机器人。默认配置下不接真实下单
+通道；实盘能力需要你显式开启开关、填入自己的 OKX 凭证，且每一步都要过确定性门禁与预览确认。
+
+> 原「左图右策略」一句话定位（Phase 1 口径）：基于**欧易（OKX）真实行情**的量化模拟交易工作
+> 台。左侧专业 K 线图（缩放 / 平移 / 日期跳转 / 滚动加载历史），右侧选择交易策略并在左图叠加
+> 买卖点 markers 与净值/盈亏折线。本期仅做**模拟快速交易**（内置 SimBroker 撮合），不接入真实
+> 下单。
 
 > 设计文档：`docs/plans/aragon-trading-platform/spec.md`（v2，已评审）。
 
+## 界面预览
+
+![Aragon Trading 主工作台：左侧为 OKX 真实行情的专业 K 线与技术指标，右侧为策略选择、回测与模拟盘控制面板](public/aragon-trading-workstation.png)
+
+> **主工作台（默认视图）**：左侧 K 线支持缩放 / 平移 / 日期跳转 / 滚动加载历史，并叠加技术
+> 指标、买卖点 markers 与净值曲线；右侧选择策略并驱动回测、多策略对比与实时模拟。图中价格与
+> 成交量均来自 OKX 真实行情，非合成数据。
+
+## 快速事实
+
+| 项目 | 内容 |
+|---|---|
+| **项目定位** | 多策略量化交易工作台：回测、多策略对比、实时模拟盘、因子挖掘、AI 自动交易（可在模拟环境运行） |
+| **行情来源** | 欧易 OKX V5 公共 REST（历史 K 线）+ 公共 WebSocket（实时 K 线 / 深度）；策略回测与因子挖掘同样只用真实数据 |
+| **撮合方式** | 内置 SimBroker（模拟撮合）；另有 OKX 模拟盘与实盘通道，二者需显式开关且默认关闭 |
+| **前端** | Next.js 14（App Router）+ React 18 + TypeScript 5.6 + Tailwind + lightweight-charts v4 + Zustand + TanStack Query |
+| **后端** | Python 3.11 + FastAPI 0.115 + SQLAlchemy 2（async SQLite）+ httpx + websockets + pandas / numpy |
+| **桌面端** | Electron + PyInstaller 打包后端可执行体，双击即用，目标机无需预装 Node / Python |
+| **端口约定** | 前端 `18761`，后端 `18760`（刻意避开常见开发端口，启动前先做占用预检） |
+| **测试规模** | 后端 pytest **3209** 个用例（437 个文件），前端 vitest **3030** 个用例（272 个文件） |
+| **核心不变量** | 真实数据硬约束（禁止 mock 冒充行情）、`ts` 全系统秒级 UTC、密钥不进日志、本机 API 的 Origin 信任边界 |
+| **数据合规** | 所有数据落在本机；AI 后训练轨迹采集默认关闭，只写本机且落盘前剔除密钥原文 |
+| **许可证** | 仓库暂未附带 `LICENSE` 文件；如需复用代码，请先与作者确认授权方式 |
+| **给 AI 的入口** | [`llms.txt`](llms.txt)：一页纸讲清项目事实、命令与文档地图 |
+
+## 目录
+
+- [Aragon Trading 是什么](#aragon-trading-是什么)
+- [界面预览](#界面预览)
+- [快速事实](#快速事实)
+- [架构](#架构)
+- [内置策略](#内置-5-个策略)
+- [环境要求](#环境要求)
+- [快速开始](#快速开始)
+  - [一键启动（推荐）](#一键启动推荐)
+  - [真实数据端到端校验（F2）](#真实数据端到端校验f2)
+  - [容器化一键运行（F5）](#容器化一键运行f5)
+  - [手动分步启动](#0-连通性预检必须先通过--真实数据硬约束)
+- [环境变量](#环境变量)
+- [安全 · 本机 API 的信任边界](#安全--本机-api-的信任边界)
+- [测试](#测试)
+- [主要接口](#主要接口后端真实路径前端经-apipy-代理)
+- [桌面端（Electron）](#桌面端electron)
+- [对话账户查询与指令交易](#对话账户查询与指令交易)
+- [常见问题（FAQ）](#常见问题faq)
+- [术语表](#术语表)
+- [延伸阅读](#延伸阅读)
+- [免责声明](#免责声明)
+
 ## 架构
+
+> **口径说明**：本节列的是 Phase 1 的 5 个原子策略；当前 `BUILTIN_ORDER` 已注册 **11 个**
+> 内置策略，另有 `trend_pullback_long` / `trend_pullback_short` / `range_scalping_strategy` /
+> `trend_band_swing` / `regime_rotation`（组合与轮动）/ `factor_score`（因子打分）。
 
 ```
 apps/web        Next.js 14 (App Router) + React 18 + TS + Tailwind + lightweight-charts v4
@@ -365,6 +444,114 @@ npm run release:check      # 打包 → 端到端发布验收（verify:dist：�
 两类自动交易也不能在聊天订单未结时启动。该互斥面向单机、单用户、
 单后端进程，不替代多租户鉴权，也不能阻止交易所上的外部手工交易。
 回滚时应先核对未结订单；不能退回不识别意图表的旧程序再启动自动交易。
+
+## 常见问题（FAQ）
+
+### Aragon Trading 能直接拿真钱交易吗？
+
+默认不能。仓库的默认配置只做**模拟交易**（内置 SimBroker 撮合），不接真实下单通道。实盘能力
+是一条需要你显式开启的链路：配置自己的 OKX 凭证 → 打开 `LIVE_TRADING_ENABLED` 等开关 →
+每笔意图先出**预览卡**、核对账户/方向/张数/价格/预估保证金后才能提交。模型生成的文字本身
+**不会直接发单**，下单前还要过共识、风控、成本、仓位等确定性门禁。
+
+### 为什么这么强调「真实数据」？
+
+因为量化研究里最贵的错误是**在假数据上得出结论**。项目把「真实数据」写成硬约束：OKX 不可达
+时后端返回显式错误、前端显示「无法连接 OKX」，**绝不用随机 / mock 数据顶替行情**。唯一的例外
+是运维显式打开 `ALLOW_CACHED_FALLBACK=true` 时回退到**真实但过期**的缓存，且响应头
+`X-Aragon-Data-Source: cache` 与界面横幅会同时说明「缓存样例 · 非实时」。
+
+### 只用模拟盘 / 回测需要 OKX API Key 吗？
+
+不需要。回测、多策略对比、实时模拟盘、因子挖掘全部只用 OKX **公共**行情接口，不涉及私钥。
+只有「OKX 模拟盘 / 实盘」与「查看真实账户资产 / 持仓」这类私有读写才需要你在设置中心填入
+API Key / Secret Key / Passphrase。
+
+### 和 TradingView、回测框架（如 backtrader）有什么区别？
+
+它把「看图 + 选策略 + 回测 + 对比 + 实时模拟」装进同一个界面，而不是分散在图表工具与脚本之间：
+左侧是 lightweight-charts 驱动的专业 K 线，右侧点两下就能跑回测并在同一张图上叠加买卖点与
+净值曲线；多策略对比时左图叠加若干条归一化净值。此外它更进一步——内置**因子挖掘**闭环与
+**AI 自动交易**（大模型决策 + 确定性门禁），这些是通用回测框架不提供、图表工具也不提供的。
+
+### 内置了哪些策略？能自己加吗？
+
+Phase 1 内置 5 个原子策略（长影线反转、暴涨动量突破、双 EMA 交叉剥头皮、布林带均值回归、
+VWAP + RSI 动量），当前注册表共 **11 个**内置策略（另含趋势回踩多 / 空、区间剥头皮、趋势带
+摆动、regime 轮动组合、因子打分策略）。新增策略只需新建一个
+`services/quant/app/strategies/<key>.py` 并加 `@register_strategy`，再在 `strategies/__init__.py`
+import 一行——引擎与接口零改动。
+
+### 回测结果和实时模拟会不会不一致？
+
+两者共用同一套策略代码与撮合逻辑，但**驱动方式不同**：回测按历史 K 线逐根推进，实时模拟由
+真实行情（实时或历史回放加速）驱动。回测与模拟都会把交易成本计入，但滑点、资金费率、成交
+不确定性在两者之间仍有差异，因此回测数字只能作为**同口径比较**，不应视为未来收益预期。
+
+### 我的数据会被上传吗？
+
+不会。整条链路是本地优先：行情直连 OKX，数据落本机 SQLite（`services/quant/aragon.db` 或
+桌面端的 `%APPDATA%/aragon-desktop/aragon.db`），没有任何遥测上传。AI 后训练轨迹采集**默认
+关闭**，开启后也只写本机目录，并在落盘前逐行剔除密钥原文——但它会包含你的策略、持仓与账户
+规模，外发前请自行审阅。
+
+### 必须装 Python / Node 吗？
+
+想要「双击即用」就用桌面端：Electron 会带上 PyInstaller 打包的后端可执行体与前端静态资源，
+目标机无需预装 Node / Python。开发或容器部署则需要 Node.js ≥ 18.18 + pnpm 与 Python 3.11，
+或直接用 `docker compose up --build`。
+
+### 为什么端口是 18760 / 18761 这种不常用的号？
+
+刻意选的。这两个端口很少出现在其它项目的默认配置里，能规避「本机已经有服务占着 3000 / 8000」
+这类启动即冲突的问题；而且启动脚本会**先做端口占用预检**，被占用时给出定位与释放命令，而不是
+崩在半路。
+
+### 怎么确认数据真的是 OKX 的？
+
+三种机器可验的方式：`GET /api/health` 返回 `okx: up|down` 与往返时延 `okxLatencyMs`；
+`/api/candles` 的响应头 `X-Aragon-Data-Source: live|cache` 标注来源；再跑一遍
+`scripts/smoke_e2e.py` 或 `pytest -m network`，它会经真实 OKX 串起 candles → 回测全链路并按
+退出码断言（0 = PASS）。
+
+### AI 自动交易是让大模型直接下单吗？
+
+不是。大模型只负责**提出**决策，落地路径上横着一串**确定性门禁**：共识门禁、风控铁律、成本
+门禁、仓位层、下单前复核、离场优先级。这些判定都是纯函数，不新增 LLM 调用，也不会因为模型
+说了什么就放行。行情不可达、证据不足、成本不划算时，系统转 `paused` 并明确说明原因。
+
+### 这个项目现在能用吗？成熟度如何？
+
+它是**单人长期迭代的工程化项目**：后端 3209 个 pytest 用例、前端 3030 个 vitest 用例，CI 在每次
+push / PR 跑离线用例；`docs/plans/` 下有 200+ 份方案与诊断文档记录每次改动的原因与回退条件。
+但它**没有附带 LICENSE 文件**、也没有多租户鉴权，按「单机、单用户、单后端进程」设计，适合
+自用研究与教学，不适合直接当作托管他人资金的商业服务。
+
+## 术语表
+
+| 术语 | 含义 |
+|---|---|
+| **run** | 一次回测运行，产出成交明细与净值曲线，可用 `/api/runs/{id}/*` 复现 |
+| **模拟会话（paper session）** | 由真实行情驱动、SimBroker 撮合的实时模拟，区别于回测 |
+| **历史回放加速** | 用真实 OKX 历史 K 线按 1× / 4× / 16× 驱动模拟，数秒内看到结果（仅加速演示，数据仍真实）|
+| **SimBroker** | 内置撮合器，模拟快速交易的成交与费用 |
+| **`ts`** | 时间戳，全系统统一**秒级 UTC**，仅 OKX 适配层做一次毫秒↔秒转换 |
+| **门禁（gate）** | 下单前必须通过的确定性规则检查，纯函数、可回放，不由大模型决定 |
+| **情报（intel）** | 由独立 Agent 采集的标的市场情报，**advisory-only**：进 prompt，但不受其改变任何阈值 |
+| **因子 / 候选库 / 成果资产** | 因子挖掘闭环的三个层次：产出候选 → 过 11 条硬过滤 → 按语义身份登记为可追溯资产 |
+| **轨迹采集（trajectory）** | AI 自动交易的后训练数据记录，默认关闭，编译后产出 `steps.jsonl` / `calls.jsonl` / `report.json` |
+
+## 延伸阅读
+
+- [`docs/plans/aragon-trading-platform/spec.md`](docs/plans/aragon-trading-platform/spec.md) — 平台设计基线（架构、约定、接口）
+- [`docs/plans/`](docs/plans) — 200+ 份迭代方案：每个功能的设计、验收标准与回退条件
+- [`docs/diagnoses/`](docs/diagnoses) — 缺陷诊断档案：复现脚本、根因与验证证据
+- [`docs/improve/`](docs/improve) — AI 自动交易的能力诊断与改进路线
+- [`desktop/README.md`](desktop/README.md) — 桌面端打包、端口同步点与发布验收
+- [`CLAUDE.md`](CLAUDE.md) — 本项目的代码规范与评审清单（尺寸阈值、命名、错误处理、测试要求）
+- [`.env.example`](.env.example) — 全部配置项与默认值（含各能力总闸）
+- [`llms.txt`](llms.txt) — 面向 AI 检索与引用的项目事实卡片
+- [`docs/plans/workstation-text-nowrap-contract/spec.md`](docs/plans/workstation-text-nowrap-contract/spec.md) — 界面契约与验收证据示例
 
 ## 免责声明
 

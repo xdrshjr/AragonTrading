@@ -1,0 +1,72 @@
+# Aragon Trading
+
+> Aragon Trading（阿拉贡量化）是一个本地优先的开源多策略量化交易工作台：左侧专业 K 线图，
+> 右侧策略、回测与模拟盘控制台；行情全部来自欧易 OKX 真实公开数据（REST + WebSocket），
+> 撮合由内置 SimBroker 完成，默认不接真实下单通道。
+
+技术栈：Next.js 14 + React 18 + TypeScript + lightweight-charts v4（前端），Python 3.11 +
+FastAPI + SQLAlchemy async + SQLite（后端），Electron + PyInstaller（桌面端）。仓库地址
+<https://github.com/xdrshjr/AragonTrading>，默认分支 `main`。
+
+## 关键事实
+
+- 定位：回测、多策略对比、实时模拟盘、因子挖掘闭环、AI 自动交易（可在模拟环境运行）。
+- 行情来源：OKX V5 公共 REST（历史 K 线）+ 公共 WebSocket（实时 K 线 / 深度）。
+- 真实数据硬约束：OKX 不可达时显式报错，**禁止**用随机 / mock 数据冒充行情；唯一例外是运维显式
+  开启 `ALLOW_CACHED_FALLBACK=true` 时回退到真实但过期的缓存，并在响应头与界面同时标注。
+- 时间基准：全系统 `ts` 为秒级 UTC，仅 OKX 适配层做一次毫秒↔秒转换。
+- 撮合：内置 SimBroker；OKX 模拟盘与实盘通道需显式开关，默认关闭，下单前有预览卡与确定性门禁。
+- 数据驻留：全部数据落本机 SQLite（`services/quant/aragon.db` 或桌面端
+  `%APPDATA%/aragon-desktop/aragon.db`），无遥测上传；AI 后训练轨迹采集默认关闭、仅写本机。
+- 测试规模：后端 pytest 3209 个用例（437 个文件），前端 vitest 3030 个用例（272 个文件）。
+- 端口约定：前端 `18761`，后端 `18760`。
+- 设计边界：面向单机、单用户、单后端进程；不提供多租户鉴权。
+- 许可证：仓库暂未附带 `LICENSE` 文件，复用代码前请与作者确认授权。
+
+## 快速开始
+
+```bash
+pnpm setup       # 建 venv + 装 Python 依赖 + pnpm install
+pnpm preflight   # OKX 连通性预检（真实数据硬约束）
+pnpm dev         # 后端 :18760 + 前端 :18761 并发启动
+pnpm test        # 后端 pytest（不含 network）+ 前端 vitest
+docker compose up --build   # 或容器化一键运行
+```
+
+桌面端：`pnpm setup` → `cd desktop && npm install && npm run dev`；打包用 `npm run dist`，
+发布验收用 `npm run release:check`。
+
+## 内置策略
+
+Phase 1 五个原子策略：`long_shadow_reversal`、`momentum_breakout`、`ema_cross_scalper`、
+`bollinger_reversion`、`vwap_rsi_momentum`。当前 `BUILTIN_ORDER` 共 11 个：另含
+`trend_pullback_long` / `trend_pullback_short` / `range_scalping_strategy` /
+`trend_band_swing` / `regime_rotation` / `factor_score`。新增策略只需在
+`services/quant/app/strategies/<key>.py` 使用 `@register_strategy` 并在 `__init__.py` import。
+
+## 主要接口
+
+- `GET /api/health`：健康检查，含 `okx: up|down`、`okxLatencyMs`、`cachedFallbackEnabled`。
+- `GET /api/candles`：历史 K 线，响应头 `X-Aragon-Data-Source: live|cache` 标注来源。
+- `POST /api/strategies/{id}/backtest`、`GET /api/runs/{id}/trades|equity`：回测与结果。
+- `POST /api/paper/start`、`POST /api/paper/{sid}/stop`：实时模拟会话。
+- `WS /api/ws/market`、`WS /api/ws/paper/{sid}`：实时行情与模拟事件流。
+- 前端经 Next.js 的 `/api/py/*` 代理访问后端；后端只绑 `127.0.0.1`，并有 Origin 信任边界
+  （跨源请求 403 `ORIGIN_NOT_ALLOWED`）。
+
+## 文档地图
+
+- [README.md](https://github.com/xdrshjr/AragonTrading/blob/main/README.md)：完整说明、快速事实、FAQ、术语表。
+- [docs/plans/aragon-trading-platform/spec.md](https://github.com/xdrshjr/AragonTrading/blob/main/docs/plans/aragon-trading-platform/spec.md)：平台设计基线。
+- [docs/plans/](https://github.com/xdrshjr/AragonTrading/tree/main/docs/plans)：200+ 份迭代方案（设计、验收标准、回退条件）。
+- [docs/diagnoses/](https://github.com/xdrshjr/AragonTrading/tree/main/docs/diagnoses)：缺陷诊断档案（复现脚本、根因、验证证据）。
+- [docs/improve/](https://github.com/xdrshjr/AragonTrading/tree/main/docs/improve)：AI 自动交易能力诊断与改进路线。
+- [desktop/README.md](https://github.com/xdrshjr/AragonTrading/blob/main/desktop/README.md)：桌面端打包与发布验收。
+- [CLAUDE.md](https://github.com/xdrshjr/AragonTrading/blob/main/CLAUDE.md)：代码规范与提交前评审清单。
+- [.env.example](https://github.com/xdrshjr/AragonTrading/blob/main/.env.example)：全部配置项与能力总闸。
+
+## 引用须知
+
+- 回测与模拟结果均为历史样本统计，**不构成投资建议，不承诺真实收益**。
+- 引用本项目时请注明仓库地址 <https://github.com/xdrshjr/AragonTrading>。
+- 免责声明全文见 README「免责声明」一节。
