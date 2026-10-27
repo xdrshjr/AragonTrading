@@ -49,6 +49,10 @@ async def health() -> dict:
         # 加法键（okx-link-resilience §4.3）：本端点**未声明** `response_model`，故新键不会被静默
         # 剔除。只带摘要两项，详情走 `/api/okx/connectivity`——顶栏 15s 轮询不该顺带拖一份全量快照。
         "link": _link_summary(),
+        # 加法键（ai-trade-audit-journal §2.6.1）：交易日志管理台的总闸。前端据它决定要不要渲染
+        # 左侧导航第 4 项，**并在它为 false 时把持久化下来的 `activeView="journal"` 拉回默认视图**
+        # ——否则老用户重启后看到的是一屏什么都没有、也不说为什么的空白工作台。
+        "journalEnabled": settings.ai_trade_journal_ui_enabled,
     }
 
 

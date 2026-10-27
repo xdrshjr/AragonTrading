@@ -9,6 +9,7 @@ import ChartWorkspace from "@/components/Chart/ChartWorkspace";
 import WindowControls from "@/components/Desktop/WindowControls";
 import DiscoveryLab from "@/components/Discovery/DiscoveryLab";
 import FactorLab from "@/components/Factor/FactorLab";
+import JournalView from "@/components/Journal/JournalView";
 import NavRail from "@/components/Nav/NavRail";
 import RightPanel from "@/components/RightPanel/RightPanel";
 import SettingsPanel from "@/components/Settings/SettingsPanel";
@@ -145,6 +146,8 @@ export default function Page() {
   const [hasOpenedFactor, setHasOpenedFactor] = useState(false);
   // 策略与因子挖掘同款惰性挂载：从未打开者不触发任何挖掘查询（DoD #13：未启动时 0 额外请求）。
   const [hasOpenedDiscovery, setHasOpenedDiscovery] = useState(false);
+  // 交易日志同款惰性挂载：从未打开者对既有请求路径零额外开销。
+  const [hasOpenedJournal, setHasOpenedJournal] = useState(false);
   const loadingMore = useRef(false);
   const lastMarketTsRef = useRef<number | null>(null);
   // 右侧面板调宽：以 <main> 右边缘为锚，宽度 = 右边缘 − 指针 X（store 负责夹取 [320,640]）。
@@ -157,6 +160,9 @@ export default function Page() {
 
   const queryClient = useQueryClient();
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, refetchInterval: 15_000 });
+  // 交易日志的总闸（ai-trade-audit-journal §2.6.1 / 评审 RP1-7）。`undefined` = health 还没回来
+  // 或老后端，按「开着」处理（NavRail 只对显式 `false` 才隐藏那一项）。
+  const journalEnabled = health.data?.journalEnabled;
   const okxUp = health.data ? health.data.okx === "up" : null;
   const latencyMs = health.data?.okxLatencyMs ?? null;
   const lastOkTs = health.data?.lastOkTs ?? null;
@@ -536,7 +542,21 @@ export default function Page() {
   useEffect(() => {
     if (activeView === "factor") setHasOpenedFactor(true);
     if (activeView === "discovery") setHasOpenedDiscovery(true);
+    if (activeView === "journal") setHasOpenedJournal(true);
   }, [activeView]);
+
+  // 门控关闭时，把**持久化下来**的 activeView 拉回默认视图（评审 RP1-7）。
+  //
+  // 落点必须是这里——拿到 health 回执的那一处，**不是** store 的 migrate：migrate 跑在拿到
+  // health 之前，那时还不知道门控关没关。不修这一条，「用户上次停在交易日志 → 管理员把
+  // AI_TRADE_JOURNAL_UI_ENABLED 关掉 → 重启」这条完全现实的路径，会让老用户开屏看到一屏
+  // 什么都没有、也不说为什么的空白工作台（NavRail 不渲染该项 ⇒ 没有一个 tab 选中；
+  // page 不渲染该视图 ⇒ 主区为空）。
+  useEffect(() => {
+    if (journalEnabled === false && useAppStore.getState().activeView === "journal") {
+      useAppStore.getState().setActiveView("trade");
+    }
+  }, [journalEnabled]);
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -634,7 +654,7 @@ export default function Page() {
           （镜像 RightPanel 惯用法）；承载 hidden 的 wrapper 绝不带 display 工具类（评审 C-1/P0），grid 与
           mainRef 下沉内层 <main>；设置中心为「覆盖」——打开时仅给两 wrapper 追加 hidden，严禁卸载（C-2）。 */}
       <div className="flex min-h-0 flex-1">
-        <NavRail />
+        <NavRail journalEnabled={journalEnabled} />
         <div className="flex min-h-0 flex-1 flex-col">
           <div className="min-h-0 flex-1" hidden={showSettings || activeView !== "trade"}>
             <main
@@ -704,6 +724,12 @@ export default function Page() {
           {hasOpenedDiscovery && (
             <div className="min-h-0 flex-1" hidden={showSettings || activeView !== "discovery"}>
               <DiscoveryLab active={activeView === "discovery" && !showSettings} />
+            </div>
+          )}
+
+          {hasOpenedJournal && (
+            <div className="min-h-0 flex-1" hidden={showSettings || activeView !== "journal"}>
+              <JournalView active={activeView === "journal" && !showSettings} />
             </div>
           )}
 

@@ -37,6 +37,7 @@ const LAYER_LABEL: Record<string, string> = {
   consensus: "同向共识门槛",
   confidence: "置信度门槛",
   edgeGate: "最小 edge 门禁",
+  evidenceGate: "实证准入", // evidence-gated-capital §3.5.5：排在 edgeGate 之后、reflection 之前
   reflection: "下单前二次反思",
   other: "其它",
 };

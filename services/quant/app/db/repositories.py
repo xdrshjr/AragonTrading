@@ -1189,3 +1189,27 @@ from .ai_intel_evidence_repositories import (  # noqa: E402,F401
     write_intel_quote_state,
     write_intel_quotes,
 )
+
+# ai_journal_repositories：AI 自动交易交易日志三张表的读写与流式分页
+# （ai-trade-audit-journal §3.1；同样是「不让 repositories.py 越 800 线」的处置）。
+# 同一条再导出纪律适用：漏一个是静默空转，不是 ImportError。
+from .ai_journal_repositories import (  # noqa: E402,F401
+    count_decision_rows,
+    decision_brief,
+    decision_full,
+    event_out,
+    get_decision_row,
+    get_prompt_profile,
+    journal_table_stats,
+    list_context_rows,
+    list_decision_rows,
+    list_event_rows,
+    list_journal_sessions,
+    list_run_trades,
+    load_profiles,
+    protected_group_ids,
+    prune_journal,
+    slice_boundary_ids,
+    trade_row,
+    write_journal_batch,
+)

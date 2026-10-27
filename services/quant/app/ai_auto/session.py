@@ -129,6 +129,8 @@ from .profit_guard_runtime import (
     SessionReadings,
     build_position_facts,
 )
+from .evidence_gate import EvidenceRule
+from .evidence_runtime import EvidenceRuntime, EvidenceSnapshot
 from .profit_lock import ProfitLockRule
 from .profit_lock_runtime import (ProfitLockRuntime, build_exit_snap, build_lock_facts,
                                   describe_lock_exit)
@@ -147,6 +149,18 @@ from .signals import (
     make_shadow_broker,
     resolve_consensus_gate,
 )
+from .journal import (
+    DeciderSnapshot,
+    EventJournalInput,
+    JournalScope,
+    RoundJournalInput,
+    build_decision_row,
+    build_event_row,
+    get_journal_writer,
+    capture_limits_of,
+)
+from .journal.records import build_gates
+from .shadow_ledger import fallback_cost_bps
 from .sizing_runtime import SizingRuntime
 from .stats_ext import build_consensus_stats
 from .track_record import TrackRecordRuntime
@@ -284,6 +298,8 @@ class AiTradeSession:
                  base_rule: MaBandRule | None = None,
                  profit_rule: ProfitGuardRule | None = None,
                  profit_lock_rule: ProfitLockRule | None = None,
+                 evidence_rule: EvidenceRule | None = None,
+                 evidence_snapshot: EvidenceSnapshot | None = None,
                  prior_snapshot: dict | None = None,
                  sizing: SizingRuntime | None = None,
                  horizon_rule: HorizonRule | None = None,
@@ -352,6 +368,10 @@ class AiTradeSession:
                 executor.settings, "ai_trade_peak_tracking_always", False)))
         # 收益锁（轴 B）：峰值读 `_guard.state`，故装配时上一行强制峰值追踪；None ⇒ 零动作。
         self._lock = ProfitLockRuntime(profit_lock_rule)
+        # 实证准入（evidence-gated-capital §3.7）：判据全在纯核心 + 运行时；None ⇒ 全部方法零动作。
+        self._evidence = EvidenceRuntime(
+            evidence_rule, evidence_snapshot, inst_id=inst_id, bar=bar, run_id=run_id,
+            group_id=None, fallback_cost_bps=fallback_cost_bps(executor.settings))
         self._atr_px: float | None = None     # 确认根 ATR（F1）；None ⇒ 回吐距离上下界不生效
         # 成本记账与最小 edge 门禁（§3.10）：状态 / 快照 / 计数全部下沉 `CostRuntime`（镜像 F0 把
         # 利润保护下沉 `ProfitGuardRuntime` 的同款范式），会话只留薄封装调用。
@@ -1235,6 +1255,7 @@ class AiTradeSession:
     async def start(self) -> None:
         """暖机（仅热指标 + 种入影子立场，不下任何真单）后订阅实时 WS 与 monitor 循环。"""
         await self._prime()
+        self._evidence.prime(self._window.candles)   # 接管未结束影子：只用已收盘根从头重算
         # 轨迹 W1：暖机不下单；冷续跑的成交台账在 start 之前已回灌 ⇒ 此刻的 trade_count 才是水位。
         self._trajectory.open_episode(self._trajectory_episode_facts())
         # 链路事件与断线补根的实体全在 okx/session_link.py（本文件只留绑定，见 spec §3.2 注）。
@@ -1336,6 +1357,7 @@ class AiTradeSession:
             time.time(), window_start_ts=self.started_ts,
             trades=self.executor.trades, push=self._push, final=True)
         await self._experience.flush()             # W-10：毫秒级本地 INSERT（物化与蒸馏都不在这条链上）
+        await self._persist_evidence_bounded()     # 证据写库有 2 s 上限：平仓安全路径绝不被它卡住
         await self._experience.persist_harvest_gap()   # ★ E-8：不落库那个数字在概览条上恒为 0
         # closed-loop 评审 P2-12：尚未落盘的引用行与认领槽**一并丢弃并计入 `dropped`**，
         # **不新增任何关停步骤**（`_shutdown_steps` 第 7 步已被用例冻结）。落在 `_finalize_run`
@@ -1617,6 +1639,7 @@ class AiTradeSession:
             position = self._state_position_snapshot()
         backstop = await self._pause_backstop(position)                          # ⑥
         await self._experience.flush()                 # W-10：暂停同样要保住收据（毫秒级本地 IO）
+        await self._persist_evidence_bounded()         # 桌面端退出走 quit-pause，暂停期不起决策轮
         await self._experience.persist_harvest_gap()   # ★ E-8：同上
         await self.snapshot_run_metrics(status="paused")                         # ⑦
         self._pause_result = {
@@ -2219,6 +2242,7 @@ class AiTradeSession:
                                 self.executor.settings.ai_trade_profit_guard_atr_period)
         self._wake.note_atr(self._atr_px)     # ATR 判据与参照断面共用这一个数（唯一入口）
         self._sizing.note_candles([c["c"] for c in self._window.candles], int(candle.ts))
+        self._evidence.on_bar(row)   # 暂停期同样推进：纯本地计算、不下单（与影子信号板同理）
         decision_as_of_ts = int(candle.ts) + BAR_SECONDS[self.bar]
         # §3.1.2 row 12b：这两处 REST 取数只服务决策轮，与 row 12 同一条理由 ⇒ paused 时跳过。
         # 不跳过的话，暂停期每根 K 线仍会照打两次 REST，row 12 省下的配额被这里原样烧掉。
@@ -2289,6 +2313,16 @@ class AiTradeSession:
             "reason": "horizon_locked",
             "minHoldRemainingSeconds": snapshot.get("minHoldRemainingSeconds"),
             "wakeKind": wake.get("kind")})
+        # 交易日志（评审 RP1-8）：被整轮跳过的轮次**没有决策行**。不写这条，运行期的实时轨迹上
+        # 看得见「这一轮被跳过了」，事后的审计台上却只有一段没有任何行的空白——而「为什么 14:30
+        # 没有决策」正是审计最常被问到的那个问题。`detail` 与上面那条 WS 事件**同一组键、同一个
+        # 数**，不给第二个真源。它是 info 级，故 `EVENT_MIN_LEVEL=warn` 时整体不采。
+        self._journal_event(EventJournalInput(
+            category="round", code="ROUND_SKIPPED", level="info",
+            message="本轮被整轮跳过（结构上不可能产生任何合法动作）", ts=int(ts),
+            detail={"roundNo": round_no, "reason": "horizon_locked",
+                    "minHoldRemainingSeconds": snapshot.get("minHoldRemainingSeconds"),
+                    "wakeKind": wake.get("kind")}))
         return True
 
     async def _run_decision_round(self, board: list[StrategySignalView], i: int,
@@ -2363,6 +2397,11 @@ class AiTradeSession:
             # `low_confidence` 轮此刻 action 已被 `_map_decision` 洗成 hold（实测占开仓意愿
             # 21%），只按 action 判会把每一轮（含纯观望轮）都计进去（评审 RP1-1）。
             self._trend.note_intent(decision.action, degrade, payload.get("trendVerdict"))
+            if self._evidence.armed:   # 影子意愿同样取第一阶段决策（任何门禁之前）
+                self._evidence.note_intent(
+                    decision, degrade, px=self._current_px(), atr_px=self._atr_px,
+                    cost_bps=self._cost.estimate_cost_only(decision, BAR_SECONDS[self.bar]),
+                    round_no=round_no)
             # 情报引用归因（closed-loop 轴 A/B）：**取 `stage1_decision`**（E-4，任何门禁之前的
             # 那一个）。取门禁后的会让「模型采信了情报却被冷却门禁拦下」变成「模型没采信情报」。
             # 编号表随注入快照一起来（热路径不查库，§3.0 第 1 条）。
@@ -2418,6 +2457,9 @@ class AiTradeSession:
             # 直通 ⇒ EV 不足的轮次自动省掉一次反思 LLM 调用，门禁本身就是省钱项。
             decision, degrade = await self._apply_edge_gate(round_no, ts, ref_px,
                                                             decision, degrade)
+            # ★ 实证准入（evidence-gated-capital §3.3.3）：edge 门禁后、反思前——被拦轮已是 hold，
+            # 反思对 hold 直通 ⇒ 每一轮影子都省掉一次反思 LLM 调用。
+            decision, degrade = self._apply_evidence_gate(decision, degrade)
             # 二次反思（ReAct 复核，仅交易意愿触发；只会更保守）——共识门禁后、真实执行前。
             # F2（hold-inertia-fix）：第三元 reflection_note 保真「提议了什么、为何被否决」。
             decision, degrade, reflection_note = await self._reflect_before_execute(
@@ -2438,7 +2480,12 @@ class AiTradeSession:
             # 与 `self._cost.note_estimate(...)` / `claim_estimate(...)` 的两步姿态逐字同构。
             # `alignment_of` 对 hold / close / 被拦轮恒返回 `neutral` ⇒ 本行自动空转。
             self._trend.note_alignment(alignment_of(decision.action, self._trend.verdict))
+            # 交易日志的成交水位（ai-trade-audit-journal §2.2.1 理由 3）：同步、无 await，
+            # 取在 `_execute_decision` **之前**。本轮此后新增的每一条腿——含 `_post_round` 里
+            # 利润保护平掉的那一笔——都要进决策行的执行断面。
+            fill_watermark = len(self.executor.trades)
             executed = await self._execute_decision(decision, ref_px, i, ts)
+            self._evidence.note_executed(executed, action=decision.action)
             # F-4 的另一半：「提议了平仓、也放行了，但挂单槽位没腾出来所以本轮什么都没平」此前
             # 是一条完全静默的路径（无成交、无降级码）。合成仍遵循「先执行者胜出」。
             degrade = degrade or executed.get("closeBlocked")
@@ -2513,6 +2560,7 @@ class AiTradeSession:
             # closed-loop §3.2.1：引用行落库排在**决策事件推送之后**——决策卡是用户最在意的那个
             # 延迟，一次本地 INSERT 虽是毫秒级，但排在推送之后最坏也只让统计晚一瞬间。
             await self._intel_cite.persist_pending()
+            await self._evidence.persist_pending(group_id=self.group_id)
             self._discipline.note_round(degrade)   # 轴 B/C：闸计数 + 开仓漏斗的首拦截层归类
             if degrade:
                 await self._emit_degraded(ts, degrade)
@@ -2522,8 +2570,21 @@ class AiTradeSession:
                 await self._emit_summary(round_no, ts, summary)
             await maybe_emit_summary_failed(self._push, self._round_trace,        # D-6
                                             self.decider.summary_health_wire(), round_no, ts)
+            # `_post_round` 之后新增的腿一律标 `source="post_round"`：它是
+            # `_maybe_profit_exit` 在决策轮内平掉的那一笔，**不在** `executed` 里。
+            post_round_offset = len(self.executor.trades) - fill_watermark
             await self._post_round(ref_px, ts)
             self._trajectory.end_round(summary_installed=summary is not None)   # 轨迹 W3b
+            # ★ 交易日志的**唯一**决策行写点（§2.2.1）：必须排在 `commit_round`（收门禁后的最终
+            # decision）、`_emit_decision`（`_last_decision` 在那里赋值）与 `_post_round`
+            # （它自己还会再产生一笔成交）**三者之后**。同步、零 await、绝不抛。
+            self._journal_round(RoundJournalInput(
+                round_no=round_no, ts=ts, wake=wake, payload=payload,
+                decision=decision, stage1_decision=stage1_decision, executed=executed,
+                degrade=degrade, gate_degrade=gate_degrade, llm_degrade=llm_degrade,
+                reflection_verdict=reflection_verdict, reflection_reason=reflection_reason,
+                round_fills=tuple(self.executor.trades[fill_watermark:]),
+                post_round_offset=post_round_offset))
         except asyncio.CancelledError:
             final_reason = "canceled_before_send"
             raise
@@ -2533,6 +2594,13 @@ class AiTradeSession:
             await self._emit_error_trace(round_no, ts, "本轮决策异常，已跳过")
             await self._push({"type": "error", "data": {
                 "ts": ts, "code": "AI_TRADE_ROUND_FAILED", "message": "本轮决策异常，已跳过"}})
+            # 异常行的写点（§2.2.1）。**刻意不在这里写决策行**：失败可能发生在 `payload` 尚未
+            # 绑定之前，一个字段半空的决策行比一条明确的错误事件更坏。也**刻意不在上面那条
+            # `except asyncio.CancelledError` 里写任何东西**——一次用户暂停不是一条审计事实。
+            self._journal_event(EventJournalInput(
+                category="round", code="AI_TRADE_ROUND_FAILED", level="error",
+                message="本轮决策异常，已跳过", ts=ts,
+                detail={"round": round_no, "ts": ts, "error": str(exc)}))
         finally:
             self._trajectory.release_round(round_no)   # 轨迹 W5：只处理仍未关闭的作用域
             self._deciding = False
@@ -2949,6 +3017,149 @@ class AiTradeSession:
         if trace is None:
             return None, None
         return trace.get("reflectionVerdict"), trace.get("reflectionReason")
+
+    # ---------- 交易日志（ai-trade-audit-journal §2.2）----------
+    # 本段的**全部**设计目标是「审计需求绝不碰坏真实资金的交易」：两个写点都是同步的
+    # （`def` 而不是 `async def`），函数体整体裹在一个 `try/except Exception` 里，且
+    # `CancelledError` 不在 `Exception` 之下——取消语义逐字不变。判定表达式一个字都不引用它们。
+
+    @staticmethod
+    def _journal_reading(values: dict) -> dict:
+        """把一层的读数收成「只留算得出来的那几个键」——**缺即省略，绝不补 0**。
+
+        全空即返回空 dict，调用方据此让该层整键缺席（前端渲染成「—」而不是一排 0）。
+        """
+        return {key: value for key, value in values.items() if value is not None}
+
+    def _journal_scope(self) -> JournalScope:
+        """本会话的日志身份与采集档（薄取数，不做任何判定）。"""
+        return JournalScope(group_id=self.group_id, run_id=self.run_id, inst_id=self.inst_id,
+                            bar=self.bar,
+                            limits=capture_limits_of(self.executor.settings))
+
+    def _journal_decider_snapshot(self) -> DeciderSnapshot:
+        """决策器在本轮结束那一刻的只读断面（全部取自它的只读出口，**一处都不重算**）。"""
+        decider = self.decider
+        shape = decider.last_request_shape
+        reasoning = decider.last_reasoning
+        return DeciderSnapshot(
+            analysis=decider.last_analysis,
+            reflection=decider.last_reflection_analysis,
+            thinking=(self._round_trace or {}).get("thinking") or "",
+            profile=decider.prompt_profile(),
+            request_shape=shape,
+            context_turn=decider.last_context_turn,
+            usage=decider.last_usage,
+            reasoning=reasoning.wire() if reasoning is not None else None,
+            latency_ms=self._reasoning_elapsed_ms,
+            # 首次尝试即 `attempt == 1`，故重试次数是它减一（缺席按 0，绝不猜）。
+            retries=max(0, int((shape or {}).get("attempt") or 1) - 1),
+            depth=decider.depth_name)
+
+    def _journal_gates(self, degrade: str | None) -> dict:
+        """13 层门禁的三态断面（**装配点唯一**；层集与层名的真源在 `open_funnel`）。
+
+        本方法只做取数：把各层 runtime **已有的**只读断面读成 `{层 key: armed}` 与
+        `{层 key: readings}`，形状装配交给纯函数 `journal.records.build_gates`。
+        每一处取数都是 `getattr` 兜底 —— **取不到就是 `None`（未知），不是 `False`（未装配）**：
+        把「问不出来」渲染成「没装」，就是用一个看起来确定的说法盖住一个不确定的事实。
+        """
+        settings = self.executor.settings
+        armed = {
+            "baseRuleMaBand": self.base_rule is not None,
+            "orphanPosition": bool(getattr(settings, "ai_trade_orphan_detect_enabled", None)),
+            "horizon": self.horizon_rule is not None,
+            "profitCooldown": self.profit_rule is not None,
+            # 换手与兜底两层都挂在 HorizonRuntime 上：前者随持仓周期规则装配，后者要有 backstop。
+            "turnover": self.horizon_rule is not None,
+            "exchangeBackstop": getattr(self._horizon, "backstop", None) is not None,
+            "drawdownBrake": getattr(self._sizing, "brake_rule", None) is not None,
+            "trendBias": self._trend_rule is not None,
+            "consensus": self._consensus_rule is not None,
+            # 置信度门槛在决策器的 `_map_decision` 里，恒装配（阈值可为 0 但那是一个读数不是装配态）。
+            "confidence": True,
+            "edgeGate": float(getattr(settings, "ai_trade_edge_k_min", 0) or 0) > 0,
+            "reflection": bool(getattr(self.decider, "reflection_enabled", None)),
+            # 末位 `other` 承接未知前缀（`classify_block` 的兜底），它没有「装不装」这回事。
+            "other": True,
+        }
+        # ⚠️ 键名必须逐字取自 `trace.new_round_trace` 的**实际**键集。这里写错一个名字不会报错，
+        # 只会让那一层的读数在详情页上恒为空——「有写点没读点」正是本仓库反复付过代价的形状。
+        trace = self._round_trace or {}
+        readings = {
+            "baseRuleMaBand": self._journal_reading({"status": trace.get("baseRuleStatus"),
+                                        "zone": trace.get("baseRuleZone"),
+                                        "pctB": trace.get("baseRulePctB"),
+                                        "reason": trace.get("baseRuleReason")}),
+            "horizon": self._journal_reading({"status": trace.get("horizonStatus"),
+                                 "reason": trace.get("horizonReason"),
+                                 "wire": trace.get("horizonWire")}),
+            "drawdownBrake": self._journal_reading({"level": trace.get("brakeLevel"),
+                                       "reason": trace.get("brakeReason"),
+                                       "drawdownPct": trace.get("drawdownPct"),
+                                       "lossStreak": trace.get("lossStreak")}),
+            "trendBias": trace.get("trendGate") or self._trend_gate_wire,
+            "consensus": trace.get("consensus"),
+            "edgeGate": self._journal_reading({"status": trace.get("edgeGateStatus"),
+                                  "edgeBps": trace.get("edgeBps"),
+                                  "costBps": trace.get("edgeCostBps"),
+                                  "reason": trace.get("edgeGateReason"),
+                                  "source": trace.get("edgeSource")}),
+            "reflection": self._journal_reading({"verdict": trace.get("reflectionVerdict"),
+                                    "reason": trace.get("reflectionReason"),
+                                    "adjustedSize": trace.get("reflectionAdjustedSize")}),
+        }
+        return build_gates(armed, {k: v for k, v in readings.items() if v}, degrade)
+
+    def _journal_round(self, inp: RoundJournalInput) -> None:
+        """把本轮决策同步入队（**零 await、绝不抛**，ai-trade-audit-journal §2.2.1）。
+
+        两条约束同等硬，且都可被 AST 用例证伪：
+
+        - **零 await**：决策轮跑在会话的取消域里，任何新的 await 点都是一个新的
+          `CancelledError` 落点，而本仓库已经为「关停链上多一个 await 就泄一条野连接」付过代价。
+        - **整体 try/except**：`json.dumps` 跑在这里（§2.2.2 约束 1 要求入队即已序列化），
+          一次 `TypeError: Object of type X is not JSON serializable` 会把一轮**已经成功成交**
+          的决策整个翻成 `AI_TRADE_ROUND_FAILED`——审计需求恰好害了它声称绝不碰的东西。
+          `asyncio.CancelledError` 不在 `Exception` 之下，故取消语义逐字不变。
+
+        Args:
+            inp: 决策轮的冻结聚合入参（只承载引用；裁剪与序列化在 `build_decision_row` 一处做）。
+        """
+        try:
+            writer = get_journal_writer()
+            if not writer.enabled:
+                return
+            inp = replace(inp, payload=self.decider.frozen_round_payload(
+                inp.payload))
+            # 门禁链取 `gate_degrade`（**执行之前**的那一个），不是合成后的 `degrade`。
+            # 理由是 directional-symmetry B-2 已经成文过的那一条：往下一行 `degrade` 就会被
+            # `degrade or executed.get("closeBlocked")` 污染，而 `exit_order_slot_busy` 不在任何
+            # 前缀里、会经 `classify_block` 落进 `"other"` ⇒ 门禁链上会出现一条**凭空捏造**的
+            # 「本轮被『其它』层拦下了」。挂单槽位被占用不是一道门禁，它的落点在第 6 段
+            # 「执行与结果」的 `closeBlocked` 上。`degrade_reason` 那一列仍存合成值（用户看到的
+            # 「本轮降级原因」就该是它），两者各说各的、互不冒充。
+            writer.note_decision(build_decision_row(
+                self._journal_scope(), inp, self._journal_decider_snapshot(),
+                self._journal_gates(inp.gate_degrade)))
+        except Exception as exc:  # noqa: BLE001 —— 见 docstring：绝不重抛，只记一个数
+            get_journal_writer().note_serialize_error()
+            logger.warning("ai-trade journal round skipped: %s", exc)
+
+    def _journal_event(self, ev: EventJournalInput) -> None:
+        """把一条事件同步入队（约束与 `_journal_round` 逐字相同：零 await、绝不抛）。
+
+        入参是冻结聚合对象而不是四五个位置形参——`CLAUDE.md` §二的「禁止靠位置堆参数」
+        与 `RoundJournalInput` 是同一条纪律，两个写点没有理由用两种姿态。
+        """
+        try:
+            writer = get_journal_writer()
+            if not writer.enabled:
+                return
+            writer.note_event(build_event_row(self._journal_scope(), ev))
+        except Exception as exc:  # noqa: BLE001 —— 同上
+            get_journal_writer().note_serialize_error()
+            logger.warning("ai-trade journal event skipped: %s", exc)
 
     def _make_trace_emit(self, round_no: int, ts: int) -> TraceEmit:
         """返回注入 decider 的 emit 闭包：补 round/ts、原地累积 thinking/analysis/reflection、扇出 agent_trace。"""
@@ -3526,6 +3737,22 @@ class AiTradeSession:
             apply_sizing_trace(self._round_trace, wire)
             await self._push(sizing_event(round_no, ts, wire))
         return decision
+
+    def _apply_evidence_gate(self, decision: TradeDecision,
+                             degrade: str | None) -> tuple[TradeDecision, str | None]:
+        """薄封装 `EvidenceRuntime.gate`：反手按投影立场降级为 close（评审 P0-2）。"""
+        decision, degrade, wire = self._evidence.gate(
+            decision, degrade, position_side=self.executor.projected)
+        if wire is not None and self._round_trace is not None:
+            self._round_trace["evidenceGate"] = wire
+        return decision, degrade
+
+    async def _persist_evidence_bounded(self) -> None:
+        """停止 / 暂停路径上的证据写库：2 s 上限，超时吞掉（丢了也能在接管时从头重算自愈）。"""
+        try:
+            await asyncio.wait_for(self._evidence.persist_pending(group_id=self.group_id), 2.0)
+        except asyncio.TimeoutError:
+            logger.warning("ai-trade evidence persist timed out on stop/pause (%s)", self.inst_id)
 
     def _apply_trend_bias_gate(self, decision: TradeDecision,
                                degrade: str | None) -> tuple[TradeDecision, str | None]:
@@ -4389,6 +4616,8 @@ class AiTradeSession:
                 "profitGuardCooldown": build_cooldown_view(self._guard.cooldown,
                                                            now_wall=time.time()),
                 **({"profitLock": self._lock.status_wire()} if self._lock.rule else {}),
+                # 实证准入：未装配 ⇒ 整键缺席；装配 ⇒ 每次都带（整体浅合并，只在变化时带会留旧值）。
+                **({"evidence": self._evidence.status_wire()} if self._evidence.armed else {}),
                 # 持仓周期快照（§4.4）：供面板 chip 在无决策事件时也能更新倒计时；未装配 ⇒ None。
                 "horizon": self._horizon.last_snapshot,
                 # ★ 轴 D：活性断面**两条通路都要下发**——REST 成员行取 `info()`、WS `status` 取本

@@ -562,6 +562,15 @@ describe("describeDegradeReason", () => {
     );
   });
 
+  it("实证准入两码 → 中文说明，参数后缀（含 reverse→close）原样保留", () => {
+    expect(describeDegradeReason("evidence_unproven(n=7/10)")).toBe(
+      "该方向尚未被实证（样本不足或区间跨零），本轮只记影子、不下单(n=7/10)",
+    );
+    expect(describeDegradeReason("evidence_disproven(ucb=-1.1,reverse→close)")).toBe(
+      "该方向已被实证为亏损，本轮只记影子、不下单(ucb=-1.1,reverse→close)",
+    );
+  });
+
   it("未命中一律原样回退（decision_timeout 展示逐字不变，P1-9）", () => {
     expect(describeDegradeReason("decision_timeout")).toBe("decision_timeout");
     expect(describeDegradeReason(null)).toBe("");

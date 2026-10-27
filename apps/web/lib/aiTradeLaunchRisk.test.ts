@@ -38,6 +38,7 @@ const CLEAN: AiTradeLaunchRiskInput = {
   experienceEnabled: true,
   wakeFloorDivisor: 0,
   targetHoldMinSeconds: 14400,
+  evidencePolicy: "strict",
 };
 
 function ids(over: Partial<AiTradeLaunchRiskInput>): string[] {
@@ -185,6 +186,33 @@ describe("U-3 / U-4 十条风险的触发与不触发断面", () => {
     expect(risk.detail).not.toContain("**");
   });
 
+  it("evidence*：observe ⇒ evidenceObserveOnly（warn）；balanced ⇒ evidenceBalanced（info）", () => {
+    const [observe] = collectRisks({ ...CLEAN, evidencePolicy: "observe" });
+    expect(observe.id).toBe("evidenceObserveOnly");
+    expect(observe.tone).toBe("warn");
+    expect(observe.steps).toEqual(["guards"]);
+    expect(`${observe.title}：${observe.detail}`).toBe(
+      "实证准入为「仅观察」：系统不会因为缺乏证据而停止下单。2026-09 的 281 次开仓意愿，" +
+        "在 4–8 小时持有尺度上方向收益为负（−4.6 ~ −23.6 bps）。",
+    );
+    const [balanced] = collectRisks({ ...CLEAN, evidencePolicy: "balanced" });
+    expect(balanced.id).toBe("evidenceBalanced");
+    expect(balanced.tone).toBe("info");
+    expect(balanced.steps).toEqual(["guards"]);
+    expect(`${balanced.title}：${balanced.detail}`).toBe(
+      "实证准入为「均衡」：证据不足的方向照常下单，只有被证明亏钱的方向会停下。" +
+        "在严格档的回放里，这一档少挡掉了大部分亏损。",
+    );
+  });
+
+  it("evidence*：strict（推荐档）与未装配（回测 / 缺省）都不产生风险项", () => {
+    const evidenceIds = ["evidenceObserveOnly", "evidenceBalanced"];
+    for (const evidencePolicy of ["strict", null, undefined] as const) {
+      const got = ids({ evidencePolicy });
+      for (const id of evidenceIds) expect(got).not.toContain(id);
+    }
+  });
+
   it("U-4：`collectRisks()` 只会产出注册表里的 id（清单外的一条都不许有）", () => {
     const everything = collectRisks({
       mode: "live",
@@ -206,11 +234,15 @@ describe("U-3 / U-4 十条风险的触发与不触发断面", () => {
       experienceEnabled: false,
       wakeFloorDivisor: 24,
       targetHoldMinSeconds: 14400,
+      evidencePolicy: "observe",
     });
-    const produced = everything.map((r) => r.id);
+    // 两条实证准入风险互斥（一次只能选一个档），故「全开断面」要并上 balanced 档那一条。
+    const balanced = collectRisks({ ...CLEAN, evidencePolicy: "balanced" });
+    const produced = [...everything, ...balanced].map((r) => r.id);
     expect(new Set(produced).size).toBe(produced.length);   // 不重复
     for (const id of produced) expect(AI_TRADE_LAUNCH_RISK_IDS).toContain(id);
-    // 全开断面下十条应当全部到齐——注册表少一条就说明有一条永远进不了第 6 步。
+    // 全开断面下十三条应当全部到齐——注册表少一条就说明有一条永远进不了第 6 步。
+    expect(AI_TRADE_LAUNCH_RISK_IDS).toHaveLength(13);
     expect([...produced].sort()).toEqual([...AI_TRADE_LAUNCH_RISK_IDS].sort());
   });
 
@@ -228,7 +260,10 @@ describe("U-3 / U-4 十条风险的触发与不触发断面", () => {
       wakeMinutes: 2,
       experienceEnabled: false,
       wakeFloorDivisor: 24,
-    });
+    }).concat(
+      collectRisks({ ...CLEAN, evidencePolicy: "observe" }),
+      collectRisks({ ...CLEAN, evidencePolicy: "balanced" }),
+    );
     for (const risk of all) {
       expect(risk.title.trim().length).toBeGreaterThan(0);
       expect(risk.detail.trim().length).toBeGreaterThan(0);

@@ -491,6 +491,7 @@ def test_group_status_carries_the_mode_through_the_same_wire():
         total_budget_usd=100.0, leverage=3.0, context_refresh_rounds=50, wake_interval_s=0,
         base_rule=None, profit_rule=None, horizon_rule=rule, created_ts=0, members=[],
         profit_lock_rule=None,   # 收益锁回执（profit-lock B-6）：`group_status()` 现在也回显它
+        evidence_rule=None,   # 实证准入回执（evidence-gated-capital §5.1）：同上
         # 纪律预设三键（discipline-preset 轴 A）：`group_status()` 现在也回显它们。
         discipline_preset="off", discipline_adjustments=[], discipline_thresholds={})
     assert manager.group_status()["tradingHorizon"]["backstopRepair"] == "arm"

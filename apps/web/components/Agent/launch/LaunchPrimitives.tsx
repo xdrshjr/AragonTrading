@@ -141,18 +141,30 @@ export function Field({
  * 与第 6 步风险清单里的那一份是同一条风险的两个渲染点：用户在产地那一步就该看见它，而最后一屏
  * 再无条件复述一次——「藏起来的警示等于消失的警示」。
  */
+export type RiskTone = "info" | "warn" | "danger";
+
+/**
+ * 风险条目的文字色与形状符号（第 5 步就地条目与第 6 步清单共用一份，免得两处各写一套）。
+ * `info` 是「用户选了非推荐档」的说明性回执，用墨色而非警示色——它不是警告。
+ */
+export function riskToneStyle(tone: RiskTone): { color: string; glyph: string } {
+  if (tone === "danger") return { color: "var(--short-ink)", glyph: "⚠ " };
+  if (tone === "info") return { color: "var(--accent-ink)", glyph: "ⓘ " };
+  return { color: "var(--warn)", glyph: "△ " };
+}
+
 export function InlineRiskNote({
   tone,
   title,
   detail,
   testId,
 }: {
-  tone: "warn" | "danger";
+  tone: RiskTone;
   title: string;
   detail: string;
   testId?: string;
 }) {
-  const color = tone === "danger" ? "var(--short-ink)" : "var(--warn)";
+  const { color, glyph } = riskToneStyle(tone);
   return (
     <p
       data-testid={testId}
@@ -160,7 +172,7 @@ export function InlineRiskNote({
       className="rounded border bg-[var(--surface-2)] px-2 py-1 text-[10px] leading-relaxed"
       style={{ color, borderColor: color }}
     >
-      <span className="font-medium">{tone === "danger" ? "⚠ " : "△ "}</span>
+      <span className="font-medium">{glyph}</span>
       {title}
       {detail ? `：${detail}` : ""}
     </p>

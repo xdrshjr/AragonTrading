@@ -175,6 +175,7 @@ export default function AiTradeToggle() {
         baseRules: opts.baseRules,               // 【基础策略】铁律（透传；取消勾选即 enabled:false）
         profitGuard: opts.profitGuard,           // 利润保护层（透传；取消勾选即 enabled:false）
         profitLock: opts.profitLock,             // 收益锁（透传；取消勾选即 enabled:false）
+        evidenceGate: opts.evidenceGate,         // 实证准入（透传；仅实盘，回测体刻意不加）
         tradingHorizon: opts.tradingHorizon,     // 交易周期模式（同上；缺省=服务端默认开启）
         discipline: opts.discipline,             // 交易纪律预设（同上；缺省=服务端默认 balanced）
         experience: opts.experience,             // 经验模式（同上；取消勾选即 enabled:false）

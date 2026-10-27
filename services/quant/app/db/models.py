@@ -1238,3 +1238,134 @@ class AiIntelQuote(Base):
     # 「原文有句劝告」变成「这条情报没有证据」，两件事差得太远）。
     has_imperative: Mapped[bool] = mapped_column(Boolean, default=False)
     verified_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiTradeDecisionLog(Base):
+    """AI 自动交易的一轮决策留痕（append-only；本表是交易日志特性的唯一真源）。
+
+    为什么是新表而不是给 ``strategy_runs.metrics_json`` 塞更多东西：``metrics_json`` 只在会话
+    **终结时**写一次（``session.py`` 的 ``_build_run_metrics``），进程崩了就什么都没有；而且它是
+    一个 TEXT 列，没法按轮次分页、按标的过滤、按时间剪枝。
+
+    为什么新表 = 零迁移：``create_all`` **会**建缺失的表、**不会**给既有表补列（见
+    ``db/session.py`` 的五个 ``_ensure_*_columns`` 补丁）。老库首次启动即获得本表，
+    不可能 ``no such column``。
+
+    **没有 ``outcome_json`` 列，这是有意的**：往返结果的真源是 ``trades``（平仓腿的 ``pnl`` 与
+    ``explain_json.meta`` 里 ``trip_ledger`` 已写好的 ``realizedBps`` / ``rMultiple`` /
+    ``exitSource``）。再存一份副本就会产生「两份真值、其中一份悄悄过期」——本仓库反复付过代价的
+    那种形状。结果一律由 ``ai_auto/journal/linking.py`` 在读时关联并如实给出 ``linkConfidence``。
+    """
+
+    __tablename__ = "ai_trade_decision_logs"
+    __table_args__ = (
+        Index("ix_ai_journal_dec_group_id", "group_id", "id"),
+        # 上下文链重建按 `(run_id, round_no)` 范围取前驱行（§2.2.4bis ④），正好走这条索引。
+        Index("ix_ai_journal_dec_run_round", "run_id", "round_no"),
+        Index("ix_ai_journal_dec_ts", "ts"),
+        Index("ix_ai_journal_dec_clordid", "cl_ord_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1)   # wire / 格式演进锚点
+    group_id: Mapped[str] = mapped_column(String(48), index=True, default="")
+    run_id: Mapped[int] = mapped_column(Integer, index=True, default=0)   # 无外键（本库不开 FK）
+    inst_id: Mapped[str] = mapped_column(String(32), default="")
+    bar: Mapped[str] = mapped_column(String(8), default="")
+    round_no: Mapped[int] = mapped_column(Integer, default=0)
+    ts: Mapped[int] = mapped_column(Integer, default=0)       # 判定时刻（秒 UTC，可能是 bar 开盘秒）
+    wall_ts: Mapped[int] = mapped_column(Integer, default=0)  # 墙钟秒（双时钟必须两个都留）
+    trigger: Mapped[str] = mapped_column(String(16), default="")   # candle|interval|monitor|…
+    # ---- 结论 ----
+    action: Mapped[str] = mapped_column(String(20), default="")        # 模型说的
+    final_action: Mapped[str] = mapped_column(String(20), default="")  # 门禁后真正执行的
+    size_fraction: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ord_type: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    limit_px: Mapped[float | None] = mapped_column(Float, nullable=True)
+    degrade_reason: Mapped[str | None] = mapped_column(String(48), nullable=True)
+    reflection_verdict: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    reason: Mapped[str] = mapped_column(String(512), default="")   # 不再受 trades.reason 的 128 截断
+    # ---- 执行 ----
+    executed: Mapped[bool] = mapped_column(Boolean, default=False)
+    cl_ord_id: Mapped[str] = mapped_column(String(32), default="")
+    ord_id: Mapped[str] = mapped_column(String(64), default="")
+    fill_ref_json: Mapped[str | None] = mapped_column(Text, nullable=True)  # 价/量/费/盈亏/持仓后
+    # ---- 上下文与模型输出（受采集档控制，可为 NULL）----
+    profile_sha256: Mapped[str] = mapped_column(String(64), default="")
+    # 取自 `decider.last_request_shape.finalUserSha256`——**真正送出去的**那条 user 文本的 sha
+    # （含重试后缀 / 追问后缀），**不是**写点按 payload 重算的那一条。重算永远看不见
+    # `decider._attempt_decision` 追加的后缀，于是「存档 sha == 重建 sha」与「样本是假的」
+    # 会同时成立（评审 RP0-1）。
+    prompt_sha256: Mapped[str] = mapped_column(String(64), default="")
+    payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    payload_truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    prompt_text: Mapped[str | None] = mapped_column(Text, nullable=True)   # 仅 full 档（含后缀原文）
+    output_json: Mapped[str | None] = mapped_column(Text, nullable=True)   # 模型**原始**工具入参
+    # ---- 上下文链（§2.2.4bis）。总闸 CONTEXT_CHAIN_ENABLED 关 ⇒ 两列恒 NULL ----
+    # `context_ref_json`：{"contextTurns","contextFirstRound","summarySha256","finalUserSha256",
+    #                      "attempt","hintApplied","extraInstruction"}
+    context_ref_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # `context_turn_json`：{"assistant": <门禁**后**的 decision_input>, "toolResult": <原串>}
+    # **必须与 `output_json` 分开存**：进上下文的是门禁后的最终 decision（`commit_round` 的
+    # docstring 明写如此），而训练目标要的是模型原始入参；也不能复用 `fill_ref_json`——那一列
+    # 按采集档裁剪过，而 tool_result 是未裁剪的原串。
+    context_turn_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    analysis_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reflection_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    thinking_text: Mapped[str | None] = mapped_column(Text, nullable=True)   # 仅 full 档
+    gates_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    telemetry_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    capture_tier: Mapped[str] = mapped_column(String(10), default="standard")
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiTradeEventLog(Base):
+    """AI 自动交易的生命周期 / 风控 / 故障事件行（append-only）。
+
+    ``code`` 是**稳定契约**：它会进导出文件、会被离线脚本按值分支。改名等同破坏性变更，必须在
+    spec §2.2.6 的事件码表与 `apps/web/lib/journal.ts` 的中文化表里同步登记。
+
+    刻意不写的两类：① 逐笔下单 / 撤单回执——``live_order_audit`` 已是它的真源；
+    ② 每轮的门禁判定——它已经在决策行的 ``gates_json`` 里，再发一条事件就是同一事实的第二份记录。
+    """
+
+    __tablename__ = "ai_trade_event_logs"
+    __table_args__ = (
+        Index("ix_ai_journal_evt_group_id", "group_id", "id"),
+        Index("ix_ai_journal_evt_ts", "ts"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    group_id: Mapped[str] = mapped_column(String(48), default="", index=True)
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    inst_id: Mapped[str] = mapped_column(String(32), default="")
+    ts: Mapped[int] = mapped_column(Integer, default=0)
+    wall_ts: Mapped[int] = mapped_column(Integer, default=0)
+    level: Mapped[str] = mapped_column(String(8), default="info")    # info|warn|error
+    category: Mapped[str] = mapped_column(String(16), default="")    # lifecycle|decision|round|…
+    code: Mapped[str] = mapped_column(String(48), default="")        # 稳定机器码
+    message: Mapped[str] = mapped_column(String(512), default="")
+    detail_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class AiTradePromptProfile(Base):
+    """内容寻址的大文本档案（写一次、按 sha 复用）。
+
+    ``kind`` 有两个取值：``profile``（系统提示词 + 决策工具 schema）与 ``summary``（滚动摘要
+    种子原文）。摘要种子也必须留档，否则上下文链的第一条消息重建不出来（评审 RP0-1）。
+    **刻意不为它再建一张表**——两者的形状完全一致（一段大文本 + 一个内容 sha），而多一张表就
+    多一处剪枝、多一处统计、多一处关停考量。
+    """
+
+    __tablename__ = "ai_trade_prompt_profiles"
+
+    sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(12), default="profile")   # profile | summary
+    system_prompt: Mapped[str] = mapped_column(Text, default="")   # kind=summary 时放摘要种子原文
+    tools_json: Mapped[str] = mapped_column(Text, default="[]")    # kind=summary 时恒 "[]"
+    provider: Mapped[str] = mapped_column(String(24), default="")
+    model: Mapped[str] = mapped_column(String(64), default="")
+    first_group_id: Mapped[str] = mapped_column(String(48), default="")
+    created_ts: Mapped[int] = mapped_column(Integer, default=0)

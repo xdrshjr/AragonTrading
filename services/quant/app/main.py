@@ -19,12 +19,14 @@ from .agent.manager import get_agent_manager
 from .ai_auto import get_ai_trade_manager
 from .ai_auto.backtest_manager import get_ai_backtest_manager
 from .ai_auto.experience import scheduler as experience_scheduler
+from .ai_auto.journal.runtime import start_journal_writer, stop_journal_writer
 from .api import (
     accounts,
     agent,
     agent_trading,
     ai_auto,
     ai_intel,
+    ai_trade_journal,
     ai_trade_lifecycle,
     ai_trade_trajectory,
     app_settings,
@@ -100,7 +102,11 @@ async def lifespan(app: FastAPI):
     link_sweeper = asyncio.create_task(_okx_link_sweeper())   # 私有连接池清扫 + 服务器时钟对齐
     # ★ E-5：消费上一次进程留下的脏标志（关软件走 pause，去抖窗口内那一笔否则永远不进图）。
     catchup = asyncio.create_task(experience_scheduler.catch_up(get_settings()))
-    background = (sweeper, resumer, link_sweeper, catchup)
+    # 交易日志（ai-trade-audit-journal §3.2）：**装配点唯一**就在这里。总闸关 ⇒ `start()` 自身
+    # 直接返回（不建 task、不建队列、零内存占用），决策轮的行为与本特性合入前逐字节相同。
+    start_journal_writer()
+    pruner = asyncio.create_task(_prune_journal_later())   # 启动后错峰剪枝（失败只 warning）
+    background = (sweeper, resumer, link_sweeper, catchup, pruner)
     yield
     from .agent_trading.admission import begin_shutdown
     begin_shutdown()
@@ -144,6 +150,14 @@ def _shutdown_steps() -> tuple[ShutdownStep, ...]:
         # `main.py` 不直接 import `intel/scheduler`（评审 P1-7）。死线
         # `ai_trade_intel_drain_timeout_s`（默认 5.0）由启动期校验器钉死 < `shutdown_step_timeout_s`。
         ("ai_trade_intel", lambda: get_ai_trade_manager().drain_intel_tasks()),
+        # 交易日志的写队列（ai-trade-audit-journal §2.2.2 约束 6）：位置是**硬性**的，三条判据
+        # 各自独立——① 必须在 `ai_trade` **之后**：`manager.shutdown()` 里还会写 `GROUP_STOPPED`
+        # / `GROUP_ENDED` 事件行；② 必须在 `db_engine` **之前**：drain task 要用引擎提交，否则
+        # 它会活着穿过 `dispose_engine()`；③ 必须在 `ai_trade_intel` **之后**：
+        # `test_ai_intel_wiring.py` 逐字断言 `names.index("ai_trade_intel") == 6`，插在它前面
+        # 会当场把那条打红。死线 `ai_trade_journal_drain_timeout_s`（默认 5.0）由启动期校验器
+        # 钉死 < `shutdown_step_timeout_s`。
+        ("ai_trade_journal", stop_journal_writer),
         ("ai_backtest", lambda: get_ai_backtest_manager().shutdown()),
         ("live_auto", lambda: get_live_auto_manager().shutdown()),
         # 关停顺序（weight-multi-model-training §2.6）：先停批次泵、再停底层作业，避免泵在作业消失后空转。
@@ -257,6 +271,28 @@ async def _backfill_discovery_assets() -> None:
                         stats.created, stats.merged, stats.skipped)
     except Exception as exc:  # noqa: BLE001 —— 启动回填非关键，绝不因它拖垮服务启动
         logger.warning("discovery asset backfill skipped: %s", exc)
+
+
+async def _prune_journal_later() -> None:
+    """启动后 30s 错峰剪枝一次交易日志（ai-trade-audit-journal §2.3 触发点①）。
+
+    姿态完全镜像 `_backfill_discovery_assets`：一次性 session + **整段 try/except，失败仅
+    warning 不阻断启动**。**刻意没有常驻定时器**——多一个常驻协程就多一个关停步骤，而日志的
+    增长是缓慢的（默认档下 5 标的约 30 MB / 天）；另一处触发点是管理台的 `POST /journal/prune`。
+
+    cancel-safe：关停期被 `_cancel_background` 取消时干净退出。
+    """
+    try:
+        from .ai_auto.journal.retention import prune_journal_once
+        await asyncio.sleep(30.0)
+        stats = await prune_journal_once(dry_run=False)
+        if stats.get("decisions") or stats.get("events"):
+            logger.info("pruned ai-trade journal: %d decisions, %d events",
+                        stats["decisions"], stats["events"])
+    except asyncio.CancelledError:      # 关停取消时干净退出
+        return
+    except Exception as exc:  # noqa: BLE001 —— 剪枝非关键，绝不因它拖垮服务启动
+        logger.warning("ai-trade journal prune skipped: %s", exc)
 
 
 async def _reconcile_weight_train_runs() -> None:
@@ -534,6 +570,10 @@ app.include_router(discovery_assets.router, prefix="/api")  # 第 17 个路由�
 # 而不是注册一个恒回空的端点——「装了但什么都不说」正是本轮要消灭的形状。
 if get_settings().ai_trade_truth_sources_enabled:
     app.include_router(truth_sources.router, prefix="/api")
+# 交易日志管理台（ai-trade-audit-journal §四）。**总闸关 ⇒ 路由不注册 ⇒ 404**，沿用上面那条
+# 先例：注册一个恒回空的端点等于「装了但什么都不说」，而这正是审计系统最不该有的形状。
+if get_settings().ai_trade_journal_ui_enabled:
+    app.include_router(ai_trade_journal.router, prefix="/api")
 
 
 @app.get("/")

@@ -1,6 +1,7 @@
 "use client";
 
 import { Badge } from "@/components/ui";
+import AiTradeEvidenceRow from "./AiTradeEvidenceRow";
 import AiTradeProfitLockRow from "./AiTradeProfitLockRow";
 import {
   describeCommittedExit,
@@ -118,6 +119,7 @@ export default function AiTradeMemberRow({
         <TurnoverChip member={member} />
         <BreakEvenRow member={member} />
         <AiTradeProfitLockRow member={member} />
+        <AiTradeEvidenceRow member={member} />
         <ProfitGuardRow guard={guard} />
         <ProfitGuardCooldownChip member={member} />
       </span>

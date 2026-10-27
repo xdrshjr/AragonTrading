@@ -23,7 +23,10 @@ import type { TruthSourcesWire } from "./truthSources";
 
 const BASE = "/api/py";
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+// 导出给 `aiTradeEvidenceApi.ts` 复用：同一个后端家族、同一种错误体（含 FastAPI `detail` 经
+// `main.http_exception_handler` 改写成的 `{error:{code,message}}`），再抄一份 fetch 包装就是
+// 第二个错误解析真源（contrastTokens ④ 的调用点计数也因此不变）。
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // D3：超时决策集中在 lib/httpTimeout.ts，接线留在原地——浏览器 fetch 无默认超时，
   // 「后端活着但不回」时按钮会静默冻结最长 5 分钟（standalone）或永远（dev）。
   const timeoutMs = timeoutFor(path);

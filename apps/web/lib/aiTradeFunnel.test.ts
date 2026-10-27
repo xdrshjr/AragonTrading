@@ -20,6 +20,7 @@ const LAYERS = [
   "consensus",
   "confidence",
   "edgeGate",
+  "evidenceGate",
   "reflection",
   "other",
 ];
@@ -121,5 +122,17 @@ describe("逐层明细", () => {
   it("未知层 key 原样显示（后端新增层时不至于变成空白）", () => {
     expect(layerLabel("brandNewGate")).toBe("brandNewGate");
     expect(layerLabel("edgeGate")).toBe("最小 edge 门禁");
+  });
+
+  it("实证准入层：标签与后端 LAYER_LABELS 逐字相同，且按层序排在 edgeGate 与 reflection 之间", () => {
+    expect(layerLabel("evidenceGate")).toBe("实证准入");
+    const at = (key: string) => LAYERS.indexOf(key);
+    expect(at("evidenceGate")).toBe(at("edgeGate") + 1);
+    expect(at("reflection")).toBe(at("evidenceGate") + 1);
+    const rows = blockedRows(
+      funnel({ blocked: { reflection: 1, evidenceGate: 7, edgeGate: 2 } }),
+    );
+    expect(rows.map((r) => r.key)).toEqual(["edgeGate", "evidenceGate", "reflection"]);
+    expect(rows[1].label).toBe("实证准入");
   });
 });

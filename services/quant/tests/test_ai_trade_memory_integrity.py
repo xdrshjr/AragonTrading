@@ -97,6 +97,20 @@ async def test_summary_failure_keeps_legacy_background_and_current_facts():
     assert text.index("本轮程序事实") < text.index(decider.summary)
 
 
+@pytest.mark.asyncio
+async def test_audit_prompt_rebuild_keeps_facts_hash_and_numeric_precision():
+    from app.ai_auto.decision_memory import build_decision_facts
+    from .test_ai_trade_journal_api import BASE, decision_row
+    from .test_ai_trade_journal_prompt_rebuild import _client, _seed
+    payload = {"round": 1, "lastPx": 1.234e-8, "position": None}
+    payload["decisionFacts"] = build_decision_facts({
+        "runId": 1, "instId": "SATS", "round": 1, "asOfTs": 10})
+    row = decision_row(1, payload_json=json.dumps(payload))
+    row_id = await _seed(row)
+    async with _client() as client:
+        rebuilt = (await client.get(f"{BASE}/decisions/{row_id}/prompt")).json()
+    assert payload["decisionFacts"]["factsHash"] in rebuilt["text"]
+    assert "0.00000001234 USDT" in rebuilt["text"]
 
 
 def test_facts_hash_changes_with_time_but_evidence_only_with_material_facts():

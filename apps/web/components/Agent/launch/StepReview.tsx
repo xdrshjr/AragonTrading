@@ -7,6 +7,7 @@ import {
   type AiTradeLaunchStepId,
 } from "@/lib/aiTradeLaunchSteps";
 import type { AiTradeLaunchRisk } from "@/lib/aiTradeLaunchRisk";
+import { riskToneStyle } from "./LaunchPrimitives";
 import type { UseAiTradeLaunchForm } from "./useAiTradeLaunchForm";
 import type { UseTrajectoryCapture } from "./useTrajectoryCapture";
 
@@ -311,7 +312,7 @@ function RiskItem({
   onUnguardedConfirmedChange: (value: boolean) => void;
   showUnguardedAck: boolean;
 }) {
-  const color = risk.tone === "danger" ? "var(--short-ink)" : "var(--warn)";
+  const { color, glyph } = riskToneStyle(risk.tone);
   const target = risk.steps[0];
   return (
     <div
@@ -323,7 +324,7 @@ function RiskItem({
       <div className="flex items-start justify-between gap-2">
         <span className="font-medium" style={{ color }}>
           {/* 形状 + 文字双通道，不靠颜色单独承载语义（仓库既有可达性纪律）。 */}
-          {risk.tone === "danger" ? "⚠ " : "△ "}
+          {glyph}
           {risk.title}
         </span>
         <button

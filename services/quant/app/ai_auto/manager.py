@@ -56,12 +56,20 @@ from . import pause as pause_core
 from .profit_guard import ProfitGuardRule
 from .profit_guard_text import format_profit_guard_charter
 from .profit_guard import rule_wire as profit_guard_wire
+from .evidence_gate import EvidenceRule, evidence_rule_wire
+from .evidence_runtime import EvidenceSnapshot
 from .profit_lock import ProfitLockRule, lock_rule_wire
 from .decider import AiTradeDecider
 from .experience import ExperienceRule, ExperienceRuntime, SessionGraph
 from .experience import scheduler
 from .experience.events import EventIdentity
 from .intel import IntelSessionRule
+from .journal import (
+    EventJournalInput,
+    JournalScope,
+    build_event_row,
+    get_journal_writer,
+)
 from .intel import runtime as intel_runtime
 from .intel import scheduler as intel_scheduler
 from .llm_budget import build_ai_trade_llm_clients
@@ -215,6 +223,10 @@ class AiTradeGroupStartRequest:
     profit_rule: ProfitGuardRule | None = None
     # 收益锁：同款零回归垫片（默认 None；「缺省即开启」只在 API 层 `_resolve_profit_lock` 解析）。
     profit_lock_rule: ProfitLockRule | None = None
+    # 实证准入（evidence-gated-capital §3.7）：规则分组共享；快照**按 `instId` 键**（证据是
+    # 「标的 × 周期 × 方向」粒度，共享一份等于拿别的标的的成绩放行真实开仓）。缺键 = 按未证实处理。
+    evidence_rule: EvidenceRule | None = None
+    evidence_snapshots: dict[str, EvidenceSnapshot] | None = None
     # 信号先验快照，**按 `instId` 键**（signal-prior-and-ev-gate §4.3 / P1-5）。刻意不镜像
     # `base_rule` 的「分组共享单对象」姿态：铁律是同一条规则，先验快照却是 `(instId, bar)` 粒度的
     # 历史统计——照字面共享会让 BTC 的成员拿 ETH 的统计去开真实仓位，且**不会报错**。
@@ -316,6 +328,7 @@ class AiTradeGroup:
     base_rule: MaBandRule | None = None      # 【基础策略】铁律（None=未装配），group_status 回显 baseRules
     profit_rule: ProfitGuardRule | None = None   # 利润保护层（None=未装配），回显 profitGuard
     profit_lock_rule: ProfitLockRule | None = None   # 收益锁（None=未装配），回显 profitLock
+    evidence_rule: EvidenceRule | None = None   # 实证准入（None=未装配），回显 evidenceGate
     sizing_rule: SizingRule | None = None    # 仓位求解规则（总闸①；None=未装配）
     stop_rule: StopRule | None = None        # ATR 止损规则（总闸②；与①独立）
     exposure_book: GroupExposureBook | None = None   # 分组共享敞口簿（总闸③关 ⇒ None）
@@ -413,6 +426,33 @@ class _GroupBuildCtx:
 _LIVENESS_DRAIN_TIMEOUT_S = 5.0
 
 
+def _journal_group_event(group_id: str, code: str, message: str, *,
+                         detail: dict | None = None, level: str = "info") -> None:
+    """分组生命周期事件的**唯一**入队点（ai-trade-audit-journal §2.2.6）。
+
+    全部 best-effort、全部同步入队：一条日志写不进去，绝不能让一次「启动 / 暂停 / 结束」失败
+    ——审计需求不配在真实资金的生命周期上冒一点风险。整段 `try/except`，只记 warning。
+
+    Args:
+        group_id: 分组 id（事件行的唯一归属键）。
+        code: §2.2.6 码表里的稳定机器码（改名 = 破坏性变更，离线脚本会静默失配）。
+        message: 一句中文事实陈述。**不得含 `**` 粗体标记**——后端文案里的星号在 JSX 里会
+            显示成字面星号，本仓库已为此复发过四次。
+        detail: 结构化补充；经 `redact` 后序列化。
+        level: `info | warn | error`。
+    """
+    try:
+        writer = get_journal_writer()
+        if not writer.enabled:
+            return
+        writer.note_event(build_event_row(
+            JournalScope(group_id=group_id),
+            EventJournalInput(category="lifecycle", code=code, level=level,
+                              message=message, detail=detail)))
+    except Exception as exc:  # noqa: BLE001 —— 见 docstring：绝不影响生命周期本身
+        logger.warning("ai-trade journal lifecycle event skipped (%s): %s", code, exc)
+
+
 
 class AiTradeManager:
     """进程内单活跃 AI 分组注册表（真实资金，一次至多一个 group，含 1..N 个标的会话）。"""
@@ -485,6 +525,12 @@ class AiTradeManager:
             # 市场情报层（market-intel §3.5.1）：装配排在启动成功之后——它是一条**加法**流水线，
             # 绝不允许它的任何失败影响真实资金会话的启动（判定与 fail-open 都在 `_wire_intel`）。
             await self._wire_intel(launched, provider=provider)
+            # 交易日志（§2.2.6）：落在启动成功、契约已落盘之后——排在前面就会给一次**失败并
+            # 回滚**的启动留下一条「已启动」的审计事实，而那是审计系统最不该说的那种话。
+            _journal_group_event(
+                launched.group_id, "GROUP_STARTED", "AI 自动交易分组已启动",
+                detail={"instIds": [m.inst_id for m in launched.members],
+                        "bar": req.bar, "totalBudgetUsd": total, "leverage": lever})
             return launched
 
     async def refresh_fee_rates(self) -> dict | None:
@@ -777,7 +823,7 @@ class AiTradeManager:
                 created_ts=created_ts, members=members,
                 wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
                 profit_rule=req.profit_rule, sizing_rule=rule, exposure_book=book,
-                profit_lock_rule=req.profit_lock_rule,
+                profit_lock_rule=req.profit_lock_rule, evidence_rule=req.evidence_rule,
                 stop_rule=parse_stop_rule(req.settings), horizon_rule=req.horizon_rule,
                 discipline_preset=req.discipline_preset,
                 discipline_adjustments=req.discipline_adjustments,
@@ -993,6 +1039,8 @@ class AiTradeManager:
             context_refresh_rounds=req.context_refresh_rounds,
             wake_interval_s=req.wake_interval_s, base_rule=req.base_rule,
             profit_rule=req.profit_rule, profit_lock_rule=req.profit_lock_rule,
+            evidence_rule=req.evidence_rule,
+            evidence_snapshot=(req.evidence_snapshots or {}).get(plan.inst_id),
             prior_snapshot=(req.prior_snapshots or {}).get(plan.inst_id), sizing=sizing,
             horizon_rule=req.horizon_rule,
             # 只为落库回答「这次会话开的是哪个预设」；阈值本身已在 executor.settings 那份派生副本里。
@@ -1049,6 +1097,10 @@ class AiTradeManager:
         self._clear_group_if_current(group)
         self._forget_paused_ref(group_id)   # I-2：`_group` 与 `_paused_ref` 永不同时非空
         self._unwire_intel(group_id)        # **同步**：只 cancel、不 await（G-8 的时延门禁）
+        _journal_group_event(group_id, "GROUP_STOPPED", "AI 自动交易分组已停止",
+                             detail={"stopReason": reason,
+                                     "members": [{"instId": r["instId"],
+                                                  "runId": r["runId"]} for r in rows]})
         return {"groupId": group_id, "stopReason": reason, "members": rows}
 
     def _forget_paused_ref(self, group_id: str) -> None:
@@ -1113,6 +1165,9 @@ class AiTradeManager:
             self._schedule_experience(
                 self._experience_finalize(member.session, distill=False))
         settings = self._group_settings(group)
+        _journal_group_event(group_id, "GROUP_PAUSED", "AI 自动交易分组已暂停",
+                             detail={"pauseReason": reason, "flatten": bool(flatten),
+                                     "pausedTs": group.paused_ts})
         return {
             "groupId": group_id, "state": group.state, "pauseReason": reason,
             "pausedTs": group.paused_ts, "holdPosition": not flatten, "resumable": True,
@@ -1170,6 +1225,9 @@ class AiTradeManager:
                 intel_scheduler.resume(group_id)   # 热续跑：runtime 还在，只需放开调度
                 for member in group.members:        # 后训练轨迹 W10（冷续跑是新 epoch，由 W1 写）
                     getattr(member.session, "trajectory", NULL_TRAJECTORY).note_resumed("hot")
+                _journal_group_event(group_id, "GROUP_RESUMED", "AI 自动交易分组已继续",
+                                     detail={"path": "hot",
+                                             "resumedCount": group.resumed_count})
                 return group
             from .resume import resume_cold_group     # 延迟导入：resume.py 反向依赖本模块
             started = time.time()
@@ -1191,6 +1249,9 @@ class AiTradeManager:
             # 上次的节奏跑，而不是一开机就把 N 个标的一起打出去（R-10）。
             await self._wire_intel(resumed)
             await self._persist_group_state(resumed, status=pause_core.STATUS_RUNNING)
+            _journal_group_event(group_id, "GROUP_RESUMED", "AI 自动交易分组已继续",
+                                 detail={"path": "cold",
+                                         "members": [m.inst_id for m in resumed.members]})
             return resumed
 
     async def _preflight_resume(self, group: AiTradeGroup) -> None:
@@ -1390,6 +1451,9 @@ class AiTradeManager:
         await self._mark_state_ended(group_id)
         self._forget_paused_ref(group_id)
         self._unwire_intel(group_id)
+        _journal_group_event(group_id, "GROUP_ENDED", "AI 自动交易分组已归档",
+                             detail={"endedFrom": ended_from, "flatten": flatten_flag,
+                                     "residualCount": len(residual)})
         # `flattened` 描述的是**结果**而不是意图：请求平仓但有成员没平掉 ⇒ 它必须是 False，
         # 且那几笔如实进 `orphanPositions`（回执里这两个键绝不能互相打架）。
         return {"groupId": group_id, "endedFrom": ended_from,
@@ -2088,6 +2152,7 @@ class AiTradeManager:
                 "baseRules": rule_wire(group.base_rule),   # 【基础策略】回执镜像（未装配→ null）
                 "profitGuard": profit_guard_wire(group.profit_rule),   # 利润保护回执镜像（同上）
                 "profitLock": lock_rule_wire(group.profit_lock_rule),  # 收益锁回执镜像（同上）
+                "evidenceGate": evidence_rule_wire(group.evidence_rule),   # 实证准入回执镜像（同上）
                 # 交易周期模式回执镜像（同上）：**生效值** + 两个派生量，使「弹窗预览 == 落地」可逐
                 # 字段核对（[P1-9]：只回显入参等于把 expectedHoldBars 的派生关系藏起来）。
                 "tradingHorizon": horizon_wire(group.horizon_rule),
@@ -2545,6 +2610,7 @@ class AiTradeManager:
                         # 利润保护配置随 config_json 落库（零列迁移；未装配存 None）。
                         "profitGuard": profit_guard_wire(req.profit_rule),
                         "profitLock": lock_rule_wire(req.profit_lock_rule),
+                        "evidenceGate": evidence_rule_wire(req.evidence_rule),
                         # 交易周期模式同款落库（零列迁移；未装配存 None）——历史详情接口直读 json 列，
                         # 故「这次会话到底选了哪种周期」事后可核对。
                         "tradingHorizon": horizon_wire(req.horizon_rule),

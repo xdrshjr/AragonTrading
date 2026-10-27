@@ -540,6 +540,13 @@ const DEGRADE_REASON_LABELS: { prefix: string; label: string }[] = [
   // 最小 edge 门禁（ai-trade-cost-accounting-and-edge-gate §3.7）：码带参数后缀
   // `edge_below_cost(edge=8.1bps,cost=13.0bps,k=2.0)`，同为前缀匹配、参数原样保留供排查。
   { prefix: "edge_below_cost", label: "期望收益不足以覆盖交易成本，本轮观望" },
+  // 实证准入两码（evidence-gated-capital §3.5.5）：带参数后缀，末尾可能是 `reverse→close`
+  // （反手被降级为只平不开，退出腿保留）。参数原样保留供排查。
+  {
+    prefix: "evidence_unproven",
+    label: "该方向尚未被实证（样本不足或区间跨零），本轮只记影子、不下单",
+  },
+  { prefix: "evidence_disproven", label: "该方向已被实证为亏损，本轮只记影子、不下单" },
   // 回撤刹车两码（vol-sizing-and-drawdown-brake §3.6）：同为带参数后缀的前缀码。文案必须写清**只拦
   // 开新仓**——用户看到「暂停」时最怕的是「我的仓位是不是也平不掉了」。
   { prefix: "drawdown_brake_halt", label: "回撤刹车：会话回撤越线，暂停开新仓（平仓不受影响）" },

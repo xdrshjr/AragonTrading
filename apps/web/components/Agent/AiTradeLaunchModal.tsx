@@ -20,6 +20,7 @@ import type {
   AiTradeReasoningDepth,
   AiTradeTrendRule,
 } from "@/lib/aiTradeTypes";
+import type { AiTradeEvidenceGateIn } from "@/lib/aiTradeEvidence";
 import type { AiTradeExperienceRule } from "@/lib/experienceTypes";
 import type { AutoTradeAllocationMode, AutoTradeMember } from "@/lib/liveAutoTypes";
 import type { AiTradeTrajectoryRule } from "@/lib/trajectoryTypes";
@@ -59,6 +60,9 @@ export interface AiTradeLaunchOpts {
   profitGuard?: AiTradeProfitGuardRule;
   // 收益锁（profit-lock C-2，**实盘与回测同源**）：开 ⇒ 只带用户改过的字段；关 ⇒ `{enabled:false}`。
   profitLock?: AiTradeProfitLockRule;
+  // 实证准入（evidence-gated-capital §5.1）：**仅 live 分支携带**——AI 回测不装配本层，回测启动体
+  // 不接该字段。`{enabled:true, policy}`；缺省 ⇒ 服务端按 settings 装配（默认开启 + 严格）。
+  evidenceGate?: AiTradeEvidenceGateIn;
   // 交易周期模式（**实盘与回测同源**，holding-horizon §4.3）：选中模式 ⇒ 带 `{enabled,profile,…}`；
   // 取消勾选 ⇒ `{enabled:false}`（**显式关闭**，与「字段缺省=默认开启」语义严格区分）。
   tradingHorizon?: AiTradeHorizonRule;

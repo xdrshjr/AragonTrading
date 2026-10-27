@@ -44,6 +44,7 @@ import type {
 } from "./aiTradeTypes";
 import type { AiBacktestConfig } from "./aiBacktestTypes";
 import type { AiTradeIntelSummary } from "./intelTypes";
+import type { JournalFilters } from "./journalTypes";
 import type { FactorEditTarget, FactorTargetRef, SymbolGroup } from "./factorTypes";
 import type { WeightTrainResult, WeightTrainTarget } from "./weightModelTypes";
 import type { WeightBatchTarget } from "./weightBatchTypes";
@@ -79,7 +80,7 @@ export type InstSidebarTab = "watch" | "spot" | "swap";
 // 右侧面板页签：AI 助手 / 交易策略（Agent Trading Copilot §5.3，默认 "agent"）。
 export type RightTab = "agent" | "strategy";
 // 一级功能视图（左侧主导航 NavRail 驱动）：trade=交易工作台，factor=因子实验室；持久化跨刷新恢复。
-export type WorkbenchView = "trade" | "factor" | "discovery";
+export type WorkbenchView = "trade" | "factor" | "discovery" | "journal";
 
 // 生成新会话 id（SSR 安全：crypto 不可用时回落空串，由组件挂载后补）。
 function makeConversationId(): string {
@@ -541,6 +542,9 @@ interface AppState {
   // 因子实验室可见性由 activeView === "factor" 派生。factorLabSection 持久化；
   // factorOverlay 瞬态（show_factor ui-action 驱动主图叠加因子/得分 pane）。
   activeView: WorkbenchView;
+  // 交易日志管理台的过滤条件（ai-trade-audit-journal §3.4）。**持久化**：审计是一件会跨天
+  // 反复回到同一个断面的事，每次重开都要重设一遍标的与时间范围是纯粹的摩擦。
+  journalFilters: JournalFilters;
   factorLabSection: string;
   factorOverlay: FactorOverlay | null;
   // 策略与因子挖掘（strategy-factor-discovery §2.13）：discoverySection 持久化（记忆上次分区）；
@@ -686,6 +690,7 @@ interface AppState {
   setShowSettings: (show: boolean) => void;
   setSettingsSection: (section: string) => void;
   setActiveView: (view: WorkbenchView) => void;
+  setJournalFilters: (next: JournalFilters) => void;
   setFactorLabSection: (section: string) => void;
   setFactorOverlay: (overlay: FactorOverlay | null) => void;
   setDiscoverySection: (section: string) => void;
@@ -887,6 +892,8 @@ export const useAppStore = create<AppState>()(
       settingsSection: "ai-models",
       // 一级视图：默认「交易」工作台；因子实验室默认工作区为「因子目录」；无叠加。
       activeView: "trade",
+      // 全新安装只走初始化器、不触发 migrate，故默认值必须写在此处（与 activeView 并列）。
+      journalFilters: {},
       factorLabSection: "catalog",
       factorOverlay: null,
       // 挖掘：默认分区「总览」；运行期态瞬态（全新安装只走初始化器、不触发 migrate，故默认值写在此处）。
@@ -1357,6 +1364,8 @@ export const useAppStore = create<AppState>()(
       // 一级视图切换（左侧 NavRail）：写入 activeView（持久化，跨切换/刷新保态）；
       // 切换当前因子工作区（持久化）/ 设置主图叠加（瞬态）。
       setActiveView: (activeView) => set({ activeView }),
+      // 交易日志过滤条件：整体替换（工具条每次都给出完整对象），避免部分合并造出半旧半新的组合。
+      setJournalFilters: (journalFilters) => set({ journalFilters }),
       setFactorLabSection: (factorLabSection) => set({ factorLabSection }),
       setFactorOverlay: (factorOverlay) => set({ factorOverlay }),
       // 挖掘：分区持久化；运行期态瞬态。WS 事件一律经纯 reducer applyDiscoveryEvent 落态——
@@ -1439,7 +1448,7 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: "aragon-ui",
-      version: 31,
+      version: 32,
       storage: createJSONStorage(() => localStorage),
       // 只持久化选择态 / 主题 / 账户态 / 自选；绝不持久化运行期句柄（runId 会 404、paperSessionId 进程重启即失效，R6）
       partialize: (s) => ({
@@ -1498,6 +1507,8 @@ export const useAppStore = create<AppState>()(
         settingsSection: s.settingsSection,
         // 持久化一级视图（NavRail）与因子实验室当前工作区；factorOverlay 为瞬态，**不**入 partialize。
         activeView: s.activeView,
+        // 交易日志过滤条件（持久化）；会话列表 / 健康度 / 三页数据全是运行期瞬态，**不**入 partialize。
+        journalFilters: s.journalFilters,
         factorLabSection: s.factorLabSection,
         // 挖掘当前分区（持久化）；discoveryRun / discoveryRunId 为运行期瞬态，**不**入 partialize
         // （刷新由 WS 首发 state 快照重建，绝不落陈旧运行态）。
@@ -1658,6 +1669,13 @@ export const useAppStore = create<AppState>()(
           // 与 v28 / v29 同款的显式收窄：`next` 是 persist 给的 `unknown` 形状。
           const cfg = next.aiTradeConfig as AiTradeConfig | null;
           next = { ...next, aiTradeConfig: stripProfitGuardEnabled(cfg) };
+        }
+        if (version < 32) {
+          // 交易日志（ai-trade-audit-journal §3.4）：**只补新键默认值、不删不改任何既有键**。
+          // 老用户从未持久化过 journalFilters，浅合并本就回落 `{}`；显式补一行是本仓既有范式
+          // （与 v19 的 activeView、v30 的 discoverySection 同款），也让这次升版在 diff 里说得出
+          // 自己改了什么。
+          next = { ...next, journalFilters: {} };
         }
         return next as never;
       },

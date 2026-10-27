@@ -1,0 +1,33 @@
+{
+  "note": "门禁层名的**唯一真源快照**（ai-trade-audit-journal §2.2.7 / 评审 RP0-3）。由后端用例 test_ai_trade_journal_gates.py 与 open_funnel.LAYERS/LAYER_LABELS 逐项对齐，前端源码扫描用例 journalNoLayerLabels.source.test.ts 读它来断言`components/Journal/**` 与 `lib/journal*.ts` 里一个层名中文字面量都没有。",
+  "layers": [
+    "baseRuleMaBand",
+    "orphanPosition",
+    "horizon",
+    "profitCooldown",
+    "turnover",
+    "exchangeBackstop",
+    "drawdownBrake",
+    "trendBias",
+    "consensus",
+    "confidence",
+    "edgeGate",
+    "reflection",
+    "other"
+  ],
+  "labels": {
+    "baseRuleMaBand": "基础策略·MA 通道",
+    "orphanPosition": "交易所侧存在未接管持仓",
+    "horizon": "持仓周期纪律",
+    "profitCooldown": "保护性平仓冷却",
+    "turnover": "换手预算",
+    "exchangeBackstop": "交易所侧兜底",
+    "drawdownBrake": "回撤刹车 / 连亏熔断",
+    "trendBias": "趋势基调·逆势门槛",
+    "consensus": "同向共识门槛",
+    "confidence": "置信度门槛",
+    "edgeGate": "最小 edge 门禁",
+    "reflection": "下单前二次反思",
+    "other": "其它"
+  }
+}

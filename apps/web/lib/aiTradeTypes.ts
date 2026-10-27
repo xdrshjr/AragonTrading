@@ -3,6 +3,11 @@
 import type { FeeRatesWire, ReconcileWire } from "./aiTradeCost";
 import type { IntegritySnapshot, OpenAttemptReceipt } from "./aiTradeIntegrity";
 import type { AiTradeContrarianBlocked } from "./aiTradeHistoryTypes";
+import type {
+  AiTradeEvidenceGateIn,
+  AiTradeEvidenceGateReceipt,
+  AiTradeEvidenceStatus,
+} from "./aiTradeEvidence";
 import type { AiTradeRealizedStats } from "./aiTradeProfitability";
 import type {
   AiTradeTrajectoryReceipt,
@@ -1356,6 +1361,8 @@ export interface AiTradeSessionRow {
   horizon?: AiTradeHorizonSnapshot | null;
   // 收益锁计数（profit-lock §5.2）：同经 status 整体浅合并进 `m.session`；未装配 ⇒ 缺席。
   profitLock?: AiTradeProfitLockStatus | null;
+  // 实证准入（evidence-gated-capital §5.2）：同经 status 整体浅合并进 `m.session`；未装配 ⇒ 整键缺席。
+  evidence?: AiTradeEvidenceStatus | null;
   // 验收闭环三键（horizon-acceptance [P0-3] 成员级实时通路）：status 事件经
   // `patchAiTradeMemberStatus` **整体 spread** 合并进 `m.session`，故运行期数据本来就在——
   // 漏的只是类型声明。未装配 / 零样本 ⇒ null ⇒ 卡片整段不渲染。
@@ -1474,6 +1481,7 @@ export interface AiTradeStatusEvent {
   // 倒计时；未装配 ⇒ null。
   horizon?: AiTradeHorizonSnapshot | null;
   profitLock?: AiTradeProfitLockStatus | null;   // 收益锁计数（规则未装配 ⇒ 缺席）
+  evidence?: AiTradeEvidenceStatus | null;     // 实证准入（未装配 ⇒ 整键缺席，§5.2）
   // 验收闭环三键（成员级口径）：随每次 status 事件下发，是运行期卡片的**主通路**。
   acceptance?: AiTradeAcceptance | null;
   exits?: AiTradeExitMix | null;
@@ -1624,6 +1632,9 @@ export interface AiTradeGroupStartReq {
   baseRules?: AiTradeBaseRules | null;  // 【基础策略】铁律（字段省略→服务端默认开启）
   profitGuard?: AiTradeProfitGuardRule | null;  // 利润保护层（字段省略→服务端默认开启）
   profitLock?: AiTradeProfitLockRule | null;    // 收益锁（字段省略→服务端默认开启）
+  // 实证准入（evidence-gated-capital §5.1）：字段省略→服务端按 settings 装配（默认开启 + 严格）。
+  // **仅实盘下发**：AI 回测不装配本层（§1.3），回测启动体不接该字段。
+  evidenceGate?: AiTradeEvidenceGateIn | null;
   tradingHorizon?: AiTradeHorizonRule | null;   // 交易周期模式（字段省略→服务端默认开启）
   discipline?: AiTradeDisciplineIn | null;      // 交易纪律预设（字段省略→服务端默认 balanced）
   // 经验模式（字段省略→服务端按 `ai_trade_experience_default_on` 装配，默认开启）。
@@ -1681,6 +1692,7 @@ export interface AiTradeGroupRow {
   baseRules?: AiTradeBaseRules | null; // 【基础策略】铁律回执镜像（null=未装配）
   profitGuard?: AiTradeProfitGuardRule | null; // 利润保护层回执镜像（null=未装配）
   profitLock?: AiTradeProfitLockRule | null;   // 收益锁回执镜像（null=未装配）
+  evidenceGate?: AiTradeEvidenceGateReceipt | null; // 实证准入回执（null=未装配）
   // 交易周期模式回执镜像（null=未装配）：**服务端解析后的生效值** + 两个派生量
   // （expectedHoldBars / confirmWindowSeconds），使「弹窗预览 == 落地」可逐字段核对。
   tradingHorizon?: AiTradeHorizonRule | null;

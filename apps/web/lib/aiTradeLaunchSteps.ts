@@ -276,6 +276,8 @@ export interface AiTradeLaunchSummaryInput {
   riskCount: number;
   /** 后训练数据采集是否**有效**开启（可选：缺省 / false ⇒ cognition 摘要逐字节不变）。 */
   trajectoryEnabled?: boolean;
+  /** 实证准入档位短名（严格 / 均衡 / 仅观察）；缺省 / `null`（回测不装配）⇒ guards 摘要逐字节不变。 */
+  evidenceLabel?: string | null;
 }
 
 const DOT = " · ";
@@ -323,6 +325,7 @@ export function stepSummary(
       return (
         `${safe(input.disciplineLabel)}${DOT}` +
         `铁律${onOff(input.baseRuleEnabled, "开", "关")}${DOT}` +
+        (input.evidenceLabel ? `实证准入：${input.evidenceLabel}${DOT}` : "") +
         `收益锁${onOff(input.profitLockEnabled, "开", "关")}${DOT}` +
         `利润保护${onOff(input.profitGuardEnabled, "开", "关")}`
       );

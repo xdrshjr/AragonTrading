@@ -13,6 +13,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .security.origins import DEFAULT_ORIGINS
 
+# 交易日志采集档与事件级别的**唯一**值域（ai-trade-audit-journal §2.2.3 / §2.2.6）。
+# 放在模块级而不是校验器内部：`journal/records.py` 与 `journal/writer.py` 也读它，
+# 各写一份必然漂移，而漂移的表现（一个未知档静默落最少的字节）不报任何错。
+JOURNAL_CAPTURE_TIERS = ("minimal", "standard", "full")
+JOURNAL_EVENT_LEVELS = ("info", "warn", "error")
+
 
 class Settings(BaseSettings):
     """全局设置。字段名即环境变量名（大小写不敏感）。"""
@@ -1254,6 +1260,23 @@ class Settings(BaseSettings):
     # `discipline.adjustments` 里被如实说出来（`sizing_runtime.margin_precheck_notice` 是唯一读点）。
     ai_trade_sizing_margin_precheck: bool = False
 
+    # ---- 实证准入（ai-trade-evidence-gated-capital §5.4，11 项）----
+    # 运维总闸：False ⇒ 整层不装配、`evidence` 状态键整键缺席、门禁链逐字节回退。
+    ai_trade_evidence_gate_enabled: bool = True
+    # 请求体缺省时的档位。strict = 先证后投（推荐）；balanced = 证伪即停；observe = 只记录。
+    ai_trade_evidence_default_policy: Literal["strict", "balanced", "observe"] = "strict"
+    ai_trade_evidence_min_samples: int = Field(default=10, ge=3, le=200)
+    ai_trade_evidence_window: int = Field(default=30, ge=5, le=500)
+    ai_trade_evidence_max_age_days: float = Field(default=30.0, gt=0, le=365)
+    ai_trade_evidence_z: float = Field(default=1.0, ge=0, le=3)
+    # 同方向跨标的合并样本只能把一个桶判成「已证伪」，永远不能判成「已证实」。
+    ai_trade_evidence_pooled_disprove: bool = True
+    # 参考离场规则：任一项变化 ⇒ policy_version 变化 ⇒ 旧样本不再参与统计。
+    ai_trade_evidence_ref_sl_atr_mult: float = Field(default=2.0, gt=0, le=10)
+    ai_trade_evidence_ref_tp_atr_mult: float = Field(default=4.0, gt=0, le=20)
+    ai_trade_evidence_ref_max_hold_bars: int = Field(default=24, ge=2, le=500)
+    ai_trade_evidence_backfill_max_days: int = Field(default=60, ge=1, le=365)
+
     # ---- AI 自动交易 · 静默降级修复（ai-trade-silent-degradation-repair §十三，12 项）----
     # 本段修的是**四条「向外界要真话」的通路在真机上全部静默返回空**：官方费率 1,524 次请求 0 次
     # 成功、情报正文 96 次抓取 0 次成功、账户级持仓被按成员重复了 5 遍（占全部出网 78.3%）、
@@ -1388,6 +1411,53 @@ class Settings(BaseSettings):
     #     否则轴 A 的效果无法归因。
     ai_trade_reconcile_capital_tol_ratio: float = Field(default=0.0, ge=0, le=1)
 
+    # ==== AI 自动交易 · 交易日志与审计导出（ai-trade-audit-journal §七，16 项）====
+    # 前缀 `AI_TRADE_` 是硬约束：`desktop/src/lib/config.js` 的后端 env 透传白名单是**前缀式**的，
+    # 裸名在打包桌面端里会被静默丢弃——那把开关在唯一的产品形态里按不下去。
+    # 16 项全部在仓库根 `.env.example` 逐条登记，由 `test_ai_trade_journal_settings.py` 双向校验。
+
+    # 1) 总闸。`false` ⇒ writer 不装配、`note_*` 直接 return、三张表零行；决策轮**逐字节**回退。
+    ai_trade_journal_enabled: bool = True
+    # 2) 采集粒度。`minimal` ⇒ 不落上下文与模型输出（SFT 导出被禁用并说明原因）。
+    ai_trade_journal_capture_tier: str = "standard"
+    # 3) 有界队列上界。越小越早开始丢**新**条（绝不丢旧条：丢旧条会静默改写历史）。
+    ai_trade_journal_queue_max: int = Field(default=2000, ge=16, le=100000)
+    # 4) drain 单次提交条数。由启动期校验器钉死 ≤ queue_max。
+    ai_trade_journal_batch_size: int = Field(default=32, ge=1, le=10000)
+    # 5) 空闲冲刷间隔（秒）。
+    ai_trade_journal_flush_interval_s: float = Field(default=1.0, gt=0, le=60)
+    # 6) 单段文本上限；`full` 档实际取 `max(本值, 20000)`。
+    ai_trade_journal_text_max_chars: int = Field(default=4000, ge=0, le=200000)
+    # 7) 上下文上限；超出即截断并置 `payload_truncated`（被截断的行在 SFT 导出中一律排除）。
+    ai_trade_journal_payload_max_chars: int = Field(default=24000, ge=0, le=2000000)
+    # 8) 事件采集下限。`warn` ⇒ info 级事件整体不采（那是用户显式选择的静默，不是设计上的空洞）。
+    ai_trade_journal_event_min_level: str = "info"
+    # 9) 保留天数。`0` ⇒ 该闸不生效。
+    ai_trade_journal_retention_days: int = Field(default=90, ge=0, le=3650)
+    # 10) 保留行数。`0` ⇒ 该闸不生效（两个都为 0 = 永不剪枝）。
+    ai_trade_journal_max_rows: int = Field(default=100000, ge=0, le=100000000)
+    # 11) 流式导出的分页大小。
+    ai_trade_journal_export_page_size: int = Field(default=500, ge=1, le=10000)
+    # 12) 单次导出的硬行数上限；触顶 ⇒ `eof.complete=false` 且 `truncatedReason="max_rows"`。
+    ai_trade_journal_export_max_rows: int = Field(default=200000, ge=1, le=10000000)
+    # 13) 关停排空死线。**必须 < SHUTDOWN_STEP_TIMEOUT_S**（启动期校验器钉死）：倒挂时外层先
+    #     cancel、内层清理永不执行，写队列会活着穿过 `dispose_engine`。
+    ai_trade_journal_drain_timeout_s: float = Field(default=5.0, gt=0, le=60)
+    # 14) 管理台总闸。`false` ⇒ 路由不注册（404）+ 导航项不渲染 + 持久化的 `activeView="journal"`
+    #     被前端水合守卫拉回 `trade`（否则老用户开屏是一片什么都没有、也不说为什么的空白）。
+    ai_trade_journal_ui_enabled: bool = True
+    # 15) 上下文链总闸（评审 RP0-1）。`false` ⇒ `context_ref_json` / `context_turn_json` 两列恒
+    #     NULL、`decider.last_request_shape` 不被读、摘要种子不留档；SFT 导出**只接受**
+    #     `contextMode=lastTurnOnly` 且每条样本强制 `quality.contextTruncated=true`。
+    #     关掉它换来的是每轮少 0.6–1.5 KB，**不是**更好看的标签。
+    ai_trade_journal_context_chain_enabled: bool = True
+    # 16) 单片导出的**墙钟**死线（评审 RP0-2）。流式解决的是内存、解决不了墙钟，而
+    #     `apps/web/next.config.mjs` 的 `experimental.proxyTimeout: 300000` 对每一个 `/api/py/*`
+    #     请求生效。默认 240 是从那个数倒推的（留 60s 余量）。触顶即干净收尾并给 `nextBeforeId`，
+    #     由导出中心切成 N 片顺序下载。置 `0` ⇒ 该闸不生效（**只在无代理的直连排障场景下这么
+    #     用**，桌面端产品形态下等于把那堵 300 秒的墙放回来）。
+    ai_trade_journal_export_time_budget_s: float = Field(default=240.0, ge=0, le=3600)
+
     # ---- 信任边界（trust-boundary-and-signal-integrity D1 / §6.1）----
     # 逗号分隔的 Origin 白名单；空 = 用 `app/security/origins.py` 的 DEFAULT_ORIGINS。
     # 显式配置即**完全替换**默认（不做合并，避免「以为收紧了其实没有」）。
@@ -1396,6 +1466,57 @@ class Settings(BaseSettings):
     # 裸名 `ALLOWED_ORIGINS` 一个前缀都不沾 ⇒ 打包形态下这个开关恒失效，白名单一旦不匹配就是
     # 「点什么都 403 且用户无从补救」。改名/加字段时必须同步那份白名单（该文件已为此栽过两次）。
     security_allowed_origins: str = ""
+
+    @model_validator(mode="after")
+    def _check_journal_wiring(self) -> "Settings":
+        """交易日志的**四条**启动期校验（ai-trade-audit-journal §七）——写错即启动失败。
+
+        1. ``AI_TRADE_JOURNAL_DRAIN_TIMEOUT_S < SHUTDOWN_STEP_TIMEOUT_S``。倒挂时
+           ``main._run_shutdown`` 的外层会先 ``cancel`` 那一步，drain 自己那半段「取消剩余任务」
+           **永远不会执行**——恰恰在它被设计来应对的那一种情况下。写队列于是活着穿过
+           ``("db_engine", dispose_engine)``。这条坑本仓库已在 ``ai_trade_experience`` 与
+           ``ai_trade_intel`` 上各踩过一次并成文，此处是第三次逐字沿用。
+        2. ``AI_TRADE_JOURNAL_CAPTURE_TIER ∈ {minimal, standard, full}``。写错一个字母，
+           ``build_decision_row`` 会按未知档静默落最少的字节，而没有任何一处会报错。
+        3. ``AI_TRADE_JOURNAL_BATCH_SIZE ≤ AI_TRADE_JOURNAL_QUEUE_MAX``。倒挂时 drain 的贪心
+           收集永远凑不满一批，冲刷完全依赖空闲间隔——一个不报错的性能陷阱。
+        4. ``AI_TRADE_JOURNAL_EXPORT_TIME_BUDGET_S == 0 或 ≥ 10.0``。**刻意不在这里与
+           `next.config.mjs` 的 `proxyTimeout` 比**——那是前端仓的一个 JS 字面量，后端的
+           ``Settings`` 读不到它，写一个读不到的判据就是一条恒真的假门禁。两者的上下界关系由
+           源码扫描用例 ``test_ai_trade_journal_proxy_budget.py`` 守。
+
+        另加一条同族的值域收口：``AI_TRADE_JOURNAL_EVENT_MIN_LEVEL ∈ {info, warn, error}``。
+
+        Raises:
+            ValueError: 上述任一条不成立（构造期即失败）。
+        """
+        if self.ai_trade_journal_drain_timeout_s >= self.shutdown_step_timeout_s:
+            raise ValueError(
+                f"AI_TRADE_JOURNAL_DRAIN_TIMEOUT_S({self.ai_trade_journal_drain_timeout_s})"
+                f" 必须 < SHUTDOWN_STEP_TIMEOUT_S({self.shutdown_step_timeout_s})，否则外层先 "
+                "cancel、drain 内层的清理永不执行，日志写队列会活着穿过 dispose_engine")
+        tier = self.ai_trade_journal_capture_tier
+        if tier not in JOURNAL_CAPTURE_TIERS:
+            raise ValueError(
+                f"AI_TRADE_JOURNAL_CAPTURE_TIER({tier!r}) 必须是 "
+                f"{sorted(JOURNAL_CAPTURE_TIERS)} 之一，否则采集档会静默落最少的字节")
+        level = self.ai_trade_journal_event_min_level
+        if level not in JOURNAL_EVENT_LEVELS:
+            raise ValueError(
+                f"AI_TRADE_JOURNAL_EVENT_MIN_LEVEL({level!r}) 必须是 "
+                f"{sorted(JOURNAL_EVENT_LEVELS)} 之一，否则事件采集下限的判定恒不成立")
+        if self.ai_trade_journal_batch_size > self.ai_trade_journal_queue_max:
+            raise ValueError(
+                f"AI_TRADE_JOURNAL_BATCH_SIZE({self.ai_trade_journal_batch_size}) 必须 ≤ "
+                f"AI_TRADE_JOURNAL_QUEUE_MAX({self.ai_trade_journal_queue_max})，"
+                "否则 drain 的贪心批永远凑不满，冲刷完全依赖空闲间隔")
+        budget = self.ai_trade_journal_export_time_budget_s
+        if budget != 0 and budget < 10.0:
+            raise ValueError(
+                f"AI_TRADE_JOURNAL_EXPORT_TIME_BUDGET_S({budget}) 必须为 0（该闸不生效）"
+                "或 ≥ 10.0：小于 10 秒的预算会让每一次导出都在首页之后立刻收尾，"
+                "用户拿到的是一串只有 manifest 与 eof 的空文件")
+        return self
 
     @model_validator(mode="after")
     def _check_allowed_origins(self) -> "Settings":

@@ -9,6 +9,7 @@ import HorizonAcceptanceCard from "./HorizonAcceptanceCard";
 import DirectionBalanceCard from "./DirectionBalanceCard";
 import TrendAlignmentCard from "./TrendAlignmentCard";
 import OpenFunnelCard from "./OpenFunnelCard";
+import EvidenceCard from "./EvidenceCard";
 import IntegrityCard from "./IntegrityCard";
 import { readIntegrity } from "@/lib/aiTradeIntegrity";
 import TradabilityCard from "./TradabilityCard";
@@ -257,6 +258,14 @@ export default function AiTradeStatsLive({
               ?? m.session?.openFunnel} />
           </div>
         ))}
+        {/* 实证准入（evidence-gated-capital §3.5.2）：紧跟开仓漏斗——漏斗说「被哪一层拦下」，
+            本卡说「实证准入这一层为什么拦」。成员级实时快照；全部未装配 ⇒ 整卡不渲染。 */}
+        <EvidenceCard
+          members={Object.values(group.members).map((m) => ({
+            instId: m.instId,
+            evidence: m.session?.evidence,
+          }))}
+        />
         {/* 方向分布（directional-symmetry 轴 D）：紧贴漏斗卡下方——两者是同一个问题的两半，
             漏斗说「被哪一层拦下」，本卡说「拦掉的是哪个方向」。老会话 / 总闸关 ⇒ 整卡不渲染。 */}
         {Object.values(group.members).map((m) => (

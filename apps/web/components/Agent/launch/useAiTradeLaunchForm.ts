@@ -112,6 +112,7 @@ import type { AiTradeLaunchModalProps, AiTradeLaunchOpts } from "../AiTradeLaunc
 import { useAiTradeLaunchState } from "./useAiTradeLaunchState";
 import { useTrajectoryCapture } from "./useTrajectoryCapture";
 import { useProfitLockFields } from "./useProfitLockFields";
+import { useEvidenceGateFields } from "./useEvidenceGateFields";
 import type { AiTradeLaunchMode } from "@/lib/aiTradeLaunchSteps";
 
 /**
@@ -259,6 +260,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
     open, mode, rule: trajectory, skipOnce: trajectorySkipOnce,
   });
   const profitLock = useProfitLockFields(state);   // 校验与提交体在该文件（本文件贴着 G-1 红线）
+  const evidence = useEvidenceGateFields(state, open); // 实证准入：档位 / 预览 / 回填全在该 hook
 
   const capital = parseOptionalUsd(capitalRaw);
   const leverage = parseOptionalLeverage(leverageRaw);
@@ -611,13 +613,14 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
         experienceEnabled: experience.enabled !== false,
         wakeFloorDivisor: horizonQ.data?.wakeHorizonDivisor ?? 0,
         targetHoldMinSeconds: activeHorizonProfile?.targetHoldMinSeconds ?? 0,
+        evidencePolicy: evidence.riskPolicy,
       }),
     [
       mode, gearNote, tradabilityView?.level, tradabilityView?.headline, profitGuardEnabled,
       horizonEnabled, effectiveMinHoldSeconds, interlockArmed, hardTakeProfitText, oversubscribed,
       sumPct, isClamped, capital.value, maxBudgetPct, budgetCap, truncated, defaultMembers.length,
       reasoningDepth, wakeMinutes, experience.enabled, horizonQ.data?.wakeHorizonDivisor,
-      activeHorizonProfile?.targetHoldMinSeconds, state.profitLockEnabled,
+      activeHorizonProfile?.targetHoldMinSeconds, state.profitLockEnabled, evidence.riskPolicy,
     ],
   );
 
@@ -673,7 +676,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
     disciplineLabel: DISCIPLINE_COPY[disciplinePreset].label,
     baseRuleEnabled,
     profitGuardEnabled, profitLockEnabled: state.profitLockEnabled,
-    riskCount: risks.length,
+    riskCount: risks.length, evidenceLabel: evidence.summaryLabel,
     trajectoryEnabled: trajectoryCapture.effectiveEnabled,
   };
 
@@ -719,6 +722,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
         ...base,
         wakeIntervalMinutes: wakeMinutes ?? 0,
         profitGuard: profitGuardPayload, profitLock: profitLock.payload,
+        evidenceGate: evidence.payload, // 仅实盘：AI 回测不装配实证准入（§1.3）
         reasoningDepth,
         trajectoryCapture: trajectoryCapture.requestRule,
         trajectoryPreference: trajectory,
@@ -779,7 +783,7 @@ export function useAiTradeLaunchForm(props: AiTradeLaunchModalProps) {
     profitGuardEnabled, setProfitGuardEnabled, armReturnRaw, setArmReturnRaw, givebackRaw,
     setGivebackRaw, breakevenArmRaw, setBreakevenArmRaw, minHoldRaw, setMinHoldRaw,
     tierPreset, setTierPreset, atrFloorRaw, setAtrFloorRaw, atrCapRaw, setAtrCapRaw,
-    cooldownRaw, setCooldownRaw, armPriceMovePct, profitLock, state,
+    cooldownRaw, setCooldownRaw, armPriceMovePct, profitLock, evidence, state,
     // 可交易性预检（探针已上提；子组件降为纯展示）
     tradabilityView, tradabilityConfirmed, setTradabilityConfirmed, tradabilityNeedsConfirm,
     tradabilityBlocked,

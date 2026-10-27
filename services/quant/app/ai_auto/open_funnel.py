@@ -48,7 +48,7 @@ _SKEW_SHARE = 0.15
 # `sum(blocked)` 小于真实拦截数，而这张图唯一的价值就是它闭合。
 LAYERS = ("baseRuleMaBand", "orphanPosition", "horizon", "profitCooldown", "turnover",
           "exchangeBackstop", "drawdownBrake", "trendBias", "consensus", "confidence",
-          "edgeGate", "reflection", "other")
+          "edgeGate", "evidenceGate", "reflection", "other")
 
 LAYER_LABELS = {
     "baseRuleMaBand": "基础策略·MA 通道",
@@ -60,7 +60,11 @@ LAYER_LABELS = {
     "exchangeBackstop": "交易所侧兜底", "drawdownBrake": "回撤刹车 / 连亏熔断",
     "trendBias": "趋势基调·逆势门槛",
     "consensus": "同向共识门槛", "confidence": "置信度门槛",
-    "edgeGate": "最小 edge 门禁", "reflection": "下单前二次反思", "other": "其它",
+    "edgeGate": "最小 edge 门禁",
+    # 实证准入（evidence-gated-capital §3.3.3）：edge 门禁问「波动够不够付成本」，本层问「这个方向
+    # 过去有没有真的赚钱」。层序即调用序：排在 edge 门禁之后、二次反思之前。
+    "evidenceGate": "实证准入",
+    "reflection": "下单前二次反思", "other": "其它",
 }
 
 # 降级理由前缀 → 层 key（单点归类，沿用 `discipline_runtime._DEGRADE_PREFIXES` 的成文范式）。
@@ -85,6 +89,7 @@ _DEGRADE_PREFIXES: tuple[tuple[str, str], ...] = (
     ("low_consensus", "consensus"),
     ("low_confidence", "confidence"),
     ("edge_below_cost", "edgeGate"),
+    ("evidence_", "evidenceGate"),   # 与既有任何前缀都不撞（已 grep）
     ("reflection_", "reflection"),
 )
 

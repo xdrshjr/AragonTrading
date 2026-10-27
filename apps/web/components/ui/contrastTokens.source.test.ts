@@ -146,15 +146,21 @@ describe("④ lib/** 下每一个 fetch 都经 withTimeout（D3）", () => {
   // ai-trade-market-intel 新增 `intelApi.ts`：**1 个调用点 / 1 个文件**（全部端点共用
   // 同一个通用 `request`）。于是 20 → 21 个调用点、19 → 20 个文件。
   //
+  // ai-trade-audit-journal 新增 `journalApi.ts`：**2 个调用点 / 1 个文件**（私有只读包装
+  // 一处 + 私有 POST 包装一处——导出预检与剪枝都要发 POST，走不了只读的那一个）。于是
+  // 21 → 23 个调用点、20 → 21 个文件。**这个数字每次都要人来对一遍**，那正是它存在的理由：
+  // 一个新 `*Api.ts` 忘了接超时时，按钮会静默冻结最长 5 分钟。
+  //
   // ai-trade-trajectory-capture 新增 `trajectoryApi.ts`：**1 个调用点 / 1 个文件**（配置读取与
-  // 目录校验共用同一个通用 `request`）。于是 21 → 22 个调用点、20 → 21 个文件。
-  // agent-trading-capabilities 新增 agentTradingApi.ts：一个共用 request，
-  // 唯一 fetch 经 withTimeout(..., 20_000)；22 → 23 个调用点，21 → 22 个文件。
-  it("扫到了全部 fetch 调用点（23 个调用点 / 22 个文件）", () => {
+  // 目录校验共用同一个通用 `request`）。于是 23 → 24 个调用点、21 → 22 个文件。
+  // agent-trading-capabilities 新增 `agentTradingApi.ts`：全部端点共用一个
+  // request，唯一 fetch 同步传入 withTimeout(..., 20_000)，且不自动重试提交。
+  // 因此 24 → 25 个调用点、22 → 23 个文件。
+  it("扫到了全部 fetch 调用点（25 个调用点 / 23 个文件）", () => {
     const sites = LIB.reduce((n, s) => n + (s.text.match(/\bfetch\(/g)?.length ?? 0), 0);
     const files = LIB.filter((s) => /\bfetch\(/.test(s.text));
-    expect(sites).toBe(23);
-    expect(files.length).toBe(22);
+    expect(sites).toBe(25);
+    expect(files.length).toBe(23);
   });
 
   // 判据是**调用点**不是文件：`aiTradeHorizonApi.ts` 一个文件里就有 3 个彼此独立的 fetch 且没有共享

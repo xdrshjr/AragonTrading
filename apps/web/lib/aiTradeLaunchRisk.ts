@@ -12,7 +12,7 @@
  * ——后者没有任何机械判据能覆盖（新警示可以出现在任何一个子组件的任何一行 JSX 里）。故边界
  * 写死在这里：
  *
- * **在册的 11 条**：`AI_TRADE_LAUNCH_RISK_IDS`，走 W-13 / W-14 / W-23 的等值判据。
+ * **在册的 13 条**：`AI_TRADE_LAUNCH_RISK_IDS`，走 W-13 / W-14 / W-23 的等值判据。
  *
  * **已知排除项（本轮明确不进风险清单，各附理由）**：
  *  · `AiTradeHorizonFields` 的「契约摘要」四行 —— 它是**当前选择的说明**，不是警示；进了清单
@@ -24,11 +24,16 @@
  *    警示；目录不可用是**阻断错误**，走步骤模型（`trajectoryDirError`）而非风险清单。
  *  · 第 6 步的 `ai-launch-trajectory-notice` 行（`var(--warn)`，「勾了采集、本次却不会采」）——
  *    说明而非警示：配置接口一次瞬时失败不该在清单里钉一条风险（不确定一律不翻译成否决）。
+ *  · `EvidenceGateCard` 的两处 `var(--warn)` 文本（evidence-gated-capital §3.5.3）——
+ *    「严格档启动后前几天大概率只记影子」是**推荐档的后果说明**：spec §3.5.4 明文规定严格档不产生
+ *    风险项，它在卡片上就地说一次；「证据预览读取失败」是一次瞬时读取失败的回执，同上一条纪律
+ *    （不确定一律不翻译成否决，也不钉进清单）。
  *
  * **实施纪律**：往任一 `Step*.tsx` 或其子组件里新增一处 `var(--warn)` 文本时，必须同时给出
  * 「进注册表」或「进上面这张排除清单」的判断。这条不由门禁守（守不住），由本注释写明——
  * 宁可把边界写死在文档里，也不要留一条自称全覆盖、实际只覆盖自己想得起来那几项的不变式。
  */
+import type { AiTradeEvidencePolicy } from "@/lib/aiTradeEvidence";
 import type { AiTradeHorizonProfile, AiTradeHorizonProfileId } from "@/lib/aiTradeTypes";
 import type { AiTradeLaunchMode, AiTradeLaunchStepId } from "@/lib/aiTradeLaunchSteps";
 
@@ -46,6 +51,9 @@ export const AI_TRADE_LAUNCH_RISK_IDS = [
   "experienceOff", // 经验模式整关：本次会话既不读取也不沉淀
   "wakeFloorRaised", // 唤醒周期低于与目标持仓相干的下限，启动时会被服务端抬上去
   "profitLockOff", // 收益锁已关闭（profit-lock C-2）：小浮盈没有任何确定性的保本兜底
+  // 实证准入（evidence-gated-capital §3.5.4）：严格档是推荐档，不产生风险项。
+  "evidenceObserveOnly", // 「仅观察」：不会因为缺乏证据而停止下单
+  "evidenceBalanced", // 「均衡」：证据不足的方向照常下单（说明性，tone=info）
 ] as const;
 
 export type AiTradeLaunchRiskId = (typeof AI_TRADE_LAUNCH_RISK_IDS)[number];
@@ -54,7 +62,8 @@ export interface AiTradeLaunchRisk {
   id: AiTradeLaunchRiskId;
   /** 渲染落点；`steps[0]` 同时是风险清单上「去处理」按钮的跳转目标。 */
   steps: AiTradeLaunchStepId[];
-  tone: "warn" | "danger";
+  /** `info` 只用于「用户主动选了一个非推荐档」的回执（evidenceBalanced），不是警示。 */
+  tone: "info" | "warn" | "danger";
   title: string;
   detail: string;
   /** 需要一次显式勾选才能启动（仅 `tradabilityInfeasible` 与互锁武装时的 `profitGuardOff`）。 */
@@ -146,6 +155,8 @@ export interface AiTradeLaunchRiskInput {
   wakeFloorDivisor: number;
   /** 当前模式的目标最短持仓（秒，服务端下发）。 */
   targetHoldMinSeconds: number;
+  /** 实证准入档位；`null` / 缺省 ⇒ 本层不装配（回测车道）⇒ 不产生任何风险项。 */
+  evidencePolicy?: AiTradeEvidencePolicy | null;
 }
 
 /** 「极致」研判档单轮的分钟数下界（与 `AiTradeLaunchModal` 既有提示逐字同源）。 */
@@ -222,6 +233,8 @@ export function collectRisks(input: AiTradeLaunchRiskInput): AiTradeLaunchRisk[]
         "口径计，5× 杠杆下要浮盈约 60 bps 才启动，管不到这个尺度。",
     });
   }
+
+  risks.push(...evidenceRisks(input.evidencePolicy ?? null));
 
   if (!input.profitGuardEnabled && input.inertHardTakeProfitText) {
     risks.push({
@@ -339,6 +352,36 @@ export function collectRisks(input: AiTradeLaunchRiskInput): AiTradeLaunchRisk[]
   }
 
   return risks;
+}
+
+/**
+ * 实证准入的两条风险项（§3.5.4）。数字全部取自 spec §2（可复算）；不写未复算的比例。
+ * 严格档 / 未装配 ⇒ 空数组。
+ */
+function evidenceRisks(policy: AiTradeEvidencePolicy | null): AiTradeLaunchRisk[] {
+  if (policy === "observe") {
+    return [{
+      id: "evidenceObserveOnly",
+      steps: ["guards"],
+      tone: "warn",
+      title: "实证准入为「仅观察」",
+      detail:
+        "系统不会因为缺乏证据而停止下单。2026-09 的 281 次开仓意愿，在 4–8 小时持有尺度上" +
+        "方向收益为负（−4.6 ~ −23.6 bps）。",
+    }];
+  }
+  if (policy === "balanced") {
+    return [{
+      id: "evidenceBalanced",
+      steps: ["guards"],
+      tone: "info",
+      title: "实证准入为「均衡」",
+      detail:
+        "证据不足的方向照常下单，只有被证明亏钱的方向会停下。在严格档的回放里，" +
+        "这一档少挡掉了大部分亏损。",
+    }];
+  }
+  return [];
 }
 
 /** 该步上就地内联渲染的风险（每条风险在其 `steps` 列出的每一步各渲染一次）。 */

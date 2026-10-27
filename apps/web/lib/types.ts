@@ -736,6 +736,14 @@ export interface Health {
   maxPaperSessions?: number;
   /** OKX 链路摘要（okx-link-resilience §4.3）。**可选**：老后端没有这个键。 */
   link?: { overall: string; summary: string };
+  /**
+   * 交易日志管理台的总闸（ai-trade-audit-journal §2.6.1）。**可选**：老后端没有这个键。
+   *
+   * `false` ⇒ 后端连路由都没注册（全部 404），故导航项不渲染；且**持久化下来的
+   * `activeView="journal"` 要被拉回默认视图**——否则老用户重启后看到的是一屏什么都没有、
+   * 也不说为什么的空白工作台。
+   */
+  journalEnabled?: boolean;
 }
 
 export interface ApiError {

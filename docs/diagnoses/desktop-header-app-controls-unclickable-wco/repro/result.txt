@@ -1,0 +1,24 @@
+
+=== RESTORED (还原态，默认启动态) ===
+getBounds        : x=157 y=74 w=1441 h=901
+getContentBounds : x=157 y=74 w=1441 h=901
+帧内缩进(inset)  : dx=0 dy=0
+WCO supported    : true
+WCO visible      : true
+titlebarAreaRect : {"x":0,"y":0,"w":1305,"h":48}
+header pad-right  : 136.143px   (env 未填充 → 0px；已填充 → ≈系统三键带宽)
+gear app-region  : no-drag
+gear rect        : {"x":1273,"y":8,"w":32,"h":32}   innerW=1441
+live(实盘) rect  : {"x":1156,"y":10,"w":51,"h":28}
+
+=== MAXIMIZED (最大化态) ===
+getBounds        : x=-7 y=-7 w=1770 h=1063
+getContentBounds : x=0 y=0 w=1756 h=1050
+帧内缩进(inset)  : dx=7 dy=7
+WCO supported    : true
+WCO visible      : true
+titlebarAreaRect : {"x":0,"y":0,"w":1619,"h":48}
+header pad-right  : 137px   (env 未填充 → 0px；已填充 → ≈系统三键带宽)
+gear app-region  : no-drag
+gear rect        : {"x":1587,"y":8,"w":32,"h":32}   innerW=1756
+live(实盘) rect  : {"x":1470,"y":10,"w":51,"h":28}

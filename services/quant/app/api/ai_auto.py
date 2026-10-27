@@ -54,6 +54,9 @@ from ..ai_auto.manager import (
 )
 from ..ai_auto.prior_service import prior_snapshot_out, rebuild_prior_snapshot
 from ..ai_auto.profit_guard import ProfitGuardRule, resolve_profit_guard_rule
+from ..ai_auto.evidence_gate import EvidenceRule, resolve_evidence_rule
+from ..ai_auto.evidence_service import load_snapshots as load_evidence_snapshots
+from .ai_trade_evidence import router as evidence_router
 from ..ai_auto.profit_lock import ProfitLockRule, resolve_profit_lock_rule
 from ..ai_auto.session import AiTradeManualExitDisabled
 from ..ai_auto.signal_prior import resolve_prior_params, strategy_fingerprint
@@ -86,6 +89,7 @@ from ..schemas import (
     AiTradePriorSnapshotOut,
     AiTradeProfitabilityOut,
     AiTradeProfitGuardIn,
+    AiTradeEvidenceGateIn,
     AiTradeProfitLockIn,
     AiTradeTradabilityOut,
     AiTradeTrendIn,
@@ -96,6 +100,8 @@ from .ws_guard import guard_ws_origin
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["ai-trade"])
+# 实证准入的两个端点（证据预览 / 历史回填）挂在本路由下，不另占 main.py 的注册位。
+router.include_router(evidence_router)
 
 _WS_HEARTBEAT_SECONDS = 20.0   # 静默此秒数后下发 ping（半开探测 + 满队列丢终态兜底，镜像 weight-train）
 _BACKTEST_TERMINAL_TYPES = ("done", "cancelled", "error")
@@ -386,6 +392,22 @@ def _resolve_profit_lock(raw: AiTradeProfitLockIn | None,
                                          "message": str(exc)}) from exc
 
 
+def _resolve_evidence_gate(raw: AiTradeEvidenceGateIn | None,
+                           settings: Settings) -> EvidenceRule | None:
+    """实证准入「缺省即开启（strict）」语义的唯一解析点；`enabled=false` / 运维总闸关 ⇒ None。
+
+    AI 回测不装配本层（spec §1.3：回测本身就是在产生证据，且没有跨会话的证据表）。
+
+    Raises:
+        HTTPException: 422，`policy` 非法（Pydantic 已先拦，这里是纯核心自卫的转译）。
+    """
+    try:
+        return resolve_evidence_rule(raw.model_dump() if raw is not None else None, settings)
+    except ValueError as exc:
+        raise HTTPException(422, detail={"code": "AI_TRADE_EVIDENCE_GATE_INVALID",
+                                         "message": str(exc)}) from exc
+
+
 def _resolve_backtest_profit_lock(raw: AiTradeProfitLockIn | None,
                                   settings: Settings) -> ProfitLockRule | None:
     """回测侧：在实盘语义之上再叠运维总闸 `ai_trade_profit_lock_backtest_enabled`。"""
@@ -647,6 +669,11 @@ async def build_start_request(session: AsyncSession, settings: Settings,
     horizon_rule = _resolve_horizon(body.tradingHorizon, settings, bar=body.bar)
     profit_rule = _resolve_profit_guard(body.profitGuard, settings)
     profit_lock_rule = _resolve_profit_lock(body.profitLock, settings)   # 同样只解析一次
+    evidence_rule = _resolve_evidence_gate(body.evidenceGate, settings)
+    # 启动期一次性证据快照（会话内不刷新合并样本）；读库失败 ⇒ 空快照 + snapshotError，不阻断启动。
+    evidence_snapshots = await load_evidence_snapshots(
+        session, inst_ids=[m.instId for m in body.members], bar=body.bar, rule=evidence_rule,
+        now=time.time())
     # ★ C-1：与目标持仓相干的唤醒下限。抬升写成装配层的一行 + 一条如实回执，
     # **不抛错**——它与 A-1 的 422 极性相反：这一条在冷续跑时会再跑一遍，而那是安全且想要的
     # （同一份 `start_wire` 得到同一个 `wake_s`，抬升是幂等的纯派生）。`divisor=0`（默认）⇒
@@ -695,6 +722,7 @@ async def build_start_request(session: AsyncSession, settings: Settings,
         base_rule=_resolve_base_rules(body.baseRules, settings),
         profit_rule=profit_rule,         # ★ 上面已解析一次，绝不再解析第二遍（两份产物必分叉）
         profit_lock_rule=profit_lock_rule,
+        evidence_rule=evidence_rule, evidence_snapshots=evidence_snapshots,
         horizon_rule=horizon_rule,
         prior_snapshots=priors,
         track_records=await resolve_track_record(   # 轴 D：启动期一次性快照（会话内不刷新，R-5）

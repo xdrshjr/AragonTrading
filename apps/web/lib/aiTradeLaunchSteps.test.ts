@@ -198,4 +198,15 @@ describe("U-7 步骤摘要", () => {
     expect(stepSummary({ ...SUMMARY, trajectoryEnabled: true }, "cognition"))
       .toBe(`${before} · 采集开`);
   });
+
+  it("guards 摘要：实证准入档位出现在「铁律」之后；缺省 / null（回测）⇒ 与改前逐字相等", () => {
+    const before = "均衡 · 铁律开 · 收益锁开 · 利润保护开";
+    expect(stepSummary(SUMMARY, "guards")).toBe(before);
+    expect(stepSummary({ ...SUMMARY, evidenceLabel: null }, "guards")).toBe(before);
+    for (const label of ["严格", "均衡", "仅观察"]) {
+      expect(stepSummary({ ...SUMMARY, evidenceLabel: label }, "guards")).toBe(
+        `均衡 · 铁律开 · 实证准入：${label} · 收益锁开 · 利润保护开`,
+      );
+    }
+  });
 });

@@ -175,8 +175,34 @@ class _StreamOutcome:
 
 
 def _sha256(text: str) -> str:
-    """计算实际模型请求的内容哈希。"""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+    """一段文本的内容 sha（交易日志的内容寻址与提示词重建判据共用同一个口径）。"""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def decision_input_wire(decision) -> dict:
+    """一次决策的**工具入参形态**（`commit_round` 写进上下文的那一份的唯一装配点）。
+
+    抽成模块级纯函数是硬约束：交易日志的 `output_json` 要用同一个形状装配**模型原始**决策
+    （`stage1_decision`），而 `commit_round` 用它装配**门禁后**的最终决策。两处各写一遍，
+    「模型说了什么」与「最终执行了什么」这两列就会在下一次给 `TradeDecision` 加字段时静默分叉
+    ——而后训练样本的训练目标正是这两者之一。
+
+    Args:
+        decision: `TradeDecision`（或任何具备同名属性的替身）。
+
+    Returns:
+        九键 dict；缺席属性一律回落 `None`（**绝不省略键**：形状稳定优先于省字符，
+        与 `_journal` 每轮恒带 trigger/reflection 两键是同一条纪律）。
+    """
+    return {"action": getattr(decision, "action", None),
+            "sizeFraction": getattr(decision, "size_fraction", None),
+            "confidence": getattr(decision, "confidence", None),
+            "reason": getattr(decision, "reason", None),
+            "orderType": getattr(decision, "ord_type", None),
+            "limitPrice": getattr(decision, "limit_px", None),
+            "holdExitPx": getattr(decision, "hold_exit_px", None),
+            "exitConviction": getattr(decision, "exit_conviction", None),
+            "exitEvidence": getattr(decision, "exit_evidence", None)}
 
 
 @dataclass(frozen=True)
@@ -406,6 +432,16 @@ class AiTradeDecider:
         self._last_reasoning: ReasoningMeta | None = None
         self._last_stop_reason: str | None = None   # 本轮最后一次尝试的收尾码（provider 原样）
         self._last_usage: dict | None = None        # 归一后的 {inputTokens, outputTokens}
+        # ---- 交易日志的三个只读出口所需的轮级槽（ai-trade-audit-journal §2.2.4bis）----
+        # `_last_request_shape`：**出站那一行现算**的上下文断面（见 `last_request_shape` 的
+        #   docstring —— 这是全设计里唯一一处没有任何自动化门禁能守住的东西）。
+        # `_last_context_turn`：本轮真正进上下文的那一段（门禁**后**的 decision_input + 原始
+        #   tool_result 串），由 `commit_round` 这个唯一写点填。
+        # `_attempt_no`：本轮已发起的尝试次数（首次为 1），供日志如实写出「这一轮重试了几次」。
+        self._last_request_shape: dict | None = None
+        self._last_context_turn: dict | None = None
+        self._attempt_no = 0
+        self._seed_text: str = ""    # 当前上下文里那段摘要种子的原文（无种子为空串）
 
     # ---------- 只读状态（供 status / snapshot）----------
     @property
@@ -473,6 +509,91 @@ class AiTradeDecider:
         """开仓档位步长（fraction，只读）；供 session 反思收缩量化吸附到合法档位（§2.3/RV-4）。"""
         return self._position_step
 
+    # ---------- 交易日志的只读出口（ai-trade-audit-journal §3.2）----------
+    # 三个都是**纯读**：不改变决策器的任何状态，也不被任何判定表达式引用（门禁 G-3）。
+
+    @property
+    def last_usage(self) -> dict | None:
+        """本轮归一后的 token 用量 `{inputTokens, outputTokens}`；未产出即 `None`（**绝不补 0**）。"""
+        return dict(self._last_usage) if self._last_usage else None
+
+    @property
+    def last_request_shape(self) -> dict | None:
+        """本轮**真正送出去**的那次请求的上下文断面；未发起过尝试即 `None`。
+
+        九个键：七个结构性字段（`contextTurns` / `contextFirstRound` / `summarySha256` /
+        `finalUserSha256` / `attempt` / `hintApplied` / `extraInstruction`）加两段大文本
+        （`finalUserText` / `summaryText`）。两段文本是**引用**、不复制，只在 `full` 档与
+        摘要种子留档时被真正读走。
+
+        取数口径由 `_request_shape` 在 `self._llm.stream(...)` **之前**现算——那一行的注释写清了
+        为什么必须是那里。
+        """
+        return dict(self._last_request_shape) if self._last_request_shape else None
+
+    @property
+    def last_context_turn(self) -> dict | None:
+        """本轮真正进上下文的那一段：`{"assistant": <门禁后的 decision_input>, "toolResult": <原串>}`。
+
+        **必须与「模型原始工具入参」分开**：进上下文的是 `commit_round` 收到的门禁**之后**的最终
+        decision（见 `commit_round` 的 R-P1-3 说明），而后训练的训练目标要的是模型自己交出的那一份。
+        两者在任何被门禁改写的轮上都不同，混用会让样本教模型去说门禁替它说的话。
+        """
+        return dict(self._last_context_turn) if self._last_context_turn else None
+
+    def prompt_profile(self) -> dict:
+        """系统提示词 + 决策工具 schema 的**内容寻址**档案（一次会话内恒定，故只存一次）。
+
+        `sha256(system_prompt + "\x00" + tools_json)` 作主键；决策行只存 `profile_sha256`。
+
+        Returns:
+            `{"sha256", "systemPrompt", "toolsJson", "provider", "model"}`。
+            `model` 取自 provider 客户端的私有字段（**best-effort**：取不到即空串，
+            绝不为了一个观测字段去改各 provider 客户端的公开接口）。
+        """
+        tools_json = json.dumps([{"name": self._tool.name,
+                                  "description": self._tool.description,
+                                  "input_schema": self._tool.input_schema}],
+                                ensure_ascii=False, sort_keys=True)
+        system = self.system_prompt or ""
+        digest = hashlib.sha256((system + "\x00" + tools_json).encode("utf-8")).hexdigest()
+        return {"sha256": digest, "systemPrompt": system, "toolsJson": tools_json,
+                "provider": str(getattr(self._llm, "provider", "") or ""),
+                "model": str(getattr(self._llm, "_model", None)
+                             or getattr(self._llm, "model", "") or "")}
+
+    def _request_shape(self, prompt_text: str, *, hint: str | None,
+                       extra_instruction: str | None) -> dict:
+        """把「这一轮的输入到底由哪些轮拼成」在唯一知道真相的那一刻现算出来。
+
+        `contextTurns` 是**出站时** `self._context` 里已有的消息条数；`contextFirstRound` 由
+        已提交的轮数反推（每一轮恰好往 `_context` 追加三条，其中 `role == "tool"` 那条一轮一条，
+        故数它即得轮数）——**刻意不另立一份计数状态**：并排的两份计数在下一次改动时必然分叉，
+        而分叉的表现（导出侧按错误的起点去取前驱行）不报任何错。
+        """
+        seed_text = self._seed_text if self._context_has_seed() else ""
+        turns = sum(1 for msg in self._context if msg.role == "tool")
+        return {
+            "contextTurns": len(self._context),
+            "contextFirstRound": (self._last_round - turns + 1) if turns else self._last_round + 1,
+            "summarySha256": _sha256(seed_text) if seed_text else "",
+            "summaryText": seed_text,
+            "finalUserSha256": _sha256(prompt_text),
+            "finalUserText": prompt_text,
+            "attempt": self._attempt_no,
+            "hintApplied": hint,
+            "extraInstruction": bool(extra_instruction),
+        }
+
+    def _context_has_seed(self) -> bool:
+        """当前上下文的首条是不是那段摘要种子（`_trim_context` 的左裁可能已经把它切掉）。"""
+        if not self._seed_text or not self._context:
+            return False
+        first = self._context[0]
+        blocks = first.content or []
+        return (first.role == "user" and bool(blocks)
+                and isinstance(blocks[0], TextBlock) and blocks[0].text == self._seed_text)
+
     # ---------- 决策 ----------
     async def decide(self, payload: dict, *, emit: TraceEmit | None = None
                      ) -> tuple[TradeDecision, str | None]:
@@ -531,11 +652,16 @@ class AiTradeDecider:
         self._last_stop_reason = None
         self._last_usage = None
         self._last_reflection_analysis = ""
+        # 与上面四项同款的入口清零（RC-1 范式）：一条**上一轮**的上下文断面比没有断面更坏，
+        # 它会让日志里那一行看起来言之凿凿地描述一段根本没发生过的请求。
+        self._last_request_shape = None
         self._round_advisory_snapshot = None
         self._round_reflection_snapshot = None
         self._round_decision_facts = None
         self._round_identity = None
         self._round_evidence_sent = False
+        self._last_context_turn = None
+        self._attempt_no = 0
 
     def _effective_max_retries(self) -> int:
         """本轮**有效**重试次数 = min(settings 的重试数, 档位尝试上限 − 1)；未封顶即逐字回退。"""
@@ -651,6 +777,22 @@ class AiTradeDecider:
         if extra_instruction:
             prompt_text += extra_instruction
         user_msg = LlmMessage("user", [TextBlock(prompt_text)])
+        self._attempt_no += 1
+        # ★★★ 交易日志的上下文断面：**必须现算在这一行**（ai-trade-audit-journal §2.2.4bis / 十二.5）。
+        #
+        # 为什么必须在这里，而不是在写点里按 `payload` 重算一遍：真实请求是
+        # `messages = self._context + [user_msg]`（见下面 `_stream_decision` 的出站那一行），
+        # 而 `self._context` 是**逐轮累积**的三元组、中途还会被 `_trim_context()` 左裁、被
+        # `summarize()` 整体换成一段摘要种子。写点只拿得到 `payload`，它**结构上看不见**这件事；
+        # 更要紧的是上面那两行会把重试后缀 / 追问后缀追加进真正送出去的那条 user 文本，而按
+        # payload 重算的版本永远看不见后缀——于是「存档 sha == 重建 sha」与「样本是假的」
+        # 可以同时成立。
+        #
+        # 把它挪到别处（写点里、`decide()` 里、`_stream_decision` 里的任何一行之后）**不会报错、
+        # 不会判红、用例照绿**，而导出的每一条后训练样本都会从此静静地说假话。这也是本设计里
+        # 唯一一处没有任何自动化门禁能守住的东西——所以它有这段注释。
+        self._last_request_shape = self._request_shape(prompt_text, hint=hint,
+                                                       extra_instruction=extra_instruction)
         try:
             outcome = await asyncio.wait_for(
                 self._stream_decision(user_msg, emit, text_phase=text_phase),
@@ -1122,16 +1264,10 @@ class AiTradeDecider:
         payload = self._with_round_facts(payload)
         tool_id = uuid.uuid4().hex
         # M-9：委托方式随 journal 落痕，否则滚动摘要会丢失挂单史（Agent 记不得自己挂过什么价）。
-        decision_input = {"action": decision.action, "sizeFraction": decision.size_fraction,
-                          "confidence": decision.confidence, "reason": decision.reason,
-                          "orderType": decision.ord_type, "limitPrice": decision.limit_px,
-                          # C1：承诺退出线随 journal 落痕，否则滚动摘要重置后问责回路断裂（模型记不得
-                          # 自己许过什么退出线）——与 orderType/limitPrice 当初落 journal 同理（M-9）。
-                          "holdExitPx": decision.hold_exit_px,
-                          # exit-priority §6.1：两者随 journal 落痕，否则滚动摘要重置后问责回路
-                          # 断裂（模型记不得自己声明过什么确信度）——与 orderType/holdExitPx 同理。
-                          "exitConviction": decision.exit_conviction,
-                          "exitEvidence": decision.exit_evidence}
+        # C1：承诺退出线同理（模型记不得自己许过什么退出线）；exit-priority §6.1：确信度与证据同理。
+        # 装配点已下沉到模块级纯函数 `decision_input_wire`——交易日志的 `output_json` 要用**同一个
+        # 形状**装配模型原始决策，两处各写一遍会在下一次给 `TradeDecision` 加字段时静默分叉。
+        decision_input = decision_input_wire(decision)
         # 浅拷贝合并，绝不就地改 `executed` 入参对象；两者都未命中时走空字典分支、tool_result
         # 内容逐字不变（R-05）。两条注记**不假设互斥**（形状稳定优先于省字符）：门禁否决轮的
         # decision 此刻已是 hold ⇒ 反思对 hold 直通、`reflection` 恒 None，故实际不会同时出现。
@@ -1159,6 +1295,10 @@ class AiTradeDecider:
             "assistant", [ToolUseBlock(id=tool_id, name=DECISION_TOOL_NAME, input=decision_input)]))
         self._context.append(LlmMessage(
             "tool", [ToolResultBlock(tool_use_id=tool_id, content=tool_result_text)]))
+        # 交易日志的 `context_turn_json`（ai-trade-audit-journal §2.2.4bis ②）：本轮真正进上下文
+        # 的那一段。**唯一写点就在这里**——它必须是刚刚 append 进去的那两条的原文，在别处按
+        # `decision` 重建会漏掉 `extra` 合并进 tool_result 的反思 / 门禁注记。
+        self._last_context_turn = {"assistant": decision_input, "toolResult": tool_result_text}
         # journal 每轮恒带 trigger/reflection 两键（含 None 值）：全轮形状稳定、F4b 折叠判定对
         # legacy 条目兼容（R-06 有意设计，勿按「省字符」回改为条件写入）。
         self._journal.append({
@@ -1244,6 +1384,9 @@ class AiTradeDecider:
         self._context = [
             LlmMessage("user", [TextBlock(seed)]),
             LlmMessage("assistant", [TextBlock("已了解此前执行情况，将据此继续决策。")])]
+        # 交易日志的上下文链要能重建出这两条（§2.2.4bis ③）。留下原文而不是只留 sha：
+        # 一段重建不出来的种子会让摘要重置之后的**每一条**样本都被判成 contextIncomplete。
+        self._seed_text = seed
 
     def seed_from_snapshot(self, *, summary: str | None, last_round: int,
                            summary_as_of_ts: float | None = None,

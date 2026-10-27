@@ -58,6 +58,15 @@ const LONG_EXACT_PREFIXES = [
   "/factor-sets/score-preview", // 组合打分的内联版本，与 /factor-sets/{id}/score 同形
   "/weight-models/train",
   "/ai-trade/prior/rebuild",
+  "/ai-trade/evidence/backfill", // 逐段拉历史 K 线，服务端 240 s 截止（实证准入 §3.6.5）
+  // 交易日志的导出预检（ai-trade-audit-journal §3.4）：它要在全量候选上走一遍完整的
+  // 样本装配才能给出精确条数与九个 skipped 桶，几万行上超 20 秒是常态。
+  //
+  // ⚠️ **`/ai-trade/journal/export` 本身刻意不进这张表**：它走 `<a download>` 的浏览器
+  // 导航，根本不经过 `timeoutFor`（本模块只服务于 `fetch` 侧），登进去是一行死码。
+  // 那条路径的时间保护在**服务端**（`AI_TRADE_JOURNAL_EXPORT_TIME_BUDGET_S` 墙钟预算
+  // + 分片契约），见 spec §2.5.1 加强一。
+  "/ai-trade/journal/export/preview",
   // 交易经验库（ai-trade-experience-context-graph E-11）：全库重建在大库上超 20 秒是常态
   // （F-2 自己论证过），导出是几万条事件的 NDJSON 流，替换式导入要先删再写。三条都落
   // `FAST_MS` 的话，「重建图谱」按钮**必然**假超时——而后端其实跑得好好的。
@@ -106,6 +115,9 @@ const WRITE_PREFIXES = [
   "/paper/start",
   "/paper/batch/start",
   "/paper/stop-all",
+  // 交易日志的剪枝：它是**删除**操作，超时要说「结果未知，请刷新核对」而不是「失败」
+  // （纪律取自 `api/experience.py` 的 `prune` 端点 docstring）。
+  "/ai-trade/journal/prune",
   // 经验库的两个写类路径（E-11）。**必须登记在这张前缀表、而不是下面那张「家族 + 末段」表**：
   // 往 `WRITE_ACTION_SUFFIXES` 里加 `/rebuild` 会让**既有的** `/ai-trade/prior/rebuild` 一并被
   // 重判为写路径——那是在一个与本特性无关的按钮上悄悄改掉超时文案。`/experience/*` 没有路径

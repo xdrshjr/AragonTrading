@@ -569,6 +569,46 @@ class AiTradeProfitLockIn(BaseModel):
     confirmSeconds: float | None = Field(default=None, ge=0, le=60)
 
 
+class AiTradeEvidenceGateIn(BaseModel):
+    """实证准入入参（ai-trade-evidence-gated-capital §5.1）。
+
+    字段整体缺省 ⇒ 按 settings 开启（默认 strict）；`enabled=false` ⇒ 该会话不装配；`policy` 为空 ⇒
+    取默认档。运维总闸 `ai_trade_evidence_gate_enabled=False` ⇒ 无论请求如何都不装配。
+    """
+
+    enabled: bool = True
+    policy: Literal["strict", "balanced", "observe"] | None = None
+
+
+class AiTradeEvidenceOut(BaseModel):
+    """`GET /ai-trade/evidence` 回执（§5.3）。桶行是 dict：其键由 `evidence_service` 单点装配。"""
+
+    bar: str
+    refPolicy: str
+    asOf: int
+    rule: dict
+    buckets: list[dict]
+    recentShadowRatePerDay: dict
+
+
+class AiTradeEvidenceBackfillIn(BaseModel):
+    """`POST /ai-trade/evidence/backfill` 入参；`days` 上限另由 settings 夹紧（端点内校验）。"""
+
+    instIds: list[str] | None = None
+    bar: str
+    days: int = Field(default=30, ge=1, le=365)
+
+
+class AiTradeEvidenceBackfillOut(BaseModel):
+    """回填回执：`truncated=true` ⇒ 到截止时间还有 `remaining` 笔没处理，再点一次接着做。"""
+
+    inserted: int
+    skipped: dict
+    truncated: bool
+    remaining: int
+    notes: list[str]
+
+
 AiTradeHorizonProfileId = Literal[
     "hourly_swing", "intraday_swing", "short_swing", "trend_hold", "custom"]
 
@@ -1053,6 +1093,9 @@ class AiTradeGroupStartIn(BaseModel):
     # 收益锁（默认开启，「字段缺省 ⇒ 开启」语义，解析点 `_resolve_profit_lock`）。冷续跑对缺该键的
     # 老 wire 显式补 `enabled=false`（`resume._rebuild_request`），故老会话续跑时不会突然多一把锁。
     profitLock: AiTradeProfitLockIn | None = None
+    # 实证准入（默认开启 strict，「字段缺省 ⇒ 开启」语义，解析点 `_resolve_evidence_gate`）。冷续跑对
+    # 缺该键的老 wire 显式补 `enabled=false`（`resume._rebuild_request`），与收益锁同一先例。
+    evidenceGate: AiTradeEvidenceGateIn | None = None
     # 交易周期模式（默认开启，同上「字段缺省 ⇒ 开启」语义，解析点 `_resolve_horizon`）；
     # `{"enabled":false}` ⇒ 该会话不装配。**实盘与回测两处启动体都接该字段**（同一解析点，
     # 否则用户拿回测调出来的参数在实盘失真——`base_rules` P1-4 / `profit_guard` I-3 的成文教训）。
@@ -1224,6 +1267,7 @@ class AiTradeGroupRow(BaseModel):
     baseRules: dict | None = None              # 【基础策略】铁律回执镜像（null=未装配）
     profitGuard: dict | None = None            # 利润保护层回执镜像（null=未装配）
     profitLock: dict | None = None             # 收益锁回执镜像（null=未装配；不声明即被静默剔除）
+    evidenceGate: dict | None = None           # 实证准入回执镜像（null=未装配；同上，不声明即被剔除）
     # 交易周期模式回执镜像（null=未装配）：为**服务端解析后的生效值**，且必须同时带上两个派生量
     # `expectedHoldBars` / `confirmWindowSeconds`（[P1-9]/[P0-3]）——只回显入参等于把派生关系藏起来。
     tradingHorizon: dict | None = None

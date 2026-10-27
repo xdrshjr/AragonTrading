@@ -160,7 +160,7 @@ def test_shutdown_steps_are_zero_arg_factories_in_the_legacy_order():
     steps = _shutdown_steps()
     assert [name for name, _ in steps] == [
         "health_guard", "agent", "discovery", "paper", "ai_trade", "ai_trade_experience",
-        "ai_trade_intel", "ai_backtest", "live_auto", "weight_batch",
+        "ai_trade_intel", "ai_trade_journal", "ai_backtest", "live_auto", "weight_batch",
         "weight_train", "agent_trading", "okx_rest", "okx_pool", "db_engine",
     ]
     assert all(callable(factory) for _, factory in steps)
@@ -218,6 +218,21 @@ async def test_failed_hydration_keeps_chat_and_automation_gate_closed(monkeypatc
     admission.set_ready(True)
     await main._recover_agent_trading()
     assert not admission.is_ready()
+
+
+def test_the_journal_drain_sits_between_intel_and_db_engine():
+    """ai-trade-audit-journal §2.2.2 约束 6：交易日志的排空步**必须**是第 8 位。
+
+    三条判据各自独立，故各断一条：① 在 `ai_trade` **之后**——`manager.shutdown()` 里还会写
+    `GROUP_STOPPED` / `GROUP_ENDED` 事件行；② 在 `db_engine` **之前**——drain task 要用引擎
+    提交，否则它会活着穿过 `dispose_engine()`；③ 紧跟 `ai_trade_intel`——那一步的位置被
+    `test_ai_intel_wiring.py:392` 的 `names.index("ai_trade_intel") == 6` 逐字冻结着。
+    """
+    names = [name for name, _ in _shutdown_steps()]
+    assert names[7] == "ai_trade_journal"
+    assert names.index("ai_trade_journal") > names.index("ai_trade")
+    assert names.index("ai_trade_journal") < names.index("db_engine")
+    assert names.count("ai_trade_journal") == 1
 
 
 def test_the_intel_drain_is_still_the_seventh_step_and_no_step_was_added():

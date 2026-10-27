@@ -7,10 +7,10 @@ import NavRail from "./NavRail";
 vi.mock("@/lib/accountApi", () => ({ accountApi: {
   accounts: { list: vi.fn().mockResolvedValue({ accounts: [], defaultId: null }) },
 } }));
-function renderRail() {
+function renderRail(props: { journalEnabled?: boolean } = {}) {
   return render(<QueryClientProvider client={new QueryClient({
     defaultOptions: { queries: { retry: false } },
-  })}><NavRail /></QueryClientProvider>);
+  })}><NavRail {...props} /></QueryClientProvider>);
 }
 
 beforeEach(() => {
@@ -21,11 +21,36 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("NavRail — 左侧主功能导航", () => {
-  it("renders the three primary nav items with accessible names", () => {
+  it("renders the four primary nav items with accessible names", () => {
+    // ai-trade-audit-journal §2.6.1：本轮新增第 4 项「交易日志」。用例名从「three」改成
+    // 「four」是**预期内的契约更新**，不是回归——设计里已经预先写明了这一处必然要改。
     renderRail();
     expect(screen.getByRole("button", { name: "交易" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "因子实验室" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "策略与因子挖掘" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "交易日志" })).toBeTruthy();
+  });
+
+  it("交易日志：点击切到 journal 视图并置 aria-current", () => {
+    renderRail();
+    fireEvent.click(screen.getByRole("button", { name: "交易日志" }));
+    expect(useAppStore.getState().activeView).toBe("journal");
+    expect(screen.getByRole("button", { name: "交易日志" })).toHaveAttribute(
+      "aria-current",
+      "page",
+    );
+  });
+
+  it("journalEnabled=false ⇒ 不渲染交易日志项（后端此时连路由都没注册）", () => {
+    // 渲染一个点了必然 404 的入口，比没有入口更坏。
+    renderRail({ journalEnabled: false });
+    expect(screen.queryByRole("button", { name: "交易日志" })).toBeNull();
+    expect(screen.getByRole("button", { name: "交易" })).toBeTruthy();
+  });
+
+  it("journalEnabled 未知（老后端 / health 还没回来）⇒ 按开着处理", () => {
+    renderRail();
+    expect(screen.getByRole("button", { name: "交易日志" })).toBeTruthy();
   });
 
   it("marks the active view with aria-current=page (trade by default)", () => {

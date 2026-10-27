@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<style>
+/* Replica of apps/web/app/globals.css drag rules (built form) */
+.drag-region { -webkit-app-region: drag; }
+.no-drag,
+.drag-region [role="radiogroup"],
+.drag-region [role="switch"],
+.drag-region a,
+.drag-region button,
+.drag-region input,
+.no-drag { -webkit-app-region: no-drag; }
+html, body { height: 100%; margin: 0; }
+</style>
+</head>
+<body>
+  <div class="flex h-screen flex-col" id="root">
+    <header class="drag-region" id="hdr" style="height:48px">
+      <div id="leftcluster">
+        <img id="logo" />
+        <span id="brand">Aragon Trading</span>
+      </div>
+      <div class="no-drag" id="rightcluster">
+        <button id="themebtn">theme</button>
+      </div>
+    </header>
+    <main id="main" style="flex:1">
+      <section id="section">
+        <div id="instlist">
+          <button id="instbtn">BTC-USDT</button>
+        </div>
+        <div id="chart">chart</div>
+      </section>
+    </main>
+  </div>
+  <script>
+    function reg(id){
+      const el = document.getElementById(id);
+      if(!el) return id + ': (missing)';
+      const v = getComputedStyle(el).getPropertyValue('-webkit-app-region') || getComputedStyle(el).getPropertyValue('app-region');
+      return id + ': ' + (v || '(empty)');
+    }
+    const ids = ['root','hdr','leftcluster','logo','brand','rightcluster','themebtn','main','section','instlist','instbtn','chart'];
+    const lines = ids.map(reg);
+    // expose to main process
+    document.title = 'REGDONE';
+    window.__regResult = lines.join('\n');
+    console.log('REG_RESULT_BEGIN\n' + lines.join('\n') + '\nREG_RESULT_END');
+  </script>
+</body>
+</html>

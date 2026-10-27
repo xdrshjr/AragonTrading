@@ -37,6 +37,7 @@ describe("超时档位（D3）", () => {
     "/experience/export",
     "/experience/import",
     "/ai-trade/prior/rebuild",
+    "/ai-trade/evidence/backfill",
   ])("重计算路径 %s 走 LONG_MS", (path) => {
     expect(timeoutFor(path)).toBe(LONG_MS);
   });

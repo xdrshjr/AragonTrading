@@ -117,6 +117,9 @@ async def _rebuild_request(row: dict, settings):
         # 收益锁「缺省即开启」：本特性合入前落库的 wire 缺该键 ⇒ 显式关闭，否则老会话续跑时会
         # 突然多一把锁、同一 run 前后两段口径不一致。新 wire 恒带该键（含 null）⇒ 原样覆盖。
         wire = {"profitLock": {"enabled": False}, **(row["startWire"] or {})}
+        # 实证准入同一先例（evidence-gated-capital §3.6.4）：缺键的老 wire 续跑不会突然被拦成影子；
+        # 新 wire 恒带该键（含 null）⇒ `setdefault` 不覆盖。
+        wire.setdefault("evidenceGate", {"enabled": False})
         body = AiTradeGroupStartIn(**wire)
         async with get_sessionmaker()() as db:
             req = await build_start_request(db, settings, body)

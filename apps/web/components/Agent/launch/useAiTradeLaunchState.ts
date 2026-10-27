@@ -11,6 +11,7 @@ import {
   AI_TRADE_PROFIT_GUARD_DEFAULTS,
 } from "@/lib/aiTrade";
 import { DEFAULT_DISCIPLINE_PRESET } from "@/lib/aiTradeDiscipline";
+import { EVIDENCE_DEFAULT_POLICY, type AiTradeEvidencePolicy } from "@/lib/aiTradeEvidence";
 import {
   matchTierPreset,
   pctToRaw,
@@ -171,6 +172,9 @@ export function useAiTradeLaunchState(props: AiTradeLaunchModalProps) {
   const [lockArmCostRaw, setLockArmCostRaw] = useState("");
   const [lockKeepRatioRaw, setLockKeepRatioRaw] = useState("");
   const [lockConfirmRaw, setLockConfirmRaw] = useState("");
+  // 实证准入档位（evidence-gated-capital §3.5.3）：默认严格；只经 `seed()` 复位。
+  const [evidencePolicy, setEvidencePolicy] =
+    useState<AiTradeEvidencePolicy>(EVIDENCE_DEFAULT_POLICY);
   const [horizonEnabled, setHorizonEnabled] = useState(defaultTradingHorizon?.enabled ?? true);
   const [horizonProfileRaw, setHorizonProfileRaw] = useState<AiTradeHorizonProfileId | null>(
     defaultTradingHorizon?.profile ?? null,
@@ -251,6 +255,7 @@ export function useAiTradeLaunchState(props: AiTradeLaunchModalProps) {
     setLockArmCostRaw("");
     setLockKeepRatioRaw("");
     setLockConfirmRaw("");
+    setEvidencePolicy(EVIDENCE_DEFAULT_POLICY);
     setHorizonEnabled(defaultTradingHorizon?.enabled ?? true);
     setHorizonProfileRaw(defaultTradingHorizon?.profile ?? null);
     setHorizonCustom(seedHorizonCustom(defaultTradingHorizon));
@@ -301,6 +306,7 @@ export function useAiTradeLaunchState(props: AiTradeLaunchModalProps) {
     trajectory, setTrajectory, trajectorySkipOnce, setTrajectorySkipOnce,
     profitLockEnabled, setProfitLockEnabled, lockArmCostRaw, setLockArmCostRaw,
     lockKeepRatioRaw, setLockKeepRatioRaw, lockConfirmRaw, setLockConfirmRaw,
+    evidencePolicy, setEvidencePolicy,
     seededMembers, seed,
   };
 }

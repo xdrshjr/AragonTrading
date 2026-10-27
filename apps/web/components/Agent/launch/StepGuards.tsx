@@ -8,6 +8,7 @@ import AiTradeDirectionFields from "../AiTradeDirectionFields";
 import AiTradeTradabilityFields from "../AiTradeTradabilityFields";
 import ProfitGuardFields from "../ProfitGuardFields";
 import DisciplinePresetFields from "./DisciplinePresetFields";
+import EvidenceGateCard from "./EvidenceGateCard";
 import ProfitLockCard from "./ProfitLockCard";
 import { InlineRiskNote } from "./LaunchPrimitives";
 import type { UseAiTradeLaunchForm } from "./useAiTradeLaunchForm";
@@ -48,6 +49,7 @@ export default function StepGuards({
     setGivebackRaw, breakevenArmRaw, setBreakevenArmRaw, minHoldRaw, setMinHoldRaw,
     tierPreset, setTierPreset, atrFloorRaw, setAtrFloorRaw, atrCapRaw, setAtrCapRaw,
     cooldownRaw, setCooldownRaw, armPriceMovePct, interlockArmed, risks, profitLock, state,
+    evidence,
   } = form;
   const stepRisks = risksForStep(risks, "guards");
 
@@ -192,6 +194,10 @@ export default function StepGuards({
         onConfirmedChange={setTradabilityConfirmed}
         disabled={submitting}
       />
+
+      {/* 实证准入（evidence-gated-capital §3.5.3）：排在收益锁之前——它决定「开不开真单」，
+          比「怎么离场」更靠前。回测模式下只渲染一行说明（AI 回测不装配本层）。 */}
+      <EvidenceGateCard view={evidence} disabled={submitting} />
 
       {/* 收益锁（profit-lock C-2）：排在利润保护之前——它在典型波动尺度上更早生效。 */}
       <ProfitLockCard

@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html,body{margin:0;height:100%;background:#1a1915;color:#ece8df;font:13px system-ui}
+  /* 复刻 apps/web 的拖拽契约（globals.css:137-155） */
+  .drag-region{-webkit-app-region:drag}
+  .no-drag,.drag-region button{-webkit-app-region:no-drag}
+  /* 复刻 apps/web/app/page.tsx:567-597 的顶栏几何 */
+  header{display:flex;height:48px;align-items:center;
+    /* .win-titlebar-safe（globals.css:153-155）+ pl-4 */
+    padding-left:16px;
+    padding-right:calc(100vw - env(titlebar-area-width, 100vw) - env(titlebar-area-x, 0px))}
+  .brand{display:flex;align-items:center;gap:8px;align-self:stretch}
+  .spacer{flex:1;align-self:stretch}
+  .cluster{display:flex;align-items:center;gap:8px}
+  .seg{height:28px;padding:0 12px;border-radius:999px;background:#2a281f;border:0;color:#ece8df}
+  .gear{height:32px;width:32px;border-radius:10px;background:transparent;border:0;color:#bdb7a8}
+</style>
+</head>
+<body>
+  <header>
+    <div class="brand drag-region"><b>Aragon Trading</b></div>
+    <div class="spacer"></div>
+    <!-- 右簇：mirror page.tsx:590-597（no-drag 容器 + 内部交互控件） -->
+    <div class="cluster no-drag">
+      <div role="radiogroup" aria-label="账户模式">
+        <button class="seg" id="sim">模拟盘</button><button class="seg" id="live">实盘</button>
+      </div>
+      <button class="seg" id="theme">暗色</button>
+      <!-- 显式 no-drag，mirror SettingsGearButton.tsx:23 -->
+      <button class="gear no-drag" id="gear">⚙</button>
+    </div>
+  </header>
+  <div style="height:1px;background:#3a382f"></div>
+  <main style="padding:16px">probe body</main>
+</body>
+</html>
